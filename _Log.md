@@ -18507,3 +18507,54 @@ top.
 - **File(s)**: pkg/config/compiler_security.go,
   pkg/config/parser_security_test.go, pkg/dataplane/compiler_iface.go,
   pkg/dataplane/compiler_test.go, docs/syn-cookie-flood-protection.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #3021/#3022/#3026 — route VLAN sub-interface ingress through
+  the `resolve_ingress_logical_ifindex` SSOT for zone-pair policy (#3021),
+  screen/SYN-cookie zone lookup (#3022), and generated-ICMP CoS/filter
+  classify (#3026). `ifindex_to_zone_id` and `forwarding.egress` are keyed
+  by the LOGICAL unit ifindex; the physical parent only inherits its first
+  sub-interface's zone, so a parent carrying multiple VLAN units in distinct
+  zones evaluated the wrong policy/screen/CoS for every unit but the first.
+  All three sites now mirror the filter/cos call sites: resolve
+  (parent, vlan) -> logical, fall back to meta.ingress_ifindex when no
+  entry (untagged == physical == logical, no-op). icmp.rs still uses the
+  physical target_ifindex for the XSK transmit. Added three fail-on-revert
+  tests: screen_zone_lookup_uses_logical_ingress_ifindex_3022 LITERALLY
+  drives stage_screen_check with a lan-only source-route profile on a
+  VID-50/lan unit (verified RED when reverted to meta.ingress_ifindex —
+  resolves zone wan, no profile, Pass); forwarding_zone_pair_…_3021 and
+  classify_generated_reply_uses_logical_egress_ifindex_3026 are
+  counterfactual pins (assert logical-keyed vs physical-keyed verdicts
+  diverge, the project's accepted idiom for helper-keyed call sites that a
+  unit test cannot reach). Gates: cargo build --release clean (0 errors);
+  full bins suite 2917 passed + 1 PRE-EXISTING flake
+  (worker_queue::concurrent_recovery_processes_each_command, passes 3/3 in
+  isolation, unrelated to this change).
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_stages.rs, userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #3021/#3026 review follow-up (MERGE-NEEDS-MINOR, test strength
+  only — production fix unchanged) — upgrade the #3021 and #3026 counterfactual
+  pins to LITERAL fail-on-revert tests driving the real production call sites.
+  #3021: poll_descriptor_policy_deny_keys_logical_ingress_zone_3021 drives
+  poll_binding_process_descriptor with the deny path ingressing on a VLAN
+  sub-interface (logical ifindex 13, zone lan) on parent 11 (zone wan), and
+  asserts the emitted PolicyDeny event.ingress_zone_id == lan. Reverting the
+  production site to meta.ingress_ifindex reports wan -> RED (verified, panic
+  at the ingress_zone_id assert). #3026:
+  build_local_time_exceeded_request_classifies_on_logical_egress_3026 drives
+  build_local_time_exceeded_request with a VLAN egress where the LOGICAL unit
+  (ifindex 12) carries an output `then discard protocol icmp` filter but the
+  physical parent (bind_ifindex 11) does not, and asserts request.is_none() +
+  time_exceeded_output_filter_drops == 1. Reverting the production site to
+  target_ifindex classifies on the unfiltered parent -> admits -> RED
+  (verified, panic at request.is_none()). The original counterfactual pins
+  are retained as additional coverage. The #3022 literal test from the prior
+  round is unchanged. Gates: cargo build --release clean; zone_pair 9,
+  screen 137, classify_generated_reply 6, poll_descriptor 24 all green; full
+  bins 2919 passed + the same pre-existing worker_queue flake.
+- **File(s)**: userspace-dp/src/afxdp/tests.rs, _Log.md

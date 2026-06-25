@@ -2549,6 +2549,101 @@ fn classify_generated_reply_drops_icmp_on_terminal_discard() {
 }
 
 #[test]
+fn classify_generated_reply_uses_logical_egress_ifindex_3026() {
+    // #3026 fail-on-revert. A generated ICMP error leaving a VLAN
+    // sub-interface must be classified (CoS / output filter) on the LOGICAL
+    // egress unit ifindex (`ingress_ident.ifindex`), NOT the physical
+    // `target_ifindex` (= bind_ifindex = the parent). Output filters and CoS
+    // are keyed by the logical unit ifindex; the physical parent carries no
+    // filter, so classifying by it would silently leak the reply past the
+    // operator's `then discard protocol icmp`.
+    //
+    // Fixture: reth0.80 is the LOGICAL unit (ifindex 202, parent 11, VID 80)
+    // and carries the ICMP-discard output filter; the physical parent 11 has
+    // NO filter.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.80".into(),
+            ifindex: 202,
+            parent_ifindex: 11,
+            vlan_id: 80,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "drop-icmp".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "drop-icmp".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-icmp".into(),
+                action: "discard".into(),
+                protocols: vec!["icmp".into()],
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+    let frame = generated_v4_frame(PROTO_ICMP, 0x00, 0, 0);
+
+    // Correct (#3026): classify on the LOGICAL egress ifindex 202 -> the
+    // output filter matches the generated ICMP and drops it.
+    let correct = classify_generated_reply(&forwarding, 202, &frame, 0);
+    assert!(
+        correct.drop,
+        "the generated ICMP reply must be dropped by the VLAN unit's own \
+         output filter (classified on the logical egress ifindex 202)"
+    );
+
+    // Pre-fix: classify on the raw PHYSICAL parent ifindex 11. The parent
+    // carries no output filter, so the reply is NOT dropped — it leaks past
+    // the operator's `then discard protocol icmp` (the #3026 bug). If the
+    // fix reverts to `target_ifindex` (physical), the `correct` branch above
+    // collapses onto this value and the drop assert fails RED.
+    let physical = classify_generated_reply(&forwarding, 11, &frame, 0);
+    assert!(
+        !physical.drop,
+        "the physical parent ifindex 11 has no filter, so a physical-keyed \
+         classification would WRONGLY admit the reply (the #3026 bug)"
+    );
+    assert_ne!(
+        correct.drop, physical.drop,
+        "logical-keyed (drop) vs physical-keyed (admit) verdicts must \
+         diverge, proving the fix changes the classification interface"
+    );
+
+    // Non-VLAN preservation: an interface that IS the bind ifindex (logical
+    // == physical) classifies identically regardless. reth1.0 below has no
+    // parent, so ifindex 24 is both the logical unit and the bind ifindex.
+    let untagged = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth1.0".into(),
+            ifindex: 24,
+            hardware_addr: "02:bf:72:01:00:01".into(),
+            filter_output_v4: "drop-icmp".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "drop-icmp".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-icmp".into(),
+                action: "discard".into(),
+                protocols: vec!["icmp".into()],
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    let untagged_fwd = build_forwarding_state(&untagged);
+    assert!(
+        classify_generated_reply(&untagged_fwd, 24, &frame, 0).drop,
+        "an untagged interface (logical == physical == 24) still applies its \
+         own output filter — non-VLAN behavior is unchanged by the fix"
+    );
+}
+
+#[test]
 fn classify_generated_reply_ignores_trigger_protocol_filter() {
     // The discriminating test: a filter discarding TCP does NOT drop a
     // generated ICMP reply (proves classify-by-generated-tuple, not trigger).

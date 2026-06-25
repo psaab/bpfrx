@@ -211,16 +211,24 @@ pub(super) fn build_local_time_exceeded_request(
 
     let now_ns = monotonic_nanos();
     // #2238: classify the GENERATED ICMP/ICMPv6 error by its OWN egress
-    // 5-tuple + the resolved egress interface (`target_ifindex`, which
-    // accounts for `bind_ifindex`), NOT the triggering inbound packet's
-    // tuple/ingress. Pre-#2238 this called
-    // `resolve_cos_tx_selection_at(.., meta, flow.forward_key, ..)` — the
-    // trigger — on `ingress_ident.ifindex`, so an output filter matching the
-    // generated ICMP tuple never fired, and an output filter matching the
-    // original TCP/UDP flow could wrongly drop the ICMP error. A parse
-    // failure of our own built bytes fails CLOSED (drop + dedicated
-    // counter, §6.2).
-    let verdict = classify_generated_reply(forwarding, target_ifindex, &prebuilt_frame, now_ns);
+    // 5-tuple, NOT the triggering inbound packet's tuple/ingress. Pre-#2238
+    // this called `resolve_cos_tx_selection_at(.., meta, flow.forward_key,
+    // ..)` — the trigger — so an output filter matching the generated ICMP
+    // tuple never fired, and an output filter matching the original TCP/UDP
+    // flow could wrongly drop the ICMP error. A parse failure of our own
+    // built bytes fails CLOSED (drop + dedicated counter, §6.2).
+    //
+    // #3026: classify on the LOGICAL egress ifindex (`ingress_ident.ifindex`,
+    // the unit ifindex that keys `forwarding.egress`), NOT `target_ifindex`.
+    // CoS interfaces (forwarding_build/cos.rs) and output filters
+    // (filter/compiler.rs) are keyed by the logical unit ifindex; on a VLAN
+    // subinterface `bind_ifindex` (hence `target_ifindex`) is the physical
+    // parent index, so classifying by it missed the subinterface's CoS
+    // queue / DSCP rewrite / output filter. `target_ifindex` (physical) is
+    // still used for the XSK transmit below. For a non-VLAN port the logical
+    // and physical indexes coincide, so this is a no-op there.
+    let verdict =
+        classify_generated_reply(forwarding, ingress_ident.ifindex, &prebuilt_frame, now_ns);
     if verdict.drop {
         counters.touched = true;
         if verdict.parse_error {

@@ -978,9 +978,25 @@ pub(super) fn poll_binding_process_descriptor(
                         // #919/#922: zero-allocation zone-pair resolution
                         // direct from u16 IDs — no String materialisation
                         // on the per-flow miss path.
-                        let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
+                        //
+                        // #3021: resolve the LOGICAL ingress ifindex first.
+                        // `ifindex_to_zone_id` is keyed by the logical unit
+                        // ifindex (forwarding_build/interfaces.rs:76); a VLAN
+                        // subinterface's physical bind ifindex maps only to its
+                        // parent's FIRST-subinterface zone, so the raw physical
+                        // index would evaluate the wrong zone-pair policy on a
+                        // parent carrying multiple VLAN units in distinct zones.
+                        // Mirrors filter.rs / cos_classify.rs; non-VLAN ports
+                        // resolve physical == logical (unchanged).
+                        let ingress_logical = resolve_ingress_logical_ifindex(
                             worker_ctx.forwarding,
                             meta.ingress_ifindex as i32,
+                            meta.ingress_vlan_id,
+                        )
+                        .unwrap_or(meta.ingress_ifindex as i32);
+                        let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
+                            worker_ctx.forwarding,
+                            ingress_logical,
                             ingress_zone_override,
                             resolution.egress_ifindex,
                         );
@@ -2759,9 +2775,20 @@ pub(super) fn poll_binding_process_descriptor(
                             // resolution. Computed at the TOP of the arm so
                             // the #1913 policy gate below can run BEFORE the
                             // negative-cache fast-fail / resolver enqueue.
-                            let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
+                            //
+                            // #3021: resolve the LOGICAL ingress ifindex first
+                            // (see the ForwardCandidate arm above) so a VLAN
+                            // subinterface evaluates its OWN ingress zone, not
+                            // the parent's first-subinterface zone.
+                            let ingress_logical = resolve_ingress_logical_ifindex(
                                 worker_ctx.forwarding,
                                 meta.ingress_ifindex as i32,
+                                meta.ingress_vlan_id,
+                            )
+                            .unwrap_or(meta.ingress_ifindex as i32);
+                            let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
+                                worker_ctx.forwarding,
+                                ingress_logical,
                                 ingress_zone_override,
                                 decision.resolution.egress_ifindex,
                             );

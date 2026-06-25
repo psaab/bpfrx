@@ -290,13 +290,25 @@ pub(super) fn stage_screen_check(
     let Some(flow) = flow else {
         return StageOutcome::Continue(ScreenCheckOutcome::Pass);
     };
+    // #3022: resolve the LOGICAL ingress ifindex before the zone lookup.
+    // `ifindex_to_zone_id` is keyed by the logical unit ifindex; the raw
+    // physical bind ifindex either misses (no zone on the parent → screen
+    // skipped entirely) or returns the parent's first-subinterface zone
+    // (wrong profile), bypassing/mis-applying screen profiles on VLAN
+    // subinterfaces. Non-VLAN ports resolve physical == logical.
+    let logical_ifindex = resolve_ingress_logical_ifindex(
+        worker_ctx.forwarding,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+    )
+    .unwrap_or(meta.ingress_ifindex as i32);
     let zone_id = ingress_zone_override
         .filter(|id| worker_ctx.forwarding.zone_id_to_name.contains_key(id))
         .or_else(|| {
             worker_ctx
                 .forwarding
                 .ifindex_to_zone_id
-                .get(&(meta.ingress_ifindex as i32))
+                .get(&logical_ifindex)
                 .copied()
         });
     let Some(zone_id) = zone_id else {
@@ -426,13 +438,23 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
     let Some(flow) = flow else {
         return StageOutcome::Continue(SynCookieAckOutcome::Pass);
     };
+    // #3022: resolve the LOGICAL ingress ifindex first (see
+    // `stage_screen_check`) so the SYN-cookie-ACK validation uses the VLAN
+    // subinterface's own zone profile, not the parent's first-subinterface
+    // zone. Non-VLAN ports resolve physical == logical.
+    let logical_ifindex = resolve_ingress_logical_ifindex(
+        worker_ctx.forwarding,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+    )
+    .unwrap_or(meta.ingress_ifindex as i32);
     let zone_id = ingress_zone_override
         .filter(|id| worker_ctx.forwarding.zone_id_to_name.contains_key(id))
         .or_else(|| {
             worker_ctx
                 .forwarding
                 .ifindex_to_zone_id
-                .get(&(meta.ingress_ifindex as i32))
+                .get(&logical_ifindex)
                 .copied()
         });
     let Some(zone_id) = zone_id else {
@@ -1542,5 +1564,233 @@ mod tests {
         assert!(!neighbor_ip_is_learnable(IpAddr::V6(Ipv6Addr::new(
             0xff02, 0, 0, 0, 0, 0, 0, 1
         ))));
+    }
+
+    // ===================================================================
+    // #3021 / #3022 — the ingress ZONE lookup (zone-pair policy for
+    // forwarding, and screen/SYN-cookie zone resolution) must key on the
+    // LOGICAL (VLAN sub-interface) ifindex resolved through
+    // `resolve_ingress_logical_ifindex`, NOT the raw physical
+    // `meta.ingress_ifindex`. `ifindex_to_zone_id` is keyed by the logical
+    // unit ifindex; the parent physical ifindex only ever maps to its
+    // FIRST sub-interface's zone (forwarding_build/interfaces.rs:77), so a
+    // parent carrying two VLAN units in DISTINCT zones would evaluate the
+    // wrong zone — wrong policy (#3021) and the wrong/absent screen
+    // profile (#3022) — for every unit but the first.
+    // ===================================================================
+
+    /// A snapshot with TWO VLAN sub-interfaces on the same physical parent
+    /// (ifindex 11) in DISTINCT zones: `reth0.80` (logical 12, VID 80,
+    /// zone `wan`, the parent's first sub-interface) and `reth0.50`
+    /// (logical 13, VID 50, zone `lan`). The parent ifindex 11 inherits
+    /// only the first sub-interface's zone (`wan`), so a physical-keyed
+    /// lookup for the VID-50 unit returns `wan` instead of its own `lan`.
+    fn two_vlan_distinct_zone_snapshot() -> crate::ConfigSnapshot {
+        let mut snap = super::super::test_fixtures::nat_snapshot();
+        // reth0.80 (logical 12, parent 11, VID 80) is already zone "wan".
+        snap.interfaces.push(crate::InterfaceSnapshot {
+            name: "reth0.50".to_string(),
+            zone: "lan".to_string(),
+            linux_name: "ge-0-0-0.50".to_string(),
+            ifindex: 13,
+            parent_ifindex: 11,
+            redundancy_group: 1,
+            vlan_id: 50,
+            hardware_addr: "02:bf:72:00:50:08".to_string(),
+            addresses: vec![crate::InterfaceAddressSnapshot {
+                family: "inet".to_string(),
+                address: "172.16.50.8/24".to_string(),
+                scope: 0,
+            }],
+            ..Default::default()
+        });
+        snap
+    }
+
+    /// #3021 fail-on-revert. `zone_pair_ids_for_flow_with_override` derives
+    /// the FROM-zone from the ingress ifindex it is handed. The forwarder
+    /// (poll_descriptor/mod.rs) now resolves the logical ifindex first; this
+    /// test proves the VID-50 unit's `from_zone` is its OWN `lan`, and that
+    /// the pre-fix physical-keyed call would return the parent's `wan`. If
+    /// the fix reverts to `meta.ingress_ifindex as i32`, the "correct"
+    /// branch below collapses onto the "pre-fix" value and the distinct-zone
+    /// assert fails RED.
+    #[test]
+    fn forwarding_zone_pair_uses_logical_ingress_ifindex_3021() {
+        use crate::test_zone_ids::{TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID};
+        let forwarding = build_forwarding_state(&two_vlan_distinct_zone_snapshot());
+
+        // Fixture sanity: parent 11 / VID 50 -> logical 13 (zone lan);
+        // parent 11 / VID 80 -> logical 12 (zone wan).
+        assert_eq!(
+            resolve_ingress_logical_ifindex(&forwarding, 11, 50),
+            Some(13),
+            "parent 11 / VLAN 50 must resolve to logical ifindex 13"
+        );
+        assert_eq!(
+            forwarding.ifindex_to_zone_id.get(&13).copied(),
+            Some(TEST_LAN_ZONE_ID),
+            "logical ifindex 13 (reth0.50) is zone lan"
+        );
+
+        // egress is the WAN unit (logical 12) — to_zone is irrelevant here;
+        // we only assert the from_zone (ingress) resolution.
+        let egress_ifindex = 12;
+
+        // Correct (#3021): classify the VID-50 ingress on the LOGICAL
+        // ifindex 13 -> from_zone == lan.
+        let logical = resolve_ingress_logical_ifindex(&forwarding, 11, 50).unwrap();
+        let (from_correct, _) =
+            zone_pair_ids_for_flow_with_override(&forwarding, logical, None, egress_ifindex);
+        assert_eq!(
+            from_correct, TEST_LAN_ZONE_ID,
+            "the VID-50 unit must evaluate its OWN ingress zone (lan)"
+        );
+
+        // Pre-fix: classify on the raw PHYSICAL parent ifindex 11 ->
+        // from_zone == wan (the parent's first-sub-interface zone). This is
+        // the #3021 bug: the VID-50 unit would be policed under wan's
+        // zone-pair, not lan's.
+        let (from_physical, _) =
+            zone_pair_ids_for_flow_with_override(&forwarding, 11, None, egress_ifindex);
+        assert_eq!(
+            from_physical, TEST_WAN_ZONE_ID,
+            "the raw physical parent ifindex 11 wrongly resolves to wan \
+             (the #3021 bug the logical-ifindex resolution fixes)"
+        );
+        assert_ne!(
+            from_correct, from_physical,
+            "logical-keyed (lan) and physical-keyed (wan) FROM-zones must \
+             diverge, proving the fix changes the evaluated zone-pair"
+        );
+    }
+
+    /// #3022 fail-on-revert (literal — drives `stage_screen_check`).
+    /// `source_route_screen()` arms the `ip-source-route` profile ONLY on
+    /// the `lan` zone. A SYN arriving on the VID-50 unit (logical 13, zone
+    /// `lan`, parent physical 11) with an IHL-6 IP header must be DROPPED:
+    /// the stage resolves the logical ifindex 13 -> zone lan -> the armed
+    /// profile fires. If #3022 reverts to `meta.ingress_ifindex` (physical
+    /// 11), the lookup returns the parent's first-sub-interface zone `wan`,
+    /// which has NO profile, the stage returns `Pass`, and the drop assert
+    /// fails RED. The untagged control (logical == physical) still drops,
+    /// keeping the assertion non-tautological / preserving non-VLAN behavior.
+    #[test]
+    fn screen_zone_lookup_uses_logical_ingress_ifindex_3022() {
+        let forwarding = build_forwarding_state(&two_vlan_distinct_zone_snapshot());
+        let ident = BindingIdentity {
+            slot: 0,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("ge-0-0-0"),
+            ifindex: 11,
+        };
+        let binding_lookup = WorkerBindingLookup::default();
+        let mirror_targets = MirrorTargetMap::default();
+        let ha_state = BTreeMap::new();
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+        let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+        let last_resolution = Arc::new(Mutex::new(None));
+        let peer_worker_commands = Vec::new();
+        let dnat_fds = DnatTableFds::default();
+        let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+        let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+            8,
+            DataplaneEventRateLimitConfig {
+                events_per_second: 0,
+                burst: 0,
+            },
+        );
+        let worker_ctx = WorkerContext {
+            ident: &ident,
+            binding_lookup: &binding_lookup,
+            mirror_targets: &mirror_targets,
+            forwarding: &forwarding,
+            ha_state: &ha_state,
+            dynamic_neighbors: &dynamic_neighbors,
+            neighbor_resolver: None,
+            shared_sessions: &shared_sessions,
+            shared_nat_sessions: &shared_nat_sessions,
+            shared_forward_wire_sessions: &shared_forward_wire_sessions,
+            shared_owner_rg_indexes: &shared_owner_rg_indexes,
+            slow_path: None,
+            event_stream: Some(&event_handle),
+            local_tunnel_deliveries: &local_tunnel_deliveries,
+            recent_exceptions: &recent_exceptions,
+            last_resolution: &last_resolution,
+            peer_worker_commands: &peer_worker_commands,
+            dnat_fds: &dnat_fds,
+            rg_epochs: &rg_epochs,
+            cold_path_sample_mask: 0xff,
+        };
+
+        // Source-route SYN arriving on the VID-50 unit. The shim strips the
+        // VLAN tag and conveys the VID out of band in meta (present=0, l3 at
+        // 14), exactly as the ARP/NDP learn tests model it.
+        let frame = tcp_v4_syn_frame_with_l2(Vlan::None, 6);
+        let mut meta = tcp_v4_syn_meta_with_l2(&frame, Vlan::None);
+        meta.ingress_ifindex = 11; // physical parent
+        meta.ingress_vlan_id = 50; // -> logical 13 (zone lan)
+        let flow = parse_session_flow_from_bytes(&frame, meta)
+            .expect("session flow from source-route SYN");
+
+        let mut screen = source_route_screen();
+        let mut counters = BatchCounters::default();
+        let outcome = stage_screen_check(
+            Some(&flow),
+            &frame,
+            meta,
+            None,
+            TEST_NOW_SECS,
+            &mut screen,
+            &mut counters,
+            &worker_ctx,
+        );
+        assert!(
+            matches!(outcome, StageOutcome::RecycleAndContinue),
+            "the VID-50 unit (logical 13, zone lan) must resolve its OWN \
+             lan screen profile and DROP the source-route SYN (#3022); a \
+             physical-keyed lookup resolves zone wan (no profile) and would \
+             wrongly Pass"
+        );
+        assert_eq!(
+            counters.screen_drops, 1,
+            "exactly one screen drop must be recorded for the VID-50 unit"
+        );
+
+        // Counterfactual / non-VLAN preservation: the SAME source-route SYN
+        // on the UNTAGGED reth1.0 (logical == physical == 24, zone lan) is
+        // also dropped — the resolution is identity there, so the fix does
+        // not change non-VLAN behavior, and the drop above is not a fluke of
+        // a globally-armed profile.
+        let mut frame_untagged = tcp_v4_syn_frame_with_l2(Vlan::None, 6);
+        let _ = &mut frame_untagged;
+        let mut meta_untagged = tcp_v4_syn_meta_with_l2(&frame_untagged, Vlan::None);
+        meta_untagged.ingress_ifindex = 24;
+        meta_untagged.ingress_vlan_id = 0;
+        let flow_untagged = parse_session_flow_from_bytes(&frame_untagged, meta_untagged)
+            .expect("session flow from untagged source-route SYN");
+        let mut screen2 = source_route_screen();
+        let mut counters2 = BatchCounters::default();
+        let outcome_untagged = stage_screen_check(
+            Some(&flow_untagged),
+            &frame_untagged,
+            meta_untagged,
+            None,
+            TEST_NOW_SECS,
+            &mut screen2,
+            &mut counters2,
+            &worker_ctx,
+        );
+        assert!(
+            matches!(outcome_untagged, StageOutcome::RecycleAndContinue),
+            "the untagged reth1.0 unit (logical == physical 24, zone lan) \
+             still drops the source-route SYN — non-VLAN behavior unchanged"
+        );
     }
 }
