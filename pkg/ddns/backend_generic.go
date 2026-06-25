@@ -105,7 +105,11 @@ func (b *genericBackend) UpsertLease(ctx context.Context, rec LeaseDNSRecord) er
 	rawURL := renderGenericURL(b.urlTemplate, rec.FQDN, rec.Addr.Unmap().String(), b.username, b.password)
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
-		return fmt.Errorf("ddns generic: %s: build request: %w", b.name, err)
+		// SECURITY: a build-request error (url.Parse) embeds the offending URL,
+		// which carries the %p-expanded password in the query — do NOT propagate
+		// the raw URL. Report the error class only (the operator can see the
+		// template in config; the EXPANDED secret must not reach a log/error).
+		return fmt.Errorf("ddns generic: %s: malformed rendered update URL (redacted)", b.name)
 	}
 	// If the operator also set username/password (and did NOT thread them through
 	// the template), offer them via Basic auth too — harmless if the server

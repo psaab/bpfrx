@@ -186,3 +186,131 @@ func TestEngineSecretsNeverLogged(t *testing.T) {
 		t.Fatalf("publish error leaked the secret: %q", err.Error())
 	}
 }
+
+// TestHTTPBackendErrorsNeverLeakSecret exercises the error path of every HTTP
+// backend (generic %p-in-URL, cloudflare token, route53 secret key) and asserts
+// no secret reaches the returned error. The generic backend is the highest-risk
+// (the password is rendered into the query) so it is tested through a failing
+// transport AND a malformed-URL render (#2691 P3 review MINOR).
+func TestHTTPBackendErrorsNeverLeakSecret(t *testing.T) {
+	const secret = "LEAK-CANARY-7c1d"
+
+	t.Run("generic-transport-error", func(t *testing.T) {
+		// A closed server makes the request a transport error whose *url.Error
+		// embeds the full URL+query (the %p-expanded password).
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		closedURL := srv.URL
+		srv.Close()
+		b, err := newGenericBackend(&config.DDNSProvider{
+			Name: "g", Backend: "generic",
+			URLTemplate: closedURL + "/u?h=%h&i=%i&p=%p",
+			Password:    config.Secret(secret),
+		})
+		if err != nil {
+			t.Fatalf("newGenericBackend: %v", err)
+		}
+		err = b.UpsertLease(context.Background(), hostRecord(t, "h.example.net", "93.184.216.34"))
+		if err == nil {
+			t.Fatal("expected a transport error against the closed server")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("generic transport error leaked the %%p password: %q", err.Error())
+		}
+	})
+
+	t.Run("generic-malformed-url", func(t *testing.T) {
+		// A control byte in the password makes the rendered URL unparseable,
+		// hitting the build-request error path — which must not echo the secret.
+		b, err := newGenericBackend(&config.DDNSProvider{
+			Name: "g", Backend: "generic",
+			URLTemplate: "https://x/u?p=%p",
+			Password:    config.Secret("\x7f" + secret),
+		})
+		if err != nil {
+			t.Fatalf("newGenericBackend: %v", err)
+		}
+		err = b.UpsertLease(context.Background(), hostRecord(t, "h.example.net", "93.184.216.34"))
+		if err != nil && strings.Contains(err.Error(), secret) {
+			t.Fatalf("generic malformed-url error leaked the password: %q", err.Error())
+		}
+	})
+
+	t.Run("cloudflare-auth-error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		defer srv.Close()
+		b, err := newCloudflareBackend(&config.DDNSProvider{
+			Name: "cf", Backend: "cloudflare", APIToken: config.Secret(secret),
+			Zone: "example.net", Server: srv.URL,
+		})
+		if err != nil {
+			t.Fatalf("newCloudflareBackend: %v", err)
+		}
+		err = b.UpsertLease(context.Background(), hostRecord(t, "wan.example.net", "93.184.216.34"))
+		if err == nil || strings.Contains(err.Error(), secret) {
+			t.Fatalf("cloudflare error must be non-nil and not leak the token: %v", err)
+		}
+	})
+
+	t.Run("route53-error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`<?xml version="1.0"?><ErrorResponse><Error><Code>AccessDenied</Code><Message>x</Message></Error></ErrorResponse>`))
+		}))
+		defer srv.Close()
+		b, err := newRoute53Backend(&config.DDNSProvider{
+			Name: "r53", Backend: "route53",
+			AWSAccessKeyID: "AKID", AWSSecretAccessKey: config.Secret(secret),
+			AWSRegion: "us-east-1", HostedZoneID: "Z123", Server: srv.URL,
+		})
+		if err != nil {
+			t.Fatalf("newRoute53Backend: %v", err)
+		}
+		err = b.UpsertLease(context.Background(), hostRecord(t, "wan.example.net", "93.184.216.34"))
+		if err == nil || strings.Contains(err.Error(), secret) {
+			t.Fatalf("route53 error must be non-nil and not leak the secret key: %v", err)
+		}
+	})
+}
+
+// TestEngineNoBackendNoPhantomOwnership is the fail-on-revert proof for the
+// #2691 P3 review MAJOR: an HTTP provider whose constructor errors on a missing
+// credential degrades to the no-op backend, and a publish through it must NOT
+// count an upsertOK, must NOT record (phantom) ownership, and must NOT advance
+// the last-published cache (so it re-attempts every cycle once the credential is
+// added). Reverting the isNopUpdater guard in publishLocked turns this RED.
+func TestEngineNoBackendNoPhantomOwnership(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	m := newHTTPEngineManager(t, func() time.Time { return now })
+
+	// cloudflare with NO api-token / NO zone → newCloudflareBackend errors →
+	// newSurfaceAHTTP degrades to nopUpdater{}.
+	sc := SurfaceAScope{
+		Key:      ScopeKey{Family: FamilyV4, Interface: "ge-0-0-2", Unit: 50, PolicyID: "cf"},
+		FQDN:     "wan.example.net",
+		TTL:      300,
+		Source:   AddressSourceInterface,
+		Provider: &config.DDNSProvider{Name: "cf", Backend: "cloudflare"}, // missing creds
+	}
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("93.184.216.34"), nil, nil); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	st := m.Stats()
+	if st.UpsertOK != 0 {
+		t.Fatalf("a no-backend publish must NOT count an upsertOK; got %d", st.UpsertOK)
+	}
+	if st.SkippedNoBackend != 1 {
+		t.Fatalf("expected one no-backend skip, got %+v", st)
+	}
+	if st.Scopes != 0 {
+		t.Fatalf("a no-backend publish must NOT record (phantom) ownership; got %d owned records", st.Scopes)
+	}
+	// rt.lastAddr must NOT be set → a second pass re-attempts.
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("93.184.216.34"), nil, nil); err != nil {
+		t.Fatalf("Reconcile2: %v", err)
+	}
+	if st2 := m.Stats(); st2.SkippedNoBackend != 2 {
+		t.Fatalf("a no-backend scope must re-attempt every cycle; got SkippedNoBackend=%d", st2.SkippedNoBackend)
+	}
+}

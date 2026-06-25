@@ -87,13 +87,36 @@ func doRequest(ctx context.Context, client *http.Client, req *http.Request) (int
 	req = req.WithContext(ctx)
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("ddns http: request failed: %w", err)
+		// SECURITY: client.Do returns a *url.Error whose Error() string embeds the
+		// FULL request URL — including the query, which for the generic backend
+		// carries the %p-expanded password. Scrub it to the transport error class
+		// + a query-stripped URL so no secret reaches a log/error string.
+		return 0, nil, fmt.Errorf("ddns http: request failed: %s", scrubURLError(err))
 	}
 	body, rerr := readCappedBody(resp)
 	if rerr != nil {
 		return resp.StatusCode, nil, fmt.Errorf("ddns http: read response: %w", rerr)
 	}
 	return resp.StatusCode, body, nil
+}
+
+// scrubURLError renders an HTTP-client error without leaking secrets carried in
+// the request URL's userinfo/query. A *url.Error embeds the full URL in its
+// Error() string; we replace it with the same URL stripped of userinfo and query
+// (the host+path are not sensitive). Any other error is returned verbatim (it
+// never carries the URL).
+func scrubURLError(err error) string {
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		return err.Error()
+	}
+	safe := ue.URL
+	if u, perr := url.Parse(ue.URL); perr == nil {
+		u.RawQuery = ""
+		u.User = nil
+		safe = u.Redacted()
+	}
+	return fmt.Sprintf("%s %q: %v", ue.Op, safe, ue.Err)
 }
 
 // queryEscape URL-query-escapes a value for safe insertion into a generic

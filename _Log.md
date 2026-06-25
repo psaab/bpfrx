@@ -14526,3 +14526,35 @@ top.
   ./pkg/daemon/... green; go test -race ./pkg/ddns/... green; go vet clean;
   gofmt clean. Deferred (parent lab gate): a LIVE publish against a real
   provider (no creds/network in CI — mock-server tests are the merge gate).
+
+## 2026-06-25 — #2691 P3 review folds (PR #2722): no-backend guard + generic URL-error redaction
+
+- **Timestamp**: 2026-06-25
+- **Action**: Addressed the two MERGE-NEEDS-MINOR review folds on PR #2722.
+  MAJOR (ship-blocker): publishLocked lacked the isNopUpdater guard, so a
+  half-configured HTTP provider (e.g. `backend cloudflare` with no api-token →
+  newSurfaceAHTTP degrades to nopUpdater{}) write-aheaded phantom ownership,
+  counted a false upsertOK, logged "published record", and advanced
+  rt.lastAddr/lastPublished while publishing NOTHING to any wire — so the scope
+  would not re-attempt until the forced-refresh floor elapsed. FIX: added an
+  isNopUpdater(backend) guard at the top of publishLocked (after backendFor)
+  that increments a new skippedNoBackend counter, records NO ownership, and
+  returns a typed errSurfaceANoBackend sentinel; reconcileScopeLocked treats
+  the sentinel as a counted no-backend skip that does NOT arm error backoff and
+  does NOT advance the last-published cache, so the scope re-attempts every
+  cycle once the credential is added. Mirrors manager.go upsertLocked's
+  skippedNoBackend handling. Exposed SkippedNoBackend in SurfaceAStats.
+  MINOR (security): the generic backend's build-request error embedded the
+  %p-expanded password (rendered into the URL query); fixed to a redacted
+  message. Hardened the shared doRequest to scrub a *url.Error's URL
+  (strip userinfo + query via url.Redacted) — defense-in-depth for the
+  transport-error path used by ALL backends.
+- **Tests**: TestEngineNoBackendNoPhantomOwnership (fail-on-revert: VERIFIED
+  RED without the guard — "must NOT count an upsertOK; got 1" — GREEN with it);
+  TestHTTPBackendErrorsNeverLeakSecret extends the no-leak property to
+  generic (transport + malformed-URL), cloudflare, and route53 error paths.
+- **File(s)**: pkg/ddns/surface_a.go (guard + sentinel + counter + stats),
+  pkg/ddns/backend_http.go (scrubURLError in doRequest), pkg/ddns/backend_generic.go
+  (redacted build-request error), pkg/ddns/surface_a_http_test.go (two new tests).
+- **Gates**: go build ./... clean; go test ./pkg/ddns ./pkg/config ./pkg/daemon
+  green; go test -race ./pkg/ddns green; go vet clean; gofmt clean (touched files).

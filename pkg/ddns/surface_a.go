@@ -189,6 +189,15 @@ type SurfaceAManager struct {
 	deleteFail uint64
 	skipped    uint64 // unchanged-and-not-yet-forced skips
 	backedOff  uint64 // scopes skipped this pass because still in error backoff
+	// skippedNoBackend counts scopes skipped because the provider resolved to the
+	// no-op backend (a half-configured HTTP provider whose constructor errored on
+	// a missing credential — newSurfaceAHTTP degrades to nopUpdater{}). Such a
+	// scope publishes NOTHING to any wire, so it must NOT count as an upsertOK,
+	// must NOT write-ahead phantom ownership, and must NOT advance the
+	// last-published cache — so it re-attempts every cycle once the operator adds
+	// the credential (mirrors manager.go upsertLocked's skippedNoBackend, #2691
+	// P3 review MAJOR).
+	skippedNoBackend uint64
 }
 
 // NewSurfaceAManager constructs the production Surface A manager (plan §5.5). It
@@ -485,6 +494,14 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 	}
 
 	if err := m.publishLocked(ctx, sc, addr, now); err != nil {
+		if errors.Is(err, errSurfaceANoBackend) {
+			// No live backend (half-configured provider): nothing was attempted on
+			// the wire. Do NOT arm error backoff and do NOT advance the
+			// last-published cache — leave rt untouched so the scope re-attempts
+			// every cycle once the operator adds the credential. Swallow the
+			// sentinel (not a pass error).
+			return nil
+		}
 		m.recordScopeError(rt, sc, err, now)
 		return err
 	}
@@ -506,6 +523,13 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 // in place (no stale old-address entry, never a withdraw-then-add gap).
 const surfaceAIdentity = "router-self"
 
+// errSurfaceANoBackend is returned by publishLocked when the scope's provider
+// resolved to the no-op backend (a half-configured HTTP provider). It is NOT a
+// failure to back off on — nothing was attempted on the wire — and NOT a success
+// (no ownership, no last-published advance). reconcileScopeLocked treats it as a
+// counted no-backend skip that re-attempts next cycle (#2691 P3 review MAJOR).
+var errSurfaceANoBackend = errors.New("ddns surface-a: no live backend for provider")
+
 // publishLocked publishes the scope's record through the resolved Backend and
 // records ownership write-ahead (the same durability discipline as the lease
 // path, #2662). The ownership key fixes Address="" so a scope owns exactly one
@@ -518,6 +542,21 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 	if err != nil {
 		m.upsertFail++
 		return err
+	}
+	if isNopUpdater(backend) {
+		// The provider degraded to the no-op backend (a half-configured HTTP
+		// provider whose constructor errored on a missing credential, e.g.
+		// `backend cloudflare` with no api-token). Publishing NOTHING to any wire:
+		// do NOT write-ahead ownership (it would be phantom — an RR that does not
+		// exist), do NOT count an upsertOK (the counter would lie), and signal the
+		// caller (errSurfaceANoBackend) so it leaves the last-published cache
+		// untouched and re-attempts next cycle once the credential is added. This
+		// mirrors manager.go upsertLocked's skippedNoBackend handling. The commit
+		// warning already told the operator the provider is incomplete.
+		m.skippedNoBackend++
+		slog.Debug("ddns surface-a: provider resolved to no-op backend; skipping publish (no ownership, will re-attempt)",
+			"fqdn", sc.FQDN, "provider", sc.Key.PolicyID)
+		return errSurfaceANoBackend
 	}
 	ttl := sc.TTL
 	if ttl <= 0 {
@@ -743,13 +782,14 @@ func (m *SurfaceAManager) StatusViews() []SurfaceAStatusView {
 
 // SurfaceAStats is the counter snapshot for `show` + Prometheus (plan §5.5).
 type SurfaceAStats struct {
-	Scopes     int
-	UpsertOK   uint64
-	UpsertFail uint64
-	DeleteOK   uint64
-	DeleteFail uint64
-	Skipped    uint64
-	BackedOff  uint64
+	Scopes           int
+	UpsertOK         uint64
+	UpsertFail       uint64
+	DeleteOK         uint64
+	DeleteFail       uint64
+	Skipped          uint64
+	BackedOff        uint64
+	SkippedNoBackend uint64
 }
 
 // Stats returns the current Surface A counters.
@@ -757,13 +797,14 @@ func (m *SurfaceAManager) Stats() SurfaceAStats {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return SurfaceAStats{
-		Scopes:     len(m.state.records),
-		UpsertOK:   m.upsertOK,
-		UpsertFail: m.upsertFail,
-		DeleteOK:   m.deleteOK,
-		DeleteFail: m.deleteFail,
-		Skipped:    m.skipped,
-		BackedOff:  m.backedOff,
+		Scopes:           len(m.state.records),
+		UpsertOK:         m.upsertOK,
+		UpsertFail:       m.upsertFail,
+		DeleteOK:         m.deleteOK,
+		DeleteFail:       m.deleteFail,
+		Skipped:          m.skipped,
+		BackedOff:        m.backedOff,
+		SkippedNoBackend: m.skippedNoBackend,
 	}
 }
 
