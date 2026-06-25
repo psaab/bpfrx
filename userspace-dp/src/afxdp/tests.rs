@@ -1519,6 +1519,120 @@ fn build_local_time_exceeded_request_ignores_trigger_matching_output_filter() {
     assert_eq!(counters.generated_reply_classify_parse_errors, 0);
 }
 
+/// #3026 LITERAL fail-on-revert. Drives the real
+/// `build_local_time_exceeded_request` with a VLAN egress where the LOGICAL
+/// unit (ifindex 12) carries an output `then discard protocol icmp` filter
+/// but the PHYSICAL parent (bind_ifindex 11) does NOT. The fix classifies the
+/// generated ICMP reply on the LOGICAL egress ifindex (`ingress_ident.ifindex`
+/// = 12), so the filter fires and the reply is dropped. If the production site
+/// is reverted to classify on `target_ifindex` (= egress.bind_ifindex = the
+/// physical parent 11, which has no filter), the reply is NOT dropped, the
+/// builder returns `Some`, and the `request.is_none()` assert fails RED.
+#[test]
+fn build_local_time_exceeded_request_classifies_on_logical_egress_3026() {
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
+    // TRIGGER is a UDP flow; the generated reply is ICMP (proven elsewhere).
+    let frame = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client_ip, dst_ip, 1);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        pkt_len: 128,
+        ..UserspaceDpMeta::default()
+    };
+    let desc = XdpDesc {
+        addr: 4096,
+        len: frame.len() as u32,
+        options: 0,
+    };
+    // The egress is resolved on the LOGICAL unit ifindex 12 (reth0.80) — the
+    // value the builder uses as ingress_ident.ifindex to key forwarding.egress.
+    let ingress_ident = BindingIdentity {
+        slot: 0,
+        queue_id: 7,
+        worker_id: 0,
+        interface: Arc::<str>::from("reth0.80"),
+        ifindex: 12,
+    };
+    let flow = icmp_suppress_flow_v4(client_ip, dst_ip);
+    // OUTPUT filter on the LOGICAL VLAN unit (ifindex 12) with a terminal
+    // `discard` for `protocol icmp`. The PHYSICAL parent (ifindex 11) is given
+    // NO output filter — so a physical-keyed classification would miss it.
+    let filter_state = crate::filter::parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "drop-icmp-out".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-icmp".into(),
+                action: "discard".into(),
+                protocols: vec!["icmp".into()],
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &[crate::InterfaceSnapshot {
+            name: "reth0.80".into(),
+            ifindex: 12,
+            parent_ifindex: 11,
+            vlan_id: 80,
+            filter_output_v4: "drop-icmp-out".into(),
+            ..Default::default()
+        }],
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+    let mut forwarding = ForwardingState {
+        filter_state,
+        tx_selection_enabled_v4: true,
+        ..ForwardingState::default()
+    };
+    // Egress keyed by the LOGICAL ifindex 12; bind_ifindex 11 is the physical
+    // parent (= target_ifindex, the pre-fix classification key).
+    forwarding.egress.insert(
+        12,
+        EgressInterface {
+            bind_ifindex: 11,
+            vlan_id: 80,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+            zone_id: TEST_WAN_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4: Some(Ipv4Addr::new(172, 16, 80, 8)),
+            primary_v6: None,
+        },
+    );
+
+    let mut counters = BatchCounters::default();
+    let request = build_local_time_exceeded_request(
+        &frame,
+        desc,
+        meta,
+        &ingress_ident,
+        &flow,
+        &forwarding,
+        &Arc::new(ShardedNeighborMap::new()),
+        &BTreeMap::new(),
+        0,
+        &mut counters,
+    );
+
+    assert!(
+        request.is_none(),
+        "the VLAN unit's OWN output filter (on logical ifindex 12) must drop \
+         the generated ICMP reply (#3026); classifying on the physical parent \
+         (bind_ifindex 11, no filter) would wrongly admit it"
+    );
+    assert_eq!(
+        counters.time_exceeded_output_filter_drops, 1,
+        "the logical-egress output-filter drop must land on the TE counter"
+    );
+    assert_eq!(counters.generated_reply_classify_parse_errors, 0);
+}
+
 /// Build a `ForwardingState.filter_state` with a single egress (output) v4
 /// firewall filter on ifindex 5 carrying one term (#2238 test helper).
 fn build_output_filter_state(
@@ -4169,6 +4283,238 @@ fn poll_descriptor_policy_deny_path_emits_rt_flow_event() {
     );
     assert_eq!(event_handle.dataplane_event_stats().policy_deny.sent, 1);
     assert!(telemetry.dbg.policy_deny >= 1);
+}
+
+/// #3021 LITERAL fail-on-revert. Drives the real
+/// `poll_binding_process_descriptor` deny path with the ingress on a VLAN
+/// SUB-INTERFACE whose LOGICAL unit (ifindex 13, zone `lan`) is in a
+/// DIFFERENT zone than its physical parent (ifindex 11, zone `wan` — the
+/// parent inherits its FIRST sub-interface reth0.80's wan zone). The emitted
+/// PolicyDeny event's `ingress_zone_id` is the from-zone the zone-pair
+/// lookup resolves. The #3021 fix resolves the logical ifindex 13 -> `lan`,
+/// so the event reports lan. If the production site is reverted to
+/// `meta.ingress_ifindex` (physical 11), the lookup resolves the parent's
+/// `wan` zone and the `ingress_zone_id == TEST_LAN_ZONE_ID` assert fails RED.
+/// (Both lan->wan and wan->wan are denied by the deny default — only dmz->wan
+/// is permitted — so the deny event fires either way; only the reported
+/// ingress zone distinguishes the fix from the bug.)
+#[test]
+fn poll_descriptor_policy_deny_keys_logical_ingress_zone_3021() {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.zones = vec![
+        ZoneSnapshot {
+            name: "lan".to_string(),
+            id: TEST_LAN_ZONE_ID,
+        },
+        ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+        },
+        ZoneSnapshot {
+            name: "dmz".to_string(),
+            id: TEST_DMZ_ZONE_ID,
+        },
+    ];
+    // Add a SECOND VLAN sub-interface (logical ifindex 13, VID 50) on the
+    // SAME physical parent (ifindex 11) as reth0.80, but in zone `lan`. The
+    // parent ifindex 11 keeps reth0.80's wan zone (first sub-interface),
+    // so the logical (13->lan) and physical (11->wan) ingress zones diverge.
+    snapshot.interfaces.push(crate::InterfaceSnapshot {
+        name: "reth0.50".to_string(),
+        zone: "lan".to_string(),
+        linux_name: "ge-0-0-0.50".to_string(),
+        ifindex: 13,
+        parent_ifindex: 11,
+        vlan_id: 50,
+        hardware_addr: "02:bf:72:00:50:08".to_string(),
+        addresses: vec![crate::InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "172.16.50.8/24".to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    });
+    snapshot.neighbors = vec![NeighborSnapshot {
+        interface: "ge-0-0-0.80".to_string(),
+        ifindex: 12,
+        family: "inet".to_string(),
+        ip: "172.16.80.200".to_string(),
+        mac: "00:aa:bb:cc:dd:ee".to_string(),
+        state: "reachable".to_string(),
+        router: false,
+        link_local: false,
+    }];
+
+    let forwarding = build_forwarding_state(&snapshot);
+    // Sanity: the fixture really maps (parent 11, VID 50) -> logical 13 (lan)
+    // while the physical parent 11 resolves to wan.
+    assert_eq!(
+        crate::afxdp::forwarding::resolve_ingress_logical_ifindex(&forwarding, 11, 50),
+        Some(13),
+        "fixture must map parent 11 / VLAN 50 -> logical ifindex 13"
+    );
+    assert_eq!(
+        forwarding.ifindex_to_zone_id.get(&13).copied(),
+        Some(TEST_LAN_ZONE_ID),
+        "logical ifindex 13 (reth0.50) is zone lan"
+    );
+    assert_eq!(
+        forwarding.ifindex_to_zone_id.get(&11).copied(),
+        Some(TEST_WAN_ZONE_ID),
+        "physical parent ifindex 11 inherits reth0.80's wan zone"
+    );
+
+    // The physical port the VLAN sub-interface rides on is ifindex 11.
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 11, 0);
+    binding.interface = Arc::<str>::from("ge-0-0-0");
+    let frame = build_policy_deny_tcp_syn_frame();
+    let meta_len = std::mem::size_of::<UserspaceDpMeta>();
+    let frame_offset = 128;
+    let meta_offset = frame_offset - meta_len;
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: meta_len as u16,
+        // Physical parent + out-of-band VID (the shim strips the tag and
+        // conveys the VID in meta; the frame stays untagged so l3 is at 14).
+        ingress_ifindex: 11,
+        ingress_vlan_id: 50,
+        ingress_vlan_present: 0,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 54,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_SYN,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    let meta_bytes = unsafe {
+        std::slice::from_raw_parts((&meta as *const UserspaceDpMeta).cast::<u8>(), meta_len)
+    };
+    unsafe {
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(meta_offset, meta_len)
+            .expect("meta slice")
+            .copy_from_slice(meta_bytes);
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(frame_offset, frame.len())
+            .expect("frame slice")
+            .copy_from_slice(&frame);
+    }
+    binding.xsk.rx.push_for_test(XdpDesc {
+        addr: frame_offset as u64,
+        len: frame.len() as u32,
+        options: 0,
+    });
+
+    let ident = binding.identity();
+    let binding_lookup = WorkerBindingLookup::from_bindings(std::slice::from_ref(&binding));
+    let mirror_targets = MirrorTargetMap::default();
+    let ha_state = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let (event_handle, event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let worker_ctx = WorkerContext {
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        mirror_targets: &mirror_targets,
+        forwarding: &forwarding,
+        ha_state: &ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        neighbor_resolver: None,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        slow_path: None,
+        event_stream: Some(&event_handle),
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
+    };
+    let mut sessions = SessionTable::new();
+    let mut screen = ScreenState::new();
+    let mut batch = BatchCounters::default();
+    let mut dbg = DebugPollCounters::default();
+    let mut telemetry = TelemetryContext {
+        dbg: &mut dbg,
+        counters: &mut batch,
+    };
+    let area_ptr = binding.umem.area() as *const MmapArea;
+
+    poll_binding_process_descriptor(
+        &mut binding,
+        0,
+        area_ptr,
+        1,
+        &mut sessions,
+        &mut screen,
+        ValidationState {
+            snapshot_installed: true,
+            config_generation: 7,
+            fib_generation: 9,
+        },
+        123_000_000_000,
+        123,
+        0,
+        0,
+        -1,
+        -1,
+        &worker_ctx,
+        &mut telemetry,
+    );
+
+    let event = event_rx
+        .try_recv()
+        .expect("policy-deny event from poll descriptor")
+        .decode_dataplane_event()
+        .expect("policy-deny payload");
+    assert_eq!(
+        event.kind,
+        crate::event_stream::codec::DataplaneEventKind::PolicyDeny
+    );
+    // The load-bearing assert: the deny event's ingress zone is the LOGICAL
+    // sub-interface zone (lan, ifindex 13), NOT the physical parent's wan
+    // (ifindex 11). Reverting the production site to meta.ingress_ifindex
+    // makes this report wan and the test fails RED.
+    assert_eq!(
+        event.ingress_zone_id, TEST_LAN_ZONE_ID,
+        "the VLAN sub-interface's OWN logical ingress zone (lan) must drive \
+         the zone-pair policy (#3021); a physical-keyed lookup reports wan"
+    );
+    assert_ne!(
+        event.ingress_zone_id, TEST_WAN_ZONE_ID,
+        "the physical parent's wan zone must NOT be used for the VLAN unit"
+    );
+    assert_eq!(event.egress_zone_id, TEST_WAN_ZONE_ID);
+    assert_eq!(event.ingress_ifindex, 11);
+    assert_eq!(event_handle.dataplane_event_stats().policy_deny.sent, 1);
 }
 
 /// #2617 harness: drive a single LAN→WAN TCP-SYN session-miss packet through

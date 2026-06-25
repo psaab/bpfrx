@@ -18535,3 +18535,26 @@ top.
   userspace-dp/src/afxdp/poll_stages.rs, userspace-dp/src/afxdp/icmp.rs,
   userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
   userspace-dp/src/afxdp/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #3021/#3026 review follow-up (MERGE-NEEDS-MINOR, test strength
+  only — production fix unchanged) — upgrade the #3021 and #3026 counterfactual
+  pins to LITERAL fail-on-revert tests driving the real production call sites.
+  #3021: poll_descriptor_policy_deny_keys_logical_ingress_zone_3021 drives
+  poll_binding_process_descriptor with the deny path ingressing on a VLAN
+  sub-interface (logical ifindex 13, zone lan) on parent 11 (zone wan), and
+  asserts the emitted PolicyDeny event.ingress_zone_id == lan. Reverting the
+  production site to meta.ingress_ifindex reports wan -> RED (verified, panic
+  at the ingress_zone_id assert). #3026:
+  build_local_time_exceeded_request_classifies_on_logical_egress_3026 drives
+  build_local_time_exceeded_request with a VLAN egress where the LOGICAL unit
+  (ifindex 12) carries an output `then discard protocol icmp` filter but the
+  physical parent (bind_ifindex 11) does not, and asserts request.is_none() +
+  time_exceeded_output_filter_drops == 1. Reverting the production site to
+  target_ifindex classifies on the unfiltered parent -> admits -> RED
+  (verified, panic at request.is_none()). The original counterfactual pins
+  are retained as additional coverage. The #3022 literal test from the prior
+  round is unchanged. Gates: cargo build --release clean; zone_pair 9,
+  screen 137, classify_generated_reply 6, poll_descriptor 24 all green; full
+  bins 2919 passed + the same pre-existing worker_queue flake.
+- **File(s)**: userspace-dp/src/afxdp/tests.rs, _Log.md
