@@ -1,3 +1,27 @@
+## 2026-06-25 — #3010: proxy-ARP/NDP VLAN sub-interface ifindex resolution
+
+- **Timestamp**: 2026-06-25
+- **Action**: `proxyARPIfaceMap` (pkg/daemon/daemon_proxyarp.go) stripped
+  the `.unit` suffix and resolved only the PARENT link via
+  `RethToPhysical` + `LinuxIfName(base)`, storing the parent ifindex for
+  a VLAN sub-interface entry (e.g. `reth0.50`, `ge-0/0/0.100`). Linux
+  `proxy_arp`/`proxy_ndp` are per-netdev, so the per-interface sysctl
+  (and NTF_PROXY scope) landed on the parent netdev and the VLAN
+  sub-interface was left silent — proxy-ARP/NDP on any VLAN
+  sub-interface was non-functional. Fixed by resolving each entry via
+  `cfg.ResolveKernelIfName(entry.Interface)`, the centralized Junos-ref
+  → Linux-netdev resolver, which maps a tagged unit to its 802.1Q VLAN
+  ID (which can differ from the unit number), collapses unit 0 onto the
+  bare parent, preserves the #2195 RETH-physical resolution, and handles
+  the st<N>/IRB/tunnel special cases. Added a fail-on-revert test
+  (`TestProxyARPIfaceMap_ResolvesVLANSubinterfaceToOwnNetdev`) using a
+  VLAN ID (100) deliberately different from the unit number (3): RED if
+  reverted to the parent-ifindex / drop-`.unit` / naive `.unit`-reappend
+  behavior. Updated the RETH test to model a unit and use `reth0.0`
+  (unit-0 collapse) so it stays a clean RETH-physical guard. Updated the
+  module doc comments + `docs/feature-gaps.md` Proxy ARP row.
+- **File(s)**: pkg/daemon/daemon_proxyarp.go,
+  pkg/daemon/daemon_proxyarp_test.go, docs/feature-gaps.md, _Log.md
 ## 2026-06-25 — #2995: WG recvmsg endpoint preserves sin6_scope_id (link-local v6)
 
 - **Timestamp**: 2026-06-25
@@ -18291,6 +18315,23 @@ top.
   pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2970 — make userspace-dp helper socket-buffer sysctls raise-only.
+  The helper's `run()` (server/lifecycle.rs) unconditionally wrote 16 MiB to
+  the host-global `rmem_default`/`rmem_max` sysctls on every start, clobbering
+  the 64 MiB the Go control plane (`tuneSocketBuffers`,
+  pkg/dataplane/userspace/process.go) had just raised them to (raise-only,
+  desired=67108864). Fix: pure `raise_only_value(current, target)` (returns
+  Some(target) only when current < target) + `raise_sysctl(path, target)`
+  wrapper; loop over all four sysctls (added wmem_* to match Go) with
+  `SOCKBUF_TARGET = 67108864` aligned to the Go constant. Fail-on-revert tests
+  in `sockbuf_raise_only_tests`: `raise_sysctl_preserves_higher_value_on_disk`
+  pre-seeds a temp file with 64 MiB and asserts the helper leaves it (RED if
+  reverted to the unconditional 16 MiB write); `does_not_lower_a_higher_existing_value`
+  + `target_matches_go_control_plane` pin the contract.
+  Gates: CARGO_TARGET_DIR=/tmp/cargo-2970 cargo build --release PASS; cargo
+  test sockbuf PASS.
+- **File(s)**: userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/src/server/README.md, _Log.md
 - **Action**: networkd batch #2987/#2988 caller-reach fix (hostile-review
   MERGE-NEEDS-MINOR). The library fixes did not reach production: the only
   caller (pkg/daemon/daemon_apply.go step 2.5) guarded networkd.Apply with
@@ -18337,3 +18378,19 @@ top.
   recvFn test seams updated to the (int, int, error) signature.
   **File(s)**: pkg/lldp/lldp.go, pkg/lldp/socket_test.go, pkg/lldp/README.md,
   _Log.md
+- **Action**: #3012 dhcp-relay read-buffer sizing — both the client-facing
+  (runRelay) and server-facing (handleServerResponses) UDP reads used a fixed
+  make([]byte, 1500). net.PacketConn.ReadFrom (UDP) MSG_TRUNCs a datagram to
+  len(buf), so a >1500-byte DHCP datagram (large option sets / jumbo-MTU links)
+  had its trailing option block truncated, dhcpv4.FromBytes failed, and the
+  packet was silently dropped. Added a named const readBufSize = 65535 (UDP/IP
+  maximum) and pointed both read sites at it. Added fail-on-revert test
+  TestRunRelay_RelaysOversizeDatagram: builds a 1858-byte BOOTREQUEST (large
+  vendor-specific option), drives it through the live runRelay loop, asserts it
+  is relayed to the server conn, parses, and the large option survives intact.
+  fakeConn.ReadFrom uses copy(p,d) which mirrors MSG_TRUNC, so reverting
+  readBufSize to 1500 makes the test RED (verified: drop, "not relayed within
+  2s"). Gates: go build ./... OK, gofmt clean, go vet ./pkg/dhcprelay/... OK,
+  go test ./pkg/dhcprelay/... ok.
+- **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/dhcprelay/README.md, _Log.md

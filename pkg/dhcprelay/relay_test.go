@@ -180,6 +180,78 @@ func TestRunRelay_RelaysInform(t *testing.T) {
 	}
 }
 
+// TestRunRelay_RelaysOversizeDatagram is the fail-on-revert proof for #3012:
+// a DHCP BOOTREQUEST whose serialized form exceeds 1500 bytes (large option
+// set / jumbo-MTU link) must be read intact and relayed — NOT truncated by the
+// read buffer and silently dropped.
+//
+// fakeConn.ReadFrom copies only len(buf) bytes (copy(p, d)), exactly mirroring
+// the kernel's MSG_TRUNC behavior on a real UDP socket: if the read buffer is
+// smaller than the datagram the tail (the option block) is lost and
+// dhcpv4.FromBytes fails -> the relay drops the packet. With the buffer sized
+// to readBufSize (#3012) the whole datagram is read and relayed. Reverting
+// readBufSize to 1500 (or any value below the datagram length) makes this test
+// RED: the truncated datagram fails to parse and is never written to the
+// server conn.
+func TestRunRelay_RelaysOversizeDatagram(t *testing.T) {
+	req, err := dhcpv4.New()
+	if err != nil {
+		t.Fatalf("dhcpv4.New: %v", err)
+	}
+	req.OpCode = dhcpv4.OpcodeBootRequest
+	req.ClientHWAddr = net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x03}
+	req.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeRequest))
+	// Append a large option (vendor-specific information) to push the
+	// serialized datagram well past 1500 bytes. DHCP options carry no
+	// 1500-byte limit; this models a real large-option-set client.
+	bigVal := make([]byte, 1600)
+	for i := range bigVal {
+		bigVal[i] = byte(i)
+	}
+	req.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, bigVal))
+
+	wire := req.ToBytes()
+	if len(wire) <= 1500 {
+		t.Fatalf("test datagram is %d bytes, want > 1500 to exercise the "+
+			"oversize read path", len(wire))
+	}
+
+	client := newFakeConn()
+	client.pending = [][]byte{wire}
+	server := newFakeConn()
+	factory, _ := recordingFactory(client, server)
+	m := testManager(factory)
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	defer m.Stop()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for server.writeCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if server.writeCount() == 0 {
+		t.Fatalf("oversize (%d-byte) BOOTREQUEST was not relayed within 2s "+
+			"(read buffer truncated it — readBufSize regressed below the "+
+			"datagram length)", len(wire))
+	}
+
+	relayed, err := dhcpv4.FromBytes(server.firstWrite(t))
+	if err != nil {
+		t.Fatalf("relayed oversize datagram does not parse "+
+			"(truncated read): %v", err)
+	}
+	if relayed.OpCode != dhcpv4.OpcodeBootRequest {
+		t.Errorf("relayed opcode = %v, want BOOTREQUEST", relayed.OpCode)
+	}
+	// The large option must survive intact end-to-end — proof the tail was
+	// not truncated by the read.
+	got := relayed.Options.Get(dhcpv4.OptionVendorSpecificInformation)
+	if len(got) != len(bigVal) {
+		t.Fatalf("relayed vendor option = %d bytes, want %d "+
+			"(option block truncated by the read buffer)", len(got), len(bigVal))
+	}
+}
+
 // TestRunRelay_RelaysDecline is the end-to-end gate proof for #2789: a real
 // BOOTREQUEST/DECLINE datagram pushed through the live runRelay loop must be
 // forwarded to the server conn (so the server marks the conflicting address
