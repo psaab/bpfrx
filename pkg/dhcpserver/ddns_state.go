@@ -21,6 +21,20 @@ import (
 // Persisted as JSON via fsatomic.WriteFileDurable (fsync-on-write): the
 // reconciler is slow-path, so durability per write is affordable and the
 // store must survive restart / failover to keep the boundary intact.
+//
+// DURABILITY CONTRACT (#2662): ownership of a published RR is durable BEFORE
+// (or at) the wire add, never only after the whole reconcile pass. upsertLocked
+// WRITE-AHEADs the ownership intent (PTRPending=true) and save()s it BEFORE
+// calling UpsertLease, then confirms (clears PTRPending) with a second save
+// after a fully-successful add. This closes the crash-after-add orphan window:
+// a crash / kill / disk-full between the wire add and any later save finds the
+// record already owned, so a later reconcile re-adds (idempotent) or a release
+// deletes it (deleting a maybe-uncreated RR is safe — the #2648 DHCID-match /
+// exact-RR delete prerequisite fails on a non-existent RR, a no-op). A refused
+// add removes the pre-written intent (no phantom ownership); a failed pre-write
+// suppresses the publish (record reported not safely owned). Deletes do not
+// need write-ahead: a delete leaves "ownership without a live RR", which the
+// idempotent re-delete on the next pass self-heals — never an orphaned live RR.
 
 // defaultDDNSStatePath is the on-disk location of the ownership store.
 const defaultDDNSStatePath = "/var/lib/xpf/dhcp-ddns-state.json"
@@ -78,6 +92,11 @@ func ownedRecordKey(identity, address string) string {
 type ddnsState struct {
 	path    string
 	records map[string]ownedRecord
+	// writeFile is the durable-write seam. Production uses
+	// fsatomic.WriteFileDurable (fsync-on-write); tests inject a recorder
+	// that can fail/panic AFTER a DNS add to prove the crash-after-add
+	// orphan window is closed (#2662). Nil selects the production path.
+	writeFile func(path string, data []byte, perm os.FileMode) error
 }
 
 // ddnsStateFile is the serialized on-disk shape (a stable, sorted slice
@@ -149,6 +168,9 @@ func (s *ddnsState) save() error {
 	}
 	if err := os.MkdirAll(dirOf(s.path), 0o755); err != nil {
 		return fmt.Errorf("create ddns state dir: %w", err)
+	}
+	if s.writeFile != nil {
+		return s.writeFile(s.path, data, 0o600)
 	}
 	return fsatomic.WriteFileDurable(s.path, data, 0o600)
 }

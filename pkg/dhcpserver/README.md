@@ -369,6 +369,26 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   fail-open store may LEAK previously-owned records — they stay in DNS until
   authoritatively removed; record TTL is resolver caching, not removal — but
   never deletes records xpf did not create.)
+  **Write-ahead durability (#2662).** Ownership of a published RR is durable
+  BEFORE the wire add, not only at the end of the reconcile pass.
+  `upsertLocked` persists the ownership intent (`PTRPending=true`) and
+  `save()`s it BEFORE calling `UpsertLease`, then confirms (clears
+  `PTRPending`) with a second save after a fully-successful add. This closes
+  the crash-after-add ORPHAN window the old end-of-pass-only save left: a
+  crash / kill / disk-full / `WriteFileDurable` failure between a successful
+  DNS add and any later save can no longer strand a LIVE RR with no durable
+  ownership. On restart the durable record says "xpf owns X", so a later
+  reconcile re-adds (idempotent) or a release deletes it — and deleting a
+  maybe-uncreated RR is safe (the #2648 DHCID-match / exact-RR delete
+  prerequisite fails on a non-existent RR, a no-op). A REFUSED add
+  (`errDDNSConflictRefused`) removes the pre-written intent so no phantom
+  ownership survives (a phantom would let a later release delete a third
+  party's record); a FAILED pre-write suppresses the publish entirely (the
+  record is reported "not safely owned" and retried next cycle — xpf never
+  publishes a RR it could not first record ownership for). Deletes do not
+  write-ahead: a delete leaves "ownership without a live RR", which the
+  idempotent re-delete on the next pass self-heals — never an orphaned live
+  RR.
 - **Counters** via `DDNSManager.Stats()` (the `show ... dynamic-dns`
   + Prometheus surface reads this).
 

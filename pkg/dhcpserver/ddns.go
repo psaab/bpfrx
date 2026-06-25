@@ -488,6 +488,15 @@ func (m *DDNSManager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, l
 		}
 	}
 
+	// End-of-pass durability backstop. Adds are already durable via the
+	// per-record write-ahead in upsertLocked (#2662), so this no longer
+	// covers the crash-after-add orphan window; it persists the ownership
+	// REMOVALS done by deleteOwnedLocked in Pass 1 (a delete drops the
+	// in-memory entry but does not self-save). A delete leaves "ownership
+	// without a live RR", never an orphaned live RR — so the residual window
+	// here is self-healing (a crash before this save replays the idempotent
+	// re-delete next pass), not an orphan. The save is still issued so the
+	// store converges promptly.
 	if err := m.state.save(); err != nil {
 		slog.Warn("ddns: persist ownership state failed", "err", err)
 		noteErr(err)
@@ -525,52 +534,129 @@ func (m *DDNSManager) withdrawAllLocked(ctx context.Context) error {
 // "already owned". So the no-op path counts the skip and returns success
 // (reconcile must not wedge) without mutating the ownership store.
 //
-// REPLACE-OWNED REFUSAL (#2648 MAJOR-1): a replace-owned add that REFUSES a
-// name owned by another party returns errDDNSConflictRefused. That is neither
-// a success nor a hard failure — it means "someone else owns this name". It is
-// classified like the nop-skip: NO ownership is recorded and the reconcile is
-// NOT marked failed. Recording phantom ownership for a refused add would let a
-// later release delete a record xpf did not create (for a no-identity lease,
-// whose delete has no DHCID-match guard, that delete actually fires).
+// WRITE-AHEAD OWNERSHIP (#2662): the durable ownership record is persisted
+// BEFORE the DNS add, not at the end of the reconcile pass. The previous
+// shape (in-memory put per record, ONE state.save() after all I/O) left a
+// per-PASS orphan window: a crash / kill / disk-full / WriteFileDurable
+// failure after a successful DNS add but before the end-of-pass save left a
+// LIVE DNS RR with NO durable ownership record — on restart the manager
+// loaded the pre-add store and had no authority to ever clean that RR (the
+// stale-record class #1387 set out to prevent). Write-ahead closes the
+// window: the intent is durable BEFORE the wire add, so a crash anywhere
+// after the add finds the ownership already recorded and a later reconcile
+// re-adds (idempotent) or release deletes it. The pre-add intent carries
+// PTRPending=true (the published tuple is not yet confirmed settled); a
+// fully-successful add clears it via a confirm save. If the durable
+// pre-write FAILS the add does NOT run and the record is reported "not
+// safely owned" (the error is surfaced) — we never publish a RR we could not
+// first record ownership for.
+//
+// REFUSED-ADD REMOVES THE INTENT (#2648 MAJOR-1 + #2662): a replace-owned /
+// skip-existing add that REFUSES a name owned by another party returns
+// errDDNSConflictRefused. The wire add did NOT happen, so the pre-written
+// intent is phantom ownership and is REMOVED (delete + save) — leaving it
+// would let a later release delete a record xpf did not create (for a
+// no-identity lease, whose delete has no DHCID-match guard, that delete
+// actually fires). Deleting an intent for a RR that was never created is
+// safe: the #2648 DHCID-match / exact-RR delete prerequisite fails on a
+// non-existent RR, so the wire delete is a harmless no-op.
 func (m *DDNSManager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow ownedRecord) error {
+	if isNopUpdater(m.updater) {
+		// No live backend: nothing is published, so record NO ownership and
+		// do not write-ahead an intent (an intent for a record nopUpdater
+		// never wrote would be phantom). Count the skip and return success so
+		// the reconcile does not wedge.
+		if err := m.updater.UpsertLease(ctx, rec); err != nil {
+			m.upsertFail.Add(1)
+			return err
+		}
+		m.skippedNoBackend.Add(1)
+		return nil
+	}
+
+	// WRITE-AHEAD: persist the ownership intent durably BEFORE the wire add.
+	// PTRPending=true until a fully-successful add confirms it; a crash after
+	// the add (but before any confirm) therefore finds the record owned and
+	// the next reconcile converges it.
+	intent := ow
+	intent.PTRPending = true
+	m.state.put(intent)
+	if err := m.state.save(); err != nil {
+		// Could not durably record ownership: do NOT publish. Roll the
+		// in-memory intent back so the store matches what is durable, surface
+		// the failure as "record not safely owned", and let the next
+		// reconcile retry.
+		m.state.delete(intent.Identity, intent.Address)
+		m.upsertFail.Add(1)
+		slog.Warn("ddns: cannot durably record ownership before add; skipping publish",
+			"fqdn", rec.FQDN, "err", err)
+		return err
+	}
+
 	if err := m.updater.UpsertLease(ctx, rec); err != nil {
 		if errors.Is(err, errDDNSConflictRefused) {
-			// Refused (name owned by another party): count it as a conflict
-			// skip already done by the backend; record NO ownership and do not
-			// fail the reconcile pass.
+			// Refused (name owned by another party): the wire add did not
+			// happen, so REMOVE the pre-written intent (no phantom ownership)
+			// and persist the removal. Count it as a conflict skip already done
+			// by the backend; do not fail the reconcile pass.
+			m.state.delete(intent.Identity, intent.Address)
+			if serr := m.state.save(); serr != nil {
+				// The intent is removed in memory but the removal is not durable.
+				// Surface it so the pass is marked failed and retried; a stale
+				// durable intent is safe (its delete is a no-op on a non-existent
+				// RR) and self-heals on the next successful save.
+				slog.Warn("ddns: cannot persist removal of refused-add intent",
+					"fqdn", rec.FQDN, "err", serr)
+				return serr
+			}
 			return nil
 		}
 		if errors.Is(err, errDDNSPTRPending) {
 			// PARTIAL SUCCESS (#2661): the forward A/AAAA is LIVE in DNS but the
-			// reverse PTR add failed with a non-skippable (transient) error. We
-			// MUST record ownership of the forward so it is tracked + cleanable —
-			// recording NO ownership here (the pre-#2661 behavior) would orphan a
-			// live forward record. Record ownership with PTRPending set so the
-			// next reconcile re-runs UpsertLease (an idempotent forward re-add)
-			// and re-attempts the still-missing PTR. The PTR failure is counted
-			// and logged so it is observable; the reconcile pass is NOT failed
-			// (the forward succeeded and the PTR retry converges on its own), the
-			// same non-fatal treatment as a NOTAUTH skip.
+			// reverse PTR add failed with a non-skippable (transient) error. The
+			// pre-written intent already records ownership with PTRPending=true,
+			// which is exactly the state we want to keep — the next reconcile
+			// re-runs UpsertLease (an idempotent forward re-add) and re-attempts
+			// the still-missing PTR. The forward is durably owned (never
+			// orphaned). The PTR failure is counted and logged so it is
+			// observable; the reconcile pass is NOT failed (the forward succeeded
+			// and the PTR retry converges on its own), the same non-fatal
+			// treatment as a NOTAUTH skip. No re-save needed: the durable intent
+			// already carries PTRPending=true.
 			m.ptrDeferred.Add(1)
 			slog.Warn("ddns: forward published but reverse PTR add failed; "+
-				"recording ownership with PTR pending for retry next cycle",
+				"ownership recorded with PTR pending for retry next cycle",
 				"fqdn", rec.FQDN, "ptr", rec.PTRName, "err", err)
-			ow.PTRPending = true
 			m.upsertOK.Add(1)
-			m.state.put(ow)
 			return nil
+		}
+		// Hard add failure: the wire add did not succeed. Remove the
+		// pre-written intent so the store does not claim a record that is not
+		// in DNS, and persist the removal so a later release cannot fire a
+		// (no-op) delete against a non-existent RR forever. A save failure here
+		// is non-fatal beyond the add error already returned: a stale durable
+		// intent's delete is a harmless no-op and self-heals on the next save.
+		m.state.delete(intent.Identity, intent.Address)
+		if serr := m.state.save(); serr != nil {
+			slog.Warn("ddns: cannot persist removal of failed-add intent",
+				"fqdn", rec.FQDN, "err", serr)
 		}
 		m.upsertFail.Add(1)
 		return err
 	}
-	if isNopUpdater(m.updater) {
-		m.skippedNoBackend.Add(1)
-		return nil
-	}
+
+	// Fully-successful add: confirm by clearing PTRPending and persisting the
+	// settled record. A confirm-save failure is non-fatal — the durable
+	// intent (PTRPending=true) already owns the live record, so it is
+	// cleanable; the only cost is the next reconcile re-running the idempotent
+	// forward add to clear the pending flag.
 	m.upsertOK.Add(1)
-	// A fully-successful upsert settles any prior pending-PTR state.
 	ow.PTRPending = false
 	m.state.put(ow)
+	if err := m.state.save(); err != nil {
+		slog.Warn("ddns: cannot persist settled ownership after add (record still owned via write-ahead intent)",
+			"fqdn", rec.FQDN, "err", err)
+	}
 	return nil
 }
 
