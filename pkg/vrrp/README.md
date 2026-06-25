@@ -277,6 +277,27 @@ load/peer-sync compile paths.
   fallback-path split-brain; `make test-failover` on the native-XDP loss
   cluster validates no-regression but does not exercise the fallback RX
   path this specifically repairs.
+- **Arrival-interface filter on the raw-socket fallback (#2886).** Because
+  `maybeBindToDevice` is a no-op on a VLAN sub-interface, two VLAN raw
+  sockets on the same parent both bind to the wildcard address with NO
+  device isolation, so the kernel delivers a proto-112 frame to *every*
+  such socket. The fallback receivers (`receiver` / `receiverIPv6`) used
+  to gate only on TTL, self-IP, and VRID — so two VLAN sub-interfaces
+  (e.g. `reth0.50` / `reth0.80`) running instances with the **same VRID**
+  cross-processed each other's adverts → false BACKUP transitions and
+  split-brain flapping. Both fallback receivers now enable the per-packet
+  interface control message (`ipv4.FlagInterface` / `ipv6.FlagInterface`),
+  capture the arrival ifindex, and route it through
+  `acceptArrivalIfindex(arrivalIfindex, vi.expectedIfindex())`: an advert
+  whose arrival interface differs from the instance's bound interface is
+  dropped. The check **fails open** when the platform reports no arrival
+  interface (`ifindex == 0`) or the instance has no resolved interface, so
+  it never regresses delivery — the VRID/TTL/self gates still apply. The
+  IPv6 read goes through the `ipv6Recv` seam (an
+  `ipv6.NewPacketConn(...).ReadFrom` wrapper in production) so tests can
+  inject a synthetic arrival ifindex without `CAP_NET_RAW`. Only the
+  AF_PACKET-unavailable fallback is affected; the default
+  `receiverAfPacket` tap already binds to a single ifindex.
 - The AF_PACKET capture fd is created `SOCK_RAW|SOCK_CLOEXEC` so it is set
   close-on-exec atomically at creation (#2476). A raw `unix.Socket` does NOT
   inherit CLOEXEC the way Go `net` sockets do, so without this the raw VRRP
