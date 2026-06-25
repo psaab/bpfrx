@@ -56,9 +56,12 @@ func sanitizeFRRValue(s string) string {
 }
 
 // knownRedistProtocols are the FRR redistribute protocol keywords.
+// ospf6 / ripng are the FRR keywords for OSPFv3 / RIPng redistribution;
+// without them a bare `export ospf6` / `export ripng` falls through to the
+// skip-and-warn path and IPv6 IGP redistribution cannot be expressed (#2943).
 var knownRedistProtocols = map[string]bool{
-	"connected": true, "static": true, "ospf": true, "bgp": true,
-	"rip": true, "isis": true, "kernel": true,
+	"connected": true, "static": true, "ospf": true, "ospf6": true,
+	"bgp": true, "rip": true, "ripng": true, "isis": true, "kernel": true,
 }
 
 // resolveRedistribute converts a Junos export value into FRR redistribute commands.
@@ -92,7 +95,7 @@ var knownRedistProtocols = map[string]bool{
 //     load / peer-sync path, opts.lenientRoutingExportRef in pkg/config).
 //     The strict validator REJECTS this case at commit; only the lenient
 //     load/peer-sync path can reach the renderer with such a name.
-func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsConfig) string {
+func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsConfig, self string) string {
 	// Junos spells directly-connected routes "direct"; FRR's redistribute
 	// keyword is "connected". A bare `export direct` must render
 	// `redistribute connected`, not the FRR-invalid `redistribute direct`
@@ -105,6 +108,16 @@ func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsCon
 		export = "connected"
 	}
 	if knownRedistProtocols[export] {
+		// A protocol can never redistribute itself: FRR rejects
+		// `redistribute ospf` under `router ospf` (etc.), and ONE
+		// rejected line degrades the WHOLE managed reload (#1880/#2223).
+		// Drop the self-redistribute rather than poison the section
+		// (#2943). self is "" for callers with no enclosing protocol.
+		if self != "" && export == self {
+			slog.Warn("FRR redistribute export skipped: protocol cannot redistribute itself",
+				"protocol", self)
+			return ""
+		}
 		return fmt.Sprintf(" redistribute %s\n", export)
 	}
 
@@ -115,6 +128,13 @@ func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsCon
 				for _, proto := range term.FromProtocols {
 					if proto == "direct" {
 						proto = "connected"
+					}
+					// Skip a policy term that matches the enclosing
+					// protocol's own routes — `redistribute ospf
+					// route-map X` under `router ospf` is self-
+					// redistribution and FRR rejects it (#2943).
+					if self != "" && proto == self {
+						continue
 					}
 					protocols[proto] = true
 				}
@@ -415,7 +435,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			fmt.Fprintf(&b, " maximum-paths %d\n", ecmpMaxPaths)
 		}
 		for _, export := range ospf.Export {
-			b.WriteString(m.resolveRedistribute(export, policyOptions))
+			b.WriteString(m.resolveRedistribute(export, policyOptions, "ospf"))
 		}
 		b.WriteString("exit\n!\n")
 		// OSPF interface settings + per-interface area activation. The
@@ -470,7 +490,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			}
 		}
 		for _, export := range ospfv3.Export {
-			b.WriteString(m.resolveRedistribute(export, policyOptions))
+			b.WriteString(m.resolveRedistribute(export, policyOptions, "ospf6"))
 		}
 		b.WriteString("exit\n!\n")
 		for _, area := range ospfv3.Areas {
@@ -609,8 +629,8 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				// validator on a lenient load/HA-sync path) → genuine
 				// redistribute. resolveRedistribute normalizes direct→
 				// connected and refuses to emit an invalid bare-name
-				// line (#2223).
-				b.WriteString(m.resolveRedistribute(e, policyOptions))
+				// line (#2223), and drops a self-redistribute (#2943).
+				b.WriteString(m.resolveRedistribute(e, policyOptions, "bgp"))
 			}
 		}
 
@@ -651,10 +671,24 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			// neighbor import/export inclusion is #2490 (symmetric to the
 			// global-default inclusion #2473 added).
 			hasOwnPolicy := bgpEffectiveExport(n, "") != "" || bgpEffectiveImport(n, "") != ""
-			if n.FamilyInet || ((globalExport != "" || globalImport != "" || hasOwnPolicy) && !n.FamilyInet6) {
+			// The "default-activate a family-less policied neighbor under
+			// ipv4 unicast" fall-through (#2473/#2490) is correct ONLY for
+			// an IPv4 peer address. An IPv6 peer (e.g. 2001:db8::1) with a
+			// policy but no explicit `family inet6` also satisfies
+			// !n.FamilyInet6, so the pre-#2941 code activated it under
+			// `address-family ipv4 unicast` — the WRONG family. FRR cannot
+			// resolve an IPv4 next-hop over an IPv6 peer (no RFC 8950
+			// extended-next-hop) so the session drops prefixes / fails, and
+			// the neighbor never participates in ipv6 unicast. Gate the
+			// ipv4 fall-through on the peer address family, and route an
+			// IPv6-address family-less-but-policied neighbor into the ipv6
+			// set instead so it activates under ipv6 unicast (#2941).
+			isIPv6Peer := strings.Contains(n.Address, ":")
+			policyDefault := globalExport != "" || globalImport != "" || hasOwnPolicy
+			if (n.FamilyInet || (policyDefault && !n.FamilyInet6)) && !isIPv6Peer {
 				inet4Neighbors = append(inet4Neighbors, n)
 			}
-			if n.FamilyInet6 {
+			if n.FamilyInet6 || (policyDefault && !n.FamilyInet && isIPv6Peer) {
 				inet6Neighbors = append(inet6Neighbors, n)
 			}
 		}
@@ -745,7 +779,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			fmt.Fprintf(&b, " passive-interface %s\n", iface)
 		}
 		for _, r := range rip.Redistribute {
-			b.WriteString(m.resolveRedistribute(r, policyOptions))
+			b.WriteString(m.resolveRedistribute(r, policyOptions, "rip"))
 		}
 		b.WriteString("exit\n!\n")
 		// RIP per-interface authentication
@@ -781,7 +815,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			b.WriteString(" is-type level-1-2\n")
 		}
 		for _, export := range isis.Export {
-			b.WriteString(m.resolveRedistribute(export, policyOptions))
+			b.WriteString(m.resolveRedistribute(export, policyOptions, "isis"))
 		}
 		if isis.WideMetricsOnly {
 			b.WriteString(" metric-style wide\n")
@@ -815,7 +849,13 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 					fmt.Fprintf(&b, " isis password clear %s\n", sanitizeFRRValue(iface.AuthKey.Reveal()))
 				}
 			}
-			b.WriteString("exit\n!\n")
+			// `isis bfd` / `isis bfd profile <name>` are interface-scoped
+			// commands and MUST be emitted INSIDE the interface block,
+			// before `exit`. Emitting them after `exit` lands them at
+			// global config scope, which vtysh rejects — and one rejected
+			// line fails the WHOLE managed-section reload (#1880/#2223),
+			// breaking every IS-IS interface with BFD enabled. This mirrors
+			// the OSPFv3 per-interface BFD ordering above (#2942).
 			if iface.BFD {
 				if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
 					profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
@@ -825,6 +865,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 					b.WriteString(" isis bfd\n")
 				}
 			}
+			b.WriteString("exit\n!\n")
 		}
 	}
 
