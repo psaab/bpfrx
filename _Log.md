@@ -1,3 +1,58 @@
+## 2026-06-25 — #2969: IPv6 NDP probe `sin6_scope_id` + sendto error surface
+
+- **Timestamp**: 2026-06-25
+- **Action**: `trigger_kernel_arp_probe` built the IPv6 NDP-solicit
+  `sockaddr_in6` with `sin6_scope_id == 0` and ignored the `sendto`
+  return in BOTH families. For a link-local (`fe80::/10`) next-hop a
+  zero scope id makes the kernel unable to route the solicit
+  (EINVAL/ENETUNREACH) → the solicit is never sent → neighbor never
+  resolves → IPv6 forwarding blackhole to link-local hops; the swallowed
+  sendto error hid it. Fixed: threaded the egress `ifindex` into
+  `trigger_kernel_arp_probe` (available at all 5 call sites —
+  `item.ifindex` in warmer/resolver, `key.0` in dispatch, `neigh_if` in
+  the cold-packet path) and set `sin6_scope_id = ifindex` via a new pure
+  `build_solicit_sockaddr_in6` helper (unconditional — link-local needs
+  it, global ignores it). Both branches now check the sendto return and
+  `eprintln!` a failure (rare, probe-send only — within logging rules)
+  instead of swallowing it. Added 3 fail-on-revert unit tests in
+  `probe_socket_tests`: link-local scope_id == ifindex (RED if it
+  reverts to 0), global also scoped, and negative-ifindex clamp-to-0.
+  Scope limited to the NDP probe send path; #2918/#2919 neighbor-dump
+  logic untouched.
+- **Gates**: CARGO_TARGET_DIR=/tmp/cargo-2969 cargo build --release
+  (xpf-userspace-dp) PASS; cargo test --release neighbor PASS.
+- **File(s)**: userspace-dp/src/afxdp/neighbor.rs,
+  userspace-dp/src/afxdp/neighbor_resolver.rs,
+  userspace-dp/src/afxdp/neighbor_dispatch.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  docs/userspace-cold-start-resolution.md, _Log.md
+## 2026-06-25 — #2916: same-plan refresh / replan predicate — guard test
+
+- **Timestamp**: 2026-06-25
+- **Action**: Investigated #2916 (same-plan snapshot refresh can skip a
+  required queue replan because the binding-plan hash and queue planner
+  used different predicates). Root cause was the predicate mismatch
+  closed by #2915 (054-01): post-#2915 both `update_snapshot_binding_plan_key`
+  and `replan_queues` filter through the single SSOT
+  `include_userspace_binding_interface`, and the hash already covers every
+  snapshot-derived field the planner consumes to build the layout
+  (`name`/`linux_name`/`ifindex`/`rx_queues` per candidate, fabric parents,
+  `workers`/`ring_entries`/`shared_umem`). Membership flips are coupled
+  because both paths use the identical predicate, so a same key now genuinely
+  means a same plan for all snapshot-driven inputs — #2916 is already fixed
+  at the root by #2915. To close #2916 with its OWN regression guard,
+  added `plan_key_covers_every_replan_queues_input`: for a candidate
+  interface, mutating any of the three planner-consumed fields
+  (`linux_name`, `ifindex`, `rx_queues`) MUST bump the plan key, each paired
+  with a `replan_queues` assertion proving the field actually changes the
+  produced layout (so the test cannot pass on a field the planner ignores).
+  Fail-on-revert proven: dropping `linux_name`/`ifindex`/`rx_queues` from the
+  `iface=...` hash segment (copy-aside) makes the test panic RED with the
+  exact message; restored clean. No production code change — the invariant
+  was already held by #2915; this hardens it against a future hash
+  regression and documents the same-plan coupling in the README.
+- **File(s)**: `userspace-dp/src/main_tests.rs`,
+  `userspace-dp/src/server/README.md`, `_Log.md`
 ## 2026-06-25 — #2978: BGP `multipath ibgp` renders FRR `maximum-paths ibgp <n>` (iBGP ECMP)
 
 - **Timestamp**: 2026-06-25
@@ -18179,6 +18234,19 @@ top.
   userspace-dp/src/afxdp/worker/loop_body/mod.rs,
   userspace-dp/src/afxdp/session_glue/tests.rs,
   userspace-dp/src/afxdp/tests.rs, userspace-dp/README.md, _Log.md
+- **Timestamp**: 2026-06-25
+- **Action**: networkd batch fix #2986/#2987/#2988 — (a) gate static
+  Address= lines per-family on DHCPv4/DHCPv6 separately so DHCPv4+static-IPv6
+  (and mirror) installs the non-DHCP family address; (b) writeIfChanged
+  returns (changed,err) and Apply aggregates write failures + returns an
+  error so a swallowed write no longer reports clean-commit-against-stale
+  kernel (fail-closed); (c) Apply no longer early-returns on an empty
+  desired set — the stale 10-xpf-* sweep + reload now run when the last
+  managed interface is removed (protected lifeline files preserved). Added
+  addressIsIPv6 helper, made runNetworkctl a stubable package var. Six new
+  tests incl. fail-on-revert per bug; build/gofmt/vet/test green.
+- **File(s)**: pkg/networkd/networkd.go, pkg/networkd/networkd_test.go,
+  pkg/networkd/README.md, _Log.md
 ## 2026-06-25 — #2975 selectInterfaceAddr skip IFA_F_TEMPORARY
 - **Timestamp**: 2026-06-25
 - **Action**: Fix Surface A interface-address selection to skip RFC 4941/8981
@@ -18199,3 +18267,36 @@ top.
   RED; restore returns green.
 - **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
   pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: networkd batch #2987/#2988 caller-reach fix (hostile-review
+  MERGE-NEEDS-MINOR). The library fixes did not reach production: the only
+  caller (pkg/daemon/daemon_apply.go step 2.5) guarded networkd.Apply with
+  len(ManagedInterfaces)>0 (shadowed the #2988 empty-set sweep) and
+  swallowed Apply's returned error with only slog.Warn (the #2987
+  fail-closed never fired). Relaxed the guard to run Apply whenever
+  applyResult!=nil (empty set still sweeps stale 10-xpf-* — lifeline
+  preserved via resolveProtectedInterfaces from ActiveConfig). Captured the
+  Apply error into networkdErr and returned errors.Join(networkdErr,
+  dhcpServerErr) at the tail so a write failure fails the commit WITHOUT
+  skipping downstream reconcile (RETH MAC/VRRP/FRR/RA/IPsec) — mirrors the
+  dhcpServerErr deferred-error precedent. Added 3 daemon tests
+  (empty-set-sweeps, empty-set-preserves-lifeline, write-error-fails-commit),
+  each fail-on-revert RED without the caller fix. build/gofmt/vet/test green
+  for pkg/networkd + pkg/daemon.
+- **File(s)**: pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_networkd_apply_test.go, pkg/networkd/README.md, _Log.md
+- **Action**: #2997 — render `maximum-paths` in the `router ospf6` block so
+  IPv6 OSPF ECMP is actually installed by FRR `ospf6d`. The OSPFv4 `router
+  ospf` block already rendered ` maximum-paths <n>` from the global
+  forwarding-table ECMP knob (`ecmpMaxPaths`, `resolveECMP`); the OSPFv3
+  `router ospf6` block omitted it, so OSPFv3 routes installed a single best
+  path even with global ECMP > 1. OSPFv3 has no separate maximum-paths config
+  leaf — it reuses the same global `ecmpMaxPaths`. Fix mirrors the OSPFv4
+  placement: gated on `ecmpMaxPaths > 1`, after the per-interface area lines,
+  before redistribute. Added fail-on-revert test
+  TestGenerateProtocols_OSPFv3ECMPMaxPaths (asserts ` maximum-paths 64` in the
+  router ospf6 block when ecmp=64; none when ecmp=0/1). Reverting the render
+  line turns the test RED. Updated pkg/frr/README.md policy_render.go row.
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
+  pkg/frr/README.md, _Log.md
