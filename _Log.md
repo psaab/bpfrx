@@ -1,3 +1,150 @@
+## 2026-06-25 — #2744: control-socket request cap raised 16→64 MiB (feed-dimension) + Go pre-flight
+
+- **Timestamp**: 2026-06-25
+- **Action**: The userspace-dp control socket capped a single request at
+  16 MiB (#2523). The dominant scaling dimension is dynamic-feed-backed
+  address books (`AddressBookSnapshot.prefixes_v4/v6` carry feed prefixes
+  inline as CIDR text, bounded only by a per-line scanner cap, not a
+  total-entry cap), so a legitimate feed-heavy `apply_snapshot` (~500K IPv6
+  CIDRs ≈ 20+ MiB) was rejected at the control socket — fail-closed, but it
+  silently dropped a committed config with no operator-facing diagnostic.
+  Raised the cap to 64 MiB on BOTH sides in lockstep
+  (`MAX_CONTROL_REQUEST_BYTES` in `userspace-dp/src/protocol/control.rs`;
+  new `MaxControlRequestBytes` const in
+  `pkg/dataplane/userspace/process.go`). 64 MiB / ~45 B per IPv6 CIDR ≈
+  1.4M prefixes, well above realistic large feeds, still a hard
+  read-allocation DoS guard. Added a Go pre-flight in
+  `requestDetailedLocked`: serialize the request once, reject an oversize
+  body HERE with an actionable config error (names the feed-size cause)
+  instead of a silent helper EOF after commit; reuse the serialized body
+  for the socket write (single trailing newline matches the Rust framing).
+- **Fail-on-revert proof**:
+  - Go: reverted const 64→16 MiB via copy-restore →
+    `TestControlRequestCapRaisedAbove16MiB` + `...LockstepWithRust` go RED
+    ("cap must be raised above the old 16 MiB ceiling, got 16777216");
+    restored → green.
+  - Rust: reverted const 64→16 MiB via copy-restore →
+    `legitimate_feed_above_old_16mib_cap_is_now_accepted` goes RED
+    (panic "cap must be raised above the old 16 MiB ceiling (got
+    16777216)"); restored → green. `request_above_new_cap_is_still_rejected`
+    + `oversize_request_is_rejected_before_decode` keep the DoS guard.
+- **Gates**: `go build ./...` OK; `gofmt -l` clean; `go vet`
+  ./pkg/dataplane/userspace/... ./pkg/feeds/... clean;
+  `go test ./pkg/dataplane/userspace/... ./pkg/feeds/...` PASS;
+  `cargo build --release -p xpf-userspace-dp` OK; `cargo test` cap tests
+  (4) PASS.
+- **File(s)**: `userspace-dp/src/protocol/control.rs` (cap + lockstep doc),
+  `userspace-dp/src/server/tests.rs` (2 new fail-on-revert tests),
+  `pkg/dataplane/userspace/process.go` (`MaxControlRequestBytes` +
+  pre-flight), `pkg/dataplane/userspace/control_request_cap_2744_test.go`
+  (new, 3 tests incl. lockstep pin),
+  `docs/userspace-dataplane-architecture.md` (control-socket cap section),
+  `pkg/feeds/README.md` (feed-size vs. cap gotcha), `_Log.md`.
+## 2026-06-25 — #2775: ddns/surface-a netlink selection honors IPv6 address lifetime
+
+- **Timestamp**: 2026-06-25
+- **Action**: Surface A interface-address selection (`observeInterfaceAddr` in
+  `pkg/daemon/daemon_ddns_surface_a.go`) ignored IPv6 address-lifetime state and
+  published the first non-link-local/loopback/multicast netlink address — it
+  could publish a `deprecated` (soon-invalid) or a `tentative`/`dadfailed`
+  (DAD-incomplete/duplicate) address as the router's AAAA record. Extracted the
+  selection into a pure, testable `selectInterfaceAddr([]netlink.Addr, af4)`
+  that: skips `IFA_F_TENTATIVE | IFA_F_DADFAILED | IFA_F_OPTIMISTIC`; PREFERS an
+  RFC 4862 preferred address, falling back to a `IFA_F_DEPRECATED` address only
+  when no preferred exists (never-blackhole); and still gates every candidate
+  through `ddns.IsPublicAddr` (#2776 composition — a preferred-but-ULA address
+  is rejected). The IFA_F_* flags were ALREADY parsed off netlink into
+  `netlink.Addr.Flags` — no extra netlink plumbing was needed, they were simply
+  ignored in selection. Preserves #2776's static-fallback public gate.
+- **File(s)**: `pkg/daemon/daemon_ddns_surface_a.go`,
+  `pkg/daemon/daemon_ddns_surface_a_test.go`, `pkg/ddns/README.md`, `_Log.md`.
+- **Fail-on-revert proof**: `TestSelectInterfaceAddrLifetime` (copy-restore).
+  Reverted the deprecated-deferral (return first eligible incl. deprecated) →
+  RED: subtest "prefer preferred over deprecated (deprecated listed first)"
+  got `2606:4700:4700::2222` (deprecated) want `...::1111` (preferred). Restored
+  → GREEN; file byte-identical (`diff` clean). Also covers deprecated-only
+  fallback, tentative/dadfailed/optimistic never-selected, preferred-ULA
+  rejection (composes #2776), and v4 family filter.
+- **Gates**: `go build ./...` OK; `gofmt -l` clean; `go vet ./pkg/daemon/...
+  ./pkg/ddns/...` clean; `go test ./pkg/daemon/ -run
+  'SurfaceA|ObserveInterface|StaticUnitAddr|SelectInterfaceAddr' ./pkg/ddns/...`
+  PASS.
+
+## 2026-06-25 — #2776: ddns/surface-a static-address fallback is now public-gated
+
+- **Timestamp**: 2026-06-25
+- **Action**: The Surface A static-address fallback (`staticUnitAddr` in
+  `pkg/daemon/daemon_ddns_surface_a.go`, used by `observeInterfaceAddr` when the
+  kernel interface is absent/addressless) filtered only loopback/
+  link-local-unicast/unspecified, while the netlink path also rejected
+  multicast — divergent publishability predicates. A mis-scoped configured
+  static address (multicast, reserved, ULA, CGNAT, documentation, IANA
+  special-purpose) could be published as the router's A/AAAA record. Fix: gate
+  the static candidate through the SAME `ddns.IsPublicAddr` predicate the
+  netlink and checkip sources use. Exported `isPublicAddr` → `IsPublicAddr` in
+  `pkg/ddns/checkip.go` (same package as the existing `#2774` gate; reused, not
+  duplicated — no second IANA range list). A non-public static address is now
+  SKIPPED and surfaced at `slog.Warn` (never-blackhole: a bad static address
+  must not silently publish a martian). Scope kept to the static-fallback path
+  only — no other surface_a address-selection refactor (#2775/#2779/#2780 are
+  separate lanes).
+- **File(s)**: `pkg/ddns/checkip.go` (export `IsPublicAddr` + callers/comment),
+  `pkg/ddns/checkip_test.go` (rename refs), `pkg/daemon/daemon_ddns_surface_a.go`
+  (`staticUnitAddr` gate + WARN), `pkg/daemon/daemon_ddns_surface_a_test.go`
+  (`TestStaticUnitAddr` updated to genuinely-public addrs since the prior fixture
+  used TEST-NET-3/2001:db8 which the gate correctly rejects;
+  `TestStaticUnitAddrPublicGate` fail-on-revert), `pkg/ddns/README.md`.
+- **Fail-on-revert proof**: copied `daemon_ddns_surface_a.go` aside, replaced
+  `ddns.IsPublicAddr(a)` with the OLD partial loopback/link-local/unspecified
+  filter → `go test ./pkg/daemon/ -run StaticUnitAddrPublicGate` went RED (all
+  8 v4 + 5 v6 special-purpose entries returned ok=true, plus the
+  skip-then-select-next-public case failed). Restored from the copy → GREEN.
+- **Gates**: `go build ./...` clean, `gofmt -l` clean, `go vet ./pkg/ddns/...`
+  clean, `go test ./pkg/ddns/...` + `go test ./pkg/daemon/ -run
+  'StaticUnitAddr|SurfaceA'` pass.
+## 2026-06-25 — #2749: flowexport populates ingressInterface (IE 10) with the real ingress ifindex (Go-only; TOS/TCPFlags/Direction/OutIf deferred)
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2613 dropped five NetFlow v9 / IPFIX template fields
+  (SrcTos 5, TCPFlags 6, ingressInterface/InputSNMP 10, egressInterface/
+  OutputSNMP 14, flowDirection 61) because the SESSION_CLOSE close path
+  carried no real value. Investigation found that #2615 since stamps the
+  closing binding's ingress ifindex into the [128:132] slot of the
+  136-byte RT_FLOW close frame (the Rust encoder no longer hardcodes 0),
+  and `pkg/logging/ringbuf.go` already reads it (only to resolve a NAME).
+  So `ingressInterface` (IE 10, an SNMP ifIndex) can be populated with a
+  REAL value **Go-only**, no wire change. Re-introduced it: retain the
+  numeric ifindex on `EventRecord.IngressIfindex`, copy it into
+  `SessionCloseData.InIf` in both daemon flow-export callbacks, thread it
+  to `FlowRecord.InIf` in both `ExportSessionClose` builders, and re-add
+  IE 10 (4B, placed BEFORE the post-NAT trailing block so #2526 offsets
+  are unchanged) to both NetFlow v9 templates + IPFIX v4/v6 templates and
+  their encoders/size constants (IPFIX v4 57→61, v6 105→109; v9 v4 52→56,
+  v6 100→104). The other four #2613 drops stay dropped — no wire source
+  exists (needs the deferred Rust↔Go frame extension + conntrack TOS/flag
+  stamping + egress-ifindex forwarding-path tracking, which remains the
+  #2749 follow-up scope).
+- **File(s)**: pkg/logging/eventbuf.go (EventRecord.IngressIfindex),
+  pkg/logging/ringbuf.go (retain numeric ifindex), pkg/flowexport/manager.go
+  (SessionCloseData.InIf), pkg/daemon/daemon_flowexport.go (sd.InIf =
+  rec.IngressIfindex, both callbacks), pkg/flowexport/netflow.go +
+  pkg/flowexport/ipfix.go (template field + encoder write + size consts +
+  ExportSessionClose population), pkg/flowexport/README.md (#2749 section).
+  Tests: pkg/flowexport/ingress_interface_test.go (NEW fail-on-revert),
+  pkg/flowexport/dropped_fields_test.go + exporter_test.go (drop IE 10
+  from the still-dropped sets), pkg/flowexport/postnat_test.go (record-size
+  literals).
+- **Wire note**: NO wire-format change. The ingress ifindex is already on
+  the SESSION_CLOSE wire ([128:132], #2615); this PR only stops discarding
+  the numeric value on the Go side. protocol_wire_v1.json unchanged; no
+  Rust change.
+- **Fail-on-revert proof**: copy-aside `netflow.go`/`ipfix.go`, removed the
+  `InIf: evt.InIf` assignment from both `ExportSessionClose` builders →
+  `TestIPFIXIngressInterfacePopulated` went RED
+  (`FlowRecord.InIf = 0x00000000, want 0xdeadbeef (population reverted)`);
+  restored from backup → GREEN. Gates: go build ./... clean, gofmt -l
+  (touched files) clean, go vet clean, go test ./pkg/flowexport/...
+  ./pkg/logging/... ./pkg/daemon/... all pass.
 ## 2026-06-25 — #2397: persistent-NAT honors permit-any-remote-host=false
 
 - **Timestamp**: 2026-06-25
@@ -16343,6 +16490,31 @@ top.
   pkg/config/ddns_provider_string_test.go, pkg/ddns/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2794 — userspace-dp reconcile `!should_run_afxdp` early arm
+  (`server/helpers.rs reconcile_status_bindings`) left the SAME stale binding
+  survivor class #2515 fixed on the `no_snapshot` reconcile arm. When
+  forwarding goes disarmed/unsupported the arm `stop()`s every worker but then
+  hand-cleared only a SUBSET of the per-binding fields
+  (`bound`/`xsk_registered`/`xsk_bind_mode`/`zero_copy`/`socket_fd`/`ready`/
+  `last_error`), leaving `socket_ifindex`/`socket_queue_id`/`socket_bind_flags`,
+  `flow_cache_capacity`, `active_flow_count` (and every counter gauge) at their
+  pre-teardown values — so `show` reported a disarmed slot as if still bound on
+  its old queue. Fix: after `stop()` (which empties `workers.live` and clears
+  the CoS owner maps), route the per-binding status through
+  `Coordinator::refresh_bindings`, which sends every now-workerless slot through
+  `zero_unbound_slot` (FULL survivor clear) and rebuilds the CoS owner->worker
+  map empty — the identical tail the `no_snapshot` arm runs. Internal reconcile
+  state only; no wire change (protocol_wire_v1.json untouched). Fail-on-revert
+  proof: new test `reconcile_disarmed_clears_full_stale_binding_survivors` seeds
+  a slot with stale socket_ifindex=7/queue_id=3/bind_flags=0x4/
+  flow_cache_capacity=65536/active_flow_count=123/rx_packets=999, disarms, and
+  asserts all are zeroed. With the fix reverted to the partial hand-clear the
+  test goes RED ("#2794: socket_ifindex left stale: left 7, right 0"); restored
+  -> GREEN (copy-restore verified). Gates: cargo build --release -p
+  xpf-userspace-dp clean; cargo test --release --bin xpf-userspace-dp --
+  reconcile coordinator -> 117 passed/0 failed. No Go touched.
+  **File(s)**: userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/server/tests.rs, userspace-dp/src/server/README.md, _Log.md
   **Action**: #2445 — the WireGuard commit-time validator
   (validateWireguardPeersStrict / validateOneWireguardTunnel,
   pkg/config/compiler_validate_wireguard.go) rejected duplicate/malformed
@@ -16395,3 +16567,100 @@ top.
   **File(s)**: userspace-dp/src/afxdp/icmp_ptb.rs,
   userspace-dp/src/afxdp/frame/wg.rs, userspace-dp/src/afxdp/frame/mod.rs,
   userspace-dp/src/afxdp/icmp_ptb_tests.rs, docs/wireguard-interop.md, _Log.md
+  **Action**: #2779 — reject Surface A DDNS operator hostnames that the
+  publish path would SILENTLY rewrite to a different public DNS name. The
+  router-owned Surface A hostname is operator intent (the operator types the
+  exact public name), but the publish path surfaceAName -> sanitizeFQDN
+  (pkg/ddns/hostname.go) lower-cases, strips every non-LDH character, drops
+  labels that sanitize empty, and trims leading/trailing dashes — so
+  wan_1.example.net was published as wan1.example.net with no commit error
+  (codex-review-048 finding 048-08). Fix per the issue's "validate at commit"
+  direction: the `interfaces <if> unit <n> family <af> dynamic-dns hostname`
+  leaf is now a TYPED leaf (new ValueHostname value-type + ValidateDDNSHostname
+  validator). The validator ACCEPTS only names sanitizeFQDN preserves unchanged
+  modulo case-folding + a single trailing dot (both benign DNS
+  canonicalizations) and REJECTS — naming the offending hostname — any name
+  with a non-LDH character, an empty label (leading/doubled/trailing dot), a
+  leading/trailing-dash label, or an over-length label/name. Scope:
+  pkg/config only (schema typing + validator); no pkg/ddns runtime code
+  changed (the sanitizer is now unreachable for a structurally-altering name
+  because commit rejects it first). Fail-on-revert proof: copied
+  pkg/config/schema_validators.go aside, stubbed ValidateDDNSHostname to
+  `return nil`, reran go test ./pkg/config/... ./pkg/ddns/... -run 2779 ->
+  BOTH packages FAILED (config matrix reject cases got nil; pkg/ddns
+  cross-package contract test "validator accepted a name the publish path
+  rewrites"); restored from the copy, all green. Gates: go build ./... clean,
+  gofmt -l (my files) clean, go vet ./pkg/config/... ./pkg/ddns/... clean,
+  go test ./pkg/config/... ./pkg/ddns/... pass.
+  **File(s)**: pkg/config/schema_validators.go,
+  pkg/config/schema_interfaces.go, pkg/config/value_type.go,
+  pkg/config/schema_validate_ddns_hostname_2779_test.go,
+  pkg/ddns/surface_a_hostname_2779_test.go, pkg/ddns/README.md,
+  docs/config-schema.md, _Log.md
+  **Action**: #2792 — eliminate the per-packet heap churn on the
+  WireGuard transit-egress encap path. `frame/wg.rs::wg_encap_frame`
+  allocated TWO heap Vecs per packet: an intermediate `wg_record`
+  scratch (`vec![0u8; wg_record_len]`, pre-#2792 line 228) that
+  `try_encap` wrote the WG transport record into, then a SECOND `out`
+  frame Vec (`vec![0u8; frame_len]`, pre-#2792 line 242) into which the
+  scratch was copied (`copy_from_slice`, pre-#2792 lines 255-257).
+  Both the intermediate Vec AND the copy are removed. `try_encap` writes
+  the WG record (data header + ciphertext + Poly1305 tag) starting at
+  byte 0 of whatever `&mut [u8]` it is handed, so the encap now lands the
+  record DIRECTLY in the output frame's UDP-payload slot
+  (`out[payload_start..payload_start + wg_record_len]`). The output Vec
+  is sized ONCE to the pad-aware maximum record length (same
+  `WG_DATA_HEADER_LEN + pad_to_16(inner) + POLY1305_TAG_LEN` the #2680
+  MTU guard already validated) and truncated to the real encapped length
+  from `EncapOutcome::len`. Soundness: `try_encap` stages the padded
+  plaintext on the stack (MaybeUninit), so snow's non-overlapping
+  plaintext/ciphertext requirement holds without a separate output
+  buffer. Net allocation reduction: 2 Vecs + 1 memcpy -> 1 Vec (the
+  function's owned return value, structurally identical to the GRE
+  sibling `encapsulate_native_gre_frame` and required because the
+  TCP-segmentation caller accumulates one owned frame per segment in a
+  `Vec<Vec<u8>>`). No wire change (protocol_wire_v1.json untouched).
+  Correctness proof: added `wg_encap_in_place_matches_separate_buffer`
+  + an `established_pair` initiator/responder fixture sharing one real
+  Noise handshake. The test encaps via `wg_encap_frame`, slices the WG
+  record out of the produced frame, `try_decap`s it under the paired
+  responder, and asserts the recovered plaintext == the original inner
+  IP packet, plus that the record sits at the exact UDP payload offset,
+  is the exact pad-aware length, and the outer IPv4 total-length / UDP
+  length / frame length all track the truncated record. Fail-on-revert
+  verified: copied wg.rs aside, shifted the encrypt slice by +1 byte
+  (`payload_start + 1`), ran the test -> FAILED (frame build returned
+  None); restored from the copy, all green. Scope: WG transit-egress
+  encrypt path only (no decap/TUN-write #2438, no GRE, no reconcile
+  #2794, no NAT/DDNS). Gates: cargo build --release -p xpf-userspace-dp
+  clean; cargo test --release --bin xpf-userspace-dp -- wg => 200
+  passed / 0 failed.
+  **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  docs/wireguard-interop.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2780 — type the per-interface Surface A `dynamic-dns
+  source-address` leaf (`ValueIPAddress` + `ValidateIPAddress`, reusing
+  the existing GRE/tunnel IP-literal validator — NO new validator added).
+  The leaf was free-form (placeholder only), so any string committed
+  cleanly. The runtime feeds it to `netip.ParseAddr`
+  (`pkg/ddns/backend_bind.go` `resolveBindConfig`), where an unparseable
+  value is a HARD error → the backend falls back to a no-op for that
+  scope and the binding silently stops emitting UPDATEs. The typed leaf
+  rejects a non-IP literal at COMMIT (riding the generic #1319
+  `SchemaValidate` gate: strict at commit via `compileTreeStrict`,
+  lenient/warn on boot-load + peer-sync, identical to the #2779 hostname
+  leaf). Mirrors the #2779 `ValueHostname`/`ValidateDDNSHostname`
+  pattern. Family-mismatch enforcement (v4 record / v6 bind) is left to
+  the runtime + Surface A status — the schema leaf closure has no family
+  context.
+  FAIL-ON-REVERT: copied `schema_interfaces.go` aside, reverted the leaf
+  to the old free-form `{placeholder:"<ip>"}` form, ran
+  `go test ./pkg/config/ -run TestSchemaValidate_DDNSSourceAddress_2780`
+  → FAILED (all 14 reject cases got nil); restored from the copy, green.
+  Gates: go build ./... clean; gofmt -l clean; go vet ./pkg/config/...
+  ./pkg/ddns/... clean; go test ./pkg/config/... ./pkg/ddns/...
+  ./pkg/cmdtree/... all ok.
+  **File(s)**: pkg/config/schema_interfaces.go,
+  pkg/config/schema_validate_ddns_source_address_2780_test.go,
+  docs/config-schema.md, _Log.md

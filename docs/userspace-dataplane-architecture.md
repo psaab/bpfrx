@@ -927,6 +927,41 @@ system {
 - Ensure VM has enough RAM: `workers × bindings × 160 MB + 2 GB` base (at 16384 ring,
   mlx5 driver; 192 MB for virtio_net)
 
+### Control-socket request size cap (#2523, #2744)
+
+Each control-socket request is a single newline-delimited JSON body. The
+helper reads it into memory before any schema validation can run, so a
+malformed or compromised local caller could otherwise stream an
+unbounded line and force a runaway read allocation. Both sides therefore
+bound a single request to a fixed ceiling, **in lockstep**:
+
+- **Rust receiver** — `MAX_CONTROL_REQUEST_BYTES` in
+  `userspace-dp/src/protocol/control.rs`. The accept loop reads at most
+  `cap + 1` bytes via a `take`-bounded `read_until`; a body that hits the
+  cap without a terminating newline is rejected before decode
+  (fail-closed: daemon alive, stale config retained, one log line).
+- **Go sender** — `MaxControlRequestBytes` in
+  `pkg/dataplane/userspace/process.go`. A pre-flight check serializes the
+  request and, if it would exceed the cap, returns an actionable
+  operator-facing config error **at apply time** instead of letting the
+  helper reject it silently after the config is already committed.
+
+**Sizing (#2744):** the dominant scaling dimension is NOT policy/NAT/route
+count (a hand-authored config is a few MB) but **dynamic-feed-backed
+address books** — `AddressBookSnapshot.prefixes_v4/v6` carry feed
+prefixes inline as CIDR text (`buildAddressBookTableWithFeeds`,
+`pkg/dataplane/userspace/policies.go`), bounded only by a per-line
+scanner cap in `pkg/feeds`, not a total-entry cap. The original #2523
+ceiling was 16 MiB and could reject a *legitimate* feed-heavy
+`apply_snapshot` (~500K IPv6 CIDRs ≈ 20+ MiB). #2744 raised the ceiling
+to **64 MiB** — `64 MiB / ~45 B per IPv6 CIDR ≈ 1.4M prefixes`, well
+above realistic large threat-intel feeds while still bounding a single
+request's read allocation to a fixed DoS guard. **The two caps MUST stay
+identical**; the relationship is pinned by
+`TestControlRequestCapLockstepWithRust` (Go) and the
+`legitimate_feed_above_old_16mib_cap_is_now_accepted` /
+`request_above_new_cap_is_still_rejected` fail-on-revert tests (Rust).
+
 ## Limitations and Mixed Boundaries
 
 This section is a high-level architecture note. The authoritative current gate

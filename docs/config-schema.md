@@ -815,6 +815,36 @@ reserved for whole-dataplane selection where a rewrite shim
     `interface` default | `dhcp`), `ttl`, and a per-binding `source-address`
     override. v4 and v6 are INDEPENDENT (distinct fields), like the Surface B
     per-family policy split (#2663).
+    - **`hostname` is a TYPED leaf (#2779, `ValueHostname` + `ValidateDDNSHostname`).**
+      Unlike the DHCP-lease path (where the CLIENT supplies the name and
+      sanitizing untrusted input is reasonable), a router-owned Surface A
+      hostname is OPERATOR INTENT. The publish path (`surfaceAName` →
+      `sanitizeFQDN`) silently lower-cases + strips non-LDH characters + drops
+      empty-sanitizing labels, so a name with an underscore / space / `@` /
+      non-ASCII char / empty label / leading-or-trailing-dash label would be
+      published as a DIFFERENT public DNS name with no error (e.g.
+      `wan_1.example.net` → `wan1.example.net`). The validator REJECTS such a
+      name at commit, naming the offending hostname, so the operator fixes it.
+      ACCEPTED unchanged: LDH labels (`[A-Za-z0-9-]`) joined by single dots,
+      with case-folding and a single trailing dot treated as benign DNS
+      canonicalization. Contract: every name that passes commit is a fixed
+      point of `sanitizeFQDN` (cross-package test
+      `pkg/ddns/surface_a_hostname_2779_test.go`).
+    - **`source-address` is a TYPED leaf (#2780, `ValueIPAddress` +
+      `ValidateIPAddress`, reusing the GRE/tunnel IP-literal validator).** It
+      was free-form. The runtime feeds it to `netip.ParseAddr`
+      (`pkg/ddns/backend_bind.go` `resolveBindConfig`), where an unparseable
+      value is a HARD error: the backend then falls back to a no-op for that
+      scope and the binding SILENTLY stops emitting UPDATEs. Typing the leaf
+      rejects a non-IP literal at commit (naming the `source-address` leaf)
+      instead of committing garbage that disables the scope at runtime. A bare
+      IP only (v4 or v6, no prefix length) — matching `netip.ParseAddr`. The
+      validator has no family context (the leaf closure receives only the raw
+      value), so either family literal commits under either `inet`/`inet6`
+      parent; a genuine v4-record / v6-bind family mismatch is left to the
+      runtime + Surface A status (not a commit-time gate). Regression coverage:
+      `pkg/config/schema_validate_ddns_source_address_2780_test.go`
+      (fail-on-revert accept/reject table).
   - **Reuses the pkg/ddns spine** (`pkg/ddns/surface_a.go`,
     `SurfaceAManager`): the SAME `DNSUpdater`/rfc2136 backend (self-ownership —
     no DHCID), the SAME `ScopeKey`, and the SAME durable-state shape (a separate

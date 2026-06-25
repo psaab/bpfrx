@@ -83,6 +83,32 @@ SYN MSS clamp (#2299, `tunnel_tcp_mss`), the encap MTU guards
 and share `native_gre_inner_mtu` / `wg::mss::wg_inner_mtu` /
 `TunnelKind`.
 
+### Transit-egress encap is no-alloc beyond the owned return (#2792)
+`frame/wg.rs::wg_encap_frame` previously allocated TWO heap `Vec`s per
+packet on the encrypt/transmit path: an intermediate `wg_record` scratch
+that `try_encap` wrote into, then a copy of that scratch into the output
+frame `Vec`. Both the intermediate buffer and the copy are gone. The
+function now sizes the output frame ONCE to the pad-aware maximum WG
+record length (the same `WG_DATA_HEADER_LEN + pad_to_16(inner) +
+POLY1305_TAG_LEN` arithmetic the #2680 MTU guard already validated) and
+hands `try_encap` a `&mut [u8]` over the output frame's UDP-payload slot
+directly — the WG transport record (data header + ciphertext + Poly1305
+tag) is encrypted into its final wire position. The frame is then
+truncated to the actual encapped length reported by `EncapOutcome::len`.
+This is sound because `try_encap` stages the padded plaintext on the
+stack (MaybeUninit), so snow's non-overlapping plaintext/ciphertext
+requirement is satisfied without a separate output buffer. The single
+remaining allocation is the function's OWNED `Vec<u8>` return value,
+which is structurally identical to the GRE sibling
+(`encapsulate_native_gre_frame`) and is required because the
+TCP-segmentation caller accumulates one owned frame per segment in a
+`Vec<Vec<u8>>`. The wire bytes are unchanged: same header bytes, same
+ciphertext+tag, same outer framing — locked by the round-trip
+byte-identity test `wg_encap_in_place_matches_separate_buffer`, which
+decrypts the in-place-written record under the paired peer's transport
+and asserts the recovered plaintext equals the original inner IP packet
+(fails on a wrong encrypt offset / mis-sized buffer / bad truncation).
+
 ### Outer MTU SSOT (#2300 / #2680 / #2517)
 There is now ONE outer-MTU model. The transit-egress encap
 (`frame/wg.rs`) and the control-thread egress (`coordinator/wg_control.rs`)

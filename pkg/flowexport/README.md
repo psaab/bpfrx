@@ -83,9 +83,10 @@ RFC 8158) are appended LAST in every template:
 | postNATDestinationIPv6Address | 282 | ipv6Address | 16 | v6 |
 
 NetFlow v9 reuses the same IANA element type IDs in its template
-FlowSet. With the #2613 drop (below) the IPv4 IPFIX record is 57 bytes
-(45 pre-NAT body + 12 post-NAT) and the IPv6 record is 105 bytes (69 +
-36); the NetFlow v9 record sizes derive from the template via
+FlowSet. With the #2613 drop and the #2749 re-add of `ingressInterface`
+(IE 10, 4B, below) the IPv4 IPFIX record is 61 bytes (45 pre-NAT body +
+4 ingressInterface + 12 post-NAT) and the IPv6 record is 109 bytes (69 +
+4 + 36); the NetFlow v9 record sizes derive from the template via
 `recordSize` (4-byte padded), so they track the template automatically.
 An init-time
 assertion in `ipfix.go` pins `ipfixRecordSizeV4/V6` to the sum of their
@@ -119,14 +120,35 @@ no observed TCP flags, no per-flow direction and no egress ifindex, and
 the Rust encoder hardcodes the ingress-ifindex slot to 0 on close frames
 (`userspace-dp/.../codec.rs::encode_session_close_rt_flow`). So every one
 of those IEs reached collectors as an authoritative zero. The five fields
-are now removed from both NetFlow v9 templates and the IPFIX v4/v6
-templates (and their record encoders / size constants). Populating them
-for real needs a Rust↔Go wire-format extension (re-lay the 136-byte
-frame + conntrack-side TCP-flag/TOS stamping + egress-ifindex tracking),
-tracked in #2749. The `export-extension flow-dir` config knob is still
-accepted but no longer adds `flowDirection`; the compiler now warns when
-it is configured (`compiler_validate_warn.go`), mirroring the existing
-`app-id` warn-not-lie precedent. fail-on-revert pins live in
+were removed from both NetFlow v9 templates and the IPFIX v4/v6 templates
+(and their record encoders / size constants).
+
+**#2749 — `ingressInterface` (IE 10 / IN_SNMP) re-introduced with a real
+value.** The remaining four — SrcTos (5), TCPFlags (6), Direction (61)
+and `egressInterface`/OutputSNMP (14) — still have no SESSION_CLOSE wire
+source and stay dropped (their absence is still pinned by
+`dropped_fields_test.go`). But the ingress ifindex IS on the wire: #2615
+stamps the closing binding's ifindex into the [128:132] slot of the
+136-byte RT_FLOW close frame (the Rust encoder no longer hardcodes 0).
+`pkg/logging/ringbuf.go` already read that slot to resolve a human-facing
+interface NAME; #2749 also retains the raw numeric value
+(`EventRecord.IngressIfindex`), the daemon flow-export callbacks copy it
+into `SessionCloseData.InIf`, and `ExportSessionClose` threads it into
+`FlowRecord.InIf`. Both exporters re-advertise IE 10 (4 bytes, placed
+before the post-NAT trailing block so #2526 offsets are unchanged) and
+write the value. This is a **Go-only** change — no wire-format change was
+needed because the ifindex was already carried since #2615. Presence
+with a real value is pinned by `ingress_interface_test.go`
+(`TestNetflowIngressInterfacePopulated` / `TestIPFIXIngressInterfacePopulated`:
+template advertises IE 10 AND the encoded record carries the session's
+ifindex, not zero). Populating SrcTos/TCPFlags/Direction/`egressInterface`
+for real still needs the Rust↔Go wire-format extension (re-lay/extend the
+close frame + conntrack-side TCP-flag/TOS stamping + egress-ifindex
+tracking on the forwarding path), which remains the deferred scope of
+#2749. The `export-extension flow-dir` config knob is still accepted but
+no longer adds `flowDirection`; the compiler warns when it is configured
+(`compiler_validate_warn.go`), mirroring the `app-id` warn-not-lie
+precedent. The remaining fail-on-revert pins live in
 `dropped_fields_test.go` (template-absence walk + record-layout golden
 that proves the bytes after `protocol` are the real counters, not a
 sentinel TOS/flags block).

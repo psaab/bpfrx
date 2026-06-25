@@ -10,7 +10,7 @@
 
 use super::helpers::{
     bindings_settled, forwarding_unsupported_error, parse_session_sync_mac,
-    set_bindings_forwarding_armed, should_run_afxdp,
+    reconcile_status_bindings, set_bindings_forwarding_armed, should_run_afxdp,
 };
 use super::{handle_stream, ServerState};
 use crate::state_writer::StateWriter;
@@ -153,6 +153,63 @@ fn max_size_legitimate_request_still_succeeds() {
     payload.push(b'\n');
     run_raw(new_state(ProcessStatus::default()), &payload)
         .expect("max-size legitimate request must succeed");
+}
+
+// --- #2744: feed-dimension cap raise (fail-on-revert) -------------------
+
+/// The pre-#2744 ceiling. A legitimate feed-heavy apply_snapshot can
+/// serialize past this (the #2744 case cited ~500K prefixes ≈ 20+ MiB);
+/// such a request must now be ACCEPTED, not rejected. This constant is
+/// hard-coded (NOT derived from MAX_CONTROL_REQUEST_BYTES) so the test
+/// goes RED if the cap is reverted to 16 MiB.
+const OLD_CONTROL_REQUEST_CAP_BYTES: usize = 16 * 1024 * 1024;
+
+#[test]
+fn legitimate_feed_above_old_16mib_cap_is_now_accepted() {
+    // Build a body comfortably above the OLD 16 MiB ceiling but within the
+    // raised cap — this models a large-but-legitimate feed-backed snapshot.
+    // It must be read, decoded, and handled (not rejected at the cap).
+    assert!(
+        OLD_CONTROL_REQUEST_CAP_BYTES < MAX_CONTROL_REQUEST_BYTES,
+        "cap must be raised above the old 16 MiB ceiling (got {MAX_CONTROL_REQUEST_BYTES})"
+    );
+    // 4 MiB above the old cap, with envelope slack below the new cap.
+    let pad_len = OLD_CONTROL_REQUEST_CAP_BYTES + 4 * 1024 * 1024;
+    assert!(
+        pad_len < MAX_CONTROL_REQUEST_BYTES - 4096,
+        "test body {pad_len} must stay within the raised cap {MAX_CONTROL_REQUEST_BYTES}"
+    );
+    let request = req(&"x".repeat(pad_len));
+    let mut payload = serde_json::to_vec(&request).expect("serialize");
+    assert!(
+        payload.len() > OLD_CONTROL_REQUEST_CAP_BYTES,
+        "test body {} must exceed the old 16 MiB cap to prove the raise",
+        payload.len()
+    );
+    assert!(
+        payload.len() <= MAX_CONTROL_REQUEST_BYTES,
+        "test body {} must stay within the raised cap {}",
+        payload.len(),
+        MAX_CONTROL_REQUEST_BYTES
+    );
+    payload.push(b'\n');
+    // Under the old 16 MiB cap this would be rejected with "exceeds
+    // maximum size"; under #2744 it must read/decode/handle cleanly.
+    run_raw(new_state(ProcessStatus::default()), &payload)
+        .expect("a legitimate feed-heavy request above the old 16 MiB cap must now be accepted");
+}
+
+#[test]
+fn request_above_new_cap_is_still_rejected() {
+    // The DoS guard must still bound allocation: one byte past the raised
+    // cap with no terminating newline is rejected before decode.
+    let payload = vec![b'a'; MAX_CONTROL_REQUEST_BYTES + 1];
+    let err = run_raw(new_state(ProcessStatus::default()), &payload)
+        .expect_err("a request past the raised cap must still be rejected");
+    assert!(
+        err.contains("exceeds maximum size"),
+        "expected oversize rejection past the raised cap, got: {err}"
+    );
 }
 
 // --- dispatcher: ping / status / unknown --------------------------------
@@ -803,6 +860,78 @@ fn should_run_afxdp_requires_armed_and_supported() {
     assert!(should_run_afxdp(&status), "armed + supported must run");
     status.forwarding_armed = false;
     assert!(!should_run_afxdp(&status), "unarmed must not run");
+}
+
+#[test]
+fn reconcile_disarmed_clears_full_stale_binding_survivors() {
+    // #2794 fail-on-revert. When `should_run_afxdp` goes false
+    // (forwarding disarmed), `reconcile_status_bindings` takes the early
+    // return arm. Before #2794 that arm hand-cleared only a SUBSET of the
+    // per-binding fields (`bound`/`xsk_registered`/`xsk_bind_mode`/
+    // `zero_copy`/`socket_fd`/`ready`/`last_error`) and left the SAME
+    // survivor class #2515 fixed on the no_snapshot reconcile arm stale:
+    // `socket_ifindex`/`socket_queue_id`/`socket_bind_flags`,
+    // `flow_cache_capacity`, and `active_flow_count`. Routing the arm
+    // through `refresh_bindings` (which sends every now-workerless slot
+    // through `zero_unbound_slot`) clears the FULL set.
+    //
+    // Seed a slot that looks like it was actively bound + forwarding, then
+    // disarm and reconcile. If someone reverts to the partial hand-clear,
+    // the survivor assertions below FAIL (the socket/flow-cache fields
+    // stay non-zero).
+    let state = new_state(ProcessStatus {
+        // forwarding_armed = false -> should_run_afxdp() false -> early arm.
+        forwarding_armed: false,
+        capabilities: UserspaceCapabilities {
+            forwarding_supported: true,
+            unsupported_reasons: Vec::new(),
+        },
+        bindings: vec![BindingStatus {
+            slot: 0,
+            registered: true,
+            // --- the subset the old hand-clear DID reset ---
+            bound: true,
+            xsk_registered: true,
+            xsk_bind_mode: "zero-copy".to_string(),
+            zero_copy: true,
+            socket_fd: 42,
+            ready: true,
+            last_error: "stale".to_string(),
+            // --- the #2794 survivor class the old hand-clear LEFT STALE ---
+            socket_ifindex: 7,
+            socket_queue_id: 3,
+            socket_bind_flags: 0x4,
+            flow_cache_capacity: 65536,
+            active_flow_count: 123,
+            // a representative counter gauge, also a survivor pre-#2794
+            rx_packets: 999,
+            ..BindingStatus::default()
+        }],
+        ..ProcessStatus::default()
+    });
+
+    {
+        let mut guard = state.lock().expect("state");
+        reconcile_status_bindings(&mut guard);
+    }
+
+    let guard = state.lock().expect("state");
+    let b = &guard.status.bindings[0];
+    // Subset the old arm already cleared (regression guard).
+    assert!(!b.bound, "bound must be cleared");
+    assert!(!b.xsk_registered, "xsk_registered must be cleared");
+    assert!(b.xsk_bind_mode.is_empty(), "xsk_bind_mode must be cleared");
+    assert!(!b.zero_copy, "zero_copy must be cleared");
+    assert_eq!(b.socket_fd, 0, "socket_fd must be cleared");
+    assert!(!b.ready, "ready must be cleared");
+    assert!(b.last_error.is_empty(), "last_error must be cleared");
+    // The #2794 survivor class — THESE go RED if the fix is reverted.
+    assert_eq!(b.socket_ifindex, 0, "#2794: socket_ifindex left stale");
+    assert_eq!(b.socket_queue_id, 0, "#2794: socket_queue_id left stale");
+    assert_eq!(b.socket_bind_flags, 0, "#2794: socket_bind_flags left stale");
+    assert_eq!(b.flow_cache_capacity, 0, "#2794: flow_cache_capacity left stale");
+    assert_eq!(b.active_flow_count, 0, "#2794: active_flow_count left stale");
+    assert_eq!(b.rx_packets, 0, "#2794: rx_packets counter left stale");
 }
 
 #[test]

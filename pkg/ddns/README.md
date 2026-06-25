@@ -20,7 +20,7 @@ moved with its assertions intact.
 | `backend.go` | `DNSUpdater` interface, `LeaseDNSRecord`, `nopUpdater`, the record + reverse-PTR-name helpers — moved from `dhcpserver/ddns_dns.go`. |
 | `backend_rfc2136.go` | The LIVE RFC 2136 backend (`rfc2136Updater`): exact-RR adds/deletes, TSIG, RFC 4701 DHCID + RFC 4703 replace-owned two-attempt, the `errDDNSConflictRefused` / `errDDNSPTRPending` sentinels — moved from `dhcpserver/ddns_rfc2136.go`. `sendRemoveForward(..., keepDHCID)` keeps a shared DHCID on a partial dual-stack teardown (#2700); `dnsCanonicalFQDN` mirrors the DHCID FQDN canonicalization. |
 | `hostname.go` | Deterministic hostname → DNS-label normalization (pure) — moved from `dhcpserver/ddns_hostname.go`. |
-| `surface_a.go` | Surface A router/interface-address publish engine (`SurfaceAManager`): change-detection, forced-refresh wire floor, per-scope error backoff, per-RG HA gate, the backend factory `productionSurfaceABackend` (#2691 P2/P3). |
+| `surface_a.go` | Surface A router/interface-address publish engine (`SurfaceAManager`): change-detection, forced-refresh wire floor, per-scope error backoff, per-RG HA gate, the backend factory `productionSurfaceABackend` (#2691 P2/P3). **Operator-hostname intent (#2779):** the publish path (`surfaceAName` → `sanitizeFQDN`) lower-cases + strips non-LDH characters + drops empty-sanitizing labels. For a *router-owned* Surface A record the hostname is operator intent (the operator types the exact public name), so a name that sanitization would STRUCTURALLY change is now a **commit error** (`config.ValidateDDNSHostname` on the typed `interfaces … dynamic-dns hostname` leaf) instead of a silent rewrite to a different DNS name — e.g. `wan_1.example.net` is rejected at commit rather than published as `wan1.example.net`. Case-folding and a single trailing dot are accepted (benign DNS canonicalizations). Every name that PASSES the commit check is a fixed point of `sanitizeFQDN` (cross-package contract test `surface_a_hostname_2779_test.go`), so the published name equals operator intent. |
 | `backend_http.go` | Shared HTTP-backend discipline (#2691 P3): hardened `http.Client` (TLS-verified, bounded timeout), capped body read, `classifyHTTPStatus`, `queryEscape`, the `errHTTPAuth`/`errHTTPRateLimited` verdicts. |
 | `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. |
 | `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → find → PATCH/POST/DELETE record. **Withdraw is content-scoped (#2770):** `DeleteLease` lists EVERY record for the FQDN+type and deletes only the rows whose `content` equals the owned address (`rec.Addr.Unmap().String()`), removing ALL such duplicates. It never deletes a row with a different value (a human/automation changed it after xpf published — an ownership conflict that is a success no-op), honouring the Surface A sole-delete-authority boundary that Route 53 / RFC 2136 also enforce. `recs[0]` is an API-ordering artifact, not ownership. |
@@ -29,7 +29,7 @@ moved with its assertions intact.
 | `backend_route53.go` | Route 53 backend (#2691 P3): SigV4-signed `ChangeResourceRecordSets` UPSERT/DELETE change batch. |
 | `sigv4.go` | Minimal self-contained AWS SigV4 signer for Route 53 (no AWS SDK dependency). |
 | `backend_generic.go` | Generic templated backend (#2691 P3, inadyn "custom"): `%h/%i/%u/%p/%%` URL template + success-substring matcher — config-only, no Go code per provider. **Withdraw (#2772):** a single update template has no portable delete verb and xpf exposes no delete template, so `DeleteLease` FAILS (`errGenericDeleteUnsupported`) rather than silently reporting success; the engine keeps ownership so the abandoned record stays operator-visible (was a silent no-op that dropped ownership while the record kept resolving). |
-| `checkip.go` | Opt-in external check-IP address source (#2691 P3): bogus-IP validity gate + allowlist (`isPublicAddr`, `parseCheckIPBody`, `CheckIP`, `ParseAllowlist`). `CheckIP` fails closed on a malformed `checkip-url` via `validateCheckIPURL` (http(s) scheme + host); a typo is also warned at commit by `config.validateSurfaceADDNSWarnings` so it cannot masquerade as a permanent transient observation failure (#2773). **Public-address gate (#2774):** `isPublicAddr` accepts only a globally-routable unicast address and rejects the full IANA Special-Purpose Address Registry so a hostile/misconfigured checkip endpoint cannot get a martian/reserved address published as the router's A/AAAA record. stdlib `netip` predicates cover unspecified, loopback, link-local (uni + multicast), multicast (incl. interface-local), and the RFC-1918 private ranges (`IsPrivate`: 10/8, 172.16/12, 192.168/16). The `specialPurposeV4`/`specialPurposeV6` prefix tables add the rest: **IPv4** 0.0.0.0/8 (this-network), 100.64/10 (CGNAT), 192.0.0/24 (IETF protocol assignments), 192.0.2/24 + 198.51.100/24 + 203.0.113/24 (TEST-NET-1/2/3 documentation), 192.88.99/24 (6to4 relay anycast), 198.18/15 (benchmarking), 240/4 (reserved), 255.255.255.255/32 (limited broadcast); **IPv6** ::ffff:0:0/96 (IPv4-mapped), 64:ff9b::/96 + 64:ff9b:1::/48 (NAT64), 100::/64 (discard-only), 100:0:0:1::/64 (dummy prefix, RFC 9780 — distinct from 100::/64), 2001::/23 (IETF protocol assignments), 2001:db8::/32 + 3fff::/20 (documentation, RFC 3849/9637), 2002::/16 (6to4), 5f00::/16 (SRv6 SIDs, RFC 9602), fc00::/7 (ULA). |
+| `checkip.go` | Opt-in external check-IP address source (#2691 P3): bogus-IP validity gate + allowlist (`IsPublicAddr`, `parseCheckIPBody`, `CheckIP`, `ParseAllowlist`). `CheckIP` fails closed on a malformed `checkip-url` via `validateCheckIPURL` (http(s) scheme + host); a typo is also warned at commit by `config.validateSurfaceADDNSWarnings` so it cannot masquerade as a permanent transient observation failure (#2773). **Public-address gate (#2774, exported #2776):** `IsPublicAddr` accepts only a globally-routable unicast address and rejects the full IANA Special-Purpose Address Registry so a hostile/misconfigured checkip endpoint cannot get a martian/reserved address published as the router's A/AAAA record. It is exported (#2776) so the daemon's Surface A static-address fallback (`staticUnitAddr`) reuses the SAME predicate instead of a weaker partial filter. stdlib `netip` predicates cover unspecified, loopback, link-local (uni + multicast), multicast (incl. interface-local), and the RFC-1918 private ranges (`IsPrivate`: 10/8, 172.16/12, 192.168/16). The `specialPurposeV4`/`specialPurposeV6` prefix tables add the rest: **IPv4** 0.0.0.0/8 (this-network), 100.64/10 (CGNAT), 192.0.0/24 (IETF protocol assignments), 192.0.2/24 + 198.51.100/24 + 203.0.113/24 (TEST-NET-1/2/3 documentation), 192.88.99/24 (6to4 relay anycast), 198.18/15 (benchmarking), 240/4 (reserved), 255.255.255.255/32 (limited broadcast); **IPv6** ::ffff:0:0/96 (IPv4-mapped), 64:ff9b::/96 + 64:ff9b:1::/48 (NAT64), 100::/64 (discard-only), 100:0:0:1::/64 (dummy prefix, RFC 9780 — distinct from 100::/64), 2001::/23 (IETF protocol assignments), 2001:db8::/32 + 3fff::/20 (documentation, RFC 3849/9637), 2002::/16 (6to4), 5f00::/16 (SRv6 SIDs, RFC 9602), fc00::/7 (ULA). |
 
 Tests moved with the code: `manager_test.go` (engine + state-store + hostname),
 `backend_rfc2136_test.go` (backend, drives a real in-process miekg/dns server),
@@ -316,6 +316,38 @@ its OWN learned address — on top of the SAME spine, without forking the engine
   (never withdraw); a valid-but-Invalid `Addr` (interface down / lease gone) →
   withdraw. Keeping observation in the daemon keeps `pkg/ddns` free of
   netlink/DHCP deps, exactly like the `LeaseParser` seam for Surface B.
+  **Static-address fallback is public-gated (#2776):** when the kernel
+  interface is absent/addressless, `observeInterfaceAddr` falls back to the
+  unit's configured static address via `staticUnitAddr`, which now gates the
+  candidate through the SAME `ddns.IsPublicAddr` predicate the netlink and
+  checkip sources use (exported for this reuse, #2774). A mis-scoped static
+  address (multicast, reserved, ULA, CGNAT, documentation, IANA
+  special-purpose) is SKIPPED and surfaced at WARN rather than silently
+  published as the router's A/AAAA record — the netlink and static paths no
+  longer use divergent publishability predicates (the netlink path already
+  rejected multicast; the fallback previously filtered only loopback/
+  link-local-unicast/unspecified).
+  **IPv6 address-lifetime-aware netlink selection (#2775):** the netlink
+  selection (`selectInterfaceAddr`, the pure core of `observeInterfaceAddr`)
+  now honors RFC 4862 address state instead of publishing the first
+  non-link-local/loopback/multicast address. (1) It NEVER selects an address
+  whose DAD has not succeeded — `IFA_F_TENTATIVE` (DAD in progress),
+  `IFA_F_DADFAILED` (duplicate detected), or `IFA_F_OPTIMISTIC` (RFC 4429
+  optimistic DAD, not yet DAD-confirmed) — publishing one risks a
+  duplicate/black-holed answer. (2) It PREFERS an RFC 4862 `preferred` address
+  over a `deprecated` one (`IFA_F_DEPRECATED`): a deprecated address is being
+  phased out (renumber / PD churn / privacy-address rotation) and will soon be
+  invalid, so publishing it black-holes inbound reachability. The first eligible
+  preferred address wins; a deprecated address is used ONLY when no preferred
+  address exists (never-blackhole — a still-valid deprecated address beats no
+  answer). (3) Every candidate STILL passes `ddns.IsPublicAddr`, so a
+  preferred-but-ULA (or otherwise reserved) address is rejected — the same gate
+  as the static fallback (#2776) and the checkip source. The IFA_F_* flags are
+  already parsed off the netlink `RTM_NEWADDR` message into
+  `netlink.Addr.Flags` (no extra netlink plumbing was needed — they were simply
+  ignored in selection before). A per-family `preferred-address` operator
+  override for multi-address interfaces (the issue's secondary ask) remains a
+  future refinement.
 - **HA gate** is the SAME per-RG `ScopeGate` (a router record on a reth/virtual
   interface publishes only on the RG master; stop-writing-never-withdraw
   otherwise). Standalone (nil gate) always publishes.

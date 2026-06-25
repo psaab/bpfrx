@@ -52,8 +52,8 @@ func TestIPFIXTemplateV4_PostNATFields(t *testing.T) {
 	if sum != ipfixRecordSizeV4 {
 		t.Fatalf("ipfixRecordSizeV4 = %d, want sum(template) = %d", ipfixRecordSizeV4, sum)
 	}
-	if ipfixRecordSizeV4 != 57 {
-		t.Fatalf("ipfixRecordSizeV4 = %d, want 57 (pre-NAT 45 + 12 post-NAT, #2613 dropped 12 unpopulated bytes)", ipfixRecordSizeV4)
+	if ipfixRecordSizeV4 != 61 {
+		t.Fatalf("ipfixRecordSizeV4 = %d, want 61 (pre-NAT 45 + 4 ingressInterface (#2749) + 12 post-NAT)", ipfixRecordSizeV4)
 	}
 }
 
@@ -78,8 +78,8 @@ func TestIPFIXTemplateV6_PostNATFields(t *testing.T) {
 	if sum != ipfixRecordSizeV6 {
 		t.Fatalf("ipfixRecordSizeV6 = %d, want sum(template) = %d", ipfixRecordSizeV6, sum)
 	}
-	if ipfixRecordSizeV6 != 105 {
-		t.Fatalf("ipfixRecordSizeV6 = %d, want 105 (pre-NAT 69 + 36 post-NAT, #2613 dropped 12 unpopulated bytes)", ipfixRecordSizeV6)
+	if ipfixRecordSizeV6 != 109 {
+		t.Fatalf("ipfixRecordSizeV6 = %d, want 109 (pre-NAT 69 + 4 ingressInterface (#2749) + 36 post-NAT)", ipfixRecordSizeV6)
 	}
 }
 
@@ -175,12 +175,11 @@ func TestNetflowTemplateV4_PostNATFields(t *testing.T) {
 			t.Fatalf("v9 v4 template post-NAT field %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
-	// Record size derives from the template; the post-NAT append grows it by
-	// 12 bytes (4+4+2+2). #2613 dropped 11 unpopulated body bytes
-	// (TOS1+TCPFlags1+Dir1+InputSNMP4+OutputSNMP4): the pre-NAT v4 body is now
-	// 39 bytes; +12 post-NAT = 51, padded to 52.
-	if rs := recordSize(netflowTemplateFieldsV4); rs != 52 {
-		t.Fatalf("v9 v4 recordSize = %d, want 52 (39 pre-NAT body + 12 post-NAT, padded; #2613)", rs)
+	// Record size derives from the template. #2613 dropped 11 unpopulated body
+	// bytes; the pre-NAT v4 body is 39 bytes; #2749 re-added ingressInterface
+	// (IE 10, 4B) with a real value; +12 post-NAT = 39+4+12 = 55, padded to 56.
+	if rs := recordSize(netflowTemplateFieldsV4); rs != 56 {
+		t.Fatalf("v9 v4 recordSize = %d, want 56 (39 pre-NAT body + 4 ingressInterface (#2749) + 12 post-NAT, padded)", rs)
 	}
 }
 
@@ -211,9 +210,10 @@ func TestNetflowTemplateV6_PostNATFields(t *testing.T) {
 		}
 	}
 	// #2613 dropped the same 11 unpopulated body bytes: the pre-NAT v6 body is
-	// now 63 bytes; +36 post-NAT = 99, padded to 100.
-	if rs := recordSize(netflowTemplateFieldsV6); rs != 100 {
-		t.Fatalf("v9 v6 recordSize = %d, want 100 (63 pre-NAT body + 36 post-NAT, padded; #2613)", rs)
+	// 63 bytes; #2749 re-added ingressInterface (IE 10, 4B) with a real value;
+	// +36 post-NAT = 63+4+36 = 103, padded to 104.
+	if rs := recordSize(netflowTemplateFieldsV6); rs != 104 {
+		t.Fatalf("v9 v6 recordSize = %d, want 104 (63 pre-NAT body + 4 ingressInterface (#2749) + 36 post-NAT, padded)", rs)
 	}
 }
 
