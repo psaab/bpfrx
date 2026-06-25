@@ -198,7 +198,7 @@ func (errClosed) Timeout() bool { return false }
 // testCfg returns a minimal RA config for an interface.
 func testCfg(iface string) *config.RAInterfaceConfig {
 	return &config.RAInterfaceConfig{
-		Interface:      iface,
+		Interface:       iface,
 		DefaultLifetime: 1800,
 		MaxAdvInterval:  600,
 		MinAdvInterval:  200,
@@ -211,8 +211,8 @@ func testCfg(iface string) *config.RAInterfaceConfig {
 // fakeListen is the test harness wiring listenFn + ensureLinkLocalFn to fakes.
 type fakeListen struct {
 	mu       sync.Mutex
-	conns    map[string]*fakeConn   // most-recent conn per interface
-	allConns map[string][]*fakeConn // EVERY conn ever opened per interface
+	conns    map[string]*fakeConn           // most-recent conn per interface
+	allConns map[string][]*fakeConn         // EVERY conn ever opened per interface
 	prehooks map[string]func(time.Duration) // installed at conn-creation time
 	live     int32
 	liveMu   sync.Mutex
@@ -857,8 +857,8 @@ func TestT7_GracefulUpgradesHard(t *testing.T) {
 		assertGoodbyeIsLast(t, fc.snapshot())
 	}
 
-	run("t7a", modeHard, modeGraceful)     // hard then graceful -> graceful wins
-	run("t7b", modeGraceful, modeHard)     // graceful then hard -> no downgrade
+	run("t7a", modeHard, modeGraceful) // hard then graceful -> graceful wins
+	run("t7b", modeGraceful, modeHard) // graceful then hard -> no downgrade
 }
 
 // T9 — startup burst preserved: a fresh start records exactly
@@ -1197,7 +1197,7 @@ func TestT7c_WithdrawAfterDeadHardSenderEmitsStandaloneGoodbye(t *testing.T) {
 
 	total, conns := fl.goodbyeStats("lo")
 	if conns == 0 {
-		t.Fatalf("no goodbye emitted for the withdrawn interface; a dead hard "+
+		t.Fatalf("no goodbye emitted for the withdrawn interface; a dead hard " +
 			"sender must get a STANDALONE goodbye (#2033 MAJOR 2 dead-sender)")
 	}
 	if conns != 1 || total != goodbyeCount {
@@ -1285,7 +1285,7 @@ func TestT2b_WithdrawDuringRestartWindowEmitsGoodbye(t *testing.T) {
 	// (the restart was aborted).
 	total, conns := fl.goodbyeStats("lo")
 	if conns == 0 {
-		t.Fatalf("no goodbye emitted for the interface withdrawn during the "+
+		t.Fatalf("no goodbye emitted for the interface withdrawn during the " +
 			"restart window (#2033 NEW MAJOR)")
 	}
 	if conns != 1 || total != goodbyeCount {
@@ -1296,7 +1296,7 @@ func TestT2b_WithdrawDuringRestartWindowEmitsGoodbye(t *testing.T) {
 	_, live := m.senders["lo"]
 	m.mu.Unlock()
 	if live {
-		t.Fatal("a replacement sender was started despite the graceful Withdraw "+
+		t.Fatal("a replacement sender was started despite the graceful Withdraw " +
 			"aborting the restart")
 	}
 }
@@ -1515,7 +1515,7 @@ func TestRace3_ApplyDuringStandaloneEmitDefersNoClobber(t *testing.T) {
 		_, live := m.senders["lo"]
 		m.mu.Unlock()
 		if live {
-			t.Fatal("Apply started a live sender DURING the standalone emit "+
+			t.Fatal("Apply started a live sender DURING the standalone emit " +
 				"(clobber; tombstone did not block it) — #2033 race 3")
 		}
 		if lc := fl.liveCount(); lc > 1 {
@@ -1615,7 +1615,7 @@ func TestRace2_TimeoutDoesNotEmitWhileOwnerCouldBeLive(t *testing.T) {
 	_, stillDraining := m.draining["lo"]
 	m.mu.Unlock()
 	if !stillDraining {
-		t.Fatal("releaseDrain removed the tombstone after a timeout; it must be "+
+		t.Fatal("releaseDrain removed the tombstone after a timeout; it must be " +
 			"LEFT HELD (owner may still hold a live conn) — #2033 round-4")
 	}
 
@@ -1712,7 +1712,7 @@ func TestRestartTimeoutNoGoodbyeNoReplacement(t *testing.T) {
 	_, live := m.senders["lo"]
 	m.mu.Unlock()
 	if live {
-		t.Fatal("restart timeout started a replacement sender while the old conn "+
+		t.Fatal("restart timeout started a replacement sender while the old conn " +
 			"may be live — #2033 round-4 MAJOR 2 (≤1-conn)")
 	}
 	if lc := fl.liveCount(); lc > 1 {
@@ -1898,8 +1898,8 @@ func TestRound5_WithdrawDuringRestartDecisionNoReplacementGoodbyeEmitted(t *test
 	// the never-start-after-supersede property, which holds on every interleave.)
 	_ = startCalled
 	if startedDespiteSupersede {
-		t.Fatal("replacement started despite a newer Withdraw superseding the "+
-			"restart at the act moment — stale cached decision across the unlock "+
+		t.Fatal("replacement started despite a newer Withdraw superseding the " +
+			"restart at the act moment — stale cached decision across the unlock " +
 			"— #2033 round-5")
 	}
 }
@@ -2142,12 +2142,264 @@ func TestRound5_ClearDuringRestartDecisionNoReplacement(t *testing.T) {
 	_ = startCalled
 	_ = cfg
 	if startedDespiteSupersede {
-		t.Fatal("restart started a replacement after a newer Clear advanced the "+
+		t.Fatal("restart started a replacement after a newer Clear advanced the " +
 			"epoch at the act moment (stale cached decision) — #2033 round-5")
 	}
 	total, conns := fl.goodbyeStats("lo")
 	if conns != 0 || total != 0 {
 		t.Fatalf("a Clear/restart race emitted a goodbye (%d conns / %d writes); "+
 			"expected 0", conns, total)
+	}
+}
+
+// installGatedListen wires listenFn + ensureLinkLocalFn so that a bind for the
+// named "slow" interface BLOCKS until release is closed (simulating the
+// link-local-settling bind retry that runs up to ~2s), while every other
+// interface binds instantly. It returns release (close to unblock the slow
+// bind) and a getConn accessor. It restores the originals on cleanup.
+//
+// This is the #2453 seam: with the fix the slow bind happens in the sender's
+// OWN goroutine (no m.mu held), so a concurrent manager op on a DIFFERENT
+// interface is unaffected. With the bug (bind under m.mu in startLocked) the
+// slow bind stalls every other manager op.
+func installGatedListen(t *testing.T, slow string) (release func(), liveCount func() int32) {
+	t.Helper()
+	origListen := listenFn
+	origEnsure := ensureLinkLocalFn
+
+	gate := make(chan struct{})
+	var once sync.Once
+	var live int32
+	var liveMu sync.Mutex
+
+	ensureLinkLocalFn = func(*net.Interface) error { return nil }
+	listenFn = func(iface *net.Interface, _ ndp.Addr) (ndpConn, netip.Addr, error) {
+		if iface.Name == slow {
+			<-gate // block the slow interface's bind until released
+		}
+		fc := newFakeConn()
+		fc.liveCounter = &live
+		fc.liveMu = &liveMu
+		liveMu.Lock()
+		live++
+		liveMu.Unlock()
+		return fc, netip.MustParseAddr("fe80::1"), nil
+	}
+
+	release = func() { once.Do(func() { close(gate) }) }
+	liveCount = func() int32 {
+		liveMu.Lock()
+		defer liveMu.Unlock()
+		return live
+	}
+
+	t.Cleanup(func() {
+		// Unblock any owner still parked in the gate, then wait for every conn
+		// opened through this listenFn to be closed by its owner goroutine BEFORE
+		// restoring the package globals. Restoring listenFn while a leaked owner
+		// is still reading/calling it is the data race the race detector flags;
+		// joining on liveCount==0 closes that window deterministically.
+		release()
+		for i := 0; i < 500; i++ {
+			if liveCount() == 0 {
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		listenFn = origListen
+		ensureLinkLocalFn = origEnsure
+	})
+	return release, liveCount
+}
+
+// TestT2453_SlowBindDoesNotStallOtherManagerOps is the #2453 fail-on-revert
+// concurrency proof: a sender whose bind is slow (stuck in the listen retry)
+// MUST NOT hold the manager mutex m.mu, so concurrent manager operations that
+// only need m.mu briefly complete promptly instead of waiting for the bind.
+//
+// The probes are operations that take m.mu and return WITHOUT joining the
+// gated sender (so they isolate "is m.mu held across the bind?" from "does a
+// same-interface withdraw legitimately wait for the owner to exit?"):
+//   - WithdrawInterfaces(["ge-0-0-9"]) — a DIFFERENT interface (the motivating
+//     VRRP-failover-on-another-RG case): finds no sender/tombstone, takes
+//     m.mu, does nothing, returns. With the bug it blocks on m.mu.Lock()
+//     behind startLocked's in-flight listen().
+//   - Status() — takes m.mu, reads, returns.
+//
+// Fail-on-revert: restore the conn-open to run synchronously under m.mu in
+// startLocked (the pre-#2453 behavior) and BOTH probes block on m.mu.Lock()
+// until the gated bind releases, so the assertions below time out and the test
+// FAILS.
+func TestT2453_SlowBindDoesNotStallOtherManagerOps(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	release, liveCount := installGatedListen(t, "lo")
+
+	m := New()
+
+	// Apply on "lo" starts a sender whose bind is GATED (blocks in listen). With
+	// the fix Apply itself returns promptly (the bind runs in the owner
+	// goroutine, NOT under m.mu); run it in the background so the gated bind is
+	// in flight while we contend the lock.
+	applyDone := make(chan error, 1)
+	go func() { applyDone <- m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}) }()
+
+	// Give the gated bind a moment to be in flight (the owner goroutine is parked
+	// in listenFn on <-gate).
+	time.Sleep(50 * time.Millisecond)
+
+	// Probe: concurrent manager ops on a DIFFERENT interface + a Status read.
+	// They must NOT be serialized behind the in-flight bind on "lo". With the
+	// bug they block on m.mu.Lock() until release.
+	probeDone := make(chan struct{}, 1)
+	start := time.Now()
+	go func() {
+		m.WithdrawInterfaces([]string{"ge-0-0-9"})
+		_ = m.Status()
+		probeDone <- struct{}{}
+	}()
+
+	select {
+	case <-probeDone:
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("concurrent manager ops took %v while another interface's "+
+				"bind was in flight — m.mu was held across the bind retry (#2453)", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("concurrent manager ops blocked >500ms behind an in-flight bind " +
+			"on another interface — startLocked is holding m.mu across listen() (#2453)")
+	}
+
+	// Apply (startLocked) itself must also have returned promptly under the fix.
+	select {
+	case <-applyDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Apply blocked behind the in-flight bind — startLocked held " +
+			"m.mu across listen() (#2453)")
+	}
+
+	// Release the gated bind and drain to a known state so the gated owner
+	// goroutine exits before cleanup (cleanup also joins on liveCount==0).
+	release()
+	_ = m.Clear()
+	for i := 0; i < 500; i++ {
+		if liveCount() == 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// TestT2453_NormalStartStillBindsAndSends is the no-regression companion: with
+// the conn-open moved into the owner goroutine, a normal start must still open
+// the conn and emit its startup burst (proving the async open is wired and the
+// owner reaches its send loop).
+func TestT2453_NormalStartStillBindsAndSends(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	getConn, liveCount := installFakeListen(t)
+
+	m := New()
+	if err := m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	fc := waitConn(t, getConn, "lo")
+	// Startup burst is startupBurstCount normal (lifetime>0) RAs.
+	waitWrites(t, fc, startupBurstCount)
+	for _, w := range fc.snapshot() {
+		if w.lifetime == 0 {
+			t.Fatalf("normal start emitted a lifetime-0 (goodbye) RA in its burst")
+		}
+	}
+	if lc := liveCount(); lc != 1 {
+		t.Fatalf("expected exactly 1 live conn after a normal start, got %d", lc)
+	}
+
+	// Clean teardown leaves no live conns.
+	if err := m.Withdraw(); err != nil {
+		t.Fatalf("Withdraw: %v", err)
+	}
+	if lc := liveCount(); lc != 0 {
+		t.Fatalf("leaked %d live conns after Withdraw", lc)
+	}
+}
+
+// TestT2453_WithdrawDuringSlowBindEmitsGoodbye proves the conn==nil safety in
+// finishShutdown: if a graceful Withdraw arrives while the bind is still
+// retrying (so the owner never opens a conn), the manager's release-time
+// backstop still emits exactly one standalone goodbye on a FRESH conn — the
+// route is withdrawn, not silently dropped, and the owner never dereferences a
+// nil conn (which would panic).
+func TestT2453_WithdrawDuringSlowBindEmitsGoodbye(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+
+	origListen := listenFn
+	origEnsure := ensureLinkLocalFn
+	t.Cleanup(func() { listenFn = origListen; ensureLinkLocalFn = origEnsure })
+
+	var mu sync.Mutex
+	allConns := map[string][]*fakeConn{}
+	// The owner's bind never succeeds while gate is open; the standalone backstop
+	// (sendOneGoodbye -> sender.listen) is allowed through once standalone=true.
+	gate := make(chan struct{})
+	var standalone atomic.Bool
+
+	ensureLinkLocalFn = func(*net.Interface) error { return nil }
+	listenFn = func(iface *net.Interface, _ ndp.Addr) (ndpConn, netip.Addr, error) {
+		if !standalone.Load() {
+			// Owner's bind: block until the test releases (then it returns an
+			// error so the owner gives up without a conn).
+			<-gate
+			return nil, netip.Addr{}, errors.New("bind aborted")
+		}
+		fc := newFakeConn()
+		mu.Lock()
+		allConns[iface.Name] = append(allConns[iface.Name], fc)
+		mu.Unlock()
+		return fc, netip.MustParseAddr("fe80::1"), nil
+	}
+
+	m := New()
+	applyDone := make(chan error, 1)
+	go func() { applyDone <- m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}) }()
+	time.Sleep(50 * time.Millisecond) // let the owner park in the gated bind
+
+	// Graceful Withdraw while the bind is still in flight: flips goodbyeWanted,
+	// signals stop (the owner's listen retry aborts via stopCh), then the release
+	// path joins the dead owner (goodbyeEmitted=false, no conn) and emits a
+	// standalone goodbye on a fresh conn.
+	standalone.Store(true) // allow the backstop's fresh-conn bind to succeed
+	close(gate)            // unblock the owner's bind so it gives up promptly
+
+	if err := m.Withdraw(); err != nil {
+		t.Fatalf("Withdraw: %v", err)
+	}
+	<-applyDone
+
+	mu.Lock()
+	conns := append([]*fakeConn(nil), allConns["lo"]...)
+	mu.Unlock()
+	total, connsWithGoodbye := 0, 0
+	for _, c := range conns {
+		n := 0
+		for _, w := range c.snapshot() {
+			if w.lifetime == 0 {
+				n++
+			}
+		}
+		if n > 0 {
+			connsWithGoodbye++
+			total += n
+		}
+	}
+	if connsWithGoodbye != 1 || total != goodbyeCount {
+		t.Fatalf("expected exactly one standalone goodbye (1 conn, %d writes) for "+
+			"a withdraw during a slow bind; got %d conns, %d writes",
+			goodbyeCount, connsWithGoodbye, total)
 	}
 }
