@@ -463,6 +463,20 @@ func interfaceDynamicDNSSchema() *schemaNode {
 			validator:     ValidateIntegerMin(1),
 			children:      nil,
 		},
-		"source-address": {desc: "Source address to bind the UPDATE socket to (overrides the provider's)", args: 1, placeholder: "<ip>", children: nil},
+		"source-address": {
+			desc: "Source address to bind the UPDATE socket to (overrides the provider's)",
+			args: 1,
+			// #2780: the runtime feeds source-address to netip.ParseAddr
+			// (pkg/ddns/backend_bind.go resolveBindConfig). A free-form value
+			// that does not parse is a hard error there, so the backend falls
+			// back to a no-op for that scope and the binding silently stops
+			// emitting UPDATEs. Reject a non-IP literal at commit (reusing the
+			// GRE/tunnel ValidateIPAddress) instead of committing garbage that
+			// disables the scope at runtime. A bare IP only — no prefix length.
+			valueType: ValueIPAddress,
+			valueDesc: "Source IP literal to bind the UPDATE socket to (v4 or v6, no prefix)",
+			validator: ValidateIPAddress,
+			children:  nil,
+		},
 	}}
 }
