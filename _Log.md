@@ -1,3 +1,26 @@
+## 2026-06-25 — #2790: validate learned ARP/NDP neighbor IP before caching
+
+- **Timestamp**: 2026-06-25
+- **Action**: `stage_link_layer_classify` learned the sender protocol
+  address from any ARP reply (and the target IP from any NDP NA) into the
+  userspace `dynamic_neighbors` map and the kernel neighbor table WITHOUT
+  validating the advertised IP — a spoofed reply claiming an unspecified
+  (`0.0.0.0`/`::`), loopback (`127/8`/`::1`), multicast (`224/4`/`ff00::/8`),
+  or IPv4 limited-broadcast (`255.255.255.255`) sender polluted the cache
+  and was programmed into the kernel (routing disruption / DoS;
+  agy-review-048 048-08). Added `frame::neighbor_ip_is_learnable(IpAddr)`
+  (unicast-only gate; rejects the classes above) mirroring the #2367/#2487
+  ICMP-source posture and the cold-neighbor warmer's existing gate, and
+  gated BOTH learn arms (ARP reply + NDP NA) on it. Fail closed: an
+  illegitimate reply is still recycled (ARP/NDP never transits) but no
+  neighbor write occurs. Read-side fix — no wire change (protocol_wire
+  green). Fail-on-revert test `arp_invalid_sender_ip_not_learned_2790`
+  (proved RED with the gate reverted) + predicate test
+  `neighbor_ip_is_learnable_rejects_non_unicast_2790`.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/poll_stages.rs, _Log.md
+
 ## 2026-06-25 — #2786: VRRP IPv6 raw socket SO_BINDTODEVICE VLAN-skip (split-brain)
 
 - **Timestamp**: 2026-06-25
