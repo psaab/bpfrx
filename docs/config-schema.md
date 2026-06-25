@@ -424,9 +424,17 @@ reserved for whole-dataplane selection where a rewrite shim
   `vrrp-group <id>`, dual-AST via `namedInstances`). A commit-time gate
   (`validateWireguardPeersStrict`, `compiler_validate_wireguard.go`)
   hard-rejects a WG tunnel with zero peers, a duplicate or malformed
-  (non-64-hex) peer pubkey, a malformed preshared-key, or
+  (non-64-hex) peer pubkey, a malformed preshared-key,
   endpoint-bearing peers that disagree on outer transport family (one
-  UDP socket = one outer family); the tolerant load / peer-sync path
+  UDP socket = one outer family), or an EXACT-duplicate `allowed-ips`
+  prefix across two peers (#2445 — the cryptokey routing table maps a
+  prefix to exactly one peer, so an exact tie has no longest-prefix
+  winner and the engine LPM resolves it by insertion order, silently
+  blackholing the loser; the check canonicalizes each CIDR to its masked
+  network so `10.0.0.5/24` and `10.0.0.0/24` collide, while a
+  broader/narrower OVERLAP — a `0.0.0.0/0` catch-all peer plus a
+  more-specific peer — stays valid because LPM resolves it
+  deterministically); the tolerant load / peer-sync path
   (`lenientWireguardPeers`) downgrades these to warnings so an
   already-persisted or peer-synced config still boots (#1960). The
   compiler sorts `WgPeers` by pubkey at the snapshot-builder boundary so
