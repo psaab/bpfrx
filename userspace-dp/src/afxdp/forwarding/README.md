@@ -44,15 +44,27 @@ Route metadata crosses the Go→Rust snapshot boundary as `RouteSnapshot`
   egress inference at build time, `infer_connected_route_target_*`,
   stays global — that resolves "which interface reaches this gateway IP",
   not a destination egress.)
-- **ECMP: all next-hops retained, dead ones skipped (#2389).** A static
-  route keeps EVERY configured next-hop (`RouteEntryV4::next_hops:
-  Vec<RouteNextHopV4>`). `select_route_next_hop` prefers a candidate with
-  a resolved neighbor (so a dead first next-hop no longer blackholes a
-  route with a healthy alternate), then distributes across the live
-  candidates by a fixed-seed hash of the destination IP (`ecmp_hash_*`).
-  Distribution is per-DESTINATION today — the 5-tuple flow hash is not
-  plumbed into the resolution layer; true per-flow ECMP spread is a
-  localized follow-up enabled by the retained candidate vector. The
+- **ECMP: all next-hops retained, dead ones skipped (#2389), per-FLOW
+  spread (#2734).** A static route keeps EVERY configured next-hop
+  (`RouteEntryV4::next_hops: Vec<RouteNextHopV4>`). `select_route_next_hop`
+  prefers a candidate with a resolved neighbor (so a dead first next-hop
+  no longer blackholes a route with a healthy alternate), then distributes
+  across the live candidates by a spread hash. **#2734: the spread key is
+  per-FLOW.** The session resolution path
+  (`lookup_forwarding_resolution_with_dynamic_for_flow`) hashes the forward
+  5-tuple with `ecmp_hash_flow` — the SAME per-boot seeded `FxHasher` the
+  flow cache uses (`hot_hash_seed::hot_path_hash_seed`, #2364), so distinct
+  flows to the same destination spread across equal-cost members while
+  every packet of one flow pins to one member (flow-consistent, no
+  intra-flow reordering; the resolution is cached on the session entry).
+  The hash reduces modulo the LIVE-member count, so the spread tracks the
+  live pool and the dead-NH fallback is preserved. Callers without a flow
+  context (tunnel/WG outer resolution, `inject`, bare-dst lookups) pass
+  `ecmp_flow_hash = None`, which falls back to the per-DESTINATION hash
+  (`ecmp_hash_v4`/`ecmp_hash_v6`, the #2389 behavior). The seed is
+  node-local (ECMP picks among THIS node's members and is not wire/HA
+  state), so an HA peer re-derives its own pick under its own seed — the
+  same property the flow cache and fabric-queue hash already rely on. The
   legacy `RouteEntryV4::{ifindex,next_hop,tunnel_endpoint_id}` accessors
   return the FIRST candidate for non-multipath call sites.
 - **Preference tie-break before insertion order (#2390).**
