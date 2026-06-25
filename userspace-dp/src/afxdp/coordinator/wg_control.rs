@@ -1218,7 +1218,22 @@ fn sockaddr_storage_to_socketaddr(
             let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
             let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
             let port = u16::from_be(sin6.sin6_port);
-            Some(SocketAddr::new(std::net::IpAddr::V6(ip), port))
+            // #2995: preserve `sin6_scope_id` (and `sin6_flowinfo`). A
+            // link-local WG peer endpoint (`fe80::/10`) carries the
+            // receiving interface scope in the kernel-populated
+            // `sockaddr_in6`; `SocketAddr::new` would drop it (scope_id =
+            // 0), and the next `wg_send_to` toward that learned endpoint
+            // would be rejected with EINVAL/ENODEV (a link-local
+            // destination requires a non-zero scope). For a global v6
+            // endpoint `sin6_scope_id` is already 0, so this is a no-op
+            // there. `sin6_scope_id` / `sin6_flowinfo` are stored in host
+            // byte order by the kernel, so no byte-swap is applied.
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                ip,
+                port,
+                sin6.sin6_flowinfo,
+                sin6.sin6_scope_id,
+            )))
         }
         _ => None,
     }
@@ -1573,6 +1588,88 @@ mod tests {
         let mut buf = [0u8; 16];
         let (n, _) = rx.recv_from(&mut buf).expect("datagram must arrive");
         assert_eq!(&buf[..n], b"wg-v4");
+    }
+
+    /// Build a `recvmsg`-shaped `sockaddr_storage` for an AF_INET6 peer
+    /// with an explicit interface scope, mirroring what the kernel writes
+    /// into `msg_name` for a datagram received from a link-local source.
+    fn make_sin6_storage(
+        ip: Ipv6Addr,
+        port: u16,
+        flowinfo: u32,
+        scope_id: u32,
+    ) -> (libc::sockaddr_storage, libc::socklen_t) {
+        let sin6 = libc::sockaddr_in6 {
+            sin6_family: libc::AF_INET6 as libc::sa_family_t,
+            sin6_port: port.to_be(),
+            sin6_flowinfo: flowinfo,
+            sin6_addr: libc::in6_addr {
+                s6_addr: ip.octets(),
+            },
+            sin6_scope_id: scope_id,
+        };
+        // SAFETY: sockaddr_storage is large enough for sockaddr_in6 and we
+        // only read back the populated prefix via the conversion under test.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &sin6 as *const libc::sockaddr_in6 as *const u8,
+                &mut storage as *mut libc::sockaddr_storage as *mut u8,
+                std::mem::size_of::<libc::sockaddr_in6>(),
+            );
+        }
+        (
+            storage,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    }
+
+    /// #2995 fail-on-revert: a link-local (`fe80::/10`) WG peer endpoint
+    /// learned from `recvmsg` MUST carry the receiving interface scope
+    /// (`sin6_scope_id` = ifindex) through `sockaddr_storage_to_socketaddr`.
+    /// If the conversion reverts to `SocketAddr::new(...)` the scope is
+    /// dropped to 0 and `wg_send_to` toward the endpoint is rejected with
+    /// EINVAL/ENODEV, so the tunnel never establishes. This asserts the
+    /// scope (and `sin6_flowinfo`) survive; it goes RED if scope_id == 0.
+    #[test]
+    fn sockaddr_storage_to_socketaddr_preserves_link_local_scope() {
+        let ll = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x1);
+        let ifindex: u32 = 7;
+        let flowinfo: u32 = 0x0001_2345;
+        let (storage, len) = make_sin6_storage(ll, 51820, flowinfo, ifindex);
+        let got = sockaddr_storage_to_socketaddr(&storage, len)
+            .expect("AF_INET6 storage must convert");
+        match got {
+            SocketAddr::V6(v6) => {
+                assert_eq!(*v6.ip(), ll);
+                assert_eq!(v6.port(), 51820);
+                assert_eq!(
+                    v6.scope_id(),
+                    ifindex,
+                    "link-local scope_id must equal the receiving ifindex \
+                     (reverting to SocketAddr::new drops it to 0)"
+                );
+                assert_eq!(v6.flowinfo(), flowinfo, "flowinfo must survive");
+            }
+            other => panic!("expected V6, got {other:?}"),
+        }
+    }
+
+    /// A global v6 endpoint carries scope_id 0 from the kernel; the
+    /// conversion must preserve that 0 unchanged (the fix is a no-op for
+    /// global addresses — it only matters for link-local).
+    #[test]
+    fn sockaddr_storage_to_socketaddr_global_v6_scope_zero() {
+        let g = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1);
+        let (storage, len) = make_sin6_storage(g, 51820, 0, 0);
+        let got = sockaddr_storage_to_socketaddr(&storage, len).expect("convert");
+        match got {
+            SocketAddr::V6(v6) => {
+                assert_eq!(*v6.ip(), g);
+                assert_eq!(v6.scope_id(), 0);
+            }
+            other => panic!("expected V6, got {other:?}"),
+        }
     }
 
     // =======================================================================
