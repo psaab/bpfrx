@@ -1,5 +1,7 @@
 # Action Log
 
+## 2026-06-24 — #2689 review fold: `from as-path` bracket-collapse (sibling reader, same function) — routed through firewallMatchValues + 3 fail-on-revert tests; children-path only (brackets never reach the inline-keys path). Files: pkg/config/compiler_routing.go, pkg/config/policy_from_multileaf_2689_test.go, docs/config-schema.md, _Log.md
+
 ## 2026-06-24 — #2689 fix: policy-term `from community` / `from prefix-list` dropped all but first bracketed value
 
 - **Timestamp**: 2026-06-24

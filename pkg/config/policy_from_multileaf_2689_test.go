@@ -133,3 +133,55 @@ func TestPolicyFromPrefixListBracketPlusSibling_2689(t *testing.T) {
 		t.Errorf("PrefixList = %v, want %v (bracket+sibling composition)", term.PrefixList, want)
 	}
 }
+
+// --- from as-path (review fold: sibling reader in the same function) ---
+
+func TestPolicyFromASPathBracketFlatSet_2689(t *testing.T) {
+	cfg, err := compileSet(t, []string{
+		"set policy-options policy-statement P term T from as-path [ a1 a2 ]",
+		"set policy-options policy-statement P term T then accept",
+	})
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	term := cfg.PolicyOptions.PolicyStatements["P"].Terms[0]
+	want := []string{"a1", "a2"}
+	if !equalStrs(term.FromASPath, want) {
+		t.Errorf("FromASPath = %v, want %v (trailing as-path dropped without firewallMatchValues)", term.FromASPath, want)
+	}
+}
+
+func TestPolicyFromASPathBracketHierarchical_2689(t *testing.T) {
+	src := `policy-options {
+    policy-statement P {
+        term T {
+            from {
+                as-path [ a1 a2 ];
+            }
+            then accept;
+        }
+    }
+}`
+	cfg := mustCompile(t, src)
+	term := cfg.PolicyOptions.PolicyStatements["P"].Terms[0]
+	want := []string{"a1", "a2"}
+	if !equalStrs(term.FromASPath, want) {
+		t.Errorf("FromASPath = %v, want %v", term.FromASPath, want)
+	}
+}
+
+func TestPolicyFromASPathBracketPlusSibling_2689(t *testing.T) {
+	cfg, err := compileSet(t, []string{
+		"set policy-options policy-statement P term T from as-path [ a1 a2 ]",
+		"set policy-options policy-statement P term T from as-path a3",
+		"set policy-options policy-statement P term T then accept",
+	})
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	term := cfg.PolicyOptions.PolicyStatements["P"].Terms[0]
+	want := []string{"a1", "a2", "a3"}
+	if !equalStrs(term.FromASPath, want) {
+		t.Errorf("FromASPath = %v, want %v (bracket+sibling composition)", term.FromASPath, want)
+	}
+}

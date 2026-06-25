@@ -639,10 +639,12 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 					// nodeVal-only read kept just the first list entry (#2689).
 					term.FromCommunity = append(term.FromCommunity, firewallMatchValues(fc)...)
 				case "as-path":
-					// Repeated `as-path` siblings match ANY (#2642).
-					if v := nodeVal(fc); v != "" {
-						term.FromASPath = append(term.FromASPath, v)
-					}
+					// Repeated `as-path` siblings match ANY (#2642). A bracketed
+					// list `as-path [ a1 a2 ]` ALSO collapses onto one leaf's
+					// Keys[1:] / Children in BOTH AST shapes (#2419), so read
+					// every value via the firewallMatchValues SSOT — the prior
+					// nodeVal-only read kept just the first list entry (#2689).
+					term.FromASPath = append(term.FromASPath, firewallMatchValues(fc)...)
 				}
 			}
 		case "then":
