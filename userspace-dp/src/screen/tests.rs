@@ -1355,7 +1355,12 @@ fn icmp_flood_triggers() {
 }
 
 #[test]
-fn icmp_flood_resets_on_new_window() {
+fn icmp_flood_sliding_window_blocks_boundary_burst_then_recovers() {
+    // #2937: the rate counter is a two-bucket sliding window, NOT a fixed
+    // wall-second window. After the budget is exhausted in second 100, the
+    // immediately following second (101) must NOT hand out a fresh full
+    // budget — the previous second's tally still counts for the whole of
+    // second 101. A full empty second must elapse before the budget frees.
     let mut profile = ScreenProfile::default();
     profile.icmp_flood_threshold = 2;
     let mut state = make_state("trust", profile);
@@ -1366,13 +1371,23 @@ fn icmp_flood_resets_on_new_window() {
     );
     assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
     assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
-    // Exceeds in window 100
+    // Exceeds in window 100.
     assert_eq!(
         state.check_packet("trust", &pkt, 100),
         ScreenVerdict::Drop("icmp-flood")
     );
-    // New window (101) resets
-    assert_eq!(state.check_packet("trust", &pkt, 101), ScreenVerdict::Pass);
+    // Boundary into second 101: the previous second contributed 3 events,
+    // so the trailing 1-second sum is already over the threshold and the
+    // first packet of the new second is still dropped (fixed-window reset
+    // would have admitted it — that was the boundary-burst bug).
+    assert_eq!(
+        state.check_packet("trust", &pkt, 101),
+        ScreenVerdict::Drop("icmp-flood")
+    );
+    // After a full empty second (102 has no traffic from 101), second 103
+    // sees prev_count == 0 and admits the budget again.
+    assert_eq!(state.check_packet("trust", &pkt, 103), ScreenVerdict::Pass);
+    assert_eq!(state.check_packet("trust", &pkt, 103), ScreenVerdict::Pass);
 }
 
 // ================================================================
@@ -2056,10 +2071,25 @@ fn syn_cookie_standby_ack_validation_is_rate_limited() {
     );
     assert_eq!(peer.syn_cookie_validated_len(), 0);
 
+    // #2937: the standby budget is a SLIDING 1-second window, not a fixed
+    // wall-second one. The immediately following second (129) must NOT
+    // hand out a fresh full budget — the prior second's saturated tally
+    // still counts, so the attacker cannot double its plausible-ACK
+    // allowance by straddling the boundary. A valid ACK at 129 stays
+    // capped.
     assert_eq!(
         peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &valid_ack, 129),
+        SynCookieAckVerdict::NotApplicable,
+        "boundary crossing must not reset the standby validation budget"
+    );
+    assert_eq!(peer.syn_cookie_validated_len(), 0);
+
+    // After a full empty second (130 saw no traffic from 129), second 131
+    // observes prev_count == 0 and the budget is available again.
+    assert_eq!(
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &valid_ack, 131),
         SynCookieAckVerdict::Validated,
-        "the standby guard is per-second and recovers on the next window"
+        "the standby guard recovers after a full quiet second"
     );
     assert_eq!(peer.syn_cookie_validated_len(), 1);
 }

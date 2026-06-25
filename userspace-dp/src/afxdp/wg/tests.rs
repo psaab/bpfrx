@@ -1294,6 +1294,107 @@ fn decap_rejects_inner_ipv4_with_invalid_ihl_or_total_length() {
     }
 }
 
+/// #2910 fail-on-revert: WG §5.4.6 trailing padding is length-driven on
+/// receive — the receiver reads the inner-IP length and discards the
+/// remainder. It MUST NOT reject a transport record merely because the
+/// trailing padding bytes are non-zero (kernel WireGuard / wireguard-go
+/// do not require zero padding; the AEAD tag already authenticates the
+/// whole plaintext so non-zero padding is not forgeable). Pre-fix,
+/// `inner_ip_len_after_decap` ran `if pkt[claimed..].any(|b| b != 0) {
+/// return None }` and the whole decap surfaced `MalformedInner` for such
+/// a record — a real interop cliff. Post-fix it truncates to the inner
+/// length and delivers.
+///
+/// We cannot drive this through `try_encap` (the encap path always
+/// zero-pads). Instead we reach into the established session's snow
+/// transport, encrypt a hand-crafted plaintext of `valid 40-byte IPv4
+/// packet || 8 NON-ZERO padding bytes` (48 total = a 16-byte multiple),
+/// frame it with the WG data header keyed on the peer-chosen
+/// `receiver_index`, and decap it on the responder. The assertions:
+///   - decap SUCCEEDS (RED before the fix — it returned MalformedInner),
+///   - `dec.len == 40` (the inner-IP length, NOT the 48-byte padded
+///     plaintext — proves the forwarded packet is bounded by the
+///     AEAD-validated inner length, not the padded length),
+///   - `plain[..40]` equals the original inner packet,
+///   - `plain[40..48]` (the non-zero pad) is OUTSIDE `dec.len` and so is
+///     never forwarded.
+#[test]
+fn decap_accepts_nonzero_trailing_padding_and_bounds_to_inner_len() {
+    use super::framing::encode_data_header;
+    use std::sync::atomic::Ordering;
+
+    let (init_engine, resp_engine, init_pub, _resp_pub) = established_pair(
+        vec!["10.0.1.0/24".parse().unwrap()],
+        vec!["10.0.0.0/24".parse().unwrap()],
+    );
+
+    // Inner IPv4 packet: src 10.0.0.5 (inside the responder's AllowedIPs
+    // for the initiator → passes the receive-side cryptokey gate),
+    // total_length = 40.
+    let inner = ipv4_packet(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 1, 5));
+    assert_eq!(inner.len(), 40);
+
+    // Plaintext to encrypt = inner || 8 non-zero padding bytes. 48 is a
+    // 16-byte multiple, the WG §5.4.6 padded form — but with a non-zero
+    // pad that a conforming sender is permitted to emit and that the old
+    // code rejected.
+    let mut plaintext = inner.clone();
+    plaintext.extend_from_slice(&[0xAB; 8]);
+    assert_eq!(plaintext.len() % 16, 0, "padded to a 16-byte multiple");
+
+    // Grab the initiator's session and use its snow transport to encrypt
+    // our crafted plaintext directly (the public encap API would zero the
+    // pad). The session's `peer_index` is the receiver_index the
+    // responder demuxes on.
+    let init_session = init_engine
+        .sessions_by_local_index
+        .read()
+        .unwrap()
+        .get(&0xaaaa_0001)
+        .cloned()
+        .expect("initiator session installed by established_pair");
+    let counter = init_session
+        .next_tx_counter()
+        .expect("fresh session has counter space");
+
+    let mut wire = vec![0u8; super::WG_DATA_HEADER_LEN + plaintext.len() + super::POLY1305_TAG_LEN];
+    encode_data_header(&mut wire, init_session.peer_index, counter)
+        .expect("header buffer is large enough");
+    let n = init_session
+        .transport
+        .write_message(counter, &plaintext, &mut wire[super::WG_DATA_HEADER_LEN..])
+        .expect("snow encrypt of crafted plaintext");
+    let record_len = super::WG_DATA_HEADER_LEN + n;
+
+    let mut plain = [0u8; 2048];
+    let dec = resp_engine
+        .try_decap(&wire[..record_len], &mut plain)
+        .expect(
+            "decap must accept a record whose trailing WG padding is \
+             non-zero (#2910); pre-fix this returned MalformedInner",
+        );
+
+    assert_eq!(dec.peer_pubkey, init_pub);
+    assert_eq!(
+        dec.len, 40,
+        "forwarded length must be the inner-IP length (40), not the \
+         48-byte padded plaintext — pad bytes are dropped, not forwarded"
+    );
+    assert_eq!(
+        &plain[..dec.len],
+        &inner[..],
+        "delivered bytes must be exactly the inner IPv4 packet"
+    );
+    assert_eq!(
+        resp_engine
+            .counters()
+            .decap_packets
+            .load(Ordering::Relaxed),
+        1,
+        "the record counts as a successfully decapped data packet"
+    );
+}
+
 /// r-final-fix regression for Copilot inline finding on
 /// `TunnelEndpointSnapshot::wg_local_privkey_hex`: the private key
 /// field MUST NOT be serialized into the on-disk state file, and a

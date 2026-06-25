@@ -126,8 +126,8 @@ func (eb *EventBuffer) unsubscribe(sub *Subscription) {
 // EventFilter specifies criteria for filtering events.
 type EventFilter struct {
 	Zone     uint16 // match if InZone or OutZone equals this; 0 = no filter
-	Protocol string // case-insensitive substring match on Protocol
-	Action   string // case-insensitive substring match on Action
+	Protocol string // exact case-insensitive match on Protocol ("" = no filter)
+	Action   string // exact case-insensitive match on Action ("" = no filter)
 }
 
 // IsEmpty returns true if no filter criteria are set.
@@ -139,10 +139,15 @@ func (f EventFilter) matches(rec *EventRecord) bool {
 	if f.Zone != 0 && rec.InZone != f.Zone && rec.OutZone != f.Zone {
 		return false
 	}
-	if f.Protocol != "" && !strings.Contains(strings.ToLower(rec.Protocol), strings.ToLower(f.Protocol)) {
+	// Exact (case-insensitive) match, NOT substring: substring matching
+	// over-matches for forensic queries — protocol=C would match TCP,
+	// ICMP, and ICMPv6 simultaneously, and action substrings are equally
+	// ambiguous (#2939). This aligns the event filter with the exact
+	// matching the other operator surfaces use.
+	if f.Protocol != "" && !strings.EqualFold(rec.Protocol, f.Protocol) {
 		return false
 	}
-	if f.Action != "" && !strings.Contains(strings.ToLower(rec.Action), strings.ToLower(f.Action)) {
+	if f.Action != "" && !strings.EqualFold(rec.Action, f.Action) {
 		return false
 	}
 	return true
