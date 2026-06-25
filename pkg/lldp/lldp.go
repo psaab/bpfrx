@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/psaab/xpf/pkg/linuxsock"
 	"golang.org/x/sys/unix"
 )
 
@@ -125,7 +126,7 @@ var newIfSessionFn = newIfSession
 // newIfSession opens and binds the RX socket and opens the TX socket for one
 // interface. Both fds live for the Apply generation and are released by close().
 func newIfSession(iface *net.Interface) (*ifSession, error) {
-	rxFD, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(etherTypeLLDP)))
+	rxFD, err := linuxsock.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(etherTypeLLDP)))
 	if err != nil {
 		return nil, fmt.Errorf("lldp: rx socket: %w", err)
 	}
@@ -139,7 +140,7 @@ func newIfSession(iface *net.Interface) (*ifSession, error) {
 	// No SO_RCVTIMEO: recv blocks indefinitely and is unblocked by closing the
 	// fd in close(), not by a polling timeout.
 
-	txFD, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
+	txFD, err := linuxsock.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
 	if err != nil {
 		unix.Close(rxFD)
 		return nil, fmt.Errorf("lldp: tx socket: %w", err)
