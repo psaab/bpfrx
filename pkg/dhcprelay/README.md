@@ -38,7 +38,7 @@ carries server-bound options, per RFC 2131 §3.4:
 | `INFORM` | yes (#2153) | client already holds an address, asks only for supplemental parameters (DNS/domain/NTP) |
 | `DECLINE` | no | broadcast by the client on address conflict (RFC 2131 §4.4); not relayed (out of scope for #2153) |
 | `RELEASE` | no | unicast by the client to its bound server; no relay-agent obligation |
-| server reply types (`OFFER`/`ACK`/`NAK`) | n/a | not client-originated; the client→server gate never sees them. The reverse server→client path (`handleServerResponses`) forwards `OFFER`, `ACK`, and `NAK` (#2606) — see the reply matrix below |
+| server reply types (`OFFER`/`ACK`/`NAK`/`FORCERENEW`) | n/a | not client-originated; the client→server gate never sees them. The reverse server→client path (`handleServerResponses`) forwards `OFFER`, `ACK`, `NAK` (#2606), and `FORCERENEW` (#2645) — see the reply matrix below |
 
 The `INFORM` reply (a server-issued `ACK` with no `yiaddr` but a real
 `ciaddr`) is delivered by the matrix below via the "flag clear, `yiaddr==0`,
@@ -47,8 +47,8 @@ its address.
 
 ## Reply delivery model (#2076)
 
-Server replies (OFFER/ACK/NAK) are delivered to clients honoring the RFC 2131
-§4.1 broadcast flag:
+Server replies (OFFER/ACK/NAK/FORCERENEW) are delivered to clients honoring the
+RFC 2131 §4.1 broadcast flag:
 
 | Condition | Delivery |
 |-----------|----------|
@@ -70,6 +70,18 @@ ahead of the matrix above: a NAK carries no binding (`yiaddr==0`), the client
 has no usable address, and broadcasting also prevents a server that
 erroneously echoes a stale `ciaddr` from steering the NAK into a UDP unicast to
 an address the client does not own.
+
+**DHCPFORCERENEW (#2645).** A server sends `DHCPFORCERENEW` (RFC 3203, message
+type 9) to a client that **already holds a lease** to force it back into the
+`RENEWING` state ahead of its T1 timer (for example, to push a configuration
+change). Before #2645 `handleServerResponses` dropped it via the `default` arm,
+so a server could never reach a relayed client. It is now forwarded. Unlike a
+NAK, FORCERENEW is **not** force-broadcast: the target client owns a current
+address (carried in `ciaddr`, `yiaddr==0`) and answers ARP for it, so the reply
+matrix routes it through the normal "flag clear, `yiaddr==0`, real `ciaddr`"
+UDP-unicast row — the same row that delivers an INFORM `ACK`. The relay only
+forwards the message; RFC 3203's RFC-3118 authentication is end-to-end between
+client and server and is out of scope for the relay agent.
 
 **Why raw L2 (`l2send_linux.go`).** A client in SELECTING/REQUESTING that
 clears the broadcast flag has **not yet configured** the offered address,
