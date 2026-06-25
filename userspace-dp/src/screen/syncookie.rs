@@ -9,7 +9,11 @@
 //! - `SipHash24` (private MAC primitive)
 //! - `SynCookieValidatedCache` (4-way set-associative recent-validated
 //!   cookie cache so the ACK+SYN bypass path doesn't re-validate per
-//!   packet)
+//!   packet). Keyed by `(zone_id, profile_gen, 4-tuple)` (#2446): the
+//!   per-zone SYN-cookie profile generation is stamped on insert and
+//!   compared on consume, so a tuple validated under an old profile is a
+//!   miss after the zone's SYN-cookie profile changes (the new profile's
+//!   SYN-flood counter then re-sees the connection).
 
 use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -375,6 +379,15 @@ impl SipHash24 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct SynCookieValidatedKey {
     zone_id: u16,
+    /// Per-zone SYN-cookie profile generation captured at validation time
+    /// (#2446). A cached entry is only consumable while the zone's current
+    /// generation still matches: a SYN-cookie-relevant profile change
+    /// (disable/re-enable, syn-flood-threshold change, zone→profile
+    /// rebinding) bumps the generation, so a tuple validated under the old
+    /// profile is treated as a miss and re-validated under the new profile —
+    /// the new profile's SYN-flood counter then sees the connection. The
+    /// master-key-change `set_hash_keys` clear remains as defense in depth.
+    profile_gen: u64,
     tuple: SynCookieTuple,
 }
 
@@ -428,11 +441,21 @@ impl SynCookieValidatedCache {
         }
     }
 
-    pub(super) fn insert(&mut self, zone_id: u16, tuple: SynCookieTuple, now_secs: u64) {
+    pub(super) fn insert(
+        &mut self,
+        zone_id: u16,
+        profile_gen: u64,
+        tuple: SynCookieTuple,
+        now_secs: u64,
+    ) {
         if self.sets.is_empty() {
             return;
         }
-        let key = SynCookieValidatedKey { zone_id, tuple };
+        let key = SynCookieValidatedKey {
+            zone_id,
+            profile_gen,
+            tuple,
+        };
         let set_index = self.set_index(&key);
         self.clock = self.clock.wrapping_add(1);
         let set = &mut self.sets[set_index];
@@ -477,13 +500,18 @@ impl SynCookieValidatedCache {
     pub(super) fn take_valid(
         &mut self,
         zone_id: u16,
+        profile_gen: u64,
         tuple: SynCookieTuple,
         now_secs: u64,
     ) -> bool {
         if self.sets.is_empty() {
             return false;
         }
-        let key = SynCookieValidatedKey { zone_id, tuple };
+        let key = SynCookieValidatedKey {
+            zone_id,
+            profile_gen,
+            tuple,
+        };
         let set_index = self.set_index(&key);
         let set = &mut self.sets[set_index];
         let mut valid = false;
@@ -530,6 +558,7 @@ impl SynCookieValidatedCache {
     fn key_hash(&self, key: &SynCookieValidatedKey) -> u64 {
         let mut sip = SipHash24::new(self.hash_keys[0], self.hash_keys[1]);
         sip.write_u16(key.zone_id);
+        sip.write_u64(key.profile_gen);
         sip.write_ip(key.tuple.src_ip);
         sip.write_ip(key.tuple.dst_ip);
         sip.write_u16(key.tuple.src_port);
@@ -548,10 +577,19 @@ impl SynCookieValidatedCache {
     }
 
     #[cfg(test)]
-    pub(super) fn debug_set_index(&self, zone_id: u16, tuple: SynCookieTuple) -> Option<usize> {
+    pub(super) fn debug_set_index(
+        &self,
+        zone_id: u16,
+        profile_gen: u64,
+        tuple: SynCookieTuple,
+    ) -> Option<usize> {
         if self.sets.is_empty() {
             return None;
         }
-        Some(self.set_index(&SynCookieValidatedKey { zone_id, tuple }))
+        Some(self.set_index(&SynCookieValidatedKey {
+            zone_id,
+            profile_gen,
+            tuple,
+        }))
     }
 }
