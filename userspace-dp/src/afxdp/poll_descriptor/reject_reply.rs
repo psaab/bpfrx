@@ -280,8 +280,12 @@ mod tests {
     #[test]
     fn reject_tcp_with_egress_enqueues_rst() {
         use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
-        // #2472: the Reject token bucket is global; reset it full so a parallel
-        // test that drained it cannot make this success-path assertion flake.
+        // #2472/#2955: the Reject token bucket is a global GCRA word whose TAT
+        // advances monotonically; reset-to-full alone is not enough because a
+        // parallel test can advance/drain the TAT after the reset. Hold the
+        // shared global-bucket test lock for the whole reset→drive→assert window
+        // so no sibling can starve this success-path assertion.
+        let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
         crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
             crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
             0,
@@ -331,6 +335,7 @@ mod tests {
     #[test]
     fn reject_reply_dropped_by_egress_output_filter() {
         use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
         crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
             crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
             0,
@@ -440,6 +445,7 @@ mod tests {
     #[test]
     fn filter_reject_tcp_enqueues_rst_filter_counter() {
         use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
         crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
             crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
             0,
@@ -485,6 +491,7 @@ mod tests {
     #[test]
     fn filter_reject_non_tcp_enqueues_icmp_unreachable() {
         use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
         crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
             crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
             0,
@@ -574,9 +581,12 @@ mod tests {
     fn reject_reply_rate_limited_when_bucket_empty() {
         use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
         use crate::afxdp::icmp_ratelimit::{
-            GeneratedErrorReason, allow_generated_error_at, rate_limited_count,
-            reset_bucket_for_test,
+            GeneratedErrorReason, allow_generated_error_at, global_bucket_test_lock,
+            rate_limited_count, reset_bucket_for_test,
         };
+        // #2955: serialise with the other global Reject-bucket tests so a
+        // parallel reset-to-full cannot undo the far-future drain mid-test.
+        let _g = global_bucket_test_lock();
         let (frame, meta, flow) = tcp_v4_syn();
         // The call site samples the REAL `monotonic_nanos()` (boot-relative,
         // small), which we cannot freeze. To keep the global Reject bucket
