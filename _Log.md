@@ -16960,3 +16960,34 @@ top.
   go vet ./pkg/frr/... ./pkg/config/... ; go test ./pkg/frr/...
   ./pkg/config/... (PASS). Fail-on-revert confirmed: reverting the gate
   to `term.Metric > 0` makes TestGeneratePolicyOptionsMetricZero RED.
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2844 — unify the NAT64 Ethernet-header writer onto the
+  shared SSOT writer. Deleted NAT64's private `write_eth_header`
+  (hardcoded 0x8100 TPID, bare-VID) and routed both NAT64 frame
+  builders through `crate::afxdp::write_eth_header_slice`, the same
+  in-place writer used by gre.rs / icmp.rs / TX segmentation. Output is
+  byte-identical for the current bare-VID case (`TxVlanTag::from(u16)`
+  reproduces present-iff-vid>0 / TPID 0x8100 / PCP·DEI 0), so no wire
+  change; the point is forward-compat — a future TPID/PCP/DEI/802.1ad/
+  ethertype change in the shared module now reaches NAT64.
+- **File(s)**:
+  - `userspace-dp/src/afxdp/frame/headers.rs` — `write_eth_header_slice`
+    widened `pub(in crate::afxdp)` → `pub(crate)`; module-doc note.
+  - `userspace-dp/src/afxdp/frame/mod.rs` — split it to a `pub(crate)`
+    re-export (other writers stay `pub(in crate::afxdp)`).
+  - `userspace-dp/src/afxdp/mod.rs` — `pub(crate) use
+    self::frame::write_eth_header_slice;` so `crate::nat64` (outside
+    `crate::afxdp`) can reach it.
+  - `userspace-dp/src/nat64.rs` — deleted private writer; import +
+    call the SSOT writer in both builders; module-doc SSOT section.
+  - `userspace-dp/src/nat64_tests.rs` — added byte-identical
+    fail-on-revert test `nat64_eth_header_is_ssot_byte_identical`
+    (v6→v4 untagged 0x0800, v6→v4 VLAN-100 0x8100+VID+0x0800,
+    v4→v6 untagged 0x86dd).
+- **Validation**: `cargo build --release -p xpf-userspace-dp` (Finished);
+  `cargo test --release --bin xpf-userspace-dp -- nat64 eth frame`
+  (453 passed, 0 failed). No `protocol_wire_v1.json` change. Fail-on-
+  revert confirmed: flipping the v6→v4 builder ethertype to 0x86dd
+  makes `nat64_eth_header_is_ssot_byte_identical` RED (got 0x86dd vs
+  expected 0x0800).
