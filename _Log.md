@@ -15181,3 +15181,26 @@ top.
   clean origin/master, no snmp involvement).
 - **File(s)**: pkg/snmp/agent.go, pkg/snmp/v3_timeliness_test.go,
   pkg/snmp/v3_set_test.go, pkg/snmp/README.md, _Log.md
+- **Timestamp**: 2026-06-25
+- **Action**: #2625 — make pkg/vrrp Manager Stop()/Start() reuse-safe.
+  Stop() closes the run-scoped channels (watcherStop via watcherStopOnce,
+  eventCh via closeEventOnce) and cancels the context, but Start() never
+  re-allocated them or reset the singleton watcher latches
+  (watcherRunning/addrWatcherRunning). A Stop->Start cycle therefore handed
+  callers a closed eventCh (send-on-closed panic), spawned watchers that
+  immediately observed the already-closed watcherStop and exited, and left
+  the latches stuck true so ensure*Locked never re-spawned. Fix: Start()
+  calls a new resetRunStateLocked under m.mu (fresh watcherStop + eventCh,
+  reset both sync.Once guards, clear both latches). Each watcher now pins
+  its run-generation watcherStop at spawn and clears its latch on ANY exit
+  (clearLinkWatcherLatch mirrors clearAddrWatcherLatch), generation-gated so
+  a lingering pre-Stop watcher cannot reset a fresh post-Start latch. Stop()
+  captures the channels+once-guards under m.mu so a concurrent Start cannot
+  race a half-swapped channel. Single-run behavior + ~60ms failover timing
+  unchanged (no advert/timer logic touched). Added manager_reuse_test.go
+  (3 tests, -race): watcher re-spawns, fresh event channel, context
+  recreated; fail-on-revert proven RED when resetRunStateLocked is removed.
+  LATENT lifecycle fix — production creates the Manager once and only
+  Stop()s at shutdown; PARENT runs make test-failover before merge.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/track.go, pkg/vrrp/addrwatch.go,
+  pkg/vrrp/manager_reuse_test.go, pkg/vrrp/README.md, _Log.md
