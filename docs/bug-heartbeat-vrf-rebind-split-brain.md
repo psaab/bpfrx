@@ -237,6 +237,57 @@ After crash recovery with RETH MAC changes:
 
 ---
 
+## Bug 4: IPv6 Advert Checksum vs Kernel-Selected Source — FIXED (#2644)
+
+**Severity:** High (split-brain on interfaces with multiple link-locals)
+**Affected code:** `pkg/vrrp/instance.go` (`sendPacketIPv6`), `pkg/vrrp/manager.go`
+(`openIPv6Socket`)
+**Status:** Fixed (agy review-044 finding 044-01)
+
+### Symptom
+
+On a VRRP interface carrying more than one IPv6 link-local address, IPv6
+advertisements were intermittently dropped by the receiving peer. Both nodes
+then declared themselves MASTER — split-brain.
+
+### Root Cause
+
+`sendPacketIPv6` marshals the VRRPv3 packet and computes its pseudo-header
+checksum over `srcIP = vi.getLocalIPv6()` (the deterministic lowest link-local).
+It then transmitted via `vi.ipv6Conn.WriteTo(data, dst)` on a socket bound to the
+wildcard `::` (`net.ListenPacket("ip6:112", "::")`) with no source-address
+control message. The kernel performs RFC 6724 source-address selection
+*independently* when filling in the outer IPv6 header. With a single link-local
+the two always agree; with more than one the kernel could stamp a different
+outer source than the checksum was computed over.
+
+The VRRPv3 IPv6 checksum (RFC 5798) is computed over an IPv6 pseudo-header that
+includes the source address. The receiver recomputes the checksum using the
+*actual outer source* of the received packet. When the outer source differs from
+the checksum source, the receiver's checksum mismatches and it silently discards
+the advert.
+
+### Fix
+
+Pin the outer source to the checksum source. `sendPacketIPv6` now sends through a
+`golang.org/x/net/ipv6.PacketConn` wrapper over the same raw conn, attaching an
+`IPV6_PKTINFO` control message:
+
+```go
+cm := &ipv6.ControlMessage{Src: srcIP, IfIndex: vi.iface.Index}
+```
+
+where `srcIP` is the identical value fed to `pkt.Marshal(true, srcIP, dstIP)` for
+the checksum. `IfIndex` scopes the link-local source to the VRRP interface
+(link-locals are zone-scoped) and keeps egress deterministic. The wrapper +
+send seam (`vi.ipv6Send`) are wired together in `openSocket()`. The
+checksum-source == cmsg-source equality is asserted by
+`TestSendPacketIPv6PinsSourceViaPktInfo`, which re-parses the captured advert
+against `cm.Src` (exactly as the receiver validates) and fails if a kernel-
+selected (no-cmsg) source is used.
+
+---
+
 ## Combined Impact
 
 When all three bugs fire together during a power cycle:
