@@ -15555,6 +15555,30 @@ top.
   pkg/cli/cli_show_nat.go, pkg/cli/sessions_iterator_error_test.go,
   _Log.md
 
+## #2653 — single-shot ExportOwnerRGSessions unbounded delta-ring push
+
+- **Timestamp**: 2026-06-25
+- **Action**: Bound the single-shot `ExportOwnerRGSessions` command path with
+  the same #2442 chunked drain-as-you-export. The command handler
+  (`handle_export_owner_rg_sessions`) no longer emits open deltas inline (it
+  pushed up to DEFAULT_MAX_SESSIONS = 32x the 4096-slot ring in one shot,
+  overflowing it and dropping sessions 4097..N from the HA bulk snapshot).
+  It now records the requested owner RGs in
+  `WorkerCommandResults.export_owner_rgs`; the worker loop performs the chunked
+  export (collect candidates -> emit in 2048 chunks -> drain+flush between) and
+  acks only after the complete export drains. `export_forward_sessions_for_owner_rgs`
+  is now `#[cfg(test)]`-only.
+- **File(s)**: userspace-dp/src/afxdp/session_glue/commands/export_owner_rg_sessions.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  docs/session-sync-architecture.md
+- **Validation**: cargo build --release OK; new fail-on-revert test
+  `export_owner_rg_command_does_not_overflow_ring_unbounded` GREEN on fix,
+  RED-on-revert proven (inline emit -> "must NOT emit deltas inline" panics);
+  session_glue suite 79/79; resync test still green. test-failover pending
+  (PARENT runs before merge — HA path).
 - **Timestamp**: 2026-06-25
   **Action**: #2522 — gate the 500ms mlx5 zero-copy teardown quiesce on
   `will_rebind` (a snapshot is being applied), not just `had_live_workers`.

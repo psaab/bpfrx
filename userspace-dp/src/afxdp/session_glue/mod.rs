@@ -240,6 +240,17 @@ fn should_bypass_unseeded_tunnel_ha(
 pub(super) struct WorkerCommandResults {
     pub cancelled_keys: Vec<SessionKey>,
     pub exported_sequences: Vec<u64>,
+    /// #2653: the union of owner RGs requested by every
+    /// `ExportOwnerRGSessions` command processed this tick. The command
+    /// handler NO LONGER emits the open deltas itself — doing so pushed the
+    /// entire owned-session set (up to `DEFAULT_MAX_SESSIONS` = 32x the 4096
+    /// delta ring) into the ring in one shot, overflowing it and silently
+    /// dropping sessions 4097..N from the HA bulk snapshot. Instead the
+    /// handler records the RGs here and the worker loop performs the same
+    /// chunked drain-as-you-export the #2442 loss-of-sync resync uses
+    /// (collect candidates -> emit in < cap chunks -> drain between chunks),
+    /// so the complete snapshot ships without overflowing the ring.
+    pub export_owner_rgs: Vec<i32>,
     pub shaped_tx_requests: Vec<TxRequest>,
     /// #941 Work item C: set when at least one
     /// `WorkerCommand::VacateAllSharedExactSlots` was processed.
@@ -456,13 +467,14 @@ pub(super) fn delete_terminal_filtered_session(
 
 /// #2442: the filter half of `export_forward_sessions_for_owner_rgs`. Walks the
 /// owner-RG index and returns the export candidates (forward, locally-owned,
-/// forwarding-disposition sessions) WITHOUT pushing any delta. The two
-/// callers re-emit at different cadences: the `ExportOwnerRGSessions` command
-/// path pushes the whole set in one go (its caller drains with a 15s
-/// export-ack budget), while the worker-loop loss-of-sync resync path
-/// (`worker::loop_body`) emits in ring-sized chunks, draining between chunks so
-/// a worker owning up to `DEFAULT_MAX_SESSIONS` (32× the delta ring) never
-/// re-overflows the ring it is trying to recover.
+/// forwarding-disposition sessions) WITHOUT pushing any delta. Both callers
+/// re-emit through the SAME `chunked_drain_as_you_export!` macro in
+/// `worker::loop_body` (#2653): the `ExportOwnerRGSessions` command path (now
+/// recorded in `WorkerCommandResults.export_owner_rgs`, not emitted inline) and
+/// the loss-of-sync resync path both emit in `RESYNC_EXPORT_CHUNK`-sized chunks,
+/// draining the ring to empty between chunks so a worker owning up to
+/// `DEFAULT_MAX_SESSIONS` (32× the delta ring) never re-overflows the ring it is
+/// trying to recover, and ship a complete snapshot.
 pub(crate) fn forward_export_candidates_for_owner_rgs(
     sessions: &SessionTable,
     owner_rgs: &[i32],
@@ -495,11 +507,18 @@ pub(crate) fn forward_export_candidates_for_owner_rgs(
 
 // #2442: widened from `pub(in crate::afxdp::session_glue)` to `pub(crate)` so
 // the session-module resync test can re-emit owned forward sessions through the
-// same table-truth walk the `ExportOwnerRGSessions` command uses. The
-// command path pushes the entire candidate set at once (its caller drains
-// against a 15s export-ack budget); the worker-loop resync uses the chunked
-// `forward_export_candidates_for_owner_rgs` collector + interleaved drain
-// instead (see `worker::loop_body`).
+// same table-truth walk the `ExportOwnerRGSessions` command uses.
+//
+// #2653: this naive "emit the whole candidate set at once" helper is no longer
+// on the production path. BOTH the worker-loop loss-of-sync resync AND the
+// single-shot `ExportOwnerRGSessions` command now use the chunked
+// drain-as-you-export (collect via `forward_export_candidates_for_owner_rgs`
+// -> emit in < ring-cap chunks -> drain between chunks, see `worker::loop_body`)
+// so a worker owning more sessions than the 4096-slot ring never overflows it
+// mid-export. The unbounded helper is retained only as a test fixture that
+// drives the candidate-selection walk directly (forward yes, reverse /
+// peer-synced / transient-seed / fabric-ingress no), hence `#[cfg(test)]`.
+#[cfg(test)]
 pub(crate) fn export_forward_sessions_for_owner_rgs(
     sessions: &mut SessionTable,
     owner_rgs: &[i32],
@@ -534,6 +553,7 @@ pub(super) fn apply_worker_commands(
                 return WorkerCommandResults {
                     cancelled_keys: Vec::new(),
                     exported_sequences: Vec::new(),
+                    export_owner_rgs: Vec::new(),
                     shaped_tx_requests: Vec::new(),
                     vacate_all_shared_exact_slots: false,
                 };
@@ -544,6 +564,7 @@ pub(super) fn apply_worker_commands(
             return WorkerCommandResults {
                 cancelled_keys: Vec::new(),
                 exported_sequences: Vec::new(),
+                export_owner_rgs: Vec::new(),
                 shaped_tx_requests: Vec::new(),
                 vacate_all_shared_exact_slots: false,
             };
@@ -556,6 +577,7 @@ pub(super) fn apply_worker_commands(
     let now_secs = now_ns / 1_000_000_000;
     let mut cancelled_keys: Vec<SessionKey> = Vec::new();
     let mut exported_sequences = Vec::new();
+    let mut export_owner_rgs: Vec<i32> = Vec::new();
     let mut shaped_tx_requests = Vec::new();
     let mut vacate_all_shared_exact_slots = false;
     for cmd in pending {
@@ -590,8 +612,8 @@ pub(super) fn apply_worker_commands(
                 owner_rgs,
             } => {
                 commands::handle_export_owner_rg_sessions(
-                    sessions,
                     &mut exported_sequences,
+                    &mut export_owner_rgs,
                     sequence,
                     owner_rgs,
                 );
@@ -680,6 +702,7 @@ pub(super) fn apply_worker_commands(
     WorkerCommandResults {
         cancelled_keys,
         exported_sequences,
+        export_owner_rgs,
         shaped_tx_requests,
         vacate_all_shared_exact_slots,
     }
