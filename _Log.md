@@ -14674,3 +14674,28 @@ top.
   **File(s)**: pkg/config/compiler_routing.go,
   pkg/config/compiler_prefix_list_merge_2641_test.go,
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2514 — address-book content-ID collision now returns a typed
+  error instead of panicking the daemon. Replaced the `probe > 256`
+  `panic(...)` in `buildAddressBookTableWithFeeds` with a returned
+  `*AddressBookIDCollisionError`. The linear-probe bound now scales with the
+  bucket count (`addressBookProbeLimit`, default `len(buckets)+8`) so a
+  forward probe is pigeonhole-guaranteed to find a free u32 slot for any
+  realistic config — the error is the genuine fail-safe, never a routine
+  path. Threaded the error up through `buildPolicySnapshots*` and the
+  `buildSnapshot*` chain: `ApplyConfig` (manager.go) now fails closed and
+  rejects the config (prior dataplane state retained); the scheduler-only
+  republish (`UpdatePolicyScheduleState`) logs and keeps the last snapshot;
+  the best-effort `UserspaceBoundLinuxInterfaces` degrades to nil. Added two
+  package-var seams (`addressBookContentHash64`, `addressBookProbeLimit`) so a
+  fail-on-revert test can force the exhaustion branch. New tests assert
+  error-not-panic (recover-guarded), snapshot-build propagation, and benign
+  64-book happy path. Gates: gofmt clean; go build ./... clean; go vet +
+  go test ./pkg/dataplane/userspace/... ./pkg/config/... ./pkg/daemon/...
+  green. Fail-on-revert verified (restoring the panic fails the test).
+  **File(s)**: pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/builder.go, pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/address_book_collision_2514_test.go,
+  + mechanical 3rd-return-value updates across userspace *_test.go, _Log.md

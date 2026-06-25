@@ -169,7 +169,7 @@ func TestBuildSnapshotFromFullConfigDecodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	snap := buildSnapshot(cfg, config.UserspaceConfig{Workers: 4, RingEntries: 1024}, 3, 3)
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{Workers: 4, RingEntries: 1024}, 3, 3)
 	buf, err := json.Marshal(&ControlRequest{Type: "apply_snapshot", Snapshot: snap})
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)

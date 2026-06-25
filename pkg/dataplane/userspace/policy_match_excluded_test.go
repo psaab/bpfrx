@@ -42,7 +42,7 @@ func TestPolicySnapshotCarriesExcludedFlags(t *testing.T) {
 			},
 		},
 	}
-	snaps := buildPolicySnapshots(cfg)
+	snaps, _ := buildPolicySnapshots(cfg)
 	if len(snaps) != 2 {
 		t.Fatalf("expected 2 rules, got %d", len(snaps))
 	}

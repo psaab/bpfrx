@@ -30,8 +30,8 @@ func TestAddressBookIDStability(t *testing.T) {
 		"alpha": "10.0.0.0/24",
 		"beta":  "192.168.0.0/16",
 	})
-	a, _ := buildAddressBookTable(cfg)
-	b, _ := buildAddressBookTable(cfg)
+	a, _, _ := buildAddressBookTable(cfg)
+	b, _, _ := buildAddressBookTable(cfg)
 	if len(a) != len(b) || len(a) != 2 {
 		t.Fatalf("expected 2 books in each build, got %d / %d", len(a), len(b))
 	}
@@ -58,7 +58,7 @@ func TestAddressBookIDDeterministicAcrossMapOrder(t *testing.T) {
 	var first []AddressBookSnapshot
 	for i := 0; i < 5; i++ {
 		cfg := newBookCfg(contents)
-		books, _ := buildAddressBookTable(cfg)
+		books, _, _ := buildAddressBookTable(cfg)
 		if i == 0 {
 			first = books
 			continue
@@ -81,12 +81,12 @@ func TestAddressBookContentDedup(t *testing.T) {
 	// Two books with identical content collapse to ONE row with ONE
 	// id. The diagnostic name is the lexicographically smallest.
 	cfg := newBookCfg(map[string]string{
-		"zeta":    "10.0.0.0/24",
-		"alpha":   "10.0.0.0/24",
-		"middle":  "10.0.0.0/24",
-		"unique":  "192.168.0.0/16",
+		"zeta":   "10.0.0.0/24",
+		"alpha":  "10.0.0.0/24",
+		"middle": "10.0.0.0/24",
+		"unique": "192.168.0.0/16",
 	})
-	books, nameToID := buildAddressBookTable(cfg)
+	books, nameToID, _ := buildAddressBookTable(cfg)
 	if len(books) != 2 {
 		t.Fatalf("expected 2 unique rows (one for 10.0.0.0/24, one for 192.168), got %d", len(books))
 	}
@@ -117,7 +117,7 @@ func TestAddressBookContainingBareIPNormalizesToSlash32Or128(t *testing.T) {
 		"host1": "10.0.0.1",
 		"host2": "2001:db8::1",
 	})
-	books, _ := buildAddressBookTable(cfg)
+	books, _, _ := buildAddressBookTable(cfg)
 	if len(books) != 2 {
 		t.Fatalf("expected 2 books, got %d", len(books))
 	}
@@ -154,7 +154,7 @@ func TestAddressBookDedupsCIDRSetByContent(t *testing.T) {
 			},
 		},
 	}
-	books, nameToID := buildAddressBookTable(cfg)
+	books, nameToID, _ := buildAddressBookTable(cfg)
 	if len(books) != 1 {
 		t.Fatalf("expected 1 deduped row, got %d (members: %+v)", len(books), books)
 	}
@@ -165,7 +165,7 @@ func TestAddressBookDedupsCIDRSetByContent(t *testing.T) {
 
 func TestAddressBookContainingAnyNormalizesToZeroSlash(t *testing.T) {
 	cfg := newBookCfg(map[string]string{"world": "any"})
-	books, _ := buildAddressBookTable(cfg)
+	books, _, _ := buildAddressBookTable(cfg)
 	if len(books) != 1 {
 		t.Fatalf("expected 1 book, got %d", len(books))
 	}
@@ -191,7 +191,7 @@ func TestClassifyPolicyAddresses(t *testing.T) {
 		"corp-net": "10.0.0.0/8",
 		"vpn-net":  "192.168.0.0/16",
 	})
-	_, nameToID := buildAddressBookTable(cfg)
+	_, nameToID, _ := buildAddressBookTable(cfg)
 	// Mix: 2 named books + 1 literal CIDR + 1 "any" + 1 unknown name.
 	bookIDs, literals := classifyPolicyAddresses(cfg, nameToID, []string{
 		"corp-net", "192.168.5.5/32", "any", "vpn-net", "unknown-book",
@@ -246,7 +246,7 @@ func TestPolicyBuildEmitsBookIDsAndLiterals(t *testing.T) {
 			},
 		},
 	}
-	snaps := buildPolicySnapshots(cfg)
+	snaps, _ := buildPolicySnapshots(cfg)
 	if len(snaps) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(snaps))
 	}

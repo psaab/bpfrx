@@ -10,11 +10,11 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
-func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32) *ConfigSnapshot {
+func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32) (*ConfigSnapshot, error) {
 	return buildSnapshotWithSchedulerState(cfg, ucfg, generation, fibGeneration, nil, nil, nil)
 }
 
-func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32, activeState map[string]bool, routeOverlay []config.RouteOverlayEntry, feedOverlay map[string][]string) *ConfigSnapshot {
+func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32, activeState map[string]bool, routeOverlay []config.RouteOverlayEntry, feedOverlay map[string][]string) (*ConfigSnapshot, error) {
 	return buildSnapshotWithSchedulerStateAndNATCounters(cfg, ucfg, generation, fibGeneration, activeState, routeOverlay, feedOverlay, nil)
 }
 
@@ -26,7 +26,7 @@ func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceCo
 // stable key-derived counter ID, #2255); a nil map leaves every CounterID at 0
 // ("no counter"), reproducing pre-#2218 wire shape for callers that do not have
 // a compile result (tests, partial syncs).
-func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32, activeState map[string]bool, routeOverlay []config.RouteOverlayEntry, feedOverlay map[string][]string, natCounterIDs map[string]uint32) *ConfigSnapshot {
+func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32, activeState map[string]bool, routeOverlay []config.RouteOverlayEntry, feedOverlay map[string][]string, natCounterIDs map[string]uint32) (*ConfigSnapshot, error) {
 	if cfg == nil {
 		return &ConfigSnapshot{
 			Version:       ProtocolVersion,
@@ -36,10 +36,24 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 			Capabilities:  deriveUserspaceCapabilities(nil),
 			MapPins:       userspaceMapPins(),
 			Userspace:     ucfg,
-		}
+		}, nil
 	}
 	policyCount := len(cfg.Security.Policies)
 	interfaces := buildInterfaceSnapshots(cfg)
+	// #2514: the address-book content-ID assignment and the policy
+	// snapshot builder (which consumes the same nameToID map) can return
+	// an AddressBookIDCollisionError on an unresolvable folded-hash
+	// collision. Surface it as a build error so the apply path rejects the
+	// config and retains the prior dataplane state (fail-closed) — a
+	// config-shaped input must never panic the daemon.
+	policies, err := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, activeState, feedOverlay)
+	if err != nil {
+		return nil, err
+	}
+	addressBooks, _, err := buildAddressBookTableWithFeeds(cfg, feedOverlay)
+	if err != nil {
+		return nil, err
+	}
 	return &ConfigSnapshot{
 		Version:            ProtocolVersion,
 		Generation:         generation,
@@ -56,7 +70,7 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 		Routes:             buildRouteSnapshots(cfg, interfaces, routeOverlay),
 		Flow:               buildFlowSnapshot(cfg),
 		DefaultPolicy:      policyActionString(cfg.Security.DefaultPolicy),
-		Policies:           buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, activeState, feedOverlay),
+		Policies:           policies,
 		SourceNAT:          buildSourceNATSnapshots(cfg, natCounterIDs),
 		StaticNAT:          buildStaticNATSnapshots(cfg, natCounterIDs),
 		DestinationNAT:     buildDestinationNATSnapshots(cfg, natCounterIDs),
@@ -70,12 +84,9 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 		ClassOfService:     buildClassOfServiceSnapshot(cfg),
 		FlowExport:         buildFlowExportSnapshot(cfg),
 		MirrorConfigs:      buildMirrorConfigSnapshotsFailClosed(cfg, interfaces),
-		AddressBooks: func() []AddressBookSnapshot {
-			books, _ := buildAddressBookTableWithFeeds(cfg, feedOverlay)
-			return books
-		}(),
-		AppCatalog: buildAppCatalogSnapshot(cfg),
-		Config:     cfg,
+		AddressBooks:       addressBooks,
+		AppCatalog:         buildAppCatalogSnapshot(cfg),
+		Config:             cfg,
 		Summary: SnapshotSummary{
 			HostName:       cfg.System.HostName,
 			DataplaneType:  cfg.System.DataplaneType,
@@ -85,7 +96,7 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 			SchedulerCount: len(cfg.Schedulers),
 			HAEnabled:      cfg.Chassis.Cluster != nil,
 		},
-	}
+	}, nil
 }
 
 // snapshotContentHash computes a SHA-256 hash over the stable content of a
