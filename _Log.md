@@ -15092,3 +15092,23 @@ top.
   pkg/config/compiler_nat_source_address_name_2416_test.go,
   pkg/dataplane/userspace/nat_source_address_name_2416_test.go,
   docs/userspace-dnat-plan.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2649 — SNMPv3 engineBoots fail-closed on corrupt/ceiling/
+  unwritable state. RFC 3414 §2.2 requires engineBoots monotonic; the prior
+  reset-to-1 on a corrupt/unreadable counter, a ceiling value, or a failed
+  durable write re-opened the timeliness replay window (same deterministic
+  engineID + low boots). Now pin engineBoots to the RFC ceiling
+  (engineBootsMax) in all those cases — checkTimeliness then rejects every
+  authenticated request (§3.2 step 7), forcing re-discovery, while the agent
+  still starts and answers discovery/report (no SNMP DoS — the owner's #2649
+  concern). First-boot missing file still legitimately starts at 1.
+  Replaced TestEngineBootsCorruptResets with three fail-on-revert tests
+  (corrupt fails closed, ceiling does not wrap, persist-failure fails closed)
+  and rebased TestV3SetRequest_NotWritable onto a writable temp boots path so
+  it still exercises the SET authz path. Fail-on-revert proven RED (restoring
+  boots=1 fails the corrupt + ceiling tests). Pre-existing pkg/ra
+  TestT2a_ChangedConfigApplyNeverTwoLiveConns failure is unrelated (fails on
+  clean origin/master, no snmp involvement).
+- **File(s)**: pkg/snmp/agent.go, pkg/snmp/v3_timeliness_test.go,
+  pkg/snmp/v3_set_test.go, pkg/snmp/README.md, _Log.md
