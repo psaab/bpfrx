@@ -484,6 +484,7 @@ impl EventFrame {
         created_unix_secs: u32,
         close_unix_ns: u64,
         application_id: u16,
+        ingress_ifindex: u32,
     ) -> Self {
         let mut buf = [0u8; 256];
         let base = FRAME_HEADER_SIZE;
@@ -530,7 +531,12 @@ impl EventFrame {
         // StartTime; 0 means "unknown" and triggers the packet-count fallback.
         buf[base + 108..base + 112].copy_from_slice(&created_unix_secs.to_le_bytes());
         // [112:120] rev packets, [120:128] rev bytes — 0 (#2501).
-        // [128:132] ingress ifindex — 0 (per-close ifindex not threaded).
+        // [128:132] ingress ifindex — #2615: the closing binding's interface
+        // (LITTLE-endian u32, decoded by the Go side as
+        // `binary.LittleEndian.Uint32` -> resolved to the RT_FLOW
+        // `packet-incoming-interface`). 0 keeps the prior "N/A" rendering for
+        // a session whose ingress interface could not be resolved.
+        buf[base + 128..base + 132].copy_from_slice(&ingress_ifindex.to_le_bytes());
         // [132:134] application id — #2520: the AppID resolved for the closing
         // session's 5-tuple (the caller runs the same app_catalog.lookup the
         // forwarding hot path used to stamp the conntrack entry). 0 stays the
@@ -571,6 +577,14 @@ impl EventFrame {
     /// frame when the gate is open (no flowexport consumer of opens — there is
     /// nothing to keep unconditional). The Go logEvent path renders it as the
     /// RT_FLOW_SESSION_CREATE syslog record.
+    ///
+    /// #2615: the create frame now also threads the ingress ifindex (the
+    /// admitting binding's interface, written to [128:132]) and the resolved
+    /// application id ([132:134]). The Go decoder already reads BOTH slots for
+    /// every RT_FLOW frame (`pkg/logging/ringbuf.go`), so this is a
+    /// render-only fix — no wire-format change. A 0 in either slot keeps the
+    /// prior `packet-incoming-interface="N/A"` / `application="UNKNOWN"`
+    /// rendering for sessions whose interface/app could not be resolved.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_session_create_rt_flow(
         seq: u64,
@@ -586,6 +600,8 @@ impl EventFrame {
         nat_dst_port: u16,
         ingress_zone_id: u16,
         egress_zone_id: u16,
+        ingress_ifindex: u32,
+        application_id: u16,
     ) -> Self {
         let mut buf = [0u8; 256];
         let base = FRAME_HEADER_SIZE;
@@ -620,8 +636,20 @@ impl EventFrame {
         // [104:106] nat src port, [106:108] nat dst port — BIG-endian.
         buf[base + 104..base + 106].copy_from_slice(&nat_src_port.to_be_bytes());
         buf[base + 106..base + 108].copy_from_slice(&nat_dst_port.to_be_bytes());
-        // [108:135] counters / ifindex / appid / close-reason all 0 for a
-        // create. [135] #2508 SYSLOG gate — always set (producer-gated).
+        // [108:112] created stamp, [112:128] rev counters — 0 (a create has
+        // no volume yet).
+        // [128:132] ingress ifindex — #2615: the admitting binding's
+        // interface (LITTLE-endian u32, decoded by the Go side as
+        // `binary.LittleEndian.Uint32` -> resolved to the RT_FLOW
+        // `packet-incoming-interface`). 0 keeps the prior "N/A" rendering.
+        buf[base + 128..base + 132].copy_from_slice(&ingress_ifindex.to_le_bytes());
+        // [132:134] application id — #2615: the AppID resolved for the new
+        // session's 5-tuple (caller runs the same app_catalog.lookup the
+        // forwarding hot path used to stamp the conntrack entry, mirroring the
+        // #2520 close-side fix). 0 stays the UNKNOWN sentinel.
+        buf[base + 132..base + 134].copy_from_slice(&application_id.to_le_bytes());
+        // [134] close reason — 0 (a create has none).
+        // [135] #2508 SYSLOG gate — always set (producer-gated).
         buf[base + 135] = RT_FLOW_LOG_SYSLOG;
 
         write_header(

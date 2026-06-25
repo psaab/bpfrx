@@ -475,7 +475,15 @@ impl EventStreamWorkerHandle {
     /// by the caller (`flush_session_deltas`) via the same `app_catalog.lookup`
     /// the forwarding hot path runs — #2520. 0 means UNKNOWN (no catalog
     /// match), the unchanged behavior.
-    pub(crate) fn emit_session_close_rt_flow(&self, delta: &SessionDelta, app_id: u16) {
+    /// `ingress_ifindex` is the closing binding's interface index (#2615); the
+    /// Go side resolves it to the RT_FLOW `packet-incoming-interface`. 0 keeps
+    /// the prior "N/A" rendering.
+    pub(crate) fn emit_session_close_rt_flow(
+        &self,
+        delta: &SessionDelta,
+        app_id: u16,
+        ingress_ifindex: u32,
+    ) {
         if delta.kind != SessionDeltaKind::Close {
             return;
         }
@@ -532,6 +540,10 @@ impl EventStreamWorkerHandle {
                     // slot so SESSION_CLOSE RT_FLOW records (and the
                     // NetFlow/IPFIX exporters) show the application.
                     app_id,
+                    // #2615: carry the closing binding's ingress ifindex in
+                    // the [128:132] wire slot so the record shows the
+                    // admitting interface instead of "N/A".
+                    ingress_ifindex,
                 )
             },
         );
@@ -544,7 +556,16 @@ impl EventStreamWorkerHandle {
     /// `delta.metadata.log_session_init` is set. The frame rides the same raw
     /// dataplane-event channel and is formatted as RT_FLOW_SESSION_CREATE by
     /// the Go logEvent path. Best-effort (`try_send`).
-    pub(crate) fn emit_session_create_rt_flow(&self, delta: &SessionDelta) {
+    /// #2615: `app_id` is the application resolved for the new session's
+    /// 5-tuple (caller runs the same `app_catalog.lookup` the close path uses,
+    /// mirroring #2520) and `ingress_ifindex` is the admitting binding's
+    /// interface index. 0 in either keeps the prior UNKNOWN / N/A rendering.
+    pub(crate) fn emit_session_create_rt_flow(
+        &self,
+        delta: &SessionDelta,
+        app_id: u16,
+        ingress_ifindex: u32,
+    ) {
         if delta.kind != SessionDeltaKind::Open {
             return;
         }
@@ -575,6 +596,12 @@ impl EventStreamWorkerHandle {
                     nat.rewrite_dst_port.unwrap_or(0),
                     delta.metadata.ingress_zone,
                     delta.metadata.egress_zone,
+                    // #2615: ingress ifindex ([128:132]) + resolved AppID
+                    // ([132:134]) so the SESSION_CREATE RT_FLOW record shows
+                    // the admitting interface and application instead of
+                    // N/A / UNKNOWN.
+                    ingress_ifindex,
+                    app_id,
                 )
             },
         );

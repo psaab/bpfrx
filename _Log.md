@@ -15438,3 +15438,27 @@ top.
   pkg/config/schema_security.go, pkg/ipsec/policy.go,
   pkg/config/parser_security_test.go, pkg/ipsec/ipsec_test.go,
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2615 — render AppID (create) + ingress ifindex (create+close)
+  into the RT_FLOW SESSION_CREATE/CLOSE eventstream frames. The
+  `[128:132]` ingress-ifindex and `[132:134]` application-id wire slots
+  already existed and the Go `pkg/logging/ringbuf.go` decoder already reads
+  them for every RT_FLOW frame, so this is a RENDER-ONLY fix — NO
+  wire-format change (no protocol_wire_v1.json regen). The create encoder
+  left both slots 0 (→ `application="UNKNOWN"` / `packet-incoming-interface=
+  "N/A"`); the close encoder carried AppID (#2520) but left the ifindex 0.
+  Threaded `forwarding.app_catalog.lookup(...)` (mirroring the #2520
+  close-side fix) + `ident.ifindex as u32` (kernel ifindex always positive,
+  loss-free; full-width u32, distinct from the i16 egress/TX #2467 bug) into
+  both `emit_session_create_rt_flow` and `emit_session_close_rt_flow`. Added
+  fail-on-revert tests on both the codec (wire-layout) and emit paths
+  (proved RED on revert — 4 tests fail when the slot writes are reverted —
+  then restored). Go contract tests (pkg/daemon eventstream + pkg/logging)
+  green.
+  **File(s)**: userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/afxdp/session_delta.rs,
+  userspace-dp/src/event_stream/codec_tests.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  userspace-dp/src/event_stream/README.md, _Log.md
