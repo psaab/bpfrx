@@ -17458,3 +17458,22 @@ top.
   go vet ./pkg/ddns/..., go test ./pkg/ddns/... PASS.
   **File(s)**: pkg/ddns/backend_bind.go, pkg/ddns/backend_bind_test.go,
   pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2910 — WG native decap no longer rejects non-zero AEAD
+  padding. `inner_ip_len_after_decap` dropped the
+  `pkt[claimed..].any(|b| b != 0)` check: WG §5.4.6 padding is a
+  send-side rule; on receive the path is length-driven (read inner-IP
+  length, bound it against the AEAD-validated plaintext via
+  `claimed > pkt.len()`, truncate, discard the pad). The tag already
+  authenticates the padding so non-zero pad is not forgeable —
+  rejecting it bought no security and broke interop with kernel
+  WireGuard / wireguard-go. Added fail-on-revert test
+  `decap_accepts_nonzero_trailing_padding_and_bounds_to_inner_len`
+  (encrypts `40B IPv4 || 8 non-zero pad` via the session's snow
+  transport, decaps on the responder, asserts success + `dec.len == 40`
+  + pad never forwarded; RED=`MalformedInner` with the check restored,
+  verified). Gates: cargo build --release -p xpf-userspace-dp OK;
+  cargo test afxdp::wg 152 passed/0 failed.
+  **File(s)**: userspace-dp/src/afxdp/wg/engine.rs,
+  userspace-dp/src/afxdp/wg/tests.rs, docs/wireguard-interop.md, _Log.md
