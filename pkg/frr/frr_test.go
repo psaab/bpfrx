@@ -3043,6 +3043,94 @@ func TestGeneratePolicyOptionsCommunityListAndMetricType(t *testing.T) {
 	}
 }
 
+// TestGeneratePolicyOptionsCommunityExpandedVsStandard pins the #2643
+// fix: a community definition with a regex/wildcard member must render as
+// an FRR `expanded` community-list (which accepts POSIX regex), NOT
+// `standard` (which rejects regex at config load and fails the whole
+// frr-reload). A literal-only definition stays `standard`, and a MIXED
+// definition (any regex member) renders the WHOLE list as `expanded`
+// because FRR forbids the same name being both standard and expanded.
+func TestGeneratePolicyOptionsCommunityExpandedVsStandard(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		Communities: map[string]*config.CommunityDef{
+			// Literal-only -> standard.
+			"LIT-ONLY": {
+				Name:    "LIT-ONLY",
+				Members: []string{"65000:100", "no-export"},
+			},
+			// Wildcard member -> expanded (whole list).
+			"WILD": {
+				Name:    "WILD",
+				Members: []string{"65000:*"},
+			},
+			// Mixed literal + regex -> whole list expanded.
+			"MIXED": {
+				Name:    "MIXED",
+				Members: []string{"65000:100", "65001:.*"},
+			},
+			// POSIX-ERE interval/bound braces are regex too — the member
+			// carries none of `* . + ? ^ $ [ ]`, so it relies on `{` `}`
+			// being in communityRegexChars to route to an expanded list
+			// (#2643 follow-up false-negative).
+			"BOUND": {
+				Name:    "BOUND",
+				Members: []string{"65000:1{2,3}"},
+			},
+		},
+	}
+
+	got := m.generatePolicyOptions(po)
+
+	wantLines := []string{
+		// Literal-only definition keeps standard.
+		"bgp community-list standard LIT-ONLY permit 65000:100",
+		"bgp community-list standard LIT-ONLY permit no-export",
+		// Wildcard member renders the member as-is into an expanded list.
+		"bgp community-list expanded WILD permit 65000:*",
+		// Mixed definition: BOTH members go into the expanded list — the
+		// literal member must NOT regress to a standard line, since the
+		// same list name cannot be both kinds in FRR.
+		"bgp community-list expanded MIXED permit 65000:100",
+		"bgp community-list expanded MIXED permit 65001:.*",
+		// Brace-bound member must render expanded, not standard.
+		"bgp community-list expanded BOUND permit 65000:1{2,3}",
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+
+	// fail-on-revert: forcing a wildcard/regex member onto a standard
+	// list is exactly the FRR-invalid config that fails the reload. No
+	// standard community-list line may carry a regex metacharacter, and
+	// no name may appear as both standard and expanded.
+	for _, line := range strings.Split(got, "\n") {
+		if !strings.HasPrefix(line, "bgp community-list standard ") {
+			continue
+		}
+		// fields: bgp community-list standard <name> permit <member>
+		fields := strings.Fields(line)
+		if len(fields) != 6 {
+			t.Fatalf("unexpected standard community-list line shape: %q", line)
+		}
+		member := fields[5]
+		if strings.ContainsAny(member, communityRegexChars) {
+			t.Errorf("FRR-invalid: regex member %q on a standard community-list line: %q", member, line)
+		}
+	}
+	if strings.Contains(got, "bgp community-list standard MIXED ") {
+		t.Errorf("MIXED list must NOT appear as standard (would collide with its expanded form):\n%s", got)
+	}
+	if strings.Contains(got, "bgp community-list standard WILD ") {
+		t.Errorf("WILD list must NOT appear as standard:\n%s", got)
+	}
+	if strings.Contains(got, "bgp community-list standard BOUND ") {
+		t.Errorf("BOUND (brace-bound regex) list must NOT appear as standard:\n%s", got)
+	}
+}
+
 func TestGenerateProtocols_BGPDampening(t *testing.T) {
 	m := New()
 	bgp := &config.BGPConfig{

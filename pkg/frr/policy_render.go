@@ -1031,6 +1031,26 @@ func partitionRouteFiltersByFamily(rfs []*config.RouteFilter) (v4, v6 []indexedR
 	return v4, v6
 }
 
+// communityRegexChars are the characters whose presence in a community
+// member means it cannot be a plain literal ASN:VALUE (or well-known
+// name) and therefore requires an FRR `expanded` community-list (POSIX
+// regex) rather than a `standard` one. A standard list rejects any of
+// these at config load, failing the whole frr-reload (#2643). The set
+// includes the POSIX-ERE interval/bound braces `{` `}` — a Junos
+// community member is a free-form verbatim string slot (no value
+// validation; the compiler copies it straight through), so a legitimate
+// bound operator like `65000:1{2,3}` must route to an expanded list too.
+const communityRegexChars = `*.+?^$[]()|\{}`
+
+// communityMemberIsRegex reports whether a Junos community member value
+// contains regex / wildcard metacharacters and must be rendered into an
+// FRR `expanded` community-list. A plain `ASN:VALUE` (digits:digits) or a
+// well-known name ("no-export", "no-advertise", "internet", "local-AS")
+// contains none of these and stays a `standard` member.
+func communityMemberIsRegex(member string) bool {
+	return strings.ContainsAny(member, communityRegexChars)
+}
+
 // generatePolicyOptions emits FRR prefix-list / route-map / community-list /
 // as-path-access-list config from the typed Junos policy-options.
 func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
@@ -1064,8 +1084,25 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 	sort.Strings(commNames)
 	for _, name := range commNames {
 		cd := po.Communities[name]
+		// FRR standard community-lists only accept literal community
+		// values (ASN:VALUE or well-known names); they REJECT regex /
+		// wildcard members (e.g. "65000:*", ".*") at config load, which
+		// fails the whole frr-reload of the managed section. An expanded
+		// community-list accepts a POSIX regex per member. FRR does NOT
+		// allow the same list NAME to be both standard and expanded, so
+		// the decision is per-DEFINITION: if ANY member is a regex/
+		// wildcard, the ENTIRE definition is rendered as `expanded`
+		// (literal members are valid regexes that match themselves);
+		// otherwise it stays `standard` (#2643).
+		listKind := "standard"
 		for _, member := range cd.Members {
-			fmt.Fprintf(&b, "bgp community-list standard %s permit %s\n", name, member)
+			if communityMemberIsRegex(member) {
+				listKind = "expanded"
+				break
+			}
+		}
+		for _, member := range cd.Members {
+			fmt.Fprintf(&b, "bgp community-list %s %s permit %s\n", listKind, name, member)
 		}
 	}
 	if len(po.Communities) > 0 {
