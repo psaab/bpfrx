@@ -1535,6 +1535,54 @@ func TestPolicyCommunityOperations(t *testing.T) {
 	}
 }
 
+// TestPolicyCommunityDeleteMultiList is the fail-on-revert guard for #2902: a
+// `then community delete [ listA listB ]` clause references MULTIPLE
+// community-lists, and FRR's `set comm-list <name> delete` strips ONE list per
+// line — so EVERY referenced list must render its own clause. The pre-#2902
+// compiler stored only vals[1] (`CommunityDelete = vals[1]`), so listB and any
+// further lists were silently dropped and the communities the operator meant to
+// strip leaked into advertised prefixes. RED if the compiler reads only the
+// first list value (only listA emitted) or the renderer emits a single clause.
+//
+// Driven through the full ParseSetCommand + SetPath + CompileConfig +
+// generatePolicyOptions path so the schema (multi-value `then community` leaf),
+// the compiler (applyCommunityAction accumulating vals[1:]), and the FRR
+// renderer (one clause per list) are all exercised.
+func TestPolicyCommunityDeleteMultiList(t *testing.T) {
+	tree := &config.ConfigTree{}
+	setCommands := []string{
+		"set policy-options policy-statement P term t_del from protocol bgp",
+		// Bracketed multi-list: the lexer strips the brackets, so this
+		// flattens to delete + [listA listB listC] (the #2419 multi-value
+		// shape). All three must render.
+		"set policy-options policy-statement P term t_del then community delete [ listA listB listC ]",
+		"set policy-options policy-statement P term t_end then accept",
+	}
+	for _, cmd := range setCommands {
+		path, err := config.ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := config.CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	m := New()
+	got := m.generatePolicyOptions(&cfg.PolicyOptions)
+
+	for _, name := range []string{"listA", "listB", "listC"} {
+		want := " set comm-list " + name + " delete\n"
+		if !strings.Contains(got, want) {
+			t.Errorf("#2902 multi-list delete: missing %q in:\n%s", want, got)
+		}
+	}
+}
+
 func TestGenerateProtocols_ECMPMaxPaths(t *testing.T) {
 	m := New()
 	bgp := &config.BGPConfig{
