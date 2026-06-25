@@ -124,11 +124,39 @@ func buildGratuitousARP(mac net.HardwareAddr, ip net.IP, opcode uint16) []byte {
 	return pkt
 }
 
+// BurstStillValid reports whether a GARP/NA burst follow-up loop is still
+// allowed to transmit. It is captured at burst start and consulted before
+// EVERY follow-up frame. The VRRP instance passes a closure that returns
+// true only while the node is STILL master AND the garpEpoch matches the
+// value observed when the burst was launched (#2867). A nil predicate means
+// "always valid" — used by callers (direct-mode re-announce, tests) that
+// have no per-instance epoch/state to gate against.
+//
+// The detached follow-up loop sends (count-1) frames over (count-1)*50ms.
+// Without this gate, a node that abdicates (loses master / becomes backup)
+// mid-burst keeps broadcasting gratuitous ARP / unsolicited NA for VIPs it
+// no longer owns, re-poisoning neighbor caches toward a node that has
+// already handed the VIP off — the exact blackhole GARP exists to prevent.
+type BurstStillValid func() bool
+
 // SendGratuitousARPBurst sends one immediate GARP pair (request + reply), then
 // schedules (count-1) follow-up pairs at 50ms intervals in a background goroutine.
 // Returns after the first pair is sent (<1ms), making it suitable for the
 // critical failover path.
+//
+// This is the ungated variant (nil predicate): the follow-up loop always runs
+// to completion. Callers on the VRRP critical path MUST use
+// SendGratuitousARPBurstGated so the follow-ups stop if the node abdicates.
 func SendGratuitousARPBurst(iface string, ip net.IP, count int) error {
+	return SendGratuitousARPBurstGated(iface, ip, count, nil)
+}
+
+// SendGratuitousARPBurstGated is SendGratuitousARPBurst with an abdication
+// gate (#2867). stillValid is captured at burst start and checked before each
+// follow-up pair; if it returns false the loop stops immediately (closing the
+// socket) so an abdicated node stops poisoning neighbor caches. A nil
+// stillValid is equivalent to the ungated behavior.
+func SendGratuitousARPBurstGated(iface string, ip net.IP, count int, stillValid BurstStillValid) error {
 	if count <= 0 {
 		count = 1
 	}
@@ -180,7 +208,7 @@ func SendGratuitousARPBurst(iface string, ip net.IP, count int) error {
 	// loop never aborts: a transient error on one frame must not suppress
 	// the remaining adverts that may still reach the LAN.
 	if count > 1 {
-		go runARPBurstFollowups(fd, iface, ip4.String(), reqPkt, repPkt, addr, count)
+		go runARPBurstFollowups(fd, iface, ip4.String(), reqPkt, repPkt, addr, count, stillValid)
 	} else {
 		unix.Close(fd)
 	}
@@ -193,13 +221,25 @@ func SendGratuitousARPBurst(iface string, ip net.IP, count int) error {
 // follow-up error handling is unit-testable via the burstSend seam without a
 // raw socket. Each failed frame bumps burstSendErrors and is logged at Debug
 // (per-iteration logging at higher levels would flood — CLAUDE.md); a single
-// Warn fires after the loop if any frame failed. The loop never aborts so a
-// transient error does not suppress the remaining adverts.
-func runARPBurstFollowups(fd int, iface, ip string, reqPkt, repPkt []byte, addr unix.SockaddrLinklayer, count int) {
+// Warn fires after the loop if any frame failed. The loop never aborts on a
+// transient SEND error so the remaining adverts still get a chance to reach
+// the LAN.
+//
+// It DOES abort — cleanly, before any frame — when stillValid returns false
+// (#2867): the node has abdicated (no longer master, or garpEpoch bumped) and
+// must stop announcing VIPs it no longer owns. The check runs after the 50ms
+// sleep, immediately before the send, so an abdication that lands mid-sleep is
+// honored on the very next iteration. A nil stillValid never aborts.
+func runARPBurstFollowups(fd int, iface, ip string, reqPkt, repPkt []byte, addr unix.SockaddrLinklayer, count int, stillValid BurstStillValid) {
 	defer unix.Close(fd)
 	var failed int
 	for i := 1; i < count; i++ {
 		time.Sleep(50 * time.Millisecond)
+		if stillValid != nil && !stillValid() {
+			slog.Debug("cluster: GARP burst follow-up aborted (abdicated)",
+				"interface", iface, "ip", ip, "iter", i, "remaining", count-i)
+			break
+		}
 		if err := burstSend(fd, reqPkt, &addr); err != nil {
 			failed++
 			slog.Debug("cluster: GARP burst follow-up send failed",
@@ -427,7 +467,19 @@ func SendGratuitousIPv6(iface string, ip net.IP, count int) error {
 // (count-1) follow-ups at 50ms intervals in a background goroutine.
 // Returns after the first NA is sent, making it suitable for the critical
 // failover path.
+//
+// This is the ungated variant (nil predicate). Callers on the VRRP critical
+// path MUST use SendGratuitousIPv6BurstGated so the follow-ups stop if the
+// node abdicates (#2867).
 func SendGratuitousIPv6Burst(iface string, ip net.IP, count int) error {
+	return SendGratuitousIPv6BurstGated(iface, ip, count, nil)
+}
+
+// SendGratuitousIPv6BurstGated is SendGratuitousIPv6Burst with an abdication
+// gate (#2867). stillValid is captured at burst start and checked before each
+// follow-up NA; false stops the loop immediately. A nil stillValid is
+// equivalent to the ungated behavior.
+func SendGratuitousIPv6BurstGated(iface string, ip net.IP, count int, stillValid BurstStillValid) error {
 	if count <= 0 {
 		count = 1
 	}
@@ -471,7 +523,7 @@ func SendGratuitousIPv6Burst(iface string, ip net.IP, count int) error {
 	// loop (never per-iteration). The loop never aborts on a transient
 	// error so the remaining NAs still get a chance to reach the LAN.
 	if count > 1 {
-		go runNABurstFollowups(fd, iface, ip6.String(), pkt, addr, count)
+		go runNABurstFollowups(fd, iface, ip6.String(), pkt, addr, count, stillValid)
 	} else {
 		unix.Close(fd)
 	}
@@ -484,12 +536,21 @@ func SendGratuitousIPv6Burst(iface string, ip net.IP, count int) error {
 // same reason as runARPBurstFollowups: the follow-up error handling is
 // unit-testable via the burstSend seam. Each failed NA bumps burstSendErrors
 // and is logged at Debug; a single Warn fires after the loop if any failed.
-// The loop never aborts on a transient error.
-func runNABurstFollowups(fd int, iface, ip string, pkt []byte, addr unix.SockaddrLinklayer, count int) {
+// The loop never aborts on a transient SEND error.
+//
+// Like the ARP follow-up loop, it aborts cleanly (before any frame) when
+// stillValid returns false (#2867) — the node has abdicated and must stop
+// announcing VIPs it no longer owns. A nil stillValid never aborts.
+func runNABurstFollowups(fd int, iface, ip string, pkt []byte, addr unix.SockaddrLinklayer, count int, stillValid BurstStillValid) {
 	defer unix.Close(fd)
 	var failed int
 	for i := 1; i < count; i++ {
 		time.Sleep(50 * time.Millisecond)
+		if stillValid != nil && !stillValid() {
+			slog.Debug("cluster: NA burst follow-up aborted (abdicated)",
+				"interface", iface, "ip", ip, "iter", i, "remaining", count-i)
+			break
+		}
 		if err := burstSend(fd, pkt, &addr); err != nil {
 			failed++
 			slog.Debug("cluster: NA burst follow-up send failed",
