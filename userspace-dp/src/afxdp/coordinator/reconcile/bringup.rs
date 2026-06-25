@@ -42,6 +42,18 @@ pub(super) fn bring_up_workers(
     } = fds;
     // #2524: clamp to the shared sanity ceiling (MAX_RING_ENTRIES) as the
     // helper-side backstop for the Go commit-time bound. Floor stays 64.
+    // The Go gate rejects any normally-committed value > MAX_RING_ENTRIES, so
+    // a clamp here only fires on a config persisted by an older binary (before
+    // the bound landed). Warn so an operator on the stale-binary path can see
+    // the configured ring depth was capped rather than silently running a
+    // smaller ring than configured.
+    if ring_entries > MAX_RING_ENTRIES as usize {
+        eprintln!(
+            "xpf-dp: ring-entries {ring_entries} exceeds MAX_RING_ENTRIES {}; \
+             capping (config predates the #2524 commit-time bound)",
+            MAX_RING_ENTRIES
+        );
+    }
     let ring_entries = ring_entries.max(64).min(MAX_RING_ENTRIES as usize) as u32;
     let mut workers: BTreeMap<u32, Vec<BindingPlan>> = BTreeMap::new();
     for binding in bindings.iter_mut() {
