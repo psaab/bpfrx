@@ -122,6 +122,71 @@ pub(crate) fn worker_loop(
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
     let mut shared_recycles = Vec::with_capacity((RX_BATCH_SIZE as usize).saturating_mul(2));
+    // #2669: flush a freshly-drained delta batch to its consumers. Used at
+    // all three drain sites (resync macro, exported-sequences branch, else
+    // branch). The drain that produced `$deltas` already popped them off the
+    // ring PERMANENTLY, so this flush MUST run regardless of whether a binding
+    // exists — otherwise the deltas are silently discarded and HA peers,
+    // sibling workers, the shared conntrack/session tables, and CLI/gRPC
+    // visibility diverge (the original bug). When a binding exists we use its
+    // identity + live RPC queue + per-binding session-map fd, exactly as
+    // before. When `bindings` is empty we synthesize a binding identity
+    // (labels only — no XSK), pass `None` for the per-binding RPC queue, and
+    // fall back to the loop-cached map fds (which are `-1`, making the live
+    // session-map delete a harmless EBADF no-op — that map belongs to the
+    // absent binding; the shared tables, HA replication, and event stream are
+    // the consumers that actually matter here).
+    macro_rules! flush_drained_session_deltas {
+        ($deltas:expr) => {{
+            let deltas_ref: &[SessionDelta] = $deltas;
+            match bindings.first() {
+                Some(binding) => {
+                    let ident = binding.identity();
+                    flush_session_deltas(
+                        &ident,
+                        Some(&binding.live),
+                        binding.bpf_maps.session_map_fd,
+                        conntrack_v4_fd,
+                        conntrack_v6_fd,
+                        deltas_ref,
+                        &shared_sessions,
+                        &shared_nat_sessions,
+                        &shared_forward_wire_sessions,
+                        &shared_owner_rg_indexes,
+                        &recent_session_deltas,
+                        &peer_worker_commands,
+                        &event_stream,
+                        forwarding.as_ref(),
+                    );
+                }
+                None => {
+                    let ident = BindingIdentity {
+                        slot: 0,
+                        queue_id: 0,
+                        worker_id,
+                        interface: Arc::<str>::from(""),
+                        ifindex: -1,
+                    };
+                    flush_session_deltas(
+                        &ident,
+                        None,
+                        session_map_fd,
+                        conntrack_v4_fd,
+                        conntrack_v6_fd,
+                        deltas_ref,
+                        &shared_sessions,
+                        &shared_nat_sessions,
+                        &shared_forward_wire_sessions,
+                        &shared_owner_rg_indexes,
+                        &recent_session_deltas,
+                        &peer_worker_commands,
+                        &event_stream,
+                        forwarding.as_ref(),
+                    );
+                }
+            }
+        }};
+    }
     // Debug: periodic summary counters
     let mut dbg_last_report_ns = monotonic_nanos();
     // #1776: the per-interval cfg(debug-log) dbg_* counters are
@@ -796,25 +861,14 @@ pub(crate) fn worker_loop(
                             &mut shared_recycles,
                             &deltas,
                         );
-                        if let Some(binding) = bindings.first() {
-                            let ident = binding.identity();
-                            flush_session_deltas(
-                                &ident,
-                                &binding.live,
-                                binding.bpf_maps.session_map_fd,
-                                conntrack_v4_fd,
-                                conntrack_v6_fd,
-                                &deltas,
-                                &shared_sessions,
-                                &shared_nat_sessions,
-                                &shared_forward_wire_sessions,
-                                &shared_owner_rg_indexes,
-                                &recent_session_deltas,
-                                &peer_worker_commands,
-                                &event_stream,
-                                forwarding.as_ref(),
-                            );
-                        }
+                        // #2669: flush UNCONDITIONALLY. The binding-independent
+                        // consumers (shared session/conntrack tables, HA peer,
+                        // peer-worker commands, recent-deltas RPC buffer, event
+                        // stream) must receive every drained delta even when no
+                        // binding exists; only the per-binding RPC fallback push
+                        // is gated on a binding. Gating the whole flush would
+                        // drain-then-discard, silently desyncing HA/conntrack.
+                        flush_drained_session_deltas!(&deltas);
                     }
                 };
             }
@@ -848,25 +902,8 @@ pub(crate) fn worker_loop(
                     &mut shared_recycles,
                     &deltas,
                 );
-                if let Some(binding) = bindings.first() {
-                    let ident = binding.identity();
-                    flush_session_deltas(
-                        &ident,
-                        &binding.live,
-                        binding.bpf_maps.session_map_fd,
-                        conntrack_v4_fd,
-                        conntrack_v6_fd,
-                        &deltas,
-                        &shared_sessions,
-                        &shared_nat_sessions,
-                        &shared_forward_wire_sessions,
-                        &shared_owner_rg_indexes,
-                        &recent_session_deltas,
-                        &peer_worker_commands,
-                        &event_stream,
-                        forwarding.as_ref(),
-                    );
-                }
+                // #2669: flush unconditionally — see flush_drained_session_deltas!.
+                flush_drained_session_deltas!(&deltas);
             }
             if let Some(sequence) = exported_sequences.iter().copied().max() {
                 session_export_ack.store(sequence, Ordering::Release);
@@ -879,25 +916,8 @@ pub(crate) fn worker_loop(
                 &mut shared_recycles,
                 &deltas,
             );
-            if let Some(binding) = bindings.first() {
-                let ident = binding.identity();
-                flush_session_deltas(
-                    &ident,
-                    &binding.live,
-                    binding.bpf_maps.session_map_fd,
-                    conntrack_v4_fd,
-                    conntrack_v6_fd,
-                    &deltas,
-                    &shared_sessions,
-                    &shared_nat_sessions,
-                    &shared_forward_wire_sessions,
-                    &shared_owner_rg_indexes,
-                    &recent_session_deltas,
-                    &peer_worker_commands,
-                    &event_stream,
-                    forwarding.as_ref(),
-                );
-            }
+            // #2669: flush unconditionally — see flush_drained_session_deltas!.
+            flush_drained_session_deltas!(&deltas);
         }
         // Debug: periodic summary report
         {

@@ -366,6 +366,43 @@ resync is entirely worker-local — it re-uses the same per-worker delta ring an
 incremental sync (the control-socket contention rules in CLAUDE.md). It runs at
 most once per worker poll tick and only when an overflow actually occurred.
 
+### Drained deltas reach binding-independent consumers even with no binding (#2669)
+
+The worker loop drains the delta ring **unconditionally** (`drain_deltas`
+pops entries off permanently) and then calls `flush_session_deltas` to apply
+them. A drain cycle can coincide with an **empty `bindings` slice** — the XSK
+sockets are admin-down or unconfigured during a reload/transaction while the
+session table is still aging entries out. `flush_session_deltas` does much
+more than push into a per-binding queue:
+
+- **binding-INDEPENDENT** (must always run): remove the closed session from
+  the shared session / NAT / forward-wire / owner-RG tables, delete the BPF
+  conntrack + live-session entries, replicate a `DeleteSynced` command to the
+  peer-worker queues (the HA delete-sync path), append to the recent-deltas
+  RPC buffer, and emit to the event stream (HA type-2 session-sync delta plus
+  the RT_FLOW SESSION_CLOSE/SESSION_CREATE frames).
+- **binding-DEPENDENT** (the only step that needs a binding): the per-binding
+  RPC fallback push, `BindingLiveState::push_session_delta` — there is no
+  interface-local RPC queue to push into when no binding exists.
+
+Pre-#2669 the **entire** flush was gated behind `if let Some(binding) =
+bindings.first()`, so when `bindings` was empty the deltas were drained off
+the ring and then silently discarded: closed/expired sessions never left the
+shared conntrack/session tables, no `DeleteSynced` reached the HA peer, and no
+SESSION_CLOSE reached the event stream — a permanent session-state leak and HA
+desync. The fix makes `flush_session_deltas` take `live: Option<&BindingLiveState>`
+and flush every binding-independent consumer unconditionally, gating **only**
+`push_session_delta` on a binding. When no binding exists the worker loop
+synthesizes a labels-only `BindingIdentity` (interface `""`, ifindex `-1`) and
+falls back to the loop-cached map fds (which are `-1`, making the live
+session-map delete a harmless `EBADF` no-op — that live map belongs to the
+absent binding; the shared tables, HA replication, and event stream are the
+consumers that matter). This is applied at **all three** drain sites (the
+#2442 resync `drain_and_flush_all!` macro, the exported-sequences branch, and
+the steady-state else branch) via the shared `flush_drained_session_deltas!`
+macro. The invariant: **a drained delta MUST be flushed to its
+binding-independent consumers — never popped-and-discarded.**
+
 ## Clock Synchronization
 
 At connection setup, both sides exchange monotonic timestamps with `ClockSync`.

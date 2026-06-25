@@ -1,5 +1,38 @@
 # Action Log
 
+## 2026-06-24 — #2669 fix: drained session deltas never discarded when bindings empty
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed a HIGH silent session-sync desync. The worker loop drains
+  the per-worker session-delta ring unconditionally (`drain_deltas` pops
+  permanently), but `flush_session_deltas` was gated behind
+  `if let Some(binding) = bindings.first()` at all three drain sites. When
+  `bindings` is empty (XSK sockets admin-down/unconfigured during a
+  reload/transaction while the table still ages entries out), the deltas were
+  drained and then silently discarded — closed/expired sessions never left the
+  shared conntrack/session tables, no `DeleteSynced` reached the HA peer, and
+  no SESSION_CLOSE reached the event stream. Read `flush_session_deltas` to
+  split binding-INDEPENDENT work (shared-table removal, BPF deletes,
+  peer-worker delete replication, recent-deltas buffer, event stream) from the
+  single binding-DEPENDENT step (`BindingLiveState::push_session_delta`).
+  PREFERRED-split fix: `flush_session_deltas` now takes
+  `live: Option<&BindingLiveState>` and flushes every binding-independent
+  consumer unconditionally, gating only the RPC fallback push. Added a
+  `flush_drained_session_deltas!` worker-loop macro that uses
+  `bindings.first()` identity+live+fd when present, else a synthesized
+  labels-only `BindingIdentity` + `None` live + loop-cached (`-1`) map fds (the
+  live session-map delete becomes a harmless EBADF no-op — that map belongs to
+  the absent binding). Applied at ALL THREE sites; composes with the #2442
+  resync `drain_and_flush_all!` (now routes through the new macro, so its drain
+  no longer discards either). Added a fail-on-revert test exercising the
+  `live = None` path: asserts the Close reaches the shared table (cleared), the
+  HA peer queue (`DeleteSynced`), and the recent-deltas buffer; reverting to a
+  binding-gated flush turns it red (proven).
+- **File(s)**: userspace-dp/src/afxdp/session_delta.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  docs/session-sync-architecture.md, _Log.md
+
 ## 2026-06-24 — #2648 fold: refused-add records NO ownership (review MAJOR-1)
 
 - **Timestamp**: 2026-06-24
