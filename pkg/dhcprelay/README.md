@@ -226,6 +226,19 @@ OFFER/ACK to forward in the first place; clients still dedupe on
   the LAN interface and the server conn binds the **specific** unicast `giaddr`,
   so the kernel delivers a unicast datagram destined to `giaddr:67` to the
   address-specific socket in preference to the wildcard listener.
+- **Read buffer sized to the UDP/IP maximum (#3012).** Both the
+  client-facing (`runRelay`) and server-facing (`handleServerResponses`)
+  loops read into a `readBufSize` (= 65535) buffer. `net.PacketConn.ReadFrom`
+  on a UDP socket copies only the first `len(buf)` bytes of a datagram and
+  silently discards the tail (`MSG_TRUNC`); a truncated DHCP datagram corrupts
+  the trailing option block, so `dhcpv4.FromBytes` fails and the packet is
+  dropped. DHCP imposes no 1500-byte limit (the Maximum DHCP Message Size
+  option is a `uint16`, and a UDP datagram can carry up to 65535 bytes), so a
+  datagram can legitimately exceed 1500 bytes — large option sets (classless
+  static routes, many search domains, Option 82, vendor/PXE options) or a
+  jumbo-MTU link delivering the whole datagram in one frame. Sizing the buffer
+  to the UDP maximum ensures the buffer is never the truncation point. (A
+  fixed 64 KiB buffer is fine here — the relay read path is not hot.)
 - **Bounded, deterministic `Stop()`.** Reads use the blocking
   `net.PacketConn.ReadFrom`; a close-on-cancel watcher (started after both
   conns exist) closes BOTH conns when the relay context is cancelled, so a

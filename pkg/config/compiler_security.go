@@ -21,6 +21,14 @@ import (
 // userspace-dp/src/screen/scan.rs (= maxScanSweepThreshold + 1).
 const maxScanSweepThreshold = 1023
 
+// defaultSynFloodAttackThreshold is the Junos SRX default attack-threshold
+// (SYN segments per second) applied when a syn-flood screen is enabled
+// without an explicit `attack-threshold`. Matching Junos, configuring
+// syn-flood with only source/destination-threshold or timeout still arms
+// the screen at this rate. See pkg/config/compiler_security.go syn-flood
+// parse and the dataplane gate in pkg/dataplane/compiler_iface.go (#3024).
+const defaultSynFloodAttackThreshold = 200
+
 // validateScreenScanSweepThresholds emits a WARNING (never a hard reject) for
 // any screen profile whose port-scan or ip-sweep threshold exceeds
 // maxScanSweepThreshold. The dataplane clamps the effective threshold to that
@@ -442,6 +450,16 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 								sf.Timeout = n
 							}
 						}
+					}
+					// Junos applies a default attack-threshold of 200
+					// SYN segments/second when syn-flood screening is
+					// enabled without an explicit attack-threshold. Without
+					// this fallback the downstream dataplane gate (which
+					// requires AttackThreshold > 0) would silently leave
+					// SYN-flood protection — including syn-cookie — disabled
+					// even though the operator configured it (#3024).
+					if sf.AttackThreshold <= 0 {
+						sf.AttackThreshold = defaultSynFloodAttackThreshold
 					}
 					profile.TCP.SynFlood = sf
 				case "port-scan":

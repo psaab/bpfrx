@@ -443,6 +443,22 @@ func TestBuildScreenConfig(t *testing.T) {
 				SynFloodTimeout: 5,
 			},
 		},
+		{
+			// #3024 fail-on-revert: a syn-flood profile that reaches the
+			// dataplane with attack-threshold unset (0) — e.g. configured
+			// with only destination-threshold — must still ARM the screen
+			// at the Junos default of 200, not be silently disabled by the
+			// old `AttackThreshold > 0` gate. RED if the gate reverts.
+			name: "unset attack-threshold defaults and enables",
+			sf: &config.SynFloodConfig{
+				DestinationThreshold: 4000,
+			},
+			expect: ScreenConfig{
+				Flags:             ScreenSynFlood,
+				SynFloodThresh:    defaultSynFloodAttackThreshold,
+				SynFloodDstThresh: 4000,
+			},
+		},
 	}
 
 	for _, tt := range tests {

@@ -31,6 +31,51 @@
   `cargo test` inspect+filter modules 226 passed / 0 failed; fail-on-
   revert verified RED (2 helper asserts fail when `l4_present` reverts to
   unconditional true).
+## 2026-06-25 — #3010: proxy-ARP/NDP VLAN sub-interface ifindex resolution
+
+- **Timestamp**: 2026-06-25
+- **Action**: `proxyARPIfaceMap` (pkg/daemon/daemon_proxyarp.go) stripped
+  the `.unit` suffix and resolved only the PARENT link via
+  `RethToPhysical` + `LinuxIfName(base)`, storing the parent ifindex for
+  a VLAN sub-interface entry (e.g. `reth0.50`, `ge-0/0/0.100`). Linux
+  `proxy_arp`/`proxy_ndp` are per-netdev, so the per-interface sysctl
+  (and NTF_PROXY scope) landed on the parent netdev and the VLAN
+  sub-interface was left silent — proxy-ARP/NDP on any VLAN
+  sub-interface was non-functional. Fixed by resolving each entry via
+  `cfg.ResolveKernelIfName(entry.Interface)`, the centralized Junos-ref
+  → Linux-netdev resolver, which maps a tagged unit to its 802.1Q VLAN
+  ID (which can differ from the unit number), collapses unit 0 onto the
+  bare parent, preserves the #2195 RETH-physical resolution, and handles
+  the st<N>/IRB/tunnel special cases. Added a fail-on-revert test
+  (`TestProxyARPIfaceMap_ResolvesVLANSubinterfaceToOwnNetdev`) using a
+  VLAN ID (100) deliberately different from the unit number (3): RED if
+  reverted to the parent-ifindex / drop-`.unit` / naive `.unit`-reappend
+  behavior. Updated the RETH test to model a unit and use `reth0.0`
+  (unit-0 collapse) so it stays a clean RETH-physical guard. Updated the
+  module doc comments + `docs/feature-gaps.md` Proxy ARP row.
+- **File(s)**: pkg/daemon/daemon_proxyarp.go,
+  pkg/daemon/daemon_proxyarp_test.go, docs/feature-gaps.md, _Log.md
+## 2026-06-25 — #2995: WG recvmsg endpoint preserves sin6_scope_id (link-local v6)
+
+- **Timestamp**: 2026-06-25
+- **Action**: `sockaddr_storage_to_socketaddr` (AF_INET6 arm) built the
+  learned WG peer endpoint via `SocketAddr::new(IpAddr::V6, port)`, which
+  fixes `sin6_scope_id = 0` and `sin6_flowinfo = 0`. A link-local
+  (`fe80::/10`) WG underlay endpoint loses its receiving-interface scope,
+  so the next `wg_send_to` toward the learned endpoint is rejected by the
+  kernel with EINVAL/ENODEV and the tunnel never establishes
+  (agy-review-058 058-03; distinct from #2969 NDP neighbor-probe scope).
+  Fix: construct `SocketAddr::V6(SocketAddrV6::new(ip, port,
+  sin6_flowinfo, sin6_scope_id))` to preserve scope + flowinfo. No-op for
+  global v6 (kernel sets scope_id 0); survives `canonicalize_endpoint`
+  (passes native v6 through untouched).
+- **File(s)**: userspace-dp/src/afxdp/coordinator/wg_control.rs,
+  docs/wireguard-interop.md, _Log.md
+- **Gates**: CARGO_TARGET_DIR=/tmp/cargo-2995 cargo build --release -p
+  xpf-userspace-dp (green); cargo test wg_control (19 passed).
+  Fail-on-revert: `sockaddr_storage_to_socketaddr_preserves_link_local_scope`
+  goes RED (scope_id 0 vs ifindex 7) when reverted to `SocketAddr::new`;
+  `sockaddr_storage_to_socketaddr_global_v6_scope_zero` stays green.
 
 ## 2026-06-25 — #2969: IPv6 NDP probe `sin6_scope_id` + sendto error surface
 
@@ -18234,6 +18279,40 @@ top.
   pkg/config/compiler_validate_warn.go,
   pkg/config/compiler_p3_http_providers_test.go, _Log.md
 
+## 2026-06-25 — #2979 dnat_table reverse-NAT leak on session close
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix unbounded leak of dynamic reverse-NAT entries in
+  `dnat_table` / `dnat_table_v6`. `publish_dnat_table_entry` inserts a
+  flags=0 reverse-NAT record on every SNAT'd session install (two worker
+  poll-path call sites), but the session Close/expiry handler
+  (`flush_session_deltas`) never deleted it. The maps are HASH (non-LRU),
+  `max_entries = MAX_SESSIONS`, `BPF_F_NO_PREALLOC` — entries leaked one
+  per closed SNAT session until the map filled and new reverse-NAT
+  publishes failed (#2244 capacity error). Confirmed real against master
+  3975912df: insert present, no matching delete on Close.
+- **Fix**: extracted the publish key into SSOT helpers `dnat_v4_key_bytes`
+  / `dnat_v6_key_bytes`; added `delete_dnat_table_entry` (same key bytes,
+  `bpf_map_delete_elem`, no-op for non-SNAT / absent fd, ENOENT benign);
+  threaded `&DnatTableFds` into `flush_session_deltas` and call the delete
+  in the Close block next to the session_map / conntrack cleanup. Only the
+  forward key publishes a reverse-NAT entry (Close delta is gated on
+  `!is_reverse`), so the delete is NOT repeated for the reverse key.
+- **Fail-on-revert**:
+  `close_delta_deletes_dnat_table_entry_for_snat_flow` (session_glue tests)
+  observes a test-only `DNAT_DELETE_ATTEMPTS` counter — a Close delta for an
+  SNAT flow MUST attempt the keyed delete (RED if the close-delete is
+  removed), a non-SNAT Close MUST NOT. Plus key-SSOT byte-equality tests
+  (`dnat_v4_key_bytes_matches_publish_encoding`,
+  `dnat_v6_key_bytes_matches_entry_bytes_key_half`) and the no-op contract
+  (`delete_dnat_table_entry_noops_without_snat_or_fd`) in afxdp/tests.rs.
+  Real BPF maps can't be created under `cargo test`
+  (`kernel.unprivileged_bpf_disabled`), hence the counter seam.
+- **File(s)**: userspace-dp/src/afxdp/checksum.rs,
+  userspace-dp/src/afxdp/session_delta.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/tests.rs, userspace-dp/README.md, _Log.md
 - **Timestamp**: 2026-06-25
 - **Action**: networkd batch fix #2986/#2987/#2988 — (a) gate static
   Address= lines per-family on DHCPv4/DHCPv6 separately so DHCPv4+static-IPv6
@@ -18269,6 +18348,23 @@ top.
   pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2970 — make userspace-dp helper socket-buffer sysctls raise-only.
+  The helper's `run()` (server/lifecycle.rs) unconditionally wrote 16 MiB to
+  the host-global `rmem_default`/`rmem_max` sysctls on every start, clobbering
+  the 64 MiB the Go control plane (`tuneSocketBuffers`,
+  pkg/dataplane/userspace/process.go) had just raised them to (raise-only,
+  desired=67108864). Fix: pure `raise_only_value(current, target)` (returns
+  Some(target) only when current < target) + `raise_sysctl(path, target)`
+  wrapper; loop over all four sysctls (added wmem_* to match Go) with
+  `SOCKBUF_TARGET = 67108864` aligned to the Go constant. Fail-on-revert tests
+  in `sockbuf_raise_only_tests`: `raise_sysctl_preserves_higher_value_on_disk`
+  pre-seeds a temp file with 64 MiB and asserts the helper leaves it (RED if
+  reverted to the unconditional 16 MiB write); `does_not_lower_a_higher_existing_value`
+  + `target_matches_go_control_plane` pin the contract.
+  Gates: CARGO_TARGET_DIR=/tmp/cargo-2970 cargo build --release PASS; cargo
+  test sockbuf PASS.
+- **File(s)**: userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/src/server/README.md, _Log.md
 - **Action**: networkd batch #2987/#2988 caller-reach fix (hostile-review
   MERGE-NEEDS-MINOR). The library fixes did not reach production: the only
   caller (pkg/daemon/daemon_apply.go step 2.5) guarded networkd.Apply with
@@ -18300,3 +18396,62 @@ top.
   line turns the test RED. Updated pkg/frr/README.md policy_render.go row.
 - **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
   pkg/frr/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2992 — fix LLDP RX self-frame learning. The RX AF_PACKET
+  socket (bound to ETH_P_LLDP) also receives this host's own transmitted
+  LLDP advertisements, which the kernel loops back marked PACKET_OUTGOING.
+  `recv` discarded the Recvfrom sockaddr, so rxLoop parsed those frames and
+  learned the firewall as its own neighbor on every LLDP-enabled link.
+  Fix: `recv` now returns the sll_pkttype from the sockaddr_ll; rxLoop drops
+  frames whose pkttype == unix.PACKET_OUTGOING before parsing TLVs. Genuine
+  inbound peer frames (PACKET_HOST/MULTICAST/BROADCAST) are preserved. Added
+  fail-on-revert test TestRxLoopSkipsSelfTransmittedFrames (self frame skipped,
+  peer frame learned; RED if the PACKET_OUTGOING skip is removed). Existing
+  recvFn test seams updated to the (int, int, error) signature.
+  **File(s)**: pkg/lldp/lldp.go, pkg/lldp/socket_test.go, pkg/lldp/README.md,
+  _Log.md
+- **Action**: #3012 dhcp-relay read-buffer sizing — both the client-facing
+  (runRelay) and server-facing (handleServerResponses) UDP reads used a fixed
+  make([]byte, 1500). net.PacketConn.ReadFrom (UDP) MSG_TRUNCs a datagram to
+  len(buf), so a >1500-byte DHCP datagram (large option sets / jumbo-MTU links)
+  had its trailing option block truncated, dhcpv4.FromBytes failed, and the
+  packet was silently dropped. Added a named const readBufSize = 65535 (UDP/IP
+  maximum) and pointed both read sites at it. Added fail-on-revert test
+  TestRunRelay_RelaysOversizeDatagram: builds a 1858-byte BOOTREQUEST (large
+  vendor-specific option), drives it through the live runRelay loop, asserts it
+  is relayed to the server conn, parses, and the large option survives intact.
+  fakeConn.ReadFrom uses copy(p,d) which mirrors MSG_TRUNC, so reverting
+  readBufSize to 1500 makes the test RED (verified: drop, "not relayed within
+  2s"). Gates: go build ./... OK, gofmt clean, go vet ./pkg/dhcprelay/... OK,
+  go test ./pkg/dhcprelay/... ok.
+- **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/dhcprelay/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #3024 syn-flood default attack-threshold — when a `tcp syn-flood`
+  screen was enabled WITHOUT an explicit `attack-threshold`, AttackThreshold
+  stayed 0 and the dataplane gate in pkg/dataplane/compiler_iface.go
+  (buildScreenConfig) required `AttackThreshold > 0`, so it never set
+  ScreenSynFlood — SYN-flood protection (and the nested syn-cookie challenge)
+  was silently disabled even though the operator configured it. Matching Junos
+  SRX, the fix applies the default of 200 SYN segments/second when
+  attack-threshold is unset. Two layers: (1) the config compiler
+  (compileScreen in pkg/config/compiler_security.go) seeds
+  defaultSynFloodAttackThreshold=200 at parse time when sf.AttackThreshold<=0;
+  (2) buildScreenConfig now arms whenever profile.TCP.SynFlood != nil and
+  applies the same 200 default defensively if a zero/unset threshold reaches
+  the dataplane. An explicitly-configured attack-threshold is preserved (never
+  overridden). Fail-on-revert tests:
+  pkg/config TestSynFloodDefaultAttackThreshold (syn-flood with only
+  destination-threshold compiles to threshold=200) +
+  TestSynFloodExplicitAttackThresholdPreserved (explicit 1500 kept), and
+  pkg/dataplane TestBuildScreenConfig case "unset attack-threshold defaults
+  and enables". Verified RED by reverting both gates (config seed removed +
+  dataplane gate back to `> 0`): config test got AttackThreshold=0, dataplane
+  test got Flags=0/Thresh=0. Gates: go build ./... OK, gofmt clean (touched
+  files), go vet ./pkg/config/... OK, go test ./pkg/config/... 1492 pass,
+  go test ./pkg/dataplane/ -run TestBuildScreenConfig pass.
+- **File(s)**: pkg/config/compiler_security.go,
+  pkg/config/parser_security_test.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/compiler_test.go, docs/syn-cookie-flood-protection.md, _Log.md
