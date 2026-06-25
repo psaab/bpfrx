@@ -330,6 +330,7 @@ type BGPConfig struct {
 	GracefulRestart      bool   // enable graceful restart
 	Multipath            int    // maximum equal-cost paths (0 = disabled)
 	MultipathMultipleAS  bool   // allow multipath across different ASes
+	MultipathIBGP        bool   // also enable iBGP multipath (FRR `maximum-paths ibgp`)
 	LogNeighborChanges   bool   // log neighbor state transitions
 	Dampening            bool   // enable route flap dampening
 	DampeningHalfLife    int    // half-life in minutes (default 15)

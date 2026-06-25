@@ -25,6 +25,32 @@
 - **File(s)**: `userspace-dp/src/afxdp/forwarding/mod.rs`,
   `userspace-dp/src/afxdp/forwarding/tests.rs`, `docs/multi-wan.md`,
   `_Log.md`
+## 2026-06-25 — #2978: BGP `multipath ibgp` renders FRR `maximum-paths ibgp <n>` (iBGP ECMP)
+
+- **Timestamp**: 2026-06-25
+- **Action**: FRR `maximum-paths <n>` enables eBGP multipath ONLY; iBGP
+  multipath needs the SEPARATE `maximum-paths ibgp <n>` command. xpf only
+  rendered the generic eBGP line from `protocols bgp multipath`, so iBGP-learned
+  prefixes kept a single best-path and ECMP was silently disabled for iBGP
+  routes in leaf-spine / route-reflector topologies (agy-review-057 057-04).
+  Confirmed against FRR bgpd that the two are distinct address-family knobs and
+  that xpf genuinely lacked the iBGP form before implementing. Fix: added a
+  `multipath ibgp` flag leaf (`schema_routing.go`, sibling of `multiple-as`) →
+  typed `BGPConfig.MultipathIBGP` (`types_routing.go`) set in
+  `compiler_protocols.go` → renderer emits `maximum-paths ibgp <n>` after the
+  eBGP `maximum-paths <n>` in BOTH unicast address-families
+  (`policy_render.go`). Without the flag the render is byte-identical to
+  pre-#2978 (eBGP-only). Tests: parse `TestBGPMultipathIBGPSetSyntax`
+  (`parser_routing_test.go`); render fail-on-revert
+  `TestGenerateProtocols_BGPMultipathIBGP` +
+  `TestGenerateProtocols_BGPMultipathNoIBGP` (`frr_test.go`). Gates: go build,
+  gofmt, go vet, go test ./pkg/frr/... ./pkg/config/... all green. Fail-on-
+  revert verified RED with the two render lines deleted.
+- **File(s)**: pkg/config/types_routing.go, pkg/config/schema_routing.go,
+  pkg/config/compiler_protocols.go, pkg/config/parser_routing_test.go,
+  pkg/frr/policy_render.go, pkg/frr/frr_test.go, pkg/frr/README.md,
+  docs/config-schema.md, _Log.md
+
 ## 2026-06-25 — #2958: state_writer runtime io_uring failure now demotes WriteMode to sync
 
 - **Timestamp**: 2026-06-25
@@ -17984,6 +18010,37 @@ top.
   pkg/api/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2955 fix the icmp_ratelimit generated-error token bucket
+  split-atomic race. The per-reason TokenBucket stored its state in two
+  independent atomics (millitokens + last_ns) and CAS-committed only
+  millitokens, then published last_ns as a SEPARATE relaxed store. Under
+  multi-worker contention two workers could read the new lower token count
+  with the stale old timestamp and double-credit a refill, or both observe
+  the first-use (last_ns==0) branch and each refill to full burst —
+  over-admitting generated ICMP/RST errors past the configured rate and
+  corrupting *_rate_limited_total counters on the DoS boundary. Fix:
+  collapsed the state into a SINGLE atomic GCRA theoretical-arrival-time
+  word (the same single-TAT pattern as event_stream/producer.rs) so refill
+  and consume commit together in one compare_exchange — no torn update,
+  hard-capped admit rate regardless of interleaving. Preserved the public
+  API (allow_generated_error[_at], rate_limited_count, reset_bucket_for_test,
+  GeneratedErrorReason, DEFAULT_RATE_PER_SEC/BURST) and all existing
+  semantics incl. the reject_reply far-future-drain pattern (a denied call
+  never advances the TAT). Added a FAIL-ON-REVERT concurrent test
+  (concurrent_hammer_never_over_admits: 16 threads x 2000 barrier-synced
+  trials from the boot/first-use epoch at a frozen instant assert admit <=
+  burst) + a deterministic single_word_state_advances_atomically guard —
+  both verified RED against the split-atomic revert (admitted 51 > burst 50).
+  Because the GCRA TAT is monotonic (unlike the order-independent
+  reset-to-full of the old millitoken model), the GLOBAL per-reason buckets'
+  tests became order-sensitive under the cargo parallel runner; added a
+  shared crate-test global_bucket_test_lock() serialising every test that
+  drives the global buckets across icmp_ratelimit.rs AND reject_reply.rs
+  (12x flake check clean). Gates: cargo build --release -p xpf-userspace-dp
+  OK; icmp_ratelimit + reject_reply tests 12/12 green; full bin test suite.
+- **File(s)**: userspace-dp/src/afxdp/icmp_ratelimit.rs,
+  userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
 - **Action**: #2957 state_writer orphan-temp sweep — robust to PID reuse.
   Temp name changed from `<dest>.<pid>.<seq>.tmp` to
   `<dest>.<pid>_<starttime>.<seq>.tmp` (process-instance identity = pid +
@@ -18024,6 +18081,33 @@ top.
   pkg/config/compiler_validate_strict.go,
   pkg/config/bgp_neighbor_peeras_2963_test.go,
   pkg/frr/policy_render.go, pkg/frr/bgp_remote_as_2963_test.go,
+  pkg/frr/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2980 — commit-time validation of OSPF/OSPFv3/BGP router-id as a
+  valid 32-bit IPv4 dotted-quad. router-id was parsed as a raw string with no
+  validation, so a malformed value (garbage, out-of-range octet, or an IPv6
+  address) flowed verbatim into frr.conf. FRR/vtysh requires an IPv4 router-id
+  for ALL routing protocols (including the IPv6 protocols OSPFv3 and BGP) and
+  rejects anything else, failing the whole frr-reload — a commit-accepted
+  config the routing daemon cannot load. Added validateRouterIDStrict
+  (pkg/config/compiler_validate_strict.go) hard-rejecting a non-IPv4 router-id
+  at commit/commit-check (global protocols {} + per-routing-instance scopes,
+  covering OSPF/OSPFv3/BGP, naming the scope + protocol) wired into
+  compileConfigWithOpts with a new lenientRouterID option (warn-and-boot on
+  load/HA-sync per #1960). Check is net.ParseIP + To4()!=nil; empty router-id
+  allowed (omitted, FRR auto-derives). Defense-in-depth: validRouterID guard
+  at the three generateProtocols render sites (pkg/frr/policy_render.go) so a
+  malformed value never reaches frr.conf on the lenient path. Mirrors the
+  #2963 strict/lenient plumbing exactly. FAIL-ON-REVERT: config gate tests RED
+  without the strict check (neutered validator → 3 anchor tests fail);
+  frr render-guard test RED without the validRouterID skip. Gates:
+  go build ./..., gofmt -l clean (my files), go vet ./pkg/config/...
+  ./pkg/frr/..., go test ./pkg/config/... ./pkg/frr/... all PASS.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/router_id_2980_test.go,
+  pkg/frr/policy_render.go, pkg/frr/router_id_2980_test.go,
   pkg/frr/README.md, _Log.md
 ## 2026-06-25 — #2960 DuckDNS dedicated backend (was a broken dyndns2 alias)
 - **Timestamp**: 2026-06-25
@@ -18087,3 +18171,24 @@ top.
 - **File(s)**: pkg/ddns/backend_duckdns.go, pkg/ddns/README.md,
   pkg/config/compiler_validate_warn.go,
   pkg/config/compiler_p3_http_providers_test.go, _Log.md
+
+## 2026-06-25 — #2975 selectInterfaceAddr skip IFA_F_TEMPORARY
+- **Timestamp**: 2026-06-25
+- **Action**: Fix Surface A interface-address selection to skip RFC 4941/8981
+  SLAAC privacy/temporary IPv6 addresses (`IFA_F_TEMPORARY`). The skip mask in
+  `selectInterfaceAddr` previously omitted IFA_F_TEMPORARY, so a rotating
+  privacy address could win on netlink order and be published to public DNS —
+  leaking the ephemeral identifier and black-holing inbound reachability on the
+  next rotation. Added IFA_F_TEMPORARY to the DAD-not-succeeded skip mask
+  (joins TENTATIVE/DADFAILED/OPTIMISTIC) so the stable permanent address is
+  selected. IFA_F_MANAGETEMPADDR (the permanent SLAAC address that spawns
+  temporaries) is intentionally NOT skipped. Added 4 fail-on-revert table cases
+  to TestSelectInterfaceAddrLifetime (temporary-first, temporary-only,
+  temporary+deprecated, deprecated-temporary). Updated function godoc and
+  pkg/ddns/README.md address-lifetime selection paragraph.
+- **Gates**: go build ./... PASS; gofmt -l clean; go vet ./pkg/daemon/ PASS;
+  go test ./pkg/daemon/ -run TestSelectInterfaceAddr PASS (12 cases).
+  Fail-on-revert: dropping IFA_F_TEMPORARY from the mask turns all 4 new cases
+  RED; restore returns green.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
+  pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md

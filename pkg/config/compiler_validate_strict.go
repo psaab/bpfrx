@@ -1039,6 +1039,91 @@ func validateBGPNeighborPeerASStrict(cfg *Config) error {
 	return nil
 }
 
+// validateRouterIDStrict hard-rejects an OSPF / OSPFv3 / BGP router-id that is
+// not a valid 32-bit IPv4 dotted-quad (#2980).
+//
+// router-id is parsed as a raw string and stored verbatim
+// (compiler_protocols.go assigns OSPF/OSPFv3/BGP RouterID = child.Keys[1] with
+// no validation). The FRR renderer (pkg/frr/policy_render.go) emits
+// `ospf router-id <v>` / `ospf6 router-id <v>` / `bgp router-id <v>` whenever
+// the field is non-empty. FRR/vtysh requires a 32-bit dotted-quad router-id
+// for ALL of these protocols — including the IPv6 protocols OSPFv3 (ospf6) and
+// BGP — and rejects anything else (e.g. `foo`, `300.1.2.3`, or an IPv6
+// address): the whole frr-reload fails (a single vtysh -f add-batch exits
+// non-zero on any CMD_WARNING_CONFIG_FAILED), leaving dynamic routing in a
+// broken/stale state. That is a commit-accepted config the routing daemon
+// cannot load — exactly the fail-class this gate closes.
+//
+// A router-id is the 32-bit dotted-quad form even for IPv6 protocols, so the
+// check is net.ParseIP + To4()!=nil (net/netip ParseAddr+Is4 is equivalent;
+// To4 keeps the validator on the same net.* surface the file already uses for
+// other address checks). Empty is allowed at every scope — an unset router-id
+// is omitted by the renderer and FRR auto-derives one, which is the documented
+// Junos/FRR default.
+//
+// Both the global `protocols {}` and per-routing-instance scopes are checked,
+// covering OSPF, OSPFv3, and BGP. Routing instances are walked in declaration
+// order for a deterministic first-error message.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientRouterID) so an already-persisted or peer-synced config
+// carrying a bad router-id still BOOTS (#1960 fail-closed-on-load class); the
+// render path now skips an invalid router-id (defense-in-depth) so a malformed
+// value never reaches frr.conf and a leniently-loaded bad router-id is inert.
+// Commit / commit-check stay strict. Mirrors validateBGPNeighborPeerASStrict.
+func validateRouterIDStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+
+	check := func(scope, proto, routerID string) error {
+		if routerID == "" {
+			return nil
+		}
+		if ip := net.ParseIP(routerID); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("%s%s router-id %q is not a valid IPv4 "+
+				"dotted-quad address — FRR/vtysh requires a 32-bit IPv4 "+
+				"router-id for all routing protocols (including OSPFv3 and "+
+				"BGP) and rejects anything else, failing the frr-reload",
+				scope, proto, routerID)
+		}
+		return nil
+	}
+
+	checkScope := func(scope string, ospf *OSPFConfig, ospfv3 *OSPFv3Config, bgp *BGPConfig) error {
+		if ospf != nil {
+			if err := check(scope, "protocols ospf", ospf.RouterID); err != nil {
+				return err
+			}
+		}
+		if ospfv3 != nil {
+			if err := check(scope, "protocols ospf3", ospfv3.RouterID); err != nil {
+				return err
+			}
+		}
+		if bgp != nil {
+			if err := check(scope, "protocols bgp", bgp.RouterID); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if err := checkScope("", cfg.Protocols.OSPF, cfg.Protocols.OSPFv3, cfg.Protocols.BGP); err != nil {
+		return err
+	}
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil {
+			continue
+		}
+		scope := fmt.Sprintf("routing-instance %s ", ri.Name)
+		if err := checkScope(scope, ri.OSPF, ri.OSPFv3, ri.BGP); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validateFirewallPolicerReferencesStrict hard-rejects a firewall-filter
 // term whose `then policer <name>` (Finding A, #2217) references neither a
 // defined single-rate policer (`firewall policer <name>`) nor a defined
