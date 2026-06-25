@@ -37,6 +37,113 @@
   100::/64, 2001:db8::/32, 2002::/16, fc00::/7, fd00::); restored →
   GREEN.
 
+## 2026-06-25 — #2622: firewall filter source-port-except / destination-port-except
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added the Junos negated port match conditions
+  `from source-port-except` / `from destination-port-except` (match every
+  port EXCEPT the listed ones) end to end, the port-dimension counterpart
+  to the existing positive source-port / destination-port. Scope is ports
+  only — `packet-length` from the same review-039 finding 039-04 is NOT
+  implemented here.
+  - Schema: two `multi: true` leaves in `schemaFirewall`'s `from` block in
+    `schema_cos.go` (both `family inet` and `inet6`).
+  - Typed config: `SourcePortsExcept` / `DestPortsExcept []string` on
+    `FirewallFilterTerm` (`types_system.go`); `compileFilterFrom`
+    accumulates via `firewallMatchValues` (both AST shapes, #2419 bracket
+    list).
+  - Wire: additive `source_ports_except` / `destination_ports_except`
+    fields on Go `FirewallTermSnapshot` (`protocol.go`) + Rust
+    `FirewallTermSnapshot` (`protocol/security.rs`, `serde(default)` for
+    #1961 parity); emitted by `filters.go`. Regenerated
+    `protocol_wire_v1.json` (exactly the 2 keys added).
+  - Rust matcher: compiler selects ONE port list per direction (positive
+    wins, else except) and sets `source_port_except` / `dest_port_except`
+    on `FilterTerm`; `port_match` evaluates `matcher.matches(port) ^ except`
+    mirroring `nets_match_v4`/`_v6` (empty-except → match ALL,
+    empty-positive → match NOTHING). Added the new flags to
+    `filter_term_semantics_match` (cache_sensitive.rs) so a `*-port-except`
+    toggle rebuilds flow-cache decisions (sibling of source_except).
+  - FAIL-ON-REVERT proof: Rust `destination_port_except_negation` /
+    `source_port_except_negation` (port IN except list does NOT match,
+    port NOT in it DOES) — proven RED when `^ except` removed; Go
+    `firewall_port_except_2622_test.go` (hierarchical + flat-set bracket
+    + inet6) — proven RED when the compiler cases removed; Go emit test
+    `filters_port_except_2622_test.go`.
+  - Gates: cargo build --release OK; cargo test filter:: 117 + protocol::
+    184 OK; go build ./... OK; gofmt clean (touched files); go vet OK;
+    go test ./pkg/config/... ./pkg/dataplane/userspace/... OK.
+- **File(s)**: `pkg/config/schema_cos.go`,
+  `pkg/config/compiler_firewall.go`, `pkg/config/types_system.go`,
+  `pkg/config/firewall_port_except_2622_test.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/filters.go`,
+  `pkg/dataplane/userspace/filters_port_except_2622_test.go`,
+  `userspace-dp/src/protocol/security.rs`,
+  `userspace-dp/src/filter/mod.rs`,
+  `userspace-dp/src/filter/compiler.rs`,
+  `userspace-dp/src/filter/engine/matching.rs`,
+  `userspace-dp/src/filter/engine/cache_sensitive.rs`,
+  `userspace-dp/src/filter/tests.rs`,
+  `userspace-dp/src/filter/README.md`,
+  `userspace-dp/tests/fixtures/protocol_wire_v1.json`,
+  `docs/config-schema.md`, `_Log.md`
+## 2026-06-25 — #2770: cloudflare withdraw is content-scoped (delete owned rows only)
+
+- **Timestamp**: 2026-06-25
+- **Action**: Cloudflare Surface A `DeleteLease` deleted whatever
+  `findRecord` returned (`recs[0]`), ignoring the owned content tuple. With
+  multiple same-name/type rows — or after a human/automation changed the
+  value xpf published — the withdraw clobbered the NEW value (or left a
+  duplicate owned row behind). Fix: split the list step into a new
+  `listRecords` (returns ALL matching records); `DeleteLease` now deletes
+  only the rows whose `content == rec.Addr.Unmap().String()`, removing
+  EVERY such row, and treats no-content-match (ownership conflict) /
+  already-gone as a success no-op — never deletes a foreign value. This
+  honours the Surface A sole-delete-authority boundary (Route 53 / RFC 2136
+  re-derive the delete from owned state too). `findRecord` gained a
+  `wantContent` arg so the upsert path prefers the content-matching row
+  (re-publish stays a no-op) before falling back to `recs[0]` for the PATCH
+  target.
+- **File(s)**: `pkg/ddns/backend_cloudflare.go`,
+  `pkg/ddns/backend_cloudflare_test.go`, `pkg/ddns/README.md`, `_Log.md`
+- **Fail-on-revert proof**: reverted `DeleteLease` to the first-only,
+  content-blind body (restored via file copy, not `git checkout`) →
+  `TestCloudflareDeleteAllOwnedRecords` and
+  `TestCloudflareDeleteOwnershipConflict` both go RED (deleted!=2 owned
+  rows / clobbered the foreign value); restored fix → all green.
+- **Gates**: `go build ./...` OK, `gofmt -l` clean, `go vet ./pkg/ddns/...`
+  OK, `go test ./pkg/ddns/...` ok.
+## 2026-06-25 — #2771: route53 already-gone DELETE is idempotent (Surface A unwedge)
+
+- **Timestamp**: 2026-06-25
+- **Action**: A Route 53 Surface A withdraw against an already-removed
+  record failed and never converged: `backend_route53.go` `DeleteLease`
+  sent a strict DELETE and a no-such-record response (HTTP 400
+  `InvalidChangeBatch` "... but it was not found") propagated as non-nil.
+  Surface A's `withdrawOwnedLocked` drops ownership only on a nil return,
+  so the withdraw wedged and retried forever while `show system services
+  dynamic-dns` reported an owned record that no longer existed. Fix: made
+  `DeleteLease` IDEMPOTENT — `change` now returns the parsed Route 53
+  error code+message, and `r53DeleteAlreadyGone` classifies the
+  already-gone case (requires BOTH `Code=InvalidChangeBatch` AND a "not
+  found" marker) as success (nil) so ownership releases. Mirrors the
+  rfc2136 backend's NXRRSET/NXDOMAIN idempotent delete (`sendRemove`).
+  Genuine transient/auth/throttle failures (`SignatureDoesNotMatch`, 5xx,
+  429, a non-"not found" `InvalidChangeBatch`) STILL return non-nil so the
+  engine retries — only the already-gone case is swallowed.
+- **Fail-on-revert proof**: copied `backend_route53.go` aside, neutered
+  the `r53DeleteAlreadyGone` branch in `DeleteLease` (return the raw
+  err) → `TestRoute53DeleteAlreadyGoneIdempotent` FAILED ("already-gone
+  DELETE must be idempotent success (nil), got ... InvalidChangeBatch:
+  [Tried to delete resource record set ...] but it was not found ...
+  unexpected status 400"); the genuine-error subtests
+  (`TestRoute53DeleteGenuineErrorRetries`) stayed GREEN through the revert
+  (no over-swallow). Restored the file → all GREEN.
+- **Gates**: `go build ./...` OK; `gofmt -l pkg/ddns/` clean; `go vet
+  ./pkg/ddns/...` clean; `go test ./pkg/ddns/...` PASS.
+- **File(s)**: `pkg/ddns/backend_route53.go`,
+  `pkg/ddns/backend_route53_test.go`, `pkg/ddns/README.md`, `_Log.md`.
 ## 2026-06-25 — #2772: ddns http dyndns2 + generic withdraw is no longer a silent no-op
 
 - **Timestamp**: 2026-06-25

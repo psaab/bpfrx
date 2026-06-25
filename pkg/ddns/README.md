@@ -22,6 +22,8 @@ moved with its assertions intact.
 | `hostname.go` | Deterministic hostname → DNS-label normalization (pure) — moved from `dhcpserver/ddns_hostname.go`. |
 | `surface_a.go` | Surface A router/interface-address publish engine (`SurfaceAManager`): change-detection, forced-refresh wire floor, per-scope error backoff, per-RG HA gate, the backend factory `productionSurfaceABackend` (#2691 P2/P3). |
 | `backend_http.go` | Shared HTTP-backend discipline (#2691 P3): hardened `http.Client` (TLS-verified, bounded timeout), capped body read, `classifyHTTPStatus`, `queryEscape`, the `errHTTPAuth`/`errHTTPRateLimited` verdicts. |
+| `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. |
+| `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → find → PATCH/POST/DELETE record. **Withdraw is content-scoped (#2770):** `DeleteLease` lists EVERY record for the FQDN+type and deletes only the rows whose `content` equals the owned address (`rec.Addr.Unmap().String()`), removing ALL such duplicates. It never deletes a row with a different value (a human/automation changed it after xpf published — an ownership conflict that is a success no-op), honouring the Surface A sole-delete-authority boundary that Route 53 / RFC 2136 also enforce. `recs[0]` is an API-ordering artifact, not ownership. |
 | `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. **Withdraw (#2772):** `DeleteLease` issues the same update GET with `offline=YES` (the de-facto dyndns2 withdraw verb) and parses the body verdict; a provider failure returns a non-nil error so the engine keeps ownership for retry (was a silent no-op that orphaned the public record). |
 | `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → find → PATCH/POST/DELETE record. |
 | `backend_route53.go` | Route 53 backend (#2691 P3): SigV4-signed `ChangeResourceRecordSets` UPSERT/DELETE change batch. |
@@ -146,6 +148,21 @@ no change in those packages:
   live backend withdraws it for real. `reconcileOnceLocked` / `withdrawAllLocked`
   swallow the sentinel so a legitimate disabled-with-no-backend pass is not
   marked failed. Mirrors the Surface A `withdrawOwnedLocked` precedent.
+- **Route 53 already-gone DELETE is idempotent (#2771)** — `backend_route53.go`
+  `DeleteLease` treats a Route 53 DELETE of an already-absent record as success
+  (nil), mirroring the rfc2136 backend's NXRRSET/NXDOMAIN handling
+  (`sendRemove`). Route 53 reports an already-gone delete as HTTP 400
+  `Code=InvalidChangeBatch` with a per-change message `... but it was not
+  found`; `r53DeleteAlreadyGone` requires BOTH the `InvalidChangeBatch` code AND
+  the "not found" marker, so a genuinely malformed/conflicting batch is NOT
+  mistaken for a no-op. Without this, a withdraw against a manually-removed (or
+  already-withdrawn-but-ack-lost) record returned non-nil forever; Surface A's
+  `withdrawOwnedLocked` only drops ownership on a nil return, so the withdraw
+  wedged and retried indefinitely while `show system services dynamic-dns`
+  reported an owned record that no longer existed. Genuine
+  transient/auth/throttle failures (`SignatureDoesNotMatch`, 5xx, 429, a
+  non-"not found" `InvalidChangeBatch`) STILL return non-nil so the engine
+  keeps retrying — only the already-gone case is swallowed.
 - **Shared-DHCID partial dual-stack teardown (#2700)** — the RFC 4701 DHCID
   digest folds in `client-identity || FQDN` only (NOT the address), so a
   dual-stack client (an A + an AAAA under one FQDN, same client id) shares ONE

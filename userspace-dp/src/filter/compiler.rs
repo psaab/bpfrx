@@ -430,14 +430,34 @@ fn parse_term(
             }
         }
     }
-    let source_ports: Vec<PortRange> = snap
-        .source_ports
+    // #2622: a direction's port scope is either the positive `source-port` /
+    // `destination-port` list OR the negated `source-port-except` /
+    // `destination-port-except` list (Junos treats them as mutually exclusive).
+    // Build ONE PortMatcher per direction from whichever list carries entries,
+    // and set `*_port_except` when the except list is the source. If both are
+    // somehow present, the positive list builds the matcher and the except list
+    // is ignored (positive wins) — the except flag stays false so the positive
+    // set is honored verbatim.
+    let source_port_except = snap.source_ports.iter().all(|p| !port_is_real(p))
+        && snap.source_ports_except.iter().any(|p| port_is_real(p));
+    let dest_port_except = snap.destination_ports.iter().all(|p| !port_is_real(p))
+        && snap.destination_ports_except.iter().any(|p| port_is_real(p));
+    let source_port_specs: &[String] = if source_port_except {
+        &snap.source_ports_except
+    } else {
+        &snap.source_ports
+    };
+    let dest_port_specs: &[String] = if dest_port_except {
+        &snap.destination_ports_except
+    } else {
+        &snap.destination_ports
+    };
+    let source_ports: Vec<PortRange> = source_port_specs
         .iter()
         .filter_map(|p| parse_port_spec(p))
         .flatten()
         .collect();
-    let dest_ports: Vec<PortRange> = snap
-        .destination_ports
+    let dest_ports: Vec<PortRange> = dest_port_specs
         .iter()
         .filter_map(|p| parse_port_spec(p))
         .flatten()
@@ -447,9 +467,11 @@ fn parse_term(
     // treats as "no port range") so an empty entry never trips fail-closed. A
     // constrained port set whose entries ALL failed to parse yields zero ranges
     // -> `PortMatcher::Any`; the `*_port_constrained` flag lets the matcher tell
-    // that apart from a genuinely unscoped term and fail closed.
-    let source_port_constrained = snap.source_ports.iter().any(|p| port_is_real(p));
-    let dest_port_constrained = snap.destination_ports.iter().any(|p| port_is_real(p));
+    // that apart from a genuinely unscoped term and fail closed. The constraint
+    // is derived from the SELECTED spec list (positive or except), so an
+    // except-only term is correctly constrained (#2622).
+    let source_port_constrained = source_port_specs.iter().any(|p| port_is_real(p));
+    let dest_port_constrained = dest_port_specs.iter().any(|p| port_is_real(p));
     let action = match snap.action.as_str() {
         "accept" => FilterAction::Accept,
         "reject" => FilterAction::Reject,
@@ -500,6 +522,9 @@ fn parse_term(
         dest_ports: build_port_matcher(dest_ports),
         source_port_constrained,
         dest_port_constrained,
+        // #2622: carry the negated-port inversion flag (Junos `*-port-except`).
+        source_port_except,
+        dest_port_except,
         dscp_bitmap: build_u6_match_bitmap(&snap.dscp_values),
         dscp_match_enabled: !snap.dscp_values.is_empty(),
         // #2362 per-packet L4 match conditions. A zero tcp_flags mask means

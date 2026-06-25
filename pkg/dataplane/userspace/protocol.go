@@ -561,11 +561,22 @@ type FirewallTermSnapshot struct {
 	// (fail-closed); with except set it matches ALL (the Junos "not in {}"
 	// semantic). These default to false, so a term with no address scope behaves
 	// exactly as before.
-	SourceConstrained bool          `json:"source_constrained,omitempty"`
-	DestConstrained   bool          `json:"destination_constrained,omitempty"`
-	Protocols         []string      `json:"protocols,omitempty"`
-	SourcePorts       []string      `json:"source_ports,omitempty"` // "80" or "1024-65535"
-	DestPorts         []string      `json:"destination_ports,omitempty"`
+	SourceConstrained bool     `json:"source_constrained,omitempty"`
+	DestConstrained   bool     `json:"destination_constrained,omitempty"`
+	Protocols         []string `json:"protocols,omitempty"`
+	SourcePorts       []string `json:"source_ports,omitempty"` // "80" or "1024-65535"
+	DestPorts         []string `json:"destination_ports,omitempty"`
+	// SourcePortsExcept / DestPortsExcept are the NEGATED port match sets
+	// (#2622, Junos `from source-port-except` / `destination-port-except`):
+	// match every port EXCEPT the listed ones. When non-empty, the Rust matcher
+	// evaluates `(port ∈ ranges) XOR true` = match-all-but-these, with the same
+	// fail-closed-on-all-malformed → match-all-but-{} = match-all semantics as
+	// the address `except`. These are wired as separate fields from the positive
+	// SourcePorts / DestPorts (Junos treats positive and `-except` as distinct,
+	// mutually-exclusive criteria). serde(default) on the Rust side keeps wire
+	// parity with an older Go control plane that omits them (#1961).
+	SourcePortsExcept []string      `json:"source_ports_except,omitempty"`
+	DestPortsExcept   []string      `json:"destination_ports_except,omitempty"`
 	DSCPValues        WireUint8List `json:"dscp_values,omitempty"`
 	Action            string        `json:"action"` // "accept", "discard", "reject"
 	// NextTerm records `then next term` / a modifier-only term — a term whose
