@@ -257,6 +257,7 @@ stays valid for back-compat.
 |----------------------------|-------------------|--------------------------|
 | `add <value>`              | `add`             | `set community <value> additive` |
 | `delete <name>`            | `delete`          | `set comm-list <name> delete`    |
+| `delete [ <a> <b> ... ]`   | `delete`          | one `set comm-list <name> delete` PER list (#2902) |
 | `set <value>`              | `set`             | `set community <value>`          |
 | `<value>` (bare)           | `""`              | `set community <value>`          |
 | `none`                     | `none`            | `set community none`             |
@@ -269,6 +270,15 @@ propagation in transit networks. `delete <name>` references a named
 `bgp community-list <name>`), so FRR's `set comm-list <name> delete` strips
 exactly its members. `none` strips all communities.
 
+**Multi-list delete (#2902):** `then community delete [ listA listB ]` references
+MULTIPLE community-lists. FRR's `set comm-list <name> delete` strips ONE list per
+line, so `PolicyTerm.CommunityDelete` is a `[]string`: the compiler accumulates
+every name in `vals[1:]` (the lexer strips the brackets, so the clause flattens
+to `delete listA listB` — the #2419 multi-value shape) and the renderer emits one
+`set comm-list <name> delete` clause per list. The pre-#2902 code stored only
+`vals[1]`, silently dropping `listB...` so the communities the operator meant to
+strip leaked into advertised prefixes.
+
 Schema (`schema_routing.go`): `then community` is a `multi: true` leaf that
 packs the optional operation keyword plus the value onto one leaf's Keys
 (`community add 65000:111`, `community none`, `community 65000:111`). The
@@ -280,8 +290,10 @@ child node, so the hierarchical compile path is the one exercised; the flat
 inline path carries belt-and-suspenders handling for the same forms.
 
 Fail-on-revert: compiler-level
-`TestPolicyCommunityOperationsCompile` (`pkg/config/parser_security_test.go`)
-and end-to-end `TestPolicyCommunityOperations` (`pkg/frr/frr_test.go`, full
+`TestPolicyCommunityOperationsCompile` and
+`TestPolicyCommunityDeleteMultiListCompile` (`pkg/config/parser_security_test.go`)
+and end-to-end `TestPolicyCommunityOperations` +
+`TestPolicyCommunityDeleteMultiList` (`pkg/frr/frr_test.go`, full
 ParseSetCommand + SetPath + CompileConfig + `generatePolicyOptions`).
 
 ## How to add a config-mode typed leaf

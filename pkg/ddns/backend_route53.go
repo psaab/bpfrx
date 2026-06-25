@@ -46,8 +46,10 @@ type route53Backend struct {
 
 // newRoute53Backend resolves a provider-catalog entry into a live Route 53
 // backend. Missing access key / secret / hosted-zone-id are hard errors so the
-// manager falls back to no-op (logged) rather than issuing unsigned requests.
-func newRoute53Backend(p *config.DDNSProvider) (*route53Backend, error) {
+// manager falls back to no-op (logged) rather than issuing unsigned requests. A
+// non-nil client is reused (the cached reconcile-path client, #2904); nil
+// builds a fresh bound client.
+func newRoute53Backend(p *config.DDNSProvider, client *http.Client) (*route53Backend, error) {
 	if p == nil {
 		return nil, fmt.Errorf("ddns route53: nil provider")
 	}
@@ -66,8 +68,9 @@ func newRoute53Backend(p *config.DDNSProvider) (*route53Backend, error) {
 	if s := strings.TrimSpace(p.Server); s != "" {
 		endpoint = strings.TrimRight(s, "/")
 	}
-	// Bind the dial to the configured source-address/interface/VRF (#2846).
-	client, err := newProviderHTTPClient(p)
+	// Bind the dial to the configured source-address/interface/VRF (#2846). A
+	// cached client (#2904) is reused when supplied; nil builds a fresh one.
+	client, err := ensureProviderHTTPClient(p, client)
 	if err != nil {
 		return nil, fmt.Errorf("ddns route53: provider %q: %w", p.Name, err)
 	}

@@ -90,13 +90,16 @@ type PolicyTerm struct {
 	// replace using term.Community (the empty string preserves back-compat
 	// with the bare `then community <v>` form). For "add" the value lives in
 	// CommunityAdd (rendered `set community <v> additive`), for "delete" the
-	// referenced community-list name lives in CommunityDelete (rendered
-	// `set comm-list <name> delete`), and "none" carries no argument
-	// (rendered `set community none`).
-	CommunityOp     string // "", "set", "add", "delete", "none"
-	CommunityAdd    string // community value(s) to append (`then community add <v>`)
-	CommunityDelete string // community-list name whose members to strip (`then community delete <name>`)
-	Origin          string // BGP origin: "igp", "egp", "incomplete"
+	// referenced community-list NAMES live in CommunityDelete (one
+	// `set comm-list <name> delete` line per name — FRR's set clause takes a
+	// single community-list per line, so a multi-list
+	// `then community delete [ listA listB ]` must accumulate every name, not
+	// just the first; #2902), and "none" carries no argument (rendered
+	// `set community none`).
+	CommunityOp     string   // "", "set", "add", "delete", "none"
+	CommunityAdd    string   // community value(s) to append (`then community add <v>`)
+	CommunityDelete []string // community-list name(s) whose members to strip (`then community delete <name> ...`)
+	Origin          string   // BGP origin: "igp", "egp", "incomplete"
 	// ASPathPrepend holds the ordered list of ASNs to prepend to the BGP
 	// AS_PATH attribute (`then as-path-prepend "<asn> <asn> ..."`), rendered
 	// as the FRR route-map clause `set as-path prepend <asn> <asn> ...`

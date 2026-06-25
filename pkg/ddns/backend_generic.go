@@ -54,7 +54,12 @@ type genericBackend struct {
 // newGenericBackend resolves a provider-catalog entry into a live generic
 // backend. A missing url-template is a hard error (nothing to do) so the manager
 // falls back to no-op rather than silently publishing nothing.
-func newGenericBackend(p *config.DDNSProvider) (*genericBackend, error) {
+//
+// client is the bound *http.Client the backend issues requests on. The Surface A
+// reconcile path passes a cached client (reused across passes, #2904); a nil
+// client makes the constructor build its own bound client (test callers, and any
+// caller without a cache) — preserving the pre-#2904 self-contained behaviour.
+func newGenericBackend(p *config.DDNSProvider, client *http.Client) (*genericBackend, error) {
 	if p == nil {
 		return nil, fmt.Errorf("ddns generic: nil provider")
 	}
@@ -70,7 +75,7 @@ func newGenericBackend(p *config.DDNSProvider) (*genericBackend, error) {
 		ok = []string{strings.ToLower(s)}
 	}
 	// Bind the dial to the configured source-address/interface/VRF (#2846).
-	client, err := newProviderHTTPClient(p)
+	client, err := ensureProviderHTTPClient(p, client)
 	if err != nil {
 		return nil, fmt.Errorf("ddns generic: provider %q: %w", p.Name, err)
 	}
