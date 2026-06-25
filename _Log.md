@@ -16444,3 +16444,35 @@ top.
   go test ./pkg/config/... pass.
   **File(s)**: pkg/config/compiler_validate_wireguard.go,
   pkg/config/wireguard_multipeer_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2779 — reject Surface A DDNS operator hostnames that the
+  publish path would SILENTLY rewrite to a different public DNS name. The
+  router-owned Surface A hostname is operator intent (the operator types the
+  exact public name), but the publish path surfaceAName -> sanitizeFQDN
+  (pkg/ddns/hostname.go) lower-cases, strips every non-LDH character, drops
+  labels that sanitize empty, and trims leading/trailing dashes — so
+  wan_1.example.net was published as wan1.example.net with no commit error
+  (codex-review-048 finding 048-08). Fix per the issue's "validate at commit"
+  direction: the `interfaces <if> unit <n> family <af> dynamic-dns hostname`
+  leaf is now a TYPED leaf (new ValueHostname value-type + ValidateDDNSHostname
+  validator). The validator ACCEPTS only names sanitizeFQDN preserves unchanged
+  modulo case-folding + a single trailing dot (both benign DNS
+  canonicalizations) and REJECTS — naming the offending hostname — any name
+  with a non-LDH character, an empty label (leading/doubled/trailing dot), a
+  leading/trailing-dash label, or an over-length label/name. Scope:
+  pkg/config only (schema typing + validator); no pkg/ddns runtime code
+  changed (the sanitizer is now unreachable for a structurally-altering name
+  because commit rejects it first). Fail-on-revert proof: copied
+  pkg/config/schema_validators.go aside, stubbed ValidateDDNSHostname to
+  `return nil`, reran go test ./pkg/config/... ./pkg/ddns/... -run 2779 ->
+  BOTH packages FAILED (config matrix reject cases got nil; pkg/ddns
+  cross-package contract test "validator accepted a name the publish path
+  rewrites"); restored from the copy, all green. Gates: go build ./... clean,
+  gofmt -l (my files) clean, go vet ./pkg/config/... ./pkg/ddns/... clean,
+  go test ./pkg/config/... ./pkg/ddns/... pass.
+  **File(s)**: pkg/config/schema_validators.go,
+  pkg/config/schema_interfaces.go, pkg/config/value_type.go,
+  pkg/config/schema_validate_ddns_hostname_2779_test.go,
+  pkg/ddns/surface_a_hostname_2779_test.go, pkg/ddns/README.md,
+  docs/config-schema.md, _Log.md

@@ -815,6 +815,21 @@ reserved for whole-dataplane selection where a rewrite shim
     `interface` default | `dhcp`), `ttl`, and a per-binding `source-address`
     override. v4 and v6 are INDEPENDENT (distinct fields), like the Surface B
     per-family policy split (#2663).
+    - **`hostname` is a TYPED leaf (#2779, `ValueHostname` + `ValidateDDNSHostname`).**
+      Unlike the DHCP-lease path (where the CLIENT supplies the name and
+      sanitizing untrusted input is reasonable), a router-owned Surface A
+      hostname is OPERATOR INTENT. The publish path (`surfaceAName` →
+      `sanitizeFQDN`) silently lower-cases + strips non-LDH characters + drops
+      empty-sanitizing labels, so a name with an underscore / space / `@` /
+      non-ASCII char / empty label / leading-or-trailing-dash label would be
+      published as a DIFFERENT public DNS name with no error (e.g.
+      `wan_1.example.net` → `wan1.example.net`). The validator REJECTS such a
+      name at commit, naming the offending hostname, so the operator fixes it.
+      ACCEPTED unchanged: LDH labels (`[A-Za-z0-9-]`) joined by single dots,
+      with case-folding and a single trailing dot treated as benign DNS
+      canonicalization. Contract: every name that passes commit is a fixed
+      point of `sanitizeFQDN` (cross-package test
+      `pkg/ddns/surface_a_hostname_2779_test.go`).
   - **Reuses the pkg/ddns spine** (`pkg/ddns/surface_a.go`,
     `SurfaceAManager`): the SAME `DNSUpdater`/rfc2136 backend (self-ownership —
     no DHCID), the SAME `ScopeKey`, and the SAME durable-state shape (a separate
