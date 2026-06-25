@@ -1658,6 +1658,73 @@ func TestApplyFull_BackupRouterWithPrefix(t *testing.T) {
 	}
 }
 
+// TestBackupRouterFamilyAwareDefault is the fail-on-revert guard for #2891.
+//
+// An IPv6 backup-router with no explicit destination must default its route
+// prefix to ::/0 and emit `ipv6 route ::/0 <v6nh>` — NOT `ip route 0.0.0.0/0
+// <v6nh>` (a v4 prefix with a v6 next-hop, which frr-reload rejects and which
+// fails the entire static config load). A v4 backup-router with no explicit
+// destination must still default to 0.0.0.0/0 and emit `ip route 0.0.0.0/0
+// <v4nh>`.
+//
+// Driven through the full ParseSetCommand + SetPath + CompileConfig path so the
+// compiler (compiler_system.go backup-router handling) and the FRR renderer
+// (renderBackupRouter) are both exercised. Reverting the family-aware default
+// in renderBackupRouter turns the v6 case red.
+func TestBackupRouterFamilyAwareDefault(t *testing.T) {
+	tests := []struct {
+		name    string
+		setCmd  string
+		want    string
+		notWant string
+	}{
+		{
+			name:    "v6 backup-router empty dst defaults to ::/0",
+			setCmd:  "set system backup-router 2001:db8::1",
+			want:    "ipv6 route ::/0 2001:db8::1 250\n",
+			notWant: "ip route 0.0.0.0/0 2001:db8::1 250\n",
+		},
+		{
+			name:    "v4 backup-router empty dst defaults to 0.0.0.0/0",
+			setCmd:  "set system backup-router 192.168.50.1",
+			want:    "ip route 0.0.0.0/0 192.168.50.1 250\n",
+			notWant: "ipv6 route ::/0 192.168.50.1 250\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := &config.ConfigTree{}
+			path, err := config.ParseSetCommand(tc.setCmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", tc.setCmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%q): %v", tc.setCmd, err)
+			}
+			cfg, err := config.CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("CompileConfig: %v", err)
+			}
+
+			fc := &FullConfig{
+				BackupRouter:    cfg.System.BackupRouter,
+				BackupRouterDst: cfg.System.BackupRouterDst,
+			}
+			var b strings.Builder
+			renderBackupRouter(&b, fc)
+			got := b.String()
+
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("#2891 %s: missing %q in:\n%s", tc.name, tc.want, got)
+			}
+			if strings.Contains(got, tc.notWant) {
+				t.Errorf("#2891 %s: must NOT emit %q (mismatched prefix/next-hop family):\n%s", tc.name, tc.notWant, got)
+			}
+		})
+	}
+}
+
 func TestGenerateStaticRoute_QualifiedNextHopLinkLocal(t *testing.T) {
 	m := New()
 	sr := &config.StaticRoute{
