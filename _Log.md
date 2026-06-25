@@ -17236,3 +17236,25 @@ top.
   clean, go vet ./pkg/dhcprelay/..., go test ./pkg/dhcprelay/... PASS.
   **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
   pkg/dhcprelay/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2865 RA sender whose initial openConn() fails stayed in
+  m.senders as a dead entry; the config-unchanged Apply reconcile skipped it
+  (configEqual → continue), so a transient boot-time bind failure (link still
+  doing DAD / link-local not yet present) left that interface permanently with
+  no RA (IPv6 hosts lose default route / RDNSS) until daemon restart or a
+  config change. Fix: added sender.dead() (open attempt RESOLVED — connReady
+  closed — without a live conn, i.e. !connOpened) and gated the reconcile
+  skip with !existing.dead(); a dead sender is now treated as a hard-REBUILD
+  even with unchanged config, reusing the #2834 make-before-break replace path
+  (tombstone → stop old → start replacement on proven-close; a dead sender's
+  run() has already exited + closed its conn so the join is immediate). An
+  in-flight slow open is NOT dead (connReady not yet closed), so it is never
+  spuriously torn down — composes with #2453/#2835. Added fail-on-revert test
+  TestT2865_DeadSenderRebuiltOnReconcile (fail-then-succeed listenFn: open
+  fails → sender goes dead → re-Apply IDENTICAL config → rebuilt into a live
+  sender emitting the startup burst; RED when the !existing.dead() guard is
+  removed — "conn for lo never opened"). Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/ra/..., go test -race ./pkg/ra/... PASS.
+  **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/serialize_test.go,
+  pkg/ra/README.md, _Log.md
