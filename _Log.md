@@ -15833,6 +15833,25 @@ top.
   userspace-dp/src/afxdp/umem/tests.rs,
   userspace-dp/src/filter/tests.rs, _Log.md
 
+- **Timestamp**: 2026-06-25
+  **Action**: #2458 — reject unknown non-empty CoS equal-flow-target-policy
+  at the Rust helper boundary instead of silently mapping it to `Slowest`.
+  `EqualFlowTargetPolicy::parse` is now fallible: `""`/`slowest`/`mean`/
+  `ideal-share` decode as before, a non-empty UNKNOWN value returns the
+  offending string. The `build_cos_iface_config` call site converts that
+  into `SnapshotIntegrityError::CosUnknownEqualFlowTargetPolicy`
+  (forwarding-class + value), failing the snapshot CLOSED (preflight keeps
+  the previous live CoS state). The Go commit-time gate
+  (`validateClassOfServiceStrict` / schema enum, #1746) was already the
+  primary defense and is unchanged; this is the version/snapshot-drift
+  backstop, consistent with the #2447 CoS fail-closed family. Decode tests
+  for `""`, the three known values, and a typo; a `build_cos_state`
+  fail-closed integration test. Fail-on-revert PROVEN: restoring the
+  catch-all arm turns both new tests RED, then restored.
+  **File(s)**: userspace-dp/src/afxdp/types/cos.rs,
+  userspace-dp/src/afxdp/forwarding_build/cos.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/policy.rs, docs/config-schema.md, _Log.md
 ---
 - **Timestamp**: 2026-06-25
 - **Action**: #2785 — carry per-policy `then log` flags on the HA session-sync wire so a synced session logs identically after failover. Open-frame flags byte (FLAG_LOG_SESSION_INIT 1<<3 / FLAG_LOG_SESSION_CLOSE 1<<4) -> SessionDeltaInfo -> dataplane.SessionValue.LogFlags (bits 0/1, already on cluster wire) -> SessionSyncRequest.log_session_init/close -> synced-session metadata. Rolling-upgrade safe (serde default / omitempty -> false on old peer). Regenerated protocol_wire_v1.json.

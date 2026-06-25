@@ -107,13 +107,24 @@ pub(in crate::afxdp) enum EqualFlowTargetPolicy {
 }
 
 impl EqualFlowTargetPolicy {
-    /// Parse the wire string from `CoSSchedulerSnapshot`. Unknown or
-    /// empty values map to the byte-unchanged default `Slowest`.
-    pub(in crate::afxdp) fn parse(value: &str) -> Self {
+    /// Parse the wire string from `CoSSchedulerSnapshot`.
+    ///
+    /// #2458: the EMPTY string is the legitimate legacy/unset default and
+    /// decodes to `Slowest` (byte-for-byte the pre-#1746 math). A NON-EMPTY
+    /// UNKNOWN string (a typo or a version-drifted/mixed-version snapshot)
+    /// is REJECTED rather than silently mapped to `Slowest` — silently
+    /// collapsing an unrecognized value to the default would change queue
+    /// fairness with no failure surfaced. The Go commit-time gate
+    /// (`compiler_validate_strict.go`, #1746) is the primary defense; this
+    /// fallible parse is the helper-boundary backstop, consistent with the
+    /// #2447 CoS fail-closed family. Returns the offending value to the
+    /// caller so the snapshot integrity error can name it.
+    pub(in crate::afxdp) fn parse(value: &str) -> Result<Self, &str> {
         match value {
-            "mean" => Self::Mean,
-            "ideal-share" => Self::IdealShare,
-            _ => Self::Slowest,
+            "" | "slowest" => Ok(Self::Slowest),
+            "mean" => Ok(Self::Mean),
+            "ideal-share" => Ok(Self::IdealShare),
+            other => Err(other),
         }
     }
 
@@ -123,6 +134,65 @@ impl EqualFlowTargetPolicy {
             Self::Mean => "mean",
             Self::IdealShare => "ideal-share",
         }
+    }
+}
+
+#[cfg(test)]
+mod equal_flow_target_policy_tests {
+    use super::EqualFlowTargetPolicy;
+
+    /// #2458: the empty (legacy/unset) wire string decodes to the
+    /// byte-unchanged default `Slowest` — NOT an error.
+    #[test]
+    fn empty_decodes_to_slowest_default() {
+        assert_eq!(
+            EqualFlowTargetPolicy::parse(""),
+            Ok(EqualFlowTargetPolicy::Slowest)
+        );
+        // The empty-string default and the explicit `slowest` value must be
+        // indistinguishable (the empty-string contract documented on the
+        // variant).
+        assert_eq!(
+            EqualFlowTargetPolicy::parse(""),
+            EqualFlowTargetPolicy::parse("slowest")
+        );
+    }
+
+    /// All three known wire strings round-trip through `parse`/`as_str`.
+    #[test]
+    fn known_values_decode_and_round_trip() {
+        assert_eq!(
+            EqualFlowTargetPolicy::parse("slowest"),
+            Ok(EqualFlowTargetPolicy::Slowest)
+        );
+        assert_eq!(
+            EqualFlowTargetPolicy::parse("mean"),
+            Ok(EqualFlowTargetPolicy::Mean)
+        );
+        assert_eq!(
+            EqualFlowTargetPolicy::parse("ideal-share"),
+            Ok(EqualFlowTargetPolicy::IdealShare)
+        );
+        for p in [
+            EqualFlowTargetPolicy::Slowest,
+            EqualFlowTargetPolicy::Mean,
+            EqualFlowTargetPolicy::IdealShare,
+        ] {
+            assert_eq!(EqualFlowTargetPolicy::parse(p.as_str()), Ok(p));
+        }
+    }
+
+    /// #2458: a non-empty UNKNOWN value (a typo or version-drifted snapshot)
+    /// is REJECTED — not silently mapped to `Slowest` — and the error names
+    /// the offending value so the snapshot integrity error can surface it.
+    #[test]
+    fn unknown_non_empty_value_is_rejected() {
+        assert_eq!(EqualFlowTargetPolicy::parse("typo"), Err("typo"));
+        assert_eq!(
+            EqualFlowTargetPolicy::parse("Slowest"),
+            Err("Slowest"),
+            "case-sensitive: the Go gate normalizes to lowercase before this point"
+        );
     }
 }
 
