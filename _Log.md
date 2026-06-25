@@ -38,6 +38,58 @@
 - **Gates**: `cargo build --release -p xpf-userspace-dp` OK;
   `cargo test --release --bin xpf-userspace-dp -- wg mtu` 244/0;
   `go build`/`gofmt`/`go vet`/`go test ./pkg/routing/` all clean.
+## 2026-06-25 — #2757: IPsec dynamic-hostname gateway local-address family match
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed defect #2 of #2404 (deferred by PR #2756). For an
+  IPsec gateway specified by `dynamic hostname <fqdn>` with no explicit
+  `local-address` but an `external-interface`, `PrepareConfig` derived
+  `local_addrs` from the interface using a family hint computed only from
+  `gw.Address`. A dynamic-hostname gateway has `Address == ""`, so the hint
+  was 0 (family-agnostic) and `selectUnitAddress` returned whichever family
+  was listed first on the interface (typically IPv4). On a dual-stack
+  appliance reaching an IPv6 peer, this sourced the IKE SA from the IPv4
+  local-address (wrong family) and the tunnel could not establish. Added
+  `gatewayRemoteFamilyHint` (gateway `address` → that IP's family; dynamic
+  hostname → resolved via the injectable `resolveHostFamily` package var,
+  default `net.LookupIP`: IPv6-only→6, IPv4-only→4, dual-stack→0). The call
+  site now passes the resolved family into `resolveInterfaceAddress`, which
+  constrains selection to that family and falls back to family-agnostic
+  only when the interface is single-stack in the other family (so a
+  degraded config still emits a `local_addrs` line). A bare IP in the
+  hostname slot still classifies directly without a DNS lookup.
+- **File(s)**: `pkg/ipsec/policy.go`, `pkg/ipsec/ipsec_test.go`,
+  `pkg/ipsec/README.md`, `_Log.md`.
+- **Fail-on-revert proof**:
+  `TestPrepareConfig_DynamicHostnameFamilyMatch` injects `resolveHostFamily`
+  so an IPv6 peer must pick the IPv6 local-address (and IPv4→IPv4) from a
+  dual-stack interface whose IPv4 address is listed first. Reverting the
+  call site to the buggy `addressFamilyHint(cp.Address)` made the IPv6
+  subtest FAIL (`local-address = "198.51.100.1", want "2001:db8:1::1"`),
+  proven by copy-restore (`cp policy.go policy.go.bak` → mutate → test RED →
+  restore → test GREEN). Companion tests cover the dual-stack peer
+  (family-agnostic, first-usable) and the single-stack fallback
+  (IPv6 peer / IPv4-only interface → IPv4, not empty).
+- **Review fold (bounded resolver)**: hostile review (MERGE-NEEDS-MINOR)
+  flagged that the default `resolveHostFamily` used the uncontexted,
+  blocking `net.LookupIP`, and `PrepareConfig` runs SYNCHRONOUSLY in the
+  daemon apply sequence (`pkg/daemon/daemon_apply.go`) and the CLI commit
+  path (`pkg/cli/apply.go`) — neither did any DNS before #2757. A
+  slow/unreachable resolver would stall `commit`/apply for the full glibc
+  resolver timeout. Folded: the default is now `defaultResolveHostFamily`
+  using `net.Resolver.LookupIPAddr(ctx, host)` bounded by a 2s context
+  timeout (`resolveHostFamilyTimeout`); on timeout/error it returns family
+  0 (agnostic), preserving the graceful interface-decides degradation.
+  Since the lookup is only a family hint (strongSwan does the authoritative
+  resolution at IKE time), 2s is ample. The injectable `resolveHostFamily`
+  seam and `func(host string) int` signature are unchanged, so no call-site
+  or family-selection logic changed (reviewer confirmed selection correct).
+  Added `TestDefaultResolveHostFamily_BoundedDegrades` exercising the REAL
+  default impl against an RFC 6761 `.invalid` host: it must return 0 within
+  4× the timeout (a hard deadline that goes RED if the context bound is
+  dropped). The injected-fake family-selection tests stay green.
+- **Gates**: `go build ./...` OK, `gofmt -l pkg/ipsec/` clean,
+  `go vet ./pkg/ipsec/...` clean, `go test ./pkg/ipsec/...` ok.
 
 ## 2026-06-25 — #2651: WG IPv6 outer UDP checksum uses the AVX2 checksum16_ipv6 helper
 
