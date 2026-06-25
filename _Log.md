@@ -17535,6 +17535,40 @@ top.
   **File(s)**: pkg/routing/xfrm.go, pkg/routing/iface_reuse_test.go,
   pkg/routing/README.md, _Log.md
 
+- **Timestamp**: 2026-06-25
+  **Action**: #2869 eventengine supersede() FIFO ordering fix. supersede()
+  rebuilt the bounded action queue by PREPENDING the new (superseding) action
+  ahead of drained other-policy survivors, converting the documented FIFO queue
+  into LIFO for the newest arrival and starving older queued remediations under
+  sustained event frequency. Fix: append the new action to the TAIL of the
+  survivors (`all := append(drained, a)`) so unrelated policies keep FIFO order;
+  supersede still drops/replaces only the stale same-policy entry. Added
+  fail-on-revert TestSupersede_PreservesFIFOPlacesNewAtTail (fills queue with
+  distinct other-policy actions + a stale same-policy entry, forces supersede,
+  asserts survivors keep order and the new action lands at the tail). Verified
+  RED under the reverted prepend (new action at index 0). Gates: go build ./...,
+  gofmt -l clean, go vet ./pkg/eventengine/..., go test -race
+  ./pkg/eventengine/... PASS.
+  **File(s)**: pkg/eventengine/engine.go,
+  pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2869 review fix — supersede() metrics double-count. In the
+  all-distinct-overflow case (queue full of distinct policies, a new distinct
+  policy arrives, no same-policy stale to evict) the FIFO tail-placement change
+  made the new action overflow supersede()'s refill default branch
+  (droppedQueueFull++) AND then enqueue() counted+warned again — net +2 on
+  xpf_event_actions_dropped_total{reason="queue_full"} for one dropped action.
+  Fix: guard the refill default increment with `if item.policyName !=
+  a.policyName` so supersede counts only un-replaceable SURVIVORS; the new
+  action's single count + warn is owned by enqueue (supersede returns false).
+  Added fail-on-revert TestSupersede_AllDistinctOverflowCountsDropOnce (fills 64
+  distinct, enqueues a 65th distinct, asserts droppedQueueFull delta == 1 and no
+  survivor evicted). Verified RED (delta=2) with the guard removed. Kept
+  TestSupersede_PreservesFIFOPlacesNewAtTail. Gates: go build ./..., gofmt -l
+  clean, go vet ./pkg/eventengine/..., go test -race ./pkg/eventengine/... PASS.
+  **File(s)**: pkg/eventengine/engine.go,
+  pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md, _Log.md
 ## 2026-06-25 — #2885 IPsec link-local IPv6 local-bind selection
 - **Timestamp**: 2026-06-25
 - **Action**: Fixed `matchFamily` (pkg/ipsec/policy.go) rejecting IPv6
