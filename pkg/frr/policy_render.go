@@ -555,6 +555,18 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			fmt.Fprintf(&b, " bgp dampening %d %d %d %d\n", hl, reuse, suppress, maxSup)
 		}
 		for _, n := range bgp.Neighbors {
+			// Defense-in-depth (#2963): never emit `remote-as 0`. peer-as is
+			// optional in the parser/compiler, so a neighbor authored without
+			// one keeps a zero PeerAS. AS 0 is reserved (RFC 7607) and FRR/vtysh
+			// rejects `remote-as 0`, failing the whole frr-reload. Commit-time
+			// validation (validateBGPNeighborPeerASStrict, pkg/config) rejects
+			// this on commit/commit-check; on the tolerant load/peer-sync path
+			// it is downgraded to a warning, so this render guard keeps a
+			// leniently-loaded remote-as-0 neighbor out of frr.conf entirely
+			// rather than bricking the reload for every other peer.
+			if n.PeerAS == 0 {
+				continue
+			}
 			fmt.Fprintf(&b, " neighbor %s remote-as %d\n", n.Address, n.PeerAS)
 			if n.Description != "" {
 				fmt.Fprintf(&b, " neighbor %s description %s\n", n.Address, sanitizeFRRValue(n.Description))

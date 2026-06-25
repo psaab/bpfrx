@@ -156,6 +156,23 @@ also carries operator content:
   the FRR-invalid `redistribute direct`, failing the reload) — matching the
   policy-term `FromProtocols` normalization and keeping the commit gate's
   acceptance of `direct` honest.
+- **A BGP neighbor's peer-as (remote-as) is validated at commit (#2963).**
+  `peer-as` is optional in the parser/compiler, so a neighbor authored
+  without one (and without an inherited group `peer-as`) keeps a zero
+  `BGPNeighbor.PeerAS`, and `generateProtocols` would emit `neighbor <addr>
+  remote-as 0`. AS 0 is reserved (RFC 7607) and FRR/vtysh rejects
+  `remote-as 0`, which fails the WHOLE `frr-reload` (a single `vtysh -f`
+  add-batch exits non-zero on any `CMD_WARNING_CONFIG_FAILED`) and leaves
+  dynamic routing broken/stale — a commit-accepted config the routing daemon
+  cannot load. `validateBGPNeighborPeerASStrict` (`pkg/config`) hard-rejects
+  a neighbor whose effective `PeerAS == 0` at commit/commit-check (both the
+  global `protocols bgp` and per-routing-instance scopes), naming the
+  offending group + neighbor; lenient (warn) on load/HA-sync (#1960). As
+  defense-in-depth the renderer (`policy_render.go`, `generateProtocols`)
+  SKIPS a neighbor with `PeerAS == 0` entirely, so AS 0 never reaches
+  frr.conf for a config that arrives via the lenient path (an older-binary
+  persisted config or a peer-synced one) — keeping the rest of the reload
+  alive instead of bricking it for every other peer.
 - **A global `protocols bgp export <token>` is split by token shape
   (#2473).** The render classifies each entry by the SAME
   policy-statement-exists predicate the commit-time validator uses
