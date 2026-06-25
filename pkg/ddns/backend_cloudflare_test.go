@@ -113,7 +113,7 @@ func newCFTestBackend(t *testing.T, srv *httptest.Server, fake *cfFakeAPI) *clou
 	b, err := newCloudflareBackend(&config.DDNSProvider{
 		Name: "cf", Backend: "cloudflare", APIToken: config.Secret(fake.token),
 		Zone: fake.zoneName, Server: srv.URL,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("newCloudflareBackend: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestCloudflareBadTokenIsAuthError(t *testing.T) {
 	b, err := newCloudflareBackend(&config.DDNSProvider{
 		Name: "cf", Backend: "cloudflare", APIToken: config.Secret("WRONG"),
 		Zone: fake.zoneName, Server: srv.URL,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("newCloudflareBackend: %v", err)
 	}
@@ -274,10 +274,10 @@ func TestCloudflareBadTokenIsAuthError(t *testing.T) {
 }
 
 func TestCloudflareMissingCredsConstructError(t *testing.T) {
-	if _, err := newCloudflareBackend(&config.DDNSProvider{Name: "cf", Backend: "cloudflare", Zone: "x"}); err == nil {
+	if _, err := newCloudflareBackend(&config.DDNSProvider{Name: "cf", Backend: "cloudflare", Zone: "x"}, nil); err == nil {
 		t.Fatal("missing api-token must error")
 	}
-	if _, err := newCloudflareBackend(&config.DDNSProvider{Name: "cf", Backend: "cloudflare", APIToken: config.Secret("t")}); err == nil {
+	if _, err := newCloudflareBackend(&config.DDNSProvider{Name: "cf", Backend: "cloudflare", APIToken: config.Secret("t")}, nil); err == nil {
 		t.Fatal("missing zone must error")
 	}
 }
