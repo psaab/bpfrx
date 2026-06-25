@@ -15113,3 +15113,71 @@ top.
   userspace-dp/src/afxdp/icmp_ptb.rs,
   userspace-dp/src/afxdp/icmp_ptb_tests.rs,
   userspace-dp/src/afxdp/README.md
+  **Action**: #2372 — reconcile the LLDP service on day-2 config commits
+  (was boot-only, requiring a daemon restart). Extracted the boot-time LLDP
+  start into `Daemon.reconcileLLDP` (single source of truth), wired it into
+  `applyConfigLocked` after the DHCP-relay reconcile, lazily instantiates the
+  manager on first enable and `Stop()`s it on disable/empty. Added
+  `lldp.Manager.Running()` accessor + a fail-on-revert daemon test
+  (lazy-create on day-2 enable; disable-stops-running under CAP_NET_RAW).
+  **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/daemon_lldp_reconcile_test.go, pkg/lldp/lldp.go,
+  pkg/lldp/README.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2372 review fold — addressed hostile-review findings 3 + 6 on
+  PR #2748. (3) Data race on d.lldpMgr: construct the manager ONCE at boot
+  (unconditionally, mirroring d.dhcpRelay); reconcileLLDP now never reassigns
+  the pointer (only Apply/Stop), so the lock-free `show lldp neighbors`
+  handler reads can't race a day-2 commit. (6) Per-commit thrash: added a
+  reconcile-level diff-guard (effectiveLLDPConfig + lldpConfigEqual,
+  lldpApplied/lldpApplyInit on Daemon) so an unrelated commit no longer
+  Stop()/rebuilds the LLDP generation (which wipes the neighbor table + churns
+  sockets). Added lldp.Manager.ApplyCount() seam + two fail-on-revert tests
+  (manager-identity-stable; skips-unchanged-commit), both proven RED on revert.
+  go test -race ./pkg/daemon/ ./pkg/lldp/ green; disable-stops test PASS under
+  CAP_NET_RAW.
+  **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_run.go, pkg/daemon/daemon_lldp_reconcile_test.go,
+  pkg/lldp/lldp.go, pkg/lldp/README.md
+## #2613 flowexport: drop unpopulated NetFlow/IPFIX template fields
+
+- **Timestamp**: 2026-06-25
+- **Action**: NetFlow v9 + IPFIX templates advertised SrcTos/ipClassOfService
+  (5), TCPFlags/tcpControlBits (6), Direction/flowDirection (61),
+  InputSNMP/ingressInterface (10) and OutputSNMP/egressInterface (14) but the
+  SESSION_CLOSE builder never populated FlowRecord.{TOS,TCPFlags,Direction,
+  InIf,OutIf} and there is no source for them — the fixed 136-byte RT_FLOW
+  close frame carries no DSCP/TOS/flags/direction/egress-ifindex and the Rust
+  encoder hardcodes ingress ifindex 0 on close frames. Collectors ingested
+  authoritative zeros. Dropped all five from both v9 templates and IPFIX v4/v6
+  templates + their record encoders + size consts (ipfixRecordSizeV4 69->57,
+  V6 117->105; v9 v4 64->52, v6 112->100). IncludeFlowDir/NoDir template split
+  collapsed (fieldDirection gone) -> single template per family; IncludeFlowDir
+  kept as an accepted no-op. Compiler now warns on export-extension flow-dir
+  (mirrors the app-id warn-not-lie precedent). Populate-via-wire-extension is a
+  tracked follow-up. fail-on-revert proven RED (3 tests fire on re-adding a
+  field) then restored GREEN.
+- **File(s)**: pkg/flowexport/netflow.go, pkg/flowexport/ipfix.go,
+  pkg/flowexport/exporter_test.go, pkg/flowexport/postnat_test.go,
+  pkg/flowexport/dropped_fields_test.go, pkg/config/compiler_validate_warn.go,
+  pkg/flowexport/README.md, _Log.md
+- **Timestamp**: 2026-06-25
+- **Action**: #2649 — SNMPv3 engineBoots fail-closed on corrupt/ceiling/
+  unwritable state. RFC 3414 §2.2 requires engineBoots monotonic; the prior
+  reset-to-1 on a corrupt/unreadable counter, a ceiling value, or a failed
+  durable write re-opened the timeliness replay window (same deterministic
+  engineID + low boots). Now pin engineBoots to the RFC ceiling
+  (engineBootsMax) in all those cases — checkTimeliness then rejects every
+  authenticated request (§3.2 step 7), forcing re-discovery, while the agent
+  still starts and answers discovery/report (no SNMP DoS — the owner's #2649
+  concern). First-boot missing file still legitimately starts at 1.
+  Replaced TestEngineBootsCorruptResets with three fail-on-revert tests
+  (corrupt fails closed, ceiling does not wrap, persist-failure fails closed)
+  and rebased TestV3SetRequest_NotWritable onto a writable temp boots path so
+  it still exercises the SET authz path. Fail-on-revert proven RED (restoring
+  boots=1 fails the corrupt + ceiling tests). Pre-existing pkg/ra
+  TestT2a_ChangedConfigApplyNeverTwoLiveConns failure is unrelated (fails on
+  clean origin/master, no snmp involvement).
+- **File(s)**: pkg/snmp/agent.go, pkg/snmp/v3_timeliness_test.go,
+  pkg/snmp/v3_set_test.go, pkg/snmp/README.md, _Log.md

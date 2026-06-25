@@ -131,11 +131,19 @@ requires of an authoritative engine:
   created. Each subsequent start reads the prior value, increments it, and
   persists the new value (1 → 2 → 3 …). `engineTime()` then counts from *this*
   boot (`startTime`), so the pair advances monotonically.
-- A corrupt/unreadable counter or a value at the RFC ceiling restarts the count
-  at `1` rather than wedging the agent — the timeliness check is the replay
-  backstop, so a lost counter degrades resynchronization, not security. A write
-  failure is logged and ignored; the agent serves with the in-memory boots for
-  this run and only cross-restart monotonicity is lost until the next write.
+- A corrupt/unreadable counter, a value already at the RFC ceiling, an
+  increment that would reach the ceiling, or a failed durable write all **fail
+  closed** by pinning `engineBoots` to the ceiling (`engineBootsMax`) rather
+  than restarting at `1` (#2649). RFC 3414 §2.2 requires `engineBoots` to be
+  monotonic for the authoritative engine; resetting to a low value while the
+  deterministic engineID is unchanged re-opens the replay window — a captured
+  authenticated request from a prior low-boots epoch could become timely again.
+  At the ceiling `checkTimeliness` rejects every authenticated request (§3.2
+  step 7), so managers must re-discover and the engineID must be reconfigured
+  to recover. The agent still starts and answers discovery/report (no SNMP
+  DoS), but no replayed low-boots packet is serveable while the counter is
+  corrupt, maxed, or unpersistable. First boot (missing file) still legitimately
+  starts at `1` — that is a genuinely new epoch, not a reuse of a low value.
 - The persist uses `fsatomic.WriteFileDurable` (fsync-on-write); the directory
   is created with `fsatomic.MkdirAllDurable`. This is slow-path (once per start),
   so per-write durability is affordable.

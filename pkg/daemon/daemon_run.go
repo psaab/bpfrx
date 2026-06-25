@@ -931,22 +931,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.reconcileRPM(cfg)
 	}
 
-	// Start LLDP if configured.
-	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Protocols.LLDP != nil && !cfg.Protocols.LLDP.Disable && len(cfg.Protocols.LLDP.Interfaces) > 0 {
-		d.lldpMgr = lldp.New()
-		var lldpIfaces []lldp.LLDPInterface
-		for _, iface := range cfg.Protocols.LLDP.Interfaces {
-			lldpIfaces = append(lldpIfaces, lldp.LLDPInterface{
-				Name:    iface.Name,
-				Disable: iface.Disable,
-			})
-		}
-		d.lldpMgr.Apply(ctx, &lldp.LLDPConfig{
-			Interfaces:     lldpIfaces,
-			Interval:       cfg.Protocols.LLDP.Interval,
-			HoldMultiplier: cfg.Protocols.LLDP.HoldMultiplier,
-			SystemName:     cfg.System.HostName,
-		})
+	// Start LLDP if configured. The Manager is always created here (not gated
+	// on a non-nil/enabled LLDP config), mirroring d.dhcpRelay above: the
+	// d.lldpMgr pointer is then written exactly once, at boot, so the lock-free
+	// reads on the gRPC / CLI `show lldp neighbors` handler goroutines never
+	// race a day-2 commit (#2372 finding 3 — a lazy day-2 reassignment would be
+	// a data race on the pointer). reconcileLLDP is the single source of truth
+	// for LLDP start/stop/reconfigure: it runs here at boot and again on every
+	// day-2 commit from applyConfigLocked, so a config change to `protocols
+	// lldp` takes effect without a daemon restart, and it only ever calls
+	// Apply()/Stop() on this already-constructed manager.
+	d.lldpMgr = lldp.New()
+	if cfg := d.store.ActiveConfig(); cfg != nil {
+		d.reconcileLLDP(cfg)
 	}
 
 	// Start event-options engine if configured.

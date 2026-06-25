@@ -52,8 +52,8 @@ func TestIPFIXTemplateV4_PostNATFields(t *testing.T) {
 	if sum != ipfixRecordSizeV4 {
 		t.Fatalf("ipfixRecordSizeV4 = %d, want sum(template) = %d", ipfixRecordSizeV4, sum)
 	}
-	if ipfixRecordSizeV4 != 69 {
-		t.Fatalf("ipfixRecordSizeV4 = %d, want 69 (pre-NAT 57 + 12 post-NAT)", ipfixRecordSizeV4)
+	if ipfixRecordSizeV4 != 57 {
+		t.Fatalf("ipfixRecordSizeV4 = %d, want 57 (pre-NAT 45 + 12 post-NAT, #2613 dropped 12 unpopulated bytes)", ipfixRecordSizeV4)
 	}
 }
 
@@ -78,8 +78,8 @@ func TestIPFIXTemplateV6_PostNATFields(t *testing.T) {
 	if sum != ipfixRecordSizeV6 {
 		t.Fatalf("ipfixRecordSizeV6 = %d, want sum(template) = %d", ipfixRecordSizeV6, sum)
 	}
-	if ipfixRecordSizeV6 != 117 {
-		t.Fatalf("ipfixRecordSizeV6 = %d, want 117 (pre-NAT 81 + 36 post-NAT)", ipfixRecordSizeV6)
+	if ipfixRecordSizeV6 != 105 {
+		t.Fatalf("ipfixRecordSizeV6 = %d, want 105 (pre-NAT 69 + 36 post-NAT, #2613 dropped 12 unpopulated bytes)", ipfixRecordSizeV6)
 	}
 }
 
@@ -175,11 +175,12 @@ func TestNetflowTemplateV4_PostNATFields(t *testing.T) {
 			t.Fatalf("v9 v4 template post-NAT field %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
-	// Record size derives from the template; the post-NAT append must grow it
-	// by 12 bytes (4+4+2+2). The pre-NAT v4 body (with flow-dir) is 50 bytes,
-	// padded to 52; +12 post-NAT = 62, padded to 64.
-	if rs := recordSize(netflowTemplateFieldsV4); rs != 64 {
-		t.Fatalf("v9 v4 recordSize = %d, want 64 (50 pre-NAT body + 12 post-NAT, padded)", rs)
+	// Record size derives from the template; the post-NAT append grows it by
+	// 12 bytes (4+4+2+2). #2613 dropped 11 unpopulated body bytes
+	// (TOS1+TCPFlags1+Dir1+InputSNMP4+OutputSNMP4): the pre-NAT v4 body is now
+	// 39 bytes; +12 post-NAT = 51, padded to 52.
+	if rs := recordSize(netflowTemplateFieldsV4); rs != 52 {
+		t.Fatalf("v9 v4 recordSize = %d, want 52 (39 pre-NAT body + 12 post-NAT, padded; #2613)", rs)
 	}
 }
 
@@ -209,10 +210,10 @@ func TestNetflowTemplateV6_PostNATFields(t *testing.T) {
 			t.Fatalf("v9 v6 template post-NAT field %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
-	// v6 pre-NAT body (with flow-dir) is 74 bytes, padded to 76; +36 post-NAT
-	// = 110, padded to 112.
-	if rs := recordSize(netflowTemplateFieldsV6); rs != 112 {
-		t.Fatalf("v9 v6 recordSize = %d, want 112 (74 pre-NAT body + 36 post-NAT, padded)", rs)
+	// #2613 dropped the same 11 unpopulated body bytes: the pre-NAT v6 body is
+	// now 63 bytes; +36 post-NAT = 99, padded to 100.
+	if rs := recordSize(netflowTemplateFieldsV6); rs != 100 {
+		t.Fatalf("v9 v6 recordSize = %d, want 100 (63 pre-NAT body + 36 post-NAT, padded; #2613)", rs)
 	}
 }
 
