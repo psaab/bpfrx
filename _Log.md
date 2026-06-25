@@ -18165,3 +18165,19 @@ top.
   RED; restore returns green.
 - **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
   pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2997 — render `maximum-paths` in the `router ospf6` block so
+  IPv6 OSPF ECMP is actually installed by FRR `ospf6d`. The OSPFv4 `router
+  ospf` block already rendered ` maximum-paths <n>` from the global
+  forwarding-table ECMP knob (`ecmpMaxPaths`, `resolveECMP`); the OSPFv3
+  `router ospf6` block omitted it, so OSPFv3 routes installed a single best
+  path even with global ECMP > 1. OSPFv3 has no separate maximum-paths config
+  leaf — it reuses the same global `ecmpMaxPaths`. Fix mirrors the OSPFv4
+  placement: gated on `ecmpMaxPaths > 1`, after the per-interface area lines,
+  before redistribute. Added fail-on-revert test
+  TestGenerateProtocols_OSPFv3ECMPMaxPaths (asserts ` maximum-paths 64` in the
+  router ospf6 block when ecmp=64; none when ecmp=0/1). Reverting the render
+  line turns the test RED. Updated pkg/frr/README.md policy_render.go row.
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
+  pkg/frr/README.md, _Log.md
