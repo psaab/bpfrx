@@ -415,7 +415,21 @@ reserved for whole-dataplane selection where a rewrite shim
   groups are keyed `<address-CIDR>_grp<id>`, so a dual-stack unit may
   carry an `inet` AND an `inet6` vrrp-group with the SAME group id without
   collision (the address strings differ → two distinct
-  `unit.VRRPGroups` entries). The WireGuard `peer` node is a NAMED-INSTANCE
+  `unit.VRRPGroups` entries). **#2850 — `preempt hold-time`:** the
+  `vrrp-group <id> preempt` leaf gained a nested `hold-time <seconds>`
+  child (`schema_interfaces.go`, typed `ValidateInteger(1, 3600)`), Junos
+  `set interfaces <if> unit <n> family inet vrrp-group <id> preempt
+  { hold-time <s>; }`. It compiles to `VRRPGroup.PreemptHoldTime`
+  (seconds; `compiler_interfaces.go` parses both the braced child and the
+  flat-set `preempt hold-time <n>` Keys-run), plumbed to
+  `vrrp.Instance.PreemptHoldTime`. Bare `preempt` (no hold-time) keeps
+  PreemptHoldTime 0 = immediate preemption (unchanged). At runtime a
+  higher-priority backup reclaiming mastership from a STILL-LIVE
+  lower-priority master defers the takeover by hold-time seconds (so
+  dynamic routing converges before failback); a dead/silent master or a
+  graceful priority-0 resignation is never delayed
+  (`pkg/vrrp/instance.go` `preemptHoldDuration` /
+  `preemptingLiveLowerMaster`). The WireGuard `peer` node is a NAMED-INSTANCE
   container keyed by the peer public key (#1434 multi-peer):
   `set interfaces <wg> tunnel wireguard peer <public-key>
   { allowed-ips <cidr>; endpoint <ip:port>; persistent-keepalive <s>;

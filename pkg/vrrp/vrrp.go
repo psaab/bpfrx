@@ -15,8 +15,9 @@ type Instance struct {
 	GroupID           int
 	Priority          int
 	Preempt           bool
+	PreemptHoldTime   int // seconds a higher-priority backup waits before preempting a live lower-priority master; 0 = immediate
 	AcceptData        bool
-	AdvertiseInterval int // milliseconds (wire format is centiseconds)
+	AdvertiseInterval int      // milliseconds (wire format is centiseconds)
 	VirtualAddresses  []string // CIDR notation
 	AuthType          string   // "" or "md5"
 	AuthKey           string
@@ -39,6 +40,7 @@ func CollectInstances(cfg *config.Config) []*Instance {
 					GroupID:           vg.ID,
 					Priority:          vg.Priority,
 					Preempt:           vg.Preempt,
+					PreemptHoldTime:   vg.PreemptHoldTime,
 					AcceptData:        vg.AcceptData,
 					AdvertiseInterval: vg.AdvertiseInterval,
 					VirtualAddresses:  vg.VirtualAddresses,
