@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-06-24 — #2630 review fold: mark flat-set collapse FIXED in pkg/frr/README.md
+
+- **Timestamp**: 2026-06-24
+- **Action**: Doc-accuracy fold from PR #2685 review. The `policy_render.go` row in `pkg/frr/README.md` still described the #2630 flat-set collapse as an UNFIXED limitation; rewrote it to "Flat-set convergence (#2630, fixed)" mirroring the docs/config-schema.md edit (the four repeatable `from` leaves are `multi: true`, so flat-set and brace shapes converge). Repo grep confirmed no other live module doc carried a stale #2630 claim.
+- **File(s)**: pkg/frr/README.md.
+
 ## 2026-06-24 — #2630 fix: flat-set repeated `from route-filter` (and prefix-list/community/as-path) collapsed to last-only
 
 - **Timestamp**: 2026-06-24
