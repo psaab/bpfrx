@@ -243,10 +243,11 @@ type DDNSProvider struct {
 	TSIGKeyName   string
 	TSIGAlgorithm string
 	TSIGSecret    Secret
-	// SourceAddress / DestinationInterface / RoutingInstance scope the RFC 2136
-	// UPDATE TRANSPORT for this provider (the same source-binding model as the
-	// Surface B per-family leaves, #2665). All optional. (Source binding for the
-	// HTTP backends is a follow-up; the HTTP client uses the default route today.)
+	// SourceAddress / DestinationInterface / RoutingInstance scope the UPDATE
+	// TRANSPORT for this provider (the same source-binding model as the Surface B
+	// per-family leaves, #2665). All optional. As of #2846 the HTTP backends
+	// (dyndns2/cloudflare/route53/generic) AND the external checkip probe bind to
+	// these too (via the shared HTTP client's DialContext) — not only RFC 2136.
 	SourceAddress        string
 	DestinationInterface string
 	RoutingInstance      string

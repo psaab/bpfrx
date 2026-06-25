@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // backend_http.go: shared discipline for the HTTP-API DDNS backends (#2691 P3,
@@ -33,6 +35,11 @@ import (
 // well under that lets a slow provider fail one scope without starving the pass.
 const httpClientTimeout = 15 * time.Second
 
+// httpDialTimeout bounds a single TCP connect on a bound HTTP client (#2846).
+// Well under httpClientTimeout so a black-holed source bind fails the connect
+// (and the pass) promptly rather than consuming the whole request budget.
+const httpDialTimeout = 10 * time.Second
+
 // httpMaxResponseBody caps how many bytes of a provider response we read. dyndns2
 // replies are a few bytes ("good 203.0.113.5\n"); Cloudflare/Route53 JSON/XML
 // replies are a few KB. 64 KiB is generous and OOM-safe.
@@ -50,26 +57,83 @@ var errHTTPAuth = errors.New("ddns http: authentication/authorization refused")
 // a ban-avoidance signal rather than a generic failure.
 var errHTTPRateLimited = errors.New("ddns http: provider rate-limited")
 
-// newHTTPClient builds the shared, hardened HTTP client for every HTTP backend.
-// TLS verification is ON; the timeout is bounded. Exposed (not a package var) so
-// each backend gets its own client with no shared mutable state, and tests can
-// point Transport at an httptest server.
+// newHTTPClient builds the shared, hardened HTTP client for every HTTP backend
+// with NO source binding (the default route / kernel-chosen source). TLS
+// verification is ON; the timeout is bounded. Exposed (not a package var) so each
+// backend gets its own client with no shared mutable state, and tests can point
+// Transport at an httptest server.
 func newHTTPClient() *http.Client {
-	return &http.Client{
-		Timeout: httpClientTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-				// InsecureSkipVerify deliberately left false: certificate +
-				// hostname verification against the system trust store.
-			},
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          4,
-			IdleConnTimeout:       30 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: time.Second,
+	return newHTTPClientBound(bindConfig{})
+}
+
+// newHTTPClientBound builds the same hardened HTTP client but applies the
+// provider's transport source binding (source-address / destination-interface /
+// routing-instance, #2846) to the dial — so Cloudflare/Route53/dyndns2/generic
+// updates and external checkip probes egress from the operator-configured source
+// IP / interface / VRF, matching the RFC 2136 backend (backend_bind.go).
+//
+// When the bindConfig requests no binding (the zero value) the Transport gets no
+// DialContext override and behaves byte-for-byte like the unbound client — the
+// default-route behaviour for an operator who never set a source-address.
+//
+// The bind reuses backend_bind.go's dialer(): a single Dialer.Control hook that
+// does unix.Bind(source-address) + SO_BINDTODEVICE(interface/VRF). For HTTP we
+// expose it via Transport.DialContext (the dialer is connection-typed "tcp" for
+// HTTP, so the Control-based bind — not a network-typed LocalAddr — is what keeps
+// it working across both families uniformly). httpDialTimeout bounds the connect.
+func newHTTPClientBound(b bindConfig) *http.Client {
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			// InsecureSkipVerify deliberately left false: certificate +
+			// hostname verification against the system trust store.
 		},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          4,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
 	}
+	if d := b.dialer(httpDialTimeout); d != nil {
+		tr.DialContext = d.DialContext
+	}
+	return &http.Client{
+		Timeout:   httpClientTimeout,
+		Transport: tr,
+	}
+}
+
+// resolveProviderBindConfig derives the transport bindConfig (#2846) from a DDNS
+// provider catalog entry's source-binding leaves. The HTTP backends carry the
+// source-address / destination-interface / routing-instance on the provider
+// (config.DDNSProvider, #2780); RFC 2136 reuses the same resolveBindConfig via a
+// DHCPDynamicDNSConfig carrier. This adapts the provider shape onto the SAME
+// resolveBindConfig discipline so an invalid source-address is a hard error
+// (fail-open: the constructor degrades to the unbound default rather than
+// emitting from the wrong source — see the callers).
+func resolveProviderBindConfig(p *config.DDNSProvider) (bindConfig, error) {
+	if p == nil {
+		return bindConfig{}, nil
+	}
+	return resolveBindConfig(&config.DHCPDynamicDNSConfig{
+		SourceAddress:        p.SourceAddress,
+		DestinationInterface: p.DestinationInterface,
+		RoutingInstance:      p.RoutingInstance,
+	})
+}
+
+// newProviderHTTPClient builds a bound HTTP client for an HTTP backend from its
+// provider's source-binding leaves (#2846). A malformed source-address fails
+// open to the unbound default client (logged by the caller already has the commit
+// warning) rather than wedging the backend — matching the rfc2136 fail-open
+// posture. Returns the client and any bind-resolution error for the caller to
+// surface; on error the returned client is the unbound default.
+func newProviderHTTPClient(p *config.DDNSProvider) (*http.Client, error) {
+	b, err := resolveProviderBindConfig(p)
+	if err != nil {
+		return newHTTPClient(), err
+	}
+	return newHTTPClientBound(b), nil
 }
 
 // readCappedBody reads at most httpMaxResponseBody bytes of a response body and

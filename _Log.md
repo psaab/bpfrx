@@ -1,3 +1,31 @@
+## 2026-06-25 — #2838: DDNS generic backend false-success on substring "ok"
+
+- **Timestamp**: 2026-06-25
+- **Action**: The generic templated HTTP DDNS backend classified an HTTP
+  2xx body as a successful update via `strings.Contains(lower, sub)`
+  against a default token set that includes the bare token `ok`. A body
+  like `not ok`, `error: ok token invalid`, `update not good`, or an HTML
+  page with an `OK` button CONTAINS a default token, so an explicit
+  provider FAILURE was recorded as a completed update — Surface A then
+  recorded ownership and suppressed retry, leaving DNS stale/missing.
+- **Fix**: Replace the substring loop with `matchesGenericOK`, a
+  whole-token matcher. A success token must equal a trimmed response line
+  OR be the leading whitespace-delimited field of a line (so dyndns2-shape
+  `good <ip>` / `nochg <ip>` still pass). Renamed `defaultGenericOKSubstrings`
+  → `defaultGenericOKTokens` and the struct field `okSubstr` → `okTokens`.
+  Scope: `backend_generic.go` response classification only — dyndns2's own
+  keyword classifier (`good`/`nochg` success, `badauth`/`abuse` failure) is
+  untouched (separate code path, not shared).
+- **Test**: `TestGenericOKTokenMatch` (table, fail-on-revert) + a
+  `matchesGenericOK` unit test. Proven RED when reverted to the substring
+  match (`not ok`/`error: ok token`/`notok`/HTML-OK all wrongly pass),
+  GREEN with the token matcher. Default success cases (`ok`/`OK`/`good <ip>`/
+  `nochg <ip>`/`OK updated`) still pass.
+- **File(s)**: `pkg/ddns/backend_generic.go`, `pkg/ddns/backend_http_test.go`,
+  `pkg/ddns/README.md`
+- **Gates**: `go build ./...`, `gofmt -l` (clean), `go vet ./pkg/ddns/...`,
+  `go test ./pkg/ddns/...` — all green.
+
 ## 2026-06-25 — #2857: route-map `set local-preference 0` silently dropped
 
 - **Timestamp**: 2026-06-25
@@ -16906,6 +16934,95 @@ top.
   **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/serialize_test.go,
   pkg/ra/README.md, _Log.md
 
+- **Timestamp**: 2026-06-25
+  **Action**: #2850 — add VRRP `preempt hold-time <seconds>` (vSRX parity).
+  Without it a higher-priority node reclaims mastership from a still-live
+  lower-priority master IMMEDIATELY on recovery — before BGP/OSPF converge —
+  blackholing every failback. Added Junos `vrrp-group <id> preempt
+  { hold-time <s>; }`: new nested typed leaf in `setSchema`
+  (`ValidateInteger(1, 3600)`), parsed in BOTH config shapes (braced child
+  + flat-set `preempt hold-time <n>` Keys-run) into
+  `VRRPGroup.PreemptHoldTime`, plumbed to `vrrp.Instance.PreemptHoldTime`.
+  State machine: `stepBackup` now takes a `preemptHoldTimer`. In the
+  `masterDownTimer.C` case, when a hold-time is set AND
+  `preemptingLiveLowerMaster()` (live, recent, strictly-lower master — the
+  same #2082 snapshot math), the promotion is DEFERRED by arming the hold
+  timer instead of `becomeMaster()`; the new `preemptHoldTimer.C` case
+  promotes when it elapses. Dead/stale master = immediate (not held); a
+  priority-0 resign arms a one-shot `skipNextPreemptHold` so planned
+  failover stays zero-delay; a returning >= master or a forced/coordinated
+  `preemptNowCh` stop-drains the hold. Bare `preempt` (PreemptHoldTime 0) is
+  immediate — today's behavior, unchanged. Composes cleanly with the #2082
+  sync-hold preempt gate (separate path: `preemptNowCh` shortcut vs the
+  `masterDownTimer` election the hold-time wraps).
+  FAIL-ON-REVERT: copied `instance.go` aside, replaced the hold-arming
+  branch with `_ = skipHold` →
+  `TestHoldTime_PreemptLiveLowerMasterDeferred` FAILs (state=MASTER, want
+  BACKUP); restored, green. Config-side FAIL-ON-REVERT: dropping the
+  hold-time parse leaves `PreemptHoldTime` 0 → the FlatSet/Hierarchical
+  tests fail.
+  test-failover relevance: YES (HA / VRRP state machine) — PARENT runs
+  `make test-failover` before merge.
+  Gates: go build ./... clean; gofmt -l clean (my files); go vet
+  ./pkg/vrrp/... ./pkg/config/... clean; go test -race ./pkg/vrrp/...
+  ./pkg/config/... ok.
+  **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/vrrp.go, pkg/vrrp/manager.go,
+  pkg/vrrp/instance_preempt_gate_test.go,
+  pkg/vrrp/instance_preempt_holdtime_test.go, pkg/config/types_interfaces.go,
+  pkg/config/schema_interfaces.go, pkg/config/compiler_interfaces.go,
+  pkg/config/vrrp_preempt_holdtime_test.go, docs/config-schema.md,
+  pkg/vrrp/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2850 review fold (MERGE-NEEDS-MINOR) — fix one-shot
+  `skipNextPreemptHold` leak. The resign bypass was set in handleBackupRx's
+  priority-0 path and cleared ONLY in the masterDownTimer.C handler. Race:
+  after a priority-0 resign arms the 1ms masterDownTimer + sets the bypass,
+  a worthy (>= priority) advert arriving before the 1ms fire reset
+  masterDownTimer to the full interval and drained the hold but did NOT
+  clear the bypass — so it survived to a LATER legitimate masterDownTimer
+  expiry and wrongly skipped the hold once (conservative: one failback
+  faster, never stuck). Fix: clear `skipNextPreemptHold = false` in the
+  accept-worthy-master branch (tying the bypass's lifetime to the same
+  condition that drains the hold) AND in `becomeBackup` (a fresh BACKUP
+  tenure after a worthy step-down has no pending resign decision). Both are
+  worthy-master-accepted paths that reset masterDownTimer to the full
+  interval; the priority-0 ARMING path itself is untouched.
+  New test `TestHoldTime_ResignBypassClearedByWorthyMaster`: resign arms
+  skip → worthy advert clears it → later live-lower master → hold IS
+  applied (BACKUP, not promoted). FAIL-ON-REVERT: copied instance.go aside,
+  removed the clear in handleBackupRx → the test FAILs ("skipNextPreemptHold
+  leaked past a worthy-master return"); restored, green.
+  Gates: go build ./... clean; gofmt -l clean; go vet ./pkg/vrrp/...
+  ./pkg/config/... clean; go test -race ./pkg/vrrp/... ./pkg/config/... ok.
+  **File(s)**: pkg/vrrp/instance.go,
+  pkg/vrrp/instance_preempt_holdtime_test.go, _Log.md
+  **Action**: #2846 — bind DDNS HTTP backends + checkip to the configured
+  source-address/destination-interface/routing-instance. Before this only the
+  RFC 2136 backend honored the source binding; the HTTP backends
+  (dyndns2/cloudflare/route53/generic) and the external checkip probe built a
+  plain newHTTPClient() with no DialContext and egressed from the kernel default
+  route. Added newHTTPClientBound(bindConfig) (wires backend_bind.go's
+  source/interface/VRF Dialer into Transport.DialContext),
+  resolveProviderBindConfig + newProviderHTTPClient (adapt config.DDNSProvider
+  leaves onto resolveBindConfig), exported NewCheckIPClient for the daemon, and
+  threaded the bound client into all four HTTP backend constructors + the daemon
+  checkip call site. newHTTPClient() is the no-bind alias (default behaviour
+  unchanged when source-address unset). Malformed source-address = hard error
+  (constructor degrades to no-op; checkip falls back to unbound default + logs),
+  mirroring rfc2136 fail-open. FAIL-ON-REVERT test
+  (backend_http_sourcebind_2846_test.go) asserts a configured source-address
+  dials with that LocalAddr (loopback 127.0.0.2 source proof) for both the HTTP
+  client and checkip, and that the unbound path installs NO DialContext; goes RED
+  if the bind is removed (verified: 3 bind tests FAIL on revert, green on
+  restore). Gates: go build ./... OK, gofmt -l clean, go vet ./pkg/ddns/... OK,
+  go test ./pkg/ddns/... ok.
+  **File(s)**: pkg/ddns/backend_http.go, pkg/ddns/backend_cloudflare.go,
+  pkg/ddns/backend_dyndns2.go, pkg/ddns/backend_route53.go,
+  pkg/ddns/backend_generic.go, pkg/ddns/checkip.go,
+  pkg/ddns/backend_http_sourcebind_2846_test.go,
+  pkg/daemon/daemon_ddns_surface_a.go, pkg/config/types_system.go,
+  pkg/ddns/README.md, _Log.md
 ## 2026-06-25 — #2847 FRR policy render: metric/MED 0 silently dropped
 
 - **Timestamp**: 2026-06-25
@@ -16967,3 +17084,25 @@ top.
   TestPolicyCommunityOperations RED; reverting the compiler call to
   `term.Community = nodeVal(ac)` makes TestPolicyCommunityOperationsCompile
   RED.
+## 2026-06-25 — #2840 DDNS Surface A: transient link-read must not publish static
+- **Timestamp**: 2026-06-25
+- **Action**: Fix `observeInterfaceAddr` so a `LinkByName`/`AddrList`
+  netlink READ ERROR returns `(zero, false)` (transient — engine leaves
+  the scope untouched, retries next pass) instead of falling back to the
+  configured static and returning `(static, true)`. Publishing a
+  configured static on a link-read failure pointed DNS at a possibly-stale
+  address during a transient link/reth outage, contradicting the
+  documented `(zero,false)=transient` contract (codex-review-049 049-09).
+  The static fallback now applies ONLY on the present-but-addressless
+  path (a SUCCESSFUL read yielding no usable dynamic address — the
+  legitimate static-use case); it still composes with `staticUnitAddr`'s
+  #2776 IsPublicAddr gate. Introduced `netlinkLinkByName`/`netlinkAddrList`
+  package-var seams so the contract is unit-tested without real netlink.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
+  pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md
+- **Validation**: go build ./... ; gofmt -l (clean on touched files) ;
+  go vet ./pkg/daemon/... ./pkg/ddns/... (clean) ;
+  go test ./pkg/daemon/ -run 'SurfaceA|ObserveInterface|StaticUnitAddr|SelectInterfaceAddr'
+  ./pkg/ddns/... (PASS). Fail-on-revert confirmed: reverting the
+  LinkByName-error branch to `(static,true)` makes
+  TestObserveInterfaceAddrTransientVsDefinitive/LinkByName_error RED.
