@@ -160,3 +160,175 @@ func TestP3CheckIPURLMalformedWarns(t *testing.T) {
 		t.Fatalf("valid checkip-url should not warn; got:\n%s", joined)
 	}
 }
+
+// TestP3CheckIPAllowlistMalformedWarns is the #2839 fail-on-revert gate: a
+// malformed checkip-allowlist token (operator typo, e.g. "8.8.8.8x") was
+// SILENTLY DROPPED by ddns.ParseAllowlist, so the bogus-IP safety gate silently
+// shrank and the checkip parser admitted the very IP the operator meant to
+// suppress. The commit-time warn pass must now name the offending token. Goes
+// RED if ddnsAllowlistMalformedTokens / its wiring is removed (back to silent
+// drop). The valid-token provider in the same config must NOT warn.
+func TestP3CheckIPAllowlistMalformedWarns(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set system services dynamic-dns provider bad backend dyndns2",
+		"set system services dynamic-dns provider bad server dyn.example",
+		"set system services dynamic-dns provider bad checkip-url https://checkip.example/",
+		// A typoed v4 token + a bare word; the valid 1.1.1.1 is retained.
+		"set system services dynamic-dns provider bad checkip-allowlist 1.1.1.1,8.8.8.8x",
+		// A provider whose allowlist is entirely valid must NOT warn.
+		"set system services dynamic-dns provider good backend dyndns2",
+		"set system services dynamic-dns provider good server dyn.example",
+		"set system services dynamic-dns provider good checkip-url https://checkip.example/",
+		"set system services dynamic-dns provider good checkip-allowlist 1.1.1.1,2606:4700::1",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	warns := validateSurfaceADDNSWarnings(cfg)
+	joined := strings.Join(warns, "\n")
+
+	// The offending token must be NAMED for provider "bad".
+	for _, want := range []string{
+		"provider \"bad\" checkip-allowlist",
+		"8.8.8.8x",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected a checkip-allowlist warning containing %q; got:\n%s", want, joined)
+		}
+	}
+	// The valid v4 token in the same "bad" allowlist must not be flagged.
+	if strings.Contains(joined, "entry \"1.1.1.1\"") {
+		t.Fatalf("valid allowlist token 1.1.1.1 must not warn; got:\n%s", joined)
+	}
+	// Provider "good" (all valid) must not warn.
+	if strings.Contains(joined, "provider \"good\" checkip-allowlist") {
+		t.Fatalf("valid checkip-allowlist should not warn; got:\n%s", joined)
+	}
+}
+
+// TestP3CheckIPURLUppercaseSchemeAccepted is the #2842 fail-on-revert gate: a
+// checkip-url with an uppercase/mixed-case scheme is valid per RFC 3986 §3.1
+// (the scheme is case-INSENSITIVE) and must NOT warn. Goes RED if the mirror
+// ddnsCheckIPURLValid reverts to a case-sensitive HasPrefix on the raw string.
+func TestP3CheckIPURLUppercaseSchemeAccepted(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set system services dynamic-dns provider up-http backend dyndns2",
+		"set system services dynamic-dns provider up-http server dyn.example",
+		"set system services dynamic-dns provider up-http checkip-url HTTP://checkip.example/",
+		"set system services dynamic-dns provider mixed-https backend dyndns2",
+		"set system services dynamic-dns provider mixed-https server dyn.example",
+		"set system services dynamic-dns provider mixed-https checkip-url Https://h/",
+		// A non-http scheme and a host-less URL must STILL warn (no over-accept).
+		"set system services dynamic-dns provider bad-scheme backend dyndns2",
+		"set system services dynamic-dns provider bad-scheme server dyn.example",
+		"set system services dynamic-dns provider bad-scheme checkip-url ftp://checkip.example/",
+		"set system services dynamic-dns provider no-host backend dyndns2",
+		"set system services dynamic-dns provider no-host server dyn.example",
+		"set system services dynamic-dns provider no-host checkip-url http://",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	joined := strings.Join(validateSurfaceADDNSWarnings(cfg), "\n")
+
+	for _, okName := range []string{"up-http", "mixed-https"} {
+		if strings.Contains(joined, "provider \""+okName+"\" checkip-url") {
+			t.Fatalf("uppercase-scheme checkip-url should not warn for %q; got:\n%s", okName, joined)
+		}
+	}
+	for _, badName := range []string{"bad-scheme", "no-host"} {
+		if !strings.Contains(joined, "provider \""+badName+"\" checkip-url") {
+			t.Fatalf("expected a checkip-url warning for provider %q; got:\n%s", badName, joined)
+		}
+	}
+}
+
+// TestP3GenericURLTemplateMalformedWarns is the #2841 fail-on-revert gate: a
+// generic backend's url-template was validated PREFIX-ONLY (a bare HasPrefix
+// http(s):// check), so a host-less or wrong-scheme template committed silently
+// and only failed at the first publish — unlike checkip-url, which parses for a
+// host. This test goes RED if the ddnsGenericURLTemplateValid wiring is removed
+// (back to prefix-only). It also pins the TEMPLATE-AWARE requirement: a valid
+// template carrying inadyn %h/%i/%u/%p specifiers (including a credential in the
+// userinfo, which makes net/url.Parse fail) must NOT be false-rejected.
+func TestP3GenericURLTemplateMalformedWarns(t *testing.T) {
+	tree := buildTree(t, []string{
+		// Host-less: passes the old HasPrefix("https://") but has no host.
+		"set system services dynamic-dns provider no-host backend generic",
+		`set system services dynamic-dns provider no-host url-template "https:///upd?ip=%i"`,
+		// Wrong scheme.
+		"set system services dynamic-dns provider bad-scheme backend generic",
+		`set system services dynamic-dns provider bad-scheme url-template "ftp://host/upd?ip=%i"`,
+		// Garbage (no scheme at all).
+		"set system services dynamic-dns provider junk backend generic",
+		`set system services dynamic-dns provider junk url-template "not a url"`,
+		// VALID template with inadyn %-specifiers in path/query — must NOT warn.
+		"set system services dynamic-dns provider good backend generic",
+		`set system services dynamic-dns provider good url-template "https://api.example.net/update?host=%h&ip=%i"`,
+		// VALID template with a credential in the userinfo (%p) — net/url.Parse
+		// would FAIL on the bare %p, but the template-aware validator must accept
+		// it (the host is present after the '@'). Goes RED if a naive url.Parse is
+		// used instead.
+		"set system services dynamic-dns provider creds backend generic",
+		`set system services dynamic-dns provider creds url-template "https://user:%p@api.example.net/upd?host=%h"`,
+		// VALID uppercase scheme (RFC 3986 §3.1 case-insensitive).
+		"set system services dynamic-dns provider up backend generic",
+		`set system services dynamic-dns provider up url-template "HTTPS://api.example.net/upd?ip=%i"`,
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	joined := strings.Join(validateSurfaceADDNSWarnings(cfg), "\n")
+
+	for _, badName := range []string{"no-host", "bad-scheme", "junk"} {
+		want := "provider \"" + badName + "\" url-template"
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected a url-template warning for provider %q; got:\n%s", badName, joined)
+		}
+	}
+	for _, okName := range []string{"good", "creds", "up"} {
+		if strings.Contains(joined, "provider \""+okName+"\" url-template") {
+			t.Fatalf("valid url-template should not warn for %q; got:\n%s", okName, joined)
+		}
+	}
+}
+
+// TestDDNSGenericURLTemplateValidLockstep pins the #2841 lockstep fold: the
+// commit-time mirror ddnsGenericURLTemplateValid must TrimSpace the template
+// before validating, exactly like the runtime gate (newGenericBackend trims
+// p.URLTemplate before constructing). A leading/trailing-whitespace template
+// must be judged VALID by the mirror so the config layer does not WARN on a
+// template the runtime trims+accepts. Goes RED if the TrimSpace is removed from
+// the mirror (the indices would slide and a leading-whitespace template would
+// fail the scheme check). It is a direct mirror-function test (the set-command
+// parser strips leading whitespace, so the divergence cannot be reached through
+// ParseSetCommand — only by editing active.json by hand or by a future parser
+// change; the byte-for-byte contract is what matters).
+func TestDDNSGenericURLTemplateValidLockstep(t *testing.T) {
+	valid := []string{
+		"\thttps://api.example.net/upd?ip=%i", // leading tab
+		"  https://api.example.net/upd",       // leading spaces
+		"https://api.example.net/upd\n",       // trailing newline
+		"https://user:%p@api.example.net/upd", // userinfo credential
+		"HTTPS://api.example.net/upd",         // uppercase scheme
+	}
+	for _, tmpl := range valid {
+		if !ddnsGenericURLTemplateValid(tmpl) {
+			t.Errorf("ddnsGenericURLTemplateValid(%q) = false, want true (lockstep with runtime trim)", tmpl)
+		}
+	}
+	invalid := []string{
+		"   ",              // whitespace only
+		"\thttps:///upd",   // trimmed but host-less
+		"  ftp://host/upd", // trimmed but wrong scheme
+		"https://",         // scheme only
+	}
+	for _, tmpl := range invalid {
+		if ddnsGenericURLTemplateValid(tmpl) {
+			t.Errorf("ddnsGenericURLTemplateValid(%q) = true, want false", tmpl)
+		}
+	}
+}

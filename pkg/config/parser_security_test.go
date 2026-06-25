@@ -3535,6 +3535,9 @@ func TestPolicyStatementRouteMapAttributesSetSyntax(t *testing.T) {
 	if term.Metric != 100 {
 		t.Errorf("metric = %d, want 100", term.Metric)
 	}
+	if !term.HasMetric {
+		t.Error("HasMetric = false, want true when `then metric` is configured (#2847)")
+	}
 	if term.Community != "65000:100" {
 		t.Errorf("community = %q, want 65000:100", term.Community)
 	}
@@ -3543,6 +3546,69 @@ func TestPolicyStatementRouteMapAttributesSetSyntax(t *testing.T) {
 	}
 	if term.Action != "accept" {
 		t.Errorf("action = %q, want accept", term.Action)
+	}
+}
+
+// TestPolicyCommunityOperationsCompile is the compiler-level fail-on-revert
+// guard for #2848: the `then community (add|delete|set|none)` operations and
+// the legacy bare `then community <value>` form must compile into the dedicated
+// PolicyTerm fields. RED if applyCommunityAction is reverted (every form would
+// land on term.Community and CommunityOp would stay empty).
+func TestPolicyCommunityOperationsCompile(t *testing.T) {
+	cmds := []string{
+		"set policy-options policy-statement P term t_add then community add 65000:111",
+		"set policy-options policy-statement P term t_del then community delete MYLIST",
+		"set policy-options policy-statement P term t_set then community set 65000:222",
+		"set policy-options policy-statement P term t_bare then community 65000:333",
+		"set policy-options policy-statement P term t_none then community none",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ps := cfg.PolicyOptions.PolicyStatements["P"]
+	if ps == nil {
+		t.Fatal("policy-statement P not found")
+	}
+	byName := make(map[string]*PolicyTerm)
+	for _, term := range ps.Terms {
+		byName[term.Name] = term
+	}
+
+	if tm := byName["t_add"]; tm == nil {
+		t.Fatal("term t_add missing")
+	} else if tm.CommunityOp != "add" || tm.CommunityAdd != "65000:111" {
+		t.Errorf("t_add: op=%q add=%q, want op=add add=65000:111", tm.CommunityOp, tm.CommunityAdd)
+	}
+	if tm := byName["t_del"]; tm == nil {
+		t.Fatal("term t_del missing")
+	} else if tm.CommunityOp != "delete" || tm.CommunityDelete != "MYLIST" {
+		t.Errorf("t_del: op=%q delete=%q, want op=delete delete=MYLIST", tm.CommunityOp, tm.CommunityDelete)
+	}
+	if tm := byName["t_set"]; tm == nil {
+		t.Fatal("term t_set missing")
+	} else if tm.CommunityOp != "set" || tm.Community != "65000:222" {
+		t.Errorf("t_set: op=%q community=%q, want op=set community=65000:222", tm.CommunityOp, tm.Community)
+	}
+	if tm := byName["t_bare"]; tm == nil {
+		t.Fatal("term t_bare missing")
+	} else if tm.CommunityOp != "" || tm.Community != "65000:333" {
+		t.Errorf("t_bare: op=%q community=%q, want op=\"\" community=65000:333", tm.CommunityOp, tm.Community)
+	}
+	if tm := byName["t_none"]; tm == nil {
+		t.Fatal("term t_none missing")
+	} else if tm.CommunityOp != "none" || tm.Community != "" {
+		t.Errorf("t_none: op=%q community=%q, want op=none community=\"\"", tm.CommunityOp, tm.Community)
 	}
 }
 

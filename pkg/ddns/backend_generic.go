@@ -1,6 +1,7 @@
 package ddns
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -22,19 +23,29 @@ import (
 //	%u → username                  %p → password
 //	%% → a literal percent sign
 //
-// Success is decided by SUBSTRING match on the (HTTP 2xx) response body against
+// Success is decided by a TOKEN match on the (HTTP 2xx) response body against
 // the operator's `ok-response` (or the default matcher set). This mirrors
 // inadyn's default {"OK","good","true","updated","nochg"} list.
+//
+// #2838: matching is token-bounded, NOT a raw substring. A success token must
+// equal a trimmed response line OR be the leading whitespace-delimited field of
+// a line (so "good 1.2.3.4" still passes). A naive strings.Contains turned an
+// explicit provider FAILURE into a false success — "not ok", "error: ok token
+// invalid", "update not good", or an HTML page with an "OK" button all CONTAIN
+// a default token, so they were wrongly classified as a completed update. The
+// engine (surface_a.go) then records ownership and suppresses retry, leaving
+// DNS stale while the router believes the address was published.
 
-// defaultGenericOKSubstrings is the success-matcher set used when a generic
-// provider sets no explicit ok-response (plan §3.1). Case-insensitive.
-var defaultGenericOKSubstrings = []string{"good", "nochg", "ok", "true", "updated"}
+// defaultGenericOKTokens is the success-matcher set used when a generic
+// provider sets no explicit ok-response (plan §3.1). Matched as whole tokens
+// (see matchesGenericOK), case-insensitive.
+var defaultGenericOKTokens = []string{"good", "nochg", "ok", "true", "updated"}
 
 // genericBackend publishes via a templated URL + substring success match.
 type genericBackend struct {
 	name        string
 	urlTemplate string
-	okSubstr    []string // success substrings (lowercased)
+	okTokens    []string // success tokens (lowercased; whole-token match, #2838)
 	username    string
 	password    string // revealed at construction; never logged
 	client      *http.Client
@@ -51,21 +62,74 @@ func newGenericBackend(p *config.DDNSProvider) (*genericBackend, error) {
 	if tmpl == "" {
 		return nil, fmt.Errorf("ddns generic: provider %q has no url-template", p.Name)
 	}
-	if !strings.HasPrefix(tmpl, "http://") && !strings.HasPrefix(tmpl, "https://") {
-		return nil, fmt.Errorf("ddns generic: provider %q url-template must be an http(s) URL", p.Name)
+	if err := validateGenericURLTemplate(tmpl); err != nil {
+		return nil, fmt.Errorf("ddns generic: provider %q %w", p.Name, err)
 	}
-	ok := defaultGenericOKSubstrings
+	ok := defaultGenericOKTokens
 	if s := strings.TrimSpace(p.OKResponse); s != "" {
 		ok = []string{strings.ToLower(s)}
+	}
+	// Bind the dial to the configured source-address/interface/VRF (#2846).
+	client, err := newProviderHTTPClient(p)
+	if err != nil {
+		return nil, fmt.Errorf("ddns generic: provider %q: %w", p.Name, err)
 	}
 	return &genericBackend{
 		name:        p.Name,
 		urlTemplate: tmpl,
-		okSubstr:    ok,
+		okTokens:    ok,
 		username:    p.Username,
 		password:    p.Password.Reveal(),
-		client:      newHTTPClient(),
+		client:      client,
 	}, nil
+}
+
+// validateGenericURLTemplate rejects an obviously malformed generic url-template
+// at construction so a typo fails closed at commit/construct rather than at the
+// first publish (#2841). It enforces the SAME discipline as checkip's
+// validateCheckIPURL — a case-INSENSITIVE http(s) scheme (RFC 3986 §3.1,
+// matching #2842) plus a non-empty host — but it is deliberately TEMPLATE-AWARE
+// and string-based, NOT net/url-based: the value is an inadyn template carrying
+// %h/%i/%u/%p specifiers (and may embed a credential in the userinfo, e.g.
+// https://user:%p@host/upd) which are not valid percent-encoding and make
+// url.Parse fail or mangle the string (the same reason RedactURL is string-based,
+// #2781). It validates ONLY the scheme + host portion and tolerates any
+// %-specifier or {{...}} placeholder in the userinfo/path/query.
+//
+// The error message embeds the template through config.RedactURL: a generic
+// template routinely carries a credential in the userinfo (https://user:%p@...)
+// or the query (?token=SECRET), and this error is logged (slog.Warn at the
+// surface-A construction site) — the raw template must NOT reach journald
+// (#2841 credential-leak fold; matches the RedactURL'd commit-time warning).
+func validateGenericURLTemplate(tmpl string) error {
+	// Scheme: the substring up to "://", compared case-insensitively.
+	i := strings.Index(tmpl, "://")
+	if i < 0 {
+		return fmt.Errorf("url-template %q must be an http(s) URL (no scheme)", config.RedactURL(tmpl))
+	}
+	scheme := tmpl[:i]
+	if !strings.EqualFold(scheme, "http") && !strings.EqualFold(scheme, "https") {
+		return fmt.Errorf("url-template %q must be an http(s) URL", config.RedactURL(tmpl))
+	}
+	// Authority: between "://" and the first '/', '?' or '#'. Strip any userinfo
+	// ("user:pass@", which legitimately contains %u/%p) — the host is what
+	// remains after the last '@'.
+	authStart := i + len("://")
+	authEnd := len(tmpl)
+	for j := authStart; j < len(tmpl); j++ {
+		if c := tmpl[j]; c == '/' || c == '?' || c == '#' {
+			authEnd = j
+			break
+		}
+	}
+	authority := tmpl[authStart:authEnd]
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		authority = authority[at+1:]
+	}
+	if authority == "" {
+		return fmt.Errorf("url-template %q has no host", config.RedactURL(tmpl))
+	}
+	return nil
 }
 
 // renderGenericURL expands the inadyn-style template specifiers. %u/%p are
@@ -127,13 +191,46 @@ func (b *genericBackend) UpsertLease(ctx context.Context, rec LeaseDNSRecord) er
 	if cerr := classifyHTTPStatus(code); cerr != nil {
 		return fmt.Errorf("ddns generic: %s: %w", b.name, cerr)
 	}
-	lower := strings.ToLower(string(body))
-	for _, sub := range b.okSubstr {
-		if strings.Contains(lower, sub) {
-			return nil
+	if matchesGenericOK(string(body), b.okTokens) {
+		return nil
+	}
+	return fmt.Errorf("ddns generic: %s: response did not match success token(s) %v", b.name, b.okTokens)
+}
+
+// matchesGenericOK decides whether an HTTP 2xx body signals a successful update
+// (#2838). A success token matches only as a WHOLE TOKEN, never as a raw
+// substring: the token must equal a trimmed response line, or be the leading
+// whitespace-delimited field of a line (e.g. dyndns2-style "good 1.2.3.4").
+// This is the fail-closed half of the issue — "not ok", "error: ok token
+// invalid", "update not good", and an HTML page containing an "OK" button all
+// CONTAIN a default token but are NOT a success, so they must be rejected. The
+// comparison is case-insensitive; tokens in okTokens are already lowercased.
+func matchesGenericOK(body string, okTokens []string) bool {
+	if len(okTokens) == 0 {
+		return false
+	}
+	sc := bufio.NewScanner(strings.NewReader(body))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		// Leading whitespace-delimited field of the line (the protocol keyword;
+		// dyndns2 returns "good <ip>" / "nochg <ip>").
+		first := lower
+		if i := strings.IndexFunc(lower, func(r rune) bool {
+			return r == ' ' || r == '\t'
+		}); i >= 0 {
+			first = lower[:i]
+		}
+		for _, tok := range okTokens {
+			if lower == tok || first == tok {
+				return true
+			}
 		}
 	}
-	return fmt.Errorf("ddns generic: %s: response did not match success substring(s) %v", b.name, b.okSubstr)
+	return false
 }
 
 // errGenericDeleteUnsupported marks the generic backend's lack of a portable

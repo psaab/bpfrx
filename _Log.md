@@ -1,3 +1,163 @@
+## 2026-06-25 — #2867: VRRP GARP/NA burst follow-up loops keep poisoning after abdication
+
+- **Timestamp**: 2026-06-25
+- **Action**: The detached GARP/NA burst follow-up loops
+  (`runARPBurstFollowups` / `runNABurstFollowups` in `pkg/cluster/garp.go`,
+  launched from `becomeMaster` → `sendGARP` → `SendGratuitous*Burst`) had no
+  epoch/state gate. A node abdicating master mid-burst (link flap / rapid
+  preempt / split-brain) kept broadcasting GARP/NA for VIPs it no longer
+  owned, re-poisoning neighbor caches. Added a `BurstStillValid func() bool`
+  predicate threaded through `SendGratuitousARPBurstGated` /
+  `SendGratuitousIPv6BurstGated` into the follow-up loops; checked before
+  every follow-up frame, stops on false. `sendGARP` passes
+  `getState()==StateMaster && garpEpoch==captured` (composes with the
+  #2081 garpEpoch / #2082 preempt-gate). Original ungated `SendGratuitous*Burst`
+  kept as nil-predicate wrappers for direct-mode re-announce callers.
+- **File(s)**: pkg/cluster/garp.go, pkg/vrrp/instance.go,
+  pkg/cluster/garp_abdicate_test.go (fail-on-revert),
+  pkg/vrrp/instance_garp_abdicate_test.go, pkg/cluster/garp_burst_errors_test.go
+  (signature update), pkg/cluster/README.md, pkg/vrrp/README.md
+- **Validation**: go build ./..., gofmt -l (clean), go vet, go test -race
+  ./pkg/cluster/... ./pkg/vrrp/... — green. Fail-on-revert verified: removing
+  the gate turns TestARPBurstFollowups_AbortsOnAbdication +
+  TestNABurstFollowups_AbortsOnAbdication RED. HA — PARENT runs
+  make test-failover before merge.
+
+## 2026-06-25 — #2843: DDNS Surface A status omits never-published / errored scopes
+
+- **Timestamp**: 2026-06-25
+- **Action**: `SurfaceAManager.StatusViews` built rows ONLY from durable
+  ownership records, so a configured scope that failed before its first
+  publish (esp. a half-configured provider whose `errSurfaceANoBackend`
+  was swallowed without `recordScopeError`) had no row — invisible in
+  `show services dynamic-dns detail` during bring-up.
+- **Fix**: `StatusViews(scopes []SurfaceAScope)` now returns the UNION of
+  a row per CONFIGURED scope (merged with ownership + runtime state) and
+  any ownership record for a scope no longer configured (withdraw
+  pending). New `SurfaceAStatusView.State`: published / unpublished
+  (no-backend) / error / pending / withdraw-pending. The no-backend
+  sentinel now records a per-scope reason (`rt.noBackend` + `lastErr`)
+  WITHOUT arming retry backoff, cleared on success / superseded by a real
+  error. Daemon `SurfaceAStatus()` materializes the configured scopes via
+  `buildSurfaceAScopes(ActiveConfig())`. CLI + gRPC `show` render the new
+  State column (text only — `SurfaceAStatusView` is an internal Go type,
+  rendered server/client side; NO protobuf/wire field added).
+- **Test**: `TestStatusViewsSurfacesUnpublishedScopes` +
+  `TestStatusViewsSurfacesPendingAndPublished` (fail-on-revert) — a
+  configured no-backend scope appears as `unpublished` with a reason, a
+  never-observed scope as `pending`, a published scope as `published`, and
+  an orphaned ownership record as `withdraw-pending`. Verified RED when
+  StatusViews reverts to ownership-records-only.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/surface_a_test.go,
+  pkg/ddns/surface_a_http_test.go, pkg/ddns/surface_a_lockio_test.go,
+  pkg/daemon/daemon_ddns_surface_a.go, pkg/cli/cli_show_services.go,
+  pkg/grpcapi/server_show_dhcp_lldp_snmp.go, pkg/ddns/README.md
+- **Validation**: go build ./... ; gofmt -l (clean on touched files) ;
+  go vet ./pkg/ddns/... ./pkg/daemon/... ./pkg/grpcapi/... (clean;
+  pre-existing pkg/cli/cli.go:460 unreachable-code vet warning is on
+  origin/master, in a file I did not touch) ; go test ./pkg/ddns/...
+  ./pkg/daemon/... ./pkg/grpcapi/... ./pkg/cli/... (PASS).
+## 2026-06-25 — #2838: DDNS generic backend false-success on substring "ok"
+
+- **Timestamp**: 2026-06-25
+- **Action**: The generic templated HTTP DDNS backend classified an HTTP
+  2xx body as a successful update via `strings.Contains(lower, sub)`
+  against a default token set that includes the bare token `ok`. A body
+  like `not ok`, `error: ok token invalid`, `update not good`, or an HTML
+  page with an `OK` button CONTAINS a default token, so an explicit
+  provider FAILURE was recorded as a completed update — Surface A then
+  recorded ownership and suppressed retry, leaving DNS stale/missing.
+- **Fix**: Replace the substring loop with `matchesGenericOK`, a
+  whole-token matcher. A success token must equal a trimmed response line
+  OR be the leading whitespace-delimited field of a line (so dyndns2-shape
+  `good <ip>` / `nochg <ip>` still pass). Renamed `defaultGenericOKSubstrings`
+  → `defaultGenericOKTokens` and the struct field `okSubstr` → `okTokens`.
+  Scope: `backend_generic.go` response classification only — dyndns2's own
+  keyword classifier (`good`/`nochg` success, `badauth`/`abuse` failure) is
+  untouched (separate code path, not shared).
+- **Test**: `TestGenericOKTokenMatch` (table, fail-on-revert) + a
+  `matchesGenericOK` unit test. Proven RED when reverted to the substring
+  match (`not ok`/`error: ok token`/`notok`/HTML-OK all wrongly pass),
+  GREEN with the token matcher. Default success cases (`ok`/`OK`/`good <ip>`/
+  `nochg <ip>`/`OK updated`) still pass.
+- **File(s)**: `pkg/ddns/backend_generic.go`, `pkg/ddns/backend_http_test.go`,
+  `pkg/ddns/README.md`
+- **Gates**: `go build ./...`, `gofmt -l` (clean), `go vet ./pkg/ddns/...`,
+  `go test ./pkg/ddns/...` — all green.
+
+## 2026-06-25 — #2857: route-map `set local-preference 0` silently dropped
+
+- **Timestamp**: 2026-06-25
+- **Action**: Direct sibling of #2847 (metric/MED-0). `policy_render.go`
+  gated `set local-preference` on `term.LocalPreference > 0`, with
+  `PolicyTerm.LocalPreference` a bare int and no presence flag, so an
+  explicitly configured `then local-preference 0` (a valid BGP value =
+  maximally deprioritize a route within the AS; FRR route-map YANG range
+  starts at 0) was indistinguishable from unset and silently dropped.
+- **Fix**: Mirror #2847 exactly — add `PolicyTerm.HasLocalPreference bool`
+  (keep the value), set it at BOTH compile sites in `compiler_routing.go`
+  (hierarchical + flat-set, the #2419 dual-shape), and render
+  `set local-preference` on presence (`HasLocalPreference`), never `> 0`.
+- **Test**: `TestGeneratePolicyOptionsLocalPreferenceZero` (fail-on-revert)
+  drives the full ParseSetCommand+SetPath+CompileConfig+generatePolicyOptions
+  path — lp 0 emitted / unset not emitted / 200 emitted. Verified RED when
+  the renderer gate is reverted to `> 0`. Updated the four existing render
+  tests that build a PolicyTerm with a nonzero LocalPreference to also set
+  `HasLocalPreference: true` so they still emit.
+- **File(s)**: pkg/config/types_routing.go, pkg/config/compiler_routing.go,
+  pkg/frr/policy_render.go, pkg/frr/frr_test.go, pkg/frr/README.md, _Log.md
+- **Gates**: go build ./... OK; gofmt -l clean; go vet ./pkg/frr/...
+  ./pkg/config/... clean; go test ./pkg/frr/... ./pkg/config/... OK.
+
+## 2026-06-25 — #2849: DHCP relay giaddr selects PRIMARY IPv4, not first kernel address
+
+- **Timestamp**: 2026-06-25
+- **Action**: `defaultIfaceResolver`/`interfaceIPv4` returned the FIRST
+  non-loopback IPv4 from `net.Interface.Addrs()`. On Linux an interface with
+  a primary address plus secondary subnet aliases returns them in netlink
+  maintenance order, NOT guaranteed primary-first, so a secondary alias could
+  be stamped as `giaddr` → upstream server leases from the wrong subnet pool
+  (agy-review-049 049-07). Fix: select the PRIMARY IPv4. Added a
+  `primaryIPv4Lister` package seam defaulted to a portable
+  `net.Interface.Addrs()` lister (cannot see the secondary flag → reports all
+  as primary, preserving historical behavior), overridden on Linux
+  (`relay_giaddr_linux.go` `init()`) by a `netlink.AddrList`-backed lister
+  that records `IFA_F_SECONDARY` per address. New pure `selectPrimaryIPv4`
+  prefers the first non-secondary candidate; falls back to the first secondary
+  (defensive) and errors on empty. Netlink-enumeration failure falls back to
+  the portable lister rather than failing closed (transient netlink hiccup
+  must not strand a relay). `interfaceIPv4(*net.Interface)` retained as a thin
+  wrapper for the existing loopback test.
+  FAIL-ON-REVERT: `TestSelectPrimaryIPv4_SecondaryBeforePrimary` injects the
+  `netlinkAddrLister` seam with a secondary alias (192.168.50.1, IFA_F_SECONDARY)
+  listed BEFORE the primary (10.0.1.1) → asserts `defaultIfaceResolver`
+  returns the PRIMARY. Verified RED when `selectPrimaryIPv4` is reverted to
+  "return first candidate" (got 192.168.50.1, want 10.0.1.1), GREEN with fix.
+  Gates: go build ./... clean; gofmt -l pkg/dhcprelay clean; go vet
+  ./pkg/dhcprelay/... clean; go test ./pkg/dhcprelay/... ok.
+  **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_giaddr_linux.go,
+  pkg/dhcprelay/relay_giaddr_linux_test.go, pkg/dhcprelay/README.md, _Log.md
+## 2026-06-25 — #2842: DDNS checkip-url scheme validation is now case-insensitive (RFC 3986 §3.1)
+
+- **Timestamp**: 2026-06-25
+- **Action**: Both checkip-url validators rejected a valid uppercase/mixed-case
+  scheme (e.g. `HTTPS://host`) because they tested the scheme with a
+  case-sensitive `strings.HasPrefix(u, "http://"/"https://")` on the raw string.
+  Per RFC 3986 §3.1 the URI scheme is case-INSENSITIVE, so this wrongly rejected
+  a syntactically valid URL. Fix: parse first with `url.Parse`, then compare the
+  parsed `Scheme` with `strings.EqualFold` against `http`/`https`, in BOTH the
+  runtime gate `pkg/ddns.validateCheckIPURL` and the commit-time mirror
+  `pkg/config.ddnsCheckIPURLValid` (the #2773 dual-validator pair — kept in
+  lockstep). Non-http schemes (`ftp://`), host-less (`http://`), and
+  unparseable strings still fail. Added fail-on-revert coverage: uppercase
+  `HTTP://`/`Https://` accepted in `pkg/ddns.TestValidateCheckIPURL` and new
+  `pkg/config.TestP3CheckIPURLUppercaseSchemeAccepted` (ParseSetCommand +
+  SetPath); both go RED if reverted to case-sensitive HasPrefix.
+- **File(s)**: `pkg/ddns/checkip.go`, `pkg/config/compiler_validate_warn.go`,
+  `pkg/ddns/checkip_test.go`,
+  `pkg/config/compiler_p3_http_providers_test.go`, `pkg/ddns/README.md`,
+  `docs/config-schema.md`
+
 ## 2026-06-25 — #2457: WG advertised/configured inner MTU clamped to engine PADDED_PLAINTEXT_MAX (4096)
 
 - **Timestamp**: 2026-06-25
@@ -16856,3 +17016,307 @@ top.
   userspace-dp/src/afxdp/wg/handshake_session.rs,
   userspace-dp/src/afxdp/wg/tests.rs,
   userspace-dp/src/afxdp/wg/engine_tests.rs, _Log.md
+  **Action**: #2850 — add VRRP `preempt hold-time <seconds>` (vSRX parity).
+  Without it a higher-priority node reclaims mastership from a still-live
+  lower-priority master IMMEDIATELY on recovery — before BGP/OSPF converge —
+  blackholing every failback. Added Junos `vrrp-group <id> preempt
+  { hold-time <s>; }`: new nested typed leaf in `setSchema`
+  (`ValidateInteger(1, 3600)`), parsed in BOTH config shapes (braced child
+  + flat-set `preempt hold-time <n>` Keys-run) into
+  `VRRPGroup.PreemptHoldTime`, plumbed to `vrrp.Instance.PreemptHoldTime`.
+  State machine: `stepBackup` now takes a `preemptHoldTimer`. In the
+  `masterDownTimer.C` case, when a hold-time is set AND
+  `preemptingLiveLowerMaster()` (live, recent, strictly-lower master — the
+  same #2082 snapshot math), the promotion is DEFERRED by arming the hold
+  timer instead of `becomeMaster()`; the new `preemptHoldTimer.C` case
+  promotes when it elapses. Dead/stale master = immediate (not held); a
+  priority-0 resign arms a one-shot `skipNextPreemptHold` so planned
+  failover stays zero-delay; a returning >= master or a forced/coordinated
+  `preemptNowCh` stop-drains the hold. Bare `preempt` (PreemptHoldTime 0) is
+  immediate — today's behavior, unchanged. Composes cleanly with the #2082
+  sync-hold preempt gate (separate path: `preemptNowCh` shortcut vs the
+  `masterDownTimer` election the hold-time wraps).
+  FAIL-ON-REVERT: copied `instance.go` aside, replaced the hold-arming
+  branch with `_ = skipHold` →
+  `TestHoldTime_PreemptLiveLowerMasterDeferred` FAILs (state=MASTER, want
+  BACKUP); restored, green. Config-side FAIL-ON-REVERT: dropping the
+  hold-time parse leaves `PreemptHoldTime` 0 → the FlatSet/Hierarchical
+  tests fail.
+  test-failover relevance: YES (HA / VRRP state machine) — PARENT runs
+  `make test-failover` before merge.
+  Gates: go build ./... clean; gofmt -l clean (my files); go vet
+  ./pkg/vrrp/... ./pkg/config/... clean; go test -race ./pkg/vrrp/...
+  ./pkg/config/... ok.
+  **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/vrrp.go, pkg/vrrp/manager.go,
+  pkg/vrrp/instance_preempt_gate_test.go,
+  pkg/vrrp/instance_preempt_holdtime_test.go, pkg/config/types_interfaces.go,
+  pkg/config/schema_interfaces.go, pkg/config/compiler_interfaces.go,
+  pkg/config/vrrp_preempt_holdtime_test.go, docs/config-schema.md,
+  pkg/vrrp/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2850 review fold (MERGE-NEEDS-MINOR) — fix one-shot
+  `skipNextPreemptHold` leak. The resign bypass was set in handleBackupRx's
+  priority-0 path and cleared ONLY in the masterDownTimer.C handler. Race:
+  after a priority-0 resign arms the 1ms masterDownTimer + sets the bypass,
+  a worthy (>= priority) advert arriving before the 1ms fire reset
+  masterDownTimer to the full interval and drained the hold but did NOT
+  clear the bypass — so it survived to a LATER legitimate masterDownTimer
+  expiry and wrongly skipped the hold once (conservative: one failback
+  faster, never stuck). Fix: clear `skipNextPreemptHold = false` in the
+  accept-worthy-master branch (tying the bypass's lifetime to the same
+  condition that drains the hold) AND in `becomeBackup` (a fresh BACKUP
+  tenure after a worthy step-down has no pending resign decision). Both are
+  worthy-master-accepted paths that reset masterDownTimer to the full
+  interval; the priority-0 ARMING path itself is untouched.
+  New test `TestHoldTime_ResignBypassClearedByWorthyMaster`: resign arms
+  skip → worthy advert clears it → later live-lower master → hold IS
+  applied (BACKUP, not promoted). FAIL-ON-REVERT: copied instance.go aside,
+  removed the clear in handleBackupRx → the test FAILs ("skipNextPreemptHold
+  leaked past a worthy-master return"); restored, green.
+  Gates: go build ./... clean; gofmt -l clean; go vet ./pkg/vrrp/...
+  ./pkg/config/... clean; go test -race ./pkg/vrrp/... ./pkg/config/... ok.
+  **File(s)**: pkg/vrrp/instance.go,
+  pkg/vrrp/instance_preempt_holdtime_test.go, _Log.md
+  **Action**: #2846 — bind DDNS HTTP backends + checkip to the configured
+  source-address/destination-interface/routing-instance. Before this only the
+  RFC 2136 backend honored the source binding; the HTTP backends
+  (dyndns2/cloudflare/route53/generic) and the external checkip probe built a
+  plain newHTTPClient() with no DialContext and egressed from the kernel default
+  route. Added newHTTPClientBound(bindConfig) (wires backend_bind.go's
+  source/interface/VRF Dialer into Transport.DialContext),
+  resolveProviderBindConfig + newProviderHTTPClient (adapt config.DDNSProvider
+  leaves onto resolveBindConfig), exported NewCheckIPClient for the daemon, and
+  threaded the bound client into all four HTTP backend constructors + the daemon
+  checkip call site. newHTTPClient() is the no-bind alias (default behaviour
+  unchanged when source-address unset). Malformed source-address = hard error
+  (constructor degrades to no-op; checkip falls back to unbound default + logs),
+  mirroring rfc2136 fail-open. FAIL-ON-REVERT test
+  (backend_http_sourcebind_2846_test.go) asserts a configured source-address
+  dials with that LocalAddr (loopback 127.0.0.2 source proof) for both the HTTP
+  client and checkip, and that the unbound path installs NO DialContext; goes RED
+  if the bind is removed (verified: 3 bind tests FAIL on revert, green on
+  restore). Gates: go build ./... OK, gofmt -l clean, go vet ./pkg/ddns/... OK,
+  go test ./pkg/ddns/... ok.
+  **File(s)**: pkg/ddns/backend_http.go, pkg/ddns/backend_cloudflare.go,
+  pkg/ddns/backend_dyndns2.go, pkg/ddns/backend_route53.go,
+  pkg/ddns/backend_generic.go, pkg/ddns/checkip.go,
+  pkg/ddns/backend_http_sourcebind_2846_test.go,
+  pkg/daemon/daemon_ddns_surface_a.go, pkg/config/types_system.go,
+  pkg/ddns/README.md, _Log.md
+## 2026-06-25 — #2847 FRR policy render: metric/MED 0 silently dropped
+
+- **Timestamp**: 2026-06-25
+- **Action**: Distinguish "metric unset" from "explicitly metric 0" so a
+  `then metric 0` (valid BGP MED traffic-engineering value) renders a
+  `set metric 0` clause instead of being silently dropped by the
+  `term.Metric > 0` gate.
+- **File(s)**:
+  - `pkg/config/types_routing.go` — added `PolicyTerm.HasMetric bool`
+    presence flag (Metric int stays the value).
+  - `pkg/config/compiler_routing.go` — set `term.HasMetric = true` at
+    both the hierarchical and flat-set `metric` compile sites.
+  - `pkg/frr/policy_render.go` — gate the `set metric` clause on
+    `term.HasMetric`, not `term.Metric > 0`.
+  - `pkg/frr/frr_test.go` — set `HasMetric: true` on the two existing
+    direct-construction render tests; added fail-on-revert
+    `TestGeneratePolicyOptionsMetricZero` (metric 0 emitted / unset not
+    emitted / nonzero emitted), driven end-to-end via ParseSetCommand +
+    SetPath + CompileConfig + generatePolicyOptions.
+  - `pkg/config/parser_security_test.go` — assert `HasMetric` after
+    parsing `then metric 100`.
+  - `pkg/frr/README.md` — documented the presence-based emit in the
+    `policy_render.go` cell.
+- **Validation**: go build ./... ; gofmt -l (clean on touched files);
+  go vet ./pkg/frr/... ./pkg/config/... ; go test ./pkg/frr/...
+  ./pkg/config/... (PASS). Fail-on-revert confirmed: reverting the gate
+  to `term.Metric > 0` makes TestGeneratePolicyOptionsMetricZero RED.
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2841 — validate generic DDNS url-template with the same
+  discipline as checkip-url (template-aware: parse scheme + host without
+  choking on inadyn %-specifiers)
+- **File(s)**:
+  - `pkg/ddns/backend_generic.go` — add `validateGenericURLTemplate`
+    (string-based, case-insensitive http(s) scheme + non-empty host,
+    strips userinfo so `%u`/`%p` credentials are tolerated); call it in
+    `newGenericBackend` in place of the old bare `HasPrefix` prefix check.
+  - `pkg/config/compiler_validate_warn.go` — add mirror
+    `ddnsGenericURLTemplateValid` + wire a commit WARNING into the
+    `case "generic"` (RedactURL'd template in the message), matching the
+    checkip-url warning pattern.
+  - `pkg/ddns/backend_http_test.go` — `TestGenericURLTemplateValidation`
+    (reject host-less/wrong-scheme/no-scheme; accept %-specifiers,
+    userinfo-credential, uppercase scheme, explicit port).
+  - `pkg/config/compiler_p3_http_providers_test.go` —
+    `TestP3GenericURLTemplateMalformedWarns` (host-less/wrong-scheme/junk
+    warn; valid %-specifier/userinfo-cred/uppercase templates do NOT
+    warn). Built via ParseSetCommand + SetPath + CompileConfig.
+  - `pkg/ddns/README.md`, `docs/config-schema.md` — documented the
+    template-aware validation + commit warning.
+- **Validation**: go build ./... ; gofmt -l (clean on touched files);
+  go vet ./pkg/config/... ./pkg/ddns/... ; go test ./pkg/config/...
+  ./pkg/ddns/... (PASS). Fail-on-revert confirmed: reverting both the
+  ddns validator and the config wiring to prefix-only makes
+  TestP3GenericURLTemplateMalformedWarns and TestGenericURLTemplateValidation
+  RED (host-less accepted + uppercase scheme false-rejected).
+
+- **Action**: #2844 — unify the NAT64 Ethernet-header writer onto the
+  shared SSOT writer. Deleted NAT64's private `write_eth_header`
+  (hardcoded 0x8100 TPID, bare-VID) and routed both NAT64 frame
+  builders through `crate::afxdp::write_eth_header_slice`, the same
+  in-place writer used by gre.rs / icmp.rs / TX segmentation. Output is
+  byte-identical for the current bare-VID case (`TxVlanTag::from(u16)`
+  reproduces present-iff-vid>0 / TPID 0x8100 / PCP·DEI 0), so no wire
+  change; the point is forward-compat — a future TPID/PCP/DEI/802.1ad/
+  ethertype change in the shared module now reaches NAT64.
+- **File(s)**:
+  - `userspace-dp/src/afxdp/frame/headers.rs` — `write_eth_header_slice`
+    widened `pub(in crate::afxdp)` → `pub(crate)`; module-doc note.
+  - `userspace-dp/src/afxdp/frame/mod.rs` — split it to a `pub(crate)`
+    re-export (other writers stay `pub(in crate::afxdp)`).
+  - `userspace-dp/src/afxdp/mod.rs` — `pub(crate) use
+    self::frame::write_eth_header_slice;` so `crate::nat64` (outside
+    `crate::afxdp`) can reach it.
+  - `userspace-dp/src/nat64.rs` — deleted private writer; import +
+    call the SSOT writer in both builders; module-doc SSOT section.
+  - `userspace-dp/src/nat64_tests.rs` — added byte-identical
+    fail-on-revert test `nat64_eth_header_is_ssot_byte_identical`
+    (v6→v4 untagged 0x0800, v6→v4 VLAN-100 0x8100+VID+0x0800,
+    v4→v6 untagged 0x86dd).
+- **Validation**: `cargo build --release -p xpf-userspace-dp` (Finished);
+  `cargo test --release --bin xpf-userspace-dp -- nat64 eth frame`
+  (453 passed, 0 failed). No `protocol_wire_v1.json` change. Fail-on-
+  revert confirmed: flipping the v6→v4 builder ethertype to 0x86dd
+  makes `nat64_eth_header_is_ssot_byte_identical` RED (got 0x86dd vs
+  expected 0x0800).
+## 2026-06-25 — #2839 DDNS checkip-allowlist: surface malformed tokens (no silent drop)
+- **Timestamp**: 2026-06-25
+- **Action**: `ddns.ParseAllowlist` silently dropped malformed checkip-allowlist
+  tokens, shrinking the bogus-IP safety gate with no operator feedback. Added
+  `ddns.ParseAllowlistChecked(s) (list, malformed)` (lenient `ParseAllowlist`
+  now delegates); wired a commit-time WARNING that names each offending token
+  via `ddnsAllowlistMalformedTokens` (mirrored in the compiler — `pkg/ddns`
+  imports `pkg/config`); the surface-A observer logs ONCE per
+  `(provider, allowlist)` so the per-poll-tick path does not flood. Semantics:
+  WARN (fail-open), matching the sibling `checkip-url` idiom (#2773) — valid
+  tokens are retained, the bad one is dropped, the operator is told.
+- **File(s)**: pkg/ddns/checkip.go, pkg/ddns/checkip_test.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_p3_http_providers_test.go, pkg/daemon/daemon.go,
+  pkg/daemon/daemon_ddns_surface_a.go, docs/config-schema.md
+- **Validation**: go build ./... ; gofmt -l (clean on touched files);
+  go vet ./pkg/ddns/... ./pkg/config/... ./pkg/daemon/... ; go test
+  ./pkg/ddns/... ./pkg/config/... ./pkg/daemon/... (PASS). Fail-on-revert
+  confirmed twice: reverting the ddns parse to a silent drop makes
+  TestParseAllowlistChecked RED ("expected 2 malformed tokens, got 0");
+  reverting the compiler helper to return nil makes
+  TestP3CheckIPAllowlistMalformedWarns RED (no allowlist warning emitted).
+## #2848 — BGP policy-options community add/delete/set/none operations
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add Junos/vSRX community manipulation operations to
+  `then community` policy-term action. Previously REPLACE-only
+  (`set community <list>`); now supports add (additive append), delete
+  (by community-list), set (replace), and none (strip all). Closes the
+  vSRX-parity gap where replace wiped upstream-set communities.
+- **File(s)**:
+  - `pkg/config/types_routing.go` — new `PolicyTerm.CommunityOp`,
+    `CommunityAdd`, `CommunityDelete` fields.
+  - `pkg/config/schema_routing.go` — `then community` is now a
+    `multi: true` leaf packing optional op keyword + value.
+  - `pkg/config/compiler_routing.go` — `applyCommunityAction` helper;
+    wired into the hierarchical (`firewallMatchValues`) and flat-set
+    inline compile paths.
+  - `pkg/frr/policy_render.go` — operation→FRR-clause switch: add →
+    `set community <v> additive`, delete → `set comm-list <name> delete`,
+    none → `set community none`, set/"" → `set community <v>`.
+  - `pkg/config/parser_security_test.go` — `TestPolicyCommunityOperationsCompile`
+    (compiler-level fail-on-revert).
+  - `pkg/frr/frr_test.go` — `TestPolicyCommunityOperations`
+    (end-to-end ParseSetCommand+SetPath+CompileConfig+generatePolicyOptions
+    fail-on-revert).
+  - `docs/config-schema.md`, `pkg/frr/README.md` — documented the
+    operation→clause mapping.
+- **Validation**: go build ./... ; gofmt -l (clean on touched files) ;
+  go vet ./pkg/frr/... ./pkg/config/... ; go test ./pkg/frr/...
+  ./pkg/config/... (PASS). Fail-on-revert confirmed both layers:
+  reverting the renderer switch to the plain `set community` makes
+  TestPolicyCommunityOperations RED; reverting the compiler call to
+  `term.Community = nodeVal(ac)` makes TestPolicyCommunityOperationsCompile
+  RED.
+## 2026-06-25 — #2840 DDNS Surface A: transient link-read must not publish static
+- **Timestamp**: 2026-06-25
+- **Action**: Fix `observeInterfaceAddr` so a `LinkByName`/`AddrList`
+  netlink READ ERROR returns `(zero, false)` (transient — engine leaves
+  the scope untouched, retries next pass) instead of falling back to the
+  configured static and returning `(static, true)`. Publishing a
+  configured static on a link-read failure pointed DNS at a possibly-stale
+  address during a transient link/reth outage, contradicting the
+  documented `(zero,false)=transient` contract (codex-review-049 049-09).
+  The static fallback now applies ONLY on the present-but-addressless
+  path (a SUCCESSFUL read yielding no usable dynamic address — the
+  legitimate static-use case); it still composes with `staticUnitAddr`'s
+  #2776 IsPublicAddr gate. Introduced `netlinkLinkByName`/`netlinkAddrList`
+  package-var seams so the contract is unit-tested without real netlink.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
+  pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md
+- **Validation**: go build ./... ; gofmt -l (clean on touched files) ;
+  go vet ./pkg/daemon/... ./pkg/ddns/... (clean) ;
+  go test ./pkg/daemon/ -run 'SurfaceA|ObserveInterface|StaticUnitAddr|SelectInterfaceAddr'
+  ./pkg/ddns/... (PASS). Fail-on-revert confirmed: reverting the
+  LinkByName-error branch to `(static,true)` makes
+  TestObserveInterfaceAddrTransientVsDefinitive/LinkByName_error RED.
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2864 static-NAT DNAT zone fallback — evaluate the
+  `from zone` constraint PER CANDIDATE so a port-specific entry whose
+  zone does not match the packet's ingress zone falls through to the
+  whole-address `(dst_ip, None)` entry instead of short-circuiting to
+  no-DNAT. Port-specific precedence preserved (it still wins when its
+  zone matches). Added fail-on-revert test
+  `static_nat_dnat_port_zone_mismatch_falls_back_to_whole_address`
+  (port-zone-fail falls back; port wins on its zone; no candidate matches
+  ingress zone -> no DNAT; unknown IP -> no DNAT). No wire change.
+- **File(s)**: userspace-dp/src/nat/static_nat.rs,
+  userspace-dp/src/nat/tests.rs, docs/feature-coverage.md
+- **Validation**: cargo build --release -p xpf-userspace-dp (clean) ;
+  cargo test --release --bin xpf-userspace-dp -- nat dnat static
+  (466 passed, 0 failed). Fail-on-revert confirmed: reverting the
+  per-candidate `.filter(zone_ok)` fall-through to the once-after-precedence
+  zone check makes the new test RED at the `fallback match` expect.
+  protocol_wire_v1.json untouched.
+- **Action**: #2889 — reject FRR auth secrets containing whitespace at
+  commit. A BGP neighbor password / OSPF-RIP-ISIS auth key with a space
+  (or tab / control char) cannot be expressed as a single FRR/vtysh token
+  (FRR's command lexer, lib/command_lex.l, splits on whitespace and has
+  NO quoted-string and NO rest-of-line token — quoting is impossible), so
+  it would be truncated at the first space or inject trailing words as
+  extra vtysh args at frr.conf load. Researched FRR's lexer to confirm
+  quoting is unsupported, then added validateFRRAuthValuesStrict (strict
+  on commit/commit-check naming the field; lenient warn on load/HA-sync
+  per #1960). Scoped to the security-relevant password/key clauses;
+  neighbor description left control-char-sanitized only (noted as
+  follow-up).
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/parser_routing_test.go, pkg/frr/README.md
+- **Validation**: go build ./... ; gofmt -l (clean) ; go vet
+  ./pkg/frr/... ./pkg/config/... (clean) ; go test ./pkg/frr/...
+  ./pkg/config/... (PASS). Fail-on-revert confirmed:
+  TestFRRAuthValueWhitespaceRejected goes RED (space-containing secrets
+  compile cleanly) when validateFRRAuthValuesStrict's call site is removed.
+  **Action**: #2888 DHCP relay server-facing socket binds giaddr:67 (BOOTPS)
+  instead of giaddr:0 (ephemeral). RFC 2131 §4.1: a strict server unicasts its
+  reply to the relay at giaddr:67, so an ephemeral-port server conn never
+  receives the reply and relayed leases never complete with strict servers. The
+  server conn now binds giaddr:relayPort and sets reusePort=true (SO_REUSEADDR/
+  SO_REUSEPORT) so giaddr:67 coexists with the client listener's 0.0.0.0:67
+  without EADDRINUSE; no BINDTODEVICE, no broadcast. Added fail-on-revert test
+  TestServerConn_BindsGiaddrBOOTPS (asserts giaddr:67 + reusePort; RED on revert
+  to Port:0). Updated TestApply_MultiInterface_NoCollision + the #2347 drift
+  test to classify client-vs-server conns by bind IP (0.0.0.0 wildcard vs
+  specific giaddr) since both now bind port 67. Gates: go build ./..., gofmt -l
+  clean, go vet ./pkg/dhcprelay/..., go test ./pkg/dhcprelay/... PASS.
+  **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/dhcprelay/README.md, _Log.md

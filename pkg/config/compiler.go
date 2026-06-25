@@ -246,6 +246,23 @@ type compileOpts struct {
 	// exactly as it did before this gate. Same doctrine as
 	// lenientLogProfileStreamRef.
 	lenientRoutingExportRef bool
+	// lenientFRRAuthValues (#2889) downgrades the FRR auth-value gate
+	// (validateFRRAuthValuesStrict) from a hard compile error to a
+	// cfg.Warnings entry. Set ONLY on the tolerant load / peer-sync paths.
+	// A BGP neighbor TCP-MD5 password or an OSPF/RIP/IS-IS authentication
+	// key containing whitespace cannot be expressed as a single FRR/vtysh
+	// token (FRR's command lexer, lib/command_lex.l, tokenizes purely on
+	// whitespace and has NO quoted-string and NO rest-of-line token), so it
+	// would be split into multiple args at frr.conf load — truncating the
+	// secret at the first space or, worse, treating trailing words as extra
+	// vtysh arguments. This gate rejects such a value at commit so the
+	// operator sees it, instead of a silently-broken authentication setup.
+	// Commit / commit-check stay strict; an already-persisted or peer-synced
+	// config carrying such a value must still BOOT (warn) per the #1960
+	// fail-closed-on-load doctrine — the render path already strips control
+	// chars (sanitizeFRRValue) so the malformed line stays inert/single-line.
+	// Same doctrine as lenientRoutingExportRef.
+	lenientFRRAuthValues bool
 	// lenientRouteFilterMatchTypes (#2525) downgrades the route-filter
 	// match-type gate (validateRouteFilterMatchTypesStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit / commit-check
@@ -577,6 +594,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
 		lenientRoutingExportRef:            true,
+		lenientFRRAuthValues:               true,
 		lenientRouteFilterMatchTypes:       true,
 		lenientApplicationSpecs:            true,
 		lenientFilterProtocols:             true,
@@ -682,6 +700,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
 		lenientRoutingExportRef:            true,
+		lenientFRRAuthValues:               true,
 		lenientRouteFilterMatchTypes:       true,
 		lenientApplicationSpecs:            true,
 		lenientFilterProtocols:             true,
@@ -1336,6 +1355,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientRoutingExportRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("routing export reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2889: FRR auth-value gate. A BGP neighbor password or an
+	// OSPF/RIP/IS-IS authentication key containing whitespace cannot be
+	// rendered as a single FRR/vtysh token (FRR's command lexer has no
+	// quoted-string and no rest-of-line token — it splits on whitespace), so
+	// it would be truncated at the first space or inject trailing words as
+	// extra vtysh args at frr.conf load. Strict on commit / commit-check
+	// (hard reject, naming the field, so the operator sees it); lenient on
+	// load / peer-sync (warn so an already-persisted or peer-synced config
+	// still boots — #1960 fail-closed-on-load class; the render path strips
+	// control chars so the malformed line stays inert). Runs on the fully-
+	// compiled *Config. Mirrors validateRoutingExportReferencesStrict.
+	if err := validateFRRAuthValuesStrict(cfg); err != nil {
+		if opts.lenientFRRAuthValues {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("FRR auth value (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

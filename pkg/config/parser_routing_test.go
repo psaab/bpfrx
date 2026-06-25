@@ -1159,6 +1159,64 @@ func TestBGPNeighborAuthOverride(t *testing.T) {
 	}
 }
 
+// TestFRRAuthValueWhitespaceRejected is the #2889 fail-on-revert gate. A BGP
+// neighbor password or an OSPF/RIP/IS-IS authentication key containing a
+// space cannot be expressed as a single FRR/vtysh token (FRR's command lexer
+// splits on whitespace and has no quoting), so it must be rejected at commit
+// rather than rendered into a broken frr.conf line. Reverting the gate (i.e.
+// dropping validateFRRAuthValuesStrict / emitting the value unquoted) makes
+// the "want commit error" subtests compile cleanly and turns this RED.
+func TestFRRAuthValueWhitespaceRejected(t *testing.T) {
+	t.Run("bgp-password-with-space-rejected", func(t *testing.T) {
+		_, err := compileSet(t, []string{
+			"set protocols bgp local-as 65001",
+			"set protocols bgp group external peer-as 65002",
+			`set protocols bgp group external neighbor 10.0.2.1 authentication-key "my secret pass"`,
+		})
+		if err == nil {
+			t.Fatal("expected commit rejection of a BGP password containing a space, got nil")
+		}
+		if !strings.Contains(err.Error(), "neighbor 10.0.2.1 authentication-key") {
+			t.Errorf("error should name the offending field, got: %v", err)
+		}
+	})
+
+	t.Run("bgp-password-with-tab-rejected", func(t *testing.T) {
+		_, err := compileSet(t, []string{
+			"set protocols bgp local-as 65001",
+			"set protocols bgp group external peer-as 65002",
+			"set protocols bgp group external neighbor 10.0.2.1 authentication-key \"tab\tpass\"",
+		})
+		if err == nil {
+			t.Fatal("expected commit rejection of a BGP password containing a tab, got nil")
+		}
+	})
+
+	t.Run("ospf-key-with-space-rejected", func(t *testing.T) {
+		_, err := compileSet(t, []string{
+			"set protocols ospf area 0.0.0.0 interface trust0 authentication md5 1 key \"two words\"",
+		})
+		if err == nil {
+			t.Fatal("expected commit rejection of an OSPF auth key containing a space, got nil")
+		}
+		if !strings.Contains(err.Error(), "authentication-key") {
+			t.Errorf("error should name the auth field, got: %v", err)
+		}
+	})
+
+	t.Run("spaceless-password-accepted", func(t *testing.T) {
+		// A space-less secret is unchanged — it must still compile cleanly.
+		_, err := compileSet(t, []string{
+			"set protocols bgp local-as 65001",
+			"set protocols bgp group external peer-as 65002",
+			`set protocols bgp group external neighbor 10.0.2.1 authentication-key "s3cr3t!pass.word@1"`,
+		})
+		if err != nil {
+			t.Fatalf("space-less BGP password should compile, got: %v", err)
+		}
+	})
+}
+
 func TestOSPFBFDSetSyntax(t *testing.T) {
 	cmds := []string{"set protocols ospf area 0.0.0.0 interface trust0 bfd-liveness-detection minimum-interval 100"}
 	tree := &ConfigTree{}

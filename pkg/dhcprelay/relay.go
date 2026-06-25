@@ -180,10 +180,12 @@ type interfaceRelay struct {
 //
 //   - ifaceName: when non-empty, SO_BINDTODEVICE binds the socket to that
 //     interface (required on the client conn so REUSEPORT fanout is filtered
-//     per-interface). Empty for the server conn (which binds a unique giaddr
-//     ephemeral port and needs no device binding).
+//     per-interface). Empty for the server conn, which binds a specific
+//     giaddr:67 (#2888) and is steered by the unicast destination address, not
+//     by a device binding.
 //   - reusePort: when true, SO_REUSEADDR+SO_REUSEPORT are set so multiple
-//     client listeners coexist on 0.0.0.0:67.
+//     client listeners coexist on 0.0.0.0:67, and so the server conn's
+//     giaddr:67 bind (#2888) coexists with the client listener's 0.0.0.0:67.
 //   - broadcast: when true, SO_BROADCAST is set so the socket can send to
 //     255.255.255.255 (the client conn's broadcast reply path).
 //   - bindAddr: the local address to bind.
@@ -339,14 +341,87 @@ func defaultPacketConnFactory(ctx context.Context, ifaceName string,
 	return lc.ListenPacket(ctx, "udp4", bindAddr.String())
 }
 
-// defaultIfaceResolver looks up the interface and returns its first
-// non-loopback IPv4 address (the giaddr).
+// defaultIfaceResolver resolves the giaddr for an interface by selecting its
+// PRIMARY non-loopback IPv4 address. It delegates address enumeration to the
+// primaryIPv4Lister seam (netlink-backed on Linux so the kernel's
+// IFA_F_SECONDARY flag is observable; a portable net.Interface.Addrs() fallback
+// otherwise) and primary selection to selectPrimaryIPv4.
+//
+// #2849: the previous implementation returned the FIRST IPv4 from
+// net.Interface.Addrs(). On Linux an interface with a primary address plus
+// secondary subnet aliases returns them in netlink maintenance order, NOT
+// guaranteed primary-first; returning a secondary alias as giaddr makes the
+// upstream server lease from the wrong subnet pool.
 func defaultIfaceResolver(ifaceName string) (net.IP, error) {
+	cands, err := primaryIPv4Lister(ifaceName)
+	if err != nil {
+		return nil, err
+	}
+	return selectPrimaryIPv4(ifaceName, cands)
+}
+
+// ipv4Candidate is one IPv4 address on an interface together with whether the
+// kernel marked it secondary (an alias of an earlier address in the same
+// subnet). selectPrimaryIPv4 prefers a non-secondary address.
+type ipv4Candidate struct {
+	ip        net.IP // 4-byte form
+	secondary bool
+}
+
+// primaryIPv4Lister enumerates the non-loopback IPv4 addresses on ifaceName,
+// preserving kernel ordering and the secondary flag. It is a package-level seam:
+// relay_giaddr_linux.go's init() replaces this portable fallback (which cannot
+// see IFA_F_SECONDARY and therefore reports every address as primary) with a
+// netlink-backed enumerator that does.
+var primaryIPv4Lister = portableIPv4Lister
+
+// portableIPv4Lister enumerates IPv4 addresses via the standard library. It
+// cannot distinguish primary from secondary (net.Interface.Addrs() drops the
+// flag), so every candidate is reported as primary — preserving the historical
+// first-address behavior on platforms without the netlink override.
+func portableIPv4Lister(ifaceName string) ([]ipv4Candidate, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return nil, fmt.Errorf("interface lookup: %w", err)
 	}
-	return interfaceIPv4(iface)
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, fmt.Errorf("list addresses: %w", err)
+	}
+	var cands []ipv4Candidate
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := ipNet.IP.To4()
+		if ip4 == nil || ip4.IsLoopback() {
+			continue
+		}
+		cands = append(cands, ipv4Candidate{ip: ip4})
+	}
+	return cands, nil
+}
+
+// selectPrimaryIPv4 returns the primary giaddr from the candidate list. It
+// prefers the first non-secondary IPv4; only if every candidate is secondary
+// (which the kernel does not normally produce, but a future netlink quirk
+// might) does it fall back to the first secondary so the relay still has an
+// address rather than failing closed. An empty list is an error.
+func selectPrimaryIPv4(ifaceName string, cands []ipv4Candidate) (net.IP, error) {
+	var firstSecondary net.IP
+	for _, c := range cands {
+		if !c.secondary {
+			return c.ip, nil
+		}
+		if firstSecondary == nil {
+			firstSecondary = c.ip
+		}
+	}
+	if firstSecondary != nil {
+		return firstSecondary, nil
+	}
+	return nil, fmt.Errorf("no IPv4 address on %s", ifaceName)
 }
 
 // defaultIfindexResolver resolves an interface name to its live kernel ifindex
@@ -737,10 +812,28 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	}
 	defer conn.Close()
 
-	// Server conn: bound to giaddr ephemeral port. No REUSEPORT, no
-	// BINDTODEVICE (unique port), no broadcast.
-	serverConn, err := m.newConn(sctx, "", false, false,
-		&net.UDPAddr{IP: giaddr, Port: 0})
+	// Server conn: bound to giaddr:67 (BOOTPS), NOT an ephemeral port (#2888).
+	// RFC 2131 §4.1 specifies a server unicasts its reply back to the relay
+	// agent at the giaddr it saw in the relayed request, destination port 67
+	// (BOOTPS) — NOT the relay's source port. A strict-RFC server therefore
+	// sends OFFER/ACK to giaddr:67; if the relay's server-facing socket sits on
+	// an ephemeral port nothing is listening on giaddr:67 and the reply is
+	// dropped, so a relayed lease never completes with a strict server. Bind the
+	// server conn to :67 so the giaddr-side reply is received.
+	//
+	// SO_REUSEADDR/SO_REUSEPORT (reusePort=true) is REQUIRED: the client-facing
+	// listener already holds 0.0.0.0:67 (REUSEPORT). A second bind on port 67 —
+	// even to the distinct, specific giaddr — would otherwise fail EADDRINUSE.
+	// The two sockets do not steal each other's traffic: the client listener is
+	// SO_BINDTODEVICE-pinned to the LAN interface (and receives client
+	// broadcasts/limited-broadcast there), while the server conn binds the
+	// SPECIFIC unicast giaddr — the kernel delivers a unicast datagram destined
+	// to giaddr:67 to the address-specific socket in preference to the wildcard
+	// listener. No BINDTODEVICE (the reply arrives via the routed WAN path, not
+	// necessarily the client interface) and no broadcast (server replies to the
+	// relay are unicast).
+	serverConn, err := m.newConn(sctx, "", true, false,
+		&net.UDPAddr{IP: giaddr, Port: relayPort})
 	if err != nil {
 		// #2787: likewise transient — the giaddr may have just been removed
 		// (interface flap) or the ephemeral bind momentarily failed. Retry
@@ -1220,21 +1313,15 @@ func stripOption82(pkt *dhcpv4.DHCPv4) {
 	pkt.Options.Del(option82)
 }
 
-// interfaceIPv4 returns the first non-loopback IPv4 address on the interface.
+// interfaceIPv4 returns the primary non-loopback IPv4 address on the interface
+// using the standard-library address list. It is retained for callers/tests
+// that already hold a *net.Interface; the giaddr resolution path uses
+// defaultIfaceResolver (which prefers a netlink-backed primary selection that
+// honors IFA_F_SECONDARY — see #2849).
 func interfaceIPv4(iface *net.Interface) (net.IP, error) {
-	addrs, err := iface.Addrs()
+	cands, err := portableIPv4Lister(iface.Name)
 	if err != nil {
-		return nil, fmt.Errorf("list addresses: %w", err)
+		return nil, err
 	}
-	for _, a := range addrs {
-		ipNet, ok := a.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		ip4 := ipNet.IP.To4()
-		if ip4 != nil && !ip4.IsLoopback() {
-			return ip4, nil
-		}
-	}
-	return nil, fmt.Errorf("no IPv4 address on %s", iface.Name)
+	return selectPrimaryIPv4(iface.Name, cands)
 }

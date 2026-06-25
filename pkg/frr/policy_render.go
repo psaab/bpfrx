@@ -1347,17 +1347,47 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 					// The route-map just needs to be a permit
 				}
 
-				if term.LocalPreference > 0 {
+				// Emit on PRESENCE, not value: local-preference 0 is a
+				// valid BGP value (maximally deprioritize a route within
+				// the AS). Gating on LocalPreference > 0 silently dropped
+				// `set local-preference 0` (#2857).
+				if term.HasLocalPreference {
 					fmt.Fprintf(&b, " set local-preference %d\n", term.LocalPreference)
 				}
-				if term.Metric > 0 {
+				// Emit on PRESENCE, not value: metric/MED 0 is a valid
+				// traffic-engineering value (advertise a highly preferred
+				// route). Gating on Metric > 0 silently dropped `set metric
+				// 0` (#2847).
+				if term.HasMetric {
 					fmt.Fprintf(&b, " set metric %d\n", term.Metric)
 				}
 				if term.MetricType == 1 || term.MetricType == 2 {
 					fmt.Fprintf(&b, " set metric-type type-%d\n", term.MetricType)
 				}
-				if term.Community != "" {
-					fmt.Fprintf(&b, " set community %s\n", term.Community)
+				// BGP community operations (#2848). Junos/vSRX supports
+				// append/delete/strip in addition to whole-attribute replace;
+				// emitting only the replace clause wiped upstream-set
+				// communities. Map each Junos operation to its FRR route-map
+				// set clause:
+				//   - add    → `set community <v> additive` (append)
+				//   - delete → `set comm-list <name> delete` (strip by list)
+				//   - none   → `set community none` (strip all)
+				//   - set/"" → `set community <v>` (replace; legacy bare form)
+				switch term.CommunityOp {
+				case "none":
+					b.WriteString(" set community none\n")
+				case "add":
+					if term.CommunityAdd != "" {
+						fmt.Fprintf(&b, " set community %s additive\n", term.CommunityAdd)
+					}
+				case "delete":
+					if term.CommunityDelete != "" {
+						fmt.Fprintf(&b, " set comm-list %s delete\n", term.CommunityDelete)
+					}
+				default: // "" or "set" — whole-attribute replace
+					if term.Community != "" {
+						fmt.Fprintf(&b, " set community %s\n", term.Community)
+					}
 				}
 				if term.Origin != "" {
 					fmt.Fprintf(&b, " set origin %s\n", term.Origin)

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strings"
@@ -976,16 +977,81 @@ func ddnsKnownDyndns2Provider(name string) bool {
 // closed regardless (#2773). A checkip-url must be an http(s) URL with a host;
 // without that gate a typo (ftp://, "not a url", host-less "http://") commits
 // silently and then masquerades forever as a transient observation failure,
-// suppressing publishing indefinitely.
+// suppressing publishing indefinitely. The scheme check is case-INSENSITIVE per
+// RFC 3986 §3.1 ("HTTPS://host" is valid); it parses first and compares the
+// parsed scheme with EqualFold, matching pkg/ddns.validateCheckIPURL (#2842).
 func ddnsCheckIPURLValid(u string) bool {
-	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-		return false
-	}
 	parsed, err := url.Parse(u)
 	if err != nil || parsed.Host == "" {
 		return false
 	}
-	return true
+	return strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https")
+}
+
+// ddnsGenericURLTemplateValid mirrors pkg/ddns.validateGenericURLTemplate for
+// the commit-time warning ONLY (config cannot import pkg/ddns). It must stay in
+// sync with that validator; a divergence only affects whether the operator gets
+// a warning at commit — the runtime newGenericBackend gate is authoritative and
+// fails closed regardless (#2841). A generic url-template must be a
+// case-INSENSITIVE http(s) URL (RFC 3986 §3.1) with a host; without this warning
+// a malformed template (no host / wrong scheme) commits silently and then fails
+// only at the first publish. It is deliberately TEMPLATE-AWARE and string-based,
+// NOT net/url-based: the value carries inadyn %h/%i/%u/%p specifiers (possibly
+// in the userinfo, e.g. https://user:%p@host/upd) that are not valid
+// percent-encoding and would make url.Parse fail or mangle the string (same
+// reason RedactURL is string-based, #2781). Only the scheme + host portion is
+// checked; any %-specifier or {{...}} placeholder in userinfo/path/query is
+// tolerated. The input is TrimSpace'd before validating so this stays byte-for-
+// byte in lockstep with the runtime gate, which trims (newGenericBackend trims
+// p.URLTemplate before constructing): a leading-whitespace template must not
+// warn at commit while the runtime trims+accepts it (#2841 lockstep fold).
+func ddnsGenericURLTemplateValid(tmpl string) bool {
+	tmpl = strings.TrimSpace(tmpl)
+	i := strings.Index(tmpl, "://")
+	if i < 0 {
+		return false
+	}
+	if scheme := tmpl[:i]; !strings.EqualFold(scheme, "http") && !strings.EqualFold(scheme, "https") {
+		return false
+	}
+	authStart := i + len("://")
+	authEnd := len(tmpl)
+	for j := authStart; j < len(tmpl); j++ {
+		if c := tmpl[j]; c == '/' || c == '?' || c == '#' {
+			authEnd = j
+			break
+		}
+	}
+	authority := tmpl[authStart:authEnd]
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		authority = authority[at+1:]
+	}
+	return authority != ""
+}
+
+// ddnsAllowlistMalformedTokens mirrors pkg/ddns.ParseAllowlistChecked's
+// tokenization for the commit-time warning ONLY (config cannot import pkg/ddns:
+// pkg/ddns imports pkg/config). It returns the comma/space/tab-separated tokens
+// that are not valid IP addresses. It must stay in sync with the splitter in
+// ddns.ParseAllowlistChecked; a divergence only affects whether the operator
+// gets a warning at commit — the runtime parse in pkg/ddns is authoritative and
+// drops the same tokens (logging once per provider) regardless (#2839).
+func ddnsAllowlistMalformedTokens(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	var bad []string
+	fields := strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' })
+	for _, f := range fields {
+		tok := strings.TrimSpace(f)
+		if tok == "" {
+			continue
+		}
+		if _, err := netip.ParseAddr(tok); err != nil {
+			bad = append(bad, tok)
+		}
+	}
+	return bad
 }
 
 // validateSurfaceADDNSWarnings emits WARN-only commit-time messages for the
@@ -1073,6 +1139,12 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
 					"provider %q (backend generic) has no url-template; scopes using it publish "+
 					"nothing", name))
+			} else if !ddnsGenericURLTemplateValid(p.URLTemplate) {
+				// RedactURL the template: it may embed a credential in the userinfo
+				// or query (%p/token=...), which must not reach a commit-warning log.
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q url-template %q is not a valid http(s) URL with a host; "+
+					"scopes using it publish nothing", name, RedactURL(p.URLTemplate)))
 			}
 		}
 
@@ -1085,6 +1157,21 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 			warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
 				"provider %q checkip-url %q is not a valid http(s) URL with a host; "+
 				"scopes using address-source checkip publish nothing", name, p.CheckIPURL))
+		}
+
+		// checkip-allowlist is a bogus-IP safety gate: each entry is an address
+		// the checkip parser may accept even though it is otherwise special-purpose
+		// (anycast resolvers, etc.). A malformed token (operator typo, e.g.
+		// "8.8.8.8x") is otherwise SILENTLY DROPPED by ddns.ParseAllowlist, so the
+		// gate silently shrinks and the checkip parser admits the very IP the
+		// operator meant to suppress (#2839). Surface the offending tokens at
+		// commit; the runtime allowlist parse mirrors this and fails lenient (it
+		// logs once per provider and keeps the valid entries). Parsing is mirrored
+		// here (not via pkg/ddns) because pkg/ddns imports pkg/config.
+		for _, tok := range ddnsAllowlistMalformedTokens(p.CheckIPAllowlist) {
+			warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+				"provider %q checkip-allowlist entry %q is not a valid IP address; "+
+				"it is ignored, shrinking the bogus-IP allowlist", name, tok))
 		}
 	}
 

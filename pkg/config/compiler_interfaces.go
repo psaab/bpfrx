@@ -698,6 +698,14 @@ func parseVRRPGroups(unit *InterfaceUnit, addrName string, addrNode *Node) {
 				}
 			case "preempt":
 				vg.Preempt = true
+				// Junos `preempt hold-time <seconds>` packs the
+				// nested leaf onto the Keys run in the flat-set
+				// shape: ... preempt hold-time 30. Consume the
+				// optional `hold-time <n>` pair when present.
+				if i+2 < len(keys) && keys[i+1] == "hold-time" {
+					vg.PreemptHoldTime, _ = strconv.Atoi(keys[i+2])
+					i += 2
+				}
 			case "accept-data":
 				vg.AcceptData = true
 			case "advertise-interval":
@@ -776,6 +784,19 @@ func parseVRRPGroups(unit *InterfaceUnit, addrName string, addrNode *Node) {
 				}
 			case "preempt":
 				vg.Preempt = true
+				// Junos `preempt { hold-time <seconds>; }`. The
+				// hierarchical / braced shape carries hold-time as a
+				// child node; the structured flat-set replay may pack
+				// it onto Keys[1:] (preempt, hold-time, <n>). Handle
+				// both. Bare `preempt` leaves PreemptHoldTime 0
+				// (immediate).
+				if ht := prop.FindChild("hold-time"); ht != nil {
+					if v := nodeVal(ht); v != "" {
+						vg.PreemptHoldTime, _ = strconv.Atoi(v)
+					}
+				} else if len(prop.Keys) >= 3 && prop.Keys[1] == "hold-time" {
+					vg.PreemptHoldTime, _ = strconv.Atoi(prop.Keys[2])
+				}
 			case "accept-data":
 				vg.AcceptData = true
 			case "advertise-interval":

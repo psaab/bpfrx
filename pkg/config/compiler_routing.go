@@ -669,12 +669,14 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 					if v := nodeVal(ac); v != "" {
 						if n, err := strconv.Atoi(v); err == nil {
 							term.LocalPreference = n
+							term.HasLocalPreference = true
 						}
 					}
 				case "metric":
 					if v := nodeVal(ac); v != "" {
 						if n, err := strconv.Atoi(v); err == nil {
 							term.Metric = n
+							term.HasMetric = true
 						}
 					}
 				case "metric-type":
@@ -684,7 +686,11 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 						}
 					}
 				case "community":
-					term.Community = nodeVal(ac)
+					// `then community` is a multi-value leaf that packs an
+					// optional operation keyword (add|delete|set|none) plus the
+					// community value onto Keys / Children. Read every token via
+					// the SSOT and interpret the operation (#2848).
+					applyCommunityAction(term, firewallMatchValues(ac))
 				case "origin":
 					term.Origin = nodeVal(ac)
 				}
@@ -693,6 +699,52 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 				term.Action = tc.Keys[1]
 			}
 		}
+	}
+}
+
+// applyCommunityAction interprets the tokens of a `then community` clause and
+// records the requested operation on the term (#2848). Junos/vSRX supports four
+// community operations in a policy term:
+//
+//   - `then community set <value>`  → replace the whole community attribute
+//   - `then community <value>`      → replace (legacy bare form, back-compat)
+//   - `then community add <value>`  → append (FRR `set community <v> additive`)
+//   - `then community delete <name>`→ strip members matching the named
+//     community-list (FRR `set comm-list <name> delete`)
+//   - `then community none`         → strip all communities (FRR `set community none`)
+//
+// vals is the flattened token list of the clause (operation keyword first when
+// present, then the value/name). The first token selects the operation; any
+// other first token is treated as a bare replace value.
+func applyCommunityAction(term *PolicyTerm, vals []string) {
+	if len(vals) == 0 {
+		return
+	}
+	switch vals[0] {
+	case "none":
+		term.CommunityOp = "none"
+		term.Community = ""
+		term.CommunityAdd = ""
+		term.CommunityDelete = ""
+	case "add":
+		if len(vals) >= 2 {
+			term.CommunityOp = "add"
+			term.CommunityAdd = strings.Join(vals[1:], " ")
+		}
+	case "delete":
+		if len(vals) >= 2 {
+			term.CommunityOp = "delete"
+			term.CommunityDelete = vals[1]
+		}
+	case "set":
+		if len(vals) >= 2 {
+			term.CommunityOp = "set"
+			term.Community = strings.Join(vals[1:], " ")
+		}
+	default:
+		// Bare `then community <value>` — legacy replace form.
+		term.CommunityOp = ""
+		term.Community = strings.Join(vals, " ")
 	}
 }
 
@@ -789,6 +841,7 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 				i++
 				if n, err := strconv.Atoi(keys[i]); err == nil {
 					term.LocalPreference = n
+					term.HasLocalPreference = true
 				}
 			}
 		case "metric":
@@ -796,6 +849,7 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 				i++
 				if n, err := strconv.Atoi(keys[i]); err == nil {
 					term.Metric = n
+					term.HasMetric = true
 				}
 			}
 		case "metric-type":
@@ -806,12 +860,36 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 				}
 			}
 		case "community":
-			if i+1 < len(keys) {
-				i++
-				if inFrom {
+			if inFrom {
+				if i+1 < len(keys) {
+					i++
 					term.FromCommunity = append(term.FromCommunity, keys[i])
-				} else {
-					term.Community = keys[i]
+				}
+				continue
+			}
+			// `then community` may carry an operation keyword
+			// (add|delete|set|none) optionally followed by a value. Consume
+			// the operation token plus, where the operation takes an
+			// argument, the value token. Belt-and-suspenders: the inline path
+			// is not reached for `then community` under the current schema
+			// (SetPath/block parse both nest `then` as a child node), but keep
+			// it correct in case dispatch ever changes (#2848).
+			if i+1 < len(keys) {
+				op := keys[i+1]
+				switch op {
+				case "add", "delete", "set":
+					if i+2 < len(keys) {
+						applyCommunityAction(term, []string{op, keys[i+2]})
+						i += 2
+					} else {
+						i++
+					}
+				case "none":
+					applyCommunityAction(term, []string{op})
+					i++
+				default:
+					applyCommunityAction(term, []string{op})
+					i++
 				}
 			}
 		case "as-path":

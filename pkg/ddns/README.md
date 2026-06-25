@@ -21,15 +21,16 @@ moved with its assertions intact.
 | `backend_rfc2136.go` | The LIVE RFC 2136 backend (`rfc2136Updater`): exact-RR adds/deletes, TSIG, RFC 4701 DHCID + RFC 4703 replace-owned two-attempt, the `errDDNSConflictRefused` / `errDDNSPTRPending` sentinels — moved from `dhcpserver/ddns_rfc2136.go`. `sendRemoveForward(..., keepDHCID)` keeps a shared DHCID on a partial dual-stack teardown (#2700); `dnsCanonicalFQDN` mirrors the DHCID FQDN canonicalization. |
 | `hostname.go` | Deterministic hostname → DNS-label normalization (pure) — moved from `dhcpserver/ddns_hostname.go`. |
 | `surface_a.go` | Surface A router/interface-address publish engine (`SurfaceAManager`): change-detection, forced-refresh wire floor, per-scope error backoff, per-RG HA gate, the backend factory `productionSurfaceABackend` (#2691 P2/P3). **Operator-hostname intent (#2779):** the publish path (`surfaceAName` → `sanitizeFQDN`) lower-cases + strips non-LDH characters + drops empty-sanitizing labels. For a *router-owned* Surface A record the hostname is operator intent (the operator types the exact public name), so a name that sanitization would STRUCTURALLY change is now a **commit error** (`config.ValidateDDNSHostname` on the typed `interfaces … dynamic-dns hostname` leaf) instead of a silent rewrite to a different DNS name — e.g. `wan_1.example.net` is rejected at commit rather than published as `wan1.example.net`. Case-folding and a single trailing dot are accepted (benign DNS canonicalizations). Every name that PASSES the commit check is a fixed point of `sanitizeFQDN` (cross-package contract test `surface_a_hostname_2779_test.go`), so the published name equals operator intent. |
-| `backend_http.go` | Shared HTTP-backend discipline (#2691 P3): hardened `http.Client` (TLS-verified, bounded timeout), capped body read, `classifyHTTPStatus`, `queryEscape`, the `errHTTPAuth`/`errHTTPRateLimited` verdicts. |
+| `backend_http.go` | Shared HTTP-backend discipline (#2691 P3): hardened `http.Client` (TLS-verified, bounded timeout), capped body read, `classifyHTTPStatus`, `queryEscape`, the `errHTTPAuth`/`errHTTPRateLimited` verdicts. **Source binding (#2846):** `newHTTPClientBound(bindConfig)` installs the SAME `backend_bind.go` source/interface/VRF `Dialer` (via `Transport.DialContext`) so the HTTP backends + checkip egress from the operator-configured `source-address` / `destination-interface` / `routing-instance` — not the kernel default route. `newHTTPClient()` is the no-bind alias (unbound default, behaviour unchanged). `resolveProviderBindConfig`/`newProviderHTTPClient` adapt a `config.DDNSProvider`'s leaves onto `resolveBindConfig`; a malformed `source-address` is a hard error so the backend constructor degrades to no-op (fail-open, mirrors rfc2136). |
 | `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. |
 | `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → find → PATCH/POST/DELETE record. **Withdraw is content-scoped (#2770):** `DeleteLease` lists EVERY record for the FQDN+type and deletes only the rows whose `content` equals the owned address (`rec.Addr.Unmap().String()`), removing ALL such duplicates. It never deletes a row with a different value (a human/automation changed it after xpf published — an ownership conflict that is a success no-op), honouring the Surface A sole-delete-authority boundary that Route 53 / RFC 2136 also enforce. `recs[0]` is an API-ordering artifact, not ownership. |
 | `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. **Withdraw (#2772):** `DeleteLease` issues the same update GET with `offline=YES` (the de-facto dyndns2 withdraw verb) and parses the body verdict; a provider failure returns a non-nil error so the engine keeps ownership for retry (was a silent no-op that orphaned the public record). |
 | `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → find → PATCH/POST/DELETE record. |
 | `backend_route53.go` | Route 53 backend (#2691 P3): SigV4-signed `ChangeResourceRecordSets` UPSERT/DELETE change batch. |
 | `sigv4.go` | Minimal self-contained AWS SigV4 signer for Route 53 (no AWS SDK dependency). |
-| `backend_generic.go` | Generic templated backend (#2691 P3, inadyn "custom"): `%h/%i/%u/%p/%%` URL template + success-substring matcher — config-only, no Go code per provider. **Withdraw (#2772):** a single update template has no portable delete verb and xpf exposes no delete template, so `DeleteLease` FAILS (`errGenericDeleteUnsupported`) rather than silently reporting success; the engine keeps ownership so the abandoned record stays operator-visible (was a silent no-op that dropped ownership while the record kept resolving). |
-| `checkip.go` | Opt-in external check-IP address source (#2691 P3): bogus-IP validity gate + allowlist (`IsPublicAddr`, `parseCheckIPBody`, `CheckIP`, `ParseAllowlist`). `CheckIP` fails closed on a malformed `checkip-url` via `validateCheckIPURL` (http(s) scheme + host); a typo is also warned at commit by `config.validateSurfaceADDNSWarnings` so it cannot masquerade as a permanent transient observation failure (#2773). **Public-address gate (#2774, exported #2776):** `IsPublicAddr` accepts only a globally-routable unicast address and rejects the full IANA Special-Purpose Address Registry so a hostile/misconfigured checkip endpoint cannot get a martian/reserved address published as the router's A/AAAA record. It is exported (#2776) so the daemon's Surface A static-address fallback (`staticUnitAddr`) reuses the SAME predicate instead of a weaker partial filter. stdlib `netip` predicates cover unspecified, loopback, link-local (uni + multicast), multicast (incl. interface-local), and the RFC-1918 private ranges (`IsPrivate`: 10/8, 172.16/12, 192.168/16). The `specialPurposeV4`/`specialPurposeV6` prefix tables add the rest: **IPv4** 0.0.0.0/8 (this-network), 100.64/10 (CGNAT), 192.0.0/24 (IETF protocol assignments), 192.0.2/24 + 198.51.100/24 + 203.0.113/24 (TEST-NET-1/2/3 documentation), 192.88.99/24 (6to4 relay anycast), 198.18/15 (benchmarking), 240/4 (reserved), 255.255.255.255/32 (limited broadcast); **IPv6** ::ffff:0:0/96 (IPv4-mapped), 64:ff9b::/96 + 64:ff9b:1::/48 (NAT64), 100::/64 (discard-only), 100:0:0:1::/64 (dummy prefix, RFC 9780 — distinct from 100::/64), 2001::/23 (IETF protocol assignments), 2001:db8::/32 + 3fff::/20 (documentation, RFC 3849/9637), 2002::/16 (6to4), 5f00::/16 (SRv6 SIDs, RFC 9602), fc00::/7 (ULA). |
+| `backend_generic.go` | Generic templated backend (#2691 P3, inadyn "custom"): `%h/%i/%u/%p/%%` URL template + success-token matcher — config-only, no Go code per provider. **Success classification (#2838):** the 2xx body is matched by WHOLE TOKEN (`matchesGenericOK`), not raw `strings.Contains`. A default/`ok-response` token (`good`/`nochg`/`ok`/`true`/`updated`, case-insensitive) is a success only when it equals a trimmed response line or is the leading whitespace-delimited field of a line (so dyndns2-style `good <ip>` still passes). A body that merely *contains* a token — `not ok`, `error: ok token invalid`, `update not good`, or an HTML page with an `OK` button — is a FAILURE; the old substring matcher turned those explicit provider errors into false successes, after which Surface A recorded ownership and suppressed retry, leaving DNS stale while the router believed the address was published. **Withdraw (#2772):** a single update template has no portable delete verb and xpf exposes no delete template, so `DeleteLease` FAILS (`errGenericDeleteUnsupported`) rather than silently reporting success; the engine keeps ownership so the abandoned record stays operator-visible (was a silent no-op that dropped ownership while the record kept resolving). **Template validation (#2841):** `newGenericBackend` validates the `url-template` with `validateGenericURLTemplate` — the SAME discipline as checkip's `validateCheckIPURL` (a case-INSENSITIVE http(s) scheme per RFC 3986 §3.1 + a non-empty host), so a host-less (`https:///upd`) or wrong-scheme (`ftp://`) template fails closed at construction instead of accepting the backend and only failing at the first publish (the old check was a bare `HasPrefix("http(s)://")` with no host parse). It is deliberately TEMPLATE-AWARE and string-based, NOT `net/url`-based (like `RedactURL`, #2781): it extracts the scheme + host portion and tolerates the inadyn `%h/%i/%u/%p` specifiers and `{{...}}` placeholders anywhere in the userinfo/path/query — a credential embedded in the userinfo (`https://user:%p@host/upd`) makes `url.Parse` fail on the bare `%p`, so it must NOT be validated with `url.Parse`. A typo is also warned at commit by `config.validateSurfaceADDNSWarnings` (mirror `ddnsGenericURLTemplateValid`, RedactURL'd in the message), matching the checkip-url warning. |
+| `checkip.go` | Opt-in external check-IP address source (#2691 P3): bogus-IP validity gate + allowlist (`IsPublicAddr`, `parseCheckIPBody`, `CheckIP`, `ParseAllowlist`). **Source binding (#2846):** `NewCheckIPClient(provider)` builds the checkip probe's `http.Client` bound to the provider's `source-address`/`destination-interface`/`routing-instance` so the external "what is my IP" query egresses from the configured source, not the default route (the daemon passes this bound client into `CheckIP`). `CheckIP` fails closed on a malformed `checkip-url` via `validateCheckIPURL` (http(s) scheme + host); a typo is also warned at commit by `config.validateSurfaceADDNSWarnings` so it cannot masquerade as a permanent transient observation failure (#2773). **Public-address gate (#2774, exported #2776):** `IsPublicAddr` accepts only a globally-routable unicast address and rejects the full IANA Special-Purpose Address Registry so a hostile/misconfigured checkip endpoint cannot get a martian/reserved address published as the router's A/AAAA record. It is exported (#2776) so the daemon's Surface A static-address fallback (`staticUnitAddr`) reuses the SAME predicate instead of a weaker partial filter. stdlib `netip` predicates cover unspecified, loopback, link-local (uni + multicast), multicast (incl. interface-local), and the RFC-1918 private ranges (`IsPrivate`: 10/8, 172.16/12, 192.168/16). The `specialPurposeV4`/`specialPurposeV6` prefix tables add the rest: **IPv4** 0.0.0.0/8 (this-network), 100.64/10 (CGNAT), 192.0.0/24 (IETF protocol assignments), 192.0.2/24 + 198.51.100/24 + 203.0.113/24 (TEST-NET-1/2/3 documentation), 192.88.99/24 (6to4 relay anycast), 198.18/15 (benchmarking), 240/4 (reserved), 255.255.255.255/32 (limited broadcast); **IPv6** ::ffff:0:0/96 (IPv4-mapped), 64:ff9b::/96 + 64:ff9b:1::/48 (NAT64), 100::/64 (discard-only), 100:0:0:1::/64 (dummy prefix, RFC 9780 — distinct from 100::/64), 2001::/23 (IETF protocol assignments), 2001:db8::/32 + 3fff::/20 (documentation, RFC 3849/9637), 2002::/16 (6to4), 5f00::/16 (SRv6 SIDs, RFC 9602), fc00::/7 (ULA). |
+| `checkip.go` | Opt-in external check-IP address source (#2691 P3): bogus-IP validity gate + allowlist (`IsPublicAddr`, `parseCheckIPBody`, `CheckIP`, `ParseAllowlist`). `CheckIP` fails closed on a malformed `checkip-url` via `validateCheckIPURL` (http(s) scheme + host; the scheme check is case-INSENSITIVE per RFC 3986 §3.1, so `HTTPS://host` is accepted — #2842); a typo is also warned at commit by `config.validateSurfaceADDNSWarnings` so it cannot masquerade as a permanent transient observation failure (#2773). **Public-address gate (#2774, exported #2776):** `IsPublicAddr` accepts only a globally-routable unicast address and rejects the full IANA Special-Purpose Address Registry so a hostile/misconfigured checkip endpoint cannot get a martian/reserved address published as the router's A/AAAA record. It is exported (#2776) so the daemon's Surface A static-address fallback (`staticUnitAddr`) reuses the SAME predicate instead of a weaker partial filter. stdlib `netip` predicates cover unspecified, loopback, link-local (uni + multicast), multicast (incl. interface-local), and the RFC-1918 private ranges (`IsPrivate`: 10/8, 172.16/12, 192.168/16). The `specialPurposeV4`/`specialPurposeV6` prefix tables add the rest: **IPv4** 0.0.0.0/8 (this-network), 100.64/10 (CGNAT), 192.0.0/24 (IETF protocol assignments), 192.0.2/24 + 198.51.100/24 + 203.0.113/24 (TEST-NET-1/2/3 documentation), 192.88.99/24 (6to4 relay anycast), 198.18/15 (benchmarking), 240/4 (reserved), 255.255.255.255/32 (limited broadcast); **IPv6** ::ffff:0:0/96 (IPv4-mapped), 64:ff9b::/96 + 64:ff9b:1::/48 (NAT64), 100::/64 (discard-only), 100:0:0:1::/64 (dummy prefix, RFC 9780 — distinct from 100::/64), 2001::/23 (IETF protocol assignments), 2001:db8::/32 + 3fff::/20 (documentation, RFC 3849/9637), 2002::/16 (6to4), 5f00::/16 (SRv6 SIDs, RFC 9602), fc00::/7 (ULA). |
 
 Tests moved with the code: `manager_test.go` (engine + state-store + hostname),
 `backend_rfc2136_test.go` (backend, drives a real in-process miekg/dns server),
@@ -52,7 +53,7 @@ single resolution point keyed on `DDNSProvider.Backend`:
 | `dyndns2` | `GET /nic/update?hostname=&myip=` + Basic auth; body verdict | `server` or a known provider name | `password` |
 | `cloudflare` | Bearer token; zone-id resolve → PATCH/POST DNS record | `api-token`, `zone` | `api-token` |
 | `route53` | SigV4 `ChangeResourceRecordSets` UPSERT | `aws-access-key`, `aws-secret-key`, `hosted-zone-id` | `aws-secret-key` |
-| `generic` | templated URL + success-substring (config-only) | `url-template` | `password` (optional) |
+| `generic` | templated URL + success-token match (config-only) | `url-template` | `password` (optional) |
 
 All credentials are `config.Secret` (revealed only at the transport boundary,
 never logged); HTTP is HTTPS with system-trust cert+hostname verification, a
@@ -248,6 +249,21 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   `SO_BINDTODEVICE` for the interface/VRF, working for both the UDP-first and
   TCP-retry exchange). Fail-open at runtime; an invalid source-address falls the
   family back to no-op.
+- **HTTP-transport + checkip source binding (#2846)** — originally only the RFC
+  2136 backend honored the source binding; the HTTP backends
+  (dyndns2/Cloudflare/Route53/generic) and the external checkip probe built a
+  plain `newHTTPClient()` and left via the default route. #2846 wires the SAME
+  `bindConfig.dialer()` into the HTTP client's `Transport.DialContext`
+  (`newHTTPClientBound` in `backend_http.go`), so an HTTP DDNS update and a
+  checkip query dial from the configured `source-address` /
+  `destination-interface` / `routing-instance`. The provider catalog carries the
+  binding leaves (`config.DDNSProvider`, #2780); `resolveProviderBindConfig`
+  adapts them onto the same `resolveBindConfig` discipline. When no
+  `source-address` is set the Transport gets no `DialContext` override — the
+  default-route behaviour is byte-for-byte unchanged. A malformed `source-address`
+  is a hard error so the backend constructor degrades to no-op (and the checkip
+  client falls back to the unbound default + logs), matching the rfc2136
+  fail-open posture.
 
 **HA correctness:** the per-RG gate change MUST pass `make test-failover` (the
 project rule for any gate / HA-path change). P1b adds the gate + the
@@ -316,9 +332,21 @@ its OWN learned address — on top of the SAME spine, without forking the engine
   (never withdraw); a valid-but-Invalid `Addr` (interface down / lease gone) →
   withdraw. Keeping observation in the daemon keeps `pkg/ddns` free of
   netlink/DHCP deps, exactly like the `LeaseParser` seam for Surface B.
-  **Static-address fallback is public-gated (#2776):** when the kernel
-  interface is absent/addressless, `observeInterfaceAddr` falls back to the
-  unit's configured static address via `staticUnitAddr`, which now gates the
+  **Transient link-read vs definitive-none (#2840):** `observeInterfaceAddr`
+  carefully distinguishes a netlink READ FAILURE from a present-but-addressless
+  interface. A `LinkByName`/`AddrList` ERROR (interface absent during a rename,
+  reth/HA churn, a netlink hiccup) is TRANSIENT → it returns `(zero, false)` so
+  the engine leaves the scope untouched and retries next pass. It does NOT fall
+  back to the configured static on a read error — publishing a "configured"
+  address that could not be confirmed "active" in the kernel data plane would
+  point DNS at a possibly-stale address during a transient link outage. The
+  netlink reads go through the `netlinkLinkByName`/`netlinkAddrList` seams so the
+  transient-vs-definitive contract is unit-tested without a real kernel
+  interface (`TestObserveInterfaceAddrTransientVsDefinitive`).
+  **Static-address fallback is public-gated (#2776) and present-but-addressless
+  only:** when the interface read SUCCEEDS but yields no usable dynamic address
+  (the legitimate static-use case), `observeInterfaceAddr` falls back to the
+  unit's configured static address via `staticUnitAddr`, which gates the
   candidate through the SAME `ddns.IsPublicAddr` predicate the netlink and
   checkip sources use (exported for this reuse, #2774). A mis-scoped static
   address (multicast, reserved, ULA, CGNAT, documentation, IANA
@@ -375,8 +403,28 @@ its OWN learned address — on top of the SAME spine, without forking the engine
   `surface_a_lockio_test.go` (a blocking provider + a concurrent `StatusViews`
   that would hang if the lock were held; fail-on-revert).
 - **Operator surfaces:** `show services dynamic-dns [detail]` (CLI + gRPC), the
-  `xpf_ddns_surface_a_*` Prometheus family, and `SurfaceAManager.StatusViews()`
-  (per-scope published address + last-published time + last error).
+  `xpf_ddns_surface_a_*` Prometheus family, and
+  `SurfaceAManager.StatusViews(scopes)` (per-scope `State` + published address +
+  last-published time + last error).
+- **Status surfaces EVERY configured scope, not just the owned ones (#2843).**
+  `StatusViews` takes the CURRENTLY configured scopes (materialized by the daemon
+  from the committed config) and returns the UNION of: a row per configured scope
+  (merged with its ownership record + runtime state) AND any ownership record for
+  a scope no longer configured (a withdraw is pending). Each row carries a
+  `State`: `published` (owns a record), `unpublished` (the provider resolved to
+  the no-op backend — `errSurfaceANoBackend`, a half-configured provider; the
+  reason is in `LastError`, no backoff armed), `error` (the last publish attempt
+  failed; reason + backoff armed), `pending` (configured, not yet owned, no
+  recorded error — never attempted or waiting on an address observation / backoff
+  window), or `withdraw-pending` (owned but no longer configured). Before #2843
+  the status was built from ownership records ONLY, so a scope that failed before
+  its first publish — most acutely a half-configured provider whose
+  `errSurfaceANoBackend` was swallowed without `recordScopeError` — was INVISIBLE
+  in `show ... detail`, the opposite of what an operator needs during bring-up.
+  The no-backend state now records a per-scope reason on the runtime cache
+  (without arming retry backoff) so the row reports it. Proven (fail-on-revert)
+  in `surface_a_http_test.go` (`TestStatusViewsSurfacesUnpublishedScopes`,
+  `TestStatusViewsSurfacesPendingAndPublished`).
 - **Tests through the REAL backend.** The self-owned replace, forced-refresh,
   and both withdraw paths are proven in `surface_a_rfc2136_test.go` against the
   stateful in-process fake DNS server (the `backend_rfc2136_test.go` harness) with

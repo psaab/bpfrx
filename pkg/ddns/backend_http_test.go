@@ -234,6 +234,163 @@ func TestGenericSuccessSubstringMismatch(t *testing.T) {
 	}
 }
 
+// TestGenericOKTokenMatch is the #2838 FAIL-ON-REVERT guard for the generic
+// backend's success classifier. The old matcher used strings.Contains against a
+// default set that included the bare token "ok", so an explicit provider FAILURE
+// body that merely CONTAINS "ok"/"good" ("not ok", "error: ok token invalid",
+// "update not good") was wrongly classified as a completed update — Surface A
+// then recorded ownership and suppressed retry, leaving DNS stale. This test
+// pins token-bounded matching: a default-token success is a whole token / the
+// leading field of a line; a negative response that only contains a token as a
+// substring is a FAILURE. Reverting to the substring match turns the negative
+// cases green again, which fails this test.
+func TestGenericOKTokenMatch(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		// okResponse: "" means use the default token set; non-empty pins it.
+		okResponse string
+		wantOK     bool
+	}{
+		// Default-token SUCCESS cases must keep passing.
+		{name: "bare ok line", body: "ok\n", wantOK: true},
+		{name: "uppercase OK line", body: "OK\n", wantOK: true},
+		{name: "good with ip (dyndns2 shape)", body: "good 198.51.100.7\n", wantOK: true},
+		{name: "nochg with ip", body: "nochg 198.51.100.7\n", wantOK: true},
+		{name: "ok updated multiword", body: "OK updated\n", wantOK: true},
+		// The #2838 false-success cases: a substring hit that is NOT a success.
+		{name: "not ok", body: "not ok\n", wantOK: false},
+		{name: "error ok token invalid", body: "error: ok token invalid\n", wantOK: false},
+		{name: "update not good", body: "update not good\n", wantOK: false},
+		{name: "notok glued", body: "notok\n", wantOK: false},
+		{name: "html ok button", body: "<html><body><button>OK</button></body></html>\n", wantOK: false},
+		// Explicit ok-response is matched the same whole-token way.
+		{name: "explicit good success", body: "good\n", okResponse: "good", wantOK: true},
+		{name: "explicit good not matched in noise", body: "this is not good news\n", okResponse: "good", wantOK: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			b, err := newGenericBackend(&config.DDNSProvider{
+				Name: "g", Backend: "generic",
+				URLTemplate: srv.URL + "/u?h=%h&i=%i",
+				OKResponse:  tc.okResponse,
+			})
+			if err != nil {
+				t.Fatalf("newGenericBackend: %v", err)
+			}
+			err = b.UpsertLease(context.Background(), hostRecord(t, "h.example.net", "198.51.100.7"))
+			if tc.wantOK && err != nil {
+				t.Fatalf("body %q must be SUCCESS, got error: %v", tc.body, err)
+			}
+			if !tc.wantOK && err == nil {
+				t.Fatalf("body %q must be FAILURE, got success (false-success regression #2838)", tc.body)
+			}
+		})
+	}
+}
+
+// TestMatchesGenericOKUnit exercises the matcher directly, including the
+// dyndns2-shared default tokens (good/nochg) that the generic default set must
+// continue to accept, and confirms substring-only hits are rejected.
+func TestMatchesGenericOKUnit(t *testing.T) {
+	def := defaultGenericOKTokens
+	cases := []struct {
+		body   string
+		tokens []string
+		want   bool
+	}{
+		{"good", def, true},
+		{"nochg", def, true},
+		{"GOOD 1.2.3.4", def, true},
+		{"ok", def, true},
+		{"not ok", def, false},
+		{"update not good", def, false},
+		{"error: ok", def, false},
+		{"", def, false},
+		{"good", nil, false}, // empty token set never matches
+	}
+	for _, tc := range cases {
+		if got := matchesGenericOK(tc.body, tc.tokens); got != tc.want {
+			t.Errorf("matchesGenericOK(%q, %v) = %v, want %v", tc.body, tc.tokens, got, tc.want)
+		}
+	}
+}
+
+// TestGenericURLTemplateValidation is the #2841 fail-on-revert gate for the
+// runtime construction path. The generic url-template was validated PREFIX-ONLY
+// (a bare HasPrefix http(s):// check), so a host-less or wrong-scheme template
+// constructed a backend that then failed at the first publish. newGenericBackend
+// must now reject a malformed template (no host / wrong scheme) at construction,
+// with the SAME discipline as checkip's validateCheckIPURL, while remaining
+// TEMPLATE-AWARE: a valid template carrying inadyn %h/%i/%u/%p specifiers — even
+// a credential in the userinfo, which makes net/url.Parse FAIL — must be
+// accepted. Goes RED if the validation reverts to prefix-only or switches to a
+// naive url.Parse.
+func TestGenericURLTemplateValidation(t *testing.T) {
+	reject := []string{
+		"https://",           // scheme only, no host
+		"https:///upd?ip=%i", // host-less but http(s):// prefix
+		"ftp://host/upd",     // wrong scheme
+		"not a url",          // no scheme
+		"http//host/upd",     // missing colon -> no "://"
+		"://host/upd",        // empty scheme
+	}
+	for _, tmpl := range reject {
+		if err := validateGenericURLTemplate(tmpl); err == nil {
+			t.Errorf("validateGenericURLTemplate(%q) = nil, want error", tmpl)
+		}
+		if _, err := newGenericBackend(&config.DDNSProvider{
+			Name: "g", Backend: "generic", URLTemplate: tmpl,
+		}); err == nil {
+			t.Errorf("newGenericBackend(%q) = nil error, want rejection", tmpl)
+		}
+	}
+
+	accept := []string{
+		"https://api.example.net/update?host=%h&ip=%i", // %-specifiers in query
+		"http://api.example.net/upd",                   // plain http
+		"HTTPS://api.example.net/upd?ip=%i",            // uppercase scheme (RFC 3986 §3.1)
+		"https://user:%p@api.example.net/upd?host=%h",  // credential in userinfo (url.Parse FAILS here)
+		"https://api.example.net:8443/upd?ip=%i",       // explicit port
+	}
+	for _, tmpl := range accept {
+		if err := validateGenericURLTemplate(tmpl); err != nil {
+			t.Errorf("validateGenericURLTemplate(%q) = %v, want nil", tmpl, err)
+		}
+		if _, err := newGenericBackend(&config.DDNSProvider{
+			Name: "g", Backend: "generic", URLTemplate: tmpl,
+		}); err != nil {
+			t.Errorf("newGenericBackend(%q) = %v, want nil", tmpl, err)
+		}
+	}
+
+	// #2841 credential-leak fold: a malformed template that carries a secret in
+	// the userinfo or query must NOT echo that secret in the construction error
+	// (the error is logged via slog.Warn at the surface-A construction site). The
+	// template is run through config.RedactURL before embedding. Goes RED if the
+	// raw template is embedded again.
+	for _, tc := range []struct {
+		tmpl, secret string
+	}{
+		{"ftp://user:SUPERSECRET@host/upd", "SUPERSECRET"}, // wrong scheme + userinfo secret
+		{"https:///upd?token=SUPERSECRET", "SUPERSECRET"},  // host-less + query secret
+	} {
+		_, err := newGenericBackend(&config.DDNSProvider{
+			Name: "g", Backend: "generic", URLTemplate: tc.tmpl,
+		})
+		if err == nil {
+			t.Fatalf("newGenericBackend(%q) = nil error, want rejection", tc.tmpl)
+		}
+		if strings.Contains(err.Error(), tc.secret) {
+			t.Errorf("construction error leaked the secret %q: %v", tc.secret, err)
+		}
+	}
+}
+
 func TestGenericRenderUnit(t *testing.T) {
 	got := renderGenericURL("https://x/u?h=%h&i=%i&p=%p&lit=%%", "host.tld", "1.2.3.4", "", "p@ss")
 	if !strings.Contains(got, "h=host.tld") || !strings.Contains(got, "i=1.2.3.4") {

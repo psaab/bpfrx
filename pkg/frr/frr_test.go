@@ -528,7 +528,7 @@ func TestGeneratePolicyOptions_MultiTermOnMatchNext(t *testing.T) {
 					{Name: "t1", Community: "65000:100"},
 					// Term 2: set local-preference + accept → terminating
 					// permit, NO on-match next.
-					{Name: "t2", LocalPreference: 200, Action: "accept"},
+					{Name: "t2", LocalPreference: 200, HasLocalPreference: true, Action: "accept"},
 				},
 				DefaultAction: "reject",
 			},
@@ -577,7 +577,7 @@ func TestGeneratePolicyOptions_TerminatingTermNoOnMatchNext(t *testing.T) {
 			"ACCEPT-ONE": {
 				Name: "ACCEPT-ONE",
 				Terms: []*config.PolicyTerm{
-					{Name: "t1", LocalPreference: 150, Action: "accept"},
+					{Name: "t1", LocalPreference: 150, HasLocalPreference: true, Action: "accept"},
 				},
 				DefaultAction: "reject",
 			},
@@ -1176,13 +1176,15 @@ func TestGeneratePolicyOptionsRouteMapAttributes(t *testing.T) {
 				Name: "SET-ATTRS",
 				Terms: []*config.PolicyTerm{
 					{
-						Name:            "t1",
-						FromProtocols:   []string{"bgp"},
-						Action:          "accept",
-						LocalPreference: 200,
-						Metric:          100,
-						Community:       "65000:100",
-						Origin:          "igp",
+						Name:               "t1",
+						FromProtocols:      []string{"bgp"},
+						Action:             "accept",
+						LocalPreference:    200,
+						HasLocalPreference: true,
+						Metric:             100,
+						HasMetric:          true,
+						Community:          "65000:100",
+						Origin:             "igp",
 					},
 				},
 				DefaultAction: "reject",
@@ -1355,6 +1357,87 @@ func TestBGPDualStackGroupActivatesByAddressVersion(t *testing.T) {
 	}
 	if v6inV4 {
 		t.Errorf("IPv6 neighbor 2001:db8::2 must NOT be activated under address-family ipv4 unicast\n%s", got)
+	}
+}
+
+// TestPolicyCommunityOperations is the end-to-end fail-on-revert guard for
+// #2848: a policy term with `then community add <v>` must render
+// `set community <v> additive`, `then community delete <name>` must render
+// `set comm-list <name> delete`, `then community set <v>` (and the legacy bare
+// `then community <v>`) must render the whole-attribute replace
+// `set community <v>`, and `then community none` must render
+// `set community none`. Before the operation support, every form collapsed onto
+// the replace clause (`set community <v>`), which wiped upstream-set communities
+// — a vSRX parity gap. RED if the operation handling is reverted (the compiler
+// would drop the op fields, or the renderer would emit `set community` for all
+// forms).
+//
+// Driven through the full ParseSetCommand + SetPath + CompileConfig +
+// generatePolicyOptions path so the schema (multi-value `then community` leaf),
+// the compiler (applyCommunityAction), and the FRR renderer are all exercised.
+func TestPolicyCommunityOperations(t *testing.T) {
+	tree := &config.ConfigTree{}
+	setCommands := []string{
+		// add → additive append
+		"set policy-options policy-statement P term t_add from protocol bgp",
+		"set policy-options policy-statement P term t_add then community add 65000:111",
+		// delete → comm-list delete (by community-list name)
+		"set policy-options policy-statement P term t_del from protocol bgp",
+		"set policy-options policy-statement P term t_del then community delete MYLIST",
+		// set → whole-attribute replace
+		"set policy-options policy-statement P term t_set from protocol bgp",
+		"set policy-options policy-statement P term t_set then community set 65000:222",
+		// bare → legacy replace form
+		"set policy-options policy-statement P term t_bare from protocol bgp",
+		"set policy-options policy-statement P term t_bare then community 65000:333",
+		// none → strip all
+		"set policy-options policy-statement P term t_none from protocol bgp",
+		"set policy-options policy-statement P term t_none then community none",
+		// terminating term so the policy is not all fall-through
+		"set policy-options policy-statement P term t_end then accept",
+	}
+	for _, cmd := range setCommands {
+		path, err := config.ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := config.CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	m := New()
+	got := m.generatePolicyOptions(&cfg.PolicyOptions)
+
+	checks := []struct {
+		desc string
+		want string
+	}{
+		{"add → additive append", " set community 65000:111 additive\n"},
+		{"delete → comm-list delete", " set comm-list MYLIST delete\n"},
+		{"set → whole-attribute replace", " set community 65000:222\n"},
+		{"bare → legacy replace form", " set community 65000:333\n"},
+		{"none → strip all", " set community none\n"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(got, c.want) {
+			t.Errorf("#2848 %s: missing %q in:\n%s", c.desc, c.want, got)
+		}
+	}
+
+	// The `add` clause must NOT degrade to a plain replace (the revert
+	// behavior): `set community 65000:111` WITHOUT the `additive` suffix would
+	// overwrite upstream communities.
+	if strings.Contains(got, " set community 65000:111\n") {
+		t.Errorf("#2848 add operation rendered as a plain replace (missing `additive`):\n%s", got)
+	}
+	// The `delete` clause must NOT render as a `set community` replace.
+	if strings.Contains(got, " set community MYLIST") {
+		t.Errorf("#2848 delete operation rendered as `set community` instead of `set comm-list ... delete`:\n%s", got)
 	}
 }
 
@@ -3054,6 +3137,7 @@ func TestGeneratePolicyOptionsCommunityListAndMetricType(t *testing.T) {
 						Action:        "accept",
 						MetricType:    1,
 						Metric:        100,
+						HasMetric:     true,
 					},
 					{
 						Name:       "t2",
@@ -3758,8 +3842,9 @@ func TestPolicyMixedFamilyRouteFilterSplit(t *testing.T) {
 						{Prefix: "10.0.0.0/8", MatchType: "orlonger"},
 						{Prefix: "2001:db8::/32", MatchType: "orlonger"},
 					},
-					LocalPreference: 200,
-					Action:          "accept",
+					LocalPreference:    200,
+					HasLocalPreference: true,
+					Action:             "accept",
 				},
 			}, DefaultAction: "reject"},
 		},
@@ -5093,4 +5178,145 @@ func TestPolicyTermSingleMatch_NoExtraSequences(t *testing.T) {
 	if !strings.Contains(got, "route-map P permit 10\n") || !strings.Contains(got, "route-map P deny 20\n") {
 		t.Errorf("single-match term must keep historical seq numbers (10, 20):\n%s", got)
 	}
+}
+
+// TestGeneratePolicyOptionsMetricZero is the #2847 fail-on-revert guard.
+//
+// A route-map `set metric N` / BGP MED of 0 is a valid traffic-engineering
+// value (advertise a highly preferred route). Before #2847 the renderer
+// gated the clause on `term.Metric > 0`, so an explicitly configured
+// `then metric 0` silently emitted nothing and the operator's MED never
+// reached FRR. The fix records presence (PolicyTerm.HasMetric, set by the
+// compiler whenever the `metric` leaf is parsed) and the renderer emits the
+// clause on presence, not on value > 0.
+//
+// This test drives the full config path (ParseSetCommand -> SetPath ->
+// CompileConfig -> generatePolicyOptions) for three cases:
+//   - metric 0   -> "set metric 0" MUST be rendered (RED if reverted to >0)
+//   - metric unset -> NO "set metric" clause
+//   - metric 50  -> "set metric 50" still rendered
+func TestGeneratePolicyOptionsMetricZero(t *testing.T) {
+	compileAndRender := func(t *testing.T, cmds []string) string {
+		t.Helper()
+		tree := &config.ConfigTree{}
+		for _, cmd := range cmds {
+			path, err := config.ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%q): %v", cmd, err)
+			}
+		}
+		cfg, err := config.CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		m := &Manager{frrConf: "/dev/null"}
+		return m.generatePolicyOptions(&cfg.PolicyOptions)
+	}
+
+	t.Run("metric_zero_emitted", func(t *testing.T) {
+		got := compileAndRender(t, []string{
+			"set policy-options policy-statement MED0 term t from protocol bgp",
+			"set policy-options policy-statement MED0 term t then metric 0",
+			"set policy-options policy-statement MED0 term t then accept",
+		})
+		if !strings.Contains(got, "set metric 0\n") {
+			t.Errorf("metric 0 must render a `set metric 0` clause (#2847); got:\n%s", got)
+		}
+	})
+
+	t.Run("metric_unset_not_emitted", func(t *testing.T) {
+		got := compileAndRender(t, []string{
+			"set policy-options policy-statement NOMED term t from protocol bgp",
+			"set policy-options policy-statement NOMED term t then accept",
+		})
+		if strings.Contains(got, "set metric") {
+			t.Errorf("an unconfigured metric must render no `set metric` clause; got:\n%s", got)
+		}
+	})
+
+	t.Run("metric_nonzero_emitted", func(t *testing.T) {
+		got := compileAndRender(t, []string{
+			"set policy-options policy-statement MED50 term t from protocol bgp",
+			"set policy-options policy-statement MED50 term t then metric 50",
+			"set policy-options policy-statement MED50 term t then accept",
+		})
+		if !strings.Contains(got, "set metric 50\n") {
+			t.Errorf("metric 50 must still render `set metric 50`; got:\n%s", got)
+		}
+	})
+}
+
+// TestGeneratePolicyOptionsLocalPreferenceZero is the #2857 fail-on-revert
+// guard, the direct sibling of TestGeneratePolicyOptionsMetricZero (#2847).
+//
+// A route-map `set local-preference 0` is a valid BGP value: it maximally
+// deprioritizes a route within the AS. Before #2857 the renderer gated the
+// clause on `term.LocalPreference > 0`, so an explicitly configured
+// `then local-preference 0` silently emitted nothing and the operator's
+// intent never reached FRR (FRR's route-map YANG accepts local-preference 0).
+// The fix records presence (PolicyTerm.HasLocalPreference, set by the
+// compiler whenever the `local-preference` leaf is parsed) and the renderer
+// emits the clause on presence, not on value > 0.
+//
+// This test drives the full config path (ParseSetCommand -> SetPath ->
+// CompileConfig -> generatePolicyOptions) for three cases:
+//   - local-preference 0   -> "set local-preference 0" MUST be rendered
+//     (RED if reverted to >0)
+//   - local-preference unset -> NO "set local-preference" clause
+//   - local-preference 200 -> "set local-preference 200" still rendered
+func TestGeneratePolicyOptionsLocalPreferenceZero(t *testing.T) {
+	compileAndRender := func(t *testing.T, cmds []string) string {
+		t.Helper()
+		tree := &config.ConfigTree{}
+		for _, cmd := range cmds {
+			path, err := config.ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%q): %v", cmd, err)
+			}
+		}
+		cfg, err := config.CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		m := &Manager{frrConf: "/dev/null"}
+		return m.generatePolicyOptions(&cfg.PolicyOptions)
+	}
+
+	t.Run("local_preference_zero_emitted", func(t *testing.T) {
+		got := compileAndRender(t, []string{
+			"set policy-options policy-statement LP0 term t from protocol bgp",
+			"set policy-options policy-statement LP0 term t then local-preference 0",
+			"set policy-options policy-statement LP0 term t then accept",
+		})
+		if !strings.Contains(got, "set local-preference 0\n") {
+			t.Errorf("local-preference 0 must render a `set local-preference 0` clause (#2857); got:\n%s", got)
+		}
+	})
+
+	t.Run("local_preference_unset_not_emitted", func(t *testing.T) {
+		got := compileAndRender(t, []string{
+			"set policy-options policy-statement NOLP term t from protocol bgp",
+			"set policy-options policy-statement NOLP term t then accept",
+		})
+		if strings.Contains(got, "set local-preference") {
+			t.Errorf("an unconfigured local-preference must render no `set local-preference` clause; got:\n%s", got)
+		}
+	})
+
+	t.Run("local_preference_nonzero_emitted", func(t *testing.T) {
+		got := compileAndRender(t, []string{
+			"set policy-options policy-statement LP200 term t from protocol bgp",
+			"set policy-options policy-statement LP200 term t then local-preference 200",
+			"set policy-options policy-statement LP200 term t then accept",
+		})
+		if !strings.Contains(got, "set local-preference 200\n") {
+			t.Errorf("local-preference 200 must still render `set local-preference 200`; got:\n%s", got)
+		}
+	})
 }

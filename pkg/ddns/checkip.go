@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // checkip.go: the optional external check-IP address source (#2691 P3, plan
@@ -62,6 +64,17 @@ func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 boo
 		return netip.Addr{}, false
 	}
 	return parseCheckIPBody(string(body), wantV4, allowlist)
+}
+
+// NewCheckIPClient builds the HTTP client a checkip probe should use, bound to
+// the provider's configured source-address / destination-interface / routing-
+// instance (#2846) so the external "what is my IP" query egresses from the SAME
+// source as the DDNS updates do — not the kernel default route. A malformed
+// source-address returns the unbound default client plus the error so the caller
+// can log it and degrade gracefully (a checkip miss is a transient observation,
+// never a withdraw). A nil provider yields the unbound default client, no error.
+func NewCheckIPClient(p *config.DDNSProvider) (*http.Client, error) {
+	return newProviderHTTPClient(p)
 }
 
 // parseCheckIPBody scans a checkip response body for the first valid address of
@@ -182,21 +195,42 @@ func isAllowlisted(a netip.Addr, allowlist []netip.Addr) bool {
 	return false
 }
 
-// ParseAllowlist parses a comma/space-separated list of bogus addresses into a
-// slice for CheckIP. Unparseable entries are skipped. Convenience for the daemon
-// wiring (the provider/global config carries the allowlist as a string).
-func ParseAllowlist(s string) []netip.Addr {
+// ParseAllowlistChecked parses a comma/space-separated list of bogus-IP
+// addresses into a slice for CheckIP and ALSO returns the tokens that failed to
+// parse. The allowlist is a safety gate: an operator typo (e.g. "8.8.8.8x")
+// must not be silently discarded, or the checkip parser accepts a bogus/anycast
+// IP the operator meant to suppress — exactly the class the allowlist exists to
+// prevent (#2839). Callers surface the malformed tokens (commit-time warning in
+// the config compiler; once-per-provider runtime log in the daemon wiring).
+func ParseAllowlistChecked(s string) (list []netip.Addr, malformed []string) {
 	if strings.TrimSpace(s) == "" {
-		return nil
+		return nil, nil
 	}
 	fields := strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' })
 	out := make([]netip.Addr, 0, len(fields))
 	for _, f := range fields {
-		if a, err := netip.ParseAddr(strings.TrimSpace(f)); err == nil {
+		tok := strings.TrimSpace(f)
+		if tok == "" {
+			continue
+		}
+		if a, err := netip.ParseAddr(tok); err == nil {
 			out = append(out, a.Unmap())
+		} else {
+			malformed = append(malformed, tok)
 		}
 	}
-	return out
+	return out, malformed
+}
+
+// ParseAllowlist parses a comma/space-separated list of bogus addresses into a
+// slice for CheckIP. Unparseable entries are skipped (use ParseAllowlistChecked
+// to also recover the malformed tokens — the daemon and compiler surface them so
+// a typo can no longer silently shrink the safety gate, #2839). Convenience for
+// the daemon wiring (the provider/global config carries the allowlist as a
+// string).
+func ParseAllowlist(s string) []netip.Addr {
+	list, _ := ParseAllowlistChecked(s)
+	return list
 }
 
 // AddressSourceCheckIP is the per-scope selection for the external checkip source
@@ -209,14 +243,17 @@ const AddressSourceCheckIP AddressSource = "checkip"
 // at runtime construction (CheckIP) rather than spinning forever as a phantom
 // "transient" observation failure (#2773). It requires an http(s) scheme AND a
 // host: http.NewRequest accepts ftp://, "not a url", and a host-less "http://",
-// none of which can ever fetch a public address.
+// none of which can ever fetch a public address. The scheme check is
+// case-INSENSITIVE per RFC 3986 §3.1 ("HTTPS://host" is valid), so it parses
+// first and compares the parsed scheme with EqualFold rather than a
+// case-sensitive HasPrefix on the raw string (#2842).
 func validateCheckIPURL(u string) error {
-	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-		return fmt.Errorf("ddns checkip: url %q must be http(s)", u)
-	}
 	parsed, err := url.Parse(u)
 	if err != nil {
 		return fmt.Errorf("ddns checkip: url %q is not a valid URL: %w", u, err)
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return fmt.Errorf("ddns checkip: url %q must be http(s)", u)
 	}
 	if parsed.Host == "" {
 		return fmt.Errorf("ddns checkip: url %q has no host", u)

@@ -152,20 +152,35 @@ impl StaticNatTable {
     /// miss the whole-address entry keyed on `None` is the fallback. When the
     /// matched entry carries a `mapped_port`, the decision rewrites the
     /// destination port too.
+    ///
+    /// #2864: the zone constraint is evaluated PER CANDIDATE, not once after
+    /// the `(port, None)` precedence is resolved. Otherwise a port-specific
+    /// entry whose `from_zone` does not match the packet's ingress zone would
+    /// short-circuit to `None` and never try the whole-address `(dst_ip, None)`
+    /// fallback, silently bypassing a legitimate whole-address DNAT rule. The
+    /// port-specific entry still wins when its zone DOES match; only on a
+    /// zone-fail (or a port miss) do we fall back to the whole-address entry
+    /// and validate ITS zone.
     pub(crate) fn match_dnat_with_counter(
         &self,
         dst_ip: IpAddr,
         dst_port: u16,
         ingress_zone: &str,
     ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
-        // Port-specific entry takes precedence over the whole-address entry.
+        // Per-candidate zone gate: an entry matches only when its zone
+        // constraint is empty (any zone) or equals the packet's ingress zone.
+        let zone_ok = |entry: &&StaticNatEntry| {
+            entry.from_zone.is_empty() || entry.from_zone == ingress_zone
+        };
+        // Port-specific entry takes precedence over the whole-address entry,
+        // but only if its OWN zone check passes. On a port miss OR a
+        // port-specific zone mismatch, fall back to the whole-address entry
+        // (which is then zone-checked on its own).
         let entry = self
             .dnat
             .get(&(dst_ip, Some(dst_port)))
-            .or_else(|| self.dnat.get(&(dst_ip, None)))?;
-        if !entry.from_zone.is_empty() && entry.from_zone != ingress_zone {
-            return None;
-        }
+            .filter(zone_ok)
+            .or_else(|| self.dnat.get(&(dst_ip, None)).filter(zone_ok))?;
         Some((
             NatDecision {
                 rewrite_src: None,
