@@ -49,6 +49,27 @@ This is the empty-view route (RFC 3413), chosen over an `authorizationError` /
 `snmpUnknownContexts` report because it is the standard, simplest result for a
 single-context agent and needs no new error-counter MIB objects.
 
+## SNMPv3 security levels (RFC 3414 §5)
+
+RFC 3414 defines exactly three USM security levels, encoded in the two
+low `msgFlags` bits:
+
+- **noAuthNoPriv** — both flags clear (`0x00`): no HMAC, no encryption.
+- **authNoPriv** — auth flag set (`0x01`): HMAC-verified, plaintext PDU.
+- **authPriv** — both flags set (`0x03`): HMAC-verified and encrypted.
+
+The fourth bit combination — privacy set, authentication clear
+(`msgFlags = 0x02`, "noAuthPriv") — is **not a valid level**: an
+encrypted message must be authenticated. `handleV3Packet` rejects it
+**before** any authentication, decryption, or PDU execution. The agent
+**drops** the message (returns nothing) rather than emitting a report,
+because with no authentication it cannot produce an authenticated reply
+at the requested security level and an unauthenticated report would
+itself be unverifiable (#2681). Accepting noAuthPriv would let a sender
+who can supply a decryptable PDU bypass HMAC and timeliness verification
+entirely — its scopedPDU would be decrypted and executed with no auth.
+The three valid levels are unaffected.
+
 ## SNMPv3 USM timeliness and replay protection (RFC 3414 §3.2)
 
 Authenticating a request proves the sender holds the user's key; it does
