@@ -1,3 +1,28 @@
+## 2026-06-25 — #2608: SOCK_CLOEXEC on all raw/datagram control sockets via pkg/linuxsock
+
+- **Timestamp**: 2026-06-25
+- **Action**: A raw `unix.Socket(2)` is not close-on-exec by default, so
+  every bare raw AF_PACKET/raw-ICMP/datagram fd leaked into the helpers
+  xpfd fork-execs (frr-reload.py, swanctl, DHCP helpers) — an fd leak and
+  a raw-frame security boundary (#2476 fixed only the VRRP receiver).
+  Added `pkg/linuxsock` SSOT factory `Socket()` that ORs `SOCK_CLOEXEC`
+  atomically into the type, and routed all 13 sibling sites through it
+  (cluster GARP/NDP x6, LLDP rx/tx, HA fabric ICMP probes x3, userspace
+  NAPI probes x4, DHCP-relay L2 send). Added `TestNoDirectUnixSocket`
+  go/ast canary (walks every production .go under pkg/, fails on a new
+  direct `unix.Socket(...)` call outside the allowlist) + factory unit
+  test (seam-captured type flags) + real-fd `F_GETFD` CLOEXEC assert.
+  Fail-on-revert proven for both the canary (reverted call site → RED)
+  and the factory test (dropped CLOEXEC → RED). Allowlist: linuxsock
+  itself + pkg/vrrp's pre-#2476 receiver (pinned by its own test).
+  go build/vet/gofmt clean; affected-package tests green (pre-existing
+  pkg/ra TestT2a flake unrelated, fails on clean origin/master too).
+- **File(s)**: pkg/linuxsock/linuxsock.go, pkg/linuxsock/linuxsock_test.go,
+  pkg/linuxsock/canary_test.go, pkg/linuxsock/README.md,
+  pkg/cluster/garp.go, pkg/lldp/lldp.go, pkg/dhcprelay/l2send_linux.go,
+  pkg/daemon/daemon_ha_fabric.go, pkg/dataplane/userspace/process.go,
+  docs/engineering-style.md, _Log.md
+
 ## 2026-06-25 — #2406 r2: dnat_table KEY port byte-order (host-order; fixes latent v4)
 
 - **Timestamp**: 2026-06-25
@@ -15368,3 +15393,14 @@ top.
   left untouched).
 - **File(s)**: userspace-dp/src/state_writer.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+  **Action**: #2404 — IPsec responder-only / %any dynamic-IP gateway. Added
+  `IPsecGateway.ResponderOnly` flag set by `compileIKE`/`compileIPsec` when a
+  `dynamic` block carries no hostname; strict validator
+  (`validateIPsecGatewayReferencesStrict`) now accepts such a gateway;
+  swanctl render (`resolveRemoteAddr`) emits `remote_addrs = %any`. Wired the
+  `dynamic { hostname <fqdn> }` child into the #1319 setSchema (both gateway
+  copies). Added fail-on-revert tests (proved RED on revert, restored).
+  **File(s)**: pkg/config/types_security.go, pkg/config/compiler_ipsec.go,
+  pkg/config/schema_security.go, pkg/ipsec/policy.go,
+  pkg/config/parser_security_test.go, pkg/ipsec/ipsec_test.go,
+  docs/config-schema.md, _Log.md

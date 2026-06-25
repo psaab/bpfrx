@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync"
 
+	"github.com/psaab/xpf/pkg/linuxsock"
 	"golang.org/x/sys/unix"
 )
 
@@ -53,7 +54,7 @@ func newL2Sender(ifaceName string) (*l2Sender, error) {
 	if err != nil {
 		return nil, fmt.Errorf("interface lookup: %w", err)
 	}
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htonsLocal(unix.ETH_P_IP)))
+	fd, err := linuxsock.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htonsLocal(unix.ETH_P_IP)))
 	if err != nil {
 		return nil, fmt.Errorf("raw socket: %w", err)
 	}

@@ -359,7 +359,9 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			}},
 			"local-identity":  {desc: "Local IKE identity (type and value)", children: nil},
 			"remote-identity": {desc: "Remote IKE identity (type and value)", children: nil},
-			"dynamic":         {desc: "Dynamic peer (hostname <fqdn>)", children: nil},
+			"dynamic": {desc: "Dynamic peer (peer has a dynamic IP). With `hostname <fqdn>` the peer is DNS-resolved; a bare `dynamic` block marks a responder-only peer (remote_addrs = %any, #2404)", children: map[string]*schemaNode{
+				"hostname": {desc: "Dynamic peer FQDN (DNS-resolved)", args: 1, placeholder: "<fqdn>", children: nil},
+			}},
 		}},
 	}},
 	"ipsec": {desc: "IPsec configuration", children: map[string]*schemaNode{
@@ -413,7 +415,9 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			}},
 			"local-identity":  {desc: "Local IKE identity (type and value)", children: nil},
 			"remote-identity": {desc: "Remote IKE identity (type and value)", children: nil},
-			"dynamic":         {desc: "Dynamic peer (hostname <fqdn>)", children: nil},
+			"dynamic": {desc: "Dynamic peer (peer has a dynamic IP). With `hostname <fqdn>` the peer is DNS-resolved; a bare `dynamic` block marks a responder-only peer (remote_addrs = %any, #2404)", children: map[string]*schemaNode{
+				"hostname": {desc: "Dynamic peer FQDN (DNS-resolved)", args: 1, placeholder: "<fqdn>", children: nil},
+			}},
 		}},
 		"vpn": {desc: "IPsec VPN tunnel name", args: 1, placeholder: "<vpn-name>", children: map[string]*schemaNode{
 			"bind-interface":    {desc: "XFRM tunnel interface to bind", args: 1, placeholder: "<interface-name>", children: nil},
