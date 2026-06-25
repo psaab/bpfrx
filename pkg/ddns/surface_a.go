@@ -227,27 +227,51 @@ func newSurfaceAManagerForTesting(statePath string, backend DNSUpdater, now func
 }
 
 // productionSurfaceABackend resolves a provider-catalog entry into a live
-// Backend (plan §5.2). P2 ships the RFC 2136 backend only; the HTTP providers
-// (dyndns2/Cloudflare/Route53/generic) are P3 — an unknown backend resolves to
-// the no-op (logged) so a P3-only provider config does not wedge P2.
-func productionSurfaceABackend(p *config.DDNSProvider, fqdn string, ttl int) (DNSUpdater, error) {
+// Backend (plan §5.2). The rfc2136 backend (P2) and the HTTP backends — dyndns2,
+// cloudflare, route53, generic (P3) — are all siblings behind the SAME
+// DNSUpdater interface, so the Surface A engine drives every one identically. A
+// backend whose required fields are missing (or an unknown backend token)
+// resolves to the no-op (logged) so a half-configured provider degrades safely
+// at runtime instead of wedging — the commit warning already told the operator.
+func productionSurfaceABackend(p *config.DDNSProvider, fqdn string, _ int) (DNSUpdater, error) {
 	if p == nil {
 		return nopUpdater{}, nil
 	}
 	switch p.Backend {
 	case "rfc2136", "":
 		if p.UpdateServer == "" {
-			// Enabled provider with nothing to update — stay no-op (the commit
-			// warning already told the operator).
 			return nopUpdater{}, nil
 		}
 		return newSurfaceARFC2136(p, fqdn)
+	case "dyndns2":
+		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newDyndns2Backend(p) })
+	case "cloudflare":
+		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newCloudflareBackend(p) })
+	case "route53":
+		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newRoute53Backend(p) })
+	case "generic":
+		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newGenericBackend(p) })
 	default:
-		// dyndns2 / cloudflare / route53 / generic land in P3.
-		slog.Debug("ddns surface-a: provider backend not implemented in P2 (deferred to P3)",
+		slog.Warn("ddns surface-a: unknown provider backend; publishing nothing",
 			"provider", p.Name, "backend", p.Backend)
 		return nopUpdater{}, nil
 	}
+}
+
+// newSurfaceAHTTP adapts an HTTP-backend constructor to the
+// productionSurfaceABackend contract: a construction error (missing credential /
+// endpoint) degrades to the no-op (logged + the commit warning already fired)
+// rather than failing the whole reconcile pass, matching the rfc2136 fail-open
+// posture. The returned backend's UpsertLease/DeleteLease are then driven by the
+// engine exactly like rfc2136.
+func newSurfaceAHTTP(p *config.DDNSProvider, build func() (DNSUpdater, error)) (DNSUpdater, error) {
+	u, err := build()
+	if err != nil {
+		slog.Warn("ddns surface-a: HTTP provider not usable; publishing nothing",
+			"provider", p.Name, "backend", p.Backend, "err", err)
+		return nopUpdater{}, nil
+	}
+	return u, nil
 }
 
 // newSurfaceARFC2136 builds the live RFC 2136 backend for a Surface A provider.

@@ -943,6 +943,22 @@ func ddnsTSIGAlgorithmSupported(algo string) bool {
 	}
 }
 
+// ddnsKnownDyndns2NameSet mirrors pkg/ddns.dyndns2Endpoints for the commit-time
+// completeness warning ONLY (config cannot import pkg/ddns). It must stay in
+// sync with that table; a name here but missing there (or vice versa) only
+// affects whether the operator gets a "no server" warning, never runtime
+// behavior — the runtime resolver in pkg/ddns is authoritative.
+var ddnsKnownDyndns2NameSet = map[string]bool{
+	"dyn": true, "dyndns": true, "no-ip": true, "noip": true,
+	"duckdns": true, "dynu": true, "easydns": true, "dnsomatic": true,
+}
+
+// ddnsKnownDyndns2Provider reports whether a provider NAME is a recognized
+// built-in dyndns2 endpoint (so a missing `server` is not warned).
+func ddnsKnownDyndns2Provider(name string) bool {
+	return ddnsKnownDyndns2NameSet[strings.ToLower(name)]
+}
+
 // validateSurfaceADDNSWarnings emits WARN-only commit-time messages for the
 // Surface A router/interface-address DDNS bindings + provider catalog (#2691
 // P2). It never returns an error: the typed schema already accepts the leaves,
@@ -992,10 +1008,43 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 					"provider %q tsig-secret is set but tsig-key is empty; signing is "+
 					"disabled and the secret is ignored", name))
 			}
-		case "dyndns2", "cloudflare", "route53", "generic":
-			warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
-				"provider %q backend %q is reserved for the #2691 P3 HTTP providers and is "+
-				"not yet implemented; scopes using it publish nothing", name, backend))
+		case "dyndns2":
+			// dyndns2 needs either a server or a recognizable provider name to
+			// resolve the endpoint (#2691 P3). Credentials are optional (some
+			// token-in-password providers, e.g. duckdns, leave the username empty).
+			if p.Server == "" && !ddnsKnownDyndns2Provider(name) {
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q (backend dyndns2) has no server and no recognized provider "+
+					"name; scopes using it publish nothing (set `server`)", name))
+			}
+		case "cloudflare":
+			if p.APIToken.Reveal() == "" {
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q (backend cloudflare) has no api-token; scopes using it publish "+
+					"nothing", name))
+			}
+			if p.Zone == "" {
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q (backend cloudflare) has no zone; scopes using it publish "+
+					"nothing", name))
+			}
+		case "route53":
+			if p.AWSAccessKeyID == "" || p.AWSSecretAccessKey.Reveal() == "" {
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q (backend route53) is missing aws-access-key / aws-secret-key; "+
+					"scopes using it publish nothing", name))
+			}
+			if p.HostedZoneID == "" {
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q (backend route53) has no hosted-zone-id; scopes using it "+
+					"publish nothing", name))
+			}
+		case "generic":
+			if p.URLTemplate == "" {
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q (backend generic) has no url-template; scopes using it publish "+
+					"nothing", name))
+			}
 		}
 	}
 

@@ -431,9 +431,9 @@ func interfaceDynamicDNSSchema() *schemaNode {
 			desc:          "Where this interface's current address is observed",
 			args:          1,
 			valueType:     ValueEnumOf,
-			valueDesc:     "Address source (interface | dhcp)",
-			valueExamples: []string{"interface", "dhcp"},
-			validator:     ValidateEnum([]string{"interface", "dhcp"}),
+			valueDesc:     "Address source (interface | dhcp | checkip)",
+			valueExamples: []string{"interface", "dhcp", "checkip"},
+			validator:     ValidateEnum([]string{"interface", "dhcp", "checkip"}),
 			children:      nil,
 		},
 		"ttl": {

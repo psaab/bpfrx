@@ -14492,3 +14492,37 @@ top.
   "owned by another party (refused)"; reverting backendForOwned/Pass-1 →
   MAJOR-2 withdraw tests FAIL with "no live backend to withdraw". make
   test-failover + the LIVE standalone-VM publish remain for the parent.
+
+## 2026-06-25 — #2691 P3: HTTP provider backends (dyndns2/Cloudflare/Route53/generic) + checkip
+
+- **Timestamp**: 2026-06-25
+- **Action**: Implemented #2691 Phase P3 — the HTTP/API DDNS provider backends
+  behind the SAME `DNSUpdater` interface the rfc2136 backend uses, so the
+  Surface A engine drives them identically (change-detection, forced-refresh,
+  per-RG HA gate, error backoff all reused unchanged). Added: dyndns2 (one impl
+  behind many provider names + good/nochg/abuse/911 verdict parse), Cloudflare
+  (Bearer token, zone-id resolve → PATCH/POST/DELETE), Route 53 (minimal
+  self-contained SigV4 signer → ChangeResourceRecordSets UPSERT/DELETE), generic
+  templated (config-only %h/%i/%u/%p/%% URL + success-substring matcher), and the
+  opt-in checkip address source (bogus-IP validity gate + allowlist). Extended
+  the `system services dynamic-dns provider` catalog with the per-backend leaves
+  (every credential config.Secret-redacted), the per-interface `address-source`
+  enum with `checkip`, and the commit-time warn-validation for incomplete HTTP
+  providers. `productionSurfaceABackend` is the single backend resolution point;
+  a missing-credential HTTP backend degrades to the no-op (fail-open). Tests are
+  all mock-server (httptest) driven through the real backend impls.
+- **File(s)**: pkg/ddns/backend_http.go (new), backend_dyndns2.go (new),
+  backend_cloudflare.go (new), backend_route53.go (new), sigv4.go (new),
+  backend_generic.go (new), checkip.go (new), surface_a.go (factory switch);
+  pkg/config/types_system.go (DDNSProvider HTTP fields + String redaction),
+  compiler_system.go (compile leaves), schema_system.go + schema_interfaces.go
+  (schema leaves + checkip enum), compiler_validate_warn.go (HTTP provider
+  warnings); pkg/daemon/daemon_ddns_surface_a.go (checkip source + observer);
+  tests: pkg/ddns/backend_http_test.go, backend_cloudflare_test.go,
+  backend_route53_test.go, sigv4_test.go, checkip_test.go, surface_a_http_test.go,
+  pkg/config/compiler_p3_http_providers_test.go; docs: pkg/ddns/README.md,
+  docs/config-schema.md, docs/research/ddns-world-class/plan.md (P3 SHIPPED).
+- **Gates**: go build ./... clean; go test ./pkg/ddns/... ./pkg/config/...
+  ./pkg/daemon/... green; go test -race ./pkg/ddns/... green; go vet clean;
+  gofmt clean. Deferred (parent lab gate): a LIVE publish against a real
+  provider (no creds/network in CI — mock-server tests are the merge gate).

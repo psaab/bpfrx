@@ -1,0 +1,120 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+// compiler_p3_http_providers_test.go: #2691 P3 — the dyndns2 / cloudflare /
+// route53 / generic provider backends compile their per-backend leaves
+// (credentials config.Secret-redacted) from the flat-set spelling, and the
+// commit-time warn-validation flags an incomplete HTTP provider. Fail-on-revert.
+
+func TestP3HTTPProvidersCompile(t *testing.T) {
+	tree := buildTree(t, []string{
+		// dyndns2 (token-in-password style; duckdns name resolves an endpoint).
+		"set system services dynamic-dns provider duckdns backend dyndns2",
+		"set system services dynamic-dns provider duckdns username myuser",
+		"set system services dynamic-dns provider duckdns password tok-secret-a",
+		// cloudflare.
+		"set system services dynamic-dns provider cf backend cloudflare",
+		"set system services dynamic-dns provider cf api-token cf-secret-b",
+		"set system services dynamic-dns provider cf zone example.net",
+		// route53.
+		"set system services dynamic-dns provider aws backend route53",
+		"set system services dynamic-dns provider aws aws-access-key AKID",
+		"set system services dynamic-dns provider aws aws-secret-key aws-secret-c",
+		"set system services dynamic-dns provider aws aws-region us-west-2",
+		"set system services dynamic-dns provider aws hosted-zone-id Z123ABC",
+		// generic templated + checkip.
+		"set system services dynamic-dns provider tmpl backend generic",
+		`set system services dynamic-dns provider tmpl url-template "https://dns.example/upd?h=%h&i=%i"`,
+		"set system services dynamic-dns provider tmpl ok-response good",
+		"set system services dynamic-dns provider tmpl checkip-url https://checkip.example/",
+		"set system services dynamic-dns provider tmpl checkip-allowlist 1.1.1.1,8.8.8.8",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	cat := cfg.System.Services.DynamicDNS
+	if cat == nil {
+		t.Fatal("provider catalog did not compile")
+	}
+
+	dd := cat.Providers["duckdns"]
+	if dd == nil || dd.Backend != "dyndns2" || dd.Username != "myuser" || dd.Password != "tok-secret-a" {
+		t.Fatalf("duckdns provider mismatch: %+v", dd)
+	}
+	cf := cat.Providers["cf"]
+	if cf == nil || cf.Backend != "cloudflare" || cf.APIToken != "cf-secret-b" || cf.Zone != "example.net" {
+		t.Fatalf("cf provider mismatch: %+v", cf)
+	}
+	aws := cat.Providers["aws"]
+	if aws == nil || aws.Backend != "route53" || aws.AWSAccessKeyID != "AKID" ||
+		aws.AWSSecretAccessKey != "aws-secret-c" || aws.AWSRegion != "us-west-2" || aws.HostedZoneID != "Z123ABC" {
+		t.Fatalf("aws provider mismatch: %+v", aws)
+	}
+	tmpl := cat.Providers["tmpl"]
+	if tmpl == nil || tmpl.Backend != "generic" ||
+		tmpl.URLTemplate != "https://dns.example/upd?h=%h&i=%i" || tmpl.OKResponse != "good" ||
+		tmpl.CheckIPURL != "https://checkip.example/" || tmpl.CheckIPAllowlist != "1.1.1.1,8.8.8.8" {
+		t.Fatalf("tmpl provider mismatch: %+v", tmpl)
+	}
+
+	// Every secret must be redacted in String() (logging hygiene; plan §8.1).
+	for _, p := range []*DDNSProvider{cf, aws, dd} {
+		s := p.String()
+		for _, secret := range []string{"cf-secret-b", "aws-secret-c", "tok-secret-a"} {
+			if strings.Contains(s, secret) {
+				t.Fatalf("provider %q String() leaked a secret: %s", p.Name, s)
+			}
+		}
+	}
+}
+
+func TestP3HTTPProviderHierarchicalCompiles(t *testing.T) {
+	// The brace form must compile identically to flat-set.
+	const cfgText = `system {
+  services {
+    dynamic-dns {
+      provider cf {
+        backend cloudflare;
+        api-token cf-secret-b;
+        zone example.net;
+      }
+    }
+  }
+}`
+	tree, perr := NewParser(cfgText).Parse()
+	if len(perr) != 0 {
+		t.Fatalf("Parse: %v", perr)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	cf := cfg.System.Services.DynamicDNS.Providers["cf"]
+	if cf == nil || cf.Backend != "cloudflare" || cf.APIToken != "cf-secret-b" || cf.Zone != "example.net" {
+		t.Fatalf("hierarchical cf provider mismatch: %+v", cf)
+	}
+}
+
+func TestP3IncompleteHTTPProviderWarns(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set system services dynamic-dns provider cf backend cloudflare", // no api-token, no zone
+		"set system services dynamic-dns provider aws backend route53",   // no keys/zone-id
+		"set system services dynamic-dns provider g backend generic",     // no url-template
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	warns := validateSurfaceADDNSWarnings(cfg)
+	joined := strings.Join(warns, "\n")
+	for _, want := range []string{"no api-token", "no zone", "aws-access-key", "no hosted-zone-id", "no url-template"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected a warning containing %q; got:\n%s", want, joined)
+		}
+	}
+}

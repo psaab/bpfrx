@@ -703,6 +703,48 @@ reserved for whole-dataplane selection where a rewrite shim
     replace / withdraw / per-RG gate / backoff), and
     `pkg/daemon/daemon_ddns_surface_a_test.go` (scope build + RG attribution +
     gate).
+- **#2691 P3 (HTTP provider backends + checkip — completes #2679):** added the
+  consumer/SaaS DNS backends behind the SAME `services dynamic-dns provider
+  <name>` catalog, so a provider is `backend dyndns2|cloudflare|route53|generic`
+  instead of `rfc2136`, with per-backend leaves. Every HTTP backend implements
+  the SAME `DNSUpdater` interface the rfc2136 backend does — the Surface A engine
+  (change-detection, forced-refresh, per-RG HA gate, error backoff) drives them
+  identically; only the wire mechanism differs (`pkg/ddns/backend_dyndns2.go`,
+  `backend_cloudflare.go`, `backend_route53.go`, `backend_generic.go`, the shared
+  `backend_http.go`, the minimal SigV4 signer `sigv4.go`).
+  - **New provider leaves** (all on `services dynamic-dns provider <name>`,
+    schema `ddnsServicesSchema()`, compiled by `compileDDNSProvider` —
+    credentials are `config.Secret`-redacted):
+    - dyndns2: `server` (endpoint host/URL; a known provider NAME like `duckdns`
+      / `no-ip` / `dyn` resolves a built-in endpoint), `username`, `password`.
+    - cloudflare: `api-token` (Bearer), `zone` (zone NAME; the zone id is
+      resolved at update time).
+    - route53: `aws-access-key`, `aws-secret-key`, `aws-region` (default
+      us-east-1), `hosted-zone-id` (SigV4-signed `ChangeResourceRecordSets`
+      UPSERT/DELETE).
+    - generic templated (config-only — no Go code per provider): `url-template`
+      (`%h` host, `%i` IP, `%u` user, `%p` pass, `%%` literal; quote the value —
+      `?`/`&`/`%` need quoting in a `set` command), `ok-response`
+      (success-substring matcher; default good/nochg/ok/true/updated).
+    - checkip (opt-in, behind-NAT address source): `checkip-url` +
+      `checkip-allowlist` (comma/space bogus addresses to ignore, e.g. the
+      embedded `1.1.1.1` in a /cdn-cgi/trace page). The per-interface binding's
+      `address-source` enum gains `checkip`.
+  - **Security** (plan §8.1): every credential is `config.Secret` (revealed only
+    at the transport boundary, never in a URL/error/log; `DDNSProvider.String()`
+    redacts all of them); HTTPS with system-trust cert+hostname verification
+    (no InsecureSkipVerify); bounded request timeout; capped response body.
+  - **Commit warnings** (`validateSurfaceADDNSWarnings`): an incomplete HTTP
+    provider (dyndns2 with no server + unknown name, cloudflare missing
+    api-token/zone, route53 missing keys/hosted-zone-id, generic missing
+    url-template) warns and publishes nothing at runtime (fail-open, never a
+    hard reject). Regression coverage:
+    `pkg/config/compiler_p3_http_providers_test.go`,
+    `pkg/ddns/backend_http_test.go` / `backend_cloudflare_test.go` /
+    `backend_route53_test.go` / `sigv4_test.go` / `checkip_test.go` /
+    `surface_a_http_test.go` (mock-server tests through the real backends).
+  - **Live-provider verify is the deferred lab gate** (no provider creds/network
+    in CI) — the mock-server tests are the merge gate.
 - **#2243 (DHCP-server static / fixed / reserved host bindings):** added a
   `static-binding <mac>` named-instance subtree under `services
   dhcp-local-server group <g> pool <p>` AND `services dhcpv6-local-server
