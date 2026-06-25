@@ -577,8 +577,13 @@ func TestRFC2136SkipExistingConflictSkips(t *testing.T) {
 		Enabled: true, Domain: "example.com", ConflictPolicy: "skip-existing",
 	}, &ptr, &conf)
 
-	if err := u.UpsertLease(context.Background(), recV4("exists.example.com", "10.0.1.5", 300)); err != nil {
-		t.Fatalf("skip-existing on a collision must NOT error: %v", err)
+	// skip-existing on a collision must REFUSE with the errDDNSConflictRefused
+	// sentinel (#2660) — not a silent nil success (which would let the manager
+	// record phantom ownership and a later release delete the third party's RR)
+	// and not a hard transport error.
+	err := u.UpsertLease(context.Background(), recV4("exists.example.com", "10.0.1.5", 300))
+	if !errors.Is(err, errDDNSConflictRefused) {
+		t.Fatalf("skip-existing on a collision must return the refusal sentinel; got %v", err)
 	}
 	if conf != 1 {
 		t.Errorf("conflict skip counter = %d, want 1", conf)
