@@ -15834,6 +15834,49 @@ top.
   userspace-dp/src/filter/tests.rs, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2501 — add per-session byte/packet accounting on the AF_XDP
+  forwarding hot path (worker-owned plain-u64 SessionCounters: fwd/rev
+  packets+bytes; account_packet on flow-cache hit + slow-path forward-build,
+  direction derived from the resolved entry, both directions folded onto the
+  canonical forward entry). Surfaced with NO new wire field: counters mirrored
+  into the BPF conntrack map by refresh_bpf_conntrack_last_seen (~1s, for `show
+  security flow session`) and harvested onto the close SessionDelta → written
+  into the SESSION_CLOSE RT_FLOW frame's already-reserved
+  [56:64]/[64:72]/[112:120]/[120:128] slots (NetFlow/IPFIX volume). Updated
+  Go flow.go doc + session README. Fail-on-revert tests added + proven RED.
+  **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/entry.rs, userspace-dp/src/session/install.rs,
+  userspace-dp/src/session/expire.rs, userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/ha.rs,
+  userspace-dp/src/afxdp/bpf_map/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/codec_tests.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  pkg/dataplane/userspace/flow.go, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2501 review fold (PR #2804 MERGE-NEEDS-MINOR finding 1) —
+  cut the FORWARD fast-path session probe count from 3→2. account_packet
+  now does a SINGLE record_by_key_mut resolve: reads is_reverse and (for the
+  dominant forward case) mutates the fwd counters under that one &mut borrow,
+  instead of the prior record_by_key + entry_by_key_mut double probe. Reverse
+  path still pays one extra probe to hop reverse→forward (fine — optimize the
+  bulk forward path). Also folded the near-dup iter_with_idle_and_counters
+  into iter_with_idle (extended its callback with the SessionCounters arg;
+  removed the now-test-only iter_with_idle_and_origin delegation), which also
+  cleared the dead-code warning my switch had introduced. 4 fail-on-revert
+  tests re-proven RED. Bulk established-flow fast path (flow_cache_hit.rs) is
+  now 2 keyed probes/packet (touch_if_stale + the merged account resolve),
+  down from 3.
+  **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/afxdp/bpf_map/mod.rs,
+  userspace-dp/src/session/tests.rs, _Log.md
   **Action**: #2458 — reject unknown non-empty CoS equal-flow-target-policy
   at the Rust helper boundary instead of silently mapping it to `Slowest`.
   `EqualFlowTargetPolicy::parse` is now fallible: `""`/`slowest`/`mean`/

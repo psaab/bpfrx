@@ -143,6 +143,14 @@ pub(crate) struct SessionDelta {
     /// wall-clock StartTime at emit time without depending on a wall-clock
     /// reading taken inside the GC pass. `0` means "unknown".
     pub(crate) last_seen_ns: u64,
+    /// #2501: the session's per-direction byte/packet counters at the moment
+    /// this delta was produced. Snapshotted from `SessionEntry.counters` so
+    /// the SESSION_CLOSE RT_FLOW frame (#2460) reports real NetFlow/IPFIX
+    /// volume in its already-reserved wire slots. Meaningful only on a Close
+    /// delta sourced from a live local entry; an Open delta and a
+    /// synthesized close that no longer has the entry carry the
+    /// `Default` (all-zero) value, which keeps the prior on-wire behavior.
+    pub(crate) counters: SessionCounters,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

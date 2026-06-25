@@ -109,6 +109,49 @@ ever being touched, then be reaped while still forwarding (an HA Close
 delta to the peer + BPF redirect-key deletion + a stale flow-cache
 descriptor out-living its session). UDP (60 s) was the most exposed.
 
+## Per-session byte/packet accounting (#2501)
+
+Each `SessionEntry` carries a `SessionCounters` (`fwd_packets`, `fwd_bytes`,
+`rev_packets`, `rev_bytes`) — plain `u64`s, not atomics, because the
+`SessionTable` is worker-owned and single-threaded (same precedent as
+`create_drops`). Every forwarded packet is accounted via
+`SessionTable::account_packet(key, len)` on the AF_XDP forwarding hot path:
+
+- the flow-cache fast path (`poll_descriptor/flow_cache_hit.rs`) accounts
+  every packet of an established flow;
+- the slow-path forward-build chokepoint (`poll_descriptor/mod.rs`, the
+  `ForwardCandidate | FabricRedirect` branch) accounts the packets that
+  reach the full forward-build — the first packet(s) of a flow before its
+  cache entry warms, and any non-cacheable flow (NAT64/NPTv6).
+
+`account_packet` derives the direction from the resolved entry rather than
+trusting the flow-cache `metadata.is_reverse` (which is always `false` —
+every cache entry is built from a forward-build decision). Both directions
+are folded onto the **single canonical forward entry**: a forward packet
+keys directly to it (`fwd`); a reverse packet keys to the reverse entry,
+whose `reverse_session_key(rev.key, nat)` recovers the forward tuple, and
+the volume lands on the forward entry's `rev`. This keeps the
+forward-only BPF-conntrack mirror and the forward-only SESSION_CLOSE
+harvest complete without a cross-entry combine or any dependence on the
+two entries' independent expiry ordering.
+
+Cost: the dominant forward direction is one warm `key_to_handle` probe +
+one `saturating_add`; the reverse direction pays one extra probe to hop
+reverse→forward. No allocation, no atomic, no cross-core traffic.
+
+Surfacing (no new wire field):
+
+- `refresh_bpf_conntrack_last_seen` (afxdp/bpf_map, ~1s GC cadence) writes
+  the counters into the BPF conntrack map value, so `show security flow
+  session` reports live volume (Go reads `FwdBytes`/`FwdPackets`/… from
+  that map today);
+- the close `SessionDelta` snapshots the entry's counters at expiry, and
+  `emit_session_close_rt_flow` writes them into the SESSION_CLOSE RT_FLOW
+  frame's already-reserved `[56:64]`/`[64:72]` (forward) and
+  `[112:120]`/`[120:128]` (reverse) wire slots — the slots the Go
+  `logging.DecodeRawEventRecord` already parses (previously hard-zeroed),
+  so NetFlow/IPFIX close records carry real volume.
+
 ## Standby retention (#2120)
 
 The Rust wheel now owns HA standby session retention — the contract the

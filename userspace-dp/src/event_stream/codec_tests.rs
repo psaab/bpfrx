@@ -281,6 +281,10 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
         1_700_000_123_000_000_000, // #2465: close instant Unix ns
         7,               // #2520: application id
         42,              // #2615: ingress ifindex
+        111,             // #2501: fwd packets
+        222_333,         // #2501: fwd bytes
+        44,              // #2501: rev packets
+        55_666,          // #2501: rev bytes
     );
 
     assert_eq!(frame.data[4], MSG_SESSION_CLOSE_RT_FLOW);
@@ -310,12 +314,17 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
     // NAT translated source IP/port.
     assert_eq!(&p[72..76], &[172, 16, 80, 8]);
     assert_eq!(u16::from_be_bytes([p[104], p[105]]), 40000);
-    // #2501: byte/packet counters are 0 until per-session accounting lands.
-    // Asserting they are 0 keeps the honest-zero contract explicit.
-    assert_eq!(u64::from_le_bytes(p[56..64].try_into().unwrap()), 0); // pkts
-    assert_eq!(u64::from_le_bytes(p[64..72].try_into().unwrap()), 0); // bytes
-    assert_eq!(u64::from_le_bytes(p[112..120].try_into().unwrap()), 0); // rev pkts
-    assert_eq!(u64::from_le_bytes(p[120..128].try_into().unwrap()), 0); // rev bytes
+    // #2501 fail-on-revert: the per-session forward/reverse byte+packet
+    // counters ride the reserved [56:64]/[64:72] (forward) and
+    // [112:120]/[120:128] (reverse) slots, LITTLE-endian, exactly where the
+    // Go logging.DecodeRawEventRecord reads SessionPackets/SessionBytes/
+    // RevPackets/RevBytes. Reverting the encoder to hard-zero these slots
+    // (the pre-#2501 behavior) makes the NetFlow/IPFIX close record report 0
+    // volume again — these assertions catch that.
+    assert_eq!(u64::from_le_bytes(p[56..64].try_into().unwrap()), 111); // fwd pkts
+    assert_eq!(u64::from_le_bytes(p[64..72].try_into().unwrap()), 222_333); // fwd bytes
+    assert_eq!(u64::from_le_bytes(p[112..120].try_into().unwrap()), 44); // rev pkts
+    assert_eq!(u64::from_le_bytes(p[120..128].try_into().unwrap()), 55_666); // rev bytes
     // #2465 fail-on-revert: the created stamp (offset 108, Unix seconds, LE)
     // and the record timestamp (offset 0, Unix ns, LE) must carry the real
     // session timestamps now, NOT 0. If the encoder drops these args the flow
@@ -366,6 +375,10 @@ fn test_encode_session_close_rt_flow_v6() {
         0,     // #2465: close instant Unix ns
         0,     // #2520: application id (unknown)
         0,     // #2615: ingress ifindex (unknown)
+        0,     // #2501: fwd packets
+        0,     // #2501: fwd bytes
+        0,     // #2501: rev packets
+        0,     // #2501: rev bytes
     );
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     assert_eq!(p[52], RT_FLOW_EVENT_SESSION_CLOSE);
@@ -406,6 +419,10 @@ fn test_session_close_rt_flow_log_gate_byte() {
             0, // #2465: close instant Unix ns
             0, // #2520: application id
             0, // #2615: ingress ifindex
+            0, // #2501: fwd packets
+            0, // #2501: fwd bytes
+            0, // #2501: rev packets
+            0, // #2501: rev bytes
         )
     };
     let gated_off = mk(false);
@@ -764,6 +781,7 @@ fn test_close_flags() {
         fabric_redirect_sync: true,
         created_ns: 0,
         last_seen_ns: 0,
+        counters: crate::session::SessionCounters::default(),
     };
     let flags = close_flags(&delta);
     assert_eq!(flags & FLAG_FABRIC_REDIRECT, FLAG_FABRIC_REDIRECT);

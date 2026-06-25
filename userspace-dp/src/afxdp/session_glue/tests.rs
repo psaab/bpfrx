@@ -4937,6 +4937,7 @@ fn flush_session_deltas_without_binding_reaches_global_consumers() {
         fabric_redirect_sync: false,
         created_ns: 0,
         last_seen_ns: 0,
+        counters: crate::session::SessionCounters::default(),
     };
 
     // Synthesize a binding identity with labels only — exactly what the
