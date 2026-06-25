@@ -15880,3 +15880,28 @@ top.
   pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
   pkg/api/metrics_test.go, pkg/api/metrics_descriptor_coverage_test.go,
   docs/userspace-native-gre-plan.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2734 — ECMP per-FLOW next-hop selection. The FIB picked the
+  equal-cost member by a fixed-seed hash of the DESTINATION IP only
+  (#2389), so every flow to one dst pinned to one member (no per-flow
+  spread). Threaded an optional per-flow ECMP hash through the
+  forwarding-resolution path: `select_route_next_hop` now takes a spread
+  hash that, on the session path, is the forward 5-tuple hashed with the
+  SAME per-boot seeded FxHasher the flow cache uses
+  (hot_hash_seed::hot_path_hash_seed, #2364) — no double-hash, one vetted
+  seed. New `lookup_forwarding_resolution_with_dynamic_for_flow` +
+  `ecmp_hash_flow`/`ecmp_hash_flow_seeded`; `_inner`/`_v4`/`_v6` carry an
+  `ecmp_flow_hash: Option<u64>` (None = per-destination fallback for
+  tunnel/WG outer + inject + bare-dst lookups). Flow-consistent (one flow
+  pins to one member, no intra-flow reorder), dead-NH fallback preserved
+  (reduce modulo live count), node-local seed (no cross-node hash-symmetry
+  invariant). Added a fail-on-revert spread test that drives the PRODUCTION
+  session path (RED-on-revert proven: per-dst collapses {11,22}->{11}) plus
+  a seeded-hash stability/spread test. No wire change (runtime selection);
+  protocol_wire green.
+  **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md, docs/multi-wan.md, _Log.md

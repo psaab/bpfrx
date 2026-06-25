@@ -140,7 +140,17 @@ fn lookup_forwarding_resolution_for_session_with_cache(
     if let Some(local) = super::interface_nat_local_resolution(forwarding, target) {
         return local;
     }
-    let resolved = lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target);
+    // #2734: spread ECMP equal-cost members by the per-FLOW 5-tuple hash
+    // (the session forward key) so distinct flows to the same destination
+    // take different paths, while every packet of one flow stays pinned to
+    // one member (the resolution is cached on the session entry, and the
+    // hash is deterministic within a boot).
+    let resolved = lookup_forwarding_resolution_with_dynamic_for_flow(
+        forwarding,
+        dynamic_neighbors,
+        target,
+        &flow.forward_key,
+    );
     match resolved.disposition {
         ForwardingDisposition::NoRoute | ForwardingDisposition::MissingNeighbor => {
             cached_session_resolution(forwarding, decision.resolution).unwrap_or(resolved)

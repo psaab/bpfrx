@@ -2287,6 +2287,7 @@ fn outer_neighbor_ifindex_non_tunnel_returns_egress_ifindex() {
         "inet.0",
         0,
         true,
+        None,
     );
     assert_eq!(resolution.tunnel_endpoint_id, 0);
     assert_eq!(
@@ -2477,6 +2478,7 @@ fn connected_routes_are_table_scoped_no_cross_vrf_leak() {
         "tenant-b.inet.0",
         0,
         true,
+        None,
     );
     assert_eq!(
         resolved.egress_ifindex, 202,
@@ -2491,6 +2493,7 @@ fn connected_routes_are_table_scoped_no_cross_vrf_leak() {
         "tenant-a.inet.0",
         0,
         true,
+        None,
     );
     assert_eq!(resolved_a.egress_ifindex, 101);
 }
@@ -2580,6 +2583,7 @@ fn ecmp_static_route_retains_all_next_hops_and_skips_dead() {
         "inet.0",
         0,
         true,
+        None,
     );
     assert_eq!(
         resolved.disposition,
@@ -2589,6 +2593,209 @@ fn ecmp_static_route_retains_all_next_hops_and_skips_dead() {
     assert_eq!(
         resolved.egress_ifindex, 22,
         "must egress the live next-hop's interface",
+    );
+}
+
+/// #2734: ECMP must spread by the per-FLOW 5-tuple, not per-destination.
+///
+/// Two equal-cost next-hops to the same prefix, BOTH neighbors live.
+/// Distinct flows to the SAME destination IP must spread across both
+/// members (per-flow), while every probe of ONE flow pins to a single
+/// member (flow consistency — no intra-flow reordering). The
+/// per-destination fallback (`None`) collapses every flow onto ONE member
+/// — that is the pre-#2734 behavior and the fail-on-revert guard: if the
+/// production path is reverted to per-dst selection, the spread assertion
+/// goes RED.
+#[test]
+fn ecmp_static_route_spreads_per_flow_not_per_destination() {
+    let snapshot = crate::ConfigSnapshot {
+        zones: vec![crate::ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+        }],
+        interfaces: vec![
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/1".to_string(),
+                zone: "wan".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                ifindex: 11,
+                hardware_addr: "02:00:00:00:00:11".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "192.0.2.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/2".to_string(),
+                zone: "wan".to_string(),
+                linux_name: "ge-0-0-2".to_string(),
+                ifindex: 22,
+                hardware_addr: "02:00:00:00:00:22".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "192.0.3.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        routes: vec![crate::RouteSnapshot {
+            table: "inet.0".to_string(),
+            family: "inet".to_string(),
+            destination: "203.0.113.0/24".to_string(),
+            next_hops: vec![
+                "192.0.2.2@ge-0/0/1".to_string(),
+                "192.0.3.2@ge-0/0/2".to_string(),
+            ],
+            discard: false,
+            next_table: String::new(),
+            preference: 5,
+        }],
+        // BOTH next-hop neighbors are resolved/live, so the live pool is
+        // the full set of equal-cost members.
+        neighbors: vec![
+            crate::NeighborSnapshot {
+                interface: "ge-0-0-1".to_string(),
+                ifindex: 11,
+                family: "inet".to_string(),
+                ip: "192.0.2.2".to_string(),
+                mac: "00:11:22:33:44:55".to_string(),
+                state: "reachable".to_string(),
+                router: true,
+                link_local: false,
+            },
+            crate::NeighborSnapshot {
+                interface: "ge-0-0-2".to_string(),
+                ifindex: 22,
+                family: "inet".to_string(),
+                ip: "192.0.3.2".to_string(),
+                mac: "00:11:22:33:44:66".to_string(),
+                state: "reachable".to_string(),
+                router: true,
+                link_local: false,
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+
+    let dst = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+    let make_flow = |src_port: u16| SessionFlow {
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+        dst_ip: dst,
+        forward_key: crate::session::SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+            dst_ip: dst,
+            src_port,
+            dst_port: 443,
+        },
+    };
+    // A non-LocalDelivery, non-tunnel, non-cacheable decision resolution so
+    // the production session path RE-RESOLVES via the flow hash (rather than
+    // returning a cached ForwardCandidate). This exercises the real wiring
+    // (`lookup_forwarding_resolution_for_session`), not just the helper.
+    let resolve_for_flow = |flow: &SessionFlow| {
+        let decision = SessionDecision {
+            resolution: no_route_resolution(None),
+            nat: NatDecision::default(),
+        };
+        lookup_forwarding_resolution_for_session(&state, &dynamic_neighbors, flow, decision)
+    };
+
+    // (a) Per-FLOW spread: distinct 5-tuples (varying source port) to the
+    // SAME destination must hit BOTH equal-cost members through the real
+    // session resolution path.
+    let mut egresses = std::collections::BTreeSet::new();
+    for src_port in 1024u16..1124 {
+        let resolved = resolve_for_flow(&make_flow(src_port));
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate,
+            "every live flow must forward",
+        );
+        egresses.insert(resolved.egress_ifindex);
+    }
+    assert_eq!(
+        egresses,
+        std::collections::BTreeSet::from([11, 22]),
+        "distinct flows to one dst must spread across BOTH ECMP members \
+         (per-flow), not pin to one — RED if reverted to per-destination",
+    );
+
+    // (b) Flow consistency: repeated probes of ONE flow pin to ONE member.
+    let one_flow = make_flow(1042);
+    let pinned = resolve_for_flow(&one_flow).egress_ifindex;
+    for _ in 0..50 {
+        let again = resolve_for_flow(&one_flow).egress_ifindex;
+        assert_eq!(
+            again, pinned,
+            "a single flow's packets must pin to one member (no reorder)",
+        );
+    }
+
+    // (c) Fail-on-revert: the per-DESTINATION path (None flow hash, the
+    // pre-#2734 behavior) collapses EVERY flow onto a SINGLE member —
+    // exactly the spread the per-flow path fixes.
+    let mut dst_egresses = std::collections::BTreeSet::new();
+    for src_port in 1024u16..1124 {
+        // The 5-tuple differs, but the per-dst path ignores it.
+        let _ = src_port;
+        let resolved = lookup_forwarding_resolution_v4(
+            &state,
+            Some(&dynamic_neighbors),
+            Ipv4Addr::new(203, 0, 113, 5),
+            "inet.0",
+            0,
+            true,
+            None,
+        );
+        dst_egresses.insert(resolved.egress_ifindex);
+    }
+    assert_eq!(
+        dst_egresses.len(),
+        1,
+        "per-destination ECMP must collapse all flows to one member \
+         (the bug #2734 fixes)",
+    );
+}
+
+/// #2734: the seeded per-flow ECMP hash is deterministic within a boot
+/// (flow consistency) and spreads distinct 5-tuples across the index
+/// space. Pin the seed so the assertions are stable across the parallel
+/// runner; production folds in the per-boot process seed.
+#[test]
+fn ecmp_flow_hash_is_stable_and_spreads() {
+    let key_a = crate::session::SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+        src_port: 1024,
+        dst_port: 443,
+    };
+    let mut key_b = key_a.clone();
+    key_b.src_port = 1025;
+
+    let seed = 0x1234_5678_9abc_def0u64;
+    // Intra-seed stability: same key, same hash (a flow never splits).
+    assert_eq!(
+        ecmp_hash_flow_seeded(seed, &key_a),
+        ecmp_hash_flow_seeded(seed, &key_a),
+    );
+    // Distinct 5-tuples map to distinct hashes under one seed (spread).
+    assert_ne!(
+        ecmp_hash_flow_seeded(seed, &key_a),
+        ecmp_hash_flow_seeded(seed, &key_b),
+    );
+    // Cross-seed reshuffle: a different per-boot seed remaps the flow.
+    assert_ne!(
+        ecmp_hash_flow_seeded(seed, &key_a),
+        ecmp_hash_flow_seeded(seed ^ 0xffff_ffff_ffff_ffff, &key_a),
     );
 }
 
@@ -2686,6 +2893,7 @@ fn same_prefix_routes_tie_break_by_preference_not_insertion_order() {
         "inet.0",
         0,
         true,
+        None,
     );
     assert_eq!(
         resolved.disposition,
