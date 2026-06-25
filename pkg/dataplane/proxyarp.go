@@ -40,23 +40,27 @@ var (
 	neighDelSeam  = netlink.NeighDel
 )
 
-// proxyARPSysctlSeam wraps the per-interface procfs writes that enable the
+// proxyARPSysctlSeam wraps the per-interface procfs writes that toggle the
 // kernel's proxy-responder for the families we install neighbor entries for.
 // It exists as a package var so unit tests can capture the writes without
 // touching real procfs (the production writer is a best-effort os.WriteFile).
+// The enable bool selects the value written: true → "1" (enable), false →
+// "0" (disable). The disable direction is the #2475 teardown cleanup — a
+// day-2 commit removing proxy-arp from an interface must drive the leaked
+// sysctl back to 0, mirroring the enable path.
 //
 // #2160: installing an NTF_PROXY neighbor entry is necessary but, depending
 // on the route topology of the proxied address, often not sufficient. The
 // Linux kernel has two distinct ARP-proxy reply paths (net/ipv4/arp.c):
 //
-//   1. the pneigh (NTF_PROXY) reply branch (arp.c:863-868), which fires when
-//      forwarding is on, the target's addr_type is RTN_UNICAST, and the route
-//      to the target leaves a *different* device than the one the request
-//      arrived on (rt.dst.dev != dev) — this branch does NOT consult the
-//      per-interface proxy_arp sysctl; and
-//   2. the arp_fwd_proxy path, which is gated by net.ipv4.conf.<if>.proxy_arp
-//      (and answers for any forwarded-out-a-different-iface target, not only
-//      installed pneigh entries).
+//  1. the pneigh (NTF_PROXY) reply branch (arp.c:863-868), which fires when
+//     forwarding is on, the target's addr_type is RTN_UNICAST, and the route
+//     to the target leaves a *different* device than the one the request
+//     arrived on (rt.dst.dev != dev) — this branch does NOT consult the
+//     per-interface proxy_arp sysctl; and
+//  2. the arp_fwd_proxy path, which is gated by net.ipv4.conf.<if>.proxy_arp
+//     (and answers for any forwarded-out-a-different-iface target, not only
+//     installed pneigh entries).
 //
 // So whether enabling the sysctl is load-bearing is route-topology dependent:
 // for an external address that is on the SAME L2 subnet as the ingress
@@ -78,11 +82,12 @@ var (
 // follow-up #2197.
 var proxyARPSysctlSeam = writeProxyResponderSysctl
 
-// writeProxyResponderSysctl enables the kernel proxy responder for the given
-// interface and address family. Best-effort: a failure (read-only procfs,
-// interface vanished) is logged by the caller, never fatal — matching the
-// surrounding proxy-ARP reconcile's best-effort posture.
-func writeProxyResponderSysctl(iface string, family int) error {
+// writeProxyResponderSysctl toggles the kernel proxy responder for the given
+// interface and address family. enable selects the written value: true → "1",
+// false → "0". Best-effort: a failure (read-only procfs, interface vanished)
+// is logged by the caller, never fatal — matching the surrounding proxy-ARP
+// reconcile's best-effort posture.
+func writeProxyResponderSysctl(iface string, family int, enable bool) error {
 	var path string
 	switch family {
 	case unix.AF_INET:
@@ -92,7 +97,11 @@ func writeProxyResponderSysctl(iface string, family int) error {
 	default:
 		return fmt.Errorf("proxy-arp: unsupported family %d", family)
 	}
-	return os.WriteFile(path, []byte("1"), 0644)
+	val := []byte("0")
+	if enable {
+		val = []byte("1")
+	}
+	return os.WriteFile(path, val, 0644)
 }
 
 // enableProxyResponders enables the per-interface proxy responder sysctl for
@@ -108,7 +117,31 @@ func writeProxyResponderSysctl(iface string, family int) error {
 // so we always write rather than read-modify-write. A deterministic key sort
 // keeps logging stable.
 func enableProxyResponders(ifaceFamilies map[string]map[int]struct{}) int {
-	enabled := 0
+	return toggleProxyResponders(ifaceFamilies, true)
+}
+
+// disableProxyResponders writes "0" to the per-interface proxy responder
+// sysctl for every (interface, family) pair in ifaceFamilies. It is the
+// #2475 teardown cleanup: a day-2 commit that removes proxy-arp from an
+// interface must drive net.ipv4.conf.<if>.proxy_arp /
+// net.ipv6.conf.<if>.proxy_ndp back to 0, otherwise the kernel keeps
+// proxy-ARPing for any target routed out a different interface (an
+// over-broad responder leaked across config changes — see the
+// proxyARPSysctlSeam breadth note). It mirrors enableProxyResponders
+// exactly (same iteration, same best-effort/never-fatal posture, same
+// deterministic v4-before-v6 order) so the disable is symmetric with the
+// enable. Returns the number of writes that succeeded.
+func disableProxyResponders(ifaceFamilies map[string]map[int]struct{}) int {
+	return toggleProxyResponders(ifaceFamilies, false)
+}
+
+// toggleProxyResponders is the shared body of enableProxyResponders /
+// disableProxyResponders: it writes the proxy responder sysctl (value chosen
+// by enable) for every (interface, family) pair, in a deterministic
+// interface-name order with v4 before v6. A per-write failure is logged and
+// skipped (best-effort) without aborting the remaining writes.
+func toggleProxyResponders(ifaceFamilies map[string]map[int]struct{}, enable bool) int {
+	count := 0
 	names := make([]string, 0, len(ifaceFamilies))
 	for iface := range ifaceFamilies {
 		names = append(names, iface)
@@ -120,22 +153,36 @@ func enableProxyResponders(ifaceFamilies map[string]map[int]struct{}) int {
 			if _, ok := fams[family]; !ok {
 				continue
 			}
-			if err := proxyARPSysctlSeam(iface, family); err != nil {
-				slog.Warn("proxy-arp: failed to enable proxy responder sysctl",
+			if err := proxyARPSysctlSeam(iface, family, enable); err != nil {
+				verb := "enable"
+				if !enable {
+					verb = "disable"
+				}
+				slog.Warn("proxy-arp: failed to "+verb+" proxy responder sysctl",
 					"iface", iface, "family", family, "err", err)
 				continue
 			}
-			enabled++
+			count++
 		}
 	}
-	return enabled
+	return count
 }
 
 // ReconcileProxyARP reconciles proxy ARP neighbor entries for NAT addresses.
 // It adds NTF_PROXY neighbor entries for configured addresses and removes
-// stale ones from managed interfaces. Returns newly added entries so the
-// caller can send GARPs (avoids import cycle with cluster package).
-func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPAdded, error) {
+// stale ones from managed interfaces.
+//
+// Returns:
+//   - the newly added entries so the caller can send GARPs (avoids an import
+//     cycle with the cluster package);
+//   - the (interface name → enabled families) set the per-interface proxy
+//     responder sysctl was enabled for this pass. The caller (the daemon)
+//     remembers this set across commits and disables the sysctl on any
+//     interface that drops out of it on a later commit — the #2475 teardown
+//     cleanup. ReconcileProxyARP itself is stateless across calls (it only
+//     sees the current config), so the enabled set is the seam the stateful
+//     disable-on-removal is built on.
+func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPAdded, map[string]map[int]struct{}, error) {
 	type proxyKey struct {
 		ifindex int
 		ip      netip.Addr
@@ -272,7 +319,7 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPA
 			Family:    family,
 		}
 		if err := neighSetSeam(neigh); err != nil {
-			return nil, fmt.Errorf("proxy-arp: add %s on ifindex %d: %w", key.ip, key.ifindex, err)
+			return nil, nil, fmt.Errorf("proxy-arp: add %s on ifindex %d: %w", key.ip, key.ifindex, err)
 		}
 		ifaceName := ""
 		if link, err := netlink.LinkByIndex(key.ifindex); err == nil {
@@ -329,5 +376,16 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPA
 		slog.Info("proxy-arp reconciled", "added", len(added), "removed", removed)
 	}
 
-	return added, nil
+	return added, ifaceFamilies, nil
+}
+
+// DisableProxyResponders writes "0" to the per-interface proxy responder
+// sysctl for every (interface name → families) pair in ifaceFamilies. It is
+// the exported #2475 teardown entry point the daemon calls for interfaces
+// that had the sysctl enabled on a prior commit but are no longer in the
+// desired set (proxy-arp removed from that interface). Best-effort and
+// never fatal, matching ReconcileProxyARP. Returns the number of successful
+// writes.
+func DisableProxyResponders(ifaceFamilies map[string]map[int]struct{}) int {
+	return disableProxyResponders(ifaceFamilies)
 }

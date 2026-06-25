@@ -1,3 +1,14 @@
+## 2026-06-25 — #2578: appid tuple fallback prefers port-based over protocol-only
+
+- **Timestamp**: 2026-06-25
+- **Action**: `resolveTupleFallback` iterated the applications map first-match
+  (non-deterministic). When both a port-based app (tcp/8443) and a protocol-only
+  app (tcp) match a session, the more-specific port-based app now wins
+  deterministically; ties break by name. Display-only label path (no
+  enforcement impact). Added a 256-iteration fail-on-revert test
+  (`TestResolveTupleFallbackPrefersPortOverProtocol`); doc note in README.
+- **File(s)**: pkg/appid/runtime.go, pkg/appid/runtime_test.go, pkg/appid/README.md
+
 ## 2026-06-25 — #2447: reject out-of-range CoS DSCP/PCP code-points instead of aliasing
 
 - **Timestamp**: 2026-06-25
@@ -14937,6 +14948,21 @@ top.
   pkg/ra/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2523 — cap control-socket request read before allocation.
+  Replaced the unbounded `read_line` in `handle_stream` with a
+  `take(MAX_CONTROL_REQUEST_BYTES + 1)`-bounded `read_until`; oversize
+  bodies (no terminating newline within the cap) are rejected before
+  decode, fail-closed, daemon stays alive. Added
+  `MAX_CONTROL_REQUEST_BYTES = 16 MiB` (headroom over the largest real
+  request, a full apply_snapshot). Both control + session sockets share
+  `handle_stream`, so one fix covers both. Read-side only — no wire
+  change (wire_invariant test green, no protocol_wire_v1.json regen).
+  Added fail-on-revert tests: oversize→rejected (RED on cap removal,
+  proven), max-size legit body→succeeds. Gates: cargo build --release
+  clean; server::tests 41/0.
+  **File(s)**: userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/server/handlers/mod.rs,
+  userspace-dp/src/server/tests.rs, _Log.md
   **Action**: #2609 — IPFIX template-refresh header no longer resets
   SequenceNumber to 0. Per RFC 7011 §3.1/§10.3.2 the IPFIX sequence is the
   cumulative data-record count; a template-only Message carries the current
@@ -15017,3 +15043,52 @@ top.
   v6-short); proved RED-on-revert (3 fail when the guard is removed).
 - **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
   userspace-dp/src/afxdp/frame/tests.rs, _Log.md
+## 2026-06-25 — #2475 proxy-ARP/NDP sysctl disable-on-removal
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix #2475 — the proxy responder sysctl
+  (`net.ipv4.conf.<if>.proxy_arp` / `net.ipv6.conf.<if>.proxy_ndp`) was
+  enabled when proxy-arp was configured (#2160) but NEVER disabled when the
+  config was removed, leaking an over-broad ARP/NDP responder across config
+  changes until reboot. Made the teardown symmetric with the enable path.
+- **File(s)**:
+  - `pkg/dataplane/proxyarp.go` — `writeProxyResponderSysctl` gained an
+    `enable bool` (writes `1`/`0`); `enableProxyResponders` +
+    `disableProxyResponders` now share `toggleProxyResponders`; exported
+    `DisableProxyResponders`; `ReconcileProxyARP` returns the enabled
+    `(iface -> families)` set so the stateful daemon can diff it.
+  - `pkg/daemon/daemon.go` — added `Daemon.proxyARPEnabled` + `…Mu`.
+  - `pkg/daemon/daemon_proxyarp.go` — `reconcileProxyARP` diffs the fresh
+    enabled set against the remembered one (`diffProxyResponders`) and
+    disables the dropped pairs; no longer early-returns on empty config when
+    there is prior state to tear down; `proxyARPDisableFn` seam.
+  - `pkg/dataplane/proxyarp_test.go` — seam carries the enable/disable bit.
+  - `pkg/daemon/daemon_proxyarp_test.go` — `TestDiffProxyResponders`
+    (hermetic table fail-on-revert anchor) + `TestReconcileProxyARP_`
+    `DisablesOnRemoval` (privileged integration over `lo`).
+  - `docs/research/2197-proxyarp-followups/plan.md`, `docs/feature-gaps.md`
+    — recorded the teardown (item 4).
+- **Validation**: fail-on-revert proven twice — (1) hermetic
+  `TestDiffProxyResponders` goes RED when `diffProxyResponders` is stubbed to
+  report nothing stale; (2) privileged `TestReconcileProxyARP_DisablesOnRemoval`
+  goes RED when `reconcileProxyARP` is reverted to the pre-fix early-return.
+  Both restored and green. Gates: GOCACHE go build ./... clean; go vet
+  ./pkg/dataplane/... ./pkg/daemon/... clean; gofmt clean; go test
+  ./pkg/dataplane/... ./pkg/daemon/... ./pkg/config/... green.
+## #2416 NAT match source-address-name resolution for DNAT/SNAT
+
+- **Timestamp**: 2026-06-25
+- **Action**: Resolve `match source-address-name <book-entry>` into concrete
+  source prefixes for DNAT and SNAT snapshots so the #2394 source constraint
+  enforces the named source scope (was published empty = fail-open match-any).
+  Fail-closed on an unknown name (raw token kept non-empty -> match-nothing);
+  added commit-time strict gate validateNATSourceAddressNameReferencesStrict
+  (lenient->warn on load/peer-sync). Added SNAT match parse + schema entry
+  (DNAT already had both). Fail-on-revert proven RED.
+- **File(s)**: pkg/dataplane/userspace/nat.go,
+  pkg/config/compiler_nat.go, pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/schema_security.go,
+  pkg/config/parser_security_test.go,
+  pkg/config/compiler_nat_source_address_name_2416_test.go,
+  pkg/dataplane/userspace/nat_source_address_name_2416_test.go,
+  docs/userspace-dnat-plan.md

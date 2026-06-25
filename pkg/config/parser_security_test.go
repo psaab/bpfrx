@@ -3884,7 +3884,10 @@ func TestDNATSourceAddressName(t *testing.T) {
 }
 
 func TestDNATSourceAddressNameSetSyntax(t *testing.T) {
-	lines := []string{"set security nat destination pool web1 address 10.0.30.100", "set security nat destination rule-set wan-dnat from zone untrust", "set security nat destination rule-set wan-dnat rule r1 match source-address-name mynet", "set security nat destination rule-set wan-dnat rule r1 match destination-address 50.0.0.1/32", "set security nat destination rule-set wan-dnat rule r1 match destination-port 443", "set security nat destination rule-set wan-dnat rule r1 then destination-nat pool web1"}
+	// #2416: the named entry must be defined in the address book or commit
+	// hard-rejects (validateNATSourceAddressNameReferencesStrict). Define
+	// `mynet` so this parse assertion still exercises the happy path.
+	lines := []string{"set security address-book global address mynet 192.0.2.0/24", "set security nat destination pool web1 address 10.0.30.100", "set security nat destination rule-set wan-dnat from zone untrust", "set security nat destination rule-set wan-dnat rule r1 match source-address-name mynet", "set security nat destination rule-set wan-dnat rule r1 match destination-address 50.0.0.1/32", "set security nat destination rule-set wan-dnat rule r1 match destination-port 443", "set security nat destination rule-set wan-dnat rule r1 then destination-nat pool web1"}
 	tree := &ConfigTree{}
 	for _, line := range lines {
 		cmd, err := ParseSetCommand(line)

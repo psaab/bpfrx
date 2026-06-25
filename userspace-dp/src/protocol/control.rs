@@ -22,6 +22,39 @@ use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, Userspac
 pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 3;
 pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
 
+/// Maximum accepted size, in bytes, of a single newline-delimited
+/// control-socket request body before it is decoded (#2523).
+///
+/// The control socket reads one JSON request per connection via a
+/// bounded `read_until`. Without a cap, a malformed or compromised local
+/// caller can stream a very large unterminated line and force the helper
+/// to grow its read buffer unbounded (bounded in time only by the 5 s
+/// read timeout, not in allocation). The accept loop reads the whole body
+/// into memory before any schema validation can run, so the cap must be
+/// enforced at the read, not at decode.
+///
+/// Sizing: the largest legitimate request is `apply_snapshot`, which
+/// carries the entire compiled config (every zone, policy, address-book
+/// entry, NAT rule, filter, route, etc.). A hand-authored production
+/// config serializes to a few MB of JSON, so 16 MiB leaves ample margin
+/// for the policy/NAT/route dimension while still bounding a single
+/// request's read allocation to a fixed ceiling. A request larger than
+/// this is rejected before allocating its body, keeping the daemon alive
+/// (fail-closed: stale config retained, one log line, no crash).
+///
+/// Caveat — the dominant scaling dimension is NOT policy count but
+/// dynamic-feed-backed address books: `AddressBookSnapshot.prefixes_v4/v6`
+/// carry feed prefixes inline as CIDR text (see
+/// `buildAddressBookTableWithFeeds`, `pkg/dataplane/userspace/policies.go`),
+/// bounded only by a per-line scanner cap, not a total-entry cap. A very
+/// large threat-intel feed (hundreds of thousands of CIDRs) can push a
+/// *legitimate* snapshot past 16 MiB, in which case this cap rejects it
+/// at the control socket with no Go-side commit-time diagnostic. That is
+/// safe (fail-closed) but coarse; #2744 tracks a feed-dimension-aware cap
+/// plus a Go-side pre-flight size check that surfaces the limit as a
+/// config error instead of a silent control-socket rejection.
+pub(crate) const MAX_CONTROL_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(crate) struct ControlRequest {
     #[serde(rename = "type")]

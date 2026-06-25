@@ -29,6 +29,12 @@ var proxyARPReassertInterval = 30 * time.Second
 // touching netlink/procfs; production wiring is (*Daemon).reconcileProxyARP.
 var proxyARPReconcileFn = (*Daemon).reconcileProxyARP
 
+// proxyARPDisableFn is the disable-on-removal sink the reconcile invokes for
+// the stale (interface → families) set (#2475). It is a package var so the
+// fail-on-revert test can capture the teardown writes without touching real
+// procfs; production wiring is dataplane.DisableProxyResponders.
+var proxyARPDisableFn = dataplane.DisableProxyResponders
+
 // ifaceIndexByName resolves a Linux interface name to its kernel ifindex. It
 // is a package var so the RETH-resolution unit test can drive
 // proxyARPIfaceMap without real interfaces; production wiring is
@@ -91,16 +97,49 @@ func proxyARPIfaceMap(cfg *config.Config) map[string]int {
 // the #2195 fix; it is preserved here verbatim — losing it would re-break
 // proxy-arp on RETH interfaces.
 func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
-	if cfg == nil || len(cfg.Security.NAT.ProxyARP) == 0 {
-		return
+	// #2475: a commit that REMOVES proxy-arp (cfg now has zero entries) must
+	// still run so the disable-on-removal pass below can drive the leaked
+	// sysctl back to 0 on the interfaces a prior commit enabled. Only skip the
+	// expensive netlink reconcile + iface resolution when there is also nothing
+	// to tear down, preserving the "no-op on configs that never use proxy-arp"
+	// property the always-on loop relies on.
+	hasEntries := cfg != nil && len(cfg.Security.NAT.ProxyARP) > 0
+	if !hasEntries {
+		d.proxyARPEnabledMu.Lock()
+		hadPrior := len(d.proxyARPEnabled) > 0
+		d.proxyARPEnabledMu.Unlock()
+		if !hadPrior {
+			return
+		}
 	}
 
-	ifaceMap := proxyARPIfaceMap(cfg)
-
-	added, err := dataplane.ReconcileProxyARP(cfg, ifaceMap)
-	if err != nil {
-		slog.Warn("failed to reconcile proxy ARP", "err", err)
+	var (
+		added   []dataplane.ProxyARPAdded
+		enabled map[string]map[int]struct{}
+		err     error
+	)
+	if hasEntries {
+		ifaceMap := proxyARPIfaceMap(cfg)
+		added, enabled, err = dataplane.ReconcileProxyARP(cfg, ifaceMap)
+		if err != nil {
+			slog.Warn("failed to reconcile proxy ARP", "err", err)
+		}
 	}
+
+	// #2475 teardown: disable the per-interface proxy responder sysctl on every
+	// (interface, family) that was enabled by a prior commit but is no longer
+	// in the freshly-enabled set. Without this the over-broad proxy_arp /
+	// proxy_ndp knob leaks on across the config removal until reboot. The diff
+	// is computed under proxyARPEnabledMu so the apply path and the always-on
+	// re-assert loop cannot race the remembered state.
+	d.proxyARPEnabledMu.Lock()
+	stale := diffProxyResponders(d.proxyARPEnabled, enabled)
+	d.proxyARPEnabled = enabled
+	d.proxyARPEnabledMu.Unlock()
+	if len(stale) > 0 {
+		proxyARPDisableFn(stale)
+	}
+
 	for _, a := range added {
 		// SendGratuitousARP is IPv4-only; a v6 (AF_INET6) proxy-NDP entry
 		// needs no unsolicited NA to start answering, so skip the GARP for
@@ -111,6 +150,33 @@ func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 			}
 		}
 	}
+}
+
+// diffProxyResponders returns the (interface name → families) entries that
+// were in prev (the last-enabled proxy responder set) but are NOT in cur (the
+// freshly-enabled set) — i.e. the interfaces/families whose proxy_arp /
+// proxy_ndp sysctl must be disabled because proxy-arp was removed from them
+// (#2475). An interface that keeps some families but drops others yields only
+// the dropped families. The returned map is safe to hand to
+// dataplane.DisableProxyResponders (a fresh map, never aliasing prev/cur).
+func diffProxyResponders(prev, cur map[string]map[int]struct{}) map[string]map[int]struct{} {
+	if len(prev) == 0 {
+		return nil
+	}
+	stale := make(map[string]map[int]struct{})
+	for iface, fams := range prev {
+		curFams := cur[iface]
+		for family := range fams {
+			if _, ok := curFams[family]; ok {
+				continue
+			}
+			if stale[iface] == nil {
+				stale[iface] = make(map[int]struct{})
+			}
+			stale[iface][family] = struct{}{}
+		}
+	}
+	return stale
 }
 
 // proxyARPReassertLoop is an always-on periodic re-assert of the proxy-ARP/NDP
