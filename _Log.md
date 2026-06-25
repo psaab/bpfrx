@@ -1,3 +1,15 @@
+## 2026-06-24 — #2691 P0 / #2666: warn-only TSIG tuple validation (key<->secret)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Added WARN-only commit-time validation that a TSIG config is
+  a complete RFC 8945 tuple. tsig-key without tsig-secret warns (the
+  backend would sign with an empty key -> runtime BADKEY/BADSIG);
+  tsig-secret without tsig-key warns (signing disabled, secret ignored).
+  Never a hard reject (no-brick posture). Added 5 subtests incl.
+  complete-tuple-silent + does-not-hard-fail; fail-on-revert verified.
+- **File(s)**: pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_dhcp_ddns_test.go, _Log.md
+
 # Action Log
 
 ## 2026-06-24 — #2691 P0 / #2667: de-stale DDNS comments + docs (live rfc2136 backend shipped)
