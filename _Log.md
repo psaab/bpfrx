@@ -17724,6 +17724,32 @@ top.
   pkg/ipsec/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2904 — Surface A HTTP client/transport reuse across reconcile
+  passes. `backendFor`/`backendForOwned` rebuilt a fresh `http.Client` +
+  `http.Transport` (own empty keep-alive pool) every reconcile pass via
+  `newProviderHTTPClient`, so each ~30s checkip probe + DNS update paid a full
+  TCP+TLS handshake (wasted CPU, latency, ephemeral-port churn). Added
+  `httpClientCache` (in `backend_http.go`) keyed on the provider's source-binding
+  inputs (source-address / destination-interface / routing-instance,
+  `bindCacheKey`); `SurfaceAManager` owns one cache. The manager-bound resolver
+  `resolveBackend` + the new `CheckIPClient` method pull the cached client per
+  binding and thread it into the 4 HTTP backend constructors (now take a
+  `client *http.Client`; nil = build-own, pre-#2904 path for direct/test callers
+  via `ensureProviderHTTPClient`). Cache invalidates implicitly: a changed
+  binding leaf keys a fresh transport. Daemon checkip site now calls
+  `d.surfaceA.CheckIPClient` instead of `ddns.NewCheckIPClient` (one line).
+  FAIL-ON-REVERT: surface_a_httpcache_2904_test.go (same-binding reuse,
+  cross-provider same-binding reuse, per-leaf invalidation, checkip↔update shared
+  pool) goes RED when clientFor is reverted to build-fresh — verified via
+  copy-aside revert (4 tests FAIL). Gates: go build ./..., gofmt -l clean (my
+  files), go vet ./pkg/ddns/... ./pkg/daemon/..., go test -race ./pkg/ddns/...
+  PASS.
+- **File(s)**: pkg/ddns/backend_http.go, pkg/ddns/backend_generic.go,
+  pkg/ddns/backend_cloudflare.go, pkg/ddns/backend_route53.go,
+  pkg/ddns/backend_dyndns2.go, pkg/ddns/surface_a.go,
+  pkg/ddns/surface_a_httpcache_2904_test.go,
+  pkg/ddns/backend_*_test.go (nil-arg call updates), pkg/ddns/README.md,
+  pkg/daemon/daemon_ddns_surface_a.go, _Log.md
 - **Action**: Fix three FRR config-render bugs that break frr-reload (#2941,
   #2942, #2943). #2941: a family-less IPv6 BGP neighbor with a policy was
   activated under `address-family ipv4 unicast` — gate the ipv4 fall-through

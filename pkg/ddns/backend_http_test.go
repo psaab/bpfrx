@@ -47,7 +47,7 @@ func TestDyndns2GoodAndNochg(t *testing.T) {
 	b, err := newDyndns2Backend(&config.DDNSProvider{
 		Name: "test", Backend: "dyndns2", Server: srv.URL,
 		Username: "u1", Password: config.Secret("p1"),
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("newDyndns2Backend: %v", err)
 	}
@@ -88,15 +88,15 @@ func TestDyndns2VerdictMapping(t *testing.T) {
 }
 
 func TestDyndns2NameEndpointResolution(t *testing.T) {
-	b, err := newDyndns2Backend(&config.DDNSProvider{Name: "duckdns", Backend: "dyndns2"})
+	b, err := newDyndns2Backend(&config.DDNSProvider{Name: "duckdns", Backend: "dyndns2"}, nil)
 	if err != nil {
-		t.Fatalf("newDyndns2Backend(duckdns): %v", err)
+		t.Fatalf("newDyndns2Backend(duckdns, nil): %v", err)
 	}
 	if !strings.Contains(b.endpoint, "duckdns.org") {
 		t.Fatalf("duckdns name must resolve to its built-in endpoint, got %q", b.endpoint)
 	}
 	// No server + unknown name → error (fall back to no-op at the manager).
-	if _, err := newDyndns2Backend(&config.DDNSProvider{Name: "weird", Backend: "dyndns2"}); err == nil {
+	if _, err := newDyndns2Backend(&config.DDNSProvider{Name: "weird", Backend: "dyndns2"}, nil); err == nil {
 		t.Fatal("unknown provider with no server must error")
 	}
 }
@@ -122,7 +122,7 @@ func TestDyndns2DeleteIssuesOfflineRequest(t *testing.T) {
 	b, err := newDyndns2Backend(&config.DDNSProvider{
 		Name: "test", Backend: "dyndns2", Server: srv.URL,
 		Username: "u1", Password: config.Secret("p1"),
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("newDyndns2Backend: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestDyndns2DeletePropagatesProviderFailure(t *testing.T) {
 	defer srv.Close()
 	b, err := newDyndns2Backend(&config.DDNSProvider{
 		Name: "test", Backend: "dyndns2", Server: srv.URL,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("newDyndns2Backend: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestGenericDeleteFailsNotSilentSuccess(t *testing.T) {
 	defer srv.Close()
 	b, err := newGenericBackend(&config.DDNSProvider{
 		Name: "g", Backend: "generic", URLTemplate: srv.URL + "/u?h=%h&i=%i",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("newGenericBackend: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestGenericTemplateRenderAndOK(t *testing.T) {
 		Name: "g", Backend: "generic",
 		URLTemplate: srv.URL + "/upd?host=%h&ip=%i&u=%u",
 		Username:    "user one", // space → must be query-escaped
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("newGenericBackend: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestGenericSuccessSubstringMismatch(t *testing.T) {
 	defer srv.Close()
 	b, err := newGenericBackend(&config.DDNSProvider{
 		Name: "g", Backend: "generic", URLTemplate: srv.URL + "/u?h=%h&i=%i", OKResponse: "good",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("newGenericBackend: %v", err)
 	}
@@ -278,7 +278,7 @@ func TestGenericOKTokenMatch(t *testing.T) {
 				Name: "g", Backend: "generic",
 				URLTemplate: srv.URL + "/u?h=%h&i=%i",
 				OKResponse:  tc.okResponse,
-			})
+			}, nil)
 			if err != nil {
 				t.Fatalf("newGenericBackend: %v", err)
 			}
@@ -345,8 +345,8 @@ func TestGenericURLTemplateValidation(t *testing.T) {
 		}
 		if _, err := newGenericBackend(&config.DDNSProvider{
 			Name: "g", Backend: "generic", URLTemplate: tmpl,
-		}); err == nil {
-			t.Errorf("newGenericBackend(%q) = nil error, want rejection", tmpl)
+		}, nil); err == nil {
+			t.Errorf("newGenericBackend(%q, nil) = nil error, want rejection", tmpl)
 		}
 	}
 
@@ -363,8 +363,8 @@ func TestGenericURLTemplateValidation(t *testing.T) {
 		}
 		if _, err := newGenericBackend(&config.DDNSProvider{
 			Name: "g", Backend: "generic", URLTemplate: tmpl,
-		}); err != nil {
-			t.Errorf("newGenericBackend(%q) = %v, want nil", tmpl, err)
+		}, nil); err != nil {
+			t.Errorf("newGenericBackend(%q, nil) = %v, want nil", tmpl, err)
 		}
 	}
 
@@ -381,9 +381,9 @@ func TestGenericURLTemplateValidation(t *testing.T) {
 	} {
 		_, err := newGenericBackend(&config.DDNSProvider{
 			Name: "g", Backend: "generic", URLTemplate: tc.tmpl,
-		})
+		}, nil)
 		if err == nil {
-			t.Fatalf("newGenericBackend(%q) = nil error, want rejection", tc.tmpl)
+			t.Fatalf("newGenericBackend(%q, nil) = nil error, want rejection", tc.tmpl)
 		}
 		if strings.Contains(err.Error(), tc.secret) {
 			t.Errorf("construction error leaked the secret %q: %v", tc.secret, err)

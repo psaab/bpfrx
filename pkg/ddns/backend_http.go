@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -103,6 +104,71 @@ func newHTTPClientBound(b bindConfig) *http.Client {
 	}
 }
 
+// httpClientCache caches the hardened *http.Client (and its underlying
+// *http.Transport keep-alive connection pool) per distinct source-binding so the
+// Surface A reconcile loop does not throw away the pool every pass (#2904). The
+// Surface A engine rebuilds the lightweight backend OBJECT every reconcile
+// (resolve-per-Reconcile, #2691) — that is cheap — but each rebuild previously
+// called newProviderHTTPClient, which allocated a fresh http.Transport with its
+// own (empty) connection pool. Every ~30s checkip probe and DNS update then paid
+// a full TCP + TLS handshake from scratch (wasted CPU, added latency, ephemeral
+// port churn).
+//
+// The cache key is the provider's source-binding inputs ONLY (source-address /
+// destination-interface / routing-instance). Two providers that egress from the
+// same source share one transport (correct: a transport's pool is keyed on the
+// destination host:port, so cross-provider reuse only ever connects to the host
+// the request actually targets). The client carries no provider credential or
+// URL — those live on the backend object and are applied per-request — so it is
+// safe to share. The cache invalidates implicitly: when an operator changes a
+// binding leaf on commit the next reconcile resolves a NEW key and builds (and
+// caches) a fresh bound transport; the stale entry is simply no longer looked
+// up. Cardinality is bounded by the number of distinct configured bindings, so
+// the map does not grow without bound.
+type httpClientCache struct {
+	mu      sync.Mutex
+	clients map[string]*http.Client
+}
+
+// newHTTPClientCache builds an empty per-binding client cache.
+func newHTTPClientCache() *httpClientCache {
+	return &httpClientCache{clients: map[string]*http.Client{}}
+}
+
+// bindCacheKey is the stable cache key for a provider's source binding. It is
+// derived from the RAW config leaves (not the resolved bindConfig) so a commit
+// that changes any binding leaf yields a different key and forces a rebuild. A
+// nil provider keys to the unbound default (empty key).
+func bindCacheKey(p *config.DDNSProvider) string {
+	if p == nil {
+		return ""
+	}
+	// NUL-separated so distinct field boundaries cannot collide (an interface
+	// named "a" + VRF "b" must not key the same as interface "a\x00b").
+	return p.SourceAddress + "\x00" + p.DestinationInterface + "\x00" + p.RoutingInstance
+}
+
+// clientFor returns the cached bound *http.Client for the provider's source
+// binding, building and caching it on first use. The bind-resolution error (a
+// malformed source-address) is returned alongside the UNBOUND default client
+// (fail-open, matching newProviderHTTPClient); the error path is NOT cached so a
+// corrected source-address on the next commit rebuilds cleanly.
+func (c *httpClientCache) clientFor(p *config.DDNSProvider) (*http.Client, error) {
+	b, err := resolveProviderBindConfig(p)
+	if err != nil {
+		return newHTTPClient(), err
+	}
+	key := bindCacheKey(p)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cl, ok := c.clients[key]; ok {
+		return cl, nil
+	}
+	cl := newHTTPClientBound(b)
+	c.clients[key] = cl
+	return cl, nil
+}
+
 // resolveProviderBindConfig derives the transport bindConfig (#2846) from a DDNS
 // provider catalog entry's source-binding leaves. The HTTP backends carry the
 // source-address / destination-interface / routing-instance on the provider
@@ -134,6 +200,20 @@ func newProviderHTTPClient(p *config.DDNSProvider) (*http.Client, error) {
 		return newHTTPClient(), err
 	}
 	return newHTTPClientBound(b), nil
+}
+
+// ensureProviderHTTPClient returns the caller-supplied client when non-nil
+// (the Surface A reconcile path threads a cached, reused client through here,
+// #2904), otherwise it builds a fresh bound client from the provider's
+// source-binding leaves (the pre-#2904 self-contained path used by direct/test
+// callers). On a bind-resolution error it fails open to the unbound default
+// client and returns the error for the caller to surface — matching
+// newProviderHTTPClient's posture.
+func ensureProviderHTTPClient(p *config.DDNSProvider, client *http.Client) (*http.Client, error) {
+	if client != nil {
+		return client, nil
+	}
+	return newProviderHTTPClient(p)
 }
 
 // readCappedBody reads at most httpMaxResponseBody bytes of a response body and
