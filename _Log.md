@@ -15003,3 +15003,17 @@ top.
   (TestT2a_ChangedConfigApplyNeverTwoLiveConns) is a pre-existing NDP-socket
   bind flake on origin/master — confirmed failing with my changes stashed,
   and this PR touches zero pkg/ra code.
+
+## 2026-06-25 — #2449 truncated-ICMP filter fail-closed
+- **Timestamp**: 2026-06-25
+- **Action**: Guard ICMP/ICMPv6 type/code read against truncated frames in
+  the firewall-filter match builders. A non-fragmented ICMP frame shorter
+  than `l4_offset + 2` previously read type/code as 0 via `.unwrap_or(0)`
+  while `l4_present` stayed true → spurious `icmp-type 0 / icmp-code 0`
+  (Echo Reply) match. Now require `frame.len() >= l4_offset + 2`; if absent,
+  force `(0,0,0)` AND `l4_present = false` so the L4 matcher fails closed.
+  Applied to both `term_match_extra_from_frame` and `_fwd`. Added 4
+  regression tests (v4 full-short / one-byte-short / full-still-matches /
+  v6-short); proved RED-on-revert (3 fail when the guard is removed).
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/tests.rs, _Log.md

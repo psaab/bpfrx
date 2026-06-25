@@ -5936,6 +5936,118 @@ fn term_extra_first_fragment_keeps_l4_fields() {
     assert!(extra.is_fragment, "first fragment IS a fragment");
 }
 
+// #2449 (the truncation class): a NON-FRAGMENTED ICMP frame that is shorter
+// than `l4_offset + 2` carries NO type/code bytes. The pre-fix code read them
+// with `.unwrap_or(0)` while keeping `l4_present = true`, so the frame
+// spuriously matched `icmp-type 0 / icmp-code 0` (Echo Reply). The guard must
+// force (0, 0, 0) AND drop l4_present. Reverting the guard makes the truncated
+// frame expose `l4_present == true` again — this test then fails.
+#[test]
+fn term_extra_truncated_icmp_v4_fails_closed_no_icmp_type_match() {
+    // Non-fragmented ICMP packet (frag_off 0) but truncated: the frame ends at
+    // l4_offset, so neither type nor code byte is present.
+    let frag = frag_v4_packet(PROTO_ICMP, 0x0000, &[]);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&frag);
+    // frame ends exactly at l4_offset (14 ethernet + 20 IPv4 = 34); no L4 bytes.
+    let l4_offset = (14 + 20) as u16;
+    assert_eq!(frame.len(), l4_offset as usize);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert_eq!(
+        extra.icmp_type, 0,
+        "truncated ICMP must not surface a real icmp_type"
+    );
+    assert_eq!(extra.icmp_code, 0);
+    assert!(
+        !extra.l4_present,
+        "truncated ICMP frame has no type/code bytes → l4_present MUST be false \
+         so an `icmp-type 0` term fails closed (reverting the #2449 guard makes \
+         this true and the term spuriously matches)"
+    );
+    // is_fragment is L3-only and this is not a fragment.
+    assert!(!extra.is_fragment, "non-fragmented packet is not a fragment");
+}
+
+#[test]
+fn term_extra_truncated_icmp_v4_one_byte_short_fails_closed() {
+    // One byte present (type) but code byte missing — still truncated, still
+    // fail-closed (we require BOTH type and code bytes).
+    let frag = frag_v4_packet(PROTO_ICMP, 0x0000, &[8]);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&frag);
+    let l4_offset = (14 + 20) as u16;
+    assert_eq!(frame.len(), l4_offset as usize + 1);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert_eq!(extra.icmp_type, 0, "type byte must not leak when code absent");
+    assert_eq!(extra.icmp_code, 0);
+    assert!(
+        !extra.l4_present,
+        "ICMP frame one byte short of type+code → fail closed"
+    );
+}
+
+#[test]
+fn term_extra_full_icmp_v4_still_matches() {
+    // A FULL non-fragmented ICMP packet (type 8 echo-request, code 0) keeps the
+    // real type/code and l4_present true — proves the guard does not over-reject
+    // legitimate packets.
+    let frag = frag_v4_packet(PROTO_ICMP, 0x0000, &[8, 0, 0, 0, 0, 0, 0, 0]);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&frag);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert_eq!(extra.icmp_type, 8, "full ICMP carries the real type");
+    assert_eq!(extra.icmp_code, 0);
+    assert!(extra.l4_present, "full ICMP frame → l4_present true");
+}
+
+// #2449 IPv6 sibling: a truncated ICMPv6 frame (no type/code bytes past the
+// fixed IPv6 header) must also fail closed.
+#[test]
+fn term_extra_truncated_icmpv6_fails_closed() {
+    use crate::ip_proto::PROTO_ICMPV6;
+    // Non-fragmented IPv6 (no fragment header), truncated at l4_offset.
+    let pkt = frag_v6_packet(PROTO_ICMPV6, None, &[]);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&pkt);
+    let l4_offset = (14 + 40) as u16;
+    assert_eq!(frame.len(), l4_offset as usize, "frame ends at l4_offset");
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert_eq!(extra.icmp_type, 0);
+    assert_eq!(extra.icmp_code, 0);
+    assert!(
+        !extra.l4_present,
+        "truncated ICMPv6 frame must fail closed (l4_present false)"
+    );
+}
+
 #[test]
 fn apply_nat_ipv4_non_first_fragment_rewrites_ip_only() {
     // Payload bytes occupy the post-IP offset where the buggy code would

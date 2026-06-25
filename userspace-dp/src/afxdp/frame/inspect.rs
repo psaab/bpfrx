@@ -403,6 +403,15 @@ pub(in crate::afxdp) fn is_any_fragment(packet: &[u8], addr_family: u8) -> bool 
 /// `is_fragment` is KEPT true (a non-first fragment IS a fragment; the
 /// `is-fragment` term reads only the L3 header, which is present on every
 /// fragment). Reuses the existing `is_non_first_fragment` predicate (#2344).
+///
+/// #2449 (the truncation class): a NON-FRAGMENTED ICMP/ICMPv6 frame may still
+/// be shorter than `l4_offset + 2`, so the type/code bytes are absent. Reading
+/// them with `unwrap_or(0)` would yield `icmp_type = icmp_code = 0` while
+/// `l4_present` stayed true — a crafted short ICMP packet would spuriously
+/// match `icmp-type 0 / icmp-code 0` (Echo Reply). So when the type/code bytes
+/// are not present in the frame, force `(0, 0, 0)` AND drop `l4_present`, so the
+/// L4 matcher fails closed (treats it as no-match). The #2344/#2362 gate only
+/// covered the non-first-fragment case, not pure truncation.
 #[inline]
 pub(in crate::afxdp) fn term_match_extra_from_frame(
     frame: &[u8],
@@ -416,15 +425,32 @@ pub(in crate::afxdp) fn term_match_extra_from_frame(
     // closed. The is-fragment bit above stays as-is (L3-only).
     let non_first_fragment =
         l3_packet.is_some_and(|packet| is_non_first_fragment(packet, meta.addr_family));
+    // #2449: a TRUNCATED (non-fragmented) ICMP/ICMPv6 frame may be shorter than
+    // `l4_offset + 2`, so the type/code bytes are absent. Reading them with
+    // `.unwrap_or(0)` would yield (0, 0) while `l4_present` stayed true — a
+    // crafted short ICMP packet would then spuriously match `icmp-type 0 /
+    // icmp-code 0` (Echo Reply). Detect the truncation and fail closed: force
+    // (0, 0, 0) AND drop `l4_present` so the L4 matcher rejects the term.
+    // `icmp_type_code_truncated` is false for non-ICMP protocols (those never
+    // read the bytes) and for non-first fragments (handled above).
+    let icmp_type_code_present = matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
+        && !non_first_fragment
+        && (frame.len() >= (meta.l4_offset as usize).saturating_add(2));
+    let l4_truncated = matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
+        && !non_first_fragment
+        && !icmp_type_code_present;
     let (tcp_flags, icmp_type, icmp_code) = if non_first_fragment {
         (0, 0, 0)
-    } else if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+    } else if icmp_type_code_present {
         let l4 = meta.l4_offset as usize;
         (
             meta.tcp_flags,
             frame.get(l4).copied().unwrap_or(0),
             frame.get(l4.wrapping_add(1)).copied().unwrap_or(0),
         )
+    } else if l4_truncated {
+        // Truncated ICMP — no real type/code bytes. Fail closed.
+        (0, 0, 0)
     } else {
         (meta.tcp_flags, 0, 0)
     };
@@ -433,10 +459,11 @@ pub(in crate::afxdp) fn term_match_extra_from_frame(
         is_fragment,
         icmp_type,
         icmp_code,
-        // The L4 header is absent only on a non-first fragment. The matcher
-        // gates tcp-flags / icmp-type / icmp-code on this (a zeroed icmp byte
-        // is otherwise a valid icmp-type 0 / icmp-code 0 match).
-        l4_present: !non_first_fragment,
+        // The L4 header is absent on a non-first fragment OR a truncated ICMP
+        // frame (#2449). The matcher gates tcp-flags / icmp-type / icmp-code on
+        // this (a zeroed icmp byte is otherwise a valid icmp-type 0 / icmp-code
+        // 0 match).
+        l4_present: !non_first_fragment && !l4_truncated,
     }
 }
 
@@ -458,15 +485,25 @@ pub(in crate::afxdp) fn term_match_extra_from_frame_fwd(
     let is_fragment = l3_packet.is_some_and(|packet| is_any_fragment(packet, meta.addr_family));
     let non_first_fragment =
         l3_packet.is_some_and(|packet| is_non_first_fragment(packet, meta.addr_family));
+    // #2449: see `term_match_extra_from_frame` — same truncated-ICMP fail-closed
+    // guard. A frame shorter than `l4_offset + 2` has no real type/code bytes.
+    let icmp_type_code_present = matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
+        && !non_first_fragment
+        && (frame.len() >= (meta.l4_offset as usize).saturating_add(2));
+    let l4_truncated = matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
+        && !non_first_fragment
+        && !icmp_type_code_present;
     let (tcp_flags, icmp_type, icmp_code) = if non_first_fragment {
         (0, 0, 0)
-    } else if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+    } else if icmp_type_code_present {
         let l4 = meta.l4_offset as usize;
         (
             meta.tcp_flags,
             frame.get(l4).copied().unwrap_or(0),
             frame.get(l4.wrapping_add(1)).copied().unwrap_or(0),
         )
+    } else if l4_truncated {
+        (0, 0, 0)
     } else {
         (meta.tcp_flags, 0, 0)
     };
@@ -475,7 +512,7 @@ pub(in crate::afxdp) fn term_match_extra_from_frame_fwd(
         is_fragment,
         icmp_type,
         icmp_code,
-        l4_present: !non_first_fragment,
+        l4_present: !non_first_fragment && !l4_truncated,
     }
 }
 
