@@ -17345,6 +17345,49 @@ top.
   pkg/dhcprelay/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2866 — populate NetFlow v9 / IPFIX srcMask/dstMask from the FIB.
+  The v9 templates advertised srcMask (IE 9) / dstMask (IE 13) + IPv6 variants
+  (IE 29/30) and the encoder wrote FlowRecord.SrcMask/.DstMask, but
+  ExportSessionClose never assigned them, so every flow exported a /0 mask;
+  IPFIX did not advertise the mask IEs at all. The mask is the prefix length of
+  the route matching the flow's src/dst IP (Junos/vSRX FIB-LPM semantics). It is
+  NOT on the SESSION_CLOSE wire frame (unlike deferred #2749 fields) but IS
+  derivable from the local FIB at export time. Added routemask.go: a TTL-cached
+  (default 10s) netlink.RouteGetWithOptions(ip,{FIBMatch:true}) resolver
+  (RTM_F_FIB_MATCH returns the matched route prefix, so a default route yields a
+  real /0). Both exporters carry a MaskResolver func (defaulted by
+  NewExporter/NewIPFIXExporter; nil on a zero-value exporter → masks stay 0, the
+  test seam). ExportSessionClose resolves src/dst masks for the pre-NAT IPs.
+  IPFIX also gains the four mask IEs (1B each, same slot as the v9 masks),
+  growing the IPFIX record size by 2B (v4 61->63, v6 109->111). Fail-on-revert:
+  TestNetflowSrcDstMaskPopulated / TestIPFIXSrcDstMaskPopulated go RED if the
+  population is reverted to 0 (verified). Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/flowexport/..., go test ./pkg/flowexport/... + ./pkg/daemon/...
+  PASS.
+  **File(s)**: pkg/flowexport/routemask.go (new),
+  pkg/flowexport/srcmask_dstmask_test.go (new), pkg/flowexport/netflow.go,
+  pkg/flowexport/ipfix.go, pkg/flowexport/postnat_test.go,
+  pkg/flowexport/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2866 review fold (MERGE-NEEDS-MINOR) — bound routeMaskCache to
+  fix an unbounded-map memory leak. The TTL bounded the FIB syscall RATE but not
+  the FOOTPRINT: resolve() only ever inserted, never evicted, so the map grew
+  for the daemon's lifetime on an internet-facing firewall (unbounded dst-IP
+  cardinality). Added routeMaskCacheMax=8192 const + maxSize field + evictLocked
+  (purge-expired-then-clear-on-overflow, under the same lock as the insert; a
+  re-inserted existing key skips eviction since it does not grow the map;
+  maxSize<=0 disables the bound, used only by the existing
+  TestRouteMaskCacheResolves). Fail-on-revert: TestRouteMaskCacheBounded asserts
+  len(entries) stays <= maxSize across >cap distinct inserts AND a within-TTL
+  repeated key still hits (no extra lookup); TestRouteMaskCacheEvictsExpiredFirst
+  asserts the expired-purge runs before a full clear so a live working set below
+  the cap is not wiped. Neutering evictLocked to a no-op turns both RED
+  (verified). Existing mask-population tests stay green. Gates: go build ./...,
+  gofmt -l clean, go vet ./pkg/flowexport/..., go test ./pkg/flowexport/... +
+  ./pkg/daemon/... PASS.
+  **File(s)**: pkg/flowexport/routemask.go,
+  pkg/flowexport/srcmask_dstmask_test.go, pkg/flowexport/README.md, _Log.md
   **Action**: #2865 RA sender whose initial openConn() fails stayed in
   m.senders as a dead entry; the config-unchanged Apply reconcile skipped it
   (configEqual → continue), so a transient boot-time bind failure (link still
@@ -17383,3 +17426,35 @@ top.
   gofmt -l clean, go vet ./pkg/frr/..., go test ./pkg/frr/... PASS.
   **File(s)**: pkg/frr/manager.go, pkg/frr/frr_test.go, pkg/frr/README.md,
   _Log.md
+  **Action**: #2868 — eventengine remediation commit now runs under a
+  cancellable engine-lifetime context instead of context.Background(). New()
+  builds lifeCtx/lifeCancel (context.WithCancel(Background)); Close() cancels
+  it alongside closing stopCh, so a remediation commit in flight at daemon
+  shutdown (netlink + FRR reload + Rust sync — seconds of work) aborts cleanly
+  instead of blocking termination past the systemd TimeoutStopSec SIGKILL.
+  Threaded the ctx through applyOnce(ctx, a) (commitContext() helper, nil-guard
+  for a zero-value Engine) into commitFn(ctx, ""). The standalone (nil commitFn)
+  store.Commit() branch is unaffected. Added fail-on-revert test
+  TestCommit_CancelledOnEngineStop (commitFn blocks on ctx.Done(); Close() must
+  abort it with context.Canceled — RED on the 3s timeout if reverted to
+  context.Background()). Scoped to the #2868 context threading only (siblings
+  #2869/#2890 are separate lanes). Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/eventengine/..., go test -race ./pkg/eventengine/... PASS.
+  **File(s)**: pkg/eventengine/engine.go, pkg/eventengine/engine_integration_test.go,
+  pkg/eventengine/README.md, _Log.md
+  **Action**: #2901 — DDNS source-binding dialer family gate. The shared
+  bindConfig.dialer Control hook (pkg/ddns/backend_bind.go) called unix.Bind by
+  the SOURCE family regardless of the dial socket family, so a dual-stack
+  endpoint (A+AAAA) whose Happy-Eyeballs picked the non-matching family hit
+  EAFNOSUPPORT/EINVAL and aborted the whole connection. Gated the source-bind on
+  sourceMatchesDialFamily(src, network) keyed off the Dialer.Control "network"
+  arg (tcp4/tcp6/udp4/udp6); on a family mismatch the bind is SKIPPED and the
+  dial proceeds with the kernel-chosen source (operator configured a source only
+  for the matching family). SO_BINDTODEVICE stays family-agnostic, applied
+  always. DDNS analog of the #2757/#2832 ipsec family-selection work. FAIL-ON-
+  REVERT: TestDialerSourceBindFamilyGate drives the Control hook over real
+  AF_INET/AF_INET6 fds — match binds cleanly, mismatch returns nil; RED (EINVAL)
+  when the gate is removed (verified). Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/ddns/..., go test ./pkg/ddns/... PASS.
+  **File(s)**: pkg/ddns/backend_bind.go, pkg/ddns/backend_bind_test.go,
+  pkg/ddns/README.md, _Log.md

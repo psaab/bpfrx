@@ -18,11 +18,15 @@ const (
 	ipfixProtocolIdentifier       = 4
 	ipfixSourceTransportPort      = 7
 	ipfixSourceIPv4Address        = 8
+	ipfixSourceIPv4PrefixLength   = 9 // #2866 srcMask (IE 9), unsigned8
 	ipfixIngressInterface         = 10
 	ipfixDestinationTransportPort = 11
 	ipfixDestinationIPv4Address   = 12
+	ipfixDestIPv4PrefixLength     = 13 // #2866 dstMask (IE 13), unsigned8
 	ipfixSourceIPv6Address        = 27
 	ipfixDestinationIPv6Address   = 28
+	ipfixSourceIPv6PrefixLength   = 29 // #2866 srcMask v6 (IE 29), unsigned8
+	ipfixDestIPv6PrefixLength     = 30 // #2866 dstMask v6 (IE 30), unsigned8
 	ipfixFlowStartMilliseconds    = 152
 	ipfixFlowEndMilliseconds      = 153
 	// #2613: ipClassOfService (5), tcpControlBits (6), ingressInterface (10),
@@ -85,6 +89,12 @@ var ipfixTemplateV4 = []ipfixField{
 	{ipfixOctetDeltaCount, 8},
 	{ipfixFlowStartMilliseconds, 8},
 	{ipfixFlowEndMilliseconds, 8},
+	// #2866: src/dst route prefix lengths (IE 9 / IE 13) populated with the
+	// FIB longest-prefix-match mask. Placed in the same slot as the NetFlow
+	// v9 srcMask/dstMask (after FlowEnd, before ingressInterface) so the two
+	// protocols keep a parallel record layout.
+	{ipfixSourceIPv4PrefixLength, 1},
+	{ipfixDestIPv4PrefixLength, 1},
 	// #2749: ingressInterface (IE 10) re-introduced with a REAL value — the
 	// ingress ifindex on the SESSION_CLOSE frame since #2615. Placed before
 	// the post-NAT tuple so the latter stays the trailing block (#2526
@@ -109,6 +119,9 @@ var ipfixTemplateV6 = []ipfixField{
 	{ipfixOctetDeltaCount, 8},
 	{ipfixFlowStartMilliseconds, 8},
 	{ipfixFlowEndMilliseconds, 8},
+	// #2866: src/dst route prefix lengths (IPv6 variants IE 29 / IE 30).
+	{ipfixSourceIPv6PrefixLength, 1},
+	{ipfixDestIPv6PrefixLength, 1},
 	// #2749: ingressInterface (IE 10) — see the V4 template note.
 	{ipfixIngressInterface, 4},
 	// #2526: post-NAT (translated) tuple, appended last. v6 addresses use the
@@ -123,16 +136,17 @@ var ipfixTemplateV6 = []ipfixField{
 // #2613 dropped TOS(1)+TCPflags(2)+direction(1)+ingressIf(4)+egressIf(4)=12
 // from the former 69-byte record. pre-NAT body = 45; #2526 post-NAT tuple
 // (4+4+2+2) = 12 → 57. #2749 re-added ingressInterface (IE 10, 4B) with a
-// real value → 61.
-// 4+4+2+2+1+8+8+8+8 + 4+4+2+2 + 4 = 61
-const ipfixRecordSizeV4 = 61
+// real value → 61. #2866 added srcMask+dstMask (IE 9/13, 1B each) → 63.
+// 4+4+2+2+1+8+8+8+8 + 1+1 + 4 + 4+4+2+2 = 63
+const ipfixRecordSizeV4 = 63
 
 // ipfixRecordSizeV6 is the byte size of a single IPv6 IPFIX data record.
 // #2613 dropped the same 12 unpopulated bytes from the former 117. pre-NAT
 // body = 69; #2526 post-NAT tuple (16+16+2+2) = 36 → 105. #2749 re-added
-// ingressInterface (IE 10, 4B) with a real value → 109.
-// 16+16+2+2+1+8+8+8+8 + 16+16+2+2 + 4 = 109
-const ipfixRecordSizeV6 = 109
+// ingressInterface (IE 10, 4B) with a real value → 109. #2866 added the IPv6
+// srcMask+dstMask (IE 29/30, 1B each) → 111.
+// 16+16+2+2+1+8+8+8+8 + 1+1 + 4 + 16+16+2+2 = 111
+const ipfixRecordSizeV6 = 111
 
 // ipfixRecordSizeV4 / V6 must equal the sum of their template field lengths.
 // A drift between the template (what the collector parses) and the encoder
@@ -290,6 +304,11 @@ func encodeIPFIXRecordV4(b []byte, off int, r FlowRecord) int {
 	off += 8
 	binary.BigEndian.PutUint64(b[off:off+8], uint64(r.EndTime.UnixMilli()))
 	off += 8
+	// #2866: src/dst route prefix lengths (IE 9 / IE 13).
+	b[off] = r.SrcMask
+	off++
+	b[off] = r.DstMask
+	off++
 	// #2749: ingressInterface (IE 10) — the SNMP ifIndex of the session's
 	// ingress binding (real value via #2615). Written before the post-NAT
 	// tuple to match the template field order.
@@ -343,6 +362,11 @@ func encodeIPFIXRecordV6(b []byte, off int, r FlowRecord) int {
 	off += 8
 	binary.BigEndian.PutUint64(b[off:off+8], uint64(r.EndTime.UnixMilli()))
 	off += 8
+	// #2866: src/dst route prefix lengths (IPv6 variants IE 29 / IE 30).
+	b[off] = r.SrcMask
+	off++
+	b[off] = r.DstMask
+	off++
 	// #2749: ingressInterface (IE 10) — see encodeIPFIXRecordV4.
 	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
 	off += 4
@@ -376,6 +400,11 @@ type IPFIXExporter struct {
 	seq   uint32 // cumulative data record count
 	conns *collectorConns
 
+	// #2866: resolves per-flow src/dst route prefix lengths (IPFIX
+	// sourceIPv4PrefixLength IE 9 / destinationIPv4PrefixLength IE 13 and the
+	// IPv6 variants IE 29/30) from the FIB. See Exporter.MaskResolver.
+	MaskResolver MaskResolver
+
 	batch flowBatch
 
 	exportedFlows atomic.Uint64
@@ -391,9 +420,10 @@ type IPFIXExporter struct {
 // would fork the counter, re-seeding the sampling cadence (#2224).
 func NewIPFIXExporter(cfg *ExportConfig) (*IPFIXExporter, error) {
 	e := &IPFIXExporter{
-		cfg:         cfg,
-		sourceID:    1,
-		templateSet: encodeIPFIXTemplateSet(),
+		cfg:          cfg,
+		sourceID:     1,
+		templateSet:  encodeIPFIXTemplateSet(),
+		MaskResolver: NewRouteMaskResolver(0),
 	}
 
 	conns, err := dialCollectors(cfg.Collectors)
@@ -442,6 +472,9 @@ func (e *IPFIXExporter) ExportSessionClose(rec logging.EventRecord, evt SessionC
 	natSrcIP, natDstIP, natSrcPort, natDstPort := resolvePostNAT(
 		evt.SrcIP, evt.DstIP, evt.SrcPort, evt.DstPort,
 		evt.NATSrcIP, evt.NATDstIP, evt.NATSrcPort, evt.NATDstPort)
+	// #2866: resolve src/dst route prefix lengths from the FIB (0/0 with no
+	// resolver wired).
+	srcMask, dstMask := resolveMasks(e.MaskResolver, evt.SrcIP, evt.DstIP)
 	fr := FlowRecord{
 		SrcIP:      evt.SrcIP,
 		DstIP:      evt.DstIP,
@@ -453,6 +486,8 @@ func (e *IPFIXExporter) ExportSessionClose(rec logging.EventRecord, evt SessionC
 		StartTime:  startTime,
 		EndTime:    rec.Time,
 		IsIPv6:     evt.IsIPv6,
+		SrcMask:    srcMask,
+		DstMask:    dstMask,
 		NATSrcIP:   natSrcIP,
 		NATDstIP:   natDstIP,
 		NATSrcPort: natSrcPort,
