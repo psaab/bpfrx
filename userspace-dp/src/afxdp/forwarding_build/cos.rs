@@ -137,17 +137,20 @@ fn cos_priority_rank(priority: &str) -> u8 {
 /// resolve `forwarding_class → queue_id` against the former.
 pub(super) fn build_cos_classifier_tables(
     cos: &ClassOfServiceSnapshot,
-) -> ClassifierTables<'_> {
-    let class_to_queue = cos
-        .forwarding_classes
-        .iter()
-        .filter_map(|class| {
-            if class.name.is_empty() || !(0..=u8::MAX as i32).contains(&class.queue) {
-                return None;
-            }
-            Some((class.name.clone(), class.queue as u8))
-        })
-        .collect::<FastMap<_, _>>();
+) -> Result<ClassifierTables<'_>, crate::policy::SnapshotIntegrityError> {
+    // #2410: a forwarding-class queue id outside 0..=255 fails the snapshot
+    // CLOSED. The pre-fix `filter_map` SILENTLY DROPPED the class, so every
+    // classifier / scheduler-map entry referencing it lost its queue mapping
+    // (a silent fail-open at the second trust boundary). An EMPTY class name
+    // is the legitimate placeholder case and is still skipped, not an error.
+    let mut class_to_queue: FastMap<String, u8> = FastMap::default();
+    for class in &cos.forwarding_classes {
+        if class.name.is_empty() {
+            continue;
+        }
+        let queue = super::validated::QueueId::try_from_snapshot(class.queue, &class.name)?.get();
+        class_to_queue.insert(class.name.clone(), queue);
+    }
     let dscp_classifiers = cos
         .dscp_classifiers
         .iter()
@@ -228,14 +231,14 @@ pub(super) fn build_cos_classifier_tables(
         .filter(|sched_map| !sched_map.name.is_empty())
         .map(|sched_map| (sched_map.name.clone(), sched_map))
         .collect::<FastMap<_, _>>();
-    ClassifierTables {
+    Ok(ClassifierTables {
         class_to_queue,
         dscp_classifiers,
         ieee8021_classifiers,
         dscp_rewrite_rules,
         schedulers,
         scheduler_maps,
-    }
+    })
 }
 
 /// Per-interface CoS config builder. Returns `None` when the
@@ -252,7 +255,7 @@ pub(super) fn build_cos_classifier_tables(
 pub(super) fn build_cos_iface_config(
     iface: &InterfaceSnapshot,
     tables: &ClassifierTables<'_>,
-) -> Option<CoSInterfaceConfig> {
+) -> Result<Option<CoSInterfaceConfig>, crate::policy::SnapshotIntegrityError> {
     let burst_bytes = if iface.cos_shaping_burst_bytes > 0 {
         iface.cos_shaping_burst_bytes
     } else {
@@ -262,8 +265,17 @@ pub(super) fn build_cos_iface_config(
     let dscp_rewrite_rule = tables.dscp_rewrite_rules.get(&iface.cos_dscp_rewrite_rule);
     if let Some(sched_map) = tables.scheduler_maps.get(&iface.cos_scheduler_map) {
         for entry in &sched_map.entries {
+            // #2409: a scheduler-map entry referencing a forwarding-class that
+            // is not in `class_to_queue` (a typo, a version-drifted snapshot,
+            // or a class dropped for an out-of-range queue id) fails the
+            // snapshot CLOSED. The pre-fix `continue` partially installed the
+            // scheduler — some queues silently missing, no apply failure — a
+            // very hard-to-troubleshoot fail-silent loss of shaping.
             let Some(queue_id) = tables.class_to_queue.get(&entry.forwarding_class).copied() else {
-                continue;
+                return Err(crate::policy::SnapshotIntegrityError::SchedulerMapUnknownClass {
+                    scheduler_map: iface.cos_scheduler_map.clone(),
+                    forwarding_class: entry.forwarding_class.clone(),
+                });
             };
             let scheduler = tables.schedulers.get(&entry.scheduler).copied();
             let explicit_transmit_rate_bytes = scheduler.and_then(|sched| {
@@ -394,7 +406,7 @@ pub(super) fn build_cos_iface_config(
         || ieee8021_classifier_targets_iface_queue
         || dscp_rewrite_targets_iface_class;
     if !contributes_usable_cos_state {
-        return None;
+        return Ok(None);
     }
     let dscp_queue_by_dscp =
         build_cos_dscp_queue_table(&iface.cos_dscp_classifier, &tables.dscp_classifiers);
@@ -446,7 +458,7 @@ pub(super) fn build_cos_iface_config(
     let oversubscription_guarantee_fraction = iface
         .cos_oversubscription_guarantee_fraction
         .clamp(0.0, 1.0);
-    Some(CoSInterfaceConfig {
+    Ok(Some(CoSInterfaceConfig {
         shaping_rate_bytes: iface.cos_shaping_rate_bytes_per_sec,
         burst_bytes,
         default_queue,
@@ -459,7 +471,7 @@ pub(super) fn build_cos_iface_config(
         oversubscription_policy,
         oversubscription_guarantee_fraction,
         priority_low_min_share_bytes: iface.cos_priority_low_min_share_bytes,
-    })
+    }))
 }
 
 /// CoS state orchestrator. Pre-#1342 this was a single 312-LOC
@@ -488,22 +500,28 @@ pub(super) fn build_cos_iface_config(
 /// (forwarding-only, burst-only without rate, typo'd named
 /// references, empty named entities, scheduler-maps with all
 /// undefined forwarding-classes).
-pub(super) fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
+pub(super) fn build_cos_state(
+    snapshot: &ConfigSnapshot,
+) -> Result<CoSState, crate::policy::SnapshotIntegrityError> {
     let Some(cos) = snapshot.class_of_service.as_ref() else {
-        return CoSState::default();
+        return Ok(CoSState::default());
     };
-    let tables = build_cos_classifier_tables(cos);
+    // #2410/#2409: both helpers are now fallible — an out-of-range queue id
+    // or a scheduler-map entry referencing a missing class fails the snapshot
+    // CLOSED rather than silently dropping the class / partially installing
+    // the scheduler.
+    let tables = build_cos_classifier_tables(cos)?;
     let mut state = CoSState::default();
     for iface in &snapshot.interfaces {
         if iface.ifindex <= 0 {
             continue;
         }
-        if let Some(cfg) = build_cos_iface_config(iface, &tables) {
+        if let Some(cfg) = build_cos_iface_config(iface, &tables)? {
             state.interfaces.insert(iface.ifindex, cfg);
         }
     }
     state.dscp_classifiers = tables.dscp_classifiers;
     state.ieee8021_classifiers = tables.ieee8021_classifiers;
     state.dscp_rewrite_rules = tables.dscp_rewrite_rules;
-    state
+    Ok(state)
 }

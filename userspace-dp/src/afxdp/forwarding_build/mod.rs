@@ -21,6 +21,10 @@
 //! - [`cos`] — `build_cos_state` (split into
 //!   `build_cos_classifier_tables` + `build_cos_iface_config` +
 //!   orchestrator).
+//! - [`validated`] — #2410 checked narrowing newtypes
+//!   (`VlanId`/`TunnelTtl`/`QueueId`) decoded once with `try_from_snapshot`
+//!   so an out-of-range control-plane integer fails the snapshot CLOSED
+//!   rather than wrapping (`as` cast) or being silently dropped.
 
 use super::*;
 
@@ -28,6 +32,7 @@ mod cos;
 mod fib;
 mod interfaces;
 mod tunnels;
+mod validated;
 mod wg;
 mod zones;
 
@@ -50,10 +55,17 @@ pub(in crate::afxdp) use tunnels::hydrate_wg_identity;
 // kind-segregation and fail-closed `_ =>` arm have one source of truth.
 pub(in crate::afxdp) use tunnels::{tunnel_mode_kind, TunnelKind};
 
-// Plain (private) `use` for orchestrator-local symbols. NOT a
-// `pub(super) use` of a `pub(super)` item — that triggers E0364
-// (see `tx/mod.rs:38` for the documented precedent).
-use cos::build_cos_state;
+// #2410: `build_cos_state` is now fallible (it fails the snapshot
+// closed on an out-of-range CoS queue id or an unresolved scheduler-map
+// class). The production orchestrator calls `cos::build_cos_state(..)?`
+// by path. The test suite (`tests.rs`, `use super::*`) keeps calling an
+// infallible `build_cos_state(..) -> CoSState` — provided by this
+// `#[cfg(test)]` wrapper that `.expect()`s the valid snapshots the CoS
+// tests build (mirrors the `build_forwarding_state` infallible wrapper).
+#[cfg(test)]
+fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
+    cos::build_cos_state(snapshot).expect("test CoS snapshot must not produce integrity error")
+}
 
 // Test-only imports. `default_cos_burst_bytes` is reached by
 // `forwarding_build/tests.rs` (loaded as `mod tests;` below) via
@@ -173,7 +185,10 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     let (excluded_local_v4, excluded_local_v6) = nat_translated_local_exclusions(snapshot);
 
     zones::populate_zones(snapshot, &mut state);
-    tunnels::populate_tunnel_endpoints(snapshot, &mut state);
+    // #2410: fail CLOSED on a tunnel TTL outside 0..=255 instead of
+    // narrowing it with an unchecked `as u8` cast that would wrap
+    // (256→0 blackholes the tunnel).
+    tunnels::populate_tunnel_endpoints(snapshot, &mut state)?;
     // #1432 S2a: instantiate one WgEngine per mode=="wireguard" endpoint,
     // reusing the previous state's engine Arc when the endpoint config is
     // unchanged (TAI64N + live sessions survive the commit) and seeding a
@@ -274,7 +289,11 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
         &snapshot.flow.lo0_filter_input_v6,
         previous.map(|state| &state.filter_state),
     )?;
-    state.cos = build_cos_state(snapshot);
+    // #2410/#2409: fail CLOSED on a CoS forwarding-class queue id outside
+    // 0..=255 (pre-fix: silently dropped), or a scheduler-map entry
+    // referencing a forwarding-class absent from the class-to-queue table
+    // (pre-fix: silently skipped → a partially-installed scheduler).
+    state.cos = cos::build_cos_state(snapshot)?;
     let has_cos_interfaces = !state.cos.interfaces.is_empty();
     state.tx_selection_enabled_v4 = has_cos_interfaces
         || state.filter_state.has_input_tx_selection_v4

@@ -97,9 +97,19 @@ pub(super) fn populate_interfaces(
             .copied()
             .unwrap_or(0);
         for addr in &iface.addresses {
-            let Ok(net) = addr.address.parse::<IpNet>() else {
-                continue;
-            };
+            // #2409: fail CLOSED on an unparseable interface address rather
+            // than silently `continue`-ing past it. The pre-fix skip lost the
+            // connected route / local-address / interface-NAT material for
+            // that address while the apply still succeeded — silent
+            // connectivity loss in a retired-eBPF world. The Go commit-time
+            // validation is the primary gate; this is the helper-boundary
+            // backstop (the preflight keeps the previous good state).
+            let net = addr.address.parse::<IpNet>().map_err(|_| {
+                crate::policy::SnapshotIntegrityError::InterfaceAddressUnparseable {
+                    interface: iface.name.clone(),
+                    address: addr.address.clone(),
+                }
+            })?;
             match net {
                 IpNet::V4(v4) => {
                     if excluded_local_v4.contains(&v4.addr()) {
@@ -150,7 +160,13 @@ pub(super) fn populate_egress(
         } else {
             iface.ifindex
         };
-        let ingress_key = (bind_ifindex, iface.vlan_id.max(0) as u16);
+        // #2410: validate the VLAN id ONCE here instead of narrowing it with
+        // an unchecked `iface.vlan_id.max(0) as u16` at both the ingress-key
+        // and the EgressInterface.vlan_id site. An out-of-range value
+        // (> 65535) fails the snapshot closed rather than wrapping to a
+        // different VLAN (a different L2 domain).
+        let vlan_id = super::validated::VlanId::try_from_snapshot(iface.vlan_id, &iface.name)?.get();
+        let ingress_key = (bind_ifindex, vlan_id);
         if iface.parent_ifindex > 0 {
             state
                 .ingress_logical_ifindex
@@ -189,7 +205,7 @@ pub(super) fn populate_egress(
             iface.ifindex,
             EgressInterface {
                 bind_ifindex,
-                vlan_id: iface.vlan_id.max(0) as u16,
+                vlan_id,
                 mtu: iface.mtu.max(0) as usize,
                 src_mac,
                 zone_id,

@@ -1146,6 +1146,266 @@ fn interface_with_empty_zone_builds_with_zone_zero() {
 }
 
 // ---------------------------------------------------------------------
+// #2410: validated narrowing newtypes — out-of-range VLAN / TTL / queue
+// fail the snapshot CLOSED instead of wrapping (VLAN/TTL) or silently
+// dropping (queue). #2409: malformed interface address fails closed.
+// ---------------------------------------------------------------------
+
+/// #2410: a VLAN id > 65535 fails the snapshot CLOSED via
+/// `InterfaceVlanOutOfRange`. fail-on-revert: restoring
+/// `iface.vlan_id.max(0) as u16` wraps 65537 → VLAN 1 and the build
+/// succeeds, making this `expect_err` red.
+#[test]
+fn interface_vlan_id_out_of_range_fails_closed() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0/0/2".into(),
+            ifindex: 23,
+            parent_ifindex: 22,
+            vlan_id: 65_537, // wraps to VLAN 1 under the old `as u16` cast
+            hardware_addr: "02:00:00:00:00:23".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let err = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err("an out-of-range VLAN id must fail closed, not wrap to a different VLAN");
+    match err {
+        crate::policy::SnapshotIntegrityError::InterfaceVlanOutOfRange { interface, vlan_id } => {
+            assert_eq!(interface, "ge-0/0/2");
+            assert_eq!(vlan_id, 65_537);
+        }
+        other => panic!("expected InterfaceVlanOutOfRange, got {other:?}"),
+    }
+}
+
+/// #2410 anti-over-reject: an in-range VLAN (and the negative "no VLAN"
+/// sentinel) still build, byte-identical to the old `.max(0) as u16`.
+#[test]
+fn interface_vlan_id_in_range_builds_exactly() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0/0/3".into(),
+                ifindex: 30,
+                parent_ifindex: 29,
+                vlan_id: 4094, // top of the legal 802.1Q range
+                hardware_addr: "02:00:00:00:00:30".into(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0/0/4".into(),
+                ifindex: 31,
+                vlan_id: -1, // legitimate "no VLAN" sentinel → 0 (untagged)
+                hardware_addr: "02:00:00:00:00:31".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert_eq!(state.egress.get(&30).expect("egress 30").vlan_id, 4094);
+    assert_eq!(state.egress.get(&31).expect("egress 31").vlan_id, 0);
+}
+
+/// #2410: a tunnel TTL > 255 fails the snapshot CLOSED via
+/// `TunnelTtlOutOfRange`. fail-on-revert: restoring
+/// `endpoint.ttl.max(0) as u8` wraps 256 → 0 (a blackholed tunnel) and
+/// the build succeeds, making this `expect_err` red.
+#[test]
+fn tunnel_ttl_out_of_range_fails_closed() {
+    let snapshot = ConfigSnapshot {
+        tunnel_endpoints: vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+            id: 9,
+            interface: "gr-0/0/0".into(),
+            ifindex: 50,
+            mode: "gre".into(),
+            source: "203.0.113.1".into(),
+            destination: "198.51.100.1".into(),
+            ttl: 256, // wraps to 0 under the old `as u8` cast
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let err = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err("an out-of-range tunnel TTL must fail closed, not wrap to 0");
+    match err {
+        crate::policy::SnapshotIntegrityError::TunnelTtlOutOfRange { tunnel_id, ttl } => {
+            assert_eq!(tunnel_id, 9);
+            assert_eq!(ttl, 256);
+        }
+        other => panic!("expected TunnelTtlOutOfRange, got {other:?}"),
+    }
+}
+
+/// #2410 anti-over-reject: an in-range TTL still builds exactly.
+#[test]
+fn tunnel_ttl_in_range_builds_exactly() {
+    let snapshot = ConfigSnapshot {
+        tunnel_endpoints: vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+            id: 10,
+            interface: "gr-0/0/0".into(),
+            ifindex: 51,
+            mode: "gre".into(),
+            source: "203.0.113.1".into(),
+            destination: "198.51.100.1".into(),
+            ttl: 255, // top of the legal range
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert_eq!(state.tunnel_endpoints.get(&10).expect("endpoint").ttl, 255);
+}
+
+/// #2410: a CoS forwarding-class queue id outside 0..=255 fails the
+/// snapshot CLOSED via `CosQueueIdOutOfRange`. fail-on-revert: restoring
+/// the `filter_map` range check silently DROPS the class, the build
+/// succeeds, and this `expect_err` is red.
+#[test]
+fn cos_forwarding_class_queue_out_of_range_fails_closed() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 60,
+            cos_shaping_rate_bytes_per_sec: 1,
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "voice".into(),
+                queue: 256, // outside u8 range — pre-fix: silently dropped
+            }],
+            schedulers: vec![],
+            scheduler_maps: vec![],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+    let err = super::cos::build_cos_state(&snapshot)
+        .expect_err("an out-of-range CoS queue id must fail closed, not silently drop the class");
+    match err {
+        crate::policy::SnapshotIntegrityError::CosQueueIdOutOfRange {
+            forwarding_class,
+            queue,
+        } => {
+            assert_eq!(forwarding_class, "voice");
+            assert_eq!(queue, 256);
+        }
+        other => panic!("expected CosQueueIdOutOfRange, got {other:?}"),
+    }
+}
+
+/// #2410 anti-over-reject: an in-range queue id still maps, and an EMPTY
+/// class name is still skipped (the legitimate placeholder case) without
+/// erroring.
+#[test]
+fn cos_forwarding_class_in_range_queue_builds_and_empty_name_skipped() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 61,
+            cos_shaping_rate_bytes_per_sec: 0,
+            cos_scheduler_map: "m".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![
+                CoSForwardingClassSnapshot {
+                    name: "voice".into(),
+                    queue: 5, // in-range
+                },
+                CoSForwardingClassSnapshot {
+                    name: String::new(), // placeholder — skipped, not an error
+                    queue: 999,
+                },
+            ],
+            schedulers: vec![],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "m".into(),
+                entries: vec![CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "voice".into(),
+                    scheduler: String::new(),
+                }],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+    let state = super::cos::build_cos_state(&snapshot).expect("in-range queue id must build");
+    let cfg = state.interfaces.get(&61).expect("iface 61 cos");
+    assert_eq!(cfg.queue_by_forwarding_class.get("voice").copied(), Some(5));
+}
+
+/// #2409: an interface address that does not parse as an `IpNet` fails the
+/// snapshot CLOSED via `InterfaceAddressUnparseable`. fail-on-revert:
+/// restoring the `else { continue; }` silently drops the address (losing
+/// the connected route) and the build succeeds, making this red.
+#[test]
+fn interface_malformed_address_fails_closed() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0/0/5".into(),
+            ifindex: 70,
+            hardware_addr: "02:00:00:00:00:70".into(),
+            addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                family: "inet".into(),
+                address: "10.0.0.0/33".into(), // not a parseable CIDR
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let err = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err("a malformed interface address must fail closed, not silently drop the route");
+    match err {
+        crate::policy::SnapshotIntegrityError::InterfaceAddressUnparseable { interface, address } => {
+            assert_eq!(interface, "ge-0/0/5");
+            assert_eq!(address, "10.0.0.0/33");
+        }
+        other => panic!("expected InterfaceAddressUnparseable, got {other:?}"),
+    }
+}
+
+/// #2409 anti-over-reject: a valid interface address still installs its
+/// connected route.
+#[test]
+fn interface_valid_address_builds_connected_route() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0/0/6".into(),
+            ifindex: 71,
+            hardware_addr: "02:00:00:00:00:71".into(),
+            addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                family: "inet".into(),
+                address: "10.0.61.1/24".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert!(
+        state.connected_v4.iter().any(|r| r.ifindex == 71),
+        "valid address must produce a connected route"
+    );
+    assert!(state.local_v4.contains(&"10.0.61.1".parse().unwrap()));
+}
+
+// ---------------------------------------------------------------------
 // #916: zero-shaping-rate (transparent root) tests.
 // ---------------------------------------------------------------------
 
@@ -1711,16 +1971,26 @@ fn build_cos_state_skips_interface_with_resolvable_but_empty_scheduler_map() {
     );
 }
 
+/// #2409: at the RUST helper boundary, a scheduler-map entry referencing a
+/// forwarding-class absent from the class-to-queue table fails the snapshot
+/// CLOSED. This is a true NEVER-FIRES DRIFT BACKSTOP: an undefined-class
+/// scheduler-map entry is a SUPPORTED, committable config shape on the Go
+/// side (warning-only at commit, `compiler_validate_warn.go`), so the Go
+/// snapshot emitter (`pkg/dataplane/userspace/cos.go`,
+/// `buildClassOfServiceSnapshot`) now DEGRADES VISIBLY — it filters the
+/// undefined entry with a `slog.Warn` and never puts it on the wire (see
+/// `TestBuildClassOfServiceSnapshotSkipsUndefinedSchedulerMapClass`). This
+/// hard-error therefore only fires on a version/snapshot-drifted helper that
+/// receives an entry the emitter would have filtered — making it consistent
+/// with the VLAN/TTL/queue/address sites (corruption a valid config never
+/// produces) and with the #2391/#2212/#2240 precedents (all have a Go gate
+/// upstream so their Rust backstop never fires on a fresh operator config).
+///
+/// fail-on-revert: restoring the `continue` at the `class_to_queue.get`
+/// lookup makes the build succeed (silently dropping the entry) and this
+/// `expect_err` red.
 #[test]
-fn build_cos_state_skips_interface_with_scheduler_map_all_undefined_forwarding_classes() {
-    // The Junos compiler emits a warning for scheduler-map entries that
-    // reference undefined forwarding-classes but does NOT drop the
-    // scheduler-map itself. After resolution, every entry's
-    // `class_to_queue.get` returns None, so `queues` is empty and the
-    // interface would otherwise fall through to the synthetic default
-    // best-effort queue. The post-build gate must reject this case so
-    // we don't reintroduce the owner-worker redirect on an interface
-    // with no effective CoS policy.
+fn build_cos_state_fails_closed_on_scheduler_map_undefined_forwarding_class() {
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
             ifindex: 402,
@@ -1730,8 +2000,8 @@ fn build_cos_state_skips_interface_with_scheduler_map_all_undefined_forwarding_c
         }],
         class_of_service: Some(ClassOfServiceSnapshot {
             // forwarding_classes intentionally does NOT include the
-            // class names referenced by `broken-map` below, so every
-            // entry collapses at `class_to_queue.get(&entry.forwarding_class)`.
+            // class names referenced by `broken-map` below, so the first
+            // entry's `class_to_queue.get(&entry.forwarding_class)` misses.
             forwarding_classes: vec![CoSForwardingClassSnapshot {
                 name: "best-effort".into(),
                 queue: 0,
@@ -1756,11 +2026,18 @@ fn build_cos_state_skips_interface_with_scheduler_map_all_undefined_forwarding_c
         }),
         ..Default::default()
     };
-    let state = build_cos_state(&snapshot);
-    assert!(
-        !state.interfaces.contains_key(&402),
-        "scheduler-map whose entries all reference undefined forwarding-classes must NOT admit interface"
-    );
+    let err = super::cos::build_cos_state(&snapshot)
+        .expect_err("scheduler-map referencing an undefined class must fail closed");
+    match err {
+        crate::policy::SnapshotIntegrityError::SchedulerMapUnknownClass {
+            scheduler_map,
+            forwarding_class,
+        } => {
+            assert_eq!(scheduler_map, "broken-map");
+            assert_eq!(forwarding_class, "missing-class-a");
+        }
+        other => panic!("expected SchedulerMapUnknownClass, got {other:?}"),
+    }
 }
 
 #[test]

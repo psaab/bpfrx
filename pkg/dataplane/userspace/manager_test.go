@@ -4746,6 +4746,57 @@ func TestBuildClassOfServiceSnapshotIncludesTransmitRateExact(t *testing.T) {
 	}
 }
 
+// #2409: a scheduler-map entry referencing a forwarding-class that is NOT
+// defined in `class-of-service forwarding-classes` is warning-only at commit
+// time (compiler_validate_warn.go), so the config commits and the valid
+// entries must still install. The snapshot emitter must DEGRADE VISIBLY here
+// — skip only the undefined entry (keeping the valid subset) so it never
+// reaches the Rust SchedulerMapUnknownClass hard-error and freezes the whole
+// dataplane apply on a supported config shape.
+//
+// fail-on-revert: removing the `cos.ForwardingClasses[...]` membership skip in
+// buildClassOfServiceSnapshot puts the undefined entry on the wire, this
+// assertion (only the valid entry survives) goes red, and the Rust side would
+// then hard-fail the apply.
+func TestBuildClassOfServiceSnapshotSkipsUndefinedSchedulerMapClass(t *testing.T) {
+	cfg := &config.Config{
+		ClassOfService: &config.ClassOfServiceConfig{
+			ForwardingClasses: map[string]*config.CoSForwardingClass{
+				"best-effort": {Name: "best-effort", Queue: 0},
+			},
+			Schedulers: map[string]*config.CoSScheduler{
+				"sched-be": {Name: "sched-be", TransmitRateBytes: 1_000_000},
+			},
+			SchedulerMaps: map[string]*config.CoSSchedulerMap{
+				"map1": {
+					Name: "map1",
+					Entries: map[string]*config.CoSSchedulerMapEntry{
+						// valid — best-effort is defined
+						"best-effort": {ForwardingClass: "best-effort", Scheduler: "sched-be"},
+						// undefined class — warning-only at commit, must be skipped
+						"voice": {ForwardingClass: "voice", Scheduler: "sched-be"},
+					},
+				},
+			},
+		},
+	}
+
+	snap := buildClassOfServiceSnapshot(cfg)
+	if snap == nil {
+		t.Fatal("expected non-nil class-of-service snapshot")
+	}
+	if len(snap.SchedulerMaps) != 1 {
+		t.Fatalf("SchedulerMaps len = %d, want 1", len(snap.SchedulerMaps))
+	}
+	entries := snap.SchedulerMaps[0].Entries
+	if len(entries) != 1 {
+		t.Fatalf("entries len = %d, want 1 (undefined-class entry must be skipped)", len(entries))
+	}
+	if entries[0].ForwardingClass != "best-effort" {
+		t.Fatalf("surviving entry class = %q, want best-effort (the valid subset must install)", entries[0].ForwardingClass)
+	}
+}
+
 // #1746: the equal-flow target policy reaches the scheduler snapshot,
 // and an UNSET policy keeps the serialized snapshot byte-identical to
 // the pre-#1746 wire (omitempty) — the byte-unchanged-default proof.

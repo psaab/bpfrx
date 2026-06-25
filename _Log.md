@@ -13926,6 +13926,62 @@ top.
   degraded-reporting bullet).
 - **File(s)**: userspace-dp/src/slowpath.rs, userspace-dp/src/afxdp/tx/dispatch/slow_path.rs, userspace-dp/src/protocol/control.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/format/status.go, docs/userspace-dataplane-architecture.md, _Log.md
 
+- **Timestamp**: 2026-06-24
+- **Action**: #2410 + #2409 — fail-closed validated conversion at the Rust
+  forwarding-build trust boundary. #2410: new checked narrowing newtypes
+  (`forwarding_build/validated.rs` — `VlanId`/`TunnelTtl`/`QueueId`,
+  `try_from_snapshot`) replace unchecked `as` casts so a VLAN id > 65535,
+  a tunnel TTL > 255, or a CoS forwarding-class queue id outside 0..=255
+  fail the snapshot CLOSED (`InterfaceVlanOutOfRange` /
+  `TunnelTtlOutOfRange` / `CosQueueIdOutOfRange`) instead of wrapping /
+  silently dropping. #2409: an unparseable interface address
+  (`InterfaceAddressUnparseable`) and a scheduler-map entry referencing a
+  missing forwarding-class (`SchedulerMapUnknownClass`) now fail closed
+  instead of `continue`-ing. `populate_tunnel_endpoints` /
+  `build_cos_state` / `build_cos_classifier_tables` /
+  `build_cos_iface_config` made fallible; errors propagate via `?` through
+  the orchestrator to the apply preflight (keeps previous live state),
+  matching the #2173/#2212/#2240/#2391 fail-closed family. Rewrote the
+  pre-existing `..scheduler_map_all_undefined_forwarding_classes` test
+  (it relied on the now-removed silent skip) to assert fail-closed; added
+  10 fail-on-revert + anti-over-reject tests. Gates: cargo build --release
+  clean; cargo test --release --bin xpf-userspace-dp forwarding_build →
+  66 passed / 0; full bin suite 2746 passed (1 pre-existing flaky
+  worker-queue concurrency race, passes in isolation 3/3).
+- **File(s)**: userspace-dp/src/afxdp/forwarding_build/validated.rs (new),
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/forwarding_build/tunnels.rs,
+  userspace-dp/src/afxdp/forwarding_build/cos.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/policy.rs, userspace-dp/src/FEATURES.md, _Log.md
+
+- **Timestamp**: 2026-06-24 (PR #2696 review follow-up)
+- **Action**: #2409 over-rejection fix (coordinator review MERGE-NEEDS-MINOR).
+  The Rust `SchedulerMapUnknownClass` hard-error over-rejected a SUPPORTED,
+  committable config shape: an undefined-class scheduler-map entry is
+  warning-only at commit (compiler_validate_warn.go; the strict gate rejects
+  only buffer-percent overcommit), so a config that commits today would, after
+  the PR, commit then FAIL THE DATAPLANE APPLY → frozen forwarding (#1961-class
+  no-transit-on-commit regression). Chose the Go-emitter degrade option: filter
+  undefined-class scheduler-map entries in
+  `buildClassOfServiceSnapshot` (pkg/dataplane/userspace/cos.go) with a
+  slog.Warn (degrade VISIBLY — the #2409 complaint was the silence, the partial
+  install is the historical/supported behavior). The entry never reaches the
+  wire, so the Rust SchedulerMapUnknownClass hard-error stays as a TRUE
+  never-fires drift backstop, consistent with the other 4 fail-closed sites
+  (VLAN/TTL/queue/unparseable-addr — corruption a valid config never produces)
+  and the #2391/#2212/#2240 precedents (all have a Go HARD gate upstream). Kept
+  the other 4 sites fail-closed. Added Go test
+  `TestBuildClassOfServiceSnapshotSkipsUndefinedSchedulerMapClass`
+  (fail-on-revert: valid subset survives, undefined entry filtered); reframed
+  the Rust scheduler-map test doc to the drift-backstop role. Gates: gofmt
+  clean, go vet clean, go build ./... clean, go test
+  ./pkg/dataplane/userspace/... ok; cargo build --release clean, cargo test
+  --release --bin xpf-userspace-dp forwarding_build → 66 passed / 0.
+- **File(s)**: pkg/dataplane/userspace/cos.go,
+  pkg/dataplane/userspace/manager_test.go,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs, _Log.md
 ## #2691 P1a — extract pkg/ddns spine (verbatim, no behavior change)
 
 - **Timestamp**: 2026-06-24
