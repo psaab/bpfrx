@@ -1882,3 +1882,29 @@ or installed a blackhole, with no signal. The SSOT is `staticRouteNode()` in
 `schema_routing.go`, shared by the `routing-options`, per-`rib`, and
 `routing-instances` static blocks. Regression + fail-on-revert tests:
 `pkg/config/schema_validate_route_2448_test.go`.
+
+### #2978 — BGP `multipath ibgp` (iBGP ECMP / `maximum-paths ibgp`)
+
+`set protocols bgp multipath ibgp` enables iBGP equal-cost multipath. FRR's
+`maximum-paths N` line (rendered from the existing `protocols bgp multipath`
+knob, `BGPConfig.Multipath`) applies ONLY to eBGP-learned routes — iBGP
+multipath requires the SEPARATE `maximum-paths ibgp N` command. Without it FRR
+installs a single best-path for any iBGP-learned prefix, so ECMP is silently
+disabled for iBGP routes in redundant leaf-spine / route-reflector topologies
+(agy-review-057 finding 057-04).
+
+- **schema** — `multipath ibgp` is a flag child of the `protocols bgp
+  multipath` node (`schema_routing.go`), a sibling of the existing
+  `multiple-as`, mirroring its shape.
+- **typed field** — `BGPConfig.MultipathIBGP bool` (`types_routing.go`); the
+  compiler (`compiler_protocols.go`) sets it from the `ibgp` child the same way
+  it sets `MultipathMultipleAS` from `multiple-as`. The count comes from the
+  same `Multipath` value (default 64 when `multipath` is present).
+- **render** — when `bgpMaxPaths > 1` AND `MultipathIBGP` is set, the BGP
+  address-family blocks (`policy_render.go`, both ipv4 and ipv6 unicast) emit
+  `maximum-paths ibgp <n>` directly after the existing eBGP `maximum-paths
+  <n>` line. Without the flag the render is byte-identical to pre-#2978
+  (eBGP-only), so existing configs are unaffected.
+- **tests** — parse: `TestBGPMultipathIBGPSetSyntax` (`parser_routing_test.go`);
+  render fail-on-revert: `TestGenerateProtocols_BGPMultipathIBGP` +
+  `TestGenerateProtocols_BGPMultipathNoIBGP` (`frr_test.go`).

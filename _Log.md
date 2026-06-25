@@ -1,3 +1,29 @@
+## 2026-06-25 — #2978: BGP `multipath ibgp` renders FRR `maximum-paths ibgp <n>` (iBGP ECMP)
+
+- **Timestamp**: 2026-06-25
+- **Action**: FRR `maximum-paths <n>` enables eBGP multipath ONLY; iBGP
+  multipath needs the SEPARATE `maximum-paths ibgp <n>` command. xpf only
+  rendered the generic eBGP line from `protocols bgp multipath`, so iBGP-learned
+  prefixes kept a single best-path and ECMP was silently disabled for iBGP
+  routes in leaf-spine / route-reflector topologies (agy-review-057 057-04).
+  Confirmed against FRR bgpd that the two are distinct address-family knobs and
+  that xpf genuinely lacked the iBGP form before implementing. Fix: added a
+  `multipath ibgp` flag leaf (`schema_routing.go`, sibling of `multiple-as`) →
+  typed `BGPConfig.MultipathIBGP` (`types_routing.go`) set in
+  `compiler_protocols.go` → renderer emits `maximum-paths ibgp <n>` after the
+  eBGP `maximum-paths <n>` in BOTH unicast address-families
+  (`policy_render.go`). Without the flag the render is byte-identical to
+  pre-#2978 (eBGP-only). Tests: parse `TestBGPMultipathIBGPSetSyntax`
+  (`parser_routing_test.go`); render fail-on-revert
+  `TestGenerateProtocols_BGPMultipathIBGP` +
+  `TestGenerateProtocols_BGPMultipathNoIBGP` (`frr_test.go`). Gates: go build,
+  gofmt, go vet, go test ./pkg/frr/... ./pkg/config/... all green. Fail-on-
+  revert verified RED with the two render lines deleted.
+- **File(s)**: pkg/config/types_routing.go, pkg/config/schema_routing.go,
+  pkg/config/compiler_protocols.go, pkg/config/parser_routing_test.go,
+  pkg/frr/policy_render.go, pkg/frr/frr_test.go, pkg/frr/README.md,
+  docs/config-schema.md, _Log.md
+
 ## 2026-06-25 — #2958: state_writer runtime io_uring failure now demotes WriteMode to sync
 
 - **Timestamp**: 2026-06-25
