@@ -16796,3 +16796,39 @@ top.
   **File(s)**: pkg/config/schema_interfaces.go,
   pkg/config/schema_validate_ddns_source_address_2780_test.go,
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2834 — fix config-replace 0-live-RA-conn outage (make-before-break)
+  pkg/ra: a changed-config `Apply` (hard replace) installs a draining
+  tombstone, proves the OLD conn closed, then starts the replacement via
+  `onProvenClose`→`startLocked`. But `start()` opens the new NDP conn
+  ASYNCHRONOUSLY in the owner goroutine (the `openConn` bind retry, up to
+  ~2s, must not run under `m.mu` — #2453). So `Apply` could return in the
+  window after `startLocked` but before the owner's `openConn` completed →
+  ZERO live RA conns immediately after a config replace = an IPv6-RA
+  outage (hosts could lose the default route / RDNSS until the next
+  periodic sender came up). `TestT2a_ChangedConfigApplyNeverTwoLiveConns`
+  asserted `live==1` synchronously after the replace and failed
+  deterministically with `live==0` (issue #2834; bisected to #2453).
+  ROOT CAUSE: async conn open + no synchronization point for callers to
+  observe the replacement going live.
+  FIX (make-before-break): added `connReady chan` + `connOpened atomic.Bool`
+  to `sender`; the owner calls `signalConnReady(opened)` after `openConn`
+  resolves (success OR give-up/pre-empt, so a waiter is never stranded).
+  `Apply`'s changed-config restart path captures the started replacement
+  and, AFTER `releaseDrain` returns (UNLOCKED — never under `m.mu`), waits
+  on `waitConnReady(claimWaitTimeout)`. `Apply` now returns only once the
+  replacement RA conn is LIVE: 1 → (briefly 0, internal) → 1, no
+  observable 0-conn window, never momentarily 2 (old conn closed first).
+  #2033 PRESERVED: a replace still emits NO goodbye; only a genuine
+  `Withdraw`/`Clear`/removal emits the lifetime-0 goodbye + goes down.
+  New `TestT2c_ReplaceStaysLiveNoGoodbye_WithdrawGoesDownWithGoodbye`
+  asserts BOTH halves (replace stays live + no goodbye; withdraw → 0 conns
+  + goodbye).
+  FAIL-ON-REVERT: copied `ra.go` aside, replaced the `waitConnReady` call
+  with `_ = replacement` → both T2a and T2c FAIL with `live conns = 0,
+  want 1`; restored from the copy, green.
+  Gates: go build ./... clean; gofmt -l pkg/ra clean; go vet ./pkg/ra/...
+  clean; go test -race ./pkg/ra/ -count=3 ok.
+  **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/serialize_test.go,
+  pkg/ra/README.md, _Log.md
