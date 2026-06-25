@@ -14134,3 +14134,28 @@ top.
   `go test ./pkg/{ddns,config,dhcpserver,daemon}` green; `-race ./pkg/ddns`
   green. `make test-failover` still MANDATORY — the parent re-runs it on the
   folded head.
+
+## 2026-06-24 — #2705 state_writer unique temp path (cross-writer corruption hardening)
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed deterministic `temporary_path()` (`<dest>.tmp`) that let two
+  writers — overlapping helper processes (restart/upgrade handover) or future
+  multi-instance code/tests — open/truncate/write the SAME temp and publish
+  crossed bytes under a successful rename (a syntactically valid but wrong-epoch
+  snapshot). Each write now uses a PRIVATE temp `<dest>.<pid>.<seq>.tmp` (pid +
+  process-global monotonic `AtomicU64`), created `O_EXCL` (`create_new`), then
+  atomically renamed onto the dest (last-writer-wins on the final file is
+  acceptable; crossed bytes are not). Added `cleanup_on_error` so a failed write
+  removes its unique temp (no leak now that names are non-reused). Atomic
+  rename + fsync(temp)+fsync(parent) durability contract preserved.
+- **Tests**: `temporary_path_is_unique_per_call_for_same_dest` (distinct temps,
+  same dir, recognizable sibling, extension-less too),
+  `two_concurrent_writers_never_publish_crossed_bytes` (two threads × 200 writes
+  of distinct 64K payloads → final file is one COMPLETE payload, no temp leak),
+  `failed_write_cleans_up_its_unique_temp` (injected fsync failure → no temp
+  sibling). Fail-on-revert proven: reverting to the deterministic temp turns
+  both unique/concurrent tests RED.
+- **Gates**: `cargo build --release` clean (no new state_writer.rs warnings);
+  `cargo test --release --bin xpf-userspace-dp state_writer` → 7 passed / 0
+  failed.
+- **File(s)**: userspace-dp/src/state_writer.rs, userspace-dp/src/FEATURES.md,
+  _Log.md.
