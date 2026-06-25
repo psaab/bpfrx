@@ -1,3 +1,42 @@
+## 2026-06-25 — #2774: ddns/checkip public-address gate covers the full IANA special-purpose registry
+
+- **Timestamp**: 2026-06-25
+- **Action**: The checkip public-address gate (`isPublicAddr`) rejected
+  loopback/link-local/multicast/unspecified + the RFC-1918 private,
+  CGNAT, link-local, and TEST-NET ranges, but ACCEPTED several other
+  non-public IANA special-purpose ranges, so a hostile or misconfigured
+  checkip endpoint could have a reserved/benchmark/martian address
+  published as the router's A/AAAA record. Rewrote the gate to accept
+  only globally-routable unicast: stdlib `netip` predicates handle
+  unspecified/loopback/link-local/multicast + `IsPrivate` (10/8,
+  172.16/12, 192.168/16), and two prefix tables (`specialPurposeV4`,
+  `specialPurposeV6`) reject the rest of the registry. Newly rejected
+  IPv4: 0.0.0.0/8, 192.0.0/24, 192.88.99/24 (6to4 relay anycast),
+  198.18/15 (benchmarking), 240/4 (reserved), 255.255.255.255/32
+  (limited broadcast). Newly rejected IPv6: ::ffff:0:0/96, 64:ff9b::/96
+  + 64:ff9b:1::/48 (NAT64), 100::/64 (discard-only), 100:0:0:1::/64
+  (dummy prefix, RFC 9780), 2001::/23, 2001:db8::/32 + 3fff::/20
+  (documentation, RFC 3849/9637), 2002::/16 (6to4), 5f00::/16 (SRv6
+  SIDs, RFC 9602); ULA/loopback/unspecified already rejected. The
+  3fff::/20, 5f00::/16, and 100:0:0:1::/64 blocks were added in the
+  review fold (all Globally-Reachable=False in the IANA registry).
+- **File(s)**: `pkg/ddns/checkip.go` (gate rewrite + prefix tables),
+  `pkg/ddns/checkip_test.go` (`TestIsPublicAddrSpecialPurpose`
+  fail-on-revert table), `pkg/ddns/README.md` (gate range list).
+- **Scope**: checkip public-address gate + its test only. No change to
+  `surface_a.go`, `provider.go`, the `backend_*.go` files, or
+  `compiler_validate_warn.go` (other lanes own those).
+- **Validation**: `go build ./...`, `gofmt -l` clean, `go vet
+  ./pkg/ddns/...`, `go test ./pkg/ddns/...` all PASS.
+- **Fail-on-revert proof**: copy-aside `checkip.go`, neutralized the
+  `specialPurposeV4`/`specialPurposeV6` loops + the `IsPrivate` guard
+  (accept-all body) → `TestIsPublicAddrSpecialPurpose` FAILED on 20
+  newly-accepted special-purpose addrs (0.1.2.3, 10/8, 100.64/10,
+  172.16/12, 192.0.0/24, 192.0.2/24, 192.88.99/24, 198.18/15,
+  198.51.100/24, 203.0.113/24, 240/4, 255.255.255.255, 64:ff9b::/96,
+  100::/64, 2001:db8::/32, 2002::/16, fc00::/7, fd00::); restored →
+  GREEN.
+
 ## 2026-06-25 — #2622: firewall filter source-port-except / destination-port-except
 
 - **Timestamp**: 2026-06-25
