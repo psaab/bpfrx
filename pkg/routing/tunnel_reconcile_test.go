@@ -396,6 +396,45 @@ func TestWgTunMTUForEndpointModel(t *testing.T) {
 	}
 }
 
+// #2457 fail-on-revert: the configured wgN inner MTU MUST be clamped to the
+// engine's encryptable ceiling (wgEngineMaxInnerMTU = 4096). An operator who
+// sets a jumbo `mtu` on a wgN device would otherwise hand the WG engine
+// plaintext above PADDED_PLAINTEXT_MAX, silently dropped at encap. Remove the
+// `min(..., wgEngineMaxInnerMTU)` clamp in wgTunMTUForEndpoint and this goes
+// RED (the jumbo override returns the unclamped 9000).
+func TestWgTunMTUForEndpointClampsToEngineMax(t *testing.T) {
+	// Sanity: the Go mirror equals the documented engine ceiling.
+	if wgEngineMaxInnerMTU != 4096 {
+		t.Fatalf("wgEngineMaxInnerMTU drifted to %d; must mirror "+
+			"engine.rs WG_ENGINE_MAX_INNER_MTU (4096)", wgEngineMaxInnerMTU)
+	}
+
+	// Jumbo operator override is clamped to the engine ceiling.
+	jumbo := wgTC()
+	jumbo.MTU = 9000
+	if got := wgTunMTUForEndpoint(jumbo); got != wgEngineMaxInnerMTU {
+		t.Fatalf("jumbo override mtu 9000: got %d, want %d (clamped to "+
+			"engine ceiling)", got, wgEngineMaxInnerMTU)
+	}
+
+	// At-ceiling override passes unchanged (clamp is a no-op at the boundary).
+	atCeiling := wgTC()
+	atCeiling.MTU = wgEngineMaxInnerMTU
+	if got := wgTunMTUForEndpoint(atCeiling); got != wgEngineMaxInnerMTU {
+		t.Fatalf("at-ceiling override mtu %d: got %d, want unchanged %d",
+			wgEngineMaxInnerMTU, got, wgEngineMaxInnerMTU)
+	}
+
+	// Below-ceiling override is honored verbatim (proves no over-clamp of
+	// the common sub-1500 / standard path).
+	below := wgTC()
+	below.MTU = 1380
+	if got := wgTunMTUForEndpoint(below); got != 1380 {
+		t.Fatalf("below-ceiling override mtu 1380: got %d, want 1380 "+
+			"(must not be over-clamped)", got)
+	}
+}
+
 // A CONFIGURED fe80 on the persistent wgN TUN, later removed from
 // config, must be reconciled away (pre-#1905 it leaked forever via the
 // nil applied-set sentinel) — while the kernel's autoconf fe80 on the
