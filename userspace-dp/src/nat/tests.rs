@@ -2532,6 +2532,21 @@ fn persistent_pool_snapshot(
     }
 }
 
+/// #2397: build a persistent-NAT pool rule whose `permit-any-remote-host`
+/// flag is set explicitly. The default `persistent_pool_snapshot` hardcodes
+/// `true`; this lets the remote-host-scoping regression exercise both modes.
+fn persistent_pool_rules_remote_scope(
+    timeout_secs: i64,
+    port_low: u16,
+    port_high: u16,
+    permit_any_remote_host: bool,
+) -> Vec<SourceNatRule> {
+    let mut snapshot =
+        persistent_pool_snapshot(timeout_secs, port_low, port_high, vec!["203.0.113.10"], false);
+    snapshot.persistent_nat_permit_any_remote_host = permit_any_remote_host;
+    parse_source_nat_rules(&[snapshot])
+}
+
 fn tuple_snat_lookup(
     rules: &[SourceNatRule],
     src_port: u16,
@@ -2580,10 +2595,14 @@ fn session_key(src_port: u16, dst_ip: &str, dst_port: u16) -> crate::session::Se
 }
 
 fn lease_key(src_port: u16) -> PersistentSourceKey {
+    // #2397: the surrounding tests build rules with
+    // `permit_any_remote_host: true`, so the lease is keyed by the local
+    // source tuple only (`remote: None`) and reused across remote hosts.
     PersistentSourceKey {
         protocol: 6,
         src_ip: "10.0.1.100".parse().unwrap(),
         src_port,
+        remote: None,
     }
 }
 
@@ -2669,6 +2688,75 @@ fn pool_snat_persistent_reuses_same_source_tuple() {
     assert_eq!(status[0].reuses_total, 1);
     assert_eq!(status[0].persistent_leases, 1);
     assert_eq!(status[0].live_flows, 2);
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
+}
+
+/// #2397 FAIL-ON-REVERT: with `permit-any-remote-host` DISABLED, the
+/// persistent mapping must be bound to the original remote endpoint. A second
+/// flow from the same local source to a DIFFERENT remote 5-tuple must NOT
+/// reuse the first translated mapping — it gets a distinct lease and a
+/// distinct port. The enabled-flag mode (asserted in the sibling test below
+/// and in `pool_snat_persistent_reuses_same_source_tuple`) keeps the historical
+/// any-remote reuse. Reverting the remote-scoping key change makes the
+/// disabled-flag branch reuse the mapping again and this assertion goes RED.
+#[test]
+fn pool_snat_persistent_no_permit_any_remote_scopes_to_remote_host() {
+    let rules = persistent_pool_rules_remote_scope(300, 40000, 40010, false);
+
+    // First flow: same local source (10.0.1.100:12345) to remote 8.8.8.8:53.
+    let first = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    // Second flow: SAME local source, DIFFERENT remote (1.1.1.1:443).
+    let second = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "1.1.1.1", 443, 2));
+
+    // permit-any-remote-host=false => the second remote must NOT inherit the
+    // first remote's persistent mapping.
+    assert_ne!(
+        (first.rewrite_src, first.rewrite_src_port),
+        (second.rewrite_src, second.rewrite_src_port),
+        "permit-any-remote-host=false must scope the persistent lease to the \
+         original remote host: a different remote 5-tuple must get a distinct \
+         translated mapping (issue #2397)"
+    );
+
+    // A THIRD flow back to the original remote 8.8.8.8:53 must reuse the first
+    // mapping (the lease is scoped TO that remote, not destroyed).
+    let third = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 3));
+    assert_eq!(
+        (third.rewrite_src, third.rewrite_src_port),
+        (first.rewrite_src, first.rewrite_src_port),
+        "the same local source returning to the ORIGINAL remote must reuse its \
+         own remote-scoped persistent mapping"
+    );
+
+    // Two distinct remotes => two distinct leases, both live.
+    let status = source_nat_pool_statuses(&rules);
+    assert_eq!(status[0].persistent_leases, 2);
+    assert_eq!(status[0].allocations_total, 2);
+    assert_eq!(status[0].reuses_total, 1);
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
+}
+
+/// #2397 control: with `permit-any-remote-host` ENABLED, the historical
+/// any-remote reuse is preserved — a second flow from the same local source to
+/// a different remote reuses the first translated mapping (one lease).
+#[test]
+fn pool_snat_persistent_permit_any_remote_reuses_across_remotes() {
+    let rules = persistent_pool_rules_remote_scope(300, 40000, 40010, true);
+
+    let first = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    let second = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "1.1.1.1", 443, 2));
+
+    assert_eq!(
+        (first.rewrite_src, first.rewrite_src_port),
+        (second.rewrite_src, second.rewrite_src_port),
+        "permit-any-remote-host=true must reuse the persistent mapping across \
+         remote hosts (unchanged behavior)"
+    );
+
+    let status = source_nat_pool_statuses(&rules);
+    assert_eq!(status[0].persistent_leases, 1);
+    assert_eq!(status[0].allocations_total, 1);
+    assert_eq!(status[0].reuses_total, 1);
     assert_persistent_expiry_indexes_consistent(&rules[0]);
 }
 
