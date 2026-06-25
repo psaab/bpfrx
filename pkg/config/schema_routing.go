@@ -168,8 +168,16 @@ var schemaPolicyOptions = &schemaNode{desc: "Policy options", children: map[stri
 				"local-preference": {desc: "Local preference", args: 1, placeholder: "<value>", children: nil},
 				"metric":           {desc: "Metric", args: 1, placeholder: "<value>", children: nil},
 				"metric-type":      {desc: "Metric type", args: 1, placeholder: "<type>", children: nil},
-				"community":        {desc: "Community", args: 1, placeholder: "<community>", children: nil},
-				"origin":           {desc: "Origin", args: 1, placeholder: "<origin>", children: nil},
+				// `then community` supports the Junos community operations
+				// (add | delete | set | none) plus the legacy bare
+				// `then community <value>` (= replace). multi:true packs the
+				// optional operation keyword and the value onto one leaf's
+				// Keys (`community add 65000:100`, `community none`,
+				// `community 65000:100`); the compiler interprets the first
+				// token as the operation when it is add/delete/set/none and
+				// otherwise treats it as a bare replace value (#2848).
+				"community": {desc: "Community (add | delete | set | none | <value>)", args: 1, multi: true, placeholder: "<add|delete|set|none|community>", children: nil},
+				"origin":    {desc: "Origin", args: 1, placeholder: "<origin>", children: nil},
 			}},
 		}},
 		"then": {desc: "Default action", children: nil},

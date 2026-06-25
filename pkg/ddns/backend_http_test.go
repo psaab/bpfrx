@@ -367,6 +367,28 @@ func TestGenericURLTemplateValidation(t *testing.T) {
 			t.Errorf("newGenericBackend(%q) = %v, want nil", tmpl, err)
 		}
 	}
+
+	// #2841 credential-leak fold: a malformed template that carries a secret in
+	// the userinfo or query must NOT echo that secret in the construction error
+	// (the error is logged via slog.Warn at the surface-A construction site). The
+	// template is run through config.RedactURL before embedding. Goes RED if the
+	// raw template is embedded again.
+	for _, tc := range []struct {
+		tmpl, secret string
+	}{
+		{"ftp://user:SUPERSECRET@host/upd", "SUPERSECRET"}, // wrong scheme + userinfo secret
+		{"https:///upd?token=SUPERSECRET", "SUPERSECRET"},  // host-less + query secret
+	} {
+		_, err := newGenericBackend(&config.DDNSProvider{
+			Name: "g", Backend: "generic", URLTemplate: tc.tmpl,
+		})
+		if err == nil {
+			t.Fatalf("newGenericBackend(%q) = nil error, want rejection", tc.tmpl)
+		}
+		if strings.Contains(err.Error(), tc.secret) {
+			t.Errorf("construction error leaked the secret %q: %v", tc.secret, err)
+		}
+	}
 }
 
 func TestGenericRenderUnit(t *testing.T) {

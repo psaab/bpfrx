@@ -17079,3 +17079,81 @@ top.
   ddns validator and the config wiring to prefix-only makes
   TestP3GenericURLTemplateMalformedWarns and TestGenericURLTemplateValidation
   RED (host-less accepted + uppercase scheme false-rejected).
+
+## 2026-06-25 — #2839 DDNS checkip-allowlist: surface malformed tokens (no silent drop)
+- **Timestamp**: 2026-06-25
+- **Action**: `ddns.ParseAllowlist` silently dropped malformed checkip-allowlist
+  tokens, shrinking the bogus-IP safety gate with no operator feedback. Added
+  `ddns.ParseAllowlistChecked(s) (list, malformed)` (lenient `ParseAllowlist`
+  now delegates); wired a commit-time WARNING that names each offending token
+  via `ddnsAllowlistMalformedTokens` (mirrored in the compiler — `pkg/ddns`
+  imports `pkg/config`); the surface-A observer logs ONCE per
+  `(provider, allowlist)` so the per-poll-tick path does not flood. Semantics:
+  WARN (fail-open), matching the sibling `checkip-url` idiom (#2773) — valid
+  tokens are retained, the bad one is dropped, the operator is told.
+- **File(s)**: pkg/ddns/checkip.go, pkg/ddns/checkip_test.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_p3_http_providers_test.go, pkg/daemon/daemon.go,
+  pkg/daemon/daemon_ddns_surface_a.go, docs/config-schema.md
+- **Validation**: go build ./... ; gofmt -l (clean on touched files);
+  go vet ./pkg/ddns/... ./pkg/config/... ./pkg/daemon/... ; go test
+  ./pkg/ddns/... ./pkg/config/... ./pkg/daemon/... (PASS). Fail-on-revert
+  confirmed twice: reverting the ddns parse to a silent drop makes
+  TestParseAllowlistChecked RED ("expected 2 malformed tokens, got 0");
+  reverting the compiler helper to return nil makes
+  TestP3CheckIPAllowlistMalformedWarns RED (no allowlist warning emitted).
+## #2848 — BGP policy-options community add/delete/set/none operations
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add Junos/vSRX community manipulation operations to
+  `then community` policy-term action. Previously REPLACE-only
+  (`set community <list>`); now supports add (additive append), delete
+  (by community-list), set (replace), and none (strip all). Closes the
+  vSRX-parity gap where replace wiped upstream-set communities.
+- **File(s)**:
+  - `pkg/config/types_routing.go` — new `PolicyTerm.CommunityOp`,
+    `CommunityAdd`, `CommunityDelete` fields.
+  - `pkg/config/schema_routing.go` — `then community` is now a
+    `multi: true` leaf packing optional op keyword + value.
+  - `pkg/config/compiler_routing.go` — `applyCommunityAction` helper;
+    wired into the hierarchical (`firewallMatchValues`) and flat-set
+    inline compile paths.
+  - `pkg/frr/policy_render.go` — operation→FRR-clause switch: add →
+    `set community <v> additive`, delete → `set comm-list <name> delete`,
+    none → `set community none`, set/"" → `set community <v>`.
+  - `pkg/config/parser_security_test.go` — `TestPolicyCommunityOperationsCompile`
+    (compiler-level fail-on-revert).
+  - `pkg/frr/frr_test.go` — `TestPolicyCommunityOperations`
+    (end-to-end ParseSetCommand+SetPath+CompileConfig+generatePolicyOptions
+    fail-on-revert).
+  - `docs/config-schema.md`, `pkg/frr/README.md` — documented the
+    operation→clause mapping.
+- **Validation**: go build ./... ; gofmt -l (clean on touched files) ;
+  go vet ./pkg/frr/... ./pkg/config/... ; go test ./pkg/frr/...
+  ./pkg/config/... (PASS). Fail-on-revert confirmed both layers:
+  reverting the renderer switch to the plain `set community` makes
+  TestPolicyCommunityOperations RED; reverting the compiler call to
+  `term.Community = nodeVal(ac)` makes TestPolicyCommunityOperationsCompile
+  RED.
+## 2026-06-25 — #2840 DDNS Surface A: transient link-read must not publish static
+- **Timestamp**: 2026-06-25
+- **Action**: Fix `observeInterfaceAddr` so a `LinkByName`/`AddrList`
+  netlink READ ERROR returns `(zero, false)` (transient — engine leaves
+  the scope untouched, retries next pass) instead of falling back to the
+  configured static and returning `(static, true)`. Publishing a
+  configured static on a link-read failure pointed DNS at a possibly-stale
+  address during a transient link/reth outage, contradicting the
+  documented `(zero,false)=transient` contract (codex-review-049 049-09).
+  The static fallback now applies ONLY on the present-but-addressless
+  path (a SUCCESSFUL read yielding no usable dynamic address — the
+  legitimate static-use case); it still composes with `staticUnitAddr`'s
+  #2776 IsPublicAddr gate. Introduced `netlinkLinkByName`/`netlinkAddrList`
+  package-var seams so the contract is unit-tested without real netlink.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
+  pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md
+- **Validation**: go build ./... ; gofmt -l (clean on touched files) ;
+  go vet ./pkg/daemon/... ./pkg/ddns/... (clean) ;
+  go test ./pkg/daemon/ -run 'SurfaceA|ObserveInterface|StaticUnitAddr|SelectInterfaceAddr'
+  ./pkg/ddns/... (PASS). Fail-on-revert confirmed: reverting the
+  LinkByName-error branch to `(static,true)` makes
+  TestObserveInterfaceAddrTransientVsDefinitive/LinkByName_error RED.

@@ -248,7 +248,20 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), surfaceACheckIPTimeout)
 			defer cancel()
-			allow := ddns.ParseAllowlist(scope.Provider.CheckIPAllowlist)
+			allow, badAllow := ddns.ParseAllowlistChecked(scope.Provider.CheckIPAllowlist)
+			if len(badAllow) > 0 {
+				// A malformed checkip-allowlist token (operator typo) is dropped so
+				// the valid entries still gate, but a silent drop shrinks the bogus-IP
+				// safety gate (#2839). The commit-time warning already named the token;
+				// log once per (provider, allowlist-string) so the running daemon also
+				// surfaces it without flooding the per-tick observer.
+				key := scope.Provider.Name + "\x00" + scope.Provider.CheckIPAllowlist
+				if _, dup := d.surfaceACheckIPAllowlistWarned.LoadOrStore(key, struct{}{}); !dup {
+					slog.Warn("ddns surface-a: ignoring malformed checkip-allowlist token(s); "+
+						"bogus-IP allowlist is smaller than configured",
+						"provider", scope.Provider.Name, "tokens", badAllow)
+				}
+			}
 			// Bind the checkip probe to the provider's configured source-address /
 			// interface / VRF (#2846) so it egresses from the same source as the
 			// DDNS updates — not the kernel default route. A malformed source-
@@ -308,42 +321,71 @@ func surfaceALinuxIfName(cfg *config.Config, ifName string, unit *config.Interfa
 	return config.DHCPLeaseIfName(resolved, unit)
 }
 
+// netlinkLinkByName and netlinkAddrList are the netlink read seams for
+// observeInterfaceAddr. They are package vars so tests can inject a synthetic
+// link/address list (and a read FAILURE) without touching the real kernel
+// netlink socket — the same dependency-inversion pattern #2294/#2775 use.
+var (
+	netlinkLinkByName = netlink.LinkByName
+	netlinkAddrList   = netlink.AddrList
+)
+
 // observeInterfaceAddr reads the current publishable address of the given family
 // on a kernel interface via netlink (selection policy in selectInterfaceAddr:
 // prefer an RFC 4862 preferred address over a deprecated one, never a
-// tentative/dadfailed/optimistic one, public-gated via ddns.IsPublicAddr),
-// falling back to the unit's configured static address. Returns (zero, true)
-// when the interface exists but has no usable address of that family
-// (definitively none → the engine withdraws); (zero, false) when the interface
-// cannot be read (transient → the engine leaves the scope untouched).
+// tentative/dadfailed/optimistic one, public-gated via ddns.IsPublicAddr).
+//
+// Contract (the engine relies on the (addr, ok) distinction, plan §5.3):
+//
+//   - (addr, true)  — a definitive observation. A valid addr publishes it; an
+//     invalid/zero addr means "definitively no address of this family"
+//     (interface present but addressless and no usable static) → the engine
+//     WITHDRAWS any previously-published record.
+//   - (zero, false) — the interface could NOT be read this cycle (a transient
+//     LinkByName / AddrList netlink failure: interface absent during a rename,
+//     reth/HA churn, a netlink hiccup). The engine leaves the scope UNTOUCHED
+//     (no publish, no withdraw; retry next pass) — the never-blackhole rule.
+//
+// The configured static address is a fallback ONLY on the present-but-addressless
+// path (the legitimate static-use case: a successful read returned no usable
+// dynamic address). It is NEVER returned on a link-READ error — publishing a
+// configured static when we could not read the interface at all would point DNS
+// at a "configured" address that may not be "active" in the kernel data plane
+// (the #2840 transient-vs-definitive distinction). On a read error we cannot
+// tell present-but-addressless from absent, so the only safe answer is the
+// transient (zero, false).
 func (d *Daemon) observeInterfaceAddr(linuxName string, af4 bool, unit *config.InterfaceUnit) (netip.Addr, bool) {
-	link, err := netlink.LinkByName(linuxName)
+	link, err := netlinkLinkByName(linuxName)
 	if err != nil {
-		// Interface not present yet (rename pending / not up): transient.
-		if a, ok := staticUnitAddr(unit, af4); ok {
-			return a, true
-		}
+		// Link read failed (interface absent during a rename / reth churn /
+		// netlink hiccup): we cannot distinguish present-but-addressless from
+		// genuinely-down, so this is a TRANSIENT observation. Do NOT publish the
+		// configured static here — return (zero, false) so the engine leaves the
+		// scope untouched and retries next pass (#2840).
 		return netip.Addr{}, false
 	}
 	family := netlink.FAMILY_V4
 	if !af4 {
 		family = netlink.FAMILY_V6
 	}
-	addrs, err := netlink.AddrList(link, family)
+	addrs, err := netlinkAddrList(link, family)
 	if err != nil {
-		if a, ok := staticUnitAddr(unit, af4); ok {
-			return a, true
-		}
+		// Address read failed for an otherwise-present link: still transient
+		// (we did not get a definitive address list). Leave the scope untouched
+		// rather than fall back to the static (#2840).
 		return netip.Addr{}, false
 	}
 	if best, ok := selectInterfaceAddr(addrs, af4); ok {
 		return best, true
 	}
-	// No usable netlink address: fall back to a configured static address.
+	// Interface read SUCCEEDED but yielded no usable dynamic address: this is the
+	// legitimate present-but-addressless case. Fall back to a configured static
+	// address (still gated through ddns.IsPublicAddr in staticUnitAddr).
 	if a, ok := staticUnitAddr(unit, af4); ok {
 		return a, true
 	}
-	// Interface is up but has no address of this family: definitively none.
+	// Interface is up but has no address of this family and no usable static:
+	// definitively none → the engine withdraws.
 	return netip.Addr{}, true
 }
 

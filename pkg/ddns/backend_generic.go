@@ -95,15 +95,21 @@ func newGenericBackend(p *config.DDNSProvider) (*genericBackend, error) {
 // url.Parse fail or mangle the string (the same reason RedactURL is string-based,
 // #2781). It validates ONLY the scheme + host portion and tolerates any
 // %-specifier or {{...}} placeholder in the userinfo/path/query.
+//
+// The error message embeds the template through config.RedactURL: a generic
+// template routinely carries a credential in the userinfo (https://user:%p@...)
+// or the query (?token=SECRET), and this error is logged (slog.Warn at the
+// surface-A construction site) — the raw template must NOT reach journald
+// (#2841 credential-leak fold; matches the RedactURL'd commit-time warning).
 func validateGenericURLTemplate(tmpl string) error {
 	// Scheme: the substring up to "://", compared case-insensitively.
 	i := strings.Index(tmpl, "://")
 	if i < 0 {
-		return fmt.Errorf("url-template %q must be an http(s) URL (no scheme)", tmpl)
+		return fmt.Errorf("url-template %q must be an http(s) URL (no scheme)", config.RedactURL(tmpl))
 	}
 	scheme := tmpl[:i]
 	if !strings.EqualFold(scheme, "http") && !strings.EqualFold(scheme, "https") {
-		return fmt.Errorf("url-template %q must be an http(s) URL", tmpl)
+		return fmt.Errorf("url-template %q must be an http(s) URL", config.RedactURL(tmpl))
 	}
 	// Authority: between "://" and the first '/', '?' or '#'. Strip any userinfo
 	// ("user:pass@", which legitimately contains %u/%p) — the host is what
@@ -121,7 +127,7 @@ func validateGenericURLTemplate(tmpl string) error {
 		authority = authority[at+1:]
 	}
 	if authority == "" {
-		return fmt.Errorf("url-template %q has no host", tmpl)
+		return fmt.Errorf("url-template %q has no host", config.RedactURL(tmpl))
 	}
 	return nil
 }

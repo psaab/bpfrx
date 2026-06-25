@@ -332,9 +332,21 @@ its OWN learned address — on top of the SAME spine, without forking the engine
   (never withdraw); a valid-but-Invalid `Addr` (interface down / lease gone) →
   withdraw. Keeping observation in the daemon keeps `pkg/ddns` free of
   netlink/DHCP deps, exactly like the `LeaseParser` seam for Surface B.
-  **Static-address fallback is public-gated (#2776):** when the kernel
-  interface is absent/addressless, `observeInterfaceAddr` falls back to the
-  unit's configured static address via `staticUnitAddr`, which now gates the
+  **Transient link-read vs definitive-none (#2840):** `observeInterfaceAddr`
+  carefully distinguishes a netlink READ FAILURE from a present-but-addressless
+  interface. A `LinkByName`/`AddrList` ERROR (interface absent during a rename,
+  reth/HA churn, a netlink hiccup) is TRANSIENT → it returns `(zero, false)` so
+  the engine leaves the scope untouched and retries next pass. It does NOT fall
+  back to the configured static on a read error — publishing a "configured"
+  address that could not be confirmed "active" in the kernel data plane would
+  point DNS at a possibly-stale address during a transient link outage. The
+  netlink reads go through the `netlinkLinkByName`/`netlinkAddrList` seams so the
+  transient-vs-definitive contract is unit-tested without a real kernel
+  interface (`TestObserveInterfaceAddrTransientVsDefinitive`).
+  **Static-address fallback is public-gated (#2776) and present-but-addressless
+  only:** when the interface read SUCCEEDS but yields no usable dynamic address
+  (the legitimate static-use case), `observeInterfaceAddr` falls back to the
+  unit's configured static address via `staticUnitAddr`, which gates the
   candidate through the SAME `ddns.IsPublicAddr` predicate the netlink and
   checkip sources use (exported for this reuse, #2774). A mis-scoped static
   address (multicast, reserved, ULA, CGNAT, documentation, IANA

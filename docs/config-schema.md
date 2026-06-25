@@ -229,6 +229,45 @@ map-reuse merge keeps both. Fail-on-revert covered by
 `TestPrefixListMergeDuplicateBlocksHierarchical`
 (`compiler_prefix_list_merge_2641_test.go`).
 
+## `then community` operations: add / delete / set / none (#2848)
+
+The policy-term action `then community` supports the Junos/vSRX community
+operations in addition to the legacy bare replace form. Junos grammar is
+`then community (add | delete | set) <community-name>` plus `then community none`;
+the bare `then community <value>` is the historical whole-attribute replace and
+stays valid for back-compat.
+
+| Junos `then community ...` | xpf `CommunityOp` | FRR route-map set clause |
+|----------------------------|-------------------|--------------------------|
+| `add <value>`              | `add`             | `set community <value> additive` |
+| `delete <name>`            | `delete`          | `set comm-list <name> delete`    |
+| `set <value>`              | `set`             | `set community <value>`          |
+| `<value>` (bare)           | `""`              | `set community <value>`          |
+| `none`                     | `none`            | `set community none`             |
+
+`add` APPENDS to (does not overwrite) the existing community attribute — the
+parity gap that motivated #2848: emitting only `set community <value>` wiped
+upstream-set communities, breaking community-based traffic engineering and tag
+propagation in transit networks. `delete <name>` references a named
+`policy-options community <name>` (which xpf already renders as a
+`bgp community-list <name>`), so FRR's `set comm-list <name> delete` strips
+exactly its members. `none` strips all communities.
+
+Schema (`schema_routing.go`): `then community` is a `multi: true` leaf that
+packs the optional operation keyword plus the value onto one leaf's Keys
+(`community add 65000:111`, `community none`, `community 65000:111`). The
+compiler's `applyCommunityAction` (`compiler_routing.go`) reads every token via
+the `firewallMatchValues` SSOT and interprets the first token: `add`/`delete`/
+`set`/`none` select the operation, any other first token is a bare replace
+value. Both AST shapes converge — `SetPath`/block parse both nest `then` as a
+child node, so the hierarchical compile path is the one exercised; the flat
+inline path carries belt-and-suspenders handling for the same forms.
+
+Fail-on-revert: compiler-level
+`TestPolicyCommunityOperationsCompile` (`pkg/config/parser_security_test.go`)
+and end-to-end `TestPolicyCommunityOperations` (`pkg/frr/frr_test.go`, full
+ParseSetCommand + SetPath + CompileConfig + `generatePolicyOptions`).
+
 ## How to add a config-mode typed leaf
 
 Edit the leaf's `schemaNode` in `setSchema` (in the domain's
@@ -900,8 +939,9 @@ reserved for whole-dataplane selection where a rewrite shim
       (success-substring matcher; default good/nochg/ok/true/updated).
     - checkip (opt-in, behind-NAT address source): `checkip-url` +
       `checkip-allowlist` (comma/space bogus addresses to ignore, e.g. the
-      embedded `1.1.1.1` in a /cdn-cgi/trace page). The per-interface binding's
-      `address-source` enum gains `checkip`.
+      embedded `1.1.1.1` in a /cdn-cgi/trace page; a malformed token is no
+      longer silently dropped — it warns at commit, naming the token, #2839).
+      The per-interface binding's `address-source` enum gains `checkip`.
   - **Security** (plan §8.1): every credential is `config.Secret` (revealed only
     at the transport boundary, never in a URL/error/log; `DDNSProvider.String()`
     redacts all of them); HTTPS with system-trust cert+hostname verification
@@ -923,12 +963,27 @@ reserved for whole-dataplane selection where a rewrite shim
     `%h/%i/%u/%p` specifiers (including a credential in the userinfo, e.g.
     `https://user:%p@host/upd`, which would make `url.Parse` fail) and `{{...}}`
     placeholders in the rest of the URL — same rationale as `RedactURL` (#2781).
+    Both the commit mirror and the runtime gate `TrimSpace` the template before
+    validating so they stay byte-for-byte in lockstep (a leading-whitespace
+    template must not warn while the runtime trims+accepts it). The malformed
+    template is `RedactURL`'d in the warning message (it may carry a credential).
     Without the commit-time check the typo committed silently and the runtime
     fetch then masqueraded forever as a transient observation failure,
     suppressing publishing indefinitely. The runtime `ddns.CheckIP` gate
     (`validateCheckIPURL`) and the generic backend's `validateGenericURLTemplate`
     (in `newGenericBackend`) fail closed on the same malformed URL regardless, so
-    a URL that slips past commit cannot reach a fetch. Regression coverage:
+    a URL that slips past commit cannot reach a fetch. A malformed
+    `checkip-allowlist` token (operator typo, e.g. `8.8.8.8x`) also warns at
+    commit and NAMES the offending token (#2839); the allowlist is a bogus-IP
+    safety gate, so a token that was previously SILENTLY DROPPED shrank the gate
+    and let the checkip parser admit the very IP the operator meant to suppress.
+    Valid tokens are still retained; the runtime parse
+    (`ddns.ParseAllowlistChecked`) mirrors this and fails lenient — it drops the
+    bad token, keeps the valid entries, and logs ONCE per `(provider, allowlist)`
+    in the surface-A observer (the per-poll-tick path must not flood). The
+    commit-warn parse is mirrored in `ddnsAllowlistMalformedTokens`
+    (`compiler_validate_warn.go`) because `pkg/ddns` imports `pkg/config`.
+    Regression coverage:
     `pkg/config/compiler_p3_http_providers_test.go`,
     `pkg/ddns/backend_http_test.go` / `backend_cloudflare_test.go` /
     `backend_route53_test.go` / `sigv4_test.go` / `checkip_test.go` /
