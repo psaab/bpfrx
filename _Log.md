@@ -1,3 +1,62 @@
+## 2026-06-25 — #2867: VRRP GARP/NA burst follow-up loops keep poisoning after abdication
+
+- **Timestamp**: 2026-06-25
+- **Action**: The detached GARP/NA burst follow-up loops
+  (`runARPBurstFollowups` / `runNABurstFollowups` in `pkg/cluster/garp.go`,
+  launched from `becomeMaster` → `sendGARP` → `SendGratuitous*Burst`) had no
+  epoch/state gate. A node abdicating master mid-burst (link flap / rapid
+  preempt / split-brain) kept broadcasting GARP/NA for VIPs it no longer
+  owned, re-poisoning neighbor caches. Added a `BurstStillValid func() bool`
+  predicate threaded through `SendGratuitousARPBurstGated` /
+  `SendGratuitousIPv6BurstGated` into the follow-up loops; checked before
+  every follow-up frame, stops on false. `sendGARP` passes
+  `getState()==StateMaster && garpEpoch==captured` (composes with the
+  #2081 garpEpoch / #2082 preempt-gate). Original ungated `SendGratuitous*Burst`
+  kept as nil-predicate wrappers for direct-mode re-announce callers.
+- **File(s)**: pkg/cluster/garp.go, pkg/vrrp/instance.go,
+  pkg/cluster/garp_abdicate_test.go (fail-on-revert),
+  pkg/vrrp/instance_garp_abdicate_test.go, pkg/cluster/garp_burst_errors_test.go
+  (signature update), pkg/cluster/README.md, pkg/vrrp/README.md
+- **Validation**: go build ./..., gofmt -l (clean), go vet, go test -race
+  ./pkg/cluster/... ./pkg/vrrp/... — green. Fail-on-revert verified: removing
+  the gate turns TestARPBurstFollowups_AbortsOnAbdication +
+  TestNABurstFollowups_AbortsOnAbdication RED. HA — PARENT runs
+  make test-failover before merge.
+
+## 2026-06-25 — #2843: DDNS Surface A status omits never-published / errored scopes
+
+- **Timestamp**: 2026-06-25
+- **Action**: `SurfaceAManager.StatusViews` built rows ONLY from durable
+  ownership records, so a configured scope that failed before its first
+  publish (esp. a half-configured provider whose `errSurfaceANoBackend`
+  was swallowed without `recordScopeError`) had no row — invisible in
+  `show services dynamic-dns detail` during bring-up.
+- **Fix**: `StatusViews(scopes []SurfaceAScope)` now returns the UNION of
+  a row per CONFIGURED scope (merged with ownership + runtime state) and
+  any ownership record for a scope no longer configured (withdraw
+  pending). New `SurfaceAStatusView.State`: published / unpublished
+  (no-backend) / error / pending / withdraw-pending. The no-backend
+  sentinel now records a per-scope reason (`rt.noBackend` + `lastErr`)
+  WITHOUT arming retry backoff, cleared on success / superseded by a real
+  error. Daemon `SurfaceAStatus()` materializes the configured scopes via
+  `buildSurfaceAScopes(ActiveConfig())`. CLI + gRPC `show` render the new
+  State column (text only — `SurfaceAStatusView` is an internal Go type,
+  rendered server/client side; NO protobuf/wire field added).
+- **Test**: `TestStatusViewsSurfacesUnpublishedScopes` +
+  `TestStatusViewsSurfacesPendingAndPublished` (fail-on-revert) — a
+  configured no-backend scope appears as `unpublished` with a reason, a
+  never-observed scope as `pending`, a published scope as `published`, and
+  an orphaned ownership record as `withdraw-pending`. Verified RED when
+  StatusViews reverts to ownership-records-only.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/surface_a_test.go,
+  pkg/ddns/surface_a_http_test.go, pkg/ddns/surface_a_lockio_test.go,
+  pkg/daemon/daemon_ddns_surface_a.go, pkg/cli/cli_show_services.go,
+  pkg/grpcapi/server_show_dhcp_lldp_snmp.go, pkg/ddns/README.md
+- **Validation**: go build ./... ; gofmt -l (clean on touched files) ;
+  go vet ./pkg/ddns/... ./pkg/daemon/... ./pkg/grpcapi/... (clean;
+  pre-existing pkg/cli/cli.go:460 unreachable-code vet warning is on
+  origin/master, in a file I did not touch) ; go test ./pkg/ddns/...
+  ./pkg/daemon/... ./pkg/grpcapi/... ./pkg/cli/... (PASS).
 ## 2026-06-25 — #2838: DDNS generic backend false-success on substring "ok"
 
 - **Timestamp**: 2026-06-25
@@ -17051,6 +17110,86 @@ top.
   ./pkg/config/... (PASS). Fail-on-revert confirmed: reverting the gate
   to `term.Metric > 0` makes TestGeneratePolicyOptionsMetricZero RED.
 
+- **Timestamp**: 2026-06-25
+- **Action**: #2841 — validate generic DDNS url-template with the same
+  discipline as checkip-url (template-aware: parse scheme + host without
+  choking on inadyn %-specifiers)
+- **File(s)**:
+  - `pkg/ddns/backend_generic.go` — add `validateGenericURLTemplate`
+    (string-based, case-insensitive http(s) scheme + non-empty host,
+    strips userinfo so `%u`/`%p` credentials are tolerated); call it in
+    `newGenericBackend` in place of the old bare `HasPrefix` prefix check.
+  - `pkg/config/compiler_validate_warn.go` — add mirror
+    `ddnsGenericURLTemplateValid` + wire a commit WARNING into the
+    `case "generic"` (RedactURL'd template in the message), matching the
+    checkip-url warning pattern.
+  - `pkg/ddns/backend_http_test.go` — `TestGenericURLTemplateValidation`
+    (reject host-less/wrong-scheme/no-scheme; accept %-specifiers,
+    userinfo-credential, uppercase scheme, explicit port).
+  - `pkg/config/compiler_p3_http_providers_test.go` —
+    `TestP3GenericURLTemplateMalformedWarns` (host-less/wrong-scheme/junk
+    warn; valid %-specifier/userinfo-cred/uppercase templates do NOT
+    warn). Built via ParseSetCommand + SetPath + CompileConfig.
+  - `pkg/ddns/README.md`, `docs/config-schema.md` — documented the
+    template-aware validation + commit warning.
+- **Validation**: go build ./... ; gofmt -l (clean on touched files);
+  go vet ./pkg/config/... ./pkg/ddns/... ; go test ./pkg/config/...
+  ./pkg/ddns/... (PASS). Fail-on-revert confirmed: reverting both the
+  ddns validator and the config wiring to prefix-only makes
+  TestP3GenericURLTemplateMalformedWarns and TestGenericURLTemplateValidation
+  RED (host-less accepted + uppercase scheme false-rejected).
+
+- **Action**: #2844 — unify the NAT64 Ethernet-header writer onto the
+  shared SSOT writer. Deleted NAT64's private `write_eth_header`
+  (hardcoded 0x8100 TPID, bare-VID) and routed both NAT64 frame
+  builders through `crate::afxdp::write_eth_header_slice`, the same
+  in-place writer used by gre.rs / icmp.rs / TX segmentation. Output is
+  byte-identical for the current bare-VID case (`TxVlanTag::from(u16)`
+  reproduces present-iff-vid>0 / TPID 0x8100 / PCP·DEI 0), so no wire
+  change; the point is forward-compat — a future TPID/PCP/DEI/802.1ad/
+  ethertype change in the shared module now reaches NAT64.
+- **File(s)**:
+  - `userspace-dp/src/afxdp/frame/headers.rs` — `write_eth_header_slice`
+    widened `pub(in crate::afxdp)` → `pub(crate)`; module-doc note.
+  - `userspace-dp/src/afxdp/frame/mod.rs` — split it to a `pub(crate)`
+    re-export (other writers stay `pub(in crate::afxdp)`).
+  - `userspace-dp/src/afxdp/mod.rs` — `pub(crate) use
+    self::frame::write_eth_header_slice;` so `crate::nat64` (outside
+    `crate::afxdp`) can reach it.
+  - `userspace-dp/src/nat64.rs` — deleted private writer; import +
+    call the SSOT writer in both builders; module-doc SSOT section.
+  - `userspace-dp/src/nat64_tests.rs` — added byte-identical
+    fail-on-revert test `nat64_eth_header_is_ssot_byte_identical`
+    (v6→v4 untagged 0x0800, v6→v4 VLAN-100 0x8100+VID+0x0800,
+    v4→v6 untagged 0x86dd).
+- **Validation**: `cargo build --release -p xpf-userspace-dp` (Finished);
+  `cargo test --release --bin xpf-userspace-dp -- nat64 eth frame`
+  (453 passed, 0 failed). No `protocol_wire_v1.json` change. Fail-on-
+  revert confirmed: flipping the v6→v4 builder ethertype to 0x86dd
+  makes `nat64_eth_header_is_ssot_byte_identical` RED (got 0x86dd vs
+  expected 0x0800).
+## 2026-06-25 — #2839 DDNS checkip-allowlist: surface malformed tokens (no silent drop)
+- **Timestamp**: 2026-06-25
+- **Action**: `ddns.ParseAllowlist` silently dropped malformed checkip-allowlist
+  tokens, shrinking the bogus-IP safety gate with no operator feedback. Added
+  `ddns.ParseAllowlistChecked(s) (list, malformed)` (lenient `ParseAllowlist`
+  now delegates); wired a commit-time WARNING that names each offending token
+  via `ddnsAllowlistMalformedTokens` (mirrored in the compiler — `pkg/ddns`
+  imports `pkg/config`); the surface-A observer logs ONCE per
+  `(provider, allowlist)` so the per-poll-tick path does not flood. Semantics:
+  WARN (fail-open), matching the sibling `checkip-url` idiom (#2773) — valid
+  tokens are retained, the bad one is dropped, the operator is told.
+- **File(s)**: pkg/ddns/checkip.go, pkg/ddns/checkip_test.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_p3_http_providers_test.go, pkg/daemon/daemon.go,
+  pkg/daemon/daemon_ddns_surface_a.go, docs/config-schema.md
+- **Validation**: go build ./... ; gofmt -l (clean on touched files);
+  go vet ./pkg/ddns/... ./pkg/config/... ./pkg/daemon/... ; go test
+  ./pkg/ddns/... ./pkg/config/... ./pkg/daemon/... (PASS). Fail-on-revert
+  confirmed twice: reverting the ddns parse to a silent drop makes
+  TestParseAllowlistChecked RED ("expected 2 malformed tokens, got 0");
+  reverting the compiler helper to return nil makes
+  TestP3CheckIPAllowlistMalformedWarns RED (no allowlist warning emitted).
 ## #2848 — BGP policy-options community add/delete/set/none operations
 
 - **Timestamp**: 2026-06-25
@@ -17125,3 +17264,37 @@ top.
   per-candidate `.filter(zone_ok)` fall-through to the once-after-precedence
   zone check makes the new test RED at the `fallback match` expect.
   protocol_wire_v1.json untouched.
+- **Action**: #2889 — reject FRR auth secrets containing whitespace at
+  commit. A BGP neighbor password / OSPF-RIP-ISIS auth key with a space
+  (or tab / control char) cannot be expressed as a single FRR/vtysh token
+  (FRR's command lexer, lib/command_lex.l, splits on whitespace and has
+  NO quoted-string and NO rest-of-line token — quoting is impossible), so
+  it would be truncated at the first space or inject trailing words as
+  extra vtysh args at frr.conf load. Researched FRR's lexer to confirm
+  quoting is unsupported, then added validateFRRAuthValuesStrict (strict
+  on commit/commit-check naming the field; lenient warn on load/HA-sync
+  per #1960). Scoped to the security-relevant password/key clauses;
+  neighbor description left control-char-sanitized only (noted as
+  follow-up).
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/parser_routing_test.go, pkg/frr/README.md
+- **Validation**: go build ./... ; gofmt -l (clean) ; go vet
+  ./pkg/frr/... ./pkg/config/... (clean) ; go test ./pkg/frr/...
+  ./pkg/config/... (PASS). Fail-on-revert confirmed:
+  TestFRRAuthValueWhitespaceRejected goes RED (space-containing secrets
+  compile cleanly) when validateFRRAuthValuesStrict's call site is removed.
+  **Action**: #2888 DHCP relay server-facing socket binds giaddr:67 (BOOTPS)
+  instead of giaddr:0 (ephemeral). RFC 2131 §4.1: a strict server unicasts its
+  reply to the relay at giaddr:67, so an ephemeral-port server conn never
+  receives the reply and relayed leases never complete with strict servers. The
+  server conn now binds giaddr:relayPort and sets reusePort=true (SO_REUSEADDR/
+  SO_REUSEPORT) so giaddr:67 coexists with the client listener's 0.0.0.0:67
+  without EADDRINUSE; no BINDTODEVICE, no broadcast. Added fail-on-revert test
+  TestServerConn_BindsGiaddrBOOTPS (asserts giaddr:67 + reusePort; RED on revert
+  to Port:0). Updated TestApply_MultiInterface_NoCollision + the #2347 drift
+  test to classify client-vs-server conns by bind IP (0.0.0.0 wildcard vs
+  specific giaddr) since both now bind port 67. Gates: go build ./..., gofmt -l
+  clean, go vet ./pkg/dhcprelay/..., go test ./pkg/dhcprelay/... PASS.
+  **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/dhcprelay/README.md, _Log.md

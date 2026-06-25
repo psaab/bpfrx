@@ -130,6 +130,22 @@ This is the package that drives chassis-cluster failover.
   the target was the network address with its last octet forced to .1, which
   fell OUTSIDE the subnet for /25-or-longer prefixes whose network does not
   end in .0 (e.g. VIP 10.0.61.18/28 → 10.0.61.1, outside .16-.31).
+- Burst follow-up abdication gate (#2867): the cluster burst helpers send the
+  first GARP/NA frame synchronously, then fan the remaining `count-1` frames
+  out over a detached goroutine spanning `(count-1)*50 ms`. `sendGARP` captures
+  `garpEpoch` and passes a `stillMaster` predicate
+  (`getState() == StateMaster && garpEpoch == captured`) into
+  `cluster.SendGratuitousARPBurstGated` / `SendGratuitousIPv6BurstGated`. The
+  follow-up loop re-reads that predicate before EVERY frame and stops the moment
+  it returns false. Without the gate, a node that abdicates (master→backup on a
+  link flap / rapid preemption / split-brain resolution) or whose burst is
+  superseded by a newer one (epoch bump from `ReconcileVIPs` / a later
+  `becomeMaster`) keeps broadcasting GARP/NA for VIPs it no longer owns —
+  re-poisoning neighbor caches toward an abdicated node, the exact blackhole
+  GARP exists to prevent. The gate is consulted only AFTER the synchronous first
+  frame, so the immediate failover advert is never suppressed; a nil predicate
+  (direct-mode re-announce, tests) keeps the original run-to-completion
+  behavior.
 - Event debounce 500 ms before priority updates.
 - Sync hold: VRRP starts with `preempt=false`; released after bulk
   session sync (or 10 s timeout). `preemptNowCh` triggers instant
