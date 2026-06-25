@@ -35,12 +35,24 @@ pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
 ///
 /// Sizing: the largest legitimate request is `apply_snapshot`, which
 /// carries the entire compiled config (every zone, policy, address-book
-/// entry, NAT rule, filter, route, etc.). Even a pathologically large
-/// production config serializes to a few MB of JSON; 16 MiB gives roughly
-/// an order of magnitude of headroom over any realistic snapshot while
-/// still bounding a single request's read allocation to a fixed ceiling.
-/// A request larger than this is, by construction, malformed — reject it
-/// before allocating its body and keep the daemon alive (fail-closed).
+/// entry, NAT rule, filter, route, etc.). A hand-authored production
+/// config serializes to a few MB of JSON, so 16 MiB leaves ample margin
+/// for the policy/NAT/route dimension while still bounding a single
+/// request's read allocation to a fixed ceiling. A request larger than
+/// this is rejected before allocating its body, keeping the daemon alive
+/// (fail-closed: stale config retained, one log line, no crash).
+///
+/// Caveat — the dominant scaling dimension is NOT policy count but
+/// dynamic-feed-backed address books: `AddressBookSnapshot.prefixes_v4/v6`
+/// carry feed prefixes inline as CIDR text (see
+/// `buildAddressBookTableWithFeeds`, `pkg/dataplane/userspace/policies.go`),
+/// bounded only by a per-line scanner cap, not a total-entry cap. A very
+/// large threat-intel feed (hundreds of thousands of CIDRs) can push a
+/// *legitimate* snapshot past 16 MiB, in which case this cap rejects it
+/// at the control socket with no Go-side commit-time diagnostic. That is
+/// safe (fail-closed) but coarse; #2744 tracks a feed-dimension-aware cap
+/// plus a Go-side pre-flight size check that surfaces the limit as a
+/// config error instead of a silent control-socket rejection.
 pub(crate) const MAX_CONTROL_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
