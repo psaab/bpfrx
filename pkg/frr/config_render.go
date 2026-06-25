@@ -245,12 +245,23 @@ func renderBackupRouter(b *strings.Builder, fc *FullConfig) {
 	if fc.BackupRouter == "" {
 		return
 	}
+	// Match the route prefix family to the next-hop (backup-router) family,
+	// not the destination family. An IPv6 backup-router with an empty/default
+	// destination must default to ::/0 and emit `ipv6 route ::/0 <v6nh>`;
+	// defaulting to 0.0.0.0/0 here would emit `ip route 0.0.0.0/0 <v6nh>` —
+	// a v4 prefix with a v6 next-hop, which frr-reload rejects and which
+	// fails the entire static config load (#2891).
+	nhV6 := strings.Contains(fc.BackupRouter, ":")
 	dst := fc.BackupRouterDst
 	if dst == "" {
-		dst = "0.0.0.0/0"
+		if nhV6 {
+			dst = "::/0"
+		} else {
+			dst = "0.0.0.0/0"
+		}
 	}
 	prefix := "ip"
-	if strings.Contains(dst, ":") {
+	if nhV6 || strings.Contains(dst, ":") {
 		prefix = "ipv6"
 	}
 	fmt.Fprintf(b, "%s route %s %s 250\n", prefix, dst, fc.BackupRouter)
