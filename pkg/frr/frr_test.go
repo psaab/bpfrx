@@ -2685,7 +2685,7 @@ func TestGenerateProtocols_BGPLogNeighborChanges(t *testing.T) {
 func TestResolveRedistribute_BareProtocol(t *testing.T) {
 	m := New()
 	for _, proto := range []string{"connected", "static", "ospf", "bgp", "rip", "isis", "kernel"} {
-		got := m.resolveRedistribute(proto, nil)
+		got := m.resolveRedistribute(proto, nil, "")
 		want := " redistribute " + proto + "\n"
 		if got != want {
 			t.Errorf("resolveRedistribute(%q, nil) = %q, want %q", proto, got, want)
@@ -2708,7 +2708,7 @@ func TestResolveRedistribute_PolicyStatement(t *testing.T) {
 			},
 		},
 	}
-	got := m.resolveRedistribute("export-connected", po)
+	got := m.resolveRedistribute("export-connected", po, "")
 	want := " redistribute connected route-map export-connected\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -2728,7 +2728,7 @@ func TestResolveRedistribute_MultiProtocol(t *testing.T) {
 			},
 		},
 	}
-	got := m.resolveRedistribute("export-all", po)
+	got := m.resolveRedistribute("export-all", po, "")
 	// Should have both protocols, sorted alphabetically
 	if !strings.Contains(got, "redistribute connected route-map export-all\n") {
 		t.Errorf("missing connected route-map in:\n%s", got)
@@ -2951,7 +2951,7 @@ func TestResolveRedistribute_ProtocolLessPolicy(t *testing.T) {
 			},
 		},
 	}
-	got := m.resolveRedistribute("export-comm", po)
+	got := m.resolveRedistribute("export-comm", po, "")
 	if got != "" {
 		t.Errorf("protocol-less policy must yield no redistribute line, got %q", got)
 	}
@@ -2970,7 +2970,7 @@ func TestResolveRedistribute_ProtocolLessPolicy(t *testing.T) {
 func TestResolveRedistribute_UnknownToken(t *testing.T) {
 	m := New()
 	// nil policy-options: the name resolves to nothing.
-	if got := m.resolveRedistribute("no-such-policy", nil); got != "" {
+	if got := m.resolveRedistribute("no-such-policy", nil, ""); got != "" {
 		t.Errorf("unknown token must yield no redistribute line, got %q", got)
 	}
 	// Non-nil policy-options that simply does not define the name.
@@ -2979,7 +2979,7 @@ func TestResolveRedistribute_UnknownToken(t *testing.T) {
 			"other": {Name: "other"},
 		},
 	}
-	if got := m.resolveRedistribute("typo-name", po); got != "" {
+	if got := m.resolveRedistribute("typo-name", po, ""); got != "" {
 		t.Errorf("undefined policy name must yield no redistribute line, got %q", got)
 	}
 }
@@ -5528,4 +5528,145 @@ func TestGeneratePolicyOptionsLocalPreferenceZero(t *testing.T) {
 			t.Errorf("local-preference 200 must still render `set local-preference 200`; got:\n%s", got)
 		}
 	})
+}
+
+// TestResolveRedistribute_SelfExclusion is the #2943 fail-on-revert guard
+// for self-redistribution: a protocol must never redistribute its own
+// routes (FRR rejects `redistribute ospf` under `router ospf`, failing the
+// whole managed reload). Both the bare-token path and the policy-statement
+// `from protocol <self>` path must drop the self protocol.
+func TestResolveRedistribute_SelfExclusion(t *testing.T) {
+	m := New()
+	// Bare-token self redistribute is dropped.
+	if got := m.resolveRedistribute("ospf", nil, "ospf"); got != "" {
+		t.Errorf("self-redistribute (bare token) must be dropped; got %q", got)
+	}
+	// A different protocol still renders.
+	if got := m.resolveRedistribute("static", nil, "ospf"); got != " redistribute static\n" {
+		t.Errorf("non-self protocol must still redistribute; got %q", got)
+	}
+	// Policy-statement path: a term `from protocol ospf` under router ospf
+	// is self-redistribution and must be excluded, while a sibling
+	// `from protocol static` term still renders.
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"leak": {
+				Name: "leak",
+				Terms: []*config.PolicyTerm{
+					{Name: "self", FromProtocols: []string{"ospf"}, Action: "accept"},
+					{Name: "other", FromProtocols: []string{"static"}, Action: "accept"},
+				},
+			},
+		},
+	}
+	got := m.resolveRedistribute("leak", po, "ospf")
+	if strings.Contains(got, "redistribute ospf route-map leak") {
+		t.Errorf("self-redistribute via policy term must be excluded (#2943); got %q", got)
+	}
+	if !strings.Contains(got, "redistribute static route-map leak") {
+		t.Errorf("non-self policy term must still render; got %q", got)
+	}
+}
+
+// TestResolveRedistribute_OSPF6RIPng is the #2943 fail-on-revert guard for
+// the missing ospf6 / ripng keywords: a bare `export ospf6` / `export
+// ripng` must render the valid FRR redistribute line, not fall through to
+// the skip-and-warn path that silently drops IPv6 IGP redistribution.
+func TestResolveRedistribute_OSPF6RIPng(t *testing.T) {
+	m := New()
+	if got := m.resolveRedistribute("ospf6", nil, ""); got != " redistribute ospf6\n" {
+		t.Errorf("ospf6 must render `redistribute ospf6`; got %q", got)
+	}
+	if got := m.resolveRedistribute("ripng", nil, ""); got != " redistribute ripng\n" {
+		t.Errorf("ripng must render `redistribute ripng`; got %q", got)
+	}
+}
+
+// TestGenerateProtocols_IPv6NeighborPolicyActivatesUnderV6 is the #2941
+// fail-on-revert guard: an IPv6 BGP peer address (2001:db8::1) with a
+// global export policy but NO explicit `family inet6` must be activated
+// under `address-family ipv6 unicast`, never under ipv4 unicast. Before the
+// fix the `!n.FamilyInet6` fall-through routed the policied family-less peer
+// into the ipv4 set, so FRR tried to resolve an IPv4 next-hop over the IPv6
+// session and dropped prefixes. The export name must be a DEFINED
+// policy-statement so the global default takes the route-map path (not the
+// redistribute path).
+func TestGenerateProtocols_IPv6NeighborPolicyActivatesUnderV6(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"adv-v6": {
+				Name:          "adv-v6",
+				Terms:         []*config.PolicyTerm{{Name: "t1", Action: "accept"}},
+				DefaultAction: "reject",
+			},
+		},
+	}
+	bgp := &config.BGPConfig{
+		LocalAS: 65000,
+		Export:  []string{"adv-v6"}, // global default export, a defined policy
+		Neighbors: []*config.BGPNeighbor{
+			// IPv6 peer, no family stanza, but reached by the global export.
+			{Address: "2001:db8::1", PeerAS: 65001},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 1, po)
+
+	v6Idx := strings.Index(got, "address-family ipv6 unicast")
+	v4Idx := strings.Index(got, "address-family ipv4 unicast")
+	if v6Idx < 0 {
+		t.Fatalf("expected an ipv6 unicast address-family block; got:\n%s", got)
+	}
+	activate := "neighbor 2001:db8::1 activate"
+	aIdx := strings.Index(got, activate)
+	if aIdx < 0 {
+		t.Fatalf("IPv6 neighbor never activated; got:\n%s", got)
+	}
+	// The activate line must fall INSIDE the ipv6 block, not the ipv4 block.
+	if v4Idx >= 0 && v4Idx < aIdx && (v6Idx < 0 || v6Idx > aIdx) {
+		t.Errorf("IPv6 neighbor activated under ipv4 unicast (#2941 regression); got:\n%s", got)
+	}
+	if !(v6Idx < aIdx) {
+		t.Errorf("IPv6 neighbor activate must follow the ipv6 unicast header; got:\n%s", got)
+	}
+	// The route-map out must also land in the ipv6 block.
+	if !strings.Contains(got, "neighbor 2001:db8::1 route-map adv-v6 out") {
+		t.Errorf("expected `neighbor 2001:db8::1 route-map adv-v6 out`; got:\n%s", got)
+	}
+}
+
+// TestGenerateProtocols_ISISBFDInsideInterfaceBlock is the #2942
+// fail-on-revert guard: `isis bfd` (interface-scoped) must be emitted
+// INSIDE the `interface <name>` block, BEFORE its `exit`. Emitting it after
+// `exit` lands it in global scope, which vtysh rejects and one rejected
+// line fails the whole managed-section reload (#1880/#2223).
+func TestGenerateProtocols_ISISBFDInsideInterfaceBlock(t *testing.T) {
+	m := New()
+	isis := &config.ISISConfig{
+		NET:   "49.0001.0100.0000.0001.00",
+		Level: "level-2",
+		Interfaces: []*config.ISISInterface{
+			{Name: "ge-0-0-1", BFD: true},
+		},
+	}
+	got := m.generateProtocols(nil, nil, nil, nil, isis, "", 1, nil)
+
+	ifaceIdx := strings.Index(got, "interface ge-0-0-1")
+	if ifaceIdx < 0 {
+		t.Fatalf("expected an `interface ge-0-0-1` block; got:\n%s", got)
+	}
+	bfdIdx := strings.Index(got[ifaceIdx:], " isis bfd\n")
+	if bfdIdx < 0 {
+		t.Fatalf("expected an `isis bfd` line for the interface; got:\n%s", got)
+	}
+	bfdIdx += ifaceIdx
+	// The interface block's `exit` must come AFTER the isis bfd line.
+	exitIdx := strings.Index(got[ifaceIdx:], "exit\n")
+	if exitIdx < 0 {
+		t.Fatalf("expected an `exit` closing the interface block; got:\n%s", got)
+	}
+	exitIdx += ifaceIdx
+	if !(bfdIdx < exitIdx) {
+		t.Errorf("`isis bfd` emitted AFTER the interface `exit` (#2942 regression) — lands in global scope; got:\n%s", got)
+	}
 }

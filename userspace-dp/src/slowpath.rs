@@ -74,10 +74,32 @@ struct PacketRequest {
     bytes: Vec<u8>,
 }
 
+/// Dual token-bucket rate limiter for the slow-path control queue (#2912).
+///
+/// The previous fixed-window limiter zeroed its counters whenever 1s of wall
+/// time had elapsed since the window opened. A fixed window admits the full
+/// per-second budget at the very end of window N AND the full budget at the
+/// start of window N+1 — up to **2x** the configured rate in an arbitrarily
+/// short interval straddling the boundary, which can overload downstream
+/// control processing.
+///
+/// A token bucket smooths the admitted rate across boundaries: tokens
+/// accumulate continuously at `rate` per second (one packet-token and one
+/// byte-token bucket) and are spent on admission. The bucket caps at `rate`
+/// (1s of accumulation) so the maximum burst in ANY interval is bounded by the
+/// configured per-second rate, not 2x. Fractional accrual is preserved by
+/// tracking the token balance as `f64` and folding the proportional refill into
+/// it on every admission, so a steady stream at exactly the rate is never
+/// under-admitted by repeated truncation.
 struct RateLimiter {
-    window_started: Instant,
-    packets: u64,
-    bytes: u64,
+    /// Wall-clock instant the token balances were last refreshed. Each refill
+    /// reads `now - last_refill`, accrues `elapsed * rate` tokens into the f64
+    /// balances (capped at capacity), and advances `last_refill` to `now`.
+    last_refill: Instant,
+    /// Currently available packet tokens (capacity == `max_packets_per_sec`).
+    packet_tokens: f64,
+    /// Currently available byte tokens (capacity == `max_bytes_per_sec`).
+    byte_tokens: f64,
     max_packets_per_sec: u64,
     max_bytes_per_sec: u64,
 }
@@ -85,28 +107,56 @@ struct RateLimiter {
 impl RateLimiter {
     fn new(max_packets_per_sec: u64, max_bytes_per_sec: u64) -> Self {
         Self {
-            window_started: Instant::now(),
-            packets: 0,
-            bytes: 0,
+            last_refill: Instant::now(),
+            // Start full so a freshly created limiter does not penalize the
+            // first burst (matches the prior fixed-window behaviour, which
+            // admitted a full budget in the first window).
+            packet_tokens: max_packets_per_sec as f64,
+            byte_tokens: max_bytes_per_sec as f64,
             max_packets_per_sec,
             max_bytes_per_sec,
         }
     }
 
+    /// Admit (or refuse) one `packet_len`-byte frame, using the real clock.
+    /// Production entry point; thin wrapper over the clock-injectable
+    /// [`Self::allow_at`].
     fn allow(&mut self, packet_len: usize) -> bool {
-        if self.window_started.elapsed() >= Duration::from_secs(1) {
-            self.window_started = Instant::now();
-            self.packets = 0;
-            self.bytes = 0;
+        self.allow_at(Instant::now(), packet_len)
+    }
+
+    /// Clock-injectable core of [`Self::allow`]. `now` is the current instant
+    /// (the real clock in production; a controlled instant in tests so the
+    /// boundary behaviour is deterministic without sleeping). Accrues tokens for
+    /// the time since the last refill, then spends one packet token and
+    /// `packet_len` byte tokens iff BOTH buckets can pay — a refused frame
+    /// charges neither bucket.
+    fn allow_at(&mut self, now: Instant, packet_len: usize) -> bool {
+        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+
+        // A zero rate admits nothing and never accrues tokens.
+        if self.max_packets_per_sec > 0 {
+            let cap = self.max_packets_per_sec as f64;
+            self.packet_tokens = (self.packet_tokens + elapsed * cap).min(cap);
+        } else {
+            self.packet_tokens = 0.0;
         }
-        if self.packets.saturating_add(1) > self.max_packets_per_sec {
+        if self.max_bytes_per_sec > 0 {
+            let cap = self.max_bytes_per_sec as f64;
+            self.byte_tokens = (self.byte_tokens + elapsed * cap).min(cap);
+        } else {
+            self.byte_tokens = 0.0;
+        }
+
+        let need_bytes = packet_len as f64;
+        // Both buckets must have a token available; do not spend either unless
+        // both can be paid (avoid charging one bucket for a refused packet).
+        if self.packet_tokens < 1.0 || self.byte_tokens < need_bytes {
             return false;
         }
-        if self.bytes.saturating_add(packet_len as u64) > self.max_bytes_per_sec {
-            return false;
-        }
-        self.packets = self.packets.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(packet_len as u64);
+        self.packet_tokens -= 1.0;
+        self.byte_tokens -= need_bytes;
         true
     }
 }
@@ -991,11 +1041,180 @@ mod tests {
 
     #[test]
     fn rate_limiter_refills_after_window() {
+        // Token-bucket: drain the 1-token budget, then advance the injected
+        // clock by a full second so exactly one token re-accrues.
         let mut limiter = RateLimiter::new(1, 128);
-        assert!(limiter.allow(64));
-        assert!(!limiter.allow(64));
-        limiter.window_started = Instant::now() - Duration::from_secs(2);
-        assert!(limiter.allow(64));
+        let t0 = Instant::now();
+        assert!(limiter.allow_at(t0, 64));
+        assert!(!limiter.allow_at(t0, 64));
+        assert!(limiter.allow_at(t0 + Duration::from_secs(1), 64));
+    }
+
+    /// #2912 fail-on-revert: the fixed-window limiter admits up to **2x** the
+    /// configured rate across a window boundary — a sender pacing its first full
+    /// budget to the last instant of window N and its second full budget to the
+    /// first instant of window N+1 gets two budgets in an arbitrarily short
+    /// real interval, because the boundary reset zeroes the counters regardless
+    /// of how recently the budget was spent.
+    ///
+    /// This drives the limiter with an INJECTED clock (`allow_at`) so the
+    /// boundary is exact and deterministic. We spend the whole budget at t0
+    /// (the end of window N for the fixed window: its window started at t0), then
+    /// jump the clock to t0 + 1.001s — just past the fixed window's 1s reset
+    /// threshold but only ~1s of real time — and try to drain a second budget.
+    ///
+    /// We model the exact straddle attack the issue describes: the fixed window
+    /// starts at t0. The sender spends its FULL budget at the very END of window
+    /// N (t0 + 0.999s) and its FULL budget at the very START of window N+1
+    /// (t0 + 1.001s) — TWO budgets across a 2ms real interval. The total
+    /// admitted in that 2ms must be at most one budget plus the ~0.02 tokens
+    /// that refill in 2ms — i.e. one budget — NOT two. The fixed-window bug
+    /// admits 2*rate here (window N late budget + window N+1 reset budget); the
+    /// token bucket admits only ~rate because just 2ms of tokens accrued between
+    /// the two bursts.
+    ///
+    /// FAIL-ON-REVERT: with the fixed-window `allow_at` reinstated, the count
+    /// across the 2ms straddle is 2*rate and the `<= rate + slack` assertion goes
+    /// RED. The token bucket keeps it at rate.
+    #[test]
+    fn rate_limiter_no_double_budget_across_boundary() {
+        let rate: u64 = 10;
+        let mut limiter = RateLimiter::new(rate, 1_000_000);
+        let t0 = Instant::now();
+
+        // Warm to steady state: at the END of window N the bucket is full and
+        // the fixed window has not yet crossed 1s. Spend the full budget here.
+        let late_n = t0 + Duration::from_millis(999);
+        let mut burst_end_of_n = 0u64;
+        while limiter.allow_at(late_n, 100) {
+            burst_end_of_n += 1;
+            if burst_end_of_n > rate * 4 {
+                break;
+            }
+        }
+        assert_eq!(burst_end_of_n, rate, "end-of-window-N burst is one full budget");
+
+        // 2ms later we cross into window N+1. The fixed window RESETS and hands
+        // out a SECOND full budget; the token bucket has only accrued
+        // 2ms * 10/s = 0.02 tokens, so it admits nothing.
+        let start_n1 = t0 + Duration::from_millis(1_001);
+        let mut burst_start_of_n1 = 0u64;
+        while limiter.allow_at(start_n1, 100) {
+            burst_start_of_n1 += 1;
+            if burst_start_of_n1 > rate * 4 {
+                break;
+            }
+        }
+        // Total across the 2ms straddle must not be a second full budget.
+        // Allow a 1-packet slack for the sub-token accrual rounding.
+        assert!(
+            burst_start_of_n1 <= 1,
+            "the 2ms boundary straddle must not refill a second budget — only \
+             ~0.02 tokens accrue in 2ms; got {burst_start_of_n1} (fixed-window 2x, #2912)"
+        );
+    }
+
+    /// #2912 fail-on-revert (the sharp discriminator): with only a SUB-second of
+    /// real spacing after the budget is drained, the token bucket REFUSES — it
+    /// has accrued only a fraction of a token. The fixed window admits a full
+    /// budget the instant its window crosses 1s, with no regard for how recently
+    /// the budget was spent, which is exactly the 2x-burst defect (two budgets in
+    /// ~2ms by straddling the boundary).
+    ///
+    /// We drain the budget at t0, then advance only 100ms (0.1s). At 10 tokens/s
+    /// that is 1.0 token of refill — right at the edge — so we use 99ms to stay
+    /// strictly below one token and assert the packet is refused. The token
+    /// bucket admits 0 here; any window/period scheme that grants a full budget
+    /// on a boundary fails this assertion.
+    #[test]
+    fn rate_limiter_refuses_subsecond_refill_after_drain() {
+        let rate: u64 = 10;
+        let mut limiter = RateLimiter::new(rate, 1_000_000);
+        let t0 = Instant::now();
+        for _ in 0..rate {
+            assert!(limiter.allow_at(t0, 100));
+        }
+        // 99ms * 10/s = 0.99 tokens — strictly below 1.
+        let t1 = t0 + Duration::from_millis(99);
+        assert!(
+            !limiter.allow_at(t1, 100),
+            "0.99 tokens refilled in 99ms — below one token, must refuse (#2912)"
+        );
+        // One more millisecond (total 100ms → 1.0 token) admits exactly one.
+        let t2 = t0 + Duration::from_millis(100);
+        assert!(
+            limiter.allow_at(t2, 100),
+            "at 100ms exactly one token has refilled — admit one"
+        );
+        assert!(
+            !limiter.allow_at(t2, 100),
+            "and only one — the second is refused with no further time"
+        );
+    }
+
+    /// The bucket caps at one second of tokens: arbitrarily long idle time does
+    /// NOT let a sender bank an unbounded burst. After idling for 100s a sender
+    /// may still only emit the per-second budget at once.
+    #[test]
+    fn rate_limiter_bucket_caps_at_one_second() {
+        let rate: u64 = 5;
+        let mut limiter = RateLimiter::new(rate, 1_000_000);
+        let t0 = Instant::now();
+        // Drain the initial full bucket.
+        for _ in 0..rate {
+            assert!(limiter.allow_at(t0, 100));
+        }
+        assert!(!limiter.allow_at(t0, 100));
+        // Idle 100s, then try to drain: only `rate` (not 500) admitted.
+        let t1 = t0 + Duration::from_secs(100);
+        let mut burst = 0u64;
+        while limiter.allow_at(t1, 100) {
+            burst += 1;
+            if burst > rate * 100 {
+                break;
+            }
+        }
+        assert_eq!(
+            burst, rate,
+            "the bucket caps at one second of tokens — idle cannot bank a larger burst"
+        );
+    }
+
+    /// A zero rate admits nothing (defensive: the configured defaults are
+    /// non-zero, but a 0 rate must never accrue tokens and silently pass).
+    #[test]
+    fn rate_limiter_zero_rate_admits_nothing() {
+        let mut limiter = RateLimiter::new(0, 0);
+        let t0 = Instant::now();
+        assert!(!limiter.allow_at(t0, 1), "zero packet rate admits nothing");
+        // Even after a long idle the zero-rate bucket stays empty.
+        let t1 = t0 + Duration::from_secs(100);
+        assert!(!limiter.allow_at(t1, 1), "zero rate never accrues tokens");
+    }
+
+    /// The byte bucket is independent of the packet bucket: a tiny packet rate
+    /// with a generous byte budget is bounded by packets, and a generous packet
+    /// rate with a tiny byte budget is bounded by bytes. A refused frame must
+    /// charge NEITHER bucket (so a too-big frame does not silently drain the
+    /// packet budget).
+    #[test]
+    fn rate_limiter_byte_bucket_is_independent() {
+        // 1000 packets/s but only 150 bytes/s: a single 100-byte frame fits,
+        // the next does not (200 > 150) until bytes refill.
+        let mut limiter = RateLimiter::new(1000, 150);
+        let t0 = Instant::now();
+        assert!(limiter.allow_at(t0, 100), "first 100-byte frame fits in 150 byte budget");
+        assert!(
+            !limiter.allow_at(t0, 100),
+            "second 100-byte frame exceeds the 150-byte budget"
+        );
+        // The refused frame must not have consumed a packet token (still ~999
+        // packet tokens) — proven by a tiny frame fitting the leftover bytes.
+        assert!(
+            limiter.allow_at(t0, 50),
+            "a 50-byte frame fits the remaining ~50 byte budget; the refused \
+             100-byte frame charged neither bucket"
+        );
     }
 
     #[test]

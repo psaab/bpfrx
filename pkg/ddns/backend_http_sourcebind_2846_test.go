@@ -164,7 +164,7 @@ func TestProviderBindConfigInvalidSourceErrors(t *testing.T) {
 	if _, err := newCloudflareBackend(&config.DDNSProvider{
 		Name: "p", APIToken: config.Secret("t"), Zone: "example.net",
 		SourceAddress: "not-an-ip",
-	}); err == nil {
+	}, nil); err == nil {
 		t.Fatal("cloudflare with malformed source-address must error")
 	}
 }

@@ -66,8 +66,10 @@ type dyndns2Backend struct {
 // backend. The endpoint is the explicit `server` (a full URL, or a bare host we
 // suffix with /nic/update) else the built-in endpoint for the named provider.
 // Returns an error when no endpoint can be resolved so the manager falls back to
-// no-op (logged + counted) rather than emitting to a wrong host.
-func newDyndns2Backend(p *config.DDNSProvider) (*dyndns2Backend, error) {
+// no-op (logged + counted) rather than emitting to a wrong host. A non-nil
+// client is reused (the cached reconcile-path client, #2904); nil builds a
+// fresh bound client.
+func newDyndns2Backend(p *config.DDNSProvider, client *http.Client) (*dyndns2Backend, error) {
 	if p == nil {
 		return nil, fmt.Errorf("ddns dyndns2: nil provider")
 	}
@@ -75,8 +77,9 @@ func newDyndns2Backend(p *config.DDNSProvider) (*dyndns2Backend, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Bind the dial to the configured source-address/interface/VRF (#2846).
-	client, err := newProviderHTTPClient(p)
+	// Bind the dial to the configured source-address/interface/VRF (#2846). A
+	// cached client (#2904) is reused when supplied; nil builds a fresh one.
+	client, err = ensureProviderHTTPClient(p, client)
 	if err != nil {
 		return nil, fmt.Errorf("ddns dyndns2: provider %q: %w", p.Name, err)
 	}

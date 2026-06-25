@@ -18,6 +18,29 @@
 - **File(s)**: pkg/config/types_routing.go, pkg/config/compiler_routing.go,
   pkg/frr/policy_render.go, pkg/config/parser_security_test.go,
   pkg/frr/frr_test.go, pkg/frr/README.md, docs/config-schema.md
+## 2026-06-25 — #2912: slow-path RateLimiter fixed window → token bucket (no 2x burst)
+
+- **Timestamp**: 2026-06-25
+- **Action**: `RateLimiter::allow` in `userspace-dp/src/slowpath.rs` used a
+  fixed 1-second window that zeroed its packet/byte counters whenever the
+  elapsed time since `window_started` reached 1s. A fixed window admits the
+  full per-second budget at the END of window N and a full budget at the
+  START of window N+1 — up to 2x the configured rate across a short interval
+  straddling the boundary, which can overload downstream control-queue
+  processing (agy-review-053 053-08). Replaced it with a dual token bucket
+  (packets/s + bytes/s): tokens accrue continuously at the configured rate,
+  the bucket caps at one second of accumulation, and a refused frame charges
+  neither bucket. Added a clock-injectable `allow_at(now, len)` core (the
+  production `allow(len)` is a thin wrapper) so the boundary behaviour is
+  deterministically unit-testable without sleeping. FAIL-ON-REVERT:
+  `rate_limiter_refuses_subsecond_refill_after_drain` (sub-second refill is
+  below one token → refuse) and `rate_limiter_no_double_budget_across_boundary`
+  (2ms straddle must not refill a second budget) both go RED against the
+  reinstated fixed-window `allow`. Gates: cargo build --release -p
+  xpf-userspace-dp PASS; cargo test slowpath:: 30/30 PASS (incl. 6
+  rate_limiter, 3 new).
+- **File(s)**: userspace-dp/src/slowpath.rs (fix + tests),
+  userspace-dp/README.md, _Log.md
 
 ## 2026-06-25 — #2937: screen flood + SYN-cookie standby-ACK rate limiting switched from fixed wall-second window to a sliding 1-second window
 
@@ -17721,6 +17744,63 @@ top.
   pkg/ipsec/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2919 — neighbor monitor: do NOT publish a FAILED initial dump
+  as generation 1; retry the full v4/v6 dump on bounded backoff. Before this,
+  both the Ok and Err arms of `initial_neighbor_dump` stored `neighbor_generation
+  = 1`, so a timed-out / WouldBlock / NLMSG_ERROR dump looked like a successful
+  empty baseline and was never retried, stranding quiet neighbors (first-packet
+  blackhole after startup / HA failover). Fix: pure `dump_establishes_baseline`
+  predicate gates `store(1)` (true ONLY on Ok); `neigh_monitor_thread` retries
+  the full dump on `INITIAL_DUMP_RETRY_BACKOFF_MS` (200/500/1000/2000/5000 ms,
+  `stop`-aware), publishing 1 only after a complete pass; if all retries fail the
+  generation stays 0 ("baseline incomplete") and the steady-state / ENOBUFS
+  re-dump paths recover. #2918 seq-0 absorb in process_dump_batch preserved.
+  FAIL-ON-REVERT: dump_batch_tests::failed_initial_dump_does_not_establish_
+  generation1_baseline goes RED (verified via copy-aside revert of the predicate
+  to always-true). Gates FG: cargo build --release -p xpf-userspace-dp OK;
+  cargo test neighbor PASS (123 passed).
+- **File(s)**: userspace-dp/src/afxdp/neighbor.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
+- **Action**: #2904 — Surface A HTTP client/transport reuse across reconcile
+  passes. `backendFor`/`backendForOwned` rebuilt a fresh `http.Client` +
+  `http.Transport` (own empty keep-alive pool) every reconcile pass via
+  `newProviderHTTPClient`, so each ~30s checkip probe + DNS update paid a full
+  TCP+TLS handshake (wasted CPU, latency, ephemeral-port churn). Added
+  `httpClientCache` (in `backend_http.go`) keyed on the provider's source-binding
+  inputs (source-address / destination-interface / routing-instance,
+  `bindCacheKey`); `SurfaceAManager` owns one cache. The manager-bound resolver
+  `resolveBackend` + the new `CheckIPClient` method pull the cached client per
+  binding and thread it into the 4 HTTP backend constructors (now take a
+  `client *http.Client`; nil = build-own, pre-#2904 path for direct/test callers
+  via `ensureProviderHTTPClient`). Cache invalidates implicitly: a changed
+  binding leaf keys a fresh transport. Daemon checkip site now calls
+  `d.surfaceA.CheckIPClient` instead of `ddns.NewCheckIPClient` (one line).
+  FAIL-ON-REVERT: surface_a_httpcache_2904_test.go (same-binding reuse,
+  cross-provider same-binding reuse, per-leaf invalidation, checkip↔update shared
+  pool) goes RED when clientFor is reverted to build-fresh — verified via
+  copy-aside revert (4 tests FAIL). Gates: go build ./..., gofmt -l clean (my
+  files), go vet ./pkg/ddns/... ./pkg/daemon/..., go test -race ./pkg/ddns/...
+  PASS.
+- **File(s)**: pkg/ddns/backend_http.go, pkg/ddns/backend_generic.go,
+  pkg/ddns/backend_cloudflare.go, pkg/ddns/backend_route53.go,
+  pkg/ddns/backend_dyndns2.go, pkg/ddns/surface_a.go,
+  pkg/ddns/surface_a_httpcache_2904_test.go,
+  pkg/ddns/backend_*_test.go (nil-arg call updates), pkg/ddns/README.md,
+  pkg/daemon/daemon_ddns_surface_a.go, _Log.md
+- **Action**: Fix three FRR config-render bugs that break frr-reload (#2941,
+  #2942, #2943). #2941: a family-less IPv6 BGP neighbor with a policy was
+  activated under `address-family ipv4 unicast` — gate the ipv4 fall-through
+  on the peer address family and route a policied family-less IPv6 peer into
+  the ipv6 set. #2942: `isis bfd` was emitted AFTER the interface `exit` →
+  global scope → frr-reload reject; moved it inside the interface block before
+  `exit`, mirroring OSPFv3. #2943: `resolveRedistribute` now takes a `self`
+  arg and drops self-redistribution (bare token + policy-term `from protocol
+  <self>`), and `knownRedistProtocols` adds `ospf6`/`ripng`. Fail-on-revert
+  tests added for each; all proven RED without the fix. Gates: go build, gofmt
+  -l clean, go vet ./pkg/frr/... ./pkg/config/..., go test ./pkg/frr/...
+  ./pkg/config/... PASS.
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go, pkg/frr/README.md,
+  _Log.md
 - **Action**: Fix three REST query-filter bugs (#2934/#2935/#2939) — fail
   closed on malformed filters, align protocol matching with gRPC/CLI, and
   switch the event filter from substring to exact match.
