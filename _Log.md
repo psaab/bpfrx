@@ -17051,6 +17051,39 @@ top.
   ./pkg/config/... (PASS). Fail-on-revert confirmed: reverting the gate
   to `term.Metric > 0` makes TestGeneratePolicyOptionsMetricZero RED.
 
+## #2848 — BGP policy-options community add/delete/set/none operations
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add Junos/vSRX community manipulation operations to
+  `then community` policy-term action. Previously REPLACE-only
+  (`set community <list>`); now supports add (additive append), delete
+  (by community-list), set (replace), and none (strip all). Closes the
+  vSRX-parity gap where replace wiped upstream-set communities.
+- **File(s)**:
+  - `pkg/config/types_routing.go` — new `PolicyTerm.CommunityOp`,
+    `CommunityAdd`, `CommunityDelete` fields.
+  - `pkg/config/schema_routing.go` — `then community` is now a
+    `multi: true` leaf packing optional op keyword + value.
+  - `pkg/config/compiler_routing.go` — `applyCommunityAction` helper;
+    wired into the hierarchical (`firewallMatchValues`) and flat-set
+    inline compile paths.
+  - `pkg/frr/policy_render.go` — operation→FRR-clause switch: add →
+    `set community <v> additive`, delete → `set comm-list <name> delete`,
+    none → `set community none`, set/"" → `set community <v>`.
+  - `pkg/config/parser_security_test.go` — `TestPolicyCommunityOperationsCompile`
+    (compiler-level fail-on-revert).
+  - `pkg/frr/frr_test.go` — `TestPolicyCommunityOperations`
+    (end-to-end ParseSetCommand+SetPath+CompileConfig+generatePolicyOptions
+    fail-on-revert).
+  - `docs/config-schema.md`, `pkg/frr/README.md` — documented the
+    operation→clause mapping.
+- **Validation**: go build ./... ; gofmt -l (clean on touched files) ;
+  go vet ./pkg/frr/... ./pkg/config/... ; go test ./pkg/frr/...
+  ./pkg/config/... (PASS). Fail-on-revert confirmed both layers:
+  reverting the renderer switch to the plain `set community` makes
+  TestPolicyCommunityOperations RED; reverting the compiler call to
+  `term.Community = nodeVal(ac)` makes TestPolicyCommunityOperationsCompile
+  RED.
 ## 2026-06-25 — #2840 DDNS Surface A: transient link-read must not publish static
 - **Timestamp**: 2026-06-25
 - **Action**: Fix `observeInterfaceAddr` so a `LinkByName`/`AddrList`

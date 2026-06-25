@@ -1364,8 +1364,30 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 				if term.MetricType == 1 || term.MetricType == 2 {
 					fmt.Fprintf(&b, " set metric-type type-%d\n", term.MetricType)
 				}
-				if term.Community != "" {
-					fmt.Fprintf(&b, " set community %s\n", term.Community)
+				// BGP community operations (#2848). Junos/vSRX supports
+				// append/delete/strip in addition to whole-attribute replace;
+				// emitting only the replace clause wiped upstream-set
+				// communities. Map each Junos operation to its FRR route-map
+				// set clause:
+				//   - add    → `set community <v> additive` (append)
+				//   - delete → `set comm-list <name> delete` (strip by list)
+				//   - none   → `set community none` (strip all)
+				//   - set/"" → `set community <v>` (replace; legacy bare form)
+				switch term.CommunityOp {
+				case "none":
+					b.WriteString(" set community none\n")
+				case "add":
+					if term.CommunityAdd != "" {
+						fmt.Fprintf(&b, " set community %s additive\n", term.CommunityAdd)
+					}
+				case "delete":
+					if term.CommunityDelete != "" {
+						fmt.Fprintf(&b, " set comm-list %s delete\n", term.CommunityDelete)
+					}
+				default: // "" or "set" — whole-attribute replace
+					if term.Community != "" {
+						fmt.Fprintf(&b, " set community %s\n", term.Community)
+					}
 				}
 				if term.Origin != "" {
 					fmt.Fprintf(&b, " set origin %s\n", term.Origin)
