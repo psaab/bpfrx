@@ -519,9 +519,18 @@ func ValidateConfig(cfg *Config) []string {
 	if fm := cfg.Services.FlowMonitoring; fm != nil {
 		checkExtWarning := func(kind, name string, exts []string) {
 			for _, ext := range exts {
-				if ext == "app-id" {
+				switch ext {
+				case "app-id":
 					warnings = append(warnings, fmt.Sprintf(
 						"flow-monitoring %s template %s: export-extension app-id configured but application data is not available in flow records", kind, name))
+				case "flow-dir":
+					// #2613: flowDirection (IE 61) was dropped from the v9/IPFIX
+					// templates because the SESSION_CLOSE wire frame carries no
+					// per-flow direction — exporting it produced authoritative
+					// zeros at the collector. The extension is still accepted but
+					// no longer adds the field; warn rather than silently lie.
+					warnings = append(warnings, fmt.Sprintf(
+						"flow-monitoring %s template %s: export-extension flow-dir configured but flow-direction data is not available in flow records (the field is no longer exported)", kind, name))
 				}
 			}
 		}

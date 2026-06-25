@@ -15093,6 +15093,28 @@ top.
   pkg/dataplane/userspace/nat_source_address_name_2416_test.go,
   docs/userspace-dnat-plan.md
 
+## #2613 flowexport: drop unpopulated NetFlow/IPFIX template fields
+
+- **Timestamp**: 2026-06-25
+- **Action**: NetFlow v9 + IPFIX templates advertised SrcTos/ipClassOfService
+  (5), TCPFlags/tcpControlBits (6), Direction/flowDirection (61),
+  InputSNMP/ingressInterface (10) and OutputSNMP/egressInterface (14) but the
+  SESSION_CLOSE builder never populated FlowRecord.{TOS,TCPFlags,Direction,
+  InIf,OutIf} and there is no source for them — the fixed 136-byte RT_FLOW
+  close frame carries no DSCP/TOS/flags/direction/egress-ifindex and the Rust
+  encoder hardcodes ingress ifindex 0 on close frames. Collectors ingested
+  authoritative zeros. Dropped all five from both v9 templates and IPFIX v4/v6
+  templates + their record encoders + size consts (ipfixRecordSizeV4 69->57,
+  V6 117->105; v9 v4 64->52, v6 112->100). IncludeFlowDir/NoDir template split
+  collapsed (fieldDirection gone) -> single template per family; IncludeFlowDir
+  kept as an accepted no-op. Compiler now warns on export-extension flow-dir
+  (mirrors the app-id warn-not-lie precedent). Populate-via-wire-extension is a
+  tracked follow-up. fail-on-revert proven RED (3 tests fire on re-adding a
+  field) then restored GREEN.
+- **File(s)**: pkg/flowexport/netflow.go, pkg/flowexport/ipfix.go,
+  pkg/flowexport/exporter_test.go, pkg/flowexport/postnat_test.go,
+  pkg/flowexport/dropped_fields_test.go, pkg/config/compiler_validate_warn.go,
+  pkg/flowexport/README.md, _Log.md
 - **Timestamp**: 2026-06-25
 - **Action**: #2649 — SNMPv3 engineBoots fail-closed on corrupt/ceiling/
   unwritable state. RFC 3414 §2.2 requires engineBoots monotonic; the prior
