@@ -828,6 +828,90 @@ fn tunnel_tcp_mss_wireguard_uses_wg_overhead_not_gre() {
     );
 }
 
+// --- #2517 GRE MSS clamp survives a transient egress-map miss ---------
+
+#[test]
+fn native_gre_inner_mtu_falls_back_to_1500_on_egress_miss() {
+    // Reproduce the transient egress-map miss (re-reconciliation /
+    // interface bringup): a valid GRE endpoint but NO egress entry for
+    // the transport / resolution-egress / endpoint-logical ifindex.
+    // Pre-#2517 `native_gre_inner_mtu` did `unwrap_or_default()` → 0, so
+    // `native_gre_tcp_mss` returned 0 and silently DISABLED a configured
+    // GRE outbound TCP MSS clamp. After #2517 it shares the
+    // `tunnel_outer_mtu` SSOT (1500 fallback) → a REAL clamp.
+    let mut state = gre1881_state();
+    state.egress.clear(); // every egress lookup now misses
+    let decision = SessionDecision {
+        resolution: gre_encap_resolution(),
+        nat: NatDecision::default(),
+    };
+
+    // Endpoint is IPv6-outer (40), no key (gre 4): inner MTU =
+    // 1500 - 40 - 4 = 1456. Fail-on-revert: with unwrap_or_default()
+    // this was 0.
+    let inner_mtu = native_gre_inner_mtu(&state, &decision);
+    assert_eq!(
+        inner_mtu, 1456,
+        "GRE inner MTU on an egress miss must fall back to the 1500 \
+         underlay (1500 - 40 outer IPv6 - 4 GRE), NOT 0 (pre-#2517 \
+         unwrap_or_default disabled the clamp)"
+    );
+
+    // The configured MSS clamp must therefore be non-zero. Inner IPv4
+    // (20) + TCP (20): MSS = 1456 - 40 = 1416.
+    let mss = native_gre_tcp_mss(&state, &decision, libc::AF_INET as u8);
+    assert_eq!(
+        mss, 1416,
+        "native_gre_tcp_mss on an egress miss must compute a real clamp \
+         from the 1500 fallback (1456 - 20 IP - 20 TCP); pre-#2517 it \
+         returned 0 and the clamp was silently disabled"
+    );
+    assert_ne!(mss, 0, "the GRE clamp must NOT be disabled on a map miss");
+
+    // It must match what the WG-sibling SSOT resolver yields for the same
+    // miss — proving the two tunnel paths can no longer drift.
+    let endpoint = state.tunnel_endpoints.get(&1).expect("fixture endpoint");
+    assert_eq!(
+        tunnel_outer_mtu(&state, &decision, endpoint),
+        1500,
+        "tunnel_outer_mtu (the shared #2300 SSOT) falls back to 1500 on \
+         the same miss — native_gre_inner_mtu now reads this exact value"
+    );
+}
+
+#[test]
+fn native_gre_inner_mtu_uses_real_egress_mtu_when_present() {
+    // No-regression: when the egress entry IS present the clamp must use
+    // the real resolved MTU exactly as before the #2517 fallback change.
+    // The gre1881 fixture egress for reth0.80 is 1500.
+    let state = gre1881_state();
+    let decision = SessionDecision {
+        resolution: gre_encap_resolution(),
+        nat: NatDecision::default(),
+    };
+
+    let inner_mtu = native_gre_inner_mtu(&state, &decision);
+    assert_eq!(
+        inner_mtu, 1456,
+        "with the egress present the GRE inner MTU is the real underlay \
+         1500 - 40 - 4 = 1456 (unchanged by #2517)"
+    );
+
+    // And the present-egress path equals the SSOT-resolved outer MTU minus
+    // the GRE overhead — i.e. #2517 did not alter the hit path.
+    let endpoint = state.tunnel_endpoints.get(&1).expect("fixture endpoint");
+    let outer = tunnel_outer_mtu(&state, &decision, endpoint);
+    assert_eq!(outer, 1500, "fixture present-egress outer MTU is 1500");
+    assert_eq!(
+        inner_mtu,
+        outer - 40 - 4,
+        "present-egress GRE inner MTU == outer MTU - outer IPv6 - GRE"
+    );
+
+    let mss = native_gre_tcp_mss(&state, &decision, libc::AF_INET as u8);
+    assert_eq!(mss, 1416, "present-egress GRE clamp unchanged");
+}
+
 #[test]
 fn tunnel_tcp_mss_gre_unchanged_for_gre_endpoint() {
     // Fail-on-revert guard: a GRE endpoint must keep the exact GRE
