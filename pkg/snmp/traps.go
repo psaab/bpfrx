@@ -5,7 +5,10 @@ import (
 	"log/slog"
 	"math/rand"
 	"net"
+	"sort"
 	"time"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // SNMPv2-Trap PDU type (context-specific, constructed, tag 7).
@@ -97,6 +100,12 @@ func (a *Agent) buildLinkTrap(community string, linkUp bool, ifindex int, ifname
 	return berEncodeTLV(tagSequence, msgBody)
 }
 
+// trapSender delivers a single pre-built trap to a target. It is a package
+// var (not a direct call) so tests can inject a deliberately slow/blocking
+// sender to prove the link-monitor caller does not block on trap delivery
+// (#2991). Production code never reassigns it.
+var trapSender = sendTrap
+
 // sendTrap sends a pre-built trap packet to a single target on port 162.
 func sendTrap(target string, pkt []byte) error {
 	// Ensure the target has a port.
@@ -139,12 +148,7 @@ func (a *Agent) sendLinkTraps(linkUp bool, ifindex int, ifname string) {
 		return
 	}
 
-	// Use the first community string for v2c traps.
-	community := "public"
-	for _, c := range cfg.Communities {
-		community = c.Name
-		break
-	}
+	community := selectTrapCommunity(cfg)
 
 	pkt := a.buildLinkTrap(community, linkUp, ifindex, ifname)
 
@@ -153,17 +157,100 @@ func (a *Agent) sendLinkTraps(linkUp bool, ifindex int, ifname string) {
 		direction = "up"
 	}
 
-	for _, tg := range cfg.TrapGroups {
+	// Enqueue one job per target. The blocking dial/write happens on the
+	// trap worker so a dead or slow target never stalls the link monitor
+	// (#2991). Iterate trap groups in deterministic (sorted) order so log
+	// output and dispatch ordering are stable across runs.
+	for _, tg := range sortedTrapGroups(cfg) {
 		for _, target := range tg.Targets {
-			if err := sendTrap(target, pkt); err != nil {
-				slog.Warn("SNMP trap send failed",
-					"target", target, "group", tg.Name,
-					"event", "link"+direction, "iface", ifname, "err", err)
-			} else {
-				slog.Info("SNMP trap sent",
-					"target", target, "group", tg.Name,
-					"event", "link"+direction, "iface", ifname, "ifindex", ifindex)
-			}
+			a.enqueueTrap(trapJob{
+				target:  target,
+				pkt:     pkt,
+				group:   tg.Name,
+				event:   "link" + direction,
+				iface:   ifname,
+				ifindex: ifindex,
+			})
+		}
+	}
+}
+
+// selectTrapCommunity picks the v2c trap community deterministically (#2989).
+// SNMPConfig.Communities is a Go map, whose iteration order is randomized, so
+// ranging over it and breaking on the first entry produced a different
+// community per process run when more than one community was configured —
+// collectors that accept only one community saw flaky traps and a less
+// privileged community could leak through the wrong credential boundary. We
+// instead pick the lexicographically-first configured community, a stable and
+// predictable selection. When no community is configured the v2c default
+// "public" is used (the configured set authorizes the trap on the wire and an
+// empty set has no on-wire credential to assert).
+func selectTrapCommunity(cfg *config.SNMPConfig) string {
+	if cfg == nil || len(cfg.Communities) == 0 {
+		return "public"
+	}
+	names := make([]string, 0, len(cfg.Communities))
+	for name := range cfg.Communities {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names[0]
+}
+
+// sortedTrapGroups returns the configured trap groups in deterministic
+// (name-sorted) order. The TrapGroups map iteration order is randomized; a
+// stable order keeps dispatch and log output reproducible.
+func sortedTrapGroups(cfg *config.SNMPConfig) []*config.SNMPTrapGroup {
+	if cfg == nil || len(cfg.TrapGroups) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.TrapGroups))
+	for name := range cfg.TrapGroups {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	groups := make([]*config.SNMPTrapGroup, 0, len(names))
+	for _, name := range names {
+		groups = append(groups, cfg.TrapGroups[name])
+	}
+	return groups
+}
+
+// enqueueTrap hands a pre-built trap to the async worker (#2991). It starts the
+// worker on first use (so both NewAgent and bare-struct test agents get it) and
+// never blocks the caller: when the bounded queue is full the trap is dropped
+// and trapsDropped is incremented. Dropping is the correct backpressure policy
+// here — the queue only fills when targets are not draining, and blocking the
+// link monitor on SNMP observability is exactly the failure #2991 fixes.
+func (a *Agent) enqueueTrap(job trapJob) {
+	a.trapWorkerOnce.Do(func() {
+		a.trapQueue = make(chan trapJob, trapQueueDepth)
+		go a.trapWorker()
+	})
+	select {
+	case a.trapQueue <- job:
+	default:
+		dropped := a.trapsDropped.Add(1)
+		slog.Warn("SNMP trap queue full, dropping trap",
+			"target", job.target, "group", job.group,
+			"event", job.event, "iface", job.iface, "dropped_total", dropped)
+	}
+}
+
+// trapWorker drains the trap queue, performing the blocking dial/write for each
+// queued trap off the link-monitor goroutine (#2991). A single worker bounds
+// goroutine growth and serializes the slow dials; the queue capacity bounds
+// memory.
+func (a *Agent) trapWorker() {
+	for job := range a.trapQueue {
+		if err := trapSender(job.target, job.pkt); err != nil {
+			slog.Warn("SNMP trap send failed",
+				"target", job.target, "group", job.group,
+				"event", job.event, "iface", job.iface, "err", err)
+		} else {
+			slog.Info("SNMP trap sent",
+				"target", job.target, "group", job.group,
+				"event", job.event, "iface", job.iface, "ifindex", job.ifindex)
 		}
 	}
 }

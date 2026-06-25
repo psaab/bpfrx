@@ -80,7 +80,23 @@ zones). The hash MUST cover exactly the interfaces the planner acts on, so
 a change to a non-candidate interface never spuriously bumps the plan key
 and a `ge-*`/`xe-*`/`et-*` netdev placed in a mgmt/control/tunnel/fabric
 context is never planned as an AF_XDP binding the rest of the system does
-not account for. The Rust planner does:
+not account for.
+
+The same-plan fast path in `apply_snapshot` (`handlers/snapshot.rs`) relies
+on this coupling for correctness (#2916): when `snapshot_binding_plan_key` is
+unchanged it skips `replan_queues` entirely (it only reconciles/refreshes the
+running bindings, never re-deriving the layout). That is sound only because
+the hash covers EVERY snapshot-derived field `replan_queues` consumes to build
+the layout — the candidate set (shared predicate, above) plus, per candidate,
+`linux_name` (bound netdev + dedup key), `ifindex` (per-binding ifindex), and
+`rx_queues` (queue count), plus the fabric parents and `workers`/`ring_entries`
+/`shared_umem`. Any new field the planner starts reading MUST be folded into
+`update_snapshot_binding_plan_key`, or a same-plan refresh will leave a stale
+worker layout. `plan_key_covers_every_replan_queues_input` (#2916) pins this:
+mutating any planner-consumed field bumps the key (and is shown to change the
+produced layout), so a dropped hash field goes RED.
+
+The Rust planner does:
 
 ```rust
 binding.worker_id = (queue_id % workers.max(1)) as u32;

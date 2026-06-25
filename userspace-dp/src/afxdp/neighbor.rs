@@ -111,6 +111,31 @@ fn build_icmp6_echo(_kind: ProbeSockKind) -> [u8; 8] {
     [128, 0, 0, 0, 0, 0, 0, 0]
 }
 
+/// Build the `sockaddr_in6` for an NDP-solicit probe send to `v6` egressing
+/// `ifindex` (#2969).
+///
+/// `sin6_scope_id` MUST carry the outgoing interface's ifindex for a
+/// LINK-LOCAL destination (`fe80::/10`): Linux cannot route a link-local
+/// datagram without the interface scope, so a zero `sin6_scope_id` made the
+/// kernel reject the `sendto` (EINVAL/ENETUNREACH) and the NDP solicit was
+/// never emitted — the next-hop never resolved and IPv6 forwarding blackholed
+/// to that link-local hop. `SO_BINDTODEVICE` alone is insufficient (and on the
+/// DGRAM fallback it is a no-op without CAP_NET_RAW).
+///
+/// For a GLOBAL/ULA destination the kernel ignores `sin6_scope_id`, so setting
+/// it unconditionally is harmless and keeps the construction uniform — the
+/// caller does not have to special-case link-local detection. Kept as a pure
+/// builder so the scope_id contract is unit-testable without a live socket.
+pub(super) fn build_solicit_sockaddr_in6(v6: Ipv6Addr, ifindex: i32) -> libc::sockaddr_in6 {
+    let mut sa6: libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
+    sa6.sin6_family = libc::AF_INET6 as u16;
+    sa6.sin6_addr.s6_addr = v6.octets();
+    // ifindex is a non-negative kernel interface index; clamp a
+    // pathological negative to 0 rather than wrap into a huge scope id.
+    sa6.sin6_scope_id = ifindex.max(0) as u32;
+    sa6
+}
+
 /// Trigger kernel ARP/NDP resolution by sending an ICMP echo via a
 /// kernel socket bound to the egress interface. The kernel's own ARP
 /// stack handles VLAN tagging correctly. No fork/exec overhead.
@@ -121,7 +146,16 @@ fn build_icmp6_echo(_kind: ProbeSockKind) -> [u8; 8] {
 /// neighbor probing still works under the rootless/container substrate
 /// (#1958, #2482). Either way the egress packet drives the kernel to
 /// ARP/NDP-resolve the next-hop — the echo's reply is irrelevant.
-pub(super) fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
+///
+/// `ifindex` is the egress interface index (available at every call site).
+/// It is threaded into the IPv6 `sockaddr_in6.sin6_scope_id` so a LINK-LOCAL
+/// (`fe80::/10`) next-hop solicit can actually be routed by the kernel
+/// (#2969); a zero scope id silently dropped link-local NDP solicits and
+/// blackholed IPv6 forwarding to those hops. The `sendto` return is checked
+/// in both families and a failure is logged (it fires rarely — only on a
+/// probe send error — so this does not violate the per-tick logging rules)
+/// instead of being swallowed, which previously hid a never-sent solicit.
+pub(super) fn trigger_kernel_arp_probe(iface_name: &str, ifindex: i32, target: IpAddr) {
     let name_c = std::ffi::CString::new(iface_name).unwrap_or_default();
     match target {
         IpAddr::V4(v4) => {
@@ -148,7 +182,7 @@ pub(super) fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
             let mut sa: libc::sockaddr_in = unsafe { core::mem::zeroed() };
             sa.sin_family = libc::AF_INET as u16;
             sa.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
-            unsafe {
+            let sent = unsafe {
                 libc::sendto(
                     fd,
                     icmp.as_ptr() as *const libc::c_void,
@@ -156,7 +190,18 @@ pub(super) fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
                     libc::MSG_DONTWAIT,
                     &sa as *const libc::sockaddr_in as *const libc::sockaddr,
                     core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            if sent < 0 {
+                // Fires only on a probe send error (rare) — do NOT swallow
+                // it as the pre-#2969 code did; a silent failure hid a
+                // never-sent solicit so the next-hop never resolved.
+                eprintln!(
+                    "xpf-userspace-dp: ARP probe sendto({iface_name}, {v4}) failed: {}",
+                    io::Error::last_os_error()
                 );
+            }
+            unsafe {
                 libc::close(fd);
             }
         }
@@ -192,10 +237,10 @@ pub(super) fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
                 }
             }
             let icmp6 = build_icmp6_echo(kind);
-            let mut sa6: libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
-            sa6.sin6_family = libc::AF_INET6 as u16;
-            sa6.sin6_addr.s6_addr = v6.octets();
-            unsafe {
+            // #2969: carry the egress ifindex in sin6_scope_id so a
+            // link-local (fe80::/10) solicit can actually be routed.
+            let sa6 = build_solicit_sockaddr_in6(v6, ifindex);
+            let sent = unsafe {
                 libc::sendto(
                     fd,
                     icmp6.as_ptr() as *const libc::c_void,
@@ -203,7 +248,18 @@ pub(super) fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
                     libc::MSG_DONTWAIT,
                     &sa6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
                     core::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            };
+            if sent < 0 {
+                // #2969: surface the NDP solicit send failure instead of
+                // swallowing it. A zero sin6_scope_id used to fail here
+                // (EINVAL/ENETUNREACH) for a link-local hop with no trace.
+                eprintln!(
+                    "xpf-userspace-dp: NDP probe sendto({iface_name}, {v6}%{ifindex}) failed: {}",
+                    io::Error::last_os_error()
                 );
+            }
+            unsafe {
                 libc::close(fd);
             }
         }
@@ -296,7 +352,7 @@ pub(super) fn neighbor_warmer_loop(
             }
         };
         if !skip {
-            trigger_kernel_arp_probe(&item.iface_name, item.hop);
+            trigger_kernel_arp_probe(&item.iface_name, item.ifindex, item.hop);
         }
     }
 }
@@ -1518,7 +1574,11 @@ mod pin_tests {
 
 #[cfg(test)]
 mod probe_socket_tests {
-    use super::{build_icmp4_echo, build_icmp6_echo, select_probe_socket, ProbeSockKind};
+    use super::{
+        build_icmp4_echo, build_icmp6_echo, build_solicit_sockaddr_in6, select_probe_socket,
+        ProbeSockKind,
+    };
+    use std::net::Ipv6Addr;
     use std::cell::RefCell;
 
     /// Base socket type with the `SOCK_CLOEXEC` (and any future flag) bits
@@ -1632,6 +1692,52 @@ mod probe_socket_tests {
         assert_eq!(dgram[0], 128, "ICMPv6 type must be Echo Request (128)");
         assert_eq!(dgram[1], 0, "ICMPv6 code must be 0");
         assert_eq!(raw, dgram);
+    }
+
+    /// FAIL-ON-REVERT (#2969): the NDP-solicit `sockaddr_in6` MUST carry the
+    /// egress ifindex in `sin6_scope_id` for a LINK-LOCAL target. Linux
+    /// cannot route a link-local datagram with `sin6_scope_id == 0`, so the
+    /// pre-fix code (which left scope_id at the `mem::zeroed()` default 0)
+    /// silently dropped every link-local NDP solicit and blackholed IPv6
+    /// forwarding to those next-hops. Reverting to `sin6_scope_id = 0`
+    /// regresses this assertion.
+    #[test]
+    fn ndp_solicit_sockaddr_carries_ifindex_scope_for_link_local() {
+        let ll = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let ifindex = 7;
+        let sa6 = build_solicit_sockaddr_in6(ll, ifindex);
+        assert_eq!(sa6.sin6_family, libc::AF_INET6 as u16);
+        assert_eq!(
+            sa6.sin6_scope_id, ifindex as u32,
+            "link-local NDP solicit must scope to the egress ifindex (#2969); \
+             a zero scope_id makes the kernel drop the solicit",
+        );
+        assert_ne!(
+            sa6.sin6_scope_id, 0,
+            "sin6_scope_id reverted to 0 — link-local solicit would be dropped",
+        );
+        assert_eq!(sa6.sin6_addr.s6_addr, ll.octets());
+    }
+
+    /// The scope id is set uniformly (harmless for a global/ULA target the
+    /// kernel ignores it for), so the builder does not have to special-case
+    /// link-local detection — the contract is "scope_id == ifindex always".
+    #[test]
+    fn ndp_solicit_sockaddr_carries_ifindex_scope_for_global() {
+        let global = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x200);
+        let ifindex = 12;
+        let sa6 = build_solicit_sockaddr_in6(global, ifindex);
+        assert_eq!(sa6.sin6_scope_id, ifindex as u32);
+        assert_eq!(sa6.sin6_addr.s6_addr, global.octets());
+    }
+
+    /// A pathological negative ifindex clamps to 0 rather than wrapping into
+    /// a huge scope id via an `as u32` sign-extension.
+    #[test]
+    fn ndp_solicit_sockaddr_clamps_negative_ifindex() {
+        let ll = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let sa6 = build_solicit_sockaddr_in6(ll, -1);
+        assert_eq!(sa6.sin6_scope_id, 0, "negative ifindex must clamp to 0");
     }
 }
 

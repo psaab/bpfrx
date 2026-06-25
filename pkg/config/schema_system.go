@@ -834,7 +834,26 @@ var schemaSNMP = &schemaNode{desc: "SNMP configuration", children: map[string]*s
 			children:      nil,
 		},
 	}},
-	"trap-group": {desc: "Trap group", args: 1, placeholder: "<group-name>", children: nil},
+	"trap-group": {desc: "Trap group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
+		"targets": {
+			desc:        "Trap target host (IP address or FQDN, optional :port)",
+			args:        1,
+			multi:       true,
+			placeholder: "<target>",
+			children:    nil,
+		},
+		"version": {
+			desc:          "SNMP version for this trap group",
+			args:          1,
+			placeholder:   "<version>",
+			valueType:     ValueEnumOf,
+			valueDesc:     "Trap protocol version (v1 | v2 | all)",
+			valueExamples: []string{"v1", "v2", "all"},
+			validator:     ValidateEnum([]string{"v1", "v2", "all"}),
+			children:      nil,
+		},
+		"categories": {desc: "Trap categories to send to this group", args: 1, multi: true, placeholder: "<category>", children: nil},
+	}},
 	"v3": {desc: "SNMPv3", children: map[string]*schemaNode{
 		"usm": {desc: "USM", children: map[string]*schemaNode{
 			"local-engine": {desc: "Local engine", children: map[string]*schemaNode{
