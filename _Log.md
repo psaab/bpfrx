@@ -17724,6 +17724,23 @@ top.
   pkg/ipsec/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2919 — neighbor monitor: do NOT publish a FAILED initial dump
+  as generation 1; retry the full v4/v6 dump on bounded backoff. Before this,
+  both the Ok and Err arms of `initial_neighbor_dump` stored `neighbor_generation
+  = 1`, so a timed-out / WouldBlock / NLMSG_ERROR dump looked like a successful
+  empty baseline and was never retried, stranding quiet neighbors (first-packet
+  blackhole after startup / HA failover). Fix: pure `dump_establishes_baseline`
+  predicate gates `store(1)` (true ONLY on Ok); `neigh_monitor_thread` retries
+  the full dump on `INITIAL_DUMP_RETRY_BACKOFF_MS` (200/500/1000/2000/5000 ms,
+  `stop`-aware), publishing 1 only after a complete pass; if all retries fail the
+  generation stays 0 ("baseline incomplete") and the steady-state / ENOBUFS
+  re-dump paths recover. #2918 seq-0 absorb in process_dump_batch preserved.
+  FAIL-ON-REVERT: dump_batch_tests::failed_initial_dump_does_not_establish_
+  generation1_baseline goes RED (verified via copy-aside revert of the predicate
+  to always-true). Gates FG: cargo build --release -p xpf-userspace-dp OK;
+  cargo test neighbor PASS (123 passed).
+- **File(s)**: userspace-dp/src/afxdp/neighbor.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
 - **Action**: #2904 — Surface A HTTP client/transport reuse across reconcile
   passes. `backendFor`/`backendForOwned` rebuilt a fresh `http.Client` +
   `http.Transport` (own empty keep-alive pool) every reconcile pass via
