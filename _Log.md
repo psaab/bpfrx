@@ -1,3 +1,33 @@
+## 2026-06-25 — #2937: screen flood + SYN-cookie standby-ACK rate limiting switched from fixed wall-second window to a sliding 1-second window
+
+- **Timestamp**: 2026-06-25
+- **Action**: `screen/rate.rs` `RateCounter::increment` was a fixed
+  wall-second window — it reset `count` to zero every time `now_secs`
+  advanced. That admitted a boundary double-burst: full budget at the end
+  of second N + full budget at the start of N+1 = ~2x the configured
+  threshold in a sub-millisecond straddle, defeating the ICMP/UDP/SYN
+  flood screens and letting the standby SYN-cookie ACK validator spend
+  ~2x the intended SipHash budget (codex-review-055 055-04). Fix: replaced
+  the single-bucket fixed window with a two-bucket sliding-window counter.
+  A second `prev_count` retains the immediately preceding second's tally;
+  admission gates on `prev_count + count <= threshold`, so the prior
+  second still counts for the whole of the current second and the trailing
+  1-second sum stays bounded across any boundary. A >=2-second gap clears
+  `prev_count` (no stale carryover). Hot path stays allocation-free and
+  integer-only. Signature (`now_secs`, `threshold`) and the `pub(super)
+  count` accessor are unchanged — no caller edits.
+- **File(s)**: userspace-dp/src/screen/rate.rs (sliding window + 4 unit
+  tests incl. FAIL-ON-REVERT boundary_double_burst_is_bounded);
+  userspace-dp/src/screen/tests.rs (icmp_flood + standby-ack window tests
+  rewritten to assert no boundary reset); userspace-dp/src/screen/mod.rs
+  (module doc); docs/syn-cookie-flood-protection.md (standby-ACK limiter
+  doc).
+- **Validation**: `cargo build --release -p xpf-userspace-dp` clean;
+  `cargo test screen` 136/136 + `screen::rate` 4/4 green. Fail-on-revert:
+  restoring the fixed-window `increment` makes
+  `boundary_double_burst_is_bounded` RED (tripped_after_boundary left:0
+  right:100 — fixed window admits all 2N).
+
 ## 2026-06-25 — #2918: neighbor initial dump consumed and dropped seq-0 multicast RTM_NEWNEIGH/DELNEIGH events
 
 - **Timestamp**: 2026-06-25
