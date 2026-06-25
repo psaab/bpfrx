@@ -245,10 +245,53 @@ type DDNSProvider struct {
 	TSIGSecret    Secret
 	// SourceAddress / DestinationInterface / RoutingInstance scope the RFC 2136
 	// UPDATE TRANSPORT for this provider (the same source-binding model as the
-	// Surface B per-family leaves, #2665). All optional.
+	// Surface B per-family leaves, #2665). All optional. (Source binding for the
+	// HTTP backends is a follow-up; the HTTP client uses the default route today.)
 	SourceAddress        string
 	DestinationInterface string
 	RoutingInstance      string
+
+	// --- HTTP-provider fields (#2691 P3; plan §5.2/§5.9). Only meaningful for
+	// the dyndns2 / cloudflare / route53 / generic backends; ignored by rfc2136.
+
+	// Server overrides the dyndns2 update endpoint host (or full base URL). When
+	// empty the dyndns2 backend uses the built-in endpoint for the named provider
+	// (Backend == a known dyndns2 provider name) or the canonical dyn.com path.
+	Server string
+	// Username / Password are the HTTP Basic-auth credentials (dyndns2 + generic).
+	// Password is sensitive (config.Secret-redacted on every marshal + String()).
+	Username string
+	Password Secret
+	// URLTemplate is the generic-templated backend's update URL with %h
+	// (hostname), %i (IP), %u (username), %p (password), %% literal-percent
+	// specifiers (inadyn "custom"; plan §3.7 idea #3). config-only — no Go code
+	// per provider.
+	URLTemplate string
+	// OKResponse is the generic backend's success-substring matcher; an HTTP 2xx
+	// body containing this substring is a success. Empty ⇒ the default matcher
+	// set ("good", "nochg", "ok", "true", "updated").
+	OKResponse string
+	// APIToken is the Cloudflare API token (config.Secret-redacted). Emitted as
+	// `Authorization: Bearer <token>`.
+	APIToken Secret
+	// Zone is the Cloudflare DNS zone name (e.g. example.net) the record lives in;
+	// the backend resolves the zone id at update time (the inadyn `setup` step).
+	Zone string
+	// AWSAccessKeyID / AWSSecretAccessKey / AWSRegion / HostedZoneID are the
+	// Route 53 SigV4 credentials + target. AWSSecretAccessKey is sensitive.
+	AWSAccessKeyID     string
+	AWSSecretAccessKey Secret
+	AWSRegion          string
+	HostedZoneID       string
+	// CheckIPURL is the optional external checkip endpoint (opt-in; plan §5.3) a
+	// scope referencing this provider may use as the address source when the
+	// firewall is behind NAT. Subject to the bogus-IP allowlist. Empty ⇒ no
+	// checkip (interface/DHCP observation only).
+	CheckIPURL string
+	// CheckIPAllowlist is a comma/space-separated list of bogus addresses to
+	// ignore in a checkip response (the inadyn except[] case — e.g. a checkip
+	// page that embeds the resolver/anycast IP like 1.1.1.1). Empty ⇒ none.
+	CheckIPAllowlist string
 }
 
 // String redacts TSIGSecret so a %v/%s/slog format of a DDNSProvider never
@@ -257,15 +300,23 @@ func (p *DDNSProvider) String() string {
 	if p == nil {
 		return "<nil>"
 	}
-	secret := ""
-	if p.TSIGSecret != "" {
-		secret = "<redacted>"
+	red := func(s Secret) string {
+		if s != "" {
+			return SecretRedacted
+		}
+		return ""
 	}
 	return fmt.Sprintf("DDNSProvider{name=%q backend=%q update-server=%q "+
 		"tsig-key=%q tsig-alg=%q tsig-secret=%q source-address=%q "+
-		"destination-interface=%q routing-instance=%q}",
+		"destination-interface=%q routing-instance=%q server=%q username=%q "+
+		"password=%q url-template=%q ok-response=%q api-token=%q zone=%q "+
+		"aws-access-key=%q aws-secret-key=%q aws-region=%q hosted-zone-id=%q "+
+		"checkip-url=%q checkip-allowlist=%q}",
 		p.Name, p.Backend, p.UpdateServer, p.TSIGKeyName, p.TSIGAlgorithm,
-		secret, p.SourceAddress, p.DestinationInterface, p.RoutingInstance)
+		red(p.TSIGSecret), p.SourceAddress, p.DestinationInterface, p.RoutingInstance,
+		p.Server, p.Username, red(p.Password), p.URLTemplate, p.OKResponse,
+		red(p.APIToken), p.Zone, p.AWSAccessKeyID, red(p.AWSSecretAccessKey),
+		p.AWSRegion, p.HostedZoneID, p.CheckIPURL, p.CheckIPAllowlist)
 }
 
 // SSHServiceConfig holds SSH service settings.

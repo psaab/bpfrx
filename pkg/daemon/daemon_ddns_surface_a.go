@@ -38,6 +38,10 @@ const (
 	surfaceAReconcileInterval = 30 * time.Second
 	// surfaceAReconcileTimeout bounds one whole Surface A reconcile pass.
 	surfaceAReconcileTimeout = 60 * time.Second
+	// surfaceACheckIPTimeout bounds a single external check-IP fetch (#2691 P3,
+	// opt-in behind-NAT source). Well under the per-pass timeout so a slow
+	// checkip endpoint fails one scope, not the whole pass.
+	surfaceACheckIPTimeout = 10 * time.Second
 )
 
 // runSurfaceADDNSReconcileLoop is the supervised Surface A reconcile loop. It
@@ -161,8 +165,16 @@ func (d *Daemon) buildSurfaceAScopes(cfg *config.Config) []ddns.SurfaceAScope {
 			p.SourceAddress = b.SourceAddress
 		}
 		src := ddns.AddressSourceInterface
-		if b.AddressSource == string(ddns.AddressSourceDHCP) {
+		switch b.AddressSource {
+		case string(ddns.AddressSourceDHCP):
 			src = ddns.AddressSourceDHCP
+		case string(ddns.AddressSourceCheckIP):
+			// checkip is opt-in and requires the provider to carry a checkip-url;
+			// without it, fall back to interface observation (the commit warning
+			// flags the missing url).
+			if prov.CheckIPURL != "" {
+				src = ddns.AddressSourceCheckIP
+			}
 		}
 		ttl := b.TTLSeconds
 		key := ddns.ScopeKey{
@@ -225,6 +237,23 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 		linuxName := surfaceALinuxIfName(cfg, ifName, unit)
 
 		switch scope.Source {
+		case ddns.AddressSourceCheckIP:
+			// Opt-in external check-IP source (behind-NAT deployments, #2691 P3).
+			// The provider carries the checkip-url + (optionally) a bogus-IP
+			// allowlist. A fetch failure is a TRANSIENT observation failure
+			// (ok=false) — never a withdraw.
+			if scope.Provider == nil || scope.Provider.CheckIPURL == "" {
+				return ddns.AddressObservation{}, false
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), surfaceACheckIPTimeout)
+			defer cancel()
+			allow := ddns.ParseAllowlist(scope.Provider.CheckIPAllowlist)
+			a, ok := ddns.CheckIP(ctx, nil, scope.Provider.CheckIPURL, af4, allow)
+			if !ok {
+				return ddns.AddressObservation{}, false
+			}
+			return ddns.AddressObservation{Addr: a, Source: ddns.AddressSourceCheckIP}, true
+
 		case ddns.AddressSourceDHCP:
 			if d.dhcp == nil {
 				return ddns.AddressObservation{}, false

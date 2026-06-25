@@ -20,11 +20,44 @@ moved with its assertions intact.
 | `backend.go` | `DNSUpdater` interface, `LeaseDNSRecord`, `nopUpdater`, the record + reverse-PTR-name helpers — moved from `dhcpserver/ddns_dns.go`. |
 | `backend_rfc2136.go` | The LIVE RFC 2136 backend (`rfc2136Updater`): exact-RR adds/deletes, TSIG, RFC 4701 DHCID + RFC 4703 replace-owned two-attempt, the `errDDNSConflictRefused` / `errDDNSPTRPending` sentinels — moved from `dhcpserver/ddns_rfc2136.go`. |
 | `hostname.go` | Deterministic hostname → DNS-label normalization (pure) — moved from `dhcpserver/ddns_hostname.go`. |
+| `surface_a.go` | Surface A router/interface-address publish engine (`SurfaceAManager`): change-detection, forced-refresh wire floor, per-scope error backoff, per-RG HA gate, the backend factory `productionSurfaceABackend` (#2691 P2/P3). |
+| `backend_http.go` | Shared HTTP-backend discipline (#2691 P3): hardened `http.Client` (TLS-verified, bounded timeout), capped body read, `classifyHTTPStatus`, `queryEscape`, the `errHTTPAuth`/`errHTTPRateLimited` verdicts. |
+| `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. |
+| `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → find → PATCH/POST/DELETE record. |
+| `backend_route53.go` | Route 53 backend (#2691 P3): SigV4-signed `ChangeResourceRecordSets` UPSERT/DELETE change batch. |
+| `sigv4.go` | Minimal self-contained AWS SigV4 signer for Route 53 (no AWS SDK dependency). |
+| `backend_generic.go` | Generic templated backend (#2691 P3, inadyn "custom"): `%h/%i/%u/%p/%%` URL template + success-substring matcher — config-only, no Go code per provider. |
+| `checkip.go` | Opt-in external check-IP address source (#2691 P3): bogus-IP validity gate + allowlist (`isPublicAddr`, `parseCheckIPBody`, `CheckIP`, `ParseAllowlist`). |
 
 Tests moved with the code: `manager_test.go` (engine + state-store + hostname),
 `backend_rfc2136_test.go` (backend, drives a real in-process miekg/dns server),
 `durability_test.go` (#2662 write-ahead), `manager_inc2_test.go`
-(manager + live backend integration).
+(manager + live backend integration). P2/P3 add `surface_a_test.go`,
+`surface_a_rfc2136_test.go`, `surface_a_http_test.go` (engine-through-real-HTTP-
+backend), `backend_http_test.go`, `backend_cloudflare_test.go`,
+`backend_route53_test.go`, `sigv4_test.go`, `checkip_test.go` — all
+mock-server-driven through the real backend impls (no protocol-bypassing fakes).
+
+## HTTP provider backends (#2691 P3)
+
+The HTTP backends are siblings of the RFC 2136 backend behind the SAME
+`DNSUpdater` interface, so the Surface A engine drives them identically — only
+the wire mechanism differs. `productionSurfaceABackend` (surface_a.go) is the
+single resolution point keyed on `DDNSProvider.Backend`:
+
+| backend | mechanism | required config | credential (config.Secret) |
+|---|---|---|---|
+| `dyndns2` | `GET /nic/update?hostname=&myip=` + Basic auth; body verdict | `server` or a known provider name | `password` |
+| `cloudflare` | Bearer token; zone-id resolve → PATCH/POST DNS record | `api-token`, `zone` | `api-token` |
+| `route53` | SigV4 `ChangeResourceRecordSets` UPSERT | `aws-access-key`, `aws-secret-key`, `hosted-zone-id` | `aws-secret-key` |
+| `generic` | templated URL + success-substring (config-only) | `url-template` | `password` (optional) |
+
+All credentials are `config.Secret` (revealed only at the transport boundary,
+never logged); HTTP is HTTPS with system-trust cert+hostname verification, a
+bounded request timeout, and a capped response body. A construction failure
+(missing credential) degrades to the no-op backend (logged; the commit warning
+already fired) — fail-open, matching the rfc2136 posture. Live-provider verify
+is the deferred lab gate; the mock-server tests are the merge gate.
 
 ## The package boundary (why a `LeaseParser` seam)
 

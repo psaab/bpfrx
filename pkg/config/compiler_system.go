@@ -414,6 +414,20 @@ var ddnsProviderStringProps = map[string]bool{
 	"source-address":        true,
 	"destination-interface": true,
 	"routing-instance":      true,
+	// HTTP-provider leaves (#2691 P3).
+	"server":            true,
+	"username":          true,
+	"password":          true,
+	"url-template":      true,
+	"ok-response":       true,
+	"api-token":         true,
+	"zone":              true,
+	"aws-access-key":    true,
+	"aws-secret-key":    true,
+	"aws-region":        true,
+	"hosted-zone-id":    true,
+	"checkip-url":       true,
+	"checkip-allowlist": true,
 }
 
 // compileDDNSServices compiles the `system services dynamic-dns` block into a
@@ -522,10 +536,28 @@ func compileDDNSProvider(name string, node *Node) *DDNSProvider {
 		SourceAddress:        props["source-address"],
 		DestinationInterface: props["destination-interface"],
 		RoutingInstance:      props["routing-instance"],
+		Server:               props["server"],
+		Username:             props["username"],
+		Password:             Secret(props["password"]),
+		URLTemplate:          props["url-template"],
+		OKResponse:           props["ok-response"],
+		APIToken:             Secret(props["api-token"]),
+		Zone:                 props["zone"],
+		AWSAccessKeyID:       props["aws-access-key"],
+		AWSSecretAccessKey:   Secret(props["aws-secret-key"]),
+		AWSRegion:            props["aws-region"],
+		HostedZoneID:         props["hosted-zone-id"],
+		CheckIPURL:           props["checkip-url"],
+		CheckIPAllowlist:     props["checkip-allowlist"],
 	}
 	if p.Backend == "" && p.UpdateServer == "" && p.TSIGKeyName == "" &&
 		p.TSIGAlgorithm == "" && p.TSIGSecret == "" && p.SourceAddress == "" &&
-		p.DestinationInterface == "" && p.RoutingInstance == "" {
+		p.DestinationInterface == "" && p.RoutingInstance == "" &&
+		p.Server == "" && p.Username == "" && p.Password == "" &&
+		p.URLTemplate == "" && p.OKResponse == "" && p.APIToken == "" &&
+		p.Zone == "" && p.AWSAccessKeyID == "" && p.AWSSecretAccessKey == "" &&
+		p.AWSRegion == "" && p.HostedZoneID == "" && p.CheckIPURL == "" &&
+		p.CheckIPAllowlist == "" {
 		return nil
 	}
 	return p
