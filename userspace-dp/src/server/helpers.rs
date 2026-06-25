@@ -491,15 +491,25 @@ pub(crate) fn parse_session_sync_mac(value: &str) -> Result<Option<[u8; 6]>, Str
 pub(crate) fn reconcile_status_bindings(state: &mut ServerState) {
     if !should_run_afxdp(&state.status) {
         state.afxdp.stop();
-        state.status.bindings.iter_mut().for_each(|binding| {
-            binding.bound = false;
-            binding.xsk_registered = false;
-            binding.xsk_bind_mode.clear();
-            binding.zero_copy = false;
-            binding.socket_fd = 0;
-            binding.ready = false;
-            binding.last_error.clear();
-        });
+        // #2794: route the disarmed-forwarding teardown through
+        // `refresh_bindings` rather than hand-clearing a SUBSET of the
+        // per-binding fields. `stop()` (above) emptied `workers.live` and
+        // cleared the CoS owner maps, so `refresh_bindings` routes every
+        // now-workerless slot through `zero_unbound_slot` — clearing the
+        // FULL survivor set (`socket_ifindex`/`socket_queue_id`/
+        // `socket_bind_flags`, `flow_cache_capacity`, `active_flow_count`,
+        // every counter gauge, the latency histograms, and the
+        // `bound`/`xsk_registered`/`xsk_bind_mode`/`zero_copy`/`socket_fd`/
+        // `ready`/`last_error` fields the old hand-clear touched) AND
+        // rebuilds the CoS owner->worker map empty. This is the same tail
+        // the no_snapshot reconcile arm now runs (#2515): previously this
+        // sibling path left `socket_ifindex`/`queue_id`/`bind_flags` +
+        // `flow_cache_capacity`/`active_flow_count` stale, so status
+        // commands reported a disarmed slot as if still bound on its old
+        // queue.
+        let mut bindings = std::mem::take(&mut state.status.bindings);
+        state.afxdp.refresh_bindings(&mut bindings);
+        state.status.bindings = bindings;
         return;
     }
     let snapshot = state.snapshot.clone();

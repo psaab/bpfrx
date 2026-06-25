@@ -193,9 +193,47 @@ func findBinary(explicit string) (string, error) {
 	return "", errors.New("userspace dataplane helper binary not found; build make build-userspace-dp or configure system dataplane binary")
 }
 
+// MaxControlRequestBytes is the maximum serialized size, in bytes, of a
+// single control-socket request body. It MUST stay in lockstep with the
+// Rust receiver's MAX_CONTROL_REQUEST_BYTES in
+// userspace-dp/src/protocol/control.rs: the helper reads at most this
+// many bytes (plus the terminating newline) before rejecting a request
+// before decode (#2523). A sender that emits a body larger than the
+// receiver's cap is rejected at the read, so the two caps move together.
+//
+// #2744 sized this off the dominant scaling dimension — dynamic-feed
+// address books carry feed prefixes inline as CIDR text and are bounded
+// only by a per-line scanner cap, not a total-entry cap. 64 MiB / ~45 B
+// per IPv6 CIDR ≈ 1.4M prefixes, comfortably above realistic large
+// threat-intel feeds (the #2744 case cited ~500K prefixes ≈ 20+ MiB,
+// which the original 16 MiB ceiling rejected). The cap remains a hard
+// allocation ceiling: a request larger than this is surfaced as a
+// config error here (a real operator-facing diagnostic) instead of a
+// silent control-socket rejection after a successful commit.
+const MaxControlRequestBytes = 64 * 1024 * 1024
+
 func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, error) {
 	if m.cfg.ControlSocket == "" {
 		return ControlResponse{}, errors.New("userspace dataplane control socket not configured")
+	}
+	// Pre-flight size check (#2744). Serialize the request once and reject
+	// it here if it would exceed the receiver's cap, so the operator sees
+	// an actionable config error at apply time rather than a silent
+	// control-socket EOF after the config is already committed. The most
+	// common offender is a feed-heavy apply_snapshot whose inline feed
+	// prefixes push the body past MaxControlRequestBytes.
+	body, err := json.Marshal(&req)
+	if err != nil {
+		return ControlResponse{}, err
+	}
+	if len(body) > MaxControlRequestBytes {
+		return ControlResponse{}, fmt.Errorf(
+			"userspace control request %q is %d bytes, exceeding the dataplane "+
+				"control-socket limit of %d bytes; this is most often a "+
+				"dynamic-address feed with too many prefixes — reduce the feed "+
+				"size or split the address book (the dataplane would reject this "+
+				"request before applying it)",
+			req.Type, len(body), MaxControlRequestBytes)
 	}
 	conn, err := net.DialTimeout("unix", m.cfg.ControlSocket, 2*time.Second)
 	if err != nil {
@@ -203,7 +241,9 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-	if err := json.NewEncoder(conn).Encode(&req); err != nil {
+	// Reuse the pre-flight-serialized body; the Rust receiver frames on a
+	// single trailing newline (json.Encoder appends one).
+	if _, err := conn.Write(append(body, '\n')); err != nil {
 		return ControlResponse{}, err
 	}
 	var resp ControlResponse

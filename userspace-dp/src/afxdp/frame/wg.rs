@@ -221,12 +221,47 @@ pub(super) fn wg_encap_frame(
         return None;
     }
 
-    // Encap the inner packet into a stack/heap scratch via the engine.
-    // No per-packet alloc on the steady path would require a worker
-    // RefCell scratch; this rarely-hit transit site uses a local buffer
-    // sized once to the record length.
-    let mut wg_record = vec![0u8; wg_record_len];
-    let outcome = match engine.try_encap(&peer_pubkey, inner_packet, &mut wg_record) {
+    // #2792 (agy-review-048 finding 048-11): eliminate the per-packet
+    // heap churn. The pre-#2792 code allocated TWO Vecs per packet here —
+    // an intermediate `wg_record` scratch for `try_encap`, then copied
+    // that scratch into a second `out` frame Vec. Both are gone:
+    //
+    //   1. `wg_record` (removed): `try_encap` writes the WG transport
+    //      record (data header + ciphertext + Poly1305 tag) starting at
+    //      `out[0]` of whatever `&mut [u8]` it is handed. We hand it the
+    //      UDP payload slot of `out` directly, so the encrypt lands in
+    //      its final position — no intermediate buffer and no follow-up
+    //      copy. The plaintext is staged on the stack inside `try_encap`
+    //      (MaybeUninit), so the in-place encrypt is sound: snow's
+    //      non-overlapping plaintext/ciphertext requirement is satisfied
+    //      by that stack staging, not by a separate output buffer.
+    //
+    //   2. `out` is now sized ONCE to the pad-aware maximum record length
+    //      (`wg_record_len`, the same arithmetic the MTU guard already
+    //      validated above) and truncated to the actual encapped length
+    //      after `try_encap` reports it. The single remaining `out`
+    //      allocation is the function's owned return value (the
+    //      `Vec<Vec<u8>>` TCP-segmentation caller needs an owned frame per
+    //      segment) and is byte-for-byte identical to the GRE sibling's
+    //      `encapsulate_native_gre_frame` output Vec — no WG-specific
+    //      extra alloc remains.
+    //
+    // Wire output is unchanged: same header bytes, same ciphertext+tag,
+    // same outer framing (proved byte-identical by
+    // `wg_encap_in_place_matches_separate_buffer`).
+    let outer_ip_start = outer_eth_len;
+    let udp_start = outer_ip_start + outer_ip_len;
+    let payload_start = udp_start + 8;
+    // Size to the pad-aware maximum WG record; truncate to the real
+    // length once `try_encap` reports `outcome.len`.
+    let max_frame_len = payload_start + wg_record_len;
+    let mut out = vec![0u8; max_frame_len];
+
+    let outcome = match engine.try_encap(
+        &peer_pubkey,
+        inner_packet,
+        out.get_mut(payload_start..payload_start + wg_record_len)?,
+    ) {
         Ok(o) => o,
         Err(EncapError::NoSession) => {
             // Request a handshake (rate-limited relaxed atomic) and drop.
@@ -235,11 +270,10 @@ pub(super) fn wg_encap_frame(
         }
         Err(_) => return None,
     };
-    let wg_record = &wg_record[..outcome.len];
-
-    let udp_len = 8 + wg_record.len();
+    let wg_record_actual = outcome.len;
+    let udp_len = 8 + wg_record_actual;
     let frame_len = outer_eth_len + outer_ip_len + udp_len;
-    let mut out = vec![0u8; frame_len];
+    out.truncate(frame_len);
 
     write_eth_header_slice(
         out.get_mut(..outer_eth_len)?,
@@ -248,13 +282,6 @@ pub(super) fn wg_encap_frame(
         vlan_id,
         if outer_v6 { 0x86dd } else { 0x0800 },
     )?;
-
-    let outer_ip_start = outer_eth_len;
-    let udp_start = outer_ip_start + outer_ip_len;
-    let payload_start = udp_start + 8;
-    out.get_mut(payload_start..)?
-        .get_mut(..wg_record.len())?
-        .copy_from_slice(wg_record);
 
     // Source IP/port: the firewall egress primary address + WG listen
     // port; destination: the peer endpoint.
@@ -642,6 +669,87 @@ mod wg_frame_tests {
         init_engine
     }
 
+    /// Build an ESTABLISHED initiator/responder PAIR sharing one real Noise
+    /// handshake. The initiator (returned `.0`) encaps via `wg_encap_frame`;
+    /// the responder (returned `.1`) can `try_decap` the resulting WG record,
+    /// recovering the original inner IP packet. Used by the #2792 in-place
+    /// encrypt byte-identity / round-trip proof: if the in-place encrypt wrote
+    /// to the wrong slice offset (or the truncation/length math drifted), the
+    /// decap would fail to authenticate or recover the wrong plaintext.
+    fn established_pair(
+        peer_ep: std::net::SocketAddr,
+        peer_cidr: &str,
+    ) -> (WgEngine, WgEngine) {
+        let (init_priv, init_pub) = wg_keypair();
+        let (resp_priv, resp_pub) = wg_keypair();
+
+        let init_engine = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: resp_pub,
+                endpoint: Some(peer_ep),
+                persistent_keepalive: 0,
+                allowed_ips: vec![peer_cidr.parse().unwrap()],
+                preshared_key: [0u8; 32],
+            }],
+        });
+        let resp_engine = WgEngine::new(WgEngineConfig {
+            local_private_key: resp_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: init_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                preshared_key: [0u8; 32],
+            }],
+        });
+
+        let mut init_hs = init_engine.build_initiator_handshake(&resp_pub).unwrap();
+        let mut resp_hs = resp_engine.build_responder_handshake().unwrap();
+        let mut buf = [0u8; 1024];
+        let mut sink = [0u8; 1024];
+        let n1 = init_hs.write_message(&[], &mut buf).unwrap();
+        resp_hs.read_message(&buf[..n1], &mut sink).unwrap();
+        let n2 = resp_hs.write_message(&[], &mut buf).unwrap();
+        init_hs.read_message(&buf[..n2], &mut sink).unwrap();
+        let init_xport = init_hs.into_stateless_transport_mode().unwrap();
+        let resp_xport = resp_hs.into_stateless_transport_mode().unwrap();
+        let now = crate::afxdp::wg::counters::monotonic_now_ns();
+        // Initiator: local index 0xaaaa_0001, sends to responder index
+        // 0xbbbb_0001 (the value snow stamps into the WG data header as the
+        // RECEIVER index). The responder must therefore be reachable in its
+        // sessions_by_local_index under 0xbbbb_0001.
+        init_engine
+            .install_session(
+                &resp_pub,
+                Arc::new(WgSession::new_with_role(
+                    init_xport,
+                    0xaaaa_0001u32,
+                    0xbbbb_0001u32,
+                    resp_pub,
+                    SessionRole::Initiator,
+                    now,
+                )),
+            )
+            .unwrap();
+        resp_engine
+            .install_session(
+                &init_pub,
+                Arc::new(WgSession::new_with_role(
+                    resp_xport,
+                    0xbbbb_0001u32,
+                    0xaaaa_0001u32,
+                    init_pub,
+                    SessionRole::Responder,
+                    now,
+                )),
+            )
+            .unwrap();
+        (init_engine, resp_engine)
+    }
+
     /// A tunnel-resolved decision with the LOGICAL egress_ifindex (400, the
     /// `wg0.0` tunnel iface — its primary is the tunnel address 10.123.0.1)
     /// and both MACs resolved so `wg_encap_frame` builds rather than dropping
@@ -834,6 +942,70 @@ mod wg_frame_tests {
         // Destination is the v6 peer endpoint.
         let dst: std::net::Ipv6Addr = "2001:db8:113::7".parse().unwrap();
         assert_eq!(&out[38..54], &dst.octets(), "outer v6 dst is the peer endpoint");
+    }
+
+    #[test]
+    fn wg_encap_in_place_matches_separate_buffer() {
+        // #2792 correctness lock: the in-place encrypt (the WG record is
+        // written DIRECTLY into the output frame's UDP payload slot, removing
+        // the pre-#2792 intermediate `wg_record` Vec + copy) must produce a
+        // frame whose WG record (a) sits at the exact UDP payload offset, (b)
+        // is the exact pad-aware record length, and (c) decrypts back to the
+        // ORIGINAL inner IP packet under the paired peer's transport. A revert
+        // that wrote the encrypt to the wrong offset, mis-sized the buffer, or
+        // truncated incorrectly fails the decap (auth/length) → red.
+        let mut state = build_forwarding_state(&wg_outer_mtu_snapshot());
+        let peer_ep: std::net::SocketAddr = "203.0.113.7:51820".parse().unwrap();
+        let (init_engine, resp_engine) = established_pair(peer_ep, "10.123.0.0/24");
+        state.wg_engines.insert(1, Arc::new(init_engine));
+
+        let decision = wg_encap_decision();
+        let frame = inner_v4_frame();
+        // The inner IP packet the encap path actually encrypts: strip L2,
+        // trim to the IP total-length (mirrors wg_encap_frame's own slicing).
+        let inner_l3 = 14usize;
+        let inner_packet = &frame[inner_l3..];
+        let inner_len =
+            crate::afxdp::gre::packet_trimmed_len(inner_packet, libc::AF_INET as u8).unwrap();
+        let expected_inner = inner_packet[..inner_len].to_vec();
+
+        let out = wg_encap_frame(&frame, inner_v4_meta(), &decision, &state)
+            .expect("wg_encap_frame must build (established session, routed peer)");
+
+        // Outer framing: eth(14) + IPv4(20) + UDP(8) = 42-byte payload offset.
+        let payload_start = 14 + 20 + 8;
+        // The WG record is the remainder of the frame. Its length must be the
+        // exact pad-aware record size (header + pad_to_16(inner) + tag).
+        let expected_record_len =
+            WG_DATA_HEADER_LEN + pad_to_16(expected_inner.len()) + POLY1305_TAG_LEN;
+        let wg_record = &out[payload_start..];
+        assert_eq!(
+            wg_record.len(),
+            expected_record_len,
+            "in-place encrypt must leave exactly the pad-aware WG record at the UDP payload offset"
+        );
+
+        // Round-trip: the paired responder must decrypt the in-place-written
+        // record back to the ORIGINAL inner IP packet. This proves the
+        // ciphertext+tag landed at the correct offset and the framing is
+        // byte-faithful to the pre-#2792 separate-buffer path.
+        let mut recovered = vec![0u8; expected_record_len];
+        let dec = resp_engine
+            .try_decap(wg_record, &mut recovered)
+            .expect("paired responder must authenticate the in-place WG record");
+        assert_eq!(
+            &recovered[..dec.len],
+            &expected_inner[..],
+            "decapped plaintext must equal the original inner IP packet (in-place encrypt is byte-faithful)"
+        );
+
+        // Outer total-length fields must agree with the truncated frame size
+        // (the truncation math, not the max-sized scratch, drives the wire).
+        let ip_total = u16::from_be_bytes([out[16], out[17]]) as usize;
+        assert_eq!(ip_total, 20 + 8 + expected_record_len, "IPv4 total length tracks the real record");
+        let udp_len = u16::from_be_bytes([out[38], out[39]]) as usize;
+        assert_eq!(udp_len, 8 + expected_record_len, "UDP length tracks the real record");
+        assert_eq!(out.len(), payload_start + expected_record_len, "frame truncated to the real size");
     }
 
     #[test]
