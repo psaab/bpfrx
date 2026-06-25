@@ -2314,3 +2314,71 @@ func validatePrefixLengthRange(rf *RouteFilter) error {
 	}
 	return nil
 }
+
+// validateNATSourceAddressNameReferencesStrict hard-rejects a source or
+// destination NAT rule whose `match source-address-name <name>` names an
+// address-book entry not defined under `security address-book` (#2416).
+//
+// The name is resolved to concrete source prefixes at snapshot-build time
+// (appendNATSourceAddressName). A dangling reference contributes no prefix and
+// the rule fails closed (matches NOTHING) — safe, but silent: the operator's
+// intended source scoping vanishes with no signal. This gate makes the typo
+// operator-visible at commit, consistent with the firewall prefix-list and
+// policer reference gates.
+//
+// On the tolerant load / peer-sync paths the call site downgrades to a warning
+// (opts.lenientFirewallRefs) so an already-persisted or peer-synced config
+// still BOOTS (#1960); the dataplane then fails closed for the unresolved
+// reference. Rule-sets are walked source-first then destination, in slice
+// order, for a deterministic first error.
+func validateNATSourceAddressNameReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	ab := cfg.Security.AddressBook
+	defined := func(name string) bool {
+		if name == "" || ab == nil {
+			return false
+		}
+		if _, ok := ab.Addresses[name]; ok {
+			return true
+		}
+		_, ok := ab.AddressSets[name]
+		return ok
+	}
+	check := func(natType string, rs *NATRuleSet) error {
+		if rs == nil {
+			return nil
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || rule.Match.SourceAddressName == "" {
+				continue
+			}
+			if defined(rule.Match.SourceAddressName) {
+				continue
+			}
+			return fmt.Errorf(
+				"%s NAT rule-set %q rule %q references undefined "+
+					"source-address-name %q (define `security address-book "+
+					"address %s` / `address-set %s`, or fix the name — the "+
+					"source scope would otherwise be silently lost and the "+
+					"rule would match no traffic)",
+				natType, rs.Name, rule.Name, rule.Match.SourceAddressName,
+				rule.Match.SourceAddressName, rule.Match.SourceAddressName)
+		}
+		return nil
+	}
+	for _, rs := range cfg.Security.NAT.Source {
+		if err := check("source", rs); err != nil {
+			return err
+		}
+	}
+	if cfg.Security.NAT.Destination != nil {
+		for _, rs := range cfg.Security.NAT.Destination.RuleSets {
+			if err := check("destination", rs); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}

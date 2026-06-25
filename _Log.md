@@ -15029,3 +15029,21 @@ top.
   (TestT2a_ChangedConfigApplyNeverTwoLiveConns) is a pre-existing NDP-socket
   bind flake on origin/master — confirmed failing with my changes stashed,
   and this PR touches zero pkg/ra code.
+
+## #2416 NAT match source-address-name resolution for DNAT/SNAT
+
+- **Timestamp**: 2026-06-25
+- **Action**: Resolve `match source-address-name <book-entry>` into concrete
+  source prefixes for DNAT and SNAT snapshots so the #2394 source constraint
+  enforces the named source scope (was published empty = fail-open match-any).
+  Fail-closed on an unknown name (raw token kept non-empty -> match-nothing);
+  added commit-time strict gate validateNATSourceAddressNameReferencesStrict
+  (lenient->warn on load/peer-sync). Added SNAT match parse + schema entry
+  (DNAT already had both). Fail-on-revert proven RED.
+- **File(s)**: pkg/dataplane/userspace/nat.go,
+  pkg/config/compiler_nat.go, pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/schema_security.go,
+  pkg/config/parser_security_test.go,
+  pkg/config/compiler_nat_source_address_name_2416_test.go,
+  pkg/dataplane/userspace/nat_source_address_name_2416_test.go,
+  docs/userspace-dnat-plan.md

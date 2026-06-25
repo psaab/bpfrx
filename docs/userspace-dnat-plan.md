@@ -374,6 +374,38 @@ Two robustness fixes (the DNAT sibling of #2398 SNAT):
    whose entries all fail to parse matches nothing rather than reverting to
    match-any. A mix of valid + garbage entries keeps the valid prefixes.
 
+### Address-book-name source scope (#2416)
+
+`match source-address` (#2394) takes literal prefixes; the sibling
+`match source-address-name <book-entry>` takes an **address-book reference**.
+The compiler parsed it into `NATMatch.SourceAddressName` but never resolved it
+into the source list `buildDestinationNATSnapshots` reads, so a name-scoped DNAT
+published an EMPTY `source_addresses` = `source_constrained == false` = match
+ANY source — the same fail-open as #2394 for the named variant. SNAT shared the
+gap (its match switch did not even parse the keyword, and the schema did not
+expose it).
+
+#2416 closes it:
+
+- `appendNATSourceAddressName` (`nat.go`) resolves the name via
+  `resolveUserspaceAddressBookEntry` — the same global-address-book expander the
+  security-policy snapshot path uses — and appends the concrete prefixes to the
+  rule's source list. Both `buildDestinationNATSnapshots` and
+  `buildSourceNATSnapshots` call it.
+- Fail-closed on an unknown / unresolvable name: the raw token is appended so
+  the source list stays non-empty (`source_constrained` stays true) while the
+  token fails `IpAddr`/`IpNet` parse and contributes no prefix — the rule
+  matches NOTHING, never collapsing back to match-any. This reuses the existing
+  #2394/#2398 all-malformed -> fail-closed Rust path; no wire change.
+- The SNAT match parser (`compiler_nat.go`) now reads `source-address-name`, and
+  the SNAT `match` schema (`schema_security.go`) exposes the keyword (DNAT
+  already did).
+- `validateNATSourceAddressNameReferencesStrict` (`compiler_validate_strict.go`)
+  hard-rejects an undefined reference at commit / commit-check so the typo is
+  operator-visible; the tolerant load / peer-sync path downgrades to a warning
+  (`lenientFirewallRefs`, #1960) and the dataplane backstop fails closed. Mirrors
+  the firewall prefix-list / policer reference gates.
+
 ## 11. Multiple destination-addresses (#2395)
 
 Junos DNAT `match destination-address [ A B C ]` publishes the SAME
