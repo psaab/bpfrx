@@ -1,3 +1,27 @@
+## 2026-06-25 — #2857: route-map `set local-preference 0` silently dropped
+
+- **Timestamp**: 2026-06-25
+- **Action**: Direct sibling of #2847 (metric/MED-0). `policy_render.go`
+  gated `set local-preference` on `term.LocalPreference > 0`, with
+  `PolicyTerm.LocalPreference` a bare int and no presence flag, so an
+  explicitly configured `then local-preference 0` (a valid BGP value =
+  maximally deprioritize a route within the AS; FRR route-map YANG range
+  starts at 0) was indistinguishable from unset and silently dropped.
+- **Fix**: Mirror #2847 exactly — add `PolicyTerm.HasLocalPreference bool`
+  (keep the value), set it at BOTH compile sites in `compiler_routing.go`
+  (hierarchical + flat-set, the #2419 dual-shape), and render
+  `set local-preference` on presence (`HasLocalPreference`), never `> 0`.
+- **Test**: `TestGeneratePolicyOptionsLocalPreferenceZero` (fail-on-revert)
+  drives the full ParseSetCommand+SetPath+CompileConfig+generatePolicyOptions
+  path — lp 0 emitted / unset not emitted / 200 emitted. Verified RED when
+  the renderer gate is reverted to `> 0`. Updated the four existing render
+  tests that build a PolicyTerm with a nonzero LocalPreference to also set
+  `HasLocalPreference: true` so they still emit.
+- **File(s)**: pkg/config/types_routing.go, pkg/config/compiler_routing.go,
+  pkg/frr/policy_render.go, pkg/frr/frr_test.go, pkg/frr/README.md, _Log.md
+- **Gates**: go build ./... OK; gofmt -l clean; go vet ./pkg/frr/...
+  ./pkg/config/... clean; go test ./pkg/frr/... ./pkg/config/... OK.
+
 ## 2026-06-25 — #2849: DHCP relay giaddr selects PRIMARY IPv4, not first kernel address
 
 - **Timestamp**: 2026-06-25
