@@ -40,6 +40,19 @@
 //!   * Because the function only returns after the matching CQE is reaped, the
 //!     caller's buffer provably outlives every kernel reference to it, closing
 //!     the UAF window.
+//!
+//! Error classification (two further defects, fixed together):
+//!
+//!   * #2477 — retry safety. On failure [`write_all`] returns a [`WriteError`]
+//!     that tells the caller whether a synchronous retry from offset 0 is safe.
+//!     `NothingWritten` (submit-queue full, a kernel completion error, a
+//!     zero-byte completion) put nothing on the fd → safe to sync-retry.
+//!     `Transferred` (a packet-fd partial write, or an ambiguous submit/wait
+//!     error where the SQE may be in flight) means bytes are — or may be —
+//!     already on the device → the caller MUST drop, never re-send. The TUN slow
+//!     path uses this so its io_uring→sync fallback cannot double-transmit a
+//!     packet; the state writer (a true byte stream, no sync fallback) ignores
+//!     it.
 
 use io_uring::{IoUring, opcode, types};
 use std::io;
@@ -81,6 +94,50 @@ pub(crate) trait RingPort {
 pub(crate) enum WriteOutcome {
     /// All `data.len()` bytes were written.
     Done,
+}
+
+/// Failure of [`write_all`] / [`write_all_to_fd`], carrying enough state for the
+/// caller to decide whether a synchronous retry is safe.
+///
+/// The distinction matters for a packet-oriented fd (the TUN slow path, #2477):
+/// a synchronous fallback must NEVER re-send a packet whose bytes the io_uring
+/// path already placed on the device, or the TUN sees a truncated frame followed
+/// by a duplicate full frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WriteError {
+    /// Nothing was transferred — the io_uring path failed before (or while)
+    /// putting any bytes on the fd (submit-queue full, the kernel completion
+    /// reported an error, or a zero-byte completion). A synchronous retry from
+    /// offset 0 is safe: no bytes are on the device yet.
+    NothingWritten(String),
+    /// Bytes were (or may have been) transferred and a retry would corrupt the
+    /// stream. Two cases:
+    ///   * a packet-fd short write — `0 < n < len` bytes are already on the TUN
+    ///     as a truncated frame; re-sending the whole packet would duplicate it;
+    ///   * an ambiguous submit/wait error after the SQE was submitted — the
+    ///     write may be in flight, so a retry could double-transmit.
+    /// The caller MUST drop the packet, never fall back to a synchronous write.
+    Transferred(String),
+}
+
+impl WriteError {
+    /// True when a synchronous retry from offset 0 is safe (nothing is on the
+    /// fd yet). Only [`WriteError::NothingWritten`] qualifies.
+    pub(crate) fn safe_to_retry(&self) -> bool {
+        matches!(self, WriteError::NothingWritten(_))
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            WriteError::NothingWritten(m) | WriteError::Transferred(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
 }
 
 /// `RingPort` adapter over a real `io_uring::IoUring`.
@@ -130,13 +187,18 @@ impl RingPort for IoUringPort<'_> {
 ///
 /// Returns once every byte is written AND every SQE this call submitted has
 /// been reaped, so `data` may be dropped safely on return.
+///
+/// On failure the [`WriteError`] reports whether a synchronous retry is safe —
+/// see [`WriteError::safe_to_retry`] / #2477. The state writer ignores this
+/// (it has no sync fallback); the TUN slow path uses it to avoid double-sending
+/// a packet whose bytes are already on the device.
 pub(crate) fn write_all_to_fd(
     ring: &mut IoUring,
     fd: i32,
     data: &[u8],
     positioned: bool,
     label: &str,
-) -> Result<(), String> {
+) -> Result<(), WriteError> {
     let mut port = IoUringPort { ring, fd };
     write_all(&mut port, data, positioned, label).map(|_| ())
 }
@@ -163,7 +225,7 @@ pub(crate) fn write_all(
     data: &[u8],
     positioned: bool,
     label: &str,
-) -> Result<WriteOutcome, String> {
+) -> Result<WriteOutcome, WriteError> {
     let mut offset = 0usize;
     // Distinct tag per submission. Start at 1 so a zero `user_data` (the value
     // an uninitialised / pre-existing CQE would carry) is never a valid match.
@@ -172,35 +234,51 @@ pub(crate) fn write_all(
     while offset < data.len() {
         let chunk = &data[offset..];
         let file_offset = if positioned { Some(offset as u64) } else { None };
-        port.push_write(tag, chunk, file_offset)?;
+        // A push failure means the SQE was never submitted — nothing is on the
+        // fd, so a synchronous retry from offset 0 is safe (#2477). For a packet
+        // fd this is always the first (only) chunk, so `offset == 0` and a
+        // retry-from-0 is sound.
+        port.push_write(tag, chunk, file_offset)
+            .map_err(WriteError::NothingWritten)?;
 
         // Submit + reap exactly the completion for THIS submission. The
         // closure below loops on the wait so an EINTR (or any wait error) does
-        // not leave the SQE outstanding.
-        let res = reap_matching(port, tag, label)?;
+        // not leave the SQE outstanding. A reap error is AMBIGUOUS: the SQE was
+        // already submitted, so the write may be in flight and a retry could
+        // double-transmit on a packet fd — classify it as `Transferred` (drop,
+        // never sync-retry).
+        let res = reap_matching(port, tag, label).map_err(WriteError::Transferred)?;
 
         if res < 0 {
-            return Err(format!(
+            // The kernel completion reported a write error: nothing was placed
+            // on the fd, so a synchronous retry from offset 0 is safe.
+            return Err(WriteError::NothingWritten(format!(
                 "{label} io_uring write failed: {}",
                 io::Error::from_raw_os_error(-res)
-            ));
+            )));
         }
         if res == 0 {
-            return Err(format!("{label} io_uring short write: 0"));
+            // Zero bytes transferred — safe to retry synchronously.
+            return Err(WriteError::NothingWritten(format!(
+                "{label} io_uring short write: 0"
+            )));
         }
         let n = res as usize;
         // A non-positioned (stream-mode) write targets a packet-oriented fd:
         // the TUN slow path (#2407). One submission is one L3 packet. A short
         // CQE count must NOT resubmit the remainder — re-writing `data[n..]`
         // would inject the leftover bytes as a SECOND, malformed packet. Treat
-        // a partial as an unsendable packet and drop it (Err); the caller
-        // counts the drop. Positioned writes (a regular file — the state
-        // writer) are a true byte stream and DO resume from `offset + n`.
+        // a partial as an unsendable packet and drop it (Err) — and because
+        // `0 < n < len` bytes are ALREADY on the TUN, classify it as
+        // `Transferred` so the caller does NOT fall back to a synchronous write
+        // (which would re-send the whole packet → truncated frame + duplicate,
+        // #2477). Positioned writes (a regular file — the state writer) are a
+        // true byte stream and DO resume from `offset + n`.
         if !positioned && n < data.len() {
-            return Err(format!(
+            return Err(WriteError::Transferred(format!(
                 "{label} io_uring short write on packet fd: wrote {n} of {} bytes (packet dropped)",
                 data.len()
-            ));
+            )));
         }
         offset += n;
         // Advance the tag so the next submission's CQE cannot be confused with
@@ -469,8 +547,19 @@ mod tests {
         let mut ring = FakeRing::new(vec![Ok(()), Ok(())], vec![2, 2]);
         let err = write_all(&mut ring, &[0u8; 4], false, "slow-path").unwrap_err();
         assert!(
-            err.contains("short write on packet fd"),
+            err.message().contains("short write on packet fd"),
             "partial packet write must be a drop, got: {err}"
+        );
+        // #2477: a packet-fd partial write put bytes on the TUN, so it MUST
+        // classify as `Transferred` (NOT safe to retry) — otherwise the
+        // slow-path caller would sync-retry and re-send the whole packet.
+        assert!(
+            matches!(err, WriteError::Transferred(_)),
+            "a packet-fd partial write must be Transferred, got: {err:?}"
+        );
+        assert!(
+            !err.safe_to_retry(),
+            "a packet-fd partial write must NOT be safe to sync-retry (#2477)"
         );
         assert_eq!(
             ring.push_calls, 1,
@@ -591,7 +680,13 @@ mod tests {
     fn negative_result_is_error() {
         let mut ring = FakeRing::new(vec![Ok(())], vec![-libc::EIO]);
         let err = write_all(&mut ring, &[0u8; 4], false, "test").unwrap_err();
-        assert!(err.contains("io_uring write failed"), "got: {err}");
+        assert!(err.message().contains("io_uring write failed"), "got: {err}");
+        // The kernel completion errored — nothing reached the fd, so a
+        // synchronous retry from offset 0 is safe (#2477).
+        assert!(
+            err.safe_to_retry(),
+            "a kernel completion error transferred nothing; sync-retry must be safe"
+        );
     }
 
     /// res == 0 is a short write and must be an error, not an infinite loop.
@@ -599,7 +694,9 @@ mod tests {
     fn zero_result_is_short_write_error() {
         let mut ring = FakeRing::new(vec![Ok(())], vec![0]);
         let err = write_all(&mut ring, &[0u8; 4], false, "test").unwrap_err();
-        assert!(err.contains("short write"), "got: {err}");
+        assert!(err.message().contains("short write"), "got: {err}");
+        // Zero bytes transferred — safe to retry synchronously (#2477).
+        assert!(err.safe_to_retry(), "a zero-byte completion must be safe to retry");
     }
 
     /// Several EINTRs in a row still converge — the loop keeps waiting.

@@ -383,8 +383,9 @@ fn slow_path_worker(name: &str, mtu: i32, rx: Receiver<PacketRequest>, status: A
     while let Ok(req) = rx.recv() {
         status.queued_packets.fetch_sub(1, Ordering::Relaxed);
         let result = match &mut mode {
-            WriteMode::IoUring(ring) => write_packet_io_uring(ring, tun.as_raw_fd(), &req.bytes)
-                .or_else(|_| write_packet_sync(tun.as_raw_fd(), &req.bytes)),
+            WriteMode::IoUring(ring) => {
+                write_packet_io_uring_or_sync(ring, tun.as_raw_fd(), &req.bytes)
+            }
             WriteMode::SyncFallback => write_packet_sync(tun.as_raw_fd(), &req.bytes),
         };
         match result {
@@ -466,13 +467,59 @@ where
     }
 }
 
-fn write_packet_io_uring(ring: &mut IoUring, fd: i32, bytes: &[u8]) -> Result<(), String> {
+fn write_packet_io_uring(
+    ring: &mut IoUring,
+    fd: i32,
+    bytes: &[u8],
+) -> Result<(), crate::io_uring_write::WriteError> {
     // Stream write to the TUN device (no file offset). The shared loop retries
     // the wait on EINTR rather than abandoning an in-flight SQE, matches the
     // completion by user_data so a stale CQE cannot corrupt the offset, and
     // returns only after the matching CQE is reaped so `bytes` outlives every
     // kernel reference (#2297).
     crate::io_uring_write::write_all_to_fd(ring, fd, bytes, false, "slow-path")
+}
+
+/// Write one packet to the TUN via io_uring, falling back to a synchronous
+/// `write()` ONLY when the io_uring attempt put nothing on the device (#2477).
+///
+/// A naive `io_uring().or_else(sync)` re-sends the whole packet on ANY io_uring
+/// error — including a partial write that already placed bytes on the
+/// packet-oriented TUN. The fallback then injects the full frame again, so the
+/// TUN sees a truncated frame followed by a duplicate full frame (parser errors
+/// / duplicate delivery to local BGP/OSPF listeners). The synchronous fallback
+/// is therefore gated on [`crate::io_uring_write::WriteError::safe_to_retry`]:
+/// only a failure that transferred nothing (submit-queue full, a kernel
+/// completion error, a zero-byte completion) may retry. A partial transfer — or
+/// an ambiguous submit/wait error where the SQE may be in flight — drops the
+/// packet instead.
+fn write_packet_io_uring_or_sync(ring: &mut IoUring, fd: i32, bytes: &[u8]) -> Result<(), String> {
+    decide_sync_fallback(write_packet_io_uring(ring, fd, bytes), || {
+        write_packet_sync(fd, bytes)
+    })
+}
+
+/// The #2477 fallback DECISION, factored out so it is unit-testable without a
+/// live io_uring ring or TUN fd. Given the io_uring write `result` and a
+/// `sync_fallback` thunk, only invokes the synchronous fallback when the
+/// io_uring failure transferred NOTHING (`safe_to_retry`). A partial transfer —
+/// or an ambiguous in-flight error — drops the packet so the whole frame is
+/// never re-sent on top of bytes already on the TUN.
+fn decide_sync_fallback<F>(
+    result: Result<(), crate::io_uring_write::WriteError>,
+    sync_fallback: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if err.safe_to_retry() => sync_fallback(),
+        // Bytes are (or may be) already on the TUN — re-sending would
+        // double-transmit / corrupt the device. Drop the packet (the caller
+        // counts it as a write error + drop).
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 pub(crate) fn open_tun(name: &str) -> Result<(std::fs::File, String), String> {
@@ -1034,5 +1081,91 @@ mod tests {
         // SAFETY: we just wrote the `mtu` arm, so reading it back is defined.
         assert_eq!(unsafe { ifr.ifru.mtu }, 9000);
         assert_eq!(ifr.name_string(), "xpf-usp0");
+    }
+
+    use crate::io_uring_write::WriteError;
+    use std::cell::Cell;
+
+    /// #2477 fail-on-revert: a PARTIAL io_uring write (`WriteError::Transferred`)
+    /// already placed bytes on the packet-oriented TUN. The fallback decision
+    /// MUST NOT invoke the synchronous write — doing so re-sends the whole frame
+    /// on top of the truncated one (truncated + duplicate delivery).
+    ///
+    /// The sync-fallback thunk records whether it ran. With the old behaviour
+    /// (`io_uring().or_else(|_| sync)` — i.e. sync on ANY error), the thunk would
+    /// fire for this partial and the assertions below fail.
+    #[test]
+    fn partial_iouring_write_does_not_sync_fallback() {
+        let sync_ran = Cell::new(false);
+        let res = decide_sync_fallback(
+            Err(WriteError::Transferred(
+                "slow-path io_uring short write on packet fd: wrote 40 of 1400 bytes".to_string(),
+            )),
+            || {
+                sync_ran.set(true);
+                Ok(())
+            },
+        );
+        assert!(
+            !sync_ran.get(),
+            "a partial io_uring write must NOT sync-retry — re-sending the whole \
+             packet on top of the bytes already on the TUN double-transmits (#2477)"
+        );
+        assert!(
+            res.is_err(),
+            "the partial packet must be DROPPED (Err), not silently succeeded"
+        );
+    }
+
+    /// #2477 fail-on-revert: an ambiguous reap error where the SQE may be in
+    /// flight is also `Transferred` — never sync-retry (could double-transmit).
+    #[test]
+    fn ambiguous_reap_error_does_not_sync_fallback() {
+        let sync_ran = Cell::new(false);
+        let res = decide_sync_fallback(
+            Err(WriteError::Transferred(
+                "slow-path io_uring submit/wait: some wait error".to_string(),
+            )),
+            || {
+                sync_ran.set(true);
+                Ok(())
+            },
+        );
+        assert!(!sync_ran.get(), "an in-flight-ambiguous error must not sync-retry");
+        assert!(res.is_err());
+    }
+
+    /// Complement: a ZERO-byte io_uring failure (`WriteError::NothingWritten`)
+    /// put nothing on the TUN, so the synchronous fallback MUST run — the packet
+    /// is still deliverable and dropping it would be a regression.
+    #[test]
+    fn zero_byte_iouring_failure_does_sync_fallback() {
+        let sync_ran = Cell::new(false);
+        let res = decide_sync_fallback(
+            Err(WriteError::NothingWritten(
+                "slow-path io_uring write failed: Input/output error".to_string(),
+            )),
+            || {
+                sync_ran.set(true);
+                Ok(())
+            },
+        );
+        assert!(
+            sync_ran.get(),
+            "a zero-byte io_uring failure transferred nothing — sync-retry MUST run"
+        );
+        assert!(res.is_ok(), "the sync fallback succeeded, so the result is Ok");
+    }
+
+    /// The happy path: a successful io_uring write never touches the sync path.
+    #[test]
+    fn successful_iouring_write_skips_sync_fallback() {
+        let sync_ran = Cell::new(false);
+        let res = decide_sync_fallback(Ok(()), || {
+            sync_ran.set(true);
+            Ok(())
+        });
+        assert!(!sync_ran.get(), "a successful io_uring write must not sync-retry");
+        assert!(res.is_ok());
     }
 }

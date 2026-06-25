@@ -214,7 +214,11 @@ fn write_all_with_ring(ring: &mut IoUring, fd: i32, data: &[u8]) -> Result<(), S
     // by user_data so a stale CQE cannot corrupt the file offset, and returns
     // only after the matching CQE is reaped so `data` outlives every kernel
     // reference (#2297).
+    // The state writer is a positioned (byte-stream) write with no synchronous
+    // fallback, so it does not consume the `WriteError` retry-safety
+    // classification (#2477) — collapse it to the error message.
     crate::io_uring_write::write_all_to_fd(ring, fd, data, true, "state")
+        .map_err(|e| e.to_string())
 }
 
 fn temporary_path(path: &str) -> PathBuf {
