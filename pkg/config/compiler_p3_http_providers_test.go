@@ -161,6 +161,52 @@ func TestP3CheckIPURLMalformedWarns(t *testing.T) {
 	}
 }
 
+// TestP3CheckIPAllowlistMalformedWarns is the #2839 fail-on-revert gate: a
+// malformed checkip-allowlist token (operator typo, e.g. "8.8.8.8x") was
+// SILENTLY DROPPED by ddns.ParseAllowlist, so the bogus-IP safety gate silently
+// shrank and the checkip parser admitted the very IP the operator meant to
+// suppress. The commit-time warn pass must now name the offending token. Goes
+// RED if ddnsAllowlistMalformedTokens / its wiring is removed (back to silent
+// drop). The valid-token provider in the same config must NOT warn.
+func TestP3CheckIPAllowlistMalformedWarns(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set system services dynamic-dns provider bad backend dyndns2",
+		"set system services dynamic-dns provider bad server dyn.example",
+		"set system services dynamic-dns provider bad checkip-url https://checkip.example/",
+		// A typoed v4 token + a bare word; the valid 1.1.1.1 is retained.
+		"set system services dynamic-dns provider bad checkip-allowlist 1.1.1.1,8.8.8.8x",
+		// A provider whose allowlist is entirely valid must NOT warn.
+		"set system services dynamic-dns provider good backend dyndns2",
+		"set system services dynamic-dns provider good server dyn.example",
+		"set system services dynamic-dns provider good checkip-url https://checkip.example/",
+		"set system services dynamic-dns provider good checkip-allowlist 1.1.1.1,2606:4700::1",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	warns := validateSurfaceADDNSWarnings(cfg)
+	joined := strings.Join(warns, "\n")
+
+	// The offending token must be NAMED for provider "bad".
+	for _, want := range []string{
+		"provider \"bad\" checkip-allowlist",
+		"8.8.8.8x",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected a checkip-allowlist warning containing %q; got:\n%s", want, joined)
+		}
+	}
+	// The valid v4 token in the same "bad" allowlist must not be flagged.
+	if strings.Contains(joined, "entry \"1.1.1.1\"") {
+		t.Fatalf("valid allowlist token 1.1.1.1 must not warn; got:\n%s", joined)
+	}
+	// Provider "good" (all valid) must not warn.
+	if strings.Contains(joined, "provider \"good\" checkip-allowlist") {
+		t.Fatalf("valid checkip-allowlist should not warn; got:\n%s", joined)
+	}
+}
+
 // TestP3CheckIPURLUppercaseSchemeAccepted is the #2842 fail-on-revert gate: a
 // checkip-url with an uppercase/mixed-case scheme is valid per RFC 3986 §3.1
 // (the scheme is case-INSENSITIVE) and must NOT warn. Goes RED if the mirror

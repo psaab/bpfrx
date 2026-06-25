@@ -142,11 +142,11 @@ func (c *CLI) showServicesDynamicDNS(detail bool) error {
 
 	if detail && c.surfaceADDNSStatusFn != nil {
 		views := c.surfaceADDNSStatusFn()
-		fmt.Println("\n  Published scopes:")
+		fmt.Println("\n  Configured scopes:")
 		if len(views) == 0 {
 			fmt.Println("    none")
 		} else {
-			fmt.Printf("    %-32s %-6s %-39s %-12s %s\n", "FQDN", "Family", "Address", "Provider", "Last error")
+			fmt.Printf("    %-32s %-6s %-15s %-39s %-12s %s\n", "FQDN", "Family", "State", "Address", "Provider", "Last error")
 			for _, v := range views {
 				fam := "inet"
 				if v.Family == 6 {
@@ -156,8 +156,12 @@ func (c *CLI) showServicesDynamicDNS(detail bool) error {
 				if lastErr == "" {
 					lastErr = "-"
 				}
-				fmt.Printf("    %-32s %-6s %-39s %-12s %s\n",
-					v.FQDN, fam, v.Published, v.Provider, lastErr)
+				addr := v.Published
+				if addr == "" {
+					addr = "-"
+				}
+				fmt.Printf("    %-32s %-6s %-15s %-39s %-12s %s\n",
+					v.FQDN, fam, v.State, addr, v.Provider, lastErr)
 			}
 		}
 	}
