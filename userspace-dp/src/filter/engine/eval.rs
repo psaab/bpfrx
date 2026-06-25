@@ -230,6 +230,7 @@ fn evaluate_filter_ref_non_routing_counted(
     dscp: u8,
     extra: TermMatchExtra,
     packet_bytes: u64,
+    count: bool,
 ) -> FilterResult {
     match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => evaluate_filter_ref_non_routing_counted_v4(
@@ -242,6 +243,7 @@ fn evaluate_filter_ref_non_routing_counted(
             dscp,
             extra,
             packet_bytes,
+            count,
         ),
         (IpAddr::V6(src), IpAddr::V6(dst)) => evaluate_filter_ref_non_routing_counted_v6(
             filter,
@@ -253,6 +255,7 @@ fn evaluate_filter_ref_non_routing_counted(
             dscp,
             extra,
             packet_bytes,
+            count,
         ),
         _ => FilterResult::default(),
     }
@@ -269,11 +272,20 @@ fn evaluate_filter_ref_non_routing_counted_v4(
     dscp: u8,
     extra: TermMatchExtra,
     packet_bytes: u64,
+    count: bool,
 ) -> FilterResult {
     // #2544: accumulate fall-through modifiers (count/log/fc/dscp). A matched
     // term that points at a routing-instance defers to the routing-instance
     // evaluator (returns default here, unchanged); such a term is never a
     // fall-through (continue_term is false when routing_instance is set).
+    //
+    // #2620: `count` is false on the session-miss path when the interface
+    // filter is route-lookup-affecting — the paired routing-instance evaluator
+    // (`ingress_route_table_override`) traverses the SAME terms and records
+    // their counters there, so counting here too would double-count every
+    // matched fall-through `then count` term ahead of the routing-instance
+    // term. With no PBR term the routing evaluator never runs, so this path
+    // owns counting and `count` is true (current behavior preserved).
     let mut acc = FilterResult::default();
     for term in &filter.terms {
         if !term_matches_v4(
@@ -284,7 +296,7 @@ fn evaluate_filter_ref_non_routing_counted_v4(
         if !term.routing_instance.is_empty() {
             return FilterResult::default();
         }
-        if term.has_count {
+        if count && term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
         merge_matched_modifiers(&mut acc, filter, term);
@@ -312,8 +324,11 @@ fn evaluate_filter_ref_non_routing_counted_v6(
     dscp: u8,
     extra: TermMatchExtra,
     packet_bytes: u64,
+    count: bool,
 ) -> FilterResult {
     // #2544: see evaluate_filter_ref_non_routing_counted_v4.
+    // #2620: `count` gating mirrors the v4 variant — false on the PBR-affecting
+    // session-miss path so the routing-instance evaluator owns the count.
     let mut acc = FilterResult::default();
     for term in &filter.terms {
         if !term_matches_v6(
@@ -324,7 +339,7 @@ fn evaluate_filter_ref_non_routing_counted_v6(
         if !term.routing_instance.is_empty() {
             return FilterResult::default();
         }
-        if term.has_count {
+        if count && term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
         merge_matched_modifiers(&mut acc, filter, term);
@@ -585,6 +600,17 @@ pub(crate) fn evaluate_interface_filter_counted(
     )
 }
 
+/// Evaluate the per-interface input filter for the session-miss decision,
+/// deferring any routing-instance (PBR) term to the routing-instance evaluator.
+///
+/// `count` controls whether matched fall-through `then count` terms record
+/// their counters here. On the session-miss path the caller passes
+/// `count = !interface_filter_affects_route_lookup(...)`: when the filter is
+/// route-lookup-affecting the paired `evaluate_interface_filter_routing_instance_event_counted`
+/// traverses the SAME terms and records their counters, so this evaluator must
+/// NOT count (else every fall-through `then count` ahead of the routing-instance
+/// term double-counts on one miss packet, #2620). When no PBR term exists the
+/// routing evaluator never runs and this path owns the count (`count = true`).
 pub(crate) fn evaluate_interface_filter_non_routing_counted(
     state: &FilterState,
     ifindex: i32,
@@ -597,6 +623,7 @@ pub(crate) fn evaluate_interface_filter_non_routing_counted(
     dscp: u8,
     extra: TermMatchExtra,
     packet_bytes: u64,
+    count: bool,
 ) -> FilterResult {
     let filter = if is_v6 {
         state.iface_filter_v6_fast.get(&ifindex).map(Arc::as_ref)
@@ -616,6 +643,7 @@ pub(crate) fn evaluate_interface_filter_non_routing_counted(
         dscp,
         extra,
         packet_bytes,
+        count,
     )
 }
 

@@ -109,6 +109,28 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   dataplane denies the packet. For a terminating logging term
   `term.action` already equals the final verdict, so normalization is a
   no-op there.
+
+  **PBR session-miss counts each fall-through term exactly once (#2620).**
+  When an interface input filter is route-lookup-affecting (it has a
+  `then routing-instance` term), the session-miss path runs TWO evaluators
+  over the same filter: the non-routing precheck
+  (`evaluate_interface_filter_non_routing_counted`) for the terminal
+  verdict, then the routing-instance evaluator
+  (`evaluate_interface_filter_routing_instance_event_counted`, via
+  `ingress_route_table_override`) for the route override. Both walk every
+  matched term, so a `then { count X; next term; }` fall-through term ahead
+  of the routing-instance term was counted TWICE on one miss packet. The
+  precheck now takes a `count: bool`; the miss-path caller
+  (`evaluate_non_pbr_input_filter`) sets it to
+  `!interface_filter_affects_route_lookup(...)`. When a routing-instance
+  term exists the routing evaluator owns the count, so the precheck passes
+  `count = false` and records nothing; with no PBR term the routing
+  evaluator never runs and the precheck owns the count (`count = true`,
+  unchanged). The routing-instance evaluator already counts every matched
+  term up to and including the terminating one — even when it ultimately
+  returns `None` (a non-PBR terminal `discard` ahead of any
+  routing-instance term) — so the single owner is complete on every
+  miss-path exit.
 - `policer.rs` — token-bucket implementation plus the #1375 RFC
   2697/2698 three-color meter core. Token math is integer-only:
   the legacy token bucket keeps its bits/sec constructor contract, and

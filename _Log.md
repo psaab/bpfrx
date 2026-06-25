@@ -1,3 +1,32 @@
+## 2026-06-25 — #2620: PBR session-miss counts pre-PBR fall-through term once
+
+- **Timestamp**: 2026-06-25
+- **Action**: On the session-miss path a route-lookup-affecting interface
+  input filter runs two counted evaluators over the same terms: the
+  non-routing precheck (`evaluate_interface_filter_non_routing_counted`)
+  for the verdict, then the routing-instance evaluator
+  (`evaluate_interface_filter_routing_instance_event_counted`, via
+  `ingress_route_table_override`). Both called `record_filter_counter` for
+  a matched `then { count X; next term; }` fall-through term ahead of the
+  `then routing-instance` term, double-counting that term on one miss
+  packet (codex review-040 finding 040-06). Fix: added a `count: bool`
+  parameter to `evaluate_interface_filter_non_routing_counted` and its
+  `evaluate_filter_ref_non_routing_counted_v4/v6` bodies; the miss-path
+  caller `evaluate_non_pbr_input_filter` sets it to
+  `!interface_filter_affects_route_lookup(...)`. When a PBR term exists the
+  routing evaluator owns the count (precheck `count=false`); with no PBR
+  term the routing evaluator never runs and the precheck owns it
+  (`count=true`, behavior unchanged). The routing-instance evaluator already
+  counts every matched term up to the terminating one even when it returns
+  None, so the single owner is complete on every miss exit. Added a
+  fail-on-revert regression replicating the two-evaluator miss sequence
+  (asserts exactly-once; proved RED at left:2/right:1 on revert, restored).
+  No wire change (`wire_invariant_default_specimens` green).
+- **File(s)**: userspace-dp/src/filter/engine/eval.rs,
+  userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
+  _Log.md
+
 ## 2026-06-25 — #2623: GARP/NDP burst follow-up sends now count + surface errors
 
 - **Timestamp**: 2026-06-25

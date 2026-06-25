@@ -103,6 +103,20 @@ pub(super) fn evaluate_non_pbr_input_filter(
     )
     .unwrap_or(meta.ingress_ifindex as i32);
     let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
+    // #2620: suppress fall-through `then count` recording here when the filter
+    // is route-lookup-affecting (a routing-instance / PBR term exists). On the
+    // session-miss path this precheck is paired with
+    // `ingress_route_table_override`, which calls
+    // `evaluate_interface_filter_routing_instance_event_counted` over the SAME
+    // terms and records their counters. Counting in both evaluators
+    // double-counts every matched `then { count X; next term; }` ahead of the
+    // routing-instance term. When no PBR term exists the routing evaluator
+    // never runs, so this precheck owns the count (count = true, unchanged).
+    let count = !crate::filter::interface_filter_affects_route_lookup(
+        &forwarding.filter_state,
+        ingress_ifindex,
+        is_v6,
+    );
     let result = crate::filter::evaluate_interface_filter_non_routing_counted(
         &forwarding.filter_state,
         ingress_ifindex,
@@ -115,6 +129,7 @@ pub(super) fn evaluate_non_pbr_input_filter(
         meta.dscp,
         extra,
         meta.pkt_len as u64,
+        count,
     );
     let ingress_zone_id =
         filter_log_ingress_zone_id(forwarding, meta, ingress_zone_override, ingress_ifindex);

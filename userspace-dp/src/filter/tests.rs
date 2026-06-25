@@ -2605,6 +2605,7 @@ fn interface_filter_non_routing_counted_defers_pbr_term() {
         0,
         TermMatchExtra::default(),
         1400,
+        true,
     );
     assert_eq!(pbr.action, FilterAction::Accept);
     assert!(pbr.routing_instance.is_empty());
@@ -2625,6 +2626,7 @@ fn interface_filter_non_routing_counted_defers_pbr_term() {
         0,
         TermMatchExtra::default(),
         500,
+        true,
     );
     assert_eq!(plain.action, FilterAction::Discard);
     assert_eq!(filter.terms[1].counter.packets.load(Ordering::Relaxed), 1);
@@ -5464,4 +5466,121 @@ fn pbr_evaluator_log_on_routing_instance_term_itself() {
     let lm = result.log_match.expect("routing-instance term log");
     assert_eq!(lm.term_id, 0);
     assert_eq!(lm.action, FilterAction::Accept);
+}
+
+// ---------------------------------------------------------------------------
+// #2620: the PBR (routing-instance) session-miss path runs TWO evaluators over
+// the same interface filter — the non-routing precheck
+// (`evaluate_interface_filter_non_routing_counted`) for the verdict, then the
+// routing-instance evaluator (`evaluate_interface_filter_routing_instance_event_counted`,
+// via `ingress_route_table_override`) for the route override. Both traverse the
+// same terms, so a `then { count X; next term; }` fall-through term ahead of the
+// `then routing-instance` term was counted twice on one miss packet.
+//
+// The fix gates counting in the precheck on `count`, which the miss-path caller
+// sets to `!interface_filter_affects_route_lookup(...)`: when a routing-instance
+// term exists the routing evaluator owns the count, so the precheck passes
+// `count = false`. This test reproduces the exact miss-path sequence and asserts
+// the fall-through counter increments EXACTLY ONCE. Counter-factual guard: if the
+// precheck counts unconditionally (revert the fix → pass `count = true` below),
+// the counter would read 2 and this test fails.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pbr_miss_path_counts_fallthrough_term_exactly_once() {
+    let state = make_filter_state_with_interfaces(
+        &[FirewallFilterSnapshot {
+            name: "pbr-count".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "count-before-pbr".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["5201".into()],
+                    action: String::new(),
+                    next_term: true,
+                    count: "pre-pbr".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "steer-blue".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["5201".into()],
+                    action: "accept".into(),
+                    routing_instance: "blue".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[crate::InterfaceSnapshot {
+            ifindex: 14,
+            filter_input_v4: "pbr-count".into(),
+            ..Default::default()
+        }],
+    );
+
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+
+    // The interface filter carries a routing-instance term, so the miss path
+    // runs the routing-instance evaluator and the precheck must NOT count.
+    let affects_route_lookup =
+        interface_filter_affects_route_lookup(&state, 14, false);
+    assert!(
+        affects_route_lookup,
+        "filter with a routing-instance term must be route-lookup-affecting"
+    );
+
+    // Step 1 — non-routing precheck (verdict). count = !affects_route_lookup,
+    // exactly as evaluate_non_pbr_input_filter computes it (#2620). The
+    // fall-through term matches; with count=false it must record nothing.
+    let precheck = evaluate_interface_filter_non_routing_counted(
+        &state,
+        14,
+        false,
+        src,
+        dst,
+        PROTO_TCP,
+        40000,
+        5201,
+        0,
+        TermMatchExtra::default(),
+        1400,
+        !affects_route_lookup,
+    );
+    // The routing-instance term defers to the routing evaluator → default Accept.
+    assert_eq!(precheck.action, FilterAction::Accept);
+    assert!(precheck.routing_instance.is_empty());
+
+    // Step 2 — routing-instance evaluator (route override). It owns the count.
+    let routing = evaluate_interface_filter_routing_instance_event_counted(
+        &state,
+        14,
+        false,
+        src,
+        dst,
+        PROTO_TCP,
+        40000,
+        5201,
+        0,
+        TermMatchExtra::default(),
+        1400,
+    )
+    .expect("routing-instance override");
+    assert_eq!(routing.routing_instance, "blue");
+
+    // The fall-through `then { count pre-pbr; next term; }` term was counted
+    // EXACTLY ONCE across the two miss-path evaluators (the routing evaluator),
+    // not twice. Pre-fix (precheck counts too) this reads 2.
+    let filter = state.iface_filter_v4_fast.get(&14).expect("input filter");
+    assert_eq!(
+        filter.terms[0].counter.packets.load(Ordering::Relaxed),
+        1,
+        "pre-PBR fall-through count must increment exactly once on the miss path (#2620)"
+    );
+    assert_eq!(
+        filter.terms[0].counter.bytes.load(Ordering::Relaxed),
+        1400,
+        "byte counter must reflect a single packet"
+    );
 }
