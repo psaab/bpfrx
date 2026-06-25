@@ -98,6 +98,19 @@ pub(crate) struct ScreenState {
     syn_cookie_standby_ack_counters: FxHashMap<String, RateCounter>,
     syn_cookie_codec: Option<SynCookieCodec>,
     syn_cookie_validated: SynCookieValidatedCache,
+    /// #2446: per-zone SYN-cookie profile generation. Bumped in
+    /// `update_profiles` whenever a zone's SYN-cookie-relevant profile fields
+    /// (`syn_cookie` enable, `syn_flood_threshold`) change — including the
+    /// zone gaining or losing a profile, which is how a zone→profile
+    /// rebinding manifests. The current generation is stamped into a
+    /// validated-cache entry on insert and compared on consume, so a tuple
+    /// validated under an old profile is treated as a cache miss after the
+    /// profile changes and is re-validated under the new profile (its
+    /// SYN-flood counter then sees the connection). Keyed by zone name to
+    /// match `profiles`; the cache is keyed by `zone_id`, but both the insert
+    /// and consume sites carry the zone name, so the name→gen lookup happens
+    /// there.
+    syn_cookie_profile_gen: FxHashMap<String, u64>,
     syn_cookie_last_full_epoch: u64,
     #[cfg(test)]
     syn_cookie_full_epoch_override: Option<u64>,
@@ -118,6 +131,7 @@ impl ScreenState {
             syn_cookie_standby_ack_counters: FxHashMap::default(),
             syn_cookie_codec: None,
             syn_cookie_validated: SynCookieValidatedCache::default(),
+            syn_cookie_profile_gen: FxHashMap::default(),
             syn_cookie_last_full_epoch: 0,
             #[cfg(test)]
             syn_cookie_full_epoch_override: None,
@@ -137,6 +151,13 @@ impl ScreenState {
             .retain(|k, _| profiles.contains_key(k));
         self.syn_cookie_standby_ack_counters
             .retain(|k, _| profiles.contains_key(k));
+        // #2446: drop generation tracking for zones that lost their profile.
+        // If such a zone is reconfigured later, the absence (gen 0 vs. a
+        // freshly bumped gen) makes the next change a bump as well — but the
+        // master-key clear plus the per-entry TTL already bound any window,
+        // and a removed zone has no live cache consumers of its old gen.
+        self.syn_cookie_profile_gen
+            .retain(|k, _| profiles.contains_key(k));
         for zone in profiles.keys() {
             self.icmp_counters.entry(zone.clone()).or_default();
             self.udp_counters.entry(zone.clone()).or_default();
@@ -147,8 +168,40 @@ impl ScreenState {
             self.syn_cookie_standby_ack_counters
                 .entry(zone.clone())
                 .or_default();
+            // #2446: bump the per-zone SYN-cookie profile generation when a
+            // SYN-cookie-relevant field changes (or the zone newly gains a
+            // profile). Only `syn_cookie` (enable/disable) and
+            // `syn_flood_threshold` (the gate that consumes a validated-cache
+            // entry) affect whether a cached validation may legitimately
+            // bypass the SYN-flood counter, so unrelated profile edits
+            // (e.g. teardrop, port-scan) do NOT churn the validated cache.
+            let new_sig = Self::syn_cookie_profile_signature(&profiles[zone]);
+            let old_sig = self.profiles.get(zone).map(Self::syn_cookie_profile_signature);
+            if old_sig != Some(new_sig) {
+                let zone_gen = self.syn_cookie_profile_gen.entry(zone.clone()).or_insert(0);
+                *zone_gen = zone_gen.wrapping_add(1);
+            }
         }
         self.profiles = profiles;
+    }
+
+    /// #2446: the SYN-cookie-relevant slice of a zone profile. Two profiles
+    /// with the same signature are interchangeable for the validated-ACK
+    /// cache: a tuple validated under one may bypass the SYN-flood counter
+    /// under the other without changing the security posture. Any change here
+    /// bumps the zone's profile generation and invalidates its cached
+    /// validations. `(syn_cookie, syn_flood_threshold)` — NOT the stateless
+    /// screens, scan/sweep, or other flood thresholds, which never gate the
+    /// validated cache.
+    fn syn_cookie_profile_signature(profile: &ScreenProfile) -> (bool, u32) {
+        (profile.syn_cookie, profile.syn_flood_threshold)
+    }
+
+    /// #2446: current SYN-cookie profile generation for a zone (0 if the zone
+    /// has no profile or has never been configured). Stamped into validated-
+    /// cache entries on insert and compared on consume.
+    fn syn_cookie_profile_gen(&self, zone: &str) -> u64 {
+        self.syn_cookie_profile_gen.get(zone).copied().unwrap_or(0)
     }
 
     /// Publish the cluster-wide SYN-cookie master key into this worker's screen
@@ -302,9 +355,11 @@ impl ScreenState {
         if syn_flood_threshold > 0 && pkt.protocol == PROTO_TCP {
             let tf = pkt.tcp_flags;
             if is_initial_syn(tf) {
+                let profile_gen = self.syn_cookie_profile_gen(zone);
                 let syn_cookie_validated = syn_cookie
                     && self.syn_cookie_validated.take_valid(
                         zone_id,
+                        profile_gen,
                         SynCookieTuple::from_packet(pkt),
                         now_secs,
                     );
@@ -550,7 +605,9 @@ impl ScreenState {
             .validate_isn(tuple, zone_id, current_epoch, cookie_isn)
             .is_some()
         {
-            self.syn_cookie_validated.insert(zone_id, tuple, now_secs);
+            let profile_gen = self.syn_cookie_profile_gen(zone);
+            self.syn_cookie_validated
+                .insert(zone_id, profile_gen, tuple, now_secs);
             SynCookieAckVerdict::Validated
         } else if locally_active {
             SynCookieAckVerdict::Invalid

@@ -53,6 +53,32 @@
   --bin xpf-userspace-dp` wg_frame (9/9) + tunnel_ttl (3/3) + gre/frame
   filters green. WG/GRE transit is lab-bound on the loss cluster (no WG
   tunnel) — unit tests are the gate.
+## 2026-06-24 — #2446: SYN-cookie validated-ACK cache survives zone profile changes
+
+- **Timestamp**: 2026-06-24
+- **Action**: Added a per-zone SYN-cookie profile generation to the
+  validated-ACK cache key. The cache was keyed by `(zone_id, 4-tuple)`
+  and cleared only on a master-key change, so a SYN-cookie-relevant
+  profile edit (disable/re-enable, syn-flood-threshold change,
+  zone→profile rebind) with a stable master key let a tuple validated
+  under the old profile bypass the new profile's SYN-flood counter until
+  TTL expiry. Fix: `SynCookieValidatedKey` now carries `profile_gen`;
+  `ScreenState.update_profiles` bumps a per-zone generation whenever the
+  SYN-cookie signature `(syn_cookie, syn_flood_threshold)` changes (or
+  the zone gains/loses a profile); insert stamps the current generation
+  and `take_valid` compares it (stale gen = miss → re-validate under the
+  new profile). Master-key clear retained as defense in depth. Unrelated
+  profile edits do not bump the generation (no re-validation churn).
+- **File(s)**: userspace-dp/src/screen/syncookie.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  docs/syn-cookie-flood-protection.md
+- **Validation**: `cargo build --release` clean (no new screen/
+  warnings); `cargo test --release --bin xpf-userspace-dp screen::`
+  123/0. New tests: invalidated_on_profile_change,
+  invalidated_on_disable_reenable, hit_within_same_generation (no
+  regression), generation_is_keyed (unit). Fail-on-revert proven —
+  disabling the gen bump turns the two invalidation tests RED
+  (SynCookieBypass instead of Pass).
 
 ## 2026-06-24 — #2702: BGP group/neighbor export/import bracket-list truncation
 
@@ -14327,4 +14353,42 @@ top.
   `cargo test --release --bin xpf-userspace-dp state_writer` → 7 passed / 0
   failed.
 - **File(s)**: userspace-dp/src/state_writer.rs, userspace-dp/src/FEATURES.md,
+  _Log.md.
+
+## #2467 — event-stream session-event ifindex widened i16 → i32 (wire change)
+
+- **Timestamp**: 2026-06-24
+- **Action**: The userspace session-event binary wire encoded three identity
+  fields (OwnerRGID, EgressIfindex, TXIfindex) as signed 16-bit, while the Go
+  side stored them as full `int`. Linux ifindexes are a full `int` and wrap
+  negative past 32767 on long-running systems with interface churn, so a high
+  ifindex truncated/sign-flipped over the wire. Widened all three open-frame
+  fields and the close-frame OwnerRGID from i16 to i32 on the wire (LE, matching
+  the existing LittleEndian convention). This is a #1961-class WIRE change: the
+  Rust encoder (event_stream/codec.rs) and Go decoder
+  (pkg/dataplane/userspace/eventstream.go) stay byte-compatible.
+- **Layout impact**: the open frame's fixed header grew 24 → 30 bytes (+6); all
+  downstream offsets (TunnelEndpoint, TXVLAN, Flags, zone IDs, Disposition, the
+  IP block start at 24 → 30) shifted +6 on BOTH sides. The close frame's
+  OwnerRGID slot grew 2 → 4 bytes; trailing Flags + zone-id offsets shifted +2.
+  Both encoder offsets, both decoder offsets, the length/min-length guards, and
+  the codec_tests.rs + eventstream_test.go payload builders/readers updated.
+- **Tests**: Rust test_encode_session_open_high_ifindex_v4 (egress 70000, tx
+  65536, owner 40000 — all > i16/u16 limits) + test_encode_session_close_high_
+  owner_rg_v4 pin the i32 wire encode. Go TestDecodeSessionEventHighIfindex +
+  TestDecodeSessionCloseEventHighOwnerRG round-trip the high values through the
+  decoder. Fail-on-revert PROVEN: reverting the Go EgressIfindex read to i16
+  yielded `EgressIfindex = 4464` (70000 & 0xFFFF) RED; restored → GREEN.
+- **Not in scope**: the 136-byte RT_FLOW dataplane.Event payload (frame types
+  11-15) keeps its own owner_rg_id i16 slot at [64:66] and ingress_ifindex i32
+  at [128:132] — a separate layout, unchanged. The protocol_wire_v1.json
+  control-protocol fixture is JSON serde (i32 numbers), unaffected; its
+  wire_invariant_default_specimens test still passes (no regen).
+- **Gates**: cargo build --release clean; cargo test event_stream::codec → 19
+  passed/0 failed; go build ./... clean; go test ./pkg/dataplane/userspace/...
+  ok; gofmt + go vet clean.
+- **File(s)**: userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/codec_tests.rs,
+  pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/eventstream_test.go, docs/session-sync-design.md,
   _Log.md.
