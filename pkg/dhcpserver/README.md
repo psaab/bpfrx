@@ -241,6 +241,22 @@ check on deploy confirms Kea parses the rendered block.
 
 ## Dynamic DNS (DDNS) — #1387, increment 1
 
+> **Moved in #2691 P1a — the DDNS spine now lives in `pkg/ddns`.** The
+> reconcile engine (`DDNSManager`, now `ddns.Manager`), the ownership state
+> store, the RFC 2136 backend, and the `DNSUpdater`/record/hostname helpers
+> were extracted VERBATIM (no behavior change) into `pkg/ddns` — see
+> `pkg/ddns/README.md` and `docs/research/ddns-world-class/plan.md` §9. The
+> file names in the sections below (`ddns.go`, `ddns_rfc2136.go`,
+> `ddns_state.go`, `ddns_dns.go`, `ddns_hostname.go`) now refer to their
+> `pkg/ddns` homes (`manager.go`, `backend_rfc2136.go`, `state.go`,
+> `backend.go`, `hostname.go`). What STAYS in `pkg/dhcpserver`: the
+> state-aware **Kea-memfile lease parser** (`ddns_leases.go` —
+> `parseActiveLeases4/6`, entangled with the lease-sync fallback), the config
+> compile/merge path, and the thin glue (`ddns.go`) that re-exports the
+> cross-package type aliases and injects the lease parser into the engine via
+> the `ddns.LeaseParser` seam. `pkg/daemon`'s HA writer gate
+> (`ddnsWriterGateOpen`) is unchanged and unmoved.
+
 Opt-in publishing of forward (`A`/`AAAA`) and reverse (`PTR`) DNS records
 for active DHCP leases, with stale-record cleanup on expire / release /
 decline / reclaim / reassign. Default OFF — an absent `dynamic-dns` block
