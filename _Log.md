@@ -17650,3 +17650,30 @@ top.
   go vet ./pkg/ipsec/..., go test ./pkg/ipsec/... PASS.
 - **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/matchfamily_linklocal_test.go,
   pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix three REST query-filter bugs (#2934/#2935/#2939) — fail
+  closed on malformed filters, align protocol matching with gRPC/CLI, and
+  switch the event filter from substring to exact match.
+  - #2934: REST `zone` (uint16) and policy-match `dst_port` (int) filters
+    returned the default (0 = "no filter"/"any port") on a parse error,
+    silently widening the query — a cross-zone observability leak. Added
+    `queryUint16Strict`/`queryIntStrict` (api.go) that return (0,false) on
+    a malformed non-empty value; sessions/events `zone` and policy-match
+    `dst_port` now return HTTP 400, mirroring gRPC sessionFilter.validate.
+  - #2935: REST session `protocol` filter compared the rendered name
+    case-SENSITIVELY with no numeric form. Added `protoFilterMatches`
+    (sessions.go) — case-insensitive name OR numeric IP-proto — mirroring
+    gRPC/CLI. `tcp`/`TCP`/`6` all match TCP now.
+  - #2939: `EventFilter.matches` (pkg/logging/eventbuf.go) used
+    `strings.Contains` (substring) → `protocol=C` matched TCP+ICMP+ICMPv6.
+    Switched to `strings.EqualFold` exact match for Protocol and Action.
+  - Fail-on-revert proofs (copy-aside + revert, all RED without fix):
+    zone=abc/65536 → 200+leak; dst_port=abc → 200 false-PERMIT; proto
+    tcp/6 → 0 sessions; event protocol=C → 3 events, action=per → 2.
+  - Gates: go build ./..., go vet ./pkg/api/..., go test ./pkg/api/...,
+    ./pkg/logging/..., ./pkg/grpcapi/, ./pkg/cli/ PASS; gofmt clean on
+    touched files.
+- **File(s)**: pkg/api/api.go, pkg/api/sessions.go, pkg/api/security.go,
+  pkg/logging/eventbuf.go, pkg/api/rest_filter_failclosed_test.go,
+  pkg/api/README.md, _Log.md
