@@ -173,6 +173,24 @@ also carries operator content:
   frr.conf for a config that arrives via the lenient path (an older-binary
   persisted config or a peer-synced one) — keeping the rest of the reload
   alive instead of bricking it for every other peer.
+- **An OSPF/OSPFv3/BGP router-id is validated at commit (#2980).** `router-id`
+  is parsed as a raw string with no validation, so a malformed value (not a
+  32-bit IPv4 dotted-quad — e.g. garbage, an out-of-range octet, or an IPv6
+  address) flowed verbatim into `frr.conf`. FRR/vtysh requires a 32-bit IPv4
+  router-id for ALL routing protocols — including the IPv6 protocols OSPFv3
+  (`ospf6 router-id`) and BGP (`bgp router-id`) — and rejects anything else,
+  failing the WHOLE `frr-reload` and leaving dynamic routing broken/stale — a
+  commit-accepted config the routing daemon cannot load.
+  `validateRouterIDStrict` (`pkg/config`) hard-rejects a non-IPv4 router-id at
+  commit/commit-check (both the global `protocols {}` and per-routing-instance
+  scopes, covering OSPF/OSPFv3/BGP), naming the scope and protocol; lenient
+  (warn) on load/HA-sync (#1960). The check is `net.ParseIP` + `To4() != nil`
+  (a router-id is the dotted-quad form even for v6 protocols); an empty
+  router-id is allowed and omitted so FRR auto-derives one. As
+  defense-in-depth the renderer (`policy_render.go`, `validRouterID` guard at
+  each of the three `generateProtocols` render sites) SKIPS an invalid
+  router-id, so a malformed value never reaches frr.conf for a config that
+  arrives via the lenient path — keeping the rest of the reload alive.
 - **A global `protocols bgp export <token>` is split by token shape
   (#2473).** The render classifies each entry by the SAME
   policy-statement-exists predicate the commit-time validator uses

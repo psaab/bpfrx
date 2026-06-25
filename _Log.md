@@ -17953,3 +17953,30 @@ top.
   pkg/config/bgp_neighbor_peeras_2963_test.go,
   pkg/frr/policy_render.go, pkg/frr/bgp_remote_as_2963_test.go,
   pkg/frr/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2980 — commit-time validation of OSPF/OSPFv3/BGP router-id as a
+  valid 32-bit IPv4 dotted-quad. router-id was parsed as a raw string with no
+  validation, so a malformed value (garbage, out-of-range octet, or an IPv6
+  address) flowed verbatim into frr.conf. FRR/vtysh requires an IPv4 router-id
+  for ALL routing protocols (including the IPv6 protocols OSPFv3 and BGP) and
+  rejects anything else, failing the whole frr-reload — a commit-accepted
+  config the routing daemon cannot load. Added validateRouterIDStrict
+  (pkg/config/compiler_validate_strict.go) hard-rejecting a non-IPv4 router-id
+  at commit/commit-check (global protocols {} + per-routing-instance scopes,
+  covering OSPF/OSPFv3/BGP, naming the scope + protocol) wired into
+  compileConfigWithOpts with a new lenientRouterID option (warn-and-boot on
+  load/HA-sync per #1960). Check is net.ParseIP + To4()!=nil; empty router-id
+  allowed (omitted, FRR auto-derives). Defense-in-depth: validRouterID guard
+  at the three generateProtocols render sites (pkg/frr/policy_render.go) so a
+  malformed value never reaches frr.conf on the lenient path. Mirrors the
+  #2963 strict/lenient plumbing exactly. FAIL-ON-REVERT: config gate tests RED
+  without the strict check (neutered validator → 3 anchor tests fail);
+  frr render-guard test RED without the validRouterID skip. Gates:
+  go build ./..., gofmt -l clean (my files), go vet ./pkg/config/...
+  ./pkg/frr/..., go test ./pkg/config/... ./pkg/frr/... all PASS.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/router_id_2980_test.go,
+  pkg/frr/policy_render.go, pkg/frr/router_id_2980_test.go,
+  pkg/frr/README.md, _Log.md
