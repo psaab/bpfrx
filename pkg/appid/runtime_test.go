@@ -229,6 +229,39 @@ func TestResolveSessionNameProtocolOnlyApp(t *testing.T) {
 	}
 }
 
+// TestResolveTupleFallbackPrefersPortOverProtocol proves the #2578 specificity
+// ordering: when BOTH a port-based app (tcp/8443) and a protocol-only app (tcp)
+// match a session, the more-specific port-based app wins deterministically. The
+// matching-port session resolves to the port-based app; a non-matching-port TCP
+// session falls through to the protocol-only app. Reverting the specificity
+// sort in resolveTupleFallback (first-match map iteration) makes the matching-
+// port assertion flaky — it picks whichever app the Go map hits first.
+func TestResolveTupleFallbackPrefersPortOverProtocol(t *testing.T) {
+	cfg := &config.Config{
+		Applications: config.ApplicationsConfig{
+			Applications: map[string]*config.Application{
+				// Named so the port-based app sorts AFTER the protocol-only app
+				// alphabetically — a name-only tiebreak would pick the protocol
+				// app, so a passing test depends on the port>protocol rule.
+				"aaa-proto-only": {Name: "aaa-proto-only", Protocol: "tcp"},
+				"zzz-port-8443":  {Name: "zzz-port-8443", Protocol: "tcp", DestinationPort: "8443"},
+			},
+		},
+	}
+
+	// Run many times: map iteration order is randomized per-range, so a
+	// first-match implementation would intermittently return the protocol-only
+	// app. The specificity sort must make every iteration deterministic.
+	for i := 0; i < 256; i++ {
+		if got := resolveTupleFallback(6, 8443, cfg); got != "zzz-port-8443" {
+			t.Fatalf("iter %d: TCP/8443 = %q, want zzz-port-8443 (port-based beats protocol-only)", i, got)
+		}
+		if got := resolveTupleFallback(6, 9999, cfg); got != "aaa-proto-only" {
+			t.Fatalf("iter %d: TCP/9999 = %q, want aaa-proto-only (only the protocol-only app matches)", i, got)
+		}
+	}
+}
+
 func TestSessionMatchesUnknown(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Services.ApplicationIdentification = true

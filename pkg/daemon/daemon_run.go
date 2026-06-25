@@ -972,6 +972,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// relays. The relay goroutines bind to d.daemonCtx (== ctx here) so
 	// they outlive each apply call and are torn down only at daemon stop.
 	d.dhcpRelay = dhcprelay.NewManager()
+	// #2456: gate the upstream relay-forward on this node's VRRP/cluster MASTER
+	// state for the relay interface's redundancy group. On a shared client
+	// segment both the master and the backup receive the client broadcast;
+	// without this gate BOTH relay it upstream (duplicate relayed requests with
+	// different per-node giaddrs). The gate is read per packet, so a backup that
+	// becomes master starts relaying immediately. Standalone / non-RG-owned
+	// interfaces always relay (the gate returns true).
+	d.dhcpRelay.SetMasterGate(d.relayMasterGateOpen)
 	if cfg := d.store.ActiveConfig(); cfg != nil {
 		d.dhcpRelay.Apply(ctx, cfg.ForwardingOptions.DHCPRelay)
 	}

@@ -32,35 +32,61 @@ pub(super) struct ClassifierTables<'a> {
 fn build_cos_dscp_queue_table(
     classifier_name: &str,
     classifiers: &FastMap<String, CoSDSCPClassifierConfig>,
-) -> [u8; 64] {
+) -> Result<[u8; 64], crate::policy::SnapshotIntegrityError> {
     let mut table = [u8::MAX; 64];
     if classifier_name.is_empty() {
-        return table;
+        return Ok(table);
     }
     if let Some(classifier) = classifiers.get(classifier_name) {
         for (&dscp, &queue_id) in &classifier.queue_by_dscp {
-            let idx = usize::from(dscp & 0x3f);
-            table[idx] = queue_id;
+            // #2447: a code-point outside the 6-bit DSCP domain fails the
+            // snapshot CLOSED. The pre-fix `dscp & 0x3f` masked an
+            // out-of-range value into a valid index, silently installing the
+            // classifier for a DIFFERENT traffic class (110 → 46). The Go
+            // commit gate rejects these first; this guards version/snapshot
+            // drift. An in-range value indexes the table unchanged.
+            let idx = usize::from(dscp);
+            let Some(slot) = table.get_mut(idx) else {
+                return Err(
+                    crate::policy::SnapshotIntegrityError::CosDscpCodePointOutOfRange {
+                        classifier: classifier_name.to_string(),
+                        dscp,
+                    },
+                );
+            };
+            *slot = queue_id;
         }
     }
-    table
+    Ok(table)
 }
 
 fn build_cos_ieee8021_queue_table(
     classifier_name: &str,
     classifiers: &FastMap<String, CoSIEEE8021ClassifierConfig>,
-) -> [u8; 8] {
+) -> Result<[u8; 8], crate::policy::SnapshotIntegrityError> {
     let mut table = [u8::MAX; 8];
     if classifier_name.is_empty() {
-        return table;
+        return Ok(table);
     }
     if let Some(classifier) = classifiers.get(classifier_name) {
         for (&pcp, &queue_id) in &classifier.queue_by_pcp {
-            let idx = usize::from(pcp.min(7));
-            table[idx] = queue_id;
+            // #2447: a code-point outside the 3-bit PCP domain fails the
+            // snapshot CLOSED. The pre-fix `pcp.min(7)` clamped an
+            // out-of-range value into a valid index, silently installing the
+            // classifier for a DIFFERENT traffic class (9 → 7).
+            let idx = usize::from(pcp);
+            let Some(slot) = table.get_mut(idx) else {
+                return Err(
+                    crate::policy::SnapshotIntegrityError::CosIeee8021CodePointOutOfRange {
+                        classifier: classifier_name.to_string(),
+                        pcp,
+                    },
+                );
+            };
+            *slot = queue_id;
         }
     }
-    table
+    Ok(table)
 }
 
 /// Default burst size when interface or scheduler did not specify
@@ -409,9 +435,11 @@ pub(super) fn build_cos_iface_config(
         return Ok(None);
     }
     let dscp_queue_by_dscp =
-        build_cos_dscp_queue_table(&iface.cos_dscp_classifier, &tables.dscp_classifiers);
-    let ieee8021_queue_by_pcp =
-        build_cos_ieee8021_queue_table(&iface.cos_ieee8021_classifier, &tables.ieee8021_classifiers);
+        build_cos_dscp_queue_table(&iface.cos_dscp_classifier, &tables.dscp_classifiers)?;
+    let ieee8021_queue_by_pcp = build_cos_ieee8021_queue_table(
+        &iface.cos_ieee8021_classifier,
+        &tables.ieee8021_classifiers,
+    )?;
 
     if queues.is_empty() {
         queues.push(CoSQueueConfig {

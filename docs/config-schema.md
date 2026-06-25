@@ -278,7 +278,8 @@ Rules:
 - **Validators live in `pkg/config/schema_validators.go`** and are stateless
   string-checkers reusing the compiler's parsers. Add a generic one
   (`ValidateInteger(min,max)`, `ValidateEnum([...])`, the IP family
-  validators `ValidateIPAddress` / `ValidateIPv4CIDR` / `ValidateIPv6CIDR`)
+  validators `ValidateIPAddress` / `ValidateIPv6Address` /
+  `ValidateIPv4CIDR` / `ValidateIPv6CIDR` / `ValidatePREF64CIDR`)
   or a bespoke `ValidateX(raw string, cfg *Config) error`. **cfg is always
   nil in production** — both call sites run the gate BEFORE compile
   (`configstore.compileTree` / `compileTreeLenient`), so a validator must
@@ -526,8 +527,9 @@ reserved for whole-dataplane selection where a rewrite shim
     compiler reads (the subtree was previously unreachable by the walker).
   - `protocols router-advertisement interface` — typed the
     second-denominated leaves (`max/min-advertisement-interval`,
-    `default-lifetime`, `link-mtu` via `ValidateIntegerMin(1)`) and
-    declared the remaining compiler-consumed structural children
+    `default-lifetime`, `link-mtu`; the latter was tightened from
+    `ValidateIntegerMin(1)` to `ValidateIntegerMin(1280)` in #2497, see
+    below) and declared the remaining compiler-consumed structural children
     (managed/other-stateful-configuration, dns-server-address, prefix
     flags). The per-`prefix` `valid-lifetime` / `preferred-lifetime` leaves
     are typed as non-negative integers (`ValidateIntegerMin(0)`): the
@@ -542,6 +544,36 @@ reserved for whole-dataplane selection where a rewrite shim
     fails at commit; `allow-duplicates` is an explicit presence-only flag.
   Pure schema hardening — no runtime behavior change. Regression coverage:
   `pkg/config/schema_validate_2008_test.go`.
+- **#2497 (router-advertisement string/identity leaves):** #2008 typed
+  only the RA integer leaves; the five string/identity leaves below were
+  still accepted untyped and then silently skipped or mis-advertised by
+  the RA sender (`pkg/ra/sender.go buildRA`). Wired at commit:
+  - `prefix` — the prefix value is the named-instance identity arg, so it
+    uses `keyValidator: ValidateIPv6CIDR` (not the typed-leaf `validator`,
+    which would mis-treat the on-link/autonomous flag children as
+    modifiers). A typo'd or IPv4 prefix previously committed and the
+    sender's `netip.ParsePrefix` error path logged-and-skipped it, so
+    hosts got no PrefixInformation option and SLAAC silently broke.
+  - `nat-prefix` / `nat64prefix` — `keyValidator: ValidatePREF64CIDR`,
+    which reuses `ValidateIPv6CIDR` and then enforces the RFC 8781 §4
+    PREF64 length set `{32,40,48,56,64,96}` (the only lengths the 3-bit
+    PLC wire field encodes). The `lifetime` child is now
+    `ValidateIntegerMin(0)` (was an Atoi-on-error-zero leaf).
+  - `preference` — `ValueEnumOf` + `ValidateEnum(high|medium|low)`. A
+    typo fell through the sender's `switch` default and silently
+    advertised Medium, perturbing host default-router selection.
+  - `dns-server-address` — `ValueIPAddress` + `ValidateIPv6Address` (a
+    new validator: bare IPv6 literal, IPv4 rejected). The RDNSS option
+    (RFC 8106) is IPv6-only; the sender skipped unparseable strings but
+    did NOT family-gate, so a valid IPv4 literal reached the wire.
+  - `link-mtu` — floor raised to `ValidateIntegerMin(1280)` (RFC 8200 §5
+    IPv6 minimum link MTU); a smaller value was advertised verbatim and
+    blackholes hosts that honor it.
+  Pure schema hardening — no runtime behavior change (the sender's
+  parse-and-skip / default paths are now unreachable for committed
+  configs). New validators `ValidateIPv6Address` / `ValidatePREF64CIDR`
+  live in `schema_validators.go`. Regression coverage:
+  `pkg/config/schema_validate_2497_test.go`.
 - **#2008 H7 (security log profile):** declared the `security log
   profile <name>` stanza — `stream-name` (`ValueHintStreamName`
   completion), `default-profile` (presence flag), and
@@ -1495,3 +1527,36 @@ remote CLI, gRPC, and REST (previously local-CLI-only) via
 (no response field). This makes `show | display set` output — including the
 `deactivate <path>` lines above — round-trippable through every service
 surface.
+
+### #2447 — class-of-service DSCP/802.1p code-points are domain-validated at commit
+
+`class-of-service` classifier (and DSCP rewrite-rule) code-points are now
+range-checked at commit, not silently aliased into a different traffic class.
+
+- **DSCP** (`classifiers dscp ...`, `rewrite-rules dscp ...`) — domain `0..63`
+  (the 6-bit DiffServ field). A symbolic alias (`be`, `ef`, `af11`, `cs6`, …)
+  resolves through `coSDSCPValues`; a numeric token outside `0..63` is a
+  **commit error** (`compileClassOfService`, `expandCoSCodePointToken` in
+  `pkg/config/compiler_class_of_service.go`).
+- **802.1p / IEEE 802.1** (`classifiers ieee-802.1 ...`) — domain `0..7` (the
+  3-bit PCP field). A numeric token outside `0..7` is a **commit error**
+  (`collectCoS8021CodePoints`).
+
+Before #2447 these were **silently dropped** at the Go parse layer (no commit
+error) and, on a version/snapshot-drifted helper, the dataplane builder masked
+`dscp & 0x3f` / clamped `pcp.min(7)` — so a configured DSCP 110 installed a
+classifier for DSCP 46 (a DIFFERENT class) and PCP 9 installed one for PCP 7,
+with no failure surfaced. A non-numeric, non-alias token (a typo) is still
+skipped (not an error), preserving Junos-compatibility for unknown spellings.
+
+The Rust forwarding-build is the second trust boundary: an out-of-range
+code-point reaching `build_cos_dscp_queue_table` / `build_cos_ieee8021_queue_table`
+fails the snapshot CLOSED (`SnapshotIntegrityError::CosDscpCodePointOutOfRange`
+/ `CosIeee8021CodePointOutOfRange`) — the apply preflight keeps the previous
+live CoS state rather than building a classifier for the wrong class. This is
+the same fail-closed posture as #2410/#2696/#2713 (queue id, scheduler-map
+class, interface MTU). Runtime packet-field masking is retained where it
+belongs: `resolve_cos_dscp_classifier_queue_id` / `resolve_cos_ieee8021_classifier_queue_id`
+(`tx/cos_classify.rs`) still mask the LIVE packet's DSCP/PCP to index the
+fixed-size table — the table is now built only from validated indices, so the
+mask just bounds the physically-limited wire field, it no longer aliases config.

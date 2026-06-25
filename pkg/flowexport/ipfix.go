@@ -479,12 +479,25 @@ func (e *IPFIXExporter) Close() {
 }
 
 func (e *IPFIXExporter) sendTemplates() {
+	// RFC 7011 §3.1 / §10.3.2: the IPFIX Sequence Number is the cumulative
+	// count of Data Records sent in all prior Messages for this Observation
+	// Domain (the value of the NEXT Data Record's sequence). A Message that
+	// carries only (Options) Template Sets contains no Data Records, so it
+	// MUST NOT advance the counter — but it MUST carry the current cumulative
+	// value, not 0. Emitting 0 on every periodic template refresh rewinds the
+	// header sequence, which loss/sequence-tracking collectors (pmacct,
+	// Elastiflow) read as packet loss or an exporter restart (#2609). Read
+	// e.seq under e.mu WITHOUT incrementing it (no data records are sent).
+	e.mu.Lock()
+	seq := e.seq
+	e.mu.Unlock()
+
 	now := time.Now()
 	hdr := ipfixHeader{
 		Version:        10,
 		Length:         uint16(16 + len(e.templateSet)),
 		ExportTime:     uint32(now.Unix()),
-		SequenceNumber: 0, // template-only messages use seq=0 per convention
+		SequenceNumber: seq,
 		ObservationID:  e.sourceID,
 	}
 

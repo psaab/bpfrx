@@ -138,7 +138,10 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 					if lossPriority == "" {
 						lossPriority = nodeVal(lpNode)
 					}
-					codePoints := collectCoSDSCPCodePoints(lpNode)
+					codePoints, err := collectCoSDSCPCodePoints(lpNode)
+					if err != nil {
+						return fmt.Errorf("class-of-service classifiers dscp %q: %w", classifier.Name, err)
+					}
 					if len(codePoints) == 0 {
 						continue
 					}
@@ -171,7 +174,10 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 					if lossPriority == "" {
 						lossPriority = nodeVal(lpNode)
 					}
-					codePoints := collectCoS8021CodePoints(lpNode)
+					codePoints, err := collectCoS8021CodePoints(lpNode)
+					if err != nil {
+						return fmt.Errorf("class-of-service classifiers ieee-802.1 %q: %w", classifier.Name, err)
+					}
 					if len(codePoints) == 0 {
 						continue
 					}
@@ -207,7 +213,10 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 					if lossPriority == "" {
 						lossPriority = nodeVal(lpNode)
 					}
-					codePoint, ok := collectCoSDSCPRewriteCodePoint(lpNode)
+					codePoint, ok, err := collectCoSDSCPRewriteCodePoint(lpNode)
+					if err != nil {
+						return fmt.Errorf("class-of-service rewrite-rules dscp %q: %w", rewriteRule.Name, err)
+					}
 					if !ok {
 						continue
 					}
@@ -514,21 +523,28 @@ func parseCoSTransmitRate(node *Node) (uint64, bool) {
 	return rate, exact
 }
 
-func collectCoSDSCPCodePoints(node *Node) []uint8 {
+func collectCoSDSCPCodePoints(node *Node) ([]uint8, error) {
 	var values []uint8
 	seen := make(map[uint8]struct{})
-	add := func(raw string) {
-		for _, value := range expandCoSCodePointToken(raw) {
+	add := func(raw string) error {
+		expanded, err := expandCoSCodePointToken(raw)
+		if err != nil {
+			return err
+		}
+		for _, value := range expanded {
 			if _, ok := seen[value]; ok {
 				continue
 			}
 			seen[value] = struct{}{}
 			values = append(values, value)
 		}
+		return nil
 	}
 	for _, child := range node.FindChildren("code-points") {
 		for _, raw := range child.Keys[1:] {
-			add(raw)
+			if err := add(raw); err != nil {
+				return nil, err
+			}
 		}
 	}
 	// Inline leaf spelling (#1809): "loss-priority low code-points ef;"
@@ -537,36 +553,53 @@ func collectCoSDSCPCodePoints(node *Node) []uint8 {
 	for i := 2; i < len(node.Keys); i++ {
 		if node.Keys[i] == "code-points" {
 			for _, raw := range node.Keys[i+1:] {
-				add(raw)
+				if err := add(raw); err != nil {
+					return nil, err
+				}
 			}
 			break
 		}
 	}
-	return values
+	return values, nil
 }
 
-func collectCoS8021CodePoints(node *Node) []uint8 {
+func collectCoS8021CodePoints(node *Node) ([]uint8, error) {
 	var values []uint8
 	seen := make(map[uint8]struct{})
-	add := func(raw string) {
+	// #2447: an 802.1p code-point is the 3-bit PCP field, domain 0..7. A
+	// numeric token outside that range is REJECTED at commit rather than
+	// silently dropped (pre-fix) or clamped to 7 by the dataplane builder —
+	// a clamp would install the classifier for a DIFFERENT traffic class.
+	add := func(raw string) error {
 		raw = strings.TrimSpace(strings.ToLower(raw))
 		if raw == "" {
-			return
+			return nil
 		}
 		v, err := strconv.Atoi(raw)
-		if err != nil || v < 0 || v > 7 {
-			return
+		if err != nil {
+			// Non-numeric token: 802.1p has no symbolic aliases (unlike
+			// DSCP). Preserve the pre-fix skip for anything that is not a
+			// number so we do not reject Junos-compatibility spellings.
+			return nil
+		}
+		if v < 0 || v > 7 {
+			return fmt.Errorf(
+				"class-of-service ieee-802.1 classifier code-point %d is out of range (must be 0..7)",
+				v)
 		}
 		value := uint8(v)
 		if _, ok := seen[value]; ok {
-			return
+			return nil
 		}
 		seen[value] = struct{}{}
 		values = append(values, value)
+		return nil
 	}
 	for _, child := range node.FindChildren("code-points") {
 		for _, raw := range child.Keys[1:] {
-			add(raw)
+			if err := add(raw); err != nil {
+				return nil, err
+			}
 		}
 	}
 	// Inline leaf spelling (#1809): "loss-priority low code-points 3;"
@@ -575,45 +608,72 @@ func collectCoS8021CodePoints(node *Node) []uint8 {
 	for i := 2; i < len(node.Keys); i++ {
 		if node.Keys[i] == "code-points" {
 			for _, raw := range node.Keys[i+1:] {
-				add(raw)
+				if err := add(raw); err != nil {
+					return nil, err
+				}
 			}
 			break
 		}
 	}
-	return values
+	return values, nil
 }
 
-func collectCoSDSCPRewriteCodePoint(node *Node) (uint8, bool) {
+func collectCoSDSCPRewriteCodePoint(node *Node) (uint8, bool, error) {
 	for _, child := range node.FindChildren("code-point") {
 		if len(child.Keys) < 2 {
 			continue
 		}
-		if values := expandCoSCodePointToken(child.Keys[1]); len(values) > 0 {
-			return values[0], true
+		values, err := expandCoSCodePointToken(child.Keys[1])
+		if err != nil {
+			return 0, false, err
+		}
+		if len(values) > 0 {
+			return values[0], true, nil
 		}
 	}
 	for _, child := range node.FindChildren("code-points") {
 		for _, raw := range child.Keys[1:] {
-			if values := expandCoSCodePointToken(raw); len(values) > 0 {
-				return values[0], true
+			values, err := expandCoSCodePointToken(raw)
+			if err != nil {
+				return 0, false, err
+			}
+			if len(values) > 0 {
+				return values[0], true, nil
 			}
 		}
 	}
-	return 0, false
+	return 0, false, nil
 }
 
-func expandCoSCodePointToken(raw string) []uint8 {
+// expandCoSCodePointToken resolves a DSCP code-point token (a symbolic
+// alias such as `ef`/`af11`/`cs6` or a numeric value) to its 0..63 DSCP
+// value(s).
+//
+// #2447: a NUMERIC token outside the 6-bit DSCP domain (0..63) is an
+// out-of-range error, REJECTED at commit. The pre-fix code silently
+// returned nil (dropping the entry), and the dataplane builder masked
+// `dscp & 0x3f` — so a configured DSCP 110 silently installed a
+// classifier for DSCP 46, a DIFFERENT traffic class, with no commit
+// error. A non-numeric, non-alias token (a typo) is NOT an error here —
+// it returns no values (the entry is skipped), preserving the pre-fix
+// Junos-compatibility behavior for unknown symbolic spellings.
+func expandCoSCodePointToken(raw string) ([]uint8, error) {
 	raw = strings.TrimSpace(strings.ToLower(raw))
 	if raw == "" {
-		return nil
+		return nil, nil
 	}
 	if value, ok := coSDSCPValues[raw]; ok {
-		return []uint8{value}
+		return []uint8{value}, nil
 	}
-	if v, err := strconv.Atoi(raw); err == nil && v >= 0 && v <= 63 {
-		return []uint8{uint8(v)}
+	if v, err := strconv.Atoi(raw); err == nil {
+		if v < 0 || v > 63 {
+			return nil, fmt.Errorf(
+				"class-of-service dscp code-point %d is out of range (must be 0..63)",
+				v)
+		}
+		return []uint8{uint8(v)}, nil
 	}
-	return nil
+	return nil, nil
 }
 
 var coSDSCPValues = map[string]uint8{

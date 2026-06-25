@@ -33,7 +33,14 @@ and resolves session display names from the dataplane's assigned `app_id`.
   matches on protocol alone (#2548; before that fix `matchTuple`
   rejected an empty port, so protocol-only apps never matched and their
   sessions reported `UNKNOWN`). An app with neither protocol nor port is
-  never a match-all. When AppID is **enabled** in
+  never a match-all. When several configured apps match the same tuple,
+  `resolveTupleFallback` resolves deterministically by **specificity**: a
+  port-constrained app (`destination-port` set) wins over a protocol-only
+  app of the same protocol, with remaining ties broken by app name (#2578;
+  before that the map was iterated first-match, so a port-specific app
+  could non-deterministically lose to a protocol-only sibling). This is a
+  display-only label path — it does not affect policy enforcement, which
+  uses the dataplane-assigned `app_id`. When AppID is **enabled** in
   `services.application-identification` and the dataplane has not
   assigned an `app_id` for the session (`appID == 0`), the function
   returns `UNKNOWN` rather than guessing from port heuristics. Used

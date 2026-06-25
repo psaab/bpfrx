@@ -1,3 +1,56 @@
+## 2026-06-25 — #2578: appid tuple fallback prefers port-based over protocol-only
+
+- **Timestamp**: 2026-06-25
+- **Action**: `resolveTupleFallback` iterated the applications map first-match
+  (non-deterministic). When both a port-based app (tcp/8443) and a protocol-only
+  app (tcp) match a session, the more-specific port-based app now wins
+  deterministically; ties break by name. Display-only label path (no
+  enforcement impact). Added a 256-iteration fail-on-revert test
+  (`TestResolveTupleFallbackPrefersPortOverProtocol`); doc note in README.
+- **File(s)**: pkg/appid/runtime.go, pkg/appid/runtime_test.go, pkg/appid/README.md
+
+## 2026-06-25 — #2447: reject out-of-range CoS DSCP/PCP code-points instead of aliasing
+
+- **Timestamp**: 2026-06-25
+- **Action**: CoS classifier/rewrite code-points are now domain-validated at
+  commit (DSCP 0..63, PCP 0..7) with a clear operator error, instead of being
+  silently dropped at the Go parse layer and masked `dscp & 0x3f` / clamped
+  `pcp.min(7)` into a DIFFERENT traffic class by the Rust builder (110→46,
+  9→7). Go: `expandCoSCodePointToken` / `collectCoS8021CodePoints` /
+  `collectCoSDSCPRewriteCodePoint` now return errors propagated through
+  `compileClassOfService` (primary, operator-facing). Rust:
+  `build_cos_dscp_queue_table` / `build_cos_ieee8021_queue_table` removed the
+  mask/clamp and fail the snapshot CLOSED
+  (`SnapshotIntegrityError::CosDscpCodePointOutOfRange` /
+  `CosIeee8021CodePointOutOfRange`) as a drift backstop (#2410/#2696/#2713
+  posture). Runtime packet-field masking in `tx/cos_classify.rs` retained
+  (legit: bounds the physically-limited wire field, table now built from
+  validated indices only).
+- **File(s)**: pkg/config/compiler_class_of_service.go,
+  pkg/config/parser_class_of_service_test.go,
+  userspace-dp/src/policy.rs,
+  userspace-dp/src/afxdp/forwarding_build/cos.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  docs/config-schema.md
+## 2026-06-25 — #2596: strip trailing dot before the 253-octet hostname cap
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed an ordering bug in `isPlausibleHostname`
+  (`pkg/config/compiler_ipsec.go`). The `len(s) > 253` presentation-form
+  length cap ran BEFORE the single trailing-dot strip (added by #2455), so
+  a maximal 253-char FQDN written in absolute form (254 bytes including the
+  root `.`) was wrongly rejected. Per RFC 1035 §3.1 the trailing root dot
+  does not count toward the 253-char presentation limit. Moved the strip to
+  precede the cap; the cap now applies to the stripped name. All other
+  validation (empty-label, hyphen, label-length, contains-a-dot) is
+  preserved. Added `TestIsUsableIPsecEndpointMaxLength` — a fail-on-revert
+  boundary table (253-char valid, 253-char+dot valid, 254-char invalid,
+  254-char+dot invalid, empty, bare-dot). Verified RED on revert (the
+  253-char+trailing-dot case returns false instead of true), GREEN after
+  restore.
+- **File(s)**: pkg/config/compiler_ipsec.go,
+  pkg/config/compiler_ipsec_gateway_ref_test.go, _Log.md
+
 ## 2026-06-25 — #2733: clear the NAT'd reverse companion at val.ReverseKey
 
 - **Timestamp**: 2026-06-25
@@ -14910,3 +14963,69 @@ top.
   **File(s)**: userspace-dp/src/protocol/control.rs,
   userspace-dp/src/server/handlers/mod.rs,
   userspace-dp/src/server/tests.rs, _Log.md
+  **Action**: #2609 — IPFIX template-refresh header no longer resets
+  SequenceNumber to 0. Per RFC 7011 §3.1/§10.3.2 the IPFIX sequence is the
+  cumulative data-record count; a template-only Message carries the current
+  value WITHOUT advancing it. sendTemplates() now reads e.seq under e.mu
+  (no increment) instead of hardcoding 0 (NetFlow v9, which counts export
+  packets, is unaffected and correctly keeps its template-send increment).
+  Added fail-on-revert TestIPFIXTemplateRefreshPreservesSequenceNumber
+  (loopback UDP collector; proven RED on revert, GREEN restored). Gates:
+  go build ./... OK; gofmt clean; go vet ./pkg/flowexport/... clean;
+  go test ./pkg/flowexport/... ok.
+  **File(s)**: pkg/flowexport/ipfix.go,
+  pkg/flowexport/ipfix_seqnum_test.go, pkg/flowexport/README.md, _Log.md
+
+## 2026-06-25 — #2456: DHCP relay master-state gate (suppress duplicate relay on backup)
+
+- **Timestamp**: 2026-06-25
+- **Action**: On a chassis cluster a shared client segment is reachable from
+  both the MASTER and the BACKUP node, so both nodes' relay listeners receive
+  the client DISCOVER/REQUEST broadcast and BOTH relayed it upstream →
+  duplicate relayed requests with different per-node giaddrs. Added a
+  per-interface VRRP/cluster master-state gate to the relay forward path.
+  pkg/dhcprelay: new `masterGate` seam on `Manager` + `SetMasterGate`; the
+  main read loop calls `shouldRelay(ifaceName)` after confirming the packet is
+  a relayable client request and DROPS (bumping `requestsDroppedBackup` /
+  `RelayStats.RequestsDroppedBackup`) when the gate is closed. The gate is read
+  PER PACKET so a backup→master failover starts relaying immediately with no
+  relay restart; a nil gate (NewManager default / non-cluster build) is
+  fail-open (standalone always relays). pkg/daemon: `Daemon.relayMasterGateOpen`
+  resolves the relay interface name (e.g. reth0.0) to its redundancy group via
+  `relayInterfaceRG` (mirrors `rgForInterfaces`, #2664: strip unit suffix, read
+  the config interface's RedundancyGroup) and returns `isRethMasterState(rg)` —
+  the SAME live RG-master query the DHCP server / DDNS gates use. Standalone
+  (cluster==nil) and non-RG-owned (RG 0) interfaces always relay. Wired via
+  `d.dhcpRelay.SetMasterGate(d.relayMasterGateOpen)` in daemon_run.go.
+- **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/daemon/daemon_dhcp.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/daemon_dhcp_relay_gate_test.go, pkg/dhcprelay/README.md, _Log.md
+- **Validation**: fail-on-revert proven — disabling the loop gate makes
+  TestRunRelay_MasterGate_BackupDrops, _PassesInterfaceName, and
+  _FailoverStartsRelaying go RED (backup relays a duplicate). Tests cover
+  backup-drops, master-relays, standalone-relays (nil gate), per-packet
+  interface-name passing, mid-session failover re-eval (feedConn), and the
+  daemon gate (standalone / master / backup / failover-reeval / non-RG). Gates:
+  GOCACHE go build ./... clean; go test ./pkg/dhcprelay/... ./pkg/daemon/...
+  green; gofmt clean; go vet clean. HA-adjacent (relay follows VRRP master
+  state) → parent may run make test-failover for no-regression.
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2497 — type the five untyped router-advertisement config
+  leaves so commit rejects garbage instead of the RA sender silently
+  skipping / mis-advertising it at runtime.
+- **File(s)**: pkg/config/schema_validators.go (new ValidateIPv6Address +
+  ValidatePREF64CIDR), pkg/config/schema_routing.go (wire keyValidator on
+  prefix/nat-prefix/nat64prefix, ValidateEnum on preference,
+  ValidateIPv6Address on dns-server-address, link-mtu floor 1->1280,
+  nat lifetime child typed integer),
+  pkg/config/schema_validate_2497_test.go (new regression suite),
+  docs/config-schema.md, _Log.md
+- **Validation**: fail-on-revert proven — stashing the two schema files
+  turns all 12 *_RejectsBad assertions RED (AcceptsValid stay green,
+  correctly fix-independent), restored identical and green. Gates:
+  GOCACHE go build ./... clean; go vet ./pkg/config/... clean; gofmt clean;
+  go test ./pkg/config/... ./pkg/cmdtree/... green. The one pkg/ra failure
+  (TestT2a_ChangedConfigApplyNeverTwoLiveConns) is a pre-existing NDP-socket
+  bind flake on origin/master — confirmed failing with my changes stashed,
+  and this PR touches zero pkg/ra code.
