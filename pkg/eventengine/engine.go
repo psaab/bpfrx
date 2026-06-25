@@ -447,8 +447,15 @@ func (e *Engine) supersede(a plannedAction) bool {
 		}
 	}
 refill:
-	// Put the new action first, then the survivors.
-	all := append([]plannedAction{a}, drained...)
+	// Re-enqueue the surviving other-policy actions in their original FIFO
+	// order, then place the new (superseding) action at the TAIL (#2869).
+	// Prepending `a` would jump it ahead of every already-queued action of
+	// OTHER policies, converting the documented FIFO queue into LIFO for the
+	// newest arrival and starving older queued remediations under sustained
+	// event frequency. Supersede must only drop/replace the stale SAME-policy
+	// entry (done in the drain loop above); it must not reorder unrelated
+	// policies relative to the order their events were observed.
+	all := append(drained, a)
 	for _, item := range all {
 		select {
 		case e.actions <- item:

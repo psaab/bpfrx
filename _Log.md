@@ -17477,3 +17477,20 @@ top.
   go test ./pkg/routing/... PASS.
   **File(s)**: pkg/routing/xfrm.go, pkg/routing/iface_reuse_test.go,
   pkg/routing/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2869 eventengine supersede() FIFO ordering fix. supersede()
+  rebuilt the bounded action queue by PREPENDING the new (superseding) action
+  ahead of drained other-policy survivors, converting the documented FIFO queue
+  into LIFO for the newest arrival and starving older queued remediations under
+  sustained event frequency. Fix: append the new action to the TAIL of the
+  survivors (`all := append(drained, a)`) so unrelated policies keep FIFO order;
+  supersede still drops/replaces only the stale same-policy entry. Added
+  fail-on-revert TestSupersede_PreservesFIFOPlacesNewAtTail (fills queue with
+  distinct other-policy actions + a stale same-policy entry, forces supersede,
+  asserts survivors keep order and the new action lands at the tail). Verified
+  RED under the reverted prepend (new action at index 0). Gates: go build ./...,
+  gofmt -l clean, go vet ./pkg/eventengine/..., go test -race
+  ./pkg/eventengine/... PASS.
+  **File(s)**: pkg/eventengine/engine.go,
+  pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md, _Log.md

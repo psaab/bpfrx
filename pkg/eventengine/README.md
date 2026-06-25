@@ -124,6 +124,17 @@ cannot occur.
   in applying a stale remediation twice). Overflow bumps
   `xpf_event_actions_dropped_total{reason="queue_full"}`. Loss is always
   counted, never silent.
+- **FIFO ordering across policies (#2869):** the queue is FIFO. When the queue
+  is full and `supersede()` drains/refills it to drop a stale same-policy entry,
+  it re-enqueues the surviving OTHER-policy actions in their original order and
+  places the new (superseding) action at the **TAIL** — never the head.
+  Prepending the new action would let the newest event jump ahead of every older
+  queued remediation (LIFO), starving older policies under sustained event
+  frequency and reordering remediation against the order events were observed.
+  Supersede therefore only ever drops/replaces the stale same-policy entry; it
+  does not reorder unrelated policies. Locked by
+  `TestSupersede_PreservesFIFOPlacesNewAtTail` (fail-on-revert: a prepend lands
+  the new action at index 0 and the test goes RED).
 - A non-lock error (bad apply / CommitCheck reject) is a permanent failure: no
   retry, bumps `xpf_event_actions_rejected_total`.
 

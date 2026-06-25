@@ -3,6 +3,7 @@ package eventengine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -503,4 +504,73 @@ func TestQueue_DedupByPolicy(t *testing.T) {
 	// Release and confirm it still converges to a single commit.
 	s.ExitConfigureSession("operator")
 	waitFor(t, "eventual commit", func() bool { return e.Stats().Committed >= 1 })
+}
+
+// #2869 supersede ordering: when supersede() rebuilds a full queue it must
+// preserve the FIFO order of UNRELATED policies and place the new (superseding)
+// action at the TAIL, not the head. A prepend would let the newest event jump
+// ahead of every older queued remediation (LIFO), starving older policies under
+// sustained event frequency.
+//
+// FAIL-ON-REVERT: revert the engine.go fix back to
+// `all := append([]plannedAction{a}, drained...)` and this test goes RED —
+// the new policy "z" lands at index 0 instead of the tail, and the surviving
+// policies are shifted out of FIFO order.
+func TestSupersede_PreservesFIFOPlacesNewAtTail(t *testing.T) {
+	e := New(nil, nil)
+	defer e.Close()
+
+	// Fill the bounded queue with DISTINCT other-policy actions p00..pNN in a
+	// known FIFO order, PLUS one stale same-policy "z" entry at the tail. The
+	// queue is now full (no free slot), so a fresh "z" trigger forces the
+	// supersede() drain/refill path (the only path that reorders).
+	want := make([]string, 0, actionQueueDepth)
+	for i := 0; i < actionQueueDepth-1; i++ {
+		name := fmt.Sprintf("p%02d", i)
+		e.actions <- plannedAction{policyName: name}
+		e.counters.queueDepth.Add(1)
+		want = append(want, name)
+	}
+	// Stale same-policy entry; it must be DROPPED (superseded), freeing the slot
+	// the new "z" will occupy at the TAIL.
+	e.actions <- plannedAction{policyName: "z"}
+	e.counters.queueDepth.Add(1)
+
+	// New "z" trigger cannot fit (queue full); enqueue() falls into supersede().
+	// The stale "z" is dropped and the new "z" is re-placed: the queue must end
+	// up holding every other-policy entry in FIFO order plus "z" at the tail.
+	e.enqueue(plannedAction{policyName: "z"})
+	want = append(want, "z")
+
+	if got := int(e.counters.queueDepth.Load()); got != len(want) {
+		t.Fatalf("queueDepth=%d; want %d (no action should be dropped)", got, len(want))
+	}
+
+	// Drain in dequeue (FIFO) order and compare against the expected sequence.
+	got := make([]string, 0, len(want))
+	for {
+		select {
+		case a := <-e.actions:
+			got = append(got, a.policyName)
+			continue
+		default:
+		}
+		break
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("drained %d actions; want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("queue order wrong at index %d: got %q, want %q\nfull got=%v\nwant=%v",
+				i, got[i], want[i], got, want)
+		}
+	}
+	if got[len(got)-1] != "z" {
+		t.Errorf("superseding action not at tail: tail=%q want %q", got[len(got)-1], "z")
+	}
+	if got[0] == "z" {
+		t.Errorf("superseding action prepended to head (LIFO regression, #2869)")
+	}
 }
