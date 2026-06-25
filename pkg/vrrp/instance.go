@@ -1267,9 +1267,19 @@ func (vi *vrrpInstance) handleBackupRx(pkt *VRRPPacket, masterDownTimer, preempt
 	// If we don't preempt, or the incoming priority is >= ours, accept it:
 	// reset the master-down timer and abort any pending preempt hold-time —
 	// a worthy master is present, so there is nothing to preempt (#2850).
+	// Also clear the one-shot resign bypass: it was armed by a prior
+	// priority-0 resign to make the imminent 1ms masterDownTimer expiry
+	// promote immediately, but a worthy master returning before that fire
+	// supersedes the resign. Tying the bypass's lifetime to the same
+	// condition that drains the hold prevents it leaking to a LATER
+	// legitimate masterDownTimer expiry where it would wrongly skip the
+	// hold once.
 	if !vi.getPreempt() || int(pkt.Priority) >= pri {
 		masterDownTimer.Reset(vi.masterDownInterval())
 		stopAndDrainTimer(preemptHoldTimer)
+		vi.mu.Lock()
+		vi.skipNextPreemptHold = false
+		vi.mu.Unlock()
 	}
 	// If preempt is true and incoming priority < ours, ignore — let the
 	// master-down timer expire (and, if a hold is armed, let it run).
@@ -1345,6 +1355,13 @@ func (vi *vrrpInstance) becomeBackup(masterDownTimer, advertTimer *time.Timer) {
 	vi.removeVIPs()
 	advertTimer.Stop()
 	masterDownTimer.Reset(vi.masterDownInterval())
+	// A MASTER stepping down to a worthy higher/tie-break master begins a
+	// fresh BACKUP tenure with no pending resign decision — clear the
+	// one-shot preempt-hold bypass so a stale flag from an earlier resign
+	// cannot leak into the next masterDownTimer expiry (#2850).
+	vi.mu.Lock()
+	vi.skipNextPreemptHold = false
+	vi.mu.Unlock()
 	vi.emitEvent()
 }
 

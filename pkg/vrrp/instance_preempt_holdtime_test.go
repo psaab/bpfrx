@@ -205,6 +205,61 @@ func TestHoldTime_ResignBypassesHold(t *testing.T) {
 	}
 }
 
+// TestHoldTime_ResignBypassClearedByWorthyMaster guards the one-shot bypass
+// race: a priority-0 resign arms skipNextPreemptHold + the 1ms masterDownTimer,
+// but a worthy (>= priority) master returns BEFORE that 1ms fires. The
+// accept-worthy-master branch must clear the bypass (and re-arm
+// masterDownTimer to the full interval). A LATER live-lower master must then be
+// HELD by the hold-time, not skipped — proving the stale bypass did not leak.
+func TestHoldTime_ResignBypassClearedByWorthyMaster(t *testing.T) {
+	vi := newHoldTestInstance(t, 200, 60)
+	vi.mu.Lock()
+	vi.lastMasterPriority = 100
+	vi.lastMasterSeen = time.Now()
+	vi.mu.Unlock()
+
+	masterDown := time.NewTimer(time.Hour)
+	defer masterDown.Stop()
+	advert := time.NewTimer(time.Hour)
+	defer advert.Stop()
+	preemptHold := time.NewTimer(time.Hour)
+	defer preemptHold.Stop()
+
+	// 1) priority-0 resign arms skipNextPreemptHold + 1ms masterDownTimer.
+	vi.handleBackupRx(&VRRPPacket{Priority: 0, SrcIP: net.IPv4(10, 0, 0, 9)}, masterDown, preemptHold)
+	vi.mu.RLock()
+	if !vi.skipNextPreemptHold {
+		vi.mu.RUnlock()
+		t.Fatal("skipNextPreemptHold not armed after resign")
+	}
+	vi.mu.RUnlock()
+
+	// 2) A worthy (>= ours) master returns before the 1ms fires. This must
+	//    clear the bypass and re-arm masterDownTimer to the full interval.
+	vi.handleBackupRx(&VRRPPacket{Priority: 200, SrcIP: net.IPv4(10, 0, 0, 9)}, masterDown, preemptHold)
+	vi.mu.RLock()
+	leaked := vi.skipNextPreemptHold
+	vi.mu.RUnlock()
+	if leaked {
+		t.Fatal("skipNextPreemptHold leaked past a worthy-master return (race not fixed)")
+	}
+
+	// 3) Later, a live LOWER-priority master is present and the masterDownTimer
+	//    fires. The hold-time MUST apply (state stays BACKUP, hold armed) —
+	//    if the stale bypass had leaked, this would promote immediately.
+	vi.mu.Lock()
+	vi.lastMasterPriority = 100
+	vi.lastMasterSeen = time.Now()
+	vi.mu.Unlock()
+	stopAndDrainTimer(masterDown)
+	masterDown.Reset(0)
+	time.Sleep(2 * time.Millisecond)
+	vi.stepBackup(masterDown, advert, preemptHold)
+	if vi.getState() != StateBackup {
+		t.Errorf("state = %s, want BACKUP (hold-time must apply; bypass must not have leaked)", vi.getState())
+	}
+}
+
 // TestPreemptHoldDuration: the seconds→Duration conversion and the 0/unset
 // sentinel.
 func TestPreemptHoldDuration(t *testing.T) {

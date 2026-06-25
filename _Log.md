@@ -16871,3 +16871,28 @@ top.
   pkg/config/schema_interfaces.go, pkg/config/compiler_interfaces.go,
   pkg/config/vrrp_preempt_holdtime_test.go, docs/config-schema.md,
   pkg/vrrp/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2850 review fold (MERGE-NEEDS-MINOR) — fix one-shot
+  `skipNextPreemptHold` leak. The resign bypass was set in handleBackupRx's
+  priority-0 path and cleared ONLY in the masterDownTimer.C handler. Race:
+  after a priority-0 resign arms the 1ms masterDownTimer + sets the bypass,
+  a worthy (>= priority) advert arriving before the 1ms fire reset
+  masterDownTimer to the full interval and drained the hold but did NOT
+  clear the bypass — so it survived to a LATER legitimate masterDownTimer
+  expiry and wrongly skipped the hold once (conservative: one failback
+  faster, never stuck). Fix: clear `skipNextPreemptHold = false` in the
+  accept-worthy-master branch (tying the bypass's lifetime to the same
+  condition that drains the hold) AND in `becomeBackup` (a fresh BACKUP
+  tenure after a worthy step-down has no pending resign decision). Both are
+  worthy-master-accepted paths that reset masterDownTimer to the full
+  interval; the priority-0 ARMING path itself is untouched.
+  New test `TestHoldTime_ResignBypassClearedByWorthyMaster`: resign arms
+  skip → worthy advert clears it → later live-lower master → hold IS
+  applied (BACKUP, not promoted). FAIL-ON-REVERT: copied instance.go aside,
+  removed the clear in handleBackupRx → the test FAILs ("skipNextPreemptHold
+  leaked past a worthy-master return"); restored, green.
+  Gates: go build ./... clean; gofmt -l clean; go vet ./pkg/vrrp/...
+  ./pkg/config/... clean; go test -race ./pkg/vrrp/... ./pkg/config/... ok.
+  **File(s)**: pkg/vrrp/instance.go,
+  pkg/vrrp/instance_preempt_holdtime_test.go, _Log.md
