@@ -22,6 +22,27 @@ use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, Userspac
 pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 3;
 pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
 
+/// Maximum accepted size, in bytes, of a single newline-delimited
+/// control-socket request body before it is decoded (#2523).
+///
+/// The control socket reads one JSON request per connection via a
+/// bounded `read_until`. Without a cap, a malformed or compromised local
+/// caller can stream a very large unterminated line and force the helper
+/// to grow its read buffer unbounded (bounded in time only by the 5 s
+/// read timeout, not in allocation). The accept loop reads the whole body
+/// into memory before any schema validation can run, so the cap must be
+/// enforced at the read, not at decode.
+///
+/// Sizing: the largest legitimate request is `apply_snapshot`, which
+/// carries the entire compiled config (every zone, policy, address-book
+/// entry, NAT rule, filter, route, etc.). Even a pathologically large
+/// production config serializes to a few MB of JSON; 16 MiB gives roughly
+/// an order of magnitude of headroom over any realistic snapshot while
+/// still bounding a single request's read allocation to a fixed ceiling.
+/// A request larger than this is, by construction, malformed — reject it
+/// before allocating its body and keep the daemon alive (fail-closed).
+pub(crate) const MAX_CONTROL_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(crate) struct ControlRequest {
     #[serde(rename = "type")]

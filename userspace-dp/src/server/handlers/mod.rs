@@ -4,7 +4,7 @@
 // decomposed into per-verb files in this directory module. This
 // `mod.rs` retains only:
 //   - Stream timeout setup
-//   - BufReader / read_line / decode
+//   - BufReader / size-capped read_until / decode (#2523)
 //   - `state.lock()` critical section
 //   - `match request.request_type.as_str()` dispatch into per-verb
 //     handlers (substantive verbs) or inline bodies (trivial arms:
@@ -35,7 +35,7 @@ mod sync_session;
 
 use super::super::*;
 use super::helpers::{refresh_status, write_state};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -54,17 +54,39 @@ pub(crate) fn handle_stream(
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| format!("set write timeout: {e}"))?;
 
+    // Read one newline-delimited request body, capped at
+    // MAX_CONTROL_REQUEST_BYTES (#2523). A malformed or compromised local
+    // caller could otherwise stream a very large unterminated line and
+    // force the read buffer to grow unbounded — the 5 s read timeout
+    // bounds the worst case in time but not in allocation. `take` limits
+    // the reader to the cap + 1 byte, so the read can never allocate
+    // beyond that ceiling. The largest legitimate request is a body of up
+    // to MAX bytes plus its single terminating newline (the Go encoder
+    // always appends one), i.e. MAX+1 bytes ending in '\n'. If the read
+    // stops at the cap WITHOUT a terminating newline the body is, by
+    // construction, oversize: reject it before any decode and keep the
+    // daemon alive (fail-closed).
     let mut reader = BufReader::new(
         stream
             .try_clone()
-            .map_err(|e| format!("clone stream for read: {e}"))?,
+            .map_err(|e| format!("clone stream for read: {e}"))?
+            .take(MAX_CONTROL_REQUEST_BYTES as u64 + 1),
     );
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
+    let mut line: Vec<u8> = Vec::new();
+    let n = reader
+        .read_until(b'\n', &mut line)
         .map_err(|e| format!("read request: {e}"))?;
+    if n > MAX_CONTROL_REQUEST_BYTES && line.last() != Some(&b'\n') {
+        return Err(format!(
+            "control request exceeds maximum size of {MAX_CONTROL_REQUEST_BYTES} bytes; rejecting before decode"
+        ));
+    }
+    let body = match line.last() {
+        Some(&b'\n') => &line[..line.len() - 1],
+        _ => &line[..],
+    };
     let request: ControlRequest =
-        serde_json::from_str(line.trim_end()).map_err(|e| format!("decode request: {e}"))?;
+        serde_json::from_slice(body).map_err(|e| format!("decode request: {e}"))?;
 
     let mut response = ControlResponse {
         ok: true,
