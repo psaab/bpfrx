@@ -40,6 +40,20 @@ type LeaseDNSRecord struct {
 	// pre-existing third-party RR). NOT part of the published forward/reverse
 	// RR set; carried alongside it only to derive the ownership marker.
 	ClientID string
+	// KeepForwardDHCID, when true on a DeleteLease, tells the replace-owned
+	// RFC 2136 backend to delete the forward A/AAAA but NOT the shared RFC 4701
+	// DHCID — because ANOTHER owned record still shares this FQDN+ClientID
+	// (a dual-stack client whose A and AAAA carry one DHCID). Deleting the
+	// shared DHCID on a partial dual-stack teardown would (1) leave the
+	// surviving family's record DHCID-unprotected (a hijack window, RFC 4703)
+	// and (2) make the eventual delete of the surviving record fail its
+	// DHCID-match prerequisite — leaking it on the wire (#2700). The DHCID-match
+	// PREREQUISITE is still sent (the delete stays ownership-guarded); only the
+	// DHCID's removal from the zone is suppressed. The manager (deleteOwnedLocked)
+	// sets this from a scan of the ownership store. Ignored on UpsertLease and by
+	// non-replace-owned / no-DHCID delete paths. Defaults false (delete the
+	// DHCID with the last record under the name — the pre-#2700 behaviour).
+	KeepForwardDHCID bool
 }
 
 // DNSUpdater is the pluggable DNS-update backend (plan §4.4). The

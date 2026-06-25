@@ -571,9 +571,12 @@ func TestNilUpdaterIsNopNotPanic(t *testing.T) {
 		t.Fatalf("no-backend upsert counted as upsertOK = %d", m.upsertOK.Load())
 	}
 
-	// Withdraw path: disabling DDNS while owned state exists must also be a
-	// safe no-op. Seed a stale owned record (as if a prior backend wrote it),
-	// then run the disabled (withdraw-all) reconcile.
+	// Withdraw path: disabling DDNS while owned state exists must be a safe
+	// no-op on the wire, but it must NOT drop ownership through the no-op
+	// backend (#2699). A record reaching the store was published by a real
+	// backend (the nop upsert path records no ownership), so forgetting it
+	// while the live RR persists would orphan it. The withdraw-all keeps the
+	// entry so a later reconcile with a real backend can clean it.
 	m.mu.Lock()
 	m.state.put(ownedRecord{
 		Family: 4, Identity: "mac:bb", Address: "10.0.0.20",
@@ -583,10 +586,16 @@ func TestNilUpdaterIsNopNotPanic(t *testing.T) {
 	err := m.withdrawAllLocked(context.Background())
 	m.mu.Unlock()
 	if err != nil {
+		// withdrawAllLocked swallows errDDNSNoBackendToWithdraw (it is the
+		// legitimate disabled-with-no-backend case), so no error is surfaced.
 		t.Fatalf("withdraw with no backend errored: %v", err)
 	}
-	if _, ok := m.state.get(ScopeKey{}, "mac:bb", "10.0.0.20"); ok {
-		t.Fatal("withdraw did not drop the owned entry under no-backend mode")
+	if _, ok := m.state.get(ScopeKey{}, "mac:bb", "10.0.0.20"); !ok {
+		t.Fatal("#2699 regression: no-backend withdraw DROPPED ownership; " +
+			"the live RR is now orphaned (unrecoverable)")
+	}
+	if m.deleteFail.Load() == 0 {
+		t.Fatal("#2699: no-backend withdraw should count a deleteFail (delete owed but no backend)")
 	}
 }
 
