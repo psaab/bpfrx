@@ -1,3 +1,32 @@
+## 2026-06-25 — #2969: IPv6 NDP probe `sin6_scope_id` + sendto error surface
+
+- **Timestamp**: 2026-06-25
+- **Action**: `trigger_kernel_arp_probe` built the IPv6 NDP-solicit
+  `sockaddr_in6` with `sin6_scope_id == 0` and ignored the `sendto`
+  return in BOTH families. For a link-local (`fe80::/10`) next-hop a
+  zero scope id makes the kernel unable to route the solicit
+  (EINVAL/ENETUNREACH) → the solicit is never sent → neighbor never
+  resolves → IPv6 forwarding blackhole to link-local hops; the swallowed
+  sendto error hid it. Fixed: threaded the egress `ifindex` into
+  `trigger_kernel_arp_probe` (available at all 5 call sites —
+  `item.ifindex` in warmer/resolver, `key.0` in dispatch, `neigh_if` in
+  the cold-packet path) and set `sin6_scope_id = ifindex` via a new pure
+  `build_solicit_sockaddr_in6` helper (unconditional — link-local needs
+  it, global ignores it). Both branches now check the sendto return and
+  `eprintln!` a failure (rare, probe-send only — within logging rules)
+  instead of swallowing it. Added 3 fail-on-revert unit tests in
+  `probe_socket_tests`: link-local scope_id == ifindex (RED if it
+  reverts to 0), global also scoped, and negative-ifindex clamp-to-0.
+  Scope limited to the NDP probe send path; #2918/#2919 neighbor-dump
+  logic untouched.
+- **Gates**: CARGO_TARGET_DIR=/tmp/cargo-2969 cargo build --release
+  (xpf-userspace-dp) PASS; cargo test --release neighbor PASS.
+- **File(s)**: userspace-dp/src/afxdp/neighbor.rs,
+  userspace-dp/src/afxdp/neighbor_resolver.rs,
+  userspace-dp/src/afxdp/neighbor_dispatch.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  docs/userspace-cold-start-resolution.md, _Log.md
+
 ## 2026-06-25 — #2922: ECMP `select_route_next_hop` single liveness snapshot
 
 - **Timestamp**: 2026-06-25

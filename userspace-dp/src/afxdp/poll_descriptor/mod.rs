@@ -3145,7 +3145,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     if let Some(name) = iface_name {
                                         // Fast path: ICMP socket triggers kernel ARP
                                         // in microseconds (no fork/exec).
-                                        trigger_kernel_arp_probe(&name, next_hop);
+                                        trigger_kernel_arp_probe(&name, neigh_if, next_hop);
                                     }
                                 }
                                 // #1912: for a tunnel-marked MissingNeighbor
