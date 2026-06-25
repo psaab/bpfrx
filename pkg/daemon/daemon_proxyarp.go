@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"net"
-	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -48,26 +47,28 @@ var ifaceIndexByName = func(name string) (int, error) {
 }
 
 // proxyARPIfaceMap maps each configured proxy-arp interface name to its kernel
-// ifindex, resolving a RETH name to its physical member (the #2195 fix:
-// cfg.RethToPhysical() + config.LinuxIfName). A VLAN sub-interface name
-// (reth0.50) is split on "." so the base interface is resolved/renamed, then
-// the unit-qualified key is preserved. An unresolvable interface is logged and
-// skipped (best-effort, matching the reconcile's posture). Extracted so the
-// RETH resolution stays unit-testable independently of the netlink install
-// (regression guard against dropping it in the apply-path extraction).
+// ifindex via cfg.ResolveKernelIfName — the centralized Junos-ref → Linux
+// netdev resolver. This resolves a RETH name to its physical member (the #2195
+// fix) AND a VLAN sub-interface (reth0.50, ge-0/0/0.100) to its OWN VLAN netdev
+// (ge-0-0-0.<vlan-id>), not the parent (#3010). The latter is essential because
+// Linux proxy_arp/proxy_ndp are per-netdev: a VLAN sub-interface is a distinct
+// netdev with its own sysctl path and neighbor scope, so storing the parent
+// ifindex would write the sysctl on the parent and leave the sub-interface
+// silent. ResolveKernelIfName maps a tagged unit to its VLAN ID (which can
+// differ from the unit number), collapses unit 0 onto the bare parent, and
+// preserves the st<N>/IRB/tunnel special cases — strictly more correct than the
+// old RethToPhysical + LinuxIfName(base) path that dropped the unit suffix.
+// An unresolvable interface is logged and skipped (best-effort, matching the
+// reconcile's posture). Extracted so the resolution stays unit-testable
+// independently of the netlink install (regression guard against dropping the
+// per-netdev resolution in the apply-path extraction).
 func proxyARPIfaceMap(cfg *config.Config) map[string]int {
 	ifaceMap := make(map[string]int)
-	rethToPhys := cfg.RethToPhysical()
 	for _, entry := range cfg.Security.NAT.ProxyARP {
 		if _, ok := ifaceMap[entry.Interface]; ok {
 			continue
 		}
-		parts := strings.SplitN(entry.Interface, ".", 2)
-		baseName := parts[0]
-		if phys, ok := rethToPhys[baseName]; ok {
-			baseName = phys
-		}
-		linuxName := config.LinuxIfName(baseName)
+		linuxName := cfg.ResolveKernelIfName(entry.Interface)
 		idx, err := ifaceIndexByName(linuxName)
 		if err != nil {
 			slog.Warn("proxy-arp: interface not found", "iface", entry.Interface, "linux", linuxName, "err", err)
@@ -92,10 +93,10 @@ func proxyARPIfaceMap(cfg *config.Config) map[string]int {
 // no-ops when already set) and best-effort (a netlink/sysctl failure is logged
 // and never fatal), so re-running it on a steady config causes no churn.
 //
-// The RETH interface resolution (proxy-arp on a reth name resolves to the
-// physical member ifindex via cfg.RethToPhysical() + config.LinuxIfName) is
-// the #2195 fix; it is preserved here verbatim — losing it would re-break
-// proxy-arp on RETH interfaces.
+// The interface resolution (RETH name → physical member, #2195; VLAN
+// sub-interface → its own VLAN netdev, #3010) is performed by proxyARPIfaceMap
+// via cfg.ResolveKernelIfName; losing it would re-break proxy-arp on RETH or
+// VLAN-tagged interfaces.
 func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 	// #2475: a commit that REMOVES proxy-arp (cfg now has zero entries) must
 	// still run so the disable-on-removal pass below can drive the leaked
