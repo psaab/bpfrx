@@ -1,5 +1,42 @@
 # Action Log
 
+## 2026-06-24 — #2660 fix: skip-existing DDNS collision must return the refusal sentinel
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed a HIGH never-delete-non-owned boundary breach on the DDNS
+  `skip-existing` conflict policy — the skip-existing sibling of the
+  #2648/#2659 MAJOR. `#2648` added `errDDNSConflictRefused` so a refused
+  replace-owned add records NO ownership, but it covered ONLY replace-owned
+  (`sendAddOwned`). The skip-existing path in `sendAdd` prepends an
+  `RRsetNotUsed` prerequisite and, on the YXRRSET/YXDOMAIN collision (the name
+  already exists = a third party owns it), called `onConflict()` and returned
+  `nil`. `nil` is a SUCCESS to `upsertLocked`, which then recorded PHANTOM
+  ownership for a record xpf did not create. skip-existing never writes a
+  DHCID, so the later release took `sendRemoveForward`'s `!hasDHCID` plain
+  exact-RR delete branch and DELETED the third-party RR. FIX: the
+  skip-existing YX-collision path now returns `errDDNSConflictRefused` (keeping
+  the `onConflict()` counter) — `upsertLocked` already classifies the sentinel
+  as "skip, no `state.put`" (post-#2648), so the phantom-ownership recording
+  stops and the later delete never fires. strict-fail (different path, returns
+  an error) is unchanged; the reverse PTR add does not run on a refused
+  forward (the sentinel propagates unwrapped through `UpsertLease`). This is
+  the #2648 mechanism extended to skip-existing.
+- **Validation**: `go test -race ./pkg/dhcpserver/...` green. Boundary test
+  added at the MANAGER level (`reconcileOnceLocked`, the layer that surfaces
+  the breach per the #2648/#2659 lesson):
+  `TestManagerSkipExistingConflictRecordsNoOwnership` — cycle-1 add against a
+  pre-existing third-party RR → collision → asserts OwnedRecords=0 +
+  SkippedConflict=1; cycle-2 (lease gone) → asserts DeleteOK=0 + the
+  third-party A survives. Plus `TestManagerSkipExistingFreshNameFullLifecycle`
+  (happy path: unused name → owned → release deletes it). Updated
+  `TestRFC2136SkipExistingConflictSkips` to assert the sentinel return.
+  Fail-on-revert: reverting the skip-existing collision to `return nil` makes
+  the boundary test red (OwnedRecords=1 phantom ownership recorded) — verified.
+- **File(s)**: pkg/dhcpserver/ddns_rfc2136.go,
+  pkg/dhcpserver/ddns_rfc2136_test.go,
+  pkg/dhcpserver/ddns_manager_inc2_test.go, pkg/dhcpserver/README.md,
+  docs/feature-gaps.md, _Log.md
+
 ## 2026-06-24 — #2669 fix: drained session deltas never discarded when bindings empty
 
 - **Timestamp**: 2026-06-24

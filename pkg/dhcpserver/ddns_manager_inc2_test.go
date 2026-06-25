@@ -449,6 +449,109 @@ func TestManagerReplaceOwnedFreshNameFullLifecycle(t *testing.T) {
 	}
 }
 
+// ddnsCfgSkipExisting is ddnsCfg with the skip-existing conflict policy.
+func ddnsCfgSkipExisting(server string) *config.DHCPServerConfig {
+	cfg := ddnsCfg(server)
+	cfg.DynamicDNS.ConflictPolicy = "skip-existing"
+	return cfg
+}
+
+// TestManagerSkipExistingConflictRecordsNoOwnership is the #2660 boundary
+// regression at the MANAGER level (the #2648/#2659 lesson: test through
+// reconcileOnceLocked, the layer that surfaces the breach, not the updater in
+// isolation). Under skip-existing, a third party already owns the forward name.
+// Cycle 1 must REFUSE the add and record NO ownership; cycle 2 (lease gone)
+// must issue NO delete and leave the third party's A intact. skip-existing
+// never writes a DHCID, so a phantom-owned record's later release would take
+// sendRemoveForward's plain exact-RR delete branch and wipe the third party's
+// RR — the exact breach #2660 closes.
+//
+// fail-on-revert: changing the skip-existing YX path back to `return nil`
+// re-records phantom ownership (cycle 1 OwnedRecords=1), and cycle 2 then
+// deletes the third party's A → this test goes red.
+func TestManagerSkipExistingConflictRecordsNoOwnership(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	// Third party already published laptop.example.com A 10.0.1.5 (no DHCID).
+	thirdParty := &dns.A{
+		Hdr: dns.RR_Header{Name: "laptop.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+		A:   net.ParseIP("10.0.1.5"),
+	}
+	srv.seedRR(thirdParty)
+
+	m := prodManagerTo(t, srv)
+	cfg := ddnsCfgSkipExisting(srv.addrUDP)
+
+	// Cycle 1: an active v4 lease for the SAME name+address.
+	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.1.5,aa:bb,01:02:03,3600,1900000000,1,laptop,0
+`)
+	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	if got := m.Stats().OwnedRecords; got != 0 {
+		t.Fatalf("#2660: skip-existing refused add recorded phantom ownership; OwnedRecords=%d want 0 (owned=%v)",
+			got, ownedFQDNs(m))
+	}
+	if !srv.zoneHas(thirdParty) {
+		t.Fatalf("third-party A vanished after a refused skip-existing add")
+	}
+	if got := m.Stats().SkippedConflict; got != 1 {
+		t.Errorf("SkippedConflict = %d, want 1", got)
+	}
+
+	// Cycle 2: lease gone — no owned state, so NO delete must be issued and the
+	// third party's A must survive.
+	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if !srv.zoneHas(thirdParty) {
+		t.Fatalf("#2660 BOUNDARY BREACH (end-to-end): manager deleted a third-party A it did not create under skip-existing")
+	}
+	if got := m.Stats().DeleteOK; got != 0 {
+		t.Errorf("a delete was issued for a name xpf never owned; DeleteOK=%d want 0", got)
+	}
+}
+
+// TestManagerSkipExistingFreshNameFullLifecycle proves the manager path still
+// works for the happy case under skip-existing: a fresh (unused) name is
+// claimed (ownership recorded → the RRsetNotUsed prereq passes), and the
+// lease's expiry deletes exactly that owned record.
+func TestManagerSkipExistingFreshNameFullLifecycle(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	m := prodManagerTo(t, srv)
+	cfg := ddnsCfgSkipExisting(srv.addrUDP)
+
+	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.1.9,aa:bb,07:08:09,3600,1900000000,1,fresh,0
+`)
+	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	if m.Stats().OwnedRecords != 1 {
+		t.Fatalf("fresh skip-existing name not owned; OwnedRecords=%d want 1", m.Stats().OwnedRecords)
+	}
+	a := &dns.A{Hdr: dns.RR_Header{Name: "fresh.example.com.", Rrtype: dns.TypeA}, A: net.ParseIP("10.0.1.9")}
+	if !srv.zoneHas(a) {
+		t.Fatalf("fresh A not published")
+	}
+
+	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if m.Stats().OwnedRecords != 0 {
+		t.Errorf("owned record not cleared after expiry; OwnedRecords=%d", m.Stats().OwnedRecords)
+	}
+	if srv.zoneHas(a) {
+		t.Errorf("owned A not deleted after expiry")
+	}
+}
+
 func TestOwnedRecordViews(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
 	m := prodManagerTo(t, srv)
