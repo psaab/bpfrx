@@ -1,5 +1,31 @@
 # Action Log
 
+## 2026-06-24 — #2479 fix: capture ioctl errno BEFORE close() in slowpath
+
+- **Timestamp**: 2026-06-24
+- **Action**: `set_if_up` (SIOCSIFFLAGS arm) and `set_if_mtu` (SIOCSIFMTU)
+  in `userspace-dp/src/slowpath.rs` called `libc::close(sock)` BETWEEN the
+  failing `libc::ioctl` and `io::Error::last_os_error()`. A failing
+  `close()` overwrites thread-local errno (and POSIX never clears it on
+  success), so the reported diagnostic could carry close()'s errno instead
+  of the ioctl's genuine failure — misleading triage for #2471. Extracted
+  the capture-then-close pattern into a small `ioctl_then_close(sock, fn)`
+  seam (returns `(rc, err, close_rc)`) that captures `last_os_error()`
+  immediately after the ioctl and BEFORE close. Both call sites now route
+  through it; the fd is still always closed (no leak). The SIOCGIFFLAGS arm
+  already captured before close — this brings the other two arms in line.
+- **Tests added**: `ioctl_then_close_captures_errno_before_close` —
+  deterministic fail-on-revert guard: hands the seam an invalid fd (`-1`,
+  so `close()` fails with EBADF) and a closure that leaves ENODEV in errno;
+  asserts the seam reports ENODEV, not EBADF. Verified RED when the capture
+  is moved after close (reports os error 9 EBADF vs expected 19 ENODEV).
+  Plus `set_if_mtu_reports_ioctl_failure` (live path) — a real SIOCSIFMTU
+  on a nonexistent interface must surface a non-zero ioctl errno, not
+  "success (os error 0)".
+- **File(s)**: `userspace-dp/src/slowpath.rs`
+- **Gates**: `cargo build --release` clean (no new slowpath warnings);
+  `cargo test --release --bin xpf-userspace-dp slowpath` → 14 passed.
+
 ## 2026-06-24 — #2480 fix: explicit O_CLOEXEC on the slow-path TUN open
 
 - **Timestamp**: 2026-06-24

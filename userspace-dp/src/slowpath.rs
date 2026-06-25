@@ -467,6 +467,27 @@ fn rp_filter_all_warning(dev: &str, all_rpf: Option<i32>) -> Option<String> {
     }
 }
 
+/// Run an ioctl on `sock`, capture its errno, THEN close `sock` (#2479).
+///
+/// Returns `(ioctl_rc, ioctl_err, close_rc)`. The ioctl's `io::Error` is
+/// captured BEFORE `close()` runs, so a caller reporting `ioctl_err` always
+/// sees the ioctl's failure — never the errno a failing `close()` would leave
+/// behind. The fd is always closed (no leak) even when the ioctl failed.
+///
+/// `ioctl_fn` receives the fd and must return the raw ioctl return code; the
+/// thread-local errno it leaves is what gets captured.
+#[inline]
+fn ioctl_then_close(
+    sock: libc::c_int,
+    ioctl_fn: impl FnOnce(libc::c_int) -> libc::c_int,
+) -> (libc::c_int, io::Error, libc::c_int) {
+    let rc = ioctl_fn(sock);
+    // Capture immediately, before close() can touch errno.
+    let err = io::Error::last_os_error();
+    let close_rc = unsafe { libc::close(sock) };
+    (rc, err, close_rc)
+}
+
 fn set_if_up(name: &str) -> Result<(), String> {
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if sock < 0 {
@@ -484,14 +505,16 @@ fn set_if_up(name: &str) -> Result<(), String> {
     }
     let flags = unsafe { ifr.ifru.flags } | (libc::IFF_UP as libc::c_short);
     ifr.ifru.flags = flags;
-    let set_rc = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS, &ifr) };
-    let close_rc = unsafe { libc::close(sock) };
+    // #2479: capture the ioctl's errno BEFORE close(). close() is a syscall
+    // that can overwrite thread-local errno (success leaves it untouched per
+    // POSIX, but a failing close sets EBADF), so reading last_os_error() after
+    // close risks reporting close's errno, not the ioctl's failure. The seam
+    // captures-then-closes in one place; mirrors the SIOCGIFFLAGS
+    // capture-before-close above.
+    let (set_rc, set_err, close_rc) =
+        ioctl_then_close(sock, |s| unsafe { libc::ioctl(s, libc::SIOCSIFFLAGS, &ifr) });
     if set_rc < 0 {
-        return Err(format!(
-            "SIOCSIFFLAGS {}: {}",
-            name,
-            io::Error::last_os_error()
-        ));
+        return Err(format!("SIOCSIFFLAGS {}: {}", name, set_err));
     }
     if close_rc < 0 {
         return Err(format!(
@@ -522,15 +545,13 @@ fn set_if_mtu(name: &str, mtu: i32) -> Result<(), String> {
             io::Error::last_os_error()
         ));
     }
-    let set_rc = unsafe { libc::ioctl(sock, libc::SIOCSIFMTU, &ifr) };
-    let close_rc = unsafe { libc::close(sock) };
+    // #2479: capture the ioctl's errno BEFORE close() via the shared seam
+    // (see set_if_up). A failing close() would otherwise clobber errno and we
+    // would report close's failure instead of the ioctl's.
+    let (set_rc, set_err, close_rc) =
+        ioctl_then_close(sock, |s| unsafe { libc::ioctl(s, libc::SIOCSIFMTU, &ifr) });
     if set_rc < 0 {
-        return Err(format!(
-            "SIOCSIFMTU {} mtu={}: {}",
-            name,
-            mtu,
-            io::Error::last_os_error()
-        ));
+        return Err(format!("SIOCSIFMTU {} mtu={}: {}", name, mtu, set_err));
     }
     if close_rc < 0 {
         return Err(format!(
@@ -782,6 +803,63 @@ mod tests {
         assert!(set_if_mtu("xpf-usp0", -1)
             .unwrap_err()
             .contains("invalid MTU"));
+    }
+
+    /// #2479: the `ioctl_then_close` seam must capture the ioctl's errno
+    /// BEFORE `close()` runs, so a failing close() cannot clobber the reported
+    /// error. This is the deterministic fail-on-revert guard for both
+    /// `set_if_up` (SIOCSIFFLAGS) and `set_if_mtu` (SIOCSIFMTU), which both
+    /// route their capture-then-close through this seam.
+    ///
+    /// We make close() FAIL deterministically by handing the seam an invalid
+    /// fd (`-1`): `close(-1)` returns -1 and sets errno to `EBADF`. The ioctl
+    /// closure instead leaves a sentinel errno (`ENODEV`). The seam must
+    /// return the SENTINEL — proving the capture happened before close.
+    ///
+    /// FAIL-ON-REVERT: if the capture is moved to AFTER `close()` (the #2479
+    /// bug), `err` carries `EBADF` (close's errno), not `ENODEV`, and this
+    /// assertion goes RED. The valid-fd path is exercised by the live
+    /// `set_if_mtu_reports_ioctl_failure` test below.
+    #[test]
+    fn ioctl_then_close_captures_errno_before_close() {
+        let (rc, err, close_rc) = ioctl_then_close(-1, |_fd| {
+            // Simulate a failing ioctl that leaves ENODEV in errno.
+            set_errno(libc::ENODEV);
+            -1
+        });
+        assert_eq!(rc, -1, "the simulated ioctl returns failure");
+        assert_eq!(close_rc, -1, "close(-1) must fail (EBADF)");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ENODEV),
+            "seam must report the IOCTL errno (ENODEV), not close()'s EBADF: {err}"
+        );
+        assert_ne!(
+            err.raw_os_error(),
+            Some(libc::EBADF),
+            "the close()-clobbered errno must NOT leak through: {err}"
+        );
+    }
+
+    /// #2479 (live path): a genuine `SIOCSIFMTU` failure surfaces a non-zero
+    /// ioctl errno, never close()'s success. Targets a nonexistent interface
+    /// (no NIC/privilege needed — opening an `AF_INET`/`SOCK_DGRAM` socket and
+    /// issuing a failing ioctl works in the sandbox). The errno varies with
+    /// privileges (`ENODEV`/`ENXIO` unprivileged, `EPERM` when CAP_NET_ADMIN
+    /// is checked first), so we assert only the load-bearing property: the
+    /// message carries a non-zero os-error, not "success (os error 0)".
+    #[test]
+    fn set_if_mtu_reports_ioctl_failure() {
+        let err = set_if_mtu("xpf-nodev-zzz9", 9000)
+            .expect_err("ioctl on a nonexistent interface must fail");
+        assert!(
+            err.contains("SIOCSIFMTU"),
+            "error should name the failing ioctl: {err}"
+        );
+        assert!(
+            err.contains("os error") && !err.contains("os error 0"),
+            "error must report a non-zero ioctl os-error, not success: {err}"
+        );
     }
 
     /// #2408: the MTU is written into the `ifru.mtu` arm of the ifreq union
