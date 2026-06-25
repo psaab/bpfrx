@@ -16242,3 +16242,30 @@ top.
   go test ./pkg/config/ + ./pkg/ddns/... pass.
   **File(s)**: pkg/config/secret.go, pkg/config/types_system.go,
   pkg/config/ddns_provider_string_test.go, pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2794 — userspace-dp reconcile `!should_run_afxdp` early arm
+  (`server/helpers.rs reconcile_status_bindings`) left the SAME stale binding
+  survivor class #2515 fixed on the `no_snapshot` reconcile arm. When
+  forwarding goes disarmed/unsupported the arm `stop()`s every worker but then
+  hand-cleared only a SUBSET of the per-binding fields
+  (`bound`/`xsk_registered`/`xsk_bind_mode`/`zero_copy`/`socket_fd`/`ready`/
+  `last_error`), leaving `socket_ifindex`/`socket_queue_id`/`socket_bind_flags`,
+  `flow_cache_capacity`, `active_flow_count` (and every counter gauge) at their
+  pre-teardown values — so `show` reported a disarmed slot as if still bound on
+  its old queue. Fix: after `stop()` (which empties `workers.live` and clears
+  the CoS owner maps), route the per-binding status through
+  `Coordinator::refresh_bindings`, which sends every now-workerless slot through
+  `zero_unbound_slot` (FULL survivor clear) and rebuilds the CoS owner->worker
+  map empty — the identical tail the `no_snapshot` arm runs. Internal reconcile
+  state only; no wire change (protocol_wire_v1.json untouched). Fail-on-revert
+  proof: new test `reconcile_disarmed_clears_full_stale_binding_survivors` seeds
+  a slot with stale socket_ifindex=7/queue_id=3/bind_flags=0x4/
+  flow_cache_capacity=65536/active_flow_count=123/rx_packets=999, disarms, and
+  asserts all are zeroed. With the fix reverted to the partial hand-clear the
+  test goes RED ("#2794: socket_ifindex left stale: left 7, right 0"); restored
+  -> GREEN (copy-restore verified). Gates: cargo build --release -p
+  xpf-userspace-dp clean; cargo test --release --bin xpf-userspace-dp --
+  reconcile coordinator -> 117 passed/0 failed. No Go touched.
+  **File(s)**: userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/server/tests.rs, userspace-dp/src/server/README.md, _Log.md
