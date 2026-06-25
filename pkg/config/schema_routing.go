@@ -305,37 +305,79 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 			"default-lifetime": {desc: "Router lifetime advertised to hosts (seconds)", args: 1, placeholder: "<seconds>",
 				valueType: ValueInteger, valueDesc: "router lifetime in seconds",
 				valueExamples: []string{"1800", "9000"}, validator: ValidateIntegerMin(1), children: nil},
+			// #2497: link-mtu is advertised verbatim via ndp.NewMTU. RFC 8200
+			// §5 sets the IPv6 minimum link MTU at 1280 bytes; a smaller value
+			// (1-1279) committed today reaches the wire and blackholes hosts
+			// that honor it. Floor the leaf at the IPv6 minimum.
 			"link-mtu": {desc: "Link MTU option advertised to hosts", args: 1, placeholder: "<mtu>",
-				valueType: ValueInteger, valueDesc: "advertised link MTU",
-				valueExamples: []string{"1280", "1500"}, validator: ValidateIntegerMin(1), children: nil},
-			"dns-server-address": {desc: "RDNSS DNS server address advertised to hosts", args: 1, multi: true, placeholder: "<address>", children: nil},
-			"preference":         {desc: "Default router preference (high|medium|low)", args: 1, placeholder: "<preference>", children: nil},
-			"prefix": {desc: "Advertised on-link prefix", args: 1, placeholder: "<prefix>", children: map[string]*schemaNode{ // prefix <prefix/len>
-				"on-link":       {desc: "Set the on-link (L) flag (default)", children: nil},
-				"autonomous":    {desc: "Set the autonomous (A) flag (default)", children: nil},
-				"no-onlink":     {desc: "Clear the on-link (L) flag", children: nil},
-				"no-autonomous": {desc: "Clear the autonomous (A) flag", children: nil},
-				// Prefix lifetimes compile with a bare strconv.Atoi
-				// (compiler_protocols.go) and treat 0 as "use the SLAAC
-				// default" (types_routing.go RAPrefix; pkg/ra sender clamps
-				// <=0 to defaultValid/PreferredLifetime). Type them as
-				// non-negative integers so the gate rejects garbage (e.g.
-				// `valid-lifetime abc`, which previously stayed at 0 and
-				// silently fell back to the default) while still accepting
-				// an explicit 0.
-				"valid-lifetime": {desc: "Prefix valid lifetime in seconds (0 = SLAAC default)", args: 1, placeholder: "<seconds>",
-					valueType: ValueInteger, valueDesc: "prefix valid lifetime in seconds",
-					valueExamples: []string{"0", "86400", "2592000"}, validator: ValidateIntegerMin(0), children: nil},
-				"preferred-lifetime": {desc: "Prefix preferred lifetime in seconds (0 = SLAAC default)", args: 1, placeholder: "<seconds>",
-					valueType: ValueInteger, valueDesc: "prefix preferred lifetime in seconds",
-					valueExamples: []string{"0", "604800", "86400"}, validator: ValidateIntegerMin(0), children: nil},
-			}},
-			"nat-prefix": {desc: "NAT prefix", args: 1, placeholder: "<prefix>", children: map[string]*schemaNode{
-				"lifetime": {desc: "Lifetime", args: 1, placeholder: "<seconds>", children: nil},
-			}},
-			"nat64prefix": {desc: "NAT64 prefix", args: 1, placeholder: "<prefix>", children: map[string]*schemaNode{
-				"lifetime": {desc: "Lifetime", args: 1, placeholder: "<seconds>", children: nil},
-			}},
+				valueType: ValueInteger, valueDesc: "advertised link MTU (RFC 8200 §5 minimum 1280)",
+				valueExamples: []string{"1280", "1500"}, validator: ValidateIntegerMin(1280), children: nil},
+			// #2497: each address is appended to an RFC 8106 RecursiveDNSServer
+			// (RDNSS) option, which is IPv6-only. The runtime skips an
+			// unparseable string but does NOT family-gate, so a bare IPv4
+			// literal was advertised on the wire. Validate as a bare IPv6
+			// literal at commit.
+			"dns-server-address": {desc: "RDNSS DNS server address advertised to hosts", args: 1, multi: true, placeholder: "<address>",
+				valueType: ValueIPAddress, valueDesc: "RDNSS server (IPv6 literal, RFC 8106)",
+				valueExamples: []string{"2001:db8::53"}, validator: ValidateIPv6Address, children: nil},
+			// #2497: a preference typo (case drift, "mdeium") falls through the
+			// RA sender's switch default and silently advertises Medium,
+			// perturbing host default-router selection on a multi-router LAN.
+			// Constrain to the three RFC 4191 router-selection preferences.
+			"preference": {desc: "Default router preference (high|medium|low)", args: 1, placeholder: "<preference>",
+				valueType: ValueEnumOf, valueDesc: "router selection preference",
+				valueExamples: []string{"high", "medium", "low"}, validator: ValidateEnum([]string{"high", "medium", "low"}), children: nil},
+			// #2497: the prefix value is the named-instance identity arg. A
+			// typo'd prefix committed today; the RA sender's netip.ParsePrefix
+			// error path logs and skips it, so hosts on the link get no PIO and
+			// SLAAC silently breaks. Validate it as an IPv6 CIDR at commit.
+			"prefix": {desc: "Advertised on-link prefix", args: 1, placeholder: "<prefix>",
+				keyValueType: ValueCIDR, keyValueDesc: "IPv6 prefix with length (e.g. 2001:db8::/64)",
+				keyValueExamples: []string{"2001:db8::/64"}, keyValidator: ValidateIPv6CIDR,
+				children: map[string]*schemaNode{ // prefix <prefix/len>
+					"on-link":       {desc: "Set the on-link (L) flag (default)", children: nil},
+					"autonomous":    {desc: "Set the autonomous (A) flag (default)", children: nil},
+					"no-onlink":     {desc: "Clear the on-link (L) flag", children: nil},
+					"no-autonomous": {desc: "Clear the autonomous (A) flag", children: nil},
+					// Prefix lifetimes compile with a bare strconv.Atoi
+					// (compiler_protocols.go) and treat 0 as "use the SLAAC
+					// default" (types_routing.go RAPrefix; pkg/ra sender clamps
+					// <=0 to defaultValid/PreferredLifetime). Type them as
+					// non-negative integers so the gate rejects garbage (e.g.
+					// `valid-lifetime abc`, which previously stayed at 0 and
+					// silently fell back to the default) while still accepting
+					// an explicit 0.
+					"valid-lifetime": {desc: "Prefix valid lifetime in seconds (0 = SLAAC default)", args: 1, placeholder: "<seconds>",
+						valueType: ValueInteger, valueDesc: "prefix valid lifetime in seconds",
+						valueExamples: []string{"0", "86400", "2592000"}, validator: ValidateIntegerMin(0), children: nil},
+					"preferred-lifetime": {desc: "Prefix preferred lifetime in seconds (0 = SLAAC default)", args: 1, placeholder: "<seconds>",
+						valueType: ValueInteger, valueDesc: "prefix preferred lifetime in seconds",
+						valueExamples: []string{"0", "604800", "86400"}, validator: ValidateIntegerMin(0), children: nil},
+				}},
+			// #2497: nat-prefix/nat64prefix feed an ndp.PREF64 option whose
+			// 3-bit PLC wire field can only encode the RFC 8781 §4 length set
+			// {32,40,48,56,64,96}. An out-of-set length committed today parses
+			// in netip.ParsePrefix, so the runtime accepts it and mis-encodes
+			// or omits the option. Validate as a PREF64-legal IPv6 CIDR at
+			// commit, and type the lifetime child as a non-negative integer so
+			// garbage no longer silently zeroes (which defaults to the router
+			// lifetime).
+			"nat-prefix": {desc: "NAT prefix", args: 1, placeholder: "<prefix>",
+				keyValueType: ValueCIDR, keyValueDesc: "NAT64 prefix (RFC 8781 length /32 /40 /48 /56 /64 /96)",
+				keyValueExamples: []string{"64:ff9b::/96"}, keyValidator: ValidatePREF64CIDR,
+				children: map[string]*schemaNode{
+					"lifetime": {desc: "Lifetime", args: 1, placeholder: "<seconds>",
+						valueType: ValueInteger, valueDesc: "PREF64 lifetime in seconds (0 = router lifetime)",
+						valueExamples: []string{"0", "1800"}, validator: ValidateIntegerMin(0), children: nil},
+				}},
+			"nat64prefix": {desc: "NAT64 prefix", args: 1, placeholder: "<prefix>",
+				keyValueType: ValueCIDR, keyValueDesc: "NAT64 prefix (RFC 8781 length /32 /40 /48 /56 /64 /96)",
+				keyValueExamples: []string{"64:ff9b::/96"}, keyValidator: ValidatePREF64CIDR,
+				children: map[string]*schemaNode{
+					"lifetime": {desc: "Lifetime", args: 1, placeholder: "<seconds>",
+						valueType: ValueInteger, valueDesc: "PREF64 lifetime in seconds (0 = router lifetime)",
+						valueExamples: []string{"0", "1800"}, validator: ValidateIntegerMin(0), children: nil},
+				}},
 		}},
 	}},
 	"lldp": {desc: "LLDP configuration", children: map[string]*schemaNode{

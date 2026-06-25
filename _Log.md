@@ -14983,3 +14983,23 @@ top.
   GOCACHE go build ./... clean; go test ./pkg/dhcprelay/... ./pkg/daemon/...
   green; gofmt clean; go vet clean. HA-adjacent (relay follows VRRP master
   state) → parent may run make test-failover for no-regression.
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2497 — type the five untyped router-advertisement config
+  leaves so commit rejects garbage instead of the RA sender silently
+  skipping / mis-advertising it at runtime.
+- **File(s)**: pkg/config/schema_validators.go (new ValidateIPv6Address +
+  ValidatePREF64CIDR), pkg/config/schema_routing.go (wire keyValidator on
+  prefix/nat-prefix/nat64prefix, ValidateEnum on preference,
+  ValidateIPv6Address on dns-server-address, link-mtu floor 1->1280,
+  nat lifetime child typed integer),
+  pkg/config/schema_validate_2497_test.go (new regression suite),
+  docs/config-schema.md, _Log.md
+- **Validation**: fail-on-revert proven — stashing the two schema files
+  turns all 12 *_RejectsBad assertions RED (AcceptsValid stay green,
+  correctly fix-independent), restored identical and green. Gates:
+  GOCACHE go build ./... clean; go vet ./pkg/config/... clean; gofmt clean;
+  go test ./pkg/config/... ./pkg/cmdtree/... green. The one pkg/ra failure
+  (TestT2a_ChangedConfigApplyNeverTwoLiveConns) is a pre-existing NDP-socket
+  bind flake on origin/master — confirmed failing with my changes stashed,
+  and this PR touches zero pkg/ra code.

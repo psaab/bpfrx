@@ -253,6 +253,63 @@ func ValidateIPAddress(raw string, _ *Config) error {
 	return nil
 }
 
+// ValidateIPv6Address accepts an IPv6 literal WITHOUT a prefix length and
+// rejects IPv4. Used for the RDNSS dns-server-address leaf (#2497): the RA
+// sender (pkg/ra/sender.go buildRA) feeds each address to netip.ParseAddr
+// and appends it to an RFC 8106 RecursiveDNSServer option, which is an
+// IPv6-only NDP option. The runtime skips an unparseable string but does
+// NOT family-gate, so a bare IPv4 literal (8.8.8.8) parses and is
+// advertised on the wire inside an IPv6 RDNSS option — a malformed RA.
+// The family rule mirrors the runtime's ip.To4()==nil classification.
+func ValidateIPv6Address(raw string, _ *Config) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fmt.Errorf("missing value (expected an IPv6 address, e.g. 2001:db8::1)")
+	}
+	ip := net.ParseIP(trimmed)
+	if ip == nil {
+		if _, _, err := net.ParseCIDR(trimmed); err == nil {
+			return fmt.Errorf("prefix length not allowed here (got %q; use a bare IPv6 address)", raw)
+		}
+		return fmt.Errorf("not a valid IP address (got %q)", raw)
+	}
+	if ip.To4() != nil {
+		return fmt.Errorf("not an IPv6 address (got %q; the RDNSS option is IPv6-only per RFC 8106)", raw)
+	}
+	return nil
+}
+
+// pref64PrefixLengths are the prefix lengths RFC 8781 §4 permits for a
+// PREF64 (NAT64 prefix) option: only these encode in the 3-bit PLC field.
+// A prefix of any other length cannot be advertised at all.
+var pref64PrefixLengths = map[int]struct{}{
+	32: {}, 40: {}, 48: {}, 56: {}, 64: {}, 96: {},
+}
+
+// ValidatePREF64CIDR accepts an IPv6 prefix usable in a PREF64 option:
+// a valid IPv6 CIDR (reusing ValidateIPv6CIDR's family + prefix rules)
+// whose prefix length is one of the RFC 8781 §4 set {32,40,48,56,64,96}.
+// Used for the router-advertisement nat-prefix/nat64prefix leaves (#2497):
+// the RA sender wraps the prefix in an ndp.PREF64 option whose wire PLC
+// field can only encode those six lengths. An out-of-set length committed
+// today reaches netip.ParsePrefix cleanly, so the runtime accepts it and
+// then either omits the option or mis-encodes the length.
+func ValidatePREF64CIDR(raw string, cfg *Config) error {
+	if err := ValidateIPv6CIDR(raw, cfg); err != nil {
+		return err
+	}
+	_, ipnet, err := net.ParseCIDR(strings.TrimSpace(raw))
+	if err != nil {
+		// Unreachable: ValidateIPv6CIDR already parsed it.
+		return fmt.Errorf("not a valid address/prefix-length (got %q): %v", raw, err)
+	}
+	ones, _ := ipnet.Mask.Size()
+	if _, ok := pref64PrefixLengths[ones]; !ok {
+		return fmt.Errorf("invalid PREF64 prefix length /%d (got %q; RFC 8781 permits only /32, /40, /48, /56, /64, /96)", ones, raw)
+	}
+	return nil
+}
+
 // ValidateIPv4CIDR accepts an IPv4 address with an explicit prefix
 // length (e.g. 10.0.1.10/24). The prefix is REQUIRED: every runtime
 // consumer of configured interface addresses net.ParseCIDRs the string
