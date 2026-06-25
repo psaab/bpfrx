@@ -54,7 +54,15 @@ single resolution point keyed on `DDNSProvider.Backend`:
 
 All credentials are `config.Secret` (revealed only at the transport boundary,
 never logged); HTTP is HTTPS with system-trust cert+hostname verification, a
-bounded request timeout, and a capped response body. A construction failure
+bounded request timeout, and a capped response body. The `generic` backend
+additionally lets an operator embed a credential directly in the `url-template`
+(userinfo `user:pass@host`, or a token in the query string via `%u`/`%p` or a
+literal `?token=...`), and a `checkip-url` can carry an API key the same way —
+neither is `config.Secret`-typed, so `DDNSProvider.String()`
+(`pkg/config/types_system.go`, used by `%v`/`%s`/slog) runs `server`,
+`url-template`, and `checkip-url` through `config.RedactURL`, which strips
+userinfo and the entire query string while keeping the scheme/host/path for
+diagnostics (#2781). A construction failure
 (missing credential) degrades to the no-op backend (logged; the commit warning
 already fired) — fail-open, matching the rfc2136 posture. Live-provider verify
 is the deferred lab gate; the mock-server tests are the merge gate.

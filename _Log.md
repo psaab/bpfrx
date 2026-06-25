@@ -16015,3 +16015,22 @@ top.
   TestAddrWatcher_UnconfiguredInterfaceNoReconcile (over-fire guard).
   **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/addrwatch.go,
   pkg/vrrp/addrwatch_test.go, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2781 — DDNSProvider.String() (pkg/config) printed url-template,
+  server, and checkip-url verbatim. The generic backend supports credentials
+  embedded in the URL template (userinfo or a token in the query string, e.g.
+  https://api.example/update?token=SECRET&host=%h) and a checkip-url can carry
+  an API key, so any %v/%s/slog of a DDNSProvider leaked those tokens. Added
+  config.RedactURL (pkg/config/secret.go): string-based (NOT net/url — the value
+  may be an inadyn template with %h/%i specifiers that url.Parse would mangle)
+  redaction that strips userinfo ("user:pass@" -> "<redacted>@") and the entire
+  query string (after the first '?' -> "<redacted>") while preserving
+  scheme/host/path for diagnostics. String() now wraps Server, URLTemplate,
+  CheckIPURL, and UpdateServer in RedactURL. Fail-on-revert proof: with
+  RedactURL removed from String(), TestDDNSProviderStringRedactsURLCredentials
+  goes RED leaking QUERY-TOKEN-1a2b3c (verified). Gates: go build ./... clean,
+  gofmt -l clean, go vet ./pkg/config/... ./pkg/ddns/... clean,
+  go test ./pkg/config/ + ./pkg/ddns/... pass.
+  **File(s)**: pkg/config/secret.go, pkg/config/types_system.go,
+  pkg/config/ddns_provider_string_test.go, pkg/ddns/README.md, _Log.md

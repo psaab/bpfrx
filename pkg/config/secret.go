@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 )
 
 // errRedactedSecretIngest is returned by Secret.UnmarshalJSON when the
@@ -54,6 +55,59 @@ func (s Secret) String() string {
 		return ""
 	}
 	return SecretRedacted
+}
+
+// RedactURL strips credential-bearing components from a URL or URL template
+// for %v/%s/slog formatting (logging hygiene, #2781). It is deliberately
+// string-based rather than net/url-based because the value may be an inadyn
+// URL TEMPLATE carrying %h/%i/%u/%p specifiers (e.g. the generic DDNS backend,
+// pkg/ddns/backend_generic.go) which are not valid percent-encoding and would
+// make url.Parse fail or mangle the string.
+//
+// Two credential-carrying components are redacted while the scheme/host/path
+// prefix is preserved so the log line stays diagnostically useful:
+//
+//   - userinfo: a "user:pass@" (or "user@") segment between "scheme://" and the
+//     first '/', '?' or '#' becomes "<redacted>@" — operators embed creds there
+//     (e.g. https://user:token@api.example/update).
+//   - query string: everything after the first '?' becomes "<redacted>" — the
+//     #2781 case is a token in the query (e.g. ...?token=SECRET&host=%h).
+//
+// An empty input returns "" so absence stays distinguishable. A value with no
+// credential-bearing component is returned with the query (if any) still
+// redacted; query strings are treated as sensitive because generic templates
+// routinely carry the auth token there.
+func RedactURL(s string) string {
+	if s == "" {
+		return ""
+	}
+	const redacted = "<redacted>"
+
+	// Redact userinfo: locate the authority (between "://" and the next
+	// delimiter) and replace any "...@" prefix within it.
+	if i := strings.Index(s, "://"); i >= 0 {
+		authStart := i + len("://")
+		// The authority ends at the first '/', '?' or '#'.
+		authEnd := len(s)
+		for j := authStart; j < len(s); j++ {
+			if c := s[j]; c == '/' || c == '?' || c == '#' {
+				authEnd = j
+				break
+			}
+		}
+		authority := s[authStart:authEnd]
+		if at := strings.LastIndex(authority, "@"); at >= 0 {
+			// Replace the whole userinfo (everything up to and including '@').
+			s = s[:authStart] + redacted + "@" + authority[at+1:] + s[authEnd:]
+		}
+	}
+
+	// Redact the query string: everything after the first '?' (preserve any
+	// trailing fragment is unnecessary — the token is the concern, drop it all).
+	if q := strings.IndexByte(s, '?'); q >= 0 {
+		s = s[:q+1] + redacted
+	}
+	return s
 }
 
 // Reveal returns the real cleartext value. It is the canonical, audited way
