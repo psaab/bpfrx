@@ -1347,10 +1347,18 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 					// The route-map just needs to be a permit
 				}
 
-				if term.LocalPreference > 0 {
+				// Emit on PRESENCE, not value: local-preference 0 is a
+				// valid BGP value (maximally deprioritize a route within
+				// the AS). Gating on LocalPreference > 0 silently dropped
+				// `set local-preference 0` (#2857).
+				if term.HasLocalPreference {
 					fmt.Fprintf(&b, " set local-preference %d\n", term.LocalPreference)
 				}
-				if term.Metric > 0 {
+				// Emit on PRESENCE, not value: metric/MED 0 is a valid
+				// traffic-engineering value (advertise a highly preferred
+				// route). Gating on Metric > 0 silently dropped `set metric
+				// 0` (#2847).
+				if term.HasMetric {
 					fmt.Fprintf(&b, " set metric %d\n", term.Metric)
 				}
 				if term.MetricType == 1 || term.MetricType == 2 {

@@ -3535,6 +3535,9 @@ func TestPolicyStatementRouteMapAttributesSetSyntax(t *testing.T) {
 	if term.Metric != 100 {
 		t.Errorf("metric = %d, want 100", term.Metric)
 	}
+	if !term.HasMetric {
+		t.Error("HasMetric = false, want true when `then metric` is configured (#2847)")
+	}
 	if term.Community != "65000:100" {
 		t.Errorf("community = %q, want 65000:100", term.Community)
 	}

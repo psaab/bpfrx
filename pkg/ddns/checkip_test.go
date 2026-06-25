@@ -157,6 +157,12 @@ func TestValidateCheckIPURL(t *testing.T) {
 		"http://checkip.example/",
 		"https://checkip.example:8443/cdn-cgi/trace",
 		"https://192.0.2.1/",
+		// RFC 3986 §3.1: the scheme is case-INSENSITIVE. Uppercase/mixed-case
+		// http(s) schemes must be ACCEPTED (#2842). Goes RED if the validator
+		// reverts to a case-sensitive HasPrefix on the raw string.
+		"HTTP://checkip.example/",
+		"Https://h/",
+		"HTTPS://checkip.example:8443/cdn-cgi/trace",
 	} {
 		if err := validateCheckIPURL(ok); err != nil {
 			t.Fatalf("validateCheckIPURL(%q) = %v, want nil", ok, err)

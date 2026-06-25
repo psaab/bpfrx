@@ -912,7 +912,9 @@ reserved for whole-dataplane selection where a rewrite shim
     url-template) warns and publishes nothing at runtime (fail-open, never a
     hard reject). A malformed `checkip-url` (not an http(s) URL with a host —
     e.g. `ftp://`, `not a url`, host-less `http://`) also warns at commit
-    (#2773): without it the typo committed silently and the runtime fetch then
+    (#2773); the scheme check is case-INSENSITIVE per RFC 3986 §3.1, so an
+    uppercase/mixed-case `HTTPS://host` is accepted, not warned (#2842). Without
+    the commit-time check the typo committed silently and the runtime fetch then
     masqueraded forever as a transient observation failure, suppressing
     publishing indefinitely. The runtime `ddns.CheckIP` gate
     (`validateCheckIPURL`) fails closed on the same malformed URL regardless, so

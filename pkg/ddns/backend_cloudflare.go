@@ -60,12 +60,19 @@ func newCloudflareBackend(p *config.DDNSProvider) (*cloudflareBackend, error) {
 	if s := strings.TrimSpace(p.Server); s != "" {
 		base = strings.TrimRight(s, "/")
 	}
+	// Bind the dial to the configured source-address/interface/VRF (#2846). A
+	// malformed source-address is a hard error so we degrade to no-op rather than
+	// publish from the wrong source.
+	client, err := newProviderHTTPClient(p)
+	if err != nil {
+		return nil, fmt.Errorf("ddns cloudflare: provider %q: %w", p.Name, err)
+	}
 	return &cloudflareBackend{
 		name:    p.Name,
 		apiBase: base,
 		token:   token,
 		zone:    strings.TrimSuffix(strings.TrimSpace(p.Zone), "."),
-		client:  newHTTPClient(),
+		client:  client,
 	}, nil
 }
 
