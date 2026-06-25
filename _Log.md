@@ -15835,3 +15835,27 @@ top.
   ./pkg/dhcprelay/... ./pkg/daemon/...` green; build/gofmt/vet clean.
   **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
   pkg/dhcprelay/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2782 — native GRE decap: handle Checksum-Present (C) bit
+  instead of silently dropping. Skip the 4-byte Checksum+Reserved1 field
+  (RFC 2784 §2.1 / RFC 2890 fixed order: Checksum, Key, Sequence) to find
+  the inner payload; validate the GRE checksum (one's-complement over the
+  GRE header+payload, region bounded by the outer IP length to exclude L2
+  pad); a corrupt checksum is now a COUNTED drop via the new
+  GRE_DECAP_CHECKSUM_INVALID_DROPS counter surfaced as
+  xpf_userspace_gre_decap_checksum_invalid_drops_total. Routing (R) bit
+  stays a drop. Added 4 fail-on-revert tests + Rust/Go counter round-trip
+  + Prometheus wiring; regenerated protocol_wire_v1.json (single key add).
+  **File(s)**: userspace-dp/src/afxdp/gre.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go, pkg/api/metrics.go,
+  pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
+  pkg/api/metrics_test.go, pkg/api/metrics_descriptor_coverage_test.go,
+  docs/userspace-native-gre-plan.md, _Log.md

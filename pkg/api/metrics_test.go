@@ -867,6 +867,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceGreDecapChecksumInvalidDrops: prometheus.NewDesc(
+			"xpf_userspace_gre_decap_checksum_invalid_drops_total",
+			"gre decap checksum-present invalid drops",
+			nil,
+			nil,
+		),
 		userspaceTimeExceededRateLimited: prometheus.NewDesc(
 			"xpf_userspace_time_exceeded_rate_limited_total",
 			"time-exceeded generated-error rate-limit drops",
@@ -925,6 +931,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		// #2331: GRE-encap DF-set oversized-outer drop counter emitted
 		// unconditionally.
 		GreEncapDfOversizeDropsTotal: 6,
+		// #2782: GRE-decap checksum-present invalid drop counter emitted
+		// unconditionally.
+		GreDecapChecksumInvalidDropsTotal: 8,
 		// #2472: per-reason generated-error rate-limit drop counters emitted
 		// unconditionally.
 		TimeExceededRateLimitedTotal: 11,
@@ -967,11 +976,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// dnat_table reverse-NAT publish-error counter (= 14) + the #2315
 	// gre_decap_ecn_illegal_drops_total counter (= 15) + the #2317
 	// wg_decap_ecn_illegal_drops_total counter (= 16) + the #2331
-	// gre_encap_df_oversize_drops_total counter (= 17) + the #2472
+	// gre_encap_df_oversize_drops_total counter (= 17) + the #2782
+	// gre_decap_checksum_invalid_drops_total counter (= 18) + the #2472
 	// per-reason generated-error rate-limit trio (time_exceeded /
-	// packet_too_big / reject) = 20.
-	if len(got) != 20 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 20 metrics, got %d", len(got))
+	// packet_too_big / reject) = 21.
+	if len(got) != 21 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 21 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -997,6 +1007,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// #2331: GRE-encap DF-set oversized-outer drop counter emitted
 	// unconditionally.
 	assertCounterClose(t, got, c.userspaceGreEncapDfOversizeDrops, nil, 6)
+	// #2782: GRE-decap checksum-present invalid drop counter emitted
+	// unconditionally.
+	assertCounterClose(t, got, c.userspaceGreDecapChecksumInvalidDrops, nil, 8)
 	// #2472: per-reason generated-error rate-limit drop counters emitted
 	// unconditionally.
 	assertCounterClose(t, got, c.userspaceTimeExceededRateLimited, nil, 11)

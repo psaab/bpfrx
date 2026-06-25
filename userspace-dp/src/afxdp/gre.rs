@@ -1,9 +1,9 @@
 use super::*;
 
-const GRE_FLAG_CHECKSUM: u16 = 0x8000;
+pub(in crate::afxdp) const GRE_FLAG_CHECKSUM: u16 = 0x8000;
 const GRE_FLAG_ROUTING: u16 = 0x4000;
-const GRE_FLAG_KEY: u16 = 0x2000;
-const GRE_FLAG_SEQUENCE: u16 = 0x1000;
+pub(in crate::afxdp) const GRE_FLAG_KEY: u16 = 0x2000;
+pub(in crate::afxdp) const GRE_FLAG_SEQUENCE: u16 = 0x1000;
 const GRE_VERSION_MASK: u16 = 0x0007;
 const GRE_PROTO_IPV4: u16 = 0x0800;
 const GRE_PROTO_IPV6: u16 = 0x86dd;
@@ -53,6 +53,41 @@ fn parse_outer_addresses(frame: &[u8], meta: UserspaceDpMeta) -> Option<(IpAddr,
         }
         _ => None,
     }
+}
+
+/// #2782: the byte slice over which a Checksum-Present GRE checksum is
+/// computed — the GRE header through the end of the GRE payload. The
+/// region is bounded by the OUTER IP length (IPv4 Total Length, IPv6
+/// Payload Length) so trailing Ethernet min-frame padding is excluded:
+/// the GRE checksum covers exactly the encapsulated octets, and folding
+/// pad bytes in would spuriously fail valid frames. Returns `None` when
+/// the outer header is truncated or its declared length lies outside the
+/// captured frame (fail-closed — a truncated/lying header must not
+/// over-read or pass an unvalidated frame).
+fn gre_checksum_region<'a>(
+    frame: &'a [u8],
+    meta: UserspaceDpMeta,
+    gre_offset: usize,
+) -> Option<&'a [u8]> {
+    let l3 = meta.l3_offset as usize;
+    let gre_region_end = match meta.addr_family as i32 {
+        libc::AF_INET => {
+            let total = u16::from_be_bytes([*frame.get(l3 + 2)?, *frame.get(l3 + 3)?]) as usize;
+            l3.checked_add(total)?
+        }
+        libc::AF_INET6 => {
+            let payload =
+                u16::from_be_bytes([*frame.get(l3 + 4)?, *frame.get(l3 + 5)?]) as usize;
+            l3.checked_add(40)?.checked_add(payload)?
+        }
+        _ => return None,
+    };
+    // The declared region must start at/after the GRE header and fit
+    // within what we actually captured.
+    if gre_region_end < gre_offset || gre_region_end > frame.len() {
+        return None;
+    }
+    frame.get(gre_offset..gre_region_end)
 }
 
 pub(in crate::afxdp) fn packet_trimmed_len(packet: &[u8], addr_family: u8) -> Option<usize> {
@@ -136,6 +171,25 @@ pub(in crate::afxdp) static WG_DECAP_ECN_ILLEGAL_DROPS: AtomicU64 = AtomicU64::n
 /// #2330 keep `Forward` to preserve pre-#2301 behaviour) whose encapped
 /// outer nonetheless exceeds the DF-set transport MTU.
 pub(in crate::afxdp) static GRE_ENCAP_DF_OVERSIZE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// #2782: count of native-GRE decap frames DROPPED because the
+/// Checksum-Present (C) bit was set but the GRE checksum did not verify
+/// (or the header/payload was too short to cover the checksummed
+/// region). RFC 2784 §2.1 + RFC 2890: when C is set the 16-bit
+/// Checksum field is the IP-style one's-complement checksum of the GRE
+/// header AND the payload, computed with the Checksum field itself
+/// zeroed; a 16-bit Reserved1 follows. A checksum-present peer (notably
+/// a vSRX configured for GRE checksum) was previously blackholed
+/// outright (`return None` before this field was even parsed) — an
+/// uncounted, no-show-reason drop and a router-interop gap. We now skip
+/// the 4-byte Checksum+Reserved1 field to locate the inner payload and
+/// VALIDATE the checksum; a verified frame decaps normally, a corrupt
+/// one is dropped HERE with a specific counter so the drop is
+/// observable. Surfaced via `coordinator/status.rs` as
+/// `xpf_userspace_gre_decap_checksum_invalid_drops_total`. A nonzero
+/// value means a checksummed GRE peer is delivering frames the path
+/// corrupted (or a header truncated past the checksum field).
+pub(in crate::afxdp) static GRE_DECAP_CHECKSUM_INVALID_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the inner IP packet's DSCP+ECN byte for outer-header
 /// propagation on tunnel encap (#2303). Returns the full 8-bit
@@ -578,15 +632,40 @@ pub(super) fn try_native_gre_decap_from_frame(
     if (flags_version & GRE_VERSION_MASK) != 0 {
         return None;
     }
-    if (flags_version & (GRE_FLAG_CHECKSUM | GRE_FLAG_ROUTING)) != 0 {
+    // Source Route Entries (the Routing-Present R bit) are not parsed —
+    // the variable SRE list has no fixed offset and is effectively dead
+    // on the modern Internet. A routed GRE frame stays a drop.
+    if (flags_version & GRE_FLAG_ROUTING) != 0 {
         return None;
     }
+    let checksum_present = (flags_version & GRE_FLAG_CHECKSUM) != 0;
     let key_present = (flags_version & GRE_FLAG_KEY) != 0;
     let sequence_present = (flags_version & GRE_FLAG_SEQUENCE) != 0;
     let gre_proto = u16::from_be_bytes([base[2], base[3]]);
     let (inner_family, inner_eth_proto) = gre_inner_family_and_proto(gre_proto)?;
 
     let mut inner_offset = gre_offset + 4;
+    // #2782: RFC 2890 fixed field order is Checksum+Reserved1, then Key,
+    // then Sequence — the Checksum field (when present) is FIRST, right
+    // after the flags/protocol word. Skip its 4 bytes (2-byte Checksum +
+    // 2-byte Reserved1) to reach Key/Sequence and the inner payload, and
+    // validate the checksum so a corrupt frame is a counted drop rather
+    // than a silently-misforwarded one.
+    if checksum_present {
+        // The checksum covers the GRE header + payload. Bound that
+        // region by the OUTER IP length so we do not fold trailing L2
+        // padding (Ethernet min-frame pad) into the sum.
+        let gre_region = gre_checksum_region(frame, meta, gre_offset)?;
+        // IP one's-complement checksum of the whole GRE region (the
+        // Checksum field is included as-is); a valid frame folds to 0.
+        if checksum16(gre_region) != 0 {
+            GRE_DECAP_CHECKSUM_INVALID_DROPS.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        // Past the checksum/reserved field; bounds-check before advance.
+        frame.get(inner_offset..inner_offset + 4)?;
+        inner_offset += 4;
+    }
     let mut key = 0u32;
     if key_present {
         key = u32::from_be_bytes(

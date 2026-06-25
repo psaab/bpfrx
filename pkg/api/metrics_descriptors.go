@@ -910,6 +910,22 @@ func newCollector(srv *Server) *xpfCollector {
 				"(#2331).",
 			nil, nil,
 		),
+		userspaceGreDecapChecksumInvalidDrops: prometheus.NewDesc(
+			"xpf_userspace_gre_decap_checksum_invalid_drops_total",
+			"Native-GRE decap frames dropped because the GRE "+
+				"Checksum-Present (C) bit was set but the GRE checksum "+
+				"failed to verify (or the header was truncated past the "+
+				"4-byte Checksum+Reserved1 field). Per RFC 2784 2.1 and "+
+				"RFC 2890 the checksum is the IP-style one's-complement "+
+				"checksum of the GRE header and payload; a checksummed "+
+				"peer (for example a vSRX with GRE checksum enabled) is "+
+				"now decapped after skipping and validating the checksum "+
+				"field instead of being silently blackholed, and only a "+
+				"frame the path corrupted is dropped here. A nonzero "+
+				"value flags a checksummed GRE peer delivering corrupt "+
+				"frames or a truncated GRE header (#2782).",
+			nil, nil,
+		),
 		userspaceTimeExceededRateLimited: prometheus.NewDesc(
 			"xpf_userspace_time_exceeded_rate_limited_total",
 			"Locally-generated ICMP/ICMPv6 Time Exceeded (TTL/hop-limit) "+
