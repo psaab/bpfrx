@@ -496,10 +496,7 @@ func IsUsableIPsecEndpoint(s string) bool {
 // a proper `security ike gateway <name> { address <ip>; }` (or
 // `dynamic { hostname <fqdn>; }`) instead.
 func isPlausibleHostname(s string) bool {
-	if len(s) == 0 || len(s) > 253 {
-		return false
-	}
-	if !strings.Contains(s, ".") {
+	if len(s) == 0 {
 		return false
 	}
 	// A single trailing dot is the absolute-root marker of a fully
@@ -510,11 +507,23 @@ func isPlausibleHostname(s string) bool {
 	// has a leading/interior empty label is NOT made valid by this: after
 	// stripping one trailing dot the scan still rejects "", a trailing
 	// dot, or any "..".
+	//
+	// The strip MUST precede the 253-octet presentation cap: RFC 1035 §3.1
+	// counts only the labels (max 253 chars), and the absolute-root dot
+	// does not consume part of that budget. A maximal 253-char FQDN written
+	// in absolute form is 254 bytes including the trailing "." and is valid
+	// (#2596) — capping the raw byte length first wrongly rejected it.
 	if strings.HasSuffix(s, ".") {
 		s = s[:len(s)-1]
 		if len(s) == 0 {
 			return false // name was just "."
 		}
+	}
+	if len(s) > 253 {
+		return false
+	}
+	if !strings.Contains(s, ".") {
+		return false
 	}
 	labelLen := 0
 	for i := 0; i < len(s); i++ {

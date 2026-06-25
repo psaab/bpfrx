@@ -1,3 +1,22 @@
+## 2026-06-25 — #2596: strip trailing dot before the 253-octet hostname cap
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed an ordering bug in `isPlausibleHostname`
+  (`pkg/config/compiler_ipsec.go`). The `len(s) > 253` presentation-form
+  length cap ran BEFORE the single trailing-dot strip (added by #2455), so
+  a maximal 253-char FQDN written in absolute form (254 bytes including the
+  root `.`) was wrongly rejected. Per RFC 1035 §3.1 the trailing root dot
+  does not count toward the 253-char presentation limit. Moved the strip to
+  precede the cap; the cap now applies to the stripped name. All other
+  validation (empty-label, hyphen, label-length, contains-a-dot) is
+  preserved. Added `TestIsUsableIPsecEndpointMaxLength` — a fail-on-revert
+  boundary table (253-char valid, 253-char+dot valid, 254-char invalid,
+  254-char+dot invalid, empty, bare-dot). Verified RED on revert (the
+  253-char+trailing-dot case returns false instead of true), GREEN after
+  restore.
+- **File(s)**: pkg/config/compiler_ipsec.go,
+  pkg/config/compiler_ipsec_gateway_ref_test.go, _Log.md
+
 ## 2026-06-25 — #2733: clear the NAT'd reverse companion at val.ReverseKey
 
 - **Timestamp**: 2026-06-25
@@ -14907,3 +14926,37 @@ top.
   go test ./pkg/flowexport/... ok.
   **File(s)**: pkg/flowexport/ipfix.go,
   pkg/flowexport/ipfix_seqnum_test.go, pkg/flowexport/README.md, _Log.md
+
+## 2026-06-25 — #2456: DHCP relay master-state gate (suppress duplicate relay on backup)
+
+- **Timestamp**: 2026-06-25
+- **Action**: On a chassis cluster a shared client segment is reachable from
+  both the MASTER and the BACKUP node, so both nodes' relay listeners receive
+  the client DISCOVER/REQUEST broadcast and BOTH relayed it upstream →
+  duplicate relayed requests with different per-node giaddrs. Added a
+  per-interface VRRP/cluster master-state gate to the relay forward path.
+  pkg/dhcprelay: new `masterGate` seam on `Manager` + `SetMasterGate`; the
+  main read loop calls `shouldRelay(ifaceName)` after confirming the packet is
+  a relayable client request and DROPS (bumping `requestsDroppedBackup` /
+  `RelayStats.RequestsDroppedBackup`) when the gate is closed. The gate is read
+  PER PACKET so a backup→master failover starts relaying immediately with no
+  relay restart; a nil gate (NewManager default / non-cluster build) is
+  fail-open (standalone always relays). pkg/daemon: `Daemon.relayMasterGateOpen`
+  resolves the relay interface name (e.g. reth0.0) to its redundancy group via
+  `relayInterfaceRG` (mirrors `rgForInterfaces`, #2664: strip unit suffix, read
+  the config interface's RedundancyGroup) and returns `isRethMasterState(rg)` —
+  the SAME live RG-master query the DHCP server / DDNS gates use. Standalone
+  (cluster==nil) and non-RG-owned (RG 0) interfaces always relay. Wired via
+  `d.dhcpRelay.SetMasterGate(d.relayMasterGateOpen)` in daemon_run.go.
+- **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/daemon/daemon_dhcp.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/daemon_dhcp_relay_gate_test.go, pkg/dhcprelay/README.md, _Log.md
+- **Validation**: fail-on-revert proven — disabling the loop gate makes
+  TestRunRelay_MasterGate_BackupDrops, _PassesInterfaceName, and
+  _FailoverStartsRelaying go RED (backup relays a duplicate). Tests cover
+  backup-drops, master-relays, standalone-relays (nil gate), per-packet
+  interface-name passing, mid-session failover re-eval (feedConn), and the
+  daemon gate (standalone / master / backup / failover-reeval / non-RG). Gates:
+  GOCACHE go build ./... clean; go test ./pkg/dhcprelay/... ./pkg/daemon/...
+  green; gofmt clean; go vet clean. HA-adjacent (relay follows VRRP master
+  state) → parent may run make test-failover for no-regression.
