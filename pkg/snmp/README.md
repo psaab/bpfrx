@@ -228,6 +228,22 @@ authorization surface: every request is dropped because no community matches.
   varbind fits. This prevents emitting an oversized UDP datagram that the peer
   or the network would fragment or drop. See `effectiveMaxSize` / `trimToFit`
   in `agent.go`.
+- **Trap delivery is asynchronous and bounded (#2991).** Link-state traps
+  are emitted from the daemon's netlink link-monitor goroutine.
+  `sendLinkTraps` builds the packet on the caller's goroutine (cheap) and
+  enqueues one job per target onto a bounded channel
+  (`trapQueueDepth = 256`) drained by a single worker goroutine; the
+  blocking `net.DialTimeout` (and DNS resolution for an FQDN target) runs
+  on the worker, NOT on the link monitor. A dead or slow target therefore
+  cannot stall link-state processing. The queue is started lazily (works
+  for both `NewAgent` and bare-struct test agents). When the queue is full
+  the trap is DROPPED and `trapsDropped` is incremented rather than
+  blocking the caller — dropping is the correct backpressure when targets
+  are not draining. The delivery is replaceable through the `trapSender`
+  package var (the seam tests use to inject a slow sender). Before #2991
+  delivery was synchronous and inline, so an unreachable trap target (or a
+  hung DNS lookup for an FQDN target) blocked link-state processing for up
+  to the 2s dial timeout × target count.
 - **The v2c trap community is selected deterministically (#2989).**
   `selectTrapCommunity` picks the lexicographically-first configured
   community (falling back to `public` when none is configured). The old
