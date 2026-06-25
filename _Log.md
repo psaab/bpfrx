@@ -1,3 +1,28 @@
+## 2026-06-25 — #2923 (review fold, PR #2984 MINOR): forwardable-disposition tunnel-liveness gate
+
+- **Timestamp**: 2026-06-25
+- **Action**: addressed the #2984 MERGE-NEEDS-MINOR review finding.
+  `tunnel_next_hop_live` gated on a bare
+  `resolve_tunnel_outer(...).is_some()`, but a tunnel whose underlay
+  ROUTE is withdrawn still returns `Some(NoRoute)` (only unknown-endpoint
+  / local-delivery / recursion return `None`). A bare `.is_some()` marked
+  that DEAD tunnel live, so in a mixed direct+tunnel ECMP group ~half the
+  flows hashed to the NoRoute tunnel and DROPPED despite a fully live
+  direct member (partial blackhole). Fixed by gating on a FORWARDABLE
+  disposition: `ForwardCandidate | MissingNeighbor` (MissingNeighbor is
+  live — the cold path drives ARP/NDP, mirroring the direct branch). Added
+  two fail-on-revert tests:
+  `ecmp_mixed_with_noroute_underlay_tunnel_uses_only_live_direct_hop`
+  (v4: RED with bare `.is_some()` — NoRoute flows blackhole) and
+  `ecmp_mixed_direct_and_tunnel_selects_both_paths_v6` (v6: RED if the v6
+  selector's tunnel-liveness branch is removed — tunnel ifindex 362 never
+  selected).
+- **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs
+- **Validation**: cargo build --release (0 errors); `ecmp_mixed` 3/3,
+  forwarding suite 190/190; both fail-on-revert proofs confirmed RED then
+  restored GREEN.
+
 ## 2026-06-25 — #2923: ECMP type-aware liveness (tunnel vs direct next-hop)
 
 - **Timestamp**: 2026-06-25

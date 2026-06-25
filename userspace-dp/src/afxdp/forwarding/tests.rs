@@ -2718,6 +2718,208 @@ fn ecmp_mixed_direct_and_tunnel_selects_both_paths() {
     );
 }
 
+/// #2923 (review finding #1): a tunnel candidate whose OUTER underlay route is
+/// WITHDRAWN must be DEAD, not live. `resolve_tunnel_outer` still returns
+/// `Some(NoRoute)` for an endpoint with no usable underlay route (it only
+/// returns `None` for unknown-endpoint / local-delivery / recursion), so a
+/// bare `.is_some()` liveness test would mark the dead tunnel live and ~half
+/// the flows in a mixed group would hash to it and DROP (NoRoute) despite a
+/// fully live direct member. The fix gates tunnel liveness on a FORWARDABLE
+/// disposition (ForwardCandidate | MissingNeighbor).
+///
+/// FAIL-ON-REVERT: revert `tunnel_next_hop_live` to bare `.is_some()` and the
+/// NoRoute tunnel is selected for ~half the hashes → a NoRoute disposition
+/// appears and the "all flows forward via the live direct hop" assertion goes
+/// RED (partial blackhole).
+#[test]
+fn ecmp_mixed_with_noroute_underlay_tunnel_uses_only_live_direct_hop() {
+    // Same base as the mixed test, but the GRE tunnel's OUTER route
+    // (2602:ffd3:0:2::/64 in inet6.0) is WITHDRAWN — its underlay is down, so
+    // the outer resolves to NoRoute and the tunnel must be DEAD.
+    let mut snapshot = native_gre_snapshot(true);
+    snapshot
+        .routes
+        .retain(|r| r.destination != "2602:ffd3:0:2::/64");
+    snapshot.interfaces.push(crate::InterfaceSnapshot {
+        name: "ge-0/0/1".to_string(),
+        zone: "wan".to_string(),
+        linux_name: "ge-0-0-1".to_string(),
+        ifindex: 11,
+        hardware_addr: "02:00:00:00:00:11".to_string(),
+        addresses: vec![crate::InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "192.0.2.1/24".to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    });
+    snapshot.neighbors.push(crate::NeighborSnapshot {
+        interface: "ge-0-0-1".to_string(),
+        ifindex: 11,
+        family: "inet".to_string(),
+        ip: "192.0.2.2".to_string(),
+        mac: "00:11:22:33:44:77".to_string(),
+        state: "reachable".to_string(),
+        router: true,
+        link_local: false,
+    });
+    snapshot.routes.push(crate::RouteSnapshot {
+        table: "inet.0".to_string(),
+        family: "inet".to_string(),
+        destination: "203.0.113.0/24".to_string(),
+        next_hops: vec![
+            "192.0.2.2@ge-0/0/1".to_string(), // direct, live
+            "@gr-0/0/0.0".to_string(),        // tunnel, underlay WITHDRAWN
+        ],
+        discard: false,
+        next_table: String::new(),
+        preference: 5,
+    });
+    let state = build_forwarding_state(&snapshot);
+
+    // Sweep the per-flow hash: EVERY flow must forward via the live direct hop
+    // (ifindex 11). The dead tunnel must never be selected — no NoRoute, no
+    // tunnel egress (362).
+    let mut egresses = std::collections::BTreeSet::new();
+    for h in 0u64..64 {
+        let resolved = lookup_forwarding_resolution_v4(
+            &state,
+            None,
+            Ipv4Addr::new(203, 0, 113, 5),
+            "inet.0",
+            0,
+            true,
+            Some(h),
+        );
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate,
+            "no flow may blackhole (NoRoute) on the dead tunnel — every flow \
+             must forward via the live direct hop",
+        );
+        assert_eq!(
+            resolved.tunnel_endpoint_id, 0,
+            "the dead (NoRoute-underlay) tunnel must never be selected",
+        );
+        egresses.insert(resolved.egress_ifindex);
+    }
+    assert_eq!(
+        egresses,
+        std::collections::BTreeSet::from([11]),
+        "every flow must forward via the live direct hop (ifindex 11) — a \
+         NoRoute-underlay tunnel must NOT be selected (RED if liveness stays \
+         bare .is_some(): the dead tunnel is picked for ~half the hashes)",
+    );
+}
+
+/// #2923 (review finding #2): the v6 selection path must apply the same
+/// type-aware tunnel liveness. Mirrors `ecmp_mixed_direct_and_tunnel_*` but
+/// drives `lookup_forwarding_resolution_v6` with an INNER v6 prefix whose ECMP
+/// set mixes a direct v6 hop (ifindex 11) and the GRE tunnel hop (endpoint 1,
+/// logical ifindex 362, IPv6 outer resolving via reth0.80).
+///
+/// FAIL-ON-REVERT: revert the v6 tunnel-liveness branch and the tunnel
+/// candidate is dead again; with the direct v6 member live, selection
+/// collapses to ifindex 11 only and the tunnel-egress assertion goes RED.
+#[test]
+fn ecmp_mixed_direct_and_tunnel_selects_both_paths_v6() {
+    let mut snapshot = native_gre_snapshot(true);
+    // Direct v6 next-hop interface in a routable zone with a live v6 neighbor.
+    snapshot.interfaces.push(crate::InterfaceSnapshot {
+        name: "ge-0/0/1".to_string(),
+        zone: "wan".to_string(),
+        linux_name: "ge-0-0-1".to_string(),
+        ifindex: 11,
+        hardware_addr: "02:00:00:00:00:11".to_string(),
+        addresses: vec![crate::InterfaceAddressSnapshot {
+            family: "inet6".to_string(),
+            address: "2001:db8:ec::1/64".to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    });
+    snapshot.neighbors.push(crate::NeighborSnapshot {
+        interface: "ge-0-0-1".to_string(),
+        ifindex: 11,
+        family: "inet6".to_string(),
+        ip: "2001:db8:ec::2".to_string(),
+        mac: "00:11:22:33:44:88".to_string(),
+        state: "reachable".to_string(),
+        router: true,
+        link_local: false,
+    });
+    // One inet6.0 INNER ECMP prefix mixing a direct v6 hop + the tunnel hop.
+    // (Disjoint from the GRE outer prefix 2602:ffd3:0:2::/64.)
+    snapshot.routes.push(crate::RouteSnapshot {
+        table: "inet6.0".to_string(),
+        family: "inet6".to_string(),
+        destination: "2001:db8:dead::/48".to_string(),
+        next_hops: vec![
+            "2001:db8:ec::2@ge-0/0/1".to_string(), // direct
+            "@gr-0/0/0.0".to_string(),             // tunnel (endpoint id 1)
+        ],
+        discard: false,
+        next_table: String::new(),
+        preference: 5,
+    });
+    let state = build_forwarding_state(&snapshot);
+
+    // The inet6.0 table also holds the GRE outer prefix; find OUR mixed prefix.
+    let dead_net: Ipv6Addr = "2001:db8:dead::".parse().unwrap();
+    let route = state
+        .routes_v6
+        .get("inet6.0")
+        .expect("table")
+        .iter()
+        .find(|r| r.prefix.contains(dead_net))
+        .expect("mixed inet6.0 ECMP route present");
+    assert_eq!(route.next_hops.len(), 2, "ECMP route must retain both hops");
+    assert!(
+        route.next_hops.iter().any(|nh| nh.tunnel_endpoint_id == 1),
+        "the tunnel next-hop must carry tunnel_endpoint_id 1",
+    );
+
+    let mut egresses = std::collections::BTreeSet::new();
+    let mut saw_tunnel_id = false;
+    for h in 0u64..64 {
+        let resolved = lookup_forwarding_resolution_v6(
+            &state,
+            None,
+            "2001:db8:dead::5".parse::<Ipv6Addr>().unwrap(),
+            "inet6.0",
+            0,
+            true,
+            Some(h),
+        );
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate,
+            "both the direct and tunnel v6 members must forward (live)",
+        );
+        egresses.insert(resolved.egress_ifindex);
+        if resolved.tunnel_endpoint_id == 1 {
+            saw_tunnel_id = true;
+            assert_eq!(
+                resolved.egress_ifindex, 362,
+                "a v6 tunnel selection must egress the logical tunnel ifindex",
+            );
+        }
+    }
+    assert!(
+        egresses.contains(&11),
+        "the direct v6 ECMP member (ifindex 11) must be selected",
+    );
+    assert!(
+        egresses.contains(&362),
+        "the v6 tunnel ECMP member (logical ifindex 362) must be selected \
+         — RED if the v6 tunnel-liveness branch is reverted",
+    );
+    assert!(
+        saw_tunnel_id,
+        "a v6 tunnel selection must carry tunnel_endpoint_id 1",
+    );
+}
+
 /// #2734: ECMP must spread by the per-FLOW 5-tuple, not per-destination.
 ///
 /// Two equal-cost next-hops to the same prefix, BOTH neighbors live.

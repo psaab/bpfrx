@@ -2102,21 +2102,42 @@ fn ecmp_hash_flow_seeded(seed: u64, key: &crate::session::SessionKey) -> u64 {
 /// which restricts selection to direct candidates and starves the tunnel path
 /// even when its underlay is fully up.
 ///
-/// A tunnel next-hop is live iff its endpoint exists and the OUTER transport
-/// resolves to a usable underlay — exactly the predicate
-/// `resolve_tunnel_outer` already encodes (endpoint present, outer not
-/// local-delivery, outer not a tunnel-interface recursion loop). Reusing that
-/// SSOT keeps tunnel liveness identical to what selection would later resolve
-/// via `resolve_tunnel_forwarding_resolution`, so a candidate marked live here
-/// will not blackhole on selection. `depth` is forwarded so the outer
-/// re-resolution honors the same next-table recursion budget as the caller.
+/// A tunnel next-hop is live iff its endpoint exists AND the OUTER transport
+/// resolves to a FORWARDABLE disposition. `resolve_tunnel_outer` already
+/// rejects the structurally-broken cases (unknown endpoint, local-delivery
+/// outer, tunnel-interface recursion loop) by returning `None`, but a tunnel
+/// whose underlay ROUTE is withdrawn still returns
+/// `Some(ForwardingResolution { disposition: NoRoute, egress_ifindex: 0, .. })`
+/// — a bare `.is_some()` would mark that DEAD tunnel live, and in a mixed
+/// group ~half the flows would hash to it and DROP (NoRoute) despite a fully
+/// live direct member (#2923 review finding). So gate on the OUTER
+/// disposition:
+///
+/// * `ForwardCandidate` — outer next-hop neighbor resolved, fully usable.
+/// * `MissingNeighbor` — outer route present, ARP/NDP pending; the cold path
+///   drives resolution, so this is LIVE, matching the direct-hop branch which
+///   keeps an `ifindex > 0` next-hop selectable while its neighbor resolves
+///   (a tunnel marked MissingNeighbor egresses the logical tunnel ifindex and
+///   the cold path probes the OUTER hop via `outer_neighbor_ifindex`).
+///
+/// Every other disposition (`NoRoute`, `DiscardRoute`, `NextTableUnsupported`,
+/// etc.) means the underlay cannot forward → DEAD, so selection skips it and a
+/// live alternate (direct or another tunnel) carries the flow. Reusing
+/// `resolve_tunnel_outer` keeps liveness identical to what selection later
+/// resolves via `resolve_tunnel_forwarding_resolution`. `depth` is forwarded
+/// so the outer re-resolution honors the same next-table recursion budget as
+/// the caller.
 fn tunnel_next_hop_live(
     state: &ForwardingState,
     dynamic_neighbors: Option<&Arc<ShardedNeighborMap>>,
     tunnel_endpoint_id: u16,
     depth: usize,
 ) -> bool {
-    resolve_tunnel_outer(state, dynamic_neighbors, tunnel_endpoint_id, depth).is_some()
+    matches!(
+        resolve_tunnel_outer(state, dynamic_neighbors, tunnel_endpoint_id, depth)
+            .map(|outer| outer.disposition),
+        Some(ForwardingDisposition::ForwardCandidate | ForwardingDisposition::MissingNeighbor)
+    )
 }
 
 fn select_route_next_hop<'a, T: Copy>(
