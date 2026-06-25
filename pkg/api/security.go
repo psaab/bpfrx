@@ -155,8 +155,13 @@ func (s *Server) eventsHandler(w http.ResponseWriter, r *http.Request) {
 		limit = 10000
 	}
 
+	zone, ok := queryUint16Strict(r, "zone", 0)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid zone filter: "+r.URL.Query().Get("zone"))
+		return
+	}
 	filter := logging.EventFilter{
-		Zone:     queryUint16(r, "zone", 0),
+		Zone:     zone,
 		Action:   r.URL.Query().Get("action"),
 		Protocol: r.URL.Query().Get("protocol"),
 	}
@@ -215,7 +220,14 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 
 	srcIP := net.ParseIP(srcIPStr)
 	dstIP := net.ParseIP(dstIPStr)
-	dstPort := queryInt(r, "dst_port", 0)
+	// A malformed dst_port must not silently become 0 (the "any port"
+	// wildcard) — that yields a misleading PERMIT/DENY verdict in the
+	// simulator (#2934). Fail closed with 400.
+	dstPort, ok := queryIntStrict(r, "dst_port", 0)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid dst_port: "+r.URL.Query().Get("dst_port"))
+		return
+	}
 	proto := r.URL.Query().Get("protocol")
 
 	for _, zpp := range cfg.Security.Policies {

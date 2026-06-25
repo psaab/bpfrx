@@ -76,6 +76,44 @@ func queryUint16(r *http.Request, key string, def uint16) uint16 {
 	return uint16(n)
 }
 
+// queryUint16Strict parses a uint16 query parameter and FAILS CLOSED on a
+// malformed/out-of-range non-empty value. Filter sentinels such as
+// zone=0 mean "no filter", so a typo'd value (zone=abc / zone=65536) must
+// NOT silently fall through to the no-filter default — that widens the
+// query to every session/event and is a cross-zone observability leak
+// (#2934). An empty value returns (def, true); a bad value returns
+// (0, false) so the caller can emit HTTP 400, mirroring the gRPC contract
+// (pkg/grpcapi sessionFilter.validate → InvalidArgument).
+func queryUint16Strict(r *http.Request, key string, def uint16) (uint16, bool) {
+	v := r.URL.Query().Get(key)
+	if v == "" {
+		return def, true
+	}
+	n, err := strconv.ParseUint(v, 10, 16)
+	if err != nil {
+		return 0, false
+	}
+	return uint16(n), true
+}
+
+// queryIntStrict parses a non-negative int query parameter and FAILS
+// CLOSED on a malformed/negative non-empty value (#2934). An empty value
+// returns (def, true); a bad value returns (0, false) so the caller can
+// emit HTTP 400. Used for filter/predicate parameters (e.g. dst_port in
+// the policy-match simulator) where a bad value silently becoming the
+// default is a wildcard that yields a misleading verdict.
+func queryIntStrict(r *http.Request, key string, def int) (int, bool) {
+	v := r.URL.Query().Get(key)
+	if v == "" {
+		return def, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
 // parseRefBaseUnit splits a Junos interface ref into its base name
 // and unit number, returning ok=false for malformed (non-numeric)
 // suffixes. A bare ref returns (ref, 0, true). This matches the

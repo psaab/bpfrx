@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
 
 	"golang.org/x/sys/unix"
 
@@ -23,7 +25,11 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 		limit = 10000
 	}
 	offset := queryInt(r, "offset", 0)
-	zoneFilter := queryUint16(r, "zone", 0)
+	zoneFilter, ok := queryUint16Strict(r, "zone", 0)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid zone filter: "+r.URL.Query().Get("zone"))
+		return
+	}
 	protoFilter := r.URL.Query().Get("protocol")
 
 	now := monotonicSeconds()
@@ -40,8 +46,7 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 		if zoneFilter != 0 && val.IngressZone != zoneFilter && val.EgressZone != zoneFilter {
 			return true
 		}
-		proto := protoName(key.Protocol)
-		if protoFilter != "" && proto != protoFilter {
+		if protoFilter != "" && !protoFilterMatches(key.Protocol, protoFilter) {
 			return true
 		}
 
@@ -63,8 +68,7 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 		if zoneFilter != 0 && val.IngressZone != zoneFilter && val.EgressZone != zoneFilter {
 			return true
 		}
-		proto := protoName(key.Protocol)
-		if protoFilter != "" && proto != protoFilter {
+		if protoFilter != "" && !protoFilterMatches(key.Protocol, protoFilter) {
 			return true
 		}
 
@@ -342,6 +346,23 @@ func monotonicSeconds() uint64 {
 	var ts unix.Timespec
 	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
 	return uint64(ts.Sec)
+}
+
+// protoFilterMatches matches a session protocol against an operator filter
+// string: a case-insensitive protocol name (tcp/udp/icmp/icmpv6/...) OR a
+// numeric IP protocol number ("6" matches TCP, "47" matches GRE). This
+// mirrors the gRPC (pkg/grpcapi server_sessions.go protoFilterMatches) and
+// CLI (pkg/cli monitor) contract; REST previously did a case-SENSITIVE
+// string compare with no numeric form, so protocol=tcp and protocol=6
+// silently returned an empty result (#2935).
+func protoFilterMatches(p uint8, filter string) bool {
+	if strings.EqualFold(protoName(p), filter) {
+		return true
+	}
+	if n, err := strconv.Atoi(filter); err == nil {
+		return n == int(p)
+	}
+	return false
 }
 
 func protoName(p uint8) string {
