@@ -163,6 +163,14 @@ pub(super) fn stage_flow_cache_hit(
         // 64, so a low-rate flow co-resident with a saturating flow
         // could be served entirely from the cache and reaped mid-flow.
         sessions.touch_if_stale(&flow.forward_key, now_ns);
+        // #2501: account this forwarded packet against the session. The packet
+        // is keyed by its OWN tuple (`flow.forward_key`); `account_packet`
+        // derives the direction from the resolved entry and folds both
+        // directions onto the canonical forward entry. HOT PATH: one
+        // `key_to_handle` probe (warm — `touch_if_stale` just probed the same
+        // key) + a `saturating_add`. Allocation-free, no atomic (worker-owned
+        // table).
+        sessions.account_packet(&flow.forward_key, meta.pkt_len as u64);
         let mut recycle_now = true;
         if matches!(
             cached_decision.resolution.disposition,

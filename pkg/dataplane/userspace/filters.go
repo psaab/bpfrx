@@ -117,6 +117,10 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 		snap.SourcePorts = append(snap.SourcePorts, term.SourcePorts...)
 		// Destination ports
 		snap.DestPorts = append(snap.DestPorts, term.DestinationPorts...)
+		// Negated port sets (#2622): match all ports EXCEPT these. Emitted as
+		// separate wire fields; the Rust matcher inverts membership.
+		snap.SourcePortsExcept = append(snap.SourcePortsExcept, term.SourcePortsExcept...)
+		snap.DestPortsExcept = append(snap.DestPortsExcept, term.DestPortsExcept...)
 		// DSCP (#2545: multi-value — emit every resolved code point).
 		for _, d := range term.DSCPs {
 			if d == "" {

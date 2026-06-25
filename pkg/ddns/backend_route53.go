@@ -146,16 +146,19 @@ func buildChangeBatch(action string, rec LeaseDNSRecord) ([]byte, error) {
 	return append([]byte(xml.Header), out...), nil
 }
 
-// change issues a signed ChangeResourceRecordSets with the given action.
-func (b *route53Backend) change(ctx context.Context, action string, rec LeaseDNSRecord) error {
+// change issues a signed ChangeResourceRecordSets with the given action. When
+// the request fails, the parsed Route 53 error code/message (never the creds)
+// is returned alongside the typed transport error so DELETE-path idempotency
+// classification (r53DeleteAlreadyGone) can inspect the on-wire code/message.
+func (b *route53Backend) change(ctx context.Context, action string, rec LeaseDNSRecord) (errCode, errMsg string, err error) {
 	body, err := buildChangeBatch(action, rec)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	path := "/" + route53APIVersion + "/hostedzone/" + b.zoneID + "/rrset/"
 	req, err := http.NewRequest(http.MethodPost, b.endpoint+path, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("ddns route53: build request: %w", err)
+		return "", "", fmt.Errorf("ddns route53: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/xml")
 	req.Header.Set("User-Agent", "xpf-ddns/1.0")
@@ -163,30 +166,70 @@ func (b *route53Backend) change(ctx context.Context, action string, rec LeaseDNS
 
 	code, raw, err := doRequest(ctx, b.client, req)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	if cerr := classifyHTTPStatus(code); cerr != nil {
 		// Surface the Route 53 error code/message when present (never the creds).
 		var e r53ErrorXML
 		if xml.Unmarshal(raw, &e) == nil && e.Error.Code != "" {
-			return fmt.Errorf("ddns route53: %s: %s: %s: %w", b.name, e.Error.Code, e.Error.Message, cerr)
+			return e.Error.Code, e.Error.Message, fmt.Errorf("ddns route53: %s: %s: %s: %w", b.name, e.Error.Code, e.Error.Message, cerr)
 		}
-		return fmt.Errorf("ddns route53: %s: %w", b.name, cerr)
+		return "", "", fmt.Errorf("ddns route53: %s: %w", b.name, cerr)
 	}
-	return nil
+	return "", "", nil
 }
 
 // UpsertLease publishes the A/AAAA via a Route 53 UPSERT (create-or-replace).
 func (b *route53Backend) UpsertLease(ctx context.Context, rec LeaseDNSRecord) error {
-	return b.change(ctx, "UPSERT", rec)
+	_, _, err := b.change(ctx, "UPSERT", rec)
+	return err
 }
 
 // DeleteLease withdraws the A/AAAA via a Route 53 DELETE. Route 53 requires the
 // DELETE to match the existing record's TTL + value; we re-derive both from the
 // owned record the engine passes (the sole-delete-authority boundary), so the
-// delete targets exactly what we published. A NoSuch... error (already gone) is
-// not specially handled here — the engine logs + retries, and a forced re-add
-// next cycle reconverges; over-deletion is impossible (exact match required).
+// delete targets exactly what we published; over-deletion is impossible (exact
+// match required).
+//
+// IDEMPOTENT delete (#2771): if the record is already gone (manually removed,
+// or a prior withdraw that did land but whose ack was lost), Route 53 rejects
+// the DELETE with HTTP 400 InvalidChangeBatch "... but it was not found".
+// Treat that as success (nil) so Surface A's withdrawOwnedLocked drops
+// ownership instead of wedging on a withdraw that can never converge. This
+// mirrors the rfc2136 backend, which treats NXRRSET/NXDOMAIN as a benign
+// idempotent delete (backend_rfc2136.go sendRemove). A genuine
+// transient/auth/throttle failure (SignatureDoesNotMatch, 5xx, 429, …) still
+// returns non-nil so the engine retries — only the already-gone case is
+// swallowed.
 func (b *route53Backend) DeleteLease(ctx context.Context, rec LeaseDNSRecord) error {
-	return b.change(ctx, "DELETE", rec)
+	errCode, errMsg, err := b.change(ctx, "DELETE", rec)
+	if err != nil && r53DeleteAlreadyGone(errCode, errMsg) {
+		return nil
+	}
+	return err
+}
+
+// r53DeleteAlreadyGone reports whether a Route 53 DELETE failure means the
+// target record set was already absent (an idempotent no-op), as opposed to a
+// real failure that must be retried.
+//
+// Route 53 reports a delete of a non-existent record as a single envelope:
+// HTTP 400, Code=InvalidChangeBatch, with a per-change message of the form
+//
+//	[Tried to delete resource record set [name='wan.example.net.', type='A']
+//	 but it was not found]
+//
+// The Code alone (InvalidChangeBatch) is NOT sufficient — it also covers
+// genuine batch errors (e.g. an UPSERT whose value collides). We additionally
+// require the "but it was not found" / "was not found" marker, so a malformed
+// or conflicting batch (which must keep retrying / surface as a conflict) is
+// never mistaken for an idempotent delete.
+func r53DeleteAlreadyGone(code, msg string) bool {
+	if !strings.EqualFold(strings.TrimSpace(code), "InvalidChangeBatch") {
+		return false
+	}
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "but it was not found") ||
+		strings.Contains(m, "was not found") ||
+		strings.Contains(m, "not found")
 }

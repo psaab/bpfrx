@@ -430,6 +430,101 @@ func TestWireguardBadPresharedKeyRejected(t *testing.T) {
 	}
 }
 
+// An EXACT-duplicate AllowedIPs prefix on two different peers is a hard
+// commit reject (#2445). The cryptokey routing table maps a prefix to one
+// peer; an exact tie has no longest-prefix winner, so the engine LPM
+// resolves it by insertion order and silently blackholes the loser.
+// FAIL-ON-REVERT: removing the prefixOwner check lets this compile, and
+// the second peer can handshake but never carry traffic for 10.5.0.0/16.
+func TestWireguardDuplicateAllowedIPsPrefixRejected(t *testing.T) {
+	_, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " allowed-ips 10.5.0.0/16",
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyC + " allowed-ips 10.5.0.0/16",
+	})
+	if err == nil {
+		t.Fatal("exact-duplicate allowed-ips prefix across two peers must be a commit error")
+	}
+	if !strings.Contains(err.Error(), "claimed by two peers") {
+		t.Errorf("error = %q, want duplicate-allowed-ips message", err)
+	}
+}
+
+// A duplicate prefix authored with differing host bits (10.5.0.0/16 vs
+// 10.5.99.99/16) denotes the SAME masked cryptokey-routing entry and must
+// also be rejected — the check canonicalizes to the masked network before
+// comparing. FAIL-ON-REVERT for the canonicalAllowedIPPrefix masking.
+func TestWireguardDuplicateAllowedIPsPrefixHostBitsRejected(t *testing.T) {
+	_, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " allowed-ips 10.5.0.0/16",
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyC + " allowed-ips 10.5.99.99/16",
+	})
+	if err == nil {
+		t.Fatal("same masked prefix with differing host bits must be a commit error")
+	}
+	if !strings.Contains(err.Error(), "claimed by two peers") {
+		t.Errorf("error = %q, want duplicate-allowed-ips message", err)
+	}
+}
+
+// Distinct AllowedIPs prefixes across peers compile fine — the dup check
+// must NOT reject a normal multi-peer cryptokey-routing layout.
+func TestWireguardDistinctAllowedIPsPrefixesPass(t *testing.T) {
+	cfg, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " allowed-ips 10.1.0.0/16",
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyC + " allowed-ips 10.2.0.0/16",
+	})
+	if err != nil {
+		t.Fatalf("distinct per-peer prefixes must compile: %v", err)
+	}
+	if tc := wgTunnel(t, cfg, "wg0"); len(tc.WgPeers) != 2 {
+		t.Fatalf("WgPeers = %d, want 2", len(tc.WgPeers))
+	}
+}
+
+// Broader/narrower OVERLAP across peers (a catch-all 0.0.0.0/0 peer plus a
+// more-specific peer) is legitimate WG cryptokey routing — the engine LPM
+// resolves it by longest prefix — and must NOT be rejected. Only an EXACT
+// duplicate prefix is ambiguous. FAIL-ON-REVERT: a naive overlap check
+// (rather than exact-prefix) would wrongly reject this.
+func TestWireguardOverlappingAllowedIPsPrefixesPass(t *testing.T) {
+	_, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " allowed-ips 0.0.0.0/0",
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyC + " allowed-ips 10.5.0.0/16",
+	})
+	if err != nil {
+		t.Fatalf("broader/narrower overlap is valid WG and must compile: %v", err)
+	}
+}
+
+// Two peers may repeat the SAME prefix only when it is the same peer's own
+// list (no cross-peer claim); a same-peer repeat is harmless. Here the
+// repeat lands within wgKeyB via a bracketed list, so no conflict fires.
+func TestWireguardSamePeerRepeatedPrefixPasses(t *testing.T) {
+	_, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB +
+			" allowed-ips [ 10.5.0.0/16 10.5.0.0/16 ]",
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyC + " allowed-ips 10.6.0.0/16",
+	})
+	if err != nil {
+		t.Fatalf("same-peer repeated prefix must not trip the cross-peer dup gate: %v", err)
+	}
+}
+
 // A valid per-peer PSK compiles onto the right peer (#1434 B2).
 func TestWireguardPresharedKeyCompiles(t *testing.T) {
 	cfg, err := compileSet(t, []string{

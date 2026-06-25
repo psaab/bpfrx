@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"sort"
 	"strings"
 )
@@ -968,6 +969,25 @@ func ddnsKnownDyndns2Provider(name string) bool {
 	return ddnsKnownDyndns2NameSet[strings.ToLower(name)]
 }
 
+// ddnsCheckIPURLValid mirrors pkg/ddns.validateCheckIPURL for the commit-time
+// warning ONLY (config cannot import pkg/ddns). It must stay in sync with that
+// validator; a divergence only affects whether the operator gets a warning at
+// commit — the runtime CheckIP gate in pkg/ddns is authoritative and fails
+// closed regardless (#2773). A checkip-url must be an http(s) URL with a host;
+// without that gate a typo (ftp://, "not a url", host-less "http://") commits
+// silently and then masquerades forever as a transient observation failure,
+// suppressing publishing indefinitely.
+func ddnsCheckIPURLValid(u string) bool {
+	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		return false
+	}
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	return true
+}
+
 // validateSurfaceADDNSWarnings emits WARN-only commit-time messages for the
 // Surface A router/interface-address DDNS bindings + provider catalog (#2691
 // P2). It never returns an error: the typed schema already accepts the leaves,
@@ -1054,6 +1074,17 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 					"provider %q (backend generic) has no url-template; scopes using it publish "+
 					"nothing", name))
 			}
+		}
+
+		// checkip-url is a backend-independent, opt-in behind-NAT address source
+		// (#2691 P3). A malformed URL is a config error, not a transient: without
+		// this warning a typo commits silently and the runtime fetch fails forever,
+		// masquerading as a transient observation failure that suppresses publishing
+		// indefinitely (#2773). The runtime CheckIP gate fails closed regardless.
+		if p.CheckIPURL != "" && !ddnsCheckIPURLValid(p.CheckIPURL) {
+			warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+				"provider %q checkip-url %q is not a valid http(s) URL with a host; "+
+				"scopes using address-source checkip publish nothing", name, p.CheckIPURL))
 		}
 	}
 

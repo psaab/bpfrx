@@ -424,9 +424,17 @@ reserved for whole-dataplane selection where a rewrite shim
   `vrrp-group <id>`, dual-AST via `namedInstances`). A commit-time gate
   (`validateWireguardPeersStrict`, `compiler_validate_wireguard.go`)
   hard-rejects a WG tunnel with zero peers, a duplicate or malformed
-  (non-64-hex) peer pubkey, a malformed preshared-key, or
+  (non-64-hex) peer pubkey, a malformed preshared-key,
   endpoint-bearing peers that disagree on outer transport family (one
-  UDP socket = one outer family); the tolerant load / peer-sync path
+  UDP socket = one outer family), or an EXACT-duplicate `allowed-ips`
+  prefix across two peers (#2445 — the cryptokey routing table maps a
+  prefix to exactly one peer, so an exact tie has no longest-prefix
+  winner and the engine LPM resolves it by insertion order, silently
+  blackholing the loser; the check canonicalizes each CIDR to its masked
+  network so `10.0.0.5/24` and `10.0.0.0/24` collide, while a
+  broader/narrower OVERLAP — a `0.0.0.0/0` catch-all peer plus a
+  more-specific peer — stays valid because LPM resolves it
+  deterministically); the tolerant load / peer-sync path
   (`lenientWireguardPeers`) downgrades these to warnings so an
   already-persisted or peer-synced config still boots (#1960). The
   compiler sorts `WgPeers` by pubkey at the snapshot-builder boundary so
@@ -858,7 +866,13 @@ reserved for whole-dataplane selection where a rewrite shim
     provider (dyndns2 with no server + unknown name, cloudflare missing
     api-token/zone, route53 missing keys/hosted-zone-id, generic missing
     url-template) warns and publishes nothing at runtime (fail-open, never a
-    hard reject). Regression coverage:
+    hard reject). A malformed `checkip-url` (not an http(s) URL with a host —
+    e.g. `ftp://`, `not a url`, host-less `http://`) also warns at commit
+    (#2773): without it the typo committed silently and the runtime fetch then
+    masqueraded forever as a transient observation failure, suppressing
+    publishing indefinitely. The runtime `ddns.CheckIP` gate
+    (`validateCheckIPURL`) fails closed on the same malformed URL regardless, so
+    a URL that slips past commit cannot reach a fetch. Regression coverage:
     `pkg/config/compiler_p3_http_providers_test.go`,
     `pkg/ddns/backend_http_test.go` / `backend_cloudflare_test.go` /
     `backend_route53_test.go` / `sigv4_test.go` / `checkip_test.go` /
@@ -1118,6 +1132,44 @@ AST shapes + bracket list, fail-on-revert), the snapshot emit test
 `pkg/dataplane/userspace/filters_multivalue_2545_test.go`, and the Rust
 matcher `icmp_type_multi_value_matches_any_in_set_2545` /
 `icmp_type_empty_set_matches_any_2545`.
+
+### #2622 — firewall-filter `source-port-except` / `destination-port-except` (negated port match)
+
+Junos firewall filters accept the negated port match conditions
+`from source-port-except` / `from destination-port-except`: match every
+port EXCEPT the listed ones (the inverse of the positive `source-port` /
+`destination-port`). xpf previously had no schema leaf, so migrating a
+config carrying a port exclusion failed to parse / silently dropped the
+condition. The two leaves are added to `schemaFirewall`'s `from` block in
+`schema_cos.go` (BOTH `family inet` and `family inet6`), `multi: true` so a
+bracketed list `[ 80 443 ]` collapses onto one leaf per #2419.
+
+The typed term carries `SourcePortsExcept []string` /
+`DestPortsExcept []string` (`types_system.go`), populated by
+`compileFilterFrom` via `firewallMatchValues` (same accumulation as the
+positive port slices, both AST shapes).
+
+**Wire + dataplane.** Two additive wire fields on `FirewallTermSnapshot` —
+`source_ports_except` / `destination_ports_except` (Go
+`pkg/dataplane/userspace/protocol.go`, Rust `protocol/security.rs`,
+`serde(default)` for #1961 mixed-version parity). The Rust compiler
+(`filter/compiler.rs`) selects ONE port spec list per direction — the
+positive list if it carries real entries, otherwise the `-except` list — and
+sets a per-direction `source_port_except` / `dest_port_except` inversion flag
+on `FilterTerm` (positive wins if both are somehow present). The matcher
+`port_match` (`filter/engine/matching.rs`) now evaluates
+`matcher.matches(port) XOR except`, mirroring the address `nets_match_v4` /
+`nets_match_v6` `except` semantics: an except term whose port list ALL
+fails to parse means "match all ports except {}" = match ALL (vs the
+positive all-malformed fail-closed = match NOTHING). The wire specimen
+`userspace-dp/tests/fixtures/protocol_wire_v1.json` was regenerated for the
+two new fields. Regression coverage:
+`pkg/config/firewall_port_except_2622_test.go` (hierarchical + flat-set
+bracket list + inet6, fail-on-revert) and the Rust matcher
+`destination_port_except_negation` / `source_port_except_negation`
+(a port IN the except list does NOT match; a port NOT in it DOES —
+fail-on-revert). Scope: ports only; `packet-length` from the same
+review-039 finding is NOT implemented here.
 
 ### #2053 — Config secret redaction at JSON/YAML marshal time
 
