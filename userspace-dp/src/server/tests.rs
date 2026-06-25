@@ -155,6 +155,63 @@ fn max_size_legitimate_request_still_succeeds() {
         .expect("max-size legitimate request must succeed");
 }
 
+// --- #2744: feed-dimension cap raise (fail-on-revert) -------------------
+
+/// The pre-#2744 ceiling. A legitimate feed-heavy apply_snapshot can
+/// serialize past this (the #2744 case cited ~500K prefixes ≈ 20+ MiB);
+/// such a request must now be ACCEPTED, not rejected. This constant is
+/// hard-coded (NOT derived from MAX_CONTROL_REQUEST_BYTES) so the test
+/// goes RED if the cap is reverted to 16 MiB.
+const OLD_CONTROL_REQUEST_CAP_BYTES: usize = 16 * 1024 * 1024;
+
+#[test]
+fn legitimate_feed_above_old_16mib_cap_is_now_accepted() {
+    // Build a body comfortably above the OLD 16 MiB ceiling but within the
+    // raised cap — this models a large-but-legitimate feed-backed snapshot.
+    // It must be read, decoded, and handled (not rejected at the cap).
+    assert!(
+        OLD_CONTROL_REQUEST_CAP_BYTES < MAX_CONTROL_REQUEST_BYTES,
+        "cap must be raised above the old 16 MiB ceiling (got {MAX_CONTROL_REQUEST_BYTES})"
+    );
+    // 4 MiB above the old cap, with envelope slack below the new cap.
+    let pad_len = OLD_CONTROL_REQUEST_CAP_BYTES + 4 * 1024 * 1024;
+    assert!(
+        pad_len < MAX_CONTROL_REQUEST_BYTES - 4096,
+        "test body {pad_len} must stay within the raised cap {MAX_CONTROL_REQUEST_BYTES}"
+    );
+    let request = req(&"x".repeat(pad_len));
+    let mut payload = serde_json::to_vec(&request).expect("serialize");
+    assert!(
+        payload.len() > OLD_CONTROL_REQUEST_CAP_BYTES,
+        "test body {} must exceed the old 16 MiB cap to prove the raise",
+        payload.len()
+    );
+    assert!(
+        payload.len() <= MAX_CONTROL_REQUEST_BYTES,
+        "test body {} must stay within the raised cap {}",
+        payload.len(),
+        MAX_CONTROL_REQUEST_BYTES
+    );
+    payload.push(b'\n');
+    // Under the old 16 MiB cap this would be rejected with "exceeds
+    // maximum size"; under #2744 it must read/decode/handle cleanly.
+    run_raw(new_state(ProcessStatus::default()), &payload)
+        .expect("a legitimate feed-heavy request above the old 16 MiB cap must now be accepted");
+}
+
+#[test]
+fn request_above_new_cap_is_still_rejected() {
+    // The DoS guard must still bound allocation: one byte past the raised
+    // cap with no terminating newline is rejected before decode.
+    let payload = vec![b'a'; MAX_CONTROL_REQUEST_BYTES + 1];
+    let err = run_raw(new_state(ProcessStatus::default()), &payload)
+        .expect_err("a request past the raised cap must still be rejected");
+    assert!(
+        err.contains("exceeds maximum size"),
+        "expected oversize rejection past the raised cap, got: {err}"
+    );
+}
+
 // --- dispatcher: ping / status / unknown --------------------------------
 
 #[test]

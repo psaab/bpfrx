@@ -73,3 +73,14 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
 - A successful fetch always replaces the snapshot and stamps success, but
   the `onUpdate` recompile fires only when the canonical content hash
   changes — not on every fetch and not merely on a count change.
+- **Feed size vs. the dataplane control-socket cap (#2744):** feed prefixes
+  are carried inline as CIDR text in the userspace-dp `apply_snapshot`
+  (`buildAddressBookTableWithFeeds`, `pkg/dataplane/userspace/policies.go`).
+  Feeds are bounded only by the per-line scanner cap above, NOT by a
+  total-entry cap, so a very large feed dominates the serialized snapshot
+  size. The control socket caps a single request at `MaxControlRequestBytes`
+  (64 MiB, in lockstep with the Rust `MAX_CONTROL_REQUEST_BYTES`); at
+  ~45 B per IPv6 CIDR that covers ~1.4M prefixes. A snapshot past the cap is
+  surfaced as a config error at apply time (Go pre-flight in
+  `pkg/dataplane/userspace/process.go`) rather than silently rejected by the
+  helper after commit.
