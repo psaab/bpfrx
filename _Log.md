@@ -17050,3 +17050,26 @@ top.
   go vet ./pkg/frr/... ./pkg/config/... ; go test ./pkg/frr/...
   ./pkg/config/... (PASS). Fail-on-revert confirmed: reverting the gate
   to `term.Metric > 0` makes TestGeneratePolicyOptionsMetricZero RED.
+
+## 2026-06-25 — #2840 DDNS Surface A: transient link-read must not publish static
+- **Timestamp**: 2026-06-25
+- **Action**: Fix `observeInterfaceAddr` so a `LinkByName`/`AddrList`
+  netlink READ ERROR returns `(zero, false)` (transient — engine leaves
+  the scope untouched, retries next pass) instead of falling back to the
+  configured static and returning `(static, true)`. Publishing a
+  configured static on a link-read failure pointed DNS at a possibly-stale
+  address during a transient link/reth outage, contradicting the
+  documented `(zero,false)=transient` contract (codex-review-049 049-09).
+  The static fallback now applies ONLY on the present-but-addressless
+  path (a SUCCESSFUL read yielding no usable dynamic address — the
+  legitimate static-use case); it still composes with `staticUnitAddr`'s
+  #2776 IsPublicAddr gate. Introduced `netlinkLinkByName`/`netlinkAddrList`
+  package-var seams so the contract is unit-tested without real netlink.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
+  pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md
+- **Validation**: go build ./... ; gofmt -l (clean on touched files) ;
+  go vet ./pkg/daemon/... ./pkg/ddns/... (clean) ;
+  go test ./pkg/daemon/ -run 'SurfaceA|ObserveInterface|StaticUnitAddr|SelectInterfaceAddr'
+  ./pkg/ddns/... (PASS). Fail-on-revert confirmed: reverting the
+  LinkByName-error branch to `(static,true)` makes
+  TestObserveInterfaceAddrTransientVsDefinitive/LinkByName_error RED.

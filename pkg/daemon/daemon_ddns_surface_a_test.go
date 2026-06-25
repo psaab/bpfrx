@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"net"
 	"net/netip"
 	"testing"
@@ -313,4 +314,111 @@ func TestSelectInterfaceAddrLifetime(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestObserveInterfaceAddrTransientVsDefinitive is the #2840 fail-on-revert gate
+// for the transient-vs-definitive contract of observeInterfaceAddr. The netlink
+// reads are injected via the netlinkLinkByName / netlinkAddrList seams so no
+// real kernel interface is required.
+//
+// The load-bearing distinction:
+//
+//   - A LinkByName ERROR or an AddrList ERROR is a TRANSIENT read failure →
+//     (zero, false): the engine leaves the scope untouched (no publish, no
+//     withdraw). It MUST NOT fall back to the configured static — publishing a
+//     "configured" address that we could not confirm is "active" points DNS at a
+//     possibly-stale address during a transient link outage. This case goes RED
+//     if reverted to returning (static, true) on a link-read error (the #2840
+//     bug).
+//   - An interface that reads SUCCESSFULLY but yields no usable dynamic address
+//     IS the legitimate static-use case → the static fallback applies
+//     (present-but-addressless), and a present-but-addressless interface with NO
+//     usable static is (zero, true) = definitively-none → the engine withdraws.
+//   - A normal dynamic address is returned as-is.
+func TestObserveInterfaceAddrTransientVsDefinitive(t *testing.T) {
+	staticV4 := netip.MustParseAddr("198.51.99.7")
+	dynV4 := netip.MustParseAddr("198.51.99.9")
+	unitWithStatic := &config.InterfaceUnit{Addresses: []string{"198.51.99.7/24"}}
+
+	// Save and restore the netlink seams.
+	origLink := netlinkLinkByName
+	origAddr := netlinkAddrList
+	t.Cleanup(func() {
+		netlinkLinkByName = origLink
+		netlinkAddrList = origAddr
+	})
+
+	// fakeLink is a minimal netlink.Link for the AddrList seam to consume.
+	fakeLink := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "ge-0-0-2"}}
+
+	d := &Daemon{}
+
+	t.Run("LinkByName error is transient (no static publish)", func(t *testing.T) {
+		netlinkLinkByName = func(string) (netlink.Link, error) {
+			return nil, errors.New("link not found")
+		}
+		netlinkAddrList = func(netlink.Link, int) ([]netlink.Addr, error) {
+			t.Fatal("AddrList must not be called after a LinkByName error")
+			return nil, nil
+		}
+		got, ok := d.observeInterfaceAddr("ge-0-0-2", true, unitWithStatic)
+		// FAIL-ON-REVERT: if observeInterfaceAddr is reverted to returning the
+		// static on a LinkByName error, ok becomes true (and got == staticV4)
+		// and this assertion fails.
+		if ok || got.IsValid() {
+			t.Fatalf("LinkByName error: got (%v, %v); want (zero, false) transient (static must NOT be published)", got, ok)
+		}
+	})
+
+	t.Run("AddrList error is transient (no static publish)", func(t *testing.T) {
+		netlinkLinkByName = func(string) (netlink.Link, error) {
+			return fakeLink, nil
+		}
+		netlinkAddrList = func(netlink.Link, int) ([]netlink.Addr, error) {
+			return nil, errors.New("netlink hiccup")
+		}
+		got, ok := d.observeInterfaceAddr("ge-0-0-2", true, unitWithStatic)
+		if ok || got.IsValid() {
+			t.Fatalf("AddrList error: got (%v, %v); want (zero, false) transient (static must NOT be published)", got, ok)
+		}
+	})
+
+	t.Run("present-but-addressless falls back to static", func(t *testing.T) {
+		netlinkLinkByName = func(string) (netlink.Link, error) {
+			return fakeLink, nil
+		}
+		netlinkAddrList = func(netlink.Link, int) ([]netlink.Addr, error) {
+			return nil, nil // successful read, no addresses
+		}
+		got, ok := d.observeInterfaceAddr("ge-0-0-2", true, unitWithStatic)
+		if !ok || got != staticV4 {
+			t.Fatalf("present-but-addressless: got (%v, %v); want (%v, true) static fallback", got, ok, staticV4)
+		}
+	})
+
+	t.Run("present-but-addressless with no static is definitively-none", func(t *testing.T) {
+		netlinkLinkByName = func(string) (netlink.Link, error) {
+			return fakeLink, nil
+		}
+		netlinkAddrList = func(netlink.Link, int) ([]netlink.Addr, error) {
+			return nil, nil
+		}
+		got, ok := d.observeInterfaceAddr("ge-0-0-2", true, &config.InterfaceUnit{})
+		if !ok || got.IsValid() {
+			t.Fatalf("addressless, no static: got (%v, %v); want (zero, true) definitively-none", got, ok)
+		}
+	})
+
+	t.Run("normal dynamic address is returned", func(t *testing.T) {
+		netlinkLinkByName = func(string) (netlink.Link, error) {
+			return fakeLink, nil
+		}
+		netlinkAddrList = func(netlink.Link, int) ([]netlink.Addr, error) {
+			return []netlink.Addr{mkAddr("198.51.99.9/24", 0)}, nil
+		}
+		got, ok := d.observeInterfaceAddr("ge-0-0-2", true, unitWithStatic)
+		if !ok || got != dynV4 {
+			t.Fatalf("dynamic address: got (%v, %v); want (%v, true)", got, ok, dynV4)
+		}
+	})
 }
