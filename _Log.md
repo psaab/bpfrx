@@ -18291,6 +18291,23 @@ top.
   pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2970 — make userspace-dp helper socket-buffer sysctls raise-only.
+  The helper's `run()` (server/lifecycle.rs) unconditionally wrote 16 MiB to
+  the host-global `rmem_default`/`rmem_max` sysctls on every start, clobbering
+  the 64 MiB the Go control plane (`tuneSocketBuffers`,
+  pkg/dataplane/userspace/process.go) had just raised them to (raise-only,
+  desired=67108864). Fix: pure `raise_only_value(current, target)` (returns
+  Some(target) only when current < target) + `raise_sysctl(path, target)`
+  wrapper; loop over all four sysctls (added wmem_* to match Go) with
+  `SOCKBUF_TARGET = 67108864` aligned to the Go constant. Fail-on-revert tests
+  in `sockbuf_raise_only_tests`: `raise_sysctl_preserves_higher_value_on_disk`
+  pre-seeds a temp file with 64 MiB and asserts the helper leaves it (RED if
+  reverted to the unconditional 16 MiB write); `does_not_lower_a_higher_existing_value`
+  + `target_matches_go_control_plane` pin the contract.
+  Gates: CARGO_TARGET_DIR=/tmp/cargo-2970 cargo build --release PASS; cargo
+  test sockbuf PASS.
+- **File(s)**: userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/src/server/README.md, _Log.md
 - **Action**: networkd batch #2987/#2988 caller-reach fix (hostile-review
   MERGE-NEEDS-MINOR). The library fixes did not reach production: the only
   caller (pkg/daemon/daemon_apply.go step 2.5) guarded networkd.Apply with
