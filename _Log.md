@@ -18200,6 +18200,40 @@ top.
   pkg/config/compiler_validate_warn.go,
   pkg/config/compiler_p3_http_providers_test.go, _Log.md
 
+## 2026-06-25 — #2979 dnat_table reverse-NAT leak on session close
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix unbounded leak of dynamic reverse-NAT entries in
+  `dnat_table` / `dnat_table_v6`. `publish_dnat_table_entry` inserts a
+  flags=0 reverse-NAT record on every SNAT'd session install (two worker
+  poll-path call sites), but the session Close/expiry handler
+  (`flush_session_deltas`) never deleted it. The maps are HASH (non-LRU),
+  `max_entries = MAX_SESSIONS`, `BPF_F_NO_PREALLOC` — entries leaked one
+  per closed SNAT session until the map filled and new reverse-NAT
+  publishes failed (#2244 capacity error). Confirmed real against master
+  3975912df: insert present, no matching delete on Close.
+- **Fix**: extracted the publish key into SSOT helpers `dnat_v4_key_bytes`
+  / `dnat_v6_key_bytes`; added `delete_dnat_table_entry` (same key bytes,
+  `bpf_map_delete_elem`, no-op for non-SNAT / absent fd, ENOENT benign);
+  threaded `&DnatTableFds` into `flush_session_deltas` and call the delete
+  in the Close block next to the session_map / conntrack cleanup. Only the
+  forward key publishes a reverse-NAT entry (Close delta is gated on
+  `!is_reverse`), so the delete is NOT repeated for the reverse key.
+- **Fail-on-revert**:
+  `close_delta_deletes_dnat_table_entry_for_snat_flow` (session_glue tests)
+  observes a test-only `DNAT_DELETE_ATTEMPTS` counter — a Close delta for an
+  SNAT flow MUST attempt the keyed delete (RED if the close-delete is
+  removed), a non-SNAT Close MUST NOT. Plus key-SSOT byte-equality tests
+  (`dnat_v4_key_bytes_matches_publish_encoding`,
+  `dnat_v6_key_bytes_matches_entry_bytes_key_half`) and the no-op contract
+  (`delete_dnat_table_entry_noops_without_snat_or_fd`) in afxdp/tests.rs.
+  Real BPF maps can't be created under `cargo test`
+  (`kernel.unprivileged_bpf_disabled`), hence the counter seam.
+- **File(s)**: userspace-dp/src/afxdp/checksum.rs,
+  userspace-dp/src/afxdp/session_delta.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/tests.rs, userspace-dp/README.md, _Log.md
 - **Timestamp**: 2026-06-25
 - **Action**: networkd batch fix #2986/#2987/#2988 — (a) gate static
   Address= lines per-family on DHCPv4/DHCPv6 separately so DHCPv4+static-IPv6
