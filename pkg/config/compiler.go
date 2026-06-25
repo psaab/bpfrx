@@ -559,6 +559,25 @@ type compileOpts struct {
 	// loaded test HOLDS state rather than actuating off a dead measurement).
 	// Same doctrine as lenientRPMHTTPGetScheme.
 	lenientRPMRoutingInstance bool
+	// lenientBGPNeighborPeerAS (#2963) downgrades the BGP neighbor peer-as
+	// gate (validateBGPNeighborPeerASStrict) from a hard compile error to a
+	// cfg.Warnings entry. A BGP neighbor whose effective peer-as (remote-as)
+	// is missing/0 (or out of [1, 4294967295]) was previously unvalidated:
+	// peer-as is optional in the parser/compiler, so a neighbor authored
+	// without one keeps the zero value and the FRR renderer (policy_render.go)
+	// emitted `neighbor <addr> remote-as 0`. AS 0 is reserved (RFC 7607) and
+	// FRR/vtysh rejects it, failing the whole frr-reload (a single vtysh -f
+	// add-batch exits non-zero on any CMD_WARNING_CONFIG_FAILED) and leaving
+	// dynamic routing in a broken/stale state — a commit-accepted config the
+	// routing daemon cannot load. The strict commit / commit-check path
+	// hard-rejects so the missing peer-as is operator-visible, naming the
+	// neighbor; the tolerant load / peer-sync paths warn so an
+	// already-persisted or peer-synced config carrying such a neighbor still
+	// BOOTS (#1960 fail-closed-on-load class) — the render path now skips a
+	// remote-as-0 neighbor (defense-in-depth), so AS 0 never reaches frr.conf
+	// and a leniently-loaded bad neighbor is inert. Same doctrine as
+	// lenientRoutingExportRef.
+	lenientBGPNeighborPeerAS bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -614,6 +633,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRPMLinkLocalZone:            true,
 		lenientRPMHTTPGetScheme:            true,
 		lenientRPMRoutingInstance:          true,
+		lenientBGPNeighborPeerAS:           true,
 	})
 }
 
@@ -720,6 +740,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRPMLinkLocalZone:            true,
 		lenientRPMHTTPGetScheme:            true,
 		lenientRPMRoutingInstance:          true,
+		lenientBGPNeighborPeerAS:           true,
 	})
 }
 
@@ -1355,6 +1376,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientRoutingExportRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("routing export reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2963: BGP neighbor peer-as gate. peer-as (remote-as) is optional in
+	// the parser/compiler, so a neighbor authored without one keeps a zero
+	// PeerAS and the FRR renderer emitted `neighbor <addr> remote-as 0`. AS 0
+	// is reserved (RFC 7607); FRR/vtysh rejects it, failing the whole
+	// frr-reload and leaving dynamic routing broken — a commit-accepted config
+	// the routing daemon cannot load. Strict on commit / commit-check (hard
+	// reject naming the neighbor); lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960; the render
+	// path now skips a remote-as-0 neighbor so AS 0 never reaches frr.conf).
+	// Runs on the fully-compiled *Config (group peer-as already inherited).
+	// Mirrors validateRoutingExportReferencesStrict.
+	if err := validateBGPNeighborPeerASStrict(cfg); err != nil {
+		if opts.lenientBGPNeighborPeerAS {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("BGP neighbor peer-as (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

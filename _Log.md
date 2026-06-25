@@ -17843,3 +17843,30 @@ top.
   go test ./pkg/api/... all PASS.
 - **File(s)**: pkg/api/nat.go, pkg/api/nat_stats_test.go,
   pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2963 — reject at COMMIT-TIME a BGP neighbor whose peer-as
+  (remote-as) is missing/0. peer-as is optional in the parser/compiler, so
+  a neighbor authored without one (and without an inherited group peer-as)
+  kept a zero BGPNeighbor.PeerAS and the FRR renderer emitted
+  `neighbor <addr> remote-as 0`. AS 0 is reserved (RFC 7607); FRR/vtysh
+  rejects it, failing the whole frr-reload — a commit-accepted config the
+  routing daemon cannot load. Added validateBGPNeighborPeerASStrict
+  (pkg/config/compiler_validate_strict.go) hard-rejecting PeerAS==0 at
+  commit/commit-check (global + per-routing-instance scopes, naming the
+  group + neighbor) wired into compileConfigWithOpts with a new
+  lenientBGPNeighborPeerAS option (warn-and-boot on load/HA-sync per #1960).
+  Defense-in-depth: generateProtocols (pkg/frr/policy_render.go) now SKIPS a
+  neighbor with PeerAS==0 so AS 0 never reaches frr.conf on the lenient
+  path. Did NOT touch local-AS / router bgp handling (the rejected false
+  half of agy-review-056 056-05 — guarded by LocalAS>0). FAIL-ON-REVERT:
+  config gate test RED without the strict check (compiles + would render
+  remote-as 0); frr render-guard test RED without the skip (emits
+  remote-as 0). Gates: go build ./..., gofmt -l clean (my files),
+  go vet ./pkg/config/... ./pkg/frr/..., go test ./pkg/config/...
+  ./pkg/frr/... all PASS.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/bgp_neighbor_peeras_2963_test.go,
+  pkg/frr/policy_render.go, pkg/frr/bgp_remote_as_2963_test.go,
+  pkg/frr/README.md, _Log.md
