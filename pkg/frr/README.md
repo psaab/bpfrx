@@ -208,6 +208,31 @@ move or rename the markers — they're literal strings.
   advertisement and defeating the operator's filter (the #2473 leak, inbound
   side). The referenced route-map is the same block `generatePolicyOptions`
   already emits for the policy-statement.
+- **Auth secrets with whitespace are rejected at commit, not quoted
+  (#2889).** A BGP neighbor TCP-MD5 password (`neighbor <addr> password
+  <secret>`) and an OSPF/RIP/IS-IS authentication key
+  (`ip ospf message-digest-key`/`authentication-key`,
+  `ip rip authentication string`, `area-password`/`domain-password`,
+  `isis password`) all render the secret directly into a frr.conf line via
+  `sanitizeFRRValue`. FRR's command lexer (`lib/command_lex.l`) tokenizes a
+  vtysh/frr.conf line purely on whitespace and has **no quoted-string rule
+  and no rest-of-line (`LINE`) token** — a double-quoted value is NOT
+  grouped, the quotes are taken literally. So a secret containing a space or
+  tab is split into multiple arguments at config load: the secret is
+  truncated at the first space, or the trailing words become spurious vtysh
+  arguments (malformed-line / injection risk). Quoting cannot fix this, so
+  the contract is to **reject** such a value at commit — `validateFRRAuthValuesStrict`
+  (`pkg/config/compiler_validate_strict.go`) hard-fails commit / commit-check
+  naming the field (strict), and downgrades to a `cfg.Warnings` entry on the
+  lenient load / HA-sync path (`opts.lenientFRRAuthValues`, #1960
+  fail-closed-on-load class). The render-side `sanitizeFRRValue` belt still
+  collapses any embedded control chars to spaces so a leniently-loaded bad
+  value stays single-line/inert. Only whitespace + the C0/DEL control set is
+  rejected; other punctuation (`.`/`@`/`!`/`#`) is matched by the lexer's
+  single-char catch-all rule and is safe. **Free-form `neighbor description`
+  is NOT covered by this gate** (it is cosmetic, not a security secret, and
+  historically multi-word); it remains control-char-sanitized only — a
+  follow-up if FRR's `description` token ever needs the same treatment.
 - **Group address-family flags are gated by neighbor address version
   (#2454).** When `compiler_protocols.go` copies a BGP group's `family inet`
   / `family inet6` flags down to each neighbor, it parses the neighbor's

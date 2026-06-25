@@ -17222,6 +17222,26 @@ top.
   TestObserveInterfaceAddrTransientVsDefinitive/LinkByName_error RED.
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2889 — reject FRR auth secrets containing whitespace at
+  commit. A BGP neighbor password / OSPF-RIP-ISIS auth key with a space
+  (or tab / control char) cannot be expressed as a single FRR/vtysh token
+  (FRR's command lexer, lib/command_lex.l, splits on whitespace and has
+  NO quoted-string and NO rest-of-line token — quoting is impossible), so
+  it would be truncated at the first space or inject trailing words as
+  extra vtysh args at frr.conf load. Researched FRR's lexer to confirm
+  quoting is unsupported, then added validateFRRAuthValuesStrict (strict
+  on commit/commit-check naming the field; lenient warn on load/HA-sync
+  per #1960). Scoped to the security-relevant password/key clauses;
+  neighbor description left control-char-sanitized only (noted as
+  follow-up).
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/parser_routing_test.go, pkg/frr/README.md
+- **Validation**: go build ./... ; gofmt -l (clean) ; go vet
+  ./pkg/frr/... ./pkg/config/... (clean) ; go test ./pkg/frr/...
+  ./pkg/config/... (PASS). Fail-on-revert confirmed:
+  TestFRRAuthValueWhitespaceRejected goes RED (space-containing secrets
+  compile cleanly) when validateFRRAuthValuesStrict's call site is removed.
   **Action**: #2888 DHCP relay server-facing socket binds giaddr:67 (BOOTPS)
   instead of giaddr:0 (ephemeral). RFC 2131 §4.1: a strict server unicasts its
   reply to the relay at giaddr:67, so an ephemeral-port server conn never
