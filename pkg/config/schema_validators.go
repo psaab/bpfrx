@@ -437,6 +437,103 @@ func ValidateRouteFilterArg(raw string, _ *Config) error {
 	return nil
 }
 
+// ValidateRouteDestination accepts a static-route destination prefix: a
+// family-agnostic CIDR (v4 or v6) with an explicit /prefix-length. Used for
+// the `routing-options static route <destination>` identity arg (#2448):
+// the destination feeds net.ParseCIDR in the FRR renderer
+// (pkg/frr/config_render.go generateStaticRoute) and net/ipnet parse in the
+// Rust FIB builder (userspace-dp forwarding_build/fib.rs populate_routes).
+// A destination that parses as neither IPv4 nor IPv6 is SILENTLY dropped by
+// both consumers today — the route commits cleanly but never installs. The
+// default routes 0.0.0.0/0 and ::/0 parse via net.ParseCIDR and are
+// accepted; a bare IP without a length, or outright garbage, is rejected
+// with a targeted message. route is family-agnostic so both families pass.
+func ValidateRouteDestination(raw string, _ *Config) error {
+	// parseCIDRStrict requires a /prefix-length and upgrades the two common
+	// operator mistakes (bare IP, garbage) to targeted messages. The returned
+	// IP is discarded because both v4 and v6 destinations are valid here.
+	if _, err := parseCIDRStrict(raw, "10.0.0.0/24"); err != nil {
+		return fmt.Errorf("not a valid route destination (expected a CIDR, e.g. 10.0.0.0/24 or 2001:db8::/32): %v", err)
+	}
+	return nil
+}
+
+// ValidateStaticNextHop accepts a static-route next-hop VALUE: a bare IPv4
+// or IPv6 address, the Rust-FIB `ip@interface` / `@interface` spec, or a
+// bare interface name. It rejects values that are genuinely malformed —
+// neither a usable IP nor a plausible interface name — so an operator typo
+// fails loud at commit instead of installing a blackhole (#2448).
+//
+// Why each accepted form is real:
+//   - a bare IP (192.168.1.1, 2001:db8::1) is the common gateway form; the
+//     FRR renderer emits it verbatim (config_render.go) and the Rust FIB
+//     parses it (parse_route_next_hop[_v6]).
+//   - `ip@iface` / `@iface` is the Rust FIB interface-scoped form
+//     (forwarding_build/fib.rs split_once('@')); the IP part, when present,
+//     must itself parse, else the spec silently degrades to interface-only.
+//   - a bare interface name (ge-0-0-0.0, reth0.50, eth1) is a valid Junos
+//     next-hop and renders as an interface route in FRR (config_render.go
+//     `case ifName != ""`).
+//
+// The malformed cases rejected: a botched IP literal (1.2.3.999,
+// 2001:db8::garbage), an `ip@iface` whose IP part does not parse
+// (notanip@eth0 — silently becomes interface-only), and any value that is
+// neither a valid IP nor a syntactically plausible interface name. The
+// interface-name test requires at least one ASCII letter so a numeric-only
+// dotted value (a botched IPv4) cannot masquerade as an interface, and uses
+// the [A-Za-z0-9._-] charset interface names actually use — which excludes
+// ':' so a botched IPv6 literal is rejected rather than mistaken for a name.
+func ValidateStaticNextHop(raw string, _ *Config) error {
+	tok := strings.TrimSpace(raw)
+	if tok == "" {
+		return fmt.Errorf("missing next-hop (expected an IP address, e.g. 192.168.1.1 or 2001:db8::1, or an interface name)")
+	}
+	// Rust-FIB ip@interface / @interface spec.
+	if ipPart, ifPart, hasAt := strings.Cut(tok, "@"); hasAt {
+		if ifPart == "" {
+			return fmt.Errorf("malformed next-hop %q: missing interface name after '@'", raw)
+		}
+		if ipPart != "" && net.ParseIP(ipPart) == nil {
+			return fmt.Errorf("malformed next-hop %q: %q is not a valid IP address before '@interface'", raw, ipPart)
+		}
+		if !plausibleInterfaceName(ifPart) {
+			return fmt.Errorf("malformed next-hop %q: %q is not a valid interface name after '@'", raw, ifPart)
+		}
+		return nil
+	}
+	if net.ParseIP(tok) != nil {
+		return nil
+	}
+	if plausibleInterfaceName(tok) {
+		return nil
+	}
+	return fmt.Errorf("not a valid next-hop (got %q; expected an IP address, ip@interface, or an interface name)", raw)
+}
+
+// plausibleInterfaceName reports whether s is syntactically usable as a
+// next-hop interface name: the [A-Za-z0-9._-] charset that xpf/vSRX and
+// kernel interface names use, with at least one ASCII letter so a
+// numeric-only dotted token (a botched IPv4 like 1.2.3.999) cannot pass as
+// an interface name. ':' is excluded so a malformed IPv6 literal is not
+// mistaken for an interface name.
+func plausibleInterfaceName(s string) bool {
+	if s == "" {
+		return false
+	}
+	hasLetter := false
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
+			hasLetter = true
+		case r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+			// allowed non-letter
+		default:
+			return false
+		}
+	}
+	return hasLetter
+}
+
 // validateForwardingClassRef is the #1319 PR 3 tree-based
 // cross-reference validator for `firewall family inet/inet6 filter
 // <f> term <t> then forwarding-class <name>`. The dataplane resolves

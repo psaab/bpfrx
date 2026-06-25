@@ -43,13 +43,52 @@ func samplingFlowServerNode() *schemaNode {
 	}
 }
 
+// staticRouteNode builds the typed `route <destination>` node for a static
+// routes block (#2448). It is a fresh node per call so each static block
+// (routing-options, per-rib, and the routing-instances mirrors) owns an
+// independent subtree. The destination identity arg is validated as a
+// family-agnostic CIDR (ValidateRouteDestination); the next-hop child value
+// is validated as an IP / ip@interface / interface-name
+// (ValidateStaticNextHop). Both were accepted untyped before #2448, so a
+// malformed destination or next-hop committed cleanly and then silently
+// failed to install in the FRR renderer and the Rust FIB builder. The
+// remaining children (qualified-next-hop, discard, reject, next-table,
+// preference) are declared so completion does not drop them and so the
+// next-hop sibling is recognized as a known child rather than an extra
+// identity token.
+func staticRouteNode() *schemaNode {
+	return &schemaNode{
+		desc: "Static route", args: 1, placeholder: "<destination>",
+		keyValueType: ValueCIDR, keyValueDesc: "Route destination prefix (CIDR, e.g. 10.0.0.0/24 or ::/0)",
+		keyValueExamples: []string{"0.0.0.0/0", "10.0.0.0/24", "::/0"},
+		keyValidator:     ValidateRouteDestination,
+		children: map[string]*schemaNode{
+			"next-hop": {desc: "Next-hop gateway (IP, ip@interface, or interface name)", args: 1, placeholder: "<gateway>",
+				valueType: ValueIPAddress, valueDesc: "next-hop IP address, ip@interface, or interface name",
+				valueExamples: []string{"192.168.1.1", "2001:db8::1"}, validator: ValidateStaticNextHop,
+				children: map[string]*schemaNode{
+					"interface": {desc: "Egress interface for this next-hop", args: 1, placeholder: "<interface-name>", children: nil},
+				}},
+			"qualified-next-hop": {desc: "Qualified next-hop", args: 1, placeholder: "<gateway>", children: map[string]*schemaNode{
+				"interface":  {desc: "Egress interface", args: 1, placeholder: "<interface-name>", children: nil},
+				"preference": {desc: "Preference", args: 1, placeholder: "<value>", children: nil},
+				"metric":     {desc: "Metric", args: 1, placeholder: "<value>", children: nil},
+			}},
+			"discard":    {desc: "Discard (blackhole) route", children: nil},
+			"reject":     {desc: "Reject route (send ICMP unreachable)", children: nil},
+			"next-table": {desc: "Resolve in another routing table", args: 1, placeholder: "<table>", children: nil},
+			"preference": {desc: "Route preference (administrative distance)", args: 1, placeholder: "<value>", children: nil},
+		},
+	}
+}
+
 var schemaRoutingOptions = &schemaNode{desc: "Routing options", children: map[string]*schemaNode{
 	"static": {desc: "Static routes", children: map[string]*schemaNode{
-		"route": {desc: "Static route", args: 1, placeholder: "<destination>", children: nil},
+		"route": staticRouteNode(),
 	}},
 	"rib": {desc: "Routing information base", args: 1, placeholder: "<rib-name>", children: map[string]*schemaNode{
 		"static": {desc: "Static routes", children: map[string]*schemaNode{
-			"route": {desc: "Static route", args: 1, placeholder: "<destination>", children: nil},
+			"route": staticRouteNode(),
 		}},
 	}},
 	"autonomous-system": {desc: "Autonomous system number", args: 1, placeholder: "<as-number>", children: nil},
@@ -479,11 +518,11 @@ var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration",
 	// e.g. "instance-type virtual-router;" and "interface enp7s0;"
 	"routing-options": {desc: "Routing options", children: map[string]*schemaNode{
 		"static": {desc: "Static routes", children: map[string]*schemaNode{
-			"route": {desc: "Static route", args: 1, placeholder: "<destination>", children: nil},
+			"route": staticRouteNode(),
 		}},
 		"rib": {desc: "Routing information base", args: 1, placeholder: "<rib-name>", children: map[string]*schemaNode{
 			"static": {desc: "Static routes", children: map[string]*schemaNode{
-				"route": {desc: "Static route", args: 1, placeholder: "<destination>", children: nil},
+				"route": staticRouteNode(),
 			}},
 		}},
 		"interface-routes": {desc: "Interface routes", children: map[string]*schemaNode{
