@@ -1,3 +1,45 @@
+## 2026-06-25 — #2744: control-socket request cap raised 16→64 MiB (feed-dimension) + Go pre-flight
+
+- **Timestamp**: 2026-06-25
+- **Action**: The userspace-dp control socket capped a single request at
+  16 MiB (#2523). The dominant scaling dimension is dynamic-feed-backed
+  address books (`AddressBookSnapshot.prefixes_v4/v6` carry feed prefixes
+  inline as CIDR text, bounded only by a per-line scanner cap, not a
+  total-entry cap), so a legitimate feed-heavy `apply_snapshot` (~500K IPv6
+  CIDRs ≈ 20+ MiB) was rejected at the control socket — fail-closed, but it
+  silently dropped a committed config with no operator-facing diagnostic.
+  Raised the cap to 64 MiB on BOTH sides in lockstep
+  (`MAX_CONTROL_REQUEST_BYTES` in `userspace-dp/src/protocol/control.rs`;
+  new `MaxControlRequestBytes` const in
+  `pkg/dataplane/userspace/process.go`). 64 MiB / ~45 B per IPv6 CIDR ≈
+  1.4M prefixes, well above realistic large feeds, still a hard
+  read-allocation DoS guard. Added a Go pre-flight in
+  `requestDetailedLocked`: serialize the request once, reject an oversize
+  body HERE with an actionable config error (names the feed-size cause)
+  instead of a silent helper EOF after commit; reuse the serialized body
+  for the socket write (single trailing newline matches the Rust framing).
+- **Fail-on-revert proof**:
+  - Go: reverted const 64→16 MiB via copy-restore →
+    `TestControlRequestCapRaisedAbove16MiB` + `...LockstepWithRust` go RED
+    ("cap must be raised above the old 16 MiB ceiling, got 16777216");
+    restored → green.
+  - Rust: reverted const 64→16 MiB via copy-restore →
+    `legitimate_feed_above_old_16mib_cap_is_now_accepted` goes RED
+    (panic "cap must be raised above the old 16 MiB ceiling (got
+    16777216)"); restored → green. `request_above_new_cap_is_still_rejected`
+    + `oversize_request_is_rejected_before_decode` keep the DoS guard.
+- **Gates**: `go build ./...` OK; `gofmt -l` clean; `go vet`
+  ./pkg/dataplane/userspace/... ./pkg/feeds/... clean;
+  `go test ./pkg/dataplane/userspace/... ./pkg/feeds/...` PASS;
+  `cargo build --release -p xpf-userspace-dp` OK; `cargo test` cap tests
+  (4) PASS.
+- **File(s)**: `userspace-dp/src/protocol/control.rs` (cap + lockstep doc),
+  `userspace-dp/src/server/tests.rs` (2 new fail-on-revert tests),
+  `pkg/dataplane/userspace/process.go` (`MaxControlRequestBytes` +
+  pre-flight), `pkg/dataplane/userspace/control_request_cap_2744_test.go`
+  (new, 3 tests incl. lockstep pin),
+  `docs/userspace-dataplane-architecture.md` (control-socket cap section),
+  `pkg/feeds/README.md` (feed-size vs. cap gotcha), `_Log.md`.
 ## 2026-06-25 — #2775: ddns/surface-a netlink selection honors IPv6 address lifetime
 
 - **Timestamp**: 2026-06-25
