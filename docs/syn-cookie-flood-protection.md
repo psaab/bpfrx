@@ -130,7 +130,24 @@ accepts a valid cookie ACK even when it has not locally observed the flood
 threshold; ACKs outside the transmitted-epoch window are prefiltered before
 SipHash, and plausible standby ACKs are rate-limited per zone per second.
 Invalid ACKs outside a local active flood window remain ordinary session-miss
-traffic instead of being counted as cookie failures. If that secret material is
+traffic instead of being counted as cookie failures.
+
+The validated-client cache is keyed by `(zone_id, profile_generation, 4-tuple)`
+(#2446). Each zone carries a SYN-cookie profile generation that is bumped
+whenever a SYN-cookie-relevant profile field changes — the `syn-cookie`
+enable/disable toggle or the `syn-flood` threshold, plus the zone gaining or
+losing a profile (how a zone→profile rebinding manifests). The current
+generation is stamped into an entry on insert and compared on consume: an entry
+from an older generation is treated as a cache miss and the connection is
+re-validated under the new profile, so the new profile's SYN-flood counter sees
+it. This closes the window where a master-key-stable profile edit let a tuple
+validated under the old profile bypass the new profile's flood gate until the
+cache TTL expired. The master-key-rotation clear (`set_hash_keys`) remains as
+defense in depth, and unrelated profile edits (e.g. stateless screens,
+scan/sweep thresholds) do NOT bump the generation, so they cause no
+re-validation churn.
+
+If that secret material is
 absent, userspace
 omits the key and fails closed instead of minting predictable cookies; config
 validation also warns and userspace capability admission refuses active

@@ -2106,21 +2106,21 @@ fn syn_cookie_validated_cache_is_bounded() {
     let mut tuple = syn_cookie_tuple();
     for port in 40000..40032 {
         tuple.src_port = port;
-        cache.insert(7, tuple, 100);
+        cache.insert(7, 0, tuple, 100);
     }
 
     assert_eq!(cache.len(), 4);
     let mut evicted = syn_cookie_tuple();
     evicted.src_port = 40000;
-    assert!(!cache.take_valid(7, evicted, 100));
+    assert!(!cache.take_valid(7, 0, evicted, 100));
     evicted.src_port = 40027;
-    assert!(!cache.take_valid(7, evicted, 100));
+    assert!(!cache.take_valid(7, 0, evicted, 100));
 
     let mut retained = syn_cookie_tuple();
     retained.src_port = 40028;
-    assert!(cache.take_valid(7, retained, 100));
+    assert!(cache.take_valid(7, 0, retained, 100));
     retained.src_port = 40031;
-    assert!(cache.take_valid(7, retained, 100));
+    assert!(cache.take_valid(7, 0, retained, 100));
 }
 
 #[test]
@@ -2133,7 +2133,7 @@ fn syn_cookie_validated_cache_index_is_keyed() {
     let mut tuple = syn_cookie_tuple();
     let differs = (0..1024).any(|offset| {
         tuple.src_port = 30000 + offset;
-        left.debug_set_index(7, tuple) != right.debug_set_index(7, tuple)
+        left.debug_set_index(7, 0, tuple) != right.debug_set_index(7, 0, tuple)
     });
 
     assert!(
@@ -2217,6 +2217,193 @@ fn syn_cookie_master_key_rotation_clears_validated_cache() {
     assert_eq!(state.syn_cookie_validated_len(), 0);
 }
 
+// #2446: helper — drive a zone through a SYN-flood crossing into cookie
+// mode, then validate a returning ACK so a validated-cache entry is
+// installed for `tuple`. Returns the validated SYN-cookie 4-tuple.
+fn install_validated_syn_cookie_entry(state: &mut ScreenState, zone: &str, zone_id: u16) {
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    // First SYN passes (counter at threshold-1), second crosses the
+    // threshold and mints a challenge.
+    assert_eq!(
+        state.check_packet_with_zone_id(zone, zone_id, &syn, 128),
+        ScreenVerdict::Pass
+    );
+    let challenge = match state.check_packet_with_zone_id(zone, zone_id, &syn, 128) {
+        ScreenVerdict::SynCookieChallenge(challenge) => challenge,
+        other => panic!("expected SYN-cookie challenge, got {other:?}"),
+    };
+    let mut ack = syn.clone();
+    ack.tcp_flags = TCP_ACK;
+    ack.tcp_ack = challenge.cookie_isn.wrapping_add(1);
+    assert_eq!(
+        state.validate_syn_cookie_ack_on_session_miss(zone, zone_id, &ack, 128),
+        SynCookieAckVerdict::Validated
+    );
+    assert_eq!(state.syn_cookie_validated_len(), 1);
+}
+
+// #2446 fail-on-revert: a tuple validated under one SYN-cookie profile
+// generation must NOT be consumable as a hit after the zone's
+// SYN-cookie-relevant profile changes (same master key). Without the
+// per-zone profile generation in the cache key (or without the gen bump
+// in `update_profiles`) the validated entry is consumed as a hit and
+// bypasses the NEW profile's SYN-flood counter — RED.
+#[test]
+fn syn_cookie_validated_cache_invalidated_on_profile_change() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+    let mut state = make_state("trust", profile);
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+
+    install_validated_syn_cookie_entry(&mut state, "trust", 7);
+
+    // Change a SYN-cookie-relevant field (the SYN-flood threshold) while
+    // the master key stays stable. This bumps the zone's profile
+    // generation, so the cached validation is from an older generation.
+    let mut changed = ScreenProfile::default();
+    changed.syn_flood_threshold = 5; // was 1
+    changed.syn_cookie = true;
+    let mut profiles = FxHashMap::default();
+    profiles.insert("trust".to_string(), changed);
+    state.update_profiles(profiles);
+
+    // The same SYN that produced the validated ACK now arrives. Under the
+    // bug it would be a validated-cache HIT (SynCookieBypass) and skip the
+    // new profile's SYN-flood counter. With the fix it is a MISS, so the
+    // packet is counted as a normal SYN under the new threshold (Pass at
+    // count 1, below the new threshold of 5).
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    // Within the entry's TTL (insert at 128, 64s TTL → expires 192) so the
+    // only reason this is a MISS is the bumped generation, not expiry.
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 7, &syn, 150),
+        ScreenVerdict::Pass,
+        "validated entry from the old profile generation must NOT bypass \
+         the new profile's SYN-flood counter"
+    );
+}
+
+// #2446: disable then re-enable SYN-cookie on a zone (master key stable)
+// invalidates a validation that occurred before the toggle.
+#[test]
+fn syn_cookie_validated_cache_invalidated_on_disable_reenable() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+    let mut state = make_state("trust", profile.clone());
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+
+    install_validated_syn_cookie_entry(&mut state, "trust", 7);
+
+    // Disable syn_cookie (gen bump), then re-enable it (gen bump again):
+    // two SYN-cookie-relevant changes, so the pre-toggle validation is
+    // stale.
+    let mut disabled = profile.clone();
+    disabled.syn_cookie = false;
+    let mut profiles = FxHashMap::default();
+    profiles.insert("trust".to_string(), disabled);
+    state.update_profiles(profiles);
+
+    let mut profiles = FxHashMap::default();
+    profiles.insert("trust".to_string(), profile);
+    state.update_profiles(profiles);
+
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    // Within the entry's TTL (insert at 128, 64s TTL → expires 192) so the
+    // only reason this is not a HIT is the stale generation. A stale HIT
+    // would return SynCookieBypass and skip the SYN-flood counter; with the
+    // fix it is a MISS, counted as the first SYN under threshold 1 → Pass.
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 7, &syn, 150),
+        ScreenVerdict::Pass,
+        "re-enabled cookie mode must NOT honour a stale pre-disable \
+         validation (a stale HIT would return SynCookieBypass)"
+    );
+}
+
+// #2446 no-regression: within the SAME profile generation a validated
+// tuple is still a hit (the cache works normally). An UNRELATED profile
+// edit (a stateless screen toggle) does NOT bump the generation, so the
+// validation survives.
+#[test]
+fn syn_cookie_validated_cache_hit_within_same_generation() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+    let mut state = make_state("trust", profile.clone());
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+
+    install_validated_syn_cookie_entry(&mut state, "trust", 7);
+
+    // An unrelated profile change (enable the teardrop screen) leaves the
+    // SYN-cookie signature unchanged, so the generation is stable and the
+    // validation remains consumable.
+    let mut unrelated = profile;
+    unrelated.teardrop = true;
+    let mut profiles = FxHashMap::default();
+    profiles.insert("trust".to_string(), unrelated);
+    state.update_profiles(profiles);
+
+    // The matching SYN is a validated-cache HIT → SynCookieBypass (it does
+    // NOT count toward the SYN-flood threshold), proving the cache still
+    // works normally within a generation.
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    // Within the entry's TTL (insert at 128, 64s TTL → expires 192).
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 7, &syn, 150),
+        ScreenVerdict::SynCookieBypass,
+        "an unrelated profile edit must not invalidate a validated entry"
+    );
+    // Consumed exactly once.
+    assert_eq!(state.syn_cookie_validated_len(), 0);
+}
+
+// #2446 unit-level: the cache treats two generations as distinct keys —
+// an entry inserted under gen N is a miss when consumed under gen N+1,
+// and a hit when consumed under gen N.
+#[test]
+fn syn_cookie_validated_cache_generation_is_keyed() {
+    let mut cache = SynCookieValidatedCache::new(64, 64);
+    let tuple = syn_cookie_tuple();
+
+    cache.insert(7, 1, tuple, 100);
+    assert!(
+        !cache.take_valid(7, 2, tuple, 100),
+        "an entry from a stale generation must be a miss under the new gen"
+    );
+
+    cache.insert(7, 1, tuple, 100);
+    assert!(
+        cache.take_valid(7, 1, tuple, 100),
+        "an entry consumed under its own generation must still be a hit"
+    );
+}
+
 #[test]
 fn update_profiles_prepopulates_syn_cookie_active_state() {
     let mut profile = ScreenProfile::default();
@@ -2241,11 +2428,11 @@ fn syn_cookie_validated_cache_refresh_extends_ttl() {
     let tuple_refreshed = syn_cookie_tuple();
     let mut tuple_old = syn_cookie_tuple();
     tuple_old.src_port += 1;
-    cache.insert(7, tuple_refreshed, 100);
-    cache.insert(7, tuple_old, 100);
-    cache.insert(7, tuple_refreshed, 109);
-    assert!(!cache.take_valid(7, tuple_old, 110));
-    assert!(cache.take_valid(7, tuple_refreshed, 110));
+    cache.insert(7, 0, tuple_refreshed, 100);
+    cache.insert(7, 0, tuple_old, 100);
+    cache.insert(7, 0, tuple_refreshed, 109);
+    assert!(!cache.take_valid(7, 0, tuple_old, 110));
+    assert!(cache.take_valid(7, 0, tuple_refreshed, 110));
 }
 
 #[test]
@@ -2253,15 +2440,15 @@ fn syn_cookie_validated_cache_expires_on_ttl_boundary() {
     let mut cache = SynCookieValidatedCache::new(4, SynCookieCodec::EPOCH_SECS);
     let tuple = syn_cookie_tuple();
 
-    cache.insert(7, tuple, 128);
+    cache.insert(7, 0, tuple, 128);
     assert!(
-        cache.take_valid(7, tuple, 191),
+        cache.take_valid(7, 0, tuple, 191),
         "entry should remain valid until just before the 64s TTL boundary"
     );
 
-    cache.insert(7, tuple, 128);
+    cache.insert(7, 0, tuple, 128);
     assert!(
-        !cache.take_valid(7, tuple, 192),
+        !cache.take_valid(7, 0, tuple, 192),
         "entry expires at insertion time + one cookie epoch"
     );
 }

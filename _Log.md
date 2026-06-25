@@ -1,3 +1,30 @@
+## 2026-06-24 — #2446: SYN-cookie validated-ACK cache survives zone profile changes
+
+- **Timestamp**: 2026-06-24
+- **Action**: Added a per-zone SYN-cookie profile generation to the
+  validated-ACK cache key. The cache was keyed by `(zone_id, 4-tuple)`
+  and cleared only on a master-key change, so a SYN-cookie-relevant
+  profile edit (disable/re-enable, syn-flood-threshold change,
+  zone→profile rebind) with a stable master key let a tuple validated
+  under the old profile bypass the new profile's SYN-flood counter until
+  TTL expiry. Fix: `SynCookieValidatedKey` now carries `profile_gen`;
+  `ScreenState.update_profiles` bumps a per-zone generation whenever the
+  SYN-cookie signature `(syn_cookie, syn_flood_threshold)` changes (or
+  the zone gains/loses a profile); insert stamps the current generation
+  and `take_valid` compares it (stale gen = miss → re-validate under the
+  new profile). Master-key clear retained as defense in depth. Unrelated
+  profile edits do not bump the generation (no re-validation churn).
+- **File(s)**: userspace-dp/src/screen/syncookie.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  docs/syn-cookie-flood-protection.md
+- **Validation**: `cargo build --release` clean (no new screen/
+  warnings); `cargo test --release --bin xpf-userspace-dp screen::`
+  123/0. New tests: invalidated_on_profile_change,
+  invalidated_on_disable_reenable, hit_within_same_generation (no
+  regression), generation_is_keyed (unit). Fail-on-revert proven —
+  disabling the gen bump turns the two invalidation tests RED
+  (SynCookieBypass instead of Pass).
+
 ## 2026-06-24 — #2702: BGP group/neighbor export/import bracket-list truncation
 
 - **Timestamp**: 2026-06-24
