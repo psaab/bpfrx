@@ -228,8 +228,15 @@ authorization surface: every request is dropped because no community matches.
   varbind fits. This prevents emitting an oversized UDP datagram that the peer
   or the network would fragment or drop. See `effectiveMaxSize` / `trimToFit`
   in `agent.go`.
-- Traps fire immediately on link-state change — they aren't queued, so
-  back-to-back link flaps produce back-to-back traps.
+- **The v2c trap community is selected deterministically (#2989).**
+  `selectTrapCommunity` picks the lexicographically-first configured
+  community (falling back to `public` when none is configured). The old
+  code ranged the `Communities` map and broke on the first entry, which —
+  because Go map iteration is randomized — picked a different community per
+  run when more than one was configured, so a collector accepting only one
+  community saw flaky traps and a less-privileged community could leak
+  through the wrong credential boundary. Trap groups are likewise iterated
+  in sorted order so dispatch and log output are reproducible.
 - Don't add a third BER library to this package. The hand-coded encoder
   is intentional; keeping the surface small avoids bringing in an SNMP
   framework with its own poll loop and threading model.

@@ -5,7 +5,10 @@ import (
 	"log/slog"
 	"math/rand"
 	"net"
+	"sort"
 	"time"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // SNMPv2-Trap PDU type (context-specific, constructed, tag 7).
@@ -139,12 +142,7 @@ func (a *Agent) sendLinkTraps(linkUp bool, ifindex int, ifname string) {
 		return
 	}
 
-	// Use the first community string for v2c traps.
-	community := "public"
-	for _, c := range cfg.Communities {
-		community = c.Name
-		break
-	}
+	community := selectTrapCommunity(cfg)
 
 	pkt := a.buildLinkTrap(community, linkUp, ifindex, ifname)
 
@@ -153,7 +151,7 @@ func (a *Agent) sendLinkTraps(linkUp bool, ifindex int, ifname string) {
 		direction = "up"
 	}
 
-	for _, tg := range cfg.TrapGroups {
+	for _, tg := range sortedTrapGroups(cfg) {
 		for _, target := range tg.Targets {
 			if err := sendTrap(target, pkt); err != nil {
 				slog.Warn("SNMP trap send failed",
@@ -166,4 +164,45 @@ func (a *Agent) sendLinkTraps(linkUp bool, ifindex int, ifname string) {
 			}
 		}
 	}
+}
+
+// selectTrapCommunity picks the v2c trap community deterministically (#2989).
+// SNMPConfig.Communities is a Go map, whose iteration order is randomized, so
+// ranging over it and breaking on the first entry produced a different
+// community per process run when more than one community was configured —
+// collectors that accept only one community saw flaky traps and a less
+// privileged community could leak through the wrong credential boundary. We
+// instead pick the lexicographically-first configured community, a stable and
+// predictable selection. When no community is configured the v2c default
+// "public" is used (the configured set authorizes the trap on the wire and an
+// empty set has no on-wire credential to assert).
+func selectTrapCommunity(cfg *config.SNMPConfig) string {
+	if cfg == nil || len(cfg.Communities) == 0 {
+		return "public"
+	}
+	names := make([]string, 0, len(cfg.Communities))
+	for name := range cfg.Communities {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names[0]
+}
+
+// sortedTrapGroups returns the configured trap groups in deterministic
+// (name-sorted) order. The TrapGroups map iteration order is randomized; a
+// stable order keeps dispatch and log output reproducible.
+func sortedTrapGroups(cfg *config.SNMPConfig) []*config.SNMPTrapGroup {
+	if cfg == nil || len(cfg.TrapGroups) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.TrapGroups))
+	for name := range cfg.TrapGroups {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	groups := make([]*config.SNMPTrapGroup, 0, len(names))
+	for _, name := range names {
+		groups = append(groups, cfg.TrapGroups[name])
+	}
+	return groups
 }
