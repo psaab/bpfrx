@@ -184,7 +184,14 @@ type Manager struct {
 	// link-local zone is preserved through to the send path (#2494). Tests
 	// inject this to assert the bound resolver is built with the probe's
 	// device/mark (live VRF DNS is lab-bound).
-	resolveTarget func(target string, opts probeSockOpts) (*net.IPAddr, error)
+	//
+	// The probe-cycle ctx is threaded into the lookup (#2647): a stuck DNS
+	// query for a HOSTNAME target now honors the cycle's
+	// cancellation/deadline (config reload, service stop) instead of
+	// running under context.Background() and outliving the cycle — matching
+	// the ctx-bound TCP DialContext and HTTP NewRequestWithContext paths. A
+	// literal-IP target short-circuits before DNS, so ctx is irrelevant.
+	resolveTarget func(ctx context.Context, target string, opts probeSockOpts) (*net.IPAddr, error)
 }
 
 // SetEventCallback registers a callback for RPM events.
