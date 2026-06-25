@@ -187,6 +187,100 @@ pub(super) fn native_gre_snapshot(include_neighbor: bool) -> ConfigSnapshot {
     }
 }
 
+/// A WireGuard tunnel endpoint whose LOGICAL interface MTU (1420) differs
+/// from the PHYSICAL underlay egress MTU (1500), used to pin the #2680 fix:
+/// the outer-encap MTU guard must gate against the PHYSICAL underlay, not the
+/// tunnel logical ifindex. Outer transport egresses on `reth0.80`
+/// (ifindex 12, MTU 1500); the WG logical interface `wg0.0` (ifindex 400) has
+/// MTU 1420. The 64-hex privkey + one peer with a valid pubkey make the row
+/// hydrate (a peerless / keyless WG row is dropped by `hydrate_wg_identity`).
+pub(super) fn wg_outer_mtu_snapshot() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: vec![
+            ZoneSnapshot {
+                name: "wan".to_string(),
+                id: TEST_WAN_ZONE_ID,
+            },
+            ZoneSnapshot {
+                name: "sfmix".to_string(),
+                id: TEST_SFMIX_ZONE_ID,
+            },
+        ],
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "reth0.80".to_string(),
+                zone: "wan".to_string(),
+                linux_name: "ge-0-0-2.80".to_string(),
+                ifindex: 12,
+                parent_ifindex: 6,
+                vlan_id: 80,
+                mtu: 1500,
+                redundancy_group: 1,
+                hardware_addr: "02:bf:72:00:50:08".to_string(),
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "172.16.80.8/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "wg0.0".to_string(),
+                zone: "sfmix".to_string(),
+                linux_name: "wg0".to_string(),
+                ifindex: 400,
+                mtu: 1420,
+                redundancy_group: 1,
+                tunnel: true,
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.123.0.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        tunnel_endpoints: vec![TunnelEndpointSnapshot {
+            id: 1,
+            interface: "wg0.0".to_string(),
+            linux_name: "wg0".to_string(),
+            ifindex: 400,
+            zone: "sfmix".to_string(),
+            redundancy_group: 1,
+            mtu: 1420,
+            mode: "wireguard".to_string(),
+            outer_family: "inet".to_string(),
+            source: "172.16.80.8".to_string(),
+            // OUTER peer endpoint is OFF the connected subnet so it resolves
+            // via the explicit route below to reth0.80 (mirroring the GRE
+            // fixture), not a connected/local-delivery short circuit.
+            destination: "203.0.113.7".to_string(),
+            ttl: 64,
+            transport_table: "inet.0".to_string(),
+            wg_listen_port: 51820,
+            wg_local_privkey_hex: "deadbeef".repeat(8),
+            wg_peers: vec![crate::TunnelWgPeerSnapshot {
+                wg_peer_pubkey_hex: "abadcafe".repeat(8),
+                wg_allowed_ips: vec!["10.123.0.0/24".to_string()],
+                wg_endpoint: "203.0.113.7:51820".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        routes: vec![RouteSnapshot {
+            table: "inet.0".to_string(),
+            family: "inet".to_string(),
+            // The OUTER peer endpoint (203.0.113.7) routes out reth0.80 via
+            // the connected next-hop 172.16.80.1.
+            destination: "203.0.113.0/24".to_string(),
+            next_hops: vec!["172.16.80.1@reth0.80".to_string()],
+            discard: false,
+            next_table: String::new(),
+        }],
+        ..Default::default()
+    }
+}
+
 pub(super) fn native_gre_pbr_snapshot(include_neighbor: bool) -> ConfigSnapshot {
     let mut snapshot = native_gre_snapshot(include_neighbor);
     snapshot.zones.insert(

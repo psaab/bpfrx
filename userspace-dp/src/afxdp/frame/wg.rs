@@ -41,6 +41,81 @@ fn wg_encapped_size(inner_len: usize, outer_v6: bool) -> usize {
     wg_record_len + outer_ip_len + 8
 }
 
+/// The PHYSICAL underlay egress MTU the OUTER (WG/UDP) datagram must fit,
+/// for a tunnel-resolved encap decision (#2680).
+///
+/// The MTU guard in `wg_encap_frame` compares the full OUTER encapped size
+/// against an interface MTU. The interface it must compare against is the
+/// PHYSICAL underlay egress — the interface the outer WG/UDP datagram
+/// actually leaves on — NOT `decision.resolution.egress_ifindex`, which for
+/// a tunnel-resolved flow is the tunnel LOGICAL ifindex (the WG interface,
+/// MTU ~1420, used for zone/policy/CoS). Gating the outer size against the
+/// logical MTU is apples-to-oranges and silently drops inner packets whose
+/// outer datagram fits the 1500-byte underlay (broken PMTUD / tunnel
+/// transit).
+///
+/// For WireGuard the outer destination is the SELECTED peer endpoint
+/// (`engine.peer_for_dest` LPM), NOT the endpoint-level `destination` (which
+/// the build path zeroes to `0.0.0.0` for WG — the peer carries the real
+/// outer hop). So the physical egress is the route to `outer_dst` in the
+/// endpoint's transport table — exactly the interface the encapped datagram
+/// egresses. `dynamic_neighbors` is `None`: the egress ifindex comes from
+/// the ROUTE lookup, not from neighbor resolution, so the static forwarding
+/// state suffices. (This is why `resolve_tunnel_outer`, which reads the
+/// zeroed endpoint destination, cannot be reused here — it always NoRoutes
+/// for WG.)
+///
+/// Fallbacks (conservative): if the outer route cannot be resolved (no FIB
+/// entry / non-positive egress) fall back to the resolution's own
+/// `egress_ifindex` MTU, then to 1500. This never makes the guard tighter
+/// than the pre-#2680 logical-MTU behaviour for the unresolvable case — it
+/// only widens it to the underlay when the outer resolves, which is the
+/// correct comparison.
+///
+/// The inner packet's own logical/PMTUD MTU is a SEPARATE concern handled
+/// by the WG inner-MTU clamp / post-transform PMTUD on the TX dispatcher
+/// (#2299/#2330/#2457); this helper is strictly outer-size-vs-physical-MTU.
+#[inline]
+fn outer_physical_egress_mtu(
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    endpoint: &TunnelEndpoint,
+    outer_dst: IpAddr,
+) -> usize {
+    let outer = match outer_dst {
+        IpAddr::V4(ip) => lookup_forwarding_resolution_v4(
+            forwarding,
+            None,
+            ip,
+            &endpoint.transport_table,
+            1,
+            false,
+        ),
+        IpAddr::V6(ip) => lookup_forwarding_resolution_v6(
+            forwarding,
+            None,
+            ip,
+            &endpoint.transport_table,
+            1,
+            false,
+        ),
+    };
+    let physical_ifindex = if outer.egress_ifindex > 0
+        && outer.disposition != ForwardingDisposition::NoRoute
+        && !forwarding.tunnel_interfaces.contains(&outer.egress_ifindex)
+    {
+        outer.egress_ifindex
+    } else {
+        decision.resolution.egress_ifindex
+    };
+    forwarding
+        .egress
+        .get(&physical_ifindex)
+        .map(|e| e.mtu)
+        .filter(|m| *m > 0)
+        .unwrap_or(1500)
+}
+
 pub(super) fn wg_encap_frame(
     inner_frame: &[u8],
     inner_meta: impl Into<ForwardPacketMeta>,
@@ -97,14 +172,14 @@ pub(super) fn wg_encap_frame(
     // Exact pad-aware MTU guard (plan §7, Codex r3). The WG record is
     // WG_DATA_HEADER_LEN + pad_to_16(inner) + POLY1305_TAG_LEN; the full
     // outer frame adds eth + outer IP + UDP(8). Drop oversize rather than
-    // letting the kernel fragment the outer datagram. The egress MTU is
-    // the egress interface MTU (default 1500 if unknown).
-    let outer_mtu = forwarding
-        .egress
-        .get(&decision.resolution.egress_ifindex)
-        .map(|e| e.mtu)
-        .filter(|m| *m > 0)
-        .unwrap_or(1500);
+    // letting the kernel fragment the outer datagram.
+    //
+    // #2680: the OUTER datagram must fit the PHYSICAL underlay egress MTU,
+    // NOT `decision.resolution.egress_ifindex` (the tunnel LOGICAL ifindex,
+    // MTU ~1420). Re-resolve the underlay egress via the route to the SELECTED
+    // peer endpoint (the real outer hop for WG) and use its MTU; the
+    // logical/inner MTU is a separate concern handled by the inner-MTU clamp.
+    let outer_mtu = outer_physical_egress_mtu(decision, forwarding, endpoint, peer_endpoint.ip());
     let wg_record_len = WG_DATA_HEADER_LEN + pad_to_16(inner_packet.len()) + POLY1305_TAG_LEN;
     if wg_encapped_size(inner_packet.len(), outer_v6) > outer_mtu {
         // #1865: the promised "follow-up" counter store — same
@@ -249,6 +324,7 @@ fn udp6_checksum(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr, udp: &[u8]) -
 
 #[cfg(test)]
 mod wg_frame_tests {
+    use super::super::super::test_fixtures::*;
     use super::*;
 
     #[test]
@@ -273,6 +349,126 @@ mod wg_frame_tests {
         assert_eq!(
             wg_encapped_size(32, false),
             WG_DATA_HEADER_LEN + 32 + POLY1305_TAG_LEN + 20 + 8
+        );
+    }
+
+    // === #2680: the OUTER MTU guard gates against the PHYSICAL underlay
+    // egress MTU, not the tunnel LOGICAL ifindex MTU. ===
+
+    /// A tunnel-resolved `SessionDecision` whose resolution carries
+    /// `egress_ifindex` = the tunnel LOGICAL ifindex (what the resolver
+    /// stores) and `tunnel_endpoint_id` = the WG endpoint id.
+    fn wg_tunnel_decision(logical_ifindex: i32, tunnel_endpoint_id: u16) -> SessionDecision {
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::MissingNeighbor,
+                local_ifindex: 0,
+                egress_ifindex: logical_ifindex,
+                tx_ifindex: 0,
+                tunnel_endpoint_id,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: crate::nat::NatDecision::default(),
+        }
+    }
+
+    // The peer endpoint the WG fixture's single peer learns / is configured
+    // with — the REAL outer hop (the endpoint-level destination is zeroed for
+    // WG). The route to this IP egresses on the physical underlay (reth0.80).
+    const WG_PEER_OUTER_DST: IpAddr =
+        IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7));
+
+    #[test]
+    fn outer_mtu_uses_physical_egress_not_tunnel_logical() {
+        // The WG endpoint's logical interface (wg0.0, ifindex 400) has MTU
+        // 1420; the outer transport egresses on reth0.80 (ifindex 12, MTU
+        // 1500) via the route to the peer endpoint. The guard must use the
+        // PHYSICAL 1500, NOT the logical 1420.
+        let state = build_forwarding_state(&wg_outer_mtu_snapshot());
+        // Sanity: both interfaces really do carry the distinct MTUs the
+        // fixture claims, so the assertion below is meaningful.
+        assert_eq!(state.egress.get(&400).map(|e| e.mtu), Some(1420));
+        assert_eq!(state.egress.get(&12).map(|e| e.mtu), Some(1500));
+
+        let endpoint = state.tunnel_endpoints.get(&1).expect("wg endpoint present");
+        let decision = wg_tunnel_decision(400, 1);
+        // The fix: the guard MTU is the physical underlay (1500). Reverting
+        // to the logical-ifindex lookup would return 1420 → this fails red.
+        assert_eq!(
+            outer_physical_egress_mtu(&decision, &state, endpoint, WG_PEER_OUTER_DST),
+            1500,
+            "outer guard must use the PHYSICAL underlay MTU (reth0.80=1500), \
+             not the tunnel LOGICAL ifindex MTU (wg0.0=1420)"
+        );
+    }
+
+    #[test]
+    fn fits_physical_but_exceeds_logical_inner_is_not_dropped() {
+        // An inner packet whose OUTER encapped size fits the PHYSICAL egress
+        // (1500) but exceeds the tunnel LOGICAL MTU (1420) must NOT be
+        // dropped. Pick an inner length whose encapped size is in (1420,
+        // 1500].
+        let state = build_forwarding_state(&wg_outer_mtu_snapshot());
+        let endpoint = state.tunnel_endpoints.get(&1).expect("wg endpoint present");
+        let decision = wg_tunnel_decision(400, 1);
+        let physical_mtu =
+            outer_physical_egress_mtu(&decision, &state, endpoint, WG_PEER_OUTER_DST);
+        let logical_mtu = 1420usize;
+
+        // 1400-byte inner → ~1460-ish outer (v4): fits 1500, exceeds 1420.
+        let inner = 1400usize;
+        let encapped = wg_encapped_size(inner, false);
+        assert!(
+            encapped > logical_mtu,
+            "the test inner must exceed the logical MTU (else it proves nothing): \
+             {encapped} <= {logical_mtu}"
+        );
+        // With the fix the guard compares against physical_mtu → NOT dropped.
+        // Reverting to the logical MTU would make physical_mtu == 1420 and
+        // this assertion would fail red (the silent drop the bug caused).
+        assert!(
+            encapped <= physical_mtu,
+            "fits-physical-exceeds-logical inner must be forwarded, not dropped \
+             ({encapped} > {physical_mtu})"
+        );
+    }
+
+    #[test]
+    fn genuinely_oversized_outer_still_drops_against_physical() {
+        // An inner whose OUTER encapped size exceeds even the PHYSICAL MTU
+        // (1500) is still correctly dropped — the fix widens the guard to the
+        // underlay, it does not disable it.
+        let state = build_forwarding_state(&wg_outer_mtu_snapshot());
+        let endpoint = state.tunnel_endpoints.get(&1).expect("wg endpoint present");
+        let decision = wg_tunnel_decision(400, 1);
+        let physical_mtu =
+            outer_physical_egress_mtu(&decision, &state, endpoint, WG_PEER_OUTER_DST);
+        assert_eq!(physical_mtu, 1500);
+        // 1480-byte inner pads to 1488; record 1488+16+16=1520; +20+8 = 1548
+        // > 1500 → drop.
+        assert!(
+            wg_encapped_size(1480, false) > physical_mtu,
+            "a genuinely oversized outer must still exceed the physical MTU"
+        );
+    }
+
+    #[test]
+    fn outer_mtu_falls_back_to_logical_when_outer_unresolvable() {
+        // Conservative fallback: if the outer destination has no FIB entry the
+        // route lookup NoRoutes → fall back to the resolution's own
+        // egress_ifindex MTU (the pre-#2680 behaviour), never tighter.
+        let state = build_forwarding_state(&wg_outer_mtu_snapshot());
+        let endpoint = state.tunnel_endpoints.get(&1).expect("wg endpoint present");
+        let decision = wg_tunnel_decision(400, 1);
+        // 198.51.100.9 has no route → NoRoute → fall back to egress_ifindex
+        // (400, the logical, MTU 1420).
+        let unrouted = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 9));
+        assert_eq!(
+            outer_physical_egress_mtu(&decision, &state, endpoint, unrouted),
+            1420
         );
     }
 
