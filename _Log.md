@@ -1,5 +1,22 @@
 # Action Log
 
+## 2026-06-24 — #2668 stable Kea subnet_id assignment
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed Kea `subnet_id` being assigned over the randomized Go
+  map iteration of `Groups`, which shifted IDs on every config regeneration
+  and remapped active memfile leases onto the wrong subnet. Added
+  `stableGroups` (sort groups by name) and `stablePools` (sort pools by
+  subnet then name); both `generateKea4Config` and `generateKea6Config` now
+  iterate the deterministic order, and the `interfaces-config` collection
+  loops use the sorted group order too. Stability level: sorted-by-name
+  (fixes the randomization; add/remove may still shift later IDs — justified
+  in the README). Added `TestKeaSubnetIDStableAcrossRegenerations` (3-group
+  multi-pool config, 50 regens, golden subnet→id map, v4+v6) — proven
+  fail-on-revert (5/5 red with the map-range restored).
+- **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md, _Log.md
+
 ## 2026-06-24 — #2648 fold: refused-add records NO ownership (review MAJOR-1)
 
 - **Timestamp**: 2026-06-24
