@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
 
 	"github.com/psaab/xpf/pkg/cluster"
@@ -98,6 +99,19 @@ type vrrpInstance struct {
 	// nil when no IPv6 VIPs are configured.
 	ipv6Conn net.PacketConn
 	ipv6FD   int // raw fd for setsockopt (hop limit, multicast)
+
+	// ipv6Send is the seam used by sendPacketIPv6 to write an IPv6 advert
+	// with an explicit IPV6_PKTINFO control message. The control message
+	// pins the OUTER IPv6 source to the same link-local address the
+	// pseudo-header checksum was computed over (#2644). Without it the
+	// kernel performs independent RFC 6724 source selection on the
+	// wildcard-bound (`::`) socket; with more than one link-local on the
+	// interface it can pick a different source than the checksum used, so
+	// the receiver's pseudo-header checksum mismatches and the advert is
+	// silently dropped -> dual-master split-brain. Defaults to a wrapper
+	// over ipv6.NewPacketConn(ipv6Conn).WriteTo; overridden in tests to
+	// capture the control message.
+	ipv6Send func(data []byte, cm *ipv6.ControlMessage, dst net.Addr) error
 
 	// AF_PACKET socket for receiving on VLAN sub-interfaces.
 	// Raw IP sockets don't reliably receive multicast on VLAN
@@ -354,6 +368,14 @@ func (vi *vrrpInstance) openSocket() error {
 		} else {
 			vi.ipv6Conn = v6Conn
 			vi.ipv6FD = v6FD
+			// Wrap the raw IPConn so we can attach an IPV6_PKTINFO
+			// control message on every advert. The control message pins
+			// the outer IPv6 source to the checksum source (#2644).
+			p6 := ipv6.NewPacketConn(v6Conn)
+			vi.ipv6Send = func(data []byte, cm *ipv6.ControlMessage, dst net.Addr) error {
+				_, werr := p6.WriteTo(data, cm, dst)
+				return werr
+			}
 		}
 	}
 
@@ -1339,6 +1361,10 @@ func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
 
 	dstIP := net.ParseIP("ff02::12")
 
+	// The pseudo-header checksum inside data is computed over srcIP. The
+	// outer IPv6 source MUST equal srcIP or the receiver's checksum (which
+	// is validated against the actual outer source) mismatches and the
+	// advert is dropped (#2644).
 	data, err := pkt.Marshal(true, srcIP, dstIP)
 	if err != nil {
 		return err
@@ -1350,7 +1376,27 @@ func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
 	dst := &net.IPAddr{
 		IP: dstIP,
 	}
-	if _, err := vi.ipv6Conn.WriteTo(data, dst); err != nil {
+
+	// Pin the outer source via IPV6_PKTINFO to the SAME address the
+	// checksum was computed over (#2644). Without this the kernel selects
+	// the outer source independently (RFC 6724) on the wildcard-bound
+	// socket and can pick a different link-local than srcIP. IfIndex
+	// scopes the link-local source to the VRRP interface (link-locals are
+	// zone-scoped) and keeps the egress interface deterministic.
+	cm := &ipv6.ControlMessage{
+		Src:     srcIP,
+		IfIndex: vi.iface.Index,
+	}
+	if vi.ipv6Send == nil {
+		// Defensive: a wired ipv6Conn without a send seam should not
+		// happen (openSocket sets both together), but fall back to the
+		// raw conn rather than panic.
+		if _, err := vi.ipv6Conn.WriteTo(data, dst); err != nil {
+			return fmt.Errorf("ipv6 writeto: %w", err)
+		}
+		return nil
+	}
+	if err := vi.ipv6Send(data, cm, dst); err != nil {
 		return fmt.Errorf("ipv6 writeto: %w", err)
 	}
 
