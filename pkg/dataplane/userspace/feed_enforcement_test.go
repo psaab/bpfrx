@@ -85,7 +85,7 @@ func TestFeedOverlayEmitsBookRowAndPopulatesNameToID(t *testing.T) {
 		"bad-actors": {"198.51.100.0/24", "2001:db8:bad::/48"},
 	}
 
-	books, nameToID := buildAddressBookTableWithFeeds(cfg, overlay)
+	books, nameToID, _ := buildAddressBookTableWithFeeds(cfg, overlay)
 
 	row := findBookByName(books, "bad-actors")
 	if row == nil {
@@ -105,7 +105,7 @@ func TestFeedOverlayEmitsBookRowAndPopulatesNameToID(t *testing.T) {
 	// NON-TAUTOLOGICAL guard: with no overlay the name is unknown — the table
 	// is empty and nameToID has no entry. Proves the row/ID come from the
 	// overlay, not from anywhere else.
-	booksNoOverlay, nameToIDNoOverlay := buildAddressBookTableWithFeeds(cfg, nil)
+	booksNoOverlay, nameToIDNoOverlay, _ := buildAddressBookTableWithFeeds(cfg, nil)
 	if findBookByName(booksNoOverlay, "bad-actors") != nil {
 		t.Fatalf("without the overlay, bad-actors must NOT emit a book row (tautology check)")
 	}
@@ -123,13 +123,13 @@ func TestFeedBackedPolicyRoutesAsBookReference(t *testing.T) {
 		"bad-actors": {"198.51.100.0/24"},
 	}
 
-	_, nameToID := buildAddressBookTableWithFeeds(cfg, overlay)
+	_, nameToID, _ := buildAddressBookTableWithFeeds(cfg, overlay)
 	wantID := nameToID["bad-actors"]
 	if wantID == 0 {
 		t.Fatalf("precondition: feed name must have an ID")
 	}
 
-	snaps := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, nil, overlay)
+	snaps, _ := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, nil, overlay)
 	if len(snaps) != 1 {
 		t.Fatalf("expected 1 policy rule, got %d", len(snaps))
 	}
@@ -144,7 +144,7 @@ func TestFeedBackedPolicyRoutesAsBookReference(t *testing.T) {
 	// NON-TAUTOLOGICAL: without the overlay the SAME token IS a no-match
 	// literal (the pre-#2049 broken behaviour). This proves the difference is
 	// the overlay.
-	snapsNoOverlay := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, nil, nil)
+	snapsNoOverlay, _ := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, nil, nil)
 	if len(snapsNoOverlay) != 1 {
 		t.Fatalf("expected 1 rule without overlay, got %d", len(snapsNoOverlay))
 	}
@@ -163,12 +163,12 @@ func TestFeedBackedPolicyDestinationRoutesAsBookReference(t *testing.T) {
 	overlay := map[string][]string{
 		"blocklist": {"203.0.113.0/24", "2001:db8:dead::/48"},
 	}
-	_, nameToID := buildAddressBookTableWithFeeds(cfg, overlay)
+	_, nameToID, _ := buildAddressBookTableWithFeeds(cfg, overlay)
 	wantID := nameToID["blocklist"]
 	if wantID == 0 {
 		t.Fatalf("precondition: feed name must have an ID")
 	}
-	snaps := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, nil, overlay)
+	snaps, _ := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, nil, overlay)
 	if !containsID(snaps[0].DestinationBookIDs, wantID) {
 		t.Fatalf("feed-backed destination must be a book reference; DestinationBookIDs=%v want %d", snaps[0].DestinationBookIDs, wantID)
 	}
@@ -184,7 +184,7 @@ func TestEmptyFeedSnapshotYieldsNoPrefixes(t *testing.T) {
 	overlay := map[string][]string{
 		"bad-actors": {}, // bound but empty (no snapshot yet)
 	}
-	books, nameToID := buildAddressBookTableWithFeeds(cfg, overlay)
+	books, nameToID, _ := buildAddressBookTableWithFeeds(cfg, overlay)
 	row := findBookByName(books, "bad-actors")
 	if row != nil {
 		if len(row.PrefixesV4) != 0 || len(row.PrefixesV6) != 0 {
@@ -196,7 +196,7 @@ func TestEmptyFeedSnapshotYieldsNoPrefixes(t *testing.T) {
 	if _, ok := nameToID["bad-actors"]; !ok {
 		t.Fatalf("empty feed-backed name must still be in nameToID (book reference to an empty set)")
 	}
-	snaps := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, nil, overlay)
+	snaps, _ := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, nil, overlay)
 	if len(snaps) != 1 {
 		t.Fatalf("policy must still build with an empty feed; got %d rules", len(snaps))
 	}
@@ -215,8 +215,8 @@ func TestFeedContentChangeReshapesPublishedSnapshot(t *testing.T) {
 	overlayP1 := map[string][]string{"bad-actors": {"198.51.100.0/24"}}
 	overlayP2 := map[string][]string{"bad-actors": {"203.0.113.0/24"}}
 
-	s1 := buildSnapshotWithSchedulerState(cfg, ucfg, 1, 0, nil, nil, overlayP1)
-	s2 := buildSnapshotWithSchedulerState(cfg, ucfg, 1, 0, nil, nil, overlayP2)
+	s1, _ := buildSnapshotWithSchedulerState(cfg, ucfg, 1, 0, nil, nil, overlayP1)
+	s2, _ := buildSnapshotWithSchedulerState(cfg, ucfg, 1, 0, nil, nil, overlayP2)
 
 	// The published address-book row follows the new content.
 	row1 := findBookByName(s1.AddressBooks, "bad-actors")
@@ -243,7 +243,7 @@ func TestFeedContentChangeReshapesPublishedSnapshot(t *testing.T) {
 
 	// Conversely: identical overlay content yields an identical hash (the skip
 	// is correct — no wasted round-trip).
-	s1b := buildSnapshotWithSchedulerState(cfg, ucfg, 9, 7, nil, nil, overlayP1)
+	s1b, _ := buildSnapshotWithSchedulerState(cfg, ucfg, 9, 7, nil, nil, overlayP1)
 	h1b, _ := snapshotContentHash(s1b)
 	if h1 != h1b {
 		t.Fatalf("identical feed content must yield identical content hash; %x != %x", h1, h1b)
@@ -264,7 +264,7 @@ func TestFeedOverlayMergesWithStaticBook(t *testing.T) {
 		},
 	}
 	overlay := map[string][]string{"mixed": {"198.51.100.0/24"}}
-	books, _ := buildAddressBookTableWithFeeds(cfg, overlay)
+	books, _, _ := buildAddressBookTableWithFeeds(cfg, overlay)
 	row := findBookByName(books, "mixed")
 	if row == nil {
 		t.Fatalf("mixed book row missing")
@@ -301,7 +301,7 @@ func TestLegacyAdapterForwardsFeedSnapshots(t *testing.T) {
 	// stored overlay emits the feed-backed book row. Mirrors the daemon path
 	// where the next Compile/Apply consumes the cached overlay.
 	cfg := feedPolicyCfg("bad-actors", "any")
-	books, nameToID := buildAddressBookTableWithFeeds(cfg, m.feedSnapshotOverlay())
+	books, nameToID, _ := buildAddressBookTableWithFeeds(cfg, m.feedSnapshotOverlay())
 	if findBookByName(books, "bad-actors") == nil {
 		t.Fatalf("feed overlay forwarded through the adapter must enforce a book row")
 	}
@@ -404,7 +404,7 @@ func TestSchedulerRepublishRetainsFeedEnforcement(t *testing.T) {
 	if len(snap.Policies) != 1 {
 		t.Fatalf("expected 1 republished policy rule, got %d", len(snap.Policies))
 	}
-	_, nameToID := buildAddressBookTableWithFeeds(cfg, overlay)
+	_, nameToID, _ := buildAddressBookTableWithFeeds(cfg, overlay)
 	wantID := nameToID["bad-actors"]
 	if wantID == 0 {
 		t.Fatalf("precondition: feed name must have an ID")

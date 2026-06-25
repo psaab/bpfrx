@@ -518,7 +518,15 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	// #1827: include the cached ip-monitoring route overlay so a full
 	// apply (operator commit) while a policy is FAILED preserves the
 	// injected route instead of reverting traffic to the dead uplink.
-	snap := buildSnapshotWithSchedulerStateAndNATCounters(cfg, ucfg, m.bumpGeneration(), m.readFIBGeneration(), activeState, m.routeOverlaySnapshot(), m.feedSnapshotOverlay(), result.NATCounterIDs)
+	// #2514: a config-shaped input (e.g. address-book content-ID
+	// collision) must reject the apply with an error rather than panic
+	// the daemon. buildSnapshot* returns the error up here; ApplyConfig
+	// fails closed and the previously published snapshot / dataplane state
+	// is retained (m.lastSnapshot is not advanced on the error path).
+	snap, err := buildSnapshotWithSchedulerStateAndNATCounters(cfg, ucfg, m.bumpGeneration(), m.readFIBGeneration(), activeState, m.routeOverlaySnapshot(), m.feedSnapshotOverlay(), result.NATCounterIDs)
+	if err != nil {
+		return nil, fmt.Errorf("userspace: build config snapshot: %w", err)
+	}
 	// #1620: stamp the cold-path sample mask onto the snapshot. The
 	// daemon called SetColdPathSampleMask once at startup with the
 	// validated CLI flag value (or nil for "use default"). A nil
@@ -729,11 +737,24 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 	// rather than feedSnapshotOverlay() (which re-locks m.mu and would
 	// deadlock). Matches how the full snapshot build reads the overlay.
 	feedOverlay := cloneFeedOverlay(m.feedOverlay)
-	next.Policies = buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, activeCopy, feedOverlay)
+	// #2514: an unresolvable address-book content-ID collision must not
+	// panic the daemon. Abort the scheduler-only republish and retain the
+	// last published snapshot (fail-closed) — the next full apply will
+	// surface the same error to the operator at commit time.
+	policies, err := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, activeCopy, feedOverlay)
+	if err != nil {
+		slog.Warn("userspace: skipping policy-scheduler republish; retaining prior snapshot", "err", err)
+		return
+	}
+	next.Policies = policies
 	// #1606: refresh the address-book table alongside the policies
 	// so book IDs cited in the new policies always resolve on the
 	// dataplane side.
-	books, _ := buildAddressBookTableWithFeeds(cfg, feedOverlay)
+	books, _, err := buildAddressBookTableWithFeeds(cfg, feedOverlay)
+	if err != nil {
+		slog.Warn("userspace: skipping policy-scheduler republish; retaining prior snapshot", "err", err)
+		return
+	}
 	next.AddressBooks = books
 
 	publishSnap := next

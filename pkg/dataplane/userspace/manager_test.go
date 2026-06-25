@@ -2080,7 +2080,7 @@ func TestBuildSnapshotSummary(t *testing.T) {
 		},
 	}
 
-	snap := buildSnapshot(cfg, config.UserspaceConfig{Workers: 2, RingEntries: 2048}, 11, 5)
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{Workers: 2, RingEntries: 2048}, 11, 5)
 	if snap.Generation != 11 {
 		t.Fatalf("Generation = %d, want 11", snap.Generation)
 	}
@@ -2707,7 +2707,7 @@ func TestBuildSnapshotIncludesThreeColorPolicerSchema(t *testing.T) {
 		},
 	}
 
-	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 	if !snap.Capabilities.ForwardingSupported {
 		t.Fatalf("ForwardingSupported = false, want three-color policers admitted. Reasons: %+v", snap.Capabilities.UnsupportedReasons)
 	}
@@ -2804,7 +2804,7 @@ func TestBuildSnapshotIncludesMirrorConfigsFromRealInterfaceSnapshot(t *testing.
 		},
 	}
 
-	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 	var loIfindex int
 	for _, iface := range snap.Interfaces {
 		if iface.Name == "lo" {
@@ -3358,7 +3358,7 @@ func TestUserspaceSupportsSimpleZonePolicies(t *testing.T) {
 	if !userspaceSupportsSecurityPolicies(cfg) {
 		t.Fatal("userspaceSupportsSecurityPolicies = false, want true")
 	}
-	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 	if snap.DefaultPolicy != "deny" || len(snap.Policies) != 1 || snap.Policies[0].Action != "permit" {
 		t.Fatalf("unexpected policy snapshot: %+v", snap.Policies)
 	}
@@ -3399,7 +3399,7 @@ func TestUserspaceSupportsAddressBookPolicyMatches(t *testing.T) {
 	if !userspaceSupportsSecurityPolicies(cfg) {
 		t.Fatal("userspaceSupportsSecurityPolicies = false, want true with resolvable address-book entries")
 	}
-	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 	if len(snap.Policies) != 1 {
 		t.Fatalf("len(Policies) = %d, want 1", len(snap.Policies))
 	}
@@ -3464,7 +3464,7 @@ func TestUserspaceSupportsNamedApplicationPolicyMatches(t *testing.T) {
 	if !userspaceSupportsSecurityPolicies(cfg) {
 		t.Fatal("userspaceSupportsSecurityPolicies = false, want true with resolvable application-set")
 	}
-	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 	if len(snap.Policies) != 1 {
 		t.Fatalf("len(Policies) = %d, want 1", len(snap.Policies))
 	}
@@ -3521,7 +3521,7 @@ func TestBuildSnapshotIncludesUnitInterfaces(t *testing.T) {
 		"wan": {Name: "wan", Interfaces: []string{"reth0.50"}},
 	}
 
-	snap := buildSnapshot(cfg, config.UserspaceConfig{Workers: 2, RingEntries: 2048}, 1, 0)
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{Workers: 2, RingEntries: 2048}, 1, 0)
 	got := map[string]InterfaceSnapshot{}
 	for _, iface := range snap.Interfaces {
 		got[iface.Name] = iface
@@ -3635,7 +3635,7 @@ func TestBuildPolicySnapshotsIncludesGlobalPolicies(t *testing.T) {
 		},
 		Action: config.PolicyDeny,
 	}}
-	snap := buildPolicySnapshots(cfg)
+	snap, _ := buildPolicySnapshots(cfg)
 	if len(snap) != 2 {
 		t.Fatalf("len(snap) = %d, want 2", len(snap))
 	}
@@ -3677,7 +3677,7 @@ func TestBuildPolicySnapshotsRoundTripsSchedulerInactiveAndRuleID(t *testing.T) 
 		Action: config.PolicyDeny,
 	}}
 
-	unseeded := buildPolicySnapshots(cfg)
+	unseeded, _ := buildPolicySnapshots(cfg)
 	if len(unseeded) != 2 {
 		t.Fatalf("len(unseeded) = %d, want 2", len(unseeded))
 	}
@@ -3687,7 +3687,7 @@ func TestBuildPolicySnapshotsRoundTripsSchedulerInactiveAndRuleID(t *testing.T) 
 		}
 	}
 
-	snap := buildPolicySnapshotsWithSchedulerState(cfg, map[string]bool{
+	snap, _ := buildPolicySnapshotsWithSchedulerState(cfg, map[string]bool{
 		"workhours": false,
 		"always":    true,
 	})
@@ -3791,7 +3791,7 @@ func TestUpdatePolicyScheduleStatePublishesUserspaceSnapshot(t *testing.T) {
 	m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
 	m.cfg.ControlSocket = controlSock
 	m.generation = 7
-	m.lastSnapshot = buildSnapshot(cfg, config.UserspaceConfig{ControlSocket: controlSock}, 7, 0)
+	m.lastSnapshot, _ = buildSnapshot(cfg, config.UserspaceConfig{ControlSocket: controlSock}, 7, 0)
 	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
 
 	m.UpdatePolicyScheduleState(cfg, map[string]bool{"workhours": false})
@@ -3889,7 +3889,7 @@ func TestUpdatePolicyScheduleStateRefusesOldHelperForScheduledPolicies(t *testin
 	m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
 	m.cfg.ControlSocket = controlSock
 	m.generation = 7
-	m.lastSnapshot = buildSnapshot(cfg, config.UserspaceConfig{ControlSocket: controlSock}, 7, 0)
+	m.lastSnapshot, _ = buildSnapshot(cfg, config.UserspaceConfig{ControlSocket: controlSock}, 7, 0)
 	m.lastSnapshot.Policies[0].Inactive = false
 
 	m.UpdatePolicyScheduleState(cfg, map[string]bool{"workhours": false})
@@ -3942,7 +3942,7 @@ func TestUpdatePolicyScheduleStateWithoutHelperDoesNotMutateSnapshot(t *testing.
 
 	m := New()
 	m.generation = 7
-	m.lastSnapshot = buildSnapshot(cfg, config.UserspaceConfig{}, 7, 0)
+	m.lastSnapshot, _ = buildSnapshot(cfg, config.UserspaceConfig{}, 7, 0)
 	m.lastSnapshot.Policies[0].Inactive = false
 
 	m.UpdatePolicyScheduleState(cfg, map[string]bool{"workhours": false})
@@ -4125,13 +4125,13 @@ func TestBuildScreenSnapshotsMarksSynCookieMode(t *testing.T) {
 	if !snaps[0].SYNCookie {
 		t.Fatalf("SYNCookie = false, want true: %+v", snaps[0])
 	}
-	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 	if len(snap.SYNCookieMasterKey) != 32 {
 		t.Fatalf("SYNCookieMasterKey len = %d, want 32", len(snap.SYNCookieMasterKey))
 	}
 	cfg.System.RootAuthentication = nil
 	cfg.System.MasterPassword = "juniper-prf1"
-	snap = buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap, _ = buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 	if snap.SYNCookieMasterKey != "" {
 		t.Fatalf("SYNCookieMasterKey without root secret = %q, want empty", snap.SYNCookieMasterKey)
 	}
@@ -5819,8 +5819,8 @@ func TestSnapshotContentHashIgnoresVolatileFields(t *testing.T) {
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
 		"trust": {Name: "trust"},
 	}
-	snap1 := buildSnapshot(cfg, config.UserspaceConfig{Workers: 1}, 1, 10)
-	snap2 := buildSnapshot(cfg, config.UserspaceConfig{Workers: 1}, 99, 50)
+	snap1, _ := buildSnapshot(cfg, config.UserspaceConfig{Workers: 1}, 1, 10)
+	snap2, _ := buildSnapshot(cfg, config.UserspaceConfig{Workers: 1}, 99, 50)
 
 	h1, ok1 := snapshotContentHash(snap1)
 	h2, ok2 := snapshotContentHash(snap2)
@@ -5843,8 +5843,8 @@ func TestSnapshotContentHashDiffersOnForwardingChange(t *testing.T) {
 		"untrust": {Name: "untrust"},
 	}
 
-	snap1 := buildSnapshot(cfg1, config.UserspaceConfig{Workers: 1}, 1, 1)
-	snap2 := buildSnapshot(cfg2, config.UserspaceConfig{Workers: 1}, 1, 1)
+	snap1, _ := buildSnapshot(cfg1, config.UserspaceConfig{Workers: 1}, 1, 1)
+	snap2, _ := buildSnapshot(cfg2, config.UserspaceConfig{Workers: 1}, 1, 1)
 
 	h1, ok1 := snapshotContentHash(snap1)
 	h2, ok2 := snapshotContentHash(snap2)

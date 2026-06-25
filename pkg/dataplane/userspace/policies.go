@@ -22,11 +22,68 @@ import (
 // by both appid.ProtocolNumber and userspace-dp parse_protocol.
 const unsupportedApplicationSentinel = "__unsupported__"
 
-func buildPolicySnapshots(cfg *config.Config) []PolicyRuleSnapshot {
+// addressBookProbeLimit bounds the deterministic linear probe used to resolve
+// a folded-hash collision when assigning a u32 address-book content ID. The
+// folded FNV hash gives a starting slot; on a collision we walk forward by one
+// slot at a time. The walk is bounded by the number of buckets actually being
+// assigned plus a small fixed margin, NOT by a magic constant: with N distinct
+// content buckets, at most N-1 prior IDs are taken, so a probe sequence of
+// length N is guaranteed to land on a free slot in the 2^32 ID space (which is
+// astronomically larger than any realistic N). Exceeding the bound therefore
+// signals a builder logic error, not a credible accidental collision — and even
+// then we return an error rather than panicking the daemon (#2514).
+const addressBookProbeMargin = 8
+
+// addressBookProbeLimit returns the maximum number of linear-probe steps
+// allowed when resolving a folded-hash content-ID collision for nBuckets
+// distinct content buckets. With at most nBuckets-1 IDs already taken, a
+// forward probe of nBuckets steps is guaranteed to reach a free slot in the
+// 2^32 space, so in production this bound is never reached — the
+// AddressBookIDCollisionError it guards is the fail-safe, not a routine path.
+// It is a package var so the #2514 fail-on-revert test can shrink the bound to
+// deterministically drive the collision-exhaustion branch (proving it returns
+// an error rather than panicking). Production code never reassigns it.
+var addressBookProbeLimit = func(nBuckets int) int {
+	return nBuckets + addressBookProbeMargin
+}
+
+// AddressBookIDCollisionError reports that the deterministic content-ID probe
+// could not assign a unique u32 ID to every address-book content bucket. It is
+// returned (never panicked) up the snapshot-build / apply path so a commit or
+// apply rejects the offending config and the prior dataplane state is retained
+// (fail-closed). FNV is not collision-resistant, so this is the defined
+// failure mode for the (astronomically unlikely) case of unresolvable folded
+// collisions among the configured address-book content buckets.
+type AddressBookIDCollisionError struct {
+	// BucketCount is the number of distinct content buckets being assigned.
+	BucketCount int
+	// Probes is the number of probe steps attempted before giving up.
+	Probes int
+}
+
+func (e *AddressBookIDCollisionError) Error() string {
+	return fmt.Sprintf(
+		"address-book content-ID collision could not be resolved within %d probes (bucket count = %d); reject config, retain prior dataplane state",
+		e.Probes, e.BucketCount)
+}
+
+// addressBookContentHash64 derives the FNV-1a/64 hash of an address-book
+// content bucket's canonical bytes. It is a package var (not an inline call)
+// solely so the #2514 fail-on-revert test can inject a degenerate hash that
+// forces every bucket into the same folded-ID probe sequence — exercising the
+// collision-exhaustion path that must return an AddressBookIDCollisionError
+// instead of panicking. Production code never reassigns it.
+var addressBookContentHash64 = func(canon []byte) uint64 {
+	h := fnv.New64a()
+	h.Write(canon)
+	return h.Sum64()
+}
+
+func buildPolicySnapshots(cfg *config.Config) ([]PolicyRuleSnapshot, error) {
 	return buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, nil, nil)
 }
 
-func buildPolicySnapshotsWithSchedulerState(cfg *config.Config, activeState map[string]bool) []PolicyRuleSnapshot {
+func buildPolicySnapshotsWithSchedulerState(cfg *config.Config, activeState map[string]bool) ([]PolicyRuleSnapshot, error) {
 	return buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, activeState, nil)
 }
 
@@ -36,11 +93,14 @@ func buildPolicySnapshotsWithSchedulerState(cfg *config.Config, activeState map[
 // feed-backed address-name resolves through nameToID to a SourceBookIDs /
 // DestinationBookIDs reference (instead of falling through to a no-match
 // literal), so the helper enforces the feed prefixes.
-func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeState map[string]bool, feedOverlay map[string][]string) []PolicyRuleSnapshot {
+func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeState map[string]bool, feedOverlay map[string][]string) ([]PolicyRuleSnapshot, error) {
 	if cfg == nil || (len(cfg.Security.Policies) == 0 && len(cfg.Security.GlobalPolicies) == 0) {
-		return nil
+		return nil, nil
 	}
-	_, nameToID := buildAddressBookTableWithFeeds(cfg, feedOverlay)
+	_, nameToID, err := buildAddressBookTableWithFeeds(cfg, feedOverlay)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]PolicyRuleSnapshot, 0)
 	policySetID := uint32(0)
 	for _, zpp := range cfg.Security.Policies {
@@ -70,7 +130,7 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 		out = append(out, snap)
 		globalRuleIndex += userspacePolicyRuleExpansionCount(cfg, pol.Match.Applications)
 	}
-	return out
+	return out, nil
 }
 
 func buildOneRuleSnapshot(
@@ -196,7 +256,7 @@ func classifyPolicyAddresses(cfg *config.Config, nameToID map[string]uint32, add
 // canonical bytes (not by hash), and the bucket sort key is
 // (hash64, canonical_bytes) so collision-resolution is fully
 // deterministic across HA peers.
-func buildAddressBookTable(cfg *config.Config) ([]AddressBookSnapshot, map[string]uint32) {
+func buildAddressBookTable(cfg *config.Config) ([]AddressBookSnapshot, map[string]uint32, error) {
 	return buildAddressBookTableWithFeeds(cfg, nil)
 }
 
@@ -229,13 +289,13 @@ func buildAddressBookTable(cfg *config.Config) ([]AddressBookSnapshot, map[strin
 // When the static AddressBook is nil but a feed overlay is present, the table
 // is still built from the overlay alone (the pre-#2049 early-return only fired
 // because there were no static books to enumerate).
-func buildAddressBookTableWithFeeds(cfg *config.Config, feedOverlay map[string][]string) ([]AddressBookSnapshot, map[string]uint32) {
+func buildAddressBookTableWithFeeds(cfg *config.Config, feedOverlay map[string][]string) ([]AddressBookSnapshot, map[string]uint32, error) {
 	if cfg == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	ab := cfg.Security.AddressBook
 	if ab == nil && len(feedOverlay) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Collect all unique names: static Addresses + AddressSets ∪ feed-overlay
@@ -292,9 +352,7 @@ func buildAddressBookTableWithFeeds(cfg *config.Config, feedOverlay map[string][
 		key := string(canon)
 		b, exists := contentToBucket[key]
 		if !exists {
-			h := fnv.New64a()
-			h.Write(canon)
-			b = &bucket{canonical: canon, hash64: h.Sum64(), v4: v4, v6: v6}
+			b = &bucket{canonical: canon, hash64: addressBookContentHash64(canon), v4: v4, v6: v6}
 			contentToBucket[key] = b
 		}
 		b.names = append(b.names, name) // already in sorted-name order
@@ -324,26 +382,33 @@ func buildAddressBookTableWithFeeds(cfg *config.Config, feedOverlay map[string][
 			id = 1
 		}
 		if _, dup := used[id]; dup {
-			// Linear probe (deterministic given bucket sort).
+			// Linear probe (deterministic given bucket sort). The
+			// walk is bounded by the number of buckets being
+			// assigned plus a small margin: with N buckets at most
+			// N-1 IDs are already taken, so a free slot is reached
+			// within N probes in the 2^32 ID space. Exceeding the
+			// bound returns an AddressBookIDCollisionError (#2514)
+			// — config-shaped input must never panic a security
+			// appliance. The caller rejects the config and retains
+			// the prior dataplane state (fail-closed).
 			folded := uint32(b.hash64 ^ (b.hash64 >> 32))
-			probe := uint32(1)
-			for {
-				cand := folded + probe
+			probeLimit := addressBookProbeLimit(len(buckets))
+			resolved := false
+			for probe := 1; probe <= probeLimit; probe++ {
+				cand := folded + uint32(probe)
 				if cand == 0 {
 					cand = 1
 				}
 				if _, dup := used[cand]; !dup {
 					id = cand
+					resolved = true
 					break
 				}
-				probe++
-				if probe > 256 {
-					// Hard-fail by panic — would indicate
-					// astronomically-unlikely 256 simultaneous
-					// collisions in a 2^32 ID space.
-					panic(fmt.Sprintf(
-						"address-book content hash collision could not be resolved within 256 probes (bucket count = %d)",
-						len(buckets)))
+			}
+			if !resolved {
+				return nil, nil, &AddressBookIDCollisionError{
+					BucketCount: len(buckets),
+					Probes:      probeLimit,
 				}
 			}
 		}
@@ -363,7 +428,7 @@ func buildAddressBookTableWithFeeds(cfg *config.Config, feedOverlay map[string][
 			nameToID[n] = id
 		}
 	}
-	return out, nameToID
+	return out, nameToID, nil
 }
 
 // splitFeedPrefixesByFamily classifies feed-backed CIDR strings into v4 and
