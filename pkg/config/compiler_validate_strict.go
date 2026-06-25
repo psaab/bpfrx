@@ -962,6 +962,83 @@ func validateFRRAuthValuesStrict(cfg *Config) error {
 	return nil
 }
 
+// validateBGPNeighborPeerASStrict hard-rejects a BGP neighbor whose effective
+// peer-as (remote-as) is missing/0 or out of the valid AS range (#2963).
+//
+// peer-as is optional in the parser/compiler (compiler_protocols.go assigns
+// BGPNeighbor.PeerAS only when a per-neighbor `peer-as` token or an inherited
+// group `peer-as` is present; otherwise it stays the zero value). The FRR
+// renderer (pkg/frr/policy_render.go) emits `neighbor <addr> remote-as <PeerAS>`
+// unconditionally, so a neighbor authored without a peer-as renders
+// `neighbor <addr> remote-as 0`. AS 0 is reserved (RFC 7607) and FRR/vtysh
+// rejects it: the whole frr-reload fails (a single vtysh -f add-batch exits
+// non-zero on any CMD_WARNING_CONFIG_FAILED), leaving dynamic routing in a
+// broken/stale state. That is a commit-accepted config the routing daemon
+// cannot load — exactly the fail-class this gate closes.
+//
+// The valid 4-byte AS space is 1..4294967295 (uint32 max); 0 is reserved
+// (RFC 7607) and 23456 (AS_TRANS) is reserved for 4-byte transition but is a
+// legal configured remote-as, so only 0 is rejected here. (PeerAS is a uint32
+// so the upper bound cannot be exceeded by the typed value — the range check
+// documents intent and is robust to a future wider type.)
+//
+// Both the global `protocols bgp` and per-routing-instance scopes are checked.
+// Neighbor addresses are sorted for a deterministic first-error message.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientBGPNeighborPeerAS) so an already-persisted or
+// peer-synced config carrying such a neighbor still BOOTS (#1960
+// fail-closed-on-load class); the render path now skips a remote-as-0 neighbor
+// (defense-in-depth) so AS 0 never reaches frr.conf and a leniently-loaded bad
+// neighbor is inert. Commit / commit-check stay strict. Mirrors
+// validateRoutingExportReferencesStrict.
+func validateBGPNeighborPeerASStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+
+	checkBGP := func(scope string, bgp *BGPConfig) error {
+		if bgp == nil {
+			return nil
+		}
+		neighbors := append([]*BGPNeighbor(nil), bgp.Neighbors...)
+		sort.SliceStable(neighbors, func(i, j int) bool {
+			return neighbors[i].Address < neighbors[j].Address
+		})
+		for _, n := range neighbors {
+			if n == nil {
+				continue
+			}
+			if n.PeerAS == 0 {
+				detail := fmt.Sprintf("%sprotocols bgp neighbor %s", scope, n.Address)
+				if n.GroupName != "" {
+					detail = fmt.Sprintf("%sprotocols bgp group %s neighbor %s", scope, n.GroupName, n.Address)
+				}
+				return fmt.Errorf("%s: missing/invalid peer-as — a BGP neighbor "+
+					"requires a peer-as (remote-as) in 1..4294967295; AS 0 is "+
+					"reserved (RFC 7607) and FRR/vtysh rejects `remote-as 0`, "+
+					"failing the frr-reload — set the neighbor (or its group) "+
+					"peer-as", detail)
+			}
+		}
+		return nil
+	}
+
+	if err := checkBGP("", cfg.Protocols.BGP); err != nil {
+		return err
+	}
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil {
+			continue
+		}
+		scope := fmt.Sprintf("routing-instance %s ", ri.Name)
+		if err := checkBGP(scope, ri.BGP); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validateFirewallPolicerReferencesStrict hard-rejects a firewall-filter
 // term whose `then policer <name>` (Finding A, #2217) references neither a
 // defined single-rate policer (`firewall policer <name>`) nor a defined

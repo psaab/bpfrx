@@ -881,8 +881,8 @@ reserved for whole-dataplane selection where a rewrite shim
     compiled by `compileDDNSServices`/`compileDDNSProvider` in
     `compiler_system.go` into `config.DDNSServicesConfig`/`DDNSProvider` on
     `System.Services.DynamicDNS`): credentials configured ONCE, referenced by
-    scope. Leaves: `backend` (enum: `rfc2136` live; `dyndns2`/`cloudflare`/
-    `route53`/`generic` reserved for P3), `update-server`, `tsig-key`,
+    scope. Leaves: `backend` (enum: `rfc2136`/`dyndns2`/`duckdns`/`cloudflare`/
+    `route53`/`generic` — all live), `update-server`, `tsig-key`,
     `tsig-algorithm`, `tsig-secret` (`config.Secret`-redacted), and the
     `source-address` / `destination-interface` / `routing-instance` transport
     binding (#2665, reused). Plus the engine tunables `forced-refresh` and
@@ -944,18 +944,25 @@ reserved for whole-dataplane selection where a rewrite shim
     gate).
 - **#2691 P3 (HTTP provider backends + checkip — completes #2679):** added the
   consumer/SaaS DNS backends behind the SAME `services dynamic-dns provider
-  <name>` catalog, so a provider is `backend dyndns2|cloudflare|route53|generic`
+  <name>` catalog, so a provider is `backend dyndns2|duckdns|cloudflare|route53|generic`
   instead of `rfc2136`, with per-backend leaves. Every HTTP backend implements
   the SAME `DNSUpdater` interface the rfc2136 backend does — the Surface A engine
   (change-detection, forced-refresh, per-RG HA gate, error backoff) drives them
   identically; only the wire mechanism differs (`pkg/ddns/backend_dyndns2.go`,
-  `backend_cloudflare.go`, `backend_route53.go`, `backend_generic.go`, the shared
-  `backend_http.go`, the minimal SigV4 signer `sigv4.go`).
+  `backend_duckdns.go`, `backend_cloudflare.go`, `backend_route53.go`,
+  `backend_generic.go`, the shared `backend_http.go`, the minimal SigV4 signer
+  `sigv4.go`).
   - **New provider leaves** (all on `services dynamic-dns provider <name>`,
     schema `ddnsServicesSchema()`, compiled by `compileDDNSProvider` —
     credentials are `config.Secret`-redacted):
-    - dyndns2: `server` (endpoint host/URL; a known provider NAME like `duckdns`
-      / `no-ip` / `dyn` resolves a built-in endpoint), `username`, `password`.
+    - dyndns2: `server` (endpoint host/URL; a known provider NAME like `no-ip`
+      / `dyn` resolves a built-in endpoint), `username`, `password`.
+    - duckdns (#2960; its OWN backend, NOT a dyndns2 alias — DuckDNS is not
+      dyndns2-protocol-compatible): `api-token` (the DuckDNS token, sent as a
+      query param not HTTP Basic), `server` optional (defaults to
+      `https://www.duckdns.org/update`). `UpsertLease` ⇒
+      `?domains=<label>&token=&ip=`/`&ipv6=`; success on the literal `OK` body
+      (`KO` ⇒ hard error); withdraw ⇒ `&clear=true` (removes both A and AAAA).
     - cloudflare: `api-token` (Bearer), `zone` (zone NAME; the zone id is
       resolved at update time).
     - route53: `aws-access-key`, `aws-secret-key`, `aws-region` (default
@@ -975,7 +982,8 @@ reserved for whole-dataplane selection where a rewrite shim
     redacts all of them); HTTPS with system-trust cert+hostname verification
     (no InsecureSkipVerify); bounded request timeout; capped response body.
   - **Commit warnings** (`validateSurfaceADDNSWarnings`): an incomplete HTTP
-    provider (dyndns2 with no server + unknown name, cloudflare missing
+    provider (dyndns2 with no server + unknown name, duckdns missing api-token
+    (#2960), cloudflare missing
     api-token/zone, route53 missing keys/hosted-zone-id, generic missing
     url-template) warns and publishes nothing at runtime (fail-open, never a
     hard reject). A malformed `checkip-url` (not an http(s) URL with a host —
