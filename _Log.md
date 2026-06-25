@@ -1,3 +1,58 @@
+## 2026-06-24 — #2701 review fold: end-to-end call-site test for the WG outer source
+
+- **Timestamp**: 2026-06-24
+- **Action**: Added two end-to-end `wg_encap_frame` tests that assert on the
+  EMITTED outer-IP source bytes of a real built frame, closing the
+  test-coverage gap flagged in review: the original
+  `outer_source_uses_physical_egress_not_tunnel_logical` test called the
+  `outer_physical_egress_ifindex` helper directly and stayed GREEN when ONLY
+  the production call-site source lookup (wg.rs) was reverted to the logical
+  `decision.resolution.egress_ifindex`. The new tests build an ESTABLISHED
+  WgEngine (real Noise IKpsk2 handshake so `try_encap` succeeds) over the
+  shared #2680 fixture, with the peer endpoint routed to the physical egress
+  (ifindex 12), and assert the built frame's outer source == the physical WAN
+  primary (172.16.80.8 v4 / 2001:559:8585:80::8 v6), NOT the tunnel-logical
+  address (10.123.0.1 / fd00:dead::1). Verified fail-on-revert at the CALL
+  SITE: reverting wg.rs's source lookup to the logical egress_ifindex turns
+  BOTH new tests RED (the helper tests stay green, confirming they alone were
+  insufficient); restoring → all green.
+- **File(s)**: `userspace-dp/src/afxdp/frame/wg.rs` (two end-to-end tests +
+  engine/inner-frame test helpers), `_Log.md`.
+- **Validation**: `cargo build --release` clean; `cargo test --release --bin
+  xpf-userspace-dp` wg_frame (11/11) + frame:: + tunnel_ttl (293 total) green.
+  Call-site fail-on-revert confirmed manually (both new tests RED on revert).
+
+## 2026-06-24 — #2701 + #2703: tunnel outer-IP-header bugs (WG outer source, GRE/WG outer TTL)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed two coupled outer-IP-header transit bugs in ONE PR.
+  - **#2701 (WG outer SOURCE)**: the #2680/#2683 MTU fix re-resolved the
+    PHYSICAL underlay egress for the outer-MTU guard but the outer IP SOURCE
+    was still read from `decision.resolution.egress_ifindex` (the LOGICAL WG
+    tunnel ifindex) — `None`-drop when the logical iface had no WAN primary,
+    or a tunnel-address source otherwise. Factored the MTU helper's
+    physical-egress resolution into `outer_physical_egress_ifindex` and used
+    it for BOTH the MTU guard (`outer_physical_egress_mtu` now wraps it) AND
+    the outer-source `primary_v4`/`primary_v6` lookup. Outer UDP now sources
+    from the physical WAN primary.
+  - **#2703 (outer TTL=0 sentinel)**: tunnel `TTL=0` means "default 64"
+    (Go config + netlink `pkg/routing/tunnel.go:686-688`), but the AF_XDP
+    snapshot passed `tunnel.TTL` raw → Rust frame builders wrote outer TTL 0
+    → blackhole. Applied the 0→64 default Go-side in
+    `pkg/dataplane/userspace/tunnels.go` (SSOT, mirrors netlink); explicit
+    non-zero preserved. Fail-closed backstop: `TunnelTtl::try_from_snapshot`
+    now maps NEGATIVE → default 64 (was 0); >255 still fails CLOSED.
+- **File(s)**: `userspace-dp/src/afxdp/frame/wg.rs` (helper refactor + outer
+  source + 2 tests), `pkg/dataplane/userspace/tunnels.go` (0→64 default),
+  `pkg/dataplane/userspace/tunnels_test.go` (TTL default/preserve test),
+  `userspace-dp/src/afxdp/forwarding_build/validated.rs` (negative→default),
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs` (negative-TTL test),
+  `docs/wireguard-interop.md` (#2701/#2703 notes), `_Log.md`.
+- **Validation**: `go build ./...`, `go test ./pkg/dataplane/userspace/...`,
+  gofmt, go vet clean; `cargo build --release` clean; `cargo test --release
+  --bin xpf-userspace-dp` wg_frame (9/9) + tunnel_ttl (3/3) + gre/frame
+  filters green. WG/GRE transit is lab-bound on the loss cluster (no WG
+  tunnel) — unit tests are the gate.
 ## 2026-06-24 — #2446: SYN-cookie validated-ACK cache survives zone profile changes
 
 - **Timestamp**: 2026-06-24

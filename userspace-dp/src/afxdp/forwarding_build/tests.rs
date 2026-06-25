@@ -1327,6 +1327,34 @@ fn tunnel_ttl_in_range_builds_exactly() {
     assert_eq!(state.tunnel_endpoints.get(&10).expect("endpoint").ttl, 255);
 }
 
+/// #2703: a NEGATIVE tunnel TTL (a corrupt / mixed-version snapshot
+/// field) maps to the documented default 64, NOT 0. fail-on-revert:
+/// restoring `TunnelTtl(0)` for negatives writes outer TTL 0 and
+/// blackholes the tunnel — the exact failure the Go-side 0→64 default
+/// guards against — making this assertion red.
+#[test]
+fn tunnel_ttl_negative_maps_to_default_not_zero() {
+    let snapshot = ConfigSnapshot {
+        tunnel_endpoints: vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+            id: 11,
+            interface: "gr-0/0/0".into(),
+            ifindex: 52,
+            mode: "gre".into(),
+            source: "203.0.113.1".into(),
+            destination: "198.51.100.1".into(),
+            ttl: -1, // corrupt / mixed-version: must NOT become 0
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert_eq!(
+        state.tunnel_endpoints.get(&11).expect("endpoint").ttl,
+        64,
+        "a negative snapshot TTL must map to the default 64, not 0 (blackhole)"
+    );
+}
+
 /// #2410: a CoS forwarding-class queue id outside 0..=255 fails the
 /// snapshot CLOSED via `CosQueueIdOutOfRange`. fail-on-revert: restoring
 /// the `filter_map` range check silently DROPS the class, the build

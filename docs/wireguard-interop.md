@@ -130,6 +130,34 @@ from `wgDefaultOuterMTU` minus the family overhead. The pre-#2300 code
 ignored `tc.MTU` entirely and always derived from 1500, so a
 lowered-underlay deployment could not set a smaller wgN MTU.
 
+**#2701 (transit-egress OUTER SOURCE).** The #2680 MTU fix resolved the
+physical underlay egress for the MTU guard but left the OUTER IP SOURCE
+still read from `decision.resolution.egress_ifindex` (the LOGICAL tunnel
+ifindex). When the logical WG interface carries no WAN primary the
+`primary_v4?`/`primary_v6?` lookup returned `None` → dropped transit; when
+it carried a tunnel address the outer UDP was sourced from that tunnel
+address (breaking source-dependent policy/NAT/upstream anti-spoofing). The
+MTU helper is now factored into `outer_physical_egress_ifindex` (returns the
+physical underlay ifindex via the same route-to-selected-peer lookup), used
+for BOTH the MTU guard (`outer_physical_egress_mtu` wraps it) AND the outer
+source primary. So the outer UDP is always sourced from the physical WAN
+primary, not the tunnel-logical address. Same conservative fallback: an
+unresolvable outer falls back to `egress_ifindex` (no worse than pre-#2701).
+
+**#2703 (outer TTL default).** A tunnel TTL of `0` is the "use the default
+64" sentinel in the Go config (`schema_interfaces.go`, `types_routing.go`),
+and the netlink GRE path applies it (`pkg/routing/tunnel.go: if ttl == 0 {
+ttl = 64 }`). The AF_XDP transit path passed `tunnel.TTL` raw into the
+snapshot, and the Rust frame builders (`frame/wg.rs`, `gre.rs`) write the
+snapshot TTL straight into the outer IP header — so a default-config tunnel
+emitted outer TTL/hop-limit 0 → deterministic first-hop blackhole. The 0→64
+default is now applied Go-side in `pkg/dataplane/userspace/tunnels.go` (the
+SSOT, mirroring the netlink precedent) before the value reaches the
+snapshot; an explicit non-zero TTL is preserved. As a fail-closed backstop,
+`TunnelTtl::try_from_snapshot` now maps a NEGATIVE snapshot TTL (corrupt /
+mixed-version) to the documented default 64 rather than 0 (an out-of-range
+value > 255 still fails the snapshot CLOSED via `TunnelTtlOutOfRange`).
+
 Residual / follow-up: the per-peer LEARNED-endpoint roam case still uses
 the spawn-time outer MTU on the control thread (the transit-egress path
 already reads the real per-packet egress MTU); the Go default cannot see
