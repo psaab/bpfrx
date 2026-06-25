@@ -39,13 +39,21 @@
   — now gone-from-config — is withdrawn (Pass 2, real DeleteLease through the
   same backend). Composes with #2778 lock-IO, #2820, #2840, #2843 status, #2846.
 - **File(s)**: pkg/ddns/state.go (ScopeKey.FQDN + scopePrefix), pkg/ddns/surface_a.go
-  (effectiveKey + all ownership lookups), pkg/daemon/daemon_ddns_surface_a.go
-  (populate Key.FQDN), pkg/ddns/surface_a_test.go (two fail-on-revert tests +
-  helper), pkg/ddns/README.md
+  (effectiveKey + adopt-on-migration + all ownership lookups),
+  pkg/daemon/daemon_ddns_surface_a.go (populate Key.FQDN),
+  pkg/ddns/surface_a_test.go (fail-on-revert tests + helper), pkg/ddns/README.md
 - **Validation**: go build ./..., gofmt -l (edited files clean), go vet
-  ./pkg/ddns/... ./pkg/daemon/..., go test -race ./pkg/ddns/... ./pkg/daemon/...;
-  fail-on-revert verified (both new tests RED when effectiveKey drops FQDN:
-  new name unpublished + zero deletes).
+  ./pkg/ddns/... ./pkg/daemon/..., go test -race ./pkg/ddns/... ./pkg/daemon/...
+- **Fail-on-revert matrix** (review #2924 follow-up — corrected from the original
+  over-claim that pinned the revert to effectiveKey): the LOAD-BEARING change is
+  `scopePrefix()` appending `/fqdn=`. Dropping it turns
+  TestSurfaceAFQDNChangeDetectedAndPublished + TestSurfaceAFQDNChangeWithdrawsOldName
+  RED (new name unpublished + zero deletes). The effectiveKey() FOLD is guarded
+  separately by TestSurfaceAFQDNFoldFromScopeFQDN (Key.FQDN empty, only
+  SurfaceAScope.FQDN set) — RED when effectiveKey reverts to `return s.Key`. The
+  adopt block is guarded by TestSurfaceAFQDNMigrationAdoptsExistingRecord (seed
+  legacyKey.FQDN="" so a real pre-#2903 FQDN-less record exists) — RED when the
+  adopt branch is disabled.
 
 ## 2026-06-25 — #2867: VRRP GARP/NA burst follow-up loops keep poisoning after abdication
 
