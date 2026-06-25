@@ -142,17 +142,53 @@ type surfaceAState struct {
 	backoff      time.Duration
 	lastErr      string
 	lastErrAt    time.Time
+	// noBackend records that the most recent reconcile resolved the scope's
+	// provider to the no-op backend (errSurfaceANoBackend — a half-configured
+	// provider). Unlike lastErr it arms NO backoff (nothing was attempted on the
+	// wire) and is cleared on the first successful publish. It drives the
+	// SurfaceAStateUnpublished status row so a never-published scope is visible to
+	// the operator instead of silently omitted (#2843).
+	noBackend bool
 }
+
+// Surface A scope status states for the operator view (#2843). A configured
+// scope is rendered with exactly one of these so the operator sees every
+// configured scope and its health, not only the successfully-owned ones.
+const (
+	// SurfaceAStatePublished — the scope has a durable ownership record (an RR
+	// is published at the provider).
+	SurfaceAStatePublished = "published"
+	// SurfaceAStatePending — the scope is configured and has no ownership record
+	// and no recorded error yet (never attempted, or skipped waiting on an
+	// address observation / backoff window). Bring-up steady state.
+	SurfaceAStatePending = "pending"
+	// SurfaceAStateUnpublished — the scope is configured but cannot publish
+	// because its provider resolved to the no-op backend (a half-configured
+	// provider, errSurfaceANoBackend). Distinct from a transient error: nothing
+	// is attempted on the wire and no backoff is armed.
+	SurfaceAStateUnpublished = "unpublished"
+	// SurfaceAStateError — the scope is configured and its last publish attempt
+	// failed (provider/wire error); LastError/LastErrorAt carry the reason and
+	// error backoff is armed.
+	SurfaceAStateError = "error"
+	// SurfaceAStateWithdrawPending — an ownership record exists for a scope that
+	// is NO LONGER configured (the binding was removed); the next reconcile will
+	// withdraw it. Surfaced so a wedged withdraw is visible, not silent.
+	SurfaceAStateWithdrawPending = "withdraw-pending"
+)
 
 // SurfaceAStatusView is a read-only projection of one Surface A scope's
 // current publish state, for the operator surfaces (CLI/gRPC/REST). It exposes
-// what is currently published, the last-published time, and the last error.
+// the scope's health State (#2843 — every CONFIGURED scope gets a row, not just
+// the successfully-owned ones), what is currently published, the last-published
+// time, and the last error.
 type SurfaceAStatusView struct {
 	Interface     string
 	Unit          int
 	Family        int
 	FQDN          string
 	Provider      string
+	State         string // one of the SurfaceAState* constants (#2843)
 	Published     string // current published address ("" = none)
 	LastPublished time.Time
 	LastError     string
@@ -523,9 +559,14 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 		if errors.Is(err, errSurfaceANoBackend) {
 			// No live backend (half-configured provider): nothing was attempted on
 			// the wire. Do NOT arm error backoff and do NOT advance the
-			// last-published cache — leave rt untouched so the scope re-attempts
-			// every cycle once the operator adds the credential. Swallow the
-			// sentinel (not a pass error).
+			// last-published cache — leave the publish cadence untouched so the scope
+			// re-attempts every cycle once the operator adds the credential. Swallow
+			// the sentinel (not a pass error). Record noBackend so the status surface
+			// shows an "unpublished: no backend" row instead of omitting the scope
+			// entirely (#2843).
+			rt.noBackend = true
+			rt.lastErr = err.Error()
+			rt.lastErrAt = now
 			return nil
 		}
 		if errors.Is(err, errSurfaceAPublishRaced) {
@@ -547,6 +588,8 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 	rt.nextEligible = time.Time{}
 	rt.backoff = 0
 	rt.lastErr = ""
+	rt.lastErrAt = time.Time{}
+	rt.noBackend = false
 	return nil
 }
 
@@ -857,20 +900,82 @@ func (m *SurfaceAManager) recordScopeError(rt *surfaceAState, sc SurfaceAScope, 
 	rt.nextEligible = now.Add(rt.backoff)
 	rt.lastErr = err.Error()
 	rt.lastErrAt = now
+	rt.noBackend = false
 	slog.Warn("ddns surface-a: scope publish failed; backing off",
 		"fqdn", sc.FQDN, "backoff", rt.backoff, "err", err)
 }
 
-// StatusViews returns a stable-ordered snapshot of every Surface A scope's
-// current publish state for the operator surfaces (plan §5.5 observability). It
-// merges the durable ownership store (what is published) with the in-memory
-// runtime state (last-published time + last error).
-func (m *SurfaceAManager) StatusViews() []SurfaceAStatusView {
+// StatusViews returns a stable-ordered snapshot of EVERY configured Surface A
+// scope's current publish state for the operator surfaces (plan §5.5
+// observability, #2843). It is the union of:
+//
+//   - every CONFIGURED scope (the `scopes` arg, materialized by the daemon from
+//     the committed config) — so a scope that has NEVER successfully published
+//     (no ownership record yet) or that errored (no-backend / provider failure /
+//     wedged) still appears, with its State and reason. Before #2843 these were
+//     silently omitted — the operator saw nothing for a broken bring-up scope.
+//   - any ownership record for a scope NO LONGER configured — a withdraw is
+//     pending; surfaced as withdraw-pending so a wedged teardown is visible.
+//
+// Each row merges the durable ownership store (what is published) with the
+// in-memory runtime state (last-published time, last error, no-backend flag).
+// Caller need not hold the mutex (the method takes it). A nil/empty `scopes`
+// (no configured Surface A bindings) yields only the orphaned-ownership rows.
+func (m *SurfaceAManager) StatusViews(scopes []SurfaceAScope) []SurfaceAStatusView {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]SurfaceAStatusView, 0, len(m.state.records))
+
+	out := make([]SurfaceAStatusView, 0, len(scopes)+len(m.state.records))
+	// configured tracks which scope prefixes are covered by a configured-scope
+	// row so the orphaned-ownership sweep below skips them.
+	configured := make(map[string]struct{}, len(scopes))
+
+	for _, sc := range scopes {
+		sid := sc.scopeID()
+		configured[sid] = struct{}{}
+		v := SurfaceAStatusView{
+			Interface: sc.Key.Interface,
+			Unit:      sc.Key.Unit,
+			Family:    int(sc.Key.Family),
+			FQDN:      sc.FQDN,
+			Provider:  sc.Key.PolicyID,
+		}
+		owned, isOwned := m.state.get(sc.Key, surfaceAIdentity, "")
+		if isOwned {
+			v.Published = owned.AddrText
+			if owned.FQDN != "" {
+				v.FQDN = owned.FQDN
+			}
+		}
+		rt := m.runtime[sid]
+		if rt != nil {
+			v.LastPublished = rt.lastPublished
+			v.LastError = rt.lastErr
+			v.LastErrorAt = rt.lastErrAt
+		}
+		switch {
+		case isOwned:
+			v.State = SurfaceAStatePublished
+		case rt != nil && rt.noBackend:
+			v.State = SurfaceAStateUnpublished
+		case rt != nil && rt.lastErr != "":
+			v.State = SurfaceAStateError
+		default:
+			// Configured, not yet owned, no recorded error: never attempted, or
+			// waiting on an address observation / backoff window.
+			v.State = SurfaceAStatePending
+		}
+		out = append(out, v)
+	}
+
+	// Orphaned ownership: a record for a scope no longer configured. The next
+	// reconcile (Pass 2) withdraws it; surface it as withdraw-pending so a wedged
+	// teardown is not invisible.
 	for _, r := range m.state.all() {
 		sc := r.scopeOf()
+		if _, ok := configured[sc.scopePrefix()]; ok {
+			continue
+		}
 		v := SurfaceAStatusView{
 			Interface: sc.Interface,
 			Unit:      sc.Unit,
@@ -878,6 +983,7 @@ func (m *SurfaceAManager) StatusViews() []SurfaceAStatusView {
 			FQDN:      r.FQDN,
 			Provider:  sc.PolicyID,
 			Published: r.AddrText,
+			State:     SurfaceAStateWithdrawPending,
 		}
 		if rt := m.runtime[sc.scopePrefix()]; rt != nil {
 			v.LastPublished = rt.lastPublished
@@ -886,6 +992,7 @@ func (m *SurfaceAManager) StatusViews() []SurfaceAStatusView {
 		}
 		out = append(out, v)
 	}
+
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].FQDN != out[j].FQDN {
 			return out[i].FQDN < out[j].FQDN

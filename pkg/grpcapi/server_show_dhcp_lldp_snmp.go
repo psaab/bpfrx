@@ -329,11 +329,11 @@ func (s *Server) showServicesDynamicDNS(cfg *config.Config, buf *strings.Builder
 
 	if detail && s.surfaceADDNSStatusFn != nil {
 		views := s.surfaceADDNSStatusFn()
-		buf.WriteString("\n  Published scopes:\n")
+		buf.WriteString("\n  Configured scopes:\n")
 		if len(views) == 0 {
 			buf.WriteString("    none\n")
 		} else {
-			fmt.Fprintf(buf, "    %-32s %-6s %-39s %-12s %s\n", "FQDN", "Family", "Address", "Provider", "Last error")
+			fmt.Fprintf(buf, "    %-32s %-6s %-15s %-39s %-12s %s\n", "FQDN", "Family", "State", "Address", "Provider", "Last error")
 			for _, v := range views {
 				fam := "inet"
 				if v.Family == 6 {
@@ -343,8 +343,12 @@ func (s *Server) showServicesDynamicDNS(cfg *config.Config, buf *strings.Builder
 				if lastErr == "" {
 					lastErr = "-"
 				}
-				fmt.Fprintf(buf, "    %-32s %-6s %-39s %-12s %s\n",
-					v.FQDN, fam, v.Published, v.Provider, lastErr)
+				addr := v.Published
+				if addr == "" {
+					addr = "-"
+				}
+				fmt.Fprintf(buf, "    %-32s %-6s %-15s %-39s %-12s %s\n",
+					v.FQDN, fam, v.State, addr, v.Provider, lastErr)
 			}
 		}
 	}

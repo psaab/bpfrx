@@ -1,3 +1,37 @@
+## 2026-06-25 — #2843: DDNS Surface A status omits never-published / errored scopes
+
+- **Timestamp**: 2026-06-25
+- **Action**: `SurfaceAManager.StatusViews` built rows ONLY from durable
+  ownership records, so a configured scope that failed before its first
+  publish (esp. a half-configured provider whose `errSurfaceANoBackend`
+  was swallowed without `recordScopeError`) had no row — invisible in
+  `show services dynamic-dns detail` during bring-up.
+- **Fix**: `StatusViews(scopes []SurfaceAScope)` now returns the UNION of
+  a row per CONFIGURED scope (merged with ownership + runtime state) and
+  any ownership record for a scope no longer configured (withdraw
+  pending). New `SurfaceAStatusView.State`: published / unpublished
+  (no-backend) / error / pending / withdraw-pending. The no-backend
+  sentinel now records a per-scope reason (`rt.noBackend` + `lastErr`)
+  WITHOUT arming retry backoff, cleared on success / superseded by a real
+  error. Daemon `SurfaceAStatus()` materializes the configured scopes via
+  `buildSurfaceAScopes(ActiveConfig())`. CLI + gRPC `show` render the new
+  State column (text only — `SurfaceAStatusView` is an internal Go type,
+  rendered server/client side; NO protobuf/wire field added).
+- **Test**: `TestStatusViewsSurfacesUnpublishedScopes` +
+  `TestStatusViewsSurfacesPendingAndPublished` (fail-on-revert) — a
+  configured no-backend scope appears as `unpublished` with a reason, a
+  never-observed scope as `pending`, a published scope as `published`, and
+  an orphaned ownership record as `withdraw-pending`. Verified RED when
+  StatusViews reverts to ownership-records-only.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/surface_a_test.go,
+  pkg/ddns/surface_a_http_test.go, pkg/ddns/surface_a_lockio_test.go,
+  pkg/daemon/daemon_ddns_surface_a.go, pkg/cli/cli_show_services.go,
+  pkg/grpcapi/server_show_dhcp_lldp_snmp.go, pkg/ddns/README.md
+- **Validation**: go build ./... ; gofmt -l (clean on touched files) ;
+  go vet ./pkg/ddns/... ./pkg/daemon/... ./pkg/grpcapi/... (clean;
+  pre-existing pkg/cli/cli.go:460 unreachable-code vet warning is on
+  origin/master, in a file I did not touch) ; go test ./pkg/ddns/...
+  ./pkg/daemon/... ./pkg/grpcapi/... ./pkg/cli/... (PASS).
 ## 2026-06-25 — #2838: DDNS generic backend false-success on substring "ok"
 
 - **Timestamp**: 2026-06-25
@@ -17080,6 +17114,35 @@ top.
   TestP3GenericURLTemplateMalformedWarns and TestGenericURLTemplateValidation
   RED (host-less accepted + uppercase scheme false-rejected).
 
+- **Action**: #2844 — unify the NAT64 Ethernet-header writer onto the
+  shared SSOT writer. Deleted NAT64's private `write_eth_header`
+  (hardcoded 0x8100 TPID, bare-VID) and routed both NAT64 frame
+  builders through `crate::afxdp::write_eth_header_slice`, the same
+  in-place writer used by gre.rs / icmp.rs / TX segmentation. Output is
+  byte-identical for the current bare-VID case (`TxVlanTag::from(u16)`
+  reproduces present-iff-vid>0 / TPID 0x8100 / PCP·DEI 0), so no wire
+  change; the point is forward-compat — a future TPID/PCP/DEI/802.1ad/
+  ethertype change in the shared module now reaches NAT64.
+- **File(s)**:
+  - `userspace-dp/src/afxdp/frame/headers.rs` — `write_eth_header_slice`
+    widened `pub(in crate::afxdp)` → `pub(crate)`; module-doc note.
+  - `userspace-dp/src/afxdp/frame/mod.rs` — split it to a `pub(crate)`
+    re-export (other writers stay `pub(in crate::afxdp)`).
+  - `userspace-dp/src/afxdp/mod.rs` — `pub(crate) use
+    self::frame::write_eth_header_slice;` so `crate::nat64` (outside
+    `crate::afxdp`) can reach it.
+  - `userspace-dp/src/nat64.rs` — deleted private writer; import +
+    call the SSOT writer in both builders; module-doc SSOT section.
+  - `userspace-dp/src/nat64_tests.rs` — added byte-identical
+    fail-on-revert test `nat64_eth_header_is_ssot_byte_identical`
+    (v6→v4 untagged 0x0800, v6→v4 VLAN-100 0x8100+VID+0x0800,
+    v4→v6 untagged 0x86dd).
+- **Validation**: `cargo build --release -p xpf-userspace-dp` (Finished);
+  `cargo test --release --bin xpf-userspace-dp -- nat64 eth frame`
+  (453 passed, 0 failed). No `protocol_wire_v1.json` change. Fail-on-
+  revert confirmed: flipping the v6→v4 builder ethertype to 0x86dd
+  makes `nat64_eth_header_is_ssot_byte_identical` RED (got 0x86dd vs
+  expected 0x0800).
 ## 2026-06-25 — #2839 DDNS checkip-allowlist: surface malformed tokens (no silent drop)
 - **Timestamp**: 2026-06-25
 - **Action**: `ddns.ParseAllowlist` silently dropped malformed checkip-allowlist

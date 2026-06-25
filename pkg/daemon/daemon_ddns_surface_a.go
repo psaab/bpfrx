@@ -534,5 +534,13 @@ func (d *Daemon) SurfaceAStatus() []ddns.SurfaceAStatusView {
 	if d.surfaceA == nil {
 		return nil
 	}
-	return d.surfaceA.StatusViews()
+	// Materialize the CURRENTLY configured scopes so the status surfaces every
+	// configured scope — including ones that never published or are erroring —
+	// not just the durably-owned ones (#2843). A nil cfg yields only the
+	// withdraw-pending (orphaned-ownership) rows.
+	var scopes []ddns.SurfaceAScope
+	if cfg := d.store.ActiveConfig(); cfg != nil {
+		scopes = d.buildSurfaceAScopes(cfg)
+	}
+	return d.surfaceA.StatusViews(scopes)
 }

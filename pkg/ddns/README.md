@@ -403,8 +403,28 @@ its OWN learned address — on top of the SAME spine, without forking the engine
   `surface_a_lockio_test.go` (a blocking provider + a concurrent `StatusViews`
   that would hang if the lock were held; fail-on-revert).
 - **Operator surfaces:** `show services dynamic-dns [detail]` (CLI + gRPC), the
-  `xpf_ddns_surface_a_*` Prometheus family, and `SurfaceAManager.StatusViews()`
-  (per-scope published address + last-published time + last error).
+  `xpf_ddns_surface_a_*` Prometheus family, and
+  `SurfaceAManager.StatusViews(scopes)` (per-scope `State` + published address +
+  last-published time + last error).
+- **Status surfaces EVERY configured scope, not just the owned ones (#2843).**
+  `StatusViews` takes the CURRENTLY configured scopes (materialized by the daemon
+  from the committed config) and returns the UNION of: a row per configured scope
+  (merged with its ownership record + runtime state) AND any ownership record for
+  a scope no longer configured (a withdraw is pending). Each row carries a
+  `State`: `published` (owns a record), `unpublished` (the provider resolved to
+  the no-op backend — `errSurfaceANoBackend`, a half-configured provider; the
+  reason is in `LastError`, no backoff armed), `error` (the last publish attempt
+  failed; reason + backoff armed), `pending` (configured, not yet owned, no
+  recorded error — never attempted or waiting on an address observation / backoff
+  window), or `withdraw-pending` (owned but no longer configured). Before #2843
+  the status was built from ownership records ONLY, so a scope that failed before
+  its first publish — most acutely a half-configured provider whose
+  `errSurfaceANoBackend` was swallowed without `recordScopeError` — was INVISIBLE
+  in `show ... detail`, the opposite of what an operator needs during bring-up.
+  The no-backend state now records a per-scope reason on the runtime cache
+  (without arming retry backoff) so the row reports it. Proven (fail-on-revert)
+  in `surface_a_http_test.go` (`TestStatusViewsSurfacesUnpublishedScopes`,
+  `TestStatusViewsSurfacesPendingAndPublished`).
 - **Tests through the REAL backend.** The self-owned replace, forced-refresh,
   and both withdraw paths are proven in `surface_a_rfc2136_test.go` against the
   stateful in-process fake DNS server (the `backend_rfc2136_test.go` harness) with

@@ -86,7 +86,7 @@ func TestSurfaceALockNotHeldDuringUpsert(t *testing.T) {
 	// proceed. If the lock were held across the I/O this read would block and the
 	// bounded wait fires — the fail-on-revert assertion.
 	statusDone := make(chan []SurfaceAStatusView, 1)
-	go func() { statusDone <- m.StatusViews() }()
+	go func() { statusDone <- m.StatusViews([]SurfaceAScope{sc}) }()
 	select {
 	case <-statusDone:
 		// good: the lock was free during provider I/O.
@@ -153,7 +153,7 @@ func TestSurfaceALockNotHeldDuringDelete(t *testing.T) {
 	}
 
 	statusDone := make(chan []SurfaceAStatusView, 1)
-	go func() { statusDone <- m.StatusViews() }()
+	go func() { statusDone <- m.StatusViews([]SurfaceAScope{sc}) }()
 	select {
 	case <-statusDone:
 	case <-time.After(2 * time.Second):
@@ -277,7 +277,7 @@ func TestSurfaceAPublishRaceDoesNotClobberNewerState(t *testing.T) {
 
 	// The owned/published address must be B (the newer desired state), never
 	// reverted to A by the stale result.
-	views := m.StatusViews()
+	views := m.StatusViews([]SurfaceAScope{sc})
 	if len(views) != 1 {
 		t.Fatalf("expected one owned scope, got %d: %+v", len(views), views)
 	}
