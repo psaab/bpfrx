@@ -559,6 +559,18 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.GreEncapDfOversizeDropsTotal),
 	)
 
+	// #2782: native-GRE decap checksum-invalid drops (C bit set but the
+	// GRE checksum failed to verify, or the header was truncated past the
+	// Checksum+Reserved1 field). Emitted unconditionally so a 0 is a real
+	// "no corrupt checksummed GRE frames seen" signal rather than an
+	// absent series. Nonzero flags a checksummed GRE peer delivering
+	// corrupt frames / a truncated GRE header.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceGreDecapChecksumInvalidDrops,
+		prometheus.CounterValue,
+		float64(status.GreDecapChecksumInvalidDropsTotal),
+	)
+
 	// #2472: locally-generated error-reply per-reason token-bucket drops.
 	// Emitted unconditionally so a 0 is a real "no generated errors
 	// rate-limited" signal rather than an absent series. Nonzero flags an

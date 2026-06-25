@@ -54,15 +54,21 @@ pub(in crate::afxdp) enum EgressMtuDecision {
 /// Compute the egress-MTU decision for a forwarded L3 frame that the TCP
 /// segmentation path did NOT handle.
 ///
-/// `forwarded_len` is the on-the-wire length of the frame as it will leave
-/// the egress interface (post-NAT / post-header-rewrite). `l3_offset` is
-/// where the L3 header starts in that frame. The decision compares the L3
-/// payload (`forwarded_len - l3_offset`) against the resolved egress MTU.
+/// `frame` is the frame as it will leave the egress interface (post-NAT /
+/// post-header-rewrite). `l3_offset` is where the L3 header starts in that
+/// frame. The decision compares the IP-DECLARED L3 datagram length (the same
+/// length authority the PTB builders quote — IPv4 `total_len`, IPv6
+/// `40 + payload_len`, each clamped to the buffer) against the resolved
+/// egress MTU. It deliberately does NOT use the raw buffer length
+/// (`frame.len() - l3_offset`): ethernet padding / trailing bytes beyond the
+/// IP datagram would otherwise mis-fire or mis-size the PTB (#2783).
 ///
 /// Returns `Forward` whenever:
 ///   - no egress MTU is known for the resolution (fail-open: never invent
 ///     an MTU smaller than the link),
-///   - the L3 payload fits the MTU,
+///   - the IP header is unparseable / too short to read the declared length
+///     (fail-open rather than over-read a truncated buffer),
+///   - the L3 datagram fits the MTU,
 ///   - the packet is IPv4 without the DF bit (the downstream is allowed to
 ///     fragment — keep the pre-#2301 behaviour rather than PTB-storm a
 ///     fragmentable flow), or
@@ -77,7 +83,18 @@ pub(in crate::afxdp) fn forwarded_egress_mtu_decision(
     if mtu == 0 || l3_offset >= frame.len() {
         return EgressMtuDecision::Forward;
     }
-    let l3_len = frame.len().saturating_sub(l3_offset);
+    let packet = &frame[l3_offset..];
+    // #2783: size the decision off the IP-DECLARED L3 length — the exact
+    // length authority the PTB builders quote — not the AF_XDP buffer
+    // length. A buffer that carries ethernet padding / trailing bytes
+    // beyond the IP datagram would otherwise fire (or drop) a PTB for a
+    // datagram that actually fits the egress MTU, then quote the smaller
+    // declared packet, hiding why the decision fired. An unparseable /
+    // truncated header (declared length unreadable) fails open to Forward
+    // rather than over-reading the buffer.
+    let Some(l3_len) = ip_declared_l3_len(packet, addr_family) else {
+        return EgressMtuDecision::Forward;
+    };
     if l3_len <= mtu {
         return EgressMtuDecision::Forward;
     }
@@ -93,7 +110,7 @@ pub(in crate::afxdp) fn forwarded_egress_mtu_decision(
             // Only signal PTB when the sender forbade fragmentation
             // (DF=1). A non-DF oversized datagram is the downstream's to
             // fragment; PTB-storming it would regress the prior behaviour.
-            if ipv4_df_set(&frame[l3_offset..]) {
+            if ipv4_df_set(packet) {
                 EgressMtuDecision::EmitPacketTooBig { next_hop_mtu }
             } else {
                 EgressMtuDecision::Forward
@@ -189,6 +206,46 @@ pub(in crate::afxdp) fn post_transform_inner_mtu(
             crate::afxdp::wg::mss::wg_inner_mtu(endpoint.outer_family, outer_mtu)
         }
         TunnelKind::Unknown => 0,
+    }
+}
+
+/// Compute the IP-declared L3 datagram length (header + payload) for the
+/// egress-MTU decision, mirroring exactly what the PTB builders quote.
+///
+/// `packet` is the L3 (IP-header-first) slice of the frame. Returns the
+/// number of bytes the IP header *says* the datagram is, clamped to what is
+/// actually present in the buffer:
+///   - IPv4: `total_len` (bytes 2..4), `.min(packet.len())`
+///     (`build_frag_needed_v4`).
+///   - IPv6: `40 + payload_len` (bytes 4..6), `.min(packet.len())`
+///     (`build_packet_too_big_v6`).
+///
+/// Returns `None` when the IP header is too short to read the declared
+/// length (a truncated / malformed packet) so the decision can fail-open to
+/// `Forward` rather than over-read or invent a length. This is the SINGLE
+/// length authority shared by the decision and the builders (#2783): using
+/// the on-wire buffer length (`frame.len() - l3_offset`) for the decision
+/// while the builders quote the IP-declared length lets ethernet padding /
+/// trailing bytes mis-fire a PTB (false positive) or, conversely, a
+/// short-buffer-but-large-declared packet miss one.
+#[inline]
+fn ip_declared_l3_len(packet: &[u8], addr_family: u8) -> Option<usize> {
+    match addr_family as i32 {
+        libc::AF_INET => {
+            if packet.len() < 20 {
+                return None;
+            }
+            let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+            Some(total_len.min(packet.len()))
+        }
+        libc::AF_INET6 => {
+            if packet.len() < 40 {
+                return None;
+            }
+            let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+            Some((40 + payload_len).min(packet.len()))
+        }
+        _ => None,
     }
 }
 

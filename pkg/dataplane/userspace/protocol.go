@@ -1003,6 +1003,17 @@ type ProcessStatus struct {
 	// PTB signalling is deferred to #2330. Omitempty for wire compat with
 	// older helpers (defaults to 0).
 	GreEncapDfOversizeDropsTotal uint64 `json:"gre_encap_df_oversize_drops_total,omitempty"`
+	// #2782: native-GRE decap frames dropped because the GRE
+	// Checksum-Present (C) bit was set but the GRE checksum failed to
+	// verify (or the header was truncated past the 4-byte
+	// Checksum+Reserved1 field). Per RFC 2784 §2.1 + RFC 2890 a
+	// checksummed peer (e.g. a vSRX with GRE checksum enabled) is now
+	// decapped after skipping+validating the checksum field instead of
+	// being silently blackholed; only a frame the path corrupted is
+	// dropped here. Surfaced as
+	// xpf_userspace_gre_decap_checksum_invalid_drops_total. Omitempty for
+	// wire compat with older helpers (defaults to 0).
+	GreDecapChecksumInvalidDropsTotal uint64 `json:"gre_decap_checksum_invalid_drops_total,omitempty"`
 	// #2472: locally-generated ICMP Time Exceeded / PTB / `reject` error
 	// replies dropped because the per-reason token bucket was empty. Each
 	// reason has an independent global-per-reason bucket (Linux

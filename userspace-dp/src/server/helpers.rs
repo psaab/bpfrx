@@ -105,6 +105,14 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // rather than silently dropping it downstream.
     state.status.gre_encap_df_oversize_drops_total =
         state.afxdp.gre_encap_df_oversize_drops_total();
+    // #2782: native-GRE decap checksum-invalid drops (C bit set but the
+    // GRE checksum failed to verify, or the header was truncated past the
+    // Checksum+Reserved1 field). Nonzero = a checksummed GRE peer
+    // delivering corrupt frames / a truncated GRE header. A verified
+    // checksummed frame forwards (RFC 2784 §2.1 / RFC 2890); only the
+    // corrupt residue is counted here.
+    state.status.gre_decap_checksum_invalid_drops_total =
+        state.afxdp.gre_decap_checksum_invalid_drops_total();
     // #2472: locally-generated error-reply per-reason token-bucket drops.
     // Nonzero = an error-amplification / reflection flood (or a routing loop)
     // being clamped before it emits unbounded generated ICMP/RST errors.
