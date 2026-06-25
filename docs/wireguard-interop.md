@@ -130,6 +130,38 @@ from `wgDefaultOuterMTU` minus the family overhead. The pre-#2300 code
 ignored `tc.MTU` entirely and always derived from 1500, so a
 lowered-underlay deployment could not set a smaller wgN MTU.
 
+**#2684 (PTB advertisement — the #2680 sibling on the same SSOT).** The
+post-transform PMTUD path (`post_transform_inner_mtu`, the TX dispatcher's
+inner-MTU derivation that turns an oversized DF-IPv4 / IPv6 inner into a
+Frag-Needed / Packet-Too-Big) computed the WG arm's outer MTU via
+`tunnel_outer_mtu` (the #2300 transport-MTU SSOT). For a WG transit flow
+`endpoint.destination` is zeroed (the peer carries the real outer hop), so
+`tunnel_outer_mtu`'s `tx_ifindex` resolution NoRoutes and the chain falls
+through to the tunnel LOGICAL `egress_ifindex` MTU (~1420 = underlay −
+encap). Feeding that already-reduced MTU to `wg_inner_mtu` subtracts the WG
+outer overhead a SECOND time, so the PTB advertised
+`wg_inner_mtu(1420)` ≈ 1345 (v4) / 1325 (v6) — ~80-100B SMALLER than the
+underlay actually permits. The encap drop guard (#2680) admits inner packets
+up to `wg_inner_mtu(physical=1500)` ≈ 1425 (v4) / 1405 (v6), so a DF-IPv4 /
+IPv6 inner in the band `(wg_inner_mtu(logical), wg_inner_mtu(physical)]` got
+a PTB clamping the sender ~100B too low (over-conservative — safe, no drops,
+but unnecessary fragmentation pressure / throughput loss).
+
+The WG arm now derives the outer MTU from the PHYSICAL underlay via
+`frame::wg_endpoint_physical_outer_mtu`, a thin wrapper over the same #2680
+`outer_physical_egress_mtu` SSOT the encap guard uses. The PTB path runs
+before the per-packet peer LPM (it has no inner frame), but the WG underlay
+is per-tunnel-endpoint, not per-inner-flow (#2734) — so it route-resolves
+the physical egress via the FIRST peer that carries an endpoint address.
+Corrected formula: advertised inner MTU = `wg_inner_mtu(outer_family,
+physical_underlay_mtu)` = `physical_mtu − WG_OVERHEAD_{V4,V6} −
+WG_MAX_PADDING` — EXACTLY the inverse of `wg_encapped_size` the encap guard
+admits against, so the PTB and the guard now agree. Conservative fallback
+(no peer endpoint to route to / unresolvable outer) reverts to the logical
+`egress_ifindex` MTU — the pre-#2684 value, never worse. GRE is unaffected:
+its `endpoint.destination` is the real outer hop, so `tunnel_outer_mtu`
+already resolves to the physical underlay for `native_gre_inner_mtu`.
+
 **#2701 (transit-egress OUTER SOURCE).** The #2680 MTU fix resolved the
 physical underlay egress for the MTU guard but left the OUTER IP SOURCE
 still read from `decision.resolution.egress_ifindex` (the LOGICAL tunnel

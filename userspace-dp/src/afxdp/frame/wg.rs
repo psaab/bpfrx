@@ -138,6 +138,62 @@ fn outer_physical_egress_mtu(
         .unwrap_or(1500)
 }
 
+/// The PHYSICAL underlay egress MTU for a WireGuard endpoint, for the
+/// post-transform PTB inner-MTU derivation (#2684).
+///
+/// This is the SAME physical-underlay SSOT (`outer_physical_egress_mtu`,
+/// #2680) the encap drop guard uses, exposed so the TX dispatcher's
+/// `post_transform_inner_mtu` advertises an inner MTU consistent with what
+/// the encap guard actually admits. The PTB path runs BEFORE the per-packet
+/// peer LPM (it has no inner frame to select a peer), but the WG outer
+/// underlay is per-tunnel-endpoint, not per-inner-flow (#2734): every peer of
+/// an endpoint egresses the same physical underlay. So we resolve the
+/// physical egress via the FIRST peer endpoint that yields a route; the
+/// fallback inside `outer_physical_egress_mtu` (route unresolvable → the
+/// resolution's own `egress_ifindex` MTU = the tunnel LOGICAL MTU) preserves
+/// the conservative pre-#2684 behaviour, never tighter.
+///
+/// Returns the logical-ifindex MTU fallback when the endpoint has no peer
+/// with a learned/configured endpoint address (no outer hop to route to) —
+/// the same value `tunnel_outer_mtu` would have produced, so the PTB is no
+/// worse than before in that degenerate case.
+///
+/// # Why not `tunnel_outer_mtu`
+/// For a WG transit flow `endpoint.destination` is `0.0.0.0`/`::`
+/// (`forwarding_build::tunnels` zeroes it — the peer carries the real outer
+/// hop), so `tunnel_outer_mtu`'s `tx_ifindex` resolution NoRoutes and the
+/// chain falls through to the LOGICAL `egress_ifindex` MTU (~1420). Feeding
+/// that to `wg_inner_mtu` subtracts the WG encap overhead a SECOND time
+/// (the logical MTU is already underlay − encap), under-advertising the
+/// inner PMTU by ~one encap (~75-95B). GRE is unaffected: its
+/// `endpoint.destination` is the real outer hop, so `tunnel_outer_mtu`
+/// resolves to the physical underlay correctly.
+#[inline]
+pub(in crate::afxdp) fn wg_endpoint_physical_outer_mtu(
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    endpoint: &TunnelEndpoint,
+) -> usize {
+    // The WG underlay is per-endpoint (#2734): the first peer with a known
+    // endpoint address resolves the same physical egress as any other.
+    let outer_dst = endpoint
+        .wg_peers
+        .iter()
+        .find_map(|peer| peer.endpoint.map(|ep| ep.ip()));
+    match outer_dst {
+        Some(dst) => outer_physical_egress_mtu(decision, forwarding, endpoint, dst),
+        // No peer endpoint to route to: fall back to the resolution's own
+        // egress (the logical ifindex), exactly what `tunnel_outer_mtu`
+        // would have yielded — no regression in the degenerate case.
+        None => forwarding
+            .egress
+            .get(&decision.resolution.egress_ifindex)
+            .map(|e| e.mtu)
+            .filter(|m| *m > 0)
+            .unwrap_or(1500),
+    }
+}
+
 pub(super) fn wg_encap_frame(
     inner_frame: &[u8],
     inner_meta: impl Into<ForwardPacketMeta>,

@@ -1149,3 +1149,187 @@ fn truncated_ip_header_forwards_fail_open() {
         "truncated IPv6 header must fail-open to Forward"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2684: the WireGuard PTB inner-MTU derives from the PHYSICAL underlay egress
+// (1500), NOT the tunnel LOGICAL ifindex MTU (1420). Before #2684 the WG arm of
+// `post_transform_inner_mtu` read `tunnel_outer_mtu`, which for a WG transit
+// flow (endpoint.destination zeroed) falls back to the LOGICAL egress_ifindex
+// MTU (~1420 = underlay − encap). Feeding that to `wg_inner_mtu` subtracts the
+// WG encap overhead a SECOND time → the PTB advertises ~1345 (v4) / ~1325 (v6),
+// ~80-100B SMALLER than the encap drop guard actually admits
+// (`wg_inner_mtu(physical=1500)` = 1425 v4 / 1405 v6). These tests use the
+// realistic `wg_outer_mtu_snapshot` (logical wg0.0 ifindex 400 MTU 1420 ≠
+// physical reth0.80 ifindex 12 MTU 1500, peer routed via reth0.80) so the
+// logical/physical split is real. They go RED if the WG arm reverts to
+// `tunnel_outer_mtu` (logical 1420).
+// ---------------------------------------------------------------------------
+
+use crate::afxdp::forwarding_build::build_forwarding_state;
+
+/// A tunnel-resolved WG `SessionDecision` matching what the resolver stores
+/// for a WG transit flow: `egress_ifindex` = the tunnel LOGICAL ifindex (the
+/// resolver copies `endpoint.logical_ifindex`), `tx_ifindex` = 0 (the WG
+/// `endpoint.destination` is zeroed so `resolve_tunnel_outer` NoRoutes and the
+/// stored tx_ifindex is unset). This is the production shape that makes
+/// `tunnel_outer_mtu` fall back to the LOGICAL MTU.
+fn wg_logical_tunnel_decision(logical_ifindex: i32, tunnel_endpoint_id: u16) -> SessionDecision {
+    SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::MissingNeighbor,
+            local_ifindex: 0,
+            egress_ifindex: logical_ifindex,
+            tx_ifindex: 0,
+            tunnel_endpoint_id,
+            next_hop: None,
+            neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    }
+}
+
+#[test]
+fn post_transform_wg_inner_mtu_uses_physical_underlay_not_logical_v4() {
+    // Fail-on-revert: with the fix the WG inner MTU is derived from the
+    // PHYSICAL underlay (reth0.80 = 1500): wg_inner_mtu(AF_INET, 1500) =
+    // 1500 - 60 - 15 = 1425. Reverting to tunnel_outer_mtu reads the LOGICAL
+    // wg0.0 MTU (1420) → wg_inner_mtu = 1345 → this assertion fails red.
+    let state = build_forwarding_state(&crate::afxdp::test_fixtures::wg_outer_mtu_snapshot());
+    // Sanity: the fixture really carries the distinct logical/physical MTUs.
+    assert_eq!(state.egress.get(&400).map(|e| e.mtu), Some(1420), "wg0.0 logical");
+    assert_eq!(state.egress.get(&12).map(|e| e.mtu), Some(1500), "reth0.80 physical");
+
+    let decision = wg_logical_tunnel_decision(400, 1);
+    let inner_mtu = post_transform_inner_mtu(&decision, &state, false, libc::AF_INET as u8, 0);
+    assert_eq!(
+        inner_mtu, 1425,
+        "WG PTB inner MTU MUST be wg_inner_mtu(physical 1500) = 1425, NOT \
+         wg_inner_mtu(logical 1420) = 1345 (the #2684 double-subtract)"
+    );
+    // It MUST equal the encap-guard SSOT: the inverse of wg_encapped_size at
+    // the physical MTU, so the PTB advertises exactly what the guard admits.
+    assert_eq!(
+        inner_mtu,
+        crate::afxdp::wg::mss::wg_inner_mtu(libc::AF_INET, 1500),
+        "WG PTB inner MTU MUST equal wg_inner_mtu(physical underlay)"
+    );
+
+    // End-to-end: a 1400-byte inner v4 DF datagram (L3 = 1400 > 1425? no — it
+    // is 1400 <= 1425 so it FORWARDS; pick > 1425 to fire the PTB). A 1440-byte
+    // L3 (> 1425) must emit a Frag-Needed advertising 1425.
+    let (frame, meta) = inbound_v4_udp(1440 - 28, true); // L3 = 20 + 8 + payload = 1440
+    let l3 = meta.l3_offset as usize;
+    let next_hop_mtu = match forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu) {
+        EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } => next_hop_mtu,
+        other => panic!("expected EmitPacketTooBig, got {other:?}"),
+    };
+    assert_eq!(next_hop_mtu, 1425, "advertised v4 inner MTU = physical-derived 1425");
+    // The ICMP source is the ingress interface primary; use reth0.80 (ifindex
+    // 12, primary 172.16.80.8) which exists in the snapshot-built state.
+    let out = build_frag_needed_v4(&frame, meta, 12, &state, next_hop_mtu)
+        .expect("WG inner-source frag-needed must build");
+    // reth0.80 carries VLAN 80, so the reply L2 is tagged (18 bytes). Derive
+    // the L3 offset from the ethertype rather than hardcoding 14.
+    let eth = if u16::from_be_bytes([out[12], out[13]]) == 0x8100 { 18 } else { 14 };
+    let icmp = eth + 20;
+    assert_eq!(out[icmp], 3, "ICMP Frag-Needed type");
+    assert_eq!(out[icmp + 1], 4, "ICMP Frag-Needed code");
+    assert_eq!(
+        u16::from_be_bytes([out[icmp + 6], out[icmp + 7]]),
+        1425,
+        "Frag-Needed carries the physical-derived inner MTU"
+    );
+}
+
+#[test]
+fn post_transform_wg_inner_mtu_uses_physical_underlay_not_logical_v6() {
+    // Same fixture, flipped to a v6 outer (peer + transport route in inet6).
+    // With the fix: wg_inner_mtu(AF_INET6, 1500) = 1500 - 80 - 15 = 1405.
+    // Reverting to tunnel_outer_mtu (logical 1420) → 1325 → fails red.
+    let mut snap = crate::afxdp::test_fixtures::wg_outer_mtu_snapshot();
+    // Flip the WG endpoint + its peer + the underlay route to IPv6.
+    {
+        let ep = &mut snap.tunnel_endpoints[0];
+        ep.outer_family = "inet6".to_string();
+        ep.source = "2001:559:8585:80::8".to_string();
+        ep.wg_peers[0].wg_endpoint = "[2001:db8:c0::7]:51820".to_string();
+        ep.wg_peers[0].wg_allowed_ips = vec!["10.123.0.0/24".to_string()];
+        ep.transport_table = "inet6.0".to_string();
+    }
+    // Physical reth0.80 already carries a v6 primary in the v4 fixture? No —
+    // the v4 fixture's reth0.80 has only a v4 address. Give it a v6 primary so
+    // the underlay route resolves on reth0.80, and add the v6 underlay route.
+    snap.interfaces[0].addresses.push(crate::InterfaceAddressSnapshot {
+        family: "inet6".to_string(),
+        address: "2001:559:8585:80::8/64".to_string(),
+        scope: 0,
+    });
+    snap.routes = vec![crate::RouteSnapshot {
+        table: "inet6.0".to_string(),
+        family: "inet6".to_string(),
+        destination: "2001:db8:c0::/64".to_string(),
+        next_hops: vec!["2001:559:8585:80::1@reth0.80".to_string()],
+        discard: false,
+        next_table: String::new(),
+        preference: 0,
+    }];
+
+    let state = build_forwarding_state(&snap);
+    assert_eq!(state.egress.get(&12).map(|e| e.mtu), Some(1500), "reth0.80 physical");
+
+    let decision = wg_logical_tunnel_decision(400, 1);
+    let inner_mtu = post_transform_inner_mtu(&decision, &state, false, libc::AF_INET6 as u8, 0);
+    assert_eq!(
+        inner_mtu, 1405,
+        "WG PTB inner MTU (v6 outer) MUST be wg_inner_mtu(physical 1500) = 1405, \
+         NOT wg_inner_mtu(logical 1420) = 1325 (the #2684 double-subtract)"
+    );
+    assert_eq!(
+        inner_mtu,
+        crate::afxdp::wg::mss::wg_inner_mtu(libc::AF_INET6, 1500),
+        "WG PTB inner MTU (v6 outer) MUST equal wg_inner_mtu(physical underlay)"
+    );
+
+    // End-to-end: a 1420-byte inner v6 datagram (L3 = 40 + 8 + payload) that
+    // exceeds 1405 must emit a Packet-Too-Big advertising 1405.
+    let (frame, meta) = inbound_v6_udp(1420 - 48); // L3 = 40 + 8 + payload = 1420
+    let l3 = meta.l3_offset as usize;
+    let next_hop_mtu = match forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu) {
+        EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } => next_hop_mtu,
+        other => panic!("expected EmitPacketTooBig, got {other:?}"),
+    };
+    assert_eq!(next_hop_mtu, 1405, "advertised v6 inner MTU = physical-derived 1405");
+    // ICMPv6 source = ingress interface primary v6; reth0.80 (ifindex 12) now
+    // carries 2001:559:8585:80::8 (added to the snapshot above).
+    let out = build_packet_too_big_v6(&frame, meta, 12, &state, next_hop_mtu as u32)
+        .expect("WG inner-source PTB must build");
+    // VLAN 80 → tagged L2 (18 bytes); derive the L3 offset from the ethertype.
+    let eth = if u16::from_be_bytes([out[12], out[13]]) == 0x8100 { 18 } else { 14 };
+    let icmp = eth + 40;
+    assert_eq!(out[icmp], 2, "ICMPv6 Packet Too Big");
+    assert_eq!(
+        u32::from_be_bytes([out[icmp + 4], out[icmp + 5], out[icmp + 6], out[icmp + 7]]),
+        1405,
+        "Packet-Too-Big carries the physical-derived inner MTU"
+    );
+}
+
+#[test]
+fn post_transform_wg_inner_mtu_falls_back_to_logical_when_no_peer_endpoint() {
+    // Degenerate case: a WG endpoint with no peer endpoint address (no outer
+    // hop to route to) falls back to the resolution's logical egress_ifindex
+    // MTU — exactly what tunnel_outer_mtu would have yielded, so no regression.
+    let mut snap = crate::afxdp::test_fixtures::wg_outer_mtu_snapshot();
+    snap.tunnel_endpoints[0].wg_peers[0].wg_endpoint = String::new(); // responder-only
+    let state = build_forwarding_state(&snap);
+    let decision = wg_logical_tunnel_decision(400, 1);
+    let inner_mtu = post_transform_inner_mtu(&decision, &state, false, libc::AF_INET as u8, 0);
+    // Logical egress (400) MTU 1420 → wg_inner_mtu(1420) = 1345.
+    assert_eq!(
+        inner_mtu, 1345,
+        "no peer endpoint → fall back to logical egress MTU (1420) → 1345, \
+         no worse than the pre-#2684 tunnel_outer_mtu behaviour"
+    );
+}

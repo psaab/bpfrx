@@ -16369,3 +16369,29 @@ top.
   go test ./pkg/config/... pass.
   **File(s)**: pkg/config/compiler_validate_wireguard.go,
   pkg/config/wireguard_multipeer_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2684 — fix WG PTB inner-MTU under-advertisement (off-by-one
+  encap). The post-transform PMTUD path (`post_transform_inner_mtu`) WG arm
+  sourced the outer MTU via `tunnel_outer_mtu`, which for a WG transit flow
+  (zeroed `endpoint.destination`) falls back to the LOGICAL ifindex MTU
+  (~1420 = underlay − encap); feeding that to `wg_inner_mtu` double-subtracts
+  the WG overhead → PTB advertised ~1345 (v4) / 1325 (v6), ~100B below what
+  the #2680 encap guard admits (`wg_inner_mtu(physical=1500)` = 1425 / 1405).
+  Fix: new `frame::wg_endpoint_physical_outer_mtu` SSOT wrapper over the #2680
+  `outer_physical_egress_mtu` (route-resolves the physical underlay via the
+  first peer endpoint; per-endpoint underlay, #2734); WG arm now derives the
+  outer MTU from the PHYSICAL underlay so the advertised inner MTU =
+  `physical_mtu − WG_OVERHEAD_{V4,V6} − WG_MAX_PADDING` (the exact inverse of
+  `wg_encapped_size`). GRE unaffected (real `destination` resolves to physical
+  already). No shared constant changed (no #2792 conflict). No wire change
+  (`protocol_wire_v1.json` untouched). Tests: 3 new fail-on-revert tests in
+  `icmp_ptb_tests.rs` (v4 Frag-Needed → 1425, v6 Packet-Too-Big → 1405,
+  no-peer fallback → 1345 = logical). Fail-on-revert proven via copy-restore:
+  reverting the WG arm to `tunnel_outer_mtu` yields left:1345 (v4) / left:1325
+  (v6) vs right:1425/1405. Gates: `cargo build --release -p xpf-userspace-dp`
+  clean; `cargo test --release --bin xpf-userspace-dp -- ptb mtu icmp` 192/0;
+  `-- wg tunnel` 268/0. No Go change.
+  **File(s)**: userspace-dp/src/afxdp/icmp_ptb.rs,
+  userspace-dp/src/afxdp/frame/wg.rs, userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/icmp_ptb_tests.rs, docs/wireguard-interop.md, _Log.md
