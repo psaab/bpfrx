@@ -168,6 +168,111 @@ pub(super) fn dnat_v6_entry_bytes(
     (dk, dv)
 }
 
+/// Build the `dnat_table` (v4) lookup KEY for an SNAT'd flow, matching the
+/// shim reader's encoding (see `dnat_v6_entry_bytes` for the byte-order
+/// rationale). Returns `None` when the flow has no v4 SNAT rewrite and so
+/// published no `dnat_table` entry. #2979: the SINGLE source of the v4 key
+/// so the close-handler delete (`delete_dnat_table_entry`) and the
+/// install-path publish (`publish_dnat_table_entry`) cannot drift — a
+/// mismatched delete key would leave the entry leaked.
+pub(super) fn dnat_v4_key_bytes(
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+) -> Option<[u8; 12]> {
+    let snat_v4 = match (key.addr_family as i32, nat.rewrite_src?) {
+        (libc::AF_INET, IpAddr::V4(snat_v4)) => snat_v4,
+        _ => return None,
+    };
+    let snat_port = nat.rewrite_src_port.unwrap_or(key.src_port);
+    let mut dk = [0u8; 12];
+    dk[0] = key.protocol;
+    dk[4..8].copy_from_slice(&snat_v4.octets());
+    // #2406: KEY port is HOST-ORDER numeric serialized natively to
+    // match the AF_XDP shim reader (from_be_bytes -> host order, stored
+    // natively, like session_map_key). to_be_bytes (network order)
+    // never matched the reader -> latent v4 reverse-NAT-over-GRE bug.
+    dk[8..10].copy_from_slice(&snat_port.to_ne_bytes());
+    Some(dk)
+}
+
+/// Build the `dnat_table_v6` lookup KEY for an SNAT66'd flow. Returns `None`
+/// when the flow has no v6 SNAT rewrite. #2979: SSOT for the v6 key shared by
+/// publish (install) and delete (close). The bytes mirror the KEY half of
+/// `dnat_v6_entry_bytes` (the shim never reads the value).
+pub(super) fn dnat_v6_key_bytes(
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+) -> Option<[u8; 24]> {
+    let snat_v6 = match (key.addr_family as i32, nat.rewrite_src?) {
+        (libc::AF_INET6, IpAddr::V6(snat_v6)) => snat_v6,
+        _ => return None,
+    };
+    let snat_port = nat.rewrite_src_port.unwrap_or(key.src_port);
+    let mut dk = [0u8; 24];
+    dk[0] = key.protocol;
+    // dk[1..4] pad; dk[4..20] dst_ip; dk[20..22] dst_port; dk[22..24] from_zone(0)
+    dk[4..20].copy_from_slice(&snat_v6.octets());
+    dk[20..22].copy_from_slice(&snat_port.to_ne_bytes());
+    Some(dk)
+}
+
+/// #2979: delete the dynamic reverse-NAT `dnat_table` / `dnat_table_v6` entry
+/// published by `publish_dnat_table_entry` when the SNAT'd session closes or
+/// expires. The maps are `BPF_MAP_TYPE_HASH` (not LRU) with
+/// `max_entries = MAX_SESSIONS` and `BPF_F_NO_PREALLOC`, so without this delete
+/// every closed SNAT session leaks one entry until the map fills and new
+/// reverse-NAT publishes start failing (the #2244 capacity error). The key is
+/// derived from the SAME `dnat_v4_key_bytes` / `dnat_v6_key_bytes` helpers the
+/// publish path uses, so it byte-matches the insert key exactly. A non-SNAT
+/// session produces no key (`None`) and so is a no-op; an absent table fd is a
+/// no-op; an absent-key delete (`ENOENT`) is benign (the entry was never
+/// published, e.g. a publish that failed at capacity, or a non-DNAT flow).
+pub(super) fn delete_dnat_table_entry(
+    fds: &DnatTableFds,
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+) {
+    if nat.rewrite_src.is_none() {
+        return;
+    }
+    match key.addr_family as i32 {
+        libc::AF_INET => {
+            let (Some(fd), Some(dk)) = (fds.v4, dnat_v4_key_bytes(key, nat)) else {
+                return;
+            };
+            // #2979: count the attempt so the close-handler wiring is testable
+            // without a real BPF map (unprivileged_bpf_disabled blocks map
+            // creation under `cargo test`). Production cost is one relaxed
+            // increment under `#[cfg(test)]` only.
+            #[cfg(test)]
+            DNAT_DELETE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                libbpf_sys::bpf_map_delete_elem(fd, dk.as_ptr().cast::<libc::c_void>());
+            }
+        }
+        libc::AF_INET6 => {
+            let (Some(fd), Some(dk)) = (fds.v6, dnat_v6_key_bytes(key, nat)) else {
+                return;
+            };
+            #[cfg(test)]
+            DNAT_DELETE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                libbpf_sys::bpf_map_delete_elem(fd, dk.as_ptr().cast::<libc::c_void>());
+            }
+        }
+        _ => {}
+    }
+}
+
+// #2979 fail-on-revert instrumentation: counts `delete_dnat_table_entry`
+// syscall attempts (an SNAT flow with a live table fd). Used by the
+// close-handler wiring test in afxdp/tests.rs to prove a Close delta for an
+// SNAT'd session reaches the dnat_table delete — RED if the delete call is
+// removed from flush_session_deltas (the leak regresses). Test-only.
+#[cfg(test)]
+pub(super) static DNAT_DELETE_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[must_use]
 pub(super) fn publish_dnat_table_entry(
     fds: &DnatTableFds,
@@ -178,20 +283,18 @@ pub(super) fn publish_dnat_table_entry(
         return true;
     };
     match (key.addr_family as i32, snat_ip) {
-        (libc::AF_INET, IpAddr::V4(snat_v4)) => {
+        (libc::AF_INET, IpAddr::V4(_snat_v4)) => {
             let Some(fd) = fds.v4 else { return true };
             let snat_port = nat.rewrite_src_port.unwrap_or(key.src_port);
             let IpAddr::V4(orig_v4) = key.src_ip else {
                 return true;
             };
-            let mut dk = [0u8; 12];
-            dk[0] = key.protocol;
-            dk[4..8].copy_from_slice(&snat_v4.octets());
-            // #2406: KEY port is HOST-ORDER numeric serialized natively to
-            // match the AF_XDP shim reader (from_be_bytes -> host order, stored
-            // natively, like session_map_key). to_be_bytes (network order)
-            // never matched the reader -> latent v4 reverse-NAT-over-GRE bug.
-            dk[8..10].copy_from_slice(&snat_port.to_ne_bytes());
+            // #2979: build the KEY via the shared helper so install and close
+            // (delete_dnat_table_entry) cannot drift — the key bytes come from
+            // the SSOT (dnat_v4_key_bytes), the value is built locally below.
+            let Some(dk) = dnat_v4_key_bytes(key, nat) else {
+                return true;
+            };
 
             let mut dv = [0u8; 8];
             dv[0..4].copy_from_slice(&orig_v4.octets());

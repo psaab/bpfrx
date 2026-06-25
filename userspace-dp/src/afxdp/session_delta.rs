@@ -53,6 +53,11 @@ pub(super) fn flush_session_deltas(
     session_map_fd: c_int,
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
+    // #2979: the reverse-NAT dnat_table / dnat_table_v6 fds so a closing SNAT
+    // session's published reverse-NAT entry is deleted here, mirroring the
+    // session_map / conntrack cleanup below. Without it the HASH (non-LRU)
+    // dnat_table leaks one entry per closed SNAT session until it fills.
+    dnat_fds: &super::checksum::DnatTableFds,
     deltas: &[SessionDelta],
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -240,6 +245,15 @@ pub(super) fn flush_session_deltas(
                 delta.metadata.is_reverse,
             );
             delete_bpf_conntrack_entry(conntrack_v4_fd, conntrack_v6_fd, &delta.key);
+            // #2979: delete the dynamic reverse-NAT dnat_table entry this
+            // SNAT'd session published at install. Keyed on the SAME forward
+            // key + nat decision used by publish_dnat_table_entry (the Close
+            // delta carries the forward key — it is gated on !is_reverse at
+            // construction in session/expire.rs and session/mod.rs). A
+            // non-SNAT session is a no-op (no rewrite_src -> no key). Only the
+            // forward key publishes a dnat_table entry, so it is NOT repeated
+            // for the reverse key below.
+            super::checksum::delete_dnat_table_entry(dnat_fds, &delta.key, delta.decision.nat);
             remove_shared_session(
                 shared_sessions,
                 shared_nat_sessions,
