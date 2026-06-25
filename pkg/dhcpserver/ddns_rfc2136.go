@@ -350,14 +350,34 @@ func (u *rfc2136Updater) UpsertLease(ctx context.Context, rec LeaseDNSRecord) er
 				}
 				return nil
 			}
+			// PTR-side CONFLICT REFUSAL (#2676): the reverse RRset already exists
+			// and is owned by another party (replace-owned DHCID mismatch, or
+			// skip-existing RRsetNotUsed prereq failure). This is a PERMANENT
+			// condition for the reverse name — exactly like a NOTAUTH skip, not a
+			// transient failure to retry. The forward A/AAAA is already LIVE, so
+			// we must NOT propagate errDDNSConflictRefused (the manager would then
+			// take its no-ownership branch and ORPHAN the live forward, the #2661
+			// class on the PTR-conflict path). Treat it as a counted, permanent
+			// PTR skip: the forward is owned (tracked + cleanable) with NO PTR
+			// pending (nothing to retry — the reverse is not ours and never will
+			// be). Do NOT double-wrap the two sentinels into one chain (the wrap
+			// that confused upsertLocked's errors.Is ordering). sendAdd already
+			// counted the conflict (its onConflict hook fired on the YX refusal),
+			// so do NOT count it again here — just swallow the refusal as a
+			// permanent skip and return nil so the manager keeps the forward
+			// owned-not-pending.
+			if errors.Is(err, errDDNSConflictRefused) {
+				return nil
+			}
 			// The forward A/AAAA is already LIVE in DNS but the reverse PTR add
-			// failed with a non-skippable (transient) error. Returning a plain
-			// error here would make the manager record NO ownership, ORPHANING
-			// the live forward (#2661). Instead, return the errDDNSPTRPending
-			// sentinel wrapping the cause: the manager records ownership of the
-			// forward (so it is tracked + cleanable) with PTRPending set, and the
-			// next reconcile re-runs UpsertLease — the forward re-add is an
-			// idempotent no-op and only the still-missing PTR is published.
+			// failed with a non-skippable, TRANSIENT error (timeout, SERVFAIL).
+			// Returning a plain error here would make the manager record NO
+			// ownership, ORPHANING the live forward (#2661). Instead, return the
+			// errDDNSPTRPending sentinel wrapping the cause: the manager records
+			// ownership of the forward (so it is tracked + cleanable) with
+			// PTRPending set, and the next reconcile re-runs UpsertLease — the
+			// forward re-add is an idempotent no-op and only the still-missing PTR
+			// is published.
 			return fmt.Errorf("ddns: reverse upsert PTR %s: %w: %w", rec.PTRName, err, errDDNSPTRPending)
 		}
 	}

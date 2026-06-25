@@ -1,3 +1,21 @@
+## 2026-06-24 — #2691 P0 / #2676: upsertLocked sentinel ordering — no orphan on PTR-conflict-after-forward-success
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed the orphan where a forward A/AAAA published OK but the
+  reverse PTR add hit a conflict-refusal: UpsertLease double-wrapped both
+  sentinels and upsertLocked checked errDDNSConflictRefused FIRST -> removed
+  the ownership intent -> live forward orphaned. Fix (2 parts): (1)
+  ddns_rfc2136.go UpsertLease classifies a PTR-side conflict-refusal as a
+  PERMANENT counted skip (like NOTAUTH) returning nil -> forward owned,
+  not-pending; no double-wrap. (2) ddns.go upsertLocked checks
+  errDDNSPTRPending BEFORE errDDNSConflictRefused (defense-in-depth: a
+  forward-published error can never reach the no-ownership branch). Added a
+  reconcile-layer test (seeded third-party reverse PTR + skip-existing) that
+  proves forward-owned + third-party-PTR-survives + release-cleans;
+  fail-on-revert verified (both parts reverted -> OwnedRecords=0 orphan).
+- **File(s)**: pkg/dhcpserver/ddns.go, pkg/dhcpserver/ddns_rfc2136.go,
+  pkg/dhcpserver/ddns_manager_inc2_test.go, _Log.md
+
 ## 2026-06-24 — #2691 P0 / #2666: warn-only TSIG tuple validation (key<->secret)
 
 - **Timestamp**: 2026-06-24

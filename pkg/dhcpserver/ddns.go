@@ -607,23 +607,15 @@ func (m *DDNSManager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow o
 	}
 
 	if err := m.updater.UpsertLease(ctx, rec); err != nil {
-		if errors.Is(err, errDDNSConflictRefused) {
-			// Refused (name owned by another party): the wire add did not
-			// happen, so REMOVE the pre-written intent (no phantom ownership)
-			// and persist the removal. Count it as a conflict skip already done
-			// by the backend; do not fail the reconcile pass.
-			m.state.delete(intent.Identity, intent.Address)
-			if serr := m.state.save(); serr != nil {
-				// The intent is removed in memory but the removal is not durable.
-				// Surface it so the pass is marked failed and retried; a stale
-				// durable intent is safe (its delete is a no-op on a non-existent
-				// RR) and self-heals on the next successful save.
-				slog.Warn("ddns: cannot persist removal of refused-add intent",
-					"fqdn", rec.FQDN, "err", serr)
-				return serr
-			}
-			return nil
-		}
+		// ORDER MATTERS (#2676): check errDDNSPTRPending BEFORE
+		// errDDNSConflictRefused. errDDNSPTRPending is returned ONLY after the
+		// forward A/AAAA add SUCCEEDED, so its presence proves the forward is
+		// LIVE and ownership MUST be recorded — it must never fall into the
+		// no-ownership (intent-removal) branch below. The backend (#2676) no
+		// longer wraps a PTR-side conflict-refusal into a chain carrying BOTH
+		// sentinels, but this defensive ordering guarantees a
+		// forward-published error can never orphan the forward even if some
+		// future path produces a chain with both sentinels.
 		if errors.Is(err, errDDNSPTRPending) {
 			// PARTIAL SUCCESS (#2661): the forward A/AAAA is LIVE in DNS but the
 			// reverse PTR add failed with a non-skippable (transient) error. The
@@ -641,6 +633,26 @@ func (m *DDNSManager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow o
 				"ownership recorded with PTR pending for retry next cycle",
 				"fqdn", rec.FQDN, "ptr", rec.PTRName, "err", err)
 			m.upsertOK.Add(1)
+			return nil
+		}
+		if errors.Is(err, errDDNSConflictRefused) {
+			// Refused (name owned by another party): the FORWARD wire add did not
+			// happen (errDDNSConflictRefused is propagated unwrapped by the
+			// backend only from the forward add, and a PTR-side conflict-refusal
+			// is now classified as a permanent skip that returns nil — #2676), so
+			// REMOVE the pre-written intent (no phantom ownership) and persist the
+			// removal. Count it as a conflict skip already done by the backend; do
+			// not fail the reconcile pass.
+			m.state.delete(intent.Identity, intent.Address)
+			if serr := m.state.save(); serr != nil {
+				// The intent is removed in memory but the removal is not durable.
+				// Surface it so the pass is marked failed and retried; a stale
+				// durable intent is safe (its delete is a no-op on a non-existent
+				// RR) and self-heals on the next successful save.
+				slog.Warn("ddns: cannot persist removal of refused-add intent",
+					"fqdn", rec.FQDN, "err", serr)
+				return serr
+			}
 			return nil
 		}
 		// Hard add failure: the wire add did not succeed. Remove the
