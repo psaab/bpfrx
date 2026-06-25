@@ -379,7 +379,19 @@ What increment 2 ships (the feasible, CI-testable slice):
   identity is the same stable lease identity (v4 client-id‖hwaddr, v6
   DUID/IAID) the reconciler keys ownership on, threaded through
   `LeaseDNSRecord.ClientID` and persisted in the ownership store as
-  `ownedRecord.ClientID` so a delete recomputes the SAME DHCID.
+  `ownedRecord.ClientID` so a delete recomputes the SAME DHCID. The RFC 4701
+  §3.3 identifier-type code is derived from the lease-identity form: `0x0002`
+  (DUID) for a v6 `duid:` identity, `0x0001` (DHCPv4 client-identifier option)
+  for a `cid:` identity, `0x0000` (htype+chaddr) for the `mac:` hwaddr
+  fallback. **Residual**: the digest is computed over xpf's canonical identity
+  STRING (the parser's prefixed colon-hex form), not the raw DHCP option byte
+  stream RFC 4701 §3.5 specifies, so cross-vendor DHCID *digest* match on a
+  shared name (ISC Kea / Windows DHCP) is best-effort — but the identifier-type
+  is RFC-correct, xpf is internally consistent (same lease ⇒ same DHCID across
+  add/delete, which is all the ownership boundary needs), and a non-matching
+  foreign DHCID is treated as "owned by another party" and left untouched (the
+  SAFE direction). A byte-exact digest would require threading the un-mangled
+  DHCP option through the lease parser; deferred as an interop enhancement.
 
   - **On add** (`sendAddOwned`): the RFC 4703 §5.3.2 two-attempt sequence —
     prerequisites are AND-combined in one message, so "DHCID matches OR name
@@ -388,8 +400,15 @@ What increment 2 ships (the feasible, CI-testable slice):
     collision, Attempt B retries under a DHCID-MATCHES-OURS prerequisite (a
     value-dependent RRset-exists prereq), which succeeds only for a name WE
     already own. If neither holds — a third party owns the name (different or
-    absent DHCID) — the add is REFUSED, counted as a conflict, and NO ownership
-    is recorded, so it can never be deleted later.
+    absent DHCID) — the add is REFUSED: `sendAddOwned` returns the
+    `errDDNSConflictRefused` sentinel (counting the conflict). The manager's
+    `upsertLocked` classifies that sentinel as a skip (not a success, not a
+    hard failure) and records NO ownership in the state store. This is what
+    closes #2648 MAJOR-1: a refused add must NOT record phantom ownership,
+    because a later release of phantom-owned state would delete a record xpf
+    did not create — and for a **no-identity** lease the delete has no
+    DHCID-match guard, so that delete actually fires. No phantom ownership ⇒
+    no later delete.
   - **On delete** (`sendRemoveForward`): the forward A/AAAA + DHCID are removed
     under a DHCID-MATCHES-OURS prerequisite. If the on-wire DHCID is not ours
     (or absent — a manual record), the prerequisite fails and the delete is

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -510,8 +511,22 @@ func (m *DDNSManager) withdrawAllLocked(ctx context.Context) error {
 // not exist in DNS and (b) cause a later real backend to skip them as
 // "already owned". So the no-op path counts the skip and returns success
 // (reconcile must not wedge) without mutating the ownership store.
+//
+// REPLACE-OWNED REFUSAL (#2648 MAJOR-1): a replace-owned add that REFUSES a
+// name owned by another party returns errDDNSConflictRefused. That is neither
+// a success nor a hard failure — it means "someone else owns this name". It is
+// classified like the nop-skip: NO ownership is recorded and the reconcile is
+// NOT marked failed. Recording phantom ownership for a refused add would let a
+// later release delete a record xpf did not create (for a no-identity lease,
+// whose delete has no DHCID-match guard, that delete actually fires).
 func (m *DDNSManager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow ownedRecord) error {
 	if err := m.updater.UpsertLease(ctx, rec); err != nil {
+		if errors.Is(err, errDDNSConflictRefused) {
+			// Refused (name owned by another party): count it as a conflict
+			// skip already done by the backend; record NO ownership and do not
+			// fail the reconcile pass.
+			return nil
+		}
 		m.upsertFail.Add(1)
 		return err
 	}

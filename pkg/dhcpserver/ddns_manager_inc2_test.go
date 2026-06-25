@@ -2,6 +2,7 @@ package dhcpserver
 
 import (
 	"context"
+	"net"
 	"path/filepath"
 	"testing"
 	"time"
@@ -300,6 +301,151 @@ func TestManagerPTRNotAuthCountedNotFailed(t *testing.T) {
 	}
 	if st.ReconcileOK != 1 {
 		t.Errorf("ReconcileOK = %d, want 1", st.ReconcileOK)
+	}
+}
+
+// ownedFQDNs returns the FQDNs the manager currently records as owned.
+func ownedFQDNs(m *DDNSManager) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []string{}
+	for _, r := range m.state.records {
+		out = append(out, r.FQDN)
+	}
+	return out
+}
+
+// TestManagerReplaceOwnedRefusedAddRecordsNoOwnership_NoIdentity is the #2648
+// MAJOR-1 regression at the MANAGER level (the layer the original tests never
+// exercised). A third party owns the forward name; the lease has NO client
+// identity (empty client_id AND hwaddr), so the delete path has no DHCID-match
+// guard. Cycle 1 must REFUSE the add and record NO ownership; cycle 2 (lease
+// gone) must issue NO delete and leave the third party's A intact.
+//
+// fail-on-revert: restoring upsertLocked's unconditional state.put on the
+// refusal path re-records phantom ownership, and cycle 2 then deletes the
+// third party's A → this test goes red (BOUNDARY BREACH).
+func TestManagerReplaceOwnedRefusedAddRecordsNoOwnership_NoIdentity(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	// Third party already published laptop.example.com A 10.0.1.5 (no DHCID).
+	thirdParty := &dns.A{
+		Hdr: dns.RR_Header{Name: "laptop.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+		A:   net.ParseIP("10.0.1.5"),
+	}
+	srv.seedRR(thirdParty)
+
+	m := prodManagerTo(t, srv)
+	cfg := ddnsCfg(srv.addrUDP)
+
+	// Cycle 1: an active v4 lease for the SAME name+address, NO identity
+	// (empty client_id AND hwaddr).
+	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.1.5,,,3600,1900000000,1,laptop,0
+`)
+	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	if got := m.Stats().OwnedRecords; got != 0 {
+		t.Fatalf("#2648: refused add recorded phantom ownership; OwnedRecords=%d want 0 (owned=%v)",
+			got, ownedFQDNs(m))
+	}
+	if !srv.zoneHas(thirdParty) {
+		t.Fatalf("third-party A vanished after a refused add")
+	}
+
+	// Cycle 2: lease gone — no owned state, so NO delete must be issued and the
+	// third party's A must survive.
+	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if !srv.zoneHas(thirdParty) {
+		t.Fatalf("#2648 BOUNDARY BREACH (end-to-end, no-identity): manager deleted a third-party A it did not create")
+	}
+	if m.Stats().DeleteOK != 0 {
+		t.Errorf("a delete was issued for a name xpf never owned; DeleteOK=%d want 0", m.Stats().DeleteOK)
+	}
+}
+
+// TestManagerReplaceOwnedRefusedAddRecordsNoOwnership_Identity is the
+// identity-bearing arm of the #2648 MAJOR-1 regression: a third party owns the
+// name (no DHCID / a foreign DHCID), and the lease HAS a client identity. The
+// add must still be refused with NO ownership recorded (phantom-state
+// pollution), and the third party's record must survive both cycles.
+func TestManagerReplaceOwnedRefusedAddRecordsNoOwnership_Identity(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	thirdParty := &dns.A{
+		Hdr: dns.RR_Header{Name: "laptop.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+		A:   net.ParseIP("10.0.1.5"),
+	}
+	srv.seedRR(thirdParty)
+
+	m := prodManagerTo(t, srv)
+	cfg := ddnsCfg(srv.addrUDP)
+
+	// Active v4 lease WITH an identity (client_id set).
+	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.1.5,aa:bb,01:02:03,3600,1900000000,1,laptop,0
+`)
+	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	if got := m.Stats().OwnedRecords; got != 0 {
+		t.Fatalf("#2648: refused identity add recorded phantom ownership; OwnedRecords=%d want 0 (owned=%v)",
+			got, ownedFQDNs(m))
+	}
+	if !srv.zoneHas(thirdParty) {
+		t.Fatalf("third-party A vanished after a refused identity add")
+	}
+
+	// Cycle 2: lease gone — third party survives, no delete issued.
+	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if !srv.zoneHas(thirdParty) {
+		t.Fatalf("#2648 BOUNDARY BREACH (end-to-end, identity): manager deleted a third-party A it did not create")
+	}
+}
+
+// TestManagerReplaceOwnedFreshNameFullLifecycle proves the manager path still
+// works for the happy case: a fresh name is claimed (ownership recorded), and
+// the lease's expiry deletes exactly that owned record via the DHCID-guarded
+// delete.
+func TestManagerReplaceOwnedFreshNameFullLifecycle(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	m := prodManagerTo(t, srv)
+	cfg := ddnsCfg(srv.addrUDP)
+
+	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.1.9,aa:bb,07:08:09,3600,1900000000,1,fresh,0
+`)
+	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	if m.Stats().OwnedRecords != 1 {
+		t.Fatalf("fresh name not owned; OwnedRecords=%d want 1", m.Stats().OwnedRecords)
+	}
+	a := &dns.A{Hdr: dns.RR_Header{Name: "fresh.example.com.", Rrtype: dns.TypeA}, A: net.ParseIP("10.0.1.9")}
+	if !srv.zoneHas(a) {
+		t.Fatalf("fresh A not published")
+	}
+
+	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if m.Stats().OwnedRecords != 0 {
+		t.Errorf("owned record not cleared after expiry; OwnedRecords=%d", m.Stats().OwnedRecords)
+	}
+	if srv.zoneHas(a) {
+		t.Errorf("owned A not deleted after expiry")
 	}
 }
 

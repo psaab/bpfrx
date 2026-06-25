@@ -50,6 +50,19 @@ import (
 // stuck server only delays DNS, never DHCP (plan risk R4).
 const defaultDDNSTimeout = 5 * time.Second
 
+// errDDNSConflictRefused is the sentinel a replace-owned add returns when it
+// REFUSES to claim a name owned by someone else (the name exists and its
+// DHCID is not ours, or there is no DHCID and the name pre-exists). It is
+// neither a success nor a hard transport error — it means "another party owns
+// this name". The manager (upsertLocked) classifies it like the nop-skip so
+// it records NO ownership: recording phantom ownership for a name xpf does not
+// own on the wire would let a LATER release delete a third party's record
+// (#2648 MAJOR-1) — directly for a no-identity lease (whose delete has no
+// DHCID-match guard), and as broad phantom-state pollution for every refused
+// identity-bearing add. Returning a DISTINCT error keeps the reverse PTR add
+// from running on a refused forward and signals the manager not to put().
+var errDDNSConflictRefused = errors.New("ddns: replace-owned add refused (name owned by another party)")
+
 // dnsExchanger is the seam the backend uses to talk to the authoritative
 // server. *dns.Client satisfies it; tests inject a recorder so the wire
 // adds/deletes can be asserted without a real socket (though the test
@@ -293,6 +306,13 @@ func (u *rfc2136Updater) UpsertLease(ctx context.Context, rec LeaseDNSRecord) er
 	// Forward zone add.
 	zone := u.resolveForwardZone(rec.FQDN)
 	if err := u.sendAdd(ctx, zone, forwardRR); err != nil {
+		// A replace-owned refusal (the name is owned by another party) is
+		// propagated UNWRAPPED so the manager's errors.Is check sees the
+		// sentinel and records no ownership. Do NOT add the reverse PTR for a
+		// forward we did not publish.
+		if errors.Is(err, errDDNSConflictRefused) {
+			return errDDNSConflictRefused
+		}
 		return fmt.Errorf("ddns: forward upsert %s %s: %w", rec.ForwardType, rec.FQDN, err)
 	}
 	// Reverse zone PTR add — NOTAUTH/REFUSED is a counted skip, not fatal.
@@ -379,17 +399,53 @@ func (u *rfc2136Updater) ptrRR(rec LeaseDNSRecord) dns.RR {
 	}
 }
 
-// dhcidIdentifierType is the RFC 4701 §3.3 "identifier type code" in the DHCID
-// RDATA. xpf hashes a single opaque client identity (the DHCPv4
-// client-id||hwaddr or the DHCPv6 DUID/IAID the lease parser already
-// composed) rather than re-deriving the precise on-wire option, so it uses
-// 0x0000 ("the 1-octet htype followed by the hardware address" is 0x0000;
-// the client-identifier option is 0x0001; the DUID is 0x0002 — RFC 4701 §3.3
-// / §3.5). The exact code is not interoperability-critical here: xpf is the
-// only writer of these DHCID RRs, the digest input is stable across an
-// add/delete pair, and the prerequisite only ever compares xpf's own DHCID
-// against itself. We fix it to 0x0000 so the marker is deterministic.
-const dhcidIdentifierType = 0x0000
+// RFC 4701 §3.3 "identifier type codes" carried in the first 2 octets of the
+// DHCID RDATA. They tell a reader WHICH client-identity form the digest was
+// computed over, so a shared zone with another DHCID writer (ISC Kea, Windows
+// DHCP) can interoperate. xpf maps them from the lease-parser identity prefix:
+//
+//   - 0x0000 — the 1-octet htype followed by the hardware address (the
+//     DHCPv4 "htype+chaddr" form). xpf uses this for the hwaddr fallback
+//     (identity4's "mac:" prefix, used only when no client-id option exists).
+//   - 0x0001 — the data octets of the DHCPv4 Client Identifier option (RFC
+//     2132 option 61). xpf uses this for identity4's "cid:" prefix.
+//   - 0x0002 — the DHCPv6 DUID. xpf uses this for identity6's "duid:" prefix.
+//
+// RESIDUAL (documented): the DIGEST input below is xpf's canonical identity
+// STRING (the prefixed, colon-hex form the Kea memfile parser produces), not
+// the raw option byte stream RFC 4701 §3.5 specifies. So the identifier-TYPE
+// is now RFC-correct, but the DIGEST is not guaranteed byte-identical to what
+// ISC Kea / Windows would compute for the same client — cross-vendor DHCID
+// MATCH on a shared name is therefore best-effort, not guaranteed. xpf is
+// internally consistent (the same lease always yields the same DHCID across an
+// add/delete pair, which is what the ownership boundary requires), and a
+// non-matching foreign DHCID is treated as "owned by another party" and left
+// untouched — the SAFE direction. Computing the digest over the raw option
+// bytes would require threading the un-mangled DHCP option through the lease
+// parser, deferred as an interop enhancement.
+const (
+	dhcidIDTypeHTypeChaddr = 0x0000 // "mac:" — htype+chaddr
+	dhcidIDTypeClientID    = 0x0001 // "cid:" — DHCPv4 client-identifier option
+	dhcidIDTypeDUID        = 0x0002 // "duid:" — DHCPv6 DUID
+)
+
+// dhcidIdentifierType returns the RFC 4701 §3.3 identifier-type code for an
+// xpf lease identity, keyed on the prefix the lease parser (identity4 /
+// identity6) attached. An unrecognized form falls back to htype+chaddr
+// (0x0000) — it only affects the marker's self-description; xpf compares its
+// own DHCID against itself, so the fallback is harmless.
+func dhcidIdentifierType(clientID string) int {
+	switch {
+	case strings.HasPrefix(clientID, "duid:"):
+		return dhcidIDTypeDUID
+	case strings.HasPrefix(clientID, "cid:"):
+		return dhcidIDTypeClientID
+	case strings.HasPrefix(clientID, "mac:"):
+		return dhcidIDTypeHTypeChaddr
+	default:
+		return dhcidIDTypeHTypeChaddr
+	}
+}
 
 // dhcidDigestTypeSHA256 is the RFC 4701 §3.4 digest type code for SHA-256.
 const dhcidDigestTypeSHA256 = 0x01
@@ -423,8 +479,9 @@ func dhcidRR(clientID, fqdn string, ttl uint32) (*dns.DHCID, bool) {
 	h.Write(wire[:off])
 	digest := h.Sum(nil)
 
+	idType := dhcidIdentifierType(clientID)
 	rdata := make([]byte, 0, 3+len(digest))
-	rdata = append(rdata, byte(dhcidIdentifierType>>8), byte(dhcidIdentifierType&0xff))
+	rdata = append(rdata, byte(idType>>8), byte(idType&0xff))
 	rdata = append(rdata, byte(dhcidDigestTypeSHA256))
 	rdata = append(rdata, digest...)
 
@@ -512,13 +569,16 @@ func (u *rfc2136Updater) dhcidForRR(rr dns.RR) (*dns.DHCID, bool) {
 //  2. On YXDOMAIN/YXRRSET (the name already exists) — Attempt B — add the same
 //     records with a DHCID-MATCHES-OURS prerequisite (a value-dependent RRset-
 //     exists prereq, RFC 2136 §2.4.2). Success ⇒ a name WE already own,
-//     refreshed. Another YX ⇒ a third party owns the name: REFUSE (count the
-//     conflict, return nil so the lease's reconcile is not failed, and record
-//     NO ownership — upsertLocked only records ownership on a successful add).
+//     refreshed. Another YX ⇒ a third party owns the name: REFUSE by returning
+//     the errDDNSConflictRefused sentinel (and counting the conflict). The
+//     manager classifies that sentinel as a skip — NOT a hard failure and NOT
+//     a success — so upsertLocked records NO ownership for the refused name.
+//     Recording phantom ownership would let a later release delete a record
+//     xpf did not create (#2648 MAJOR-1).
 //
 // When the lease has no client identity there is no DHCID to match, so the
 // name-not-in-use prerequisite alone gates the claim: a pre-existing name (by
-// anyone) is refused and never adopted.
+// anyone) is refused (same sentinel) and never adopted.
 func (u *rfc2136Updater) sendAddOwned(ctx context.Context, zone string, rr dns.RR) error {
 	dhcid, hasDHCID := u.dhcidForRR(rr)
 
@@ -548,11 +608,14 @@ func (u *rfc2136Updater) sendAddOwned(ctx context.Context, zone string, rr dns.R
 		// No ownership proof available and the name already exists: this is a
 		// pre-existing record we cannot claim as ours. Refuse (count + skip)
 		// rather than adopt it — adopting would let a later release delete a
-		// record xpf did not create (#2648).
+		// record xpf did not create (#2648). Signal the refusal with the
+		// sentinel so the manager records NO ownership (a no-identity lease's
+		// delete has no DHCID guard, so phantom ownership here would delete the
+		// third party's record on release).
 		if u.onConflict != nil {
 			u.onConflict()
 		}
-		return nil
+		return errDDNSConflictRefused
 	}
 
 	// Attempt B: adopt/refresh a name whose existing DHCID matches OURS.
@@ -573,12 +636,13 @@ func (u *rfc2136Updater) sendAddOwned(ctx context.Context, zone string, rr dns.R
 		return nil
 	case dns.RcodeYXRrset, dns.RcodeYXDomain, dns.RcodeNXRrset, dns.RcodeNameError:
 		// The existing DHCID is NOT ours (or absent): a third party owns this
-		// name. Refuse to claim it — never record ownership, so a later
-		// release cannot delete it (#2648).
+		// name. Refuse to claim it — record NO ownership (the sentinel tells
+		// the manager not to put()), so a later release cannot delete it
+		// (#2648).
 		if u.onConflict != nil {
 			u.onConflict()
 		}
-		return nil
+		return errDDNSConflictRefused
 	default:
 		return rcodeError(resp.Rcode)
 	}

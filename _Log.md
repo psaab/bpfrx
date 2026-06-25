@@ -1,5 +1,26 @@
 # Action Log
 
+## 2026-06-24 — #2648 fold: refused-add records NO ownership (review MAJOR-1)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Folded the hostile-review MAJOR-1 boundary breach. The first
+  cut's `sendAddOwned` returned nil on a refusal, and `upsertLocked` recorded
+  ownership on ANY nil return (except nop) — so a refused add recorded PHANTOM
+  ownership. For a no-identity lease the later delete (no DHCID guard) then
+  deleted the third party's record. Fix: a refusal now returns the
+  `errDDNSConflictRefused` sentinel; `UpsertLease` propagates it unwrapped
+  (and skips the reverse PTR); `upsertLocked` classifies it as a skip and
+  records NO ownership / does not fail the pass. Also fixed the now-false
+  comments (MINOR-2) and made the RFC 4701 §3.3 identifier-type correct per
+  lease-identity form (duid→0x0002, cid→0x0001, mac→0x0000; MINOR-3, with the
+  digest-input residual documented). Added manager-level regression tests
+  through reconcileOnceLocked (no-identity AND identity) that the isolation
+  tests structurally couldn't catch; fail-on-revert proven (restoring the
+  state.put on refusal → both manager tests red).
+- **File(s)**: pkg/dhcpserver/ddns_rfc2136.go, pkg/dhcpserver/ddns.go,
+  pkg/dhcpserver/ddns_rfc2136_test.go, pkg/dhcpserver/ddns_manager_inc2_test.go,
+  pkg/dhcpserver/README.md, _Log.md
+
 ## 2026-06-24 — #2648 fix: DDNS replace-owned RFC 4701/4703 DHCID ownership
 
 - **Timestamp**: 2026-06-24

@@ -2,6 +2,7 @@ package dhcpserver
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"strings"
@@ -668,10 +669,13 @@ func TestRFC2136ReplaceOwnedDoesNotAdoptThirdPartyRR(t *testing.T) {
 		Enabled: true, Domain: "example.com", ConflictPolicy: "replace-owned",
 	}, &ptr, &conf)
 
-	// The upsert must NOT error (it is a counted skip), but it must not have
-	// adopted the record: the add is refused.
-	if err := u.UpsertLease(context.Background(), recV4ID("host.example.com", "10.0.1.5", "cid:aabb", 300)); err != nil {
-		t.Fatalf("UpsertLease on a third-party-owned name must be a counted skip, not an error: %v", err)
+	// The upsert must REFUSE with the errDDNSConflictRefused sentinel (the
+	// signal the manager uses to record NO ownership, #2648 MAJOR-1) — not a
+	// silent nil success (which would let the manager record phantom ownership)
+	// and not a hard transport error.
+	err := u.UpsertLease(context.Background(), recV4ID("host.example.com", "10.0.1.5", "cid:aabb", 300))
+	if !errors.Is(err, errDDNSConflictRefused) {
+		t.Fatalf("UpsertLease on a third-party-owned name must return the refusal sentinel; got %v", err)
 	}
 	if conf == 0 {
 		t.Errorf("expected the third-party collision to be counted")
@@ -769,8 +773,8 @@ func TestRFC2136ReplaceOwnedRefusesNameOwnedByDifferentDHCID(t *testing.T) {
 	srv.seedRR(otherA)
 	srv.seedRR(otherDHCID)
 
-	if err := u.UpsertLease(context.Background(), recV4ID("shared.example.com", "10.0.1.51", "cid:MINE", 300)); err != nil {
-		t.Fatalf("add against a different owner's name must be a counted skip: %v", err)
+	if err := u.UpsertLease(context.Background(), recV4ID("shared.example.com", "10.0.1.51", "cid:MINE", 300)); !errors.Is(err, errDDNSConflictRefused) {
+		t.Fatalf("add against a different owner's name must return the refusal sentinel; got %v", err)
 	}
 	if conf == 0 {
 		t.Errorf("collision with a different DHCID owner must be counted")
