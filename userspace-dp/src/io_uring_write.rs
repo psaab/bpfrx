@@ -53,6 +53,12 @@
 //!     path uses this so its io_uring→sync fallback cannot double-transmit a
 //!     packet; the state writer (a true byte stream, no sync fallback) ignores
 //!     it.
+//!   * #2478 — permanent-error fast-fail. [`reap_matching`] no longer
+//!     re-spins the submit/wait on a PERMANENT OS error (a bad/closed ring fd,
+//!     EINVAL, EFAULT, …) — those return the same error forever and would burn a
+//!     full core through the `MAX_WAIT_RETRIES` ceiling. [`is_permanent`]
+//!     classifies the errno; permanent errors return immediately, transient ones
+//!     (EINTR/EAGAIN) retry after a `yield_now`.
 
 use io_uring::{IoUring, opcode, types};
 use std::io;
@@ -291,10 +297,38 @@ pub(crate) fn write_all(
     Ok(WriteOutcome::Done)
 }
 
+/// True when `err` is a PERMANENT OS failure that a retry cannot recover from
+/// (a bad/closed ring fd, an invalid argument, a faulting buffer). Retrying
+/// these would just re-spin at 100% CPU through the `MAX_WAIT_RETRIES` ceiling
+/// (#2478), so [`reap_matching`] returns immediately on them. EINTR/EAGAIN (and
+/// any unrecognised errno) are treated as TRANSIENT and retried.
+fn is_permanent(err: &io::Error) -> bool {
+    match err.raw_os_error() {
+        Some(e) => matches!(
+            e,
+            libc::EBADF        // ring fd closed / never valid
+                | libc::EINVAL     // malformed submission / unsupported op
+                | libc::EFAULT     // buffer/iovec points at unmapped memory
+                | libc::ENXIO      // device/ring gone
+                | libc::EBADFD     // ring in a bad state
+                | libc::ENODEV     // backing device removed
+                | libc::EOPNOTSUPP // op not supported by the ring
+                | libc::EPERM      // not permitted — no point retrying
+        ),
+        // No errno (e.g. a non-OS io::Error) — treat as transient and let the
+        // retry ceiling bound it rather than wedging on a misclassification.
+        None => false,
+    }
+}
+
 /// Submit the queued SQE and reap the completion whose `user_data == want`,
 /// retrying the wait on `EINTR`/error so the in-flight SQE is never abandoned.
 /// Stale completions (a different `user_data`, e.g. a leftover from a prior
 /// interrupted call) are drained and discarded rather than mis-attributed.
+///
+/// A PERMANENT submit/wait error (bad ring fd, EINVAL, EFAULT, …) returns
+/// immediately instead of re-spinning through `MAX_WAIT_RETRIES` at 100% CPU
+/// (#2478); a TRANSIENT error yields the core before retrying.
 fn reap_matching(port: &mut dyn RingPort, want: u64, label: &str) -> Result<i32, String> {
     // First, drain any already-ready stale completions so a leftover CQE from a
     // previously interrupted submission can never be returned as ours. At this
@@ -326,9 +360,23 @@ fn reap_matching(port: &mut dyn RingPort, want: u64, label: &str) -> Result<i32,
                 continue;
             }
             Err(err) => {
-                // Any other wait error: the SQE may still be in flight. Keep
-                // waiting for it to drain rather than returning and leaving the
-                // ring desynchronised for the next write.
+                // A PERMANENT error (bad/closed ring fd, EINVAL, EFAULT, …)
+                // returns the SAME error on every retry. Looping on it just
+                // burns a full core through the MAX_WAIT_RETRIES ceiling without
+                // making progress (#2478) — fail fast instead. The caller drops
+                // the packet; leaving the ring "desynchronised" is moot when the
+                // ring fd itself is dead.
+                if is_permanent(&err) {
+                    return Err(format!(
+                        "{label} io_uring permanent submit/wait error: {err}"
+                    ));
+                }
+                // A TRANSIENT wait error (e.g. EAGAIN): the SQE may still be in
+                // flight. Keep waiting for it to drain rather than returning and
+                // leaving the ring desynchronised for the next write — but yield
+                // the core first so a burst of transient failures does not
+                // tight-spin at 100% CPU before the ceiling.
+                std::thread::yield_now();
                 waits += 1;
                 if waits >= MAX_WAIT_RETRIES {
                     return Err(format!("{label} io_uring submit/wait: {err}"));
@@ -406,6 +454,14 @@ mod tests {
         /// alongside the real CQE and the REAP-LOOP user_data match is what must
         /// skip it. `None` for a given wait injects nothing.
         stale_on_wait: VecDeque<Option<Completion>>,
+        /// Number of `submit_and_wait_one` calls — the spin counter for #2478.
+        /// A permanent error must return after exactly ONE wait, not loop to the
+        /// `MAX_WAIT_RETRIES` ceiling.
+        wait_calls: usize,
+        /// When set, every wait beyond the scripted `wait_script` returns this
+        /// errno (instead of materialising a completion). Models a ring fd that
+        /// keeps returning the SAME error — the #2478 tight-spin condition.
+        repeat_err: Option<i32>,
     }
 
     impl FakeRing {
@@ -419,7 +475,16 @@ mod tests {
                 real_tags: std::collections::HashSet::new(),
                 accepted_bytes: 0,
                 stale_on_wait: VecDeque::new(),
+                wait_calls: 0,
+                repeat_err: None,
             }
+        }
+
+        /// Make every wait past the script return `errno` forever (no
+        /// completion). Used to drive the #2478 permanent/transient spin tests.
+        fn with_repeat_err(mut self, errno: i32) -> Self {
+            self.repeat_err = Some(errno);
+            self
         }
 
         fn with_stale(mut self, stale: Vec<Completion>) -> Self {
@@ -476,6 +541,7 @@ mod tests {
         }
 
         fn submit_and_wait_one(&mut self) -> io::Result<()> {
+            self.wait_calls += 1;
             match self.wait_script.pop_front() {
                 Some(Ok(())) => {
                     self.materialise_on_successful_wait();
@@ -483,8 +549,13 @@ mod tests {
                 }
                 Some(Err(e)) => Err(e),
                 None => {
-                    // No more script: behave as a successful wait that
-                    // materialises an in-flight completion if any, else Ok.
+                    // Script exhausted: if a repeating errno was configured, keep
+                    // returning it (no completion) so the caller's retry loop is
+                    // exercised (#2478). Otherwise behave as a successful wait
+                    // that materialises an in-flight completion if any, else Ok.
+                    if let Some(errno) = self.repeat_err {
+                        return Err(io::Error::from_raw_os_error(errno));
+                    }
                     self.materialise_on_successful_wait();
                     Ok(())
                 }
@@ -715,5 +786,96 @@ mod tests {
         let out = write_all(&mut ring, &[0u8; 6], true, "state").unwrap();
         assert_eq!(out, WriteOutcome::Done);
         assert_eq!(ring.push_calls, 2);
+    }
+
+    fn os_err(errno: i32) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(errno))
+    }
+
+    /// #2478 errno classification: the permanent set returns from the retry
+    /// loop, the transient set keeps retrying.
+    #[test]
+    fn is_permanent_classifies_errnos() {
+        for e in [
+            libc::EBADF,
+            libc::EINVAL,
+            libc::EFAULT,
+            libc::ENXIO,
+            libc::EBADFD,
+            libc::ENODEV,
+            libc::EOPNOTSUPP,
+            libc::EPERM,
+        ] {
+            assert!(
+                is_permanent(&io::Error::from_raw_os_error(e)),
+                "errno {e} must be permanent"
+            );
+        }
+        for e in [libc::EINTR, libc::EAGAIN] {
+            assert!(
+                !is_permanent(&io::Error::from_raw_os_error(e)),
+                "errno {e} must be transient"
+            );
+        }
+        // A non-OS io::Error has no errno — treated as transient (bounded by the
+        // retry ceiling) rather than misclassified as permanent.
+        assert!(!is_permanent(&io::Error::new(io::ErrorKind::Other, "no errno")));
+    }
+
+    /// #2478 fail-on-revert: a PERMANENT submit/wait error (EBADF) must return
+    /// after exactly ONE `submit_and_wait_one` call — never tight-spin up to the
+    /// MAX_WAIT_RETRIES (4096) ceiling at 100% CPU.
+    ///
+    /// `repeat_err` makes every wait return EBADF forever. With the old
+    /// unconditional-retry arm, `wait_calls` would reach 4096 before the ceiling
+    /// gives up (the assert `== 1` fails). With the fix, `is_permanent(EBADF)`
+    /// returns immediately on the first wait.
+    #[test]
+    fn permanent_error_returns_without_spinning() {
+        let mut ring = FakeRing::new(vec![], vec![]).with_repeat_err(libc::EBADF);
+        let err = write_all(&mut ring, &[0u8; 4], false, "slow-path").unwrap_err();
+        assert!(
+            err.message().contains("permanent submit/wait error"),
+            "got: {err}"
+        );
+        // The single load-bearing assertion: ONE wait, not 4096.
+        assert_eq!(
+            ring.wait_calls, 1,
+            "a permanent error must fail fast after one wait, not spin to the ceiling"
+        );
+        // A permanent submit/wait error is ambiguous about the SQE, so it is
+        // `Transferred` (no sync-retry) — consistent with the #2477 contract.
+        assert!(matches!(err, WriteError::Transferred(_)));
+    }
+
+    /// #2478 complement: a TRANSIENT error (EAGAIN) is NOT permanent, so the loop
+    /// keeps retrying and DOES reach the MAX_WAIT_RETRIES ceiling rather than
+    /// returning on the first wait. This proves the classification actually
+    /// gates the behaviour (and that transient errors are not fast-failed).
+    #[test]
+    fn transient_error_retries_to_ceiling() {
+        let mut ring = FakeRing::new(vec![], vec![]).with_repeat_err(libc::EAGAIN);
+        let err = write_all(&mut ring, &[0u8; 4], false, "slow-path").unwrap_err();
+        assert!(err.message().contains("submit/wait"), "got: {err}");
+        // It looped to the ceiling (4096) rather than bailing on wait #1.
+        assert!(
+            ring.wait_calls >= 4096,
+            "a transient error must keep retrying to the ceiling, got {} waits",
+            ring.wait_calls
+        );
+    }
+
+    /// A single EINTR followed by a permanent EBADF returns on the permanent
+    /// error — EINTR retried (wait #1), EBADF fast-failed (wait #2). Confirms the
+    /// permanent check sits on the catch-all arm, not the EINTR arm.
+    #[test]
+    fn eintr_then_permanent_returns_promptly() {
+        let mut ring = FakeRing::new(vec![os_err(libc::EINTR)], vec![]).with_repeat_err(libc::EBADF);
+        let err = write_all(&mut ring, &[0u8; 4], false, "slow-path").unwrap_err();
+        assert!(err.message().contains("permanent submit/wait error"), "got: {err}");
+        assert_eq!(
+            ring.wait_calls, 2,
+            "EINTR retries once, then the permanent EBADF fast-fails — two waits total"
+        );
     }
 }

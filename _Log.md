@@ -1,5 +1,41 @@
 # Action Log
 
+## 2026-06-24 — #2477 + #2478: io_uring slow-path write error handling (one PR, two commits)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Two coupled io_uring write error-handling fixes sharing the
+  slow-path write helper.
+  - **#2477** (TUN double-transmission): `write_all`/`write_all_to_fd` now
+    return a `WriteError { NothingWritten(_) | Transferred(_) }` instead of a
+    bare `String`. `safe_to_retry()` is true only for `NothingWritten`
+    (submit-queue full, kernel completion error, zero-byte completion —
+    nothing on the fd). A packet-fd partial write, and an ambiguous reap
+    submit/wait error (SQE may be in flight), are `Transferred` (drop, never
+    re-send). The slow-path caller's `io_uring().or_else(|_| sync)` is
+    replaced by `write_packet_io_uring_or_sync` → `decide_sync_fallback`,
+    which falls back to the synchronous TUN write ONLY when
+    `safe_to_retry()`. Previously ANY io_uring error — including a partial
+    that already placed a truncated frame on the TUN — re-sent the whole
+    packet, yielding a truncated frame + a duplicate full frame.
+  - **#2478** (tight-spin on permanent error): `reap_matching` now calls
+    `is_permanent(errno)` (EBADF/EINVAL/EFAULT/ENXIO/EBADFD/ENODEV/
+    EOPNOTSUPP/EPERM) on the catch-all submit/wait error arm and returns
+    immediately rather than re-spinning to the `MAX_WAIT_RETRIES` (4096)
+    ceiling at 100% CPU; transient errors yield (`yield_now`) before
+    retrying.
+  - State writer (`state_writer.rs`) collapses the new `WriteError` to a
+    `String` (positioned byte-stream write, no sync fallback — retry-safety
+    classification is irrelevant there).
+- **File(s)**: userspace-dp/src/io_uring_write.rs,
+  userspace-dp/src/slowpath.rs, userspace-dp/src/state_writer.rs, _Log.md
+- **Validation**: `cargo build --release` clean (no new warnings in touched
+  files); `cargo test --release --bin xpf-userspace-dp` slowpath::/
+  io_uring_write::/state_writer:: all green. Fail-on-revert verified for
+  both: reverting `decide_sync_fallback` to sync-on-any-error makes
+  `partial_iouring_write_does_not_sync_fallback` RED; removing the
+  `is_permanent` fast-fail makes `permanent_error_returns_without_spinning`
+  RED (wait_calls hits the 4096 ceiling).
+
 ## 2026-06-24 — #2689 review fold: `from as-path` bracket-collapse (sibling reader, same function) — routed through firewallMatchValues + 3 fail-on-revert tests; children-path only (brackets never reach the inline-keys path). Files: pkg/config/compiler_routing.go, pkg/config/policy_from_multileaf_2689_test.go, docs/config-schema.md, _Log.md
 
 ## 2026-06-24 — #2689 fix: policy-term `from community` / `from prefix-list` dropped all but first bracketed value
