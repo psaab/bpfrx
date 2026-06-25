@@ -24,6 +24,31 @@ func natCounterID(ids map[string]uint32, natType, ruleSet, rule string) uint32 {
 	return ids[dataplane.NATCounterKey(natType, ruleSet, rule)]
 }
 
+// appendNATSourceAddressName resolves a NAT rule's `match source-address-name
+// <book-entry>` into concrete source prefixes and appends them to the rule's
+// source list (#2416). It reuses resolveUserspaceAddressBookEntry — the same
+// global-address-book expander the security-policy snapshot path uses — so a
+// name-scoped NAT rule carries the entry's prefixes into the #2394 source
+// constraint instead of publishing an empty (match-any) source list.
+//
+// Fail-closed on an unknown / unresolvable name: the raw token is appended so
+// the source list stays NON-EMPTY (source_constrained stays true on the Rust
+// side) while the token itself fails IpAddr/IpNet parse and contributes no
+// prefix — the rule then matches NOTHING rather than collapsing to match-any.
+// This mirrors the policy path's behavior for an unresolved address reference
+// and is backstopped at commit by validateNATSourceAddressNameReferencesStrict.
+func appendNATSourceAddressName(cfg *config.Config, sourceAddrs []string, name string) []string {
+	if name == "" {
+		return sourceAddrs
+	}
+	if values, ok := resolveUserspaceAddressBookEntry(cfg, name); ok && len(values) > 0 {
+		return append(sourceAddrs, values...)
+	}
+	// Unknown / empty book entry: keep the constraint non-empty but
+	// unmatchable (fail-closed). The raw name cannot parse as an IP.
+	return append(sourceAddrs, name)
+}
+
 func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32) []SourceNATRuleSnapshot {
 	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
 		return nil
@@ -41,6 +66,10 @@ func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32
 			if len(sourceAddrs) == 0 && rule.Match.SourceAddress != "" {
 				sourceAddrs = append(sourceAddrs, rule.Match.SourceAddress)
 			}
+			// #2416: resolve `match source-address-name` for SNAT too — same
+			// builder gap as DNAT (the source list only carried literal
+			// prefixes). See appendNATSourceAddressName.
+			sourceAddrs = appendNATSourceAddressName(cfg, sourceAddrs, rule.Match.SourceAddressName)
 			destAddrs := append([]string(nil), rule.Match.DestinationAddresses...)
 			if len(destAddrs) == 0 && rule.Match.DestinationAddress != "" {
 				destAddrs = append(destAddrs, rule.Match.DestinationAddress)
@@ -233,6 +262,22 @@ func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]u
 			if len(sourceAddrs) == 0 && rule.Match.SourceAddress != "" {
 				sourceAddrs = append(sourceAddrs, rule.Match.SourceAddress)
 			}
+			// #2416: `match source-address-name <book-entry>` scopes the DNAT
+			// the same way a literal `match source-address` does, but as an
+			// address-book reference. It was parsed into SourceAddressName yet
+			// never resolved into the source list the #2394 enforcement reads,
+			// so a name-scoped DNAT published an EMPTY source list = match any
+			// source = fail-open (a destination translation the operator scoped
+			// to a named source set fired for everyone). Resolve the name to its
+			// concrete prefixes via the same address-book expander the policy
+			// path uses and append them. On an unknown name we append the raw
+			// token: it cannot parse on the Rust side (IpAddr::parse fails) so it
+			// contributes no prefix, but it keeps the source list NON-EMPTY so
+			// source_constrained stays true and the rule matches NOTHING
+			// (fail-closed) instead of collapsing back to match-any. A commit-
+			// time strict gate (validateNATSourceAddressNameReferencesStrict)
+			// makes the typo operator-visible; this is the dataplane backstop.
+			sourceAddrs = appendNATSourceAddressName(cfg, sourceAddrs, rule.Match.SourceAddressName)
 
 			// Resolve application match to protocol+ports if specified.
 			type appTerm struct {
