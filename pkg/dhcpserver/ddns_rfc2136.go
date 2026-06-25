@@ -50,17 +50,24 @@ import (
 // stuck server only delays DNS, never DHCP (plan risk R4).
 const defaultDDNSTimeout = 5 * time.Second
 
-// errDDNSConflictRefused is the sentinel a replace-owned add returns when it
-// REFUSES to claim a name owned by someone else (the name exists and its
-// DHCID is not ours, or there is no DHCID and the name pre-exists). It is
-// neither a success nor a hard transport error — it means "another party owns
-// this name". The manager (upsertLocked) classifies it like the nop-skip so
-// it records NO ownership: recording phantom ownership for a name xpf does not
-// own on the wire would let a LATER release delete a third party's record
-// (#2648 MAJOR-1) — directly for a no-identity lease (whose delete has no
-// DHCID-match guard), and as broad phantom-state pollution for every refused
-// identity-bearing add. Returning a DISTINCT error keeps the reverse PTR add
-// from running on a refused forward and signals the manager not to put().
+// errDDNSConflictRefused is the sentinel an add returns when it REFUSES to
+// claim a name owned by someone else. Two policies raise it:
+//
+//   - replace-owned (#2648): the name exists and its DHCID is not ours, or
+//     there is no DHCID and the name pre-exists.
+//   - skip-existing (#2660): the RRsetNotUsed prerequisite failed (the name
+//     already exists), so a third party owns it.
+//
+// It is neither a success nor a hard transport error — it means "another party
+// owns this name". The manager (upsertLocked) classifies it like the nop-skip
+// so it records NO ownership: recording phantom ownership for a name xpf does
+// not own on the wire would let a LATER release delete a third party's record
+// (#2648/#2659/#2660 MAJOR) — directly for a no-identity lease (whose delete
+// has no DHCID-match guard) and for EVERY skip-existing record (which never
+// writes a DHCID, so its delete always takes the plain exact-RR branch), and
+// as broad phantom-state pollution for every refused identity-bearing
+// replace-owned add. Returning a DISTINCT error keeps the reverse PTR add from
+// running on a refused forward and signals the manager not to put().
 var errDDNSConflictRefused = errors.New("ddns: replace-owned add refused (name owned by another party)")
 
 // dnsExchanger is the seam the backend uses to talk to the authoritative
@@ -306,10 +313,11 @@ func (u *rfc2136Updater) UpsertLease(ctx context.Context, rec LeaseDNSRecord) er
 	// Forward zone add.
 	zone := u.resolveForwardZone(rec.FQDN)
 	if err := u.sendAdd(ctx, zone, forwardRR); err != nil {
-		// A replace-owned refusal (the name is owned by another party) is
-		// propagated UNWRAPPED so the manager's errors.Is check sees the
-		// sentinel and records no ownership. Do NOT add the reverse PTR for a
-		// forward we did not publish.
+		// A conflict refusal (the name is owned by another party) — from
+		// replace-owned (#2648) OR skip-existing (#2660) — is propagated
+		// UNWRAPPED so the manager's errors.Is check sees the sentinel and
+		// records no ownership. Do NOT add the reverse PTR for a forward we did
+		// not publish.
 		if errors.Is(err, errDDNSConflictRefused) {
 			return errDDNSConflictRefused
 		}
@@ -511,7 +519,11 @@ func dhcidRR(clientID, fqdn string, ttl uint32) (*dns.DHCID, bool) {
 //     the DHCID is omitted and the name-not-in-use prerequisite alone guards
 //     the claim (still never adopting a pre-existing third-party RR).
 //   - skip-existing: precede the Insert with a "name not in use" prerequisite
-//     and skip on a YX collision.
+//     and REFUSE on a YX collision (the name already exists = a third party
+//     owns it) by returning errDDNSConflictRefused so the manager records NO
+//     ownership. skip-existing never writes a DHCID, so phantom ownership here
+//     would let a later release take the plain exact-RR delete and remove the
+//     third party's RR (#2660).
 //   - strict-fail: same prerequisite, surface the collision as an error.
 func (u *rfc2136Updater) sendAdd(ctx context.Context, zone string, rr dns.RR) error {
 	if u.conflictPolicy == "replace-owned" {
@@ -534,12 +546,21 @@ func (u *rfc2136Updater) sendAdd(ctx context.Context, zone string, rr dns.RR) er
 	case dns.RcodeSuccess:
 		return nil
 	case dns.RcodeYXRrset, dns.RcodeYXDomain:
-		// Prerequisite failed: a record already exists.
+		// Prerequisite failed: a record already exists — a third party owns
+		// this name. Refuse to claim it (count the conflict) and signal the
+		// refusal with errDDNSConflictRefused, NOT nil. A nil return is a
+		// SUCCESS to upsertLocked, which would then record phantom ownership
+		// for a name xpf did not create; skip-existing never writes a DHCID, so
+		// a later release would take sendRemoveForward's plain exact-RR delete
+		// branch and DELETE the third party's RR (#2660, the skip-existing
+		// sibling of the #2648/#2659 boundary breach). The sentinel tells the
+		// manager to record NO ownership — exactly the replace-owned mechanism
+		// (#2648), extended to skip-existing.
 		if u.conflictPolicy == "skip-existing" {
 			if u.onConflict != nil {
 				u.onConflict()
 			}
-			return nil
+			return errDDNSConflictRefused
 		}
 		return fmt.Errorf("ddns: conflict on %s (rcode %s)", rr.Header().Name, dns.RcodeToString[resp.Rcode])
 	default:

@@ -398,9 +398,10 @@ What increment 2 ships (the feasible, CI-testable slice):
   that is derived from the CALLER's context (so a canceled/deadline'd reconcile
   pass cancels the in-flight retry), a bounded per-call timeout, and
   conflict-policy handling (replace-owned = DHCID ownership-proving add/delete,
-  see below; skip-existing = no-RRset prerequisite, skip on collision;
-  strict-fail = error on collision). The backend is STATELESS beyond its
-  config — all ownership lives in the unchanged state store.
+  see below; skip-existing = no-RRset prerequisite, REFUSE on collision via the
+  same sentinel so no phantom ownership is recorded, see below; strict-fail =
+  error on collision). The backend is STATELESS beyond its config — all
+  ownership lives in the unchanged state store.
 
   **`replace-owned` DHCID ownership (RFC 4701 / RFC 4703, #2648).** The
   default `replace-owned` policy no longer sends a BARE RFC 2136 Insert. A bare
@@ -456,6 +457,21 @@ What increment 2 ships (the feasible, CI-testable slice):
     falls back to the plain exact-RR delete of the firewall's own tuple.
   - **Reverse PTR** records carry no DHCID (RFC 4701 binds the marker to the
     forward owner name); they remain idempotent exact adds / exact-RR deletes.
+
+  **`skip-existing` refusal sentinel (#2660).** `skip-existing` prepends an
+  RFC 2136 `RRsetNotUsed` ("name not in use") prerequisite to the Insert. On a
+  `YXRRSET`/`YXDOMAIN` collision the name already exists — a third party owns
+  it — so `sendAdd` now REFUSES by returning the SAME `errDDNSConflictRefused`
+  sentinel `replace-owned` uses (and counts the conflict). It used to return
+  `nil`, which `upsertLocked` reads as a SUCCESS and records phantom ownership.
+  That is the #2648/#2659 boundary breach on the skip-existing path: skip-
+  existing NEVER writes a DHCID, so the phantom-owned record's later release
+  takes `sendRemoveForward`'s `!hasDHCID` plain exact-RR delete branch and
+  DELETES the third party's RR. Returning the sentinel makes `upsertLocked`
+  record NO ownership (the same skip classification as replace-owned), so no
+  later delete is ever constructed. A FRESH (unused) name still publishes
+  normally and is owned — only a collision is refused. This is the #2648
+  mechanism extended to skip-existing.
 - **Zone surface** (plan §11 Q1): the forward zone is the configured
   `Domain` ONLY when the lease's FQDN is actually under it (an out-of-domain
   `ClientFQDN` derives its own parent zone instead of being misrouted into the
