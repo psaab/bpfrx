@@ -1,3 +1,29 @@
+## 2026-06-25 — #2623: GARP/NDP burst follow-up sends now count + surface errors
+
+- **Timestamp**: 2026-06-25
+- **Action**: The failover GARP / unsolicited-NA bursts
+  (`SendGratuitousARPBurst` / `SendGratuitousIPv6Burst`) sent the first
+  frame synchronously (error returned) but the background follow-up
+  goroutine ignored every send error (`unix.Sendto(...) //nolint:errcheck`)
+  while the log reported `total=count` — masking a real failover-reliability
+  degradation when a transient link/qdisc/socket error appears after the
+  first frame. Fix per issue prescription: count follow-up send failures,
+  bump an exported `burstSendErrors` atomic counter (accessor
+  `BurstSendErrors()`), log per-send at Debug (per CLAUDE.md logging rules —
+  no flood) and a single Warn after the burst if any frame failed. The loop
+  never aborts on a transient error. Extracted the two goroutine bodies into
+  `runARPBurstFollowups` / `runNABurstFollowups` and added a `burstSend`
+  package-var seam so a fail-on-revert test can inject a sender that succeeds
+  once then fails. Async-burst timing, non-blocking first send, and the
+  #2081/#2082 epoch/dampener storm-control gates (in pkg/vrrp) are unchanged.
+- **File(s)**: pkg/cluster/garp.go, pkg/cluster/garp_burst_errors_test.go,
+  pkg/cluster/README.md, _Log.md
+- **Validation**: go build ./...; gofmt -l clean; go vet; go test -race
+  ./pkg/cluster/... ./pkg/vrrp/... PASS. Fail-on-revert proven: reverting the
+  ARP helper to the error-ignoring form makes burstSendErrors delta=0 and
+  TestARPBurstFollowupsCountFailures goes RED. HA code — PARENT runs
+  make test-failover before merge.
+
 ## 2026-06-25 — #2412: GRE local-origin thread eventfd wake (kill 1ms busy-poll)
 
 - **Timestamp**: 2026-06-25
@@ -15452,3 +15478,46 @@ top.
 - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/afxdp/tests.rs,
   docs/pr/1373-retire-ebpf-dataplane/plan-1379-dataplane-events.md, _Log.md
+- **Timestamp**: 2026-06-25
+  **Action**: #2615 — render AppID (create) + ingress ifindex (create+close)
+  into the RT_FLOW SESSION_CREATE/CLOSE eventstream frames. The
+  `[128:132]` ingress-ifindex and `[132:134]` application-id wire slots
+  already existed and the Go `pkg/logging/ringbuf.go` decoder already reads
+  them for every RT_FLOW frame, so this is a RENDER-ONLY fix — NO
+  wire-format change (no protocol_wire_v1.json regen). The create encoder
+  left both slots 0 (→ `application="UNKNOWN"` / `packet-incoming-interface=
+  "N/A"`); the close encoder carried AppID (#2520) but left the ifindex 0.
+  Threaded `forwarding.app_catalog.lookup(...)` (mirroring the #2520
+  close-side fix) + `ident.ifindex as u32` (kernel ifindex always positive,
+  loss-free; full-width u32, distinct from the i16 egress/TX #2467 bug) into
+  both `emit_session_create_rt_flow` and `emit_session_close_rt_flow`. Added
+  fail-on-revert tests on both the codec (wire-layout) and emit paths
+  (proved RED on revert — 4 tests fail when the slot writes are reverted —
+  then restored). Go contract tests (pkg/daemon eventstream + pkg/logging)
+  green.
+  **File(s)**: userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/afxdp/session_delta.rs,
+  userspace-dp/src/event_stream/codec_tests.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  userspace-dp/src/event_stream/README.md, _Log.md
+  **Action**: #2469 — session-view surfaces must not publish a partial
+  scan as success on iterator error. REST (`/sessions`,
+  `/sessions/summary`, `/sessions/zone-pair`, interface-mode NAT pool
+  stats) now return HTTP 500 on an `IterateSessions`/`IterateSessionsV6`
+  error instead of HTTP 200 with a partial/zero body. Prometheus session
+  collector emits new `xpf_sessions_breakdown_scrape_ok` gauge (1=full,
+  0=truncated) and OMITS the ipv4/ipv6/snat/dnat breakdown gauges on
+  failure. gRPC `getSessionsLegacy` + `GetSessionSummary` now return
+  `codes.Internal` (matching the already-correct cursor path). CLI
+  top-talkers fails the command; NAT source/dest summaries print a
+  stderr warning via new `warnSessionScan` helper. Added fail-on-revert
+  tests across pkg/api, pkg/grpcapi, pkg/cli (proved RED on revert,
+  restored). Provenance: codex review-034 finding 5.
+  **File(s)**: pkg/api/sessions.go, pkg/api/nat.go,
+  pkg/api/metrics_sessions.go, pkg/api/metrics.go,
+  pkg/api/metrics_descriptors.go, pkg/api/sessions_iterator_error_test.go,
+  pkg/api/README.md, pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/sessions_iterator_error_test.go, pkg/cli/cli_show_flow.go,
+  pkg/cli/cli_show_nat.go, pkg/cli/sessions_iterator_error_test.go,
+  _Log.md

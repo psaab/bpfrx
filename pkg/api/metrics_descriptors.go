@@ -151,6 +151,13 @@ func newCollector(srv *Server) *xpfCollector {
 			"Current number of DNAT sessions.",
 			nil, nil,
 		),
+		sessionScrapeOK: prometheus.NewDesc(
+			"xpf_sessions_breakdown_scrape_ok",
+			"1 if the last session-breakdown scrape (ipv4/ipv6/snat/dnat gauges) "+
+				"enumerated the full session table; 0 if a backend iterator "+
+				"error truncated the scan (the breakdown gauges are then omitted).",
+			nil, nil,
+		),
 		gcSweepDuration: prometheus.NewDesc(
 			"xpf_gc_sweep_duration_seconds",
 			"Duration of the last GC sweep in seconds.",
