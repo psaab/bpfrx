@@ -1119,6 +1119,44 @@ AST shapes + bracket list, fail-on-revert), the snapshot emit test
 matcher `icmp_type_multi_value_matches_any_in_set_2545` /
 `icmp_type_empty_set_matches_any_2545`.
 
+### #2622 — firewall-filter `source-port-except` / `destination-port-except` (negated port match)
+
+Junos firewall filters accept the negated port match conditions
+`from source-port-except` / `from destination-port-except`: match every
+port EXCEPT the listed ones (the inverse of the positive `source-port` /
+`destination-port`). xpf previously had no schema leaf, so migrating a
+config carrying a port exclusion failed to parse / silently dropped the
+condition. The two leaves are added to `schemaFirewall`'s `from` block in
+`schema_cos.go` (BOTH `family inet` and `family inet6`), `multi: true` so a
+bracketed list `[ 80 443 ]` collapses onto one leaf per #2419.
+
+The typed term carries `SourcePortsExcept []string` /
+`DestPortsExcept []string` (`types_system.go`), populated by
+`compileFilterFrom` via `firewallMatchValues` (same accumulation as the
+positive port slices, both AST shapes).
+
+**Wire + dataplane.** Two additive wire fields on `FirewallTermSnapshot` —
+`source_ports_except` / `destination_ports_except` (Go
+`pkg/dataplane/userspace/protocol.go`, Rust `protocol/security.rs`,
+`serde(default)` for #1961 mixed-version parity). The Rust compiler
+(`filter/compiler.rs`) selects ONE port spec list per direction — the
+positive list if it carries real entries, otherwise the `-except` list — and
+sets a per-direction `source_port_except` / `dest_port_except` inversion flag
+on `FilterTerm` (positive wins if both are somehow present). The matcher
+`port_match` (`filter/engine/matching.rs`) now evaluates
+`matcher.matches(port) XOR except`, mirroring the address `nets_match_v4` /
+`nets_match_v6` `except` semantics: an except term whose port list ALL
+fails to parse means "match all ports except {}" = match ALL (vs the
+positive all-malformed fail-closed = match NOTHING). The wire specimen
+`userspace-dp/tests/fixtures/protocol_wire_v1.json` was regenerated for the
+two new fields. Regression coverage:
+`pkg/config/firewall_port_except_2622_test.go` (hierarchical + flat-set
+bracket list + inet6, fail-on-revert) and the Rust matcher
+`destination_port_except_negation` / `source_port_except_negation`
+(a port IN the except list does NOT match; a port NOT in it DOES —
+fail-on-revert). Scope: ports only; `packet-length` from the same
+review-039 finding is NOT implemented here.
+
 ### #2053 — Config secret redaction at JSON/YAML marshal time
 
 The compiled `*config.Config` carries every operator secret verbatim in

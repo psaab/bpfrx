@@ -130,6 +130,17 @@ pub(crate) struct FilterTerm {
     // ports as before.
     pub(crate) source_port_constrained: bool,
     pub(crate) dest_port_constrained: bool,
+    // #2622: invert the source/destination PORT membership test (Junos `from
+    // source-port-except` / `destination-port-except`). When true, the matcher
+    // matches every port NOT in the source/dest port set:
+    // `(port ∈ ranges) XOR except`. The except port list builds the SAME
+    // PortMatcher and sets `*_port_constrained`; only the inversion differs.
+    // When the except list is non-empty but ALL entries fail to parse
+    // (PortMatcher::Any while constrained), the term means "match all ports
+    // except {}" = match ALL — handled in port_match. Only meaningful when the
+    // direction is `*_port_constrained`.
+    pub(crate) source_port_except: bool,
+    pub(crate) dest_port_except: bool,
     pub(crate) dscp_bitmap: u64,
     pub(crate) dscp_match_enabled: bool,
     // Per-packet L4 match conditions (#2362). NOT in SessionKey, so a filter

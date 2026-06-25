@@ -58,6 +58,8 @@ fn basic_accept_discard() {
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
+                    source_ports_except: vec![],
+                    destination_ports_except: vec![],
                 },
                 FirewallTermSnapshot {
                     name: "allow-all".into(),
@@ -83,6 +85,8 @@ fn basic_accept_discard() {
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
+                    source_ports_except: vec![],
+                    destination_ports_except: vec![],
                 },
             ],
         }],
@@ -289,6 +293,8 @@ fn port_range_matching() {
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
+                source_ports_except: vec![],
+                destination_ports_except: vec![],
             }],
         }],
         &[],
@@ -322,6 +328,170 @@ fn port_range_matching() {
     assert_eq!(result.action, FilterAction::Accept);
 }
 
+// #2622: negated port match (Junos `destination-port-except` /
+// `source-port-except`). A `destination-port-except [ 22 80 ]` term must
+// DISCARD every TCP packet whose destination port is NOT 22 and NOT 80, and
+// must NOT match (implicit accept) a packet whose dst port IS 22 or 80.
+//
+// FAIL-ON-REVERT: if the `except` inversion in port_match is reverted to plain
+// membership, the two assertions swap — port 80 would discard and port 12345
+// would accept — and both asserts below go RED.
+#[test]
+fn destination_port_except_negation() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "dport-except".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "deny-except-web".into(),
+                source_except: false,
+                destination_except: false,
+                source_constrained: false,
+                destination_constrained: false,
+                destination_addresses: vec![],
+                source_addresses: vec![],
+                protocols: vec!["tcp".into()],
+                source_ports: vec![],
+                destination_ports: vec![],
+                dscp_values: vec![],
+                action: "discard".into(),
+                next_term: false,
+                count: String::new(),
+                log: false,
+                policer: String::new(),
+                routing_instance: String::new(),
+                forwarding_class: String::new(),
+                dscp_rewrite: None,
+                tcp_flags: None,
+                is_fragment: false,
+                icmp_types: vec![],
+                icmp_codes: vec![],
+                source_ports_except: vec![],
+                destination_ports_except: vec!["22".into(), "80".into()],
+            }],
+        }],
+        &[],
+    );
+    // Port 80 IS in the except list -> term does NOT match -> implicit accept.
+    let result = evaluate_filter(
+        &state,
+        "inet:dport-except",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        54321,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Accept,
+        "port 80 is in the except list, must NOT match the discard term"
+    );
+    // Port 22 IS in the except list -> implicit accept.
+    let result = evaluate_filter(
+        &state,
+        "inet:dport-except",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        54321,
+        22,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(result.action, FilterAction::Accept, "port 22 is excepted");
+    // Port 12345 is NOT in the except list -> term matches -> discard.
+    let result = evaluate_filter(
+        &state,
+        "inet:dport-except",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        54321,
+        12345,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Discard,
+        "port 12345 is NOT excepted, must match the discard term"
+    );
+}
+
+// #2622: source-port-except sibling of the test above, confirming the
+// inversion is wired on the SOURCE direction too. FAIL-ON-REVERT: drop the
+// source_port_except plumbing in compiler.rs and the second assert goes RED.
+#[test]
+fn source_port_except_negation() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "sport-except".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "deny-except-ephemeral".into(),
+                source_except: false,
+                destination_except: false,
+                source_constrained: false,
+                destination_constrained: false,
+                destination_addresses: vec![],
+                source_addresses: vec![],
+                protocols: vec!["udp".into()],
+                source_ports: vec![],
+                destination_ports: vec![],
+                dscp_values: vec![],
+                action: "discard".into(),
+                next_term: false,
+                count: String::new(),
+                log: false,
+                policer: String::new(),
+                routing_instance: String::new(),
+                forwarding_class: String::new(),
+                dscp_rewrite: None,
+                tcp_flags: None,
+                is_fragment: false,
+                icmp_types: vec![],
+                icmp_codes: vec![],
+                source_ports_except: vec!["53".into()],
+                destination_ports_except: vec![],
+            }],
+        }],
+        &[],
+    );
+    // Source port 53 IS excepted -> no match -> accept.
+    let result = evaluate_filter(
+        &state,
+        "inet:sport-except",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        crate::ip_proto::PROTO_UDP,
+        53,
+        4000,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(result.action, FilterAction::Accept, "src port 53 is excepted");
+    // Source port 9999 is NOT excepted -> match -> discard.
+    let result = evaluate_filter(
+        &state,
+        "inet:sport-except",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        crate::ip_proto::PROTO_UDP,
+        9999,
+        4000,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Discard,
+        "src port 9999 is NOT excepted, must match the discard term"
+    );
+}
+
 #[test]
 fn protocol_matching() {
     let state = make_filter_state(
@@ -352,6 +522,8 @@ fn protocol_matching() {
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
+                source_ports_except: vec![],
+                destination_ports_except: vec![],
             }],
         }],
         &[],
@@ -415,6 +587,8 @@ fn dscp_rewrite_action() {
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
+                source_ports_except: vec![],
+                destination_ports_except: vec![],
             }],
         }],
         &[],
@@ -464,6 +638,8 @@ fn dscp_rewrite_action_allows_default_zero() {
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
+                source_ports_except: vec![],
+                destination_ports_except: vec![],
             }],
         }],
         &[],
@@ -1328,6 +1504,8 @@ fn multiple_terms_first_match_wins() {
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
+                    source_ports_except: vec![],
+                    destination_ports_except: vec![],
                 },
                 FirewallTermSnapshot {
                     name: "deny-all-udp".into(),
@@ -1353,6 +1531,8 @@ fn multiple_terms_first_match_wins() {
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
+                    source_ports_except: vec![],
+                    destination_ports_except: vec![],
                 },
             ],
         }],
@@ -1417,6 +1597,8 @@ fn source_dest_address_matching() {
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
+                source_ports_except: vec![],
+                destination_ports_except: vec![],
             }],
         }],
         &[],
