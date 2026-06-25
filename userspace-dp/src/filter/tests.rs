@@ -5128,6 +5128,111 @@ fn fallthrough_tx_selection_applies_forwarding_class_then_discards() {
 }
 
 // ---------------------------------------------------------------------------
+// #2573: the cached TX-selection path must record EVERY matched `then count`
+// term, not just the last. With #2544 fall-through a single packet can match
+// two count terms on the same flow-cache key; the old single-Arc slot kept only
+// the last, so the earlier fall-through count term was silently under-counted on
+// the cached replay path (the uncached full-eval path counted both).
+//
+// FAIL-ON-REVERT: reverting `merge_matched_cached_modifiers` to
+// `acc.counter = Some(term.counter.clone())` (last-only) makes the cached result
+// carry one counter and replay increments only the terminal term — the
+// `terms[0].counter` assert below then fails RED.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cached_tx_selection_records_all_fallthrough_count_terms() {
+    // Two fall-through `then count` terms both match the same 5-tuple, followed
+    // by a terminating accept. The output filter is the TX-selection filter.
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "reth0.80".into(),
+        ifindex: 9,
+        filter_output_v4: "multi-count".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "multi-count".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "count-a".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: String::new(),
+                    next_term: true,
+                    count: "count-a-hits".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "count-b".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: String::new(),
+                    next_term: true,
+                    count: "count-b-hits".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "accept-rest".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: "accept".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+
+    let filter = state
+        .iface_filter_out_v4_fast
+        .get(&9)
+        .expect("output filter present");
+    // The compiler must mark the first two terms as fall-through count terms.
+    assert!(filter.terms[0].continue_term && filter.terms[0].has_count);
+    assert!(filter.terms[1].continue_term && filter.terms[1].has_count);
+
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    let cached =
+        evaluate_filter_ref_tx_selection_cached(filter, src, dst, PROTO_TCP, 40000, 80, 0);
+
+    // The cached descriptor must carry BOTH matched count terms (deduped to 2).
+    assert_eq!(
+        cached.counters.len(),
+        2,
+        "cached TX-selection must record every matched `then count` term, not just the last"
+    );
+    assert_eq!(cached.action, FilterAction::Accept);
+
+    // Replay exactly as the flow-cache hit path does: record each cached counter.
+    cached.counters.for_each(|counter| {
+        crate::filter::record_filter_counter(counter, 1500);
+    });
+    crate::filter::flush_recorded_filter_counters();
+
+    // BOTH fall-through count terms must have incremented on the cached replay.
+    // Revert to last-only and terms[0] stays 0 -> this assert fails RED.
+    assert_eq!(
+        filter.terms[0].counter.packets.load(Ordering::Relaxed),
+        1,
+        "first fall-through count term must increment on the cached path"
+    );
+    assert_eq!(filter.terms[0].counter.bytes.load(Ordering::Relaxed), 1500);
+    assert_eq!(
+        filter.terms[1].counter.packets.load(Ordering::Relaxed),
+        1,
+        "second fall-through count term must increment on the cached path"
+    );
+    assert_eq!(filter.terms[1].counter.bytes.load(Ordering::Relaxed), 1500);
+}
+
+// ---------------------------------------------------------------------------
 // #2616: a fall-through `then { log; next term; }` term followed by a terminal
 // discard/reject must report the FINAL verdict (deny) in its RT_FLOW log action,
 // not the Accept placeholder the fall-through term carries. Pre-fix the

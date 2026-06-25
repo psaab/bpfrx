@@ -1367,9 +1367,12 @@ func TestGenerateProtocols_ECMPMaxPaths(t *testing.T) {
 			{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true},
 		},
 	}
+	// Global ECMP (forwarding-table export) must NOT enable BGP multipath:
+	// without an explicit `protocols bgp multipath`, the BGP address-
+	// families render no `maximum-paths` even when ecmpMaxPaths > 1 (#2791).
 	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 64, nil)
-	if !strings.Contains(got, "maximum-paths 64") {
-		t.Errorf("missing maximum-paths in BGP, got:\n%s", got)
+	if strings.Contains(got, "maximum-paths") {
+		t.Errorf("global ECMP must not emit BGP maximum-paths, got:\n%s", got)
 	}
 
 	// Also test OSPF ECMP
@@ -2314,6 +2317,47 @@ func TestGenerateProtocols_BGPMultipath(t *testing.T) {
 	}
 	if !strings.Contains(got, "maximum-paths 64\n") {
 		t.Errorf("missing maximum-paths in:\n%s", got)
+	}
+}
+
+// TestGenerateProtocols_BGPMaxPathsDecoupledFromECMP pins the #2791 fix: the
+// BGP address-family `maximum-paths` line is driven ONLY by the explicit
+// `protocols bgp multipath` knob (bgp.Multipath), and is NEVER seeded from the
+// global forwarding-table ECMP value (ecmpMaxPaths). The pre-fix code did
+// `bgpMaxPaths := ecmpMaxPaths` so a global ECMP setting silently enabled BGP
+// multipath. Reverting that decoupling re-introduces a `maximum-paths` line in
+// the ECMP-only sub-case below, turning this test RED.
+func TestGenerateProtocols_BGPMaxPathsDecoupledFromECMP(t *testing.T) {
+	m := New()
+	// Dual-stack neighbors so both the ipv4 and ipv6 unicast address-family
+	// blocks are emitted and inspected.
+	mkBGP := func(multipath int) *config.BGPConfig {
+		return &config.BGPConfig{
+			LocalAS:   65001,
+			RouterID:  "1.1.1.1",
+			Multipath: multipath,
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true},
+				{Address: "2001:db8::1", PeerAS: 65002, FamilyInet6: true},
+			},
+		}
+	}
+
+	// Global ECMP set (ecmpMaxPaths=8), BGP multipath NOT configured: the BGP
+	// address-families must NOT contain `maximum-paths`.
+	got := m.generateProtocols(nil, nil, mkBGP(0), nil, nil, "", 8, nil)
+	if strings.Contains(got, "maximum-paths") {
+		t.Errorf("global ECMP (no bgp multipath) must not emit BGP maximum-paths; "+
+			"reverting the #2791 decoupling re-couples it. got:\n%s", got)
+	}
+
+	// BGP multipath explicitly configured: the BGP address-families MUST
+	// contain `maximum-paths` even when global ECMP is off (ecmpMaxPaths=0) —
+	// one line per address-family (ipv4 + ipv6).
+	got = m.generateProtocols(nil, nil, mkBGP(4), nil, nil, "", 0, nil)
+	if n := strings.Count(got, "maximum-paths 4\n"); n != 2 {
+		t.Errorf("explicit bgp multipath must emit `maximum-paths 4` in both "+
+			"address-families (want 2, got %d):\n%s", n, got)
 	}
 }
 

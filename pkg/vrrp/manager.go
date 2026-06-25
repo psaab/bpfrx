@@ -690,6 +690,32 @@ func (m *Manager) Status() string {
 	return sb.String()
 }
 
+// bindSocketToDevice applies SO_BINDTODEVICE to fd, pinning it to ifName. It
+// is a package var so tests can intercept the call and assert whether the
+// per-interface raw-socket setup binds to the device (it must on a plain
+// interface, must NOT on a VLAN sub-interface) without needing CAP_NET_RAW or
+// a real socket fd. Both the IPv4 (openPerInterfaceSocket) and IPv6
+// (openIPv6Socket) paths route through this seam so the VLAN-skip decision is
+// observable and stays symmetric across families (#2786).
+var bindSocketToDevice = func(fd int, ifName string) error {
+	return unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, ifName)
+}
+
+// maybeBindToDevice applies SO_BINDTODEVICE to fd ONLY when ifName is a plain
+// (non-VLAN) interface. On a VLAN sub-interface it is a no-op: generic-XDP
+// VLAN tag handling makes the kernel's interface association unpredictable, so
+// pinning the socket to the sub-interface index can drop VRRP multicast. Both
+// the IPv4 (openPerInterfaceSocket) and IPv6 (openIPv6Socket) raw-socket paths
+// MUST route their device bind through this single decision so the two
+// families behave identically on a VLAN RETH member — an asymmetry here lets
+// one family miss peer adverts and split-brain (#2786).
+func maybeBindToDevice(fd int, ifName string, isVLAN bool) error {
+	if isVLAN {
+		return nil
+	}
+	return bindSocketToDevice(fd, ifName)
+}
+
 // openPerInterfaceSocket creates a raw IP socket (proto 112) and joins the
 // VRRP multicast group (224.0.0.18) on the given interface.
 // For non-VLAN interfaces, SO_BINDTODEVICE is used for isolation.
@@ -705,7 +731,8 @@ func openPerInterfaceSocket(ifName string, iface *net.Interface, isVLAN bool) (*
 	}
 
 	// For plain (non-VLAN) interfaces, bind to the interface via SyscallConn
-	// (avoids File() which sets blocking mode and removes the fd from Go's poller).
+	// (avoids File() which sets blocking mode and removes the fd from Go's
+	// poller). maybeBindToDevice skips the bind on VLAN sub-interfaces.
 	if !isVLAN {
 		sc, err := conn.(*net.IPConn).SyscallConn()
 		if err != nil {
@@ -714,7 +741,7 @@ func openPerInterfaceSocket(ifName string, iface *net.Interface, isVLAN bool) (*
 		}
 		var bindErr error
 		if err := sc.Control(func(fd uintptr) {
-			bindErr = unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, ifName)
+			bindErr = maybeBindToDevice(int(fd), ifName, isVLAN)
 		}); err != nil {
 			conn.Close()
 			return nil, nil, fmt.Errorf("control: %w", err)
@@ -873,7 +900,19 @@ func openAfPacketReceiver(ifIndex int) (int, error) {
 // openIPv6Socket creates a raw IPv6 socket (IPPROTO_VRRP = 112) bound to
 // the given interface for sending VRRPv3 IPv6 advertisements.
 // Returns the PacketConn and the raw fd for setsockopt operations.
-func openIPv6Socket(ifName string, iface *net.Interface) (net.PacketConn, int, error) {
+//
+// SO_BINDTODEVICE is applied identically to the IPv4 path
+// (openPerInterfaceSocket): used on plain interfaces for isolation, but
+// SKIPPED on VLAN sub-interfaces. Generic-XDP VLAN tag handling makes the
+// kernel's interface association unpredictable — pinning the socket to the
+// VLAN sub-interface index can drop incoming/locally-looped multicast when
+// the tag is stripped/modified before delivery. Before #2786 the IPv6 path
+// bound unconditionally while IPv4 skipped, so the two families saw VRRP
+// traffic differently on a VLAN RETH member (e.g. reth0.50/reth0.80): the
+// IPv6 instance could miss peer adverts entirely and both nodes would hold
+// MASTER → split-brain / dual-MASTER. IPv6 multicast egress is still steered
+// by IPV6_MULTICAST_IF below, which does not depend on SO_BINDTODEVICE.
+func openIPv6Socket(ifName string, iface *net.Interface, isVLAN bool) (net.PacketConn, int, error) {
 	conn, err := net.ListenPacket("ip6:112", "::")
 	if err != nil {
 		return nil, -1, fmt.Errorf("listen ip6:112: %w", err)
@@ -889,8 +928,9 @@ func openIPv6Socket(ifName string, iface *net.Interface) (net.PacketConn, int, e
 	var bindErr error
 	if err := sc.Control(func(rawfd uintptr) {
 		fd = int(rawfd)
-		// Bind to interface.
-		bindErr = unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, ifName)
+		// Bind to interface — skip on VLAN sub-interfaces (matches the IPv4
+		// path; see openPerInterfaceSocket and the doc comment above).
+		bindErr = maybeBindToDevice(fd, ifName, isVLAN)
 		if bindErr != nil {
 			return
 		}
