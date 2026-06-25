@@ -198,3 +198,54 @@ func TestP3CheckIPURLUppercaseSchemeAccepted(t *testing.T) {
 		}
 	}
 }
+
+// TestP3GenericURLTemplateMalformedWarns is the #2841 fail-on-revert gate: a
+// generic backend's url-template was validated PREFIX-ONLY (a bare HasPrefix
+// http(s):// check), so a host-less or wrong-scheme template committed silently
+// and only failed at the first publish — unlike checkip-url, which parses for a
+// host. This test goes RED if the ddnsGenericURLTemplateValid wiring is removed
+// (back to prefix-only). It also pins the TEMPLATE-AWARE requirement: a valid
+// template carrying inadyn %h/%i/%u/%p specifiers (including a credential in the
+// userinfo, which makes net/url.Parse fail) must NOT be false-rejected.
+func TestP3GenericURLTemplateMalformedWarns(t *testing.T) {
+	tree := buildTree(t, []string{
+		// Host-less: passes the old HasPrefix("https://") but has no host.
+		"set system services dynamic-dns provider no-host backend generic",
+		`set system services dynamic-dns provider no-host url-template "https:///upd?ip=%i"`,
+		// Wrong scheme.
+		"set system services dynamic-dns provider bad-scheme backend generic",
+		`set system services dynamic-dns provider bad-scheme url-template "ftp://host/upd?ip=%i"`,
+		// Garbage (no scheme at all).
+		"set system services dynamic-dns provider junk backend generic",
+		`set system services dynamic-dns provider junk url-template "not a url"`,
+		// VALID template with inadyn %-specifiers in path/query — must NOT warn.
+		"set system services dynamic-dns provider good backend generic",
+		`set system services dynamic-dns provider good url-template "https://api.example.net/update?host=%h&ip=%i"`,
+		// VALID template with a credential in the userinfo (%p) — net/url.Parse
+		// would FAIL on the bare %p, but the template-aware validator must accept
+		// it (the host is present after the '@'). Goes RED if a naive url.Parse is
+		// used instead.
+		"set system services dynamic-dns provider creds backend generic",
+		`set system services dynamic-dns provider creds url-template "https://user:%p@api.example.net/upd?host=%h"`,
+		// VALID uppercase scheme (RFC 3986 §3.1 case-insensitive).
+		"set system services dynamic-dns provider up backend generic",
+		`set system services dynamic-dns provider up url-template "HTTPS://api.example.net/upd?ip=%i"`,
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	joined := strings.Join(validateSurfaceADDNSWarnings(cfg), "\n")
+
+	for _, badName := range []string{"no-host", "bad-scheme", "junk"} {
+		want := "provider \"" + badName + "\" url-template"
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected a url-template warning for provider %q; got:\n%s", badName, joined)
+		}
+	}
+	for _, okName := range []string{"good", "creds", "up"} {
+		if strings.Contains(joined, "provider \""+okName+"\" url-template") {
+			t.Fatalf("valid url-template should not warn for %q; got:\n%s", okName, joined)
+		}
+	}
+}

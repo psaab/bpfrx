@@ -17050,3 +17050,32 @@ top.
   go vet ./pkg/frr/... ./pkg/config/... ; go test ./pkg/frr/...
   ./pkg/config/... (PASS). Fail-on-revert confirmed: reverting the gate
   to `term.Metric > 0` makes TestGeneratePolicyOptionsMetricZero RED.
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2841 — validate generic DDNS url-template with the same
+  discipline as checkip-url (template-aware: parse scheme + host without
+  choking on inadyn %-specifiers)
+- **File(s)**:
+  - `pkg/ddns/backend_generic.go` — add `validateGenericURLTemplate`
+    (string-based, case-insensitive http(s) scheme + non-empty host,
+    strips userinfo so `%u`/`%p` credentials are tolerated); call it in
+    `newGenericBackend` in place of the old bare `HasPrefix` prefix check.
+  - `pkg/config/compiler_validate_warn.go` — add mirror
+    `ddnsGenericURLTemplateValid` + wire a commit WARNING into the
+    `case "generic"` (RedactURL'd template in the message), matching the
+    checkip-url warning pattern.
+  - `pkg/ddns/backend_http_test.go` — `TestGenericURLTemplateValidation`
+    (reject host-less/wrong-scheme/no-scheme; accept %-specifiers,
+    userinfo-credential, uppercase scheme, explicit port).
+  - `pkg/config/compiler_p3_http_providers_test.go` —
+    `TestP3GenericURLTemplateMalformedWarns` (host-less/wrong-scheme/junk
+    warn; valid %-specifier/userinfo-cred/uppercase templates do NOT
+    warn). Built via ParseSetCommand + SetPath + CompileConfig.
+  - `pkg/ddns/README.md`, `docs/config-schema.md` — documented the
+    template-aware validation + commit warning.
+- **Validation**: go build ./... ; gofmt -l (clean on touched files);
+  go vet ./pkg/config/... ./pkg/ddns/... ; go test ./pkg/config/...
+  ./pkg/ddns/... (PASS). Fail-on-revert confirmed: reverting both the
+  ddns validator and the config wiring to prefix-only makes
+  TestP3GenericURLTemplateMalformedWarns and TestGenericURLTemplateValidation
+  RED (host-less accepted + uppercase scheme false-rejected).

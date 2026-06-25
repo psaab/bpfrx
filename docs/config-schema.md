@@ -913,11 +913,21 @@ reserved for whole-dataplane selection where a rewrite shim
     hard reject). A malformed `checkip-url` (not an http(s) URL with a host —
     e.g. `ftp://`, `not a url`, host-less `http://`) also warns at commit
     (#2773); the scheme check is case-INSENSITIVE per RFC 3986 §3.1, so an
-    uppercase/mixed-case `HTTPS://host` is accepted, not warned (#2842). Without
-    the commit-time check the typo committed silently and the runtime fetch then
-    masqueraded forever as a transient observation failure, suppressing
-    publishing indefinitely. The runtime `ddns.CheckIP` gate
-    (`validateCheckIPURL`) fails closed on the same malformed URL regardless, so
+    uppercase/mixed-case `HTTPS://host` is accepted, not warned (#2842). A
+    malformed generic `url-template` (no host / wrong scheme) likewise warns at
+    commit (#2841, mirror `ddnsGenericURLTemplateValid`) — previously it was
+    validated PREFIX-ONLY (a bare `HasPrefix` http(s):// with no host parse), so
+    a host-less template committed silently and only failed at the first publish.
+    That validator is deliberately TEMPLATE-AWARE and string-based (not
+    `net/url`): it extracts the scheme + host and tolerates the inadyn
+    `%h/%i/%u/%p` specifiers (including a credential in the userinfo, e.g.
+    `https://user:%p@host/upd`, which would make `url.Parse` fail) and `{{...}}`
+    placeholders in the rest of the URL — same rationale as `RedactURL` (#2781).
+    Without the commit-time check the typo committed silently and the runtime
+    fetch then masqueraded forever as a transient observation failure,
+    suppressing publishing indefinitely. The runtime `ddns.CheckIP` gate
+    (`validateCheckIPURL`) and the generic backend's `validateGenericURLTemplate`
+    (in `newGenericBackend`) fail closed on the same malformed URL regardless, so
     a URL that slips past commit cannot reach a fetch. Regression coverage:
     `pkg/config/compiler_p3_http_providers_test.go`,
     `pkg/ddns/backend_http_test.go` / `backend_cloudflare_test.go` /

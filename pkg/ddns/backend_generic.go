@@ -62,8 +62,8 @@ func newGenericBackend(p *config.DDNSProvider) (*genericBackend, error) {
 	if tmpl == "" {
 		return nil, fmt.Errorf("ddns generic: provider %q has no url-template", p.Name)
 	}
-	if !strings.HasPrefix(tmpl, "http://") && !strings.HasPrefix(tmpl, "https://") {
-		return nil, fmt.Errorf("ddns generic: provider %q url-template must be an http(s) URL", p.Name)
+	if err := validateGenericURLTemplate(tmpl); err != nil {
+		return nil, fmt.Errorf("ddns generic: provider %q %w", p.Name, err)
 	}
 	ok := defaultGenericOKTokens
 	if s := strings.TrimSpace(p.OKResponse); s != "" {
@@ -82,6 +82,48 @@ func newGenericBackend(p *config.DDNSProvider) (*genericBackend, error) {
 		password:    p.Password.Reveal(),
 		client:      client,
 	}, nil
+}
+
+// validateGenericURLTemplate rejects an obviously malformed generic url-template
+// at construction so a typo fails closed at commit/construct rather than at the
+// first publish (#2841). It enforces the SAME discipline as checkip's
+// validateCheckIPURL — a case-INSENSITIVE http(s) scheme (RFC 3986 §3.1,
+// matching #2842) plus a non-empty host — but it is deliberately TEMPLATE-AWARE
+// and string-based, NOT net/url-based: the value is an inadyn template carrying
+// %h/%i/%u/%p specifiers (and may embed a credential in the userinfo, e.g.
+// https://user:%p@host/upd) which are not valid percent-encoding and make
+// url.Parse fail or mangle the string (the same reason RedactURL is string-based,
+// #2781). It validates ONLY the scheme + host portion and tolerates any
+// %-specifier or {{...}} placeholder in the userinfo/path/query.
+func validateGenericURLTemplate(tmpl string) error {
+	// Scheme: the substring up to "://", compared case-insensitively.
+	i := strings.Index(tmpl, "://")
+	if i < 0 {
+		return fmt.Errorf("url-template %q must be an http(s) URL (no scheme)", tmpl)
+	}
+	scheme := tmpl[:i]
+	if !strings.EqualFold(scheme, "http") && !strings.EqualFold(scheme, "https") {
+		return fmt.Errorf("url-template %q must be an http(s) URL", tmpl)
+	}
+	// Authority: between "://" and the first '/', '?' or '#'. Strip any userinfo
+	// ("user:pass@", which legitimately contains %u/%p) — the host is what
+	// remains after the last '@'.
+	authStart := i + len("://")
+	authEnd := len(tmpl)
+	for j := authStart; j < len(tmpl); j++ {
+		if c := tmpl[j]; c == '/' || c == '?' || c == '#' {
+			authEnd = j
+			break
+		}
+	}
+	authority := tmpl[authStart:authEnd]
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		authority = authority[at+1:]
+	}
+	if authority == "" {
+		return fmt.Errorf("url-template %q has no host", tmpl)
+	}
+	return nil
 }
 
 // renderGenericURL expands the inadyn-style template specifiers. %u/%p are
