@@ -16,6 +16,13 @@ func ddnsOf(t *testing.T, cfg *Config) *DHCPDynamicDNSConfig {
 	return cfg.System.DHCPServer.DynamicDNS
 }
 
+// ddnsV6Of returns the IPv6-family DDNS policy (#2691 P1b / #2663: v4 and v6
+// now compile to independent fields instead of one field-merged struct).
+func ddnsV6Of(t *testing.T, cfg *Config) *DHCPDynamicDNSConfig {
+	t.Helper()
+	return cfg.System.DHCPServer.DynamicDNSv6
+}
+
 func TestDHCPDDNSHierarchicalAndFlatSetCompileEqually(t *testing.T) {
 	// Dual-AST equality: the hierarchical block and the flat-set spelling
 	// must compile to the same typed DHCPDynamicDNSConfig (plan §5 inv 5).
@@ -116,75 +123,80 @@ func TestDHCPDDNSV6BlockCompiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompileConfig: %v", err)
 	}
-	d := ddnsOf(t, cfg)
+	// #2691 P1b / #2663: a v6-only block now compiles to the INDEPENDENT
+	// DynamicDNSv6 field (not field-merged into DynamicDNS). The v4 field stays
+	// nil (no v4 DDNS configured).
+	d := ddnsV6Of(t, cfg)
 	if d == nil || !d.Enabled || d.Domain != "v6.example.com" {
-		t.Fatalf("v6 dynamic-dns not compiled: %+v", d)
+		t.Fatalf("v6 dynamic-dns not compiled into DynamicDNSv6: %+v", d)
+	}
+	if ddnsOf(t, cfg) != nil {
+		t.Fatalf("v6-only block must leave the v4 DynamicDNS field nil, got %+v", ddnsOf(t, cfg))
 	}
 }
 
-// TestDHCPDDNSDualFamilyMergesFieldByField proves the Copilot/Codex MAJOR
-// fix: when BOTH dhcp-local-server AND dhcpv6-local-server carry a
-// dynamic-dns block, the compiler MERGES them field-by-field instead of
-// whole-struct overwrite. A partial second-family block (e.g. only domain
-// under v6) must NOT clear the first family's Enabled/server/ttl. Against
-// the pre-fix `dhcp.DynamicDNS = compileDHCPDynamicDNS(...)` overwrite, the
-// v6 block (Enabled=false, no server, no ttl) replaced the v4 block and
-// DDNS was silently disabled with its settings dropped — so this test
-// fails pre-fix.
-func TestDHCPDDNSDualFamilyMergesFieldByField(t *testing.T) {
-	// v4 compiles first (dst): enable + update-server + ttl. v6 compiles
-	// second (src): only domain. Merge must keep all v4 fields + gain domain.
+// TestDHCPDDNSDualFamilyIndependentPolicy proves the #2691 P1b / #2663 fix:
+// when BOTH dhcp-local-server AND dhcpv6-local-server carry a dynamic-dns
+// block, the two families compile to INDEPENDENT policies (DynamicDNS vs
+// DynamicDNSv6) — NOT one field-merged struct. A v4 block and a v6 block keep
+// their OWN domain / server / ttl, so an operator can direct v4 leases to one
+// zone/server and v6 leases to another. This is the deliberate behaviour change
+// from the pre-P1b field-merge (under which a v6 `domain` silently filled an
+// empty v4 field and a single struct could not represent two servers).
+func TestDHCPDDNSDualFamilyIndependentPolicy(t *testing.T) {
 	cfg, err := CompileConfig(buildTree(t, []string{
 		"set system services dhcp-local-server dynamic-dns enable",
+		"set system services dhcp-local-server dynamic-dns domain v4.example.com",
 		"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
 		"set system services dhcp-local-server dynamic-dns ttl 600",
-		"set system services dhcpv6-local-server dynamic-dns domain corp.example.com",
+		"set system services dhcpv6-local-server dynamic-dns enable",
+		"set system services dhcpv6-local-server dynamic-dns domain v6.example.com",
+		"set system services dhcpv6-local-server dynamic-dns update-server 2001:db8::53",
+		"set system services dhcpv6-local-server dynamic-dns ttl 1200",
 	}))
 	if err != nil {
 		t.Fatalf("CompileConfig: %v", err)
 	}
-	d := ddnsOf(t, cfg)
-	if d == nil {
-		t.Fatal("dual-family DDNS compiled to nil")
+	v4 := ddnsOf(t, cfg)
+	v6 := ddnsV6Of(t, cfg)
+	if v4 == nil || v6 == nil {
+		t.Fatalf("both families must compile to a policy: v4=%+v v6=%+v", v4, v6)
 	}
-	if !d.Enabled {
-		t.Fatal("partial v6 block cleared v4 Enabled (whole-struct overwrite bug)")
+	// v4 keeps ITS settings; v6 keeps ITS settings — independent, never merged.
+	if v4.Domain != "v4.example.com" || v4.UpdateServer != "192.0.2.53" || v4.TTLSeconds != 600 {
+		t.Fatalf("v4 policy not independent: %+v", v4)
 	}
-	if d.UpdateServer != "192.0.2.53" {
-		t.Fatalf("v4 update-server lost on merge: %q", d.UpdateServer)
+	if v6.Domain != "v6.example.com" || v6.UpdateServer != "2001:db8::53" || v6.TTLSeconds != 1200 {
+		t.Fatalf("v6 policy not independent: %+v", v6)
 	}
-	if d.TTLSeconds != 600 {
-		t.Fatalf("v4 ttl lost on merge: %d", d.TTLSeconds)
-	}
-	if d.Domain != "corp.example.com" {
-		t.Fatalf("v6 domain not merged in: %q", d.Domain)
+	// The cardinal #2663 assertion: a v6 field never bled into the v4 struct.
+	if v4.Domain == v6.Domain || v4.UpdateServer == v6.UpdateServer {
+		t.Fatalf("v4 and v6 policies were merged (not independent): v4=%+v v6=%+v", v4, v6)
 	}
 }
 
-// TestDHCPDDNSDualFamilyEnableLatchesEitherOrder proves the Enabled latch is
-// order-robust: enabling DDNS in EITHER family enables it, and a partial
-// block in the other family cannot flip it off — regardless of which family
-// is the partial one.
-func TestDHCPDDNSDualFamilyEnableLatchesEitherOrder(t *testing.T) {
-	// v4 partial (only domain), v6 enables. Latch must hold (v6 is src; the
-	// merge ORs Enabled so dst v4 ends up Enabled too).
+// TestDHCPDDNSSingleFamilyAppliesToBoth proves backward compatibility (#2691
+// P1b / plan §5.9): a pre-P1b config that set the dynamic-dns block under only
+// ONE family still works — the engine inherits that single policy for the other
+// family at reconcile time (ReconcileScoped). At the COMPILE layer the v4 block
+// lands in DynamicDNS and DynamicDNSv6 stays nil; the inheritance is a runtime
+// (engine) concern, asserted in pkg/ddns. Here we only prove the v4 block
+// compiles into the v4 field and the v6 field is nil (no silent v6 struct).
+func TestDHCPDDNSSingleFamilyAppliesToBoth(t *testing.T) {
 	cfg, err := CompileConfig(buildTree(t, []string{
+		"set system services dhcp-local-server dynamic-dns enable",
 		"set system services dhcp-local-server dynamic-dns domain corp.example.com",
-		"set system services dhcpv6-local-server dynamic-dns enable",
-		"set system services dhcpv6-local-server dynamic-dns update-server 2001:db8::53",
+		"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
 	}))
 	if err != nil {
 		t.Fatalf("CompileConfig: %v", err)
 	}
-	d := ddnsOf(t, cfg)
-	if d == nil || !d.Enabled {
-		t.Fatalf("enable in v6 did not latch when v4 was the partial block: %+v", d)
+	v4 := ddnsOf(t, cfg)
+	if v4 == nil || !v4.Enabled || v4.Domain != "corp.example.com" {
+		t.Fatalf("v4 block not compiled: %+v", v4)
 	}
-	if d.Domain != "corp.example.com" {
-		t.Fatalf("v4 domain lost: %q", d.Domain)
-	}
-	if d.UpdateServer != "2001:db8::53" {
-		t.Fatalf("v6 update-server not merged: %q", d.UpdateServer)
+	if ddnsV6Of(t, cfg) != nil {
+		t.Fatalf("v4-only block must leave DynamicDNSv6 nil (engine inherits at reconcile), got %+v", ddnsV6Of(t, cfg))
 	}
 }
 
@@ -219,6 +231,41 @@ func TestDHCPDDNSSchemaAcceptsValidLeaves(t *testing.T) {
 	})
 	if err := SchemaValidate(tree, nil); err != nil {
 		t.Fatalf("SchemaValidate rejected valid DDNS leaves: %v", err)
+	}
+}
+
+// TestDHCPDDNSSourceBindingLeaves proves the #2691 P1b / #2665 source-binding
+// leaves (source-address / destination-interface / routing-instance) pass
+// schema validation AND compile onto the typed policy.
+func TestDHCPDDNSSourceBindingLeaves(t *testing.T) {
+	lines := []string{
+		"set system services dhcp-local-server dynamic-dns enable",
+		"set system services dhcp-local-server dynamic-dns domain example.com",
+		"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
+		"set system services dhcp-local-server dynamic-dns source-address 10.0.0.9",
+		"set system services dhcp-local-server dynamic-dns destination-interface ge-0/0/2.50",
+		"set system services dhcp-local-server dynamic-dns routing-instance VRF-WAN",
+	}
+	tree := buildTree(t, lines)
+	if err := SchemaValidate(tree, nil); err != nil {
+		t.Fatalf("SchemaValidate rejected source-binding leaves: %v", err)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	d := ddnsOf(t, cfg)
+	if d == nil {
+		t.Fatal("source-binding block compiled to nil")
+	}
+	if d.SourceAddress != "10.0.0.9" {
+		t.Fatalf("source-address not compiled: %q", d.SourceAddress)
+	}
+	if d.DestinationInterface != "ge-0/0/2.50" {
+		t.Fatalf("destination-interface not compiled: %q", d.DestinationInterface)
+	}
+	if d.RoutingInstance != "VRF-WAN" {
+		t.Fatalf("routing-instance not compiled: %q", d.RoutingInstance)
 	}
 }
 

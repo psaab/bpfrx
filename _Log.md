@@ -14046,3 +14046,91 @@ top.
   only full-suite failure is the pre-existing `pkg/fsatomic` canary flagging
   `pkg/dataplane/proxyarp.go` (untouched by this PR). `make test-failover`
   deferred to the parent (no cluster access); the HA gate is call-through-only.
+
+---
+
+## 2026-06-24 — #2691 Phase P1b: ScopeKey + per-scope policy + per-RG HA gate + source binding
+
+- **Timestamp**: 2026-06-24
+- **Action**: Implement #2691 P1b (closes #2663, #2664, #2665) on the P1a
+  pkg/ddns spine — the load-bearing ScopeKey primitive, independent v4/v6
+  policy, the per-RG HA writer gate, and RFC 2136 source/VRF binding.
+- **ScopeKey (#2663/#2664, plan §5.4)**: added `ScopeKey
+  {Family,Interface,Unit,RoutingInstance,RGOwner,PolicyID}` +
+  `Family`/`familyOf` to `pkg/ddns/state.go`. Ownership records carry a
+  `*ScopeKey` (pointer → JSON-omitted for the zero/global scope) and are keyed
+  by `{scope,identity,address}`. The ZERO scope reproduces the pre-P1b
+  `identity|address` key byte-for-byte → pre-P1b stores load with NO migration
+  (plan §11 Q7). `scopeOf()`/`withScope()` helpers; `get`/`delete`/`put`/`all`
+  + `loadDDNSState` made scope-aware.
+- **Independent v4/v6 policy (#2663)**: `Reconcile` → `ReconcileScoped`
+  resolves a policy + backend PER FAMILY (`reconcileEnv.pol[2]/updater[2]`)
+  from `DHCPServerConfig.DynamicDNS` (v4) + new `.DynamicDNSv6` (v6). Compiler
+  routes v4→DynamicDNS, v6→DynamicDNSv6 (no more field-merge). Single-family
+  backward compat: the other family inherits the single block at reconcile.
+- **Per-RG HA gate (#2664)**: `ReconcileOptions{Gate,Resolver}` →
+  `reconcileOnceLocked` tags each lease's scope + applies the gate
+  (stop-writing-never-withdraw for a gated-out scope; fail-closed on
+  unattributable when RG-owned pools exist). Daemon `ddnsReconcileOptions`
+  builds the resolver (lease addr → pool-subnet CIDR → group → interface → RG)
+  + gate (master[RGOwner]); `reconcileDDNSOnce` calls `ReconcileScoped`. Added
+  the partial-demotion DDNS nudge in `clearRethServicesForRG`.
+- **Source/VRF binding (#2665)**: new `pkg/ddns/backend_bind.go` builds a
+  custom `net.Dialer` (one Control hook: `unix.Bind` source IP +
+  `SO_BINDTODEVICE` interface/VRF, works for UDP-first + TCP-retry).
+  `newRFC2136Updater` installs it; invalid source-address → hard ctor error →
+  family falls back to no-op. New config leaves source-address /
+  destination-interface / routing-instance (schema + compiler + types).
+- **File(s)**: [Write] pkg/ddns/backend_bind.go, pkg/ddns/scope_test.go,
+  pkg/ddns/backend_bind_test.go, pkg/daemon/daemon_ddns_scope_test.go;
+  [Edit] pkg/ddns/{state,manager,backend_rfc2136,README}.go|md,
+  pkg/ddns/{manager_test,durability_test}.go,
+  pkg/config/{types_system,compiler_services,schema_system}.go,
+  pkg/config/compiler_dhcp_ddns_test.go,
+  pkg/daemon/{daemon_ddns,daemon_ha}.go, docs/config-schema.md, _Log.md.
+- **Validation**: `go build ./...` clean; `gofmt`/`go vet` clean on touched
+  files; `go test ./pkg/ddns/ ./pkg/config/ ./pkg/dhcpserver/ ./pkg/daemon/`
+  all green; `go test -race ./pkg/ddns/` green. `make test-failover` is
+  MANDATORY (HA gate change) and DEFERRED to the parent (no cluster access);
+  the gate is reasoned + unit-tested (partial-demotion + fail-on-revert).
+
+---
+
+## 2026-06-24 — #2691 P1b review fold (#2664 MAJOR + MINOR)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Address PR #2697 review (MERGE-NEEDS-MAJOR): one HA-correctness
+  MAJOR + one MINOR.
+- **MAJOR — partial-demotion withdrawal blackhole (#2664/§5.6)**: Pass 1
+  protected an owned record from withdrawal ONLY via `gatedScope`, which is
+  populated solely from leases in the CURRENT parsed set. On a STEADY-STATE
+  partial demotion the demoted RG's group is dropped from the narrowed Kea
+  config and its leases age out of the memfile → they vanish from the parsed
+  set → gatedScope never learns the demoted RG's prefix → Pass 1 saw the owned
+  record as expired and WITHDREW it (the exact blackhole the gate exists to
+  prevent). FIX (`pkg/ddns/manager.go` Pass 1): protect whenever the gate
+  rejects the OWNED record's stored scope —
+  `gatedScope[...] || !env.scopeAdmits(owned.scopeOf())` — re-consulting the
+  SAME gate the publish path uses so publish + withdraw agree. Standalone (nil
+  gate) admits all → guard inert → turn-off/expiry/reassign withdrawal
+  unaffected; disabled-family records are in mastered scopes → still withdrawn.
+- **MINOR — non-deterministic overlapping-pool attribution**:
+  `buildLeaseSubnetRGMap` appended in Go map-iteration order (randomized) and
+  `rgForLeaseAddress` first-matched, so two overlapping cross-RG pools could
+  flip the attributed RG between passes (gate flap). FIX
+  (`pkg/daemon/daemon_ddns.go`): sort the subnet→RG slice MOST-SPECIFIC-FIRST
+  (longest prefix wins) with a stable CIDR/RG tie-break.
+- **Tests**: `TestPerRGGatePartialDemotionSteadyState`
+  (`pkg/ddns/scope_test.go`) — Phase 2 DROPS the demoted RG's lease from the
+  source, asserts NOT withdrawn + still owned + kept RG keeps publishing;
+  VERIFIED RED on the pre-fix guard (withdrew rg2host) and GREEN with the fix
+  (fail-on-revert). `TestDDNSOverlappingPoolAttributionDeterministic`
+  (`pkg/daemon/daemon_ddns_scope_test.go`) — 50 rebuilds, overlap address
+  always attributes to the more-specific RG.
+- **File(s)**: [Edit] pkg/ddns/manager.go, pkg/ddns/scope_test.go,
+  pkg/daemon/daemon_ddns.go, pkg/daemon/daemon_ddns_scope_test.go,
+  pkg/ddns/README.md, _Log.md.
+- **Validation**: `go build ./...` clean; gofmt/vet clean on touched files;
+  `go test ./pkg/{ddns,config,dhcpserver,daemon}` green; `-race ./pkg/ddns`
+  green. `make test-failover` still MANDATORY — the parent re-runs it on the
+  folded head.

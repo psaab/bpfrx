@@ -1058,6 +1058,18 @@ func (d *Daemon) clearRethServicesForRG(rgID int) {
 			slog.Info("vrrp: DHCP server stop enqueued (BACKUP)", "rg", rgID)
 		}
 	}
+	// #2691 P1b / #2664: nudge the DDNS reconcile loop after a (partial)
+	// demotion. This closes the documented "no DDNS nudge on partial demotion"
+	// gap: when this node loses RG `rgID` but stays MASTER for another RG, the
+	// per-RG writer gate now CLOSES for rgID's scopes — but only a reconcile
+	// pass acts on it, so without this nudge the demoted RG's records would keep
+	// being re-asserted until the next 30s tick. The nudged pass STOPS
+	// publishing rgID's leases (the gate is closed for that RG) and does NOT
+	// withdraw them (stop-writing, never withdraw — the peer that became MASTER
+	// for rgID refreshes them; a withdraw race would blackhole, plan §5.6). The
+	// nudge is benign if it races the async Kea re-apply: a too-early pass sees
+	// the unchanged store and only the gate state matters for the demoted RG.
+	d.nudgeDDNSReconcile()
 }
 
 // filterDHCPConfigForMasterRGs returns a DHCP config containing only groups
