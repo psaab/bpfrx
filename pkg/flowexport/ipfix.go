@@ -16,20 +16,19 @@ const (
 	ipfixOctetDeltaCount          = 1
 	ipfixPacketDeltaCount         = 2
 	ipfixProtocolIdentifier       = 4
-	ipfixIpClassOfService         = 5
-	ipfixTcpControlBits           = 6
 	ipfixSourceTransportPort      = 7
 	ipfixSourceIPv4Address        = 8
 	ipfixDestinationTransportPort = 11
 	ipfixDestinationIPv4Address   = 12
-	ipfixIngressInterface         = 10
-	ipfixEgressInterface          = 14
 	ipfixSourceIPv6Address        = 27
 	ipfixDestinationIPv6Address   = 28
-	ipfixFlowDirection            = 61
-	ipfixApplicationId            = 95
 	ipfixFlowStartMilliseconds    = 152
 	ipfixFlowEndMilliseconds      = 153
+	// #2613: ipClassOfService (5), tcpControlBits (6), ingressInterface (10),
+	// egressInterface (14) and flowDirection (61) are no longer advertised —
+	// the SESSION_CLOSE wire frame carries no real value for any of them, so
+	// exporting them produced authoritative zeros at the collector.
+	// ipfixApplicationId (95) is reserved for a future app-id record field.
 	// RFC 5103 post-NAT (translated) tuple elements. IPv4 addresses 225/226
 	// (ipv4Address, 4B); transport ports 227/228 (unsigned16, 2B), which are
 	// family-agnostic and reused for IPv6. IPv6 addresses 281/282
@@ -62,6 +61,18 @@ type ipfixField struct {
 	length    uint16
 }
 
+// #2613: the IPFIX templates do NOT advertise ipClassOfService (5),
+// tcpControlBits (6), flowDirection (61), ingressInterface (10) or
+// egressInterface (14). The SESSION_CLOSE wire frame (the only flow source)
+// carries no DSCP/TOS, no observed TCP flags, no per-flow direction and no
+// egress ifindex, and the dataplane hardcodes the ingress ifindex slot to 0
+// on close frames (userspace-dp encode_session_close_rt_flow). Advertising
+// those IEs made every collector ingest authoritative zeros for
+// class-of-service, TCP flags, direction and interface attribution.
+// Populating them requires a Rust<->Go wire-format extension tracked
+// separately; until that exists the templates omit the fields rather than
+// export synthetic zeros.
+
 // ipfixTemplateV4 defines the IPv4 IPFIX template fields.
 var ipfixTemplateV4 = []ipfixField{
 	{ipfixSourceIPv4Address, 4},
@@ -69,11 +80,6 @@ var ipfixTemplateV4 = []ipfixField{
 	{ipfixSourceTransportPort, 2},
 	{ipfixDestinationTransportPort, 2},
 	{ipfixProtocolIdentifier, 1},
-	{ipfixIpClassOfService, 1},
-	{ipfixTcpControlBits, 2}, // IPFIX uses 2 bytes for TCP flags (RFC 7011)
-	{ipfixFlowDirection, 1},
-	{ipfixIngressInterface, 4},
-	{ipfixEgressInterface, 4},
 	{ipfixPacketDeltaCount, 8},
 	{ipfixOctetDeltaCount, 8},
 	{ipfixFlowStartMilliseconds, 8},
@@ -92,11 +98,6 @@ var ipfixTemplateV6 = []ipfixField{
 	{ipfixSourceTransportPort, 2},
 	{ipfixDestinationTransportPort, 2},
 	{ipfixProtocolIdentifier, 1},
-	{ipfixIpClassOfService, 1},
-	{ipfixTcpControlBits, 2},
-	{ipfixFlowDirection, 1},
-	{ipfixIngressInterface, 4},
-	{ipfixEgressInterface, 4},
 	{ipfixPacketDeltaCount, 8},
 	{ipfixOctetDeltaCount, 8},
 	{ipfixFlowStartMilliseconds, 8},
@@ -110,15 +111,17 @@ var ipfixTemplateV6 = []ipfixField{
 }
 
 // ipfixRecordSizeV4 is the byte size of a single IPv4 IPFIX data record.
-// pre-NAT 5-tuple + meta + counters + timestamps = 57; #2526 post-NAT tuple
-// (4+4+2+2) = 12 → 69.
-// 4+4+2+2+1+1+2+1+4+4+8+8+8+8 + 4+4+2+2 = 69
-const ipfixRecordSizeV4 = 69
+// #2613 dropped TOS(1)+TCPflags(2)+direction(1)+ingressIf(4)+egressIf(4)=12
+// from the former 69-byte record. pre-NAT body = 45; #2526 post-NAT tuple
+// (4+4+2+2) = 12 → 57.
+// 4+4+2+2+1+8+8+8+8 + 4+4+2+2 = 57
+const ipfixRecordSizeV4 = 57
 
 // ipfixRecordSizeV6 is the byte size of a single IPv6 IPFIX data record.
-// pre-NAT body = 81; #2526 post-NAT tuple (16+16+2+2) = 36 → 117.
-// 16+16+2+2+1+1+2+1+4+4+8+8+8+8 + 16+16+2+2 = 117
-const ipfixRecordSizeV6 = 117
+// #2613 dropped the same 12 unpopulated bytes from the former 117. pre-NAT
+// body = 69; #2526 post-NAT tuple (16+16+2+2) = 36 → 105.
+// 16+16+2+2+1+8+8+8+8 + 16+16+2+2 = 105
+const ipfixRecordSizeV6 = 105
 
 // ipfixRecordSizeV4 / V6 must equal the sum of their template field lengths.
 // A drift between the template (what the collector parses) and the encoder
@@ -265,16 +268,9 @@ func encodeIPFIXRecordV4(b []byte, off int, r FlowRecord) int {
 	off += 2
 	b[off] = r.Protocol
 	off++
-	b[off] = r.TOS
-	off++
-	binary.BigEndian.PutUint16(b[off:off+2], uint16(r.TCPFlags))
-	off += 2
-	b[off] = r.Direction
-	off++
-	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
-	off += 4
-	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
-	off += 4
+	// #2613: ipClassOfService/tcpControlBits/flowDirection/ingress+egress
+	// interface are no longer in the template (no wire data) — go straight to
+	// the counters/timestamps the close frame actually carries.
 	binary.BigEndian.PutUint64(b[off:off+8], r.Packets)
 	off += 8
 	binary.BigEndian.PutUint64(b[off:off+8], r.Bytes)
@@ -322,16 +318,7 @@ func encodeIPFIXRecordV6(b []byte, off int, r FlowRecord) int {
 	off += 2
 	b[off] = r.Protocol
 	off++
-	b[off] = r.TOS
-	off++
-	binary.BigEndian.PutUint16(b[off:off+2], uint16(r.TCPFlags))
-	off += 2
-	b[off] = r.Direction
-	off++
-	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
-	off += 4
-	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
-	off += 4
+	// #2613: dropped class-of-service/TCP flags/direction/interface fields.
 	binary.BigEndian.PutUint64(b[off:off+8], r.Packets)
 	off += 8
 	binary.BigEndian.PutUint64(b[off:off+8], r.Bytes)

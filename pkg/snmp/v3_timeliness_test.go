@@ -291,18 +291,71 @@ func TestEngineBootsFirstBootMissingFile(t *testing.T) {
 	}
 }
 
-// TestEngineBootsCorruptResets confirms an unparseable counter restarts at 1
-// rather than wedging the agent (the timeliness check remains the replay
-// backstop).
-func TestEngineBootsCorruptResets(t *testing.T) {
+// TestEngineBootsCorruptFailsClosed confirms an unparseable counter does NOT
+// silently reset to a low, replayable value but pins engineBoots to the RFC
+// ceiling (#2649). RFC 3414 §2.2 requires engineBoots to be monotonic; a reset
+// to 1 with the same deterministic engineID re-opens the replay window for a
+// captured prior-epoch request. At the ceiling checkTimeliness rejects every
+// authenticated request, forcing re-discovery — fail closed, not fail open.
+//
+// fail-on-revert: restoring the old `boots = 1` reset makes both assertions
+// fail (engineBoots becomes 1, and checkTimeliness would no longer reject).
+func TestEngineBootsCorruptFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snmp-engineboots")
 	if err := os.WriteFile(path, []byte("not-a-number"), 0o644); err != nil {
 		t.Fatalf("seed corrupt file: %v", err)
 	}
 	a := NewAgentWithBootsPath(nil, path)
-	if a.engineBoots != 1 {
-		t.Fatalf("corrupt state: engineBoots = %d, want 1", a.engineBoots)
+	if a.engineBoots == 1 {
+		t.Fatal("corrupt state: engineBoots reset to 1 (fail-open replay window) — must pin to ceiling")
+	}
+	if a.engineBoots != engineBootsMax {
+		t.Fatalf("corrupt state: engineBoots = %d, want ceiling %d (fail-closed)", a.engineBoots, engineBootsMax)
+	}
+	// At the ceiling every authenticated request is rejected (§3.2 step 7),
+	// so no replayed prior-epoch packet can be timely.
+	if a.checkTimeliness(a.engineBoots, a.engineTime()) {
+		t.Fatal("corrupt state pinned to ceiling must reject all authenticated requests")
+	}
+}
+
+// TestEngineBootsCeilingDoesNotWrap confirms a persisted value at the ceiling
+// does NOT wrap back to 1 on the next start (which would re-open the replay
+// window) but stays pinned at the ceiling (#2649).
+//
+// fail-on-revert: the old `boots = 1` reset wraps a ceiling-valued file to 1.
+func TestEngineBootsCeilingDoesNotWrap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snmp-engineboots")
+	if err := os.WriteFile(path, []byte(strconv.Itoa(engineBootsMax)+"\n"), 0o644); err != nil {
+		t.Fatalf("seed ceiling file: %v", err)
+	}
+	a := NewAgentWithBootsPath(nil, path)
+	if a.engineBoots != engineBootsMax {
+		t.Fatalf("ceiling state: engineBoots = %d, want ceiling %d (no wrap to 1)", a.engineBoots, engineBootsMax)
+	}
+}
+
+// TestEngineBootsPersistFailureFailsClosed confirms that when the boots value
+// cannot be durably persisted (unwritable state directory), the agent pins to
+// the ceiling for this run rather than serving with an unpersisted low value
+// that the next start would reuse as a stale (replayable) epoch (#2649).
+//
+// fail-on-revert: dropping the persist-failure ceiling pin makes engineBoots
+// stay at the low prev+1 value, failing this assertion.
+func TestEngineBootsPersistFailureFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	// Make the parent a regular file so MkdirAllDurable/WriteFileDurable under
+	// it cannot succeed, forcing the durable-write failure path.
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed blocker file: %v", err)
+	}
+	path := filepath.Join(blocker, "subdir", "snmp-engineboots")
+	a := NewAgentWithBootsPath(nil, path)
+	if a.engineBoots != engineBootsMax {
+		t.Fatalf("persist failure: engineBoots = %d, want ceiling %d (fail-closed)", a.engineBoots, engineBootsMax)
 	}
 }
 

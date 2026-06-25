@@ -64,11 +64,26 @@ type templateField struct {
 	fieldLen  uint16
 }
 
-// V9TemplateOptions controls which optional fields are included in v9 templates.
+// V9TemplateOptions controls which optional fields are included in v9
+// templates.
+//
+// #2613: IncludeFlowDir formerly toggled fieldDirection (IE 61) in the v9
+// templates. fieldDirection — together with SrcTos (5), TCPFlags (6),
+// InputSNMP (10) and OutputSNMP (14) — has been removed because the
+// SESSION_CLOSE wire frame carries no real value for any of them, so the
+// fields exported authoritative zeros to collectors. The option is retained
+// (still set by the `export-extension flow-dir` config knob, which the
+// schema already documents as "accepted; not applied") but no longer changes
+// the emitted template. It becomes load-bearing again only if a future
+// Rust<->Go wire-format extension threads real per-flow direction.
 type V9TemplateOptions struct {
-	IncludeFlowDir bool // include fieldDirection (export-extension flow-dir)
+	IncludeFlowDir bool // accepted; no longer changes the template (#2613)
 }
 
+// #2613: SrcTos/TCPFlags/Direction/InputSNMP/OutputSNMP dropped — no wire
+// data backs them on the SESSION_CLOSE path. The IncludeFlowDir/NoDir split
+// collapsed with fieldDirection's removal, so there is a single template per
+// address family.
 var (
 	netflowTemplateFieldsV4 = []templateField{
 		{fieldIPv4SrcAddr, 4},
@@ -76,33 +91,6 @@ var (
 		{fieldL4SrcPort, 2},
 		{fieldL4DstPort, 2},
 		{fieldProtocol, 1},
-		{fieldSrcTos, 1},
-		{fieldTCPFlags, 1},
-		{fieldDirection, 1},
-		{fieldInputSNMP, 4},
-		{fieldOutputSNMP, 4},
-		{fieldInPkts, 8},
-		{fieldInBytes, 8},
-		{fieldFirstSwitched, 4},
-		{fieldLastSwitched, 4},
-		{fieldSrcMask, 1},
-		{fieldDstMask, 1},
-		// #2526: post-NAT (translated) tuple, appended last.
-		{fieldPostNatSrcIPv4, 4},
-		{fieldPostNatDstIPv4, 4},
-		{fieldPostNapatSrcPort, 2},
-		{fieldPostNapatDstPort, 2},
-	}
-	netflowTemplateFieldsV4NoDir = []templateField{
-		{fieldIPv4SrcAddr, 4},
-		{fieldIPv4DstAddr, 4},
-		{fieldL4SrcPort, 2},
-		{fieldL4DstPort, 2},
-		{fieldProtocol, 1},
-		{fieldSrcTos, 1},
-		{fieldTCPFlags, 1},
-		{fieldInputSNMP, 4},
-		{fieldOutputSNMP, 4},
 		{fieldInPkts, 8},
 		{fieldInBytes, 8},
 		{fieldFirstSwitched, 4},
@@ -121,33 +109,6 @@ var (
 		{fieldL4SrcPort, 2},
 		{fieldL4DstPort, 2},
 		{fieldProtocol, 1},
-		{fieldSrcTos, 1},
-		{fieldTCPFlags, 1},
-		{fieldDirection, 1},
-		{fieldInputSNMP, 4},
-		{fieldOutputSNMP, 4},
-		{fieldInPkts, 8},
-		{fieldInBytes, 8},
-		{fieldFirstSwitched, 4},
-		{fieldLastSwitched, 4},
-		{fieldIPv6SrcMask, 1},
-		{fieldIPv6DstMask, 1},
-		// #2526: post-NAT (translated) tuple, appended last (v6 addrs 16B).
-		{fieldPostNatSrcIPv6, 16},
-		{fieldPostNatDstIPv6, 16},
-		{fieldPostNapatSrcPort, 2},
-		{fieldPostNapatDstPort, 2},
-	}
-	netflowTemplateFieldsV6NoDir = []templateField{
-		{fieldIPv6SrcAddr, 16},
-		{fieldIPv6DstAddr, 16},
-		{fieldL4SrcPort, 2},
-		{fieldL4DstPort, 2},
-		{fieldProtocol, 1},
-		{fieldSrcTos, 1},
-		{fieldTCPFlags, 1},
-		{fieldInputSNMP, 4},
-		{fieldOutputSNMP, 4},
 		{fieldInPkts, 8},
 		{fieldInBytes, 8},
 		{fieldFirstSwitched, 4},
@@ -167,20 +128,16 @@ func DefaultV9TemplateOptions() V9TemplateOptions {
 	return V9TemplateOptions{IncludeFlowDir: true}
 }
 
-// buildTemplateFieldsV4 returns the IPv4 template fields based on options.
-func buildTemplateFieldsV4(opts V9TemplateOptions) []templateField {
-	if opts.IncludeFlowDir {
-		return netflowTemplateFieldsV4
-	}
-	return netflowTemplateFieldsV4NoDir
+// buildTemplateFieldsV4 returns the IPv4 template fields. #2613: the option no
+// longer changes the field set (fieldDirection removed); the parameter is kept
+// for call-site stability and future re-introduction.
+func buildTemplateFieldsV4(_ V9TemplateOptions) []templateField {
+	return netflowTemplateFieldsV4
 }
 
-// buildTemplateFieldsV6 returns the IPv6 template fields based on options.
-func buildTemplateFieldsV6(opts V9TemplateOptions) []templateField {
-	if opts.IncludeFlowDir {
-		return netflowTemplateFieldsV6
-	}
-	return netflowTemplateFieldsV6NoDir
+// buildTemplateFieldsV6 returns the IPv6 template fields. See buildTemplateFieldsV4.
+func buildTemplateFieldsV6(_ V9TemplateOptions) []templateField {
+	return netflowTemplateFieldsV6
 }
 
 // recordSize computes the data record size from template fields, padded to 4 bytes.
@@ -297,30 +254,19 @@ func encodeDataFlowSetInto(b []byte, records []FlowRecord, bootTime time.Time,
 	binary.BigEndian.PutUint16(b[2:4], uint16(totalLen))
 	off := 4
 	isV6 := records[0].IsIPv6
-	includeFlowDir := fieldSetIncludesFlowDir(fields)
+	_ = fields // template field set is fixed per family (#2613)
 	for _, r := range records {
 		if isV6 {
-			off = encodeRecordV6(b, off, r, bootTime,
-				includeFlowDir, recSize)
+			off = encodeRecordV6(b, off, r, bootTime, recSize)
 		} else {
-			off = encodeRecordV4(b, off, r, bootTime,
-				includeFlowDir, recSize)
+			off = encodeRecordV4(b, off, r, bootTime, recSize)
 		}
 	}
 	clear(b[off:totalLen])
 }
 
-func fieldSetIncludesFlowDir(fields []templateField) bool {
-	for _, f := range fields {
-		if f.fieldType == fieldDirection {
-			return true
-		}
-	}
-	return false
-}
-
 func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time,
-	includeFlowDir bool, recSize int,
+	recSize int,
 ) int {
 	startOff := off
 	src4 := r.SrcIP.To4()
@@ -341,18 +287,8 @@ func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time,
 	off += 2
 	b[off] = r.Protocol
 	off++
-	b[off] = r.TOS
-	off++
-	b[off] = r.TCPFlags
-	off++
-	if includeFlowDir {
-		b[off] = r.Direction
-		off++
-	}
-	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
-	off += 4
-	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
-	off += 4
+	// #2613: SrcTos/TCPFlags/Direction/InputSNMP/OutputSNMP are no longer in
+	// the template (no wire data backs them on the close path).
 	binary.BigEndian.PutUint64(b[off:off+8], r.Packets)
 	off += 8
 	binary.BigEndian.PutUint64(b[off:off+8], r.Bytes)
@@ -386,7 +322,7 @@ func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time,
 }
 
 func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time,
-	includeFlowDir bool, recSize int,
+	recSize int,
 ) int {
 	startOff := off
 	src16 := r.SrcIP.To16()
@@ -407,18 +343,7 @@ func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time,
 	off += 2
 	b[off] = r.Protocol
 	off++
-	b[off] = r.TOS
-	off++
-	b[off] = r.TCPFlags
-	off++
-	if includeFlowDir {
-		b[off] = r.Direction
-		off++
-	}
-	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
-	off += 4
-	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
-	off += 4
+	// #2613: dropped class-of-service/TCP flags/direction/interface fields.
 	binary.BigEndian.PutUint64(b[off:off+8], r.Packets)
 	off += 8
 	binary.BigEndian.PutUint64(b[off:off+8], r.Bytes)

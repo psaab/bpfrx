@@ -2,6 +2,7 @@ package snmp
 
 import (
 	"crypto/hmac"
+	"path/filepath"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -156,11 +157,16 @@ func TestV3SetRequest_NotWritable(t *testing.T) {
 		authPro  = "sha"
 	)
 
-	a := NewAgent(&config.SNMPConfig{
+	// Use a writable temp boots path so engineBoots is a fresh 1 (matching the
+	// packet's engineBoots) and the timeliness gate passes — the default
+	// /var/lib/xpf path is unwritable under test and now fails closed by
+	// pinning to the ceiling (#2649), which is exercised separately.
+	bootsPath := filepath.Join(t.TempDir(), "snmp-engineboots")
+	a := NewAgentWithBootsPath(&config.SNMPConfig{
 		V3Users: map[string]*config.SNMPv3User{
 			userName: {Name: userName, AuthProtocol: authPro, AuthPassword: authPW},
 		},
-	})
+	}, bootsPath)
 
 	// Derive the localized auth key against the agent's engine ID so the
 	// packet authenticates against the live user table.

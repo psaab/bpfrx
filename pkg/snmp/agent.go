@@ -275,34 +275,53 @@ func (a *Agent) initEngine() {
 // monotonically-advancing authoritative pair RFC 3414 requires for replay
 // protection across restarts.
 //
-// A read/parse failure or a value at/over the RFC ceiling restarts the count
-// at 1 rather than refusing to serve — the timeliness check (which rejects a
-// stale boots/time on its own) is the replay backstop, and a corrupt counter
-// must not wedge the agent. A write failure is logged and ignored: the agent
-// still serves with the in-memory boots for this run; only cross-restart
-// monotonicity is lost until the next successful write.
+// RFC 3414 §2.2 requires engineBoots to be MONOTONIC for the authoritative
+// engine; it must never silently decrease while the engineID stays the same.
+// A reset back to a low value re-opens the replay window: a captured
+// authenticated request from a prior low-boots epoch can become timely again
+// (#2649). So a read/parse failure, a value already at/over the RFC ceiling,
+// an increment that would reach the ceiling, OR a failed durable write all
+// FAIL CLOSED by pinning engineBoots to the ceiling (engineBootsMax) rather
+// than restarting at 1. At the ceiling checkTimeliness rejects every
+// authenticated request (§3.2 step 7), which forces managers to re-discover —
+// the engineID must be reconfigured to recover. The agent still starts and
+// answers discovery/report (no SNMP DoS — the owner's #2649 concern), but no
+// replayed low-boots packet can pass while the counter is corrupt or maxed.
 func (a *Agent) loadAndIncrementEngineBoots() int {
 	prev := 0
+	corrupt := false
 	if data, err := os.ReadFile(a.engineBootsPath); err == nil {
 		if n, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && n > 0 && n < engineBootsMax {
 			prev = n
 		} else {
-			slog.Warn("SNMP: engineBoots state unreadable, restarting count", "path", a.engineBootsPath)
+			slog.Warn("SNMP: engineBoots state unreadable, pinning to ceiling (fail-closed, re-discovery required)", "path", a.engineBootsPath)
+			corrupt = true
 		}
-	} else if !os.IsNotExist(err) {
-		slog.Warn("SNMP: engineBoots state read error, restarting count", "path", a.engineBootsPath, "err", err)
+	} else if os.IsNotExist(err) {
+		// First boot: no prior epoch exists, so boots=1 is genuinely new and
+		// not a reuse of a persisted low value. This is not a fail-open reset.
+	} else {
+		slog.Warn("SNMP: engineBoots state read error, pinning to ceiling (fail-closed, re-discovery required)", "path", a.engineBootsPath, "err", err)
+		corrupt = true
 	}
 
 	boots := prev + 1
-	if boots < 1 || boots >= engineBootsMax {
-		boots = 1
+	if corrupt || boots < 1 || boots >= engineBootsMax {
+		// Fail closed: a lost/corrupt counter or an exhausted counter pins to
+		// the ceiling so no low-boots replay is timely. Never restart at 1.
+		boots = engineBootsMax
 	}
 
 	if err := fsatomic.MkdirAllDurable(filepath.Dir(a.engineBootsPath), 0o755); err != nil {
-		slog.Warn("SNMP: engineBoots state dir create failed", "path", a.engineBootsPath, "err", err)
+		slog.Warn("SNMP: engineBoots state dir create failed, pinning to ceiling (fail-closed)", "path", a.engineBootsPath, "err", err)
+		boots = engineBootsMax
 	}
 	if err := fsatomic.WriteFileDurable(a.engineBootsPath, []byte(strconv.Itoa(boots)+"\n"), 0o644); err != nil {
-		slog.Warn("SNMP: engineBoots state persist failed", "path", a.engineBootsPath, "err", err)
+		// A boots value we cannot durably persist would be reused next start
+		// (the next read sees the stale lower value) → replay window. Fail
+		// closed for THIS run so the unpersisted epoch is never serveable.
+		slog.Warn("SNMP: engineBoots state persist failed, pinning to ceiling (fail-closed, re-discovery required)", "path", a.engineBootsPath, "err", err)
+		boots = engineBootsMax
 	}
 	return boots
 }
