@@ -2612,6 +2612,52 @@ func TestGenerateProtocols_BGPMultipath(t *testing.T) {
 	}
 }
 
+// TestGenerateProtocols_BGPMultipathIBGP pins the #2978 fix: FRR `maximum-paths
+// N` only enables eBGP multipath, so iBGP-learned prefixes get a single best
+// path and ECMP is silently disabled for iBGP routes. When the operator sets
+// `protocols bgp multipath ibgp`, the renderer must ALSO emit `maximum-paths
+// ibgp <n>` in BOTH unicast address-families. Deleting the new render lines
+// turns this test RED.
+func TestGenerateProtocols_BGPMultipathIBGP(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS:       65001,
+		RouterID:      "1.1.1.1",
+		Multipath:     64,
+		MultipathIBGP: true,
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.0.2", PeerAS: 65002, FamilyInet: true},
+			{Address: "2001:db8::1", PeerAS: 65002, FamilyInet6: true},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 1, nil)
+	// eBGP multipath line unchanged.
+	if n := strings.Count(got, "maximum-paths 64\n"); n != 2 {
+		t.Errorf("want 2 `maximum-paths 64` lines (ipv4+ipv6), got %d:\n%s", n, got)
+	}
+	// iBGP multipath line emitted in both address-families.
+	if n := strings.Count(got, "maximum-paths ibgp 64\n"); n != 2 {
+		t.Errorf("want 2 `maximum-paths ibgp 64` lines (ipv4+ipv6), got %d:\n%s", n, got)
+	}
+}
+
+// TestGenerateProtocols_BGPMultipathNoIBGP asserts the eBGP-only default is
+// unchanged: without `multipath ibgp`, NO `maximum-paths ibgp` line is emitted.
+func TestGenerateProtocols_BGPMultipathNoIBGP(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS:   65001,
+		Multipath: 64,
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.0.2", PeerAS: 65002, FamilyInet: true},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 1, nil)
+	if strings.Contains(got, "maximum-paths ibgp") {
+		t.Errorf("eBGP-only multipath must NOT emit `maximum-paths ibgp`:\n%s", got)
+	}
+}
+
 // TestGenerateProtocols_BGPMaxPathsDecoupledFromECMP pins the #2791 fix: the
 // BGP address-family `maximum-paths` line is driven ONLY by the explicit
 // `protocols bgp multipath` knob (bgp.Multipath), and is NEVER seeded from the
