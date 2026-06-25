@@ -30,8 +30,10 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 	all := make([]SessionEntry, 0)
 	idx := 0
 
-	// IPv4 sessions
-	_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	// IPv4 sessions. A backend iterator failure (e.g. helper restart
+	// mid-scan) must fail the request rather than returning HTTP 200 with
+	// a partial/zero session list as a healthy result (#2469).
+	if err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
@@ -48,10 +50,13 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		idx++
 		return true
-	})
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "iterate sessions: "+err.Error())
+		return
+	}
 
 	// IPv6 sessions
-	_ = s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
@@ -68,7 +73,10 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		idx++
 		return true
-	})
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "iterate sessions_v6: "+err.Error())
+		return
+	}
 
 	writeOK(w, SessionListResponse{
 		Total:    idx,
@@ -86,7 +94,9 @@ func (s *Server) sessionSummaryHandler(w http.ResponseWriter, _ *http.Request) {
 
 	var summary SessionSummary
 
-	_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+	// A partial scan yields an under-count that looks like a healthy
+	// summary — fail the request instead of publishing it (#2469).
+	if err := s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
 		summary.TotalEntries++
 		if val.IsReverse == 0 {
 			summary.ForwardOnly++
@@ -102,9 +112,12 @@ func (s *Server) sessionSummaryHandler(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 		return true
-	})
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "iterate sessions: "+err.Error())
+		return
+	}
 
-	_ = s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	if err := s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		summary.TotalEntries++
 		if val.IsReverse == 0 {
 			summary.ForwardOnly++
@@ -120,7 +133,10 @@ func (s *Server) sessionSummaryHandler(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 		return true
-	})
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "iterate sessions_v6: "+err.Error())
+		return
+	}
 
 	writeOK(w, summary)
 }
@@ -184,18 +200,26 @@ func (s *Server) sessionZonePairHandler(w http.ResponseWriter, _ *http.Request) 
 		zp.Total++
 	}
 
-	_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	// A partial scan produces a misleading zone-pair breakdown — fail
+	// the request rather than serving an incomplete table as OK (#2469).
+	if err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse == 0 {
 			countSession(val.IngressZone, val.EgressZone, key.Protocol)
 		}
 		return true
-	})
-	_ = s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "iterate sessions: "+err.Error())
+		return
+	}
+	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse == 0 {
 			countSession(val.IngressZone, val.EgressZone, key.Protocol)
 		}
 		return true
-	})
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "iterate sessions_v6: "+err.Error())
+		return
+	}
 
 	result := make([]ZonePairSessionSummary, 0, len(counts))
 	for _, zp := range counts {

@@ -56,6 +56,7 @@ type xpfCollector struct {
 	sessionsIPv6        *prometheus.Desc
 	sessionsSNAT        *prometheus.Desc
 	sessionsDNAT        *prometheus.Desc
+	sessionScrapeOK     *prometheus.Desc
 	gcSweepDuration     *prometheus.Desc
 
 	// NAT pool utilization
@@ -468,6 +469,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.sessionsIPv6
 	ch <- c.sessionsSNAT
 	ch <- c.sessionsDNAT
+	ch <- c.sessionScrapeOK
 	ch <- c.gcSweepDuration
 	ch <- c.natPoolUsedPorts
 	ch <- c.natPoolTotalPorts

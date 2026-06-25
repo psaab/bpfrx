@@ -731,7 +731,11 @@ func (c *CLI) showTopTalkers(f sessionFilter) error {
 	now := monotonicSeconds()
 	var entries []topTalkerEntry
 
-	_ = c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	// A backend iterator error (e.g. helper restart mid-scan) must fail
+	// the command rather than printing a truncated top-talkers list as if
+	// it were the full picture (#2469). The iteration runs before any
+	// output, so an early return leaves no partial table on screen.
+	if err := c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
@@ -766,9 +770,11 @@ func (c *CLI) showTopTalkers(f sessionFilter) error {
 			age:      age,
 		})
 		return true
-	})
+	}); err != nil {
+		return fmt.Errorf("iterate sessions: %w", err)
+	}
 
-	_ = c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	if err := c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
@@ -803,7 +809,9 @@ func (c *CLI) showTopTalkers(f sessionFilter) error {
 			age:      age,
 		})
 		return true
-	})
+	}); err != nil {
+		return fmt.Errorf("iterate sessions_v6: %w", err)
+	}
 
 	if f.sortBy == "bytes" {
 		sort.Slice(entries, func(i, j int) bool {

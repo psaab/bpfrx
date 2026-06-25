@@ -583,7 +583,10 @@ func (s *Server) getSessionsLegacy(ctx context.Context, req *pb.GetSessionsReque
 		haActive = s.cluster.IsLocalPrimary(0)
 	}
 
-	_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	// A backend iterator error (e.g. helper restart mid-scan) must fail
+	// the RPC rather than returning a partial session list as success —
+	// matching the cursor path above (#2469).
+	if err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if !filter.matchV4(key, val) {
 			return true
 		}
@@ -605,9 +608,11 @@ func (s *Server) getSessionsLegacy(ctx context.Context, req *pb.GetSessionsReque
 		}
 		idx++
 		return true
-	})
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "v4 session iteration: %v", err)
+	}
 
-	_ = s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if !filter.matchV6(key, val) {
 			return true
 		}
@@ -628,7 +633,9 @@ func (s *Server) getSessionsLegacy(ctx context.Context, req *pb.GetSessionsReque
 		}
 		idx++
 		return true
-	})
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "v6 session iteration: %v", err)
+	}
 
 	resp := &pb.GetSessionsResponse{
 		Total:    int32(idx),
@@ -654,7 +661,9 @@ func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummar
 		resp.NodeId = int32(s.cluster.NodeID())
 	}
 
-	_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+	// A partial scan under-counts the summary; fail the RPC rather than
+	// returning a healthy-looking but incomplete summary (#2469).
+	if err := s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
 		resp.TotalEntries++
 		if val.IsReverse == 0 {
 			resp.ForwardOnly++
@@ -670,9 +679,11 @@ func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummar
 			}
 		}
 		return true
-	})
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "v4 session iteration: %v", err)
+	}
 
-	_ = s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	if err := s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		resp.TotalEntries++
 		if val.IsReverse == 0 {
 			resp.ForwardOnly++
@@ -688,7 +699,9 @@ func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummar
 			}
 		}
 		return true
-	})
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "v6 session iteration: %v", err)
+	}
 
 	// Fetch peer summary if requested and in cluster mode.
 	if req.GetIncludePeer() && s.cluster != nil && s.cluster.PeerAlive() {
