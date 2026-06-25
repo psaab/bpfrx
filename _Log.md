@@ -37,6 +37,48 @@
   `cargo test --release --bin xpf-userspace-dp -- wg checksum udp` 278/278
   pass. No Go change.
 
+## 2026-06-25 — #2744: control-socket request cap raised 16→64 MiB (feed-dimension) + Go pre-flight
+
+- **Timestamp**: 2026-06-25
+- **Action**: The userspace-dp control socket capped a single request at
+  16 MiB (#2523). The dominant scaling dimension is dynamic-feed-backed
+  address books (`AddressBookSnapshot.prefixes_v4/v6` carry feed prefixes
+  inline as CIDR text, bounded only by a per-line scanner cap, not a
+  total-entry cap), so a legitimate feed-heavy `apply_snapshot` (~500K IPv6
+  CIDRs ≈ 20+ MiB) was rejected at the control socket — fail-closed, but it
+  silently dropped a committed config with no operator-facing diagnostic.
+  Raised the cap to 64 MiB on BOTH sides in lockstep
+  (`MAX_CONTROL_REQUEST_BYTES` in `userspace-dp/src/protocol/control.rs`;
+  new `MaxControlRequestBytes` const in
+  `pkg/dataplane/userspace/process.go`). 64 MiB / ~45 B per IPv6 CIDR ≈
+  1.4M prefixes, well above realistic large feeds, still a hard
+  read-allocation DoS guard. Added a Go pre-flight in
+  `requestDetailedLocked`: serialize the request once, reject an oversize
+  body HERE with an actionable config error (names the feed-size cause)
+  instead of a silent helper EOF after commit; reuse the serialized body
+  for the socket write (single trailing newline matches the Rust framing).
+- **Fail-on-revert proof**:
+  - Go: reverted const 64→16 MiB via copy-restore →
+    `TestControlRequestCapRaisedAbove16MiB` + `...LockstepWithRust` go RED
+    ("cap must be raised above the old 16 MiB ceiling, got 16777216");
+    restored → green.
+  - Rust: reverted const 64→16 MiB via copy-restore →
+    `legitimate_feed_above_old_16mib_cap_is_now_accepted` goes RED
+    (panic "cap must be raised above the old 16 MiB ceiling (got
+    16777216)"); restored → green. `request_above_new_cap_is_still_rejected`
+    + `oversize_request_is_rejected_before_decode` keep the DoS guard.
+- **Gates**: `go build ./...` OK; `gofmt -l` clean; `go vet`
+  ./pkg/dataplane/userspace/... ./pkg/feeds/... clean;
+  `go test ./pkg/dataplane/userspace/... ./pkg/feeds/...` PASS;
+  `cargo build --release -p xpf-userspace-dp` OK; `cargo test` cap tests
+  (4) PASS.
+- **File(s)**: `userspace-dp/src/protocol/control.rs` (cap + lockstep doc),
+  `userspace-dp/src/server/tests.rs` (2 new fail-on-revert tests),
+  `pkg/dataplane/userspace/process.go` (`MaxControlRequestBytes` +
+  pre-flight), `pkg/dataplane/userspace/control_request_cap_2744_test.go`
+  (new, 3 tests incl. lockstep pin),
+  `docs/userspace-dataplane-architecture.md` (control-socket cap section),
+  `pkg/feeds/README.md` (feed-size vs. cap gotcha), `_Log.md`.
 ## 2026-06-25 — #2775: ddns/surface-a netlink selection honors IPv6 address lifetime
 
 - **Timestamp**: 2026-06-25
@@ -16540,6 +16582,36 @@ top.
   pkg/config/wireguard_multipeer_test.go, docs/config-schema.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2779 — reject Surface A DDNS operator hostnames that the
+  publish path would SILENTLY rewrite to a different public DNS name. The
+  router-owned Surface A hostname is operator intent (the operator types the
+  exact public name), but the publish path surfaceAName -> sanitizeFQDN
+  (pkg/ddns/hostname.go) lower-cases, strips every non-LDH character, drops
+  labels that sanitize empty, and trims leading/trailing dashes — so
+  wan_1.example.net was published as wan1.example.net with no commit error
+  (codex-review-048 finding 048-08). Fix per the issue's "validate at commit"
+  direction: the `interfaces <if> unit <n> family <af> dynamic-dns hostname`
+  leaf is now a TYPED leaf (new ValueHostname value-type + ValidateDDNSHostname
+  validator). The validator ACCEPTS only names sanitizeFQDN preserves unchanged
+  modulo case-folding + a single trailing dot (both benign DNS
+  canonicalizations) and REJECTS — naming the offending hostname — any name
+  with a non-LDH character, an empty label (leading/doubled/trailing dot), a
+  leading/trailing-dash label, or an over-length label/name. Scope:
+  pkg/config only (schema typing + validator); no pkg/ddns runtime code
+  changed (the sanitizer is now unreachable for a structurally-altering name
+  because commit rejects it first). Fail-on-revert proof: copied
+  pkg/config/schema_validators.go aside, stubbed ValidateDDNSHostname to
+  `return nil`, reran go test ./pkg/config/... ./pkg/ddns/... -run 2779 ->
+  BOTH packages FAILED (config matrix reject cases got nil; pkg/ddns
+  cross-package contract test "validator accepted a name the publish path
+  rewrites"); restored from the copy, all green. Gates: go build ./... clean,
+  gofmt -l (my files) clean, go vet ./pkg/config/... ./pkg/ddns/... clean,
+  go test ./pkg/config/... ./pkg/ddns/... pass.
+  **File(s)**: pkg/config/schema_validators.go,
+  pkg/config/schema_interfaces.go, pkg/config/value_type.go,
+  pkg/config/schema_validate_ddns_hostname_2779_test.go,
+  pkg/ddns/surface_a_hostname_2779_test.go, pkg/ddns/README.md,
+  docs/config-schema.md, _Log.md
   **Action**: #2792 — eliminate the per-packet heap churn on the
   WireGuard transit-egress encap path. `frame/wg.rs::wg_encap_frame`
   allocated TWO heap Vecs per packet: an intermediate `wg_record`

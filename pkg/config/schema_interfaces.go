@@ -419,14 +419,32 @@ func wireguardSchemaNode() *schemaNode {
 // Surface A router/interface-address DDNS binding (#2691 P2, plan §5.9):
 // `interfaces <if> unit <n> family <af> dynamic-dns { provider X; hostname Y;
 // address-source dhcp; ttl 300; }`. A fresh tree per call so the inet and inet6
-// parents do not share a mutable map. Free-form leaves (provider name,
-// hostname, source-address) stay untyped so a valid value is not rejected at
-// commit; the engine warn-validates the provider reference + binding at commit
-// (validateSurfaceADDNSWarnings) and is fail-open at runtime.
+// parents do not share a mutable map. The provider name stays untyped so a
+// valid value is not rejected at commit; the engine warn-validates the provider
+// reference + binding at commit (validateSurfaceADDNSWarnings) and is fail-open
+// at runtime. The hostname leaf IS typed (#2779): the publish path silently
+// rewrites a non-LDH / empty-label name to a DIFFERENT public DNS name, so a
+// name that would be structurally transformed is rejected at commit via
+// ValidateDDNSHostname rather than published wrong with no error.
 func interfaceDynamicDNSSchema() *schemaNode {
 	return &schemaNode{desc: "Publish this interface address via Dynamic DNS (Surface A, #2691)", children: map[string]*schemaNode{
 		"provider": {desc: "system services dynamic-dns provider to publish through", args: 1, placeholder: "<provider-name>", children: nil},
-		"hostname": {desc: "FQDN to publish for this interface address", args: 1, placeholder: "<fqdn>", children: nil},
+		"hostname": {
+			desc:        "FQDN to publish for this interface address",
+			args:        1,
+			placeholder: "<fqdn>",
+			// #2779: the publish path (surfaceAName -> sanitizeFQDN) silently
+			// rewrites a hostname containing non-LDH characters / empty labels
+			// to a DIFFERENT public DNS name. For router-owned Surface A the
+			// hostname is operator intent, so reject a name that would be
+			// structurally transformed at commit instead of publishing the
+			// wrong name with no error. Case + a single trailing dot are
+			// accepted (benign canonicalization).
+			valueType: ValueHostname,
+			valueDesc: "FQDN to publish (LDH labels only: letters, digits, hyphens)",
+			validator: ValidateDDNSHostname,
+			children:  nil,
+		},
 		"address-source": {
 			desc:          "Where this interface's current address is observed",
 			args:          1,
