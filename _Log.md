@@ -1,3 +1,30 @@
+## 2026-06-25 — #2916: same-plan refresh / replan predicate — guard test
+
+- **Timestamp**: 2026-06-25
+- **Action**: Investigated #2916 (same-plan snapshot refresh can skip a
+  required queue replan because the binding-plan hash and queue planner
+  used different predicates). Root cause was the predicate mismatch
+  closed by #2915 (054-01): post-#2915 both `update_snapshot_binding_plan_key`
+  and `replan_queues` filter through the single SSOT
+  `include_userspace_binding_interface`, and the hash already covers every
+  snapshot-derived field the planner consumes to build the layout
+  (`name`/`linux_name`/`ifindex`/`rx_queues` per candidate, fabric parents,
+  `workers`/`ring_entries`/`shared_umem`). Membership flips are coupled
+  because both paths use the identical predicate, so a same key now genuinely
+  means a same plan for all snapshot-driven inputs — #2916 is already fixed
+  at the root by #2915. To close #2916 with its OWN regression guard,
+  added `plan_key_covers_every_replan_queues_input`: for a candidate
+  interface, mutating any of the three planner-consumed fields
+  (`linux_name`, `ifindex`, `rx_queues`) MUST bump the plan key, each paired
+  with a `replan_queues` assertion proving the field actually changes the
+  produced layout (so the test cannot pass on a field the planner ignores).
+  Fail-on-revert proven: dropping `linux_name`/`ifindex`/`rx_queues` from the
+  `iface=...` hash segment (copy-aside) makes the test panic RED with the
+  exact message; restored clean. No production code change — the invariant
+  was already held by #2915; this hardens it against a future hash
+  regression and documents the same-plan coupling in the README.
+- **File(s)**: `userspace-dp/src/main_tests.rs`,
+  `userspace-dp/src/server/README.md`, `_Log.md`
 ## 2026-06-25 — #2978: BGP `multipath ibgp` renders FRR `maximum-paths ibgp <n>` (iBGP ECMP)
 
 - **Timestamp**: 2026-06-25
