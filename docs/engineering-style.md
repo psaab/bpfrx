@@ -446,6 +446,17 @@ they repeatedly bite:
     lock still held means a child inherited the fd (pre-#1875 raw
     holders only; `with-cluster.sh` runs cells with the lock fd
     closed, so killing a cell's tree releases instantly).
+- **Raw/datagram sockets go through `pkg/linuxsock` (#2608).** A raw
+  `unix.Socket(2)` is NOT close-on-exec by default (unlike Go `net`
+  sockets), so a bare raw `AF_PACKET`/raw-ICMP/datagram fd leaks into
+  every helper the daemon fork-execs (`frr-reload.py`, `swanctl`, DHCP
+  helpers) — an fd leak and a raw-frame security boundary. Use
+  `linuxsock.Socket(domain, typ, proto)` (ORs `SOCK_CLOEXEC` atomically
+  into the type), never `unix.Socket` directly. `pkg/linuxsock`'s
+  `TestNoDirectUnixSocket` canary scans every production `.go` under
+  `pkg/` and fails the suite on a new direct call site (the one
+  justified exception, `pkg/vrrp`'s pre-#2476 receiver, is allowlisted
+  and pinned by its own `afpacket_cloexec_test.go`).
 - **Always `source ~/.sshrc` before `git push`.** The user's SSH agent
   config lives there.
 - **172.16.80.200 is the iperf3 test endpoint.** Not 172.16.50.x.

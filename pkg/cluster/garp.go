@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/psaab/xpf/pkg/linuxsock"
 	"golang.org/x/sys/unix"
 )
 
@@ -32,7 +33,7 @@ func SendGratuitousARP(iface string, ip net.IP, count int) error {
 	reqPkt := buildGratuitousARP(ifi.HardwareAddr, ip4, 1) // ARP Request
 	repPkt := buildGratuitousARP(ifi.HardwareAddr, ip4, 2) // ARP Reply
 
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ARP)))
+	fd, err := linuxsock.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ARP)))
 	if err != nil {
 		return fmt.Errorf("raw socket: %w", err)
 	}
@@ -121,7 +122,7 @@ func SendGratuitousARPBurst(iface string, ip net.IP, count int) error {
 	reqPkt := buildGratuitousARP(ifi.HardwareAddr, ip4, 1) // ARP Request
 	repPkt := buildGratuitousARP(ifi.HardwareAddr, ip4, 2) // ARP Reply
 
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ARP)))
+	fd, err := linuxsock.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ARP)))
 	if err != nil {
 		return fmt.Errorf("raw socket: %w", err)
 	}
@@ -198,7 +199,7 @@ func SendARPProbe(iface string, senderIP, targetIP net.IP) error {
 // frame SendARPProbe emits (sender field at pkt[28:32]) without socket I/O,
 // proving the wiring passes the VIP and not the interface primary (#2152).
 var arpProbeSend = func(ifi *net.Interface, pkt []byte) error {
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ARP)))
+	fd, err := linuxsock.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ARP)))
 	if err != nil {
 		return fmt.Errorf("raw socket: %w", err)
 	}
@@ -337,7 +338,7 @@ func SendGratuitousIPv6(iface string, ip net.IP, count int) error {
 
 	pkt := buildUnsolicitedNA(ifi.HardwareAddr, ip6)
 
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_IPV6)))
+	fd, err := linuxsock.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_IPV6)))
 	if err != nil {
 		return fmt.Errorf("raw socket: %w", err)
 	}
@@ -386,7 +387,7 @@ func SendGratuitousIPv6Burst(iface string, ip net.IP, count int) error {
 
 	pkt := buildUnsolicitedNA(ifi.HardwareAddr, ip6)
 
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_IPV6)))
+	fd, err := linuxsock.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_IPV6)))
 	if err != nil {
 		return fmt.Errorf("raw socket: %w", err)
 	}
@@ -531,7 +532,7 @@ func SendNDSolicitation(iface string, sourceIP, targetIP net.IP) error {
 
 	pkt := buildNDSolicitation(ifi.HardwareAddr, src6, target6)
 
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_IPV6)))
+	fd, err := linuxsock.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_IPV6)))
 	if err != nil {
 		return fmt.Errorf("raw socket: %w", err)
 	}

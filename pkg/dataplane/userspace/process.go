@@ -18,6 +18,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/linuxsock"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -772,7 +773,7 @@ func sendICMPProbeFromManager(iface string, target net.IP) {
 // queues, triggering NAPI on each queue for zero-copy fill ring processing.
 func sendICMPProbeWithID(iface string, target net.IP, id uint16) {
 	if target.To4() != nil {
-		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)
+		fd, err := linuxsock.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)
 		if err != nil {
 			return
 		}
@@ -794,7 +795,7 @@ func sendICMPProbeWithID(iface string, target net.IP, id uint16) {
 		copy(sa.Addr[:], target.To4())
 		_ = unix.Sendto(fd, icmp[:], unix.MSG_DONTWAIT, sa)
 	} else {
-		fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_ICMPV6)
+		fd, err := linuxsock.Socket(unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_ICMPV6)
 		if err != nil {
 			return
 		}
@@ -817,7 +818,7 @@ func sendICMPProbeWithID(iface string, target net.IP, id uint16) {
 // (src_ip, dst_ip, src_port, dst_port). Different ports → different queues.
 func sendUDPProbeForNAPI(iface string, target net.IP, port uint16) {
 	if target.To4() != nil {
-		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, unix.IPPROTO_UDP)
+		fd, err := linuxsock.Socket(unix.AF_INET, unix.SOCK_DGRAM, unix.IPPROTO_UDP)
 		if err != nil {
 			return
 		}
@@ -827,7 +828,7 @@ func sendUDPProbeForNAPI(iface string, target net.IP, port uint16) {
 		copy(sa.Addr[:], target.To4())
 		_ = unix.Sendto(fd, []byte("napi"), unix.MSG_DONTWAIT, sa)
 	} else {
-		fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_DGRAM, unix.IPPROTO_UDP)
+		fd, err := linuxsock.Socket(unix.AF_INET6, unix.SOCK_DGRAM, unix.IPPROTO_UDP)
 		if err != nil {
 			return
 		}

@@ -532,6 +532,7 @@ type IPsecGateway struct {
 	Name             string
 	Address          string // remote gateway IP
 	DynamicHostname  string // dynamic peer hostname (DNS-resolved)
+	ResponderOnly    bool   // dynamic peer with no fixed address/hostname: responder-only (remote_addrs = %any)
 	LocalAddress     string // local IP
 	IKEPolicy        string // IKE policy reference
 	ExternalIface    string // external-facing interface
