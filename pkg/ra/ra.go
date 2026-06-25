@@ -47,10 +47,10 @@ var claimWaitTimeout = 5 * time.Second
 //   - the goodbye decision reads sender.goodbyeEmitted only AFTER <-stopped
 //     (happens-before), never on the timeout path.
 type drainEntry struct {
-	sender        *sender                   // draining sender; nil for a standalone-only claim
-	cfg           *config.RAInterfaceConfig // config for a standalone goodbye, if owed
-	goodbyeWanted bool                      // a graceful Withdraw targeted this interface
-	goodbyeClaimed bool                     // the owner has taken responsibility to emit it
+	sender         *sender                   // draining sender; nil for a standalone-only claim
+	cfg            *config.RAInterfaceConfig // config for a standalone goodbye, if owed
+	goodbyeWanted  bool                      // a graceful Withdraw targeted this interface
+	goodbyeClaimed bool                      // the owner has taken responsibility to emit it
 }
 
 // Manager manages per-interface RA sender goroutines.
@@ -275,7 +275,7 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 	// replace — tombstone + stop old, defer the start), or already-draining /
 	// new (deferred or started directly).
 	var firstErr error
-	var deferred []*config.RAInterfaceConfig // already-draining when we held the lock
+	var deferred []*config.RAInterfaceConfig  // already-draining when we held the lock
 	var toRestart []*config.RAInterfaceConfig // changed config: old stopped, start after join
 	for name, cfg := range desired {
 		existing, ok := m.senders[name]
@@ -492,6 +492,7 @@ func (m *Manager) WithdrawInterfaces(names []string) {
 //     owner's release path (releaseDrain / Apply restart) emits the standalone
 //     if owed — claim-once via goodbyeClaimed guarantees no double-send even if
 //     several Withdraws flip the same entry.
+//
 // Callers must hold m.mu.
 func (m *Manager) claimGracefulLocked(names []string) []ownedDrain {
 	var owned []ownedDrain
@@ -714,7 +715,7 @@ func (m *Manager) Status() []SenderInfo {
 	for _, s := range m.senders {
 		info := SenderInfo{
 			Interface:   s.cfg.Interface,
-			SrcAddr:     s.srcAddr.String(),
+			SrcAddr:     s.getSrcAddr().String(),
 			Lifetime:    s.cfg.DefaultLifetime,
 			MaxInterval: s.cfg.MaxAdvInterval,
 			MinInterval: s.cfg.MinAdvInterval,

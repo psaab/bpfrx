@@ -108,9 +108,16 @@ var ensureLinkLocalFn = ensureLinkLocal
 // lifetime-0 goodbye as its FINAL action in finishShutdown — guaranteeing no
 // lifetime>0 RA follows the goodbye on the wire.
 type sender struct {
-	cfg     *config.RAInterfaceConfig
-	iface   *net.Interface
-	conn    ndpConn
+	cfg   *config.RAInterfaceConfig
+	iface *net.Interface
+	conn  ndpConn
+
+	// srcAddr is the bound link-local source address. Since openConn now runs
+	// in the owner goroutine (#2453), the owner WRITES srcAddr without m.mu
+	// while Manager.Status READS it under m.mu — so it must carry its own
+	// guard. srcMu is that guard; use getSrcAddr/setSrcAddr, never the field
+	// directly off-goroutine.
+	srcMu   sync.Mutex
 	srcAddr netip.Addr
 
 	mode     atomic.Int32 // shutdownMode; set BEFORE close(stopCh)
@@ -142,20 +149,60 @@ func newSender(cfg *config.RAInterfaceConfig, iface *net.Interface) *sender {
 	}
 }
 
-// start opens the NDP connection and launches the sender goroutine.
-// Ensures a link-local address exists (RETH interfaces suppress auto
-// link-local via addr_gen_mode=1, so we add one explicitly with NODAD).
+// start launches the sender goroutine. It does NOT open the NDP connection
+// itself — the socket open (ensureLinkLocal + the link-local bind RETRY, which
+// sleeps up to ~2s while a settling/RETH link-local appears) is performed by
+// the owner goroutine in openConn() BEFORE it enters its main loop (#2453).
+//
+// Why the open moved off this path: start() is called from
+// Manager.startLocked while the manager mutex m.mu is held. Doing the
+// multi-second bind retry under m.mu serialized every other RA manager op
+// (a VRRP-failover Withdraw, or an Apply on a DIFFERENT interface) behind the
+// retry — control-plane latency up to ~2s. Launching the goroutine and
+// returning immediately keeps the m.mu critical section to just the
+// s.senders bookkeeping; the bind retry runs fully UNLOCKED.
+//
+// start() therefore never returns a listen/bind error (the open is async); the
+// only error it can return is a programming-level one, and there are none here.
+// A bind that ultimately fails is logged by openConn and the owner exits
+// cleanly (closing s.stopped) so the manager's join/release path still
+// completes. s.conn is opened, used, and closed solely by the owner goroutine,
+// preserving the single-owner contract (#2033).
 func (s *sender) start() error {
+	go s.run()
+	return nil
+}
+
+// openConn performs the (potentially slow) NDP socket open for the owner
+// goroutine: ensure a link-local exists, then bind with the bounded retry. It
+// is INTERRUPTIBLE by stopCh — a withdraw/clear signalled while the bind is
+// still retrying aborts promptly instead of blocking up to ~2s. It returns
+// false if no connection was opened (bind failed after all retries, or a stop
+// was signalled mid-retry); in that case the owner must go straight to
+// finishShutdown without a live conn.
+//
+// On success s.conn / s.srcAddr are set (owner-only writes), the all-routers
+// group is joined, and the RS-only ICMPv6 filter is installed.
+func (s *sender) openConn() bool {
+	// A stop signalled before we even begin: do not open a conn.
+	select {
+	case <-s.stopCh:
+		return false
+	default:
+	}
+
 	if err := ensureLinkLocalFn(s.iface); err != nil {
 		slog.Warn("ra: failed to ensure link-local", "interface", s.iface.Name, "err", err)
 	}
 
 	conn, srcAddr, err := s.listen()
 	if err != nil {
-		return err
+		slog.Warn("ra: failed to open NDP connection (giving up after retries)",
+			"interface", s.cfg.Interface, "err", err)
+		return false
 	}
 	s.conn = conn
-	s.srcAddr = srcAddr
+	s.setSrcAddr(srcAddr)
 
 	// Join all-routers multicast to receive Router Solicitations.
 	allRouters := netip.MustParseAddr("ff02::2")
@@ -171,9 +218,7 @@ func (s *sender) start() error {
 		slog.Warn("ra: failed to set ICMPv6 filter",
 			"interface", s.cfg.Interface, "err", err)
 	}
-
-	go s.run()
-	return nil
+	return true
 }
 
 // sendGoodbyeStandalone is the WithdrawOnce goodbye-only entry point. It opens
@@ -190,10 +235,24 @@ func (s *sender) sendGoodbyeStandalone() error {
 		return err
 	}
 	s.conn = conn
-	s.srcAddr = srcAddr
+	s.setSrcAddr(srcAddr)
 	defer s.conn.Close()
 	s.sendGoodbyeRA()
 	return nil
+}
+
+// getSrcAddr / setSrcAddr guard the bound source address against the
+// owner-writes / Status-reads race (#2453). See the srcMu field comment.
+func (s *sender) getSrcAddr() netip.Addr {
+	s.srcMu.Lock()
+	defer s.srcMu.Unlock()
+	return s.srcAddr
+}
+
+func (s *sender) setSrcAddr(a netip.Addr) {
+	s.srcMu.Lock()
+	s.srcAddr = a
+	s.srcMu.Unlock()
 }
 
 // listen opens the NDP connection with the configured bind address, retrying
@@ -212,8 +271,19 @@ func (s *sender) listen() (ndpConn, netip.Addr, error) {
 		if err == nil {
 			return conn, srcAddr, nil
 		}
-		// Re-read interface (link-local may appear after addr add).
-		time.Sleep(200 * time.Millisecond)
+		// Re-read interface (link-local may appear after addr add). The sleep is
+		// interruptible by stopCh (#2453): a withdraw/clear signalled while the
+		// bind is still retrying aborts the retry promptly rather than running
+		// the full ~2s. Since this loop now runs in the owner goroutine
+		// (unlocked), the abort frees nothing held by the manager — it just lets
+		// the owner reach finishShutdown sooner.
+		t := time.NewTimer(200 * time.Millisecond)
+		select {
+		case <-s.stopCh:
+			t.Stop()
+			return nil, netip.Addr{}, err
+		case <-t.C:
+		}
 		if iface, e := net.InterfaceByName(s.iface.Name); e == nil {
 			s.iface = iface
 		}
@@ -278,6 +348,25 @@ func (s *sender) draining() bool { return s.mode.Load() != int32(modeNone) }
 // closes the connection.
 func (s *sender) run() {
 	defer close(s.stopped)
+
+	// Open the NDP conn (ensureLinkLocal + the bounded, interruptible bind
+	// retry) HERE, in the owner goroutine, not under the manager mutex (#2453).
+	// If it fails (bind gave up, or a stop was signalled mid-retry) there is no
+	// conn to emit on: go straight to finishShutdown, which tolerates a nil conn
+	// (no goodbye is written, goodbyeEmitted stays false → the manager's
+	// release-time backstop emits a standalone goodbye if one was owed).
+	if !s.openConn() {
+		s.finishShutdown()
+		return
+	}
+
+	// A stop may have been signalled while the conn was opening. Honor it before
+	// emitting the startup burst (burstInterruptible also short-circuits, but
+	// this avoids even the first burst RA after a withdraw).
+	if s.draining() {
+		s.finishShutdown()
+		return
+	}
 
 	// Interruptible startup burst so a withdraw during startup cannot leave a
 	// normal RA after the goodbye.
@@ -346,6 +435,15 @@ func (s *sender) run() {
 // graceful upgrade that landed before the owner woke. The conn is closed AFTER
 // the goodbye, which also unblocks the detached rsReceiver's ReadFrom (I10).
 func (s *sender) finishShutdown() {
+	// No conn was ever opened (openConn failed or a stop landed mid bind-retry).
+	// There is nothing to emit on and nothing to close. Leave goodbyeEmitted=
+	// false so the manager's release-time backstop (sendOneGoodbye on a FRESH
+	// conn) still emits a standalone goodbye if a graceful withdraw owed one
+	// (#2453). This mirrors the conn==nil tail below; we return early so the
+	// graceful branch never dereferences a nil conn.
+	if s.conn == nil {
+		return
+	}
 	if shutdownMode(s.mode.Load()) == modeGraceful {
 		// Record the fact for the manager's post-join owes-a-goodbye check, but
 		// ONLY if the goodbye actually went out. On a write failure (interface
