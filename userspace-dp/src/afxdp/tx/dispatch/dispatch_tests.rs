@@ -541,7 +541,7 @@ fn enqueue_pending_forwards_mirrors_live_frame_and_records_counter() {
     let mut post_recycles = Vec::new();
     let ingress_ident = bindings[0].identity();
     let ingress_live = &*bindings[0].live as *const BindingLiveState;
-    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>> =
+    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
@@ -624,7 +624,7 @@ fn enqueue_pending_forwards_counts_prebuilt_fabric_redirect_no_binding() {
     let mut post_recycles = Vec::new();
     let ingress_ident = bindings[0].identity();
     let ingress_live = &*bindings[0].live as *const BindingLiveState;
-    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>> =
+    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
@@ -749,7 +749,7 @@ fn enqueue_failure_recycles_ingress_descriptor_and_reinjects_slow_path() {
     let mut post_recycles = Vec::new();
     let ingress_ident = bindings[0].identity();
     let ingress_live = &*bindings[0].live as *const BindingLiveState;
-    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>> =
+    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
@@ -830,7 +830,7 @@ fn oversized_forward_frame_recycles_ingress_descriptor_without_reinject() {
     let mut post_recycles = Vec::new();
     let ingress_ident = bindings[0].identity();
     let ingress_live = &*bindings[0].live as *const BindingLiveState;
-    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>> =
+    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
@@ -934,7 +934,7 @@ fn enqueue_failure_conserves_free_frames_across_many_forwards() {
     let mut post_recycles = Vec::new();
     let ingress_ident = bindings[0].identity();
     let ingress_live = &*bindings[0].live as *const BindingLiveState;
-    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>> =
+    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
@@ -1094,7 +1094,7 @@ fn run_ptb_dispatch_with_forwarding(
     let mut post_recycles = Vec::new();
     let ingress_ident = bindings[0].identity();
     let ingress_live = &*bindings[0].live as *const BindingLiveState;
-    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>> =
+    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();

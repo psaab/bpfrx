@@ -6065,7 +6065,7 @@ fn txn_run_descriptor_with_deliveries(
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
     frame: &[u8],
     meta: UserspaceDpMeta,
-    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
+    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
 ) -> (BatchCounters, DebugPollCounters) {
     let meta_len = std::mem::size_of::<UserspaceDpMeta>();
     let frame_offset = 128;
@@ -7035,8 +7035,11 @@ fn tunnel_marked_build_failure_drops_instead_of_slow_path() {
 fn tunnel_gate_keeps_local_tunnel_delivery_open() {
     let (binding, live, recent_exceptions, meta, frame) = tunnel_gate_test_fixture();
     let (tx, rx) = mpsc::sync_channel(4);
+    // #2412: the delivery map now carries the eventfd wake alongside the
+    // sender; the worker slow path signals it via LocalTunnelDelivery.
+    let wake = Arc::new(TunnelWake::new().expect("eventfd"));
     let mut deliveries = BTreeMap::new();
-    deliveries.insert(9, tx);
+    deliveries.insert(9, LocalTunnelDelivery { tx, wake });
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(deliveries));
     let mut decision = tunnel_marked_decision(ForwardingDisposition::LocalDelivery);
     decision.resolution.local_ifindex = 9;
@@ -7451,8 +7454,9 @@ fn assert_gre_to_self_delivers_inner_exactly_once(vlan_id: u16) {
     let meta = gre_to_self_outer_meta(vlan_id, frame.len());
 
     let (tx, rx) = mpsc::sync_channel(8);
+    let wake = Arc::new(TunnelWake::new().expect("eventfd"));
     let mut deliveries = BTreeMap::new();
-    deliveries.insert(77, tx);
+    deliveries.insert(77, LocalTunnelDelivery { tx, wake });
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(deliveries));
 
     txn_run_descriptor_with_deliveries(
@@ -7504,8 +7508,9 @@ fn gre_to_self_session_hit_delivery_is_inner_packet_exactly_once() {
     let frame = build_gre_to_self_outer_frame_v4(80, &inner);
 
     let (tx, rx) = mpsc::sync_channel(8);
+    let wake = Arc::new(TunnelWake::new().expect("eventfd"));
     let mut deliveries = BTreeMap::new();
-    deliveries.insert(77, tx);
+    deliveries.insert(77, LocalTunnelDelivery { tx, wake });
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(deliveries));
 
     for pass in ["session-miss", "session-hit"] {
@@ -7578,8 +7583,9 @@ fn unencapsulated_local_delivery_reinjects_slow_path_exactly_once() {
     let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
 
     let (tx, rx) = mpsc::sync_channel(8);
+    let wake = Arc::new(TunnelWake::new().expect("eventfd"));
     let mut deliveries = BTreeMap::new();
-    deliveries.insert(77, tx);
+    deliveries.insert(77, LocalTunnelDelivery { tx, wake });
     let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(deliveries));
 
     let (_batch, dbg) = txn_run_descriptor_with_deliveries(

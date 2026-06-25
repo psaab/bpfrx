@@ -140,7 +140,7 @@ impl super::Coordinator {
         for id in finished {
             if let Some(entry) = self.tunnel_sources.get_mut(&id) {
                 if let Some(mut handle) = entry.handle.take() {
-                    handle.stop.store(true, Ordering::Relaxed);
+                    handle.request_stop();
                     if let Some(join) = handle.join.take() {
                         let _ = join.join();
                     }
@@ -161,7 +161,7 @@ impl super::Coordinator {
     fn stop_remove_local_tunnel_entry(&mut self, id: u16, reason: &str) {
         if let Some(mut entry) = self.tunnel_sources.remove(&id) {
             if let Some(mut handle) = entry.handle.take() {
-                handle.stop.store(true, Ordering::Relaxed);
+                handle.request_stop();
                 if let Some(join) = handle.join.take() {
                     let _ = join.join();
                 }
@@ -178,13 +178,13 @@ impl super::Coordinator {
     /// minus `exclude` (the pass-2 stale set, for the
     /// unpublish-before-join store #1).
     fn publish_local_tunnel_deliveries_excluding(&self, exclude: &[u16]) {
-        let mut map: BTreeMap<i32, SyncSender<Vec<u8>>> = BTreeMap::new();
+        let mut map: BTreeMap<i32, LocalTunnelDelivery> = BTreeMap::new();
         for (id, entry) in self.tunnel_sources.iter() {
             if exclude.contains(id) || entry.handle.is_none() {
                 continue;
             }
-            if let Some(tx) = entry.delivery_tx.as_ref() {
-                map.insert(entry.spawned_ifindex, tx.clone());
+            if let Some(delivery) = entry.delivery_tx.as_ref() {
+                map.insert(entry.spawned_ifindex, delivery.clone());
             }
         }
         self.local_tunnel_deliveries.store(Arc::new(map));
@@ -236,6 +236,45 @@ impl super::Coordinator {
         let recent_exceptions = self.recent_exceptions.clone();
         let thread_tunnel_name = tunnel_name.clone();
         let (delivery_tx, delivery_rx) = mpsc::sync_channel(LOCAL_TUNNEL_DELIVERY_QUEUE_DEPTH);
+        // #2412: eventfd wake shared by the loop's poll(2), the delivery
+        // producers (worker slow path), and the stop path. If the
+        // eventfd cannot be created, fail the spawn like any other
+        // resource failure (tombstone + respawn-backoff).
+        let wake = match TunnelWake::new() {
+            Ok(wake) => Arc::new(wake),
+            Err(err) => {
+                if let Ok(mut recent) = self.recent_exceptions.lock() {
+                    push_recent_exception(
+                        &mut recent,
+                        ExceptionStatus {
+                            timestamp: Utc::now(),
+                            interface: tunnel_name.clone(),
+                            reason: format!("local_tunnel_wake_eventfd_failed:{id}:{err}"),
+                            ..ExceptionStatus::default()
+                        },
+                    );
+                }
+                eprintln!(
+                    "xpf-userspace-dp: GRE local-origin thread spawn FAILED endpoint={id}: eventfd: {err}"
+                );
+                self.tunnel_sources.insert(
+                    id,
+                    LocalTunnelSourceEntry {
+                        handle: None,
+                        spawned_ifindex: logical_ifindex,
+                        spawned_tunnel_name: tunnel_name,
+                        delivery_tx: None,
+                        last_spawn_attempt_ns: monotonic_nanos(),
+                    },
+                );
+                return false;
+            }
+        };
+        let thread_wake = wake.clone();
+        let delivery = LocalTunnelDelivery {
+            tx: delivery_tx,
+            wake: wake.clone(),
+        };
         eprintln!(
             "xpf-userspace-dp: spawning GRE local-origin thread endpoint={id} tun={tunnel_name}"
         );
@@ -261,6 +300,7 @@ impl super::Coordinator {
                     shared_owner_rg_indexes,
                     worker_commands,
                     delivery_rx,
+                    thread_wake,
                     recent_exceptions,
                     stop_clone,
                 );
@@ -270,9 +310,10 @@ impl super::Coordinator {
             Ok(join) => (
                 Some(LocalTunnelSourceHandle {
                     stop,
+                    wake: Some(wake),
                     join: Some(join),
                 }),
-                Some(delivery_tx),
+                Some(delivery),
                 true,
             ),
             Err(err) => {
@@ -577,7 +618,7 @@ impl super::Coordinator {
         for id in finished {
             if let Some(entry) = self.wg_control_threads.get_mut(&id) {
                 if let Some(mut handle) = entry.handle.take() {
-                    handle.stop.store(true, Ordering::Relaxed);
+                    handle.request_stop();
                     if let Some(join) = handle.join.take() {
                         let _ = join.join();
                     }
@@ -603,7 +644,7 @@ impl super::Coordinator {
             if let Some(mut entry) = self.wg_control_threads.remove(&id) {
                 let name = entry.spawned_tunnel_name.clone();
                 if let Some(handle) = entry.handle.take() {
-                    handle.stop.store(true, Ordering::Relaxed);
+                    handle.request_stop();
                     removed.push((id, reason, handle, name));
                 } else {
                     eprintln!(
@@ -630,7 +671,7 @@ impl super::Coordinator {
     fn stop_remove_wg_control_entry(&mut self, id: u16, reason: &str) {
         if let Some(mut entry) = self.wg_control_threads.remove(&id) {
             if let Some(mut handle) = entry.handle.take() {
-                handle.stop.store(true, Ordering::Relaxed);
+                handle.request_stop();
                 if let Some(join) = handle.join.take() {
                     let _ = join.join();
                 }
@@ -734,6 +775,9 @@ impl super::Coordinator {
         let handle = match join {
             Ok(join) => Some(LocalTunnelSourceHandle {
                 stop,
+                // #2412: the WG control thread polls its UDP socket with
+                // its own timeout cap and has no delivery eventfd.
+                wake: None,
                 join: Some(join),
             }),
             Err(err) => {

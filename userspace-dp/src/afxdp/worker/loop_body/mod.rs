@@ -46,7 +46,7 @@ pub(crate) fn worker_loop(
     shared_forward_wire_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_owner_rg_indexes: SharedSessionOwnerRgIndexes,
     slow_path: Option<Arc<SlowPathReinjector>>,
-    local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
+    local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     last_resolution: Arc<Mutex<Option<PacketResolution>>>,

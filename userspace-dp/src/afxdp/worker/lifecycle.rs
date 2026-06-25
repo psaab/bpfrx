@@ -35,7 +35,7 @@ pub(super) fn poll_binding(
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
-    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
+    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     _recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
