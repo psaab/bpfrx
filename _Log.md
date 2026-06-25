@@ -1,3 +1,27 @@
+## 2026-06-25 — #2447: reject out-of-range CoS DSCP/PCP code-points instead of aliasing
+
+- **Timestamp**: 2026-06-25
+- **Action**: CoS classifier/rewrite code-points are now domain-validated at
+  commit (DSCP 0..63, PCP 0..7) with a clear operator error, instead of being
+  silently dropped at the Go parse layer and masked `dscp & 0x3f` / clamped
+  `pcp.min(7)` into a DIFFERENT traffic class by the Rust builder (110→46,
+  9→7). Go: `expandCoSCodePointToken` / `collectCoS8021CodePoints` /
+  `collectCoSDSCPRewriteCodePoint` now return errors propagated through
+  `compileClassOfService` (primary, operator-facing). Rust:
+  `build_cos_dscp_queue_table` / `build_cos_ieee8021_queue_table` removed the
+  mask/clamp and fail the snapshot CLOSED
+  (`SnapshotIntegrityError::CosDscpCodePointOutOfRange` /
+  `CosIeee8021CodePointOutOfRange`) as a drift backstop (#2410/#2696/#2713
+  posture). Runtime packet-field masking in `tx/cos_classify.rs` retained
+  (legit: bounds the physically-limited wire field, table now built from
+  validated indices only).
+- **File(s)**: pkg/config/compiler_class_of_service.go,
+  pkg/config/parser_class_of_service_test.go,
+  userspace-dp/src/policy.rs,
+  userspace-dp/src/afxdp/forwarding_build/cos.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  docs/config-schema.md
+
 ## 2026-06-25 — #2519: allowlist writeProxyResponderSysctl in fsatomic canary
 
 - **Timestamp**: 2026-06-25

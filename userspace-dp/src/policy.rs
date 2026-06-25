@@ -174,6 +174,22 @@ pub(crate) enum SnapshotIntegrityError {
         scheduler_map: String,
         forwarding_class: String,
     },
+    /// #2447: a CoS DSCP classifier entry carried a code-point outside the
+    /// 6-bit DSCP domain (0..=63). The pre-fix builder masked the index with
+    /// `dscp & 0x3f`, so a value of 110 silently installed the classifier for
+    /// DSCP 46 — a DIFFERENT traffic class — with no apply failure. The Go
+    /// commit-time gate (`expandCoSCodePointToken`, #2447) is the primary
+    /// defense; this is the helper-boundary backstop against version/snapshot
+    /// drift, consistent with the #2410/#2696/#2713 fail-closed family. Fail
+    /// the snapshot closed (the preflight keeps the previous live CoS state)
+    /// rather than building a classifier for a different class than configured.
+    CosDscpCodePointOutOfRange { classifier: String, dscp: u8 },
+    /// #2447: a CoS IEEE 802.1p classifier entry carried a code-point outside
+    /// the 3-bit PCP domain (0..=7). The pre-fix builder clamped the index with
+    /// `pcp.min(7)`, so a value of 9 silently installed the classifier for PCP
+    /// 7 — a DIFFERENT traffic class — with no apply failure. Same fail-closed
+    /// rationale as `CosDscpCodePointOutOfRange`.
+    CosIeee8021CodePointOutOfRange { classifier: String, pcp: u8 },
 }
 
 impl std::fmt::Display for SnapshotIntegrityError {
@@ -262,6 +278,16 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "cos scheduler-map {:?} references forwarding-class {:?} that is not in the class-to-queue table — refusing to partially install the scheduler (some queues silently missing)",
                 scheduler_map, forwarding_class
+            ),
+            Self::CosDscpCodePointOutOfRange { classifier, dscp } => write!(
+                f,
+                "cos dscp classifier {:?} has code-point {} outside the 0..=63 DSCP range — refusing to mask it with & 0x3f (which would install the classifier for a different traffic class)",
+                classifier, dscp
+            ),
+            Self::CosIeee8021CodePointOutOfRange { classifier, pcp } => write!(
+                f,
+                "cos ieee-802.1 classifier {:?} has code-point {} outside the 0..=7 PCP range — refusing to clamp it with .min(7) (which would install the classifier for a different traffic class)",
+                classifier, pcp
             ),
         }
     }

@@ -1436,6 +1436,142 @@ fn cos_forwarding_class_in_range_queue_builds_and_empty_name_skipped() {
     assert_eq!(cfg.queue_by_forwarding_class.get("voice").copied(), Some(5));
 }
 
+/// #2447: a DSCP classifier code-point outside the 6-bit DSCP domain
+/// (0..=63) fails the snapshot CLOSED via `CosDscpCodePointOutOfRange`. The
+/// pre-fix builder masked the index `dscp & 0x3f`, so 110 silently built the
+/// classifier for DSCP 46 — a DIFFERENT traffic class. fail-on-revert:
+/// restore `usize::from(dscp & 0x3f)` and `table[idx] = queue_id` and the
+/// build succeeds (installing the aliased entry), making this `expect_err`
+/// red.
+#[test]
+fn cos_dscp_classifier_out_of_range_code_point_fails_closed() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 80,
+            cos_shaping_rate_bytes_per_sec: 1,
+            cos_dscp_classifier: "wan".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            }],
+            dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+                name: "wan".into(),
+                entries: vec![CoSDSCPClassifierEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    loss_priority: "low".into(),
+                    dscp_values: vec![110], // > 63 — pre-fix masked to 46
+                }],
+            }],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+            schedulers: vec![],
+            scheduler_maps: vec![],
+        }),
+        ..Default::default()
+    };
+    let err = super::cos::build_cos_state(&snapshot)
+        .expect_err("an out-of-range DSCP code-point must fail closed, not alias into queue 46");
+    match err {
+        crate::policy::SnapshotIntegrityError::CosDscpCodePointOutOfRange { classifier, dscp } => {
+            assert_eq!(classifier, "wan");
+            assert_eq!(dscp, 110);
+        }
+        other => panic!("expected CosDscpCodePointOutOfRange, got {other:?}"),
+    }
+}
+
+/// #2447: an 802.1p classifier code-point outside the 3-bit PCP domain
+/// (0..=7) fails closed via `CosIeee8021CodePointOutOfRange` (pre-fix
+/// `pcp.min(7)` clamped 9 into queue 7).
+#[test]
+fn cos_ieee8021_classifier_out_of_range_code_point_fails_closed() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 81,
+            cos_shaping_rate_bytes_per_sec: 1,
+            cos_ieee8021_classifier: "wan-pcp".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![CoSIEEE8021ClassifierSnapshot {
+                name: "wan-pcp".into(),
+                entries: vec![CoSIEEE8021ClassifierEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    loss_priority: "low".into(),
+                    code_points: vec![9], // > 7 — pre-fix clamped to 7
+                }],
+            }],
+            dscp_rewrite_rules: vec![],
+            schedulers: vec![],
+            scheduler_maps: vec![],
+        }),
+        ..Default::default()
+    };
+    let err = super::cos::build_cos_state(&snapshot)
+        .expect_err("an out-of-range PCP code-point must fail closed, not clamp into queue 7");
+    match err {
+        crate::policy::SnapshotIntegrityError::CosIeee8021CodePointOutOfRange { classifier, pcp } => {
+            assert_eq!(classifier, "wan-pcp");
+            assert_eq!(pcp, 9);
+        }
+        other => panic!("expected CosIeee8021CodePointOutOfRange, got {other:?}"),
+    }
+}
+
+/// #2447 anti-over-reject: in-range boundary code-points (DSCP 63, PCP 7)
+/// still build the classifier table at the expected indices.
+#[test]
+fn cos_classifier_in_range_boundary_code_points_build() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 82,
+            cos_shaping_rate_bytes_per_sec: 1,
+            cos_dscp_classifier: "wan".into(),
+            cos_ieee8021_classifier: "wan-pcp".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            }],
+            dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+                name: "wan".into(),
+                entries: vec![CoSDSCPClassifierEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    loss_priority: "low".into(),
+                    dscp_values: vec![63], // max in-range
+                }],
+            }],
+            ieee8021_classifiers: vec![CoSIEEE8021ClassifierSnapshot {
+                name: "wan-pcp".into(),
+                entries: vec![CoSIEEE8021ClassifierEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    loss_priority: "low".into(),
+                    code_points: vec![7], // max in-range
+                }],
+            }],
+            dscp_rewrite_rules: vec![],
+            schedulers: vec![],
+            scheduler_maps: vec![],
+        }),
+        ..Default::default()
+    };
+    let state = super::cos::build_cos_state(&snapshot)
+        .expect("in-range boundary code-points must build");
+    let iface = state.interfaces.get(&82).expect("iface 82 cos");
+    assert_eq!(iface.dscp_queue_by_dscp[63], 0, "DSCP 63 must map to queue 0");
+    assert_eq!(iface.ieee8021_queue_by_pcp[7], 0, "PCP 7 must map to queue 0");
+}
+
 /// #2409: an interface address that does not parse as an `IpNet` fails the
 /// snapshot CLOSED via `InterfaceAddressUnparseable`. fail-on-revert:
 /// restoring the `else { continue; }` silently drops the address (losing
