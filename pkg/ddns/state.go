@@ -100,6 +100,15 @@ func familyOf(f int) Family {
 //   - RGOwner        — the redundancy-group id that owns this scope (#2664:
 //     the per-RG HA writer gate keys on this; 0 = unscoped / standalone).
 //   - PolicyID       — which provider/profile applies (P2/P3 catalog; "" today).
+//   - FQDN           — the published forward name for a Surface A router record
+//     (#2903). The published NAME is part of the scope IDENTITY for Surface A:
+//     a scope owns exactly ONE record at a fixed FQDN, so changing the
+//     configured hostname for a binding is a NEW scope (old name withdrawn,
+//     new name published) rather than an in-place name overwrite that orphans
+//     the old RR. It is EMPTY for the DHCP-lease path (Surface B), where the
+//     published name is the client-supplied host part carried on the owned
+//     record, not a per-scope identity — so a lease scope's key is unchanged
+//     and the pre-#2903 on-disk shape for leases is preserved.
 //
 // ScopeKey is a comparable struct so it is usable directly as a map key. The
 // zero value (FamilyV4-via-familyOf, all-empty) is the BACKWARD-COMPATIBLE
@@ -114,6 +123,7 @@ type ScopeKey struct {
 	RoutingInstance string
 	RGOwner         int
 	PolicyID        string
+	FQDN            string
 }
 
 // scopePrefix is the stable, deterministic textual encoding of a ScopeKey for
@@ -125,6 +135,14 @@ type ScopeKey struct {
 // collide (the #2663 / #2664 requirement: a v4-scoped and a v6-scoped publish,
 // or an RG0-owned and RG1-owned publish, of the same host are distinct owned
 // records).
+//
+// FQDN (#2903) is appended ONLY when non-empty: a Surface B (DHCP-lease) scope
+// leaves FQDN empty, so its prefix is byte-for-byte the pre-#2903 encoding and
+// the on-disk lease store loads unchanged. A Surface A router scope sets FQDN,
+// so the published NAME is part of the scope identity — changing the configured
+// hostname yields a DIFFERENT prefix, which the reconciler treats as a new
+// scope (old name withdrawn via the gone-from-config sweep, new name published)
+// instead of an in-place name overwrite that would orphan the old RR.
 func (s ScopeKey) scopePrefix() string {
 	if s == (ScopeKey{}) {
 		return ""
@@ -133,8 +151,15 @@ func (s ScopeKey) scopePrefix() string {
 	// terminating "#" separates the scope prefix from the identity|address
 	// suffix so a scope value containing '|' cannot alias an identity.
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "f%d/if=%s/u=%d/ri=%s/rg=%d/pid=%s#",
+	fmt.Fprintf(&sb, "f%d/if=%s/u=%d/ri=%s/rg=%d/pid=%s",
 		int(s.Family), s.Interface, s.Unit, s.RoutingInstance, s.RGOwner, s.PolicyID)
+	// Append the FQDN axis only when set so an FQDN-less (lease) scope keeps its
+	// pre-#2903 prefix byte-for-byte. "/fqdn=" cannot alias an earlier field
+	// (pid is the last fixed field and the value cannot contain "/fqdn=").
+	if s.FQDN != "" {
+		fmt.Fprintf(&sb, "/fqdn=%s", s.FQDN)
+	}
+	sb.WriteByte('#')
 	return sb.String()
 }
 
