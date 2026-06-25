@@ -3,6 +3,7 @@ package dhcpserver
 import (
 	"context"
 	"net"
+	"net/netip"
 	"path/filepath"
 	"testing"
 	"time"
@@ -550,6 +551,186 @@ func TestManagerSkipExistingFreshNameFullLifecycle(t *testing.T) {
 	if srv.zoneHas(a) {
 		t.Errorf("owned A not deleted after expiry")
 	}
+}
+
+// TestManagerForwardPublishedPTRFailsRecordsOwnership is the #2661 regression
+// at the MANAGER level (the layer reconcileOnceLocked drives). The forward A
+// add succeeds but the reverse PTR add returns a NON-skippable error (SERVFAIL).
+// Pre-#2661 the manager recorded NO ownership while the forward was already
+// live in DNS → the forward was ORPHANED (live but untracked, never cleanable).
+// Post-fix the manager records ownership of the live forward with PTRPending so
+// it is tracked + cleanable, and a later release deletes it.
+//
+// fail-on-revert: restoring UpsertLease to return a plain error (no pending
+// sentinel) / upsertLocked to record no ownership on that error re-creates the
+// orphan: cycle 1 OwnedRecords=0 while the A is live, and cycle 2 issues no
+// delete → the A survives in the zone with no owner → this test goes red.
+func TestManagerForwardPublishedPTRFailsRecordsOwnership(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	// The reverse zone always SERVFAILs (a non-skippable, transient error —
+	// NOT NOTAUTH/REFUSED, which is the permanent counted-skip case).
+	srv.setRcode("1.0.10.in-addr.arpa.", dns.RcodeServerFailure)
+
+	m := prodManagerTo(t, srv)
+	cfg := ddnsCfg(srv.addrUDP)
+
+	// Cycle 1: an active v4 lease. Forward A publishes; reverse PTR SERVFAILs.
+	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.1.5,aa:bb,01:02:03,3600,1900000000,1,laptop,0
+`)
+	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 1 must not fail the pass on a PTR-only failure: %v", err)
+	}
+	// The forward A is LIVE in the zone...
+	liveA := &dns.A{Hdr: dns.RR_Header{Name: "laptop.example.com.", Rrtype: dns.TypeA}, A: net.ParseIP("10.0.1.5")}
+	if !srv.zoneHas(liveA) {
+		t.Fatalf("forward A was not published")
+	}
+	// ...and it MUST be owned (tracked + cleanable), not orphaned.
+	if got := m.Stats().OwnedRecords; got != 1 {
+		t.Fatalf("#2661: forward published but NOT owned (orphaned); OwnedRecords=%d want 1 (owned=%v)",
+			got, ownedFQDNs(m))
+	}
+	if got := m.Stats().PTRDeferred; got != 1 {
+		t.Errorf("PTRDeferred = %d, want 1 (the PTR failure must be counted)", got)
+	}
+	// The owned record must be marked PTR-pending so the PTR is retried.
+	if !ownedPTRPending(m, "laptop.example.com") {
+		t.Errorf("owned record not marked PTRPending; the PTR will never be retried")
+	}
+
+	// Cycle 2: PTR zone recovers. The forward re-add is an idempotent no-op and
+	// the still-missing PTR publishes; the record settles (PTRPending cleared).
+	srv.clearRcode("1.0.10.in-addr.arpa.")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 2 (PTR retry): %v", err)
+	}
+	livePTR := &dns.PTR{
+		Hdr: dns.RR_Header{Name: reversePTRName(netip.MustParseAddr("10.0.1.5")) + ".", Rrtype: dns.TypePTR},
+		Ptr: "laptop.example.com.",
+	}
+	if !srv.zoneHas(livePTR) {
+		t.Errorf("reverse PTR was not published on the retry cycle")
+	}
+	if ownedPTRPending(m, "laptop.example.com") {
+		t.Errorf("PTRPending not cleared after a successful PTR retry")
+	}
+
+	// Cycle 3: lease gone — the (now fully-owned) forward is deleted, never
+	// orphaned. This is the no-orphan proof: a release withdraws the forward.
+	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 3 (release): %v", err)
+	}
+	if srv.zoneHas(liveA) {
+		t.Fatalf("#2661: the forward A was NOT withdrawn on release — it was orphaned")
+	}
+	if m.Stats().OwnedRecords != 0 {
+		t.Errorf("OwnedRecords = %d after release, want 0", m.Stats().OwnedRecords)
+	}
+}
+
+// TestManagerPTRPendingReleaseWithoutRetryStillCleansForward proves the forward
+// is cleanable even if the PTR NEVER recovers: a record stuck PTR-pending is
+// still owned, so when the lease expires the release withdraws the forward
+// (#2661 — the forward is tracked + cleanable regardless of the PTR outcome).
+func TestManagerPTRPendingReleaseWithoutRetryStillCleansForward(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	srv.setRcode("1.0.10.in-addr.arpa.", dns.RcodeServerFailure)
+
+	m := prodManagerTo(t, srv)
+	cfg := ddnsCfg(srv.addrUDP)
+
+	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.1.5,aa:bb,01:02:03,3600,1900000000,1,laptop,0
+`)
+	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	liveA := &dns.A{Hdr: dns.RR_Header{Name: "laptop.example.com.", Rrtype: dns.TypeA}, A: net.ParseIP("10.0.1.5")}
+	if !srv.zoneHas(liveA) || m.Stats().OwnedRecords != 1 {
+		t.Fatalf("forward not owned after PTR failure")
+	}
+
+	// Lease gone while still PTR-pending (PTR zone still broken): the forward
+	// must still be withdrawn (it is OWNED — that is the whole point of #2661).
+	// DeleteLease deletes the forward FIRST, then the PTR; the PTR delete to the
+	// still-broken zone surfaces an error so the reconcile pass reports it and
+	// keeps the ownership entry for a later retry, but the forward A is GONE
+	// from the zone — never orphaned. (Re-deleting an already-gone forward on a
+	// later cycle is an idempotent NXRRSET no-op.)
+	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	_ = m.Reconcile(context.Background(), cfg) // PTR-delete error is expected/non-fatal here
+	if srv.zoneHas(liveA) {
+		t.Fatalf("#2661: a PTR-pending forward was NOT cleaned on release — orphaned")
+	}
+	// The forward is withdrawn from DNS; ownership lingers only because the PTR
+	// delete to the broken zone could not complete. Once the PTR zone recovers
+	// the entry clears. Prove no orphan + eventual cleanup: recover the zone.
+	srv.clearRcode("1.0.10.in-addr.arpa.")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 3 (cleanup after PTR zone recovery): %v", err)
+	}
+	if m.Stats().OwnedRecords != 0 {
+		t.Errorf("OwnedRecords = %d after PTR-zone recovery, want 0", m.Stats().OwnedRecords)
+	}
+}
+
+// TestManagerPTRNotAuthOwnedNotPending guards the no-regression case: a NOTAUTH
+// reverse zone (permanently not ours) is a counted SKIP — the forward is owned
+// but NOT marked PTR-pending (there is nothing to retry), so steady state does
+// not churn re-attempting an UPDATE the server will always refuse.
+func TestManagerPTRNotAuthOwnedNotPending(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	srv.setRcode("1.0.10.in-addr.arpa.", dns.RcodeNotAuth)
+
+	m := prodManagerTo(t, srv)
+	cfg := ddnsCfg(srv.addrUDP)
+	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.1.5,aa:bb,01:02:03,3600,1900000000,1,laptop,0
+`)
+	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	if m.Stats().OwnedRecords != 1 {
+		t.Fatalf("forward not owned after a NOTAUTH PTR skip")
+	}
+	if m.Stats().SkippedPTRNotAuth != 1 {
+		t.Errorf("SkippedPTRNotAuth = %d, want 1", m.Stats().SkippedPTRNotAuth)
+	}
+	if m.Stats().PTRDeferred != 0 {
+		t.Errorf("PTRDeferred = %d, want 0 (NOTAUTH is a permanent skip, not a retry)", m.Stats().PTRDeferred)
+	}
+	if ownedPTRPending(m, "laptop.example.com") {
+		t.Errorf("NOTAUTH-skip record must NOT be PTRPending (nothing to retry)")
+	}
+	// Steady state: a second cycle does not re-upsert (no churn) — the record
+	// is settled, not pending.
+	after := m.Stats().UpsertOK
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if got := m.Stats().UpsertOK; got != after {
+		t.Errorf("NOTAUTH-skip record churned a re-upsert: %d -> %d (want flat)", after, got)
+	}
+}
+
+// ownedPTRPending reports whether the owned record for fqdn is PTR-pending.
+func ownedPTRPending(m *DDNSManager, fqdn string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.state.records {
+		if r.FQDN == fqdn {
+			return r.PTRPending
+		}
+	}
+	return false
 }
 
 func TestOwnedRecordViews(t *testing.T) {

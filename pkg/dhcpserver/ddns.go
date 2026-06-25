@@ -93,6 +93,11 @@ type DDNSStats struct {
 	// SkippedConflict counts adds skipped under conflict-policy skip-existing
 	// because the exact RR already existed at the server (plan §4.1).
 	SkippedConflict uint64
+	// PTRDeferred counts upserts where the forward A/AAAA published but the
+	// reverse PTR add failed with a non-skippable (transient) error: ownership
+	// is recorded for the live forward (never orphaned) and the PTR is retried
+	// on the next reconcile (#2661).
+	PTRDeferred uint64
 	// ReconcileOK / ReconcileFail count whole reconcile passes by outcome
 	// (a pass is "fail" when at least one record op errored this cycle).
 	ReconcileOK    uint64
@@ -145,6 +150,7 @@ type DDNSManager struct {
 	skippedNoBackend  atomic.Uint64 // upsert/delete skipped: no live backend wired
 	skippedPTRNotAuth atomic.Uint64 // reverse-zone PTR skipped (NOTAUTH/REFUSED)
 	skippedConflict   atomic.Uint64 // add skipped: exact RR already exists
+	ptrDeferred       atomic.Uint64 // forward published, PTR add failed (retry next cycle)
 	reconcileOK       atomic.Uint64 // reconcile passes with no record-op error
 	reconcileFail     atomic.Uint64 // reconcile passes with >=1 record-op error
 
@@ -426,7 +432,14 @@ func (m *DDNSManager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, l
 		key := ownedRecordKey(owned.Identity, owned.Address)
 		d, stillWanted := want[key]
 		if stillWanted && recordsEqual(owned, d.ow) {
-			d.seen = true // unchanged; no add needed below
+			// The published forward/reverse tuple is unchanged. If the owned
+			// record still owes its reverse PTR (#2661 partial success), leave it
+			// owned (do NOT delete the live forward) but do NOT mark it settled —
+			// fall through so Pass 2 re-runs the upsert and re-attempts the PTR
+			// (the forward re-add is an idempotent no-op).
+			if !owned.PTRPending {
+				d.seen = true // fully published; no add needed below
+			}
 			continue
 		}
 		// Fail-safe (#1387 MAJOR-4): if this owned record's family had an
@@ -527,6 +540,26 @@ func (m *DDNSManager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow o
 			// fail the reconcile pass.
 			return nil
 		}
+		if errors.Is(err, errDDNSPTRPending) {
+			// PARTIAL SUCCESS (#2661): the forward A/AAAA is LIVE in DNS but the
+			// reverse PTR add failed with a non-skippable (transient) error. We
+			// MUST record ownership of the forward so it is tracked + cleanable —
+			// recording NO ownership here (the pre-#2661 behavior) would orphan a
+			// live forward record. Record ownership with PTRPending set so the
+			// next reconcile re-runs UpsertLease (an idempotent forward re-add)
+			// and re-attempts the still-missing PTR. The PTR failure is counted
+			// and logged so it is observable; the reconcile pass is NOT failed
+			// (the forward succeeded and the PTR retry converges on its own), the
+			// same non-fatal treatment as a NOTAUTH skip.
+			m.ptrDeferred.Add(1)
+			slog.Warn("ddns: forward published but reverse PTR add failed; "+
+				"recording ownership with PTR pending for retry next cycle",
+				"fqdn", rec.FQDN, "ptr", rec.PTRName, "err", err)
+			ow.PTRPending = true
+			m.upsertOK.Add(1)
+			m.state.put(ow)
+			return nil
+		}
 		m.upsertFail.Add(1)
 		return err
 	}
@@ -535,6 +568,8 @@ func (m *DDNSManager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow o
 		return nil
 	}
 	m.upsertOK.Add(1)
+	// A fully-successful upsert settles any prior pending-PTR state.
+	ow.PTRPending = false
 	m.state.put(ow)
 	return nil
 }
@@ -643,6 +678,7 @@ func (m *DDNSManager) Stats() DDNSStats {
 		SkippedNoBackend:  m.skippedNoBackend.Load(),
 		SkippedPTRNotAuth: m.skippedPTRNotAuth.Load(),
 		SkippedConflict:   m.skippedConflict.Load(),
+		PTRDeferred:       m.ptrDeferred.Load(),
 		ReconcileOK:       m.reconcileOK.Load(),
 		ReconcileFail:     m.reconcileFail.Load(),
 		OwnedRecords:      n,
