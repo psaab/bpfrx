@@ -1,3 +1,36 @@
+## 2026-06-25 — #2397: persistent-NAT honors permit-any-remote-host=false
+
+- **Timestamp**: 2026-06-25
+- **Action**: Persistent source-NAT ignored `persistent-nat
+  permit-any-remote-host`. The lease was keyed by the local source tuple
+  `(protocol, src_ip, src_port)` only, so the same translated mapping was
+  reused across ANY remote destination — the disabled-flag (Junos
+  target-host scoping) mode was silently a no-op. Fix: `PersistentSourceKey`
+  gained an in-memory `remote: Option<(IpAddr, u16)>` field;
+  `SourceNatFlowKey::persistent_source_key(permit_any_remote_host)` folds the
+  flow's `(dst_ip, dst_port)` into the key when the flag is false (`None`
+  when true, preserving the historical any-remote reuse).
+  `PortAllocator::allocate_translation` takes the flag and threads it to the
+  key builder; both source.rs call sites pass
+  `rule.persistent_nat_permit_any_remote_host`. NOTE: the
+  `permit_any_remote_host` flag was ALREADY plumbed Go→Rust on both wire
+  sides (`pkg/dataplane/userspace/protocol.go`,
+  `userspace-dp/src/protocol/nat.rs`); no new wire field was added — `remote`
+  is purely in-memory allocator state, never serialized, so no
+  protocol_wire_v1.json regen.
+- **File(s)**: userspace-dp/src/nat/allocator.rs,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests.rs,
+  docs/userspace-dataplane-gaps.md, _Log.md
+- **Fail-on-revert proof**: new test
+  `pool_snat_persistent_no_permit_any_remote_scopes_to_remote_host` asserts a
+  second remote 5-tuple gets a DISTINCT mapping (2 leases) while a return to
+  the original remote reuses (1 reuse); sibling
+  `pool_snat_persistent_permit_any_remote_reuses_across_remotes` asserts the
+  flag-true path still shares one lease. Copy-restore revert (forced
+  `remote: None` regardless of flag) drove the disabled-flag test RED
+  (`left == right`, both `(203.0.113.10, 40000)`); restored, all 127 nat::
+  tests green.
+
 ## 2026-06-25 — #2772: ddns http dyndns2 + generic withdraw is no longer a silent no-op
 
 - **Timestamp**: 2026-06-25

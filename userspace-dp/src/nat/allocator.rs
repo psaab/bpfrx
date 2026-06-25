@@ -39,6 +39,13 @@ pub(super) struct PersistentSourceKey {
     pub(super) protocol: u8,
     pub(super) src_ip: IpAddr,
     pub(super) src_port: u16,
+    /// #2397: remote (destination) endpoint scope. `None` => the lease is
+    /// reusable by ANY remote host (`persistent-nat permit-any-remote-host`).
+    /// `Some((dst_ip, dst_port))` => the lease is bound to the original remote
+    /// endpoint (the disabled-flag / Junos target-host[-port] mode): a second
+    /// flow from the same local source to a DIFFERENT remote 5-tuple keys to a
+    /// distinct lease and therefore gets a distinct translated mapping.
+    pub(super) remote: Option<(IpAddr, u16)>,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -253,6 +260,7 @@ impl PortAllocator {
         family_offset: usize,
         address_persistent: bool,
         persistent_nat: bool,
+        persistent_nat_permit_any_remote_host: bool,
         persistent_nat_timeout_ns: u64,
         now_ns: u64,
     ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
@@ -281,7 +289,8 @@ impl PortAllocator {
             return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
         }
 
-        let persistent_key = persistent_nat.then(|| flow.persistent_source_key());
+        let persistent_key = persistent_nat
+            .then(|| flow.persistent_source_key(persistent_nat_permit_any_remote_host));
         if let Some(key) = persistent_key {
             if live.persistent_by_source.contains_key(&key) {
                 let mut reusable = None;
