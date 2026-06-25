@@ -18200,6 +18200,19 @@ top.
   pkg/config/compiler_validate_warn.go,
   pkg/config/compiler_p3_http_providers_test.go, _Log.md
 
+- **Timestamp**: 2026-06-25
+- **Action**: networkd batch fix #2986/#2987/#2988 — (a) gate static
+  Address= lines per-family on DHCPv4/DHCPv6 separately so DHCPv4+static-IPv6
+  (and mirror) installs the non-DHCP family address; (b) writeIfChanged
+  returns (changed,err) and Apply aggregates write failures + returns an
+  error so a swallowed write no longer reports clean-commit-against-stale
+  kernel (fail-closed); (c) Apply no longer early-returns on an empty
+  desired set — the stale 10-xpf-* sweep + reload now run when the last
+  managed interface is removed (protected lifeline files preserved). Added
+  addressIsIPv6 helper, made runNetworkctl a stubable package var. Six new
+  tests incl. fail-on-revert per bug; build/gofmt/vet/test green.
+- **File(s)**: pkg/networkd/networkd.go, pkg/networkd/networkd_test.go,
+  pkg/networkd/README.md, _Log.md
 ## 2026-06-25 — #2975 selectInterfaceAddr skip IFA_F_TEMPORARY
 - **Timestamp**: 2026-06-25
 - **Action**: Fix Surface A interface-address selection to skip RFC 4941/8981
@@ -18222,6 +18235,23 @@ top.
   pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+- **Action**: networkd batch #2987/#2988 caller-reach fix (hostile-review
+  MERGE-NEEDS-MINOR). The library fixes did not reach production: the only
+  caller (pkg/daemon/daemon_apply.go step 2.5) guarded networkd.Apply with
+  len(ManagedInterfaces)>0 (shadowed the #2988 empty-set sweep) and
+  swallowed Apply's returned error with only slog.Warn (the #2987
+  fail-closed never fired). Relaxed the guard to run Apply whenever
+  applyResult!=nil (empty set still sweeps stale 10-xpf-* — lifeline
+  preserved via resolveProtectedInterfaces from ActiveConfig). Captured the
+  Apply error into networkdErr and returned errors.Join(networkdErr,
+  dhcpServerErr) at the tail so a write failure fails the commit WITHOUT
+  skipping downstream reconcile (RETH MAC/VRRP/FRR/RA/IPsec) — mirrors the
+  dhcpServerErr deferred-error precedent. Added 3 daemon tests
+  (empty-set-sweeps, empty-set-preserves-lifeline, write-error-fails-commit),
+  each fail-on-revert RED without the caller fix. build/gofmt/vet/test green
+  for pkg/networkd + pkg/daemon.
+- **File(s)**: pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_networkd_apply_test.go, pkg/networkd/README.md, _Log.md
 - **Action**: #2997 — render `maximum-paths` in the `router ospf6` block so
   IPv6 OSPF ECMP is actually installed by FRR `ospf6d`. The OSPFv4 `router
   ospf` block already rendered ` maximum-paths <n>` from the global
