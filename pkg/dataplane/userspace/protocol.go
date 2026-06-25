@@ -1557,7 +1557,17 @@ type HAGroupStatus struct {
 }
 
 type SlowPathStatus struct {
-	Active             bool   `json:"active"`
+	Active bool `json:"active"`
+	// Degraded (#2471): the slow-path worker is active but the live TUN MTU is
+	// below the configured data-interface MTU because the MTU-programming ioctl
+	// failed. Jumbo reinjection is refused (see MTUDroppedPackets); a bare
+	// Active without this would mislead an operator into thinking the slow path
+	// is healthy while jumbo frames silently drop.
+	Degraded bool `json:"degraded,omitempty"`
+	// LiveMTU (#2471): the MTU the live TUN device is actually programmed with.
+	// Equals the desired MTU on success; falls back to 1500 when programming
+	// failed. Frames longer than this are refused at enqueue.
+	LiveMTU            int32  `json:"live_mtu,omitempty"`
 	DeviceName         string `json:"device_name,omitempty"`
 	Mode               string `json:"mode,omitempty"`
 	LastError          string `json:"last_error,omitempty"`
@@ -1569,6 +1579,10 @@ type SlowPathStatus struct {
 	RateLimitedPackets uint64 `json:"rate_limited_packets,omitempty"`
 	QueueFullPackets   uint64 `json:"queue_full_packets,omitempty"`
 	WriteErrors        uint64 `json:"write_errors,omitempty"`
+	// MTUDroppedPackets (#2471): frames refused at enqueue because they exceed
+	// the live TUN MTU. Non-zero while Degraded is the operator-visible proof
+	// that jumbo reinjection is being dropped by the firewall, not the kernel.
+	MTUDroppedPackets uint64 `json:"mtu_dropped_packets,omitempty"`
 }
 
 type PacketResolution struct {

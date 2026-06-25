@@ -567,6 +567,14 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	fmt.Fprintf(&b, "  Slow path next-table:      %d\n", slowPathNextTablePackets)
 	fmt.Fprintf(&b, "  Slow path forward-build:   %d\n", slowPathForwardBuildPackets)
 	fmt.Fprintf(&b, "  Slow path active:          %t\n", status.SlowPath.Active)
+	// #2471: surface the degraded MTU state so an operator is not misled by a
+	// bare "active: true" while jumbo reinjection is being dropped.
+	if status.SlowPath.Degraded {
+		fmt.Fprintf(&b, "  Slow path DEGRADED:        true (live MTU %d < configured; jumbo frames refused)\n", status.SlowPath.LiveMTU)
+	}
+	if status.SlowPath.LiveMTU != 0 {
+		fmt.Fprintf(&b, "  Slow path live MTU:        %d\n", status.SlowPath.LiveMTU)
+	}
 	if status.SlowPath.DeviceName != "" {
 		fmt.Fprintf(&b, "  Slow path device:          %s\n", status.SlowPath.DeviceName)
 	}
@@ -578,6 +586,7 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	fmt.Fprintf(&b, "  Slow path dropped:         %d pkts / %d bytes\n", status.SlowPath.DroppedPackets, status.SlowPath.DroppedBytes)
 	fmt.Fprintf(&b, "  Slow path rate-limited:    %d\n", status.SlowPath.RateLimitedPackets)
 	fmt.Fprintf(&b, "  Slow path queue-full:      %d\n", status.SlowPath.QueueFullPackets)
+	fmt.Fprintf(&b, "  Slow path MTU-exceeded:    %d\n", status.SlowPath.MTUDroppedPackets)
 	fmt.Fprintf(&b, "  Slow path write errors:    %d\n", status.SlowPath.WriteErrors)
 	if status.SlowPath.LastError != "" {
 		fmt.Fprintf(&b, "  Slow path last error:      %s\n", status.SlowPath.LastError)

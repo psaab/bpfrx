@@ -511,6 +511,13 @@ pub(crate) struct ProcessStatus {
 pub(crate) struct SlowPathStatus {
     #[serde(default)]
     pub active: bool,
+    /// #2471: active but the live TUN MTU is below the configured MTU because
+    /// the MTU-programming ioctl failed. Jumbo reinjection is refused.
+    #[serde(rename = "degraded", default)]
+    pub degraded: bool,
+    /// #2471: the live TUN MTU (1500 fallback when programming failed).
+    #[serde(rename = "live_mtu", default)]
+    pub live_mtu: i32,
     #[serde(rename = "device_name", default)]
     pub device_name: String,
     #[serde(default)]
@@ -533,12 +540,17 @@ pub(crate) struct SlowPathStatus {
     pub queue_full_packets: u64,
     #[serde(rename = "write_errors", default)]
     pub write_errors: u64,
+    /// #2471: frames refused at enqueue because they exceed the live TUN MTU.
+    #[serde(rename = "mtu_dropped_packets", default)]
+    pub mtu_dropped_packets: u64,
 }
 
 impl From<crate::slowpath::SlowPathStatus> for SlowPathStatus {
     fn from(value: crate::slowpath::SlowPathStatus) -> Self {
         Self {
             active: value.active,
+            degraded: value.degraded,
+            live_mtu: value.live_mtu,
             device_name: value.device_name,
             mode: value.mode,
             last_error: value.last_error,
@@ -550,6 +562,7 @@ impl From<crate::slowpath::SlowPathStatus> for SlowPathStatus {
             rate_limited_packets: value.rate_limited_packets,
             queue_full_packets: value.queue_full_packets,
             write_errors: value.write_errors,
+            mtu_dropped_packets: value.mtu_dropped_packets,
         }
     }
 }

@@ -3,7 +3,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,9 +19,28 @@ const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 const IFF_TUN: libc::c_short = 0x0001;
 const IFF_NO_PI: libc::c_short = 0x1000;
 
+/// The MTU the kernel assigns a freshly created TUN device. When the
+/// desired-MTU programming ioctl fails, this is the MTU the live TUN still
+/// has, so it is the largest L3 frame the slow path can actually inject
+/// (#2471). Reinjected frames above it are silently dropped by the kernel on
+/// TUN egress, so the reinjector must refuse them with a counter and the
+/// status must report the degraded state rather than a plain `active`.
+const DEFAULT_TUN_MTU: i32 = 1500;
+
 #[derive(Clone, Debug, Default)]
 pub struct SlowPathStatus {
     pub active: bool,
+    /// #2471: the slow-path worker is running (`active`) but the desired-MTU
+    /// programming ioctl failed, so the live TUN MTU is below the configured
+    /// data-interface MTU. Jumbo reinjection is refused (see `live_mtu`);
+    /// status must surface this so an operator is not misled by a bare
+    /// `active = true` while jumbo frames silently drop.
+    pub degraded: bool,
+    /// #2471: the MTU the live TUN device is actually programmed with. On a
+    /// successful program this equals the desired MTU; on a failed program it
+    /// falls back to the kernel-default `DEFAULT_TUN_MTU` (1500). Frames whose
+    /// total length exceeds this are refused at enqueue.
+    pub live_mtu: i32,
     pub device_name: String,
     pub mode: String,
     pub last_error: String,
@@ -33,12 +52,22 @@ pub struct SlowPathStatus {
     pub rate_limited_packets: u64,
     pub queue_full_packets: u64,
     pub write_errors: u64,
+    /// #2471: frames refused at enqueue because their length exceeds the live
+    /// TUN MTU (counted into `dropped_packets`/`dropped_bytes` as well). A
+    /// non-zero value while `degraded` is the operator-visible proof that
+    /// jumbo reinjection is being dropped by the firewall, not the kernel.
+    pub mtu_dropped_packets: u64,
 }
 
 pub enum EnqueueOutcome {
     Accepted,
     RateLimited,
     QueueFull,
+    /// #2471: the frame's length exceeds the live TUN MTU (the slow path is
+    /// degraded — MTU programming failed and the TUN is at the 1500 default).
+    /// Refused at enqueue with a counter instead of being silently dropped by
+    /// the kernel on TUN egress.
+    MtuExceeded,
 }
 
 struct PacketRequest {
@@ -89,6 +118,13 @@ enum WriteMode {
 
 struct SharedStatus {
     active: AtomicBool,
+    /// #2471: set when the worker is active but the live TUN MTU is below the
+    /// configured/desired MTU (set_if_mtu failed). See `SlowPathStatus`.
+    degraded: AtomicBool,
+    /// #2471: the live TUN MTU. `AtomicI64` so the reinjector enqueue path can
+    /// read it lock-free on the hot path. Defaults to `DEFAULT_TUN_MTU` until
+    /// the worker programs (or fails to program) the device.
+    live_mtu: AtomicI64,
     queued_packets: AtomicU64,
     injected_packets: AtomicU64,
     injected_bytes: AtomicU64,
@@ -97,6 +133,7 @@ struct SharedStatus {
     rate_limited_packets: AtomicU64,
     queue_full_packets: AtomicU64,
     write_errors: AtomicU64,
+    mtu_dropped_packets: AtomicU64,
     mode: Mutex<String>,
     device_name: Mutex<String>,
     last_error: Mutex<String>,
@@ -106,6 +143,8 @@ impl SharedStatus {
     fn new() -> Self {
         Self {
             active: AtomicBool::new(false),
+            degraded: AtomicBool::new(false),
+            live_mtu: AtomicI64::new(DEFAULT_TUN_MTU as i64),
             queued_packets: AtomicU64::new(0),
             injected_packets: AtomicU64::new(0),
             injected_bytes: AtomicU64::new(0),
@@ -114,9 +153,44 @@ impl SharedStatus {
             rate_limited_packets: AtomicU64::new(0),
             queue_full_packets: AtomicU64::new(0),
             write_errors: AtomicU64::new(0),
+            mtu_dropped_packets: AtomicU64::new(0),
             mode: Mutex::new(String::from("sync")),
             device_name: Mutex::new(String::new()),
             last_error: Mutex::new(String::new()),
+        }
+    }
+
+    /// #2471: apply the desired MTU to the live TUN and record the resulting
+    /// status. On success the live MTU is the desired MTU and the path is not
+    /// degraded. On failure the live MTU falls back to the kernel-default TUN
+    /// MTU (1500), `degraded` is set, and the error is recorded — the path
+    /// stays usable for <=1500 frames but jumbo reinjection is refused.
+    ///
+    /// `programmer` is the MTU-programming seam (`set_if_mtu` in production, a
+    /// failure-injecting closure in tests). Returns the live MTU now in
+    /// effect.
+    fn apply_mtu_status(
+        &self,
+        name: &str,
+        desired_mtu: i32,
+        programmer: impl FnOnce(&str, i32) -> Result<(), String>,
+    ) -> i32 {
+        match programmer(name, desired_mtu) {
+            Ok(()) => {
+                self.live_mtu.store(desired_mtu as i64, Ordering::Relaxed);
+                self.degraded.store(false, Ordering::Relaxed);
+                desired_mtu
+            }
+            Err(err) => {
+                eprintln!(
+                    "xpf-slowpath: set MTU {desired_mtu} on {name}: {err} \
+                     (slow-path DEGRADED: jumbo frames > {DEFAULT_TUN_MTU} will be refused)"
+                );
+                self.set_last_error(err);
+                self.live_mtu.store(DEFAULT_TUN_MTU as i64, Ordering::Relaxed);
+                self.degraded.store(true, Ordering::Relaxed);
+                DEFAULT_TUN_MTU
+            }
         }
     }
 
@@ -141,6 +215,8 @@ impl SharedStatus {
     fn snapshot(&self) -> SlowPathStatus {
         SlowPathStatus {
             active: self.active.load(Ordering::Relaxed),
+            degraded: self.degraded.load(Ordering::Relaxed),
+            live_mtu: self.live_mtu.load(Ordering::Relaxed) as i32,
             device_name: self
                 .device_name
                 .lock()
@@ -160,6 +236,7 @@ impl SharedStatus {
             rate_limited_packets: self.rate_limited_packets.load(Ordering::Relaxed),
             queue_full_packets: self.queue_full_packets.load(Ordering::Relaxed),
             write_errors: self.write_errors.load(Ordering::Relaxed),
+            mtu_dropped_packets: self.mtu_dropped_packets.load(Ordering::Relaxed),
         }
     }
 }
@@ -210,6 +287,20 @@ impl SlowPathReinjector {
 
     pub fn enqueue(&self, bytes: Vec<u8>) -> Result<EnqueueOutcome, String> {
         let packet_len = bytes.len() as u64;
+        // #2471: refuse frames larger than the live TUN MTU. When MTU
+        // programming failed the live TUN is at 1500; injecting a jumbo frame
+        // would be silently dropped by the kernel on TUN egress while status
+        // still reported `active`. Drop it here with an explicit counter so the
+        // degradation is firewall-visible, not hidden in the kernel.
+        let live_mtu = self.status.live_mtu.load(Ordering::Relaxed);
+        if live_mtu > 0 && packet_len > live_mtu as u64 {
+            self.status.mtu_dropped_packets.fetch_add(1, Ordering::Relaxed);
+            self.status.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            self.status
+                .dropped_bytes
+                .fetch_add(packet_len, Ordering::Relaxed);
+            return Ok(EnqueueOutcome::MtuExceeded);
+        }
         let allowed = self
             .limiter
             .lock()
@@ -269,14 +360,11 @@ fn slow_path_worker(name: &str, mtu: i32, rx: Receiver<PacketRequest>, status: A
     // #2408: the kernel creates the TUN at the default 1500 MTU. Raise it to
     // the largest configured data-interface MTU so reinjected jumbo frames are
     // not silently dropped on the TUN egress. A failure here is non-fatal: the
-    // TUN is still usable for <=1500 frames, so log and continue rather than
-    // tearing down the whole slow path.
-    if let Err(err) = set_if_mtu(&actual_name, mtu) {
-        eprintln!(
-            "xpf-slowpath: set MTU {mtu} on {actual_name}: {err} (slow-path jumbo frames may drop)"
-        );
-        status.set_last_error(err);
-    }
+    // TUN is still usable for <=1500 frames, so the path stays active but is
+    // marked DEGRADED (#2471) — `live_mtu` falls back to 1500 and the enqueue
+    // path refuses frames above it rather than letting the kernel drop them
+    // silently while status reports a healthy `active`.
+    status.apply_mtu_status(&actual_name, mtu, set_if_mtu);
     status.set_device_name(&actual_name);
     status.active.store(true, Ordering::Relaxed);
 
@@ -668,6 +756,80 @@ mod tests {
         std::fs::write(&ok, "garbage").unwrap();
         assert_eq!(read_all_rp_filter(ok.to_str().unwrap()), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2471 fail-on-revert: when the MTU-programming ioctl FAILS, the slow
+    /// path must NOT report a bare `active = true`. It must report `degraded`,
+    /// fall the live MTU back to the kernel default (1500), and record the
+    /// error. If the failure handling reverts to the buggy unconditional
+    /// `active.store(true)` with no degraded bit, these assertions fail.
+    #[test]
+    fn apply_mtu_status_degrades_on_failure() {
+        let status = SharedStatus::new();
+        let live = status.apply_mtu_status("xpf-usp0", 9000, |_name, _mtu| {
+            Err("SIOCSIFMTU xpf-usp0 mtu=9000: Operation not permitted".to_string())
+        });
+        // The worker would still flip active=true after this; what proves the
+        // bug is fixed is the degraded bit + the live-MTU fallback.
+        assert_eq!(live, DEFAULT_TUN_MTU, "failed program falls back to 1500");
+        let snap = status.snapshot();
+        assert!(snap.degraded, "MTU program failure must mark the path degraded");
+        assert_eq!(snap.live_mtu, DEFAULT_TUN_MTU, "live MTU reports the 1500 fallback");
+        assert!(
+            !snap.last_error.is_empty(),
+            "the ioctl error must be recorded for the operator"
+        );
+    }
+
+    /// On a successful program the path is NOT degraded and the live MTU is the
+    /// desired (jumbo) MTU, so jumbo reinjection is permitted.
+    #[test]
+    fn apply_mtu_status_clean_on_success() {
+        let status = SharedStatus::new();
+        let live = status.apply_mtu_status("xpf-usp0", 9000, |name, mtu| {
+            assert_eq!(name, "xpf-usp0");
+            assert_eq!(mtu, 9000);
+            Ok(())
+        });
+        assert_eq!(live, 9000);
+        let snap = status.snapshot();
+        assert!(!snap.degraded, "a successful program is not degraded");
+        assert_eq!(snap.live_mtu, 9000, "live MTU is the desired jumbo MTU");
+    }
+
+    /// #2471 fail-on-revert: a frame larger than the live TUN MTU must be
+    /// REFUSED at enqueue (counted), not silently passed to the kernel where it
+    /// would be dropped on TUN egress. With the bug (no live-MTU gate) the
+    /// jumbo frame would be Accepted; this asserts MtuExceeded + the counters.
+    #[test]
+    fn enqueue_refuses_frame_above_live_mtu() {
+        let reinjector =
+            SlowPathReinjector::new("xpf-usp-test0", 9000).expect("spawn reinjector");
+        // Simulate a degraded TUN: the worker programmed (or failed to) and the
+        // live MTU is the 1500 default. Force that state directly.
+        reinjector
+            .status
+            .live_mtu
+            .store(DEFAULT_TUN_MTU as i64, Ordering::Relaxed);
+        reinjector.status.degraded.store(true, Ordering::Relaxed);
+
+        // A <=1500 frame is admitted (not MTU-refused).
+        let small = reinjector.enqueue(vec![0u8; 1400]).expect("enqueue small");
+        assert!(
+            matches!(small, EnqueueOutcome::Accepted),
+            "a 1400-byte frame is within the live MTU and must be accepted"
+        );
+
+        // A jumbo frame above the live MTU is refused with the MTU outcome.
+        let jumbo = reinjector.enqueue(vec![0u8; 8000]).expect("enqueue jumbo");
+        assert!(
+            matches!(jumbo, EnqueueOutcome::MtuExceeded),
+            "an 8000-byte frame above the 1500 live MTU must be refused, not silently dropped"
+        );
+        let snap = reinjector.status();
+        assert_eq!(snap.mtu_dropped_packets, 1, "the MTU drop is counted");
+        assert!(snap.dropped_packets >= 1, "MTU drop also rolls into dropped_packets");
+        assert!(snap.dropped_bytes >= 8000, "dropped bytes accumulate the refused frame");
     }
 
     #[test]
