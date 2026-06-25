@@ -18507,3 +18507,31 @@ top.
 - **File(s)**: pkg/config/compiler_security.go,
   pkg/config/parser_security_test.go, pkg/dataplane/compiler_iface.go,
   pkg/dataplane/compiler_test.go, docs/syn-cookie-flood-protection.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #3021/#3022/#3026 — route VLAN sub-interface ingress through
+  the `resolve_ingress_logical_ifindex` SSOT for zone-pair policy (#3021),
+  screen/SYN-cookie zone lookup (#3022), and generated-ICMP CoS/filter
+  classify (#3026). `ifindex_to_zone_id` and `forwarding.egress` are keyed
+  by the LOGICAL unit ifindex; the physical parent only inherits its first
+  sub-interface's zone, so a parent carrying multiple VLAN units in distinct
+  zones evaluated the wrong policy/screen/CoS for every unit but the first.
+  All three sites now mirror the filter/cos call sites: resolve
+  (parent, vlan) -> logical, fall back to meta.ingress_ifindex when no
+  entry (untagged == physical == logical, no-op). icmp.rs still uses the
+  physical target_ifindex for the XSK transmit. Added three fail-on-revert
+  tests: screen_zone_lookup_uses_logical_ingress_ifindex_3022 LITERALLY
+  drives stage_screen_check with a lan-only source-route profile on a
+  VID-50/lan unit (verified RED when reverted to meta.ingress_ifindex —
+  resolves zone wan, no profile, Pass); forwarding_zone_pair_…_3021 and
+  classify_generated_reply_uses_logical_egress_ifindex_3026 are
+  counterfactual pins (assert logical-keyed vs physical-keyed verdicts
+  diverge, the project's accepted idiom for helper-keyed call sites that a
+  unit test cannot reach). Gates: cargo build --release clean (0 errors);
+  full bins suite 2917 passed + 1 PRE-EXISTING flake
+  (worker_queue::concurrent_recovery_processes_each_command, passes 3/3 in
+  isolation, unrelated to this change).
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_stages.rs, userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md

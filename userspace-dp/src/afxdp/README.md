@@ -56,6 +56,35 @@ sync.
     ifindex (no drop). Two VLANs on one physical port resolve to distinct
     logical ifindexes, so a same-IP-different-subnet neighbor never
     collides in the cache.
+  - **Same SSOT for zone / screen / generated-ICMP keying (`#3021` /
+    `#3022` / `#3026`):** every per-ingress map keyed by the LOGICAL unit
+    ifindex must resolve `(parent, vlan) -> logical` through
+    `resolve_ingress_logical_ifindex` before indexing — not pass the raw
+    `meta.ingress_ifindex`. `ifindex_to_zone_id` is keyed by the logical
+    unit (`forwarding_build/interfaces.rs:76`); the physical parent ifindex
+    only ever inherits its FIRST sub-interface's zone (lines 77-86), so a
+    parent carrying multiple VLAN units in distinct zones would evaluate the
+    wrong zone for every unit but the first. The three sites now mirror the
+    filter (`poll_descriptor/filter.rs`) and CoS (`tx/cos_classify.rs`)
+    call sites:
+      - **#3021 — forwarding zone-pair:** both `from_zone` derivations in
+        `poll_descriptor/mod.rs::poll_binding_process_descriptor` resolve
+        the logical ingress ifindex before
+        `zone_pair_ids_for_flow_with_override`, so a VLAN sub-interface is
+        policed under its OWN ingress zone-pair.
+      - **#3022 — screen / SYN-cookie:** `stage_screen_check` and
+        `stage_screen_syn_cookie_ack_on_session_miss` resolve the logical
+        ifindex before the `ifindex_to_zone_id` lookup, so the correct
+        screen profile applies (a parent-zone miss would otherwise SKIP
+        screening entirely, or apply the wrong profile).
+      - **#3026 — generated ICMP error:** `icmp.rs` classifies the
+        generated reply (CoS queue / DSCP rewrite / output filter) on the
+        LOGICAL egress unit ifindex (`ingress_ident.ifindex`, the key for
+        `forwarding.egress`), NOT the physical `target_ifindex` /
+        `bind_ifindex`. `target_ifindex` (physical) is still used for the
+        XSK transmit.
+    Untagged ports resolve physical == logical, so all four sites are
+    no-ops there (non-VLAN behavior preserved).
   - **NA validation (`#2368`, RFC 4861 §7.1.2 / RFC 4443):** before an
     NA learns a Target Link-Layer Address, `parse_ndp_neighbor_advert`
     enforces the §7.1.2 MUSTs — IPv6 Hop Limit == 255 (the off-link
