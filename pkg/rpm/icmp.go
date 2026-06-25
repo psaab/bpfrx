@@ -127,7 +127,7 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts prob
 	if resolve == nil {
 		resolve = resolveProbeTarget
 	}
-	dstAddr, err := resolve(test.Target, opts)
+	dstAddr, err := resolve(ctx, test.Target, opts)
 	if err != nil {
 		return 0, err
 	}
@@ -275,14 +275,32 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts prob
 // inside the VRF (#2614). An unscoped test (no device, no mark) uses the
 // default resolver, bit-identical to the pre-#2614 net.ResolveIPAddr
 // path.
-func resolveProbeTarget(target string, opts probeSockOpts) (*net.IPAddr, error) {
+//
+// The lookup runs under the probe-cycle ctx (#2647) so a stuck DNS query
+// for a hostname target honors the cycle's cancellation/deadline (config
+// reload, service stop) instead of escaping it via context.Background() —
+// matching the ctx-bound TCP/HTTP probe paths. A literal-IP target
+// returns before the lookup, so ctx never gates it. The ctx flows into
+// the (possibly VRF-bound, #2614) resolver's LookupIPAddr, and into the
+// bound resolver's Dial via the standard net.Resolver plumbing.
+// lookupIPAddr is the DNS-lookup seam used by resolveProbeTarget. Production
+// calls the (possibly VRF-bound, #2614) resolver's LookupIPAddr, threading the
+// probe-cycle ctx (#2647). It is a package var so a unit test can substitute a
+// resolver whose Dial genuinely blocks until ctx is done — the fail-on-revert
+// gate for the ctx threading (a hostname lookup honors cancellation instead of
+// hanging under context.Background()).
+var lookupIPAddr = func(ctx context.Context, r *net.Resolver, target string) ([]net.IPAddr, error) {
+	return r.LookupIPAddr(ctx, target)
+}
+
+func resolveProbeTarget(ctx context.Context, target string, opts probeSockOpts) (*net.IPAddr, error) {
 	if target == "" {
 		return nil, fmt.Errorf("no target specified")
 	}
 	if ip := net.ParseIP(target); ip != nil {
 		return &net.IPAddr{IP: ip}, nil
 	}
-	ips, err := resolverForOpts(opts).LookupIPAddr(context.Background(), target)
+	ips, err := lookupIPAddr(ctx, resolverForOpts(opts), target)
 	if err != nil {
 		return nil, fmt.Errorf("resolve target %q: %w", target, err)
 	}

@@ -15,7 +15,7 @@ import (
 // which populates IPAddr.Zone. Before #2494 the resolver returned a bare
 // net.IP and the zone was dropped — this test fails on master.
 func TestResolveProbeTargetPreservesZone(t *testing.T) {
-	addr, err := resolveProbeTarget("fe80::1%ge-0-0-3", probeSockOpts{})
+	addr, err := resolveProbeTarget(context.Background(), "fe80::1%ge-0-0-3", probeSockOpts{})
 	if err != nil {
 		t.Fatalf("resolveProbeTarget: %v", err)
 	}
@@ -27,7 +27,7 @@ func TestResolveProbeTargetPreservesZone(t *testing.T) {
 	}
 
 	// A plain global literal carries no zone.
-	g, err := resolveProbeTarget("2001:db8::10", probeSockOpts{})
+	g, err := resolveProbeTarget(context.Background(), "2001:db8::10", probeSockOpts{})
 	if err != nil {
 		t.Fatalf("resolveProbeTarget global: %v", err)
 	}

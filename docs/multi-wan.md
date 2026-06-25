@@ -85,7 +85,9 @@ set services rpm probe WAN test wan-a thresholds successive-loss 3
     VRF and hits the VRF's DNS servers. icmp-ping resolves through
     `rpm.resolveProbeTarget(target, opts)`; tcp-ping / http-get set the
     dialer's `Resolver` (`probeDialer.Resolver = vrfBoundResolver(opts)`)
-    so the dialer's own name lookup is bound too. A hostname inside an
+    so the dialer's own name lookup is bound too. (Since #2647
+    `resolveProbeTarget(ctx, target, opts)` threads the probe-cycle
+    context into the lookup — see the cancellation note below.) A hostname inside an
     isolated VRF therefore resolves correctly instead of through the
     main table / default DNS (or failing when DNS is reachable only
     inside the VRF). `applyVRFBind` is the single source of truth for the
@@ -106,6 +108,20 @@ set services rpm probe WAN test wan-a thresholds successive-loss 3
     reach the resolver, while an unscoped probe keeps the default
     resolver. Reverting to the unbound `net.ResolveIPAddr` path turns
     those tests red.
+  - **Resolution honors the probe-cycle context (#2647).** Hostname
+    resolution for an icmp-ping target now runs under the probe ctx:
+    `resolveProbeTarget(ctx, target, opts)` passes that ctx to the
+    resolver's `LookupIPAddr(ctx, target)` (and, for a VRF-bound
+    resolver, on into its `Dial`). A stuck DNS query therefore aborts on
+    the cycle's cancellation/deadline (config reload, service stop)
+    instead of running under `context.Background()` and outliving the
+    cycle — matching the ctx-bound tcp-ping `DialContext(ctx, …)` and
+    http-get `NewRequestWithContext`. An IP-literal target returns before
+    the lookup, so the ctx never gates it. Gate in CI:
+    `pkg/rpm/TestResolveProbeTargetHonorsCanceledCtx` /
+    `…HonorsDeadline` — a blocking-lookup seam under a canceled/expired
+    ctx returns promptly; reverting the call to `context.Background()`
+    hangs them red.
 - **IPv6 link-local targets need a scope (#2494).** A link-local target
   (`fe80::/10`) is unprobeable without an egress link: the kernel cannot
   pick the link, so the ICMP echo goes nowhere. The scope can come from

@@ -60,7 +60,7 @@ func TestScopedHostnameResolvesInScope(t *testing.T) {
 			m, conn := newFakeManager(func(b []byte, _ net.Addr) []fakeReply {
 				return []fakeReply{echoReply(t, b, false, false, target)}
 			})
-			m.resolveTarget = func(name string, opts probeSockOpts) (*net.IPAddr, error) {
+			m.resolveTarget = func(_ context.Context, name string, opts probeSockOpts) (*net.IPAddr, error) {
 				resolves.Add(1)
 				gotOpts = opts
 				return &net.IPAddr{IP: target}, nil
@@ -134,7 +134,7 @@ func TestUnscopedHostnameUsesDefaultResolver(t *testing.T) {
 	m, conn := newFakeManager(func(b []byte, _ net.Addr) []fakeReply {
 		return []fakeReply{echoReply(t, b, false, false, target)}
 	})
-	m.resolveTarget = func(name string, opts probeSockOpts) (*net.IPAddr, error) {
+	m.resolveTarget = func(_ context.Context, name string, opts probeSockOpts) (*net.IPAddr, error) {
 		resolves.Add(1)
 		gotOpts = opts
 		return &net.IPAddr{IP: target}, nil
@@ -159,7 +159,7 @@ func TestUnscopedHostnameUsesDefaultResolver(t *testing.T) {
 // hits DNS — resolveProbeTarget short-circuits via net.ParseIP regardless
 // of scope, so no resolver (bound or default) is consulted.
 func TestScopedIPLiteralSkipsDNS(t *testing.T) {
-	addr, err := resolveProbeTarget("192.0.2.10", probeSockOpts{BindDevice: "vrf-ISP-B"})
+	addr, err := resolveProbeTarget(context.Background(), "192.0.2.10", probeSockOpts{BindDevice: "vrf-ISP-B"})
 	if err != nil {
 		t.Fatalf("resolveProbeTarget IP literal: %v", err)
 	}
