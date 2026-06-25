@@ -15967,3 +15967,17 @@ top.
   pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
   pkg/api/metrics_test.go, pkg/api/metrics_descriptor_coverage_test.go,
   docs/userspace-native-gre-plan.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2788 — VRRP addrwatch now schedules an immediate reconcile on an
+  address event for a CONFIGURED interface that appeared after VRRP start
+  (no instance built yet). Track desired interface names in
+  Manager.desiredIfaces (populated in UpdateInstances); reresolveAddrFor's
+  cached-ifindex-miss path treats a resolved-name-in-desiredIfaces with no
+  bound instance as a late-appearing creation signal and fires onEventDrop.
+  Composes with #2294 ifindex-drift restart, #2528 source re-resolve, #2707
+  recreated-link drift. Fail-on-revert test
+  TestAddrWatcher_LateAppearingInterfaceSchedulesReconcile +
+  TestAddrWatcher_UnconfiguredInterfaceNoReconcile (over-fire guard).
+  **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/addrwatch.go,
+  pkg/vrrp/addrwatch_test.go, _Log.md
