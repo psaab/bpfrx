@@ -15521,3 +15521,24 @@ top.
   pkg/grpcapi/sessions_iterator_error_test.go, pkg/cli/cli_show_flow.go,
   pkg/cli/cli_show_nat.go, pkg/cli/sessions_iterator_error_test.go,
   _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2522 — gate the 500ms mlx5 zero-copy teardown quiesce on
+  `will_rebind` (a snapshot is being applied), not just `had_live_workers`.
+  A teardown with no following bind (the `no_snapshot` / shutdown path)
+  never rebinds the queues, so the 500ms quiesce was pure dead latency
+  there. `Coordinator::reconcile` now passes `will_rebind =
+  snapshot.is_some()` into `tear_down`; the quiesce fires only when live
+  workers were torn down AND a rebind follows. Added `reconcile_quiesce_count`
+  observability counter (bumped on each quiesce). The quiesce routes
+  through a `cfg(test)` `test_seam` that records the requested duration
+  and skips the real sleep so the new tests run fast. Three fail-on-revert
+  tests in coordinator/tests.rs: no-live-workers skip, no-snapshot skip
+  (THE pin — RED on revert: left=500 right=0), and live-workers+snapshot
+  fires (barrier preserved). Proved RED on revert, restored. EBUSY barrier
+  is unchanged on the rebind path. Provenance: codex review-037 finding
+  037-03.
+  **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/teardown.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md

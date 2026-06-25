@@ -208,6 +208,12 @@ pub struct Coordinator {
     pub(crate) last_resolution: Arc<Mutex<Option<PacketResolution>>>,
     pub(crate) validation: ValidationState,
     pub(crate) reconcile_calls: u64,
+    /// #2522: count of teardowns that paid the 500ms mlx5 zero-copy
+    /// EBUSY quiesce. Bumped only when live workers were torn down AND a
+    /// rebind follows (snapshot-apply path). Surfaces the mlx5-specific
+    /// workaround so its frequency is observable; the `no_snapshot` /
+    /// shutdown teardown no longer pays (and no longer counts) it.
+    pub(crate) reconcile_quiesce_count: u64,
     pub(crate) last_reconcile_stage: String,
     pub(crate) poll_mode: crate::PollMode,
     pub(crate) event_stream: Option<crate::event_stream::EventStreamSender>,
@@ -251,6 +257,7 @@ impl Coordinator {
             last_resolution: Arc::new(Mutex::new(None)),
             validation: ValidationState::default(),
             reconcile_calls: 0,
+            reconcile_quiesce_count: 0,
             last_reconcile_stage: "idle".to_string(),
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,
