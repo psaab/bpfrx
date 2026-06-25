@@ -2367,7 +2367,7 @@ func TestResolveRedistribute_PolicyStatement(t *testing.T) {
 			"export-connected": {
 				Name: "export-connected",
 				Terms: []*config.PolicyTerm{
-					{Name: "t1", FromProtocols: []string{"direct"}, Action: "accept", PrefixList: "internal"},
+					{Name: "t1", FromProtocols: []string{"direct"}, Action: "accept", PrefixList: []string{"internal"}},
 				},
 			},
 		},
@@ -2412,7 +2412,7 @@ func TestGenerateProtocols_OSPFExportRouteMap(t *testing.T) {
 			"export-direct": {
 				Name: "export-direct",
 				Terms: []*config.PolicyTerm{
-					{Name: "t1", FromProtocols: []string{"direct"}, PrefixList: "trusted-nets", Action: "accept"},
+					{Name: "t1", FromProtocols: []string{"direct"}, PrefixList: []string{"trusted-nets"}, Action: "accept"},
 				},
 				DefaultAction: "reject",
 			},
@@ -2484,7 +2484,7 @@ func TestGenerateProtocols_BGPExportPrefixOnly(t *testing.T) {
 				Name: "adv-filter",
 				Terms: []*config.PolicyTerm{
 					// No FromProtocols — matches by community only.
-					{Name: "t1", FromCommunity: "no-export", Action: "reject"},
+					{Name: "t1", FromCommunity: []string{"no-export"}, Action: "reject"},
 				},
 				DefaultAction: "accept",
 			},
@@ -2556,7 +2556,7 @@ func TestGenerateProtocols_BGPExportMixed(t *testing.T) {
 		PolicyStatements: map[string]*config.PolicyStatement{
 			"adv-filter": {
 				Name:          "adv-filter",
-				Terms:         []*config.PolicyTerm{{Name: "t1", FromCommunity: "no-export", Action: "reject"}},
+				Terms:         []*config.PolicyTerm{{Name: "t1", FromCommunity: []string{"no-export"}, Action: "reject"}},
 				DefaultAction: "accept",
 			},
 		},
@@ -2609,7 +2609,7 @@ func TestResolveRedistribute_ProtocolLessPolicy(t *testing.T) {
 				Name: "export-comm",
 				Terms: []*config.PolicyTerm{
 					// from community only — no `from protocol`.
-					{Name: "t1", FromCommunity: "my-comm", Action: "accept"},
+					{Name: "t1", FromCommunity: []string{"my-comm"}, Action: "accept"},
 				},
 				DefaultAction: "accept",
 			},
@@ -2662,7 +2662,7 @@ func TestGenerateProtocols_ProtocolLessPolicyExport(t *testing.T) {
 			// Protocol-less: from community only.
 			"export-comm": {
 				Name:          "export-comm",
-				Terms:         []*config.PolicyTerm{{Name: "t1", FromCommunity: "my-comm", Action: "accept"}},
+				Terms:         []*config.PolicyTerm{{Name: "t1", FromCommunity: []string{"my-comm"}, Action: "accept"}},
 				DefaultAction: "accept",
 			},
 			// Well-formed: from protocol static.
@@ -3006,7 +3006,7 @@ func TestGeneratePolicyOptionsCommunityListAndMetricType(t *testing.T) {
 					{
 						Name:          "t1",
 						FromProtocols: []string{"direct"},
-						FromCommunity: "MY-COMM",
+						FromCommunity: []string{"MY-COMM"},
 						Action:        "accept",
 						MetricType:    1,
 						Metric:        100,
@@ -3180,7 +3180,7 @@ func TestGeneratePolicyOptionsASPath(t *testing.T) {
 				Terms: []*config.PolicyTerm{
 					{
 						Name:       "match-as",
-						FromASPath: "AS65000",
+						FromASPath: []string{"AS65000"},
 						Action:     "accept",
 					},
 				},
@@ -4449,7 +4449,7 @@ func TestGenerateProtocols_NewlineFreeTextDoesNotInject(t *testing.T) {
 func policyOptionsWithPrefixListTerm(plName string, prefixes []string, withRouteFilter bool) *config.PolicyOptionsConfig {
 	term := &config.PolicyTerm{
 		Name:       "t1",
-		PrefixList: plName,
+		PrefixList: []string{plName},
 		Action:     "accept",
 	}
 	if withRouteFilter {
@@ -4878,5 +4878,175 @@ func TestGenerateProtocols_BFDPeerMixedInstances(t *testing.T) {
 	}
 	if strings.Contains(got, " peer 10.2.2.2\n") {
 		t.Errorf("VRF-instance peer must NOT render an unqualified line, got:\n%s", got)
+	}
+}
+
+// --- #2642: a policy term with MULTIPLE same-type `from` matches ------------
+// Junos allows repeated `from { community c1; community c2; }` (and the same
+// for prefix-list / as-path) which match with OR ("any") semantics. FRR holds
+// only one rule of each match TYPE per route-map index (route_map_add_match
+// replaces same-type), so OR is rendered as one route-map SEQUENCE per value,
+// each carrying the full term body and the same permit/deny action — a route
+// matching ANY value reaches a sequence it satisfies.
+
+func TestPolicyTermMultiCommunity_OR(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		Communities: map[string]*config.CommunityDef{
+			"C1": {Name: "C1", Members: []string{"65000:1"}},
+			"C2": {Name: "C2", Members: []string{"65000:2"}},
+		},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"P": {
+				Name: "P",
+				Terms: []*config.PolicyTerm{
+					{Name: "t1", FromCommunity: []string{"C1", "C2"}, Action: "accept"},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+	got := m.generatePolicyOptions(po)
+
+	// Both communities must render (the bug kept only the last). OR =
+	// two permit sequences, NOT two match lines in one index (which FRR
+	// would collapse to the last).
+	for _, want := range []string{
+		"match community C1",
+		"match community C2",
+		"route-map P permit 10",
+		"route-map P permit 20",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	// fail-on-revert: each community sits in its OWN sequence (OR), so the
+	// two match lines must not co-reside in one route-map index. Count permit
+	// sequences for P: exactly two term sequences + (deny default) => the two
+	// match-community lines are in distinct indices.
+	if got1, got2 := strings.Count(got, "match community C1"), strings.Count(got, "match community C2"); got1 != 1 || got2 != 1 {
+		t.Errorf("expected exactly one match line per community, got C1=%d C2=%d:\n%s", got1, got2, got)
+	}
+	if n := strings.Count(got, "route-map P permit "); n != 2 {
+		t.Errorf("expected 2 permit term sequences (one per community, OR), got %d:\n%s", n, got)
+	}
+}
+
+func TestPolicyTermMultiASPath_OR(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		ASPaths: map[string]*config.ASPathDef{
+			"A1": {Name: "A1", Regex: "65001"},
+			"A2": {Name: "A2", Regex: "65002"},
+		},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"P": {
+				Name: "P",
+				Terms: []*config.PolicyTerm{
+					{Name: "t1", FromASPath: []string{"A1", "A2"}, Action: "accept"},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+	got := m.generatePolicyOptions(po)
+	for _, want := range []string{"match as-path A1", "match as-path A2", "route-map P permit 10", "route-map P permit 20"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	if n := strings.Count(got, "route-map P permit "); n != 2 {
+		t.Errorf("expected 2 permit term sequences (one per as-path, OR), got %d:\n%s", n, got)
+	}
+}
+
+func TestPolicyTermMultiPrefixList_OR(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		PrefixLists: map[string]*config.PrefixList{
+			"PL1": {Name: "PL1", Prefixes: []string{"10.0.0.0/8"}},
+			"PL2": {Name: "PL2", Prefixes: []string{"172.16.0.0/12"}},
+		},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"P": {
+				Name: "P",
+				Terms: []*config.PolicyTerm{
+					{Name: "t1", PrefixList: []string{"PL1", "PL2"}, Action: "accept"},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+	got := m.generatePolicyOptions(po)
+	for _, want := range []string{
+		"match ip address prefix-list PL1",
+		"match ip address prefix-list PL2",
+		"route-map P permit 10",
+		"route-map P permit 20",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	if n := strings.Count(got, "route-map P permit "); n != 2 {
+		t.Errorf("expected 2 permit term sequences (one per prefix-list, OR), got %d:\n%s", n, got)
+	}
+}
+
+// Different match TYPES AND, same type ORs: `from { community c1; community c2;
+// as-path a1; }` = (c1 OR c2) AND a1. The cross-product renders as two
+// sequences {c1,a1} and {c2,a1}; each carries the as-path match (AND).
+func TestPolicyTermMultiCommunity_ANDAsPath_CrossProduct(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		Communities: map[string]*config.CommunityDef{
+			"C1": {Name: "C1", Members: []string{"65000:1"}},
+			"C2": {Name: "C2", Members: []string{"65000:2"}},
+		},
+		ASPaths: map[string]*config.ASPathDef{"A1": {Name: "A1", Regex: "65001"}},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"P": {
+				Name: "P",
+				Terms: []*config.PolicyTerm{
+					{Name: "t1", FromCommunity: []string{"C1", "C2"}, FromASPath: []string{"A1"}, Action: "accept"},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+	got := m.generatePolicyOptions(po)
+	// Two sequences, each ANDing the single as-path with one community.
+	if n := strings.Count(got, "route-map P permit "); n != 2 {
+		t.Errorf("expected 2 permit sequences (|C|*|A| = 2), got %d:\n%s", n, got)
+	}
+	if n := strings.Count(got, "match as-path A1"); n != 2 {
+		t.Errorf("as-path must AND into BOTH community sequences, got %d match lines:\n%s", n, got)
+	}
+	if !strings.Contains(got, "match community C1") || !strings.Contains(got, "match community C2") {
+		t.Errorf("both communities must render:\n%s", got)
+	}
+}
+
+// A single-match term must still render exactly ONE sequence (no churn /
+// regression of the common case).
+func TestPolicyTermSingleMatch_NoExtraSequences(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		Communities: map[string]*config.CommunityDef{"C1": {Name: "C1", Members: []string{"65000:1"}}},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"P": {
+				Name:          "P",
+				Terms:         []*config.PolicyTerm{{Name: "t1", FromCommunity: []string{"C1"}, Action: "accept"}},
+				DefaultAction: "reject",
+			},
+		},
+	}
+	got := m.generatePolicyOptions(po)
+	if n := strings.Count(got, "route-map P permit "); n != 1 {
+		t.Errorf("single-match term must render exactly 1 permit sequence, got %d:\n%s", n, got)
+	}
+	if !strings.Contains(got, "route-map P permit 10\n") || !strings.Contains(got, "route-map P deny 20\n") {
+		t.Errorf("single-match term must keep historical seq numbers (10, 20):\n%s", got)
 	}
 }

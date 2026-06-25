@@ -1192,7 +1192,7 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			// body) is the only structure where each family's routes hit a
 			// sequence they can satisfy (#2607; the same AND finding that
 			// drove #2071's single-matcher decision).
-			emitTermBody := func(seqFam string, seqNum int, rfs []indexedRouteFilter, plName string) {
+			emitTermBody := func(seqFam string, seqNum int, rfs []indexedRouteFilter, plName, fromPrefixList, fromCommunity, fromASPath string) {
 				fmt.Fprintf(&b, "route-map %s %s %d\n", name, action, seqNum)
 
 				// Inline prefix-list for this sequence's route-filters.
@@ -1248,7 +1248,7 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 					}
 				}
 
-				if term.PrefixList != "" {
+				if fromPrefixList != "" {
 					// Choose the address-family matcher from the referenced
 					// prefix-list's entries, mirroring the route-filter match
 					// branch above. FRR keeps `ip` and `ipv6` prefix-lists in
@@ -1266,8 +1266,17 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 					// not pick up a `match ip/ipv6` clause that would AND-NOMATCH
 					// its own family's routes (the #2071 co-resident collision,
 					// avoided by construction here).
+					//
+					// fromPrefixList is ONE entry of a possibly multi-valued
+					// `from prefix-list` set (#2642). Multiple entries match
+					// with OR ("any") semantics, but FRR's route_map_add_match
+					// REPLACES a same-type rule (lib/routemap.c), so two `match
+					// ip address prefix-list` lines in one index keep only the
+					// last. OR is therefore expressed by one route-map SEQUENCE
+					// per entry (the dispatch loop below), each carrying the full
+					// term body — exactly the #2607 split structure.
 					matchKW := "ip"
-					if pl := po.PrefixLists[term.PrefixList]; pl != nil {
+					if pl := po.PrefixLists[fromPrefixList]; pl != nil {
 						for _, p := range pl.Prefixes {
 							if strings.Contains(p, ":") {
 								matchKW = "ipv6"
@@ -1276,7 +1285,7 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 						}
 					}
 					if seqFam == "" || (seqFam == "v6" && matchKW == "ipv6") || (seqFam == "v4" && matchKW == "ip") {
-						fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, term.PrefixList)
+						fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, fromPrefixList)
 					}
 				}
 
@@ -1291,12 +1300,18 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 					fmt.Fprintf(&b, " match source-protocol %s\n", proto)
 				}
 
-				if term.FromCommunity != "" {
-					fmt.Fprintf(&b, " match community %s\n", term.FromCommunity)
+				// fromCommunity / fromASPath are ONE entry of a possibly
+				// multi-valued `from community` / `from as-path` set (#2642).
+				// Junos OR's repeated same-type matches; FRR can hold only one
+				// `match community` / `match as-path` rule per route-map index
+				// (route_map_add_match replaces same-type), so OR is expressed
+				// by emitting one SEQUENCE per entry (dispatch loop below).
+				if fromCommunity != "" {
+					fmt.Fprintf(&b, " match community %s\n", fromCommunity)
 				}
 
-				if term.FromASPath != "" {
-					fmt.Fprintf(&b, " match as-path %s\n", term.FromASPath)
+				if fromASPath != "" {
+					fmt.Fprintf(&b, " match as-path %s\n", fromASPath)
 				}
 
 				// then actions
@@ -1362,30 +1377,76 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			// homogeneous or empty route-filter set renders as today — ONE
 			// sequence, ONE plName, byte-identical output (no churn for the
 			// common case).
+			// Two independent OR-dimensions can each multiply the number of
+			// emitted sequences:
+			//   (a) route-filters that genuinely mix families (#2607) - one
+			//       sequence per family; and
+			//   (b) repeated same-type `from prefix-list` / `from community`
+			//       / `from as-path` matches (#2642) - Junos OR's them, but
+			//       FRR holds only one rule of each match TYPE per route-map
+			//       index (route_map_add_match replaces same-type), so OR is
+			//       expressed as one sequence per value.
+			// Different match types must AND, the same type must OR. The
+			// correct structure is the CARTESIAN PRODUCT of the OR-sets: each
+			// emitted sequence carries exactly one prefix-list, one community,
+			// one as-path (plus its family's route-filter match, all
+			// source-protocol lines, and all set actions). A route that
+			// satisfies (any prefix-list) AND (any community) AND (any as-path)
+			// reaches at least one sequence it fully matches - the Junos
+			// "(p1|p2) AND (c1|c2) AND ..." semantics.
+			//
+			// The common single-valued / no-match case collapses to ONE
+			// sequence with the historical plName, byte-identical to master:
+			// each OR-set defaults to a single "" sentinel.
 			plName := name + "-" + term.Name
 			v4rf, v6rf := partitionRouteFiltersByFamily(term.RouteFilters)
-			if len(term.RouteFilters) > 0 && len(v4rf) > 0 && len(v6rf) > 0 {
-				// Mixed-family term: two sequences. Each carries its own
-				// family's route-filter entries into a per-family prefix-list
-				// (plName_v4 / plName_v6 — FRR `ip` vs `ipv6` prefix-lists are
-				// separate namespaces anyway, but the distinct NAME keeps the
-				// two match lines referencing disjoint, single-family lists so
-				// neither can pick up an off-family entry). v4 sequence first
-				// (lower seq), then v6; each gets its own +10 seq slot.
-				emitTermBody("v4", seq, v4rf, plName+"_v4")
-				seq += 10
-				emitTermBody("v6", seq, v6rf, plName+"_v6")
-				seq += 10
+			mixedFamily := len(term.RouteFilters) > 0 && len(v4rf) > 0 && len(v6rf) > 0
+
+			// orElseEmpty yields the OR-set to iterate: the field's values, or
+			// a single "" sentinel so a missing match still emits one sequence
+			// (the per-clause guards skip the empty value).
+			orElseEmpty := func(vs []string) []string {
+				if len(vs) == 0 {
+					return []string{""}
+				}
+				return vs
+			}
+
+			// emitVariants emits the cross-product of the three from-* OR sets
+			// for one route-filter family group (seqFam/rfs/famPL), advancing
+			// seq by 10 per sequence. The iteration order (prefix-list,
+			// community, as-path) is fixed, so output is deterministic.
+			emitVariants := func(seqFam string, rfs []indexedRouteFilter, famPL string) {
+				for _, pl := range orElseEmpty(term.PrefixList) {
+					for _, comm := range orElseEmpty(term.FromCommunity) {
+						for _, asp := range orElseEmpty(term.FromASPath) {
+							emitTermBody(seqFam, seq, rfs, famPL, pl, comm, asp)
+							seq += 10
+						}
+					}
+				}
+			}
+
+			if mixedFamily {
+				// Mixed-family route-filters: split into a v4 group and a v6
+				// group (#2607), each carrying its own family's route-filter
+				// entries into a per-family prefix-list (plName_v4 / plName_v6 -
+				// FRR `ip` vs `ipv6` prefix-lists are separate namespaces anyway,
+				// but the distinct NAME keeps the two match lines referencing
+				// disjoint single-family lists). Within each group the from-* OR
+				// cross-product is emitted; v4 first.
+				emitVariants("v4", v4rf, plName+"_v4")
+				emitVariants("v6", v6rf, plName+"_v6")
 			} else {
-				// Single sequence — homogeneous or no route-filters. Pass the
+				// Homogeneous or no route-filters: one family group. Pass the
 				// full (possibly empty) indexed route-filter set and the
-				// historical plName so the output is byte-identical to master.
+				// historical plName. With no repeated from-* matches this is a
+				// single sequence, byte-identical to master.
 				all := make([]indexedRouteFilter, len(term.RouteFilters))
 				for i, rf := range term.RouteFilters {
 					all[i] = indexedRouteFilter{i, rf}
 				}
-				emitTermBody("", seq, all, plName)
-				seq += 10
+				emitVariants("", all, plName)
 			}
 		}
 
