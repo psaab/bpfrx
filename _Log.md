@@ -15727,3 +15727,33 @@ top.
   userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
   userspace-dp/src/afxdp/umem/tests.rs,
   userspace-dp/src/filter/tests.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2621 — verified codex review-040 finding 040-07
+  (input-filter forwarding-class/DSCP/policer modifiers before a
+  routing-instance/PBR term "dropped") is a FALSE POSITIVE, and added a
+  regression guard. The split PBR/non-PBR session-miss evaluators in
+  filter/engine/eval.rs DO discard fc/dscp/policer from the FilterResult
+  returned on a matched routing-instance term — but that FilterResult feeds
+  ONLY the verdict + log on the miss path (NonPbrInputFilterEval reads
+  action/log_match only; afxdp/poll_descriptor/filter.rs:78-154). The
+  forwarding-class queue, DSCP rewrite, and three-color policer are enforced
+  at TX time via resolve_cos_tx_selection / resolve_cached_cos_tx_selection
+  (afxdp/tx/cos_classify.rs), which re-walk the FULL ingress filter through
+  the TX-selection evaluators (filter/engine/tx_selection.rs +
+  cache_sensitive.rs). Those evaluators ACCUMULATE fc/dscp/three_color_policer
+  across every matched fall-through term (merge_matched_tx_modifiers /
+  merge_matched_cached_modifiers) and only return at the terminating
+  routing-instance term (the last relevant term) — so the earlier classify
+  term's modifiers ARE recovered. tx_selection_enabled_v{4,6} is set whenever
+  has_input_tx_selection (fc/dscp) or has_input_three_color_policer is true,
+  so the TX pass actually runs for such a filter. The single-rate
+  `then policer NAME` maps to a three_color_policer (compiler.rs:533);
+  FilterResult.policer_name is never consumed in afxdp (informational only).
+  Empirically confirmed with a unit test (live + cached TX selection at the
+  PBR-overridden egress returns EF queue + DSCP 46 + policer drop) and an
+  independent Codex source audit covering all four runtime paths (session-miss
+  first packet, session-hit, cache-hit, generated-reply — all recover). No
+  code fix; the deliverable is two named regression guards that pin the
+  recovery and go RED if the split is ever reintroduced into the TX path.
+  **File(s)**: userspace-dp/src/afxdp/tx/cos_classify_tests.rs, _Log.md
