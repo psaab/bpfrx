@@ -234,6 +234,92 @@ func TestGenericSuccessSubstringMismatch(t *testing.T) {
 	}
 }
 
+// TestGenericOKTokenMatch is the #2838 FAIL-ON-REVERT guard for the generic
+// backend's success classifier. The old matcher used strings.Contains against a
+// default set that included the bare token "ok", so an explicit provider FAILURE
+// body that merely CONTAINS "ok"/"good" ("not ok", "error: ok token invalid",
+// "update not good") was wrongly classified as a completed update — Surface A
+// then recorded ownership and suppressed retry, leaving DNS stale. This test
+// pins token-bounded matching: a default-token success is a whole token / the
+// leading field of a line; a negative response that only contains a token as a
+// substring is a FAILURE. Reverting to the substring match turns the negative
+// cases green again, which fails this test.
+func TestGenericOKTokenMatch(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		// okResponse: "" means use the default token set; non-empty pins it.
+		okResponse string
+		wantOK     bool
+	}{
+		// Default-token SUCCESS cases must keep passing.
+		{name: "bare ok line", body: "ok\n", wantOK: true},
+		{name: "uppercase OK line", body: "OK\n", wantOK: true},
+		{name: "good with ip (dyndns2 shape)", body: "good 198.51.100.7\n", wantOK: true},
+		{name: "nochg with ip", body: "nochg 198.51.100.7\n", wantOK: true},
+		{name: "ok updated multiword", body: "OK updated\n", wantOK: true},
+		// The #2838 false-success cases: a substring hit that is NOT a success.
+		{name: "not ok", body: "not ok\n", wantOK: false},
+		{name: "error ok token invalid", body: "error: ok token invalid\n", wantOK: false},
+		{name: "update not good", body: "update not good\n", wantOK: false},
+		{name: "notok glued", body: "notok\n", wantOK: false},
+		{name: "html ok button", body: "<html><body><button>OK</button></body></html>\n", wantOK: false},
+		// Explicit ok-response is matched the same whole-token way.
+		{name: "explicit good success", body: "good\n", okResponse: "good", wantOK: true},
+		{name: "explicit good not matched in noise", body: "this is not good news\n", okResponse: "good", wantOK: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			b, err := newGenericBackend(&config.DDNSProvider{
+				Name: "g", Backend: "generic",
+				URLTemplate: srv.URL + "/u?h=%h&i=%i",
+				OKResponse:  tc.okResponse,
+			})
+			if err != nil {
+				t.Fatalf("newGenericBackend: %v", err)
+			}
+			err = b.UpsertLease(context.Background(), hostRecord(t, "h.example.net", "198.51.100.7"))
+			if tc.wantOK && err != nil {
+				t.Fatalf("body %q must be SUCCESS, got error: %v", tc.body, err)
+			}
+			if !tc.wantOK && err == nil {
+				t.Fatalf("body %q must be FAILURE, got success (false-success regression #2838)", tc.body)
+			}
+		})
+	}
+}
+
+// TestMatchesGenericOKUnit exercises the matcher directly, including the
+// dyndns2-shared default tokens (good/nochg) that the generic default set must
+// continue to accept, and confirms substring-only hits are rejected.
+func TestMatchesGenericOKUnit(t *testing.T) {
+	def := defaultGenericOKTokens
+	cases := []struct {
+		body   string
+		tokens []string
+		want   bool
+	}{
+		{"good", def, true},
+		{"nochg", def, true},
+		{"GOOD 1.2.3.4", def, true},
+		{"ok", def, true},
+		{"not ok", def, false},
+		{"update not good", def, false},
+		{"error: ok", def, false},
+		{"", def, false},
+		{"good", nil, false}, // empty token set never matches
+	}
+	for _, tc := range cases {
+		if got := matchesGenericOK(tc.body, tc.tokens); got != tc.want {
+			t.Errorf("matchesGenericOK(%q, %v) = %v, want %v", tc.body, tc.tokens, got, tc.want)
+		}
+	}
+}
+
 func TestGenericRenderUnit(t *testing.T) {
 	got := renderGenericURL("https://x/u?h=%h&i=%i&p=%p&lit=%%", "host.tld", "1.2.3.4", "", "p@ss")
 	if !strings.Contains(got, "h=host.tld") || !strings.Contains(got, "i=1.2.3.4") {
