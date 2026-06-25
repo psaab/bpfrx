@@ -98,11 +98,25 @@ pub(crate) struct SourceNatFlowKey {
 }
 
 impl SourceNatFlowKey {
-    pub(super) fn persistent_source_key(self) -> PersistentSourceKey {
+    /// #2397: build the persistent-NAT lease key for this flow.
+    ///
+    /// `permit_any_remote_host == true` (Junos default) keeps the historical
+    /// behavior: the lease is keyed by the local source tuple only, so any
+    /// remote host reuses the same translated mapping. When `false` (Junos
+    /// target-host[-port] scoping) the remote endpoint (destination ip/port)
+    /// is folded into the key, binding the persistent mapping to the original
+    /// remote: a second flow from the same source to a different remote 5-tuple
+    /// keys to a distinct lease and is allocated a fresh mapping.
+    pub(super) fn persistent_source_key(self, permit_any_remote_host: bool) -> PersistentSourceKey {
         PersistentSourceKey {
             protocol: self.protocol,
             src_ip: self.src_ip,
             src_port: self.src_port,
+            remote: if permit_any_remote_host {
+                None
+            } else {
+                Some((self.dst_ip, self.dst_port))
+            },
         }
     }
 }
@@ -565,6 +579,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     0,
                     rule.address_persistent,
                     rule.persistent_nat,
+                    rule.persistent_nat_permit_any_remote_host,
                     rule.persistent_nat_timeout_ns,
                     now_ns,
                 ) {
@@ -616,6 +631,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     v6_offset,
                     rule.address_persistent,
                     rule.persistent_nat,
+                    rule.persistent_nat_permit_any_remote_host,
                     rule.persistent_nat_timeout_ns,
                     now_ns,
                 ) {

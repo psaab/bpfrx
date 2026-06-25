@@ -164,6 +164,19 @@ type SurfaceAStatusView struct {
 // DHCP-lease Manager (different ownership semantics — self-owned vs DHCID — and
 // a different state file), but it drives the SAME Backend interface and the
 // SAME record/scope/durability primitives.
+//
+// Lock discipline (#2778): m.mu guards ALL manager state — the durable store,
+// the runtime cache, and the counters — but it is NEVER held across provider
+// network I/O (UpsertLease/DeleteLease run with a 15s client timeout). A pass
+// snapshots the exact intent under the lock (the resolved backend + record +
+// the durably-written ownership write-ahead), RELEASES the lock to perform the
+// wire op, then RE-ACQUIRES it to commit the result, re-validating that the
+// scope's desired ownership has not changed while unlocked (the racing-op CAS).
+// This keeps `show system services dynamic-dns`, metric scrapes, and other
+// scopes responsive while one provider is slow or hung. The single-flight guard
+// in the daemon (surfaceAReconcileInFlight) means two full passes never run
+// concurrently, but StatusViews/Stats and any future caller must not block on
+// provider I/O — hence the lock is released around every wire call.
 type SurfaceAManager struct {
 	mu    sync.Mutex
 	state *ddnsState // durable ownership store (interface-ddns-state.json)
@@ -343,6 +356,19 @@ func (m *SurfaceAManager) seedFromStore() {
 	}
 }
 
+// providerIO performs ONE provider network call (UpsertLease/DeleteLease) with
+// m.mu RELEASED, then re-acquires the lock before returning (#2778). The caller
+// MUST hold m.mu on entry and will hold it again on return. Releasing the lock
+// around the (up-to-15s) wire op is the whole point: a slow or hung provider
+// must not block StatusViews/Stats/other-scope reconcile work. The function is
+// careful to re-acquire the lock even if fn panics, so the deferred Unlock in
+// Reconcile stays balanced (a panicking backend would otherwise double-unlock).
+func (m *SurfaceAManager) providerIO(fn func() error) error {
+	m.mu.Unlock()
+	defer m.mu.Lock()
+	return fn()
+}
+
 // Reconcile drives one Surface A reconcile pass over the configured scopes
 // (plan §5.5/§5.6). For each scope it: observes the current address; applies
 // the per-RG HA gate; runs change-detection + forced-refresh + error backoff;
@@ -502,6 +528,16 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 			// sentinel (not a pass error).
 			return nil
 		}
+		if errors.Is(err, errSurfaceAPublishRaced) {
+			// The wire add succeeded but a concurrent op changed the scope's
+			// ownership while the lock was released for the I/O (#2778). Do NOT
+			// advance the runtime cache to a value the live ownership no longer
+			// agrees with, and do NOT arm backoff (the wire op worked). The next
+			// reconcile converges the current desired state. Note: `rt` here may be
+			// the entry a concurrent withdraw deleted from m.runtime — advancing it
+			// would resurrect a stale map entry, so we swallow without touching rt.
+			return nil
+		}
 		m.recordScopeError(rt, sc, err, now)
 		return err
 	}
@@ -530,13 +566,32 @@ const surfaceAIdentity = "router-self"
 // counted no-backend skip that re-attempts next cycle (#2691 P3 review MAJOR).
 var errSurfaceANoBackend = errors.New("ddns surface-a: no live backend for provider")
 
+// errSurfaceAPublishRaced is returned by publishLocked when the wire add
+// SUCCEEDED but a concurrent op changed the scope's owned record while the lock
+// was released for the I/O (#2778). It is NOT a failure (the wire op worked, the
+// counter advanced) and NOT a clean success for THIS desired state — the live
+// ownership now reflects a newer intent. reconcileScopeLocked treats it as a
+// no-op for the runtime cache (do not advance lastAddr/lastPublished, do not arm
+// backoff); the next reconcile converges whatever the current desired state is.
+var errSurfaceAPublishRaced = errors.New("ddns surface-a: publish raced a concurrent ownership change")
+
 // publishLocked publishes the scope's record through the resolved Backend and
 // records ownership write-ahead (the same durability discipline as the lease
 // path, #2662). The ownership key fixes Address="" so a scope owns exactly one
 // record: an address change REPLACES the rdata via the backend's atomic
 // in-place self-owned replace (rfc2136Updater.sendAddSelfOwned: a single UPDATE
 // that delete-RRsets our forward type then inserts the new rdata), never a
-// withdraw-then-add that would blackhole. Caller holds m.mu.
+// withdraw-then-add that would blackhole.
+//
+// Lock discipline (#2778): the caller holds m.mu on entry and exit, but the
+// lock is RELEASED around the wire UpsertLease (via providerIO) so a slow/hung
+// provider cannot block other manager ops. Everything that touches manager
+// state — backend/record construction, the ownership write-ahead + save, the
+// counters, the last-published cache — happens UNDER the lock; only the wire
+// call is unlocked. After the unlocked wire op the result is committed under
+// the re-acquired lock with a racing-op re-validation: if a concurrent op
+// changed the scope's owned record while we were unlocked, the stale wire
+// result is NOT allowed to clobber the newer ownership (see below).
 func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, addr netip.Addr, now time.Time) error {
 	backend, err := m.backendFor(sc)
 	if err != nil {
@@ -599,23 +654,58 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 		return fmt.Errorf("ddns surface-a: cannot durably record ownership before publish: %w", err)
 	}
 
-	if err := backend.UpsertLease(ctx, rec); err != nil {
+	// Perform the wire UpsertLease with m.mu RELEASED (#2778): the 15s-timeout
+	// provider call must not block StatusViews/Stats/other scopes. The ownership
+	// write-ahead above is already durable, so a crash during the unlocked window
+	// still finds the record owned and the next reconcile converges it.
+	wireErr := m.providerIO(func() error { return backend.UpsertLease(ctx, rec) })
+
+	// Re-acquired the lock. Re-validate that THIS publish's write-ahead is still
+	// the live owned record before acting on the (possibly stale) wire result. A
+	// concurrent op (a racing reconcile, a withdraw, a removed-binding cleanup)
+	// could have replaced or deleted the ownership entry while we were unlocked;
+	// if so, the newer state wins and we must NOT clobber it with a rollback or a
+	// stale success — just report the wire outcome and let the next pass converge.
+	cur, stillOwned := m.state.get(sc.Key, surfaceAIdentity, "")
+	stale := !stillOwned || cur.AddrText != ow.AddrText
+	if wireErr != nil {
 		// Hard add failure: the record is NOT live with the new rdata. Restore
 		// the previous durable ownership (the old address is still live) so we
 		// do not claim an address we failed to publish. A conflict refusal
 		// (name owned by another party) also lands here — Surface A does not
 		// adopt a third party's name.
-		if hadPrev {
-			m.state.put(prevOwned)
-		} else {
-			m.state.delete(sc.Key, surfaceAIdentity, "")
+		//
+		// Racing-op guard (#2778): only roll back if OUR write-ahead is still the
+		// live entry. If a concurrent op already changed the owned record while we
+		// were unlocked, rolling back to prevOwned would clobber the newer truth —
+		// leave it alone and let the next reconcile converge.
+		if !stale {
+			if hadPrev {
+				m.state.put(prevOwned)
+			} else {
+				m.state.delete(sc.Key, surfaceAIdentity, "")
+			}
+			_ = m.state.save()
 		}
-		_ = m.state.save()
 		m.upsertFail++
-		if errors.Is(err, errDDNSConflictRefused) {
-			return fmt.Errorf("ddns surface-a: %s is owned by another party (refused): %w", rec.FQDN, err)
+		if errors.Is(wireErr, errDDNSConflictRefused) {
+			return fmt.Errorf("ddns surface-a: %s is owned by another party (refused): %w", rec.FQDN, wireErr)
 		}
-		return fmt.Errorf("ddns surface-a: publish %s %s=%s: %w", rec.ForwardType, rec.FQDN, addr, err)
+		return fmt.Errorf("ddns surface-a: publish %s %s=%s: %w", rec.ForwardType, rec.FQDN, addr, wireErr)
+	}
+
+	if stale {
+		// The wire add succeeded, but a concurrent op changed the scope's desired
+		// ownership while we were unlocked. The owned record now reflects the
+		// newer intent (or the scope was withdrawn); count the successful wire op
+		// for honesty but do NOT advance the (caller-owned) last-published cache
+		// to a value the live ownership no longer agrees with — the next reconcile
+		// reconciles the current desired state. Signal the caller via a sentinel
+		// so it skips the lastAddr/lastPublished advance.
+		m.upsertOK++
+		slog.Debug("ddns surface-a: publish raced a concurrent ownership change; not advancing cache",
+			"fqdn", rec.FQDN, "published", addr.String())
+		return errSurfaceAPublishRaced
 	}
 
 	// Success. If the address CHANGED (replace), the self-owned add already
@@ -646,6 +736,15 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 // deleteOK) and leaves the entry so the next reconcile retries. A no-op backend
 // (provider unresolvable) is treated as a FAILURE — it did NOT remove the RR, so
 // it must not report success nor drop ownership (which would orphan the RR).
+//
+// Lock discipline (#2778): the caller holds m.mu on entry and exit, but the lock
+// is RELEASED around the wire DeleteLease (via providerIO) so a slow/hung
+// provider cannot block other manager ops. After the unlocked delete the
+// ownership drop is committed under the re-acquired lock with a racing-op
+// re-validation: the entry is dropped only if it is STILL the exact record we
+// deleted (same scope+identity+address-text). If a concurrent publish re-asserted
+// the scope with a different address while we were unlocked, we must NOT drop the
+// newer ownership — that would orphan the freshly-published RR.
 func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRecord, backend DNSUpdater) error {
 	a, err := netip.ParseAddr(owned.AddrText)
 	if err != nil {
@@ -672,11 +771,27 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 		m.deleteFail++
 		return err
 	}
-	if err := backend.DeleteLease(ctx, rec); err != nil {
+	// Perform the wire DeleteLease with m.mu RELEASED (#2778): the 15s-timeout
+	// provider call must not block StatusViews/Stats/other scopes.
+	wireErr := m.providerIO(func() error { return backend.DeleteLease(ctx, rec) })
+	if wireErr != nil {
 		m.deleteFail++
-		return fmt.Errorf("ddns surface-a: withdraw %s %s: %w", owned.ForwardType, owned.FQDN, err)
+		return fmt.Errorf("ddns surface-a: withdraw %s %s: %w", owned.ForwardType, owned.FQDN, wireErr)
 	}
 	m.deleteOK++
+
+	// Racing-op guard (#2778): drop ownership only if the live entry is STILL the
+	// exact record we deleted. A concurrent publish could have re-asserted this
+	// scope (new address) while we were unlocked; that publish re-wrote the owned
+	// record (a different AddrText) and already drove its own wire add. Dropping
+	// it here would orphan the freshly-published RR. Leave the newer entry; the
+	// next reconcile converges it.
+	cur, stillOwned := m.state.get(owned.scopeOf(), owned.Identity, owned.Address)
+	if stillOwned && cur.AddrText != owned.AddrText {
+		slog.Debug("ddns surface-a: withdraw raced a concurrent re-publish; keeping newer ownership",
+			"fqdn", owned.FQDN, "withdrew", owned.AddrText, "current", cur.AddrText)
+		return nil
+	}
 	m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
 	delete(m.runtime, owned.scopeOf().scopePrefix())
 	slog.Info("ddns surface-a: withdrew record", "fqdn", owned.FQDN, "addr", owned.AddrText)

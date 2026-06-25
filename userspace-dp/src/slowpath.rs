@@ -467,6 +467,116 @@ where
     }
 }
 
+/// Bound on the WouldBlock/EAGAIN retry spin for a NON-BLOCKING packet fd
+/// (#2438). The WG/GRE local-delivery TUN fds are opened `O_NONBLOCK`, so a
+/// transient EAGAIN is normal backpressure, not an anomaly — we retry the
+/// WHOLE packet rather than drop it. But the retry must be bounded so a
+/// genuinely stuck device (full kernel TUN queue with no drainer) cannot wedge
+/// the delivery thread in an unbounded busy-spin. After this many EAGAINs we
+/// give up and drop the single packet (counted by the caller); the next packet
+/// gets a fresh budget. The TUN egress queue is drained by the kernel routing
+/// stack, so in practice EAGAIN clears within a few iterations.
+const NONBLOCK_WOULDBLOCK_RETRY_BUDGET: u32 = 1024;
+
+/// Synthetic errno for the exhausted-WouldBlock-budget drop (#2438) so the
+/// caller's fatal-errno classifier sees a NON-fatal, per-packet condition
+/// (matching how a real transient EAGAIN would be classified) rather than a
+/// hard fd-death code. `ENOBUFS` is the natural "queue full, packet dropped"
+/// errno and is non-fatal in the WG/GRE write predicates.
+const WOULDBLOCK_EXHAUSTED_ERRNO: i32 = libc::ENOBUFS;
+
+/// Write one whole packet to a NON-BLOCKING packet-oriented fd (the WG/GRE
+/// local-delivery TUN devices, opened `O_NONBLOCK`).
+///
+/// This is the non-blocking sibling of `write_packet_atomic` (#2438). The
+/// packet-device semantics are identical — each `write()` injects exactly one
+/// L3 packet, there is NO byte-stream resume, so a "remainder" write of
+/// `buf[n..]` after a short count would inject the leftover bytes as a SECOND,
+/// malformed packet (the #2407 corruption that std `Write::write_all` causes on
+/// a packet fd). The ONE behavioural difference from the blocking helper is the
+/// EAGAIN/`WouldBlock` arm:
+///
+///   * `EINTR` — the write never started; retry the WHOLE packet.
+///   * `WouldBlock`/`EAGAIN` — the fd is non-blocking and the TUN queue is
+///     momentarily full; this is legitimate backpressure, NOT a per-packet
+///     fault. Retry the WHOLE packet (never `buf[n..]`), bounded by
+///     `NONBLOCK_WOULDBLOCK_RETRY_BUDGET` so a stuck device cannot wedge the
+///     thread. On the (blocking) slow path #2407 dropped here because EAGAIN
+///     could not legitimately occur on its blocking fd — dropping here would
+///     lose packets under load, which is exactly the #2438 bug.
+///   * full count (`rc == len`) — success.
+///   * partial (`0 < rc < len`) — the packet is unsendable as written and a
+///     resubmit would corrupt the device stream; DROP it (Err — counted as a
+///     dropped packet + write error). Never resume `buf[n..]`.
+///   * `rc == 0` or any other negative errno — `Err` (drop).
+///
+/// Returns the underlying `io::Error` on failure so the caller's fatal-errno
+/// classifier (`local_tunnel_write_error_is_fatal`) keeps working. The
+/// exhausted-budget drop surfaces as `ENOBUFS` (non-fatal — drop the packet,
+/// keep the thread).
+///
+/// `writer(len)` performs one `write(fd, buf, len)` and returns its raw result
+/// (mirroring `libc::write`: a byte count on success, `-1` with `errno` set on
+/// error). It is a seam so the short-count / EINTR / EAGAIN behaviour is
+/// unit-testable without a real non-blocking fd.
+fn write_packet_atomic_nonblocking<F>(len: usize, mut writer: F) -> io::Result<()>
+where
+    F: FnMut(usize) -> isize,
+{
+    let mut wouldblock_retries: u32 = 0;
+    loop {
+        let rc = writer(len);
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            match err.kind() {
+                io::ErrorKind::Interrupted => {
+                    // Interrupted before any byte transferred; retry the whole
+                    // packet from offset 0. Does NOT consume the WouldBlock
+                    // budget (a distinct, non-backpressure condition).
+                    continue;
+                }
+                io::ErrorKind::WouldBlock => {
+                    // Non-blocking fd backpressure: the TUN queue is full right
+                    // now. Retry the WHOLE packet — never a partial offset.
+                    // Bounded so a wedged device cannot spin forever.
+                    wouldblock_retries += 1;
+                    if wouldblock_retries > NONBLOCK_WOULDBLOCK_RETRY_BUDGET {
+                        return Err(io::Error::from_raw_os_error(WOULDBLOCK_EXHAUSTED_ERRNO));
+                    }
+                    continue;
+                }
+                _ => return Err(err),
+            }
+        }
+        let n = rc as usize;
+        if n == len {
+            return Ok(());
+        }
+        // A short or zero count on a packet device: the packet cannot be
+        // resumed (re-writing bytes[n..] would inject a corrupt packet), so
+        // drop it. Unexpected for a valid TUN write — dropping avoids
+        // corrupting the device stream (the #2438 / #2407 corruption). Use
+        // EMSGSIZE so the caller classifies it as a non-fatal per-packet
+        // rejection (drop + count), never as fatal fd death.
+        return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
+    }
+}
+
+/// Write one whole packet to a NON-BLOCKING TUN fd (#2438), wrapping
+/// `write_packet_atomic_nonblocking` around a real `libc::write`. Used by the
+/// WG decap inner-delivery path (`wg_control.rs`) and the GRE local-origin
+/// delivery path (`tunnel.rs`), both of which open their TUN `O_NONBLOCK`.
+/// Replaces std `Write::write_all`, whose stream-resume loop corrupts a packet
+/// device on a short count.
+pub(crate) fn write_packet_nonblocking(fd: i32, bytes: &[u8]) -> io::Result<()> {
+    write_packet_atomic_nonblocking(bytes.len(), |buf_len| {
+        // SAFETY: `bytes` is a valid slice for `buf_len` bytes; `fd` is the TUN
+        // fd owned by the caller's thread. Always writes from offset 0 — a TUN
+        // write is one packet, never a partial-offset resubmit.
+        unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), buf_len) }
+    })
+}
+
 fn write_packet_io_uring(
     ring: &mut IoUring,
     fd: i32,
@@ -990,6 +1100,165 @@ mod tests {
             -1
         });
         assert!(res.unwrap_err().contains("slow-path write"));
+    }
+
+    // --- #2438 NON-BLOCKING packet-write helper -----------------------
+    //
+    // These cover the WG/GRE local-delivery TUN write paths
+    // (`write_packet_nonblocking`), whose fds are O_NONBLOCK. The ONE
+    // behavioural difference from the blocking helper is the
+    // WouldBlock/EAGAIN arm: it must RETRY the WHOLE packet (backpressure
+    // on a non-blocking fd is not a fault), never resume `buf[n..]`, and
+    // never drop the packet outright the way the blocking #2407 helper
+    // does.
+
+    /// A normal full write succeeds in a single `write()` (no regression).
+    #[test]
+    fn nb_full_write_succeeds_single_call() {
+        let len = 100usize;
+        let mut calls = 0usize;
+        let res = write_packet_atomic_nonblocking(len, |buf_len| {
+            calls += 1;
+            assert_eq!(buf_len, len, "writer must always be handed the full packet");
+            buf_len as isize
+        });
+        assert!(res.is_ok());
+        assert_eq!(calls, 1, "a full write must not loop");
+    }
+
+    /// #2438 fail-on-revert (corruption): a SHORT count (0 < n < len) on
+    /// the non-blocking packet fd MUST drop the packet (Err) and issue
+    /// EXACTLY ONE write of the FULL length — never a follow-up
+    /// `write(buf[n..])` of `len - n`. The std `Write::write_all` this
+    /// replaced loops on `Ok(n)` and re-writes the remainder, injecting it
+    /// as a second malformed packet (the #2407 corruption class). If that
+    /// loop is restored, the writer is called a second time with `len - n`
+    /// and this fails the call-count + observed-length assertion.
+    #[test]
+    fn nb_short_write_drops_no_remainder() {
+        let len = 100usize;
+        let mut observed_lens = Vec::new();
+        let res = write_packet_atomic_nonblocking(len, |buf_len| {
+            observed_lens.push(buf_len);
+            40 // partial: 40 of 100
+        });
+        let err = res.unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EMSGSIZE),
+            "a partial packet write must be a (non-fatal) drop, got: {err}"
+        );
+        assert_eq!(
+            observed_lens,
+            vec![len],
+            "a partial write must NOT trigger a remainder write — exactly one \
+             full-length write, never a write of buf[n..]"
+        );
+    }
+
+    /// #2438 fail-on-revert (packet loss): WouldBlock/EAGAIN on the
+    /// NON-BLOCKING fd is legitimate backpressure — the helper must RETRY
+    /// the WHOLE packet (offset 0), NOT drop it. The blocking #2407 helper
+    /// drops on EAGAIN (its fd can never legitimately block); doing that
+    /// here would lose packets under load, which is the #2438 bug. This
+    /// asserts the retried write is re-issued at full length and ultimately
+    /// succeeds. If the EAGAIN arm were changed to drop (the blocking
+    /// behaviour), the second full-length write never happens and the
+    /// observed-length vec is `[len]` not `[len, len]`.
+    #[test]
+    fn nb_wouldblock_retries_whole_packet() {
+        let len = 100usize;
+        let mut observed_lens = Vec::new();
+        let mut first = true;
+        let res = write_packet_atomic_nonblocking(len, |buf_len| {
+            observed_lens.push(buf_len);
+            if first {
+                first = false;
+                set_errno(libc::EAGAIN);
+                -1
+            } else {
+                buf_len as isize
+            }
+        });
+        assert!(res.is_ok(), "WouldBlock must retry, not drop");
+        assert_eq!(
+            observed_lens,
+            vec![len, len],
+            "WouldBlock retry must re-issue the WHOLE packet, never buf[n..], \
+             and must not drop it"
+        );
+    }
+
+    /// EINTR retries the WHOLE packet (offset 0), like the blocking helper.
+    #[test]
+    fn nb_eintr_retries_whole_packet() {
+        let len = 100usize;
+        let mut observed_lens = Vec::new();
+        let mut first = true;
+        let res = write_packet_atomic_nonblocking(len, |buf_len| {
+            observed_lens.push(buf_len);
+            if first {
+                first = false;
+                set_errno(libc::EINTR);
+                -1
+            } else {
+                buf_len as isize
+            }
+        });
+        assert!(res.is_ok(), "EINTR must retry, not fail");
+        assert_eq!(
+            observed_lens,
+            vec![len, len],
+            "EINTR retry re-issues the whole packet"
+        );
+    }
+
+    /// A WouldBlock that never clears is bounded: the helper gives up
+    /// after `NONBLOCK_WOULDBLOCK_RETRY_BUDGET` retries and drops the
+    /// packet with a non-fatal `ENOBUFS` (so the caller's fatal-errno
+    /// classifier drops + counts rather than killing the thread). Without
+    /// the bound this would spin forever. The writer is called
+    /// budget-plus-one times, always at full length, never a remainder.
+    #[test]
+    fn nb_wouldblock_budget_is_bounded_and_drops() {
+        let len = 100usize;
+        let mut calls = 0u32;
+        let mut all_full_len = true;
+        let res = write_packet_atomic_nonblocking(len, |buf_len| {
+            calls += 1;
+            if buf_len != len {
+                all_full_len = false;
+            }
+            set_errno(libc::EAGAIN);
+            -1
+        });
+        let err = res.unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ENOBUFS),
+            "exhausted WouldBlock budget drops with non-fatal ENOBUFS, got: {err}"
+        );
+        assert_eq!(
+            calls,
+            NONBLOCK_WOULDBLOCK_RETRY_BUDGET + 1,
+            "the busy-spin must be bounded by the retry budget"
+        );
+        assert!(all_full_len, "every retry must use the WHOLE packet length");
+    }
+
+    /// A hard error (e.g. EBADF) drops with the underlying errno preserved
+    /// so the WG/GRE fatal-errno classifier can act on it.
+    #[test]
+    fn nb_hard_error_preserves_errno() {
+        let res = write_packet_atomic_nonblocking(100, |_| {
+            set_errno(libc::EBADF);
+            -1
+        });
+        assert_eq!(
+            res.unwrap_err().raw_os_error(),
+            Some(libc::EBADF),
+            "hard errno must propagate for fatal-errno classification"
+        );
     }
 
     /// Set the thread-local errno so the seam can simulate `libc::write`'s
