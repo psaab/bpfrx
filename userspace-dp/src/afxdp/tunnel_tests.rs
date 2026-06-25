@@ -191,8 +191,13 @@ fn drain_local_tunnel_deliveries_observes_stop_under_busy_producer() {
     });
     let started = std::time::Instant::now();
     let mut sink: Vec<u8> = Vec::new();
-    let outcome =
-        drain_local_tunnel_deliveries(&mut sink, &rx, &stop, "gre1881drain", &recent);
+    let outcome = {
+        let mut write_packet = |buf: &[u8]| {
+            sink.extend_from_slice(buf);
+            Ok(())
+        };
+        drain_local_tunnel_deliveries(&mut write_packet, &rx, &stop, "gre1881drain", &recent)
+    };
     let elapsed = started.elapsed();
     producer_quit.store(true, Ordering::Relaxed);
     producer.join().expect("producer joins");
@@ -216,8 +221,13 @@ fn drain_local_tunnel_deliveries_drains_then_returns_when_not_stopped() {
     let stop = Arc::new(AtomicBool::new(false));
     let recent = Arc::new(Mutex::new(VecDeque::new()));
     let mut sink: Vec<u8> = Vec::new();
-    let outcome =
-        drain_local_tunnel_deliveries(&mut sink, &rx, &stop, "gre1881drain2", &recent);
+    let outcome = {
+        let mut write_packet = |buf: &[u8]| {
+            sink.extend_from_slice(buf);
+            Ok(())
+        };
+        drain_local_tunnel_deliveries(&mut write_packet, &rx, &stop, "gre1881drain2", &recent)
+    };
     assert!(matches!(outcome, LocalTunnelDrainOutcome::Drained));
     assert_eq!(sink, vec![1, 2, 3, 4, 5], "all queued deliveries written");
 }
@@ -248,26 +258,16 @@ fn local_tunnel_write_error_einval_is_not_fatal() {
 
 #[test]
 fn drain_survives_einval_write_and_thread_keeps_draining() {
-    struct EinvalSink;
-    impl Write for EinvalSink {
-        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-            Err(io::Error::from_raw_os_error(libc::EINVAL))
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
+    // #2438: the write seam is now a closure (was an `impl Write` sink).
+    // A per-packet EINVAL rejection is still non-fatal — drop, record,
+    // keep draining.
+    let mut einval_writer = |_buf: &[u8]| Err(io::Error::from_raw_os_error(libc::EINVAL));
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
     tx.try_send(vec![0u8, 0x50, 0x86, 0xdd]).expect("queued");
     let stop = Arc::new(AtomicBool::new(false));
     let recent = Arc::new(Mutex::new(VecDeque::new()));
-    let outcome = drain_local_tunnel_deliveries(
-        &mut EinvalSink,
-        &rx,
-        &stop,
-        "gre1881einval",
-        &recent,
-    );
+    let outcome =
+        drain_local_tunnel_deliveries(&mut einval_writer, &rx, &stop, "gre1881einval", &recent);
     assert!(
         matches!(outcome, LocalTunnelDrainOutcome::Drained),
         "EINVAL delivery write must NOT be FatalIo — the loop continues"
@@ -276,6 +276,50 @@ fn drain_survives_einval_write_and_thread_keeps_draining() {
         recent.lock().unwrap().len(),
         1,
         "the rejected delivery is recorded as an exception"
+    );
+}
+
+// --- #2438 GRE local-delivery TUN write: whole-packet (non-blocking) --
+//
+// The substantive no-remainder / WouldBlock-retry / partial-drop
+// semantics live in `crate::slowpath::write_packet_nonblocking` (the
+// helper the production drain closure calls) and are fail-on-revert
+// tested there (slowpath.rs `nb_*` tests). At the drain level the
+// invariant to pin is that ONE queued delivery is handed to the write
+// seam EXACTLY ONCE with the WHOLE packet — never a second, remainder
+// write. A restored `Write::write_all` remainder loop would re-issue a
+// `buf[n..]` write on a short count; this asserts that never happens.
+
+#[test]
+fn drain_gre_delivery_calls_write_seam_once_with_whole_packet() {
+    let observed_lens = std::cell::RefCell::new(Vec::<usize>::new());
+    // A short-count drop (EMSGSIZE, the helper's genuine-partial errno).
+    // Non-fatal — the loop continues; the delivery is dropped, not
+    // resumed.
+    let mut short_writer = |buf: &[u8]| -> io::Result<()> {
+        observed_lens.borrow_mut().push(buf.len());
+        Err(io::Error::from_raw_os_error(libc::EMSGSIZE))
+    };
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
+    tx.try_send(vec![0xAAu8; 100]).expect("queued");
+    let stop = Arc::new(AtomicBool::new(false));
+    let recent = Arc::new(Mutex::new(VecDeque::new()));
+    let outcome =
+        drain_local_tunnel_deliveries(&mut short_writer, &rx, &stop, "gre2438short", &recent);
+    assert!(
+        matches!(outcome, LocalTunnelDrainOutcome::Drained),
+        "a short/partial packet write is a non-fatal drop, loop continues"
+    );
+    assert_eq!(
+        observed_lens.into_inner(),
+        vec![100usize],
+        "the delivery write seam must be called exactly ONCE with the \
+         WHOLE 100-byte packet — never a remainder write of len-n"
+    );
+    assert_eq!(
+        recent.lock().unwrap().len(),
+        1,
+        "the dropped delivery is recorded as an exception"
     );
 }
 

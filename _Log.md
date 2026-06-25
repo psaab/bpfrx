@@ -1,3 +1,149 @@
+## 2026-06-25 — #2776: ddns/surface-a static-address fallback is now public-gated
+
+- **Timestamp**: 2026-06-25
+- **Action**: The Surface A static-address fallback (`staticUnitAddr` in
+  `pkg/daemon/daemon_ddns_surface_a.go`, used by `observeInterfaceAddr` when the
+  kernel interface is absent/addressless) filtered only loopback/
+  link-local-unicast/unspecified, while the netlink path also rejected
+  multicast — divergent publishability predicates. A mis-scoped configured
+  static address (multicast, reserved, ULA, CGNAT, documentation, IANA
+  special-purpose) could be published as the router's A/AAAA record. Fix: gate
+  the static candidate through the SAME `ddns.IsPublicAddr` predicate the
+  netlink and checkip sources use. Exported `isPublicAddr` → `IsPublicAddr` in
+  `pkg/ddns/checkip.go` (same package as the existing `#2774` gate; reused, not
+  duplicated — no second IANA range list). A non-public static address is now
+  SKIPPED and surfaced at `slog.Warn` (never-blackhole: a bad static address
+  must not silently publish a martian). Scope kept to the static-fallback path
+  only — no other surface_a address-selection refactor (#2775/#2779/#2780 are
+  separate lanes).
+- **File(s)**: `pkg/ddns/checkip.go` (export `IsPublicAddr` + callers/comment),
+  `pkg/ddns/checkip_test.go` (rename refs), `pkg/daemon/daemon_ddns_surface_a.go`
+  (`staticUnitAddr` gate + WARN), `pkg/daemon/daemon_ddns_surface_a_test.go`
+  (`TestStaticUnitAddr` updated to genuinely-public addrs since the prior fixture
+  used TEST-NET-3/2001:db8 which the gate correctly rejects;
+  `TestStaticUnitAddrPublicGate` fail-on-revert), `pkg/ddns/README.md`.
+- **Fail-on-revert proof**: copied `daemon_ddns_surface_a.go` aside, replaced
+  `ddns.IsPublicAddr(a)` with the OLD partial loopback/link-local/unspecified
+  filter → `go test ./pkg/daemon/ -run StaticUnitAddrPublicGate` went RED (all
+  8 v4 + 5 v6 special-purpose entries returned ok=true, plus the
+  skip-then-select-next-public case failed). Restored from the copy → GREEN.
+- **Gates**: `go build ./...` clean, `gofmt -l` clean, `go vet ./pkg/ddns/...`
+  clean, `go test ./pkg/ddns/...` + `go test ./pkg/daemon/ -run
+  'StaticUnitAddr|SurfaceA'` pass.
+## 2026-06-25 — #2749: flowexport populates ingressInterface (IE 10) with the real ingress ifindex (Go-only; TOS/TCPFlags/Direction/OutIf deferred)
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2613 dropped five NetFlow v9 / IPFIX template fields
+  (SrcTos 5, TCPFlags 6, ingressInterface/InputSNMP 10, egressInterface/
+  OutputSNMP 14, flowDirection 61) because the SESSION_CLOSE close path
+  carried no real value. Investigation found that #2615 since stamps the
+  closing binding's ingress ifindex into the [128:132] slot of the
+  136-byte RT_FLOW close frame (the Rust encoder no longer hardcodes 0),
+  and `pkg/logging/ringbuf.go` already reads it (only to resolve a NAME).
+  So `ingressInterface` (IE 10, an SNMP ifIndex) can be populated with a
+  REAL value **Go-only**, no wire change. Re-introduced it: retain the
+  numeric ifindex on `EventRecord.IngressIfindex`, copy it into
+  `SessionCloseData.InIf` in both daemon flow-export callbacks, thread it
+  to `FlowRecord.InIf` in both `ExportSessionClose` builders, and re-add
+  IE 10 (4B, placed BEFORE the post-NAT trailing block so #2526 offsets
+  are unchanged) to both NetFlow v9 templates + IPFIX v4/v6 templates and
+  their encoders/size constants (IPFIX v4 57→61, v6 105→109; v9 v4 52→56,
+  v6 100→104). The other four #2613 drops stay dropped — no wire source
+  exists (needs the deferred Rust↔Go frame extension + conntrack TOS/flag
+  stamping + egress-ifindex forwarding-path tracking, which remains the
+  #2749 follow-up scope).
+- **File(s)**: pkg/logging/eventbuf.go (EventRecord.IngressIfindex),
+  pkg/logging/ringbuf.go (retain numeric ifindex), pkg/flowexport/manager.go
+  (SessionCloseData.InIf), pkg/daemon/daemon_flowexport.go (sd.InIf =
+  rec.IngressIfindex, both callbacks), pkg/flowexport/netflow.go +
+  pkg/flowexport/ipfix.go (template field + encoder write + size consts +
+  ExportSessionClose population), pkg/flowexport/README.md (#2749 section).
+  Tests: pkg/flowexport/ingress_interface_test.go (NEW fail-on-revert),
+  pkg/flowexport/dropped_fields_test.go + exporter_test.go (drop IE 10
+  from the still-dropped sets), pkg/flowexport/postnat_test.go (record-size
+  literals).
+- **Wire note**: NO wire-format change. The ingress ifindex is already on
+  the SESSION_CLOSE wire ([128:132], #2615); this PR only stops discarding
+  the numeric value on the Go side. protocol_wire_v1.json unchanged; no
+  Rust change.
+- **Fail-on-revert proof**: copy-aside `netflow.go`/`ipfix.go`, removed the
+  `InIf: evt.InIf` assignment from both `ExportSessionClose` builders →
+  `TestIPFIXIngressInterfacePopulated` went RED
+  (`FlowRecord.InIf = 0x00000000, want 0xdeadbeef (population reverted)`);
+  restored from backup → GREEN. Gates: go build ./... clean, gofmt -l
+  (touched files) clean, go vet clean, go test ./pkg/flowexport/...
+  ./pkg/logging/... ./pkg/daemon/... all pass.
+## 2026-06-25 — #2397: persistent-NAT honors permit-any-remote-host=false
+
+- **Timestamp**: 2026-06-25
+- **Action**: Persistent source-NAT ignored `persistent-nat
+  permit-any-remote-host`. The lease was keyed by the local source tuple
+  `(protocol, src_ip, src_port)` only, so the same translated mapping was
+  reused across ANY remote destination — the disabled-flag (Junos
+  target-host scoping) mode was silently a no-op. Fix: `PersistentSourceKey`
+  gained an in-memory `remote: Option<(IpAddr, u16)>` field;
+  `SourceNatFlowKey::persistent_source_key(permit_any_remote_host)` folds the
+  flow's `(dst_ip, dst_port)` into the key when the flag is false (`None`
+  when true, preserving the historical any-remote reuse).
+  `PortAllocator::allocate_translation` takes the flag and threads it to the
+  key builder; both source.rs call sites pass
+  `rule.persistent_nat_permit_any_remote_host`. NOTE: the
+  `permit_any_remote_host` flag was ALREADY plumbed Go→Rust on both wire
+  sides (`pkg/dataplane/userspace/protocol.go`,
+  `userspace-dp/src/protocol/nat.rs`); no new wire field was added — `remote`
+  is purely in-memory allocator state, never serialized, so no
+  protocol_wire_v1.json regen.
+- **File(s)**: userspace-dp/src/nat/allocator.rs,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests.rs,
+  docs/userspace-dataplane-gaps.md, _Log.md
+- **Fail-on-revert proof**: new test
+  `pool_snat_persistent_no_permit_any_remote_scopes_to_remote_host` asserts a
+  second remote 5-tuple gets a DISTINCT mapping (2 leases) while a return to
+  the original remote reuses (1 reuse); sibling
+  `pool_snat_persistent_permit_any_remote_reuses_across_remotes` asserts the
+  flag-true path still shares one lease. Copy-restore revert (forced
+  `remote: None` regardless of flag) drove the disabled-flag test RED
+  (`left == right`, both `(203.0.113.10, 40000)`); restored, all 127 nat::
+  tests green.
+
+## 2026-06-25 — #2778: ddns/surface-a no longer holds the manager mutex across provider I/O
+
+- **Timestamp**: 2026-06-25
+- **Action**: Surface A provider I/O (`UpsertLease`/`DeleteLease`, 15s HTTP
+  client timeout) ran UNDER `SurfaceAManager.mu`, so a slow/hung provider
+  blocked every other Surface A op — `StatusViews` (operator `show`), `Stats`
+  (Prometheus scrape), and other scopes' reconcile work — for up to 15s exactly
+  while the subsystem was unhealthy. Added `providerIO(fn)`: it unlocks `m.mu`,
+  runs the one wire call, and re-acquires the lock (`defer m.mu.Lock()` so a
+  panicking backend cannot leave the deferred `Reconcile` Unlock unbalanced).
+  `publishLocked` now durably write-aheads ownership BEFORE the wire add (crash
+  in the unlocked window still finds the record owned → next pass converges),
+  releases the lock for the `UpsertLease`, then re-acquires and commits with a
+  racing-op CAS: if a concurrent op changed the owned record while unlocked, the
+  stale result is NOT rolled back / advanced (newer ownership wins,
+  `errSurfaceAPublishRaced` tells `reconcileScopeLocked` to leave the runtime
+  cache + backoff untouched). `withdrawOwnedLocked` releases the lock for the
+  `DeleteLease`, then drops ownership only if the live entry is STILL the exact
+  record it deleted (a concurrent re-publish with a new address keeps its
+  ownership, never orphaned). All preserved invariants: never-blackhole,
+  write-ahead-before-add (#2662), withdraw-keeps-ownership-on-error/no-op-backend
+  (#2691 P2 M1), per-RG HA gate (#2664). The daemon single-flight guard
+  (`surfaceAReconcileInFlight`) already serializes full passes; the CAS keeps the
+  contract correct regardless.
+- **File(s)**: `pkg/ddns/surface_a.go` (`providerIO` helper, lock-release +
+  racing-op CAS in `publishLocked`/`withdrawOwnedLocked`, `errSurfaceAPublishRaced`
+  sentinel), `pkg/ddns/surface_a_lockio_test.go` (new fail-on-revert + race
+  tests), `pkg/ddns/README.md` (P2 lock-discipline bullet).
+- **Fail-on-revert proof**: copied `surface_a.go` aside, reverted `providerIO`
+  to call `fn()` with the lock HELD (the #2778 bug), ran the three new tests:
+  all three FAILED with a 2s bounded-wait timeout —
+  `TestSurfaceALockNotHeldDuringUpsert` (StatusViews blocked behind a blocked
+  UpsertLease), `TestSurfaceALockNotHeldDuringDelete` (StatusViews blocked behind
+  a blocked DeleteLease), `TestSurfaceAPublishRaceDoesNotClobberNewerState`
+  (Reconcile #2 blocked behind #1's lock-held publish). Restored from the copy;
+  all pass with the fix. `go build ./...`, `gofmt -l` (clean on touched files),
+  `go vet`, `go test -race ./pkg/ddns/... ./pkg/daemon/...` all green.
+
 ## 2026-06-25 — #2774: ddns/checkip public-address gate covers the full IANA special-purpose registry
 
 - **Timestamp**: 2026-06-25
@@ -16225,6 +16371,34 @@ top.
   pkg/vrrp/addrwatch_test.go, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2438 — WG/GRE local-delivery TUN write paths shared the same
+  short-write packet-corruption class as #2407, but on NON-BLOCKING fds.
+  Both `afxdp/tunnel.rs` (GRE local-origin delivery, via
+  `drain_local_tunnel_deliveries`) and `afxdp/coordinator/wg_control.rs`
+  (WG decap inner-delivery) used std `Write::write_all`, whose `Ok(n)`
+  loop re-writes `buf[n..]` on a short count — injecting the remainder as
+  a second, malformed packet. Added a non-blocking sibling of #2407's
+  whole-packet helper: `slowpath::write_packet_nonblocking` (single
+  `write()`, retries the WHOLE packet on EINTR and on WouldBlock/EAGAIN —
+  legitimate backpressure on an O_NONBLOCK fd, bounded by a 1024 retry
+  budget then drops with non-fatal ENOBUFS; genuine partial drops with
+  non-fatal EMSGSIZE). Returns the underlying io::Error so each path's
+  fatal-errno classifier is unchanged. The GRE drain helper now takes a
+  packet-write closure seam instead of `&mut impl Write`; the WG site
+  calls the helper on `tun.as_raw_fd()`. Internal-only — NO control
+  message field, NO wire change. Fail-on-revert: slowpath
+  `nb_short_write_drops_no_remainder` (one full-length write, never
+  buf[n..]) and `nb_wouldblock_retries_whole_packet` (EAGAIN retries the
+  whole packet, does not drop) — both proven RED by reverting the
+  respective arm (remainder-resume → second write of len-n; EAGAIN→drop →
+  no second write); `nb_wouldblock_budget_is_bounded_and_drops` (no
+  infinite spin); tunnel `drain_gre_delivery_calls_write_seam_once_with_whole_packet`
+  (drain hands the packet to the seam exactly once at full length).
+  **File(s)**: userspace-dp/src/slowpath.rs,
+  userspace-dp/src/afxdp/tunnel.rs,
+  userspace-dp/src/afxdp/tunnel_tests.rs,
+  userspace-dp/src/afxdp/coordinator/wg_control.rs,
+  docs/xdp-io-uring-userspace-dataplane.md, _Log.md
   **Action**: #2781 — DDNSProvider.String() (pkg/config) printed url-template,
   server, and checkip-url verbatim. The generic backend supports credentials
   embedded in the URL template (userinfo or a token in the query string, e.g.
@@ -16269,3 +16443,29 @@ top.
   reconcile coordinator -> 117 passed/0 failed. No Go touched.
   **File(s)**: userspace-dp/src/server/helpers.rs,
   userspace-dp/src/server/tests.rs, userspace-dp/src/server/README.md, _Log.md
+  **Action**: #2445 — the WireGuard commit-time validator
+  (validateWireguardPeersStrict / validateOneWireguardTunnel,
+  pkg/config/compiler_validate_wireguard.go) rejected duplicate/malformed
+  pubkeys but explicitly NOT an exact-duplicate allowed-ips prefix across
+  peers. The cryptokey routing table is a prefix->peer map; an exact tie
+  has no longest-prefix winner, so the engine LPM (allowed_ips.rs, stable
+  sort by prefix length) resolves it by insertion order — the second peer
+  can handshake but never carries traffic for that prefix (silent route
+  strip). Added a per-tunnel prefixOwner map keyed by the canonical masked
+  CIDR (canonicalAllowedIPPrefix: net.ParseCIDR -> IPNet.String, so
+  10.0.0.5/24 and 10.0.0.0/24 collide; unparseable strings keyed verbatim
+  — malformed-prefix validation stays the Rust IpNet boundary's concern,
+  orthogonal to #2445). An exact-duplicate prefix on two DIFFERENT peers is
+  now a hard commit error; broader/narrower OVERLAP (0.0.0.0/0 catch-all +
+  more-specific peer) and a same-peer repeat stay valid. Scope: pkg/config
+  validation + test only; no userspace-dp Rust touched. Fail-on-revert
+  proof: copied compiler_validate_wireguard.go aside, removed the
+  prefixOwner block + decl, ran go test ./pkg/config/ -run
+  TestWireguardDuplicateAllowedIPsPrefix... ->
+  TestWireguardDuplicateAllowedIPsPrefixRejected and
+  TestWireguardDuplicateAllowedIPsPrefixHostBitsRejected both FAILED
+  ("must be a commit error"); restored from the copy, all green. Gates:
+  go build ./... clean, gofmt -l clean, go vet ./pkg/config/... clean,
+  go test ./pkg/config/... pass.
+  **File(s)**: pkg/config/compiler_validate_wireguard.go,
+  pkg/config/wireguard_multipeer_test.go, docs/config-schema.md, _Log.md
