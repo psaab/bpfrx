@@ -1,3 +1,50 @@
+## 2026-06-24 — #2691 P0 / #2676: upsertLocked sentinel ordering — no orphan on PTR-conflict-after-forward-success
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed the orphan where a forward A/AAAA published OK but the
+  reverse PTR add hit a conflict-refusal: UpsertLease double-wrapped both
+  sentinels and upsertLocked checked errDDNSConflictRefused FIRST -> removed
+  the ownership intent -> live forward orphaned. Fix (2 parts): (1)
+  ddns_rfc2136.go UpsertLease classifies a PTR-side conflict-refusal as a
+  PERMANENT counted skip (like NOTAUTH) returning nil -> forward owned,
+  not-pending; no double-wrap. (2) ddns.go upsertLocked checks
+  errDDNSPTRPending BEFORE errDDNSConflictRefused (defense-in-depth: a
+  forward-published error can never reach the no-ownership branch). Added a
+  reconcile-layer test (seeded third-party reverse PTR + skip-existing) that
+  proves forward-owned + third-party-PTR-survives + release-cleans;
+  fail-on-revert verified (both parts reverted -> OwnedRecords=0 orphan).
+- **File(s)**: pkg/dhcpserver/ddns.go, pkg/dhcpserver/ddns_rfc2136.go,
+  pkg/dhcpserver/ddns_manager_inc2_test.go, _Log.md
+
+## 2026-06-24 — #2691 P0 / #2666: warn-only TSIG tuple validation (key<->secret)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Added WARN-only commit-time validation that a TSIG config is
+  a complete RFC 8945 tuple. tsig-key without tsig-secret warns (the
+  backend would sign with an empty key -> runtime BADKEY/BADSIG);
+  tsig-secret without tsig-key warns (signing disabled, secret ignored).
+  Never a hard reject (no-brick posture). Added 5 subtests incl.
+  complete-tuple-silent + does-not-hard-fail; fail-on-revert verified.
+- **File(s)**: pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_dhcp_ddns_test.go, _Log.md
+
+# Action Log
+
+## 2026-06-24 — #2691 P0 / #2667: de-stale DDNS comments + docs (live rfc2136 backend shipped)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Corrected stale "deferred / config-only / increment N"
+  comments that described the now-live RFC 2136 DDNS backend as not-yet-
+  built. Fixed the `ownerWatermark` comment that wrongly claimed nodeID is
+  "folded in" (it never was — the node-INDEPENDENT hash is correct and
+  required for cross-failover cleanup; comment corrected, code unchanged).
+  Fixed the `nodeID` field "HA emission gating is increment 3" claim (the
+  writer gate is live). Updated schema descriptions + docs/config-schema.md
+  + dhcpserver/README.md to state rfc2136 is live and warn-validated.
+- **File(s)**: pkg/dhcpserver/ddns.go, pkg/config/schema_system.go,
+  pkg/config/types_system.go, docs/config-schema.md,
+  pkg/dhcpserver/README.md, _Log.md
+
 # Action Log
 
 ## 2026-06-24 — #2689 review fold: `from as-path` bracket-collapse (sibling reader, same function) — routed through firewallMatchValues + 3 fail-on-revert tests; children-path only (brackets never reach the inline-keys path). Files: pkg/config/compiler_routing.go, pkg/config/policy_from_multileaf_2689_test.go, docs/config-schema.md, _Log.md

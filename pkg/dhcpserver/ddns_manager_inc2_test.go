@@ -733,6 +733,102 @@ func ownedPTRPending(m *DDNSManager, fqdn string) bool {
 	return false
 }
 
+// TestManagerForwardPublishedPTRConflictRecordsOwnership is the #2676
+// regression at the MANAGER level (the layer reconcileOnceLocked drives — the
+// #2648/#2659/#2661 lesson: an updater-in-isolation test misses the orphan;
+// only the reconcile layer surfaces it). Under skip-existing the FORWARD A add
+// SUCCEEDS (its name is unused) but the REVERSE PTR add hits a conflict
+// refusal because the reverse RRset is already owned by another party.
+//
+// Pre-#2676 ordering bug: UpsertLease wrapped the PTR-side
+// errDDNSConflictRefused into a chain carrying BOTH errDDNSConflictRefused AND
+// errDDNSPTRPending; upsertLocked checked errDDNSConflictRefused FIRST →
+// removed the pre-written intent → recorded NO ownership while the forward A
+// was already LIVE → ORPHANED forward (live in the zone, untracked, never
+// cleanable). Post-fix: a PTR-side conflict-refusal is a PERMANENT counted skip
+// (like NOTAUTH) that returns nil; the forward is OWNED, owned-not-pending, and
+// a later release withdraws it.
+//
+// fail-on-revert: restoring UpsertLease to wrap the PTR-conflict as
+// `%w: %w`, err(=errDDNSConflictRefused), errDDNSPTRPending AND restoring
+// upsertLocked to check errDDNSConflictRefused before errDDNSPTRPending
+// re-creates the orphan — cycle 1 OwnedRecords=0 while the A is live, and the
+// release issues no delete, so the A survives untracked → this test goes red.
+func TestManagerForwardPublishedPTRConflictRecordsOwnership(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	// A THIRD PARTY already owns the reverse PTR RRset for 10.0.1.5 — the
+	// forward name (laptop.example.com) is unused, so the forward A add will
+	// SUCCEED; only the reverse PTR add collides.
+	addr := netip.MustParseAddr("10.0.1.5")
+	thirdPartyPTR := &dns.PTR{
+		Hdr: dns.RR_Header{Name: reversePTRName(addr) + ".", Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 300},
+		Ptr: "someone-else.example.net.",
+	}
+	srv.seedRR(thirdPartyPTR)
+
+	m := prodManagerTo(t, srv)
+	cfg := ddnsCfgSkipExisting(srv.addrUDP)
+
+	// Cycle 1: an active v4 lease. Forward A publishes; reverse PTR is refused.
+	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.1.5,aa:bb,01:02:03,3600,1900000000,1,laptop,0
+`)
+	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 1 must not fail the pass on a PTR-only conflict: %v", err)
+	}
+	// The forward A is LIVE in the zone...
+	liveA := &dns.A{Hdr: dns.RR_Header{Name: "laptop.example.com.", Rrtype: dns.TypeA}, A: net.ParseIP("10.0.1.5")}
+	if !srv.zoneHas(liveA) {
+		t.Fatalf("forward A was not published")
+	}
+	// ...and it MUST be OWNED (tracked + cleanable), not orphaned.
+	if got := m.Stats().OwnedRecords; got != 1 {
+		t.Fatalf("#2676: forward published but NOT owned (orphaned); OwnedRecords=%d want 1 (owned=%v)",
+			got, ownedFQDNs(m))
+	}
+	// The third party's PTR must survive — xpf never adopts/overwrites it.
+	if !srv.zoneHas(thirdPartyPTR) {
+		t.Fatalf("#2676: third-party reverse PTR vanished after a refused PTR add")
+	}
+	// A PTR-side conflict-refusal is a PERMANENT skip, NOT a pending retry:
+	// the owned record must NOT be PTR-pending (nothing to retry — the reverse
+	// is permanently another party's).
+	if ownedPTRPending(m, "laptop.example.com") {
+		t.Errorf("#2676: a PTR-conflict record must NOT be PTRPending (the reverse is permanently not ours)")
+	}
+	if got := m.Stats().PTRDeferred; got != 0 {
+		t.Errorf("PTRDeferred = %d, want 0 (a PTR conflict is a permanent skip, not a transient retry)", got)
+	}
+	if got := m.Stats().SkippedConflict; got != 1 {
+		t.Errorf("SkippedConflict = %d, want 1 (the PTR conflict must be counted)", got)
+	}
+
+	// Steady state: a second cycle does not churn — the record is settled
+	// (owned-not-pending), so no re-upsert beyond the idempotent forward re-add.
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+
+	// Cycle 3: lease gone — the (owned) forward A is DELETED, never orphaned.
+	// This is the no-orphan proof: a release withdraws the forward xpf created
+	// while leaving the third party's PTR intact.
+	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("reconcile 3 (release): %v", err)
+	}
+	if srv.zoneHas(liveA) {
+		t.Fatalf("#2676: the forward A was NOT withdrawn on release — it was orphaned")
+	}
+	if m.Stats().OwnedRecords != 0 {
+		t.Errorf("OwnedRecords = %d after release, want 0", m.Stats().OwnedRecords)
+	}
+	if !srv.zoneHas(thirdPartyPTR) {
+		t.Errorf("#2676: the third party's reverse PTR must survive the release (xpf never owned it)")
+	}
+}
+
 func TestOwnedRecordViews(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
 	m := prodManagerTo(t, srv)

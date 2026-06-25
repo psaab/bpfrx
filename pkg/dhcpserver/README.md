@@ -555,9 +555,12 @@ What increment 2 ships (the feasible, CI-testable slice):
   (and, in detail, the owned records) via the in-process CLI and the gRPC
   `ShowText` topic.
 - **Retired the deferred-backend commit warning** and replaced it with live
-  WARN-only validation (`validateDDNSBackendWarnings`, `pkg/config/compiler.go`):
-  enabled rfc2136 with no update-server, a malformed update-server, an
-  unsupported TSIG algorithm, and the still-deferred kea-d2 backend each WARN
+  WARN-only validation (`validateDDNSBackendWarnings`,
+  `pkg/config/compiler_validate_warn.go`): enabled rfc2136 with no
+  update-server, a malformed update-server, an unsupported TSIG algorithm, an
+  INCOMPLETE TSIG tuple (`tsig-key` without `tsig-secret`, or `tsig-secret`
+  without `tsig-key` — #2666/#2691 P0; RFC 8945 requires the full {key name,
+  algorithm, secret} triple), and the still-deferred kea-d2 backend each WARN
   (never error, so a previously-inert malformed value cannot brick a boot —
   plan §7 Q-C).
 

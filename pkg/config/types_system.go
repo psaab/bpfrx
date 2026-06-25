@@ -938,16 +938,17 @@ type DHCPDynamicDNSConfig struct {
 	// (default — only replace records this firewall owns per the state
 	// store), skip-existing, or strict-fail.
 	ConflictPolicy string
-	// Backend selects the DNS-update mechanism. The value is PARSED and
-	// VALIDATED in this increment, but the live updater is DEFERRED to a
-	// later increment — nothing is published to DNS yet regardless of the
-	// backend chosen. "rfc2136" is the default; "kea-d2" is a reserved enum
-	// value for a later increment (Kea D2 is not in the image — bake.py).
+	// Backend selects the DNS-update mechanism. "rfc2136" is the default and
+	// is LIVE (#1387 inc-2): records are published to and withdrawn from the
+	// authoritative server over real RFC 2136 UPDATE by the always-on
+	// reconcile loop. "kea-d2" is a reserved enum value that is NOT
+	// implemented (Kea D2 is not in the image — bake.py); selecting it warns
+	// at commit and publishes nothing.
 	Backend string
 	// UpdateServer is the RFC 2136 target authoritative DNS, host or
-	// host:port (Path A / rfc2136 backend). Not consumed by the live
-	// path in increment 1 (no live emission yet); carried for the
-	// increment-2 backend.
+	// host:port (rfc2136 backend). It IS consumed by the live path: an
+	// enabled rfc2136 backend with no update-server publishes nothing and
+	// warns at commit (validateDDNSBackendWarnings).
 	UpdateServer string
 	// TSIGKeyName / TSIGAlgorithm / TSIGSecret are the TSIG credentials
 	// for authenticated RFC 2136 updates. TSIGSecret is the sensitive HMAC

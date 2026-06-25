@@ -323,6 +323,7 @@ func TestDHCPDDNSBackendWarnings(t *testing.T) {
 			"set system services dhcp-local-server dynamic-dns enable",
 			"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
 			"set system services dhcp-local-server dynamic-dns tsig-key k1",
+			"set system services dhcp-local-server dynamic-dns tsig-secret c2VjcmV0",
 		}))
 		if err != nil {
 			t.Fatalf("CompileConfig: %v", err)
@@ -333,6 +334,84 @@ func TestDHCPDDNSBackendWarnings(t *testing.T) {
 		}
 		if _, ok := hasDDNSWarn(ws, "no update-server"); ok {
 			t.Fatalf("a configured update-server must not warn: %v", ws)
+		}
+	})
+
+	// #2666 / #2691 P0: TSIG tuple completeness. RFC 8945 needs the full
+	// {key name, algorithm, secret} triple. An incomplete tuple commits today
+	// and fails only at runtime (BADKEY/BADSIG); warn at commit instead.
+	// fail-on-revert: removing the keySet/secretSet switch in
+	// validateDDNSBackendWarnings makes both "warns" subtests go red (no
+	// tsig-secret / no tsig-key warning is emitted).
+	t.Run("tsig-key without tsig-secret warns (#2666)", func(t *testing.T) {
+		cfg, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns enable",
+			"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
+			"set system services dhcp-local-server dynamic-dns tsig-key k1",
+			"set system services dhcp-local-server dynamic-dns tsig-algorithm hmac-sha256",
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig must NOT error on an incomplete TSIG tuple (Q-C): %v", err)
+		}
+		ws := ValidateConfig(cfg)
+		w, ok := hasDDNSWarn(ws, "tsig-secret is empty")
+		if !ok {
+			t.Fatalf("tsig-key without tsig-secret must warn: %v", ws)
+		}
+		if !strings.Contains(w, "tsig-key is set") {
+			t.Errorf("the warn must name the incomplete side: %q", w)
+		}
+	})
+
+	t.Run("tsig-secret without tsig-key warns (#2666)", func(t *testing.T) {
+		cfg, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns enable",
+			"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
+			"set system services dhcp-local-server dynamic-dns tsig-secret c2VjcmV0",
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig must NOT error on an incomplete TSIG tuple (Q-C): %v", err)
+		}
+		ws := ValidateConfig(cfg)
+		if _, ok := hasDDNSWarn(ws, "tsig-secret is set but"); !ok {
+			t.Fatalf("tsig-secret without tsig-key must warn (ignored): %v", ws)
+		}
+	})
+
+	t.Run("complete TSIG tuple is silent (#2666)", func(t *testing.T) {
+		cfg, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns enable",
+			"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
+			"set system services dhcp-local-server dynamic-dns tsig-key k1",
+			"set system services dhcp-local-server dynamic-dns tsig-algorithm hmac-sha256",
+			"set system services dhcp-local-server dynamic-dns tsig-secret c2VjcmV0",
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		ws := ValidateConfig(cfg)
+		if _, ok := hasDDNSWarn(ws, "tsig-secret is empty"); ok {
+			t.Fatalf("a complete TSIG tuple must not warn key-without-secret: %v", ws)
+		}
+		if _, ok := hasDDNSWarn(ws, "tsig-secret is set but"); ok {
+			t.Fatalf("a complete TSIG tuple must not warn secret-without-key: %v", ws)
+		}
+	})
+
+	t.Run("incomplete TSIG tuple does not hard-fail the commit (#2666)", func(t *testing.T) {
+		// The whole point of the WARN-only posture: a previously-inert
+		// incomplete TSIG config must still COMMIT (CompileConfig succeeds and
+		// ValidateConfig returns warnings, never an error/panic).
+		cfg, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns enable",
+			"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
+			"set system services dhcp-local-server dynamic-dns tsig-key k1",
+		}))
+		if err != nil {
+			t.Fatalf("an incomplete TSIG tuple must NOT brick the commit: %v", err)
+		}
+		if _, ok := hasDDNSWarn(ValidateConfig(cfg), "tsig-secret is empty"); !ok {
+			t.Fatal("the incomplete tuple must still warn")
 		}
 	})
 

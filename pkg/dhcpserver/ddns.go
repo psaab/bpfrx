@@ -13,26 +13,31 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
-// ddns.go: the DHCP dynamic-DNS manager + reconciler core (#1387,
-// increment 1 per docs/research/1387-dhcp-ddns/plan.md). This is the
-// fully-unit-testable slice: config-driven policy, the state-aware lease
-// parser, the never-delete-non-owned ownership store, and the
-// build-desired / diff-owned / transition reconcile algorithm driven
-// through a pluggable DNSUpdater. Tests drive reconcileOnce directly with
-// synthetic leases and a fakeUpdater (zero network/DNS dependency).
+// ddns.go: the DHCP dynamic-DNS manager + reconciler core (#1387, per
+// docs/research/1387-dhcp-ddns/plan.md). This is the config-driven policy,
+// the state-aware lease parser, the never-delete-non-owned ownership store,
+// and the build-desired / diff-owned / transition reconcile algorithm
+// driven through a pluggable DNSUpdater. Tests drive reconcileOnce directly
+// with synthetic leases and a fakeUpdater (zero network/DNS dependency).
 //
-// DELIBERATELY OUT OF SCOPE for increment 1 (deferred, see plan §12):
-//   - the LIVE rfc2136 DNSUpdater backend (lab-gated increment 2);
-//   - HA ownership coupling to VRRP MASTER/BACKUP (test-failover-gated
-//     increment 3);
-//   - the Kea D2 backend (reserved enum; increment 4);
-//   - Prometheus emission through pkg/api (the API collector is a CHECKED
-//     collector — declaring a desc without emitting it breaks the
-//     descriptor-coverage canary; counters live here and surface via
-//     Stats() until a value source on the server exists in increment 2).
+// SHIPPED (no longer deferred):
+//   - the LIVE rfc2136 DNSUpdater backend (#1387 inc-2; see
+//     ddns_rfc2136.go) — records are published to and withdrawn from the
+//     authoritative server over real RFC 2136 UPDATE;
+//   - the always-on daemon reconcile loop with the HA writer gate
+//     (pkg/daemon/daemon_ddns.go) — a node only publishes when it is the
+//     cluster writer (standalone, or MASTER for >=1 redundancy group);
+//   - Prometheus emission through pkg/api (the xpf_dhcp_ddns_* counters
+//     are exported from Stats()).
 //
-// When DynamicDNS is nil or disabled the manager does nothing — net
-// behaviour change for existing users is zero.
+// STILL DEFERRED:
+//   - the Kea D2 backend (reserved enum; not in the image — bake.py);
+//   - per-scope / per-RG policy, source binding, and router/interface
+//     address publish (the #2691 world-class redesign, phases P1-P3).
+//
+// When DynamicDNS is nil or disabled the manager does nothing except a
+// one-time withdraw of any previously-owned records (turn-off cleanup) —
+// net behaviour change for existing users is zero.
 
 // ddnsPolicy is the resolved, runtime-shaped DDNS configuration the
 // reconciler consumes. It is derived from config.DHCPDynamicDNSConfig at
@@ -130,8 +135,9 @@ type DDNSManager struct {
 	// nodeID is the deterministic-owner-id seed (plan §5 invariant 2):
 	// the owner watermark is derived from the lease identity so EITHER HA
 	// node computes the same value, keeping cleanup safe across failover.
-	// The HA emission gating itself is increment 3; the watermark is
-	// laid down now so the state store is forward-compatible.
+	// The HA emission gating (the writer gate in pkg/daemon/daemon_ddns.go)
+	// is live; the watermark is node-stable so a failed-over node can clean
+	// up records its peer published.
 	nodeID string
 
 	// lease file paths (overridable for tests).
@@ -233,19 +239,31 @@ func newDDNSManagerForTesting(updater DNSUpdater, statePath, leasePath4, leasePa
 }
 
 // ownerWatermark is the deterministic, node-stable owner id for a lease
-// identity (plan §5 invariant 2). It is a hash of identity+address so
-// either HA node derives the same value; the node id is folded in only as
-// a TXT-marker hint (increment 3), NOT into the delete-matching key.
+// identity (plan §5 invariant 2). It is a hash of identity+address ONLY —
+// the receiver's nodeID is DELIBERATELY NOT folded in — so EITHER HA node
+// derives the SAME value for the same lease.
+//
+// Today this value is an INFORMATIONAL marker only (stored as the
+// ownership record's OwnerID); it is NOT the delete-matching key. Record
+// cleanup matches on identity+address plus the reconstructed RFC 4701
+// DHCID, which is already node-independent, so OwnerID is never compared
+// across nodes at present. Keeping the watermark node-independent is
+// intentional regardless: it avoids surprises if a future phase ever does
+// compare it across nodes (folding nodeID would make the two HA nodes
+// disagree for the same lease). (#2691 P0 / #2667: the prior comment
+// wrongly claimed nodeID was "folded in as a TXT-marker hint"; it never
+// was — the code below is correct, the comment was stale.)
 func (m *DDNSManager) ownerWatermark(identity, address string) string {
 	h := sha256.Sum256([]byte(identity + "|" + address))
 	return "xpf-dhcp-ddns:" + hex.EncodeToString(h[:8])
 }
 
 // Reconcile resolves the policy from cfg and runs one reconcile pass over
-// the current lease files. It is the production entry point (the loop and
-// HA gating that call it are increment 2/3). A nil/disabled policy is a
-// no-op except for one-time cleanup of any previously-owned records when
-// the feature is turned OFF (so disabling DDNS withdraws its records).
+// the current lease files. It is the production entry point; the always-on
+// reconcile loop and the HA writer gate that call it are live in
+// pkg/daemon/daemon_ddns.go. A nil/disabled policy is a no-op except for
+// one-time cleanup of any previously-owned records when the feature is
+// turned OFF (so disabling DDNS withdraws its records).
 func (m *DDNSManager) Reconcile(ctx context.Context, cfg *config.DHCPServerConfig) error {
 	var ddns *config.DHCPDynamicDNSConfig
 	if cfg != nil {
@@ -594,23 +612,15 @@ func (m *DDNSManager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow o
 	}
 
 	if err := m.updater.UpsertLease(ctx, rec); err != nil {
-		if errors.Is(err, errDDNSConflictRefused) {
-			// Refused (name owned by another party): the wire add did not
-			// happen, so REMOVE the pre-written intent (no phantom ownership)
-			// and persist the removal. Count it as a conflict skip already done
-			// by the backend; do not fail the reconcile pass.
-			m.state.delete(intent.Identity, intent.Address)
-			if serr := m.state.save(); serr != nil {
-				// The intent is removed in memory but the removal is not durable.
-				// Surface it so the pass is marked failed and retried; a stale
-				// durable intent is safe (its delete is a no-op on a non-existent
-				// RR) and self-heals on the next successful save.
-				slog.Warn("ddns: cannot persist removal of refused-add intent",
-					"fqdn", rec.FQDN, "err", serr)
-				return serr
-			}
-			return nil
-		}
+		// ORDER MATTERS (#2676): check errDDNSPTRPending BEFORE
+		// errDDNSConflictRefused. errDDNSPTRPending is returned ONLY after the
+		// forward A/AAAA add SUCCEEDED, so its presence proves the forward is
+		// LIVE and ownership MUST be recorded — it must never fall into the
+		// no-ownership (intent-removal) branch below. The backend (#2676) no
+		// longer wraps a PTR-side conflict-refusal into a chain carrying BOTH
+		// sentinels, but this defensive ordering guarantees a
+		// forward-published error can never orphan the forward even if some
+		// future path produces a chain with both sentinels.
 		if errors.Is(err, errDDNSPTRPending) {
 			// PARTIAL SUCCESS (#2661): the forward A/AAAA is LIVE in DNS but the
 			// reverse PTR add failed with a non-skippable (transient) error. The
@@ -628,6 +638,26 @@ func (m *DDNSManager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow o
 				"ownership recorded with PTR pending for retry next cycle",
 				"fqdn", rec.FQDN, "ptr", rec.PTRName, "err", err)
 			m.upsertOK.Add(1)
+			return nil
+		}
+		if errors.Is(err, errDDNSConflictRefused) {
+			// Refused (name owned by another party): the FORWARD wire add did not
+			// happen (errDDNSConflictRefused is propagated unwrapped by the
+			// backend only from the forward add, and a PTR-side conflict-refusal
+			// is now classified as a permanent skip that returns nil — #2676), so
+			// REMOVE the pre-written intent (no phantom ownership) and persist the
+			// removal. Count it as a conflict skip already done by the backend; do
+			// not fail the reconcile pass.
+			m.state.delete(intent.Identity, intent.Address)
+			if serr := m.state.save(); serr != nil {
+				// The intent is removed in memory but the removal is not durable.
+				// Surface it so the pass is marked failed and retried; a stale
+				// durable intent is safe (its delete is a no-op on a non-existent
+				// RR) and self-heals on the next successful save.
+				slog.Warn("ddns: cannot persist removal of refused-add intent",
+					"fqdn", rec.FQDN, "err", serr)
+				return serr
+			}
 			return nil
 		}
 		// Hard add failure: the wire add did not succeed. Remove the

@@ -875,6 +875,29 @@ func validateDDNSBackendWarnings(cfg *Config) []string {
 				"hmac-sha256, hmac-sha384, or hmac-sha512; hmac-md5 is rejected as "+
 				"insecure); the backend will fail to sign updates", d.TSIGAlgorithm))
 		}
+		// TSIG tuple completeness (#2666 / #2691 P0): RFC 8945 TSIG needs the
+		// full {key name, algorithm, secret} triple. The backend enables
+		// signing whenever tsig-key is set and copies the secret without an
+		// empty check, so a key without a secret signs with an empty key and
+		// a real authoritative server rejects it (BADKEY/BADSIG) at RUNTIME.
+		// A secret without a key is silently ignored (no signing happens).
+		// Warn at commit so the operator sees the incomplete tuple instead of
+		// debugging a runtime failure. WARN-only (never a hard reject): a
+		// previously-inert partial TSIG config must not brick a boot.
+		keySet := d.TSIGKeyName != ""
+		secretSet := d.TSIGSecret.Reveal() != ""
+		switch {
+		case keySet && !secretSet:
+			warnings = append(warnings, "dhcp dynamic-dns tsig-key is set but "+
+				"tsig-secret is empty; TSIG signing will use an empty key and the "+
+				"authoritative server will reject updates (BADKEY/BADSIG) — set "+
+				"tsig-secret to complete the TSIG key")
+		case secretSet && !keySet:
+			warnings = append(warnings, "dhcp dynamic-dns tsig-secret is set but "+
+				"tsig-key is empty; without a key name TSIG signing is disabled and "+
+				"the secret is ignored — set tsig-key to enable authenticated "+
+				"updates")
+		}
 	case "kea-d2":
 		warnings = append(warnings, "dhcp dynamic-dns backend kea-d2 is "+
 			"reserved but not implemented (Kea D2 is not in the image); no "+
