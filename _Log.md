@@ -1,3 +1,37 @@
+## 2026-06-25 — #2843: DDNS Surface A status omits never-published / errored scopes
+
+- **Timestamp**: 2026-06-25
+- **Action**: `SurfaceAManager.StatusViews` built rows ONLY from durable
+  ownership records, so a configured scope that failed before its first
+  publish (esp. a half-configured provider whose `errSurfaceANoBackend`
+  was swallowed without `recordScopeError`) had no row — invisible in
+  `show services dynamic-dns detail` during bring-up.
+- **Fix**: `StatusViews(scopes []SurfaceAScope)` now returns the UNION of
+  a row per CONFIGURED scope (merged with ownership + runtime state) and
+  any ownership record for a scope no longer configured (withdraw
+  pending). New `SurfaceAStatusView.State`: published / unpublished
+  (no-backend) / error / pending / withdraw-pending. The no-backend
+  sentinel now records a per-scope reason (`rt.noBackend` + `lastErr`)
+  WITHOUT arming retry backoff, cleared on success / superseded by a real
+  error. Daemon `SurfaceAStatus()` materializes the configured scopes via
+  `buildSurfaceAScopes(ActiveConfig())`. CLI + gRPC `show` render the new
+  State column (text only — `SurfaceAStatusView` is an internal Go type,
+  rendered server/client side; NO protobuf/wire field added).
+- **Test**: `TestStatusViewsSurfacesUnpublishedScopes` +
+  `TestStatusViewsSurfacesPendingAndPublished` (fail-on-revert) — a
+  configured no-backend scope appears as `unpublished` with a reason, a
+  never-observed scope as `pending`, a published scope as `published`, and
+  an orphaned ownership record as `withdraw-pending`. Verified RED when
+  StatusViews reverts to ownership-records-only.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/surface_a_test.go,
+  pkg/ddns/surface_a_http_test.go, pkg/ddns/surface_a_lockio_test.go,
+  pkg/daemon/daemon_ddns_surface_a.go, pkg/cli/cli_show_services.go,
+  pkg/grpcapi/server_show_dhcp_lldp_snmp.go, pkg/ddns/README.md
+- **Validation**: go build ./... ; gofmt -l (clean on touched files) ;
+  go vet ./pkg/ddns/... ./pkg/daemon/... ./pkg/grpcapi/... (clean;
+  pre-existing pkg/cli/cli.go:460 unreachable-code vet warning is on
+  origin/master, in a file I did not touch) ; go test ./pkg/ddns/...
+  ./pkg/daemon/... ./pkg/grpcapi/... ./pkg/cli/... (PASS).
 ## 2026-06-25 — #2838: DDNS generic backend false-success on substring "ok"
 
 - **Timestamp**: 2026-06-25

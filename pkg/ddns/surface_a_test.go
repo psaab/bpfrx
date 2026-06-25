@@ -189,7 +189,7 @@ func TestSurfaceAStatusViews(t *testing.T) {
 	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil, nil); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	views := m.StatusViews()
+	views := m.StatusViews([]SurfaceAScope{sc})
 	if len(views) != 1 {
 		t.Fatalf("expected one status view, got %d", len(views))
 	}
@@ -197,6 +197,9 @@ func TestSurfaceAStatusViews(t *testing.T) {
 	if v.FQDN != "wan.example.net" || v.Published != "203.0.113.5" ||
 		v.Interface != "ge-0-0-2" || v.Family != 4 || v.Provider != "corp-2136" {
 		t.Fatalf("status view mismatch: %+v", v)
+	}
+	if v.State != SurfaceAStatePublished {
+		t.Fatalf("published scope must have state %q, got %q", SurfaceAStatePublished, v.State)
 	}
 	if v.LastPublished.IsZero() {
 		t.Fatal("status view must carry a last-published time")
