@@ -2,6 +2,7 @@ package ddns
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -97,6 +98,96 @@ func TestDyndns2NameEndpointResolution(t *testing.T) {
 	// No server + unknown name → error (fall back to no-op at the manager).
 	if _, err := newDyndns2Backend(&config.DDNSProvider{Name: "weird", Backend: "dyndns2"}); err == nil {
 		t.Fatal("unknown provider with no server must error")
+	}
+}
+
+// TestDyndns2DeleteIssuesOfflineRequest is the #2772 FAIL-ON-REVERT guard for
+// the dyndns2 withdraw path. The previous DeleteLease was a no-op that returned
+// nil WITHOUT contacting the provider, so the engine dropped ownership while the
+// public record kept resolving. This test asserts DeleteLease actually issues
+// the dyndns2 offline GET (offline=YES + the hostname) and that a provider
+// failure verdict propagates as an error. If DeleteLease is reverted to
+// `return nil`, the server handler is never hit (got=="") and the test fails.
+func TestDyndns2DeleteIssuesOfflineRequest(t *testing.T) {
+	var gotPath, gotAuth string
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		gotPath = r.URL.String()
+		gotAuth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte("good\n"))
+	}))
+	defer srv.Close()
+
+	b, err := newDyndns2Backend(&config.DDNSProvider{
+		Name: "test", Backend: "dyndns2", Server: srv.URL,
+		Username: "u1", Password: config.Secret("p1"),
+	})
+	if err != nil {
+		t.Fatalf("newDyndns2Backend: %v", err)
+	}
+	if err := b.DeleteLease(context.Background(), hostRecord(t, "wan.example.net", "203.0.113.5")); err != nil {
+		t.Fatalf("DeleteLease good: %v", err)
+	}
+	// FAIL-ON-REVERT: a no-op DeleteLease never reaches the server.
+	if hits == 0 {
+		t.Fatal("DeleteLease did not issue any HTTP request — withdraw is a silent no-op (regression #2772)")
+	}
+	if !strings.Contains(gotPath, "offline=YES") {
+		t.Fatalf("dyndns2 withdraw must send offline=YES; got %q", gotPath)
+	}
+	if !strings.Contains(gotPath, "hostname=wan.example.net") {
+		t.Fatalf("dyndns2 withdraw must name the hostname; got %q", gotPath)
+	}
+	if gotAuth == "" {
+		t.Fatal("dyndns2 withdraw must send Basic auth header")
+	}
+}
+
+// TestDyndns2DeletePropagatesProviderFailure asserts that a provider error
+// verdict on the withdraw GET (not a silent success) propagates as a non-nil
+// error so the Surface A engine keeps ownership for retry.
+func TestDyndns2DeletePropagatesProviderFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("badauth\n"))
+	}))
+	defer srv.Close()
+	b, err := newDyndns2Backend(&config.DDNSProvider{
+		Name: "test", Backend: "dyndns2", Server: srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("newDyndns2Backend: %v", err)
+	}
+	if err := b.DeleteLease(context.Background(), hostRecord(t, "wan.example.net", "203.0.113.5")); err == nil {
+		t.Fatal("dyndns2 withdraw with a badauth verdict must return an error, not silent success")
+	}
+}
+
+// TestGenericDeleteFailsNotSilentSuccess is the #2772 FAIL-ON-REVERT guard for
+// the generic backend's withdraw path. The generic templated protocol has no
+// portable delete verb, so DeleteLease must FAIL (so the engine keeps ownership
+// and the abandoned record stays operator-visible) rather than return nil and
+// silently drop ownership while the public record persists. If DeleteLease is
+// reverted to `return nil`, this test fails.
+func TestGenericDeleteFailsNotSilentSuccess(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write([]byte("good\n"))
+	}))
+	defer srv.Close()
+	b, err := newGenericBackend(&config.DDNSProvider{
+		Name: "g", Backend: "generic", URLTemplate: srv.URL + "/u?h=%h&i=%i",
+	})
+	if err != nil {
+		t.Fatalf("newGenericBackend: %v", err)
+	}
+	err = b.DeleteLease(context.Background(), hostRecord(t, "h.example.net", "198.51.100.7"))
+	if err == nil {
+		t.Fatal("generic DeleteLease must FAIL (no portable delete verb), not report silent success (regression #2772)")
+	}
+	if !errors.Is(err, errGenericDeleteUnsupported) {
+		t.Fatalf("generic DeleteLease error must wrap errGenericDeleteUnsupported; got %v", err)
 	}
 }
 

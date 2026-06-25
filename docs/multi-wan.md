@@ -8,15 +8,20 @@ uplink selection (FBF composition); PR-3 defines the NAT interplay
 semantics, mini-plan: `docs/pr/1827-pr3-nat/plan.md`). The PR-4
 weights/load-share stage was KILLED by its own research-gate criteria
 (audit of record: `docs/research/1827-pr4-loadshare/plan.md` on the
-`research/1827-pr4-loadshare` branch): the userspace dataplane has no
-ECMP next-hop selection to weight — the FIB flattens multi-next-hop
-routes to the first entry at build time — so any per-flow load-share
-(weighted or equal-cost) would be a new Rust hot-path program with new
-cross-node hash-symmetry invariants, unjustified at 2 uplinks given
-the FBF steering recipe below. Equal-cost or weighted per-flow
-load-balance parity remains unimplemented; if demand materializes it
-is its own issue with its own value case — it is not a multi-WAN
-failover deliverable.
+`research/1827-pr4-loadshare` branch): at the time, the userspace
+dataplane had no ECMP next-hop selection to weight — the FIB flattened
+multi-next-hop routes to the first entry at build time. That premise has
+since shifted: #2389 retained the full equal-cost candidate vector
+(`Vec<RouteNextHopV4>`) with dead-NH fallback, and **#2734 added
+EQUAL-COST per-FLOW selection** — the session resolution path hashes the
+forward 5-tuple (the per-boot seeded `ecmp_hash_flow`) to pick a member,
+so distinct flows spread across equal-cost uplinks while a single flow
+stays pinned (flow-consistent). The seed is node-local (ECMP picks among
+THIS node's members, not wire/HA state), so there are no cross-node
+hash-symmetry invariants to maintain. **WEIGHTED** per-flow load-share
+(unequal-cost ratios) remains unimplemented; if demand materializes it is
+its own issue with its own value case — it is not a multi-WAN failover
+deliverable.
 
 xpf models multi-WAN the way real SRX does — as the composition of
 existing subsystems, not an invented `services multi-wan` tree:
