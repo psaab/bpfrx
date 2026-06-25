@@ -673,12 +673,12 @@ func ddnsServicesSchema() *schemaNode {
 	return &schemaNode{desc: "Dynamic DNS provider catalog + engine tunables (Surface A, #2691)", children: map[string]*schemaNode{
 		"provider": {desc: "Named DDNS provider", args: 1, placeholder: "<provider-name>", children: map[string]*schemaNode{
 			"backend": {
-				desc:          "DNS-update backend (rfc2136 is live; dyndns2/cloudflare/route53/generic are reserved for P3)",
+				desc:          "DNS-update backend (rfc2136/dyndns2/duckdns/cloudflare/route53/generic)",
 				args:          1,
 				valueType:     ValueEnumOf,
-				valueDesc:     "Update backend (rfc2136 [live] | dyndns2 | cloudflare | route53 | generic [P3])",
+				valueDesc:     "Update backend (rfc2136 [live] | dyndns2 | duckdns | cloudflare | route53 | generic)",
 				valueExamples: []string{"rfc2136"},
-				validator:     ValidateEnum([]string{"rfc2136", "dyndns2", "cloudflare", "route53", "generic"}),
+				validator:     ValidateEnum([]string{"rfc2136", "dyndns2", "duckdns", "cloudflare", "route53", "generic"}),
 				children:      nil,
 			},
 			"update-server":         {desc: "Authoritative DNS target for RFC 2136 updates (host[:port])", args: 1, placeholder: "<host[:port]>", children: nil},
@@ -694,7 +694,7 @@ func ddnsServicesSchema() *schemaNode {
 			"password":          {desc: "HTTP Basic-auth password (sensitive; redacted in show output)", args: 1, placeholder: "<secret>", children: nil},
 			"url-template":      {desc: "generic backend update URL template (%h host, %i IP, %u user, %p pass, %% literal)", args: 1, placeholder: "<url-template>", children: nil},
 			"ok-response":       {desc: "generic backend success-substring matcher (default: good/nochg/ok/true/updated)", args: 1, placeholder: "<substring>", children: nil},
-			"api-token":         {desc: "Cloudflare API token (sensitive; redacted in show output)", args: 1, placeholder: "<secret>", children: nil},
+			"api-token":         {desc: "Cloudflare / DuckDNS API token (sensitive; redacted in show output)", args: 1, placeholder: "<secret>", children: nil},
 			"zone":              {desc: "Cloudflare DNS zone name the record lives in (e.g. example.net)", args: 1, placeholder: "<zone>", children: nil},
 			"aws-access-key":    {desc: "Route 53 AWS access-key id (SigV4)", args: 1, placeholder: "<access-key-id>", children: nil},
 			"aws-secret-key":    {desc: "Route 53 AWS secret access key (sensitive; redacted in show output)", args: 1, placeholder: "<secret>", children: nil},

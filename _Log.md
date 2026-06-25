@@ -17969,3 +17969,65 @@ top.
   pkg/config/bgp_neighbor_peeras_2963_test.go,
   pkg/frr/policy_render.go, pkg/frr/bgp_remote_as_2963_test.go,
   pkg/frr/README.md, _Log.md
+## 2026-06-25 — #2960 DuckDNS dedicated backend (was a broken dyndns2 alias)
+- **Timestamp**: 2026-06-25
+- **Action**: Implemented `duckdns` as its OWN DDNS backend instead of a
+  dyndns2 alias. DuckDNS is not dyndns2-protocol-compatible: the alias sent
+  the wrong params (`hostname=`/`myip=`), the wrong auth (HTTP Basic), rejected
+  DuckDNS's `OK` body (only `good`/`nochg` were accepted), and used the wrong
+  withdraw verb (`offline=YES`) — so updates/withdraws never worked against the
+  real DuckDNS API. New backend speaks the real protocol:
+  `GET /update?domains=<label>&token=<tok>&ip=<v4>` (`&ipv6=<v6>` for AAAA),
+  token as a QUERY param, success on the literal `OK` (`KO` ⇒ hard
+  `errHTTPAuth`), withdraw via `&clear=true`. Token comes from the `api-token`
+  leaf (reused from cloudflare). `duckdns` removed from `dyndns2Endpoints` and
+  from the config dyndns2 known-name set; added to the `backend` enum and a
+  duckdns warn-validation case (missing api-token). Mirrors the
+  cloudflare/route53 backend structure + the #2904 cached-client path.
+- **Fail-on-revert**: `pkg/ddns/backend_duckdns_test.go` asserts the update
+  request shape (domains/token/ip/ipv6), no Basic auth header, no dyndns2
+  hostname/myip, `OK`-keyword success, `clear=true` withdraw (no offline=YES),
+  OK/KO verdict mapping, missing-token fail-closed, and the FQDN→label
+  reduction — RED if reverted to the alias (proven: alias UpsertLease drops
+  `ip=`). `TestDyndns2NameEndpointResolution` now guards that `duckdns` does
+  NOT resolve a dyndns2 endpoint (RED if re-added to the table — proven).
+  Config-side: `TestP3IncompleteHTTPProviderWarns` requires the duckdns
+  no-api-token warning.
+- **Gates**: go build ./..., gofmt -l clean (touched files), go vet
+  ./pkg/ddns/..., go test -race ./pkg/ddns/..., go test ./pkg/config/... PASS.
+- **File(s)**: pkg/ddns/backend_duckdns.go (new), pkg/ddns/backend_duckdns_test.go
+  (new), pkg/ddns/surface_a.go, pkg/ddns/backend_dyndns2.go,
+  pkg/ddns/backend_http_test.go, pkg/ddns/README.md,
+  pkg/config/schema_system.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_p3_http_providers_test.go, docs/config-schema.md, _Log.md
+
+## 2026-06-25 — #2960 review fix: DuckDNS per-family clobber (PR #2967 r2)
+- **Timestamp**: 2026-06-25
+- **Action**: Hostile review (MERGE-NEEDS-MINOR) flagged a spec-backed defect:
+  the DuckDNS update API auto-detects and SETS the family whose address param
+  is omitted ("If you do not specify the IP address, then it will be detected",
+  duckdns.org/spec.jsp). A v6-only UpsertLease (ipv6= only) therefore overwrites
+  the A record. Surface A scopes are per-family with NO per-FQDN coalescing, so
+  a dual-stack DuckDNS name has two scopes that clobber each other every
+  reconcile. Approach (a) (per-FQDN coalescing so one update carries both ip=
+  and ipv6=) would require threading cross-scope address knowledge through the
+  surface_a engine into the backend boundary — too invasive (the engine resolves
+  a backend per scope and calls UpsertLease with a single-address record; the
+  change-detection / ownership / RG-gate state machine is all per-scope). Took
+  approach (b): SINGLE-FAMILY-PER-NAME restriction enforced by a commit-time
+  warning in validateSurfaceADDNSWarnings — a DuckDNS (provider,FQDN) bound on
+  BOTH inet and inet6 is flagged (warn, not hard-reject, matching this
+  validator's fail-open posture). Fixed the now-false UpsertLease code comment
+  (documents the auto-detect clobber + why no placeholder is synthesized) and
+  the README (single-family-per-name caveat).
+- **Fail-on-revert**: pkg/config TestDuckDNSDualStackNameWarns — a config with
+  both A+AAAA duckdns scopes on one name MUST warn (RED without the cross-family
+  detection — proven by neutralizing the gate). Asserts NO false positives: a
+  single-family duckdns name and a dual-stack name on a non-duckdns (cloudflare)
+  backend are NOT warned.
+- **Gates**: go build ./..., gofmt -l clean (Go files), go vet
+  ./pkg/ddns/... ./pkg/config/..., go test -race ./pkg/ddns/... ./pkg/config/...
+  all PASS.
+- **File(s)**: pkg/ddns/backend_duckdns.go, pkg/ddns/README.md,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_p3_http_providers_test.go, _Log.md
