@@ -116,19 +116,23 @@ var specialPurposeV4 = []netip.Prefix{
 // ranges not covered by the stdlib netip predicates used in isPublicAddr.
 // IsUnspecified (::/128), IsLoopback (::1/128), IsLinkLocalUnicast (fe80::/10),
 // and IsMulticast (ff00::/8) are handled by predicates; the prefixes below add
-// ULA (fc00::/7), the documentation prefix (2001:db8::/32), the IPv4-mapped and
-// IPv4/IPv6 translation ranges, the discard-only prefix, and the deprecated
-// 6to4 documentation/ORCHID blocks. Inputs are already Unmap()'d before this
-// gate, so an IPv4-mapped literal cannot reach the v6 path, but ::ffff:0:0/96
-// is listed for completeness against a raw v6 caller.
+// ULA (fc00::/7), the documentation prefixes (2001:db8::/32, 3fff::/20), the
+// IPv4-mapped and IPv4/IPv6 translation ranges, the discard-only and dummy
+// prefixes, the SRv6 SID block, and the deprecated 6to4 block. Inputs are
+// already Unmap()'d before this gate, so an IPv4-mapped literal cannot reach
+// the v6 path, but ::ffff:0:0/96 is listed for completeness against a raw v6
+// caller. Every entry has Globally-Reachable=False in the IANA registry.
 var specialPurposeV6 = []netip.Prefix{
 	netip.MustParsePrefix("::ffff:0:0/96"),  // IPv4-mapped (RFC 4291)
 	netip.MustParsePrefix("64:ff9b::/96"),   // NAT64 well-known prefix (RFC 6052)
 	netip.MustParsePrefix("64:ff9b:1::/48"), // NAT64 local-use (RFC 8215)
 	netip.MustParsePrefix("100::/64"),       // discard-only (RFC 6666)
+	netip.MustParsePrefix("100:0:0:1::/64"), // dummy IPv6 prefix (RFC 9780)
 	netip.MustParsePrefix("2001::/23"),      // IETF protocol assignments
 	netip.MustParsePrefix("2001:db8::/32"),  // documentation (RFC 3849)
 	netip.MustParsePrefix("2002::/16"),      // 6to4 (RFC 3056, deprecated)
+	netip.MustParsePrefix("3fff::/20"),      // documentation (RFC 9637)
+	netip.MustParsePrefix("5f00::/16"),      // SRv6 SIDs (RFC 9602)
 	netip.MustParsePrefix("fc00::/7"),       // unique-local / ULA (RFC 4193)
 }
 

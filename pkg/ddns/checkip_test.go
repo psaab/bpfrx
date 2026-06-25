@@ -94,16 +94,19 @@ func TestIsPublicAddrSpecialPurpose(t *testing.T) {
 		"240.0.0.1",       // 240/4 reserved
 		"255.255.255.255", // limited broadcast
 		// IPv6 special-purpose (IANA registry).
-		"::",          // ::/128 unspecified
-		"::1",         // ::1/128 loopback
-		"64:ff9b::1",  // 64:ff9b::/96 NAT64 well-known
-		"100::1",      // 100::/64 discard-only
-		"2001:db8::1", // 2001:db8::/32 documentation
-		"2002::1",     // 2002::/16 6to4
-		"fc00::1",     // fc00::/7 ULA
-		"fd00::1",     // fc00::/7 ULA
-		"fe80::1",     // fe80::/10 link-local
-		"ff02::1",     // ff00::/8 multicast
+		"::",           // ::/128 unspecified
+		"::1",          // ::1/128 loopback
+		"64:ff9b::1",   // 64:ff9b::/96 NAT64 well-known
+		"100::1",       // 100::/64 discard-only
+		"100:0:0:1::1", // 100:0:0:1::/64 dummy prefix (RFC 9780) — outside 100::/64
+		"2001:db8::1",  // 2001:db8::/32 documentation
+		"2002::1",      // 2002::/16 6to4
+		"3fff::1",      // 3fff::/20 documentation (RFC 9637)
+		"5f00::1",      // 5f00::/16 SRv6 SIDs (RFC 9602)
+		"fc00::1",      // fc00::/7 ULA
+		"fd00::1",      // fc00::/7 ULA
+		"fe80::1",      // fe80::/10 link-local
+		"ff02::1",      // ff00::/8 multicast
 	}
 	for _, s := range reject {
 		a := netip.MustParseAddr(s).Unmap()
