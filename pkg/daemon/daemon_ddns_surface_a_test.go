@@ -295,6 +295,57 @@ func TestSelectInterfaceAddrLifetime(t *testing.T) {
 			ok:   true,
 		},
 		{
+			// #2975 fail-on-revert: a SLAAC privacy/temporary preferred address
+			// listed FIRST must NOT be selected when a stable permanent preferred
+			// address exists. Goes RED if IFA_F_TEMPORARY is dropped from the skip
+			// mask (the temporary 0xdead address would win on netlink order).
+			name: "temporary skipped, permanent preferred selected (temporary first)",
+			addrs: []netlink.Addr{
+				mkAddr("2606:4700:4700::dead/64", unix.IFA_F_TEMPORARY),
+				mkAddr("2606:4700:4700::1111/64", 0),
+			},
+			af4:  false,
+			want: pref6,
+			ok:   true,
+		},
+		{
+			// A temporary address as the ONLY candidate is rejected outright — a
+			// rotating privacy identifier must never be published, even at the
+			// cost of no answer (it would blackhole on the next rotation anyway).
+			name: "temporary only is rejected (never publish privacy identifier)",
+			addrs: []netlink.Addr{
+				mkAddr("2606:4700:4700::dead/64", unix.IFA_F_TEMPORARY),
+			},
+			af4:  false,
+			want: netip.Addr{},
+			ok:   false,
+		},
+		{
+			// Composition: a temporary preferred + a deprecated permanent → the
+			// temporary is skipped and the deprecated permanent is the only usable
+			// answer (never blackhole). Confirms the temporary skip does not
+			// accidentally promote a temporary into the deprecated fallback slot.
+			name: "temporary preferred skipped, deprecated permanent used",
+			addrs: []netlink.Addr{
+				mkAddr("2606:4700:4700::dead/64", unix.IFA_F_TEMPORARY),
+				mkAddr("2606:4700:4700::2222/64", unix.IFA_F_DEPRECATED),
+			},
+			af4:  false,
+			want: dep6,
+			ok:   true,
+		},
+		{
+			// A deprecated temporary address (privacy address mid-rotation) is
+			// skipped twice over — neither TEMPORARY nor DEPRECATED may publish.
+			name: "deprecated temporary never used as fallback",
+			addrs: []netlink.Addr{
+				mkAddr("2606:4700:4700::dead/64", unix.IFA_F_TEMPORARY|unix.IFA_F_DEPRECATED),
+			},
+			af4:  false,
+			want: netip.Addr{},
+			ok:   false,
+		},
+		{
 			// IPv4 family filter + preferred selection.
 			name: "v4 preferred selected, v6 ignored",
 			addrs: []netlink.Addr{

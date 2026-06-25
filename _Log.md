@@ -18118,3 +18118,24 @@ top.
 - **File(s)**: pkg/ddns/backend_duckdns.go, pkg/ddns/README.md,
   pkg/config/compiler_validate_warn.go,
   pkg/config/compiler_p3_http_providers_test.go, _Log.md
+
+## 2026-06-25 — #2975 selectInterfaceAddr skip IFA_F_TEMPORARY
+- **Timestamp**: 2026-06-25
+- **Action**: Fix Surface A interface-address selection to skip RFC 4941/8981
+  SLAAC privacy/temporary IPv6 addresses (`IFA_F_TEMPORARY`). The skip mask in
+  `selectInterfaceAddr` previously omitted IFA_F_TEMPORARY, so a rotating
+  privacy address could win on netlink order and be published to public DNS —
+  leaking the ephemeral identifier and black-holing inbound reachability on the
+  next rotation. Added IFA_F_TEMPORARY to the DAD-not-succeeded skip mask
+  (joins TENTATIVE/DADFAILED/OPTIMISTIC) so the stable permanent address is
+  selected. IFA_F_MANAGETEMPADDR (the permanent SLAAC address that spawns
+  temporaries) is intentionally NOT skipped. Added 4 fail-on-revert table cases
+  to TestSelectInterfaceAddrLifetime (temporary-first, temporary-only,
+  temporary+deprecated, deprecated-temporary). Updated function godoc and
+  pkg/ddns/README.md address-lifetime selection paragraph.
+- **Gates**: go build ./... PASS; gofmt -l clean; go vet ./pkg/daemon/ PASS;
+  go test ./pkg/daemon/ -run TestSelectInterfaceAddr PASS (12 cases).
+  Fail-on-revert: dropping IFA_F_TEMPORARY from the mask turns all 4 new cases
+  RED; restore returns green.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
+  pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
