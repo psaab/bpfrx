@@ -12,11 +12,16 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 pub(super) fn populate_tunnel_endpoints(
     snapshot: &ConfigSnapshot,
     state: &mut ForwardingState,
-) {
+) -> Result<(), crate::policy::SnapshotIntegrityError> {
     for endpoint in &snapshot.tunnel_endpoints {
         if endpoint.id == 0 || endpoint.ifindex <= 0 {
             continue;
         }
+        // #2410: validate the outer-IP TTL ONCE here instead of narrowing it
+        // with an unchecked `endpoint.ttl.max(0) as u8`. A value > 255 fails
+        // the snapshot closed rather than wrapping (256→0 blackholes the
+        // tunnel).
+        let ttl = super::validated::TunnelTtl::try_from_snapshot(endpoint.ttl, endpoint.id)?.get();
         let is_wireguard = endpoint.mode == "wireguard";
         // GRE/IPIP require concrete outer source/destination. WireGuard
         // carries the peer in `wg_endpoint` and may have neither
@@ -84,7 +89,7 @@ pub(super) fn populate_tunnel_endpoints(
                 source,
                 destination,
                 key: endpoint.key,
-                ttl: endpoint.ttl.max(0) as u8,
+                ttl,
                 transport_table,
                 wg_listen_port: endpoint.wg_listen_port,
                 wg_local_privkey,
@@ -113,6 +118,7 @@ pub(super) fn populate_tunnel_endpoints(
             state.has_wg_tunnels = true;
         }
     }
+    Ok(())
 }
 
 /// #2327: the typed kind of a tunnel-endpoint `mode` string. Centralizes

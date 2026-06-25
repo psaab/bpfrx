@@ -112,6 +112,57 @@ pub(crate) enum SnapshotIntegrityError {
     /// #2124/#2142/#2173/#2212/#2505 fail-closed family. An interface with NO
     /// zone (empty string) is the legitimate "unzoned" case and is NOT an error.
     InterfaceUnknownZone { interface: String, zone: String },
+    /// #2410: an interface snapshot's `vlan_id` is outside the 0..=65535 range
+    /// representable on the 802.1Q wire (and in the `EgressInterface.vlan_id` /
+    /// `ingress_logical_ifindex` key u16). The pre-fix code narrowed it with an
+    /// unchecked `iface.vlan_id.max(0) as u16`, so a value > 65535 WRAPPED to a
+    /// different VLAN id — silently building a DIFFERENT L2 broadcast domain than
+    /// the operator configured (a value of 65537 becomes VLAN 1, a value of
+    /// 65536 becomes VLAN 0/untagged). That is a security-relevant
+    /// misconfiguration: the interface's ingress demux and egress tag would key
+    /// off the wrong VLAN. The Go commit-time validation is the primary gate;
+    /// this is the helper-boundary backstop, consistent with the
+    /// #2173/#2212/#2240/#2391 fail-closed family. Rejecting the whole snapshot
+    /// keeps the previous live forwarding state rather than steering traffic onto
+    /// a wrapped VLAN.
+    InterfaceVlanOutOfRange { interface: String, vlan_id: i32 },
+    /// #2410: a tunnel-endpoint snapshot's `ttl` is outside the 0..=255 range
+    /// representable in the outer IP TTL/hop-limit octet (`TunnelEndpoint.ttl`,
+    /// a u8). The pre-fix code narrowed it with `endpoint.ttl.max(0) as u8`, so
+    /// 256 wrapped to 0 (a packet that can never leave the first hop) and 300
+    /// wrapped to 44. Silently installing a wrapped TTL produces a tunnel that
+    /// either blackholes (TTL 0) or has a surprising reach. Fail closed instead.
+    TunnelTtlOutOfRange { tunnel_id: u16, ttl: i32 },
+    /// #2410: a CoS forwarding-class snapshot's `queue` is outside the 0..=255
+    /// range representable in the runtime `queue_id` (a u8). The pre-fix code
+    /// SILENTLY DROPPED the class via a `filter_map` range check
+    /// (`(0..=u8::MAX as i32).contains(&class.queue)`), so a class with a
+    /// wrapped/over-range queue disappeared from `class_to_queue` — every
+    /// classifier / scheduler-map entry referencing it then silently lost its
+    /// queue mapping (see #2409). Fail the snapshot closed rather than installing
+    /// a partial CoS table. An EMPTY class name is the legitimate "unnamed /
+    /// placeholder" case and is NOT an error (skipped as before).
+    CosQueueIdOutOfRange { forwarding_class: String, queue: i32 },
+    /// #2409: an interface address snapshot's `address` string did not parse as
+    /// an `IpNet` CIDR. The pre-fix code `continue`d past it, so the connected
+    /// route / local-address / interface-NAT material for that address silently
+    /// disappeared while the apply still SUCCEEDED — a connected route the
+    /// operator configured would just never install, with no failure surfaced.
+    /// In a retired-eBPF world where this helper is the only forwarding plane,
+    /// that is silent connectivity loss. Fail the snapshot closed (the preflight
+    /// keeps the previous good state) instead of silently dropping the address.
+    InterfaceAddressUnparseable { interface: String, address: String },
+    /// #2409: a CoS scheduler-map entry references a `forwarding_class` that is
+    /// not in the `class_to_queue` table — either a typo, a version-drifted
+    /// snapshot, or a class dropped for an out-of-range queue id (#2410). The
+    /// pre-fix code `continue`d past it, so the scheduler-map installed only a
+    /// SUBSET of its queues with no apply failure — a partially-installed
+    /// scheduler is very hard to troubleshoot (some classes shape, some do not).
+    /// Fail the snapshot closed instead of partially installing the scheduler.
+    SchedulerMapUnknownClass {
+        scheduler_map: String,
+        forwarding_class: String,
+    },
 }
 
 impl std::fmt::Display for SnapshotIntegrityError {
@@ -164,6 +215,37 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "interface {:?} references zone {:?} that is not in the zone table — refusing to fail open by collapsing it to the \"unknown\" zone 0 (which would bypass every zone-pair policy)",
                 interface, zone
+            ),
+            Self::InterfaceVlanOutOfRange { interface, vlan_id } => write!(
+                f,
+                "interface {:?} has vlan_id {} outside the 0..=65535 802.1Q range — refusing to narrow it with an unchecked cast that would wrap to a different VLAN (a different L2 domain)",
+                interface, vlan_id
+            ),
+            Self::TunnelTtlOutOfRange { tunnel_id, ttl } => write!(
+                f,
+                "tunnel endpoint id={} has ttl {} outside the 0..=255 range — refusing to narrow it with an unchecked cast that would wrap (256→0 blackholes the tunnel)",
+                tunnel_id, ttl
+            ),
+            Self::CosQueueIdOutOfRange {
+                forwarding_class,
+                queue,
+            } => write!(
+                f,
+                "cos forwarding-class {:?} has queue {} outside the 0..=255 range — refusing to silently drop the class (which would unmap every classifier/scheduler entry referencing it)",
+                forwarding_class, queue
+            ),
+            Self::InterfaceAddressUnparseable { interface, address } => write!(
+                f,
+                "interface {:?} address {:?} is not a parseable IpNet — refusing to silently drop it (which would lose the connected route / local-address material with no apply failure)",
+                interface, address
+            ),
+            Self::SchedulerMapUnknownClass {
+                scheduler_map,
+                forwarding_class,
+            } => write!(
+                f,
+                "cos scheduler-map {:?} references forwarding-class {:?} that is not in the class-to-queue table — refusing to partially install the scheduler (some queues silently missing)",
+                scheduler_map, forwarding_class
             ),
         }
     }
