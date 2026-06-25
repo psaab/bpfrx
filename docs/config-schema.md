@@ -463,6 +463,20 @@ reserved for whole-dataplane selection where a rewrite shim
   subsystems — one dedicated pass later), `track-interface priority-cost`
   (#1814 pre-walk owns it), `cpu-governor` (pass-through by design), dhcp
   client knobs, tunnel keepalives.
+- **#2524 (ring-entries bound):** `system dataplane ring-entries` was
+  min-only (`ValidateIntegerMin(1)`) — any large value committed and was
+  handed to the Rust helper, which preallocates ~3×ring_entries UMEM frames
+  per binding (~96 MB/binding at ring_entries=8192), so an out-of-range
+  value OOM'd at bring-up instead of failing as a clean commit error. The
+  leaf now uses `ValidateRingEntries`: bounded `[1..MaxRingEntries]`
+  (`MaxRingEntries = 16384`) AND required power-of-two (the helper rounds
+  ring sizes up to a power of two, so the configured number stays honest
+  about the depth allocated). A matching helper-side backstop clamps at
+  bring-up (`afxdp::MAX_RING_ENTRIES`,
+  `coordinator/reconcile/bringup.rs`) and rejects out-of-range /
+  non-power-of-two values at the `--ring-entries` CLI boundary
+  (`server/lifecycle.rs validate_ring_entries_arg`). Go and Rust ceilings
+  must stay equal.
 - **#1746:** added the `class-of-service schedulers <s>
   equal-flow-target-policy (slowest | mean | ideal-share)` typed enum
   leaf (ValueEnumOf + `ValidateEnum`, same recipe as the scheduler

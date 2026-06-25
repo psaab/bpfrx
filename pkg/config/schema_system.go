@@ -155,10 +155,11 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		// garbage silently fell back to the 0 zero-value, which the
 		// manager coerces to the default (workers<=0 -> 1,
 		// ring-entries<=0 -> 1024; pkg/dataplane/userspace/
-		// manager.go:1347-1351). Min-only: the runtime owns any
-		// ceiling, and the Rust helper rounds ring sizes up to a
-		// power of two itself (afxdp/bind.rs
-		// checked_next_power_of_two).
+		// manager.go capabilities.go). `workers` stays min-only (the
+		// runtime owns its ceiling); `ring-entries` is bounded both
+		// ways and required power-of-two as of #2524, because it sizes
+		// per-binding UMEM preallocations directly (an unbounded value
+		// OOM'd at bring-up rather than failing at commit).
 		"workers": {
 			args:          1,
 			desc:          "Worker thread count",
@@ -172,10 +173,14 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 			args:          1,
 			desc:          "AF_XDP ring entries per queue",
 			valueType:     ValueInteger,
-			valueDesc:     "AF_XDP ring entries per queue (>= 1; rounded up to a power of two)",
+			valueDesc:     "AF_XDP ring entries per queue (power of two in [1..16384])",
 			valueExamples: []string{"1024", "2048"},
-			validator:     ValidateIntegerMin(1),
-			children:      nil,
+			// #2524: bound [1..MaxRingEntries] AND power-of-two. The
+			// helper preallocates ~3×ring_entries UMEM frames per binding
+			// (bind.rs), so an unbounded value OOM'd at bring-up instead
+			// of failing as a clean commit error.
+			validator: ValidateRingEntries,
+			children:  nil,
 		},
 		// Only these two strings are acted on; anything else was
 		// silently ignored (compiler_system.go poll-mode case).
