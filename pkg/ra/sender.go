@@ -388,6 +388,29 @@ func (s *sender) requestBurst() {
 // PRECEDES it).
 func (s *sender) draining() bool { return s.mode.Load() != int32(modeNone) }
 
+// dead reports whether this sender's owner goroutine resolved its openConn
+// attempt WITHOUT producing a live NDP conn — i.e. the bind gave up after all
+// retries, or a stop pre-empted the open before it succeeded. Such a sender
+// will never emit an RA: its run() goes straight to finishShutdown and exits.
+//
+// connOpened is stored BEFORE close(connReady) (signalConnReady), so observing
+// the closed channel guarantees the stored value is visible (Go memory model).
+// A sender whose open is still in flight (connReady not yet closed) is NOT
+// dead — it may still come up — so this returns false until the attempt has
+// resolved. The manager uses this in its Apply reconcile to REBUILD a sender
+// that failed its initial open instead of treating the config-unchanged entry
+// as healthy and skipping it forever (#2865): a transient boot-time bind
+// failure (link still doing DAD / link-local not yet present) then recovers on
+// the next reconcile without any config change.
+func (s *sender) dead() bool {
+	select {
+	case <-s.connReady:
+		return !s.connOpened.Load()
+	default:
+		return false
+	}
+}
+
 // run is the single-owner sender loop. It is the ONLY goroutine that writes or
 // closes the connection.
 func (s *sender) run() {

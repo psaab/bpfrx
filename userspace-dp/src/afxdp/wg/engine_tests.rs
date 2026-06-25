@@ -570,7 +570,7 @@ fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
                         .get(*idx as usize)
                         .expect("idx must be in bounds within a snapshot");
                     assert_eq!(
-                        &peer.pubkey, pubkey,
+                        &peer.peer.pubkey, pubkey,
                         "torn snapshot: index map and peer vec disagree"
                     );
                 }
@@ -837,7 +837,7 @@ fn encap_padded_plaintext_overflow_leaves_counter_and_buffer_untouched() {
 fn session_tx_counter(engine: &WgEngine, pubkey: &[u8; 32]) -> u64 {
     let table = engine.load_table();
     let idx = *table.peer_index_by_pubkey.get(pubkey).unwrap();
-    let peer = table.peers[idx as usize].clone();
+    let peer = table.peers[idx as usize].peer.clone();
     let cur = peer.current.read().unwrap().clone().unwrap();
     cur.tx_counter.load(Ordering::Relaxed)
 }

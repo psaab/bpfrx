@@ -2475,3 +2475,174 @@ func TestT2453_WithdrawDuringSlowBindEmitsGoodbye(t *testing.T) {
 			goodbyeCount, connsWithGoodbye, total)
 	}
 }
+
+// installFailThenSucceedListen wires listenFn + ensureLinkLocalFn so that the
+// FIRST open attempt for every interface FAILS (every bind retry returns an
+// error, so sender.openConn gives up — the boot-time "link still doing DAD /
+// link-local not yet present" case), and all subsequent opens (after fail is
+// set false) succeed instantly. It returns a setter to flip to the succeed
+// phase, a getConn accessor for the most-recent conn, and a liveCount probe.
+//
+// To keep the failing phase fast (the real listen() retries 10× with a 200ms
+// interruptible sleep between attempts), the test shortens that wait by stopping
+// the sender between Apply passes is NOT needed — instead we keep claimWaitTimeout
+// untouched and rely on the owner reaching finishShutdown quickly: the bind
+// returns its error immediately and the only delay is the inter-retry sleep,
+// which the test tolerates via waitDead's generous poll budget.
+func installFailThenSucceedListen(t *testing.T) (setSucceed func(), getConn func(string) *fakeConn, liveCount func() int32) {
+	t.Helper()
+	origListen := listenFn
+	origEnsure := ensureLinkLocalFn
+
+	var mu sync.Mutex
+	var live int32
+	var liveMu sync.Mutex
+	var fail atomic.Bool
+	fail.Store(true)
+	conns := map[string]*fakeConn{}
+
+	ensureLinkLocalFn = func(*net.Interface) error { return nil }
+	listenFn = func(iface *net.Interface, _ ndp.Addr) (ndpConn, netip.Addr, error) {
+		if fail.Load() {
+			return nil, netip.Addr{}, errors.New("ra-test: bind failed (link not ready)")
+		}
+		fc := newFakeConn()
+		fc.liveCounter = &live
+		fc.liveMu = &liveMu
+		liveMu.Lock()
+		live++
+		liveMu.Unlock()
+		mu.Lock()
+		conns[iface.Name] = fc
+		mu.Unlock()
+		return fc, netip.MustParseAddr("fe80::1"), nil
+	}
+
+	setSucceed = func() { fail.Store(false) }
+	getConn = func(name string) *fakeConn {
+		mu.Lock()
+		defer mu.Unlock()
+		return conns[name]
+	}
+	liveCount = func() int32 {
+		liveMu.Lock()
+		defer liveMu.Unlock()
+		return live
+	}
+
+	t.Cleanup(func() {
+		setSucceed()
+		for i := 0; i < 500; i++ {
+			if liveCount() == 0 {
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		listenFn = origListen
+		ensureLinkLocalFn = origEnsure
+	})
+	return setSucceed, getConn, liveCount
+}
+
+// senderDead reports whether the manager currently holds a sender for name whose
+// initial conn open resolved without a live conn (dead). Used by the #2865 test
+// to confirm the failed-open sender is in fact recorded as dead before the
+// recovery Apply.
+func (m *Manager) senderDead(name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.senders[name]
+	return ok && s.dead()
+}
+
+// TestT2865_DeadSenderRebuiltOnReconcile is the fail-on-revert proof for #2865:
+// a sender whose initial openConn() FAILS (transient boot-time bind failure)
+// stays in m.senders but never emits an RA. A subsequent Apply with the SAME
+// (unchanged) config MUST rebuild it once the link is ready, so the interface
+// eventually gets a live RA sender without any config change.
+//
+// Sequence:
+//  1. listenFn fails every open → Apply("lo") records a sender that goes dead.
+//  2. Flip listenFn to succeed (link now ready) — NO config change.
+//  3. Apply("lo") with the IDENTICAL config → reconcile must detect the dead
+//     sender, rebuild it, and the replacement opens a live conn that emits the
+//     startup burst.
+//
+// Fail-on-revert: drop the `!existing.dead()` guard in Apply's reconcile (so a
+// config-unchanged dead sender is skipped as "healthy"), and step 3 leaves the
+// dead sender in place — no live conn is ever opened, the assertion that a live
+// startup burst was emitted times out, and the test FAILS.
+func TestT2865_DeadSenderRebuiltOnReconcile(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	setSucceed, getConn, liveCount := installFailThenSucceedListen(t)
+
+	m := New()
+
+	// Step 1: every open fails. Apply records a sender, whose owner gives up and
+	// goes dead (run() -> openConn() false -> finishShutdown -> exit), but the
+	// dead sender remains in m.senders.
+	if err := m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}); err != nil {
+		t.Fatalf("Apply (failing phase): %v", err)
+	}
+
+	// Wait for the owner to resolve its (failed) open and be recorded as dead.
+	// The failing open retries 10× with a ~200ms inter-retry sleep (≈2s) before
+	// openConn gives up, so allow a generous budget (~4s).
+	deadObserved := false
+	for i := 0; i < 2000; i++ {
+		if m.senderDead("lo") {
+			deadObserved = true
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !deadObserved {
+		t.Fatal("sender never became dead after a failing open; cannot exercise #2865")
+	}
+	if lc := liveCount(); lc != 0 {
+		t.Fatalf("expected 0 live conns while opens fail, got %d", lc)
+	}
+
+	// Step 2: link is now ready — opens will succeed. NO config change.
+	setSucceed()
+
+	// Step 3: re-Apply the IDENTICAL config. The reconcile must REBUILD the dead
+	// sender (config is unchanged, so without the #2865 fix it would be skipped).
+	if err := m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}); err != nil {
+		t.Fatalf("Apply (recovery phase): %v", err)
+	}
+
+	// A live conn must now exist and emit the startup burst — proving the dead
+	// sender was rebuilt into a working one with no config change.
+	fc := waitConn(t, getConn, "lo")
+	waitWrites(t, fc, startupBurstCount)
+	for _, w := range fc.snapshot() {
+		if w.lifetime == 0 {
+			t.Fatalf("rebuilt sender emitted a lifetime-0 (goodbye) RA in its burst")
+		}
+	}
+
+	// The rebuilt sender must be live (not dead) and the sole conn.
+	if m.senderDead("lo") {
+		t.Fatal("sender is still dead after the recovery Apply — it was not rebuilt (#2865)")
+	}
+	if lc := liveCount(); lc != 1 {
+		t.Fatalf("expected exactly 1 live conn after the rebuild, got %d", lc)
+	}
+
+	// Clean teardown leaves no live conns.
+	if err := m.Withdraw(); err != nil {
+		t.Fatalf("Withdraw: %v", err)
+	}
+	for i := 0; i < 500; i++ {
+		if liveCount() == 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if lc := liveCount(); lc != 0 {
+		t.Fatalf("leaked %d live conns after Withdraw", lc)
+	}
+}

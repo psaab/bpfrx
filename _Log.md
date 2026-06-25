@@ -17017,6 +17017,28 @@ top.
   pkg/ra/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2836 WG PeerTable COW — make endpoint/keepalive/PSK part of
+  the atomic snapshot. `reconcile_peers` no longer interior-mutates a
+  reused `Arc<Peer>`'s config in place before the table swap (which let an
+  OLD-table reader see NEW config — a torn endpoint/keepalive/PSK read).
+  Split the operator-facing config into an immutable `PeerConfig` owned by a
+  per-snapshot `PeerEntry { peer: Arc<Peer>, config: Arc<PeerConfig> }`;
+  reconcile builds a FRESH `PeerConfig` per commit and reuses the long-lived
+  `Peer` (sessions/timers survive). Hot egress `peer_for_dest` reads the
+  endpoint from the loaded snapshot — removes the per-packet endpoint
+  `RwLock` (folds codex-049-04). Timers/handshake read config via new
+  `peer_config`/`peer_entry` snapshot helpers. Added FAIL-ON-REVERT test
+  `old_snapshot_observes_old_config_after_concurrent_reconcile` (pins the old
+  snapshot, races a reconcile, asserts old-all / new-all + reused peer Arc;
+  RED under simulated in-place mutation). Gates: cargo build --release -p
+  xpf-userspace-dp clean; cargo test --release --bin xpf-userspace-dp --
+  wg peer all green. No wire change (protocol_wire_v1.json untouched).
+  **File(s)**: userspace-dp/src/afxdp/wg/peer.rs,
+  userspace-dp/src/afxdp/wg/engine.rs,
+  userspace-dp/src/afxdp/wg/timers.rs,
+  userspace-dp/src/afxdp/wg/handshake_session.rs,
+  userspace-dp/src/afxdp/wg/tests.rs,
+  userspace-dp/src/afxdp/wg/engine_tests.rs, _Log.md
   **Action**: #2850 — add VRRP `preempt hold-time <seconds>` (vSRX parity).
   Without it a higher-priority node reclaims mastership from a still-live
   lower-priority master IMMEDIATELY on recovery — before BGP/OSPF converge —
@@ -17270,6 +17292,23 @@ top.
   TestObserveInterfaceAddrTransientVsDefinitive/LinkByName_error RED.
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2864 static-NAT DNAT zone fallback — evaluate the
+  `from zone` constraint PER CANDIDATE so a port-specific entry whose
+  zone does not match the packet's ingress zone falls through to the
+  whole-address `(dst_ip, None)` entry instead of short-circuiting to
+  no-DNAT. Port-specific precedence preserved (it still wins when its
+  zone matches). Added fail-on-revert test
+  `static_nat_dnat_port_zone_mismatch_falls_back_to_whole_address`
+  (port-zone-fail falls back; port wins on its zone; no candidate matches
+  ingress zone -> no DNAT; unknown IP -> no DNAT). No wire change.
+- **File(s)**: userspace-dp/src/nat/static_nat.rs,
+  userspace-dp/src/nat/tests.rs, docs/feature-coverage.md
+- **Validation**: cargo build --release -p xpf-userspace-dp (clean) ;
+  cargo test --release --bin xpf-userspace-dp -- nat dnat static
+  (466 passed, 0 failed). Fail-on-revert confirmed: reverting the
+  per-candidate `.filter(zone_ok)` fall-through to the once-after-precedence
+  zone check makes the new test RED at the `fallback match` expect.
+  protocol_wire_v1.json untouched.
 - **Action**: #2889 — reject FRR auth secrets containing whitespace at
   commit. A BGP neighbor password / OSPF-RIP-ISIS auth key with a space
   (or tab / control char) cannot be expressed as a single FRR/vtysh token
@@ -17304,3 +17343,25 @@ top.
   clean, go vet ./pkg/dhcprelay/..., go test ./pkg/dhcprelay/... PASS.
   **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
   pkg/dhcprelay/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2865 RA sender whose initial openConn() fails stayed in
+  m.senders as a dead entry; the config-unchanged Apply reconcile skipped it
+  (configEqual → continue), so a transient boot-time bind failure (link still
+  doing DAD / link-local not yet present) left that interface permanently with
+  no RA (IPv6 hosts lose default route / RDNSS) until daemon restart or a
+  config change. Fix: added sender.dead() (open attempt RESOLVED — connReady
+  closed — without a live conn, i.e. !connOpened) and gated the reconcile
+  skip with !existing.dead(); a dead sender is now treated as a hard-REBUILD
+  even with unchanged config, reusing the #2834 make-before-break replace path
+  (tombstone → stop old → start replacement on proven-close; a dead sender's
+  run() has already exited + closed its conn so the join is immediate). An
+  in-flight slow open is NOT dead (connReady not yet closed), so it is never
+  spuriously torn down — composes with #2453/#2835. Added fail-on-revert test
+  TestT2865_DeadSenderRebuiltOnReconcile (fail-then-succeed listenFn: open
+  fails → sender goes dead → re-Apply IDENTICAL config → rebuilt into a live
+  sender emitting the startup burst; RED when the !existing.dead() guard is
+  removed — "conn for lo never opened"). Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/ra/..., go test -race ./pkg/ra/... PASS.
+  **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/serialize_test.go,
+  pkg/ra/README.md, _Log.md
