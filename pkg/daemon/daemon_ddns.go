@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -252,6 +253,25 @@ func (d *Daemon) buildLeaseSubnetRGMap(cfg *config.Config) []leaseSubnetRG {
 	}
 	collect(cfg.System.DHCPServer.DHCPLocalServer)
 	collect(cfg.System.DHCPServer.DHCPv6LocalServer)
+	// Deterministic attribution (#2664 review MINOR): the source iterates Go
+	// maps (ls.Groups) in RANDOMIZED order, so a first-match resolver over an
+	// unsorted slice would attribute an address that falls in two OVERLAPPING
+	// pool subnets owned by DIFFERENT RGs non-deterministically — the gate would
+	// then FLAP between passes for that address. Sort MOST-SPECIFIC FIRST (longer
+	// prefix wins), with a stable tie-break (CIDR string, then RG) for
+	// equal-length prefixes, so rgForLeaseAddress's first-match is both
+	// longest-prefix-correct AND stable across reconciles.
+	sort.Slice(out, func(i, j int) bool {
+		oi, _ := out[i].net.Mask.Size()
+		oj, _ := out[j].net.Mask.Size()
+		if oi != oj {
+			return oi > oj // longer prefix (more specific) first
+		}
+		if si, sj := out[i].net.String(), out[j].net.String(); si != sj {
+			return si < sj
+		}
+		return out[i].rg < out[j].rg
+	})
 	return out
 }
 

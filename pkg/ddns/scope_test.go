@@ -40,6 +40,32 @@ func scopeManager(t *testing.T, up DNSUpdater, v4, v6 []Lease) *Manager {
 	return m
 }
 
+// scopeManagerSrc is scopeManager but also returns the mutable lease source so
+// a test can change the parsed lease set between reconcile passes (modeling a
+// steady-state partial demotion where the demoted RG's leases AGE OUT of the
+// memfile, not merely linger in a stale one).
+func scopeManagerSrc(t *testing.T, up DNSUpdater, v4, v6 []Lease) (*Manager, *fakeLeaseSource) {
+	t.Helper()
+	dir := t.TempDir()
+	src := &fakeLeaseSource{v4: v4, v6: v6}
+	m := newManagerForTesting(
+		src.parser(),
+		up,
+		filepath.Join(dir, "state.json"),
+		filepath.Join(dir, "leases4.csv"),
+		filepath.Join(dir, "leases6.csv"),
+		"node0",
+		func() time.Time { return time.Unix(1_700_000_000, 0) },
+	)
+	m.newUpdater = func(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig) (DNSUpdater, error) {
+		if !pol.enabled || c == nil {
+			return nopUpdater{}, nil
+		}
+		return up, nil
+	}
+	return m, src
+}
+
 // scopeRecOf counts how many owned records carry the given RGOwner.
 func ownedByRG(m *Manager, rg int) int {
 	m.mu.Lock()
@@ -293,5 +319,84 @@ func TestPerRGGateFailClosedUnattributable(t *testing.T) {
 	}
 	if len(m.state.records) != 0 {
 		t.Fatalf("an unattributable lease must not be recorded as owned, got %d", len(m.state.records))
+	}
+}
+
+// TestPerRGGatePartialDemotionSteadyState is the load-bearing #2664
+// fail-on-revert test (review MAJOR): on a STEADY-STATE partial demotion the
+// demoted RG's lease is GONE from the parsed set (its group was dropped from
+// the narrowed Kea config and the lease aged out of the memfile), NOT merely
+// lingering in a stale memfile. The demoted RG's owned record must STILL NOT be
+// withdrawn (stop-writing-never-withdraw, §5.6 — the peer that became MASTER for
+// that RG refreshes it; a withdraw would blackhole), while the kept RG keeps
+// publishing normally.
+//
+// This goes RED on the pre-fix HEAD (Pass 1 protected an owned record ONLY via
+// gatedScope, which is populated solely from CURRENT leases — so a demoted RG
+// whose lease is gone is seen as "expired" and WITHDRAWN) and GREEN with the
+// direct-gate guard (protect whenever the gate rejects the owned scope). It is a
+// reconcile-layer test: it asserts on the durable ownership store + the wire
+// delete calls, not on an updater-in-isolation.
+func TestPerRGGatePartialDemotionSteadyState(t *testing.T) {
+	up := newFakeUpdater()
+	rg1Lease := Lease{Family: 4, Address: "10.0.1.5", Identity: "mac:11", HostName: "rg1host", SubnetID: "1"}
+	rg2Lease := Lease{Family: 4, Address: "10.0.2.5", Identity: "mac:22", HostName: "rg2host", SubnetID: "2"}
+	m, src := scopeManagerSrc(t, up, []Lease{rg1Lease, rg2Lease}, nil)
+
+	cfg := &config.DHCPServerConfig{
+		DynamicDNS: &config.DHCPDynamicDNSConfig{Enabled: true, Domain: "example.com", TTLSeconds: 300},
+	}
+	resolver := func(l Lease) (ScopeKey, bool) {
+		switch l.Address {
+		case "10.0.1.5":
+			return ScopeKey{Family: FamilyV4, RGOwner: 1}, true
+		case "10.0.2.5":
+			return ScopeKey{Family: FamilyV4, RGOwner: 2}, true
+		}
+		return ScopeKey{}, false
+	}
+
+	// Phase 1: MASTER for BOTH RGs → both published + owned.
+	if err := m.ReconcileScoped(context.Background(), cfg,
+		ReconcileOptions{Gate: func(ScopeKey) bool { return true }, Resolver: resolver}); err != nil {
+		t.Fatalf("phase 1 reconcile: %v", err)
+	}
+	if ownedByRG(m, 1) != 1 || ownedByRG(m, 2) != 1 {
+		t.Fatalf("phase 1: both RGs should be owned: rg1=%d rg2=%d", ownedByRG(m, 1), ownedByRG(m, 2))
+	}
+
+	// Phase 2: STEADY-STATE partial demotion. The node lost RG2; the narrowed
+	// Kea config dropped RG2's group and RG2's lease AGED OUT of the memfile —
+	// so it is GONE from the parsed set (the critical difference from the
+	// transient-window test). The gate is closed for RG2.
+	src.v4 = []Lease{rg1Lease} // RG2's lease is NO LONGER present
+	up.upserts = nil
+	up.deletes = nil
+	gateRG1Only := func(s ScopeKey) bool { return s.RGOwner == 1 }
+	if err := m.ReconcileScoped(context.Background(), cfg,
+		ReconcileOptions{Gate: gateRG1Only, Resolver: resolver}); err != nil {
+		t.Fatalf("phase 2 reconcile: %v", err)
+	}
+
+	// THE ASSERTION (RED pre-fix): RG2's record must NOT be withdrawn even
+	// though no current lease references it — the gate rejects RG2's scope, so
+	// this node neither publishes nor withdraws it.
+	for _, d := range up.deletes {
+		if d.FQDN == "rg2host.example.com" {
+			t.Fatalf("STEADY-STATE partial demotion WITHDREW the demoted RG's record (§5.6 blackhole): %s", d.FQDN)
+		}
+	}
+	if ownedByRG(m, 2) != 1 {
+		t.Fatalf("RG2 owned record must be PRESERVED on steady-state partial demotion, got %d", ownedByRG(m, 2))
+	}
+	// And it must not have been republished from this node either.
+	for _, u := range up.upserts {
+		if u.FQDN == "rg2host.example.com" {
+			t.Fatalf("RG2 republished from a non-master node: %s", u.FQDN)
+		}
+	}
+	// RG1 stays owned + serviced (its lease is still present + the gate admits).
+	if ownedByRG(m, 1) != 1 {
+		t.Fatalf("RG1 owned record must remain, got %d", ownedByRG(m, 1))
 	}
 }

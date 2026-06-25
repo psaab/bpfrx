@@ -756,7 +756,24 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, env *reconcileEnv, le
 		// peer and blackhole (plan §5.6 / risk R3). This is the load-bearing
 		// #2664 invariant: a node that loses one RG must not delete that RG's
 		// records.
-		if gatedScope[owned.scopeOf().scopePrefix()] {
+		//
+		// The gate is consulted DIRECTLY on the owned record's stored scope
+		// (env.scopeAdmits), NOT only via gatedScope — which is populated solely
+		// from leases present in THIS cycle's parsed set. On a STEADY-STATE
+		// partial demotion the demoted RG's group is dropped from the narrowed
+		// Kea config (filterDHCPConfigForMasterRGs) and its leases age out of the
+		// memfile, so those leases vanish from the parsed set and gatedScope
+		// never learns the demoted RG's prefix. Without re-asking the gate here,
+		// Pass 1 would then see the demoted RG's owned record as "not wanted, not
+		// gated, not untrusted, not disabled" and WITHDRAW it — the exact §5.6
+		// blackhole the per-RG gate exists to prevent. Re-evaluating the SAME
+		// gate the publish path consults keeps publish and withdraw in agreement:
+		// a scope this node does not master is neither published nor withdrawn.
+		// Standalone (nil gate) admits every scope ⇒ this guard is inert and
+		// turn-off / expiry / reassignment withdrawal still works; a disabled
+		// family's owned records are in scopes this node DOES master, so the gate
+		// admits them and they are still withdrawn (turn-off cleanup unaffected).
+		if gatedScope[owned.scopeOf().scopePrefix()] || !env.scopeAdmits(owned.scopeOf()) {
 			if stillWanted {
 				d.seen = true
 			}

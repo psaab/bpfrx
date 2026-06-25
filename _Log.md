@@ -14061,3 +14061,44 @@ top.
   all green; `go test -race ./pkg/ddns/` green. `make test-failover` is
   MANDATORY (HA gate change) and DEFERRED to the parent (no cluster access);
   the gate is reasoned + unit-tested (partial-demotion + fail-on-revert).
+
+---
+
+## 2026-06-24 — #2691 P1b review fold (#2664 MAJOR + MINOR)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Address PR #2697 review (MERGE-NEEDS-MAJOR): one HA-correctness
+  MAJOR + one MINOR.
+- **MAJOR — partial-demotion withdrawal blackhole (#2664/§5.6)**: Pass 1
+  protected an owned record from withdrawal ONLY via `gatedScope`, which is
+  populated solely from leases in the CURRENT parsed set. On a STEADY-STATE
+  partial demotion the demoted RG's group is dropped from the narrowed Kea
+  config and its leases age out of the memfile → they vanish from the parsed
+  set → gatedScope never learns the demoted RG's prefix → Pass 1 saw the owned
+  record as expired and WITHDREW it (the exact blackhole the gate exists to
+  prevent). FIX (`pkg/ddns/manager.go` Pass 1): protect whenever the gate
+  rejects the OWNED record's stored scope —
+  `gatedScope[...] || !env.scopeAdmits(owned.scopeOf())` — re-consulting the
+  SAME gate the publish path uses so publish + withdraw agree. Standalone (nil
+  gate) admits all → guard inert → turn-off/expiry/reassign withdrawal
+  unaffected; disabled-family records are in mastered scopes → still withdrawn.
+- **MINOR — non-deterministic overlapping-pool attribution**:
+  `buildLeaseSubnetRGMap` appended in Go map-iteration order (randomized) and
+  `rgForLeaseAddress` first-matched, so two overlapping cross-RG pools could
+  flip the attributed RG between passes (gate flap). FIX
+  (`pkg/daemon/daemon_ddns.go`): sort the subnet→RG slice MOST-SPECIFIC-FIRST
+  (longest prefix wins) with a stable CIDR/RG tie-break.
+- **Tests**: `TestPerRGGatePartialDemotionSteadyState`
+  (`pkg/ddns/scope_test.go`) — Phase 2 DROPS the demoted RG's lease from the
+  source, asserts NOT withdrawn + still owned + kept RG keeps publishing;
+  VERIFIED RED on the pre-fix guard (withdrew rg2host) and GREEN with the fix
+  (fail-on-revert). `TestDDNSOverlappingPoolAttributionDeterministic`
+  (`pkg/daemon/daemon_ddns_scope_test.go`) — 50 rebuilds, overlap address
+  always attributes to the more-specific RG.
+- **File(s)**: [Edit] pkg/ddns/manager.go, pkg/ddns/scope_test.go,
+  pkg/daemon/daemon_ddns.go, pkg/daemon/daemon_ddns_scope_test.go,
+  pkg/ddns/README.md, _Log.md.
+- **Validation**: `go build ./...` clean; gofmt/vet clean on touched files;
+  `go test ./pkg/{ddns,config,dhcpserver,daemon}` green; `-race ./pkg/ddns`
+  green. `make test-failover` still MANDATORY — the parent re-runs it on the
+  folded head.

@@ -106,8 +106,15 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   subnet_id); the gate admits a scope IFF this node is MASTER for its RG. A
   gated-out scope is **stop-writing, never-withdraw**: its owned records are left
   untouched (the peer MASTER for that RG refreshes them — a withdraw would
-  blackhole, plan §5.6). Unattributable leases FAIL-CLOSED when RG-owned pools
-  exist. The daemon also nudges DDNS on a partial demotion
+  blackhole, plan §5.6). Pass 1 protects an owned record by re-consulting the
+  SAME gate on the record's STORED scope (`env.scopeAdmits(owned.scopeOf())`),
+  NOT only via the current-lease-derived `gatedScope` set — so a STEADY-STATE
+  partial demotion, where the demoted RG's leases have aged out of the parsed
+  set, still does not withdraw the demoted RG's records (#2664 review MAJOR;
+  `TestPerRGGatePartialDemotionSteadyState`). Unattributable leases FAIL-CLOSED
+  when RG-owned pools exist. Pool→RG attribution is sorted MOST-SPECIFIC-FIRST so
+  overlapping cross-RG pools attribute deterministically across passes (the gate
+  cannot flap). The daemon also nudges DDNS on a partial demotion
   (`clearRethServicesForRG`) so the gate change takes effect within one pass.
 - **Source / VRF binding (#2665, `backend_bind.go`)** — the per-family
   `source-address` / `destination-interface` / `routing-instance` leaves build a
