@@ -500,6 +500,123 @@ func TestHandleServerResponses_NakForwarded(t *testing.T) {
 	<-done
 }
 
+// newForceRenew builds a BOOTREPLY DHCPFORCERENEW (RFC 3203, type 9). The
+// server forces a client that ALREADY holds a lease back into RENEWING, so the
+// message carries the client's current address in ciaddr and no yiaddr.
+func newForceRenew(t *testing.T, ciaddr net.IP, chaddr net.HardwareAddr) *dhcpv4.DHCPv4 {
+	t.Helper()
+	pkt, err := dhcpv4.New()
+	if err != nil {
+		t.Fatalf("dhcpv4.New: %v", err)
+	}
+	pkt.OpCode = dhcpv4.OpcodeBootReply
+	pkt.HWType = iana.HWTypeEthernet
+	pkt.ClientHWAddr = chaddr
+	pkt.UpdateOption(dhcpv4.OptMessageType(messageTypeForceRenew))
+	pkt.YourIPAddr = net.IPv4zero
+	pkt.ClientIPAddr = ciaddr
+	return pkt
+}
+
+// TestDeliverReply_ForceRenew_UnicastCiaddr proves a DHCPFORCERENEW is unicast
+// to the client's current address (ciaddr), NOT broadcast like a NAK. RFC 3203
+// targets a client that already owns a lease, so the matrix must route a type-9
+// reply (yiaddr==0, real ciaddr, flag clear) through the ciaddr UDP-unicast row.
+func TestDeliverReply_ForceRenew_UnicastCiaddr(t *testing.T) {
+	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+	client := newFakeConn()
+	defer client.Close()
+	fl2 := &fakeL2{}
+
+	pkt := newForceRenew(t, testCiaddr, testChaddr)
+	if !deliverReply(ir, client, fl2, testGiaddr, pkt, pkt.ToBytes()) {
+		t.Fatal("deliverReply returned false (FORCERENEW not delivered)")
+	}
+
+	if fl2.callCount() != 0 {
+		t.Errorf("FORCERENEW must NOT use raw-L2 unicast, got %d calls", fl2.callCount())
+	}
+	if ir.repliesBroadcastNak.Load() != 0 {
+		t.Errorf("FORCERENEW must NOT take the NAK broadcast path, got %d", ir.repliesBroadcastNak.Load())
+	}
+	if ir.repliesUnicastCiaddr.Load() != 1 {
+		t.Errorf("repliesUnicastCiaddr = %d, want 1", ir.repliesUnicastCiaddr.Load())
+	}
+
+	client.mu.Lock()
+	writes := append([]fakeWrite(nil), client.writes...)
+	client.mu.Unlock()
+	if len(writes) != 1 {
+		t.Fatalf("expected 1 client UDP write, got %d", len(writes))
+	}
+	got := writes[0].addr.(*net.UDPAddr)
+	if !got.IP.Equal(testCiaddr) || got.Port != clientPort {
+		t.Errorf("FORCERENEW dst = %v, want unicast %v:%d", got, testCiaddr, clientPort)
+	}
+}
+
+// TestHandleServerResponses_ForceRenewForwarded is the fail-on-revert gate for
+// #2645: a DHCPFORCERENEW server reply MUST be forwarded to the client (unicast
+// to ciaddr), not silently dropped by the default arm. Removing
+// dhcpv4.MessageTypeForceRenew from the accepted set in handleServerResponses
+// makes this test red (the reply is never written to the client conn).
+func TestHandleServerResponses_ForceRenewForwarded(t *testing.T) {
+	fr := newForceRenew(t, testCiaddr, testChaddr)
+	fr.GatewayIPAddr = testGiaddr // server echoes giaddr; relay must zero it
+	serverConn := newFakeConn()
+	serverConn.mu.Lock()
+	serverConn.pending = [][]byte{fr.ToBytes()}
+	serverConn.mu.Unlock()
+	clientConn := newFakeConn()
+	defer clientConn.Close()
+	fl2 := &fakeL2{}
+	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		handleServerResponses(ctx, serverConn, clientConn, ir, fl2, testGiaddr)
+		close(done)
+	}()
+
+	// Wait for the client-direction write (the FORCERENEW must reach the client).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		clientConn.mu.Lock()
+		n := len(clientConn.writes)
+		clientConn.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	clientConn.mu.Lock()
+	writes := append([]fakeWrite(nil), clientConn.writes...)
+	clientConn.mu.Unlock()
+	if len(writes) != 1 {
+		t.Fatalf("DHCPFORCERENEW not forwarded to client: got %d writes, want 1", len(writes))
+	}
+	dst := writes[0].addr.(*net.UDPAddr)
+	if !dst.IP.Equal(testCiaddr) || dst.Port != clientPort {
+		t.Errorf("FORCERENEW forwarded to %v, want unicast %v:%d", dst, testCiaddr, clientPort)
+	}
+	if fl2.callCount() != 0 {
+		t.Errorf("FORCERENEW must not use raw-L2, got %d calls", fl2.callCount())
+	}
+	if ir.repliesForwarded.Load() != 1 {
+		t.Errorf("repliesForwarded = %d, want 1", ir.repliesForwarded.Load())
+	}
+	if ir.repliesUnicastCiaddr.Load() != 1 {
+		t.Errorf("repliesUnicastCiaddr = %d, want 1", ir.repliesUnicastCiaddr.Load())
+	}
+
+	cancel()
+	serverConn.Close()
+	<-done
+}
+
 // TestHandleServerResponses_L2SourceIsSavedGiaddr proves the end-to-end path:
 // handleServerResponses zeroes pkt.GatewayIPAddr before sending, yet the L2
 // frame's source IP is the SAVED giaddr passed by runRelay (#2076 §7.2 / SMR-F4)
