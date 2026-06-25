@@ -17494,3 +17494,21 @@ top.
   ./pkg/eventengine/... PASS.
   **File(s)**: pkg/eventengine/engine.go,
   pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2869 review fix — supersede() metrics double-count. In the
+  all-distinct-overflow case (queue full of distinct policies, a new distinct
+  policy arrives, no same-policy stale to evict) the FIFO tail-placement change
+  made the new action overflow supersede()'s refill default branch
+  (droppedQueueFull++) AND then enqueue() counted+warned again — net +2 on
+  xpf_event_actions_dropped_total{reason="queue_full"} for one dropped action.
+  Fix: guard the refill default increment with `if item.policyName !=
+  a.policyName` so supersede counts only un-replaceable SURVIVORS; the new
+  action's single count + warn is owned by enqueue (supersede returns false).
+  Added fail-on-revert TestSupersede_AllDistinctOverflowCountsDropOnce (fills 64
+  distinct, enqueues a 65th distinct, asserts droppedQueueFull delta == 1 and no
+  survivor evicted). Verified RED (delta=2) with the guard removed. Kept
+  TestSupersede_PreservesFIFOPlacesNewAtTail. Gates: go build ./..., gofmt -l
+  clean, go vet ./pkg/eventengine/..., go test -race ./pkg/eventengine/... PASS.
+  **File(s)**: pkg/eventengine/engine.go,
+  pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md, _Log.md

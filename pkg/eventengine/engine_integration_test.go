@@ -574,3 +574,44 @@ func TestSupersede_PreservesFIFOPlacesNewAtTail(t *testing.T) {
 		t.Errorf("superseding action prepended to head (LIFO regression, #2869)")
 	}
 }
+
+// #2869 metrics single-count: in the all-distinct-overflow case (queue full of
+// DISTINCT policies, a new DISTINCT policy arrives, NO same-policy stale entry
+// to evict), the new action is genuinely unfittable and must be dropped — but
+// exactly ONCE on xpf_event_actions_dropped_total{reason="queue_full"}.
+// supersede() returns false (it could not place `a` and evicted nothing), so
+// enqueue() owns the single count + warn; supersede() must NOT also count the
+// overflow of `a` itself in its refill `default` branch.
+//
+// FAIL-ON-REVERT: remove the `if item.policyName != a.policyName` guard around
+// supersede()'s refill `default` increment and this test goes RED — the drop is
+// counted twice (delta == 2).
+func TestSupersede_AllDistinctOverflowCountsDropOnce(t *testing.T) {
+	e := New(nil, nil)
+	defer e.Close()
+
+	// Fill the bounded queue completely with DISTINCT other-policy actions; no
+	// same-policy entry exists for the incoming action, so supersede() can evict
+	// nothing and the new action cannot be re-placed.
+	for i := 0; i < actionQueueDepth; i++ {
+		e.actions <- plannedAction{policyName: fmt.Sprintf("p%02d", i)}
+		e.counters.queueDepth.Add(1)
+	}
+
+	before := e.counters.droppedQueueFull.Load()
+
+	// A new DISTINCT policy arrives; enqueue() -> supersede() -> drop (no evict).
+	e.enqueue(plannedAction{policyName: "z"})
+
+	delta := e.counters.droppedQueueFull.Load() - before
+	if delta != 1 {
+		t.Fatalf("droppedQueueFull delta=%d; want exactly 1 (a single dropped action must not double-count, #2869)", delta)
+	}
+
+	// The queue must be unchanged: every original distinct action still present,
+	// none evicted to make room for the unfittable new arrival (correct FIFO:
+	// drop the new arrival, keep the older survivors).
+	if got := int(e.counters.queueDepth.Load()); got != actionQueueDepth {
+		t.Errorf("queueDepth=%d; want %d (no survivor should be evicted for an unfittable new arrival)", got, actionQueueDepth)
+	}
+}

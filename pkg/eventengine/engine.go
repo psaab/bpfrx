@@ -464,9 +464,16 @@ refill:
 				replaced = true
 			}
 		default:
-			// Still no room (lost the race to another producer). Count the
-			// loss for whatever we could not re-place.
-			e.counters.droppedQueueFull.Add(1)
+			// Still no room (lost the race to another producer, or the queue
+			// is full of unrelated policies and there was no stale same-policy
+			// entry to evict). Count the loss for any SURVIVOR we could not
+			// re-place — but NOT for the new action `a` itself: supersede
+			// returns false in that case and enqueue owns `a`'s single
+			// queue_full count + warn. Counting it here too would
+			// double-increment xpf_event_actions_dropped_total (#2869).
+			if item.policyName != a.policyName {
+				e.counters.droppedQueueFull.Add(1)
+			}
 		}
 	}
 	return replaced
