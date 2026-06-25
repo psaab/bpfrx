@@ -283,6 +283,32 @@ The daemon reads events, applies ownership filtering, and queues them to the
 peer sync stream. Ack frames flow back for replay buffer management. Pause,
 Resume, and DrainRequest frames support demotion-prep integration.
 
+#### DrainRequest fence (#2876)
+
+At demotion, `EventStream.SendDrainRequest` fences the drain to the last
+fully-applied sequence (`lastAppliedSeq`, the *target seq*) and blocks for the
+helper's `DrainComplete`. The drain is only reported successful when the
+**acked/drained seq has reached the target fence**:
+
+- **Helper side** (`handle_drain_request`, `event_stream/mod.rs`): the drain
+  loop tracks whether the target fence was reached. On a timeout below the
+  fence (the channel never produced the target seq within the 200 ms deadline)
+  the helper **withholds** `DrainComplete` rather than emitting one carrying a
+  below-target `replay_buf.back().seq`.
+- **Go side** (`SendDrainRequest`, `eventstream.go`): a `DrainComplete` with
+  `seq < targetSeq` is rejected as a **hard error**, and a context expiry
+  (helper withheld the completion) is likewise an error. Demotion must NOT
+  proceed past an unflushed fence.
+
+Before #2876 the Go side returned the first `DrainComplete` seq with no fence
+check and the helper emitted `DrainComplete` even on a below-fence timeout, so
+sessions created after the fence were never synced to the peer before it took
+over — silent HA session loss on failover. The fence carries no new wire field
+(the existing `DrainRequest` target seq and `DrainComplete` seq are reused), so
+the protocol is unchanged. Siblings in the same event-stream/drain cluster:
+#2882 (drain ignores the target_seq filter), #2877 (blocking writes), #2883
+(keepalive) — out of scope here.
+
 When the event stream is disconnected (helper restart, startup race), the
 daemon automatically falls back to RPC polling.
 
