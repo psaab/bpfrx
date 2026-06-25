@@ -1,4 +1,4 @@
-package dhcpserver
+package ddns
 
 import (
 	"encoding/json"
@@ -10,7 +10,8 @@ import (
 	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
-// ddns_state.go: the persistent ownership state store for #1387 DDNS — the
+// state.go (moved verbatim from pkg/dhcpserver/ddns_state.go in #2691 P1a):
+// the persistent ownership state store for #1387 DDNS — the
 // PROTECTION BOUNDARY for the never-delete-a-record-xpf-did-not-create
 // invariant (plan §4.2, §5 invariant 1, risk table "cardinal sin"). Every
 // record this firewall publishes is recorded here with the EXACT

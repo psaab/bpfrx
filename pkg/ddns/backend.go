@@ -1,4 +1,4 @@
-package dhcpserver
+package ddns
 
 import (
 	"context"
@@ -8,7 +8,8 @@ import (
 	"strings"
 )
 
-// ddns_dns.go: the DNS-update backend interface (#1387 plan §4.4) plus the
+// backend.go (moved verbatim from pkg/dhcpserver/ddns_dns.go in #2691 P1a):
+// the DNS-update backend interface (#1387 plan §4.4) plus the
 // pure record-construction helpers (forward A/AAAA + reverse PTR name).
 // Increment 1 ships the interface, the record model, and a fakeUpdater
 // (see ddns_test.go) so the reconciler is fully unit-testable with no
@@ -54,7 +55,7 @@ type DNSUpdater interface {
 }
 
 // nopUpdater is the no-op backend used when no live DNSUpdater is wired
-// (increment 1 defers the live rfc2136 backend; NewDDNSManager substitutes
+// (increment 1 defers the live rfc2136 backend; NewManager substitutes
 // this when nil is passed). Every call is a LOGGED no-op rather than a
 // crash: a missing backend must never turn lease processing into a panic.
 // Both methods return nil so the reconciler treats the (skipped) record as
@@ -63,7 +64,7 @@ type DNSUpdater interface {
 // and a no-op upsert that recorded ownership would let a later real backend
 // believe it already published the record). To keep the never-publish/never-
 // orphan invariants intact, the nopUpdater reports success so reconcile does
-// not wedge, and the manager-level guard (see DDNSManager.upsertLocked) is
+// not wedge, and the manager-level guard (see Manager.upsertLocked) is
 // what keeps a no-op upsert from recording phantom ownership.
 type nopUpdater struct{}
 

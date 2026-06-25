@@ -1,4 +1,4 @@
-package dhcpserver
+package ddns
 
 import (
 	"context"
@@ -14,6 +14,9 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// backend_rfc2136.go was moved verbatim from pkg/dhcpserver/ddns_rfc2136.go in
+// #2691 P1a (the pkg/ddns spine extraction). Logic is unchanged.
 
 // ddns_rfc2136.go: the LIVE RFC 2136 DNS-update backend (#1387 increment 2,
 // docs/research/1387-inc2-ddns-backend/plan.md §4.1). It implements the
@@ -96,7 +99,7 @@ type dnsExchanger interface {
 }
 
 // rfc2136Updater is the live DNSUpdater backend. It is STATELESS beyond
-// its resolved config — all ownership/state lives in the DDNSManager store
+// its resolved config — all ownership/state lives in the Manager store
 // (unchanged from Inc-1). A new one is built per reconcile from the current
 // policy (plan §6 fork 1: resolve-per-Reconcile), so a backend-config
 // change at commit takes effect on the next cycle with no swap race.
