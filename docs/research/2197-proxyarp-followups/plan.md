@@ -12,6 +12,42 @@ Per-item verdict:
 | 1. v6 proxy-NDP pneigh table install | MEDIUM | **PLAN-READY** | mirror the v4 NTF_PROXY install in the AF_INET6 branch — clear win, the netlink lib already supports it |
 | 2. re-assert proxy_arp after a non-commit link cycle | LOW | **PLAN-READY** | factor the apply-path reconcile into a daemon method, call it from the always-on periodic neighbor loop (standalone) + `reconcileRGState` (cluster) + post-`programRethMAC` |
 | 3. narrow over-answer to per-address (Junos parity) | LOW-MED | **PLAN-DEFER** | the #2160 case is exactly the topology where the pneigh branch CANNOT answer (`rt.dst.dev == dev`) → the sysctl is load-bearing → cannot be dropped without breaking the very case #2160 fixed; ship a documented, opt-in narrowing only after a lab characterization |
+| 4. disable the sysctl on proxy-arp removal (#2475) | MEDIUM | **SHIPPED** | the enable path (item 1/#2160) was one-way — a day-2 commit removing proxy-arp tore down the NTF_PROXY entries but left `proxy_arp`/`proxy_ndp` ON, leaking an over-broad responder until reboot. Track the enabled (iface → families) set on the daemon, diff it on every reconcile, and write `0` for the dropped pairs |
+
+---
+
+## Item 4 — disable the proxy responder sysctl on removal (#2475)
+
+`dataplane.ReconcileProxyARP` is stateless across commits: it only ever sees
+the *current* config, so the original code enabled `proxy_arp`/`proxy_ndp`
+when proxy-arp was configured but never disabled it when the config was
+removed (the reconcile early-returned on an empty entry list). The
+NTF_PROXY neighbor entries were torn down by the stale-removal pass, but the
+broad per-interface sysctl stayed `1`, so the interface kept proxy-ARPing
+for any target routed out a different interface (the `arp_fwd_proxy` breadth
+documented on `proxyARPSysctlSeam`) until reboot.
+
+Fix (symmetric with the enable path, fail-safe):
+
+- `ReconcileProxyARP` now returns the `(interface name → enabled families)`
+  set it enabled this pass (it was already computed for the enable call).
+- `dataplane.DisableProxyResponders` mirrors `enableProxyResponders` exactly
+  (same iteration, deterministic v4-before-v6 order, best-effort/never-fatal)
+  but writes `0`. Both share `toggleProxyResponders`, and
+  `writeProxyResponderSysctl` gained an `enable bool` selecting `1`/`0`.
+- The daemon remembers the last-enabled set (`Daemon.proxyARPEnabled`, guarded
+  by `proxyARPEnabledMu` because the apply path and the always-on re-assert
+  loop both reconcile). On every reconcile it diffs the fresh set against the
+  remembered one (`diffProxyResponders`) and disables the dropped pairs. An
+  interface that keeps some families but drops others disables only the
+  dropped families. `reconcileProxyARP` no longer early-returns on an empty
+  config when there is prior state to tear down — that is the teardown
+  trigger — but stays a true no-op on configs that never used proxy-arp.
+
+Tests: `pkg/daemon` `TestDiffProxyResponders` (hermetic, table-driven, the
+fail-on-revert anchor) + `TestReconcileProxyARP_DisablesOnRemoval`
+(privileged integration over `lo`, SKIPs unprivileged); `pkg/dataplane`
+seam assertions extended with the enable/disable bit.
 
 ---
 
