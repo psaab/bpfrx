@@ -568,8 +568,14 @@ func TestApply_MultiInterface_NoCollision(t *testing.T) {
 	clientIfaces := map[string]bool{}
 	clientListeners, serverListeners := 0, 0
 	for _, c := range calls {
-		if c.bindAddr.Port == relayPort {
+		// Both conns now bind port 67 (#2888): classify by bind IP — the client
+		// listener binds the 0.0.0.0 wildcard, the server conn binds the
+		// specific giaddr.
+		if c.bindAddr.IP.Equal(net.IPv4zero) {
 			clientListeners++
+			if c.bindAddr.Port != relayPort {
+				t.Errorf("client listener must bind :67: %+v", c)
+			}
 			if !c.reusePort {
 				t.Errorf("client listener on :67 must set reusePort: %+v", c)
 			}
@@ -579,14 +585,17 @@ func TestApply_MultiInterface_NoCollision(t *testing.T) {
 			if c.ifaceName == "" {
 				t.Errorf("client listener MUST have non-empty BINDTODEVICE ifaceName: %+v", c)
 			}
-			if !c.bindAddr.IP.Equal(net.IPv4zero) {
-				t.Errorf("client listener must bind 0.0.0.0: %+v", c)
-			}
 			clientIfaces[c.ifaceName] = true
 		} else {
 			serverListeners++
-			if c.reusePort {
-				t.Errorf("server conn must NOT set reusePort: %+v", c)
+			// #2888: the server conn must bind giaddr:67 (BOOTPS) so a strict
+			// server's reply to giaddr:67 is received, and must set reusePort so
+			// the :67 bind coexists with the client listener's 0.0.0.0:67.
+			if c.bindAddr.Port != relayPort {
+				t.Errorf("server conn must bind :67 (BOOTPS), got %+v", c)
+			}
+			if !c.reusePort {
+				t.Errorf("server conn must set reusePort to coexist on :67: %+v", c)
 			}
 			if c.ifaceName != "" {
 				t.Errorf("server conn must NOT set BINDTODEVICE: %+v", c)
@@ -601,6 +610,68 @@ func TestApply_MultiInterface_NoCollision(t *testing.T) {
 	}
 	if len(clientIfaces) != 2 {
 		t.Errorf("expected 2 distinct client ifaceNames, got %v", clientIfaces)
+	}
+}
+
+// TestServerConn_BindsGiaddrBOOTPS is the #2888 fail-on-revert guard. RFC 2131
+// §4.1 specifies a server unicasts its reply back to the relay agent at
+// giaddr:67 (BOOTPS), NOT the relay's source port. If the server-facing socket
+// binds an ephemeral port (giaddr:0) — the pre-#2888 behavior — a strict
+// server's reply to giaddr:67 has no listener and is dropped, so a relayed
+// lease never completes.
+//
+// This test asserts, by construction, that the server conn binds to the resolved
+// giaddr on PORT 67. Reverting the bind to Port:0 (ephemeral) makes the
+// `Port != relayPort` assertion fail RED. It also pins the reusePort=true
+// requirement, since giaddr:67 must coexist with the client listener's
+// 0.0.0.0:67 (without SO_REUSEADDR/SO_REUSEPORT the second :67 bind would
+// EADDRINUSE in production).
+func TestServerConn_BindsGiaddrBOOTPS(t *testing.T) {
+	factory, getCalls := recordingFactory()
+	m := testManager(factory)
+	defer m.Stop()
+
+	// testManager's resolver returns 10.0.0.254 as the giaddr.
+	wantGIAddr := net.IPv4(10, 0, 0, 254)
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	waitRelays(t, m, 1, 2*time.Second)
+	calls := waitCalls(t, getCalls, 2, 2*time.Second) // client + server conn
+
+	var serverCalls int
+	for _, c := range calls {
+		// The server conn binds the specific giaddr; the client listener binds
+		// the 0.0.0.0 wildcard.
+		if c.bindAddr.IP.Equal(net.IPv4zero) {
+			continue
+		}
+		serverCalls++
+		if !c.bindAddr.IP.Equal(wantGIAddr) {
+			t.Errorf("server conn must bind the resolved giaddr %v, got %v",
+				wantGIAddr, c.bindAddr.IP)
+		}
+		// FAIL-ON-REVERT: the server-facing socket MUST bind BOOTPS (67), not an
+		// ephemeral port (0). Reverting to Port:0 turns this RED.
+		if c.bindAddr.Port != relayPort {
+			t.Errorf("server conn must bind giaddr:%d (BOOTPS) so a strict "+
+				"server's reply to giaddr:67 is received (#2888), got port %d: %+v",
+				relayPort, c.bindAddr.Port, c)
+		}
+		// giaddr:67 must coexist with the client listener's 0.0.0.0:67.
+		if !c.reusePort {
+			t.Errorf("server conn must set SO_REUSEADDR/SO_REUSEPORT to coexist "+
+				"with the client listener on :67 (#2888): %+v", c)
+		}
+		if c.broadcast {
+			t.Errorf("server conn must not set SO_BROADCAST (server replies are unicast): %+v", c)
+		}
+		if c.ifaceName != "" {
+			t.Errorf("server conn must NOT set BINDTODEVICE: %+v", c)
+		}
+	}
+	if serverCalls != 1 {
+		t.Fatalf("expected exactly 1 server conn (non-wildcard bind), got %d: %+v",
+			serverCalls, calls)
 	}
 }
 
@@ -1260,11 +1331,12 @@ func TestRunRelay_IfindexDrift_RebindsListener(t *testing.T) {
 	// producing 2 more factory calls (gen-2 client + server).
 	calls := waitCalls(t, getCalls, 4, 2*time.Second)
 
-	// The rebound client listener (a :67 call after the first two) must keep the
-	// per-interface SO_BINDTODEVICE ifaceName.
+	// The rebound client listener (a 0.0.0.0:67 call after the first two) must
+	// keep the per-interface SO_BINDTODEVICE ifaceName. Both conns now bind :67
+	// (#2888), so classify the client listener by its 0.0.0.0 wildcard bind.
 	clientListeners := 0
 	for _, c := range calls {
-		if c.bindAddr.Port == relayPort {
+		if c.bindAddr.IP.Equal(net.IPv4zero) {
 			clientListeners++
 			if c.ifaceName != "ge-0-0-0" {
 				t.Errorf("rebound client listener lost BINDTODEVICE ifaceName: %+v", c)

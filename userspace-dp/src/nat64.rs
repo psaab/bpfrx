@@ -47,8 +47,30 @@
 //!   with an emptied pool — `allocate_v4_source` then returns `None` and NAT64
 //!   forward translation silently stops (a fail-open in the retired-eBPF
 //!   enforcement plane).
+//!
+//! ## Single Ethernet-header writer (#2844)
+//!
+//! The NAT64 frame builders ([`build_nat64_v6_to_v4_frame`] /
+//! [`build_nat64_v4_to_v6_frame`]) serialize their Ethernet header through the
+//! shared SSOT writer [`crate::afxdp::write_eth_header_slice`] — the same
+//! in-place writer used by `gre.rs`, `icmp.rs`, and the TX segmentation path —
+//! NOT a private copy. NAT64 lives at the crate root (`mod nat64;`), outside
+//! `crate::afxdp`, so the `pub(in crate::afxdp)` writer is re-exported
+//! `pub(crate)` from `afxdp/mod.rs` for it. NAT64 still passes a bare `vlan_id:
+//! u16`; the shared writer's `TxVlanTag::from(u16)` reproduces the legacy
+//! semantics byte-for-byte (tag present iff `vlan_id > 0`, TPID 0x8100, PCP/DEI
+//! 0), so output is identical for every frame the dataplane currently emits.
+//! The point of unifying is forward-compatibility: a future TPID / PCP / DEI /
+//! 802.1ad (0x88a8) / priority-tagged-VID-0 / ethertype change in the shared
+//! frame module now propagates to NAT64 automatically instead of silently
+//! drifting. Pinned by the byte-identical fail-on-revert test
+//! `nat64_eth_header_is_ssot_byte_identical`.
 
 use crate::NAT64RuleSnapshot;
+// #2844: shared SSOT in-place Ethernet-header writer (one writer for
+// the whole dataplane). Re-exported `pub(crate)` from `crate::afxdp`
+// because NAT64 lives outside `crate::afxdp`.
+use crate::afxdp::write_eth_header_slice;
 use crate::nat::NatDecision;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1831,7 +1853,10 @@ pub(crate) fn build_nat64_v6_to_v4_frame(
     // `_into` core (no intermediate L3 `Vec`, no second copy — #2211), then
     // truncate to the exact length.
     let mut out = vec![0u8; eth_len + ipv6_packet.len()];
-    write_eth_header(&mut out, eth_dst, eth_src, vlan_id, 0x0800)?;
+    // #2844: use the SSOT in-place Ethernet writer shared with gre.rs,
+    // icmp.rs, and the TX segmentation path instead of a private copy,
+    // so VLAN/TPID/PCP/ethertype changes propagate to NAT64 too.
+    write_eth_header_slice(&mut out, eth_dst, eth_src, vlan_id, 0x0800)?;
     let written =
         write_v6_to_v4_into(&mut out[eth_len..], ipv6_packet, snat_v4, dst_v4, no_v6_frag_header)?;
     out.truncate(eth_len + written);
@@ -1862,7 +1887,8 @@ pub(crate) fn build_nat64_v4_to_v6_frame(
     // core (no intermediate L3 `Vec`, no second copy — #2211), then truncate to
     // the exact length.
     let mut out = vec![0u8; eth_len + ipv4_packet.len().saturating_add(2 * NAT64_HEADER_DELTA as usize)];
-    write_eth_header(&mut out, eth_dst, eth_src, vlan_id, 0x86dd)?;
+    // #2844: SSOT Ethernet writer (see build_nat64_v6_to_v4_frame).
+    write_eth_header_slice(&mut out, eth_dst, eth_src, vlan_id, 0x86dd)?;
     let written = write_v4_to_v6_into(&mut out[eth_len..], ipv4_packet, src_v6, dst_v6)?;
     out.truncate(eth_len + written);
     Some(out)
@@ -1893,33 +1919,15 @@ fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
     }
 }
 
-/// Write Ethernet header (with optional VLAN tag) into the beginning of `buf`.
-fn write_eth_header(
-    buf: &mut [u8],
-    dst: [u8; 6],
-    src: [u8; 6],
-    vlan_id: u16,
-    ether_type: u16,
-) -> Option<()> {
-    if vlan_id > 0 {
-        if buf.len() < 18 {
-            return None;
-        }
-        buf[..6].copy_from_slice(&dst);
-        buf[6..12].copy_from_slice(&src);
-        buf[12..14].copy_from_slice(&0x8100u16.to_be_bytes());
-        buf[14..16].copy_from_slice(&vlan_id.to_be_bytes());
-        buf[16..18].copy_from_slice(&ether_type.to_be_bytes());
-    } else {
-        if buf.len() < 14 {
-            return None;
-        }
-        buf[..6].copy_from_slice(&dst);
-        buf[6..12].copy_from_slice(&src);
-        buf[12..14].copy_from_slice(&ether_type.to_be_bytes());
-    }
-    Some(())
-}
+// #2844: NAT64's private `write_eth_header` (hardcoded 0x8100 TPID,
+// bare-VID semantics) was deleted. The frame builders above now call
+// the shared SSOT `crate::afxdp::write_eth_header_slice`, the same
+// in-place writer used by gre.rs, icmp.rs, and the TX segmentation
+// path. The SSOT writer's `From<u16>` VLAN semantics (tag present iff
+// `vlan_id > 0`, TPID 0x8100, PCP/DEI 0) reproduce the deleted copy's
+// behavior byte-for-byte, so output is identical for every NAT64
+// frame the dataplane currently emits — while a future TPID/PCP/DEI/
+// 802.1ad/ethertype change in the shared module now reaches NAT64.
 
 // ---------------------------------------------------------------------------
 // Tests

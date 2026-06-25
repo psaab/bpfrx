@@ -625,6 +625,87 @@ fn frame_building_v6_to_v4_with_vlan() {
     assert_eq!(u16::from_be_bytes([result[16], result[17]]), 0x0800);
 }
 
+// #2844: SSOT eth-header fail-on-revert.
+//
+// The NAT64 frame builders must emit their Ethernet header through the
+// shared `crate::afxdp::write_eth_header_slice`, not a private
+// hardcoded copy. These tests pin the EXACT L2 header bytes the SSOT
+// writer produces for both translation directions, tagged and
+// untagged, so the assertions are byte-identical to the intended
+// frame. They go RED if the builder reverts to a private writer that
+// emits the wrong ethertype (e.g. 0x86dd on the v6→v4 IPv4 frame),
+// the wrong TPID, or the wrong dst/src MAC / VLAN placement.
+#[test]
+fn nat64_eth_header_is_ssot_byte_identical() {
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let eth_dst = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66];
+    let eth_src = [0xaau8, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+
+    // --- v6→v4, untagged: ethertype must be IPv4 (0x0800). ---
+    let pkt = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"ssot");
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[0x01; 6]);
+    frame.extend_from_slice(&[0x02; 6]);
+    frame.extend_from_slice(&0x86ddu16.to_be_bytes());
+    frame.extend_from_slice(&pkt);
+    let out = build_nat64_v6_to_v4_frame(
+        &frame,
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(198, 51, 100, 50),
+        eth_dst,
+        eth_src,
+        0, // untagged
+        false,
+    )
+    .expect("build v6->v4 untagged");
+    // Reference: the SSOT writer applied to a fresh buffer.
+    let mut want = [0u8; 14];
+    crate::afxdp::write_eth_header_slice(&mut want, eth_dst, eth_src, 0, 0x0800)
+        .expect("ssot ref");
+    assert_eq!(&out[..14], &want, "v6->v4 untagged L2 header must match SSOT");
+    // Explicit field pins so the intent is RED-obvious on revert.
+    assert_eq!(&out[0..6], &eth_dst, "dst MAC");
+    assert_eq!(&out[6..12], &eth_src, "src MAC");
+    assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x0800, "ethertype IPv4");
+
+    // --- v6→v4, tagged VLAN 100: TPID 0x8100, then VID, then 0x0800. ---
+    let out_t = build_nat64_v6_to_v4_frame(
+        &frame,
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(198, 51, 100, 50),
+        eth_dst,
+        eth_src,
+        100,
+        false,
+    )
+    .expect("build v6->v4 tagged");
+    let mut want_t = [0u8; 18];
+    crate::afxdp::write_eth_header_slice(&mut want_t, eth_dst, eth_src, 100, 0x0800)
+        .expect("ssot ref tagged");
+    assert_eq!(&out_t[..18], &want_t, "v6->v4 tagged L2 header must match SSOT");
+    assert_eq!(u16::from_be_bytes([out_t[12], out_t[13]]), 0x8100, "TPID");
+    assert_eq!(u16::from_be_bytes([out_t[14], out_t[15]]), 100, "VID");
+    assert_eq!(u16::from_be_bytes([out_t[16], out_t[17]]), 0x0800, "ethertype IPv4");
+
+    // --- v4→v6, untagged: ethertype must be IPv6 (0x86dd). ---
+    let v4src = Ipv4Addr::new(198, 51, 100, 50);
+    let v4dst = Ipv4Addr::new(198, 51, 100, 1);
+    let v4pkt = make_ipv4_tcp_packet(v4src, v4dst, 80, 12345, b"ssot");
+    let mut frame4 = Vec::new();
+    frame4.extend_from_slice(&[0x03; 6]);
+    frame4.extend_from_slice(&[0x04; 6]);
+    frame4.extend_from_slice(&0x0800u16.to_be_bytes());
+    frame4.extend_from_slice(&v4pkt);
+    let out4 = build_nat64_v4_to_v6_frame(&frame4, src_v6, dst_v6, eth_dst, eth_src, 0)
+        .expect("build v4->v6 untagged");
+    let mut want4 = [0u8; 14];
+    crate::afxdp::write_eth_header_slice(&mut want4, eth_dst, eth_src, 0, 0x86dd)
+        .expect("ssot ref v4->v6");
+    assert_eq!(&out4[..14], &want4, "v4->v6 untagged L2 header must match SSOT");
+    assert_eq!(u16::from_be_bytes([out4[12], out4[13]]), 0x86dd, "ethertype IPv6");
+}
+
 // ---------------------------------------------------------------------------
 // Regression tests for #1641: translate_v4_to_v6 must trim the L4 payload to
 // the IPv4 Total Length field, not the end of the input slice. The caller

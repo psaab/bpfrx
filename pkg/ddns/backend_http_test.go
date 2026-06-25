@@ -320,6 +320,77 @@ func TestMatchesGenericOKUnit(t *testing.T) {
 	}
 }
 
+// TestGenericURLTemplateValidation is the #2841 fail-on-revert gate for the
+// runtime construction path. The generic url-template was validated PREFIX-ONLY
+// (a bare HasPrefix http(s):// check), so a host-less or wrong-scheme template
+// constructed a backend that then failed at the first publish. newGenericBackend
+// must now reject a malformed template (no host / wrong scheme) at construction,
+// with the SAME discipline as checkip's validateCheckIPURL, while remaining
+// TEMPLATE-AWARE: a valid template carrying inadyn %h/%i/%u/%p specifiers — even
+// a credential in the userinfo, which makes net/url.Parse FAIL — must be
+// accepted. Goes RED if the validation reverts to prefix-only or switches to a
+// naive url.Parse.
+func TestGenericURLTemplateValidation(t *testing.T) {
+	reject := []string{
+		"https://",           // scheme only, no host
+		"https:///upd?ip=%i", // host-less but http(s):// prefix
+		"ftp://host/upd",     // wrong scheme
+		"not a url",          // no scheme
+		"http//host/upd",     // missing colon -> no "://"
+		"://host/upd",        // empty scheme
+	}
+	for _, tmpl := range reject {
+		if err := validateGenericURLTemplate(tmpl); err == nil {
+			t.Errorf("validateGenericURLTemplate(%q) = nil, want error", tmpl)
+		}
+		if _, err := newGenericBackend(&config.DDNSProvider{
+			Name: "g", Backend: "generic", URLTemplate: tmpl,
+		}); err == nil {
+			t.Errorf("newGenericBackend(%q) = nil error, want rejection", tmpl)
+		}
+	}
+
+	accept := []string{
+		"https://api.example.net/update?host=%h&ip=%i", // %-specifiers in query
+		"http://api.example.net/upd",                   // plain http
+		"HTTPS://api.example.net/upd?ip=%i",            // uppercase scheme (RFC 3986 §3.1)
+		"https://user:%p@api.example.net/upd?host=%h",  // credential in userinfo (url.Parse FAILS here)
+		"https://api.example.net:8443/upd?ip=%i",       // explicit port
+	}
+	for _, tmpl := range accept {
+		if err := validateGenericURLTemplate(tmpl); err != nil {
+			t.Errorf("validateGenericURLTemplate(%q) = %v, want nil", tmpl, err)
+		}
+		if _, err := newGenericBackend(&config.DDNSProvider{
+			Name: "g", Backend: "generic", URLTemplate: tmpl,
+		}); err != nil {
+			t.Errorf("newGenericBackend(%q) = %v, want nil", tmpl, err)
+		}
+	}
+
+	// #2841 credential-leak fold: a malformed template that carries a secret in
+	// the userinfo or query must NOT echo that secret in the construction error
+	// (the error is logged via slog.Warn at the surface-A construction site). The
+	// template is run through config.RedactURL before embedding. Goes RED if the
+	// raw template is embedded again.
+	for _, tc := range []struct {
+		tmpl, secret string
+	}{
+		{"ftp://user:SUPERSECRET@host/upd", "SUPERSECRET"}, // wrong scheme + userinfo secret
+		{"https:///upd?token=SUPERSECRET", "SUPERSECRET"},  // host-less + query secret
+	} {
+		_, err := newGenericBackend(&config.DDNSProvider{
+			Name: "g", Backend: "generic", URLTemplate: tc.tmpl,
+		})
+		if err == nil {
+			t.Fatalf("newGenericBackend(%q) = nil error, want rejection", tc.tmpl)
+		}
+		if strings.Contains(err.Error(), tc.secret) {
+			t.Errorf("construction error leaked the secret %q: %v", tc.secret, err)
+		}
+	}
+}
+
 func TestGenericRenderUnit(t *testing.T) {
 	got := renderGenericURL("https://x/u?h=%h&i=%i&p=%p&lit=%%", "host.tld", "1.2.3.4", "", "p@ss")
 	if !strings.Contains(got, "h=host.tld") || !strings.Contains(got, "i=1.2.3.4") {
