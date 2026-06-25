@@ -15702,6 +15702,19 @@ top.
   userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2791 frr/bgp — decouple BGP maximum-paths from global ECMP.
+  `generateProtocols` seeded `bgpMaxPaths := ecmpMaxPaths` then only bumped
+  it for `bgp.Multipath`, so a global forwarding-table ECMP setting silently
+  rendered `maximum-paths` into both BGP unicast address-families, enabling
+  BGP multipath path-selection the operator never configured. Fix: drive the
+  BGP address-family `maximum-paths` SOLELY from `bgp.Multipath`
+  (`bgpMaxPaths := bgp.Multipath`); the global ECMP knob still reaches the
+  IGP/zebra `maximum-paths` lines via `ecmpMaxPaths`. Reworked
+  TestGenerateProtocols_ECMPMaxPaths (was asserting the coupled bug) and
+  added TestGenerateProtocols_BGPMaxPathsDecoupledFromECMP (dual-stack
+  fail-on-revert pin — RED when the coupling is restored, both AFs checked).
+  **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
+  pkg/frr/README.md, _Log.md
   **Action**: #2573 — cached TX-selection records ALL matched `then count`
   terms, not just the last. #2544 fall-through lets one packet match
   multiple `then count` terms; the cached flow-replay descriptor held a
