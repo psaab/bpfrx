@@ -10,7 +10,7 @@
 
 use super::helpers::{
     bindings_settled, forwarding_unsupported_error, parse_session_sync_mac,
-    set_bindings_forwarding_armed, should_run_afxdp,
+    reconcile_status_bindings, set_bindings_forwarding_armed, should_run_afxdp,
 };
 use super::{handle_stream, ServerState};
 use crate::state_writer::StateWriter;
@@ -803,6 +803,78 @@ fn should_run_afxdp_requires_armed_and_supported() {
     assert!(should_run_afxdp(&status), "armed + supported must run");
     status.forwarding_armed = false;
     assert!(!should_run_afxdp(&status), "unarmed must not run");
+}
+
+#[test]
+fn reconcile_disarmed_clears_full_stale_binding_survivors() {
+    // #2794 fail-on-revert. When `should_run_afxdp` goes false
+    // (forwarding disarmed), `reconcile_status_bindings` takes the early
+    // return arm. Before #2794 that arm hand-cleared only a SUBSET of the
+    // per-binding fields (`bound`/`xsk_registered`/`xsk_bind_mode`/
+    // `zero_copy`/`socket_fd`/`ready`/`last_error`) and left the SAME
+    // survivor class #2515 fixed on the no_snapshot reconcile arm stale:
+    // `socket_ifindex`/`socket_queue_id`/`socket_bind_flags`,
+    // `flow_cache_capacity`, and `active_flow_count`. Routing the arm
+    // through `refresh_bindings` (which sends every now-workerless slot
+    // through `zero_unbound_slot`) clears the FULL set.
+    //
+    // Seed a slot that looks like it was actively bound + forwarding, then
+    // disarm and reconcile. If someone reverts to the partial hand-clear,
+    // the survivor assertions below FAIL (the socket/flow-cache fields
+    // stay non-zero).
+    let state = new_state(ProcessStatus {
+        // forwarding_armed = false -> should_run_afxdp() false -> early arm.
+        forwarding_armed: false,
+        capabilities: UserspaceCapabilities {
+            forwarding_supported: true,
+            unsupported_reasons: Vec::new(),
+        },
+        bindings: vec![BindingStatus {
+            slot: 0,
+            registered: true,
+            // --- the subset the old hand-clear DID reset ---
+            bound: true,
+            xsk_registered: true,
+            xsk_bind_mode: "zero-copy".to_string(),
+            zero_copy: true,
+            socket_fd: 42,
+            ready: true,
+            last_error: "stale".to_string(),
+            // --- the #2794 survivor class the old hand-clear LEFT STALE ---
+            socket_ifindex: 7,
+            socket_queue_id: 3,
+            socket_bind_flags: 0x4,
+            flow_cache_capacity: 65536,
+            active_flow_count: 123,
+            // a representative counter gauge, also a survivor pre-#2794
+            rx_packets: 999,
+            ..BindingStatus::default()
+        }],
+        ..ProcessStatus::default()
+    });
+
+    {
+        let mut guard = state.lock().expect("state");
+        reconcile_status_bindings(&mut guard);
+    }
+
+    let guard = state.lock().expect("state");
+    let b = &guard.status.bindings[0];
+    // Subset the old arm already cleared (regression guard).
+    assert!(!b.bound, "bound must be cleared");
+    assert!(!b.xsk_registered, "xsk_registered must be cleared");
+    assert!(b.xsk_bind_mode.is_empty(), "xsk_bind_mode must be cleared");
+    assert!(!b.zero_copy, "zero_copy must be cleared");
+    assert_eq!(b.socket_fd, 0, "socket_fd must be cleared");
+    assert!(!b.ready, "ready must be cleared");
+    assert!(b.last_error.is_empty(), "last_error must be cleared");
+    // The #2794 survivor class — THESE go RED if the fix is reverted.
+    assert_eq!(b.socket_ifindex, 0, "#2794: socket_ifindex left stale");
+    assert_eq!(b.socket_queue_id, 0, "#2794: socket_queue_id left stale");
+    assert_eq!(b.socket_bind_flags, 0, "#2794: socket_bind_flags left stale");
+    assert_eq!(b.flow_cache_capacity, 0, "#2794: flow_cache_capacity left stale");
+    assert_eq!(b.active_flow_count, 0, "#2794: active_flow_count left stale");
+    assert_eq!(b.rx_packets, 0, "#2794: rx_packets counter left stale");
 }
 
 #[test]
