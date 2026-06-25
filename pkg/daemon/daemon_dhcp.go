@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dhcp"
@@ -217,6 +218,55 @@ func resolveConfigSubnetLinuxName(cfg *config.Config, ip net.IP) (string, string
 		}
 	}
 	return "", "", false
+}
+
+// relayInterfaceRG resolves the redundancy group that owns the DHCP-relay
+// interface named ifaceName (the raw config form the relay carries, e.g.
+// "reth0.0" or "ge-0/0/0.0"), or 0 when the interface is not RG-owned (#2456).
+// It mirrors rgForInterfaces (#2664): strip the unit suffix, then look up the
+// base interface in the config table and read its RedundancyGroup. A nil config
+// or unknown interface yields 0 (non-HA → always relay at the caller).
+func relayInterfaceRG(cfg *config.Config, ifaceName string) int {
+	if cfg == nil || cfg.Interfaces.Interfaces == nil {
+		return 0
+	}
+	base := ifaceName
+	if i := strings.IndexByte(base, '.'); i >= 0 {
+		base = base[:i]
+	}
+	if ifc, ok := cfg.Interfaces.Interfaces[base]; ok && ifc != nil {
+		if ifc.RedundancyGroup > 0 {
+			return ifc.RedundancyGroup
+		}
+	}
+	return 0
+}
+
+// relayMasterGateOpen reports whether THIS node may relay client requests
+// received on ifaceName right now (#2456). It is installed on the DHCP relay
+// Manager via SetMasterGate and read PER PACKET, so it reflects live VRRP/
+// cluster master state and a backup→master failover is followed immediately
+// with no relay restart.
+//
+// Decision (mirrors the DDNS per-RG writer gate, ddnsReconcileOptions):
+//   - Standalone (d.cluster == nil): always relay.
+//   - Interface not RG-owned (RG 0): always relay — a non-HA segment is not a
+//     duplicate-relay hazard.
+//   - RG-owned: relay IFF this node is currently MASTER for that RG
+//     (isRethMasterState reads the live rgStateMachine, the SAME source the
+//     DHCP server / DDNS gates use).
+//
+// On a BACKUP node for the relay's RG the gate is CLOSED, so the relay drops
+// the client broadcast instead of forwarding a duplicate upstream.
+func (d *Daemon) relayMasterGateOpen(ifaceName string) bool {
+	if d.cluster == nil {
+		return true
+	}
+	rg := relayInterfaceRG(d.store.ActiveConfig(), ifaceName)
+	if rg == 0 {
+		return true
+	}
+	return d.isRethMasterState(rg)
 }
 
 // stripCIDR removes the /prefix from a CIDR string, returning just the IP.

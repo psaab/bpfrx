@@ -67,6 +67,10 @@ type RelayStats struct {
 	RequestsRelayed  uint64
 	RepliesForwarded uint64
 
+	// RequestsDroppedBackup counts client requests dropped because this node is
+	// BACKUP for the interface's redundancy group (#2456 HA relay gate).
+	RequestsDroppedBackup uint64
+
 	// Reply-delivery breakdown (#2076). These distinguish WHY a reply was
 	// broadcast vs L2-unicast so an L2/CAP_NET_RAW/driver/MTU regression is
 	// observable in operations. RepliesBroadcastL2Fallback is the one to
@@ -124,6 +128,12 @@ type interfaceRelay struct {
 	done             chan struct{}
 	requestsRelayed  atomic.Uint64
 	repliesForwarded atomic.Uint64
+
+	// requestsDroppedBackup counts client requests dropped because this node is
+	// BACKUP (not MASTER) for the interface's redundancy group (#2456). It is
+	// the observability signal that the HA relay gate is suppressing duplicate
+	// upstream relays on the standby node.
+	requestsDroppedBackup atomic.Uint64
 
 	// spec is the desired-config snapshot this relay was started with. Apply
 	// (#2348) compares it against the new desired spec to detect a changed
@@ -196,12 +206,58 @@ type Manager struct {
 	// returns (nil, err) → fail-soft to the broadcast path; the production
 	// implementation is defaultL2SenderFactory.
 	newL2 l2SenderFactory
+
+	// relayGate, when non-nil, gates the upstream relay-forward on this node's
+	// VRRP/cluster MASTER state for the relay interface's redundancy group
+	// (#2456). It is read PER PACKET (under mu) so a backup→master failover is
+	// followed without a relay restart. nil (the NewManager default) = always
+	// relay (standalone fail-open). SetMasterGate installs the daemon's live
+	// RG-master query.
+	relayGate masterGate
+}
+
+// SetMasterGate installs the per-interface VRRP/cluster master-state gate
+// (#2456). The daemon calls this once after constructing the Manager, passing a
+// closure that resolves the relay interface's redundancy group and reports
+// whether this node is currently MASTER for it (true) or BACKUP (false). The
+// gate is read per packet by the relay loops, so it MUST be cheap and lock-safe
+// to call concurrently. A nil gate restores the standalone fail-open behavior.
+func (m *Manager) SetMasterGate(g masterGate) {
+	m.mu.Lock()
+	m.relayGate = g
+	m.mu.Unlock()
+}
+
+// shouldRelay reports whether a client request received on ifaceName may be
+// forwarded upstream now (#2456). It reads the installed master gate under mu
+// so a concurrent SetMasterGate is race-free. nil gate = fail-open (standalone
+// always relays).
+func (m *Manager) shouldRelay(ifaceName string) bool {
+	m.mu.Lock()
+	g := m.relayGate
+	m.mu.Unlock()
+	if g == nil {
+		return true
+	}
+	return g(ifaceName)
 }
 
 // l2SenderFactory opens a raw-L2 reply sender bound to ifaceName. On error the
 // caller records a nil sender and every flag-clear reply takes the broadcast
 // fallback — the relay stays up (fail-soft).
 type l2SenderFactory func(ifaceName string) (l2Replier, error)
+
+// masterGate reports whether THIS node should relay client requests received
+// on ifaceName right now (#2456). On a shared client segment both the cluster
+// MASTER and the BACKUP node receive the client broadcast; only the MASTER for
+// the relay interface's redundancy group may forward it upstream, otherwise the
+// server sees duplicate relayed requests (and duplicate relay state with
+// different per-node giaddrs). It is queried PER PACKET so a backup that becomes
+// master (VRRP failover) starts relaying immediately with no cached-at-startup
+// staleness — the daemon's implementation reads live RG master state. A nil
+// gate (the NewManager default, or any non-cluster build) is fail-open: every
+// request is relayed, which is the correct standalone behavior.
+type masterGate func(ifaceName string) bool
 
 // NewManager creates a new DHCP relay Manager.
 func NewManager() *Manager {
@@ -489,6 +545,7 @@ func (m *Manager) Stats() []RelayStats {
 			Interface:                  ir.ifaceName,
 			RequestsRelayed:            ir.requestsRelayed.Load(),
 			RepliesForwarded:           ir.repliesForwarded.Load(),
+			RequestsDroppedBackup:      ir.requestsDroppedBackup.Load(),
 			RepliesL2Unicast:           ir.repliesL2Unicast.Load(),
 			RepliesUnicastCiaddr:       ir.repliesUnicastCiaddr.Load(),
 			RepliesBroadcastFlag1:      ir.repliesBroadcastFlag1.Load(),
@@ -791,6 +848,23 @@ func (m *Manager) runRelaySession(ctx context.Context,
 				"type", msgType,
 				"client_mac", pkt.ClientHWAddr,
 				"src", srcAddr)
+
+			// #2456: HA master-state gate. On a shared client segment both the
+			// cluster MASTER and the BACKUP node receive the client broadcast;
+			// only the MASTER for this interface's redundancy group may forward
+			// it upstream, otherwise the server sees duplicate relayed requests
+			// (and duplicate relay state with different per-node giaddrs). The
+			// gate is read per packet, so a backup→master failover starts
+			// relaying immediately (the daemon's gate reads live RG state).
+			// Standalone (nil gate) always relays.
+			if !m.shouldRelay(ifaceName) {
+				ir.requestsDroppedBackup.Add(1)
+				slog.Debug("dhcp-relay: not master for interface, dropping client request",
+					"interface", ifaceName,
+					"type", msgType,
+					"client_mac", pkt.ClientHWAddr)
+				continue
+			}
 
 			// Set giaddr to our interface IP so the server knows where to reply.
 			pkt.GatewayIPAddr = giaddr

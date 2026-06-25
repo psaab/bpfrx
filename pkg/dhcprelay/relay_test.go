@@ -1243,3 +1243,218 @@ func TestRunRelay_DegradedBaseline_AdoptsFirstRealIfindex(t *testing.T) {
 		t.Errorf("degraded baseline must adopt first real ifindex, not rebind: got %d calls, want 2", got)
 	}
 }
+
+// makeRequest builds a DHCPREQUEST client packet for the master-gate tests.
+func makeRequest(t *testing.T) []byte {
+	t.Helper()
+	req, err := dhcpv4.New()
+	if err != nil {
+		t.Fatalf("dhcpv4.New: %v", err)
+	}
+	req.OpCode = dhcpv4.OpcodeBootRequest
+	req.ClientHWAddr = net.HardwareAddr{0x02, 0, 0, 0, 0, 0x42}
+	req.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeRequest))
+	return req.ToBytes()
+}
+
+// runGatedRelay starts a single-interface relay with the supplied master gate,
+// feeds it one DHCPREQUEST, waits for the loop to consume it, and returns the
+// number of datagrams relayed upstream plus the backup-drop counter.
+func runGatedRelay(t *testing.T, gate masterGate) (relayed int, droppedBackup uint64) {
+	t.Helper()
+	client := newFakeConn()
+	client.pending = [][]byte{makeRequest(t)}
+	server := newFakeConn()
+	factory, _ := recordingFactory(client, server)
+	m := testManager(factory)
+	m.SetMasterGate(gate)
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	defer m.Stop()
+
+	// Wait until the loop has consumed the request (>=2 ReadFrom calls: the
+	// first returns the pending datagram, the second blocks).
+	deadline := time.Now().Add(2 * time.Second)
+	for client.readCalls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	relayed = server.writeCount()
+	for _, st := range m.Stats() {
+		droppedBackup += st.RequestsDroppedBackup
+	}
+	return relayed, droppedBackup
+}
+
+// TestRunRelay_MasterGate_BackupDrops asserts the #2456 HA gate: a relay on a
+// BACKUP node (gate returns false) does NOT forward the client request
+// upstream and bumps the backup-drop counter. THIS is the fail-on-revert
+// guard — without the gate check in the main loop the backup would relay the
+// request and this test goes RED (relayed==1, droppedBackup==0).
+func TestRunRelay_MasterGate_BackupDrops(t *testing.T) {
+	relayed, dropped := runGatedRelay(t, func(string) bool { return false })
+	if relayed != 0 {
+		t.Fatalf("backup node relayed %d datagram(s) upstream; want 0 "+
+			"(duplicate-relay regression — #2456 gate removed)", relayed)
+	}
+	if dropped != 1 {
+		t.Fatalf("RequestsDroppedBackup = %d, want 1", dropped)
+	}
+}
+
+// TestRunRelay_MasterGate_MasterRelays asserts a relay on the MASTER node
+// (gate returns true) forwards the client request upstream exactly as today.
+func TestRunRelay_MasterGate_MasterRelays(t *testing.T) {
+	relayed, dropped := runGatedRelay(t, func(string) bool { return true })
+	if relayed != 1 {
+		t.Fatalf("master node relayed %d datagram(s); want 1", relayed)
+	}
+	if dropped != 0 {
+		t.Fatalf("RequestsDroppedBackup = %d, want 0 on master", dropped)
+	}
+}
+
+// TestRunRelay_MasterGate_StandaloneRelays asserts the nil-gate default
+// (standalone / non-cluster build) always relays — the fail-open behavior.
+func TestRunRelay_MasterGate_StandaloneRelays(t *testing.T) {
+	relayed, dropped := runGatedRelay(t, nil)
+	if relayed != 1 {
+		t.Fatalf("standalone (nil gate) relayed %d datagram(s); want 1", relayed)
+	}
+	if dropped != 0 {
+		t.Fatalf("RequestsDroppedBackup = %d, want 0 standalone", dropped)
+	}
+}
+
+// TestRunRelay_MasterGate_PassesInterfaceName asserts the gate is queried with
+// the relay's interface name, so a per-interface (per-RG) decision is possible.
+func TestRunRelay_MasterGate_PassesInterfaceName(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	gate := func(iface string) bool {
+		mu.Lock()
+		seen[iface] = true
+		mu.Unlock()
+		return true
+	}
+	if relayed, _ := runGatedRelay(t, gate); relayed != 1 {
+		t.Fatalf("relayed %d, want 1", relayed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !seen["ge-0-0-0"] {
+		t.Fatalf("gate was not queried with the relay interface name; saw %v", seen)
+	}
+}
+
+// feedConn is a net.PacketConn whose ReadFrom blocks until a datagram is
+// pushed on its channel (or it is closed). Unlike fakeConn's pre-seeded
+// pending slice, it lets a test deliver a SECOND datagram after the relay
+// loop has already consumed the first and is blocked in ReadFrom — required to
+// prove the #2456 gate re-evaluates per packet across a mid-session failover.
+type feedConn struct {
+	mu      sync.Mutex
+	closed  bool
+	closeCh chan struct{}
+	feed    chan []byte
+	writes  int
+}
+
+func newFeedConn() *feedConn {
+	return &feedConn{closeCh: make(chan struct{}), feed: make(chan []byte, 8)}
+}
+
+func (f *feedConn) push(b []byte) { f.feed <- b }
+
+func (f *feedConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	select {
+	case d := <-f.feed:
+		n := copy(p, d)
+		return n, &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 68}, nil
+	case <-f.closeCh:
+		return 0, nil, net.ErrClosed
+	}
+}
+
+func (f *feedConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return 0, net.ErrClosed
+	}
+	f.writes++
+	return len(p), nil
+}
+
+func (f *feedConn) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return net.ErrClosed
+	}
+	f.closed = true
+	close(f.closeCh)
+	return nil
+}
+
+func (f *feedConn) writeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.writes
+}
+
+func (f *feedConn) LocalAddr() net.Addr                { return &net.UDPAddr{} }
+func (f *feedConn) SetDeadline(t time.Time) error      { return nil }
+func (f *feedConn) SetReadDeadline(t time.Time) error  { return nil }
+func (f *feedConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// TestRunRelay_MasterGate_FailoverStartsRelaying asserts the gate is read PER
+// PACKET, so a backup that BECOMES master (VRRP failover) starts relaying
+// immediately with no relay restart. The gate flips from false→true while the
+// relay is running; the first request (gate closed) is dropped, the second
+// (gate open, after failover) is relayed.
+func TestRunRelay_MasterGate_FailoverStartsRelaying(t *testing.T) {
+	var master atomic.Bool // starts false (BACKUP)
+
+	client := newFeedConn()
+	server := newFeedConn()
+	// The factory hands out the client conn first, then the server conn.
+	var fmu sync.Mutex
+	idx := 0
+	factory := func(_ context.Context, _ string, _, _ bool,
+		_ *net.UDPAddr) (net.PacketConn, error) {
+		fmu.Lock()
+		defer fmu.Unlock()
+		idx++
+		if idx == 1 {
+			return client, nil
+		}
+		return server, nil
+	}
+	m := testManager(factory)
+	m.SetMasterGate(func(string) bool { return master.Load() })
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	defer m.Stop()
+
+	// First request while BACKUP — must be dropped (no upstream relay).
+	client.push(makeRequest(t))
+	time.Sleep(50 * time.Millisecond)
+	if server.writeCount() != 0 {
+		t.Fatalf("backup relayed before failover: %d datagram(s)", server.writeCount())
+	}
+
+	// Failover: this node becomes MASTER, then a second request arrives. The
+	// SAME running relay session must now forward it (per-packet re-eval).
+	master.Store(true)
+	client.push(makeRequest(t))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for server.writeCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if server.writeCount() != 1 {
+		t.Fatalf("after failover the new master relayed %d datagram(s); want 1 "+
+			"(gate must re-evaluate per packet, not cache at startup)", server.writeCount())
+	}
+}
