@@ -1,3 +1,31 @@
+## 2026-06-25 — #2838: DDNS generic backend false-success on substring "ok"
+
+- **Timestamp**: 2026-06-25
+- **Action**: The generic templated HTTP DDNS backend classified an HTTP
+  2xx body as a successful update via `strings.Contains(lower, sub)`
+  against a default token set that includes the bare token `ok`. A body
+  like `not ok`, `error: ok token invalid`, `update not good`, or an HTML
+  page with an `OK` button CONTAINS a default token, so an explicit
+  provider FAILURE was recorded as a completed update — Surface A then
+  recorded ownership and suppressed retry, leaving DNS stale/missing.
+- **Fix**: Replace the substring loop with `matchesGenericOK`, a
+  whole-token matcher. A success token must equal a trimmed response line
+  OR be the leading whitespace-delimited field of a line (so dyndns2-shape
+  `good <ip>` / `nochg <ip>` still pass). Renamed `defaultGenericOKSubstrings`
+  → `defaultGenericOKTokens` and the struct field `okSubstr` → `okTokens`.
+  Scope: `backend_generic.go` response classification only — dyndns2's own
+  keyword classifier (`good`/`nochg` success, `badauth`/`abuse` failure) is
+  untouched (separate code path, not shared).
+- **Test**: `TestGenericOKTokenMatch` (table, fail-on-revert) + a
+  `matchesGenericOK` unit test. Proven RED when reverted to the substring
+  match (`not ok`/`error: ok token`/`notok`/HTML-OK all wrongly pass),
+  GREEN with the token matcher. Default success cases (`ok`/`OK`/`good <ip>`/
+  `nochg <ip>`/`OK updated`) still pass.
+- **File(s)**: `pkg/ddns/backend_generic.go`, `pkg/ddns/backend_http_test.go`,
+  `pkg/ddns/README.md`
+- **Gates**: `go build ./...`, `gofmt -l` (clean), `go vet ./pkg/ddns/...`,
+  `go test ./pkg/ddns/...` — all green.
+
 ## 2026-06-25 — #2857: route-map `set local-preference 0` silently dropped
 
 - **Timestamp**: 2026-06-25

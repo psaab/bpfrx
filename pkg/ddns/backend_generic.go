@@ -1,6 +1,7 @@
 package ddns
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -22,19 +23,29 @@ import (
 //	%u → username                  %p → password
 //	%% → a literal percent sign
 //
-// Success is decided by SUBSTRING match on the (HTTP 2xx) response body against
+// Success is decided by a TOKEN match on the (HTTP 2xx) response body against
 // the operator's `ok-response` (or the default matcher set). This mirrors
 // inadyn's default {"OK","good","true","updated","nochg"} list.
+//
+// #2838: matching is token-bounded, NOT a raw substring. A success token must
+// equal a trimmed response line OR be the leading whitespace-delimited field of
+// a line (so "good 1.2.3.4" still passes). A naive strings.Contains turned an
+// explicit provider FAILURE into a false success — "not ok", "error: ok token
+// invalid", "update not good", or an HTML page with an "OK" button all CONTAIN
+// a default token, so they were wrongly classified as a completed update. The
+// engine (surface_a.go) then records ownership and suppresses retry, leaving
+// DNS stale while the router believes the address was published.
 
-// defaultGenericOKSubstrings is the success-matcher set used when a generic
-// provider sets no explicit ok-response (plan §3.1). Case-insensitive.
-var defaultGenericOKSubstrings = []string{"good", "nochg", "ok", "true", "updated"}
+// defaultGenericOKTokens is the success-matcher set used when a generic
+// provider sets no explicit ok-response (plan §3.1). Matched as whole tokens
+// (see matchesGenericOK), case-insensitive.
+var defaultGenericOKTokens = []string{"good", "nochg", "ok", "true", "updated"}
 
 // genericBackend publishes via a templated URL + substring success match.
 type genericBackend struct {
 	name        string
 	urlTemplate string
-	okSubstr    []string // success substrings (lowercased)
+	okTokens    []string // success tokens (lowercased; whole-token match, #2838)
 	username    string
 	password    string // revealed at construction; never logged
 	client      *http.Client
@@ -54,7 +65,7 @@ func newGenericBackend(p *config.DDNSProvider) (*genericBackend, error) {
 	if !strings.HasPrefix(tmpl, "http://") && !strings.HasPrefix(tmpl, "https://") {
 		return nil, fmt.Errorf("ddns generic: provider %q url-template must be an http(s) URL", p.Name)
 	}
-	ok := defaultGenericOKSubstrings
+	ok := defaultGenericOKTokens
 	if s := strings.TrimSpace(p.OKResponse); s != "" {
 		ok = []string{strings.ToLower(s)}
 	}
@@ -66,7 +77,7 @@ func newGenericBackend(p *config.DDNSProvider) (*genericBackend, error) {
 	return &genericBackend{
 		name:        p.Name,
 		urlTemplate: tmpl,
-		okSubstr:    ok,
+		okTokens:    ok,
 		username:    p.Username,
 		password:    p.Password.Reveal(),
 		client:      client,
@@ -132,13 +143,46 @@ func (b *genericBackend) UpsertLease(ctx context.Context, rec LeaseDNSRecord) er
 	if cerr := classifyHTTPStatus(code); cerr != nil {
 		return fmt.Errorf("ddns generic: %s: %w", b.name, cerr)
 	}
-	lower := strings.ToLower(string(body))
-	for _, sub := range b.okSubstr {
-		if strings.Contains(lower, sub) {
-			return nil
+	if matchesGenericOK(string(body), b.okTokens) {
+		return nil
+	}
+	return fmt.Errorf("ddns generic: %s: response did not match success token(s) %v", b.name, b.okTokens)
+}
+
+// matchesGenericOK decides whether an HTTP 2xx body signals a successful update
+// (#2838). A success token matches only as a WHOLE TOKEN, never as a raw
+// substring: the token must equal a trimmed response line, or be the leading
+// whitespace-delimited field of a line (e.g. dyndns2-style "good 1.2.3.4").
+// This is the fail-closed half of the issue — "not ok", "error: ok token
+// invalid", "update not good", and an HTML page containing an "OK" button all
+// CONTAIN a default token but are NOT a success, so they must be rejected. The
+// comparison is case-insensitive; tokens in okTokens are already lowercased.
+func matchesGenericOK(body string, okTokens []string) bool {
+	if len(okTokens) == 0 {
+		return false
+	}
+	sc := bufio.NewScanner(strings.NewReader(body))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		// Leading whitespace-delimited field of the line (the protocol keyword;
+		// dyndns2 returns "good <ip>" / "nochg <ip>").
+		first := lower
+		if i := strings.IndexFunc(lower, func(r rune) bool {
+			return r == ' ' || r == '\t'
+		}); i >= 0 {
+			first = lower[:i]
+		}
+		for _, tok := range okTokens {
+			if lower == tok || first == tok {
+				return true
+			}
 		}
 	}
-	return fmt.Errorf("ddns generic: %s: response did not match success substring(s) %v", b.name, b.okSubstr)
+	return false
 }
 
 // errGenericDeleteUnsupported marks the generic backend's lack of a portable
