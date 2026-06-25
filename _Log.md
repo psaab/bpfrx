@@ -17458,3 +17458,22 @@ top.
   go vet ./pkg/ddns/..., go test ./pkg/ddns/... PASS.
   **File(s)**: pkg/ddns/backend_bind.go, pkg/ddns/backend_bind_test.go,
   pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25 13:36
+  **Action**: #2909 — pkg/routing xfrmi if_id collision guard. A bare
+  secure-tunnel bind-interface (`st0`) and an explicit `st0.0` derive
+  DISTINCT device names but the SAME XFRM `if_id` (1, unit defaults to 0
+  with no `.N` suffix). The kernel keys SA<->xfrmi binding on `if_id`, so
+  programming both devices either EEXISTs or silently cross-leaks traffic
+  between VPNs meant to be isolated. `xfrmManager.Apply` now detects two
+  distinct desired names mapping to one `if_id` and refuses to create
+  EITHER (fail-closed); a formerly-good device is torn down if a later
+  commit introduces the alias. Added FAIL-ON-REVERT tests
+  (TestXfrmApplyIfIDCollisionRefused, TestXfrmApplyCollisionDeletesPriorDevice)
+  — RED without the guard (3 LinkAdd / 2 devices sharing if_id 1). Root
+  derivation lives in pkg/config/xfrmi.go; commit-time rejection is a
+  separate lane (#2885) — this is the last-line routing defense.
+  Gates: go build ./..., gofmt -l clean, go vet ./pkg/routing/...,
+  go test ./pkg/routing/... PASS.
+  **File(s)**: pkg/routing/xfrm.go, pkg/routing/iface_reuse_test.go,
+  pkg/routing/README.md, _Log.md
