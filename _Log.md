@@ -14272,3 +14272,41 @@ top.
   failed.
 - **File(s)**: userspace-dp/src/state_writer.rs, userspace-dp/src/FEATURES.md,
   _Log.md.
+
+## #2467 — event-stream session-event ifindex widened i16 → i32 (wire change)
+
+- **Timestamp**: 2026-06-24
+- **Action**: The userspace session-event binary wire encoded three identity
+  fields (OwnerRGID, EgressIfindex, TXIfindex) as signed 16-bit, while the Go
+  side stored them as full `int`. Linux ifindexes are a full `int` and wrap
+  negative past 32767 on long-running systems with interface churn, so a high
+  ifindex truncated/sign-flipped over the wire. Widened all three open-frame
+  fields and the close-frame OwnerRGID from i16 to i32 on the wire (LE, matching
+  the existing LittleEndian convention). This is a #1961-class WIRE change: the
+  Rust encoder (event_stream/codec.rs) and Go decoder
+  (pkg/dataplane/userspace/eventstream.go) stay byte-compatible.
+- **Layout impact**: the open frame's fixed header grew 24 → 30 bytes (+6); all
+  downstream offsets (TunnelEndpoint, TXVLAN, Flags, zone IDs, Disposition, the
+  IP block start at 24 → 30) shifted +6 on BOTH sides. The close frame's
+  OwnerRGID slot grew 2 → 4 bytes; trailing Flags + zone-id offsets shifted +2.
+  Both encoder offsets, both decoder offsets, the length/min-length guards, and
+  the codec_tests.rs + eventstream_test.go payload builders/readers updated.
+- **Tests**: Rust test_encode_session_open_high_ifindex_v4 (egress 70000, tx
+  65536, owner 40000 — all > i16/u16 limits) + test_encode_session_close_high_
+  owner_rg_v4 pin the i32 wire encode. Go TestDecodeSessionEventHighIfindex +
+  TestDecodeSessionCloseEventHighOwnerRG round-trip the high values through the
+  decoder. Fail-on-revert PROVEN: reverting the Go EgressIfindex read to i16
+  yielded `EgressIfindex = 4464` (70000 & 0xFFFF) RED; restored → GREEN.
+- **Not in scope**: the 136-byte RT_FLOW dataplane.Event payload (frame types
+  11-15) keeps its own owner_rg_id i16 slot at [64:66] and ingress_ifindex i32
+  at [128:132] — a separate layout, unchanged. The protocol_wire_v1.json
+  control-protocol fixture is JSON serde (i32 numbers), unaffected; its
+  wire_invariant_default_specimens test still passes (no regen).
+- **Gates**: cargo build --release clean; cargo test event_stream::codec → 19
+  passed/0 failed; go build ./... clean; go test ./pkg/dataplane/userspace/...
+  ok; gofmt + go vet clean.
+- **File(s)**: userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/codec_tests.rs,
+  pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/eventstream_test.go, docs/session-sync-design.md,
+  _Log.md.

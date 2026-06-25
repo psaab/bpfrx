@@ -500,19 +500,19 @@ SessionOpen and SessionUpdate share the same payload:
   [4:6]   DstPort (uint16 LE)
   [6:8]   NATSrcPort (uint16 LE)
   [8:10]  NATDstPort (uint16 LE)
-  [10:12] OwnerRGID (int16 LE)
-  [12:14] EgressIfindex (int16 LE)
-  [14:16] TXIfindex (int16 LE)
-  [16:18] TunnelEndpointID (uint16 LE)
-  [18:20] TXVLANID (uint16 LE)
-  [20]    Flags (bit0=FabricRedirect, bit1=FabricIngress, bit2=IsReverse)
-  [21]    IngressZoneID (uint8)
-  [22]    EgressZoneID (uint8)
-  [23]    Disposition (uint8: 0=Accept, 1=LocalDelivery, 2=Reject, ...)
-  [24:28] SrcIP (4 bytes for v4, first 4 of 16 for v6)
-  [28:32] DstIP
-  [32:36] NATSrcIP
-  [36:40] NATDstIP
+  [10:14] OwnerRGID (int32 LE)       — #2467: widened from int16
+  [14:18] EgressIfindex (int32 LE)   — #2467: widened from int16
+  [18:22] TXIfindex (int32 LE)       — #2467: widened from int16
+  [22:24] TunnelEndpointID (uint16 LE)
+  [24:26] TXVLANID (uint16 LE)
+  [26]    Flags (bit0=FabricRedirect, bit1=FabricIngress, bit2=IsReverse)
+  [27]    IngressZoneID (uint8)
+  [28]    EgressZoneID (uint8)
+  [29]    Disposition (uint8: 0=Accept, 1=LocalDelivery, 2=Reject, ...)
+  [30:34] SrcIP (4 bytes for v4, first 4 of 16 for v6)
+  [34:38] DstIP
+  [38:42] NATSrcIP
+  [42:46] NATDstIP
   For IPv6: addresses are 16 bytes each (payload is larger)
   After addresses:
   [N:N+6]  NeighborMAC (6 bytes, zero if unresolved)
@@ -529,9 +529,21 @@ SessionClose payload is minimal:
   [4:6]   DstPort
   [6:10]  SrcIP (4 or 16 bytes)
   [10:14] DstIP (4 or 16 bytes)
-  [N:N+2] OwnerRGID (int16 LE)
-  [N+2]   Flags (bit0=FabricRedirect, bit1=FabricIngress)
+  [N:N+4] OwnerRGID (int32 LE)       — #2467: widened from int16
+  [N+4]   Flags (bit0=FabricRedirect, bit1=FabricIngress)
+  [N+5]   IngressZoneID (uint8)      — #919/#922
+  [N+6]   EgressZoneID (uint8)       — #919/#922
 ```
+
+> **#2467 (breaking wire change):** the three identity fields in the open
+> frame (`OwnerRGID`, `EgressIfindex`, `TXIfindex`) and the close frame's
+> `OwnerRGID` were widened from signed 16-bit to signed 32-bit. Linux
+> ifindexes are a full `int` and wrap negative past 32767 on long-running
+> systems with interface churn. The event-stream frame is unversioned and
+> fixed-layout, so this is NOT a rolling-upgrade-compatible change: the Rust
+> encoder (`event_stream/codec.rs`) and the Go decoder
+> (`pkg/dataplane/userspace/eventstream.go`) must be deployed together. They
+> always are — `xpfd` and the `userspace-dp` helper ship as one binary set.
 
 ### Flow Control
 
