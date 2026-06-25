@@ -14660,3 +14660,17 @@ top.
   userspace-dp/src/afxdp/flow_cache_tests.rs,
   userspace-dp/src/afxdp/frame/prop_tests/rewrite.rs,
   docs/flow-cache-simplification.md
+
+- **Timestamp**: 2026-06-25T08:13Z
+  **Action**: #2641 — merge duplicate named policy-options prefix-list blocks
+  instead of overwriting. `compilePolicyOptions` allocated a fresh PrefixList
+  per `prefix-list NAME` block and clobbered `po.PrefixLists[name]`, discarding
+  the earlier block's prefixes; the sibling community loop already merged by
+  reusing the map entry. Fix mirrors community: reuse the existing map entry
+  and append. Added fail-on-revert tests for both flat-set and hierarchical AST
+  shapes; documented the merge in docs/config-schema.md.
+  Gates: gofmt clean; go build ./... clean; go vet ./pkg/config clean;
+  go test ./pkg/config/... ./pkg/frr/... green.
+  **File(s)**: pkg/config/compiler_routing.go,
+  pkg/config/compiler_prefix_list_merge_2641_test.go,
+  docs/config-schema.md, _Log.md
