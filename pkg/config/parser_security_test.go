@@ -3592,8 +3592,8 @@ func TestPolicyCommunityOperationsCompile(t *testing.T) {
 	}
 	if tm := byName["t_del"]; tm == nil {
 		t.Fatal("term t_del missing")
-	} else if tm.CommunityOp != "delete" || tm.CommunityDelete != "MYLIST" {
-		t.Errorf("t_del: op=%q delete=%q, want op=delete delete=MYLIST", tm.CommunityOp, tm.CommunityDelete)
+	} else if tm.CommunityOp != "delete" || len(tm.CommunityDelete) != 1 || tm.CommunityDelete[0] != "MYLIST" {
+		t.Errorf("t_del: op=%q delete=%v, want op=delete delete=[MYLIST]", tm.CommunityOp, tm.CommunityDelete)
 	}
 	if tm := byName["t_set"]; tm == nil {
 		t.Fatal("term t_set missing")
@@ -3609,6 +3609,58 @@ func TestPolicyCommunityOperationsCompile(t *testing.T) {
 		t.Fatal("term t_none missing")
 	} else if tm.CommunityOp != "none" || tm.Community != "" {
 		t.Errorf("t_none: op=%q community=%q, want op=none community=\"\"", tm.CommunityOp, tm.Community)
+	}
+}
+
+// TestPolicyCommunityDeleteMultiListCompile is the compiler-level fail-on-revert
+// guard for #2902: a bracketed multi-list `then community delete [ listA listB ]`
+// must accumulate EVERY referenced community-list name into
+// PolicyTerm.CommunityDelete. The lexer strips the brackets, so the flattened
+// clause is delete + [listA listB] (the #2419 multi-value shape). Before #2902
+// the compiler stored only vals[1] (`CommunityDelete = vals[1]`), silently
+// dropping listB... RED if applyCommunityAction reads only the first list value.
+func TestPolicyCommunityDeleteMultiListCompile(t *testing.T) {
+	cmds := []string{
+		"set policy-options policy-statement P term t_del then community delete [ listA listB ]",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ps := cfg.PolicyOptions.PolicyStatements["P"]
+	if ps == nil {
+		t.Fatal("policy-statement P not found")
+	}
+	var tm *PolicyTerm
+	for _, term := range ps.Terms {
+		if term.Name == "t_del" {
+			tm = term
+		}
+	}
+	if tm == nil {
+		t.Fatal("term t_del missing")
+	}
+	if tm.CommunityOp != "delete" {
+		t.Fatalf("t_del: op=%q, want delete", tm.CommunityOp)
+	}
+	want := []string{"listA", "listB"}
+	if len(tm.CommunityDelete) != len(want) {
+		t.Fatalf("#2902 t_del: CommunityDelete=%v, want %v (multi-list delete dropped names)", tm.CommunityDelete, want)
+	}
+	for i, w := range want {
+		if tm.CommunityDelete[i] != w {
+			t.Errorf("#2902 t_del: CommunityDelete[%d]=%q, want %q", i, tm.CommunityDelete[i], w)
+		}
 	}
 }
 

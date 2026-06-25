@@ -1,3 +1,24 @@
+## 2026-06-25 — #2902: BGP `then community delete [ list1 list2 ]` multi-list — accumulate all community-lists
+
+- **Timestamp**: 2026-06-25
+- **Action**: `applyCommunityAction` stored only `vals[1]` for the
+  `delete` op, so a multi-list `then community delete [ listA listB ]`
+  (which the lexer flattens to `delete listA listB` — the #2419
+  multi-value/bracketed-list shape) dropped all but the first
+  community-list. FRR's `set comm-list <name> delete` strips ONE list per
+  line, so the renderer emitted only `set comm-list listA delete` and the
+  communities the operator meant to strip via listB... leaked into
+  advertised prefixes. Fix: `PolicyTerm.CommunityDelete` is now `[]string`;
+  the compiler accumulates `vals[1:]` (mirroring how `add`/`set` join the
+  whole tail and how #2892 as-path-prepend reads `firewallMatchValues`),
+  and the renderer emits one `set comm-list <name> delete` clause per
+  referenced list. Fail-on-revert: a `delete [ listA listB listC ]` config
+  renders all three deletes (RED if the compiler reads only the first list
+  value).
+- **File(s)**: pkg/config/types_routing.go, pkg/config/compiler_routing.go,
+  pkg/frr/policy_render.go, pkg/config/parser_security_test.go,
+  pkg/frr/frr_test.go, pkg/frr/README.md, docs/config-schema.md
+
 ## 2026-06-25 — #2937: screen flood + SYN-cookie standby-ACK rate limiting switched from fixed wall-second window to a sliding 1-second window
 
 - **Timestamp**: 2026-06-25

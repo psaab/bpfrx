@@ -1381,8 +1381,14 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 						fmt.Fprintf(&b, " set community %s additive\n", term.CommunityAdd)
 					}
 				case "delete":
-					if term.CommunityDelete != "" {
-						fmt.Fprintf(&b, " set comm-list %s delete\n", term.CommunityDelete)
+					// FRR's `set comm-list <name> delete` strips ONE
+					// community-list per line, so a multi-list
+					// `then community delete [ listA listB ]` emits one clause
+					// per referenced list — every name in order (#2902).
+					for _, name := range term.CommunityDelete {
+						if name != "" {
+							fmt.Fprintf(&b, " set comm-list %s delete\n", name)
+						}
 					}
 				default: // "" or "set" — whole-attribute replace
 					if term.Community != "" {
