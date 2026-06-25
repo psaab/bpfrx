@@ -202,8 +202,14 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			case "multipath":
 				proto.BGP.Multipath = 64 // default to 64 when enabled
 				for _, mc := range child.Children {
-					if mc.Name() == "multiple-as" {
+					switch mc.Name() {
+					case "multiple-as":
 						proto.BGP.MultipathMultipleAS = true
+					case "ibgp":
+						// FRR `maximum-paths N` only enables eBGP multipath;
+						// iBGP multipath needs the separate `maximum-paths
+						// ibgp N` line. `multipath ibgp` selects it (#2978).
+						proto.BGP.MultipathIBGP = true
 					}
 				}
 			case "damping":

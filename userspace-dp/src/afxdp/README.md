@@ -292,9 +292,20 @@ sync.
   flood cannot starve PTB or reject (per-reason isolation). Defaults:
   `DEFAULT_RATE_PER_SEC = 1000` tokens/s refill + `DEFAULT_BURST = 1000`
   capacity, PER reason (compile-time; a rate of 0 disables the limiter). The
-  check is a single CAS loop over two atomics (millitoken count + last-refill
-  ns) on the cold generated-error path only — never per forwarded packet, no
-  allocation. On bucket-empty the generated reply is DROPPED (the TTL/reject
+  check is a single CAS loop over ONE atomic word — a GCRA (Generic Cell Rate
+  Algorithm) theoretical-arrival-time, the same single-TAT pattern used by
+  `event_stream/producer.rs` — on the cold generated-error path only, never per
+  forwarded packet, no allocation. #2955: the limiter previously split its state
+  into TWO atomics (a millitoken count + a last-refill timestamp) and CAS-
+  committed only the token count, publishing the timestamp as a SEPARATE relaxed
+  store. Under multi-worker contention two workers could read the new (lower)
+  token count with the stale OLD timestamp and credit the same refill interval
+  twice (double-credit), or both observe the first-use (`last_ns == 0`) branch
+  and each refill to full burst — OVER-ADMITTING generated errors past the
+  configured rate (a DoS-boundary weakening) and corrupting the
+  `*_rate_limited_total` counters. Collapsing the state into the single GCRA word
+  makes refill and consume commit together in ONE compare-exchange, so the
+  admitted rate is hard-capped regardless of interleaving. On bucket-empty the generated reply is DROPPED (the TTL/reject
   paths fail-closed to the silent drop they already perform; the PTB path
   still drops the oversized original via `mtu_signalled`, so it never falls
   through to forward the MTU-violating frame) and a per-reason observable
