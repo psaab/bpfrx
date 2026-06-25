@@ -1,3 +1,29 @@
+## 2026-06-24 — #2702: BGP group/neighbor export/import bracket-list truncation
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed silent policy truncation for BGP per-group and
+  per-neighbor `export`/`import` bracket lists (sibling of #2587/#2690).
+  The top-level `protocols bgp export/import` readers were moved onto the
+  multi-value `firewallMatchValues` SSOT by #2587/#2690, but the GROUP and
+  NEIGHBOR export/import readers still used the `nodeVal(child)`-first
+  pattern. For a flat-set/bracket list `export [ OUT-A OUT-B ]` the values
+  collapse onto `child.Keys[1:]` (#2585); `nodeVal` returns `Keys[1]`
+  ("OUT-A", non-empty) so the `if v != ""` branch appended ONLY the first
+  policy and the `else ... Keys[1:]` fallback never ran — every policy past
+  the first was silently dropped. (An earlier #2690 review note that the
+  group/neighbor readers were "already correct" was wrong; verified against
+  current master at lines 282-293 and 445-466.) Routed all four readers
+  (group export, group import, neighbor export, neighbor import) through the
+  shared `firewallMatchValues(child)` helper, exactly as #2587/#2690 did for
+  the top-level + policy-statement from-readers. Schema leaves were already
+  `multi:true` (`schema_routing.go` lines 197/198/227/228). Added four
+  fail-on-revert tests (group + neighbor, each flat-set AND hierarchical);
+  reverting either reader to the nodeVal-first form turns all four RED with
+  `neighbor.Export = [OUT-A]` (the truncation symptom).
+- **File(s)**: [Edit] pkg/config/compiler_protocols.go,
+  pkg/config/protocols_multileaf_2587_test.go, docs/config-schema.md,
+  _Log.md.
+
 ## 2026-06-24 — #2466: flow-cache RG epoch index fallback for out-of-range RG IDs
 
 - **Timestamp**: 2026-06-24

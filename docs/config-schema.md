@@ -129,12 +129,22 @@ export`, `policy-options community <name> members`), but the compilers
 `compiler_routing.go`) read only `child.Keys[1]` with no children iteration,
 so `protocols ospf export [ connected static ]` redistributed only
 `connected` and `community c1 members [ 65000:1 65000:2 ]` truncated to the
-first member. All six now route through `firewallMatchValues`. The
-already-correct BGP **group**/**neighbor** export/import readers
-(`compiler_protocols.go`, #2490) read `Keys[1:]` directly and were left
-unchanged. Fail-on-revert covered by the `TestOSPFExport*`,
-`TestBGPExportImport*`, `TestOSPFv3Export*`, `TestISISExport*`, and
-`TestCommunityMembers*` cases in
+first member. All six now route through `firewallMatchValues`.
+
+The BGP **group** and **neighbor** export/import readers
+(`compiler_protocols.go`, #2490) were NOT on the contract: they used the
+`nodeVal(child)`-first pattern (`if v := nodeVal(child); v != "" { append v }
+else if len(Keys) >= 2 { append Keys[1:] }`). Because `nodeVal` returns
+`Keys[1]` (non-empty for a bracket list), the `v != ""` branch fired and
+appended ONLY the first policy — the `Keys[1:]` fallback never ran, so
+`group g1 export [ OUT-A OUT-B ]` and `neighbor 10.0.0.1 export [ N-A N-B ]`
+silently dropped every policy past the first (#2702; an earlier #2690 review
+note that these readers were "already correct" was wrong). All four
+(group export/import, neighbor export/import) now route through
+`firewallMatchValues`, matching the top-level readers. Fail-on-revert covered
+by the `TestOSPFExport*`, `TestBGPExportImport*`,
+`TestBGPGroupExportImport*`, `TestBGPNeighborExportImport*`,
+`TestOSPFv3Export*`, `TestISISExport*`, and `TestCommunityMembers*` cases in
 `pkg/config/protocols_multileaf_2587_test.go`.
 
 The policy-statement `from community`, `from prefix-list`, and `from as-path`
