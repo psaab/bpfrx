@@ -119,6 +119,19 @@ type vrrpInstance struct {
 	// capture the control message.
 	ipv6Send func(data []byte, cm *ipv6.ControlMessage, dst net.Addr) error
 
+	// ipv6Recv is the seam used by receiverIPv6 to read an IPv6 advert together
+	// with its arrival interface (the per-packet control message). It returns
+	// the byte count, the arrival ifindex (0 if the platform did not report
+	// one), and the source address. Production leaves it nil and receiverIPv6
+	// lazily builds a wrapper over ipv6.NewPacketConn(ipv6Conn) with
+	// FlagInterface enabled; tests override it to inject synthetic adverts with
+	// a chosen arrival ifindex (the #2886 cross-VLAN filter seam). Capturing the
+	// arrival ifindex is required because the IPv6 raw socket on a VLAN
+	// sub-interface is wildcard-bound (no SO_BINDTODEVICE — see manager.go), so
+	// the kernel fans a proto-112 frame out to every sibling-VLAN socket; the
+	// VRID/TTL/self gates alone let same-VRID siblings cross-process (#2886).
+	ipv6Recv func(buf []byte) (n int, ifindex int, src net.Addr, err error)
+
 	// AF_PACKET socket for receiving on VLAN sub-interfaces.
 	// Raw IP sockets don't reliably receive multicast on VLAN
 	// sub-interfaces (kernel limitation). AF_PACKET captures at
@@ -843,9 +856,56 @@ func isTimeoutError(err error) bool {
 	return false
 }
 
+// acceptArrivalIfindex decides whether a raw-socket VRRP advert that arrived on
+// interface arrivalIfindex should be processed by an instance bound to
+// expectedIfindex.
+//
+// On the fallback raw-IP receiver path (afPacketFD < 0), VLAN sub-interfaces
+// skip SO_BINDTODEVICE (maybeBindToDevice is a no-op on VLAN, see manager.go),
+// so every per-instance raw socket on a shared parent binds to the wildcard
+// address with NO device isolation. The kernel then delivers a proto-112 frame
+// to ALL such sockets. Without an arrival-interface check, two VLAN
+// sub-interfaces (e.g. reth0.50 / reth0.80) running instances with the SAME
+// VRID would cross-process each other's adverts — state corruption, false
+// BACKUP transitions, split-brain flapping (#2886).
+//
+// The receiver enables the per-packet interface control message and passes the
+// reported arrival ifindex here. A mismatch is rejected. arrivalIfindex == 0
+// means the platform did not report an arrival interface for this packet; we
+// fail OPEN in that case so we never regress real delivery on a kernel/socket
+// combination that omits the control message — the VRID/TTL/self-IP gates still
+// apply. expectedIfindex <= 0 (an instance with no resolved interface index, as
+// in some unit-test constructions) also fails open.
+func acceptArrivalIfindex(arrivalIfindex, expectedIfindex int) bool {
+	if arrivalIfindex <= 0 || expectedIfindex <= 0 {
+		return true
+	}
+	return arrivalIfindex == expectedIfindex
+}
+
+// expectedIfindex returns the kernel ifindex this instance is bound to, or 0 if
+// no interface is resolved (test constructions may leave iface nil).
+func (vi *vrrpInstance) expectedIfindex() int {
+	if vi.iface == nil {
+		return 0
+	}
+	return vi.iface.Index
+}
+
 // receiver reads VRRP packets from the per-instance raw socket.
 func (vi *vrrpInstance) receiver() {
 	buf := make([]byte, 1500)
+
+	// Capture the per-packet arrival interface so cross-VLAN frames delivered
+	// to this wildcard-bound socket can be rejected (#2886). On VLAN
+	// sub-interfaces the socket is NOT bound to a device, so the kernel fans a
+	// proto-112 frame out to every instance's socket on the shared parent.
+	if vi.rawConn != nil {
+		if err := vi.rawConn.SetControlMessage(ipv4.FlagInterface, true); err != nil {
+			slog.Debug("vrrp: set control message failed", "key", vi.key(), "err", err)
+		}
+	}
+
 	for {
 		select {
 		case <-vi.stopCh:
@@ -858,7 +918,7 @@ func (vi *vrrpInstance) receiver() {
 		// blocking recvmsg syscall; the deadline ensures we periodically
 		// check stopCh even if the socket is unexpectedly in blocking mode.
 		vi.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		hdr, payload, _, err := vi.rawConn.ReadFrom(buf)
+		hdr, payload, cm, err := vi.rawConn.ReadFrom(buf)
 		if err != nil {
 			select {
 			case <-vi.stopCh:
@@ -870,6 +930,17 @@ func (vi *vrrpInstance) receiver() {
 				}
 				continue
 			}
+		}
+
+		// Reject adverts that arrived on a different interface (#2886). On the
+		// VLAN fallback path the socket is wildcard-bound, so the kernel
+		// delivers a same-VRID advert from a sibling VLAN here too.
+		arrivalIf := 0
+		if cm != nil {
+			arrivalIf = cm.IfIndex
+		}
+		if !acceptArrivalIfindex(arrivalIf, vi.expectedIfindex()) {
+			continue
 		}
 
 		// Verify TTL == 255 (RFC 5798 §5.1.1.3).
@@ -915,6 +986,31 @@ func (vi *vrrpInstance) receiver() {
 // Source address comes from the addr parameter of ReadFrom.
 func (vi *vrrpInstance) receiverIPv6() {
 	buf := make([]byte, 1500)
+
+	// Resolve the read seam. Production builds a wrapper over the raw conn that
+	// returns the per-packet control message (the arrival interface). The IPv6
+	// raw socket is wildcard-bound (`::`) and NOT bound to a device on a VLAN
+	// sub-interface (no SO_BINDTODEVICE — manager.go), so the kernel fans a
+	// proto-112 frame out to every instance's socket on the shared parent;
+	// without an arrival-interface check, sibling VLANs with the same VRID
+	// cross-process (#2886). Tests override ipv6Recv to inject a chosen ifindex.
+	recv := vi.ipv6Recv
+	if recv == nil {
+		pc := ipv6.NewPacketConn(vi.ipv6Conn)
+		if err := pc.SetControlMessage(ipv6.FlagInterface, true); err != nil {
+			slog.Debug("vrrp: set ipv6 control message failed", "key", vi.key(), "err", err)
+		}
+		recv = func(b []byte) (int, int, net.Addr, error) {
+			vi.ipv6Conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			n, cm, src, err := pc.ReadFrom(b)
+			ifindex := 0
+			if cm != nil {
+				ifindex = cm.IfIndex
+			}
+			return n, ifindex, src, err
+		}
+	}
+
 	for {
 		select {
 		case <-vi.stopCh:
@@ -922,8 +1018,7 @@ func (vi *vrrpInstance) receiverIPv6() {
 		default:
 		}
 
-		vi.ipv6Conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		n, addr, err := vi.ipv6Conn.ReadFrom(buf)
+		n, arrivalIf, addr, err := recv(buf)
 		if err != nil {
 			select {
 			case <-vi.stopCh:
@@ -937,6 +1032,11 @@ func (vi *vrrpInstance) receiverIPv6() {
 		}
 
 		if n < vrrpHeaderLen {
+			continue
+		}
+
+		// Reject adverts that arrived on a different interface (#2886).
+		if !acceptArrivalIfindex(arrivalIf, vi.expectedIfindex()) {
 			continue
 		}
 

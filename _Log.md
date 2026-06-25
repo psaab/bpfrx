@@ -1,3 +1,41 @@
+## 2026-06-25 — #2886: VRRP raw-socket fallback cross-VLAN crosstalk (no per-interface ifindex check)
+
+- **Timestamp**: 2026-06-25
+- **Action**: On the AF_PACKET-unavailable fallback (`afPacketFD < 0`), VRRP
+  uses per-instance raw IP sockets. `maybeBindToDevice` is a deliberate no-op
+  on VLAN sub-interfaces (`manager.go`), so two VLAN raw sockets on the same
+  parent both bind to the wildcard address with NO device isolation — the
+  kernel delivers a proto-112 frame to every such socket. The fallback
+  receivers (`receiver` IPv4 / `receiverIPv6`) gated only on TTL, self-IP, and
+  VRID, so two VLAN sub-interfaces (reth0.50 / reth0.80) with the SAME VRID
+  cross-processed each other's adverts → false BACKUP transitions, split-brain
+  flapping (#2886, agy-review-051 051-03). Fix: both receivers now enable the
+  per-packet interface control message (`ipv4.FlagInterface` /
+  `ipv6.FlagInterface`), capture the arrival ifindex, and route it through
+  `acceptArrivalIfindex(arrival, vi.expectedIfindex())`. A mismatch is dropped;
+  it fails OPEN when ifindex==0 (platform reported none) or the instance has no
+  resolved interface, so real delivery never regresses (VRID/TTL/self gates
+  still apply). IPv6 reads go through a new `ipv6Recv` seam (an
+  `ipv6.NewPacketConn(...).ReadFrom` wrapper in production) so tests can inject
+  a synthetic arrival ifindex without CAP_NET_RAW. The existing
+  `TestReceiverIPv6_DeliversPacket` was migrated from the `mockPacketConn`
+  injection (incompatible with `ipv6.NewPacketConn`, which needs `net.Conn`) to
+  the `ipv6Recv` seam with arrival ifindex 0 (fail-open). Only the fallback
+  path is affected; the default `receiverAfPacket` tap already binds one
+  ifindex.
+- **File(s)**: pkg/vrrp/instance.go (acceptArrivalIfindex + expectedIfindex
+  helpers, ipv4 receiver FlagInterface + ifindex gate, ipv6Recv seam +
+  receiverIPv6 ifindex gate), pkg/vrrp/instance_ifindex_filter_test.go (new),
+  pkg/vrrp/vrrp_test.go (TestReceiverIPv6_DeliversPacket migrated to ipv6Recv
+  seam), pkg/vrrp/README.md, _Log.md.
+- **Validation**: go build ./..., gofmt -l clean, go vet ./pkg/vrrp/...,
+  go test ./pkg/vrrp/... all PASS. FAIL-ON-REVERT (copy-aside revert proof):
+  neutering `acceptArrivalIfindex` to `return true` flips
+  TestAcceptArrivalIfindexCrossVLAN/sibling_VLAN_same_VRID_rejected RED;
+  deleting the ifindex check in both receivers makes
+  TestReceiverIPv6_DropsCrossInterfaceAdvert process the cross-interface advert
+  (RED). Both restored to GREEN. PARENT will run `make test-failover` (HA gate)
+  before merge.
 ## 2026-06-25 — #2902: BGP `then community delete [ list1 list2 ]` multi-list — accumulate all community-lists
 
 - **Timestamp**: 2026-06-25
