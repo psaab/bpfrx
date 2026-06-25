@@ -565,7 +565,7 @@ reserved for whole-dataplane selection where a rewrite shim
   no-op knob, not a false dataplane/identity promise — and its real
   implementation is split to /research. Regression coverage:
   `pkg/config/compiler_interfaces_unsupported_test.go`.
-- **#1387 (DHCP dynamic-DNS, increment 1):** added an opt-in
+- **#1387 (DHCP dynamic-DNS — live rfc2136 backend):** added an opt-in
   `dynamic-dns` subtree under BOTH `services dhcp-local-server` and
   `services dhcpv6-local-server` (a single shared `config.DHCPDynamicDNSConfig`
   on `DHCPServerConfig`; absent block == nil == today's behaviour). The
@@ -581,16 +581,24 @@ reserved for whole-dataplane selection where a rewrite shim
     fqdn | mac-fallback)`, matching `deriveFQDN`'s three modes.
   - `conflict-policy` — `ValueEnumOf` + `ValidateEnum(replace-owned |
     skip-existing | strict-fail)`.
-  - `backend` — `ValueEnumOf` + `ValidateEnum(rfc2136 | kea-d2)`. `kea-d2`
-    is a RESERVED enum value (the live backend is `rfc2136`, increment 2;
-    Kea D2 is not in the image). The enum accepts it so a config naming it
-    commits, but increment 1 implements only `rfc2136`.
+  - `backend` — `ValueEnumOf` + `ValidateEnum(rfc2136 | kea-d2)`. `rfc2136`
+    is LIVE (#1387 inc-2: the always-on reconcile loop publishes/withdraws
+    records over real RFC 2136 UPDATE). `kea-d2` is a RESERVED enum value
+    that is NOT implemented (Kea D2 is not in the image); the enum accepts it
+    so a config naming it commits, but selecting it warns at commit and
+    publishes nothing.
   Deliberately UNTYPED (free-form `args:1` leaves), with reasons in
   `schema_system.go`: `domain`, `update-server`, `tsig-key`,
-  `tsig-algorithm`, `tsig-secret`. The live rfc2136 backend that would
-  constrain `update-server` (host[:port]) lands in increment 2, and a
-  hostname / base64 secret is not validatable by the existing IP/identifier
-  validators without false-rejecting valid input. `tsig-secret` is
+  `tsig-algorithm`, `tsig-secret`. These are not rejected at the typed-schema
+  layer (a hostname / base64 secret is not validatable by the existing
+  IP/identifier validators without false-rejecting valid input); instead the
+  live rfc2136 backend warn-validates them at commit
+  (`validateDDNSBackendWarnings` in `compiler_validate_warn.go`): an enabled
+  rfc2136 backend with no/garbage `update-server`, an unsupported
+  `tsig-algorithm`, or an incomplete TSIG tuple (`tsig-key` without
+  `tsig-secret`, or `tsig-secret` without `tsig-key`) each emit a WARN-only
+  commit message (#2666) — never a hard reject, and the backend degrades
+  safely at runtime. `tsig-secret` is
   SENSITIVE: it is redacted in `DHCPDynamicDNSConfig.String()` (logging) AND,
   since #2053, by its `config.Secret` field type on every JSON/YAML marshal
   (so the compiled-config dump on `GET /api/v1/config` never leaks it — see

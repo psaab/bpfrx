@@ -553,8 +553,10 @@ var schemaServices = &schemaNode{desc: "Services configuration", children: map[s
 // parents do not share a mutable map. The enums + ttl carry validators
 // (the compiler/runtime consume them); the free-form credential and
 // target fields (domain, update-server, tsig-*) stay untyped so a valid
-// hostname / base64 secret is not rejected at commit — the live backend
-// that constrains them lands in increment 2.
+// hostname / base64 secret is not rejected at commit — the live rfc2136
+// backend that consumes them is warn-validated at commit
+// (validateDDNSBackendWarnings) and fail-open at runtime, never a hard
+// brick.
 func dhcpDynamicDNSSchema() *schemaNode {
 	return &schemaNode{desc: "Dynamic DNS updates for DHCP leases (#1387)", children: map[string]*schemaNode{
 		"enable": {desc: "Enable dynamic DNS record publishing", children: nil},
@@ -592,10 +594,10 @@ func dhcpDynamicDNSSchema() *schemaNode {
 			children:      nil,
 		},
 		"backend": {
-			desc:          "DNS-update backend (parsed/validated; live updater deferred to a later increment)",
+			desc:          "DNS-update backend (rfc2136 is live; kea-d2 is reserved/unimplemented)",
 			args:          1,
 			valueType:     ValueEnumOf,
-			valueDesc:     "Update backend (rfc2136 | kea-d2 [reserved]) — config-only in this increment",
+			valueDesc:     "Update backend (rfc2136 [live] | kea-d2 [reserved, not in image])",
 			valueExamples: []string{"rfc2136"},
 			validator:     ValidateEnum([]string{"rfc2136", "kea-d2"}),
 			children:      nil,

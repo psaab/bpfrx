@@ -1,5 +1,22 @@
 # Action Log
 
+## 2026-06-24 — #2691 P0 / #2667: de-stale DDNS comments + docs (live rfc2136 backend shipped)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Corrected stale "deferred / config-only / increment N"
+  comments that described the now-live RFC 2136 DDNS backend as not-yet-
+  built. Fixed the `ownerWatermark` comment that wrongly claimed nodeID is
+  "folded in" (it never was — the node-INDEPENDENT hash is correct and
+  required for cross-failover cleanup; comment corrected, code unchanged).
+  Fixed the `nodeID` field "HA emission gating is increment 3" claim (the
+  writer gate is live). Updated schema descriptions + docs/config-schema.md
+  + dhcpserver/README.md to state rfc2136 is live and warn-validated.
+- **File(s)**: pkg/dhcpserver/ddns.go, pkg/config/schema_system.go,
+  pkg/config/types_system.go, docs/config-schema.md,
+  pkg/dhcpserver/README.md, _Log.md
+
+# Action Log
+
 ## 2026-06-24 — #2689 review fold: `from as-path` bracket-collapse (sibling reader, same function) — routed through firewallMatchValues + 3 fail-on-revert tests; children-path only (brackets never reach the inline-keys path). Files: pkg/config/compiler_routing.go, pkg/config/policy_from_multileaf_2689_test.go, docs/config-schema.md, _Log.md
 
 ## 2026-06-24 — #2689 fix: policy-term `from community` / `from prefix-list` dropped all but first bracketed value
