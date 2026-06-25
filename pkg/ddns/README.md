@@ -27,7 +27,7 @@ moved with its assertions intact.
 | `backend_route53.go` | Route 53 backend (#2691 P3): SigV4-signed `ChangeResourceRecordSets` UPSERT/DELETE change batch. |
 | `sigv4.go` | Minimal self-contained AWS SigV4 signer for Route 53 (no AWS SDK dependency). |
 | `backend_generic.go` | Generic templated backend (#2691 P3, inadyn "custom"): `%h/%i/%u/%p/%%` URL template + success-substring matcher — config-only, no Go code per provider. |
-| `checkip.go` | Opt-in external check-IP address source (#2691 P3): bogus-IP validity gate + allowlist (`isPublicAddr`, `parseCheckIPBody`, `CheckIP`, `ParseAllowlist`). |
+| `checkip.go` | Opt-in external check-IP address source (#2691 P3): bogus-IP validity gate + allowlist (`isPublicAddr`, `parseCheckIPBody`, `CheckIP`, `ParseAllowlist`). `CheckIP` fails closed on a malformed `checkip-url` via `validateCheckIPURL` (http(s) scheme + host); a typo is also warned at commit by `config.validateSurfaceADDNSWarnings` so it cannot masquerade as a permanent transient observation failure (#2773). |
 
 Tests moved with the code: `manager_test.go` (engine + state-store + hostname),
 `backend_rfc2136_test.go` (backend, drives a real in-process miekg/dns server),

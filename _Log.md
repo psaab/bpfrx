@@ -1,3 +1,37 @@
+## 2026-06-25 — #2773: wire validateCheckIPURL (dead code) into commit + runtime
+
+- **Timestamp**: 2026-06-25
+- **Action**: `ddns.validateCheckIPURL` existed but had NO callers, so a
+  malformed `checkip-url` committed with no warning and then suppressed
+  publishing indefinitely as a phantom "transient" observation failure
+  (`http.NewRequest` accepts `ftp://`, `not a url`, host-less `http://`,
+  so the bad URL fell through to a fetch failure → `ok=false` → engine
+  leaves the scope untouched forever; a previously-published record
+  stays stale). Fix: (1) hardened `validateCheckIPURL` to require an
+  http(s) scheme AND a host (was prefix-only, missed host-less
+  `http://`); (2) wired it into `ddns.CheckIP` as a fail-closed runtime
+  backstop before constructing the request; (3) mirrored the check as
+  `config.ddnsCheckIPURLValid` and emitted a commit-time warning in
+  `validateSurfaceADDNSWarnings` (config cannot import pkg/ddns — same
+  pattern as `ddnsUpdateServerParseable` / `ddnsKnownDyndns2NameSet`) so
+  an operator typo is surfaced at `commit`. Two fail-on-revert tests:
+  `config.TestP3CheckIPURLMalformedWarns` (commit warning; also asserts a
+  valid URL does NOT warn) and `ddns.TestCheckIPRejectsMalformedURL`
+  (runtime gate via a panic-on-dial transport) + `TestValidateCheckIPURL`.
+- **Fail-on-revert proof**: removed the `validateSurfaceADDNSWarnings`
+  checkip block → `TestP3CheckIPURLMalformedWarns` FAILED ("expected a
+  checkip-url warning for provider \"bad-scheme\""); removed the
+  `CheckIP` gate → `TestCheckIPRejectsMalformedURL` FAILED ("CheckIP
+  attempted a request for a malformed URL: ftp://checkip.example/").
+  Both GREEN after restore.
+- **Gates**: `go build ./...` OK; `gofmt -l` clean; `go vet
+  ./pkg/ddns/... ./pkg/config/...` clean; `go test ./pkg/ddns/...` and
+  `go test ./pkg/config/...` PASS.
+- **File(s)**: `pkg/ddns/checkip.go`, `pkg/ddns/checkip_test.go`,
+  `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/compiler_p3_http_providers_test.go`,
+  `docs/config-schema.md`, `pkg/ddns/README.md`
+
 ## 2026-06-25 — #2789: relay DHCPDECLINE to the server
 
 - **Timestamp**: 2026-06-25
