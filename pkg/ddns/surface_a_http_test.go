@@ -205,7 +205,7 @@ func TestHTTPBackendErrorsNeverLeakSecret(t *testing.T) {
 			Name: "g", Backend: "generic",
 			URLTemplate: closedURL + "/u?h=%h&i=%i&p=%p",
 			Password:    config.Secret(secret),
-		})
+		}, nil)
 		if err != nil {
 			t.Fatalf("newGenericBackend: %v", err)
 		}
@@ -225,7 +225,7 @@ func TestHTTPBackendErrorsNeverLeakSecret(t *testing.T) {
 			Name: "g", Backend: "generic",
 			URLTemplate: "https://x/u?p=%p",
 			Password:    config.Secret("\x7f" + secret),
-		})
+		}, nil)
 		if err != nil {
 			t.Fatalf("newGenericBackend: %v", err)
 		}
@@ -243,7 +243,7 @@ func TestHTTPBackendErrorsNeverLeakSecret(t *testing.T) {
 		b, err := newCloudflareBackend(&config.DDNSProvider{
 			Name: "cf", Backend: "cloudflare", APIToken: config.Secret(secret),
 			Zone: "example.net", Server: srv.URL,
-		})
+		}, nil)
 		if err != nil {
 			t.Fatalf("newCloudflareBackend: %v", err)
 		}
@@ -263,7 +263,7 @@ func TestHTTPBackendErrorsNeverLeakSecret(t *testing.T) {
 			Name: "r53", Backend: "route53",
 			AWSAccessKeyID: "AKID", AWSSecretAccessKey: config.Secret(secret),
 			AWSRegion: "us-east-1", HostedZoneID: "Z123", Server: srv.URL,
-		})
+		}, nil)
 		if err != nil {
 			t.Fatalf("newRoute53Backend: %v", err)
 		}

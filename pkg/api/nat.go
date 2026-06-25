@@ -6,7 +6,51 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
+
+// runtimeSourceNATPools returns the userspace helper's live source-NAT pool
+// status, deduplicated by pool name. Rules sharing a pool reference the same
+// Arc<PortAllocatorShared> and report identical occupancy, so a single entry
+// per pool is kept (never summed) — matching the AppliedNATView dedup contract
+// in pkg/dataplane/userspace/applied_nat_view.go.
+//
+// This is the SSOT for in-use / capacity under the AF_XDP userspace dataplane
+// (#2938): the helper publishes the authoritative AddressCount / PortLow /
+// PortHigh / UsedPorts (it rejects malformed addresses, splits pools by IP
+// family, and shares allocator state across rules), which config text and the
+// retired-eBPF port counter cannot. Returns nil when the helper is not running
+// or does not expose a runtime status — callers then fall back to the
+// config-derived view.
+func (s *Server) runtimeSourceNATPools() map[string]dpuserspace.SourceNATPoolStatus {
+	if s.dp == nil || !s.dp.IsLoaded() {
+		return nil
+	}
+	provider, ok := s.dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		return nil
+	}
+	status, err := provider.Status()
+	if err != nil {
+		return nil
+	}
+	if len(status.SourceNATPools) == 0 {
+		return nil
+	}
+	pools := make(map[string]dpuserspace.SourceNATPoolStatus, len(status.SourceNATPools))
+	for _, p := range status.SourceNATPools {
+		if p.PoolName == "" {
+			continue
+		}
+		if _, seen := pools[p.PoolName]; seen {
+			continue
+		}
+		pools[p.PoolName] = p
+	}
+	return pools
+}
 
 func (s *Server) natSourceHandler(w http.ResponseWriter, _ *http.Request) {
 	cfg := s.store.ActiveConfig()
@@ -76,8 +120,18 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		cr = s.applyResult()
 	}
 
+	// #2938: in-use / capacity must come from the userspace helper's live
+	// runtime status, not config text + the retired-eBPF port counter. The
+	// helper rejects malformed addresses, splits pools by IP family, reports
+	// actual used ports, and shares allocator state across rules — config text
+	// can over-report capacity and the legacy ReadNATPortCounter is dead under
+	// the AF_XDP dataplane. runtime[name] is the SSOT when present.
+	runtime := s.runtimeSourceNATPools()
+
 	// Named pools
 	for name, pool := range cfg.Security.NAT.SourcePools {
+		// Config-derived fallback for capacity (used only when the helper has
+		// no runtime entry for this pool — e.g. before the first apply lands).
 		portLow, portHigh := pool.PortLow, pool.PortHigh
 		if portLow == 0 {
 			portLow = 1024
@@ -85,16 +139,36 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		if portHigh == 0 {
 			portHigh = 65535
 		}
-		totalPorts := (portHigh - portLow + 1) * len(pool.Addresses)
+		addrCount := len(pool.Addresses)
 		used := 0
 
-		if cr != nil {
+		if rp, ok := runtime[name]; ok {
+			// Runtime SSOT: the helper's applied address count, port window,
+			// and live used-port occupancy.
+			if rp.AddressCount > 0 {
+				addrCount = rp.AddressCount
+			}
+			if rp.PortLow != 0 {
+				portLow = int(rp.PortLow)
+			}
+			if rp.PortHigh != 0 {
+				portHigh = int(rp.PortHigh)
+			}
+			used = int(rp.UsedPorts)
+		} else if cr != nil {
+			// No runtime entry (helper not running / pre-first-apply): fall
+			// back to the legacy port counter so the surface is not blank.
 			if id, ok := cr.PoolIDs[name]; ok {
 				cnt, err := s.dp.ReadNATPortCounter(uint32(id))
 				if err == nil {
 					used = int(cnt)
 				}
 			}
+		}
+
+		totalPorts := 0
+		if portHigh >= portLow {
+			totalPorts = (portHigh - portLow + 1) * addrCount
 		}
 
 		avail := totalPorts - used
