@@ -1,3 +1,54 @@
+## 2026-06-25 — #2622: firewall filter source-port-except / destination-port-except
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added the Junos negated port match conditions
+  `from source-port-except` / `from destination-port-except` (match every
+  port EXCEPT the listed ones) end to end, the port-dimension counterpart
+  to the existing positive source-port / destination-port. Scope is ports
+  only — `packet-length` from the same review-039 finding 039-04 is NOT
+  implemented here.
+  - Schema: two `multi: true` leaves in `schemaFirewall`'s `from` block in
+    `schema_cos.go` (both `family inet` and `inet6`).
+  - Typed config: `SourcePortsExcept` / `DestPortsExcept []string` on
+    `FirewallFilterTerm` (`types_system.go`); `compileFilterFrom`
+    accumulates via `firewallMatchValues` (both AST shapes, #2419 bracket
+    list).
+  - Wire: additive `source_ports_except` / `destination_ports_except`
+    fields on Go `FirewallTermSnapshot` (`protocol.go`) + Rust
+    `FirewallTermSnapshot` (`protocol/security.rs`, `serde(default)` for
+    #1961 parity); emitted by `filters.go`. Regenerated
+    `protocol_wire_v1.json` (exactly the 2 keys added).
+  - Rust matcher: compiler selects ONE port list per direction (positive
+    wins, else except) and sets `source_port_except` / `dest_port_except`
+    on `FilterTerm`; `port_match` evaluates `matcher.matches(port) ^ except`
+    mirroring `nets_match_v4`/`_v6` (empty-except → match ALL,
+    empty-positive → match NOTHING). Added the new flags to
+    `filter_term_semantics_match` (cache_sensitive.rs) so a `*-port-except`
+    toggle rebuilds flow-cache decisions (sibling of source_except).
+  - FAIL-ON-REVERT proof: Rust `destination_port_except_negation` /
+    `source_port_except_negation` (port IN except list does NOT match,
+    port NOT in it DOES) — proven RED when `^ except` removed; Go
+    `firewall_port_except_2622_test.go` (hierarchical + flat-set bracket
+    + inet6) — proven RED when the compiler cases removed; Go emit test
+    `filters_port_except_2622_test.go`.
+  - Gates: cargo build --release OK; cargo test filter:: 117 + protocol::
+    184 OK; go build ./... OK; gofmt clean (touched files); go vet OK;
+    go test ./pkg/config/... ./pkg/dataplane/userspace/... OK.
+- **File(s)**: `pkg/config/schema_cos.go`,
+  `pkg/config/compiler_firewall.go`, `pkg/config/types_system.go`,
+  `pkg/config/firewall_port_except_2622_test.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/filters.go`,
+  `pkg/dataplane/userspace/filters_port_except_2622_test.go`,
+  `userspace-dp/src/protocol/security.rs`,
+  `userspace-dp/src/filter/mod.rs`,
+  `userspace-dp/src/filter/compiler.rs`,
+  `userspace-dp/src/filter/engine/matching.rs`,
+  `userspace-dp/src/filter/engine/cache_sensitive.rs`,
+  `userspace-dp/src/filter/tests.rs`,
+  `userspace-dp/src/filter/README.md`,
+  `userspace-dp/tests/fixtures/protocol_wire_v1.json`,
+  `docs/config-schema.md`, `_Log.md`
 ## 2026-06-25 — #2770: cloudflare withdraw is content-scoped (delete owned rows only)
 
 - **Timestamp**: 2026-06-25

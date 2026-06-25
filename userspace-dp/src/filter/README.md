@@ -414,6 +414,37 @@ follow-up. An undefined prefix-list reference is rejected at commit by
 `validateFirewallPrefixListReferencesStrict` (Go), so the Rust side never has to
 reason about a dangling name.
 
+### Negated port match — `source-port-except` / `destination-port-except` (#2622)
+
+Junos `from source-port-except` / `from destination-port-except` matches every
+port EXCEPT the listed ones — the port-dimension counterpart to the address
+`except` above. The negated list travels as two additive wire fields on
+`FirewallTermSnapshot` — `source_ports_except` / `destination_ports_except` (Go
+`pkg/dataplane/userspace/protocol.go`, Rust `protocol/security.rs` with
+`serde(default)` for #1961 mixed-version parity).
+
+The Rust compiler (`compiler.rs`) selects ONE port spec list per direction: the
+positive `source_ports` / `destination_ports` if it carries a real entry,
+otherwise the `*_except` list. It builds the SAME `PortMatcher` from the
+selected list, sets `*_port_constrained` from the selected list, and sets a
+per-direction `source_port_except` / `dest_port_except` inversion flag on
+`FilterTerm` when the except list is the source (positive wins if both are
+present — there is no single matcher that expresses "ports in A but not B", same
+fold as the address mixed case). The matcher `port_match`
+(`engine/matching.rs`) evaluates `matcher.matches(port) ^ except`, mirroring
+`nets_match_v4` / `nets_match_v6`:
+
+- positive (`except == false`), `PortMatcher::Any` while constrained → match
+  NOTHING (the #2400 all-malformed fail-closed case);
+- `except == true`, `PortMatcher::Any` while constrained → match ALL (Junos
+  "all ports except {}");
+- otherwise → `(port ∈ ranges) XOR except`.
+
+Tests: `destination_port_except_negation` / `source_port_except_negation` in
+`filter/tests.rs` (port IN the except list does NOT match, port NOT in it DOES;
+fail-on-revert). Scope is ports only — `packet-length` from the same review-039
+finding is not implemented.
+
 ### Path (b) runbook — cache-sensitive
 
 Adding a per-packet match field that is NOT in the cache key

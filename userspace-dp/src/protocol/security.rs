@@ -129,6 +129,19 @@ pub(crate) struct FirewallTermSnapshot {
     pub source_ports: Vec<String>,
     #[serde(rename = "destination_ports", default)]
     pub destination_ports: Vec<String>,
+    // #2622: NEGATED port match sets (Junos `from source-port-except` /
+    // `destination-port-except`) — match every port EXCEPT these. The compiler
+    // turns a non-empty list into a port matcher plus a per-direction `except`
+    // flag, and the evaluator computes `(port ∈ ranges) XOR except` with the
+    // same fail-closed-on-all-malformed semantics as the address except. These
+    // are distinct from the positive source_ports / destination_ports (Junos
+    // treats positive and `-except` as mutually-exclusive criteria).
+    // serde(default) keeps wire parity with an older Go control plane that omits
+    // the field (#1961).
+    #[serde(rename = "source_ports_except", default)]
+    pub source_ports_except: Vec<String>,
+    #[serde(rename = "destination_ports_except", default)]
+    pub destination_ports_except: Vec<String>,
     #[serde(rename = "dscp_values", default)]
     pub dscp_values: Vec<u8>,
     #[serde(default)]
