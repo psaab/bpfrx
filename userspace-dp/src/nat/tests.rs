@@ -550,6 +550,8 @@ fn static_nat_dnat_matches_external_ip_v4() {
             from_zone: "untrust".to_string(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
         }],
         &crate::nat::NatCounterStore::default(),
     );
@@ -573,6 +575,8 @@ fn static_nat_snat_matches_internal_ip_v4() {
             from_zone: "trust".to_string(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
         }],
         &crate::nat::NatCounterStore::default(),
     );
@@ -596,6 +600,8 @@ fn static_nat_dnat_matches_external_ip_v6() {
             from_zone: "untrust".to_string(),
             external_ip: "2001:db8::1".to_string(),
             internal_ip: "fd00::1".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
         }],
         &crate::nat::NatCounterStore::default(),
     );
@@ -619,6 +625,8 @@ fn static_nat_snat_matches_internal_ip_v6() {
             from_zone: "trust".to_string(),
             external_ip: "2001:db8::1".to_string(),
             internal_ip: "fd00::1".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
         }],
         &crate::nat::NatCounterStore::default(),
     );
@@ -642,6 +650,8 @@ fn static_nat_zone_mismatch_returns_none_for_dnat() {
             from_zone: "untrust".to_string(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
         }],
         &crate::nat::NatCounterStore::default(),
     );
@@ -669,6 +679,8 @@ fn static_nat_empty_zone_matches_any() {
             from_zone: String::new(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
         }],
         &crate::nat::NatCounterStore::default(),
     );
@@ -698,6 +710,8 @@ fn static_nat_bidirectional_reverse() {
             from_zone: "untrust".to_string(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
         }],
         &crate::nat::NatCounterStore::default(),
     );
@@ -739,6 +753,8 @@ fn static_nat_no_match_returns_none() {
             from_zone: "untrust".to_string(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
         }],
         &crate::nat::NatCounterStore::default(),
     );
@@ -764,6 +780,8 @@ fn static_nat_invalid_ip_skipped() {
                 from_zone: String::new(),
                 external_ip: "not-an-ip".to_string(),
                 internal_ip: "192.168.1.10".to_string(),
+                match_destination_port: 0,
+                mapped_port: 0,
             },
             StaticNATRuleSnapshot {
                 counter_id: 0,
@@ -771,6 +789,8 @@ fn static_nat_invalid_ip_skipped() {
                 from_zone: String::new(),
                 external_ip: "203.0.113.10".to_string(),
                 internal_ip: "192.168.1.10".to_string(),
+                match_destination_port: 0,
+                mapped_port: 0,
             },
         ],
         &crate::nat::NatCounterStore::default(),
@@ -793,6 +813,8 @@ fn static_nat_external_ips_iterator() {
                 from_zone: String::new(),
                 external_ip: "203.0.113.10".to_string(),
                 internal_ip: "192.168.1.10".to_string(),
+                match_destination_port: 0,
+                mapped_port: 0,
             },
             StaticNATRuleSnapshot {
                 counter_id: 0,
@@ -800,6 +822,8 @@ fn static_nat_external_ips_iterator() {
                 from_zone: String::new(),
                 external_ip: "203.0.113.20".to_string(),
                 internal_ip: "192.168.1.20".to_string(),
+                match_destination_port: 0,
+                mapped_port: 0,
             },
         ],
         &crate::nat::NatCounterStore::default(),
@@ -827,6 +851,8 @@ fn static_nat_canonical_cidr_mask_v4_installs_entry() {
             from_zone: "untrust".to_string(),
             external_ip: "203.0.113.5/32".to_string(),
             internal_ip: "10.0.0.5/32".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
         }],
         &crate::nat::NatCounterStore::default(),
     );
@@ -864,6 +890,8 @@ fn static_nat_canonical_cidr_mask_v6_installs_entry() {
             from_zone: "untrust".to_string(),
             external_ip: "2001:db8::1/128".to_string(),
             internal_ip: "fd00::1/128".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
         }],
         &crate::nat::NatCounterStore::default(),
     );
@@ -899,6 +927,8 @@ fn static_nat_cidr_and_bare_coexist() {
                 from_zone: String::new(),
                 external_ip: "203.0.113.5/32".to_string(),
                 internal_ip: "10.0.0.5".to_string(),
+                match_destination_port: 0,
+                mapped_port: 0,
             },
             StaticNATRuleSnapshot {
                 counter_id: 0,
@@ -906,6 +936,8 @@ fn static_nat_cidr_and_bare_coexist() {
                 from_zone: String::new(),
                 external_ip: "203.0.113.6".to_string(),
                 internal_ip: "10.0.0.6/32".to_string(),
+                match_destination_port: 0,
+                mapped_port: 0,
             },
         ],
         &crate::nat::NatCounterStore::default(),
@@ -955,6 +987,8 @@ fn static_nat_non_host_mask_rejected() {
                 from_zone: String::new(),
                 external_ip: bad.to_string(),
                 internal_ip: "10.0.0.5".to_string(),
+                match_destination_port: 0,
+                mapped_port: 0,
             }],
             &crate::nat::NatCounterStore::default(),
         );
@@ -964,6 +998,130 @@ fn static_nat_non_host_mask_rejected() {
             "non-host/garbage mask {bad:?} must be rejected, not installed"
         );
     }
+}
+
+// --- #2491 static-NAT port / mapped-port forwarding ---
+
+fn mapped_port_snapshot() -> StaticNATRuleSnapshot {
+    StaticNATRuleSnapshot {
+        counter_id: 0,
+        name: "port-map".to_string(),
+        from_zone: "untrust".to_string(),
+        external_ip: "203.0.113.1/32".to_string(),
+        internal_ip: "10.0.0.5/32".to_string(),
+        match_destination_port: 8080,
+        mapped_port: 80,
+    }
+}
+
+// Forward (inbound DNAT): a packet to the external IP on the matched external
+// port is translated to the internal IP AND the destination port is rewritten
+// to the mapped-port. A packet to the same IP on a DIFFERENT port misses (no
+// port-less fallback entry, so no translation).
+//
+// Fail-on-revert: dropping `rewrite_dst_port: entry.mapped_port` in
+// match_dnat_with_counter turns the rewrite_dst_port assertion RED.
+#[test]
+fn static_nat_mapped_port_dnat_rewrites_dst_port() {
+    let table =
+        StaticNatTable::from_snapshots(&[mapped_port_snapshot()], &crate::nat::NatCounterStore::default());
+    let ext: IpAddr = "203.0.113.1".parse().unwrap();
+    let int: IpAddr = "10.0.0.5".parse().unwrap();
+
+    let (decision, _) = table
+        .match_dnat_with_counter(ext, 8080, "untrust")
+        .expect("matched external port");
+    assert_eq!(decision.rewrite_dst, Some(int), "dst IP must be the internal host");
+    assert_eq!(decision.rewrite_dst_port, Some(80), "dst port must be the mapped-port");
+
+    // A non-matching external port must NOT translate (no whole-address
+    // fallback present).
+    assert!(
+        table.match_dnat_with_counter(ext, 9999, "untrust").is_none(),
+        "non-matching external port must miss"
+    );
+}
+
+// Reverse (outbound return SNAT): the return packet from the internal host's
+// mapped-port has its source IP rewritten back to the external IP AND its
+// source port un-translated back to the external (match) port.
+//
+// Fail-on-revert: dropping `rewrite_src_port` in match_snat_with_counter (or
+// keying snat on the internal IP without the mapped-port) turns the
+// rewrite_src_port assertion RED / the lookup miss.
+#[test]
+fn static_nat_mapped_port_snat_untranslates_src_port() {
+    let table =
+        StaticNatTable::from_snapshots(&[mapped_port_snapshot()], &crate::nat::NatCounterStore::default());
+    let ext: IpAddr = "203.0.113.1".parse().unwrap();
+    let int: IpAddr = "10.0.0.5".parse().unwrap();
+
+    let (decision, _) = table
+        .match_snat_with_counter(int, 80, "trust")
+        .expect("matched internal mapped-port");
+    assert_eq!(decision.rewrite_src, Some(ext), "src IP must be the external IP");
+    assert_eq!(
+        decision.rewrite_src_port,
+        Some(8080),
+        "src port must be un-translated to the external match port"
+    );
+}
+
+// A whole-address rule and a port-mapped rule can coexist on the SAME external
+// IP: the port-mapped entry wins on its exact port; everything else falls back
+// to the whole-address mapping (no port rewrite).
+#[test]
+fn static_nat_port_mapped_and_whole_address_coexist() {
+    let table = StaticNatTable::from_snapshots(
+        &[
+            mapped_port_snapshot(), // 203.0.113.1:8080 -> 10.0.0.5:80
+            StaticNATRuleSnapshot {
+                counter_id: 0,
+                name: "whole".to_string(),
+                from_zone: "untrust".to_string(),
+                external_ip: "203.0.113.1/32".to_string(),
+                internal_ip: "10.0.0.9/32".to_string(),
+                match_destination_port: 0,
+                mapped_port: 0,
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+    let ext: IpAddr = "203.0.113.1".parse().unwrap();
+
+    // Port-mapped entry wins on 8080.
+    let (port_dec, _) = table.match_dnat_with_counter(ext, 8080, "untrust").expect("port match");
+    assert_eq!(port_dec.rewrite_dst, Some("10.0.0.5".parse().unwrap()));
+    assert_eq!(port_dec.rewrite_dst_port, Some(80));
+
+    // Any other port falls back to the whole-address mapping (no port rewrite).
+    let (whole_dec, _) = table.match_dnat_with_counter(ext, 443, "untrust").expect("fallback match");
+    assert_eq!(whole_dec.rewrite_dst, Some("10.0.0.9".parse().unwrap()));
+    assert_eq!(whole_dec.rewrite_dst_port, None);
+}
+
+// Fail-closed: a mapped_port without a match_destination_port (which the Go
+// strict commit-check rejects, but can slip through the lenient load path) is
+// demoted to a whole-address 1:1 — no port rewrite, no orphaned port key.
+#[test]
+fn static_nat_mapped_port_without_match_port_demotes_to_whole_address() {
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "orphan".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.1/32".to_string(),
+            internal_ip: "10.0.0.5/32".to_string(),
+            match_destination_port: 0,
+            mapped_port: 80,
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    let ext: IpAddr = "203.0.113.1".parse().unwrap();
+    // Matches as a whole-address entry on any port, with NO port rewrite.
+    let (decision, _) = table.match_dnat_with_counter(ext, 12345, "untrust").expect("whole-address match");
+    assert_eq!(decision.rewrite_dst, Some("10.0.0.5".parse().unwrap()));
+    assert_eq!(decision.rewrite_dst_port, None, "orphaned mapped-port must not rewrite");
 }
 
 // --- DNAT table tests ---
@@ -4307,12 +4465,14 @@ fn parsed_nat_rules_share_store_counters() {
             from_zone: "untrust".to_string(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
             counter_id: 22,
         }],
         &store,
     );
     let (_d, static_counter) = static_tbl
-        .match_dnat_with_counter("203.0.113.10".parse().unwrap(), "untrust")
+        .match_dnat_with_counter("203.0.113.10".parse().unwrap(), 0, "untrust")
         .expect("static dnat match");
     assert!(
         std::sync::Arc::ptr_eq(

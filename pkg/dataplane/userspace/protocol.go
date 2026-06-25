@@ -415,6 +415,17 @@ type StaticNATRuleSnapshot struct {
 	FromZone   string `json:"from_zone,omitempty"`
 	ExternalIP string `json:"external_ip"`
 	InternalIP string `json:"internal_ip"`
+	// MatchDestinationPort is the external (pre-translation) destination port
+	// the inbound packet must carry for this port-mapped static-NAT rule
+	// (Junos `match destination-port`). 0 = match any port (whole-address
+	// 1:1, the legacy behaviour). #2491.
+	MatchDestinationPort uint16 `json:"match_destination_port,omitempty"`
+	// MappedPort is the internal (post-translation) destination port the 1:1
+	// host receives (Junos `then static-nat prefix <ip> mapped-port <port>`).
+	// 0 = no port translation. When set, the inbound DNAT rewrites the
+	// destination port to this value and the reverse-path SNAT un-translates
+	// it back to MatchDestinationPort. #2491.
+	MappedPort uint16 `json:"mapped_port,omitempty"`
 	// CounterID is the compiler-assigned per-rule translation hit counter ID
 	// (stable key-derived hash, non-zero; 0 means "no counter") for this static
 	// NAT rule (#2218; stable across reorder/removal, #2255).

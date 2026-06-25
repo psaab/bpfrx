@@ -153,9 +153,23 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					"match": {desc: "Match criteria", children: map[string]*schemaNode{
 						"destination-address": {desc: "Destination address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
 						"source-address":      {desc: "Source address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
+						// #2491: external (pre-translation) destination port the
+						// inbound packet must carry for a port-mapped static-NAT
+						// rule (`then static-nat prefix <ip> mapped-port <port>`).
+						// Typed 1..65535 so a garbage or out-of-range port fails
+						// at commit instead of silently dropping the rule.
+						"destination-port": {desc: "Destination port to match", args: 1, valueType: ValueInteger, valueDesc: "TCP/UDP destination port (1-65535)", valueExamples: []string{"443", "8080"}, validator: ValidateInteger(1, 65535), placeholder: "<port>", children: nil},
 					}},
+					// #2491: `static-nat` stays a free-form leaf (children: nil)
+					// so `prefix <ip> [mapped-port <port>]`, `nptv6-prefix
+					// <prefix>`, and `inet` all collapse onto ONE leaf node and
+					// the compiler reads the tokens from Keys. Adding children
+					// here would split the mapped-port modifier off the prefix
+					// value and regress SetPath grouping (schema.go: children==
+					// nil is the replace-vs-container signal). The mapped-port
+					// range is validated in the compiler (compileNATStatic).
 					"then": {desc: "Static NAT action", children: map[string]*schemaNode{
-						"static-nat": {desc: "Static NAT translation (prefix|nptv6-prefix|inet)", children: nil},
+						"static-nat": {desc: "Static NAT translation (prefix [mapped-port <port>]|nptv6-prefix|inet)", children: nil},
 					}},
 				}},
 			}},

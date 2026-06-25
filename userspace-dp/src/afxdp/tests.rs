@@ -943,6 +943,8 @@ fn static_nat_snat_matches_when_zone_is_empty() {
         from_zone: String::new(), // matches any zone
         external_ip: "203.0.113.10".to_string(),
         internal_ip: "192.168.1.10".to_string(),
+        match_destination_port: 0,
+        mapped_port: 0,
     }];
     let state = build_forwarding_state(&snapshot);
 
@@ -969,6 +971,8 @@ fn static_nat_takes_priority_over_interface_snat() {
         from_zone: String::new(),
         external_ip: "203.0.113.10".to_string(),
         internal_ip: "192.168.1.10".to_string(),
+        match_destination_port: 0,
+        mapped_port: 0,
     }];
     snapshot.source_nat_rules = vec![SourceNATRuleSnapshot {
         name: "interface-snat".to_string(),
@@ -1003,6 +1007,8 @@ fn static_nat_v6_dnat_and_snat() {
         from_zone: String::new(),
         external_ip: "2001:db8::10".to_string(),
         internal_ip: "fd00::10".to_string(),
+        match_destination_port: 0,
+        mapped_port: 0,
     }];
     // Add v6 addresses to interfaces
     snapshot.interfaces[0]

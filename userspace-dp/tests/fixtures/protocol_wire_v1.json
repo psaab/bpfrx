@@ -1047,6 +1047,8 @@
     "external_ip": "",
     "from_zone": "",
     "internal_ip": "",
+    "mapped_port": 0,
+    "match_destination_port": 0,
     "name": ""
   },
   "three_color_policer_snapshot": {
