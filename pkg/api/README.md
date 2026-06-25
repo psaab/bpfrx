@@ -72,6 +72,21 @@ under the daemon's errgroup. Nothing else imports this package.
   pair is shaper-side; the `drain_park_root_tokens` / `drain_park_queue_tokens`
   pair counts the per-batch drain-loop decision (see
   `docs/cos-validation-notes.md`).
+- Session-view read paths must NOT publish a partial scan as success
+  (#2469). A backend session-iterator error (e.g. helper restart
+  mid-scan) makes `IterateSessions`/`IterateSessionsV6` return non-nil.
+  The REST session handlers (`/sessions`, `/sessions/summary`,
+  `/sessions/zone-pair`, interface-mode NAT pool stats) return HTTP 500
+  on that error instead of an HTTP 200 with a partial/zero body. The
+  Prometheus session-breakdown collector emits
+  `xpf_sessions_breakdown_scrape_ok` (1 = full scan, 0 = truncated) and
+  OMITS the `xpf_sessions_{ipv4,ipv6,snat,dnat}` gauges when the scan
+  failed, so an alert fires rather than a graph silently dropping to
+  zero. The gRPC `GetSessions` (legacy + cursor) and `GetSessionSummary`
+  return `codes.Internal` on the same error. The contract is pinned by
+  `sessions_iterator_error_test.go` in this package and in `pkg/grpcapi`
+  / `pkg/cli` (CLI top-talkers fails the command; NAT summaries print a
+  stderr warning).
 - The SSE handler reads from `pkg/logging.EventBuffer`. The buffer is
   bounded; if a consumer stops reading, events are dropped silently — by
   design.

@@ -15438,3 +15438,25 @@ top.
   pkg/config/schema_security.go, pkg/ipsec/policy.go,
   pkg/config/parser_security_test.go, pkg/ipsec/ipsec_test.go,
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2469 — session-view surfaces must not publish a partial
+  scan as success on iterator error. REST (`/sessions`,
+  `/sessions/summary`, `/sessions/zone-pair`, interface-mode NAT pool
+  stats) now return HTTP 500 on an `IterateSessions`/`IterateSessionsV6`
+  error instead of HTTP 200 with a partial/zero body. Prometheus session
+  collector emits new `xpf_sessions_breakdown_scrape_ok` gauge (1=full,
+  0=truncated) and OMITS the ipv4/ipv6/snat/dnat breakdown gauges on
+  failure. gRPC `getSessionsLegacy` + `GetSessionSummary` now return
+  `codes.Internal` (matching the already-correct cursor path). CLI
+  top-talkers fails the command; NAT source/dest summaries print a
+  stderr warning via new `warnSessionScan` helper. Added fail-on-revert
+  tests across pkg/api, pkg/grpcapi, pkg/cli (proved RED on revert,
+  restored). Provenance: codex review-034 finding 5.
+  **File(s)**: pkg/api/sessions.go, pkg/api/nat.go,
+  pkg/api/metrics_sessions.go, pkg/api/metrics.go,
+  pkg/api/metrics_descriptors.go, pkg/api/sessions_iterator_error_test.go,
+  pkg/api/README.md, pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/sessions_iterator_error_test.go, pkg/cli/cli_show_flow.go,
+  pkg/cli/cli_show_nat.go, pkg/cli/sessions_iterator_error_test.go,
+  _Log.md

@@ -122,12 +122,18 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, _ *http.Request) {
 			if rule.Then.Interface {
 				used := 0
 				if s.dp != nil && s.dp.IsLoaded() {
-					_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+					// A partial scan under-counts interface-mode NAT
+					// usage; fail rather than report a healthy-but-low
+					// figure (#2469).
+					if err := s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
 						if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
 							used++
 						}
 						return true
-					})
+					}); err != nil {
+						writeError(w, http.StatusInternalServerError, "iterate sessions: "+err.Error())
+						return
+					}
 				}
 				result = append(result, NATPoolStatsInfo{
 					Name:        fmt.Sprintf("%s->%s", rs.FromZone, rs.ToZone),
