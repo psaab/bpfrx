@@ -1,3 +1,22 @@
+## 2026-06-25 — #2596: strip trailing dot before the 253-octet hostname cap
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed an ordering bug in `isPlausibleHostname`
+  (`pkg/config/compiler_ipsec.go`). The `len(s) > 253` presentation-form
+  length cap ran BEFORE the single trailing-dot strip (added by #2455), so
+  a maximal 253-char FQDN written in absolute form (254 bytes including the
+  root `.`) was wrongly rejected. Per RFC 1035 §3.1 the trailing root dot
+  does not count toward the 253-char presentation limit. Moved the strip to
+  precede the cap; the cap now applies to the stripped name. All other
+  validation (empty-label, hyphen, label-length, contains-a-dot) is
+  preserved. Added `TestIsUsableIPsecEndpointMaxLength` — a fail-on-revert
+  boundary table (253-char valid, 253-char+dot valid, 254-char invalid,
+  254-char+dot invalid, empty, bare-dot). Verified RED on revert (the
+  253-char+trailing-dot case returns false instead of true), GREEN after
+  restore.
+- **File(s)**: pkg/config/compiler_ipsec.go,
+  pkg/config/compiler_ipsec_gateway_ref_test.go, _Log.md
+
 ## 2026-06-25 — #2733: clear the NAT'd reverse companion at val.ReverseKey
 
 - **Timestamp**: 2026-06-25
