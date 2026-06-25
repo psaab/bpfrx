@@ -687,6 +687,13 @@ type SessionCloseData struct {
 	NATDstIP   net.IP
 	NATSrcPort uint16
 	NATDstPort uint16
+	// #2749: ingress ifindex (SNMP ifIndex) carried on the SESSION_CLOSE
+	// wire frame ([128:132], stamped by the dataplane in #2615). The
+	// exporter writes it into the re-introduced NetFlow IE 10 / IPFIX
+	// ingressInterface field. 0 means the dataplane could not attribute an
+	// ingress interface (the collector then sees ifIndex 0, the
+	// conventional "unknown interface" value).
+	InIf uint32
 }
 
 // flowStartTime resolves the flow record StartTime for a session-close event.
