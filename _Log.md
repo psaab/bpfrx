@@ -18178,3 +18178,22 @@ top.
   RED; restore returns green.
 - **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
   pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: networkd batch #2987/#2988 caller-reach fix (hostile-review
+  MERGE-NEEDS-MINOR). The library fixes did not reach production: the only
+  caller (pkg/daemon/daemon_apply.go step 2.5) guarded networkd.Apply with
+  len(ManagedInterfaces)>0 (shadowed the #2988 empty-set sweep) and
+  swallowed Apply's returned error with only slog.Warn (the #2987
+  fail-closed never fired). Relaxed the guard to run Apply whenever
+  applyResult!=nil (empty set still sweeps stale 10-xpf-* — lifeline
+  preserved via resolveProtectedInterfaces from ActiveConfig). Captured the
+  Apply error into networkdErr and returned errors.Join(networkdErr,
+  dhcpServerErr) at the tail so a write failure fails the commit WITHOUT
+  skipping downstream reconcile (RETH MAC/VRRP/FRR/RA/IPsec) — mirrors the
+  dhcpServerErr deferred-error precedent. Added 3 daemon tests
+  (empty-set-sweeps, empty-set-preserves-lifeline, write-error-fails-commit),
+  each fail-on-revert RED without the caller fix. build/gofmt/vet/test green
+  for pkg/networkd + pkg/daemon.
+- **File(s)**: pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_networkd_apply_test.go, pkg/networkd/README.md, _Log.md
