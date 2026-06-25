@@ -378,6 +378,54 @@ impl CachedThreeColorPolicers {
     }
 }
 
+/// #2573: the set of `then count` term counters a cached TX-selection decision
+/// must increment on every flow-cache replay. With #2544 fall-through, a single
+/// packet can match multiple `then count` terms; the old single-`Arc` slot kept
+/// only the LAST, so the earlier fall-through count terms were silently
+/// under-counted on the cached path (the uncached full-eval path counted each).
+///
+/// Backed by a `SmallVec` with an inline capacity of 2 so the common single- and
+/// dual-counter flows record with NO heap allocation. The descriptor is built
+/// ONCE at flow-cache install and then only read (`for_each`) on the per-packet
+/// replay, so any spill to the heap for >2 counters happens off the packet hot
+/// path. Dedup is by `Arc::ptr_eq` (FilterTermCounter has no id) so the same
+/// counter referenced by two matched terms is recorded once per packet.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CachedFilterCounters {
+    counters: smallvec::SmallVec<[Arc<FilterTermCounter>; 2]>,
+}
+
+impl CachedFilterCounters {
+    #[inline]
+    pub(crate) fn push(&mut self, counter: Arc<FilterTermCounter>) {
+        if self
+            .counters
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &counter))
+        {
+            return;
+        }
+        self.counters.push(counter);
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.counters.is_empty()
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.counters.len()
+    }
+
+    #[inline]
+    pub(crate) fn for_each(&self, mut f: impl FnMut(&Arc<FilterTermCounter>)) {
+        for counter in &self.counters {
+            f(counter);
+        }
+    }
+}
+
 impl ThreeColorPolicerRuntime {
     pub(crate) fn new(id: u32, name: String, state: ThreeColorPolicerState) -> Self {
         Self {
@@ -688,7 +736,8 @@ pub(crate) struct CachedTxSelectionFilterResult {
     pub(crate) action: FilterAction,
     pub(crate) forwarding_class: Option<Arc<str>>,
     pub(crate) dscp_rewrite: Option<u8>,
-    pub(crate) counter: Option<Arc<FilterTermCounter>>,
+    // #2573: record ALL matched `then count` term counters, not just the last.
+    pub(crate) counters: CachedFilterCounters,
     pub(crate) three_color_policers: CachedThreeColorPolicers,
     pub(crate) log_match: Option<FilterLogMatch>,
 }
@@ -731,7 +780,7 @@ impl Default for CachedTxSelectionFilterResult {
             action: FilterAction::Accept,
             forwarding_class: None,
             dscp_rewrite: None,
-            counter: None,
+            counters: CachedFilterCounters::default(),
             three_color_policers: CachedThreeColorPolicers::default(),
             log_match: None,
         }

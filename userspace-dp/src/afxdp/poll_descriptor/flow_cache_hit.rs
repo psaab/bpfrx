@@ -117,9 +117,14 @@ pub(super) fn stage_flow_cache_hit(
         let cached_decision = cached.decision;
         let cached_descriptor = &cached.descriptor;
         let cached_metadata = &cached.metadata;
-        if let Some(counter) = cached_descriptor.tx_selection.filter_counter.as_ref() {
-            crate::filter::record_filter_counter(counter, meta.pkt_len as u64);
-        }
+        // #2573: replay ALL matched `then count` term counters, not just the
+        // last. A #2544 fall-through flow can match multiple count terms.
+        cached_descriptor
+            .tx_selection
+            .filter_counters
+            .for_each(|counter| {
+                crate::filter::record_filter_counter(counter, meta.pkt_len as u64);
+            });
         let policer_action = crate::filter::apply_cached_three_color_policers(
             &cached_descriptor.tx_selection.three_color_policers,
             now_ns,
