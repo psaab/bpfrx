@@ -495,6 +495,7 @@ func (c *CLI) showDHCPDynamicDNS(detail bool) error {
 	fmt.Printf("    Reconciles: ok=%d fail=%d\n", st.ReconcileOK, st.ReconcileFail)
 	fmt.Printf("    Skipped:    no-name=%d no-backend=%d conflict=%d ptr-notauth=%d\n",
 		st.SkippedNoName, st.SkippedNoBackend, st.SkippedConflict, st.SkippedPTRNotAuth)
+	fmt.Printf("    PTR deferred: %d (forward published, reverse PTR retry pending)\n", st.PTRDeferred)
 	fmt.Printf("    Owned records: %d\n", st.OwnedRecords)
 	if !st.LastReconcile.IsZero() {
 		fmt.Printf("    Last reconcile: %s (%d leases)\n",

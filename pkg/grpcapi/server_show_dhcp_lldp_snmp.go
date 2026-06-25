@@ -243,6 +243,7 @@ func (s *Server) showDHCPDynamicDNS(cfg *config.Config, buf *strings.Builder, de
 	fmt.Fprintf(buf, "    Reconciles: ok=%d fail=%d\n", st.ReconcileOK, st.ReconcileFail)
 	fmt.Fprintf(buf, "    Skipped:    no-name=%d no-backend=%d conflict=%d ptr-notauth=%d\n",
 		st.SkippedNoName, st.SkippedNoBackend, st.SkippedConflict, st.SkippedPTRNotAuth)
+	fmt.Fprintf(buf, "    PTR deferred: %d (forward published, reverse PTR retry pending)\n", st.PTRDeferred)
 	fmt.Fprintf(buf, "    Owned records: %d\n", st.OwnedRecords)
 	if !st.LastReconcile.IsZero() {
 		fmt.Fprintf(buf, "    Last reconcile: %s (%d leases)\n",
