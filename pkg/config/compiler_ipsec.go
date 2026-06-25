@@ -157,7 +157,10 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 					}
 				}
 			case "dynamic":
-				// "dynamic hostname FQDN" or children
+				// "dynamic hostname FQDN" or children. A `dynamic` block
+				// with no hostname marks a responder-only / dynamic-IP peer
+				// (remote_addrs = %any) — see the IPsec-stanza copy below
+				// and resolveRemoteAddr (#2404).
 				if len(p.Keys) >= 3 && p.Keys[1] == "hostname" {
 					gw.DynamicHostname = p.Keys[2]
 				} else {
@@ -166,6 +169,9 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 							gw.DynamicHostname = c.Keys[1]
 						}
 					}
+				}
+				if gw.DynamicHostname == "" {
+					gw.ResponderOnly = true
 				}
 			}
 		}
@@ -333,6 +339,10 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 					}
 				}
 			case "dynamic":
+				// A `dynamic` block with no hostname marks a responder-only
+				// / dynamic-IP peer: the peer initiates from an unknown
+				// address, so the gateway carries no remote_addrs target and
+				// renders remote_addrs = %any (#2404).
 				if len(p.Keys) >= 3 && p.Keys[1] == "hostname" {
 					gw.DynamicHostname = p.Keys[2]
 				} else {
@@ -341,6 +351,9 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 							gw.DynamicHostname = nodeVal(c)
 						}
 					}
+				}
+				if gw.DynamicHostname == "" {
+					gw.ResponderOnly = true
 				}
 			}
 		}
@@ -443,12 +456,14 @@ func validateIPsecGatewayReferencesStrict(cfg *Config) error {
 			continue
 		}
 		if gw, ok := ipsec.Gateways[vpn.Gateway]; ok {
-			if gw.Address == "" && gw.DynamicHostname == "" {
+			if gw.Address == "" && gw.DynamicHostname == "" && !gw.ResponderOnly {
 				return fmt.Errorf("security ipsec vpn %s: ike gateway %q "+
 					"has no address or dynamic hostname; the tunnel would "+
 					"never establish", name, vpn.Gateway)
 			}
-			continue // resolves to a defined, addressed gateway
+			// A responder-only gateway (dynamic block, no address/hostname)
+			// legitimately omits remote_addrs and renders %any (#2404).
+			continue // resolves to a defined, addressed (or responder-only) gateway
 		}
 		if IsUsableIPsecEndpoint(vpn.Gateway) {
 			continue // legacy inline literal IP / dotted hostname
