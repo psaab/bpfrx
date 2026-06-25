@@ -25,38 +25,39 @@ func buildSessionOpenV4Payload(
 	srcIP, dstIP [4]byte,
 	natSrcIP, natDstIP [4]byte,
 	natSrcPort, natDstPort uint16,
-	ownerRG int16,
-	egressIfindex, txIfindex int16,
+	ownerRG int32,
+	egressIfindex, txIfindex int32,
 	tunnelEndpoint, txVLAN uint16,
 	flags uint8,
 	ingressZone, egressZone, disposition uint8,
 	neighborMAC, srcMAC [6]byte,
 	nextHop [4]byte,
 ) []byte {
-	// 24 fixed + 4*4 IPs + 6+6 MACs + 4 NextHop = 56 bytes
-	buf := make([]byte, 56)
+	// #2467: 30 fixed + 4*4 IPs + 6+6 MACs + 4 NextHop = 62 bytes
+	// (the three identity fields at [10:22] are int32, not int16).
+	buf := make([]byte, 62)
 	buf[0] = 4 // AddrFamily
 	buf[1] = proto
 	binary.LittleEndian.PutUint16(buf[2:4], srcPort)
 	binary.LittleEndian.PutUint16(buf[4:6], dstPort)
 	binary.LittleEndian.PutUint16(buf[6:8], natSrcPort)
 	binary.LittleEndian.PutUint16(buf[8:10], natDstPort)
-	binary.LittleEndian.PutUint16(buf[10:12], uint16(ownerRG))
-	binary.LittleEndian.PutUint16(buf[12:14], uint16(egressIfindex))
-	binary.LittleEndian.PutUint16(buf[14:16], uint16(txIfindex))
-	binary.LittleEndian.PutUint16(buf[16:18], tunnelEndpoint)
-	binary.LittleEndian.PutUint16(buf[18:20], txVLAN)
-	buf[20] = flags
-	buf[21] = ingressZone
-	buf[22] = egressZone
-	buf[23] = disposition
-	copy(buf[24:28], srcIP[:])
-	copy(buf[28:32], dstIP[:])
-	copy(buf[32:36], natSrcIP[:])
-	copy(buf[36:40], natDstIP[:])
-	copy(buf[40:46], neighborMAC[:])
-	copy(buf[46:52], srcMAC[:])
-	copy(buf[52:56], nextHop[:])
+	binary.LittleEndian.PutUint32(buf[10:14], uint32(ownerRG))
+	binary.LittleEndian.PutUint32(buf[14:18], uint32(egressIfindex))
+	binary.LittleEndian.PutUint32(buf[18:22], uint32(txIfindex))
+	binary.LittleEndian.PutUint16(buf[22:24], tunnelEndpoint)
+	binary.LittleEndian.PutUint16(buf[24:26], txVLAN)
+	buf[26] = flags
+	buf[27] = ingressZone
+	buf[28] = egressZone
+	buf[29] = disposition
+	copy(buf[30:34], srcIP[:])
+	copy(buf[34:38], dstIP[:])
+	copy(buf[38:42], natSrcIP[:])
+	copy(buf[42:46], natDstIP[:])
+	copy(buf[46:52], neighborMAC[:])
+	copy(buf[52:58], srcMAC[:])
+	copy(buf[58:62], nextHop[:])
 	return buf
 }
 
@@ -66,22 +67,22 @@ func buildSessionCloseV4Payload(
 	proto uint8,
 	srcPort, dstPort uint16,
 	srcIP, dstIP [4]byte,
-	ownerRG int16,
+	ownerRG int32,
 	flags uint8,
 	ingressZoneID, egressZoneID uint8,
 ) []byte {
-	// 6 + 4+4 + 2 + 1 + 2 = 19 bytes
-	buf := make([]byte, 19)
+	// #2467: 6 + 4+4 + 4 (OwnerRGID int32) + 1 + 2 = 21 bytes
+	buf := make([]byte, 21)
 	buf[0] = 4 // AddrFamily
 	buf[1] = proto
 	binary.LittleEndian.PutUint16(buf[2:4], srcPort)
 	binary.LittleEndian.PutUint16(buf[4:6], dstPort)
 	copy(buf[6:10], srcIP[:])
 	copy(buf[10:14], dstIP[:])
-	binary.LittleEndian.PutUint16(buf[14:16], uint16(ownerRG))
-	buf[16] = flags
-	buf[17] = ingressZoneID
-	buf[18] = egressZoneID
+	binary.LittleEndian.PutUint32(buf[14:18], uint32(ownerRG))
+	buf[18] = flags
+	buf[19] = ingressZoneID
+	buf[20] = egressZoneID
 	return buf
 }
 
@@ -326,14 +327,93 @@ func TestDecodeSessionCloseEventV4(t *testing.T) {
 	}
 }
 
+// TestDecodeSessionEventHighIfindex is the #2467 fail-on-revert guard. Linux
+// ifindexes are a full `int` and exceed 32767 on long-running systems with
+// interface churn. The wire fields used to be int16, so an ifindex of 70000
+// truncated and decoded as a negative number. The builder writes the value via
+// the now-int32 PutUint32 path; with a revert to int16 these high values would
+// wrap negative and the assertions below fail RED.
+func TestDecodeSessionEventHighIfindex(t *testing.T) {
+	const (
+		hiOwnerRG = int32(40000) // > int16 max (32767)
+		hiEgress  = int32(70000) // > uint16 max (65535)
+		hiTX      = int32(65536) // exactly uint16 max + 1 (would be 0 as int16)
+	)
+	payload := buildSessionOpenV4Payload(
+		6,
+		12345, 443,
+		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
+		[4]byte{}, [4]byte{},
+		0, 0,
+		hiOwnerRG,
+		hiEgress, hiTX,
+		0, 80,
+		0,
+		1, 2, 0,
+		[6]byte{}, [6]byte{}, [4]byte{},
+	)
+
+	d, ok := decodeSessionEvent(payload)
+	if !ok {
+		t.Fatal("decodeSessionEvent returned false")
+	}
+	if d.OwnerRGID != int(hiOwnerRG) {
+		t.Fatalf("OwnerRGID = %d, want %d (must not wrap negative)", d.OwnerRGID, hiOwnerRG)
+	}
+	if d.EgressIfindex != int(hiEgress) {
+		t.Fatalf("EgressIfindex = %d, want %d (must not wrap negative)", d.EgressIfindex, hiEgress)
+	}
+	if d.TXIfindex != int(hiTX) {
+		t.Fatalf("TXIfindex = %d, want %d (must not wrap)", d.TXIfindex, hiTX)
+	}
+	// Downstream fields must still decode correctly after the +6-byte shift.
+	if d.TXVLANID != 80 {
+		t.Fatalf("TXVLANID = %d, want 80", d.TXVLANID)
+	}
+	if d.IngressZoneID != 1 || d.EgressZoneID != 2 {
+		t.Fatalf("ZoneIDs = (%d,%d), want (1,2)", d.IngressZoneID, d.EgressZoneID)
+	}
+}
+
+// TestDecodeSessionCloseEventHighOwnerRG is the #2467 close-side fail-on-revert
+// guard: the close frame's owner RG must survive past int16 too.
+func TestDecodeSessionCloseEventHighOwnerRG(t *testing.T) {
+	const hiOwnerRG = int32(40000) // > int16 max
+	payload := buildSessionCloseV4Payload(
+		6,
+		12345, 443,
+		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
+		hiOwnerRG,
+		SessionEventFlagFabricRedirect,
+		3, 4,
+	)
+
+	d, ok := decodeSessionCloseEvent(payload)
+	if !ok {
+		t.Fatal("decodeSessionCloseEvent returned false")
+	}
+	if d.OwnerRGID != int(hiOwnerRG) {
+		t.Fatalf("OwnerRGID = %d, want %d (must not wrap negative)", d.OwnerRGID, hiOwnerRG)
+	}
+	if d.IngressZoneID != 3 || d.EgressZoneID != 4 {
+		t.Fatalf("ZoneIDs = (%d,%d), want (3,4)", d.IngressZoneID, d.EgressZoneID)
+	}
+	if !d.FabricRedirect {
+		t.Fatal("FabricRedirect should be true")
+	}
+}
+
 func TestDecodeSessionEventRejectsTruncated(t *testing.T) {
-	// Too short for v4 (need 56 bytes minimum).
+	// Too short for v4 (#2467: need 62 bytes minimum, 30-byte fixed header).
 	_, ok := decodeSessionEvent([]byte{4, 6, 0, 0})
 	if ok {
 		t.Fatal("should reject truncated v4 payload")
 	}
-	// Invalid address family.
-	_, ok = decodeSessionEvent([]byte{99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+	// Invalid address family (long enough to pass the length gate so the AF
+	// switch is what rejects it).
+	badAF := make([]byte, 64)
+	badAF[0] = 99
+	_, ok = decodeSessionEvent(badAF)
 	if ok {
 		t.Fatal("should reject unknown address family")
 	}

@@ -755,7 +755,7 @@ func (es *EventStream) writeFrame(typ uint8, seq uint64, payload []byte) error {
 // decodeSessionEvent decodes a SessionOpen or SessionUpdate binary payload
 // into a SessionDeltaInfo.
 //
-// Wire layout (v4, 56 bytes):
+// Wire layout (v4, 62 bytes):
 //
 //	[0]     AddrFamily (4=v4, 6=v6)
 //	[1]     Protocol
@@ -763,19 +763,25 @@ func (es *EventStream) writeFrame(typ uint8, seq uint64, payload []byte) error {
 //	[4:6]   DstPort (uint16 LE)
 //	[6:8]   NATSrcPort (uint16 LE)
 //	[8:10]  NATDstPort (uint16 LE)
-//	[10:12] OwnerRGID (int16 LE)
-//	[12:14] EgressIfindex (int16 LE)
-//	[14:16] TXIfindex (int16 LE)
-//	[16:18] TunnelEndpointID (uint16 LE)
-//	[18:20] TXVLANID (uint16 LE)
-//	[20]    Flags
-//	[21]    IngressZoneID
-//	[22]    EgressZoneID
-//	[23]    Disposition
-//	[24..]  IPs (4 bytes each for v4, 16 each for v6): src, dst, nat_src, nat_dst
+//	[10:14] OwnerRGID (int32 LE)      — #2467: widened from int16
+//	[14:18] EgressIfindex (int32 LE)  — #2467: widened from int16
+//	[18:22] TXIfindex (int32 LE)      — #2467: widened from int16
+//	[22:24] TunnelEndpointID (uint16 LE)
+//	[24:26] TXVLANID (uint16 LE)
+//	[26]    Flags
+//	[27]    IngressZoneID
+//	[28]    EgressZoneID
+//	[29]    Disposition
+//	[30..]  IPs (4 bytes each for v4, 16 each for v6): src, dst, nat_src, nat_dst
 //	[N..]   NeighborMAC (6 bytes)
 //	[N+6..] SrcMAC (6 bytes)
 //	[N+12..]NextHop (4 or 16 bytes)
+//
+// #2467: the three identity fields at [10:22] were widened from signed
+// 16-bit to signed 32-bit. Linux ifindexes are a full `int`; with the old
+// i16 encoding an ifindex above 32767 wrapped negative. This is a breaking
+// wire-format change — the Rust encoder (event_stream/codec.rs) and this
+// decoder must be deployed together (they always are: one binary set).
 //
 // wireAFToDataplane maps the 1-byte wire encoding (4 = IPv4, 6 = IPv6
 // — chosen by the Rust codec to match the protocol number; see
@@ -793,7 +799,9 @@ func wireAFToDataplane(wire uint8) uint8 {
 }
 
 func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
-	if len(payload) < 24 {
+	// #2467: fixed header is 30 bytes (was 24) after widening the three
+	// identity fields at [10:22] from int16 to int32.
+	if len(payload) < 30 {
 		return SessionDeltaInfo{}, false
 	}
 
@@ -808,13 +816,13 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 		return SessionDeltaInfo{}, false
 	}
 
-	// Fixed header (24 bytes) + 4*addrSize + 6+6 + addrSize = 24 + 5*addrSize + 12
-	minLen := 24 + 5*addrSize + 12
+	// Fixed header (30 bytes) + 4*addrSize + 6+6 + addrSize = 30 + 5*addrSize + 12
+	minLen := 30 + 5*addrSize + 12
 	if len(payload) < minLen {
 		return SessionDeltaInfo{}, false
 	}
 
-	flags := payload[20]
+	flags := payload[26]
 
 	// #919/#922: normalise the wire AF (4/6) to the dataplane AF
 	// constants (2/10) consumed by daemon_ha_userspace.go's switch.
@@ -824,34 +832,35 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 	}
 
 	d := SessionDeltaInfo{
-		AddrFamily:       dpAF,
-		Protocol:         payload[1],
-		SrcPort:          binary.LittleEndian.Uint16(payload[2:4]),
-		DstPort:          binary.LittleEndian.Uint16(payload[4:6]),
-		NATSrcPort:       binary.LittleEndian.Uint16(payload[6:8]),
-		NATDstPort:       binary.LittleEndian.Uint16(payload[8:10]),
-		OwnerRGID:        int(int16(binary.LittleEndian.Uint16(payload[10:12]))),
-		EgressIfindex:    int(int16(binary.LittleEndian.Uint16(payload[12:14]))),
-		TXIfindex:        int(int16(binary.LittleEndian.Uint16(payload[14:16]))),
-		TunnelEndpointID: binary.LittleEndian.Uint16(payload[16:18]),
-		TXVLANID:         binary.LittleEndian.Uint16(payload[18:20]),
-		// #919/#922: bytes [21]/[22] are u8 ingress/egress zone IDs
-		// written by the Rust codec at event_stream/codec.rs:144-156.
-		// Promote to uint16 for symmetry with SessionSyncRequest.
-		IngressZoneID:  uint16(payload[21]),
-		EgressZoneID:   uint16(payload[22]),
+		AddrFamily: dpAF,
+		Protocol:   payload[1],
+		SrcPort:    binary.LittleEndian.Uint16(payload[2:4]),
+		DstPort:    binary.LittleEndian.Uint16(payload[4:6]),
+		NATSrcPort: binary.LittleEndian.Uint16(payload[6:8]),
+		NATDstPort: binary.LittleEndian.Uint16(payload[8:10]),
+		// #2467: int32 LE (was int16) — ifindexes are a full Linux int.
+		OwnerRGID:        int(int32(binary.LittleEndian.Uint32(payload[10:14]))),
+		EgressIfindex:    int(int32(binary.LittleEndian.Uint32(payload[14:18]))),
+		TXIfindex:        int(int32(binary.LittleEndian.Uint32(payload[18:22]))),
+		TunnelEndpointID: binary.LittleEndian.Uint16(payload[22:24]),
+		TXVLANID:         binary.LittleEndian.Uint16(payload[24:26]),
+		// #919/#922: bytes [27]/[28] are u8 ingress/egress zone IDs
+		// written by the Rust codec. Promote to uint16 for symmetry with
+		// SessionSyncRequest. (#2467: offsets shifted +6 by the int32 widen.)
+		IngressZoneID:  uint16(payload[27]),
+		EgressZoneID:   uint16(payload[28]),
 		FabricRedirect: flags&SessionEventFlagFabricRedirect != 0,
 		FabricIngress:  flags&SessionEventFlagFabricIngress != 0,
 	}
 
 	// Disposition mapping: 0=Accept, 1=LocalDelivery
-	switch payload[23] {
+	switch payload[29] {
 	case 1:
 		d.Disposition = "local_delivery"
 	}
 
-	// IP addresses start at offset 24.
-	off := 24
+	// IP addresses start at offset 30 (#2467: was 24).
+	off := 30
 	d.SrcIP = formatIP(payload[off:off+addrSize], af)
 	off += addrSize
 	d.DstIP = formatIP(payload[off:off+addrSize], af)
@@ -883,8 +892,10 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 //	[4:6]   DstPort
 //	[6..]   SrcIP (4 or 16 bytes)
 //	[N..]   DstIP (4 or 16 bytes)
-//	[M:M+2] OwnerRGID (int16 LE)
-//	[M+2]   Flags
+//	[M:M+4] OwnerRGID (int32 LE)  — #2467: widened from int16
+//	[M+4]   Flags
+//	[M+5]   IngressZoneID (#919/#922)
+//	[M+6]   EgressZoneID (#919/#922)
 func decodeSessionCloseEvent(payload []byte) (SessionDeltaInfo, bool) {
 	if len(payload) < 6 {
 		return SessionDeltaInfo{}, false
@@ -901,10 +912,10 @@ func decodeSessionCloseEvent(payload []byte) (SessionDeltaInfo, bool) {
 		return SessionDeltaInfo{}, false
 	}
 
-	// Legacy minimum: 6 (fixed) + 2*addrSize + 2 (OwnerRGID) + 1 (Flags).
-	// New helpers append +2 (ZoneIDs); accept both for rolling upgrade.
-	legacyMin := 6 + 2*addrSize + 3
-	if len(payload) < legacyMin {
+	// Minimum: 6 (fixed) + 2*addrSize + 4 (OwnerRGID int32, #2467) + 1 (Flags).
+	// Helpers append +2 (ZoneIDs) after that; accept both lengths.
+	minLen := 6 + 2*addrSize + 5
+	if len(payload) < minLen {
 		return SessionDeltaInfo{}, false
 	}
 
@@ -925,8 +936,9 @@ func decodeSessionCloseEvent(payload []byte) (SessionDeltaInfo, bool) {
 	off += addrSize
 	d.DstIP = formatIP(payload[off:off+addrSize], af)
 	off += addrSize
-	d.OwnerRGID = int(int16(binary.LittleEndian.Uint16(payload[off : off+2])))
-	off += 2
+	// #2467: int32 LE (was int16).
+	d.OwnerRGID = int(int32(binary.LittleEndian.Uint32(payload[off : off+4])))
+	off += 4
 	flags := payload[off]
 	off++
 	d.FabricRedirect = flags&SessionEventFlagFabricRedirect != 0

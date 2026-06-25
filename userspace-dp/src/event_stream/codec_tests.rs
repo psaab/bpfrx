@@ -546,13 +546,14 @@ fn test_encode_session_open_v4() {
     assert_eq!(u16::from_le_bytes([p[4], p[5]]), 80); // DstPort
     assert_eq!(u16::from_le_bytes([p[6], p[7]]), 40000); // NATSrcPort
     assert_eq!(u16::from_le_bytes([p[8], p[9]]), 0); // NATDstPort
-    assert_eq!(i16::from_le_bytes([p[10], p[11]]), 0); // OwnerRGID
-    assert_eq!(i16::from_le_bytes([p[12], p[13]]), 3); // EgressIfindex
-    assert_eq!(i16::from_le_bytes([p[14], p[15]]), 3); // TXIfindex
-    assert_eq!(p[20], 0); // Flags (no fabric redirect, no fabric ingress)
-    assert_eq!(p[21], TEST_TRUST_ZONE_ID as u8); // IngressZoneID
-    assert_eq!(p[22], TEST_UNTRUST_ZONE_ID as u8); // EgressZoneID
-    assert_eq!(p[23], DISP_FORWARD_CANDIDATE); // Disposition
+    // #2467: OwnerRGID/EgressIfindex/TXIfindex are i32 LE at [10:14]/[14:18]/[18:22].
+    assert_eq!(i32::from_le_bytes([p[10], p[11], p[12], p[13]]), 0); // OwnerRGID
+    assert_eq!(i32::from_le_bytes([p[14], p[15], p[16], p[17]]), 3); // EgressIfindex
+    assert_eq!(i32::from_le_bytes([p[18], p[19], p[20], p[21]]), 3); // TXIfindex
+    assert_eq!(p[26], 0); // Flags (no fabric redirect, no fabric ingress)
+    assert_eq!(p[27], TEST_TRUST_ZONE_ID as u8); // IngressZoneID
+    assert_eq!(p[28], TEST_UNTRUST_ZONE_ID as u8); // EgressZoneID
+    assert_eq!(p[29], DISP_FORWARD_CANDIDATE); // Disposition
 }
 
 #[test]
@@ -597,13 +598,63 @@ fn test_encode_session_close_v4() {
     assert_eq!(u16::from_le_bytes([p[2], p[3]]), 12345); // SrcPort
     assert_eq!(u16::from_le_bytes([p[4], p[5]]), 80); // DstPort
     // p[6..10] SrcIP, p[10..14] DstIP
-    // p[14..16] OwnerRGID
-    assert_eq!(i16::from_le_bytes([p[14], p[15]]), 1);
-    // p[16] Flags
-    assert_eq!(p[16], FLAG_FABRIC_REDIRECT);
-    // #919/#922: p[17] IngressZoneID, p[18] EgressZoneID
-    assert_eq!(p[17], TEST_TRUST_ZONE_ID as u8);
-    assert_eq!(p[18], TEST_UNTRUST_ZONE_ID as u8);
+    // #2467: p[14..18] OwnerRGID (i32 LE, was i16 at [14..16]).
+    assert_eq!(i32::from_le_bytes([p[14], p[15], p[16], p[17]]), 1);
+    // p[18] Flags
+    assert_eq!(p[18], FLAG_FABRIC_REDIRECT);
+    // #919/#922: p[19] IngressZoneID, p[20] EgressZoneID
+    assert_eq!(p[19], TEST_TRUST_ZONE_ID as u8);
+    assert_eq!(p[20], TEST_UNTRUST_ZONE_ID as u8);
+}
+
+// #2467: high (>32767) ifindexes must survive the wire encode. With the old
+// i16 encoding, an ifindex of 70000 truncated to (70000 & 0xFFFF) = 4464 and,
+// once reinterpreted as i16 on decode, sign-extended to a negative value. This
+// test pins the i32 encode of the session-open identity fields so a revert to
+// i16 (which would write only 2 bytes) fails RED. The full cross-language
+// round-trip (Rust encode -> Go decode -> value preserved) is exercised by the
+// Go TestDecodeSessionEvent*HighIfindex tests in pkg/dataplane/userspace.
+#[test]
+fn test_encode_session_open_high_ifindex_v4() {
+    let zones = test_zone_map();
+    let mut decision = test_decision();
+    decision.resolution.egress_ifindex = 70000; // > i16::MAX
+    decision.resolution.tx_ifindex = 65536; // > u16::MAX (would be 0 as i16)
+    let mut metadata = test_metadata();
+    metadata.owner_rg_id = 40000; // > i16::MAX
+
+    let frame =
+        EventFrame::encode_session_open(1, &test_key_v4(), &decision, &metadata, &zones, false);
+    let p = &frame.data[FRAME_HEADER_SIZE..];
+
+    // i32 LE reads recover the exact values; an i16 encode could not.
+    assert_eq!(i32::from_le_bytes([p[10], p[11], p[12], p[13]]), 40000); // OwnerRGID
+    assert_eq!(i32::from_le_bytes([p[14], p[15], p[16], p[17]]), 70000); // EgressIfindex
+    assert_eq!(i32::from_le_bytes([p[18], p[19], p[20], p[21]]), 65536); // TXIfindex
+    // Downstream fields must still land at their shifted offsets.
+    assert_eq!(p[27], TEST_TRUST_ZONE_ID as u8); // IngressZoneID
+    assert_eq!(p[28], TEST_UNTRUST_ZONE_ID as u8); // EgressZoneID
+    assert_eq!(p[29], DISP_FORWARD_CANDIDATE); // Disposition
+}
+
+// #2467: session-close owner RG must also survive the i32 widen. The encoder
+// accepts owner_rg_id as i32; this pins the 4-byte LE wire encoding.
+#[test]
+fn test_encode_session_close_high_owner_rg_v4() {
+    let frame = EventFrame::encode_session_close(
+        2,
+        &test_key_v4(),
+        40000, // owner_rg_id > i16::MAX
+        FLAG_FABRIC_REDIRECT,
+        TEST_TRUST_ZONE_ID,
+        TEST_UNTRUST_ZONE_ID,
+    );
+    let p = &frame.data[FRAME_HEADER_SIZE..];
+    // p[6..10] SrcIP, p[10..14] DstIP, p[14..18] OwnerRGID i32 LE.
+    assert_eq!(i32::from_le_bytes([p[14], p[15], p[16], p[17]]), 40000);
+    assert_eq!(p[18], FLAG_FABRIC_REDIRECT); // Flags
+    assert_eq!(p[19], TEST_TRUST_ZONE_ID as u8); // IngressZoneID
+    assert_eq!(p[20], TEST_UNTRUST_ZONE_ID as u8); // EgressZoneID
 }
 
 #[test]
