@@ -102,7 +102,7 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
             queue_id: iface.map(|iface| iface.default_queue),
             dscp_rewrite: None,
             drop: false,
-            filter_counter: None,
+            filter_counters: crate::filter::CachedFilterCounters::default(),
             three_color_policers: crate::filter::CachedThreeColorPolicers::default(),
             filter_log: None,
         };
@@ -165,7 +165,7 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
 
     let mut effective_dscp_rewrite = output_result.dscp_rewrite;
     let mut forwarding_class = output_result.forwarding_class.clone();
-    let mut filter_counter = output_result.counter.clone();
+    let mut filter_counters = output_result.counters;
     let mut three_color_policers = output_result.three_color_policers;
     let filter_log = output_result.log_match;
 
@@ -205,7 +205,7 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
             effective_dscp_rewrite = effective_dscp_rewrite.or(ingress_result.dscp_rewrite);
             if output_filter.is_none() {
                 forwarding_class = ingress_result.forwarding_class;
-                filter_counter = ingress_result.counter;
+                filter_counters = ingress_result.counters;
             }
             three_color_policers.extend(ingress_result.three_color_policers);
         }
@@ -228,7 +228,7 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
         queue_id,
         dscp_rewrite: effective_dscp_rewrite,
         drop: output_result.action != crate::filter::FilterAction::Accept,
-        filter_counter,
+        filter_counters,
         three_color_policers,
         filter_log,
     }

@@ -1,3 +1,31 @@
+## 2026-06-25 — #2515: reconcile no_snapshot teardown now refreshes bindings
+
+- **Timestamp**: 2026-06-25
+- **Action**: The `Coordinator::reconcile` `no_snapshot` (config-cleared /
+  shutdown) early-return ran the teardown + counter-reset phases but
+  returned BEFORE `refresh_bindings`. Teardown stopped every worker
+  (`stop_inner` empties `workers.live` + clears CoS owner maps), but
+  `reset_binding_counters` only zeroes counter scalars +
+  `bound`/`xsk_registered`/`socket_fd` — it leaves `xsk_bind_mode`,
+  `socket_ifindex`/`queue_id`/`bind_flags`, `zero_copy`, and the
+  `flow_cache_capacity`/`active_flow_count` gauges at pre-teardown
+  values. So status commands kept reporting torn-down slots as if bound,
+  and the CoS owner->worker map kept stale entries (operator-visible
+  status + stale CoS scheduling state; not a forwarding bug). Fix: call
+  `self.refresh_bindings(bindings)` in the `no_snapshot` arm before
+  setting the stage — it routes every now-workerless slot through
+  `zero_unbound_slot` (clearing exactly those residual fields) and
+  rebuilds the CoS owner map empty, the same tail the snapshot-apply
+  path runs. Sibling of #2522 (which gated the teardown quiesce on the
+  same path). Provenance: agy (gemini) review-036 finding 036-04.
+- **Validation**: `cargo build --release` clean;
+  `cargo test --release --bin xpf-userspace-dp -- reconcile` 19/19 green
+  (single-thread). Fail-on-revert: new test
+  `reconcile_none_snapshot_refreshes_bindings_clearing_reset_survivor_fields`
+  goes RED ("ZEROCOPY" xsk_bind_mode persists) when the refresh call is
+  removed, GREEN when restored.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md
 ## 2026-06-25 — #2524: ring-entries max bound + power-of-two (commit + Rust backstop)
 
 - **Timestamp**: 2026-06-25
@@ -15687,3 +15715,28 @@ top.
   fail-on-revert pin — RED when the coupling is restored, both AFs checked).
   **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
   pkg/frr/README.md, _Log.md
+  **Action**: #2573 — cached TX-selection records ALL matched `then count`
+  terms, not just the last. #2544 fall-through lets one packet match
+  multiple `then count` terms; the cached flow-replay descriptor held a
+  single counter `Arc` so only the LAST term incremented on a cache hit
+  (the uncached full-eval path counted each). Added `CachedFilterCounters`
+  (`SmallVec<[Arc<FilterTermCounter>; 2]>`, dedup by `Arc::ptr_eq`, built
+  once at flow-cache install, read-only `for_each` on the per-packet replay
+  → no heap alloc for the common single/dual case). Replaced the single
+  `counter` slot on `CachedTxSelectionFilterResult` and `filter_counter` on
+  `CachedTxSelectionDescriptor`; `merge_matched_cached_modifiers` now
+  `push`es every matched count term; the flow-cache hit path iterates and
+  records all. Fail-on-revert test
+  `cached_tx_selection_records_all_fallthrough_count_terms` (two
+  fall-through count terms + terminal accept) asserts both term counters
+  increment on the cached replay; reverting to last-only leaves term[0] at
+  0 → RED.
+  **File(s)**: userspace-dp/src/filter/mod.rs,
+  userspace-dp/src/filter/engine/cache_sensitive.rs,
+  userspace-dp/src/filter/README.md,
+  userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/tx/cos_classify.rs,
+  userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/umem/tests.rs,
+  userspace-dp/src/filter/tests.rs, _Log.md
