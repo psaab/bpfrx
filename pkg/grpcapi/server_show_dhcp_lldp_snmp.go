@@ -238,6 +238,10 @@ func (s *Server) showDHCPDynamicDNS(cfg *config.Config, buf *strings.Builder, de
 		buf.WriteString("\n  Runtime counters: unavailable (manager not running)\n")
 		return
 	}
+	if st.Degraded {
+		fmt.Fprintf(buf, "\n  ALARM: DDNS DEGRADED (fail-closed) — %s\n", st.DegradedReason)
+		buf.WriteString("    Publishing and withdrawals are SUSPENDED until the ownership state is resolved.\n")
+	}
 	buf.WriteString("\n  Counters:\n")
 	fmt.Fprintf(buf, "    Upserts:    ok=%d fail=%d\n", st.UpsertOK, st.UpsertFail)
 	fmt.Fprintf(buf, "    Deletes:    ok=%d fail=%d\n", st.DeleteOK, st.DeleteFail)
