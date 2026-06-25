@@ -135,6 +135,26 @@ after HA failover. To make that **structural**, not flag-defended:
   `waitConnReady(timeout) bool`; the owner calls `signalConnReady(opened)`
   after `openConn` so a failed/pre-empted open releases the waiter promptly
   rather than blocking the full timeout on a sender that will never serve.
+- **Dead-sender rebuild on reconcile (#2865).** A sender whose initial
+  `openConn()` FAILS — the bind retry exhausts (link still doing DAD, the
+  link-local has not appeared yet, a transient link-down at cold boot) or a
+  stop pre-empts the open — has its owner go straight to `finishShutdown` and
+  exit, but the `sender` struct REMAINS in `m.senders`. Such a sender will
+  never emit an RA. Without special handling the next `Apply` reconcile would
+  see the config is unchanged (`configEqual`) and `continue`, treating the
+  dead entry as healthy and NEVER rebuilding it — so a transient boot-time
+  bind failure would leave that interface permanently without RAs (IPv6 hosts
+  lose their default route / RDNSS) until the daemon restarts or the RA config
+  for that interface changes. The reconcile therefore probes `sender.dead()`
+  (the open attempt RESOLVED — `connReady` closed — WITHOUT producing a live
+  conn: `!connOpened`) and treats a dead sender as a hard-REBUILD even when
+  the config is unchanged. The rebuild reuses the make-before-break replace
+  path (tombstone → stop old → start replacement on PROVEN-close); because a
+  dead sender's `run()` has already exited and closed its conn, the
+  `releaseDrain` join returns immediately. A `sender` whose open is still in
+  flight is NOT dead (`dead()` returns false until `connReady` is closed), so
+  an in-progress slow bind is never spuriously torn down. Net effect: a
+  transient open failure recovers on the next reconcile with NO config change.
 - **Deferred / restart Apply is epoch-guarded.** An `Apply` start that
   waits behind a tombstone (a pre-existing drain, or its own changed-config
   stop) captures the manager epoch; if a newer `Withdraw`/`Clear`/`Apply`

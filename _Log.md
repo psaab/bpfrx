@@ -1,3 +1,51 @@
+## 2026-06-25 — #2891: FRR backup-router IPv6 next-hop with empty dst emitted invalid `ip route 0.0.0.0/0 <v6nh>`
+
+- **Timestamp**: 2026-06-25
+- **Action**: `renderBackupRouter` defaulted an empty `BackupRouterDst` to
+  `0.0.0.0/0` unconditionally and picked the route-prefix keyword (`ip` vs
+  `ipv6`) only from the destination family. An IPv6 backup-router
+  (`set system backup-router 2001:db8::1`) with no `destination` therefore
+  rendered `ip route 0.0.0.0/0 2001:db8::1 250` — a v4 prefix with a v6
+  next-hop, which frr-reload rejects and which fails the ENTIRE static
+  config load (#2891, agy-review-051 051-12). Made the default and the
+  prefix keyword next-hop-family-aware: a v6 `BackupRouter` with an empty
+  dst defaults to `::/0` and emits `ipv6 route ::/0 <v6nh> 250`; a v4
+  backup-router still defaults to `0.0.0.0/0` (`ip route 0.0.0.0/0
+  <v4nh> 250`). Byte-identical for any explicit `destination`.
+- **File(s)**: pkg/frr/config_render.go (fix), pkg/frr/frr_test.go
+  (TestBackupRouterFamilyAwareDefault fail-on-revert guard, driven through
+  ParseSetCommand+SetPath+CompileConfig), pkg/frr/README.md (config_render.go
+  cell #2891 note).
+- **Validation**: go build ./..., gofmt -l clean on changed files, go vet
+  ./pkg/frr/... ./pkg/config/..., go test ./pkg/frr/... ./pkg/config/... all
+  green; fail-on-revert proven — reverting the family-aware default turns the
+  v6 case RED with the exact pre-fix `ip route 0.0.0.0/0 2001:db8::1 250`.
+
+## 2026-06-25 — #2867: VRRP GARP/NA burst follow-up loops keep poisoning after abdication
+
+- **Timestamp**: 2026-06-25
+- **Action**: The detached GARP/NA burst follow-up loops
+  (`runARPBurstFollowups` / `runNABurstFollowups` in `pkg/cluster/garp.go`,
+  launched from `becomeMaster` → `sendGARP` → `SendGratuitous*Burst`) had no
+  epoch/state gate. A node abdicating master mid-burst (link flap / rapid
+  preempt / split-brain) kept broadcasting GARP/NA for VIPs it no longer
+  owned, re-poisoning neighbor caches. Added a `BurstStillValid func() bool`
+  predicate threaded through `SendGratuitousARPBurstGated` /
+  `SendGratuitousIPv6BurstGated` into the follow-up loops; checked before
+  every follow-up frame, stops on false. `sendGARP` passes
+  `getState()==StateMaster && garpEpoch==captured` (composes with the
+  #2081 garpEpoch / #2082 preempt-gate). Original ungated `SendGratuitous*Burst`
+  kept as nil-predicate wrappers for direct-mode re-announce callers.
+- **File(s)**: pkg/cluster/garp.go, pkg/vrrp/instance.go,
+  pkg/cluster/garp_abdicate_test.go (fail-on-revert),
+  pkg/vrrp/instance_garp_abdicate_test.go, pkg/cluster/garp_burst_errors_test.go
+  (signature update), pkg/cluster/README.md, pkg/vrrp/README.md
+- **Validation**: go build ./..., gofmt -l (clean), go vet, go test -race
+  ./pkg/cluster/... ./pkg/vrrp/... — green. Fail-on-revert verified: removing
+  the gate turns TestARPBurstFollowups_AbortsOnAbdication +
+  TestNABurstFollowups_AbortsOnAbdication RED. HA — PARENT runs
+  make test-failover before merge.
+
 ## 2026-06-25 — #2843: DDNS Surface A status omits never-published / errored scopes
 
 - **Timestamp**: 2026-06-25
@@ -16969,6 +17017,28 @@ top.
   pkg/ra/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2836 WG PeerTable COW — make endpoint/keepalive/PSK part of
+  the atomic snapshot. `reconcile_peers` no longer interior-mutates a
+  reused `Arc<Peer>`'s config in place before the table swap (which let an
+  OLD-table reader see NEW config — a torn endpoint/keepalive/PSK read).
+  Split the operator-facing config into an immutable `PeerConfig` owned by a
+  per-snapshot `PeerEntry { peer: Arc<Peer>, config: Arc<PeerConfig> }`;
+  reconcile builds a FRESH `PeerConfig` per commit and reuses the long-lived
+  `Peer` (sessions/timers survive). Hot egress `peer_for_dest` reads the
+  endpoint from the loaded snapshot — removes the per-packet endpoint
+  `RwLock` (folds codex-049-04). Timers/handshake read config via new
+  `peer_config`/`peer_entry` snapshot helpers. Added FAIL-ON-REVERT test
+  `old_snapshot_observes_old_config_after_concurrent_reconcile` (pins the old
+  snapshot, races a reconcile, asserts old-all / new-all + reused peer Arc;
+  RED under simulated in-place mutation). Gates: cargo build --release -p
+  xpf-userspace-dp clean; cargo test --release --bin xpf-userspace-dp --
+  wg peer all green. No wire change (protocol_wire_v1.json untouched).
+  **File(s)**: userspace-dp/src/afxdp/wg/peer.rs,
+  userspace-dp/src/afxdp/wg/engine.rs,
+  userspace-dp/src/afxdp/wg/timers.rs,
+  userspace-dp/src/afxdp/wg/handshake_session.rs,
+  userspace-dp/src/afxdp/wg/tests.rs,
+  userspace-dp/src/afxdp/wg/engine_tests.rs, _Log.md
   **Action**: #2850 — add VRRP `preempt hold-time <seconds>` (vSRX parity).
   Without it a higher-priority node reclaims mastership from a still-live
   lower-priority master IMMEDIATELY on recovery — before BGP/OSPF converge —
@@ -17222,6 +17292,43 @@ top.
   TestObserveInterfaceAddrTransientVsDefinitive/LinkByName_error RED.
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2864 static-NAT DNAT zone fallback — evaluate the
+  `from zone` constraint PER CANDIDATE so a port-specific entry whose
+  zone does not match the packet's ingress zone falls through to the
+  whole-address `(dst_ip, None)` entry instead of short-circuiting to
+  no-DNAT. Port-specific precedence preserved (it still wins when its
+  zone matches). Added fail-on-revert test
+  `static_nat_dnat_port_zone_mismatch_falls_back_to_whole_address`
+  (port-zone-fail falls back; port wins on its zone; no candidate matches
+  ingress zone -> no DNAT; unknown IP -> no DNAT). No wire change.
+- **File(s)**: userspace-dp/src/nat/static_nat.rs,
+  userspace-dp/src/nat/tests.rs, docs/feature-coverage.md
+- **Validation**: cargo build --release -p xpf-userspace-dp (clean) ;
+  cargo test --release --bin xpf-userspace-dp -- nat dnat static
+  (466 passed, 0 failed). Fail-on-revert confirmed: reverting the
+  per-candidate `.filter(zone_ok)` fall-through to the once-after-precedence
+  zone check makes the new test RED at the `fallback match` expect.
+  protocol_wire_v1.json untouched.
+- **Action**: #2889 — reject FRR auth secrets containing whitespace at
+  commit. A BGP neighbor password / OSPF-RIP-ISIS auth key with a space
+  (or tab / control char) cannot be expressed as a single FRR/vtysh token
+  (FRR's command lexer, lib/command_lex.l, splits on whitespace and has
+  NO quoted-string and NO rest-of-line token — quoting is impossible), so
+  it would be truncated at the first space or inject trailing words as
+  extra vtysh args at frr.conf load. Researched FRR's lexer to confirm
+  quoting is unsupported, then added validateFRRAuthValuesStrict (strict
+  on commit/commit-check naming the field; lenient warn on load/HA-sync
+  per #1960). Scoped to the security-relevant password/key clauses;
+  neighbor description left control-char-sanitized only (noted as
+  follow-up).
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/parser_routing_test.go, pkg/frr/README.md
+- **Validation**: go build ./... ; gofmt -l (clean) ; go vet
+  ./pkg/frr/... ./pkg/config/... (clean) ; go test ./pkg/frr/...
+  ./pkg/config/... (PASS). Fail-on-revert confirmed:
+  TestFRRAuthValueWhitespaceRejected goes RED (space-containing secrets
+  compile cleanly) when validateFRRAuthValuesStrict's call site is removed.
   **Action**: #2888 DHCP relay server-facing socket binds giaddr:67 (BOOTPS)
   instead of giaddr:0 (ephemeral). RFC 2131 §4.1: a strict server unicasts its
   reply to the relay at giaddr:67, so an ephemeral-port server conn never
@@ -17281,3 +17388,41 @@ top.
   ./pkg/daemon/... PASS.
   **File(s)**: pkg/flowexport/routemask.go,
   pkg/flowexport/srcmask_dstmask_test.go, pkg/flowexport/README.md, _Log.md
+  **Action**: #2865 RA sender whose initial openConn() fails stayed in
+  m.senders as a dead entry; the config-unchanged Apply reconcile skipped it
+  (configEqual → continue), so a transient boot-time bind failure (link still
+  doing DAD / link-local not yet present) left that interface permanently with
+  no RA (IPv6 hosts lose default route / RDNSS) until daemon restart or a
+  config change. Fix: added sender.dead() (open attempt RESOLVED — connReady
+  closed — without a live conn, i.e. !connOpened) and gated the reconcile
+  skip with !existing.dead(); a dead sender is now treated as a hard-REBUILD
+  even with unchanged config, reusing the #2834 make-before-break replace path
+  (tombstone → stop old → start replacement on proven-close; a dead sender's
+  run() has already exited + closed its conn so the join is immediate). An
+  in-flight slow open is NOT dead (connReady not yet closed), so it is never
+  spuriously torn down — composes with #2453/#2835. Added fail-on-revert test
+  TestT2865_DeadSenderRebuiltOnReconcile (fail-then-succeed listenFn: open
+  fails → sender goes dead → re-Apply IDENTICAL config → rebuilt into a live
+  sender emitting the startup burst; RED when the !existing.dead() guard is
+  removed — "conn for lo never opened"). Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/ra/..., go test -race ./pkg/ra/... PASS.
+  **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/serialize_test.go,
+  pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2901 — DDNS source-binding dialer family gate. The shared
+  bindConfig.dialer Control hook (pkg/ddns/backend_bind.go) called unix.Bind by
+  the SOURCE family regardless of the dial socket family, so a dual-stack
+  endpoint (A+AAAA) whose Happy-Eyeballs picked the non-matching family hit
+  EAFNOSUPPORT/EINVAL and aborted the whole connection. Gated the source-bind on
+  sourceMatchesDialFamily(src, network) keyed off the Dialer.Control "network"
+  arg (tcp4/tcp6/udp4/udp6); on a family mismatch the bind is SKIPPED and the
+  dial proceeds with the kernel-chosen source (operator configured a source only
+  for the matching family). SO_BINDTODEVICE stays family-agnostic, applied
+  always. DDNS analog of the #2757/#2832 ipsec family-selection work. FAIL-ON-
+  REVERT: TestDialerSourceBindFamilyGate drives the Control hook over real
+  AF_INET/AF_INET6 fds — match binds cleanly, mismatch returns nil; RED (EINVAL)
+  when the gate is removed (verified). Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/ddns/..., go test ./pkg/ddns/... PASS.
+  **File(s)**: pkg/ddns/backend_bind.go, pkg/ddns/backend_bind_test.go,
+  pkg/ddns/README.md, _Log.md

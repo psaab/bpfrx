@@ -809,6 +809,159 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// frrTokenUnsafeIndex returns the byte index of the first character in s
+// that FRR's command lexer cannot carry inside a single config token, or
+// -1 if every character is safe.
+//
+// FRR's CLI lexer (lib/command_lex.l) tokenizes a vtysh / frr.conf line on
+// ASCII whitespace and has NO quoted-string rule and NO rest-of-line
+// ("LINE") token — a double-quoted value is NOT grouped, the quotes are
+// taken literally. So any whitespace inside a rendered value splits it into
+// multiple arguments: a password / auth key is truncated at the first space,
+// or trailing words become spurious vtysh arguments. We therefore reject
+// only the characters that actually break tokenization: ASCII space, tab,
+// and the C0 / DEL control set (which sanitizeFRRValue would otherwise turn
+// into spaces at render time, re-introducing the same split). Other
+// punctuation (`.`, `@`, `!`, `#`, …) is matched by the lexer's single-char
+// catch-all rule and stays adjacent with no whitespace, so it is safe.
+func frrTokenUnsafeIndex(s string) int {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == ' ' || c == '\t' || c < 0x20 || c == 0x7f {
+			return i
+		}
+	}
+	return -1
+}
+
+// validateFRRAuthValuesStrict hard-rejects a dynamic-routing authentication
+// secret that cannot be rendered as a single FRR/vtysh token (#2889):
+//
+//   - a BGP neighbor TCP-MD5 password (`neighbor <addr> password ...`)
+//   - an OSPF interface authentication key (`ip ospf message-digest-key`
+//     md5 / `ip ospf authentication-key`)
+//   - a RIP authentication key (`ip rip authentication string`)
+//   - an IS-IS area/domain or per-interface authentication key
+//     (`area-password` / `domain-password` / `isis password`)
+//
+// All of these render the secret directly into a frr.conf line. FRR's
+// command lexer (lib/command_lex.l) splits on whitespace and supports
+// neither a quoted string nor a rest-of-line token, so a secret containing
+// a space or tab is parsed as multiple arguments at config load: the secret
+// is truncated at the first space, or — worse — the trailing words are
+// interpreted as additional vtysh arguments (a malformed-line / injection
+// risk). The render-side belt (sanitizeFRRValue, #1798) already collapses
+// embedded control characters to spaces, so it cannot rescue this; it would
+// only widen the split. Quoting is not an option here, so the safe contract
+// is to reject the value at commit, naming the field.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientFRRAuthValues) so an already-persisted or peer-synced
+// config carrying such a value still BOOTS (#1960 fail-closed-on-load
+// class); the render path strips control chars and the offending line stays
+// inert / single-line. Commit / commit-check stay strict. Mirrors
+// validateRoutingExportReferencesStrict.
+func validateFRRAuthValuesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+
+	const why = "FRR's vtysh config lexer splits on whitespace and supports " +
+		"no quoting, so the secret would be truncated at the first space or " +
+		"inject trailing words as extra arguments at frr.conf load — remove " +
+		"the whitespace/control characters from the value"
+
+	checkKey := func(scope, field string, s Secret) error {
+		if s == "" {
+			return nil
+		}
+		if i := frrTokenUnsafeIndex(s.Reveal()); i >= 0 {
+			return fmt.Errorf("%s%s contains whitespace or a control "+
+				"character (at byte offset %d) that cannot be represented "+
+				"in FRR config — %s", scope, field, i, why)
+		}
+		return nil
+	}
+
+	checkProtocols := func(scope string, ospf *OSPFConfig, bgp *BGPConfig, rip *RIPConfig, isis *ISISConfig) error {
+		if ospf != nil {
+			for _, area := range ospf.Areas {
+				if area == nil {
+					continue
+				}
+				for _, iface := range area.Interfaces {
+					if iface == nil {
+						continue
+					}
+					fld := fmt.Sprintf("protocols ospf area %s interface %s authentication-key", area.ID, iface.Name)
+					if err := checkKey(scope, fld, iface.AuthKey); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if rip != nil {
+			if err := checkKey(scope, "protocols rip authentication-key", rip.AuthKey); err != nil {
+				return err
+			}
+		}
+		if isis != nil {
+			if err := checkKey(scope, "protocols isis authentication-key", isis.AuthKey); err != nil {
+				return err
+			}
+			for _, iface := range isis.Interfaces {
+				if iface == nil {
+					continue
+				}
+				fld := fmt.Sprintf("protocols isis interface %s authentication-key", iface.Name)
+				if err := checkKey(scope, fld, iface.AuthKey); err != nil {
+					return err
+				}
+			}
+		}
+		if bgp != nil {
+			// Sort neighbor addresses for a deterministic first-error
+			// message (Go map / slice authoring order is not stable across
+			// the parse paths).
+			neighbors := append([]*BGPNeighbor(nil), bgp.Neighbors...)
+			sort.SliceStable(neighbors, func(i, j int) bool {
+				return neighbors[i].Address < neighbors[j].Address
+			})
+			for _, n := range neighbors {
+				if n == nil {
+					continue
+				}
+				fld := fmt.Sprintf("protocols bgp neighbor %s authentication-key", n.Address)
+				if n.GroupName != "" {
+					fld = fmt.Sprintf("protocols bgp group %s neighbor %s authentication-key", n.GroupName, n.Address)
+				}
+				if err := checkKey(scope, fld, n.AuthPassword); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	// Top-level protocols.
+	if err := checkProtocols("", cfg.Protocols.OSPF, cfg.Protocols.BGP, cfg.Protocols.RIP, cfg.Protocols.ISIS); err != nil {
+		return err
+	}
+
+	// Per routing-instance protocols.
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil {
+			continue
+		}
+		scope := fmt.Sprintf("routing-instance %s ", ri.Name)
+		if err := checkProtocols(scope, ri.OSPF, ri.BGP, ri.RIP, ri.ISIS); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // validateFirewallPolicerReferencesStrict hard-rejects a firewall-filter
 // term whose `then policer <name>` (Finding A, #2217) references neither a
 // defined single-rate policer (`firewall policer <name>`) nor a defined
