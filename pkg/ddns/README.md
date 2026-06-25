@@ -319,6 +319,29 @@ its OWN learned address — on top of the SAME spine, without forking the engine
 - **HA gate** is the SAME per-RG `ScopeGate` (a router record on a reth/virtual
   interface publishes only on the RG master; stop-writing-never-withdraw
   otherwise). Standalone (nil gate) always publishes.
+- **Lock discipline — I/O is NEVER performed under the manager mutex (#2778).**
+  `SurfaceAManager.mu` guards ALL manager state (the durable ownership store, the
+  per-scope runtime cache, the counters), but it is RELEASED across every
+  provider network call (`UpsertLease`/`DeleteLease`, which run with a 15s HTTP
+  client timeout). A slow or hung provider must NOT block `StatusViews`/`Stats`
+  (operator `show` + Prometheus scrapes) or other scopes' reconcile work — that
+  would freeze the control plane for up to 15s exactly while the subsystem is
+  unhealthy. The pattern (`providerIO`): under the lock, the pass snapshots the
+  exact intent (resolved backend + record) and durably write-aheads the
+  ownership BEFORE the wire op (so a crash in the unlocked window still finds the
+  record owned and converges next pass); it then RELEASES the lock for the wire
+  call and RE-ACQUIRES it to commit the result. The commit is guarded by a
+  racing-op re-validation (CAS): if a concurrent op changed the scope's owned
+  record while the lock was released, the stale wire result does NOT clobber the
+  newer truth — a stale publish-rollback is skipped (the newer ownership wins,
+  signalled via `errSurfaceAPublishRaced` so the runtime cache is not advanced),
+  and a stale withdraw drops ownership only if the live entry is STILL the exact
+  record it deleted (a concurrent re-publish with a new address keeps its
+  ownership, never orphaned). The single-flight guard in the daemon
+  (`surfaceAReconcileInFlight`) means two full passes never run concurrently, but
+  the CAS keeps the contract correct regardless. Proven in
+  `surface_a_lockio_test.go` (a blocking provider + a concurrent `StatusViews`
+  that would hang if the lock were held; fail-on-revert).
 - **Operator surfaces:** `show services dynamic-dns [detail]` (CLI + gRPC), the
   `xpf_ddns_surface_a_*` Prometheus family, and `SurfaceAManager.StatusViews()`
   (per-scope published address + last-published time + last error).

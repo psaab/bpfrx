@@ -1,3 +1,41 @@
+## 2026-06-25 — #2778: ddns/surface-a no longer holds the manager mutex across provider I/O
+
+- **Timestamp**: 2026-06-25
+- **Action**: Surface A provider I/O (`UpsertLease`/`DeleteLease`, 15s HTTP
+  client timeout) ran UNDER `SurfaceAManager.mu`, so a slow/hung provider
+  blocked every other Surface A op — `StatusViews` (operator `show`), `Stats`
+  (Prometheus scrape), and other scopes' reconcile work — for up to 15s exactly
+  while the subsystem was unhealthy. Added `providerIO(fn)`: it unlocks `m.mu`,
+  runs the one wire call, and re-acquires the lock (`defer m.mu.Lock()` so a
+  panicking backend cannot leave the deferred `Reconcile` Unlock unbalanced).
+  `publishLocked` now durably write-aheads ownership BEFORE the wire add (crash
+  in the unlocked window still finds the record owned → next pass converges),
+  releases the lock for the `UpsertLease`, then re-acquires and commits with a
+  racing-op CAS: if a concurrent op changed the owned record while unlocked, the
+  stale result is NOT rolled back / advanced (newer ownership wins,
+  `errSurfaceAPublishRaced` tells `reconcileScopeLocked` to leave the runtime
+  cache + backoff untouched). `withdrawOwnedLocked` releases the lock for the
+  `DeleteLease`, then drops ownership only if the live entry is STILL the exact
+  record it deleted (a concurrent re-publish with a new address keeps its
+  ownership, never orphaned). All preserved invariants: never-blackhole,
+  write-ahead-before-add (#2662), withdraw-keeps-ownership-on-error/no-op-backend
+  (#2691 P2 M1), per-RG HA gate (#2664). The daemon single-flight guard
+  (`surfaceAReconcileInFlight`) already serializes full passes; the CAS keeps the
+  contract correct regardless.
+- **File(s)**: `pkg/ddns/surface_a.go` (`providerIO` helper, lock-release +
+  racing-op CAS in `publishLocked`/`withdrawOwnedLocked`, `errSurfaceAPublishRaced`
+  sentinel), `pkg/ddns/surface_a_lockio_test.go` (new fail-on-revert + race
+  tests), `pkg/ddns/README.md` (P2 lock-discipline bullet).
+- **Fail-on-revert proof**: copied `surface_a.go` aside, reverted `providerIO`
+  to call `fn()` with the lock HELD (the #2778 bug), ran the three new tests:
+  all three FAILED with a 2s bounded-wait timeout —
+  `TestSurfaceALockNotHeldDuringUpsert` (StatusViews blocked behind a blocked
+  UpsertLease), `TestSurfaceALockNotHeldDuringDelete` (StatusViews blocked behind
+  a blocked DeleteLease), `TestSurfaceAPublishRaceDoesNotClobberNewerState`
+  (Reconcile #2 blocked behind #1's lock-held publish). Restored from the copy;
+  all pass with the fix. `go build ./...`, `gofmt -l` (clean on touched files),
+  `go vet`, `go test -race ./pkg/ddns/... ./pkg/daemon/...` all green.
+
 ## 2026-06-25 — #2774: ddns/checkip public-address gate covers the full IANA special-purpose registry
 
 - **Timestamp**: 2026-06-25
