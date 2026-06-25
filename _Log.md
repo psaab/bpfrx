@@ -1,3 +1,24 @@
+## 2026-06-25 — #2842: DDNS checkip-url scheme validation is now case-insensitive (RFC 3986 §3.1)
+
+- **Timestamp**: 2026-06-25
+- **Action**: Both checkip-url validators rejected a valid uppercase/mixed-case
+  scheme (e.g. `HTTPS://host`) because they tested the scheme with a
+  case-sensitive `strings.HasPrefix(u, "http://"/"https://")` on the raw string.
+  Per RFC 3986 §3.1 the URI scheme is case-INSENSITIVE, so this wrongly rejected
+  a syntactically valid URL. Fix: parse first with `url.Parse`, then compare the
+  parsed `Scheme` with `strings.EqualFold` against `http`/`https`, in BOTH the
+  runtime gate `pkg/ddns.validateCheckIPURL` and the commit-time mirror
+  `pkg/config.ddnsCheckIPURLValid` (the #2773 dual-validator pair — kept in
+  lockstep). Non-http schemes (`ftp://`), host-less (`http://`), and
+  unparseable strings still fail. Added fail-on-revert coverage: uppercase
+  `HTTP://`/`Https://` accepted in `pkg/ddns.TestValidateCheckIPURL` and new
+  `pkg/config.TestP3CheckIPURLUppercaseSchemeAccepted` (ParseSetCommand +
+  SetPath); both go RED if reverted to case-sensitive HasPrefix.
+- **File(s)**: `pkg/ddns/checkip.go`, `pkg/config/compiler_validate_warn.go`,
+  `pkg/ddns/checkip_test.go`,
+  `pkg/config/compiler_p3_http_providers_test.go`, `pkg/ddns/README.md`,
+  `docs/config-schema.md`
+
 ## 2026-06-25 — #2457: WG advertised/configured inner MTU clamped to engine PADDED_PLAINTEXT_MAX (4096)
 
 - **Timestamp**: 2026-06-25
