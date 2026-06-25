@@ -23,7 +23,7 @@ pub(crate) use eval::{
     evaluate_interface_filter_routing_instance_counted,
     evaluate_interface_filter_routing_instance_event_counted, evaluate_interface_output_filter,
     evaluate_interface_output_filter_counted, evaluate_lo0_filter, evaluate_lo0_filter_counted,
-    evaluate_lo0_filter_log_match, interface_filter_affects_route_lookup,
+    evaluate_lo0_filter_log_match, interface_filter_affects_route_lookup, NonRoutingCountPolicy,
 };
 pub(crate) use policer::{
     apply_cached_three_color_policers, filter_state_has_input_three_color_policer,

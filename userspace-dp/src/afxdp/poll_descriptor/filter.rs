@@ -89,6 +89,7 @@ pub(super) fn evaluate_non_pbr_input_filter(
     flow: Option<&SessionFlow>,
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
+    routing_eval_follows: bool,
 ) -> NonPbrInputFilterEval {
     let Some(flow) = flow else {
         return NonPbrInputFilterEval {
@@ -103,6 +104,31 @@ pub(super) fn evaluate_non_pbr_input_filter(
     )
     .unwrap_or(meta.ingress_ifindex as i32);
     let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
+    // #2620: pick the counter-ownership policy. `routing_eval_follows` is true
+    // ONLY on the session-MISS path, where the caller proceeds to
+    // `ingress_route_table_override` after an Accept verdict from this precheck.
+    // When that path is taken AND the filter is route-lookup-affecting, the
+    // routing-instance evaluator runs on the Accept/defer exit and counts the
+    // same terms — so this precheck must count only on the terminal
+    // discard/reject exit the routing evaluator can't reach (the poll path
+    // `continue`s on a non-Accept verdict, never calling the routing
+    // evaluator). `OnlyTerminalNonAccept` avoids BOTH the #2620 double-count
+    // (count in both evaluators on Accept) AND the under-count regression
+    // (count in neither on a discard/reject ahead of the routing-instance
+    // term). Otherwise — a non-PBR-affecting filter, or the session-HIT re-eval
+    // (`routing_eval_follows == false`, which never invokes the routing
+    // evaluator) — this evaluator is the SOLE per-packet counter: `Always`
+    // (pre-#2620 behavior).
+    let count_policy = if routing_eval_follows
+        && crate::filter::interface_filter_affects_route_lookup(
+            &forwarding.filter_state,
+            ingress_ifindex,
+            is_v6,
+        ) {
+        crate::filter::NonRoutingCountPolicy::OnlyTerminalNonAccept
+    } else {
+        crate::filter::NonRoutingCountPolicy::Always
+    };
     let result = crate::filter::evaluate_interface_filter_non_routing_counted(
         &forwarding.filter_state,
         ingress_ifindex,
@@ -115,6 +141,7 @@ pub(super) fn evaluate_non_pbr_input_filter(
         meta.dscp,
         extra,
         meta.pkt_len as u64,
+        count_policy,
     );
     let ingress_zone_id =
         filter_log_ingress_zone_id(forwarding, meta, ingress_zone_override, ingress_ifindex);
@@ -205,12 +232,17 @@ pub(super) fn evaluate_dscp_sensitive_input_filter_on_session_hit(
         return None;
     }
     let extra = term_match_extra_from_frame(frame, meta);
+    // #2620: the session-HIT re-eval is the SOLE counter for this packet — it
+    // never calls `ingress_route_table_override`/the routing evaluator. Pass
+    // `routing_eval_follows = false` so it counts on every exit (per-packet,
+    // pre-#2620 behavior), even when the filter is route-lookup-affecting.
     Some(evaluate_non_pbr_input_filter(
         forwarding,
         extra,
         Some(flow),
         meta,
         ingress_zone_override,
+        false,
     ))
 }
 

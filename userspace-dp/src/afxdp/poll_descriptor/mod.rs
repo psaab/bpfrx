@@ -836,12 +836,19 @@ pub(super) fn poll_binding_process_descriptor(
                             .as_ref()
                             .and_then(|d| d.rewrite_dst_port)
                             .unwrap_or(flow.forward_key.dst_port);
+                        // #2620: session-MISS path — an Accept verdict here
+                        // proceeds to ingress_route_table_override (the routing
+                        // evaluator), so pass routing_eval_follows = true. The
+                        // precheck then counts only on the terminal
+                        // discard/reject exit (the routing evaluator owns the
+                        // Accept/defer exit count).
                         let input_filter_eval = evaluate_non_pbr_input_filter(
                             worker_ctx.forwarding,
                             crate::afxdp::frame::term_match_extra_from_frame(packet_frame, meta),
                             Some(flow),
                             meta,
                             ingress_zone_override,
+                            true,
                         );
                         // #2617: emit the matched input-filter `then log` event
                         // on THIS (session-miss / first) packet, regardless of
