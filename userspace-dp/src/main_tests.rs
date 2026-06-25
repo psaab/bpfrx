@@ -376,6 +376,55 @@ fn build_synced_session_entry_preserves_fabric_ingress() {
     assert_eq!(entry.metadata.owner_rg_id, 1);
 }
 
+// #2785: a synced session must carry the per-policy `then log` selection so
+// it emits the same RT_FLOW SESSION_CREATE/CLOSE records after failover.
+// Reverting the helpers.rs mapping hard-codes both false and this fails RED.
+#[test]
+fn build_synced_session_entry_applies_log_flags() {
+    let req = SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: libc::AF_INET as u8,
+        protocol: 6,
+        src_ip: "10.0.61.102".to_string(),
+        dst_ip: "172.16.80.200".to_string(),
+        src_port: 40000,
+        dst_port: 5201,
+        ingress_zone: "lan".to_string(),
+        egress_zone: "wan".to_string(),
+        egress_ifindex: 5,
+        tx_ifindex: 5,
+        log_session_init: true,
+        log_session_close: true,
+        ..SessionSyncRequest::default()
+    };
+    let entry =
+        build_synced_session_entry(&req, &test_zone_name_to_id()).expect("synced session entry");
+    assert!(entry.metadata.log_session_init, "log_session_init applied");
+    assert!(entry.metadata.log_session_close, "log_session_close applied");
+
+    // Close-only: init must NOT leak true.
+    let req_close = SessionSyncRequest {
+        log_session_init: false,
+        log_session_close: true,
+        ..req.clone()
+    };
+    let entry_close = build_synced_session_entry(&req_close, &test_zone_name_to_id())
+        .expect("synced session entry");
+    assert!(!entry_close.metadata.log_session_init);
+    assert!(entry_close.metadata.log_session_close);
+
+    // Old peer omits the fields => serde(default) false => no per-policy log.
+    let req_none = SessionSyncRequest {
+        log_session_init: false,
+        log_session_close: false,
+        ..req
+    };
+    let entry_none = build_synced_session_entry(&req_none, &test_zone_name_to_id())
+        .expect("synced session entry");
+    assert!(!entry_none.metadata.log_session_init);
+    assert!(!entry_none.metadata.log_session_close);
+}
+
 #[test]
 fn build_synced_session_entry_preserves_tunnel_endpoint_id() {
     let req = SessionSyncRequest {

@@ -121,3 +121,40 @@ func TestStaticNATMappedPortWithoutMatchPortRejected(t *testing.T) {
 		t.Fatalf("error must explain the missing match destination-port, got %v", err)
 	}
 }
+
+// TestStaticNATMatchPortWithoutMappedPortRejected is the #2769 config half: a
+// `match destination-port` WITHOUT a `then static-nat mapped-port` is a
+// port-scoped 1:1 that historically broadened the reverse SNAT to the whole
+// host. Strict commit-check now rejects the half-config (mirror of the
+// mapped-port-without-match-port rejection) so the operator must drop the port
+// match (whole-address 1:1) or add a mapped-port (port forward).
+//
+// Fail-on-revert: removing the `rule.MatchDestinationPort != 0 &&
+// rule.MappedPort == 0` guard in validateNATHostMaskStrict makes CompileConfig
+// succeed → RED.
+func TestStaticNATMatchPortWithoutMappedPortRejected(t *testing.T) {
+	tree := &ConfigTree{}
+	lines := []string{
+		"set security zones security-zone untrust",
+		"set security nat static rule-set rs1 from zone untrust",
+		"set security nat static rule-set rs1 rule r1 match destination-address 203.0.113.1/32",
+		"set security nat static rule-set rs1 rule r1 match destination-port 8080",
+		"set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.5/32",
+	}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatalf("expected CompileConfig to reject match destination-port without mapped-port")
+	}
+	if !strings.Contains(err.Error(), "requires a matching") {
+		t.Fatalf("error must explain the missing mapped-port, got %v", err)
+	}
+}

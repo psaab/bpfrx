@@ -190,6 +190,21 @@ pub(crate) enum SnapshotIntegrityError {
     /// 7 — a DIFFERENT traffic class — with no apply failure. Same fail-closed
     /// rationale as `CosDscpCodePointOutOfRange`.
     CosIeee8021CodePointOutOfRange { classifier: String, pcp: u8 },
+    /// #2458: a CoS scheduler snapshot carried a NON-EMPTY
+    /// `equal_flow_target_policy` wire string that is not one of the known
+    /// values (`slowest` / `mean` / `ideal-share`). The pre-fix
+    /// `EqualFlowTargetPolicy::parse` mapped any unknown string to the
+    /// `Slowest` default via a catch-all match arm — identically to the
+    /// empty (legacy-default) string — so a typo or a mixed-version snapshot
+    /// silently changed queue fairness instead of failing. The Go
+    /// commit-time gate (`compiler_validate_strict.go`, #1746/#2458) is the
+    /// primary defense; this is the helper-boundary backstop, consistent
+    /// with the #2447 CoS fail-closed family. An EMPTY value is the
+    /// legitimate legacy/unset default and is NOT an error.
+    CosUnknownEqualFlowTargetPolicy {
+        forwarding_class: String,
+        target_policy: String,
+    },
 }
 
 impl std::fmt::Display for SnapshotIntegrityError {
@@ -288,6 +303,14 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "cos ieee-802.1 classifier {:?} has code-point {} outside the 0..=7 PCP range — refusing to clamp it with .min(7) (which would install the classifier for a different traffic class)",
                 classifier, pcp
+            ),
+            Self::CosUnknownEqualFlowTargetPolicy {
+                forwarding_class,
+                target_policy,
+            } => write!(
+                f,
+                "cos forwarding-class {:?} has equal-flow-target-policy {:?} that is not one of slowest | mean | ideal-share — refusing to silently map it to the \"slowest\" default (which would change queue fairness with no failure surfaced)",
+                forwarding_class, target_policy
             ),
         }
     }

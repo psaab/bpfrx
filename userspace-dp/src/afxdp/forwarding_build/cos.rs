@@ -310,6 +310,27 @@ pub(super) fn build_cos_iface_config(
             let guarantee_enabled = explicit_transmit_rate_bytes.is_some();
             let transmit_rate_bytes =
                 explicit_transmit_rate_bytes.unwrap_or(iface.cos_shaping_rate_bytes_per_sec);
+            // #2458: parse the equal-flow target policy up front so an
+            // unknown NON-EMPTY value fails the snapshot CLOSED instead of
+            // silently collapsing to `Slowest` (the pre-fix catch-all arm).
+            // Gated identically to `equal_flow_enforcement`: a policy on a
+            // scheduler that is not (or cannot be) equal-flow-enforcing stays
+            // at the byte-unchanged default `Slowest`, and the empty / unset
+            // wire string is the legitimate legacy default. Only an active
+            // equal-flow scheduler with a non-empty UNRECOGNIZED policy
+            // string is rejected.
+            let equal_flow_target_policy = match scheduler.filter(|sched| {
+                guarantee_enabled && sched.transmit_rate_exact && sched.equal_flow_enforcement
+            }) {
+                Some(sched) => EqualFlowTargetPolicy::parse(&sched.equal_flow_target_policy)
+                    .map_err(|bad| {
+                        crate::policy::SnapshotIntegrityError::CosUnknownEqualFlowTargetPolicy {
+                            forwarding_class: entry.forwarding_class.clone(),
+                            target_policy: bad.to_string(),
+                        }
+                    })?,
+                None => EqualFlowTargetPolicy::default(),
+            };
             queues.push(CoSQueueConfig {
                 queue_id,
                 forwarding_class: entry.forwarding_class.clone(),
@@ -335,21 +356,10 @@ pub(super) fn build_cos_iface_config(
                             && sched.equal_flow_enforcement
                     })
                     .unwrap_or(false),
-                // #1746: policy is gated identically to
-                // equal_flow_enforcement — a policy on a scheduler that
-                // is not (or cannot be) equal-flow-enforcing stays at
-                // the byte-unchanged default `Slowest`. Unknown / empty
-                // wire strings also parse to `Slowest`.
-                equal_flow_target_policy: scheduler
-                    .filter(|sched| {
-                        guarantee_enabled
-                            && sched.transmit_rate_exact
-                            && sched.equal_flow_enforcement
-                    })
-                    .map(|sched| {
-                        EqualFlowTargetPolicy::parse(&sched.equal_flow_target_policy)
-                    })
-                    .unwrap_or_default(),
+                // #1746/#2458: gated identically to
+                // equal_flow_enforcement; parsed above so an unknown
+                // non-empty value fails the snapshot closed.
+                equal_flow_target_policy,
                 surplus_weight: cos_surplus_weight(
                     transmit_rate_bytes.max(1),
                     iface.cos_shaping_rate_bytes_per_sec,

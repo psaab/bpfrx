@@ -593,6 +593,57 @@ fn test_encode_session_open_v4() {
     assert_eq!(p[29], DISP_FORWARD_CANDIDATE); // Disposition
 }
 
+// #2785: the per-policy `then log` selection must ride the open-frame flags
+// byte (bits 1<<3/1<<4) so a synced session logs identically after failover.
+// Reverting the codec.rs encode drops the bits and this fails RED.
+#[test]
+fn test_encode_session_open_carries_log_flags() {
+    let zones = test_zone_map();
+    let mut md = test_metadata();
+    md.log_session_init = true;
+    md.log_session_close = true;
+    let frame =
+        EventFrame::encode_session_open(1, &test_key_v4(), &test_decision(), &md, &zones, false);
+    let p = &frame.data[FRAME_HEADER_SIZE..];
+    assert_eq!(
+        p[26] & FLAG_LOG_SESSION_INIT,
+        FLAG_LOG_SESSION_INIT,
+        "log_session_init must set flags bit 1<<3"
+    );
+    assert_eq!(
+        p[26] & FLAG_LOG_SESSION_CLOSE,
+        FLAG_LOG_SESSION_CLOSE,
+        "log_session_close must set flags bit 1<<4"
+    );
+
+    // Only close set: init bit must stay clear.
+    let mut md_close = test_metadata();
+    md_close.log_session_close = true;
+    let frame_close = EventFrame::encode_session_open(
+        2,
+        &test_key_v4(),
+        &test_decision(),
+        &md_close,
+        &zones,
+        false,
+    );
+    let pc = &frame_close.data[FRAME_HEADER_SIZE..];
+    assert_eq!(pc[26] & FLAG_LOG_SESSION_INIT, 0);
+    assert_eq!(pc[26] & FLAG_LOG_SESSION_CLOSE, FLAG_LOG_SESSION_CLOSE);
+
+    // Default metadata: neither bit set.
+    let frame_none = EventFrame::encode_session_open(
+        3,
+        &test_key_v4(),
+        &test_decision(),
+        &test_metadata(),
+        &zones,
+        false,
+    );
+    let pn = &frame_none.data[FRAME_HEADER_SIZE..];
+    assert_eq!(pn[26] & (FLAG_LOG_SESSION_INIT | FLAG_LOG_SESSION_CLOSE), 0);
+}
+
 #[test]
 fn test_encode_session_open_v6() {
     let zones = test_zone_map();

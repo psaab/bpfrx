@@ -235,6 +235,20 @@ impl super::Coordinator {
         crate::afxdp::gre::GRE_ENCAP_DF_OVERSIZE_DROPS.load(Ordering::Relaxed)
     }
 
+    /// #2782: native-GRE decap frames dropped because the Checksum-Present
+    /// (C) bit was set but the GRE checksum failed to verify (or the
+    /// header was truncated past the 4-byte Checksum+Reserved1 field). The
+    /// decap path now skips+validates the checksum (RFC 2784 §2.1 / RFC
+    /// 2890) so a checksummed peer (e.g. a vSRX with GRE checksum enabled)
+    /// forwards instead of being silently blackholed; a corrupt frame is
+    /// dropped here with this specific counter. Surfaced as
+    /// `xpf_userspace_gre_decap_checksum_invalid_drops_total`; a nonzero
+    /// value flags a checksummed GRE peer delivering corrupt frames or a
+    /// truncated GRE header.
+    pub fn gre_decap_checksum_invalid_drops_total(&self) -> u64 {
+        crate::afxdp::gre::GRE_DECAP_CHECKSUM_INVALID_DROPS.load(Ordering::Relaxed)
+    }
+
     /// #2472: locally-generated ICMP/ICMPv6 Time Exceeded replies dropped
     /// because the per-reason token bucket was empty. The TTL/hop-limit error
     /// generator is rate-limited (global-per-reason, Linux `icmp_msgs_per_sec`

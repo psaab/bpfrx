@@ -481,8 +481,21 @@ reserved for whole-dataplane selection where a rewrite shim
   equal-flow-target-policy (slowest | mean | ideal-share)` typed enum
   leaf (ValueEnumOf + `ValidateEnum`, same recipe as the scheduler
   `priority` leaf): value-slot completion, flat-set commit-check
-  rejection of unknown values, plus a strict-compile re-check for
-  externally-assembled configs.
+  rejection of unknown values, plus a strict-compile re-check
+  (`validateClassOfServiceStrict`) for externally-assembled configs.
+- **#2458 (Rust fail-closed backstop):** the helper-side
+  `EqualFlowTargetPolicy::parse` previously mapped any unrecognized
+  wire string to `Slowest` via a catch-all match arm — identically to
+  the empty (legacy/unset) string — so a typo or a mixed-version
+  snapshot that slipped past the Go gate silently changed queue
+  fairness with no failure surfaced. The parse is now fallible: the
+  EMPTY string still decodes to the byte-unchanged `Slowest` default,
+  but a NON-EMPTY unknown value fails the snapshot CLOSED with
+  `SnapshotIntegrityError::CosUnknownEqualFlowTargetPolicy` naming the
+  offending forwarding-class and value (preflight keeps the previous
+  live CoS state). The Go commit-time gate above stays the PRIMARY
+  defense; this is the helper-boundary backstop against version /
+  snapshot drift, consistent with the #2447 CoS fail-closed family.
 - **#1956 (chassis device-map):** added the bare-metal stable-identity
   managed allowlist under `chassis device-map` (a SIBLING of `cluster`, so
   per-node apply-groups compose). New value types `ValuePCIAddr` /
@@ -565,7 +578,17 @@ reserved for whole-dataplane selection where a rewrite shim
     is range-checked in the compiler (`validateNATHostMaskStrict`,
     `compiler_nat.go`), which ALSO rejects a `mapped-port` with no
     matching `match destination-port` (the reverse SNAT could not recover
-    the original port). The snapshot fields `match_destination_port` /
+    the original port) AND the mirror half-config — a `match
+    destination-port` with no `mapped-port` (#2769). The port-match-without-
+    mapped-port form is a port-scoped 1:1 (no port translation); rejecting
+    it at strict commit-check forces the operator to either drop the port
+    match (a whole-address 1:1) or add a `mapped-port` (a port forward). If
+    such a rule slips through the lenient load / peer-sync path, the Rust
+    dataplane backstop (`static_nat.rs from_snapshots`) keys the reverse
+    SNAT on `(internal_ip, Some(match_dst_port))` rather than
+    `(internal_ip, None)`, keeping the source translation scoped to the one
+    matched port instead of broadening it to every source port on the
+    internal host. The snapshot fields `match_destination_port` /
     `mapped_port` (`StaticNATRuleSnapshot`, both Go `omitempty` + Rust
     `#[serde(default)]`, default 0) are an additive, backward-compatible
     wire change; a single external IP can host several per-port mappings

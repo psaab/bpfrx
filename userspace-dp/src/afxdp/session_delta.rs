@@ -151,6 +151,10 @@ pub(super) fn flush_session_deltas(
             fabric_redirect: delta.fabric_redirect_sync
                 || delta.decision.resolution.disposition == ForwardingDisposition::FabricRedirect,
             fabric_ingress: delta.metadata.fabric_ingress,
+            // #2785: carry the per-policy log selection on the JSON fallback
+            // delta so the synced session logs identically after failover.
+            log_session_init: delta.metadata.log_session_init,
+            log_session_close: delta.metadata.log_session_close,
         };
         // #2669: per-binding RPC fallback push is the ONLY binding-dependent
         // step. Skipped when no binding exists; every consumer below is

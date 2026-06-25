@@ -1003,6 +1003,17 @@ type ProcessStatus struct {
 	// PTB signalling is deferred to #2330. Omitempty for wire compat with
 	// older helpers (defaults to 0).
 	GreEncapDfOversizeDropsTotal uint64 `json:"gre_encap_df_oversize_drops_total,omitempty"`
+	// #2782: native-GRE decap frames dropped because the GRE
+	// Checksum-Present (C) bit was set but the GRE checksum failed to
+	// verify (or the header was truncated past the 4-byte
+	// Checksum+Reserved1 field). Per RFC 2784 §2.1 + RFC 2890 a
+	// checksummed peer (e.g. a vSRX with GRE checksum enabled) is now
+	// decapped after skipping+validating the checksum field instead of
+	// being silently blackholed; only a frame the path corrupted is
+	// dropped here. Surfaced as
+	// xpf_userspace_gre_decap_checksum_invalid_drops_total. Omitempty for
+	// wire compat with older helpers (defaults to 0).
+	GreDecapChecksumInvalidDropsTotal uint64 `json:"gre_decap_checksum_invalid_drops_total,omitempty"`
 	// #2472: locally-generated ICMP Time Exceeded / PTB / `reject` error
 	// replies dropped because the per-reason token bucket was empty. Each
 	// reason has an independent global-per-reason bucket (Linux
@@ -2094,6 +2105,13 @@ type SessionSyncRequest struct {
 	NATDstPort       uint16 `json:"nat_dst_port,omitempty"`
 	FabricIngress    bool   `json:"fabric_ingress,omitempty"`
 	IsReverse        bool   `json:"is_reverse,omitempty"`
+	// #2785: the admitting policy's per-policy `then log` selection, carried
+	// so a session synced to the peer logs the same RT_FLOW
+	// SESSION_CREATE/CLOSE records after failover. omitempty is safe — an old
+	// helper without these keys decodes them via serde(default) to false (no
+	// per-policy log), bit-identical to pre-#2785 behavior.
+	LogSessionInit  bool `json:"log_session_init,omitempty"`
+	LogSessionClose bool `json:"log_session_close,omitempty"`
 	// Generation carries the #2170 HA install generation to the helper so
 	// its in-memory SyncedSessionEntry can mirror the cluster apply layer's
 	// generation guard (belt-and-suspenders for helper-originated deletes
@@ -2144,6 +2162,12 @@ type SessionDeltaInfo struct {
 	NATDstPort       uint16 `json:"nat_dst_port,omitempty"`
 	FabricRedirect   bool   `json:"fabric_redirect,omitempty"`
 	FabricIngress    bool   `json:"fabric_ingress,omitempty"`
+	// #2785: the admitting policy's per-policy `then log` selection. Decoded
+	// from the binary open-frame flags byte (bits 1<<3/1<<4) AND mirrored on
+	// the JSON RPC-fallback delta; stamped onto the synced session's
+	// LogFlags so it logs identically after failover.
+	LogSessionInit  bool `json:"log_session_init,omitempty"`
+	LogSessionClose bool `json:"log_session_close,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -2193,4 +2217,9 @@ const (
 	SessionEventFlagFabricRedirect uint8 = 1 << 0
 	SessionEventFlagFabricIngress  uint8 = 1 << 1
 	SessionEventFlagIsReverse      uint8 = 1 << 2
+	// #2785: per-policy `then log` selection carried on the open frame so a
+	// synced session logs the same RT_FLOW records after failover. Must match
+	// FLAG_LOG_SESSION_INIT/CLOSE in userspace-dp/src/event_stream/codec.rs.
+	SessionEventFlagLogSessionInit  uint8 = 1 << 3
+	SessionEventFlagLogSessionClose uint8 = 1 << 4
 )

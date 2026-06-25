@@ -111,6 +111,14 @@ const DISP_NEXT_TABLE_UNSUPPORTED: u8 = 8;
 pub(crate) const FLAG_FABRIC_REDIRECT: u8 = 1 << 0;
 pub(crate) const FLAG_FABRIC_INGRESS: u8 = 1 << 1;
 pub(crate) const FLAG_IS_REVERSE: u8 = 1 << 2;
+// #2785: carry the admitting policy's per-policy `then log` selection on
+// the HA session-sync open frame so a session that fails over to the peer
+// keeps emitting the same RT_FLOW SESSION_CREATE/CLOSE syslog records after
+// takeover. Additive bits on the existing flags byte: an old peer leaves
+// them clear (0), which decodes to "no per-policy log" — bit-identical to
+// pre-#2785 behavior (rolling-upgrade safe).
+pub(crate) const FLAG_LOG_SESSION_INIT: u8 = 1 << 3;
+pub(crate) const FLAG_LOG_SESSION_CLOSE: u8 = 1 << 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DataplaneEventKind {
@@ -296,6 +304,14 @@ impl EventFrame {
         }
         if metadata.is_reverse {
             flags |= FLAG_IS_REVERSE;
+        }
+        // #2785: per-policy log selection rides the open frame so the
+        // synced session logs identically on the peer after failover.
+        if metadata.log_session_init {
+            flags |= FLAG_LOG_SESSION_INIT;
+        }
+        if metadata.log_session_close {
+            flags |= FLAG_LOG_SESSION_CLOSE;
         }
         buf[pos] = flags;
         pos += 1;

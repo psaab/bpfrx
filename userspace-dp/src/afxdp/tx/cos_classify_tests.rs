@@ -11,7 +11,7 @@ use crate::{
     ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
     CoSForwardingClassSnapshot, CoSIEEE8021ClassifierEntrySnapshot, CoSIEEE8021ClassifierSnapshot,
     CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot, CoSSchedulerSnapshot,
-    FirewallFilterSnapshot, FirewallTermSnapshot,
+    FirewallFilterSnapshot, FirewallTermSnapshot, ThreeColorPolicerSnapshot,
 };
 
 #[test]
@@ -2998,5 +2998,226 @@ fn resolve_cos_tx_selection_honors_tcp_flags_per_packet_match() {
         ack.queue_id,
         Some(1),
         "a non-SYN packet must NOT be classified into the SYN-gated EF queue (#2362 fold B)"
+    );
+}
+
+
+// #2621 regression guard: an accepted input firewall-filter whose fall-through
+// `then { forwarding-class; dscp; policer; next term; }` classify term precedes
+// a terminating `then routing-instance` (PBR) term must still apply the
+// forwarding-class queue, DSCP rewrite, AND three-color policer at egress.
+//
+// codex review-040 finding 040-07 hypothesized the split PBR/non-PBR session-
+// miss evaluators (eval.rs `evaluate_filter_ref_non_routing_counted_v4` returns
+// `FilterResult::default()` on a matched routing-instance term) DROP these
+// modifiers. That FilterResult feeds ONLY the verdict + log on the miss path
+// (`NonPbrInputFilterEval` reads action/log_match only — filter.rs:78-154);
+// the modifiers are enforced at TX time, where `resolve_cos_tx_selection` and
+// `resolve_cached_cos_tx_selection` re-walk the FULL ingress filter via the
+// TX-selection evaluators (`tx_selection.rs` / `cache_sensitive.rs`), which
+// ACCUMULATE fc/dscp/three-color-policer across every matched fall-through term
+// and only return at the terminating routing-instance term (the LAST relevant
+// term). So the classify term's modifiers ARE recovered — #2621 is a false
+// positive. This test pins that recovery on BOTH the per-packet live path and
+// the cached descriptor path; it goes RED if a future change reintroduces the
+// split (e.g. the TX-selection evaluator early-returning at the routing-instance
+// term before folding the earlier classify term's modifiers).
+fn pbr_classify_then_route_snapshot() -> ConfigSnapshot {
+    ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "reth1.0".into(),
+                ifindex: 101,
+                parent_ifindex: 5,
+                vlan_id: 0,
+                hardware_addr: "02:bf:72:00:61:01".into(),
+                filter_input_v4: "classify-then-pbr".into(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "reth0.0".into(),
+                ifindex: 202,
+                hardware_addr: "02:bf:72:00:80:08".into(),
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
+                cos_shaping_burst_bytes: 256_000,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            },
+        ],
+        filters: vec![FirewallFilterSnapshot {
+            name: "classify-then-pbr".into(),
+            family: "inet".into(),
+            terms: vec![
+                // Fall-through (`next term`) classify term ahead of the PBR
+                // term: forwarding-class + dscp rewrite + a single-rate
+                // (three-color) policer whose tiny committed rate/burst meters
+                // any real packet RED -> drop.
+                FirewallTermSnapshot {
+                    name: "classify-before-pbr".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    next_term: true,
+                    forwarding_class: "expedited-forwarding".into(),
+                    dscp_rewrite: Some(46),
+                    policer: "trickle".into(),
+                    ..Default::default()
+                },
+                // Terminating PBR term — routing-instance only, no modifiers.
+                FirewallTermSnapshot {
+                    name: "steer-blue".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: "accept".into(),
+                    routing_instance: "blue".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        three_color_policers: vec![ThreeColorPolicerSnapshot {
+            name: "trickle".into(),
+            mode: "single-rate".into(),
+            color_blind: true,
+            committed_rate_bytes_per_sec: 1,
+            committed_burst_bytes: 1,
+            peak_or_excess_rate_bytes_per_sec: 0,
+            peak_or_excess_burst_bytes: 1,
+            then_action: "discard".into(),
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![
+                CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "expedited-forwarding".into(),
+                    queue: 1,
+                },
+            ],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+            schedulers: vec![
+                CoSSchedulerSnapshot {
+                    name: "be-sched".into(),
+                    transmit_rate_bytes: 4_000_000,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 128_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+                CoSSchedulerSnapshot {
+                    name: "ef-sched".into(),
+                    transmit_rate_bytes: 6_000_000,
+                    transmit_rate_exact: false,
+                    priority: "strict-high".into(),
+                    buffer_size_bytes: 64_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+            ],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be-sched".into(),
+                    },
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "expedited-forwarding".into(),
+                        scheduler: "ef-sched".into(),
+                    },
+                ],
+            }],
+        }),
+        ..Default::default()
+    }
+}
+
+fn pbr_classify_flow_key() -> SessionKey {
+    SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 12345,
+        dst_port: 443,
+    }
+}
+
+fn pbr_classify_meta() -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        ingress_ifindex: 5,
+        ingress_vlan_id: 0,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        dscp: 0,
+        pkt_len: 1500,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn pbr_recovers_classify_modifiers_on_live_tx_selection() {
+    // #2621: live (per-packet) TX selection at the PBR-overridden egress must
+    // recover the classify term's forwarding-class queue + DSCP rewrite + the
+    // three-color policer drop that ride ahead of the routing-instance term.
+    let forwarding = build_forwarding_state(&pbr_classify_then_route_snapshot());
+    let key = pbr_classify_flow_key();
+
+    // The runtime-counted path actually meters the three-color policer (now_ns
+    // present), so its tiny committed burst forces a RED -> drop on a 1500-byte
+    // packet — proving the policer modifier is recovered through PBR.
+    let metered = resolve_cos_tx_selection_at(
+        &forwarding,
+        202,
+        pbr_classify_meta(),
+        Some(&key),
+        TermMatchExtra::default(),
+        1_000_000_000,
+    );
+    assert_eq!(
+        metered.queue_id,
+        Some(1),
+        "#2621: forwarding-class -> EF queue must survive the PBR term"
+    );
+    assert_eq!(
+        metered.dscp_rewrite,
+        Some(46),
+        "#2621: dscp rewrite must survive the PBR term"
+    );
+    assert!(
+        metered.drop,
+        "#2621: three-color policer drop must survive the PBR term"
+    );
+}
+
+#[test]
+fn pbr_recovers_classify_modifiers_on_cached_tx_selection() {
+    // #2621: the cached descriptor TX selection (flow-cache hit replay) must
+    // also recover the classify term's forwarding-class queue + DSCP rewrite
+    // ahead of the routing-instance term. (The cached path carries the policer
+    // runtimes for cache-hit metering but does not meter at build time, so this
+    // arm pins the queue + DSCP recovery; the live arm above pins the drop.)
+    let forwarding = build_forwarding_state(&pbr_classify_then_route_snapshot());
+    let key = pbr_classify_flow_key();
+
+    let cached = resolve_cached_cos_tx_selection(&forwarding, 202, pbr_classify_meta(), Some(&key));
+    assert_eq!(
+        cached.queue_id,
+        Some(1),
+        "#2621: cached forwarding-class -> EF queue must survive the PBR term"
+    );
+    assert_eq!(
+        cached.dscp_rewrite,
+        Some(46),
+        "#2621: cached dscp rewrite must survive the PBR term"
     );
 }
