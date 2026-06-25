@@ -230,6 +230,92 @@ func TestCommit_CancelledOnEngineStop(t *testing.T) {
 	}
 }
 
+// #2890: the runAction lock-held retry select must release its backoff timer
+// when stopCh fires before the backoff elapses. A plain time.After cannot be
+// stopped — its runtime timer stays armed until it fires, so on shutdown /
+// restart churn with a doubling backoff toward maxBackoff the orphaned timers
+// accumulate (a temporary memory leak). The fix uses an explicit
+// time.NewTimer + Stop().
+//
+// FAIL-ON-REVERT: this test injects a newTimerFn that records whether the
+// retry stopped the timer. It holds the configure lock so applyOnce returns
+// ErrConfigLocked and the worker enters the retry select with a long backoff,
+// then calls Close() (which closes stopCh) and asserts the stop func WAS
+// invoked. If the select is reverted to `case <-time.After(backoff)`, the seam
+// is never consulted on the stop branch (no Stop call), stopped stays false,
+// and the test fails.
+func TestRetry_TimerStoppedOnEngineStop(t *testing.T) {
+	s := newStore(t)
+	pol := &config.EventPolicy{
+		Name:         "p",
+		Events:       []string{"ping_test_failed"},
+		ThenCommands: []string{"set system host-name remediated"},
+	}
+
+	e := New(s, nil)
+	// Long backoff + deadline so the worker parks in the retry select waiting
+	// on the timer (never hits the deadline, never fires the timer) until we
+	// close stopCh.
+	e.retryInitial = time.Hour
+	e.retryMax = time.Hour
+	e.retryDeadline = time.Hour
+
+	armed := make(chan struct{}, 1) // the retry select has been entered
+	var mu sync.Mutex
+	var stopped bool
+	e.newTimerFn = func(d time.Duration) (<-chan time.Time, func() bool) {
+		// A channel that never fires: the only way out of the select is stopCh.
+		ch := make(chan time.Time)
+		select {
+		case armed <- struct{}{}:
+		default:
+		}
+		return ch, func() bool {
+			mu.Lock()
+			stopped = true
+			mu.Unlock()
+			return true
+		}
+	}
+
+	// Hold the configure lock so applyOnce -> EnterConfigure returns
+	// ErrConfigLocked, driving the worker into the lock-held retry path.
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure (hold lock): %v", err)
+	}
+	defer s.ExitConfigure()
+
+	e.Apply([]*config.EventPolicy{pol})
+	e.HandleEvent(eventFor("ping_test_failed"))
+
+	select {
+	case <-armed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker never entered the retry select (newTimerFn was not consulted)")
+	}
+
+	// Closing the engine closes stopCh; the retry select must take the stopCh
+	// branch and Stop() the timer before returning.
+	closed := make(chan struct{})
+	go func() {
+		e.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close() did not return — worker is stuck in the retry select")
+	}
+
+	mu.Lock()
+	got := stopped
+	mu.Unlock()
+	if !got {
+		t.Fatal("retry backoff timer was NOT stopped on stopCh — a plain" +
+			" time.After leaks its runtime timer until the backoff elapses (#2890)")
+	}
+}
+
 // #2139: a valid-only batch commits in full.
 func TestBatch_ValidBatchCommits(t *testing.T) {
 	s := newStore(t)
