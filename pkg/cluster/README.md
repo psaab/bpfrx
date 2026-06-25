@@ -67,7 +67,17 @@ locating any symbol below is now a matter of opening the named file.
   `InterfaceMonitorInfo`, `RethInfo`, `InterfacesInput`) —
   `status.go`.
 - `triggerGARP` (no-op/log hook today — native VRRP owns GARP),
-  plus the gratuitous-ARP burst sender — `garp.go`.
+  plus the gratuitous-ARP / unsolicited-NA burst senders — `garp.go`.
+  `SendGratuitousARPBurst` / `SendGratuitousIPv6Burst` send the first
+  frame synchronously (error returned to the caller) and the remaining
+  follow-up frames at 50ms intervals in a background goroutine. The
+  follow-up sends are the failover-convergence reliability mechanism, so
+  their send errors are NOT dropped: each failed follow-up frame bumps the
+  package-level `burstSendErrors` counter (exported via `BurstSendErrors()`
+  for observability) and is logged at Debug; a single Warn fires after the
+  burst if any frame failed. The loop never aborts on a transient error
+  (#2623). The burst remains non-blocking and the #2081/#2082 epoch +
+  dampener storm-control gates live in `pkg/vrrp`, untouched by this.
 - `SessionSync` — `sync.go`, `sync_conn.go`, `sync_bulk.go`, `runtime.go`. HA
   session replication. After #1518, `NewSessionSync`, `NewDualSessionSync`,
   and `SetRuntime` accept the narrow `clusterRuntime` (see `runtime.go`) —

@@ -1,3 +1,29 @@
+## 2026-06-25 — #2623: GARP/NDP burst follow-up sends now count + surface errors
+
+- **Timestamp**: 2026-06-25
+- **Action**: The failover GARP / unsolicited-NA bursts
+  (`SendGratuitousARPBurst` / `SendGratuitousIPv6Burst`) sent the first
+  frame synchronously (error returned) but the background follow-up
+  goroutine ignored every send error (`unix.Sendto(...) //nolint:errcheck`)
+  while the log reported `total=count` — masking a real failover-reliability
+  degradation when a transient link/qdisc/socket error appears after the
+  first frame. Fix per issue prescription: count follow-up send failures,
+  bump an exported `burstSendErrors` atomic counter (accessor
+  `BurstSendErrors()`), log per-send at Debug (per CLAUDE.md logging rules —
+  no flood) and a single Warn after the burst if any frame failed. The loop
+  never aborts on a transient error. Extracted the two goroutine bodies into
+  `runARPBurstFollowups` / `runNABurstFollowups` and added a `burstSend`
+  package-var seam so a fail-on-revert test can inject a sender that succeeds
+  once then fails. Async-burst timing, non-blocking first send, and the
+  #2081/#2082 epoch/dampener storm-control gates (in pkg/vrrp) are unchanged.
+- **File(s)**: pkg/cluster/garp.go, pkg/cluster/garp_burst_errors_test.go,
+  pkg/cluster/README.md, _Log.md
+- **Validation**: go build ./...; gofmt -l clean; go vet; go test -race
+  ./pkg/cluster/... ./pkg/vrrp/... PASS. Fail-on-revert proven: reverting the
+  ARP helper to the error-ignoring form makes burstSendErrors delta=0 and
+  TestARPBurstFollowupsCountFailures goes RED. HA code — PARENT runs
+  make test-failover before merge.
+
 ## 2026-06-25 — #2412: GRE local-origin thread eventfd wake (kill 1ms busy-poll)
 
 - **Timestamp**: 2026-06-25
