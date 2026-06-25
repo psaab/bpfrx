@@ -362,10 +362,65 @@ What increment 2 ships (the feasible, CI-testable slice):
   insecure; default hmac-sha256). UDP-first with a TCP retry on truncation
   that is derived from the CALLER's context (so a canceled/deadline'd reconcile
   pass cancels the in-flight retry), a bounded per-call timeout, and
-  conflict-policy handling (replace-owned =
-  bare add; skip-existing = no-RRset prerequisite, skip on collision;
+  conflict-policy handling (replace-owned = DHCID ownership-proving add/delete,
+  see below; skip-existing = no-RRset prerequisite, skip on collision;
   strict-fail = error on collision). The backend is STATELESS beyond its
   config — all ownership lives in the unchanged state store.
+
+  **`replace-owned` DHCID ownership (RFC 4701 / RFC 4703, #2648).** The
+  default `replace-owned` policy no longer sends a BARE RFC 2136 Insert. A bare
+  Insert is unsafe because DNS RRsets are set-like: if a third party had
+  already published the identical A/AAAA, the add succeeded idempotently, xpf
+  recorded ownership, and a later release deleted a record xpf did not create —
+  breaking the never-delete-non-owned boundary on the wire. The fix writes an
+  RFC 4701 DHCID resource record alongside the A/AAAA as an on-wire ownership
+  marker. The DHCID RDATA is `identifier-type(2B) || digest-type=SHA-256(1B) ||
+  SHA-256(client-identity || canonical-FQDN-wire-form)`, where the client
+  identity is the same stable lease identity (v4 client-id‖hwaddr, v6
+  DUID/IAID) the reconciler keys ownership on, threaded through
+  `LeaseDNSRecord.ClientID` and persisted in the ownership store as
+  `ownedRecord.ClientID` so a delete recomputes the SAME DHCID. The RFC 4701
+  §3.3 identifier-type code is derived from the lease-identity form: `0x0002`
+  (DUID) for a v6 `duid:` identity, `0x0001` (DHCPv4 client-identifier option)
+  for a `cid:` identity, `0x0000` (htype+chaddr) for the `mac:` hwaddr
+  fallback. **Residual**: the digest is computed over xpf's canonical identity
+  STRING (the parser's prefixed colon-hex form), not the raw DHCP option byte
+  stream RFC 4701 §3.5 specifies, so cross-vendor DHCID *digest* match on a
+  shared name (ISC Kea / Windows DHCP) is best-effort — but the identifier-type
+  is RFC-correct, xpf is internally consistent (same lease ⇒ same DHCID across
+  add/delete, which is all the ownership boundary needs), and a non-matching
+  foreign DHCID is treated as "owned by another party" and left untouched (the
+  SAFE direction). A byte-exact digest would require threading the un-mangled
+  DHCP option through the lease parser; deferred as an interop enhancement.
+
+  - **On add** (`sendAddOwned`): the RFC 4703 §5.3.2 two-attempt sequence —
+    prerequisites are AND-combined in one message, so "DHCID matches OR name
+    unused" cannot be a single message. Attempt A adds A/AAAA + DHCID under a
+    NAME-NOT-IN-USE prerequisite (a fresh name we may claim). On a name-exists
+    collision, Attempt B retries under a DHCID-MATCHES-OURS prerequisite (a
+    value-dependent RRset-exists prereq), which succeeds only for a name WE
+    already own. If neither holds — a third party owns the name (different or
+    absent DHCID) — the add is REFUSED: `sendAddOwned` returns the
+    `errDDNSConflictRefused` sentinel (counting the conflict). The manager's
+    `upsertLocked` classifies that sentinel as a skip (not a success, not a
+    hard failure) and records NO ownership in the state store. This is what
+    closes #2648 MAJOR-1: a refused add must NOT record phantom ownership,
+    because a later release of phantom-owned state would delete a record xpf
+    did not create — and for a **no-identity** lease the delete has no
+    DHCID-match guard, so that delete actually fires. No phantom ownership ⇒
+    no later delete.
+  - **On delete** (`sendRemoveForward`): the forward A/AAAA + DHCID are removed
+    under a DHCID-MATCHES-OURS prerequisite. If the on-wire DHCID is not ours
+    (or absent — a manual record), the prerequisite fails and the delete is
+    SKIPPED + counted. This is a SECOND, on-wire guard on top of the
+    store-driven `deleteOwnedLocked` authority, closing the narrow race where a
+    third party adopted the exact name+address between xpf's add and release.
+  - **No client identity**: when a lease carries no stable identity there is no
+    DHCID to write; the add falls back to the name-not-in-use prerequisite
+    alone (still never adopting a pre-existing third-party RR) and the delete
+    falls back to the plain exact-RR delete of the firewall's own tuple.
+  - **Reverse PTR** records carry no DHCID (RFC 4701 binds the marker to the
+    forward owner name); they remain idempotent exact adds / exact-RR deletes.
 - **Zone surface** (plan §11 Q1): the forward zone is the configured
   `Domain` ONLY when the lease's FQDN is actually under it (an out-of-domain
   `ClientFQDN` derives its own parent zone instead of being misrouted into the
