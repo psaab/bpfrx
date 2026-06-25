@@ -4,6 +4,7 @@ package networkd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -24,8 +25,11 @@ import (
 // (pkg/frr/manager.go reloadTimeout). #1794/#1800.
 const networkctlTimeout = 15 * time.Second
 
-// runNetworkctl runs `networkctl <args...>` under networkctlTimeout.
-func runNetworkctl(args ...string) error {
+// runNetworkctl runs `networkctl <args...>` under networkctlTimeout. It is a
+// package var so tests can stub the shell-out (the unit sandbox has no
+// systemd-networkd) and assert Apply's success/error contract without
+// depending on a real networkctl.
+var runNetworkctl = func(args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), networkctlTimeout)
 	defer cancel()
 	return exec.CommandContext(ctx, "networkctl", args...).Run()
@@ -107,9 +111,12 @@ func NewInDir(networkDir string) *Manager {
 // Interfaces with existing non-xpf networkd configs (e.g. management
 // interface) are skipped to avoid conflicts.
 func (m *Manager) Apply(interfaces []InterfaceConfig) error {
-	if len(interfaces) == 0 {
-		return nil
-	}
+	// An empty desired set is NOT a no-op (#2988): if the last xpf-managed
+	// interface is removed, the stale `10-xpf-*` sweep below must still run
+	// so old .network/.link/.netdev snippets do not resurrect addresses,
+	// bonds, bridges, or renames on the next reload. The expected set ends up
+	// holding only the protected-resolver's lifeline files, so everything
+	// else xpf owns is swept and a reload is requested.
 
 	// Discover interfaces with existing non-xpf networkd .network files.
 	// Only skip unmanaged interfaces that have external configs (e.g.
@@ -175,22 +182,30 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 		}
 	}
 
-	// Write .netdev, .link, and .network files
+	// Write .netdev, .link, and .network files. Write failures are
+	// aggregated (#2987): we still attempt every generated file so a single
+	// blocked path does not silently skip the rest, then fail the Apply at
+	// the end so the commit cannot succeed against stale kernel state.
+	var writeErrs []error
+	write := func(path, content string) {
+		ch, err := writeIfChanged(path, content)
+		if err != nil {
+			writeErrs = append(writeErrs, err)
+			return
+		}
+		if ch {
+			changed = true
+		}
+	}
 	for _, ifc := range interfaces {
 		// .netdev file: for bond/LAG devices and bridge devices
 		if ifc.IsBond {
 			netdevPath := filepath.Join(m.networkDir, filePrefix+ifc.Name+".netdev")
-			netdevContent := m.generateNetdev(ifc)
-			if writeIfChanged(netdevPath, netdevContent) {
-				changed = true
-			}
+			write(netdevPath, m.generateNetdev(ifc))
 		}
 		if ifc.IsBridge {
 			netdevPath := filepath.Join(m.networkDir, filePrefix+ifc.Name+".netdev")
-			netdevContent := m.generateBridgeNetdev(ifc)
-			if writeIfChanged(netdevPath, netdevContent) {
-				changed = true
-			}
+			write(netdevPath, m.generateBridgeNetdev(ifc))
 		}
 
 		// .link file: only for managed physical interfaces with a MAC address.
@@ -199,18 +214,26 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 		// override the FPC-aware naming (e.g. ge-7-0-X on node1).
 		if ifc.MACAddress != "" && !ifc.Unmanaged {
 			linkPath := filepath.Join(m.networkDir, filePrefix+ifc.Name+".link")
-			linkContent := m.generateLink(ifc)
-			if writeIfChanged(linkPath, linkContent) {
-				changed = true
-			}
+			write(linkPath, m.generateLink(ifc))
 		}
 
 		// .network file: for all interfaces
 		networkPath := filepath.Join(m.networkDir, filePrefix+ifc.Name+".network")
-		networkContent := m.generateNetwork(ifc)
-		if writeIfChanged(networkPath, networkContent) {
-			changed = true
+		write(networkPath, m.generateNetwork(ifc))
+	}
+
+	if len(writeErrs) > 0 {
+		// Fail the commit (#2987). Still reload if some files changed so the
+		// kernel reflects whatever did get written, but surface the error.
+		if changed {
+			if err := runNetworkctl("reload"); err != nil {
+				writeErrs = append(writeErrs, fmt.Errorf("networkctl reload: %w", err))
+			} else {
+				restoreSlowPathRPFilter()
+			}
 		}
+		return fmt.Errorf("networkd: %d generated file(s) failed to write: %w",
+			len(writeErrs), errors.Join(writeErrs...))
 	}
 
 	if changed {
@@ -524,9 +547,27 @@ func (m *Manager) generateNetwork(ifc InterfaceConfig) string {
 		b.WriteString("IPv6DuplicateAddressDetection=0\n")
 	}
 
-	// Only write Address= lines for static (non-DHCP, non-VLAN-parent) interfaces
-	if !ifc.IsVLANParent && !ifc.DHCPv4 && !ifc.DHCPv6 {
-		addrs := orderAddresses(ifc.Addresses, ifc.PrimaryAddress)
+	// Write static Address= lines for VLAN-parent-exempt interfaces, gating
+	// each family independently on its own DHCP flag (#2986). DHCP is a
+	// per-family property on the wire (DHCPv4 vs DHCPv6/PD), so a static
+	// address must be suppressed ONLY for the family whose DHCP client owns
+	// it — not the opposite family. The common WAN shape DHCPv4 + static
+	// IPv6 (and the mirror static IPv4 + DHCPv6) previously dropped the
+	// static address of the non-DHCP family because the gate keyed on
+	// whole-interface (!DHCPv4 && !DHCPv6).
+	if !ifc.IsVLANParent {
+		ordered := orderAddresses(ifc.Addresses, ifc.PrimaryAddress)
+		addrs := make([]string, 0, len(ordered))
+		for _, addr := range ordered {
+			if addressIsIPv6(addr) {
+				if ifc.DHCPv6 {
+					continue
+				}
+			} else if ifc.DHCPv4 {
+				continue
+			}
+			addrs = append(addrs, addr)
+		}
 		if ifc.PreferredAddress != "" {
 			// Use [Address] sections so we can set PreferredLifetime
 			for _, addr := range addrs {
@@ -575,6 +616,15 @@ func junosSpeedToNetworkd(speed string) string {
 	}
 }
 
+// addressIsIPv6 reports whether a CIDR address string (e.g.
+// "2001:db8::1/64" or "10.0.1.10/24") is IPv6. An IPv6 literal always
+// contains a colon and an IPv4 literal never does, so a colon test
+// classifies the family without a full netip parse — keeping the static
+// render allocation-free and tolerant of zone-id suffixes.
+func addressIsIPv6(addr string) bool {
+	return strings.Contains(addr, ":")
+}
+
 // orderAddresses returns a copy of addrs with primaryAddr first (if set and present).
 func orderAddresses(addrs []string, primaryAddr string) []string {
 	if primaryAddr == "" || len(addrs) <= 1 {
@@ -596,11 +646,18 @@ func orderAddresses(addrs []string, primaryAddr string) []string {
 }
 
 // writeIfChanged writes content to path only if the content differs from
-// the existing file. Returns true if the file was written.
-func writeIfChanged(path, content string) bool {
+// the existing file. It returns (changed, err): changed is true when the
+// file was actually written, and err is non-nil when the write failed.
+//
+// A write failure (read-only /etc, full disk, EACCES, blocked path) MUST
+// propagate so Apply can fail the commit (#2987) — fail-closed posture.
+// Previously the error was logged and swallowed as changed=false, which a
+// caller could not distinguish from "nothing changed", so the commit
+// succeeded while the kernel kept stale link/address/VRF state.
+func writeIfChanged(path, content string) (bool, error) {
 	existing, err := os.ReadFile(path)
 	if err == nil && string(existing) == content {
-		return false
+		return false, nil
 	}
 
 	// AtomicGeneratedConfig (#1894): .link/.network snippets are
@@ -609,9 +666,9 @@ func writeIfChanged(path, content string) bool {
 	// reconcile).
 	if err := fsatomic.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 		slog.Warn("failed to write networkd file", "path", path, "err", err)
-		return false
+		return false, fmt.Errorf("write %s: %w", path, err)
 	}
 
 	slog.Info("wrote networkd file", "path", path)
-	return true
+	return true, nil
 }
