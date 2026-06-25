@@ -17410,6 +17410,22 @@ top.
   pkg/ra/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2908 — anchor frr writeManagedSection end-marker lookup after
+  the begin marker so a stale end-marker BEFORE the begin can't yield
+  end<start and duplicate config (agy-review-053 053-03). Was
+  `strings.Index(content, markerEnd)` from index 0; now searches
+  `content[start+len(markerBegin):]` and maps the relative index back to
+  absolute, keeping the end>=start invariant. Degenerate cases preserved:
+  begin+no-end-after-it still falls to the #1646 orphaned-begin discard-to-EOF
+  branch; both-missing still appends fresh. Distinct from #1646 (orphaned
+  begin). Added fail-on-revert test TestWriteManagedSection_StaleEndMarkerBeforeBegin
+  (stale end before live begin with operator config interleaved → exactly one
+  managed begin, operator config on both sides preserved, route replaced; goes
+  RED with the from-0 lookup, showing 2 begin markers after the first write
+  and 3 + duplicated operator config after the second). Gates: go build ./...,
+  gofmt -l clean, go vet ./pkg/frr/..., go test ./pkg/frr/... PASS.
+  **File(s)**: pkg/frr/manager.go, pkg/frr/frr_test.go, pkg/frr/README.md,
+  _Log.md
   **Action**: #2868 — eventengine remediation commit now runs under a
   cancellable engine-lifetime context instead of context.Background(). New()
   builds lifeCtx/lifeCancel (context.WithCancel(Background)); Close() cancels

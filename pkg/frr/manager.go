@@ -530,10 +530,24 @@ func (m *Manager) writeManagedSection(section string) error {
 	// orphaned begin — deleting everything between them, which may include
 	// unrelated FRR config the operator appended. So we treat a begin with no
 	// end as a corrupt tail and discard it to EOF.
+	//
+	// The end-marker search is anchored AFTER the begin marker (#2908). A
+	// stale end-marker positioned *before* the begin marker (an operator
+	// hand-edit, an interleaved partial copy, or external tooling) must not
+	// be matched: an unanchored strings.Index(content, markerEnd) would
+	// return end < start, and the strip content[:start] + content[end:] would
+	// then DUPLICATE the text between end and start while leaving the live
+	// begin marker in place — corrupting the file with two begin markers and
+	// breaking FRR reload. Anchoring the search keeps the end >= start
+	// invariant, so the slice can never duplicate. (This is distinct from the
+	// #1646 orphaned-begin case handled by the else branch below.)
 	content := string(existing)
 	if start := strings.Index(content, markerBegin); start >= 0 {
-		if end := strings.Index(content, markerEnd); end >= 0 {
-			end += len(markerEnd)
+		// Search for the end marker strictly after the begin marker, then map
+		// the relative index back to an absolute offset.
+		searchFrom := start + len(markerBegin)
+		if rel := strings.Index(content[searchFrom:], markerEnd); rel >= 0 {
+			end := searchFrom + rel + len(markerEnd)
 			// Also consume the trailing newline
 			if end < len(content) && content[end] == '\n' {
 				end++
