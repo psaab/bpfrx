@@ -23,6 +23,31 @@
 - **File(s)**: [Edit] pkg/config/compiler_protocols.go,
   pkg/config/protocols_multileaf_2587_test.go, docs/config-schema.md,
   _Log.md.
+## 2026-06-24 — #2517: GRE MSS clamp survives a transient egress-map miss
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed a transient silent loss of a configured GRE outbound TCP
+  MSS clamp and unified it with the WireGuard path. `native_gre_inner_mtu`
+  resolved the outer/transport MTU with its own egress-lookup chain ending in
+  `unwrap_or_default()` → 0 on an egress-map miss, which made
+  `native_gre_tcp_mss` return 0 and silently DISABLE the clamp during
+  re-reconciliation / interface bringup (until the next reconcile re-populated
+  the egress map). The sibling WG MSS clamp resolves the SAME chain via
+  `tunnel_outer_mtu` (the #2300 SSOT) with `.filter(|m| *m > 0)
+  .unwrap_or(1500)`. Routed `native_gre_inner_mtu`'s outer-MTU resolution
+  through `tunnel_outer_mtu` so both tunnel MSS paths read ONE resolver and
+  cannot drift: a GRE egress miss now falls back to the 1500 underlay MTU and
+  the GRE overhead is still subtracted after, so the clamp stays live. Dropped
+  the now-redundant `.cloned()` and the dead `if transport_mtu == 0` guard
+  (`tunnel_outer_mtu` never returns 0). Added a fail-on-revert test
+  (native_gre_inner_mtu_falls_back_to_1500_on_egress_miss — clears egress,
+  asserts inner MTU 1456 + MSS 1416, not 0) proven to turn RED under the old
+  `unwrap_or_default()`, plus a no-regression test
+  (native_gre_inner_mtu_uses_real_egress_mtu_when_present). Gates: cargo build
+  --release clean (no new forwarding/mod.rs warnings); filtered tests (gre /
+  mss / tunnel / forwarding) green.
+- **File(s)**: [Edit] userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/tunnel_tests.rs, docs/wireguard-interop.md, _Log.md.
 
 ## 2026-06-24 — #2466: flow-cache RG epoch index fallback for out-of-range RG IDs
 
