@@ -6,6 +6,13 @@
 // and (since-deleted) `wg/outer.rs`. Single source of truth for the
 // byte offsets / network-byte-order writes.
 //
+// Issue #2844 — `write_eth_header_slice` is also the writer for the
+// NAT64 frame builders (`crate::nat64::build_nat64_v6_to_v4_frame` /
+// `build_nat64_v4_to_v6_frame`), which previously carried a private
+// hardcoded copy. NAT64 is the one consumer outside `crate::afxdp`, so
+// `write_eth_header_slice` is `pub(crate)` (re-exported from
+// `afxdp/mod.rs`) while the other writers stay `pub(in crate::afxdp)`.
+//
 // Hot-path discipline:
 //   - All builders take `&mut [u8]` — zero allocations.
 //   - All builders are `#[inline]` so the optimizer folds the
@@ -173,8 +180,12 @@ pub(in crate::afxdp) fn write_eth_header_tagged(
 /// with). Existing call sites (gre.rs, icmp_embed.rs,
 /// tx/tcp_segmentation.rs, frame/tcp_segmentation.rs) use this
 /// slice shape.
+// #2844: `pub(crate)` (not `pub(in crate::afxdp)`) so the top-level
+// `crate::nat64` module can reach this single source-of-truth writer
+// via the `pub(crate)` re-export in `afxdp/mod.rs`. NAT64 lives outside
+// `crate::afxdp` and previously carried a private hardcoded copy.
 #[inline]
-pub(in crate::afxdp) fn write_eth_header_slice(
+pub(crate) fn write_eth_header_slice(
     buf: &mut [u8],
     dst: [u8; 6],
     src: [u8; 6],

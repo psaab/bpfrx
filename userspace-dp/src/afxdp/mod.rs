@@ -198,6 +198,15 @@ use self::tx::dispatch::*;
 use self::tx::*;
 use self::types::*;
 pub(crate) use self::types::{ForwardingDisposition, ForwardingResolution, NeighborEntry};
+// #2844: expose the SSOT in-place Ethernet-header writer to the
+// top-level `crate::nat64` module. NAT64 lives outside `crate::afxdp`
+// (it is `mod nat64;` at the crate root), so it cannot reach the
+// `pub(in crate::afxdp)` writer in `frame::headers` directly. This
+// `pub(crate)` re-export lets the NAT64 frame builders use the one
+// shared writer instead of a private hardcoded copy, so any future
+// VLAN/TPID/PCP/DEI/ethertype change in the shared module propagates
+// to NAT64 automatically.
+pub(crate) use self::frame::write_eth_header_slice;
 use self::umem::*;
 
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;

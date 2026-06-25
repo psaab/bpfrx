@@ -314,3 +314,105 @@ func TestEngineNoBackendNoPhantomOwnership(t *testing.T) {
 		t.Fatalf("a no-backend scope must re-attempt every cycle; got SkippedNoBackend=%d", st2.SkippedNoBackend)
 	}
 }
+
+// TestStatusViewsSurfacesUnpublishedScopes is the #2843 fail-on-revert proof: a
+// CONFIGURED scope that has never successfully published — because its provider
+// resolved to the no-op backend (errSurfaceANoBackend) — MUST appear in
+// StatusViews with the unpublished state and its no-backend reason, NOT be
+// silently omitted. Reverting StatusViews to iterate the ownership records only
+// (the pre-#2843 behavior) turns this RED: the no-backend scope has no ownership
+// record, so it would not appear at all.
+func TestStatusViewsSurfacesUnpublishedScopes(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	m := newHTTPEngineManager(t, func() time.Time { return now })
+
+	// cloudflare with NO credentials → no-op backend → never publishes.
+	noBackend := SurfaceAScope{
+		Key:      ScopeKey{Family: FamilyV4, Interface: "ge-0-0-2", Unit: 50, PolicyID: "cf"},
+		FQDN:     "broken.example.net",
+		TTL:      300,
+		Source:   AddressSourceInterface,
+		Provider: &config.DDNSProvider{Name: "cf", Backend: "cloudflare"}, // missing creds
+	}
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{noBackend}, fixedObserver("93.184.216.34"), nil, nil); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// The status MUST contain the configured-but-unpublished scope even though it
+	// owns no record.
+	views := m.StatusViews([]SurfaceAScope{noBackend})
+	if len(views) != 1 {
+		t.Fatalf("a configured scope with no ownership record must still appear; got %d views: %+v", len(views), views)
+	}
+	v := views[0]
+	if v.FQDN != "broken.example.net" || v.Provider != "cf" || v.Interface != "ge-0-0-2" {
+		t.Fatalf("unpublished status view identity mismatch: %+v", v)
+	}
+	if v.State != SurfaceAStateUnpublished {
+		t.Fatalf("a no-backend scope must report state %q, got %q", SurfaceAStateUnpublished, v.State)
+	}
+	if v.Published != "" {
+		t.Fatalf("a never-published scope must show no published address, got %q", v.Published)
+	}
+	if v.LastError == "" {
+		t.Fatalf("an unpublished (no-backend) scope must carry a reason in LastError")
+	}
+}
+
+// TestStatusViewsSurfacesPendingAndPublished proves the other configured-scope
+// states: a scope still waiting on an address observation is `pending`, and a
+// scope that successfully published is `published`. Mixed with a no-longer-
+// configured owned record (withdraw-pending), it confirms StatusViews is the
+// union of configured scopes + orphaned ownership, stably ordered.
+func TestStatusViewsSurfacesPendingAndPublished(t *testing.T) {
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
+
+	published := surfaceAScope("aaa.example.net", FamilyV4, 0)
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{published}, fixedObserver("203.0.113.5"), nil, nil); err != nil {
+		t.Fatalf("Reconcile published: %v", err)
+	}
+
+	// A second, distinct configured scope whose address cannot be observed this
+	// cycle (interface still coming up) → no ownership, no error → pending.
+	pending := SurfaceAScope{
+		Key:    ScopeKey{Family: FamilyV4, Interface: "ge-0-0-3", Unit: 0, PolicyID: "corp-2136"},
+		FQDN:   "bbb.example.net",
+		TTL:    300,
+		Source: AddressSourceDHCP,
+	}
+	noObserve := func(SurfaceAScope) (AddressObservation, bool) { return AddressObservation{}, false }
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{published, pending}, noObserve, nil, nil); err != nil {
+		t.Fatalf("Reconcile pending: %v", err)
+	}
+
+	views := m.StatusViews([]SurfaceAScope{published, pending})
+	byFQDN := map[string]SurfaceAStatusView{}
+	for _, v := range views {
+		byFQDN[v.FQDN] = v
+	}
+	if got := byFQDN["aaa.example.net"].State; got != SurfaceAStatePublished {
+		t.Fatalf("published scope state = %q, want %q", got, SurfaceAStatePublished)
+	}
+	if got := byFQDN["bbb.example.net"].State; got != SurfaceAStatePending {
+		t.Fatalf("never-observed scope state = %q, want %q", got, SurfaceAStatePending)
+	}
+
+	// Drop the published scope from config → its owned record is now orphaned.
+	// StatusViews (called with only the pending scope configured) must surface the
+	// orphan as withdraw-pending, not omit it.
+	orphanViews := m.StatusViews([]SurfaceAScope{pending})
+	var sawOrphan bool
+	for _, v := range orphanViews {
+		if v.FQDN == "aaa.example.net" {
+			sawOrphan = true
+			if v.State != SurfaceAStateWithdrawPending {
+				t.Fatalf("orphaned ownership state = %q, want %q", v.State, SurfaceAStateWithdrawPending)
+			}
+		}
+	}
+	if !sawOrphan {
+		t.Fatalf("an owned record for a no-longer-configured scope must appear as withdraw-pending; views=%+v", orphanViews)
+	}
+}

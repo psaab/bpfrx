@@ -149,6 +149,44 @@ func TestParseAllowlist(t *testing.T) {
 	}
 }
 
+// TestParseAllowlistChecked is the #2839 fail-on-revert gate: a malformed
+// allowlist token must be RECOVERABLE (named) instead of silently dropped, while
+// every valid token is still retained and a clean list reports no malformed
+// tokens. Goes RED if ParseAllowlistChecked reverts to silently discarding bad
+// tokens (the old ParseAllowlist behaviour that shrank the bogus-IP safety gate).
+func TestParseAllowlistChecked(t *testing.T) {
+	// Mixed list: 3 valid + 2 malformed (an operator typo + a bare word).
+	list, bad := ParseAllowlistChecked("1.1.1.1, 8.8.8.8x garbage 8.8.8.8 2606:4700::1")
+	if len(list) != 3 {
+		t.Fatalf("expected 3 valid addresses retained, got %d (%v)", len(list), list)
+	}
+	wantValid := []string{"1.1.1.1", "8.8.8.8", "2606:4700::1"}
+	for i, w := range wantValid {
+		if list[i].String() != w {
+			t.Fatalf("valid[%d] = %q, want %q (all valid tokens must be retained)", i, list[i].String(), w)
+		}
+	}
+	if len(bad) != 2 {
+		t.Fatalf("expected 2 malformed tokens surfaced, got %d (%v)", len(bad), bad)
+	}
+	// The offending tokens must be NAMED (not silently dropped) so the operator
+	// can find the typo.
+	if bad[0] != "8.8.8.8x" || bad[1] != "garbage" {
+		t.Fatalf("malformed tokens = %v, want [8.8.8.8x garbage]", bad)
+	}
+
+	// A clean allowlist surfaces no malformed tokens.
+	clean, none := ParseAllowlistChecked("1.1.1.1, 2606:4700::1")
+	if len(clean) != 2 || len(none) != 0 {
+		t.Fatalf("clean allowlist: got %d valid / %d malformed, want 2 / 0 (%v, %v)", len(clean), len(none), clean, none)
+	}
+
+	// Empty / whitespace input: no addresses, no malformed tokens.
+	if l, b := ParseAllowlistChecked("   "); l != nil || b != nil {
+		t.Fatalf("empty allowlist: got %v / %v, want nil / nil", l, b)
+	}
+}
+
 // TestValidateCheckIPURL is the #2773 validator gate: http(s) scheme + a host.
 // validateCheckIPURL was dead code (no callers) before #2773 wired it into
 // CheckIP and (mirrored) into the commit-time warning.
