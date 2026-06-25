@@ -16832,3 +16832,42 @@ top.
   clean; go test -race ./pkg/ra/ -count=3 ok.
   **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/serialize_test.go,
   pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2850 — add VRRP `preempt hold-time <seconds>` (vSRX parity).
+  Without it a higher-priority node reclaims mastership from a still-live
+  lower-priority master IMMEDIATELY on recovery — before BGP/OSPF converge —
+  blackholing every failback. Added Junos `vrrp-group <id> preempt
+  { hold-time <s>; }`: new nested typed leaf in `setSchema`
+  (`ValidateInteger(1, 3600)`), parsed in BOTH config shapes (braced child
+  + flat-set `preempt hold-time <n>` Keys-run) into
+  `VRRPGroup.PreemptHoldTime`, plumbed to `vrrp.Instance.PreemptHoldTime`.
+  State machine: `stepBackup` now takes a `preemptHoldTimer`. In the
+  `masterDownTimer.C` case, when a hold-time is set AND
+  `preemptingLiveLowerMaster()` (live, recent, strictly-lower master — the
+  same #2082 snapshot math), the promotion is DEFERRED by arming the hold
+  timer instead of `becomeMaster()`; the new `preemptHoldTimer.C` case
+  promotes when it elapses. Dead/stale master = immediate (not held); a
+  priority-0 resign arms a one-shot `skipNextPreemptHold` so planned
+  failover stays zero-delay; a returning >= master or a forced/coordinated
+  `preemptNowCh` stop-drains the hold. Bare `preempt` (PreemptHoldTime 0) is
+  immediate — today's behavior, unchanged. Composes cleanly with the #2082
+  sync-hold preempt gate (separate path: `preemptNowCh` shortcut vs the
+  `masterDownTimer` election the hold-time wraps).
+  FAIL-ON-REVERT: copied `instance.go` aside, replaced the hold-arming
+  branch with `_ = skipHold` →
+  `TestHoldTime_PreemptLiveLowerMasterDeferred` FAILs (state=MASTER, want
+  BACKUP); restored, green. Config-side FAIL-ON-REVERT: dropping the
+  hold-time parse leaves `PreemptHoldTime` 0 → the FlatSet/Hierarchical
+  tests fail.
+  test-failover relevance: YES (HA / VRRP state machine) — PARENT runs
+  `make test-failover` before merge.
+  Gates: go build ./... clean; gofmt -l clean (my files); go vet
+  ./pkg/vrrp/... ./pkg/config/... clean; go test -race ./pkg/vrrp/...
+  ./pkg/config/... ok.
+  **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/vrrp.go, pkg/vrrp/manager.go,
+  pkg/vrrp/instance_preempt_gate_test.go,
+  pkg/vrrp/instance_preempt_holdtime_test.go, pkg/config/types_interfaces.go,
+  pkg/config/schema_interfaces.go, pkg/config/compiler_interfaces.go,
+  pkg/config/vrrp_preempt_holdtime_test.go, docs/config-schema.md,
+  pkg/vrrp/README.md, _Log.md

@@ -154,6 +154,43 @@ This is the package that drives chassis-cluster failover.
   governs the shortcut: a denied gate never stops `masterDownTimer`, so the
   normal RFC election still promotes the node when the real master dies.
 
+## Preempt hold-time (#2850)
+
+`vrrp-group <id> preempt { hold-time <seconds>; }` (Junos parity) delays a
+higher-priority node reclaiming mastership from a still-live lower-priority
+master, so dynamic routing (BGP/OSPF) converges before failback instead of
+blackholing on takeover. Compiled to `Instance.PreemptHoldTime` (seconds);
+0/unset = immediate preemption (the prior behavior, unchanged).
+
+- **Where it applies** — ONLY to preemption of a *live* lower-priority
+  master. The existing takeover path runs through `masterDownTimer` expiry
+  (a preempt-enabled backup hearing a LOWER advert ignores it and lets the
+  timer fire — see Interface tracking below). In `stepBackup`'s
+  `masterDownTimer.C` case, when a hold-time is configured AND
+  `preemptingLiveLowerMaster()` is true (a non-zero master advert was seen
+  within `masterDownInterval` with priority strictly below our effective
+  priority — the same snapshot math as the #2082 gate), the promotion is
+  DEFERRED: a `preemptHoldTimer` is armed for hold-time seconds instead of
+  calling `becomeMaster()`. When `preemptHoldTimer.C` fires, the node
+  promotes.
+- **What is NOT delayed** — a genuinely dead/silent master (no recent
+  advert, or last seen beyond `masterDownInterval`) is takeover, not
+  preemption — there is nothing forwarding to blackhole, so it promotes
+  immediately. A graceful priority-0 resignation arms a one-shot
+  `skipNextPreemptHold` in `handleBackupRx` so the imminent 1 ms
+  `masterDownTimer` expiry promotes immediately (planned failover stays
+  zero-delay).
+- **Cancellation** — while the hold is armed, a returning >= -priority
+  master advert (`handleBackupRx`) resets `masterDownTimer` and
+  stop-drains the hold (no longer a lower master to preempt). A
+  coordinated/forced `preemptNowCh` promotion (#2082 / `ForceRGMaster`)
+  also stop-drains the pending hold. A persisting lower-priority master
+  leaves the armed hold running.
+- **Scope** — interface-level `CollectInstances` VRRP groups. The RETH
+  cluster path (`CollectRethInstances`) is driven by chassis-cluster RG
+  preempt and is not wired to interface `preempt hold-time` (out of scope
+  for #2850).
+
 ## Interface tracking (#1814)
 
 Single-interface tracking per VRRP group:

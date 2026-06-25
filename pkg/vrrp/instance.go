@@ -56,7 +56,13 @@ type vrrpInstance struct {
 	cfg              Instance
 	desiredPreempt   bool // configured preempt value (may differ from cfg.Preempt during sync hold)
 	forcePreemptOnce bool // one-shot preempt override from ForceRGMaster (auto-cleared after use)
-	trackDown        bool // tracked interface (cfg.TrackInterface) is down (#1814); guarded by mu
+	// skipNextPreemptHold makes the next masterDownTimer expiry promote
+	// immediately, bypassing the preempt hold-time (#2850). Set when the
+	// master resigns (priority-0) so a graceful, planned failover is never
+	// delayed by the hold-time — there is no live master to blackhole.
+	// One-shot: cleared by the masterDownTimer.C handler. Guarded by mu.
+	skipNextPreemptHold bool
+	trackDown           bool // tracked interface (cfg.TrackInterface) is down (#1814); guarded by mu
 
 	// Last-seen master advertisement (#2082). Recorded by handleBackupRx /
 	// handleMasterRx for every non-zero-priority advert from a peer, and read
@@ -392,6 +398,7 @@ func (vi *vrrpInstance) updateConfig(cfg Instance) {
 	vi.mu.Lock()
 	vi.cfg.Priority = cfg.Priority
 	vi.cfg.Preempt = cfg.Preempt
+	vi.cfg.PreemptHoldTime = cfg.PreemptHoldTime
 	vi.cfg.TrackInterface = cfg.TrackInterface
 	vi.cfg.TrackPriorityCost = cfg.TrackPriorityCost
 	vi.desiredPreempt = cfg.Preempt
@@ -553,22 +560,133 @@ func (vi *vrrpInstance) masterDownInterval() time.Duration {
 	return 3*advert + skew
 }
 
+// preemptHoldDuration returns the configured preempt hold-time as a Duration,
+// or 0 when no hold-time is configured (immediate preemption — today's
+// behavior). cfg.PreemptHoldTime is in seconds (Junos `preempt hold-time`).
+func (vi *vrrpInstance) preemptHoldDuration() time.Duration {
+	vi.mu.RLock()
+	defer vi.mu.RUnlock()
+	if vi.cfg.PreemptHoldTime <= 0 {
+		return 0
+	}
+	return time.Duration(vi.cfg.PreemptHoldTime) * time.Second
+}
+
+// preemptingLiveLowerMaster reports whether the masterDownTimer expiry that is
+// firing right now represents PREEMPTION of a still-live lower-priority master
+// (as opposed to takeover of a dead/silent master). It returns true iff a
+// non-zero-priority master advert was observed within the master-down horizon
+// AND its last advertised priority is strictly below our effective priority.
+//
+// This is the ONLY case the preempt hold-time delays (#2850): RFC 5798 / Junos
+// `preempt hold-time` defers a higher-priority node reclaiming mastership from
+// a working lower-priority master until routing converges. A genuinely dead
+// master (no recent advert) is NOT delayed — there is nothing forwarding to
+// blackhole, so takeover stays immediate.
+//
+// Reuses the same lastMaster* snapshot + effective-priority + master-down
+// staleness math as shouldPreemptObservedMaster (#2082); kept as a sibling so
+// the two preempt paths agree on what "a live lower master" means.
+func (vi *vrrpInstance) preemptingLiveLowerMaster() bool {
+	vi.mu.RLock()
+	priority := vi.cfg.Priority
+	trackDown := vi.trackDown
+	trackIface := vi.cfg.TrackInterface
+	trackCost := vi.cfg.TrackPriorityCost
+	advertMS := vi.cfg.AdvertiseInterval
+	lastMasterPriority := vi.lastMasterPriority
+	lastMasterSeen := vi.lastMasterSeen
+	vi.mu.RUnlock()
+
+	effective := priority
+	if priority != 0 && priority != 255 && trackDown && trackIface != "" {
+		effective -= trackCost
+		if effective < 1 {
+			effective = 1
+		} else if effective > 254 {
+			effective = 254
+		}
+	}
+
+	advert := time.Duration(advertMS) * time.Millisecond
+	if advertMS <= 0 {
+		advert = 1000 * time.Millisecond
+	}
+	skew := time.Duration(256-effective) * advert / 256
+	masterDown := 3*advert + skew
+
+	// No recent live master → this is a dead-master takeover, not preemption.
+	if lastMasterSeen.IsZero() || time.Since(lastMasterSeen) > masterDown {
+		return false
+	}
+	// A live master was observed — only its STRICTLY lower priority is a
+	// preemption we should hold.
+	return effective > lastMasterPriority
+}
+
+// stopAndDrainTimer stops t and drains a pending fire from its channel so a
+// subsequent Reset arms a clean interval. Safe on an already-stopped or
+// already-drained timer.
+func stopAndDrainTimer(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+}
+
 // stepBackup runs one iteration of the StateBackup select. It is called by the
 // run loop AND directly by unit tests (the run() preamble unconditionally
 // spawns a receiver goroutine that nil-derefs vi.conn on a test instance, so
 // tests must not call run() — they drive this seam instead). It returns true
 // when the instance has been told to stop (the caller's run loop should
 // return).
-func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer *time.Timer) (stop bool) {
+//
+// preemptHoldTimer carries the optional `preempt hold-time` delay (#2850): when
+// the masterDownTimer fires while a live lower-priority master is still
+// present and a hold-time is configured, the promotion is deferred by arming
+// preemptHoldTimer instead of becoming MASTER immediately. handleBackupRx
+// cancels the armed hold if a >= -priority master returns; a fresh
+// lower-priority advert re-arms the masterDownTimer so the hold restarts when
+// it next expires.
+func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer, preemptHoldTimer *time.Timer) (stop bool) {
 	select {
 	case <-vi.stopCh:
 		return true
 	case pkt := <-vi.rxCh:
-		vi.handleBackupRx(pkt, masterDownTimer)
+		vi.handleBackupRx(pkt, masterDownTimer, preemptHoldTimer)
 	case <-masterDownTimer.C:
-		// Master timed out — become Master.
+		// Master timed out. If this is preemption of a still-live
+		// lower-priority master AND a preempt hold-time is configured,
+		// defer the takeover by arming the hold timer rather than
+		// becoming MASTER now (#2850). Otherwise (no hold-time, the
+		// master is genuinely gone, or the one-shot resign bypass is
+		// set) become MASTER immediately — today's behavior, unchanged.
+		vi.mu.Lock()
+		skipHold := vi.skipNextPreemptHold
+		vi.skipNextPreemptHold = false
+		vi.mu.Unlock()
+		if hold := vi.preemptHoldDuration(); !skipHold && hold > 0 && vi.preemptingLiveLowerMaster() {
+			slog.Info("vrrp: preempt deferred by hold-time",
+				"key", vi.key(), "hold", hold)
+			stopAndDrainTimer(preemptHoldTimer)
+			preemptHoldTimer.Reset(hold)
+			return false
+		}
 		vi.becomeMaster()
 		advertTimer.Reset(vi.advertInterval())
+	case <-preemptHoldTimer.C:
+		// The preempt hold-time elapsed (#2850). A >= -priority master
+		// returning during the hold would have re-armed masterDownTimer
+		// and stopped this timer (handleBackupRx), so reaching here means
+		// the live lower master is still present (or has gone silent in
+		// the interim) — takeover is now due.
+		slog.Info("vrrp: preempt hold-time elapsed, taking over",
+			"key", vi.key())
+		vi.becomeMaster()
+		advertTimer.Reset(vi.advertInterval())
+		masterDownTimer.Stop()
 	case <-vi.preemptNowCh:
 		// Coordinated preemption from ReleaseSyncHold or forced transition
 		// from ForceRGMaster. The forcePreemptOnce flag allows a one-shot
@@ -588,6 +706,9 @@ func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer *time.Timer) (st
 			vi.becomeMaster()
 			advertTimer.Reset(vi.advertInterval())
 			masterDownTimer.Stop()
+			// A coordinated/forced promotion supersedes any pending
+			// preempt hold-time countdown (#2850).
+			stopAndDrainTimer(preemptHoldTimer)
 		}
 	}
 	return false
@@ -650,12 +771,20 @@ func (vi *vrrpInstance) run() {
 	advertTimer.Stop()
 	defer advertTimer.Stop()
 
+	// Preempt hold-time timer (#2850): armed only when the masterDownTimer
+	// fires while a live lower-priority master is present and a hold-time is
+	// configured. Idle otherwise.
+	preemptHoldTimer := time.NewTimer(0)
+	preemptHoldTimer.Stop()
+	stopAndDrainTimer(preemptHoldTimer)
+	defer preemptHoldTimer.Stop()
+
 	for {
 		state := vi.getState()
 
 		switch state {
 		case StateBackup:
-			if vi.stepBackup(masterDownTimer, advertTimer) {
+			if vi.stepBackup(masterDownTimer, advertTimer, preemptHoldTimer) {
 				return
 			}
 
@@ -1104,25 +1233,46 @@ func (vi *vrrpInstance) recordMasterAdvert(pkt *VRRPPacket) {
 }
 
 // handleBackupRx processes a received advertisement while in Backup state.
-func (vi *vrrpInstance) handleBackupRx(pkt *VRRPPacket, masterDownTimer *time.Timer) {
+//
+// preemptHoldTimer is the optional `preempt hold-time` countdown (#2850). A
+// resigning (priority-0) master or a returning >= -priority master cancels any
+// in-flight hold: the first because takeover becomes immediate, the second
+// because there is no longer a lower-priority master to preempt. A persisting
+// lower-priority master leaves an armed hold running (the masterDownTimer it
+// was armed from is intentionally not reset on a lower advert).
+func (vi *vrrpInstance) handleBackupRx(pkt *VRRPPacket, masterDownTimer, preemptHoldTimer *time.Timer) {
 	vi.recordMasterAdvert(pkt)
 	pri := vi.getPriority()
 	if pkt.Priority == 0 {
 		// Master is explicitly resigning — become Master immediately.
 		// RFC 5798 says use skew timer, but with only 2 HA nodes there's
 		// no contention risk, and immediate transition gives zero-delay
-		// planned failover (systemctl stop on primary).
+		// planned failover (systemctl stop on primary). A pending preempt
+		// hold-time is irrelevant once the master has resigned: there is
+		// no live master left to blackhole. Cancel any in-flight hold and
+		// arm a one-shot bypass so the imminent 1ms masterDownTimer expiry
+		// promotes immediately instead of re-arming the hold (#2850). The
+		// last-seen master record is intentionally left untouched — the
+		// #2082 recordMasterAdvert contract owns it.
 		slog.Info("vrrp: peer resigned (priority 0), immediate takeover",
 			"key", vi.key())
+		stopAndDrainTimer(preemptHoldTimer)
+		vi.mu.Lock()
+		vi.skipNextPreemptHold = true
+		vi.mu.Unlock()
 		masterDownTimer.Reset(time.Millisecond)
 		return
 	}
 
-	// If we don't preempt, or the incoming priority is >= ours, accept it.
+	// If we don't preempt, or the incoming priority is >= ours, accept it:
+	// reset the master-down timer and abort any pending preempt hold-time —
+	// a worthy master is present, so there is nothing to preempt (#2850).
 	if !vi.getPreempt() || int(pkt.Priority) >= pri {
 		masterDownTimer.Reset(vi.masterDownInterval())
+		stopAndDrainTimer(preemptHoldTimer)
 	}
-	// If preempt is true and incoming priority < ours, ignore — let timer expire.
+	// If preempt is true and incoming priority < ours, ignore — let the
+	// master-down timer expire (and, if a hold is armed, let it run).
 }
 
 // handleMasterRx processes a received advertisement while in Master state.
