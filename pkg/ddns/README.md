@@ -15,10 +15,10 @@ moved with its assertions intact.
 
 | File | Contents |
 |------|----------|
-| `manager.go` | `Manager` (the DDNS reconcile engine — moved from `dhcpserver/ddns.go`): `policyFromConfig`, `Reconcile`, `reconcileOnceLocked`, `upsertLocked`/`deleteOwnedLocked`, `withdrawAllLocked`, `ownerWatermark`, `Stats`, `OwnedRecordView(s)`, the write-ahead durability + never-delete-non-owned boundary. Also the `Lease` record + `LeaseParser` seam. |
+| `manager.go` | `Manager` (the DDNS reconcile engine — moved from `dhcpserver/ddns.go`): `policyFromConfig`, `Reconcile`, `reconcileOnceLocked`, `upsertLocked`/`deleteOwnedLocked`, `withdrawAllLocked`, `ownerWatermark`, `dhcidSharedWithOther` (#2700 shared-DHCID guard), `Stats` (incl. `PTRPendingNow`, #2708), `OwnedRecordView(s)`, the `errDDNSNoBackendToWithdraw` keep-ownership sentinel (#2699), the write-ahead durability + never-delete-non-owned boundary. Also the `Lease` record + `LeaseParser` seam. |
 | `state.go` | Ownership state store (`ownedRecord`, `ddnsState`, `loadDDNSState`, durable `save` via `fsatomic.WriteFileDurable`) — moved from `dhcpserver/ddns_state.go`. |
 | `backend.go` | `DNSUpdater` interface, `LeaseDNSRecord`, `nopUpdater`, the record + reverse-PTR-name helpers — moved from `dhcpserver/ddns_dns.go`. |
-| `backend_rfc2136.go` | The LIVE RFC 2136 backend (`rfc2136Updater`): exact-RR adds/deletes, TSIG, RFC 4701 DHCID + RFC 4703 replace-owned two-attempt, the `errDDNSConflictRefused` / `errDDNSPTRPending` sentinels — moved from `dhcpserver/ddns_rfc2136.go`. |
+| `backend_rfc2136.go` | The LIVE RFC 2136 backend (`rfc2136Updater`): exact-RR adds/deletes, TSIG, RFC 4701 DHCID + RFC 4703 replace-owned two-attempt, the `errDDNSConflictRefused` / `errDDNSPTRPending` sentinels — moved from `dhcpserver/ddns_rfc2136.go`. `sendRemoveForward(..., keepDHCID)` keeps a shared DHCID on a partial dual-stack teardown (#2700); `dnsCanonicalFQDN` mirrors the DHCID FQDN canonicalization. |
 | `hostname.go` | Deterministic hostname → DNS-label normalization (pure) — moved from `dhcpserver/ddns_hostname.go`. |
 | `surface_a.go` | Surface A router/interface-address publish engine (`SurfaceAManager`): change-detection, forced-refresh wire floor, per-scope error backoff, per-RG HA gate, the backend factory `productionSurfaceABackend` (#2691 P2/P3). |
 | `backend_http.go` | Shared HTTP-backend discipline (#2691 P3): hardened `http.Client` (TLS-verified, bounded timeout), capped body read, `classifyHTTPStatus`, `queryEscape`, the `errHTTPAuth`/`errHTTPRateLimited` verdicts. |
@@ -110,10 +110,46 @@ no change in those packages:
   is never orphaned.
 - **Mass-delete fail-safe** — a family whose `LeaseParser` errors is marked
   untrusted and its destructive diff is skipped.
+- **No-backend withdraw keeps ownership (#2699)** — `deleteOwnedLocked` no
+  longer drops the ownership entry when only the `nopUpdater` is wired. A record
+  in the store was published by a real backend (the nop upsert path records no
+  ownership), so forgetting it while the live RR persists would ORPHAN it (after
+  a restart with DDNS disabled / no `update-server`, or a backend removal).
+  Instead the no-op delete counts `deleteFail`, returns
+  `errDDNSNoBackendToWithdraw`, and KEEPS ownership; a later reconcile with a
+  live backend withdraws it for real. `reconcileOnceLocked` / `withdrawAllLocked`
+  swallow the sentinel so a legitimate disabled-with-no-backend pass is not
+  marked failed. Mirrors the Surface A `withdrawOwnedLocked` precedent.
+- **Shared-DHCID partial dual-stack teardown (#2700)** — the RFC 4701 DHCID
+  digest folds in `client-identity || FQDN` only (NOT the address), so a
+  dual-stack client (an A + an AAAA under one FQDN, same client id) shares ONE
+  DHCID. `deleteOwnedLocked` scans the store (`dhcidSharedWithOther`); when a
+  sibling family still owns the same FQDN+ClientID it sets
+  `LeaseDNSRecord.KeepForwardDHCID`, and `sendRemoveForward` then deletes only
+  the A/AAAA and LEAVES the shared DHCID (the DHCID-match prerequisite is still
+  sent, so the delete stays ownership-guarded). The DHCID is removed only with
+  the LAST family's record, so a fully-released name leaves no orphan DHCID and
+  a survivor is never left unprotected (no hijack window, no wire leak).
 - **No secret in any error string** (TSIG secret revealed only at construction).
 
 The HA writer gate (`ddnsWriterGateOpen`) stays in `pkg/daemon/daemon_ddns.go`
 (it reads cluster RG state); P1a did not move or change it.
+
+## Observability — PTR-pending (#2708)
+
+A record can be HALF-PUBLISHED: the forward A/AAAA is live but the reverse PTR
+add failed with a non-skippable error (`ownedRecord.PTRPending=true`, #2661).
+This condition is surfaced per record and as a current gauge so an operator can
+identify the broken record and watch it recover:
+
+- `OwnedRecordView.PTRPending` — exposed on every owned record (CLI + gRPC
+  `show ... dynamic-dns detail` print a `Pending` column).
+- `Stats.PTRPendingNow` — the CURRENT count of records pending a PTR, distinct
+  from the cumulative lifetime `PTRDeferred` (which only ever increases). It
+  falls back to 0 once every PTR finally publishes.
+- Prometheus `xpf_dhcp_ddns_ptr_pending` (gauge) — current pending count, beside
+  the existing `xpf_dhcp_ddns_skipped_total{reason="ptr-deferred"}` lifetime
+  counter.
 
 ## Phase P1b — ScopeKey, per-family policy, per-RG HA gate, source binding
 

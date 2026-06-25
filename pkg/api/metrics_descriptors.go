@@ -235,6 +235,13 @@ func newCollector(srv *Server) *xpfCollector {
 			"Current number of DHCP dynamic-DNS records this node owns in DNS.",
 			nil, nil,
 		),
+		dhcpDDNSPTRPending: prometheus.NewDesc(
+			"xpf_dhcp_ddns_ptr_pending",
+			"Current number of owned DHCP dynamic-DNS records whose forward "+
+				"A/AAAA is published but whose reverse PTR is still owed "+
+				"(distinct from the cumulative ptr-deferred counter; #2708).",
+			nil, nil,
+		),
 		dhcpDDNSLastReconcileTs: prometheus.NewDesc(
 			"xpf_dhcp_ddns_last_reconcile_timestamp_seconds",
 			"Unix timestamp of the last DHCP dynamic-DNS reconcile pass.",

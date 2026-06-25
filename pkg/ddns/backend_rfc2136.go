@@ -428,7 +428,12 @@ func (u *rfc2136Updater) DeleteLease(ctx context.Context, rec LeaseDNSRecord) er
 		return err
 	}
 	zone := u.resolveForwardZone(rec.FQDN)
-	if err := u.sendRemoveForward(ctx, zone, forwardRR); err != nil {
+	// rec.KeepForwardDHCID (#2700): another owned record still shares this
+	// FQDN+ClientID (a dual-stack client's surviving family), so delete the
+	// forward A/AAAA but keep the shared DHCID — the surviving record stays
+	// DHCID-protected and its later delete still satisfies the DHCID-match
+	// prerequisite.
+	if err := u.sendRemoveForward(ctx, zone, forwardRR, rec.KeepForwardDHCID); err != nil {
 		return fmt.Errorf("ddns: forward delete %s %s: %w", rec.ForwardType, rec.FQDN, err)
 	}
 	if rec.PTRName != "" {
@@ -533,6 +538,15 @@ func dhcidIdentifierType(clientID string) int {
 
 // dhcidDigestTypeSHA256 is the RFC 4701 §3.4 digest type code for SHA-256.
 const dhcidDigestTypeSHA256 = 0x01
+
+// dnsCanonicalFQDN returns the canonical (lowercased, trailing-dot) form of a
+// name, matching exactly how dhcidRR canonicalizes the FQDN before folding it
+// into the DHCID digest. The manager (dhcidSharedWithOther, #2700) uses it to
+// decide whether two owned records would compute the SAME DHCID, so this must
+// stay in lockstep with dhcidRR's `dns.CanonicalName(dns.Fqdn(fqdn))`.
+func dnsCanonicalFQDN(fqdn string) string {
+	return dns.CanonicalName(dns.Fqdn(fqdn))
+}
 
 // dhcidRR builds the RFC 4701 DHCID resource record that proves xpf owns a
 // forward name. The RDATA is: 2-byte identifier-type || 1-byte digest-type
@@ -834,7 +848,18 @@ func (u *rfc2136Updater) sendRemove(ctx context.Context, zone string, rr dns.RR)
 // release. Without a client identity (no DHCID was ever written) the delete is
 // the plain exact-RR delete — still only the firewall's own (name,type,rdata)
 // tuple, never a delete-RRset.
-func (u *rfc2136Updater) sendRemoveForward(ctx context.Context, zone string, rr dns.RR) error {
+//
+// keepDHCID (#2700): when ANOTHER owned record still shares this FQDN+ClientID
+// (a dual-stack client whose A and AAAA carry the SAME shared DHCID), the DHCID
+// must SURVIVE this delete so the remaining family's record stays
+// DHCID-protected (RFC 4703) and its eventual delete still satisfies the
+// DHCID-match prerequisite. In that case the DHCID-match PREREQUISITE is still
+// sent (the delete stays ownership-guarded — xpf removes the A/AAAA only when
+// the on-wire DHCID proves xpf created it) but the DHCID itself is OMITTED from
+// the Remove section, so only the specific A/AAAA is removed. When this is the
+// LAST owned record under the name (keepDHCID=false) the DHCID is removed with
+// it (the pre-#2700 behaviour), so a fully-released name leaves no orphan DHCID.
+func (u *rfc2136Updater) sendRemoveForward(ctx context.Context, zone string, rr dns.RR, keepDHCID bool) error {
 	if u.conflictPolicy != "replace-owned" {
 		return u.sendRemove(ctx, zone, rr)
 	}
@@ -850,7 +875,13 @@ func (u *rfc2136Updater) sendRemoveForward(ctx context.Context, zone string, rr 
 	// CLASS=NONE in place, which would otherwise corrupt the value-dependent
 	// Used() prerequisite that proves we own the record.
 	m.Used([]dns.RR{dns.Copy(dhcid)}) // prerequisite: our exact DHCID must exist
-	m.Remove([]dns.RR{rr, dhcid})
+	if keepDHCID {
+		// A sibling family's record still shares this DHCID (#2700): remove only
+		// the A/AAAA, leave the shared DHCID so the survivor stays protected.
+		m.Remove([]dns.RR{rr})
+	} else {
+		m.Remove([]dns.RR{rr, dhcid})
+	}
 	resp, err := u.exchange(ctx, m)
 	if err != nil {
 		return err
