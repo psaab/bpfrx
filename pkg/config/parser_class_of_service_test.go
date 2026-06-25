@@ -1466,3 +1466,143 @@ func TestCompileClassOfServiceRejectsThreeFCsOnOneQueue(t *testing.T) {
 		t.Errorf("error must reference queue 5, got: %s", err.Error())
 	}
 }
+
+// TestCompileClassOfServiceRejectsOutOfRangeDSCPCodePoint proves the #2447
+// fix: a DSCP code-point outside the 6-bit domain (0..63) is REJECTED at
+// commit with a clear operator error, rather than being silently dropped at
+// the Go parse layer (pre-fix) or masked `dscp & 0x3f` into a different
+// traffic class by the dataplane builder (110 → 46).
+//
+// Fail-on-revert: restore the pre-fix `v >= 0 && v <= 63` silent-skip in
+// expandCoSCodePointToken (returning nil instead of an error) and this test
+// goes RED — the bad config compiles and the classifier installs with the
+// out-of-range entry dropped (no commit error).
+func TestCompileClassOfServiceRejectsOutOfRangeDSCPCodePoint(t *testing.T) {
+	tree := &ConfigTree{}
+	lines := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service classifiers dscp wan-classifier forwarding-class best-effort loss-priority low code-points 110",
+		"set system dataplane-type userspace",
+	}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected compile to reject DSCP code-point 110, got nil error")
+	}
+	if !strings.Contains(err.Error(), "110") || !strings.Contains(err.Error(), "0..63") {
+		t.Errorf("error must name the out-of-range value 110 and the 0..63 range, got: %s", err.Error())
+	}
+}
+
+// TestCompileClassOfServiceRejectsOutOfRangePCPCodePoint proves the #2447
+// fix for the 802.1p path: a code-point outside the 3-bit PCP domain (0..7)
+// is REJECTED at commit rather than silently dropped (pre-fix) or clamped
+// `pcp.min(7)` into a different traffic class by the dataplane builder (9 → 7).
+func TestCompileClassOfServiceRejectsOutOfRangePCPCodePoint(t *testing.T) {
+	tree := &ConfigTree{}
+	lines := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service classifiers ieee-802.1 wan-pcp forwarding-class best-effort loss-priority low code-points 9",
+		"set system dataplane-type userspace",
+	}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected compile to reject 802.1p code-point 9, got nil error")
+	}
+	if !strings.Contains(err.Error(), "9") || !strings.Contains(err.Error(), "0..7") {
+		t.Errorf("error must name the out-of-range value 9 and the 0..7 range, got: %s", err.Error())
+	}
+}
+
+// TestCompileClassOfServiceRejectsOutOfRangeRewriteCodePoint proves a DSCP
+// rewrite-rule code-point > 63 is rejected (same domain, same builder hazard).
+func TestCompileClassOfServiceRejectsOutOfRangeRewriteCodePoint(t *testing.T) {
+	tree := &ConfigTree{}
+	lines := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service rewrite-rules dscp wan-rewrite forwarding-class best-effort loss-priority low code-point 200",
+		"set system dataplane-type userspace",
+	}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected compile to reject rewrite code-point 200, got nil error")
+	}
+	if !strings.Contains(err.Error(), "200") || !strings.Contains(err.Error(), "0..63") {
+		t.Errorf("error must name the out-of-range value 200 and the 0..63 range, got: %s", err.Error())
+	}
+}
+
+// TestCompileClassOfServiceAcceptsBoundaryCodePoints confirms the valid
+// domain still compiles unchanged: DSCP 63 (max) and PCP 7 (max), plus the
+// `ef` alias (46), all build a classifier entry with the expected value.
+func TestCompileClassOfServiceAcceptsBoundaryCodePoints(t *testing.T) {
+	tree := &ConfigTree{}
+	lines := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service classifiers dscp wan-classifier forwarding-class best-effort loss-priority low code-points 63",
+		"set class-of-service classifiers dscp wan-classifier forwarding-class best-effort loss-priority high code-points ef",
+		"set class-of-service classifiers ieee-802.1 wan-pcp forwarding-class best-effort loss-priority low code-points 7",
+		"set system dataplane-type userspace",
+	}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile of in-range boundary code-points: %v", err)
+	}
+	dscp := cfg.ClassOfService.DSCPClassifiers["wan-classifier"]
+	if dscp == nil {
+		t.Fatal("expected wan-classifier")
+	}
+	var sawDSCP63, sawDSCP46 bool
+	for _, e := range dscp.Entries {
+		for _, v := range e.DSCPValues {
+			if v == 63 {
+				sawDSCP63 = true
+			}
+			if v == 46 {
+				sawDSCP46 = true
+			}
+		}
+	}
+	if !sawDSCP63 || !sawDSCP46 {
+		t.Fatalf("expected DSCP 63 and 46 (ef) entries, got %#v", dscp.Entries)
+	}
+	pcp := cfg.ClassOfService.IEEE8021Classifiers["wan-pcp"]
+	if pcp == nil || len(pcp.Entries) != 1 || len(pcp.Entries[0].CodePoints) != 1 || pcp.Entries[0].CodePoints[0] != 7 {
+		t.Fatalf("expected wan-pcp code-point 7, got %#v", pcp)
+	}
+}
