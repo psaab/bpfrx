@@ -279,16 +279,26 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 	var toRestart []*config.RAInterfaceConfig // changed config: old stopped, start after join
 	for name, cfg := range desired {
 		existing, ok := m.senders[name]
-		if ok && configEqual(existing.cfg, cfg) {
+		if ok && !existing.dead() && configEqual(existing.cfg, cfg) {
 			continue // No change — keep running, no RA gap.
 		}
 
-		// Changed config: hard-replace. Install a tombstone, stop the old
-		// sender, and DEFER the start until the old conn is closed (the
-		// tombstone covers the whole window). Never open the new conn while the
-		// old one is live (#2033 MAJOR 1).
+		// Changed config OR a DEAD sender (its openConn failed at boot, so it
+		// will never emit an RA — #2865): hard-replace. Install a tombstone,
+		// stop the old sender, and DEFER the start until the old conn is closed
+		// (the tombstone covers the whole window). Never open the new conn while
+		// the old one is live (#2033 MAJOR 1). For a dead sender the old conn is
+		// already closed (run() exited via finishShutdown), so the join in
+		// releaseDrain returns immediately and the rebuild proceeds — a transient
+		// boot-time bind failure recovers on the next reconcile with NO config
+		// change, instead of leaving the interface permanently without RAs.
 		if ok {
-			slog.Info("ra: restarting sender", "interface", name)
+			if existing.dead() && configEqual(existing.cfg, cfg) {
+				slog.Info("ra: rebuilding dead sender (initial conn open failed)",
+					"interface", name)
+			} else {
+				slog.Info("ra: restarting sender", "interface", name)
+			}
 			delete(m.senders, name)
 			m.draining[name] = &drainEntry{sender: existing, cfg: existing.cfg}
 			existing.signalStop(modeHard)
