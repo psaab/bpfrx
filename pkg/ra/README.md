@@ -96,13 +96,14 @@ after HA failover. To make that **structural**, not flag-defended:
   lands after is harmless (no supersession existed at the act moment). The only
   unlock inside `releaseDrain` is for the blocking standalone-goodbye send; the
   loop re-acquires and re-evaluates fresh state before touching the replacement.
-  NOTE: `onProvenClose` calls `startLocked`, which does blocking setup
-  (`InterfaceByName`, link-local add, `ndp.Listen` with retry) UNDER `m.mu` —
-  this can hold the manager mutex for up to ~2s and is pre-existing (plain
-  `Apply` also calls `startLocked` under `m.mu`). It is a known cost, not a
-  correctness issue; the tombstone (held) is what provides mutual exclusion, so
-  moving the start just after the unlock is possible but was left as-is to avoid
-  reintroducing a check-then-act.
+  NOTE: `onProvenClose` calls `startLocked` under `m.mu`. As of #2453 that is
+  cheap: `startLocked` only does the synchronous `InterfaceByName` check and the
+  `m.senders` bookkeeping, then launches the owner goroutine and returns. The
+  socket open — `ensureLinkLocal` + the `ndp.Listen` bind RETRY that sleeps up
+  to ~2s while a settling/RETH link-local appears — now runs in the owner
+  goroutine's `openConn()` BEFORE its main loop, NOT under `m.mu` (see "Bind
+  retry runs unlocked" below). The tombstone (held) still provides mutual
+  exclusion for the start.
 - **Draining tombstone — one live conn per interface, including replaces.**
   Every transition that removes OR replaces a sender installs a
   per-interface DRAINING tombstone under the manager mutex BEFORE releasing
@@ -206,7 +207,30 @@ best-effort).
   DOWN/UP from inside the RA manager would un-reconcile VIPs / stable LLAs
   and race the AF_XDP dataplane rebind. An interface with no usable 6-byte
   MAC degrades to a soft-logged warning (the caller only `slog.Warn`s the
-  error); the explicit `source-link-local` config and the `start()` retry
-  loop are the recovery path.
+  error); the explicit `source-link-local` config and the `listen()` retry
+  loop (now in the owner goroutine, see below) are the recovery path.
+- **Bind retry runs UNLOCKED, in the owner goroutine (#2453).** `start()` no
+  longer opens the NDP conn synchronously. It just launches `run()` and returns,
+  so `Manager.startLocked` holds `m.mu` only for the cheap `InterfaceByName`
+  check plus the `m.senders` bookkeeping. The socket open — `ensureLinkLocal`
+  plus the `ndp.Listen` bind retry, which sleeps up to ~2s (10 × 200 ms) while a
+  settling/RETH link-local appears — runs in the owner goroutine's `openConn()`
+  before its main loop, with NO lock held. Before this, a slow/settling
+  link-local on one interface stalled EVERY other RA manager op (a VRRP-failover
+  `Withdraw`, or an `Apply` on a different interface) for up to ~2s, because they
+  all contend `m.mu`. The bind retry is now interruptible by `stopCh`: a withdraw
+  signalled mid-retry aborts the sleep instead of running the full ~2s.
+  Consequences for the single-owner / #2033 invariants: `s.conn` is still opened,
+  used, and closed solely by the owner goroutine. If the bind ultimately fails
+  (or a stop lands before/during the retry) `openConn` returns false and `run`
+  goes straight to `finishShutdown`, which tolerates a nil conn — no goodbye is
+  written and `goodbyeEmitted` stays false, so the manager's release-time
+  backstop (`sendOneGoodbye` on a FRESH conn) still emits a standalone goodbye if
+  a graceful withdraw owed one. `start()` therefore never returns a listen error
+  (the open is async); the only caller cost is that an unreachable interface is
+  logged by the owner instead of surfaced as an `Apply` error — and every `Apply`
+  call site already only `slog.Warn`s that error. `srcAddr` is now written by the
+  owner goroutine and read by `Status` under `m.mu`, so it carries its own
+  `srcMu` guard (`getSrcAddr`/`setSrcAddr`).
 - Per RFC 5798, `AdvertiseInterval` is stored in milliseconds but goes
   on the wire in centiseconds. Don't double-convert.

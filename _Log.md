@@ -14742,3 +14742,34 @@ top.
   pkg/api/metrics_surface_a_ddns_test.go, pkg/cli/cli_show_services.go,
   pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
   userspace-dp/src/afxdp/forwarding/mod.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2453 — move the RA sender NDP bind retry OUT of the manager
+  mutex critical section. `Manager.startLocked` (under `m.mu`) called
+  `sender.start()`, which opened the NDP conn synchronously: `ensureLinkLocal`
+  + `listen()`'s 10×200ms (~2s) bind retry while a settling/RETH link-local
+  appears. The whole retry ran under `m.mu`, so any concurrent RA manager op —
+  a VRRP-failover `Withdraw` or an `Apply` on a DIFFERENT interface — stalled up
+  to ~2s on `m.mu.Lock()`. Fix (approach b): `start()` now just launches the
+  owner goroutine and returns; the socket open moved to `openConn()`, run in the
+  owner goroutine BEFORE its main loop, with no lock held. The bind retry sleep
+  is now interruptible by `stopCh` (a mid-retry withdraw aborts promptly).
+  `startLocked`'s `m.mu` hold is reduced to the `InterfaceByName` check + the
+  `m.senders` bookkeeping. Race-safety: `s.conn` remains owner-only;
+  `finishShutdown` tolerates a nil conn (open failed or stop landed mid-retry) →
+  no goodbye, `goodbyeEmitted` stays false → the manager's release-time
+  standalone-goodbye backstop still fires for an owed graceful withdraw; `start()`
+  no longer returns a listen error (open is async — every `Apply` call site only
+  `slog.Warn`s it anyway); `srcAddr` is now owner-written / `Status`-read so it
+  got its own `srcMu` guard (`getSrcAddr`/`setSrcAddr`). Tests (race-on):
+  `TestT2453_SlowBindDoesNotStallOtherManagerOps` (fail-on-revert — a gated bind
+  on "lo" must not stall `WithdrawInterfaces` on another interface + `Status`;
+  verified RED when `start()` is reverted to synchronous open under `m.mu`),
+  `TestT2453_NormalStartStillBindsAndSends` (no-regression bind+burst),
+  `TestT2453_WithdrawDuringSlowBindEmitsGoodbye` (conn==nil safety + standalone
+  goodbye backstop). Gates: gofmt clean; go build ./... clean; go vet
+  ./pkg/ra/... clean; go test -race ./pkg/ra/... green; go test
+  ./pkg/daemon/... ./pkg/cluster/... green. HA-adjacent (RA Withdraw on VRRP
+  failover) → parent may run make test-failover for no-regression.
+  **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/serialize_test.go,
+  pkg/ra/README.md, _Log.md
