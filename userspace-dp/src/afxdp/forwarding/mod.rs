@@ -2048,6 +2048,27 @@ fn ecmp_hash_flow_seeded(seed: u64, key: &crate::session::SessionKey) -> u64 {
     hasher.finish()
 }
 
+/// #2922: select one equal-cost next-hop in a SINGLE liveness pass.
+///
+/// The liveness predicate (`is_live`) is NOT pure — the IPv4/IPv6 callers
+/// probe the shared dynamic-neighbor map, which the monitor thread mutates
+/// concurrently. The previous two-pass form (`count()` then `nth()`)
+/// evaluated `is_live` twice per candidate, so (a) a neighbor removed
+/// between the two passes made `live > 0` true at count time but
+/// `nth(pick)` yield `None` → spurious no-route even though a live
+/// candidate existed at count time, and (b) every session-miss ECMP
+/// lookup ran two full sets of neighbor hash probes on the hot path.
+///
+/// Fix: materialize the live candidates into a stack `SmallVec` of
+/// references in one pass, so the count and the selection observe the
+/// SAME liveness snapshot. ECMP fanout is small (a handful of equal-cost
+/// members), so the inline capacity (8) covers the common case without a
+/// heap allocation. Selection semantics are unchanged: when any member is
+/// live, the pick is `ip_hash % live_count` over the live set in original
+/// candidate order (so the same flow pins to the same member given the
+/// same liveness); when none are live, fall back to the same hashed pick
+/// over the full candidate vector so the kernel slow-path can drive
+/// ARP/NDP.
 fn select_route_next_hop<'a, T: Copy>(
     candidates: &'a [T],
     ip_hash: u64,
@@ -2056,12 +2077,16 @@ fn select_route_next_hop<'a, T: Copy>(
     if candidates.is_empty() {
         return None;
     }
-    let live: usize = candidates.iter().filter(|c| is_live(c)).count();
-    let pool_len = if live > 0 { live } else { candidates.len() };
-    let pick = (ip_hash % pool_len as u64) as usize;
-    if live > 0 {
-        candidates.iter().filter(|c| is_live(c)).nth(pick)
+    // Single liveness evaluation: collect live candidate references once.
+    // `is_live` is called exactly `candidates.len()` times total.
+    let live: smallvec::SmallVec<[&'a T; 8]> =
+        candidates.iter().filter(|c| is_live(c)).collect();
+    if !live.is_empty() {
+        let pick = (ip_hash % live.len() as u64) as usize;
+        // `pick < live.len()` by construction, so this never yields None.
+        live.get(pick).copied()
     } else {
+        let pick = (ip_hash % candidates.len() as u64) as usize;
         candidates.get(pick)
     }
 }

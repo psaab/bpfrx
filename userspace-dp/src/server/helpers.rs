@@ -763,7 +763,18 @@ pub(crate) fn replan_queues(
     let mut seen_linux: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(snapshot) = snapshot {
         for iface in &snapshot.interfaces {
-            if !is_userspace_candidate_interface(&iface.name) {
+            // #2915: the binding candidate decision is a single shared
+            // invariant. The plan-key hash
+            // (`update_snapshot_binding_plan_key`) and the Go authoritative
+            // allowlist (`UserspaceBoundLinuxInterfaces`) both filter through
+            // the binding exclusion contract — zoned, non-tunnel,
+            // non-local-fabric, excluding fxp*/em*/fab*/lo0 and mgmt/control
+            // zones. `replan_queues` MUST act on exactly that set; a
+            // prefix-only `ge-*`/`xe-*`/`et-*` test (the pre-#2915 predicate)
+            // let a `ge-*` netdev placed in a mgmt/control zone (or a
+            // tunnel/local-fabric context) be planned as an AF_XDP binding
+            // that neither the hash nor the control plane accounts for.
+            if !include_userspace_binding_interface(iface) {
                 continue;
             }
             let linux_name = if iface.linux_name.is_empty() {
@@ -897,10 +908,6 @@ pub(crate) fn summarize_queues(bindings: &[BindingStatus]) -> Vec<QueueStatus> {
         });
     }
     out
-}
-
-pub(crate) fn is_userspace_candidate_interface(name: &str) -> bool {
-    name.starts_with("ge-") || name.starts_with("xe-") || name.starts_with("et-")
 }
 
 pub(crate) fn linux_ifname(name: &str) -> String {

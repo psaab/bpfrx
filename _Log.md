@@ -1,3 +1,23 @@
+## 2026-06-25 — #2922: ECMP `select_route_next_hop` single liveness snapshot
+
+- **Timestamp**: 2026-06-25
+- **Action**: `select_route_next_hop` evaluated the (impure)
+  dynamic-neighbor liveness closure TWICE — `count()` then `nth()`. A
+  neighbor removed by the monitor thread between the two passes made the
+  count see `live > 0` while the select pass yielded `None` → spurious
+  no-route despite a live member at count time, plus doubled hot-path
+  neighbor probes. Fixed: collect live candidate refs into a stack
+  `SmallVec<[&T; 8]>` in a single pass and index into that snapshot, so
+  count and selection observe one consistent liveness view. Selection
+  semantics preserved (`ip_hash % live_count` over candidate order;
+  hashed full-vector fallback when none live). Added two fail-on-revert
+  tests: exact `candidates.len()` predicate-call count, and a
+  live→dead-flip-between-passes case that the reverted double-eval form
+  fails. Scope limited to `select_route_next_hop`; #2923 (tunnel-endpoint
+  ECMP) is a separate lane and untouched.
+- **File(s)**: `userspace-dp/src/afxdp/forwarding/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding/tests.rs`, `docs/multi-wan.md`,
+  `_Log.md`
 ## 2026-06-25 — #2886: VRRP raw-socket fallback cross-VLAN crosstalk (no per-interface ifindex check)
 
 - **Timestamp**: 2026-06-25
@@ -17866,6 +17886,31 @@ top.
   pkg/api/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2915 — unify the AF_XDP queue-planner binding-candidate
+  predicate. `replan_queues` filtered interfaces through the prefix-only
+  `is_userspace_candidate_interface` (`ge-`/`xe-`/`et-`) while the
+  plan-key hash (`update_snapshot_binding_plan_key`) and the Go
+  authoritative allowlist (`UserspaceBoundLinuxInterfaces` /
+  `userspaceSkipsIngressInterface`) used the full exclusion contract
+  `include_userspace_binding_interface` (zoned, non-tunnel,
+  non-local-fabric, excluding `fxp*`/`em*`/`fab*`/`lo0` and
+  `mgmt`/`control` zones). The hash (change-detection key) and the
+  planner therefore operated on different interface sets — a `ge-*`
+  netdev placed in a mgmt/control zone (or a tunnel/local-fabric
+  context) could be planned as an AF_XDP binding neither the hash nor
+  the control plane accounted for. Routed `replan_queues` through
+  `include_userspace_binding_interface` (the SSOT) and removed the now
+  dead `is_userspace_candidate_interface`. Existing planner tests gained
+  real zones on their data interfaces (the prefix-only predicate did not
+  require one). Added a fail-on-revert test
+  (`queue_planner_and_plan_key_agree_on_binding_set`) pinning that the
+  hash and planner agree on the binding set + a
+  tunnel/local-fabric exclusion test. Both go RED if the planner reverts
+  to the divergent prefix-only predicate (verified by copy-aside revert).
+  Couples cleanly to #2916 (same-plan refresh) which bases off this fix.
+- **File(s)**: userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md,
+  _Log.md
 - **Action**: #2938 — wire REST named source-NAT pool stats to the
   userspace helper's LIVE runtime SourceNATPoolStatus instead of config
   text (len(pool.Addresses)) + the retired-eBPF ReadNATPortCounter.
@@ -17899,3 +17944,28 @@ top.
   cargo test -p xpf-userspace-dp state_writer 11/11 PASS.
 - **File(s)**: userspace-dp/src/state_writer.rs, userspace-dp/src/FEATURES.md,
   docs/userspace-dataplane-architecture.md, _Log.md
+- **Action**: #2963 — reject at COMMIT-TIME a BGP neighbor whose peer-as
+  (remote-as) is missing/0. peer-as is optional in the parser/compiler, so
+  a neighbor authored without one (and without an inherited group peer-as)
+  kept a zero BGPNeighbor.PeerAS and the FRR renderer emitted
+  `neighbor <addr> remote-as 0`. AS 0 is reserved (RFC 7607); FRR/vtysh
+  rejects it, failing the whole frr-reload — a commit-accepted config the
+  routing daemon cannot load. Added validateBGPNeighborPeerASStrict
+  (pkg/config/compiler_validate_strict.go) hard-rejecting PeerAS==0 at
+  commit/commit-check (global + per-routing-instance scopes, naming the
+  group + neighbor) wired into compileConfigWithOpts with a new
+  lenientBGPNeighborPeerAS option (warn-and-boot on load/HA-sync per #1960).
+  Defense-in-depth: generateProtocols (pkg/frr/policy_render.go) now SKIPS a
+  neighbor with PeerAS==0 so AS 0 never reaches frr.conf on the lenient
+  path. Did NOT touch local-AS / router bgp handling (the rejected false
+  half of agy-review-056 056-05 — guarded by LocalAS>0). FAIL-ON-REVERT:
+  config gate test RED without the strict check (compiles + would render
+  remote-as 0); frr render-guard test RED without the skip (emits
+  remote-as 0). Gates: go build ./..., gofmt -l clean (my files),
+  go vet ./pkg/config/... ./pkg/frr/..., go test ./pkg/config/...
+  ./pkg/frr/... all PASS.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/bgp_neighbor_peeras_2963_test.go,
+  pkg/frr/policy_render.go, pkg/frr/bgp_remote_as_2963_test.go,
+  pkg/frr/README.md, _Log.md
