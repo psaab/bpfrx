@@ -8,6 +8,26 @@ import (
 	"strings"
 )
 
+// parseDHGroup converts a Junos/vSRX dh-group value to its numeric
+// Diffie-Hellman group. It accepts both the prefixed Junos spelling
+// ("group14", "group19") and a bare number ("14"). TrimPrefix leaves a
+// bare number unchanged, so a single Atoi handles both forms. The ok
+// return is false when the value does not parse, leaving the caller's
+// DHGroup at its zero value.
+//
+// This is the single source of truth for dh-group parsing across the
+// Phase 1 IKE proposal, the Phase 2 ESP proposal, and the PFS keys
+// stanza so the three sites cannot drift (#2639: the Phase 2 site used a
+// bare strconv.Atoi and silently dropped "group14", leaving the ESP
+// proposal with no PFS group).
+func parseDHGroup(v string) (int, bool) {
+	g := strings.TrimPrefix(v, "group")
+	if n, err := strconv.Atoi(g); err == nil {
+		return n, true
+	}
+	return 0, false
+}
+
 func compileIKE(node *Node, sec *SecurityConfig) error {
 	if sec.IPsec.IKEProposals == nil {
 		sec.IPsec.IKEProposals = make(map[string]*IKEProposal)
@@ -33,8 +53,7 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 				prop.AuthAlg = v
 			case "dh-group":
 				// Handle "group2" or "2" format
-				g := strings.TrimPrefix(v, "group")
-				if n, err := strconv.Atoi(g); err == nil {
+				if n, ok := parseDHGroup(v); ok {
 					prop.DHGroup = n
 				}
 			case "lifetime-seconds":
@@ -209,7 +228,10 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 			case "authentication-algorithm":
 				prop.AuthAlg = v
 			case "dh-group":
-				if n, err := strconv.Atoi(v); err == nil {
+				// Handle "group14" or "14" format (#2639): the bare
+				// strconv.Atoi here dropped the Junos "group14" spelling,
+				// silently disabling PFS on the ESP/Phase-2 proposal.
+				if n, ok := parseDHGroup(v); ok {
 					prop.DHGroup = n
 				}
 			case "lifetime-seconds":
@@ -232,8 +254,7 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 			case "perfect-forward-secrecy":
 				for _, c := range p.Children {
 					if c.Name() == "keys" {
-						g := strings.TrimPrefix(nodeVal(c), "group")
-						if n, err := strconv.Atoi(g); err == nil {
+						if n, ok := parseDHGroup(nodeVal(c)); ok {
 							pol.PFSGroup = n
 						}
 					}

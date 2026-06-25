@@ -370,21 +370,22 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		// lifetime-seconds (silent-zero footgun), leave the algorithm and
 		// protocol spellings untyped (the renderer accepts a wide set).
 		//
-		// dh-group is validated as a PLAIN POSITIVE INTEGER here, NOT with
-		// ValidateDHGroup. Unlike the IKE loop, the Phase-2 compiler
-		// (compiler_ipsec.go compileIPsec proposal loop) parses dh-group
-		// with a bare strconv.Atoi and does NOT strip the "group" prefix.
-		// Accepting `group14` at commit would let it compile to DHGroup=0
-		// and silently drop the PFS/modp term from the swanctl proposal —
-		// the exact schema-only drift this sweep closes. Keep the gate
-		// compiler-faithful: bare positive integer only for Phase-2 PFS.
+		// dh-group is validated with ValidateDHGroup (both the bare integer
+		// and the Junos `group<N>` spelling). As of #2639 the Phase-2
+		// compiler (compiler_ipsec.go compileIPsec proposal loop) strips the
+		// "group" prefix via the shared parseDHGroup helper — exactly like
+		// the IKE loop — so `group14` now compiles to DHGroup=14 and renders
+		// the modp/ecp term. Before #2639 the loop used a bare strconv.Atoi
+		// that dropped `group14` to DHGroup=0 (silent PFS loss), and this
+		// gate deliberately rejected the prefixed spelling to stay
+		// compiler-faithful; the compiler fix lets both gates accept it.
 		"proposal": {desc: "IPsec (Phase 2) proposal name", args: 1, placeholder: "<proposal-name>", children: map[string]*schemaNode{
 			"protocol":                 {desc: "IPsec protocol (esp|ah)", args: 1, placeholder: "<protocol>", children: nil},
 			"encryption-algorithm":     {desc: "Encryption algorithm (e.g. aes-256-cbc, aes-256-gcm)", args: 1, placeholder: "<algorithm>", children: nil},
 			"authentication-algorithm": {desc: "Authentication/integrity algorithm (e.g. hmac-sha-256-128)", args: 1, placeholder: "<algorithm>", children: nil},
-			"dh-group": {desc: "Diffie-Hellman group for PFS (bare integer, e.g. 14 — Phase-2 does NOT accept the group<N> spelling)", args: 1, placeholder: "<dh-group>",
-				valueType: ValueInteger, valueDesc: "Diffie-Hellman group (PFS modp number)",
-				valueExamples: []string{"2", "14", "19"}, validator: ValidateIntegerMin(1), children: nil},
+			"dh-group": {desc: "Diffie-Hellman group for PFS (e.g. 14 or group14)", args: 1, placeholder: "<dh-group>",
+				valueType: ValueDHGroup, valueDesc: "Diffie-Hellman group (PFS modp/ecp number)",
+				valueExamples: []string{"2", "14", "group19"}, validator: ValidateDHGroup, children: nil},
 			"lifetime-seconds": {desc: "IPsec SA lifetime in seconds", args: 1, placeholder: "<seconds>",
 				valueType: ValueInteger, valueDesc: "IPsec SA lifetime in seconds",
 				valueExamples: []string{"3600", "28800"}, validator: ValidateIntegerMin(1), children: nil},

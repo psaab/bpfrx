@@ -434,21 +434,21 @@ reserved for whole-dataplane selection where a rewrite shim
     `pre-shared-keys|rsa-signatures|ecdsa-signatures`, matching
     `authMethodToSwan`), `dh-group`, and `lifetime-seconds`
     (`ValidateIntegerMin(1)` — 0/garbage previously silently compiled to
-    0). The two `dh-group` leaves are validated DIFFERENTLY, on purpose, to
-    stay compiler-faithful (the gate must match what each compiler loop
-    actually parses):
-    - IKE `dh-group` — `ValueDHGroup` + `ValidateDHGroup`. The IKE compiler
-      loop (`compiler_ipsec.go` `compileIKE`) strips a leading `group`
-      prefix before `strconv.Atoi`, so both the bare-integer (`14`) and the
-      Junos `group<N>` (`group14`) spellings compile identically; the
-      validator accepts both and rejects 0/garbage that would drop the
-      modp term.
-    - IPsec Phase-2 `dh-group` — plain positive integer (`ValueInteger` +
-      `ValidateIntegerMin(1)`). The Phase-2 compiler loop (`compileIPsec`)
-      parses it with a bare `strconv.Atoi` and does NOT strip the `group`
-      prefix, so `group14` would compile to `DHGroup=0` and silently drop
-      PFS/modp. The schema rejects the `group<N>` spelling for Phase-2 PFS
-      rather than admit a value the compiler cannot honor.
+    0). Both `dh-group` leaves use `ValueDHGroup` + `ValidateDHGroup` and
+    accept the bare-integer (`14`) and the Junos `group<N>` (`group14`)
+    spellings identically (#2639):
+    - IKE `dh-group` — the IKE compiler loop (`compiler_ipsec.go`
+      `compileIKE`) strips a leading `group` prefix before `strconv.Atoi`.
+    - IPsec Phase-2 `dh-group` — the Phase-2 compiler loop (`compileIPsec`)
+      ALSO strips the `group` prefix, via the shared `parseDHGroup` helper
+      that both loops (and the PFS `keys` stanza) now call. Before #2639
+      the Phase-2 loop used a bare `strconv.Atoi` that left `group14` at
+      `DHGroup=0`, silently dropping the PFS/modp term from the ESP
+      proposal; the schema deliberately rejected the prefixed spelling to
+      stay compiler-faithful. The compiler fix makes both gates accept
+      `group<N>`, and the shared helper keeps the two sites from drifting
+      again. The validator still rejects 0/garbage that would drop the
+      modp/ecp term.
     `protocol` and `encryption-algorithm` / `authentication-algorithm` stay
     UNTYPED: the swanctl renderer normalizes arbitrary algorithm spellings
     by string substitution, so an enum there would false-reject valid

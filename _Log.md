@@ -1,5 +1,26 @@
 # Action Log
 
+## 2026-06-24 — #2639 fix: Phase-2 dh-group silently dropped the group<N> spelling
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed a HIGH PFS-silently-dropped bug. The Phase 2 IPsec
+  (ESP) proposal compiler parsed `dh-group` with a bare `strconv.Atoi`, so
+  the Junos/vSRX `dh-group group14` spelling failed to parse and `DHGroup`
+  stayed 0 — no PFS group on the ESP proposal. Factored a shared
+  `parseDHGroup` helper (TrimPrefix "group" then Atoi; accepts `group14`
+  and bare `14`) and routed Phase 1 IKE, Phase 2 ESP, and the PFS `keys`
+  stanza through it (SSOT, so they cannot drift again). Relaxed the
+  Phase-2 `dh-group` schema gate from `ValueInteger`/`ValidateIntegerMin`
+  to `ValueDHGroup`/`ValidateDHGroup` so `group<N>` is accepted at
+  commit-check (it was deliberately rejected to stay compiler-faithful).
+- **File(s)**: pkg/config/compiler_ipsec.go, pkg/config/schema_security.go,
+  pkg/config/schema_validate_2008_test.go, pkg/config/ipsec_dhgroup_test.go,
+  pkg/ipsec/dhgroup_roundtrip_test.go, docs/config-schema.md
+- **Validation**: `go test ./pkg/config/... ./pkg/ipsec/...` green; gofmt -w
+  + go vet clean. Round-trip confirmed: `group14` → DHGroup 14 → swanctl
+  `modp2048` (buildESPProposal). fail-on-revert: reverting Phase-2 to bare
+  Atoi makes the `group14` test report DHGroup 0 → red.
+
 ## 2026-06-24 — #2669 fix: drained session deltas never discarded when bindings empty
 
 - **Timestamp**: 2026-06-24

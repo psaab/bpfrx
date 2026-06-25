@@ -154,26 +154,23 @@ func TestSchema2008_IPsecProposalDHGroup_RejectsBad(t *testing.T) {
 	}
 }
 
-// Phase-2 IPsec dh-group must be a PLAIN positive integer: the compiler
-// (compiler_ipsec.go compileIPsec) uses a bare strconv.Atoi and does NOT
-// strip the "group" prefix, so "group14" would compile to DHGroup=0 and
-// silently drop the PFS/modp term. The schema must reject the group<N>
-// spelling for Phase-2 to stay compiler-faithful — unlike IKE Phase-1
-// below, which DOES strip the prefix and accepts both spellings.
-func TestSchema2008_IPsecProposalDHGroup_RejectsGroupSpelling(t *testing.T) {
-	err := schemaCheck(t, `security {
+// Phase-2 IPsec dh-group accepts the Junos group<N> spelling (#2639): the
+// compiler (compiler_ipsec.go compileIPsec) now strips the "group" prefix
+// via the shared parseDHGroup helper before Atoi, exactly like IKE
+// Phase-1, so "group14" compiles to DHGroup=14 and renders the modp/ecp
+// term. Before #2639 the loop used a bare strconv.Atoi that dropped
+// "group14" to DHGroup=0 (silent PFS loss) and this gate deliberately
+// rejected the prefixed spelling; the compiler fix lets it through.
+func TestSchema2008_IPsecProposalDHGroup_AcceptsGroupSpelling(t *testing.T) {
+	if err := schemaCheck(t, `security {
     ipsec {
         proposal esp1 {
             protocol esp;
             dh-group group14;
         }
     }
-}`)
-	if err == nil {
-		t.Fatal("expected error for ipsec dh-group group14 (Phase-2 compiler does not strip group prefix), got nil")
-	}
-	if !strings.Contains(err.Error(), "dh-group") {
-		t.Fatalf("error should reference dh-group: %v", err)
+}`); err != nil {
+		t.Fatalf("ipsec dh-group group14 should be accepted (#2639: compiler strips prefix): %v", err)
 	}
 }
 
