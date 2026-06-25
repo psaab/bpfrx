@@ -164,22 +164,44 @@ func (b *cloudflareBackend) resolveZoneID(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("ddns cloudflare: %s: zone %q not found for this token", b.name, b.zone)
 }
 
-// findRecord returns the existing A/AAAA record for the FQDN+type, or ("", nil)
-// when none exists.
-func (b *cloudflareBackend) findRecord(ctx context.Context, zoneID, rtype, fqdn string) (cfRecord, bool, error) {
+// listRecords returns ALL A/AAAA records Cloudflare holds for the FQDN+type.
+// Returning the full set (rather than recs[0]) is the basis for both the
+// upsert content-match and — critically — the ownership-scoped delete: a name
+// can carry several records of one type, and recs[0] is an API-ordering
+// artifact, not a statement of which row xpf owns (#2770).
+func (b *cloudflareBackend) listRecords(ctx context.Context, zoneID, rtype, fqdn string) ([]cfRecord, error) {
 	q := url.Values{}
 	q.Set("type", rtype)
 	q.Set("name", strings.TrimSuffix(fqdn, "."))
 	env, err := b.do(ctx, http.MethodGet, "/zones/"+zoneID+"/dns_records?"+q.Encode(), nil)
 	if err != nil {
-		return cfRecord{}, false, err
+		return nil, err
 	}
 	var recs []cfRecord
 	if err := json.Unmarshal(env.Result, &recs); err != nil {
-		return cfRecord{}, false, fmt.Errorf("ddns cloudflare: %s: decode records: %w", b.name, err)
+		return nil, fmt.Errorf("ddns cloudflare: %s: decode records: %w", b.name, err)
+	}
+	return recs, nil
+}
+
+// findRecord returns ONE existing A/AAAA record for the FQDN+type to update, or
+// (zero, false) when none exists. It prefers the row whose content already
+// equals wantContent (so a re-publish is a no-op) and otherwise returns the
+// first record (the row to PATCH to the new content). Used only by the upsert
+// path — the delete path re-derives ownership from content and must NOT
+// collapse to a single record.
+func (b *cloudflareBackend) findRecord(ctx context.Context, zoneID, rtype, fqdn, wantContent string) (cfRecord, bool, error) {
+	recs, err := b.listRecords(ctx, zoneID, rtype, fqdn)
+	if err != nil {
+		return cfRecord{}, false, err
 	}
 	if len(recs) == 0 {
 		return cfRecord{}, false, nil
+	}
+	for _, rec := range recs {
+		if rec.Content == wantContent {
+			return rec, true, nil
+		}
 	}
 	return recs[0], true, nil
 }
@@ -197,7 +219,7 @@ func (b *cloudflareBackend) UpsertLease(ctx context.Context, rec LeaseDNSRecord)
 	if ttl <= 0 {
 		ttl = 1 // Cloudflare TTL=1 means "automatic".
 	}
-	existing, found, err := b.findRecord(ctx, zoneID, rec.ForwardType, name)
+	existing, found, err := b.findRecord(ctx, zoneID, rec.ForwardType, name, content)
 	if err != nil {
 		return err
 	}
@@ -220,21 +242,37 @@ func (b *cloudflareBackend) UpsertLease(ctx context.Context, rec LeaseDNSRecord)
 	return err
 }
 
-// DeleteLease removes the firewall's A/AAAA from Cloudflare: resolve zone id,
-// find the record, DELETE it. A record that is already gone is a success.
+// DeleteLease removes the firewall's OWN A/AAAA from Cloudflare: resolve zone
+// id, list every record for the FQDN+type, and DELETE only the rows whose
+// content equals the owned address (rec.Addr.Unmap().String()).
+//
+// This honours the Surface A sole-delete-authority boundary
+// (withdrawOwnedLocked re-derives the delete from the EXACT owned tuple): xpf
+// never deletes a name+value it did not record. recs[0] is an API-ordering
+// artifact, so a content-blind delete of the first match would clobber a value
+// a human/automation later set on the same name (#2770). Multiple owned rows
+// with the same content are all removed (not just the first). A record that is
+// already gone — or where no row matches the owned content (ownership conflict)
+// — is a success no-op: the wire is already in (or never reached) the desired
+// state, and deleting a foreign value would itself be the bug.
 func (b *cloudflareBackend) DeleteLease(ctx context.Context, rec LeaseDNSRecord) error {
 	zoneID, err := b.resolveZoneID(ctx)
 	if err != nil {
 		return err
 	}
 	name := strings.TrimSuffix(rec.FQDN, ".")
-	existing, found, err := b.findRecord(ctx, zoneID, rec.ForwardType, name)
+	owned := rec.Addr.Unmap().String()
+	recs, err := b.listRecords(ctx, zoneID, rec.ForwardType, name)
 	if err != nil {
 		return err
 	}
-	if !found {
-		return nil
+	for _, r := range recs {
+		if r.Content != owned {
+			continue
+		}
+		if _, err := b.do(ctx, http.MethodDelete, "/zones/"+zoneID+"/dns_records/"+r.ID, nil); err != nil {
+			return err
+		}
 	}
-	_, err = b.do(ctx, http.MethodDelete, "/zones/"+zoneID+"/dns_records/"+existing.ID, nil)
-	return err
+	return nil
 }

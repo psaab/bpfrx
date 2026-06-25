@@ -1,3 +1,30 @@
+## 2026-06-25 — #2770: cloudflare withdraw is content-scoped (delete owned rows only)
+
+- **Timestamp**: 2026-06-25
+- **Action**: Cloudflare Surface A `DeleteLease` deleted whatever
+  `findRecord` returned (`recs[0]`), ignoring the owned content tuple. With
+  multiple same-name/type rows — or after a human/automation changed the
+  value xpf published — the withdraw clobbered the NEW value (or left a
+  duplicate owned row behind). Fix: split the list step into a new
+  `listRecords` (returns ALL matching records); `DeleteLease` now deletes
+  only the rows whose `content == rec.Addr.Unmap().String()`, removing
+  EVERY such row, and treats no-content-match (ownership conflict) /
+  already-gone as a success no-op — never deletes a foreign value. This
+  honours the Surface A sole-delete-authority boundary (Route 53 / RFC 2136
+  re-derive the delete from owned state too). `findRecord` gained a
+  `wantContent` arg so the upsert path prefers the content-matching row
+  (re-publish stays a no-op) before falling back to `recs[0]` for the PATCH
+  target.
+- **File(s)**: `pkg/ddns/backend_cloudflare.go`,
+  `pkg/ddns/backend_cloudflare_test.go`, `pkg/ddns/README.md`, `_Log.md`
+- **Fail-on-revert proof**: reverted `DeleteLease` to the first-only,
+  content-blind body (restored via file copy, not `git checkout`) →
+  `TestCloudflareDeleteAllOwnedRecords` and
+  `TestCloudflareDeleteOwnershipConflict` both go RED (deleted!=2 owned
+  rows / clobbered the foreign value); restored fix → all green.
+- **Gates**: `go build ./...` OK, `gofmt -l` clean, `go vet ./pkg/ddns/...`
+  OK, `go test ./pkg/ddns/...` ok.
+
 ## 2026-06-25 — #2773: wire validateCheckIPURL (dead code) into commit + runtime
 
 - **Timestamp**: 2026-06-25
