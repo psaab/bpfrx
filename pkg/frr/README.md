@@ -292,7 +292,38 @@ also carries operator content:
   source protocol, so skipping is the only correct outcome; the operator is
   warned to add a `from protocol <proto>` (or use a bare protocol token).
   This is the load-bearing invariant: a single unresolvable export can never
-  poison the entire managed-section reload.
+  poison the entire managed-section reload. `knownRedistProtocols` includes
+  `ospf6` and `ripng` (the FRR keywords for OSPFv3 / RIPng redistribution) so
+  a bare `export ospf6` / `export ripng` renders the valid line instead of
+  falling through to skip-and-warn and silently dropping IPv6 IGP
+  redistribution (#2943).
+- **`resolveRedistribute` excludes the SELF protocol (#2943).** It takes a
+  `self` argument naming the enclosing router protocol (`ospf` / `ospf6` /
+  `bgp` / `rip` / `isis`; `""` for callers with no enclosing protocol such as
+  unit tests). FRR rejects a protocol redistributing into itself
+  (`redistribute ospf` under `router ospf`), and one rejected line degrades
+  the whole managed reload (#1880/#2223). Both render paths drop the self
+  protocol: a bare self token returns `""` (skip+warn), and a policy-statement
+  term whose `from protocol` names the self protocol is filtered out while its
+  sibling non-self terms still render. Each `generateProtocols` call site
+  passes its own protocol as `self`.
+- **A policied family-less IPv6 BGP neighbor activates under ipv6 unicast,
+  not ipv4 (#2941).** The "default-activate a family-less policied neighbor
+  under ipv4 unicast" fall-through (#2473/#2490) is correct ONLY for an IPv4
+  peer address. An IPv6 peer (address contains `:`) with a global/per-neighbor
+  policy but no explicit `family inet6` also satisfies `!FamilyInet6`, so the
+  pre-#2941 code routed it into the ipv4 set and emitted `neighbor <v6>
+  activate` under `address-family ipv4 unicast` — FRR cannot resolve an IPv4
+  next-hop over an IPv6 session (no RFC 8950 extended-next-hop), so the
+  session drops prefixes. The ipv4 fall-through is now gated on the peer
+  address family, and a family-less-but-policied IPv6 peer is routed into the
+  ipv6 set so it activates (with its `route-map out`/`in`) under ipv6 unicast.
+- **IS-IS per-interface `isis bfd` is emitted INSIDE the interface block
+  (#2942).** `isis bfd` / `isis bfd profile <name>` are interface-scoped
+  commands; the IS-IS interface loop now writes them before the interface
+  block's `exit\n!\n`, mirroring the OSPFv3 ordering. Emitting them after
+  `exit` lands them in global config scope, which vtysh rejects and (one bad
+  line) fails the whole managed-section reload (#1880/#2223).
 - **Community-lists: `standard` vs `expanded` is per-DEFINITION (#2643).**
   An FRR `standard` community-list accepts ONLY literal community values
   (`ASN:VALUE`, or a well-known name such as `no-export` /

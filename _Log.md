@@ -17616,3 +17616,19 @@ top.
   go vet ./pkg/ipsec/..., go test ./pkg/ipsec/... PASS.
 - **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/matchfamily_linklocal_test.go,
   pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix three FRR config-render bugs that break frr-reload (#2941,
+  #2942, #2943). #2941: a family-less IPv6 BGP neighbor with a policy was
+  activated under `address-family ipv4 unicast` — gate the ipv4 fall-through
+  on the peer address family and route a policied family-less IPv6 peer into
+  the ipv6 set. #2942: `isis bfd` was emitted AFTER the interface `exit` →
+  global scope → frr-reload reject; moved it inside the interface block before
+  `exit`, mirroring OSPFv3. #2943: `resolveRedistribute` now takes a `self`
+  arg and drops self-redistribution (bare token + policy-term `from protocol
+  <self>`), and `knownRedistProtocols` adds `ospf6`/`ripng`. Fail-on-revert
+  tests added for each; all proven RED without the fix. Gates: go build, gofmt
+  -l clean, go vet ./pkg/frr/... ./pkg/config/..., go test ./pkg/frr/...
+  ./pkg/config/... PASS.
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go, pkg/frr/README.md,
+  _Log.md

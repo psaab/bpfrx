@@ -849,7 +849,13 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 					fmt.Fprintf(&b, " isis password clear %s\n", sanitizeFRRValue(iface.AuthKey.Reveal()))
 				}
 			}
-			b.WriteString("exit\n!\n")
+			// `isis bfd` / `isis bfd profile <name>` are interface-scoped
+			// commands and MUST be emitted INSIDE the interface block,
+			// before `exit`. Emitting them after `exit` lands them at
+			// global config scope, which vtysh rejects — and one rejected
+			// line fails the WHOLE managed-section reload (#1880/#2223),
+			// breaking every IS-IS interface with BFD enabled. This mirrors
+			// the OSPFv3 per-interface BFD ordering above (#2942).
 			if iface.BFD {
 				if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
 					profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
@@ -859,6 +865,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 					b.WriteString(" isis bfd\n")
 				}
 			}
+			b.WriteString("exit\n!\n")
 		}
 	}
 

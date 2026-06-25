@@ -5586,3 +5586,39 @@ func TestGenerateProtocols_IPv6NeighborPolicyActivatesUnderV6(t *testing.T) {
 		t.Errorf("expected `neighbor 2001:db8::1 route-map adv-v6 out`; got:\n%s", got)
 	}
 }
+
+// TestGenerateProtocols_ISISBFDInsideInterfaceBlock is the #2942
+// fail-on-revert guard: `isis bfd` (interface-scoped) must be emitted
+// INSIDE the `interface <name>` block, BEFORE its `exit`. Emitting it after
+// `exit` lands it in global scope, which vtysh rejects and one rejected
+// line fails the whole managed-section reload (#1880/#2223).
+func TestGenerateProtocols_ISISBFDInsideInterfaceBlock(t *testing.T) {
+	m := New()
+	isis := &config.ISISConfig{
+		NET:   "49.0001.0100.0000.0001.00",
+		Level: "level-2",
+		Interfaces: []*config.ISISInterface{
+			{Name: "ge-0-0-1", BFD: true},
+		},
+	}
+	got := m.generateProtocols(nil, nil, nil, nil, isis, "", 1, nil)
+
+	ifaceIdx := strings.Index(got, "interface ge-0-0-1")
+	if ifaceIdx < 0 {
+		t.Fatalf("expected an `interface ge-0-0-1` block; got:\n%s", got)
+	}
+	bfdIdx := strings.Index(got[ifaceIdx:], " isis bfd\n")
+	if bfdIdx < 0 {
+		t.Fatalf("expected an `isis bfd` line for the interface; got:\n%s", got)
+	}
+	bfdIdx += ifaceIdx
+	// The interface block's `exit` must come AFTER the isis bfd line.
+	exitIdx := strings.Index(got[ifaceIdx:], "exit\n")
+	if exitIdx < 0 {
+		t.Fatalf("expected an `exit` closing the interface block; got:\n%s", got)
+	}
+	exitIdx += ifaceIdx
+	if !(bfdIdx < exitIdx) {
+		t.Errorf("`isis bfd` emitted AFTER the interface `exit` (#2942 regression) — lands in global scope; got:\n%s", got)
+	}
+}
