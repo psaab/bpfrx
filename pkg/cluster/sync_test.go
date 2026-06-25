@@ -653,7 +653,7 @@ func TestHandleMessageDeleteV4RemovesCompanions(t *testing.T) {
 	if _, ok := dp.v4sessions[reverse]; ok {
 		t.Fatal("reverse session still present")
 	}
-	wantDNAT := dataplane.DNATKey{Protocol: 6, DstIP: natIP, DstPort: natPort}
+	wantDNAT := dataplane.DNATKey{Protocol: 6, DstIP: natIP, DstPort: dnatKeyHostPort(natPort)} // #2406 host-order key port
 	if len(dp.deletedDNATV4) != 1 || dp.deletedDNATV4[0] != wantDNAT {
 		t.Fatalf("deleted DNAT = %+v, want [%+v]", dp.deletedDNATV4, wantDNAT)
 	}
@@ -693,10 +693,17 @@ func TestHandleMessageDeleteV6RemovesCompanions(t *testing.T) {
 	if _, ok := dp.v6sessions[reverse]; ok {
 		t.Fatal("reverse session still present")
 	}
-	wantDNAT := dataplane.DNATKeyV6{Protocol: 17, DstIP: natIP, DstPort: natPort}
+	wantDNAT := dataplane.DNATKeyV6{Protocol: 17, DstIP: natIP, DstPort: dnatKeyHostPort(natPort)} // #2406 host-order key port
 	if len(dp.deletedDNATV6) != 1 || dp.deletedDNATV6[0] != wantDNAT {
 		t.Fatalf("deleted DNATv6 = %+v, want [%+v]", dp.deletedDNATV6, wantDNAT)
 	}
+}
+
+// dnatKeyHostPort converts a network-order port (as stored in
+// SessionValue.NATSrcPort) into the host-order numeric value the
+// session-derived dnat_table KEY uses (#2406). Mirrors dataplane.ntohs.
+func dnatKeyHostPort(netPort uint16) uint16 {
+	return (netPort&0xff)<<8 | netPort>>8
 }
 
 // --- Sync sweep tests ---
@@ -1739,7 +1746,7 @@ func TestReconcileStaleSessionsUsesSessionStoreCompanionDeleteV4(t *testing.T) {
 	if _, ok := dp.v4sessions[reverseKey]; ok {
 		t.Fatal("stale reverse session should be deleted")
 	}
-	wantDNAT := dataplane.DNATKey{Protocol: 6, DstIP: 0x2c0200c0, DstPort: 40443}
+	wantDNAT := dataplane.DNATKey{Protocol: 6, DstIP: 0x2c0200c0, DstPort: dnatKeyHostPort(40443)} // #2406 host-order key port
 	if len(dp.deletedDNATV4) != 1 || dp.deletedDNATV4[0] != wantDNAT {
 		t.Fatalf("deleted DNAT = %+v, want [%+v]", dp.deletedDNATV4, wantDNAT)
 	}
@@ -1786,7 +1793,7 @@ func TestReconcileStaleSessionsUsesSessionStoreCompanionDeleteV6(t *testing.T) {
 	if _, ok := dp.v6sessions[reverseKey]; ok {
 		t.Fatal("stale reverse session should be deleted")
 	}
-	wantDNAT := dataplane.DNATKeyV6{Protocol: 17, DstIP: natIP, DstPort: 53000}
+	wantDNAT := dataplane.DNATKeyV6{Protocol: 17, DstIP: natIP, DstPort: dnatKeyHostPort(53000)} // #2406 host-order key port
 	if len(dp.deletedDNATV6) != 1 || dp.deletedDNATV6[0] != wantDNAT {
 		t.Fatalf("deleted DNATv6 = %+v, want [%+v]", dp.deletedDNATV6, wantDNAT)
 	}

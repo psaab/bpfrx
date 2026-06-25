@@ -1,3 +1,59 @@
+## 2026-06-25 — #2406 r2: dnat_table KEY port byte-order (host-order; fixes latent v4)
+
+- **Timestamp**: 2026-06-25
+- **Action**: Hostile review (MERGE-NEEDS-MAJOR, finding 3c) proved the first
+  cut was a no-op: the dnat_table/dnat_table_v6 KEY port was written
+  network-order by ALL publishers while the AF_XDP shim reader builds its key
+  port host-order (`u16::from_be_bytes(wire)` -> host numeric, stored natively,
+  identical to the proven `session_map_key`). Verified the convention myself
+  against `session_map_key` (host-order) + the shim GRE-inner reader + the
+  `parse_l4` `from_be_bytes` source before flipping. Fix = make every dnat KEY
+  port writer host-order: Rust `publish_dnat_table_entry` v4+v6 use
+  `to_ne_bytes` (was `to_be_bytes`); Go added `ntohs` helper + a single-SSOT
+  `DNATKeyForSessionV4/V6` (ntohs of network-order NATSrcPort) routed through
+  by every install + companion-delete site (session_store, maps_session,
+  grpcapi server_sessions, cli cli_clear); static-DNAT config (compiler_nat)
+  writes the host-order `dstPort` raw (dropped htons). KEY DstIP unchanged
+  (already network-byte on both sides); dnat VALUE unchanged (shim never reads
+  it). Updated the v6 layout test to pin host-order; added Go<->Rust parity
+  tests (`TestDNATKeyForSessionPortParityWithShimReader` +
+  `dnat_v6_key_port_parity_with_shim_reader`) as the 3c regression guard. No
+  shim regen (reader was already correct). DNATKey/DNATKeyV6 doc-comments
+  corrected (DstPort now host-order).
+- **File(s)**: userspace-dp/src/afxdp/checksum.rs, userspace-dp/src/afxdp/tests.rs,
+  pkg/dataplane/maps_helpers.go, pkg/dataplane/session_store.go,
+  pkg/dataplane/maps_session.go, pkg/dataplane/compiler_nat.go,
+  pkg/dataplane/types.go, pkg/dataplane/session_store_test.go,
+  pkg/grpcapi/server_sessions.go, pkg/cli/cli_clear.go,
+  pkg/cluster/sync_test.go, docs/userspace-icmp-te-debugging.md, _Log.md
+
+## 2026-06-25 — #2406: IPv6 SNAT66-return reverse-NAT (dnat_table_v6) steering
+
+- **Timestamp**: 2026-06-25
+- **Action**: Wired the IPv6 SNAT66-return reverse-NAT path end to end so an
+  inbound ICMPv6 error (PMTUD Packet-Too-Big / traceroute Time-Exceeded)
+  carried over a native-GRE tunnel whose inner destination is a pool-mode
+  SNAT66 address is steered to the helper for embedded-ICMP reverse-NAT.
+  Investigation confirmed the prescribed one-arm fix was a no-op (the shim
+  had no `dnat_table_v6` reader) and that `dnat_table` is consulted ONLY in
+  the shim's native-GRE-inner classify path — the normal transit path
+  redirects via the per-queue binding and reverse-NATs from in-memory state.
+  Added: shim `DnatKeyV6`/`DnatValueV6` + `dnat_table_v6` map + exact-match
+  `dnat_lookup_v6` in `classify_native_gre_inner_ipv6` (exact-only to stay
+  under the 1M-insn BPF verifier cap — wildcard probe blew the gate);
+  `publish_dnat_table_entry` `(AF_INET6, V6)` arm via the new pure
+  `dnat_v6_entry_bytes`; `MapReplacements["dnat_table_v6"]` binding in the
+  Go loader; canary allowlist entry. Regenerated the verifier-gated shim
+  `.o` (PASS, pinned nightly-2026-05-23). No wire change — the map_pins
+  envelope already carried `dnat_table_v6`. Fail-on-revert tests:
+  `dnat_v6_entry_bytes_matches_struct_layout` + `publish_dnat_table_entry_v6_attempts_publish`
+  (proven RED when the v6 arm reverts to `_ => true`).
+- **File(s)**: userspace-xdp/src/lib.rs, pkg/dataplane/userspace_xdp_bpfel.o,
+  userspace-dp/src/afxdp/checksum.rs, userspace-dp/src/afxdp/tests.rs,
+  pkg/dataplane/loader_userspace_shim.go,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  docs/userspace-icmp-te-debugging.md, _Log.md
+
 ## 2026-06-25 — #2578: appid tuple fallback prefers port-based over protocol-only
 
 - **Timestamp**: 2026-06-25

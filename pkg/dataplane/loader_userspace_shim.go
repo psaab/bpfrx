@@ -101,6 +101,13 @@ func (m *Manager) loadUserspaceShimObjectsOnce() (err error) {
 	if dnat := sharedMaps["dnat_table"]; dnat != nil {
 		opts.MapReplacements["dnat_table"] = dnat
 	}
+	// #2406: bind the shim's dnat_table_v6 reader to the Go-created/pinned
+	// shared map so SNAT66-return entries published by the userspace-dp
+	// helper (publish_dnat_table_entry v6 arm) are visible to the shim's
+	// GRE-inner v6 classify (dnat_lookup_v6). Mirrors the v4 binding above.
+	if dnatV6 := sharedMaps["dnat_table_v6"]; dnatV6 != nil {
+		opts.MapReplacements["dnat_table_v6"] = dnatV6
+	}
 	userspaceCollection, err := ebpf.NewCollectionWithOptions(userspaceSpec, opts)
 	if err != nil {
 		return fmt.Errorf("load Rust xdp_userspace collection: %w", err)

@@ -198,6 +198,32 @@ struct DnatValueV4 {
     pad: u8,
 }
 
+// Mirrors `struct dnat_key_v6` / `struct dnat_value_v6` in
+// bpf/headers/xpf_maps.h (24-byte key, 20-byte value). The v6 reverse-NAT
+// table is the IPv6 analog of DNAT_TABLE: the userspace-dp helper publishes
+// a (proto, snat_ip, snat_port) -> (orig_src, orig_src_port) entry for each
+// SNAT66 flow so an inbound ICMPv6 error carried over a native-GRE tunnel
+// (whose inner destination is the SNAT pool address) is steered to the
+// helper for embedded-ICMP reverse-NAT (#2406).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnatKeyV6 {
+    protocol: u8,
+    pad: [u8; 3],
+    dst_ip: [u8; 16],
+    dst_port: u16,
+    from_zone: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnatValueV6 {
+    new_dst_ip: [u8; 16],
+    new_dst_port: u16,
+    flags: u8,
+    pad: u8,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UserspaceSessionKey {
@@ -330,6 +356,14 @@ static USERSPACE_INTERFACE_NAT_V6: HashMap<UserspaceLocalV6Key, u8> =
 // collection shares the same pinned dnat_table map fd.
 #[map(name = "dnat_table")]
 static DNAT_TABLE: HashMap<DnatKeyV4, DnatValueV4> =
+    HashMap::with_max_entries(USERSPACE_SHIM_MAX_DNAT_ENTRIES, BPF_F_NO_PREALLOC);
+
+// IPv6 reverse-NAT steering table. Shares the same pinned-map contract as
+// DNAT_TABLE above: the Go loader / userspace-dp coordinator reuse the
+// pinned dnat_table_v6 fd so SNAT66-return entries published by the helper
+// are visible to this classify path (#2406).
+#[map(name = "dnat_table_v6")]
+static DNAT_TABLE_V6: HashMap<DnatKeyV6, DnatValueV6> =
     HashMap::with_max_entries(USERSPACE_SHIM_MAX_DNAT_ENTRIES, BPF_F_NO_PREALLOC);
 
 #[map(name = "userspace_sessions")]
@@ -835,6 +869,28 @@ fn dnat_lookup_v4(protocol: u8, dst_ip: u32, dst_port: u16) -> Option<DnatValueV
     unsafe { DNAT_TABLE.get(&wildcard).copied() }
 }
 
+// Exact-match only: an SNAT66-return entry always carries a concrete
+// snat_port (publish_dnat_table_entry v6 arm writes `snat_port`), so the
+// exact key is what hits for the #2406 PMTUD/traceroute case. The v4 path
+// also probes a port-0 wildcard to catch port-less STATIC DNAT config, but
+// the second HASH lookup pushed xdp_userspace_prog over the 1M-insn BPF
+// verifier cap (#1864 complexity gate) when added to the v6 GRE-inner
+// classify. Port-wildcard static-DNAT-v6 carried inside a native-GRE tunnel
+// is not steered by this path; non-GRE DNAT-v6 is unaffected (it rides the
+// binding redirect, not dnat_table). Kept #[inline(always)] so the single
+// lookup folds into the caller without a separate BPF program symbol.
+#[inline(always)]
+fn dnat_lookup_v6(protocol: u8, dst_ip: &[u8; 16], dst_port: u16) -> Option<DnatValueV6> {
+    let exact = DnatKeyV6 {
+        protocol,
+        pad: [0; 3],
+        dst_ip: *dst_ip,
+        dst_port,
+        from_zone: 0,
+    };
+    unsafe { DNAT_TABLE_V6.get(&exact).copied() }
+}
+
 #[inline(never)]
 fn classify_native_gre_inner_ipv6(data: usize, data_end: usize, l3_offset: usize) -> u8 {
     let Some(ip6) = read_bytes(data, data_end, l3_offset, 40) else {
@@ -893,6 +949,20 @@ fn classify_native_gre_inner_ipv6(data: usize, data_end: usize, l3_offset: usize
     let action = unsafe { USERSPACE_SESSIONS.get(&key).copied() }.unwrap_or(0);
     if action != 0 {
         return action;
+    }
+    // SNAT66-return steering: an inbound ICMPv6 error (or reply) whose inner
+    // destination is a SNAT66 pool address has no live session of its own.
+    // The helper publishes the reverse mapping into dnat_table_v6; mirror the
+    // v4 path so the GRE-inner classify steers it to userspace for embedded-
+    // ICMP reverse-NAT (#2406). ICMPv6 echo flows key the dnat entry on the
+    // identifier (stored in src_port), matching publish_dnat_table_entry.
+    let dnat_port = if protocol == PROTO_ICMPV6 {
+        key.src_port
+    } else {
+        key.dst_port
+    };
+    if dnat_lookup_v6(protocol, &key.dst_addr, dnat_port).is_some() {
+        return USERSPACE_SESSION_ACTION_REDIRECT;
     }
     if protocol == PROTO_ICMPV6
         && icmp_type == 128

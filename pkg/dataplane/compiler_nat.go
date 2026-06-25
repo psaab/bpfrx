@@ -807,7 +807,12 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 								dk := DNATKey{
 									Protocol: proto,
 									DstIP:    ipToUint32BE(matchIP),
-									DstPort:  htons(dstPort),
+									// #2406: dnat_table KEY port is host-order
+									// numeric (the AF_XDP shim reader builds its
+									// lookup key from u16::from_be_bytes -> host
+									// order). dstPort is already host-order here,
+									// so store it raw (NOT htons).
+									DstPort:  dstPort,
 									FromZone: fromZone,
 								}
 								dv := DNATValue{
@@ -824,7 +829,8 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 								dk := DNATKeyV6{
 									Protocol: proto,
 									DstIP:    ipTo16Bytes(matchIP),
-									DstPort:  htons(dstPort),
+									// #2406: host-order KEY port (see v4 above).
+									DstPort:  dstPort,
 									FromZone: fromZone,
 								}
 								dv := DNATValueV6{
