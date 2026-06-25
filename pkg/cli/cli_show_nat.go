@@ -10,6 +10,22 @@ import (
 	"github.com/psaab/xpf/pkg/natshow"
 )
 
+// warnSessionScan prints a single operator warning to stderr when a
+// session enumeration used for a NAT/summary count was truncated by a
+// backend iterator error (e.g. a helper restart mid-scan). Without this
+// the CLI would print an under-count as if it were the full table —
+// the #2469 partial-as-success defect. nil errors are no-ops.
+func warnSessionScan(errs ...error) {
+	for _, err := range errs {
+		if err != nil {
+			fmt.Fprintf(os.Stderr,
+				"warning: session enumeration incomplete (counts below may be understated): %v\n",
+				err)
+			return
+		}
+	}
+}
+
 // handleShowNAT dispatches `show security nat ...` subcommands to the
 // per-NAT-mode presenters below.
 func (c *CLI) handleShowNAT(args []string) error {
@@ -118,7 +134,7 @@ func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
 	}
 
 	snatCount := 0
-	_ = c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	errV4 := c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
@@ -127,7 +143,7 @@ func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
 		}
 		return true
 	})
-	_ = c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	errV6 := c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
@@ -136,6 +152,9 @@ func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
 		}
 		return true
 	})
+	// A truncated scan (e.g. helper restart) under-counts; warn so the
+	// operator does not read the count as authoritative (#2469).
+	warnSessionScan(errV4, errV6)
 	fmt.Printf("Active SNAT sessions: %d\n", snatCount)
 
 	// Show NAT alloc fail counter
@@ -225,7 +244,7 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 			}
 		}
 		// Count SNAT sessions per zone pair
-		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+		errV4 := c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
 				totalSNAT++
 				if zoneByID != nil {
@@ -235,7 +254,7 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 			return true
 		})
 		// Count IPv6 SNAT sessions
-		_ = c.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		errV6 := c.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
 				totalSNAT++
 				if zoneByID != nil {
@@ -244,6 +263,9 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 			}
 			return true
 		})
+		// A truncated scan under-counts the per-pool/zone-pair session
+		// figures below; warn so they are not read as authoritative (#2469).
+		warnSessionScan(errV4, errV6)
 		for i := range pools {
 			if pools[i].isIface {
 				pools[i].used = rsSessions[pools[i].key]
@@ -536,7 +558,7 @@ func (c *CLI) showNATDestination(cfg *config.Config, args []string) error {
 	// Show summary of active DNAT sessions
 	if c.dp != nil && c.dp.IsLoaded() {
 		dnatCount := 0
-		_ = c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		errV4 := c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 			if val.IsReverse != 0 {
 				return true
 			}
@@ -545,7 +567,7 @@ func (c *CLI) showNATDestination(cfg *config.Config, args []string) error {
 			}
 			return true
 		})
-		_ = c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		errV6 := c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 			if val.IsReverse != 0 {
 				return true
 			}
@@ -554,6 +576,7 @@ func (c *CLI) showNATDestination(cfg *config.Config, args []string) error {
 			}
 			return true
 		})
+		warnSessionScan(errV4, errV6)
 		fmt.Printf("Active DNAT sessions: %d\n", dnatCount)
 	}
 
@@ -600,20 +623,21 @@ func (c *CLI) showNATDestinationSummary(cfg *config.Config) error {
 		for name, id := range cr.ZoneIDs {
 			zoneByID[id] = name
 		}
-		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+		errV4 := c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
 				totalDNAT++
 				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
 			}
 			return true
 		})
-		_ = c.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		errV6 := c.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
 				totalDNAT++
 				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
 			}
 			return true
 		})
+		warnSessionScan(errV4, errV6)
 	}
 
 	fmt.Printf("Total active translations: %d\n", totalDNAT)
