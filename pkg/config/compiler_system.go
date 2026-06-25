@@ -13,7 +13,7 @@ import (
 
 const sharedUMEMPhase0ArtifactMaxBytes = 16 << 20
 
-func compileSystem(node *Node, sys *SystemConfig) error {
+func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts) error {
 	dpType, err := compileSystemDataplaneType(node)
 	if err != nil {
 		return err
@@ -394,7 +394,7 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 
 	snmpNode := node.FindChild("snmp")
 	if snmpNode != nil {
-		if err := compileSNMP(snmpNode, sys); err != nil {
+		if err := compileSNMP(snmpNode, sys, cfg, opts.lenientSNMPTrapGroup); err != nil {
 			return err
 		}
 	}
@@ -856,7 +856,7 @@ func normalizeSharedUMEMArtifactInterfaceMap(artifact map[string]interface{}, ke
 	return nil
 }
 
-func compileSNMP(node *Node, sys *SystemConfig) error {
+func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error {
 	snmp := &SNMPConfig{
 		Communities: make(map[string]*SNMPCommunity),
 		TrapGroups:  make(map[string]*SNMPTrapGroup),
@@ -904,10 +904,49 @@ func compileSNMP(node *Node, sys *SystemConfig) error {
 					tgChildren = child.Children[0].Children
 				}
 				for _, prop := range tgChildren {
-					if prop.Name() == "targets" {
-						if v := nodeVal(prop); v != "" {
-							tg.Targets = append(tg.Targets, v)
+					switch prop.Name() {
+					case "targets":
+						// targets may carry multiple values: one per child
+						// (hierarchical `targets { a; b; }`) and/or packed in
+						// the leaf Keys (flat-set / bracketed list).
+						tg.Targets = append(tg.Targets, firewallMatchValues(prop)...)
+					case "version", "categories":
+						// Accepted trap-group leaves (schema-declared). Not
+						// consumed by the link-trap runtime today; recognized
+						// here so a valid key does not trip the unknown-key
+						// rejection below.
+					default:
+						// #2990: a typoed child key (e.g. `tragets`) would
+						// otherwise be silently dropped, committing a trap
+						// group with zero targets that sends nothing. Strict
+						// (commit / commit-check): reject so the operator is
+						// told about the typo instead of losing every
+						// notification at runtime. Lenient (load / HA-sync):
+						// downgrade to a warning so an already-persisted bad
+						// config still boots — the runtime ignores the unknown
+						// key, so it is inert (#1960 fail-closed-on-load).
+						if !lenient {
+							return fmt.Errorf("snmp trap-group %q: unknown statement %q (valid: targets, version, categories)", tgName, prop.Name())
 						}
+						if cfg != nil {
+							cfg.Warnings = append(cfg.Warnings,
+								fmt.Sprintf("snmp trap-group %q: unknown statement %q (downgraded to warning on tolerant path; ignored at runtime)", tgName, prop.Name()))
+						}
+					}
+				}
+				// #2990: a trap group with no targets sends nothing. Strict:
+				// reject rather than presenting a configured-but-inert group
+				// (this also catches a bare `set snmp trap-group g1` with no
+				// children). Lenient: warn so an already-persisted zero-target
+				// group still boots — sendLinkTraps skips a zero-target group,
+				// so it is inert (#1960).
+				if len(tg.Targets) == 0 {
+					if !lenient {
+						return fmt.Errorf("snmp trap-group %q: no targets configured (a trap group with zero targets sends no notifications)", tgName)
+					}
+					if cfg != nil {
+						cfg.Warnings = append(cfg.Warnings,
+							fmt.Sprintf("snmp trap-group %q: no targets configured (downgraded to warning on tolerant path; sends no notifications)", tgName))
 					}
 				}
 				snmp.TrapGroups[tg.Name] = tg

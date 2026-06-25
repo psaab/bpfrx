@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -183,7 +184,42 @@ type Agent struct {
 	cfgMu   sync.RWMutex
 	cfg     *config.SNMPConfig  // authorization + sysContact/Location/Description
 	v3Users map[string]*usmUser // SNMPv3 USM users (keyed by name)
+
+	// Asynchronous trap delivery (#2991). Link-state traps are emitted from
+	// the daemon's netlink link-monitor goroutine; sendTrap does a blocking
+	// net.DialTimeout (and DNS resolution for an FQDN target) that, done
+	// inline, would stall link processing for up to dialTimeout × target
+	// count when a target is dead or slow. Instead sendLinkTraps enqueues a
+	// pre-built packet onto a small bounded channel drained by a single
+	// worker goroutine. The queue is started lazily (works for both NewAgent
+	// and bare-struct test agents) and is capacity-bounded: when full, the
+	// trap is dropped and trapsDropped is incremented rather than blocking
+	// the caller. A single worker bounds goroutine growth (no per-trap
+	// goroutine storm) while still serializing the slow dials off the hot
+	// link-monitor path.
+	trapQueue      chan trapJob
+	trapWorkerOnce sync.Once
+	trapsDropped   atomic.Uint64
 }
+
+// trapJob is one queued trap-delivery unit: a pre-built SNMP packet and its
+// destination target (host or host:port). The packet is built on the caller's
+// goroutine (cheap, allocation only) and the blocking dial/write happens on the
+// worker.
+type trapJob struct {
+	target  string
+	pkt     []byte
+	group   string
+	event   string
+	iface   string
+	ifindex int
+}
+
+// trapQueueDepth bounds the number of pending trap deliveries. A handful of
+// targets times a short burst of link flaps fits comfortably; past this the
+// targets are clearly not draining and dropping is preferable to unbounded
+// memory growth or blocking the link monitor.
+const trapQueueDepth = 256
 
 // NewAgent creates a new SNMP agent with the given configuration. The
 // SNMPv3 engineBoots counter is loaded from defaultEngineBootsPath,

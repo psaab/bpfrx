@@ -228,8 +228,31 @@ authorization surface: every request is dropped because no community matches.
   varbind fits. This prevents emitting an oversized UDP datagram that the peer
   or the network would fragment or drop. See `effectiveMaxSize` / `trimToFit`
   in `agent.go`.
-- Traps fire immediately on link-state change — they aren't queued, so
-  back-to-back link flaps produce back-to-back traps.
+- **Trap delivery is asynchronous and bounded (#2991).** Link-state traps
+  are emitted from the daemon's netlink link-monitor goroutine.
+  `sendLinkTraps` builds the packet on the caller's goroutine (cheap) and
+  enqueues one job per target onto a bounded channel
+  (`trapQueueDepth = 256`) drained by a single worker goroutine; the
+  blocking `net.DialTimeout` (and DNS resolution for an FQDN target) runs
+  on the worker, NOT on the link monitor. A dead or slow target therefore
+  cannot stall link-state processing. The queue is started lazily (works
+  for both `NewAgent` and bare-struct test agents). When the queue is full
+  the trap is DROPPED and `trapsDropped` is incremented rather than
+  blocking the caller — dropping is the correct backpressure when targets
+  are not draining. The delivery is replaceable through the `trapSender`
+  package var (the seam tests use to inject a slow sender). Before #2991
+  delivery was synchronous and inline, so an unreachable trap target (or a
+  hung DNS lookup for an FQDN target) blocked link-state processing for up
+  to the 2s dial timeout × target count.
+- **The v2c trap community is selected deterministically (#2989).**
+  `selectTrapCommunity` picks the lexicographically-first configured
+  community (falling back to `public` when none is configured). The old
+  code ranged the `Communities` map and broke on the first entry, which —
+  because Go map iteration is randomized — picked a different community per
+  run when more than one was configured, so a collector accepting only one
+  community saw flaky traps and a less-privileged community could leak
+  through the wrong credential boundary. Trap groups are likewise iterated
+  in sorted order so dispatch and log output are reproducible.
 - Don't add a third BER library to this package. The hand-coded encoder
   is intentional; keeping the surface small avoids bringing in an SNMP
   framework with its own poll loop and threading model.

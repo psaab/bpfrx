@@ -525,20 +525,42 @@ pub(in crate::afxdp) fn term_match_extra_from_frame_fwd(
 /// 0/false — a CoS-action filter term keyed on is-fragment or icmp-type on one
 /// of these non-transit paths under-matches rather than mis-matches. The common
 /// `tcp-flags` CoS term is fully covered.
+///
+/// #3008 (meta sibling of #2449): the real ICMP type/code bytes are NOT
+/// available on this meta-only path — there is no frame to read them from. The
+/// pre-#3008 code stamped `icmp_type = icmp_code = 0` while leaving
+/// `l4_present = true`, so any term keyed on `icmp-type 0` (echo-reply) or
+/// `icmp-code 0` (a *valid*, common value) FALSE-MATCHED every ICMP-family
+/// packet whose type/code was never parsed. The matcher gates the
+/// icmp-type / icmp-code terms on `l4_present`, so for an ICMP/ICMPv6 packet on
+/// this path we MUST drop `l4_present` to make those terms fail closed — the
+/// type/code is genuinely unknown, so an `icmp-type N` / `icmp-code N` term must
+/// NOT match. For non-ICMP protocols `l4_present` stays true so the
+/// authoritative shim-stamped `tcp_flags` keeps matching (tcp-flags terms only
+/// apply to TCP anyway). `icmp_type` / `icmp_code` are left 0 but are now inert
+/// on the ICMP path because the `l4_present` gate rejects the term first.
 #[inline]
 pub(in crate::afxdp) fn term_match_extra_from_meta(
     meta: ForwardPacketMeta,
 ) -> crate::filter::TermMatchExtra {
+    use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6};
+    // #3008: the ICMP type/code bytes are unknown on the meta-only path (no
+    // frame). A 0 byte is a real `icmp-type 0` / `icmp-code 0` value, so we must
+    // signal "L4 type/code not parsed" to fail those terms closed. The matcher
+    // shares one `l4_present` bit across tcp-flags and icmp-type/code; for an
+    // ICMP-family packet there are no tcp-flags terms to preserve, so dropping
+    // `l4_present` is safe and fails the icmp-type/code terms closed. For TCP/
+    // UDP it stays true so authoritative `tcp_flags` matching is preserved.
+    let is_icmp = matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6);
     crate::filter::TermMatchExtra {
         tcp_flags: meta.tcp_flags,
         is_fragment: false,
         icmp_type: 0,
         icmp_code: 0,
-        // TRUE: these synthetic / locally-stamped packets carry a real L4
-        // header and are never IP fragments, so a legit tcp-flags match keeps
-        // working. The 0 icmp bytes are an under-match (frame unavailable), NOT
-        // an absent-L4 signal.
-        l4_present: true,
+        // FALSE for ICMP/ICMPv6 (type/code genuinely unknown — fail
+        // icmp-type/code terms closed); TRUE otherwise so the shim-stamped
+        // tcp_flags still drives tcp-flags matching on synthetic/local TX.
+        l4_present: !is_icmp,
     }
 }
 

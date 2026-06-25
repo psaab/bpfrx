@@ -312,6 +312,26 @@ recycled before the deferred recompute runs. The flow-cache decline (output and
 input legs) keeps the precomputed TX-selection descriptor from being built for a
 per-packet-L4 filter, so the live per-packet evaluator always runs.
 
+#2449 also covers a NON-FRAGMENTED but TRUNCATED ICMP/ICMPv6 frame (shorter than
+`l4_offset + 2`, so the type/code bytes are absent): the frame builders force
+`(0, 0, 0)` AND drop `l4_present`, failing the icmp-type/code terms closed rather
+than spuriously matching `icmp-type 0` / `icmp-code 0`.
+
+**Meta-only builder (`term_match_extra_from_meta`, #3008 — meta sibling of
+#2449).** A few cold TX-selection callers (re-derived locally-generated replies,
+ARP/NDP-deferred forwards, control-plane injects;
+`poll_descriptor/mod.rs`, `tunnel.rs`, `tx/cos_classify.rs`) have NO contiguous
+ingress frame, so the real ICMP type/code can never be read. The shim-stamped
+`tcp_flags` is still authoritative, but `icmp_type`/`icmp_code` are unknown. The
+matcher shares ONE `l4_present` bit across tcp-flags AND icmp-type/code, so the
+builder sets `l4_present = false` for the ICMP/ICMPv6 family (failing the
+icmp-type/code terms closed — the type/code is genuinely unknown) and
+`l4_present = true` otherwise (preserving authoritative `tcp_flags` matching;
+tcp-flags terms only apply to TCP). Before #3008 this builder stamped an
+unconditional `l4_present = true` with `icmp_type = icmp_code = 0`, so a term
+keyed on `icmp-type 0` (echo-reply) or `icmp-code 0` false-matched every
+ICMP-family packet on these paths.
+
 Fields like `action`, `count`, `log`, `policer`, `routing_instance`,
 `forwarding_class`, and `dscp_rewrite` are forwarding actions and
 modifiers, applied after a match has succeeded. They do not

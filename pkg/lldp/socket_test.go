@@ -48,8 +48,8 @@ func TestSessionRecvUnblocksOnClose(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		buf := make([]byte, 64)
-		close(started)               // signal: about to enter recv
-		_, _ = sess.recv(buf)        // blocks until close() unblocks the fd
+		close(started)           // signal: about to enter recv
+		_, _, _ = sess.recv(buf) // blocks until close() unblocks the fd
 		close(done)
 	}()
 
@@ -206,19 +206,19 @@ func TestRxLoopRetriesTransientRecvErrors(t *testing.T) {
 	var step int32
 	sess := &ifSession{
 		iface: &net.Interface{Name: "test0", Index: 1},
-		recvFn: func(buf []byte) (int, error) {
+		recvFn: func(buf []byte) (int, int, error) {
 			switch atomic.AddInt32(&step, 1) {
 			case 1:
-				return 0, unix.EINTR // must be retried, not fatal
+				return 0, 0, unix.EINTR // must be retried, not fatal
 			case 2:
-				return 0, unix.EAGAIN // must be retried, not fatal
+				return 0, 0, unix.EAGAIN // must be retried, not fatal
 			case 3:
-				return copy(buf, frame), nil // the one real frame
+				return copy(buf, frame), unix.PACKET_HOST, nil // the one real frame
 			default:
 				// Park until ctx is cancelled, then report a fatal error so
 				// rxLoop takes the cancel-exit path.
 				<-gate
-				return 0, unix.EBADF
+				return 0, 0, unix.EBADF
 			}
 		},
 	}
@@ -284,19 +284,19 @@ func TestRxLoopSurvivesNonTransientRecvError(t *testing.T) {
 	var step int32
 	sess := &ifSession{
 		iface: &net.Interface{Name: "test0", Index: 1},
-		recvFn: func(buf []byte) (int, error) {
+		recvFn: func(buf []byte) (int, int, error) {
 			switch atomic.AddInt32(&step, 1) {
 			case 1:
 				// Non-transient operational error with ctx live: the loop must
 				// back off and retry, NOT exit.
-				return 0, unix.ENETDOWN
+				return 0, 0, unix.ENETDOWN
 			case 2:
-				return copy(buf, frame), nil // the one real frame, post-recovery
+				return copy(buf, frame), unix.PACKET_HOST, nil // the one real frame, post-recovery
 			default:
 				// Park until ctx is cancelled, then report a fatal error so
 				// rxLoop takes the cancel-exit path.
 				<-gate
-				return 0, unix.EBADF
+				return 0, 0, unix.EBADF
 			}
 		},
 	}
@@ -348,11 +348,11 @@ func TestRxLoopBackoffInterruptedByCancel(t *testing.T) {
 	var once sync.Once
 	sess := &ifSession{
 		iface: &net.Interface{Name: "test0", Index: 1},
-		recvFn: func(buf []byte) (int, error) {
+		recvFn: func(buf []byte) (int, int, error) {
 			// Signal once that we have entered recv and are about to return the
 			// non-transient error that drives rxLoop into the backoff select.
 			once.Do(func() { close(entered) })
-			return 0, unix.ENETDOWN
+			return 0, 0, unix.ENETDOWN
 		},
 	}
 
@@ -409,5 +409,101 @@ func TestApplySkipsInterfaceOnSocketError(t *testing.T) {
 	case <-doneCh:
 	case <-time.After(time.Second):
 		t.Fatal("Stop() stalled after Apply skipped all interfaces")
+	}
+}
+
+// TestRxLoopSkipsSelfTransmittedFrames is the fail-on-revert regression test
+// for #2992. The LLDP RX AF_PACKET socket is bound to ETH_P_LLDP and also
+// receives this host's OWN transmitted LLDP advertisements, which the kernel
+// loops back marked PACKET_OUTGOING. Without a pkttype filter the daemon parses
+// those frames and learns itself as a neighbor on every LLDP-enabled link.
+//
+// This drives rxLoop through the recvFn seam: step 1 delivers a valid LLDP
+// frame marked PACKET_OUTGOING (the host's own advertisement looped back) — it
+// MUST be skipped; step 2 delivers an otherwise-identical valid LLDP frame
+// marked PACKET_HOST (a genuine inbound peer frame) — it MUST be learned.
+//
+// Non-tautological / fail-on-revert: if the `pkttype == unix.PACKET_OUTGOING`
+// skip in rxLoop is removed, the step-1 self frame is learned too, so the
+// neighbor table holds the self chassis and the strict "exactly the peer,
+// never the self" assertions fail.
+func TestRxLoopSkipsSelfTransmittedFrames(t *testing.T) {
+	selfMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0xAA}
+	peerMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0xBB}
+
+	selfFrame, err := BuildFrame(selfMAC, "self0", 120, "self-node", "")
+	if err != nil {
+		t.Fatalf("BuildFrame self: %v", err)
+	}
+	peerFrame, err := BuildFrame(peerMAC, "peer0", 120, "peer-node", "")
+	if err != nil {
+		t.Fatalf("BuildFrame peer: %v", err)
+	}
+
+	// ParseTLVs renders a MAC chassis ID via net.HardwareAddr.String().
+	selfChassis := selfMAC.String()
+	peerChassis := peerMAC.String()
+
+	gate := make(chan struct{})
+	var step int32
+	sess := &ifSession{
+		iface: &net.Interface{Name: "test0", Index: 1},
+		recvFn: func(buf []byte) (int, int, error) {
+			switch atomic.AddInt32(&step, 1) {
+			case 1:
+				// The host's own advertisement looped back on the RX socket.
+				// MUST be skipped (not learned).
+				return copy(buf, selfFrame), unix.PACKET_OUTGOING, nil
+			case 2:
+				// A genuine inbound peer frame. MUST be learned.
+				return copy(buf, peerFrame), unix.PACKET_HOST, nil
+			default:
+				// Park until ctx is cancelled, then report a fatal error so
+				// rxLoop takes the cancel-exit path.
+				<-gate
+				return 0, 0, unix.EBADF
+			}
+		},
+	}
+
+	m := New()
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		m.rxLoop(ctx, sess)
+		close(loopDone)
+	}()
+
+	// Wait until the peer frame has been processed (the only frame that should
+	// ever produce a neighbor).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(m.Neighbors()) > 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	neighbors := m.Neighbors()
+	if len(neighbors) != 1 {
+		t.Fatalf("want exactly 1 learned neighbor (the peer), got %d: %+v "+
+			"(the PACKET_OUTGOING self frame must be skipped, not learned)",
+			len(neighbors), neighbors)
+	}
+	got := neighbors[0]
+	if got.ChassisID == selfChassis {
+		t.Fatalf("daemon learned its OWN transmitted frame (chassis %q) as a neighbor", selfChassis)
+	}
+	if got.ChassisID != peerChassis {
+		t.Fatalf("learned neighbor chassis = %q, want peer %q (self %q must be skipped)",
+			got.ChassisID, peerChassis, selfChassis)
+	}
+
+	cancel()
+	close(gate)
+	select {
+	case <-loopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rxLoop did not exit after ctx cancellation")
 	}
 }

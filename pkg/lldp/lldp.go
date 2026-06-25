@@ -113,9 +113,13 @@ type ifSession struct {
 
 	// recvFn, when non-nil, replaces the real unix.Recvfrom-based recv. It is
 	// the test seam for exercising rxLoop's transient-error handling (EINTR /
-	// EAGAIN retry vs fatal exit) deterministically, without a real socket or
-	// signal delivery. Production leaves it nil.
-	recvFn func(buf []byte) (int, error)
+	// EAGAIN retry vs fatal exit) and the PACKET_OUTGOING self-frame filter
+	// deterministically, without a real socket or signal delivery. The middle
+	// return value is the AF_PACKET sll_pkttype of the received frame (e.g.
+	// unix.PACKET_HOST for an inbound peer frame, unix.PACKET_OUTGOING for the
+	// host's own transmitted frame looped back on the socket). Production leaves
+	// it nil.
+	recvFn func(buf []byte) (int, int, error)
 }
 
 // newIfSessionFn is the construction seam for ifSession. Tests override it to
@@ -150,13 +154,26 @@ func newIfSession(iface *net.Interface) (*ifSession, error) {
 }
 
 // recv reads one frame from the RX socket. It blocks until a frame arrives or
-// the fd is closed by close().
-func (s *ifSession) recv(buf []byte) (int, error) {
+// the fd is closed by close(). It returns the number of bytes read and the
+// AF_PACKET packet type (sll_pkttype) from the returned sockaddr_ll. The packet
+// type lets rxLoop distinguish a genuine inbound peer frame (PACKET_HOST /
+// PACKET_MULTICAST / PACKET_BROADCAST) from the host's own transmitted frame
+// that the kernel loops back on the same AF_PACKET socket (PACKET_OUTGOING).
+// Without that distinction the daemon learns its own LLDP advertisements as a
+// neighbor (#2992).
+func (s *ifSession) recv(buf []byte) (int, int, error) {
 	if s.recvFn != nil {
 		return s.recvFn(buf)
 	}
-	n, _, err := unix.Recvfrom(s.rxFD, buf, 0)
-	return n, err
+	n, from, err := unix.Recvfrom(s.rxFD, buf, 0)
+	if err != nil {
+		return n, 0, err
+	}
+	pkttype := 0
+	if sll, ok := from.(*unix.SockaddrLinklayer); ok {
+		pkttype = int(sll.Pkttype)
+	}
+	return n, pkttype, err
 }
 
 // send transmits an LLDP frame to the multicast destination on the bound
@@ -413,7 +430,7 @@ func (m *Manager) rxLoop(ctx context.Context, sess *ifSession) {
 	iface := sess.iface
 	buf := make([]byte, 1600)
 	for {
-		n, err := sess.recv(buf)
+		n, pkttype, err := sess.recv(buf)
 		if err != nil {
 			// Transient, non-fatal recv errors must not kill neighbor
 			// discovery on a long-running daemon. EINTR can be delivered to a
@@ -450,6 +467,20 @@ func (m *Manager) rxLoop(ctx context.Context, sess *ifSession) {
 			continue
 		}
 		if n < ethHdrLen {
+			continue
+		}
+
+		// Skip the host's own transmitted LLDP frames. The RX AF_PACKET socket
+		// is bound to ETH_P_LLDP and also receives this host's own outgoing LLDP
+		// advertisements (the kernel loops every transmitted frame of the bound
+		// protocol back to AF_PACKET listeners, marked PACKET_OUTGOING). Parsing
+		// them would learn the firewall as its own neighbor on every LLDP-enabled
+		// link, polluting `show lldp neighbors` (#2992). The EtherType and the
+		// well-known multicast destination are already kernel-filtered; the
+		// remaining self-frame source is the loopback of our own transmissions,
+		// which the kernel marks PACKET_OUTGOING. Genuine inbound peer frames
+		// carry PACKET_HOST / PACKET_MULTICAST / PACKET_BROADCAST and are kept.
+		if pkttype == unix.PACKET_OUTGOING {
 			continue
 		}
 

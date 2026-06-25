@@ -118,6 +118,28 @@ logging rules, not these specific hot-path constants.
   plus a full budget at the start of window N+1). `allow_at(now, len)` is
   the clock-injectable core so the boundary behaviour is unit-tested
   fail-on-revert without sleeping; `allow(len)` is the production wrapper.
+- **dnat_table reverse-NAT lifecycle (#2979)**: when an SNAT'd session
+  installs, the worker poll path calls `publish_dnat_table_entry`
+  (`src/afxdp/checksum.rs`) to write a DYNAMIC (flags=0) reverse-NAT
+  record into `dnat_table` / `dnat_table_v6` so the embedded-ICMP handler
+  can reverse-NAT inbound ICMP errors (PMTUD / traceroute) back to the
+  original source. Those maps are `BPF_MAP_TYPE_HASH`,
+  `max_entries = MAX_SESSIONS`, `BPF_F_NO_PREALLOC` — **NOT LRU**, so
+  nothing self-evicts. The session Close/expiry handler
+  (`flush_session_deltas` in `src/afxdp/session_delta.rs`) therefore MUST
+  delete the matching entry via `delete_dnat_table_entry`, alongside the
+  `session_map` / conntrack cleanup, or every closed SNAT session leaks
+  one entry until the map fills and new reverse-NAT publishes fail (the
+  #2244 capacity error). The delete key is derived from the SAME
+  `dnat_v4_key_bytes` / `dnat_v6_key_bytes` helpers the publish path uses,
+  so it byte-matches the insert key exactly (a mismatched key would leave
+  the leak). The delete keys ONLY on the forward key + nat decision (the
+  Close delta is gated on `!is_reverse`), is a no-op for non-SNAT flows
+  (no `rewrite_src` → no key), and ENOENT on an absent key is benign.
+  Compiler-managed STATIC DNAT-config entries (flags=1) are never
+  published or deleted by this path. Fail-on-revert: the wiring test
+  `close_delta_deletes_dnat_table_entry_for_snat_flow` plus the key-SSOT
+  tests in `src/afxdp/tests.rs`.
 - `HEARTBEAT_GRACE_PERIOD_NS = 6 s` is defined in
   `userspace-dp/src/afxdp/mod.rs` but currently `#[allow(dead_code)]`
   — reserved for future XDP-shim heartbeat gating logic. Workers
