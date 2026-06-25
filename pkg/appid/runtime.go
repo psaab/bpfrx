@@ -129,11 +129,28 @@ func sortedNames(names map[string]struct{}) []string {
 
 func resolveTupleFallback(proto uint8, dstPort uint16, cfg *config.Config) string {
 	if cfg != nil {
+		// #2578: cfg.Applications.Applications is a Go map; iterating it and
+		// returning the first match is non-deterministic. When BOTH a
+		// port-constrained app (e.g. tcp/8443) and a protocol-only app (tcp)
+		// match the same session, the more-specific port-based app must win,
+		// deterministically. Scan all matches, prefer a port-constrained app
+		// (DestinationPort != "") over a protocol-only one, and break ties by
+		// name so the result is stable regardless of map iteration order.
+		best := ""
+		bestPortBased := false
 		for name, app := range cfg.Applications.Applications {
 			if !matchTuple(proto, dstPort, app.Protocol, app.DestinationPort) {
 				continue
 			}
-			return name
+			portBased := app.DestinationPort != ""
+			if best == "" || (portBased && !bestPortBased) ||
+				(portBased == bestPortBased && name < best) {
+				best = name
+				bestPortBased = portBased
+			}
+		}
+		if best != "" {
+			return best
 		}
 	}
 	for name, ba := range builtinFallbacks {
