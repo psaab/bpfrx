@@ -1,3 +1,33 @@
+## 2026-06-25 — #2937: screen flood + SYN-cookie standby-ACK rate limiting switched from fixed wall-second window to a sliding 1-second window
+
+- **Timestamp**: 2026-06-25
+- **Action**: `screen/rate.rs` `RateCounter::increment` was a fixed
+  wall-second window — it reset `count` to zero every time `now_secs`
+  advanced. That admitted a boundary double-burst: full budget at the end
+  of second N + full budget at the start of N+1 = ~2x the configured
+  threshold in a sub-millisecond straddle, defeating the ICMP/UDP/SYN
+  flood screens and letting the standby SYN-cookie ACK validator spend
+  ~2x the intended SipHash budget (codex-review-055 055-04). Fix: replaced
+  the single-bucket fixed window with a two-bucket sliding-window counter.
+  A second `prev_count` retains the immediately preceding second's tally;
+  admission gates on `prev_count + count <= threshold`, so the prior
+  second still counts for the whole of the current second and the trailing
+  1-second sum stays bounded across any boundary. A >=2-second gap clears
+  `prev_count` (no stale carryover). Hot path stays allocation-free and
+  integer-only. Signature (`now_secs`, `threshold`) and the `pub(super)
+  count` accessor are unchanged — no caller edits.
+- **File(s)**: userspace-dp/src/screen/rate.rs (sliding window + 4 unit
+  tests incl. FAIL-ON-REVERT boundary_double_burst_is_bounded);
+  userspace-dp/src/screen/tests.rs (icmp_flood + standby-ack window tests
+  rewritten to assert no boundary reset); userspace-dp/src/screen/mod.rs
+  (module doc); docs/syn-cookie-flood-protection.md (standby-ACK limiter
+  doc).
+- **Validation**: `cargo build --release -p xpf-userspace-dp` clean;
+  `cargo test screen` 136/136 + `screen::rate` 4/4 green. Fail-on-revert:
+  restoring the fixed-window `increment` makes
+  `boundary_double_burst_is_bounded` RED (tripped_after_boundary left:0
+  right:100 — fixed window admits all 2N).
+
 ## 2026-06-25 — #2918: neighbor initial dump consumed and dropped seq-0 multicast RTM_NEWNEIGH/DELNEIGH events
 
 - **Timestamp**: 2026-06-25
@@ -77,6 +107,40 @@
   ./pkg/frr/... ./pkg/config/..., go test ./pkg/frr/... ./pkg/config/... all
   green; fail-on-revert proven — reverting the family-aware default turns the
   v6 case RED with the exact pre-fix `ip route 0.0.0.0/0 2001:db8::1 250`.
+
+## 2026-06-25 — #2903: DDNS Surface A FQDN rename — new name unpublished + old name orphaned
+
+- **Timestamp**: 2026-06-25
+- **Action**: Surface A's `ScopeKey` had no FQDN axis, so changing only the
+  configured hostname for a scope (same IP) (1) was NOT detected as a change —
+  the `owned && !changed && !refreshDue` skip fired, so the new name was never
+  published; and (2) when a publish did occur the in-place ownership overwrite
+  stored the new FQDN under the SAME scope key and never `DeleteLease`'d the old
+  name — the old RR was orphaned (kept resolving forever). Fix: added an `FQDN`
+  field to `ScopeKey` and made the published name part of the Surface A scope
+  identity. `scopePrefix()` appends `/fqdn=<name>` only when non-empty, so a
+  DHCP-lease (Surface B) scope keeps its pre-#2903 prefix byte-for-byte (no
+  lease-store migration). The manager folds `SurfaceAScope.FQDN` into the key via
+  a new `effectiveKey()` used by every ownership/runtime/status lookup, so a
+  hostname change is a rename: the new scope publishes (Pass 1) and the old scope
+  — now gone-from-config — is withdrawn (Pass 2, real DeleteLease through the
+  same backend). Composes with #2778 lock-IO, #2820, #2840, #2843 status, #2846.
+- **File(s)**: pkg/ddns/state.go (ScopeKey.FQDN + scopePrefix), pkg/ddns/surface_a.go
+  (effectiveKey + adopt-on-migration + all ownership lookups),
+  pkg/daemon/daemon_ddns_surface_a.go (populate Key.FQDN),
+  pkg/ddns/surface_a_test.go (fail-on-revert tests + helper), pkg/ddns/README.md
+- **Validation**: go build ./..., gofmt -l (edited files clean), go vet
+  ./pkg/ddns/... ./pkg/daemon/..., go test -race ./pkg/ddns/... ./pkg/daemon/...
+- **Fail-on-revert matrix** (review #2924 follow-up — corrected from the original
+  over-claim that pinned the revert to effectiveKey): the LOAD-BEARING change is
+  `scopePrefix()` appending `/fqdn=`. Dropping it turns
+  TestSurfaceAFQDNChangeDetectedAndPublished + TestSurfaceAFQDNChangeWithdrawsOldName
+  RED (new name unpublished + zero deletes). The effectiveKey() FOLD is guarded
+  separately by TestSurfaceAFQDNFoldFromScopeFQDN (Key.FQDN empty, only
+  SurfaceAScope.FQDN set) — RED when effectiveKey reverts to `return s.Key`. The
+  adopt block is guarded by TestSurfaceAFQDNMigrationAdoptsExistingRecord (seed
+  legacyKey.FQDN="" so a real pre-#2903 FQDN-less record exists) — RED when the
+  adopt branch is disabled.
 
 ## 2026-06-25 — #2867: VRRP GARP/NA burst follow-up loops keep poisoning after abdication
 
@@ -17632,3 +17696,28 @@ top.
   ./pkg/config/... PASS.
 - **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go, pkg/frr/README.md,
   _Log.md
+- **Action**: Fix three REST query-filter bugs (#2934/#2935/#2939) — fail
+  closed on malformed filters, align protocol matching with gRPC/CLI, and
+  switch the event filter from substring to exact match.
+  - #2934: REST `zone` (uint16) and policy-match `dst_port` (int) filters
+    returned the default (0 = "no filter"/"any port") on a parse error,
+    silently widening the query — a cross-zone observability leak. Added
+    `queryUint16Strict`/`queryIntStrict` (api.go) that return (0,false) on
+    a malformed non-empty value; sessions/events `zone` and policy-match
+    `dst_port` now return HTTP 400, mirroring gRPC sessionFilter.validate.
+  - #2935: REST session `protocol` filter compared the rendered name
+    case-SENSITIVELY with no numeric form. Added `protoFilterMatches`
+    (sessions.go) — case-insensitive name OR numeric IP-proto — mirroring
+    gRPC/CLI. `tcp`/`TCP`/`6` all match TCP now.
+  - #2939: `EventFilter.matches` (pkg/logging/eventbuf.go) used
+    `strings.Contains` (substring) → `protocol=C` matched TCP+ICMP+ICMPv6.
+    Switched to `strings.EqualFold` exact match for Protocol and Action.
+  - Fail-on-revert proofs (copy-aside + revert, all RED without fix):
+    zone=abc/65536 → 200+leak; dst_port=abc → 200 false-PERMIT; proto
+    tcp/6 → 0 sessions; event protocol=C → 3 events, action=per → 2.
+  - Gates: go build ./..., go vet ./pkg/api/..., go test ./pkg/api/...,
+    ./pkg/logging/..., ./pkg/grpcapi/, ./pkg/cli/ PASS; gofmt clean on
+    touched files.
+- **File(s)**: pkg/api/api.go, pkg/api/sessions.go, pkg/api/security.go,
+  pkg/logging/eventbuf.go, pkg/api/rest_filter_failclosed_test.go,
+  pkg/api/README.md, _Log.md

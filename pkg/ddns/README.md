@@ -213,13 +213,33 @@ identify the broken record and watch it recover:
 
 P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
 
-- **ScopeKey (`state.go`, #2663/#2664, plan §5.4)** — the unifying ownership
-  primitive `{Family, Interface, Unit, RoutingInstance, RGOwner, PolicyID}`.
+- **ScopeKey (`state.go`, #2663/#2664/#2903, plan §5.4)** — the unifying
+  ownership primitive
+  `{Family, Interface, Unit, RoutingInstance, RGOwner, PolicyID, FQDN}`.
   Ownership records are now keyed by `{ScopeKey, identity, address}`. The ZERO
   scope reproduces the pre-P1b `identity|address` key byte-for-byte (the `scope`
   JSON field is a `*ScopeKey`, omitted for the global lease scope), so a pre-P1b
   store loads with **no migration**. Two scopes for the same name+address (a v4
   vs v6 publish, or an RG0-owned vs RG1-owned publish) are DISTINCT entries.
+  **FQDN axis (#2903)** — the published name is part of a *Surface A* scope's
+  identity: `scopePrefix()` appends `/fqdn=<name>` only when FQDN is non-empty,
+  so a DHCP-lease (Surface B) scope leaves FQDN empty and keeps its pre-#2903
+  prefix byte-for-byte (no lease-store migration). Changing the configured
+  hostname for a Surface A binding therefore yields a DIFFERENT scope key, which
+  the reconciler treats as a rename — the OLD name is withdrawn by the
+  gone-from-config sweep (Pass 2) and the NEW name is published — instead of an
+  in-place name overwrite that published the new name but ORPHANED the old RR
+  (the #2903 data-loss bug). The manager always folds `SurfaceAScope.FQDN` into
+  the key via `effectiveKey()`, so the lookup, the stored Scope, and StatusViews
+  agree regardless of whether the caller pre-populated `Key.FQDN`.
+  **On-disk upgrade is blackhole-safe:** a pre-#2903 record sits under the
+  FQDN-less prefix while the configured scope now keys under the FQDN-bearing
+  prefix with the SAME name+address. Pass 1 (re)publishes under the new prefix;
+  Pass 2 detects that the stale entry's `{FQDN, AddrText}` is still live (owned
+  by a configured scope) and ADOPTS it — drops the stale ownership WITHOUT an
+  exact-RR delete that would have removed the just-published live RR. A genuine
+  rename changes the name, so its old `{FQDN, AddrText}` is NOT in the live set
+  and the withdraw still fires.
 - **Independent v4/v6 policy (#2663)** — `Reconcile` →
   `ReconcileScoped` resolves an INDEPENDENT policy + backend PER FAMILY
   (`reconcileEnv.pol[2]`/`updater[2]`) from `DHCPServerConfig.DynamicDNS` (v4)
@@ -328,7 +348,12 @@ its OWN learned address — on top of the SAME spine, without forking the engine
   - **change detection + last-published cache** — a wire UPDATE fires only when
     the observed address changed (or the forced-refresh floor elapsed). The
     cache is seeded from the durable store on restart (`seedFromStore`) so a
-    restart does not blast a redundant update.
+    restart does not blast a redundant update. **A FQDN change is also a change
+    (#2903):** the published name is part of the scope identity (`effectiveKey`),
+    so renaming the configured hostname (same IP) is a new, not-yet-owned scope —
+    the `owned && !changed && !refreshDue` skip does not fire, the new name is
+    published, and the old name's record (under the previous FQDN's scope key) is
+    withdrawn by Pass 2 (publish-new + withdraw-old, never an orphaned old RR).
   - **forced-refresh** — a per-scope wire-update FLOOR (default 24h) decoupled
     from the 30s reconcile cadence, to prove liveness / resist record reaping
     without per-poll traffic.
@@ -339,8 +364,11 @@ its OWN learned address — on top of the SAME spine, without forking the engine
     the atomic self-owned in-place replace described above (no blackhole gap).
 - **Ownership key.** A router record is keyed on its SCOPE + the fixed identity
   `router-self` + Address `""` (the published address lives in the new
-  `ownedRecord.AddrText` field, JSON-omitted for lease records). So an interface
-  unit/family owns at most one record and an address change replaces it in place.
+  `ownedRecord.AddrText` field, JSON-omitted for lease records). The scope now
+  includes the published FQDN (#2903), so an interface unit/family owns at most
+  one record PER configured hostname: an address change replaces that one record
+  in place, while a hostname change is a rename (new scope published, old scope
+  withdrawn) rather than an in-place overwrite that orphaned the old name.
 - **Address observation** is the daemon's job (`pkg/daemon/daemon_ddns_surface_a.go`):
   `AddressObserver` reads netlink (interface source) or `pkg/dhcp.LeaseFor` (dhcp
   source). `ok=false` (transient read failure) → leave the scope untouched
