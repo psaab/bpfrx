@@ -1,3 +1,25 @@
+## 2026-06-25 — #2995: WG recvmsg endpoint preserves sin6_scope_id (link-local v6)
+
+- **Timestamp**: 2026-06-25
+- **Action**: `sockaddr_storage_to_socketaddr` (AF_INET6 arm) built the
+  learned WG peer endpoint via `SocketAddr::new(IpAddr::V6, port)`, which
+  fixes `sin6_scope_id = 0` and `sin6_flowinfo = 0`. A link-local
+  (`fe80::/10`) WG underlay endpoint loses its receiving-interface scope,
+  so the next `wg_send_to` toward the learned endpoint is rejected by the
+  kernel with EINVAL/ENODEV and the tunnel never establishes
+  (agy-review-058 058-03; distinct from #2969 NDP neighbor-probe scope).
+  Fix: construct `SocketAddr::V6(SocketAddrV6::new(ip, port,
+  sin6_flowinfo, sin6_scope_id))` to preserve scope + flowinfo. No-op for
+  global v6 (kernel sets scope_id 0); survives `canonicalize_endpoint`
+  (passes native v6 through untouched).
+- **File(s)**: userspace-dp/src/afxdp/coordinator/wg_control.rs,
+  docs/wireguard-interop.md, _Log.md
+- **Gates**: CARGO_TARGET_DIR=/tmp/cargo-2995 cargo build --release -p
+  xpf-userspace-dp (green); cargo test wg_control (19 passed).
+  Fail-on-revert: `sockaddr_storage_to_socketaddr_preserves_link_local_scope`
+  goes RED (scope_id 0 vs ifindex 7) when reverted to `SocketAddr::new`;
+  `sockaddr_storage_to_socketaddr_global_v6_scope_zero` stays green.
+
 ## 2026-06-25 — #2969: IPv6 NDP probe `sin6_scope_id` + sendto error surface
 
 - **Timestamp**: 2026-06-25
