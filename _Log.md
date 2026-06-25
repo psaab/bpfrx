@@ -14913,6 +14913,20 @@ top.
   **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/serialize_test.go,
   pkg/ra/README.md, _Log.md
 
+- **Timestamp**: 2026-06-25
+  **Action**: #2609 — IPFIX template-refresh header no longer resets
+  SequenceNumber to 0. Per RFC 7011 §3.1/§10.3.2 the IPFIX sequence is the
+  cumulative data-record count; a template-only Message carries the current
+  value WITHOUT advancing it. sendTemplates() now reads e.seq under e.mu
+  (no increment) instead of hardcoding 0 (NetFlow v9, which counts export
+  packets, is unaffected and correctly keeps its template-send increment).
+  Added fail-on-revert TestIPFIXTemplateRefreshPreservesSequenceNumber
+  (loopback UDP collector; proven RED on revert, GREEN restored). Gates:
+  go build ./... OK; gofmt clean; go vet ./pkg/flowexport/... clean;
+  go test ./pkg/flowexport/... ok.
+  **File(s)**: pkg/flowexport/ipfix.go,
+  pkg/flowexport/ipfix_seqnum_test.go, pkg/flowexport/README.md, _Log.md
+
 ## 2026-06-25 — #2456: DHCP relay master-state gate (suppress duplicate relay on backup)
 
 - **Timestamp**: 2026-06-25
