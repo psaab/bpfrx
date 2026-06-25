@@ -55,9 +55,20 @@ synthesizing tuple identity locally.
 ## Reconciliation
 
 `replan_queues` derives the binding plan from the current
-`ConfigSnapshot`: enumerate userspace-candidate interfaces, count their
+`ConfigSnapshot`: enumerate userspace-binding interfaces, count their
 RX queues, and emit one `BindingStatus` per `(queue_id, interface)`
-pair. The Rust planner does:
+pair. The binding-candidate decision is a single shared invariant
+(#2915): `replan_queues`, the plan-key hash
+(`update_snapshot_binding_plan_key`), and the Go authoritative allowlist
+(`UserspaceBoundLinuxInterfaces` /
+`userspaceSkipsIngressInterface`) all filter through the same exclusion
+contract — `include_userspace_binding_interface` (zoned, non-tunnel,
+non-local-fabric, excluding `fxp*`/`em*`/`fab*`/`lo0` and `mgmt`/`control`
+zones). The hash MUST cover exactly the interfaces the planner acts on, so
+a change to a non-candidate interface never spuriously bumps the plan key
+and a `ge-*`/`xe-*`/`et-*` netdev placed in a mgmt/control/tunnel/fabric
+context is never planned as an AF_XDP binding the rest of the system does
+not account for. The Rust planner does:
 
 ```rust
 binding.worker_id = (queue_id % workers.max(1)) as u32;

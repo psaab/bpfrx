@@ -17739,3 +17739,30 @@ top.
 - **File(s)**: pkg/api/api.go, pkg/api/sessions.go, pkg/api/security.go,
   pkg/logging/eventbuf.go, pkg/api/rest_filter_failclosed_test.go,
   pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2915 — unify the AF_XDP queue-planner binding-candidate
+  predicate. `replan_queues` filtered interfaces through the prefix-only
+  `is_userspace_candidate_interface` (`ge-`/`xe-`/`et-`) while the
+  plan-key hash (`update_snapshot_binding_plan_key`) and the Go
+  authoritative allowlist (`UserspaceBoundLinuxInterfaces` /
+  `userspaceSkipsIngressInterface`) used the full exclusion contract
+  `include_userspace_binding_interface` (zoned, non-tunnel,
+  non-local-fabric, excluding `fxp*`/`em*`/`fab*`/`lo0` and
+  `mgmt`/`control` zones). The hash (change-detection key) and the
+  planner therefore operated on different interface sets — a `ge-*`
+  netdev placed in a mgmt/control zone (or a tunnel/local-fabric
+  context) could be planned as an AF_XDP binding neither the hash nor
+  the control plane accounted for. Routed `replan_queues` through
+  `include_userspace_binding_interface` (the SSOT) and removed the now
+  dead `is_userspace_candidate_interface`. Existing planner tests gained
+  real zones on their data interfaces (the prefix-only predicate did not
+  require one). Added a fail-on-revert test
+  (`queue_planner_and_plan_key_agree_on_binding_set`) pinning that the
+  hash and planner agree on the binding set + a
+  tunnel/local-fabric exclusion test. Both go RED if the planner reverts
+  to the divergent prefix-only predicate (verified by copy-aside revert).
+  Couples cleanly to #2916 (same-plan refresh) which bases off this fix.
+- **File(s)**: userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md,
+  _Log.md
