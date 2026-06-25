@@ -2472,3 +2472,124 @@ fn flow_cache_not_populated_by_control_segment_via_insertion_site() {
         );
     }
 }
+
+// ---- #2364: seeded flow-cache set index ------------------------------
+
+    /// Build N distinct v4 5-tuples differing only in src_port. These are
+    /// trivially attacker-constructible (one source, one ephemeral range).
+    fn adversarial_keys(n: u16) -> Vec<crate::session::SessionKey> {
+        (0..n)
+            .map(|i| crate::session::SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 40000u16.wrapping_add(i),
+                dst_port: 443,
+            })
+            .collect()
+    }
+
+    /// Set distribution = the multiset of set indices for a key list under
+    /// a given seed. Equal vectors ⇒ identical mapping.
+    fn set_distribution(seed: u64, keys: &[crate::session::SessionKey]) -> Vec<usize> {
+        keys.iter()
+            .map(|k| FlowCache::set_index_seeded(seed, k, 7))
+            .collect()
+    }
+
+    #[test]
+    fn set_index_is_stable_within_one_seed() {
+        // Cache-consistency invariant: a given flow must map to the SAME
+        // set every time within one process, or lookup/insert disagree
+        // and the cache silently misses. Repeat many times under a fixed
+        // seed and demand byte-identical results.
+        let keys = adversarial_keys(64);
+        let seed = 0x0123_4567_89AB_CDEF;
+        let first = set_distribution(seed, &keys);
+        for _ in 0..256 {
+            assert_eq!(
+                first,
+                set_distribution(seed, &keys),
+                "set_index must be stable for a fixed seed (cache consistency)"
+            );
+        }
+    }
+
+    #[test]
+    fn set_index_distribution_depends_on_seed() {
+        // Hardening invariant: the set mapping is NOT an externally
+        // probeable pure function of the 5-tuple. Two different process
+        // seeds must produce a DIFFERENT set distribution for the SAME
+        // attacker key set — so an offline attacker cannot precompute a
+        // colliding key set. (With the unseeded `FxHasher::default()` the
+        // distribution is seed-independent and this assertion fails —
+        // fail-on-revert.)
+        let keys = adversarial_keys(128);
+        let ref_seed = 0xA5A5_0000_C3C3_FFFFu64;
+        let reference = set_distribution(ref_seed, &keys);
+
+        // Scan seeds for a divergence. Under a uniform hash the chance
+        // that an entire 128-element distribution matches the reference by
+        // accident is ~ (1/1024)^? — vanishingly small per seed; one
+        // differing seed is essentially guaranteed immediately. Bound the
+        // loop so a TRULY seed-independent hash (the reverted state) makes
+        // this test FAIL rather than hang.
+        let mut diverged = false;
+        for seed in 1u64..4096u64 {
+            if seed == ref_seed {
+                continue;
+            }
+            if set_distribution(seed, &keys) != reference {
+                diverged = true;
+                break;
+            }
+        }
+        assert!(
+            diverged,
+            "flow-cache set distribution did not change across {} seeds — \
+             set_index is seed-independent (unseeded FxHash regression, #2364)",
+            4095
+        );
+    }
+
+    #[test]
+    fn set_index_seed_reshuffles_collision_set() {
+        // Concrete attack framing: take the keys that all land in ONE set
+        // under seed A, then show that under seed B they no longer all
+        // share a set. Proves the per-boot reseed defeats a precomputed
+        // single-set flood. Use a large enough key pool that some set is
+        // guaranteed to hold >=2 keys (4096 keys into 1024 sets ⇒ mean 4
+        // per set, max well above 2 under any reasonable hash).
+        let keys = adversarial_keys(4096);
+        let seed_a = 0xDEAD_BEEF_CAFE_BABEu64;
+        // Find the most-populated set under seed A.
+        let mut counts: std::collections::BTreeMap<usize, Vec<crate::session::SessionKey>> =
+            std::collections::BTreeMap::new();
+        for k in &keys {
+            counts
+                .entry(FlowCache::set_index_seeded(seed_a, k, 7))
+                .or_default()
+                .push(k.clone());
+        }
+        let (_, hot_set_keys) = counts
+            .into_iter()
+            .max_by_key(|(_, v)| v.len())
+            .expect("at least one set");
+        assert!(
+            hot_set_keys.len() >= 2,
+            "test precondition: need >=2 keys colliding in one set under seed A"
+        );
+        // Under a different seed, those same keys must NOT all collide in
+        // a single set (otherwise the reseed bought nothing).
+        let seed_b = seed_a ^ 0xFFFF_FFFF_FFFF_FFFF;
+        let distinct_under_b: std::collections::BTreeSet<usize> = hot_set_keys
+            .iter()
+            .map(|k| FlowCache::set_index_seeded(seed_b, k, 7))
+            .collect();
+        assert!(
+            distinct_under_b.len() > 1,
+            "keys colliding in one set under seed A still all collide under seed B — \
+             reseed did not break the precomputed flood (#2364)"
+        );
+    }

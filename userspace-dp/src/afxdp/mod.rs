@@ -425,6 +425,8 @@ pub(crate) use self::worker::{
     BindingLiveSnapshot, BindingWorker, SyncedSessionEntry, XskBindMode, fabric_queue_hash,
     push_recent_exception, push_recent_session_delta, worker_loop,
 };
+#[cfg(test)]
+pub(crate) use self::worker::fabric_queue_hash_seeded;
 
 // Lifted from `poll_binding` so the per-descriptor batch function
 // (`poll_binding_process_descriptor`) can take `&mut BatchCounters`.

@@ -242,6 +242,42 @@ pub(crate) fn fabric_queue_hash(
     meta: UserspaceDpMeta,
     non_first_fragment: bool,
 ) -> u64 {
+    fabric_queue_hash_seeded(
+        crate::hot_hash_seed::hot_path_hash_seed(),
+        flow,
+        expected_ports,
+        meta,
+        non_first_fragment,
+    )
+}
+
+/// Seed-parameterized core of `fabric_queue_hash` (#2364).
+///
+/// The fabric queue hash maps an attacker-controllable 5-tuple (or, for a
+/// non-first fragment, a 3-tuple) onto one of THIS node's local fabric
+/// egress bindings (`BindingLookup::fabric_target_index` indexes
+/// `all_by_if[..] % len`). With the previous fixed public mixing
+/// (`seed = meta.protocol`) a flow generator could bias the selection and
+/// pin attack flows onto a single fabric worker (queue skew → CPU/lock
+/// amplification on that worker). Folding the per-boot process seed into
+/// the initial state makes the mapping unknowable offline and reshuffled
+/// per restart.
+///
+/// NODE-LOCAL CORRECTNESS: this hash is NOT a wire field and is NOT
+/// HA-synced. Each node independently spreads its OWN fabric TX across its
+/// OWN local fabric bindings; the peer does not need to agree on the
+/// result, so a per-node seed is correct (it does not break fabric
+/// forwarding). The ONLY intra-process invariant — every fragment of one
+/// datagram must select the same fabric binding (no cross-chassis
+/// reordering, #2357) — is preserved because the seed is constant for the
+/// process lifetime, so the same input still maps to the same output.
+pub(crate) fn fabric_queue_hash_seeded(
+    seed_secret: u64,
+    flow: Option<&SessionFlow>,
+    expected_ports: Option<(u16, u16)>,
+    meta: UserspaceDpMeta,
+    non_first_fragment: bool,
+) -> u64 {
     fn mix(seed: &mut u64, value: u64) {
         *seed ^= value
             .wrapping_add(0x9e3779b97f4a7c15)
@@ -249,7 +285,7 @@ pub(crate) fn fabric_queue_hash(
             .wrapping_add(*seed >> 2);
     }
 
-    let mut seed = meta.protocol as u64;
+    let mut seed = seed_secret ^ (meta.protocol as u64);
     // #2357: a non-first IP fragment has no L4 header — `meta.flow_*_port`
     // and `expected_ports` describe payload bytes, not real ports. Hash a
     // fragment-stable 3-tuple (protocol + L3 src/dst from metadata, which the

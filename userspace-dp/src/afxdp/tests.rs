@@ -9447,6 +9447,108 @@ fn fabric_queue_hash_non_first_fragment_is_port_independent_3tuple() {
     );
 }
 
+// ---- #2364: seeded fabric queue hash ------------------------------------
+
+/// Build N attacker-constructible flowless v4 metas differing only in the
+/// (src_port, dst_port) pair — the input the fabric hash mixes when there
+/// is no session flow yet.
+fn fabric_adversarial_metas(n: u16) -> Vec<(UserspaceDpMeta, (u16, u16))> {
+    (0..n)
+        .map(|i| {
+            let mut meta = frag_test_meta(14);
+            let src = 40000u16.wrapping_add(i);
+            let dst = 443u16;
+            meta.flow_src_port = src;
+            meta.flow_dst_port = dst;
+            (meta, (src, dst))
+        })
+        .collect()
+}
+
+#[test]
+fn fabric_queue_hash_is_stable_within_one_seed() {
+    // Intra-process invariant: every fragment/packet of one datagram must
+    // pick the same fabric binding, so the hash must be stable for a fixed
+    // seed. Pin a seed and demand identical output across repeats.
+    let metas = fabric_adversarial_metas(32);
+    let seed = 0x0123_4567_89AB_CDEFu64;
+    let first: Vec<u64> = metas
+        .iter()
+        .map(|(m, ports)| fabric_queue_hash_seeded(seed, None, Some(*ports), *m, false))
+        .collect();
+    for _ in 0..128 {
+        let again: Vec<u64> = metas
+            .iter()
+            .map(|(m, ports)| fabric_queue_hash_seeded(seed, None, Some(*ports), *m, false))
+            .collect();
+        assert_eq!(
+            first, again,
+            "fabric_queue_hash must be stable for a fixed seed (no fragment reorder)"
+        );
+    }
+}
+
+#[test]
+fn fabric_queue_hash_distribution_depends_on_seed() {
+    // Hardening invariant: the fabric queue selection is not an externally
+    // probeable pure function of the tuple. Two seeds must produce a
+    // different hash distribution for the SAME attacker tuple set, so a
+    // flow generator cannot precompute a single-worker pin. With the prior
+    // unseeded `seed = meta.protocol` the distribution is seed-independent
+    // and this fails — fail-on-revert.
+    let metas = fabric_adversarial_metas(64);
+    let ref_seed = 0xA5A5_0000_C3C3_FFFFu64;
+    let reference: Vec<u64> = metas
+        .iter()
+        .map(|(m, ports)| fabric_queue_hash_seeded(ref_seed, None, Some(*ports), *m, false))
+        .collect();
+    let mut diverged = false;
+    for seed in 1u64..4096u64 {
+        if seed == ref_seed {
+            continue;
+        }
+        let dist: Vec<u64> = metas
+            .iter()
+            .map(|(m, ports)| fabric_queue_hash_seeded(seed, None, Some(*ports), *m, false))
+            .collect();
+        if dist != reference {
+            diverged = true;
+            break;
+        }
+    }
+    assert!(
+        diverged,
+        "fabric_queue_hash distribution did not change across seeds — \
+         hash is seed-independent (unseeded regression, #2364)"
+    );
+}
+
+#[test]
+fn fabric_queue_hash_seed_reshuffles_modular_target_buckets() {
+    // The production consumer is `flow_hash % local_fabric_binding_count`.
+    // Model that with a small modulus and show the per-flow target bucket
+    // assignment changes across seeds — i.e. an attacker who biased all
+    // flows onto one fabric worker under a known mapping loses that pin on
+    // the next boot's reseed.
+    const FABRIC_QUEUES: u64 = 6; // mlx5 VF: 6 combined RX queues → 6 workers
+    let metas = fabric_adversarial_metas(96);
+    let buckets = |seed: u64| -> Vec<u64> {
+        metas
+            .iter()
+            .map(|(m, ports)| {
+                fabric_queue_hash_seeded(seed, None, Some(*ports), *m, false) % FABRIC_QUEUES
+            })
+            .collect()
+    };
+    let a = buckets(0xDEAD_BEEF_CAFE_BABE);
+    let b = buckets(0xDEAD_BEEF_CAFE_BABE ^ 0xFFFF_FFFF_FFFF_FFFF);
+    assert_ne!(
+        a, b,
+        "modular fabric target assignment is identical across seeds — \
+         reseed does not break a precomputed single-worker pin (#2364)"
+    );
+}
+
 /// Ethernet (14B) + IPv6 header + fragment header (44) + `payload`. A
 /// non-first fragment has fragment-offset bits set.
 fn eth_ipv6_frag_frame(frag_off: u16, payload: &[u8]) -> Vec<u8> {
