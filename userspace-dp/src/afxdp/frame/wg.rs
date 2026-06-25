@@ -20,6 +20,7 @@
 
 use super::super::wg::{EncapError, POLY1305_TAG_LEN, WG_DATA_HEADER_LEN};
 use super::super::*;
+use super::checksum::checksum16_ipv6;
 use super::headers::{write_eth_header_slice, write_ipv4_header, write_ipv6_header, write_udp_header};
 use std::net::IpAddr;
 
@@ -398,7 +399,19 @@ pub(super) fn wg_encap_frame(
                 payload_len,
                 0,
             )?;
-            let csum = udp6_checksum(src, dst, &out[udp_start..udp_start + udp_len]);
+            // #2651: use the AVX2-backed `checksum16_ipv6` helper (the same
+            // routine the inner TCP/UDP/ICMPv6 paths use) instead of the
+            // scalar word-at-a-time loop that used to live in
+            // `udp6_checksum`. The pseudo-header layout is identical (src,
+            // dst, payload-len-as-u32-BE, [0,0,0,next-header], payload) so the
+            // one's-complement sum is byte-for-byte the same; we re-apply the
+            // IPv6 mandatory 0x0000 -> 0xFFFF canonicalization at the call
+            // site (RFC 768 / RFC 8200 — the UDPv6 checksum MUST be non-zero
+            // on the wire, unlike v4 where 0 means "disabled"). Proven
+            // byte-identical to the prior scalar reference across sizes
+            // (odd/even, all-zero-sum -> 0xFFFF, max) by
+            // `udp6_checksum_matches_scalar_reference`.
+            let csum = udp6_checksum_optimized(src, dst, &out[udp_start..udp_start + udp_len]);
             out[udp_start + 6..udp_start + 8].copy_from_slice(&csum.to_be_bytes());
         }
         _ => return None,
@@ -408,8 +421,23 @@ pub(super) fn wg_encap_frame(
 }
 
 /// RFC 768 / RFC 8200 IPv6 UDP checksum over the pseudo-header + UDP
-/// datagram. `udp` is the full UDP header+payload (checksum field 0).
-fn udp6_checksum(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr, udp: &[u8]) -> u16 {
+/// datagram, computed with a deliberately naive scalar word-at-a-time
+/// one's-complement loop. `udp` is the full UDP header+payload (checksum
+/// field 0).
+///
+/// #2651: this was the production routine on the WG IPv6 egress hot path;
+/// it has been replaced at the call site by the AVX2-backed
+/// `checksum16_ipv6` helper. It is retained ONLY as the independent
+/// reference oracle for the parity test
+/// (`udp6_checksum_matches_scalar_reference`), which proves the optimized
+/// helper produces the byte-identical wire checksum across odd/even
+/// lengths, the all-zero-sum -> 0xFFFF mandatory-v6 case, and max size.
+#[cfg(test)]
+fn udp6_checksum_scalar_reference(
+    src: std::net::Ipv6Addr,
+    dst: std::net::Ipv6Addr,
+    udp: &[u8],
+) -> u16 {
     let mut sum: u32 = 0;
     for chunk in src.octets().chunks(2) {
         sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
@@ -433,6 +461,21 @@ fn udp6_checksum(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr, udp: &[u8]) -
         sum = (sum & 0xffff) + (sum >> 16);
     }
     let csum = !(sum as u16);
+    if csum == 0 { 0xffff } else { csum }
+}
+
+/// The production WG IPv6 outer UDP checksum: the AVX2-backed
+/// `checksum16_ipv6` one's-complement sum over the pseudo-header + UDP
+/// datagram, with the RFC 768 / RFC 8200 mandatory 0x0000 -> 0xFFFF
+/// canonicalization applied. Mirrors the call site so tests exercise the
+/// exact production formula. `udp` is the full UDP header+payload
+/// (checksum field 0).
+fn udp6_checksum_optimized(
+    src: std::net::Ipv6Addr,
+    dst: std::net::Ipv6Addr,
+    udp: &[u8],
+) -> u16 {
+    let csum = checksum16_ipv6(src, dst, PROTO_UDP, udp);
     if csum == 0 { 0xffff } else { csum }
 }
 
@@ -1079,4 +1122,159 @@ mod wg_frame_tests {
             "1441-byte inner (pads to 1456) must overflow and be dropped"
         );
     }
+
+    // === #2651: the WG IPv6 outer UDP checksum optimization. The
+    // production path swapped the scalar word-at-a-time `udp6_checksum`
+    // loop for the AVX2-backed `checksum16_ipv6` helper. These tests prove
+    // the swap is byte-identical on the wire and lock the output so a
+    // future regression in the optimized path is caught. ===
+
+    /// A small deterministic xorshift PRNG — no external `rand` dependency,
+    /// matching the multiply-hash style used by the `checksum.rs` tests.
+    /// Seeded for reproducibility; the parity property is exercised over a
+    /// wide, fixed sweep of sizes and contents.
+    struct Xorshift64(u64);
+    impl Xorshift64 {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn fill(&mut self, buf: &mut [u8]) {
+            for b in buf.iter_mut() {
+                *b = (self.next_u64() & 0xff) as u8;
+            }
+        }
+    }
+
+    #[test]
+    fn udp6_checksum_matches_scalar_reference() {
+        // Property: the optimized helper equals the independent scalar
+        // one's-complement reference for EVERY input. Sweep lengths from 8
+        // (a bare UDP header) through a jumbo payload, hitting every
+        // odd/even boundary (odd-length tail handling) and many random
+        // contents per length, across multiple distinct src/dst pairs.
+        let mut rng = Xorshift64(0x2651_5151_a5a5_1234);
+        let addr_pairs = [
+            (
+                std::net::Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 0x200),
+                std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0xdead, 0xbeef, 0, 1),
+            ),
+            (std::net::Ipv6Addr::UNSPECIFIED, std::net::Ipv6Addr::LOCALHOST),
+            (
+                std::net::Ipv6Addr::new(
+                    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                ),
+                std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0),
+            ),
+        ];
+        // The udp slice MUST be at least 8 bytes (UDP header). Sweep every
+        // length in [8, 1500] plus a few large sizes for carry stress.
+        let mut lengths: Vec<usize> = (8..=1500).collect();
+        lengths.extend_from_slice(&[2048, 4096, 9000, 65000]);
+        for &len in &lengths {
+            for &(src, dst) in &addr_pairs {
+                let mut udp = vec![0u8; len];
+                rng.fill(&mut udp);
+                // Zero the checksum field (bytes 6..8) as the production
+                // path does before summing.
+                udp[6] = 0;
+                udp[7] = 0;
+                let reference = udp6_checksum_scalar_reference(src, dst, &udp);
+                let optimized = udp6_checksum_optimized(src, dst, &udp);
+                assert_eq!(
+                    optimized, reference,
+                    "len={len} src={src} dst={dst}: optimized UDPv6 checksum \
+                     diverged from the scalar reference"
+                );
+                // RFC 768 / RFC 8200: the transmitted UDPv6 checksum is
+                // MANDATORY and must never be 0x0000 on the wire.
+                assert_ne!(
+                    optimized, 0,
+                    "UDPv6 checksum must never be transmitted as 0x0000"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn udp6_checksum_canonicalizes_zero_sum_to_ffff() {
+        // Construct a UDP datagram + pseudo-header whose one's-complement
+        // sum is 0xFFFF, so the raw complement is 0x0000 and MUST be
+        // emitted as 0xFFFF. The simplest construction: an all-zero
+        // pseudo-header (UNSPECIFIED src/dst, next-header byte 0 via... no
+        // — next-header is fixed to UDP). Instead drive a payload whose
+        // sum cancels the pseudo-header contribution. We brute-force a
+        // tiny 2-byte tail so the raw sum hits 0xFFFF.
+        let src = std::net::Ipv6Addr::UNSPECIFIED;
+        let dst = std::net::Ipv6Addr::UNSPECIFIED;
+        // Minimal 8-byte UDP header, checksum field zeroed; the pseudo-
+        // header contributes len(8) + next-header(17 = PROTO_UDP). We want
+        // the total one's-complement sum == 0xFFFF (-> complement 0x0000).
+        // src_port + dst_port + udp_len(8) + 0(csum) + pseudo(len 8 +
+        // proto 17) — choose ports so the folded sum is exactly 0xFFFF.
+        let mut udp = vec![0u8; 8];
+        udp[4] = 0;
+        udp[5] = 8; // UDP length field = 8
+        // pseudo-header sum so far: 8 (payload-len-u32 low) + 17 (proto)
+        //   + udp_len field 8 = 33. Need ports summing to 0xFFFF - 33.
+        let want: u32 = 0xffff - 33;
+        let p0 = (want >> 16) as u16; // 0 here
+        let _ = p0;
+        let src_port = (want & 0xffff) as u16;
+        udp[0..2].copy_from_slice(&src_port.to_be_bytes());
+        // dst_port left 0.
+        let reference = udp6_checksum_scalar_reference(src, dst, &udp);
+        let optimized = udp6_checksum_optimized(src, dst, &udp);
+        assert_eq!(
+            reference, 0xffff,
+            "fixture must drive the raw complement to 0x0000 (emitted as 0xFFFF)"
+        );
+        assert_eq!(
+            optimized, 0xffff,
+            "optimized path must canonicalize a 0x0000 raw checksum to 0xFFFF"
+        );
+    }
+
+    #[test]
+    fn udp6_checksum_locked_value_for_known_frame() {
+        // FAIL-ON-REVERT: lock the exact wire checksum for a fixed WG IPv6
+        // outer UDP datagram. Any divergence in the optimized helper (e.g.
+        // a perturbed pseudo-header layout or a dropped odd-tail byte)
+        // flips this constant and the test goes red. The literal below is
+        // the value computed by the byte-identical scalar reference for
+        // this exact input.
+        let src = std::net::Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 0x8);
+        let dst = std::net::Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 0x200);
+        // A 13-byte UDP datagram (8-byte header + 5-byte payload) — ODD
+        // total length, so the odd-tail path is exercised. src_port 51820
+        // (WG default), dst_port 51820, length 13, checksum field zeroed,
+        // payload 0xDE 0xAD 0xBE 0xEF 0x42.
+        let mut udp = vec![0u8; 13];
+        udp[0..2].copy_from_slice(&51820u16.to_be_bytes());
+        udp[2..4].copy_from_slice(&51820u16.to_be_bytes());
+        udp[4..6].copy_from_slice(&13u16.to_be_bytes());
+        // bytes 6..8 = checksum = 0
+        udp[8..13].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
+        let reference = udp6_checksum_scalar_reference(src, dst, &udp);
+        let optimized = udp6_checksum_optimized(src, dst, &udp);
+        // The two must agree (cross-check), and both must equal the locked
+        // literal. If a future edit perturbs the optimized impl, optimized
+        // != reference fails first; if both drift together (impossible for
+        // a one's-complement sum), the literal lock catches it.
+        assert_eq!(optimized, reference, "optimized must match the scalar reference");
+        assert_eq!(
+            optimized, LOCKED_WG_UDP6_CHECKSUM,
+            "the WG IPv6 outer UDP checksum for the fixed known frame changed — \
+             a regression in the optimized checksum path"
+        );
+    }
+
+    /// Locked wire checksum for the `udp6_checksum_locked_value_for_known_frame`
+    /// fixture. Derived from the byte-identical scalar one's-complement
+    /// reference; a change here means the on-wire checksum changed.
+    const LOCKED_WG_UDP6_CHECKSUM: u16 = 0x3296;
 }
