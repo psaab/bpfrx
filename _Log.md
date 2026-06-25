@@ -17503,3 +17503,47 @@ top.
   go test ./pkg/routing/... PASS.
   **File(s)**: pkg/routing/xfrm.go, pkg/routing/iface_reuse_test.go,
   pkg/routing/README.md, _Log.md
+
+## 2026-06-25 — #2885 IPsec link-local IPv6 local-bind selection
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `matchFamily` (pkg/ipsec/policy.go) rejecting IPv6
+  link-local unicast (`fe80::/10`) via `IsGlobalUnicast()`. The local-address
+  resolver gated every candidate interface address on `IsGlobalUnicast()`,
+  which is false for link-local, so an IPsec local-bind on a point-to-point /
+  link-local IPv6 link could never source from `fe80::`. Now `matchFamily`
+  also admits `IsLinkLocalUnicast()`, but link-local is surfaced ONLY for an
+  explicit family-6 hint: excluded from family-4 (and IPv4 link-local
+  169.254.0.0/16 too) and from family-agnostic (hint 0) selection so it never
+  wins implicitly over a global address. Multicast/unspecified/loopback stay
+  excluded for all families. Found by agy-review-051 051-02 (MEDIUM).
+  FAIL-ON-REVERT: TestMatchFamilyLinkLocalIPv6 asserts
+  matchFamily(fe80::1, 6) == "fe80::1"; RED ("" ) when the old IsGlobalUnicast
+  gate is restored (verified by copy-aside revert), GREEN with the fix.
+  TestMatchFamilyExclusions guards the exclusions. Gates: go build ./...,
+  gofmt -l clean, go vet ./pkg/ipsec/..., go test ./pkg/ipsec/... PASS.
+- **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/matchfamily_linklocal_test.go,
+  pkg/ipsec/README.md, _Log.md
+
+## 2026-06-25 — #2885 review fold (PR #2927 MERGE-NEEDS-MINOR x2)
+- **Timestamp**: 2026-06-25
+- **Action**: Folded two hostile-review MINORs on the #2885 fix.
+  MINOR-1 (global-must-win order-dependence): matchFamily feeds a first-match
+  loop (selectUnitAddress over config order; resolveKernelInterfaceAddress
+  over kernel order). Now that family-6 admits fe80::, a link-local enumerated
+  before the global IPv6 could win. Added selectFamilyAddress doing a two-pass
+  family-6 scan — pass 1 admits only global unicast (bareIPGlobalOnly), pass 2
+  falls back to link-local only if no global exists. Both resolvers route
+  through it; "global wins" is now order-independent.
+  MINOR-2 (bare fe80:: lacks %iface zone): a bare link-local local_addrs is
+  ambiguous on a multi-interface box. Added zoneQualify(addr, iface) appending
+  %<iface> to a link-local result; resolveKernelInterfaceAddress uses the
+  looked-up name, resolveConfiguredInterfaceAddress uses config.LinuxIfName(
+  base). Global/IPv4/already-zoned addresses pass through unchanged.
+  FAIL-ON-REVERT: TestSelectUnitAddressFamily6GlobalWinsOverLinkLocal (link-
+  local listed FIRST, asserts the GLOBAL wins) goes RED when the global-only
+  first pass is removed; TestResolveConfiguredInterfaceAddressZoneQualifiesLink
+  Local asserts fe80::1%ge-0-0-3 and goes RED when zoneQualify is neutered.
+  Both verified via copy-aside revert. Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/ipsec/..., go test ./pkg/ipsec/... PASS.
+- **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/matchfamily_linklocal_test.go,
+  pkg/ipsec/README.md, _Log.md
