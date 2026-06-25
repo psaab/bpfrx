@@ -931,22 +931,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.reconcileRPM(cfg)
 	}
 
-	// Start LLDP if configured.
-	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Protocols.LLDP != nil && !cfg.Protocols.LLDP.Disable && len(cfg.Protocols.LLDP.Interfaces) > 0 {
-		d.lldpMgr = lldp.New()
-		var lldpIfaces []lldp.LLDPInterface
-		for _, iface := range cfg.Protocols.LLDP.Interfaces {
-			lldpIfaces = append(lldpIfaces, lldp.LLDPInterface{
-				Name:    iface.Name,
-				Disable: iface.Disable,
-			})
-		}
-		d.lldpMgr.Apply(ctx, &lldp.LLDPConfig{
-			Interfaces:     lldpIfaces,
-			Interval:       cfg.Protocols.LLDP.Interval,
-			HoldMultiplier: cfg.Protocols.LLDP.HoldMultiplier,
-			SystemName:     cfg.System.HostName,
-		})
+	// Start LLDP if configured. reconcileLLDP is the single source of truth
+	// for LLDP start/stop/reconfigure: it runs here at boot and again on every
+	// day-2 commit from applyConfigLocked (#2372), so a config change to
+	// `protocols lldp` takes effect without a daemon restart.
+	if cfg := d.store.ActiveConfig(); cfg != nil {
+		d.reconcileLLDP(cfg)
 	}
 
 	// Start event-options engine if configured.

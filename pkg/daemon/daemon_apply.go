@@ -18,6 +18,7 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/ipsec"
+	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
@@ -1202,6 +1203,15 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// d.daemonCtx so the relay goroutines outlive this apply call.
 	d.reconcileDHCPRelay(cfg)
 
+	// 16d. Reconcile the LLDP service (#2372). Before this, LLDP was applied
+	// only at boot (daemon_run.go), so a day-2 commit that enabled, disabled,
+	// or changed `protocols lldp` (interface set, transmit-interval,
+	// hold-multiplier) was silently ignored until a daemon restart. reconcileLLDP
+	// lazily instantiates the manager on the first enable and Apply()s the new
+	// config; a disabled/empty stanza stops the running service. Bound to
+	// d.daemonCtx so the TX/RX goroutines outlive this apply call.
+	d.reconcileLLDP(cfg)
+
 	// 17. Update event-options policies (RPM-driven failover)
 	if d.eventEngine != nil {
 		d.eventEngine.Apply(cfg.EventOptions)
@@ -1370,6 +1380,61 @@ func (d *Daemon) reconcileDHCPRelay(cfg *config.Config) {
 		ctx = context.Background()
 	}
 	d.dhcpRelay.Apply(ctx, cfg.ForwardingOptions.DHCPRelay)
+}
+
+// reconcileLLDP re-applies the LLDP service config on every commit (#2372). It
+// is the single source of truth for LLDP lifecycle — daemon_run.go calls it at
+// boot, and applyConfigLocked calls it on every day-2 commit, so a change to
+// `protocols lldp` takes effect without a daemon restart.
+//
+// Unlike the DHCP relay Manager (always created at boot), the LLDP Manager is
+// instantiated lazily on the first commit that enables LLDP, so a daemon that
+// never runs LLDP never allocates the manager or its sockets. lldp.Manager.Apply
+// is itself reconcile-shaped: it Stop()s the current generation (closing every
+// per-interface socket and clearing the neighbor table) before starting the new
+// one, so calling it repeatedly is idempotent and a disabled/empty config stops
+// the running service.
+//
+// The manager is bound to d.daemonCtx (the daemon lifetime) — NOT a
+// request-scoped context — so the TX/RX/expiry goroutines survive past this
+// apply call and are torn down only at daemon stop (or the next reconcile that
+// disables LLDP).
+func (d *Daemon) reconcileLLDP(cfg *config.Config) {
+	enabled := cfg != nil && cfg.Protocols.LLDP != nil &&
+		!cfg.Protocols.LLDP.Disable && len(cfg.Protocols.LLDP.Interfaces) > 0
+
+	if !enabled {
+		// Nothing to run. Stop a manager that was started by an earlier commit;
+		// if LLDP was never enabled, d.lldpMgr is nil and this is a no-op (no
+		// manager is allocated just to immediately stop it).
+		if d.lldpMgr != nil {
+			d.lldpMgr.Stop()
+		}
+		return
+	}
+
+	if d.lldpMgr == nil {
+		d.lldpMgr = lldp.New()
+	}
+
+	var lldpIfaces []lldp.LLDPInterface
+	for _, iface := range cfg.Protocols.LLDP.Interfaces {
+		lldpIfaces = append(lldpIfaces, lldp.LLDPInterface{
+			Name:    iface.Name,
+			Disable: iface.Disable,
+		})
+	}
+
+	ctx := d.daemonCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d.lldpMgr.Apply(ctx, &lldp.LLDPConfig{
+		Interfaces:     lldpIfaces,
+		Interval:       cfg.Protocols.LLDP.Interval,
+		HoldMultiplier: cfg.Protocols.LLDP.HoldMultiplier,
+		SystemName:     cfg.System.HostName,
+	})
 }
 
 func (d *Daemon) publishInitialPolicySchedulerStateLocked(cfg *config.Config, activeState map[string]bool, applyResult *dataplane.ApplyResult) {

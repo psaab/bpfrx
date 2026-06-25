@@ -10,8 +10,13 @@ entries by TTL.
 - `Neighbor` — `lldp.go`. Chassis ID, port ID, TTL, system name and
   description.
 - `New()` — `lldp.go`.
-- `Apply(ctx context.Context, cfg *LLDPConfig)` — `lldp.go`.
+- `Apply(ctx context.Context, cfg *LLDPConfig)` — `lldp.go`. Reconcile-shaped:
+  `Stop()`s the current generation before starting the new one, so calling it
+  repeatedly is idempotent. A nil/disabled/empty config stops the service.
 - `Stop()` — `lldp.go`.
+- `Running()` — `lldp.go`. Reports whether a live generation has at least one
+  active interface session. Used by the daemon's day-2 reconcile (#2372) and
+  its tests to observe the start/stop transition.
 - `Neighbors()` — `lldp.go`. Snapshot consumed by `show lldp
   neighbors`.
 
@@ -43,10 +48,12 @@ Standard library + `golang.org/x/sys/unix`. No internal `pkg/*` imports.
   `Stop()` close-to-unblock and the loop returns; otherwise (the context
   is still live, e.g. the interface flapped down — `ENETDOWN`) the loop
   **backs off `rxErrorBackoff` (1s) and retries** rather than exiting.
-  Nothing restarts `rxLoop` short of a daemon restart — LLDP is `Apply()`'d
-  once at startup — so a permanent exit on a transient flap would silently
-  kill neighbor discovery for the life of the process (the pre-`#2040`
-  behavior; the old timeout-poll loop survived flaps by continuing). The
+  Nothing restarts `rxLoop` within a generation — it lives only for the life
+  of the `Apply()` that started it (a config change re-`Apply()`s, which
+  `Stop()`s the old generation and starts a fresh one) — so a permanent exit
+  on a transient flap would silently kill neighbor discovery until the next
+  `protocols lldp` commit or a daemon restart (the pre-`#2040` behavior; the
+  old timeout-poll loop survived flaps by continuing). The
   backoff is interruptible: a concurrent `Stop()` cancels the context and
   the loop returns promptly instead of sleeping out the delay, and the
   closed fd makes any parked `Recvfrom` return so `Stop()` stays bounded.
@@ -58,6 +65,18 @@ Standard library + `golang.org/x/sys/unix`. No internal `pkg/*` imports.
   promptly with a parked RX goroutine, without `CAP_NET_RAW`.
 - A socket setup / `CAP_NET_RAW` failure now surfaces at `Apply()` time
   (logged once, interface skipped) instead of silently per-frame.
+
+## Day-2 reconcile (#2372)
+
+The daemon owns the manager and reconciles it on every commit, not just at
+boot. `Daemon.reconcileLLDP` (`pkg/daemon/daemon_apply.go`) is the single
+source of truth: `daemon_run.go` calls it at boot and `applyConfigLocked`
+calls it on every commit. It lazily instantiates the manager on the first
+commit that enables LLDP (so a daemon that never runs LLDP never allocates the
+sockets) and `Stop()`s it when a commit disables or empties the stanza. Because
+`Apply()` is reconcile-shaped (stop-then-start), an interface-set,
+`transmit-interval`, or `hold-multiplier` change takes effect on commit without
+a daemon restart.
 
 ## Gotchas
 

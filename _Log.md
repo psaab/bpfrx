@@ -15092,3 +15092,15 @@ top.
   pkg/config/compiler_nat_source_address_name_2416_test.go,
   pkg/dataplane/userspace/nat_source_address_name_2416_test.go,
   docs/userspace-dnat-plan.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2372 — reconcile the LLDP service on day-2 config commits
+  (was boot-only, requiring a daemon restart). Extracted the boot-time LLDP
+  start into `Daemon.reconcileLLDP` (single source of truth), wired it into
+  `applyConfigLocked` after the DHCP-relay reconcile, lazily instantiates the
+  manager on first enable and `Stop()`s it on disable/empty. Added
+  `lldp.Manager.Running()` accessor + a fail-on-revert daemon test
+  (lazy-create on day-2 enable; disable-stops-running under CAP_NET_RAW).
+  **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/daemon_lldp_reconcile_test.go, pkg/lldp/lldp.go,
+  pkg/lldp/README.md

@@ -299,6 +299,22 @@ func (m *Manager) Stop() {
 	m.mu.Unlock()
 }
 
+// Running reports whether a live LLDP generation is active — i.e. Apply() has
+// started the TX/RX/expiry goroutines and Stop() has not since torn them down.
+// It lets the daemon's day-2 reconcile (and tests of it) observe the
+// start/stop transition without reaching into unexported fields. The result is
+// the m.sessions snapshot: Apply appends sessions under mu and Stop nils them
+// under mu, so a non-empty session set is the race-free witness that a
+// generation is live (cancel is set/cleared by the apply-serialized caller, but
+// sessions are the mu-guarded state). A generation with zero usable interfaces
+// (all InterfaceByName lookups failed) reports false — there is nothing running
+// to reconcile away.
+func (m *Manager) Running() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.sessions) > 0
+}
+
 // Neighbors returns a sorted snapshot of all discovered neighbors.
 func (m *Manager) Neighbors() []*Neighbor {
 	m.mu.RLock()
