@@ -254,6 +254,17 @@ pub(in crate::afxdp) fn ptb_reply_suppressed(
     if source_is_invalid_for_icmp_error(meta.addr_family, packet) {
         return true;
     }
+    // #2487: never generate a PTB in reply to an IPv4 subnet-directed
+    // broadcast SOURCE (all-ones host of a connected prefix). The PTB is
+    // addressed to the trigger's source, so a directed-broadcast source
+    // would send the PTB to that directed broadcast (Smurf backscatter);
+    // `source_is_invalid_for_icmp_error` only catches the limited
+    // broadcast (255.255.255.255). v4-only — IPv6 has no broadcast and
+    // `src_is_directed_broadcast` reads the v4 source octets, so it is
+    // gated on AF_INET (matching the #2411 destination gate below).
+    if meta.addr_family as i32 == libc::AF_INET && src_is_directed_broadcast(forwarding, packet) {
+        return true;
+    }
     // #2314: never generate a PTB in reply to a datagram whose IP
     // destination was multicast or broadcast.
     if dest_is_multicast_or_broadcast(meta.addr_family, packet) {

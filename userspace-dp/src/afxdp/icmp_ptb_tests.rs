@@ -409,6 +409,53 @@ fn ptb_still_generated_for_unicast_in_connected_subnet() {
     );
 }
 
+/// #2487: an oversized DF IPv4 datagram whose SOURCE is a SUBNET-DIRECTED
+/// broadcast (all-ones host of a connected prefix, e.g. 10.0.1.255 for
+/// 10.0.1.0/24) must NOT generate a PTB (RFC 1812 §4.3.2.7). The PTB is
+/// addressed to the trigger's source, so a directed-broadcast source
+/// would emit the PTB to that directed broadcast (Smurf backscatter). The
+/// limited-broadcast test in `source_is_invalid_for_icmp_error` only
+/// catches 255.255.255.255. Fails (PTB allowed) if the
+/// `src_is_directed_broadcast` check is removed.
+#[test]
+fn ptb_suppressed_for_v4_directed_broadcast_src() {
+    let (mut frame, meta) = inbound_v4_udp(1500, true);
+    let l3 = meta.l3_offset as usize;
+    set_v4_src(&mut frame, l3, Ipv4Addr::new(10, 0, 1, 255));
+    let mut fwd = forwarding_with_egress(1400);
+    fwd.connected_v4.push(ConnectedRouteV4 {
+        prefix: crate::prefix::PrefixV4::from_net("10.0.1.0/24".parse().expect("cidr")),
+        ifindex: PTB_IFINDEX,
+        tunnel_endpoint_id: 0,
+        table: "inet.0".to_string(),
+    });
+    assert!(
+        ptb_reply_suppressed(&frame, meta, l3, &fwd),
+        "IPv4 subnet-directed broadcast SOURCE must suppress the PTB"
+    );
+}
+
+/// #2487 anti-over-suppress: a normal unicast HOST source inside the same
+/// connected subnet must STILL generate the PTB; only the all-ones host
+/// is the directed broadcast.
+#[test]
+fn ptb_still_generated_for_unicast_src_in_connected_subnet() {
+    let (mut frame, meta) = inbound_v4_udp(1500, true);
+    let l3 = meta.l3_offset as usize;
+    set_v4_src(&mut frame, l3, Ipv4Addr::new(10, 0, 1, 42));
+    let mut fwd = forwarding_with_egress(1400);
+    fwd.connected_v4.push(ConnectedRouteV4 {
+        prefix: crate::prefix::PrefixV4::from_net("10.0.1.0/24".parse().expect("cidr")),
+        ifindex: PTB_IFINDEX,
+        tunnel_endpoint_id: 0,
+        table: "inet.0".to_string(),
+    });
+    assert!(
+        !ptb_reply_suppressed(&frame, meta, l3, &fwd),
+        "a unicast host source inside a connected subnet must NOT suppress the PTB"
+    );
+}
+
 /// #2314: an oversized IPv6 datagram destined to ff00::/8 multicast must
 /// NOT generate a Packet-Too-Big (RFC 4443 §2.4(e)).
 #[test]

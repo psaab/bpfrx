@@ -93,9 +93,15 @@ pub(super) fn can_generate_icmp_error_reply(
             // #2314 destination) so the PTB, reject, and Time Exceeded
             // paths agree on the disallowed source/destination sets.
             // #2411: also suppress for an IPv4 subnet-directed broadcast
-            // (all-ones host of a connected prefix) — invisible to the
-            // limited-broadcast test, needs the connected subnet mask.
+            // DESTINATION (all-ones host of a connected prefix) —
+            // invisible to the limited-broadcast test, needs the
+            // connected subnet mask.
+            // #2487: and the matching SOURCE check — a directed-broadcast
+            // SOURCE would send the generated error to that directed
+            // broadcast (Smurf backscatter); `source_is_invalid_for_icmp_error`
+            // only catches the limited broadcast (255.255.255.255).
             if source_is_invalid_for_icmp_error(meta.addr_family, packet)
+                || src_is_directed_broadcast(forwarding, packet)
                 || dest_is_multicast_or_broadcast(meta.addr_family, packet)
                 || dest_is_directed_broadcast(forwarding, packet)
             {
@@ -892,6 +898,72 @@ mod tests {
         assert!(
             can_generate_icmp_error_reply(&frame, meta, &fwd),
             "a /32 connected host must not be treated as a directed broadcast"
+        );
+    }
+
+    /// #2487: rewrite the IPv4 SOURCE of an `inbound_v4` frame (offset
+    /// depends on the L2 tag) and fix the IP-header checksum. Mirror of
+    /// `set_inbound_v4_dst` for the source-side directed-broadcast test.
+    fn set_inbound_v4_src(frame: &mut [u8], meta: UserspaceDpMeta, src: Ipv4Addr) {
+        let l3 = meta.l3_offset as usize;
+        frame[l3 + 12..l3 + 16].copy_from_slice(&src.octets());
+        frame[l3 + 10..l3 + 12].copy_from_slice(&[0, 0]);
+        let csum = checksum16(&frame[l3..l3 + 20]);
+        frame[l3 + 10..l3 + 12].copy_from_slice(&csum.to_be_bytes());
+    }
+
+    /// #2487: an IPv4 trigger whose SOURCE is a SUBNET-DIRECTED broadcast
+    /// (the all-ones host of a configured connected prefix, e.g.
+    /// 10.0.1.255 for 10.0.1.0/24) must suppress the locally generated
+    /// ICMP error (RFC 1812 §4.3.2.7). The error is addressed to the
+    /// trigger's source, so a directed-broadcast source would emit the
+    /// error to that directed broadcast (Smurf backscatter). This is the
+    /// source-side sibling of #2411 — the limited-broadcast test in
+    /// `source_is_invalid_for_icmp_error` (`is_broadcast()`) only catches
+    /// 255.255.255.255. FAILS (error generated) if the
+    /// `src_is_directed_broadcast` check is removed.
+    #[test]
+    fn reject_suppressed_for_v4_directed_broadcast_src() {
+        let (mut frame, meta) = inbound_v4(InL2::Untagged);
+        set_inbound_v4_src(&mut frame, meta, Ipv4Addr::new(10, 0, 1, 255));
+        let fwd = forwarding_with_connected_v4("10.0.1.0/24");
+        assert!(
+            !can_generate_icmp_error_reply(&frame, meta, &fwd),
+            "IPv4 subnet-directed broadcast SOURCE must suppress the reply"
+        );
+        assert!(
+            build_reject_icmp_unreachable(&frame, meta, ICMP_IFINDEX, &fwd).is_none(),
+            "reject unreachable must not build for a directed-broadcast source"
+        );
+    }
+
+    /// #2487 anti-over-suppress: a normal unicast HOST source inside the
+    /// same connected subnet (10.0.1.42 in 10.0.1.0/24) must STILL
+    /// generate the error — only the all-ones host is the directed
+    /// broadcast.
+    #[test]
+    fn reject_still_allowed_for_unicast_src_in_connected_subnet() {
+        let (mut frame, meta) = inbound_v4(InL2::Untagged);
+        set_inbound_v4_src(&mut frame, meta, Ipv4Addr::new(10, 0, 1, 42));
+        let fwd = forwarding_with_connected_v4("10.0.1.0/24");
+        assert!(
+            can_generate_icmp_error_reply(&frame, meta, &fwd),
+            "a unicast host source inside a connected subnet must allow the reply"
+        );
+    }
+
+    /// #2487 fail-on-revert guard for the prefix-length skip: a /32
+    /// connected host's `.255` octet is the host itself, NOT a directed
+    /// broadcast, so a normal unicast source to a /32 host must NOT be
+    /// suppressed (the `prefix_len() < 31` guard keeps it allowed).
+    #[test]
+    fn reject_still_allowed_for_v4_host_route_all_ones_octet_src() {
+        let (mut frame, meta) = inbound_v4(InL2::Untagged);
+        set_inbound_v4_src(&mut frame, meta, Ipv4Addr::new(10, 0, 1, 255));
+        let fwd = forwarding_with_connected_v4("10.0.1.255/32");
+        assert!(
+            can_generate_icmp_error_reply(&frame, meta, &fwd),
+            "a /32 connected host source must not be treated as a directed broadcast"
         );
     }
 

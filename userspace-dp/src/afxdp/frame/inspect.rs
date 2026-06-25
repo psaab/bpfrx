@@ -626,16 +626,67 @@ pub(in crate::afxdp) fn dest_is_directed_broadcast(
         return true;
     };
     let dst = Ipv4Addr::new(dst[0], dst[1], dst[2], dst[3]);
-    // `directed_broadcast() == dst` already implies the prefix contains
-    // dst: a directed broadcast is `network | !mask`, so `dst & mask ==
-    // network` (the host bits are all-ones and masked off) — i.e.
-    // `contains(dst)` is necessarily true. The explicit `contains` check
-    // would be redundant, so only the broadcast-equality and the
-    // prefix-length guard remain.
+    v4_addr_is_directed_broadcast(forwarding, dst)
+}
+
+/// Shared connected-table directed-broadcast test for a single IPv4
+/// address, used by both the L3-DESTINATION gate
+/// ([`dest_is_directed_broadcast`]) and the L3-SOURCE gate
+/// ([`src_is_directed_broadcast`]). Returns `true` when `addr` is the
+/// all-ones host (subnet-directed broadcast) of any connected prefix.
+///
+/// `directed_broadcast() == addr` already implies the prefix contains
+/// `addr`: a directed broadcast is `network | !mask`, so `addr & mask ==
+/// network` (the host bits are all-ones and masked off) — i.e.
+/// `contains(addr)` is necessarily true. The explicit `contains` check
+/// would be redundant, so only the broadcast-equality and the
+/// prefix-length guard remain.
+///
+/// Prefixes shorter than /31 are the only ones with a meaningful
+/// directed broadcast: a /31 (RFC 3021) has no broadcast and a /32's
+/// host-all-ones value equals the host itself, so both are skipped to
+/// avoid mis-classifying a legitimate unicast to a /32 connected host.
+#[inline]
+fn v4_addr_is_directed_broadcast(forwarding: &ForwardingState, addr: Ipv4Addr) -> bool {
     forwarding
         .connected_v4
         .iter()
-        .any(|entry| entry.prefix.prefix_len() < 31 && entry.prefix.directed_broadcast() == dst)
+        .any(|entry| entry.prefix.prefix_len() < 31 && entry.prefix.directed_broadcast() == addr)
+}
+
+/// #2487: RFC 1812 §4.3.2.7 — a router MUST NOT originate an ICMP error
+/// in reply to a datagram whose IP SOURCE is a *directed* (subnet)
+/// broadcast, e.g. `10.0.1.255` for a connected `10.0.1.0/24`. A locally
+/// generated error is addressed TO the trigger's source, so a directed-
+/// broadcast source produces an error sent to that directed broadcast —
+/// delivered to every host on the segment (Smurf-style amplification /
+/// backscatter). This is the L3-SOURCE sibling of the merged #2411
+/// [`dest_is_directed_broadcast`] (L3 destination): the
+/// [`source_is_invalid_for_icmp_error`] limited-broadcast test
+/// (`is_broadcast()`) only catches `255.255.255.255`; a subnet-directed
+/// broadcast is a plain unicast address to that test and needs the
+/// configured subnet MASK from the connected-route table to recognize.
+///
+/// IPv4-only: IPv6 has no broadcast (the v6 caller never invokes this).
+/// `packet` is the L3 (IP-header-first) slice. Returns `true` when the
+/// source is the all-ones host address of a connected prefix and the
+/// ICMP error MUST be suppressed. A too-short slice fails closed
+/// (suppress). The connected table is reused from the forwarding path
+/// (no new infrastructure), scanned only on the cold error-generation
+/// path. The /31 and /32 prefix-length guards match
+/// [`dest_is_directed_broadcast`].
+#[inline]
+pub(in crate::afxdp) fn src_is_directed_broadcast(
+    forwarding: &ForwardingState,
+    packet: &[u8],
+) -> bool {
+    let Some(src) = packet.get(12..16) else {
+        // Fail closed: a source we cannot read must suppress the error
+        // rather than risk directed-broadcast backscatter.
+        return true;
+    };
+    let src = Ipv4Addr::new(src[0], src[1], src[2], src[3]);
+    v4_addr_is_directed_broadcast(forwarding, src)
 }
 
 /// #2367: RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e) — a router MUST NOT
