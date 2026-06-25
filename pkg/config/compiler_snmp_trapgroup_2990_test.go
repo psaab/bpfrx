@@ -54,6 +54,51 @@ func TestSNMPTrapGroup_ZeroTargetsRejected(t *testing.T) {
 	}
 }
 
+// TestSNMPTrapGroup_TypoLenientWarns pins the no-brick contract (#1960
+// doctrine) for the typo case: the unknown trap-group key the STRICT path
+// rejects is TOLERATED on the lenient load / peer-sync path — downgraded to a
+// warning so an already-persisted/peer-synced config (committed before #2990
+// gave trap-group children) still boots. Goes RED (CompileConfigLenient hard-
+// errors) if the lenient downgrade is removed.
+func TestSNMPTrapGroup_TypoLenientWarns(t *testing.T) {
+	tree := &ConfigTree{}
+	path, err := ParseSetCommand("set snmp trap-group managers tragets 10.0.0.10")
+	if err != nil {
+		t.Fatalf("ParseSetCommand: %v", err)
+	}
+	if err := tree.SetPath(path); err != nil {
+		t.Fatalf("SetPath: %v", err)
+	}
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient must not fail on a typoed trap-group key (brick-on-restart): %v", err)
+	}
+	if !hasWarningSubstr(cfg.Warnings, "unknown statement") {
+		t.Fatalf("expected a downgraded unknown-statement warning, warnings=%v", cfg.Warnings)
+	}
+}
+
+// TestSNMPTrapGroup_ZeroTargetsLenientWarns is the zero-target companion of the
+// no-brick contract: a persisted zero-target trap group boots through on the
+// lenient path with a warning rather than failing to compile.
+func TestSNMPTrapGroup_ZeroTargetsLenientWarns(t *testing.T) {
+	tree := &ConfigTree{}
+	path, err := ParseSetCommand("set snmp trap-group empty version v2")
+	if err != nil {
+		t.Fatalf("ParseSetCommand: %v", err)
+	}
+	if err := tree.SetPath(path); err != nil {
+		t.Fatalf("SetPath: %v", err)
+	}
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient must not fail on a zero-target trap group (brick-on-restart): %v", err)
+	}
+	if !hasWarningSubstr(cfg.Warnings, "no targets configured") {
+		t.Fatalf("expected a downgraded zero-target warning, warnings=%v", cfg.Warnings)
+	}
+}
+
 // TestSNMPTrapGroup_ValidAccepted confirms the fix does not over-reject: a
 // well-formed trap group (single target, multiple targets, with version /
 // categories) compiles and the targets land in the typed config.

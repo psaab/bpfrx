@@ -596,6 +596,21 @@ type compileOpts struct {
 	// the malformed value never reaches frr.conf and a leniently-loaded bad
 	// router-id is inert. Same doctrine as lenientBGPNeighborPeerAS.
 	lenientRouterID bool
+	// lenientSNMPTrapGroup (#2990) downgrades the SNMP trap-group commit gate
+	// (unknown trap-group child key, e.g. a `tragets` typo, and an
+	// enabled-but-zero-target trap group) from a hard compile error to a
+	// cfg.Warnings entry. Before #2990 the trap-group schema had children:nil
+	// and the compiler silently dropped every child but `targets`, so a typo'd
+	// or zero-target trap group COMMITTED CLEANLY and persists in active.json.
+	// The #2990 strict gate rejects such a group at commit (operator-visible,
+	// naming the offending key) — but on the tolerant load / peer-sync path it
+	// MUST warn, not error, or an already-persisted bad trap group would fail
+	// CompileConfigLenient and blackout the boot / alarm-loop HA sync (the
+	// exact #1960 fail-closed-on-load class compileTreeLenient exists to
+	// prevent). Runtime is already inert for both cases — sendLinkTraps skips a
+	// zero-target group and never reads an unknown key — so a leniently-loaded
+	// bad group is harmless. Same doctrine as lenientRouterID.
+	lenientSNMPTrapGroup bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -653,6 +668,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRPMRoutingInstance:          true,
 		lenientBGPNeighborPeerAS:           true,
 		lenientRouterID:                    true,
+		lenientSNMPTrapGroup:               true,
 	})
 }
 
@@ -761,6 +777,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRPMRoutingInstance:          true,
 		lenientBGPNeighborPeerAS:           true,
 		lenientRouterID:                    true,
+		lenientSNMPTrapGroup:               true,
 	})
 }
 
@@ -925,7 +942,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 				return nil, fmt.Errorf("forwarding-options: %w", err)
 			}
 		case "system":
-			if err := compileSystem(node, &cfg.System); err != nil {
+			if err := compileSystem(node, &cfg.System, cfg, opts); err != nil {
 				return nil, fmt.Errorf("system: %w", err)
 			}
 		case "schedulers":
@@ -946,7 +963,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 			}
 		case "snmp":
 			// Top-level snmp stanza (same format as system { snmp { ... } })
-			if err := compileSNMP(node, &cfg.System); err != nil {
+			if err := compileSNMP(node, &cfg.System, cfg, opts.lenientSNMPTrapGroup); err != nil {
 				return nil, fmt.Errorf("snmp: %w", err)
 			}
 		case "bridge-domains":
