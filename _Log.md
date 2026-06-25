@@ -14948,6 +14948,21 @@ top.
   pkg/ra/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2523 — cap control-socket request read before allocation.
+  Replaced the unbounded `read_line` in `handle_stream` with a
+  `take(MAX_CONTROL_REQUEST_BYTES + 1)`-bounded `read_until`; oversize
+  bodies (no terminating newline within the cap) are rejected before
+  decode, fail-closed, daemon stays alive. Added
+  `MAX_CONTROL_REQUEST_BYTES = 16 MiB` (headroom over the largest real
+  request, a full apply_snapshot). Both control + session sockets share
+  `handle_stream`, so one fix covers both. Read-side only — no wire
+  change (wire_invariant test green, no protocol_wire_v1.json regen).
+  Added fail-on-revert tests: oversize→rejected (RED on cap removal,
+  proven), max-size legit body→succeeds. Gates: cargo build --release
+  clean; server::tests 41/0.
+  **File(s)**: userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/server/handlers/mod.rs,
+  userspace-dp/src/server/tests.rs, _Log.md
   **Action**: #2609 — IPFIX template-refresh header no longer resets
   SequenceNumber to 0. Per RFC 7011 §3.1/§10.3.2 the IPFIX sequence is the
   cumulative data-record count; a template-only Message carries the current

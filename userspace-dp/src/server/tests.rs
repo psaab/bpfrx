@@ -17,7 +17,7 @@ use crate::state_writer::StateWriter;
 use crate::{
     afxdp, BindingControlRequest, BindingStatus, ControlRequest, ControlResponse, ForwardingControlRequest,
     HAGroupStatus, HAStateUpdateRequest, ProcessStatus, QueueControlRequest, SessionSyncRequest,
-    UserspaceCapabilities,
+    UserspaceCapabilities, MAX_CONTROL_REQUEST_BYTES,
 };
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -76,6 +76,83 @@ fn req(request_type: &str) -> ControlRequest {
         request_type: request_type.to_string(),
         ..ControlRequest::default()
     }
+}
+
+/// Drive a RAW byte payload through `handle_stream` and return the
+/// handler's `Result<(), String>` directly. Unlike `run_request`, this
+/// does not assume the handler replies — an oversize/undecodable request
+/// is rejected before the reply is written, so the caller inspects the
+/// returned error string. The client half writes `payload` then shuts
+/// down the write side so a body WITHOUT a terminating newline still
+/// reaches EOF (the `take` cap, not the missing newline, must be what
+/// bounds the read).
+fn run_raw(state: Arc<Mutex<ServerState>>, payload: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    let state_file = unique_state_file("raw");
+    let (mut client, server) =
+        std::os::unix::net::UnixStream::pair().expect("control socket pair");
+    let running = Arc::new(AtomicBool::new(true));
+    let handle = {
+        let state_file = state_file.clone();
+        std::thread::spawn(move || handle_stream(server, &state_file, state, running))
+    };
+    client.write_all(payload).expect("write raw payload");
+    // Drop the write half so the handler sees EOF; an oversize body with
+    // no newline must still be bounded by the read cap, not block.
+    client
+        .shutdown(std::net::Shutdown::Write)
+        .expect("shutdown write");
+    // Drain any response the handler may write so it never blocks on a
+    // full socket buffer, then collect the handler result.
+    let mut sink = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut client, &mut sink);
+    let result = handle.join().expect("handler thread");
+    let _ = std::fs::remove_file(&state_file);
+    result
+}
+
+// --- request byte cap (#2523) -------------------------------------------
+
+#[test]
+fn oversize_request_is_rejected_before_decode() {
+    // A body one byte past the cap with NO terminating newline. The cap
+    // must reject it before the (unbounded) decode allocation; the read
+    // itself is bounded to MAX+1 by the `take` in handle_stream.
+    let payload = vec![b'a'; MAX_CONTROL_REQUEST_BYTES + 1];
+    let err = run_raw(new_state(ProcessStatus::default()), &payload)
+        .expect_err("oversize request must be rejected");
+    assert!(
+        err.contains("exceeds maximum size"),
+        "expected oversize rejection, got: {err}"
+    );
+    // Fail-on-revert pin: if the cap is removed, `read_until` would slurp
+    // all MAX+1 'a' bytes and serde would fail with a DECODE error, not an
+    // "exceeds maximum size" error — so this assertion goes RED on revert.
+}
+
+#[test]
+fn max_size_legitimate_request_still_succeeds() {
+    // A real request padded with a large (but legal) field up to just
+    // under the cap, terminated by the single newline the Go encoder
+    // appends. The body is <= MAX bytes, so MAX+1 bytes on the wire ending
+    // in '\n' — the largest legitimate read. It must decode and succeed.
+    // Pad the request_type string so the serialized body approaches the
+    // cap without crossing it (leave generous slack for the JSON
+    // envelope). The body decodes as valid JSON and the dispatcher runs
+    // its catch-all arm — handle_stream completes with Ok(()), proving a
+    // max-size body is read, decoded, and handled rather than rejected.
+    let pad_len = MAX_CONTROL_REQUEST_BYTES - 4096;
+    let request = req(&"x".repeat(pad_len));
+    let mut payload = serde_json::to_vec(&request).expect("serialize");
+    assert!(
+        payload.len() <= MAX_CONTROL_REQUEST_BYTES,
+        "test payload {} must stay within the cap {}",
+        payload.len(),
+        MAX_CONTROL_REQUEST_BYTES
+    );
+    payload.push(b'\n');
+    run_raw(new_state(ProcessStatus::default()), &payload)
+        .expect("max-size legitimate request must succeed");
 }
 
 // --- dispatcher: ping / status / unknown --------------------------------
