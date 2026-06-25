@@ -16582,6 +16582,30 @@ top.
   pkg/config/wireguard_multipeer_test.go, docs/config-schema.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2684 — fix WG PTB inner-MTU under-advertisement (off-by-one
+  encap). The post-transform PMTUD path (`post_transform_inner_mtu`) WG arm
+  sourced the outer MTU via `tunnel_outer_mtu`, which for a WG transit flow
+  (zeroed `endpoint.destination`) falls back to the LOGICAL ifindex MTU
+  (~1420 = underlay − encap); feeding that to `wg_inner_mtu` double-subtracts
+  the WG overhead → PTB advertised ~1345 (v4) / 1325 (v6), ~100B below what
+  the #2680 encap guard admits (`wg_inner_mtu(physical=1500)` = 1425 / 1405).
+  Fix: new `frame::wg_endpoint_physical_outer_mtu` SSOT wrapper over the #2680
+  `outer_physical_egress_mtu` (route-resolves the physical underlay via the
+  first peer endpoint; per-endpoint underlay, #2734); WG arm now derives the
+  outer MTU from the PHYSICAL underlay so the advertised inner MTU =
+  `physical_mtu − WG_OVERHEAD_{V4,V6} − WG_MAX_PADDING` (the exact inverse of
+  `wg_encapped_size`). GRE unaffected (real `destination` resolves to physical
+  already). No shared constant changed (no #2792 conflict). No wire change
+  (`protocol_wire_v1.json` untouched). Tests: 3 new fail-on-revert tests in
+  `icmp_ptb_tests.rs` (v4 Frag-Needed → 1425, v6 Packet-Too-Big → 1405,
+  no-peer fallback → 1345 = logical). Fail-on-revert proven via copy-restore:
+  reverting the WG arm to `tunnel_outer_mtu` yields left:1345 (v4) / left:1325
+  (v6) vs right:1425/1405. Gates: `cargo build --release -p xpf-userspace-dp`
+  clean; `cargo test --release --bin xpf-userspace-dp -- ptb mtu icmp` 192/0;
+  `-- wg tunnel` 268/0. No Go change.
+  **File(s)**: userspace-dp/src/afxdp/icmp_ptb.rs,
+  userspace-dp/src/afxdp/frame/wg.rs, userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/icmp_ptb_tests.rs, docs/wireguard-interop.md, _Log.md
   **Action**: #2779 — reject Surface A DDNS operator hostnames that the
   publish path would SILENTLY rewrite to a different public DNS name. The
   router-owned Surface A hostname is operator intent (the operator types the
@@ -16652,3 +16676,30 @@ top.
   passed / 0 failed.
   **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
   docs/wireguard-interop.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2780 — type the per-interface Surface A `dynamic-dns
+  source-address` leaf (`ValueIPAddress` + `ValidateIPAddress`, reusing
+  the existing GRE/tunnel IP-literal validator — NO new validator added).
+  The leaf was free-form (placeholder only), so any string committed
+  cleanly. The runtime feeds it to `netip.ParseAddr`
+  (`pkg/ddns/backend_bind.go` `resolveBindConfig`), where an unparseable
+  value is a HARD error → the backend falls back to a no-op for that
+  scope and the binding silently stops emitting UPDATEs. The typed leaf
+  rejects a non-IP literal at COMMIT (riding the generic #1319
+  `SchemaValidate` gate: strict at commit via `compileTreeStrict`,
+  lenient/warn on boot-load + peer-sync, identical to the #2779 hostname
+  leaf). Mirrors the #2779 `ValueHostname`/`ValidateDDNSHostname`
+  pattern. Family-mismatch enforcement (v4 record / v6 bind) is left to
+  the runtime + Surface A status — the schema leaf closure has no family
+  context.
+  FAIL-ON-REVERT: copied `schema_interfaces.go` aside, reverted the leaf
+  to the old free-form `{placeholder:"<ip>"}` form, ran
+  `go test ./pkg/config/ -run TestSchemaValidate_DDNSSourceAddress_2780`
+  → FAILED (all 14 reject cases got nil); restored from the copy, green.
+  Gates: go build ./... clean; gofmt -l clean; go vet ./pkg/config/...
+  ./pkg/ddns/... clean; go test ./pkg/config/... ./pkg/ddns/...
+  ./pkg/cmdtree/... all ok.
+  **File(s)**: pkg/config/schema_interfaces.go,
+  pkg/config/schema_validate_ddns_source_address_2780_test.go,
+  docs/config-schema.md, _Log.md

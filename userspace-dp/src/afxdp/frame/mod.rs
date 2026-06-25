@@ -13,6 +13,12 @@ mod wg;
 // classifier in `tx/cos_classify.rs` (a sibling afxdp module) can reach it.
 pub(in crate::afxdp) use generated::generated_reply_session_key;
 
+// #2684: the WG physical-underlay outer MTU SSOT, re-exported so the TX
+// dispatcher's `post_transform_inner_mtu` (icmp_ptb.rs) derives the PTB
+// inner MTU from the SAME physical underlay the encap drop guard admits
+// against (the `mod wg` submodule itself is private to `frame`).
+pub(in crate::afxdp) use wg::wg_endpoint_physical_outer_mtu;
+
 // #1440 consolidated outer-header serializers. Re-exported at
 // `frame::write_eth_header`, `frame::write_eth_header_slice`, and
 // `frame::headers::*` to keep existing call sites in icmp.rs,
