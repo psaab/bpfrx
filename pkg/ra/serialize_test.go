@@ -1027,6 +1027,78 @@ func TestT2a_ChangedConfigApplyNeverTwoLiveConns(t *testing.T) {
 	_ = m.Clear()
 }
 
+// TestT2c_ReplaceStaysLiveNoGoodbye_WithdrawGoesDownWithGoodbye is the #2834
+// make-before-break contract, asserting BOTH halves so the replace and withdraw
+// paths can never collapse into one another:
+//
+//	REPLACE  (config changed, RA still served): Apply returns with EXACTLY one
+//	         live conn (the replacement) and emits NO goodbye — no observable
+//	         0-live-conn window, no prefix withdrawal. This is the bug #2834
+//	         fixed: the replacement conn opens asynchronously, so before the fix
+//	         Apply could return with the new conn not yet up (0 live conns = an
+//	         IPv6-RA outage). Apply now waits (unlocked) for the replacement conn
+//	         to come live before returning.
+//
+//	WITHDRAW (interface/prefix genuinely removed): a lifetime-0 goodbye IS
+//	         emitted and the live-conn count drops to 0 — the #2033 behavior is
+//	         preserved.
+//
+// NON-TAUTOLOGY: against the pre-#2834 code the REPLACE assertion (live==1
+// immediately after Apply, no waiting in the test) fails with live==0.
+func TestT2c_ReplaceStaysLiveNoGoodbye_WithdrawGoesDownWithGoodbye(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+
+	m := New()
+	if err := m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}); err != nil {
+		t.Fatalf("initial Apply: %v", err)
+	}
+	old := waitConn(t, fl.getConn, "lo")
+	waitWrites(t, old, 1)
+
+	// --- REPLACE: changed config, no gating. Apply must return make-before-break
+	// with the replacement live. The test does NOT poll/wait afterward — the
+	// guarantee is that Apply returned only once the replacement conn was up. ---
+	if err := m.Apply([]*config.RAInterfaceConfig{configChanged("lo")}); err != nil {
+		t.Fatalf("changed-config Apply: %v", err)
+	}
+	if lc := fl.liveCount(); lc != 1 {
+		t.Fatalf("after replace: live conns = %d, want 1 (make-before-break: "+
+			"Apply must return with the replacement RA conn live, #2834)", lc)
+	}
+	newConn := fl.getConn("lo")
+	if newConn == old {
+		t.Fatal("changed-config Apply did not open a new conn (no replace happened)")
+	}
+	// A config replace is NOT a withdrawal: no goodbye on either conn.
+	if total, conns := fl.goodbyeStats("lo"); conns != 0 || total != 0 {
+		t.Fatalf("config replace emitted a goodbye (%d conns, %d writes); a "+
+			"replace must not withdraw the prefix (#2033 preserved)", conns, total)
+	}
+
+	// --- WITHDRAW: a genuine withdrawal still emits the lifetime-0 goodbye and
+	// drops to 0 live conns (the #2033 behavior must not regress). ---
+	if err := m.Withdraw(); err != nil {
+		t.Fatalf("Withdraw: %v", err)
+	}
+	for i := 0; i < 200; i++ {
+		if fl.liveCount() == 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if lc := fl.liveCount(); lc != 0 {
+		t.Fatalf("after withdraw: live conns = %d, want 0", lc)
+	}
+	total, conns := fl.goodbyeStats("lo")
+	if conns == 0 || total == 0 {
+		t.Fatalf("withdraw emitted no goodbye (%d conns, %d writes); a genuine "+
+			"withdrawal must emit the lifetime-0 goodbye (#2033)", conns, total)
+	}
+}
+
 // TestT7b_ManagerHardFirstThenGracefulStillGoodbye is the #2033 MAJOR 2
 // regression. A Clear (hard) can acquire m.mu first, delete the sender, install
 // a tombstone and signalStop(modeHard). A graceful Withdraw arriving afterward

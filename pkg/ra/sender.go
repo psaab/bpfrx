@@ -126,6 +126,21 @@ type sender struct {
 	stopped  chan struct{}
 	burstCh  chan struct{} // buffered(1): request a re-burst (ResendBurst)
 
+	// connReady is closed by the owner goroutine ONCE the openConn attempt has
+	// resolved (whether it opened the conn or gave up). It lets a caller observe
+	// the end of the async socket-open window without blocking the owner under
+	// m.mu. connOpened records whether that resolution actually produced a live
+	// conn (true) or gave up / was pre-empted by a stop (false). The manager's
+	// changed-config replace path waits on connReady so Apply returns only once
+	// the REPLACEMENT RA conn is live — a make-before-break guarantee that there
+	// is no observable 0-live-conn window across a config replace (#2834). Both
+	// are written exactly once by the owner before any waiter is released:
+	// connOpened is stored BEFORE close(connReady), so a waiter that observes the
+	// closed channel also observes the stored value (Go memory model).
+	connReady    chan struct{}
+	connReadyOne sync.Once
+	connOpened   atomic.Bool
+
 	// goodbyeEmitted records whether finishShutdown actually emitted the
 	// lifetime-0 goodbye. The manager reads it AFTER the join (<-stopped) to
 	// decide whether it still OWES a standalone goodbye for a graceful
@@ -141,11 +156,12 @@ type sender struct {
 
 func newSender(cfg *config.RAInterfaceConfig, iface *net.Interface) *sender {
 	return &sender{
-		cfg:     cfg,
-		iface:   iface,
-		stopCh:  make(chan struct{}),
-		stopped: make(chan struct{}),
-		burstCh: make(chan struct{}, 1),
+		cfg:       cfg,
+		iface:     iface,
+		stopCh:    make(chan struct{}),
+		stopped:   make(chan struct{}),
+		burstCh:   make(chan struct{}, 1),
+		connReady: make(chan struct{}),
 	}
 }
 
@@ -171,6 +187,34 @@ func newSender(cfg *config.RAInterfaceConfig, iface *net.Interface) *sender {
 func (s *sender) start() error {
 	go s.run()
 	return nil
+}
+
+// signalConnReady records the result of the owner's openConn attempt and
+// releases any waiter on connReady. Owner-only; idempotent. opened MUST be
+// stored before the channel is closed so a waiter that observes the close also
+// observes the value.
+func (s *sender) signalConnReady(opened bool) {
+	s.connReadyOne.Do(func() {
+		s.connOpened.Store(opened)
+		close(s.connReady)
+	})
+}
+
+// waitConnReady blocks until the owner's openConn attempt has resolved (the
+// conn is live or the open gave up / was pre-empted by a stop), or until the
+// bounded deadline elapses. It returns true only when a live conn was actually
+// opened. It is used by the changed-config replace path so Apply returns only
+// once the REPLACEMENT RA conn is live — closing the make-before-break gap that
+// would otherwise leave a brief 0-live-conn window after a config replace
+// (#2834). It NEVER holds m.mu: the wait is the async socket-open latency, which
+// must not serialize other RA manager operations.
+func (s *sender) waitConnReady(timeout time.Duration) bool {
+	select {
+	case <-s.connReady:
+		return s.connOpened.Load()
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // openConn performs the (potentially slow) NDP socket open for the owner
@@ -356,9 +400,14 @@ func (s *sender) run() {
 	// (no goodbye is written, goodbyeEmitted stays false → the manager's
 	// release-time backstop emits a standalone goodbye if one was owed).
 	if !s.openConn() {
+		// The open attempt resolved (failed or pre-empted by a stop). Release any
+		// waiter on connReady BEFORE finishShutdown so a make-before-break Apply
+		// does not block for the full timeout on a sender that will never serve.
+		s.signalConnReady(false)
 		s.finishShutdown()
 		return
 	}
+	s.signalConnReady(true)
 
 	// A stop may have been signalled while the conn was opening. Honor it before
 	// emitting the startup burst (burstInterruptible also short-circuits, but

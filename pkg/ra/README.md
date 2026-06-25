@@ -116,6 +116,25 @@ after HA failover. To make that **structural**, not flag-defended:
   `WithdrawOnce` treats it as a claim and defers. This guarantees **at most
   one live NDP conn per interface** at any time (no `ndp.Listen` collision,
   no goodbye-after-new-burst inversion).
+- **Make-before-break on a changed-config replace (#2834).** The ≤1-conn
+  rule above means the old conn is PROVEN closed before the replacement is
+  started — but `start()` opens the new conn ASYNCHRONOUSLY in the owner
+  goroutine (the `openConn` bind retry must not run under `m.mu`; see "Bind
+  retry runs unlocked"). So between `startLocked` returning and the owner's
+  `openConn` completing there is a brief window with ZERO live conns — an
+  IPv6-RA outage after a config change (hosts could lose the default route /
+  RDNSS). On the changed-config restart path ONLY, `Apply` therefore waits —
+  UNLOCKED, after `releaseDrain` returns — on the replacement sender's
+  `connReady` signal (closed by the owner once `openConn` resolves), bounded
+  by `claimWaitTimeout`. `Apply` returns only once the replacement RA conn is
+  LIVE, so the live-conn count goes 1 → (briefly 0, internal) → 1 with no
+  observable 0-conn window for callers, and never momentarily 2 (the old conn
+  is gone first). This applies ONLY to a replace — it is NOT a withdrawal, so
+  it still emits no goodbye; a genuine `Withdraw`/`Clear`/removal keeps its
+  existing lifetime-0-goodbye + go-down behavior. The sender exposes
+  `waitConnReady(timeout) bool`; the owner calls `signalConnReady(opened)`
+  after `openConn` so a failed/pre-empted open releases the waiter promptly
+  rather than blocking the full timeout on a sender that will never serve.
 - **Deferred / restart Apply is epoch-guarded.** An `Apply` start that
   waits behind a tombstone (a pre-existing drain, or its own changed-config
   stop) captures the manager epoch; if a newer `Withdraw`/`Clear`/`Apply`

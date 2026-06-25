@@ -327,6 +327,7 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 	for _, req := range toStop {
 		name := req.name
 		var onProvenClose func() error
+		var replacement *sender // set by onProvenClose on a successful restart start
 		if cfg, isRestart := restartSet[name]; isRestart {
 			cfg := cfg // capture
 			onProvenClose = func() error {
@@ -334,11 +335,26 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 				if err := m.startLocked(cfg); err != nil {
 					return err
 				}
+				replacement = m.senders[cfg.Interface]
 				return nil
 			}
 		}
 		if err := m.releaseDrain(name, req.s, epoch, onProvenClose); err != nil && firstErr == nil {
 			firstErr = err
+		}
+		// Make-before-break: the old conn was PROVEN closed before startLocked ran
+		// (releaseDrain only invokes onProvenClose on the <-stopped arm), so the
+		// replacement is the sole conn for this interface. start() opens the conn
+		// asynchronously in the owner goroutine; wait (UNLOCKED) for that open to
+		// resolve so Apply returns only once the replacement RA conn is live —
+		// there is no observable 0-live-conn window across a config replace
+		// (#2834). If the open gives up or is pre-empted, waitConnReady returns
+		// promptly (it does not block for the full timeout on a dead sender).
+		if replacement != nil {
+			if !replacement.waitConnReady(claimWaitTimeout) {
+				slog.Warn("ra: replacement sender conn did not come up after a "+
+					"config replace", "interface", name)
+			}
 		}
 	}
 
