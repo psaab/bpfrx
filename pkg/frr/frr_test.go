@@ -2637,7 +2637,7 @@ func TestGenerateProtocols_BGPLogNeighborChanges(t *testing.T) {
 func TestResolveRedistribute_BareProtocol(t *testing.T) {
 	m := New()
 	for _, proto := range []string{"connected", "static", "ospf", "bgp", "rip", "isis", "kernel"} {
-		got := m.resolveRedistribute(proto, nil)
+		got := m.resolveRedistribute(proto, nil, "")
 		want := " redistribute " + proto + "\n"
 		if got != want {
 			t.Errorf("resolveRedistribute(%q, nil) = %q, want %q", proto, got, want)
@@ -2660,7 +2660,7 @@ func TestResolveRedistribute_PolicyStatement(t *testing.T) {
 			},
 		},
 	}
-	got := m.resolveRedistribute("export-connected", po)
+	got := m.resolveRedistribute("export-connected", po, "")
 	want := " redistribute connected route-map export-connected\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -2680,7 +2680,7 @@ func TestResolveRedistribute_MultiProtocol(t *testing.T) {
 			},
 		},
 	}
-	got := m.resolveRedistribute("export-all", po)
+	got := m.resolveRedistribute("export-all", po, "")
 	// Should have both protocols, sorted alphabetically
 	if !strings.Contains(got, "redistribute connected route-map export-all\n") {
 		t.Errorf("missing connected route-map in:\n%s", got)
@@ -2903,7 +2903,7 @@ func TestResolveRedistribute_ProtocolLessPolicy(t *testing.T) {
 			},
 		},
 	}
-	got := m.resolveRedistribute("export-comm", po)
+	got := m.resolveRedistribute("export-comm", po, "")
 	if got != "" {
 		t.Errorf("protocol-less policy must yield no redistribute line, got %q", got)
 	}
@@ -2922,7 +2922,7 @@ func TestResolveRedistribute_ProtocolLessPolicy(t *testing.T) {
 func TestResolveRedistribute_UnknownToken(t *testing.T) {
 	m := New()
 	// nil policy-options: the name resolves to nothing.
-	if got := m.resolveRedistribute("no-such-policy", nil); got != "" {
+	if got := m.resolveRedistribute("no-such-policy", nil, ""); got != "" {
 		t.Errorf("unknown token must yield no redistribute line, got %q", got)
 	}
 	// Non-nil policy-options that simply does not define the name.
@@ -2931,7 +2931,7 @@ func TestResolveRedistribute_UnknownToken(t *testing.T) {
 			"other": {Name: "other"},
 		},
 	}
-	if got := m.resolveRedistribute("typo-name", po); got != "" {
+	if got := m.resolveRedistribute("typo-name", po, ""); got != "" {
 		t.Errorf("undefined policy name must yield no redistribute line, got %q", got)
 	}
 }
@@ -5480,4 +5480,56 @@ func TestGeneratePolicyOptionsLocalPreferenceZero(t *testing.T) {
 			t.Errorf("local-preference 200 must still render `set local-preference 200`; got:\n%s", got)
 		}
 	})
+}
+
+// TestResolveRedistribute_SelfExclusion is the #2943 fail-on-revert guard
+// for self-redistribution: a protocol must never redistribute its own
+// routes (FRR rejects `redistribute ospf` under `router ospf`, failing the
+// whole managed reload). Both the bare-token path and the policy-statement
+// `from protocol <self>` path must drop the self protocol.
+func TestResolveRedistribute_SelfExclusion(t *testing.T) {
+	m := New()
+	// Bare-token self redistribute is dropped.
+	if got := m.resolveRedistribute("ospf", nil, "ospf"); got != "" {
+		t.Errorf("self-redistribute (bare token) must be dropped; got %q", got)
+	}
+	// A different protocol still renders.
+	if got := m.resolveRedistribute("static", nil, "ospf"); got != " redistribute static\n" {
+		t.Errorf("non-self protocol must still redistribute; got %q", got)
+	}
+	// Policy-statement path: a term `from protocol ospf` under router ospf
+	// is self-redistribution and must be excluded, while a sibling
+	// `from protocol static` term still renders.
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"leak": {
+				Name: "leak",
+				Terms: []*config.PolicyTerm{
+					{Name: "self", FromProtocols: []string{"ospf"}, Action: "accept"},
+					{Name: "other", FromProtocols: []string{"static"}, Action: "accept"},
+				},
+			},
+		},
+	}
+	got := m.resolveRedistribute("leak", po, "ospf")
+	if strings.Contains(got, "redistribute ospf route-map leak") {
+		t.Errorf("self-redistribute via policy term must be excluded (#2943); got %q", got)
+	}
+	if !strings.Contains(got, "redistribute static route-map leak") {
+		t.Errorf("non-self policy term must still render; got %q", got)
+	}
+}
+
+// TestResolveRedistribute_OSPF6RIPng is the #2943 fail-on-revert guard for
+// the missing ospf6 / ripng keywords: a bare `export ospf6` / `export
+// ripng` must render the valid FRR redistribute line, not fall through to
+// the skip-and-warn path that silently drops IPv6 IGP redistribution.
+func TestResolveRedistribute_OSPF6RIPng(t *testing.T) {
+	m := New()
+	if got := m.resolveRedistribute("ospf6", nil, ""); got != " redistribute ospf6\n" {
+		t.Errorf("ospf6 must render `redistribute ospf6`; got %q", got)
+	}
+	if got := m.resolveRedistribute("ripng", nil, ""); got != " redistribute ripng\n" {
+		t.Errorf("ripng must render `redistribute ripng`; got %q", got)
+	}
 }
