@@ -11,6 +11,18 @@ this surface over a Unix socket using a newline-delimited text protocol.
   socket setup (control + a derived dedicated session-install
   socket so session installs don't share the control channel),
   sysctl tuning, signal handling.
+  - **Socket-buffer sysctls are raise-only (#2970).** `run()` bumps the
+    host-global `rmem_default`/`rmem_max`/`wmem_default`/`wmem_max` to a
+    64 MiB target (`SOCKBUF_TARGET`) so AF_XDP copy-mode sockets receive
+    at line rate, but it only ever *raises* — `raise_only_value` /
+    `raise_sysctl` skip the write when the current value is already
+    `>=` target. The target is kept equal to the Go control plane's
+    `tuneSocketBuffers` desired (`pkg/dataplane/userspace/process.go`,
+    `const desired = 67108864`); the Go side raises these before
+    launching the helper, so whichever runs second is a no-op rather
+    than a fight. Earlier the helper unconditionally wrote 16 MiB and
+    clobbered Go's 64 MiB (and any operator-tuned larger value) back
+    down, reintroducing receive drops.
 - `state.rs` — `ServerState`: coordinator handle, latest config
   snapshot, session-table handle, policy state.
 - `handlers/` — request dispatch (`handlers/mod.rs` is the
