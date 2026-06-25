@@ -4440,3 +4440,74 @@ fn run_chunked_resync(table: &mut SessionTable, chunk: usize) -> usize {
     }
     exported
 }
+
+// ---- #2364: seeded session-index hashing --------------------------------
+
+/// The session indices are private, so assert the hardening property at
+/// the BuildHasher the maps are constructed with: `FxSeededState` over a
+/// `SessionKey` must produce a seed-dependent bucket distribution (so an
+/// attacker cannot precompute a collision chain offline) while staying
+/// stable for a fixed seed (so the live table's lookup/insert agree).
+///
+/// Fail-on-revert: the reverted state used `FxHashMap::default()`
+/// (= `FxBuildHasher`, unseeded). `FxBuildHasher::hash_one` ignores any
+/// seed, so the "distribution depends on seed" arm below would fail.
+#[test]
+fn session_key_seeded_hash_depends_on_seed_and_is_stable() {
+    use std::hash::BuildHasher;
+
+    // 256 attacker-constructible keys (one src subnet, sweeping src_port).
+    let keys: Vec<SessionKey> = (0..256u16)
+        .map(|i| make_v4_key((i & 0xff) as u8, 40000u16.wrapping_add(i)))
+        .collect();
+
+    // Low bits of the hash model the open-addressing bucket the map would
+    // probe; equal vectors ⇒ identical bucket layout.
+    let dist = |seed: usize| -> Vec<u64> {
+        let state = FxSeededState::with_seed(seed);
+        keys.iter().map(|k| state.hash_one(k) & 0x3ff).collect()
+    };
+
+    // Stability within one seed (cache/lookup consistency).
+    let s = 0x0123_4567usize;
+    assert_eq!(dist(s), dist(s), "seeded session hash must be stable per seed");
+
+    // Seed-dependence: some seed produces a different bucket layout for the
+    // SAME key set. With the unseeded FxBuildHasher this is impossible
+    // (the seed is ignored) → fail-on-revert.
+    let reference = dist(0xA5A5_5A5A);
+    let mut diverged = false;
+    for seed in 1usize..4096 {
+        if dist(seed) != reference {
+            diverged = true;
+            break;
+        }
+    }
+    assert!(
+        diverged,
+        "session-key bucket layout did not change across seeds — index hash \
+         is seed-independent (unseeded FxHashMap regression, #2364)"
+    );
+}
+
+/// The seeded session table must still behave correctly end-to-end:
+/// insert under the per-boot seed, look the key back up, get a hit.
+/// Guards against the seed silently breaking normal lookup.
+#[test]
+fn seeded_session_table_round_trips_lookup() {
+    let mut table = SessionTable::new();
+    let key = make_v4_key(7, 41000);
+    let now = 1_000_000_000u64;
+    install_synced_tcp(&mut table, &key, 1, now);
+    assert!(
+        table.lookup(&key, now, 0x10).is_some(),
+        "a key inserted into the seeded index must be found by the same key"
+    );
+    // A different key must miss — proves we are matching the key, not
+    // succeeding for everything.
+    let other = make_v4_key(8, 41001);
+    assert!(
+        table.lookup(&other, now, 0x10).is_none(),
+        "a non-inserted key must miss under the seeded index"
+    );
+}

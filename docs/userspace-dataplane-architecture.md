@@ -395,7 +395,35 @@ Each binding manages four rings:
 
 #### Session Table (`session.rs`)
 
-Per-worker hash table using `FxHashMap` (fast non-cryptographic hash).
+Per-worker hash table using a SEEDED `FxHasher` (`FxSeededState`, fast
+non-cryptographic hash keyed by a per-boot secret).
+
+> **Hot-path hash hardening (#2364).** The node-local hot-path hashes
+> that key on attacker-controllable values — the session indices
+> (`SessionKey`-keyed `key_to_handle` / `nat_reverse_index` /
+> `forward_wire_index` / `reverse_translated_index`, plus the per-IP
+> `session_limit_{src,dst}_counts`), the flow-cache set index
+> (`FlowCache::set_index`), and the fabric queue hash
+> (`worker::fabric_queue_hash`) — fold in a per-process secret seed
+> (`crate::hot_hash_seed::hot_path_hash_seed`, drawn once at first use via
+> the same `getrandom(2)` + CLOCK_MONOTONIC/pid/stack fallback +
+> never-zero path that backs the CoS SFQ seed). The seed is:
+> per-boot random (defeats offline collision construction — an off-box
+> sender can no longer precompute keys that thrash one flow-cache set,
+> chain a session-map bucket, or pin attack flows onto one fabric worker),
+> stable for the process lifetime (so a flow's set/bucket/fabric-queue is
+> consistent across its life — caches/maps and fragment ordering keep
+> working), and NODE-LOCAL ONLY. The seed is never part of any wire
+> protocol or HA-synced structure: HA session sync transmits the explicit
+> `SessionKey`, never a hash value, so peers re-bucket under their own
+> seed; the fabric queue hash selects among THIS node's local fabric
+> egress bindings, so the peer does not need to agree. Hashes that
+> require cross-node or cross-restart determinism are therefore deliberately
+> **excluded** from seeding (none of the seeded sites have that
+> requirement). `owner_rg_sessions` (keyed by `i32` RG/ifindex with inner
+> sets of internally allocated `u32` handles) stays on the unseeded
+> `FxHasher` — neither key class is an off-box attacker surface. Cost is
+> one extra seed word per hasher; no per-packet allocation.
 
 ```
 SessionKey {

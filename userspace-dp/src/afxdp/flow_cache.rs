@@ -639,13 +639,43 @@ impl FlowCache {
     }
 
     /// Set index = low bits of the FxHasher-produced flow hash.
-    /// Same hash function as the prior 1-way layout to preserve
-    /// behavior for non-collision keys.
+    ///
+    /// #2364: the hasher is now SEEDED with the per-boot, per-process
+    /// secret (`crate::hot_hash_seed::hot_path_hash_seed`) instead of
+    /// `FxHasher::default()`. The set index is keyed by the
+    /// attacker-controllable 5-tuple + ingress ifindex; with the unseeded
+    /// default an off-box sender could precompute keys whose low
+    /// `FLOW_CACHE_SET_MASK` bits all collide in one 4-way set, forcing
+    /// steady eviction churn (algorithmic-complexity DoS). Folding the
+    /// per-boot seed in (FxHasher writes the seed first, so the cost is a
+    /// single extra word write — no per-packet allocation) makes the
+    /// mapping unknowable offline and reshuffled on every restart. The
+    /// seed is WORKER/PROCESS-LOCAL: the flow cache is never synced and is
+    /// not part of any wire protocol, so a per-node seed is correct (HA
+    /// peers re-derive their own sets from the explicit SessionKey). The
+    /// seed is stable for the process lifetime, so a given flow maps to a
+    /// stable set across its whole lifetime — cache consistency is
+    /// preserved. The `& FLOW_CACHE_SET_MASK` masking and 4-way layout are
+    /// unchanged.
     #[inline]
     pub(super) fn set_index(key: &crate::session::SessionKey, ingress_ifindex: i32) -> usize {
+        Self::set_index_seeded(crate::hot_hash_seed::hot_path_hash_seed(), key, ingress_ifindex)
+    }
+
+    /// Seed-parameterized core of `set_index`. Split out so adversarial
+    /// tests can pin the seed and assert (a) intra-seed stability and
+    /// (b) cross-seed reshuffling of the set distribution. Production
+    /// always calls through `set_index`, which supplies the per-boot
+    /// process seed.
+    #[inline]
+    pub(super) fn set_index_seeded(
+        seed: u64,
+        key: &crate::session::SessionKey,
+        ingress_ifindex: i32,
+    ) -> usize {
         use std::hash::{Hash, Hasher};
 
-        let mut hasher = rustc_hash::FxHasher::default();
+        let mut hasher = rustc_hash::FxHasher::with_seed(seed as usize);
         key.hash(&mut hasher);
         (ingress_ifindex as u32).hash(&mut hasher);
         hasher.finish() as usize & FLOW_CACHE_SET_MASK

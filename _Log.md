@@ -1,3 +1,44 @@
+## 2026-06-25 — #2364: seed node-local hot-path hashes (algorithmic-complexity hardening)
+
+- **Timestamp**: 2026-06-25
+- **Action**: Introduced a per-boot, per-process secret seed for the
+  node-local hot-path hashes that key on attacker-controllable values,
+  closing the unkeyed-FxHash algorithmic-complexity hole. New module
+  `userspace-dp/src/hot_hash_seed.rs` exposes
+  `hot_path_hash_seed()` (OnceLock, drawn once via `os_random_seed_u64`)
+  and hoists the OS-entropy draw (getrandom + CLOCK_MONOTONIC/pid/stack
+  fallback + never-zero invariant) out of `cos::flow_hash` so the CoS SFQ
+  seed and the hot-path seed share ONE audited entropy path. Seeded sites:
+  (1) `FlowCache::set_index` → `set_index_seeded(seed, ...)` using
+  `FxHasher::with_seed`; (2) `worker::fabric_queue_hash` →
+  `fabric_queue_hash_seeded(seed, ...)` folding the seed into the initial
+  mixer state; (3) session indices in `session/mod.rs` — the SessionKey
+  maps and per-IP session-limit maps now use `FxSeededState`. EXCLUDED:
+  `owner_rg_sessions` (i32 RG/ifindex key + u32-handle inner sets — not an
+  off-box surface). No site requires cross-node/cross-restart determinism,
+  so per-node seeding is safe (HA syncs explicit keys, not hash values;
+  fabric hash picks among this node's local bindings). Fail-on-revert
+  tests added: flow-cache set distribution is seed-dependent yet stable
+  per seed and a precomputed single-set flood reshuffles across seeds;
+  fabric hash likewise; session-key bucket layout is seed-dependent; plus
+  a seeded round-trip lookup. Gates: `cargo build --release` clean (no new
+  warnings in touched files); `cargo test --release --bin xpf-userspace-dp`
+  green (2777 passed; the lone failure is the pre-existing
+  `concurrent_recovery_processes_each_command_exactly_once` parallelism
+  flake — passes in isolation, untouched by this change).
+- **File(s)**: userspace-dp/src/hot_hash_seed.rs (new),
+  userspace-dp/src/hot_hash_seed_tests.rs (new),
+  userspace-dp/src/main.rs,
+  userspace-dp/src/afxdp/cos/flow_hash.rs,
+  userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/flow_cache_tests.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/tests.rs,
+  docs/userspace-dataplane-architecture.md
+
 ## 2026-06-24 — #2719 fix: stale pkg/daemon event-stream test fixture (post-#2467 wire widen)
 
 - **Timestamp**: 2026-06-24

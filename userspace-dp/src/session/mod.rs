@@ -1,9 +1,26 @@
 use crate::afxdp::{ForwardingDisposition, ForwardingResolution};
 use crate::nat::NatDecision;
 use crate::nat64::Nat64ReverseInfo;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxSeededState};
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::IpAddr;
+
+/// #2364: session-index maps keyed by attacker-controllable values (the
+/// externally-chosen 5-tuple `SessionKey`, per-IP `IpAddr`) use a SEEDED
+/// FxHasher instead of the unkeyed `FxBuildHasher`. With the default
+/// unseeded hasher an off-box sender can construct keys whose buckets
+/// collide, building collision chains that amplify lookup/insert/remove
+/// CPU — and for the maps placed behind `Arc<Mutex<..>>` in
+/// `coordinator/session_manager.rs`, lock-hold time as well. The seed is
+/// the per-boot, per-process secret (`crate::hot_hash_seed`): node-local
+/// (HA sync transmits explicit keys, never hash values, so peers re-bucket
+/// under their own seed), stable for the process lifetime (so a key's
+/// bucket is consistent across the session's life), and reshuffled per
+/// restart. Cost is one extra `usize` in the BuildHasher state and a seed
+/// write per hasher — no per-packet allocation.
+type SeededKeyMap<V> = HashMap<SessionKey, V, FxSeededState>;
+type SeededIpMap<V> = HashMap<IpAddr, V, FxSeededState>;
 
 // #1047 P2: SessionKey and the key-transform helpers (forward_wire_key,
 // translated_session_key, reverse_canonical_key, reverse_wire_key,
@@ -294,11 +311,11 @@ pub(crate) struct SessionTable {
     entries: slab::Slab<SessionRecord>,
     /// #964 Step 1: forward-key → handle. Replaces the
     /// `sessions` HashMap's key-to-entry mapping.
-    key_to_handle: FxHashMap<SessionKey, u32>,
+    key_to_handle: SeededKeyMap<u32>,
     /// #964 Step 1: secondary indices map to u32 handles, not full keys.
-    nat_reverse_index: FxHashMap<SessionKey, u32>,
-    forward_wire_index: FxHashMap<SessionKey, u32>,
-    reverse_translated_index: FxHashMap<SessionKey, u32>,
+    nat_reverse_index: SeededKeyMap<u32>,
+    forward_wire_index: SeededKeyMap<u32>,
+    reverse_translated_index: SeededKeyMap<u32>,
     /// #964 Step 1: owner-RG sets keyed by handle (was Key).
     owner_rg_sessions: FxHashMap<i32, FxHashSet<u32>>,
     deltas: VecDeque<SessionDelta>,
@@ -382,13 +399,21 @@ pub(crate) struct SessionTable {
     /// the map is bounded by distinct IPs with >=1 live local session
     /// (#2128 — no phantom-zero entries). Read non-mutating at the
     /// new-flow check.
-    session_limit_src_counts: FxHashMap<IpAddr, u32>,
+    session_limit_src_counts: SeededIpMap<u32>,
     /// #2134: per-destination-IP mirror of `session_limit_src_counts`.
-    session_limit_dst_counts: FxHashMap<IpAddr, u32>,
+    session_limit_dst_counts: SeededIpMap<u32>,
 }
 
 impl SessionTable {
     pub fn new() -> Self {
+        // #2364: the per-boot, per-process secret seed for the
+        // attacker-keyed session indices. Drawn once (process-global
+        // OnceLock), so every worker's SessionTable on this node shares
+        // the same seed — fine, the seed only needs to be unknowable
+        // off-box and stable within the boot, not unique per table. A
+        // `usize` truncation of the 64-bit seed is the FxSeededState width.
+        let seed = crate::hot_hash_seed::hot_path_hash_seed() as usize;
+        let state = FxSeededState::with_seed(seed);
         Self {
             // Start with an empty slab and let it grow on demand.
             // `Slab::with_capacity(DEFAULT_MAX_SESSIONS)` would eagerly
@@ -396,10 +421,18 @@ impl SessionTable {
             // review finding) — the prior FxHashMap grew on demand,
             // so match that to keep baseline RSS unchanged.
             entries: slab::Slab::new(),
-            key_to_handle: FxHashMap::default(),
-            nat_reverse_index: FxHashMap::default(),
-            forward_wire_index: FxHashMap::default(),
-            reverse_translated_index: FxHashMap::default(),
+            // #2364: SessionKey-keyed indices use the per-boot secret seed
+            // so attacker-chosen 5-tuples cannot construct collision chains.
+            // `state` is the shared `FxSeededState` (carries the seed; a
+            // `Clone` per map is just a `usize` copy).
+            key_to_handle: HashMap::with_hasher(state.clone()),
+            nat_reverse_index: HashMap::with_hasher(state.clone()),
+            forward_wire_index: HashMap::with_hasher(state.clone()),
+            reverse_translated_index: HashMap::with_hasher(state.clone()),
+            // owner_rg_sessions is keyed by i32 RG/ifindex (not an
+            // attacker-chosen 5-tuple) with inner sets of internally
+            // allocated u32 handles — neither is the hash-flood surface, so
+            // it stays on the default FxHasher (#2364 scope note).
             owner_rg_sessions: FxHashMap::default(),
             deltas: VecDeque::with_capacity(MAX_SESSION_DELTAS.min(256)),
             last_gc_ns: 0,
@@ -417,8 +450,10 @@ impl SessionTable {
             wheel: SessionWheel::new(),
             last_pop_stats: WheelPopStats::default(),
             session_limit_active: false,
-            session_limit_src_counts: FxHashMap::default(),
-            session_limit_dst_counts: FxHashMap::default(),
+            // #2364: per-IP session-limit counters are keyed by the
+            // attacker-chosen source/destination IP — seed them too.
+            session_limit_src_counts: HashMap::with_hasher(state.clone()),
+            session_limit_dst_counts: HashMap::with_hasher(state),
         }
     }
 

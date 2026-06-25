@@ -22,83 +22,15 @@ fn mix_cos_flow_bucket(seed: &mut u64, value: u64) {
 
 /// Draw a fresh per-queue hash salt from the kernel.
 ///
-/// `getrandom(2)` with `flags=0` blocks only during early boot before the
-/// urandom pool is initialized, which is not a path this daemon runs on
-/// (xpfd starts well after systemd-random-seed). Retries on `EINTR` and
-/// partial reads (the kernel is allowed to return fewer bytes than
-/// requested; 8 bytes is well below any documented per-call limit so a
-/// partial is pathological, but still explicitly handled rather than
-/// silently degrading). If the syscall ever fails for a real reason we
-/// fall through to a CLOCK_MONOTONIC + pid + stack-address-mixed
-/// fallback so the daemon does not abort on queue construction. The
-/// fallback is strictly weaker than `getrandom` — predictable enough
-/// that it must not be the production path — but strictly stronger
-/// than the zero-seed it replaces, and stays per-call-distinct because
-/// each call mixes in a live clock read and the stack address of the
-/// return buffer.
+/// #2364: the OS-entropy draw (`getrandom(2)` with a CLOCK_MONOTONIC +
+/// pid + stack-address fallback and a never-zero invariant) was hoisted
+/// into `crate::hot_hash_seed::os_random_seed_u64` so the CoS SFQ seed
+/// and the node-local hot-path hash seed share ONE audited entropy path
+/// instead of two byte-identical copies. The never-zero contract that
+/// `cos_flow_hash_seed_from_os_never_returns_zero` (and the downstream
+/// `assert_ne!(flow_hash_seed, 0)`) depend on is enforced there.
 pub(in crate::afxdp) fn cos_flow_hash_seed_from_os() -> u64 {
-    let mut buf = [0u8; 8];
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        // SAFETY: `buf[filled..]` is a valid mutable slice of length
-        // `buf.len() - filled` for the duration of the call.
-        let rc = unsafe {
-            libc::getrandom(
-                buf.as_mut_ptr().add(filled).cast::<libc::c_void>(),
-                buf.len() - filled,
-                0,
-            )
-        };
-        if rc > 0 {
-            filled += rc as usize;
-            continue;
-        }
-        if rc < 0 {
-            let err = std::io::Error::last_os_error().raw_os_error();
-            if err == Some(libc::EINTR) {
-                continue;
-            }
-        }
-        // rc == 0 (should not happen for getrandom) or a real error: bail
-        // to the fallback rather than spinning.
-        break;
-    }
-    // Production invariant (#785 Copilot review): never return 0.
-    // Zero is a valid getrandom output (probability 2^-64 per call,
-    // but across a fleet of daemons × per-binding promotions it DOES
-    // occur), and a zero seed turns the SFQ hash mapping into a pure
-    // function of the 5-tuple — externally probeable, and identical
-    // across all bindings on all nodes, which collapses SFQ bucket
-    // diversity to zero. The `assert_ne!(flow_hash_seed, 0)` test
-    // downstream depends on this invariant and would otherwise be
-    // theoretically flaky. One in 2^64 getrandom reads gets OR'd
-    // with 1 — indistinguishable from the raw entropy for any
-    // downstream use.
-    let nonzero = |v: u64| if v == 0 { 1 } else { v };
-    if filled == buf.len() {
-        return nonzero(u64::from_ne_bytes(buf));
-    }
-
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `ts` is a valid out-pointer for `clock_gettime`.
-    let now = unsafe {
-        if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) == 0 {
-            (ts.tv_sec as u64)
-                .wrapping_mul(1_000_000_000)
-                .wrapping_add(ts.tv_nsec as u64)
-        } else {
-            0
-        }
-    };
-    let pid = std::process::id() as u64;
-    let stack_addr = (&buf as *const [u8; 8]) as usize as u64;
-    let mut fallback = now ^ pid.wrapping_mul(0x9e3779b97f4a7c15);
-    mix_cos_flow_bucket(&mut fallback, now.rotate_left(17));
-    mix_cos_flow_bucket(&mut fallback, stack_addr.rotate_left(31));
-    nonzero(fallback)
+    crate::hot_hash_seed::os_random_seed_u64()
 }
 
 // #711: returns `u16` (was `u8`). With `COS_FLOW_FAIR_BUCKETS = 4096`

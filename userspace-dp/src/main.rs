@@ -8,6 +8,7 @@ mod event_stream;
 #[cfg(test)]
 mod fairness;
 mod filter;
+mod hot_hash_seed;
 mod io_uring_write;
 mod ip_proto;
 mod nat;
