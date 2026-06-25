@@ -7,7 +7,24 @@ import (
 	"runtime"
 
 	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 )
+
+// IsKeyNotFound reports whether err is a map "key does not exist" error
+// from a session/DNAT/companion delete or lookup. It keeps the
+// github.com/cilium/ebpf sentinel behind the dataplane boundary so
+// operator packages (pkg/cli, pkg/grpcapi) can classify a delete result
+// without importing the BPF-artifact package directly (the
+// retirement-boundary canary forbids that import). It treats both
+// ebpf.ErrKeyNotExist and unix.ENOENT as not-found.
+//
+// Used by the session-clear paths (#2468): a NAT'd session's reverse
+// companion is keyed on the TRANSLATED tuple, so the naive-swap reverse
+// key and the DNAT companion key are frequently absent on an otherwise
+// successful clear — a benign idempotent not-found, not a failure.
+func IsKeyNotFound(err error) bool {
+	return errors.Is(err, ebpf.ErrKeyNotExist) || errors.Is(err, unix.ENOENT)
+}
 
 // Conntrack session-table map accessors.
 // Same-package split of maps.go (#1686): iterate/batch/get/set/delete for the

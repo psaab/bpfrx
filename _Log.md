@@ -1,3 +1,23 @@
+## 2026-06-25 — #2519: allowlist writeProxyResponderSysctl in fsatomic canary
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed RED-on-master `TestNoDirectOsWriteFile` (the #1916
+  receiver-aware direct-`os.WriteFile` canary). It flagged
+  `pkg/dataplane/proxyarp.go:95` `writeProxyResponderSysctl`, which writes
+  `[]byte("1")` to the procfs `net.ipv4.conf.<if>.proxy_arp` /
+  `net.ipv6.conf.<if>.proxy_ndp` knob. procfs has no rename(2), so the
+  fsatomic atomic-rename writers are impossible by construction — this is a
+  legitimate BestEffortKernelKnob write, exactly like the already-allowlisted
+  slow-path procfs/sysfs entries. Added the narrow receiver-aware allowlist
+  entry `"dataplane::writeProxyResponderSysctl": "procfs proxy_arp /
+  proxy_ndp knob"` mirroring the existing `dataplane::ensureVLANSubInterface`
+  shape. The entry is keyed to this one function only — the canary still
+  catches any genuine non-allowlisted direct `os.WriteFile`.
+- **File(s)**: pkg/fsatomic/canary_test.go, _Log.md
+- **Validation**: confirmed RED on master (proxyarp.go:95 violation) → GREEN
+  with the entry; `go build ./...` clean; `go test ./pkg/fsatomic/...` and
+  `go test ./pkg/dataplane/...` green; gofmt clean; `go vet` clean.
+
 ## 2026-06-25 — #2364: seed node-local hot-path hashes (algorithmic-complexity hardening)
 
 - **Timestamp**: 2026-06-25
@@ -14718,3 +14738,123 @@ top.
   userspace-dp/src/afxdp/test_fixtures.rs, userspace-dp/src/afxdp/tests.rs,
   userspace-dp/src/afxdp/frame/wg.rs,
   userspace-dp/tests/fixtures/protocol_wire_v1.json, _Log.md
+- **Timestamp**: 2026-06-25
+  **Action**: #2514 — address-book content-ID collision now returns a typed
+  error instead of panicking the daemon. Replaced the `probe > 256`
+  `panic(...)` in `buildAddressBookTableWithFeeds` with a returned
+  `*AddressBookIDCollisionError`. The linear-probe bound now scales with the
+  bucket count (`addressBookProbeLimit`, default `len(buckets)+8`) so a
+  forward probe is pigeonhole-guaranteed to find a free u32 slot for any
+  realistic config — the error is the genuine fail-safe, never a routine
+  path. Threaded the error up through `buildPolicySnapshots*` and the
+  `buildSnapshot*` chain: `ApplyConfig` (manager.go) now fails closed and
+  rejects the config (prior dataplane state retained); the scheduler-only
+  republish (`UpdatePolicyScheduleState`) logs and keeps the last snapshot;
+  the best-effort `UserspaceBoundLinuxInterfaces` degrades to nil. Added two
+  package-var seams (`addressBookContentHash64`, `addressBookProbeLimit`) so a
+  fail-on-revert test can force the exhaustion branch. New tests assert
+  error-not-panic (recover-guarded), snapshot-build propagation, and benign
+  64-book happy path. Gates: gofmt clean; go build ./... clean; go vet +
+  go test ./pkg/dataplane/userspace/... ./pkg/config/... ./pkg/daemon/...
+  green. Fail-on-revert verified (restoring the panic fails the test).
+  **File(s)**: pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/builder.go, pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/address_book_collision_2514_test.go,
+  + mechanical 3rd-return-value updates across userspace *_test.go, _Log.md
+  **Action**: #2726 — surface Surface A DDNS SkippedNoBackend on all three
+  operator surfaces (Prometheus / CLI / gRPC) + correct stale
+  tunnel_tcp_mss docstring (post-#2715). (a) Mirrored the lease-path
+  no-backend surfacing: added the
+  xpf_ddns_surface_a_skipped_total{reason="no-backend"} series in
+  collectSurfaceADDNSMetrics (descriptor already had the reason label,
+  closed-cardinality — only the comment's reason set updated); added
+  no-backend to the CLI + gRPC "Skipped:" formatted lines. No proto
+  change (both render formatted strings). New fail-on-revert test drives
+  collectSurfaceADDNSMetrics directly and asserts the no-backend series.
+  (b) Doc-only: rewrote the tunnel_tcp_mss docstring to describe the
+  ACTUAL behavior — the WG MSS clamp uses tunnel_outer_mtu
+  (tx_ifindex→egress→logical, 1500 floor), NOT the #2715 route-resolved
+  encap-guard path — and note it is safe (route-resolved WG endpoints
+  NoRoute on this AF_XDP builder; clamp errs smaller, can't reintroduce
+  encap_mtu_drops).
+  Gates: gofmt clean; go build ./... clean; go test ./pkg/api/...
+  ./pkg/cli/... ./pkg/grpcapi/... ./pkg/ddns/... green; cargo build
+  --release clean (doc-only).
+  **File(s)**: pkg/api/metrics_system.go,
+  pkg/api/metrics_surface_a_ddns_test.go, pkg/cli/cli_show_services.go,
+  pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
+  userspace-dp/src/afxdp/forwarding/mod.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2468 — session-clear honestly surfaces sub-operation
+  failures instead of reporting bare success. CLI `clear security flow
+  session ...` now aggregates iterator / forward+reverse delete / DNAT
+  companion delete / HA peer-clear errors and prints a `WARNING: N clear
+  operation(s) failed: <summary>` tail (happy path unchanged). gRPC
+  `ClearSessions` aggregates the same and returns the new
+  `ClearSessionsResponse.failures` + `failure_summary` fields (proto
+  field 3/4, regenerated) — partial-success semantics, accurate cleared
+  counts preserved; bulk clear-all stays a hard RPC error (atomic). CLI
+  `clearPeerSessions`/gRPC `clearPeerSessions` now return errors and the
+  CLI propagates the peer's `failures` tally. Fail-on-revert tests in
+  both packages (silence report()/apply() -> RED). gofmt/vet clean
+  (pre-existing cli.go:460 unreachable-code vet diag untouched).
+  **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/cli/cli_clear.go, pkg/cli/cli_clear_errors_test.go,
+  pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/clear_sessions_errors_test.go, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2468 review fix (finding 6, over-reporting) — the
+  reverse-session and DNAT-companion deletes compute a NAIVE src/dst
+  swap of the forward key, but a NAT'd session's real reverse companion
+  is keyed on the TRANSLATED tuple (val.ReverseKey). The naive-swap key
+  is absent for NAT'd sessions, so DeleteSession/DeleteDNATEntry return
+  ebpf.ErrKeyNotExist on an otherwise-successful clear; the new
+  aggregation was counting that as a failure (spurious WARNING /
+  Failures>0). Fix: reverse + DNAT-companion deletes now use
+  addExceptNotFound, which treats a key-not-found as benign (idempotent)
+  via the new exported dataplane.IsKeyNotFound predicate. The forward
+  delete keeps aggregating ALL errors (a forward key came from
+  iteration, so not-found is a real anomaly). Iterator + peer-clear
+  aggregation unchanged. IsKeyNotFound keeps the cilium/ebpf sentinel
+  behind the dataplane boundary — pkg/cli and pkg/grpcapi must NOT
+  import github.com/cilium/ebpf (retirement-boundary canary). Tests:
+  added NAT-not-found-benign cases (Failures==0, no WARNING) AND a
+  non-not-found reverse-delete error case (still aggregated — guards
+  against under-reporting); renamed the reverse-failure test to
+  forward-delete. Fail-on-revert: breaking the not-found suppression
+  turns the NAT cases RED while the real-error case stays green.
+  **File(s)**: pkg/dataplane/maps_session.go, pkg/cli/cli_clear.go,
+  pkg/cli/cli_clear_errors_test.go, pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/clear_sessions_errors_test.go, _Log.md
+  **Action**: #2453 — move the RA sender NDP bind retry OUT of the manager
+  mutex critical section. `Manager.startLocked` (under `m.mu`) called
+  `sender.start()`, which opened the NDP conn synchronously: `ensureLinkLocal`
+  + `listen()`'s 10×200ms (~2s) bind retry while a settling/RETH link-local
+  appears. The whole retry ran under `m.mu`, so any concurrent RA manager op —
+  a VRRP-failover `Withdraw` or an `Apply` on a DIFFERENT interface — stalled up
+  to ~2s on `m.mu.Lock()`. Fix (approach b): `start()` now just launches the
+  owner goroutine and returns; the socket open moved to `openConn()`, run in the
+  owner goroutine BEFORE its main loop, with no lock held. The bind retry sleep
+  is now interruptible by `stopCh` (a mid-retry withdraw aborts promptly).
+  `startLocked`'s `m.mu` hold is reduced to the `InterfaceByName` check + the
+  `m.senders` bookkeeping. Race-safety: `s.conn` remains owner-only;
+  `finishShutdown` tolerates a nil conn (open failed or stop landed mid-retry) →
+  no goodbye, `goodbyeEmitted` stays false → the manager's release-time
+  standalone-goodbye backstop still fires for an owed graceful withdraw; `start()`
+  no longer returns a listen error (open is async — every `Apply` call site only
+  `slog.Warn`s it anyway); `srcAddr` is now owner-written / `Status`-read so it
+  got its own `srcMu` guard (`getSrcAddr`/`setSrcAddr`). Tests (race-on):
+  `TestT2453_SlowBindDoesNotStallOtherManagerOps` (fail-on-revert — a gated bind
+  on "lo" must not stall `WithdrawInterfaces` on another interface + `Status`;
+  verified RED when `start()` is reverted to synchronous open under `m.mu`),
+  `TestT2453_NormalStartStillBindsAndSends` (no-regression bind+burst),
+  `TestT2453_WithdrawDuringSlowBindEmitsGoodbye` (conn==nil safety + standalone
+  goodbye backstop). Gates: gofmt clean; go build ./... clean; go vet
+  ./pkg/ra/... clean; go test -race ./pkg/ra/... green; go test
+  ./pkg/daemon/... ./pkg/cluster/... green. HA-adjacent (RA Withdraw on VRRP
+  failover) → parent may run make test-failover for no-regression.
+  **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/serialize_test.go,
+  pkg/ra/README.md, _Log.md

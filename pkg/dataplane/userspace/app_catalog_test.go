@@ -23,7 +23,7 @@ func appCatalogTestConfig() *config.Config {
 
 func TestBuildSnapshotShipsAppCatalog_M5(t *testing.T) {
 	cfg := appCatalogTestConfig()
-	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 	if len(snap.AppCatalog) == 0 {
 		t.Fatal("snapshot AppCatalog is empty; catalog never ships to Rust (#2008 M5)")
 	}
@@ -44,7 +44,7 @@ func TestBuildSnapshotShipsAppCatalog_M5(t *testing.T) {
 
 func TestAppCatalogSnapshotJSONRoundTrip_M5(t *testing.T) {
 	cfg := appCatalogTestConfig()
-	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 
 	data, err := json.Marshal(snap)
 	if err != nil {
@@ -80,7 +80,7 @@ func TestAppCatalogSnapshotJSONRoundTrip_M5(t *testing.T) {
 // and a new Rust helper sees an empty catalog (every session keeps app_id 0).
 func TestAppCatalogOmittedWhenEmpty_M5(t *testing.T) {
 	cfg := &config.Config{} // no applications referenced, AppID off
-	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 	if len(snap.AppCatalog) != 0 {
 		t.Fatalf("expected empty AppCatalog for bare config, got %+v", snap.AppCatalog)
 	}

@@ -133,7 +133,7 @@ func TestSnapshotWireNoNullCollections2214(t *testing.T) {
 	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
 		"EMPTY": {Name: "EMPTY"},
 	}
-	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 
 	if len(snap.NAT64) != 1 {
 		t.Fatalf("snap.NAT64 = %d, want 1", len(snap.NAT64))

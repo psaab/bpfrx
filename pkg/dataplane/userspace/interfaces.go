@@ -91,8 +91,13 @@ func UserspaceBoundLinuxInterfaces(cfg *config.Config) []string {
 	// allowlist is by Linux name (what `ethtool` consumes), so ifindex
 	// lookups are unnecessary here. We reuse the shared filter via the
 	// real builder to stay in lock-step with binding logic.
-	snap := buildSnapshot(cfg, ucfg, 0, 0)
-	if snap == nil {
+	// #2514: buildSnapshot can return an error (e.g. an unresolvable
+	// address-book content-ID collision). This is a best-effort allowlist
+	// derivation, so on error we degrade to nil rather than propagating —
+	// the real apply path (ApplyConfig) surfaces the same error to the
+	// operator and rejects the commit.
+	snap, err := buildSnapshot(cfg, ucfg, 0, 0)
+	if err != nil || snap == nil {
 		return nil
 	}
 	seen := make(map[string]struct{})

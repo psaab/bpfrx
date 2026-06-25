@@ -47,7 +47,7 @@ func TestNestedApplicationSetPolicyMatch(t *testing.T) {
 		t.Fatalf("CompileConfig: %v", err)
 	}
 
-	snaps := buildPolicySnapshots(cfg)
+	snaps, _ := buildPolicySnapshots(cfg)
 	if len(snaps) != 1 {
 		t.Fatalf("expected 1 policy rule snapshot, got %d", len(snaps))
 	}
