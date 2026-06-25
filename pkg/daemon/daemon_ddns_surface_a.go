@@ -272,7 +272,10 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 			// DDNS updates — not the kernel default route. A malformed source-
 			// address yields the unbound default client (the commit warning already
 			// fired); the probe is a transient observation, never a withdraw.
-			client, berr := ddns.NewCheckIPClient(scope.Provider)
+			// Reuse the manager's cached per-binding HTTP client (#2904) so the
+			// recurring checkip probe shares the keep-alive connection pool with the
+			// DNS-update path instead of rebuilding a transport every reconcile pass.
+			client, berr := d.surfaceA.CheckIPClient(scope.Provider)
 			if berr != nil {
 				slog.Warn("ddns surface-a: checkip source bind unusable; probing from default route",
 					"provider", scope.Provider.Name, "err", berr)
