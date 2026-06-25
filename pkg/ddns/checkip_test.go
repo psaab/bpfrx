@@ -83,3 +83,54 @@ func TestParseAllowlist(t *testing.T) {
 		t.Fatalf("expected 3 parsed addresses, got %d (%v)", len(got), got)
 	}
 }
+
+// TestValidateCheckIPURL is the #2773 validator gate: http(s) scheme + a host.
+// validateCheckIPURL was dead code (no callers) before #2773 wired it into
+// CheckIP and (mirrored) into the commit-time warning.
+func TestValidateCheckIPURL(t *testing.T) {
+	for _, ok := range []string{
+		"http://checkip.example/",
+		"https://checkip.example:8443/cdn-cgi/trace",
+		"https://192.0.2.1/",
+	} {
+		if err := validateCheckIPURL(ok); err != nil {
+			t.Fatalf("validateCheckIPURL(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"",                // empty
+		"ftp://host/",     // non-http scheme
+		"not a url",       // no scheme
+		"http://",         // scheme but no host
+		"https:///path",   // empty host
+		"javascript:0",    // non-http scheme
+		"checkip.example", // bare host, no scheme
+	} {
+		if err := validateCheckIPURL(bad); err == nil {
+			t.Fatalf("validateCheckIPURL(%q) = nil, want error", bad)
+		}
+	}
+}
+
+// TestCheckIPRejectsMalformedURL is the #2773 runtime fail-on-revert gate: a
+// malformed checkip-url must be rejected by CheckIP itself (fail closed), not
+// fall through to a fetch and masquerade as a transient failure. Before the
+// wiring, http.NewRequest accepted these strings and CheckIP returned ok=false
+// only because the *fetch* failed — indistinguishable from a real transient.
+// This goes RED if the validateCheckIPURL gate is removed from CheckIP: the
+// requests would then reach the transport, which fails the test on contact.
+func TestCheckIPRejectsMalformedURL(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("CheckIP attempted a request for a malformed URL: %s", r.URL)
+		return nil, nil
+	})}
+	for _, bad := range []string{"ftp://checkip.example/", "http://", "not a url"} {
+		if _, ok := CheckIP(context.Background(), client, bad, true, nil); ok {
+			t.Fatalf("CheckIP(%q) ok=true, want false (malformed URL must fail closed)", bad)
+		}
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

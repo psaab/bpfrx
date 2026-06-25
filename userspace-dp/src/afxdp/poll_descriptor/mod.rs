@@ -2312,6 +2312,20 @@ pub(super) fn poll_binding_process_descriptor(
                     ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
                 ) {
                     telemetry.dbg.forward += 1;
+                    // #2501: account this slow-path forwarded packet against
+                    // its session. The flow-cache fast path accounts every
+                    // packet of an established flow; this chokepoint covers
+                    // the packets that reach the full forward-build — the
+                    // first packet(s) of a flow before the cache warms, and
+                    // any non-cacheable flow (NAT64/NPTv6). `account_packet`
+                    // derives the direction from the resolved entry and folds
+                    // it onto the canonical forward entry; a packet whose
+                    // session does not yet exist (the very first SYN, accounted
+                    // on its install pass via the cache or this site once the
+                    // session lands) is a no-op miss.
+                    if let Some(flow) = flow.as_ref() {
+                        sessions.account_packet(&flow.forward_key, meta.pkt_len as u64);
+                    }
                     // Direction-specific tracking
                     let ingress_if = meta.ingress_ifindex as i32;
                     let egress_if = decision.resolution.egress_ifindex;

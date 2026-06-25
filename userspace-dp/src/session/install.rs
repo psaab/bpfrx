@@ -162,6 +162,8 @@ impl SessionTable {
                 // intact under the old-map/new-epoch read skew.
                 seen_rg_epoch: 0,
                 first_held_ns: 0,
+                // #2501: a fresh entry has forwarded no packets yet.
+                counters: SessionCounters::default(),
             },
         };
         let raw = self.entries.insert(record);
@@ -194,6 +196,10 @@ impl SessionTable {
                 // with the entry avoids a 0/unknown asymmetry.
                 created_ns: now_ns,
                 last_seen_ns: now_ns,
+                // #2501: a freshly-installed session has forwarded no
+                // packets yet (the trigger packet is accounted on its own
+                // forwarding pass).
+                counters: SessionCounters::default(),
             });
         }
         true
@@ -280,6 +286,8 @@ impl SessionTable {
                 // contract clears `first_held_ns` on.
                 seen_rg_epoch: 0,
                 first_held_ns: 0,
+                // #2501: a fresh entry has forwarded no packets yet.
+                counters: SessionCounters::default(),
             },
         };
         let raw = self.entries.insert(record);
@@ -314,6 +322,8 @@ impl SessionTable {
             // SESSION_CREATE frame reports no duration, so 0/unknown is fine.
             created_ns: 0,
             last_seen_ns: 0,
+            // #2501: an open carries no volume yet.
+            counters: SessionCounters::default(),
         });
     }
 
@@ -341,6 +351,11 @@ impl SessionTable {
             fabric_redirect_sync: false,
             created_ns: 0,
             last_seen_ns: 0,
+            // #2501: the entry was already removed by the explicit-close
+            // caller, so its counters are no longer in hand — emit 0 (the
+            // same fallback as the timestamps above). The dominant close
+            // path (idle/age expiry) harvests the real counters.
+            counters: SessionCounters::default(),
         });
     }
 
