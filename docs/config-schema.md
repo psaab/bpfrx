@@ -149,17 +149,25 @@ turns each value into its own route-map sequence (OR semantics; FRR replaces
 a same-type `match` rule in one index, so multiple match lines cannot OR) —
 see `pkg/frr/README.md` (`policy_render.go`, #2642).
 
-**Dual-AST split (#2630-class):** the HIERARCHICAL (brace) parser accumulates
-every sibling correctly — this is the primary, fully-fixed path. The FLAT-SET
-path is LIMITED: `ConfigTree.SetPath` collapses repeated `set ... from
-community c1` / `from community c2` sibling paths onto ONE AST node before the
-compiler runs, so only the last value reaches the compiler. The compiler
-append is correct, but it never sees more than one value on flat-set. This is
-the SAME flat-set AST limitation as #2630 (route-filter siblings) and is
-tracked there; pinned by `TestPolicyTermMultiMatch_FlatSet_2630Limited` and
-proven against the working brace path by
+**Dual-AST convergence (#2630, fixed):** the HIERARCHICAL (brace) parser has
+always accumulated every sibling correctly. The FLAT-SET path used to be
+LIMITED — `ConfigTree.SetPath` collapsed repeated `set ... from community c1` /
+`from community c2` sibling paths onto ONE AST node before the compiler ran, so
+only the last value reached the compiler (silently dropping all but the last
+`route-filter` / `prefix-list` / `community` / `as-path`). #2630 fixes this by
+marking those four `from` leaves `multi: true` in `setSchema`
+(`schema_routing.go`): the same `SetPath` multi-value-leaf logic that keeps
+`from protocol` siblings distinct now keeps each repeated `set` line as its own
+sibling leaf, so the two AST shapes CONVERGE on the same typed config.
+`route-filter` is `args: 2` (prefix + match-type); a trailing
+`upto /N` / `prefix-length-range /lo-/hi` / `through <cidr>` arg is absorbed as
+a fourth packed key by the multi value-tail logic, matching the brace AST the
+compiler reads via `routeFilterTrailingToken`. Proven by
+`TestRouteFilterFlatSetMultipleAccumulate` + `TestRouteFilterFlatSetBraceParity`
+(`compiler_route_filter_range_2525_test.go`) and
+`TestPolicyTermMultiMatch_FlatSet_2630` /
 `TestPolicyTermMultiMatch_Hierarchical_2642`
-(`pkg/config/compiler_policy_term_multimatch_2642_test.go`).
+(`compiler_policy_term_multimatch_2642_test.go`).
 
 ## How to add a config-mode typed leaf
 

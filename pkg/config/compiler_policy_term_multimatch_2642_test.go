@@ -8,10 +8,11 @@ import "testing"
 // single-string fields silently dropped all but the last.
 //
 // The hierarchical (brace) AST accumulates every sibling match — this is the
-// primary, fully-fixed path. The flat-set path is #2630-limited: ConfigTree
-// .SetPath collapses repeated `from community c1` / `community c2` sibling
-// paths into one node before the compiler runs, so only the last value
-// survives upstream of the compiler (see TestPolicyTermMultiMatch_FlatSet_2630).
+// primary path. The flat-set path now converges with it (#2630): marking the
+// repeatable `from` leaves (route-filter / prefix-list / community / as-path)
+// `multi: true` in setSchema makes ConfigTree.SetPath keep every flat-set
+// `set ... from <type> <value>` line as a distinct sibling leaf instead of
+// overwriting the previous one (see TestPolicyTermMultiMatch_FlatSet_2630).
 
 func TestPolicyTermMultiMatch_Hierarchical_2642(t *testing.T) {
 	cfg := `policy-options {
@@ -93,15 +94,14 @@ func TestPolicyTermSingleMatch_Hierarchical_2642(t *testing.T) {
 	}
 }
 
-// The flat-set path collapses repeated same-type `from <type> <name>` siblings
-// upstream of the compiler (ConfigTree.SetPath merges them onto one node), so
-// only the LAST value reaches the compiler. This is the SAME flat-set AST
-// limitation as #2630 (route-filter), NOT a compiler bug: the compiler appends
-// correctly, but never sees more than one value. This test PINS the current
-// (limited) flat-set behavior so a future #2630-class SetPath fix that lifts
-// it is a deliberate, visible change here. The compiler-side append is proven
-// by the hierarchical test above.
-func TestPolicyTermMultiMatch_FlatSet_2630Limited(t *testing.T) {
+// #2630 fix: the flat-set path now keeps EVERY repeated same-type `from
+// <type> <name>` sibling, converging with the hierarchical AST. Marking the
+// repeatable `from` leaves `multi: true` in setSchema makes ConfigTree.SetPath
+// append each `set ... from <type> <value>` line as a distinct sibling leaf
+// instead of overwriting the previous one. fail-on-revert: dropping `multi`
+// from any of these schema leaves makes SetPath collapse the siblings back to
+// last-only and these assertions go red.
+func TestPolicyTermMultiMatch_FlatSet_2630(t *testing.T) {
 	tree := &ConfigTree{}
 	cmds := []string{
 		"set policy-options policy-statement P term t1 from community c1",
@@ -126,14 +126,18 @@ func TestPolicyTermMultiMatch_FlatSet_2630Limited(t *testing.T) {
 		t.Fatalf("compile: %v", err)
 	}
 	term := c.PolicyOptions.PolicyStatements["P"].Terms[0]
-	// Documents the #2630-class limitation: SetPath keeps only the last sibling.
-	if len(term.FromCommunity) != 1 || term.FromCommunity[0] != "c2" {
-		t.Errorf("flat-set FromCommunity = %v; expected the #2630-limited last-only [c2]", term.FromCommunity)
+	wantSlice := func(name string, got, want []string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s = %v, want %v", name, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s = %v, want %v", name, got, want)
+			}
+		}
 	}
-	if len(term.PrefixList) != 1 || term.PrefixList[0] != "pl2" {
-		t.Errorf("flat-set PrefixList = %v; expected the #2630-limited last-only [pl2]", term.PrefixList)
-	}
-	if len(term.FromASPath) != 1 || term.FromASPath[0] != "a2" {
-		t.Errorf("flat-set FromASPath = %v; expected the #2630-limited last-only [a2]", term.FromASPath)
-	}
+	wantSlice("flat-set FromCommunity", term.FromCommunity, []string{"c1", "c2"})
+	wantSlice("flat-set PrefixList", term.PrefixList, []string{"pl1", "pl2"})
+	wantSlice("flat-set FromASPath", term.FromASPath, []string{"a1", "a2"})
 }

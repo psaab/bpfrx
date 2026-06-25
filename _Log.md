@@ -1,5 +1,42 @@
 # Action Log
 
+## 2026-06-24 — #2630 review fold: mark flat-set collapse FIXED in pkg/frr/README.md
+
+- **Timestamp**: 2026-06-24
+- **Action**: Doc-accuracy fold from PR #2685 review. The `policy_render.go` row in `pkg/frr/README.md` still described the #2630 flat-set collapse as an UNFIXED limitation; rewrote it to "Flat-set convergence (#2630, fixed)" mirroring the docs/config-schema.md edit (the four repeatable `from` leaves are `multi: true`, so flat-set and brace shapes converge). Repo grep confirmed no other live module doc carried a stale #2630 claim.
+- **File(s)**: pkg/frr/README.md.
+
+## 2026-06-24 — #2630 fix: flat-set repeated `from route-filter` (and prefix-list/community/as-path) collapsed to last-only
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed the flat-set AST collapse where repeated
+  `set policy-options policy-statement <p> term <t> from route-filter
+  <prefix> <match>` lines overwrote each other in `ConfigTree.SetPath`,
+  so only the LAST route-filter survived (the brace parser kept them
+  distinct). Same #2630-class collapse affected repeated `from
+  prefix-list` / `community` / `as-path` siblings. Root cause: those
+  four `from` leaves were not marked `multi: true` in `setSchema`, so
+  the `i>=len(path)` single-value-leaf branch in `SetPath` filtered by
+  `Keys[0]` and replaced every prior entry. Fix: mark `route-filter`
+  (args:2), `prefix-list`, `community`, `as-path` (args:1) `multi: true`
+  so `SetPath`'s multi-value-leaf logic keeps each repeated `set` line
+  as a distinct sibling leaf — converging flat-set with the brace AST.
+  route-filter's trailing `upto /N` / `prefix-length-range /lo-/hi` /
+  `through <cidr>` arg is absorbed as a fourth packed key by the multi
+  value-tail absorber, matching the brace shape the compiler reads via
+  `routeFilterTrailingToken`. No compiler/validator change needed: the
+  keyValidator container path is unchanged (route-filter has no
+  valueType, so it never reroutes through validateMultiValueLeaf).
+- **File(s)**: pkg/config/schema_routing.go (the four `from` leaves),
+  pkg/config/compiler_route_filter_range_2525_test.go (new
+  TestRouteFilterFlatSetMultipleAccumulate fail-on-revert +
+  TestRouteFilterFlatSetBraceParity convergence), 
+  pkg/config/compiler_policy_term_multimatch_2642_test.go (rewrote the
+  FlatSet_2630Limited pin into FlatSet_2630 asserting the fix),
+  docs/config-schema.md (Dual-AST convergence section).
+- **Validation**: go build ./... clean; go test ./pkg/config/...
+  ./pkg/frr/... green; fail-on-revert verified (removing `multi` from
+  route-filter drops 4→3 route-filters and breaks brace/flat parity).
 ## 2026-06-24 — #2480 fix: explicit O_CLOEXEC on the slow-path TUN open
 
 - **Timestamp**: 2026-06-24
