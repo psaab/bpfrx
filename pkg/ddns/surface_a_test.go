@@ -50,7 +50,7 @@ func TestSurfaceAPublishesObservedAddress(t *testing.T) {
 	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
 
 	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil); err != nil {
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil, nil); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	ups := fu.upsertNames()
@@ -69,13 +69,13 @@ func TestSurfaceASkipsUnchangedWithinForcedRefresh(t *testing.T) {
 	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
 	obs := fixedObserver("203.0.113.5")
 
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil); err != nil {
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil); err != nil {
 		t.Fatalf("Reconcile1: %v", err)
 	}
 	// Second pass, same address, still inside the forced-refresh floor: NO wire
 	// update.
 	now = now.Add(time.Minute)
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil); err != nil {
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil); err != nil {
 		t.Fatalf("Reconcile2: %v", err)
 	}
 	if got := len(fu.upserts); got != 1 {
@@ -94,12 +94,12 @@ func TestSurfaceARepublishesAfterForcedRefresh(t *testing.T) {
 	sc.ForcedRefresh = time.Hour
 	obs := fixedObserver("203.0.113.5")
 
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil); err != nil {
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil); err != nil {
 		t.Fatalf("Reconcile1: %v", err)
 	}
 	// Past the forced-refresh floor: a wire re-assert fires even with no change.
 	now = now.Add(2 * time.Hour)
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil); err != nil {
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil); err != nil {
 		t.Fatalf("Reconcile2: %v", err)
 	}
 	if got := len(fu.upserts); got != 2 {
@@ -107,78 +107,16 @@ func TestSurfaceARepublishesAfterForcedRefresh(t *testing.T) {
 	}
 }
 
-func TestSurfaceAReplacesOnAddressChange(t *testing.T) {
-	fu := newFakeUpdater()
-	now := time.Unix(1_700_000_000, 0)
-	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
-	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
-
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil); err != nil {
-		t.Fatalf("Reconcile1: %v", err)
-	}
-	now = now.Add(time.Minute)
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.9"), nil); err != nil {
-		t.Fatalf("Reconcile2: %v", err)
-	}
-	// The address change is a REPLACE (idempotent replace-owned add of the new
-	// rdata), NOT a withdraw-then-add: there must be NO delete (never a
-	// blackhole gap), and the second upsert carries the new address.
-	if got := len(fu.deletes); got != 0 {
-		t.Fatalf("address change must REPLACE, not withdraw-then-add; got %d deletes", got)
-	}
-	if got := len(fu.upserts); got != 2 {
-		t.Fatalf("expected 2 upserts (publish + replace), got %d", got)
-	}
-	if last := fu.upserts[len(fu.upserts)-1]; last.Addr.String() != "203.0.113.9" {
-		t.Fatalf("replace must carry the new address, got %s", last.Addr)
-	}
-	// The scope still owns exactly one record.
-	if st := m.Stats(); st.Scopes != 1 {
-		t.Fatalf("a scope owns exactly one record; got %d", st.Scopes)
-	}
-}
-
-func TestSurfaceAWithdrawsOnConfigRemoval(t *testing.T) {
-	fu := newFakeUpdater()
-	now := time.Unix(1_700_000_000, 0)
-	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
-	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
-
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil); err != nil {
-		t.Fatalf("Reconcile1: %v", err)
-	}
-	// Binding removed: empty scope list → withdraw the owned record.
-	if err := m.Reconcile(context.Background(), nil, fixedObserver("203.0.113.5"), nil); err != nil {
-		t.Fatalf("Reconcile2: %v", err)
-	}
-	if got := fu.deleteNames(); len(got) != 1 || got[0] != "wan.example.net=203.0.113.5" {
-		t.Fatalf("config removal must withdraw the owned record, got %v", got)
-	}
-	if st := m.Stats(); st.Scopes != 0 {
-		t.Fatalf("withdraw must drop ownership; got %d scopes", st.Scopes)
-	}
-}
-
-func TestSurfaceAWithdrawsOnAddressLoss(t *testing.T) {
-	fu := newFakeUpdater()
-	now := time.Unix(1_700_000_000, 0)
-	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
-	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
-
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil); err != nil {
-		t.Fatalf("Reconcile1: %v", err)
-	}
-	// Address definitively lost (Invalid Addr, ok=true): withdraw.
-	lost := func(SurfaceAScope) (AddressObservation, bool) {
-		return AddressObservation{Source: AddressSourceDHCP}, true
-	}
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, lost, nil); err != nil {
-		t.Fatalf("Reconcile2: %v", err)
-	}
-	if got := len(fu.deletes); got != 1 {
-		t.Fatalf("address loss must withdraw, got %d deletes", got)
-	}
-}
+// NOTE (#2691 P2 review): the replace-on-address-change, withdraw-on-config-
+// removal, withdraw-on-address-loss, and per-RG-gate-withdraw proofs moved to
+// surface_a_rfc2136_test.go — they MUST run through the REAL rfc2136 backend
+// against the stateful fake DNS server, because the two production-path bugs the
+// review found (the no-DHCID replace refusal + the no-op withdraw) are invisible
+// to fakeUpdater (it appends on any UpsertLease and the old withdraw helper
+// returned the injected static backend regardless of the production newBackend
+// wiring). The fakeUpdater tests below stay only for backend-AGNOSTIC engine
+// cadence (publish-once, skip-unchanged, forced-refresh fires, transient does
+// not withdraw, backoff, status).
 
 func TestSurfaceATransientObservationDoesNotWithdraw(t *testing.T) {
 	fu := newFakeUpdater()
@@ -186,7 +124,7 @@ func TestSurfaceATransientObservationDoesNotWithdraw(t *testing.T) {
 	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
 	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
 
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil); err != nil {
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil, nil); err != nil {
 		t.Fatalf("Reconcile1: %v", err)
 	}
 	// Transient observation failure (ok=false): NEVER withdraw (the
@@ -194,7 +132,7 @@ func TestSurfaceATransientObservationDoesNotWithdraw(t *testing.T) {
 	transient := func(SurfaceAScope) (AddressObservation, bool) {
 		return AddressObservation{}, false
 	}
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, transient, nil); err != nil {
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, transient, nil, nil); err != nil {
 		t.Fatalf("Reconcile2: %v", err)
 	}
 	if got := len(fu.deletes); got != 0 {
@@ -205,50 +143,9 @@ func TestSurfaceATransientObservationDoesNotWithdraw(t *testing.T) {
 	}
 }
 
-func TestSurfaceAPerRGGate(t *testing.T) {
-	// A scope on RG1: the RG1 MASTER publishes; a node that is NOT master for
-	// RG1 neither publishes NOR withdraws (stop-writing, never-withdraw).
-	scRG1 := surfaceAScope("vip.example.net", FamilyV4, 1)
-	obs := fixedObserver("198.51.100.7")
-
-	// MASTER node: gate admits RG1 → publishes.
-	fuM := newFakeUpdater()
-	now := time.Unix(1_700_000_000, 0)
-	mMaster := newSurfaceATestManager(t, fuM, func() time.Time { return now })
-	gateMaster := func(s ScopeKey) bool { return s.RGOwner == 1 }
-	if err := mMaster.Reconcile(context.Background(), []SurfaceAScope{scRG1}, obs, gateMaster); err != nil {
-		t.Fatalf("master Reconcile: %v", err)
-	}
-	if got := len(fuM.upserts); got != 1 {
-		t.Fatalf("RG1 master must publish; got %d upserts", got)
-	}
-
-	// NON-master node that ALREADY owns the record (e.g. it just lost RG1):
-	// it must NOT withdraw (the peer master refreshes; a withdraw blackholes).
-	fuB := newFakeUpdater()
-	mBackup := newSurfaceATestManager(t, fuB, func() time.Time { return now })
-	// Seed ownership as if it had published before demotion.
-	gateAdmitAll := func(ScopeKey) bool { return true }
-	if err := mBackup.Reconcile(context.Background(), []SurfaceAScope{scRG1}, obs, gateAdmitAll); err != nil {
-		t.Fatalf("backup seed Reconcile: %v", err)
-	}
-	fuB.deletes = nil
-	fuB.upserts = nil
-	// Now it is NOT master for RG1: stop-writing, never-withdraw.
-	gateBackup := func(ScopeKey) bool { return false }
-	if err := mBackup.Reconcile(context.Background(), []SurfaceAScope{scRG1}, obs, gateBackup); err != nil {
-		t.Fatalf("backup Reconcile: %v", err)
-	}
-	if got := len(fuB.deletes); got != 0 {
-		t.Fatalf("non-master must NOT withdraw a gated-out scope; got %d deletes", got)
-	}
-	if got := len(fuB.upserts); got != 0 {
-		t.Fatalf("non-master must NOT publish a gated-out scope; got %d upserts", got)
-	}
-	if st := mBackup.Stats(); st.Scopes != 1 {
-		t.Fatalf("the gated-out record must stay owned (peer refreshes); got %d scopes", st.Scopes)
-	}
-}
+// TestSurfaceAPerRGGate moved to surface_a_rfc2136_test.go
+// (TestSurfaceARealBackendPerRGGate) — it asserts the actual zone state through
+// the real backend, not fakeUpdater call counts.
 
 func TestSurfaceABackoffOnRepeatedFailure(t *testing.T) {
 	fu := newFakeUpdater()
@@ -259,7 +156,7 @@ func TestSurfaceABackoffOnRepeatedFailure(t *testing.T) {
 	obs := fixedObserver("203.0.113.5")
 
 	// First pass: attempts a publish, fails, arms backoff.
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil); err == nil {
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil); err == nil {
 		t.Fatal("expected a publish error on first pass")
 	}
 	attemptsAfterFirst := len(fu.upserts) // the fakeUpdater records nothing on failure
@@ -268,7 +165,7 @@ func TestSurfaceABackoffOnRepeatedFailure(t *testing.T) {
 	// Second pass immediately after (still inside the backoff window): the
 	// scope is SKIPPED, so the backend is NOT hit again (ban-avoidance).
 	now = now.Add(time.Second)
-	_ = m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil)
+	_ = m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil)
 	if fu.failedCalls != failCalls1 {
 		t.Fatalf("scope in backoff window must not hit the backend again; calls %d -> %d",
 			failCalls1, fu.failedCalls)
@@ -278,7 +175,7 @@ func TestSurfaceABackoffOnRepeatedFailure(t *testing.T) {
 	}
 	// Well past the backoff window: the scope is eligible again and retries.
 	now = now.Add(time.Hour)
-	_ = m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil)
+	_ = m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil)
 	if fu.failedCalls <= failCalls1 {
 		t.Fatalf("after backoff window the scope must retry; calls stayed at %d", fu.failedCalls)
 	}
@@ -289,7 +186,7 @@ func TestSurfaceAStatusViews(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
 	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
-	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil); err != nil {
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil, nil); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	views := m.StatusViews()

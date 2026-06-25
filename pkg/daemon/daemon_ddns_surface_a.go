@@ -104,7 +104,15 @@ func (d *Daemon) reconcileSurfaceAOnce(ctx context.Context) {
 	defer cancel()
 	observe := d.surfaceAObserver(cfg)
 	gate := d.surfaceAGate()
-	if err := d.surfaceA.Reconcile(rctx, scopes, observe, gate); err != nil {
+	// The provider catalog lets the engine REBUILD the publish backend to
+	// withdraw a removed-binding record (#2691 P2 MAJOR-2) — the owned record
+	// carries only the provider NAME (scope.PolicyID), so the live credentials/
+	// server come from the still-committed catalog.
+	var catalog map[string]*config.DDNSProvider
+	if cfg.System.Services != nil && cfg.System.Services.DynamicDNS != nil {
+		catalog = cfg.System.Services.DynamicDNS.Providers
+	}
+	if err := d.surfaceA.Reconcile(rctx, scopes, observe, gate, catalog); err != nil {
 		slog.Warn("ddns surface-a: reconcile pass had errors (retrying next cycle)", "err", err)
 	}
 }

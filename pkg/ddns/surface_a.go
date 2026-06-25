@@ -251,22 +251,25 @@ func productionSurfaceABackend(p *config.DDNSProvider, fqdn string, ttl int) (DN
 }
 
 // newSurfaceARFC2136 builds the live RFC 2136 backend for a Surface A provider.
-// It reuses the SAME rfc2136Updater the lease path uses, with self-ownership
-// semantics: there is NO ClientID/DHCID for a router record, so under the
-// default replace-owned conflict policy sendAddOwned uses the name-not-in-use
-// (Attempt A) / no-DHCID refuse (Attempt B) path — the firewall claims a name
-// only when it is free, and refreshes an unchanged record idempotently. The
-// provider's transport binding (source-address / dest-interface / VRF) is
-// honored via the shared resolveBindConfig→dialer path by reusing
-// DHCPDynamicDNSConfig as the transport carrier.
+// It reuses the SAME rfc2136Updater the lease path uses, in SELF-OWNED mode:
+// a router record has NO ClientID/DHCID (the firewall is the authoritative owner
+// of its OWN configured FQDN), so the forward ADD is an atomic IN-PLACE REPLACE
+// of our record type (rfc2136Updater.selfOwned → sendAddSelfOwned), NOT the
+// lease path's name-not-in-use / DHCID-match prerequisite. This is what lets an
+// address change and a forced-refresh of an EXISTING name succeed — without
+// selfOwned, the no-DHCID lease path would REFUSE the pre-existing name and pin
+// the record at its first address forever. The provider's transport binding
+// (source-address / dest-interface / VRF) is honored via the shared
+// resolveBindConfig→dialer path by reusing DHCPDynamicDNSConfig as the carrier.
 func newSurfaceARFC2136(p *config.DDNSProvider, _ string) (DNSUpdater, error) {
 	if p == nil {
 		return nil, errors.New("ddns surface-a: nil provider")
 	}
 	// Reuse the lease-path policy + config shape so the rfc2136 backend builds
-	// identically (server, TSIG, source binding). conflict-policy is fixed to
-	// replace-owned: a router record is self-owned (no DHCID), so the
-	// name-not-in-use / refresh path is the correct self-ownership prerequisite.
+	// identically (server, TSIG, source binding). conflict-policy is replace-
+	// owned but the selfOwned flag (set below) overrides the forward-add path to
+	// the in-place replace — the conflict-policy value only governs the unused
+	// PTR path for a self record.
 	pol := ddnsPolicy{
 		domain:         "", // the FQDN is absolute; no domain suffixing
 		conflictPolicy: "replace-owned",
@@ -281,7 +284,12 @@ func newSurfaceARFC2136(p *config.DDNSProvider, _ string) (DNSUpdater, error) {
 		DestinationInterface: p.DestinationInterface,
 		RoutingInstance:      p.RoutingInstance,
 	}
-	return newRFC2136Updater(pol, c, nil, nil, nil)
+	u, err := newRFC2136Updater(pol, c, nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	u.selfOwned = true
+	return u, nil
 }
 
 // seedFromStore rebuilds the in-memory runtime cache from the durable ownership
@@ -312,7 +320,7 @@ func (m *SurfaceAManager) seedFromStore() {
 // gate is the SAME per-RG ScopeGate the lease reconciler uses (#2664). A nil
 // gate (standalone) admits every scope. A gated-out scope is stop-writing,
 // never-withdraw (the peer RG master refreshes it).
-func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope, observe AddressObserver, gate ScopeGate) error {
+func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope, observe AddressObserver, gate ScopeGate, catalog map[string]*config.DDNSProvider) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -332,7 +340,7 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 	}
 
 	// desired[scopeID] = the configured scope. Used to find owned records that
-	// are no longer configured (withdraw).
+	// are no longer configured (withdraw), and to drive the per-scope publish.
 	desired := map[string]SurfaceAScope{}
 	for _, sc := range scopes {
 		desired[sc.scopeID()] = sc
@@ -354,7 +362,11 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 	// Pass 2 — withdraw scopes whose binding was removed from config. A record
 	// owned for a scope NOT in `desired` is withdrawn (turn-off cleanup), gated
 	// by the same per-RG writer gate (never withdraw a scope this node does not
-	// master).
+	// master). The live backend is REBUILT from the owned record's provider
+	// attribution (scope.PolicyID → the provider catalog) — the same backend the
+	// publish used — so the withdraw actually reaches the wire even though the
+	// SurfaceAScope is gone (#2691 P2 MAJOR-2 fix: a removed-binding withdraw
+	// MUST send a real DNS DELETE, not silently drop ownership and orphan the RR).
 	for _, owned := range m.state.all() {
 		sid := owned.scopeOf().scopePrefix()
 		if _, stillConfigured := desired[sid]; stillConfigured {
@@ -363,7 +375,12 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 		if !admit(owned.scopeOf()) {
 			continue
 		}
-		noteErr(m.withdrawOwnedLocked(ctx, owned))
+		backend, err := m.backendForOwned(owned, catalog)
+		if err != nil {
+			noteErr(err)
+			continue
+		}
+		noteErr(m.withdrawOwnedLocked(ctx, owned, backend))
 	}
 
 	if err := m.state.save(); err != nil {
@@ -404,9 +421,18 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 	if !obs.Addr.IsValid() {
 		// The scope lost its address (interface down / lease gone). If we own a
 		// record for it, withdraw it (the address really is gone — this is the
-		// authoritative "no address", not a transient observation failure).
+		// authoritative "no address", not a transient observation failure). We
+		// still have the live SurfaceAScope here, so resolve its provider backend
+		// directly — the withdraw reaches the wire (the address-loss half of the
+		// #2691 P2 MAJOR-2 fix; backendForOwned is only needed for the gone-from-
+		// config Pass 2 withdraw where the scope no longer exists).
 		if owned, exists := m.state.get(sc.Key, surfaceAIdentity, ""); exists {
-			if err := m.withdrawOwnedLocked(ctx, owned); err != nil {
+			backend, err := m.backendFor(sc)
+			if err != nil {
+				m.deleteFail++
+				return err
+			}
+			if err := m.withdrawOwnedLocked(ctx, owned, backend); err != nil {
 				return err
 			}
 			delete(m.runtime, sid)
@@ -459,9 +485,10 @@ const surfaceAIdentity = "router-self"
 // publishLocked publishes the scope's record through the resolved Backend and
 // records ownership write-ahead (the same durability discipline as the lease
 // path, #2662). The ownership key fixes Address="" so a scope owns exactly one
-// record: an address change REPLACES the rdata via an idempotent
-// replace-owned add (RFC 2136 replace semantics in the rfc2136 backend), never
-// a withdraw-then-add that would blackhole. Caller holds m.mu.
+// record: an address change REPLACES the rdata via the backend's atomic
+// in-place self-owned replace (rfc2136Updater.sendAddSelfOwned: a single UPDATE
+// that delete-RRsets our forward type then inserts the new rdata), never a
+// withdraw-then-add that would blackhole. Caller holds m.mu.
 func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, addr netip.Addr, now time.Time) error {
 	backend, err := m.backendFor(sc)
 	if err != nil {
@@ -528,10 +555,10 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 		return fmt.Errorf("ddns surface-a: publish %s %s=%s: %w", rec.ForwardType, rec.FQDN, addr, err)
 	}
 
-	// Success. If the address CHANGED (replace), the replace-owned add already
-	// updated the rdata in place at the server (RFC 4703 §5.3 refresh-owned),
-	// so there is no separate withdraw of the old address — the never-blackhole
-	// replace. Log the transition for observability.
+	// Success. If the address CHANGED (replace), the self-owned add already
+	// updated the rdata in place at the server (sendAddSelfOwned's atomic
+	// delete-RRset + insert), so there is no separate withdraw of the old
+	// address — the never-blackhole replace. Log the transition for observability.
 	if prevAddr != "" && prevAddr != addr.String() {
 		slog.Info("ddns surface-a: replaced record address",
 			"fqdn", rec.FQDN, "old", prevAddr, "new", addr.String())
@@ -543,11 +570,20 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 }
 
 // withdrawOwnedLocked removes the firewall's own record for an owned scope
-// (binding removed, or address lost) through the resolved Backend, then drops
-// the ownership entry. Caller holds m.mu. A delete is re-derived from the
-// EXACT owned tuple (the sole-delete-authority boundary, shared with the lease
-// path): Surface A never deletes a name it did not record.
-func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRecord) error {
+// (binding removed, or address lost) through the GIVEN backend, then drops the
+// ownership entry. Caller holds m.mu and is responsible for resolving the LIVE
+// backend (Pass 1 from the live scope via backendFor, Pass 2 from the provider
+// catalog via backendForOwned) so the delete actually reaches the wire — a nil/
+// no-op backend would orphan the RR (#2691 P2 MAJOR-2). A delete is re-derived
+// from the EXACT owned tuple (the sole-delete-authority boundary, shared with
+// the lease path): Surface A never deletes a name it did not record.
+//
+// Observability honesty (#2691 P2 MINOR M1): the ownership entry is dropped only
+// AFTER a successful wire delete; a failed delete increments deleteFail (not
+// deleteOK) and leaves the entry so the next reconcile retries. A no-op backend
+// (provider unresolvable) is treated as a FAILURE — it did NOT remove the RR, so
+// it must not report success nor drop ownership (which would orphan the RR).
+func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRecord, backend DNSUpdater) error {
 	a, err := netip.ParseAddr(owned.AddrText)
 	if err != nil {
 		// Stored rdata no longer parses (should not happen): drop the entry to
@@ -558,10 +594,15 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 		delete(m.runtime, owned.scopeOf().scopePrefix())
 		return nil
 	}
-	backend, err := m.backendForOwned(owned)
-	if err != nil {
+	if isNopUpdater(backend) {
+		// No live backend resolved (provider gone from the catalog): the RR
+		// cannot be withdrawn. Do NOT claim success or drop ownership — leaving
+		// the entry keeps the RR cleanable once the provider is reconfigured, and
+		// keeps the deleteOK counter honest (#2691 P2 MINOR M1).
 		m.deleteFail++
-		return err
+		slog.Warn("ddns surface-a: cannot withdraw record — no live backend for its provider; keeping ownership for retry",
+			"fqdn", owned.FQDN, "addr", owned.AddrText, "provider", owned.scopeOf().PolicyID)
+		return fmt.Errorf("ddns surface-a: no live backend to withdraw %s", owned.FQDN)
 	}
 	rec, err := buildHostRecord(owned.FQDN, a, owned.TTL)
 	if err != nil {
@@ -591,21 +632,32 @@ func (m *SurfaceAManager) backendFor(sc SurfaceAScope) (DNSUpdater, error) {
 	return m.newBackend(sc.Provider, sc.FQDN, sc.TTL)
 }
 
-// backendForOwned resolves the Backend for a withdraw of an owned record whose
-// scope is no longer in the desired set (the provider is not available from a
-// SurfaceAScope). The static backend wins (tests); production withdraws are
-// driven from the still-configured scope set (Pass 2 only fires for a removed
-// binding, where the provider catalog may still hold the entry — but we no
-// longer have the SurfaceAScope). For P2 a removed-binding withdraw uses the
-// static backend if present, else the no-op (the record is dropped from the
-// store either way; a no-op withdraw leaves the RR until its provider is
-// reconfigured — documented residual). The common case (address loss / replace)
-// goes through backendFor with the live SurfaceAScope.
-func (m *SurfaceAManager) backendForOwned(_ ownedRecord) (DNSUpdater, error) {
+// backendForOwned resolves the live Backend for a WITHDRAW of an owned record
+// whose binding was REMOVED from config, so there is no live SurfaceAScope to
+// read the provider from (#2691 P2 MAJOR-2). It REBUILDS the SAME backend the
+// publish used by looking the owned record's provider (scope.PolicyID) up in the
+// still-committed provider catalog and feeding it through newBackend — so a
+// removed-binding withdraw sends a real DNS DELETE instead of orphaning the RR.
+// The static `backend` field (test injection) wins when set; when no factory and
+// no static backend are available the no-op is returned (and withdrawOwnedLocked
+// treats it as a failure that keeps ownership for retry, never a false success).
+func (m *SurfaceAManager) backendForOwned(owned ownedRecord, catalog map[string]*config.DDNSProvider) (DNSUpdater, error) {
 	if m.backend != nil {
 		return m.backend, nil
 	}
-	return nopUpdater{}, nil
+	if m.newBackend == nil {
+		return nopUpdater{}, nil
+	}
+	policyID := owned.scopeOf().PolicyID
+	prov := catalog[policyID]
+	if prov == nil {
+		// The provider was removed alongside the binding: no credentials/server
+		// to rebuild the backend, so the RR cannot be withdrawn this cycle.
+		slog.Warn("ddns surface-a: owned record's provider is no longer in the catalog; cannot withdraw",
+			"fqdn", owned.FQDN, "provider", policyID)
+		return nopUpdater{}, nil
+	}
+	return m.newBackend(prov, owned.FQDN, owned.TTL)
 }
 
 // recordScopeError records a failure on a scope and advances its flat error

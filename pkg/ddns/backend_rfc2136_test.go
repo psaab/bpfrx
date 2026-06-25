@@ -274,9 +274,25 @@ func (s *fakeDNSServer) evalStatefulLocked(r *dns.Msg) int {
 				}
 			}
 		case dns.ClassANY:
-			// delete-RRset / delete-name — the backend must never send these;
-			// apply defensively so a stray one is observable in the zone.
-			delete(s.zone, name)
+			// CLASS=ANY: delete-name (Rrtype ANY) OR delete-RRset (a specific
+			// Rrtype). The lease path never sends these, but the #2691 P2
+			// self-owned forward replace (sendAddSelfOwned) sends a delete-RRset
+			// of OUR forward type in the SAME message as the Insert (atomic
+			// in-place replace). Honor the RFC 2136 §2.5.1/§2.5.2 distinction so
+			// the test verifies the delete is scoped to OUR type and never harms a
+			// co-resident RR of a DIFFERENT type at the name.
+			if h.Rrtype == dns.TypeANY {
+				delete(s.zone, name)
+			} else if set := s.zone[name]; set != nil {
+				for k, rr := range set {
+					if rr.Header().Rrtype == h.Rrtype {
+						delete(set, k)
+					}
+				}
+				if len(set) == 0 {
+					delete(s.zone, name)
+				}
+			}
 		default:
 			// Insert.
 			if s.zone[name] == nil {

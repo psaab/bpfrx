@@ -14371,3 +14371,39 @@ top.
   `go test ./pkg/{ddns,config,dhcpserver,daemon,api,grpcapi,cli,cmdtree}` green;
   `-race ./pkg/ddns` green. `make test-failover` + a LIVE standalone-VM publish
   remain MANDATORY (no cluster/VM access here) — the parent must run them.
+
+## 2026-06-24 — #2691 P2 review fixes (MERGE-NEEDS-MAJOR → fixed)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fix the two production-path bugs the P2 review found, both hidden
+  because the original Surface A tests used fakeUpdater instead of the real
+  rfc2136 backend.
+    - MAJOR-1: a self-owned router record could never be updated (no-DHCID
+      replace-owned refuses a pre-existing name). FIX: add
+      rfc2136Updater.selfOwned → sendAddSelfOwned, an atomic single-message
+      RFC 2136 UPDATE (RemoveRRset of our forward type + Insert new rdata).
+      newSurfaceARFC2136 sets selfOwned=true. Address change and same-address
+      forced-refresh now succeed in-place with no blackhole gap.
+    - MAJOR-2: withdraw never reached the wire (backendForOwned ignored the
+      newBackend factory; production leaves the static backend nil). FIX: Pass-1
+      address-loss withdraw resolves the live scope's backend (backendFor);
+      Pass-2 config-removal withdraw rebuilds the backend from the owned
+      record's provider (scope.PolicyID) via the provider catalog now threaded
+      into Reconcile. Reconcile signature gains the catalog arg.
+    - MINOR M1: an unresolvable withdraw counts deleteFail (not deleteOK), keeps
+      ownership for retry, and returns an error — observability no longer lies.
+  - **File(s)**: pkg/ddns/backend_rfc2136.go (selfOwned + sendAddSelfOwned),
+    pkg/ddns/surface_a.go (selfOwned wiring, Reconcile catalog arg, withdraw
+    backend resolution, counter honesty), pkg/ddns/backend_rfc2136_test.go
+    (stateful server now honors delete-RRset-of-type vs delete-name),
+    pkg/ddns/surface_a_rfc2136_test.go (NEW — 7 real-backend fail-on-revert
+    tests against the stateful fake DNS server), pkg/ddns/surface_a_test.go
+    (removed the 4 false-passing fakeUpdater tests; kept backend-agnostic
+    cadence), pkg/daemon/daemon_ddns_surface_a.go (thread the provider catalog
+    into Reconcile), pkg/ddns/README.md.
+- **Validation**: go build ./... clean; gofmt/vet clean on touched files;
+  go test ./pkg/{ddns,config,dhcpserver,daemon} green; -race ./pkg/ddns green.
+  Fail-on-revert PROVEN: reverting selfOwned → MAJOR-1 tests FAIL with
+  "owned by another party (refused)"; reverting backendForOwned/Pass-1 →
+  MAJOR-2 withdraw tests FAIL with "no live backend to withdraw". make
+  test-failover + the LIVE standalone-VM publish remain for the parent.

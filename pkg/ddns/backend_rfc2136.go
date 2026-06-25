@@ -127,6 +127,20 @@ type rfc2136Updater struct {
 	// backend is safe). Empty ⇒ no DHCID (name-not-in-use guard only).
 	dhcidClientID string
 
+	// selfOwned marks a backend that publishes the FIREWALL'S OWN records
+	// (Surface A router/interface-address publish, #2691 P2), as opposed to a
+	// DHCP-lease record claimed on behalf of a client. A self-owned record has
+	// no DHCID (the firewall IS the authoritative owner of its configured FQDN),
+	// so the forward ADD is an atomic IN-PLACE REPLACE of OUR record type at OUR
+	// name — `sendAddSelfOwned` — rather than the lease path's name-not-in-use /
+	// DHCID-match prerequisite. This is what makes an address change and a
+	// forced-refresh of an existing self-record succeed (the lease path would
+	// refuse the pre-existing name, since with no DHCID it has no "matches our
+	// prior value" branch). A self-owned add NEVER touches a co-resident record
+	// of a DIFFERENT type at the name, and NEVER issues a delete-RRset/delete-
+	// name for anything but its own forward type (exact-RR discipline preserved).
+	selfOwned bool
+
 	client dnsExchanger // *dns.Client in production; recorder in tests
 
 	// counters surfaced to the manager via the reason-tagged skip path.
@@ -588,6 +602,15 @@ func dhcidRR(clientID, fqdn string, ttl uint32) (*dns.DHCID, bool) {
 //     third party's RR (#2660).
 //   - strict-fail: same prerequisite, surface the collision as an error.
 func (u *rfc2136Updater) sendAdd(ctx context.Context, zone string, rr dns.RR) error {
+	// #2691 P2: a self-owned forward record (Surface A) is published as an
+	// atomic in-place replace of OUR record type, so an address change or a
+	// forced-refresh of an EXISTING name succeeds (the DHCID/name-not-in-use
+	// prerequisites below would refuse the pre-existing name). Only the forward
+	// A/AAAA add is self-owned; a PTR add (rare for Surface A) falls through to
+	// the normal path.
+	if u.selfOwned && (rr.Header().Rrtype == dns.TypeA || rr.Header().Rrtype == dns.TypeAAAA) {
+		return u.sendAddSelfOwned(ctx, zone, rr)
+	}
 	if u.conflictPolicy == "replace-owned" {
 		return u.sendAddOwned(ctx, zone, rr)
 	}
@@ -726,6 +749,52 @@ func (u *rfc2136Updater) sendAddOwned(ctx context.Context, zone string, rr dns.R
 			u.onConflict()
 		}
 		return errDDNSConflictRefused
+	default:
+		return rcodeError(resp.Rcode)
+	}
+}
+
+// sendAddSelfOwned publishes a SELF-OWNED forward record (Surface A router /
+// interface-address publish, #2691 P2) as an ATOMIC IN-PLACE REPLACE: a single
+// RFC 2136 UPDATE that, in one message, deletes the existing RRset OF OUR TYPE
+// at our name (RFC 2136 §2.5.2 delete-RRset, CLASS=ANY, no rdata) and then
+// inserts the new rdata. Because both ops are in the SAME UPDATE, the server
+// applies them atomically — there is NO withdraw-then-add blackhole window, and
+// the new address is live the instant the old one is gone.
+//
+// Why this (vs the DHCID/name-not-in-use path): a router record has no DHCID
+// (the firewall is the authoritative owner of its OWN configured FQDN), so the
+// lease path's two prerequisites both REFUSE a pre-existing name — which would
+// pin the record at its first address forever (the bug this fixes). The
+// firewall owns the NAME, so an in-place replace of its own forward type is the
+// correct, idempotent self-ownership mechanism: a same-address re-publish
+// (forced-refresh) deletes-then-re-adds the identical RR (a no-op net change
+// that SUCCEEDS), and an address change replaces the rdata atomically.
+//
+// Exact-RR / co-resident safety: the delete is scoped to OUR forward type (A
+// for a v4 record, AAAA for a v6 record) at OUR exact name only — it never
+// touches a different RR type at the name (e.g. a co-resident MX/TXT) and never
+// issues a delete-name. The third-party case: if an operator points two
+// firewalls' Surface-A FQDNs at the SAME name they will fight (each replaces the
+// other's A) — that is an operator misconfiguration (the per-RG HA gate already
+// prevents the in-cluster two-writer case), and is strictly the documented
+// "self-owned name" contract; this backend never adopts or deletes a DIFFERENT
+// record TYPE, so a co-resident non-A/AAAA record at the name is never harmed.
+func (u *rfc2136Updater) sendAddSelfOwned(ctx context.Context, zone string, rr dns.RR) error {
+	m := new(dns.Msg)
+	m.SetUpdate(dns.Fqdn(zone))
+	// RemoveRRset deletes the entire RRset of rr's type at rr's name (CLASS=ANY,
+	// TTL=0, empty rdata) — our prior A/AAAA value(s), if any. Applied in the
+	// SAME message as the Insert below, so the replace is atomic.
+	m.RemoveRRset([]dns.RR{rr})
+	m.Insert([]dns.RR{rr})
+	resp, err := u.exchange(ctx, m)
+	if err != nil {
+		return err
+	}
+	switch resp.Rcode {
+	case dns.RcodeSuccess:
+		return nil
 	default:
 		return rcodeError(resp.Rcode)
 	}

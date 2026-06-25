@@ -137,12 +137,35 @@ its OWN learned address — on top of the SAME spine, without forking the engine
 - **`SurfaceAManager` (`surface_a.go`)** — a separate manager from the
   DHCP-lease `Manager` (different ownership semantics: self-owned, no DHCID; and
   a different durable state file, `interface-ddns-state.json`), but it drives the
-  SAME `DNSUpdater` interface, the SAME RFC 2136 backend (`newRFC2136Updater`
-  with `conflict-policy=replace-owned` and no `ClientID`, so `sendAddOwned` uses
-  the name-not-in-use / refresh-owned prerequisite — the self-ownership claim),
+  SAME `DNSUpdater` interface, the SAME RFC 2136 backend (`newRFC2136Updater`),
   the SAME `ScopeKey` ownership primitive, the SAME source/VRF binding
   (`backend_bind.go`, via `DHCPDynamicDNSConfig` as the transport carrier), and
   the SAME write-ahead durability discipline.
+- **Self-owned forward ADD = atomic in-place replace** (`rfc2136Updater.selfOwned`
+  → `sendAddSelfOwned`). A router record has NO DHCID (the firewall IS the
+  authoritative owner of its OWN configured FQDN). The lease path's two
+  prerequisites — name-not-in-use (Attempt A) and DHCID-match (Attempt B) — both
+  REFUSE a pre-existing name when there is no DHCID, which would pin a self-record
+  at its first address forever (the #2691 P2 MAJOR-1 bug). So a self-owned
+  forward add is a SINGLE RFC 2136 UPDATE that, in one message, `RemoveRRset`s our
+  forward type at our name (CLASS=ANY, our type only — co-resident records of a
+  DIFFERENT type are never touched) and `Insert`s the new rdata. The server
+  applies both atomically: a same-address forced-refresh deletes-then-re-adds the
+  identical RR (a no-op net change that SUCCEEDS), and an address change replaces
+  the rdata with NO withdraw-then-add blackhole gap. (Third-party case: the
+  firewall owns the name; two firewalls pointed at the same self-record FQDN is an
+  operator misconfig — the per-RG HA gate prevents the in-cluster two-writer case.)
+- **Withdraw rebuilds the live backend** (the #2691 P2 MAJOR-2 fix). An
+  address-loss withdraw (Pass 1) resolves the backend from the live
+  `SurfaceAScope` (`backendFor`); a config-removal withdraw (Pass 2, where the
+  binding — and thus the scope — is gone) REBUILDS the same backend the publish
+  used by looking the owned record's provider (`scope.PolicyID`) up in the
+  still-committed provider catalog passed into `Reconcile` (`backendForOwned` →
+  `newBackend`). Production sets only `newBackend` (not the static `backend`
+  field), so a withdraw that ignored `newBackend` would no-op and ORPHAN the RR —
+  the bug this fixes. If the provider is also gone from the catalog the withdraw
+  cannot reach the wire: it counts `deleteFail`, keeps ownership for retry, and
+  surfaces an error (never a false `deleteOK`).
 - **What the engine ADDS over the lease reconciler** (the inadyn ideas the
   DHCP-lease path does not need, plan §3.3/§5.5):
   - **change detection + last-published cache** — a wire UPDATE fires only when
@@ -156,7 +179,7 @@ its OWN learned address — on top of the SAME spine, without forking the engine
     (30s → cap, default 1h) so a failing provider is not hammered (ban-avoidance).
   - **replace, never withdraw-then-add, on address change** — a scope owns
     exactly ONE record (keyed `{scope, "router-self", ""}`); an address change is
-    an idempotent replace-owned re-add of the new rdata (no blackhole gap).
+    the atomic self-owned in-place replace described above (no blackhole gap).
 - **Ownership key.** A router record is keyed on its SCOPE + the fixed identity
   `router-self` + Address `""` (the published address lives in the new
   `ownedRecord.AddrText` field, JSON-omitted for lease records). So an interface
@@ -173,6 +196,15 @@ its OWN learned address — on top of the SAME spine, without forking the engine
 - **Operator surfaces:** `show services dynamic-dns [detail]` (CLI + gRPC), the
   `xpf_ddns_surface_a_*` Prometheus family, and `SurfaceAManager.StatusViews()`
   (per-scope published address + last-published time + last error).
+- **Tests through the REAL backend.** The self-owned replace, forced-refresh,
+  and both withdraw paths are proven in `surface_a_rfc2136_test.go` against the
+  stateful in-process fake DNS server (the `backend_rfc2136_test.go` harness) with
+  PRODUCTION wiring (`newBackend` set, static `backend` nil) — asserting the
+  actual zone state + the actual wire DELETE. `fakeUpdater` (`surface_a_test.go`)
+  is kept only for backend-agnostic engine cadence (publish-once, skip-unchanged,
+  forced-refresh-fires, transient-no-withdraw, backoff, status), because it models
+  neither RFC 2136 prerequisites nor the production `newBackend` wiring and so
+  cannot catch the two MAJORs above.
 
 P3 (the rest of #2679) adds the HTTP provider backends
 (dyndns2/Cloudflare/Route53/generic-template) + the checkip address source;
