@@ -248,7 +248,20 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), surfaceACheckIPTimeout)
 			defer cancel()
-			allow := ddns.ParseAllowlist(scope.Provider.CheckIPAllowlist)
+			allow, badAllow := ddns.ParseAllowlistChecked(scope.Provider.CheckIPAllowlist)
+			if len(badAllow) > 0 {
+				// A malformed checkip-allowlist token (operator typo) is dropped so
+				// the valid entries still gate, but a silent drop shrinks the bogus-IP
+				// safety gate (#2839). The commit-time warning already named the token;
+				// log once per (provider, allowlist-string) so the running daemon also
+				// surfaces it without flooding the per-tick observer.
+				key := scope.Provider.Name + "\x00" + scope.Provider.CheckIPAllowlist
+				if _, dup := d.surfaceACheckIPAllowlistWarned.LoadOrStore(key, struct{}{}); !dup {
+					slog.Warn("ddns surface-a: ignoring malformed checkip-allowlist token(s); "+
+						"bogus-IP allowlist is smaller than configured",
+						"provider", scope.Provider.Name, "tokens", badAllow)
+				}
+			}
 			// Bind the checkip probe to the provider's configured source-address /
 			// interface / VRF (#2846) so it egresses from the same source as the
 			// DDNS updates — not the kernel default route. A malformed source-

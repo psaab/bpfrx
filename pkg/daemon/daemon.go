@@ -117,6 +117,12 @@ type Daemon struct {
 	// a depth-1 nudge channel + a no-freeze skip-if-in-flight guard.
 	surfaceAReconcileNowCh    chan struct{}
 	surfaceAReconcileInFlight atomic.Bool
+	// surfaceACheckIPAllowlistWarned dedups the once-per-(provider,allowlist)
+	// runtime log emitted when ddns.ParseAllowlistChecked drops a malformed
+	// checkip-allowlist token (#2839). The observer runs per poll-tick, so the
+	// drop must not log every tick. Keyed by "<provider>\x00<allowlist-string>"
+	// so a corrected commit re-arms the warning.
+	surfaceACheckIPAllowlistWarned sync.Map
 	// #2239 HA DHCP-server lease sync (PATH C). The push loop runs on the
 	// RG-MASTER, reads the active lease set (Kea control socket → memfile
 	// fallback), and replicates it over the cluster sync channel. The standby
