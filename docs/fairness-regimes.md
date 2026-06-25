@@ -1008,7 +1008,16 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
   small drain calls a queue takes under low/medium load (#2624); a
   per-call reset would re-arm the full scan on every drain and defeat the
   cadence, raising cross-core coherency traffic without changing the
-  throttle decision.
+  throttle decision. The counter advances ONLY over a CONFIRMED pop
+  (#2646): the commit is deferred past the gate to after the head item is
+  actually removed from its bucket, so a post-gate budget-miss or
+  mirror-reserve-miss break (head packet larger than the remaining
+  root/secondary budget) breaks WITHOUT advancing the cadence — it no
+  longer burns a cadence position while draining zero bytes, which would
+  otherwise skip a mandatory/cadence peer snapshot and count a phantom pop
+  in exactly the low-budget bursty regime this brake serves. The
+  gate-throttle (hard-cap) path is unchanged; only the post-gate pre-pop
+  breaks now also skip the advance.
 - **`xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total{binding_slot=..., queue_id=..., worker_id=..., iface=...}`**
   counter (#1831): V_MIN_CONSECUTIVE_SKIP_HARD_CAP escape-hatch
   activations — after that many back-to-back throttle decisions the
