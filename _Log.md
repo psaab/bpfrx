@@ -18322,3 +18322,18 @@ top.
   line turns the test RED. Updated pkg/frr/README.md policy_render.go row.
 - **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
   pkg/frr/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2992 — fix LLDP RX self-frame learning. The RX AF_PACKET
+  socket (bound to ETH_P_LLDP) also receives this host's own transmitted
+  LLDP advertisements, which the kernel loops back marked PACKET_OUTGOING.
+  `recv` discarded the Recvfrom sockaddr, so rxLoop parsed those frames and
+  learned the firewall as its own neighbor on every LLDP-enabled link.
+  Fix: `recv` now returns the sll_pkttype from the sockaddr_ll; rxLoop drops
+  frames whose pkttype == unix.PACKET_OUTGOING before parsing TLVs. Genuine
+  inbound peer frames (PACKET_HOST/MULTICAST/BROADCAST) are preserved. Added
+  fail-on-revert test TestRxLoopSkipsSelfTransmittedFrames (self frame skipped,
+  peer frame learned; RED if the PACKET_OUTGOING skip is removed). Existing
+  recvFn test seams updated to the (int, int, error) signature.
+  **File(s)**: pkg/lldp/lldp.go, pkg/lldp/socket_test.go, pkg/lldp/README.md,
+  _Log.md
