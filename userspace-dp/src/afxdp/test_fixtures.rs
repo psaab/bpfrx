@@ -748,6 +748,8 @@ pub(super) fn static_nat_snapshot() -> ConfigSnapshot {
             from_zone: "untrust".to_string(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
         }],
         default_policy: "deny".to_string(),
         policies: vec![

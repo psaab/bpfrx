@@ -1657,6 +1657,110 @@ fn reconcile_with_none_snapshot_reaches_no_snapshot_early_exit() {
 }
 
 // ---------------------------------------------------------------------------
+// #2522: the mlx5 zero-copy teardown quiesce (500ms) is gated on BOTH
+// `had_live_workers` AND `will_rebind` (a snapshot is being applied, so
+// a rebind on the same queue set follows). A teardown with no following
+// bind — the `no_snapshot` / shutdown path — never rebinds, so the
+// quiesce was pure dead latency there.
+//
+// Under `cfg(test)` the quiesce records its requested duration on the
+// PER-INSTANCE `Coordinator::last_quiesce_ms` field and skips the real
+// `thread::sleep`. Each test reads its OWN coordinator's field — there
+// is NO process-global state, so the three tests are independent and
+// safe to run in parallel (the default `cargo test` mode).
+// `reconcile_quiesce_count` is an internal/test counter mirroring the
+// gate.
+// ---------------------------------------------------------------------------
+
+/// No live workers + no rebind: the quiesce never fires. (Sanity floor
+/// for the gate — the first conjunct alone is enough to skip.)
+#[test]
+fn teardown_quiesce_skipped_when_no_live_workers() {
+    let mut coordinator = Coordinator::new();
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+    coordinator.reconcile(None, &mut bindings, 64);
+    assert_eq!(
+        coordinator.last_quiesce_ms, 0,
+        "no live workers => no mlx5 quiesce"
+    );
+    assert_eq!(coordinator.reconcile_quiesce_count, 0);
+}
+
+/// THE #2522 fail-on-revert pin: live workers WERE torn down, but the
+/// reconcile carries NO snapshot (`will_rebind == false`) — the
+/// `no_snapshot` early-exit follows with no rebind. The quiesce MUST be
+/// skipped.
+///
+/// Fail-on-revert: revert the fix (gate back to `if had_live_workers`,
+/// dropping the `&& will_rebind` conjunct) and this teardown sleeps the
+/// full 500ms again — `last_quiesce_ms` becomes 500 and
+/// `reconcile_quiesce_count` becomes 1, failing both assertions. The
+/// pre-fix code paid this stall on every live-worker config-clear /
+/// shutdown reconcile.
+#[test]
+fn teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers() {
+    let mut coordinator = gre1881_coordinator_with_worker();
+    assert!(
+        !coordinator.workers.handles.is_empty(),
+        "precondition: a live worker handle is seeded (had_live_workers == true)"
+    );
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+    coordinator.reconcile(None, &mut bindings, 64);
+    assert_eq!(
+        coordinator.last_reconcile_stage, "no_snapshot",
+        "None snapshot reaches the no_snapshot early-exit"
+    );
+    assert!(
+        coordinator.workers.handles.is_empty(),
+        "the seeded worker WAS torn down (proves had_live_workers held)"
+    );
+    assert_eq!(
+        coordinator.last_quiesce_ms, 0,
+        "#2522: a teardown with no following rebind must NOT pay the 500ms mlx5 quiesce"
+    );
+    assert_eq!(
+        coordinator.reconcile_quiesce_count, 0,
+        "no quiesce event counted on the no-rebind teardown"
+    );
+}
+
+/// The other side of the gate: live workers AND a snapshot to apply
+/// (`will_rebind == true`) — the rebind on the same queue set follows,
+/// so the mlx5 EBUSY quiesce is load-bearing and MUST still fire. This
+/// is the barrier-preservation half: the fix narrows WHEN the quiesce
+/// runs, it does not remove the barrier from the path that needs it.
+///
+/// Fail-on-revert: if a future change drops the quiesce entirely (or
+/// gates it on `will_rebind` alone, losing the `had_live_workers`
+/// conjunct in a way that skips this case), `last_quiesce_ms` stays 0
+/// and this assertion fails.
+#[test]
+fn teardown_quiesce_fires_when_live_workers_and_snapshot_rebinds() {
+    let mut coordinator = gre1881_coordinator_with_worker();
+    assert!(
+        !coordinator.workers.handles.is_empty(),
+        "precondition: had_live_workers == true"
+    );
+    // All-OK mandatory pins so the map-FD preflight + forwarding build
+    // pass and the reconcile REACHES `tear_down` (and the quiesce). The
+    // post-teardown bringup may not fully bind a real XSK in the unit
+    // env, but the quiesce already ran inside `tear_down` before any of
+    // that — which is exactly the EBUSY-guard placement under test.
+    let mut snap = fail_open_snapshot(1);
+    snap.map_pins.sessions = format!("{TEST_MAP_PIN_OK}sessions");
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+    assert_eq!(
+        coordinator.last_quiesce_ms, 500,
+        "#2522: live workers + a rebinding snapshot MUST still pay the mlx5 EBUSY quiesce"
+    );
+    assert_eq!(
+        coordinator.reconcile_quiesce_count, 1,
+        "exactly one quiesce event counted for the rebinding teardown"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // #1636 option C: proactive neighbor warm tests.
 // ---------------------------------------------------------------------------
 

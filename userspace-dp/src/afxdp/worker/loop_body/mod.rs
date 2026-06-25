@@ -586,6 +586,7 @@ pub(crate) fn worker_loop(
             WorkerCommandResults {
                 cancelled_keys: Vec::new(),
                 exported_sequences: Vec::new(),
+                export_owner_rgs: Vec::new(),
                 shaped_tx_requests: Vec::new(),
                 vacate_all_shared_exact_slots: false,
             }
@@ -593,6 +594,7 @@ pub(crate) fn worker_loop(
         let WorkerCommandResults {
             cancelled_keys,
             exported_sequences,
+            export_owner_rgs,
             shaped_tx_requests,
             vacate_all_shared_exact_slots,
         } = command_results;
@@ -839,49 +841,75 @@ pub(crate) fn worker_loop(
         // during a resync — the complete snapshot ships and the latch is not
         // spuriously re-armed. A genuinely new drop after the resync still
         // re-arms a fresh episode on a later cycle.
-        if sessions.take_delta_loss() {
-            // Emit at most this many open deltas before draining. Comfortably
-            // under MAX_SESSION_DELTAS (4096) so a freshly-emptied ring never
-            // overflows mid-chunk.
-            const RESYNC_EXPORT_CHUNK: usize = 2048;
-            // Flush whatever is queued in the ring to the peer (shared with the
-            // pre-export backlog drain and each chunk's post-emit drain).
-            macro_rules! drain_and_flush_all {
-                () => {
-                    while sessions.has_pending_deltas() {
-                        let deltas = sessions.drain_deltas(256);
-                        purge_queued_flows_for_closed_deltas(
-                            &mut bindings,
-                            &binding_lookup,
-                            &mut shared_recycles,
-                            &deltas,
-                        );
-                        // #2669: flush UNCONDITIONALLY. The binding-independent
-                        // consumers (shared session/conntrack tables, HA peer,
-                        // peer-worker commands, recent-deltas RPC buffer, event
-                        // stream) must receive every drained delta even when no
-                        // binding exists; only the per-binding RPC fallback push
-                        // is gated on a binding. Gating the whole flush would
-                        // drain-then-discard, silently desyncing HA/conntrack.
-                        flush_drained_session_deltas!(&deltas);
+        //
+        // Emit at most this many open deltas before draining. Comfortably
+        // under MAX_SESSION_DELTAS (4096) so a freshly-emptied ring never
+        // overflows mid-chunk. Shared by the #2442 loss-of-sync resync and the
+        // #2653 single-shot `ExportOwnerRGSessions` command path.
+        const RESYNC_EXPORT_CHUNK: usize = 2048;
+        // Flush whatever is queued in the ring to the peer (shared with the
+        // pre-export backlog drain and each chunk's post-emit drain).
+        macro_rules! drain_and_flush_all {
+            () => {
+                while sessions.has_pending_deltas() {
+                    let deltas = sessions.drain_deltas(256);
+                    purge_queued_flows_for_closed_deltas(
+                        &mut bindings,
+                        &binding_lookup,
+                        &mut shared_recycles,
+                        &deltas,
+                    );
+                    // #2669: flush UNCONDITIONALLY. The binding-independent
+                    // consumers (shared session/conntrack tables, HA peer,
+                    // peer-worker commands, recent-deltas RPC buffer, event
+                    // stream) must receive every drained delta even when no
+                    // binding exists; only the per-binding RPC fallback push
+                    // is gated on a binding. Gating the whole flush would
+                    // drain-then-discard, silently desyncing HA/conntrack.
+                    flush_drained_session_deltas!(&deltas);
+                }
+            };
+        }
+        // Chunked drain-as-you-export: collect the owned forward candidates
+        // for `$owner_rgs` once, then emit them in ring-sized chunks, draining
+        // and flushing each chunk to the peer before emitting the next. The
+        // ring is empty before every chunk and a chunk is < cap, so
+        // `push_delta` NEVER overflows during the export — the complete
+        // snapshot ships and the loss latch is not spuriously re-armed. A
+        // worker can own up to DEFAULT_MAX_SESSIONS (131072) forward sessions
+        // — 32x the 4096-slot delta ring — so a naive "emit all N then drain
+        // once" drops sessions 4097..N (the #2653 command-path bug, sibling of
+        // #2442's worker-loop bug).
+        macro_rules! chunked_drain_as_you_export {
+            ($owner_rgs:expr) => {{
+                let owner_rgs = $owner_rgs;
+                if !owner_rgs.is_empty() {
+                    let candidates = crate::afxdp::forward_export_candidates_for_owner_rgs(
+                        &sessions, &owner_rgs,
+                    );
+                    for chunk in candidates.chunks(RESYNC_EXPORT_CHUNK) {
+                        for (key, decision, metadata, origin) in chunk.iter().cloned() {
+                            sessions
+                                .emit_open_delta_with_origin(key, decision, metadata, origin, true);
+                        }
+                        // Ship this chunk and empty the ring before the next
+                        // chunk, so the next batch of emits cannot overflow.
+                        drain_and_flush_all!();
                     }
-                };
-            }
+                }
+            }};
+        }
+        if sessions.take_delta_loss() {
+            // #2442 loss-of-sync resync. If `push_delta` dropped any delta
+            // since the last drain, the in-worker session-delta ring
+            // overflowed and the downstream session-sync consumer missed
+            // HA-relevant open/close events — its view may have silently
+            // diverged from the table truth. Re-emit an open delta for every
+            // owned forward session so the peer re-derives a complete snapshot.
+            //
             // Drain the existing backlog so the ring starts empty.
             drain_and_flush_all!();
-            let owner_rgs = sessions.all_owner_rg_ids();
-            if !owner_rgs.is_empty() {
-                let candidates =
-                    crate::afxdp::forward_export_candidates_for_owner_rgs(&sessions, &owner_rgs);
-                for chunk in candidates.chunks(RESYNC_EXPORT_CHUNK) {
-                    for (key, decision, metadata, origin) in chunk.iter().cloned() {
-                        sessions.emit_open_delta_with_origin(key, decision, metadata, origin, true);
-                    }
-                    // Ship this chunk and empty the ring before the next chunk,
-                    // so the next batch of emits cannot overflow.
-                    drain_and_flush_all!();
-                }
-            }
+            chunked_drain_as_you_export!(sessions.all_owner_rg_ids());
             // The export drained to empty without overflowing, so any latch set
             // during this resync was a genuinely-new local drop, not the export
             // re-flooding itself. Clearing it here is unnecessary (drain-as-you-
@@ -889,17 +917,19 @@ pub(crate) fn worker_loop(
             // spurious re-arm regardless.
         }
         if !exported_sequences.is_empty() {
-            while sessions.has_pending_deltas() {
-                let deltas = sessions.drain_deltas(256);
-                purge_queued_flows_for_closed_deltas(
-                    &mut bindings,
-                    &binding_lookup,
-                    &mut shared_recycles,
-                    &deltas,
-                );
-                // #2669: flush unconditionally — see flush_drained_session_deltas!.
-                flush_drained_session_deltas!(&deltas);
-            }
+            // #2653 single-shot `ExportOwnerRGSessions` command path. The
+            // command handler (`handle_export_owner_rg_sessions`) no longer
+            // emits the open deltas itself — it only records the requested
+            // owner RGs in `export_owner_rgs`. We perform the SAME chunked
+            // drain-as-you-export here (where the binding + flush machinery
+            // lives), so a worker owning more sessions than the 4096-slot ring
+            // ships the COMPLETE bulk snapshot to the HA peer without dropping
+            // sessions 4097..N. Drain any pre-export backlog first so the ring
+            // starts empty, then export, then drain the final chunk's tail.
+            drain_and_flush_all!();
+            chunked_drain_as_you_export!(export_owner_rgs);
+            drain_and_flush_all!();
+            // Ack only after the complete export has drained to the peer.
             if let Some(sequence) = exported_sequences.iter().copied().max() {
                 session_export_ack.store(sequence, Ordering::Release);
             }

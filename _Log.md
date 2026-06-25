@@ -42,6 +42,38 @@
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
   _Log.md
+## 2026-06-25 — #2491: static NAT port / mapped-port forwarding
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added Junos static-NAT per-port forwarding so several
+  services can live behind one public IP. Grammar:
+  `match destination-port <port>` (typed ValueInteger 1..65535) +
+  `then static-nat prefix <ip> mapped-port <port>`. The inbound DNAT
+  rewrites the destination port to mapped-port; the reverse SNAT
+  un-translates the return packet's source port back to the external
+  match port. Go: `StaticNATRule.{MatchDestinationPort,MappedPort}`,
+  compiler parse (both flat-set Keys + hierarchical shapes), strict
+  commit-check range guard + "mapped-port requires match destination-port"
+  guard in `validateNATHostMaskStrict`. Snapshot wire: additive
+  `match_destination_port`/`mapped_port` u16 fields (Go omitempty + Rust
+  serde default, regenerated `protocol_wire_v1.json`). Rust dataplane:
+  `StaticNatTable` keyed by `(IpAddr, Option<u16>)` so a port-mapped rule
+  and a whole-address 1:1 rule coexist on one external IP (port-specific
+  entry wins, port-less is the fallback); `match_dnat_with_counter` /
+  `match_snat_with_counter` thread the packet port. Fail-closed: a
+  mapped-port with no match-port demotes to whole-address; an
+  out-of-range port clamps to 0 on the wire.
+- **File(s)**: pkg/config/types_security.go, pkg/config/compiler_nat.go,
+  pkg/config/schema_security.go, pkg/config/static_nat_mapped_port_2491_test.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/static_nat_mapped_port_2491_test.go,
+  userspace-dp/src/protocol/nat.rs, userspace-dp/src/nat/static_nat.rs,
+  userspace-dp/src/nat/tests.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs,
+  userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/config-schema.md, docs/feature-coverage.md,
+  docs/pr/2491-static-nat-port-fwd/plan.md, _Log.md
 
 ## 2026-06-25 — #2623: GARP/NDP burst follow-up sends now count + surface errors
 
@@ -15566,3 +15598,53 @@ top.
   pkg/grpcapi/sessions_iterator_error_test.go, pkg/cli/cli_show_flow.go,
   pkg/cli/cli_show_nat.go, pkg/cli/sessions_iterator_error_test.go,
   _Log.md
+
+## #2653 — single-shot ExportOwnerRGSessions unbounded delta-ring push
+
+- **Timestamp**: 2026-06-25
+- **Action**: Bound the single-shot `ExportOwnerRGSessions` command path with
+  the same #2442 chunked drain-as-you-export. The command handler
+  (`handle_export_owner_rg_sessions`) no longer emits open deltas inline (it
+  pushed up to DEFAULT_MAX_SESSIONS = 32x the 4096-slot ring in one shot,
+  overflowing it and dropping sessions 4097..N from the HA bulk snapshot).
+  It now records the requested owner RGs in
+  `WorkerCommandResults.export_owner_rgs`; the worker loop performs the chunked
+  export (collect candidates -> emit in 2048 chunks -> drain+flush between) and
+  acks only after the complete export drains. `export_forward_sessions_for_owner_rgs`
+  is now `#[cfg(test)]`-only.
+- **File(s)**: userspace-dp/src/afxdp/session_glue/commands/export_owner_rg_sessions.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  docs/session-sync-architecture.md
+- **Validation**: cargo build --release OK; new fail-on-revert test
+  `export_owner_rg_command_does_not_overflow_ring_unbounded` GREEN on fix,
+  RED-on-revert proven (inline emit -> "must NOT emit deltas inline" panics);
+  session_glue suite 79/79; resync test still green. test-failover pending
+  (PARENT runs before merge — HA path).
+- **Timestamp**: 2026-06-25
+  **Action**: #2522 — gate the 500ms mlx5 zero-copy teardown quiesce on
+  `will_rebind` (a snapshot is being applied), not just `had_live_workers`.
+  A teardown with no following bind (the `no_snapshot` / shutdown path)
+  never rebinds the queues, so the 500ms quiesce was pure dead latency
+  there. `Coordinator::reconcile` now passes `will_rebind =
+  snapshot.is_some()` into `tear_down`; the quiesce fires only when live
+  workers were torn down AND a rebind follows. Added `reconcile_quiesce_count`
+  — an INTERNAL / test counter (bumped on each quiesce), NOT wired to any
+  gRPC / Prometheus / status surface. Under `cfg(test)` the quiesce records
+  its requested duration on the PER-INSTANCE `Coordinator::last_quiesce_ms`
+  field (no process-global — each test reads its own coordinator, safe
+  under parallel `cargo test`) and skips the real sleep so the new tests
+  run fast. Three fail-on-revert tests in coordinator/tests.rs:
+  no-live-workers skip, no-snapshot skip (THE pin — RED on revert:
+  left=500 right=0), and live-workers+snapshot fires (barrier preserved).
+  Proved RED on revert, restored. EBUSY barrier is unchanged on the rebind
+  path. Review fold: M1 (replaced a process-global atomic seam with the
+  per-instance field — removed an introduced parallel-test flake), M2
+  (corrected counter wording to internal/test, not "observability").
+  Provenance: codex review-037 finding 037-03.
+  **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/teardown.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md

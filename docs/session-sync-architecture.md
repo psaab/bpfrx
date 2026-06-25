@@ -352,9 +352,26 @@ would climb without bound). The resync therefore **interleaves the drain**:
 Because the ring is empty before every chunk and a chunk is smaller than the
 cap, `push_delta` never overflows during a resync. The complete snapshot ships
 in chunks regardless of session count, and the loss latch is not spuriously
-re-armed by the export itself. (The single-shot `ExportOwnerRGSessions` command
-path keeps pushing the whole candidate set at once — its caller drains against a
-15 s export-ack budget — so only the worker-loop resync needs the chunked path.)
+re-armed by the export itself.
+
+**The single-shot `ExportOwnerRGSessions` command path uses the same chunked
+drain-as-you-export (#2653).** Pre-#2653 the command handler
+(`handle_export_owner_rg_sessions`) called `export_forward_sessions_for_owner_rgs`
+inline, pushing the whole owned-session set into the ring in one shot on the
+theory that the caller's 15 s export-ack drain would mop it up. But the overflow
+happens *inside* the emit, before any drain runs: with >4096 owned sessions the
+ring overflowed at delta 4097 and silently dropped sessions 4097..N, so the HA
+peer received an INCOMPLETE bulk snapshot on rejoin / RG transition (the
+command-path sibling of the #2442 worker-loop overflow). Since
+`apply_worker_commands` has no `BindingWorker`/flush access (it cannot drain the
+ring to the peer mid-export), the handler now only **records** the requested
+owner RGs in `WorkerCommandResults.export_owner_rgs`; the worker loop — which
+owns the binding + flush machinery — performs the identical chunked
+drain-as-you-export (collect candidates → emit in `RESYNC_EXPORT_CHUNK = 2048`
+chunks → drain+flush between chunks) and only advances `session_export_ack` once
+the complete export has drained to the peer. The unbounded
+`export_forward_sessions_for_owner_rgs` helper is now `#[cfg(test)]`-only (a
+candidate-selection fixture); both production paths are bounded.
 
 **Debounce / composition with the sync state machine.** The signal is a single
 bool cleared on read, so a burst that drops N deltas before the worker reads it

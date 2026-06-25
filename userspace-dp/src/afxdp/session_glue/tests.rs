@@ -2120,6 +2120,136 @@ fn epoch_based_flow_cache_unrelated_rg_not_invalidated() {
     );
 }
 
+/// #2653: the single-shot `ExportOwnerRGSessions` command path must NOT push
+/// the entire owned-session set into the 4096-slot delta ring in one shot. A
+/// worker can own up to DEFAULT_MAX_SESSIONS (131072) = 32x the ring; the old
+/// `handle_export_owner_rg_sessions` called `export_forward_sessions_for_owner_rgs`
+/// inline, which emitted all N open deltas with no interleaved drain, overflowed
+/// the ring at delta 4097, and silently dropped sessions 4097..N from the HA
+/// bulk snapshot on rejoin / RG transition (the command-path sibling of the
+/// #2442 worker-loop overflow).
+///
+/// The fix makes the command handler RECORD the owner RGs (`export_owner_rgs`)
+/// instead of emitting; the worker loop performs the chunked drain-as-you-export.
+/// This test installs > ring-cap owned forward sessions, dispatches the command
+/// through `apply_worker_commands`, and asserts:
+///   (a) the command records the owner RG;
+///   (b) `apply_worker_commands` emits NOTHING inline and does NOT overflow the
+///       ring (delta_drops unchanged, no loss latch) — the bound is respected;
+///   (c) driving the recorded RGs through the chunked drain-as-you-export ships
+///       the COMPLETE snapshot (all N) with zero new drops.
+///
+/// FAIL-ON-REVERT: restoring the inline `export_forward_sessions_for_owner_rgs`
+/// call in `handle_export_owner_rg_sessions` overflows the ring INSIDE
+/// `apply_worker_commands` — (b) reds (delta_drops jumps by ~N-4096, the loss
+/// latch arms, and only 4096 deltas reach the inline drain).
+#[test]
+fn export_owner_rg_command_does_not_overflow_ring_unbounded() {
+    // Ring cap is MAX_SESSION_DELTAS (4096, private to session/mod.rs).
+    const RING_CAP: usize = 4096;
+    const RESYNC_EXPORT_CHUNK: usize = 2048; // mirror the worker loop
+    let n: usize = RING_CAP + 1000; // 5096 > cap to exercise the overflow hole
+
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    let mut sessions = SessionTable::new();
+    let mut keys: Vec<SessionKey> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut key = test_key();
+        // Unique forward keys (owner RG 1 from test_metadata): sweep src ip+port.
+        key.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 61, (i / 256) as u8));
+        key.src_port = ((i % 256) as u16) + 1000;
+        assert!(sessions.install_with_protocol(
+            key.clone(),
+            test_decision(),
+            test_metadata(),
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        keys.push(key);
+    }
+    // The installs themselves overflowed the ring (n > cap) and latched loss;
+    // clear that pre-existing state so the assertions below measure ONLY what
+    // the export command does.
+    assert!(sessions.delta_drops() > 0, "installing > cap deltas overflows");
+    let _ = sessions.take_delta_loss();
+    while !sessions.drain_deltas(256).is_empty() {}
+    let drops_before_export = sessions.delta_drops();
+    assert!(!sessions.take_delta_loss(), "loss latch cleared before export");
+
+    commands
+        .lock()
+        .expect("commands lock")
+        .push_back(WorkerCommand::ExportOwnerRGSessions {
+            sequence: 42,
+            owner_rgs: vec![1],
+        });
+    let forwarding = test_forwarding_state_with_fabric();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let mut ha_state = BTreeMap::new();
+    ha_state.insert(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000));
+    let results = apply_worker_commands(
+        &commands,
+        &mut sessions,
+        -1,
+        -1,
+        -1,
+        &forwarding,
+        &ha_state,
+        &dynamic_neighbors,
+    );
+
+    // (a) the command recorded the owner RG and sequence.
+    assert_eq!(results.exported_sequences, vec![42]);
+    assert_eq!(results.export_owner_rgs, vec![1]);
+
+    // (b) THE BOUND: apply_worker_commands must NOT push unbounded into the
+    // ring. It emits nothing inline and never overflows. The reverted inline
+    // export would have emitted all N here, overflowing the ring.
+    assert!(
+        !sessions.has_pending_deltas(),
+        "export command must NOT emit deltas inline (#2653) — the worker loop \
+         performs the chunked drain-as-you-export"
+    );
+    assert_eq!(
+        sessions.delta_drops(),
+        drops_before_export,
+        "export command must NOT overflow the ring (the #2653 unbounded bug)"
+    );
+    assert!(
+        !sessions.take_delta_loss(),
+        "export command must NOT latch a delta loss (no mid-export overflow)"
+    );
+
+    // (c) driving the recorded RGs through the chunked drain-as-you-export the
+    // worker loop runs ships the COMPLETE snapshot with zero new drops.
+    let owner_rgs = results.export_owner_rgs.clone();
+    let candidates = crate::afxdp::forward_export_candidates_for_owner_rgs(&sessions, &owner_rgs);
+    let mut exported = 0usize;
+    for chunk in candidates.chunks(RESYNC_EXPORT_CHUNK) {
+        for (key, decision, metadata, origin) in chunk.iter().cloned() {
+            sessions.emit_open_delta_with_origin(key, decision, metadata, origin, true);
+        }
+        loop {
+            let d = sessions.drain_deltas(256);
+            if d.is_empty() {
+                break;
+            }
+            exported += d.iter().filter(|x| x.kind == SessionDeltaKind::Open).count();
+        }
+    }
+    assert_eq!(
+        exported, n,
+        "chunked export ships the COMPLETE snapshot ({n}), not the ring cap"
+    );
+    assert_eq!(
+        sessions.delta_drops(),
+        drops_before_export,
+        "the chunked export drops nothing (drain-as-you-export never overflows)"
+    );
+    assert!(!sessions.take_delta_loss(), "no spurious re-arm after export");
+}
+
 #[test]
 fn apply_worker_commands_exports_owner_rg_forward_sessions_without_teardown() {
     let commands = Arc::new(Mutex::new(VecDeque::new()));
@@ -2169,6 +2299,13 @@ fn apply_worker_commands_exports_owner_rg_forward_sessions_without_teardown() {
 
     assert!(results.cancelled_keys.is_empty());
     assert_eq!(results.exported_sequences, vec![9]);
+    // #2653: the command handler records the owner RGs instead of emitting the
+    // deltas inline (the worker loop performs the chunked drain-as-you-export).
+    assert_eq!(results.export_owner_rgs, vec![1]);
+    assert!(
+        sessions.drain_deltas(16).is_empty(),
+        "apply_worker_commands no longer emits export deltas inline (#2653)"
+    );
     let hit = sessions
         .lookup(&key, 2_000_000, 0x10)
         .expect("exported forward hit");
@@ -2177,6 +2314,9 @@ fn apply_worker_commands_exports_owner_rg_forward_sessions_without_teardown() {
         hit.decision.resolution.disposition,
         ForwardingDisposition::ForwardCandidate
     );
+    // Drive the recorded RGs through the same candidate walk the worker loop
+    // chunked export uses: the forward session must republish as an Open delta.
+    export_forward_sessions_for_owner_rgs(&mut sessions, &results.export_owner_rgs);
     let deltas = sessions.drain_deltas(16);
     assert_eq!(deltas.len(), 1, "export should republish forward session");
     assert_eq!(deltas[0].kind, SessionDeltaKind::Open);
@@ -2229,6 +2369,10 @@ fn apply_worker_commands_does_not_export_missing_neighbor_seed_sessions() {
 
     assert!(results.cancelled_keys.is_empty());
     assert_eq!(results.exported_sequences, vec![10]);
+    assert_eq!(results.export_owner_rgs, vec![1]);
+    // Even when the worker loop drives the recorded RGs through the chunked
+    // export, a missing-neighbor seed session must NOT be republished.
+    export_forward_sessions_for_owner_rgs(&mut sessions, &results.export_owner_rgs);
     assert!(
         sessions.drain_deltas(16).is_empty(),
         "missing-neighbor seed sessions must not be exported as HA deltas"
@@ -3057,6 +3201,10 @@ fn export_owner_rg_sessions_skips_locally_demoted_entries() {
     );
 
     assert_eq!(results.exported_sequences, vec![11]);
+    assert_eq!(results.export_owner_rgs, vec![1]);
+    // Driving the recorded RGs through the chunked-export candidate walk must
+    // still emit nothing: the session was demoted out of owner RG 1's index.
+    export_forward_sessions_for_owner_rgs(&mut sessions, &results.export_owner_rgs);
     assert!(
         sessions.drain_deltas(16).is_empty(),
         "demoted local owner sessions must not be re-exported as fresh HA deltas"
@@ -3966,6 +4114,8 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
 
     // ── (a) Exports preserved ───────────────────────────────────────────────
     assert_eq!(results.exported_sequences, vec![7u64]);
+    // #2653: the export owner RG is recorded for the worker-loop chunked export.
+    assert_eq!(results.export_owner_rgs, vec![5i32]);
 
     // ── (b) ShapedLocal pushed exactly once ────────────────────────────────
     assert_eq!(results.shaped_tx_requests.len(), 1);
