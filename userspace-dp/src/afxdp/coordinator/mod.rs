@@ -706,23 +706,30 @@ impl Coordinator {
         // endpoints are also explicitly out of warm scope per the plan
         // (AGY plan r1 #3); their underlay next-hops, if relevant, appear
         // as ordinary (tunnel_endpoint_id == 0) routes.
+        // #2389: warm EVERY equal-cost next-hop's neighbor (not just the
+        // first), so a multipath route's alternate paths are pre-resolved
+        // and selectable on the hot path.
         for routes in snapshot.routes_v4.values() {
             for route in routes {
-                if route.tunnel_endpoint_id != 0 {
-                    continue;
-                }
-                if let Some(hop) = route.next_hop {
-                    enqueue(route.ifindex, IpAddr::V4(hop));
+                for nh in &route.next_hops {
+                    if nh.tunnel_endpoint_id != 0 {
+                        continue;
+                    }
+                    if let Some(hop) = nh.next_hop {
+                        enqueue(nh.ifindex, IpAddr::V4(hop));
+                    }
                 }
             }
         }
         for routes in snapshot.routes_v6.values() {
             for route in routes {
-                if route.tunnel_endpoint_id != 0 {
-                    continue;
-                }
-                if let Some(hop) = route.next_hop {
-                    enqueue(route.ifindex, IpAddr::V6(hop));
+                for nh in &route.next_hops {
+                    if nh.tunnel_endpoint_id != 0 {
+                        continue;
+                    }
+                    if let Some(hop) = nh.next_hop {
+                        enqueue(nh.ifindex, IpAddr::V6(hop));
+                    }
                 }
             }
         }

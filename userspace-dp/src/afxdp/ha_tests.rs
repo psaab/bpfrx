@@ -165,6 +165,7 @@ fn test_forwarding_state_with_fabric() -> ForwardingState {
         prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(10, 0, 61, 0), 24).unwrap()),
         ifindex: 6,
         tunnel_endpoint_id: 0,
+        table: "inet.0".to_string(),
     });
     forwarding.neighbors.insert(
         (6, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),

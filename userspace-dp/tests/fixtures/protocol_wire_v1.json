@@ -632,6 +632,7 @@
     "parent_ifindex": 0,
     "parent_linux_name": "",
     "redundancy_group": 0,
+    "routing_instance": "",
     "rx_queues": 0,
     "tunnel": false,
     "unit_count": 0,
@@ -884,6 +885,7 @@
     "family": "",
     "next_hops": [],
     "next_table": "",
+    "preference": 0,
     "table": ""
   },
   "screen_profile_snapshot": {

@@ -136,6 +136,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 		return nil
 	}
 	zoneByInterface := buildInterfaceZoneMap(cfg)
+	ifaceRoutingInstance := buildInterfaceRoutingInstances(cfg)
 	usedSyntheticIfindexes := make(map[int]struct{})
 	// Build RETH RG lookup: physical member → RETH's RedundancyGroup.
 	// Physical members have RedundantParent set but RedundancyGroup=0;
@@ -171,6 +172,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 		out = append(out, InterfaceSnapshot{
 			Name:            name,
 			Zone:            zoneByInterface[name],
+			RoutingInstance: ifaceRoutingInstance[name],
 			LinuxName:       linuxName,
 			ParentLinuxName: "",
 			Ifindex:         ifindex,
@@ -233,6 +235,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			out = append(out, InterfaceSnapshot{
 				Name:                      unitName,
 				Zone:                      zoneByInterface[unitName],
+				RoutingInstance:           ifaceRoutingInstance[unitName],
 				LinuxName:                 linuxUnit,
 				ParentLinuxName:           parentLinux,
 				Ifindex:                   ifindex,

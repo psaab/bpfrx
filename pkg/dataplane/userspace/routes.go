@@ -42,6 +42,7 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 				Destination: route.Destination,
 				Discard:     route.Discard,
 				NextTable:   route.NextTable,
+				Preference:  route.Preference,
 			}
 			for _, nh := range route.NextHops {
 				switch {
@@ -234,6 +235,33 @@ func buildInterfaceRouteTables(cfg *config.Config) (map[string]string, map[strin
 		}
 	}
 	return v4, v6
+}
+
+// buildInterfaceRoutingInstances maps each interface (config name, e.g.
+// "ge-0-0-1.80") to the routing-instance it belongs to. The default
+// instance is the empty string. This mirrors buildInterfaceRouteTables'
+// membership lookup, but carries the bare instance NAME so the Rust
+// dataplane can scope its rebuilt-from-interface connected routes to the
+// owning routing table (#2388): without it, the Rust connected store is
+// global and a per-table (VRF / next-table) FIB lookup can match a
+// connected prefix owned by a different routing-instance.
+func buildInterfaceRoutingInstances(cfg *config.Config) map[string]string {
+	out := make(map[string]string)
+	if cfg == nil {
+		return out
+	}
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil || ri.Name == "" {
+			continue
+		}
+		for _, ifname := range ri.Interfaces {
+			if ifname == "" {
+				continue
+			}
+			out[ifname] = ri.Name
+		}
+	}
+	return out
 }
 
 func connectedPrefixesForInterface(iface InterfaceSnapshot) ([]string, []string) {

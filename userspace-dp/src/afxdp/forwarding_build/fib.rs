@@ -13,7 +13,7 @@
 //!   [`IfaceIndex`] and the populated `state.neighbors` map.
 //!
 //! Also hosts the route-target resolution helpers
-//! ([`resolve_route_target_v4`] etc.) re-exported by
+//! ([`resolve_route_next_hops_v4`] etc.) re-exported by
 //! `forwarding_build/mod.rs` as `pub(in crate::afxdp)` for the
 //! other afxdp siblings that consume them via `use
 //! self::forwarding_build::*;` in `afxdp/mod.rs`.
@@ -41,7 +41,7 @@ pub(super) fn populate_routes(
 ) {
     for route in &snapshot.routes {
         if let Ok(prefix) = route.destination.parse::<Ipv4Net>() {
-            let (next_hop, ifindex, tunnel_endpoint_id) = resolve_route_target_v4(
+            let next_hops = resolve_route_next_hops_v4(
                 route,
                 &iface_ctx.name_to_ifindex,
                 &iface_ctx.linux_to_ifindex,
@@ -54,16 +54,15 @@ pub(super) fn populate_routes(
                 .or_default()
                 .push(RouteEntryV4 {
                     prefix: PrefixV4::from_net(prefix),
-                    ifindex,
-                    tunnel_endpoint_id,
-                    next_hop,
+                    next_hops,
                     discard: route.discard,
                     next_table: route.next_table.clone(),
+                    preference: route.preference,
                 });
             continue;
         }
         if let Ok(prefix) = route.destination.parse::<Ipv6Net>() {
-            let (next_hop, ifindex, tunnel_endpoint_id) = resolve_route_target_v6(
+            let next_hops = resolve_route_next_hops_v6(
                 route,
                 &iface_ctx.name_to_ifindex,
                 &iface_ctx.linux_to_ifindex,
@@ -76,22 +75,37 @@ pub(super) fn populate_routes(
                 .or_default()
                 .push(RouteEntryV6 {
                     prefix: PrefixV6::from_net(prefix),
-                    ifindex,
-                    tunnel_endpoint_id,
-                    next_hop,
+                    next_hops,
                     discard: route.discard,
                     next_table: route.next_table.clone(),
+                    preference: route.preference,
                 });
         }
     }
 }
 
 pub(super) fn sort_routes(state: &mut ForwardingState) {
+    // #2390: order each table by descending prefix length (longest-match
+    // first), then ASCENDING preference (lower = more preferred per Junos),
+    // so `routes.iter().find(prefix.contains)` returns the most-specific
+    // and, among same-prefix routes, the operator-preferred one — NOT the
+    // insertion-order first. `sort_by` is stable, so same-prefix /
+    // same-preference routes keep their relative (insertion) order.
     for routes in state.routes_v4.values_mut() {
-        routes.sort_by(|a, b| b.prefix.prefix_len().cmp(&a.prefix.prefix_len()));
+        routes.sort_by(|a, b| {
+            b.prefix
+                .prefix_len()
+                .cmp(&a.prefix.prefix_len())
+                .then(a.preference.cmp(&b.preference))
+        });
     }
     for routes in state.routes_v6.values_mut() {
-        routes.sort_by(|a, b| b.prefix.prefix_len().cmp(&a.prefix.prefix_len()));
+        routes.sort_by(|a, b| {
+            b.prefix
+                .prefix_len()
+                .cmp(&a.prefix.prefix_len())
+                .then(a.preference.cmp(&b.preference))
+        });
     }
 }
 
@@ -149,58 +163,83 @@ pub(super) fn populate_fabrics(
     }
 }
 
-pub(in crate::afxdp) fn resolve_route_target_v4(
+/// #2389: resolve EVERY configured next-hop of a static route into a
+/// `RouteNextHopV4` candidate. A discard / next-table route has no
+/// forwarding next-hop (returns empty). Each candidate resolves its egress
+/// ifindex from an explicit `@interface` spec, else by inferring the
+/// connected interface that contains the gateway IP — scoped to the
+/// route's own table (#2388) so a gateway is never resolved against
+/// another routing-instance's connected prefix. Candidates whose interface
+/// fails to resolve are still retained with ifindex 0 (matching the
+/// pre-#2389 single-next-hop fallback, which kept next_hop with ifindex 0).
+pub(in crate::afxdp) fn resolve_route_next_hops_v4(
     route: &RouteSnapshot,
     names: &BTreeMap<String, i32>,
     linux_names: &BTreeMap<String, i32>,
     state: &ForwardingState,
-) -> (Option<Ipv4Addr>, i32, u16) {
+) -> Vec<RouteNextHopV4> {
     if route.discard || !route.next_table.is_empty() {
-        return (None, 0, 0);
+        return Vec::new();
     }
-    let Some((next_hop, interface)) = route
+    route
         .next_hops
-        .first()
-        .map(|nh| parse_route_next_hop(nh.as_str()))
-    else {
-        return (None, 0, 0);
-    };
-    let target = interface
-        .as_deref()
-        .and_then(|name| resolve_ifindex(name, names, linux_names))
-        .map(|ifindex| {
-            (
+        .iter()
+        .map(|nh| {
+            let (next_hop, interface) = parse_route_next_hop(nh.as_str());
+            let (ifindex, tunnel_endpoint_id) = resolve_next_hop_target_v4(
+                next_hop,
+                interface.as_deref(),
+                names,
+                linux_names,
+                state,
+            );
+            RouteNextHopV4 {
+                next_hop,
                 ifindex,
-                state
-                    .tunnel_endpoint_by_ifindex
-                    .get(&ifindex)
-                    .copied()
-                    .unwrap_or(0),
-            )
+                tunnel_endpoint_id,
+            }
         })
-        .or_else(|| next_hop.and_then(|ip| infer_connected_route_target_v4(state, ip)));
-    let (ifindex, tunnel_endpoint_id) = target.unwrap_or((0, 0));
-    (next_hop, ifindex, tunnel_endpoint_id)
+        .collect()
 }
 
-pub(in crate::afxdp) fn resolve_route_target_v6(
+pub(in crate::afxdp) fn resolve_route_next_hops_v6(
     route: &RouteSnapshot,
     names: &BTreeMap<String, i32>,
     linux_names: &BTreeMap<String, i32>,
     state: &ForwardingState,
-) -> (Option<Ipv6Addr>, i32, u16) {
+) -> Vec<RouteNextHopV6> {
     if route.discard || !route.next_table.is_empty() {
-        return (None, 0, 0);
+        return Vec::new();
     }
-    let Some((next_hop, interface)) = route
+    route
         .next_hops
-        .first()
-        .map(|nh| parse_route_next_hop_v6(nh.as_str()))
-    else {
-        return (None, 0, 0);
-    };
-    let target = interface
-        .as_deref()
+        .iter()
+        .map(|nh| {
+            let (next_hop, interface) = parse_route_next_hop_v6(nh.as_str());
+            let (ifindex, tunnel_endpoint_id) = resolve_next_hop_target_v6(
+                next_hop,
+                interface.as_deref(),
+                names,
+                linux_names,
+                state,
+            );
+            RouteNextHopV6 {
+                next_hop,
+                ifindex,
+                tunnel_endpoint_id,
+            }
+        })
+        .collect()
+}
+
+fn resolve_next_hop_target_v4(
+    next_hop: Option<Ipv4Addr>,
+    interface: Option<&str>,
+    names: &BTreeMap<String, i32>,
+    linux_names: &BTreeMap<String, i32>,
+    state: &ForwardingState,
+) -> (i32, u16) {
+    interface
         .and_then(|name| resolve_ifindex(name, names, linux_names))
         .map(|ifindex| {
             (
@@ -212,9 +251,31 @@ pub(in crate::afxdp) fn resolve_route_target_v6(
                     .unwrap_or(0),
             )
         })
-        .or_else(|| next_hop.and_then(|ip| infer_connected_route_target_v6(state, ip)));
-    let (ifindex, tunnel_endpoint_id) = target.unwrap_or((0, 0));
-    (next_hop, ifindex, tunnel_endpoint_id)
+        .or_else(|| next_hop.and_then(|ip| infer_connected_route_target_v4(state, ip)))
+        .unwrap_or((0, 0))
+}
+
+fn resolve_next_hop_target_v6(
+    next_hop: Option<Ipv6Addr>,
+    interface: Option<&str>,
+    names: &BTreeMap<String, i32>,
+    linux_names: &BTreeMap<String, i32>,
+    state: &ForwardingState,
+) -> (i32, u16) {
+    interface
+        .and_then(|name| resolve_ifindex(name, names, linux_names))
+        .map(|ifindex| {
+            (
+                ifindex,
+                state
+                    .tunnel_endpoint_by_ifindex
+                    .get(&ifindex)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        })
+        .or_else(|| next_hop.and_then(|ip| infer_connected_route_target_v6(state, ip)))
+        .unwrap_or((0, 0))
 }
 
 pub(in crate::afxdp) fn parse_route_next_hop(spec: &str) -> (Option<Ipv4Addr>, Option<String>) {
@@ -270,6 +331,13 @@ pub(in crate::afxdp) fn infer_connected_route_target_v4(
     state: &ForwardingState,
     ip: Ipv4Addr,
 ) -> Option<(i32, u16)> {
+    // Gateway -> egress-interface inference at FIB-build time: "which
+    // interface can reach this next-hop gateway IP". This is a global
+    // connected-prefix match and is intentionally NOT table-scoped — a
+    // route's configured gateway resolves to whatever connected interface
+    // contains it. The #2388 cross-VRF leak is a LOOKUP-time concern
+    // (which connected prefix a destination egresses on) and is fixed at
+    // the lookup site by filtering connected_v4 on the resolving table.
     state
         .connected_v4
         .iter()

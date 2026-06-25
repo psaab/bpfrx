@@ -794,6 +794,7 @@ mod wg_frame_tests {
             next_hops: vec!["2001:559:8585:80::1@reth0.80".to_string()],
             discard: false,
             next_table: String::new(),
+            preference: 0,
         });
         // The WG endpoint's transport table follows the v6 outer family.
         snap.tunnel_endpoints[0].outer_family = "inet6".to_string();

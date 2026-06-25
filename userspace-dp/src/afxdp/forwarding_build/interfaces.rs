@@ -96,6 +96,14 @@ pub(super) fn populate_interfaces(
             .get(&iface.ifindex)
             .copied()
             .unwrap_or(0);
+        // #2388: canonical connected-route table names for this interface's
+        // routing-instance. "" (default instance) → inet.0 / inet6.0; a
+        // named instance → "<ri>.inet.0" / "<ri>.inet6.0". The lookup
+        // filters connected routes by the canonical table it is resolving
+        // in, so a per-VRF / next-table lookup never matches a connected
+        // prefix owned by a different routing-instance.
+        let (connected_table_v4, connected_table_v6) =
+            connected_route_tables(&iface.routing_instance);
         for addr in &iface.addresses {
             // #2409: fail CLOSED on an unparseable interface address rather
             // than silently `continue`-ing past it. The pre-fix skip lost the
@@ -121,6 +129,7 @@ pub(super) fn populate_interfaces(
                         prefix: PrefixV4::from_net(v4),
                         ifindex: iface.ifindex,
                         tunnel_endpoint_id,
+                        table: connected_table_v4.clone(),
                     });
                 }
                 IpNet::V6(v6) => {
@@ -133,6 +142,7 @@ pub(super) fn populate_interfaces(
                         prefix: PrefixV6::from_net(v6),
                         ifindex: iface.ifindex,
                         tunnel_endpoint_id,
+                        table: connected_table_v6.clone(),
                     });
                 }
             }
@@ -223,6 +233,23 @@ pub(super) fn populate_egress(
         );
     }
     Ok(())
+}
+
+/// #2388: canonical (v4, v6) connected-route table names for a routing
+/// instance. The empty instance name is the default instance
+/// (inet.0 / inet6.0); a named instance maps to "<ri>.inet.0" /
+/// "<ri>.inet6.0". These match the names the lookup canonicalizes the
+/// queried table to (`canonical_route_table`), so a connected entry is
+/// only matched when the lookup is resolving in the owning table.
+pub(in crate::afxdp) fn connected_route_tables(routing_instance: &str) -> (String, String) {
+    if routing_instance.is_empty() {
+        ("inet.0".to_string(), "inet6.0".to_string())
+    } else {
+        (
+            format!("{routing_instance}.inet.0"),
+            format!("{routing_instance}.inet6.0"),
+        )
+    }
 }
 
 pub(in crate::afxdp) fn pick_interface_v4(iface: &InterfaceSnapshot) -> Option<Ipv4Addr> {
