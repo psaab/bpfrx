@@ -164,19 +164,30 @@ The io_uring state-persistence thread (`src/state_writer.rs`) writes each
 state snapshot via write-temp-then-rename with a full durability contract
 (`finalize_durably`): fsync the temp file, atomic `rename` onto the
 destination, then fsync the parent directory so the rename survives power
-loss. Each write uses a **private** temp path `<dest>.<pid>.<seq>.tmp`
-created `O_EXCL`, so two concurrent writers — including a replacement
-helper racing the old one during a restart/upgrade handover — can never
-open/truncate/write the SAME temp and publish crossed bytes (#2705).
+loss. Each write uses a **private** temp path
+`<dest>.<pid>_<starttime>.<seq>.tmp` created `O_EXCL`, so two concurrent
+writers — including a replacement helper racing the old one during a
+restart/upgrade handover — can never open/truncate/write the SAME temp
+and publish crossed bytes (#2705). The `<pid>_<starttime>` component is
+the writer's *process-instance* identity (pid + process start time from
+`/proc/<pid>/stat` field 22).
 
 Because the temp is unique per write, a crash between create and rename
 leaks one orphan temp. To bound that (#2714), the writer runs a
 best-effort **orphan sweep once per distinct destination** at the first
-write to it: it removes only siblings matching `<dest>.<pid>.<seq>.tmp`
-whose embedded pid is no longer a live process (`/proc/<pid>`), so a
-concurrent live writer's in-flight temp is never deleted (preserving the
-#2705 guarantee). The sweep is fail-safe — any error is swallowed so a
-sweep failure can never break the subsequent write.
+write to it: it removes only siblings matching
+`<dest>.<pid>_<starttime>.<seq>.tmp` whose embedded writer *instance* is
+no longer live. Liveness is keyed on the **pid AND its process start
+time**, not the bare pid (#2957): pids are recycled after a crash, so a
+bare-pid `/proc/<pid>` check would preserve a dead writer's orphan
+forever once Linux reassigns that pid to an unrelated process, pinning
+crash debris indefinitely. The sweep instead reads the candidate pid's
+current start time and preserves the temp only when both the pid exists
+and its start time matches the embedded one — so a reused pid (different
+start time) is correctly swept while a genuinely-live writer's in-flight
+temp is never deleted (preserving the #2705 guarantee). The sweep is
+fail-safe — any error is swallowed so a sweep failure can never break the
+subsequent write.
 
 #### Reconcile Ordering Invariant (#2440 / #2444 / #2484)
 

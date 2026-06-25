@@ -23,6 +23,22 @@ hash-symmetry invariants to maintain. **WEIGHTED** per-flow load-share
 its own issue with its own value case — it is not a multi-WAN failover
 deliverable.
 
+**#2922 — single liveness snapshot in `select_route_next_hop`.** The
+equal-cost member picker (`select_route_next_hop`,
+`userspace-dp/src/afxdp/forwarding/mod.rs`) now evaluates the liveness
+predicate exactly ONCE per candidate. The predicate probes the shared
+dynamic-neighbor map, which the neighbor-monitor thread mutates
+concurrently, so it is not pure. The old two-pass form (`count()` the live
+members, then `nth()` to select) ran the predicate twice and a neighbor
+removed between the passes made the count see `live > 0` while the select
+pass yielded `None` → a spurious no-route despite a live member existing at
+count time, plus doubled hot-path neighbor probes. The picker now collects
+the live candidate references into a stack `SmallVec` in one pass and
+indexes into that materialized snapshot, so count and selection always
+agree. Selection semantics are unchanged: `ip_hash % live_count` over the
+live set in candidate order (flow-pinned), with the hashed full-vector
+fallback when no member is live.
+
 xpf models multi-WAN the way real SRX does — as the composition of
 existing subsystems, not an invented `services multi-wan` tree:
 

@@ -237,6 +237,7 @@ fn queue_planner_filters_non_data_interfaces() {
             InterfaceSnapshot {
                 name: "ge-0/0/1".to_string(),
                 linux_name: "ge-0-0-1".to_string(),
+                zone: "trust".to_string(),
                 ifindex: 11,
                 rx_queues: 1,
                 ..Default::default()
@@ -244,6 +245,7 @@ fn queue_planner_filters_non_data_interfaces() {
             InterfaceSnapshot {
                 name: "xe-0/0/0".to_string(),
                 linux_name: "xe-0-0-0".to_string(),
+                zone: "untrust".to_string(),
                 ifindex: 12,
                 rx_queues: 1,
                 ..Default::default()
@@ -268,6 +270,131 @@ fn queue_planner_filters_non_data_interfaces() {
     assert!(bindings.iter().all(|b| b.registered));
 }
 
+// #2915 fail-on-revert: the plan-key hash and the queue planner MUST agree
+// on the binding interface set. Both must route through
+// `include_userspace_binding_interface` (the Rust mirror of the Go
+// authoritative allowlist), not the pre-#2915 prefix-only test. This test
+// pins three properties; any one of them goes RED if `replan_queues` reverts
+// to the divergent `ge-*`/`xe-*`/`et-*` prefix predicate:
+//
+//   1. A `ge-*` netdev in a mgmt/control zone is EXCLUDED by both the hash
+//      and the planner (the prefix-only predicate would plan it).
+//   2. Mutating a non-candidate (mgmt-zone) interface does NOT bump the
+//      plan key — change detection is scoped to the planned set.
+//   3. Mutating a candidate (zoned data) interface DOES bump the plan key
+//      AND that interface IS planned.
+#[test]
+fn queue_planner_and_plan_key_agree_on_binding_set() {
+    use crate::server::helpers::snapshot_binding_plan_key;
+
+    // A genuine data interface plus a `ge-*`-named interface that lives in a
+    // management zone (e.g. an out-of-band port the operator zoned `mgmt`).
+    let mk = |mgmt_ifindex: i32, data_rx: usize| ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0/0/9".to_string(),
+                linux_name: "ge-0-0-9".to_string(),
+                zone: "mgmt".to_string(),
+                ifindex: mgmt_ifindex,
+                rx_queues: 1,
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0/0/1".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                zone: "trust".to_string(),
+                ifindex: 11,
+                rx_queues: data_rx,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let base = mk(99, 1);
+
+    // Property 1: the mgmt-zone `ge-*` is NOT planned; only the data iface is.
+    let bindings = replan_queues(Some(&base), 1, &[]);
+    assert!(
+        bindings.iter().all(|b| b.interface == "ge-0-0-1"),
+        "mgmt-zone ge-* must be excluded from the plan, got: {:?}",
+        bindings.iter().map(|b| &b.interface).collect::<Vec<_>>()
+    );
+    assert_eq!(bindings.len(), 1, "only the data interface should be planned");
+
+    // Property 2: mutating the non-candidate (mgmt) interface must NOT bump
+    // the plan key — it is outside the planned set, so it is outside the hash.
+    let mgmt_changed = mk(123, 1);
+    assert_eq!(
+        snapshot_binding_plan_key(&base),
+        snapshot_binding_plan_key(&mgmt_changed),
+        "a change to a non-candidate (mgmt-zone) interface must not bump the \
+         plan key — the hash and planner must share the exclusion contract"
+    );
+    // ...and the planned set is identical regardless of the mgmt change.
+    let bindings_changed = replan_queues(Some(&mgmt_changed), 1, &[]);
+    assert_eq!(
+        bindings.iter().map(|b| b.interface.clone()).collect::<Vec<_>>(),
+        bindings_changed
+            .iter()
+            .map(|b| b.interface.clone())
+            .collect::<Vec<_>>(),
+        "mgmt-zone change must not alter the planned interface set"
+    );
+
+    // Property 3: mutating the candidate (data) interface DOES bump the key.
+    let data_changed = mk(99, 4);
+    assert_ne!(
+        snapshot_binding_plan_key(&base),
+        snapshot_binding_plan_key(&data_changed),
+        "a change to a candidate (zoned data) interface must bump the plan key"
+    );
+}
+
+#[test]
+fn queue_planner_excludes_tunnel_and_local_fabric_ge_interfaces() {
+    // #2915: `ge-*`-named interfaces in tunnel or local-fabric contexts are
+    // excluded by `include_userspace_binding_interface` (and the Go
+    // allowlist). The prefix-only predicate would have planned them.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0/0/5".to_string(),
+                linux_name: "ge-0-0-5".to_string(),
+                zone: "trust".to_string(),
+                ifindex: 30,
+                rx_queues: 1,
+                tunnel: true,
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0/0/6".to_string(),
+                linux_name: "ge-0-0-6".to_string(),
+                zone: "trust".to_string(),
+                ifindex: 31,
+                rx_queues: 1,
+                local_fabric_member: "fab0".to_string(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0/0/7".to_string(),
+                linux_name: "ge-0-0-7".to_string(),
+                zone: "untrust".to_string(),
+                ifindex: 32,
+                rx_queues: 1,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let bindings = replan_queues(Some(&snapshot), 1, &[]);
+    assert_eq!(
+        bindings.iter().map(|b| b.interface.clone()).collect::<Vec<_>>(),
+        vec!["ge-0-0-7".to_string()],
+        "tunnel and local-fabric ge-* interfaces must be excluded from the plan"
+    );
+}
+
 #[test]
 fn queue_planner_includes_fabric_parent_interface() {
     // The fabric parent (ge-0/0/0) is not in snapshot.interfaces but is
@@ -278,6 +405,7 @@ fn queue_planner_includes_fabric_parent_interface() {
             InterfaceSnapshot {
                 name: "ge-0/0/1".to_string(),
                 linux_name: "ge-0-0-1".to_string(),
+                zone: "trust".to_string(),
                 ifindex: 11,
                 rx_queues: 1,
                 ..Default::default()
@@ -285,6 +413,7 @@ fn queue_planner_includes_fabric_parent_interface() {
             InterfaceSnapshot {
                 name: "ge-0/0/2".to_string(),
                 linux_name: "ge-0-0-2".to_string(),
+                zone: "untrust".to_string(),
                 ifindex: 12,
                 rx_queues: 1,
                 ..Default::default()
@@ -323,6 +452,7 @@ fn queue_planner_deduplicates_fabric_parent_already_in_interfaces() {
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/0".to_string(),
             linux_name: "ge-0-0-0".to_string(),
+            zone: "trust".to_string(),
             ifindex: 21,
             rx_queues: 1,
             ..Default::default()
@@ -578,6 +708,7 @@ fn queue_planner_ignores_tunnel_netdevices_for_transit() {
             InterfaceSnapshot {
                 name: "ge-0/0/2.80".to_string(),
                 linux_name: "ge-0-0-2.80".to_string(),
+                zone: "untrust".to_string(),
                 ifindex: 24,
                 parent_ifindex: 6,
                 rx_queues: 1,
@@ -623,6 +754,7 @@ fn queue_planner_keeps_queue_zero_available_for_userspace() {
             InterfaceSnapshot {
                 name: "ge-0/0/1".to_string(),
                 linux_name: "ge-0-0-1".to_string(),
+                zone: "trust".to_string(),
                 ifindex: 11,
                 rx_queues: 2,
                 ..Default::default()
@@ -662,12 +794,14 @@ fn queue_planner_uses_smallest_queue_count() {
             InterfaceSnapshot {
                 name: "ge-0/0/1".to_string(),
                 linux_name: "ge-0-0-1".to_string(),
+                zone: "trust".to_string(),
                 rx_queues: 4,
                 ..Default::default()
             },
             InterfaceSnapshot {
                 name: "ge-0/0/2".to_string(),
                 linux_name: "ge-0-0-2".to_string(),
+                zone: "untrust".to_string(),
                 rx_queues: 2,
                 ..Default::default()
             },
@@ -702,6 +836,7 @@ fn queue_planner_dedups_physical_and_unit_to_same_netdev() {
             InterfaceSnapshot {
                 name: "ge-0/0/0".to_string(),
                 linux_name: "ge-0-0-0".to_string(),
+                zone: "trust".to_string(),
                 rx_queues: 4,
                 ..Default::default()
             },
@@ -709,6 +844,7 @@ fn queue_planner_dedups_physical_and_unit_to_same_netdev() {
                 // unit 0 of the same physical NIC — same Linux netdev.
                 name: "ge-0/0/0.0".to_string(),
                 linux_name: "ge-0-0-0".to_string(),
+                zone: "trust".to_string(),
                 rx_queues: 4,
                 ..Default::default()
             },
