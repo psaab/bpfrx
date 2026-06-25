@@ -20,7 +20,9 @@ import (
 // verdict. The inadyn idea adopted here (idea #2, plan §3.7): ONE implementation
 // behind MANY provider names — a name→endpoint table (dyndns2Endpoints) maps the
 // provider backend token (or an explicit `server`) to the right host. dyn,
-// no-ip, duckdns, dynu, etc. all speak this protocol; only the endpoint differs.
+// no-ip, dynu, etc. all speak this protocol; only the endpoint differs. (DuckDNS
+// does NOT — it has its own backend, backend_duckdns.go, #2960; it was wrongly an
+// alias here.)
 //
 // This backend implements the SAME DNSUpdater interface as rfc2136, so the
 // Surface A engine drives it identically. A router record carries no PTR and no
@@ -47,7 +49,6 @@ var dyndns2Endpoints = map[string]string{
 	"dyndns":    "https://members.dyndns.org/v3/update",
 	"no-ip":     "https://dynupdate.no-ip.com/nic/update",
 	"noip":      "https://dynupdate.no-ip.com/nic/update",
-	"duckdns":   "https://www.duckdns.org/update",
 	"dynu":      "https://api.dynu.com/nic/update",
 	"easydns":   "https://api.cp.easydns.com/dyn/generic.php",
 	"dnsomatic": "https://updates.dnsomatic.com/nic/update",

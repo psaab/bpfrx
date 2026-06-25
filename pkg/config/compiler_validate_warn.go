@@ -961,7 +961,9 @@ func ddnsTSIGAlgorithmSupported(algo string) bool {
 // behavior — the runtime resolver in pkg/ddns is authoritative.
 var ddnsKnownDyndns2NameSet = map[string]bool{
 	"dyn": true, "dyndns": true, "no-ip": true, "noip": true,
-	"duckdns": true, "dynu": true, "easydns": true, "dnsomatic": true,
+	"dynu": true, "easydns": true, "dnsomatic": true,
+	// NOTE: duckdns is intentionally NOT here — DuckDNS is its own backend
+	// (#2960), not a dyndns2 alias (it uses domains=/token=/OK and clear=true).
 }
 
 // ddnsKnownDyndns2Provider reports whether a provider NAME is a recognized
@@ -1106,11 +1108,22 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 		case "dyndns2":
 			// dyndns2 needs either a server or a recognizable provider name to
 			// resolve the endpoint (#2691 P3). Credentials are optional (some
-			// token-in-password providers, e.g. duckdns, leave the username empty).
+			// token-in-password providers leave the username empty).
 			if p.Server == "" && !ddnsKnownDyndns2Provider(name) {
 				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
 					"provider %q (backend dyndns2) has no server and no recognized provider "+
 					"name; scopes using it publish nothing (set `server`)", name))
+			}
+		case "duckdns":
+			// DuckDNS authenticates by TOKEN passed as a query param (#2960). The
+			// token comes from the api-token leaf (reused from cloudflare); a
+			// missing token publishes nothing (DuckDNS answers KO). The endpoint
+			// defaults to the built-in https://www.duckdns.org/update, so `server`
+			// is optional (test/mocking only).
+			if p.APIToken.Reveal() == "" {
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q (backend duckdns) has no api-token; scopes using it "+
+					"publish nothing", name))
 			}
 		case "cloudflare":
 			if p.APIToken.Reveal() == "" {

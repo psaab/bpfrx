@@ -17953,3 +17953,34 @@ top.
   pkg/config/bgp_neighbor_peeras_2963_test.go,
   pkg/frr/policy_render.go, pkg/frr/bgp_remote_as_2963_test.go,
   pkg/frr/README.md, _Log.md
+## 2026-06-25 — #2960 DuckDNS dedicated backend (was a broken dyndns2 alias)
+- **Timestamp**: 2026-06-25
+- **Action**: Implemented `duckdns` as its OWN DDNS backend instead of a
+  dyndns2 alias. DuckDNS is not dyndns2-protocol-compatible: the alias sent
+  the wrong params (`hostname=`/`myip=`), the wrong auth (HTTP Basic), rejected
+  DuckDNS's `OK` body (only `good`/`nochg` were accepted), and used the wrong
+  withdraw verb (`offline=YES`) — so updates/withdraws never worked against the
+  real DuckDNS API. New backend speaks the real protocol:
+  `GET /update?domains=<label>&token=<tok>&ip=<v4>` (`&ipv6=<v6>` for AAAA),
+  token as a QUERY param, success on the literal `OK` (`KO` ⇒ hard
+  `errHTTPAuth`), withdraw via `&clear=true`. Token comes from the `api-token`
+  leaf (reused from cloudflare). `duckdns` removed from `dyndns2Endpoints` and
+  from the config dyndns2 known-name set; added to the `backend` enum and a
+  duckdns warn-validation case (missing api-token). Mirrors the
+  cloudflare/route53 backend structure + the #2904 cached-client path.
+- **Fail-on-revert**: `pkg/ddns/backend_duckdns_test.go` asserts the update
+  request shape (domains/token/ip/ipv6), no Basic auth header, no dyndns2
+  hostname/myip, `OK`-keyword success, `clear=true` withdraw (no offline=YES),
+  OK/KO verdict mapping, missing-token fail-closed, and the FQDN→label
+  reduction — RED if reverted to the alias (proven: alias UpsertLease drops
+  `ip=`). `TestDyndns2NameEndpointResolution` now guards that `duckdns` does
+  NOT resolve a dyndns2 endpoint (RED if re-added to the table — proven).
+  Config-side: `TestP3IncompleteHTTPProviderWarns` requires the duckdns
+  no-api-token warning.
+- **Gates**: go build ./..., gofmt -l clean (touched files), go vet
+  ./pkg/ddns/..., go test -race ./pkg/ddns/..., go test ./pkg/config/... PASS.
+- **File(s)**: pkg/ddns/backend_duckdns.go (new), pkg/ddns/backend_duckdns_test.go
+  (new), pkg/ddns/surface_a.go, pkg/ddns/backend_dyndns2.go,
+  pkg/ddns/backend_http_test.go, pkg/ddns/README.md,
+  pkg/config/schema_system.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_p3_http_providers_test.go, docs/config-schema.md, _Log.md

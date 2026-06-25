@@ -12,10 +12,10 @@ import (
 
 func TestP3HTTPProvidersCompile(t *testing.T) {
 	tree := buildTree(t, []string{
-		// dyndns2 (token-in-password style; duckdns name resolves an endpoint).
-		"set system services dynamic-dns provider duckdns backend dyndns2",
-		"set system services dynamic-dns provider duckdns username myuser",
-		"set system services dynamic-dns provider duckdns password tok-secret-a",
+		// duckdns is its OWN backend (#2960), not a dyndns2 alias: token via
+		// api-token (query-param auth), not username/password Basic.
+		"set system services dynamic-dns provider duckdns backend duckdns",
+		"set system services dynamic-dns provider duckdns api-token tok-secret-a",
 		// cloudflare.
 		"set system services dynamic-dns provider cf backend cloudflare",
 		"set system services dynamic-dns provider cf api-token cf-secret-b",
@@ -43,7 +43,7 @@ func TestP3HTTPProvidersCompile(t *testing.T) {
 	}
 
 	dd := cat.Providers["duckdns"]
-	if dd == nil || dd.Backend != "dyndns2" || dd.Username != "myuser" || dd.Password != "tok-secret-a" {
+	if dd == nil || dd.Backend != "duckdns" || dd.APIToken != "tok-secret-a" {
 		t.Fatalf("duckdns provider mismatch: %+v", dd)
 	}
 	cf := cat.Providers["cf"]
@@ -105,6 +105,7 @@ func TestP3IncompleteHTTPProviderWarns(t *testing.T) {
 		"set system services dynamic-dns provider cf backend cloudflare", // no api-token, no zone
 		"set system services dynamic-dns provider aws backend route53",   // no keys/zone-id
 		"set system services dynamic-dns provider g backend generic",     // no url-template
+		"set system services dynamic-dns provider duck backend duckdns",  // no api-token (#2960)
 	})
 	cfg, err := CompileConfig(tree)
 	if err != nil {
@@ -112,7 +113,7 @@ func TestP3IncompleteHTTPProviderWarns(t *testing.T) {
 	}
 	warns := validateSurfaceADDNSWarnings(cfg)
 	joined := strings.Join(warns, "\n")
-	for _, want := range []string{"no api-token", "no zone", "aws-access-key", "no hosted-zone-id", "no url-template"} {
+	for _, want := range []string{"no api-token", "no zone", "aws-access-key", "no hosted-zone-id", "no url-template", "(backend duckdns) has no api-token"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("expected a warning containing %q; got:\n%s", want, joined)
 		}
