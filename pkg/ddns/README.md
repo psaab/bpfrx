@@ -146,6 +146,21 @@ no change in those packages:
   live backend withdraws it for real. `reconcileOnceLocked` / `withdrawAllLocked`
   swallow the sentinel so a legitimate disabled-with-no-backend pass is not
   marked failed. Mirrors the Surface A `withdrawOwnedLocked` precedent.
+- **Route 53 already-gone DELETE is idempotent (#2771)** — `backend_route53.go`
+  `DeleteLease` treats a Route 53 DELETE of an already-absent record as success
+  (nil), mirroring the rfc2136 backend's NXRRSET/NXDOMAIN handling
+  (`sendRemove`). Route 53 reports an already-gone delete as HTTP 400
+  `Code=InvalidChangeBatch` with a per-change message `... but it was not
+  found`; `r53DeleteAlreadyGone` requires BOTH the `InvalidChangeBatch` code AND
+  the "not found" marker, so a genuinely malformed/conflicting batch is NOT
+  mistaken for a no-op. Without this, a withdraw against a manually-removed (or
+  already-withdrawn-but-ack-lost) record returned non-nil forever; Surface A's
+  `withdrawOwnedLocked` only drops ownership on a nil return, so the withdraw
+  wedged and retried indefinitely while `show system services dynamic-dns`
+  reported an owned record that no longer existed. Genuine
+  transient/auth/throttle failures (`SignatureDoesNotMatch`, 5xx, 429, a
+  non-"not found" `InvalidChangeBatch`) STILL return non-nil so the engine
+  keeps retrying — only the already-gone case is swallowed.
 - **Shared-DHCID partial dual-stack teardown (#2700)** — the RFC 4701 DHCID
   digest folds in `client-identity || FQDN` only (NOT the address), so a
   dual-stack client (an A + an AAAA under one FQDN, same client id) shares ONE
