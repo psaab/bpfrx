@@ -1,3 +1,42 @@
+## 2026-06-25 — #2651: WG IPv6 outer UDP checksum uses the AVX2 checksum16_ipv6 helper
+
+- **Timestamp**: 2026-06-25
+- **Action**: The WireGuard transit-egress AF_XDP copy path
+  (`wg_encap_frame` in `userspace-dp/src/afxdp/frame/wg.rs`) computed the
+  outer IPv6 UDP checksum with a hand-rolled scalar word-at-a-time
+  one's-complement loop (`udp6_checksum`), running per encapsulated packet
+  on the egress hot path — a perf issue (agy review-044 finding 044-05).
+  Replaced the scalar loop with the AVX2-backed `checksum::checksum16_ipv6`
+  helper (the same routine the inner TCP/UDP/ICMPv6 paths already use). The
+  IPv6 pseudo-header layout is identical (src, dst, payload-len-as-u32-BE,
+  `[0,0,0,next-header]`, payload) so the one's-complement sum is
+  byte-for-byte the same; the RFC 768 / RFC 8200 mandatory `0x0000 →
+  0xFFFF` canonicalization (UDPv6 checksum is MANDATORY, unlike v4) is
+  re-applied at the call site, mirroring the existing inner-UDP path. The
+  IPv4 outer UDP checksum path is untouched (left 0 = optional/disabled).
+  No wire change (`protocol_wire_v1.json` untouched). The old scalar
+  routine is retained as a `#[cfg(test)]` reference oracle.
+- **File(s)**: `userspace-dp/src/afxdp/frame/wg.rs`,
+  `userspace-dp/src/afxdp/frame/README.md`, `_Log.md`.
+- **Correctness proof (byte-identical)**:
+  `udp6_checksum_matches_scalar_reference` — property test asserting the
+  optimized helper == the independent scalar one's-complement reference for
+  EVERY input across a fixed sweep of lengths [8, 1500] plus 2048/4096/9000/
+  65000 (every odd/even tail boundary), 3 distinct src/dst pairs (incl.
+  all-ones and all-zero addrs), randomized contents (xorshift PRNG, no
+  external `rand` dep). `udp6_checksum_canonicalizes_zero_sum_to_ffff` —
+  drives a raw complement of 0x0000 and asserts both paths emit 0xFFFF.
+- **Fail-on-revert proof**: `udp6_checksum_locked_value_for_known_frame`
+  locks the exact wire checksum (`0x3296`) for a fixed 13-byte (odd-length)
+  WG IPv6 UDP datagram. Proven by copy-restore: perturbing the optimized
+  helper (wrong next-header byte) → all three tests RED
+  (`matches_scalar_reference` len=8 got 3728 want 3729, `locked_value`
+  optimized 12949 != reference 12950). Restored → GREEN, file
+  byte-identical.
+- **Gates**: `cargo build --release -p xpf-userspace-dp` clean;
+  `cargo test --release --bin xpf-userspace-dp -- wg checksum udp` 278/278
+  pass. No Go change.
+
 ## 2026-06-25 — #2775: ddns/surface-a netlink selection honors IPv6 address lifetime
 
 - **Timestamp**: 2026-06-25
