@@ -64,10 +64,16 @@ func (d *clearFaultCLIDP) DeleteDNATEntry(dataplane.DNATKey) error      { return
 func (d *clearFaultCLIDP) DeleteDNATEntryV6(dataplane.DNATKeyV6) error  { return nil }
 func (d *clearFaultCLIDP) ClearAllSessions() (int, int, error)          { return 0, 0, nil }
 
-// one matching TCP session (proto-only filter), optionally SNAT.
+// one matching TCP session (proto-only filter), optionally SNAT. A
+// reverse companion (val.ReverseKey) is always populated with a tuple
+// distinct from the forward key so the clear issues a reverse delete the
+// mock routes to revDelErr (#2733: the clear now keys the reverse delete
+// on val.ReverseKey, skipping it entirely when ReverseKey.Protocol == 0).
 func seedV4(snat bool) map[dataplane.SessionKey]dataplane.SessionValue {
 	key := dataplane.SessionKey{Protocol: 6, SrcPort: 0x3930} // network-order, irrelevant to proto filter
-	val := dataplane.SessionValue{}
+	val := dataplane.SessionValue{
+		ReverseKey: dataplane.SessionKey{Protocol: 6, SrcPort: 0x0050, DstPort: 0x3930},
+	}
 	if snat {
 		val.Flags = dataplane.SessFlagSNAT
 	}

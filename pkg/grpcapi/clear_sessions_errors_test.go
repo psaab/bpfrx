@@ -60,10 +60,16 @@ func (d *clearFaultGRPCDP) DeleteDNATEntry(dataplane.DNATKey) error      { retur
 func (d *clearFaultGRPCDP) DeleteDNATEntryV6(dataplane.DNATKeyV6) error  { return nil }
 
 func seedGRPCV4(snat bool) map[dataplane.SessionKey]dataplane.SessionValue {
-	// Distinct src/dst ports so the naive-swap reverse key differs from
-	// the forward key (the mock distinguishes them by key membership).
+	// Distinct src/dst ports so the reverse companion key differs from
+	// the forward key (the mock distinguishes them by key membership). A
+	// reverse companion (val.ReverseKey) is always populated so the clear
+	// issues a reverse delete the mock routes to revDelErr (#2733: the
+	// clear keys the reverse delete on val.ReverseKey and skips it when
+	// ReverseKey.Protocol == 0).
 	key := dataplane.SessionKey{Protocol: 6, SrcPort: 0x3930, DstPort: 0x0050}
-	val := dataplane.SessionValue{}
+	val := dataplane.SessionValue{
+		ReverseKey: dataplane.SessionKey{Protocol: 6, SrcPort: 0x0050, DstPort: 0x3930},
+	}
 	if snat {
 		val.Flags = dataplane.SessFlagSNAT
 	}

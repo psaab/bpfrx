@@ -1,3 +1,38 @@
+## 2026-06-25 — #2733: clear the NAT'd reverse companion at val.ReverseKey
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed a session-map leak on operator session-clear. The
+  filtered clear (CLI `clearFilteredSessions` and gRPC `ClearSessions`)
+  deleted the dual-entry reverse companion at a NAIVE src/dst 5-tuple swap
+  of the forward key. But the companion is INSTALLED keyed on
+  `val.ReverseKey` — the TRANSLATED tuple for NAT'd sessions
+  (`session_store.go` PutClusterSynced* + `manager_ha.go`, gated by
+  `val.IsReverse == 0 && val.ReverseKey.Protocol != 0`). For a NAT'd
+  session the naive swap != val.ReverseKey, so the clear removed the
+  forward entry and LEAKED the real reverse companion. Replaced the naive
+  swap with `val.ReverseKey` (from the iteration value), skipping the
+  reverse delete when `val.ReverseKey.Protocol == 0` (no companion). Both
+  V4 and V6, both call sites. Non-NAT sessions are unchanged
+  (val.ReverseKey == the naive swap). The #2730 error-aggregation
+  (addExceptNotFound) is retained — a benign not-found (already-GC'd
+  companion) still does not inflate Failures. The SNAT DNAT-companion
+  delete was already correct (keyed on val.NATSrcIP/NATSrcPort, matching
+  the install in session_store.go), so it needed no change.
+- **File(s)**: pkg/cli/cli_clear.go, pkg/grpcapi/server_sessions.go,
+  pkg/cli/cli_clear_reversekey_test.go,
+  pkg/grpcapi/clear_sessions_reversekey_test.go,
+  pkg/cli/cli_clear_errors_test.go, pkg/grpcapi/clear_sessions_errors_test.go,
+  _Log.md
+- **Validation**: new fail-on-revert tests assert the clear deletes
+  val.ReverseKey (the translated tuple) and NOT the naive swap — reverting
+  to the naive swap turns them RED (verified: leaks 203.0.113.5, deletes
+  10.0.1.10 instead). Non-NAT no-regression + no-companion-skip tests
+  added. Updated the two existing #2468 reverse-delete-error tests to
+  populate val.ReverseKey so a reverse delete is actually issued.
+  `go build ./...` clean; `go test ./pkg/cli/... ./pkg/grpcapi/...
+  ./pkg/dataplane/...` green; gofmt clean; go vet clean (cli.go:460
+  unreachable-code warning is pre-existing on master, unrelated).
+
 ## 2026-06-25 — #2519: allowlist writeProxyResponderSysctl in fsatomic canary
 
 - **Timestamp**: 2026-06-25
