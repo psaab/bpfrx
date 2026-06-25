@@ -14,6 +14,9 @@ to the interface name.
   AND on every day-2 commit (#2348). A nil `cfg` stops all relays.
 - `Stats()` — `relay.go`. Per-interface counters.
 - `RelayStats` — `relay.go`.
+- `SetMasterGate(g)` — `relay.go`. Installs the per-interface HA master-state
+  gate (#2456); the daemon passes `Daemon.relayMasterGateOpen`. nil = always
+  relay (standalone). Read per packet, so failover is followed live.
 
 ## Callers
 
@@ -140,16 +143,47 @@ link-local source and the relay replies to that link-local unicast (or
 `ff02::1:2`), so there is no "reply to an unconfigured global address via
 ND" failure mode. This fix is strictly DHCPv4.
 
-### HA / VRRP-Backup duplicate delivery
+### HA master-state gate (#2456)
 
-Before #2076, a relay running on a VRRP **Backup** node sent a duplicate
-flag-clear reply that was harmlessly lost on ARP failure. Now that the
-flag-clear path actually delivers (raw L2 to `chaddr`), a flag-clear client
-may receive duplicate OFFER/ACK from both nodes. DHCP clients dedupe on
-`xid` + `chaddr`, so this is tolerable; a single node never double-delivers
-(L2 success and broadcast are mutually exclusive per reply). Suppressing
-relay forwarding on a VRRP-Backup node remains a deferred follow-up (see
-below). Changes touching this path must pass `make test-failover`.
+On a chassis cluster a shared client segment is reachable from BOTH the
+MASTER and the BACKUP node, so both nodes' listeners receive the client
+DISCOVER/REQUEST broadcast. Without a gate both relay it upstream, so the
+server sees **duplicate** relayed requests (and duplicate relay state with
+different per-node `giaddr`s). #2456 couples the upstream relay-forward to
+this node's VRRP/cluster MASTER state for the relay interface's redundancy
+group:
+
+- The Manager carries a `masterGate` seam, installed by the daemon via
+  `Manager.SetMasterGate` (`daemon_run.go`). The gate closure is
+  `Daemon.relayMasterGateOpen` (`daemon_dhcp.go`).
+- The gate is read **per packet** in the relay's main read loop (after the
+  packet is parsed and confirmed relayable, before `giaddr`/forward). A
+  BACKUP node **drops** the request (bumping `RequestsDroppedBackup`); a
+  MASTER node relays as before.
+- The decision mirrors the DDNS per-RG writer gate
+  (`ddnsReconcileOptions`): standalone (no cluster) always relays; a
+  non-RG-owned relay interface (RG 0) always relays (not a duplicate
+  hazard); an RG-owned interface relays IFF this node is MASTER for that RG.
+  `relayInterfaceRG` resolves the relay interface name (e.g. `reth0.0`) to
+  its RG by stripping the unit suffix and reading the config interface's
+  `redundant-ether-options redundancy-group` (same shape as `rgForInterfaces`,
+  #2664).
+- Because the gate reads live `isRethMasterState` (the SAME source the DHCP
+  server / DDNS gates use), a backup that **becomes** master on VRRP failover
+  starts relaying immediately — no relay restart, no cached-at-startup
+  staleness.
+- A nil gate (the `NewManager` default, or any non-cluster build) is
+  fail-open: every request is relayed (correct standalone behavior).
+
+Changes touching this path must pass `make test-failover`.
+
+Note (#2076): the *reply* path on Backup is a separate concern. Before #2076
+a Backup's duplicate flag-clear reply was harmlessly lost on ARP failure;
+now that the flag-clear path actually delivers (raw L2 to `chaddr`), a
+flag-clear client could receive duplicate OFFER/ACK. With the #2456 gate the
+Backup no longer relays the *request* upstream, so it never produces an
+OFFER/ACK to forward in the first place; clients still dedupe on
+`xid` + `chaddr` for any residual cross-node delivery.
 
 ## Socket / lifecycle model (#1915)
 
@@ -245,11 +279,12 @@ below). Changes touching this path must pass `make test-failover`.
   a given interface's `:67` — Kea does not set REUSEPORT/BINDTODEVICE, so
   configuring both to bind the same port leaves one failing to bind. A
   commit-check that rejects this is a deferred follow-up.
-- **VRRP-Backup duplicate relay (HA).** On a chassis cluster, a relay
-  running on a VRRP **Backup** node also receives segment broadcasts and
-  would relay duplicate requests. DHCP tolerates this (servers dedupe on
-  xid + chaddr; clients dedupe offers), so it is an acceptable interim;
-  suppressing forwarding on Backup is a deferred follow-up gated on
-  `make test-failover`. Note (#2076): the Backup's duplicate *reply* to a
-  flag-clear client now actually delivers (raw L2) instead of being lost on
-  ARP failure — see "HA / VRRP-Backup duplicate delivery" above.
+- **VRRP-Backup duplicate relay (HA) — gated since #2456.** On a chassis
+  cluster a relay on a VRRP **Backup** node also receives segment broadcasts;
+  before #2456 both nodes relayed duplicate requests upstream. The per-packet
+  `masterGate` (`Daemon.relayMasterGateOpen`, installed via
+  `Manager.SetMasterGate`) now drops the client request on a node that is
+  BACKUP for the relay interface's redundancy group, so only the MASTER
+  relays — see "HA master-state gate (#2456)" above. Standalone and
+  non-RG-owned interfaces still always relay. Changes here must pass
+  `make test-failover`.
