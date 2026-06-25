@@ -899,10 +899,26 @@ type PrefixListRef struct {
 type DHCPServerConfig struct {
 	DHCPLocalServer   *DHCPLocalServerConfig
 	DHCPv6LocalServer *DHCPLocalServerConfig
-	// DynamicDNS is the opt-in DHCP DDNS policy (#1387 increment 1).
-	// nil == disabled == today's behaviour byte-for-byte; the dataplane
-	// (Kea render, daemon wiring) ignores a nil block entirely.
+	// DynamicDNS is the opt-in DHCP DDNS policy (#1387 increment 1). It is the
+	// IPv4-family (dhcp-local-server) policy. nil == disabled == today's
+	// behaviour byte-for-byte; the dataplane (Kea render, daemon wiring)
+	// ignores a nil block entirely.
+	//
+	// #2691 P1b / #2663: this is now the v4 policy ONLY. The v6 policy lives in
+	// DynamicDNSv6 and is INDEPENDENT (separate domain / server / TSIG / TTL /
+	// conflict-policy / source-binding). The two families are no longer
+	// field-merged into one struct — a v4-family block and a v6-family block
+	// keep their own settings. Backward compatibility: a config that sets the
+	// stanza under only ONE family compiles to that family's field with the
+	// other nil (so the single-family case is byte-for-byte unchanged), and a
+	// config that set BOTH under the pre-P1b field-merge model now keeps them
+	// distinct (the documented behaviour change in §5.8).
 	DynamicDNS *DHCPDynamicDNSConfig
+	// DynamicDNSv6 is the opt-in IPv6-family (dhcpv6-local-server) DDNS policy
+	// (#2691 P1b / #2663), independent of the v4 DynamicDNS policy above. nil
+	// == no v6 DDNS policy. When a config sets the stanza under only
+	// dhcpv6-local-server, DynamicDNS is nil and this carries the v6 policy.
+	DynamicDNSv6 *DHCPDynamicDNSConfig
 }
 
 // DHCPDynamicDNSConfig is the opt-in dynamic-DNS policy for the DHCP
@@ -960,6 +976,28 @@ type DHCPDynamicDNSConfig struct {
 	TSIGKeyName   string
 	TSIGAlgorithm string
 	TSIGSecret    Secret
+	// SourceAddress / DestinationInterface / RoutingInstance scope the RFC
+	// 2136 UPDATE TRANSPORT (#2691 P1b / #2665). In a multi-WAN / VRF
+	// deployment a DNS UPDATE must egress from the right source IP, the right
+	// interface, and/or the right routing-instance (VRF) or it is dropped by
+	// source-IP-keyed ACLs or sent to the wrong upstream. The live rfc2136
+	// backend builds its transport with a custom net.Dialer:
+	//   - SourceAddress       → Dialer.LocalAddr (bind the UDP/TCP socket's
+	//     source IP). Must be a bare IP literal (v4 or v6); the port is chosen
+	//     by the kernel.
+	//   - DestinationInterface → Dialer.Control → SO_BINDTODEVICE (pin egress
+	//     to a specific interface; covers the no-source-route / policy-route
+	//     case).
+	//   - RoutingInstance     → Dialer.Control → SO_BINDTODEVICE on the VRF
+	//     master device (Linux binds a socket into a VRF by binding to the vrf
+	//     device). xpf names a routing-instance and the VRF device shares that
+	//     name (pkg/routing), so the bind target is the routing-instance name.
+	// All three are optional; empty means "default table / kernel source
+	// selection" (today's behaviour). They are per-family (v4 vs v6 may bind
+	// different sources), which is why they live on this per-family struct.
+	SourceAddress        string
+	DestinationInterface string
+	RoutingInstance      string
 }
 
 // String redacts TSIGSecret so a %v/%s/slog format of a

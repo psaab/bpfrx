@@ -3,10 +3,13 @@ package daemon
 import (
 	"context"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/ddns"
 	"github.com/psaab/xpf/pkg/dhcpserver"
 )
 
@@ -119,18 +122,181 @@ func (d *Daemon) reconcileDDNSOnce(ctx context.Context) {
 		return
 	}
 	if !d.ddnsWriterGateOpen() {
-		// BACKUP for all RGs: stop emitting. No withdraw (plan R3).
+		// BACKUP for all RGs: cheap short-circuit — stop emitting entirely. No
+		// withdraw (plan R3). This is the node-level fast path; the per-scope
+		// gate below makes the publish decision PER RG so a node MASTER for one
+		// RG and BACKUP for another publishes only its own RG's leases (#2664).
 		slog.Debug("ddns: skipping reconcile — node is not MASTER for any RG")
 		return
 	}
 	rctx, cancel := context.WithTimeout(ctx, ddnsReconcileTimeout)
 	defer cancel()
-	if err := d.ddns.Reconcile(rctx, &cfg.System.DHCPServer); err != nil {
+	// #2691 P1b / #2664: drive the SCOPED reconcile with a per-RG writer gate +
+	// a lease→RG resolver. Standalone (no cluster) passes nil gate/resolver
+	// (every scope writable — today's behaviour). In a cluster the resolver
+	// attributes each lease to its owning RG (by stable pool-subnet CIDR
+	// membership, NOT the per-render-unstable Kea subnet_id) and the gate admits
+	// a scope IFF this node is MASTER for that RG — FAIL-CLOSED for an
+	// unattributable lease (an address in no known master-owned subnet is not
+	// published, but its owned record is never withdrawn either).
+	opts := d.ddnsReconcileOptions(cfg)
+	if err := d.ddns.ReconcileScoped(rctx, &cfg.System.DHCPServer, opts); err != nil {
 		// Fail-open for DHCP (plan risk R9): a DNS failure is logged +
 		// counted (by the manager) and retried next cycle; it NEVER
 		// propagates to the Kea apply path or to commit.
 		slog.Warn("ddns: reconcile pass had errors (retrying next cycle)", "err", err)
 	}
+}
+
+// ddnsReconcileOptions builds the per-scope HA wiring for one reconcile pass
+// (#2691 P1b / #2664). Standalone (no cluster) returns the zero options (nil
+// gate + resolver) so the engine treats every scope as writable — byte-for-byte
+// today's behaviour. In a cluster it builds:
+//
+//   - a lease→RG RESOLVER from the committed DHCP config: an address is mapped
+//     to its pool subnet (stable CIDR membership) → group → interface →
+//     redundancy-group. This is the SAME RG attribution the Kea master-filter
+//     uses (rethInterfacesForRG), but keyed on the lease ADDRESS, not on the
+//     Kea subnet_id (which is map-order-assigned and unstable per render, plan
+//     §6 fork 2). A lease whose address falls in no known pool subnet is
+//     UNATTRIBUTABLE → ok=false → fail-closed (not published).
+//   - a per-RG GATE: a scope is writable IFF this node is MASTER for
+//     scope.RGOwner. RGOwner 0 (a lease in a non-RETH / non-HA pool) is admitted
+//     when the node is the writer at all (the node-level short-circuit already
+//     ran): such a pool is not HA-owned, so there is no peer to double-write.
+func (d *Daemon) ddnsReconcileOptions(cfg *config.Config) ddns.ReconcileOptions {
+	if d.cluster == nil || cfg == nil {
+		return ddns.ReconcileOptions{}
+	}
+	subnetRG := d.buildLeaseSubnetRGMap(cfg)
+	master := d.snapshotRethMasterState()
+
+	// anyRGOwnedPool reports whether the config has ANY redundancy-group-owned
+	// pool at all. When it does NOT, the cluster has no HA-owned DHCP scope, so
+	// an unattributable lease is just a standalone-style pool (no peer
+	// double-write hazard) and is admitted as RG 0; the per-RG gate is moot.
+	anyRGOwnedPool := false
+	for _, s := range subnetRG {
+		if s.rg > 0 {
+			anyRGOwnedPool = true
+			break
+		}
+	}
+
+	resolver := func(l ddns.Lease) (ddns.ScopeKey, bool) {
+		rg, ok := rgForLeaseAddress(l.Address, subnetRG)
+		if !ok {
+			// Unattributable: an address in no known pool subnet.
+			//
+			//   - If there ARE RG-owned pools, an address that falls in NONE of
+			//     them is ambiguous w.r.t. HA ownership — FAIL-CLOSED (#2664 /
+			//     plan §5.6: uncertain RG ownership → do not write). This is the
+			//     split-brain guard: a stale memfile row for a subnet we no
+			//     longer serve must not be republished from here.
+			//   - If there are NO RG-owned pools, the cluster has no HA-owned
+			//     DHCP scope (e.g. a non-RETH DHCP group in a cluster used for
+			//     other HA services). There is no peer to double-write, so admit
+			//     as RG 0 — the node-level writer gate already authorized the
+			//     pass.
+			if anyRGOwnedPool {
+				return ddns.ScopeKey{Family: ddns.Family(l.Family)}, false
+			}
+			return ddns.ScopeKey{Family: ddns.Family(l.Family), RGOwner: 0}, true
+		}
+		return ddns.ScopeKey{Family: ddns.Family(l.Family), RGOwner: rg}, true
+	}
+	gate := func(s ddns.ScopeKey) bool {
+		if s.RGOwner == 0 {
+			// Non-RG-owned pool (no RETH / no HA attribution): not a
+			// double-write hazard. The node-level writer gate already gated
+			// the whole pass, so admit.
+			return true
+		}
+		return master[s.RGOwner]
+	}
+	return ddns.ReconcileOptions{Gate: gate, Resolver: resolver}
+}
+
+// leaseSubnetRG pairs a parsed pool subnet (CIDR) with the redundancy group
+// that owns the interfaces of the group the pool belongs to (#2664).
+type leaseSubnetRG struct {
+	net *net.IPNet
+	rg  int
+}
+
+// buildLeaseSubnetRGMap walks the committed DHCP config and pairs each pool
+// subnet with its owning redundancy group, by mapping group → interfaces →
+// redundancy-group (#2664). A group whose interfaces are not RETH / not
+// RG-owned yields rg 0 (a non-HA pool: admitted by the gate as a non-double-
+// write hazard). This is the lease→RG attribution source for the resolver; it
+// is rebuilt per reconcile so a commit takes effect on the next pass.
+func (d *Daemon) buildLeaseSubnetRGMap(cfg *config.Config) []leaseSubnetRG {
+	var out []leaseSubnetRG
+	collect := func(ls *config.DHCPLocalServerConfig) {
+		if ls == nil {
+			return
+		}
+		for _, g := range ls.Groups {
+			rg := rgForInterfaces(cfg, g.Interfaces)
+			for _, p := range g.Pools {
+				if p.Subnet == "" {
+					continue
+				}
+				_, ipnet, err := net.ParseCIDR(p.Subnet)
+				if err != nil || ipnet == nil {
+					continue
+				}
+				out = append(out, leaseSubnetRG{net: ipnet, rg: rg})
+			}
+		}
+	}
+	collect(cfg.System.DHCPServer.DHCPLocalServer)
+	collect(cfg.System.DHCPServer.DHCPv6LocalServer)
+	return out
+}
+
+// rgForInterfaces returns the redundancy group that owns the given DHCP-group
+// interfaces (#2664). An interface that is a RETH member maps to its
+// RedundancyGroup; the first RG-owned interface wins (a DHCP group binds to one
+// HA-owned segment in practice). Returns 0 when no interface is RG-owned (a
+// non-HA pool).
+func rgForInterfaces(cfg *config.Config, ifaces []string) int {
+	if cfg == nil {
+		return 0
+	}
+	for _, name := range ifaces {
+		// The configured interface name may be the RETH logical name (reth0.0)
+		// or a unit form; match against the config's interface table by the
+		// base interface name.
+		base := name
+		if i := strings.IndexByte(base, '.'); i >= 0 {
+			base = base[:i]
+		}
+		if ifc, ok := cfg.Interfaces.Interfaces[base]; ok {
+			if ifc.RedundancyGroup > 0 {
+				return ifc.RedundancyGroup
+			}
+		}
+	}
+	return 0
+}
+
+// rgForLeaseAddress maps a lease address to its owning redundancy group via the
+// pool-subnet→RG map (#2664). It is the stable, render-independent attribution
+// the per-RG gate keys on (CIDR membership, NOT the Kea subnet_id). Returns
+// ok=false when the address parses but falls in no known pool subnet
+// (unattributable → fail-closed at the caller) or does not parse.
+func rgForLeaseAddress(addr string, subnetRG []leaseSubnetRG) (int, bool) {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return 0, false
+	}
+	for _, s := range subnetRG {
+		if s.net.Contains(ip) {
+			return s.rg, true
+		}
+	}
+	return 0, false
 }
 
 // ddnsWriterGateOpen reports whether this node should publish DDNS now

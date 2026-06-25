@@ -33,10 +33,20 @@ import (
 //   - Prometheus emission through pkg/api (the xpf_dhcp_ddns_* counters
 //     are exported from Stats()).
 //
+// SHIPPED in #2691 P1b (this phase):
+//   - ScopeKey on ownership records + per-family INDEPENDENT v4/v6 policy
+//     (#2663): ReconcileScoped resolves a policy + backend PER FAMILY;
+//   - per-RG HA writer gate (#2664): a ScopeGate/ScopeResolver gates the
+//     publish decision PER redundancy-group (stop-writing-never-withdraw on a
+//     partial demotion), wired from pkg/daemon (ddnsReconcileOptions);
+//   - source / interface / VRF binding for the RFC 2136 update socket (#2665,
+//     backend_bind.go).
+//
 // STILL DEFERRED:
 //   - the Kea D2 backend (reserved enum; not in the image — bake.py);
-//   - per-scope / per-RG policy, source binding, and router/interface
-//     address publish (the #2691 world-class redesign, phases P1-P3).
+//   - router/interface-address publish (Surface A) + the HTTP provider
+//     backends (dyndns2/Cloudflare/Route53/generic) — the #2691 world-class
+//     redesign phases P2-P3.
 //
 // When DynamicDNS is nil or disabled the manager does nothing except a
 // one-time withdraw of any previously-owned records (turn-off cleanup) —
@@ -69,6 +79,11 @@ type LeaseParser func(path string, family int, now time.Time) ([]Lease, error)
 // reconciler consumes. It is derived from config.DHCPDynamicDNSConfig at
 // reconcile time so the reconciler never holds a stale captured cfg
 // (plan §5 invariant 1).
+//
+// #2691 P1b — one ddnsPolicy is resolved PER FAMILY (#2663 independent v4/v6
+// policy). The v4 and v6 lease sets are now reconciled with their OWN policy +
+// own backend, so a v4 conflict, a v4 backend failure, or a v4 turn-off can
+// never affect v6 publishing (and vice-versa).
 type ddnsPolicy struct {
 	enabled        bool
 	domain         string
@@ -76,6 +91,46 @@ type ddnsPolicy struct {
 	hostnameSource string
 	conflictPolicy string
 	backend        string
+}
+
+// ScopeGate decides whether THIS node may publish records for a given scope
+// (#2691 P1b / #2664 the per-RG HA writer gate). It returns true when the
+// scope is writable from here: standalone always true; in a cluster, true IFF
+// the local node is the MASTER for scope.RGOwner. A nil gate (the standalone
+// Reconcile entry point and existing tests) means "every scope is writable".
+//
+// FAIL-CLOSED CONTRACT (#2664): the daemon's gate returns FALSE for any scope
+// whose RG ownership is uncertain (a lease whose address falls in no
+// master-owned subnet, or whose RG cannot be attributed). A scope the gate
+// rejects is NOT published — but it is also NOT withdrawn (stop-writing, never
+// withdraw: the peer that became MASTER for that RG refreshes the record; a
+// withdraw race would blackhole, plan §5.6 / risk R3). The reconciler enforces
+// this by treating a gated-out OWNED record exactly like an untrusted family:
+// it is left in the store, never deleted, and never re-published from here.
+type ScopeGate func(ScopeKey) bool
+
+// ScopeResolver attributes a lease to the redundancy group (and, in later
+// phases, the interface/unit/routing-instance) that OWNS it (#2691 P1b). The
+// daemon supplies it from the committed DHCP config: a lease address is mapped
+// to its pool subnet → group → interface → redundancy-group (stable CIDR
+// membership, NOT the per-render-unstable Kea subnet_id, plan §6 fork 2). It
+// returns the scope's RG owner and ok=false when the lease cannot be attributed
+// to any known scope — which the gate then treats as fail-closed (not
+// published). A nil resolver (standalone / tests) yields the zero scope for the
+// family (RGOwner 0), which a nil gate always admits.
+type ScopeResolver func(l Lease) (ScopeKey, bool)
+
+// ReconcileOptions carries the HA scope wiring for one reconcile pass (#2691
+// P1b). All fields are optional; the zero value is the standalone behaviour
+// (every scope writable, leases keyed by family only). The daemon populates
+// Gate + Resolver so the per-RG writer gate and per-family/per-RG ownership
+// scoping take effect.
+type ReconcileOptions struct {
+	// Gate is the per-scope HA writer gate (#2664). Nil ⇒ all scopes writable.
+	Gate ScopeGate
+	// Resolver attributes each lease to its owning scope (RG etc., #2664). Nil
+	// ⇒ leases get the zero scope for their family (standalone Surface B).
+	Resolver ScopeResolver
 }
 
 // policyFromConfig resolves a typed config block into a runtime policy,
@@ -332,83 +387,193 @@ func (m *Manager) ownerWatermark(identity, address string) string {
 // one-time cleanup of any previously-owned records when the feature is
 // turned OFF (so disabling DDNS withdraws its records).
 func (m *Manager) Reconcile(ctx context.Context, cfg *config.DHCPServerConfig) error {
-	var ddns *config.DHCPDynamicDNSConfig
-	if cfg != nil {
-		ddns = cfg.DynamicDNS
+	return m.ReconcileScoped(ctx, cfg, ReconcileOptions{})
+}
+
+// reconcileEnv is the per-pass, per-family resolved environment the reconcile
+// algorithm + the upsert/delete helpers consume (#2691 P1b). It carries each
+// family's INDEPENDENT policy + backend (#2663), plus the HA scope gate +
+// resolver (#2664). The helpers select the family slice by a record's Family.
+type reconcileEnv struct {
+	pol     [2]ddnsPolicy // [0]=v4, [1]=v6
+	updater [2]DNSUpdater // [0]=v4, [1]=v6 (resolve-per-Reconcile per family)
+	gate    ScopeGate     // per-scope HA writer gate (#2664); nil ⇒ all writable
+	res     ScopeResolver // lease→scope attribution (#2664); nil ⇒ zero scope
+}
+
+// famIdx maps an engine family int (4/6) to the [2] env slot.
+func famIdx(family int) int {
+	if family == 6 {
+		return 1
 	}
-	pol := policyFromConfig(ddns)
-	m.lastPolicy.Store(&pol)
+	return 0
+}
+
+// updaterFor returns the resolved backend for a record's family.
+func (e *reconcileEnv) updaterFor(family int) DNSUpdater { return e.updater[famIdx(family)] }
+
+// polFor returns the resolved policy for a family.
+func (e *reconcileEnv) polFor(family int) ddnsPolicy { return e.pol[famIdx(family)] }
+
+// scopeAdmits reports whether THIS node may publish records for a scope under
+// the gate (#2664). A nil gate admits everything (standalone). Fail-closed is
+// the daemon's gate's responsibility (it returns false for an uncertain RG).
+func (e *reconcileEnv) scopeAdmits(s ScopeKey) bool {
+	if e.gate == nil {
+		return true
+	}
+	return e.gate(s)
+}
+
+// scopeFor attributes a lease to its owning scope (#2664). With no resolver
+// (standalone / tests) the scope is just the family — the zero-scope global
+// lease path, byte-for-byte the pre-P1b ownership key. The resolver's ok=false
+// (lease attributable to no known scope) returns the family-only scope with
+// admit=false so the caller fail-closes (does not publish), without losing the
+// family tag that keeps v4/v6 ownership independent.
+func (e *reconcileEnv) scopeFor(l Lease) (scope ScopeKey, admit bool) {
+	if e.res == nil {
+		// Standalone / no-resolver: the ZERO scope for BOTH families — the
+		// global lease key, byte-for-byte the pre-P1b "identity|address"
+		// ownership key (no migration, no churn). A v4 and a v6 record never
+		// collide on this key because their ADDRESSES differ (an address is
+		// either v4 or v6), so the family need not be folded into the key here;
+		// per-family POLICY independence (#2663) is delivered by the per-family
+		// policy + backend resolution, not by the ownership key. The record's
+		// own Family field stays authoritative for the wire op.
+		return ScopeKey{}, e.scopeAdmits(ScopeKey{})
+	}
+	s, ok := e.res(l)
+	if !ok {
+		// Unattributable lease: fail-closed (#2664). Use a non-zero family-only
+		// scope so the gated-out record cannot alias a real global-scope entry;
+		// it is dropped (admit=false), so it is never stored anyway.
+		return ScopeKey{Family: familyOf(l.Family)}, false
+	}
+	return s, e.scopeAdmits(s)
+}
+
+// ReconcileScoped is the per-family / per-scope reconcile entry point (#2691
+// P1b). It resolves an INDEPENDENT policy + backend for the v4 and the v6
+// family (#2663), tags every desired record with its ScopeKey (#2664), and
+// applies the per-scope HA writer gate (opts.Gate / opts.Resolver). Reconcile
+// is the nil-options (standalone, all-scopes-writable) wrapper.
+func (m *Manager) ReconcileScoped(ctx context.Context, cfg *config.DHCPServerConfig, opts ReconcileOptions) error {
+	var ddns4, ddns6 *config.DHCPDynamicDNSConfig
+	if cfg != nil {
+		ddns4 = cfg.DynamicDNS
+		ddns6 = cfg.DynamicDNSv6
+	}
+	// BACKWARD COMPATIBILITY (#2663 + plan §5.9): a pre-P1b config carried a
+	// SINGLE dynamic-dns block under ONE family that applied to BOTH families
+	// (the reconciler walked both lease sets with one policy). To keep those
+	// committed configs working byte-for-byte, when only ONE family's block is
+	// present the OTHER family INHERITS it. The moment BOTH families set their
+	// own block they are fully INDEPENDENT (the #2663 fix). This preserves the
+	// single-family case AND delivers per-family independence for the two-block
+	// case, with no silent loss of v6 publishing for existing single-block
+	// configs.
+	if ddns4 == nil && ddns6 != nil {
+		ddns4 = ddns6
+	} else if ddns6 == nil && ddns4 != nil {
+		ddns6 = ddns4
+	}
+	pol4 := policyFromConfig(ddns4)
+	pol6 := policyFromConfig(ddns6)
+	// lastPolicy surfaces an aggregate for Stats(): enabled if EITHER family is
+	// enabled; backend is the v4 backend when v4 is configured, else v6's.
+	agg := pol4
+	if !agg.enabled {
+		agg = pol6
+	}
+	if ddns4 == nil && ddns6 != nil {
+		agg = pol6
+	}
+	m.lastPolicy.Store(&agg)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Resolve the live backend from the policy resolved THIS cycle (plan §6
-	// fork 1: resolve-per-Reconcile). A nil factory keeps the static updater
-	// (tests inject a fixed fakeUpdater). A factory error (bad TSIG /
-	// unusable policy) falls back to the no-op so reconcile never wedges and
-	// a malformed backend cannot crash the loop — it is logged + counted as
-	// a no-backend cycle. This MUST run even when disabled so a turn-off
-	// resolves the live backend that published the records and can withdraw
-	// them (else the static nop would silently no-op the withdraw).
-	if m.newUpdater != nil {
-		up, err := m.newUpdater(pol, ddns)
-		if err != nil {
-			slog.Warn("ddns: cannot build DNS-update backend; staying no-op this cycle", "err", err)
-			up = nopUpdater{}
-		}
-		// Do NOT replace a LIVE updater with a nop while owned records still
-		// need withdrawing. The whole-stanza removal (DynamicDNS=nil) resolves
-		// the factory to a nopUpdater (no update-server/TSIG left to build the
-		// live backend from), and the !pol.enabled branch below would then run
-		// withdrawAllLocked THROUGH the nop — dropping ownership entries while
-		// sending no real DNS delete, orphaning the records this firewall
-		// published. Keep the existing live updater for THIS withdraw cycle so
-		// the backend that published the records also withdraws them; the swap
-		// to nop happens on the next cycle once nothing is owned. (Disable via
-		// Enabled=false while keeping the backend config still resolves a live
-		// updater here, so that path is unaffected.)
-		if isNopUpdater(up) && !isNopUpdater(m.updater) && len(m.state.records) > 0 {
-			slog.Debug("ddns: keeping live updater this cycle to withdraw owned records " +
-				"before swapping to no-op")
-		} else {
-			m.updater = up
-		}
+	env := reconcileEnv{
+		pol:     [2]ddnsPolicy{pol4, pol6},
+		updater: [2]DNSUpdater{m.updater, m.updater},
+		gate:    opts.Gate,
+		res:     opts.Resolver,
 	}
 
-	if !pol.enabled {
-		err := m.withdrawAllLocked(ctx)
-		m.recordReconcilePass(err)
-		return err
+	// Resolve each family's live backend from THIS cycle's policy (plan §6
+	// fork 1: resolve-per-Reconcile, now PER FAMILY — #2663). A nil factory
+	// keeps the static updater (tests inject a fixed fakeUpdater). A factory
+	// error (bad TSIG / unusable policy) for one family falls back to that
+	// family's no-op WITHOUT affecting the other family — independence (#2663).
+	if m.newUpdater != nil {
+		env.updater[0] = m.resolveFamilyUpdater(pol4, ddns4)
+		env.updater[1] = m.resolveFamilyUpdater(pol6, ddns6)
+		// Keep the LIVE-updater-for-withdraw guard, now per family: if a family
+		// resolved to nop but still owns records (turn-off), keep the prior live
+		// updater for THIS withdraw cycle so the backend that published also
+		// withdraws (else the nop silently drops ownership, orphaning the live
+		// RR — the same hazard the single-family path guards, plan §4.2).
+		if isNopUpdater(env.updater[0]) && !isNopUpdater(m.updater) && m.familyOwnsRecords(4) {
+			env.updater[0] = m.updater
+			slog.Debug("ddns: keeping live v4 updater this cycle to withdraw owned records")
+		}
+		if isNopUpdater(env.updater[1]) && !isNopUpdater(m.updater) && m.familyOwnsRecords(6) {
+			env.updater[1] = m.updater
+			slog.Debug("ddns: keeping live v6 updater this cycle to withdraw owned records")
+		}
+		// Track a single representative live updater for the next-cycle
+		// withdraw guard (m.updater is the "last live backend seen" anchor).
+		if !isNopUpdater(env.updater[0]) {
+			m.updater = env.updater[0]
+		} else if !isNopUpdater(env.updater[1]) {
+			m.updater = env.updater[1]
+		}
 	}
 
 	now := m.now()
-	leases4, err4 := m.parseLeases(m.leasePath4, 4, now)
-	if err4 != nil {
-		slog.Warn("ddns: parse v4 leases failed; suppressing v4 deletes this cycle", "err", err4)
-	}
-	leases6, err6 := m.parseLeases(m.leasePath6, 6, now)
-	if err6 != nil {
-		slog.Warn("ddns: parse v6 leases failed; suppressing v6 deletes this cycle", "err", err6)
-	}
-	leases := append(leases4, leases6...)
-
-	// Fail-safe: when a family's lease CSV cannot be read/parsed, its lease
-	// set is unreliable (nil/partial) and EVERY owned record of that family
-	// would look expired -> eligible for deletion. We must never delete owned
-	// records on the basis of an unreadable source of truth, so mark that
-	// family as untrusted and the reconciler skips its destructive diff this
-	// cycle. The error is surfaced to the caller so the loop logs/counts it.
 	untrusted := map[int]bool{}
-	if err4 != nil {
-		untrusted[4] = true
+	var leases []Lease
+	var err4, err6 error
+
+	// Per-family enable: a disabled family withdraws ITS OWN records only
+	// (#2663 independence — disabling v4 must not touch v6). A family that is
+	// enabled feeds its leases into the shared desired set.
+	if pol4.enabled {
+		l4, e4 := m.parseLeases(m.leasePath4, 4, now)
+		err4 = e4
+		if e4 != nil {
+			slog.Warn("ddns: parse v4 leases failed; suppressing v4 deletes this cycle", "err", e4)
+			untrusted[4] = true
+		}
+		leases = append(leases, l4...)
+	} else {
+		// v4 disabled: withdraw v4-owned records through the resolved v4
+		// updater. Leaving v4 out of `leases` would make Pass 1 try to delete
+		// every v4 record anyway, but routing the withdraw explicitly keeps the
+		// family-scoped semantics clear and uses the v4 backend.
+		untrusted[4] = false
 	}
-	if err6 != nil {
-		untrusted[6] = true
+	if pol6.enabled {
+		l6, e6 := m.parseLeases(m.leasePath6, 6, now)
+		err6 = e6
+		if e6 != nil {
+			slog.Warn("ddns: parse v6 leases failed; suppressing v6 deletes this cycle", "err", e6)
+			untrusted[6] = true
+		}
+		leases = append(leases, l6...)
+	} else {
+		untrusted[6] = false
 	}
-	recErr := m.reconcileOnceLocked(ctx, pol, leases, untrusted)
-	// A reconcile pass "fails" when any record op errored OR a family's lease
-	// CSV was unreadable (its destructive diff was suppressed — an incomplete
-	// pass). Surface the first error to the loop for logging.
+
+	// disabledFamilies tells the reconciler to WITHDRAW (delete-owned) a
+	// family's records rather than skip them: a family that is not enabled has
+	// no desired set, so Pass 1 deletes its owned records (turn-off cleanup),
+	// while an ENABLED family with an unreadable CSV is untrusted (skip the
+	// destructive diff). The two must not be conflated.
+	disabled := map[int]bool{4: !pol4.enabled, 6: !pol6.enabled}
+
+	recErr := m.reconcileOnceLocked(ctx, &env, leases, untrusted, disabled)
 	passErr := recErr
 	if passErr == nil {
 		if err4 != nil {
@@ -419,6 +584,29 @@ func (m *Manager) Reconcile(ctx context.Context, cfg *config.DHCPServerConfig) e
 	}
 	m.recordReconcilePass(passErr)
 	return passErr
+}
+
+// resolveFamilyUpdater resolves one family's backend from its policy + config,
+// falling back to the no-op (logged, counted) on a factory error so one
+// family's malformed backend cannot wedge the loop or affect the other family.
+func (m *Manager) resolveFamilyUpdater(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig) DNSUpdater {
+	up, err := m.newUpdater(pol, c)
+	if err != nil {
+		slog.Warn("ddns: cannot build DNS-update backend; staying no-op this cycle for this family", "err", err)
+		return nopUpdater{}
+	}
+	return up
+}
+
+// familyOwnsRecords reports whether the ownership store holds any record of the
+// given family — used to keep a live updater for a turn-off withdraw cycle.
+func (m *Manager) familyOwnsRecords(family int) bool {
+	for _, r := range m.state.records {
+		if r.Family == family {
+			return true
+		}
+	}
+	return false
 }
 
 // parseLeases reads a family's active leases via the injected LeaseParser
@@ -455,13 +643,22 @@ func (m *Manager) recordReconcilePass(err error) {
 // destructive diff (deletes) for an untrusted family so a transient
 // malformed lease file can never mass-delete that family's owned records.
 // A nil map means all families are trusted.
-func (m *Manager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, leases []Lease, untrusted map[int]bool) error {
-	source := hostnameSourceFor(&pol)
+func (m *Manager) reconcileOnceLocked(ctx context.Context, env *reconcileEnv, leases []Lease, untrusted, disabled map[int]bool) error {
 	blockedIdentity := map[string]struct{}{}
 	blockedAddress := map[string]struct{}{}
 	blockedFQDN := map[string]struct{}{}
 
-	// desired[key] = the record we want owned for that identity+address.
+	// gatedScope[scopePrefix] = true marks a scope this node may NOT publish
+	// for (the per-RG HA writer gate is CLOSED for it, #2664). An owned record
+	// in a gated scope is treated EXACTLY like an untrusted family in Pass 1:
+	// it is NEVER deleted (stop-writing, never withdraw — the peer MASTER for
+	// that RG refreshes it; a withdraw race would blackhole, plan §5.6) and
+	// never re-published from here. Tracked by scope-prefix so the Pass-1
+	// owned-record loop can ask "is this record's scope gated?" without a
+	// resolver (the owned record carries its scope).
+	gatedScope := map[string]bool{}
+
+	// desired[key] = the record we want owned for that scope+identity+address.
 	type desired struct {
 		rec  LeaseDNSRecord
 		ow   ownedRecord
@@ -470,11 +667,24 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, lease
 	want := map[string]*desired{}
 	// Reassignment (a new client taking over an address a different client
 	// held) is cleaned by the owned-state delete pass below, NOT a separate
-	// tracker: the old owner's (identity,address) key is no longer in `want`
-	// (the new client has a different identity), so Pass 1 deletes the old
-	// owned record before Pass 2 adds the new one (delete-before-add on a
+	// tracker: the old owner's (scope,identity,address) key is no longer in
+	// `want` (the new client has a different identity), so Pass 1 deletes the
+	// old owned record before Pass 2 adds the new one (delete-before-add on a
 	// shared address; a failed delete blocks the add via the blocked maps).
 	for _, l := range leases {
+		pol := env.polFor(l.Family)
+		source := hostnameSourceFor(&pol)
+		// Resolve the lease's scope + the per-RG HA gate decision (#2664). A
+		// gated-out scope is recorded so Pass 1 protects its owned records from
+		// deletion, and the desired record is NOT added (stop-writing).
+		scope, admit := env.scopeFor(l)
+		if !admit {
+			gatedScope[scope.scopePrefix()] = true
+			slog.Debug("ddns: scope not writable from this node (per-RG gate closed); "+
+				"not publishing, not withdrawing",
+				"address", l.Address, "rg", scope.RGOwner, "family", l.Family)
+			continue
+		}
 		fqdn, err := deriveFQDN(l.HostName, l.ClientFQDN, l.Identity, pol.domain, source)
 		if err != nil {
 			m.skippedNoName.Add(1)
@@ -510,8 +720,8 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, lease
 			TTL:         rec.TTL,
 			OwnerID:     m.ownerWatermark(identity, l.Address),
 			ClientID:    l.Identity,
-		}
-		want[ownedRecordKey(identity, l.Address)] = &desired{rec: rec, ow: ow}
+		}.withScope(scope)
+		want[ownedRecordKey(scope, identity, l.Address)] = &desired{rec: rec, ow: ow}
 	}
 
 	var firstErr error
@@ -526,7 +736,7 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, lease
 	// moved, name changed). Cleaning before adding is what makes
 	// reassignment safe (delete the old owner first).
 	for _, owned := range m.state.all() {
-		key := ownedRecordKey(owned.Identity, owned.Address)
+		key := ownedRecordKey(owned.scopeOf(), owned.Identity, owned.Address)
 		d, stillWanted := want[key]
 		if stillWanted && recordsEqual(owned, d.ow) {
 			// The published forward/reverse tuple is unchanged. If the owned
@@ -539,12 +749,28 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, lease
 			}
 			continue
 		}
+		// HA per-RG gate (#2664): if this owned record's scope is gated CLOSED
+		// from this node (we are not the MASTER for its RG), STOP WRITING but
+		// NEVER WITHDRAW — leave it in the store untouched. The peer that is
+		// MASTER for that RG owns the refresh; a withdraw here would race the
+		// peer and blackhole (plan §5.6 / risk R3). This is the load-bearing
+		// #2664 invariant: a node that loses one RG must not delete that RG's
+		// records.
+		if gatedScope[owned.scopeOf().scopePrefix()] {
+			if stillWanted {
+				d.seen = true
+			}
+			continue
+		}
 		// Fail-safe (#1387 MAJOR-4): if this owned record's family had an
 		// unreadable/partial lease CSV this cycle, its "expired" appearance
 		// is untrustworthy — skip the delete entirely. Mark the record as
 		// seen so the add pass does not re-publish it either; leave the
-		// ownership entry intact for a later, trustworthy reconcile.
-		if untrusted[owned.Family] {
+		// ownership entry intact for a later, trustworthy reconcile. A DISABLED
+		// family (disabled[family]) is NOT untrusted — it has no desired set on
+		// purpose, so its owned records SHOULD be withdrawn (turn-off cleanup),
+		// so disabled does not protect from delete here.
+		if untrusted[owned.Family] && !disabled[owned.Family] {
 			if stillWanted {
 				d.seen = true
 			}
@@ -553,7 +779,7 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, lease
 		// Owned but not wanted (expired/released) OR wanted differently
 		// (the desired pass below re-adds the new form). Delete only the
 		// EXACT owned tuple — never anything not in the store.
-		if err := m.deleteOwnedLocked(ctx, owned); err != nil {
+		if err := m.deleteOwnedLocked(ctx, env.updaterFor(owned.Family), owned); err != nil {
 			noteErr(err)
 			blockedIdentity[owned.Identity] = struct{}{}
 			blockedAddress[owned.Address] = struct{}{}
@@ -579,7 +805,7 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, lease
 		if _, blocked := blockedFQDN[d.ow.FQDN]; blocked {
 			continue
 		}
-		if err := m.upsertLocked(ctx, d.rec, d.ow); err != nil {
+		if err := m.upsertLocked(ctx, env.updaterFor(d.ow.Family), d.rec, d.ow); err != nil {
 			noteErr(err)
 			continue
 		}
@@ -613,7 +839,7 @@ func (m *Manager) withdrawAllLocked(ctx context.Context) error {
 	}
 	var firstErr error
 	for _, r := range owned {
-		if err := m.deleteOwnedLocked(ctx, r); err != nil && firstErr == nil {
+		if err := m.deleteOwnedLocked(ctx, m.updater, r); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -657,13 +883,13 @@ func (m *Manager) withdrawAllLocked(ctx context.Context) error {
 // actually fires). Deleting an intent for a RR that was never created is
 // safe: the #2648 DHCID-match / exact-RR delete prerequisite fails on a
 // non-existent RR, so the wire delete is a harmless no-op.
-func (m *Manager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow ownedRecord) error {
-	if isNopUpdater(m.updater) {
+func (m *Manager) upsertLocked(ctx context.Context, updater DNSUpdater, rec LeaseDNSRecord, ow ownedRecord) error {
+	if isNopUpdater(updater) {
 		// No live backend: nothing is published, so record NO ownership and
 		// do not write-ahead an intent (an intent for a record nopUpdater
 		// never wrote would be phantom). Count the skip and return success so
 		// the reconcile does not wedge.
-		if err := m.updater.UpsertLease(ctx, rec); err != nil {
+		if err := updater.UpsertLease(ctx, rec); err != nil {
 			m.upsertFail.Add(1)
 			return err
 		}
@@ -683,14 +909,14 @@ func (m *Manager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow owned
 		// in-memory intent back so the store matches what is durable, surface
 		// the failure as "record not safely owned", and let the next
 		// reconcile retry.
-		m.state.delete(intent.Identity, intent.Address)
+		m.state.delete(intent.scopeOf(), intent.Identity, intent.Address)
 		m.upsertFail.Add(1)
 		slog.Warn("ddns: cannot durably record ownership before add; skipping publish",
 			"fqdn", rec.FQDN, "err", err)
 		return err
 	}
 
-	if err := m.updater.UpsertLease(ctx, rec); err != nil {
+	if err := updater.UpsertLease(ctx, rec); err != nil {
 		// ORDER MATTERS (#2676): check errDDNSPTRPending BEFORE
 		// errDDNSConflictRefused. errDDNSPTRPending is returned ONLY after the
 		// forward A/AAAA add SUCCEEDED, so its presence proves the forward is
@@ -727,7 +953,7 @@ func (m *Manager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow owned
 			// REMOVE the pre-written intent (no phantom ownership) and persist the
 			// removal. Count it as a conflict skip already done by the backend; do
 			// not fail the reconcile pass.
-			m.state.delete(intent.Identity, intent.Address)
+			m.state.delete(intent.scopeOf(), intent.Identity, intent.Address)
 			if serr := m.state.save(); serr != nil {
 				// The intent is removed in memory but the removal is not durable.
 				// Surface it so the pass is marked failed and retried; a stale
@@ -745,7 +971,7 @@ func (m *Manager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow owned
 		// (no-op) delete against a non-existent RR forever. A save failure here
 		// is non-fatal beyond the add error already returned: a stale durable
 		// intent's delete is a harmless no-op and self-heals on the next save.
-		m.state.delete(intent.Identity, intent.Address)
+		m.state.delete(intent.scopeOf(), intent.Identity, intent.Address)
 		if serr := m.state.save(); serr != nil {
 			slog.Warn("ddns: cannot persist removal of failed-add intent",
 				"fqdn", rec.FQDN, "err", serr)
@@ -773,7 +999,7 @@ func (m *Manager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow owned
 // deletes it, removing the ownership entry on success. This is the sole
 // delete authority — it never constructs a delete from anything but the
 // store, so a record xpf did not create can never be deleted.
-func (m *Manager) deleteOwnedLocked(ctx context.Context, owned ownedRecord) error {
+func (m *Manager) deleteOwnedLocked(ctx context.Context, updater DNSUpdater, owned ownedRecord) error {
 	rec, err := buildLeaseRecord(owned.FQDN, owned.Address, owned.TTL)
 	if err != nil {
 		// The stored address no longer parses (should not happen): drop
@@ -781,7 +1007,7 @@ func (m *Manager) deleteOwnedLocked(ctx context.Context, owned ownedRecord) erro
 		// guessed name.
 		slog.Warn("ddns: owned record has unparseable address; dropping entry",
 			"address", owned.Address, "err", err)
-		m.state.delete(owned.Identity, owned.Address)
+		m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
 		return nil
 	}
 	// Force the stored forward type / PTR name (re-derived above should
@@ -792,11 +1018,11 @@ func (m *Manager) deleteOwnedLocked(ctx context.Context, owned ownedRecord) erro
 	// backend recomputes the same RFC 4701 DHCID — the delete prerequisite
 	// then proves xpf owns the record before removing it.
 	rec.ClientID = owned.ClientID
-	if err := m.updater.DeleteLease(ctx, rec); err != nil {
+	if err := updater.DeleteLease(ctx, rec); err != nil {
 		m.deleteFail.Add(1)
 		return err
 	}
-	if isNopUpdater(m.updater) {
+	if isNopUpdater(updater) {
 		// No live backend: the delete was a logged no-op. Still drop the
 		// ownership entry. For increment 1 this is CORRECT: nopUpdater never
 		// published anything, so there is nothing in DNS to orphan by
@@ -807,11 +1033,11 @@ func (m *Manager) deleteOwnedLocked(ctx context.Context, owned ownedRecord) erro
 		// increment-2 concern; there is NO logic change for inc-1, where the
 		// store can only ever hold records nopUpdater "wrote" (i.e. none).
 		m.skippedNoBackend.Add(1)
-		m.state.delete(owned.Identity, owned.Address)
+		m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
 		return nil
 	}
 	m.deleteOK.Add(1)
-	m.state.delete(owned.Identity, owned.Address)
+	m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
 	return nil
 }
 
@@ -898,14 +1124,21 @@ func (m *Manager) DDNSLeasePaths() (leasePath4, leasePath6 string) {
 }
 
 // OwnedForTesting reports whether the ownership store holds a record for the
-// given identity+address. Test-only accessor for cross-package tests (the
-// pkg/dhcpserver real-parser→engine integration tests) that previously reached
-// into the unexported state store directly (#2691 P1a). Not for production use.
+// given identity+address IN ANY SCOPE. Test-only accessor for cross-package
+// tests (the pkg/dhcpserver real-parser→engine integration tests) that
+// previously reached into the unexported state store directly (#2691 P1a). It
+// matches scope-agnostically (#2691 P1b) so the existing seam callers — which
+// publish on the zero/global lease scope — keep working unchanged. Not for
+// production use.
 func (m *Manager) OwnedForTesting(identity, address string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_, ok := m.state.get(identity, address)
-	return ok
+	for _, r := range m.state.records {
+		if r.Identity == identity && r.Address == address {
+			return true
+		}
+	}
+	return false
 }
 
 // OwnedKeysForTesting returns the identity|address keys of every owned record,

@@ -107,7 +107,15 @@ func runReconcile(t *testing.T, m *Manager, pol ddnsPolicy, leases []Lease) erro
 	t.Helper()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.reconcileOnceLocked(context.Background(), pol, leases, nil)
+	// #2691 P1b: reconcileOnceLocked now takes a per-family env (the same policy
+	// is applied to both families here) + the disabled map. The updater is the
+	// manager's single test updater for both families; nil gate/resolver ⇒ all
+	// scopes writable (the standalone / zero-scope path these tests assert on).
+	env := &reconcileEnv{
+		pol:     [2]ddnsPolicy{pol, pol},
+		updater: [2]DNSUpdater{m.updater, m.updater},
+	}
+	return m.reconcileOnceLocked(context.Background(), env, leases, nil, nil)
 }
 
 // writeCSV writes a file (used by the state-store tests to seed an on-disk
@@ -392,7 +400,7 @@ func TestReconcileDeleteFailureBlocksReplacementUpsert(t *testing.T) {
 	if m.deleteFail.Load() != 1 {
 		t.Fatalf("deleteFail = %d, want 1", m.deleteFail.Load())
 	}
-	if _, ok := m.state.get("mac:aa", "10.0.0.10"); !ok {
+	if _, ok := m.state.get(ScopeKey{}, "mac:aa", "10.0.0.10"); !ok {
 		t.Fatal("old ownership entry dropped after failed delete")
 	}
 
@@ -409,7 +417,7 @@ func TestReconcileDeleteFailureBlocksReplacementUpsert(t *testing.T) {
 	if got := up.upsertNames(); !equalStr(got, []string{"host-b.example.com=10.0.0.10"}) {
 		t.Fatalf("replacement upserts = %v", got)
 	}
-	if _, ok := m.state.get("mac:aa", "10.0.0.10"); ok {
+	if _, ok := m.state.get(ScopeKey{}, "mac:aa", "10.0.0.10"); ok {
 		t.Fatal("old ownership entry still present after successful retry")
 	}
 }
@@ -571,7 +579,7 @@ func TestNilUpdaterIsNopNotPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("withdraw with no backend errored: %v", err)
 	}
-	if _, ok := m.state.get("mac:bb", "10.0.0.20"); ok {
+	if _, ok := m.state.get(ScopeKey{}, "mac:bb", "10.0.0.20"); ok {
 		t.Fatal("withdraw did not drop the owned entry under no-backend mode")
 	}
 }
@@ -657,11 +665,11 @@ func TestReconcileParseErrorSuppressesFamilyDeletes(t *testing.T) {
 		}
 	}
 	// The v4 owned record is still in the store.
-	if _, ok := m.state.get("mac:aa", "10.0.0.10"); !ok {
+	if _, ok := m.state.get(ScopeKey{}, "mac:aa", "10.0.0.10"); !ok {
 		t.Fatal("v4 owned record dropped after a v4 parse error (mass-delete bug)")
 	}
 	// The healthy v6 owned record is also still present (active this cycle).
-	if _, ok := m.state.get("duid:00:01/7", "2001:db8::5"); !ok {
+	if _, ok := m.state.get(ScopeKey{}, "duid:00:01/7", "2001:db8::5"); !ok {
 		t.Fatal("healthy v6 owned record lost while v4 was untrusted")
 	}
 }
@@ -683,7 +691,7 @@ func TestStateStorePersistsAndReloads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r, ok := s2.get("mac:aa", "10.0.0.10"); !ok || r.FQDN != "h.example.com" {
+	if r, ok := s2.get(ScopeKey{}, "mac:aa", "10.0.0.10"); !ok || r.FQDN != "h.example.com" {
 		t.Fatalf("reload lost record: %+v ok=%v", r, ok)
 	}
 }
@@ -733,7 +741,7 @@ func TestStateStoreUnsupportedVersionFailsOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("version-0 store must load, got error: %v", err)
 	}
-	if _, ok := s0.get("mac:bb", "10.0.0.20"); !ok {
+	if _, ok := s0.get(ScopeKey{}, "mac:bb", "10.0.0.20"); !ok {
 		t.Fatal("version-0 store should load its records")
 	}
 }

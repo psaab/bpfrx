@@ -609,6 +609,50 @@ reserved for whole-dataplane selection where a rewrite shim
   empty-tree-compiles-non-nil trap). Regression coverage:
   `pkg/config/compiler_dhcp_ddns_test.go` (dual-AST equality, absent-default,
   TSIG redaction, enum/ttl accept+reject).
+- **#2691 P1b (DDNS ScopeKey + independent v4/v6 policy + source binding):**
+  three additions to the `dynamic-dns` subtree above.
+  - **#2663 — independent v4/v6 policy.** The v4 (`dhcp-local-server`) and v6
+    (`dhcpv6-local-server`) blocks now compile to SEPARATE fields —
+    `DHCPServerConfig.DynamicDNS` (v4) and `DHCPServerConfig.DynamicDNSv6`
+    (v6) — instead of one field-merged struct. Each family keeps its OWN
+    `domain` / `update-server` / `tsig-*` / `ttl` / `conflict-policy` /
+    source-binding, so v4 leases and v6 leases can target different zones /
+    servers / TSIG keys, and a v4 conflict or v4 turn-off never affects v6.
+    Backward compatibility: a config that sets the block under only ONE family
+    still works — the engine (`ReconcileScoped`) INHERITS that single policy for
+    the other family at reconcile time, so committed single-block configs are
+    byte-for-byte unchanged; the moment BOTH families set their own block they
+    are fully independent. The pre-P1b field-merge (`mergeDHCPDynamicDNS`) is
+    retained only as a defensive same-family-block-seen-twice no-op.
+  - **#2665 — source / interface / VRF binding** (three new free-form
+    `args:1` leaves on the `dynamic-dns` subtree, per family):
+    - `source-address <ip>` — bind the RFC 2136 UPDATE socket's source IP.
+    - `destination-interface <if>` — pin egress to an interface
+      (`SO_BINDTODEVICE`).
+    - `routing-instance <name>` — egress from a routing-instance / VRF (binds
+      to the VRF master device, which shares the routing-instance name).
+    They are free-form (an IP / interface / instance name is not rejected at the
+    typed-schema layer) and FAIL-OPEN at runtime: an invalid `source-address`
+    makes the live backend fall back to no-op for that family (logged + counted),
+    never a hard commit brick — matching the existing `update-server` / `tsig-*`
+    posture. The live rfc2136 backend (`pkg/ddns/backend_bind.go`) builds a
+    custom `net.Dialer` (a single `Control` hook does `unix.Bind` for the source
+    IP and `SO_BINDTODEVICE` for the interface/VRF, so the bind works for both
+    the UDP-first and the TCP-retry exchange); a config with no binding leaves
+    the default transport unchanged. `destination-interface` wins over
+    `routing-instance` for `SO_BINDTODEVICE` (the more specific pin).
+  - **ScopeKey (#2663/#2664).** Ownership records now carry a `ScopeKey`
+    `{Family, Interface, Unit, RoutingInstance, RGOwner, PolicyID}`
+    (`pkg/ddns/state.go`) and are keyed by `{ScopeKey, identity, address}`. The
+    ZERO scope reproduces the pre-P1b `identity|address` key byte-for-byte, so a
+    pre-P1b ownership store loads with no migration (the `scope` JSON field is a
+    pointer, omitted for the global lease scope). This is the load-bearing
+    primitive the per-RG HA gate and (future) Surface-A router publish build on.
+  Regression coverage: `pkg/config/compiler_dhcp_ddns_test.go`
+  (independent-policy, single-family-applies-to-both, source-binding-leaves),
+  `pkg/ddns/scope_test.go` (ScopeKey distinctness + pre-P1b round-trip +
+  independent v4/v6 + per-RG gate), `pkg/ddns/backend_bind_test.go` (dial
+  config), `pkg/daemon/daemon_ddns_scope_test.go` (per-RG resolver + gate).
 - **#2243 (DHCP-server static / fixed / reserved host bindings):** added a
   `static-binding <mac>` named-instance subtree under `services
   dhcp-local-server group <g> pool <p>` AND `services dhcpv6-local-server

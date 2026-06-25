@@ -626,6 +626,31 @@ func dhcpDynamicDNSSchema() *schemaNode {
 			placeholder: "<secret>",
 			children:    nil,
 		},
+		// #2691 P1b / #2665: source/VRF binding for the RFC 2136 UPDATE
+		// transport (multi-WAN / VRF parity). All three are free-form leaves
+		// (an IP literal / interface name / routing-instance name) — the live
+		// backend builds a custom net.Dialer (LocalAddr + SO_BINDTODEVICE / VRF
+		// bind) from them; an unusable value is fail-open at runtime (logged,
+		// the update falls back to the default table), never a hard commit
+		// brick — matching the existing update-server / tsig-* leaves.
+		"source-address": {
+			desc:        "Source address to bind the RFC 2136 UPDATE socket to (#2665)",
+			args:        1,
+			placeholder: "<ip>",
+			children:    nil,
+		},
+		"destination-interface": {
+			desc:        "Egress interface to pin the RFC 2136 UPDATE to (SO_BINDTODEVICE, #2665)",
+			args:        1,
+			placeholder: "<interface>",
+			children:    nil,
+		},
+		"routing-instance": {
+			desc:        "Routing instance / VRF the RFC 2136 UPDATE egresses from (#2665)",
+			args:        1,
+			placeholder: "<instance>",
+			children:    nil,
+		},
 	}}
 }
 

@@ -217,11 +217,26 @@ func newRFC2136Updater(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig, client dn
 		u.tsigAlgo = algo
 		u.tsigSecret = c.TSIGSecret.Reveal()
 	}
+	// #2691 P1b / #2665: resolve the source / interface / VRF binding. An
+	// invalid source-address is a hard error (the caller falls back to no-op +
+	// counts it) so a misconfigured bind never emits UPDATEs from the wrong
+	// source.
+	bind, err := resolveBindConfig(c)
+	if err != nil {
+		return nil, err
+	}
 	if u.client == nil {
-		u.client = &dns.Client{
+		cl := &dns.Client{
 			Timeout:    u.timeout,
 			TsigSecret: u.tsigSecretMap(),
 		}
+		// Apply the custom dialer (source-address LocalAddr + interface/VRF
+		// SO_BINDTODEVICE) when any binding is requested; otherwise leave the
+		// *dns.Client's default dialer (today's behaviour byte-for-byte).
+		if d := bind.dialer(u.timeout); d != nil {
+			cl.Dialer = d
+		}
+		u.client = cl
 	}
 	return u, nil
 }

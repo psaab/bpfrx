@@ -32,7 +32,7 @@ func readDurableOwnership(t *testing.T, path string) map[string]ownedRecord {
 	}
 	out := map[string]ownedRecord{}
 	for _, r := range f.Records {
-		out[ownedRecordKey(r.Identity, r.Address)] = r
+		out[ownedRecordKey(r.scopeOf(), r.Identity, r.Address)] = r
 	}
 	return out
 }
@@ -150,7 +150,7 @@ func TestUpsertCrashAfterAddBeforeEndOfPassSave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load durable state: %v", err)
 	}
-	if _, ok := fresh.get("mac:aabb", "10.0.1.50"); !ok {
+	if _, ok := fresh.get(ScopeKey{}, "mac:aabb", "10.0.1.50"); !ok {
 		t.Fatalf("orphan: fresh manager has no durable ownership for the live RR; records=%v", fresh.records)
 	}
 }
@@ -175,7 +175,7 @@ func TestUpsertRefusedAddRemovesIntent(t *testing.T) {
 		t.Fatalf("refused add should record no successful upsert, got %v", up.upserts)
 	}
 	// Neither in-memory nor durable ownership may claim the refused name.
-	if _, ok := m.state.get("mac:aabb", "10.0.1.50"); ok {
+	if _, ok := m.state.get(ScopeKey{}, "mac:aabb", "10.0.1.50"); ok {
 		t.Fatalf("phantom in-memory ownership survived a refused add")
 	}
 	durable := readDurableOwnership(t, m.state.path)
@@ -206,7 +206,7 @@ func TestUpsertPreAddSaveFailureSuppressesPublish(t *testing.T) {
 	if len(up.upserts) != 0 {
 		t.Fatalf("publish must be suppressed when ownership cannot be durably recorded; got %v", up.upserts)
 	}
-	if _, ok := m.state.get("mac:aabb", "10.0.1.50"); ok {
+	if _, ok := m.state.get(ScopeKey{}, "mac:aabb", "10.0.1.50"); ok {
 		t.Fatalf("in-memory ownership left after a suppressed publish")
 	}
 }

@@ -14014,3 +14014,50 @@ top.
   only full-suite failure is the pre-existing `pkg/fsatomic` canary flagging
   `pkg/dataplane/proxyarp.go` (untouched by this PR). `make test-failover`
   deferred to the parent (no cluster access); the HA gate is call-through-only.
+
+---
+
+## 2026-06-24 — #2691 Phase P1b: ScopeKey + per-scope policy + per-RG HA gate + source binding
+
+- **Timestamp**: 2026-06-24
+- **Action**: Implement #2691 P1b (closes #2663, #2664, #2665) on the P1a
+  pkg/ddns spine — the load-bearing ScopeKey primitive, independent v4/v6
+  policy, the per-RG HA writer gate, and RFC 2136 source/VRF binding.
+- **ScopeKey (#2663/#2664, plan §5.4)**: added `ScopeKey
+  {Family,Interface,Unit,RoutingInstance,RGOwner,PolicyID}` +
+  `Family`/`familyOf` to `pkg/ddns/state.go`. Ownership records carry a
+  `*ScopeKey` (pointer → JSON-omitted for the zero/global scope) and are keyed
+  by `{scope,identity,address}`. The ZERO scope reproduces the pre-P1b
+  `identity|address` key byte-for-byte → pre-P1b stores load with NO migration
+  (plan §11 Q7). `scopeOf()`/`withScope()` helpers; `get`/`delete`/`put`/`all`
+  + `loadDDNSState` made scope-aware.
+- **Independent v4/v6 policy (#2663)**: `Reconcile` → `ReconcileScoped`
+  resolves a policy + backend PER FAMILY (`reconcileEnv.pol[2]/updater[2]`)
+  from `DHCPServerConfig.DynamicDNS` (v4) + new `.DynamicDNSv6` (v6). Compiler
+  routes v4→DynamicDNS, v6→DynamicDNSv6 (no more field-merge). Single-family
+  backward compat: the other family inherits the single block at reconcile.
+- **Per-RG HA gate (#2664)**: `ReconcileOptions{Gate,Resolver}` →
+  `reconcileOnceLocked` tags each lease's scope + applies the gate
+  (stop-writing-never-withdraw for a gated-out scope; fail-closed on
+  unattributable when RG-owned pools exist). Daemon `ddnsReconcileOptions`
+  builds the resolver (lease addr → pool-subnet CIDR → group → interface → RG)
+  + gate (master[RGOwner]); `reconcileDDNSOnce` calls `ReconcileScoped`. Added
+  the partial-demotion DDNS nudge in `clearRethServicesForRG`.
+- **Source/VRF binding (#2665)**: new `pkg/ddns/backend_bind.go` builds a
+  custom `net.Dialer` (one Control hook: `unix.Bind` source IP +
+  `SO_BINDTODEVICE` interface/VRF, works for UDP-first + TCP-retry).
+  `newRFC2136Updater` installs it; invalid source-address → hard ctor error →
+  family falls back to no-op. New config leaves source-address /
+  destination-interface / routing-instance (schema + compiler + types).
+- **File(s)**: [Write] pkg/ddns/backend_bind.go, pkg/ddns/scope_test.go,
+  pkg/ddns/backend_bind_test.go, pkg/daemon/daemon_ddns_scope_test.go;
+  [Edit] pkg/ddns/{state,manager,backend_rfc2136,README}.go|md,
+  pkg/ddns/{manager_test,durability_test}.go,
+  pkg/config/{types_system,compiler_services,schema_system}.go,
+  pkg/config/compiler_dhcp_ddns_test.go,
+  pkg/daemon/{daemon_ddns,daemon_ha}.go, docs/config-schema.md, _Log.md.
+- **Validation**: `go build ./...` clean; `gofmt`/`go vet` clean on touched
+  files; `go test ./pkg/ddns/ ./pkg/config/ ./pkg/dhcpserver/ ./pkg/daemon/`
+  all green; `go test -race ./pkg/ddns/` green. `make test-failover` is
+  MANDATORY (HA gate change) and DEFERRED to the parent (no cluster access);
+  the gate is reasoned + unit-tested (partial-demotion + fail-on-revert).

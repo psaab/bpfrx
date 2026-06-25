@@ -81,3 +81,43 @@ no change in those packages:
 
 The HA writer gate (`ddnsWriterGateOpen`) stays in `pkg/daemon/daemon_ddns.go`
 (it reads cluster RG state); P1a did not move or change it.
+
+## Phase P1b — ScopeKey, per-family policy, per-RG HA gate, source binding
+
+P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
+
+- **ScopeKey (`state.go`, #2663/#2664, plan §5.4)** — the unifying ownership
+  primitive `{Family, Interface, Unit, RoutingInstance, RGOwner, PolicyID}`.
+  Ownership records are now keyed by `{ScopeKey, identity, address}`. The ZERO
+  scope reproduces the pre-P1b `identity|address` key byte-for-byte (the `scope`
+  JSON field is a `*ScopeKey`, omitted for the global lease scope), so a pre-P1b
+  store loads with **no migration**. Two scopes for the same name+address (a v4
+  vs v6 publish, or an RG0-owned vs RG1-owned publish) are DISTINCT entries.
+- **Independent v4/v6 policy (#2663)** — `Reconcile` →
+  `ReconcileScoped` resolves an INDEPENDENT policy + backend PER FAMILY
+  (`reconcileEnv.pol[2]`/`updater[2]`) from `DHCPServerConfig.DynamicDNS` (v4)
+  and `.DynamicDNSv6` (v6). A v4 conflict, a v4 backend error, or a v4 turn-off
+  never affects v6. Single-block backward compat: if only one family's block is
+  set, the other inherits it at reconcile time.
+- **Per-RG HA writer gate (#2664)** — `ReconcileScoped` takes a
+  `ScopeGate`/`ScopeResolver` (built in `pkg/daemon/daemon_ddns.go`
+  `ddnsReconcileOptions`). The resolver attributes each lease to its owning RG
+  by STABLE pool-subnet CIDR membership (not the per-render-unstable Kea
+  subnet_id); the gate admits a scope IFF this node is MASTER for its RG. A
+  gated-out scope is **stop-writing, never-withdraw**: its owned records are left
+  untouched (the peer MASTER for that RG refreshes them — a withdraw would
+  blackhole, plan §5.6). Unattributable leases FAIL-CLOSED when RG-owned pools
+  exist. The daemon also nudges DDNS on a partial demotion
+  (`clearRethServicesForRG`) so the gate change takes effect within one pass.
+- **Source / VRF binding (#2665, `backend_bind.go`)** — the per-family
+  `source-address` / `destination-interface` / `routing-instance` leaves build a
+  custom `net.Dialer` (one `Control` hook: `unix.Bind` for the source IP +
+  `SO_BINDTODEVICE` for the interface/VRF, working for both the UDP-first and
+  TCP-retry exchange). Fail-open at runtime; an invalid source-address falls the
+  family back to no-op.
+
+**HA correctness:** the per-RG gate change MUST pass `make test-failover` (the
+project rule for any gate / HA-path change). P1b adds the gate + the
+partial-demotion nudge; reason about split-brain (uncertain RG → fail-closed)
+and partial demotion (lose one RG, keep another → publish only the kept RG,
+withdraw nothing) in `scope_test.go` / `daemon_ddns_scope_test.go`.

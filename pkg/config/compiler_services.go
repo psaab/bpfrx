@@ -346,18 +346,24 @@ func compileDHCPLocalServer(node *Node, dhcp *DHCPServerConfig, isV6 bool) error
 		dhcp.DHCPLocalServer = lsc
 	}
 
-	// #1387: the dynamic-dns block is a server-level policy shared by all
-	// pools of the family. It can appear under dhcp-local-server and/or
-	// dhcpv6-local-server; the typed model carries a single
-	// DHCPDynamicDNSConfig (the reconciler walks both families' leases).
-	// When BOTH families carry a block we MERGE field-by-field rather than
-	// whole-struct overwrite: a partial second block (e.g. only `domain`
-	// under v6) must NOT clear the v4 block's Enabled/server/ttl. A field
-	// set in either block wins; presence-only `enable` latches on (once any
-	// family enables DDNS it stays enabled). See mergeDHCPDynamicDNS.
+	// #1387 + #2691 P1b (#2663 independent v4/v6 policy): the dynamic-dns block
+	// is a server-level policy for THIS family. It can appear under
+	// dhcp-local-server (v4) and/or dhcpv6-local-server (v6); each family's
+	// block now compiles into its OWN typed field — DynamicDNS (v4) /
+	// DynamicDNSv6 (v6) — so the two families keep INDEPENDENT
+	// domain/server/TSIG/TTL/conflict-policy/source-binding. This replaces the
+	// pre-P1b field-MERGE (mergeDHCPDynamicDNS), under which a v6 `domain`
+	// silently filled an empty v4 field and a single shared struct could not
+	// represent two different servers. mergeDHCPDynamicDNS is retained ONLY for
+	// the degenerate same-family-block-seen-twice case (compileDHCPLocalServer
+	// runs once per family, so it is effectively a defensive no-op now).
 	if ddnsNode := node.FindChild("dynamic-dns"); ddnsNode != nil {
 		if ddns := compileDHCPDynamicDNS(ddnsNode); ddns != nil {
-			dhcp.DynamicDNS = mergeDHCPDynamicDNS(dhcp.DynamicDNS, ddns)
+			if isV6 {
+				dhcp.DynamicDNSv6 = mergeDHCPDynamicDNS(dhcp.DynamicDNSv6, ddns)
+			} else {
+				dhcp.DynamicDNS = mergeDHCPDynamicDNS(dhcp.DynamicDNS, ddns)
+			}
 		}
 	}
 
@@ -485,6 +491,15 @@ func mergeDHCPDynamicDNS(dst, src *DHCPDynamicDNSConfig) *DHCPDynamicDNSConfig {
 	if dst.TSIGSecret == "" {
 		dst.TSIGSecret = src.TSIGSecret
 	}
+	if dst.SourceAddress == "" {
+		dst.SourceAddress = src.SourceAddress
+	}
+	if dst.DestinationInterface == "" {
+		dst.DestinationInterface = src.DestinationInterface
+	}
+	if dst.RoutingInstance == "" {
+		dst.RoutingInstance = src.RoutingInstance
+	}
 	if dst.TTLSeconds == 0 {
 		dst.TTLSeconds = src.TTLSeconds
 	}
@@ -505,6 +520,10 @@ var dhcpDDNSStringProps = map[string]bool{
 	"tsig-key":        true,
 	"tsig-algorithm":  true,
 	"tsig-secret":     true,
+	// #2691 P1b / #2665 source-binding leaves (per-family transport scoping).
+	"source-address":        true,
+	"destination-interface": true,
+	"routing-instance":      true,
 }
 
 // compileDHCPDynamicDNS converts a parsed `dynamic-dns` subtree into a
@@ -563,6 +582,9 @@ func compileDHCPDynamicDNS(node *Node) *DHCPDynamicDNSConfig {
 	d.TSIGKeyName = props["tsig-key"]
 	d.TSIGAlgorithm = props["tsig-algorithm"]
 	d.TSIGSecret = Secret(props["tsig-secret"])
+	d.SourceAddress = props["source-address"]
+	d.DestinationInterface = props["destination-interface"]
+	d.RoutingInstance = props["routing-instance"]
 	if v := props["ttl"]; v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			d.TTLSeconds = n
@@ -574,7 +596,8 @@ func compileDHCPDynamicDNS(node *Node) *DHCPDynamicDNSConfig {
 	if !d.Enabled && d.Domain == "" && d.HostnameSource == "" &&
 		d.ConflictPolicy == "" && d.Backend == "" && d.UpdateServer == "" &&
 		d.TSIGKeyName == "" && d.TSIGAlgorithm == "" && d.TSIGSecret == "" &&
-		d.TTLSeconds == 0 {
+		d.SourceAddress == "" && d.DestinationInterface == "" &&
+		d.RoutingInstance == "" && d.TTLSeconds == 0 {
 		return nil
 	}
 	return d
