@@ -553,3 +553,98 @@ func TestXfrmClearStillDeletesAll(t *testing.T) {
 		t.Errorf("Clear left %d tracked xfrmis, want 0", len(xm.xfrmis))
 	}
 }
+
+// TestXfrmApplyIfIDCollisionRefused is the #2909 regression. A bare
+// secure-tunnel bind-interface ("st0") and an explicit ".0"
+// bind-interface ("st0.0") derive DISTINCT device names ("st0" vs
+// "st0.0") but the SAME XFRM if_id (1, because unit defaults to 0 with
+// no ".N" suffix). The kernel keys SA<->xfrmi binding on if_id, so
+// creating both devices would either EEXIST or, worse, silently route
+// both VPNs' SAs to one device — leaking traffic between isolated VPNs.
+//
+// Apply must refuse to create EITHER colliding device (fail-closed):
+// zero LinkAdd, nothing tracked. The non-colliding interface in the same
+// commit must still be created normally.
+//
+// FAIL-ON-REVERT: without the if_id collision guard in Apply, both "st0"
+// and "st0.0" land in the desired set under different names and are each
+// LinkAdd'd, yielding 3 LinkAdd / 3 tracked xfrmis and two kernel
+// devices sharing if_id 1. The assertions below (2 adds, st1.0 only)
+// then fail.
+func TestXfrmApplyIfIDCollisionRefused(t *testing.T) {
+	// Sanity: the two binds really do collide on if_id under distinct
+	// names — the precondition the guard defends against.
+	nameBare, idBare := config.XFRMIfNameAndID("st0")
+	nameUnit, idUnit := config.XFRMIfNameAndID("st0.0")
+	if idBare == 0 || idUnit == 0 || idBare != idUnit || nameBare == nameUnit {
+		t.Fatalf("precondition broke: st0=(%q,%d) st0.0=(%q,%d); "+
+			"test requires distinct names sharing one if_id",
+			nameBare, idBare, nameUnit, idUnit)
+	}
+
+	ops := newFakeLinkOps()
+	xm := &xfrmManager{ops: ops}
+
+	// st0 + st0.0 collide on if_id; st1.0 is independent and must survive.
+	if err := xm.Apply(xfrmVPNs("st0", "st0.0", "st1.0")); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// Only the non-colliding st1.0 may be created.
+	if ops.addCount != 1 {
+		t.Errorf("collision Apply issued %d LinkAdd, want exactly 1 "+
+			"(only the non-colliding st1.0)", ops.addCount)
+	}
+	survivor, _ := config.XFRMIfNameAndID("st1.0")
+	if _, ok := xm.xfrmis[survivor]; !ok {
+		t.Errorf("non-colliding xfrmi %q not tracked", survivor)
+	}
+	if len(xm.xfrmis) != 1 {
+		t.Errorf("tracked %d xfrmis, want exactly 1 (collision pair dropped)",
+			len(xm.xfrmis))
+	}
+	// Neither colliding device may exist in the kernel.
+	for _, n := range []string{nameBare, nameUnit} {
+		if _, ok := ops.links[n]; ok {
+			t.Errorf("colliding xfrmi %q was created in the kernel", n)
+		}
+		if _, ok := xm.xfrmis[n]; ok {
+			t.Errorf("colliding xfrmi %q was tracked", n)
+		}
+	}
+}
+
+// TestXfrmApplyCollisionDeletesPriorDevice covers the case where a
+// previously-created, correctly-tracked xfrmi later becomes one half of
+// an if_id collision (a subsequent commit adds the aliasing
+// bind-interface). The colliding pair must be removed entirely — the
+// formerly-good device is torn down rather than left sharing its if_id.
+func TestXfrmApplyCollisionDeletesPriorDevice(t *testing.T) {
+	ops := newFakeLinkOps()
+	xm := &xfrmManager{ops: ops}
+
+	// First commit: only st0.0 — created and tracked normally.
+	if err := xm.Apply(xfrmVPNs("st0.0")); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	nameUnit, _ := config.XFRMIfNameAndID("st0.0")
+	if _, ok := xm.xfrmis[nameUnit]; !ok {
+		t.Fatalf("st0.0 not tracked after first Apply")
+	}
+
+	// Second commit introduces the aliasing bare st0 (same if_id 1).
+	if err := xm.Apply(xfrmVPNs("st0.0", "st0")); err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+
+	nameBare, _ := config.XFRMIfNameAndID("st0")
+	if len(xm.xfrmis) != 0 {
+		t.Errorf("collision left %d tracked xfrmis, want 0", len(xm.xfrmis))
+	}
+	if _, ok := ops.links[nameUnit]; ok {
+		t.Errorf("formerly-good xfrmi %q not torn down on collision", nameUnit)
+	}
+	if _, ok := ops.links[nameBare]; ok {
+		t.Errorf("colliding xfrmi %q was created", nameBare)
+	}
+}

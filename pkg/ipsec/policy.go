@@ -650,9 +650,13 @@ func resolveConfiguredInterfaceAddress(cfg *config.Config, ifaceRef string, fami
 		return ""
 	}
 
+	// Zone identifier for a link-local result is the kernel interface name of
+	// the configured ifaceRef base (#2885) — the vSRX name xpfd renames to.
+	zone := config.LinuxIfName(base)
+
 	if unit, ok := ifc.Units[unitNum]; ok {
 		if addr := selectUnitAddress(unit, family); addr != "" {
-			return addr
+			return zoneQualify(addr, zone)
 		}
 	}
 
@@ -664,7 +668,7 @@ func resolveConfiguredInterfaceAddress(cfg *config.Config, ifaceRef string, fami
 		sort.Ints(unitIDs)
 		for _, id := range unitIDs {
 			if addr := selectUnitAddress(ifc.Units[id], family); addr != "" {
-				return addr
+				return zoneQualify(addr, zone)
 			}
 		}
 	}
@@ -677,17 +681,12 @@ func selectUnitAddress(unit *config.InterfaceUnit, family int) string {
 		return ""
 	}
 
-	for _, candidate := range []string{unit.PrimaryAddress, unit.PreferredAddress} {
-		if addr := bareIP(candidate, family); addr != "" {
-			return addr
-		}
-	}
-	for _, candidate := range unit.Addresses {
-		if addr := bareIP(candidate, family); addr != "" {
-			return addr
-		}
-	}
-	return ""
+	candidates := make([]string, 0, 2+len(unit.Addresses))
+	candidates = append(candidates, unit.PrimaryAddress, unit.PreferredAddress)
+	candidates = append(candidates, unit.Addresses...)
+	// Global-wins is order-independent (#2885): selectFamilyAddress scans
+	// family-6 candidates for a global address before admitting link-local.
+	return selectFamilyAddress(candidates, family)
 }
 
 func resolveKernelInterfaceAddress(ifaceName string, family int) string {
@@ -702,8 +701,38 @@ func resolveKernelInterfaceAddress(ifaceName string, family int) string {
 	if err != nil {
 		return ""
 	}
+	candidates := make([]string, 0, len(addrs))
 	for _, addr := range addrs {
-		if ip := bareIP(addr.String(), family); ip != "" {
+		candidates = append(candidates, addr.String())
+	}
+	// A global address always wins over a link-local one regardless of
+	// kernel enumeration order (#2885); zone-qualify a link-local result with
+	// the interface name so strongSwan can disambiguate fe80:: on a
+	// multi-interface box.
+	if addr := selectFamilyAddress(candidates, family); addr != "" {
+		return zoneQualify(addr, ifaceName)
+	}
+	return ""
+}
+
+// selectFamilyAddress chooses one address from candidates for the requested
+// family. For family 6 it scans twice: the first pass admits only
+// global-unicast addresses, and a link-local (fe80::/10) candidate is accepted
+// only if no global address is present. This makes "global wins" independent of
+// candidate enumeration order (config order or kernel order) — without it a
+// link-local enumerated before the global IPv6 would be selected first (#2885).
+// For family 4 and family-agnostic (0) selection, link-local is never admitted
+// by matchFamily, so a single pass is sufficient.
+func selectFamilyAddress(candidates []string, family int) string {
+	if family == 6 {
+		for _, c := range candidates {
+			if ip := bareIPGlobalOnly(c); ip != "" {
+				return ip
+			}
+		}
+	}
+	for _, c := range candidates {
+		if ip := bareIP(c, family); ip != "" {
 			return ip
 		}
 	}
@@ -711,16 +740,46 @@ func resolveKernelInterfaceAddress(ifaceName string, family int) string {
 }
 
 func bareIP(addr string, family int) string {
-	if addr == "" {
+	ip := parseBareIP(addr)
+	if ip == nil {
 		return ""
 	}
+	return matchFamily(ip, family)
+}
+
+// bareIPGlobalOnly is bareIP restricted to global-unicast IPv6 — the first pass
+// of the family-6 global-wins scan in selectFamilyAddress (#2885).
+func bareIPGlobalOnly(addr string) string {
+	ip := parseBareIP(addr)
+	if ip == nil || !ip.IsGlobalUnicast() || ip.To4() != nil {
+		return ""
+	}
+	return matchFamily(ip, 6)
+}
+
+func parseBareIP(addr string) net.IP {
+	if addr == "" {
+		return nil
+	}
 	if ip, _, err := net.ParseCIDR(addr); err == nil {
-		return matchFamily(ip, family)
+		return ip
 	}
-	if ip := net.ParseIP(addr); ip != nil {
-		return matchFamily(ip, family)
+	return net.ParseIP(addr)
+}
+
+// zoneQualify appends the IPv6 zone (%<iface>) to a link-local source address
+// so strongSwan/the kernel can pick the right interface when more than one
+// interface carries an fe80:: address (#2885). Non-link-local addresses, an
+// empty iface name, and addresses already carrying a zone are returned
+// unchanged.
+func zoneQualify(addr, ifaceName string) string {
+	if ifaceName == "" || strings.Contains(addr, "%") {
+		return addr
 	}
-	return ""
+	if ip := net.ParseIP(addr); ip != nil && ip.IsLinkLocalUnicast() && ip.To4() == nil {
+		return addr + "%" + ifaceName
+	}
+	return addr
 }
 
 func addressFamilyHint(addr string) int {
@@ -735,11 +794,22 @@ func addressFamilyHint(addr string) int {
 }
 
 func matchFamily(ip net.IP, family int) string {
-	if ip == nil || !ip.IsGlobalUnicast() {
+	if ip == nil {
+		return ""
+	}
+	// Global unicast covers the common case. IPv6 link-local unicast
+	// (fe80::/10) is also a valid IPsec local-bind source on point-to-point
+	// / link-local IPv6 links (#2885); IsGlobalUnicast() rejects it, so admit
+	// it explicitly here. Multicast, unspecified, and loopback stay excluded.
+	if !ip.IsGlobalUnicast() && !ip.IsLinkLocalUnicast() {
 		return ""
 	}
 	switch family {
 	case 4:
+		// IPv4 link-local (169.254.0.0/16) is not a usable IPsec source.
+		if ip.IsLinkLocalUnicast() {
+			return ""
+		}
 		if ip4 := ip.To4(); ip4 != nil {
 			return ip4.String()
 		}
@@ -748,6 +818,11 @@ func matchFamily(ip net.IP, family int) string {
 			return ip.String()
 		}
 	default:
+		// Family-agnostic selection: never surface a link-local address
+		// implicitly — only an explicit family-6 hint may bind link-local.
+		if ip.IsLinkLocalUnicast() {
+			return ""
+		}
 		return ip.String()
 	}
 	return ""

@@ -56,7 +56,27 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 	}
 
 	// Build the desired name -> if_id set from the VPN config.
+	//
+	// The XFRM interface id MUST be unique per distinct xfrmi device:
+	// the kernel keys SA<->xfrmi binding on if_id, so two devices that
+	// share an if_id make the SAs route to whichever device the kernel
+	// matched first — leaking traffic between VPNs that are supposed to
+	// be isolated (#2909). config.XFRMIfNameAndID can derive a colliding
+	// id for distinct bind-interfaces: a bare "st0" and an explicit
+	// "st0.0" both yield if_id 1 (unit defaults to 0 when no ".N" suffix
+	// is present) under DIFFERENT device names ("st0" vs "st0.0"). Detect
+	// such a collision here and refuse to create either colliding device
+	// — better to leave both tunnels' xfrmi absent (fail-closed, no
+	// transit) than to create two devices that silently cross-leak.
+	//
+	// The proper long-term fix is a commit-time rejection of an ambiguous
+	// secure-tunnel bind-interface in the config compiler / pkg/ipsec
+	// (tracked separately); this routing guard is the last line of
+	// defense so a config that slips through never programs colliding
+	// kernel state.
 	desired := make(map[string]uint32, len(vpns))
+	idToName := make(map[uint32]string, len(vpns))
+	collidingIDs := make(map[uint32]struct{})
 	for _, vpn := range vpns {
 		if vpn.BindInterface == "" {
 			continue
@@ -67,7 +87,27 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 				"vpn", vpn.Name, "bind-interface", vpn.BindInterface)
 			continue
 		}
+		if prev, dup := idToName[ifID]; dup && prev != ifName {
+			// A different device name already claimed this if_id. Mark
+			// the id as colliding; both names are dropped below.
+			collidingIDs[ifID] = struct{}{}
+			slog.Error("xfrmi if_id collision: distinct bind-interfaces "+
+				"derive the same XFRM if_id; refusing to create either "+
+				"(cross-VPN leak / EEXIST risk)",
+				"if_id", ifID, "name_a", prev, "name_b", ifName,
+				"vpn", vpn.Name)
+			continue
+		}
+		idToName[ifID] = ifName
 		desired[ifName] = ifID
+	}
+	// Drop every device whose if_id collided. The first claimant was
+	// recorded in desired before the collision was seen, so remove it too
+	// — neither colliding device may be programmed.
+	for id := range collidingIDs {
+		if name, ok := idToName[id]; ok {
+			delete(desired, name)
+		}
 	}
 
 	// Delete xfrmis no longer desired, plus those whose if_id changed

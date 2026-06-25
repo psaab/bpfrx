@@ -946,6 +946,100 @@ func TestWriteManagedSection_OrphanedBeginMarker(t *testing.T) {
 	}
 }
 
+// TestWriteManagedSection_StaleEndMarkerBeforeBegin is the #2908 regression
+// test (agy-review-053 053-03). A stale end-marker positioned *before* the
+// live begin marker (operator hand-edit, an interleaved partial copy, or
+// external tooling) used to make the unanchored strings.Index(content,
+// markerEnd) return end < start. The strip content[:start] + content[end:]
+// then DUPLICATED the text between end and start while leaving the live begin
+// marker in place, producing two begin markers and a corrupt managed block
+// that FRR reload rejects.
+//
+// This is distinct from #1646 (orphaned begin / missing end). The fix anchors
+// the end-marker search strictly after the begin marker so end >= start always
+// holds and the slice can never duplicate.
+//
+// FAIL-ON-REVERT: if the end-marker lookup is reverted to the from-0
+// strings.Index(content, markerEnd), the stale-end case yields end < start and
+// this test fails on the duplicated begin marker and corrupted body.
+func TestWriteManagedSection_StaleEndMarkerBeforeBegin(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "frr.conf")
+
+	m := &Manager{frrConf: confPath}
+
+	// Construct a file where a STALE end marker appears BEFORE the live begin
+	// marker, with operator config interleaved around them.
+	stale := "log syslog informational\n" +
+		"ip route 192.0.2.0/24 198.51.100.1\n" + // operator config, before stale end
+		markerEnd + "\n" + // STALE/orphaned end marker (no preceding begin)
+		"ip route 203.0.113.0/24 198.51.100.2\n" + // operator config, between markers
+		markerBegin + "\n" +
+		"ip route 10.0.0.0/8 192.168.9.9\n" + // current managed body
+		markerEnd + "\n"
+	if err := os.WriteFile(confPath, []byte(stale), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.writeManagedSection("ip route 10.0.0.0/8 192.168.2.1\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(confPath)
+	got := string(data)
+
+	// Exactly one begin marker. With the from-0 lookup, end < start kept the
+	// live begin marker AND re-appended the duplicated tail → two begin
+	// markers.
+	if n := strings.Count(got, markerBegin); n != 1 {
+		t.Errorf("expected exactly 1 begin marker, got %d:\n%s", n, got)
+	}
+	// Exactly one end marker — the stale one must be carried as inert operator
+	// text (it is just a comment line outside the managed block) but the
+	// managed block itself must contribute exactly one. The total end-marker
+	// count is the stale one + the managed one = 2; what matters is that the
+	// managed block is well formed (one begin, and an end after it).
+	beginIdx := strings.Index(got, markerBegin)
+	if beginIdx < 0 {
+		t.Fatalf("managed begin marker missing:\n%s", got)
+	}
+	if !strings.Contains(got[beginIdx:], markerEnd) {
+		t.Errorf("managed block has no end marker after its begin:\n%s", got)
+	}
+	// The new managed route is present; the old managed body is gone.
+	if !strings.Contains(got, "ip route 10.0.0.0/8 192.168.2.1") {
+		t.Errorf("new managed route missing:\n%s", got)
+	}
+	if strings.Contains(got, "192.168.9.9") {
+		t.Errorf("old managed body was not replaced:\n%s", got)
+	}
+	// Operator config on both sides of the stale end marker must survive.
+	if !strings.Contains(got, "ip route 192.0.2.0/24 198.51.100.1") {
+		t.Errorf("operator config before stale end marker lost:\n%s", got)
+	}
+	if !strings.Contains(got, "ip route 203.0.113.0/24 198.51.100.2") {
+		t.Errorf("operator config between markers lost:\n%s", got)
+	}
+
+	// A SECOND write must stay stable — exactly one begin marker, operator
+	// config preserved, route updated. This is where a duplicated-begin state
+	// from the first write would corrupt the file on the next over-cut.
+	if err := m.writeManagedSection("ip route 10.0.0.0/8 192.168.3.3\n"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(confPath)
+	got = string(data)
+	if n := strings.Count(got, markerBegin); n != 1 {
+		t.Errorf("second write: expected 1 begin marker, got %d:\n%s", n, got)
+	}
+	if !strings.Contains(got, "ip route 192.0.2.0/24 198.51.100.1") {
+		t.Errorf("second write: operator config before stale end lost:\n%s", got)
+	}
+	if !strings.Contains(got, "192.168.3.3") {
+		t.Errorf("second write's route missing:\n%s", got)
+	}
+}
+
 // TestWriteManagedSection_PreservesExistingMode guards the Copilot finding on
 // #1646: the atomic temp-file + rename write replaces the inode, so it must
 // reuse the existing file's mode rather than unconditionally applying 0644.
