@@ -1,3 +1,60 @@
+## 2026-06-25 — #2918: neighbor initial dump consumed and dropped seq-0 multicast RTM_NEWNEIGH/DELNEIGH events
+
+- **Timestamp**: 2026-06-25
+- **Action**: `initial_neighbor_dump` runs on a netlink fd already joined
+  to `RTMGRP_NEIGH` (the same fd backs the steady-state monitor). Its read
+  loop skipped every message whose `nlmsg_seq != next_seq`. Async multicast
+  `RTM_NEWNEIGH`/`RTM_DELNEIGH` notifications carry `nlmsg_seq == 0`, so one
+  interleaved during the dump was consumed off the socket and dropped
+  (seq 0 != next_seq) — never redelivered, leaving the dynamic neighbor map
+  stale until an unrelated later event or re-dump (#2918, codex-review-054
+  054-04). Startup + HA failover are peak neighbor-churn, so a lost event
+  could cause a first-packet blackhole. Fix: extracted the per-recv-batch
+  parse into a pure `process_dump_batch` helper that, on an off-sequence
+  message, routes a seq-0 type-28/29 event through the same
+  `parse_neighbor_msg` path the steady-state monitor uses (absorb instead of
+  discard); all other off-seq control messages are still skipped, and the
+  dump's own `next_seq` still drives NLMSG_DONE/NLMSG_ERROR detection.
+- **File(s)**: userspace-dp/src/afxdp/neighbor.rs (process_dump_batch +
+  DumpBatchOutcome, initial_neighbor_dump rewired through it, doc-comment
+  records the #2918 rationale + seq-matching contract; dump_batch_tests
+  module with the fail-on-revert + completion-keying guards), _Log.md.
+  No separate operator/state doc edit: the neighbor module has no doc
+  describing the dump loop's seq-matching — the contract lives in the
+  `process_dump_batch` doc-comment, which now records it.
+- **Validation**: CARGO_TARGET_DIR=/tmp/cargo-2918 cargo build --release -p
+  xpf-userspace-dp OK; cargo test -p xpf-userspace-dp neighbor → 122 passed
+  / 0 failed (incl. the 2 new tests). FAIL-ON-REVERT proven: reverting
+  process_dump_batch to the bare `nlmsg_seq != next_seq { continue }` skip
+  turns dump_batch_absorbs_interleaved_seq0_multicast_newneigh RED with the
+  #2918 assertion message; restored + re-green.
+
+## 2026-06-25 — #2876: HA demotion drain reports DrainComplete below the target fence
+
+- **Timestamp**: 2026-06-25
+- **Action**: The demotion-prep drain reported success even when the drained
+  sequence never reached the target fence (last-applied seq at demotion).
+  `SendDrainRequest` returned the first `DrainComplete` seq with no
+  `seq >= targetSeq` check, and the Rust helper's `handle_drain_request`
+  emitted `DrainComplete` carrying `replay_buf.back().seq` even on a 200 ms
+  timeout below the fence — so sessions created after the fence were never
+  flushed to the peer before takeover (silent HA session loss on failover).
+  Fix (both sides): Go `SendDrainRequest` now rejects `seq < targetSeq` as a
+  hard error; the Rust helper tracks `reached_target` and WITHHOLDS
+  `DrainComplete` on a below-fence timeout (Go ctx then errors). No wire
+  change — existing DrainRequest target seq / DrainComplete seq reused.
+  Siblings #2882/#2877/#2883 left out of scope.
+- **File(s)**: pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/eventstream_test.go,
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  docs/session-sync-architecture.md, _Log.md
+- **Validation**: go build/vet/gofmt clean; go test -race
+  ./pkg/dataplane/... ./pkg/cluster/... green; cargo build --release +
+  cargo test (event_stream/drain) green. Fail-on-revert proven RED on both
+  sides (Go gate removed → TestEventStreamDrainBelowFenceFails fails; Rust
+  reached_target gate removed → test_drain_below_fence_withholds_drain_complete
+  fails).
 ## 2026-06-25 — #2891: FRR backup-router IPv6 next-hop with empty dst emitted invalid `ip route 0.0.0.0/0 <v6nh>`
 
 - **Timestamp**: 2026-06-25
@@ -20,6 +77,40 @@
   ./pkg/frr/... ./pkg/config/..., go test ./pkg/frr/... ./pkg/config/... all
   green; fail-on-revert proven — reverting the family-aware default turns the
   v6 case RED with the exact pre-fix `ip route 0.0.0.0/0 2001:db8::1 250`.
+
+## 2026-06-25 — #2903: DDNS Surface A FQDN rename — new name unpublished + old name orphaned
+
+- **Timestamp**: 2026-06-25
+- **Action**: Surface A's `ScopeKey` had no FQDN axis, so changing only the
+  configured hostname for a scope (same IP) (1) was NOT detected as a change —
+  the `owned && !changed && !refreshDue` skip fired, so the new name was never
+  published; and (2) when a publish did occur the in-place ownership overwrite
+  stored the new FQDN under the SAME scope key and never `DeleteLease`'d the old
+  name — the old RR was orphaned (kept resolving forever). Fix: added an `FQDN`
+  field to `ScopeKey` and made the published name part of the Surface A scope
+  identity. `scopePrefix()` appends `/fqdn=<name>` only when non-empty, so a
+  DHCP-lease (Surface B) scope keeps its pre-#2903 prefix byte-for-byte (no
+  lease-store migration). The manager folds `SurfaceAScope.FQDN` into the key via
+  a new `effectiveKey()` used by every ownership/runtime/status lookup, so a
+  hostname change is a rename: the new scope publishes (Pass 1) and the old scope
+  — now gone-from-config — is withdrawn (Pass 2, real DeleteLease through the
+  same backend). Composes with #2778 lock-IO, #2820, #2840, #2843 status, #2846.
+- **File(s)**: pkg/ddns/state.go (ScopeKey.FQDN + scopePrefix), pkg/ddns/surface_a.go
+  (effectiveKey + adopt-on-migration + all ownership lookups),
+  pkg/daemon/daemon_ddns_surface_a.go (populate Key.FQDN),
+  pkg/ddns/surface_a_test.go (fail-on-revert tests + helper), pkg/ddns/README.md
+- **Validation**: go build ./..., gofmt -l (edited files clean), go vet
+  ./pkg/ddns/... ./pkg/daemon/..., go test -race ./pkg/ddns/... ./pkg/daemon/...
+- **Fail-on-revert matrix** (review #2924 follow-up — corrected from the original
+  over-claim that pinned the revert to effectiveKey): the LOAD-BEARING change is
+  `scopePrefix()` appending `/fqdn=`. Dropping it turns
+  TestSurfaceAFQDNChangeDetectedAndPublished + TestSurfaceAFQDNChangeWithdrawsOldName
+  RED (new name unpublished + zero deletes). The effectiveKey() FOLD is guarded
+  separately by TestSurfaceAFQDNFoldFromScopeFQDN (Key.FQDN empty, only
+  SurfaceAScope.FQDN set) — RED when effectiveKey reverts to `return s.Key`. The
+  adopt block is guarded by TestSurfaceAFQDNMigrationAdoptsExistingRecord (seed
+  legacyKey.FQDN="" so a real pre-#2903 FQDN-less record exists) — RED when the
+  adopt branch is disabled.
 
 ## 2026-06-25 — #2867: VRRP GARP/NA burst follow-up loops keep poisoning after abdication
 
@@ -17477,3 +17568,130 @@ top.
   cargo test afxdp::wg 152 passed/0 failed.
   **File(s)**: userspace-dp/src/afxdp/wg/engine.rs,
   userspace-dp/src/afxdp/wg/tests.rs, docs/wireguard-interop.md, _Log.md
+## #2892 — BGP policy `then as-path-prepend` (AS-path prepending)
+- **Timestamp**: 2026-06-25
+- **Action**: Implement Junos `then as-path-prepend "<asn> ..."` → FRR `set as-path prepend <asn> ...` end-to-end (schema typed leaf, typed struct field, compiler both AST paths, renderer). Add fail-on-revert render test + multi-ASN parse tests.
+- **File(s)**: pkg/config/types_routing.go (ASPathPrepend []string), pkg/config/schema_routing.go (then as-path-prepend multi:true leaf), pkg/config/compiler_routing.go (parsePolicyTermChildren + parsePolicyTermInlineKeys + policyTermInlineKeywords), pkg/frr/policy_render.go (set as-path prepend clause), pkg/frr/policy_as_path_prepend_2892_test.go (new), pkg/config/compiler_as_path_prepend_2892_test.go (new), pkg/frr/README.md, docs/config-schema.md, docs/feature-gaps.md
+- **Timestamp**: 2026-06-25 13:36
+  **Action**: #2909 — pkg/routing xfrmi if_id collision guard. A bare
+  secure-tunnel bind-interface (`st0`) and an explicit `st0.0` derive
+  DISTINCT device names but the SAME XFRM `if_id` (1, unit defaults to 0
+  with no `.N` suffix). The kernel keys SA<->xfrmi binding on `if_id`, so
+  programming both devices either EEXISTs or silently cross-leaks traffic
+  between VPNs meant to be isolated. `xfrmManager.Apply` now detects two
+  distinct desired names mapping to one `if_id` and refuses to create
+  EITHER (fail-closed); a formerly-good device is torn down if a later
+  commit introduces the alias. Added FAIL-ON-REVERT tests
+  (TestXfrmApplyIfIDCollisionRefused, TestXfrmApplyCollisionDeletesPriorDevice)
+  — RED without the guard (3 LinkAdd / 2 devices sharing if_id 1). Root
+  derivation lives in pkg/config/xfrmi.go; commit-time rejection is a
+  separate lane (#2885) — this is the last-line routing defense.
+  Gates: go build ./..., gofmt -l clean, go vet ./pkg/routing/...,
+  go test ./pkg/routing/... PASS.
+  **File(s)**: pkg/routing/xfrm.go, pkg/routing/iface_reuse_test.go,
+  pkg/routing/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2869 eventengine supersede() FIFO ordering fix. supersede()
+  rebuilt the bounded action queue by PREPENDING the new (superseding) action
+  ahead of drained other-policy survivors, converting the documented FIFO queue
+  into LIFO for the newest arrival and starving older queued remediations under
+  sustained event frequency. Fix: append the new action to the TAIL of the
+  survivors (`all := append(drained, a)`) so unrelated policies keep FIFO order;
+  supersede still drops/replaces only the stale same-policy entry. Added
+  fail-on-revert TestSupersede_PreservesFIFOPlacesNewAtTail (fills queue with
+  distinct other-policy actions + a stale same-policy entry, forces supersede,
+  asserts survivors keep order and the new action lands at the tail). Verified
+  RED under the reverted prepend (new action at index 0). Gates: go build ./...,
+  gofmt -l clean, go vet ./pkg/eventengine/..., go test -race
+  ./pkg/eventengine/... PASS.
+  **File(s)**: pkg/eventengine/engine.go,
+  pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2869 review fix — supersede() metrics double-count. In the
+  all-distinct-overflow case (queue full of distinct policies, a new distinct
+  policy arrives, no same-policy stale to evict) the FIFO tail-placement change
+  made the new action overflow supersede()'s refill default branch
+  (droppedQueueFull++) AND then enqueue() counted+warned again — net +2 on
+  xpf_event_actions_dropped_total{reason="queue_full"} for one dropped action.
+  Fix: guard the refill default increment with `if item.policyName !=
+  a.policyName` so supersede counts only un-replaceable SURVIVORS; the new
+  action's single count + warn is owned by enqueue (supersede returns false).
+  Added fail-on-revert TestSupersede_AllDistinctOverflowCountsDropOnce (fills 64
+  distinct, enqueues a 65th distinct, asserts droppedQueueFull delta == 1 and no
+  survivor evicted). Verified RED (delta=2) with the guard removed. Kept
+  TestSupersede_PreservesFIFOPlacesNewAtTail. Gates: go build ./..., gofmt -l
+  clean, go vet ./pkg/eventengine/..., go test -race ./pkg/eventengine/... PASS.
+  **File(s)**: pkg/eventengine/engine.go,
+  pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md, _Log.md
+## 2026-06-25 — #2885 IPsec link-local IPv6 local-bind selection
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `matchFamily` (pkg/ipsec/policy.go) rejecting IPv6
+  link-local unicast (`fe80::/10`) via `IsGlobalUnicast()`. The local-address
+  resolver gated every candidate interface address on `IsGlobalUnicast()`,
+  which is false for link-local, so an IPsec local-bind on a point-to-point /
+  link-local IPv6 link could never source from `fe80::`. Now `matchFamily`
+  also admits `IsLinkLocalUnicast()`, but link-local is surfaced ONLY for an
+  explicit family-6 hint: excluded from family-4 (and IPv4 link-local
+  169.254.0.0/16 too) and from family-agnostic (hint 0) selection so it never
+  wins implicitly over a global address. Multicast/unspecified/loopback stay
+  excluded for all families. Found by agy-review-051 051-02 (MEDIUM).
+  FAIL-ON-REVERT: TestMatchFamilyLinkLocalIPv6 asserts
+  matchFamily(fe80::1, 6) == "fe80::1"; RED ("" ) when the old IsGlobalUnicast
+  gate is restored (verified by copy-aside revert), GREEN with the fix.
+  TestMatchFamilyExclusions guards the exclusions. Gates: go build ./...,
+  gofmt -l clean, go vet ./pkg/ipsec/..., go test ./pkg/ipsec/... PASS.
+- **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/matchfamily_linklocal_test.go,
+  pkg/ipsec/README.md, _Log.md
+
+## 2026-06-25 — #2885 review fold (PR #2927 MERGE-NEEDS-MINOR x2)
+- **Timestamp**: 2026-06-25
+- **Action**: Folded two hostile-review MINORs on the #2885 fix.
+  MINOR-1 (global-must-win order-dependence): matchFamily feeds a first-match
+  loop (selectUnitAddress over config order; resolveKernelInterfaceAddress
+  over kernel order). Now that family-6 admits fe80::, a link-local enumerated
+  before the global IPv6 could win. Added selectFamilyAddress doing a two-pass
+  family-6 scan — pass 1 admits only global unicast (bareIPGlobalOnly), pass 2
+  falls back to link-local only if no global exists. Both resolvers route
+  through it; "global wins" is now order-independent.
+  MINOR-2 (bare fe80:: lacks %iface zone): a bare link-local local_addrs is
+  ambiguous on a multi-interface box. Added zoneQualify(addr, iface) appending
+  %<iface> to a link-local result; resolveKernelInterfaceAddress uses the
+  looked-up name, resolveConfiguredInterfaceAddress uses config.LinuxIfName(
+  base). Global/IPv4/already-zoned addresses pass through unchanged.
+  FAIL-ON-REVERT: TestSelectUnitAddressFamily6GlobalWinsOverLinkLocal (link-
+  local listed FIRST, asserts the GLOBAL wins) goes RED when the global-only
+  first pass is removed; TestResolveConfiguredInterfaceAddressZoneQualifiesLink
+  Local asserts fe80::1%ge-0-0-3 and goes RED when zoneQualify is neutered.
+  Both verified via copy-aside revert. Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/ipsec/..., go test ./pkg/ipsec/... PASS.
+- **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/matchfamily_linklocal_test.go,
+  pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix three REST query-filter bugs (#2934/#2935/#2939) — fail
+  closed on malformed filters, align protocol matching with gRPC/CLI, and
+  switch the event filter from substring to exact match.
+  - #2934: REST `zone` (uint16) and policy-match `dst_port` (int) filters
+    returned the default (0 = "no filter"/"any port") on a parse error,
+    silently widening the query — a cross-zone observability leak. Added
+    `queryUint16Strict`/`queryIntStrict` (api.go) that return (0,false) on
+    a malformed non-empty value; sessions/events `zone` and policy-match
+    `dst_port` now return HTTP 400, mirroring gRPC sessionFilter.validate.
+  - #2935: REST session `protocol` filter compared the rendered name
+    case-SENSITIVELY with no numeric form. Added `protoFilterMatches`
+    (sessions.go) — case-insensitive name OR numeric IP-proto — mirroring
+    gRPC/CLI. `tcp`/`TCP`/`6` all match TCP now.
+  - #2939: `EventFilter.matches` (pkg/logging/eventbuf.go) used
+    `strings.Contains` (substring) → `protocol=C` matched TCP+ICMP+ICMPv6.
+    Switched to `strings.EqualFold` exact match for Protocol and Action.
+  - Fail-on-revert proofs (copy-aside + revert, all RED without fix):
+    zone=abc/65536 → 200+leak; dst_port=abc → 200 false-PERMIT; proto
+    tcp/6 → 0 sessions; event protocol=C → 3 events, action=per → 2.
+  - Gates: go build ./..., go vet ./pkg/api/..., go test ./pkg/api/...,
+    ./pkg/logging/..., ./pkg/grpcapi/, ./pkg/cli/ PASS; gofmt clean on
+    touched files.
+- **File(s)**: pkg/api/api.go, pkg/api/sessions.go, pkg/api/security.go,
+  pkg/logging/eventbuf.go, pkg/api/rest_filter_failclosed_test.go,
+  pkg/api/README.md, _Log.md

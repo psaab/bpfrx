@@ -87,6 +87,21 @@ under the daemon's errgroup. Nothing else imports this package.
   `sessions_iterator_error_test.go` in this package and in `pkg/grpcapi`
   / `pkg/cli` (CLI top-talkers fails the command; NAT summaries print a
   stderr warning).
+- Query-filter parsing fails CLOSED, matching the gRPC contract
+  (#2934/#2935/#2939). A filter sentinel of `0`/`""` means "no filter",
+  so a *malformed* filter value must error rather than silently fall
+  through to no-filter (which widens the query to everything — a
+  cross-zone observability leak). `queryUint16Strict`/`queryIntStrict`
+  (`api.go`) return `(0, false)` on a malformed non-empty value; the
+  sessions/events `zone` filter and the policy-match `dst_port` return
+  HTTP 400 instead of zeroing the predicate. The session `protocol`
+  filter (`sessions.go` `protoFilterMatches`) is case-insensitive AND
+  accepts a numeric IP protocol number (`tcp`/`TCP`/`6` all match TCP),
+  mirroring gRPC (`pkg/grpcapi` `protoFilterMatches`) and CLI. The event
+  filter (`pkg/logging` `EventFilter.matches`) matches protocol/action
+  EXACTLY (case-insensitive), not by substring — `protocol=C` no longer
+  over-matches TCP/ICMP/ICMPv6. These contracts are pinned by
+  `rest_filter_failclosed_test.go` in this package.
 - The SSE handler reads from `pkg/logging.EventBuffer`. The buffer is
   bounded; if a consumer stops reading, events are dropped silently — by
   design.

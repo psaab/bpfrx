@@ -932,13 +932,18 @@ fn handle_drain_request(
     let deadline = Instant::now() + Duration::from_millis(200);
     let was_paused = shared.paused.load(Ordering::Acquire);
 
-    // Drain channel until we've seen target_seq or timeout
+    // Drain channel until we've seen target_seq or timeout. `reached_target`
+    // records whether the fence was actually reached: a timeout below the fence
+    // (#2876) must NOT be reported as a successful DrainComplete, because the
+    // events after the fence have not been flushed to the daemon/peer.
+    let mut reached_target = false;
     loop {
         match rx.try_recv() {
             Ok(frame) => {
                 let frame_seq = frame.seq;
                 push_replay_frame(shared, replay_buf, frame);
                 if frame_seq >= target_seq {
+                    reached_target = true;
                     break;
                 }
             }
@@ -949,12 +954,14 @@ fn handle_drain_request(
                     .map(|f| f.seq >= target_seq)
                     .unwrap_or(false)
                 {
+                    reached_target = true;
                     break;
                 }
                 if Instant::now() >= deadline {
                     eprintln!(
-                        "xpf-event-stream: drain timeout, highest_seq={}",
-                        replay_buf.back().map(|f| f.seq).unwrap_or(0)
+                        "xpf-event-stream: drain timeout below fence, highest_seq={} target={}",
+                        replay_buf.back().map(|f| f.seq).unwrap_or(0),
+                        target_seq
                     );
                     break;
                 }
@@ -973,13 +980,19 @@ fn handle_drain_request(
         }
     }
 
-    // Send DrainComplete
+    // Send DrainComplete ONLY when the target fence was reached. If the drain
+    // timed out below the fence, withhold DrainComplete: the daemon's
+    // SendDrainRequest then times out (or rejects a below-target seq) and
+    // refuses to proceed with demotion, rather than silently losing the
+    // post-fence sessions on failover (#2876).
     let drain_seq = replay_buf.back().map(|f| f.seq).unwrap_or(target_seq);
-    let complete_frame = EventFrame::encode_drain_complete(drain_seq);
-    if let Err(e) = (&*stream).write_all(complete_frame.as_bytes()) {
-        eprintln!("xpf-event-stream: drain complete write error: {e}");
-    } else {
-        shared.frames_sent.fetch_add(1, Ordering::Relaxed);
+    if reached_target {
+        let complete_frame = EventFrame::encode_drain_complete(drain_seq);
+        if let Err(e) = (&*stream).write_all(complete_frame.as_bytes()) {
+            eprintln!("xpf-event-stream: drain complete write error: {e}");
+        } else {
+            shared.frames_sent.fetch_add(1, Ordering::Relaxed);
+        }
     }
     stream.set_nonblocking(true).ok();
 
@@ -988,7 +1001,14 @@ fn handle_drain_request(
         shared.paused.store(true, Ordering::Release);
     }
 
-    eprintln!("xpf-event-stream: drain complete up to seq {}", drain_seq);
+    if reached_target {
+        eprintln!("xpf-event-stream: drain complete up to seq {}", drain_seq);
+    } else {
+        eprintln!(
+            "xpf-event-stream: drain incomplete (below fence), highest_seq={} target={} -- DrainComplete withheld",
+            drain_seq, target_seq
+        );
+    }
 }
 
 /// Drain remaining events from the channel on shutdown.

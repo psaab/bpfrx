@@ -97,6 +97,17 @@ type PolicyTerm struct {
 	CommunityAdd    string // community value(s) to append (`then community add <v>`)
 	CommunityDelete string // community-list name whose members to strip (`then community delete <name>`)
 	Origin          string // BGP origin: "igp", "egp", "incomplete"
+	// ASPathPrepend holds the ordered list of ASNs to prepend to the BGP
+	// AS_PATH attribute (`then as-path-prepend "<asn> <asn> ..."`), rendered
+	// as the FRR route-map clause `set as-path prepend <asn> <asn> ...`
+	// (#2892). AS-path prepending is a fundamental inbound traffic-engineering
+	// knob — repeating the local ASN lengthens the advertised path so peers
+	// prefer a shorter alternate path. Junos accepts the ASNs as a quoted
+	// space-separated string ("65001 65001") or a bracketed list
+	// ([ 65001 65001 ]); both flatten to this slice, preserving order and
+	// repetition (the count of repeats is the whole point). Empty = no
+	// prepend clause is rendered.
+	ASPathPrepend []string
 }
 
 // RouteFilter matches a prefix with a match type.

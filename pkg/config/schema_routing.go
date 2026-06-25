@@ -177,7 +177,14 @@ var schemaPolicyOptions = &schemaNode{desc: "Policy options", children: map[stri
 				// token as the operation when it is add/delete/set/none and
 				// otherwise treats it as a bare replace value (#2848).
 				"community": {desc: "Community (add | delete | set | none | <value>)", args: 1, multi: true, placeholder: "<add|delete|set|none|community>", children: nil},
-				"origin":    {desc: "Origin", args: 1, placeholder: "<origin>", children: nil},
+				// `then as-path-prepend "<asn> <asn> ..."` prepends the listed
+				// ASNs to the advertised AS_PATH (FRR `set as-path prepend`).
+				// multi:true so a quoted "65001 65001" or bracketed
+				// [ 65001 65001 ] list keeps EVERY ASN (order + repetition
+				// matter — repeating the ASN is the whole mechanism); a
+				// single-value leaf would drop all but the first (#2892).
+				"as-path-prepend": {desc: "AS path prepend", args: 1, multi: true, placeholder: "<asn>", children: nil},
+				"origin":          {desc: "Origin", args: 1, placeholder: "<origin>", children: nil},
 			}},
 		}},
 		"then": {desc: "Default action", children: nil},

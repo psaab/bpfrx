@@ -26,7 +26,7 @@ which makes each domain unit-testable with a fake (see `rules_test.go`'s
 | `routes.go` | `routeReader` | kernel routing-table reads (`routeLister`) |
 | `routeformat.go` | free fns | Junos `show route` formatters |
 | `tunnel.go` | `tunnelManager` | GRE/IPIP tunnels + keepalive goroutines; own `mu` |
-| `xfrm.go` | `xfrmManager` | XFRM/IPsec interface lifecycle; own `mu` + tracked `name→if_id` set. `Apply` reconciles **differentially** against the tracked set (keep unchanged / create new / delete removed / recreate on `if_id` change) — it does NOT clear-all-then-rebuild, so an unrelated config commit leaves active xfrmi interfaces untouched (#2546) |
+| `xfrm.go` | `xfrmManager` | XFRM/IPsec interface lifecycle; own `mu` + tracked `name→if_id` set. `Apply` reconciles **differentially** against the tracked set (keep unchanged / create new / delete removed / recreate on `if_id` change) — it does NOT clear-all-then-rebuild, so an unrelated config commit leaves active xfrmi interfaces untouched (#2546). Refuses to create either of two distinct devices that derive the same `if_id` — fail-closed collision guard (#2909) |
 | `rules.go` | `nextTableManager` / `ribGroupManager` / `pbrManager` | policy-routing ip-rule reconcilers (`ruleOps`, stateless) |
 | `probe_pin.go` | `probePinManager` | RPM probe next-hop pin reconciler (#1827): fwmark rules in band 50-99 + pinned host routes in reserved tables 7000-7049 (`probePinOps`, stateless). `Apply` returns per-test install failures (keyed by TestKey) and rolls back the fwmark rule when the pinned route fails (best-effort — a failed rollback is swept by the next band clear; the pin reports failed either way); callers thread the failed map into `pkg/rpm` so affected tests hold state instead of probing unpinned (#1895) |
 | `bond.go` | `bondManager` | bond device lifecycle; own `mu` |
@@ -59,6 +59,28 @@ all and rebuilding:
 A no-op commit (identical VPN set) issues zero `LinkDel` and zero
 `LinkAdd`. `Clear()` (shutdown / full teardown) still deletes every
 tracked interface.
+
+#### `if_id` collision guard (#2909)
+
+The kernel keys the SA↔xfrmi binding on the XFRM `if_id`, so the `if_id`
+**must be unique per distinct xfrmi device**. `config.XFRMIfNameAndID`
+can derive a colliding id for two *distinct* `bind-interface` values: a
+bare `st0` and an explicit `st0.0` both resolve to `if_id 1` (the unit
+defaults to 0 when there is no `.N` suffix) under *different* device
+names (`st0` vs `st0.0`). Programming both would either `EEXIST` or,
+worse, silently route both VPNs' SAs through one device — leaking
+traffic between VPNs that are supposed to be isolated.
+
+`Apply` therefore detects when two distinct desired device names map to
+the same `if_id` and **refuses to create either** colliding device
+(fail-closed: no transit for the ambiguous pair beats a cross-VPN leak).
+If one half of the colliding pair was already created by an earlier
+commit, it is torn down on the commit that introduces the alias.
+Non-colliding interfaces in the same commit are created normally. The
+proper long-term fix is a commit-time rejection of an ambiguous
+secure-tunnel `bind-interface` in the config compiler / `pkg/ipsec`
+(separate lane, #2885); this routing guard is the last line of defense
+so a config that slips through never programs colliding kernel state.
 
 ## Entry points
 

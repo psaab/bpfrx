@@ -4,7 +4,8 @@
 // `#[path = "tests.rs"]` from mod.rs.
 
 use super::codec::{
-    DataplaneEventKind, DataplaneEventPayload, MSG_FULL_RESYNC, MSG_SESSION_CREATE_RT_FLOW,
+    DataplaneEventKind, DataplaneEventPayload, MSG_DRAIN_COMPLETE, MSG_FULL_RESYNC,
+    MSG_SESSION_CREATE_RT_FLOW,
 };
 use super::*;
 use std::io::{Read, Write};
@@ -1262,4 +1263,120 @@ fn test_one_and_half_frames() {
     assert_eq!(consumed, FRAME_HEADER_SIZE);
     assert_eq!(shared.acked_seq.load(Ordering::Relaxed), 4);
     assert_eq!(replay_buf.len(), 1); // only frame 5 remains
+}
+
+// Build a benign header-only replay frame (MSG_SESSION_OPEN type) carrying the
+// given seq. Used so drain replay frames are NOT mistaken for the type-8
+// DrainComplete signal under test.
+fn replay_seq_frame(seq: u64) -> EventFrame {
+    let mut data = [0u8; 256];
+    // payload_len = 0, msg_type = MSG_SESSION_OPEN (1)
+    data[4] = super::codec::MSG_SESSION_OPEN;
+    data[8..16].copy_from_slice(&seq.to_le_bytes());
+    EventFrame {
+        data,
+        len: FRAME_HEADER_SIZE as u16,
+        seq,
+    }
+}
+
+// Helper: read one wire frame header from a stream (header-only frames).
+// Returns (msg_type, seq) or None if no frame arrives within the read timeout.
+fn try_read_frame_header(stream: &mut std::os::unix::net::UnixStream) -> Option<(u8, u64)> {
+    let mut hdr = [0u8; FRAME_HEADER_SIZE];
+    match stream.read_exact(&mut hdr) {
+        Ok(()) => {
+            let payload_len =
+                u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+            // Consume any payload so the next header read is aligned.
+            if payload_len > 0 {
+                let mut sink = vec![0u8; payload_len];
+                stream.read_exact(&mut sink).ok()?;
+            }
+            let msg_type = hdr[4];
+            let seq = u64::from_le_bytes([
+                hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+            ]);
+            Some((msg_type, seq))
+        }
+        Err(_) => None,
+    }
+}
+
+// #2876 fail-on-revert guard (Rust helper side): when the drain channel never
+// reaches the target fence, handle_drain_request must time out and WITHHOLD
+// DrainComplete -- it must NOT emit a DrainComplete carrying a below-target seq.
+// This goes RED if the `reached_target` gate is removed and the helper falls
+// back to sending DrainComplete with replay_buf.back().seq below the fence.
+#[test]
+fn test_drain_below_fence_withholds_drain_complete() {
+    let (mut daemon_side, helper_side) = std::os::unix::net::UnixStream::pair().unwrap();
+    daemon_side
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let shared = Arc::new(EventStreamShared::new());
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+
+    // Channel holds only seq 3, but the fence target is 5: the drain can never
+    // reach the fence and must time out (200ms) below it.
+    let (tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    tx.send(replay_seq_frame(3)).unwrap();
+
+    handle_drain_request(5, &rx, &helper_side, &shared, &mut replay_buf);
+
+    // No DrainComplete must reach the daemon side.
+    if let Some((msg_type, seq)) = try_read_frame_header(&mut daemon_side) {
+        // The replayed frame (seq 3) may be written, but a DrainComplete must
+        // never appear below the fence. Walk any non-drain frames first.
+        let mut t = msg_type;
+        let mut s = seq;
+        loop {
+            assert_ne!(
+                t, MSG_DRAIN_COMPLETE,
+                "helper emitted DrainComplete seq {} below fence 5 (#2876 regression)",
+                s
+            );
+            match try_read_frame_header(&mut daemon_side) {
+                Some((nt, ns)) => {
+                    t = nt;
+                    s = ns;
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+// #2876: when the channel reaches the fence, handle_drain_request must emit a
+// DrainComplete whose seq is >= the target.
+#[test]
+fn test_drain_at_fence_emits_drain_complete() {
+    let (mut daemon_side, helper_side) = std::os::unix::net::UnixStream::pair().unwrap();
+    daemon_side
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let shared = Arc::new(EventStreamShared::new());
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+
+    let (tx, rx) = mpsc::sync_channel::<EventFrame>(8);
+    for seq in 1..=5u64 {
+        tx.send(replay_seq_frame(seq)).unwrap();
+    }
+
+    handle_drain_request(5, &rx, &helper_side, &shared, &mut replay_buf);
+
+    // Drain frames until we observe the DrainComplete at/above the fence.
+    let mut saw_complete = false;
+    while let Some((msg_type, seq)) = try_read_frame_header(&mut daemon_side) {
+        if msg_type == MSG_DRAIN_COMPLETE {
+            assert!(
+                seq >= 5,
+                "DrainComplete seq {} must be >= fence 5",
+                seq
+            );
+            saw_complete = true;
+            break;
+        }
+    }
+    assert!(saw_complete, "helper did not emit DrainComplete at fence");
 }

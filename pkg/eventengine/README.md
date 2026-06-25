@@ -122,8 +122,24 @@ cannot occur.
 - **Bounded queue, dedup-by-policy:** the queue holds at most one pending
   action per policy — a newer trigger supersedes an older queued one (no value
   in applying a stale remediation twice). Overflow bumps
-  `xpf_event_actions_dropped_total{reason="queue_full"}`. Loss is always
-  counted, never silent.
+  `xpf_event_actions_dropped_total{reason="queue_full"}` **exactly once per
+  dropped action**. When the queue is full of unrelated policies and there is no
+  stale same-policy entry to evict, the genuinely-unfittable new arrival is
+  dropped (the older FIFO survivors are kept) and counted once by `enqueue` —
+  `supersede()` does NOT also count that overflow in its refill loop (it only
+  counts a SURVIVOR it could not re-place). Loss is always counted, never silent,
+  and never double-counted (#2869).
+- **FIFO ordering across policies (#2869):** the queue is FIFO. When the queue
+  is full and `supersede()` drains/refills it to drop a stale same-policy entry,
+  it re-enqueues the surviving OTHER-policy actions in their original order and
+  places the new (superseding) action at the **TAIL** — never the head.
+  Prepending the new action would let the newest event jump ahead of every older
+  queued remediation (LIFO), starving older policies under sustained event
+  frequency and reordering remediation against the order events were observed.
+  Supersede therefore only ever drops/replaces the stale same-policy entry; it
+  does not reorder unrelated policies. Locked by
+  `TestSupersede_PreservesFIFOPlacesNewAtTail` (fail-on-revert: a prepend lands
+  the new action at index 0 and the test goes RED).
 - A non-lock error (bad apply / CommitCheck reject) is a permanent failure: no
   retry, bumps `xpf_event_actions_rejected_total`.
 
