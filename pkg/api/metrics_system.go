@@ -69,6 +69,11 @@ func (c *xpfCollector) collectDDNSMetrics(ch chan<- prometheus.Metric) {
 		float64(st.OwnedRecords))
 	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSPTRPending, prometheus.GaugeValue,
 		float64(st.PTRPendingNow))
+	var degraded float64
+	if st.Degraded {
+		degraded = 1
+	}
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSDegraded, prometheus.GaugeValue, degraded)
 	var lastTs float64
 	if !st.LastReconcile.IsZero() {
 		lastTs = float64(st.LastReconcile.Unix())

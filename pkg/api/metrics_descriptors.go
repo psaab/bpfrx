@@ -242,6 +242,14 @@ func newCollector(srv *Server) *xpfCollector {
 				"(distinct from the cumulative ptr-deferred counter; #2708).",
 			nil, nil,
 		),
+		dhcpDDNSDegraded: prometheus.NewDesc(
+			"xpf_dhcp_ddns_degraded",
+			"1 when the DHCP dynamic-DNS ownership state failed to load "+
+				"(corrupt / unsupported-version / unreadable) and the manager is "+
+				"FAILING CLOSED: publishing and withdrawals are suspended until the "+
+				"operator resolves the quarantined state file (#2650).",
+			nil, nil,
+		),
 		dhcpDDNSLastReconcileTs: prometheus.NewDesc(
 			"xpf_dhcp_ddns_last_reconcile_timestamp_seconds",
 			"Unix timestamp of the last DHCP dynamic-DNS reconcile pass.",

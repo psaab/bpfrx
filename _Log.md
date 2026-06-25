@@ -15222,3 +15222,21 @@ top.
   container/explicit-interface paragraph.
 - **File(s)**: pkg/config/schema_routing.go,
   pkg/config/schema_validate_route_2448_test.go, docs/config-schema.md, _Log.md
+- **Action**: #2650 — DDNS ownership state corrupt/unknown-version load now
+  FAILS CLOSED instead of silently resetting to an empty store. `loadDDNSState`
+  returns classified sentinels (`errDDNSStateCorrupt` /
+  `errDDNSStateUnsupportedVersion`); a new `loadStateOrDegrade` helper sets
+  `Manager.degraded`, quarantines the bad file aside
+  (`<path>.corrupt-<UTC-stamp>`, never overwritten by a later save), and
+  `ReconcileScoped` refuses the whole pass (no publish, no withdraw, counted as
+  a reconcile failure) while degraded. The old behavior leaked previously-owned
+  records forever (cleanup authority lost) and could re-claim a peer-owned name.
+  Alarm surfaced in `show ... dynamic-dns` (CLI + gRPC) and the new
+  `xpf_dhcp_ddns_degraded` Prometheus gauge. Added fail-on-revert tests
+  (corrupt + unknown-version → degraded, no ops, quarantined; reverting to
+  fail-open goes RED, proven). go build/vet/gofmt + ddns/dhcpserver/api/cli/
+  grpcapi/daemon tests green.
+- **File(s)**: pkg/ddns/state.go, pkg/ddns/manager.go, pkg/ddns/manager_test.go,
+  pkg/ddns/README.md, pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
+  pkg/api/metrics_system.go, pkg/cli/cli_show_services.go,
+  pkg/grpcapi/server_show_dhcp_lldp_snmp.go, _Log.md

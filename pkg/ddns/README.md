@@ -16,7 +16,7 @@ moved with its assertions intact.
 | File | Contents |
 |------|----------|
 | `manager.go` | `Manager` (the DDNS reconcile engine — moved from `dhcpserver/ddns.go`): `policyFromConfig`, `Reconcile`, `reconcileOnceLocked`, `upsertLocked`/`deleteOwnedLocked`, `withdrawAllLocked`, `ownerWatermark`, `dhcidSharedWithOther` (#2700 shared-DHCID guard), `Stats` (incl. `PTRPendingNow`, #2708), `OwnedRecordView(s)`, the `errDDNSNoBackendToWithdraw` keep-ownership sentinel (#2699), the write-ahead durability + never-delete-non-owned boundary. Also the `Lease` record + `LeaseParser` seam. |
-| `state.go` | Ownership state store (`ownedRecord`, `ddnsState`, `loadDDNSState`, durable `save` via `fsatomic.WriteFileDurable`) — moved from `dhcpserver/ddns_state.go`. |
+| `state.go` | Ownership state store (`ownedRecord`, `ddnsState`, `loadDDNSState`, durable `save` via `fsatomic.WriteFileDurable`) — moved from `dhcpserver/ddns_state.go`. Also the fail-closed load classifiers `errDDNSStateCorrupt` / `errDDNSStateUnsupportedVersion` + `quarantineBadState` (#2650). |
 | `backend.go` | `DNSUpdater` interface, `LeaseDNSRecord`, `nopUpdater`, the record + reverse-PTR-name helpers — moved from `dhcpserver/ddns_dns.go`. |
 | `backend_rfc2136.go` | The LIVE RFC 2136 backend (`rfc2136Updater`): exact-RR adds/deletes, TSIG, RFC 4701 DHCID + RFC 4703 replace-owned two-attempt, the `errDDNSConflictRefused` / `errDDNSPTRPending` sentinels — moved from `dhcpserver/ddns_rfc2136.go`. `sendRemoveForward(..., keepDHCID)` keeps a shared DHCID on a partial dual-stack teardown (#2700); `dnsCanonicalFQDN` mirrors the DHCID FQDN canonicalization. |
 | `hostname.go` | Deterministic hostname → DNS-label normalization (pure) — moved from `dhcpserver/ddns_hostname.go`. |
@@ -130,6 +130,20 @@ no change in those packages:
   sent, so the delete stays ownership-guarded). The DHCID is removed only with
   the LAST family's record, so a fully-released name leaves no orphan DHCID and
   a survivor is never left unprotected (no hijack window, no wire leak).
+- **Unloadable ownership state fails CLOSED (#2650)** — a corrupt, unknown-
+  future-version, or unreadable state file is NOT silently reset to an empty
+  store. `loadDDNSState` returns the empty store plus a CLASSIFIED error
+  (`errDDNSStateCorrupt` / `errDDNSStateUnsupportedVersion`); `loadStateOrDegrade`
+  sets `Manager.degraded`, QUARANTINES a corrupt/unsupported file aside
+  (`<path>.corrupt-<UTC-stamp>` — preserved, never overwritten by a later
+  `save()`), and `ReconcileScoped` then refuses the WHOLE pass (no publish, no
+  withdraw, counted as a reconcile failure) until the operator resolves it. Fail
+  OPEN would forget every owned record (permanent stale-record leak — the cleanup
+  half of the feature is lost) AND let a later publish re-claim a name a PEER
+  owns, since the lost DHCID/ownership state can no longer veto it. The degraded
+  state is surfaced as a `show ... dynamic-dns` ALARM and the
+  `xpf_dhcp_ddns_degraded` Prometheus gauge so the lost cleanup authority is
+  never silent.
 - **No secret in any error string** (TSIG secret revealed only at construction).
 
 The HA writer gate (`ddnsWriterGateOpen`) stays in `pkg/daemon/daemon_ddns.go`
