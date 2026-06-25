@@ -49,6 +49,15 @@ type fakeDNSServer struct {
 	conflictPrereq bool
 	conflictZones  map[string]bool
 
+	// stateful, when true, makes the server maintain an in-memory zone and
+	// evaluate RFC 2136 prerequisites + apply Insert/Remove against it (used by
+	// the #2648 DHCID ownership tests, which need realistic NameNotUsed /
+	// DHCID-match prerequisite evaluation across an add/delete sequence).
+	// zone[name] is the set of RRs currently present at that owner name; the
+	// value key is the RR's textual form for set semantics.
+	stateful bool
+	zone     map[string]map[string]dns.RR
+
 	// truncateUDP, when set, marks every UDP reply Truncated so the client
 	// retries over TCP (used to exercise the TCP-retry path).
 	truncateUDP bool
@@ -137,6 +146,12 @@ func (s *fakeDNSServer) handle(w dns.ResponseWriter, r *dns.Msg) {
 	conflict := s.conflictPrereq && (len(s.conflictZones) == 0 || s.conflictZones[zone])
 	truncate := s.truncateUDP && !overTCP
 	tcpDelay := s.tcpReplyDelay
+	statefulRcode := 0
+	statefulSet := false
+	if s.stateful {
+		statefulRcode = s.evalStatefulLocked(r)
+		statefulSet = true
+	}
 	s.mu.Unlock()
 	// Mark a UDP reply Truncated to drive the client into the TCP-retry path.
 	if truncate {
@@ -161,6 +176,8 @@ func (s *fakeDNSServer) handle(w dns.ResponseWriter, r *dns.Msg) {
 	case conflict && len(r.Answer) > 0:
 		// A prerequisite present + conflict flag → simulate a collision.
 		m.Rcode = dns.RcodeYXRrset
+	case statefulSet:
+		m.Rcode = statefulRcode
 	default:
 		m.Rcode = dns.RcodeSuccess
 	}
@@ -172,6 +189,124 @@ func (s *fakeDNSServer) handle(w dns.ResponseWriter, r *dns.Msg) {
 		m.SetTsig(t.Hdr.Name, t.Algorithm, 300, time.Now().Unix())
 	}
 	_ = w.WriteMsg(m)
+}
+
+// rrKey is the set-membership key for an RR within a name (type + rdata).
+func rrKey(rr dns.RR) string {
+	h := rr.Header()
+	// String() includes the full rdata; strip the leading header text so the
+	// key is type+rdata (TTL/class differences must not split a logical RR).
+	return dns.TypeToString[h.Rrtype] + "|" + rrRdataString(rr)
+}
+
+// rrRdataString returns the rdata portion of an RR's text form (everything
+// after the standard header fields name/ttl/class/type).
+func rrRdataString(rr dns.RR) string {
+	full := rr.String()
+	// dns RR String() is "<name>\t<ttl>\t<class>\t<type>\t<rdata>"; take the
+	// 5th tab-separated field onward as rdata.
+	parts := strings.SplitN(full, "\t", 5)
+	if len(parts) == 5 {
+		return parts[4]
+	}
+	return full
+}
+
+// evalStatefulLocked evaluates RFC 2136 prerequisites against the in-memory
+// zone and, on success, applies the update section (Insert / exact-RR Remove).
+// It supports exactly the prerequisite kinds the backend uses:
+//   - NameNotUsed  (ANY type, ClassNONE)      — name must have NO records.
+//   - RRsetNotUsed (specific type, ClassNONE) — that RRset must not exist.
+//   - Used         (value-dependent, ClassINET w/ rdata) — that exact RR must
+//     exist (DHCID-match).
+//
+// Returns the rcode the server should answer with. Caller holds s.mu.
+func (s *fakeDNSServer) evalStatefulLocked(r *dns.Msg) int {
+	if s.zone == nil {
+		s.zone = map[string]map[string]dns.RR{}
+	}
+	// 1) Check prerequisites (Answer section).
+	for _, pre := range r.Answer {
+		h := pre.Header()
+		name := dns.CanonicalName(h.Name)
+		set := s.zone[name]
+		switch h.Class {
+		case dns.ClassNONE:
+			if h.Rrtype == dns.TypeANY {
+				// NameNotUsed: the name must have no records.
+				if len(set) > 0 {
+					return dns.RcodeYXDomain
+				}
+			} else {
+				// RRsetNotUsed: no RR of this type may exist.
+				for _, rr := range set {
+					if rr.Header().Rrtype == h.Rrtype {
+						return dns.RcodeYXRrset
+					}
+				}
+			}
+		case dns.ClassINET:
+			// Used (value-dependent RRset exists): this exact RR must exist.
+			if _, ok := set[rrKey(pre)]; !ok {
+				return dns.RcodeNXRrset
+			}
+		}
+	}
+	// 2) Apply the update section (Ns).
+	for _, rr := range r.Ns {
+		h := rr.Header()
+		name := dns.CanonicalName(h.Name)
+		switch h.Class {
+		case dns.ClassNONE:
+			// Exact-RR delete.
+			if set := s.zone[name]; set != nil {
+				delete(set, rrKey(rr))
+				if len(set) == 0 {
+					delete(s.zone, name)
+				}
+			}
+		case dns.ClassANY:
+			// delete-RRset / delete-name — the backend must never send these;
+			// apply defensively so a stray one is observable in the zone.
+			delete(s.zone, name)
+		default:
+			// Insert.
+			if s.zone[name] == nil {
+				s.zone[name] = map[string]dns.RR{}
+			}
+			s.zone[name][rrKey(rr)] = dns.Copy(rr)
+		}
+	}
+	return dns.RcodeSuccess
+}
+
+// seedRR injects a record into the stateful zone as if a third party (or a
+// prior xpf add) had published it.
+func (s *fakeDNSServer) seedRR(rr dns.RR) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.zone == nil {
+		s.zone = map[string]map[string]dns.RR{}
+	}
+	name := dns.CanonicalName(rr.Header().Name)
+	if s.zone[name] == nil {
+		s.zone[name] = map[string]dns.RR{}
+	}
+	s.zone[name][rrKey(rr)] = dns.Copy(rr)
+}
+
+// zoneHas reports whether the stateful zone currently holds an RR equal to the
+// given one (type + rdata) at its name.
+func (s *fakeDNSServer) zoneHas(rr dns.RR) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name := dns.CanonicalName(rr.Header().Name)
+	set := s.zone[name]
+	if set == nil {
+		return false
+	}
+	_, ok := set[rrKey(rr)]
+	return ok
 }
 
 func (s *fakeDNSServer) recorded() []recordedUpdate {
@@ -204,6 +339,15 @@ func (s *fakeDNSServer) setConflict(prereq bool, zones map[string]bool) {
 	defer s.mu.Unlock()
 	s.conflictPrereq = prereq
 	s.conflictZones = zones
+}
+
+func (s *fakeDNSServer) setStateful(on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stateful = on
+	if on && s.zone == nil {
+		s.zone = map[string]map[string]dns.RR{}
+	}
 }
 
 func (s *fakeDNSServer) setTruncate(truncate bool, tcpDelay time.Duration) {
@@ -459,19 +603,209 @@ func TestRFC2136StrictFailConflictErrors(t *testing.T) {
 	}
 }
 
-func TestRFC2136ReplaceOwnedNoPrereq(t *testing.T) {
+// recV4ID is recV4 with a client identity (the DHCID input).
+func recV4ID(fqdn, addr, clientID string, ttl int) LeaseDNSRecord {
+	r := recV4(fqdn, addr, ttl)
+	r.ClientID = clientID
+	return r
+}
+
+// TestRFC2136ReplaceOwnedFreshNameUsesNameNotUsedPrereq proves the #2648 fix:
+// replace-owned no longer sends a BARE Insert. A fresh-name add carries a
+// "name not in use" prerequisite (so it can never adopt a pre-existing RR) and
+// publishes the A + a DHCID ownership marker.
+func TestRFC2136ReplaceOwnedFreshNameUsesNameNotUsedPrereq(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
 	var ptr, conf int
 	u := testUpdater(t, srv, &config.DHCPDynamicDNSConfig{
 		Enabled: true, Domain: "example.com", ConflictPolicy: "replace-owned",
 	}, &ptr, &conf)
-	if err := u.UpsertLease(context.Background(), recV4("r.example.com", "10.0.1.5", 300)); err != nil {
+	if err := u.UpsertLease(context.Background(), recV4ID("r.example.com", "10.0.1.5", "cid:0102", 300)); err != nil {
 		t.Fatalf("UpsertLease: %v", err)
 	}
-	for _, up := range srv.recorded() {
-		if len(up.prereqs) != 0 {
-			t.Errorf("replace-owned must send NO prerequisite; got %d", len(up.prereqs))
-		}
+	// The forward add must carry a prerequisite (NameNotUsed) — NOT a bare add.
+	fwd := srv.recorded()[0]
+	if len(fwd.prereqs) == 0 {
+		t.Fatalf("replace-owned fresh add must carry a name-not-in-use prerequisite (#2648); got none")
+	}
+	pre := fwd.prereqs[0]
+	if pre.Header().Class != dns.ClassNONE || pre.Header().Rrtype != dns.TypeANY {
+		t.Errorf("fresh-add prereq = class %d type %s, want NameNotUsed (ClassNONE ANY)",
+			pre.Header().Class, dns.TypeToString[pre.Header().Rrtype])
+	}
+	// xpf now owns the A AND a DHCID marker at the name.
+	if !srv.zoneHas(&dns.A{Hdr: dns.RR_Header{Name: "r.example.com.", Rrtype: dns.TypeA}, A: net.ParseIP("10.0.1.5")}) {
+		t.Errorf("A record was not published")
+	}
+	dhcid, ok := dhcidRR("cid:0102", "r.example.com", 300)
+	if !ok || !srv.zoneHas(dhcid) {
+		t.Errorf("DHCID ownership marker was not published")
+	}
+}
+
+// TestRFC2136ReplaceOwnedDoesNotAdoptThirdPartyRR is the #2648 boundary proof:
+// a third party has already published the IDENTICAL A record (no DHCID). Under
+// replace-owned, xpf's add must be REFUSED (name-not-in-use fails, no DHCID of
+// ours to match), so xpf records NO ownership — and a later release therefore
+// does NOT delete the third party's record.
+//
+// fail-on-revert: reverting sendAdd to a bare Insert makes the add idempotently
+// succeed against the pre-existing RR, xpf records ownership, and the delete
+// path then removes the third party's record → this test goes red.
+func TestRFC2136ReplaceOwnedDoesNotAdoptThirdPartyRR(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	// Third party pre-publishes the exact A (no DHCID).
+	thirdParty := &dns.A{
+		Hdr: dns.RR_Header{Name: "host.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+		A:   net.ParseIP("10.0.1.5"),
+	}
+	srv.seedRR(thirdParty)
+
+	var ptr, conf int
+	u := testUpdater(t, srv, &config.DHCPDynamicDNSConfig{
+		Enabled: true, Domain: "example.com", ConflictPolicy: "replace-owned",
+	}, &ptr, &conf)
+
+	// The upsert must NOT error (it is a counted skip), but it must not have
+	// adopted the record: the add is refused.
+	if err := u.UpsertLease(context.Background(), recV4ID("host.example.com", "10.0.1.5", "cid:aabb", 300)); err != nil {
+		t.Fatalf("UpsertLease on a third-party-owned name must be a counted skip, not an error: %v", err)
+	}
+	if conf == 0 {
+		t.Errorf("expected the third-party collision to be counted")
+	}
+	// xpf must not have written a DHCID for this name (no ownership claimed).
+	ours, _ := dhcidRR("cid:aabb", "host.example.com", 300)
+	if srv.zoneHas(ours) {
+		t.Errorf("xpf wrote a DHCID for a name it does not own — it ADOPTED a third-party RR (#2648 boundary breach)")
+	}
+
+	// A later release/delete (as the reconciler would issue) must leave the
+	// third party's record intact: its DHCID-match prerequisite fails.
+	if err := u.DeleteLease(context.Background(), recV4ID("host.example.com", "10.0.1.5", "cid:aabb", 300)); err != nil {
+		t.Fatalf("DeleteLease should be a counted skip on a non-owned name, not an error: %v", err)
+	}
+	if !srv.zoneHas(thirdParty) {
+		t.Fatalf("#2648 BOUNDARY BREACH: xpf deleted a third-party A record it did not create")
+	}
+}
+
+// TestRFC2136ReplaceOwnedFullLifecycleOwnsAndDeletes proves the safe path: a
+// normal add on an unused name claims ownership (A + DHCID), and a later
+// release deletes exactly those records (DHCID-match prerequisite holds).
+func TestRFC2136ReplaceOwnedFullLifecycleOwnsAndDeletes(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	var ptr, conf int
+	u := testUpdater(t, srv, &config.DHCPDynamicDNSConfig{
+		Enabled: true, Domain: "example.com", ConflictPolicy: "replace-owned",
+	}, &ptr, &conf)
+
+	rec := recV4ID("mine.example.com", "10.0.1.7", "cid:1234", 300)
+	if err := u.UpsertLease(context.Background(), rec); err != nil {
+		t.Fatalf("UpsertLease: %v", err)
+	}
+	a := &dns.A{Hdr: dns.RR_Header{Name: "mine.example.com.", Rrtype: dns.TypeA}, A: net.ParseIP("10.0.1.7")}
+	dhcid, _ := dhcidRR("cid:1234", "mine.example.com", 300)
+	if !srv.zoneHas(a) || !srv.zoneHas(dhcid) {
+		t.Fatalf("after add, xpf should own the A and DHCID")
+	}
+	if err := u.DeleteLease(context.Background(), rec); err != nil {
+		t.Fatalf("DeleteLease: %v", err)
+	}
+	if srv.zoneHas(a) {
+		t.Errorf("after release, the owned A should be deleted")
+	}
+	if srv.zoneHas(dhcid) {
+		t.Errorf("after release, the owned DHCID should be deleted")
+	}
+}
+
+// TestRFC2136ReplaceOwnedAdoptsOwnNameOnReadd proves the RFC 4703 §5.3.2
+// second attempt: when a name already exists with OUR DHCID (e.g. a lease
+// refresh after a restart re-derives the same record), the add succeeds via
+// the DHCID-match prerequisite rather than being refused.
+func TestRFC2136ReplaceOwnedAdoptsOwnNameOnReadd(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	var ptr, conf int
+	u := testUpdater(t, srv, &config.DHCPDynamicDNSConfig{
+		Enabled: true, Domain: "example.com", ConflictPolicy: "replace-owned",
+	}, &ptr, &conf)
+
+	// Pre-seed OUR own A + DHCID (as if a prior add already ran).
+	a := &dns.A{Hdr: dns.RR_Header{Name: "self.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300}, A: net.ParseIP("10.0.1.9")}
+	dhcid, _ := dhcidRR("cid:5678", "self.example.com", 300)
+	srv.seedRR(a)
+	srv.seedRR(dhcid)
+
+	if err := u.UpsertLease(context.Background(), recV4ID("self.example.com", "10.0.1.9", "cid:5678", 300)); err != nil {
+		t.Fatalf("re-add of our own name must succeed via the DHCID-match prereq: %v", err)
+	}
+	if conf != 0 {
+		t.Errorf("re-adding our OWN name must not be counted as a conflict; got %d", conf)
+	}
+	if !srv.zoneHas(a) || !srv.zoneHas(dhcid) {
+		t.Errorf("our records should remain after a self re-add")
+	}
+}
+
+// TestRFC2136ReplaceOwnedRefusesNameOwnedByDifferentDHCID proves a name owned
+// by a DIFFERENT client (a DHCID that is not ours) is never touched: the add
+// is refused and a later delete is skipped, leaving the other owner's records.
+func TestRFC2136ReplaceOwnedRefusesNameOwnedByDifferentDHCID(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	var ptr, conf int
+	u := testUpdater(t, srv, &config.DHCPDynamicDNSConfig{
+		Enabled: true, Domain: "example.com", ConflictPolicy: "replace-owned",
+	}, &ptr, &conf)
+
+	// A different client owns shared.example.com (its own A + DHCID).
+	otherA := &dns.A{Hdr: dns.RR_Header{Name: "shared.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300}, A: net.ParseIP("10.0.1.50")}
+	otherDHCID, _ := dhcidRR("cid:OTHER", "shared.example.com", 300)
+	srv.seedRR(otherA)
+	srv.seedRR(otherDHCID)
+
+	if err := u.UpsertLease(context.Background(), recV4ID("shared.example.com", "10.0.1.51", "cid:MINE", 300)); err != nil {
+		t.Fatalf("add against a different owner's name must be a counted skip: %v", err)
+	}
+	if conf == 0 {
+		t.Errorf("collision with a different DHCID owner must be counted")
+	}
+	if !srv.zoneHas(otherA) || !srv.zoneHas(otherDHCID) {
+		t.Errorf("the other owner's records must be untouched by a refused add")
+	}
+
+	// And a delete must not remove the other owner's records.
+	if err := u.DeleteLease(context.Background(), recV4ID("shared.example.com", "10.0.1.51", "cid:MINE", 300)); err != nil {
+		t.Fatalf("delete against a different owner's name must be a counted skip: %v", err)
+	}
+	if !srv.zoneHas(otherA) || !srv.zoneHas(otherDHCID) {
+		t.Fatalf("#2648 BOUNDARY BREACH: xpf deleted records owned by a different DHCID")
+	}
+}
+
+// TestDHCIDDeterministicAndBound proves the DHCID digest is a deterministic
+// function of (client-id, name) and changes when either changes.
+func TestDHCIDDeterministicAndBound(t *testing.T) {
+	a, _ := dhcidRR("cid:1", "host.example.com", 300)
+	b, _ := dhcidRR("cid:1", "host.example.com", 300)
+	if a.Digest != b.Digest {
+		t.Errorf("DHCID not deterministic for the same (id,name)")
+	}
+	c, _ := dhcidRR("cid:2", "host.example.com", 300)
+	if a.Digest == c.Digest {
+		t.Errorf("DHCID must change with a different client id")
+	}
+	d, _ := dhcidRR("cid:1", "other.example.com", 300)
+	if a.Digest == d.Digest {
+		t.Errorf("DHCID must change with a different name")
+	}
+	if _, ok := dhcidRR("", "host.example.com", 300); ok {
+		t.Errorf("DHCID must be omitted when there is no client identity")
 	}
 }
 

@@ -1,5 +1,24 @@
 # Action Log
 
+## 2026-06-24 — #2648 fix: DDNS replace-owned RFC 4701/4703 DHCID ownership
+
+- **Timestamp**: 2026-06-24
+- **Action**: Made the default `replace-owned` DDNS conflict policy
+  ownership-safe. It no longer sends a bare RFC 2136 Insert (which could
+  adopt then later delete a pre-existing identical third-party RR). On add it
+  now writes an RFC 4701 DHCID ownership marker and runs RFC 4703 §5.3.2
+  two-attempt conflict resolution (name-not-in-use → DHCID-matches-ours); a
+  name owned by a third party / different DHCID is refused (counted, no
+  ownership recorded). On delete it removes the A/AAAA + DHCID only when the
+  on-wire DHCID matches ours. Threaded the lease client identity through
+  `LeaseDNSRecord.ClientID` + persisted `ownedRecord.ClientID` so delete
+  recomputes the same DHCID. Added a stateful fake DNS server + boundary
+  tests (never adopts/deletes a third-party RR; fail-on-revert proven).
+- **File(s)**: pkg/dhcpserver/ddns_rfc2136.go, pkg/dhcpserver/ddns_dns.go,
+  pkg/dhcpserver/ddns_state.go, pkg/dhcpserver/ddns.go,
+  pkg/dhcpserver/ddns_rfc2136_test.go, pkg/dhcpserver/README.md,
+  docs/feature-gaps.md, _Log.md
+
 ## 2026-06-24 — #2643 fix: FRR community-lists with regex members render `expanded`
 
 - **Timestamp**: 2026-06-24
