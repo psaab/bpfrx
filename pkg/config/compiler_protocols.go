@@ -68,9 +68,11 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			case "passive":
 				proto.OSPF.PassiveDefault = true
 			case "export":
-				if len(child.Keys) >= 2 {
-					proto.OSPF.Export = append(proto.OSPF.Export, child.Keys[1])
-				}
+				// Multi-value leaf (#2587): `export [ p1 p2 ]` collapses onto
+				// child.Keys[1:] (flat-set) or child.Children (hierarchical
+				// block). Read ALL values via the firewallMatchValues SSOT;
+				// reading only Keys[1] dropped every policy past the first.
+				proto.OSPF.Export = append(proto.OSPF.Export, firewallMatchValues(child)...)
 			}
 		}
 
@@ -238,13 +240,11 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 					}
 				}
 			case "export":
-				if len(child.Keys) >= 2 {
-					proto.BGP.Export = append(proto.BGP.Export, child.Keys[1])
-				}
+				// Multi-value leaf (#2587): accumulate ALL policies across
+				// both AST shapes via the firewallMatchValues SSOT.
+				proto.BGP.Export = append(proto.BGP.Export, firewallMatchValues(child)...)
 			case "import":
-				if len(child.Keys) >= 2 {
-					proto.BGP.Import = append(proto.BGP.Import, child.Keys[1])
-				}
+				proto.BGP.Import = append(proto.BGP.Import, firewallMatchValues(child)...)
 			}
 		}
 
@@ -514,9 +514,9 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 					proto.OSPFv3.RouterID = child.Keys[1]
 				}
 			case "export":
-				if len(child.Keys) >= 2 {
-					proto.OSPFv3.Export = append(proto.OSPFv3.Export, child.Keys[1])
-				}
+				// Multi-value leaf (#2587): accumulate ALL policies across
+				// both AST shapes via the firewallMatchValues SSOT.
+				proto.OSPFv3.Export = append(proto.OSPFv3.Export, firewallMatchValues(child)...)
 			}
 		}
 
@@ -622,9 +622,9 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 					proto.ISIS.Level = child.Keys[1]
 				}
 			case "export":
-				if len(child.Keys) >= 2 {
-					proto.ISIS.Export = append(proto.ISIS.Export, child.Keys[1])
-				}
+				// Multi-value leaf (#2587): accumulate ALL policies across
+				// both AST shapes via the firewallMatchValues SSOT.
+				proto.ISIS.Export = append(proto.ISIS.Export, firewallMatchValues(child)...)
 			case "authentication-key":
 				if v := nodeVal(child); v != "" {
 					proto.ISIS.AuthKey = Secret(v)
