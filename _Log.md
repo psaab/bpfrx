@@ -1,3 +1,36 @@
+## 2026-06-25 — #3008: meta-only `term_match_extra_from_meta` icmp-type/code false-match
+
+- **Timestamp**: 2026-06-25
+- **Action**: `term_match_extra_from_meta` (the frame-less, metadata-only
+  TX-selection match-input builder) stamped `icmp_type = icmp_code = 0`
+  while leaving `l4_present: true`. The filter matcher gates the
+  icmp-type / icmp-code terms on `l4_present`, and 0 is a *valid* ICMP
+  type (echo-reply) and code, so any term keyed on `icmp-type 0` /
+  `icmp-code 0` FALSE-MATCHED every ICMP-family packet on the three
+  meta-only call sites (`poll_descriptor/mod.rs` embedded-ICMP-error TX,
+  `tunnel.rs` local-origin tunnel TX, `tx/cos_classify.rs`
+  `resolve_cos_queue_id`). Net-new meta sibling of the truncated-frame
+  bug fixed in #2449 (`term_match_extra_from_frame`). Fix: the ICMP
+  type/code is genuinely unknown on this path (no frame to read it from),
+  so set `l4_present = false` for the ICMP/ICMPv6 family — the matcher
+  then fails the icmp-type/code terms closed. `l4_present` stays `true`
+  for non-ICMP so the authoritative shim-stamped `tcp_flags` keeps
+  driving tcp-flags matching (tcp-flags terms only apply to TCP). Added
+  fail-on-revert tests: `term_extra_from_meta_icmpv4/icmpv6_fails_closed`
+  (assert `l4_present == false`, RED on the default-0+l4_present=true
+  revert), `term_extra_from_meta_tcp_keeps_l4_present_and_tcp_flags`
+  (anti-over-gate), and end-to-end matcher proof
+  `meta_only_icmp_does_not_match_icmp_type_zero_but_known_type_does`
+  (meta-only ICMP does NOT match `icmp-type 0`; genuinely-known type 0
+  DOES). Doc: `userspace-dp/src/filter/README.md`.
+- **File(s)**: `userspace-dp/src/afxdp/frame/inspect.rs`,
+  `userspace-dp/src/afxdp/frame/tests.rs`,
+  `userspace-dp/src/filter/tests.rs`,
+  `userspace-dp/src/filter/README.md`, `_Log.md`
+- **Validation**: `cargo build --release -p xpf-userspace-dp` green;
+  `cargo test` inspect+filter modules 226 passed / 0 failed; fail-on-
+  revert verified RED (2 helper asserts fail when `l4_present` reverts to
+  unconditional true).
 ## 2026-06-25 — #3010: proxy-ARP/NDP VLAN sub-interface ifindex resolution
 
 - **Timestamp**: 2026-06-25
