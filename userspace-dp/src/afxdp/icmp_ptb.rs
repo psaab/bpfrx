@@ -144,10 +144,14 @@ pub(in crate::afxdp) fn forwarded_egress_mtu_decision(
 ///   - GRE: the #2300 SSOT `native_gre_inner_mtu` (transport MTU minus the
 ///     outer IP + GRE[+key] header) — the SAME value the #2331 encap drop
 ///     guard enforces, so this site and that drop site agree.
-///   - WireGuard: the pad-aware `wg::mss::wg_inner_mtu` derived from
-///     `tunnel_outer_mtu` (the #2300 transport-MTU SSOT) minus the WG outer
-///     overhead and worst-case §5.4.6 padding — the inverse of the
-///     `frame::wg::wg_encapped_size` drop guard.
+///   - WireGuard: the pad-aware `wg::mss::wg_inner_mtu` derived from the
+///     PHYSICAL underlay egress MTU (`frame::wg_endpoint_physical_outer_mtu`,
+///     the #2680 SSOT) minus the WG outer overhead and worst-case §5.4.6
+///     padding — the inverse of the `frame::wg::wg_encapped_size` drop guard,
+///     so the advertised inner MTU matches the threshold the guard admits
+///     (#2684). NOT `tunnel_outer_mtu`: for a WG flow `endpoint.destination`
+///     is zeroed, so that helper falls back to the LOGICAL ifindex MTU
+///     (already underlay − encap) and double-subtracts the encap overhead.
 ///   - NAT64: the egress MTU adjusted by the v6<->v4 header-size delta
 ///     (RFC 7915): a v6 inner translated to a v4 egress may be 20 bytes
 ///     LARGER on the inner side; a v4 inner translated to a v6 egress 20
@@ -157,8 +161,9 @@ pub(in crate::afxdp) fn forwarded_egress_mtu_decision(
 /// Returns 0 (fail-open — never invent a too-small MTU) when the endpoint
 /// row is missing, the tunnel kind is unknown, or the computed inner MTU is
 /// below the usable minimum (the per-kind inner-MTU helper returns 0). Note:
-/// the outer/transport MTU itself always resolves — `tunnel_outer_mtu` falls
-/// back to 1500 — so a 0 return reflects a missing/unknown endpoint or an
+/// the outer/transport MTU itself always resolves — both `tunnel_outer_mtu`
+/// (GRE) and `wg_endpoint_physical_outer_mtu` (WG) fall back to a non-zero
+/// MTU — so a 0 return reflects a missing/unknown endpoint or an
 /// unusably-small inner budget, never an unresolved outer MTU.
 /// `egress_mtu` is the already-resolved physical egress-interface MTU
 /// (`forwarded_egress_mtu`); used only for the NAT64 arm (the tunnel arms
@@ -200,9 +205,24 @@ pub(in crate::afxdp) fn post_transform_inner_mtu(
         return 0;
     };
     match tunnel_mode_kind(&endpoint.mode) {
+        // GRE's `endpoint.destination` is the real outer hop, so
+        // `native_gre_inner_mtu`'s `tunnel_outer_mtu` resolves to the
+        // physical underlay MTU correctly — leave it.
         TunnelKind::Gre => native_gre_inner_mtu(forwarding, decision),
         TunnelKind::WireGuard => {
-            let outer_mtu = tunnel_outer_mtu(forwarding, decision, endpoint);
+            // #2684: resolve the outer MTU via the PHYSICAL underlay egress
+            // (the #2680 SSOT), NOT `tunnel_outer_mtu`. For a WG transit flow
+            // `endpoint.destination` is zeroed (the peer carries the outer
+            // hop), so `tunnel_outer_mtu` falls back to the tunnel LOGICAL
+            // ifindex MTU (~1420) — already underlay − encap. Feeding that to
+            // `wg_inner_mtu` double-subtracts the WG encap overhead and
+            // under-advertises the inner PMTU by ~one encap. Using the
+            // physical underlay MTU (~1500) makes the advertised inner MTU
+            // match the encap drop guard's admit threshold
+            // (`wg_inner_mtu(physical)`), so DF-IPv4 / IPv6 inners get the
+            // same PMTU the guard tolerates instead of ~100B too small.
+            let outer_mtu =
+                crate::afxdp::frame::wg_endpoint_physical_outer_mtu(decision, forwarding, endpoint);
             crate::afxdp::wg::mss::wg_inner_mtu(endpoint.outer_family, outer_mtu)
         }
         TunnelKind::Unknown => 0,
