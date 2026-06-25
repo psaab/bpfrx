@@ -3,6 +3,7 @@ package ipsec
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -1061,6 +1062,162 @@ func TestPrepareConfig_ExternalInterfaceLocalAddress(t *testing.T) {
 	prepared := PrepareConfig(cfg)
 	if prepared.Gateways["gw"].LocalAddress != "198.51.100.1" {
 		t.Fatalf("resolved local-address = %q, want 198.51.100.1", prepared.Gateways["gw"].LocalAddress)
+	}
+}
+
+// dualStackCfg builds a config whose external interface carries BOTH an IPv4
+// and an IPv6 address, and whose gateway is reached by a dynamic hostname.
+// The local-address family is therefore ambiguous unless it is constrained to
+// the resolved remote family.
+func dualStackCfg(hostname string) *config.Config {
+	return &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"wan0": {
+					Name: "wan0",
+					Units: map[int]*config.InterfaceUnit{
+						0: {
+							// IPv4 listed first so a family-agnostic
+							// selection would wrongly win it for the IPv6
+							// peer (the #2757 bug).
+							Addresses: []string{
+								"198.51.100.1/24",
+								"2001:db8:1::1/64",
+							},
+						},
+					},
+				},
+			},
+		},
+		Security: config.SecurityConfig{
+			IPsec: config.IPsecConfig{
+				Gateways: map[string]*config.IPsecGateway{
+					"gw": {
+						Name:            "gw",
+						DynamicHostname: hostname,
+						ExternalIface:   "wan0.0",
+					},
+				},
+				VPNs: map[string]*config.IPsecVPN{
+					"tun": {Gateway: "gw"},
+				},
+			},
+		},
+	}
+}
+
+// TestPrepareConfig_DynamicHostnameFamilyMatch is the #2757 fail-on-revert
+// guard: a dual-stack appliance reaching a dynamic-hostname gateway must
+// source the IKE SA from the local-address whose family matches the family
+// the peer resolves to. If the family-matching is reverted (the empty
+// gateway.Address yields a family-agnostic hint), the IPv4 address — listed
+// first on the interface — wins for the IPv6 peer and this test goes RED.
+func TestPrepareConfig_DynamicHostnameFamilyMatch(t *testing.T) {
+	orig := resolveHostFamily
+	t.Cleanup(func() { resolveHostFamily = orig })
+
+	tests := []struct {
+		name          string
+		resolvedFam   int
+		wantLocalAddr string
+	}{
+		{"ipv6 peer selects ipv6 local", 6, "2001:db8:1::1"},
+		{"ipv4 peer selects ipv4 local", 4, "198.51.100.1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resolveHostFamily = func(host string) int {
+				if host != "peer.example.com" {
+					t.Fatalf("unexpected host lookup: %q", host)
+				}
+				return tc.resolvedFam
+			}
+			cfg := dualStackCfg("peer.example.com")
+			prepared := PrepareConfig(cfg)
+			got := prepared.Gateways["gw"].LocalAddress
+			if got != tc.wantLocalAddr {
+				t.Fatalf("local-address = %q, want %q (family %d)",
+					got, tc.wantLocalAddr, tc.resolvedFam)
+			}
+		})
+	}
+}
+
+// TestDefaultResolveHostFamily_BoundedDegrades exercises the REAL default
+// resolver implementation (not an injected fake) and proves it (a) is bounded
+// by resolveHostFamilyTimeout and (b) degrades to family 0 on failure rather
+// than hanging the synchronous commit/apply path (#2757 review fold). It uses
+// the RFC 6761 reserved `.invalid` TLD, which is guaranteed never to resolve,
+// so the lookup fails (NXDOMAIN / no such host) without depending on a
+// reachable nameserver. The hard deadline (4x the timeout) catches a
+// regression that drops the context bound; the expected return is 0.
+func TestDefaultResolveHostFamily_BoundedDegrades(t *testing.T) {
+	done := make(chan int, 1)
+	go func() { done <- defaultResolveHostFamily("xpf-2757-nonexistent.invalid") }()
+
+	select {
+	case fam := <-done:
+		if fam != 0 {
+			t.Fatalf("unresolvable host family = %d, want 0 (degrade-to-agnostic)", fam)
+		}
+	case <-time.After(4 * resolveHostFamilyTimeout):
+		t.Fatalf("default resolver did not return within %v — context bound missing",
+			4*resolveHostFamilyTimeout)
+	}
+}
+
+// TestPrepareConfig_DynamicHostnameDualStackPeer verifies that when the peer
+// resolves to BOTH families (no explicit preference), local-address selection
+// stays family-agnostic and degrades to the interface's first usable address
+// rather than guessing — and that a single-stack interface still resolves.
+func TestPrepareConfig_DynamicHostnameDualStackPeer(t *testing.T) {
+	orig := resolveHostFamily
+	t.Cleanup(func() { resolveHostFamily = orig })
+	resolveHostFamily = func(string) int { return 0 } // dual-stack peer
+
+	cfg := dualStackCfg("peer.example.com")
+	prepared := PrepareConfig(cfg)
+	got := prepared.Gateways["gw"].LocalAddress
+	if got != "198.51.100.1" {
+		t.Fatalf("dual-stack peer local-address = %q, want 198.51.100.1 (first usable)", got)
+	}
+}
+
+// TestPrepareConfig_DynamicHostnameFamilyFallback verifies the single-stack
+// fallback: an IPv6-only peer against an IPv4-only interface still yields the
+// IPv4 local-address rather than an empty local_addrs.
+func TestPrepareConfig_DynamicHostnameFamilyFallback(t *testing.T) {
+	orig := resolveHostFamily
+	t.Cleanup(func() { resolveHostFamily = orig })
+	resolveHostFamily = func(string) int { return 6 } // IPv6 peer
+
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"wan0": {
+					Name: "wan0",
+					Units: map[int]*config.InterfaceUnit{
+						0: {Addresses: []string{"198.51.100.1/24"}}, // IPv4 only
+					},
+				},
+			},
+		},
+		Security: config.SecurityConfig{
+			IPsec: config.IPsecConfig{
+				Gateways: map[string]*config.IPsecGateway{
+					"gw": {
+						Name:            "gw",
+						DynamicHostname: "peer.example.com",
+						ExternalIface:   "wan0.0",
+					},
+				},
+				VPNs: map[string]*config.IPsecVPN{"tun": {Gateway: "gw"}},
+			},
+		},
+	}
+	prepared := PrepareConfig(cfg)
+	if got := prepared.Gateways["gw"].LocalAddress; got != "198.51.100.1" {
+		t.Fatalf("IPv6-peer/IPv4-only-iface local-address = %q, want 198.51.100.1 (fallback)", got)
 	}
 }
 

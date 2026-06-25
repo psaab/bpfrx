@@ -1,6 +1,7 @@
 package ipsec
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -8,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -482,7 +484,8 @@ func PrepareConfig(cfg *config.Config) *config.IPsecConfig {
 	for name, gw := range src.Gateways {
 		cp := *gw
 		if cp.LocalAddress == "" && cp.ExternalIface != "" {
-			cp.LocalAddress = resolveInterfaceAddress(cfg, cp.ExternalIface, cp.Address)
+			cp.LocalAddress = resolveInterfaceAddress(
+				cfg, cp.ExternalIface, gatewayRemoteFamilyHint(&cp))
 		}
 		out.Gateways[name] = &cp
 	}
@@ -509,8 +512,32 @@ func PrepareConfig(cfg *config.Config) *config.IPsecConfig {
 	return out
 }
 
-func resolveInterfaceAddress(cfg *config.Config, ifaceRef, remoteAddr string) string {
-	family := addressFamilyHint(remoteAddr)
+// resolveInterfaceAddress selects the local-address to bind for an IKE SA
+// from the external interface, constrained to the remote gateway's address
+// family. family is the resolved remote family hint (4, 6, or 0 for
+// "either" — see gatewayRemoteFamilyHint). Constraining by family is what
+// keeps a dual-stack appliance from sourcing the SA out of the wrong family
+// vs the resolved peer (#2757): if the remote is/resolves to IPv6, the IPv6
+// local-address is chosen, and vice versa.
+//
+// When the constrained family yields no local-address on the interface (the
+// interface is single-stack in the other family), we fall back to a
+// family-agnostic selection so a misconfiguration degrades to the legacy
+// behavior rather than emitting no local_addrs line at all.
+func resolveInterfaceAddress(cfg *config.Config, ifaceRef string, family int) string {
+	if addr := resolveInterfaceAddressFamily(cfg, ifaceRef, family); addr != "" {
+		return addr
+	}
+	if family != 0 {
+		// The remote family has no matching local-address on this
+		// interface — fall back to whatever the interface offers rather
+		// than rendering an empty local_addrs.
+		return resolveInterfaceAddressFamily(cfg, ifaceRef, 0)
+	}
+	return ""
+}
+
+func resolveInterfaceAddressFamily(cfg *config.Config, ifaceRef string, family int) string {
 	if addr := resolveConfiguredInterfaceAddress(cfg, ifaceRef, family); addr != "" {
 		return addr
 	}
@@ -526,6 +553,86 @@ func resolveInterfaceAddress(cfg *config.Config, ifaceRef, remoteAddr string) st
 	}
 
 	return ""
+}
+
+// resolveHostFamilyTimeout bounds the default dynamic-hostname DNS lookup.
+// PrepareConfig runs SYNCHRONOUSLY in the daemon's ordered apply sequence
+// (pkg/daemon/daemon_apply.go) and the CLI commit path (pkg/cli/apply.go),
+// neither of which did any DNS before #2757. This lookup is only a *family
+// hint* (strongSwan does the authoritative resolution at IKE time), so it
+// must never stall commit/apply for the full glibc resolver timeout. 2s is
+// ample for a hint; on timeout/error the default returns family 0 and the
+// interface-decides fallback applies — graceful degradation, never a hang.
+const resolveHostFamilyTimeout = 2 * time.Second
+
+// resolveHostFamily is the hook used to resolve a dynamic-hostname gateway to
+// an address family for local-address selection. It is a package var so tests
+// can make resolution deterministic without real DNS (tests inject a fake; no
+// real DNS in the test suite). It returns 4 if the host resolves to (or
+// prefers) IPv4, 6 for IPv6, and 0 if it cannot resolve, times out, or the
+// host is dual-stack with no clear preference (let the local interface
+// decide). The default uses the system resolver bounded by
+// resolveHostFamilyTimeout.
+var resolveHostFamily = defaultResolveHostFamily
+
+func defaultResolveHostFamily(host string) int {
+	ctx, cancel := context.WithTimeout(
+		context.Background(), resolveHostFamilyTimeout)
+	defer cancel()
+
+	var r net.Resolver
+	ips, err := r.LookupIPAddr(ctx, host)
+	if err != nil || len(ips) == 0 {
+		// Timeout / NXDOMAIN / SERVFAIL: fall back to family-agnostic so a
+		// slow or unreachable resolver degrades to interface-decides rather
+		// than stalling commit/apply or guessing the family.
+		return 0
+	}
+	var has4, has6 bool
+	for _, addr := range ips {
+		if addr.IP.To4() != nil {
+			has4 = true
+		} else {
+			has6 = true
+		}
+	}
+	switch {
+	case has4 && has6:
+		// Dual-stack peer: no explicit preference is configured, so let
+		// the local interface's available family decide (family-agnostic).
+		return 0
+	case has6:
+		return 6
+	case has4:
+		return 4
+	default:
+		return 0
+	}
+}
+
+// gatewayRemoteFamilyHint determines the address family (4, 6, or 0 for
+// either) that the local-address for this gateway must match. A gateway with
+// a literal remote Address takes the family of that IP. A dynamic-hostname
+// gateway (Address empty, DynamicHostname set) is resolved via
+// resolveHostFamily so the chosen local-address matches the family the peer
+// actually resolves to (#2757) — previously the empty Address yielded a
+// family-agnostic hint and the wrong-family local-address could win on a
+// dual-stack appliance.
+func gatewayRemoteFamilyHint(gw *config.IPsecGateway) int {
+	if gw == nil {
+		return 0
+	}
+	if gw.Address != "" {
+		return addressFamilyHint(gw.Address)
+	}
+	if gw.DynamicHostname != "" {
+		// A bare IP in the hostname slot still classifies directly.
+		if f := addressFamilyHint(gw.DynamicHostname); f != 0 {
+			return f
+		}
+		return resolveHostFamily(gw.DynamicHostname)
+	}
+	return 0
 }
 
 func resolveConfiguredInterfaceAddress(cfg *config.Config, ifaceRef string, family int) string {
