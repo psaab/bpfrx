@@ -104,11 +104,26 @@ type SurfaceAScope struct {
 	ErrorBackoffMax time.Duration
 }
 
+// effectiveKey returns the scope's ownership key with the published FQDN folded
+// in (#2903). The published NAME is part of the Surface A scope identity, so the
+// manager ALWAYS keys ownership/runtime/status on Key-with-FQDN regardless of
+// whether the caller pre-populated Key.FQDN: a hostname change is then a NEW
+// scope (old name withdrawn by the gone-from-config sweep, new name published)
+// instead of an in-place name overwrite that orphans the old RR. SurfaceAScope.
+// FQDN is authoritative; this folds it into the key so every manager lookup,
+// the durable ownership record's stored Scope, and StatusViews agree.
+func (s SurfaceAScope) effectiveKey() ScopeKey {
+	k := s.Key
+	k.FQDN = s.FQDN
+	return k
+}
+
 // scopeID is the stable string id for a Surface A scope (its ScopeKey prefix),
 // used as the map key in the manager's per-scope runtime state and the
 // observation request. Two scopes with the same interface/unit but different
-// families are distinct.
-func (s SurfaceAScope) scopeID() string { return s.Key.scopePrefix() }
+// families — or the same interface/unit/family but a DIFFERENT published FQDN
+// (#2903) — are distinct.
+func (s SurfaceAScope) scopeID() string { return s.effectiveKey().scopePrefix() }
 
 // AddressObservation is the result of observing a scope's current address
 // (plan §5.3). Addr.IsValid()==false means "no address right now" (the
@@ -454,6 +469,23 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 		noteErr(m.reconcileScopeLocked(ctx, sc, observe, now))
 	}
 
+	// liveRR is the set of {FQDN, AddrText} that a STILL-CONFIGURED scope owns
+	// after Pass 1 — the exact name+rdata that is (or will be) live at the
+	// provider. A Pass 2 withdraw issues an EXACT-RR delete (name+type+rdata), so
+	// withdrawing a record whose name+rdata equals a live RR would REMOVE the live
+	// RR. This is the #2903 on-disk MIGRATION case: a pre-#2903 store has the
+	// Surface A record under an FQDN-LESS scope prefix, while the configured scope
+	// now keys under the FQDN-bearing prefix — both carry the SAME name+address.
+	// Pass 1 (re)published under the new prefix; Pass 2 must NOT then exact-RR
+	// delete the same name+address. Skip the wire delete but still drop the stale
+	// old-prefix ownership entry (adopt-in-place — no blackhole, no orphan).
+	liveRR := make(map[string]struct{}, len(desired))
+	for _, owned := range m.state.all() {
+		if _, stillConfigured := desired[owned.scopeOf().scopePrefix()]; stillConfigured {
+			liveRR[owned.FQDN+"|"+owned.AddrText] = struct{}{}
+		}
+	}
+
 	// Pass 2 — withdraw scopes whose binding was removed from config. A record
 	// owned for a scope NOT in `desired` is withdrawn (turn-off cleanup), gated
 	// by the same per-RG writer gate (never withdraw a scope this node does not
@@ -468,6 +500,17 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 			continue
 		}
 		if !admit(owned.scopeOf()) {
+			continue
+		}
+		if _, live := liveRR[owned.FQDN+"|"+owned.AddrText]; live {
+			// The exact name+rdata is owned by a still-configured scope (the #2903
+			// on-disk migration from an FQDN-less prefix to an FQDN-bearing one).
+			// An exact-RR delete here would remove the live RR — adopt in place:
+			// drop the stale old-prefix ownership entry, no wire delete.
+			slog.Debug("ddns surface-a: stale-prefix ownership adopted by a configured FQDN scope; dropping without a wire delete",
+				"fqdn", owned.FQDN, "addr", owned.AddrText)
+			m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
+			delete(m.runtime, owned.scopeOf().scopePrefix())
 			continue
 		}
 		backend, err := m.backendForOwned(owned, catalog)
@@ -521,7 +564,7 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 		// directly — the withdraw reaches the wire (the address-loss half of the
 		// #2691 P2 MAJOR-2 fix; backendForOwned is only needed for the gone-from-
 		// config Pass 2 withdraw where the scope no longer exists).
-		if owned, exists := m.state.get(sc.Key, surfaceAIdentity, ""); exists {
+		if owned, exists := m.state.get(sc.effectiveKey(), surfaceAIdentity, ""); exists {
 			backend, err := m.backendFor(sc)
 			if err != nil {
 				m.deleteFail++
@@ -546,7 +589,12 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 		forced = defaultForcedRefresh
 	}
 	changed := addr != rt.lastAddr
-	_, owned := m.state.get(sc.Key, surfaceAIdentity, "")
+	// Ownership is keyed on the scope INCLUDING the published FQDN (#2903), so a
+	// hostname-only change (same address) yields a new effectiveKey for which no
+	// record is owned yet → owned==false → the skip below does not fire and the
+	// new name is published. The old name's record (under the previous FQDN's
+	// scope key) is no longer in `desired`, so Reconcile Pass 2 withdraws it.
+	_, owned := m.state.get(sc.effectiveKey(), surfaceAIdentity, "")
 	refreshDue := rt.lastPublished.IsZero() || now.Sub(rt.lastPublished) >= forced
 	if owned && !changed && !refreshDue {
 		m.skipped++
@@ -666,7 +714,12 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 		return err
 	}
 
-	prevOwned, hadPrev := m.state.get(sc.Key, surfaceAIdentity, "")
+	// Ownership is keyed on the scope INCLUDING the published FQDN (#2903): a
+	// hostname change is a NEW scope (no prevOwned here — the old name lives under
+	// its own scope key and is withdrawn by Reconcile Pass 2), never an in-place
+	// overwrite that would orphan the old RR.
+	key := sc.effectiveKey()
+	prevOwned, hadPrev := m.state.get(key, surfaceAIdentity, "")
 	prevAddr := ""
 	if hadPrev {
 		prevAddr = prevOwned.Address
@@ -683,7 +736,7 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 		PTRName:     "",
 		TTL:         ttl,
 		AddrText:    addr.String(),
-	}.withScope(sc.Key)
+	}.withScope(key)
 	m.state.put(ow)
 	if err := m.state.save(); err != nil {
 		// Could not durably record ownership: do NOT publish. Roll back to the
@@ -691,7 +744,7 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 		if hadPrev {
 			m.state.put(prevOwned)
 		} else {
-			m.state.delete(sc.Key, surfaceAIdentity, "")
+			m.state.delete(key, surfaceAIdentity, "")
 		}
 		m.upsertFail++
 		return fmt.Errorf("ddns surface-a: cannot durably record ownership before publish: %w", err)
@@ -709,7 +762,7 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 	// could have replaced or deleted the ownership entry while we were unlocked;
 	// if so, the newer state wins and we must NOT clobber it with a rollback or a
 	// stale success — just report the wire outcome and let the next pass converge.
-	cur, stillOwned := m.state.get(sc.Key, surfaceAIdentity, "")
+	cur, stillOwned := m.state.get(key, surfaceAIdentity, "")
 	stale := !stillOwned || cur.AddrText != ow.AddrText
 	if wireErr != nil {
 		// Hard add failure: the record is NOT live with the new rdata. Restore
@@ -726,7 +779,7 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 			if hadPrev {
 				m.state.put(prevOwned)
 			} else {
-				m.state.delete(sc.Key, surfaceAIdentity, "")
+				m.state.delete(key, surfaceAIdentity, "")
 			}
 			_ = m.state.save()
 		}
@@ -940,7 +993,7 @@ func (m *SurfaceAManager) StatusViews(scopes []SurfaceAScope) []SurfaceAStatusVi
 			FQDN:      sc.FQDN,
 			Provider:  sc.Key.PolicyID,
 		}
-		owned, isOwned := m.state.get(sc.Key, surfaceAIdentity, "")
+		owned, isOwned := m.state.get(sc.effectiveKey(), surfaceAIdentity, "")
 		if isOwned {
 			v.Published = owned.AddrText
 			if owned.FQDN != "" {

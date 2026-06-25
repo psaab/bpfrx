@@ -21,6 +21,32 @@
   green; fail-on-revert proven — reverting the family-aware default turns the
   v6 case RED with the exact pre-fix `ip route 0.0.0.0/0 2001:db8::1 250`.
 
+## 2026-06-25 — #2903: DDNS Surface A FQDN rename — new name unpublished + old name orphaned
+
+- **Timestamp**: 2026-06-25
+- **Action**: Surface A's `ScopeKey` had no FQDN axis, so changing only the
+  configured hostname for a scope (same IP) (1) was NOT detected as a change —
+  the `owned && !changed && !refreshDue` skip fired, so the new name was never
+  published; and (2) when a publish did occur the in-place ownership overwrite
+  stored the new FQDN under the SAME scope key and never `DeleteLease`'d the old
+  name — the old RR was orphaned (kept resolving forever). Fix: added an `FQDN`
+  field to `ScopeKey` and made the published name part of the Surface A scope
+  identity. `scopePrefix()` appends `/fqdn=<name>` only when non-empty, so a
+  DHCP-lease (Surface B) scope keeps its pre-#2903 prefix byte-for-byte (no
+  lease-store migration). The manager folds `SurfaceAScope.FQDN` into the key via
+  a new `effectiveKey()` used by every ownership/runtime/status lookup, so a
+  hostname change is a rename: the new scope publishes (Pass 1) and the old scope
+  — now gone-from-config — is withdrawn (Pass 2, real DeleteLease through the
+  same backend). Composes with #2778 lock-IO, #2820, #2840, #2843 status, #2846.
+- **File(s)**: pkg/ddns/state.go (ScopeKey.FQDN + scopePrefix), pkg/ddns/surface_a.go
+  (effectiveKey + all ownership lookups), pkg/daemon/daemon_ddns_surface_a.go
+  (populate Key.FQDN), pkg/ddns/surface_a_test.go (two fail-on-revert tests +
+  helper), pkg/ddns/README.md
+- **Validation**: go build ./..., gofmt -l (edited files clean), go vet
+  ./pkg/ddns/... ./pkg/daemon/..., go test -race ./pkg/ddns/... ./pkg/daemon/...;
+  fail-on-revert verified (both new tests RED when effectiveKey drops FQDN:
+  new name unpublished + zero deletes).
+
 ## 2026-06-25 — #2867: VRRP GARP/NA burst follow-up loops keep poisoning after abdication
 
 - **Timestamp**: 2026-06-25
