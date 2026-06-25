@@ -4165,8 +4165,23 @@ fn poll_descriptor_policy_deny_path_emits_rt_flow_event() {
     assert!(telemetry.dbg.policy_deny >= 1);
 }
 
-#[test]
-fn poll_descriptor_input_filter_log_path_emits_rt_flow_event() {
+/// #2617 harness: drive a single LAN→WAN TCP-SYN session-miss packet through
+/// `poll_binding_process_descriptor` with an interface input filter whose term
+/// is `then { log; accept; }` matching dport 5201. Returns the worker event
+/// handle (for `filter_log.sent` stats) plus the decoded receiver so callers
+/// can assert the emitted RT_FLOW event.
+///
+/// `max_sessions` caps the worker session table BEFORE the poll: `Some(0)`
+/// forces the ForwardCandidate install to be REFUSED (admission cap), which
+/// exercises the cache-declined / short-lived permitted-flow path the #2617
+/// fix repairs — the accepted `then log` must still emit on the miss packet
+/// even though no session is installed.
+fn run_input_filter_accept_log_poll(
+    max_sessions: Option<usize>,
+) -> (
+    crate::event_stream::EventStreamWorkerHandle,
+    std::sync::mpsc::Receiver<crate::event_stream::codec::EventFrame>,
+) {
     let mut snapshot = policy_deny_snapshot();
     snapshot.default_policy = "permit".to_string();
     snapshot.policies.clear();
@@ -4303,6 +4318,9 @@ fn poll_descriptor_input_filter_log_path_emits_rt_flow_event() {
         cold_path_sample_mask: 0xff,
     };
     let mut sessions = SessionTable::new();
+    if let Some(cap) = max_sessions {
+        sessions.set_max_sessions_for_test(cap);
+    }
     let mut screen = ScreenState::new();
     let mut batch = BatchCounters::default();
     let mut dbg = DebugPollCounters::default();
@@ -4334,6 +4352,16 @@ fn poll_descriptor_input_filter_log_path_emits_rt_flow_event() {
         &mut telemetry,
     );
 
+    (event_handle, event_rx)
+}
+
+/// Assert the common shape of the emitted accepted input-filter `then log`
+/// RT_FLOW event (shared by the install-success and install-refused #2617
+/// tests).
+fn assert_input_filter_accept_log_event(
+    event_handle: &crate::event_stream::EventStreamWorkerHandle,
+    event_rx: &std::sync::mpsc::Receiver<crate::event_stream::codec::EventFrame>,
+) {
     let event = event_rx
         .try_recv()
         .expect("input filter-log event from poll descriptor")
@@ -4350,6 +4378,28 @@ fn poll_descriptor_input_filter_log_path_emits_rt_flow_event() {
     assert_eq!(event.ingress_zone_id, TEST_LAN_ZONE_ID);
     assert_eq!(event.egress_zone_id, 0);
     assert_eq!(event_handle.dataplane_event_stats().filter_log.sent, 1);
+}
+
+#[test]
+fn poll_descriptor_input_filter_log_path_emits_rt_flow_event() {
+    // Default session cap: the ForwardCandidate flow installs a session.
+    let (event_handle, event_rx) = run_input_filter_accept_log_poll(None);
+    assert_input_filter_accept_log_event(&event_handle, &event_rx);
+}
+
+#[test]
+fn poll_descriptor_input_filter_accept_log_emits_on_install_refused_miss() {
+    // #2617 fail-on-revert guard. With the session table capped at 0 the
+    // ForwardCandidate install is REFUSED (admission cap) and the miss
+    // packet is dropped via `continue` BEFORE the former per-install emit
+    // site. The accepted `then log` term must still emit its RT_FLOW audit
+    // record on this first/only packet, otherwise a cache-declined or
+    // short-lived permitted flow logs nothing at all. Before the fix moved
+    // the emit to the single early accept-fall-through site, this asserted
+    // `try_recv()` found NO event and `filter_log.sent == 0` — reverting the
+    // fix turns this test RED.
+    let (event_handle, event_rx) = run_input_filter_accept_log_poll(Some(0));
+    assert_input_filter_accept_log_event(&event_handle, &event_rx);
 }
 
 #[test]

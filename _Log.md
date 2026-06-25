@@ -15438,3 +15438,17 @@ top.
   pkg/config/schema_security.go, pkg/ipsec/policy.go,
   pkg/config/parser_security_test.go, pkg/ipsec/ipsec_test.go,
   docs/config-schema.md, _Log.md
+
+## 2026-06-25 — #2617 accepted input-filter `then log` miss-packet emit
+- **Timestamp**: 2026-06-25
+- **Action**: Move the non-PBR input-filter `then log` emit to a single early
+  site at the accept fall-through in `poll_binding_process_descriptor`, so an
+  accepted term emits its RT_FLOW audit record on the session-miss (first)
+  packet across ALL accept exits (forward-candidate install-success and
+  install-refused, local-delivery). Removed the former per-install emit site
+  (would double-log an installed forward flow). Added fail-on-revert test
+  `poll_descriptor_input_filter_accept_log_emits_on_install_refused_miss`
+  (cap=0 → install refused → log must still emit; RED on revert with "Empty").
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  docs/pr/1373-retire-ebpf-dataplane/plan-1379-dataplane-events.md, _Log.md
