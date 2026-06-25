@@ -71,6 +71,12 @@ const (
 	// positive integer ("14") or the Junos "group<N>" spelling
 	// ("group14"). Both spellings compile; validated by ValidateDHGroup.
 	ValueDHGroup
+	// ValueHostname is a DNS hostname / FQDN whose published form must
+	// equal the operator's intent (#2779): LDH labels (letters, digits,
+	// hyphens) joined by dots, optional trailing dot. Validated by
+	// ValidateDDNSHostname — a name the publish path would silently
+	// rewrite is rejected at commit.
+	ValueHostname
 )
 
 // Placeholder returns the angle-bracket placeholder name shown in `?`
@@ -105,6 +111,8 @@ func (v ValueType) Placeholder() string {
 		return "<mac-address>"
 	case ValueDHGroup:
 		return "<dh-group>"
+	case ValueHostname:
+		return "<fqdn>"
 	}
 	return ""
 }
