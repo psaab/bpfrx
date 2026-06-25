@@ -111,7 +111,23 @@ func duckdnsDomain(fqdn string) string {
 // UpsertLease publishes one A or AAAA via a single DuckDNS update GET. DuckDNS
 // takes the v4 address in `ip` and the v6 address in `ipv6`; a Surface A record
 // carries exactly one address (one family per record), so exactly one of the two
-// is set per call and the other family's existing record is left untouched.
+// is set per call.
+//
+// CAVEAT — DuckDNS per-family clobber (#2960): omitting the OTHER family's
+// parameter does NOT leave that family's record untouched. The DuckDNS spec
+// (duckdns.org/spec.jsp) says "If you do not specify the IP address, then it
+// will be detected" — so a v6 update that sends only ipv6= makes DuckDNS
+// AUTO-DETECT the source IPv4 and SET the A record (and the v4-only path's
+// behaviour for the AAAA is undocumented — treat it as the same risk). DuckDNS
+// has no per-family update verb, so xpf cannot update one family without DuckDNS
+// touching the other. With per-family Surface A scopes (no per-FQDN coalescing)
+// a dual-stack DuckDNS name would have its A and AAAA fight on every reconcile.
+// The supported topology is therefore ONE family per DuckDNS name; a config that
+// binds the same DuckDNS name on both inet and inet6 is flagged at commit by
+// config.validateSurfaceADDNSWarnings (#2960). We deliberately do NOT synthesize
+// a placeholder/last-known value for the other family here: the engine does not
+// pass cross-scope knowledge to the backend, so any value we could fabricate
+// would itself be a guess that clobbers.
 func (b *duckdnsBackend) UpsertLease(ctx context.Context, rec LeaseDNSRecord) error {
 	q := url.Values{}
 	addr := rec.Addr.Unmap()

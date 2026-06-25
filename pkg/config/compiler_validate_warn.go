@@ -1189,6 +1189,27 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 	}
 
 	// Per-interface binding completeness.
+	//
+	// duckFamilies tracks, per (provider, FQDN) that resolves to a DuckDNS
+	// backend, which address families are bound — to warn about the DuckDNS
+	// per-family clobber (#2960). DuckDNS's update API auto-detects and SETS the
+	// family whose address parameter is OMITTED ("If you do not specify the IP
+	// address, then it will be detected" — duckdns.org/spec.jsp). A Surface A v6
+	// scope therefore sends only ipv6= and DuckDNS auto-sets the A from the
+	// source IPv4 — overwriting the A the separate v4 scope publishes. Because
+	// Surface A scopes are per-family with NO per-FQDN coalescing, a dual-stack
+	// DuckDNS name has two scopes that fight on every reconcile (and with
+	// source-binding/multi-WAN/NAT the auto-detected A diverges from the
+	// configured one). One family per DuckDNS name is the supported topology.
+	type duckKey struct{ provider, fqdn string }
+	duckFamilies := map[duckKey][]string{}
+	isDuckDNS := func(provider string) bool {
+		if provider == "" || catalog == nil {
+			return false
+		}
+		p, ok := catalog[provider]
+		return ok && p != nil && p.Backend == "duckdns"
+	}
 	if cfg.Interfaces.Interfaces != nil {
 		ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
 		for n := range cfg.Interfaces.Interfaces {
@@ -1227,13 +1248,54 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 						warnings = append(warnings, fmt.Sprintf("%s references undefined provider %q "+
 							"(define it under system services dynamic-dns provider)", loc, d.Provider))
 					}
+					// #2960: record DuckDNS (provider, FQDN) bindings per family so a
+					// dual-stack DuckDNS name (the clobber topology) is flagged below.
+					if d.Hostname != "" && isDuckDNS(d.Provider) {
+						k := duckKey{provider: d.Provider, fqdn: strings.ToLower(strings.TrimSuffix(d.Hostname, "."))}
+						duckFamilies[k] = append(duckFamilies[k], family)
+					}
 				}
 				check("inet", unit.DynamicDNSInet)
 				check("inet6", unit.DynamicDNSInet6)
 			}
 		}
 	}
+
+	// #2960: a single DuckDNS name bound on BOTH inet and inet6 is the per-family
+	// clobber topology (the v6 scope's update auto-sets the A and vice versa).
+	// Warn (not hard-reject, matching this validator's fail-open posture — a hard
+	// reject could brick a boot on a previously-inert misconfig); the runtime
+	// still publishes, but the operator is told the two families fight.
+	duckNames := make([]duckKey, 0, len(duckFamilies))
+	for k, fams := range duckFamilies {
+		if hasFamily(fams, "inet") && hasFamily(fams, "inet6") {
+			duckNames = append(duckNames, k)
+		}
+	}
+	sort.Slice(duckNames, func(i, j int) bool {
+		if duckNames[i].provider != duckNames[j].provider {
+			return duckNames[i].provider < duckNames[j].provider
+		}
+		return duckNames[i].fqdn < duckNames[j].fqdn
+	})
+	for _, k := range duckNames {
+		warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+			"provider %q (backend duckdns) hostname %q is bound on BOTH inet and "+
+			"inet6: DuckDNS auto-detects and overwrites the family whose address is "+
+			"omitted, so the two scopes clobber each other's A/AAAA on every "+
+			"reconcile. Bind a DuckDNS name to a single family.", k.provider, k.fqdn))
+	}
 	return warnings
+}
+
+// hasFamily reports whether fams contains the given family token.
+func hasFamily(fams []string, want string) bool {
+	for _, f := range fams {
+		if f == want {
+			return true
+		}
+	}
+	return false
 }
 
 // validateRoutingRuleWindowWarnings emits commit-time warnings when a

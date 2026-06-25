@@ -17984,3 +17984,34 @@ top.
   pkg/ddns/backend_http_test.go, pkg/ddns/README.md,
   pkg/config/schema_system.go, pkg/config/compiler_validate_warn.go,
   pkg/config/compiler_p3_http_providers_test.go, docs/config-schema.md, _Log.md
+
+## 2026-06-25 — #2960 review fix: DuckDNS per-family clobber (PR #2967 r2)
+- **Timestamp**: 2026-06-25
+- **Action**: Hostile review (MERGE-NEEDS-MINOR) flagged a spec-backed defect:
+  the DuckDNS update API auto-detects and SETS the family whose address param
+  is omitted ("If you do not specify the IP address, then it will be detected",
+  duckdns.org/spec.jsp). A v6-only UpsertLease (ipv6= only) therefore overwrites
+  the A record. Surface A scopes are per-family with NO per-FQDN coalescing, so
+  a dual-stack DuckDNS name has two scopes that clobber each other every
+  reconcile. Approach (a) (per-FQDN coalescing so one update carries both ip=
+  and ipv6=) would require threading cross-scope address knowledge through the
+  surface_a engine into the backend boundary — too invasive (the engine resolves
+  a backend per scope and calls UpsertLease with a single-address record; the
+  change-detection / ownership / RG-gate state machine is all per-scope). Took
+  approach (b): SINGLE-FAMILY-PER-NAME restriction enforced by a commit-time
+  warning in validateSurfaceADDNSWarnings — a DuckDNS (provider,FQDN) bound on
+  BOTH inet and inet6 is flagged (warn, not hard-reject, matching this
+  validator's fail-open posture). Fixed the now-false UpsertLease code comment
+  (documents the auto-detect clobber + why no placeholder is synthesized) and
+  the README (single-family-per-name caveat).
+- **Fail-on-revert**: pkg/config TestDuckDNSDualStackNameWarns — a config with
+  both A+AAAA duckdns scopes on one name MUST warn (RED without the cross-family
+  detection — proven by neutralizing the gate). Asserts NO false positives: a
+  single-family duckdns name and a dual-stack name on a non-duckdns (cloudflare)
+  backend are NOT warned.
+- **Gates**: go build ./..., gofmt -l clean (Go files), go vet
+  ./pkg/ddns/... ./pkg/config/..., go test -race ./pkg/ddns/... ./pkg/config/...
+  all PASS.
+- **File(s)**: pkg/ddns/backend_duckdns.go, pkg/ddns/README.md,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_p3_http_providers_test.go, _Log.md
