@@ -15,18 +15,64 @@
 
 use super::super::*;
 
+// Target for the kernel socket-buffer sysctls, in bytes. MUST match the Go
+// control plane's `tuneSocketBuffers` target (`pkg/dataplane/userspace/
+// process.go`, `const desired = 67108864`). Both components raise these
+// host-global sysctls so AF_XDP copy-mode sockets can receive at line rate;
+// keeping the targets identical means whichever runs second is a no-op rather
+// than a fight (#2970).
+const SOCKBUF_TARGET: i64 = 67108864; // 64 MiB
+
+/// Raise-only sysctl computation (#2970): given the current sysctl contents
+/// and a target, return `Some(target)` if the target is strictly higher than
+/// the current value, otherwise `None` (already >= target, or unparseable —
+/// never lower a value an operator or the Go control plane set higher).
+///
+/// Pure function so it can be unit-tested without touching real `/proc`.
+fn raise_only_value(current: &str, target: i64) -> Option<i64> {
+    let cur: i64 = current.trim().parse().ok()?;
+    if cur >= target { None } else { Some(target) }
+}
+
+/// Apply `raise_only_value` to a real sysctl path: read the current value and
+/// only write the target when it would raise (never lower). Host-global
+/// rmem/wmem ceilings must never be clobbered downward — the Go control plane
+/// already raises these to 64 MiB before launching us, and an operator may
+/// have tuned them even higher (#2970).
+fn raise_sysctl(path: &str, target: i64) {
+    let current = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warn: read {path}: {e}");
+            return;
+        }
+    };
+    match raise_only_value(&current, target) {
+        Some(val) => {
+            if let Err(e) = fs::write(path, val.to_string()) {
+                eprintln!("warn: set {path}: {e}");
+            } else {
+                eprintln!("set {path}={val} (raised from {})", current.trim());
+            }
+        }
+        None => {
+            eprintln!("keep {path}={} (>= target {target})", current.trim());
+        }
+    }
+}
+
 pub(crate) fn run() -> Result<(), String> {
-    // Increase socket receive buffer defaults — needed for AF_XDP copy mode
-    // to avoid drops when the kernel backlog is large.
+    // Increase socket buffer ceilings — needed for AF_XDP copy mode to avoid
+    // drops when the kernel backlog is large. Raise-only: never lower a value
+    // the Go control plane (64 MiB) or an operator already set higher (#2970).
+    // Cover both rmem and wmem to match the Go side.
     for sysctl in &[
         "/proc/sys/net/core/rmem_default",
         "/proc/sys/net/core/rmem_max",
+        "/proc/sys/net/core/wmem_default",
+        "/proc/sys/net/core/wmem_max",
     ] {
-        if let Err(e) = fs::write(sysctl, "16777216") {
-            eprintln!("warn: set {sysctl}: {e}");
-        } else {
-            eprintln!("set {sysctl}=16777216");
-        }
+        raise_sysctl(sysctl, SOCKBUF_TARGET);
     }
     let args = parse_args()?;
     // Enable NAPI busy polling sysctls only in busy-poll mode.
@@ -420,5 +466,98 @@ mod ring_entries_tests {
     fn rejects_zero_and_garbage() {
         assert!(validate_ring_entries_arg("0").is_err());
         assert!(validate_ring_entries_arg("asd").is_err());
+    }
+}
+
+#[cfg(test)]
+mod sockbuf_raise_only_tests {
+    // #2970 fail-on-revert: the helper must NEVER lower a socket-buffer
+    // sysctl below its current value. Before #2970 `run()` unconditionally
+    // wrote 16 MiB to rmem_default/rmem_max, clobbering the 64 MiB the Go
+    // control plane had just raised them to. These tests pin the raise-only
+    // contract: revert to the unconditional write and they go RED.
+    use super::{raise_only_value, raise_sysctl, SOCKBUF_TARGET};
+    use std::fs;
+
+    // 16 MiB — the value the pre-#2970 helper unconditionally forced.
+    const OLD_FORCED: i64 = 16_777_216;
+
+    #[test]
+    fn target_matches_go_control_plane() {
+        // Must equal the Go `tuneSocketBuffers` desired (64 MiB) so whichever
+        // component runs second is a no-op rather than a downgrade.
+        assert_eq!(SOCKBUF_TARGET, 67_108_864);
+        // And the old forced value is strictly smaller — the whole point.
+        assert!(OLD_FORCED < SOCKBUF_TARGET);
+    }
+
+    #[test]
+    fn does_not_lower_a_higher_existing_value() {
+        // Go raised it to 64 MiB; helper must leave it alone.
+        assert_eq!(raise_only_value("67108864", SOCKBUF_TARGET), None);
+        // Operator tuned it even higher (128 MiB); must not be lowered.
+        assert_eq!(raise_only_value("134217728", SOCKBUF_TARGET), None);
+        // Exactly at target — no write.
+        assert_eq!(raise_only_value(" 67108864\n", SOCKBUF_TARGET), None);
+    }
+
+    #[test]
+    fn raises_a_lower_value_to_target() {
+        // Kernel default 208 KiB → raised to 64 MiB.
+        assert_eq!(raise_only_value("212992", SOCKBUF_TARGET), Some(SOCKBUF_TARGET));
+        // The pre-#2970 forced 16 MiB is itself below target → would be raised.
+        assert_eq!(raise_only_value("16777216", SOCKBUF_TARGET), Some(SOCKBUF_TARGET));
+    }
+
+    #[test]
+    fn unparseable_current_is_left_alone() {
+        assert_eq!(raise_only_value("garbage", SOCKBUF_TARGET), None);
+        assert_eq!(raise_only_value("", SOCKBUF_TARGET), None);
+    }
+
+    // End-to-end against a real file: the strongest fail-on-revert guard.
+    // If `run()`'s sysctl loop is reverted to an unconditional 16 MiB write,
+    // a path pre-seeded with 64 MiB would be clobbered to 16 MiB and this
+    // assertion fails.
+    #[test]
+    fn raise_sysctl_preserves_higher_value_on_disk() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "xpf-2970-rmem-{}-{}",
+            std::process::id(),
+            // distinguish from the lower-value test below
+            "hi"
+        ));
+        let p = path.to_str().unwrap();
+        // Simulate the Go control plane having already raised it to 64 MiB.
+        fs::write(p, "67108864").unwrap();
+
+        raise_sysctl(p, SOCKBUF_TARGET);
+
+        let after: i64 = fs::read_to_string(p).unwrap().trim().parse().unwrap();
+        let _ = fs::remove_file(p);
+        assert_eq!(
+            after, 67_108_864,
+            "raise_sysctl must NOT lower a value the Go side already raised"
+        );
+        assert_ne!(
+            after, OLD_FORCED,
+            "regression: helper lowered rmem back to the pre-#2970 16 MiB"
+        );
+    }
+
+    #[test]
+    fn raise_sysctl_raises_a_low_value() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("xpf-2970-rmem-{}-lo", std::process::id()));
+        let p = path.to_str().unwrap();
+        // Kernel default, well below target.
+        fs::write(p, "212992").unwrap();
+
+        raise_sysctl(p, SOCKBUF_TARGET);
+
+        let after: i64 = fs::read_to_string(p).unwrap().trim().parse().unwrap();
+        let _ = fs::remove_file(p);
+        assert_eq!(after, SOCKBUF_TARGET, "raise_sysctl must raise a low value to target");
     }
 }

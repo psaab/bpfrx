@@ -329,6 +329,24 @@ DSCP is not copied back at decap.
   `align_of::<CmsgBuf>() >= align_of::<cmsghdr>()` assertion is the
   fail-on-revert sentinel.
 
+- **Link-local v6 endpoint scope (#2995)** — the same `recvmsg` loop
+  converts the kernel-populated `msg_name` `sockaddr_storage` into a Rust
+  `SocketAddr` (`sockaddr_storage_to_socketaddr`) to learn / refresh a
+  peer's roaming endpoint. The AF_INET6 arm builds a `SocketAddrV6` that
+  preserves `sin6_scope_id` and `sin6_flowinfo` rather than discarding
+  them via `SocketAddr::new` (which fixes `scope_id = 0`). A WireGuard
+  underlay endpoint that is an IPv6 link-local address (`fe80::/10`)
+  carries the receiving-interface scope; without it the next
+  `wg_send_to` toward the learned endpoint is rejected by the kernel with
+  EINVAL/ENODEV (a link-local destination requires a non-zero scope) and
+  the tunnel never establishes. The scope survives `canonicalize_endpoint`
+  (it only unmaps v4-mapped v6, passing native v6 through untouched). For
+  a global v6 endpoint the kernel sets `sin6_scope_id = 0`, so the change
+  is a no-op there. Fail-on-revert: the `wg_control`
+  `sockaddr_storage_to_socketaddr_preserves_link_local_scope` unit test
+  goes RED (scope_id 0 vs ifindex) if the construction reverts to
+  `SocketAddr::new`.
+
 ## What S1 delivers
 
 S1 makes xpf's WireGuard **handshake bytes** standards-compliant:
