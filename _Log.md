@@ -1,3 +1,24 @@
+## 2026-06-25 — #2789: relay DHCPDECLINE to the server
+
+- **Timestamp**: 2026-06-25
+- **Action**: `clientRequestRelayable` gated the client→server relay loop
+  to DISCOVER/REQUEST/INFORM, dropping DHCPDECLINE. A client that detects
+  an in-use offered address (ARP probe) broadcasts a DHCPDECLINE
+  (RFC 2131 §3.1 step 4, §4.4.1); the relay dropped it, so the upstream
+  server never learned of the conflict and kept re-offering the in-use
+  address. Added `dhcpv4.MessageTypeDecline` to the relayable set so the
+  DECLINE flows through the unchanged path (master-gate #2456, giaddr
+  stamp, RFC 1542 hop-limit, Option 82). RELEASE stays excluded: it is
+  unicast directly to the bound server (RFC 2131 §4.4.4) and is never
+  seen on the relay's client-facing broadcast socket. Composes with the
+  #2606 NAK / #2645 forcerenew reply paths (DECLINE has no server reply).
+  Updated the function doc, the README relayed-type table, and added a
+  fail-on-revert end-to-end test (`TestRunRelay_RelaysDecline`) plus the
+  table case in `TestClientRequestRelayable` — both proven RED when the
+  type is removed, GREEN with the fix.
+- **File(s)**: `pkg/dhcprelay/relay.go`, `pkg/dhcprelay/relay_test.go`,
+  `pkg/dhcprelay/README.md`
+
 ## 2026-06-25 — #2783: PTB egress-MTU decision uses IP-declared length
 
 - **Timestamp**: 2026-06-25
