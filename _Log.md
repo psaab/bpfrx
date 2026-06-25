@@ -15181,3 +15181,23 @@ top.
   clean origin/master, no snmp involvement).
 - **File(s)**: pkg/snmp/agent.go, pkg/snmp/v3_timeliness_test.go,
   pkg/snmp/v3_set_test.go, pkg/snmp/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2448 — type static-route destination + next-hop at commit so a
+  malformed CIDR or gateway is REJECTED instead of silently dropped by the
+  FRR renderer / Rust FIB builder (populate_routes soft-skips a non-v4/v6
+  destination; the next-hop resolver falls back to ifindex 0 / interface-only).
+  Added ValidateRouteDestination (family-agnostic CIDR, required prefix —
+  accepts 0.0.0.0/0 + ::/0) and ValidateStaticNextHop (IP / ip@interface /
+  bare interface name; rejects botched IP literals + bad-IP-before-@) +
+  plausibleInterfaceName helper. Wired via a new staticRouteNode() SSOT shared
+  by routing-options / per-rib / routing-instances static blocks; the node now
+  declares next-hop, qualified-next-hop, discard, reject, next-table,
+  preference children so no-next-hop and qualified forms still commit. Added
+  schema_validate_route_2448_test.go (hierarchical + flat-set, fail-on-revert
+  proven RED: stripping the two validators makes all 9 RejectsBad cases
+  silently accept). Gates: go build ./..., gofmt -l clean, go vet clean,
+  go test ./pkg/config/... ./pkg/cmdtree/... ./pkg/frr/... ./pkg/configstore/...
+  all green. Doc: docs/config-schema.md #2448 subsection.
+- **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_routing.go,
+  pkg/config/schema_validate_route_2448_test.go, docs/config-schema.md, _Log.md
