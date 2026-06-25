@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/ddns"
@@ -297,12 +298,14 @@ func surfaceALinuxIfName(cfg *config.Config, ifName string, unit *config.Interfa
 	return config.DHCPLeaseIfName(resolved, unit)
 }
 
-// observeInterfaceAddr reads the current global-scope address of the given
-// family on a kernel interface via netlink, falling back to the unit's
-// configured static address. Returns (zero, true) when the interface exists but
-// has no usable address of that family (definitively none → the engine
-// withdraws); (zero, false) when the interface cannot be read (transient → the
-// engine leaves the scope untouched).
+// observeInterfaceAddr reads the current publishable address of the given family
+// on a kernel interface via netlink (selection policy in selectInterfaceAddr:
+// prefer an RFC 4862 preferred address over a deprecated one, never a
+// tentative/dadfailed/optimistic one, public-gated via ddns.IsPublicAddr),
+// falling back to the unit's configured static address. Returns (zero, true)
+// when the interface exists but has no usable address of that family
+// (definitively none → the engine withdraws); (zero, false) when the interface
+// cannot be read (transient → the engine leaves the scope untouched).
 func (d *Daemon) observeInterfaceAddr(linuxName string, af4 bool, unit *config.InterfaceUnit) (netip.Addr, bool) {
 	link, err := netlink.LinkByName(linuxName)
 	if err != nil {
@@ -323,37 +326,78 @@ func (d *Daemon) observeInterfaceAddr(linuxName string, af4 bool, unit *config.I
 		}
 		return netip.Addr{}, false
 	}
-	best := netip.Addr{}
+	if best, ok := selectInterfaceAddr(addrs, af4); ok {
+		return best, true
+	}
+	// No usable netlink address: fall back to a configured static address.
+	if a, ok := staticUnitAddr(unit, af4); ok {
+		return a, true
+	}
+	// Interface is up but has no address of this family: definitively none.
+	return netip.Addr{}, true
+}
+
+// selectInterfaceAddr chooses the address to publish from a kernel interface's
+// netlink address list for the requested family. It is the pure (no-netlink-I/O)
+// core of observeInterfaceAddr so the selection policy can be exercised
+// directly with synthetic IFA_F_* flag combinations.
+//
+// Selection policy (RFC 4862 address states + the Surface A publishability gate):
+//
+//   - NEVER select an address whose DAD has not succeeded:
+//     IFA_F_TENTATIVE (DAD in progress), IFA_F_DADFAILED (duplicate detected),
+//     or IFA_F_OPTIMISTIC (RFC 4429 optimistic DAD — usable for some traffic but
+//     not yet DAD-confirmed, so not safe to publish to global DNS). Publishing
+//     one risks a duplicate/black-holed answer.
+//   - NEVER select a non-globally-meaningful address (loopback / link-local
+//     uni+multicast / multicast / unspecified, AND every IANA special-purpose
+//     range) — the SAME ddns.IsPublicAddr gate the static fallback (#2776) and
+//     the checkip source use. A preferred-but-ULA address is still rejected.
+//   - PREFER an RFC 4862 `preferred` address over a `deprecated` one
+//     (IFA_F_DEPRECATED). A deprecated address is being phased out (renumber /
+//     PD churn / privacy-address rotation) and will soon become invalid, so
+//     publishing it black-holes inbound reachability. The first eligible
+//     preferred address wins; a deprecated address is remembered only as a
+//     fallback used IFF no preferred address exists (never blackhole — a
+//     deprecated-but-still-valid address is better than no answer).
+//
+// netlink returns a stable order, so "first eligible" is deterministic.
+func selectInterfaceAddr(addrs []netlink.Addr, af4 bool) (netip.Addr, bool) {
+	deprecated := netip.Addr{}
 	for _, ad := range addrs {
 		ip, ok := netip.AddrFromSlice(ad.IP)
 		if !ok {
 			continue
 		}
 		ip = ip.Unmap()
-		// Skip link-local / loopback / unspecified — Surface A publishes a
-		// globally meaningful address only (the inadyn validity gate, plan §3.2).
-		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-			ip.IsMulticast() || ip.IsUnspecified() {
-			continue
-		}
 		if af4 != ip.Is4() {
 			continue
 		}
-		// Prefer the first global address (deterministic; netlink returns a
-		// stable order). A more specific selection (primary flag) is a P3
-		// refinement.
-		best = ip
-		break
+		// Skip addresses whose DAD has not succeeded — they may be duplicate or
+		// not yet usable. tentative/dadfailed/optimistic are never publishable.
+		if ad.Flags&(unix.IFA_F_TENTATIVE|unix.IFA_F_DADFAILED|unix.IFA_F_OPTIMISTIC) != 0 {
+			continue
+		}
+		// Globally-routable-unicast gate (#2776): reject link-local, loopback,
+		// unspecified, multicast, ULA, CGNAT, documentation, and every other
+		// IANA special-purpose range. A preferred-but-ULA address is rejected.
+		if !ddns.IsPublicAddr(ip) {
+			continue
+		}
+		if ad.Flags&unix.IFA_F_DEPRECATED != 0 {
+			// Remember the first deprecated candidate as a no-blackhole fallback.
+			if !deprecated.IsValid() {
+				deprecated = ip
+			}
+			continue
+		}
+		// First eligible preferred address wins.
+		return ip, true
 	}
-	if best.IsValid() {
-		return best, true
+	if deprecated.IsValid() {
+		return deprecated, true
 	}
-	// No global netlink address: fall back to a configured static address.
-	if a, ok := staticUnitAddr(unit, af4); ok {
-		return a, true
-	}
-	// Interface is up but has no address of this family: definitively none.
-	return netip.Addr{}, true
+	return netip.Addr{}, false
 }
 
 // staticUnitAddr returns the first configured static address of the given
