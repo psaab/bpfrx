@@ -44,8 +44,10 @@ type cloudflareBackend struct {
 
 // newCloudflareBackend resolves a provider-catalog entry into a live Cloudflare
 // backend. A missing api-token or zone is a hard error so the manager falls back
-// to no-op (logged) rather than issuing unauthenticated requests.
-func newCloudflareBackend(p *config.DDNSProvider) (*cloudflareBackend, error) {
+// to no-op (logged) rather than issuing unauthenticated requests. A non-nil
+// client is reused (the cached reconcile-path client, #2904); nil builds a
+// fresh bound client.
+func newCloudflareBackend(p *config.DDNSProvider, client *http.Client) (*cloudflareBackend, error) {
 	if p == nil {
 		return nil, fmt.Errorf("ddns cloudflare: nil provider")
 	}
@@ -62,8 +64,9 @@ func newCloudflareBackend(p *config.DDNSProvider) (*cloudflareBackend, error) {
 	}
 	// Bind the dial to the configured source-address/interface/VRF (#2846). A
 	// malformed source-address is a hard error so we degrade to no-op rather than
-	// publish from the wrong source.
-	client, err := newProviderHTTPClient(p)
+	// publish from the wrong source. A cached client (#2904) is reused when the
+	// reconcile path supplies one; nil builds a fresh bound client.
+	client, err := ensureProviderHTTPClient(p, client)
 	if err != nil {
 		return nil, fmt.Errorf("ddns cloudflare: provider %q: %w", p.Name, err)
 	}
