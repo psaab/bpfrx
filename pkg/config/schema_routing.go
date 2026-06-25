@@ -89,11 +89,23 @@ var schemaPolicyOptions = &schemaNode{desc: "Policy options", children: map[stri
 				// leaf instead of replacing the previous one (#2008 H18 /
 				// Copilot #2011). A single-value leaf collapses separate set
 				// commands down to only the last protocol.
-				"protocol":     {desc: "Protocol", args: 1, multi: true, placeholder: "<protocol>", children: nil},
-				"prefix-list":  {desc: "Prefix list", args: 1, placeholder: "<list-name>", children: nil},
-				"route-filter": {desc: "Route filter", args: 2, placeholder: "<prefix>", keyValidator: ValidateRouteFilterArg, children: nil},
-				"community":    {desc: "Community", args: 1, placeholder: "<community>", children: nil},
-				"as-path":      {desc: "AS path", args: 1, placeholder: "<name>", children: nil},
+				"protocol": {desc: "Protocol", args: 1, multi: true, placeholder: "<protocol>", children: nil},
+				// prefix-list / route-filter / community / as-path may all be
+				// repeated within one term (Junos OR's repeated same-type `from`
+				// matches). Mark them multi so SetPath keeps every flat-set
+				// `set ... from <type> <value>` line as a distinct sibling leaf
+				// instead of overwriting the previous one (#2630). Without multi,
+				// the i>=len(path) single-value-leaf branch in SetPath filters
+				// by Keys[0] and replaces every prior entry, so only the LAST
+				// flat-set value survived — silently dropping all but the last
+				// route-filter/prefix-list/community/as-path. route-filter is
+				// args:2 (prefix + match-type); a trailing upto/range/through
+				// arg lands as a fourth packed key via the multi value-tail
+				// absorber, matching the brace AST the compiler already reads.
+				"prefix-list":  {desc: "Prefix list", args: 1, multi: true, placeholder: "<list-name>", children: nil},
+				"route-filter": {desc: "Route filter", args: 2, multi: true, placeholder: "<prefix>", keyValidator: ValidateRouteFilterArg, children: nil},
+				"community":    {desc: "Community", args: 1, multi: true, placeholder: "<community>", children: nil},
+				"as-path":      {desc: "AS path", args: 1, multi: true, placeholder: "<name>", children: nil},
 			}},
 			"then": {desc: "Action", children: map[string]*schemaNode{
 				"accept":           {desc: "Accept route", children: nil},

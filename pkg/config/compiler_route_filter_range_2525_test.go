@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -195,6 +196,138 @@ func TestRouteFilterMatchTypesStrictUnaffected(t *testing.T) {
 		tree := compileRouteFilterCmd(t, cmd)
 		if _, err := CompileConfig(tree); err != nil {
 			t.Errorf("compile of %q must succeed: %v", cmd, err)
+		}
+	}
+}
+
+// rfKey is a stable identity for a compiled RouteFilter, used to compare the
+// flat-set and brace-parsed route-filter sets independent of slice order.
+func rfKey(rf *RouteFilter) string {
+	return strings.Join([]string{
+		rf.Prefix, rf.MatchType,
+		itoa(rf.UptoLen), itoa(rf.RangeLow), itoa(rf.RangeHigh), rf.ThroughPrefix,
+	}, "|")
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
+
+// TestRouteFilterFlatSetMultipleAccumulate is the #2630 fail-on-revert guard:
+// repeated `set ... from route-filter <prefix> <match>` lines into the SAME
+// term must ALL persist. Before the fix (route-filter not marked multi in
+// setSchema), ConfigTree.SetPath overwrote the previous route-filter on every
+// line, so only the LAST prefix survived — this asserts all N survive.
+func TestRouteFilterFlatSetMultipleAccumulate(t *testing.T) {
+	tree := &ConfigTree{}
+	cmds := []string{
+		"set policy-options policy-statement P term t1 from route-filter 10.0.0.0/8 orlonger",
+		"set policy-options policy-statement P term t1 from route-filter 192.168.0.0/16 exact",
+		"set policy-options policy-statement P term t1 from route-filter 172.16.0.0/12 upto /24",
+		"set policy-options policy-statement P term t1 from route-filter 2001:db8::/32 prefix-length-range /48-/64",
+		"set policy-options policy-statement P term t1 then accept",
+	}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	term := cfg.PolicyOptions.PolicyStatements["P"].Terms[0]
+	if len(term.RouteFilters) != 4 {
+		t.Fatalf("flat-set route-filters = %d (%v), want 4 — repeated route-filter lines collapsed (#2630)",
+			len(term.RouteFilters), term.RouteFilters)
+	}
+	got := map[string]bool{}
+	for _, rf := range term.RouteFilters {
+		got[rfKey(rf)] = true
+	}
+	for _, want := range []string{
+		"10.0.0.0/8|orlonger|0|0|0|",
+		"192.168.0.0/16|exact|0|0|0|",
+		"172.16.0.0/12|upto|24|0|0|",
+		"2001:db8::/32|prefix-length-range|0|48|64|",
+	} {
+		if !got[want] {
+			t.Errorf("missing route-filter %q in %v", want, term.RouteFilters)
+		}
+	}
+}
+
+// TestRouteFilterFlatSetBraceParity proves the dual AST shapes converge: the
+// same N route-filters via flat-set SetPath and via the brace/hierarchical
+// parser produce the SAME compiled RouteFilter set (#2630).
+func TestRouteFilterFlatSetBraceParity(t *testing.T) {
+	// Brace / hierarchical form.
+	brace := `policy-options {
+    policy-statement P {
+        term t1 {
+            from {
+                route-filter 10.0.0.0/8 orlonger;
+                route-filter 192.168.0.0/16 exact;
+                route-filter 172.16.0.0/12 upto /24;
+                route-filter 2001:db8::/32 prefix-length-range /48-/64;
+            }
+            then accept;
+        }
+    }
+}`
+	bp := NewParser(brace)
+	btree, perrs := bp.Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("brace parse: %v", perrs)
+	}
+	bcfg, err := CompileConfig(btree)
+	if err != nil {
+		t.Fatalf("brace compile: %v", err)
+	}
+
+	// Flat-set form — same four route-filters.
+	ftree := &ConfigTree{}
+	for _, cmd := range []string{
+		"set policy-options policy-statement P term t1 from route-filter 10.0.0.0/8 orlonger",
+		"set policy-options policy-statement P term t1 from route-filter 192.168.0.0/16 exact",
+		"set policy-options policy-statement P term t1 from route-filter 172.16.0.0/12 upto /24",
+		"set policy-options policy-statement P term t1 from route-filter 2001:db8::/32 prefix-length-range /48-/64",
+		"set policy-options policy-statement P term t1 then accept",
+	} {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := ftree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	fcfg, err := CompileConfig(ftree)
+	if err != nil {
+		t.Fatalf("flat-set compile: %v", err)
+	}
+
+	keys := func(cfg *Config) map[string]bool {
+		m := map[string]bool{}
+		for _, rf := range cfg.PolicyOptions.PolicyStatements["P"].Terms[0].RouteFilters {
+			m[rfKey(rf)] = true
+		}
+		return m
+	}
+	bk, fk := keys(bcfg), keys(fcfg)
+	if len(bk) != 4 || len(fk) != 4 {
+		t.Fatalf("brace=%d flat=%d route-filters, want 4 each", len(bk), len(fk))
+	}
+	for k := range bk {
+		if !fk[k] {
+			t.Errorf("flat-set missing route-filter %q present in brace parse", k)
+		}
+	}
+	for k := range fk {
+		if !bk[k] {
+			t.Errorf("brace parse missing route-filter %q present in flat-set", k)
 		}
 	}
 }
