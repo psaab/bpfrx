@@ -111,9 +111,12 @@ func NewInDir(networkDir string) *Manager {
 // Interfaces with existing non-xpf networkd configs (e.g. management
 // interface) are skipped to avoid conflicts.
 func (m *Manager) Apply(interfaces []InterfaceConfig) error {
-	if len(interfaces) == 0 {
-		return nil
-	}
+	// An empty desired set is NOT a no-op (#2988): if the last xpf-managed
+	// interface is removed, the stale `10-xpf-*` sweep below must still run
+	// so old .network/.link/.netdev snippets do not resurrect addresses,
+	// bonds, bridges, or renames on the next reload. The expected set ends up
+	// holding only the protected-resolver's lifeline files, so everything
+	// else xpf owns is swept and a reload is requested.
 
 	// Discover interfaces with existing non-xpf networkd .network files.
 	// Only skip unmanaged interfaces that have external configs (e.g.
