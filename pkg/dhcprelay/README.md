@@ -168,10 +168,15 @@ group:
   its RG by stripping the unit suffix and reading the config interface's
   `redundant-ether-options redundancy-group` (same shape as `rgForInterfaces`,
   #2664).
-- Because the gate reads live `isRethMasterState` (the SAME source the DHCP
-  server / DDNS gates use), a backup that **becomes** master on VRRP failover
-  starts relaying immediately — no relay restart, no cached-at-startup
-  staleness.
+- Because the gate reads the same live `rgStateMachine` the DHCP server and
+  DDNS gates read — via the stricter `isRethMasterState` → `AllVRRPMaster()`
+  accessor (all the RG's VRRP instances MASTER), not the looser `IsActive()`
+  (`rg_active = clusterPri || allVrrpMaster` in non-strict mode) those gates
+  use — a backup that **becomes** master on VRRP failover starts relaying
+  immediately, no relay restart and no cached-at-startup staleness. The
+  tighter all-VRRP-master criterion is deliberate: it avoids two nodes both
+  relaying during the cluster-primary-but-not-yet-VRRP-master convergence
+  window, which is the duplicate-relay hazard this gate closes.
 - A nil gate (the `NewManager` default, or any non-cluster build) is
   fail-open: every request is relayed (correct standalone behavior).
 
