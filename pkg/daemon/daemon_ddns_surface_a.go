@@ -409,6 +409,11 @@ func (d *Daemon) observeInterfaceAddr(linuxName string, af4 bool, unit *config.I
 //     or IFA_F_OPTIMISTIC (RFC 4429 optimistic DAD — usable for some traffic but
 //     not yet DAD-confirmed, so not safe to publish to global DNS). Publishing
 //     one risks a duplicate/black-holed answer.
+//   - NEVER select an RFC 4941/8981 SLAAC privacy/temporary address
+//     (IFA_F_TEMPORARY, #2975). It is an outbound-only ephemeral identifier that
+//     rotates on a short timer; publishing it leaks the privacy identifier and
+//     black-holes inbound reachability when it rotates. The stable permanent
+//     address (which privacy extensions keep for inbound service) is preferred.
 //   - NEVER select a non-globally-meaningful address (loopback / link-local
 //     uni+multicast / multicast / unspecified, AND every IANA special-purpose
 //     range) — the SAME ddns.IsPublicAddr gate the static fallback (#2776) and
@@ -435,7 +440,16 @@ func selectInterfaceAddr(addrs []netlink.Addr, af4 bool) (netip.Addr, bool) {
 		}
 		// Skip addresses whose DAD has not succeeded — they may be duplicate or
 		// not yet usable. tentative/dadfailed/optimistic are never publishable.
-		if ad.Flags&(unix.IFA_F_TENTATIVE|unix.IFA_F_DADFAILED|unix.IFA_F_OPTIMISTIC) != 0 {
+		//
+		// Also skip RFC 4941/8981 SLAAC privacy/temporary addresses
+		// (IFA_F_TEMPORARY, #2975). A temporary address is an outbound-only
+		// ephemeral identifier that rotates on a short timer; publishing one to
+		// public DNS leaks the privacy identifier AND black-holes inbound
+		// reachability as soon as it rotates (the record points at an address
+		// that no longer exists). The stable permanent address on the same
+		// interface — which privacy extensions are designed to KEEP for inbound
+		// service — is the correct publication target.
+		if ad.Flags&(unix.IFA_F_TENTATIVE|unix.IFA_F_DADFAILED|unix.IFA_F_OPTIMISTIC|unix.IFA_F_TEMPORARY) != 0 {
 			continue
 		}
 		// Globally-routable-unicast gate (#2776): reject link-local, loopback,

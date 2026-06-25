@@ -1718,6 +1718,45 @@ func TestBGPMultipathSetSyntax(t *testing.T) {
 	if !bgp.MultipathMultipleAS {
 		t.Error("MultipathMultipleAS should be true")
 	}
+	if bgp.MultipathIBGP {
+		t.Error("MultipathIBGP should default false without `multipath ibgp`")
+	}
+}
+
+// TestBGPMultipathIBGPSetSyntax pins the #2978 parse path: `set protocols bgp
+// multipath ibgp` compiles to BGPConfig.MultipathIBGP=true (and still sets the
+// generic Multipath count), so the renderer can emit FRR `maximum-paths ibgp`.
+func TestBGPMultipathIBGPSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp multipath ibgp",
+		"set protocols bgp group external peer-as 65002",
+		"set protocols bgp group external neighbor 10.0.0.2",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	bgp := cfg.Protocols.BGP
+	if bgp == nil {
+		t.Fatal("BGP config is nil")
+	}
+	if bgp.Multipath != 64 {
+		t.Errorf("Multipath = %d, want 64", bgp.Multipath)
+	}
+	if !bgp.MultipathIBGP {
+		t.Error("MultipathIBGP should be true with `multipath ibgp`")
+	}
 }
 
 func TestBGPDefaultOriginateSetSyntax(t *testing.T) {
