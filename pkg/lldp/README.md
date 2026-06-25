@@ -59,6 +59,17 @@ Standard library + `golang.org/x/sys/unix`. No internal `pkg/*` imports.
   backoff is interruptible: a concurrent `Stop()` cancels the context and
   the loop returns promptly instead of sleeping out the delay, and the
   closed fd makes any parked `Recvfrom` return so `Stop()` stays bounded.
+- **Self-frame filter (`#2992`):** the RX socket is bound to `ETH_P_LLDP`,
+  so the kernel loops this host's own transmitted LLDP advertisements back
+  to the listener marked `PACKET_OUTGOING`. `recv` returns the
+  `sll_pkttype` from the `Recvfrom` `sockaddr_ll`, and `rxLoop` drops any
+  frame whose pkttype is `PACKET_OUTGOING` before parsing TLVs. Without this
+  the firewall learns its own advertisement as a neighbor on every
+  LLDP-enabled link, polluting `show lldp neighbors`. The EtherType and the
+  well-known LLDP multicast destination are already kernel-filtered, so the
+  loopback of our own transmissions is the only self-frame source; genuine
+  inbound peer frames carry `PACKET_HOST`/`PACKET_MULTICAST`/`PACKET_BROADCAST`
+  and are kept.
 - The TX socket is opened once per interface in `newIfSession` and reused
   for every periodic advertisement (was previously opened+closed per
   frame).
