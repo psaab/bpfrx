@@ -79,8 +79,24 @@ type PolicyTerm struct {
 	// FRR clause on HasMetric, never on Metric > 0.
 	HasMetric  bool
 	MetricType int    // OSPF metric type (1 or 2, 0 = not set)
-	Community  string // BGP community to set (e.g. "65000:100")
-	Origin     string // BGP origin: "igp", "egp", "incomplete"
+	Community  string // BGP community to REPLACE with (`then community set <v>` or the bare `then community <v>`; e.g. "65000:100")
+	// CommunityOp distinguishes the Junos `then community (add|delete|set)`
+	// operations from the legacy bare `then community <value>` (= replace).
+	// Junos/vSRX supports append (additive), delete (by community-list), and
+	// none (strip all) in addition to whole-attribute replace; emitting only
+	// the replace clause (`set community <v>`) wiped any upstream-set
+	// communities, a vSRX-parity gap (#2848). The compiler sets CommunityOp
+	// to one of "", "set", "add", "delete", "none". Both "" and "set" mean
+	// replace using term.Community (the empty string preserves back-compat
+	// with the bare `then community <v>` form). For "add" the value lives in
+	// CommunityAdd (rendered `set community <v> additive`), for "delete" the
+	// referenced community-list name lives in CommunityDelete (rendered
+	// `set comm-list <name> delete`), and "none" carries no argument
+	// (rendered `set community none`).
+	CommunityOp     string // "", "set", "add", "delete", "none"
+	CommunityAdd    string // community value(s) to append (`then community add <v>`)
+	CommunityDelete string // community-list name whose members to strip (`then community delete <name>`)
+	Origin          string // BGP origin: "igp", "egp", "incomplete"
 }
 
 // RouteFilter matches a prefix with a match type.

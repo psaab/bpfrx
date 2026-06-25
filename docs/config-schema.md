@@ -229,6 +229,45 @@ map-reuse merge keeps both. Fail-on-revert covered by
 `TestPrefixListMergeDuplicateBlocksHierarchical`
 (`compiler_prefix_list_merge_2641_test.go`).
 
+## `then community` operations: add / delete / set / none (#2848)
+
+The policy-term action `then community` supports the Junos/vSRX community
+operations in addition to the legacy bare replace form. Junos grammar is
+`then community (add | delete | set) <community-name>` plus `then community none`;
+the bare `then community <value>` is the historical whole-attribute replace and
+stays valid for back-compat.
+
+| Junos `then community ...` | xpf `CommunityOp` | FRR route-map set clause |
+|----------------------------|-------------------|--------------------------|
+| `add <value>`              | `add`             | `set community <value> additive` |
+| `delete <name>`            | `delete`          | `set comm-list <name> delete`    |
+| `set <value>`              | `set`             | `set community <value>`          |
+| `<value>` (bare)           | `""`              | `set community <value>`          |
+| `none`                     | `none`            | `set community none`             |
+
+`add` APPENDS to (does not overwrite) the existing community attribute — the
+parity gap that motivated #2848: emitting only `set community <value>` wiped
+upstream-set communities, breaking community-based traffic engineering and tag
+propagation in transit networks. `delete <name>` references a named
+`policy-options community <name>` (which xpf already renders as a
+`bgp community-list <name>`), so FRR's `set comm-list <name> delete` strips
+exactly its members. `none` strips all communities.
+
+Schema (`schema_routing.go`): `then community` is a `multi: true` leaf that
+packs the optional operation keyword plus the value onto one leaf's Keys
+(`community add 65000:111`, `community none`, `community 65000:111`). The
+compiler's `applyCommunityAction` (`compiler_routing.go`) reads every token via
+the `firewallMatchValues` SSOT and interprets the first token: `add`/`delete`/
+`set`/`none` select the operation, any other first token is a bare replace
+value. Both AST shapes converge — `SetPath`/block parse both nest `then` as a
+child node, so the hierarchical compile path is the one exercised; the flat
+inline path carries belt-and-suspenders handling for the same forms.
+
+Fail-on-revert: compiler-level
+`TestPolicyCommunityOperationsCompile` (`pkg/config/parser_security_test.go`)
+and end-to-end `TestPolicyCommunityOperations` (`pkg/frr/frr_test.go`, full
+ParseSetCommand + SetPath + CompileConfig + `generatePolicyOptions`).
+
 ## How to add a config-mode typed leaf
 
 Edit the leaf's `schemaNode` in `setSchema` (in the domain's
