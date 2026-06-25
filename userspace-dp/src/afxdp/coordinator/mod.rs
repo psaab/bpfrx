@@ -210,10 +210,20 @@ pub struct Coordinator {
     pub(crate) reconcile_calls: u64,
     /// #2522: count of teardowns that paid the 500ms mlx5 zero-copy
     /// EBUSY quiesce. Bumped only when live workers were torn down AND a
-    /// rebind follows (snapshot-apply path). Surfaces the mlx5-specific
-    /// workaround so its frequency is observable; the `no_snapshot` /
-    /// shutdown teardown no longer pays (and no longer counts) it.
+    /// rebind follows (snapshot-apply path); the `no_snapshot` /
+    /// shutdown teardown no longer pays (and no longer counts) it. This
+    /// is an INTERNAL / test counter — it is read only by the #2522
+    /// regression tests and is NOT wired to any gRPC / Prometheus /
+    /// status surface. Wiring it into the status surface (a wire change)
+    /// is a possible follow-up.
     pub(crate) reconcile_quiesce_count: u64,
+    /// #2522 test seam (per-instance, NOT a process-global): under
+    /// `cfg(test)` `tear_down`'s quiesce records its requested duration
+    /// here and skips the real `thread::sleep`, so each test asserts
+    /// against its OWN coordinator with no cross-test race. Absent from
+    /// release builds.
+    #[cfg(test)]
+    pub(crate) last_quiesce_ms: u64,
     pub(crate) last_reconcile_stage: String,
     pub(crate) poll_mode: crate::PollMode,
     pub(crate) event_stream: Option<crate::event_stream::EventStreamSender>,
@@ -258,6 +268,8 @@ impl Coordinator {
             validation: ValidationState::default(),
             reconcile_calls: 0,
             reconcile_quiesce_count: 0,
+            #[cfg(test)]
+            last_quiesce_ms: 0,
             last_reconcile_stage: "idle".to_string(),
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,

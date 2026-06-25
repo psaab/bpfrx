@@ -13,49 +13,35 @@
 //! never rebinds the queues, so the 500ms quiesce was pure dead
 //! latency there. Gating it on `will_rebind` removes that stall while
 //! keeping the EBUSY guard exactly where a back-to-back rebind needs
-//! it. `quiesce()` routes through a test seam so a unit test can prove
-//! the gate without paying the real 500ms.
+//! it. Under `cfg(test)` the quiesce is RECORDED on the per-instance
+//! `Coordinator::last_quiesce_ms` field and the real `thread::sleep`
+//! is skipped, so a unit test proves the gate against ITS OWN
+//! coordinator (no process-global state, no cross-test race) and the
+//! suite stays fast.
 use super::PreservedReconcileState;
 use super::super::Coordinator;
 use std::time::Duration;
 
 /// The mlx5 zero-copy teardown quiesce. Real builds sleep; tests
-/// record the request and skip the sleep (see [`test_seam`]).
+/// record the request on `Coordinator::last_quiesce_ms` and skip the
+/// sleep.
 const TEARDOWN_QUIESCE: Duration = Duration::from_millis(500);
 
-#[cfg(test)]
-pub(in crate::afxdp) mod test_seam {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
-
-    /// Total quiesce duration requested by `tear_down`, in
-    /// milliseconds. A test resets this to 0, drives a reconcile, and
-    /// asserts whether the gate fired. The real `thread::sleep` is
-    /// skipped under `cfg(test)` so the suite stays fast.
-    pub(in crate::afxdp) static QUIESCE_MS: AtomicU64 = AtomicU64::new(0);
-
-    pub(in crate::afxdp) fn reset() {
-        QUIESCE_MS.store(0, Ordering::Relaxed);
-    }
-
-    pub(in crate::afxdp) fn requested_ms() -> u64 {
-        QUIESCE_MS.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn record(d: Duration) {
-        QUIESCE_MS.fetch_add(d.as_millis() as u64, Ordering::Relaxed);
-    }
-}
-
+/// Apply the teardown quiesce. In a real build this sleeps; under
+/// `cfg(test)` it records the requested duration on the coordinator's
+/// own `last_quiesce_ms` field (per-instance — no shared global) and
+/// returns immediately so the suite is fast.
 #[inline]
-fn quiesce(d: Duration) {
+fn quiesce(coord: &mut Coordinator, d: Duration) {
     #[cfg(test)]
     {
-        // Record the request; skip the real sleep so the suite is fast.
-        test_seam::record(d);
+        coord.last_quiesce_ms = coord
+            .last_quiesce_ms
+            .saturating_add(d.as_millis() as u64);
     }
     #[cfg(not(test))]
     {
+        let _ = coord;
         std::thread::sleep(d);
     }
 }
@@ -98,10 +84,10 @@ pub(super) fn tear_down(coord: &mut Coordinator, will_rebind: bool) -> Preserved
         // refresh rebuilds the same queue set immediately after
         // shutdown. #2522: skipped when no rebind follows (the
         // `no_snapshot` / shutdown teardown), where it was pure dead
-        // latency. Counted in `reconcile_quiesce_count` for
-        // observability.
+        // latency. Counted in `reconcile_quiesce_count` (an internal /
+        // test counter — not wired to any status surface).
         coord.reconcile_quiesce_count = coord.reconcile_quiesce_count.saturating_add(1);
-        quiesce(TEARDOWN_QUIESCE);
+        quiesce(coord, TEARDOWN_QUIESCE);
     }
     PreservedReconcileState {
         synced_sessions,

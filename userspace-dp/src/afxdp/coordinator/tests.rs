@@ -1663,25 +1663,24 @@ fn reconcile_with_none_snapshot_reaches_no_snapshot_early_exit() {
 // bind — the `no_snapshot` / shutdown path — never rebinds, so the
 // quiesce was pure dead latency there.
 //
-// The quiesce routes through `teardown::test_seam` under `cfg(test)`:
-// it RECORDS the requested duration in `QUIESCE_MS` and skips the real
-// `thread::sleep`, so these tests run fast while still proving the gate.
-// `reconcile_quiesce_count` mirrors the gate as an operator-visible
-// counter.
+// Under `cfg(test)` the quiesce records its requested duration on the
+// PER-INSTANCE `Coordinator::last_quiesce_ms` field and skips the real
+// `thread::sleep`. Each test reads its OWN coordinator's field — there
+// is NO process-global state, so the three tests are independent and
+// safe to run in parallel (the default `cargo test` mode).
+// `reconcile_quiesce_count` is an internal/test counter mirroring the
+// gate.
 // ---------------------------------------------------------------------------
-use crate::afxdp::coordinator::reconcile::teardown::test_seam as quiesce_seam;
 
 /// No live workers + no rebind: the quiesce never fires. (Sanity floor
 /// for the gate — the first conjunct alone is enough to skip.)
 #[test]
 fn teardown_quiesce_skipped_when_no_live_workers() {
-    quiesce_seam::reset();
     let mut coordinator = Coordinator::new();
     let mut bindings: Vec<BindingStatus> = Vec::new();
     coordinator.reconcile(None, &mut bindings, 64);
     assert_eq!(
-        quiesce_seam::requested_ms(),
-        0,
+        coordinator.last_quiesce_ms, 0,
         "no live workers => no mlx5 quiesce"
     );
     assert_eq!(coordinator.reconcile_quiesce_count, 0);
@@ -1694,13 +1693,12 @@ fn teardown_quiesce_skipped_when_no_live_workers() {
 ///
 /// Fail-on-revert: revert the fix (gate back to `if had_live_workers`,
 /// dropping the `&& will_rebind` conjunct) and this teardown sleeps the
-/// full 500ms again — `requested_ms()` becomes 500 and
+/// full 500ms again — `last_quiesce_ms` becomes 500 and
 /// `reconcile_quiesce_count` becomes 1, failing both assertions. The
 /// pre-fix code paid this stall on every live-worker config-clear /
 /// shutdown reconcile.
 #[test]
 fn teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers() {
-    quiesce_seam::reset();
     let mut coordinator = gre1881_coordinator_with_worker();
     assert!(
         !coordinator.workers.handles.is_empty(),
@@ -1717,8 +1715,7 @@ fn teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers() {
         "the seeded worker WAS torn down (proves had_live_workers held)"
     );
     assert_eq!(
-        quiesce_seam::requested_ms(),
-        0,
+        coordinator.last_quiesce_ms, 0,
         "#2522: a teardown with no following rebind must NOT pay the 500ms mlx5 quiesce"
     );
     assert_eq!(
@@ -1735,11 +1732,10 @@ fn teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers() {
 ///
 /// Fail-on-revert: if a future change drops the quiesce entirely (or
 /// gates it on `will_rebind` alone, losing the `had_live_workers`
-/// conjunct in a way that skips this case), `requested_ms()` stays 0
+/// conjunct in a way that skips this case), `last_quiesce_ms` stays 0
 /// and this assertion fails.
 #[test]
 fn teardown_quiesce_fires_when_live_workers_and_snapshot_rebinds() {
-    quiesce_seam::reset();
     let mut coordinator = gre1881_coordinator_with_worker();
     assert!(
         !coordinator.workers.handles.is_empty(),
@@ -1755,8 +1751,7 @@ fn teardown_quiesce_fires_when_live_workers_and_snapshot_rebinds() {
     let mut bindings: Vec<BindingStatus> = Vec::new();
     coordinator.reconcile(Some(&snap), &mut bindings, 64);
     assert_eq!(
-        quiesce_seam::requested_ms(),
-        500,
+        coordinator.last_quiesce_ms, 500,
         "#2522: live workers + a rebinding snapshot MUST still pay the mlx5 EBUSY quiesce"
     );
     assert_eq!(

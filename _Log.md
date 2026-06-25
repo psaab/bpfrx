@@ -15530,14 +15530,19 @@ top.
   there. `Coordinator::reconcile` now passes `will_rebind =
   snapshot.is_some()` into `tear_down`; the quiesce fires only when live
   workers were torn down AND a rebind follows. Added `reconcile_quiesce_count`
-  observability counter (bumped on each quiesce). The quiesce routes
-  through a `cfg(test)` `test_seam` that records the requested duration
-  and skips the real sleep so the new tests run fast. Three fail-on-revert
-  tests in coordinator/tests.rs: no-live-workers skip, no-snapshot skip
-  (THE pin — RED on revert: left=500 right=0), and live-workers+snapshot
-  fires (barrier preserved). Proved RED on revert, restored. EBUSY barrier
-  is unchanged on the rebind path. Provenance: codex review-037 finding
-  037-03.
+  — an INTERNAL / test counter (bumped on each quiesce), NOT wired to any
+  gRPC / Prometheus / status surface. Under `cfg(test)` the quiesce records
+  its requested duration on the PER-INSTANCE `Coordinator::last_quiesce_ms`
+  field (no process-global — each test reads its own coordinator, safe
+  under parallel `cargo test`) and skips the real sleep so the new tests
+  run fast. Three fail-on-revert tests in coordinator/tests.rs:
+  no-live-workers skip, no-snapshot skip (THE pin — RED on revert:
+  left=500 right=0), and live-workers+snapshot fires (barrier preserved).
+  Proved RED on revert, restored. EBUSY barrier is unchanged on the rebind
+  path. Review fold: M1 (replaced a process-global atomic seam with the
+  per-instance field — removed an introduced parallel-test flake), M2
+  (corrected counter wording to internal/test, not "observability").
+  Provenance: codex review-037 finding 037-03.
   **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/teardown.rs,
   userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
   userspace-dp/src/afxdp/coordinator/mod.rs,
