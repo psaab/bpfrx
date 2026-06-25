@@ -245,6 +245,17 @@ OFFER/ACK to forward in the first place; clients still dedupe on
   giaddr on a bounded, `ctx`-cancelable interval instead of dying
   permanently. The interface is re-looked-up every attempt (no stale cached
   index).
+- **Socket bind/listen retry (#2787).** A *transient* failure to open the
+  client listener (`0.0.0.0:67`) or the giaddr server conn — interface not yet
+  up, its IPv4 not yet bound, or port 67 momentarily busy on a quick reload —
+  is **not terminal**. `runRelaySession` returns `sessionRetry`, and the
+  supervisor (`runRelay`) waits the same bounded, `ctx`-cancelable
+  `retryInterval` and rebuilds, so the relay recovers on that interface once
+  the condition clears. Before #2787 a bind failure returned `false`/terminal
+  and the per-interface supervisor goroutine exited permanently — the relay
+  went deaf on that segment until a daemon restart or operator re-commit. Only
+  a *cancelled* session context (`Stop()`) on a bind failure is terminal
+  (`sessionStop`), so teardown stays prompt and never spins past shutdown.
 - **ifindex-drift detection (#2347).** `SO_BINDTODEVICE` pins the client
   listener to the interface's kernel **ifindex** at `bind(2)`. If the
   interface is deleted+recreated or renamed at runtime under unchanged config

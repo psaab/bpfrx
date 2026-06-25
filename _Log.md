@@ -15740,3 +15740,20 @@ top.
   userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
   userspace-dp/src/afxdp/umem/tests.rs,
   userspace-dp/src/filter/tests.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2787 — DHCP-relay supervisor no longer dies on a transient
+  socket bind/listen failure. `runRelaySession` now returns a tri-state
+  `sessionOutcome` (`sessionStop`/`sessionDrift`/`sessionRetry`) instead of
+  `bool drift`. The two `newConn` failures (client listener `0.0.0.0:67`,
+  giaddr server conn) return `sessionRetry` when the session ctx is still
+  live, and the supervisor (`runRelay`) waits the bounded ctx-cancelable
+  `retryInterval` and rebuilds rather than exiting the per-interface
+  goroutine. A cancelled session ctx on a bind failure returns `sessionStop`
+  so `Stop()` stays prompt. Fail-on-revert tests: `TestRunRelay_BindFailureRetries`
+  (fails first K binds then succeeds → supervisor survives + binds; reverting
+  to terminal → 0 factory calls, RED) and `TestRunRelay_StopDuringBindRetry`
+  (Stop during failing bind returns promptly). `go test -race
+  ./pkg/dhcprelay/... ./pkg/daemon/...` green; build/gofmt/vet clean.
+  **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/dhcprelay/README.md, _Log.md

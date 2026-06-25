@@ -55,6 +55,25 @@ const startupRetryInterval = 5 * time.Second
 // a cheap name->ifindex lookup and idempotent (unchanged ifindex => no action).
 const ifindexCheckInterval = 5 * time.Second
 
+// sessionOutcome is how a single relay session ended, telling the supervisor
+// (runRelay) whether to stop, rebind immediately, or retry after a delay.
+type sessionOutcome int
+
+const (
+	// sessionStop is a terminal exit: the manager context was cancelled
+	// (Stop()) or a session goroutine exited one-sidedly. The supervisor ends
+	// the per-interface goroutine.
+	sessionStop sessionOutcome = iota
+	// sessionDrift means the interface's live kernel ifindex moved away from
+	// the bound ifindex (#2347); the supervisor rebuilds immediately to rebind.
+	sessionDrift
+	// sessionRetry means a TRANSIENT socket bind/listen failure occurred
+	// before the session could start (#2787). The supervisor waits the
+	// bounded, ctx-cancelable retry interval and rebuilds, so the relay
+	// recovers when the interface comes up — it must NOT kill the supervisor.
+	sessionRetry
+)
+
 // option82 is the DHCP Relay Agent Information option (RFC 3046).
 const option82 = dhcpv4.OptionRelayAgentInformation
 
@@ -598,27 +617,46 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 		if ctx.Err() != nil {
 			return
 		}
-		// runRelaySession returns drift=true ONLY when it tore down because the
-		// live ifindex moved; in that case rebuild immediately (rebind to the
-		// new ifindex). Any other return (Stop/one-sided exit/listen failure)
-		// is drift=false and terminal for this supervisor — we return right
-		// here, ending the per-interface goroutine.
-		drift := m.runRelaySession(ctx, ir, servers)
-		if !drift {
+		switch m.runRelaySession(ctx, ir, servers) {
+		case sessionStop:
+			// Stop() / one-sided exit / unrecoverable: end the per-interface
+			// goroutine.
 			return
+		case sessionDrift:
+			// The live ifindex moved (#2347): rebuild immediately (rebind to
+			// the new ifindex), no delay.
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Info("dhcp-relay: interface ifindex changed, rebinding listener",
+				"interface", ir.ifaceName)
+		case sessionRetry:
+			// A transient socket bind/listen failure (interface not yet up,
+			// IP not yet bound, EADDRINUSE on a quick reload). Do NOT kill the
+			// supervisor (#2787) — wait the bounded, ctx-cancelable retry
+			// interval and rebuild, so the relay recovers when the condition
+			// clears. Stop() unblocks the wait promptly via ctx.Done().
+			if ctx.Err() != nil {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(m.retryInterval):
+			}
 		}
-		if ctx.Err() != nil {
-			return
-		}
-		slog.Info("dhcp-relay: interface ifindex changed, rebinding listener",
-			"interface", ir.ifaceName)
 	}
 }
 
-// runRelaySession runs a single relay session and returns drift=true iff it tore
-// down because the interface's live ifindex differs from the ifindex the client
-// listener was bound to (#2347). On any other exit (Stop, one-sided socket
-// close, fatal listen failure) it returns drift=false and the supervisor exits.
+// runRelaySession runs a single relay session and returns how it ended:
+//   - sessionDrift: it tore down because the interface's live ifindex differs
+//     from the ifindex the client listener was bound to (#2347) — rebind now.
+//   - sessionRetry: a TRANSIENT socket bind/listen failure occurred before the
+//     session could start (interface not yet up, IP not yet bound, EADDRINUSE
+//     on a quick reload, #2787) — the supervisor waits and rebuilds rather than
+//     dying, so the relay recovers when the interface comes up.
+//   - sessionStop: any other exit (Stop, one-sided socket close) — the
+//     supervisor ends the per-interface goroutine.
 //
 // Lifecycle invariants (see docs/research/1915-relay-socket-lifecycle/plan.md),
 // preserved intact under a per-session child context:
@@ -634,7 +672,7 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 //     path, no EADDRINUSE (the old socket is fully closed before rebind), no
 //     Stop()-hang risk.
 func (m *Manager) runRelaySession(ctx context.Context,
-	ir *interfaceRelay, servers []*net.UDPAddr) (drift bool) {
+	ir *interfaceRelay, servers []*net.UDPAddr) sessionOutcome {
 	ifaceName := ir.ifaceName
 
 	// Per-session context. Either the manager ctx (Stop), a loop's exit
@@ -653,7 +691,7 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	// does not permanently kill the relay.
 	giaddr, ok := m.resolveGIAddrWithRetry(sctx, ifaceName)
 	if !ok {
-		return false // ctx cancelled during retry; nothing created yet.
+		return sessionStop // ctx cancelled during retry; nothing created yet.
 	}
 
 	// #2347: capture the interface's live ifindex at the moment we open the
@@ -684,9 +722,18 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	conn, err := m.newConn(sctx, ifaceName, true, true,
 		&net.UDPAddr{IP: net.IPv4zero, Port: relayPort})
 	if err != nil {
-		slog.Error("dhcp-relay: listen failed",
-			"interface", ifaceName, "err", err)
-		return false
+		// #2787: a bind/listen failure is TRANSIENT, not terminal — the
+		// interface may not be up yet, its IP not yet bound, or port 67 may be
+		// momentarily busy on a quick reload. Tell the supervisor to retry
+		// (after retryInterval) rather than killing it, so the relay recovers
+		// when the condition clears. Only a cancelled session ctx is terminal.
+		if sctx.Err() != nil {
+			return sessionStop
+		}
+		slog.Warn("dhcp-relay: listen failed, will retry",
+			"interface", ifaceName, "err", err,
+			"interval", m.retryInterval)
+		return sessionRetry
 	}
 	defer conn.Close()
 
@@ -695,9 +742,16 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	serverConn, err := m.newConn(sctx, "", false, false,
 		&net.UDPAddr{IP: giaddr, Port: 0})
 	if err != nil {
-		slog.Error("dhcp-relay: server conn failed",
-			"interface", ifaceName, "err", err)
-		return false
+		// #2787: likewise transient — the giaddr may have just been removed
+		// (interface flap) or the ephemeral bind momentarily failed. Retry
+		// instead of dying. Only a cancelled session ctx is terminal.
+		if sctx.Err() != nil {
+			return sessionStop
+		}
+		slog.Warn("dhcp-relay: server conn failed, will retry",
+			"interface", ifaceName, "err", err,
+			"interval", m.retryInterval)
+		return sessionRetry
 	}
 	defer serverConn.Close()
 
@@ -903,7 +957,10 @@ func (m *Manager) runRelaySession(ctx context.Context,
 
 	// The drift watcher (joined above) is the only writer of driftDetected; its
 	// store happens-before this read through wg.Wait().
-	return driftDetected.Load()
+	if driftDetected.Load() {
+		return sessionDrift
+	}
+	return sessionStop
 }
 
 // resolveGIAddrWithRetry resolves the interface giaddr, retrying on a bounded
