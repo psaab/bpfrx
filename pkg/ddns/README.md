@@ -440,8 +440,18 @@ its OWN learned address — on top of the SAME spine, without forking the engine
   address exists (never-blackhole — a still-valid deprecated address beats no
   answer). (3) Every candidate STILL passes `ddns.IsPublicAddr`, so a
   preferred-but-ULA (or otherwise reserved) address is rejected — the same gate
-  as the static fallback (#2776) and the checkip source. The IFA_F_* flags are
-  already parsed off the netlink `RTM_NEWADDR` message into
+  as the static fallback (#2776) and the checkip source. (4) It NEVER selects an
+  RFC 4941/8981 SLAAC privacy/temporary address (`IFA_F_TEMPORARY`, #2975): a
+  temporary address is an outbound-only ephemeral identifier that rotates on a
+  short timer, so publishing it leaks the privacy identifier into public DNS AND
+  black-holes inbound reachability the moment it rotates (the record points at an
+  address that no longer exists). `IFA_F_TEMPORARY` joins the
+  tentative/dadfailed/optimistic skip mask, so the stable permanent address —
+  which privacy extensions are designed to KEEP for inbound service — wins even
+  when netlink lists a temporary address first. Note this skips ONLY
+  `IFA_F_TEMPORARY`; `IFA_F_MANAGETEMPADDR` marks the *permanent* SLAAC address
+  that spawns the temporaries and remains a valid publication target. The
+  IFA_F_* flags are already parsed off the netlink `RTM_NEWADDR` message into
   `netlink.Addr.Flags` (no extra netlink plumbing was needed — they were simply
   ignored in selection before). A per-family `preferred-address` operator
   override for multi-address interfaces (the issue's secondary ask) remains a
