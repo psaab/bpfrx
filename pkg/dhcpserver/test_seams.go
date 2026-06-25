@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/ddns"
 )
 
 // Test-only helpers for pkg/dhcpserver.Manager, following the
@@ -72,24 +73,18 @@ func (m *Manager) SetKeaOwnerLookupForTesting(fn func() (uid, gid int, ok bool))
 // lease paths, clock, and a per-Reconcile updater factory (#1387 inc-2).
 // It is used by OTHER packages' tests (e.g. pkg/daemon) to drive the
 // production resolve-per-Reconcile manager without real /var/lib paths.
-// updater is the fixed fallback used when newUpdater is nil.
+// updater is the fixed fallback used when newUpdater is nil. It wires the
+// package-local Kea-memfile lease parser into the pkg/ddns engine (#2691 P1a)
+// so the manager reads the synthetic memfiles a cross-package test writes via
+// DDNSLeasePaths. The DDNSManager type + the engine now live in pkg/ddns; this
+// is a thin wrapper that keeps the existing seam signature unchanged.
 func NewDDNSManagerForTesting(
 	updater DNSUpdater,
 	statePath, leasePath4, leasePath6, nodeID string,
 	now func() time.Time,
 	newUpdater func(c *config.DHCPDynamicDNSConfig) (DNSUpdater, error),
 ) *DDNSManager {
-	m := newDDNSManagerForTesting(updater, statePath, leasePath4, leasePath6, nodeID, now)
-	if newUpdater != nil {
-		m.newUpdater = func(_ ddnsPolicy, c *config.DHCPDynamicDNSConfig) (DNSUpdater, error) {
-			return newUpdater(c)
-		}
-	}
-	return m
-}
-
-// DDNSLeasePaths returns the manager's lease CSV paths so a cross-package
-// test can write synthetic memfiles the reconcile loop will read.
-func (m *DDNSManager) DDNSLeasePaths() (leasePath4, leasePath6 string) {
-	return m.leasePath4, m.leasePath6
+	return ddns.NewManagerForTesting(
+		keaLeaseParser, updater, statePath, leasePath4, leasePath6, nodeID, now, newUpdater,
+	)
 }

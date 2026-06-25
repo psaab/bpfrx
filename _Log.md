@@ -13982,3 +13982,35 @@ top.
 - **File(s)**: pkg/dataplane/userspace/cos.go,
   pkg/dataplane/userspace/manager_test.go,
   userspace-dp/src/afxdp/forwarding_build/tests.rs, _Log.md
+## #2691 P1a — extract pkg/ddns spine (verbatim, no behavior change)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Extract the DDNS spine (RFC 2136 backend + ownership state store
+  + reconcile engine + DNS-record/hostname helpers) out of `pkg/dhcpserver`
+  into a new `pkg/ddns` package — a verbatim code-motion refactor (no behavior
+  change), phase P1a of the #2691 world-class DDNS redesign.
+- **Moves (git rename-detected)**:
+    - `pkg/dhcpserver/ddns_rfc2136.go` -> `pkg/ddns/backend_rfc2136.go`
+    - `pkg/dhcpserver/ddns_state.go` -> `pkg/ddns/state.go`
+    - `pkg/dhcpserver/ddns_dns.go` -> `pkg/ddns/backend.go`
+    - `pkg/dhcpserver/ddns_hostname.go` -> `pkg/ddns/hostname.go`
+    - `pkg/dhcpserver/ddns.go` (engine) -> `pkg/ddns/manager.go`
+    - `pkg/dhcpserver/ddns_rfc2136_test.go` -> `pkg/ddns/backend_rfc2136_test.go`
+    - `pkg/dhcpserver/ddns_durability_test.go` -> `pkg/ddns/durability_test.go`
+    - `pkg/dhcpserver/ddns_manager_inc2_test.go` -> `pkg/ddns/manager_inc2_test.go`
+    - spine portion of `pkg/dhcpserver/ddns_test.go` -> `pkg/ddns/manager_test.go`
+- **Stays in pkg/dhcpserver**: the Kea-memfile lease parser (`ddns_leases.go`,
+  entangled with lease-sync), its tests (now `ddns_leases_test.go`), and a new
+  thin glue `ddns.go` (type aliases + `keaLeaseParser` injected via the
+  `ddns.LeaseParser` seam). The HA writer gate stays in `pkg/daemon`.
+- **Files**: [Write] pkg/ddns/{manager,state,backend,backend_rfc2136,hostname}.go,
+  pkg/ddns/{manager_test,manager_inc2_test,backend_rfc2136_test,durability_test}.go,
+  pkg/ddns/README.md, pkg/dhcpserver/ddns.go, pkg/dhcpserver/ddns_leases_test.go,
+  pkg/dhcpserver/ddns_integration_test.go; [Edit] pkg/dhcpserver/test_seams.go,
+  pkg/dhcpserver/README.md, _Log.md.
+- **Validation**: `go build ./...` clean; `go vet ./pkg/ddns/... ./pkg/dhcpserver/...`
+  clean; `go test ./pkg/ddns/... ./pkg/dhcpserver/... ./pkg/daemon/...
+  ./pkg/grpcapi/... ./pkg/cli/... ./pkg/api/...` all green; gofmt clean. The
+  only full-suite failure is the pre-existing `pkg/fsatomic` canary flagging
+  `pkg/dataplane/proxyarp.go` (untouched by this PR). `make test-failover`
+  deferred to the parent (no cluster access); the HA gate is call-through-only.

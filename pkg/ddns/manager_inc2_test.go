@@ -1,4 +1,4 @@
-package dhcpserver
+package ddns
 
 import (
 	"context"
@@ -13,17 +13,66 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
-// #1387 inc-2 manager-level integration tests: the DDNSManager driving the
+// #1387 inc-2 manager-level integration tests: the Manager driving the
 // LIVE rfc2136 backend (resolved per-Reconcile) against the in-process
 // miekg/dns server, plus the reconcile-pass / skip counters and the
 // enabled→disabled withdraw-once behaviour.
 
+// fakeLeaseSource is the test LeaseParser double (#2691 P1a): the engine now
+// reads leases through the injected LeaseParser seam instead of parsing the
+// Kea memfile itself (the Kea-memfile parser stays in pkg/dhcpserver, and its
+// CSV-specific behavior is covered verbatim by the parser tests there). The
+// integration tests below inject the EXACT Leases the real Kea parser would
+// have produced from the memfile rows they previously wrote — so every
+// manager+backend assertion is preserved unchanged.
+type fakeLeaseSource struct {
+	v4 []Lease
+	v6 []Lease
+}
+
+func (s *fakeLeaseSource) parser() LeaseParser {
+	return func(_ string, family int, _ time.Time) ([]Lease, error) {
+		if family == 6 {
+			return s.v6, nil
+		}
+		return s.v4, nil
+	}
+}
+
+// laptopMacLease is the Lease the real Kea parser yields for the recurring
+// memfile row `10.0.1.5,aa,,...,1,laptop,0` (hwaddr aa, no client-id ⇒
+// identity "mac:aa").
+func laptopMacLease() []Lease {
+	return []Lease{{Family: 4, Address: "10.0.1.5", Identity: "mac:aa", SubnetID: "1", HostName: "laptop"}}
+}
+
+// laptopCIDLease is the Lease for `10.0.1.5,aa:bb,01:02:03,...,1,laptop,0`
+// (client-id present ⇒ identity "cid:01:02:03", client-id preferred over hwaddr).
+func laptopCIDLease() []Lease {
+	return []Lease{{Family: 4, Address: "10.0.1.5", Identity: "cid:01:02:03", SubnetID: "1", HostName: "laptop"}}
+}
+
+// laptopNoIdentityLease is the Lease for `10.0.1.5,,,...,1,laptop,0`
+// (no hwaddr, no client-id ⇒ empty identity, keyed on address).
+func laptopNoIdentityLease() []Lease {
+	return []Lease{{Family: 4, Address: "10.0.1.5", Identity: "", SubnetID: "1", HostName: "laptop"}}
+}
+
+// freshCIDLease is the Lease for `10.0.1.9,aa:bb,07:08:09,...,1,fresh,0`.
+func freshCIDLease() []Lease {
+	return []Lease{{Family: 4, Address: "10.0.1.9", Identity: "cid:07:08:09", SubnetID: "1", HostName: "fresh"}}
+}
+
 // prodManagerTo builds a production-shaped manager (resolve-per-Reconcile)
-// whose factory points the live backend at the fake server.
-func prodManagerTo(t *testing.T, srv *fakeDNSServer) *DDNSManager {
+// whose factory points the live backend at the fake server. The returned
+// fakeLeaseSource is the lease input; tests mutate its v4/v6 slices to model
+// lease arrival/departure (the seam that replaced writing a Kea memfile).
+func prodManagerTo(t *testing.T, srv *fakeDNSServer) (*Manager, *fakeLeaseSource) {
 	t.Helper()
 	dir := t.TempDir()
-	m := newDDNSManagerForTesting(
+	src := &fakeLeaseSource{}
+	m := newManagerForTesting(
+		src.parser(),
 		nopUpdater{},
 		filepath.Join(dir, "state.json"),
 		filepath.Join(dir, "leases4.csv"),
@@ -40,7 +89,7 @@ func prodManagerTo(t *testing.T, srv *fakeDNSServer) *DDNSManager {
 			func() { m.skippedPTRNotAuth.Add(1) },
 			func() { m.skippedConflict.Add(1) })
 	}
-	return m
+	return m, src
 }
 
 func ddnsCfg(server string) *config.DHCPServerConfig {
@@ -57,14 +106,12 @@ func ddnsCfg(server string) *config.DHCPServerConfig {
 
 func TestManagerReconcileLiveBackendPublishesAndExpires(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfg(srv.addrUDP)
 
 	// Cycle 1: one active v4 lease → forward + reverse published; owned.
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,aa,,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopMacLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
@@ -95,7 +142,7 @@ func TestManagerReconcileLiveBackendPublishesAndExpires(t *testing.T) {
 	}
 
 	// Cycle 2: lease gone (empty CSV) → the owned record is deleted.
-	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	src.v4 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}
@@ -110,12 +157,10 @@ func TestManagerReconcileLiveBackendPublishesAndExpires(t *testing.T) {
 
 func TestManagerReconcileSteadyStateNoChurn(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfg(srv.addrUDP)
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,aa,,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopMacLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
@@ -134,12 +179,10 @@ func TestManagerReconcileSteadyStateNoChurn(t *testing.T) {
 
 func TestManagerEnabledThenDisabledWithdrawsOnce(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	enabled := ddnsCfg(srv.addrUDP)
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,aa,,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopMacLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), enabled); err != nil {
 		t.Fatalf("enable reconcile: %v", err)
 	}
@@ -192,7 +235,9 @@ func TestManagerEnabledThenDisabledWithdrawsOnce(t *testing.T) {
 func TestManagerStanzaRemovalWithdrawsThroughLiveBackend(t *testing.T) {
 	dir := t.TempDir()
 	fake := newFakeUpdater()
-	m := newDDNSManagerForTesting(
+	src := &fakeLeaseSource{}
+	m := newManagerForTesting(
+		src.parser(),
 		fake,
 		filepath.Join(dir, "state.json"),
 		filepath.Join(dir, "leases4.csv"),
@@ -200,7 +245,7 @@ func TestManagerStanzaRemovalWithdrawsThroughLiveBackend(t *testing.T) {
 		"node0",
 		func() time.Time { return time.Unix(1_700_000_000, 0) },
 	)
-	// Factory mirrors NewProductionDDNSManager: a usable rfc2136 policy yields
+	// Factory mirrors NewProductionManager: a usable rfc2136 policy yields
 	// the (recording) live backend; anything else (incl. stanza removal where
 	// backend resolves to "") yields the nopUpdater.
 	m.newUpdater = func(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig) (DNSUpdater, error) {
@@ -210,10 +255,8 @@ func TestManagerStanzaRemovalWithdrawsThroughLiveBackend(t *testing.T) {
 		return fake, nil
 	}
 
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,aa,,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopMacLease()
+	src.v6 = nil
 
 	// Enable + publish via the live (fake) backend.
 	enabled := &config.DHCPServerConfig{DynamicDNS: &config.DHCPDynamicDNSConfig{
@@ -249,12 +292,10 @@ func TestManagerReconcileFailCountsAndDoesNotWedge(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
 	// Make the FORWARD zone always SERVFAIL so the upsert errors.
 	srv.setRcode("example.com.", dns.RcodeServerFailure)
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfg(srv.addrUDP)
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,aa,,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopMacLease()
+	src.v6 = nil
 	err := m.Reconcile(context.Background(), cfg)
 	if err == nil {
 		t.Fatal("a forward-zone SERVFAIL must surface a reconcile error")
@@ -283,12 +324,10 @@ func TestManagerReconcileFailCountsAndDoesNotWedge(t *testing.T) {
 func TestManagerPTRNotAuthCountedNotFailed(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
 	srv.setRcode("1.0.10.in-addr.arpa.", dns.RcodeNotAuth)
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfg(srv.addrUDP)
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,aa,,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopMacLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile: a reverse NOTAUTH must not fail the pass: %v", err)
 	}
@@ -306,7 +345,7 @@ func TestManagerPTRNotAuthCountedNotFailed(t *testing.T) {
 }
 
 // ownedFQDNs returns the FQDNs the manager currently records as owned.
-func ownedFQDNs(m *DDNSManager) []string {
+func ownedFQDNs(m *Manager) []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := []string{}
@@ -336,15 +375,13 @@ func TestManagerReplaceOwnedRefusedAddRecordsNoOwnership_NoIdentity(t *testing.T
 	}
 	srv.seedRR(thirdParty)
 
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfg(srv.addrUDP)
 
 	// Cycle 1: an active v4 lease for the SAME name+address, NO identity
 	// (empty client_id AND hwaddr).
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,,,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopNoIdentityLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
@@ -358,7 +395,7 @@ func TestManagerReplaceOwnedRefusedAddRecordsNoOwnership_NoIdentity(t *testing.T
 
 	// Cycle 2: lease gone — no owned state, so NO delete must be issued and the
 	// third party's A must survive.
-	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	src.v4 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}
@@ -384,14 +421,12 @@ func TestManagerReplaceOwnedRefusedAddRecordsNoOwnership_Identity(t *testing.T) 
 	}
 	srv.seedRR(thirdParty)
 
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfg(srv.addrUDP)
 
 	// Active v4 lease WITH an identity (client_id set).
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,aa:bb,01:02:03,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopCIDLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
@@ -404,7 +439,7 @@ func TestManagerReplaceOwnedRefusedAddRecordsNoOwnership_Identity(t *testing.T) 
 	}
 
 	// Cycle 2: lease gone — third party survives, no delete issued.
-	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	src.v4 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}
@@ -420,13 +455,11 @@ func TestManagerReplaceOwnedRefusedAddRecordsNoOwnership_Identity(t *testing.T) 
 func TestManagerReplaceOwnedFreshNameFullLifecycle(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
 	srv.setStateful(true)
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfg(srv.addrUDP)
 
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.9,aa:bb,07:08:09,3600,1900000000,1,fresh,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = freshCIDLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
@@ -438,7 +471,7 @@ func TestManagerReplaceOwnedFreshNameFullLifecycle(t *testing.T) {
 		t.Fatalf("fresh A not published")
 	}
 
-	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	src.v4 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}
@@ -480,14 +513,12 @@ func TestManagerSkipExistingConflictRecordsNoOwnership(t *testing.T) {
 	}
 	srv.seedRR(thirdParty)
 
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfgSkipExisting(srv.addrUDP)
 
 	// Cycle 1: an active v4 lease for the SAME name+address.
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,aa:bb,01:02:03,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopCIDLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
@@ -504,7 +535,7 @@ func TestManagerSkipExistingConflictRecordsNoOwnership(t *testing.T) {
 
 	// Cycle 2: lease gone — no owned state, so NO delete must be issued and the
 	// third party's A must survive.
-	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	src.v4 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}
@@ -523,13 +554,11 @@ func TestManagerSkipExistingConflictRecordsNoOwnership(t *testing.T) {
 func TestManagerSkipExistingFreshNameFullLifecycle(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
 	srv.setStateful(true)
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfgSkipExisting(srv.addrUDP)
 
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.9,aa:bb,07:08:09,3600,1900000000,1,fresh,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = freshCIDLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
@@ -541,7 +570,7 @@ func TestManagerSkipExistingFreshNameFullLifecycle(t *testing.T) {
 		t.Fatalf("fresh A not published")
 	}
 
-	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	src.v4 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}
@@ -572,14 +601,12 @@ func TestManagerForwardPublishedPTRFailsRecordsOwnership(t *testing.T) {
 	// NOT NOTAUTH/REFUSED, which is the permanent counted-skip case).
 	srv.setRcode("1.0.10.in-addr.arpa.", dns.RcodeServerFailure)
 
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfg(srv.addrUDP)
 
 	// Cycle 1: an active v4 lease. Forward A publishes; reverse PTR SERVFAILs.
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,aa:bb,01:02:03,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopCIDLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 1 must not fail the pass on a PTR-only failure: %v", err)
 	}
@@ -620,7 +647,7 @@ func TestManagerForwardPublishedPTRFailsRecordsOwnership(t *testing.T) {
 
 	// Cycle 3: lease gone — the (now fully-owned) forward is deleted, never
 	// orphaned. This is the no-orphan proof: a release withdraws the forward.
-	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	src.v4 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 3 (release): %v", err)
 	}
@@ -641,13 +668,11 @@ func TestManagerPTRPendingReleaseWithoutRetryStillCleansForward(t *testing.T) {
 	srv.setStateful(true)
 	srv.setRcode("1.0.10.in-addr.arpa.", dns.RcodeServerFailure)
 
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfg(srv.addrUDP)
 
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,aa:bb,01:02:03,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopCIDLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
@@ -663,7 +688,7 @@ func TestManagerPTRPendingReleaseWithoutRetryStillCleansForward(t *testing.T) {
 	// keeps the ownership entry for a later retry, but the forward A is GONE
 	// from the zone — never orphaned. (Re-deleting an already-gone forward on a
 	// later cycle is an idempotent NXRRSET no-op.)
-	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	src.v4 = nil
 	_ = m.Reconcile(context.Background(), cfg) // PTR-delete error is expected/non-fatal here
 	if srv.zoneHas(liveA) {
 		t.Fatalf("#2661: a PTR-pending forward was NOT cleaned on release — orphaned")
@@ -689,12 +714,10 @@ func TestManagerPTRNotAuthOwnedNotPending(t *testing.T) {
 	srv.setStateful(true)
 	srv.setRcode("1.0.10.in-addr.arpa.", dns.RcodeNotAuth)
 
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfg(srv.addrUDP)
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,aa:bb,01:02:03,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopCIDLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
@@ -722,7 +745,7 @@ func TestManagerPTRNotAuthOwnedNotPending(t *testing.T) {
 }
 
 // ownedPTRPending reports whether the owned record for fqdn is PTR-pending.
-func ownedPTRPending(m *DDNSManager, fqdn string) bool {
+func ownedPTRPending(m *Manager, fqdn string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, r := range m.state.records {
@@ -767,14 +790,12 @@ func TestManagerForwardPublishedPTRConflictRecordsOwnership(t *testing.T) {
 	}
 	srv.seedRR(thirdPartyPTR)
 
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfgSkipExisting(srv.addrUDP)
 
 	// Cycle 1: an active v4 lease. Forward A publishes; reverse PTR is refused.
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,aa:bb,01:02:03,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopCIDLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 1 must not fail the pass on a PTR-only conflict: %v", err)
 	}
@@ -814,7 +835,7 @@ func TestManagerForwardPublishedPTRConflictRecordsOwnership(t *testing.T) {
 	// Cycle 3: lease gone — the (owned) forward A is DELETED, never orphaned.
 	// This is the no-orphan proof: a release withdraws the forward xpf created
 	// while leaving the third party's PTR intact.
-	writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+	src.v4 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile 3 (release): %v", err)
 	}
@@ -831,12 +852,10 @@ func TestManagerForwardPublishedPTRConflictRecordsOwnership(t *testing.T) {
 
 func TestOwnedRecordViews(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
-	m := prodManagerTo(t, srv)
+	m, src := prodManagerTo(t, srv)
 	cfg := ddnsCfg(srv.addrUDP)
-	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
-10.0.1.5,aa,,3600,1900000000,1,laptop,0
-`)
-	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+	src.v4 = laptopMacLease()
+	src.v6 = nil
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}

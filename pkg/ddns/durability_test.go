@@ -1,4 +1,4 @@
-package dhcpserver
+package ddns
 
 import (
 	"context"
@@ -82,7 +82,7 @@ func TestUpsertWriteAheadDurableBeforeAdd(t *testing.T) {
 	up.read = func(p string) map[string]ownedRecord { return readDurableOwnership(t, p) }
 
 	pol := enabledPolicy()
-	leases := []ddnsLease{leaseV4("10.0.1.50", "mac:aabb", "laptop")}
+	leases := []Lease{leaseV4("10.0.1.50", "mac:aabb", "laptop")}
 	if err := runReconcile(t, m, pol, leases); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestUpsertCrashAfterAddBeforeEndOfPassSave(t *testing.T) {
 	}
 
 	pol := enabledPolicy()
-	leases := []ddnsLease{leaseV4("10.0.1.50", "mac:aabb", "laptop")}
+	leases := []Lease{leaseV4("10.0.1.50", "mac:aabb", "laptop")}
 	_ = runReconcile(t, m, pol, leases) // confirm/end-of-pass save errors are tolerated
 
 	if len(up.upserts) != 1 {
@@ -167,7 +167,7 @@ func TestUpsertRefusedAddRemovesIntent(t *testing.T) {
 	up.refuse["laptop.example.com"] = true
 
 	pol := enabledPolicy()
-	leases := []ddnsLease{leaseV4("10.0.1.50", "mac:aabb", "laptop")}
+	leases := []Lease{leaseV4("10.0.1.50", "mac:aabb", "laptop")}
 	if err := runReconcile(t, m, pol, leases); err != nil {
 		t.Fatalf("reconcile (refused add must not fail the pass): %v", err)
 	}
@@ -198,7 +198,7 @@ func TestUpsertPreAddSaveFailureSuppressesPublish(t *testing.T) {
 	}
 
 	pol := enabledPolicy()
-	leases := []ddnsLease{leaseV4("10.0.1.50", "mac:aabb", "laptop")}
+	leases := []Lease{leaseV4("10.0.1.50", "mac:aabb", "laptop")}
 	err := runReconcile(t, m, pol, leases)
 	if err == nil {
 		t.Fatalf("reconcile should surface the durable-write failure")

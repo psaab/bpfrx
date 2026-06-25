@@ -1,4 +1,4 @@
-package dhcpserver
+package ddns
 
 import (
 	"context"

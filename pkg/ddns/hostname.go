@@ -1,11 +1,12 @@
-package dhcpserver
+package ddns
 
 import (
 	"fmt"
 	"strings"
 )
 
-// ddns_hostname.go: deterministic hostname -> DNS-label normalization for
+// hostname.go (moved verbatim from pkg/dhcpserver/ddns_hostname.go in #2691
+// P1a): deterministic hostname -> DNS-label normalization for
 // the #1387 DHCP DDNS feature (plan §4.3). Pure functions, no I/O — the
 // reconciler feeds a lease's offered name(s) and the configured policy in
 // and gets back a validated FQDN (or an error for an unpublishable name).
