@@ -488,25 +488,49 @@ fn forward_candidate_is_cacheable() {
 }
 
 // ----------------------------------------------------------------
-// (g-extra) NAT64 and NPTv6 decisions are not cacheable
+// (g-extra) NAT64 stays non-cacheable; NPTv6 IS cacheable (#2652)
 // ----------------------------------------------------------------
 #[test]
-fn nat64_and_nptv6_not_cacheable() {
+fn nat64_not_cacheable() {
     let meta = make_meta(PROTO_TCP);
 
+    // NAT64 is a version-changing translation (header rebuild) the in-place
+    // descriptor fast path cannot express — it must stay on the generic path.
     let mut nat64_decision = make_decision(ForwardingDisposition::ForwardCandidate);
     nat64_decision.nat.nat64 = true;
     assert!(
         !FlowCacheEntry::should_cache(meta, nat64_decision),
         "NAT64 should not be cacheable",
     );
+}
+
+#[test]
+fn nptv6_is_cacheable() {
+    // #2652: NPTv6 is a same-family IPv6 prefix rewrite that is
+    // checksum-neutral by RFC 6296, so the descriptor fast path reproduces it
+    // byte-for-byte. It MUST now be admitted to the flow cache. Use a v6 meta
+    // so the eligibility predicate (UDP / established-TCP) and the v6 family
+    // match the NPTv6 dst rewrite below.
+    let meta = UserspaceDpMeta {
+        protocol: PROTO_TCP,
+        addr_family: libc::AF_INET6 as u8,
+        ingress_ifindex: 7,
+        tcp_flags: 0x10, // ACK only
+        ..Default::default()
+    };
 
     let mut nptv6_decision = make_decision(ForwardingDisposition::ForwardCandidate);
     nptv6_decision.nat.nptv6 = true;
+    nptv6_decision.nat.rewrite_dst = Some(IpAddr::V6(std::net::Ipv6Addr::new(
+        0xfd00, 0, 0, 0, 0, 0, 0, 0x1234,
+    )));
     assert!(
-        !FlowCacheEntry::should_cache(meta, nptv6_decision),
-        "NPTv6 should not be cacheable",
+        FlowCacheEntry::should_cache(meta, nptv6_decision),
+        "NPTv6 should be cacheable (#2652)",
     );
+
+    // Fail-on-revert guard: if the `!decision.nat.nptv6` exclusion is
+    // reinstated in `should_cache`, this assertion flips to false.
 }
 
 // ----------------------------------------------------------------

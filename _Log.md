@@ -14492,3 +14492,27 @@ top.
   "owned by another party (refused)"; reverting backendForOwned/Pass-1 →
   MAJOR-2 withdraw tests FAIL with "no live backend to withdraw". make
   test-failover + the LIVE standalone-VM publish remain for the parent.
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2652 — flow cache: enable NPTv6 fast-path caching; keep NAT64
+  excluded (version-changing). NPTv6 is a same-family IPv6 address byte-rewrite
+  that is checksum-neutral by RFC 6296 (adjustment baked into the address
+  upstream in src/nptv6.rs), so the descriptor IPv6 arm reproduces the slow
+  path byte-for-byte: write address, l4_csum_delta==0 → no L4 csum touch
+  (matches apply_nat_ipv6 skip_l4_csum). NAT64 rebuilds the IP header to a
+  different version/size (build_nat64_*_frame allocates a new frame) — cannot
+  be expressed by the in-place RewriteDescriptor; stays excluded.
+  Changes: should_cache drops !nptv6 (keeps !nat64); from_forward_decision
+  propagates nptv6; orchestrator early-returns only for rd.nat64 + a v4-guard
+  for a nptv6 descriptor with non-v6 ether_type.
+  Tests: nptv6_is_cacheable, nat64_not_cacheable (renamed),
+  pin_nptv6_descriptor_matches_generic_byte_for_byte (byte-identical
+  fast-vs-slow + L4 csum unchanged), pin_descriptor_nat64_decline_frame_untouched.
+  Fail-on-revert PROVEN for both should_cache and orchestrator changes.
+  Gates: cargo build --release clean; cargo test --release --bin
+  xpf-userspace-dp 2768 passed / 0 failed.
+  **File(s)**: userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/frame/rewrite/mod.rs,
+  userspace-dp/src/afxdp/flow_cache_tests.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/rewrite.rs,
+  docs/flow-cache-simplification.md

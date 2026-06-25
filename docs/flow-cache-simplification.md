@@ -250,7 +250,8 @@ Add focused tests for:
 2. cache hit, cross-binding transmit
 3. stale HA validation forcing miss/fallthrough
 4. stale RG epoch forcing miss
-5. non-cacheable NAT64/NPTv6 decisions staying uncached
+5. non-cacheable NAT64 decisions staying uncached (NPTv6 is now
+   cacheable — see "NPTv6 fast-path caching (#2652)" below)
 
 Expected benefit:
 
@@ -324,6 +325,54 @@ structural behavior the worker session-expiry gate already has. No schema
 change and no operator-facing rejection. Tests: `out_of_range_owner_rg_stamps_node_level_epoch`,
 `out_of_range_owner_rg_invalidates_on_node_level_bump`,
 `in_range_owner_rg_unchanged_by_node_level_bump` (flow_cache_tests.rs).
+
+## NPTv6 fast-path caching (#2652)
+
+Before #2652 `FlowCacheEntry::should_cache` excluded BOTH `decision.nat.nat64`
+and `decision.nat.nptv6`, so every NPTv6- and NAT64-translated packet missed
+the flow cache and re-ran the full session-lookup + policy-eval slow path on
+every packet. #2652 splits these two cases on the actual dataplane mechanics:
+
+- **NPTv6 (RFC 6296) is now cacheable.** At the dataplane an NPTv6 decision is
+  nothing more than a same-family IPv6 address byte-rewrite of one side
+  (`rewrite_dst` for inbound, `rewrite_src` for outbound). The RFC 6296
+  checksum-neutral adjustment word is computed entirely upstream in
+  `src/nptv6.rs` (`translate_inbound`/`translate_outbound` via `adjust_word`),
+  so the `Ipv6Addr` handed to the worker in `NatDecision` already preserves
+  the L4 ones-complement sum. The slow path (`apply_nat_ipv6`) writes that
+  address and SKIPS the L4 checksum adjust (`skip_l4_csum = nat.nptv6`); the
+  descriptor fast path carries `l4_csum_delta == 0` (`compute_l4_csum_delta`
+  short-circuits on `nat.nptv6`) so the IPv6 arm
+  (`apply_rewrite_descriptor_ipv6`) ALSO leaves the L4 checksum untouched.
+  The two paths are therefore byte-identical. The orchestrator
+  (`frame/rewrite/mod.rs`) no longer early-returns for `rd.nptv6`; it keeps a
+  defense-in-depth fall-back only when a `nptv6` descriptor carries a non-v6
+  `ether_type` (NPTv6 is IPv6-only). `should_cache` drops the
+  `!decision.nat.nptv6` clause and `from_forward_decision` propagates
+  `nptv6: decision.nat.nptv6` into the descriptor.
+
+- **NAT64 stays excluded (correct).** NAT64 is a version-changing translation:
+  the IPv6 40-byte header is rebuilt as an IPv4 20-byte header (or vice versa),
+  the frame length changes, and fragment-header handling differs. It is
+  produced by `build_nat64_*_frame`, which ALLOCATES a fresh frame of a
+  different size — there is no in-place rewrite the byte-write
+  `RewriteDescriptor` could carry. The orchestrator still early-returns
+  `None` for `rd.nat64`, and `should_cache` keeps `!decision.nat.nat64`.
+
+Validation:
+
+- `nptv6_is_cacheable`, `nat64_not_cacheable` (flow_cache_tests.rs) — the
+  admission split; fail-on-revert if the `!nptv6` exclusion is reinstated.
+- `pin_nptv6_descriptor_matches_generic_byte_for_byte`
+  (frame/prop_tests/rewrite.rs) — proves the descriptor fast path output is
+  byte-identical to the generic slow path for an NPTv6 dst rewrite, with the
+  L4 checksum unchanged (checksum-neutral). Fail-on-revert: reinstating the
+  `rd.nptv6` decline makes `apply_rewrite_descriptor` return `None` and the
+  `.expect(...)` panics.
+- `pin_descriptor_nat64_decline_frame_untouched` — NAT64 (and a `nptv6`
+  descriptor with a v4 `ether_type`) still decline before any byte is written.
+- `descriptor_generic_differential` (unmasked) — existing same-family parity
+  unaffected.
 
 ## Recommended Next Step
 
