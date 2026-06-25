@@ -185,6 +185,11 @@ func (d *Daemon) buildSurfaceAScopes(cfg *config.Config) []ddns.SurfaceAScope {
 			RoutingInstance: prov.RoutingInstance,
 			RGOwner:         ifc.RedundancyGroup,
 			PolicyID:        b.Provider,
+			// The published NAME is part of the Surface A scope identity (#2903):
+			// changing the configured hostname is a NEW scope (old name withdrawn,
+			// new name published) rather than an in-place overwrite that orphans the
+			// old RR. The scope's FQDN must equal SurfaceAScope.FQDN below.
+			FQDN: b.Hostname,
 		}
 		out = append(out, ddns.SurfaceAScope{
 			Key:             key,

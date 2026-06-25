@@ -29,6 +29,10 @@ func surfaceAScope(fqdn string, family Family, rg int) SurfaceAScope {
 			Unit:      50,
 			RGOwner:   rg,
 			PolicyID:  "corp-2136",
+			// The published name is part of the Surface A scope identity (#2903):
+			// Key.FQDN must equal SurfaceAScope.FQDN so a hostname change is a new
+			// scope (old withdrawn, new published), not an orphaning in-place rename.
+			FQDN: fqdn,
 		},
 		FQDN:   fqdn,
 		TTL:    300,
@@ -204,4 +208,195 @@ func TestSurfaceAStatusViews(t *testing.T) {
 	if v.LastPublished.IsZero() {
 		t.Fatal("status view must carry a last-published time")
 	}
+}
+
+// TestSurfaceAFQDNChangeDetectedAndPublished is the #2903 fail-on-revert proof
+// for the change-detection half: changing ONLY the configured hostname for a
+// scope (same interface/unit/family/RG/provider, SAME address) must be detected
+// as a change and the NEW name published. Before #2903 the ScopeKey had no FQDN
+// axis, so a FQDN-only edit kept the same scope key; change detection compared
+// only the IP, so `owned && !changed && !refreshDue` skipped the pass and the
+// new name was never published (RED: only the first publish would appear). The
+// fix makes the published FQDN part of the scope identity so the renamed scope
+// is a new, not-yet-owned scope whose publish is not skipped.
+//
+// FAIL-ON-REVERT: this goes RED when `scopePrefix()` drops the `/fqdn=` axis
+// (state.go) — the load-bearing change. (Both these helper-built scopes set
+// Key.FQDN, so this particular test does NOT isolate the effectiveKey fold;
+// TestSurfaceAFQDNFoldFromScopeFQDN below covers the fold with an empty Key.FQDN.)
+func TestSurfaceAFQDNChangeDetectedAndPublished(t *testing.T) {
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
+
+	old := surfaceAScope("old.example.net", FamilyV4, 0)
+	obs := fixedObserver("203.0.113.5")
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{old}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile(old): %v", err)
+	}
+
+	// Operator renames the published hostname; the address is UNCHANGED and we
+	// are well inside the forced-refresh floor (only a minute later).
+	now = now.Add(time.Minute)
+	renamed := surfaceAScope("new.example.net", FamilyV4, 0)
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{renamed}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile(renamed): %v", err)
+	}
+
+	ups := fu.upsertNames()
+	if !contains(ups, "new.example.net=203.0.113.5") {
+		t.Fatalf("FQDN-only change (same IP) must publish the NEW name; upserts=%v", ups)
+	}
+}
+
+// TestSurfaceAFQDNChangeWithdrawsOldName is the #2903 fail-on-revert proof for
+// the orphan half: when the configured hostname changes, the OLD name's RR must
+// be withdrawn at the provider (a real DeleteLease), not left orphaned. Before
+// #2903 the in-place ownership overwrite stored the new FQDN under the SAME
+// scope key and never DeleteLease'd the old name (RED: zero deletes, the old
+// record resolves forever). The fix makes the old FQDN its own scope key; once
+// the binding is reconciled under the new name, the old scope is gone-from-
+// config and Reconcile Pass 2 withdraws it through the same backend.
+//
+// FAIL-ON-REVERT: this goes RED when `scopePrefix()` drops the `/fqdn=` axis
+// (state.go) — the load-bearing change.
+func TestSurfaceAFQDNChangeWithdrawsOldName(t *testing.T) {
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
+
+	old := surfaceAScope("old.example.net", FamilyV4, 0)
+	obs := fixedObserver("203.0.113.5")
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{old}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile(old): %v", err)
+	}
+
+	now = now.Add(time.Minute)
+	renamed := surfaceAScope("new.example.net", FamilyV4, 0)
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{renamed}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile(renamed): %v", err)
+	}
+
+	dels := fu.deleteNames()
+	if !contains(dels, "old.example.net=203.0.113.5") {
+		t.Fatalf("a FQDN rename must withdraw the OLD name (no orphaned RR); deletes=%v", dels)
+	}
+	// And only ONE record is owned afterward (the new name); the old scope's
+	// ownership entry must be dropped after the successful withdraw.
+	if st := m.Stats(); st.Scopes != 1 {
+		t.Fatalf("after a rename exactly one scope must remain owned (the new name); got %d", st.Scopes)
+	}
+	// Status must show the renamed scope as published, no stale withdraw-pending.
+	views := m.StatusViews([]SurfaceAScope{renamed})
+	if len(views) != 1 || views[0].FQDN != "new.example.net" || views[0].State != SurfaceAStatePublished {
+		t.Fatalf("after a rename the only status row must be the published new name; got %+v", views)
+	}
+}
+
+// TestSurfaceAFQDNFoldFromScopeFQDN is the focused fail-on-revert guard for the
+// effectiveKey() FOLD specifically: the manager must derive the FQDN scope axis
+// from SurfaceAScope.FQDN even when the caller did NOT pre-populate Key.FQDN.
+// The daemon and the surfaceAScope helper both happen to set Key.FQDN, which
+// makes the other rename tests insensitive to a no-op effectiveKey (return
+// s.Key) — so this test deliberately leaves Key.FQDN EMPTY and only sets
+// SurfaceAScope.FQDN. With the fold intact, renaming SurfaceAScope.FQDN (same
+// interface/unit/family, same IP) is a new scope: the new name publishes and the
+// old name is withdrawn. With effectiveKey reverted to a passthrough that
+// ignores SurfaceAScope.FQDN, both scopes collapse to the SAME key — the rename
+// is skipped (no new publish) and the old name is overwritten in place (no
+// withdraw), so this test goes RED.
+func TestSurfaceAFQDNFoldFromScopeFQDN(t *testing.T) {
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
+
+	// Key.FQDN intentionally EMPTY; only SurfaceAScope.FQDN carries the name.
+	base := ScopeKey{Family: FamilyV4, Interface: "ge-0-0-2", Unit: 50, PolicyID: "corp-2136"}
+	old := SurfaceAScope{Key: base, FQDN: "old.example.net", TTL: 300, Source: AddressSourceDHCP}
+	obs := fixedObserver("203.0.113.5")
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{old}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile(old): %v", err)
+	}
+
+	now = now.Add(time.Minute)
+	renamed := SurfaceAScope{Key: base, FQDN: "new.example.net", TTL: 300, Source: AddressSourceDHCP}
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{renamed}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile(renamed): %v", err)
+	}
+
+	if ups := fu.upsertNames(); !contains(ups, "new.example.net=203.0.113.5") {
+		t.Fatalf("the manager must fold SurfaceAScope.FQDN into the scope key (publish the new name) even with an empty Key.FQDN; upserts=%v", ups)
+	}
+	if dels := fu.deleteNames(); !contains(dels, "old.example.net=203.0.113.5") {
+		t.Fatalf("the manager must fold SurfaceAScope.FQDN into the scope key (withdraw the old name) even with an empty Key.FQDN; deletes=%v", dels)
+	}
+}
+
+// TestSurfaceAFQDNMigrationAdoptsExistingRecord proves the #2903 on-disk
+// upgrade path does NOT blackhole: a pre-#2903 ownership record was keyed under
+// an FQDN-LESS scope prefix; after upgrade the configured scope keys under the
+// FQDN-bearing prefix with the SAME name+address. Pass 1 (re)publishes under the
+// new prefix; Pass 2 must adopt the stale old-prefix entry (drop it WITHOUT an
+// exact-RR delete that would remove the just-published live RR). Net: the name
+// stays published and no stale ownership lingers.
+func TestSurfaceAFQDNMigrationAdoptsExistingRecord(t *testing.T) {
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "iface-ddns.json")
+
+	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
+
+	// Seed a PRE-#2903 ownership record: same scope, but FQDN NOT in the key
+	// (the old on-disk shape). We build the manager, then inject the legacy entry
+	// directly into the store under the FQDN-less scope key.
+	m := newSurfaceAManagerForTesting(statePath, fu, func() time.Time { return now })
+	// The pre-#2903 on-disk record was keyed WITHOUT the FQDN axis. The helper
+	// pre-populates sc.Key.FQDN, so we MUST clear it here — otherwise legacyKey
+	// would equal the configured scope's effectiveKey, only ONE record would
+	// exist, and the adopt branch would never run (a vacuous test that stays
+	// green even with the adopt block disabled).
+	legacyKey := sc.Key
+	legacyKey.FQDN = ""
+	m.state.put(ownedRecord{
+		Family:      4,
+		Identity:    surfaceAIdentity,
+		Address:     "",
+		FQDN:        "wan.example.net",
+		ForwardType: "A",
+		TTL:         300,
+		AddrText:    "203.0.113.5",
+	}.withScope(legacyKey))
+	if err := m.state.save(); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+
+	// First post-upgrade reconcile, same address.
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil, nil); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// The name must NOT have been withdrawn (no blackhole on upgrade).
+	if dels := fu.deleteNames(); contains(dels, "wan.example.net=203.0.113.5") {
+		t.Fatalf("upgrade migration must NOT delete the live RR; deletes=%v", dels)
+	}
+	// Exactly one scope owned (the new FQDN-bearing prefix); the stale legacy
+	// entry must have been adopted/dropped.
+	if st := m.Stats(); st.Scopes != 1 {
+		t.Fatalf("after migration exactly one scope must remain owned; got %d", st.Scopes)
+	}
+	views := m.StatusViews([]SurfaceAScope{sc})
+	if len(views) != 1 || views[0].State != SurfaceAStatePublished {
+		t.Fatalf("migrated scope must be the single published row; got %+v", views)
+	}
+}
+
+// contains reports whether s is present in xs.
+func contains(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
