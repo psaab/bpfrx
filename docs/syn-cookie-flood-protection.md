@@ -25,6 +25,20 @@ exceeded:
 - **Without syn-cookie mode:** SYNs are dropped (existing behavior)
 - **With syn-cookie mode:** SYNs trigger the cookie challenge instead of being dropped
 
+### Default attack-threshold (#3024)
+
+Matching Junos SRX, a `tcp syn-flood` screen that is enabled WITHOUT an
+explicit `attack-threshold` arms at the default of **200 SYN segments/second**.
+Configuring syn-flood with only `destination-threshold`, `source-threshold`,
+`alarm-threshold`, or `timeout` (no `attack-threshold`) still enables the
+screen — and the nested syn-cookie challenge — at that default rate. The
+config compiler seeds the default at parse time
+(`defaultSynFloodAttackThreshold` in `pkg/config/compiler_security.go`); the
+dataplane gate in `pkg/dataplane/compiler_iface.go` (`buildScreenConfig`)
+applies the same default defensively. Previously the dataplane gate required
+`AttackThreshold > 0`, so an unset attack-threshold silently left SYN-flood
+protection disabled even when configured.
+
 ## Algorithm
 
 ```
