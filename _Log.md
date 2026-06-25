@@ -17345,6 +17345,49 @@ top.
   pkg/dhcprelay/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2866 — populate NetFlow v9 / IPFIX srcMask/dstMask from the FIB.
+  The v9 templates advertised srcMask (IE 9) / dstMask (IE 13) + IPv6 variants
+  (IE 29/30) and the encoder wrote FlowRecord.SrcMask/.DstMask, but
+  ExportSessionClose never assigned them, so every flow exported a /0 mask;
+  IPFIX did not advertise the mask IEs at all. The mask is the prefix length of
+  the route matching the flow's src/dst IP (Junos/vSRX FIB-LPM semantics). It is
+  NOT on the SESSION_CLOSE wire frame (unlike deferred #2749 fields) but IS
+  derivable from the local FIB at export time. Added routemask.go: a TTL-cached
+  (default 10s) netlink.RouteGetWithOptions(ip,{FIBMatch:true}) resolver
+  (RTM_F_FIB_MATCH returns the matched route prefix, so a default route yields a
+  real /0). Both exporters carry a MaskResolver func (defaulted by
+  NewExporter/NewIPFIXExporter; nil on a zero-value exporter → masks stay 0, the
+  test seam). ExportSessionClose resolves src/dst masks for the pre-NAT IPs.
+  IPFIX also gains the four mask IEs (1B each, same slot as the v9 masks),
+  growing the IPFIX record size by 2B (v4 61->63, v6 109->111). Fail-on-revert:
+  TestNetflowSrcDstMaskPopulated / TestIPFIXSrcDstMaskPopulated go RED if the
+  population is reverted to 0 (verified). Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/flowexport/..., go test ./pkg/flowexport/... + ./pkg/daemon/...
+  PASS.
+  **File(s)**: pkg/flowexport/routemask.go (new),
+  pkg/flowexport/srcmask_dstmask_test.go (new), pkg/flowexport/netflow.go,
+  pkg/flowexport/ipfix.go, pkg/flowexport/postnat_test.go,
+  pkg/flowexport/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2866 review fold (MERGE-NEEDS-MINOR) — bound routeMaskCache to
+  fix an unbounded-map memory leak. The TTL bounded the FIB syscall RATE but not
+  the FOOTPRINT: resolve() only ever inserted, never evicted, so the map grew
+  for the daemon's lifetime on an internet-facing firewall (unbounded dst-IP
+  cardinality). Added routeMaskCacheMax=8192 const + maxSize field + evictLocked
+  (purge-expired-then-clear-on-overflow, under the same lock as the insert; a
+  re-inserted existing key skips eviction since it does not grow the map;
+  maxSize<=0 disables the bound, used only by the existing
+  TestRouteMaskCacheResolves). Fail-on-revert: TestRouteMaskCacheBounded asserts
+  len(entries) stays <= maxSize across >cap distinct inserts AND a within-TTL
+  repeated key still hits (no extra lookup); TestRouteMaskCacheEvictsExpiredFirst
+  asserts the expired-purge runs before a full clear so a live working set below
+  the cap is not wiped. Neutering evictLocked to a no-op turns both RED
+  (verified). Existing mask-population tests stay green. Gates: go build ./...,
+  gofmt -l clean, go vet ./pkg/flowexport/..., go test ./pkg/flowexport/... +
+  ./pkg/daemon/... PASS.
+  **File(s)**: pkg/flowexport/routemask.go,
+  pkg/flowexport/srcmask_dstmask_test.go, pkg/flowexport/README.md, _Log.md
   **Action**: #2865 RA sender whose initial openConn() fails stayed in
   m.senders as a dead entry; the config-unchanged Apply reconcile skipped it
   (configEqual → continue), so a transient boot-time bind failure (link still

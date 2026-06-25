@@ -52,8 +52,8 @@ func TestIPFIXTemplateV4_PostNATFields(t *testing.T) {
 	if sum != ipfixRecordSizeV4 {
 		t.Fatalf("ipfixRecordSizeV4 = %d, want sum(template) = %d", ipfixRecordSizeV4, sum)
 	}
-	if ipfixRecordSizeV4 != 61 {
-		t.Fatalf("ipfixRecordSizeV4 = %d, want 61 (pre-NAT 45 + 4 ingressInterface (#2749) + 12 post-NAT)", ipfixRecordSizeV4)
+	if ipfixRecordSizeV4 != 63 {
+		t.Fatalf("ipfixRecordSizeV4 = %d, want 63 (pre-NAT 45 + 2 src/dst mask (#2866) + 4 ingressInterface (#2749) + 12 post-NAT)", ipfixRecordSizeV4)
 	}
 }
 
@@ -78,8 +78,8 @@ func TestIPFIXTemplateV6_PostNATFields(t *testing.T) {
 	if sum != ipfixRecordSizeV6 {
 		t.Fatalf("ipfixRecordSizeV6 = %d, want sum(template) = %d", ipfixRecordSizeV6, sum)
 	}
-	if ipfixRecordSizeV6 != 109 {
-		t.Fatalf("ipfixRecordSizeV6 = %d, want 109 (pre-NAT 69 + 4 ingressInterface (#2749) + 36 post-NAT)", ipfixRecordSizeV6)
+	if ipfixRecordSizeV6 != 111 {
+		t.Fatalf("ipfixRecordSizeV6 = %d, want 111 (pre-NAT 69 + 2 src/dst mask (#2866) + 4 ingressInterface (#2749) + 36 post-NAT)", ipfixRecordSizeV6)
 	}
 }
 
