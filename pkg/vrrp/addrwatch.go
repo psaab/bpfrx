@@ -92,12 +92,82 @@ func (m *Manager) clearAddrWatcherLatch() {
 // per-instance lock is needed and no lock-order inversion with m.mu exists
 // (instances never take m.mu). Filtering by ifindex ensures churn on an
 // interface no VRRP instance uses is ignored.
+//
+// Recreated-link robustness (#2707): the fast path matches on the cached
+// vi.iface.Index. When a VLAN/GRE/WireGuard sub-interface is deleted and
+// recreated (config change, driver restart, link-cycle recovery) the kernel
+// assigns a NEW ifindex, so an address event on the recreated link no longer
+// matches any cached ifindex and would be silently dropped until the ~2s
+// UpdateInstances reconcile noticed the drift — leaving the instance
+// advertising from a stale source (or off a stale socket) for that whole
+// window. On a cached-ifindex MISS we therefore resolve the event ifindex back
+// to its current link NAME (a single syscall, ONLY on a miss — the common
+// unchanged-ifindex path stays syscall-free) and re-match instances by their
+// STABLE configured interface name. A match whose cached ifindex differs is a
+// recreated link: re-resolving its source against the stale vi.iface would
+// query the wrong/absent ifindex (net.Interface.Addrs filters by Index), so
+// instead we trigger an immediate reconcile (onEventDrop) which rebuilds the
+// instance with a fresh socket bound to the new ifindex AND a fresh source —
+// the same restart UpdateInstances would do, but event-driven rather than
+// ~2s-deferred. Mutating vi.iface here would race the run-loop reads in
+// sendPacket/sendPacketIPv6, so we deliberately do not; the reconcile owns the
+// rebind.
 func (m *Manager) reresolveAddrFor(ifindex int) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	matched := false
 	for _, vi := range m.instances {
 		if vi.iface != nil && vi.iface.Index == ifindex {
 			vi.reresolveLocalAddrs()
+			matched = true
 		}
 	}
+	if matched {
+		m.mu.RUnlock()
+		return
+	}
+
+	// Cached-ifindex miss: the event may be for a recreated link whose name
+	// still matches a configured instance but whose ifindex drifted. Resolve
+	// the event ifindex -> current name and re-match by the stable name.
+	resolve := m.resolveLinkName
+	onDrop := m.onEventDrop
+	m.mu.RUnlock()
+	if resolve == nil {
+		return
+	}
+	name, err := resolve(ifindex)
+	if err != nil || name == "" {
+		return // ifindex gone (pure delete) or unresolvable — nothing to rebind
+	}
+
+	m.mu.RLock()
+	driftDetected := false
+	for _, vi := range m.instances {
+		if vi.iface != nil && vi.cfg.Interface == name && vi.iface.Index != ifindex {
+			driftDetected = true
+			slog.Info("vrrp: address event on recreated link, scheduling reconcile",
+				"key", vi.key(), "interface", name,
+				"old_ifindex", vi.iface.Index, "new_ifindex", ifindex)
+		}
+	}
+	m.mu.RUnlock()
+
+	if driftDetected && onDrop != nil {
+		// Reuse the immediate-reconcile lever (the daemon wires onEventDrop to
+		// schedule a reconcile pass). UpdateInstances then rebinds the drifted
+		// instance to the new ifindex and re-resolves the source.
+		onDrop()
+	}
+}
+
+// netlinkLinkName is the production resolveLinkName seam (#2707): map a kernel
+// ifindex to its current link name. Returns an error if the ifindex no longer
+// exists (a pure delete with no recreate) — the caller treats that as "nothing
+// to rebind".
+func netlinkLinkName(ifindex int) (string, error) {
+	link, err := netlink.LinkByIndex(ifindex)
+	if err != nil {
+		return "", err
+	}
+	return link.Attrs().Name, nil
 }

@@ -59,6 +59,19 @@ type Manager struct {
 	addrWatcherStarts  int  // guarded by mu — observability/test seam
 	subscribeAddrs     func(ch chan<- netlink.AddrUpdate, done <-chan struct{}) error
 
+	// resolveLinkName maps a kernel ifindex to its current link NAME. The
+	// addr-watcher (#2707) calls it ONLY on a cached-ifindex miss — when an
+	// address event arrives for an ifindex no instance is bound to. A
+	// VLAN/GRE/WireGuard link that is deleted+recreated (config change, driver
+	// restart, link-cycle recovery) gets a NEW ifindex, so the cached
+	// vi.iface.Index no longer matches and every subsequent address event on
+	// the recreated link would be ignored until the ~2s reconcile noticed the
+	// drift. Resolving the event ifindex back to a name lets us re-match the
+	// instance by its STABLE configured name and trigger an immediate
+	// reconcile. Defaults to a netlink.LinkByIndex wrapper; injectable so unit
+	// tests need no real netlink.
+	resolveLinkName func(ifindex int) (string, error)
+
 	// Injectable instance-lifecycle seams (#2156). Unit tests must not
 	// require real raw sockets or a live run() goroutine to exercise the
 	// build-before-teardown ordering in UpdateInstances. Production
@@ -91,6 +104,7 @@ func NewManager() *Manager {
 		linkState:          netlinkLinkState,
 		subscribeLinks:     netlink.LinkSubscribe,
 		subscribeAddrs:     netlink.AddrSubscribe,
+		resolveLinkName:    netlinkLinkName,
 		resolveIface:       net.InterfaceByName,
 		openInstanceSocket: func(vi *vrrpInstance) error { return vi.openSocket() },
 		runInstance:        func(vi *vrrpInstance) { go vi.run() },
