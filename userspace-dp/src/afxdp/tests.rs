@@ -8441,6 +8441,89 @@ fn publish_dnat_table_entry_failure_increments_counter() {
     assert_eq!(live.dnat_publish_errors.load(Ordering::Relaxed), 2);
 }
 
+// ---------------------------------------------------------------------------
+// #2406: IPv6 SNAT66-return reverse-NAT must be published to dnat_table_v6.
+//
+// Before #2406 publish_dnat_table_entry had ONLY a (AF_INET, V4) arm; an
+// AF_INET6 SNAT'd flow fell through `_ => true` and NOTHING was written to
+// dnat_table_v6. The shim's GRE-inner v6 classify therefore never saw the
+// reverse mapping, so an inbound ICMPv6 error (PMTUD Packet-Too-Big /
+// traceroute Time-Exceeded) carried over a native-GRE tunnel whose inner
+// destination is the SNAT66 pool address was not steered to the helper —
+// silent IPv6 PMTUD/traceroute blackhole behind pool-mode SNAT66.
+//
+// FAIL-ON-REVERT: drop the (AF_INET6, V6) arm in publish_dnat_table_entry
+// and both tests below regress — `dnat_v6_entry_bytes` disappears
+// (compile error) and the publish-attempt test sees the AF_INET6 key
+// return `true` (no syscall) instead of `false` (EBADF on the forced-bad
+// v6 fd).
+// ---------------------------------------------------------------------------
+
+fn dnat_v6_key() -> SessionKey {
+    SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V6("2001:559:8585:61::100".parse::<Ipv6Addr>().unwrap()),
+        dst_ip: IpAddr::V6("2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap()),
+        src_port: 12345,
+        dst_port: 443,
+    }
+}
+
+fn dnat_snat_decision_v6() -> NatDecision {
+    NatDecision {
+        rewrite_src: Some(IpAddr::V6("2001:559:8585:80::8".parse::<Ipv6Addr>().unwrap())),
+        rewrite_src_port: Some(54321),
+        ..NatDecision::default()
+    }
+}
+
+#[test]
+fn dnat_v6_entry_bytes_matches_struct_layout() {
+    // Reverse mapping: inbound return packet carries dst = SNAT addr/port;
+    // the value steers it back to the original pre-NAT source.
+    let snat: Ipv6Addr = "2001:559:8585:80::8".parse().unwrap();
+    let orig: Ipv6Addr = "2001:559:8585:61::100".parse().unwrap();
+    let (dk, dv) = dnat_v6_entry_bytes(PROTO_TCP, snat, 54321, orig, 12345);
+
+    // struct dnat_key_v6 (24B): protocol, 3B pad, 16B dst_ip, BE dst_port, from_zone.
+    assert_eq!(dk[0], PROTO_TCP, "key protocol");
+    assert_eq!(&dk[1..4], &[0u8; 3], "key pad must be zero");
+    assert_eq!(&dk[4..20], &snat.octets(), "key dst_ip = SNAT address");
+    assert_eq!(&dk[20..22], &54321u16.to_be_bytes(), "key dst_port = SNAT port (BE)");
+    assert_eq!(&dk[22..24], &[0u8; 2], "key from_zone = 0");
+
+    // struct dnat_value_v6 (20B): 16B new_dst_ip, BE new_dst_port, flags, pad.
+    assert_eq!(&dv[0..16], &orig.octets(), "value new_dst_ip = original source");
+    assert_eq!(&dv[16..18], &12345u16.to_be_bytes(), "value new_dst_port = orig source port (BE)");
+    assert_eq!(dv[18], 0, "value flags = 0 (dynamic SNAT-return)");
+    assert_eq!(dv[19], 0, "value pad = 0");
+}
+
+#[test]
+fn publish_dnat_table_entry_v6_attempts_publish() {
+    // Pre-#2406 an AF_INET6 SNAT'd flow returned `true` via the `_ => true`
+    // fall-through WITHOUT touching dnat_table_v6. With the v6 arm wired, a
+    // present-but-invalid v6 fd forces bpf_map_update_elem to fail (EBADF),
+    // which the function reports as `false` — proving the arm runs and the
+    // syscall is attempted for v6.
+    let fds = DnatTableFds { v4: None, v6: Some(-1) };
+    let ok = publish_dnat_table_entry(&fds, &dnat_v6_key(), dnat_snat_decision_v6());
+    assert!(
+        !ok,
+        "v6 SNAT'd flow with a bad v6 fd must attempt the publish and return false (revert => returns true, no syscall)"
+    );
+
+    // No v6 fd → nothing to publish, success (the noops contract still holds).
+    let no_fd = DnatTableFds { v4: None, v6: None };
+    assert!(publish_dnat_table_entry(&no_fd, &dnat_v6_key(), dnat_snat_decision_v6()));
+
+    // v6 SNAT decision present but no v6 fd, with a v4 fd set, must NOT use
+    // the v4 fd for a v6 flow (no cross-family publish).
+    let v4_only = DnatTableFds { v4: Some(-1), v6: None };
+    assert!(publish_dnat_table_entry(&v4_only, &dnat_v6_key(), dnat_snat_decision_v6()));
+}
+
 // =====================================================================
 // #2345: inbound destination-translation policy is evaluated on the
 // POST-translation destination tuple (Junos parity).
