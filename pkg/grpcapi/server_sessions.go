@@ -798,13 +798,16 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 			return true
 		}
 		v4Keys = append(v4Keys, key)
-		v4RevKeys = append(v4RevKeys, dataplane.SessionKey{
-			Protocol: key.Protocol,
-			SrcIP:    key.DstIP,
-			DstIP:    key.SrcIP,
-			SrcPort:  key.DstPort,
-			DstPort:  key.SrcPort,
-		})
+		// The reverse companion is installed keyed on val.ReverseKey
+		// (the TRANSLATED tuple for NAT'd sessions — session_store.go
+		// PutClusterSyncedV4 / manager_ha.go), NOT a naive src/dst swap
+		// of the forward key. For a non-NAT session the two coincide;
+		// for a NAT'd session a naive swap would leave the real reverse
+		// entry behind (#2733). A zero ReverseKey (Protocol==0) means no
+		// reverse companion was installed (the needsReverse gate).
+		if val.ReverseKey.Protocol != 0 {
+			v4RevKeys = append(v4RevKeys, val.ReverseKey)
+		}
 		if val.Flags&dataplane.SessFlagSNAT != 0 &&
 			val.Flags&dataplane.SessFlagStaticNAT == 0 {
 			snatDNATKeys = append(snatDNATKeys, dataplane.DNATKey{
@@ -840,13 +843,11 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 			return true
 		}
 		v6Keys = append(v6Keys, key)
-		v6RevKeys = append(v6RevKeys, dataplane.SessionKeyV6{
-			Protocol: key.Protocol,
-			SrcIP:    key.DstIP,
-			DstIP:    key.SrcIP,
-			SrcPort:  key.DstPort,
-			DstPort:  key.SrcPort,
-		})
+		// Reverse companion at the TRANSLATED tuple val.ReverseKey, not a
+		// naive swap (see V4 above, #2733). Zero ReverseKey => no companion.
+		if val.ReverseKey.Protocol != 0 {
+			v6RevKeys = append(v6RevKeys, val.ReverseKey)
+		}
 		if val.Flags&dataplane.SessFlagSNAT != 0 &&
 			val.Flags&dataplane.SessFlagStaticNAT == 0 {
 			snatDNATKeysV6 = append(snatDNATKeysV6, dataplane.DNATKeyV6{

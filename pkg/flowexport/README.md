@@ -127,6 +127,26 @@ The package is split by responsibility (#1988):
   earlier in the loop before returning — no descriptor leak on partial
   failure.
 
+## Header sequence number — v9 vs IPFIX (#2609)
+
+The two protocols define the header sequence number differently, and the
+exporters MUST NOT share the same rule:
+
+- **NetFlow v9 (RFC 3954)** — the header `SeqNumber` counts **export
+  packets**. Every datagram, *including* a template-only refresh,
+  advances the counter. `Exporter.sendTemplates()` therefore reads and
+  post-increments `e.seq` exactly like a data send.
+- **IPFIX / NetFlow v10 (RFC 7011 §3.1, §10.3.2)** — the header
+  `SequenceNumber` is the **cumulative count of Data Records** sent in
+  all prior Messages for this Observation Domain (the sequence of the
+  *next* Data Record). A Message that carries only (Options) Template
+  Sets contains no Data Records, so `IPFIXExporter.sendTemplates()`
+  carries the **current** cumulative value WITHOUT advancing it. Emitting
+  a hardcoded `0` on every periodic refresh (the pre-#2609 bug) rewound
+  the header sequence, which loss/sequence-tracking collectors (pmacct,
+  Elastiflow) read as packet loss or an exporter restart. Pinned by
+  `TestIPFIXTemplateRefreshPreservesSequenceNumber` (fail-on-revert).
+
 ## Per-collector write-health (#2464)
 
 Flow export is forensics/compliance data; a collector going unreachable
