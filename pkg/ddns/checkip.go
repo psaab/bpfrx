@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // checkip.go: the optional external check-IP address source (#2691 P3, plan
@@ -62,6 +64,17 @@ func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 boo
 		return netip.Addr{}, false
 	}
 	return parseCheckIPBody(string(body), wantV4, allowlist)
+}
+
+// NewCheckIPClient builds the HTTP client a checkip probe should use, bound to
+// the provider's configured source-address / destination-interface / routing-
+// instance (#2846) so the external "what is my IP" query egresses from the SAME
+// source as the DDNS updates do — not the kernel default route. A malformed
+// source-address returns the unbound default client plus the error so the caller
+// can log it and degrade gracefully (a checkip miss is a transient observation,
+// never a withdraw). A nil provider yields the unbound default client, no error.
+func NewCheckIPClient(p *config.DDNSProvider) (*http.Client, error) {
+	return newProviderHTTPClient(p)
 }
 
 // parseCheckIPBody scans a checkip response body for the first valid address of

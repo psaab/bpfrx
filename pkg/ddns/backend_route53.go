@@ -66,6 +66,11 @@ func newRoute53Backend(p *config.DDNSProvider) (*route53Backend, error) {
 	if s := strings.TrimSpace(p.Server); s != "" {
 		endpoint = strings.TrimRight(s, "/")
 	}
+	// Bind the dial to the configured source-address/interface/VRF (#2846).
+	client, err := newProviderHTTPClient(p)
+	if err != nil {
+		return nil, fmt.Errorf("ddns route53: provider %q: %w", p.Name, err)
+	}
 	return &route53Backend{
 		name:     p.Name,
 		endpoint: endpoint,
@@ -76,7 +81,7 @@ func newRoute53Backend(p *config.DDNSProvider) (*route53Backend, error) {
 			region:          region,
 			service:         "route53",
 		},
-		client: newHTTPClient(),
+		client: client,
 		now:    time.Now,
 	}, nil
 }

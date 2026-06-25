@@ -58,13 +58,18 @@ func newGenericBackend(p *config.DDNSProvider) (*genericBackend, error) {
 	if s := strings.TrimSpace(p.OKResponse); s != "" {
 		ok = []string{strings.ToLower(s)}
 	}
+	// Bind the dial to the configured source-address/interface/VRF (#2846).
+	client, err := newProviderHTTPClient(p)
+	if err != nil {
+		return nil, fmt.Errorf("ddns generic: provider %q: %w", p.Name, err)
+	}
 	return &genericBackend{
 		name:        p.Name,
 		urlTemplate: tmpl,
 		okSubstr:    ok,
 		username:    p.Username,
 		password:    p.Password.Reveal(),
-		client:      newHTTPClient(),
+		client:      client,
 	}, nil
 }
 
