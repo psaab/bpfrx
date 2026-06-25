@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/netip"
 	"sort"
 	"sync"
@@ -244,6 +245,15 @@ type SurfaceAManager struct {
 	newBackend func(p *config.DDNSProvider, fqdn string, ttl int) (DNSUpdater, error)
 	backend    DNSUpdater // static fallback / test injection
 
+	// httpClients caches the hardened *http.Client (and its keep-alive
+	// connection pool) per distinct provider source-binding so the HTTP backends
+	// (dyndns2/cloudflare/route53/generic) reuse the pool across reconcile passes
+	// instead of paying a full TCP+TLS handshake every ~30s pass (#2904). The
+	// backend OBJECT is still rebuilt per pass (resolve-per-Reconcile, #2691); only
+	// the expensive transport is reused. Keyed on the binding leaves, so a commit
+	// that changes a binding resolves a fresh key and rebuilds the transport.
+	httpClients *httpClientCache
+
 	now func() time.Time
 
 	// counters (observability, plan §5.5).
@@ -275,11 +285,15 @@ func NewSurfaceAManager() *SurfaceAManager {
 		slog.Warn("ddns surface-a: ownership state load failed; starting empty", "err", err)
 	}
 	m := &SurfaceAManager{
-		state:      st,
-		runtime:    map[string]*surfaceAState{},
-		newBackend: productionSurfaceABackend,
-		now:        time.Now,
+		state:       st,
+		runtime:     map[string]*surfaceAState{},
+		httpClients: newHTTPClientCache(),
+		now:         time.Now,
 	}
+	// resolveBackend closes over the manager's per-binding HTTP client cache
+	// (#2904) so every HTTP backend the reconcile path builds reuses the cached
+	// transport/connection pool rather than allocating a fresh one each pass.
+	m.newBackend = m.resolveBackend
 	m.seedFromStore()
 	return m
 }
@@ -306,9 +320,57 @@ func newSurfaceAManagerForTesting(statePath string, backend DNSUpdater, now func
 // backend whose required fields are missing (or an unknown backend token)
 // resolves to the no-op (logged) so a half-configured provider degrades safely
 // at runtime instead of wedging — the commit warning already told the operator.
-func productionSurfaceABackend(p *config.DDNSProvider, fqdn string, _ int) (DNSUpdater, error) {
+func productionSurfaceABackend(p *config.DDNSProvider, fqdn string, ttl int) (DNSUpdater, error) {
+	return resolveSurfaceABackend(p, fqdn, ttl, nil)
+}
+
+// CheckIPClient returns the bound *http.Client a checkip probe should use for a
+// provider, reusing the manager's cached per-binding client (#2904) so the
+// ~30s checkip probe reuses the keep-alive connection pool instead of doing a
+// full TCP+TLS handshake every reconcile pass. The bind-resolution error (a
+// malformed source-address) is returned alongside the UNBOUND default client
+// (fail-open, matching NewCheckIPClient); the probe is a transient observation,
+// never a withdraw. When the cache is nil (a test manager) it falls back to
+// building a fresh client.
+func (m *SurfaceAManager) CheckIPClient(p *config.DDNSProvider) (*http.Client, error) {
+	if m.httpClients == nil {
+		return newProviderHTTPClient(p)
+	}
+	return m.httpClients.clientFor(p)
+}
+
+// resolveBackend is the manager-bound backend resolver (#2904). It is identical
+// to productionSurfaceABackend except the HTTP backends are built with the
+// manager's cached, per-binding *http.Client so the keep-alive connection pool
+// is reused across reconcile passes instead of being rebuilt every pass.
+func (m *SurfaceAManager) resolveBackend(p *config.DDNSProvider, fqdn string, ttl int) (DNSUpdater, error) {
+	return resolveSurfaceABackend(p, fqdn, ttl, m.httpClients)
+}
+
+// resolveSurfaceABackend resolves a provider-catalog entry into a live Backend.
+// When clients is non-nil the HTTP backends reuse the cached per-binding client
+// (#2904); when nil each HTTP backend builds its own client (the pre-#2904
+// behaviour, used by productionSurfaceABackend's direct/test callers). A
+// half-configured or unknown provider degrades to the no-op (logged) exactly as
+// before.
+func resolveSurfaceABackend(p *config.DDNSProvider, fqdn string, _ int, clients *httpClientCache) (DNSUpdater, error) {
 	if p == nil {
 		return nopUpdater{}, nil
+	}
+	// httpClientFor pulls the cached bound client for this provider's binding
+	// when a cache is present, else returns nil (the constructor then builds its
+	// own). A bind-resolution error fails open to the unbound client AND is
+	// logged here once; the constructor degrades the same way it did pre-cache.
+	httpClientFor := func() *http.Client {
+		if clients == nil {
+			return nil
+		}
+		cl, err := clients.clientFor(p)
+		if err != nil {
+			slog.Warn("ddns surface-a: HTTP source bind unusable; using unbound client",
+				"provider", p.Name, "err", err)
+		}
+		return cl
 	}
 	switch p.Backend {
 	case "rfc2136", "":
@@ -317,13 +379,13 @@ func productionSurfaceABackend(p *config.DDNSProvider, fqdn string, _ int) (DNSU
 		}
 		return newSurfaceARFC2136(p, fqdn)
 	case "dyndns2":
-		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newDyndns2Backend(p) })
+		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newDyndns2Backend(p, httpClientFor()) })
 	case "cloudflare":
-		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newCloudflareBackend(p) })
+		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newCloudflareBackend(p, httpClientFor()) })
 	case "route53":
-		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newRoute53Backend(p) })
+		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newRoute53Backend(p, httpClientFor()) })
 	case "generic":
-		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newGenericBackend(p) })
+		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newGenericBackend(p, httpClientFor()) })
 	default:
 		slog.Warn("ddns surface-a: unknown provider backend; publishing nothing",
 			"provider", p.Name, "backend", p.Backend)

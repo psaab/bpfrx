@@ -1,3 +1,105 @@
+## 2026-06-25 — #2922: ECMP `select_route_next_hop` single liveness snapshot
+
+- **Timestamp**: 2026-06-25
+- **Action**: `select_route_next_hop` evaluated the (impure)
+  dynamic-neighbor liveness closure TWICE — `count()` then `nth()`. A
+  neighbor removed by the monitor thread between the two passes made the
+  count see `live > 0` while the select pass yielded `None` → spurious
+  no-route despite a live member at count time, plus doubled hot-path
+  neighbor probes. Fixed: collect live candidate refs into a stack
+  `SmallVec<[&T; 8]>` in a single pass and index into that snapshot, so
+  count and selection observe one consistent liveness view. Selection
+  semantics preserved (`ip_hash % live_count` over candidate order;
+  hashed full-vector fallback when none live). Added two fail-on-revert
+  tests: exact `candidates.len()` predicate-call count, and a
+  live→dead-flip-between-passes case that the reverted double-eval form
+  fails. Scope limited to `select_route_next_hop`; #2923 (tunnel-endpoint
+  ECMP) is a separate lane and untouched.
+- **File(s)**: `userspace-dp/src/afxdp/forwarding/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding/tests.rs`, `docs/multi-wan.md`,
+  `_Log.md`
+## 2026-06-25 — #2886: VRRP raw-socket fallback cross-VLAN crosstalk (no per-interface ifindex check)
+
+- **Timestamp**: 2026-06-25
+- **Action**: On the AF_PACKET-unavailable fallback (`afPacketFD < 0`), VRRP
+  uses per-instance raw IP sockets. `maybeBindToDevice` is a deliberate no-op
+  on VLAN sub-interfaces (`manager.go`), so two VLAN raw sockets on the same
+  parent both bind to the wildcard address with NO device isolation — the
+  kernel delivers a proto-112 frame to every such socket. The fallback
+  receivers (`receiver` IPv4 / `receiverIPv6`) gated only on TTL, self-IP, and
+  VRID, so two VLAN sub-interfaces (reth0.50 / reth0.80) with the SAME VRID
+  cross-processed each other's adverts → false BACKUP transitions, split-brain
+  flapping (#2886, agy-review-051 051-03). Fix: both receivers now enable the
+  per-packet interface control message (`ipv4.FlagInterface` /
+  `ipv6.FlagInterface`), capture the arrival ifindex, and route it through
+  `acceptArrivalIfindex(arrival, vi.expectedIfindex())`. A mismatch is dropped;
+  it fails OPEN when ifindex==0 (platform reported none) or the instance has no
+  resolved interface, so real delivery never regresses (VRID/TTL/self gates
+  still apply). IPv6 reads go through a new `ipv6Recv` seam (an
+  `ipv6.NewPacketConn(...).ReadFrom` wrapper in production) so tests can inject
+  a synthetic arrival ifindex without CAP_NET_RAW. The existing
+  `TestReceiverIPv6_DeliversPacket` was migrated from the `mockPacketConn`
+  injection (incompatible with `ipv6.NewPacketConn`, which needs `net.Conn`) to
+  the `ipv6Recv` seam with arrival ifindex 0 (fail-open). Only the fallback
+  path is affected; the default `receiverAfPacket` tap already binds one
+  ifindex.
+- **File(s)**: pkg/vrrp/instance.go (acceptArrivalIfindex + expectedIfindex
+  helpers, ipv4 receiver FlagInterface + ifindex gate, ipv6Recv seam +
+  receiverIPv6 ifindex gate), pkg/vrrp/instance_ifindex_filter_test.go (new),
+  pkg/vrrp/vrrp_test.go (TestReceiverIPv6_DeliversPacket migrated to ipv6Recv
+  seam), pkg/vrrp/README.md, _Log.md.
+- **Validation**: go build ./..., gofmt -l clean, go vet ./pkg/vrrp/...,
+  go test ./pkg/vrrp/... all PASS. FAIL-ON-REVERT (copy-aside revert proof):
+  neutering `acceptArrivalIfindex` to `return true` flips
+  TestAcceptArrivalIfindexCrossVLAN/sibling_VLAN_same_VRID_rejected RED;
+  deleting the ifindex check in both receivers makes
+  TestReceiverIPv6_DropsCrossInterfaceAdvert process the cross-interface advert
+  (RED). Both restored to GREEN. PARENT will run `make test-failover` (HA gate)
+  before merge.
+## 2026-06-25 — #2902: BGP `then community delete [ list1 list2 ]` multi-list — accumulate all community-lists
+
+- **Timestamp**: 2026-06-25
+- **Action**: `applyCommunityAction` stored only `vals[1]` for the
+  `delete` op, so a multi-list `then community delete [ listA listB ]`
+  (which the lexer flattens to `delete listA listB` — the #2419
+  multi-value/bracketed-list shape) dropped all but the first
+  community-list. FRR's `set comm-list <name> delete` strips ONE list per
+  line, so the renderer emitted only `set comm-list listA delete` and the
+  communities the operator meant to strip via listB... leaked into
+  advertised prefixes. Fix: `PolicyTerm.CommunityDelete` is now `[]string`;
+  the compiler accumulates `vals[1:]` (mirroring how `add`/`set` join the
+  whole tail and how #2892 as-path-prepend reads `firewallMatchValues`),
+  and the renderer emits one `set comm-list <name> delete` clause per
+  referenced list. Fail-on-revert: a `delete [ listA listB listC ]` config
+  renders all three deletes (RED if the compiler reads only the first list
+  value).
+- **File(s)**: pkg/config/types_routing.go, pkg/config/compiler_routing.go,
+  pkg/frr/policy_render.go, pkg/config/parser_security_test.go,
+  pkg/frr/frr_test.go, pkg/frr/README.md, docs/config-schema.md
+## 2026-06-25 — #2912: slow-path RateLimiter fixed window → token bucket (no 2x burst)
+
+- **Timestamp**: 2026-06-25
+- **Action**: `RateLimiter::allow` in `userspace-dp/src/slowpath.rs` used a
+  fixed 1-second window that zeroed its packet/byte counters whenever the
+  elapsed time since `window_started` reached 1s. A fixed window admits the
+  full per-second budget at the END of window N and a full budget at the
+  START of window N+1 — up to 2x the configured rate across a short interval
+  straddling the boundary, which can overload downstream control-queue
+  processing (agy-review-053 053-08). Replaced it with a dual token bucket
+  (packets/s + bytes/s): tokens accrue continuously at the configured rate,
+  the bucket caps at one second of accumulation, and a refused frame charges
+  neither bucket. Added a clock-injectable `allow_at(now, len)` core (the
+  production `allow(len)` is a thin wrapper) so the boundary behaviour is
+  deterministically unit-testable without sleeping. FAIL-ON-REVERT:
+  `rate_limiter_refuses_subsecond_refill_after_drain` (sub-second refill is
+  below one token → refuse) and `rate_limiter_no_double_budget_across_boundary`
+  (2ms straddle must not refill a second budget) both go RED against the
+  reinstated fixed-window `allow`. Gates: cargo build --release -p
+  xpf-userspace-dp PASS; cargo test slowpath:: 30/30 PASS (incl. 6
+  rate_limiter, 3 new).
+- **File(s)**: userspace-dp/src/slowpath.rs (fix + tests),
+  userspace-dp/README.md, _Log.md
+
 ## 2026-06-25 — #2937: screen flood + SYN-cookie standby-ACK rate limiting switched from fixed wall-second window to a sliding 1-second window
 
 - **Timestamp**: 2026-06-25
@@ -17700,6 +17802,49 @@ top.
   pkg/ipsec/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2919 — neighbor monitor: do NOT publish a FAILED initial dump
+  as generation 1; retry the full v4/v6 dump on bounded backoff. Before this,
+  both the Ok and Err arms of `initial_neighbor_dump` stored `neighbor_generation
+  = 1`, so a timed-out / WouldBlock / NLMSG_ERROR dump looked like a successful
+  empty baseline and was never retried, stranding quiet neighbors (first-packet
+  blackhole after startup / HA failover). Fix: pure `dump_establishes_baseline`
+  predicate gates `store(1)` (true ONLY on Ok); `neigh_monitor_thread` retries
+  the full dump on `INITIAL_DUMP_RETRY_BACKOFF_MS` (200/500/1000/2000/5000 ms,
+  `stop`-aware), publishing 1 only after a complete pass; if all retries fail the
+  generation stays 0 ("baseline incomplete") and the steady-state / ENOBUFS
+  re-dump paths recover. #2918 seq-0 absorb in process_dump_batch preserved.
+  FAIL-ON-REVERT: dump_batch_tests::failed_initial_dump_does_not_establish_
+  generation1_baseline goes RED (verified via copy-aside revert of the predicate
+  to always-true). Gates FG: cargo build --release -p xpf-userspace-dp OK;
+  cargo test neighbor PASS (123 passed).
+- **File(s)**: userspace-dp/src/afxdp/neighbor.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
+- **Action**: #2904 — Surface A HTTP client/transport reuse across reconcile
+  passes. `backendFor`/`backendForOwned` rebuilt a fresh `http.Client` +
+  `http.Transport` (own empty keep-alive pool) every reconcile pass via
+  `newProviderHTTPClient`, so each ~30s checkip probe + DNS update paid a full
+  TCP+TLS handshake (wasted CPU, latency, ephemeral-port churn). Added
+  `httpClientCache` (in `backend_http.go`) keyed on the provider's source-binding
+  inputs (source-address / destination-interface / routing-instance,
+  `bindCacheKey`); `SurfaceAManager` owns one cache. The manager-bound resolver
+  `resolveBackend` + the new `CheckIPClient` method pull the cached client per
+  binding and thread it into the 4 HTTP backend constructors (now take a
+  `client *http.Client`; nil = build-own, pre-#2904 path for direct/test callers
+  via `ensureProviderHTTPClient`). Cache invalidates implicitly: a changed
+  binding leaf keys a fresh transport. Daemon checkip site now calls
+  `d.surfaceA.CheckIPClient` instead of `ddns.NewCheckIPClient` (one line).
+  FAIL-ON-REVERT: surface_a_httpcache_2904_test.go (same-binding reuse,
+  cross-provider same-binding reuse, per-leaf invalidation, checkip↔update shared
+  pool) goes RED when clientFor is reverted to build-fresh — verified via
+  copy-aside revert (4 tests FAIL). Gates: go build ./..., gofmt -l clean (my
+  files), go vet ./pkg/ddns/... ./pkg/daemon/..., go test -race ./pkg/ddns/...
+  PASS.
+- **File(s)**: pkg/ddns/backend_http.go, pkg/ddns/backend_generic.go,
+  pkg/ddns/backend_cloudflare.go, pkg/ddns/backend_route53.go,
+  pkg/ddns/backend_dyndns2.go, pkg/ddns/surface_a.go,
+  pkg/ddns/surface_a_httpcache_2904_test.go,
+  pkg/ddns/backend_*_test.go (nil-arg call updates), pkg/ddns/README.md,
+  pkg/daemon/daemon_ddns_surface_a.go, _Log.md
 - **Action**: Fix three FRR config-render bugs that break frr-reload (#2941,
   #2942, #2943). #2941: a family-less IPv6 BGP neighbor with a policy was
   activated under `address-family ipv4 unicast` — gate the ipv4 fall-through
@@ -17766,3 +17911,18 @@ top.
 - **File(s)**: userspace-dp/src/server/helpers.rs,
   userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md,
   _Log.md
+- **Action**: #2938 — wire REST named source-NAT pool stats to the
+  userspace helper's LIVE runtime SourceNATPoolStatus instead of config
+  text (len(pool.Addresses)) + the retired-eBPF ReadNATPortCounter.
+  natPoolStatsHandler now calls s.runtimeSourceNATPools() (Status()
+  type-assertion, dedup by pool name like applied_nat_view.go) and reports
+  AddressCount / PortLow / PortHigh / UsedPorts from the runtime view;
+  TotalPorts = (PortHigh-PortLow+1)*AddressCount. Config + legacy counter
+  retained only as fallback when the helper has no entry. Added
+  TestNATPoolStatsHandlerUsesRuntimeStatus (fail-on-revert: config/legacy
+  fixture disagrees with runtime on every field — RED if reverted).
+  gRPC/CLI/metrics_nat.go named-pool surfaces noted as SSOT follow-up.
+  Gates: go build ./..., gofmt -l clean, go vet ./pkg/api/...,
+  go test ./pkg/api/... all PASS.
+- **File(s)**: pkg/api/nat.go, pkg/api/nat_stats_test.go,
+  pkg/api/README.md, _Log.md

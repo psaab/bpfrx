@@ -651,6 +651,39 @@ pub(super) fn initial_neighbor_dump(
     Ok(if changed { 1 } else { 0 })
 }
 
+/// Bounded backoff schedule (milliseconds) for retrying a FAILED initial
+/// neighbor dump (#2919). The dump runs once at monitor startup and
+/// publishes `neighbor_generation = 1` as the "baseline acquired"
+/// sentinel the resolver epoch logic relies on. A dump that returns
+/// `Err` (timeout / `WouldBlock` / `NLMSG_ERROR`) acquired NO baseline,
+/// so publishing generation 1 anyway would falsely advertise a complete
+/// neighbor population — quiet existing neighbors missed by the failed
+/// dump would never be loaded until an unrelated later event, an
+/// avoidable first-packet blackhole after helper startup or HA failover.
+///
+/// Instead we retry the full v4/v6 dump on this schedule until one full
+/// pass completes, and publish generation 1 ONLY then. The `stop` flag
+/// is honored between attempts so shutdown is not delayed. If every
+/// attempt fails the generation stays 0 (an explicit "baseline
+/// incomplete" state); the steady-state loop's per-batch `fetch_add` and
+/// the ENOBUFS re-dump path then recover the population from 0 rather
+/// than from a bogus 1.
+const INITIAL_DUMP_RETRY_BACKOFF_MS: &[u64] = &[200, 500, 1000, 2000, 5000];
+
+/// Decide whether an `initial_neighbor_dump` result may be published as
+/// the `neighbor_generation = 1` baseline (#2919).
+///
+/// Only `Ok` — a fully completed v4+v6 dump — establishes the baseline.
+/// An `Err` (timeout, `WouldBlock`, or netlink `NLMSG_ERROR`) means no
+/// complete baseline was acquired and MUST NOT be published as
+/// generation 1; the caller retries instead. Kept as a tiny pure
+/// predicate so the publish/skip contract is unit-testable without a
+/// live netlink socket (a regression that re-publishes the failure as
+/// generation 1 is caught here).
+pub(super) fn dump_establishes_baseline(result: &io::Result<u64>) -> bool {
+    result.is_ok()
+}
+
 /// Requested receive-buffer size for the neighbor-monitor netlink socket
 /// (#1658). Under an RTM_NEWNEIGH/DELNEIGH multicast burst (HA failover,
 /// large neighbor churn) the default rcvbuf can overflow and the kernel
@@ -807,15 +840,59 @@ pub(super) fn neigh_monitor_thread(
             core::mem::size_of::<libc::timeval>() as libc::socklen_t,
         );
     }
-    match initial_neighbor_dump(fd, &dynamic_neighbors) {
-        Ok(_) => {
+    // #2919: publish generation 1 ONLY once a full v4+v6 dump completes.
+    // A failed dump (timeout / WouldBlock / NLMSG_ERROR) acquired no
+    // baseline; publishing it as generation 1 would falsely advertise a
+    // complete neighbor population and there was previously no retry,
+    // stranding quiet neighbors until an unrelated later event. Retry the
+    // full dump on a bounded backoff, honoring `stop` between attempts;
+    // if every attempt fails the generation stays 0 ("baseline
+    // incomplete") and the steady-state / ENOBUFS re-dump paths recover.
+    let mut attempt = 0usize;
+    loop {
+        let result = initial_neighbor_dump(fd, &dynamic_neighbors);
+        if dump_establishes_baseline(&result) {
             neighbor_generation.store(1, Ordering::Relaxed);
-            eprintln!("neigh_monitor: initial kernel neighbor dump complete");
+            if attempt == 0 {
+                eprintln!("neigh_monitor: initial kernel neighbor dump complete");
+            } else {
+                eprintln!(
+                    "neigh_monitor: initial kernel neighbor dump complete \
+                     (after {attempt} retr{})",
+                    if attempt == 1 { "y" } else { "ies" }
+                );
+            }
+            break;
         }
-        Err(err) => {
-            neighbor_generation.store(1, Ordering::Relaxed);
-            eprintln!("neigh_monitor: initial dump failed: {err}");
+        let err = result.expect_err("dump_establishes_baseline rejected an Ok result");
+        if attempt >= INITIAL_DUMP_RETRY_BACKOFF_MS.len() {
+            eprintln!(
+                "neigh_monitor: initial dump failed after {attempt} retries \
+                 ({err}); neighbor baseline incomplete (generation stays 0), \
+                 relying on steady-state events / ENOBUFS re-dump to recover"
+            );
+            break;
         }
+        let backoff_ms = INITIAL_DUMP_RETRY_BACKOFF_MS[attempt];
+        eprintln!(
+            "neigh_monitor: initial dump failed ({err}); retrying in \
+             {backoff_ms}ms (attempt {})",
+            attempt + 1
+        );
+        // Sleep in short slices so a stop request aborts the backoff
+        // promptly instead of blocking shutdown for up to 5s.
+        let mut slept = 0u64;
+        while slept < backoff_ms {
+            if stop.load(Ordering::Relaxed) {
+                eprintln!("neigh_monitor: stop requested during initial-dump backoff");
+                unsafe { libc::close(fd) };
+                return;
+            }
+            let slice = (backoff_ms - slept).min(100);
+            std::thread::sleep(std::time::Duration::from_millis(slice));
+            slept += slice;
+        }
+        attempt += 1;
     }
     eprintln!("neigh_monitor: listening for kernel neighbor events");
     let mut buf = vec![0u8; 8192];
@@ -1217,6 +1294,51 @@ mod dump_batch_tests {
             },
             "only the matching-seq NLMSG_DONE ends the dump",
         );
+    }
+
+    /// #2919 fail-on-revert: a FAILED initial neighbor dump must NOT be
+    /// published as the `neighbor_generation = 1` baseline.
+    ///
+    /// `dump_establishes_baseline` is the predicate the monitor uses to
+    /// gate the `store(1)` publish: it returns `true` ONLY for `Ok`
+    /// (a fully completed v4+v6 dump). The pre-#2919 bug stored
+    /// generation 1 on BOTH the Ok and Err arms, so a timeout /
+    /// WouldBlock / NLMSG_ERROR dump looked like a successful empty
+    /// baseline and was never retried.
+    ///
+    /// Reverting the predicate to "always publish" (e.g. `true` for both
+    /// arms, mirroring the old `Err => store(1)`) makes the Err
+    /// assertion below FAIL. This is the load-bearing invariant:
+    /// generation 1 means a complete baseline was acquired.
+    #[test]
+    fn failed_initial_dump_does_not_establish_generation1_baseline() {
+        // A completed dump (Ok) — empty or populated — establishes the
+        // baseline and may publish generation 1.
+        let ok_empty: io::Result<u64> = Ok(0);
+        let ok_changed: io::Result<u64> = Ok(1);
+        assert!(
+            dump_establishes_baseline(&ok_empty),
+            "a completed (empty) dump establishes the baseline",
+        );
+        assert!(
+            dump_establishes_baseline(&ok_changed),
+            "a completed (populated) dump establishes the baseline",
+        );
+
+        // Every failure mode that initial_neighbor_dump can return —
+        // timeout, WouldBlock, and an NLMSG_ERROR-derived io::Error —
+        // acquired NO baseline and MUST NOT be published as generation 1.
+        for err in [
+            io::Error::from(io::ErrorKind::TimedOut),
+            io::Error::from(io::ErrorKind::WouldBlock),
+            io::Error::other("netlink neighbor dump failed"),
+        ] {
+            let failed: io::Result<u64> = Err(err);
+            assert!(
+                !dump_establishes_baseline(&failed),
+                "a failed dump must NOT publish generation 1 (it acquired no baseline)",
+            );
+        }
     }
 }
 

@@ -733,16 +733,23 @@ func applyCommunityAction(term *PolicyTerm, vals []string) {
 		term.CommunityOp = "none"
 		term.Community = ""
 		term.CommunityAdd = ""
-		term.CommunityDelete = ""
+		term.CommunityDelete = nil
 	case "add":
 		if len(vals) >= 2 {
 			term.CommunityOp = "add"
 			term.CommunityAdd = strings.Join(vals[1:], " ")
 		}
 	case "delete":
+		// `then community delete [ listA listB ]` flattens (the lexer strips
+		// the brackets) to vals = ["delete","listA","listB"], so every
+		// referenced community-list name is in vals[1:]. FRR's
+		// `set comm-list <name> delete` clause strips ONE list per line, so
+		// accumulate all names (reading only vals[1] would silently drop
+		// listB... — the #2419/#2902 multi-value trap) and append so repeated
+		// `set ... then community delete` lines also keep every name.
 		if len(vals) >= 2 {
 			term.CommunityOp = "delete"
-			term.CommunityDelete = vals[1]
+			term.CommunityDelete = append(term.CommunityDelete, vals[1:]...)
 		}
 	case "set":
 		if len(vals) >= 2 {

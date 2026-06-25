@@ -300,6 +300,30 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   client falls back to the unbound default + logs), matching the rfc2136
   fail-open posture.
 
+- **HTTP client / connection-pool reuse across reconcile passes (#2904)** — the
+  Surface A engine rebuilds the lightweight backend OBJECT every reconcile pass
+  (resolve-per-Reconcile, #2691) — that is cheap — but each rebuild used to call
+  `newProviderHTTPClient`, allocating a brand-new `http.Transport` with its own
+  empty keep-alive pool. Every ~30s checkip probe and DNS update then paid a full
+  TCP + TLS handshake from scratch (wasted CPU, added latency, ephemeral-port
+  churn). The `SurfaceAManager` now owns an `httpClientCache` keyed on the
+  provider's source-binding inputs ONLY (`source-address` /
+  `destination-interface` / `routing-instance`, `bindCacheKey`); the manager-bound
+  resolver (`resolveBackend`) and the checkip path (`CheckIPClient`) pull the
+  cached `*http.Client` per binding and thread it into the backend constructors
+  (`new{Dyndns2,Cloudflare,Route53,Generic}Backend(p, client)` — a nil client
+  makes the constructor build its own, the pre-#2904 path used by direct/test
+  callers). Two providers with the same binding share one transport (safe: a
+  transport's pool is keyed on the destination host:port, so reuse only ever
+  connects to the host a request targets; the client carries no credential/URL —
+  those live on the backend object and apply per-request). The cache invalidates
+  implicitly: a commit that changes a binding leaf resolves a NEW key and builds a
+  fresh bound transport, and the stale entry is simply no longer looked up.
+  Cardinality is bounded by the number of distinct configured bindings. Backed by
+  the FAIL-ON-REVERT suite `surface_a_httpcache_2904_test.go` (same-binding reuse,
+  cross-provider same-binding reuse, per-leaf invalidation, checkip↔update shared
+  pool).
+
 **HA correctness:** the per-RG gate change MUST pass `make test-failover` (the
 project rule for any gate / HA-path change). P1b adds the gate + the
 partial-demotion nudge; reason about split-brain (uncertain RG → fail-closed)

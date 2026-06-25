@@ -88,6 +88,29 @@ sync.
     the #2368 NA fail-closed discipline. Only opcode-2 replies are ever
     learned; ARP requests (opcode 1) classify `OtherArp` and never write
     the cache.
+- `neighbor.rs` — netlink neighbor monitor (`neigh_monitor_thread`),
+  startup dump (`initial_neighbor_dump` / `process_dump_batch`), the
+  on-demand resolver glue, and `worker::pin_current_thread`. The monitor
+  publishes `neighbor_generation` — the epoch counter the on-demand
+  resolver snapshots for its guard, and whose value `1` is the
+  **"initial baseline acquired" sentinel**.
+  - **Generation-1 baseline invariant (`#2919`):** `neighbor_generation`
+    is advanced to `1` ONLY when a full v4+v6 startup dump COMPLETES
+    (`initial_neighbor_dump` → `Ok`). A failed dump (timeout /
+    `WouldBlock` / `NLMSG_ERROR`) acquired no baseline and is NOT
+    published as `1`; the monitor retries the full dump on a bounded
+    backoff (`INITIAL_DUMP_RETRY_BACKOFF_MS`, `stop`-aware) until one
+    pass succeeds. If every retry fails the generation stays `0`
+    ("baseline incomplete"); the steady-state per-batch `fetch_add` and
+    the ENOBUFS re-dump path then recover the population from `0` rather
+    than from a bogus `1`. The publish/skip decision is the pure
+    `dump_establishes_baseline` predicate (unit-tested fail-on-revert).
+    The pre-#2919 bug stored `1` on BOTH the `Ok` and `Err` arms with no
+    retry, so a failed initial dump looked like a completed empty
+    baseline and quiet neighbors were stranded until an unrelated later
+    event — an avoidable first-packet blackhole after startup / HA
+    failover. The seq-0 absorb in `process_dump_batch` (`#2918`) is the
+    sibling completeness fix on the success path and is preserved.
 - `poll_stages.rs` — sibling of `worker/`, not inside it. Holds the
   per-packet pipeline stages extracted in #946 Phase 1. The screen and
   SYN-cookie stages decide the L3 offset (14 vs 18) on tag PRESENCE

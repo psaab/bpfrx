@@ -2009,15 +2009,20 @@ func TestReceiverIPv6_DeliversPacket(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Inject the advert through the ipv6Recv seam (#2886). arrival ifindex 0
+	// means "platform reported no arrival interface" → the filter fails open,
+	// so this packet is delivered exactly as before.
 	readOnce := make(chan struct{}, 1)
 	readOnce <- struct{}{} // allow one read
-	mock := &mockPacketConn{
-		data:     data,
-		srcAddr:  &net.IPAddr{IP: srcIP},
-		readOnce: readOnce,
-		closed:   make(chan struct{}),
+	vi.ipv6Recv = func(b []byte) (int, int, net.Addr, error) {
+		select {
+		case <-readOnce:
+			n := copy(b, data)
+			return n, 0, &net.IPAddr{IP: srcIP}, nil
+		case <-vi.stopCh:
+			return 0, 0, nil, net.ErrClosed
+		}
 	}
-	vi.ipv6Conn = mock
 
 	// Start receiver.
 	go vi.receiverIPv6()
