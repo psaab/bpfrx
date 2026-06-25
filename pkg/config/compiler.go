@@ -578,6 +578,24 @@ type compileOpts struct {
 	// and a leniently-loaded bad neighbor is inert. Same doctrine as
 	// lenientRoutingExportRef.
 	lenientBGPNeighborPeerAS bool
+	// lenientRouterID (#2980) downgrades the OSPF/OSPFv3/BGP router-id gate
+	// (validateRouterIDStrict) from a hard compile error to a cfg.Warnings
+	// entry. router-id is parsed as a raw string with no validation, so a
+	// malformed value (not a 32-bit IPv4 dotted-quad — e.g. garbage, an
+	// out-of-range octet, or an IPv6 address) flowed verbatim into frr.conf.
+	// FRR/vtysh requires an IPv4 router-id for ALL routing protocols
+	// (including the IPv6 protocols OSPFv3 and BGP) and rejects anything else,
+	// failing the whole frr-reload (a single vtysh -f add-batch exits non-zero
+	// on any CMD_WARNING_CONFIG_FAILED) and leaving dynamic routing
+	// broken/stale — a commit-accepted config the routing daemon cannot load.
+	// The strict commit / commit-check path hard-rejects so the bad value is
+	// operator-visible, naming the scope and protocol; the tolerant load /
+	// peer-sync paths warn so an already-persisted or peer-synced config
+	// carrying such a router-id still BOOTS (#1960 fail-closed-on-load class)
+	// — the render path now skips an invalid router-id (defense-in-depth), so
+	// the malformed value never reaches frr.conf and a leniently-loaded bad
+	// router-id is inert. Same doctrine as lenientBGPNeighborPeerAS.
+	lenientRouterID bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -634,6 +652,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRPMHTTPGetScheme:            true,
 		lenientRPMRoutingInstance:          true,
 		lenientBGPNeighborPeerAS:           true,
+		lenientRouterID:                    true,
 	})
 }
 
@@ -741,6 +760,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRPMHTTPGetScheme:            true,
 		lenientRPMRoutingInstance:          true,
 		lenientBGPNeighborPeerAS:           true,
+		lenientRouterID:                    true,
 	})
 }
 
@@ -1396,6 +1416,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientBGPNeighborPeerAS {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("BGP neighbor peer-as (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2980: OSPF/OSPFv3/BGP router-id gate. router-id is parsed as a raw
+	// string with no validation, so a malformed value (not a 32-bit IPv4
+	// dotted-quad) flowed verbatim into frr.conf. FRR/vtysh requires an IPv4
+	// router-id for ALL routing protocols (including the IPv6 protocols OSPFv3
+	// and BGP) and rejects anything else, failing the whole frr-reload and
+	// leaving dynamic routing broken — a commit-accepted config the routing
+	// daemon cannot load. Strict on commit / commit-check (hard reject naming
+	// the scope and protocol); lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960; the render
+	// path now skips an invalid router-id so it never reaches frr.conf). Runs
+	// on the fully-compiled *Config. Mirrors validateBGPNeighborPeerASStrict.
+	if err := validateRouterIDStrict(cfg); err != nil {
+		if opts.lenientRouterID {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("router-id (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
