@@ -38,7 +38,27 @@ pub(in crate::afxdp) struct WorkerHandle {
 
 pub(in crate::afxdp) struct LocalTunnelSourceHandle {
     pub(in crate::afxdp) stop: Arc<AtomicBool>,
+    /// #2412: the GRE local-origin thread blocks in poll(2) on this
+    /// eventfd. After setting `stop`, the join paths signal it so the
+    /// thread wakes immediately instead of waiting for the poll cap.
+    /// `None` for the WG control thread (it polls its UDP socket with its
+    /// own timeout cap and has no eventfd).
+    pub(in crate::afxdp) wake: Option<Arc<TunnelWake>>,
     pub(in crate::afxdp) join: Option<JoinHandle<()>>,
+}
+
+impl LocalTunnelSourceHandle {
+    /// #2412: request stop and wake the thread's poll(2). Set `stop`
+    /// first so the woken thread observes it on its next stop-check, then
+    /// signal the eventfd so a thread blocked in poll exits immediately
+    /// rather than after the poll cap. The WG control thread has no
+    /// eventfd (`wake == None`); it relies on its own poll cap as before.
+    pub(in crate::afxdp) fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(wake) = &self.wake {
+            wake.signal();
+        }
+    }
 }
 
 /// #1881: lifecycle entry for one GRE local-origin thread, keyed by
@@ -59,12 +79,13 @@ pub(crate) struct LocalTunnelSourceEntry {
     /// tunnel name. Attachment drift is the ONLY restart condition.
     pub(in crate::afxdp) spawned_ifindex: i32,
     pub(in crate::afxdp) spawned_tunnel_name: String,
-    /// Delivery sender for the CURRENT spawn attempt. A fresh channel
-    /// pair is created per spawn (the Receiver dies with the thread);
-    /// a failed spawn leaves this `None`; publication into
-    /// `local_tunnel_deliveries` is restricted to entries with a live
-    /// handle (plan v3 SMR-2 / AGY r1 R2).
-    pub(in crate::afxdp) delivery_tx: Option<SyncSender<Vec<u8>>>,
+    /// Delivery endpoint for the CURRENT spawn attempt: the mpsc sender
+    /// plus the eventfd that wakes the thread's poll(2) (#2412). A fresh
+    /// channel + eventfd pair is created per spawn (the Receiver dies
+    /// with the thread); a failed spawn leaves this `None`; publication
+    /// into `local_tunnel_deliveries` is restricted to entries with a
+    /// live handle (plan v3 SMR-2 / AGY r1 R2).
+    pub(in crate::afxdp) delivery_tx: Option<LocalTunnelDelivery>,
     /// Stamped at EVERY spawn attempt (success or failure).
     pub(in crate::afxdp) last_spawn_attempt_ns: u64,
 }
@@ -398,7 +419,7 @@ pub(in crate::afxdp) struct WorkerContext<'a> {
     pub(in crate::afxdp) slow_path: Option<&'a Arc<SlowPathReinjector>>,
     pub(in crate::afxdp) event_stream: Option<&'a crate::event_stream::EventStreamWorkerHandle>,
     pub(in crate::afxdp) local_tunnel_deliveries:
-        &'a Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
+        &'a Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
     pub(in crate::afxdp) recent_exceptions: &'a Arc<Mutex<VecDeque<ExceptionStatus>>>,
     pub(in crate::afxdp) last_resolution: &'a Arc<Mutex<Option<PacketResolution>>>,
     pub(in crate::afxdp) peer_worker_commands: &'a [Arc<Mutex<VecDeque<WorkerCommand>>>],

@@ -928,3 +928,94 @@ fn tunnel_tcp_mss_gre_unchanged_for_gre_endpoint() {
         "GRE endpoint must take the GRE branch bit-for-bit"
     );
 }
+
+// === #2412: eventfd wake replaces the 1ms busy-poll =====================
+
+#[test]
+fn tunnel_wake_signal_makes_poll_return_ready_promptly() {
+    // The loop blocks in poll(2) on {tun_fd, wake_fd}. With no readable
+    // fd it must time out (Idle); after signal() the wake fd is readable
+    // and poll returns Ready without burning the full cap. Use a pipe
+    // read end as the stand-in TUN fd (never readable here).
+    let mut pipe = [0i32; 2];
+    // SAFETY: pipe(2) into a 2-element array.
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let tun_read = pipe[0];
+    let wake = TunnelWake::new().expect("eventfd");
+
+    // Idle: nothing readable -> times out (use a short cap via Backoff).
+    let start = std::time::Instant::now();
+    let idle = wait_for_local_tunnel_event(tun_read, wake.raw_fd(), &wake, LocalTunnelWait::Backoff);
+    assert!(
+        matches!(idle, LocalTunnelPollOutcome::Idle),
+        "no readable fd must time out, not spin"
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(40),
+        "Backoff wait must actually block, not return instantly"
+    );
+
+    // Signalled: wake fd readable -> Ready promptly, well under the cap.
+    wake.signal();
+    let start = std::time::Instant::now();
+    let ready = wait_for_local_tunnel_event(tun_read, wake.raw_fd(), &wake, LocalTunnelWait::Block);
+    assert!(
+        matches!(ready, LocalTunnelPollOutcome::Ready),
+        "a signalled wake must return Ready"
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(100),
+        "signalled wake must return promptly, not after the {LOCAL_TUNNEL_POLL_CAP_MS}ms cap"
+    );
+
+    // Ready drained the eventfd: a follow-up Block wait times out again
+    // (proves the wake is edge-cleared, so the loop will block, not spin).
+    let start = std::time::Instant::now();
+    let idle_again =
+        wait_for_local_tunnel_event(tun_read, wake.raw_fd(), &wake, LocalTunnelWait::Backoff);
+    assert!(
+        matches!(idle_again, LocalTunnelPollOutcome::Idle),
+        "drained wake must not stay readable (would re-spin the loop)"
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(40),
+        "drained wake must block again instead of returning instantly"
+    );
+
+    // SAFETY: closing the pipe fds owned by this test.
+    unsafe {
+        libc::close(pipe[0]);
+        libc::close(pipe[1]);
+    }
+}
+
+#[test]
+fn local_tunnel_delivery_try_send_enqueues_and_wakes() {
+    // The worker slow path calls LocalTunnelDelivery::try_send: it must
+    // enqueue the packet AND wake the poll so the loop drains it without
+    // waiting for the cap.
+    let (tx, rx) = std::sync::mpsc::sync_channel(4);
+    let wake = Arc::new(TunnelWake::new().expect("eventfd"));
+    let delivery = LocalTunnelDelivery {
+        tx,
+        wake: wake.clone(),
+    };
+    delivery.try_send(vec![1, 2, 3]).expect("enqueue");
+    assert_eq!(rx.try_recv().expect("queued"), vec![1, 2, 3]);
+
+    // The wake fd is readable (poll Ready), proving the send woke the loop.
+    let mut pipe = [0i32; 2];
+    // SAFETY: pipe(2) into a 2-element array.
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let outcome =
+        wait_for_local_tunnel_event(pipe[0], wake.raw_fd(), &wake, LocalTunnelWait::Block);
+    assert!(
+        matches!(outcome, LocalTunnelPollOutcome::Ready),
+        "try_send must signal the wake eventfd"
+    );
+    // SAFETY: closing the pipe fds owned by this test.
+    unsafe {
+        libc::close(pipe[0]);
+        libc::close(pipe[1]);
+    }
+}

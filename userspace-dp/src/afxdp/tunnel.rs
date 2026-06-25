@@ -1,5 +1,105 @@
 use super::*;
 
+/// #2412: poll(2) cap for the GRE local-origin loop. With the eventfd
+/// wake below, idle wakeups are NOT paced by this cap — the loop blocks
+/// in poll until the TUN fd is readable, the delivery eventfd is
+/// signalled (peer-decap inbound delivery), or stop is requested. The
+/// cap is only a liveness backstop against a missed wake (the eventfd
+/// signal is best-effort on the cold reinjection path) and bounds the
+/// worst-case stop latency if the stop-wake write were ever to fail. At
+/// 250ms a wholly idle tunnel wakes ~4×/sec instead of ~1000×/sec — the
+/// #2412 busy-poll is eliminated without depending solely on the wake.
+const LOCAL_TUNNEL_POLL_CAP_MS: i32 = 250;
+
+/// #2412: an eventfd-backed wake shared between the GRE local-origin
+/// delivery producers (worker slow path), the coordinator stop path,
+/// and the local-origin loop's poll(2). Replaces the 1ms busy-poll: the
+/// loop blocks in poll on {TUN fd, this eventfd} and wakes only when
+/// there is work (a TUN read, a queued delivery, or shutdown) instead of
+/// spinning at 1000 wakeups/sec/tunnel.
+///
+/// EFD_NONBLOCK so `drain()` cannot block the loop; the counter
+/// semantics coalesce N signals into one readable event, so a single
+/// drain after the poll wake suffices to clear it (the loop then drains
+/// the mpsc queue to completion regardless of the counter value).
+pub(crate) struct TunnelWake {
+    fd: std::os::fd::OwnedFd,
+}
+
+impl TunnelWake {
+    pub(crate) fn new() -> io::Result<Self> {
+        // SAFETY: eventfd(2) with valid flags returns a new fd or -1.
+        let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        use std::os::fd::FromRawFd;
+        // SAFETY: `raw` is a fresh, owned, valid fd from eventfd(2).
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        Ok(Self { fd })
+    }
+
+    pub(crate) fn raw_fd(&self) -> c_int {
+        self.fd.as_raw_fd()
+    }
+
+    /// Wake the poll(2) waiter. Best-effort: a full counter (EAGAIN, the
+    /// only failure short of a closed fd) still leaves the eventfd
+    /// readable, so the waiter wakes anyway. Called from the worker slow
+    /// path (cold branch) and the stop path.
+    pub(crate) fn signal(&self) {
+        let val: u64 = 1;
+        // SAFETY: writing 8 bytes from a u64 to the owned eventfd.
+        unsafe {
+            libc::write(
+                self.fd.as_raw_fd(),
+                &val as *const u64 as *const c_void,
+                std::mem::size_of::<u64>(),
+            );
+        }
+    }
+
+    /// Clear the readable state after a poll wake. EFD_NONBLOCK, so an
+    /// empty counter returns EAGAIN — harmless.
+    fn drain(&self) {
+        let mut val: u64 = 0;
+        // SAFETY: reading 8 bytes into a u64 from the owned eventfd.
+        unsafe {
+            libc::read(
+                self.fd.as_raw_fd(),
+                &mut val as *mut u64 as *mut c_void,
+                std::mem::size_of::<u64>(),
+            );
+        }
+    }
+}
+
+/// #2412: delivery endpoint for one GRE local-origin thread — the mpsc
+/// sender the worker slow path pushes decapsulated inbound packets into,
+/// paired with the eventfd that wakes the thread's poll(2). The pair is
+/// stored in `local_tunnel_deliveries` so the producer can both enqueue
+/// AND wake in the same cold branch.
+#[derive(Clone)]
+pub(crate) struct LocalTunnelDelivery {
+    pub(in crate::afxdp) tx: SyncSender<Vec<u8>>,
+    pub(in crate::afxdp) wake: Arc<TunnelWake>,
+}
+
+impl LocalTunnelDelivery {
+    /// Enqueue a delivery and wake the loop. Mirrors `SyncSender::try_send`
+    /// so the worker slow path keeps its Full/Disconnected handling; the
+    /// eventfd is signalled ONLY on a successful enqueue (no point waking
+    /// for a packet that was dropped).
+    pub(in crate::afxdp) fn try_send(
+        &self,
+        packet: Vec<u8>,
+    ) -> Result<(), std::sync::mpsc::TrySendError<Vec<u8>>> {
+        self.tx.try_send(packet)?;
+        self.wake.signal();
+        Ok(())
+    }
+}
+
 const LOCAL_TUNNEL_SESSION_PRUNE_INTERVAL_NS: u64 = 5_000_000_000;
 const LOCAL_TUNNEL_SESSION_STALE_NS: u64 = 30_000_000_000;
 const LOCAL_TUNNEL_SESSION_PRUNE_THRESHOLD: usize = 4096;
@@ -118,6 +218,9 @@ pub(super) fn endpoint_attachment_valid(
             .is_some_and(|name| name == spawned_tunnel_name)
 }
 
+// Spawn plumbing: the shared state this thread reads is threaded in by
+// value/Arc at spawn (#1881). #2412 added the `wake` eventfd (16→17).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn local_tunnel_source_loop(
     tunnel_name: String,
     tunnel_endpoint_id: u16,
@@ -133,6 +236,10 @@ pub(super) fn local_tunnel_source_loop(
     shared_owner_rg_indexes: SharedSessionOwnerRgIndexes,
     worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
     delivery_rx: Receiver<Vec<u8>>,
+    // #2412: the eventfd this thread blocks on in poll(2) alongside the
+    // TUN fd. Producers (worker slow path) and the stop path signal it
+    // to wake the loop, replacing the 1ms busy-poll.
+    wake: Arc<TunnelWake>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     stop: Arc<AtomicBool>,
 ) {
@@ -152,15 +259,17 @@ pub(super) fn local_tunnel_source_loop(
     let mut next_slot = 0usize;
     let mut local_sessions = FastMap::<SessionKey, u64>::default();
     let mut local_sessions_last_prune_ns = 0u64;
+    let tun_fd = tun.as_raw_fd();
+    let wake_fd = wake.raw_fd();
     // #1881 D.1: track the worker-visible forwarding ArcSwap instead
     // of a spawn-time clone. ONE load point per outer iteration (the
     // #1188 ptr_eq short-circuit); the same Arc is used for the WHOLE
     // packet build below, so resolution, session synthesis, CoS, and
     // encap are coherent by construction. Cost honesty: this loop is
-    // syscall-paced (one read(2) per iteration, 1ms sleep when idle,
-    // single-digit pps workload) — an iteration IS the batch (≤1
-    // packet), so the per-BATCH ArcSwap rule holds and the AF_XDP
-    // worker hot path is untouched.
+    // syscall-paced (read(2) drained per iteration, then a blocking
+    // poll(2) when idle — #2412 replaced the 1ms busy-poll, single-digit
+    // pps workload) — a drained read pass IS the batch, so the per-BATCH
+    // ArcSwap rule holds and the AF_XDP worker hot path is untouched.
     let mut forwarding: Arc<ForwardingState> = shared_forwarding.load_full();
     let mut endpoint_attached = endpoint_attachment_valid(
         &forwarding,
@@ -196,91 +305,195 @@ pub(super) fn local_tunnel_source_loop(
             LocalTunnelDrainOutcome::Stopped | LocalTunnelDrainOutcome::FatalIo => return,
             LocalTunnelDrainOutcome::Drained => {}
         }
-        match tun.read(&mut packet) {
-            Ok(0) => thread::sleep(Duration::from_millis(1)),
-            Ok(len) => {
-                // #1881 D.1b: parked — the loaded state no longer
-                // describes this thread's TUN attachment (endpoint
-                // removed, mode flipped, or reattached). Drop without
-                // building; the coordinator prune will join us. Keep
-                // reading so the TUN never backs up.
-                if !endpoint_attached {
-                    debug_log!(
-                        "LOCAL_TUNNEL[{}]: drop endpoint={} reason=local_tunnel_unattached",
-                        tunnel_name,
-                        tunnel_endpoint_id
-                    );
-                    continue;
-                }
-                let packet = &packet[..len];
-                match build_local_origin_tunnel_tx_request(
-                    packet,
-                    tunnel_endpoint_id,
-                    &forwarding,
-                    ha_runtime.as_ref(),
-                    &dynamic_neighbors,
-                ) {
-                    Ok(plan) => {
-                        maybe_enqueue_local_tunnel_session(
-                            &shared_sessions,
-                            &shared_nat_sessions,
-                            &shared_forward_wire_sessions,
-                            &shared_owner_rg_indexes,
-                            &worker_commands,
-                            &mut local_sessions,
-                            &mut local_sessions_last_prune_ns,
-                            &plan,
+        // #2412: drain every currently-readable TUN packet, then block
+        // in poll(2) below. The old code read ONE packet per outer
+        // iteration and slept 1ms when idle; draining here keeps the TUN
+        // from backing up under a burst and makes the poll the single
+        // idle wait point.
+        let mut wait = LocalTunnelWait::Block;
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            match tun.read(&mut packet) {
+                // EOF on a TUN fd does not occur in practice; treat it as
+                // "nothing more right now" and fall through to poll.
+                Ok(0) => break,
+                Ok(len) => {
+                    // #1881 D.1b: parked — the loaded state no longer
+                    // describes this thread's TUN attachment (endpoint
+                    // removed, mode flipped, or reattached). Drop without
+                    // building; the coordinator prune will join us. Keep
+                    // reading so the TUN never backs up.
+                    if !endpoint_attached {
+                        debug_log!(
+                            "LOCAL_TUNNEL[{}]: drop endpoint={} reason=local_tunnel_unattached",
+                            tunnel_name,
+                            tunnel_endpoint_id
                         );
-                        if let Some(target_live) = select_live_binding_for_ifindex(
-                            &identities,
-                            &live,
-                            plan.tx_ifindex,
-                            next_slot,
-                        ) {
-                            next_slot = next_slot.wrapping_add(1);
-                            if let Err(err) = target_live.enqueue_tx(plan.tx_request) {
+                        continue;
+                    }
+                    let packet = &packet[..len];
+                    match build_local_origin_tunnel_tx_request(
+                        packet,
+                        tunnel_endpoint_id,
+                        &forwarding,
+                        ha_runtime.as_ref(),
+                        &dynamic_neighbors,
+                    ) {
+                        Ok(plan) => {
+                            maybe_enqueue_local_tunnel_session(
+                                &shared_sessions,
+                                &shared_nat_sessions,
+                                &shared_forward_wire_sessions,
+                                &shared_owner_rg_indexes,
+                                &worker_commands,
+                                &mut local_sessions,
+                                &mut local_sessions_last_prune_ns,
+                                &plan,
+                            );
+                            if let Some(target_live) = select_live_binding_for_ifindex(
+                                &identities,
+                                &live,
+                                plan.tx_ifindex,
+                                next_slot,
+                            ) {
+                                next_slot = next_slot.wrapping_add(1);
+                                if let Err(err) = target_live.enqueue_tx(plan.tx_request) {
+                                    record_local_tunnel_exception(
+                                        &recent_exceptions,
+                                        &tunnel_name,
+                                        format!("enqueue_local_tunnel_tx:{err}"),
+                                    );
+                                }
+                            } else {
                                 record_local_tunnel_exception(
                                     &recent_exceptions,
                                     &tunnel_name,
-                                    format!("enqueue_local_tunnel_tx:{err}"),
+                                    format!("no_live_binding_for_tx_ifindex:{}", plan.tx_ifindex),
                                 );
                             }
-                        } else {
-                            record_local_tunnel_exception(
-                                &recent_exceptions,
-                                &tunnel_name,
-                                format!("no_live_binding_for_tx_ifindex:{}", plan.tx_ifindex),
+                        }
+                        Err(err) => {
+                            #[cfg(not(feature = "debug-log"))]
+                            let _ = &err;
+                            debug_log!(
+                                "LOCAL_TUNNEL[{}]: drop endpoint={} reason={}",
+                                tunnel_name,
+                                tunnel_endpoint_id,
+                                err
                             );
                         }
                     }
-                    Err(err) => {
-                        #[cfg(not(feature = "debug-log"))]
-                        let _ = &err;
-                        debug_log!(
-                            "LOCAL_TUNNEL[{}]: drop endpoint={} reason={}",
-                            tunnel_name,
-                            tunnel_endpoint_id,
-                            err
-                        );
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => {
+                    record_local_tunnel_exception(
+                        &recent_exceptions,
+                        &tunnel_name,
+                        format!("read_local_tunnel:{err}"),
+                    );
+                    if local_tunnel_io_error_is_fatal(&err) {
+                        return;
                     }
+                    // Transient read error: don't hot-spin re-reading the
+                    // same broken fd. Back off via a short poll instead of
+                    // blocking for the full cap, then re-evaluate.
+                    wait = LocalTunnelWait::Backoff;
+                    break;
                 }
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(err) => {
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        // #2412: idle — block in poll(2) on {TUN readable, delivery
+        // eventfd} until there is work or the cap elapses. The stop
+        // path signals the eventfd so shutdown is observed immediately,
+        // not after the cap. POLLERR/POLLHUP/POLLNVAL on the TUN are
+        // fatal (device destroyed/downed — poll would return instantly
+        // forever); the tombstone/respawn path recovers.
+        match wait_for_local_tunnel_event(tun_fd, wake_fd, &wake, wait) {
+            LocalTunnelPollOutcome::Ready | LocalTunnelPollOutcome::Idle => {}
+            LocalTunnelPollOutcome::Fatal(reason) => {
                 record_local_tunnel_exception(
                     &recent_exceptions,
                     &tunnel_name,
-                    format!("read_local_tunnel:{err}"),
+                    format!("poll_local_tunnel:{reason}"),
                 );
-                if local_tunnel_io_error_is_fatal(&err) {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(50));
+                return;
             }
         }
     }
+}
+
+/// #2412: which poll(2) timeout the idle wait should use.
+enum LocalTunnelWait {
+    /// Normal idle wait — block up to the poll cap.
+    Block,
+    /// A transient TUN read error just occurred — wait ~50ms before
+    /// re-reading, preserving the pre-#2412 backoff without hot-spinning.
+    Backoff,
+}
+
+/// #2412: poll(2) wait disposition for the GRE local-origin loop.
+enum LocalTunnelPollOutcome {
+    /// At least one fd is readable (or EINTR — treat as a wakeup).
+    Ready,
+    /// Timed out (cap or backoff elapsed) — re-run the loop.
+    Idle,
+    /// Unrecoverable TUN fd state — exit the thread (tombstone respawn
+    /// is the recovery path).
+    Fatal(&'static str),
+}
+
+/// #2412: block on {TUN readable, delivery eventfd} until work arrives,
+/// the stop-wake fires, or the timeout elapses. Replaces the three 1ms /
+/// 50ms `thread::sleep` busy-poll sites. The eventfd is drained after a
+/// wake so the next poll blocks again instead of returning instantly.
+fn wait_for_local_tunnel_event(
+    tun_fd: c_int,
+    wake_fd: c_int,
+    wake: &TunnelWake,
+    wait: LocalTunnelWait,
+) -> LocalTunnelPollOutcome {
+    let timeout_ms = match wait {
+        LocalTunnelWait::Block => LOCAL_TUNNEL_POLL_CAP_MS,
+        LocalTunnelWait::Backoff => 50,
+    };
+    let mut fds = [
+        libc::pollfd {
+            fd: tun_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // SAFETY: two valid pollfds, count 2.
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            return LocalTunnelPollOutcome::Ready; // spurious — re-run
+        }
+        return LocalTunnelPollOutcome::Fatal("poll_failed");
+    }
+    if rc == 0 {
+        return LocalTunnelPollOutcome::Idle;
+    }
+    if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return LocalTunnelPollOutcome::Fatal("tun_revents");
+    }
+    // Coalesced eventfd signals: one drain clears the readable state; the
+    // caller drains the mpsc queue to completion regardless of the count.
+    if fds[1].revents & libc::POLLIN != 0 {
+        wake.drain();
+    }
+    LocalTunnelPollOutcome::Ready
 }
 
 pub(super) fn build_local_origin_tunnel_tx_request(

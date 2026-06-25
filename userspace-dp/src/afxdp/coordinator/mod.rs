@@ -170,7 +170,7 @@ pub(in crate::afxdp) fn log_wg_endpoint_set_transition(
 pub struct Coordinator {
     pub(crate) bpf_maps: BpfMaps,
     pub(crate) slow_path: Option<Arc<SlowPathReinjector>>,
-    pub(crate) local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
+    pub(crate) local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
     /// #1881: GRE local-origin thread lifecycle entries keyed by
     /// tunnel_endpoint_id. Reconciled by the same three-pass shape as
     /// `wg_control_threads` (finished sweep → attachment-stale prune →
@@ -402,7 +402,7 @@ impl Coordinator {
         // after a stop the next reconcile re-legitimates entries).
         for entry in self.tunnel_sources.values_mut() {
             if let Some(handle) = entry.handle.as_ref() {
-                handle.stop.store(true, Ordering::Relaxed);
+                handle.request_stop();
             }
         }
         for entry in self.tunnel_sources.values_mut() {
@@ -422,7 +422,7 @@ impl Coordinator {
         // reconcile re-legitimates entries from a coherent snapshot.
         for entry in self.wg_control_threads.values_mut() {
             if let Some(handle) = entry.handle.as_ref() {
-                handle.stop.store(true, Ordering::Relaxed);
+                handle.request_stop();
             }
         }
         for entry in self.wg_control_threads.values_mut() {

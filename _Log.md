@@ -1,3 +1,37 @@
+## 2026-06-25 — #2412: GRE local-origin thread eventfd wake (kill 1ms busy-poll)
+
+- **Timestamp**: 2026-06-25
+- **Action**: The GRE local-origin delivery thread (`local_tunnel_source_loop`)
+  busy-polled: a non-blocking TUN read plus a `thread::sleep(1ms)` on
+  `Ok(0)`/`WouldBlock`, waking ~1000×/sec/tunnel when idle. Replaced the spin
+  with a `poll(2)` block on {TUN fd, eventfd} (`wait_for_local_tunnel_event`,
+  250ms cap). Added `TunnelWake` (EFD_NONBLOCK | EFD_CLOEXEC eventfd) shared
+  three ways: the worker slow path signals it on a successful delivery enqueue
+  (`LocalTunnelDelivery::try_send` wraps the mpsc send + wake), and the
+  stop/join path signals it via `LocalTunnelSourceHandle::request_stop()` after
+  setting `stop` so shutdown is observed immediately, not after the cap. The
+  delivery map value changed from `SyncSender<Vec<u8>>` to `LocalTunnelDelivery`
+  (sender + wake). WG control threads carry `wake: None` (they keep their own
+  socket-poll cap). The loop now drains all readable TUN packets before
+  blocking (was one-per-iteration). Transient read errors take a 50ms backoff
+  poll instead of a sleep; fatal read/poll states still exit (tombstone +
+  respawn). Added two unit tests (signal→Ready prompt + drain→Idle re-block;
+  try_send enqueues AND wakes). gofmt/clippy: added one
+  `#[allow(too_many_arguments)]` on the loop (16→17 args). Gates:
+  `cargo build --release` clean; `cargo test --bin xpf-userspace-dp` 2800
+  passed / 0 failed; tunnel module 72/72. No wire change.
+- **File(s)**: userspace-dp/src/afxdp/tunnel.rs,
+  userspace-dp/src/afxdp/tunnel_tests.rs,
+  userspace-dp/src/afxdp/types/runtime.rs,
+  userspace-dp/src/afxdp/coordinator/tunnel_supervision.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/afxdp/tx/dispatch/slow_path.rs,
+  userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/worker/lifecycle.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs, _Log.md
 ## 2026-06-25 — #2608: SOCK_CLOEXEC on all raw/datagram control sockets via pkg/linuxsock
 
 - **Timestamp**: 2026-06-25

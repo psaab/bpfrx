@@ -107,7 +107,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
     ingress_ident: &BindingIdentity,
     ingress_live: &BindingLiveState,
     slow_path: Option<&Arc<SlowPathReinjector>>,
-    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
+    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     dbg: &mut DebugPollCounters,
     counters: &mut BatchCounters,

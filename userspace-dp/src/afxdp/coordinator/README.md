@@ -70,6 +70,15 @@ Differences that matter (#1881):
   published map BEFORE stop+join (so a busy worker producer cannot
   extend the join — the delivery drain also observes `stop` per
   chunk), with a final republish after spawns.
+- #2412: the published value is a `LocalTunnelDelivery` (the mpsc
+  sender PLUS an eventfd `TunnelWake`), not a bare sender. The GRE
+  local-origin loop blocks in `poll(2)` on {TUN fd, eventfd} instead
+  of the former 1ms `thread::sleep` busy-poll (~1000 wakeups/sec/tunnel
+  when idle). The worker slow path signals the eventfd on a successful
+  enqueue, and the stop/join path signals it after setting `stop`, so a
+  queued delivery and a shutdown both wake the loop immediately rather
+  than after the poll cap. WG control threads keep their own socket-poll
+  cap and carry no eventfd (`LocalTunnelSourceHandle.wake == None`).
 
 ## Notable invariants
 
