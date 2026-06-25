@@ -137,6 +137,19 @@ unchanged. Fail-on-revert covered by the `TestOSPFExport*`,
 `TestCommunityMembers*` cases in
 `pkg/config/protocols_multileaf_2587_test.go`.
 
+The policy-statement `from community` and `from prefix-list` match readers were
+the same class and were brought onto the contract in #2689. Both leaves are
+`multi:true` (`schema_routing.go`: `policy-options policy-statement <name> term
+<name> from prefix-list`/`community`), but `parsePolicyTermChildren`
+(`compiler_routing.go`) read only `nodeVal(fc)` = `child.Keys[1]`, so
+`from community [ c1 c2 ]` matched only `c1` and `from prefix-list [ p1 p2 ]`
+matched only `p1`. Both now route through `firewallMatchValues`. This composes
+with the #2642 repeated-sibling append below — a term carrying BOTH a bracket
+list AND a separate `from community c3` sibling keeps every value
+(`[c1 c2 c3]`). Fail-on-revert covered by `TestPolicyFromCommunity*` and
+`TestPolicyFromPrefixList*` in
+`pkg/config/policy_from_multileaf_2689_test.go`.
+
 ## Repeated same-type sibling matches (NOT bracketed multi-value)
 
 The dual-AST contract above covers a single leaf carrying a bracketed list

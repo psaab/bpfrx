@@ -1,5 +1,26 @@
 # Action Log
 
+## 2026-06-24 — #2689 fix: policy-term `from community` / `from prefix-list` dropped all but first bracketed value
+
+- **Timestamp**: 2026-06-24
+- **Action**: Routed the two policy-statement match readers (`from
+  community`, `from prefix-list`) in `parsePolicyTermChildren` through
+  the shared `firewallMatchValues` SSOT (Keys[1:] + child leaves) so a
+  bracketed list `from community [ c1 c2 ]` / `from prefix-list [ p1 p2 ]`
+  keeps ALL values on BOTH AST shapes. Both leaves were already
+  `multi:true` in `schema_routing.go`; the readers previously used
+  `nodeVal(fc)` = Keys[1] only, truncating to the first list entry. Same
+  class as #2587 (PR #2687) and #2630 (PR #2685). Composes with #2642's
+  repeated-sibling append (bracket values + a sibling statement both
+  accumulate). Added `policy_from_multileaf_2689_test.go` with 6
+  fail-on-revert cases (flat-set bracket, hierarchical block, and
+  bracket+sibling composition per reader) — all 6 fail on the old reader,
+  pass on the fix. `go build ./...` clean; `go test ./pkg/config/...
+  ./pkg/frr/...` green (frr cartesian render unchanged downstream).
+- **File(s)**: pkg/config/compiler_routing.go,
+  pkg/config/policy_from_multileaf_2689_test.go, docs/config-schema.md,
+  _Log.md
+
 ## 2026-06-24 — #2587 fix: routing-protocol export/import + community members dropped all but first bracketed value
 
 - **Timestamp**: 2026-06-24
