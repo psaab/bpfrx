@@ -17843,3 +17843,36 @@ top.
   go test ./pkg/api/... all PASS.
 - **File(s)**: pkg/api/nat.go, pkg/api/nat_stats_test.go,
   pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2955 fix the icmp_ratelimit generated-error token bucket
+  split-atomic race. The per-reason TokenBucket stored its state in two
+  independent atomics (millitokens + last_ns) and CAS-committed only
+  millitokens, then published last_ns as a SEPARATE relaxed store. Under
+  multi-worker contention two workers could read the new lower token count
+  with the stale old timestamp and double-credit a refill, or both observe
+  the first-use (last_ns==0) branch and each refill to full burst —
+  over-admitting generated ICMP/RST errors past the configured rate and
+  corrupting *_rate_limited_total counters on the DoS boundary. Fix:
+  collapsed the state into a SINGLE atomic GCRA theoretical-arrival-time
+  word (the same single-TAT pattern as event_stream/producer.rs) so refill
+  and consume commit together in one compare_exchange — no torn update,
+  hard-capped admit rate regardless of interleaving. Preserved the public
+  API (allow_generated_error[_at], rate_limited_count, reset_bucket_for_test,
+  GeneratedErrorReason, DEFAULT_RATE_PER_SEC/BURST) and all existing
+  semantics incl. the reject_reply far-future-drain pattern (a denied call
+  never advances the TAT). Added a FAIL-ON-REVERT concurrent test
+  (concurrent_hammer_never_over_admits: 16 threads x 2000 barrier-synced
+  trials from the boot/first-use epoch at a frozen instant assert admit <=
+  burst) + a deterministic single_word_state_advances_atomically guard —
+  both verified RED against the split-atomic revert (admitted 51 > burst 50).
+  Because the GCRA TAT is monotonic (unlike the order-independent
+  reset-to-full of the old millitoken model), the GLOBAL per-reason buckets'
+  tests became order-sensitive under the cargo parallel runner; added a
+  shared crate-test global_bucket_test_lock() serialising every test that
+  drives the global buckets across icmp_ratelimit.rs AND reject_reply.rs
+  (12x flake check clean). Gates: cargo build --release -p xpf-userspace-dp
+  OK; icmp_ratelimit + reject_reply tests 12/12 green; full bin test suite.
+- **File(s)**: userspace-dp/src/afxdp/icmp_ratelimit.rs,
+  userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
