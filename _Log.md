@@ -14186,6 +14186,34 @@ top.
   green. `make test-failover` still MANDATORY — the parent re-runs it on the
   folded head.
 
+## 2026-06-24 — #2707 VRRP addr-watch ifindex robustness (fix/2707-vrrp-addrwatch-ifindex)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Make the VRRP source-address watcher robust to a sub-interface
+  (VLAN/GRE/WireGuard) being deleted and recreated with a NEW ifindex. The
+  watcher matched address events only by the cached `vi.iface.Index`, so after
+  a recreate (config change, driver restart, link-cycle recovery) every address
+  event on the new ifindex was silently dropped until the ~2s reconcile noticed
+  the drift — leaving the instance on a stale source/socket for that window.
+- **Fix**: `reresolveAddrFor` keeps the syscall-free fast path (match by cached
+  ifindex -> `reresolveLocalAddrs`). On a cached-ifindex MISS it resolves the
+  event ifindex -> current link NAME (one syscall, only on a miss) via a new
+  `resolveLinkName` seam (`netlinkLinkName` = `netlink.LinkByIndex`), re-matches
+  instances by their STABLE configured name, and on an ifindex drift triggers
+  the immediate-reconcile lever (`onEventDrop`, wired to `triggerReconcile` in
+  the daemon). UpdateInstances then rebinds the drifted instance to the new
+  ifindex and re-resolves the source — event-driven, not ~2s-deferred. We do
+  NOT mutate `vi.iface` here (it would race the run-loop reads in
+  sendPacket/sendPacketIPv6); the reconcile owns the rebind.
+- **File(s)**: pkg/vrrp/addrwatch.go (reresolveAddrFor + netlinkLinkName),
+  pkg/vrrp/manager.go (resolveLinkName seam + NewManager default),
+  pkg/vrrp/addrwatch_test.go (RecreatedLinkNewIfindexSchedulesReconcile
+  fail-on-revert + UnchangedIfindexUsesFastPath guard), _Log.md.
+- **Validation**: `go build ./...` clean; gofmt/vet clean on touched files;
+  `go test -race ./pkg/vrrp/...` green; fail-on-revert proven (reverting to the
+  cached-only match makes the recreated-link test time out RED). HA-touching ->
+  `make test-failover` MANDATORY before merge (parent runs it; not attempted
+  here).
 ## 2026-06-24 — #2705 state_writer unique temp path (cross-writer corruption hardening)
 - **Timestamp**: 2026-06-24
 - **Action**: Fixed deterministic `temporary_path()` (`<dest>.tmp`) that let two

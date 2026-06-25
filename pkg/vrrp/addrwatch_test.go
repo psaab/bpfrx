@@ -3,6 +3,7 @@ package vrrp
 import (
 	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -224,6 +225,145 @@ func TestAddrWatcher_IgnoresUnrelatedInterface(t *testing.T) {
 	// event, so its source must be the ORIGINAL, not the renumbered 10.0.61.2.
 	if got := viB.getLocalIP(); got == nil || got.String() != "10.0.61.1" {
 		t.Fatalf("viB localIP = %v, want unchanged 10.0.61.1 (no event for its ifindex)", got)
+	}
+}
+
+// TestAddrWatcher_RecreatedLinkNewIfindexSchedulesReconcile is the #2707
+// fail-on-revert gate. A VLAN/GRE/WireGuard sub-interface is deleted and
+// recreated, so the kernel assigns a NEW ifindex while the configured NAME is
+// stable. An address event arrives on the NEW ifindex. The cached vi.iface.Index
+// no longer matches, so the pre-#2707 cached-ifindex-only match dropped the
+// event entirely and the instance waited up to ~2s for the reconcile to notice
+// the drift. The fix resolves the event ifindex -> name, re-matches by the
+// stable name, and triggers the immediate-reconcile lever (onEventDrop).
+//
+// Revert proof: with the old reresolveAddrFor (match only on cached ifindex),
+// the ifindex-77 event matches nothing, onEventDrop never fires, and this test
+// times out RED.
+func TestAddrWatcher_RecreatedLinkNewIfindexSchedulesReconcile(t *testing.T) {
+	m := NewManager()
+	defer stopManagerForTest(m)
+
+	updates := make(chan chan<- netlink.AddrUpdate, 1)
+	m.subscribeAddrs = func(ch chan<- netlink.AddrUpdate, done <-chan struct{}) error {
+		updates <- ch
+		return nil
+	}
+	// The recreated link's NEW ifindex (77) resolves back to the SAME name the
+	// instance is configured with. This is the only syscall the watcher makes,
+	// and only on a cached-ifindex miss.
+	m.resolveLinkName = func(ifindex int) (string, error) {
+		if ifindex == 77 {
+			return "reth0.50", nil
+		}
+		return "", errors.New("test: no such ifindex")
+	}
+	reconciled := make(chan struct{}, 4)
+	m.SetOnEventDrop(func() { reconciled <- struct{}{} })
+
+	// Instance was built when the link had ifindex 42 (the pre-recreate value).
+	cur := []net.Addr{ipnetAddr(t, "172.16.50.8/24")}
+	vi := newInstance(Instance{Interface: "reth0.50", GroupID: 1, Priority: 200},
+		&net.Interface{Name: "reth0.50", Index: 42}, m.eventCh, m.onEventDrop)
+	vi.addrsFn = func() ([]net.Addr, error) { return cur, nil }
+	vi.reresolveLocalAddrs()
+
+	m.mu.Lock()
+	m.instances[instanceKey{iface: "reth0.50", groupID: 1}] = vi
+	m.ensureAddrWatcherLocked()
+	m.mu.Unlock()
+
+	var ch chan<- netlink.AddrUpdate
+	select {
+	case ch = <-updates:
+	case <-time.After(2 * time.Second):
+		t.Fatal("addr watcher never subscribed")
+	}
+
+	// Address comes up on the RECREATED link — new ifindex 77, same name.
+	ch <- netlink.AddrUpdate{
+		LinkIndex:   77,
+		NewAddr:     true,
+		LinkAddress: net.IPNet{IP: net.ParseIP("172.16.50.8"), Mask: net.CIDRMask(24, 32)},
+	}
+
+	select {
+	case <-reconciled:
+		// Immediate reconcile scheduled — the rebind happens event-driven, not
+		// after the ~2s periodic reconcile.
+	case <-time.After(2 * time.Second):
+		t.Fatal("recreated-link addr event (new ifindex, same name) did not schedule a reconcile")
+	}
+}
+
+// TestAddrWatcher_UnchangedIfindexUsesFastPath asserts the common case is
+// unchanged: when the event ifindex still matches the cached vi.iface.Index the
+// source is re-resolved IN PLACE (reresolveLocalAddrs) and NO reconcile is
+// scheduled and NO link-name syscall is made. This guards the #2707 fix from
+// regressing into a reconcile (or a syscall) on every routine address event.
+func TestAddrWatcher_UnchangedIfindexUsesFastPath(t *testing.T) {
+	m := NewManager()
+	defer stopManagerForTest(m)
+
+	updates := make(chan chan<- netlink.AddrUpdate, 1)
+	m.subscribeAddrs = func(ch chan<- netlink.AddrUpdate, done <-chan struct{}) error {
+		updates <- ch
+		return nil
+	}
+	var nameResolves int32
+	m.resolveLinkName = func(ifindex int) (string, error) {
+		atomic.AddInt32(&nameResolves, 1)
+		return "reth0.50", nil
+	}
+	reconciled := make(chan struct{}, 4)
+	m.SetOnEventDrop(func() { reconciled <- struct{}{} })
+
+	cur := []net.Addr{ipnetAddr(t, "172.16.50.8/24")}
+	vi := newInstance(Instance{Interface: "reth0.50", GroupID: 1, Priority: 200},
+		&net.Interface{Name: "reth0.50", Index: 42}, m.eventCh, m.onEventDrop)
+	vi.addrsFn = func() ([]net.Addr, error) { return cur, nil }
+	vi.reresolveLocalAddrs()
+
+	m.mu.Lock()
+	m.instances[instanceKey{iface: "reth0.50", groupID: 1}] = vi
+	m.ensureAddrWatcherLocked()
+	m.mu.Unlock()
+
+	var ch chan<- netlink.AddrUpdate
+	select {
+	case ch = <-updates:
+	case <-time.After(2 * time.Second):
+		t.Fatal("addr watcher never subscribed")
+	}
+
+	// Renumber + event on the SAME (cached) ifindex 42.
+	cur = []net.Addr{ipnetAddr(t, "172.16.50.9/24")}
+	ch <- netlink.AddrUpdate{
+		LinkIndex:   42,
+		NewAddr:     true,
+		LinkAddress: net.IPNet{IP: net.ParseIP("172.16.50.9"), Mask: net.CIDRMask(24, 32)},
+	}
+
+	// Fast path re-resolves in place.
+	deadline := time.After(2 * time.Second)
+	for {
+		if got := vi.getLocalIP(); got != nil && got.String() == "172.16.50.9" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("localIP = %v, want 172.16.50.9 (fast-path reresolve)", vi.getLocalIP())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	// No reconcile and no link-name syscall on the fast path.
+	select {
+	case <-reconciled:
+		t.Fatal("unchanged-ifindex event must NOT schedule a reconcile")
+	case <-time.After(150 * time.Millisecond):
+	}
+	if n := atomic.LoadInt32(&nameResolves); n != 0 {
+		t.Fatalf("resolveLinkName called %d times on the fast path, want 0 (no syscall on a cached-ifindex hit)", n)
 	}
 }
 

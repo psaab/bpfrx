@@ -18,6 +18,14 @@ cause transient packet loss or sticky incorrect state during repeated failover:
   changes.
 - IPv6 VRRP source address selection is not fully deterministic in all
   multi-address edge cases.
+- The source-address watcher (#2528) matched netlink address events by the
+  instance's cached `vi.iface.Index`. RESOLVED (#2707): when a VLAN/GRE/
+  WireGuard sub-interface is deleted and recreated with a NEW ifindex (config
+  change, driver restart, link-cycle recovery), the watcher now resolves the
+  event ifindex back to its stable link name on a cached-ifindex miss,
+  re-matches the instance by name, and triggers an immediate reconcile so the
+  instance rebinds to the new ifindex without waiting for the ~2s periodic
+  reconcile. The common unchanged-ifindex path stays syscall-free.
 
 ## Goals
 
