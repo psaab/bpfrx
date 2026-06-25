@@ -1537,6 +1537,18 @@ pub(super) fn lookup_forwarding_resolution_v4(
             // else fall back to the per-destination hash.
             let spread_hash = ecmp_flow_hash.unwrap_or_else(|| ecmp_hash_v4(ip));
             let selected = select_route_next_hop(&route.next_hops, spread_hash, |nh| {
+                // #2923: tunnel candidates use TUNNEL liveness (endpoint +
+                // resolvable underlay), NOT the direct-neighbor gate they can
+                // never satisfy. Without this branch a live direct member in a
+                // mixed ECMP group starves the tunnel path.
+                if nh.tunnel_endpoint_id != 0 {
+                    return tunnel_next_hop_live(
+                        state,
+                        dynamic_neighbors,
+                        nh.tunnel_endpoint_id,
+                        depth,
+                    );
+                }
                 let target = nh.next_hop.unwrap_or(ip);
                 nh.ifindex > 0
                     && lookup_neighbor_entry(state, dynamic_neighbors, nh.ifindex, IpAddr::V4(target))
@@ -1698,6 +1710,18 @@ pub(super) fn lookup_forwarding_resolution_v6(
             // else fall back to the per-destination hash.
             let spread_hash = ecmp_flow_hash.unwrap_or_else(|| ecmp_hash_v6(ip));
             let selected = select_route_next_hop(&route.next_hops, spread_hash, |nh| {
+                // #2923: tunnel candidates use TUNNEL liveness (endpoint +
+                // resolvable underlay), NOT the direct-neighbor gate they can
+                // never satisfy. Without this branch a live direct member in a
+                // mixed ECMP group starves the tunnel path.
+                if nh.tunnel_endpoint_id != 0 {
+                    return tunnel_next_hop_live(
+                        state,
+                        dynamic_neighbors,
+                        nh.tunnel_endpoint_id,
+                        depth,
+                    );
+                }
                 let target = nh.next_hop.unwrap_or(ip);
                 nh.ifindex > 0
                     && lookup_neighbor_entry(state, dynamic_neighbors, nh.ifindex, IpAddr::V6(target))
@@ -2069,6 +2093,53 @@ fn ecmp_hash_flow_seeded(seed: u64, key: &crate::session::SessionKey) -> u64 {
 /// same liveness); when none are live, fall back to the same hashed pick
 /// over the full candidate vector so the kernel slow-path can drive
 /// ARP/NDP.
+/// #2923: ECMP candidate liveness for a TUNNEL next-hop.
+///
+/// A tunnel candidate (`tunnel_endpoint_id != 0`) is NOT a neighbor-resolved
+/// L2 next-hop on the logical tunnel ifindex, so the direct-neighbor liveness
+/// gate (`ifindex > 0 && lookup_neighbor_entry(...)`) always marks it dead.
+/// In a MIXED direct+tunnel ECMP group a live direct member makes `live > 0`,
+/// which restricts selection to direct candidates and starves the tunnel path
+/// even when its underlay is fully up.
+///
+/// A tunnel next-hop is live iff its endpoint exists AND the OUTER transport
+/// resolves to a FORWARDABLE disposition. `resolve_tunnel_outer` already
+/// rejects the structurally-broken cases (unknown endpoint, local-delivery
+/// outer, tunnel-interface recursion loop) by returning `None`, but a tunnel
+/// whose underlay ROUTE is withdrawn still returns
+/// `Some(ForwardingResolution { disposition: NoRoute, egress_ifindex: 0, .. })`
+/// — a bare `.is_some()` would mark that DEAD tunnel live, and in a mixed
+/// group ~half the flows would hash to it and DROP (NoRoute) despite a fully
+/// live direct member (#2923 review finding). So gate on the OUTER
+/// disposition:
+///
+/// * `ForwardCandidate` — outer next-hop neighbor resolved, fully usable.
+/// * `MissingNeighbor` — outer route present, ARP/NDP pending; the cold path
+///   drives resolution, so this is LIVE, matching the direct-hop branch which
+///   keeps an `ifindex > 0` next-hop selectable while its neighbor resolves
+///   (a tunnel marked MissingNeighbor egresses the logical tunnel ifindex and
+///   the cold path probes the OUTER hop via `outer_neighbor_ifindex`).
+///
+/// Every other disposition (`NoRoute`, `DiscardRoute`, `NextTableUnsupported`,
+/// etc.) means the underlay cannot forward → DEAD, so selection skips it and a
+/// live alternate (direct or another tunnel) carries the flow. Reusing
+/// `resolve_tunnel_outer` keeps liveness identical to what selection later
+/// resolves via `resolve_tunnel_forwarding_resolution`. `depth` is forwarded
+/// so the outer re-resolution honors the same next-table recursion budget as
+/// the caller.
+fn tunnel_next_hop_live(
+    state: &ForwardingState,
+    dynamic_neighbors: Option<&Arc<ShardedNeighborMap>>,
+    tunnel_endpoint_id: u16,
+    depth: usize,
+) -> bool {
+    matches!(
+        resolve_tunnel_outer(state, dynamic_neighbors, tunnel_endpoint_id, depth)
+            .map(|outer| outer.disposition),
+        Some(ForwardingDisposition::ForwardCandidate | ForwardingDisposition::MissingNeighbor)
+    )
+}
+
 fn select_route_next_hop<'a, T: Copy>(
     candidates: &'a [T],
     ip_hash: u64,

@@ -39,6 +39,26 @@ agree. Selection semantics are unchanged: `ip_hash % live_count` over the
 live set in candidate order (flow-pinned), with the hashed full-vector
 fallback when no member is live.
 
+**#2923 — type-aware ECMP candidate liveness (direct vs tunnel).** The
+liveness predicate `select_route_next_hop` evaluates was written for direct
+next-hops only: a candidate is live iff `ifindex > 0` AND the destination
+resolves to a neighbor entry on that ifindex. A TUNNEL next-hop (a route
+next-hop pointing at a GRE/WireGuard/IPIP tunnel interface, carrying a
+non-zero `tunnel_endpoint_id`) is the LOGICAL tunnel ifindex and has no
+neighbor for the inner destination, so it always failed that gate. In a
+MIXED direct+tunnel ECMP group a live direct member made `live > 0`, which
+restricted selection to the direct members and STARVED the tunnel path —
+the tunnel endpoint was never selected even when its underlay was fully up.
+(A tunnel-only group still worked: with `live == 0` the fallback picks from
+all candidates.) The picker now branches on `tunnel_endpoint_id`: a tunnel
+candidate is live when its endpoint resolves a usable OUTER underlay
+(`resolve_tunnel_outer` — endpoint present, outer not local-delivery, outer
+not a tunnel-interface recursion loop), the same SSOT selection later uses
+in `resolve_tunnel_forwarding_resolution`, so a candidate marked live here
+never blackholes on selection. Direct-hop liveness is unchanged. This
+restores full equal-cost participation for multi-WAN and route-leak designs
+that mix a physical uplink with a tunnel transport.
+
 xpf models multi-WAN the way real SRX does — as the composition of
 existing subsystems, not an invented `services multi-wan` tree:
 
