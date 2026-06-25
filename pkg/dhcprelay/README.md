@@ -207,8 +207,25 @@ OFFER/ACK to forward in the first place; clients still dedupe on
   join the REUSEPORT group unfiltered and steal other interfaces' packets.
 - **`SO_BROADCAST` on the client listener** so broadcast OFFER/ACK replies
   to `255.255.255.255:68` are delivered (Linux returns `EACCES` on a
-  limited-broadcast `sendto` without it). The server conn (bound to
-  `giaddr:0`) sets none of these — it has a unique ephemeral port.
+  limited-broadcast `sendto` without it). The server conn does not set
+  `SO_BROADCAST` (server replies to the relay are unicast) or
+  `SO_BINDTODEVICE` (the routed reply may arrive via the WAN path, not the
+  client interface).
+- **Server-facing socket binds `giaddr:67` (BOOTPS), not an ephemeral port
+  (#2888).** RFC 2131 §4.1 specifies a server unicasts its reply back to the
+  relay agent at the `giaddr` it saw in the relayed request, destination port
+  `67` (BOOTPS) — **not** the relay's source port. A strict-RFC server
+  therefore sends `OFFER`/`ACK` to `giaddr:67`; if the relay's server conn sat
+  on an ephemeral port (`giaddr:0`, the pre-#2888 behavior) nothing listened on
+  `giaddr:67` and the reply was dropped, so a relayed lease never completed with
+  a strict server. The server conn now binds `giaddr:67` and sets
+  `SO_REUSEADDR` + `SO_REUSEPORT` — **required**, because the client listener
+  already holds `0.0.0.0:67`; a second `:67` bind (even to the distinct,
+  specific `giaddr`) would otherwise fail `EADDRINUSE`. The two sockets do not
+  steal each other's traffic: the client listener is `SO_BINDTODEVICE`-pinned to
+  the LAN interface and the server conn binds the **specific** unicast `giaddr`,
+  so the kernel delivers a unicast datagram destined to `giaddr:67` to the
+  address-specific socket in preference to the wildcard listener.
 - **Bounded, deterministic `Stop()`.** Reads use the blocking
   `net.PacketConn.ReadFrom`; a close-on-cancel watcher (started after both
   conns exist) closes BOTH conns when the relay context is cancelled, so a
@@ -246,8 +263,8 @@ OFFER/ACK to forward in the first place; clients still dedupe on
   permanently. The interface is re-looked-up every attempt (no stale cached
   index).
 - **Socket bind/listen retry (#2787).** A *transient* failure to open the
-  client listener (`0.0.0.0:67`) or the giaddr server conn — interface not yet
-  up, its IPv4 not yet bound, or port 67 momentarily busy on a quick reload —
+  client listener (`0.0.0.0:67`) or the `giaddr:67` server conn — interface not
+  yet up, its IPv4 not yet bound, or port 67 momentarily busy on a quick reload —
   is **not terminal**. `runRelaySession` returns `sessionRetry`, and the
   supervisor (`runRelay`) waits the same bounded, `ctx`-cancelable
   `retryInterval` and rebuilds, so the relay recovers on that interface once

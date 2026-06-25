@@ -180,10 +180,12 @@ type interfaceRelay struct {
 //
 //   - ifaceName: when non-empty, SO_BINDTODEVICE binds the socket to that
 //     interface (required on the client conn so REUSEPORT fanout is filtered
-//     per-interface). Empty for the server conn (which binds a unique giaddr
-//     ephemeral port and needs no device binding).
+//     per-interface). Empty for the server conn, which binds a specific
+//     giaddr:67 (#2888) and is steered by the unicast destination address, not
+//     by a device binding.
 //   - reusePort: when true, SO_REUSEADDR+SO_REUSEPORT are set so multiple
-//     client listeners coexist on 0.0.0.0:67.
+//     client listeners coexist on 0.0.0.0:67, and so the server conn's
+//     giaddr:67 bind (#2888) coexists with the client listener's 0.0.0.0:67.
 //   - broadcast: when true, SO_BROADCAST is set so the socket can send to
 //     255.255.255.255 (the client conn's broadcast reply path).
 //   - bindAddr: the local address to bind.
@@ -810,10 +812,28 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	}
 	defer conn.Close()
 
-	// Server conn: bound to giaddr ephemeral port. No REUSEPORT, no
-	// BINDTODEVICE (unique port), no broadcast.
-	serverConn, err := m.newConn(sctx, "", false, false,
-		&net.UDPAddr{IP: giaddr, Port: 0})
+	// Server conn: bound to giaddr:67 (BOOTPS), NOT an ephemeral port (#2888).
+	// RFC 2131 §4.1 specifies a server unicasts its reply back to the relay
+	// agent at the giaddr it saw in the relayed request, destination port 67
+	// (BOOTPS) — NOT the relay's source port. A strict-RFC server therefore
+	// sends OFFER/ACK to giaddr:67; if the relay's server-facing socket sits on
+	// an ephemeral port nothing is listening on giaddr:67 and the reply is
+	// dropped, so a relayed lease never completes with a strict server. Bind the
+	// server conn to :67 so the giaddr-side reply is received.
+	//
+	// SO_REUSEADDR/SO_REUSEPORT (reusePort=true) is REQUIRED: the client-facing
+	// listener already holds 0.0.0.0:67 (REUSEPORT). A second bind on port 67 —
+	// even to the distinct, specific giaddr — would otherwise fail EADDRINUSE.
+	// The two sockets do not steal each other's traffic: the client listener is
+	// SO_BINDTODEVICE-pinned to the LAN interface (and receives client
+	// broadcasts/limited-broadcast there), while the server conn binds the
+	// SPECIFIC unicast giaddr — the kernel delivers a unicast datagram destined
+	// to giaddr:67 to the address-specific socket in preference to the wildcard
+	// listener. No BINDTODEVICE (the reply arrives via the routed WAN path, not
+	// necessarily the client interface) and no broadcast (server replies to the
+	// relay are unicast).
+	serverConn, err := m.newConn(sctx, "", true, false,
+		&net.UDPAddr{IP: giaddr, Port: relayPort})
 	if err != nil {
 		// #2787: likewise transient — the giaddr may have just been removed
 		// (interface flap) or the ephemeral bind momentarily failed. Retry

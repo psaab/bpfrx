@@ -939,8 +939,9 @@ reserved for whole-dataplane selection where a rewrite shim
       (success-substring matcher; default good/nochg/ok/true/updated).
     - checkip (opt-in, behind-NAT address source): `checkip-url` +
       `checkip-allowlist` (comma/space bogus addresses to ignore, e.g. the
-      embedded `1.1.1.1` in a /cdn-cgi/trace page). The per-interface binding's
-      `address-source` enum gains `checkip`.
+      embedded `1.1.1.1` in a /cdn-cgi/trace page; a malformed token is no
+      longer silently dropped — it warns at commit, naming the token, #2839).
+      The per-interface binding's `address-source` enum gains `checkip`.
   - **Security** (plan §8.1): every credential is `config.Secret` (revealed only
     at the transport boundary, never in a URL/error/log; `DDNSProvider.String()`
     redacts all of them); HTTPS with system-trust cert+hostname verification
@@ -952,12 +953,37 @@ reserved for whole-dataplane selection where a rewrite shim
     hard reject). A malformed `checkip-url` (not an http(s) URL with a host —
     e.g. `ftp://`, `not a url`, host-less `http://`) also warns at commit
     (#2773); the scheme check is case-INSENSITIVE per RFC 3986 §3.1, so an
-    uppercase/mixed-case `HTTPS://host` is accepted, not warned (#2842). Without
-    the commit-time check the typo committed silently and the runtime fetch then
-    masqueraded forever as a transient observation failure, suppressing
-    publishing indefinitely. The runtime `ddns.CheckIP` gate
-    (`validateCheckIPURL`) fails closed on the same malformed URL regardless, so
-    a URL that slips past commit cannot reach a fetch. Regression coverage:
+    uppercase/mixed-case `HTTPS://host` is accepted, not warned (#2842). A
+    malformed generic `url-template` (no host / wrong scheme) likewise warns at
+    commit (#2841, mirror `ddnsGenericURLTemplateValid`) — previously it was
+    validated PREFIX-ONLY (a bare `HasPrefix` http(s):// with no host parse), so
+    a host-less template committed silently and only failed at the first publish.
+    That validator is deliberately TEMPLATE-AWARE and string-based (not
+    `net/url`): it extracts the scheme + host and tolerates the inadyn
+    `%h/%i/%u/%p` specifiers (including a credential in the userinfo, e.g.
+    `https://user:%p@host/upd`, which would make `url.Parse` fail) and `{{...}}`
+    placeholders in the rest of the URL — same rationale as `RedactURL` (#2781).
+    Both the commit mirror and the runtime gate `TrimSpace` the template before
+    validating so they stay byte-for-byte in lockstep (a leading-whitespace
+    template must not warn while the runtime trims+accepts it). The malformed
+    template is `RedactURL`'d in the warning message (it may carry a credential).
+    Without the commit-time check the typo committed silently and the runtime
+    fetch then masqueraded forever as a transient observation failure,
+    suppressing publishing indefinitely. The runtime `ddns.CheckIP` gate
+    (`validateCheckIPURL`) and the generic backend's `validateGenericURLTemplate`
+    (in `newGenericBackend`) fail closed on the same malformed URL regardless, so
+    a URL that slips past commit cannot reach a fetch. A malformed
+    `checkip-allowlist` token (operator typo, e.g. `8.8.8.8x`) also warns at
+    commit and NAMES the offending token (#2839); the allowlist is a bogus-IP
+    safety gate, so a token that was previously SILENTLY DROPPED shrank the gate
+    and let the checkip parser admit the very IP the operator meant to suppress.
+    Valid tokens are still retained; the runtime parse
+    (`ddns.ParseAllowlistChecked`) mirrors this and fails lenient — it drops the
+    bad token, keeps the valid entries, and logs ONCE per `(provider, allowlist)`
+    in the surface-A observer (the per-poll-tick path must not flood). The
+    commit-warn parse is mirrored in `ddnsAllowlistMalformedTokens`
+    (`compiler_validate_warn.go`) because `pkg/ddns` imports `pkg/config`.
+    Regression coverage:
     `pkg/config/compiler_p3_http_providers_test.go`,
     `pkg/ddns/backend_http_test.go` / `backend_cloudflare_test.go` /
     `backend_route53_test.go` / `sigv4_test.go` / `checkip_test.go` /

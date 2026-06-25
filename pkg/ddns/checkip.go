@@ -195,21 +195,42 @@ func isAllowlisted(a netip.Addr, allowlist []netip.Addr) bool {
 	return false
 }
 
-// ParseAllowlist parses a comma/space-separated list of bogus addresses into a
-// slice for CheckIP. Unparseable entries are skipped. Convenience for the daemon
-// wiring (the provider/global config carries the allowlist as a string).
-func ParseAllowlist(s string) []netip.Addr {
+// ParseAllowlistChecked parses a comma/space-separated list of bogus-IP
+// addresses into a slice for CheckIP and ALSO returns the tokens that failed to
+// parse. The allowlist is a safety gate: an operator typo (e.g. "8.8.8.8x")
+// must not be silently discarded, or the checkip parser accepts a bogus/anycast
+// IP the operator meant to suppress — exactly the class the allowlist exists to
+// prevent (#2839). Callers surface the malformed tokens (commit-time warning in
+// the config compiler; once-per-provider runtime log in the daemon wiring).
+func ParseAllowlistChecked(s string) (list []netip.Addr, malformed []string) {
 	if strings.TrimSpace(s) == "" {
-		return nil
+		return nil, nil
 	}
 	fields := strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' })
 	out := make([]netip.Addr, 0, len(fields))
 	for _, f := range fields {
-		if a, err := netip.ParseAddr(strings.TrimSpace(f)); err == nil {
+		tok := strings.TrimSpace(f)
+		if tok == "" {
+			continue
+		}
+		if a, err := netip.ParseAddr(tok); err == nil {
 			out = append(out, a.Unmap())
+		} else {
+			malformed = append(malformed, tok)
 		}
 	}
-	return out
+	return out, malformed
+}
+
+// ParseAllowlist parses a comma/space-separated list of bogus addresses into a
+// slice for CheckIP. Unparseable entries are skipped (use ParseAllowlistChecked
+// to also recover the malformed tokens — the daemon and compiler surface them so
+// a typo can no longer silently shrink the safety gate, #2839). Convenience for
+// the daemon wiring (the provider/global config carries the allowlist as a
+// string).
+func ParseAllowlist(s string) []netip.Addr {
+	list, _ := ParseAllowlistChecked(s)
+	return list
 }
 
 // AddressSourceCheckIP is the per-scope selection for the external checkip source
