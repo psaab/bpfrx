@@ -97,6 +97,14 @@ var (
 		{fieldLastSwitched, 4},
 		{fieldSrcMask, 1},
 		{fieldDstMask, 1},
+		// #2749: ingressInterface (IN_SNMP, IE 10) re-introduced with a REAL
+		// value — the ingress ifindex carried on the SESSION_CLOSE frame
+		// since #2615. Placed before the post-NAT tuple so the latter stays
+		// the trailing block (#2526 invariant); the proto->packet-counter
+		// adjacency the #2613 fail-on-revert pin checks is preserved either
+		// way. The other four #2613 drops (SrcTos 5 / TCPFlags 6 /
+		// OutputSNMP 14 / Direction 61) remain absent — no wire source yet.
+		{fieldInputSNMP, 4},
 		// #2526: post-NAT (translated) tuple, appended last.
 		{fieldPostNatSrcIPv4, 4},
 		{fieldPostNatDstIPv4, 4},
@@ -115,6 +123,8 @@ var (
 		{fieldLastSwitched, 4},
 		{fieldIPv6SrcMask, 1},
 		{fieldIPv6DstMask, 1},
+		// #2749: ingressInterface (IN_SNMP, IE 10) — see the V4 template note.
+		{fieldInputSNMP, 4},
 		// #2526: post-NAT (translated) tuple, appended last (v6 addrs 16B).
 		{fieldPostNatSrcIPv6, 16},
 		{fieldPostNatDstIPv6, 16},
@@ -301,6 +311,11 @@ func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time,
 	off++
 	b[off] = r.DstMask
 	off++
+	// #2749: ingressInterface (IN_SNMP, IE 10) — the SNMP ifIndex of the
+	// session's ingress binding (real value via #2615). Written before the
+	// post-NAT tuple to match the template field order.
+	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
+	off += 4
 	// #2526: post-NAT (translated) tuple — 225/226/227/228.
 	natSrc4 := r.NATSrcIP.To4()
 	natDst4 := r.NATDstIP.To4()
@@ -356,6 +371,9 @@ func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time,
 	off++
 	b[off] = r.DstMask
 	off++
+	// #2749: ingressInterface (IN_SNMP, IE 10) — see encodeRecordV4.
+	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
+	off += 4
 	// #2526: post-NAT (translated) tuple — 281/282 (16B) + 227/228 (2B).
 	natSrc16 := r.NATSrcIP.To16()
 	natDst16 := r.NATDstIP.To16()
@@ -482,16 +500,18 @@ func (e *Exporter) ExportSessionClose(rec logging.EventRecord, evt SessionCloseD
 		evt.SrcIP, evt.DstIP, evt.SrcPort, evt.DstPort,
 		evt.NATSrcIP, evt.NATDstIP, evt.NATSrcPort, evt.NATDstPort)
 	fr := FlowRecord{
-		SrcIP:      evt.SrcIP,
-		DstIP:      evt.DstIP,
-		SrcPort:    evt.SrcPort,
-		DstPort:    evt.DstPort,
-		Protocol:   evt.Protocol,
-		Packets:    rec.SessionPkts,
-		Bytes:      rec.SessionBytes,
-		StartTime:  startTime,
-		EndTime:    rec.Time,
-		IsIPv6:     evt.IsIPv6,
+		SrcIP:     evt.SrcIP,
+		DstIP:     evt.DstIP,
+		SrcPort:   evt.SrcPort,
+		DstPort:   evt.DstPort,
+		Protocol:  evt.Protocol,
+		Packets:   rec.SessionPkts,
+		Bytes:     rec.SessionBytes,
+		StartTime: startTime,
+		EndTime:   rec.Time,
+		IsIPv6:    evt.IsIPv6,
+		// #2749: ingress ifindex (SNMP ifIndex) -> NetFlow IE 10.
+		InIf:       evt.InIf,
 		NATSrcIP:   natSrcIP,
 		NATDstIP:   natDstIP,
 		NATSrcPort: natSrcPort,

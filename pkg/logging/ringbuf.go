@@ -506,6 +506,10 @@ func (er *EventReader) logEvent(data []byte) {
 		closeReasonCode = data[134]
 
 		rec.IngressIface = er.resolveIfName(ifindex)
+		// #2749: retain the raw numeric ifindex so the flow exporters can
+		// populate ingressInterface (NetFlow IE 10 / IPFIX ingressInterface),
+		// which is an SNMP ifIndex value, not the resolved name.
+		rec.IngressIfindex = ifindex
 		rec.AppName = er.resolveAppName(appID)
 		rec.CloseReason = closeReasonName(closeReasonCode)
 	}

@@ -68,10 +68,10 @@ func TestParseCheckIPBodyV6First(t *testing.T) {
 
 // TestIsPublicAddrSpecialPurpose is the #2774 fail-on-revert gate for the
 // public-address gate. Every IANA special-purpose range the checkip endpoint
-// could return must be REJECTED (isPublicAddr == false), and a genuine
+// could return must be REJECTED (IsPublicAddr == false), and a genuine
 // globally-routable unicast address must be ACCEPTED. This goes RED if the
 // specialPurposeV4/V6 prefix tables (or the stdlib predicate guards) are
-// removed from isPublicAddr: each rejected entry below would then be accepted.
+// removed from IsPublicAddr: each rejected entry below would then be accepted.
 func TestIsPublicAddrSpecialPurpose(t *testing.T) {
 	reject := []string{
 		// IPv4 special-purpose (IANA registry).
@@ -110,8 +110,8 @@ func TestIsPublicAddrSpecialPurpose(t *testing.T) {
 	}
 	for _, s := range reject {
 		a := netip.MustParseAddr(s).Unmap()
-		if isPublicAddr(a) {
-			t.Errorf("isPublicAddr(%s) = true, want false (special-purpose range)", s)
+		if IsPublicAddr(a) {
+			t.Errorf("IsPublicAddr(%s) = true, want false (special-purpose range)", s)
 		}
 	}
 	accept := []string{
@@ -125,8 +125,8 @@ func TestIsPublicAddrSpecialPurpose(t *testing.T) {
 	}
 	for _, s := range accept {
 		a := netip.MustParseAddr(s).Unmap()
-		if !isPublicAddr(a) {
-			t.Errorf("isPublicAddr(%s) = false, want true (globally-routable unicast)", s)
+		if !IsPublicAddr(a) {
+			t.Errorf("IsPublicAddr(%s) = false, want true (globally-routable unicast)", s)
 		}
 	}
 }

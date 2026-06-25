@@ -81,6 +81,22 @@ queues. See PR #1243's kill record for why i40e doesn't reshape.
 
 ## Gotchas
 
+- `reconcile_status_bindings` has two arms. When `should_run_afxdp`
+  holds it runs `Coordinator::reconcile` then surfaces the result. When
+  it does NOT (forwarding disarmed / unsupported) it `stop()`s every
+  worker and then routes the per-binding status through
+  `refresh_bindings` — which sends each now-workerless slot through
+  `zero_unbound_slot`, clearing the FULL survivor set
+  (`socket_ifindex`/`socket_queue_id`/`socket_bind_flags`,
+  `flow_cache_capacity`, `active_flow_count`, every counter gauge, the
+  latency histograms, plus `bound`/`xsk_registered`/`xsk_bind_mode`/
+  `zero_copy`/`socket_fd`/`ready`/`last_error`) and rebuilds the CoS
+  owner→worker map empty. This is the SAME tail the `no_snapshot`
+  reconcile arm runs (#2515). Do NOT replace it with a hand-clear of a
+  subset of fields: #2794 was exactly that bug — the disarmed arm left
+  `socket_ifindex`/`queue_id`/`bind_flags` + `flow_cache_capacity`/
+  `active_flow_count` stale, so `show` reported a disarmed slot as if
+  still bound on its old queue.
 - `defer_workers=true` requests skip the worker spawn until the next
   reconcile. Used during RETH MAC programming so workers don't bind to
   an interface that's about to drop and re-add its MAC.
