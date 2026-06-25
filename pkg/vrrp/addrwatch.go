@@ -30,7 +30,12 @@ func (m *Manager) ensureAddrWatcherLocked() {
 	}
 	m.addrWatcherRunning = true
 	m.addrWatcherStarts++
-	go m.runAddrWatcher()
+	// Pin the current run-generation stop channel (#2625): a
+	// Stop()->Start() cycle re-allocates m.watcherStop, so the watcher must
+	// cancel on, and clear its latch against, its OWN generation rather than
+	// reading the live field which a later Start() may have replaced.
+	stop := m.watcherStop
+	go m.runAddrWatcher(stop)
 }
 
 // runAddrWatcher subscribes to netlink address updates and re-resolves the
@@ -49,27 +54,30 @@ func (m *Manager) ensureAddrWatcherLocked() {
 // correctness. On subscribe failure or an unexpected subscription close the
 // latch is cleared so a later UpdateInstances can retry the subscribe
 // (self-healing, one short-lived goroutine per ~2s reconcile at worst).
-func (m *Manager) runAddrWatcher() {
+func (m *Manager) runAddrWatcher(stop chan struct{}) {
+	// Clear the latch on ANY exit (subscribe failure, subscription close,
+	// Stop() cancellation) so a later UpdateInstances can re-spawn the
+	// watcher on a reused Manager (#2625) and self-heal after a transient
+	// subscribe failure (#2528).
+	defer m.clearAddrWatcherLatch(stop)
 	ch := make(chan netlink.AddrUpdate, 64)
-	if err := m.subscribeAddrs(ch, m.watcherStop); err != nil {
+	if err := m.subscribeAddrs(ch, stop); err != nil {
 		slog.Warn("vrrp: address subscribe failed, advert source will not auto-refresh on address change", "err", err)
-		m.clearAddrWatcherLatch()
 		return
 	}
 	slog.Info("vrrp: address watcher started (advert source re-resolution)")
 	for {
 		select {
-		case <-m.watcherStop:
+		case <-stop:
 			return
 		case u, ok := <-ch:
 			if !ok {
 				select {
-				case <-m.watcherStop:
+				case <-stop:
 					return
 				default:
 				}
 				slog.Warn("vrrp: address subscription closed, advert source will not auto-refresh on address change")
-				m.clearAddrWatcherLatch()
 				return
 			}
 			m.reresolveAddrFor(u.LinkIndex)
@@ -78,11 +86,18 @@ func (m *Manager) runAddrWatcher() {
 }
 
 // clearAddrWatcherLatch resets the singleton latch so a future
-// UpdateInstances can re-start the watcher after a subscribe failure or a
-// subscription close.
-func (m *Manager) clearAddrWatcherLatch() {
+// UpdateInstances can re-start the watcher after a subscribe failure, a
+// subscription close, or a Stop() (#2528, #2625).
+//
+// The stop arg is the generation token: the latch is cleared ONLY if it still
+// belongs to this watcher's generation (m.watcherStop unchanged since spawn).
+// After a Stop()->Start() the channel is re-allocated and a fresh watcher may
+// already be latched — a lingering old watcher must NOT reset that newer latch.
+func (m *Manager) clearAddrWatcherLatch(stop chan struct{}) {
 	m.mu.Lock()
-	m.addrWatcherRunning = false
+	if m.watcherStop == stop {
+		m.addrWatcherRunning = false
+	}
 	m.mu.Unlock()
 }
 
