@@ -1,6 +1,7 @@
 use io_uring::IoUring;
 use std::fs::OpenOptions;
 use std::io;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -387,9 +388,15 @@ fn write_packet_io_uring(ring: &mut IoUring, fd: i32, bytes: &[u8]) -> Result<()
 }
 
 pub(crate) fn open_tun(name: &str) -> Result<(std::fs::File, String), String> {
+    // O_CLOEXEC so the TUN fd is NOT inherited by any child process xpfd execs
+    // (frr-reload, ip, sysctl helpers, etc.) — a leaked TUN fd in a child both
+    // wastes a descriptor and pins the device open past helper exit (#2480).
+    // Rust's OpenOptions does NOT set O_CLOEXEC by default on Unix, so request
+    // it explicitly via custom_flags.
     let tun = OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(libc::O_CLOEXEC)
         .open("/dev/net/tun")
         .map_err(|e| format!("open /dev/net/tun: {e}"))?;
     let mut ifr = IfReq::new(name, IFF_TUN | IFF_NO_PI)?;

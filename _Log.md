@@ -1,5 +1,31 @@
 # Action Log
 
+## 2026-06-24 — #2480 fix: explicit O_CLOEXEC on the slow-path TUN open
+
+- **Timestamp**: 2026-06-24
+- **Action**: `open_tun` in `userspace-dp/src/slowpath.rs` opened
+  `/dev/net/tun` via `OpenOptions::new().read(true).write(true).open()`
+  without requesting `O_CLOEXEC`. Added
+  `.custom_flags(libc::O_CLOEXEC)` (and the `use
+  std::os::unix::fs::OpenOptionsExt;` import) so the close-on-exec intent
+  is explicit at the call site. Findings: Rust std ALSO sets `O_CLOEXEC`
+  under the hood for every `File`/`OpenOptions::open`, so the original
+  code was not actually leaking the TUN fd into child execs (frr-reload,
+  ip, sysctl) — verified by a test where a plain open already yields
+  FD_CLOEXEC. The explicit flag is therefore defense-in-depth /
+  intent-documenting hardening, robust to any future std change. The two
+  raw sockets in the same file (lines ~470/~517) already use
+  `SOCK_CLOEXEC`; no other unguarded fd opens found in slowpath.rs.
+- **Tests added**: `open_options_with_cloexec_sets_fd_cloexec` (exercises
+  the exact builder against a temp-file stand-in since /dev/net/tun needs
+  CAP_NET_ADMIN) and `cloexec_flag_round_trips_via_custom_flags` (syscall-
+  level fail-on-revert: `libc::open(O_CLOEXEC)` sets FD_CLOEXEC, plain
+  `libc::open` does not — proven to go red when O_CLOEXEC is removed).
+- **File(s)**: `userspace-dp/src/slowpath.rs`, `_Log.md`
+- **Validation**: `cargo build --release` clean (no new slowpath.rs
+  warnings); `cargo test --release --bin xpf-userspace-dp slowpath` =
+  14 passed; fail-on-revert confirmed by removing the flag.
+
 ## 2026-06-24 — #2646 fix: V_min cadence counter advanced before a confirmed pop
 
 - **Timestamp**: 2026-06-24
