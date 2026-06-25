@@ -1,3 +1,33 @@
+## 2026-06-24 — #2719 fix: stale pkg/daemon event-stream test fixture (post-#2467 wire widen)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed a red-on-master regression. #2467/PR#2716 widened the
+  session-event wire (open-frame header 24→30 bytes: OwnerRGID/EgressIfindex/
+  TXIfindex int16→int32; close-frame OwnerRGID 2→4) in
+  pkg/dataplane/userspace, but missed the pkg/daemon test fixture
+  `buildSessionOpenFrameV4PayloadForWiringTest`, which still hand-built a
+  56-byte v4 payload at the OLD 24-byte-header layout (IPs at offset 24).
+  Under the widened decoder the v4 minimum is 62 bytes, so the fixture frame
+  was rejected by `decodeSessionEvent` (DecodeErrors++, no callback, no ACK)
+  → `TestWireUserspaceEventStreamCallbacksStandaloneWiresSessionAndFullResync`
+  blocked on `read ack frame: i/o timeout`. ROOT CAUSE = stale TEST FIXTURE,
+  not a production bug: the daemon consumer (`SetOnEvent` in
+  daemon_ha_userspace.go) receives a pre-decoded SessionDeltaInfo from the
+  correctly-widened pkg/dataplane/userspace decoder — it never parses raw
+  bytes at fixed offsets. Rewrote the fixture to the new 62-byte v4 layout
+  (i32 identity fields at [10:22], IPs at offset 30) and seeded the three
+  identity fields with 40000 (> int16 max 32767) so the full daemon wire+ack
+  path round-trips a high ifindex per the #2467 intent. The #2467
+  fail-on-revert decode guard already lives on the correct side
+  (`TestDecodeSessionEventHighIfindex`, pkg/dataplane/userspace).
+- **Validation**: regression test GREEN 3x (was a 2s i/o timeout — confirmed
+  not flaky); `go build ./...` clean; `go test ./pkg/daemon/...` and
+  `go test ./pkg/dataplane/userspace/...` green; gofmt clean; go vet clean.
+- **Process note**: event-stream wire changes must gate on
+  `go test ./pkg/daemon/...`, not just `./pkg/dataplane/userspace/...` — the
+  fixture lives in the daemon package.
+- **File(s)**: `pkg/daemon/userspace_sync_test.go`, `_Log.md`.
+
 ## 2026-06-24 — #2701 review fold: end-to-end call-site test for the WG outer source
 
 - **Timestamp**: 2026-06-24
