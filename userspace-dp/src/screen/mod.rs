@@ -31,7 +31,8 @@
 //!                     `ScreenVerdict`, protocol/flag constants.
 //! - `syncookie`     — `SynCookieCodec`, `SipHash24`,
 //!                     `SynCookieValidatedCache`, all cookie types.
-//! - `rate`          — per-zone 1-second window `RateCounter`.
+//! - `rate`          — per-zone sliding 1-second window `RateCounter`
+//!                     (two-bucket counter; no fixed wall-second reset, #2937).
 //! - `stateless`     — side-effect-free packet-policy helpers.
 //! - `scan`          — port-scan + IP-sweep windowed trackers.
 //! - `session_limit` — per-IP session-count tracker.

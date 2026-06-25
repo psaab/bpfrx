@@ -128,7 +128,13 @@ previous, or next Unix wall-clock epoch overlap. The next-epoch candidate keeps
 failover stable when peer clocks straddle a 64-second boundary. A standby peer
 accepts a valid cookie ACK even when it has not locally observed the flood
 threshold; ACKs outside the transmitted-epoch window are prefiltered before
-SipHash, and plausible standby ACKs are rate-limited per zone per second.
+SipHash, and plausible standby ACKs are rate-limited per zone over a sliding
+1-second window. The limiter (`screen/rate.rs`) is a two-bucket sliding-window
+counter rather than a fixed wall-second window: the immediately preceding
+second's tally still contributes for the whole of the current second, so an
+attacker cannot double the plausible-ACK validation budget by straddling a
+wall-second boundary (#2937). The same counter type gates the ICMP/UDP/SYN
+flood screens.
 Invalid ACKs outside a local active flood window remain ordinary session-miss
 traffic instead of being counted as cookie failures.
 

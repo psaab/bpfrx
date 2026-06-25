@@ -1436,14 +1436,24 @@ fn inner_ip_len_after_decap(pkt: &[u8]) -> Option<usize> {
         }
         _ => return None,
     };
-    // The claimed length must fit inside what we decrypted, and the
-    // remaining bytes (the §5.4.6 padding) must all be zero.
+    // The claimed length must fit inside the AEAD-validated plaintext.
+    // `pkt` is the snow `read_message` output (ciphertext_len - 16 tag),
+    // so this bound rejects an inner header whose declared length lies
+    // about how many bytes were actually decrypted — the only real
+    // length invariant on the decap side (#2910).
     if claimed > pkt.len() {
         return None;
     }
-    if pkt[claimed..].iter().any(|&b| b != 0) {
-        return None;
-    }
+    // WG §5.4.6 trailing padding: the protocol is length-driven on
+    // receive. The receiver reads the inner-IP length and discards the
+    // remainder; it does NOT validate the padding bytes. The AEAD tag
+    // already authenticates the entire plaintext (including any
+    // padding), so non-zero padding cannot be forged by an attacker —
+    // rejecting it buys no security but breaks interop with peers whose
+    // padding is not all-zero (kernel WireGuard / wireguard-go do not
+    // require zero padding; a peer may randomize it for traffic-analysis
+    // resistance). Truncate to `claimed` and deliver; the pad bytes
+    // after it are dropped, never forwarded (#2910 / agy-review-053).
     Some(claimed)
 }
 

@@ -36,6 +36,35 @@
   TestReceiverIPv6_DropsCrossInterfaceAdvert process the cross-interface advert
   (RED). Both restored to GREEN. PARENT will run `make test-failover` (HA gate)
   before merge.
+## 2026-06-25 — #2937: screen flood + SYN-cookie standby-ACK rate limiting switched from fixed wall-second window to a sliding 1-second window
+
+- **Timestamp**: 2026-06-25
+- **Action**: `screen/rate.rs` `RateCounter::increment` was a fixed
+  wall-second window — it reset `count` to zero every time `now_secs`
+  advanced. That admitted a boundary double-burst: full budget at the end
+  of second N + full budget at the start of N+1 = ~2x the configured
+  threshold in a sub-millisecond straddle, defeating the ICMP/UDP/SYN
+  flood screens and letting the standby SYN-cookie ACK validator spend
+  ~2x the intended SipHash budget (codex-review-055 055-04). Fix: replaced
+  the single-bucket fixed window with a two-bucket sliding-window counter.
+  A second `prev_count` retains the immediately preceding second's tally;
+  admission gates on `prev_count + count <= threshold`, so the prior
+  second still counts for the whole of the current second and the trailing
+  1-second sum stays bounded across any boundary. A >=2-second gap clears
+  `prev_count` (no stale carryover). Hot path stays allocation-free and
+  integer-only. Signature (`now_secs`, `threshold`) and the `pub(super)
+  count` accessor are unchanged — no caller edits.
+- **File(s)**: userspace-dp/src/screen/rate.rs (sliding window + 4 unit
+  tests incl. FAIL-ON-REVERT boundary_double_burst_is_bounded);
+  userspace-dp/src/screen/tests.rs (icmp_flood + standby-ack window tests
+  rewritten to assert no boundary reset); userspace-dp/src/screen/mod.rs
+  (module doc); docs/syn-cookie-flood-protection.md (standby-ACK limiter
+  doc).
+- **Validation**: `cargo build --release -p xpf-userspace-dp` clean;
+  `cargo test screen` 136/136 + `screen::rate` 4/4 green. Fail-on-revert:
+  restoring the fixed-window `increment` makes
+  `boundary_double_burst_is_bounded` RED (tripped_after_boundary left:0
+  right:100 — fixed window admits all 2N).
 
 ## 2026-06-25 — #2918: neighbor initial dump consumed and dropped seq-0 multicast RTM_NEWNEIGH/DELNEIGH events
 
@@ -17589,6 +17618,24 @@ top.
   **File(s)**: pkg/ddns/backend_bind.go, pkg/ddns/backend_bind_test.go,
   pkg/ddns/README.md, _Log.md
 
+- **Timestamp**: 2026-06-25
+  **Action**: #2910 — WG native decap no longer rejects non-zero AEAD
+  padding. `inner_ip_len_after_decap` dropped the
+  `pkt[claimed..].any(|b| b != 0)` check: WG §5.4.6 padding is a
+  send-side rule; on receive the path is length-driven (read inner-IP
+  length, bound it against the AEAD-validated plaintext via
+  `claimed > pkt.len()`, truncate, discard the pad). The tag already
+  authenticates the padding so non-zero pad is not forgeable —
+  rejecting it bought no security and broke interop with kernel
+  WireGuard / wireguard-go. Added fail-on-revert test
+  `decap_accepts_nonzero_trailing_padding_and_bounds_to_inner_len`
+  (encrypts `40B IPv4 || 8 non-zero pad` via the session's snow
+  transport, decaps on the responder, asserts success + `dec.len == 40`
+  + pad never forwarded; RED=`MalformedInner` with the check restored,
+  verified). Gates: cargo build --release -p xpf-userspace-dp OK;
+  cargo test afxdp::wg 152 passed/0 failed.
+  **File(s)**: userspace-dp/src/afxdp/wg/engine.rs,
+  userspace-dp/src/afxdp/wg/tests.rs, docs/wireguard-interop.md, _Log.md
 ## #2892 — BGP policy `then as-path-prepend` (AS-path prepending)
 - **Timestamp**: 2026-06-25
 - **Action**: Implement Junos `then as-path-prepend "<asn> ..."` → FRR `set as-path prepend <asn> ...` end-to-end (schema typed leaf, typed struct field, compiler both AST paths, renderer). Add fail-on-revert render test + multi-ASN parse tests.
@@ -17689,3 +17736,44 @@ top.
   go vet ./pkg/ipsec/..., go test ./pkg/ipsec/... PASS.
 - **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/matchfamily_linklocal_test.go,
   pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix three FRR config-render bugs that break frr-reload (#2941,
+  #2942, #2943). #2941: a family-less IPv6 BGP neighbor with a policy was
+  activated under `address-family ipv4 unicast` — gate the ipv4 fall-through
+  on the peer address family and route a policied family-less IPv6 peer into
+  the ipv6 set. #2942: `isis bfd` was emitted AFTER the interface `exit` →
+  global scope → frr-reload reject; moved it inside the interface block before
+  `exit`, mirroring OSPFv3. #2943: `resolveRedistribute` now takes a `self`
+  arg and drops self-redistribution (bare token + policy-term `from protocol
+  <self>`), and `knownRedistProtocols` adds `ospf6`/`ripng`. Fail-on-revert
+  tests added for each; all proven RED without the fix. Gates: go build, gofmt
+  -l clean, go vet ./pkg/frr/... ./pkg/config/..., go test ./pkg/frr/...
+  ./pkg/config/... PASS.
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go, pkg/frr/README.md,
+  _Log.md
+- **Action**: Fix three REST query-filter bugs (#2934/#2935/#2939) — fail
+  closed on malformed filters, align protocol matching with gRPC/CLI, and
+  switch the event filter from substring to exact match.
+  - #2934: REST `zone` (uint16) and policy-match `dst_port` (int) filters
+    returned the default (0 = "no filter"/"any port") on a parse error,
+    silently widening the query — a cross-zone observability leak. Added
+    `queryUint16Strict`/`queryIntStrict` (api.go) that return (0,false) on
+    a malformed non-empty value; sessions/events `zone` and policy-match
+    `dst_port` now return HTTP 400, mirroring gRPC sessionFilter.validate.
+  - #2935: REST session `protocol` filter compared the rendered name
+    case-SENSITIVELY with no numeric form. Added `protoFilterMatches`
+    (sessions.go) — case-insensitive name OR numeric IP-proto — mirroring
+    gRPC/CLI. `tcp`/`TCP`/`6` all match TCP now.
+  - #2939: `EventFilter.matches` (pkg/logging/eventbuf.go) used
+    `strings.Contains` (substring) → `protocol=C` matched TCP+ICMP+ICMPv6.
+    Switched to `strings.EqualFold` exact match for Protocol and Action.
+  - Fail-on-revert proofs (copy-aside + revert, all RED without fix):
+    zone=abc/65536 → 200+leak; dst_port=abc → 200 false-PERMIT; proto
+    tcp/6 → 0 sessions; event protocol=C → 3 events, action=per → 2.
+  - Gates: go build ./..., go vet ./pkg/api/..., go test ./pkg/api/...,
+    ./pkg/logging/..., ./pkg/grpcapi/, ./pkg/cli/ PASS; gofmt clean on
+    touched files.
+- **File(s)**: pkg/api/api.go, pkg/api/sessions.go, pkg/api/security.go,
+  pkg/logging/eventbuf.go, pkg/api/rest_filter_failclosed_test.go,
+  pkg/api/README.md, _Log.md
