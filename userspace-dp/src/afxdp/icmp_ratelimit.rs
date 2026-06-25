@@ -25,10 +25,13 @@
 // bucket so a TTL-exceeded flood cannot starve the PTB or reject reasons (and
 // vice-versa) — per-reason isolation.
 //
-// Hot-path: the check is a single CAS loop over two atomics (token count +
-// last-refill timestamp). It runs ONLY on the cold generated-error path (per
-// TTL-exceeded / PTB / reject decision), never per forwarded packet, and never
-// allocates. On bucket-empty the generated reply is DROPPED and a per-reason
+// Hot-path: the check is a single CAS loop over ONE atomic word (a GCRA
+// theoretical-arrival-time; #2955 collapsed the prior split token-count +
+// timestamp pair into this single CAS so refill and consume commit together
+// and concurrent workers cannot double-credit / over-admit). It runs ONLY on
+// the cold generated-error path (per TTL-exceeded / PTB / reject decision),
+// never per forwarded packet, and never allocates. On bucket-empty the
+// generated reply is DROPPED and a per-reason
 // `*_rate_limited` counter (a global `AtomicU64`, surfaced via the coordinator
 // status the same way as `GRE_ENCAP_DF_OVERSIZE_DROPS`) is bumped so the
 // suppression is observable.
@@ -69,26 +72,36 @@ pub(in crate::afxdp) const DEFAULT_BURST: u64 = 1000;
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
-/// A lock-free token bucket. `tokens` is stored in MILLITOKENS (tokens * 1000)
-/// so that a sub-token-per-tick refill (the common case at nanosecond
-/// granularity) accumulates without integer-truncation starvation. `last_ns`
-/// is the monotonic timestamp of the last refill. Both are plain atomics; the
-/// `try_take` CAS loop keeps them mutually consistent without a lock.
+/// A lock-free GCRA (Generic Cell Rate Algorithm) token bucket. #2955: the
+/// state is a SINGLE atomic word — the "theoretical arrival time" (TAT) in
+/// monotonic nanos — so refill and consume commit together in one CAS. The
+/// previous implementation split the state into two independent atomics
+/// (`millitokens` + `last_ns`) and CAS-committed only `millitokens`, then
+/// published `last_ns` as a separate relaxed store. Two workers could observe
+/// the new (lower) token count with the OLD timestamp and credit the same
+/// refill interval twice (double-credit), or both observe the `last_ns == 0`
+/// first-use branch and each refill to full burst — over-admitting generated
+/// error replies past the configured rate and corrupting the
+/// `rate_limited_total` counters on the DoS boundary.
+///
+/// GCRA encodes the bucket as one number: as long as `tat - burst_horizon <=
+/// now`, a token is available, and a successful consume advances `tat` by one
+/// `interval`. Because `tat` is the entire state, there is no second field to
+/// tear against — the single CAS atomically refills AND consumes. This is the
+/// same single-TAT pattern used by `event_stream/producer.rs`.
 struct TokenBucket {
-    /// Available tokens * 1000. Capacity is `burst * 1000`.
-    millitokens: AtomicU64,
-    /// Monotonic nanos at the last refill.
-    last_ns: AtomicU64,
+    /// Theoretical arrival time (monotonic nanos). The whole limiter state.
+    /// Initialised to 0 so the first `burst` calls after boot pass (an
+    /// effectively-full bucket: `0 - horizon` saturates to 0 <= any `now`).
+    theoretical_arrival_ns: AtomicU64,
     /// Count of generated errors dropped because the bucket was empty.
     rate_limited: AtomicU64,
 }
 
 impl TokenBucket {
     const fn new() -> Self {
-        // Start full (burst * 1000) so the first burst after boot is allowed.
         TokenBucket {
-            millitokens: AtomicU64::new(DEFAULT_BURST * 1000),
-            last_ns: AtomicU64::new(0),
+            theoretical_arrival_ns: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
         }
     }
@@ -97,64 +110,52 @@ impl TokenBucket {
     /// generated reply MAY be sent) and false when the bucket is empty (the
     /// reply MUST be dropped + the per-reason counter bumped by the caller).
     ///
-    /// Refill is computed lazily from the elapsed time since `last_ns` at the
-    /// configured `rate_per_sec`, capped at `burst`. The whole operation is a
-    /// CAS loop over `millitokens`; `last_ns` advances monotonically.
+    /// GCRA: `interval_ns = 1e9 / rate_per_sec` is the steady-state spacing
+    /// between admitted replies; `burst_horizon_ns = (burst - 1) * interval`
+    /// is how far ahead of `now` the TAT may run while still admitting a
+    /// burst. The refill (advancing the admissible window as `now` grows) and
+    /// the consume (advancing `tat` by one interval) are committed TOGETHER in
+    /// a single `compare_exchange` over the one state word, so concurrent
+    /// workers can never double-credit or over-admit (#2955).
     fn try_take(&self, now_ns: u64, rate_per_sec: u64, burst: u64) -> bool {
-        let cap = burst.saturating_mul(1000);
         // A zero rate disables the bucket (unlimited) — never rate-limit. This
         // keeps the limiter opt-out-able via config without a branch at the
         // call site.
         if rate_per_sec == 0 {
             return true;
         }
+        // interval = nanos between admitted tokens at the steady rate. Round up
+        // so a high rate never collapses to a zero interval (which would admit
+        // unboundedly). A burst of 0 is treated as 1 (no negative horizon).
+        let interval_ns =
+            (NANOS_PER_SEC.saturating_add(rate_per_sec - 1) / rate_per_sec).max(1);
+        let burst_horizon_ns = interval_ns.saturating_mul(burst.saturating_sub(1));
+
+        let mut tat = self.theoretical_arrival_ns.load(Ordering::Relaxed);
         loop {
-            let last = self.last_ns.load(Ordering::Relaxed);
-            let cur = self.millitokens.load(Ordering::Relaxed);
-            // Compute the lazily-accrued refill since `last`. Guard against a
-            // non-monotonic / first-call (last == 0) sample.
-            let elapsed = now_ns.saturating_sub(last);
-            // refill_millitokens = elapsed_ns * rate_per_sec * 1000 / 1e9.
-            // Order the multiply to stay within u128 and avoid truncation.
-            let refill = ((elapsed as u128) * (rate_per_sec as u128) * 1000u128
-                / (NANOS_PER_SEC as u128)) as u64;
-            let refreshed = if last == 0 {
-                // First use: treat the bucket as full; do not credit a huge
-                // refill from the 0 epoch.
-                cap
-            } else {
-                cur.saturating_add(refill).min(cap)
-            };
-            if refreshed < 1000 {
-                // Less than one whole token even after refill — deny. Publish
-                // the refilled level + advance the timestamp so the accrual is
-                // not lost, but only when we actually moved time forward.
-                if refill > 0 || last == 0 {
-                    // best-effort: store refilled tokens and the new epoch.
-                    let _ = self.millitokens.compare_exchange(
-                        cur,
-                        refreshed,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
-                    self.last_ns.store(now_ns, Ordering::Relaxed);
-                }
+            // Bucket empty: the next admission would push the TAT more than the
+            // burst horizon ahead of the current time. Deny WITHOUT mutating
+            // state (a denied call must not advance the epoch — sibling tests
+            // and the far-future-drain pattern in reject_reply.rs rely on this).
+            if tat.saturating_sub(burst_horizon_ns) > now_ns {
                 return false;
             }
-            let after = refreshed - 1000;
-            // Commit the consume. On contention, retry with a fresh read.
-            if self
-                .millitokens
-                .compare_exchange(cur, after, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                // Advance the refill epoch only after a successful consume so a
-                // racing thread does not lose accrued time. Storing `now_ns`
-                // (not `last`) folds the just-applied refill into the epoch.
-                self.last_ns.store(now_ns, Ordering::Relaxed);
-                return true;
+            // Refill + consume in ONE value: clamp the TAT forward to `now`
+            // (this is the lazy refill — never let the bucket accrue more than
+            // `burst` worth of credit) and add one interval (the consume).
+            let next_tat = tat.max(now_ns).saturating_add(interval_ns);
+            match self.theoretical_arrival_ns.compare_exchange_weak(
+                tat,
+                next_tat,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                // Single CAS committed refill AND consume atomically.
+                Ok(_) => return true,
+                // CAS lost: another worker advanced the TAT concurrently. Retry
+                // with the observed value — never with stale split state.
+                Err(actual) => tat = actual,
             }
-            // CAS lost: another worker consumed/refilled concurrently; retry.
         }
     }
 }
@@ -207,13 +208,38 @@ pub(in crate::afxdp) fn rate_limited_count(reason: GeneratedErrorReason) -> u64 
     bucket_for(reason).rate_limited.load(Ordering::Relaxed)
 }
 
+/// #2955: serialises every test that drives the GLOBAL per-reason buckets.
+/// The buckets are process-wide statics shared across modules (this module's
+/// unit tests AND `poll_descriptor::reject_reply`'s tests), and the GCRA TAT
+/// advances monotonically and never travels backwards. So a
+/// `reset_bucket_for_test` from one test interleaved with a TAT advance / drain
+/// from another can starve a sibling (e.g. a drain-to-far-future leaves the
+/// Reject bucket denied for a concurrent success-path test). The old
+/// millitoken reset-to-full was order-independent and hid this; the
+/// race-immune single-word limiter is order-SENSITIVE under the cargo parallel
+/// runner, so the *tests* must serialise their reset→drive→assert window over
+/// the shared statics. Every global-bucket test holds this guard for its whole
+/// body. (Tests using a LOCAL `TokenBucket` — the #2955 concurrency guards —
+/// touch no shared state and do not take the lock.)
+#[cfg(test)]
+pub(in crate::afxdp) fn global_bucket_test_lock()
+-> std::sync::MutexGuard<'static, ()> {
+    use std::sync::Mutex;
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 pub(in crate::afxdp) fn reset_bucket_for_test(reason: GeneratedErrorReason, now_ns: u64) {
     let bucket = bucket_for(reason);
+    // GCRA: a full bucket at epoch `now_ns` is `tat == now_ns` (the next
+    // `burst` admissions all satisfy `tat - horizon <= now`). Tests that pin a
+    // FAR-FUTURE epoch then drain rely on this: after draining at `now_ns`,
+    // `tat` runs `burst * interval` ahead, and a later call at a SMALLER clock
+    // value stays denied (the GCRA window never travels backwards).
     bucket
-        .millitokens
-        .store(DEFAULT_BURST * 1000, Ordering::Relaxed);
-    bucket.last_ns.store(now_ns, Ordering::Relaxed);
+        .theoretical_arrival_ns
+        .store(now_ns, Ordering::Relaxed);
     bucket.rate_limited.store(0, Ordering::Relaxed);
 }
 
@@ -221,16 +247,13 @@ pub(in crate::afxdp) fn reset_bucket_for_test(reason: GeneratedErrorReason, now_
 mod tests {
     use super::*;
 
-    // Each test uses a distinct (reason, rate, burst) so the global buckets do
-    // not cross-contaminate across the parallel test runner. Where a test must
-    // own a reason's bucket it resets it first under a fixed epoch.
-
     /// A burst up to `burst` passes; the (burst+1)th within the same instant is
     /// rate-limited (dropped + counter bumped). FAIL-ON-REVERT: without the
     /// limiter every call returns true and `rate_limited` stays 0, so the
     /// `assert!(!allowed)` + counter assertion both fail.
     #[test]
     fn burst_beyond_capacity_is_rate_limited() {
+        let _g = global_bucket_test_lock();
         let reason = GeneratedErrorReason::TimeExceeded;
         let t0 = 1_000_000_000u64;
         reset_bucket_for_test(reason, t0);
@@ -260,6 +283,7 @@ mod tests {
     /// capacity.
     #[test]
     fn refill_over_time_restores_capacity() {
+        let _g = global_bucket_test_lock();
         let reason = GeneratedErrorReason::PacketTooBig;
         let t0 = 5_000_000_000u64;
         reset_bucket_for_test(reason, t0);
@@ -290,6 +314,7 @@ mod tests {
     /// the Reject bucket. FAIL-ON-REVERT for a single-shared-bucket regression.
     #[test]
     fn reasons_are_isolated() {
+        let _g = global_bucket_test_lock();
         let te = GeneratedErrorReason::TimeExceeded;
         let rj = GeneratedErrorReason::Reject;
         let t0 = 9_000_000_000u64;
@@ -308,10 +333,106 @@ mod tests {
         );
     }
 
+    /// #2955 FAIL-ON-REVERT: under heavy multi-thread contention at a FROZEN
+    /// first-use instant, the limiter must admit AT MOST `burst` tokens — never
+    /// more — regardless of interleaving. The pre-#2955 split-atomic
+    /// implementation (CAS `millitokens`, then a SEPARATE relaxed `last_ns`
+    /// store) let every worker that read while `last_ns == 0` (the boot epoch)
+    /// take the first-use branch and force `refreshed = cap`, each granting
+    /// itself a full burst — admitting MORE than `burst` total (a torn
+    /// refill/double-credit). With the GCRA single-CAS word, refill and consume
+    /// commit together, so the admitted count is hard-capped at `burst`.
+    ///
+    /// This mirrors the demonstrated race vector exactly: each trial starts from
+    /// `TokenBucket::new()` (TAT == 0, the boot/first-use state) and a start
+    /// barrier maximises the simultaneous-read window. Every call uses the SAME
+    /// frozen `now_ns`, so no real time elapses and the only legitimately
+    /// admissible tokens are the initial burst — any `total > burst` is the bug.
+    /// Verified RED against the split-atomic revert (admitted 51 > burst 50).
+    #[test]
+    fn concurrent_hammer_never_over_admits() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let now = 100_000_000_000u64;
+        let rate = 1000u64;
+        let burst = 50u64;
+        let threads = 16;
+        let calls_per_thread = 200u64;
+
+        for trial in 0..2000 {
+            let bucket = Arc::new(TokenBucket::new()); // TAT == 0 (boot/first-use)
+            let admitted = Arc::new(AtomicU64::new(0));
+            let barrier = Arc::new(Barrier::new(threads));
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    let bucket = Arc::clone(&bucket);
+                    let admitted = Arc::clone(&admitted);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        for _ in 0..calls_per_thread {
+                            if bucket.try_take(now, rate, burst) {
+                                admitted.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            let total = admitted.load(Ordering::Relaxed);
+            assert!(
+                total <= burst,
+                "trial {trial}: at a frozen first-use instant the limiter must \
+                 admit AT MOST the burst ({burst}); admitted {total} means a \
+                 split-atomic double-credit over-admit (the #2955 race)"
+            );
+        }
+    }
+
+    /// #2955 deterministic atomicity guard: a single successful `try_take`
+    /// advances the WHOLE state word by exactly one interval. If the refill and
+    /// consume were ever split back into two atomics, a reader between them
+    /// could observe an inconsistent (consumed-but-not-timestamped) state. Here
+    /// we assert the GCRA invariant directly: from a full bucket at `now`, after
+    /// `burst` admissions the TAT is exactly `now + burst * interval`, and the
+    /// next admission is denied without further advancing the word.
+    #[test]
+    fn single_word_state_advances_atomically() {
+        let now = 7_000_000_000u64;
+        let rate = 1000u64; // interval = 1ms
+        let burst = 8u64;
+        let interval = NANOS_PER_SEC / rate;
+
+        let bucket = TokenBucket::new();
+        bucket.theoretical_arrival_ns.store(now, Ordering::Relaxed);
+
+        for i in 0..burst {
+            assert!(bucket.try_take(now, rate, burst), "burst token {i}");
+            assert_eq!(
+                bucket.theoretical_arrival_ns.load(Ordering::Relaxed),
+                now + (i + 1) * interval,
+                "each admit advances the single state word by exactly one \
+                 interval — refill+consume committed together"
+            );
+        }
+        // Bucket empty at the frozen instant.
+        assert!(!bucket.try_take(now, rate, burst), "burst exhausted");
+        assert_eq!(
+            bucket.theoretical_arrival_ns.load(Ordering::Relaxed),
+            now + burst * interval,
+            "a denied call must NOT advance the state word"
+        );
+    }
+
     /// A zero rate disables the limiter (opt-out): always allowed, counter
     /// never moves.
     #[test]
     fn zero_rate_disables_limiter() {
+        let _g = global_bucket_test_lock();
         let reason = GeneratedErrorReason::Reject;
         let t0 = 12_000_000_000u64;
         reset_bucket_for_test(reason, t0);

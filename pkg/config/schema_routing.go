@@ -249,6 +249,7 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		"log-updown":       {desc: "Log up/down events", children: nil},
 		"multipath": {desc: "Multipath", children: map[string]*schemaNode{
 			"multiple-as": {desc: "Multiple AS", children: nil},
+			"ibgp":        {desc: "Enable iBGP multipath", children: nil},
 		}},
 		"damping": {desc: "Route damping", children: map[string]*schemaNode{
 			"half-life":    {desc: "Half life", args: 1, placeholder: "<minutes>", children: nil},

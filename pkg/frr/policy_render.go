@@ -732,6 +732,13 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			b.WriteString(" !\n address-family ipv4 unicast\n")
 			if bgpMaxPaths > 1 {
 				fmt.Fprintf(&b, "  maximum-paths %d\n", bgpMaxPaths)
+				// FRR `maximum-paths N` enables eBGP multipath only; iBGP
+				// multipath requires the separate `maximum-paths ibgp N`
+				// command, gated on the explicit `protocols bgp multipath
+				// ibgp` knob (#2978).
+				if bgp.MultipathIBGP {
+					fmt.Fprintf(&b, "  maximum-paths ibgp %d\n", bgpMaxPaths)
+				}
 			}
 			for _, n := range inet4Neighbors {
 				fmt.Fprintf(&b, "  neighbor %s activate\n", n.Address)
@@ -773,6 +780,10 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			b.WriteString(" !\n address-family ipv6 unicast\n")
 			if bgpMaxPaths > 1 {
 				fmt.Fprintf(&b, "  maximum-paths %d\n", bgpMaxPaths)
+				// iBGP multipath (#2978) — see the ipv4 block above.
+				if bgp.MultipathIBGP {
+					fmt.Fprintf(&b, "  maximum-paths ibgp %d\n", bgpMaxPaths)
+				}
 			}
 			for _, n := range inet6Neighbors {
 				fmt.Fprintf(&b, "  neighbor %s activate\n", n.Address)
