@@ -4,6 +4,7 @@ package networkd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -24,8 +25,11 @@ import (
 // (pkg/frr/manager.go reloadTimeout). #1794/#1800.
 const networkctlTimeout = 15 * time.Second
 
-// runNetworkctl runs `networkctl <args...>` under networkctlTimeout.
-func runNetworkctl(args ...string) error {
+// runNetworkctl runs `networkctl <args...>` under networkctlTimeout. It is a
+// package var so tests can stub the shell-out (the unit sandbox has no
+// systemd-networkd) and assert Apply's success/error contract without
+// depending on a real networkctl.
+var runNetworkctl = func(args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), networkctlTimeout)
 	defer cancel()
 	return exec.CommandContext(ctx, "networkctl", args...).Run()
@@ -175,22 +179,30 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 		}
 	}
 
-	// Write .netdev, .link, and .network files
+	// Write .netdev, .link, and .network files. Write failures are
+	// aggregated (#2987): we still attempt every generated file so a single
+	// blocked path does not silently skip the rest, then fail the Apply at
+	// the end so the commit cannot succeed against stale kernel state.
+	var writeErrs []error
+	write := func(path, content string) {
+		ch, err := writeIfChanged(path, content)
+		if err != nil {
+			writeErrs = append(writeErrs, err)
+			return
+		}
+		if ch {
+			changed = true
+		}
+	}
 	for _, ifc := range interfaces {
 		// .netdev file: for bond/LAG devices and bridge devices
 		if ifc.IsBond {
 			netdevPath := filepath.Join(m.networkDir, filePrefix+ifc.Name+".netdev")
-			netdevContent := m.generateNetdev(ifc)
-			if writeIfChanged(netdevPath, netdevContent) {
-				changed = true
-			}
+			write(netdevPath, m.generateNetdev(ifc))
 		}
 		if ifc.IsBridge {
 			netdevPath := filepath.Join(m.networkDir, filePrefix+ifc.Name+".netdev")
-			netdevContent := m.generateBridgeNetdev(ifc)
-			if writeIfChanged(netdevPath, netdevContent) {
-				changed = true
-			}
+			write(netdevPath, m.generateBridgeNetdev(ifc))
 		}
 
 		// .link file: only for managed physical interfaces with a MAC address.
@@ -199,18 +211,26 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 		// override the FPC-aware naming (e.g. ge-7-0-X on node1).
 		if ifc.MACAddress != "" && !ifc.Unmanaged {
 			linkPath := filepath.Join(m.networkDir, filePrefix+ifc.Name+".link")
-			linkContent := m.generateLink(ifc)
-			if writeIfChanged(linkPath, linkContent) {
-				changed = true
-			}
+			write(linkPath, m.generateLink(ifc))
 		}
 
 		// .network file: for all interfaces
 		networkPath := filepath.Join(m.networkDir, filePrefix+ifc.Name+".network")
-		networkContent := m.generateNetwork(ifc)
-		if writeIfChanged(networkPath, networkContent) {
-			changed = true
+		write(networkPath, m.generateNetwork(ifc))
+	}
+
+	if len(writeErrs) > 0 {
+		// Fail the commit (#2987). Still reload if some files changed so the
+		// kernel reflects whatever did get written, but surface the error.
+		if changed {
+			if err := runNetworkctl("reload"); err != nil {
+				writeErrs = append(writeErrs, fmt.Errorf("networkctl reload: %w", err))
+			} else {
+				restoreSlowPathRPFilter()
+			}
 		}
+		return fmt.Errorf("networkd: %d generated file(s) failed to write: %w",
+			len(writeErrs), errors.Join(writeErrs...))
 	}
 
 	if changed {
@@ -623,11 +643,18 @@ func orderAddresses(addrs []string, primaryAddr string) []string {
 }
 
 // writeIfChanged writes content to path only if the content differs from
-// the existing file. Returns true if the file was written.
-func writeIfChanged(path, content string) bool {
+// the existing file. It returns (changed, err): changed is true when the
+// file was actually written, and err is non-nil when the write failed.
+//
+// A write failure (read-only /etc, full disk, EACCES, blocked path) MUST
+// propagate so Apply can fail the commit (#2987) — fail-closed posture.
+// Previously the error was logged and swallowed as changed=false, which a
+// caller could not distinguish from "nothing changed", so the commit
+// succeeded while the kernel kept stale link/address/VRF state.
+func writeIfChanged(path, content string) (bool, error) {
 	existing, err := os.ReadFile(path)
 	if err == nil && string(existing) == content {
-		return false
+		return false, nil
 	}
 
 	// AtomicGeneratedConfig (#1894): .link/.network snippets are
@@ -636,9 +663,9 @@ func writeIfChanged(path, content string) bool {
 	// reconcile).
 	if err := fsatomic.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 		slog.Warn("failed to write networkd file", "path", path, "err", err)
-		return false
+		return false, fmt.Errorf("write %s: %w", path, err)
 	}
 
 	slog.Info("wrote networkd file", "path", path)
-	return true
+	return true, nil
 }

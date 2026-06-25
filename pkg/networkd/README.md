@@ -49,7 +49,23 @@ Standard library only.
   must be cheap.
 - Interfaces not in the typed config get `ActivationPolicy=always-down`
   in their `.network` file, so they stay down across reboots.
-- DHCP-marked interfaces skip address reconciliation entirely — the
-  daemon's DHCP client (`pkg/dhcp`) owns the address.
+- **DHCP is gated per-family (#2986).** A static address is suppressed
+  ONLY for the family whose DHCP client owns it: `DHCPv4` suppresses the
+  static IPv4 address(es), `DHCPv6` suppresses the static IPv6
+  address(es). The common WAN shape `DHCPv4 + static IPv6` (and the
+  mirror) installs the non-DHCP family's static address; do NOT re-gate
+  all addresses on whole-interface DHCP state. `generateNetwork`
+  classifies family by `addressIsIPv6` (colon test on the CIDR string).
 - VRF and tunnel interfaces created elsewhere are excluded from the
   unmanaged-interface scan via the `daemonOwned` map.
+- **`Apply` is fail-closed on write errors (#2987).** `writeIfChanged`
+  returns `(changed, err)`; `Apply` aggregates per-file write failures
+  (still attempting every generated file), reloads whatever did change,
+  then returns a non-nil error so `pkg/daemon` fails the commit rather
+  than reporting a clean commit against stale kernel state. A swallowed
+  write (read-only `/etc`, full disk, EACCES, blocked path) was a
+  fail-open hole.
+- **An empty desired set is NOT a no-op (#2988).** `Apply(nil)` (last
+  managed interface removed) still runs the `10-xpf-*` stale-file sweep
+  and requests a reload so old addresses/bonds/bridges/renames don't
+  resurrect — while preserving the `SetProtectedResolver` lifeline files.

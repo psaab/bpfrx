@@ -18087,3 +18087,17 @@ top.
 - **File(s)**: pkg/ddns/backend_duckdns.go, pkg/ddns/README.md,
   pkg/config/compiler_validate_warn.go,
   pkg/config/compiler_p3_http_providers_test.go, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: networkd batch fix #2986/#2987/#2988 — (a) gate static
+  Address= lines per-family on DHCPv4/DHCPv6 separately so DHCPv4+static-IPv6
+  (and mirror) installs the non-DHCP family address; (b) writeIfChanged
+  returns (changed,err) and Apply aggregates write failures + returns an
+  error so a swallowed write no longer reports clean-commit-against-stale
+  kernel (fail-closed); (c) Apply no longer early-returns on an empty
+  desired set — the stale 10-xpf-* sweep + reload now run when the last
+  managed interface is removed (protected lifeline files preserved). Added
+  addressIsIPv6 helper, made runNetworkctl a stubable package var. Six new
+  tests incl. fail-on-revert per bug; build/gofmt/vet/test green.
+- **File(s)**: pkg/networkd/networkd.go, pkg/networkd/networkd_test.go,
+  pkg/networkd/README.md, _Log.md
