@@ -491,6 +491,7 @@
     "destination_constrained": false,
     "destination_except": false,
     "destination_ports": [],
+    "destination_ports_except": [],
     "dscp_rewrite": null,
     "dscp_values": [],
     "forwarding_class": "",
@@ -507,6 +508,7 @@
     "source_constrained": false,
     "source_except": false,
     "source_ports": [],
+    "source_ports_except": [],
     "tcp_flags": null
   },
   "flow_export_snapshot": {

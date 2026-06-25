@@ -121,10 +121,20 @@ pub(super) fn term_matches_v4(
     ) {
         return false;
     }
-    if !port_match(term.source_port_constrained, &term.source_ports, src_port) {
+    if !port_match(
+        term.source_port_constrained,
+        term.source_port_except,
+        &term.source_ports,
+        src_port,
+    ) {
         return false;
     }
-    if !port_match(term.dest_port_constrained, &term.dest_ports, dst_port) {
+    if !port_match(
+        term.dest_port_constrained,
+        term.dest_port_except,
+        &term.dest_ports,
+        dst_port,
+    ) {
         return false;
     }
     if term.dscp_match_enabled && (term.dscp_bitmap & (1u64 << dscp)) == 0 {
@@ -185,22 +195,30 @@ fn nets_match_v6(constrained: bool, except: bool, nets: &[PrefixV6], ip: Ipv6Add
     nets.iter().any(|net| net.contains(ip)) ^ except
 }
 
-/// #2400 (032-19): match a port against a filter term's port matcher with
-/// fail-closed semantics for an all-malformed list.
+/// #2400 (032-19) + #2622: match a port against a filter term's port matcher
+/// with fail-closed semantics for an all-malformed list, and optional `except`
+/// inversion for the negated `source-port-except` / `destination-port-except`
+/// match.
 ///
 /// - `constrained == false` (the term carried no real port spec): the matcher
 ///   is `PortMatcher::Any` and matches any port — unchanged unscoped behavior.
+///   `except` is irrelevant: there is no port scope to invert.
 /// - `constrained == true` but the matcher is `PortMatcher::Any` (every
-///   configured port spec failed to parse, leaving zero ranges): match NOTHING
-///   — fail closed.
-/// - otherwise: the matcher's own range/set logic applies.
+///   configured port spec failed to parse, leaving zero ranges):
+///     * positive (`except == false`): match NOTHING — fail closed (#2400).
+///     * `except == true`: "match all ports EXCEPT {}" = match ALL — the Junos
+///       empty-except-set semantic (mirrors `nets_match_v4`).
+/// - otherwise: `matcher.matches(port) XOR except`. `except == false` is the
+///   plain positive membership; `except == true` matches every port NOT in the
+///   set.
 #[inline(always)]
-fn port_match(constrained: bool, matcher: &PortMatcher, port: u16) -> bool {
+fn port_match(constrained: bool, except: bool, matcher: &PortMatcher, port: u16) -> bool {
     if constrained && matches!(matcher, PortMatcher::Any) {
-        // Constrained but no range survived parsing -> fail closed.
-        return false;
+        // Constrained but no range survived parsing. Positive -> match nothing
+        // (fail closed). Except -> "all ports but none" = match all.
+        return except;
     }
-    matcher.matches(port)
+    matcher.matches(port) ^ except
 }
 
 #[inline(always)]
@@ -236,10 +254,20 @@ pub(super) fn term_matches_v6(
     ) {
         return false;
     }
-    if !port_match(term.source_port_constrained, &term.source_ports, src_port) {
+    if !port_match(
+        term.source_port_constrained,
+        term.source_port_except,
+        &term.source_ports,
+        src_port,
+    ) {
         return false;
     }
-    if !port_match(term.dest_port_constrained, &term.dest_ports, dst_port) {
+    if !port_match(
+        term.dest_port_constrained,
+        term.dest_port_except,
+        &term.dest_ports,
+        dst_port,
+    ) {
         return false;
     }
     if term.dscp_match_enabled && (term.dscp_bitmap & (1u64 << dscp)) == 0 {
