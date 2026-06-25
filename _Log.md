@@ -26,6 +26,29 @@
   removed, GREEN when restored.
 - **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
   userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md
+## 2026-06-25 — #2524: ring-entries max bound + power-of-two (commit + Rust backstop)
+
+- **Timestamp**: 2026-06-25
+- **Action**: `system dataplane ring-entries` was min-only
+  (`ValidateIntegerMin(1)`) — a large value committed and was handed to the
+  Rust helper, which preallocates ~3×ring_entries UMEM frames per binding
+  (~96 MB/binding at 8192), so an out-of-range value OOM'd at bring-up
+  instead of failing as a clean commit error (codex review-037 037-05).
+  Added `config.MaxRingEntries = 16384` + `ValidateRingEntries` (bounded
+  [1..16384] AND power-of-two), wired into the `ring-entries` schema leaf.
+  Rust backstop: `afxdp::MAX_RING_ENTRIES = 16384`, bring-up clamps to it
+  (`coordinator/reconcile/bringup.rs`), and the `--ring-entries` CLI parse
+  fails closed on out-of-range / non-power-of-two
+  (`server/lifecycle.rs::validate_ring_entries_arg`).
+- **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_system.go,
+  pkg/config/schema_validate_system_test.go,
+  pkg/config/schema_validate_2524_test.go,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/server/lifecycle.rs, docs/config-schema.md
+- **Validation**: go build/vet/test ./pkg/config (green); fail-on-revert
+  proven RED (flip to ValidateIntegerMin(1) → over-max + non-pow2 commit
+  clean); cargo build --release + 4 ring_entries unit tests pass.
 
 ## 2026-06-25 — #2620: PBR session-miss counts pre-PBR fall-through term once
 
