@@ -1,3 +1,23 @@
+## 2026-06-25 — #2890: eventengine runAction retry timer leak (time.After → time.NewTimer+Stop)
+
+- **Timestamp**: 2026-06-25
+- **Action**: fixed the lock-held retry select in `runAction`. The backoff
+  sleep used `case <-time.After(backoff)`, whose runtime timer cannot be
+  stopped — when `stopCh` fired before the backoff elapsed (daemon shutdown or
+  `Apply` churn) the armed timer leaked until it fired. With the doubling
+  backoff toward the 5 s ceiling, orphaned timers accumulate across restart
+  churn. Replaced with an explicit `time.NewTimer` + `Stop()` exposed through a
+  test-injectable `newRetryTimer`/`newTimerFn` seam; the stopCh branch now
+  stops the timer before returning. The #2868 engine-lifetime `lifeCtx` /
+  `commitContext` plumbing is preserved unchanged.
+- **File(s)**: pkg/eventengine/engine.go,
+  pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md
+- **Validation**: `go build ./...`, `gofmt -l pkg/eventengine` (clean),
+  `go vet ./pkg/eventengine/...`, `go test -race ./pkg/eventengine/...` (26
+  passed). Fail-on-revert proven: reverting the select to `time.After` makes
+  `TestRetry_TimerStoppedOnEngineStop` go RED (the injected `newTimerFn` seam
+  is never consulted on the stop branch).
+
 ## 2026-06-25 — #2923 (review fold, PR #2984 MINOR): forwardable-disposition tunnel-liveness gate
 
 - **Timestamp**: 2026-06-25

@@ -118,7 +118,17 @@ cannot occur.
   (200 ms → 5 s) up to a 60 s deadline, bumping
   `xpf_event_actions_retried_total`, instead of dropping. After the deadline it
   bumps `xpf_event_actions_dropped_total{reason="lock_held"}`. The sentinel is
-  matched with `errors.Is`, not a fragile string match.
+  matched with `errors.Is`, not a fragile string match. The backoff sleep uses
+  an explicit `time.NewTimer` + `Stop()` (via `newRetryTimer`), NOT
+  `time.After`: when `stopCh` fires before the backoff elapses (daemon shutdown
+  or `Apply` churn), the retry stops the timer immediately and releases the
+  runtime timer instead of leaking an armed timer until it fires (#2890). With
+  a doubling backoff toward the 5 s ceiling, orphaned `time.After` timers would
+  otherwise accumulate across restart churn. Regression-locked by
+  `TestRetry_TimerStoppedOnEngineStop` (fail-on-revert: it injects `newTimerFn`,
+  parks the worker in the retry select under a held lock, closes the engine, and
+  asserts the stop func was invoked — reverting to `time.After` never consults
+  the seam and the test goes RED).
 - **Bounded queue, dedup-by-policy:** the queue holds at most one pending
   action per policy — a newer trigger supersedes an older queued one (no value
   in applying a stale remediation twice). Overflow bumps
