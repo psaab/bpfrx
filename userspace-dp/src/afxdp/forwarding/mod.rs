@@ -1537,6 +1537,18 @@ pub(super) fn lookup_forwarding_resolution_v4(
             // else fall back to the per-destination hash.
             let spread_hash = ecmp_flow_hash.unwrap_or_else(|| ecmp_hash_v4(ip));
             let selected = select_route_next_hop(&route.next_hops, spread_hash, |nh| {
+                // #2923: tunnel candidates use TUNNEL liveness (endpoint +
+                // resolvable underlay), NOT the direct-neighbor gate they can
+                // never satisfy. Without this branch a live direct member in a
+                // mixed ECMP group starves the tunnel path.
+                if nh.tunnel_endpoint_id != 0 {
+                    return tunnel_next_hop_live(
+                        state,
+                        dynamic_neighbors,
+                        nh.tunnel_endpoint_id,
+                        depth,
+                    );
+                }
                 let target = nh.next_hop.unwrap_or(ip);
                 nh.ifindex > 0
                     && lookup_neighbor_entry(state, dynamic_neighbors, nh.ifindex, IpAddr::V4(target))
@@ -1698,6 +1710,18 @@ pub(super) fn lookup_forwarding_resolution_v6(
             // else fall back to the per-destination hash.
             let spread_hash = ecmp_flow_hash.unwrap_or_else(|| ecmp_hash_v6(ip));
             let selected = select_route_next_hop(&route.next_hops, spread_hash, |nh| {
+                // #2923: tunnel candidates use TUNNEL liveness (endpoint +
+                // resolvable underlay), NOT the direct-neighbor gate they can
+                // never satisfy. Without this branch a live direct member in a
+                // mixed ECMP group starves the tunnel path.
+                if nh.tunnel_endpoint_id != 0 {
+                    return tunnel_next_hop_live(
+                        state,
+                        dynamic_neighbors,
+                        nh.tunnel_endpoint_id,
+                        depth,
+                    );
+                }
                 let target = nh.next_hop.unwrap_or(ip);
                 nh.ifindex > 0
                     && lookup_neighbor_entry(state, dynamic_neighbors, nh.ifindex, IpAddr::V6(target))
@@ -2069,6 +2093,32 @@ fn ecmp_hash_flow_seeded(seed: u64, key: &crate::session::SessionKey) -> u64 {
 /// same liveness); when none are live, fall back to the same hashed pick
 /// over the full candidate vector so the kernel slow-path can drive
 /// ARP/NDP.
+/// #2923: ECMP candidate liveness for a TUNNEL next-hop.
+///
+/// A tunnel candidate (`tunnel_endpoint_id != 0`) is NOT a neighbor-resolved
+/// L2 next-hop on the logical tunnel ifindex, so the direct-neighbor liveness
+/// gate (`ifindex > 0 && lookup_neighbor_entry(...)`) always marks it dead.
+/// In a MIXED direct+tunnel ECMP group a live direct member makes `live > 0`,
+/// which restricts selection to direct candidates and starves the tunnel path
+/// even when its underlay is fully up.
+///
+/// A tunnel next-hop is live iff its endpoint exists and the OUTER transport
+/// resolves to a usable underlay — exactly the predicate
+/// `resolve_tunnel_outer` already encodes (endpoint present, outer not
+/// local-delivery, outer not a tunnel-interface recursion loop). Reusing that
+/// SSOT keeps tunnel liveness identical to what selection would later resolve
+/// via `resolve_tunnel_forwarding_resolution`, so a candidate marked live here
+/// will not blackhole on selection. `depth` is forwarded so the outer
+/// re-resolution honors the same next-table recursion budget as the caller.
+fn tunnel_next_hop_live(
+    state: &ForwardingState,
+    dynamic_neighbors: Option<&Arc<ShardedNeighborMap>>,
+    tunnel_endpoint_id: u16,
+    depth: usize,
+) -> bool {
+    resolve_tunnel_outer(state, dynamic_neighbors, tunnel_endpoint_id, depth).is_some()
+}
+
 fn select_route_next_hop<'a, T: Copy>(
     candidates: &'a [T],
     ip_hash: u64,

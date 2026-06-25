@@ -1,3 +1,31 @@
+## 2026-06-25 — #2923: ECMP type-aware liveness (tunnel vs direct next-hop)
+
+- **Timestamp**: 2026-06-25
+- **Action**: the ECMP liveness closure in `select_route_next_hop`
+  (v4 + v6 paths in `lookup_forwarding_resolution_v4/v6`) gated EVERY
+  candidate on the direct-neighbor predicate (`ifindex > 0 && a resolved
+  neighbor on that ifindex`). A TUNNEL next-hop (non-zero
+  `tunnel_endpoint_id`, the logical tunnel ifindex) has no neighbor for
+  the inner destination, so it always failed the gate. In a MIXED
+  direct+tunnel ECMP group a live direct member made `live > 0`,
+  restricting selection to direct candidates and STARVING the tunnel
+  path even when its underlay was up (tunnel-only groups still worked via
+  the `live == 0` fallback). Fixed: branch the closure on
+  `tunnel_endpoint_id` — a tunnel candidate is live iff
+  `resolve_tunnel_outer(...)` resolves a usable underlay (endpoint
+  present, outer not local-delivery, outer not a tunnel recursion loop),
+  the same SSOT selection later uses, so a live-marked tunnel candidate
+  never blackholes on selection. Direct-hop liveness unchanged; builds on
+  #2922's single-pass SmallVec (no double-eval reintroduced). Added a
+  fail-on-revert test `ecmp_mixed_direct_and_tunnel_selects_both_paths`:
+  a direct hop (ifindex 11) + GRE tunnel hop (endpoint 1, logical ifindex
+  362) on one inet.0 prefix; sweeping the per-flow hash must select BOTH
+  egresses 11 and 362. Reverting the v4 tunnel-liveness branch collapses
+  selection to 11 only → RED ("tunnel ECMP member must be selected").
+- **File(s)**: `userspace-dp/src/afxdp/forwarding/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding/tests.rs`, `docs/multi-wan.md`,
+  `_Log.md`
+
 ## 2026-06-25 — #2922: ECMP `select_route_next_hop` single liveness snapshot
 
 - **Timestamp**: 2026-06-25

@@ -2596,6 +2596,128 @@ fn ecmp_static_route_retains_all_next_hops_and_skips_dead() {
     );
 }
 
+/// #2923: a MIXED direct+tunnel ECMP group must select BOTH paths. The
+/// pre-fix liveness closure gated EVERY candidate on `ifindex > 0 &&
+/// neighbor-resolved-on-that-ifindex`. A tunnel next-hop is the logical
+/// tunnel ifindex with no neighbor for the inner destination, so it always
+/// failed that gate. With a live DIRECT member also present, `live > 0`
+/// restricted selection to the direct member and the tunnel path was
+/// starved — every flow pinned to the direct hop, the tunnel endpoint never
+/// selected even though its underlay was fully up.
+///
+/// The fix makes liveness type-aware: a tunnel candidate is live when its
+/// endpoint resolves a usable underlay (`resolve_tunnel_outer`). This test
+/// builds a direct hop (egress ifindex 11) plus a GRE tunnel hop (endpoint
+/// id 1, logical ifindex 362, IPv6 outer that resolves via reth0.80 with a
+/// live neighbor) on ONE inet.0 ECMP prefix, and asserts that sweeping the
+/// per-flow hash selects BOTH the direct egress (11) and the tunnel egress
+/// (362, carrying tunnel_endpoint_id 1).
+///
+/// FAIL-ON-REVERT: revert the tunnel-liveness branch in the v4 selection
+/// closure and the tunnel candidate is marked dead again; with the direct
+/// member live, selection collapses to ifindex 11 only and the tunnel egress
+/// assertion goes RED (tunnel starved).
+#[test]
+fn ecmp_mixed_direct_and_tunnel_selects_both_paths() {
+    // Base GRE fixture: tunnel endpoint id 1 on gr-0/0/0.0 (logical ifindex
+    // 362), IPv6 outer destination resolving via reth0.80 (ifindex 12) with
+    // a live outer neighbor (include_neighbor = true).
+    let mut snapshot = native_gre_snapshot(true);
+    // Add a DIRECT next-hop interface in a routable zone with a live neighbor.
+    snapshot.interfaces.push(crate::InterfaceSnapshot {
+        name: "ge-0/0/1".to_string(),
+        zone: "wan".to_string(),
+        linux_name: "ge-0-0-1".to_string(),
+        ifindex: 11,
+        hardware_addr: "02:00:00:00:00:11".to_string(),
+        addresses: vec![crate::InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "192.0.2.1/24".to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    });
+    snapshot.neighbors.push(crate::NeighborSnapshot {
+        interface: "ge-0-0-1".to_string(),
+        ifindex: 11,
+        family: "inet".to_string(),
+        ip: "192.0.2.2".to_string(),
+        mac: "00:11:22:33:44:77".to_string(),
+        state: "reachable".to_string(),
+        router: true,
+        link_local: false,
+    });
+    // One inet.0 ECMP prefix with a mixed direct + tunnel next-hop set.
+    snapshot.routes.push(crate::RouteSnapshot {
+        table: "inet.0".to_string(),
+        family: "inet".to_string(),
+        destination: "203.0.113.0/24".to_string(),
+        next_hops: vec![
+            "192.0.2.2@ge-0/0/1".to_string(), // direct
+            "@gr-0/0/0.0".to_string(),        // tunnel (endpoint id 1)
+        ],
+        discard: false,
+        next_table: String::new(),
+        preference: 5,
+    });
+    let state = build_forwarding_state(&snapshot);
+
+    // The FIB retains BOTH next-hops, and exactly one carries a tunnel id.
+    let route = &state.routes_v4.get("inet.0").expect("table")[0];
+    assert_eq!(route.next_hops.len(), 2, "ECMP route must retain both hops");
+    assert!(
+        route.next_hops.iter().any(|nh| nh.tunnel_endpoint_id == 1),
+        "the tunnel next-hop must carry tunnel_endpoint_id 1",
+    );
+    assert!(
+        route.next_hops.iter().any(|nh| nh.tunnel_endpoint_id == 0),
+        "the direct next-hop must carry no tunnel id",
+    );
+
+    // Sweep the per-flow hash; both the direct egress (11) and the tunnel
+    // egress (logical ifindex 362) must be selected. Pre-fix, the tunnel
+    // candidate is dead and selection collapses to 11 only.
+    let mut egresses = std::collections::BTreeSet::new();
+    let mut saw_tunnel_id = false;
+    for h in 0u64..64 {
+        let resolved = lookup_forwarding_resolution_v4(
+            &state,
+            None,
+            Ipv4Addr::new(203, 0, 113, 5),
+            "inet.0",
+            0,
+            true,
+            Some(h),
+        );
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate,
+            "both the direct and tunnel members must forward (live)",
+        );
+        egresses.insert(resolved.egress_ifindex);
+        if resolved.tunnel_endpoint_id == 1 {
+            saw_tunnel_id = true;
+            assert_eq!(
+                resolved.egress_ifindex, 362,
+                "a tunnel selection must egress the logical tunnel ifindex",
+            );
+        }
+    }
+    assert!(
+        egresses.contains(&11),
+        "the direct ECMP member (ifindex 11) must be selected",
+    );
+    assert!(
+        egresses.contains(&362),
+        "the tunnel ECMP member (logical ifindex 362) must be selected \
+         — RED pre-fix: the direct-neighbor gate starves the tunnel path",
+    );
+    assert!(
+        saw_tunnel_id,
+        "a tunnel selection must carry tunnel_endpoint_id 1",
+    );
+}
+
 /// #2734: ECMP must spread by the per-FLOW 5-tuple, not per-destination.
 ///
 /// Two equal-cost next-hops to the same prefix, BOTH neighbors live.
