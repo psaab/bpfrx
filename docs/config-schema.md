@@ -1560,3 +1560,56 @@ belongs: `resolve_cos_dscp_classifier_queue_id` / `resolve_cos_ieee8021_classifi
 (`tx/cos_classify.rs`) still mask the LIVE packet's DSCP/PCP to index the
 fixed-size table — the table is now built only from validated indices, so the
 mask just bounds the physically-limited wire field, it no longer aliases config.
+
+### #2448 — static-route destination + next-hop typed at commit
+
+`routing-options static route <destination>` and its `next-hop <gateway>`
+child are now typed so a malformed prefix or gateway fails the commit instead
+of installing silently and then vanishing from the dataplane.
+
+- **destination** — the `route` identity arg uses `keyValidator:
+  ValidateRouteDestination` (`keyValueType: ValueCIDR`), a family-agnostic
+  CIDR with a REQUIRED `/prefix-length`. The default routes `0.0.0.0/0` and
+  `::/0` parse via `net.ParseCIDR` and are accepted; a bare IP (no length), an
+  out-of-range mask (`/99`), or outright garbage is a commit error. v4 and v6
+  both pass because a static block holds either family.
+- **next-hop** — the `next-hop` gateway uses `keyValidator:
+  ValidateStaticNextHop` (`keyValueType: ValueIPAddress`). next-hop is modeled
+  as a CONTAINER node (like `qualified-next-hop`), NOT a typed value-leaf, so
+  the gateway is validated through the identity-arg keyValidator while the
+  optional `interface <iface>` CHILD still walks as a normal value-bearing
+  child. This matters: the compiler accepts an EXPLICIT egress interface on a
+  plain next-hop (for IPv6 link-local gateways) in BOTH the hierarchical
+  `next-hop fe80::50 { interface reth0.50; }` and the flat/inline
+  `next-hop fe80::50 interface reth0.50` shapes (compiler_routing.go). A
+  typed value-leaf would route the `interface` child through the presence-only
+  modifier path and reject the value token after `interface` as `unknown
+  modifier` — the #2448 over-rejection regression caught in review. Accepted
+  gateway values: a bare IPv4/IPv6 address (the FRR renderer emits it
+  verbatim, the Rust FIB parses it), a bare interface name (`ge-0-0-0.0`,
+  `reth0.50`, `eth1` — a valid Junos interface next-hop that FRR renders as an
+  interface route), and the Rust-FIB `ip@interface` / `@interface` spec (the
+  Junos lexer rejects `@`, so this form reaches only a programmatic caller,
+  but the validator classifies it correctly: the IP part, when present, must
+  parse, else the spec silently degrades to interface-only). Rejected: a
+  botched IP literal (`1.2.3.999`, `2001:db8::garbage`), an `ip@iface` whose
+  IP part does not parse, and any value that is neither a valid IP nor a
+  plausible interface name (`[A-Za-z0-9._-]`, at least one ASCII letter so a
+  numeric-only dotted token cannot masquerade as a name). The gateway is still
+  validated when an explicit `interface` is present — the keyValidator runs on
+  the gateway identity arg regardless of the child.
+- **what is NOT rejected** — a plain `next-hop <ip> interface <iface>` (the
+  link-local form above, both shapes); `discard` / `reject` / `next-table` /
+  `qualified-next-hop ... interface ...` are declared children of the `route`
+  node, so a no-next-hop blackhole/leak route and the link-local-IPv6
+  qualified-next-hop form still commit. `preference` is likewise declared.
+
+Before #2448 both leaves were accepted untyped: the Rust FIB builder
+(`userspace-dp forwarding_build/fib.rs populate_routes`) soft-skips a
+destination that parses as neither v4 nor v6 (no error, no counter), and the
+next-hop resolver falls back to ifindex 0 / interface-only on an unparseable
+spec — so an operator typo committed cleanly and then either never installed
+or installed a blackhole, with no signal. The SSOT is `staticRouteNode()` in
+`schema_routing.go`, shared by the `routing-options`, per-`rib`, and
+`routing-instances` static blocks. Regression + fail-on-revert tests:
+`pkg/config/schema_validate_route_2448_test.go`.
