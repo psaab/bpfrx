@@ -31,6 +31,190 @@
   (`left == right`, both `(203.0.113.10, 40000)`); restored, all 127 nat::
   tests green.
 
+## 2026-06-25 — #2778: ddns/surface-a no longer holds the manager mutex across provider I/O
+
+- **Timestamp**: 2026-06-25
+- **Action**: Surface A provider I/O (`UpsertLease`/`DeleteLease`, 15s HTTP
+  client timeout) ran UNDER `SurfaceAManager.mu`, so a slow/hung provider
+  blocked every other Surface A op — `StatusViews` (operator `show`), `Stats`
+  (Prometheus scrape), and other scopes' reconcile work — for up to 15s exactly
+  while the subsystem was unhealthy. Added `providerIO(fn)`: it unlocks `m.mu`,
+  runs the one wire call, and re-acquires the lock (`defer m.mu.Lock()` so a
+  panicking backend cannot leave the deferred `Reconcile` Unlock unbalanced).
+  `publishLocked` now durably write-aheads ownership BEFORE the wire add (crash
+  in the unlocked window still finds the record owned → next pass converges),
+  releases the lock for the `UpsertLease`, then re-acquires and commits with a
+  racing-op CAS: if a concurrent op changed the owned record while unlocked, the
+  stale result is NOT rolled back / advanced (newer ownership wins,
+  `errSurfaceAPublishRaced` tells `reconcileScopeLocked` to leave the runtime
+  cache + backoff untouched). `withdrawOwnedLocked` releases the lock for the
+  `DeleteLease`, then drops ownership only if the live entry is STILL the exact
+  record it deleted (a concurrent re-publish with a new address keeps its
+  ownership, never orphaned). All preserved invariants: never-blackhole,
+  write-ahead-before-add (#2662), withdraw-keeps-ownership-on-error/no-op-backend
+  (#2691 P2 M1), per-RG HA gate (#2664). The daemon single-flight guard
+  (`surfaceAReconcileInFlight`) already serializes full passes; the CAS keeps the
+  contract correct regardless.
+- **File(s)**: `pkg/ddns/surface_a.go` (`providerIO` helper, lock-release +
+  racing-op CAS in `publishLocked`/`withdrawOwnedLocked`, `errSurfaceAPublishRaced`
+  sentinel), `pkg/ddns/surface_a_lockio_test.go` (new fail-on-revert + race
+  tests), `pkg/ddns/README.md` (P2 lock-discipline bullet).
+- **Fail-on-revert proof**: copied `surface_a.go` aside, reverted `providerIO`
+  to call `fn()` with the lock HELD (the #2778 bug), ran the three new tests:
+  all three FAILED with a 2s bounded-wait timeout —
+  `TestSurfaceALockNotHeldDuringUpsert` (StatusViews blocked behind a blocked
+  UpsertLease), `TestSurfaceALockNotHeldDuringDelete` (StatusViews blocked behind
+  a blocked DeleteLease), `TestSurfaceAPublishRaceDoesNotClobberNewerState`
+  (Reconcile #2 blocked behind #1's lock-held publish). Restored from the copy;
+  all pass with the fix. `go build ./...`, `gofmt -l` (clean on touched files),
+  `go vet`, `go test -race ./pkg/ddns/... ./pkg/daemon/...` all green.
+
+## 2026-06-25 — #2774: ddns/checkip public-address gate covers the full IANA special-purpose registry
+
+- **Timestamp**: 2026-06-25
+- **Action**: The checkip public-address gate (`isPublicAddr`) rejected
+  loopback/link-local/multicast/unspecified + the RFC-1918 private,
+  CGNAT, link-local, and TEST-NET ranges, but ACCEPTED several other
+  non-public IANA special-purpose ranges, so a hostile or misconfigured
+  checkip endpoint could have a reserved/benchmark/martian address
+  published as the router's A/AAAA record. Rewrote the gate to accept
+  only globally-routable unicast: stdlib `netip` predicates handle
+  unspecified/loopback/link-local/multicast + `IsPrivate` (10/8,
+  172.16/12, 192.168/16), and two prefix tables (`specialPurposeV4`,
+  `specialPurposeV6`) reject the rest of the registry. Newly rejected
+  IPv4: 0.0.0.0/8, 192.0.0/24, 192.88.99/24 (6to4 relay anycast),
+  198.18/15 (benchmarking), 240/4 (reserved), 255.255.255.255/32
+  (limited broadcast). Newly rejected IPv6: ::ffff:0:0/96, 64:ff9b::/96
+  + 64:ff9b:1::/48 (NAT64), 100::/64 (discard-only), 100:0:0:1::/64
+  (dummy prefix, RFC 9780), 2001::/23, 2001:db8::/32 + 3fff::/20
+  (documentation, RFC 3849/9637), 2002::/16 (6to4), 5f00::/16 (SRv6
+  SIDs, RFC 9602); ULA/loopback/unspecified already rejected. The
+  3fff::/20, 5f00::/16, and 100:0:0:1::/64 blocks were added in the
+  review fold (all Globally-Reachable=False in the IANA registry).
+- **File(s)**: `pkg/ddns/checkip.go` (gate rewrite + prefix tables),
+  `pkg/ddns/checkip_test.go` (`TestIsPublicAddrSpecialPurpose`
+  fail-on-revert table), `pkg/ddns/README.md` (gate range list).
+- **Scope**: checkip public-address gate + its test only. No change to
+  `surface_a.go`, `provider.go`, the `backend_*.go` files, or
+  `compiler_validate_warn.go` (other lanes own those).
+- **Validation**: `go build ./...`, `gofmt -l` clean, `go vet
+  ./pkg/ddns/...`, `go test ./pkg/ddns/...` all PASS.
+- **Fail-on-revert proof**: copy-aside `checkip.go`, neutralized the
+  `specialPurposeV4`/`specialPurposeV6` loops + the `IsPrivate` guard
+  (accept-all body) → `TestIsPublicAddrSpecialPurpose` FAILED on 20
+  newly-accepted special-purpose addrs (0.1.2.3, 10/8, 100.64/10,
+  172.16/12, 192.0.0/24, 192.0.2/24, 192.88.99/24, 198.18/15,
+  198.51.100/24, 203.0.113/24, 240/4, 255.255.255.255, 64:ff9b::/96,
+  100::/64, 2001:db8::/32, 2002::/16, fc00::/7, fd00::); restored →
+  GREEN.
+
+## 2026-06-25 — #2622: firewall filter source-port-except / destination-port-except
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added the Junos negated port match conditions
+  `from source-port-except` / `from destination-port-except` (match every
+  port EXCEPT the listed ones) end to end, the port-dimension counterpart
+  to the existing positive source-port / destination-port. Scope is ports
+  only — `packet-length` from the same review-039 finding 039-04 is NOT
+  implemented here.
+  - Schema: two `multi: true` leaves in `schemaFirewall`'s `from` block in
+    `schema_cos.go` (both `family inet` and `inet6`).
+  - Typed config: `SourcePortsExcept` / `DestPortsExcept []string` on
+    `FirewallFilterTerm` (`types_system.go`); `compileFilterFrom`
+    accumulates via `firewallMatchValues` (both AST shapes, #2419 bracket
+    list).
+  - Wire: additive `source_ports_except` / `destination_ports_except`
+    fields on Go `FirewallTermSnapshot` (`protocol.go`) + Rust
+    `FirewallTermSnapshot` (`protocol/security.rs`, `serde(default)` for
+    #1961 parity); emitted by `filters.go`. Regenerated
+    `protocol_wire_v1.json` (exactly the 2 keys added).
+  - Rust matcher: compiler selects ONE port list per direction (positive
+    wins, else except) and sets `source_port_except` / `dest_port_except`
+    on `FilterTerm`; `port_match` evaluates `matcher.matches(port) ^ except`
+    mirroring `nets_match_v4`/`_v6` (empty-except → match ALL,
+    empty-positive → match NOTHING). Added the new flags to
+    `filter_term_semantics_match` (cache_sensitive.rs) so a `*-port-except`
+    toggle rebuilds flow-cache decisions (sibling of source_except).
+  - FAIL-ON-REVERT proof: Rust `destination_port_except_negation` /
+    `source_port_except_negation` (port IN except list does NOT match,
+    port NOT in it DOES) — proven RED when `^ except` removed; Go
+    `firewall_port_except_2622_test.go` (hierarchical + flat-set bracket
+    + inet6) — proven RED when the compiler cases removed; Go emit test
+    `filters_port_except_2622_test.go`.
+  - Gates: cargo build --release OK; cargo test filter:: 117 + protocol::
+    184 OK; go build ./... OK; gofmt clean (touched files); go vet OK;
+    go test ./pkg/config/... ./pkg/dataplane/userspace/... OK.
+- **File(s)**: `pkg/config/schema_cos.go`,
+  `pkg/config/compiler_firewall.go`, `pkg/config/types_system.go`,
+  `pkg/config/firewall_port_except_2622_test.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/filters.go`,
+  `pkg/dataplane/userspace/filters_port_except_2622_test.go`,
+  `userspace-dp/src/protocol/security.rs`,
+  `userspace-dp/src/filter/mod.rs`,
+  `userspace-dp/src/filter/compiler.rs`,
+  `userspace-dp/src/filter/engine/matching.rs`,
+  `userspace-dp/src/filter/engine/cache_sensitive.rs`,
+  `userspace-dp/src/filter/tests.rs`,
+  `userspace-dp/src/filter/README.md`,
+  `userspace-dp/tests/fixtures/protocol_wire_v1.json`,
+  `docs/config-schema.md`, `_Log.md`
+## 2026-06-25 — #2770: cloudflare withdraw is content-scoped (delete owned rows only)
+
+- **Timestamp**: 2026-06-25
+- **Action**: Cloudflare Surface A `DeleteLease` deleted whatever
+  `findRecord` returned (`recs[0]`), ignoring the owned content tuple. With
+  multiple same-name/type rows — or after a human/automation changed the
+  value xpf published — the withdraw clobbered the NEW value (or left a
+  duplicate owned row behind). Fix: split the list step into a new
+  `listRecords` (returns ALL matching records); `DeleteLease` now deletes
+  only the rows whose `content == rec.Addr.Unmap().String()`, removing
+  EVERY such row, and treats no-content-match (ownership conflict) /
+  already-gone as a success no-op — never deletes a foreign value. This
+  honours the Surface A sole-delete-authority boundary (Route 53 / RFC 2136
+  re-derive the delete from owned state too). `findRecord` gained a
+  `wantContent` arg so the upsert path prefers the content-matching row
+  (re-publish stays a no-op) before falling back to `recs[0]` for the PATCH
+  target.
+- **File(s)**: `pkg/ddns/backend_cloudflare.go`,
+  `pkg/ddns/backend_cloudflare_test.go`, `pkg/ddns/README.md`, `_Log.md`
+- **Fail-on-revert proof**: reverted `DeleteLease` to the first-only,
+  content-blind body (restored via file copy, not `git checkout`) →
+  `TestCloudflareDeleteAllOwnedRecords` and
+  `TestCloudflareDeleteOwnershipConflict` both go RED (deleted!=2 owned
+  rows / clobbered the foreign value); restored fix → all green.
+- **Gates**: `go build ./...` OK, `gofmt -l` clean, `go vet ./pkg/ddns/...`
+  OK, `go test ./pkg/ddns/...` ok.
+## 2026-06-25 — #2771: route53 already-gone DELETE is idempotent (Surface A unwedge)
+
+- **Timestamp**: 2026-06-25
+- **Action**: A Route 53 Surface A withdraw against an already-removed
+  record failed and never converged: `backend_route53.go` `DeleteLease`
+  sent a strict DELETE and a no-such-record response (HTTP 400
+  `InvalidChangeBatch` "... but it was not found") propagated as non-nil.
+  Surface A's `withdrawOwnedLocked` drops ownership only on a nil return,
+  so the withdraw wedged and retried forever while `show system services
+  dynamic-dns` reported an owned record that no longer existed. Fix: made
+  `DeleteLease` IDEMPOTENT — `change` now returns the parsed Route 53
+  error code+message, and `r53DeleteAlreadyGone` classifies the
+  already-gone case (requires BOTH `Code=InvalidChangeBatch` AND a "not
+  found" marker) as success (nil) so ownership releases. Mirrors the
+  rfc2136 backend's NXRRSET/NXDOMAIN idempotent delete (`sendRemove`).
+  Genuine transient/auth/throttle failures (`SignatureDoesNotMatch`, 5xx,
+  429, a non-"not found" `InvalidChangeBatch`) STILL return non-nil so the
+  engine retries — only the already-gone case is swallowed.
+- **Fail-on-revert proof**: copied `backend_route53.go` aside, neutered
+  the `r53DeleteAlreadyGone` branch in `DeleteLease` (return the raw
+  err) → `TestRoute53DeleteAlreadyGoneIdempotent` FAILED ("already-gone
+  DELETE must be idempotent success (nil), got ... InvalidChangeBatch:
+  [Tried to delete resource record set ...] but it was not found ...
+  unexpected status 400"); the genuine-error subtests
+  (`TestRoute53DeleteGenuineErrorRetries`) stayed GREEN through the revert
+  (no over-swallow). Restored the file → all GREEN.
+- **Gates**: `go build ./...` OK; `gofmt -l pkg/ddns/` clean; `go vet
+  ./pkg/ddns/...` clean; `go test ./pkg/ddns/...` PASS.
+- **File(s)**: `pkg/ddns/backend_route53.go`,
+  `pkg/ddns/backend_route53_test.go`, `pkg/ddns/README.md`, `_Log.md`.
 ## 2026-06-25 — #2772: ddns http dyndns2 + generic withdraw is no longer a silent no-op
 
 - **Timestamp**: 2026-06-25
@@ -16112,6 +16296,34 @@ top.
   pkg/vrrp/addrwatch_test.go, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2438 — WG/GRE local-delivery TUN write paths shared the same
+  short-write packet-corruption class as #2407, but on NON-BLOCKING fds.
+  Both `afxdp/tunnel.rs` (GRE local-origin delivery, via
+  `drain_local_tunnel_deliveries`) and `afxdp/coordinator/wg_control.rs`
+  (WG decap inner-delivery) used std `Write::write_all`, whose `Ok(n)`
+  loop re-writes `buf[n..]` on a short count — injecting the remainder as
+  a second, malformed packet. Added a non-blocking sibling of #2407's
+  whole-packet helper: `slowpath::write_packet_nonblocking` (single
+  `write()`, retries the WHOLE packet on EINTR and on WouldBlock/EAGAIN —
+  legitimate backpressure on an O_NONBLOCK fd, bounded by a 1024 retry
+  budget then drops with non-fatal ENOBUFS; genuine partial drops with
+  non-fatal EMSGSIZE). Returns the underlying io::Error so each path's
+  fatal-errno classifier is unchanged. The GRE drain helper now takes a
+  packet-write closure seam instead of `&mut impl Write`; the WG site
+  calls the helper on `tun.as_raw_fd()`. Internal-only — NO control
+  message field, NO wire change. Fail-on-revert: slowpath
+  `nb_short_write_drops_no_remainder` (one full-length write, never
+  buf[n..]) and `nb_wouldblock_retries_whole_packet` (EAGAIN retries the
+  whole packet, does not drop) — both proven RED by reverting the
+  respective arm (remainder-resume → second write of len-n; EAGAIN→drop →
+  no second write); `nb_wouldblock_budget_is_bounded_and_drops` (no
+  infinite spin); tunnel `drain_gre_delivery_calls_write_seam_once_with_whole_packet`
+  (drain hands the packet to the seam exactly once at full length).
+  **File(s)**: userspace-dp/src/slowpath.rs,
+  userspace-dp/src/afxdp/tunnel.rs,
+  userspace-dp/src/afxdp/tunnel_tests.rs,
+  userspace-dp/src/afxdp/coordinator/wg_control.rs,
+  docs/xdp-io-uring-userspace-dataplane.md, _Log.md
   **Action**: #2781 — DDNSProvider.String() (pkg/config) printed url-template,
   server, and checkip-url verbatim. The generic backend supports credentials
   embedded in the URL template (userinfo or a token in the query string, e.g.
@@ -16129,3 +16341,31 @@ top.
   go test ./pkg/config/ + ./pkg/ddns/... pass.
   **File(s)**: pkg/config/secret.go, pkg/config/types_system.go,
   pkg/config/ddns_provider_string_test.go, pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2445 — the WireGuard commit-time validator
+  (validateWireguardPeersStrict / validateOneWireguardTunnel,
+  pkg/config/compiler_validate_wireguard.go) rejected duplicate/malformed
+  pubkeys but explicitly NOT an exact-duplicate allowed-ips prefix across
+  peers. The cryptokey routing table is a prefix->peer map; an exact tie
+  has no longest-prefix winner, so the engine LPM (allowed_ips.rs, stable
+  sort by prefix length) resolves it by insertion order — the second peer
+  can handshake but never carries traffic for that prefix (silent route
+  strip). Added a per-tunnel prefixOwner map keyed by the canonical masked
+  CIDR (canonicalAllowedIPPrefix: net.ParseCIDR -> IPNet.String, so
+  10.0.0.5/24 and 10.0.0.0/24 collide; unparseable strings keyed verbatim
+  — malformed-prefix validation stays the Rust IpNet boundary's concern,
+  orthogonal to #2445). An exact-duplicate prefix on two DIFFERENT peers is
+  now a hard commit error; broader/narrower OVERLAP (0.0.0.0/0 catch-all +
+  more-specific peer) and a same-peer repeat stay valid. Scope: pkg/config
+  validation + test only; no userspace-dp Rust touched. Fail-on-revert
+  proof: copied compiler_validate_wireguard.go aside, removed the
+  prefixOwner block + decl, ran go test ./pkg/config/ -run
+  TestWireguardDuplicateAllowedIPsPrefix... ->
+  TestWireguardDuplicateAllowedIPsPrefixRejected and
+  TestWireguardDuplicateAllowedIPsPrefixHostBitsRejected both FAILED
+  ("must be a commit error"); restored from the copy, all green. Gates:
+  go build ./... clean, gofmt -l clean, go vet ./pkg/config/... clean,
+  go test ./pkg/config/... pass.
+  **File(s)**: pkg/config/compiler_validate_wireguard.go,
+  pkg/config/wireguard_multipeer_test.go, docs/config-schema.md, _Log.md

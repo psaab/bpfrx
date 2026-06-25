@@ -172,6 +172,12 @@ fn filter_term_semantics_match(old: &FilterTerm, new: &FilterTerm) -> bool {
         && old.dest_ports == new.dest_ports
         && old.source_port_constrained == new.source_port_constrained
         && old.dest_port_constrained == new.dest_port_constrained
+        // #2622: the port-except inversion flips the port decision without
+        // changing the parsed port matcher, so it must be compared here too —
+        // a snapshot toggling `*-port-except` on/off otherwise keeps stale
+        // flow-cache decisions (sibling of source_except/dest_except above).
+        && old.source_port_except == new.source_port_except
+        && old.dest_port_except == new.dest_port_except
         && old.dscp_bitmap == new.dscp_bitmap
         && old.dscp_match_enabled == new.dscp_match_enabled
         && old.tcp_flags_mask == new.tcp_flags_mask

@@ -22,12 +22,14 @@ moved with its assertions intact.
 | `hostname.go` | Deterministic hostname → DNS-label normalization (pure) — moved from `dhcpserver/ddns_hostname.go`. |
 | `surface_a.go` | Surface A router/interface-address publish engine (`SurfaceAManager`): change-detection, forced-refresh wire floor, per-scope error backoff, per-RG HA gate, the backend factory `productionSurfaceABackend` (#2691 P2/P3). |
 | `backend_http.go` | Shared HTTP-backend discipline (#2691 P3): hardened `http.Client` (TLS-verified, bounded timeout), capped body read, `classifyHTTPStatus`, `queryEscape`, the `errHTTPAuth`/`errHTTPRateLimited` verdicts. |
+| `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. |
+| `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → find → PATCH/POST/DELETE record. **Withdraw is content-scoped (#2770):** `DeleteLease` lists EVERY record for the FQDN+type and deletes only the rows whose `content` equals the owned address (`rec.Addr.Unmap().String()`), removing ALL such duplicates. It never deletes a row with a different value (a human/automation changed it after xpf published — an ownership conflict that is a success no-op), honouring the Surface A sole-delete-authority boundary that Route 53 / RFC 2136 also enforce. `recs[0]` is an API-ordering artifact, not ownership. |
 | `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. **Withdraw (#2772):** `DeleteLease` issues the same update GET with `offline=YES` (the de-facto dyndns2 withdraw verb) and parses the body verdict; a provider failure returns a non-nil error so the engine keeps ownership for retry (was a silent no-op that orphaned the public record). |
 | `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → find → PATCH/POST/DELETE record. |
 | `backend_route53.go` | Route 53 backend (#2691 P3): SigV4-signed `ChangeResourceRecordSets` UPSERT/DELETE change batch. |
 | `sigv4.go` | Minimal self-contained AWS SigV4 signer for Route 53 (no AWS SDK dependency). |
 | `backend_generic.go` | Generic templated backend (#2691 P3, inadyn "custom"): `%h/%i/%u/%p/%%` URL template + success-substring matcher — config-only, no Go code per provider. **Withdraw (#2772):** a single update template has no portable delete verb and xpf exposes no delete template, so `DeleteLease` FAILS (`errGenericDeleteUnsupported`) rather than silently reporting success; the engine keeps ownership so the abandoned record stays operator-visible (was a silent no-op that dropped ownership while the record kept resolving). |
-| `checkip.go` | Opt-in external check-IP address source (#2691 P3): bogus-IP validity gate + allowlist (`isPublicAddr`, `parseCheckIPBody`, `CheckIP`, `ParseAllowlist`). `CheckIP` fails closed on a malformed `checkip-url` via `validateCheckIPURL` (http(s) scheme + host); a typo is also warned at commit by `config.validateSurfaceADDNSWarnings` so it cannot masquerade as a permanent transient observation failure (#2773). |
+| `checkip.go` | Opt-in external check-IP address source (#2691 P3): bogus-IP validity gate + allowlist (`isPublicAddr`, `parseCheckIPBody`, `CheckIP`, `ParseAllowlist`). `CheckIP` fails closed on a malformed `checkip-url` via `validateCheckIPURL` (http(s) scheme + host); a typo is also warned at commit by `config.validateSurfaceADDNSWarnings` so it cannot masquerade as a permanent transient observation failure (#2773). **Public-address gate (#2774):** `isPublicAddr` accepts only a globally-routable unicast address and rejects the full IANA Special-Purpose Address Registry so a hostile/misconfigured checkip endpoint cannot get a martian/reserved address published as the router's A/AAAA record. stdlib `netip` predicates cover unspecified, loopback, link-local (uni + multicast), multicast (incl. interface-local), and the RFC-1918 private ranges (`IsPrivate`: 10/8, 172.16/12, 192.168/16). The `specialPurposeV4`/`specialPurposeV6` prefix tables add the rest: **IPv4** 0.0.0.0/8 (this-network), 100.64/10 (CGNAT), 192.0.0/24 (IETF protocol assignments), 192.0.2/24 + 198.51.100/24 + 203.0.113/24 (TEST-NET-1/2/3 documentation), 192.88.99/24 (6to4 relay anycast), 198.18/15 (benchmarking), 240/4 (reserved), 255.255.255.255/32 (limited broadcast); **IPv6** ::ffff:0:0/96 (IPv4-mapped), 64:ff9b::/96 + 64:ff9b:1::/48 (NAT64), 100::/64 (discard-only), 100:0:0:1::/64 (dummy prefix, RFC 9780 — distinct from 100::/64), 2001::/23 (IETF protocol assignments), 2001:db8::/32 + 3fff::/20 (documentation, RFC 3849/9637), 2002::/16 (6to4), 5f00::/16 (SRv6 SIDs, RFC 9602), fc00::/7 (ULA). |
 
 Tests moved with the code: `manager_test.go` (engine + state-store + hostname),
 `backend_rfc2136_test.go` (backend, drives a real in-process miekg/dns server),
@@ -146,6 +148,21 @@ no change in those packages:
   live backend withdraws it for real. `reconcileOnceLocked` / `withdrawAllLocked`
   swallow the sentinel so a legitimate disabled-with-no-backend pass is not
   marked failed. Mirrors the Surface A `withdrawOwnedLocked` precedent.
+- **Route 53 already-gone DELETE is idempotent (#2771)** — `backend_route53.go`
+  `DeleteLease` treats a Route 53 DELETE of an already-absent record as success
+  (nil), mirroring the rfc2136 backend's NXRRSET/NXDOMAIN handling
+  (`sendRemove`). Route 53 reports an already-gone delete as HTTP 400
+  `Code=InvalidChangeBatch` with a per-change message `... but it was not
+  found`; `r53DeleteAlreadyGone` requires BOTH the `InvalidChangeBatch` code AND
+  the "not found" marker, so a genuinely malformed/conflicting batch is NOT
+  mistaken for a no-op. Without this, a withdraw against a manually-removed (or
+  already-withdrawn-but-ack-lost) record returned non-nil forever; Surface A's
+  `withdrawOwnedLocked` only drops ownership on a nil return, so the withdraw
+  wedged and retried indefinitely while `show system services dynamic-dns`
+  reported an owned record that no longer existed. Genuine
+  transient/auth/throttle failures (`SignatureDoesNotMatch`, 5xx, 429, a
+  non-"not found" `InvalidChangeBatch`) STILL return non-nil so the engine
+  keeps retrying — only the already-gone case is swallowed.
 - **Shared-DHCID partial dual-stack teardown (#2700)** — the RFC 4701 DHCID
   digest folds in `client-identity || FQDN` only (NOT the address), so a
   dual-stack client (an A + an AAAA under one FQDN, same client id) shares ONE
@@ -302,6 +319,29 @@ its OWN learned address — on top of the SAME spine, without forking the engine
 - **HA gate** is the SAME per-RG `ScopeGate` (a router record on a reth/virtual
   interface publishes only on the RG master; stop-writing-never-withdraw
   otherwise). Standalone (nil gate) always publishes.
+- **Lock discipline — I/O is NEVER performed under the manager mutex (#2778).**
+  `SurfaceAManager.mu` guards ALL manager state (the durable ownership store, the
+  per-scope runtime cache, the counters), but it is RELEASED across every
+  provider network call (`UpsertLease`/`DeleteLease`, which run with a 15s HTTP
+  client timeout). A slow or hung provider must NOT block `StatusViews`/`Stats`
+  (operator `show` + Prometheus scrapes) or other scopes' reconcile work — that
+  would freeze the control plane for up to 15s exactly while the subsystem is
+  unhealthy. The pattern (`providerIO`): under the lock, the pass snapshots the
+  exact intent (resolved backend + record) and durably write-aheads the
+  ownership BEFORE the wire op (so a crash in the unlocked window still finds the
+  record owned and converges next pass); it then RELEASES the lock for the wire
+  call and RE-ACQUIRES it to commit the result. The commit is guarded by a
+  racing-op re-validation (CAS): if a concurrent op changed the scope's owned
+  record while the lock was released, the stale wire result does NOT clobber the
+  newer truth — a stale publish-rollback is skipped (the newer ownership wins,
+  signalled via `errSurfaceAPublishRaced` so the runtime cache is not advanced),
+  and a stale withdraw drops ownership only if the live entry is STILL the exact
+  record it deleted (a concurrent re-publish with a new address keeps its
+  ownership, never orphaned). The single-flight guard in the daemon
+  (`surfaceAReconcileInFlight`) means two full passes never run concurrently, but
+  the CAS keeps the contract correct regardless. Proven in
+  `surface_a_lockio_test.go` (a blocking provider + a concurrent `StatusViews`
+  that would hang if the lock were held; fail-on-revert).
 - **Operator surfaces:** `show services dynamic-dns [detail]` (CLI + gRPC), the
   `xpf_ddns_surface_a_*` Prometheus family, and `SurfaceAManager.StatusViews()`
   (per-scope published address + last-published time + last error).

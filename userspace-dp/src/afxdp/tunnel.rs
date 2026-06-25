@@ -156,8 +156,18 @@ pub(super) enum LocalTunnelDrainOutcome {
 /// #1881: one bounded delivery-drain chunk, extracted from
 /// `local_tunnel_source_loop` so the stop-latency contract is unit
 /// testable (plan §9 test 4).
+///
+/// #2438: writes go through `write_packet`, a single-`write()`
+/// whole-packet seam (the production caller passes
+/// `crate::slowpath::write_packet_nonblocking`), NOT std
+/// `Write::write_all`. The TUN fd is `O_NONBLOCK`, and `write_all`'s
+/// stream-resume loop would re-write `buf[n..]` after a short count —
+/// injecting the remainder as a SECOND, malformed packet (the #2407
+/// corruption class). The seam retries the WHOLE packet on
+/// WouldBlock/EINTR and drops (Err, non-fatal errno) on a genuine
+/// partial, so this drain's fatal-errno classification is unchanged.
 pub(super) fn drain_local_tunnel_deliveries(
-    tun: &mut impl Write,
+    write_packet: &mut impl FnMut(&[u8]) -> io::Result<()>,
     delivery_rx: &Receiver<Vec<u8>>,
     stop: &AtomicBool,
     tunnel_name: &str,
@@ -169,7 +179,7 @@ pub(super) fn drain_local_tunnel_deliveries(
         }
         match delivery_rx.try_recv() {
             Ok(packet) => {
-                if let Err(err) = tun.write_all(&packet) {
+                if let Err(err) = write_packet(&packet) {
                     record_local_tunnel_exception(
                         recent_exceptions,
                         tunnel_name,
@@ -295,8 +305,14 @@ pub(super) fn local_tunnel_source_loop(
         // not claimed — they are published independently by design,
         // matching the worker path.
         let ha_runtime = ha_state.load();
+        // #2438: deliver each queued packet with a single-write,
+        // whole-packet seam (non-blocking TUN fd) — never std
+        // `Write::write_all`, whose short-count resume would corrupt the
+        // device. `tun_fd` is a plain i32 copy, so this closure does not
+        // borrow `tun` (the read below still uses `tun`).
+        let mut write_packet = |buf: &[u8]| crate::slowpath::write_packet_nonblocking(tun_fd, buf);
         match drain_local_tunnel_deliveries(
-            &mut tun,
+            &mut write_packet,
             &delivery_rx,
             &stop,
             &tunnel_name,

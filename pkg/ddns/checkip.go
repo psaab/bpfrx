@@ -89,44 +89,77 @@ func parseCheckIPBody(body string, wantV4 bool, allowlist []netip.Addr) (netip.A
 	return netip.Addr{}, false
 }
 
-// isPublicAddr is the inadyn validity gate: reject loopback, link-local,
-// multicast, unspecified, and (for v4) private/CGNAT/documentation ranges that
-// can never be the public address a checkip endpoint should report. A private
-// result usually means the request never left the NAT — not a usable answer.
+// specialPurposeV4 enumerates the IANA IPv4 Special-Purpose Address Registry
+// ranges (RFC 6890 and successors) that are NOT globally-routable unicast and
+// therefore can never be the public address a checkip endpoint should report.
+// stdlib netip predicates already cover the unspecified address, loopback
+// (127/8), link-local (169.254/16), and multicast (224/4); the prefixes below
+// are the ranges those predicates miss — notably CGNAT (100.64/10), the
+// benchmarking range (198.18/15), the IETF-protocol/documentation/6to4-relay
+// /24s, the 0/8 "this network", the reserved 240/4 block, and the limited
+// broadcast 255.255.255.255/32. netip.Addr.IsPrivate() covers 10/8, 172.16/12,
+// and 192.168/16 but does NOT cover any of these, hence the explicit list.
+var specialPurposeV4 = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),          // "this network" (RFC 1122)
+	netip.MustParsePrefix("100.64.0.0/10"),      // CGNAT (RFC 6598)
+	netip.MustParsePrefix("192.0.0.0/24"),       // IETF protocol assignments
+	netip.MustParsePrefix("192.0.2.0/24"),       // TEST-NET-1 (documentation)
+	netip.MustParsePrefix("192.88.99.0/24"),     // 6to4 relay anycast (deprecated)
+	netip.MustParsePrefix("198.18.0.0/15"),      // benchmarking (RFC 2544)
+	netip.MustParsePrefix("198.51.100.0/24"),    // TEST-NET-2 (documentation)
+	netip.MustParsePrefix("203.0.113.0/24"),     // TEST-NET-3 (documentation)
+	netip.MustParsePrefix("240.0.0.0/4"),        // reserved for future use
+	netip.MustParsePrefix("255.255.255.255/32"), // limited broadcast
+}
+
+// specialPurposeV6 enumerates the IANA IPv6 Special-Purpose Address Registry
+// ranges not covered by the stdlib netip predicates used in isPublicAddr.
+// IsUnspecified (::/128), IsLoopback (::1/128), IsLinkLocalUnicast (fe80::/10),
+// and IsMulticast (ff00::/8) are handled by predicates; the prefixes below add
+// ULA (fc00::/7), the documentation prefixes (2001:db8::/32, 3fff::/20), the
+// IPv4-mapped and IPv4/IPv6 translation ranges, the discard-only and dummy
+// prefixes, the SRv6 SID block, and the deprecated 6to4 block. Inputs are
+// already Unmap()'d before this gate, so an IPv4-mapped literal cannot reach
+// the v6 path, but ::ffff:0:0/96 is listed for completeness against a raw v6
+// caller. Every entry has Globally-Reachable=False in the IANA registry.
+var specialPurposeV6 = []netip.Prefix{
+	netip.MustParsePrefix("::ffff:0:0/96"),  // IPv4-mapped (RFC 4291)
+	netip.MustParsePrefix("64:ff9b::/96"),   // NAT64 well-known prefix (RFC 6052)
+	netip.MustParsePrefix("64:ff9b:1::/48"), // NAT64 local-use (RFC 8215)
+	netip.MustParsePrefix("100::/64"),       // discard-only (RFC 6666)
+	netip.MustParsePrefix("100:0:0:1::/64"), // dummy IPv6 prefix (RFC 9780)
+	netip.MustParsePrefix("2001::/23"),      // IETF protocol assignments
+	netip.MustParsePrefix("2001:db8::/32"),  // documentation (RFC 3849)
+	netip.MustParsePrefix("2002::/16"),      // 6to4 (RFC 3056, deprecated)
+	netip.MustParsePrefix("3fff::/20"),      // documentation (RFC 9637)
+	netip.MustParsePrefix("5f00::/16"),      // SRv6 SIDs (RFC 9602)
+	netip.MustParsePrefix("fc00::/7"),       // unique-local / ULA (RFC 4193)
+}
+
+// isPublicAddr is the inadyn validity gate: it accepts only a globally-routable
+// unicast address (the public address a checkip endpoint should report) and
+// rejects every IANA special-purpose range. A private/reserved/benchmark result
+// usually means the request never left the NAT, or the endpoint is hostile or
+// misconfigured — never a usable answer to publish as the router's A/AAAA
+// record (#2774). stdlib predicates cover the loopback/link-local/multicast/
+// unspecified/RFC-1918 cases; the specialPurposeV4/V6 tables cover the rest of
+// the registry (CGNAT, benchmarking, documentation, ULA, translation, etc.).
 func isPublicAddr(a netip.Addr) bool {
 	if !a.IsValid() || a.IsUnspecified() || a.IsLoopback() ||
-		a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() || a.IsMulticast() {
+		a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() || a.IsMulticast() ||
+		a.IsPrivate() || a.IsInterfaceLocalMulticast() {
 		return false
 	}
 	if a.Is4() {
-		o := a.As4()
-		switch {
-		case o[0] == 10: // 10.0.0.0/8
-			return false
-		case o[0] == 172 && o[1] >= 16 && o[1] <= 31: // 172.16.0.0/12
-			return false
-		case o[0] == 192 && o[1] == 168: // 192.168.0.0/16
-			return false
-		case o[0] == 100 && o[1] >= 64 && o[1] <= 127: // 100.64.0.0/10 CGNAT
-			return false
-		case o[0] == 192 && o[1] == 0 && o[2] == 2: // 192.0.2.0/24 TEST-NET-1
-			return false
-		case o[0] == 198 && o[1] == 51 && o[2] == 100: // 198.51.100.0/24 TEST-NET-2
-			return false
-		case o[0] == 203 && o[1] == 0 && o[2] == 113: // 203.0.113.0/24 TEST-NET-3
-			return false
-		case o[0] == 169 && o[1] == 254: // 169.254.0.0/16 (also IsLinkLocal)
-			return false
+		for _, p := range specialPurposeV4 {
+			if p.Contains(a) {
+				return false
+			}
 		}
 		return true
 	}
-	// IPv6: reject ULA (fc00::/7) and the documentation prefix (2001:db8::/32).
-	if a.Is6() {
-		b := a.As16()
-		if b[0]&0xfe == 0xfc { // fc00::/7
-			return false
-		}
-		if b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0d && b[3] == 0xb8 { // 2001:db8::/32
+	for _, p := range specialPurposeV6 {
+		if p.Contains(a) {
 			return false
 		}
 	}
