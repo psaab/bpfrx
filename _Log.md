@@ -17342,3 +17342,21 @@ top.
   go vet ./pkg/ra/..., go test -race ./pkg/ra/... PASS.
   **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/serialize_test.go,
   pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2868 — eventengine remediation commit now runs under a
+  cancellable engine-lifetime context instead of context.Background(). New()
+  builds lifeCtx/lifeCancel (context.WithCancel(Background)); Close() cancels
+  it alongside closing stopCh, so a remediation commit in flight at daemon
+  shutdown (netlink + FRR reload + Rust sync — seconds of work) aborts cleanly
+  instead of blocking termination past the systemd TimeoutStopSec SIGKILL.
+  Threaded the ctx through applyOnce(ctx, a) (commitContext() helper, nil-guard
+  for a zero-value Engine) into commitFn(ctx, ""). The standalone (nil commitFn)
+  store.Commit() branch is unaffected. Added fail-on-revert test
+  TestCommit_CancelledOnEngineStop (commitFn blocks on ctx.Done(); Close() must
+  abort it with context.Canceled — RED on the 3s timeout if reverted to
+  context.Background()). Scoped to the #2868 context threading only (siblings
+  #2869/#2890 are separate lanes). Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/eventengine/..., go test -race ./pkg/eventengine/... PASS.
+  **File(s)**: pkg/eventengine/engine.go, pkg/eventengine/engine_integration_test.go,
+  pkg/eventengine/README.md, _Log.md
