@@ -1165,19 +1165,26 @@ func broadcastReply(ir *interfaceRelay, clientConn net.PacketConn, replyData []b
 //     central configuration; the server answers an INFORM with an ACK, which
 //     the reply path already forwards (see deliverReply: the flag-clear,
 //     yiaddr==0, real-ciaddr case unicasts to the client's ciaddr).
+//   - DECLINE — a client that, after an ARP probe, detected the offered
+//     address already in use broadcasts a DHCPDECLINE (RFC 2131 §3.1 step 4,
+//     §4.4.1). The relay MUST forward it so the originating server marks that
+//     address unavailable; otherwise the server keeps re-offering the
+//     conflicting address and the segment suffers a persistent duplicate-IP
+//     condition (#2789). DECLINE carries no server reply, so no reply-path
+//     handling is needed.
 //
-// DECLINE and RELEASE are intentionally not relayed here, preserving the
-// pre-#2153 behavior (which relayed only DISCOVER/REQUEST). RELEASE is
-// unicast by the client to the server it is bound to, so it does not require
-// relaying. DECLINE is broadcast (RFC 2131 §4.4.1) but signals an address
-// conflict back to the originating server, which is reachable on the relayed
-// path only via DISCOVER/REQUEST state; this relay does not forward it, and
-// widening that set is out of scope for #2153.
+// RELEASE is intentionally not relayed here. Unlike DISCOVER/REQUEST/INFORM/
+// DECLINE — which a client broadcasts when it has no usable server unicast
+// path on the local segment — a RELEASE is unicast by the client directly to
+// the server it is bound to (RFC 2131 §4.4.4), so the datagram routes to the
+// server without relay assistance and is never seen on the relay's
+// client-facing broadcast socket in the first place.
 func clientRequestRelayable(msgType dhcpv4.MessageType) bool {
 	switch msgType {
 	case dhcpv4.MessageTypeDiscover,
 		dhcpv4.MessageTypeRequest,
-		dhcpv4.MessageTypeInform:
+		dhcpv4.MessageTypeInform,
+		dhcpv4.MessageTypeDecline:
 		return true
 	default:
 		return false

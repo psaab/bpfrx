@@ -92,12 +92,14 @@ func TestInterfaceIPv4_Loopback(t *testing.T) {
 }
 
 // TestClientRequestRelayable asserts the client->server forwarding gate
-// (#2153): a relay must forward DISCOVER, REQUEST, and INFORM, but not server
-// reply types or client-to-server-direct types (DECLINE/RELEASE). The INFORM
-// case is the regression target — before #2153 the gate dropped it, so a
-// domain-joined client that holds its own address never received DNS/domain/NTP
-// options from the central server. This test FAILS against the pre-fix gate
-// (which returned false for INFORM).
+// (#2153/#2789): a relay must forward DISCOVER, REQUEST, INFORM, and DECLINE,
+// but not server reply types or the client-to-server-direct RELEASE. INFORM is
+// the #2153 regression target and DECLINE the #2789 target — before each fix
+// the gate returned false for that type. Pre-#2153 the dropped INFORM left a
+// domain-joined client that holds its own address without DNS/domain/NTP
+// options from the central server; pre-#2789 the dropped DECLINE meant a
+// client-detected address conflict never reached the server, which kept
+// re-offering the in-use address.
 func TestClientRequestRelayable(t *testing.T) {
 	cases := []struct {
 		msgType dhcpv4.MessageType
@@ -105,8 +107,8 @@ func TestClientRequestRelayable(t *testing.T) {
 	}{
 		{dhcpv4.MessageTypeDiscover, true},
 		{dhcpv4.MessageTypeRequest, true},
-		{dhcpv4.MessageTypeInform, true}, // #2153 regression target
-		{dhcpv4.MessageTypeDecline, false},
+		{dhcpv4.MessageTypeInform, true},  // #2153 regression target
+		{dhcpv4.MessageTypeDecline, true}, // #2789 regression target
 		{dhcpv4.MessageTypeRelease, false},
 		{dhcpv4.MessageTypeOffer, false},
 		{dhcpv4.MessageTypeAck, false},
@@ -175,6 +177,66 @@ func TestRunRelay_RelaysInform(t *testing.T) {
 	}
 	if !relayed.GatewayIPAddr.Equal(net.IPv4(10, 0, 0, 254)) {
 		t.Errorf("relayed giaddr = %v, want 10.0.0.254", relayed.GatewayIPAddr)
+	}
+}
+
+// TestRunRelay_RelaysDecline is the end-to-end gate proof for #2789: a real
+// BOOTREQUEST/DECLINE datagram pushed through the live runRelay loop must be
+// forwarded to the server conn (so the server marks the conflicting address
+// unavailable per RFC 2131 §4.4.1), and must carry the relay-set giaddr so the
+// server can attribute the decline to this relayed segment. The assertion
+// FAILS against the pre-#2789 gate, which `continue`d on DECLINE and never
+// wrote to the server conn.
+func TestRunRelay_RelaysDecline(t *testing.T) {
+	// Build a client DECLINE: BOOTREQUEST whose Requested-IP option names the
+	// address the client found in use (RFC 2131 §4.4.1 — the declined address
+	// is carried in option 50, ciaddr stays zero).
+	decline, err := dhcpv4.New()
+	if err != nil {
+		t.Fatalf("dhcpv4.New: %v", err)
+	}
+	decline.OpCode = dhcpv4.OpcodeBootRequest
+	decline.ClientHWAddr = net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}
+	decline.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeDecline))
+	decline.UpdateOption(dhcpv4.OptRequestedIPAddress(net.IPv4(192, 0, 2, 77)))
+
+	client := newFakeConn()
+	client.pending = [][]byte{decline.ToBytes()}
+	server := newFakeConn()
+	factory, _ := recordingFactory(client, server)
+	m := testManager(factory)
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	defer m.Stop()
+
+	// Wait for the DECLINE to be relayed onto the server conn.
+	deadline := time.Now().Add(2 * time.Second)
+	for server.writeCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if server.writeCount() == 0 {
+		t.Fatal("DECLINE was not relayed to the server within 2s " +
+			"(pre-#2789 gate dropped it)")
+	}
+
+	// The relayed datagram must parse, be a BOOTREQUEST/DECLINE, carry the
+	// relay-set giaddr (10.0.0.254, from testManager's resolver), and preserve
+	// the declined address so the server knows which binding to mark in-use.
+	relayed, err := dhcpv4.FromBytes(server.firstWrite(t))
+	if err != nil {
+		t.Fatalf("relayed datagram does not parse: %v", err)
+	}
+	if relayed.OpCode != dhcpv4.OpcodeBootRequest {
+		t.Errorf("relayed opcode = %v, want BOOTREQUEST", relayed.OpCode)
+	}
+	if relayed.MessageType() != dhcpv4.MessageTypeDecline {
+		t.Errorf("relayed message type = %v, want DECLINE", relayed.MessageType())
+	}
+	if !relayed.GatewayIPAddr.Equal(net.IPv4(10, 0, 0, 254)) {
+		t.Errorf("relayed giaddr = %v, want 10.0.0.254", relayed.GatewayIPAddr)
+	}
+	if got := relayed.RequestedIPAddress(); !got.Equal(net.IPv4(192, 0, 2, 77)) {
+		t.Errorf("relayed requested-IP = %v, want 192.0.2.77", got)
 	}
 }
 
