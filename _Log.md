@@ -17477,3 +17477,23 @@ top.
   go test ./pkg/routing/... PASS.
   **File(s)**: pkg/routing/xfrm.go, pkg/routing/iface_reuse_test.go,
   pkg/routing/README.md, _Log.md
+
+## 2026-06-25 — #2885 IPsec link-local IPv6 local-bind selection
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `matchFamily` (pkg/ipsec/policy.go) rejecting IPv6
+  link-local unicast (`fe80::/10`) via `IsGlobalUnicast()`. The local-address
+  resolver gated every candidate interface address on `IsGlobalUnicast()`,
+  which is false for link-local, so an IPsec local-bind on a point-to-point /
+  link-local IPv6 link could never source from `fe80::`. Now `matchFamily`
+  also admits `IsLinkLocalUnicast()`, but link-local is surfaced ONLY for an
+  explicit family-6 hint: excluded from family-4 (and IPv4 link-local
+  169.254.0.0/16 too) and from family-agnostic (hint 0) selection so it never
+  wins implicitly over a global address. Multicast/unspecified/loopback stay
+  excluded for all families. Found by agy-review-051 051-02 (MEDIUM).
+  FAIL-ON-REVERT: TestMatchFamilyLinkLocalIPv6 asserts
+  matchFamily(fe80::1, 6) == "fe80::1"; RED ("" ) when the old IsGlobalUnicast
+  gate is restored (verified by copy-aside revert), GREEN with the fix.
+  TestMatchFamilyExclusions guards the exclusions. Gates: go build ./...,
+  gofmt -l clean, go vet ./pkg/ipsec/..., go test ./pkg/ipsec/... PASS.
+- **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/matchfamily_linklocal_test.go,
+  pkg/ipsec/README.md, _Log.md

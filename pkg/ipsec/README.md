@@ -177,6 +177,18 @@ all files stay in `package ipsec`, so the public API is unchanged.
     timeout / NXDOMAIN / SERVFAIL it returns family 0 (agnostic) — a slow or
     unreachable resolver degrades to the interface-decides path and NEVER
     stalls `commit` / apply for the full glibc resolver timeout.
+  - **IPv6 link-local local binds (#2885):** the candidate filter
+    `matchFamily` (`policy.go`) admits an IPv6 link-local unicast source
+    (`fe80::/10`) when the gateway family hint is IPv6 (family 6). The
+    earlier `IsGlobalUnicast()` gate rejected link-local outright, so an
+    IPsec local-bind on a point-to-point / link-local IPv6 link could never
+    source from `fe80::` — the documented dynamic-routing local-source over
+    such links was unreachable. Link-local is admitted ONLY under an explicit
+    family-6 hint: it is excluded from family-4 selection (and IPv4
+    link-local `169.254.0.0/16` is never a usable source) and from
+    family-agnostic (hint 0) selection, so it never wins implicitly over a
+    global address on a dual-stack interface. Multicast, unspecified, and
+    loopback stay excluded for every family.
 - **IKE policy chain → proposal cross-reference (#2270).** A gateway's
   `ike-policy` reference walks gateway → `ike-policy` → `ike-proposal`
   (`resolveIKESettings`, `ike.go`). When that chain breaks — the

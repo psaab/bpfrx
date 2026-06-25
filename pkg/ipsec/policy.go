@@ -735,11 +735,22 @@ func addressFamilyHint(addr string) int {
 }
 
 func matchFamily(ip net.IP, family int) string {
-	if ip == nil || !ip.IsGlobalUnicast() {
+	if ip == nil {
+		return ""
+	}
+	// Global unicast covers the common case. IPv6 link-local unicast
+	// (fe80::/10) is also a valid IPsec local-bind source on point-to-point
+	// / link-local IPv6 links (#2885); IsGlobalUnicast() rejects it, so admit
+	// it explicitly here. Multicast, unspecified, and loopback stay excluded.
+	if !ip.IsGlobalUnicast() && !ip.IsLinkLocalUnicast() {
 		return ""
 	}
 	switch family {
 	case 4:
+		// IPv4 link-local (169.254.0.0/16) is not a usable IPsec source.
+		if ip.IsLinkLocalUnicast() {
+			return ""
+		}
 		if ip4 := ip.To4(); ip4 != nil {
 			return ip4.String()
 		}
@@ -748,6 +759,11 @@ func matchFamily(ip net.IP, family int) string {
 			return ip.String()
 		}
 	default:
+		// Family-agnostic selection: never surface a link-local address
+		// implicitly — only an explicit family-6 hint may bind link-local.
+		if ip.IsLinkLocalUnicast() {
+			return ""
+		}
 		return ip.String()
 	}
 	return ""
