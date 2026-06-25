@@ -268,6 +268,67 @@ func TestDecodeSessionEventV4(t *testing.T) {
 	}
 }
 
+// #2785: the per-policy `then log` selection rides the open-frame flags
+// byte (bits 1<<3/1<<4) so a synced session logs identically after failover.
+// Reverting the eventstream.go decode drops the flags and this fails RED.
+func TestDecodeSessionEventV4CarriesLogFlags(t *testing.T) {
+	payload := buildSessionOpenV4Payload(
+		6, 12345, 443,
+		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
+		[4]byte{}, [4]byte{},
+		0, 0, 1, 1, 0, 0, 0,
+		SessionEventFlagLogSessionInit|SessionEventFlagLogSessionClose,
+		1, 2, 0,
+		[6]byte{}, [6]byte{}, [4]byte{},
+	)
+	d, ok := decodeSessionEvent(payload)
+	if !ok {
+		t.Fatal("decodeSessionEvent returned false")
+	}
+	if !d.LogSessionInit || !d.LogSessionClose {
+		t.Fatalf("expected both log flags decoded, got init=%t close=%t",
+			d.LogSessionInit, d.LogSessionClose)
+	}
+
+	// Only close bit set: init must NOT leak true.
+	payloadCloseOnly := buildSessionOpenV4Payload(
+		6, 12345, 443,
+		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
+		[4]byte{}, [4]byte{},
+		0, 0, 1, 1, 0, 0, 0,
+		SessionEventFlagLogSessionClose,
+		1, 2, 0,
+		[6]byte{}, [6]byte{}, [4]byte{},
+	)
+	dCloseOnly, ok := decodeSessionEvent(payloadCloseOnly)
+	if !ok {
+		t.Fatal("decodeSessionEvent (close-only) returned false")
+	}
+	if dCloseOnly.LogSessionInit || !dCloseOnly.LogSessionClose {
+		t.Fatalf("close-only: init=%t close=%t, want false/true",
+			dCloseOnly.LogSessionInit, dCloseOnly.LogSessionClose)
+	}
+
+	// No log bits: both false.
+	payloadNone := buildSessionOpenV4Payload(
+		6, 12345, 443,
+		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
+		[4]byte{}, [4]byte{},
+		0, 0, 1, 1, 0, 0, 0,
+		0,
+		1, 2, 0,
+		[6]byte{}, [6]byte{}, [4]byte{},
+	)
+	dNone, ok := decodeSessionEvent(payloadNone)
+	if !ok {
+		t.Fatal("decodeSessionEvent (none) returned false")
+	}
+	if dNone.LogSessionInit || dNone.LogSessionClose {
+		t.Fatalf("none: expected both false, got init=%t close=%t",
+			dNone.LogSessionInit, dNone.LogSessionClose)
+	}
+}
+
 func TestDecodeSessionEventV4LocalDelivery(t *testing.T) {
 	payload := buildSessionOpenV4Payload(
 		17, 53, 53,

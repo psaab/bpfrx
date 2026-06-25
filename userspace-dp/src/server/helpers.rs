@@ -445,15 +445,15 @@ pub(crate) fn build_synced_session_entry(
             fabric_ingress: req.fabric_ingress,
             is_reverse: req.is_reverse,
             nat64_reverse: None,
-            // #2508: the per-policy `then log` selection is NOT carried on
-            // the HA session-sync wire (it lives on the policy snapshot,
-            // which both nodes compile identically). An HA-imported session
-            // therefore defaults to no per-policy SYSLOG record on this node;
-            // the node that locally admitted the session emits the
-            // session-init/close records. Threading the flag through the
-            // session-sync wire is a follow-up, out of #2508's scope.
-            log_session_init: false,
-            log_session_close: false,
+            // #2785: the per-policy `then log` selection is now carried on
+            // the HA session-sync wire (open-frame flags bits 1<<3/1<<4 ->
+            // SessionSyncRequest.log_session_{init,close}). A synced session
+            // therefore emits the same RT_FLOW SESSION_CREATE/CLOSE records
+            // after failover as the node that locally admitted it. An old
+            // peer that omits the fields decodes to false (no per-policy
+            // log), bit-identical to pre-#2785 behavior.
+            log_session_init: req.log_session_init,
+            log_session_close: req.log_session_close,
         },
         origin: crate::session::SessionOrigin::SyncImport,
         // #2170: carry the peer's install generation onto the helper entry.
