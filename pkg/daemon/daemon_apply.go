@@ -4,6 +4,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -742,10 +743,31 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		teardownUnmappedManaged(cfg.Chassis.DeviceMap, protectedForConfig(cfg))
 	}
 
-	// 2.5. Write systemd-networkd config for managed interfaces
-	if d.networkd != nil && applyResult != nil && len(applyResult.ManagedInterfaces) > 0 {
+	// 2.5. Write systemd-networkd config for managed interfaces.
+	//
+	// An empty ManagedInterfaces set is NOT a no-op (#2988): when the last
+	// xpf-managed interface is removed, networkd.Apply must still run so its
+	// stale `10-xpf-*` sweep cleans the now-orphaned .network/.link/.netdev
+	// snippets (otherwise the next reload resurrects stale addresses/bonds/
+	// renames). The previous `len(...) > 0` guard shadowed the sweep, leaving
+	// the library fix dead on the live reconcile path. The lifeline is still
+	// protected end-to-end: SetProtectedResolver (daemon_run.go) feeds
+	// resolveProtectedInterfaces, which derives the mgmt set from
+	// ActiveConfig independently of ManagedInterfaces, so the empty-set sweep
+	// preserves the management NIC's files. The `applyResult != nil` guard
+	// stays — a nil result (no dataplane) means there is nothing to reconcile
+	// and the daemon's own startup/Clear paths own the files.
+	//
+	// A write failure is captured (not swallowed, #2987) and returned at the
+	// tail of applyConfigLocked so the commit reports failure (fail-closed),
+	// mirroring dhcpServerErr: every downstream reconcile step still runs so a
+	// networkd write error does not skip RETH MAC programming, VRRP VIP
+	// reconcile, FRR, RA, IPsec, etc. and leave HA state half-applied.
+	var networkdErr error
+	if d.networkd != nil && applyResult != nil {
 		if err := d.networkd.Apply(applyResult.ManagedInterfaces); err != nil {
 			slog.Warn("failed to apply networkd config", "err", err)
+			networkdErr = fmt.Errorf("apply networkd config: %w", err)
 		}
 	}
 
@@ -1321,9 +1343,12 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
 			coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
 	}
-	// #1778: deferred DHCP-server failure — every reconcile step above
-	// has run; surface the Kea restart/stop failure through the commit.
-	return dhcpServerErr
+	// #1778 + #2987: deferred reconcile failures — every reconcile step
+	// above has run; surface the networkd write failure and the Kea
+	// restart/stop failure through the commit so a write that left stale
+	// kernel state fails the commit (fail-closed) instead of reporting
+	// success. Both are joined so neither masks the other.
+	return errors.Join(networkdErr, dhcpServerErr)
 }
 
 // compileErrorMustAbortApply reports whether a dataplane ApplyConfig error

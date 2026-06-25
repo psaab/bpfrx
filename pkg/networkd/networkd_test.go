@@ -146,23 +146,23 @@ func TestWriteIfChanged(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.network")
 
-	// First write — should return true
-	if !writeIfChanged(path, "content1") {
-		t.Error("first write should return true")
+	// First write — should return changed=true, no error
+	if ch, err := writeIfChanged(path, "content1"); !ch || err != nil {
+		t.Errorf("first write: got changed=%v err=%v, want true/nil", ch, err)
 	}
 	data, _ := os.ReadFile(path)
 	if string(data) != "content1" {
 		t.Errorf("got %q, want %q", string(data), "content1")
 	}
 
-	// Same content — should return false
-	if writeIfChanged(path, "content1") {
-		t.Error("same content should return false")
+	// Same content — should return changed=false, no error
+	if ch, err := writeIfChanged(path, "content1"); ch || err != nil {
+		t.Errorf("same content: got changed=%v err=%v, want false/nil", ch, err)
 	}
 
-	// Different content — should return true
-	if !writeIfChanged(path, "content2") {
-		t.Error("different content should return true")
+	// Different content — should return changed=true, no error
+	if ch, err := writeIfChanged(path, "content2"); !ch || err != nil {
+		t.Errorf("different content: got changed=%v err=%v, want true/nil", ch, err)
 	}
 	data, _ = os.ReadFile(path)
 	if string(data) != "content2" {
@@ -669,5 +669,145 @@ func TestApplyPreservesProtectedFiles(t *testing.T) {
 	// The genuinely stale file MUST be removed.
 	if _, err := os.Stat(filepath.Join(dir, "10-xpf-ge-0-0-9.link")); !os.IsNotExist(err) {
 		t.Fatalf("stale ge-0-0-9 .link should have been swept")
+	}
+}
+
+// stubNetworkctl replaces the runNetworkctl shell-out for the duration of a
+// test (the unit sandbox has no systemd-networkd). It records the argument
+// lists each call received and restores the original on cleanup.
+func stubNetworkctl(t *testing.T) *[][]string {
+	t.Helper()
+	orig := runNetworkctl
+	var calls [][]string
+	runNetworkctl = func(args ...string) error {
+		calls = append(calls, append([]string(nil), args...))
+		return nil
+	}
+	t.Cleanup(func() { runNetworkctl = orig })
+	return &calls
+}
+
+// TestGenerateNetwork_DHCPv4StaticIPv6 is the #2986 fail-on-revert: a WAN
+// shape with DHCPv4 enabled AND a static IPv6 address must still install the
+// static IPv6 (the v4 family's DHCP must not suppress the v6 static addr).
+// With the pre-fix whole-interface gate (!DHCPv4 && !DHCPv6) the IPv6 line is
+// dropped and this test fails RED.
+func TestGenerateNetwork_DHCPv4StaticIPv6(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:      "wan0",
+		DHCPv4:    true,
+		Addresses: []string{"10.0.2.10/24", "2001:db8:2::10/64"},
+	}
+	got := m.generateNetwork(ifc)
+	// DHCPv4 owns the v4 address — the static IPv4 must NOT be written.
+	if strings.Contains(got, "Address=10.0.2.10/24") {
+		t.Errorf("DHCPv4 interface should not write static IPv4 address:\n%s", got)
+	}
+	// The static IPv6 belongs to the non-DHCP family — it MUST be written.
+	if !strings.Contains(got, "Address=2001:db8:2::10/64") {
+		t.Errorf("DHCPv4+static-IPv6: static IPv6 address must be installed:\n%s", got)
+	}
+}
+
+// TestGenerateNetwork_DHCPv6StaticIPv4 is the mirror of #2986: DHCPv6 enabled
+// with a static IPv4 must still install the static IPv4.
+func TestGenerateNetwork_DHCPv6StaticIPv4(t *testing.T) {
+	m := New()
+	ifc := InterfaceConfig{
+		Name:      "wan0",
+		DHCPv6:    true,
+		Addresses: []string{"10.0.2.10/24", "2001:db8:2::10/64"},
+	}
+	got := m.generateNetwork(ifc)
+	if !strings.Contains(got, "Address=10.0.2.10/24") {
+		t.Errorf("DHCPv6+static-IPv4: static IPv4 address must be installed:\n%s", got)
+	}
+	if strings.Contains(got, "Address=2001:db8:2::10/64") {
+		t.Errorf("DHCPv6 interface should not write static IPv6 address:\n%s", got)
+	}
+}
+
+// TestApply_WriteErrorFailsCommit is the #2987 fail-on-revert: a write failure
+// must propagate out of Apply rather than being swallowed as no-change-success.
+// The .network path is pre-created as an unwritable DIRECTORY so the atomic
+// writer's rename/create cannot succeed. With the pre-fix swallow
+// (writeIfChanged logs + returns false) Apply returns nil and this test fails
+// RED.
+func TestApply_WriteErrorFailsCommit(t *testing.T) {
+	stubNetworkctl(t)
+	dir := t.TempDir()
+	m := NewInDir(dir)
+
+	// Make the target .network path un-writable by pre-creating a directory
+	// where the file is expected — WriteFileAtomic cannot replace a dir.
+	blocked := filepath.Join(dir, filePrefix+"trust0.network")
+	if err := os.Mkdir(blocked, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := m.Apply([]InterfaceConfig{
+		{Name: "trust0", MACAddress: "52:54:00:aa:bb:cc", Addresses: []string{"10.0.1.10/24"}},
+	})
+	if err == nil {
+		t.Fatal("Apply must fail when a generated file cannot be written (got nil)")
+	}
+	if !strings.Contains(err.Error(), "failed to write") &&
+		!strings.Contains(err.Error(), "write ") {
+		t.Errorf("Apply error should mention the write failure: %v", err)
+	}
+}
+
+// TestApply_EmptySetSweepsStaleFiles is the #2988 fail-on-revert: removing the
+// last managed interface (Apply with an empty desired set) must still sweep
+// stale 10-xpf-* files and request a reload. With the pre-fix early return
+// (len==0 -> return nil) the stale file survives and this test fails RED.
+func TestApply_EmptySetSweepsStaleFiles(t *testing.T) {
+	calls := stubNetworkctl(t)
+	dir := t.TempDir()
+	m := NewInDir(dir)
+
+	stale := filepath.Join(dir, filePrefix+"old.network")
+	if err := os.WriteFile(stale, []byte("[Match]\nName=old\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Apply(nil); err != nil {
+		t.Fatalf("Apply(nil) should succeed: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale 10-xpf-old.network should be swept on empty Apply")
+	}
+	// A reload must be requested because a file was removed.
+	if len(*calls) == 0 || (*calls)[0][0] != "reload" {
+		t.Errorf("empty Apply that removed files must request networkctl reload, got %v", *calls)
+	}
+}
+
+// TestApply_EmptySetPreservesProtected ensures the #2988 empty-set sweep still
+// honors the #1922/#1956 protected-set exemption — the lifeline files must NOT
+// be swept even when the desired set is empty.
+func TestApply_EmptySetPreservesProtected(t *testing.T) {
+	stubNetworkctl(t)
+	dir := t.TempDir()
+	m := NewInDir(dir)
+	m.SetProtectedResolver(func() map[string]bool { return map[string]bool{"fxp0": true} })
+
+	if err := os.WriteFile(filepath.Join(dir, "10-xpf-fxp0.network"),
+		[]byte("[Match]\nName=fxp0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "10-xpf-fxp0.link"),
+		[]byte("[Match]\nOriginalName=enp5s0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Apply(nil); err != nil {
+		t.Fatalf("Apply(nil) should succeed: %v", err)
+	}
+	for _, f := range []string{"10-xpf-fxp0.network", "10-xpf-fxp0.link"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+			t.Errorf("protected file %s swept on empty Apply (lockout!): %v", f, err)
+		}
 	}
 }

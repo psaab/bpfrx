@@ -1619,6 +1619,43 @@ func TestGenerateProtocols_ECMPMaxPaths(t *testing.T) {
 	}
 }
 
+// TestGenerateProtocols_OSPFv3ECMPMaxPaths is a fail-on-revert guard for
+// #2997: the "router ospf6" block must emit "maximum-paths <N>" when global
+// forwarding-table ECMP is enabled (ecmpMaxPaths > 1), mirroring the OSPFv4
+// "router ospf" block. Before the fix the ospf6 block omitted the line, so
+// IPv6 OSPF ECMP was never installed even when configured. Reverting the
+// render line in policy_render.go turns this test RED.
+func TestGenerateProtocols_OSPFv3ECMPMaxPaths(t *testing.T) {
+	m := New()
+	ospfv3 := &config.OSPFv3Config{
+		RouterID: "1.1.1.1",
+		Areas: []*config.OSPFv3Area{
+			{ID: "0.0.0.0", Interfaces: []*config.OSPFv3Interface{{Name: "trust0"}}},
+		},
+	}
+
+	// Global ECMP set: the router ospf6 block must render maximum-paths.
+	got := m.generateProtocols(nil, ospfv3, nil, nil, nil, "", 64, nil)
+	if !strings.Contains(got, "router ospf6") {
+		t.Fatalf("expected router ospf6 block, got:\n%s", got)
+	}
+	if !strings.Contains(got, "maximum-paths 64") {
+		t.Errorf("#2997: missing maximum-paths in router ospf6 block, got:\n%s", got)
+	}
+
+	// No ECMP (ecmpMaxPaths=0): no maximum-paths line.
+	got = m.generateProtocols(nil, ospfv3, nil, nil, nil, "", 0, nil)
+	if strings.Contains(got, "maximum-paths") {
+		t.Errorf("#2997: should not emit maximum-paths in ospf6 when ecmp=0, got:\n%s", got)
+	}
+
+	// ecmpMaxPaths=1 is single-path: no maximum-paths line.
+	got = m.generateProtocols(nil, ospfv3, nil, nil, nil, "", 1, nil)
+	if strings.Contains(got, "maximum-paths") {
+		t.Errorf("#2997: should not emit maximum-paths in ospf6 when ecmp=1, got:\n%s", got)
+	}
+}
+
 func TestApplyFull_BackupRouter(t *testing.T) {
 	dir := t.TempDir()
 	confPath := filepath.Join(dir, "frr.conf")

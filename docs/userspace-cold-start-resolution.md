@@ -180,6 +180,39 @@ reply is irrelevant. The selection seam is unit-tested
 (`probe_socket_tests` in `neighbor.rs`) without manipulating process
 capabilities: a raw failure must produce a DGRAM attempt + selection.
 
+### 5c. IPv6 NDP Solicit Omitted `sin6_scope_id` for Link-Local (#2969)
+
+**Problem:** `trigger_kernel_arp_probe()` built the IPv6
+`sockaddr_in6` from `mem::zeroed()` and set only `sin6_family` +
+`sin6_addr`, leaving `sin6_scope_id == 0`. Linux **cannot route a
+link-local (`fe80::/10`) datagram without the interface scope**, so for
+a link-local next-hop the `sendto` failed (EINVAL/ENETUNREACH) and the
+NDP solicit was never emitted. The `sendto` return was also ignored in
+both the IPv4 and IPv6 branches, so the failure was completely silent:
+probe counters advanced as if NDP was nudged but no packet left the box,
+and the next-hop never resolved — an IPv6 forwarding blackhole to
+link-local next-hops that cleared only when unrelated traffic happened to
+trigger kernel resolution. `SO_BINDTODEVICE` does not substitute for the
+scope id (and on the DGRAM fallback it is itself a no-op without
+CAP_NET_RAW).
+
+**Fix:** `trigger_kernel_arp_probe()` now takes the egress `ifindex`
+(available at every call site — `item.ifindex` in the warmer/resolver,
+`key.0` in dispatch, `neigh_if` in the cold-packet path) and threads it
+into `sin6_scope_id` via the pure `build_solicit_sockaddr_in6()` helper.
+The scope id is set unconditionally: link-local **requires** it, and a
+global/ULA destination ignores it, so no link-local special-case is
+needed. Both branches now check the `sendto` return and `eprintln!` a
+failure (fires only on a probe send error — rare — so it does not
+violate the per-tick logging rules) instead of swallowing it. The
+sockaddr construction is unit-tested as a fail-on-revert in
+`probe_socket_tests` (`ndp_solicit_sockaddr_carries_ifindex_scope_for_link_local`):
+the test goes RED if `sin6_scope_id` reverts to 0.
+
+Distinct from #2482 (DGRAM fallback when no CAP_NET_RAW),
+#2452/#2494 (Go-side static-route/RPM link-local scoping), and the
+#2918/#2919 neighbor-dump work.
+
 ### 6. Buffer Retry Not Running on Empty RX
 
 **Problem:** The `retry_pending_neigh()` function only ran at the end
