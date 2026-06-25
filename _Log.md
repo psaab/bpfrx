@@ -17106,3 +17106,22 @@ top.
   ./pkg/ddns/... (PASS). Fail-on-revert confirmed: reverting the
   LinkByName-error branch to `(static,true)` makes
   TestObserveInterfaceAddrTransientVsDefinitive/LinkByName_error RED.
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2864 static-NAT DNAT zone fallback — evaluate the
+  `from zone` constraint PER CANDIDATE so a port-specific entry whose
+  zone does not match the packet's ingress zone falls through to the
+  whole-address `(dst_ip, None)` entry instead of short-circuiting to
+  no-DNAT. Port-specific precedence preserved (it still wins when its
+  zone matches). Added fail-on-revert test
+  `static_nat_dnat_port_zone_mismatch_falls_back_to_whole_address`
+  (port-zone-fail falls back; port wins on its zone; no candidate matches
+  ingress zone -> no DNAT; unknown IP -> no DNAT). No wire change.
+- **File(s)**: userspace-dp/src/nat/static_nat.rs,
+  userspace-dp/src/nat/tests.rs, docs/feature-coverage.md
+- **Validation**: cargo build --release -p xpf-userspace-dp (clean) ;
+  cargo test --release --bin xpf-userspace-dp -- nat dnat static
+  (466 passed, 0 failed). Fail-on-revert confirmed: reverting the
+  per-candidate `.filter(zone_ok)` fall-through to the once-after-precedence
+  zone check makes the new test RED at the `fallback match` expect.
+  protocol_wire_v1.json untouched.
