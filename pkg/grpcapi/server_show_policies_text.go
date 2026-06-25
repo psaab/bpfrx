@@ -263,8 +263,14 @@ func (s *Server) showPolicyOptions(cfg *config.Config, buf *strings.Builder) {
 				} else if len(t.FromProtocols) > 1 {
 					fmt.Fprintf(buf, "      from protocol [ %s ]\n", strings.Join(t.FromProtocols, " "))
 				}
-				if t.PrefixList != "" {
-					fmt.Fprintf(buf, "      from prefix-list %s\n", t.PrefixList)
+				for _, pl := range t.PrefixList {
+					fmt.Fprintf(buf, "      from prefix-list %s\n", pl)
+				}
+				for _, c := range t.FromCommunity {
+					fmt.Fprintf(buf, "      from community %s\n", c)
+				}
+				for _, ap := range t.FromASPath {
+					fmt.Fprintf(buf, "      from as-path %s\n", ap)
 				}
 				for _, rf := range t.RouteFilters {
 					match := rf.MatchType

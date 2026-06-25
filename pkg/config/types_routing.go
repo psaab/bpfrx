@@ -48,9 +48,15 @@ type PolicyTerm struct {
 	Name          string
 	FromProtocols []string // "direct", "static", "bgp", "ospf" — Junos
 	// "from protocol [ bgp ospf static ]" matches ANY listed protocol.
-	PrefixList      string         // from prefix-list <name>
-	FromCommunity   string         // from community <name> (match against community-list)
-	FromASPath      string         // from as-path <name> (match against as-path access-list)
+	// PrefixList / FromCommunity / FromASPath hold the term's `from
+	// prefix-list`, `from community`, and `from as-path` match statements.
+	// Junos permits MULTIPLE sibling match statements of the same type in
+	// one term (e.g. `from { community c1; community c2; }`), which match
+	// with OR ("any") semantics. They are slices so every repeated match is
+	// kept; a single-string field silently dropped all but the last (#2642).
+	PrefixList      []string       // from prefix-list <name> (OR across entries)
+	FromCommunity   []string       // from community <name> (match community-list; OR)
+	FromASPath      []string       // from as-path <name> (match as-path access-list; OR)
 	RouteFilters    []*RouteFilter // prefix matching
 	Action          string         // "accept", "reject"
 	NextHop         string         // then next-hop (e.g. "peer-address", "self", IP)

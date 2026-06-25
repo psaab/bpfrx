@@ -585,8 +585,11 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 					// first (#2008 H18).
 					term.FromProtocols = append(term.FromProtocols, collectProtocolList(fc)...)
 				case "prefix-list":
+					// Junos allows repeated `prefix-list` siblings in one
+					// term (match ANY). Accumulate so multiple statements are
+					// all kept, not just the last (#2642).
 					if v := nodeVal(fc); v != "" {
-						term.PrefixList = v
+						term.PrefixList = append(term.PrefixList, v)
 					}
 				case "route-filter":
 					if len(fc.Keys) >= 3 {
@@ -623,12 +626,15 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 						term.RouteFilters = append(term.RouteFilters, rf)
 					}
 				case "community":
+					// Repeated `community` siblings match ANY (#2642) — keep
+					// every one, not just the last.
 					if v := nodeVal(fc); v != "" {
-						term.FromCommunity = v
+						term.FromCommunity = append(term.FromCommunity, v)
 					}
 				case "as-path":
+					// Repeated `as-path` siblings match ANY (#2642).
 					if v := nodeVal(fc); v != "" {
-						term.FromASPath = v
+						term.FromASPath = append(term.FromASPath, v)
 					}
 				}
 			}
@@ -714,7 +720,7 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 		case "prefix-list":
 			if i+1 < len(keys) {
 				i++
-				term.PrefixList = keys[i]
+				term.PrefixList = append(term.PrefixList, keys[i])
 			}
 		case "route-filter":
 			if i+2 < len(keys) {
@@ -787,7 +793,7 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 			if i+1 < len(keys) {
 				i++
 				if inFrom {
-					term.FromCommunity = keys[i]
+					term.FromCommunity = append(term.FromCommunity, keys[i])
 				} else {
 					term.Community = keys[i]
 				}
@@ -795,7 +801,7 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 		case "as-path":
 			if i+1 < len(keys) {
 				i++
-				term.FromASPath = keys[i]
+				term.FromASPath = append(term.FromASPath, keys[i])
 			}
 		case "origin":
 			if i+1 < len(keys) {

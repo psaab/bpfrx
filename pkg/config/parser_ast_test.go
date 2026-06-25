@@ -3620,8 +3620,8 @@ func TestMetricTypeAndCommunityListSetSyntax(t *testing.T) {
 	if len(t1.FromProtocols) != 1 || t1.FromProtocols[0] != "direct" {
 		t.Errorf("t1 from protocol = %v, want [direct]", t1.FromProtocols)
 	}
-	if t1.FromCommunity != "MY-COMM" {
-		t.Errorf("t1 from community = %q, want MY-COMM", t1.FromCommunity)
+	if len(t1.FromCommunity) != 1 || t1.FromCommunity[0] != "MY-COMM" {
+		t.Errorf("t1 from community = %v, want [MY-COMM]", t1.FromCommunity)
 	}
 	if t1.MetricType != 1 {
 		t.Errorf("t1 metric-type = %d, want 1", t1.MetricType)
@@ -3681,8 +3681,8 @@ func TestASPathSetSyntax(t *testing.T) {
 	if len(ps.Terms) != 1 {
 		t.Fatalf("got %d terms, want 1", len(ps.Terms))
 	}
-	if ps.Terms[0].FromASPath != "AS65000" {
-		t.Errorf("from as-path = %q, want AS65000", ps.Terms[0].FromASPath)
+	if len(ps.Terms[0].FromASPath) != 1 || ps.Terms[0].FromASPath[0] != "AS65000" {
+		t.Errorf("from as-path = %v, want [AS65000]", ps.Terms[0].FromASPath)
 	}
 	if ps.Terms[0].Action != "accept" {
 		t.Errorf("action = %q, want accept", ps.Terms[0].Action)
