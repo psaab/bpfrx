@@ -144,12 +144,14 @@ impl StateWriter {
                     if swept.insert(req.path.clone()) {
                         sweep_stale_temps(&req.path);
                     }
-                    let result = persist_with_mode(&mut write_mode, &req.path, &req.data);
-                    if let Err(err) = &result {
-                        if let Ok(mut last) = last_error_bg.lock() {
-                            *last = err.clone();
-                        }
-                    }
+                    let outcome = persist_with_mode(&mut write_mode, &req.path, &req.data);
+                    let result = apply_outcome(
+                        outcome,
+                        &mut write_mode,
+                        &active_bg,
+                        &mode_bg,
+                        &last_error_bg,
+                    );
                     let _ = req.resp.send(result);
                 }
             })
@@ -190,13 +192,101 @@ impl StateWriter {
     }
 }
 
-fn persist_with_mode(mode: &mut WriteMode, path: &str, data: &[u8]) -> Result<(), String> {
+/// Result of one persistence attempt, carrying the I/O outcome plus whether the
+/// io_uring transport failed on this write. The writer loop uses `io_uring_failed`
+/// to decide whether to demote `WriteMode` to sync for the rest of its lifetime
+/// (#2958): a runtime ring failure that fell back to a successful sync write must
+/// still flip the reported mode and stop future ring submissions.
+struct PersistOutcome {
+    result: Result<(), String>,
+    /// The io_uring transport failed on this write (regardless of whether the
+    /// sync fallback then succeeded). Always false when already in sync mode.
+    io_uring_failed: bool,
+    /// The io_uring error that triggered the demotion, recorded as `last_error`
+    /// even when the sync fallback succeeded so the demotion cause is visible.
+    demotion_cause: Option<String>,
+}
+
+fn persist_with_mode(mode: &mut WriteMode, path: &str, data: &[u8]) -> PersistOutcome {
     match mode {
-        WriteMode::IoUring(ring) => persist_with_io_uring(ring, path, data).or_else(|err| {
-            persist_sync(path, data).map_err(|sync_err| format!("{err}; {sync_err}"))
-        }),
-        WriteMode::SyncFallback => persist_sync(path, data),
+        WriteMode::IoUring(ring) => match persist_with_io_uring(ring, path, data) {
+            Ok(()) => PersistOutcome {
+                result: Ok(()),
+                io_uring_failed: false,
+                demotion_cause: None,
+            },
+            Err(ring_err) => {
+                // io_uring failed at runtime. Fall back to a sync write for THIS
+                // request, but flag the failure so the writer loop demotes the
+                // mode persistently (status + no future ring attempts).
+                let cause = format!("io_uring write failed, demoting to sync: {ring_err}");
+                let result = persist_sync(path, data)
+                    .map_err(|sync_err| format!("{ring_err}; {sync_err}"));
+                PersistOutcome {
+                    result,
+                    io_uring_failed: true,
+                    demotion_cause: Some(cause),
+                }
+            }
+        },
+        WriteMode::SyncFallback => PersistOutcome {
+            result: persist_sync(path, data),
+            io_uring_failed: false,
+            demotion_cause: None,
+        },
     }
+}
+
+/// Apply a [`PersistOutcome`] to the writer's shared state and return the
+/// caller-visible result. This is the runtime-demotion chokepoint (#2958):
+///
+/// * On an io_uring transport failure (`io_uring_failed`), if we are still in
+///   io_uring mode, demote `*mode` to [`WriteMode::SyncFallback`] PERMANENTLY
+///   (no cooldown retry — avoids flapping) and flip the reported status:
+///   `active=false`, `mode="sync"`. Every subsequent write then takes the sync
+///   branch directly, never re-submitting to the broken ring, and the status
+///   path stops claiming io_uring is active.
+/// * `last_error` is set to the write error when the write failed, or to the
+///   demotion cause when the sync fallback succeeded (so an operator can see
+///   why the writer left io_uring even on a "successful" write).
+///
+/// Extracting this from the writer-thread loop lets a unit test drive the exact
+/// demotion logic on the test thread (fail-on-revert): remove the demotion and
+/// the mode stays io_uring, turning the test RED.
+fn apply_outcome(
+    outcome: PersistOutcome,
+    mode: &mut WriteMode,
+    active: &AtomicBool,
+    mode_str: &Mutex<String>,
+    last_error: &Mutex<String>,
+) -> Result<(), String> {
+    if outcome.io_uring_failed && matches!(mode, WriteMode::IoUring(_)) {
+        *mode = WriteMode::SyncFallback;
+        active.store(false, Ordering::Relaxed);
+        if let Ok(mut m) = mode_str.lock() {
+            *m = "sync".to_string();
+        }
+    }
+    match &outcome.result {
+        Err(err) => {
+            if let Ok(mut last) = last_error.lock() {
+                *last = err.clone();
+            }
+        }
+        Ok(()) => {
+            // The write itself succeeded. If io_uring failed and we fell back to
+            // sync, surface the demotion cause so the transition is observable
+            // even without a failed write.
+            if outcome.io_uring_failed {
+                if let (Ok(mut last), Some(cause)) =
+                    (last_error.lock(), outcome.demotion_cause.as_ref())
+                {
+                    *last = cause.clone();
+                }
+            }
+        }
+    }
+    outcome.result
 }
 
 fn persist_with_io_uring(ring: &mut IoUring, path: &str, data: &[u8]) -> Result<(), String> {
@@ -821,6 +911,89 @@ mod tests {
             "only the published destination should remain after sweep+write"
         );
         assert_eq!(fs::read(&dest).unwrap(), b"fresh state");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Fail-on-revert (#2958): a RUNTIME io_uring write failure must DEMOTE the
+    // writer to sync — permanently — so (a) the reported mode flips to "sync"
+    // and active=false, (b) the demotion cause is recorded as last_error, and
+    // (c) every subsequent write takes the sync branch and never re-submits to
+    // the broken ring. Reverting the demotion (leaving *mode = IoUring) makes
+    // the post-failure assertions RED: the mode stays IoUring and a later write
+    // still reports io_uring_failed=true.
+    #[test]
+    fn runtime_io_uring_failure_demotes_to_sync_permanently() {
+        let dir = tmpdir();
+        let dest = dir.join("state.json");
+        let dest_str = dest.to_str().unwrap().to_string();
+
+        // Construct a writer in io_uring mode. If the kernel cannot provide a
+        // ring (older CI), the demotion path is unreachable, so skip rather than
+        // give a false pass — production always starts in io_uring when a ring
+        // is available, which is the scenario this regression guards.
+        let ring = match IoUring::new(8) {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!("io_uring unavailable on this kernel; skipping demotion test");
+                return;
+            }
+        };
+        let mut mode = WriteMode::IoUring(ring);
+
+        // Mirror the StateWriter startup state: active + mode reflect io_uring.
+        let active = AtomicBool::new(true);
+        let mode_str = Mutex::new(String::from("io_uring"));
+        let last_error = Mutex::new(String::new());
+
+        // Simulate the writer loop receiving an io_uring transport failure whose
+        // sync fallback succeeded — exactly what persist_with_mode produces on a
+        // runtime ring failure.
+        let demotion_cause = "io_uring write failed, demoting to sync: injected".to_string();
+        let outcome = PersistOutcome {
+            result: Ok(()),
+            io_uring_failed: true,
+            demotion_cause: Some(demotion_cause.clone()),
+        };
+        let res = apply_outcome(outcome, &mut mode, &active, &mode_str, &last_error);
+        assert!(res.is_ok(), "sync fallback succeeded, write must report Ok");
+
+        // (a) mode demoted.
+        assert!(
+            matches!(mode, WriteMode::SyncFallback),
+            "runtime io_uring failure must demote WriteMode to SyncFallback"
+        );
+        // (b) reported status reflects sync.
+        assert!(
+            !active.load(Ordering::Relaxed),
+            "status.active must be false after demotion"
+        );
+        assert_eq!(
+            *mode_str.lock().unwrap(),
+            "sync",
+            "status.mode must report sync after demotion"
+        );
+        assert_eq!(
+            *last_error.lock().unwrap(),
+            demotion_cause,
+            "last_error must record the demotion cause"
+        );
+
+        // (c) no further io_uring attempts: a subsequent write now goes through
+        // the sync branch (io_uring_failed=false) and actually persists. With
+        // the demotion reverted, `mode` would still be IoUring here and this
+        // write would route through the ring.
+        let next = persist_with_mode(&mut mode, &dest_str, b"after demotion");
+        assert!(next.result.is_ok(), "post-demotion write must succeed");
+        assert!(
+            !next.io_uring_failed,
+            "post-demotion write must NOT touch io_uring (must take the sync branch)"
+        );
+        assert!(
+            matches!(mode, WriteMode::SyncFallback),
+            "mode must stay sync for the writer's lifetime (no flapping)"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"after demotion");
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

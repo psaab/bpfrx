@@ -989,6 +989,17 @@ Implemented today:
 - helper state persistence through `io_uring` with sync fallback
 - slow-path TUN reinjection through `io_uring` with sync fallback
 
+State-writer runtime demotion (#2958): the helper state writer
+(`userspace-dp/src/state_writer.rs`) picks `io_uring` at thread start when a
+ring is available, otherwise sync. If the ring is created but a *runtime*
+write later fails, that write falls back to sync AND the writer **demotes
+`WriteMode` to sync permanently** for the rest of its lifetime. This keeps the
+reported status truthful — `io_uring_active`/`io_uring_mode` flip to
+`false`/`sync` and `io_uring_last_error` records the demotion cause — and
+avoids every subsequent write paying a guaranteed-failing ring submission
+before falling back. Demotion is one-way (no cooldown retry) to avoid mode
+flapping; restarting the helper re-probes the ring.
+
 Not implemented yet:
 - io_uring-backed session-sync / export transport
 
