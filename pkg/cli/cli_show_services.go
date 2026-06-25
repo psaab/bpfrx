@@ -137,7 +137,7 @@ func (c *CLI) showServicesDynamicDNS(detail bool) error {
 	fmt.Println("\n  Counters:")
 	fmt.Printf("    Publishes: ok=%d fail=%d\n", st.UpsertOK, st.UpsertFail)
 	fmt.Printf("    Withdraws: ok=%d fail=%d\n", st.DeleteOK, st.DeleteFail)
-	fmt.Printf("    Skipped:   unchanged=%d backoff=%d\n", st.Skipped, st.BackedOff)
+	fmt.Printf("    Skipped:   unchanged=%d backoff=%d no-backend=%d\n", st.Skipped, st.BackedOff, st.SkippedNoBackend)
 	fmt.Printf("    Published records: %d\n", st.Scopes)
 
 	if detail && c.surfaceADDNSStatusFn != nil {
