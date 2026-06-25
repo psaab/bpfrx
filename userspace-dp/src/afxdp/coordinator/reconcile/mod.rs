@@ -82,6 +82,15 @@ impl Coordinator {
     ///    start neighbor monitor + local tunnel sources.
     /// 5. Final `refresh_bindings(bindings)` so the operator-visible
     ///    `BindingStatus` snapshot reflects the just-spawned workers.
+    ///
+    /// The `no_snapshot` (config-cleared / shutdown) path returns after
+    /// phase 2 but ALSO runs `refresh_bindings(bindings)` before
+    /// returning (#2515) — phase 1 stopped every worker, so the refresh
+    /// routes each now-workerless slot through `zero_unbound_slot`
+    /// (clearing the bind-mode / socket / capacity fields that the phase
+    /// 2 counter reset leaves untouched) and rebuilds the CoS owner map
+    /// empty. Without it, status commands report torn-down slots as if
+    /// still bound and the CoS owner->worker map keeps stale entries.
     pub fn reconcile(
         &mut self,
         snapshot: Option<&ConfigSnapshot>,
@@ -185,6 +194,22 @@ impl Coordinator {
             self.policy_counters.reconcile_rules(&[]);
             // #2218: no snapshot -> no active NAT rules -> drop all counters.
             self.nat_counters.reconcile_ids(&[]);
+            // #2515: the no_snapshot teardown stopped every worker
+            // (`stop_inner` emptied `workers.live` and cleared the CoS
+            // owner maps), but `reset_binding_counters` only zeroes the
+            // counter scalars + `bound`/`xsk_registered`/`socket_fd` — it
+            // leaves `xsk_bind_mode`, `socket_ifindex`/`queue_id`/
+            // `bind_flags`, `zero_copy`, and the `flow_cache_capacity`/
+            // `active_flow_count` gauges at their pre-teardown values.
+            // Without the refresh below, status commands keep reporting
+            // those slots as if still bound, and the rebuilt CoS
+            // owner->worker map is never emptied. `refresh_bindings`
+            // routes every now-workerless slot through `zero_unbound_slot`
+            // (clearing exactly those residual fields) and rebuilds the
+            // CoS owner map empty — the same tail the snapshot-apply path
+            // runs at the end of `reconcile`. Run it BEFORE setting the
+            // stage so the operator-visible state is consistent on return.
+            self.refresh_bindings(bindings);
             self.last_reconcile_stage = "no_snapshot".to_string();
             return;
         };

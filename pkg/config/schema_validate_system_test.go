@@ -47,8 +47,11 @@ var systemLeafMatrix = []systemLeafCase{
 		name:     "dataplane-ring-entries",
 		leaf:     "ring-entries",
 		template: "set system dataplane ring-entries %s",
-		accept:   []string{"1", "1024", "2048", "8192"},
-		reject:   []string{"0", "-1", "asd", ""},
+		// #2524: bounded [1..16384] AND power-of-two. 16384 is the cap;
+		// 1 (2^0) is the floor. Non-powers-of-two and over-max OOM the
+		// dataplane at bring-up before the fix, so they are rejected.
+		accept: []string{"1", "1024", "2048", "8192", "16384"},
+		reject: []string{"0", "-1", "asd", "", "16385", "32768", "1000", "3000", "100000"},
 	},
 	{
 		name:     "dataplane-poll-mode",

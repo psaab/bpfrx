@@ -131,6 +131,46 @@ const MaxDurationMillis = int64(math.MaxInt64) / int64(time.Millisecond)
 // invert the damping behaviour).
 const MaxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
 
+// MaxRingEntries is the inclusive upper bound for the AF_XDP `ring-entries`
+// per-queue knob (#2524). The Rust helper preallocates UMEM frames directly
+// from this value: per bind.rs binding_frame_count_for_driver, a virtio_net
+// binding reserves ~3×ring_entries frames at UMEM_FRAME_SIZE=4096, i.e.
+// ~96 MB per binding at ring_entries=8192 (×queues ×interfaces). With no
+// ceiling a fat-fingered or malicious value drove an enormous preallocation
+// and OOM'd at bring-up instead of failing as a clean commit/startup error.
+// 16384 is double the documented 8192 example (~192 MB/binding worst case)
+// and is the largest value we consider sane on a router; it must agree with
+// the Rust backstop (afxdp/coordinator/reconcile/bringup.rs clamps to the
+// same ceiling). The value must additionally be a power of two — the helper
+// rounds ring sizes up to a power of two (xsk_ffi.rs next_power_of_two), so
+// requiring it at commit keeps the configured number honest about the size
+// actually allocated.
+const MaxRingEntries = int64(16384)
+
+// ValidateRingEntries accepts a bare integer in [1, MaxRingEntries] that is
+// also a power of two. It is the typed-leaf gate for `system dataplane
+// ring-entries` (#2524). Before #2524 the leaf used ValidateIntegerMin(1):
+// any large value committed and was passed to the dataplane, where it sized
+// per-binding UMEM preallocations and could OOM at bring-up. The power-of-two
+// requirement matches the helper's own rounding so the operator-visible
+// number equals the allocated ring depth.
+func ValidateRingEntries(raw string, _ *Config) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("missing value (expected integer)")
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fmt.Errorf("not an integer: %q", raw)
+	}
+	if v < 1 || v > MaxRingEntries {
+		return fmt.Errorf("ring-entries out of range [1..%d] (got %d)", MaxRingEntries, v)
+	}
+	if v&(v-1) != 0 {
+		return fmt.Errorf("ring-entries must be a power of two in [1..%d] (got %d)", MaxRingEntries, v)
+	}
+	return nil
+}
+
 // maxWireU16 / maxWireU32 are the inclusive ceilings for typed leaves
 // whose value lands in a Rust u16 / u32 wire field. #1979 Layer B uses
 // these so the commit-time range gate agrees EXACTLY with the build-time

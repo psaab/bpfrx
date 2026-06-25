@@ -252,6 +252,15 @@ const _: () = assert!(
 );
 const MIN_RESERVED_TX_FRAMES: u32 = 256;
 const MAX_RESERVED_TX_FRAMES: u32 = 8192;
+/// #2524: independent backstop ceiling for the AF_XDP `ring-entries` knob.
+/// The Go schema rejects out-of-range / non-power-of-two values at commit
+/// (pkg/config ValidateRingEntries, MaxRingEntries = 16384); this constant
+/// is the helper-side fail-safe so a config or `--ring-entries` flag that
+/// bypassed the Go gate still cannot drive an enormous per-binding UMEM
+/// preallocation (binding_frame_count_for_driver sizes ~3×ring_entries
+/// frames per binding). Bring-up clamps to this ceiling. Must match the
+/// Go MaxRingEntries.
+pub(crate) const MAX_RING_ENTRIES: u32 = 16384;
 const TX_BATCH_SIZE: usize = 64;
 const _: () = assert!(
     TX_BATCH_SIZE == 64,
