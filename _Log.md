@@ -1,3 +1,28 @@
+## 2026-06-25 — #2867: VRRP GARP/NA burst follow-up loops keep poisoning after abdication
+
+- **Timestamp**: 2026-06-25
+- **Action**: The detached GARP/NA burst follow-up loops
+  (`runARPBurstFollowups` / `runNABurstFollowups` in `pkg/cluster/garp.go`,
+  launched from `becomeMaster` → `sendGARP` → `SendGratuitous*Burst`) had no
+  epoch/state gate. A node abdicating master mid-burst (link flap / rapid
+  preempt / split-brain) kept broadcasting GARP/NA for VIPs it no longer
+  owned, re-poisoning neighbor caches. Added a `BurstStillValid func() bool`
+  predicate threaded through `SendGratuitousARPBurstGated` /
+  `SendGratuitousIPv6BurstGated` into the follow-up loops; checked before
+  every follow-up frame, stops on false. `sendGARP` passes
+  `getState()==StateMaster && garpEpoch==captured` (composes with the
+  #2081 garpEpoch / #2082 preempt-gate). Original ungated `SendGratuitous*Burst`
+  kept as nil-predicate wrappers for direct-mode re-announce callers.
+- **File(s)**: pkg/cluster/garp.go, pkg/vrrp/instance.go,
+  pkg/cluster/garp_abdicate_test.go (fail-on-revert),
+  pkg/vrrp/instance_garp_abdicate_test.go, pkg/cluster/garp_burst_errors_test.go
+  (signature update), pkg/cluster/README.md, pkg/vrrp/README.md
+- **Validation**: go build ./..., gofmt -l (clean), go vet, go test -race
+  ./pkg/cluster/... ./pkg/vrrp/... — green. Fail-on-revert verified: removing
+  the gate turns TestARPBurstFollowups_AbortsOnAbdication +
+  TestNABurstFollowups_AbortsOnAbdication RED. HA — PARENT runs
+  make test-failover before merge.
+
 ## 2026-06-25 — #2838: DDNS generic backend false-success on substring "ok"
 
 - **Timestamp**: 2026-06-25
