@@ -1,3 +1,23 @@
+## 2026-06-25 — #2922: ECMP `select_route_next_hop` single liveness snapshot
+
+- **Timestamp**: 2026-06-25
+- **Action**: `select_route_next_hop` evaluated the (impure)
+  dynamic-neighbor liveness closure TWICE — `count()` then `nth()`. A
+  neighbor removed by the monitor thread between the two passes made the
+  count see `live > 0` while the select pass yielded `None` → spurious
+  no-route despite a live member at count time, plus doubled hot-path
+  neighbor probes. Fixed: collect live candidate refs into a stack
+  `SmallVec<[&T; 8]>` in a single pass and index into that snapshot, so
+  count and selection observe one consistent liveness view. Selection
+  semantics preserved (`ip_hash % live_count` over candidate order;
+  hashed full-vector fallback when none live). Added two fail-on-revert
+  tests: exact `candidates.len()` predicate-call count, and a
+  live→dead-flip-between-passes case that the reverted double-eval form
+  fails. Scope limited to `select_route_next_hop`; #2923 (tunnel-endpoint
+  ECMP) is a separate lane and untouched.
+- **File(s)**: `userspace-dp/src/afxdp/forwarding/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding/tests.rs`, `docs/multi-wan.md`,
+  `_Log.md`
 ## 2026-06-25 — #2886: VRRP raw-socket fallback cross-VLAN crosstalk (no per-interface ifindex check)
 
 - **Timestamp**: 2026-06-25
