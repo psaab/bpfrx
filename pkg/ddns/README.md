@@ -22,11 +22,11 @@ moved with its assertions intact.
 | `hostname.go` | Deterministic hostname → DNS-label normalization (pure) — moved from `dhcpserver/ddns_hostname.go`. |
 | `surface_a.go` | Surface A router/interface-address publish engine (`SurfaceAManager`): change-detection, forced-refresh wire floor, per-scope error backoff, per-RG HA gate, the backend factory `productionSurfaceABackend` (#2691 P2/P3). |
 | `backend_http.go` | Shared HTTP-backend discipline (#2691 P3): hardened `http.Client` (TLS-verified, bounded timeout), capped body read, `classifyHTTPStatus`, `queryEscape`, the `errHTTPAuth`/`errHTTPRateLimited` verdicts. |
-| `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. |
+| `backend_dyndns2.go` | dyndns2 backend (#2691 P3): one impl behind many provider names (`dyndns2Endpoints`), `good`/`nochg`/`badauth`/`abuse`/`911`/`nohost` verdict parsing. **Withdraw (#2772):** `DeleteLease` issues the same update GET with `offline=YES` (the de-facto dyndns2 withdraw verb) and parses the body verdict; a provider failure returns a non-nil error so the engine keeps ownership for retry (was a silent no-op that orphaned the public record). |
 | `backend_cloudflare.go` | Cloudflare API backend (#2691 P3): Bearer token, zone-id resolve → find → PATCH/POST/DELETE record. |
 | `backend_route53.go` | Route 53 backend (#2691 P3): SigV4-signed `ChangeResourceRecordSets` UPSERT/DELETE change batch. |
 | `sigv4.go` | Minimal self-contained AWS SigV4 signer for Route 53 (no AWS SDK dependency). |
-| `backend_generic.go` | Generic templated backend (#2691 P3, inadyn "custom"): `%h/%i/%u/%p/%%` URL template + success-substring matcher — config-only, no Go code per provider. |
+| `backend_generic.go` | Generic templated backend (#2691 P3, inadyn "custom"): `%h/%i/%u/%p/%%` URL template + success-substring matcher — config-only, no Go code per provider. **Withdraw (#2772):** a single update template has no portable delete verb and xpf exposes no delete template, so `DeleteLease` FAILS (`errGenericDeleteUnsupported`) rather than silently reporting success; the engine keeps ownership so the abandoned record stays operator-visible (was a silent no-op that dropped ownership while the record kept resolving). |
 | `checkip.go` | Opt-in external check-IP address source (#2691 P3): bogus-IP validity gate + allowlist (`isPublicAddr`, `parseCheckIPBody`, `CheckIP`, `ParseAllowlist`). `CheckIP` fails closed on a malformed `checkip-url` via `validateCheckIPURL` (http(s) scheme + host); a typo is also warned at commit by `config.validateSurfaceADDNSWarnings` so it cannot masquerade as a permanent transient observation failure (#2773). |
 
 Tests moved with the code: `manager_test.go` (engine + state-store + hostname),
@@ -66,6 +66,24 @@ diagnostics (#2781). A construction failure
 (missing credential) degrades to the no-op backend (logged; the commit warning
 already fired) — fail-open, matching the rfc2136 posture. Live-provider verify
 is the deferred lab gate; the mock-server tests are the merge gate.
+
+### Withdraw (DeleteLease) semantics per backend (#2772)
+
+A withdraw is triggered when a Surface A scope shrinks, a binding is removed, or
+the observed address is lost. `withdrawOwnedLocked` drops local ownership ONLY on
+a nil-error `DeleteLease`; a non-nil error increments `deleteFail` and KEEPS the
+ownership entry for retry. The HTTP backends therefore must never report a false
+success for a withdraw they did not actually perform — doing so orphans the
+public record while xpf believes it withdrawn (the #2772 bug, originally a no-op
+that returned nil on both dyndns2 and generic).
+
+| backend | withdraw mechanism |
+|---|---|
+| `dyndns2` | the same update GET with `offline=YES` (the de-facto dyndns2 withdraw — dyn/no-ip/dns-o-matic take the hostname offline). Body verdict parsed like an upsert; a provider failure → non-nil error → ownership kept for retry. |
+| `cloudflare` | real DELETE of the record (zone-id resolve → find → DELETE). |
+| `route53` | SigV4 `ChangeResourceRecordSets` DELETE change batch. |
+| `rfc2136` | exact-RR delete (TTL=0 / CLASS=NONE), DHCID-match guarded. |
+| `generic` | **no portable delete verb and no delete template → FAILS** (`errGenericDeleteUnsupported`). Ownership is kept so the abandoned record stays operator-visible; the operator clears it out of band (or uses a backend that supports a withdraw). |
 
 ## The package boundary (why a `LeaseParser` seam)
 

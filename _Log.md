@@ -1,3 +1,42 @@
+## 2026-06-25 — #2772: ddns http dyndns2 + generic withdraw is no longer a silent no-op
+
+- **Timestamp**: 2026-06-25
+- **Action**: For the dyndns2 and generic HTTP DDNS backends, `DeleteLease`
+  was a no-op that returned nil WITHOUT any remote operation. Surface A's
+  `withdrawOwnedLocked` drops local ownership only on a nil-error
+  `DeleteLease`, so when xpf withdrew a name (scope shrink, binding
+  removed, address lost) it reported the withdraw done while the public
+  record kept resolving forever — the comments assumed a provider
+  TTL/liveness reap that is NOT a portable dyndns2/generic contract.
+  Fix:
+  - **dyndns2**: `DeleteLease` now performs the de-facto dyndns2 withdraw
+    verb — the SAME update GET with `offline=YES` (which dyn/no-ip/
+    dns-o-matic honour by taking the hostname offline). Refactored the
+    request/auth/status/verdict logic into a shared `update(ctx, q)`
+    helper used by both `UpsertLease` and `DeleteLease`, so a provider
+    failure on the withdraw propagates as a non-nil error and the engine
+    keeps ownership for retry.
+  - **generic**: a single inadyn-style update template has no portable
+    delete verb and xpf exposes no per-provider delete template, so
+    `DeleteLease` now FAILS (`errGenericDeleteUnsupported`) instead of
+    returning nil. The engine increments `deleteFail` and KEEPS the
+    ownership entry, so the abandoned record stays operator-visible
+    rather than being silently reported as withdrawn.
+  - **scope**: provider-source only (`backend_dyndns2.go`,
+    `backend_generic.go` + `backend_http_test.go`). No shared file
+    (`surface_a.go`/`provider.go`/config types) touched — the existing
+    withdraw-keeps-ownership-on-error contract did the rest.
+  - **Fail-on-revert proof**: reverted both `DeleteLease` bodies to
+    `return nil` and confirmed all three new tests go RED
+    (`TestDyndns2DeleteIssuesOfflineRequest` — server never hit;
+    `TestDyndns2DeletePropagatesProviderFailure` — badauth not surfaced;
+    `TestGenericDeleteFailsNotSilentSuccess` — silent success), then
+    restored and confirmed GREEN.
+  - **Validation**: `go build ./...`, `gofmt -l pkg/ddns/` (clean),
+    `go vet ./pkg/ddns/...`, `go test ./pkg/ddns/...` all pass.
+- **File(s)**: pkg/ddns/backend_dyndns2.go, pkg/ddns/backend_generic.go,
+  pkg/ddns/backend_http_test.go, pkg/ddns/README.md, _Log.md
+
 ## 2026-06-25 — #2773: wire validateCheckIPURL (dead code) into commit + runtime
 
 - **Timestamp**: 2026-06-25
