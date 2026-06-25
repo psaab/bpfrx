@@ -905,6 +905,15 @@ pub(crate) struct SessionSyncRequest {
     pub fabric_ingress: bool,
     #[serde(rename = "is_reverse", default)]
     pub is_reverse: bool,
+    /// #2785: the admitting policy's per-policy `then log` selection,
+    /// carried so a session synced to this node logs the same RT_FLOW
+    /// SESSION_CREATE/CLOSE records after failover. `serde(default)` =>
+    /// false on an old peer that omits the field (no per-policy log),
+    /// which is bit-identical to pre-#2785 behavior (rolling-upgrade safe).
+    #[serde(rename = "log_session_init", default)]
+    pub log_session_init: bool,
+    #[serde(rename = "log_session_close", default)]
+    pub log_session_close: bool,
     /// #2170 HA install generation. Mirrors the Go cluster apply layer's
     /// per-(sender,key) monotonic generation so the helper's in-memory
     /// SyncedSessionEntry can enforce the same guard (belt-and-suspenders

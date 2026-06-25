@@ -2105,6 +2105,13 @@ type SessionSyncRequest struct {
 	NATDstPort       uint16 `json:"nat_dst_port,omitempty"`
 	FabricIngress    bool   `json:"fabric_ingress,omitempty"`
 	IsReverse        bool   `json:"is_reverse,omitempty"`
+	// #2785: the admitting policy's per-policy `then log` selection, carried
+	// so a session synced to the peer logs the same RT_FLOW
+	// SESSION_CREATE/CLOSE records after failover. omitempty is safe — an old
+	// helper without these keys decodes them via serde(default) to false (no
+	// per-policy log), bit-identical to pre-#2785 behavior.
+	LogSessionInit  bool `json:"log_session_init,omitempty"`
+	LogSessionClose bool `json:"log_session_close,omitempty"`
 	// Generation carries the #2170 HA install generation to the helper so
 	// its in-memory SyncedSessionEntry can mirror the cluster apply layer's
 	// generation guard (belt-and-suspenders for helper-originated deletes
@@ -2155,6 +2162,12 @@ type SessionDeltaInfo struct {
 	NATDstPort       uint16 `json:"nat_dst_port,omitempty"`
 	FabricRedirect   bool   `json:"fabric_redirect,omitempty"`
 	FabricIngress    bool   `json:"fabric_ingress,omitempty"`
+	// #2785: the admitting policy's per-policy `then log` selection. Decoded
+	// from the binary open-frame flags byte (bits 1<<3/1<<4) AND mirrored on
+	// the JSON RPC-fallback delta; stamped onto the synced session's
+	// LogFlags so it logs identically after failover.
+	LogSessionInit  bool `json:"log_session_init,omitempty"`
+	LogSessionClose bool `json:"log_session_close,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -2204,4 +2217,9 @@ const (
 	SessionEventFlagFabricRedirect uint8 = 1 << 0
 	SessionEventFlagFabricIngress  uint8 = 1 << 1
 	SessionEventFlagIsReverse      uint8 = 1 << 2
+	// #2785: per-policy `then log` selection carried on the open frame so a
+	// synced session logs the same RT_FLOW records after failover. Must match
+	// FLAG_LOG_SESSION_INIT/CLOSE in userspace-dp/src/event_stream/codec.rs.
+	SessionEventFlagLogSessionInit  uint8 = 1 << 3
+	SessionEventFlagLogSessionClose uint8 = 1 << 4
 )

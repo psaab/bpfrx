@@ -15812,6 +15812,10 @@ top.
   userspace-dp/src/afxdp/umem/tests.rs,
   userspace-dp/src/filter/tests.rs, _Log.md
 
+---
+- **Timestamp**: 2026-06-25
+- **Action**: #2785 — carry per-policy `then log` flags on the HA session-sync wire so a synced session logs identically after failover. Open-frame flags byte (FLAG_LOG_SESSION_INIT 1<<3 / FLAG_LOG_SESSION_CLOSE 1<<4) -> SessionDeltaInfo -> dataplane.SessionValue.LogFlags (bits 0/1, already on cluster wire) -> SessionSyncRequest.log_session_init/close -> synced-session metadata. Rolling-upgrade safe (serde default / omitempty -> false on old peer). Regenerated protocol_wire_v1.json.
+- **File(s)**: userspace-dp/src/event_stream/codec.rs, userspace-dp/src/protocol/control.rs, userspace-dp/src/protocol/binding.rs, userspace-dp/src/afxdp/session_delta.rs, userspace-dp/src/server/helpers.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/eventstream.go, pkg/dataplane/userspace/manager_ha.go, pkg/daemon/daemon_ha_userspace.go, docs/feature-gaps.md, docs/sync-protocol.md, userspace-dp/src/session/README.md, plus tests (codec_tests.rs, main_tests.rs, protocol/tests.rs, eventstream_test.go, manager_test.go).
 - **Timestamp**: 2026-06-25
   **Action**: #2621 — verified codex review-040 finding 040-07
   (input-filter forwarding-class/DSCP/policer modifiers before a
