@@ -524,9 +524,27 @@ func (m *Manager) generateNetwork(ifc InterfaceConfig) string {
 		b.WriteString("IPv6DuplicateAddressDetection=0\n")
 	}
 
-	// Only write Address= lines for static (non-DHCP, non-VLAN-parent) interfaces
-	if !ifc.IsVLANParent && !ifc.DHCPv4 && !ifc.DHCPv6 {
-		addrs := orderAddresses(ifc.Addresses, ifc.PrimaryAddress)
+	// Write static Address= lines for VLAN-parent-exempt interfaces, gating
+	// each family independently on its own DHCP flag (#2986). DHCP is a
+	// per-family property on the wire (DHCPv4 vs DHCPv6/PD), so a static
+	// address must be suppressed ONLY for the family whose DHCP client owns
+	// it — not the opposite family. The common WAN shape DHCPv4 + static
+	// IPv6 (and the mirror static IPv4 + DHCPv6) previously dropped the
+	// static address of the non-DHCP family because the gate keyed on
+	// whole-interface (!DHCPv4 && !DHCPv6).
+	if !ifc.IsVLANParent {
+		ordered := orderAddresses(ifc.Addresses, ifc.PrimaryAddress)
+		addrs := make([]string, 0, len(ordered))
+		for _, addr := range ordered {
+			if addressIsIPv6(addr) {
+				if ifc.DHCPv6 {
+					continue
+				}
+			} else if ifc.DHCPv4 {
+				continue
+			}
+			addrs = append(addrs, addr)
+		}
 		if ifc.PreferredAddress != "" {
 			// Use [Address] sections so we can set PreferredLifetime
 			for _, addr := range addrs {
@@ -573,6 +591,15 @@ func junosSpeedToNetworkd(speed string) string {
 	default:
 		return speed // pass through as-is
 	}
+}
+
+// addressIsIPv6 reports whether a CIDR address string (e.g.
+// "2001:db8::1/64" or "10.0.1.10/24") is IPv6. An IPv6 literal always
+// contains a colon and an IPv4 literal never does, so a colon test
+// classifies the family without a full netip parse — keeping the static
+// render allocation-free and tolerant of zone-id suffixes.
+func addressIsIPv6(addr string) bool {
+	return strings.Contains(addr, ":")
 }
 
 // orderAddresses returns a copy of addrs with primaryAddr first (if set and present).
