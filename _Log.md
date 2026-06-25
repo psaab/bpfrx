@@ -16263,6 +16263,34 @@ top.
   pkg/vrrp/addrwatch_test.go, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2438 — WG/GRE local-delivery TUN write paths shared the same
+  short-write packet-corruption class as #2407, but on NON-BLOCKING fds.
+  Both `afxdp/tunnel.rs` (GRE local-origin delivery, via
+  `drain_local_tunnel_deliveries`) and `afxdp/coordinator/wg_control.rs`
+  (WG decap inner-delivery) used std `Write::write_all`, whose `Ok(n)`
+  loop re-writes `buf[n..]` on a short count — injecting the remainder as
+  a second, malformed packet. Added a non-blocking sibling of #2407's
+  whole-packet helper: `slowpath::write_packet_nonblocking` (single
+  `write()`, retries the WHOLE packet on EINTR and on WouldBlock/EAGAIN —
+  legitimate backpressure on an O_NONBLOCK fd, bounded by a 1024 retry
+  budget then drops with non-fatal ENOBUFS; genuine partial drops with
+  non-fatal EMSGSIZE). Returns the underlying io::Error so each path's
+  fatal-errno classifier is unchanged. The GRE drain helper now takes a
+  packet-write closure seam instead of `&mut impl Write`; the WG site
+  calls the helper on `tun.as_raw_fd()`. Internal-only — NO control
+  message field, NO wire change. Fail-on-revert: slowpath
+  `nb_short_write_drops_no_remainder` (one full-length write, never
+  buf[n..]) and `nb_wouldblock_retries_whole_packet` (EAGAIN retries the
+  whole packet, does not drop) — both proven RED by reverting the
+  respective arm (remainder-resume → second write of len-n; EAGAIN→drop →
+  no second write); `nb_wouldblock_budget_is_bounded_and_drops` (no
+  infinite spin); tunnel `drain_gre_delivery_calls_write_seam_once_with_whole_packet`
+  (drain hands the packet to the seam exactly once at full length).
+  **File(s)**: userspace-dp/src/slowpath.rs,
+  userspace-dp/src/afxdp/tunnel.rs,
+  userspace-dp/src/afxdp/tunnel_tests.rs,
+  userspace-dp/src/afxdp/coordinator/wg_control.rs,
+  docs/xdp-io-uring-userspace-dataplane.md, _Log.md
   **Action**: #2781 — DDNSProvider.String() (pkg/config) printed url-template,
   server, and checkip-url verbatim. The generic backend supports credentials
   embedded in the URL template (userinfo or a token in the query string, e.g.
@@ -16280,3 +16308,31 @@ top.
   go test ./pkg/config/ + ./pkg/ddns/... pass.
   **File(s)**: pkg/config/secret.go, pkg/config/types_system.go,
   pkg/config/ddns_provider_string_test.go, pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2445 — the WireGuard commit-time validator
+  (validateWireguardPeersStrict / validateOneWireguardTunnel,
+  pkg/config/compiler_validate_wireguard.go) rejected duplicate/malformed
+  pubkeys but explicitly NOT an exact-duplicate allowed-ips prefix across
+  peers. The cryptokey routing table is a prefix->peer map; an exact tie
+  has no longest-prefix winner, so the engine LPM (allowed_ips.rs, stable
+  sort by prefix length) resolves it by insertion order — the second peer
+  can handshake but never carries traffic for that prefix (silent route
+  strip). Added a per-tunnel prefixOwner map keyed by the canonical masked
+  CIDR (canonicalAllowedIPPrefix: net.ParseCIDR -> IPNet.String, so
+  10.0.0.5/24 and 10.0.0.0/24 collide; unparseable strings keyed verbatim
+  — malformed-prefix validation stays the Rust IpNet boundary's concern,
+  orthogonal to #2445). An exact-duplicate prefix on two DIFFERENT peers is
+  now a hard commit error; broader/narrower OVERLAP (0.0.0.0/0 catch-all +
+  more-specific peer) and a same-peer repeat stay valid. Scope: pkg/config
+  validation + test only; no userspace-dp Rust touched. Fail-on-revert
+  proof: copied compiler_validate_wireguard.go aside, removed the
+  prefixOwner block + decl, ran go test ./pkg/config/ -run
+  TestWireguardDuplicateAllowedIPsPrefix... ->
+  TestWireguardDuplicateAllowedIPsPrefixRejected and
+  TestWireguardDuplicateAllowedIPsPrefixHostBitsRejected both FAILED
+  ("must be a commit error"); restored from the copy, all green. Gates:
+  go build ./... clean, gofmt -l clean, go vet ./pkg/config/... clean,
+  go test ./pkg/config/... pass.
+  **File(s)**: pkg/config/compiler_validate_wireguard.go,
+  pkg/config/wireguard_multipeer_test.go, docs/config-schema.md, _Log.md

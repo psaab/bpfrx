@@ -52,7 +52,7 @@
 use super::*;
 use crate::afxdp::wg::counters::WgCounters;
 use crate::afxdp::wg::{POLY1305_TAG_LEN, WG_DATA_HEADER_LEN};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
 
@@ -1375,7 +1375,20 @@ fn dispatch_inbound(
                     // kernel routes/firewalls it (NOT the AF_XDP policy
                     // engine — the AllowedIPs gate inside try_decap is
                     // S2a's inner-src control).
-                    if let Err(e) = tun.write_all(&decap_buf[..outcome.len]) {
+                    //
+                    // #2438: the wgN TUN fd is O_NONBLOCK, so this uses
+                    // the single-write whole-packet seam
+                    // (`write_packet_nonblocking`) — never std
+                    // `Write::write_all`, whose short-count stream-resume
+                    // would re-write `buf[n..]` and inject the remainder
+                    // as a SECOND, malformed inner packet (the #2407
+                    // corruption class). The seam retries the WHOLE
+                    // packet on WouldBlock/EINTR and drops (counted) on a
+                    // genuine partial.
+                    if let Err(e) = crate::slowpath::write_packet_nonblocking(
+                        tun.as_raw_fd(),
+                        &decap_buf[..outcome.len],
+                    ) {
                         WgCounters::bump(&engine.counters().tun_write_errors);
                         record_local_tunnel_exception(
                             recent_exceptions,
