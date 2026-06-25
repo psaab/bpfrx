@@ -150,8 +150,10 @@ all files stay in `package ipsec`, so the public API is unchanged.
   - **Family hint** (`gatewayRemoteFamilyHint`, `policy.go`): a gateway
     with a literal `address` takes that IP's family. A **dynamic-hostname**
     gateway (`address` empty, `dynamic hostname <fqdn>` set) is resolved
-    via `resolveHostFamily` (an injectable package var defaulting to
-    `net.LookupIP`) — IPv6-only → family 6, IPv4-only → family 4. Before
+    via `resolveHostFamily` (an injectable package var; the default,
+    `defaultResolveHostFamily`, uses `net.Resolver.LookupIPAddr` bounded by
+    a 2s context timeout — see the bounded-resolver note below) — IPv6-only
+    → family 6, IPv4-only → family 4. Before
     #2757 the empty `address` produced a family-agnostic hint (0), so
     `selectUnitAddress` returned whichever family was listed first on the
     interface (typically IPv4) regardless of the peer — the defect-#2 bug
@@ -166,6 +168,15 @@ all files stay in `package ipsec`, so the public API is unchanged.
     (0) and the interface's first usable address decides — strongSwan then
     initiates from a routable local source. (An explicit `local-address`
     always wins outright; this path only fires when one is absent.)
+  - **Bounded resolver (review fold):** `PrepareConfig` runs synchronously
+    inside the daemon apply sequence (`pkg/daemon/daemon_apply.go`) and the
+    CLI commit path (`pkg/cli/apply.go`), which did NO DNS before #2757.
+    Because the lookup is only a family *hint* (strongSwan does the
+    authoritative resolution at IKE time), the default `resolveHostFamily`
+    bounds it with a 2s context timeout (`resolveHostFamilyTimeout`). On
+    timeout / NXDOMAIN / SERVFAIL it returns family 0 (agnostic) — a slow or
+    unreachable resolver degrades to the interface-decides path and NEVER
+    stalls `commit` / apply for the full glibc resolver timeout.
 - **IKE policy chain → proposal cross-reference (#2270).** A gateway's
   `ike-policy` reference walks gateway → `ike-policy` → `ike-proposal`
   (`resolveIKESettings`, `ike.go`). When that chain breaks — the

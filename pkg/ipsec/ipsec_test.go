@@ -3,6 +3,7 @@ package ipsec
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -1139,6 +1140,29 @@ func TestPrepareConfig_DynamicHostnameFamilyMatch(t *testing.T) {
 					got, tc.wantLocalAddr, tc.resolvedFam)
 			}
 		})
+	}
+}
+
+// TestDefaultResolveHostFamily_BoundedDegrades exercises the REAL default
+// resolver implementation (not an injected fake) and proves it (a) is bounded
+// by resolveHostFamilyTimeout and (b) degrades to family 0 on failure rather
+// than hanging the synchronous commit/apply path (#2757 review fold). It uses
+// the RFC 6761 reserved `.invalid` TLD, which is guaranteed never to resolve,
+// so the lookup fails (NXDOMAIN / no such host) without depending on a
+// reachable nameserver. The hard deadline (4x the timeout) catches a
+// regression that drops the context bound; the expected return is 0.
+func TestDefaultResolveHostFamily_BoundedDegrades(t *testing.T) {
+	done := make(chan int, 1)
+	go func() { done <- defaultResolveHostFamily("xpf-2757-nonexistent.invalid") }()
+
+	select {
+	case fam := <-done:
+		if fam != 0 {
+			t.Fatalf("unresolvable host family = %d, want 0 (degrade-to-agnostic)", fam)
+		}
+	case <-time.After(4 * resolveHostFamilyTimeout):
+		t.Fatalf("default resolver did not return within %v — context bound missing",
+			4*resolveHostFamilyTimeout)
 	}
 }
 

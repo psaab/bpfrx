@@ -1,6 +1,7 @@
 package ipsec
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -8,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -553,20 +555,42 @@ func resolveInterfaceAddressFamily(cfg *config.Config, ifaceRef string, family i
 	return ""
 }
 
+// resolveHostFamilyTimeout bounds the default dynamic-hostname DNS lookup.
+// PrepareConfig runs SYNCHRONOUSLY in the daemon's ordered apply sequence
+// (pkg/daemon/daemon_apply.go) and the CLI commit path (pkg/cli/apply.go),
+// neither of which did any DNS before #2757. This lookup is only a *family
+// hint* (strongSwan does the authoritative resolution at IKE time), so it
+// must never stall commit/apply for the full glibc resolver timeout. 2s is
+// ample for a hint; on timeout/error the default returns family 0 and the
+// interface-decides fallback applies — graceful degradation, never a hang.
+const resolveHostFamilyTimeout = 2 * time.Second
+
 // resolveHostFamily is the hook used to resolve a dynamic-hostname gateway to
 // an address family for local-address selection. It is a package var so tests
-// can make resolution deterministic without real DNS. It returns 4 if the
-// host resolves to (or prefers) IPv4, 6 for IPv6, and 0 if it cannot resolve
-// or the host is dual-stack with no clear preference (let the local interface
-// decide). The default uses the system resolver.
-var resolveHostFamily = func(host string) int {
-	ips, err := net.LookupIP(host)
+// can make resolution deterministic without real DNS (tests inject a fake; no
+// real DNS in the test suite). It returns 4 if the host resolves to (or
+// prefers) IPv4, 6 for IPv6, and 0 if it cannot resolve, times out, or the
+// host is dual-stack with no clear preference (let the local interface
+// decide). The default uses the system resolver bounded by
+// resolveHostFamilyTimeout.
+var resolveHostFamily = defaultResolveHostFamily
+
+func defaultResolveHostFamily(host string) int {
+	ctx, cancel := context.WithTimeout(
+		context.Background(), resolveHostFamilyTimeout)
+	defer cancel()
+
+	var r net.Resolver
+	ips, err := r.LookupIPAddr(ctx, host)
 	if err != nil || len(ips) == 0 {
+		// Timeout / NXDOMAIN / SERVFAIL: fall back to family-agnostic so a
+		// slow or unreachable resolver degrades to interface-decides rather
+		// than stalling commit/apply or guessing the family.
 		return 0
 	}
 	var has4, has6 bool
-	for _, ip := range ips {
-		if ip.To4() != nil {
+	for _, addr := range ips {
+		if addr.IP.To4() != nil {
 			has4 = true
 		} else {
 			has6 = true

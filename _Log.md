@@ -30,6 +30,24 @@
   restore → test GREEN). Companion tests cover the dual-stack peer
   (family-agnostic, first-usable) and the single-stack fallback
   (IPv6 peer / IPv4-only interface → IPv4, not empty).
+- **Review fold (bounded resolver)**: hostile review (MERGE-NEEDS-MINOR)
+  flagged that the default `resolveHostFamily` used the uncontexted,
+  blocking `net.LookupIP`, and `PrepareConfig` runs SYNCHRONOUSLY in the
+  daemon apply sequence (`pkg/daemon/daemon_apply.go`) and the CLI commit
+  path (`pkg/cli/apply.go`) — neither did any DNS before #2757. A
+  slow/unreachable resolver would stall `commit`/apply for the full glibc
+  resolver timeout. Folded: the default is now `defaultResolveHostFamily`
+  using `net.Resolver.LookupIPAddr(ctx, host)` bounded by a 2s context
+  timeout (`resolveHostFamilyTimeout`); on timeout/error it returns family
+  0 (agnostic), preserving the graceful interface-decides degradation.
+  Since the lookup is only a family hint (strongSwan does the authoritative
+  resolution at IKE time), 2s is ample. The injectable `resolveHostFamily`
+  seam and `func(host string) int` signature are unchanged, so no call-site
+  or family-selection logic changed (reviewer confirmed selection correct).
+  Added `TestDefaultResolveHostFamily_BoundedDegrades` exercising the REAL
+  default impl against an RFC 6761 `.invalid` host: it must return 0 within
+  4× the timeout (a hard deadline that goes RED if the context bound is
+  dropped). The injected-fake family-selection tests stay green.
 - **Gates**: `go build ./...` OK, `gofmt -l pkg/ipsec/` clean,
   `go vet ./pkg/ipsec/...` clean, `go test ./pkg/ipsec/...` ok.
 
