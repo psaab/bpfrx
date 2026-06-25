@@ -518,6 +518,100 @@ pub(super) fn request_neighbor_dump(fd: c_int, family: u8, seq: u32) -> io::Resu
 const NLMSG_DONE: u16 = 3;
 const NLMSG_ERROR: u16 = 2;
 
+/// Outcome of parsing one `recv()` batch during the initial dump.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DumpBatchOutcome {
+    /// Batch parsed; `changed` is true if any message mutated the map and
+    /// `dump_done` is true if this batch carried the dump's `NLMSG_DONE`.
+    Parsed { changed: bool, dump_done: bool },
+    /// The dump request itself failed (`NLMSG_ERROR` carrying `next_seq`).
+    Error,
+}
+
+/// Parse one netlink `recv()` batch during the startup neighbor dump.
+///
+/// The dump runs on a socket already subscribed to `RTMGRP_NEIGH` (the same
+/// fd backs the steady-state monitor), so async multicast
+/// `RTM_NEWNEIGH`/`RTM_DELNEIGH` notifications — which carry `nlmsg_seq == 0`
+/// (#1771 §2.6) — can interleave with the dump reply. The previous code
+/// skipped every message whose `nlmsg_seq != next_seq`, which silently
+/// dropped those seq-0 events: they had already been consumed off the
+/// socket and would never be re-delivered, leaving the dynamic neighbor map
+/// stale until an unrelated later event or re-dump (#2918). Startup and HA
+/// failover are exactly when neighbor churn is highest, so a dropped event
+/// could leave a first-packet blackhole.
+///
+/// Fix: route a seq-0 RTM_NEWNEIGH/RTM_DELNEIGH through the same
+/// `parse_neighbor_msg` path the steady-state monitor uses, absorbing it
+/// into the cache instead of discarding it. The dump's own seq-matching is
+/// preserved for `NLMSG_DONE`/`NLMSG_ERROR` (completion + failure
+/// detection): a non-matching, non-multicast control message is still
+/// skipped, and a control message that DOES match `next_seq` drives
+/// completion/error exactly as before.
+pub(super) fn process_dump_batch(
+    buf: &[u8],
+    n: usize,
+    next_seq: u32,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
+) -> DumpBatchOutcome {
+    let mut changed = false;
+    let mut dump_done = false;
+    let mut offset = 0usize;
+    while offset + 16 <= n {
+        let nlmsg_len = u32::from_ne_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+        ]) as usize;
+        let nlmsg_type = u16::from_ne_bytes([buf[offset + 4], buf[offset + 5]]);
+        let nlmsg_seq = u32::from_ne_bytes([
+            buf[offset + 8],
+            buf[offset + 9],
+            buf[offset + 10],
+            buf[offset + 11],
+        ]);
+        if nlmsg_len < 16 || offset + nlmsg_len > n {
+            break;
+        }
+        if nlmsg_seq != next_seq {
+            // A message that is not part of this dump request. An async
+            // multicast neighbor notification (seq 0, type 28/29) MUST be
+            // absorbed — it was already pulled off the socket and will not
+            // be redelivered (#2918). Any other off-sequence control
+            // message is unrelated to this dump and is skipped (its own
+            // dump, if any, tracks completion via its own next_seq).
+            if nlmsg_seq == 0 && (nlmsg_type == 28 || nlmsg_type == 29) {
+                changed |= parse_neighbor_msg(
+                    nlmsg_type,
+                    &buf[offset + 16..offset + nlmsg_len],
+                    dynamic_neighbors,
+                ) != NeighborMsgEffect::None;
+            }
+            offset += (nlmsg_len + 3) & !3;
+            continue;
+        }
+        match nlmsg_type {
+            NLMSG_DONE => {
+                dump_done = true;
+            }
+            NLMSG_ERROR => {
+                return DumpBatchOutcome::Error;
+            }
+            28 | 29 => {
+                changed |= parse_neighbor_msg(
+                    nlmsg_type,
+                    &buf[offset + 16..offset + nlmsg_len],
+                    dynamic_neighbors,
+                ) != NeighborMsgEffect::None;
+            }
+            _ => {}
+        }
+        offset += (nlmsg_len + 3) & !3;
+    }
+    DumpBatchOutcome::Parsed { changed, dump_done }
+}
+
 pub(super) fn initial_neighbor_dump(
     fd: c_int,
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
@@ -537,49 +631,19 @@ pub(super) fn initial_neighbor_dump(
                 }
                 continue;
             }
-            let mut offset = 0usize;
-            let mut dump_done = false;
-            while offset + 16 <= n as usize {
-                let nlmsg_len = u32::from_ne_bytes([
-                    buf[offset],
-                    buf[offset + 1],
-                    buf[offset + 2],
-                    buf[offset + 3],
-                ]) as usize;
-                let nlmsg_type = u16::from_ne_bytes([buf[offset + 4], buf[offset + 5]]);
-                let nlmsg_seq = u32::from_ne_bytes([
-                    buf[offset + 8],
-                    buf[offset + 9],
-                    buf[offset + 10],
-                    buf[offset + 11],
-                ]);
-                if nlmsg_len < 16 || offset + nlmsg_len > n as usize {
-                    break;
+            match process_dump_batch(&buf, n as usize, next_seq, dynamic_neighbors) {
+                DumpBatchOutcome::Error => {
+                    return Err(io::Error::other("netlink neighbor dump failed"));
                 }
-                if nlmsg_seq != next_seq {
-                    offset += (nlmsg_len + 3) & !3;
-                    continue;
+                DumpBatchOutcome::Parsed {
+                    changed: batch_changed,
+                    dump_done,
+                } => {
+                    changed |= batch_changed;
+                    if dump_done {
+                        break;
+                    }
                 }
-                match nlmsg_type {
-                    NLMSG_DONE => {
-                        dump_done = true;
-                    }
-                    NLMSG_ERROR => {
-                        return Err(io::Error::other("netlink neighbor dump failed"));
-                    }
-                    28 | 29 => {
-                        changed |= parse_neighbor_msg(
-                            nlmsg_type,
-                            &buf[offset + 16..offset + nlmsg_len],
-                            dynamic_neighbors,
-                        ) != NeighborMsgEffect::None;
-                    }
-                    _ => {}
-                }
-                offset += (nlmsg_len + 3) & !3;
-            }
-            if dump_done {
-                break;
             }
         }
         next_seq += 1;
@@ -1004,6 +1068,156 @@ pub(super) fn format_mac(mac: [u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+#[cfg(test)]
+mod dump_batch_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const RTM_NEWNEIGH: u16 = 28;
+    const NDA_DST: u16 = 1;
+    const NDA_LLADDR: u16 = 2;
+    const NUD_REACHABLE: u16 = 0x02;
+
+    /// Serialize one RTM_NEWNEIGH netlink message (header + ndmsg + NDA_DST
+    /// + NDA_LLADDR) into `out`, mirroring the kernel wire layout that
+    /// `process_dump_batch`/`parse_neighbor_msg` decode. `seq` is the
+    /// nlmsghdr sequence: the dump reply uses the request seq, a multicast
+    /// notification uses 0.
+    fn push_newneigh_v4(out: &mut Vec<u8>, seq: u32, ifindex: i32, ip: Ipv4Addr, mac: [u8; 6]) {
+        let ip_bytes = ip.octets();
+        let ip_attr_len = 4 + ip_bytes.len(); // NLA header + payload
+        let ip_attr_padded = (ip_attr_len + 3) & !3;
+        let mac_attr_len = 4 + 6;
+        let mac_attr_padded = (mac_attr_len + 3) & !3;
+        let ndmsg_len = 12;
+        let total_len = 16 + ndmsg_len + ip_attr_padded + mac_attr_padded;
+        let start = out.len();
+        out.resize(start + total_len, 0);
+        let buf = &mut out[start..];
+        buf[0..4].copy_from_slice(&(total_len as u32).to_ne_bytes());
+        buf[4..6].copy_from_slice(&RTM_NEWNEIGH.to_ne_bytes());
+        buf[6..8].copy_from_slice(&0u16.to_ne_bytes()); // flags
+        buf[8..12].copy_from_slice(&seq.to_ne_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_ne_bytes()); // pid
+        // ndmsg
+        buf[16] = libc::AF_INET as u8;
+        buf[20..24].copy_from_slice(&ifindex.to_ne_bytes());
+        buf[24..26].copy_from_slice(&NUD_REACHABLE.to_ne_bytes());
+        // NDA_DST
+        let off = 16 + ndmsg_len;
+        buf[off..off + 2].copy_from_slice(&(ip_attr_len as u16).to_ne_bytes());
+        buf[off + 2..off + 4].copy_from_slice(&NDA_DST.to_ne_bytes());
+        buf[off + 4..off + 4 + ip_bytes.len()].copy_from_slice(&ip_bytes);
+        // NDA_LLADDR
+        let off2 = off + ip_attr_padded;
+        buf[off2..off2 + 2].copy_from_slice(&(mac_attr_len as u16).to_ne_bytes());
+        buf[off2 + 2..off2 + 4].copy_from_slice(&NDA_LLADDR.to_ne_bytes());
+        buf[off2 + 4..off2 + 10].copy_from_slice(&mac);
+    }
+
+    /// Serialize an NLMSG_DONE (type 3) control message carrying `seq`.
+    fn push_done(out: &mut Vec<u8>, seq: u32) {
+        let total_len = 16usize;
+        let start = out.len();
+        out.resize(start + total_len, 0);
+        let buf = &mut out[start..];
+        buf[0..4].copy_from_slice(&(total_len as u32).to_ne_bytes());
+        buf[4..6].copy_from_slice(&NLMSG_DONE.to_ne_bytes());
+        buf[8..12].copy_from_slice(&seq.to_ne_bytes());
+    }
+
+    /// #2918 fail-on-revert: a seq-0 (unsolicited multicast)
+    /// RTM_NEWNEIGH that interleaves with the dump reply must be ABSORBED
+    /// into the dynamic neighbor map, not consumed-and-dropped. The dump
+    /// runs on a socket already joined to RTMGRP_NEIGH, so such an event
+    /// can arrive in the same recv() batch as the dump entries; the old
+    /// `if nlmsg_seq != next_seq { continue }` skip silently lost it.
+    ///
+    /// This test feeds `process_dump_batch` a single batch holding the
+    /// dump's own entry (seq 1), an interleaved multicast entry (seq 0),
+    /// and the dump's NLMSG_DONE (seq 1). Reverting the fix to the bare
+    /// skip drops the seq-0 entry and the second `get` assertion FAILS.
+    #[test]
+    fn dump_batch_absorbs_interleaved_seq0_multicast_newneigh() {
+        let dynamic = Arc::new(ShardedNeighborMap::new());
+        let next_seq = 1u32;
+        let ifindex = 7;
+        let dump_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let dump_mac = [0x02, 0, 0, 0, 0, 0x01];
+        let mcast_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let mcast_mac = [0x02, 0, 0, 0, 0, 0x02];
+
+        let mut buf = Vec::new();
+        // Dump reply entry (carries the request seq).
+        push_newneigh_v4(&mut buf, next_seq, ifindex, dump_ip, dump_mac);
+        // Unsolicited multicast notification (seq 0) interleaved BEFORE
+        // the dump completes — the bug case.
+        push_newneigh_v4(&mut buf, 0, ifindex, mcast_ip, mcast_mac);
+        // Dump completion for this family.
+        push_done(&mut buf, next_seq);
+
+        let n = buf.len();
+        let outcome = process_dump_batch(&buf, n, next_seq, &dynamic);
+
+        match outcome {
+            DumpBatchOutcome::Parsed { changed, dump_done } => {
+                assert!(changed, "batch mutated the map, so changed must be true");
+                assert!(dump_done, "NLMSG_DONE for next_seq must end the dump");
+            }
+            DumpBatchOutcome::Error => panic!("unexpected NLMSG_ERROR outcome"),
+        }
+
+        // The dump's own entry is absorbed (baseline).
+        assert_eq!(
+            dynamic.get(&(ifindex, IpAddr::V4(dump_ip))).map(|e| e.mac),
+            Some(dump_mac),
+            "dump entry must be in the cache",
+        );
+        // FAIL-ON-REVERT: the interleaved seq-0 multicast entry must also be
+        // absorbed. With the old `nlmsg_seq != next_seq` skip this is None.
+        assert_eq!(
+            dynamic.get(&(ifindex, IpAddr::V4(mcast_ip))).map(|e| e.mac),
+            Some(mcast_mac),
+            "seq-0 multicast RTM_NEWNEIGH interleaved during the dump must \
+             be absorbed, not dropped (#2918)",
+        );
+    }
+
+    /// Guard the completion path: NLMSG_DONE detection still keys off the
+    /// dump's own seq. A seq-0 multicast event must NOT be mistaken for a
+    /// dump-completion control message, and an unrelated off-seq control
+    /// message must still be skipped without ending the dump early.
+    #[test]
+    fn dump_batch_completion_keys_off_request_seq() {
+        let dynamic = Arc::new(ShardedNeighborMap::new());
+        let next_seq = 2u32;
+
+        let mut buf = Vec::new();
+        // An NLMSG_DONE for an UNRELATED seq must not complete this dump.
+        push_done(&mut buf, 99);
+        // Dump entry + the matching completion.
+        push_newneigh_v4(
+            &mut buf,
+            next_seq,
+            3,
+            Ipv4Addr::new(192, 0, 2, 9),
+            [0x02, 0, 0, 0, 0, 0x09],
+        );
+        push_done(&mut buf, next_seq);
+
+        let n = buf.len();
+        let outcome = process_dump_batch(&buf, n, next_seq, &dynamic);
+        assert_eq!(
+            outcome,
+            DumpBatchOutcome::Parsed {
+                changed: true,
+                dump_done: true,
+            },
+            "only the matching-seq NLMSG_DONE ends the dump",
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
