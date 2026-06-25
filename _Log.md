@@ -15228,3 +15228,62 @@ top.
   Gates re-run green (build, gofmt, vet vrrp/cluster/daemon, -race
   vrrp+cluster, daemon tests).
 - **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/manager_reuse_test.go, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2448 — type static-route destination + next-hop at commit so a
+  malformed CIDR or gateway is REJECTED instead of silently dropped by the
+  FRR renderer / Rust FIB builder (populate_routes soft-skips a non-v4/v6
+  destination; the next-hop resolver falls back to ifindex 0 / interface-only).
+  Added ValidateRouteDestination (family-agnostic CIDR, required prefix —
+  accepts 0.0.0.0/0 + ::/0) and ValidateStaticNextHop (IP / ip@interface /
+  bare interface name; rejects botched IP literals + bad-IP-before-@) +
+  plausibleInterfaceName helper. Wired via a new staticRouteNode() SSOT shared
+  by routing-options / per-rib / routing-instances static blocks; the node now
+  declares next-hop, qualified-next-hop, discard, reject, next-table,
+  preference children so no-next-hop and qualified forms still commit. Added
+  schema_validate_route_2448_test.go (hierarchical + flat-set, fail-on-revert
+  proven RED: stripping the two validators makes all 9 RejectsBad cases
+  silently accept). Gates: go build ./..., gofmt -l clean, go vet clean,
+  go test ./pkg/config/... ./pkg/cmdtree/... ./pkg/frr/... ./pkg/configstore/...
+  all green. Doc: docs/config-schema.md #2448 subsection.
+- **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_routing.go,
+  pkg/config/schema_validate_route_2448_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2448 review fold — fix over-rejection regression flagged in the
+  hostile review of PR #2752. Modeling `next-hop` as a typed value-leaf routed
+  its `interface <iface>` child through the presence-only modifier path, so a
+  PLAIN `next-hop <ip> interface <iface>` (the IPv6 link-local form the
+  compiler supports in both AST shapes) was rejected as
+  `unknown modifier "<iface>"`. Re-modeled next-hop as a CONTAINER with a
+  keyValidator (keyValueType/keyValueDesc/keyValueExamples/keyValidator =
+  ValidateStaticNextHop) so the gateway is still validated while the
+  `interface` child walks as a normal value-bearing child. Added
+  TestSchema2448_NextHop_AcceptsExplicitInterface covering the hierarchical
+  child form AND the flat inline form (both now PASS; rejected before the
+  fold), plus a negative that a malformed gateway WITH an interface is still
+  rejected. All 9 RejectsBad fail-on-revert cases still go RED when the two
+  keyValidators are stripped. Gates: go build ./..., gofmt -l clean, go vet
+  clean, go test ./pkg/config/... ./pkg/cmdtree/... ./pkg/frr/...
+  ./pkg/configstore/... all green. Doc: docs/config-schema.md next-hop
+  container/explicit-interface paragraph.
+- **File(s)**: pkg/config/schema_routing.go,
+  pkg/config/schema_validate_route_2448_test.go, docs/config-schema.md, _Log.md
+- **Action**: #2650 — DDNS ownership state corrupt/unknown-version load now
+  FAILS CLOSED instead of silently resetting to an empty store. `loadDDNSState`
+  returns classified sentinels (`errDDNSStateCorrupt` /
+  `errDDNSStateUnsupportedVersion`); a new `loadStateOrDegrade` helper sets
+  `Manager.degraded`, quarantines the bad file aside
+  (`<path>.corrupt-<UTC-stamp>`, never overwritten by a later save), and
+  `ReconcileScoped` refuses the whole pass (no publish, no withdraw, counted as
+  a reconcile failure) while degraded. The old behavior leaked previously-owned
+  records forever (cleanup authority lost) and could re-claim a peer-owned name.
+  Alarm surfaced in `show ... dynamic-dns` (CLI + gRPC) and the new
+  `xpf_dhcp_ddns_degraded` Prometheus gauge. Added fail-on-revert tests
+  (corrupt + unknown-version → degraded, no ops, quarantined; reverting to
+  fail-open goes RED, proven). go build/vet/gofmt + ddns/dhcpserver/api/cli/
+  grpcapi/daemon tests green.
+- **File(s)**: pkg/ddns/state.go, pkg/ddns/manager.go, pkg/ddns/manager_test.go,
+  pkg/ddns/README.md, pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
+  pkg/api/metrics_system.go, pkg/cli/cli_show_services.go,
+  pkg/grpcapi/server_show_dhcp_lldp_snmp.go, _Log.md

@@ -2,6 +2,7 @@ package ddns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -711,7 +712,7 @@ func TestStateStorePersistsAndReloads(t *testing.T) {
 	}
 }
 
-func TestStateStoreCorruptResetsEmptyFailOpen(t *testing.T) {
+func TestStateStoreCorruptReturnsEmptyStoreClassifiedError(t *testing.T) {
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "state.json")
 	writeCSV(t, statePath, "{ this is not json")
@@ -719,19 +720,22 @@ func TestStateStoreCorruptResetsEmptyFailOpen(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error for corrupt state")
 	}
+	// #2650: the error must be CLASSIFIED corrupt so the manager can fail closed.
+	if !errors.Is(err, errDDNSStateCorrupt) {
+		t.Fatalf("corrupt store error must wrap errDDNSStateCorrupt, got %v", err)
+	}
 	if s == nil || len(s.records) != 0 {
-		t.Fatalf("corrupt store must reset to empty, got %+v", s)
+		t.Fatalf("corrupt store must return an empty store, got %+v", s)
 	}
 }
 
-// TestStateStoreUnsupportedVersionFailsOpen proves the Copilot robustness
-// fix: a state file with an unknown (future) non-zero Version is treated
-// like a corrupt store — fail-open to an EMPTY store + surface an error (so
-// the caller warns), rather than silently decoding records that may carry a
-// different tuple shape into wrong-tuple deletes. No panic. Against the
-// pre-fix loader (which never checked Version) the records load and would be
-// trusted, so this test fails pre-fix.
-func TestStateStoreUnsupportedVersionFailsOpen(t *testing.T) {
+// TestStateStoreUnsupportedVersionClassifiedError proves a state file with an
+// unknown (future) non-zero Version returns an EMPTY store plus a CLASSIFIED
+// unsupported-version error (#2650) — never silently decoding records that may
+// carry a different tuple shape into wrong-tuple deletes, and never silently
+// trusting the empty store. No panic. Against the pre-#2691 loader (which never
+// checked Version) the records load and would be trusted, so this fails pre-fix.
+func TestStateStoreUnsupportedVersionClassifiedError(t *testing.T) {
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "state.json")
 	// A syntactically-valid state file from a FUTURE format version, with a
@@ -741,11 +745,14 @@ func TestStateStoreUnsupportedVersionFailsOpen(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error for an unsupported state version")
 	}
+	if !errors.Is(err, errDDNSStateUnsupportedVersion) {
+		t.Fatalf("unsupported-version error must wrap errDDNSStateUnsupportedVersion, got %v", err)
+	}
 	if s == nil {
 		t.Fatal("loadDDNSState returned nil store on unsupported version (must be empty store)")
 	}
 	if len(s.records) != 0 {
-		t.Fatalf("unsupported version must reset to empty (no wrong-tuple records), got %d records", len(s.records))
+		t.Fatalf("unsupported version must return an empty store (no wrong-tuple records), got %d records", len(s.records))
 	}
 
 	// A version-0 (pre-versioning / zero-value) file is tolerated and its
@@ -758,6 +765,112 @@ func TestStateStoreUnsupportedVersionFailsOpen(t *testing.T) {
 	}
 	if _, ok := s0.get(ScopeKey{}, "mac:bb", "10.0.0.20"); !ok {
 		t.Fatal("version-0 store should load its records")
+	}
+}
+
+// TestCorruptStateFailsClosedRefusingAllOps is the #2650 fail-on-revert test:
+// a corrupt ownership state file must put the manager into the DEGRADED
+// (fail-closed) state — it refuses to publish AND to withdraw any record, never
+// silently resetting to an empty store and reconciling-from-empty (which would
+// leak previously-owned records and could overwrite a peer-owned name). It also
+// proves the bad file is quarantined (preserved, not overwritten) and the alarm
+// is surfaced in Stats. Reverting loadStateOrDegrade to the old fail-open path
+// (treat the empty store as trusted, no degraded flag) makes this test RED: the
+// reconcile would publish the lease and the assertions on no-ops + degraded fail.
+func TestCorruptStateFailsClosedRefusingAllOps(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	// A corrupt store left behind by a crash / disk fault.
+	writeCSV(t, statePath, "{ this is not valid json at all")
+
+	src := &fakeLeaseSource{v4: laptopMacLease()}
+	up := newFakeUpdater()
+	m := newManagerForTesting(
+		src.parser(),
+		up,
+		statePath,
+		filepath.Join(dir, "leases4.csv"),
+		filepath.Join(dir, "leases6.csv"),
+		"node0",
+		func() time.Time { return time.Unix(1_700_000_000, 0) },
+	)
+
+	// Degraded must be set at construction, and surfaced in Stats.
+	if !m.degraded {
+		t.Fatal("manager must be DEGRADED after loading a corrupt state file")
+	}
+	if st := m.Stats(); !st.Degraded || st.DegradedReason == "" {
+		t.Fatalf("Stats must report Degraded with a reason, got %+v", st)
+	}
+
+	// The corrupt file must be quarantined aside (preserved for inspection),
+	// not left in place to be overwritten by a later save.
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("corrupt state file must be quarantined (renamed away); stat err=%v", err)
+	}
+	matches, _ := filepath.Glob(statePath + ".corrupt-*")
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly one quarantined copy, found %v", matches)
+	}
+
+	// A reconcile with an ENABLED config + a live lease must FAIL CLOSED: no
+	// publish, no withdraw, an error returned, and the state file NOT recreated.
+	cfg := &config.DHCPServerConfig{
+		DynamicDNS: &config.DHCPDynamicDNSConfig{
+			Enabled:    true,
+			Domain:     "example.com",
+			TTLSeconds: 300,
+		},
+	}
+	err := m.Reconcile(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("reconcile must return an error while degraded (fail closed)")
+	}
+	if names := up.upsertNames(); len(names) != 0 {
+		t.Fatalf("degraded manager must NOT publish any record, got upserts %v", names)
+	}
+	if names := up.deleteNames(); len(names) != 0 {
+		t.Fatalf("degraded manager must NOT withdraw any record, got deletes %v", names)
+	}
+	// The reconcile must NOT have written a fresh (empty) state file — that
+	// would erase the only signal that ownership was lost.
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatal("degraded manager must not recreate the ownership state file")
+	}
+	// The pass is counted as a failure so an operator watching ReconcileFail /
+	// the degraded gauge sees the suspension.
+	if st := m.Stats(); st.ReconcileFail == 0 {
+		t.Fatal("a degraded reconcile must count as a reconcile failure")
+	}
+}
+
+// TestUnsupportedVersionStateFailsClosed proves the unknown-future-version path
+// also fails closed + quarantines (the sibling of the corrupt path, #2650).
+func TestUnsupportedVersionStateFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	writeCSV(t, statePath, `{"version":99,"records":[{"family":4,"identity":"mac:aa","address":"10.0.0.10","fqdn":"h.example.com","forward_type":"A","ptr_name":"10.0.0.10.in-addr.arpa","ttl":300}]}`)
+
+	up := newFakeUpdater()
+	m := newManagerForTesting(
+		(&fakeLeaseSource{}).parser(),
+		up,
+		statePath,
+		filepath.Join(dir, "leases4.csv"),
+		filepath.Join(dir, "leases6.csv"),
+		"node0",
+		func() time.Time { return time.Unix(1_700_000_000, 0) },
+	)
+	if !m.degraded {
+		t.Fatal("unsupported-version state must put the manager into the degraded state")
+	}
+	// No record from the future-version file leaked into the in-memory store.
+	if len(m.state.records) != 0 {
+		t.Fatalf("unsupported-version records must not load, got %d", len(m.state.records))
+	}
+	matches, _ := filepath.Glob(statePath + ".corrupt-*")
+	if len(matches) != 1 {
+		t.Fatalf("unsupported-version file must be quarantined, found %v", matches)
 	}
 }
 

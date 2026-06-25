@@ -7,8 +7,24 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/psaab/xpf/pkg/fsatomic"
+)
+
+// errDDNSStateCorrupt / errDDNSStateUnsupportedVersion classify a load failure
+// of the ownership store so the manager can FAIL CLOSED rather than silently
+// reset to an empty store (#2650). A corrupt or unknown-future-version store is
+// the only authority for the records this firewall published; treating it as
+// empty would (a) forget what we own — leaking previously-published records into
+// authoritative DNS forever — and (b) let a later publish RE-CLAIM a name a peer
+// owns, since the lost DHCID ownership records can no longer prove or deny our
+// authorship. The reconciler refuses destructive AND additive ops while the load
+// is unresolved (see Manager.degraded). These wrap with %w so the caller uses
+// errors.Is to decide the degraded reason.
+var (
+	errDDNSStateCorrupt            = errors.New("ddns: ownership state file is corrupt")
+	errDDNSStateUnsupportedVersion = errors.New("ddns: ownership state file has an unsupported version")
 )
 
 // state.go (moved verbatim from pkg/dhcpserver/ddns_state.go in #2691 P1a):
@@ -236,11 +252,27 @@ type ddnsStateFile struct {
 
 const ddnsStateVersion = 1
 
-// loadDDNSState reads the ownership store from path. A missing file yields
-// an empty store (first run). A CORRUPT file is FAIL-OPEN per plan §5
-// invariant 4: log-and-reset to empty rather than wedge the reconciler —
-// the caller logs; this returns (emptyStore, err) so the caller can count
-// and warn without aborting.
+// loadDDNSState reads the ownership store from path. A missing file yields an
+// empty store (first run, error nil). A CORRUPT or UNKNOWN-VERSION file is
+// FAIL-CLOSED (#2650): the returned store is empty, but the returned error is
+// non-nil and classifiable (errors.Is errDDNSStateCorrupt /
+// errDDNSStateUnsupportedVersion) so the manager enters a DEGRADED state and
+// refuses to publish or withdraw any record until the operator resolves it.
+//
+// Why fail closed, not fail open: this store is the ONLY authority for the
+// records this firewall published and the DHCID ownership it can prove. Silently
+// resetting to empty both forgets what we own (the cleanup half of the feature is
+// lost — stale A/AAAA/PTR records leak into authoritative DNS forever) AND lets a
+// later publish overwrite a record a PEER owns, because the lost ownership/DHCID
+// state can no longer veto the re-claim. Returning the empty store keeps the
+// manager constructible (the daemon still starts), but the non-nil error gates
+// every reconcile op off until the state is trustworthy again.
+//
+// A read error other than not-exist (permission / IO) is also returned so the
+// manager degrades — an unreadable store is no more trustworthy than a corrupt
+// one — but it is NOT classified corrupt/unsupported (no quarantine: the bytes
+// may be fine and re-readable, so do not move the file out from under a transient
+// fault).
 func loadDDNSState(path string) (*ddnsState, error) {
 	s := &ddnsState{path: path, records: map[string]ownedRecord{}}
 	data, err := os.ReadFile(path)
@@ -252,27 +284,43 @@ func loadDDNSState(path string) (*ddnsState, error) {
 	}
 	var f ddnsStateFile
 	if err := json.Unmarshal(data, &f); err != nil {
-		// Corrupt store: keep the empty (fresh) store. The boundary is only
-		// weakened to "may leak previously-owned records" — those records
-		// stay in DNS until something authoritatively removes them (TTL only
-		// controls resolver CACHING, not removal), so the worst case is
-		// stale-but-present records, never "deletes unowned records".
-		return s, fmt.Errorf("parse ddns state %s (resetting to empty): %w", path, err)
+		// Corrupt store: return the empty store + a corrupt-classified error so
+		// the manager fails closed (refuses all record ops) and quarantines the
+		// bad file. We must NOT silently treat this as an empty trusted store:
+		// that would forget every owned record (permanent stale-record leak) and
+		// permit re-claiming a peer-owned name.
+		return s, fmt.Errorf("parse ddns state %s: %w: %v", path, errDDNSStateCorrupt, err)
 	}
-	// Version validation: an unknown (future / unsupported) non-zero version
-	// means a format we cannot safely decode — its records may carry a
-	// different tuple shape, so trusting them could drive WRONG-tuple
-	// deletes. Treat it like a corrupt store: fail-open to an empty store +
-	// surface the error so the caller warns. Version 0 is tolerated as a
-	// pre-versioning / zero-value store (the field was absent or defaulted).
+	// Version validation: an unknown (future / unsupported) non-zero version is a
+	// format we cannot safely decode — its records may carry a different tuple
+	// shape, so trusting them could drive WRONG-tuple deletes, and ignoring them
+	// loses ownership. Fail closed exactly like a corrupt store. Version 0 is
+	// tolerated as a pre-versioning / zero-value store (the field was absent or
+	// defaulted).
 	if f.Version != 0 && f.Version != ddnsStateVersion {
-		return s, fmt.Errorf("ddns state %s has unsupported version %d (want %d); resetting to empty",
-			path, f.Version, ddnsStateVersion)
+		return s, fmt.Errorf("ddns state %s has version %d (want %d): %w",
+			path, f.Version, ddnsStateVersion, errDDNSStateUnsupportedVersion)
 	}
 	for _, r := range f.Records {
 		s.records[ownedRecordKey(r.scopeOf(), r.Identity, r.Address)] = r
 	}
 	return s, nil
+}
+
+// quarantineBadState moves a corrupt / unknown-version ownership file aside to a
+// timestamped copy (path + ".corrupt-<RFC3339-ish>") so (a) the operator can
+// inspect it and (b) a later save() does NOT overwrite the only forensic copy of
+// the lost ownership records. It is best-effort: a quarantine failure is logged
+// by the caller and does not change the fail-closed posture. Returns the
+// quarantine path on success.
+func quarantineBadState(path string, now time.Time) (string, error) {
+	// Colons are filesystem-hostile; use a compact, sortable stamp.
+	stamp := now.UTC().Format("20060102T150405Z")
+	dst := fmt.Sprintf("%s.corrupt-%s", path, stamp)
+	if err := os.Rename(path, dst); err != nil {
+		return "", fmt.Errorf("quarantine ddns state %s -> %s: %w", path, dst, err)
+	}
+	return dst, nil
 }
 
 // save persists the store durably (fsync-on-write). Records are sorted by

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -214,6 +215,18 @@ type Stats struct {
 	OwnedRecords   int
 	LastReconcile  time.Time
 	LastReconcileN int // active leases seen on the last reconcile
+	// Degraded is the FAIL-CLOSED alarm (#2650): the ownership state file could
+	// not be loaded (corrupt JSON, an unsupported/future version, or an
+	// unreadable file), so the manager cannot prove what records it owns. While
+	// degraded the reconciler refuses BOTH to publish (it could overwrite a
+	// peer-owned record) AND to withdraw/delete (it has lost the ownership it
+	// would withdraw against). The operator must resolve the state file before
+	// DDNS resumes. Surfaced in `show ... dynamic-dns` and Prometheus so the lost
+	// cleanup authority is never silent.
+	Degraded bool
+	// DegradedReason is a human-readable explanation of Degraded (the load error
+	// plus the quarantine path of the bad file, if any). Empty when not degraded.
+	DegradedReason string
 }
 
 // Manager owns the DDNS reconcile loop and the ownership store. It is
@@ -223,6 +236,18 @@ type Manager struct {
 	mu      sync.Mutex
 	state   *ddnsState
 	updater DNSUpdater
+
+	// degraded fails the manager CLOSED when the ownership state file could not
+	// be loaded (#2650): corrupt JSON, an unsupported/future version, or an
+	// unreadable file. The loaded `state` is empty in this case, but it must NOT
+	// be acted upon — an empty store would forget every owned record (permanent
+	// stale-record leak) and let a publish re-claim a peer-owned name. While
+	// degraded, ReconcileScoped is a no-op-with-error: no publish, no withdraw,
+	// no save() (which would overwrite the on-disk file). Cleared only by a
+	// successful reload (operator resolves/removes the bad file and restarts, or
+	// the quarantine leaves a clean slate for a genuine first run). Guarded by mu.
+	degraded       bool
+	degradedReason string
 
 	// newUpdater resolves the live DNS-update backend from the policy +
 	// config resolved at the start of each Reconcile (plan §6 fork 1:
@@ -282,17 +307,55 @@ type Manager struct {
 	lastPolicy atomic.Pointer[ddnsPolicy]
 }
 
+// loadStateOrDegrade loads the ownership store and classifies a load failure
+// into the fail-closed degraded posture (#2650). It always returns a usable
+// (possibly empty) store so the manager is constructible — the daemon must still
+// start — but on a corrupt / unsupported-version / unreadable store it returns
+// degraded=true plus a reason, and the manager refuses every reconcile op until
+// the operator resolves the file. A corrupt / unsupported-version file is
+// QUARANTINED (renamed aside, timestamped) so the bad bytes are preserved for
+// inspection and a later save() cannot clobber the only forensic copy. An
+// unreadable file (permission / IO) is NOT quarantined — the bytes may be fine
+// and re-readable, so it would be wrong to move the file under a transient fault.
+func loadStateOrDegrade(path string, now func() time.Time) (st *ddnsState, degraded bool, reason string) {
+	st, err := loadDDNSState(path)
+	if err == nil {
+		return st, false, ""
+	}
+	classified := errors.Is(err, errDDNSStateCorrupt) || errors.Is(err, errDDNSStateUnsupportedVersion)
+	reason = err.Error()
+	if classified {
+		nowFn := now
+		if nowFn == nil {
+			nowFn = time.Now
+		}
+		if qp, qerr := quarantineBadState(path, nowFn()); qerr != nil {
+			slog.Error("ddns: FAILING CLOSED on unloadable ownership state; quarantine of the bad file also failed",
+				"err", err, "quarantine_err", qerr)
+			reason += " (quarantine failed: " + qerr.Error() + ")"
+		} else {
+			slog.Error("ddns: FAILING CLOSED on unloadable ownership state; bad file quarantined; "+
+				"publishing and withdrawals are SUSPENDED until the operator resolves it",
+				"err", err, "quarantine", qp)
+			reason += " (quarantined to " + qp + ")"
+		}
+	} else {
+		slog.Error("ddns: FAILING CLOSED on unreadable ownership state; publishing and withdrawals "+
+			"are SUSPENDED until the file is readable", "err", err)
+	}
+	return st, true, reason
+}
+
 // NewManager constructs a DDNS manager with the given lease parser, updater
 // backend, and node id. The ownership store is loaded from
-// defaultDDNSStatePath; a corrupt store is reset to empty (fail-open) and the
-// error logged. The parser is the LeaseParser seam (the Kea-memfile parser
-// lives in pkg/dhcpserver — #2691 P1a); a nil parser means the manager reads
-// no leases (every family trusted-empty).
+// defaultDDNSStatePath. A corrupt / unsupported-version / unreadable store puts
+// the manager into the FAIL-CLOSED degraded state (#2650): it is constructible
+// (the daemon still starts) but refuses to publish or withdraw any record until
+// the operator resolves the bad file (quarantined aside). The parser is the
+// LeaseParser seam (the Kea-memfile parser lives in pkg/dhcpserver — #2691 P1a);
+// a nil parser means the manager reads no leases (every family trusted-empty).
 func NewManager(parser LeaseParser, updater DNSUpdater, nodeID string) *Manager {
-	st, err := loadDDNSState(defaultDDNSStatePath)
-	if err != nil {
-		slog.Warn("ddns: ownership state load failed; starting empty", "err", err)
-	}
+	st, degraded, reason := loadStateOrDegrade(defaultDDNSStatePath, time.Now)
 	if updater == nil {
 		// Increment 1 defers the live backend: a nil updater becomes a
 		// logged no-op rather than a nil-pointer panic on first publish or
@@ -302,13 +365,15 @@ func NewManager(parser LeaseParser, updater DNSUpdater, nodeID string) *Manager 
 		updater = nopUpdater{}
 	}
 	return &Manager{
-		state:       st,
-		updater:     updater,
-		nodeID:      nodeID,
-		leaseParser: parser,
-		leasePath4:  "/var/lib/kea/kea-leases4.csv",
-		leasePath6:  "/var/lib/kea/kea-leases6.csv",
-		now:         time.Now,
+		state:          st,
+		degraded:       degraded,
+		degradedReason: reason,
+		updater:        updater,
+		nodeID:         nodeID,
+		leaseParser:    parser,
+		leasePath4:     "/var/lib/kea/kea-leases4.csv",
+		leasePath6:     "/var/lib/kea/kea-leases6.csv",
+		now:            time.Now,
 	}
 }
 
@@ -344,18 +409,20 @@ func NewProductionManager(parser LeaseParser, nodeID string) *Manager {
 // at statePath and injectable lease parser / paths / clock. Exported to other
 // packages' tests via pkg/dhcpserver's test seam.
 func newManagerForTesting(parser LeaseParser, updater DNSUpdater, statePath, leasePath4, leasePath6, nodeID string, now func() time.Time) *Manager {
-	st, _ := loadDDNSState(statePath)
+	st, degraded, reason := loadStateOrDegrade(statePath, now)
 	if updater == nil {
 		updater = nopUpdater{}
 	}
 	return &Manager{
-		state:       st,
-		updater:     updater,
-		nodeID:      nodeID,
-		leaseParser: parser,
-		leasePath4:  leasePath4,
-		leasePath6:  leasePath6,
-		now:         now,
+		state:          st,
+		degraded:       degraded,
+		degradedReason: reason,
+		updater:        updater,
+		nodeID:         nodeID,
+		leaseParser:    parser,
+		leasePath4:     leasePath4,
+		leasePath6:     leasePath6,
+		now:            now,
 	}
 }
 
@@ -516,6 +583,19 @@ func (m *Manager) ReconcileScoped(ctx context.Context, cfg *config.DHCPServerCon
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// FAIL CLOSED (#2650): the ownership state could not be loaded, so we cannot
+	// prove what records this firewall owns. Doing ANYTHING here is unsafe — a
+	// publish could overwrite a peer-owned name (lost DHCID veto) and a withdraw
+	// has no trustworthy owned set to delete against. Refuse the whole pass
+	// (counted as a reconcile failure for visibility) and DO NOT touch the state
+	// file. The empty in-memory store is never acted upon, so no save() runs and
+	// the quarantined bad file is preserved.
+	if m.degraded {
+		err := fmt.Errorf("ddns: reconcile suspended (state degraded): %s", m.degradedReason)
+		m.recordReconcilePass(err)
+		return err
+	}
 
 	env := reconcileEnv{
 		pol:     [2]ddnsPolicy{pol4, pol6},
@@ -1208,9 +1288,13 @@ func (m *Manager) Stats() Stats {
 			pendingNow++
 		}
 	}
+	degraded := m.degraded
+	degradedReason := m.degradedReason
 	m.mu.Unlock()
 
 	st := Stats{
+		Degraded:          degraded,
+		DegradedReason:    degradedReason,
 		UpsertOK:          m.upsertOK.Load(),
 		UpsertFail:        m.upsertFail.Load(),
 		DeleteOK:          m.deleteOK.Load(),
