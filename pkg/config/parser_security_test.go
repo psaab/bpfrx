@@ -5078,3 +5078,94 @@ func TestAddressBookEmptyValueWarns(t *testing.T) {
 		})
 	}
 }
+
+// TestIPsecResponderOnlyGatewaySetSyntax is the #2404 fail-on-revert
+// guard for the config layer: a `security ike gateway G dynamic` block
+// with NO hostname (and no address) marks the gateway responder-only —
+// a dial-in peer with a dynamic source IP. The compiler must set
+// gw.ResponderOnly and the strict commit-time validator
+// (validateIPsecGatewayReferencesStrict, reached via CompileConfig) must
+// ACCEPT the referencing VPN.
+//
+// Counter-factual pin: before #2404 the parser left ResponderOnly false
+// and the strict validator rejected the VPN with "has no address or
+// dynamic hostname; the tunnel would never establish" — CompileConfig
+// returned a non-nil error. Reverting the fix makes CompileConfig fail
+// here.
+func TestIPsecResponderOnlyGatewaySetSyntax(t *testing.T) {
+	cmds := []string{
+		"set security ike proposal p1 authentication-method pre-shared-keys",
+		"set security ike proposal p1 encryption-algorithm aes-256-cbc",
+		"set security ike proposal p1 authentication-algorithm sha-256",
+		"set security ike proposal p1 dh-group group14",
+		"set security ike policy ike-pol proposals p1",
+		"set security ike policy ike-pol pre-shared-key ascii-text secret123",
+		"set security ike gateway dial-in ike-policy ike-pol",
+		"set security ike gateway dial-in local-address 198.51.100.1",
+		"set security ike gateway dial-in dynamic",
+		"set security ipsec vpn dyn ike gateway dial-in",
+		"set security ipsec vpn dyn bind-interface st0.0",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	// CompileConfig is the STRICT commit path
+	// (lenientIPsecGatewayRefs=false): it must accept the responder-only
+	// gateway, not reject it.
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig rejected responder-only gateway: %v", err)
+	}
+	gw := cfg.Security.IPsec.Gateways["dial-in"]
+	if gw == nil {
+		t.Fatal("gateway dial-in not found")
+	}
+	if !gw.ResponderOnly {
+		t.Errorf("gateway ResponderOnly = false, want true (bare dynamic block)")
+	}
+	if gw.Address != "" || gw.DynamicHostname != "" {
+		t.Errorf("responder-only gateway should have no address/hostname, got addr=%q host=%q",
+			gw.Address, gw.DynamicHostname)
+	}
+}
+
+// TestIPsecDynamicHostnameNotResponderOnly pins that a `dynamic hostname
+// <fqdn>` block does NOT flip the responder-only flag — it still carries
+// a resolvable remote target (#2404).
+func TestIPsecDynamicHostnameNotResponderOnly(t *testing.T) {
+	cmds := []string{
+		"set security ike gateway gw1 ike-policy ike-pol",
+		"set security ike gateway gw1 dynamic hostname peer.example.com",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	gw := cfg.Security.IPsec.Gateways["gw1"]
+	if gw == nil {
+		t.Fatal("gateway gw1 not found")
+	}
+	if gw.DynamicHostname != "peer.example.com" {
+		t.Errorf("dynamic hostname = %q, want peer.example.com", gw.DynamicHostname)
+	}
+	if gw.ResponderOnly {
+		t.Errorf("dynamic-hostname gateway must NOT be responder-only")
+	}
+}

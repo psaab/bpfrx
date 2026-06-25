@@ -522,6 +522,21 @@ reserved for whole-dataplane selection where a rewrite shim
     UNTYPED: the swanctl renderer normalizes arbitrary algorithm spellings
     by string substitution, so an enum there would false-reject valid
     configs.
+  - **#2404 (responder-only / dynamic-IP peer):** the `security ike gateway
+    <g> dynamic` node now declares a `hostname <fqdn>` child (it was a
+    `children: nil` leaf in both the `ike` and `ipsec` stanza copies of the
+    gateway schema). The semantics: `dynamic hostname <fqdn>` is a peer with
+    a dynamic IP but a resolvable DNS name (renders `remote_addrs = <fqdn>`,
+    unchanged); a BARE `dynamic` block — no address, no hostname — marks a
+    responder-only peer that dials in from an unknown source address. The
+    compiler (`compileIKE` / `compileIPsec`) sets `IPsecGateway.ResponderOnly`
+    when the `dynamic` block resolves no hostname; the strict commit-time
+    validator (`validateIPsecGatewayReferencesStrict`) accepts such a gateway
+    instead of rejecting it as addressless; and the swanctl render
+    (`resolveRemoteAddr`, `pkg/ipsec/policy.go`) emits `remote_addrs = %any`
+    so strongSwan listens for the inbound IKE rather than skipping the
+    connection. `local-address` (or `external-interface`) still pins the
+    local endpoint as usual.
   - `security nat static rule-set rule match` — declared the
     `source-address` / `destination-address` children the static-NAT
     compiler reads (the subtree was previously unreachable by the walker).

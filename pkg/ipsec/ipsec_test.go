@@ -1289,3 +1289,44 @@ func TestRenderConfig_GatewayNameNeverLeaks(t *testing.T) {
 		}
 	})
 }
+
+// TestGenerateConfig_ResponderOnlyGateway is the #2404 fail-on-revert
+// guard: a gateway carrying a `dynamic` block with no address and no
+// hostname is responder-only — the peer dials in from a dynamic source
+// address. The render MUST emit `remote_addrs = %any` so strongSwan
+// listens for the inbound IKE instead of skipping the connection.
+//
+// Counter-factual pin: before #2404, resolveRemoteAddr returned ok=false
+// for a gateway with neither Address nor DynamicHostname, so renderConfig
+// skipped the VPN entirely (no `dyn {` connection block, no
+// `remote_addrs = %any`). Reverting the ResponderOnly handling makes both
+// assertions below fail.
+func TestGenerateConfig_ResponderOnlyGateway(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+	cfg := &config.IPsecConfig{
+		Gateways: map[string]*config.IPsecGateway{
+			"dial-in": {
+				Name:          "dial-in",
+				ResponderOnly: true,
+				LocalAddress:  "203.0.113.5",
+			},
+		},
+		VPNs: map[string]*config.IPsecVPN{
+			"dyn": {
+				Gateway: "dial-in",
+				PSK:     "supersecret",
+			},
+		},
+		Proposals: map[string]*config.IPsecProposal{},
+	}
+	got := m.generateConfig(cfg)
+	if !strings.Contains(got, "dyn {") {
+		t.Fatalf("responder-only VPN should render a connection block:\n%s", got)
+	}
+	if !strings.Contains(got, "remote_addrs = %any") {
+		t.Fatalf("responder-only gateway must render remote_addrs = %%any:\n%s", got)
+	}
+	if !strings.Contains(got, "local_addrs = 203.0.113.5") {
+		t.Fatalf("responder-only gateway local_addrs missing:\n%s", got)
+	}
+}

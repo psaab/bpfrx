@@ -249,7 +249,9 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 // NAME never leaks into remote_addrs (#2074):
 //
 //   - defined gateway with an address / dynamic hostname -> remote = that
-//   - defined gateway with neither (addressless)         -> ok=false
+//   - defined gateway flagged responder-only (dynamic, no addr/host)
+//     -> remote = "%any" (strongSwan responds, never initiates) (#2404)
+//   - defined gateway with neither + not responder-only   -> ok=false
 //   - no gateway object, vpn.Gateway is a usable IP/host -> remote = it
 //   - no gateway object, vpn.Gateway empty               -> ok=true,
 //     remote="" (connection emitted with no remote_addrs line, as before)
@@ -268,11 +270,14 @@ func resolveRemoteAddr(ipsecCfg *config.IPsecConfig, vpn *config.IPsecVPN) (
 			remoteAddr = gw.Address
 		case gw.DynamicHostname != "":
 			remoteAddr = gw.DynamicHostname
+		case gw.ResponderOnly:
+			// Responder-only / dynamic-IP peer (#2404): the peer initiates
+			// from an unknown source address, so strongSwan listens with
+			// remote_addrs = %any and never initiates to this gateway.
+			remoteAddr = "%any"
 		default:
-			// Gateway exists but has nothing routable. Do NOT fall back
-			// to the object name. (Forecloses a future responder-only /
-			// %any peer that legitimately omits remote_addrs — no such
-			// concept exists in the parser today; revisit if added.)
+			// Gateway exists but has nothing routable and is not flagged
+			// responder-only. Do NOT fall back to the object name.
 			return "", localAddr, gw, false
 		}
 		if gw.LocalAddress != "" && localAddr == "" {

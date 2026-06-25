@@ -15343,3 +15343,16 @@ top.
   pkg/ddns/README.md, pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
   pkg/api/metrics_system.go, pkg/cli/cli_show_services.go,
   pkg/grpcapi/server_show_dhcp_lldp_snmp.go, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2404 — IPsec responder-only / %any dynamic-IP gateway. Added
+  `IPsecGateway.ResponderOnly` flag set by `compileIKE`/`compileIPsec` when a
+  `dynamic` block carries no hostname; strict validator
+  (`validateIPsecGatewayReferencesStrict`) now accepts such a gateway;
+  swanctl render (`resolveRemoteAddr`) emits `remote_addrs = %any`. Wired the
+  `dynamic { hostname <fqdn> }` child into the #1319 setSchema (both gateway
+  copies). Added fail-on-revert tests (proved RED on revert, restored).
+  **File(s)**: pkg/config/types_security.go, pkg/config/compiler_ipsec.go,
+  pkg/config/schema_security.go, pkg/ipsec/policy.go,
+  pkg/config/parser_security_test.go, pkg/ipsec/ipsec_test.go,
+  docs/config-schema.md, _Log.md
