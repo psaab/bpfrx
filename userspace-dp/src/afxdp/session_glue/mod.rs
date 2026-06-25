@@ -467,13 +467,14 @@ pub(super) fn delete_terminal_filtered_session(
 
 /// #2442: the filter half of `export_forward_sessions_for_owner_rgs`. Walks the
 /// owner-RG index and returns the export candidates (forward, locally-owned,
-/// forwarding-disposition sessions) WITHOUT pushing any delta. The two
-/// callers re-emit at different cadences: the `ExportOwnerRGSessions` command
-/// path pushes the whole set in one go (its caller drains with a 15s
-/// export-ack budget), while the worker-loop loss-of-sync resync path
-/// (`worker::loop_body`) emits in ring-sized chunks, draining between chunks so
-/// a worker owning up to `DEFAULT_MAX_SESSIONS` (32× the delta ring) never
-/// re-overflows the ring it is trying to recover.
+/// forwarding-disposition sessions) WITHOUT pushing any delta. Both callers
+/// re-emit through the SAME `chunked_drain_as_you_export!` macro in
+/// `worker::loop_body` (#2653): the `ExportOwnerRGSessions` command path (now
+/// recorded in `WorkerCommandResults.export_owner_rgs`, not emitted inline) and
+/// the loss-of-sync resync path both emit in `RESYNC_EXPORT_CHUNK`-sized chunks,
+/// draining the ring to empty between chunks so a worker owning up to
+/// `DEFAULT_MAX_SESSIONS` (32× the delta ring) never re-overflows the ring it is
+/// trying to recover, and ship a complete snapshot.
 pub(crate) fn forward_export_candidates_for_owner_rgs(
     sessions: &SessionTable,
     owner_rgs: &[i32],
