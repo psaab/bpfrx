@@ -83,14 +83,32 @@ SYN MSS clamp (#2299, `tunnel_tcp_mss`), the encap MTU guards
 and share `native_gre_inner_mtu` / `wg::mss::wg_inner_mtu` /
 `TunnelKind`.
 
-### Outer MTU SSOT (#2300)
+### Outer MTU SSOT (#2300 / #2680)
 There is now ONE outer-MTU model. The transit-egress encap
 (`frame/wg.rs`) and the control-thread egress (`coordinator/wg_control.rs`)
-both gate against the REAL underlay-egress interface MTU, not a hardcoded
-1500. The control thread is handed the resolved underlay MTU at spawn
-(`Coordinator::resolve_wg_outer_mtu` route-looks-up the peer endpoint in
-the endpoint's transport table). `WG_DEFAULT_OUTER_MTU` (1500) is now
-ONLY the last-resort fallback for an unconfigured/unroutable endpoint.
+both gate the OUTER encapped datagram against the REAL underlay-egress
+interface MTU, not a hardcoded 1500. The control thread is handed the
+resolved underlay MTU at spawn (`Coordinator::resolve_wg_outer_mtu`
+route-looks-up the peer endpoint in the endpoint's transport table).
+`WG_DEFAULT_OUTER_MTU` (1500) is now ONLY the last-resort fallback for an
+unconfigured/unroutable endpoint.
+
+**#2680 (transit-egress site).** The `frame/wg.rs` guard previously read
+the MTU of `decision.resolution.egress_ifindex`, which for a tunnel-resolved
+flow is the tunnel LOGICAL ifindex (the WG interface, MTU ~1420), NOT the
+physical underlay. Comparing the full OUTER encapped size against the
+LOGICAL MTU silently dropped inner packets whose outer datagram fit the
+1500-byte underlay (`encap_mtu_drops`) — broken PMTUD / tunnel transit. The
+guard now resolves the PHYSICAL egress MTU via `outer_physical_egress_mtu`,
+which route-looks-up the SELECTED peer endpoint (`engine.peer_for_dest`, the
+real outer hop — the endpoint-level `destination` is zeroed to `0.0.0.0` for
+WG, so `resolve_tunnel_outer` cannot be reused here) in the endpoint's
+transport table and gates against that underlay interface's MTU.
+Distinctions kept separate: OUTER encapped size vs PHYSICAL underlay MTU is
+THIS guard; the INNER packet's own logical/PMTUD budget is the inner-MTU
+clamp / post-transform PMTUD (#2299/#2330/#2457). Conservative fallback: an
+unresolvable outer route falls back to the resolution's `egress_ifindex` MTU
+(the pre-#2680 behaviour) then 1500 — never tighter than before.
 On the Go side, `wgTunMTUForEndpoint` honors an operator-set `mtu` on the
 tunnel interface (the supported sub-1500 / jumbo override — PPPoE 1492,
 cloud overlays ~1450); with no operator MTU it derives the wgN inner MTU
