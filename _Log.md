@@ -17497,3 +17497,27 @@ top.
   gofmt -l clean, go vet ./pkg/ipsec/..., go test ./pkg/ipsec/... PASS.
 - **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/matchfamily_linklocal_test.go,
   pkg/ipsec/README.md, _Log.md
+
+## 2026-06-25 — #2885 review fold (PR #2927 MERGE-NEEDS-MINOR x2)
+- **Timestamp**: 2026-06-25
+- **Action**: Folded two hostile-review MINORs on the #2885 fix.
+  MINOR-1 (global-must-win order-dependence): matchFamily feeds a first-match
+  loop (selectUnitAddress over config order; resolveKernelInterfaceAddress
+  over kernel order). Now that family-6 admits fe80::, a link-local enumerated
+  before the global IPv6 could win. Added selectFamilyAddress doing a two-pass
+  family-6 scan — pass 1 admits only global unicast (bareIPGlobalOnly), pass 2
+  falls back to link-local only if no global exists. Both resolvers route
+  through it; "global wins" is now order-independent.
+  MINOR-2 (bare fe80:: lacks %iface zone): a bare link-local local_addrs is
+  ambiguous on a multi-interface box. Added zoneQualify(addr, iface) appending
+  %<iface> to a link-local result; resolveKernelInterfaceAddress uses the
+  looked-up name, resolveConfiguredInterfaceAddress uses config.LinuxIfName(
+  base). Global/IPv4/already-zoned addresses pass through unchanged.
+  FAIL-ON-REVERT: TestSelectUnitAddressFamily6GlobalWinsOverLinkLocal (link-
+  local listed FIRST, asserts the GLOBAL wins) goes RED when the global-only
+  first pass is removed; TestResolveConfiguredInterfaceAddressZoneQualifiesLink
+  Local asserts fe80::1%ge-0-0-3 and goes RED when zoneQualify is neutered.
+  Both verified via copy-aside revert. Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/ipsec/..., go test ./pkg/ipsec/... PASS.
+- **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/matchfamily_linklocal_test.go,
+  pkg/ipsec/README.md, _Log.md
