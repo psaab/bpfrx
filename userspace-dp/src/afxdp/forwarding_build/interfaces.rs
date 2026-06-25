@@ -166,6 +166,13 @@ pub(super) fn populate_egress(
         // (> 65535) fails the snapshot closed rather than wrapping to a
         // different VLAN (a different L2 domain).
         let vlan_id = super::validated::VlanId::try_from_snapshot(iface.vlan_id, &iface.name)?.get();
+        // #2706: validate the MTU ONCE here instead of narrowing it with an
+        // unchecked `iface.mtu.max(0) as usize`. A NEGATIVE value fails the
+        // snapshot closed rather than collapsing to 0 — which the egress MTU
+        // guard treats as "unknown; forward", silently disabling PTB/drop
+        // enforcement. 0 (the legitimate "unknown MTU" sentinel) stays
+        // permissive.
+        let mtu = super::validated::InterfaceMtu::try_from_snapshot(iface.mtu, &iface.name)?.get();
         let ingress_key = (bind_ifindex, vlan_id);
         if iface.parent_ifindex > 0 {
             state
@@ -206,7 +213,7 @@ pub(super) fn populate_egress(
             EgressInterface {
                 bind_ifindex,
                 vlan_id,
-                mtu: iface.mtu.max(0) as usize,
+                mtu,
                 src_mac,
                 zone_id,
                 redundancy_group: iface.redundancy_group,

@@ -53,6 +53,20 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				if entry == nil {
 					continue
 				}
+				// #2704: an undefined forwarding-class ref in a DSCP
+				// classifier is only a non-fatal commit-time warning
+				// (compiler_validate_warn.go). Mirror the #2696/#2409
+				// scheduler-map skip+warn so the loss is no longer SILENT
+				// (the Rust side already drops unresolvable classifier
+				// entries; filtering here keeps the drop visible and the
+				// helper drift-backstop a true never-fires guard).
+				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+					slog.Warn("cos dscp-classifier references undefined forwarding-class; skipping entry (classifier partially absent)",
+						"classifier", classifier.Name,
+						"forwarding_class", entry.ForwardingClass,
+					)
+					continue
+				}
 				classifierSnap.Entries = append(classifierSnap.Entries, CoSDSCPClassifierEntrySnapshot{
 					ForwardingClass: entry.ForwardingClass,
 					LossPriority:    entry.LossPriority,
@@ -80,6 +94,14 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				if entry == nil {
 					continue
 				}
+				// #2704: same skip+warn for 802.1p classifier entries.
+				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+					slog.Warn("cos ieee-802.1 classifier references undefined forwarding-class; skipping entry (classifier partially absent)",
+						"classifier", classifier.Name,
+						"forwarding_class", entry.ForwardingClass,
+					)
+					continue
+				}
 				classifierSnap.Entries = append(classifierSnap.Entries, CoSIEEE8021ClassifierEntrySnapshot{
 					ForwardingClass: entry.ForwardingClass,
 					LossPriority:    entry.LossPriority,
@@ -105,6 +127,18 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 			rewriteSnap := CoSDSCPRewriteRuleSnapshot{Name: rewriteRule.Name}
 			for _, entry := range rewriteRule.Entries {
 				if entry == nil {
+					continue
+				}
+				// #2704: same skip+warn for DSCP rewrite entries. Without
+				// this an undefined-class rewrite crossed the wire and the
+				// Rust side only materialized rewrite for classes the
+				// interface actually carries, so the rewrite was silently
+				// no-op for the undefined class.
+				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+					slog.Warn("cos dscp rewrite-rule references undefined forwarding-class; skipping entry (rewrite absent for class)",
+						"rewrite_rule", rewriteRule.Name,
+						"forwarding_class", entry.ForwardingClass,
+					)
 					continue
 				}
 				rewriteSnap.Entries = append(rewriteSnap.Entries, CoSDSCPRewriteRuleEntrySnapshot{

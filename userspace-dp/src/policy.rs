@@ -143,6 +143,17 @@ pub(crate) enum SnapshotIntegrityError {
     /// a partial CoS table. An EMPTY class name is the legitimate "unnamed /
     /// placeholder" case and is NOT an error (skipped as before).
     CosQueueIdOutOfRange { forwarding_class: String, queue: i32 },
+    /// #2706: an interface snapshot's `mtu` is NEGATIVE. The pre-fix code
+    /// narrowed it with `iface.mtu.max(0) as usize`, so a negative value
+    /// silently collapsed to 0 — and the egress MTU guard
+    /// (`forwarded_egress_mtu_decision`) treats mtu 0 as "unknown; forward"
+    /// (fail-open), so a negative MTU silently DISABLED PTB / drop enforcement
+    /// on that interface. A healthy Go control plane never emits a negative MTU
+    /// (netlink MTUs are non-negative; 0 is the legitimate "unknown" sentinel
+    /// preserved as permissive). Fail the snapshot closed on a negative value
+    /// rather than installing an interface with MTU enforcement off, consistent
+    /// with the #2410/#2696 fail-closed family.
+    InterfaceMtuInvalid { interface: String, mtu: i32 },
     /// #2409: an interface address snapshot's `address` string did not parse as
     /// an `IpNet` CIDR. The pre-fix code `continue`d past it, so the connected
     /// route / local-address / interface-NAT material for that address silently
@@ -233,6 +244,11 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "cos forwarding-class {:?} has queue {} outside the 0..=255 range — refusing to silently drop the class (which would unmap every classifier/scheduler entry referencing it)",
                 forwarding_class, queue
+            ),
+            Self::InterfaceMtuInvalid { interface, mtu } => write!(
+                f,
+                "interface {:?} has a negative mtu {} — refusing to narrow it with an unchecked .max(0) cast that would collapse it to 0 (which the egress MTU guard treats as \"unknown; forward\", silently disabling PTB/drop enforcement)",
+                interface, mtu
             ),
             Self::InterfaceAddressUnparseable { interface, address } => write!(
                 f,

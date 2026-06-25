@@ -1211,6 +1211,69 @@ fn interface_vlan_id_in_range_builds_exactly() {
     assert_eq!(state.egress.get(&31).expect("egress 31").vlan_id, 0);
 }
 
+/// #2706: a NEGATIVE interface MTU fails the snapshot CLOSED via
+/// `InterfaceMtuInvalid`. fail-on-revert: restoring `iface.mtu.max(0) as
+/// usize` silently collapses -1 → 0, the egress MTU guard then treats 0 as
+/// "unknown; forward" (PTB/drop enforcement disabled), the build succeeds,
+/// and this `expect_err` goes red.
+#[test]
+fn interface_negative_mtu_fails_closed() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0/0/2".into(),
+            ifindex: 40,
+            mtu: -1, // collapses to 0 (enforcement off) under the old `.max(0)` cast
+            hardware_addr: "02:00:00:00:00:40".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let err = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err("a negative interface MTU must fail closed, not collapse to 0 (enforcement off)");
+    match err {
+        crate::policy::SnapshotIntegrityError::InterfaceMtuInvalid { interface, mtu } => {
+            assert_eq!(interface, "ge-0/0/2");
+            assert_eq!(mtu, -1);
+        }
+        other => panic!("expected InterfaceMtuInvalid, got {other:?}"),
+    }
+}
+
+/// #2706 anti-over-reject: a positive MTU builds through unchanged, and the
+/// legitimate 0 "unknown MTU" sentinel is preserved as 0 (the permissive
+/// "forward; MTU unknown" case the egress guard relies on) — byte-identical
+/// to the old `.max(0) as usize`. This guards against the #2696
+/// over-rejection dual-risk (rejecting a legit 0 would break deploy-boot of
+/// any interface whose link MTU could not be resolved).
+#[test]
+fn interface_mtu_positive_and_zero_build_exactly() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0/0/3".into(),
+                ifindex: 41,
+                mtu: 9000, // jumbo — passes through unchanged
+                hardware_addr: "02:00:00:00:00:41".into(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0/0/4".into(),
+                ifindex: 42,
+                mtu: 0, // legitimate "unknown MTU" sentinel → stays 0 (permissive)
+                hardware_addr: "02:00:00:00:00:42".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert_eq!(state.egress.get(&41).expect("egress 41").mtu, 9000);
+    assert_eq!(state.egress.get(&42).expect("egress 42").mtu, 0);
+}
+
 /// #2410: a tunnel TTL > 255 fails the snapshot CLOSED via
 /// `TunnelTtlOutOfRange`. fail-on-revert: restoring
 /// `endpoint.ttl.max(0) as u8` wraps 256 → 0 (a blackholed tunnel) and

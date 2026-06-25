@@ -14134,3 +14134,38 @@ top.
   `go test ./pkg/{ddns,config,dhcpserver,daemon}` green; `-race ./pkg/ddns`
   green. `make test-failover` still MANDATORY — the parent re-runs it on the
   folded head.
+
+## 2026-06-24 — #2704 + #2706 forwarding-build validation siblings (one PR)
+
+- **Timestamp**: 2026-06-24
+- **Action**: #2704 — apply the #2696/#2409 scheduler-map skip+warn pattern to
+  the DSCP classifier, 802.1p classifier, and DSCP rewrite emitters so an
+  entry referencing an undefined forwarding-class (a non-fatal commit warning)
+  is SKIPPED with a slog.Warn instead of crossing the wire to be silently
+  dropped / no-op'd by the Rust drift backstop. Go warn NOT promoted to a hard
+  error (out of scope). #2706 — add an `InterfaceMtu` validated newtype
+  (mirroring VlanId/TunnelTtl/QueueId) decoded at the egress-interface build
+  site; a NEGATIVE snapshot MTU now fails the snapshot closed
+  (`InterfaceMtuInvalid`) instead of `iface.mtu.max(0) as usize` collapsing it
+  to 0 — which the egress MTU guard treats as "unknown; forward", silently
+  disabling PTB/drop enforcement. 0 (the legitimate Go "unknown MTU" sentinel,
+  omitempty-dropped when the link can't be resolved) stays permissive (=0),
+  avoiding the #2696 over-rejection dual-risk.
+- **File(s)**: [Edit] pkg/dataplane/userspace/cos.go,
+  pkg/dataplane/userspace/manager_test.go,
+  userspace-dp/src/afxdp/forwarding_build/validated.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/policy.rs, _Log.md. Docs: behavior documented inline per the
+  established fail-closed-family convention (VlanId/TunnelTtl/QueueId and the
+  #2409 scheduler-map skip are all self-documenting in code; no separate md
+  registry exists for this family).
+- **Validation**: GOCACHE go build ./... clean; gofmt + go vet clean on touched
+  Go; go test ./pkg/dataplane/userspace/... green (incl. new
+  TestBuildClassOfServiceSnapshotSkipsUndefinedClassifierAndRewriteClass).
+  cargo build --release clean; cargo test --release --bin xpf-userspace-dp
+  forwarding_build green (68/0) incl. new interface_negative_mtu_fails_closed +
+  interface_mtu_positive_and_zero_build_exactly. Fail-on-revert: removing the
+  Go filter lets the undefined-class entry cross the wire (surviving-entry
+  asserts go red); restoring `.max(0) as usize` collapses -1→0 (expect_err goes
+  red).
