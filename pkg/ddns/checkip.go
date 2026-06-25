@@ -222,14 +222,17 @@ const AddressSourceCheckIP AddressSource = "checkip"
 // at runtime construction (CheckIP) rather than spinning forever as a phantom
 // "transient" observation failure (#2773). It requires an http(s) scheme AND a
 // host: http.NewRequest accepts ftp://, "not a url", and a host-less "http://",
-// none of which can ever fetch a public address.
+// none of which can ever fetch a public address. The scheme check is
+// case-INSENSITIVE per RFC 3986 §3.1 ("HTTPS://host" is valid), so it parses
+// first and compares the parsed scheme with EqualFold rather than a
+// case-sensitive HasPrefix on the raw string (#2842).
 func validateCheckIPURL(u string) error {
-	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-		return fmt.Errorf("ddns checkip: url %q must be http(s)", u)
-	}
 	parsed, err := url.Parse(u)
 	if err != nil {
 		return fmt.Errorf("ddns checkip: url %q is not a valid URL: %w", u, err)
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return fmt.Errorf("ddns checkip: url %q must be http(s)", u)
 	}
 	if parsed.Host == "" {
 		return fmt.Errorf("ddns checkip: url %q has no host", u)

@@ -669,12 +669,14 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 					if v := nodeVal(ac); v != "" {
 						if n, err := strconv.Atoi(v); err == nil {
 							term.LocalPreference = n
+							term.HasLocalPreference = true
 						}
 					}
 				case "metric":
 					if v := nodeVal(ac); v != "" {
 						if n, err := strconv.Atoi(v); err == nil {
 							term.Metric = n
+							term.HasMetric = true
 						}
 					}
 				case "metric-type":
@@ -789,6 +791,7 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 				i++
 				if n, err := strconv.Atoi(keys[i]); err == nil {
 					term.LocalPreference = n
+					term.HasLocalPreference = true
 				}
 			}
 		case "metric":
@@ -796,6 +799,7 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 				i++
 				if n, err := strconv.Atoi(keys[i]); err == nil {
 					term.Metric = n
+					term.HasMetric = true
 				}
 			}
 		case "metric-type":

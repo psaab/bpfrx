@@ -1,3 +1,76 @@
+## 2026-06-25 — #2857: route-map `set local-preference 0` silently dropped
+
+- **Timestamp**: 2026-06-25
+- **Action**: Direct sibling of #2847 (metric/MED-0). `policy_render.go`
+  gated `set local-preference` on `term.LocalPreference > 0`, with
+  `PolicyTerm.LocalPreference` a bare int and no presence flag, so an
+  explicitly configured `then local-preference 0` (a valid BGP value =
+  maximally deprioritize a route within the AS; FRR route-map YANG range
+  starts at 0) was indistinguishable from unset and silently dropped.
+- **Fix**: Mirror #2847 exactly — add `PolicyTerm.HasLocalPreference bool`
+  (keep the value), set it at BOTH compile sites in `compiler_routing.go`
+  (hierarchical + flat-set, the #2419 dual-shape), and render
+  `set local-preference` on presence (`HasLocalPreference`), never `> 0`.
+- **Test**: `TestGeneratePolicyOptionsLocalPreferenceZero` (fail-on-revert)
+  drives the full ParseSetCommand+SetPath+CompileConfig+generatePolicyOptions
+  path — lp 0 emitted / unset not emitted / 200 emitted. Verified RED when
+  the renderer gate is reverted to `> 0`. Updated the four existing render
+  tests that build a PolicyTerm with a nonzero LocalPreference to also set
+  `HasLocalPreference: true` so they still emit.
+- **File(s)**: pkg/config/types_routing.go, pkg/config/compiler_routing.go,
+  pkg/frr/policy_render.go, pkg/frr/frr_test.go, pkg/frr/README.md, _Log.md
+- **Gates**: go build ./... OK; gofmt -l clean; go vet ./pkg/frr/...
+  ./pkg/config/... clean; go test ./pkg/frr/... ./pkg/config/... OK.
+
+## 2026-06-25 — #2849: DHCP relay giaddr selects PRIMARY IPv4, not first kernel address
+
+- **Timestamp**: 2026-06-25
+- **Action**: `defaultIfaceResolver`/`interfaceIPv4` returned the FIRST
+  non-loopback IPv4 from `net.Interface.Addrs()`. On Linux an interface with
+  a primary address plus secondary subnet aliases returns them in netlink
+  maintenance order, NOT guaranteed primary-first, so a secondary alias could
+  be stamped as `giaddr` → upstream server leases from the wrong subnet pool
+  (agy-review-049 049-07). Fix: select the PRIMARY IPv4. Added a
+  `primaryIPv4Lister` package seam defaulted to a portable
+  `net.Interface.Addrs()` lister (cannot see the secondary flag → reports all
+  as primary, preserving historical behavior), overridden on Linux
+  (`relay_giaddr_linux.go` `init()`) by a `netlink.AddrList`-backed lister
+  that records `IFA_F_SECONDARY` per address. New pure `selectPrimaryIPv4`
+  prefers the first non-secondary candidate; falls back to the first secondary
+  (defensive) and errors on empty. Netlink-enumeration failure falls back to
+  the portable lister rather than failing closed (transient netlink hiccup
+  must not strand a relay). `interfaceIPv4(*net.Interface)` retained as a thin
+  wrapper for the existing loopback test.
+  FAIL-ON-REVERT: `TestSelectPrimaryIPv4_SecondaryBeforePrimary` injects the
+  `netlinkAddrLister` seam with a secondary alias (192.168.50.1, IFA_F_SECONDARY)
+  listed BEFORE the primary (10.0.1.1) → asserts `defaultIfaceResolver`
+  returns the PRIMARY. Verified RED when `selectPrimaryIPv4` is reverted to
+  "return first candidate" (got 192.168.50.1, want 10.0.1.1), GREEN with fix.
+  Gates: go build ./... clean; gofmt -l pkg/dhcprelay clean; go vet
+  ./pkg/dhcprelay/... clean; go test ./pkg/dhcprelay/... ok.
+  **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_giaddr_linux.go,
+  pkg/dhcprelay/relay_giaddr_linux_test.go, pkg/dhcprelay/README.md, _Log.md
+## 2026-06-25 — #2842: DDNS checkip-url scheme validation is now case-insensitive (RFC 3986 §3.1)
+
+- **Timestamp**: 2026-06-25
+- **Action**: Both checkip-url validators rejected a valid uppercase/mixed-case
+  scheme (e.g. `HTTPS://host`) because they tested the scheme with a
+  case-sensitive `strings.HasPrefix(u, "http://"/"https://")` on the raw string.
+  Per RFC 3986 §3.1 the URI scheme is case-INSENSITIVE, so this wrongly rejected
+  a syntactically valid URL. Fix: parse first with `url.Parse`, then compare the
+  parsed `Scheme` with `strings.EqualFold` against `http`/`https`, in BOTH the
+  runtime gate `pkg/ddns.validateCheckIPURL` and the commit-time mirror
+  `pkg/config.ddnsCheckIPURLValid` (the #2773 dual-validator pair — kept in
+  lockstep). Non-http schemes (`ftp://`), host-less (`http://`), and
+  unparseable strings still fail. Added fail-on-revert coverage: uppercase
+  `HTTP://`/`Https://` accepted in `pkg/ddns.TestValidateCheckIPURL` and new
+  `pkg/config.TestP3CheckIPURLUppercaseSchemeAccepted` (ParseSetCommand +
+  SetPath); both go RED if reverted to case-sensitive HasPrefix.
+- **File(s)**: `pkg/ddns/checkip.go`, `pkg/config/compiler_validate_warn.go`,
+  `pkg/ddns/checkip_test.go`,
+  `pkg/config/compiler_p3_http_providers_test.go`, `pkg/ddns/README.md`,
+  `docs/config-schema.md`
+
 ## 2026-06-25 — #2457: WG advertised/configured inner MTU clamped to engine PADDED_PLAINTEXT_MAX (4096)
 
 - **Timestamp**: 2026-06-25
@@ -16860,3 +16933,30 @@ top.
   pkg/ddns/backend_http_sourcebind_2846_test.go,
   pkg/daemon/daemon_ddns_surface_a.go, pkg/config/types_system.go,
   pkg/ddns/README.md, _Log.md
+## 2026-06-25 — #2847 FRR policy render: metric/MED 0 silently dropped
+
+- **Timestamp**: 2026-06-25
+- **Action**: Distinguish "metric unset" from "explicitly metric 0" so a
+  `then metric 0` (valid BGP MED traffic-engineering value) renders a
+  `set metric 0` clause instead of being silently dropped by the
+  `term.Metric > 0` gate.
+- **File(s)**:
+  - `pkg/config/types_routing.go` — added `PolicyTerm.HasMetric bool`
+    presence flag (Metric int stays the value).
+  - `pkg/config/compiler_routing.go` — set `term.HasMetric = true` at
+    both the hierarchical and flat-set `metric` compile sites.
+  - `pkg/frr/policy_render.go` — gate the `set metric` clause on
+    `term.HasMetric`, not `term.Metric > 0`.
+  - `pkg/frr/frr_test.go` — set `HasMetric: true` on the two existing
+    direct-construction render tests; added fail-on-revert
+    `TestGeneratePolicyOptionsMetricZero` (metric 0 emitted / unset not
+    emitted / nonzero emitted), driven end-to-end via ParseSetCommand +
+    SetPath + CompileConfig + generatePolicyOptions.
+  - `pkg/config/parser_security_test.go` — assert `HasMetric` after
+    parsing `then metric 100`.
+  - `pkg/frr/README.md` — documented the presence-based emit in the
+    `policy_render.go` cell.
+- **Validation**: go build ./... ; gofmt -l (clean on touched files);
+  go vet ./pkg/frr/... ./pkg/config/... ; go test ./pkg/frr/...
+  ./pkg/config/... (PASS). Fail-on-revert confirmed: reverting the gate
+  to `term.Metric > 0` makes TestGeneratePolicyOptionsMetricZero RED.
