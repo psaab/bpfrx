@@ -1,3 +1,35 @@
+## 2026-06-24 — #2466: flow-cache RG epoch index fallback for out-of-range RG IDs
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed delayed HA failover invalidation for redundancy-group IDs
+  >= MAX_RG_EPOCHS (16). The userspace flow cache used a fixed 16-entry per-RG
+  epoch table; an out-of-range owner_rg_id (or owner_rg_id <= 0) was stamped
+  with a literal epoch 0 and never re-checked against any epoch slot on
+  lookup, so a cached forwarding decision for an RG >= 16 survived that RG's
+  activation/demotion until the lease/session-expiry backstop caught it.
+  Added `flow_cache::rg_epoch_index(owner_rg_id)` (in-range -> own slot;
+  out-of-range / <= 0 -> node-level rg_epochs[0]) and routed BOTH
+  FlowCacheStamp::capture and the lookup invalidation through it, so stamp and
+  re-check agree. This mirrors the worker session-expiry gate (epoch_of in
+  worker/loop_body/mod.rs), which already used the rg_epochs[0] fallback;
+  the worker gate now calls the same helper and its divergence comment is
+  resolved. In-range RGs (1..15 — the RG 0/1/2 the loss cluster uses) are
+  bit-identical to before. Added fail-on-revert tests
+  (out_of_range_owner_rg_stamps_node_level_epoch,
+  out_of_range_owner_rg_invalidates_on_node_level_bump) + a no-regression test
+  (in_range_owner_rg_unchanged_by_node_level_bump). Capture-only revert proven
+  to turn both #2466 tests RED while the in-range test stays green.
+- **File(s)**: [Edit] userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/flow_cache_tests.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  docs/flow-cache-simplification.md, _Log.md.
+- **Validation**: `cargo build --release` clean (146 warnings, same as
+  baseline, none new in flow_cache.rs); `cargo test --release --bin
+  xpf-userspace-dp` flow_cache + ha filters green (508 passed). HA-touching
+  (flow-cache invalidation) but the loss cluster only has RG 0/1/2 (< 16) so
+  the RG >= 16 path is not live-testable — the unit test is the gate; parent
+  may run make test-failover for no-regression on the normal RG path.
+
 ## 2026-06-24 — #2691 P0 / #2676: upsertLocked sentinel ordering — no orphan on PTR-conflict-after-forward-success
 
 - **Timestamp**: 2026-06-24

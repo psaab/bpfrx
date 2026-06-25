@@ -286,6 +286,39 @@ The current simplification work has been validated with:
 - `cargo test --manifest-path userspace-dp/Cargo.toml epoch_based_flow_cache_unrelated_rg_not_invalidated -- --nocapture`
 - `cargo test --manifest-path userspace-dp/Cargo.toml apply_descriptor_nat64_falls_back -- --nocapture`
 
+## RG epoch index fallback (#2466)
+
+The per-RG epoch table is a fixed `MAX_RG_EPOCHS = 16` array (`rg_epochs:
+[AtomicU32; 16]`). The config schema accepts redundancy-group IDs with no
+upper bound, so an operator can configure an RG whose ID is `>= 16`.
+
+Before #2466 the flow-cache stamp/consumer guard only consulted a per-RG
+epoch slot when `owner_rg_id > 0 && owner_rg_id < MAX_RG_EPOCHS`; any other
+owner (an out-of-range high RG ID, or `owner_rg_id <= 0` for fabric /
+unresolved-owner reverse) was stamped with a literal epoch `0` and never
+re-checked against any epoch slot on lookup. A cached forwarding decision
+for an RG `>= 16` therefore survived that RG's activation/demotion until the
+`owner_rg_lease_until` or node-level session-expiry backstop caught it —
+delayed invalidation, not immediate.
+
+The fix routes every owner through a single helper,
+`flow_cache::rg_epoch_index(owner_rg_id)`:
+
+- in-range (`1 ..= MAX_RG_EPOCHS-1`): use the owner's own slot (unchanged —
+  RG 0/1/2 used by the loss cluster behave bit-identically);
+- out-of-range high RG IDs and `owner_rg_id <= 0`: fall back to the
+  node-level `rg_epochs[0]` activation edge.
+
+Both `FlowCacheStamp::capture` and the lookup invalidation now use that
+helper, so the stamp and the re-check always agree. This mirrors the worker
+session-expiry gate (`epoch_of` in `worker/loop_body/mod.rs`), which already
+maps out-of-range/`<= 0` owners to `rg_epochs[0]`; the two gates are now
+consistent. A high-RG flow invalidates on any node-level transition
+(immediate) instead of never. No schema change and no operator-facing
+rejection. Tests: `out_of_range_owner_rg_stamps_node_level_epoch`,
+`out_of_range_owner_rg_invalidates_on_node_level_bump`,
+`in_range_owner_rg_unchanged_by_node_level_bump` (flow_cache_tests.rs).
+
 ## Recommended Next Step
 
 Implement Phase 1 next:
