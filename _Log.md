@@ -1,3 +1,32 @@
+## 2026-06-25 — #2958: state_writer runtime io_uring failure now demotes WriteMode to sync
+
+- **Timestamp**: 2026-06-25
+- **Action**: The helper state writer (`userspace-dp/src/state_writer.rs`)
+  picked `io_uring` at thread start when a ring was available, but a *runtime*
+  io_uring write failure only fell back to sync for that single write and left
+  `WriteMode::IoUring` in place. Status kept reporting `io_uring_active=true`/
+  `mode="io_uring"` (a lie) and every subsequent write paid a guaranteed-failing
+  ring submission before falling back (codex-review-056 056-03). Fix: introduced
+  `PersistOutcome { result, io_uring_failed, demotion_cause }` and an
+  `apply_outcome()` chokepoint that, on a runtime io_uring failure, demotes
+  `*mode` to `WriteMode::SyncFallback` PERMANENTLY (no cooldown retry — avoids
+  flapping; restart re-probes the ring), flips `active=false`/`mode="sync"`, and
+  records the demotion cause in `last_error`. The reported status
+  (`io_uring_active`/`io_uring_mode`/`io_uring_last_error` via
+  `server/helpers.rs`) follows the shared handles, so observability is correct
+  with no wire-protocol change. Scope kept minimal/localized to coordinate with
+  the in-flight #2957 (state_writer PID-reuse) on the same file. Counters
+  (`io_uring_write_failures_total`/`io_uring_demotions_total`) from the issue
+  were NOT added — they would require wire-protocol + Go-side changes; the
+  observable contract (mode/active/last_error) fully satisfies the requirements.
+- **File(s)**: userspace-dp/src/state_writer.rs,
+  docs/xdp-io-uring-userspace-dataplane.md, _Log.md
+- **Validation**: `cargo build --release -p xpf-userspace-dp` (clean);
+  `cargo test -p xpf-userspace-dp state_writer` 11/11 pass incl. new
+  `runtime_io_uring_failure_demotes_to_sync_permanently`. Fail-on-revert
+  PROVEN: stubbing out the demotion in `apply_outcome` turns the test RED
+  ("runtime io_uring failure must demote WriteMode to SyncFallback").
+
 ## 2026-06-25 — #2922: ECMP `select_route_next_hop` single liveness snapshot
 
 - **Timestamp**: 2026-06-25
