@@ -42,8 +42,13 @@ use crate::afxdp::{MmapArea, RewriteDescriptor, UserspaceDpMeta, XdpDesc};
 ///
 /// **Scope**: IPv4/IPv6 TCP and UDP only (flow cache gates on
 /// ACK-only TCP + UDP). Does NOT handle: ICMP identifier repair,
-/// NAT64 (header-size change), NPTv6 (checksum-neutral — address
-/// rewrite differs).
+/// NAT64 (header-size change — always falls back to the generic frame
+/// builder). NPTv6 IS handled (#2652): it is a same-family IPv6 address
+/// byte-rewrite that is checksum-neutral by RFC 6296, so the IPv6 arm
+/// reproduces the slow path exactly — it writes the new address(es) and,
+/// because the descriptor's `l4_csum_delta` is 0 for NPTv6
+/// (`compute_l4_csum_delta` short-circuits on `nat.nptv6`), it leaves the
+/// L4 checksum untouched, matching `apply_nat_ipv6`'s `skip_l4_csum`.
 #[inline]
 pub(in crate::afxdp) fn apply_rewrite_descriptor(
     area: &MmapArea,
@@ -52,8 +57,16 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
     rd: &RewriteDescriptor,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<InPlaceRewriteResult> {
-    // NAT64 and NPTv6 use the generic path — they need special handling.
-    if rd.nat64 || rd.nptv6 {
+    // NAT64 is a version-changing translation (IPv6 40B <-> IPv4 20B header
+    // rebuild, fragment handling) built by the generic NAT64 frame builder —
+    // the in-place descriptor byte-write path cannot express it, so fall back.
+    if rd.nat64 {
+        return None;
+    }
+    // #2652 defense-in-depth: NPTv6 is IPv6-only. A descriptor flagged nptv6
+    // with a non-v6 ether_type is a malformed/inconsistent cache entry; fall
+    // back to the generic path rather than misapply a v4 rewrite.
+    if rd.nptv6 && rd.ether_type != 0x86dd {
         return None;
     }
 

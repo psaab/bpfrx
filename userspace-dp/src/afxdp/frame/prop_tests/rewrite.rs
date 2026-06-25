@@ -381,31 +381,136 @@ fn pin_descriptor_port_mismatch_declines() {
     assert_eq!(&after[pkt.l3..], &pkt.frame[pkt.l3..]);
 }
 
-/// (c) NAT64/NPTv6 descriptors decline BEFORE the eth prep
-/// (rewrite/mod.rs:52) — frame fully untouched, including L2. The
-/// flow cache never builds such descriptors (`should_cache` gates at
-/// flow_cache.rs:223-224); this pins the defense-in-depth check.
+/// (c) NAT64 descriptors decline BEFORE the eth prep (rewrite/mod.rs)
+/// — frame fully untouched, including L2. The flow cache never builds a
+/// NAT64 descriptor (`should_cache` gates `!decision.nat.nat64`); this
+/// pins the defense-in-depth check.
+///
+/// #2652: NPTv6 is no longer in this decline set — it is now applied by
+/// the descriptor fast path (proved byte-identical to the generic path
+/// in `pin_nptv6_descriptor_matches_generic_byte_for_byte`). A
+/// descriptor flagged `nptv6` with a non-v6 ether_type still declines
+/// (the defense-in-depth v4 guard), which is also pinned below.
 #[test]
-fn pin_descriptor_nat64_nptv6_decline_frame_untouched() {
+fn pin_descriptor_nat64_decline_frame_untouched() {
     let pkt = pin_packet(false, PROTO_TCP, 64, Vec::new());
     let desc = XdpDesc {
         addr: DIFF_ADDR as u64,
         len: pkt.frame.len() as u32,
         options: 0,
     };
-    for (nat64, nptv6) in [(true, false), (false, true)] {
+    // NAT64: always declines, frame untouched.
+    {
         let area = area_with_frame(&pkt.frame);
         let mut rd = make_descriptor(&pkt, NatDecision::default(), 0);
-        rd.nat64 = nat64;
-        rd.nptv6 = nptv6;
+        rd.nat64 = true;
         assert!(apply_rewrite_descriptor(&area, desc, pkt.meta, &rd, None).is_none());
         let after = area.slice(DIFF_ADDR, pkt.frame.len()).unwrap();
         assert_eq!(
             after,
             &pkt.frame[..],
-            "nat64/nptv6 decline happens before any byte is written"
+            "nat64 decline happens before any byte is written"
         );
     }
+    // NPTv6 on a v4-typed descriptor: defense-in-depth decline, frame
+    // untouched (NPTv6 is IPv6-only; the v4 ether_type is inconsistent).
+    {
+        let area = area_with_frame(&pkt.frame);
+        let mut rd = make_descriptor(&pkt, NatDecision::default(), 0);
+        rd.nptv6 = true; // ether_type stays 0x0800 (this is a v4 pin packet)
+        assert!(apply_rewrite_descriptor(&area, desc, pkt.meta, &rd, None).is_none());
+        let after = area.slice(DIFF_ADDR, pkt.frame.len()).unwrap();
+        assert_eq!(
+            after,
+            &pkt.frame[..],
+            "nptv6 on a non-v6 descriptor declines before any byte is written"
+        );
+    }
+}
+
+/// #2652 — NPTv6 descriptor fast path is BYTE-IDENTICAL to the generic
+/// slow path. NPTv6 (RFC 6296) is a same-family IPv6 dst-prefix rewrite
+/// that is checksum-neutral by design: the generic `apply_nat_ipv6`
+/// writes the new address and SKIPS the L4 checksum adjust
+/// (`skip_l4_csum = nat.nptv6`); the descriptor carries `l4_csum_delta
+/// == 0` (`compute_l4_csum_delta` short-circuits on `nat.nptv6`) so the
+/// fast path's IPv6 arm also leaves the L4 checksum untouched.
+///
+/// This is the fail-on-revert proof: with the descriptor `nptv6` flag
+/// honored (orchestrator no longer early-returns for `rd.nptv6`), the
+/// two outputs match byte-for-byte. Reinstating the `rd.nptv6` decline
+/// makes `fast` `None` and the `.expect(...)` panics.
+#[test]
+fn pin_nptv6_descriptor_matches_generic_byte_for_byte() {
+    // Valid IPv6 TCP packet (no VLAN), pure-ACK eligible.
+    let pkt = pin_packet(true, PROTO_TCP, 64, Vec::new());
+    // NPTv6: dst prefix translation only (the upstream compiler folds the
+    // RFC 6296 adjustment word into the rewritten address, so the
+    // dataplane simply writes it and leaves the L4 checksum alone).
+    let mut new_dst = match pkt.dst_ip {
+        IpAddr::V6(a) => a.octets(),
+        _ => unreachable!("v6 pin packet"),
+    };
+    // Replace the /48 prefix; checksum-neutrality is a property of the
+    // address bytes the compiler chose, but the DATAPLANE behavior under
+    // test (write address, skip L4 csum) is identical for any new dst —
+    // both paths skip the L4 csum, so they agree regardless.
+    new_dst[0] = 0xfd;
+    new_dst[1] = 0x00;
+    new_dst[2] = 0x00;
+    let nptv6_nat = NatDecision {
+        rewrite_dst: Some(IpAddr::V6(std::net::Ipv6Addr::from(new_dst))),
+        nptv6: true,
+        ..NatDecision::default()
+    };
+
+    let desc = XdpDesc {
+        addr: DIFF_ADDR as u64,
+        len: pkt.frame.len() as u32,
+        options: 0,
+    };
+
+    // Capture the input L4 checksum (TCP csum at rel_l4 + 16).
+    let l4_csum_off = pkt.l3 + pkt.rel_l4 + 16;
+    let in_l4_csum =
+        u16::from_be_bytes([pkt.frame[l4_csum_off], pkt.frame[l4_csum_off + 1]]);
+
+    // Generic slow path.
+    let area_g = area_with_frame(&pkt.frame);
+    let decision = make_decision(&pkt, nptv6_nat, 0);
+    let generic = rewrite_forwarded_frame_in_place(&area_g, desc, pkt.meta, &decision, false, None)
+        .expect("generic NPTv6 rewrite must succeed");
+
+    // Descriptor fast path — descriptor built exactly as the flow cache does,
+    // including the nptv6 flag (#2652) and the zero L4 csum delta.
+    let area_d = area_with_frame(&pkt.frame);
+    let mut rd = make_descriptor(&pkt, nptv6_nat, 0);
+    rd.nptv6 = true;
+    assert_eq!(
+        rd.l4_csum_delta, 0,
+        "NPTv6 descriptor must carry a zero L4 csum delta (checksum-neutral)"
+    );
+    let fast = apply_rewrite_descriptor(&area_d, desc, pkt.meta, &rd, None)
+        .expect("descriptor NPTv6 rewrite must succeed (#2652) — fail-on-revert");
+
+    assert_eq!(generic, fast, "InPlaceRewriteResult (offset/len/l2) must agree");
+
+    let out_g = area_g.slice(generic.offset as usize, generic.len as usize).unwrap();
+    let out_d = area_d.slice(fast.offset as usize, fast.len as usize).unwrap();
+    assert_eq!(out_g, out_d, "NPTv6 fast path must be byte-identical to generic");
+
+    // Confirm the actual NPTv6 semantics on the shared output: dst address
+    // rewritten, L4 checksum UNCHANGED (checksum-neutral).
+    let out_l3 = 14usize; // no VLAN
+    let out_dst = &out_g[out_l3 + 24..out_l3 + 40];
+    assert_eq!(out_dst, &new_dst, "NPTv6 must rewrite the IPv6 dst address");
+    let out_l4_csum_off = out_l3 + pkt.rel_l4 + 16;
+    let out_l4_csum =
+        u16::from_be_bytes([out_g[out_l4_csum_off], out_g[out_l4_csum_off + 1]]);
+    assert_eq!(
+        out_l4_csum, in_l4_csum,
+        "NPTv6 is checksum-neutral — the L4 checksum must be untouched"
+    );
 }
 
 /// (d) #1838 (D3) FIXED pin: the generic v6 NAT path threads the

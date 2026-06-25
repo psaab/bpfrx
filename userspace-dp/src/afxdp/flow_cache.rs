@@ -263,10 +263,23 @@ impl FlowCacheEntry {
         // truth for cacheability (see `packet_eligible`); PSH+ACK data segments
         // remain cacheable because `is_ack_only` ignores PSH/URG, so
         // steady-state data and UDP still fast-path.
+        //
+        // #2652: NPTv6 (RFC 6296 stateless prefix translation) IS cacheable.
+        // It is a same-family IPv6 address byte-rewrite that is checksum-neutral
+        // by design, so the descriptor fast path (`apply_rewrite_descriptor` →
+        // `apply_rewrite_descriptor_ipv6`) reproduces it byte-for-byte: it
+        // writes the new IPv6 address(es) and, because `compute_l4_csum_delta`
+        // returns 0 for nptv6, leaves the L4 checksum untouched — exactly what
+        // the slow-path `apply_nat_ipv6` does (`skip_l4_csum = nat.nptv6`).
+        //
+        // NAT64 stays EXCLUDED. It is a version-changing translation (IPv6 40B
+        // header <-> IPv4 20B header, fragment-header handling) built by
+        // `build_nat64_*_frame` which allocates a fresh frame of a different
+        // size. The in-place `RewriteDescriptor` byte-write fast path cannot
+        // express a header rebuild, so NAT64 must remain on the generic path.
         Self::packet_eligible(meta)
             && matches!(meta.protocol, PROTO_TCP | PROTO_UDP)
             && !decision.nat.nat64
-            && !decision.nat.nptv6
             && decision.resolution.disposition.is_cacheable()
     }
 
@@ -413,7 +426,11 @@ impl FlowCacheEntry {
                     Some(&flow.forward_key),
                 ),
                 nat64: false,
-                nptv6: false,
+                // #2652: carry the NPTv6 flag so the descriptor fast path
+                // routes through the IPv6 arm with a zero L4 csum delta
+                // (checksum-neutral). NAT64 is never cached (gated out in
+                // `should_cache`), so its flag stays false here.
+                nptv6: decision.nat.nptv6,
                 apply_nat_on_fabric,
             },
             decision,
