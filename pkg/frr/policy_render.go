@@ -1350,7 +1350,11 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 				if term.LocalPreference > 0 {
 					fmt.Fprintf(&b, " set local-preference %d\n", term.LocalPreference)
 				}
-				if term.Metric > 0 {
+				// Emit on PRESENCE, not value: metric/MED 0 is a valid
+				// traffic-engineering value (advertise a highly preferred
+				// route). Gating on Metric > 0 silently dropped `set metric
+				// 0` (#2847).
+				if term.HasMetric {
 					fmt.Fprintf(&b, " set metric %d\n", term.Metric)
 				}
 				if term.MetricType == 1 || term.MetricType == 2 {

@@ -1181,6 +1181,7 @@ func TestGeneratePolicyOptionsRouteMapAttributes(t *testing.T) {
 						Action:          "accept",
 						LocalPreference: 200,
 						Metric:          100,
+						HasMetric:       true,
 						Community:       "65000:100",
 						Origin:          "igp",
 					},
@@ -3054,6 +3055,7 @@ func TestGeneratePolicyOptionsCommunityListAndMetricType(t *testing.T) {
 						Action:        "accept",
 						MetricType:    1,
 						Metric:        100,
+						HasMetric:     true,
 					},
 					{
 						Name:       "t2",
@@ -5093,4 +5095,73 @@ func TestPolicyTermSingleMatch_NoExtraSequences(t *testing.T) {
 	if !strings.Contains(got, "route-map P permit 10\n") || !strings.Contains(got, "route-map P deny 20\n") {
 		t.Errorf("single-match term must keep historical seq numbers (10, 20):\n%s", got)
 	}
+}
+
+// TestGeneratePolicyOptionsMetricZero is the #2847 fail-on-revert guard.
+//
+// A route-map `set metric N` / BGP MED of 0 is a valid traffic-engineering
+// value (advertise a highly preferred route). Before #2847 the renderer
+// gated the clause on `term.Metric > 0`, so an explicitly configured
+// `then metric 0` silently emitted nothing and the operator's MED never
+// reached FRR. The fix records presence (PolicyTerm.HasMetric, set by the
+// compiler whenever the `metric` leaf is parsed) and the renderer emits the
+// clause on presence, not on value > 0.
+//
+// This test drives the full config path (ParseSetCommand -> SetPath ->
+// CompileConfig -> generatePolicyOptions) for three cases:
+//   - metric 0   -> "set metric 0" MUST be rendered (RED if reverted to >0)
+//   - metric unset -> NO "set metric" clause
+//   - metric 50  -> "set metric 50" still rendered
+func TestGeneratePolicyOptionsMetricZero(t *testing.T) {
+	compileAndRender := func(t *testing.T, cmds []string) string {
+		t.Helper()
+		tree := &config.ConfigTree{}
+		for _, cmd := range cmds {
+			path, err := config.ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%q): %v", cmd, err)
+			}
+		}
+		cfg, err := config.CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		m := &Manager{frrConf: "/dev/null"}
+		return m.generatePolicyOptions(&cfg.PolicyOptions)
+	}
+
+	t.Run("metric_zero_emitted", func(t *testing.T) {
+		got := compileAndRender(t, []string{
+			"set policy-options policy-statement MED0 term t from protocol bgp",
+			"set policy-options policy-statement MED0 term t then metric 0",
+			"set policy-options policy-statement MED0 term t then accept",
+		})
+		if !strings.Contains(got, "set metric 0\n") {
+			t.Errorf("metric 0 must render a `set metric 0` clause (#2847); got:\n%s", got)
+		}
+	})
+
+	t.Run("metric_unset_not_emitted", func(t *testing.T) {
+		got := compileAndRender(t, []string{
+			"set policy-options policy-statement NOMED term t from protocol bgp",
+			"set policy-options policy-statement NOMED term t then accept",
+		})
+		if strings.Contains(got, "set metric") {
+			t.Errorf("an unconfigured metric must render no `set metric` clause; got:\n%s", got)
+		}
+	})
+
+	t.Run("metric_nonzero_emitted", func(t *testing.T) {
+		got := compileAndRender(t, []string{
+			"set policy-options policy-statement MED50 term t from protocol bgp",
+			"set policy-options policy-statement MED50 term t then metric 50",
+			"set policy-options policy-statement MED50 term t then accept",
+		})
+		if !strings.Contains(got, "set metric 50\n") {
+			t.Errorf("metric 50 must still render `set metric 50`; got:\n%s", got)
+		}
+	})
 }

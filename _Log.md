@@ -16832,3 +16832,31 @@ top.
   clean; go test -race ./pkg/ra/ -count=3 ok.
   **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/serialize_test.go,
   pkg/ra/README.md, _Log.md
+
+## 2026-06-25 — #2847 FRR policy render: metric/MED 0 silently dropped
+
+- **Timestamp**: 2026-06-25
+- **Action**: Distinguish "metric unset" from "explicitly metric 0" so a
+  `then metric 0` (valid BGP MED traffic-engineering value) renders a
+  `set metric 0` clause instead of being silently dropped by the
+  `term.Metric > 0` gate.
+- **File(s)**:
+  - `pkg/config/types_routing.go` — added `PolicyTerm.HasMetric bool`
+    presence flag (Metric int stays the value).
+  - `pkg/config/compiler_routing.go` — set `term.HasMetric = true` at
+    both the hierarchical and flat-set `metric` compile sites.
+  - `pkg/frr/policy_render.go` — gate the `set metric` clause on
+    `term.HasMetric`, not `term.Metric > 0`.
+  - `pkg/frr/frr_test.go` — set `HasMetric: true` on the two existing
+    direct-construction render tests; added fail-on-revert
+    `TestGeneratePolicyOptionsMetricZero` (metric 0 emitted / unset not
+    emitted / nonzero emitted), driven end-to-end via ParseSetCommand +
+    SetPath + CompileConfig + generatePolicyOptions.
+  - `pkg/config/parser_security_test.go` — assert `HasMetric` after
+    parsing `then metric 100`.
+  - `pkg/frr/README.md` — documented the presence-based emit in the
+    `policy_render.go` cell.
+- **Validation**: go build ./... ; gofmt -l (clean on touched files);
+  go vet ./pkg/frr/... ./pkg/config/... ; go test ./pkg/frr/...
+  ./pkg/config/... (PASS). Fail-on-revert confirmed: reverting the gate
+  to `term.Metric > 0` makes TestGeneratePolicyOptionsMetricZero RED.
