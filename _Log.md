@@ -13955,3 +13955,30 @@ top.
   userspace-dp/src/afxdp/forwarding_build/cos.rs,
   userspace-dp/src/afxdp/forwarding_build/tests.rs,
   userspace-dp/src/policy.rs, userspace-dp/src/FEATURES.md, _Log.md
+
+- **Timestamp**: 2026-06-24 (PR #2696 review follow-up)
+- **Action**: #2409 over-rejection fix (coordinator review MERGE-NEEDS-MINOR).
+  The Rust `SchedulerMapUnknownClass` hard-error over-rejected a SUPPORTED,
+  committable config shape: an undefined-class scheduler-map entry is
+  warning-only at commit (compiler_validate_warn.go; the strict gate rejects
+  only buffer-percent overcommit), so a config that commits today would, after
+  the PR, commit then FAIL THE DATAPLANE APPLY → frozen forwarding (#1961-class
+  no-transit-on-commit regression). Chose the Go-emitter degrade option: filter
+  undefined-class scheduler-map entries in
+  `buildClassOfServiceSnapshot` (pkg/dataplane/userspace/cos.go) with a
+  slog.Warn (degrade VISIBLY — the #2409 complaint was the silence, the partial
+  install is the historical/supported behavior). The entry never reaches the
+  wire, so the Rust SchedulerMapUnknownClass hard-error stays as a TRUE
+  never-fires drift backstop, consistent with the other 4 fail-closed sites
+  (VLAN/TTL/queue/unparseable-addr — corruption a valid config never produces)
+  and the #2391/#2212/#2240 precedents (all have a Go HARD gate upstream). Kept
+  the other 4 sites fail-closed. Added Go test
+  `TestBuildClassOfServiceSnapshotSkipsUndefinedSchedulerMapClass`
+  (fail-on-revert: valid subset survives, undefined entry filtered); reframed
+  the Rust scheduler-map test doc to the drift-backstop role. Gates: gofmt
+  clean, go vet clean, go build ./... clean, go test
+  ./pkg/dataplane/userspace/... ok; cargo build --release clean, cargo test
+  --release --bin xpf-userspace-dp forwarding_build → 66 passed / 0.
+- **File(s)**: pkg/dataplane/userspace/cos.go,
+  pkg/dataplane/userspace/manager_test.go,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs, _Log.md

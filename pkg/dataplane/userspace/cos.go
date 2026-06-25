@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"log/slog"
 	"sort"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -164,6 +165,29 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 			for _, className := range entryNames {
 				entry := schedMap.Entries[className]
 				if entry == nil {
+					continue
+				}
+				// #2409: a scheduler-map entry referencing a forwarding-class
+				// that is not defined in `class-of-service forwarding-classes`
+				// is only a NON-FATAL warning at commit time
+				// (compiler_validate_warn.go; the strict gate rejects only
+				// buffer-percent overcommit, not undefined-class refs). So this
+				// is a SUPPORTED, committable config shape — not corruption.
+				// Skip the undefined entry here (degrade visibly, preserving the
+				// historical "install the valid subset" semantics) with a
+				// slog.Warn so the loss is no longer SILENT (the #2409
+				// complaint was the silence, not the partial install). Keeping
+				// the entry OFF THE WIRE means the Rust
+				// SchedulerMapUnknownClass hard-error stays a true never-fires
+				// drift backstop — it now fires only on a version/snapshot-
+				// drifted helper that receives an entry this emitter would have
+				// filtered, consistent with the VLAN/TTL/queue/address sites
+				// (corruption a valid config never produces).
+				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+					slog.Warn("cos scheduler-map references undefined forwarding-class; skipping entry (degraded shaping)",
+						"scheduler_map", schedMap.Name,
+						"forwarding_class", entry.ForwardingClass,
+					)
 					continue
 				}
 				mapSnap.Entries = append(mapSnap.Entries, CoSSchedulerMapEntrySnapshot{

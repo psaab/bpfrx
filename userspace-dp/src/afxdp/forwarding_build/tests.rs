@@ -1971,12 +1971,20 @@ fn build_cos_state_skips_interface_with_resolvable_but_empty_scheduler_map() {
     );
 }
 
-/// #2409: a scheduler-map entry referencing a forwarding-class absent from
-/// the class-to-queue table now FAILS THE SNAPSHOT CLOSED rather than
-/// silently skipping the entry. The pre-#2409 behavior partially installed
-/// the scheduler (some queues silently missing, no apply failure) — a very
-/// hard-to-troubleshoot fail-silent loss of shaping. The Go commit-time
-/// validation is the primary gate; this is the helper-boundary backstop.
+/// #2409: at the RUST helper boundary, a scheduler-map entry referencing a
+/// forwarding-class absent from the class-to-queue table fails the snapshot
+/// CLOSED. This is a true NEVER-FIRES DRIFT BACKSTOP: an undefined-class
+/// scheduler-map entry is a SUPPORTED, committable config shape on the Go
+/// side (warning-only at commit, `compiler_validate_warn.go`), so the Go
+/// snapshot emitter (`pkg/dataplane/userspace/cos.go`,
+/// `buildClassOfServiceSnapshot`) now DEGRADES VISIBLY — it filters the
+/// undefined entry with a `slog.Warn` and never puts it on the wire (see
+/// `TestBuildClassOfServiceSnapshotSkipsUndefinedSchedulerMapClass`). This
+/// hard-error therefore only fires on a version/snapshot-drifted helper that
+/// receives an entry the emitter would have filtered — making it consistent
+/// with the VLAN/TTL/queue/address sites (corruption a valid config never
+/// produces) and with the #2391/#2212/#2240 precedents (all have a Go gate
+/// upstream so their Rust backstop never fires on a fresh operator config).
 ///
 /// fail-on-revert: restoring the `continue` at the `class_to_queue.get`
 /// lookup makes the build succeed (silently dropping the entry) and this
