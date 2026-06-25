@@ -163,9 +163,22 @@ func (m *Manager) Stop() {
 		instances[k] = v
 	}
 	m.instances = make(map[instanceKey]*vrrpInstance)
-	// Capture the run-scoped channels + once-guards under the lock so a
-	// concurrent Start() (which re-allocates them via resetRunStateLocked,
-	// #2625) cannot race the close below onto a half-swapped channel.
+	// Capture a CONSISTENT once/channel pair (and the channel) under the lock
+	// so the close below operates on a matched generation. This keeps the
+	// realistic sequential reuse correct: Stop() closes generation N's
+	// channels, then a later Start() re-allocates generation N+1's via
+	// resetRunStateLocked (also under m.mu).
+	//
+	// It does NOT make a concurrent Stop()+Start() race-free: the once-guard
+	// Do() and the channel reads run AFTER the lock is released (they must —
+	// vi.stop() below blocks on each run() goroutine exiting and cannot hold
+	// m.mu, and the close has to follow the instance teardown ordering). A
+	// hypothetical concurrent Start() resetting watcherStopOnce / re-allocating
+	// the channels could still interleave. That is not reachable today: the
+	// Manager is not designed for concurrent Stop/Start — its sole caller (the
+	// daemon) does Start-once at init and Stop-once at shutdown, never
+	// concurrently (#2625). No locking machinery is added for the unreachable
+	// case; the capture is only to keep the pair self-consistent.
 	watcherStop := m.watcherStop
 	watcherStopOnce := &m.watcherStopOnce
 	eventCh := m.eventCh
@@ -173,7 +186,10 @@ func (m *Manager) Stop() {
 	cancel := m.cancel
 	m.mu.Unlock()
 
-	// Stop all instances (removes VIPs, sends priority-0, closes per-instance socket).
+	// Stop all instances (removes VIPs, sends priority-0, closes per-instance
+	// socket) BEFORE closing eventCh: the stopCh shutdown arm in run() does not
+	// emitEvent, but stopping instances first keeps the channel-close strictly
+	// after all senders are quiesced regardless.
 	for _, vi := range instances {
 		vi.stop()
 	}
@@ -181,7 +197,7 @@ func (m *Manager) Stop() {
 	// Stop the singleton link/addr watchers (done-channel cancellation; the
 	// netlink subscriptions observe the same channel). Both watchers pinned
 	// this exact channel at spawn time, so closing it cancels precisely this
-	// run-generation's goroutines.
+	// run generation's goroutines; a later Start() re-allocates a fresh one.
 	watcherStopOnce.Do(func() { close(watcherStop) })
 
 	// Close events channel so watchers (e.g. daemon's watchVRRPEvents) unblock.

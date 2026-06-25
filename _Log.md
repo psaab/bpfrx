@@ -15204,3 +15204,27 @@ top.
   Stop()s at shutdown; PARENT runs make test-failover before merge.
 - **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/track.go, pkg/vrrp/addrwatch.go,
   pkg/vrrp/manager_reuse_test.go, pkg/vrrp/README.md, _Log.md
+- **Timestamp**: 2026-06-25
+- **Action**: #2625 review fold (PR #2753, 2 MINOR). FINDING 4 (introduced
+  flaky test): TestManager_StopStartReuse_WatcherRespawns raced a
+  watcherRunning latch read against the gen-1 watcher's deferred
+  latch-clear (under revert the un-reallocated watcherStop still equals
+  the gen-1 pinned stop, so that defer DOES clear the latch → ~3/8 runs
+  the goroutine won the race and the test wrongly passed, missing the
+  revert). Removed the racy latch read; the subscribe stub now records
+  whether the run-generation `done` channel it received was already
+  closed, and the test asserts the second subscribe must get an OPEN
+  channel. Both revert outcomes are now RED every run: latch-stuck →
+  the 2s subscribe wait times out; gen-1-defer-cleared → the second
+  watcher spawns on the closed gen-1 watcherStop (doneClosed=true). Proven
+  DETERMINISTIC: RED 10/10 on revert, GREEN 10/10 restored, GREEN under
+  -race -count=10. FINDING 3 (comment accuracy): the Stop() capture
+  comment claimed the close "cannot race" a concurrent Start(); corrected
+  to state the real guarantee (captures a consistent once/channel pair;
+  the Do()/close run after the lock so a HYPOTHETICAL concurrent
+  Stop+Start could still interleave — not reachable, sole caller is
+  single-threaded init/shutdown; no locking machinery added). No runtime
+  behavior change; instance-stop-then-channel-close ordering preserved.
+  Gates re-run green (build, gofmt, vet vrrp/cluster/daemon, -race
+  vrrp+cluster, daemon tests).
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/manager_reuse_test.go, _Log.md
