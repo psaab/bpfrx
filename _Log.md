@@ -1,3 +1,23 @@
+## 2026-06-25 — #2519: allowlist writeProxyResponderSysctl in fsatomic canary
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed RED-on-master `TestNoDirectOsWriteFile` (the #1916
+  receiver-aware direct-`os.WriteFile` canary). It flagged
+  `pkg/dataplane/proxyarp.go:95` `writeProxyResponderSysctl`, which writes
+  `[]byte("1")` to the procfs `net.ipv4.conf.<if>.proxy_arp` /
+  `net.ipv6.conf.<if>.proxy_ndp` knob. procfs has no rename(2), so the
+  fsatomic atomic-rename writers are impossible by construction — this is a
+  legitimate BestEffortKernelKnob write, exactly like the already-allowlisted
+  slow-path procfs/sysfs entries. Added the narrow receiver-aware allowlist
+  entry `"dataplane::writeProxyResponderSysctl": "procfs proxy_arp /
+  proxy_ndp knob"` mirroring the existing `dataplane::ensureVLANSubInterface`
+  shape. The entry is keyed to this one function only — the canary still
+  catches any genuine non-allowlisted direct `os.WriteFile`.
+- **File(s)**: pkg/fsatomic/canary_test.go, _Log.md
+- **Validation**: confirmed RED on master (proxyarp.go:95 violation) → GREEN
+  with the entry; `go build ./...` clean; `go test ./pkg/fsatomic/...` and
+  `go test ./pkg/dataplane/...` green; gofmt clean; `go vet` clean.
+
 ## 2026-06-25 — #2364: seed node-local hot-path hashes (algorithmic-complexity hardening)
 
 - **Timestamp**: 2026-06-25

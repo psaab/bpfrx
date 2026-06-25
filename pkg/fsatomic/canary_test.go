@@ -46,6 +46,7 @@ var allowedFunctions = map[string]string{
 	// pkg/dataplane — RPS/RFS/XPS + accept_ra sysfs/procfs knobs.
 	"dataplane::CompileResult.tuneInterfaceBuffers": "sysfs RPS/RFS/XPS knobs",
 	"dataplane::ensureVLANSubInterface":             "procfs accept_ra knob",
+	"dataplane::writeProxyResponderSysctl":          "procfs proxy_arp / proxy_ndp knob",
 	// pkg/dataplane/userspace — socket-buffer sysctls.
 	"dataplane/userspace::tuneSocketBuffers": "procfs socket-buffer sysctls",
 	// pkg/networkd — slow-path rp_filter restore (procfs).
