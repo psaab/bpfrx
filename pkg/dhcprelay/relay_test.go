@@ -859,6 +859,111 @@ func TestRunRelay_StopDuringRetry(t *testing.T) {
 	}
 }
 
+// TestRunRelay_BindFailureRetries injects a packetConnFactory that fails the
+// first K bind attempts with a transient error, then succeeds. It proves the
+// per-interface supervisor does NOT die on a transient bind/listen failure
+// (#2787): it keeps retrying and eventually binds. This is a fail-on-revert
+// test — reverting runRelaySession to `return false`/`return sessionStop` on a
+// listen error makes the supervisor exit on the first failure, so the client
+// conn is never created and waitCalls below times out (RED).
+func TestRunRelay_BindFailureRetries(t *testing.T) {
+	client := newFakeConn()
+	server := newFakeConn()
+
+	const k = 3
+	var mu sync.Mutex
+	var calls []factoryCall
+	attempts := 0
+	factory := func(ctx context.Context, ifaceName string, reusePort, broadcast bool,
+		bindAddr *net.UDPAddr) (net.PacketConn, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		// Only the client-facing listener (reusePort+broadcast on the iface)
+		// is failed; once it binds, hand out the recorded conns in order.
+		if reusePort && broadcast {
+			attempts++
+			if attempts <= k {
+				return nil, errors.New("listen udp 0.0.0.0:67: bind: cannot assign requested address")
+			}
+			calls = append(calls, factoryCall{ifaceName, reusePort, broadcast, bindAddr})
+			return client, nil
+		}
+		calls = append(calls, factoryCall{ifaceName, reusePort, broadcast, bindAddr})
+		return server, nil
+	}
+	getCalls := func() []factoryCall {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make([]factoryCall, len(calls))
+		copy(out, calls)
+		return out
+	}
+
+	m := testManager(factory)
+	m.retryInterval = 5 * time.Millisecond
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+
+	// The supervisor must survive the K failures and bind both conns. With a
+	// terminal `return sessionStop` on listen failure this never reaches 2
+	// (the supervisor dies after the first failed bind) and times out.
+	calls2 := waitCalls(t, getCalls, 2, 2*time.Second)
+	if len(calls2) < 2 {
+		t.Fatalf("supervisor died on transient bind failure: only %d successful "+
+			"factory calls (attempts=%d) — relay never recovered", len(calls2), attempts)
+	}
+	mu.Lock()
+	gotAttempts := attempts
+	mu.Unlock()
+	if gotAttempts <= k {
+		t.Errorf("expected listener bind retried past %d failures, got %d attempts", k, gotAttempts)
+	}
+
+	done := make(chan struct{})
+	go func() { m.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() did not return after bind-retry recovery")
+	}
+}
+
+// TestRunRelay_StopDuringBindRetry cancels while the bind is still failing;
+// Stop must return promptly (the supervisor's retry select is ctx-cancelable,
+// #2787) and the relay never binds a client conn.
+func TestRunRelay_StopDuringBindRetry(t *testing.T) {
+	var mu sync.Mutex
+	clientBinds := 0
+	factory := func(ctx context.Context, ifaceName string, reusePort, broadcast bool,
+		bindAddr *net.UDPAddr) (net.PacketConn, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if reusePort && broadcast {
+			clientBinds++
+		}
+		return nil, errors.New("bind: cannot assign requested address")
+	}
+	m := testManager(factory)
+	m.retryInterval = 50 * time.Millisecond
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	time.Sleep(20 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() { m.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() during bind retry did not return promptly")
+	}
+	mu.Lock()
+	got := clientBinds
+	mu.Unlock()
+	if got == 0 {
+		t.Error("expected at least one client bind attempt during the failing retry window")
+	}
+}
+
 // TestRunRelay_OneSidedExitNoHang makes the response goroutine's serverConn
 // return ErrClosed while ctx is NOT cancelled. Per the cross-cancellation
 // design the response loop returns -> defer cancel() fires -> watcher closes

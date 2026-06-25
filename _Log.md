@@ -1,3 +1,25 @@
+## 2026-06-25 — #2786: VRRP IPv6 raw socket SO_BINDTODEVICE VLAN-skip (split-brain)
+
+- **Timestamp**: 2026-06-25
+- **Action**: The IPv6 VRRP raw socket (`openIPv6Socket`) bound
+  `SO_BINDTODEVICE` UNCONDITIONALLY, while the IPv4 path
+  (`openPerInterfaceSocket`) skips it on VLAN sub-interfaces (generic-XDP
+  VLAN tag handling makes the kernel interface association unreliable). On
+  a VLAN RETH member (e.g. `reth0.50`/`reth0.80`) the two families saw
+  VRRP multicast differently — the IPv6 instance could miss peer adverts
+  and both nodes hold MASTER → split-brain / dual-MASTER (agy-review-048
+  finding 048-01). Fix: extracted the single gated bind decision into
+  `maybeBindToDevice(fd, ifName, isVLAN)` (skip on VLAN) and routed BOTH
+  the v4 and v6 paths through it; added `isVLAN` to `openIPv6Socket` and
+  its instance.go call site (derived from the same
+  `strings.Contains(Interface, ".")` as v4). bindSocketToDevice is a
+  package-var seam so the gate is testable without CAP_NET_RAW. Fail-on-
+  revert: TestMaybeBindToDeviceVLANGate goes RED if the gate is reverted
+  to an unconditional bind (proven). HA code — PARENT runs
+  `make test-failover` (the split-brain gate) before merge.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance.go,
+  pkg/vrrp/bindtodevice_test.go, pkg/vrrp/README.md, _Log.md
+
 ## 2026-06-25 — #2515: reconcile no_snapshot teardown now refreshes bindings
 
 - **Timestamp**: 2026-06-25
@@ -15702,6 +15724,19 @@ top.
   userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2791 frr/bgp — decouple BGP maximum-paths from global ECMP.
+  `generateProtocols` seeded `bgpMaxPaths := ecmpMaxPaths` then only bumped
+  it for `bgp.Multipath`, so a global forwarding-table ECMP setting silently
+  rendered `maximum-paths` into both BGP unicast address-families, enabling
+  BGP multipath path-selection the operator never configured. Fix: drive the
+  BGP address-family `maximum-paths` SOLELY from `bgp.Multipath`
+  (`bgpMaxPaths := bgp.Multipath`); the global ECMP knob still reaches the
+  IGP/zebra `maximum-paths` lines via `ecmpMaxPaths`. Reworked
+  TestGenerateProtocols_ECMPMaxPaths (was asserting the coupled bug) and
+  added TestGenerateProtocols_BGPMaxPathsDecoupledFromECMP (dual-stack
+  fail-on-revert pin — RED when the coupling is restored, both AFs checked).
+  **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
+  pkg/frr/README.md, _Log.md
   **Action**: #2573 — cached TX-selection records ALL matched `then count`
   terms, not just the last. #2544 fall-through lets one packet match
   multiple `then count` terms; the cached flow-replay descriptor held a
@@ -15757,3 +15792,18 @@ top.
   code fix; the deliverable is two named regression guards that pin the
   recovery and go RED if the split is ever reintroduced into the TX path.
   **File(s)**: userspace-dp/src/afxdp/tx/cos_classify_tests.rs, _Log.md
+  **Action**: #2787 — DHCP-relay supervisor no longer dies on a transient
+  socket bind/listen failure. `runRelaySession` now returns a tri-state
+  `sessionOutcome` (`sessionStop`/`sessionDrift`/`sessionRetry`) instead of
+  `bool drift`. The two `newConn` failures (client listener `0.0.0.0:67`,
+  giaddr server conn) return `sessionRetry` when the session ctx is still
+  live, and the supervisor (`runRelay`) waits the bounded ctx-cancelable
+  `retryInterval` and rebuilds rather than exiting the per-interface
+  goroutine. A cancelled session ctx on a bind failure returns `sessionStop`
+  so `Stop()` stays prompt. Fail-on-revert tests: `TestRunRelay_BindFailureRetries`
+  (fails first K binds then succeeds → supervisor survives + binds; reverting
+  to terminal → 0 factory calls, RED) and `TestRunRelay_StopDuringBindRetry`
+  (Stop during failing bind returns promptly). `go test -race
+  ./pkg/dhcprelay/... ./pkg/daemon/...` green; build/gofmt/vet clean.
+  **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/dhcprelay/README.md, _Log.md
