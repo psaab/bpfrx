@@ -40,7 +40,9 @@ pub(super) fn bring_up_workers(
         // reads coord.forwarding, not this field.
         forwarding: _,
     } = fds;
-    let ring_entries = ring_entries.max(64).min(u32::MAX as usize) as u32;
+    // #2524: clamp to the shared sanity ceiling (MAX_RING_ENTRIES) as the
+    // helper-side backstop for the Go commit-time bound. Floor stays 64.
+    let ring_entries = ring_entries.max(64).min(MAX_RING_ENTRIES as usize) as u32;
     let mut workers: BTreeMap<u32, Vec<BindingPlan>> = BTreeMap::new();
     for binding in bindings.iter_mut() {
         if !binding.registered || binding.ifindex <= 0 {

@@ -312,6 +312,29 @@ pub(crate) fn derive_event_socket_path(control_socket: &str) -> String {
     }
 }
 
+/// #2524: parse and bound the `--ring-entries` CLI value. Accepts a power
+/// of two in [1..MAX_RING_ENTRIES]; otherwise returns a clean startup error
+/// so an out-of-range value cannot drive an enormous per-binding UMEM
+/// preallocation (binding_frame_count_for_driver ~3×ring_entries frames).
+/// Independent backstop for the Go commit-time gate (ValidateRingEntries).
+fn validate_ring_entries_arg(val: &str) -> Result<usize, String> {
+    let parsed = val
+        .parse::<usize>()
+        .map_err(|e| format!("parse --ring-entries: {e}"))?;
+    let max = crate::afxdp::MAX_RING_ENTRIES as usize;
+    if parsed < 1 || parsed > max {
+        return Err(format!(
+            "--ring-entries out of range [1..{max}] (got {parsed})"
+        ));
+    }
+    if parsed & (parsed - 1) != 0 {
+        return Err(format!(
+            "--ring-entries must be a power of two in [1..{max}] (got {parsed})"
+        ));
+    }
+    Ok(parsed)
+}
+
 pub(crate) fn parse_args() -> Result<Args, String> {
     let mut control_socket = env::temp_dir()
         .join("xpf-userspace-dp")
@@ -341,12 +364,12 @@ pub(crate) fn parse_args() -> Result<Args, String> {
                     .map_err(|e| format!("parse --workers: {e}"))?
                     .max(1)
             }
-            "--ring-entries" => {
-                ring_entries = val
-                    .parse::<usize>()
-                    .map_err(|e| format!("parse --ring-entries: {e}"))?
-                    .max(1)
-            }
+            // #2524: fail-closed at the CLI boundary — reject an
+            // out-of-range or non-power-of-two value with a clean startup
+            // error instead of letting it drive an enormous per-binding
+            // UMEM preallocation. Mirrors the Go commit gate (pkg/config
+            // ValidateRingEntries, MaxRingEntries).
+            "--ring-entries" => ring_entries = validate_ring_entries_arg(&val)?,
             "--poll-mode" => poll_mode = PollMode::from_str(&val),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -359,4 +382,42 @@ pub(crate) fn parse_args() -> Result<Args, String> {
         ring_entries,
         poll_mode,
     })
+}
+
+#[cfg(test)]
+mod ring_entries_tests {
+    use super::validate_ring_entries_arg;
+
+    #[test]
+    fn accepts_powers_of_two_in_range() {
+        for v in ["1", "2", "1024", "4096", "8192", "16384"] {
+            assert!(
+                validate_ring_entries_arg(v).is_ok(),
+                "expected {v} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_over_max() {
+        // 16385 = max+1; 32768 / 65536 powers of two above the ceiling.
+        for v in ["16385", "32768", "65536"] {
+            let err = validate_ring_entries_arg(v).unwrap_err();
+            assert!(err.contains("out of range"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_power_of_two() {
+        for v in ["3", "1000", "1023", "12345"] {
+            let err = validate_ring_entries_arg(v).unwrap_err();
+            assert!(err.contains("power of two"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_zero_and_garbage() {
+        assert!(validate_ring_entries_arg("0").is_err());
+        assert!(validate_ring_entries_arg("asd").is_err());
+    }
 }
