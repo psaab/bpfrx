@@ -219,6 +219,38 @@ fn evaluate_filter_ref_counted_v6(
     acc
 }
 
+/// #2620: counter ownership policy for the non-routing input-filter evaluator.
+///
+/// The session-miss path runs this precheck for the verdict AND — only on its
+/// Accept/defer exit (`poll_descriptor/mod.rs` does `continue` on a non-Accept
+/// verdict, never reaching the routing evaluator) — the routing-instance
+/// evaluator (`evaluate_interface_filter_routing_instance_event_counted`, via
+/// `ingress_route_table_override`), which counts every matched term itself.
+/// So WHO owns the count depends on the per-packet exit, not just on whether
+/// the filter has a routing-instance term:
+///
+/// * `Always` — this precheck is the SOLE counter for the packet. Used when no
+///   routing-instance term exists in the filter (the routing evaluator returns
+///   early at the `affects_route_lookup` guard and counts nothing) AND on the
+///   DSCP/L4-sensitive SESSION-HIT re-eval path (`evaluate_dscp_sensitive_input_filter_on_session_hit`),
+///   which never invokes the routing evaluator. Counts every matched `then
+///   count` term on every exit — bit-identical to pre-#2620 behavior.
+/// * `OnlyTerminalNonAccept` — used on the session-MISS path when the filter IS
+///   route-lookup-affecting. The routing evaluator runs and counts on the
+///   Accept/defer exit, so this precheck must NOT count there (else the
+///   fall-through `then count` ahead of the routing-instance term double-counts,
+///   the #2620 bug). But on a terminal `discard`/`reject` exit BEFORE the
+///   routing-instance term the poll path `continue`s and the routing evaluator
+///   never runs — so this precheck IS the sole counter on that exit and must
+///   count every matched `then count` term up to and including the terminal one
+///   (else those terms under-count to zero, the regression the coarse boolean
+///   gate introduced).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NonRoutingCountPolicy {
+    Always,
+    OnlyTerminalNonAccept,
+}
+
 #[inline]
 fn evaluate_filter_ref_non_routing_counted(
     filter: &Filter,
@@ -230,7 +262,7 @@ fn evaluate_filter_ref_non_routing_counted(
     dscp: u8,
     extra: TermMatchExtra,
     packet_bytes: u64,
-    count: bool,
+    count_policy: NonRoutingCountPolicy,
 ) -> FilterResult {
     match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => evaluate_filter_ref_non_routing_counted_v4(
@@ -243,7 +275,7 @@ fn evaluate_filter_ref_non_routing_counted(
             dscp,
             extra,
             packet_bytes,
-            count,
+            count_policy,
         ),
         (IpAddr::V6(src), IpAddr::V6(dst)) => evaluate_filter_ref_non_routing_counted_v6(
             filter,
@@ -255,7 +287,7 @@ fn evaluate_filter_ref_non_routing_counted(
             dscp,
             extra,
             packet_bytes,
-            count,
+            count_policy,
         ),
         _ => FilterResult::default(),
     }
@@ -272,20 +304,22 @@ fn evaluate_filter_ref_non_routing_counted_v4(
     dscp: u8,
     extra: TermMatchExtra,
     packet_bytes: u64,
-    count: bool,
+    count_policy: NonRoutingCountPolicy,
 ) -> FilterResult {
     // #2544: accumulate fall-through modifiers (count/log/fc/dscp). A matched
     // term that points at a routing-instance defers to the routing-instance
     // evaluator (returns default here, unchanged); such a term is never a
     // fall-through (continue_term is false when routing_instance is set).
     //
-    // #2620: `count` is false on the session-miss path when the interface
-    // filter is route-lookup-affecting — the paired routing-instance evaluator
-    // (`ingress_route_table_override`) traverses the SAME terms and records
-    // their counters there, so counting here too would double-count every
-    // matched fall-through `then count` term ahead of the routing-instance
-    // term. With no PBR term the routing evaluator never runs, so this path
-    // owns counting and `count` is true (current behavior preserved).
+    // #2620: counting follows `count_policy` (see NonRoutingCountPolicy). Under
+    // `Always` every matched `then count` term records inline. Under
+    // `OnlyTerminalNonAccept` we do NOT count during the walk — the routing
+    // evaluator owns the count on the Accept/defer exit — and instead replay the
+    // count over the matched terms ONLY when this evaluator reaches a terminal
+    // `discard`/`reject` (the exit on which the poll path `continue`s and the
+    // routing evaluator never runs), so those fall-through counters are recorded
+    // exactly once and never drop to zero.
+    let always_count = count_policy == NonRoutingCountPolicy::Always;
     let mut acc = FilterResult::default();
     for term in &filter.terms {
         if !term_matches_v4(
@@ -296,7 +330,7 @@ fn evaluate_filter_ref_non_routing_counted_v4(
         if !term.routing_instance.is_empty() {
             return FilterResult::default();
         }
-        if count && term.has_count {
+        if always_count && term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
         merge_matched_modifiers(&mut acc, filter, term);
@@ -305,12 +339,63 @@ fn evaluate_filter_ref_non_routing_counted_v4(
         acc.routing_instance = String::new();
         if !term.continue_term {
             acc.action = term.action;
+            if !always_count && term.action != FilterAction::Accept {
+                count_matched_non_routing_terms_v4(
+                    filter,
+                    src_ip,
+                    dst_ip,
+                    protocol,
+                    src_port,
+                    dst_port,
+                    dscp,
+                    extra,
+                    packet_bytes,
+                    term,
+                );
+            }
             normalize_log_match_action(&mut acc);
             return acc;
         }
     }
     normalize_log_match_action(&mut acc);
     acc
+}
+
+/// #2620: replay the matched-term walk under `OnlyTerminalNonAccept` once the
+/// caller has resolved that the verdict is a terminal `discard`/`reject`,
+/// recording each matched `then count` term up to AND INCLUDING `terminal`
+/// exactly once. The routing evaluator never runs on this exit, so this
+/// evaluator is the sole counter. Walk order is identical to the main loop so
+/// the recorded set matches.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn count_matched_non_routing_terms_v4(
+    filter: &Filter,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    extra: TermMatchExtra,
+    packet_bytes: u64,
+    terminal: &FilterTerm,
+) {
+    for term in &filter.terms {
+        if !term_matches_v4(
+            term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
+        ) {
+            continue;
+        }
+        // A routing-instance term would have made the main loop return default
+        // before reaching the terminal; it can never precede `terminal` here.
+        if term.has_count {
+            record_filter_counter(&term.counter, packet_bytes);
+        }
+        if std::ptr::eq(term, terminal) {
+            return;
+        }
+    }
 }
 
 #[inline]
@@ -324,11 +409,10 @@ fn evaluate_filter_ref_non_routing_counted_v6(
     dscp: u8,
     extra: TermMatchExtra,
     packet_bytes: u64,
-    count: bool,
+    count_policy: NonRoutingCountPolicy,
 ) -> FilterResult {
-    // #2544: see evaluate_filter_ref_non_routing_counted_v4.
-    // #2620: `count` gating mirrors the v4 variant — false on the PBR-affecting
-    // session-miss path so the routing-instance evaluator owns the count.
+    // #2544/#2620: see evaluate_filter_ref_non_routing_counted_v4.
+    let always_count = count_policy == NonRoutingCountPolicy::Always;
     let mut acc = FilterResult::default();
     for term in &filter.terms {
         if !term_matches_v6(
@@ -339,19 +423,63 @@ fn evaluate_filter_ref_non_routing_counted_v6(
         if !term.routing_instance.is_empty() {
             return FilterResult::default();
         }
-        if count && term.has_count {
+        if always_count && term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
         merge_matched_modifiers(&mut acc, filter, term);
         acc.routing_instance = String::new();
         if !term.continue_term {
             acc.action = term.action;
+            if !always_count && term.action != FilterAction::Accept {
+                count_matched_non_routing_terms_v6(
+                    filter,
+                    src_ip,
+                    dst_ip,
+                    protocol,
+                    src_port,
+                    dst_port,
+                    dscp,
+                    extra,
+                    packet_bytes,
+                    term,
+                );
+            }
             normalize_log_match_action(&mut acc);
             return acc;
         }
     }
     normalize_log_match_action(&mut acc);
     acc
+}
+
+/// #2620: v6 counterpart of `count_matched_non_routing_terms_v4`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn count_matched_non_routing_terms_v6(
+    filter: &Filter,
+    src_ip: Ipv6Addr,
+    dst_ip: Ipv6Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    extra: TermMatchExtra,
+    packet_bytes: u64,
+    terminal: &FilterTerm,
+) {
+    for term in &filter.terms {
+        if !term_matches_v6(
+            term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
+        ) {
+            continue;
+        }
+        if term.has_count {
+            record_filter_counter(&term.counter, packet_bytes);
+        }
+        if std::ptr::eq(term, terminal) {
+            return;
+        }
+    }
 }
 
 #[inline]
@@ -600,17 +728,17 @@ pub(crate) fn evaluate_interface_filter_counted(
     )
 }
 
-/// Evaluate the per-interface input filter for the session-miss decision,
-/// deferring any routing-instance (PBR) term to the routing-instance evaluator.
+/// Evaluate the per-interface input filter for the session-miss / session-hit
+/// decision, deferring any routing-instance (PBR) term to the routing-instance
+/// evaluator. `count_policy` selects who owns the per-packet count — see
+/// [`NonRoutingCountPolicy`] (#2620). The caller picks:
 ///
-/// `count` controls whether matched fall-through `then count` terms record
-/// their counters here. On the session-miss path the caller passes
-/// `count = !interface_filter_affects_route_lookup(...)`: when the filter is
-/// route-lookup-affecting the paired `evaluate_interface_filter_routing_instance_event_counted`
-/// traverses the SAME terms and records their counters, so this evaluator must
-/// NOT count (else every fall-through `then count` ahead of the routing-instance
-/// term double-counts on one miss packet, #2620). When no PBR term exists the
-/// routing evaluator never runs and this path owns the count (`count = true`).
+/// * `OnlyTerminalNonAccept` on the session-MISS path when the filter is
+///   route-lookup-affecting (the routing evaluator runs on the Accept exit and
+///   counts there; this evaluator counts only on the terminal discard/reject
+///   exit the routing evaluator can't reach), and
+/// * `Always` otherwise — a plain non-PBR filter, or the DSCP/L4 session-HIT
+///   re-eval, where this evaluator is the SOLE counter.
 pub(crate) fn evaluate_interface_filter_non_routing_counted(
     state: &FilterState,
     ifindex: i32,
@@ -623,7 +751,7 @@ pub(crate) fn evaluate_interface_filter_non_routing_counted(
     dscp: u8,
     extra: TermMatchExtra,
     packet_bytes: u64,
-    count: bool,
+    count_policy: NonRoutingCountPolicy,
 ) -> FilterResult {
     let filter = if is_v6 {
         state.iface_filter_v6_fast.get(&ifindex).map(Arc::as_ref)
@@ -643,7 +771,7 @@ pub(crate) fn evaluate_interface_filter_non_routing_counted(
         dscp,
         extra,
         packet_bytes,
-        count,
+        count_policy,
     )
 }
 

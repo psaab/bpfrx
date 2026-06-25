@@ -2,28 +2,44 @@
 
 - **Timestamp**: 2026-06-25
 - **Action**: On the session-miss path a route-lookup-affecting interface
-  input filter runs two counted evaluators over the same terms: the
-  non-routing precheck (`evaluate_interface_filter_non_routing_counted`)
-  for the verdict, then the routing-instance evaluator
+  input filter runs the non-routing precheck
+  (`evaluate_interface_filter_non_routing_counted`) for the verdict and —
+  ONLY on the precheck's Accept verdict — the routing-instance evaluator
   (`evaluate_interface_filter_routing_instance_event_counted`, via
-  `ingress_route_table_override`). Both called `record_filter_counter` for
-  a matched `then { count X; next term; }` fall-through term ahead of the
-  `then routing-instance` term, double-counting that term on one miss
-  packet (codex review-040 finding 040-06). Fix: added a `count: bool`
-  parameter to `evaluate_interface_filter_non_routing_counted` and its
-  `evaluate_filter_ref_non_routing_counted_v4/v6` bodies; the miss-path
-  caller `evaluate_non_pbr_input_filter` sets it to
-  `!interface_filter_affects_route_lookup(...)`. When a PBR term exists the
-  routing evaluator owns the count (precheck `count=false`); with no PBR
-  term the routing evaluator never runs and the precheck owns it
-  (`count=true`, behavior unchanged). The routing-instance evaluator already
-  counts every matched term up to the terminating one even when it returns
-  None, so the single owner is complete on every miss exit. Added a
-  fail-on-revert regression replicating the two-evaluator miss sequence
-  (asserts exactly-once; proved RED at left:2/right:1 on revert, restored).
-  No wire change (`wire_invariant_default_specimens` green).
+  `ingress_route_table_override`). On a non-Accept verdict the poll path
+  `continue`s and the routing evaluator NEVER runs. Both called
+  `record_filter_counter` for a matched `then { count X; next term; }`
+  fall-through term ahead of the `then routing-instance` term, so on the
+  Accept exit that term was double-counted on one miss packet (codex
+  review-040 finding 040-06). Counter ownership is per-EXIT, not a static
+  property of the filter. Initial fix used a coarse `count: bool` gated on
+  `!interface_filter_affects_route_lookup(...)`, which introduced a NEW
+  under-count: a terminal `discard`/`reject` ahead of the routing-instance
+  term, and the DSCP/L4 session-HIT re-eval, both reach the precheck while
+  the routing evaluator never runs — the coarse gate dropped those counts
+  to zero. Corrected fix: a `NonRoutingCountPolicy` enum (`Always` |
+  `OnlyTerminalNonAccept`) on
+  `evaluate_interface_filter_non_routing_counted` +
+  `evaluate_filter_ref_non_routing_counted_v4/v6`.
+  `evaluate_non_pbr_input_filter` takes `routing_eval_follows` and derives
+  the policy as `OnlyTerminalNonAccept` only when
+  `routing_eval_follows && affects_route_lookup`, else `Always`. Under
+  `OnlyTerminalNonAccept` the precheck counts nothing on the Accept exit
+  (routing eval owns it) but replays the matched-term walk to count
+  up-to-and-including the terminal on a `discard`/`reject` (via the new
+  `count_matched_non_routing_terms_v4/v6` helpers, ptr-eq terminal stop).
+  Miss-path call site passes `routing_eval_follows=true`; session-hit
+  re-eval passes `false`. Exactly-once on all four exits: Accept+PBR (once,
+  routing eval), discard/reject-before-PBR (once, precheck), plain non-PBR
+  (once, precheck), DSCP/L4 session-hit (once per packet, precheck). Four
+  regression tests; proved RED-on-revert: double-count revert →
+  exactly-once test left:2/right:1; under-count revert → terminal-discard
+  test left:0/right:1. Restored, full filter+poll_descriptor suite 188/0,
+  no wire change (`wire_invariant_default_specimens` green).
 - **File(s)**: userspace-dp/src/filter/engine/eval.rs,
+  userspace-dp/src/filter/engine/mod.rs,
   userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
   _Log.md
 
