@@ -22,9 +22,9 @@ pub(super) mod snapshot;
 pub(super) mod teardown;
 
 /// State preserved across `stop_inner(false)` that the later phases
-/// need to consume. Two fields only — `had_live_workers` lives
-/// entirely inside `teardown.rs` (it gates the 500ms mlx5 quiesce
-/// sleep, which is not needed outside teardown).
+/// need to consume. `had_live_workers` lives entirely inside
+/// `teardown.rs` (it gates the 500ms mlx5 quiesce sleep alongside the
+/// `will_rebind` flag, which is not needed outside teardown).
 pub(in crate::afxdp) struct PreservedReconcileState {
     pub(super) synced_sessions: Vec<SyncedSessionEntry>,
     pub(super) slow_path: Option<Arc<SlowPathReinjector>>,
@@ -70,7 +70,8 @@ impl Coordinator {
     ///
     /// Phases (preserved verbatim from pre-#1328 monolithic body):
     /// 1. Teardown: preserve synced sessions + healthy slow path,
-    ///    stop workers, 500ms quiesce if workers were live.
+    ///    stop workers, 500ms quiesce if workers were live AND a rebind
+    ///    follows (snapshot-apply path only — #2522).
     /// 2. Reset: zero per-binding counter fields.
     /// 3. Snapshot apply (only if `snapshot.is_some()`): install
     ///    validation/forwarding state, re-arm slow path, open BPF
@@ -171,7 +172,14 @@ impl Coordinator {
         } else {
             None
         };
-        let mut preserved = teardown::tear_down(self);
+        // #2522: only the snapshot-apply path rebinds the XSK on the
+        // (possibly) same queue set, so only it needs the mlx5 EBUSY
+        // quiesce. A `None`-snapshot teardown (config cleared / shutdown
+        // reconcile) returns at `no_snapshot` below without ever
+        // rebinding — pass `will_rebind = false` so it skips the 500ms
+        // stall.
+        let will_rebind = snapshot.is_some();
+        let mut preserved = teardown::tear_down(self, will_rebind);
         reset::reset_binding_counters(bindings);
         let Some(snapshot) = snapshot else {
             self.policy_counters.reconcile_rules(&[]);
