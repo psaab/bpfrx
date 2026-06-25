@@ -110,14 +110,25 @@ pub(super) fn stage_link_layer_classify(
     };
     match parser::classify_arp(raw_frame) {
         parser::ArpClassification::Reply(arp) => {
-            let ifindex = learn_ifindex();
-            worker_ctx.dynamic_neighbors.insert(
-                (ifindex, arp.sender_ip),
-                NeighborEntry {
-                    mac: arp.sender_mac,
-                },
-            );
-            add_kernel_neighbor(ifindex, arp.sender_ip, arp.sender_mac);
+            // #2790: validate the advertised sender protocol address BEFORE
+            // caching it. RFC 826 — a learnable ARP reply must name a single
+            // unicast host. A reply claiming an unspecified / loopback /
+            // multicast / broadcast sender IP would otherwise pollute both
+            // the userspace `dynamic_neighbors` map and the kernel ARP table
+            // (spoofed-reply DoS / routing disruption). Fail closed: recycle
+            // the ARP frame (it never transits) but skip learning, mirroring
+            // the #2369 fail-closed-on-malformed-ARP posture and the cold
+            // neighbor warmer's unicast-only gate.
+            if neighbor_ip_is_learnable(arp.sender_ip) {
+                let ifindex = learn_ifindex();
+                worker_ctx.dynamic_neighbors.insert(
+                    (ifindex, arp.sender_ip),
+                    NeighborEntry {
+                        mac: arp.sender_mac,
+                    },
+                );
+                add_kernel_neighbor(ifindex, arp.sender_ip, arp.sender_mac);
+            }
             return StageOutcome::RecycleAndContinue;
         }
         parser::ArpClassification::OtherArp => {
@@ -127,6 +138,12 @@ pub(super) fn stage_link_layer_classify(
     }
     if let Some(na) = parser::parse_ndp_neighbor_advert(raw_frame)
         && let Some(mac) = na.target_mac
+        // #2790: same unicast-only gate for the NDP NA target address —
+        // an NA advertising an unspecified / loopback / multicast target
+        // IP is not a learnable neighbor (RFC 4861 §7.2.4 targets are
+        // unicast). The NA frame still transits (falls through below);
+        // only the neighbor write is suppressed.
+        && neighbor_ip_is_learnable(na.target_ip)
     {
         let ifindex = learn_ifindex();
         worker_ctx
@@ -1446,5 +1463,84 @@ mod tests {
             &mut f, l3_start, l4_start, packet_end,
         );
         (f, IpAddr::V6(Ipv6Addr::from(target_bytes)), target_mac)
+    }
+
+    /// #2790 fail-on-revert (ARP). A valid unicast on-subnet sender IS
+    /// learned; an ARP reply whose sender protocol address is unspecified
+    /// (`0.0.0.0`), the limited broadcast (`255.255.255.255`), or
+    /// multicast (`224.0.0.1`) is NOT learned — the frame is still
+    /// recycled (ARP never transits) but no neighbor write occurs.
+    ///
+    /// Reverting the `neighbor_ip_is_learnable(arp.sender_ip)` gate in
+    /// `stage_link_layer_classify` caches the bad sender IPs, so the
+    /// "must NOT be present" asserts fail RED. The valid-unicast assert
+    /// keeps the gate from over-rejecting a legitimate neighbor.
+    #[test]
+    fn arp_invalid_sender_ip_not_learned_2790() {
+        let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+            &super::super::test_fixtures::nat_snapshot(),
+        )));
+        let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+
+        // reth1.0 is logical==physical ifindex 24 (untagged) in 10.0.61.0/24.
+        let meta = link_layer_meta(24, 0);
+
+        // 1) Valid unicast on-subnet sender — MUST be learned.
+        let good_ip = Ipv4Addr::new(10, 0, 61, 50);
+        let good_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x18];
+        let outcome =
+            stage_link_layer_classify(&arp_reply_frame(good_ip, good_mac), meta, ctx);
+        assert!(matches!(outcome, StageOutcome::RecycleAndContinue));
+        assert_eq!(
+            neighbors.get(&(24, IpAddr::V4(good_ip))).map(|e| e.mac),
+            Some(good_mac),
+            "a valid unicast on-subnet ARP sender must be learned (#2790 \
+             gate must not over-reject)"
+        );
+
+        // 2) Illegitimate senders — each recycled but NEVER cached.
+        for bad_ip in [
+            Ipv4Addr::new(0, 0, 0, 0),             // unspecified
+            Ipv4Addr::new(255, 255, 255, 255),     // limited broadcast
+            Ipv4Addr::new(224, 0, 0, 1),           // multicast
+            Ipv4Addr::new(127, 0, 0, 1),           // loopback
+        ] {
+            let bad_mac = [0x02, 0x00, 0x00, 0x00, 0xba, 0xad];
+            let outcome =
+                stage_link_layer_classify(&arp_reply_frame(bad_ip, bad_mac), meta, ctx);
+            // ARP is always recycled (it never transits the firewall).
+            assert!(
+                matches!(outcome, StageOutcome::RecycleAndContinue),
+                "ARP reply with sender {bad_ip} must still be recycled"
+            );
+            assert!(
+                neighbors.get(&(24, IpAddr::V4(bad_ip))).is_none(),
+                "ARP reply claiming illegitimate sender {bad_ip} must NOT be \
+                 cached (#2790 cache-pollution gate)"
+            );
+        }
+    }
+
+    /// #2790 direct predicate coverage — `neighbor_ip_is_learnable`
+    /// accepts only legitimate unicast addresses (the contract the ARP /
+    /// NDP learn sites rely on).
+    #[test]
+    fn neighbor_ip_is_learnable_rejects_non_unicast_2790() {
+        // Learnable unicast.
+        assert!(neighbor_ip_is_learnable(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 50))));
+        assert!(neighbor_ip_is_learnable(IpAddr::V6(Ipv6Addr::from([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0xab, 0xcd, 0xef, 0x01, 0x00, 0x00, 0x00, 0x42,
+        ]))));
+        // Rejected IPv4 classes.
+        assert!(!neighbor_ip_is_learnable(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(!neighbor_ip_is_learnable(IpAddr::V4(Ipv4Addr::BROADCAST)));
+        assert!(!neighbor_ip_is_learnable(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))));
+        assert!(!neighbor_ip_is_learnable(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        // Rejected IPv6 classes (no broadcast in v6).
+        assert!(!neighbor_ip_is_learnable(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        assert!(!neighbor_ip_is_learnable(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(!neighbor_ip_is_learnable(IpAddr::V6(Ipv6Addr::new(
+            0xff02, 0, 0, 0, 0, 0, 0, 1
+        ))));
     }
 }

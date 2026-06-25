@@ -758,6 +758,41 @@ pub(in crate::afxdp) fn l2_dst_is_group_or_broadcast(eth_dst: &[u8; 6]) -> bool 
     (eth_dst[0] & 0x01) != 0
 }
 
+/// #2790: RFC 826 — a learned neighbor (ARP reply sender, NDP NA target)
+/// MUST uniquely identify a single host before it is cached and
+/// programmed into the kernel neighbor table. An ARP/NDP reply whose
+/// advertised protocol address is unspecified (`0.0.0.0` / `::`),
+/// loopback (`127/8` / `::1`), multicast (`224/4` / `ff00::/8`), or — for
+/// IPv4 — the limited broadcast (`255.255.255.255`) does not name a
+/// legitimate unicast peer; caching it pollutes both the userspace
+/// `dynamic_neighbors` map and the kernel ARP/NDP table, enabling a
+/// spoofed-reply DoS (routing disruption). Fail closed: such a reply is
+/// not learnable and the caller drops/recycles it without caching.
+///
+/// This is the neighbor-learning sibling of
+/// [`source_is_invalid_for_icmp_error`] (the ICMP-error L3-SOURCE gate);
+/// it applies the SAME unicast-only posture the #2367 / #2487 ICMP-source
+/// checks and the cold-neighbor warmer (`coordinator::warm_neighbors`)
+/// already enforce, so every neighbor write — learned or warmed — rejects
+/// the same illegitimate address classes.
+///
+/// Returns `true` when `ip` is a legitimate unicast address that MAY be
+/// learned. IPv4 broadcast is rejected; IPv6 has no broadcast (multicast
+/// covers the group case). Directed (subnet) broadcasts are NOT rejected
+/// here: recognizing them needs the per-interface mask, the learned key
+/// is already scoped to the ingress logical ifindex, and a directed
+/// broadcast is a normal unicast address to this test — matching the
+/// warmer's posture, which also only tests the limited broadcast.
+#[inline]
+pub(in crate::afxdp) fn neighbor_ip_is_learnable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_unspecified() && !v4.is_loopback() && !v4.is_multicast() && !v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => !v6.is_unspecified() && !v6.is_loopback() && !v6.is_multicast(),
+    }
+}
+
 pub(in crate::afxdp) fn metadata_tuple_complete(meta: UserspaceDpMeta, flow: &SessionFlow) -> bool {
     if flow.src_ip.is_unspecified() || flow.dst_ip.is_unspecified() {
         return false;
