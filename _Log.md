@@ -1,3 +1,34 @@
+## 2026-06-25 — #2771: route53 already-gone DELETE is idempotent (Surface A unwedge)
+
+- **Timestamp**: 2026-06-25
+- **Action**: A Route 53 Surface A withdraw against an already-removed
+  record failed and never converged: `backend_route53.go` `DeleteLease`
+  sent a strict DELETE and a no-such-record response (HTTP 400
+  `InvalidChangeBatch` "... but it was not found") propagated as non-nil.
+  Surface A's `withdrawOwnedLocked` drops ownership only on a nil return,
+  so the withdraw wedged and retried forever while `show system services
+  dynamic-dns` reported an owned record that no longer existed. Fix: made
+  `DeleteLease` IDEMPOTENT — `change` now returns the parsed Route 53
+  error code+message, and `r53DeleteAlreadyGone` classifies the
+  already-gone case (requires BOTH `Code=InvalidChangeBatch` AND a "not
+  found" marker) as success (nil) so ownership releases. Mirrors the
+  rfc2136 backend's NXRRSET/NXDOMAIN idempotent delete (`sendRemove`).
+  Genuine transient/auth/throttle failures (`SignatureDoesNotMatch`, 5xx,
+  429, a non-"not found" `InvalidChangeBatch`) STILL return non-nil so the
+  engine retries — only the already-gone case is swallowed.
+- **Fail-on-revert proof**: copied `backend_route53.go` aside, neutered
+  the `r53DeleteAlreadyGone` branch in `DeleteLease` (return the raw
+  err) → `TestRoute53DeleteAlreadyGoneIdempotent` FAILED ("already-gone
+  DELETE must be idempotent success (nil), got ... InvalidChangeBatch:
+  [Tried to delete resource record set ...] but it was not found ...
+  unexpected status 400"); the genuine-error subtests
+  (`TestRoute53DeleteGenuineErrorRetries`) stayed GREEN through the revert
+  (no over-swallow). Restored the file → all GREEN.
+- **Gates**: `go build ./...` OK; `gofmt -l pkg/ddns/` clean; `go vet
+  ./pkg/ddns/...` clean; `go test ./pkg/ddns/...` PASS.
+- **File(s)**: `pkg/ddns/backend_route53.go`,
+  `pkg/ddns/backend_route53_test.go`, `pkg/ddns/README.md`, `_Log.md`.
+
 ## 2026-06-25 — #2773: wire validateCheckIPURL (dead code) into commit + runtime
 
 - **Timestamp**: 2026-06-25
