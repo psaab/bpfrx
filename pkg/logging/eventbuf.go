@@ -35,8 +35,15 @@ type EventRecord struct {
 	RevSessionBytes uint64 // bytes from server (for SESSION_CLOSE)
 	AppName         string // resolved application name (e.g. "junos-http")
 	IngressIface    string // resolved interface name (e.g. "trust0")
-	CloseReason     string // "idle Timeout", "TCP FIN", "TCP RST", etc.
-	SessionID       uint64 // unique session identifier
+	// IngressIfindex is the raw numeric ingress ifindex carried on the
+	// SESSION_CLOSE wire frame ([128:132], #2615). IngressIface is the
+	// name resolution of this value; the numeric form is retained so the
+	// NetFlow v9 / IPFIX exporters can populate ingressInterface
+	// (IE 10 / IN_SNMP), which is an SNMP ifIndex, not a name (#2749).
+	// 0 means the dataplane could not attribute an ingress interface.
+	IngressIfindex uint32
+	CloseReason    string // "idle Timeout", "TCP FIN", "TCP RST", etc.
+	SessionID      uint64 // unique session identifier
 }
 
 // EventBuffer is a thread-safe circular buffer for recent events.

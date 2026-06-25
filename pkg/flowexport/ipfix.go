@@ -18,6 +18,7 @@ const (
 	ipfixProtocolIdentifier       = 4
 	ipfixSourceTransportPort      = 7
 	ipfixSourceIPv4Address        = 8
+	ipfixIngressInterface         = 10
 	ipfixDestinationTransportPort = 11
 	ipfixDestinationIPv4Address   = 12
 	ipfixSourceIPv6Address        = 27
@@ -84,6 +85,12 @@ var ipfixTemplateV4 = []ipfixField{
 	{ipfixOctetDeltaCount, 8},
 	{ipfixFlowStartMilliseconds, 8},
 	{ipfixFlowEndMilliseconds, 8},
+	// #2749: ingressInterface (IE 10) re-introduced with a REAL value — the
+	// ingress ifindex on the SESSION_CLOSE frame since #2615. Placed before
+	// the post-NAT tuple so the latter stays the trailing block (#2526
+	// invariant). The other four #2613 drops (ipClassOfService 5 /
+	// tcpControlBits 6 / egressInterface 14 / flowDirection 61) stay absent.
+	{ipfixIngressInterface, 4},
 	// #2526: post-NAT (translated) tuple, appended last.
 	{ipfixPostNatSourceIPv4Address, 4},
 	{ipfixPostNatDestinationIPv4Address, 4},
@@ -102,6 +109,8 @@ var ipfixTemplateV6 = []ipfixField{
 	{ipfixOctetDeltaCount, 8},
 	{ipfixFlowStartMilliseconds, 8},
 	{ipfixFlowEndMilliseconds, 8},
+	// #2749: ingressInterface (IE 10) — see the V4 template note.
+	{ipfixIngressInterface, 4},
 	// #2526: post-NAT (translated) tuple, appended last. v6 addresses use the
 	// 16-byte RFC 8158 elements; ports reuse the family-agnostic 227/228.
 	{ipfixPostNatSourceIPv6Address, 16},
@@ -113,15 +122,17 @@ var ipfixTemplateV6 = []ipfixField{
 // ipfixRecordSizeV4 is the byte size of a single IPv4 IPFIX data record.
 // #2613 dropped TOS(1)+TCPflags(2)+direction(1)+ingressIf(4)+egressIf(4)=12
 // from the former 69-byte record. pre-NAT body = 45; #2526 post-NAT tuple
-// (4+4+2+2) = 12 → 57.
-// 4+4+2+2+1+8+8+8+8 + 4+4+2+2 = 57
-const ipfixRecordSizeV4 = 57
+// (4+4+2+2) = 12 → 57. #2749 re-added ingressInterface (IE 10, 4B) with a
+// real value → 61.
+// 4+4+2+2+1+8+8+8+8 + 4+4+2+2 + 4 = 61
+const ipfixRecordSizeV4 = 61
 
 // ipfixRecordSizeV6 is the byte size of a single IPv6 IPFIX data record.
 // #2613 dropped the same 12 unpopulated bytes from the former 117. pre-NAT
-// body = 69; #2526 post-NAT tuple (16+16+2+2) = 36 → 105.
-// 16+16+2+2+1+8+8+8+8 + 16+16+2+2 = 105
-const ipfixRecordSizeV6 = 105
+// body = 69; #2526 post-NAT tuple (16+16+2+2) = 36 → 105. #2749 re-added
+// ingressInterface (IE 10, 4B) with a real value → 109.
+// 16+16+2+2+1+8+8+8+8 + 16+16+2+2 + 4 = 109
+const ipfixRecordSizeV6 = 109
 
 // ipfixRecordSizeV4 / V6 must equal the sum of their template field lengths.
 // A drift between the template (what the collector parses) and the encoder
@@ -279,6 +290,11 @@ func encodeIPFIXRecordV4(b []byte, off int, r FlowRecord) int {
 	off += 8
 	binary.BigEndian.PutUint64(b[off:off+8], uint64(r.EndTime.UnixMilli()))
 	off += 8
+	// #2749: ingressInterface (IE 10) — the SNMP ifIndex of the session's
+	// ingress binding (real value via #2615). Written before the post-NAT
+	// tuple to match the template field order.
+	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
+	off += 4
 	// #2526: post-NAT (translated) tuple — 225/226/227/228.
 	natSrc4 := r.NATSrcIP.To4()
 	natDst4 := r.NATDstIP.To4()
@@ -327,6 +343,9 @@ func encodeIPFIXRecordV6(b []byte, off int, r FlowRecord) int {
 	off += 8
 	binary.BigEndian.PutUint64(b[off:off+8], uint64(r.EndTime.UnixMilli()))
 	off += 8
+	// #2749: ingressInterface (IE 10) — see encodeIPFIXRecordV4.
+	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
+	off += 4
 	// #2526: post-NAT (translated) tuple — 281/282 (16B) + 227/228 (2B).
 	natSrc16 := r.NATSrcIP.To16()
 	natDst16 := r.NATDstIP.To16()
@@ -438,6 +457,8 @@ func (e *IPFIXExporter) ExportSessionClose(rec logging.EventRecord, evt SessionC
 		NATDstIP:   natDstIP,
 		NATSrcPort: natSrcPort,
 		NATDstPort: natDstPort,
+		// #2749: ingress ifindex (SNMP ifIndex) -> IPFIX ingressInterface.
+		InIf: evt.InIf,
 	}
 
 	e.batch.add(fr)
