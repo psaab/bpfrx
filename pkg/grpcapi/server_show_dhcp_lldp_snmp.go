@@ -320,7 +320,7 @@ func (s *Server) showServicesDynamicDNS(cfg *config.Config, buf *strings.Builder
 	buf.WriteString("\n  Counters:\n")
 	fmt.Fprintf(buf, "    Publishes: ok=%d fail=%d\n", st.UpsertOK, st.UpsertFail)
 	fmt.Fprintf(buf, "    Withdraws: ok=%d fail=%d\n", st.DeleteOK, st.DeleteFail)
-	fmt.Fprintf(buf, "    Skipped:   unchanged=%d backoff=%d\n", st.Skipped, st.BackedOff)
+	fmt.Fprintf(buf, "    Skipped:   unchanged=%d backoff=%d no-backend=%d\n", st.Skipped, st.BackedOff, st.SkippedNoBackend)
 	fmt.Fprintf(buf, "    Published records: %d\n", st.Scopes)
 
 	if detail && s.surfaceADDNSStatusFn != nil {

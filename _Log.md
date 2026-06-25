@@ -1,3 +1,23 @@
+## 2026-06-25 — #2519: allowlist writeProxyResponderSysctl in fsatomic canary
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed RED-on-master `TestNoDirectOsWriteFile` (the #1916
+  receiver-aware direct-`os.WriteFile` canary). It flagged
+  `pkg/dataplane/proxyarp.go:95` `writeProxyResponderSysctl`, which writes
+  `[]byte("1")` to the procfs `net.ipv4.conf.<if>.proxy_arp` /
+  `net.ipv6.conf.<if>.proxy_ndp` knob. procfs has no rename(2), so the
+  fsatomic atomic-rename writers are impossible by construction — this is a
+  legitimate BestEffortKernelKnob write, exactly like the already-allowlisted
+  slow-path procfs/sysfs entries. Added the narrow receiver-aware allowlist
+  entry `"dataplane::writeProxyResponderSysctl": "procfs proxy_arp /
+  proxy_ndp knob"` mirroring the existing `dataplane::ensureVLANSubInterface`
+  shape. The entry is keyed to this one function only — the canary still
+  catches any genuine non-allowlisted direct `os.WriteFile`.
+- **File(s)**: pkg/fsatomic/canary_test.go, _Log.md
+- **Validation**: confirmed RED on master (proxyarp.go:95 violation) → GREEN
+  with the entry; `go build ./...` clean; `go test ./pkg/fsatomic/...` and
+  `go test ./pkg/dataplane/...` green; gofmt clean; `go vet` clean.
+
 ## 2026-06-25 — #2364: seed node-local hot-path hashes (algorithmic-complexity hardening)
 
 - **Timestamp**: 2026-06-25
@@ -14699,3 +14719,26 @@ top.
   pkg/dataplane/userspace/interfaces.go,
   pkg/dataplane/userspace/address_book_collision_2514_test.go,
   + mechanical 3rd-return-value updates across userspace *_test.go, _Log.md
+  **Action**: #2726 — surface Surface A DDNS SkippedNoBackend on all three
+  operator surfaces (Prometheus / CLI / gRPC) + correct stale
+  tunnel_tcp_mss docstring (post-#2715). (a) Mirrored the lease-path
+  no-backend surfacing: added the
+  xpf_ddns_surface_a_skipped_total{reason="no-backend"} series in
+  collectSurfaceADDNSMetrics (descriptor already had the reason label,
+  closed-cardinality — only the comment's reason set updated); added
+  no-backend to the CLI + gRPC "Skipped:" formatted lines. No proto
+  change (both render formatted strings). New fail-on-revert test drives
+  collectSurfaceADDNSMetrics directly and asserts the no-backend series.
+  (b) Doc-only: rewrote the tunnel_tcp_mss docstring to describe the
+  ACTUAL behavior — the WG MSS clamp uses tunnel_outer_mtu
+  (tx_ifindex→egress→logical, 1500 floor), NOT the #2715 route-resolved
+  encap-guard path — and note it is safe (route-resolved WG endpoints
+  NoRoute on this AF_XDP builder; clamp errs smaller, can't reintroduce
+  encap_mtu_drops).
+  Gates: gofmt clean; go build ./... clean; go test ./pkg/api/...
+  ./pkg/cli/... ./pkg/grpcapi/... ./pkg/ddns/... green; cargo build
+  --release clean (doc-only).
+  **File(s)**: pkg/api/metrics_system.go,
+  pkg/api/metrics_surface_a_ddns_test.go, pkg/cli/cli_show_services.go,
+  pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
+  userspace-dp/src/afxdp/forwarding/mod.rs, _Log.md
