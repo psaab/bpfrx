@@ -147,6 +147,15 @@ type ownedRecord struct {
 	// an absent value degrades to the no-DHCID path on delete (safe — the
 	// exact-RR delete still only removes the firewall's own tuple).
 	ClientID string `json:"client_id,omitempty"`
+	// AddrText is the textual rdata (the published address) for a Surface A
+	// router record (#2691 P2). Surface A keys ownership on {scope, fixed
+	// identity, ""} so a scope owns exactly ONE record and an address change
+	// REPLACES it in place (no stale old-address entry, never a withdraw-then-
+	// add gap) — which means the keying Address field is "" and the actual
+	// published address must be carried separately. The DHCP-lease path leaves
+	// this empty (its Address field IS the rdata). Omitted from the JSON when
+	// empty so a pre-P2 / lease store shape is unchanged.
+	AddrText string `json:"addr_text,omitempty"`
 	// PTRPending marks an ownership record whose forward A/AAAA was published
 	// but whose reverse PTR add failed with a non-skippable (transient) error
 	// (#2661). Ownership is still recorded so the live forward is tracked +

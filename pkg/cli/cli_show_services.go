@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -77,9 +78,90 @@ func (c *CLI) handleShowServices(args []string) error {
 				"(expected `status`)", rest[0])
 		}
 		return c.showApplicationIdentificationStatus()
+	case "dynamic-dns":
+		// #2691 P2: Surface A (router/interface-address) DDNS status.
+		detail := len(args) >= 2 && args[1] == "detail"
+		return c.showServicesDynamicDNS(detail)
 	default:
 		return fmt.Errorf("unknown services target: %s", args[0])
 	}
+}
+
+// showServicesDynamicDNS renders the Surface A (router/interface-address) DDNS
+// status: the provider catalog, runtime counters, and (detail) the per-scope
+// last-published state (#2691 P2).
+func (c *CLI) showServicesDynamicDNS(detail bool) error {
+	cfg := c.store.ActiveConfig()
+	fmt.Println("Dynamic DNS (Surface A — router/interface-address publish):")
+	if cfg != nil && cfg.System.Services != nil && cfg.System.Services.DynamicDNS != nil {
+		cat := cfg.System.Services.DynamicDNS
+		if len(cat.Providers) > 0 {
+			fmt.Println("  Providers:")
+			names := make([]string, 0, len(cat.Providers))
+			for n := range cat.Providers {
+				names = append(names, n)
+			}
+			sort.Strings(names)
+			for _, n := range names {
+				p := cat.Providers[n]
+				backend := p.Backend
+				if backend == "" {
+					backend = "rfc2136"
+				}
+				fmt.Printf("    %s: backend=%s update-server=%s", n, backend, p.UpdateServer)
+				if p.TSIGKeyName != "" {
+					fmt.Printf(" tsig-key=%s (secret redacted)", p.TSIGKeyName)
+				}
+				fmt.Println()
+			}
+		}
+		if cat.ForcedRefreshSeconds > 0 {
+			fmt.Printf("  Forced-refresh: %ds\n", cat.ForcedRefreshSeconds)
+		}
+		if cat.ErrorBackoffMaxSeconds > 0 {
+			fmt.Printf("  Error-backoff-max: %ds\n", cat.ErrorBackoffMaxSeconds)
+		}
+	} else {
+		fmt.Println("  No provider catalog configured")
+	}
+
+	if c.surfaceADDNSStatsFn == nil {
+		fmt.Println("\n  Runtime counters: unavailable")
+		return nil
+	}
+	st := c.surfaceADDNSStatsFn()
+	if st == nil {
+		fmt.Println("\n  Runtime counters: unavailable (manager not running)")
+		return nil
+	}
+	fmt.Println("\n  Counters:")
+	fmt.Printf("    Publishes: ok=%d fail=%d\n", st.UpsertOK, st.UpsertFail)
+	fmt.Printf("    Withdraws: ok=%d fail=%d\n", st.DeleteOK, st.DeleteFail)
+	fmt.Printf("    Skipped:   unchanged=%d backoff=%d\n", st.Skipped, st.BackedOff)
+	fmt.Printf("    Published records: %d\n", st.Scopes)
+
+	if detail && c.surfaceADDNSStatusFn != nil {
+		views := c.surfaceADDNSStatusFn()
+		fmt.Println("\n  Published scopes:")
+		if len(views) == 0 {
+			fmt.Println("    none")
+		} else {
+			fmt.Printf("    %-32s %-6s %-39s %-12s %s\n", "FQDN", "Family", "Address", "Provider", "Last error")
+			for _, v := range views {
+				fam := "inet"
+				if v.Family == 6 {
+					fam = "inet6"
+				}
+				lastErr := v.LastError
+				if lastErr == "" {
+					lastErr = "-"
+				}
+				fmt.Printf("    %-32s %-6s %-39s %-12s %s\n",
+					v.FQDN, fam, v.Published, v.Provider, lastErr)
+			}
+		}
+	}
+	return nil
 }
 
 func (c *CLI) showDHCPLeases() error {

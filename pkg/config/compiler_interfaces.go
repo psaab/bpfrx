@@ -383,6 +383,13 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 								unit.FilterOutputV4 = nodeVal(outputNode)
 							}
 						}
+						// Surface A router/interface-address DDNS (#2691 P2): the
+						// per-family `dynamic-dns` binding may appear as a child node
+						// (hierarchical) OR be packed into afNode's Keys (flat-set), so
+						// compileInterfaceDynamicDNS walks the whole inet subtree.
+						if ddns := compileInterfaceDynamicDNS(afNode); ddns != nil {
+							unit.DynamicDNSInet = ddns
+						}
 					case "inet6":
 						for _, addrInst := range namedInstances(afNode.FindChildren("address")) {
 							unit.Addresses = append(unit.Addresses, addrInst.name)
@@ -427,6 +434,11 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 							if outputNode := filterNode.FindChild("output"); outputNode != nil {
 								unit.FilterOutputV6 = nodeVal(outputNode)
 							}
+						}
+						// Surface A router/interface-address DDNS (#2691 P2): the
+						// per-family inet6 binding (independent of the inet binding).
+						if ddns := compileInterfaceDynamicDNS(afNode); ddns != nil {
+							unit.DynamicDNSInet6 = ddns
 						}
 						if dcNode := afNode.FindChild("dhcpv6-client"); dcNode != nil {
 							unit.DHCPv6 = true
@@ -1015,4 +1027,91 @@ func vrrpTrackConfigWarnings(cfg *Config) []string {
 		}
 	}
 	return warnings
+}
+
+// ifaceDDNSStringProps are the per-interface `dynamic-dns` leaves that carry a
+// string value (everything except the integer `ttl`). Used by
+// compileInterfaceDynamicDNS's walker to recognize a "<leaf> <value>" pair at
+// any depth regardless of the AST shape (#2691 P2).
+var ifaceDDNSStringProps = map[string]bool{
+	"provider":       true,
+	"hostname":       true,
+	"address-source": true,
+	"source-address": true,
+}
+
+// compileInterfaceDynamicDNS converts an interface family node's `dynamic-dns`
+// subtree into a typed *InterfaceDynamicDNSConfig (Surface A, #2691 P2). The
+// afNode passed in is the `family inet`/`family inet6` node; this finds the
+// `dynamic-dns` block under it (as a child node in the hierarchical shape, or
+// packed into the family node's Keys in the flat-set shape) and walks it. It
+// handles BOTH AST shapes the same way compileDHCPDynamicDNS does. Returns nil
+// when there is no dynamic-dns binding (so an interface with no Surface A
+// config compiles to a nil field — byte-for-byte today's behaviour).
+func compileInterfaceDynamicDNS(afNode *Node) *InterfaceDynamicDNSConfig {
+	// Locate the subtree root. Hierarchical: a child node named dynamic-dns.
+	// Flat-set: the token "dynamic-dns" appears inside afNode.Keys (the family
+	// node), with the binding's leaves following it / nested as children.
+	var root *Node
+	if c := afNode.FindChild("dynamic-dns"); c != nil {
+		root = c
+	} else {
+		for i, k := range afNode.Keys {
+			if k == "dynamic-dns" {
+				// Wrap the tail of the family node's Keys (from dynamic-dns on) so
+				// the walker reads them; the family node's children are walked too.
+				root = &Node{Keys: afNode.Keys[i:], Children: afNode.Children}
+				break
+			}
+		}
+	}
+	if root == nil {
+		return nil
+	}
+
+	props := map[string]string{}
+	var walk func(n *Node, isRoot bool)
+	walk = func(n *Node, isRoot bool) {
+		start := 0
+		if isRoot {
+			start = 1 // skip the "dynamic-dns" identifier itself
+		}
+		for i := start; i < len(n.Keys); i++ {
+			k := n.Keys[i]
+			switch {
+			case k == "ttl" && i+1 < len(n.Keys):
+				if _, ok := props["ttl"]; !ok {
+					props["ttl"] = n.Keys[i+1]
+				}
+				i++
+			case ifaceDDNSStringProps[k] && i+1 < len(n.Keys):
+				if _, ok := props[k]; !ok {
+					props[k] = n.Keys[i+1]
+				}
+				i++
+			}
+		}
+		for _, c := range n.Children {
+			walk(c, false)
+		}
+	}
+	walk(root, true)
+
+	d := &InterfaceDynamicDNSConfig{
+		Provider:      props["provider"],
+		Hostname:      props["hostname"],
+		AddressSource: props["address-source"],
+		SourceAddress: props["source-address"],
+	}
+	if v := props["ttl"]; v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			d.TTLSeconds = n
+		}
+	}
+	// Empty block -> treat as absent (no Surface A binding).
+	if d.Provider == "" && d.Hostname == "" && d.AddressSource == "" &&
+		d.SourceAddress == "" && d.TTLSeconds == 0 {
+		return nil
+	}
+	return d
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dataplane"
+	ddnspkg "github.com/psaab/xpf/pkg/ddns"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcprelay"
 	"github.com/psaab/xpf/pkg/dhcpserver"
@@ -54,6 +55,10 @@ type CLI struct {
 	lldpNeighborsFn    func() []*lldp.Neighbor
 	ddnsStatsFn        func() *dhcpserver.DDNSStats
 	ddnsOwnedRecordsFn func() []dhcpserver.DDNSOwnedRecordView
+	// #2691 P2: Surface A (router/interface-address) DDNS status sources for
+	// `show services dynamic-dns [detail]`.
+	surfaceADDNSStatsFn  func() *ddnspkg.SurfaceAStats
+	surfaceADDNSStatusFn func() []ddnspkg.SurfaceAStatusView
 	// flowCollectorHealthFn surfaces live per-collector NetFlow v9 / IPFIX
 	// write-health for `show flow-monitoring statistics` (#2464). Nil
 	// leaves the show reporting "no flow export configured".
@@ -194,6 +199,20 @@ func (c *CLI) SetFlowCollectorHealthFn(fn func() []flowexport.ExporterCollectorH
 // dynamic-DNS records this node currently owns (#1387 inc-2).
 func (c *CLI) SetDDNSOwnedRecordsFn(fn func() []dhcpserver.DDNSOwnedRecordView) {
 	c.ddnsOwnedRecordsFn = fn
+}
+
+// SetSurfaceADDNSStatsFn sets a callback for retrieving live Surface A
+// (router/interface-address) DDNS counters (#2691 P2). Nil leaves the show
+// config-only.
+func (c *CLI) SetSurfaceADDNSStatsFn(fn func() *ddnspkg.SurfaceAStats) {
+	c.surfaceADDNSStatsFn = fn
+}
+
+// SetSurfaceADDNSStatusFn sets a callback for retrieving the Surface A DDNS
+// per-scope last-published views for `show services dynamic-dns detail` (#2691
+// P2).
+func (c *CLI) SetSurfaceADDNSStatusFn(fn func() []ddnspkg.SurfaceAStatusView) {
+	c.surfaceADDNSStatusFn = fn
 }
 
 // SetVersion sets the software version string for show version.

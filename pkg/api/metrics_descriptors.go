@@ -246,6 +246,27 @@ func newCollector(srv *Server) *xpfCollector {
 			nil, nil,
 		),
 
+		surfaceADDNSUpsertsTotal: prometheus.NewDesc(
+			"xpf_ddns_surface_a_upserts_total",
+			"Total Surface A (router/interface-address) DDNS publishes by result.",
+			[]string{"result"}, nil,
+		),
+		surfaceADDNSDeletesTotal: prometheus.NewDesc(
+			"xpf_ddns_surface_a_deletes_total",
+			"Total Surface A DDNS record withdrawals by result.",
+			[]string{"result"}, nil,
+		),
+		surfaceADDNSSkippedTotal: prometheus.NewDesc(
+			"xpf_ddns_surface_a_skipped_total",
+			"Total Surface A DDNS reconcile skips by reason.",
+			[]string{"reason"}, nil,
+		),
+		surfaceADDNSScopes: prometheus.NewDesc(
+			"xpf_ddns_surface_a_scopes",
+			"Current number of Surface A DDNS records this node owns in DNS.",
+			nil, nil,
+		),
+
 		sysCPUUser: prometheus.NewDesc(
 			"xpf_system_cpu_user_percent",
 			"User CPU utilization percentage.",

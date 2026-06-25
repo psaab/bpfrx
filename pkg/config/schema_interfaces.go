@@ -149,6 +149,7 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 					"input":  {desc: "Input filter", args: 1, placeholder: "<filter-name>", children: nil},
 					"output": {desc: "Output filter", args: 1, placeholder: "<filter-name>", children: nil},
 				}},
+				"dynamic-dns": interfaceDynamicDNSSchema(),
 			}},
 			"inet6": {desc: "IPv6 protocol", children: map[string]*schemaNode{
 				// Compiled at compiler_interfaces.go:578 (the lower of
@@ -188,6 +189,7 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 					"input":  {desc: "Input filter", args: 1, placeholder: "<filter-name>", children: nil},
 					"output": {desc: "Output filter", args: 1, placeholder: "<filter-name>", children: nil},
 				}},
+				"dynamic-dns": interfaceDynamicDNSSchema(),
 				"dhcpv6-client": {desc: "DHCPv6 client", children: map[string]*schemaNode{
 					"client-type":    {desc: "Client type", args: 1, placeholder: "<type>", children: nil},
 					"client-ia-type": {desc: "Client IA type", args: 1, placeholder: "<type>", children: nil},
@@ -411,4 +413,38 @@ func wireguardSchemaNode() *schemaNode {
 			}},
 		},
 	}
+}
+
+// interfaceDynamicDNSSchema returns the config-mode schema for a per-family
+// Surface A router/interface-address DDNS binding (#2691 P2, plan §5.9):
+// `interfaces <if> unit <n> family <af> dynamic-dns { provider X; hostname Y;
+// address-source dhcp; ttl 300; }`. A fresh tree per call so the inet and inet6
+// parents do not share a mutable map. Free-form leaves (provider name,
+// hostname, source-address) stay untyped so a valid value is not rejected at
+// commit; the engine warn-validates the provider reference + binding at commit
+// (validateSurfaceADDNSWarnings) and is fail-open at runtime.
+func interfaceDynamicDNSSchema() *schemaNode {
+	return &schemaNode{desc: "Publish this interface address via Dynamic DNS (Surface A, #2691)", children: map[string]*schemaNode{
+		"provider": {desc: "system services dynamic-dns provider to publish through", args: 1, placeholder: "<provider-name>", children: nil},
+		"hostname": {desc: "FQDN to publish for this interface address", args: 1, placeholder: "<fqdn>", children: nil},
+		"address-source": {
+			desc:          "Where this interface's current address is observed",
+			args:          1,
+			valueType:     ValueEnumOf,
+			valueDesc:     "Address source (interface | dhcp)",
+			valueExamples: []string{"interface", "dhcp"},
+			validator:     ValidateEnum([]string{"interface", "dhcp"}),
+			children:      nil,
+		},
+		"ttl": {
+			desc:          "TTL (seconds) for the published A/AAAA record (default 300)",
+			args:          1,
+			valueType:     ValueInteger,
+			valueDesc:     "Record TTL in seconds (>= 1; default 300 when unset)",
+			valueExamples: []string{"300", "3600"},
+			validator:     ValidateIntegerMin(1),
+			children:      nil,
+		},
+		"source-address": {desc: "Source address to bind the UPDATE socket to (overrides the provider's)", args: 1, placeholder: "<ip>", children: nil},
+	}}
 }

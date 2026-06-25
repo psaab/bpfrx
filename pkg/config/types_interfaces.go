@@ -64,6 +64,39 @@ type InterfaceUnit struct {
 	FilterOutputV6   string                // family inet6 { filter { output NAME; } }
 	VRRPGroups       map[string]*VRRPGroup // keyed by address (CIDR), each address can have VRRP groups
 	Tunnel           *TunnelConfig         // per-unit tunnel config (for multi-unit GRE/IPIP)
+	// DynamicDNSInet / DynamicDNSInet6 are the per-family Surface A
+	// router/interface-address DDNS bindings (#2691 P2, plan §5.9): publish
+	// THIS interface unit's learned v4 / v6 address as a configured FQDN through
+	// a referenced `system services dynamic-dns provider`. nil == no Surface A
+	// publish for that family. The two families are INDEPENDENT (a v4 record can
+	// go to one provider, the v6 record to another), so they are distinct
+	// fields, matching the per-family Surface B policy split (#2663).
+	DynamicDNSInet  *InterfaceDynamicDNSConfig // family inet  { dynamic-dns ... }
+	DynamicDNSInet6 *InterfaceDynamicDNSConfig // family inet6 { dynamic-dns ... }
+}
+
+// InterfaceDynamicDNSConfig is one per-interface, per-family Surface A DDNS
+// binding (#2691 P2, plan §5.9). It says "publish this interface unit's learned
+// address (for this family) as Hostname, via the named Provider, observing the
+// address from AddressSource". The Provider references a
+// `system services dynamic-dns provider <name>` catalog entry (credentials +
+// backend + transport configured once there).
+type InterfaceDynamicDNSConfig struct {
+	// Provider is the name of the `system services dynamic-dns provider` catalog
+	// entry this binding publishes through. Required (a binding with no provider
+	// publishes nothing and warns at commit).
+	Provider string
+	// Hostname is the absolute FQDN to publish (e.g. wan.example.net). Required.
+	Hostname string
+	// AddressSource selects where the unit's current address is observed:
+	// "interface" (netlink / static, default) or "dhcp" (the DHCP client lease).
+	AddressSource string
+	// TTLSeconds is the published record TTL (0 == engine default, 300).
+	TTLSeconds int
+	// SourceAddress optionally binds the UPDATE socket's source IP for THIS
+	// binding (overrides the provider's source-address when set). Free-form IP
+	// literal; fail-open at runtime.
+	SourceAddress string
 }
 
 // VRRPGroup defines a VRRP (Virtual Router Redundancy Protocol) group.

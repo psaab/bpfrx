@@ -1,0 +1,746 @@
+package ddns
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/netip"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/psaab/xpf/pkg/config"
+)
+
+// surface_a.go: the Surface A router/interface-address DDNS engine (#2691 P2,
+// plan §2.1, §5.3, §5.5). Surface A publishes the firewall's OWN address — an
+// interface/unit/family's learned WAN address (DHCP lease, static, netlink) —
+// as a single A/AAAA record at a configured FQDN through an external DNS
+// provider. It is the classic "dyndns client on the CPE" surface.
+//
+// REUSE, DO NOT FORK THE SPINE: Surface A drives the SAME Backend (DNSUpdater)
+// interface, the SAME record construction (buildHostRecord → LeaseDNSRecord),
+// the SAME RFC 2136 backend (newRFC2136Updater, with self-ownership semantics:
+// no DHCID/ClientID, so sendAddOwned uses the name-not-in-use / refresh-owned
+// prerequisite), the SAME ScopeKey ownership primitive (plan §5.4), and the
+// SAME durable-fsync state store pattern (state.go ddnsState shape) — only the
+// state FILE differs (interface-ddns-state.json, plan §5.5). The ONLY thing
+// Surface A adds on top of the spine is the update ENGINE discipline the
+// DHCP-lease reconciler does not need: per-scope change detection, a
+// forced-refresh wire floor decoupled from the poll cadence, and flat error
+// backoff (ban-avoidance) — the inadyn ideas #4/#7/#8 (plan §3.3/§5.5).
+//
+// HA (plan §5.6 / #2664): a router record on a reth/virtual interface is
+// published only by the node that masters its scope's RG. The SurfaceAManager
+// takes the SAME per-scope ScopeGate the lease reconciler does; a gated-out
+// scope is stop-writing, never-withdraw (the peer RG master refreshes; a
+// withdraw race would blackhole). A standalone (nil gate) always publishes.
+
+// defaultSurfaceAStatePath is the on-disk location of the Surface A
+// last-published / ownership store (plan §5.5). Distinct from the Surface B
+// lease ownership store (defaultDDNSStatePath) so the two surfaces never
+// collide on a record key and either can be reset independently.
+const defaultSurfaceAStatePath = "/var/lib/xpf/interface-ddns-state.json"
+
+// defaultForcedRefresh is the wire-update floor for an UNCHANGED address
+// (inadyn idea #7, plan §5.5). The reconcile loop re-asserts desired state
+// every 30s, but a wire UPDATE for an unchanged address fires at most once per
+// forced-refresh interval — proving liveness to the provider / resisting record
+// reaping without per-poll traffic. 24h matches the plan default.
+const defaultForcedRefresh = 24 * time.Hour
+
+// defaultErrorBackoffMax caps the per-scope error backoff (inadyn idea #8,
+// flat — not exponential beyond the cap; plan §5.5). On a transient failure a
+// scope backs off from the reconcile interval up to this cap so a failing
+// provider is not hammered at the poll cadence (ban-avoidance).
+const defaultErrorBackoffMax = time.Hour
+
+// surfaceABaseBackoff is the first error-backoff step (the reconcile cadence).
+// A scope that keeps failing doubles up to defaultErrorBackoffMax.
+const surfaceABaseBackoff = 30 * time.Second
+
+// AddressSource selects where an interface scope's current address is observed
+// (plan §5.3). Ordered-fallback observation lives in the daemon's
+// AddressObserver; this enum is the per-scope operator selection.
+type AddressSource string
+
+const (
+	// AddressSourceInterface reads the address from the interface (netlink /
+	// configured static) — the default. The firewall is the router, so it
+	// usually knows its own public address directly (plan §7 fork 4).
+	AddressSourceInterface AddressSource = "interface"
+	// AddressSourceDHCP reads the address from the DHCP client lease
+	// (pkg/dhcp.Manager.LeaseFor) — the authoritative learned WAN address.
+	AddressSourceDHCP AddressSource = "dhcp"
+)
+
+// SurfaceAScope is the resolved, runtime-shaped configuration for ONE
+// interface/unit/family Surface A binding (plan §5.9). It is derived from the
+// per-interface `dynamic-dns` config + the referenced provider-catalog entry at
+// reconcile time so the manager never holds a stale captured cfg.
+type SurfaceAScope struct {
+	// Key is the ownership/scope key (plan §5.4). For Surface A it is keyed on
+	// {Family, Interface, Unit, RGOwner} — RoutingInstance/PolicyID round out
+	// the transport + provider attribution. The interface+unit+family triple is
+	// unique per binding.
+	Key ScopeKey
+	// FQDN is the forward name to publish (already an operator-supplied FQDN;
+	// finalizeFQDN normalizes it against an empty zone so a dotted name is kept
+	// verbatim, a bare label is published as-is).
+	FQDN string
+	// TTL is the record TTL in seconds (defaultDDNSTTL when unset).
+	TTL int
+	// Source selects the address-observation source for this scope.
+	Source AddressSource
+	// Provider is the resolved provider-catalog entry (backend + credentials +
+	// transport binding) this scope publishes through.
+	Provider *config.DDNSProvider
+	// ForcedRefresh is the wire-update floor for an unchanged address; 0 ⇒
+	// defaultForcedRefresh.
+	ForcedRefresh time.Duration
+	// ErrorBackoffMax caps the per-scope error backoff; 0 ⇒
+	// defaultErrorBackoffMax.
+	ErrorBackoffMax time.Duration
+}
+
+// scopeID is the stable string id for a Surface A scope (its ScopeKey prefix),
+// used as the map key in the manager's per-scope runtime state and the
+// observation request. Two scopes with the same interface/unit but different
+// families are distinct.
+func (s SurfaceAScope) scopeID() string { return s.Key.scopePrefix() }
+
+// AddressObservation is the result of observing a scope's current address
+// (plan §5.3). Addr.IsValid()==false means "no address right now" (the
+// interface is down / has no lease for this family) — the engine withdraws a
+// previously-published record for a scope that loses its address.
+type AddressObservation struct {
+	Addr   netip.Addr
+	Source AddressSource
+}
+
+// AddressObserver observes the current address for a Surface A scope (plan
+// §5.3). The daemon supplies it (it reads netlink / pkg/dhcp.LeaseFor). The
+// engine never reads netlink/DHCP directly — keeping pkg/ddns free of those
+// dependencies, exactly as the LeaseParser seam keeps it free of the Kea
+// memfile parser. ok=false means the address could not be observed this cycle
+// (transient) — the engine then leaves the scope untouched (no withdraw on a
+// transient observation failure, the never-blackhole rule).
+type AddressObserver func(scope SurfaceAScope) (AddressObservation, bool)
+
+// surfaceAState is the per-scope runtime engine state (plan §5.5): the
+// last-published address + time (change-detection + forced-refresh) and the
+// error-backoff schedule. It is kept in memory alongside the durable ownership
+// record (the durable store proves ownership for cleanup; this drives the wire
+// cadence). lastErr surfaces the last failure for observability.
+type surfaceAState struct {
+	lastAddr      netip.Addr
+	lastPublished time.Time
+	// nextEligible is the earliest time the scope may attempt a wire op again
+	// after a failure (error backoff). Zero ⇒ eligible now.
+	nextEligible time.Time
+	backoff      time.Duration
+	lastErr      string
+	lastErrAt    time.Time
+}
+
+// SurfaceAStatusView is a read-only projection of one Surface A scope's
+// current publish state, for the operator surfaces (CLI/gRPC/REST). It exposes
+// what is currently published, the last-published time, and the last error.
+type SurfaceAStatusView struct {
+	Interface     string
+	Unit          int
+	Family        int
+	FQDN          string
+	Provider      string
+	Published     string // current published address ("" = none)
+	LastPublished time.Time
+	LastError     string
+	LastErrorAt   time.Time
+}
+
+// SurfaceAManager owns the Surface A reconcile + the per-scope last-published
+// cache + ownership store (plan §5.5/§5.6). It is a SEPARATE manager from the
+// DHCP-lease Manager (different ownership semantics — self-owned vs DHCID — and
+// a different state file), but it drives the SAME Backend interface and the
+// SAME record/scope/durability primitives.
+type SurfaceAManager struct {
+	mu    sync.Mutex
+	state *ddnsState // durable ownership store (interface-ddns-state.json)
+
+	// runtime is the per-scope engine state (change-detect / forced-refresh /
+	// backoff), keyed by scopeID. NOT persisted: it is rebuilt on restart from
+	// the durable store (seedFromStore) so a restart does not blast a redundant
+	// update for an unchanged address (inadyn idea #5, plan §5.5).
+	runtime map[string]*surfaceAState
+
+	// newBackend resolves the live Backend for a provider at reconcile time
+	// (resolve-per-Reconcile, plan §6 fork 1). When nil (tests injecting a fixed
+	// backend) the static `backend` field is used for every scope.
+	newBackend func(p *config.DDNSProvider, fqdn string, ttl int) (DNSUpdater, error)
+	backend    DNSUpdater // static fallback / test injection
+
+	now func() time.Time
+
+	// counters (observability, plan §5.5).
+	upsertOK   uint64
+	upsertFail uint64
+	deleteOK   uint64
+	deleteFail uint64
+	skipped    uint64 // unchanged-and-not-yet-forced skips
+	backedOff  uint64 // scopes skipped this pass because still in error backoff
+}
+
+// NewSurfaceAManager constructs the production Surface A manager (plan §5.5). It
+// loads the durable ownership store from defaultSurfaceAStatePath (a corrupt
+// store is reset to empty, fail-open) and resolves the live RFC 2136 backend
+// per provider at reconcile time. The runtime cache is seeded from the durable
+// store so a restart does not republish an unchanged address.
+func NewSurfaceAManager() *SurfaceAManager {
+	st, err := loadDDNSState(defaultSurfaceAStatePath)
+	if err != nil {
+		slog.Warn("ddns surface-a: ownership state load failed; starting empty", "err", err)
+	}
+	m := &SurfaceAManager{
+		state:      st,
+		runtime:    map[string]*surfaceAState{},
+		newBackend: productionSurfaceABackend,
+		now:        time.Now,
+	}
+	m.seedFromStore()
+	return m
+}
+
+// newSurfaceAManagerForTesting builds a manager with an in-memory state file
+// path, an injected backend, and an injectable clock — no real /var/lib path,
+// no network. Used by surface_a_test.go.
+func newSurfaceAManagerForTesting(statePath string, backend DNSUpdater, now func() time.Time) *SurfaceAManager {
+	st, _ := loadDDNSState(statePath)
+	m := &SurfaceAManager{
+		state:   st,
+		runtime: map[string]*surfaceAState{},
+		backend: backend,
+		now:     now,
+	}
+	m.seedFromStore()
+	return m
+}
+
+// productionSurfaceABackend resolves a provider-catalog entry into a live
+// Backend (plan §5.2). P2 ships the RFC 2136 backend only; the HTTP providers
+// (dyndns2/Cloudflare/Route53/generic) are P3 — an unknown backend resolves to
+// the no-op (logged) so a P3-only provider config does not wedge P2.
+func productionSurfaceABackend(p *config.DDNSProvider, fqdn string, ttl int) (DNSUpdater, error) {
+	if p == nil {
+		return nopUpdater{}, nil
+	}
+	switch p.Backend {
+	case "rfc2136", "":
+		if p.UpdateServer == "" {
+			// Enabled provider with nothing to update — stay no-op (the commit
+			// warning already told the operator).
+			return nopUpdater{}, nil
+		}
+		return newSurfaceARFC2136(p, fqdn)
+	default:
+		// dyndns2 / cloudflare / route53 / generic land in P3.
+		slog.Debug("ddns surface-a: provider backend not implemented in P2 (deferred to P3)",
+			"provider", p.Name, "backend", p.Backend)
+		return nopUpdater{}, nil
+	}
+}
+
+// newSurfaceARFC2136 builds the live RFC 2136 backend for a Surface A provider.
+// It reuses the SAME rfc2136Updater the lease path uses, with self-ownership
+// semantics: there is NO ClientID/DHCID for a router record, so under the
+// default replace-owned conflict policy sendAddOwned uses the name-not-in-use
+// (Attempt A) / no-DHCID refuse (Attempt B) path — the firewall claims a name
+// only when it is free, and refreshes an unchanged record idempotently. The
+// provider's transport binding (source-address / dest-interface / VRF) is
+// honored via the shared resolveBindConfig→dialer path by reusing
+// DHCPDynamicDNSConfig as the transport carrier.
+func newSurfaceARFC2136(p *config.DDNSProvider, _ string) (DNSUpdater, error) {
+	if p == nil {
+		return nil, errors.New("ddns surface-a: nil provider")
+	}
+	// Reuse the lease-path policy + config shape so the rfc2136 backend builds
+	// identically (server, TSIG, source binding). conflict-policy is fixed to
+	// replace-owned: a router record is self-owned (no DHCID), so the
+	// name-not-in-use / refresh path is the correct self-ownership prerequisite.
+	pol := ddnsPolicy{
+		domain:         "", // the FQDN is absolute; no domain suffixing
+		conflictPolicy: "replace-owned",
+		backend:        "rfc2136",
+	}
+	c := &config.DHCPDynamicDNSConfig{
+		UpdateServer:         p.UpdateServer,
+		TSIGKeyName:          p.TSIGKeyName,
+		TSIGAlgorithm:        p.TSIGAlgorithm,
+		TSIGSecret:           p.TSIGSecret,
+		SourceAddress:        p.SourceAddress,
+		DestinationInterface: p.DestinationInterface,
+		RoutingInstance:      p.RoutingInstance,
+	}
+	return newRFC2136Updater(pol, c, nil, nil, nil)
+}
+
+// seedFromStore rebuilds the in-memory runtime cache from the durable ownership
+// store (inadyn idea #5, plan §5.5): a restart must not blast a redundant
+// update for an address that has not changed. Each owned record seeds
+// lastAddr; lastPublished is left zero so the FIRST post-restart reconcile,
+// if the address is unchanged, still satisfies change-detection (addr matches)
+// and the forced-refresh floor is measured from the restart (a benign at-most-
+// one wire refresh on the first forced interval after a restart). Caller need
+// not hold the mutex (constructor-only).
+func (m *SurfaceAManager) seedFromStore() {
+	for _, r := range m.state.all() {
+		a, err := netip.ParseAddr(r.Address)
+		if err != nil {
+			continue
+		}
+		m.runtime[r.scopeOf().scopePrefix()] = &surfaceAState{lastAddr: a.Unmap()}
+	}
+}
+
+// Reconcile drives one Surface A reconcile pass over the configured scopes
+// (plan §5.5/§5.6). For each scope it: observes the current address; applies
+// the per-RG HA gate; runs change-detection + forced-refresh + error backoff;
+// and publishes/withdraws through the resolved Backend. A scope present in the
+// durable store but ABSENT from `scopes` (binding removed from config) is
+// WITHDRAWN (turn-off cleanup), provided this node may write its scope.
+//
+// gate is the SAME per-RG ScopeGate the lease reconciler uses (#2664). A nil
+// gate (standalone) admits every scope. A gated-out scope is stop-writing,
+// never-withdraw (the peer RG master refreshes it).
+func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope, observe AddressObserver, gate ScopeGate) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := m.now()
+	var firstErr error
+	noteErr := func(e error) {
+		if e != nil && firstErr == nil {
+			firstErr = e
+		}
+	}
+
+	admit := func(s ScopeKey) bool {
+		if gate == nil {
+			return true
+		}
+		return gate(s)
+	}
+
+	// desired[scopeID] = the configured scope. Used to find owned records that
+	// are no longer configured (withdraw).
+	desired := map[string]SurfaceAScope{}
+	for _, sc := range scopes {
+		desired[sc.scopeID()] = sc
+	}
+
+	// Pass 1 — publish / refresh / withdraw-on-address-loss each configured
+	// scope.
+	for _, sc := range scopes {
+		if !admit(sc.Key) {
+			// Per-RG gate closed: stop writing, never withdraw (plan §5.6). The
+			// peer that masters this RG owns the refresh.
+			slog.Debug("ddns surface-a: scope not writable from this node (per-RG gate closed); not publishing, not withdrawing",
+				"fqdn", sc.FQDN, "rg", sc.Key.RGOwner, "iface", sc.Key.Interface)
+			continue
+		}
+		noteErr(m.reconcileScopeLocked(ctx, sc, observe, now))
+	}
+
+	// Pass 2 — withdraw scopes whose binding was removed from config. A record
+	// owned for a scope NOT in `desired` is withdrawn (turn-off cleanup), gated
+	// by the same per-RG writer gate (never withdraw a scope this node does not
+	// master).
+	for _, owned := range m.state.all() {
+		sid := owned.scopeOf().scopePrefix()
+		if _, stillConfigured := desired[sid]; stillConfigured {
+			continue
+		}
+		if !admit(owned.scopeOf()) {
+			continue
+		}
+		noteErr(m.withdrawOwnedLocked(ctx, owned))
+	}
+
+	if err := m.state.save(); err != nil {
+		slog.Warn("ddns surface-a: persist ownership state failed", "err", err)
+		noteErr(err)
+	}
+	return firstErr
+}
+
+// reconcileScopeLocked is the per-scope engine (plan §5.5): observe → change
+// detection → forced-refresh → error backoff → publish/withdraw. Caller holds
+// m.mu.
+func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAScope, observe AddressObserver, now time.Time) error {
+	sid := sc.scopeID()
+	rt := m.runtime[sid]
+	if rt == nil {
+		rt = &surfaceAState{}
+		m.runtime[sid] = rt
+	}
+
+	// Error backoff (inadyn idea #8): a scope still in its backoff window is
+	// skipped this pass so a failing provider is not hammered (ban-avoidance).
+	if !rt.nextEligible.IsZero() && now.Before(rt.nextEligible) {
+		m.backedOff++
+		slog.Debug("ddns surface-a: scope in error backoff; skipping this pass",
+			"fqdn", sc.FQDN, "next-eligible", rt.nextEligible)
+		return nil
+	}
+
+	obs, ok := observe(sc)
+	if !ok {
+		// Transient observation failure: leave the scope untouched (never
+		// withdraw on a transient — the never-blackhole rule, plan §8.2).
+		slog.Debug("ddns surface-a: address observation failed (transient); leaving scope untouched", "fqdn", sc.FQDN)
+		return nil
+	}
+
+	if !obs.Addr.IsValid() {
+		// The scope lost its address (interface down / lease gone). If we own a
+		// record for it, withdraw it (the address really is gone — this is the
+		// authoritative "no address", not a transient observation failure).
+		if owned, exists := m.state.get(sc.Key, surfaceAIdentity, ""); exists {
+			if err := m.withdrawOwnedLocked(ctx, owned); err != nil {
+				return err
+			}
+			delete(m.runtime, sid)
+		}
+		return nil
+	}
+
+	addr := obs.Addr.Unmap()
+
+	// Change detection + forced-refresh (inadyn ideas #4/#7): fire a wire
+	// UPDATE when the address changed OR the forced-refresh floor elapsed since
+	// the last successful publish. An unchanged address inside the floor is a
+	// counted skip (no wire traffic).
+	forced := sc.ForcedRefresh
+	if forced <= 0 {
+		forced = defaultForcedRefresh
+	}
+	changed := addr != rt.lastAddr
+	_, owned := m.state.get(sc.Key, surfaceAIdentity, "")
+	refreshDue := rt.lastPublished.IsZero() || now.Sub(rt.lastPublished) >= forced
+	if owned && !changed && !refreshDue {
+		m.skipped++
+		slog.Debug("ddns surface-a: address unchanged and forced-refresh not due; skipping",
+			"fqdn", sc.FQDN, "addr", addr.String())
+		return nil
+	}
+
+	if err := m.publishLocked(ctx, sc, addr, now); err != nil {
+		m.recordScopeError(rt, sc, err, now)
+		return err
+	}
+	// Success: clear backoff, update the last-published cache.
+	rt.lastAddr = addr
+	rt.lastPublished = now
+	rt.nextEligible = time.Time{}
+	rt.backoff = 0
+	rt.lastErr = ""
+	return nil
+}
+
+// surfaceAIdentity is the fixed ownership "identity" for every Surface A record
+// — a router record is keyed on its SCOPE + FQDN, not a client identity (there
+// is no DHCP client). Using a constant identity keeps the ownedRecordKey shape
+// shared with the lease store (scopePrefix + identity + "|" + address) while
+// the scope (interface/unit/family) is the real discriminator. Address is "" in
+// the key so a scope owns at most ONE record and an address change REPLACES it
+// in place (no stale old-address entry, never a withdraw-then-add gap).
+const surfaceAIdentity = "router-self"
+
+// publishLocked publishes the scope's record through the resolved Backend and
+// records ownership write-ahead (the same durability discipline as the lease
+// path, #2662). The ownership key fixes Address="" so a scope owns exactly one
+// record: an address change REPLACES the rdata via an idempotent
+// replace-owned add (RFC 2136 replace semantics in the rfc2136 backend), never
+// a withdraw-then-add that would blackhole. Caller holds m.mu.
+func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, addr netip.Addr, now time.Time) error {
+	backend, err := m.backendFor(sc)
+	if err != nil {
+		m.upsertFail++
+		return err
+	}
+	ttl := sc.TTL
+	if ttl <= 0 {
+		ttl = defaultDDNSTTL
+	}
+	rec, err := buildHostRecord(sc.FQDN, addr, ttl)
+	if err != nil {
+		m.upsertFail++
+		return err
+	}
+
+	prevOwned, hadPrev := m.state.get(sc.Key, surfaceAIdentity, "")
+	prevAddr := ""
+	if hadPrev {
+		prevAddr = prevOwned.Address
+	}
+
+	// Write-ahead the ownership intent BEFORE the wire add (#2662): a crash
+	// after the add finds the record owned and the next reconcile converges it.
+	ow := ownedRecord{
+		Family:      familyInt(addr),
+		Identity:    surfaceAIdentity,
+		Address:     "", // key on scope+FQDN; rdata lives in AddrText below
+		FQDN:        rec.FQDN,
+		ForwardType: rec.ForwardType,
+		PTRName:     "",
+		TTL:         ttl,
+		AddrText:    addr.String(),
+	}.withScope(sc.Key)
+	m.state.put(ow)
+	if err := m.state.save(); err != nil {
+		// Could not durably record ownership: do NOT publish. Roll back to the
+		// previous durable state.
+		if hadPrev {
+			m.state.put(prevOwned)
+		} else {
+			m.state.delete(sc.Key, surfaceAIdentity, "")
+		}
+		m.upsertFail++
+		return fmt.Errorf("ddns surface-a: cannot durably record ownership before publish: %w", err)
+	}
+
+	if err := backend.UpsertLease(ctx, rec); err != nil {
+		// Hard add failure: the record is NOT live with the new rdata. Restore
+		// the previous durable ownership (the old address is still live) so we
+		// do not claim an address we failed to publish. A conflict refusal
+		// (name owned by another party) also lands here — Surface A does not
+		// adopt a third party's name.
+		if hadPrev {
+			m.state.put(prevOwned)
+		} else {
+			m.state.delete(sc.Key, surfaceAIdentity, "")
+		}
+		_ = m.state.save()
+		m.upsertFail++
+		if errors.Is(err, errDDNSConflictRefused) {
+			return fmt.Errorf("ddns surface-a: %s is owned by another party (refused): %w", rec.FQDN, err)
+		}
+		return fmt.Errorf("ddns surface-a: publish %s %s=%s: %w", rec.ForwardType, rec.FQDN, addr, err)
+	}
+
+	// Success. If the address CHANGED (replace), the replace-owned add already
+	// updated the rdata in place at the server (RFC 4703 §5.3 refresh-owned),
+	// so there is no separate withdraw of the old address — the never-blackhole
+	// replace. Log the transition for observability.
+	if prevAddr != "" && prevAddr != addr.String() {
+		slog.Info("ddns surface-a: replaced record address",
+			"fqdn", rec.FQDN, "old", prevAddr, "new", addr.String())
+	} else if !hadPrev {
+		slog.Info("ddns surface-a: published record", "fqdn", rec.FQDN, "addr", addr.String())
+	}
+	m.upsertOK++
+	return nil
+}
+
+// withdrawOwnedLocked removes the firewall's own record for an owned scope
+// (binding removed, or address lost) through the resolved Backend, then drops
+// the ownership entry. Caller holds m.mu. A delete is re-derived from the
+// EXACT owned tuple (the sole-delete-authority boundary, shared with the lease
+// path): Surface A never deletes a name it did not record.
+func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRecord) error {
+	a, err := netip.ParseAddr(owned.AddrText)
+	if err != nil {
+		// Stored rdata no longer parses (should not happen): drop the entry to
+		// avoid wedging, but issue no delete with a guessed address.
+		slog.Warn("ddns surface-a: owned record has unparseable address; dropping entry",
+			"fqdn", owned.FQDN, "addr", owned.AddrText, "err", err)
+		m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
+		delete(m.runtime, owned.scopeOf().scopePrefix())
+		return nil
+	}
+	backend, err := m.backendForOwned(owned)
+	if err != nil {
+		m.deleteFail++
+		return err
+	}
+	rec, err := buildHostRecord(owned.FQDN, a, owned.TTL)
+	if err != nil {
+		m.deleteFail++
+		return err
+	}
+	if err := backend.DeleteLease(ctx, rec); err != nil {
+		m.deleteFail++
+		return fmt.Errorf("ddns surface-a: withdraw %s %s: %w", owned.ForwardType, owned.FQDN, err)
+	}
+	m.deleteOK++
+	m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
+	delete(m.runtime, owned.scopeOf().scopePrefix())
+	slog.Info("ddns surface-a: withdrew record", "fqdn", owned.FQDN, "addr", owned.AddrText)
+	return nil
+}
+
+// backendFor resolves the live Backend for a scope's provider (resolve-per-
+// Reconcile). The static `backend` field (test injection) wins when set.
+func (m *SurfaceAManager) backendFor(sc SurfaceAScope) (DNSUpdater, error) {
+	if m.newBackend == nil {
+		if m.backend != nil {
+			return m.backend, nil
+		}
+		return nopUpdater{}, nil
+	}
+	return m.newBackend(sc.Provider, sc.FQDN, sc.TTL)
+}
+
+// backendForOwned resolves the Backend for a withdraw of an owned record whose
+// scope is no longer in the desired set (the provider is not available from a
+// SurfaceAScope). The static backend wins (tests); production withdraws are
+// driven from the still-configured scope set (Pass 2 only fires for a removed
+// binding, where the provider catalog may still hold the entry — but we no
+// longer have the SurfaceAScope). For P2 a removed-binding withdraw uses the
+// static backend if present, else the no-op (the record is dropped from the
+// store either way; a no-op withdraw leaves the RR until its provider is
+// reconfigured — documented residual). The common case (address loss / replace)
+// goes through backendFor with the live SurfaceAScope.
+func (m *SurfaceAManager) backendForOwned(_ ownedRecord) (DNSUpdater, error) {
+	if m.backend != nil {
+		return m.backend, nil
+	}
+	return nopUpdater{}, nil
+}
+
+// recordScopeError records a failure on a scope and advances its flat error
+// backoff (inadyn idea #8): nextEligible = now + backoff, doubling from
+// surfaceABaseBackoff up to the cap. Surfaced via lastErr for observability.
+func (m *SurfaceAManager) recordScopeError(rt *surfaceAState, sc SurfaceAScope, err error, now time.Time) {
+	maxBackoff := sc.ErrorBackoffMax
+	if maxBackoff <= 0 {
+		maxBackoff = defaultErrorBackoffMax
+	}
+	if rt.backoff <= 0 {
+		rt.backoff = surfaceABaseBackoff
+	} else {
+		rt.backoff *= 2
+	}
+	if rt.backoff > maxBackoff {
+		rt.backoff = maxBackoff
+	}
+	rt.nextEligible = now.Add(rt.backoff)
+	rt.lastErr = err.Error()
+	rt.lastErrAt = now
+	slog.Warn("ddns surface-a: scope publish failed; backing off",
+		"fqdn", sc.FQDN, "backoff", rt.backoff, "err", err)
+}
+
+// StatusViews returns a stable-ordered snapshot of every Surface A scope's
+// current publish state for the operator surfaces (plan §5.5 observability). It
+// merges the durable ownership store (what is published) with the in-memory
+// runtime state (last-published time + last error).
+func (m *SurfaceAManager) StatusViews() []SurfaceAStatusView {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]SurfaceAStatusView, 0, len(m.state.records))
+	for _, r := range m.state.all() {
+		sc := r.scopeOf()
+		v := SurfaceAStatusView{
+			Interface: sc.Interface,
+			Unit:      sc.Unit,
+			Family:    int(sc.Family),
+			FQDN:      r.FQDN,
+			Provider:  sc.PolicyID,
+			Published: r.AddrText,
+		}
+		if rt := m.runtime[sc.scopePrefix()]; rt != nil {
+			v.LastPublished = rt.lastPublished
+			v.LastError = rt.lastErr
+			v.LastErrorAt = rt.lastErrAt
+		}
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].FQDN != out[j].FQDN {
+			return out[i].FQDN < out[j].FQDN
+		}
+		return out[i].Family < out[j].Family
+	})
+	return out
+}
+
+// SurfaceAStats is the counter snapshot for `show` + Prometheus (plan §5.5).
+type SurfaceAStats struct {
+	Scopes     int
+	UpsertOK   uint64
+	UpsertFail uint64
+	DeleteOK   uint64
+	DeleteFail uint64
+	Skipped    uint64
+	BackedOff  uint64
+}
+
+// Stats returns the current Surface A counters.
+func (m *SurfaceAManager) Stats() SurfaceAStats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return SurfaceAStats{
+		Scopes:     len(m.state.records),
+		UpsertOK:   m.upsertOK,
+		UpsertFail: m.upsertFail,
+		DeleteOK:   m.deleteOK,
+		DeleteFail: m.deleteFail,
+		Skipped:    m.skipped,
+		BackedOff:  m.backedOff,
+	}
+}
+
+// buildHostRecord constructs the forward-only A/AAAA record for a Surface A
+// router record (no PTR — Surface A publishes the firewall's forward name; PTR
+// for the firewall's own address is an operator/ISP concern, not auto-managed).
+// The FQDN is normalized against an EMPTY zone (finalizeFQDN keeps a dotted
+// operator-supplied name verbatim, a bare label as-is) so an absolute name like
+// wan.example.net is published exactly.
+func buildHostRecord(fqdn string, addr netip.Addr, ttl int) (LeaseDNSRecord, error) {
+	// Surface A operator FQDNs are ABSOLUTE (the operator picks the full name,
+	// unlike the DHCP-lease path where the client picks the host part and the
+	// firewall picks the zone). finalizeFQDN("",...) would reduce a dotted name
+	// to its first label, which is wrong for "wan.example.net" — so use a
+	// dotted-structure-preserving per-label sanitize instead.
+	name := surfaceAName(fqdn)
+	if name == "" {
+		return LeaseDNSRecord{}, fmt.Errorf("ddns surface-a: hostname %q sanitizes to empty", fqdn)
+	}
+	a := addr.Unmap()
+	if ttl <= 0 {
+		ttl = defaultDDNSTTL
+	}
+	rec := LeaseDNSRecord{
+		FQDN: name,
+		Addr: a,
+		TTL:  ttl,
+	}
+	if a.Is4() {
+		rec.ForwardType = "A"
+	} else if a.Is6() {
+		rec.ForwardType = "AAAA"
+	} else {
+		return LeaseDNSRecord{}, fmt.Errorf("ddns surface-a: record %q has an unspecified address", fqdn)
+	}
+	return rec, nil
+}
+
+// surfaceAName normalizes an operator-supplied Surface A hostname. Unlike the
+// DHCP-lease path (where the CLIENT supplies the name and the FIREWALL picks the
+// zone), the OPERATOR supplies the full FQDN here, so the name is honored
+// verbatim after a per-label LDH sanitize that preserves the dotted structure
+// (so wan.example.net stays wan.example.net), trimming a trailing dot. An empty
+// result ("" — the input had no usable label) is returned so the caller errors
+// rather than publishing junk.
+func surfaceAName(fqdn string) string {
+	return sanitizeFQDN(fqdn)
+}
+
+// familyInt returns the engine family int (4/6) for an address.
+func familyInt(a netip.Addr) int {
+	if a.Unmap().Is4() {
+		return 4
+	}
+	return 6
+}

@@ -663,6 +663,46 @@ reserved for whole-dataplane selection where a rewrite shim
   `pkg/ddns/scope_test.go` (ScopeKey distinctness + pre-P1b round-trip +
   independent v4/v6 + per-RG gate), `pkg/ddns/backend_bind_test.go` (dial
   config), `pkg/daemon/daemon_ddns_scope_test.go` (per-RG resolver + gate).
+- **#2691 P2 (Surface A — router/interface-address DDNS):** added the
+  operator-facing `system services dynamic-dns` provider catalog + a
+  per-interface per-family `dynamic-dns` binding so the firewall can publish its
+  OWN learned address (DHCP-lease / static / netlink) as a configured FQDN.
+  - **Provider catalog** (`services dynamic-dns provider <name>`, a repeatable
+    named instance built by `ddnsServicesSchema()` in `schema_system.go`,
+    compiled by `compileDDNSServices`/`compileDDNSProvider` in
+    `compiler_system.go` into `config.DDNSServicesConfig`/`DDNSProvider` on
+    `System.Services.DynamicDNS`): credentials configured ONCE, referenced by
+    scope. Leaves: `backend` (enum: `rfc2136` live; `dyndns2`/`cloudflare`/
+    `route53`/`generic` reserved for P3), `update-server`, `tsig-key`,
+    `tsig-algorithm`, `tsig-secret` (`config.Secret`-redacted), and the
+    `source-address` / `destination-interface` / `routing-instance` transport
+    binding (#2665, reused). Plus the engine tunables `forced-refresh` and
+    `error-backoff-max` (a Go duration like `24h` OR a bare-seconds integer,
+    parsed by `parseDurationSeconds`).
+  - **Per-interface binding** (`interfaces <if> unit <n> family <af>
+    dynamic-dns`, schema `interfaceDynamicDNSSchema()` in `schema_interfaces.go`,
+    compiled by `compileInterfaceDynamicDNS` in `compiler_interfaces.go` into
+    `InterfaceUnit.DynamicDNSInet` / `.DynamicDNSInet6`): `provider <name>`
+    (catalog reference), `hostname <fqdn>`, `address-source` (enum:
+    `interface` default | `dhcp`), `ttl`, and a per-binding `source-address`
+    override. v4 and v6 are INDEPENDENT (distinct fields), like the Surface B
+    per-family policy split (#2663).
+  - **Reuses the pkg/ddns spine** (`pkg/ddns/surface_a.go`,
+    `SurfaceAManager`): the SAME `DNSUpdater`/rfc2136 backend (self-ownership —
+    no DHCID), the SAME `ScopeKey`, and the SAME durable-state shape (a separate
+    file, `interface-ddns-state.json`). The engine adds change-detection,
+    forced-refresh (a wire floor), and per-scope error backoff. The per-RG HA
+    gate is the SAME one Surface B uses (publish only on the RG master;
+    stop-writing-never-withdraw on a partial demotion). Warn-only validation:
+    `validateSurfaceADDNSWarnings` (undefined provider, missing hostname,
+    rfc2136 provider with no update-server, P3-reserved backend). Observability:
+    `show services dynamic-dns [detail]` (CLI + gRPC), the
+    `xpf_ddns_surface_a_*` Prometheus family. Regression coverage:
+    `pkg/config/compiler_surface_a_ddns_test.go` (flat-set + hierarchical +
+    warnings), `pkg/ddns/surface_a_test.go` (change-detect / forced-refresh /
+    replace / withdraw / per-RG gate / backoff), and
+    `pkg/daemon/daemon_ddns_surface_a_test.go` (scope build + RG attribution +
+    gate).
 - **#2243 (DHCP-server static / fixed / reserved host bindings):** added a
   `static-binding <mac>` named-instance subtree under `services
   dhcp-local-server group <g> pool <p>` AND `services dhcpv6-local-server

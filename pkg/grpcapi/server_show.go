@@ -111,6 +111,13 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 	case "dhcp-server-dynamic-dns-detail":
 		s.showDHCPDynamicDNS(cfg, &buf, true)
 
+	case "services-dynamic-dns":
+		// #2691 P2: Surface A (router/interface-address) DDNS status + counters.
+		s.showServicesDynamicDNS(cfg, &buf, false)
+
+	case "services-dynamic-dns-detail":
+		s.showServicesDynamicDNS(cfg, &buf, true)
+
 	case "dhcp-relay":
 		// #1043 Phase 4: case body extracted to server_show_dhcp_lldp_snmp.go
 		s.showDHCPRelay(cfg, &buf)

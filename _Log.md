@@ -14337,3 +14337,37 @@ top.
   pkg/dataplane/userspace/eventstream.go,
   pkg/dataplane/userspace/eventstream_test.go, docs/session-sync-design.md,
   _Log.md.
+
+## 2026-06-24 — #2691 P2 Surface A (router/interface-address DDNS)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Implement #2691 phase P2 — Surface A router/interface-address
+  publish over RFC 2136, reusing the pkg/ddns spine.
+- **File(s)**:
+    - `pkg/ddns/surface_a.go` (NEW — SurfaceAManager engine:
+      change-detect/forced-refresh/backoff, self-ownership, per-RG gate,
+      durable interface-ddns-state.json), `pkg/ddns/surface_a_test.go` (NEW),
+      `pkg/ddns/state.go` (ownedRecord.AddrText), `pkg/ddns/manager_test.go`
+      (fakeUpdater.failedCalls).
+    - `pkg/config/types_system.go` (DDNSServicesConfig + DDNSProvider),
+      `pkg/config/types_interfaces.go` (InterfaceDynamicDNSConfig),
+      `pkg/config/schema_system.go` (ddnsServicesSchema),
+      `pkg/config/schema_interfaces.go` (interfaceDynamicDNSSchema),
+      `pkg/config/compiler_system.go` (compileDDNSServices/Provider),
+      `pkg/config/compiler_interfaces.go` (compileInterfaceDynamicDNS),
+      `pkg/config/compiler_validate_warn.go` (validateSurfaceADDNSWarnings),
+      `pkg/config/compiler_surface_a_ddns_test.go` (NEW).
+    - `pkg/daemon/daemon_ddns_surface_a.go` (NEW — loop + scope build +
+      AddressObserver netlink/DHCP + per-RG gate + nudges + stats),
+      `pkg/daemon/daemon_ddns_surface_a_test.go` (NEW), `daemon.go`,
+      `daemon_run.go`, `daemon_apply.go`, `daemon_ha.go`, `daemon_dhcp.go`.
+    - `pkg/api/{server,metrics,metrics_descriptors,metrics_system}.go`
+      (xpf_ddns_surface_a_* Prometheus family),
+      `pkg/grpcapi/{server,server_show,server_show_dhcp_lldp_snmp}.go`,
+      `pkg/cli/{cli,cli_show_services}.go`, `pkg/cmdtree/tree.go`,
+      `cmd/cli/show.go` (show services dynamic-dns [detail]).
+    - `docs/config-schema.md`, `pkg/ddns/README.md`, `_Log.md`.
+- **Validation**: `go build ./...` clean; gofmt/vet clean on touched files;
+  `go test ./pkg/{ddns,config,dhcpserver,daemon,api,grpcapi,cli,cmdtree}` green;
+  `-race ./pkg/ddns` green. `make test-failover` + a LIVE standalone-VM publish
+  remain MANDATORY (no cluster/VM access here) — the parent must run them.

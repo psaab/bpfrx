@@ -128,3 +128,53 @@ project rule for any gate / HA-path change). P1b adds the gate + the
 partial-demotion nudge; reason about split-brain (uncertain RG → fail-closed)
 and partial demotion (lose one RG, keep another → publish only the kept RG,
 withdraw nothing) in `scope_test.go` / `daemon_ddns_scope_test.go`.
+
+## Phase P2 — Surface A (router/interface-address publish)
+
+P2 (partial **#2679**) adds the SECOND publish surface — the firewall publishing
+its OWN learned address — on top of the SAME spine, without forking the engine.
+
+- **`SurfaceAManager` (`surface_a.go`)** — a separate manager from the
+  DHCP-lease `Manager` (different ownership semantics: self-owned, no DHCID; and
+  a different durable state file, `interface-ddns-state.json`), but it drives the
+  SAME `DNSUpdater` interface, the SAME RFC 2136 backend (`newRFC2136Updater`
+  with `conflict-policy=replace-owned` and no `ClientID`, so `sendAddOwned` uses
+  the name-not-in-use / refresh-owned prerequisite — the self-ownership claim),
+  the SAME `ScopeKey` ownership primitive, the SAME source/VRF binding
+  (`backend_bind.go`, via `DHCPDynamicDNSConfig` as the transport carrier), and
+  the SAME write-ahead durability discipline.
+- **What the engine ADDS over the lease reconciler** (the inadyn ideas the
+  DHCP-lease path does not need, plan §3.3/§5.5):
+  - **change detection + last-published cache** — a wire UPDATE fires only when
+    the observed address changed (or the forced-refresh floor elapsed). The
+    cache is seeded from the durable store on restart (`seedFromStore`) so a
+    restart does not blast a redundant update.
+  - **forced-refresh** — a per-scope wire-update FLOOR (default 24h) decoupled
+    from the 30s reconcile cadence, to prove liveness / resist record reaping
+    without per-poll traffic.
+  - **flat error backoff** — on a transient failure a scope backs off
+    (30s → cap, default 1h) so a failing provider is not hammered (ban-avoidance).
+  - **replace, never withdraw-then-add, on address change** — a scope owns
+    exactly ONE record (keyed `{scope, "router-self", ""}`); an address change is
+    an idempotent replace-owned re-add of the new rdata (no blackhole gap).
+- **Ownership key.** A router record is keyed on its SCOPE + the fixed identity
+  `router-self` + Address `""` (the published address lives in the new
+  `ownedRecord.AddrText` field, JSON-omitted for lease records). So an interface
+  unit/family owns at most one record and an address change replaces it in place.
+- **Address observation** is the daemon's job (`pkg/daemon/daemon_ddns_surface_a.go`):
+  `AddressObserver` reads netlink (interface source) or `pkg/dhcp.LeaseFor` (dhcp
+  source). `ok=false` (transient read failure) → leave the scope untouched
+  (never withdraw); a valid-but-Invalid `Addr` (interface down / lease gone) →
+  withdraw. Keeping observation in the daemon keeps `pkg/ddns` free of
+  netlink/DHCP deps, exactly like the `LeaseParser` seam for Surface B.
+- **HA gate** is the SAME per-RG `ScopeGate` (a router record on a reth/virtual
+  interface publishes only on the RG master; stop-writing-never-withdraw
+  otherwise). Standalone (nil gate) always publishes.
+- **Operator surfaces:** `show services dynamic-dns [detail]` (CLI + gRPC), the
+  `xpf_ddns_surface_a_*` Prometheus family, and `SurfaceAManager.StatusViews()`
+  (per-scope published address + last-published time + last error).
+
+P3 (the rest of #2679) adds the HTTP provider backends
+(dyndns2/Cloudflare/Route53/generic-template) + the checkip address source;
+`productionSurfaceABackend` already routes an unknown backend to the no-op
+(logged) so a P3-only provider config does not wedge P2.

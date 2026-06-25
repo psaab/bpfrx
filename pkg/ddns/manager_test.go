@@ -29,6 +29,10 @@ type fakeUpdater struct {
 	failUpd   map[string]bool // FQDN -> fail upsert
 	failDel   map[string]bool // FQDN -> fail delete
 	failEvery bool            // fail all ops (retry-no-wedge probe)
+	// failedCalls counts UpsertLease/DeleteLease calls that RETURNED an error
+	// (the #2691 P2 Surface A backoff test asserts the backend is not re-hit
+	// while a scope is in its error-backoff window).
+	failedCalls int
 }
 
 func newFakeUpdater() *fakeUpdater {
@@ -39,6 +43,7 @@ func (f *fakeUpdater) UpsertLease(_ context.Context, rec LeaseDNSRecord) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failEvery || f.failUpd[rec.FQDN] {
+		f.failedCalls++
 		return fmt.Errorf("fake: upsert %s failed", rec.FQDN)
 	}
 	f.upserts = append(f.upserts, rec)
@@ -49,6 +54,7 @@ func (f *fakeUpdater) DeleteLease(_ context.Context, rec LeaseDNSRecord) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failEvery || f.failDel[rec.FQDN] {
+		f.failedCalls++
 		return fmt.Errorf("fake: delete %s failed", rec.FQDN)
 	}
 	f.deletes = append(f.deletes, rec)

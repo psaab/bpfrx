@@ -81,6 +81,12 @@ type xpfCollector struct {
 	dhcpDDNSLastReconcileTs    *prometheus.Desc
 	dhcpDDNSLastReconcileN     *prometheus.Desc
 
+	// Surface A (router/interface-address) DDNS metrics (#2691 P2).
+	surfaceADDNSUpsertsTotal *prometheus.Desc
+	surfaceADDNSDeletesTotal *prometheus.Desc
+	surfaceADDNSSkippedTotal *prometheus.Desc
+	surfaceADDNSScopes       *prometheus.Desc
+
 	// System metrics
 	sysCPUUser   *prometheus.Desc
 	sysCPUSystem *prometheus.Desc
@@ -478,6 +484,10 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.dhcpDDNSOwnedRecords
 	ch <- c.dhcpDDNSLastReconcileTs
 	ch <- c.dhcpDDNSLastReconcileN
+	ch <- c.surfaceADDNSUpsertsTotal
+	ch <- c.surfaceADDNSDeletesTotal
+	ch <- c.surfaceADDNSSkippedTotal
+	ch <- c.surfaceADDNSScopes
 	ch <- c.sysCPUUser
 	ch <- c.sysCPUSystem
 	ch <- c.sysMemTotal
@@ -753,6 +763,7 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectNATPoolMetrics(ch, dp)
 	c.collectDHCPMetrics(ch)
 	c.collectDDNSMetrics(ch)
+	c.collectSurfaceADDNSMetrics(ch)
 	c.collectSystemMetrics(ch)
 	c.collectUserspaceStatus(ch, dp)
 }

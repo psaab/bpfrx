@@ -20,6 +20,7 @@ import (
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
 	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/ddns"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcprelay"
 	"github.com/psaab/xpf/pkg/dhcpserver"
@@ -102,6 +103,20 @@ type Daemon struct {
 	// loop) so a hung DNS server can never wedge the loop or starve the
 	// nudge channel.
 	ddnsReconcileInFlight atomic.Bool
+	// surfaceA is the always-on Surface A router/interface-address DDNS manager
+	// (#2691 P2). It publishes THIS firewall's own learned interface addresses
+	// (DHCP-lease / static / netlink) as configured FQDNs through the
+	// `system services dynamic-dns` provider catalog, reusing the pkg/ddns
+	// spine (the same Backend, record, ScopeKey, durable-state primitives). It
+	// is constructed unconditionally so a binding removal always has a running
+	// loop to withdraw; the loop is netlink + DNS-network only (no control
+	// socket), gated to the RG-MASTER per scope, nudged on commit + the #1844
+	// DHCP gateway/address-change hook + MASTER transition.
+	surfaceA *ddns.SurfaceAManager
+	// surfaceAReconcileNowCh / surfaceAReconcileInFlight mirror the ddns* pair:
+	// a depth-1 nudge channel + a no-freeze skip-if-in-flight guard.
+	surfaceAReconcileNowCh    chan struct{}
+	surfaceAReconcileInFlight atomic.Bool
 	// #2239 HA DHCP-server lease sync (PATH C). The push loop runs on the
 	// RG-MASTER, reads the active lease set (Kea control socket → memfile
 	// fallback), and replicates it over the cluster sync channel. The standby
@@ -495,6 +510,7 @@ func New(opts Options) (*Daemon, error) {
 		blackholeRoutes:            make(map[int][]netlink.Route),
 		reconcileNowCh:             make(chan struct{}, 1),
 		ddnsReconcileNowCh:         make(chan struct{}, 1),
+		surfaceAReconcileNowCh:     make(chan struct{}, 1),
 		dhcpLeaseSyncNowCh:         make(chan struct{}, 1),
 		syncReadyTimeout:           5 * time.Second,
 		linkByNameFn:               netlink.LinkByName,

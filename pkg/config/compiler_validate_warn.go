@@ -735,6 +735,13 @@ func ValidateConfig(cfg *Config) []string {
 	// against increment 1 cannot brick a boot (plan §4.5 / §7 Q-C).
 	warnings = append(warnings, validateDDNSBackendWarnings(cfg)...)
 
+	// #2691 P2: warn on a per-interface Surface A `dynamic-dns` binding that
+	// references a missing/incomplete provider or omits a hostname, and on a
+	// `system services dynamic-dns provider` whose rfc2136 backend is unusable.
+	// WARN-only (never a hard reject) — a previously-inert misconfig must not
+	// brick a boot; the runtime degrades to a logged no-op for that scope.
+	warnings = append(warnings, validateSurfaceADDNSWarnings(cfg)...)
+
 	// #2507: firewall-filter `then loss-priority <low|...|high>` is parsed and
 	// stored on the term (FirewallFilterTerm.LossPriority) but is never wired
 	// onto the wire (no FirewallTermSnapshot field) and the userspace dataplane
@@ -934,6 +941,110 @@ func ddnsTSIGAlgorithmSupported(algo string) bool {
 	default:
 		return false
 	}
+}
+
+// validateSurfaceADDNSWarnings emits WARN-only commit-time messages for the
+// Surface A router/interface-address DDNS bindings + provider catalog (#2691
+// P2). It never returns an error: the typed schema already accepts the leaves,
+// and a hard reject would brick a boot on a previously-inert misconfig. The
+// engine degrades safely at runtime (an unresolved provider / missing hostname
+// scope resolves to a no-op).
+func validateSurfaceADDNSWarnings(cfg *Config) []string {
+	var warnings []string
+
+	var catalog map[string]*DDNSProvider
+	if cfg.System.Services != nil && cfg.System.Services.DynamicDNS != nil {
+		catalog = cfg.System.Services.DynamicDNS.Providers
+	}
+
+	// Provider-catalog completeness (rfc2136 backend).
+	for name, p := range catalog {
+		if p == nil {
+			continue
+		}
+		backend := p.Backend
+		if backend == "" {
+			backend = "rfc2136"
+		}
+		switch backend {
+		case "rfc2136":
+			if p.UpdateServer == "" {
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q (backend rfc2136) has no update-server; scopes using it "+
+					"publish nothing until an update-server is set", name))
+			} else if !ddnsUpdateServerParseable(p.UpdateServer) {
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q update-server %q is not a valid host or host:port", name, p.UpdateServer))
+			}
+			keySet := p.TSIGKeyName != ""
+			secretSet := p.TSIGSecret.Reveal() != ""
+			switch {
+			case keySet && secretSet && !ddnsTSIGAlgorithmSupported(p.TSIGAlgorithm):
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q tsig-algorithm %q is not supported (use hmac-sha1/224/256/"+
+					"384/512; hmac-md5 is rejected)", name, p.TSIGAlgorithm))
+			case keySet && !secretSet:
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q tsig-key is set but tsig-secret is empty; the server will "+
+					"reject updates (BADKEY/BADSIG)", name))
+			case secretSet && !keySet:
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q tsig-secret is set but tsig-key is empty; signing is "+
+					"disabled and the secret is ignored", name))
+			}
+		case "dyndns2", "cloudflare", "route53", "generic":
+			warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+				"provider %q backend %q is reserved for the #2691 P3 HTTP providers and is "+
+				"not yet implemented; scopes using it publish nothing", name, backend))
+		}
+	}
+
+	// Per-interface binding completeness.
+	if cfg.Interfaces.Interfaces != nil {
+		ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+		for n := range cfg.Interfaces.Interfaces {
+			ifNames = append(ifNames, n)
+		}
+		sort.Strings(ifNames)
+		for _, ifName := range ifNames {
+			ifc := cfg.Interfaces.Interfaces[ifName]
+			if ifc == nil {
+				continue
+			}
+			unitNums := make([]int, 0, len(ifc.Units))
+			for un := range ifc.Units {
+				unitNums = append(unitNums, un)
+			}
+			sort.Ints(unitNums)
+			for _, un := range unitNums {
+				unit := ifc.Units[un]
+				if unit == nil {
+					continue
+				}
+				check := func(family string, d *InterfaceDynamicDNSConfig) {
+					if d == nil {
+						return
+					}
+					loc := fmt.Sprintf("interfaces %s unit %d family %s dynamic-dns", ifName, un, family)
+					if d.Hostname == "" {
+						warnings = append(warnings, loc+": no hostname is set; nothing will be published")
+					}
+					if d.Provider == "" {
+						warnings = append(warnings, loc+": no provider is set; nothing will be published")
+					} else if catalog == nil {
+						warnings = append(warnings, fmt.Sprintf("%s references provider %q but no "+
+							"`system services dynamic-dns provider` catalog is configured", loc, d.Provider))
+					} else if _, ok := catalog[d.Provider]; !ok {
+						warnings = append(warnings, fmt.Sprintf("%s references undefined provider %q "+
+							"(define it under system services dynamic-dns provider)", loc, d.Provider))
+					}
+				}
+				check("inet", unit.DynamicDNSInet)
+				check("inet6", unit.DynamicDNSInet6)
+			}
+		}
+	}
+	return warnings
 }
 
 // validateRoutingRuleWindowWarnings emits commit-time warnings when a

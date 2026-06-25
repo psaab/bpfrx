@@ -463,6 +463,9 @@ var OperationalTree = map[string]*Node{
 			"application-identification": {Desc: "Show application-identification (AppID) status", Children: map[string]*Node{
 				"status": {Desc: "Show AppID engine status and supported contract"},
 			}},
+			"dynamic-dns": {Desc: "Show Surface A (router/interface-address) dynamic-DNS status (#2691)", Children: map[string]*Node{
+				"detail": {Desc: "Show per-scope published Surface A DDNS records"},
+			}},
 		}},
 		"interfaces": {Desc: "Show interface information", DynamicFn: func(cfg *config.Config) []string {
 			if cfg == nil || cfg.Interfaces.Interfaces == nil {

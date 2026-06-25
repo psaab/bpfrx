@@ -21,6 +21,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
+	"github.com/psaab/xpf/pkg/ddns"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/eventengine"
@@ -126,6 +127,10 @@ type Config struct {
 	// api package does not import the manager type. Optional; if nil (or it
 	// returns nil), the family is omitted.
 	DDNSStatsFn func() *dhcpserver.DDNSStats
+	// SurfaceAStatsFn surfaces the Surface A (router/interface-address) DDNS
+	// counter snapshot for the xpf_ddns_surface_a_* metric family (#2691 P2).
+	// Optional; if nil (or it returns nil), the family is omitted.
+	SurfaceAStatsFn func() *ddns.SurfaceAStats
 	// FlowCollectorHealthFn surfaces per-collector NetFlow v9 / IPFIX
 	// write-health for the xpf_flow_export_collector_* metric family and
 	// the /flow-exporters status endpoint (#2464). Flow export is
@@ -161,6 +166,7 @@ type Server struct {
 	rpmPinFailedFn          func() float64
 	feedsFn                 func() map[string]feeds.FeedInfo
 	ddnsStatsFn             func() *dhcpserver.DDNSStats
+	surfaceAStatsFn         func() *ddns.SurfaceAStats
 	flowCollectorHealthFn   func() []flowexport.ExporterCollectorHealth
 	startTime               time.Time
 }
@@ -188,6 +194,7 @@ func NewServer(cfg Config) *Server {
 		rpmPinFailedFn:          cfg.RPMPinFailedFn,
 		feedsFn:                 cfg.FeedsFn,
 		ddnsStatsFn:             cfg.DDNSStatsFn,
+		surfaceAStatsFn:         cfg.SurfaceAStatsFn,
 		flowCollectorHealthFn:   cfg.FlowCollectorHealthFn,
 		startTime:               time.Now(),
 	}
