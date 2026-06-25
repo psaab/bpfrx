@@ -49,6 +49,53 @@ func TestBuildTunnelEndpointSnapshotsDropsRemovedWireguard(t *testing.T) {
 	}
 }
 
+// #2703: a tunnel TTL of 0 is the "use the default 64" sentinel. The
+// AF_XDP snapshot emitter must apply that default (mirroring the netlink
+// path in pkg/routing/tunnel.go) BEFORE the value reaches the Rust frame
+// builders, which write the snapshot TTL straight into the outer IP
+// header. Leaving it 0 emits outer TTL/hop-limit 0 → first-hop blackhole.
+// An explicitly-configured non-zero TTL must be preserved unchanged.
+func TestBuildTunnelEndpointSnapshotsTTLDefault(t *testing.T) {
+	mkCfg := func(ttl int) *config.Config {
+		cfg := &config.Config{}
+		cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+			"gr-0/0/0": {
+				Name: "gr-0/0/0",
+				Tunnel: &config.TunnelConfig{
+					Name:        "gr-0/0/0",
+					Mode:        "gre",
+					Source:      "172.16.50.8",
+					Destination: "172.16.50.9",
+					TTL:         ttl,
+				},
+			},
+		}
+		return cfg
+	}
+	interfaces := []InterfaceSnapshot{
+		{Name: "gr-0/0/0", LinuxName: "gr0", Ifindex: 50},
+	}
+
+	// TTL unset (0) → defaulted to 64. Fail-on-revert: raw passthrough
+	// keeps 0 here, which the Rust builder writes as outer TTL 0 (blackhole).
+	eps := buildTunnelEndpointSnapshots(mkCfg(0), interfaces)
+	if len(eps) != 1 {
+		t.Fatalf("TTL=0 endpoints = %+v, want exactly one", eps)
+	}
+	if eps[0].TTL != 64 {
+		t.Fatalf("TTL=0 (sentinel) must default to 64, got %d", eps[0].TTL)
+	}
+
+	// Explicit non-zero TTL is preserved (the default must not override it).
+	eps = buildTunnelEndpointSnapshots(mkCfg(32), interfaces)
+	if len(eps) != 1 {
+		t.Fatalf("TTL=32 endpoints = %+v, want exactly one", eps)
+	}
+	if eps[0].TTL != 32 {
+		t.Fatalf("explicit TTL=32 must be preserved, got %d", eps[0].TTL)
+	}
+}
+
 // #1910 r2 Codex High: an interface-level WireGuard tunnel with
 // multiple units is ONE persistent TUN with ONE listen port. Now that
 // TunnelNameMap resolves every unit ref of an interface-level wg to
@@ -337,7 +384,7 @@ func TestEmitTunnelEndpointNamesMatchesBuilder(t *testing.T) {
 			cfg: cfgWith(map[string]*config.InterfaceConfig{
 				"gr-2/0/0": mkIface("gr-2/0/0", nil, map[int]*config.InterfaceUnit{
 					0: {Number: 0, Tunnel: greComplete()},
-					1: {Number: 1}, // no tunnel — not emitted
+					1: {Number: 1},                          // no tunnel — not emitted
 					2: {Number: 2, Tunnel: greIncomplete()}, // dropped
 				}),
 			}),

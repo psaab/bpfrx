@@ -55,16 +55,26 @@ impl VlanId {
 pub(in crate::afxdp) struct TunnelTtl(u8);
 
 impl TunnelTtl {
-    /// Decode a tunnel-endpoint snapshot `ttl` (an `i32`). A NEGATIVE
-    /// value maps to `TunnelTtl(0)` (the pre-fix `.max(0)` behavior); a
-    /// value > `u8::MAX` is REJECTED (the pre-fix cast wrapped it,
-    /// 256→0).
+    /// The documented default outer TTL when a tunnel carries no explicit
+    /// value. Mirrors the Go contract (`0` = "use the default 64",
+    /// `pkg/config/schema_interfaces.go` / `types_routing.go`) and the
+    /// netlink path (`pkg/routing/tunnel.go: if ttl == 0 { ttl = 64 }`).
+    pub(in crate::afxdp) const DEFAULT_TTL: u8 = 64;
+
+    /// Decode a tunnel-endpoint snapshot `ttl` (an `i32`). A value > `u8::MAX`
+    /// is REJECTED (the pre-fix cast wrapped it, 256→0). A NEGATIVE value is a
+    /// corrupt / mixed-version snapshot field — map it to the documented
+    /// default `DEFAULT_TTL` rather than `0` (#2703): coercing to 0 would write
+    /// outer TTL 0 and blackhole the tunnel, the exact failure the Go-side
+    /// 0→64 default in `pkg/dataplane/userspace/tunnels.go` exists to prevent.
+    /// The well-behaved Go emitter never sends 0 (it applies the default
+    /// before the snapshot), so this is a fail-closed backstop only.
     pub(in crate::afxdp) fn try_from_snapshot(
         ttl: i32,
         tunnel_id: u16,
     ) -> Result<Self, SnapshotIntegrityError> {
         if ttl < 0 {
-            return Ok(Self(0));
+            return Ok(Self(Self::DEFAULT_TTL));
         }
         u8::try_from(ttl)
             .map(Self)

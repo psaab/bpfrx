@@ -1,3 +1,35 @@
+## 2026-06-24 — #2701 + #2703: tunnel outer-IP-header bugs (WG outer source, GRE/WG outer TTL)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed two coupled outer-IP-header transit bugs in ONE PR.
+  - **#2701 (WG outer SOURCE)**: the #2680/#2683 MTU fix re-resolved the
+    PHYSICAL underlay egress for the outer-MTU guard but the outer IP SOURCE
+    was still read from `decision.resolution.egress_ifindex` (the LOGICAL WG
+    tunnel ifindex) — `None`-drop when the logical iface had no WAN primary,
+    or a tunnel-address source otherwise. Factored the MTU helper's
+    physical-egress resolution into `outer_physical_egress_ifindex` and used
+    it for BOTH the MTU guard (`outer_physical_egress_mtu` now wraps it) AND
+    the outer-source `primary_v4`/`primary_v6` lookup. Outer UDP now sources
+    from the physical WAN primary.
+  - **#2703 (outer TTL=0 sentinel)**: tunnel `TTL=0` means "default 64"
+    (Go config + netlink `pkg/routing/tunnel.go:686-688`), but the AF_XDP
+    snapshot passed `tunnel.TTL` raw → Rust frame builders wrote outer TTL 0
+    → blackhole. Applied the 0→64 default Go-side in
+    `pkg/dataplane/userspace/tunnels.go` (SSOT, mirrors netlink); explicit
+    non-zero preserved. Fail-closed backstop: `TunnelTtl::try_from_snapshot`
+    now maps NEGATIVE → default 64 (was 0); >255 still fails CLOSED.
+- **File(s)**: `userspace-dp/src/afxdp/frame/wg.rs` (helper refactor + outer
+  source + 2 tests), `pkg/dataplane/userspace/tunnels.go` (0→64 default),
+  `pkg/dataplane/userspace/tunnels_test.go` (TTL default/preserve test),
+  `userspace-dp/src/afxdp/forwarding_build/validated.rs` (negative→default),
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs` (negative-TTL test),
+  `docs/wireguard-interop.md` (#2701/#2703 notes), `_Log.md`.
+- **Validation**: `go build ./...`, `go test ./pkg/dataplane/userspace/...`,
+  gofmt, go vet clean; `cargo build --release` clean; `cargo test --release
+  --bin xpf-userspace-dp` wg_frame (9/9) + tunnel_ttl (3/3) + gre/frame
+  filters green. WG/GRE transit is lab-bound on the loss cluster (no WG
+  tunnel) — unit tests are the gate.
+
 ## 2026-06-24 — #2702: BGP group/neighbor export/import bracket-list truncation
 
 - **Timestamp**: 2026-06-24

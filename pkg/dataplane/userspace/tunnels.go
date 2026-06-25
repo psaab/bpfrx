@@ -82,6 +82,19 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 				transportTable = tunnel.RoutingInstance + ".inet.0"
 			}
 		}
+		// #2703: a tunnel TTL of 0 is the "use the default 64" sentinel
+		// (pkg/config/schema_interfaces.go, types_routing.go). The netlink
+		// kernel-tunnel path applies that default
+		// (pkg/routing/tunnel.go: `if ttl == 0 { ttl = 64 }`); the AF_XDP
+		// transit path must mirror it BEFORE the value reaches the snapshot,
+		// else the Rust frame builders write outer TTL/hop-limit 0 and every
+		// default-config GRE/IPIP/WG outer packet is dropped at the first hop
+		// (a deterministic blackhole that looks like underlay loss). An
+		// explicitly-configured non-zero TTL is preserved unchanged.
+		ttl := tunnel.TTL
+		if ttl == 0 {
+			ttl = 64
+		}
 		redundancyGroup := iface.RedundancyGroup
 		if redundancyGroup <= 0 {
 			if src := net.ParseIP(tunnel.Source); src != nil {
@@ -116,7 +129,7 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 			Source:          tunnel.Source,
 			Destination:     tunnel.Destination,
 			Key:             tunnel.Key,
-			TTL:             tunnel.TTL,
+			TTL:             ttl,
 			TransportTable:  transportTable,
 		}
 		if isWireguard {
