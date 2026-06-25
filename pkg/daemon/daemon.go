@@ -209,6 +209,8 @@ type Daemon struct {
 	dhcpRelay                  *dhcprelay.Manager
 	snmpAgent                  *snmp.Agent
 	lldpMgr                    *lldp.Manager
+	lldpApplied                *lldp.LLDPConfig // last effective LLDP config Apply()'d (#2372 diff-guard); nil = stopped
+	lldpApplyInit              bool             // true once reconcileLLDP has run at least once
 	scheduler                  *scheduler.Scheduler
 	schedulerCancel            context.CancelFunc
 	policySchedulerConfigHash  [32]byte

@@ -15093,6 +15093,34 @@ top.
   pkg/dataplane/userspace/nat_source_address_name_2416_test.go,
   docs/userspace-dnat-plan.md
 
+- **Timestamp**: 2026-06-25
+  **Action**: #2372 — reconcile the LLDP service on day-2 config commits
+  (was boot-only, requiring a daemon restart). Extracted the boot-time LLDP
+  start into `Daemon.reconcileLLDP` (single source of truth), wired it into
+  `applyConfigLocked` after the DHCP-relay reconcile, lazily instantiates the
+  manager on first enable and `Stop()`s it on disable/empty. Added
+  `lldp.Manager.Running()` accessor + a fail-on-revert daemon test
+  (lazy-create on day-2 enable; disable-stops-running under CAP_NET_RAW).
+  **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/daemon_lldp_reconcile_test.go, pkg/lldp/lldp.go,
+  pkg/lldp/README.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2372 review fold — addressed hostile-review findings 3 + 6 on
+  PR #2748. (3) Data race on d.lldpMgr: construct the manager ONCE at boot
+  (unconditionally, mirroring d.dhcpRelay); reconcileLLDP now never reassigns
+  the pointer (only Apply/Stop), so the lock-free `show lldp neighbors`
+  handler reads can't race a day-2 commit. (6) Per-commit thrash: added a
+  reconcile-level diff-guard (effectiveLLDPConfig + lldpConfigEqual,
+  lldpApplied/lldpApplyInit on Daemon) so an unrelated commit no longer
+  Stop()/rebuilds the LLDP generation (which wipes the neighbor table + churns
+  sockets). Added lldp.Manager.ApplyCount() seam + two fail-on-revert tests
+  (manager-identity-stable; skips-unchanged-commit), both proven RED on revert.
+  go test -race ./pkg/daemon/ ./pkg/lldp/ green; disable-stops test PASS under
+  CAP_NET_RAW.
+  **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_run.go, pkg/daemon/daemon_lldp_reconcile_test.go,
+  pkg/lldp/lldp.go, pkg/lldp/README.md
 ## #2613 flowexport: drop unpopulated NetFlow/IPFIX template fields
 
 - **Timestamp**: 2026-06-25
