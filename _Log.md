@@ -1,3 +1,38 @@
+## 2026-06-25 — #2757: IPsec dynamic-hostname gateway local-address family match
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed defect #2 of #2404 (deferred by PR #2756). For an
+  IPsec gateway specified by `dynamic hostname <fqdn>` with no explicit
+  `local-address` but an `external-interface`, `PrepareConfig` derived
+  `local_addrs` from the interface using a family hint computed only from
+  `gw.Address`. A dynamic-hostname gateway has `Address == ""`, so the hint
+  was 0 (family-agnostic) and `selectUnitAddress` returned whichever family
+  was listed first on the interface (typically IPv4). On a dual-stack
+  appliance reaching an IPv6 peer, this sourced the IKE SA from the IPv4
+  local-address (wrong family) and the tunnel could not establish. Added
+  `gatewayRemoteFamilyHint` (gateway `address` → that IP's family; dynamic
+  hostname → resolved via the injectable `resolveHostFamily` package var,
+  default `net.LookupIP`: IPv6-only→6, IPv4-only→4, dual-stack→0). The call
+  site now passes the resolved family into `resolveInterfaceAddress`, which
+  constrains selection to that family and falls back to family-agnostic
+  only when the interface is single-stack in the other family (so a
+  degraded config still emits a `local_addrs` line). A bare IP in the
+  hostname slot still classifies directly without a DNS lookup.
+- **File(s)**: `pkg/ipsec/policy.go`, `pkg/ipsec/ipsec_test.go`,
+  `pkg/ipsec/README.md`, `_Log.md`.
+- **Fail-on-revert proof**:
+  `TestPrepareConfig_DynamicHostnameFamilyMatch` injects `resolveHostFamily`
+  so an IPv6 peer must pick the IPv6 local-address (and IPv4→IPv4) from a
+  dual-stack interface whose IPv4 address is listed first. Reverting the
+  call site to the buggy `addressFamilyHint(cp.Address)` made the IPv6
+  subtest FAIL (`local-address = "198.51.100.1", want "2001:db8:1::1"`),
+  proven by copy-restore (`cp policy.go policy.go.bak` → mutate → test RED →
+  restore → test GREEN). Companion tests cover the dual-stack peer
+  (family-agnostic, first-usable) and the single-stack fallback
+  (IPv6 peer / IPv4-only interface → IPv4, not empty).
+- **Gates**: `go build ./...` OK, `gofmt -l pkg/ipsec/` clean,
+  `go vet ./pkg/ipsec/...` clean, `go test ./pkg/ipsec/...` ok.
+
 ## 2026-06-25 — #2651: WG IPv6 outer UDP checksum uses the AVX2 checksum16_ipv6 helper
 
 - **Timestamp**: 2026-06-25

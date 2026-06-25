@@ -140,6 +140,32 @@ all files stay in `package ipsec`, so the public API is unchanged.
     gateway — `set security ike gateway <name> address <ip>` (or
     `dynamic hostname <fqdn>`). The shared accept predicate is
     `config.IsUsableIPsecEndpoint`.
+- **Local-address family selection for dynamic-hostname gateways
+  (#2757).** When a gateway has no explicit `local-address` but does name
+  an `external-interface`, `PrepareConfig` derives `local_addrs` from the
+  interface's address. On a dual-stack appliance the interface carries both
+  an IPv4 and an IPv6 address, so the chosen family MUST match the family
+  the remote peer is reached over — otherwise the IKE SA is sourced from
+  the wrong family and never establishes.
+  - **Family hint** (`gatewayRemoteFamilyHint`, `policy.go`): a gateway
+    with a literal `address` takes that IP's family. A **dynamic-hostname**
+    gateway (`address` empty, `dynamic hostname <fqdn>` set) is resolved
+    via `resolveHostFamily` (an injectable package var defaulting to
+    `net.LookupIP`) — IPv6-only → family 6, IPv4-only → family 4. Before
+    #2757 the empty `address` produced a family-agnostic hint (0), so
+    `selectUnitAddress` returned whichever family was listed first on the
+    interface (typically IPv4) regardless of the peer — the defect-#2 bug
+    deferred from #2404.
+  - **Family-matched selection** (`resolveInterfaceAddress`): the local
+    address is constrained to the hinted family. If the interface is
+    single-stack in the OTHER family, selection falls back to
+    family-agnostic so a degraded config still emits a `local_addrs` line
+    instead of an empty one.
+  - **Dual-stack peer:** when the hostname resolves to BOTH families, no
+    explicit preference is configured, so the hint stays family-agnostic
+    (0) and the interface's first usable address decides — strongSwan then
+    initiates from a routable local source. (An explicit `local-address`
+    always wins outright; this path only fires when one is absent.)
 - **IKE policy chain → proposal cross-reference (#2270).** A gateway's
   `ike-policy` reference walks gateway → `ike-policy` → `ike-proposal`
   (`resolveIKESettings`, `ike.go`). When that chain breaks — the
