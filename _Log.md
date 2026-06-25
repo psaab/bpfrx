@@ -17106,3 +17106,19 @@ top.
   ./pkg/ddns/... (PASS). Fail-on-revert confirmed: reverting the
   LinkByName-error branch to `(static,true)` makes
   TestObserveInterfaceAddrTransientVsDefinitive/LinkByName_error RED.
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2888 DHCP relay server-facing socket binds giaddr:67 (BOOTPS)
+  instead of giaddr:0 (ephemeral). RFC 2131 §4.1: a strict server unicasts its
+  reply to the relay at giaddr:67, so an ephemeral-port server conn never
+  receives the reply and relayed leases never complete with strict servers. The
+  server conn now binds giaddr:relayPort and sets reusePort=true (SO_REUSEADDR/
+  SO_REUSEPORT) so giaddr:67 coexists with the client listener's 0.0.0.0:67
+  without EADDRINUSE; no BINDTODEVICE, no broadcast. Added fail-on-revert test
+  TestServerConn_BindsGiaddrBOOTPS (asserts giaddr:67 + reusePort; RED on revert
+  to Port:0). Updated TestApply_MultiInterface_NoCollision + the #2347 drift
+  test to classify client-vs-server conns by bind IP (0.0.0.0 wildcard vs
+  specific giaddr) since both now bind port 67. Gates: go build ./..., gofmt -l
+  clean, go vet ./pkg/dhcprelay/..., go test ./pkg/dhcprelay/... PASS.
+  **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/dhcprelay/README.md, _Log.md
