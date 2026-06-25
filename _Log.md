@@ -17881,3 +17881,21 @@ top.
   go test ./pkg/api/... all PASS.
 - **File(s)**: pkg/api/nat.go, pkg/api/nat_stats_test.go,
   pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2957 state_writer orphan-temp sweep — robust to PID reuse.
+  Temp name changed from `<dest>.<pid>.<seq>.tmp` to
+  `<dest>.<pid>_<starttime>.<seq>.tmp` (process-instance identity = pid +
+  `/proc/<pid>/stat` field 22 start time). Sweep liveness now requires BOTH
+  the pid to exist AND its current start time to match the embedded one, so
+  a recycled pid (new unrelated process on a crashed writer's pid) no longer
+  pins the stale orphan; a genuinely-live writer's in-flight temp is still
+  preserved (#2705 guarantee intact). New seam (START_TIME_HOOK) lets tests
+  simulate PID reuse. Added fail-on-revert test
+  `sweep_removes_orphan_whose_pid_was_reused_by_another_process` (RED against
+  bare-pid keying, verified by temporary revert). Legacy bare-pid temps are
+  no longer sweep candidates under the new scheme.
+  Gates: cargo build --release -p xpf-userspace-dp PASS;
+  cargo test -p xpf-userspace-dp state_writer 11/11 PASS.
+- **File(s)**: userspace-dp/src/state_writer.rs, userspace-dp/src/FEATURES.md,
+  docs/userspace-dataplane-architecture.md, _Log.md
