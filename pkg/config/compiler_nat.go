@@ -281,6 +281,25 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 					return nil, err
 				}
 			}
+			// #2769: a `match destination-port` WITHOUT a `then static-nat
+			// mapped-port` is a port-scoped 1:1 (no port translation). The
+			// dataplane scopes the reverse SNAT to that one port — but the
+			// half-config is almost always an operator mistake (the intent is
+			// usually a full port-forward with mapped-port). Reject it at
+			// strict commit-check, mirroring the existing mapped-port-without-
+			// match-port rejection below, so the operator must either drop the
+			// port match (whole-address 1:1) or add a mapped-port (port
+			// forward). The dataplane backstop (static_nat.rs) keeps the
+			// reverse SNAT scoped to the matched port if the rule slips through
+			// the lenient load / peer-sync path.
+			if rule.MatchDestinationPort != 0 && rule.MappedPort == 0 {
+				if err := emitSuffix(fmt.Sprintf(
+					"security nat static rule-set %q rule %q match destination-port %d requires a matching `then static-nat mapped-port` (a port match without a port translation either broadens or scopes the reverse source-NAT in a non-obvious way; drop the port match for a whole-address 1:1, or add a mapped-port for a port forward)",
+					rs.Name, rule.Name, rule.MatchDestinationPort),
+					" (ignored: port match dropped by dataplane until corrected)"); err != nil {
+					return nil, err
+				}
+			}
 			if rule.MappedPort != 0 {
 				if rule.MappedPort < 1 || rule.MappedPort > 65535 {
 					if err := emitSuffix(fmt.Sprintf(
