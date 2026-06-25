@@ -380,6 +380,8 @@ func resolveSurfaceABackend(p *config.DDNSProvider, fqdn string, _ int, clients 
 		return newSurfaceARFC2136(p, fqdn)
 	case "dyndns2":
 		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newDyndns2Backend(p, httpClientFor()) })
+	case "duckdns":
+		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newDuckDNSBackend(p, httpClientFor()) })
 	case "cloudflare":
 		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newCloudflareBackend(p, httpClientFor()) })
 	case "route53":
