@@ -292,6 +292,56 @@ struct SessionEntry {
     /// (`update_session`), promotion refresh
     /// (`refresh_for_ha_transition`), or re-import (`upsert_synced`).
     first_held_ns: u64,
+    /// #2501: per-session forward/reverse byte and packet counters,
+    /// accumulated on the AF_XDP forwarding hot path. Forward = the
+    /// initiator→responder direction (the direction the session was keyed
+    /// in); reverse = the reply direction (`metadata.is_reverse` packets).
+    ///
+    /// These are PLAIN `u64`s, not atomics: the `SessionTable` is
+    /// worker-owned and single-threaded (every increment site runs under
+    /// `&mut self` on the owning worker — see the `create_drops` /
+    /// `admission_refused` precedent above), so a session entry is never
+    /// touched by two cores concurrently. The hot-path cost is a single
+    /// `saturating_add` per counter (no allocation, no atomic, no
+    /// cross-core cache-line traffic). They are surfaced two ways without
+    /// any new wire field:
+    ///   - periodically mirrored into the BPF conntrack map by
+    ///     `refresh_bpf_conntrack_last_seen` (~1s GC cadence) so `show
+    ///     security flow session` reports live volume;
+    ///   - snapshotted onto the close `SessionDelta` so the SESSION_CLOSE
+    ///     RT_FLOW frame (#2460) carries the real NetFlow/IPFIX volume in
+    ///     the already-reserved [56:64]/[64:72]/[112:120]/[120:128] wire
+    ///     slots (previously hard-zeroed with `(#2501)` markers).
+    counters: SessionCounters,
+}
+
+/// #2501: per-session traffic accounting, split by direction. A `Copy`
+/// snapshot type so callers can read the four counters out of a session
+/// entry in one move (the BPF-map refresh and the close-delta harvest both
+/// need the whole set).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionCounters {
+    pub(crate) fwd_packets: u64,
+    pub(crate) fwd_bytes: u64,
+    pub(crate) rev_packets: u64,
+    pub(crate) rev_bytes: u64,
+}
+
+impl SessionCounters {
+    /// Account a single forwarded packet of `len` bytes in the given
+    /// direction. `saturating_add` so a (practically impossible) overflow
+    /// pins at `u64::MAX` rather than wrapping a volume counter to a tiny
+    /// value — branchless, predictable codegen on the hot path.
+    #[inline]
+    fn account(&mut self, is_reverse: bool, len: u64) {
+        if is_reverse {
+            self.rev_packets = self.rev_packets.saturating_add(1);
+            self.rev_bytes = self.rev_bytes.saturating_add(len);
+        } else {
+            self.fwd_packets = self.fwd_packets.saturating_add(1);
+            self.fwd_bytes = self.fwd_bytes.saturating_add(len);
+        }
+    }
 }
 
 /// #964 Step 1: slab-resident record. Holds the canonical
@@ -694,6 +744,74 @@ impl SessionTable {
         }
     }
 
+    /// #2501: account a single forwarded packet (of on-wire length `len`,
+    /// `UserspaceDpMeta.pkt_len`) against the session whose THIS-PACKET key is
+    /// `key`. The direction is derived from the resolved entry — the caller
+    /// does NOT supply it, because the only per-packet direction signal the
+    /// hot path otherwise has (the flow-cache `metadata.is_reverse`) is
+    /// always `false` (every cache entry is built from a forward-build
+    /// decision), so trusting it would book all reverse traffic as forward.
+    ///
+    /// Both directions' counters are folded onto the SINGLE canonical FORWARD
+    /// entry so the BPF-conntrack mirror (`refresh_bpf_conntrack_last_seen`,
+    /// which walks only forward entries) and the SESSION_CLOSE harvest
+    /// (forward-entry only) see the complete fwd+rev volume with no
+    /// cross-entry combine and no dependence on the two entries' independent
+    /// expiry ordering:
+    ///   - a forward packet keys directly to the forward entry
+    ///     (`is_reverse == false`) → bump its `fwd`;
+    ///   - a reverse packet keys to the REVERSE entry
+    ///     (`is_reverse == true`); `reverse_session_key(rev.key, nat)`
+    ///     recovers the forward entry's wire tuple → bump that forward
+    ///     entry's `rev`.
+    ///
+    /// HOT PATH: the dominant (forward) direction is a SINGLE `key_to_handle`
+    /// hash probe (`entry_by_key_mut` resolves the record once; the direction
+    /// is read and the `fwd` counters mutated under that same `&mut` borrow)
+    /// plus one `saturating_add`. The reverse direction copies the bits
+    /// needed to recover the forward tuple out of that first borrow, then pays
+    /// one extra probe to hop reverse-entry → forward-entry. Worker-owned
+    /// `&mut self`: plain stores, no atomic, no allocation, no cross-core
+    /// traffic. A miss (session reaped between resolution and accounting) is a
+    /// no-op — the same fail-open posture as `touch`.
+    #[inline]
+    pub fn account_packet(&mut self, key: &SessionKey, len: u64) {
+        // Single resolve. For the dominant FORWARD case this is the only
+        // session probe `account_packet` does — read the direction and mutate
+        // the `fwd` counters under this one `&mut record` borrow. For the
+        // REVERSE case, snapshot the (Copy) bits needed to recover the forward
+        // tuple and fall out of this borrow before the second resolve.
+        let (record_key, nat) = match self.record_by_key_mut(key) {
+            Some(record) => {
+                if !record.entry.metadata.is_reverse {
+                    // Forward packet → forward entry. Bump `fwd` in place.
+                    record.entry.counters.account(false, len);
+                    return;
+                }
+                (record.key.clone(), record.entry.decision.nat)
+            }
+            None => return,
+        };
+        // Reverse packet → reverse entry. Fold onto the forward entry's `rev`.
+        let fwd_key = reverse_session_key(&record_key, nat);
+        if let Some(entry) = self.entry_by_key_mut(&fwd_key) {
+            entry.counters.account(true, len);
+        } else if let Some(entry) = self.entry_by_key_mut(key) {
+            // Forward entry already gone (independent expiry) — fall back to
+            // the reverse entry so the count is not silently dropped.
+            entry.counters.account(true, len);
+        }
+    }
+
+    /// #2501: read the four per-direction traffic counters for the session
+    /// keyed by `key`, or `None` if no live entry exists. Cold path
+    /// (BPF-conntrack-map refresh on the ~1s GC cadence); a single lookup +
+    /// a `Copy` of the four-`u64` snapshot.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn session_counters(&self, key: &SessionKey) -> Option<SessionCounters> {
+        self.entry_by_key(key).map(|e| e.counters)
+    }
+
     /// Unified session update function replacing promote_synced,
     /// refresh_local, and refresh_for_ha_activation.
     ///
@@ -849,6 +967,14 @@ impl SessionTable {
                 .entry_by_key(key)
                 .map(|e| e.created_ns)
                 .unwrap_or(now_ns);
+            // #2501: a promote keeps the entry's accumulated counters
+            // (informational on an Open delta — SESSION_CREATE reports no
+            // volume — but consistent with reading created_ns off the same
+            // entry).
+            let counters = self
+                .entry_by_key(key)
+                .map(|e| e.counters)
+                .unwrap_or_default();
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
                 key: key.clone(),
@@ -858,6 +984,7 @@ impl SessionTable {
                 fabric_redirect_sync: false,
                 created_ns,
                 last_seen_ns: now_ns,
+                counters,
             });
         }
         true

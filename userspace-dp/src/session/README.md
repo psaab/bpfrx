@@ -109,6 +109,49 @@ ever being touched, then be reaped while still forwarding (an HA Close
 delta to the peer + BPF redirect-key deletion + a stale flow-cache
 descriptor out-living its session). UDP (60 s) was the most exposed.
 
+## Per-session byte/packet accounting (#2501)
+
+Each `SessionEntry` carries a `SessionCounters` (`fwd_packets`, `fwd_bytes`,
+`rev_packets`, `rev_bytes`) — plain `u64`s, not atomics, because the
+`SessionTable` is worker-owned and single-threaded (same precedent as
+`create_drops`). Every forwarded packet is accounted via
+`SessionTable::account_packet(key, len)` on the AF_XDP forwarding hot path:
+
+- the flow-cache fast path (`poll_descriptor/flow_cache_hit.rs`) accounts
+  every packet of an established flow;
+- the slow-path forward-build chokepoint (`poll_descriptor/mod.rs`, the
+  `ForwardCandidate | FabricRedirect` branch) accounts the packets that
+  reach the full forward-build — the first packet(s) of a flow before its
+  cache entry warms, and any non-cacheable flow (NAT64/NPTv6).
+
+`account_packet` derives the direction from the resolved entry rather than
+trusting the flow-cache `metadata.is_reverse` (which is always `false` —
+every cache entry is built from a forward-build decision). Both directions
+are folded onto the **single canonical forward entry**: a forward packet
+keys directly to it (`fwd`); a reverse packet keys to the reverse entry,
+whose `reverse_session_key(rev.key, nat)` recovers the forward tuple, and
+the volume lands on the forward entry's `rev`. This keeps the
+forward-only BPF-conntrack mirror and the forward-only SESSION_CLOSE
+harvest complete without a cross-entry combine or any dependence on the
+two entries' independent expiry ordering.
+
+Cost: the dominant forward direction is one warm `key_to_handle` probe +
+one `saturating_add`; the reverse direction pays one extra probe to hop
+reverse→forward. No allocation, no atomic, no cross-core traffic.
+
+Surfacing (no new wire field):
+
+- `refresh_bpf_conntrack_last_seen` (afxdp/bpf_map, ~1s GC cadence) writes
+  the counters into the BPF conntrack map value, so `show security flow
+  session` reports live volume (Go reads `FwdBytes`/`FwdPackets`/… from
+  that map today);
+- the close `SessionDelta` snapshots the entry's counters at expiry, and
+  `emit_session_close_rt_flow` writes them into the SESSION_CLOSE RT_FLOW
+  frame's already-reserved `[56:64]`/`[64:72]` (forward) and
+  `[112:120]`/`[120:128]` (reverse) wire slots — the slots the Go
+  `logging.DecodeRawEventRecord` already parses (previously hard-zeroed),
+  so NetFlow/IPFIX close records carry real volume.
+
 ## Standby retention (#2120)
 
 The Rust wheel now owns HA standby session retention — the contract the
@@ -332,6 +375,31 @@ which short-circuits both the BPF map delete and the helper. The counters are
 surfaced via `Coordinator::session_install_stale_ignored_total()` /
 `session_delete_stale_ignored_total()`. See `docs/sync-protocol.md` and
 `docs/research/2170-ha-deferred-delete/plan.md`.
+
+### Per-policy log flags on the session-sync wire (#2785)
+
+A locally-admitted session stamps the admitting policy's `then log
+session-init`/`session-close` selection onto `SessionMetadata.log_session_init`
+/`log_session_close` (the #2508 path). Before #2785 the HA sync-import path
+hard-coded both flags `false`, so a session that failed over to the standby
+emitted no per-policy RT_FLOW SESSION_CREATE/CLOSE syslog records on the new
+active node.
+
+#2785 carries the selection across the full sync path:
+
+1. **Open frame** (`event_stream/codec.rs`): `FLAG_LOG_SESSION_INIT` (1<<3) /
+   `FLAG_LOG_SESSION_CLOSE` (1<<4) on the existing flags byte, encoded from
+   `metadata.log_session_init/close`.
+2. **Go control plane**: decoded into `SessionDeltaInfo`, stamped onto
+   `dataplane.SessionValue.LogFlags` (`LogFlagSessionInit`/`Close`, bits 0/1),
+   which already rides the cluster wire (`pkg/cluster/sync_protocol.go`).
+3. **Install**: `SessionSyncRequest.log_session_init/close` ->
+   `build_synced_session_entry` -> the synced session's metadata.
+
+`serde(default)`/`omitempty` make this rolling-upgrade safe: an old peer that
+omits the fields decodes to `false` (no per-policy log) — bit-identical to
+pre-#2785 behavior. The JSON RPC-fallback delta (`SessionDeltaInfo` in
+`protocol/binding.rs`) carries the same fields at parity with the binary frame.
 
 ## Per-IP session-limit lifecycle (#2134; #2128 leak-fix preserved)
 

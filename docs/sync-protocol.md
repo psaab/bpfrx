@@ -424,6 +424,20 @@ Forward-only sweep entries are reconstructed into full conntrack state:
   own snapshot (`sessionSyncTunnelEndpointLocked`); an unknown id
   degrades that synced session to NoRoute until configs converge.
 
+### LogFlags bits (userspace dataplane)
+The 1-byte `LogFlags` field (offset 113 V4) carries, in addition to the
+userspace-internal `LogFlagUserspaceTunnelEndpoint` (1<<6) /
+`LogFlagUserspaceFabricIngress` (1<<7), the **per-policy log selection**
+(#2785): `LogFlagSessionInit` (1<<0) / `LogFlagSessionClose` (1<<1). These
+mirror the admitting policy's `then log session-init`/`session-close` so a
+session that fails over to the standby emits the same RT_FLOW
+SESSION_CREATE/CLOSE syslog records on the new active node. They reach the
+cluster wire via the helper's open-frame flags byte
+(`FLAG_LOG_SESSION_INIT`/`CLOSE`, `event_stream/codec.rs`) and are re-applied
+to the peer helper's synced session via `SessionSyncRequest.log_session_init/
+close`. An old peer leaves the bits clear -> no per-policy log (pre-#2785
+behavior), so the carry is rolling-upgrade safe.
+
 ### Known Issues
 - **NO_NEIGH after failover (FIXED, `0080cbc`):** Cold ARP cache on takeover previously caused `bpf_fib_lookup` rc=7 and mis-forward behavior. This was fixed in HA sync hardening.
 - **Monotonic clock skew (FIXED, `0080cbc`):** Remote timestamps in synced sessions previously caused premature GC expiry; this was fixed in receiver-side handling.

@@ -481,8 +481,21 @@ reserved for whole-dataplane selection where a rewrite shim
   equal-flow-target-policy (slowest | mean | ideal-share)` typed enum
   leaf (ValueEnumOf + `ValidateEnum`, same recipe as the scheduler
   `priority` leaf): value-slot completion, flat-set commit-check
-  rejection of unknown values, plus a strict-compile re-check for
-  externally-assembled configs.
+  rejection of unknown values, plus a strict-compile re-check
+  (`validateClassOfServiceStrict`) for externally-assembled configs.
+- **#2458 (Rust fail-closed backstop):** the helper-side
+  `EqualFlowTargetPolicy::parse` previously mapped any unrecognized
+  wire string to `Slowest` via a catch-all match arm — identically to
+  the empty (legacy/unset) string — so a typo or a mixed-version
+  snapshot that slipped past the Go gate silently changed queue
+  fairness with no failure surfaced. The parse is now fallible: the
+  EMPTY string still decodes to the byte-unchanged `Slowest` default,
+  but a NON-EMPTY unknown value fails the snapshot CLOSED with
+  `SnapshotIntegrityError::CosUnknownEqualFlowTargetPolicy` naming the
+  offending forwarding-class and value (preflight keeps the previous
+  live CoS state). The Go commit-time gate above stays the PRIMARY
+  defense; this is the helper-boundary backstop against version /
+  snapshot drift, consistent with the #2447 CoS fail-closed family.
 - **#1956 (chassis device-map):** added the bare-metal stable-identity
   managed allowlist under `chassis device-map` (a SIBLING of `cluster`, so
   per-node apply-groups compose). New value types `ValuePCIAddr` /
@@ -845,7 +858,13 @@ reserved for whole-dataplane selection where a rewrite shim
     provider (dyndns2 with no server + unknown name, cloudflare missing
     api-token/zone, route53 missing keys/hosted-zone-id, generic missing
     url-template) warns and publishes nothing at runtime (fail-open, never a
-    hard reject). Regression coverage:
+    hard reject). A malformed `checkip-url` (not an http(s) URL with a host —
+    e.g. `ftp://`, `not a url`, host-less `http://`) also warns at commit
+    (#2773): without it the typo committed silently and the runtime fetch then
+    masqueraded forever as a transient observation failure, suppressing
+    publishing indefinitely. The runtime `ddns.CheckIP` gate
+    (`validateCheckIPURL`) fails closed on the same malformed URL regardless, so
+    a URL that slips past commit cannot reach a fetch. Regression coverage:
     `pkg/config/compiler_p3_http_providers_test.go`,
     `pkg/ddns/backend_http_test.go` / `backend_cloudflare_test.go` /
     `backend_route53_test.go` / `sigv4_test.go` / `checkip_test.go` /

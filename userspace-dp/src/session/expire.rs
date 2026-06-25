@@ -302,6 +302,13 @@ impl SessionTable {
                                 // RT_FLOW close frame reports a true StartTime.
                                 created_ns: removed.created_ns,
                                 last_seen_ns: removed.last_seen_ns,
+                                // #2501: harvest the per-direction byte/packet
+                                // counters off the entry BEFORE it is dropped
+                                // (remove_entry has already returned it). These
+                                // populate the reserved volume slots on the
+                                // SESSION_CLOSE RT_FLOW frame so NetFlow/IPFIX
+                                // reports real volume instead of 0.
+                                counters: removed.counters,
                             });
                         }
                         expired_entries.push(ExpiredSession {

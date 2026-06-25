@@ -420,8 +420,10 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
 fn build_cos_state_propagates_equal_flow_target_policy_gated_on_enforcement() {
     // #1746: the policy string reaches CoSQueueConfig only when the
     // scheduler is actually equal-flow-enforcing; otherwise the queue
-    // carries the byte-unchanged default `Slowest`. Unknown strings
-    // also parse to `Slowest`.
+    // carries the byte-unchanged default `Slowest`. #2458: an unknown
+    // NON-EMPTY policy on an active equal-flow scheduler now fails the
+    // snapshot closed (see the dedicated fail-closed test below); the
+    // empty/unset string still decodes to `Slowest`.
     let make_sched = |name: &str, enforcement: bool, policy: &str| CoSSchedulerSnapshot {
         name: name.into(),
         transmit_rate_bytes: 1_000_000_000 / 8,
@@ -457,7 +459,7 @@ fn build_cos_state_propagates_equal_flow_target_policy_gated_on_enforcement() {
                     queue: 6,
                 },
                 CoSForwardingClassSnapshot {
-                    name: "fc-unknown".into(),
+                    name: "fc-empty".into(),
                     queue: 7,
                 },
             ],
@@ -466,8 +468,9 @@ fn build_cos_state_propagates_equal_flow_target_policy_gated_on_enforcement() {
                 // Policy set but enforcement absent: must stay Slowest.
                 make_sched("s-ungated", false, "mean"),
                 make_sched("s-ideal", true, "ideal-share"),
-                // Unknown value: parse falls back to Slowest.
-                make_sched("s-unknown", true, "bogus-policy"),
+                // #2458: empty/unset policy on an active equal-flow
+                // scheduler is the legacy default and decodes to Slowest.
+                make_sched("s-empty", true, ""),
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -485,8 +488,8 @@ fn build_cos_state_propagates_equal_flow_target_policy_gated_on_enforcement() {
                         scheduler: "s-ideal".into(),
                     },
                     CoSSchedulerMapEntrySnapshot {
-                        forwarding_class: "fc-unknown".into(),
-                        scheduler: "s-unknown".into(),
+                        forwarding_class: "fc-empty".into(),
+                        scheduler: "s-empty".into(),
                     },
                 ],
             }],
@@ -517,8 +520,71 @@ fn build_cos_state_propagates_equal_flow_target_policy_gated_on_enforcement() {
     assert_eq!(
         policy_of(7),
         EqualFlowTargetPolicy::Slowest,
-        "unknown policy strings must parse to the byte-unchanged default"
+        "empty/unset policy string must decode to the byte-unchanged default"
     );
+}
+
+#[test]
+fn build_cos_state_fails_closed_on_unknown_equal_flow_target_policy() {
+    // #2458: an active equal-flow scheduler carrying a NON-EMPTY policy
+    // string that is not one of slowest|mean|ideal-share fails the
+    // snapshot CLOSED (the helper-boundary backstop for a typo or a
+    // version-drifted snapshot) rather than silently mapping it to the
+    // `Slowest` default and changing queue fairness with no failure
+    // surfaced. The Go commit-time gate (#1746/#2458) is the primary
+    // defense; this proves the Rust backstop names the offending value.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 42,
+            cos_shaping_rate_bytes_per_sec: 10_000_000,
+            cos_shaping_burst_bytes: 256_000,
+            cos_scheduler_map: "wan-map".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "fc-bad".into(),
+                queue: 4,
+            }],
+            schedulers: vec![CoSSchedulerSnapshot {
+                name: "s-bad".into(),
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                transmit_rate_exact: true,
+                priority: "low".into(),
+                buffer_size_bytes: 128 * 1024,
+                buffer_size_percent: 0.0,
+                surplus_sharing: false,
+                equal_flow_enforcement: true,
+                equal_flow_target_policy: "bogus-policy".into(),
+                codel_target_ns: 0,
+            }],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "fc-bad".into(),
+                    scheduler: "s-bad".into(),
+                }],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+
+    // Call the fallible production orchestrator directly (the `super::*`
+    // `build_cos_state` test wrapper `.expect()`s a clean snapshot).
+    match super::cos::build_cos_state(&snapshot) {
+        Err(crate::policy::SnapshotIntegrityError::CosUnknownEqualFlowTargetPolicy {
+            forwarding_class,
+            target_policy,
+        }) => {
+            assert_eq!(forwarding_class, "fc-bad");
+            assert_eq!(target_policy, "bogus-policy");
+        }
+        Err(other) => panic!("wrong integrity error: {other}"),
+        Ok(_) => panic!("unknown equal-flow-target-policy must fail the snapshot closed"),
+    }
 }
 
 #[test]

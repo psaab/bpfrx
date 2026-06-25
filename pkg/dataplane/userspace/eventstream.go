@@ -851,6 +851,9 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 		EgressZoneID:   uint16(payload[28]),
 		FabricRedirect: flags&SessionEventFlagFabricRedirect != 0,
 		FabricIngress:  flags&SessionEventFlagFabricIngress != 0,
+		// #2785: per-policy log selection from the open-frame flags byte.
+		LogSessionInit:  flags&SessionEventFlagLogSessionInit != 0,
+		LogSessionClose: flags&SessionEventFlagLogSessionClose != 0,
 	}
 
 	// Disposition mapping: 0=Accept, 1=LocalDelivery

@@ -849,6 +849,60 @@ func TestBuildSessionSyncRequestV4ConvertsPortsToHostOrder(t *testing.T) {
 	}
 }
 
+// #2785: the per-policy `then log` selection must ride the session-sync
+// request so a session synced to the peer logs identically after failover.
+// Reverting the manager_ha.go mapping drops the flags and this fails RED.
+func TestBuildSessionSyncRequestCarriesLogFlags(t *testing.T) {
+	m := &Manager{bpfShim: dataplane.New()}
+	keyV4 := dataplane.SessionKey{
+		SrcIP:    [4]byte{10, 0, 61, 102},
+		DstIP:    [4]byte{172, 16, 80, 200},
+		SrcPort:  hostToNetwork16(50952),
+		DstPort:  hostToNetwork16(5201),
+		Protocol: 6,
+	}
+	valV4 := &dataplane.SessionValue{
+		IngressZone: 1,
+		EgressZone:  2,
+		LogFlags:    dataplane.LogFlagSessionInit | dataplane.LogFlagSessionClose,
+	}
+	reqV4 := m.buildSessionSyncRequestV4("upsert", keyV4, valV4)
+	if !reqV4.LogSessionInit || !reqV4.LogSessionClose {
+		t.Fatalf("v4: expected log flags carried, got init=%t close=%t",
+			reqV4.LogSessionInit, reqV4.LogSessionClose)
+	}
+
+	// Only session-close set: init must NOT leak true.
+	valCloseOnly := &dataplane.SessionValue{
+		IngressZone: 1, EgressZone: 2,
+		LogFlags: dataplane.LogFlagSessionClose,
+	}
+	reqCloseOnly := m.buildSessionSyncRequestV4("upsert", keyV4, valCloseOnly)
+	if reqCloseOnly.LogSessionInit || !reqCloseOnly.LogSessionClose {
+		t.Fatalf("v4 close-only: init=%t close=%t, want false/true",
+			reqCloseOnly.LogSessionInit, reqCloseOnly.LogSessionClose)
+	}
+
+	// Neither set: both false.
+	reqNone := m.buildSessionSyncRequestV4("upsert", keyV4,
+		&dataplane.SessionValue{IngressZone: 1, EgressZone: 2})
+	if reqNone.LogSessionInit || reqNone.LogSessionClose {
+		t.Fatalf("v4 none: expected both false, got init=%t close=%t",
+			reqNone.LogSessionInit, reqNone.LogSessionClose)
+	}
+
+	keyV6 := dataplane.SessionKeyV6{Protocol: 6}
+	valV6 := &dataplane.SessionValueV6{
+		IngressZone: 1, EgressZone: 2,
+		LogFlags: dataplane.LogFlagSessionInit | dataplane.LogFlagSessionClose,
+	}
+	reqV6 := m.buildSessionSyncRequestV6("upsert", keyV6, valV6)
+	if !reqV6.LogSessionInit || !reqV6.LogSessionClose {
+		t.Fatalf("v6: expected log flags carried, got init=%t close=%t",
+			reqV6.LogSessionInit, reqV6.LogSessionClose)
+	}
+}
+
 func TestBuildSessionSyncRequestV4PreservesBothNatLegs(t *testing.T) {
 	m := &Manager{bpfShim: dataplane.New()}
 	key := dataplane.SessionKey{

@@ -544,6 +544,14 @@ impl EventStreamWorkerHandle {
                     // the [128:132] wire slot so the record shows the
                     // admitting interface instead of "N/A".
                     ingress_ifindex,
+                    // #2501: real per-session volume harvested off the
+                    // expiring entry's counters, into the reserved
+                    // [56:64]/[64:72] (forward) and [112:120]/[120:128]
+                    // (reverse) slots.
+                    delta.counters.fwd_packets,
+                    delta.counters.fwd_bytes,
+                    delta.counters.rev_packets,
+                    delta.counters.rev_bytes,
                 )
             },
         );
