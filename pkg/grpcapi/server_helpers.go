@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/vishvananda/netlink"
@@ -63,27 +64,15 @@ func policyActionStr(a config.PolicyAction) string {
 	}
 }
 
+// protoName renders an IP protocol number as its canonical lowercase name,
+// falling back to the numeric form for an unnamed protocol. The named set is
+// owned by appid.ProtocolName (the #2949 SSOT) so gRPC, REST, and the catalog
+// agree on which protocols are named.
 func protoName(p uint8) string {
-	switch p {
-	case 6:
-		return "tcp"
-	case 17:
-		return "udp"
-	case 1:
-		return "icmp"
-	case 47:
-		return "gre"
-	case 50:
-		return "esp"
-	case 4:
-		return "ipip"
-	case 41:
-		return "ipv6"
-	case dataplane.ProtoICMPv6:
-		return "icmpv6"
-	default:
-		return fmt.Sprintf("%d", p)
+	if name := appid.ProtocolName(p); name != "" {
+		return name
 	}
+	return fmt.Sprintf("%d", p)
 }
 
 func ntohs(v uint16) uint16 {
