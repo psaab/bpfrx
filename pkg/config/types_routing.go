@@ -61,8 +61,16 @@ type PolicyTerm struct {
 	Action          string         // "accept", "reject"
 	NextHop         string         // then next-hop (e.g. "peer-address", "self", IP)
 	LoadBalance     string         // then load-balance (e.g. "consistent-hash", "per-packet")
-	LocalPreference int            // BGP local-preference (0 = not set)
-	Metric          int            // BGP MED/metric value (valid when HasMetric)
+	LocalPreference int            // BGP local-preference value (valid when HasLocalPreference)
+	// HasLocalPreference distinguishes an explicitly configured
+	// local-preference (including the valid value 0, which maximally
+	// deprioritizes a route within the AS) from "local-preference not
+	// configured". A bare int could not tell local-preference-0 apart
+	// from unset, so a `set local-preference 0` term silently rendered
+	// no `set local-preference` clause (#2857). The renderer must gate
+	// the FRR clause on HasLocalPreference, never on LocalPreference > 0.
+	HasLocalPreference bool
+	Metric             int // BGP MED/metric value (valid when HasMetric)
 	// HasMetric distinguishes an explicitly configured metric (including the
 	// valid traffic-engineering value 0, e.g. MED 0 = advertise a highly
 	// preferred route) from "metric not configured". A bare int could not
