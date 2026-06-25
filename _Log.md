@@ -30,6 +30,81 @@
 - **Gates**: `go build ./...` clean, `gofmt -l` clean, `go vet ./pkg/ddns/...`
   clean, `go test ./pkg/ddns/...` + `go test ./pkg/daemon/ -run
   'StaticUnitAddr|SurfaceA'` pass.
+## 2026-06-25 — #2749: flowexport populates ingressInterface (IE 10) with the real ingress ifindex (Go-only; TOS/TCPFlags/Direction/OutIf deferred)
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2613 dropped five NetFlow v9 / IPFIX template fields
+  (SrcTos 5, TCPFlags 6, ingressInterface/InputSNMP 10, egressInterface/
+  OutputSNMP 14, flowDirection 61) because the SESSION_CLOSE close path
+  carried no real value. Investigation found that #2615 since stamps the
+  closing binding's ingress ifindex into the [128:132] slot of the
+  136-byte RT_FLOW close frame (the Rust encoder no longer hardcodes 0),
+  and `pkg/logging/ringbuf.go` already reads it (only to resolve a NAME).
+  So `ingressInterface` (IE 10, an SNMP ifIndex) can be populated with a
+  REAL value **Go-only**, no wire change. Re-introduced it: retain the
+  numeric ifindex on `EventRecord.IngressIfindex`, copy it into
+  `SessionCloseData.InIf` in both daemon flow-export callbacks, thread it
+  to `FlowRecord.InIf` in both `ExportSessionClose` builders, and re-add
+  IE 10 (4B, placed BEFORE the post-NAT trailing block so #2526 offsets
+  are unchanged) to both NetFlow v9 templates + IPFIX v4/v6 templates and
+  their encoders/size constants (IPFIX v4 57→61, v6 105→109; v9 v4 52→56,
+  v6 100→104). The other four #2613 drops stay dropped — no wire source
+  exists (needs the deferred Rust↔Go frame extension + conntrack TOS/flag
+  stamping + egress-ifindex forwarding-path tracking, which remains the
+  #2749 follow-up scope).
+- **File(s)**: pkg/logging/eventbuf.go (EventRecord.IngressIfindex),
+  pkg/logging/ringbuf.go (retain numeric ifindex), pkg/flowexport/manager.go
+  (SessionCloseData.InIf), pkg/daemon/daemon_flowexport.go (sd.InIf =
+  rec.IngressIfindex, both callbacks), pkg/flowexport/netflow.go +
+  pkg/flowexport/ipfix.go (template field + encoder write + size consts +
+  ExportSessionClose population), pkg/flowexport/README.md (#2749 section).
+  Tests: pkg/flowexport/ingress_interface_test.go (NEW fail-on-revert),
+  pkg/flowexport/dropped_fields_test.go + exporter_test.go (drop IE 10
+  from the still-dropped sets), pkg/flowexport/postnat_test.go (record-size
+  literals).
+- **Wire note**: NO wire-format change. The ingress ifindex is already on
+  the SESSION_CLOSE wire ([128:132], #2615); this PR only stops discarding
+  the numeric value on the Go side. protocol_wire_v1.json unchanged; no
+  Rust change.
+- **Fail-on-revert proof**: copy-aside `netflow.go`/`ipfix.go`, removed the
+  `InIf: evt.InIf` assignment from both `ExportSessionClose` builders →
+  `TestIPFIXIngressInterfacePopulated` went RED
+  (`FlowRecord.InIf = 0x00000000, want 0xdeadbeef (population reverted)`);
+  restored from backup → GREEN. Gates: go build ./... clean, gofmt -l
+  (touched files) clean, go vet clean, go test ./pkg/flowexport/...
+  ./pkg/logging/... ./pkg/daemon/... all pass.
+## 2026-06-25 — #2397: persistent-NAT honors permit-any-remote-host=false
+
+- **Timestamp**: 2026-06-25
+- **Action**: Persistent source-NAT ignored `persistent-nat
+  permit-any-remote-host`. The lease was keyed by the local source tuple
+  `(protocol, src_ip, src_port)` only, so the same translated mapping was
+  reused across ANY remote destination — the disabled-flag (Junos
+  target-host scoping) mode was silently a no-op. Fix: `PersistentSourceKey`
+  gained an in-memory `remote: Option<(IpAddr, u16)>` field;
+  `SourceNatFlowKey::persistent_source_key(permit_any_remote_host)` folds the
+  flow's `(dst_ip, dst_port)` into the key when the flag is false (`None`
+  when true, preserving the historical any-remote reuse).
+  `PortAllocator::allocate_translation` takes the flag and threads it to the
+  key builder; both source.rs call sites pass
+  `rule.persistent_nat_permit_any_remote_host`. NOTE: the
+  `permit_any_remote_host` flag was ALREADY plumbed Go→Rust on both wire
+  sides (`pkg/dataplane/userspace/protocol.go`,
+  `userspace-dp/src/protocol/nat.rs`); no new wire field was added — `remote`
+  is purely in-memory allocator state, never serialized, so no
+  protocol_wire_v1.json regen.
+- **File(s)**: userspace-dp/src/nat/allocator.rs,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests.rs,
+  docs/userspace-dataplane-gaps.md, _Log.md
+- **Fail-on-revert proof**: new test
+  `pool_snat_persistent_no_permit_any_remote_scopes_to_remote_host` asserts a
+  second remote 5-tuple gets a DISTINCT mapping (2 leases) while a return to
+  the original remote reuses (1 reuse); sibling
+  `pool_snat_persistent_permit_any_remote_reuses_across_remotes` asserts the
+  flag-true path still shares one lease. Copy-restore revert (forced
+  `remote: None` regardless of flag) drove the disabled-flag test RED
+  (`left == right`, both `(203.0.113.10, 40000)`); restored, all 127 nat::
+  tests green.
 
 ## 2026-06-25 — #2778: ddns/surface-a no longer holds the manager mutex across provider I/O
 

@@ -7,19 +7,27 @@ import (
 	"time"
 )
 
-// #2613: the NetFlow v9 and IPFIX templates no longer advertise
-// ipClassOfService/SrcTos (5), tcpControlBits/TCPFlags (6),
-// flowDirection/Direction (61), ingressInterface/InputSNMP (10) or
-// egressInterface/OutputSNMP (14). The SESSION_CLOSE wire frame carries no
-// real value for any of them, so advertising them made collectors ingest
-// authoritative zeros.
+// #2613: the NetFlow v9 and IPFIX templates dropped ipClassOfService/SrcTos
+// (5), tcpControlBits/TCPFlags (6), flowDirection/Direction (61),
+// ingressInterface/InputSNMP (10) and egressInterface/OutputSNMP (14) because
+// the SESSION_CLOSE wire frame carried no real value for any of them, so
+// advertising them made collectors ingest authoritative zeros.
 //
-// These tests are fail-on-revert pins: re-adding any of the five IEs to a
-// template slice (and re-introducing the matching encoder write) shifts the
-// record layout and re-fails both the template-absence walk AND the
+// #2749: ingressInterface/InputSNMP (10) is RE-INTRODUCED with a real value —
+// the ingress ifindex carried on the SESSION_CLOSE frame since #2615. It is
+// appended LAST in both templates, so the proto->packet-counter adjacency the
+// record-layout goldens below check is preserved. The presence-with-real-value
+// of IE 10 is now pinned by TestNetflowIngressInterfacePopulated /
+// TestIPFIXIngressInterfacePopulated.
+//
+// The remaining four (5/6/61/14) stay absent — no wire source exists yet.
+//
+// These tests are fail-on-revert pins: re-adding any of the four still-dropped
+// IEs to a template slice (and re-introducing the matching encoder write)
+// shifts the record layout and re-fails both the template-absence walk AND the
 // record-layout golden, which assert that the bytes immediately after the
 // protocol byte are the packet/byte counters (carrying the REAL values), not
-// a zero TOS/flags/direction/interface block.
+// a zero TOS/flags/direction block.
 
 // --- IPFIX template-absence ------------------------------------------------
 
@@ -28,11 +36,13 @@ import (
 // asserted as literals (independent of the package constants) so a renamed or
 // removed constant cannot make the test agree with itself.
 func TestIPFIXTemplateDroppedFieldsAbsent(t *testing.T) {
+	// #2749: IE 10 (ingressInterface) is intentionally NOT in this set — it is
+	// re-introduced with a real value and pinned present by
+	// TestIPFIXIngressInterfacePopulated.
 	dropped := map[uint16]string{
 		5:  "ipClassOfService",
 		6:  "tcpControlBits",
 		61: "flowDirection",
-		10: "ingressInterface",
 		14: "egressInterface",
 	}
 	for _, tmpl := range [][]ipfixField{ipfixTemplateV4, ipfixTemplateV6} {
