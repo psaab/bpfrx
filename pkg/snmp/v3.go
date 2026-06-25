@@ -158,6 +158,21 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 	}
 	msgFlags := flagsBytes[0]
 
+	// Reject the invalid noAuthPriv security level (RFC 3414 §5): the only
+	// defined levels are noAuthNoPriv, authNoPriv, and authPriv. A message that
+	// requests privacy without authentication (msgFlagPriv set, msgFlagAuth
+	// clear) is malformed — an encrypted PDU MUST be authenticated. Drop it
+	// BEFORE the auth/decrypt path below so its scopedPDU is never decrypted or
+	// executed; doing the decrypt with the auth check skipped would let a sender
+	// who can supply a decryptable PDU bypass HMAC/timeliness verification. We
+	// drop rather than emit a report because, with no authentication, we cannot
+	// produce an authenticated reply at the requested security level and an
+	// unauthenticated report would itself be unverifiable.
+	if msgFlags&msgFlagPriv != 0 && msgFlags&msgFlagAuth == 0 {
+		slog.Debug("SNMPv3: invalid security level (noAuthPriv not supported), dropping")
+		return nil
+	}
+
 	secModel, _, err := berDecodeInteger(rest)
 	if err != nil {
 		slog.Debug("SNMPv3: failed to decode securityModel")
