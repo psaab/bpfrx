@@ -590,10 +590,12 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 				case "prefix-list":
 					// Junos allows repeated `prefix-list` siblings in one
 					// term (match ANY). Accumulate so multiple statements are
-					// all kept, not just the last (#2642).
-					if v := nodeVal(fc); v != "" {
-						term.PrefixList = append(term.PrefixList, v)
-					}
+					// all kept, not just the last (#2642). A bracketed list
+					// `prefix-list [ p1 p2 ]` ALSO collapses onto one leaf's
+					// Keys[1:] / Children in BOTH AST shapes (#2419), so read
+					// every value via the firewallMatchValues SSOT — the prior
+					// nodeVal-only read kept just the first list entry (#2689).
+					term.PrefixList = append(term.PrefixList, firewallMatchValues(fc)...)
 				case "route-filter":
 					if len(fc.Keys) >= 3 {
 						rf := &RouteFilter{
@@ -630,15 +632,19 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 					}
 				case "community":
 					// Repeated `community` siblings match ANY (#2642) — keep
-					// every one, not just the last.
-					if v := nodeVal(fc); v != "" {
-						term.FromCommunity = append(term.FromCommunity, v)
-					}
+					// every one, not just the last. A bracketed list
+					// `community [ c1 c2 ]` ALSO collapses onto one leaf's
+					// Keys[1:] / Children in BOTH AST shapes (#2419), so read
+					// every value via the firewallMatchValues SSOT — the prior
+					// nodeVal-only read kept just the first list entry (#2689).
+					term.FromCommunity = append(term.FromCommunity, firewallMatchValues(fc)...)
 				case "as-path":
-					// Repeated `as-path` siblings match ANY (#2642).
-					if v := nodeVal(fc); v != "" {
-						term.FromASPath = append(term.FromASPath, v)
-					}
+					// Repeated `as-path` siblings match ANY (#2642). A bracketed
+					// list `as-path [ a1 a2 ]` ALSO collapses onto one leaf's
+					// Keys[1:] / Children in BOTH AST shapes (#2419), so read
+					// every value via the firewallMatchValues SSOT — the prior
+					// nodeVal-only read kept just the first list entry (#2689).
+					term.FromASPath = append(term.FromASPath, firewallMatchValues(fc)...)
 				}
 			}
 		case "then":
