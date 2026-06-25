@@ -1,5 +1,38 @@
 # Action Log
 
+## 2026-06-24 — #2646 fix: V_min cadence counter advanced before a confirmed pop
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed a CoS-drain cadence-accuracy bug (residual of #2624).
+  In both `drain_exact_*_to_scratch_flow_fair` fns the cadence counter
+  `queue.v_min.v_min_pop_count = candidate_pop_count` was committed right
+  after the V_min gate but BEFORE the code knew a packet could actually
+  pop. A subsequent post-gate budget-miss or mirror-reserve-miss break
+  exited WITHOUT popping, yet the cadence counter had already advanced —
+  contradicting #2624's "counts POPS THAT ACTUALLY PROCEED" contract and
+  letting a head packet larger than the remaining budget burn cadence
+  positions (skipping mandatory/cadence peer snapshots and counting
+  phantom pops) in the low-budget bursty regime. Moved the commit to
+  immediately AFTER `cos_queue_pop_known_bucket` confirms the pop (the
+  normal pop site and the mirror-reserve-empty-scratch pop site in the
+  Local fn; the single pop site in the Prepared fn). The gate
+  (`cos_queue_v_min_continue`) still runs at `candidate_pop_count` to
+  drive throttle / hard-cap accounting — its throttle-break is unchanged
+  (it breaks before the commit, as in #2624), so the #941 hard-cap retry
+  semantics are preserved; only the post-gate pre-pop breaks now also
+  skip the advance.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/drain.rs,
+  userspace-dp/src/afxdp/cos/queue_ops/v_min_tests.rs,
+  userspace-dp/src/afxdp/cos/README.md, docs/fairness-regimes.md
+- **Validation**: `cargo test --release --bin xpf-userspace-dp` green
+  (2720 passed, 0 failed). Added `vmin_local_drain_budget_miss_does_not_
+  advance_cadence` + `vmin_prepared_drain_budget_miss_does_not_advance_
+  cadence`: gate passes (peer publishes high v_min, local vtime 0) but
+  budget one byte short → no pop, `v_min_pop_count` stays 0; adequate
+  budget → pop, counter == 1. fail-on-revert: re-introducing the commit
+  above the budget break made the Local test report counter 1 vs 0 → red.
+  #2624's `vmin_cadence_persists_across_small_drain_calls` and #941's
+  `vmin_prepared_drain_arms_hard_cap_after_repeated_throttle` still green.
 ## 2026-06-24 — #2661 fix: forward A/AAAA orphaned when reverse PTR update fails
 
 - **Timestamp**: 2026-06-24

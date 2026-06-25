@@ -207,13 +207,28 @@ pub(in crate::afxdp) fn drain_exact_local_items_to_scratch_flow_fair(
         // low/medium load, instead of re-arming the full peer-slot scan
         // on every drain invocation.
         //
+        // #2646: the `v_min_pop_count` commit is deferred to the point
+        // where a pop is CONFIRMED (after peek + budget + mirror-reserve
+        // all pass and `cos_queue_pop_known_bucket` actually removes the
+        // item). The gate (`cos_queue_v_min_continue`) is still
+        // evaluated here at `candidate_pop_count` — it must run to drive
+        // the throttle / hard-cap accounting (`consecutive_v_min_skips`,
+        // suspension arming) — but a POST-GATE no-pop exit (empty peek,
+        // budget miss, mirror-reserve miss, or a pop that returns None)
+        // now breaks WITHOUT advancing the counter. This honors the
+        // #2624 "counts pops that actually proceed" contract: a head
+        // packet larger than the remaining budget no longer burns a
+        // cadence position while draining zero bytes, so the next drain
+        // re-checks at the same position when budget returns. The gate-
+        // throttle path is unchanged (it breaks before the commit, same
+        // as #2624) so the #941 hard-cap retry semantics are preserved.
+        //
         // #941 Work item D: skip the V_min check entirely when this
         // drain is suspended (hard-cap previously armed).
         let candidate_pop_count = queue.v_min.v_min_pop_count.wrapping_add(1);
         if !suspended && !cos_queue_v_min_continue(queue, candidate_pop_count) {
             break;
         }
-        queue.v_min.v_min_pop_count = candidate_pop_count;
         // #1229 v7: cap-aware front/pop. target_bps was sampled
         // once at drain-batch start; same value used for every
         // pop in the batch so the eligible-set is stable.
@@ -244,6 +259,10 @@ pub(in crate::afxdp) fn drain_exact_local_items_to_scratch_flow_fair(
                 else {
                     break;
                 };
+                // #2646: a real pop occurred (the head is removed and
+                // accounted as a mirror-reserve drop) — advance the
+                // cadence counter now that the pop is confirmed.
+                queue.v_min.v_min_pop_count = candidate_pop_count;
                 cos_queue_clear_orphan_snapshot_after_drop(queue);
                 return ExactCoSScratchBuild::MirrorTxFrameReserve { dropped_bytes: len };
             }
@@ -254,6 +273,11 @@ pub(in crate::afxdp) fn drain_exact_local_items_to_scratch_flow_fair(
         else {
             break;
         };
+        // #2646: the pop is confirmed (item removed from the bucket) —
+        // advance the cadence counter now. A budget/mirror/peek/None
+        // break above exited without reaching here, so it did not burn
+        // a cadence position.
+        queue.v_min.v_min_pop_count = candidate_pop_count;
         remaining_root = remaining_root.saturating_sub(len);
         remaining_secondary = remaining_secondary.saturating_sub(len);
 
@@ -481,11 +505,20 @@ pub(in crate::afxdp) fn drain_exact_prepared_items_to_scratch_flow_fair(
         // throttled drain breaks WITHOUT advancing the counter; only a
         // pop that passes the gate advances it (see the Local-flow
         // comment for the full rationale).
+        //
+        // #2646: as in the Local flow-fair drain, the `v_min_pop_count`
+        // commit is deferred until the pop is CONFIRMED (after peek +
+        // budget pass and `cos_queue_pop_known_bucket` removes the
+        // item). The gate still runs here to drive throttle / hard-cap
+        // accounting, but a post-gate no-pop exit (empty peek, Local at
+        // head, budget miss, or a pop that returns None) breaks WITHOUT
+        // advancing the counter — honoring the #2624 "counts pops that
+        // actually proceed" contract while leaving the gate-throttle
+        // (#941 hard-cap) path unchanged.
         let candidate_pop_count = queue.v_min.v_min_pop_count.wrapping_add(1);
         if !suspended && !cos_queue_v_min_continue(queue, candidate_pop_count) {
             break;
         }
-        queue.v_min.v_min_pop_count = candidate_pop_count;
         // #1763 Lever A — fused select+pop (Prepared cap-aware arm).
         // Budget break abandons without popping (1 scan); commit reuses
         // `bucket` (no re-scan). See the Local arm for the invariant.
@@ -504,6 +537,11 @@ pub(in crate::afxdp) fn drain_exact_prepared_items_to_scratch_flow_fair(
         else {
             break;
         };
+        // #2646: the pop is confirmed (item removed from the bucket) —
+        // advance the cadence counter now. A budget/peek/Local-head/None
+        // break above exited without reaching here, so it did not burn
+        // a cadence position.
+        queue.v_min.v_min_pop_count = candidate_pop_count;
         remaining_root = remaining_root.saturating_sub(len);
         remaining_secondary = remaining_secondary.saturating_sub(len);
 

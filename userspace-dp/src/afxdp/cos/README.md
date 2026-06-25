@@ -105,10 +105,24 @@ mod.rs for further file-level breakdown.
   cross-core cache-line ping-pong and defeating the cadence. It is
   counted over POPS THAT ACTUALLY PROCEED — a throttled drain breaks
   WITHOUT advancing it, so the next drain re-checks at the same cadence
-  position (preserving the #941 hard-cap retry semantics). Both flow-fair
-  drains (Local + Prepared) for a queue run on that queue's single owner
-  worker and share the one counter, so it is a plain `u32` with no
-  atomics — the same single-writer model as the sibling
+  position (preserving the #941 hard-cap retry semantics). The counter
+  advances ONLY on a CONFIRMED pop (#2646): the commit
+  (`v_min_pop_count = candidate_pop_count`) is deferred past the gate
+  to the point where the peek succeeds, the root/secondary budget and
+  mirror-reserve checks pass, and `cos_queue_pop_known_bucket` actually
+  removes the item. The gate (`cos_queue_v_min_continue`) is still
+  evaluated at `candidate_pop_count` to drive the throttle / hard-cap
+  accounting, but every POST-GATE no-pop exit (empty peek, wrong-variant
+  head, budget miss, mirror-reserve miss, or a pop that returns None) now
+  breaks without advancing the counter — so a head packet larger than the
+  remaining budget no longer burns a cadence position while draining zero
+  bytes (which would otherwise skip a mandatory/cadence peer snapshot and
+  count a phantom pop in the bursty low-budget regime CoS targets). The
+  gate-throttle path is unchanged (it breaks before the commit, as in
+  #2624), so the #941 hard-cap retry semantics are unaffected. Both
+  flow-fair drains (Local + Prepared) for a queue run on that queue's
+  single owner worker and share the one counter, so it is a plain `u32`
+  with no atomics — the same single-writer model as the sibling
   `consecutive_v_min_skips` / `v_min_suspended_remaining` fields.
 - Prepared CoS items may carry frames from another binding in the same
   shared-UMEM group. Queue overflow, capacity rejection, local

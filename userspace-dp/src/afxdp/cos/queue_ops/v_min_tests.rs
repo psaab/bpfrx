@@ -1346,3 +1346,174 @@ fn vmin_cadence_persists_across_small_drain_calls() {
          drains, not once per call; got {snapshots}",
     );
 }
+
+/// #2646 (Local flow-fair): the V_min cadence counter
+/// (`v_min_pop_count`) must advance only on a pop that ACTUALLY
+/// PROCEEDS. When the gate (`cos_queue_v_min_continue`) PASSES but the
+/// budget check fails (head packet larger than the remaining root/
+/// secondary budget), the drain breaks WITHOUT popping — and the
+/// counter must NOT advance, so the cadence position is preserved for
+/// the next real pop. A subsequent drain with adequate budget pops the
+/// same head and advances the counter exactly once.
+///
+/// fail-on-revert: moving the `queue.v_min.v_min_pop_count =
+/// candidate_pop_count` commit back ABOVE the budget break (the pre-
+/// #2646 placement) makes the budget-miss drain advance the counter →
+/// the first assertion (`== 0`) goes red.
+#[test]
+fn vmin_local_drain_budget_miss_does_not_advance_cadence() {
+    let umem = MmapArea::new(2 * 1024 * 1024).expect("umem");
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "iperf-c".into(),
+            priority: 5,
+            transmit_rate_bytes: 10_000_000_000 / 8,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let queue = &mut root.queues[0];
+    let floor = attach_test_vtime_floor(queue, 4, 1);
+    // Gate PASSES: a peer participates with a high v_min and the local
+    // queue_vtime sits at 0, so the lag check always returns continue ==
+    // true. This isolates the post-gate budget break from the gate-
+    // throttle path.
+    floor.slots[0].publish(u64::MAX - 1);
+    test_flow_fair_state_mut(queue).queue_vtime = 0;
+
+    const PKT: usize = 1500;
+    cos_queue_push_back(queue, test_cos_item(PKT));
+    assert_eq!(queue.v_min.v_min_pop_count, 0, "counter starts at 0");
+
+    // Drain with a root budget SMALLER than the head packet. The gate
+    // passes, the peek succeeds, but the budget check (remaining_root <
+    // len) breaks WITHOUT popping.
+    let mut scratch: Vec<(u64, TxRequest)> = Vec::new();
+    let mut free_tx: VecDeque<u64> = VecDeque::new();
+    free_tx.push_back(0);
+    let _ = drain_exact_local_items_to_scratch_flow_fair(
+        queue,
+        &mut free_tx,
+        &mut scratch,
+        &umem,
+        (PKT as u64) - 1, // root budget one byte short
+        u64::MAX,
+        None,
+    );
+    assert!(scratch.is_empty(), "budget miss must not pop");
+    assert_eq!(
+        queue.v_min.v_min_pop_count, 0,
+        "a post-gate budget miss must NOT advance the V_min cadence counter",
+    );
+
+    // Now drain with adequate budget — the head pops and the counter
+    // advances exactly once.
+    let mut free_tx2: VecDeque<u64> = VecDeque::new();
+    free_tx2.push_back(0);
+    let _ = drain_exact_local_items_to_scratch_flow_fair(
+        queue,
+        &mut free_tx2,
+        &mut scratch,
+        &umem,
+        PKT as u64,
+        u64::MAX,
+        None,
+    );
+    assert_eq!(scratch.len(), 1, "adequate budget must pop the head");
+    assert_eq!(
+        queue.v_min.v_min_pop_count, 1,
+        "a confirmed pop must advance the V_min cadence counter exactly once",
+    );
+}
+
+/// #2646 (Prepared flow-fair): same contract as the Local case above —
+/// a post-gate budget miss must NOT burn a cadence position. The gate
+/// passes, the budget check fails, the drain breaks without popping,
+/// and `v_min_pop_count` stays put; the next adequate-budget drain pops
+/// and advances it once.
+///
+/// fail-on-revert: restoring the commit above the budget break makes
+/// the first (`== 0`) assertion red.
+#[test]
+fn vmin_prepared_drain_budget_miss_does_not_advance_cadence() {
+    let mut umem = MmapArea::new(2 * 1024 * 1024).expect("umem");
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "iperf-c".into(),
+            priority: 5,
+            transmit_rate_bytes: 10_000_000_000 / 8,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let queue = &mut root.queues[0];
+    let floor = attach_test_vtime_floor(queue, 4, 1);
+    // Gate PASSES (see the Local test for the rationale).
+    floor.slots[0].publish(u64::MAX - 1);
+    test_flow_fair_state_mut(queue).queue_vtime = 0;
+
+    const PKT: usize = 1500;
+    let packet = vec![0u8; PKT];
+    let prepared = test_prepared_item_in_umem(&mut umem, 0, &packet, libc::AF_INET as u8);
+    cos_queue_push_back(queue, prepared);
+    assert_eq!(queue.v_min.v_min_pop_count, 0, "counter starts at 0");
+
+    // Budget one byte short of the head — gate passes, budget breaks.
+    let mut scratch: Vec<PreparedTxRequest> = Vec::new();
+    let mut free_tx: VecDeque<u64> = VecDeque::new();
+    let mut pending_fill: VecDeque<u64> = VecDeque::new();
+    let _ = drain_exact_prepared_items_to_scratch_flow_fair(
+        queue,
+        &mut scratch,
+        &umem,
+        &mut free_tx,
+        &mut pending_fill,
+        0,
+        &mut Vec::new(),
+        (PKT as u64) - 1,
+        u64::MAX,
+        None,
+    );
+    assert!(scratch.is_empty(), "budget miss must not pop");
+    assert_eq!(
+        queue.v_min.v_min_pop_count, 0,
+        "a post-gate budget miss must NOT advance the V_min cadence counter (Prepared)",
+    );
+
+    // Adequate budget — head pops, counter advances once.
+    let _ = drain_exact_prepared_items_to_scratch_flow_fair(
+        queue,
+        &mut scratch,
+        &umem,
+        &mut free_tx,
+        &mut pending_fill,
+        0,
+        &mut Vec::new(),
+        PKT as u64,
+        u64::MAX,
+        None,
+    );
+    assert_eq!(scratch.len(), 1, "adequate budget must pop the head (Prepared)");
+    assert_eq!(
+        queue.v_min.v_min_pop_count, 1,
+        "a confirmed pop must advance the V_min cadence counter exactly once (Prepared)",
+    );
+}
