@@ -1057,3 +1057,95 @@ fn post_transform_in_mtu_forwards_no_ptb() {
         "in-inner-MTU transformed frame must forward, no PTB"
     );
 }
+
+// #2783: the egress-MTU decision must size off the IP-DECLARED L3 length
+// (the same authority the PTB builders quote), NOT the AF_XDP buffer
+// length. A buffer carrying ethernet padding / trailing bytes beyond the
+// IP datagram must not mis-fire a PTB for a datagram that actually fits the
+// egress MTU.
+//
+// FAIL-ON-REVERT: reverting `forwarded_egress_mtu_decision` to
+// `frame.len() - l3_offset` (the buffer length) makes both halves of each
+// assertion below FAIL — the padded buffer (> MTU) would emit a spurious
+// PTB even though the declared datagram (<= MTU) fits.
+
+#[test]
+fn v4_trailing_padding_does_not_misfire_ptb() {
+    // Declared L3 = 20 + 8 + 1000 = 1028 <= 1400 MTU (fits, DF set). Append
+    // 500 bytes of ethernet padding / trailing junk so the BUFFER L3 length
+    // is 1528 > 1400. The decision must read total_len (1028), not the
+    // buffer (1528), and forward.
+    let (mut frame, meta) = inbound_v4_udp(1000, true);
+    let l3 = meta.l3_offset as usize;
+    let declared_l3 = frame.len() - l3; // 1028
+    frame.extend(std::iter::repeat(0x00u8).take(500));
+    let buffer_l3 = frame.len() - l3; // 1528
+    assert!(declared_l3 <= 1400 && buffer_l3 > 1400, "test setup");
+
+    assert_eq!(
+        forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, 1400),
+        EgressMtuDecision::Forward,
+        "padded-but-fitting v4 datagram must forward (IP-declared len, not buffer len)"
+    );
+
+    // The inverse: when the DECLARED datagram genuinely exceeds the MTU, the
+    // PTB still fires regardless of any padding — so the fix doesn't suppress
+    // legitimate PTBs. (Declared 1528 > 1400; +500 padding is irrelevant.)
+    let (mut big, big_meta) = inbound_v4_udp(1500, true); // declared 1528
+    big.extend(std::iter::repeat(0x00u8).take(500));
+    assert_eq!(
+        forwarded_egress_mtu_decision(&big, l3, big_meta.addr_family, 1400),
+        EgressMtuDecision::EmitPacketTooBig { next_hop_mtu: 1400 },
+        "genuinely-oversized declared v4 datagram must still emit PTB"
+    );
+}
+
+#[test]
+fn v6_trailing_padding_does_not_misfire_ptb() {
+    // Declared L3 = 40 + 8 + 600 = 648 <= 1280 MTU (fits). Append 800 bytes
+    // of trailing junk so the BUFFER L3 length is 1448 > 1280. The decision
+    // must read 40 + payload_len (648), not the buffer (1448), and forward.
+    let (mut frame, meta) = inbound_v6_udp(600);
+    let l3 = meta.l3_offset as usize;
+    let declared_l3 = frame.len() - l3; // 648
+    frame.extend(std::iter::repeat(0x00u8).take(800));
+    let buffer_l3 = frame.len() - l3; // 1448
+    assert!(declared_l3 <= 1280 && buffer_l3 > 1280, "test setup");
+
+    assert_eq!(
+        forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, 1280),
+        EgressMtuDecision::Forward,
+        "padded-but-fitting v6 datagram must forward (IP-declared len, not buffer len)"
+    );
+
+    // Inverse: a genuinely-oversized declared v6 datagram still emits PTB.
+    let (mut big, big_meta) = inbound_v6_udp(1300); // declared 1348
+    big.extend(std::iter::repeat(0x00u8).take(800));
+    assert_eq!(
+        forwarded_egress_mtu_decision(&big, l3, big_meta.addr_family, 1280),
+        EgressMtuDecision::EmitPacketTooBig { next_hop_mtu: 1280 },
+        "genuinely-oversized declared v6 datagram must still emit PTB"
+    );
+}
+
+#[test]
+fn truncated_ip_header_forwards_fail_open() {
+    // A buffer shorter than the minimum IP header (declared length
+    // unreadable) must fail-open to Forward, never over-read.
+    let (frame, meta) = inbound_v4_udp(1500, true);
+    let l3 = meta.l3_offset as usize;
+    // Truncate to 10 bytes of L3 (< 20-byte IPv4 header).
+    let truncated = frame[..l3 + 10].to_vec();
+    assert_eq!(
+        forwarded_egress_mtu_decision(&truncated, l3, meta.addr_family, 1400),
+        EgressMtuDecision::Forward,
+        "truncated IPv4 header must fail-open to Forward"
+    );
+    let (v6_frame, v6_meta) = inbound_v6_udp(1300);
+    let v6_truncated = v6_frame[..l3 + 20].to_vec(); // < 40-byte IPv6 header
+    assert_eq!(
+        forwarded_egress_mtu_decision(&v6_truncated, l3, v6_meta.addr_family, 1280),
+        EgressMtuDecision::Forward,
+        "truncated IPv6 header must fail-open to Forward"
+    );
+}

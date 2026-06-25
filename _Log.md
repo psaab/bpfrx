@@ -1,3 +1,25 @@
+## 2026-06-25 — #2783: PTB egress-MTU decision uses IP-declared length
+
+- **Timestamp**: 2026-06-25
+- **Action**: `forwarded_egress_mtu_decision` sized the PTB / Frag-Needed
+  decision off the AF_XDP buffer length (`frame.len() - l3_offset`) while
+  the PTB builders quote the IP-declared length (IPv4 `total_len`, IPv6
+  `40 + payload_len`). A buffer carrying ethernet padding / trailing
+  bytes beyond the IP datagram could mis-fire (or mis-size) a PTB for a
+  datagram that actually fits the egress MTU, then quote the smaller
+  declared packet — hiding why the decision fired. Added
+  `ip_declared_l3_len` (the single length authority shared with the
+  builders; `None` on a too-short header → decision fails open to
+  Forward, never over-reads). Reworked the decision to read it; reused
+  the parsed `packet` slice for the existing DF check. Updated the
+  function doc + `userspace-dp/src/afxdp/README.md` PTB contract.
+  Added fail-on-revert tests (v4 + v6 padding-does-not-misfire, genuine
+  oversize still fires, truncated-header fail-open); proven RED when
+  reverted to buffer length, GREEN with the fix.
+- **File(s)**: `userspace-dp/src/afxdp/icmp_ptb.rs`,
+  `userspace-dp/src/afxdp/icmp_ptb_tests.rs`,
+  `userspace-dp/src/afxdp/README.md`
+
 ## 2026-06-25 — #2515: reconcile no_snapshot teardown now refreshes bindings
 
 - **Timestamp**: 2026-06-25
