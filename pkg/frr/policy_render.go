@@ -658,10 +658,15 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				inet6Neighbors = append(inet6Neighbors, n)
 			}
 		}
-		bgpMaxPaths := ecmpMaxPaths
-		if bgp.Multipath > 0 && bgpMaxPaths < bgp.Multipath {
-			bgpMaxPaths = bgp.Multipath
-		}
+		// BGP maximum-paths is driven ONLY by the explicit `protocols bgp
+		// multipath` knob (bgp.Multipath), never seeded from the global
+		// forwarding-table ECMP setting (ecmpMaxPaths). ECMP is a zebra/
+		// kernel forwarding concept; rendering it into the BGP address-
+		// families would silently turn on BGP multipath path-selection the
+		// operator never asked for (#2791). The global ECMP knob still
+		// reaches the IGP `maximum-paths` lines (OSPF/zebra) above via
+		// ecmpMaxPaths.
+		bgpMaxPaths := bgp.Multipath
 		if len(inet4Neighbors) > 0 || bgpMaxPaths > 1 {
 			b.WriteString(" !\n address-family ipv4 unicast\n")
 			if bgpMaxPaths > 1 {
