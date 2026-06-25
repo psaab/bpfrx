@@ -32,19 +32,25 @@ func withFakeIfaceResolver(t *testing.T, byName map[string]int) {
 }
 
 // TestProxyARPIfaceMap_ResolvesRethToPhysical is the #2195/#2197 SMR F6
-// regression guard: a proxy-arp entry on a RETH (sub-)interface must resolve to
-// the PHYSICAL member ifindex (via cfg.RethToPhysical + config.LinuxIfName).
+// regression guard: a proxy-arp entry on a base RETH interface must resolve to
+// the PHYSICAL member ifindex (via cfg.ResolveKernelIfName → RethToPhysical).
 // Losing this resolution in the apply-path extraction would silently break
 // proxy-arp on RETH interfaces (the NTF_PROXY entry / sysctl would land on the
 // wrong — or no — link). The fake resolver only knows the physical member name,
 // so a non-resolving extraction would drop the entry and fail this test.
+//
+// The entry is on unit 0 (untagged, addresses on the base reth), which collapses
+// onto the bare parent netdev — distinct from the VLAN sub-interface case in
+// TestProxyARPIfaceMap_ResolvesVLANSubinterfaceToOwnNetdev (#3010).
 func TestProxyARPIfaceMap_ResolvesRethToPhysical(t *testing.T) {
 	// RethToPhysical is built from Interfaces with RedundantParent set; node 0
 	// is local (slot-0 member preferred). reth0 → ge-0/0/2 (local member).
 	cfg := &config.Config{
 		Interfaces: config.InterfacesConfig{
 			Interfaces: map[string]*config.InterfaceConfig{
-				"reth0":    {Name: "reth0", RedundancyGroup: 1},
+				"reth0": {Name: "reth0", RedundancyGroup: 1, Units: map[int]*config.InterfaceUnit{
+					0: {Number: 0, VlanID: 0},
+				}},
 				"ge-0/0/2": {Name: "ge-0/0/2", RedundantParent: "reth0"},
 				"ge-7/0/2": {Name: "ge-7/0/2", RedundantParent: "reth0"},
 			},
@@ -52,21 +58,80 @@ func TestProxyARPIfaceMap_ResolvesRethToPhysical(t *testing.T) {
 	}
 	cfg.Chassis.Cluster = &config.ClusterConfig{NodeID: 0}
 	cfg.Security.NAT.ProxyARP = []*config.ProxyARPEntry{
-		{Interface: "reth0.50", Addresses: []string{"172.16.50.50/32"}},
+		{Interface: "reth0.0", Addresses: []string{"172.16.50.50/32"}},
 	}
 
-	// reth0 → ge-0/0/2 (local member) → Linux name ge-0-0-2.
+	// reth0 → ge-0/0/2 (local member) → Linux name ge-0-0-2 (unit 0 collapse).
 	const wantIdx = 42
 	linux := config.LinuxIfName("ge-0/0/2")
 	withFakeIfaceResolver(t, map[string]int{linux: wantIdx})
 
 	m := proxyARPIfaceMap(cfg)
-	got, ok := m["reth0.50"]
+	got, ok := m["reth0.0"]
 	if !ok {
-		t.Fatalf("reth0.50 not resolved; map=%v (RETH→physical resolution dropped?)", m)
+		t.Fatalf("reth0.0 not resolved; map=%v (RETH→physical resolution dropped?)", m)
 	}
 	if got != wantIdx {
-		t.Fatalf("reth0.50 ifindex = %d, want %d (physical member %s)", got, wantIdx, linux)
+		t.Fatalf("reth0.0 ifindex = %d, want %d (physical member %s)", got, wantIdx, linux)
+	}
+}
+
+// TestProxyARPIfaceMap_ResolvesVLANSubinterfaceToOwnNetdev is the #3010
+// fail-on-revert guard: a proxy-arp entry on a VLAN sub-interface must resolve
+// to the SUB-INTERFACE's own VLAN netdev ifindex (ge-0-0-1.100), NOT the parent
+// (ge-0-0-1). Linux proxy_arp/proxy_ndp are per-netdev, so storing the parent
+// ifindex writes the sysctl on the parent and leaves the VLAN sub-interface
+// silent — the bug this test pins.
+//
+// The fake resolver knows ONLY the VLAN netdev name (ge-0-0-1.100) and NOT the
+// bare parent, so the old behavior (strip ".unit", resolve only the parent via
+// RethToPhysical + LinuxIfName(base), store the parent ifindex) would call the
+// resolver with "ge-0-0-1", get an error, log+skip, and produce an EMPTY map —
+// failing this test. It also asserts the resolved ifindex is the VLAN netdev's,
+// not the parent's, so a revert that resolved the parent (if the parent were
+// resolvable) would still fail on the wrong-ifindex check.
+//
+// Note the VLAN ID (100) is intentionally DIFFERENT from the unit number (3):
+// the kernel netdev is named by the 802.1Q VLAN ID, not the unit number, so a
+// naive ".unit" re-append (the issue's first-cut suggestion) would resolve the
+// wrong netdev name (ge-0-0-1.3) and also fail this test.
+func TestProxyARPIfaceMap_ResolvesVLANSubinterfaceToOwnNetdev(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"ge-0/0/1": {Name: "ge-0/0/1", Units: map[int]*config.InterfaceUnit{
+					3: {Number: 3, VlanID: 100},
+				}},
+			},
+		},
+	}
+	cfg.Security.NAT.ProxyARP = []*config.ProxyARPEntry{
+		{Interface: "ge-0/0/1.3", Addresses: []string{"10.0.100.50/32"}},
+	}
+
+	// The resolver knows ONLY the VLAN netdev (ge-0-0-1.100), so resolving the
+	// parent (ge-0-0-1) or the wrong suffix (ge-0-0-1.3) yields no entry.
+	const wantIdx = 77
+	const parentIdx = 7
+	vlanNetdev := config.LinuxIfName("ge-0/0/1") + ".100"
+	withFakeIfaceResolver(t, map[string]int{
+		vlanNetdev: wantIdx,
+		// Deliberately also expose the bare parent so a parent-resolving revert
+		// returns the WRONG (parent) ifindex and fails the equality check below,
+		// rather than silently passing by absence.
+		config.LinuxIfName("ge-0/0/1"): parentIdx,
+	})
+
+	m := proxyARPIfaceMap(cfg)
+	got, ok := m["ge-0/0/1.3"]
+	if !ok {
+		t.Fatalf("ge-0/0/1.3 not resolved; map=%v (VLAN sub-interface resolution dropped?)", m)
+	}
+	if got == parentIdx {
+		t.Fatalf("ge-0/0/1.3 resolved to PARENT ifindex %d — proxy_arp would land on the parent netdev, leaving the VLAN sub-interface silent (#3010)", parentIdx)
+	}
+	if got != wantIdx {
+		t.Fatalf("ge-0/0/1.3 ifindex = %d, want %d (VLAN netdev %s)", got, wantIdx, vlanNetdev)
 	}
 }
 

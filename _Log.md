@@ -1,3 +1,28 @@
+## 2026-06-25 — #3010: proxy-ARP/NDP VLAN sub-interface ifindex resolution
+
+- **Timestamp**: 2026-06-25
+- **Action**: `proxyARPIfaceMap` (pkg/daemon/daemon_proxyarp.go) stripped
+  the `.unit` suffix and resolved only the PARENT link via
+  `RethToPhysical` + `LinuxIfName(base)`, storing the parent ifindex for
+  a VLAN sub-interface entry (e.g. `reth0.50`, `ge-0/0/0.100`). Linux
+  `proxy_arp`/`proxy_ndp` are per-netdev, so the per-interface sysctl
+  (and NTF_PROXY scope) landed on the parent netdev and the VLAN
+  sub-interface was left silent — proxy-ARP/NDP on any VLAN
+  sub-interface was non-functional. Fixed by resolving each entry via
+  `cfg.ResolveKernelIfName(entry.Interface)`, the centralized Junos-ref
+  → Linux-netdev resolver, which maps a tagged unit to its 802.1Q VLAN
+  ID (which can differ from the unit number), collapses unit 0 onto the
+  bare parent, preserves the #2195 RETH-physical resolution, and handles
+  the st<N>/IRB/tunnel special cases. Added a fail-on-revert test
+  (`TestProxyARPIfaceMap_ResolvesVLANSubinterfaceToOwnNetdev`) using a
+  VLAN ID (100) deliberately different from the unit number (3): RED if
+  reverted to the parent-ifindex / drop-`.unit` / naive `.unit`-reappend
+  behavior. Updated the RETH test to model a unit and use `reth0.0`
+  (unit-0 collapse) so it stays a clean RETH-physical guard. Updated the
+  module doc comments + `docs/feature-gaps.md` Proxy ARP row.
+- **File(s)**: pkg/daemon/daemon_proxyarp.go,
+  pkg/daemon/daemon_proxyarp_test.go, docs/feature-gaps.md, _Log.md
+
 ## 2026-06-25 — #2969: IPv6 NDP probe `sin6_scope_id` + sendto error surface
 
 - **Timestamp**: 2026-06-25
