@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"syscall"
 	"time"
 
@@ -95,6 +96,23 @@ func (b bindConfig) isSet() bool {
 //
 // Returns nil when no binding is requested (the *dns.Client then uses its
 // default dialer — today's behaviour byte-for-byte).
+//
+// Dual-stack family gate (#2901): the source-bind is applied only when the
+// source-address family MATCHES the dial socket's address family. The dialer is
+// shared by the RFC 2136 backend AND, via newHTTPClientBound (#2846), every HTTP
+// DDNS backend + the checkip probe — dialing endpoints that may resolve to both
+// A and AAAA records. When Go's Happy-Eyeballs dials the family that does NOT
+// match the configured source-address, calling unix.Bind with a SockaddrInet4 on
+// an AF_INET6 socket (or the reverse) fails EAFNOSUPPORT/EINVAL and aborts the
+// whole connection instead of letting it proceed. We therefore key off the
+// Dialer.Control "network" argument ("tcp4"/"tcp6"/"udp4"/"udp6") and SKIP the
+// source-bind on a family mismatch — the mismatched-family dial proceeds with
+// the kernel-chosen source rather than hard-failing. SO_BINDTODEVICE is
+// family-agnostic and is always applied. A configured source-address still
+// constrains the matching family to the operator's source; the unmatched family
+// (which the operator did not provide a source for) simply uses the default
+// source. When network is empty/unsuffixed (no family hint), the bind is applied
+// by source family as before.
 func (b bindConfig) dialer(timeout time.Duration) *net.Dialer {
 	if !b.isSet() {
 		return nil
@@ -103,22 +121,25 @@ func (b bindConfig) dialer(timeout time.Duration) *net.Dialer {
 	dev := b.bindDevice
 	return &net.Dialer{
 		Timeout: timeout,
-		Control: func(_, _ string, c syscall.RawConn) error {
+		Control: func(network, _ string, c syscall.RawConn) error {
 			var serr error
 			if err := c.Control(func(fd uintptr) {
 				if dev != "" {
 					// SO_BINDTODEVICE pins egress to the named device; for a VRF
 					// the device is the VRF master (Linux's VRF socket-binding
-					// model), matching pkg/grpcapi's VRF-bind pattern.
+					// model), matching pkg/grpcapi's VRF-bind pattern. It is
+					// family-agnostic, so it applies on every dial.
 					if e := unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, dev); e != nil {
 						serr = e
 						return
 					}
 				}
-				if src.IsValid() {
+				if src.IsValid() && sourceMatchesDialFamily(src, network) {
 					// Bind the source IP (ephemeral port). unix.Bind on the raw fd
 					// before connect sets the socket's local address for both UDP
-					// and TCP.
+					// and TCP. Only reached when the source family matches the dial
+					// socket's family, so the Sockaddr type can never mismatch the
+					// socket (no EAFNOSUPPORT on a dual-stack lookup, #2901).
 					var sa unix.Sockaddr
 					if src.Is4() {
 						sa = &unix.SockaddrInet4{Addr: src.As4()}
@@ -135,5 +156,24 @@ func (b bindConfig) dialer(timeout time.Duration) *net.Dialer {
 			}
 			return serr
 		},
+	}
+}
+
+// sourceMatchesDialFamily reports whether the source-address family is
+// compatible with the dial socket's address family, as named by the
+// Dialer.Control "network" argument ("tcp4"/"tcp6"/"udp4"/"udp6"). A "4" suffix
+// is an AF_INET socket; a "6" suffix is an AF_INET6 socket. When the network
+// carries no family suffix (e.g. a bare "tcp"/"udp" — the dial family is then
+// chosen by the resolved address and not surfaced here) we cannot prove a
+// mismatch, so we permit the bind and rely on the source family selecting the
+// correct Sockaddr type (pre-#2901 behaviour for the no-hint case).
+func sourceMatchesDialFamily(src netip.Addr, network string) bool {
+	switch {
+	case strings.HasSuffix(network, "4"):
+		return src.Is4()
+	case strings.HasSuffix(network, "6"):
+		return src.Is6()
+	default:
+		return true
 	}
 }
