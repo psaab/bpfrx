@@ -16152,3 +16152,31 @@ top.
   go test ./pkg/config/ + ./pkg/ddns/... pass.
   **File(s)**: pkg/config/secret.go, pkg/config/types_system.go,
   pkg/config/ddns_provider_string_test.go, pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2445 — the WireGuard commit-time validator
+  (validateWireguardPeersStrict / validateOneWireguardTunnel,
+  pkg/config/compiler_validate_wireguard.go) rejected duplicate/malformed
+  pubkeys but explicitly NOT an exact-duplicate allowed-ips prefix across
+  peers. The cryptokey routing table is a prefix->peer map; an exact tie
+  has no longest-prefix winner, so the engine LPM (allowed_ips.rs, stable
+  sort by prefix length) resolves it by insertion order — the second peer
+  can handshake but never carries traffic for that prefix (silent route
+  strip). Added a per-tunnel prefixOwner map keyed by the canonical masked
+  CIDR (canonicalAllowedIPPrefix: net.ParseCIDR -> IPNet.String, so
+  10.0.0.5/24 and 10.0.0.0/24 collide; unparseable strings keyed verbatim
+  — malformed-prefix validation stays the Rust IpNet boundary's concern,
+  orthogonal to #2445). An exact-duplicate prefix on two DIFFERENT peers is
+  now a hard commit error; broader/narrower OVERLAP (0.0.0.0/0 catch-all +
+  more-specific peer) and a same-peer repeat stay valid. Scope: pkg/config
+  validation + test only; no userspace-dp Rust touched. Fail-on-revert
+  proof: copied compiler_validate_wireguard.go aside, removed the
+  prefixOwner block + decl, ran go test ./pkg/config/ -run
+  TestWireguardDuplicateAllowedIPsPrefix... ->
+  TestWireguardDuplicateAllowedIPsPrefixRejected and
+  TestWireguardDuplicateAllowedIPsPrefixHostBitsRejected both FAILED
+  ("must be a commit error"); restored from the copy, all green. Gates:
+  go build ./... clean, gofmt -l clean, go vet ./pkg/config/... clean,
+  go test ./pkg/config/... pass.
+  **File(s)**: pkg/config/compiler_validate_wireguard.go,
+  pkg/config/wireguard_multipeer_test.go, docs/config-schema.md, _Log.md
