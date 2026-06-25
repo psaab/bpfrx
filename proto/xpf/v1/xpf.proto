@@ -512,6 +512,16 @@ message ClearSessionsRequest {
 message ClearSessionsResponse {
   int32 ipv4_cleared = 1;
   int32 ipv6_cleared = 2;
+  // failures counts sub-operations that did NOT complete: iterator
+  // errors, reverse/companion-entry delete failures, and the HA
+  // peer-clear RPC. Zero means the clear fully succeeded. A non-zero
+  // value reports partial success — the cleared counts above are still
+  // accurate for the forward entries that were removed (#2468).
+  int32 failures = 3;
+  // failure_summary is a short human-readable description of the
+  // failures (e.g. "v4 iterate: <err>; peer clear: <err>"). Empty when
+  // failures == 0.
+  string failure_summary = 4;
 }
 
 message ClearCountersRequest {}

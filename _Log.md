@@ -14744,6 +14744,48 @@ top.
   userspace-dp/src/afxdp/forwarding/mod.rs, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2468 — session-clear honestly surfaces sub-operation
+  failures instead of reporting bare success. CLI `clear security flow
+  session ...` now aggregates iterator / forward+reverse delete / DNAT
+  companion delete / HA peer-clear errors and prints a `WARNING: N clear
+  operation(s) failed: <summary>` tail (happy path unchanged). gRPC
+  `ClearSessions` aggregates the same and returns the new
+  `ClearSessionsResponse.failures` + `failure_summary` fields (proto
+  field 3/4, regenerated) — partial-success semantics, accurate cleared
+  counts preserved; bulk clear-all stays a hard RPC error (atomic). CLI
+  `clearPeerSessions`/gRPC `clearPeerSessions` now return errors and the
+  CLI propagates the peer's `failures` tally. Fail-on-revert tests in
+  both packages (silence report()/apply() -> RED). gofmt/vet clean
+  (pre-existing cli.go:460 unreachable-code vet diag untouched).
+  **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/cli/cli_clear.go, pkg/cli/cli_clear_errors_test.go,
+  pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/clear_sessions_errors_test.go, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2468 review fix (finding 6, over-reporting) — the
+  reverse-session and DNAT-companion deletes compute a NAIVE src/dst
+  swap of the forward key, but a NAT'd session's real reverse companion
+  is keyed on the TRANSLATED tuple (val.ReverseKey). The naive-swap key
+  is absent for NAT'd sessions, so DeleteSession/DeleteDNATEntry return
+  ebpf.ErrKeyNotExist on an otherwise-successful clear; the new
+  aggregation was counting that as a failure (spurious WARNING /
+  Failures>0). Fix: reverse + DNAT-companion deletes now use
+  addExceptNotFound, which treats a key-not-found as benign (idempotent)
+  via the new exported dataplane.IsKeyNotFound predicate. The forward
+  delete keeps aggregating ALL errors (a forward key came from
+  iteration, so not-found is a real anomaly). Iterator + peer-clear
+  aggregation unchanged. IsKeyNotFound keeps the cilium/ebpf sentinel
+  behind the dataplane boundary — pkg/cli and pkg/grpcapi must NOT
+  import github.com/cilium/ebpf (retirement-boundary canary). Tests:
+  added NAT-not-found-benign cases (Failures==0, no WARNING) AND a
+  non-not-found reverse-delete error case (still aggregated — guards
+  against under-reporting); renamed the reverse-failure test to
+  forward-delete. Fail-on-revert: breaking the not-found suppression
+  turns the NAT cases RED while the real-error case stays green.
+  **File(s)**: pkg/dataplane/maps_session.go, pkg/cli/cli_clear.go,
+  pkg/cli/cli_clear_errors_test.go, pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/clear_sessions_errors_test.go, _Log.md
   **Action**: #2453 — move the RA sender NDP bind retry OUT of the manager
   mutex critical section. `Manager.startLocked` (under `m.mu`) called
   `sender.start()`, which opened the NDP conn synchronously: `ensureLinkLocal`
