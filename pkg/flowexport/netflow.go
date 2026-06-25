@@ -417,6 +417,13 @@ type Exporter struct {
 	seq   uint32
 	conns *collectorConns
 
+	// #2866: resolves the per-flow src/dst route prefix length (NetFlow IE
+	// 9/13, IPv6 IE 29/30) from the FIB at export time. Nil on a zero-value
+	// exporter (masks stay 0, the pre-#2866 behaviour); the daemon reconcile
+	// path sets it via NewRouteMaskResolver so production records carry the
+	// real matching-route prefix length.
+	MaskResolver MaskResolver
+
 	// Batching: accumulate records, flush periodically
 	batch flowBatch
 
@@ -440,11 +447,12 @@ type Exporter struct {
 // callback so there is exactly one counter per exporter.
 func NewExporter(cfg *ExportConfig) (*Exporter, error) {
 	e := &Exporter{
-		cfg:      cfg,
-		bootTime: time.Now(),
-		sourceID: 1,
-		fieldsV4: buildTemplateFieldsV4(cfg.V9TemplateOpts),
-		fieldsV6: buildTemplateFieldsV6(cfg.V9TemplateOpts),
+		cfg:          cfg,
+		bootTime:     time.Now(),
+		sourceID:     1,
+		fieldsV4:     buildTemplateFieldsV4(cfg.V9TemplateOpts),
+		fieldsV6:     buildTemplateFieldsV6(cfg.V9TemplateOpts),
+		MaskResolver: NewRouteMaskResolver(0),
 	}
 	e.recSizeV4 = recordSize(e.fieldsV4)
 	e.recSizeV6 = recordSize(e.fieldsV6)
@@ -499,6 +507,9 @@ func (e *Exporter) ExportSessionClose(rec logging.EventRecord, evt SessionCloseD
 	natSrcIP, natDstIP, natSrcPort, natDstPort := resolvePostNAT(
 		evt.SrcIP, evt.DstIP, evt.SrcPort, evt.DstPort,
 		evt.NATSrcIP, evt.NATDstIP, evt.NATSrcPort, evt.NATDstPort)
+	// #2866: resolve src/dst route prefix lengths (NetFlow IE 9/13, IPv6 IE
+	// 29/30) from the FIB. Masks default to 0 when no resolver is wired.
+	srcMask, dstMask := resolveMasks(e.MaskResolver, evt.SrcIP, evt.DstIP)
 	fr := FlowRecord{
 		SrcIP:     evt.SrcIP,
 		DstIP:     evt.DstIP,
@@ -510,6 +521,8 @@ func (e *Exporter) ExportSessionClose(rec logging.EventRecord, evt SessionCloseD
 		StartTime: startTime,
 		EndTime:   rec.Time,
 		IsIPv6:    evt.IsIPv6,
+		SrcMask:   srcMask,
+		DstMask:   dstMask,
 		// #2749: ingress ifindex (SNMP ifIndex) -> NetFlow IE 10.
 		InIf:       evt.InIf,
 		NATSrcIP:   natSrcIP,

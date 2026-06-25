@@ -153,6 +153,36 @@ precedent. The remaining fail-on-revert pins live in
 that proves the bytes after `protocol` are the real counters, not a
 sentinel TOS/flags block).
 
+**#2866 — `srcMask` / `dstMask` populated from the FIB.** The NetFlow v9
+templates advertised `srcMask` (IE 9) / `dstMask` (IE 13) and the IPv6
+variants (IE 29 / IE 30) and the v9 encoder wrote `FlowRecord.SrcMask` /
+`.DstMask`, but `ExportSessionClose` never assigned those members, so
+every flow reached collectors with a `/0` mask. (IPFIX did not advertise
+the mask IEs at all.) The mask fields are the prefix length of the
+routing-table entry that matches the flow's source / destination address
+— the same FIB-longest-prefix-match semantics Junos/vSRX export. That
+prefix length is NOT on the SESSION_CLOSE wire frame (unlike the deferred
+#2749 fields, which need a dataplane wire extension), but it IS cheaply
+derivable from the local FIB at export time. `routemask.go` resolves it
+with `netlink.RouteGetWithOptions(ip, {FIBMatch:true})` (RTM_F_FIB_MATCH
+makes the kernel report the matched FIB entry's prefix, so a default-route
+match returns the real `/0` rather than echoing the queried host as a
+`/32`), behind a short-TTL cache (`routeMaskCache`, default 10s) so the
+per-flow close path does not issue an RTM_GETROUTE syscall per record.
+`Exporter` / `IPFIXExporter` carry a `MaskResolver` func (defaulted by
+`NewExporter`/`NewIPFIXExporter` to `NewRouteMaskResolver`; nil on a
+zero-value exporter → masks stay 0, the pre-#2866 behaviour and the test
+seam). `ExportSessionClose` calls it for the pre-NAT src/dst IP. IPFIX
+also gains the four mask IEs (9/13/29/30, 1 byte each), placed in the same
+record slot as the v9 masks (after `flowEnd`, before `ingressInterface`)
+so the two protocols keep a parallel layout; the IPFIX record sizes grow
+by 2 bytes (v4 61→63, v6 109→111). Presence-with-real-value is pinned by
+`srcmask_dstmask_test.go` (`TestNetflowSrcDstMaskPopulated` /
+`TestIPFIXSrcDstMaskPopulated`: the template advertises the mask IE AND
+the encoded record carries the resolved prefix length, not zero — a
+deterministic injected resolver keeps the test free of a kernel-FIB
+dependency).
+
 ## File layout
 
 The package is split by responsibility (#1988):
@@ -166,6 +196,10 @@ The package is split by responsibility (#1988):
   that drives it.
 - `ipfix.go` — IPFIX (v10) template/record encoding and the
   `IPFIXExporter` that drives it.
+- `routemask.go` — the `MaskResolver` func type and
+  `NewRouteMaskResolver` (#2866): a TTL-cached FIB longest-prefix-match
+  lookup that resolves a flow's `srcMask`/`dstMask` (route prefix length)
+  at export time, plus the `resolveMasks` helper both exporters call.
 - `transport.go` — shared collector connection management
   (`collectorConns`: dial / fan-out write / close) and the per-family
   batch accumulator (`flowBatch`) used by both exporters. `dialCollectors`
