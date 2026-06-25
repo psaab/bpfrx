@@ -136,7 +136,9 @@ func (c *CLI) handleClearSecurity(args []string) error {
 			return fmt.Errorf("clear sessions: %w", err)
 		}
 		fmt.Printf("%d IPv4 and %d IPv6 session entries cleared\n", v4, v6)
-		c.clearPeerSessions(nil)
+		var agg sessionClearErrors
+		agg.add("peer clear", c.clearPeerSessions(nil))
+		agg.report()
 		return nil
 
 	case "policies":
@@ -184,11 +186,14 @@ func (c *CLI) clearFilteredSessions(f sessionFilter) error {
 
 	v4Deleted := 0
 	v6Deleted := 0
+	var agg sessionClearErrors
 
 	var v4Keys []dataplane.SessionKey
 	var v4RevKeys []dataplane.SessionKey
 	var snatDNATKeys []dataplane.DNATKey
-	_ = c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	// Enumeration failure must be surfaced: a partial scan silently
+	// skips sessions the operator asked to clear (#2468).
+	agg.add("v4 iterate", c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
@@ -212,24 +217,26 @@ func (c *CLI) clearFilteredSessions(f sessionFilter) error {
 			})
 		}
 		return true
-	})
+	}))
 
 	for _, key := range v4Keys {
-		if err := c.dp.DeleteSession(key); err == nil {
+		if err := c.dp.DeleteSession(key); err != nil {
+			agg.add("v4 forward delete", err)
+		} else {
 			v4Deleted++
 		}
 	}
 	for _, key := range v4RevKeys {
-		c.dp.DeleteSession(key)
+		agg.add("v4 reverse delete", c.dp.DeleteSession(key))
 	}
 	for _, dk := range snatDNATKeys {
-		c.dp.DeleteDNATEntry(dk)
+		agg.add("v4 DNAT companion delete", c.dp.DeleteDNATEntry(dk))
 	}
 
 	var v6Keys []dataplane.SessionKeyV6
 	var v6RevKeys []dataplane.SessionKeyV6
 	var snatDNATKeysV6 []dataplane.DNATKeyV6
-	_ = c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	agg.add("v6 iterate", c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
@@ -253,39 +260,86 @@ func (c *CLI) clearFilteredSessions(f sessionFilter) error {
 			})
 		}
 		return true
-	})
+	}))
 
 	for _, key := range v6Keys {
-		if err := c.dp.DeleteSessionV6(key); err == nil {
+		if err := c.dp.DeleteSessionV6(key); err != nil {
+			agg.add("v6 forward delete", err)
+		} else {
 			v6Deleted++
 		}
 	}
 	for _, key := range v6RevKeys {
-		c.dp.DeleteSessionV6(key)
+		agg.add("v6 reverse delete", c.dp.DeleteSessionV6(key))
 	}
 	for _, dk := range snatDNATKeysV6 {
-		c.dp.DeleteDNATEntryV6(dk)
+		agg.add("v6 DNAT companion delete", c.dp.DeleteDNATEntryV6(dk))
 	}
 
 	fmt.Printf("%d IPv4 and %d IPv6 matching sessions cleared\n", v4Deleted, v6Deleted)
-	c.clearPeerSessions(&f)
+	agg.add("peer clear", c.clearPeerSessions(&f))
+	agg.report()
 	return nil
 }
 
-func (c *CLI) clearPeerSessions(f *sessionFilter) {
-	if c.cluster == nil {
+// sessionClearErrors accumulates per-operation failures during a CLI
+// session clear (iterator, forward/reverse/companion deletes, and the
+// HA peer-clear RPC) so the operator sees the full failure picture
+// instead of a bare success line (#2468). nil errors are ignored.
+type sessionClearErrors struct {
+	count int
+	parts []string
+}
+
+func (e *sessionClearErrors) add(op string, err error) {
+	if err == nil {
 		return
+	}
+	e.count++
+	e.parts = append(e.parts, fmt.Sprintf("%s: %v", op, err))
+}
+
+// report prints a warning line to stdout if any sub-operation failed.
+// The cleared-count line is printed by the caller and stays accurate
+// for the forward entries that were removed; this adds the honest
+// failure tail.
+func (e *sessionClearErrors) report() {
+	if e.count == 0 {
+		return
+	}
+	fmt.Printf("WARNING: %d clear operation(s) failed: %s\n", e.count, strings.Join(e.parts, "; "))
+}
+
+// clearPeerSessions forwards the clear to the HA peer. Returns a
+// non-nil error when the peer is unreachable or its clear failed (or
+// only partially succeeded) so the caller can report it to the operator
+// rather than silently leaving the peer holding the sessions (#2468).
+//
+// A standalone node (no cluster manager) has no peer and returns nil —
+// not a failure.
+func (c *CLI) clearPeerSessions(f *sessionFilter) error {
+	if c.cluster == nil {
+		return nil
 	}
 	conn := c.dialPeer()
 	if conn == nil {
-		return
+		return fmt.Errorf("peer unreachable")
 	}
 	defer conn.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req := buildPeerClearRequest(f)
 	ctx = metadata.AppendToOutgoingContext(ctx, "x-peer-forwarded", "1")
-	_, _ = pb.NewBpfrxServiceClient(conn).ClearSessions(ctx, req)
+	resp, err := pb.NewBpfrxServiceClient(conn).ClearSessions(ctx, req)
+	if err != nil {
+		return err
+	}
+	// The peer reports its own partial-failure tally — propagate it so a
+	// local operator learns the peer clear was incomplete.
+	if resp != nil && resp.Failures > 0 {
+		return fmt.Errorf("peer reported %d failure(s): %s", resp.Failures, resp.FailureSummary)
+	}
+	return nil
 }
 
 // buildPeerClearRequest translates a local session filter into the

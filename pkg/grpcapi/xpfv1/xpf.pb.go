@@ -5394,11 +5394,21 @@ func (x *ClearSessionsRequest) GetSourceNatPool() string {
 }
 
 type ClearSessionsResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ipv4Cleared   int32                  `protobuf:"varint,1,opt,name=ipv4_cleared,json=ipv4Cleared,proto3" json:"ipv4_cleared,omitempty"`
-	Ipv6Cleared   int32                  `protobuf:"varint,2,opt,name=ipv6_cleared,json=ipv6Cleared,proto3" json:"ipv6_cleared,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Ipv4Cleared int32                  `protobuf:"varint,1,opt,name=ipv4_cleared,json=ipv4Cleared,proto3" json:"ipv4_cleared,omitempty"`
+	Ipv6Cleared int32                  `protobuf:"varint,2,opt,name=ipv6_cleared,json=ipv6Cleared,proto3" json:"ipv6_cleared,omitempty"`
+	// failures counts sub-operations that did NOT complete: iterator
+	// errors, reverse/companion-entry delete failures, and the HA
+	// peer-clear RPC. Zero means the clear fully succeeded. A non-zero
+	// value reports partial success — the cleared counts above are still
+	// accurate for the forward entries that were removed (#2468).
+	Failures int32 `protobuf:"varint,3,opt,name=failures,proto3" json:"failures,omitempty"`
+	// failure_summary is a short human-readable description of the
+	// failures (e.g. "v4 iterate: <err>; peer clear: <err>"). Empty when
+	// failures == 0.
+	FailureSummary string `protobuf:"bytes,4,opt,name=failure_summary,json=failureSummary,proto3" json:"failure_summary,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ClearSessionsResponse) Reset() {
@@ -5443,6 +5453,20 @@ func (x *ClearSessionsResponse) GetIpv6Cleared() int32 {
 		return x.Ipv6Cleared
 	}
 	return 0
+}
+
+func (x *ClearSessionsResponse) GetFailures() int32 {
+	if x != nil {
+		return x.Failures
+	}
+	return 0
+}
+
+func (x *ClearSessionsResponse) GetFailureSummary() string {
+	if x != nil {
+		return x.FailureSummary
+	}
+	return ""
 }
 
 type ClearCountersRequest struct {
@@ -7332,10 +7356,12 @@ const file_xpf_proto_rawDesc = "" +
 	"\tinterface\x18\b \x01(\tR\tinterface\x12\x19\n" +
 	"\bnat_only\x18\t \x01(\bR\anatOnly\x12&\n" +
 	"\x0fsource_nat_pool\x18\n" +
-	" \x01(\tR\rsourceNatPool\"]\n" +
+	" \x01(\tR\rsourceNatPool\"\xa2\x01\n" +
 	"\x15ClearSessionsResponse\x12!\n" +
 	"\fipv4_cleared\x18\x01 \x01(\x05R\vipv4Cleared\x12!\n" +
-	"\fipv6_cleared\x18\x02 \x01(\x05R\vipv6Cleared\"\x16\n" +
+	"\fipv6_cleared\x18\x02 \x01(\x05R\vipv6Cleared\x12\x1a\n" +
+	"\bfailures\x18\x03 \x01(\x05R\bfailures\x12'\n" +
+	"\x0ffailure_summary\x18\x04 \x01(\tR\x0efailureSummary\"\x16\n" +
 	"\x14ClearCountersRequest\"\x17\n" +
 	"\x15ClearCountersResponse\"\x18\n" +
 	"\x16GetNATPoolStatsRequest\"\xc9\x01\n" +

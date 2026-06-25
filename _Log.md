@@ -14742,3 +14742,22 @@ top.
   pkg/api/metrics_surface_a_ddns_test.go, pkg/cli/cli_show_services.go,
   pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
   userspace-dp/src/afxdp/forwarding/mod.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2468 — session-clear honestly surfaces sub-operation
+  failures instead of reporting bare success. CLI `clear security flow
+  session ...` now aggregates iterator / forward+reverse delete / DNAT
+  companion delete / HA peer-clear errors and prints a `WARNING: N clear
+  operation(s) failed: <summary>` tail (happy path unchanged). gRPC
+  `ClearSessions` aggregates the same and returns the new
+  `ClearSessionsResponse.failures` + `failure_summary` fields (proto
+  field 3/4, regenerated) — partial-success semantics, accurate cleared
+  counts preserved; bulk clear-all stays a hard RPC error (atomic). CLI
+  `clearPeerSessions`/gRPC `clearPeerSessions` now return errors and the
+  CLI propagates the peer's `failures` tally. Fail-on-revert tests in
+  both packages (silence report()/apply() -> RED). gofmt/vet clean
+  (pre-existing cli.go:460 unreachable-code vet diag untouched).
+  **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/cli/cli_clear.go, pkg/cli/cli_clear_errors_test.go,
+  pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/clear_sessions_errors_test.go, _Log.md

@@ -734,15 +734,21 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 		!req.NatOnly && req.SourceNatPool == "" {
 		v4, v6, err := s.dp.ClearAllSessions()
 		if err != nil {
+			// Bulk clear-all is atomic in the dataplane: a failure means
+			// nothing was reliably cleared, so this stays a hard RPC error
+			// rather than a partial-success count.
 			return nil, status.Errorf(codes.Internal, "%v", err)
 		}
+		var agg clearErrors
 		if !forwarded {
-			s.clearPeerSessions(req)
+			agg.add("peer clear", s.clearPeerSessions(req))
 		}
-		return &pb.ClearSessionsResponse{
+		resp := &pb.ClearSessionsResponse{
 			Ipv4Cleared: int32(v4),
 			Ipv6Cleared: int32(v6),
-		}, nil
+		}
+		agg.apply(resp)
+		return resp, nil
 	}
 
 	// Build the SAME filter the show path uses (matchV4/matchV6) so
@@ -778,12 +784,16 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 		return nil, err
 	}
 
+	var agg clearErrors
+
 	// Clear matching IPv4 sessions
 	v4Deleted := 0
 	var v4Keys []dataplane.SessionKey
 	var v4RevKeys []dataplane.SessionKey
 	var snatDNATKeys []dataplane.DNATKey
-	_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	// Enumeration failure must be surfaced: a partial scan means the
+	// clear silently misses sessions the operator asked to remove.
+	agg.add("v4 iterate", s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if !filter.matchV4(key, val) {
 			return true
 		}
@@ -804,18 +814,20 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 			})
 		}
 		return true
-	})
+	}))
 
 	for _, key := range v4Keys {
-		if err := s.dp.DeleteSession(key); err == nil {
+		if err := s.dp.DeleteSession(key); err != nil {
+			agg.add("v4 forward delete", err)
+		} else {
 			v4Deleted++
 		}
 	}
 	for _, key := range v4RevKeys {
-		s.dp.DeleteSession(key)
+		agg.add("v4 reverse delete", s.dp.DeleteSession(key))
 	}
 	for _, dk := range snatDNATKeys {
-		s.dp.DeleteDNATEntry(dk)
+		agg.add("v4 DNAT companion delete", s.dp.DeleteDNATEntry(dk))
 	}
 
 	// Clear matching IPv6 sessions
@@ -823,7 +835,7 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 	var v6Keys []dataplane.SessionKeyV6
 	var v6RevKeys []dataplane.SessionKeyV6
 	var snatDNATKeysV6 []dataplane.DNATKeyV6
-	_ = s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	agg.add("v6 iterate", s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if !filter.matchV6(key, val) {
 			return true
 		}
@@ -844,41 +856,88 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 			})
 		}
 		return true
-	})
+	}))
 
 	for _, key := range v6Keys {
-		if err := s.dp.DeleteSessionV6(key); err == nil {
+		if err := s.dp.DeleteSessionV6(key); err != nil {
+			agg.add("v6 forward delete", err)
+		} else {
 			v6Deleted++
 		}
 	}
 	for _, key := range v6RevKeys {
-		s.dp.DeleteSessionV6(key)
+		agg.add("v6 reverse delete", s.dp.DeleteSessionV6(key))
 	}
 	for _, dk := range snatDNATKeysV6 {
-		s.dp.DeleteDNATEntryV6(dk)
+		agg.add("v6 DNAT companion delete", s.dp.DeleteDNATEntryV6(dk))
 	}
 
 	if !forwarded {
-		s.clearPeerSessions(req)
+		agg.add("peer clear", s.clearPeerSessions(req))
 	}
-	return &pb.ClearSessionsResponse{
+	resp := &pb.ClearSessionsResponse{
 		Ipv4Cleared: int32(v4Deleted),
 		Ipv6Cleared: int32(v6Deleted),
-	}, nil
+	}
+	agg.apply(resp)
+	return resp, nil
 }
 
 // clearPeerSessions forwards a ClearSessions request to the cluster peer.
-// Uses x-peer-forwarded metadata to prevent infinite recursion.
-func (s *Server) clearPeerSessions(req *pb.ClearSessionsRequest) {
+// Uses x-peer-forwarded metadata to prevent infinite recursion. Returns
+// a non-nil error if the peer is unreachable or its clear failed so the
+// caller can report the partial success (#2468) rather than silently
+// leaving the peer holding the sessions.
+//
+// A standalone node (no cluster manager) has no peer to clear and
+// returns nil — not a failure.
+func (s *Server) clearPeerSessions(req *pb.ClearSessionsRequest) error {
+	if s.cluster == nil {
+		return nil
+	}
 	conn, err := s.dialPeer()
 	if err != nil {
-		return
+		return fmt.Errorf("dial peer: %w", err)
 	}
 	defer conn.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	ctx = metadata.AppendToOutgoingContext(ctx, "x-peer-forwarded", "1")
-	_, _ = pb.NewBpfrxServiceClient(conn).ClearSessions(ctx, req)
+	if _, err := pb.NewBpfrxServiceClient(conn).ClearSessions(ctx, req); err != nil {
+		return fmt.Errorf("peer ClearSessions: %w", err)
+	}
+	return nil
+}
+
+// clearErrors accumulates per-operation failures across a session clear
+// without aborting the clear: enumeration, forward/reverse/companion
+// deletes, and the HA peer-clear RPC each report independently so an
+// operator sees the FULL failure picture instead of a bare success
+// (#2468). nil errors (the common case) are ignored.
+type clearErrors struct {
+	count int
+	parts []string
+}
+
+// add records a failed sub-operation. nil errors are no-ops.
+func (e *clearErrors) add(op string, err error) {
+	if err == nil {
+		return
+	}
+	e.count++
+	e.parts = append(e.parts, fmt.Sprintf("%s: %v", op, err))
+}
+
+// summary returns a single-line description of all accumulated failures.
+func (e *clearErrors) summary() string {
+	return strings.Join(e.parts, "; ")
+}
+
+// apply records the accumulated failure count and summary on the
+// response so a remote caller learns the clear was partial.
+func (e *clearErrors) apply(resp *pb.ClearSessionsResponse) {
+	resp.Failures = int32(e.count)
+	resp.FailureSummary = e.summary()
 }
 
 func sessionStateName(state uint8) string {
