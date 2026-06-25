@@ -113,6 +113,41 @@ subtree with an IPv6 `fixed-address`.)
   separate companion gap, #2239.) ISC Kea handles static reservations
   entirely in the config file, independent of its HA hook.
 
+## Stable subnet IDs — #2668
+
+`generateKea4Config`/`generateKea6Config` assign each rendered subnet a Kea
+`subnet_id` (the `id` field of `subnet4`/`subnet6`). Kea binds memfile leases
+(`kea-leases4.csv`/`kea-leases6.csv`) to a subnet by the `subnet_id` COLUMN,
+so the ID a subnet receives MUST be stable across config regenerations
+(commit / reload) — a shifted ID remaps live leases onto the wrong
+subnet/pool and corrupts diagnostics, lease-sync, and DDNS (which keys
+desired records by SubnetID, #2663).
+
+The IDs are assigned over a DETERMINISTIC order:
+
+- **Groups** are sorted by name (`stableGroups`). The config holds groups in
+  a Go map, whose iteration order is RANDOMIZED — ranging it directly was the
+  #2668 bug: the same subnet could get a different `subnet_id` on every
+  regeneration of an UNCHANGED config.
+- **Pools** within a group are sorted by subnet, then name (`stablePools`),
+  so a pool keeps its `subnet_id` even if it is reordered within the group's
+  config list. The subnet string is the natural key Kea binds a lease to.
+- The `interfaces-config.interfaces` list is collected over the same sorted
+  group order, so it is deterministic too.
+
+Stability level: SORTED-BY-NAME (not a persisted name→id map). This removes
+the randomization — the actual reported defect — so an unchanged config
+always renders identical `subnet_id`s. The weaker guarantee is that
+INSERTING a group/pool whose sort key lands in the middle shifts the IDs of
+all later subnets (a persistent name→id store would avoid that). Add/remove
+is a deliberate operator config change, not the per-reload churn #2668 is
+about, and a persisted ID map adds a new on-disk state file plus its own
+HA-sync and stale-entry-GC concerns; the regression guard
+(`TestKeaSubnetIDStableAcrossRegenerations`) pins the sorted ordering and is
+the failure mode that bit production. If add/remove lease-remapping becomes a
+concern, layering a persistent map on top of this stable order is the next
+increment.
+
 ## Expired-lease reclamation — #1387 (stale-lease-cleanup slice / Path S)
 
 The "stale lease cleanup" half of #1387. Kea keeps an expired / released /
@@ -466,7 +501,8 @@ What increment 2 ships (the feasible, CI-testable slice):
   ONLY its own MASTER-RG leases — the two nodes' input sets are disjoint by RG
   ownership, so dueling writers are impossible. The gate reads
   `snapshotRethMasterState` ONLY (the same source the Kea manager uses), never
-  the map-order-assigned, per-render-unstable `subnet_id`. A BACKUP-for-all
+  the `subnet_id` (which is now reload-stable per #2668, but the gate still
+  reads RG master state, not the ID). A BACKUP-for-all
   node STOPS WRITING — it does NOT withdraw valid records (the peer MASTER
   owns them; deletion is lease-state / config-removal driven only). The
   async-takeover ordering (Kea `ApplyAsync` may lag the DDNS nudge) is benign:

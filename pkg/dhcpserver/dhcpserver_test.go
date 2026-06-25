@@ -1055,3 +1055,145 @@ func TestApplyAsyncConcurrentProducersHighestGenWins(t *testing.T) {
 		t.Fatalf("lastAppliedGen = %d, want %d", last, pend.gen)
 	}
 }
+
+// multiGroupV4Config builds a 3-group / multi-pool DHCPv4 config whose
+// stable (sorted) subnet_id assignment is known. Group names are chosen so
+// lexical order (alpha, mid, zeta) differs from any natural map-insert order.
+func multiGroupV4Config() *config.DHCPServerConfig {
+	return &config.DHCPServerConfig{
+		DHCPLocalServer: &config.DHCPLocalServerConfig{
+			Groups: map[string]*config.DHCPServerGroup{
+				"zeta": {Name: "zeta", Interfaces: []string{"ge-0-0-2"}, Pools: []*config.DHCPPool{
+					{Name: "z0", Subnet: "10.0.3.0/24", RangeLow: "10.0.3.10", RangeHigh: "10.0.3.20"},
+				}},
+				"alpha": {Name: "alpha", Interfaces: []string{"ge-0-0-0"}, Pools: []*config.DHCPPool{
+					// Declared out of subnet order to exercise stablePools.
+					{Name: "a1", Subnet: "10.0.1.128/25", RangeLow: "10.0.1.130", RangeHigh: "10.0.1.140"},
+					{Name: "a0", Subnet: "10.0.1.0/25", RangeLow: "10.0.1.10", RangeHigh: "10.0.1.20"},
+				}},
+				"mid": {Name: "mid", Interfaces: []string{"ge-0-0-1"}, Pools: []*config.DHCPPool{
+					{Name: "m0", Subnet: "10.0.2.0/24", RangeLow: "10.0.2.10", RangeHigh: "10.0.2.20"},
+				}},
+			},
+		},
+	}
+}
+
+func multiGroupV6Config() *config.DHCPServerConfig {
+	return &config.DHCPServerConfig{
+		DHCPv6LocalServer: &config.DHCPLocalServerConfig{
+			Groups: map[string]*config.DHCPServerGroup{
+				"zeta": {Name: "zeta", Interfaces: []string{"ge-0-0-2"}, Pools: []*config.DHCPPool{
+					{Name: "z0", Subnet: "2001:db8:3::/64", RangeLow: "2001:db8:3::10", RangeHigh: "2001:db8:3::20"},
+				}},
+				"alpha": {Name: "alpha", Interfaces: []string{"ge-0-0-0"}, Pools: []*config.DHCPPool{
+					{Name: "a1", Subnet: "2001:db8:1:8000::/65", RangeLow: "2001:db8:1:8000::10", RangeHigh: "2001:db8:1:8000::20"},
+					{Name: "a0", Subnet: "2001:db8:1::/65", RangeLow: "2001:db8:1::10", RangeHigh: "2001:db8:1::20"},
+				}},
+				"mid": {Name: "mid", Interfaces: []string{"ge-0-0-1"}, Pools: []*config.DHCPPool{
+					{Name: "m0", Subnet: "2001:db8:2::/64", RangeLow: "2001:db8:2::10", RangeHigh: "2001:db8:2::20"},
+				}},
+			},
+		},
+	}
+}
+
+// subnetIDMap reads the rendered Kea conf and returns subnet -> id.
+func subnetIDMap(t *testing.T, path, family string) map[string]int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type sub struct {
+		ID     int    `json:"id"`
+		Subnet string `json:"subnet"`
+	}
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	var inner struct {
+		Subnet4 []sub `json:"subnet4"`
+		Subnet6 []sub `json:"subnet6"`
+	}
+	if err := json.Unmarshal(out["Dhcp"+family], &inner); err != nil {
+		t.Fatal(err)
+	}
+	subs := inner.Subnet4
+	if family == "6" {
+		subs = inner.Subnet6
+	}
+	res := make(map[string]int, len(subs))
+	for _, s := range subs {
+		if prev, dup := res[s.Subnet]; dup {
+			t.Fatalf("duplicate subnet %s (ids %d and %d)", s.Subnet, prev, s.ID)
+		}
+		res[s.Subnet] = s.ID
+	}
+	return res
+}
+
+// TestKeaSubnetIDStableAcrossRegenerations is the #2668 regression guard.
+// Kea binds memfile leases to subnets by the subnet_id column, so the SAME
+// subnet MUST receive the SAME subnet_id on every config regeneration. The
+// assignment used to range the randomized Groups map, so reverting to that
+// makes this test flaky (a wrong mapping eventually appears across the N
+// regenerations); the sorted assignment never does. The expected mapping is
+// the golden sorted order: groups by name (alpha, mid, zeta), pools by
+// subnet within each group.
+func TestKeaSubnetIDStableAcrossRegenerations(t *testing.T) {
+	// Golden expected subnet_id, derived from the deterministic order:
+	//   alpha/10.0.1.0/25=1, alpha/10.0.1.128/25=2, mid/10.0.2.0/24=3,
+	//   zeta/10.0.3.0/24=4.
+	wantV4 := map[string]int{
+		"10.0.1.0/25":   1,
+		"10.0.1.128/25": 2,
+		"10.0.2.0/24":   3,
+		"10.0.3.0/24":   4,
+	}
+	// NOTE: stablePools sorts by the literal subnet STRING, and
+	// "2001:db8:1:8000::/65" < "2001:db8:1::/65" lexically ('8' (0x38) <
+	// ':' (0x3a) at the 4th hextet), so the 8000 half-subnet gets id 1.
+	// The exact ordering does not matter for correctness — only that it is
+	// STABLE — but the golden pins it so an accidental reorder is caught.
+	wantV6 := map[string]int{
+		"2001:db8:1:8000::/65": 1,
+		"2001:db8:1::/65":      2,
+		"2001:db8:2::/64":      3,
+		"2001:db8:3::/64":      4,
+	}
+
+	const regens = 50 // enough to surface map-order randomization on revert
+	for i := 0; i < regens; i++ {
+		mv4, _ := testManager(t, map[string]bool{}, "")
+		if err := mv4.generateKea4Config(multiGroupV4Config()); err != nil {
+			t.Fatalf("generateKea4Config[%d]: %v", i, err)
+		}
+		got := subnetIDMap(t, mv4.confPath4, "4")
+		if !mapsEqualSI(got, wantV4) {
+			t.Fatalf("v4 regen %d: subnet_id mapping %v != golden %v", i, got, wantV4)
+		}
+
+		mv6, _ := testManager(t, map[string]bool{}, "")
+		if err := mv6.generateKea6Config(multiGroupV6Config()); err != nil {
+			t.Fatalf("generateKea6Config[%d]: %v", i, err)
+		}
+		got6 := subnetIDMap(t, mv6.confPath6, "6")
+		if !mapsEqualSI(got6, wantV6) {
+			t.Fatalf("v6 regen %d: subnet_id mapping %v != golden %v", i, got6, wantV6)
+		}
+	}
+}
+
+func mapsEqualSI(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
