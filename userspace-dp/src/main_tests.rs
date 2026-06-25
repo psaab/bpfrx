@@ -351,6 +351,100 @@ fn queue_planner_and_plan_key_agree_on_binding_set() {
     );
 }
 
+// #2916 fail-on-revert: the same-plan fast path in `apply_snapshot`
+// (`handlers/snapshot.rs`) skips `replan_queues` whenever the plan key is
+// unchanged. That is only sound if EVERY field `replan_queues` reads to build
+// the binding layout is also hashed into `snapshot_binding_plan_key`. If a
+// planner-consumed field were dropped from the hash, two snapshots that
+// produce DIFFERENT layouts could share a key, the apply path would take the
+// same-plan branch, and the live AF_XDP worker layout would stay stale.
+//
+// #2915 unified the candidate SET (both paths filter through
+// `include_userspace_binding_interface`). This test pins the remaining half of
+// the #2916 invariant: for a single candidate interface, mutating ANY of the
+// three fields `replan_queues` consumes to construct the layout — `linux_name`
+// (candidate identity + dedup key), `ifindex` (per-binding ifindex, drives
+// registered/armed/ready gating), and `rx_queues` (queue_count) — MUST bump
+// the plan key. Each property is paired with a `replan_queues` assertion
+// proving the mutated field actually changes the produced layout, so the test
+// cannot be satisfied by a field that the planner ignores.
+//
+// Revert proof: drop any one of `linux_name`, `ifindex`, or `rx_queues` from
+// the `iface=...` segment in `update_snapshot_binding_plan_key` and the
+// matching property goes RED — a real layout change becomes invisible to the
+// same-plan branch.
+#[test]
+fn plan_key_covers_every_replan_queues_input() {
+    use crate::server::helpers::{replan_queues, snapshot_binding_plan_key};
+
+    let mk = |linux_name: &str, ifindex: i32, rx_queues: usize| ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0/0/1".to_string(),
+            linux_name: linux_name.to_string(),
+            zone: "trust".to_string(),
+            ifindex,
+            rx_queues,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let base = mk("ge-0-0-1", 11, 2);
+    let base_key = snapshot_binding_plan_key(&base);
+    let base_layout: Vec<(String, i32, u32)> = replan_queues(Some(&base), 2, &[])
+        .iter()
+        .map(|b| (b.interface.clone(), b.ifindex, b.queue_id))
+        .collect();
+
+    // linux_name change -> different bound netdev -> must bump key.
+    let name_changed = mk("ge-0-0-2", 11, 2);
+    assert_ne!(
+        base_key,
+        snapshot_binding_plan_key(&name_changed),
+        "a candidate linux_name change must bump the plan key (#2916): the \
+         same-plan branch would otherwise leave the binding on the old netdev"
+    );
+    let name_layout: Vec<String> = replan_queues(Some(&name_changed), 2, &[])
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect();
+    assert!(
+        name_layout.iter().all(|i| i == "ge-0-0-2"),
+        "replan_queues must bind the new linux_name; got {name_layout:?}"
+    );
+
+    // ifindex change -> different per-binding ifindex -> must bump key.
+    let ifindex_changed = mk("ge-0-0-1", 99, 2);
+    assert_ne!(
+        base_key,
+        snapshot_binding_plan_key(&ifindex_changed),
+        "a candidate ifindex change must bump the plan key (#2916): the \
+         same-plan branch would otherwise leave bindings pointed at the stale \
+         ifindex"
+    );
+    assert!(
+        replan_queues(Some(&ifindex_changed), 2, &[])
+            .iter()
+            .all(|b| b.ifindex == 99),
+        "replan_queues must carry the new ifindex onto every binding"
+    );
+
+    // rx_queues change -> different queue_count -> must bump key.
+    let rx_changed = mk("ge-0-0-1", 11, 4);
+    assert_ne!(
+        base_key,
+        snapshot_binding_plan_key(&rx_changed),
+        "a candidate rx_queues change must bump the plan key (#2916): the \
+         same-plan branch would otherwise leave a stale queue count"
+    );
+    assert_ne!(
+        base_layout.len(),
+        replan_queues(Some(&rx_changed), 2, &[]).len(),
+        "replan_queues must emit a different number of bindings when \
+         rx_queues changes"
+    );
+}
+
 #[test]
 fn queue_planner_excludes_tunnel_and_local_fabric_ge_interfaces() {
     // #2915: `ge-*`-named interfaces in tunnel or local-fabric contexts are
