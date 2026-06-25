@@ -904,11 +904,34 @@ func compileSNMP(node *Node, sys *SystemConfig) error {
 					tgChildren = child.Children[0].Children
 				}
 				for _, prop := range tgChildren {
-					if prop.Name() == "targets" {
-						if v := nodeVal(prop); v != "" {
-							tg.Targets = append(tg.Targets, v)
-						}
+					switch prop.Name() {
+					case "targets":
+						// targets may carry multiple values: one per child
+						// (hierarchical `targets { a; b; }`) and/or packed in
+						// the leaf Keys (flat-set / bracketed list).
+						tg.Targets = append(tg.Targets, firewallMatchValues(prop)...)
+					case "version", "categories":
+						// Accepted trap-group leaves (schema-declared). Not
+						// consumed by the link-trap runtime today; recognized
+						// here so a valid key does not trip the unknown-key
+						// rejection below.
+					default:
+						// #2990: a typoed child key (e.g. `tragets`) would
+						// otherwise be silently dropped, committing a trap
+						// group with zero targets that sends nothing. Reject
+						// it at commit so the operator is told about the typo
+						// instead of losing every notification at runtime.
+						return fmt.Errorf("snmp trap-group %q: unknown statement %q (valid: targets, version, categories)", tgName, prop.Name())
 					}
+				}
+				// #2990: a trap group with no targets sends nothing — reject
+				// it at commit rather than presenting a configured-but-inert
+				// group. This also catches the typo case where the only child
+				// was misspelled (the unknown-key branch above already errors,
+				// but a bare `set snmp trap-group g1` with no children lands
+				// here).
+				if len(tg.Targets) == 0 {
+					return fmt.Errorf("snmp trap-group %q: no targets configured (a trap group with zero targets sends no notifications)", tgName)
 				}
 				snmp.TrapGroups[tg.Name] = tg
 			}
