@@ -751,26 +751,20 @@ pub(super) fn native_gre_inner_mtu(
     let Some(endpoint) = forwarding
         .tunnel_endpoints
         .get(&decision.resolution.tunnel_endpoint_id)
-        .cloned()
     else {
         return 0;
     };
-    let transport_ifindex = resolve_ingress_logical_ifindex(
-        forwarding,
-        decision.resolution.tx_ifindex,
-        decision.resolution.tx_vlan_id,
-    )
-    .unwrap_or(decision.resolution.tx_ifindex);
-    let transport_mtu = forwarding
-        .egress
-        .get(&transport_ifindex)
-        .or_else(|| forwarding.egress.get(&decision.resolution.egress_ifindex))
-        .or_else(|| forwarding.egress.get(&endpoint.logical_ifindex))
-        .map(|egress| egress.mtu)
-        .unwrap_or_default();
-    if transport_mtu == 0 {
-        return 0;
-    }
+    // #2517: resolve the outer/transport MTU through the SAME #2300 SSOT
+    // helper the WireGuard MSS clamp uses (`tunnel_outer_mtu`) so the two
+    // tunnel MSS paths cannot drift. That helper falls back to the
+    // standard 1500 underlay MTU when EVERY egress lookup misses (a
+    // transient egress-map miss during re-reconciliation / interface
+    // bringup) instead of the old `unwrap_or_default()` → 0, which made
+    // `native_gre_tcp_mss` return 0 and silently DISABLE a configured GRE
+    // outbound TCP MSS clamp until the next reconcile. `tunnel_outer_mtu`
+    // also filters out an explicitly-zero stored egress MTU, so it never
+    // returns 0; `transport_mtu` here is therefore always >= 1500.
+    let transport_mtu = tunnel_outer_mtu(forwarding, decision, endpoint);
     let outer_ip_header_len = match endpoint.outer_family {
         libc::AF_INET => 20usize,
         libc::AF_INET6 => 40usize,
@@ -810,11 +804,14 @@ pub(super) fn native_gre_tcp_mss(
 
 /// Resolve the real outer-link (transport) MTU for a tunnel endpoint —
 /// the egress interface the OUTER encapped datagram leaves on, NOT the
-/// tunnel device. Same resolution chain as `native_gre_inner_mtu`
-/// (#2300 SSOT): transport ifindex → stored resolution egress →
-/// endpoint logical ifindex; `unwrap_or(1500)` only when every lookup
-/// misses. Used by the WireGuard MSS clamp (#2299) so the advertised
-/// inner MSS matches the encap MTU guard.
+/// tunnel device. This is the #2300 SSOT resolver shared by BOTH tunnel
+/// MSS-clamp paths: the WireGuard clamp (#2299) and the native-GRE
+/// clamp (`native_gre_inner_mtu`, #2517). Resolution chain: transport
+/// ifindex → stored resolution egress → endpoint logical ifindex;
+/// `unwrap_or(1500)` only when every lookup misses (a transient
+/// egress-map miss must NOT zero the clamp). The `.filter(|m| *m > 0)`
+/// also coerces an explicitly-zero stored egress MTU to the 1500
+/// fallback, so this helper never returns 0.
 pub(super) fn tunnel_outer_mtu(
     forwarding: &ForwardingState,
     decision: &SessionDecision,

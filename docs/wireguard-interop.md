@@ -83,7 +83,7 @@ SYN MSS clamp (#2299, `tunnel_tcp_mss`), the encap MTU guards
 and share `native_gre_inner_mtu` / `wg::mss::wg_inner_mtu` /
 `TunnelKind`.
 
-### Outer MTU SSOT (#2300 / #2680)
+### Outer MTU SSOT (#2300 / #2680 / #2517)
 There is now ONE outer-MTU model. The transit-egress encap
 (`frame/wg.rs`) and the control-thread egress (`coordinator/wg_control.rs`)
 both gate the OUTER encapped datagram against the REAL underlay-egress
@@ -92,6 +92,20 @@ resolved underlay MTU at spawn (`Coordinator::resolve_wg_outer_mtu`
 route-looks-up the peer endpoint in the endpoint's transport table).
 `WG_DEFAULT_OUTER_MTU` (1500) is now ONLY the last-resort fallback for an
 unconfigured/unroutable endpoint.
+
+**#2517 (GRE inner-MTU shares the same fallback).** The native-GRE
+inner-MTU resolver `native_gre_inner_mtu` now resolves its outer/transport
+MTU through the SAME `tunnel_outer_mtu` SSOT helper the WG MSS clamp uses,
+instead of an independent egress-lookup chain. The two paths had drifted on
+the miss case: `tunnel_outer_mtu` falls back to 1500 (`.filter(|m| *m > 0)
+.unwrap_or(1500)`), but `native_gre_inner_mtu` used `unwrap_or_default()` →
+0, which made `native_gre_tcp_mss` return 0 and silently DISABLE a
+configured GRE outbound TCP MSS clamp during a transient egress-map miss
+(re-reconciliation / interface bringup) — the clamp came back only on the
+next reconcile. After #2517 a GRE egress-map miss falls back to the 1500
+underlay MTU and `native_gre_tcp_mss` keeps computing a real clamp, exactly
+like the WG path. Both tunnel MSS-clamp paths now read one resolver and
+cannot drift again.
 
 **#2680 (transit-egress site).** The `frame/wg.rs` guard previously read
 the MTU of `decision.resolution.egress_ifindex`, which for a tunnel-resolved
