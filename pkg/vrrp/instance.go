@@ -361,7 +361,7 @@ func (vi *vrrpInstance) openSocket() error {
 
 	// Open IPv6 raw socket if any VIPs are IPv6.
 	if hasIPv6VIPs {
-		v6Conn, v6FD, err := openIPv6Socket(vi.cfg.Interface, vi.iface)
+		v6Conn, v6FD, err := openIPv6Socket(vi.cfg.Interface, vi.iface, isVLAN)
 		if err != nil {
 			slog.Warn("vrrp: ipv6 socket open failed, IPv6 adverts disabled",
 				"key", vi.key(), "err", err)

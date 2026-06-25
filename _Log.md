@@ -1,3 +1,25 @@
+## 2026-06-25 — #2786: VRRP IPv6 raw socket SO_BINDTODEVICE VLAN-skip (split-brain)
+
+- **Timestamp**: 2026-06-25
+- **Action**: The IPv6 VRRP raw socket (`openIPv6Socket`) bound
+  `SO_BINDTODEVICE` UNCONDITIONALLY, while the IPv4 path
+  (`openPerInterfaceSocket`) skips it on VLAN sub-interfaces (generic-XDP
+  VLAN tag handling makes the kernel interface association unreliable). On
+  a VLAN RETH member (e.g. `reth0.50`/`reth0.80`) the two families saw
+  VRRP multicast differently — the IPv6 instance could miss peer adverts
+  and both nodes hold MASTER → split-brain / dual-MASTER (agy-review-048
+  finding 048-01). Fix: extracted the single gated bind decision into
+  `maybeBindToDevice(fd, ifName, isVLAN)` (skip on VLAN) and routed BOTH
+  the v4 and v6 paths through it; added `isVLAN` to `openIPv6Socket` and
+  its instance.go call site (derived from the same
+  `strings.Contains(Interface, ".")` as v4). bindSocketToDevice is a
+  package-var seam so the gate is testable without CAP_NET_RAW. Fail-on-
+  revert: TestMaybeBindToDeviceVLANGate goes RED if the gate is reverted
+  to an unconditional bind (proven). HA code — PARENT runs
+  `make test-failover` (the split-brain gate) before merge.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance.go,
+  pkg/vrrp/bindtodevice_test.go, pkg/vrrp/README.md, _Log.md
+
 ## 2026-06-25 — #2515: reconcile no_snapshot teardown now refreshes bindings
 
 - **Timestamp**: 2026-06-25
