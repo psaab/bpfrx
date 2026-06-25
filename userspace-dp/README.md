@@ -105,6 +105,19 @@ logging rules, not these specific hot-path constants.
   avoidable serial bringup latency across 16 queues) is cut. The
   iteration driver `drive_fill_prime_loop` is a pure seam so the early-out
   is unit-tested (fail-on-revert) without a bound `DeviceQueue`.
+- **Slow-path control-queue rate limiter** (`src/slowpath.rs`,
+  `RateLimiter`): the reinjector that punts firewall-local / control
+  traffic to the kernel via the TUN device protects the control queue
+  with a dual **token bucket** (packets/s and bytes/s). Tokens accrue
+  continuously at the configured rate and the bucket caps at one second
+  of tokens, so the admitted rate is smooth across time and the burst in
+  ANY interval is bounded by the configured per-second rate. This
+  replaced a fixed 1-second window (#2912) that zeroed its counters on
+  the boundary and therefore permitted up to **2x** the rate in a short
+  interval straddling a window edge (full budget at the end of window N
+  plus a full budget at the start of window N+1). `allow_at(now, len)` is
+  the clock-injectable core so the boundary behaviour is unit-tested
+  fail-on-revert without sleeping; `allow(len)` is the production wrapper.
 - `HEARTBEAT_GRACE_PERIOD_NS = 6 s` is defined in
   `userspace-dp/src/afxdp/mod.rs` but currently `#[allow(dead_code)]`
   — reserved for future XDP-shim heartbeat gating logic. Workers
