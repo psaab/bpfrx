@@ -241,11 +241,16 @@ func newDDNSManagerForTesting(updater DNSUpdater, statePath, leasePath4, leasePa
 // ownerWatermark is the deterministic, node-stable owner id for a lease
 // identity (plan §5 invariant 2). It is a hash of identity+address ONLY —
 // the receiver's nodeID is DELIBERATELY NOT folded in — so EITHER HA node
-// derives the SAME value for the same lease. That node-independence is the
-// whole point: after a failover the surviving node must compute the same
-// watermark its peer used so it can recognise and clean up the records the
-// peer published. Folding nodeID would make the two nodes disagree and
-// strand records across failover. (#2691 P0 / #2667: the prior comment
+// derives the SAME value for the same lease.
+//
+// Today this value is an INFORMATIONAL marker only (stored as the
+// ownership record's OwnerID); it is NOT the delete-matching key. Record
+// cleanup matches on identity+address plus the reconstructed RFC 4701
+// DHCID, which is already node-independent, so OwnerID is never compared
+// across nodes at present. Keeping the watermark node-independent is
+// intentional regardless: it avoids surprises if a future phase ever does
+// compare it across nodes (folding nodeID would make the two HA nodes
+// disagree for the same lease). (#2691 P0 / #2667: the prior comment
 // wrongly claimed nodeID was "folded in as a TXT-marker hint"; it never
 // was — the code below is correct, the comment was stale.)
 func (m *DDNSManager) ownerWatermark(identity, address string) string {
