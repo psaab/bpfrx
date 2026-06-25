@@ -89,11 +89,17 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   a later `discard` was never reached. `continue_term` is compared in
   `filter_term_semantics_match` (it flips terminate-vs-fall-through
   without changing the parsed match vecs, so a flow-cache rebuild must
-  catch a `then next term` toggle). The cached TX-selection result holds
-  a single `counter` Arc, so when multiple matched fall-through terms
-  each carry `then count` the cached rebuild path records only the last
-  (a pre-existing structural limit; the uncached full-eval path counts
-  every term).
+  catch a `then next term` toggle). The cached TX-selection result
+  accumulates EVERY matched `then count` term in `CachedFilterCounters`
+  (#2573), deduped by counter identity, so a flow whose fall-through set
+  carries multiple `then count` terms increments all of them on the
+  cached replay — matching the uncached full-eval path. The container is
+  a `SmallVec<[_; 2]>` (built once at flow-cache install, only read on
+  the per-packet replay), so the common single/dual-counter case records
+  with no heap allocation. Before #2573 the result held a single
+  `counter` Arc and the cached rebuild path recorded only the LAST
+  matched count term (the earlier fall-through count terms were silently
+  under-counted on the cached path only).
 
   **Fall-through log action follows the terminal verdict (#2616).** A
   matched fall-through logging term records its identity

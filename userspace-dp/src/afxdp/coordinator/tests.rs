@@ -1656,6 +1656,96 @@ fn reconcile_with_none_snapshot_reaches_no_snapshot_early_exit() {
     assert_eq!(bindings[0].rx_packets, 0);
 }
 
+/// #2515 fail-on-revert: the `no_snapshot` teardown path must run
+/// `refresh_bindings` so every now-workerless slot is routed through
+/// `zero_unbound_slot` AND the CoS owner->worker map is rebuilt empty.
+///
+/// `reset_binding_counters` (the phase that always runs before the
+/// `no_snapshot` early-return) ONLY zeroes the counter scalars plus
+/// `bound`/`xsk_registered`/`socket_fd`. It deliberately does NOT touch
+/// `xsk_bind_mode`, `socket_ifindex`/`queue_id`/`bind_flags`,
+/// `zero_copy`, `flow_cache_capacity`, or `active_flow_count` — those
+/// are cleared only by `zero_unbound_slot` inside `refresh_bindings`.
+/// So this test pre-populates exactly those reset-survivor fields and a
+/// stale CoS owner-map entry, runs `reconcile(None, ...)`, and asserts
+/// they are cleared. Reverting the `self.refresh_bindings(bindings)`
+/// call added in the `no_snapshot` arm leaves every one of these stale
+/// → the asserts go RED.
+#[test]
+fn reconcile_none_snapshot_refreshes_bindings_clearing_reset_survivor_fields() {
+    let mut coordinator = Coordinator::new();
+    // A stale CoS owner->worker entry that the teardown's
+    // `refresh_cos_owner_worker_map_from_binding_statuses` (reached only
+    // via refresh_bindings) must rebuild empty. `stop_inner` clears the
+    // atomic CoS maps directly, but `cos_owner_worker_by_queue` (the
+    // plain field compared in `refresh_cos_runtime_maps`) is the
+    // operator-facing owner snapshot — confirm it ends empty.
+    coordinator.cos_owner_worker_by_queue.insert((10, 3), 7);
+
+    let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
+        slot: 1,
+        worker_id: 0,
+        queue_id: 0,
+        interface: "ge-0-0-0".into(),
+        ifindex: 10,
+        registered: true,
+        bound: true,
+        xsk_registered: true,
+        ready: true,
+        // Fields the reset pass leaves UNTOUCHED — only
+        // `zero_unbound_slot` (via refresh_bindings) clears them.
+        xsk_bind_mode: "ZEROCOPY".into(),
+        zero_copy: true,
+        socket_ifindex: 10,
+        socket_queue_id: 3,
+        socket_bind_flags: 0xc0,
+        flow_cache_capacity: 65536,
+        active_flow_count: 4096,
+        ..BindingStatus::default()
+    }];
+
+    coordinator.reconcile(None, &mut bindings, 64);
+
+    assert_eq!(coordinator.last_reconcile_stage, "no_snapshot");
+    // The reset-survivor fields must now be cleared by the teardown
+    // refresh. Each of these stays stale if refresh_bindings is skipped.
+    assert_eq!(
+        bindings[0].xsk_bind_mode, "",
+        "#2515: no_snapshot teardown must clear stale xsk_bind_mode"
+    );
+    assert!(
+        !bindings[0].zero_copy,
+        "#2515: no_snapshot teardown must clear stale zero_copy"
+    );
+    assert_eq!(
+        bindings[0].socket_ifindex, 0,
+        "#2515: no_snapshot teardown must clear stale socket_ifindex"
+    );
+    assert_eq!(
+        bindings[0].socket_queue_id, 0,
+        "#2515: no_snapshot teardown must clear stale socket_queue_id"
+    );
+    assert_eq!(
+        bindings[0].socket_bind_flags, 0,
+        "#2515: no_snapshot teardown must clear stale socket_bind_flags"
+    );
+    assert_eq!(
+        bindings[0].flow_cache_capacity, 0,
+        "#2515: no_snapshot teardown must clear stale flow_cache_capacity"
+    );
+    assert_eq!(
+        bindings[0].active_flow_count, 0,
+        "#2515: no_snapshot teardown must clear stale active_flow_count"
+    );
+    // The CoS owner->worker map must be rebuilt empty (no live/ready
+    // workers remain after teardown).
+    assert!(
+        coordinator.cos_owner_worker_by_queue.is_empty(),
+        "#2515: no_snapshot teardown must rebuild the CoS owner->worker \
+         map empty"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #2522: the mlx5 zero-copy teardown quiesce (500ms) is gated on BOTH
 // `had_live_workers` AND `will_rebind` (a snapshot is being applied, so
