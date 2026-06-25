@@ -25,14 +25,24 @@ import (
 // leave the field at 0 only when no resolver is wired (zero-value exporter).
 type MaskResolver func(ip net.IP) (mask uint8, ok bool)
 
+// routeMaskCacheMax bounds the number of distinct IPs the cache retains. The
+// TTL bounds the syscall RATE; this bounds the FOOTPRINT. On an internet-facing
+// firewall the destination-IP cardinality is effectively unbounded, so without
+// a size cap the map would grow for the daemon's lifetime (~50-70 B/entry) — a
+// slow leak. 8192 entries (~0.5 MB worst case) is far above the working set of
+// distinct src/dst prefixes for any realistic flow mix yet a hard ceiling.
+const routeMaskCacheMax = 8192
+
 // routeMaskCache caches FIB-match results for a short TTL so the per-flow
 // session-close export path does not issue an RTM_GETROUTE netlink syscall for
 // every record. Flows to the same destination/source prefix are common
 // (per-host or per-subnet aggregates), so a small TTL cache collapses the
 // syscall rate dramatically while keeping the mask fresh across routing
-// changes. The cache is keyed by the 16-byte IP representation.
+// changes. The cache is keyed by the 16-byte IP representation and bounded at
+// routeMaskCacheMax entries.
 type routeMaskCache struct {
-	ttl time.Duration
+	ttl     time.Duration
+	maxSize int
 	// lookup is the FIB query; a package var/field so tests can inject a
 	// deterministic resolver without touching the kernel routing table.
 	lookup func(ip net.IP) (uint8, bool)
@@ -57,6 +67,7 @@ func NewRouteMaskResolver(ttl time.Duration) MaskResolver {
 	}
 	c := &routeMaskCache{
 		ttl:     ttl,
+		maxSize: routeMaskCacheMax,
 		lookup:  fibMatchMask,
 		entries: make(map[string]routeMaskEntry),
 	}
@@ -85,9 +96,37 @@ func (c *routeMaskCache) resolve(ip net.IP) (uint8, bool) {
 	mask, ok := c.lookup(ip)
 
 	c.mu.Lock()
+	c.evictLocked(key, now)
 	c.entries[key] = routeMaskEntry{mask: mask, ok: ok, expires: now.Add(c.ttl)}
 	c.mu.Unlock()
 	return mask, ok
+}
+
+// evictLocked bounds the cache before an insert. It is a no-op until the map is
+// at the size cap; at the cap it first drops every expired entry (cheap, and it
+// usually recovers headroom on a busy cache because TTLs are short), and if the
+// map is STILL at the cap (a burst of distinct live IPs) it clears the whole
+// map. Clearing is the simplest hard bound — it sacrifices the warm set for one
+// cold round of syscalls rather than tracking per-entry LRU, which is not worth
+// the bookkeeping for a syscall-amortization cache. maxSize<=0 disables the
+// bound (used only by tests). The caller holds c.mu.
+func (c *routeMaskCache) evictLocked(key string, now time.Time) {
+	if c.maxSize <= 0 || len(c.entries) < c.maxSize {
+		return
+	}
+	// Re-inserting an existing key does not grow the map, so it never needs
+	// eviction; only a NEW key crossing the cap does.
+	if _, exists := c.entries[key]; exists {
+		return
+	}
+	for k, e := range c.entries {
+		if now.After(e.expires) {
+			delete(c.entries, k)
+		}
+	}
+	if len(c.entries) >= c.maxSize {
+		clear(c.entries)
+	}
 }
 
 // resolveMasks returns the src/dst route prefix lengths for a flow using r.

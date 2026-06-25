@@ -169,6 +169,16 @@ makes the kernel report the matched FIB entry's prefix, so a default-route
 match returns the real `/0` rather than echoing the queried host as a
 `/32`), behind a short-TTL cache (`routeMaskCache`, default 10s) so the
 per-flow close path does not issue an RTM_GETROUTE syscall per record.
+The cache is also size-bounded at `routeMaskCacheMax` (8192) entries: the
+TTL bounds the syscall *rate* but not the footprint, and on an
+internet-facing firewall the destination-IP cardinality is effectively
+unbounded, so an uncapped map would grow for the daemon's lifetime (a
+slow leak). On insert at the cap, `evictLocked` first purges expired
+entries (cheap, usually recovers headroom because TTLs are short) and, if
+still at the cap, clears the map — a simple hard ceiling rather than
+per-entry LRU bookkeeping for a syscall-amortization cache. The bound is
+pinned by `TestRouteMaskCacheBounded` (inserting >cap distinct keys keeps
+`len(entries)` <= cap; removing the bound flips it RED).
 `Exporter` / `IPFIXExporter` carry a `MaskResolver` func (defaulted by
 `NewExporter`/`NewIPFIXExporter` to `NewRouteMaskResolver`; nil on a
 zero-value exporter → masks stay 0, the pre-#2866 behaviour and the test

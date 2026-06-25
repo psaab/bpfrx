@@ -17261,3 +17261,23 @@ top.
   pkg/flowexport/srcmask_dstmask_test.go (new), pkg/flowexport/netflow.go,
   pkg/flowexport/ipfix.go, pkg/flowexport/postnat_test.go,
   pkg/flowexport/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2866 review fold (MERGE-NEEDS-MINOR) — bound routeMaskCache to
+  fix an unbounded-map memory leak. The TTL bounded the FIB syscall RATE but not
+  the FOOTPRINT: resolve() only ever inserted, never evicted, so the map grew
+  for the daemon's lifetime on an internet-facing firewall (unbounded dst-IP
+  cardinality). Added routeMaskCacheMax=8192 const + maxSize field + evictLocked
+  (purge-expired-then-clear-on-overflow, under the same lock as the insert; a
+  re-inserted existing key skips eviction since it does not grow the map;
+  maxSize<=0 disables the bound, used only by the existing
+  TestRouteMaskCacheResolves). Fail-on-revert: TestRouteMaskCacheBounded asserts
+  len(entries) stays <= maxSize across >cap distinct inserts AND a within-TTL
+  repeated key still hits (no extra lookup); TestRouteMaskCacheEvictsExpiredFirst
+  asserts the expired-purge runs before a full clear so a live working set below
+  the cap is not wiped. Neutering evictLocked to a no-op turns both RED
+  (verified). Existing mask-population tests stay green. Gates: go build ./...,
+  gofmt -l clean, go vet ./pkg/flowexport/..., go test ./pkg/flowexport/... +
+  ./pkg/daemon/... PASS.
+  **File(s)**: pkg/flowexport/routemask.go,
+  pkg/flowexport/srcmask_dstmask_test.go, pkg/flowexport/README.md, _Log.md

@@ -196,6 +196,89 @@ func TestRouteMaskCacheResolves(t *testing.T) {
 	}
 }
 
+// TestRouteMaskCacheBounded is a fail-on-revert pin for the cache size bound.
+// Inserting many more distinct keys than the cap must NOT grow the map without
+// bound — len(entries) stays <= maxSize. Reverting evictLocked (the unbounded
+// map[key]=val of the original #2866 implementation) lets the map grow to the
+// full insert count and flips this RED. A within-TTL repeated key still hits
+// the cache (no extra lookup), so the bound does not break the hit path.
+func TestRouteMaskCacheBounded(t *testing.T) {
+	const maxSize = 64
+	calls := 0
+	c := &routeMaskCache{
+		ttl:     time.Hour, // long TTL: entries never expire during the test,
+		maxSize: maxSize,   // so the bound is enforced purely by the size cap.
+		entries: make(map[string]routeMaskEntry),
+	}
+	c.lookup = func(net.IP) (uint8, bool) { calls++; return 24, true }
+
+	// Insert far more distinct keys than the cap. Each is a fresh IPv4 address.
+	const inserts = maxSize * 10
+	for i := 0; i < inserts; i++ {
+		ip := net.IPv4(10, byte(i>>16), byte(i>>8), byte(i))
+		c.resolve(ip)
+		if got := len(c.entries); got > maxSize {
+			t.Fatalf("after %d inserts len(entries) = %d, want <= %d (cache unbounded — leak)",
+				i+1, got, maxSize)
+		}
+	}
+	if calls != inserts {
+		t.Fatalf("lookup called %d times, want %d (one per distinct insert)", calls, inserts)
+	}
+
+	// A repeated key within TTL must still hit the cache (no new lookup), even
+	// after the churn above evicted older entries.
+	before := calls
+	ip := net.IPv4(192, 0, 2, 7)
+	if m, ok := c.resolve(ip); m != 24 || !ok {
+		t.Fatalf("warm insert = %d,%v want 24,true", m, ok)
+	}
+	if m, ok := c.resolve(ip); m != 24 || !ok {
+		t.Fatalf("warm hit = %d,%v want 24,true", m, ok)
+	}
+	if calls != before+1 {
+		t.Fatalf("repeated key triggered %d lookups, want 1 (hit path broken)", calls-before)
+	}
+	if len(c.entries) > maxSize {
+		t.Fatalf("final len(entries) = %d, want <= %d", len(c.entries), maxSize)
+	}
+}
+
+// TestRouteMaskCacheEvictsExpiredFirst checks that at the cap the bound first
+// drops expired entries (recovering headroom) before resorting to a full clear,
+// so a steady cache of live entries below the cap is not needlessly wiped.
+func TestRouteMaskCacheEvictsExpiredFirst(t *testing.T) {
+	const maxSize = 4
+	c := &routeMaskCache{
+		ttl:     time.Hour,
+		maxSize: maxSize,
+		entries: make(map[string]routeMaskEntry),
+	}
+	c.lookup = func(net.IP) (uint8, bool) { return 16, true }
+
+	past := time.Now().Add(-time.Hour)
+	// Fill to the cap: 1 live entry + (maxSize-1) already-expired entries.
+	live := net.IPv4(10, 0, 0, 1)
+	c.entries[string(live.To16())] = routeMaskEntry{mask: 16, ok: true, expires: time.Now().Add(time.Hour)}
+	for i := 0; i < maxSize-1; i++ {
+		ip := net.IPv4(10, 0, 1, byte(i))
+		c.entries[string(ip.To16())] = routeMaskEntry{mask: 16, ok: true, expires: past}
+	}
+	if len(c.entries) != maxSize {
+		t.Fatalf("setup len = %d, want %d", len(c.entries), maxSize)
+	}
+
+	// A new key at the cap should purge the expired entries (not clear the
+	// whole map), leaving the live entry + the newcomer.
+	c.resolve(net.IPv4(203, 0, 113, 9))
+	if _, ok := c.entries[string(live.To16())]; !ok {
+		t.Fatalf("live entry was wiped — expired-first purge did not run")
+	}
+	if len(c.entries) > maxSize {
+		t.Fatalf("len after purge = %d, want <= %d", len(c.entries), maxSize)
+	}
+}
+
 // TestResolveMasksNilResolver pins the pre-#2866 fallback: a zero-value
 // exporter (nil resolver) leaves both masks 0.
 func TestResolveMasksNilResolver(t *testing.T) {
