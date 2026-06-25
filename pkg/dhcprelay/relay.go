@@ -339,14 +339,87 @@ func defaultPacketConnFactory(ctx context.Context, ifaceName string,
 	return lc.ListenPacket(ctx, "udp4", bindAddr.String())
 }
 
-// defaultIfaceResolver looks up the interface and returns its first
-// non-loopback IPv4 address (the giaddr).
+// defaultIfaceResolver resolves the giaddr for an interface by selecting its
+// PRIMARY non-loopback IPv4 address. It delegates address enumeration to the
+// primaryIPv4Lister seam (netlink-backed on Linux so the kernel's
+// IFA_F_SECONDARY flag is observable; a portable net.Interface.Addrs() fallback
+// otherwise) and primary selection to selectPrimaryIPv4.
+//
+// #2849: the previous implementation returned the FIRST IPv4 from
+// net.Interface.Addrs(). On Linux an interface with a primary address plus
+// secondary subnet aliases returns them in netlink maintenance order, NOT
+// guaranteed primary-first; returning a secondary alias as giaddr makes the
+// upstream server lease from the wrong subnet pool.
 func defaultIfaceResolver(ifaceName string) (net.IP, error) {
+	cands, err := primaryIPv4Lister(ifaceName)
+	if err != nil {
+		return nil, err
+	}
+	return selectPrimaryIPv4(ifaceName, cands)
+}
+
+// ipv4Candidate is one IPv4 address on an interface together with whether the
+// kernel marked it secondary (an alias of an earlier address in the same
+// subnet). selectPrimaryIPv4 prefers a non-secondary address.
+type ipv4Candidate struct {
+	ip        net.IP // 4-byte form
+	secondary bool
+}
+
+// primaryIPv4Lister enumerates the non-loopback IPv4 addresses on ifaceName,
+// preserving kernel ordering and the secondary flag. It is a package-level seam:
+// relay_giaddr_linux.go's init() replaces this portable fallback (which cannot
+// see IFA_F_SECONDARY and therefore reports every address as primary) with a
+// netlink-backed enumerator that does.
+var primaryIPv4Lister = portableIPv4Lister
+
+// portableIPv4Lister enumerates IPv4 addresses via the standard library. It
+// cannot distinguish primary from secondary (net.Interface.Addrs() drops the
+// flag), so every candidate is reported as primary — preserving the historical
+// first-address behavior on platforms without the netlink override.
+func portableIPv4Lister(ifaceName string) ([]ipv4Candidate, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return nil, fmt.Errorf("interface lookup: %w", err)
 	}
-	return interfaceIPv4(iface)
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, fmt.Errorf("list addresses: %w", err)
+	}
+	var cands []ipv4Candidate
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := ipNet.IP.To4()
+		if ip4 == nil || ip4.IsLoopback() {
+			continue
+		}
+		cands = append(cands, ipv4Candidate{ip: ip4})
+	}
+	return cands, nil
+}
+
+// selectPrimaryIPv4 returns the primary giaddr from the candidate list. It
+// prefers the first non-secondary IPv4; only if every candidate is secondary
+// (which the kernel does not normally produce, but a future netlink quirk
+// might) does it fall back to the first secondary so the relay still has an
+// address rather than failing closed. An empty list is an error.
+func selectPrimaryIPv4(ifaceName string, cands []ipv4Candidate) (net.IP, error) {
+	var firstSecondary net.IP
+	for _, c := range cands {
+		if !c.secondary {
+			return c.ip, nil
+		}
+		if firstSecondary == nil {
+			firstSecondary = c.ip
+		}
+	}
+	if firstSecondary != nil {
+		return firstSecondary, nil
+	}
+	return nil, fmt.Errorf("no IPv4 address on %s", ifaceName)
 }
 
 // defaultIfindexResolver resolves an interface name to its live kernel ifindex
@@ -1220,21 +1293,15 @@ func stripOption82(pkt *dhcpv4.DHCPv4) {
 	pkt.Options.Del(option82)
 }
 
-// interfaceIPv4 returns the first non-loopback IPv4 address on the interface.
+// interfaceIPv4 returns the primary non-loopback IPv4 address on the interface
+// using the standard-library address list. It is retained for callers/tests
+// that already hold a *net.Interface; the giaddr resolution path uses
+// defaultIfaceResolver (which prefers a netlink-backed primary selection that
+// honors IFA_F_SECONDARY — see #2849).
 func interfaceIPv4(iface *net.Interface) (net.IP, error) {
-	addrs, err := iface.Addrs()
+	cands, err := portableIPv4Lister(iface.Name)
 	if err != nil {
-		return nil, fmt.Errorf("list addresses: %w", err)
+		return nil, err
 	}
-	for _, a := range addrs {
-		ipNet, ok := a.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		ip4 := ipNet.IP.To4()
-		if ip4 != nil && !ip4.IsLoopback() {
-			return ip4, nil
-		}
-	}
-	return nil, fmt.Errorf("no IPv4 address on %s", iface.Name)
+	return selectPrimaryIPv4(iface.Name, cands)
 }
