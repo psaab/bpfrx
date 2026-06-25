@@ -6052,6 +6052,79 @@ fn term_extra_truncated_icmpv6_fails_closed() {
     );
 }
 
+// #3008 (meta sibling of #2449): `term_match_extra_from_meta` builds match
+// inputs from metadata ALONE — there is no frame to read the real ICMP type/code
+// from. The pre-fix code stamped `icmp_type = icmp_code = 0` while keeping
+// `l4_present = true`, so any term keyed on `icmp-type 0` (echo-reply) or
+// `icmp-code 0` (a valid, common value) FALSE-MATCHED every ICMP-family packet
+// whose type/code was never parsed. The fix drops `l4_present` for ICMP/ICMPv6
+// on this path so the matcher fails the icmp-type/code terms closed. These tests
+// FAIL if `l4_present` reverts to an unconditional `true`.
+#[test]
+fn term_extra_from_meta_icmpv4_fails_closed_no_icmp_type_match() {
+    use crate::ip_proto::PROTO_ICMP;
+    let meta: ForwardPacketMeta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    }
+    .into();
+    let extra = term_match_extra_from_meta(meta);
+    assert_eq!(extra.icmp_type, 0);
+    assert_eq!(extra.icmp_code, 0);
+    assert!(
+        !extra.l4_present,
+        "meta-only ICMP packet has no parsed type/code → l4_present MUST be false \
+         so an `icmp-type 0` / `icmp-code 0` term fails closed (reverting to \
+         unconditional l4_present=true makes this true and the term spuriously \
+         matches every ICMP-family packet)"
+    );
+    assert!(!extra.is_fragment);
+}
+
+#[test]
+fn term_extra_from_meta_icmpv6_fails_closed_no_icmp_type_match() {
+    use crate::ip_proto::PROTO_ICMPV6;
+    let meta: ForwardPacketMeta = UserspaceDpMeta {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        ..UserspaceDpMeta::default()
+    }
+    .into();
+    let extra = term_match_extra_from_meta(meta);
+    assert_eq!(extra.icmp_type, 0);
+    assert_eq!(extra.icmp_code, 0);
+    assert!(
+        !extra.l4_present,
+        "meta-only ICMPv6 packet must fail closed (l4_present false)"
+    );
+}
+
+// Anti-over-gate: a meta-only TCP packet must KEEP l4_present true so the
+// authoritative shim-stamped tcp_flags still drives `tcp-flags` matching. The
+// #3008 fix only drops l4_present for the ICMP family.
+#[test]
+fn term_extra_from_meta_tcp_keeps_l4_present_and_tcp_flags() {
+    use crate::ip_proto::PROTO_TCP;
+    let meta: ForwardPacketMeta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x02, // SYN
+        ..UserspaceDpMeta::default()
+    }
+    .into();
+    let extra = term_match_extra_from_meta(meta);
+    assert_eq!(
+        extra.tcp_flags, 0x02,
+        "meta-only TCP must surface the authoritative shim-stamped tcp_flags"
+    );
+    assert!(
+        extra.l4_present,
+        "meta-only TCP carries a real L4 header (tcp_flags authoritative) → \
+         l4_present stays true so tcp-flags terms keep matching"
+    );
+}
+
 #[test]
 fn apply_nat_ipv4_non_first_fragment_rewrites_ip_only() {
     // Payload bytes occupy the post-IP offset where the buggy code would

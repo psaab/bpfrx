@@ -3675,6 +3675,68 @@ fn non_first_fragment_does_not_match_icmp_code_zero() {
     );
 }
 
+// #3008 (meta sibling of #2449): end-to-end matcher proof for the meta-only
+// TX-selection path. `term_match_extra_from_meta` cannot read the ICMP type/code
+// (no frame), so for an ICMP-family packet it emits `l4_present: false` with
+// `icmp_type/icmp_code = 0`. The matcher MUST treat that exactly like a non-first
+// fragment: the `icmp-type 0` / `icmp-code 0` terms fail closed. A genuinely-
+// known type/code 0 (l4_present true, e.g. the frame path on a full echo-reply)
+// MUST still match. Pre-fix the meta helper stamped l4_present=true, so these
+// terms false-matched every meta-only ICMP packet.
+#[test]
+fn meta_only_icmp_does_not_match_icmp_type_zero_but_known_type_does() {
+    let state = make_filter_state(
+        &per_packet_filter("inet", "icmp", None, false, Some(0), None),
+        &[],
+    );
+    // What the fixed `term_match_extra_from_meta` produces for a meta-only ICMP
+    // packet: l4_present FALSE (type/code unknown), icmp bytes 0, not a fragment.
+    let meta_icmp = TermMatchExtra {
+        l4_present: false,
+        icmp_type: 0,
+        is_fragment: false,
+        ..Default::default()
+    };
+    let r = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_ICMP,
+        0,
+        0,
+        0,
+        meta_icmp,
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Accept,
+        "a meta-only ICMP packet (real type unknown) must NOT match `icmp-type 0` (#3008)"
+    );
+    // A genuinely-known echo-reply (type 0, L4 parsed) DOES match.
+    let known = TermMatchExtra {
+        l4_present: true,
+        icmp_type: 0,
+        ..Default::default()
+    };
+    let r2 = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_ICMP,
+        0,
+        0,
+        0,
+        known,
+    );
+    assert_eq!(
+        r2.action,
+        FilterAction::Discard,
+        "a packet with a genuinely-known icmp-type 0 (L4 present) MUST still match (#3008)"
+    );
+}
+
 #[test]
 fn non_first_fragment_still_matches_is_fragment() {
     // The is-fragment term is L3-derived and NOT gated by l4_present.
