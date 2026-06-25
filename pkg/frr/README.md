@@ -62,6 +62,23 @@ the overlay as step 7.
 content **outside** the markers is preserved across `ApplyFull`. Don't
 move or rename the markers — they're literal strings.
 
+`writeManagedSection` strips the old managed block before re-appending the
+new one. Two corruption hazards are handled defensively because the file
+also carries operator content:
+
+- **Orphaned begin / missing end (#1646).** A torn write can leave a begin
+  marker with no end. The strip discards the begin-to-EOF tail rather than
+  appending a second block (which a later write would over-cut).
+- **Stale end before begin (#2908).** The end-marker search is anchored
+  strictly *after* the begin marker. An unanchored `strings.Index(content,
+  markerEnd)` from index 0 would match a stale/orphaned end marker that
+  appears *before* the live begin marker (operator hand-edit, interleaved
+  partial copy, external tooling), returning `end < start`; the strip
+  `content[:start] + content[end:]` would then DUPLICATE the text between
+  the stale end and the begin while leaving the live begin in place —
+  two begin markers and a corrupt block that FRR reload rejects. Anchoring
+  keeps `end >= start`, so the slice can never duplicate.
+
 ## Gotchas
 
 - Static routes have RETH names (`reth0`) but FRR wants the physical
