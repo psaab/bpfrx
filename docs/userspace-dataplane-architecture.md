@@ -537,6 +537,20 @@ A TUN device (`xpf-usp0`) for packets that need kernel processing:
   (> 1500 bytes on a jumbo-frame topology) is silently dropped on the TUN
   egress. A failed `SIOCSIFMTU` is non-fatal: it is logged and recorded in
   `last_error`, and the TUN stays usable for frames up to its current MTU.
+  - **Degraded reporting (#2471):** a failed `SIOCSIFMTU` no longer hides
+    behind a bare `active = true`. `apply_mtu_status` falls the live MTU back
+    to the kernel-default 1500 (`live_mtu` in the status), sets `degraded =
+    true`, and records the ioctl error. The reinjector's `enqueue` then
+    REFUSES any frame larger than `live_mtu` (returning
+    `EnqueueOutcome::MtuExceeded`, counted in `mtu_dropped_packets` and
+    `dropped_packets`/`dropped_bytes`) instead of handing it to the kernel to
+    be silently dropped on TUN egress. The slow path remains usable for
+    <=1500 frames, so this is degraded — not unusable — capacity. All three
+    fields (`degraded`, `live_mtu`, `mtu_dropped_packets`) cross the control
+    socket (Rust `protocol/control.rs` SlowPathStatus → Go
+    `pkg/dataplane/userspace/protocol.go` SlowPathStatus, tag-matched) and
+    surface in `show ... slow path` output: a `Slow path DEGRADED: true` line,
+    the live MTU, and the MTU-exceeded drop counter.
   - **Set once at creation:** the MTU is programmed when the worker opens
     the TUN (first apply, i.e. `apply_snapshot`'s `preserved_slow_path ==
     None` branch). Later reconciles preserve the running reinjector and do

@@ -323,6 +323,21 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
                 forwarding,
             );
         }
+        // #2471: the slow path is degraded (MTU programming failed); the live
+        // TUN is at 1500 and this frame is jumbo. Refused at enqueue with a
+        // counted exception rather than being silently dropped by the kernel.
+        Ok(EnqueueOutcome::MtuExceeded) => {
+            live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
+            record_exception(
+                recent_exceptions,
+                binding,
+                &format!("{reason}_slow_path_mtu_exceeded"),
+                frame.len() as u32,
+                Some(meta),
+                None,
+                forwarding,
+            );
+        }
         Err(err) => {
             live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
             live.set_error(err);

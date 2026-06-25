@@ -13779,3 +13779,43 @@ top.
 - **File(s)**: userspace-dp/src/afxdp/frame/wg.rs, userspace-dp/src/afxdp/test_fixtures.rs, docs/wireguard-interop.md, _Log.md
 - **Action**: #2681 (review HIGH, RFC 3414 §5 security) — the SNMPv3 USM agent checked authentication and privacy INDEPENDENTLY in handleV3Packet (`if msgFlags&msgFlagAuth != 0 {…verifyAuth/checkTimeliness…}` then `if msgFlags&msgFlagPriv != 0 {…decrypt…}`) and never rejected the invalid noAuthPriv combination (priv set, auth CLEAR, msgFlags=0x02). A request with msgFlags=0x02 SKIPPED all authentication verification yet still had its encrypted scopedPDU DECRYPTED and the carried PDU EXECUTED — a sender able to supply a decryptable PDU bypassed HMAC + timeliness. RFC 3414 §5 defines only noAuthNoPriv/authNoPriv/authPriv; noAuthPriv is forbidden (an encrypted message MUST be authenticated). FIX: reject noAuthPriv EARLY in handleV3Packet, immediately after decoding msgFlags and BEFORE the auth/decrypt/execute path — `if msgFlags&msgFlagPriv != 0 && msgFlags&msgFlagAuth == 0 { slog.Debug(...); return nil }`. Mechanism = DROP (return nil), not a report: with no authentication the agent cannot produce an authenticated reply at the requested level and an unauthenticated report would itself be unverifiable. The three valid levels are untouched (guard fires only on priv-set+auth-clear). Tests (v3_seclevel_test.go): TestSecLevel_NoAuthPrivRejected builds a REAL AES-128-CFB-encrypted GetRequest with flags=0x02 + empty authParams and asserts classifyV3Response==“nil” (dropped, not decrypted/executed); TestSecLevel_NoAuthNoPrivStillServed asserts a flags=0x00 request is still served. authNoPriv (TestTimeliness_InWindowAccepted) and authPriv (TestAESDecryptIV_UsesReceivedBootsTime) valid-level serving already covered by existing tests and stay green. FAIL-ON-REVERT PROVEN: removing the guard makes TestSecLevel_NoAuthPrivRejected go red (got “other” — the encrypted PDU is decrypted + processed instead of dropped = the exact security hole); restored to green. Did not regress #2610 timeliness / #2611 context / #2612 getbulk / #2640 AES-IV. Validation: go test ./pkg/snmp/... PASS; gofmt -w + go vet ./pkg/snmp/... clean. Docs: pkg/snmp/README.md (new “SNMPv3 security levels (RFC 3414 §5)” section documenting the three valid levels + the noAuthPriv drop).
 - **File(s)**: pkg/snmp/v3.go, pkg/snmp/v3_seclevel_test.go, pkg/snmp/README.md, _Log.md
+- **Timestamp**: 2026-06-24
+- **Action**: #2471 (MEDIUM, degraded slow path hidden behind active bit) — when
+  the slow-path TUN MTU-programming ioctl (`set_if_mtu`/SIOCSIFMTU) failed,
+  `slow_path_worker` logged + recorded `last_error` but then unconditionally
+  `status.active.store(true)`, so `show ... slow path` reported a healthy
+  `active: true` while reinjected jumbo frames silently dropped at the kernel-
+  default 1500 TUN MTU. A security appliance must not hide degraded capacity.
+  FIX (degraded+live_mtu representation, keeps the path usable for <=1500
+  frames): added `degraded: AtomicBool` + `live_mtu: AtomicI64` +
+  `mtu_dropped_packets: AtomicU64` to SharedStatus and the public
+  SlowPathStatus. Extracted the MTU-apply-and-classify into a testable seam
+  `SharedStatus::apply_mtu_status(name, desired_mtu, programmer)` — on success
+  live_mtu=desired/degraded=false; on failure live_mtu=DEFAULT_TUN_MTU(1500)/
+  degraded=true + records the ioctl error. The worker still flips active=true
+  (slow path is usable for <=1500), but degraded now tells the truth.
+  `enqueue` gained a live-MTU gate: a frame longer than live_mtu is REFUSED
+  (new `EnqueueOutcome::MtuExceeded`, counted in mtu_dropped_packets +
+  dropped_packets/dropped_bytes) instead of being silently dropped by the
+  kernel; the tx slow_path dispatch records a `<reason>_slow_path_mtu_exceeded`
+  exception. WIRE: the status crosses the control socket (server/helpers.rs →
+  ProcessStatus.slow_path), so degraded/live_mtu/mtu_dropped_packets were
+  added to BOTH the Rust wire struct (protocol/control.rs SlowPathStatus + the
+  From impl) AND the Go mirror (pkg/dataplane/userspace/protocol.go), tag-
+  matched (avoids the #1961 one-sided-field hazard); regenerated the wire
+  contract fixture (XPF_PROTOCOL_WIRE_REGEN=1 → protocol_wire_v1.json adds the
+  3 keys in both slow_path blocks). Go `show` formatter
+  (format/status.go) prints a `Slow path DEGRADED: true (live MTU N <
+  configured; jumbo frames refused)` line, the live MTU, and a `Slow path
+  MTU-exceeded` drop counter. TESTS (fail-on-revert): apply_mtu_status_
+  degrades_on_failure (programmer-seam returns Err → asserts degraded +
+  live_mtu==1500 + last_error recorded — reverting to the bare active.store
+  reds this), apply_mtu_status_clean_on_success, enqueue_refuses_frame_above_
+  live_mtu (1400B accepted, 8000B → MtuExceeded + counters — reverting the
+  gate makes the jumbo frame Accepted = the silent-drop bug). Validation:
+  cargo build --release clean (no new warnings in slowpath.rs); cargo test
+  --release --bin xpf-userspace-dp slowpath → 17 passed / 0; protocol::tests
+  → 58 passed / 0; go build ./... + go test ./pkg/dataplane/userspace/... PASS.
+  Docs: docs/userspace-dataplane-architecture.md TUN MTU section (#2471
+  degraded-reporting bullet).
+- **File(s)**: userspace-dp/src/slowpath.rs, userspace-dp/src/afxdp/tx/dispatch/slow_path.rs, userspace-dp/src/protocol/control.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/format/status.go, docs/userspace-dataplane-architecture.md, _Log.md
