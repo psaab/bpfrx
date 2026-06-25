@@ -970,11 +970,21 @@ type FirewallFilterTerm struct {
 	Protocols        []string // tcp, udp, icmp, icmpv6, esp, ...
 	DestinationPorts []string // port numbers or names
 	SourcePorts      []string // source port numbers or ranges
-	ICMPTypes        []int    // ICMP/ICMPv6 type bytes (0..255); empty = not set
-	ICMPCodes        []int    // ICMP/ICMPv6 code bytes (0..255); empty = not set
-	TCPFlags         []string // TCP flags: "syn", "ack", "fin", "rst", "psh", "urg"
-	IsFragment       bool     // match IP fragments
-	Action           string   // "accept", "reject", "discard", ""
+	// SourcePortsExcept / DestinationPortsExcept are the NEGATED port match
+	// sets (#2622, Junos `from source-port-except` / `destination-port-except`):
+	// match any port EXCEPT the listed ones. They are mutually exclusive with the
+	// positive SourcePorts / DestinationPorts in Junos; if both are somehow set,
+	// the dataplane evaluates whichever direction carries entries (the compiler
+	// keeps them as independent slices, the wire carries an `except` flag per
+	// direction). An empty slice means the except criterion is unconstrained
+	// (matches any), exactly like the positive port slices.
+	SourcePortsExcept []string // source ports to EXCLUDE (match all others)
+	DestPortsExcept   []string // destination ports to EXCLUDE (match all others)
+	ICMPTypes         []int    // ICMP/ICMPv6 type bytes (0..255); empty = not set
+	ICMPCodes         []int    // ICMP/ICMPv6 code bytes (0..255); empty = not set
+	TCPFlags          []string // TCP flags: "syn", "ack", "fin", "rst", "psh", "urg"
+	IsFragment        bool     // match IP fragments
+	Action            string   // "accept", "reject", "discard", ""
 	// UnknownActions records `then` tokens that are neither a recognized
 	// terminating action nor a recognized modifier (#2399 finding 032-16).
 	// An unknown or misspelled action would otherwise be silently dropped

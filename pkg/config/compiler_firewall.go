@@ -277,6 +277,13 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
 			}
 		case "source-port":
 			term.SourcePorts = append(term.SourcePorts, firewallMatchValues(child)...)
+		case "destination-port-except":
+			// #2622 negated port match: match all destination ports EXCEPT
+			// these. Multi-value/bracket-list, same accumulation as the
+			// positive destination-port case.
+			term.DestPortsExcept = append(term.DestPortsExcept, firewallMatchValues(child)...)
+		case "source-port-except":
+			term.SourcePortsExcept = append(term.SourcePortsExcept, firewallMatchValues(child)...)
 		case "icmp-type":
 			for _, v := range firewallMatchValues(child) {
 				if n, err := strconv.Atoi(v); err == nil {
