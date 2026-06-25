@@ -28,6 +28,12 @@ const relayPort = 67
 // clientPort is the standard DHCP client port.
 const clientPort = 68
 
+// messageTypeForceRenew is the DHCPFORCERENEW message type (RFC 3203, §3.1).
+// The insomniacslk/dhcp library only enumerates message types 1-8, so the
+// type-9 value is defined locally. A server sends FORCERENEW to a client that
+// already holds a lease to force it back into the RENEWING state.
+const messageTypeForceRenew = dhcpv4.MessageType(9)
+
 // startupRetryInterval is how long runRelay waits between attempts to resolve
 // the interface and its IPv4 address (giaddr) at startup. Apply runs once at
 // daemon boot, so an interface that is not yet ready (carrier wait, late link
@@ -899,11 +905,17 @@ func handleServerResponses(ctx context.Context, serverConn, clientConn net.Packe
 
 		msgType := pkt.MessageType()
 		switch msgType {
-		case dhcpv4.MessageTypeOffer, dhcpv4.MessageTypeAck, dhcpv4.MessageTypeNak:
+		case dhcpv4.MessageTypeOffer, dhcpv4.MessageTypeAck, dhcpv4.MessageTypeNak,
+			messageTypeForceRenew:
 			// Forward to the client. NAK rejects the client's request
 			// (RFC 2131 §4.3.2); dropping it makes the client hang until
 			// its retransmission timeout instead of restarting with a
-			// fresh DISCOVER.
+			// fresh DISCOVER. FORCERENEW (RFC 3203, type 9) tells a client
+			// that already holds a lease to re-enter RENEWING; dropping it
+			// means a server can never force a relayed client to renew.
+			// Unlike NAK it carries the client's current address in ciaddr,
+			// so deliverReply unicasts it (the ciaddr row) rather than
+			// broadcasting.
 		default:
 			continue
 		}
