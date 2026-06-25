@@ -37,17 +37,20 @@ func newGateTestInstance(t *testing.T, priority int, preempt bool) *vrrpInstance
 	return vi
 }
 
-// longTimers returns a masterDown/advert timer pair armed far in the future so
-// that, in a stepBackup select, only a pre-loaded preemptNowCh (or rxCh) case
-// is ready — making the select deterministic. Do NOT use already-expired
-// timers in these wiring tests (that makes the select nondeterministic).
-func longTimers(t *testing.T) (masterDown, advert *time.Timer) {
+// longTimers returns a masterDown/advert/preemptHold timer triple armed far in
+// the future so that, in a stepBackup select, only a pre-loaded preemptNowCh
+// (or rxCh) case is ready — making the select deterministic. Do NOT use
+// already-expired timers in these wiring tests (that makes the select
+// nondeterministic).
+func longTimers(t *testing.T) (masterDown, advert, preemptHold *time.Timer) {
 	t.Helper()
 	masterDown = time.NewTimer(time.Hour)
 	t.Cleanup(func() { masterDown.Stop() })
 	advert = time.NewTimer(time.Hour)
 	t.Cleanup(func() { advert.Stop() })
-	return masterDown, advert
+	preemptHold = time.NewTimer(time.Hour)
+	t.Cleanup(func() { preemptHold.Stop() })
+	return masterDown, advert, preemptHold
 }
 
 // TestPreemptNow_LowerPriorityStaysBackup is the PRIMARY regression guard. A
@@ -64,9 +67,9 @@ func TestPreemptNow_LowerPriorityStaysBackup(t *testing.T) {
 	vi.lastMasterSeen = time.Now()
 	vi.mu.Unlock()
 
-	masterDown, advert := longTimers(t)
+	masterDown, advert, preemptHold := longTimers(t)
 	vi.triggerPreemptNow()
-	if stop := vi.stepBackup(masterDown, advert); stop {
+	if stop := vi.stepBackup(masterDown, advert, preemptHold); stop {
 		t.Fatal("stepBackup returned stop=true unexpectedly")
 	}
 
@@ -85,9 +88,9 @@ func TestPreemptNow_HigherPriorityBecomesMaster(t *testing.T) {
 	vi.lastMasterSeen = time.Now()
 	vi.mu.Unlock()
 
-	masterDown, advert := longTimers(t)
+	masterDown, advert, preemptHold := longTimers(t)
 	vi.triggerPreemptNow()
-	vi.stepBackup(masterDown, advert)
+	vi.stepBackup(masterDown, advert, preemptHold)
 
 	if vi.getState() != StateMaster {
 		t.Errorf("state = %s, want MASTER (higher priority must preempt)", vi.getState())
@@ -103,9 +106,9 @@ func TestPreemptNow_EqualPriorityStaysBackup(t *testing.T) {
 	vi.lastMasterSeen = time.Now()
 	vi.mu.Unlock()
 
-	masterDown, advert := longTimers(t)
+	masterDown, advert, preemptHold := longTimers(t)
 	vi.triggerPreemptNow()
-	vi.stepBackup(masterDown, advert)
+	vi.stepBackup(masterDown, advert, preemptHold)
 
 	if vi.getState() != StateBackup {
 		t.Errorf("state = %s, want BACKUP (equal priority must not preempt)", vi.getState())
@@ -123,9 +126,9 @@ func TestPreemptNow_ForceBypassesGate(t *testing.T) {
 	vi.forcePreemptOnce = true
 	vi.mu.Unlock()
 
-	masterDown, advert := longTimers(t)
+	masterDown, advert, preemptHold := longTimers(t)
 	vi.triggerPreemptNow()
-	vi.stepBackup(masterDown, advert)
+	vi.stepBackup(masterDown, advert, preemptHold)
 
 	if vi.getState() != StateMaster {
 		t.Errorf("state = %s, want MASTER (force must bypass the priority gate)", vi.getState())
@@ -142,9 +145,9 @@ func TestPreemptNow_ForceBypassesGate_EvenWithoutPreempt(t *testing.T) {
 	vi.forcePreemptOnce = true
 	vi.mu.Unlock()
 
-	masterDown, advert := longTimers(t)
+	masterDown, advert, preemptHold := longTimers(t)
 	vi.triggerPreemptNow()
-	vi.stepBackup(masterDown, advert)
+	vi.stepBackup(masterDown, advert, preemptHold)
 
 	if vi.getState() != StateMaster {
 		t.Errorf("state = %s, want MASTER (force must promote even with preempt=false)", vi.getState())
@@ -161,9 +164,9 @@ func TestPreemptNow_NoPreemptStaysBackup(t *testing.T) {
 	vi.lastMasterSeen = time.Now()
 	vi.mu.Unlock()
 
-	masterDown, advert := longTimers(t)
+	masterDown, advert, preemptHold := longTimers(t)
 	vi.triggerPreemptNow()
-	vi.stepBackup(masterDown, advert)
+	vi.stepBackup(masterDown, advert, preemptHold)
 
 	if vi.getState() != StateBackup {
 		t.Errorf("state = %s, want BACKUP (preempt=false must never preempt on the shortcut)", vi.getState())
@@ -177,9 +180,9 @@ func TestPreemptNow_NoObservedMasterBecomesMaster(t *testing.T) {
 	vi := newGateTestInstance(t, 100, true)
 	// lastMasterSeen left zero.
 
-	masterDown, advert := longTimers(t)
+	masterDown, advert, preemptHold := longTimers(t)
 	vi.triggerPreemptNow()
-	vi.stepBackup(masterDown, advert)
+	vi.stepBackup(masterDown, advert, preemptHold)
 
 	if vi.getState() != StateMaster {
 		t.Errorf("state = %s, want MASTER (cold-start, no observed master)", vi.getState())
@@ -204,18 +207,21 @@ func TestPreemptNow_DeniedGateLeavesMasterDownTimerArmed(t *testing.T) {
 	defer masterDownLong.Stop()
 	advert := time.NewTimer(time.Hour)
 	defer advert.Stop()
+	preemptHold := time.NewTimer(time.Hour)
+	defer preemptHold.Stop()
 	vi.triggerPreemptNow()
-	vi.stepBackup(masterDownLong, advert)
+	vi.stepBackup(masterDownLong, advert, preemptHold)
 	if vi.getState() != StateBackup {
 		t.Fatalf("state = %s after denied gate, want BACKUP", vi.getState())
 	}
 
 	// Now simulate the masterDownTimer firing (real master died): a fresh,
 	// already-expired masterDown timer drives the second iteration. The gate
-	// never stopped the timer, so the RFC election promotes us.
+	// never stopped the timer, so the RFC election promotes us. No hold-time
+	// is configured (PreemptHoldTime 0) so takeover stays immediate (#2850).
 	masterDownExpired := time.NewTimer(0)
 	defer masterDownExpired.Stop()
-	vi.stepBackup(masterDownExpired, advert)
+	vi.stepBackup(masterDownExpired, advert, preemptHold)
 	if vi.getState() != StateMaster {
 		t.Errorf("state = %s, want MASTER (masterDown election must still promote after a denied gate)", vi.getState())
 	}
@@ -351,9 +357,11 @@ func TestRecordMasterAdvert_RecordsNonZero(t *testing.T) {
 	vi := newGateTestInstance(t, 100, true)
 	masterDown := time.NewTimer(time.Hour)
 	defer masterDown.Stop()
+	preemptHold := time.NewTimer(time.Hour)
+	defer preemptHold.Stop()
 
 	before := time.Now()
-	vi.handleBackupRx(&VRRPPacket{Priority: 200, SrcIP: net.IPv4(10, 0, 0, 2)}, masterDown)
+	vi.handleBackupRx(&VRRPPacket{Priority: 200, SrcIP: net.IPv4(10, 0, 0, 2)}, masterDown, preemptHold)
 
 	vi.mu.RLock()
 	gotPri := vi.lastMasterPriority
@@ -375,6 +383,8 @@ func TestRecordMasterAdvert_IgnoresPriorityZero(t *testing.T) {
 	vi := newGateTestInstance(t, 100, true)
 	masterDown := time.NewTimer(time.Hour)
 	defer masterDown.Stop()
+	preemptHold := time.NewTimer(time.Hour)
+	defer preemptHold.Stop()
 
 	// Seed a recorded master.
 	vi.mu.Lock()
@@ -384,7 +394,7 @@ func TestRecordMasterAdvert_IgnoresPriorityZero(t *testing.T) {
 	vi.mu.Unlock()
 
 	// Feed a priority-0 advert (resignation).
-	vi.handleBackupRx(&VRRPPacket{Priority: 0, SrcIP: net.IPv4(10, 0, 0, 2)}, masterDown)
+	vi.handleBackupRx(&VRRPPacket{Priority: 0, SrcIP: net.IPv4(10, 0, 0, 2)}, masterDown, preemptHold)
 
 	vi.mu.RLock()
 	gotPri := vi.lastMasterPriority

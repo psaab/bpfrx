@@ -261,7 +261,24 @@ func vrrpGroupSchemaNode(v6 bool) *schemaNode {
 			validator:     ValidateInteger(1, 255),
 			children:      nil,
 		},
-		"preempt":     {desc: "Allow preemption", children: nil},
+		// Junos `preempt { hold-time <seconds>; }`: a higher-priority
+		// backup that comes back up waits hold-time seconds before
+		// preempting a still-live lower-priority master, so failback is
+		// deferred until dynamic routing converges (avoids a transient
+		// blackhole). 0/unset hold-time = immediate preemption (today's
+		// behavior). Bare `preempt` (no hold-time) is still valid.
+		"preempt": {desc: "Allow preemption", children: map[string]*schemaNode{
+			"hold-time": {
+				desc:          "Seconds to wait before preempting a live lower-priority master",
+				args:          1,
+				placeholder:   "<seconds>",
+				valueType:     ValueInteger,
+				valueDesc:     "Preempt hold-time in seconds (1..3600; 0/unset = immediate)",
+				valueExamples: []string{"30", "60", "120"},
+				validator:     ValidateInteger(1, 3600),
+				children:      nil,
+			},
+		}},
 		"accept-data": {desc: "Accept packets sent to the virtual address", children: nil},
 		// Seconds. xpf-DIVERGENT from Junos (1..255 s): the value is
 		// converted seconds→ms (pkg/vrrp/vrrp.go:58) then ms→centiseconds

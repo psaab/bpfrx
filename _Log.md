@@ -16935,6 +16935,68 @@ top.
   pkg/ra/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2850 — add VRRP `preempt hold-time <seconds>` (vSRX parity).
+  Without it a higher-priority node reclaims mastership from a still-live
+  lower-priority master IMMEDIATELY on recovery — before BGP/OSPF converge —
+  blackholing every failback. Added Junos `vrrp-group <id> preempt
+  { hold-time <s>; }`: new nested typed leaf in `setSchema`
+  (`ValidateInteger(1, 3600)`), parsed in BOTH config shapes (braced child
+  + flat-set `preempt hold-time <n>` Keys-run) into
+  `VRRPGroup.PreemptHoldTime`, plumbed to `vrrp.Instance.PreemptHoldTime`.
+  State machine: `stepBackup` now takes a `preemptHoldTimer`. In the
+  `masterDownTimer.C` case, when a hold-time is set AND
+  `preemptingLiveLowerMaster()` (live, recent, strictly-lower master — the
+  same #2082 snapshot math), the promotion is DEFERRED by arming the hold
+  timer instead of `becomeMaster()`; the new `preemptHoldTimer.C` case
+  promotes when it elapses. Dead/stale master = immediate (not held); a
+  priority-0 resign arms a one-shot `skipNextPreemptHold` so planned
+  failover stays zero-delay; a returning >= master or a forced/coordinated
+  `preemptNowCh` stop-drains the hold. Bare `preempt` (PreemptHoldTime 0) is
+  immediate — today's behavior, unchanged. Composes cleanly with the #2082
+  sync-hold preempt gate (separate path: `preemptNowCh` shortcut vs the
+  `masterDownTimer` election the hold-time wraps).
+  FAIL-ON-REVERT: copied `instance.go` aside, replaced the hold-arming
+  branch with `_ = skipHold` →
+  `TestHoldTime_PreemptLiveLowerMasterDeferred` FAILs (state=MASTER, want
+  BACKUP); restored, green. Config-side FAIL-ON-REVERT: dropping the
+  hold-time parse leaves `PreemptHoldTime` 0 → the FlatSet/Hierarchical
+  tests fail.
+  test-failover relevance: YES (HA / VRRP state machine) — PARENT runs
+  `make test-failover` before merge.
+  Gates: go build ./... clean; gofmt -l clean (my files); go vet
+  ./pkg/vrrp/... ./pkg/config/... clean; go test -race ./pkg/vrrp/...
+  ./pkg/config/... ok.
+  **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/vrrp.go, pkg/vrrp/manager.go,
+  pkg/vrrp/instance_preempt_gate_test.go,
+  pkg/vrrp/instance_preempt_holdtime_test.go, pkg/config/types_interfaces.go,
+  pkg/config/schema_interfaces.go, pkg/config/compiler_interfaces.go,
+  pkg/config/vrrp_preempt_holdtime_test.go, docs/config-schema.md,
+  pkg/vrrp/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2850 review fold (MERGE-NEEDS-MINOR) — fix one-shot
+  `skipNextPreemptHold` leak. The resign bypass was set in handleBackupRx's
+  priority-0 path and cleared ONLY in the masterDownTimer.C handler. Race:
+  after a priority-0 resign arms the 1ms masterDownTimer + sets the bypass,
+  a worthy (>= priority) advert arriving before the 1ms fire reset
+  masterDownTimer to the full interval and drained the hold but did NOT
+  clear the bypass — so it survived to a LATER legitimate masterDownTimer
+  expiry and wrongly skipped the hold once (conservative: one failback
+  faster, never stuck). Fix: clear `skipNextPreemptHold = false` in the
+  accept-worthy-master branch (tying the bypass's lifetime to the same
+  condition that drains the hold) AND in `becomeBackup` (a fresh BACKUP
+  tenure after a worthy step-down has no pending resign decision). Both are
+  worthy-master-accepted paths that reset masterDownTimer to the full
+  interval; the priority-0 ARMING path itself is untouched.
+  New test `TestHoldTime_ResignBypassClearedByWorthyMaster`: resign arms
+  skip → worthy advert clears it → later live-lower master → hold IS
+  applied (BACKUP, not promoted). FAIL-ON-REVERT: copied instance.go aside,
+  removed the clear in handleBackupRx → the test FAILs ("skipNextPreemptHold
+  leaked past a worthy-master return"); restored, green.
+  Gates: go build ./... clean; gofmt -l clean; go vet ./pkg/vrrp/...
+  ./pkg/config/... clean; go test -race ./pkg/vrrp/... ./pkg/config/... ok.
+  **File(s)**: pkg/vrrp/instance.go,
+  pkg/vrrp/instance_preempt_holdtime_test.go, _Log.md
   **Action**: #2846 — bind DDNS HTTP backends + checkip to the configured
   source-address/destination-interface/routing-instance. Before this only the
   RFC 2136 backend honored the source binding; the HTTP backends

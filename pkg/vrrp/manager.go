@@ -380,6 +380,7 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 			if !ifindexChanged &&
 				existing.cfg.Priority == inst.Priority &&
 				existing.cfg.Preempt == inst.Preempt &&
+				existing.cfg.PreemptHoldTime == inst.PreemptHoldTime &&
 				existing.cfg.TrackInterface == inst.TrackInterface &&
 				existing.cfg.TrackPriorityCost == inst.TrackPriorityCost &&
 				vipsEqual(existing.cfg.VirtualAddresses, inst.VirtualAddresses) {
