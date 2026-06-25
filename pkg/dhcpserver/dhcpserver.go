@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -714,6 +715,48 @@ func keaExpiredLeasesMap(c *config.DHCPExpiredLeasesConfig) map[string]any {
 	return m
 }
 
+// stableGroups returns the DHCP server groups in a DETERMINISTIC,
+// reload-stable order (#2668). The config holds groups in a Go map whose
+// iteration order is randomized, so assigning Kea subnet_id over a direct
+// map range produced a different ID for the same subnet on every config
+// regeneration. Sorting by the group name (the map key) gives the same
+// subnet the same subnet_id across reloads of an unchanged config, which is
+// what Kea needs to keep memfile leases bound to the right subnet. The map
+// key is mirrored into DHCPServerGroup.Name by the compiler, but we sort on
+// the authoritative map key so a (hypothetical) name/key mismatch cannot
+// reintroduce nondeterminism.
+func stableGroups(groups map[string]*config.DHCPServerGroup) []*config.DHCPServerGroup {
+	names := make([]string, 0, len(groups))
+	for name := range groups {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]*config.DHCPServerGroup, 0, len(names))
+	for _, name := range names {
+		out = append(out, groups[name])
+	}
+	return out
+}
+
+// stablePools returns a group's pools in a deterministic order (#2668).
+// Pools already arrive as a config-declared slice (stable across reloads of
+// an unchanged config), but sorting by the pool subnet (then name) hardens
+// the subnet_id assignment against a pool being reordered within a group:
+// the subnet string is the natural key Kea uses to bind a lease, so a pool
+// keeps its subnet_id even if its position in the group's list shifts. It
+// returns a fresh slice — the caller's config is not mutated.
+func stablePools(pools []*config.DHCPPool) []*config.DHCPPool {
+	out := make([]*config.DHCPPool, len(pools))
+	copy(out, pools)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Subnet != out[j].Subnet {
+			return out[i].Subnet < out[j].Subnet
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
 func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 	type keaPool struct {
 		Pool string `json:"pool"`
@@ -741,8 +784,16 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 
 	var subnets []keaSubnet4
 	subnetID := 1
-	for _, group := range cfg.DHCPLocalServer.Groups {
-		for _, pool := range group.Pools {
+	// #2668: assign Kea subnet_id over a DETERMINISTIC, reload-stable order.
+	// Ranging the Groups map directly used Go's randomized map-iteration
+	// order, so every config regeneration (commit / reload) could hand the
+	// same subnet a DIFFERENT subnet_id. Kea binds memfile leases
+	// (kea-leases4.csv) to subnets by the subnet_id column, so a shifted ID
+	// remaps live leases onto the wrong subnet. Iterate group names sorted
+	// lexically and pools sorted by their subnet so the SAME logical subnet
+	// always gets the SAME subnet_id across reloads of an unchanged config.
+	for _, group := range stableGroups(cfg.DHCPLocalServer.Groups) {
+		for _, pool := range stablePools(group.Pools) {
 			sub := keaSubnet4{
 				ID:     subnetID,
 				Subnet: pool.Subnet,
@@ -798,9 +849,10 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 		}
 	}
 
-	// Collect interfaces
+	// Collect interfaces. Sorted group order (#2668) also keeps this list
+	// deterministic across reloads.
 	var ifaces []string
-	for _, group := range cfg.DHCPLocalServer.Groups {
+	for _, group := range stableGroups(cfg.DHCPLocalServer.Groups) {
 		ifaces = append(ifaces, group.Interfaces...)
 	}
 
@@ -855,8 +907,12 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 
 	var subnets []keaSubnet6
 	subnetID := 1
-	for _, group := range cfg.DHCPv6LocalServer.Groups {
-		for _, pool := range group.Pools {
+	// #2668: same reload-stable subnet_id ordering as the v4 path. Kea binds
+	// kea-leases6.csv leases by subnet_id, so the randomized map-iteration
+	// order had to be replaced by a deterministic sort to keep active leases
+	// pinned to their subnet across reloads.
+	for _, group := range stableGroups(cfg.DHCPv6LocalServer.Groups) {
+		for _, pool := range stablePools(group.Pools) {
 			sub := keaSubnet6{
 				ID:     subnetID,
 				Subnet: pool.Subnet,
@@ -914,8 +970,9 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 		}
 	}
 
+	// Sorted group order (#2668) keeps this list deterministic across reloads.
 	var ifaces []string
-	for _, group := range cfg.DHCPv6LocalServer.Groups {
+	for _, group := range stableGroups(cfg.DHCPv6LocalServer.Groups) {
 		ifaces = append(ifaces, group.Interfaces...)
 	}
 
