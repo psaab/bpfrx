@@ -354,15 +354,22 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 		po.PolicyStatements = make(map[string]*PolicyStatement)
 	}
 
-	// Parse prefix-lists
+	// Parse prefix-lists. A named prefix-list may be defined across multiple
+	// separate blocks (two `prefix-list NAME { ... }` braces, or two
+	// `set policy-options prefix-list NAME ...` groups). Reuse the existing
+	// map entry and append so later blocks MERGE into the earlier ones rather
+	// than overwriting them — mirroring the community loop below (#2641).
 	for _, inst := range namedInstances(node.FindChildren("prefix-list")) {
-		pl := &PrefixList{Name: inst.name}
+		pl := po.PrefixLists[inst.name]
+		if pl == nil {
+			pl = &PrefixList{Name: inst.name}
+			po.PrefixLists[inst.name] = pl
+		}
 		for _, entry := range inst.node.Children {
 			if len(entry.Keys) > 0 {
 				pl.Prefixes = append(pl.Prefixes, entry.Keys[0])
 			}
 		}
-		po.PrefixLists[pl.Name] = pl
 	}
 
 	// Parse community definitions

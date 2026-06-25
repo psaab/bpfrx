@@ -211,6 +211,24 @@ compiler reads via `routeFilterTrailingToken`. Proven by
 `TestPolicyTermMultiMatch_Hierarchical_2642`
 (`compiler_policy_term_multimatch_2642_test.go`).
 
+## Repeated definition blocks merge (prefix-list, community)
+
+A named policy-options DEFINITION can be authored across multiple separate
+blocks — two `prefix-list NAME { ... }` braces, or two
+`set policy-options prefix-list NAME ...` set groups (and likewise for
+`community NAME`). `compilePolicyOptions` (`compiler_routing.go`) MERGES these
+by reusing the existing `po.PrefixLists[name]` / `po.Communities[name]` map
+entry and APPENDING each block's prefixes/members, rather than allocating a
+fresh struct and overwriting `po.PrefixLists[name]` (which discarded the
+earlier block — the #2641 prefix-list bug; the community loop already merged).
+The two AST shapes converge: flat-set `SetPath` collapses repeated same-name
+set groups onto one AST node so they accumulate naturally; the hierarchical
+parser keeps two same-name brace blocks as distinct `namedInstances`, and the
+map-reuse merge keeps both. Fail-on-revert covered by
+`TestPrefixListMergeDuplicateBlocksFlatSet` /
+`TestPrefixListMergeDuplicateBlocksHierarchical`
+(`compiler_prefix_list_merge_2641_test.go`).
+
 ## How to add a config-mode typed leaf
 
 Edit the leaf's `schemaNode` in `setSchema` (in the domain's
