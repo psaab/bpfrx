@@ -202,6 +202,19 @@ load/peer-sync compile paths.
   VLAN sub-interfaces (the kernel's raw IP doesn't reliably receive
   multicast on VLANs).
 - IPv6: separate raw socket; hop limit set to 255 per RFC.
+- **`SO_BINDTODEVICE` is applied symmetrically across both families**
+  via `maybeBindToDevice` (`manager.go`): the device bind is used on a
+  plain interface for isolation but **SKIPPED on a VLAN sub-interface**
+  (name contains `.`). Generic-XDP VLAN tag handling makes the kernel's
+  interface association unpredictable, so pinning the raw socket to the
+  VLAN sub-interface index can drop VRRP multicast. Before #2786 only the
+  IPv4 path skipped — the IPv6 path bound unconditionally, so on a VLAN
+  RETH member (e.g. `reth0.50`/`reth0.80`) the two families saw VRRP
+  traffic differently, the IPv6 instance could miss peer adverts, and both
+  nodes could hold MASTER → split-brain. Both `openPerInterfaceSocket`
+  (v4) and `openIPv6Socket` (v6) now route their bind through the single
+  `maybeBindToDevice` decision. IPv6 multicast egress is steered by
+  `IPV6_MULTICAST_IF`, which does not depend on `SO_BINDTODEVICE`.
 - The AF_PACKET capture fd is created `SOCK_RAW|SOCK_CLOEXEC` so it is set
   close-on-exec atomically at creation (#2476). A raw `unix.Socket` does NOT
   inherit CLOEXEC the way Go `net` sockets do, so without this the raw VRRP
