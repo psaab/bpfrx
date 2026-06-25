@@ -280,17 +280,17 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 						}
 					}
 				case "export":
-					if v := nodeVal(child); v != "" {
-						groupExport = append(groupExport, v)
-					} else if len(child.Keys) >= 2 {
-						groupExport = append(groupExport, child.Keys[1:]...)
-					}
+					// Multi-value leaf (#2702): a bracket-list
+					// `export [ p1 p2 ]` collapses every policy onto
+					// child.Keys[1:] (flat-set, #2585) or onto child
+					// nodes (hierarchical). The old nodeVal-first read
+					// returned Keys[1] (non-empty) and appended ONLY the
+					// first policy, masking the Keys[1:] fallback. Route
+					// through the firewallMatchValues SSOT so all
+					// policies survive in both AST shapes.
+					groupExport = append(groupExport, firewallMatchValues(child)...)
 				case "import":
-					if v := nodeVal(child); v != "" {
-						groupImport = append(groupImport, v)
-					} else if len(child.Keys) >= 2 {
-						groupImport = append(groupImport, child.Keys[1:]...)
-					}
+					groupImport = append(groupImport, firewallMatchValues(child)...)
 				case "family":
 					// Hierarchical: family { inet { unicast; } inet6 { unicast; } }
 					// Flat (via schema): family node with children inet/inet6
@@ -449,21 +449,23 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 								// after the inherited group export so the
 								// bgpEffectiveExport last-wins helper picks the
 								// more-specific neighbor policy.
-								if v := nodeVal(prop); v != "" {
-									neighbor.Export = append(neighbor.Export, v)
-								} else if len(prop.Keys) >= 2 {
-									neighbor.Export = append(neighbor.Export, prop.Keys[1:]...)
-								}
+								//
+								// Multi-value leaf (#2702): a bracket-list
+								// `export [ p1 p2 ]` collapses every policy onto
+								// prop.Keys[1:] (flat-set) or onto child nodes
+								// (hierarchical). The old nodeVal-first read
+								// returned Keys[1] and dropped all but the first
+								// policy; firewallMatchValues accumulates both
+								// AST shapes.
+								neighbor.Export = append(neighbor.Export, firewallMatchValues(prop)...)
 							case "import":
 								// Per-neighbor import override (#2490). Appended
 								// after the inherited group import so the
 								// bgpEffectiveImport last-wins helper picks the
-								// more-specific neighbor policy.
-								if v := nodeVal(prop); v != "" {
-									neighbor.Import = append(neighbor.Import, v)
-								} else if len(prop.Keys) >= 2 {
-									neighbor.Import = append(neighbor.Import, prop.Keys[1:]...)
-								}
+								// more-specific neighbor policy. Multi-value
+								// (#2702) — accumulate every policy across both
+								// AST shapes via firewallMatchValues.
+								neighbor.Import = append(neighbor.Import, firewallMatchValues(prop)...)
 							case "family":
 								if len(prop.Keys) >= 2 {
 									switch prop.Keys[1] {

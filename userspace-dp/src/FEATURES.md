@@ -45,7 +45,7 @@ ordering.
 | File | What it does |
 |------|--------------|
 | `protocol.rs` | Control request / response and snapshot schema types shared between the control socket server (`server/`) and the AF_XDP coordinator. The JSON tags ARE the wire contract — changing them without updating the Go side (`pkg/dataplane/userspace/protocol.go`) breaks the helper. |
-| `state_writer.rs` | Crash-safe writer for the daemon's state snapshot file. Both the `io_uring` transport and the sync fallback route through one durable finalizer (`finalize_durably`): fsync temp file → atomic rename → fsync parent dir (#2147). |
+| `state_writer.rs` | Crash-safe writer for the daemon's state snapshot file. Each write goes to a PRIVATE temp path `<dest>.<pid>.<seq>.tmp` (pid + a process-global monotonic counter), created `O_EXCL`, so two writers — even overlapping helper processes during a restart/upgrade handover — can never open/truncate/write the SAME temp and publish crossed bytes under a successful rename (#2705). Both the `io_uring` transport and the sync fallback route through one durable finalizer (`finalize_durably`): fsync temp file → atomic rename → fsync parent dir (#2147); a failed write removes its unique temp so nothing leaks. |
 | `xsk_ffi.rs` | Drop-in replacement for `xdpilone` using libxdp's XSK helpers via a C bridge. Provides the same type names (`Umem`, `UmemConfig`, `UmemChunk`, `IfInfo`, `Socket`, `DeviceQueue`, `RingRx`, `RingTx`, `ReadRx`, `WriteTx`, `WriteFill`, `ReadComplete`, `XdpDesc`) so the rest of the crate compiles unchanged. |
 | `test_zone_ids.rs` | Test-only zone-id constants used across `_tests.rs` files. |
 | `main.rs` / `main_tests.rs` | Crate `main()` — argv handling and dispatch into `server::lifecycle::run()`. Tests live next door. |

@@ -1,3 +1,54 @@
+## 2026-06-24 — #2702: BGP group/neighbor export/import bracket-list truncation
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed silent policy truncation for BGP per-group and
+  per-neighbor `export`/`import` bracket lists (sibling of #2587/#2690).
+  The top-level `protocols bgp export/import` readers were moved onto the
+  multi-value `firewallMatchValues` SSOT by #2587/#2690, but the GROUP and
+  NEIGHBOR export/import readers still used the `nodeVal(child)`-first
+  pattern. For a flat-set/bracket list `export [ OUT-A OUT-B ]` the values
+  collapse onto `child.Keys[1:]` (#2585); `nodeVal` returns `Keys[1]`
+  ("OUT-A", non-empty) so the `if v != ""` branch appended ONLY the first
+  policy and the `else ... Keys[1:]` fallback never ran — every policy past
+  the first was silently dropped. (An earlier #2690 review note that the
+  group/neighbor readers were "already correct" was wrong; verified against
+  current master at lines 282-293 and 445-466.) Routed all four readers
+  (group export, group import, neighbor export, neighbor import) through the
+  shared `firewallMatchValues(child)` helper, exactly as #2587/#2690 did for
+  the top-level + policy-statement from-readers. Schema leaves were already
+  `multi:true` (`schema_routing.go` lines 197/198/227/228). Added four
+  fail-on-revert tests (group + neighbor, each flat-set AND hierarchical);
+  reverting either reader to the nodeVal-first form turns all four RED with
+  `neighbor.Export = [OUT-A]` (the truncation symptom).
+- **File(s)**: [Edit] pkg/config/compiler_protocols.go,
+  pkg/config/protocols_multileaf_2587_test.go, docs/config-schema.md,
+  _Log.md.
+## 2026-06-24 — #2517: GRE MSS clamp survives a transient egress-map miss
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed a transient silent loss of a configured GRE outbound TCP
+  MSS clamp and unified it with the WireGuard path. `native_gre_inner_mtu`
+  resolved the outer/transport MTU with its own egress-lookup chain ending in
+  `unwrap_or_default()` → 0 on an egress-map miss, which made
+  `native_gre_tcp_mss` return 0 and silently DISABLE the clamp during
+  re-reconciliation / interface bringup (until the next reconcile re-populated
+  the egress map). The sibling WG MSS clamp resolves the SAME chain via
+  `tunnel_outer_mtu` (the #2300 SSOT) with `.filter(|m| *m > 0)
+  .unwrap_or(1500)`. Routed `native_gre_inner_mtu`'s outer-MTU resolution
+  through `tunnel_outer_mtu` so both tunnel MSS paths read ONE resolver and
+  cannot drift: a GRE egress miss now falls back to the 1500 underlay MTU and
+  the GRE overhead is still subtracted after, so the clamp stays live. Dropped
+  the now-redundant `.cloned()` and the dead `if transport_mtu == 0` guard
+  (`tunnel_outer_mtu` never returns 0). Added a fail-on-revert test
+  (native_gre_inner_mtu_falls_back_to_1500_on_egress_miss — clears egress,
+  asserts inner MTU 1456 + MSS 1416, not 0) proven to turn RED under the old
+  `unwrap_or_default()`, plus a no-regression test
+  (native_gre_inner_mtu_uses_real_egress_mtu_when_present). Gates: cargo build
+  --release clean (no new forwarding/mod.rs warnings); filtered tests (gre /
+  mss / tunnel / forwarding) green.
+- **File(s)**: [Edit] userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/tunnel_tests.rs, docs/wireguard-interop.md, _Log.md.
+
 ## 2026-06-24 — #2466: flow-cache RG epoch index fallback for out-of-range RG IDs
 
 - **Timestamp**: 2026-06-24
@@ -14169,3 +14220,55 @@ top.
   Go filter lets the undefined-class entry cross the wire (surviving-entry
   asserts go red); restoring `.max(0) as usize` collapses -1→0 (expect_err goes
   red).
+## 2026-06-24 — #2707 VRRP addr-watch ifindex robustness (fix/2707-vrrp-addrwatch-ifindex)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Make the VRRP source-address watcher robust to a sub-interface
+  (VLAN/GRE/WireGuard) being deleted and recreated with a NEW ifindex. The
+  watcher matched address events only by the cached `vi.iface.Index`, so after
+  a recreate (config change, driver restart, link-cycle recovery) every address
+  event on the new ifindex was silently dropped until the ~2s reconcile noticed
+  the drift — leaving the instance on a stale source/socket for that window.
+- **Fix**: `reresolveAddrFor` keeps the syscall-free fast path (match by cached
+  ifindex -> `reresolveLocalAddrs`). On a cached-ifindex MISS it resolves the
+  event ifindex -> current link NAME (one syscall, only on a miss) via a new
+  `resolveLinkName` seam (`netlinkLinkName` = `netlink.LinkByIndex`), re-matches
+  instances by their STABLE configured name, and on an ifindex drift triggers
+  the immediate-reconcile lever (`onEventDrop`, wired to `triggerReconcile` in
+  the daemon). UpdateInstances then rebinds the drifted instance to the new
+  ifindex and re-resolves the source — event-driven, not ~2s-deferred. We do
+  NOT mutate `vi.iface` here (it would race the run-loop reads in
+  sendPacket/sendPacketIPv6); the reconcile owns the rebind.
+- **File(s)**: pkg/vrrp/addrwatch.go (reresolveAddrFor + netlinkLinkName),
+  pkg/vrrp/manager.go (resolveLinkName seam + NewManager default),
+  pkg/vrrp/addrwatch_test.go (RecreatedLinkNewIfindexSchedulesReconcile
+  fail-on-revert + UnchangedIfindexUsesFastPath guard), _Log.md.
+- **Validation**: `go build ./...` clean; gofmt/vet clean on touched files;
+  `go test -race ./pkg/vrrp/...` green; fail-on-revert proven (reverting to the
+  cached-only match makes the recreated-link test time out RED). HA-touching ->
+  `make test-failover` MANDATORY before merge (parent runs it; not attempted
+  here).
+## 2026-06-24 — #2705 state_writer unique temp path (cross-writer corruption hardening)
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed deterministic `temporary_path()` (`<dest>.tmp`) that let two
+  writers — overlapping helper processes (restart/upgrade handover) or future
+  multi-instance code/tests — open/truncate/write the SAME temp and publish
+  crossed bytes under a successful rename (a syntactically valid but wrong-epoch
+  snapshot). Each write now uses a PRIVATE temp `<dest>.<pid>.<seq>.tmp` (pid +
+  process-global monotonic `AtomicU64`), created `O_EXCL` (`create_new`), then
+  atomically renamed onto the dest (last-writer-wins on the final file is
+  acceptable; crossed bytes are not). Added `cleanup_on_error` so a failed write
+  removes its unique temp (no leak now that names are non-reused). Atomic
+  rename + fsync(temp)+fsync(parent) durability contract preserved.
+- **Tests**: `temporary_path_is_unique_per_call_for_same_dest` (distinct temps,
+  same dir, recognizable sibling, extension-less too),
+  `two_concurrent_writers_never_publish_crossed_bytes` (two threads × 200 writes
+  of distinct 64K payloads → final file is one COMPLETE payload, no temp leak),
+  `failed_write_cleans_up_its_unique_temp` (injected fsync failure → no temp
+  sibling). Fail-on-revert proven: reverting to the deterministic temp turns
+  both unique/concurrent tests RED.
+- **Gates**: `cargo build --release` clean (no new state_writer.rs warnings);
+  `cargo test --release --bin xpf-userspace-dp state_writer` → 7 passed / 0
+  failed.
+- **File(s)**: userspace-dp/src/state_writer.rs, userspace-dp/src/FEATURES.md,
+  _Log.md.

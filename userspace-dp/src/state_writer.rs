@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -149,31 +149,52 @@ fn persist_with_mode(mode: &mut WriteMode, path: &str, data: &[u8]) -> Result<()
 }
 
 fn persist_with_io_uring(ring: &mut IoUring, path: &str, data: &[u8]) -> Result<(), String> {
+    // Each write gets a PRIVATE temp path (pid + monotonic counter), created
+    // with O_EXCL so two concurrent writers — even different helper processes
+    // racing the same destination during a restart/upgrade handover — can never
+    // open, truncate, or write the SAME temp file. The atomic rename then
+    // publishes onto `path` (last-writer-wins on the final file is acceptable;
+    // crossed bytes under a successful rename are not, #2705).
     let tmp = temporary_path(path);
     let file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .open(&tmp)
         .map_err(|e| format!("open temp state file {}: {e}", tmp.display()))?;
-    write_all_with_ring(ring, file.as_raw_fd(), data)?;
-    finalize_durably(&file, &tmp, path)
+    let result = (|| {
+        write_all_with_ring(ring, file.as_raw_fd(), data)?;
+        finalize_durably(&file, &tmp, path)
+    })();
+    cleanup_on_error(&tmp, result)
 }
 
 fn persist_sync(path: &str, data: &[u8]) -> Result<(), String> {
+    // See persist_with_io_uring: O_EXCL unique temp, atomic rename publish.
     let tmp = temporary_path(path);
     let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .open(&tmp)
         .map_err(|e| format!("open temp state file {}: {e}", tmp.display()))?;
-    {
-        use io::Write;
-        file.write_all(data)
-            .map_err(|e| format!("write temp state file {}: {e}", tmp.display()))?;
+    let result = (|| {
+        {
+            use io::Write;
+            file.write_all(data)
+                .map_err(|e| format!("write temp state file {}: {e}", tmp.display()))?;
+        }
+        finalize_durably(&file, &tmp, path)
+    })();
+    cleanup_on_error(&tmp, result)
+}
+
+/// On a failed write the unique temp is never renamed into place, so it would
+/// leak. Remove it (best-effort) and propagate the original error. On success
+/// the rename already consumed the temp, so there is nothing to clean up.
+fn cleanup_on_error(tmp: &Path, result: Result<(), String>) -> Result<(), String> {
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
     }
-    finalize_durably(&file, &tmp, path)
+    result
 }
 
 /// Shared crash-safe finalizer for both write transports (io_uring and the
@@ -221,14 +242,27 @@ fn write_all_with_ring(ring: &mut IoUring, fd: i32, data: &[u8]) -> Result<(), S
         .map_err(|e| e.to_string())
 }
 
+/// Process-global monotonic counter that makes every temp path produced by this
+/// process unique, even for back-to-back writes to the same destination.
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Build a PRIVATE temp path for one write: `<dest>.<pid>.<seq>.tmp`. The pid
+/// isolates separate helper processes (restart/upgrade handover) and the
+/// per-process monotonic counter isolates concurrent or rapid in-process writes.
+/// Two distinct writers therefore never name — and so never open/truncate/write
+/// — the same temp file, which is what previously let a successful rename
+/// publish crossed bytes (#2705). The destination's own extension is preserved
+/// in the stem so the temp stays a recognizable sibling.
 fn temporary_path(path: &str) -> PathBuf {
+    let pid = std::process::id();
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut tmp = PathBuf::from(path);
-    let ext = tmp
+    let suffix = tmp
         .extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| format!("{ext}.tmp"))
-        .unwrap_or_else(|| "tmp".to_string());
-    tmp.set_extension(ext);
+        .map(|ext| format!("{ext}.{pid}.{seq}.tmp"))
+        .unwrap_or_else(|| format!("{pid}.{seq}.tmp"));
+    tmp.set_extension(suffix);
     tmp
 }
 
@@ -380,6 +414,120 @@ mod tests {
             fs::read(&dest).unwrap(),
             b"previous-good",
             "destination must be untouched when the temp-file fsync fails"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temporary_path_is_unique_per_call_for_same_dest() {
+        // The core #2705 invariant: two writes targeting the SAME destination
+        // must get DISTINCT temp paths so they can never open/truncate/write the
+        // same temp file and publish crossed bytes under a successful rename.
+        // With the old deterministic `<dest>.tmp` both calls returned the same
+        // path and this assertion goes RED (fail-on-revert).
+        let dest = "/tmp/xpf-state-uniq/state.json";
+        let a = temporary_path(dest);
+        let b = temporary_path(dest);
+        assert_ne!(
+            a, b,
+            "two writes to the same dest must use distinct temp paths (got {a:?} twice)"
+        );
+        // Still a recognizable sibling of the destination, in the same dir.
+        assert_eq!(a.parent(), Path::new(dest).parent());
+        assert_eq!(b.parent(), Path::new(dest).parent());
+        for p in [&a, &b] {
+            let name = p.file_name().unwrap().to_str().unwrap();
+            assert!(name.starts_with("state.json."), "unexpected temp name: {name}");
+            assert!(name.ends_with(".tmp"), "unexpected temp name: {name}");
+        }
+        // Extension-less destinations also get a unique temp.
+        let c = temporary_path("/tmp/xpf-state-uniq/state");
+        let d = temporary_path("/tmp/xpf-state-uniq/state");
+        assert_ne!(c, d, "extension-less dest must also get unique temp paths");
+    }
+
+    #[test]
+    fn two_concurrent_writers_never_publish_crossed_bytes() {
+        // Simulate two writers (two logical "processes"/instances) racing the
+        // same destination. Each writes a distinct, self-describing payload many
+        // times. Because every write uses a private O_EXCL temp + atomic rename,
+        // the destination must ALWAYS contain exactly one writer's COMPLETE
+        // payload — never a mix. With a shared deterministic temp, the open(+
+        // truncate)/write/rename sequences could interleave and publish crossed
+        // bytes; here that is impossible.
+        let dir = tmpdir();
+        let dest = dir.join("state.json");
+        let dest_str = dest.to_str().unwrap().to_string();
+
+        // Two payloads of equal length, each internally consistent.
+        let payload_a = vec![b'A'; 64 * 1024];
+        let payload_b = vec![b'B'; 64 * 1024];
+
+        let iters = 200usize;
+        let d_a = dest_str.clone();
+        let p_a = payload_a.clone();
+        let d_b = dest_str.clone();
+        let p_b = payload_b.clone();
+
+        let h_a = thread::spawn(move || {
+            for _ in 0..iters {
+                persist_sync(&d_a, &p_a).expect("writer A persist");
+            }
+        });
+        let h_b = thread::spawn(move || {
+            for _ in 0..iters {
+                persist_sync(&d_b, &p_b).expect("writer B persist");
+            }
+        });
+        h_a.join().unwrap();
+        h_b.join().unwrap();
+
+        // The final file must be exactly one writer's complete payload.
+        let final_bytes = fs::read(&dest).unwrap();
+        assert!(
+            final_bytes == payload_a || final_bytes == payload_b,
+            "final file is neither complete payload (len={}, first byte={:?}) — crossed bytes",
+            final_bytes.len(),
+            final_bytes.first()
+        );
+
+        // No private temp files leaked: only the destination should remain.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "state.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files leaked after concurrent writes: {leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_write_cleans_up_its_unique_temp() {
+        // A unique temp is never renamed on failure, so it must be removed or it
+        // would accumulate. Inject a temp-file fsync failure and assert no temp
+        // sibling is left behind in the directory.
+        let dir = tmpdir();
+        let dest = dir.join("state.json");
+        let dest_str = dest.to_str().unwrap();
+
+        let guard = SyncGuard::install();
+        guard.fail_at(1); // temp-file fsync fails -> no rename, temp must be cleaned
+
+        let err = persist_sync(dest_str, b"doomed").expect_err("write should fail");
+        assert!(err.contains("sync temp state file"), "unexpected error: {err}");
+
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "failed write must clean up its unique temp; found: {leftovers:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
