@@ -2,6 +2,8 @@ package dhcpserver
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -77,6 +79,14 @@ type rfc2136Updater struct {
 	reverseZones []string
 
 	timeout time.Duration
+
+	// dhcidClientID is the client identity (from the LeaseDNSRecord) for the
+	// record currently being upserted/deleted. It seeds the RFC 4701 DHCID
+	// ownership marker under replace-owned. It is set at the top of each
+	// UpsertLease / DeleteLease call (the manager serializes all reconcile
+	// work under its mutex, so per-call mutation of this stateless-config
+	// backend is safe). Empty ⇒ no DHCID (name-not-in-use guard only).
+	dhcidClientID string
 
 	client dnsExchanger // *dns.Client in production; recorder in tests
 
@@ -275,6 +285,7 @@ func canonicalReverseZone(ptrName string) string {
 // (plan §4.1). The forward add is the operation whose success governs the
 // lease's reconcile result; a PTR NOTAUTH/REFUSED is a counted skip.
 func (u *rfc2136Updater) UpsertLease(ctx context.Context, rec LeaseDNSRecord) error {
+	u.dhcidClientID = rec.ClientID
 	forwardRR, err := u.forwardRR(rec)
 	if err != nil {
 		return err
@@ -307,12 +318,13 @@ func (u *rfc2136Updater) UpsertLease(ctx context.Context, rec LeaseDNSRecord) er
 // the same name is never collateral. A PTR NOTAUTH/REFUSED on delete is the
 // same counted skip as on add.
 func (u *rfc2136Updater) DeleteLease(ctx context.Context, rec LeaseDNSRecord) error {
+	u.dhcidClientID = rec.ClientID
 	forwardRR, err := u.forwardRR(rec)
 	if err != nil {
 		return err
 	}
 	zone := u.resolveForwardZone(rec.FQDN)
-	if err := u.sendRemove(ctx, zone, forwardRR); err != nil {
+	if err := u.sendRemoveForward(ctx, zone, forwardRR); err != nil {
 		return fmt.Errorf("ddns: forward delete %s %s: %w", rec.ForwardType, rec.FQDN, err)
 	}
 	if rec.PTRName != "" {
@@ -367,12 +379,87 @@ func (u *rfc2136Updater) ptrRR(rec LeaseDNSRecord) dns.RR {
 	}
 }
 
-// sendAdd issues an exact-RR ADD honoring the conflict policy. replace-owned
-// sends a bare Insert (the never-delete-non-owned boundary lives in the
-// reconciler, not on the wire); skip-existing precedes the Insert with a
-// "name not in use" prerequisite and skips on a YX collision; strict-fail
-// surfaces the collision as an error.
+// dhcidIdentifierType is the RFC 4701 §3.3 "identifier type code" in the DHCID
+// RDATA. xpf hashes a single opaque client identity (the DHCPv4
+// client-id||hwaddr or the DHCPv6 DUID/IAID the lease parser already
+// composed) rather than re-deriving the precise on-wire option, so it uses
+// 0x0000 ("the 1-octet htype followed by the hardware address" is 0x0000;
+// the client-identifier option is 0x0001; the DUID is 0x0002 — RFC 4701 §3.3
+// / §3.5). The exact code is not interoperability-critical here: xpf is the
+// only writer of these DHCID RRs, the digest input is stable across an
+// add/delete pair, and the prerequisite only ever compares xpf's own DHCID
+// against itself. We fix it to 0x0000 so the marker is deterministic.
+const dhcidIdentifierType = 0x0000
+
+// dhcidDigestTypeSHA256 is the RFC 4701 §3.4 digest type code for SHA-256.
+const dhcidDigestTypeSHA256 = 0x01
+
+// dhcidRR builds the RFC 4701 DHCID resource record that proves xpf owns a
+// forward name. The RDATA is: 2-byte identifier-type || 1-byte digest-type
+// || SHA-256(client-identity || canonical-FQDN-in-wire-form) (RFC 4701
+// §3.5). miekg's DHCID.Digest is the base64 of that whole RDATA blob.
+//
+// The FQDN is folded into the digest in DNS wire form (canonical, lowercased)
+// so the marker is bound to BOTH the client identity and the exact name —
+// the same (identity, name) pair always produces the same DHCID, and a
+// different name or client cannot collide onto it. Returns ok=false when the
+// lease has no stable client identity (the caller then omits the DHCID and
+// uses the name-not-in-use prerequisite instead).
+func dhcidRR(clientID, fqdn string, ttl uint32) (*dns.DHCID, bool) {
+	if clientID == "" {
+		return nil, false
+	}
+	name := dns.CanonicalName(dns.Fqdn(fqdn))
+	wire := make([]byte, len(name)+1)
+	off, err := dns.PackDomainName(name, wire, 0, nil, false)
+	if err != nil {
+		// A name that cannot be packed (should not happen for a validated
+		// FQDN) means we cannot bind the digest to it: omit the DHCID and let
+		// the caller fall back to the name-not-in-use prerequisite.
+		return nil, false
+	}
+	h := sha256.New()
+	h.Write([]byte(clientID))
+	h.Write(wire[:off])
+	digest := h.Sum(nil)
+
+	rdata := make([]byte, 0, 3+len(digest))
+	rdata = append(rdata, byte(dhcidIdentifierType>>8), byte(dhcidIdentifierType&0xff))
+	rdata = append(rdata, byte(dhcidDigestTypeSHA256))
+	rdata = append(rdata, digest...)
+
+	return &dns.DHCID{
+		Hdr: dns.RR_Header{
+			Name:   name,
+			Rrtype: dns.TypeDHCID,
+			Class:  dns.ClassINET,
+			Ttl:    ttl,
+		},
+		Digest: base64.StdEncoding.EncodeToString(rdata),
+	}, true
+}
+
+// sendAdd issues an exact-RR ADD honoring the conflict policy.
+//
+//   - replace-owned (the SAFE default, #2648): xpf claims a name only when it
+//     can PROVE ownership. It computes the RFC 4701 DHCID for (client-id,
+//     name) and runs RFC 4703 §5.3 DHCID conflict resolution: first try to
+//     add the A/AAAA + DHCID with a "name not in use" prerequisite (a fresh
+//     name we are free to claim); if that collides (YXDOMAIN), retry with a
+//     "DHCID matches OURS" prerequisite so we only adopt/update a name WE
+//     already own. If neither holds — a third party owns the name (a
+//     different or absent DHCID) — the add is REFUSED and counted, so xpf
+//     never records ownership of, and therefore never later deletes, a
+//     record it did not create. When the lease has no stable client identity
+//     the DHCID is omitted and the name-not-in-use prerequisite alone guards
+//     the claim (still never adopting a pre-existing third-party RR).
+//   - skip-existing: precede the Insert with a "name not in use" prerequisite
+//     and skip on a YX collision.
+//   - strict-fail: same prerequisite, surface the collision as an error.
 func (u *rfc2136Updater) sendAdd(ctx context.Context, zone string, rr dns.RR) error {
+	if u.conflictPolicy == "replace-owned" {
+		return u.sendAddOwned(ctx, zone, rr)
+	}
 	m := new(dns.Msg)
 	m.SetUpdate(dns.Fqdn(zone))
 	switch u.conflictPolicy {
@@ -403,6 +490,100 @@ func (u *rfc2136Updater) sendAdd(ctx context.Context, zone string, rr dns.RR) er
 	}
 }
 
+// dhcidForRR returns the DHCID RR that should accompany an A/AAAA add under
+// replace-owned, derived from the client identity carried alongside the
+// record. Reverse PTR adds get no DHCID (RFC 4701 binds the marker to the
+// forward owner name only). ok=false means no DHCID applies (a reverse name,
+// or a forward name with no stable client identity).
+func (u *rfc2136Updater) dhcidForRR(rr dns.RR) (*dns.DHCID, bool) {
+	if rr.Header().Rrtype != dns.TypeA && rr.Header().Rrtype != dns.TypeAAAA {
+		return nil, false
+	}
+	return dhcidRR(u.dhcidClientID, rr.Header().Name, rr.Header().Ttl)
+}
+
+// sendAddOwned implements the replace-owned ownership-proving add via RFC 4703
+// DHCID conflict resolution. The two-condition "DHCID matches OR name unused"
+// guard cannot be a single RFC 2136 prerequisite (prerequisites are AND-ed),
+// so it is two sequential attempts (RFC 4703 §5.3.2):
+//
+//  1. Attempt A — add A/AAAA (+ DHCID, when there is a client identity) with a
+//     NAME-NOT-IN-USE prerequisite. Success ⇒ a fresh name we now own.
+//  2. On YXDOMAIN/YXRRSET (the name already exists) — Attempt B — add the same
+//     records with a DHCID-MATCHES-OURS prerequisite (a value-dependent RRset-
+//     exists prereq, RFC 2136 §2.4.2). Success ⇒ a name WE already own,
+//     refreshed. Another YX ⇒ a third party owns the name: REFUSE (count the
+//     conflict, return nil so the lease's reconcile is not failed, and record
+//     NO ownership — upsertLocked only records ownership on a successful add).
+//
+// When the lease has no client identity there is no DHCID to match, so the
+// name-not-in-use prerequisite alone gates the claim: a pre-existing name (by
+// anyone) is refused and never adopted.
+func (u *rfc2136Updater) sendAddOwned(ctx context.Context, zone string, rr dns.RR) error {
+	dhcid, hasDHCID := u.dhcidForRR(rr)
+
+	// Attempt A: fresh-name claim (name not in use).
+	mA := new(dns.Msg)
+	mA.SetUpdate(dns.Fqdn(zone))
+	mA.NameNotUsed([]dns.RR{rr})
+	if hasDHCID {
+		mA.Insert([]dns.RR{rr, dhcid})
+	} else {
+		mA.Insert([]dns.RR{rr})
+	}
+	resp, err := u.exchange(ctx, mA)
+	if err != nil {
+		return err
+	}
+	switch resp.Rcode {
+	case dns.RcodeSuccess:
+		return nil
+	case dns.RcodeYXRrset, dns.RcodeYXDomain:
+		// Name already exists — fall through to the ownership-proving retry.
+	default:
+		return rcodeError(resp.Rcode)
+	}
+
+	if !hasDHCID {
+		// No ownership proof available and the name already exists: this is a
+		// pre-existing record we cannot claim as ours. Refuse (count + skip)
+		// rather than adopt it — adopting would let a later release delete a
+		// record xpf did not create (#2648).
+		if u.onConflict != nil {
+			u.onConflict()
+		}
+		return nil
+	}
+
+	// Attempt B: adopt/refresh a name whose existing DHCID matches OURS.
+	// Use a SEPARATE copy of the DHCID for the prerequisite vs the update
+	// section: miekg's Used()/Insert() mutate the RR header class in place, so
+	// sharing one pointer would let Insert (CLASS=INET) clobber the
+	// prerequisite's value-dependent class and corrupt the ownership check.
+	mB := new(dns.Msg)
+	mB.SetUpdate(dns.Fqdn(zone))
+	mB.Used([]dns.RR{dns.Copy(dhcid)}) // value-dependent: our exact DHCID must exist
+	mB.Insert([]dns.RR{rr, dhcid})
+	resp, err = u.exchange(ctx, mB)
+	if err != nil {
+		return err
+	}
+	switch resp.Rcode {
+	case dns.RcodeSuccess:
+		return nil
+	case dns.RcodeYXRrset, dns.RcodeYXDomain, dns.RcodeNXRrset, dns.RcodeNameError:
+		// The existing DHCID is NOT ours (or absent): a third party owns this
+		// name. Refuse to claim it — never record ownership, so a later
+		// release cannot delete it (#2648).
+		if u.onConflict != nil {
+			u.onConflict()
+		}
+		return nil
+	default:
+		return rcodeError(resp.Rcode)
+	}
+}
+
 // sendRemove issues an exact-RR delete (RFC 2136 §2.5.4 via miekg Remove,
 // which forces TTL=0 / CLASS=NONE). An NXRRSET/NXDOMAIN-style "nothing to
 // delete" is benign and treated as success (idempotent delete).
@@ -416,6 +597,62 @@ func (u *rfc2136Updater) sendRemove(ctx context.Context, zone string, rr dns.RR)
 	}
 	switch resp.Rcode {
 	case dns.RcodeSuccess, dns.RcodeNXRrset, dns.RcodeNameError:
+		return nil
+	default:
+		return rcodeError(resp.Rcode)
+	}
+}
+
+// sendRemoveForward deletes the forward A/AAAA record. Under replace-owned
+// (#2648) it is OWNERSHIP-GUARDED: when the record carries a client identity,
+// it prepends a "DHCID matches OURS" prerequisite (RFC 2136 §2.4.2 value-
+// dependent RRset-exists) and deletes the A/AAAA AND the DHCID together, so
+// xpf removes a name ONLY when the on-wire DHCID proves xpf created it. If the
+// DHCID does not match (a third party re-published the name, or there is no
+// DHCID at all = a manual record), the prerequisite fails and the delete is
+// SKIPPED + counted — xpf never deletes a record it does not own.
+//
+// The state store already prevents constructing a delete for a tuple xpf
+// never recorded; this adds a SECOND, on-wire guard against the narrow race
+// where a third party adopted the exact name+address between xpf's add and
+// release. Without a client identity (no DHCID was ever written) the delete is
+// the plain exact-RR delete — still only the firewall's own (name,type,rdata)
+// tuple, never a delete-RRset.
+func (u *rfc2136Updater) sendRemoveForward(ctx context.Context, zone string, rr dns.RR) error {
+	if u.conflictPolicy != "replace-owned" {
+		return u.sendRemove(ctx, zone, rr)
+	}
+	dhcid, hasDHCID := u.dhcidForRR(rr)
+	if !hasDHCID {
+		// No DHCID was ever published for this record (no client identity):
+		// fall back to the plain exact-RR delete of the firewall's own tuple.
+		return u.sendRemove(ctx, zone, rr)
+	}
+	m := new(dns.Msg)
+	m.SetUpdate(dns.Fqdn(zone))
+	// Separate DHCID copies for the prerequisite vs the delete: Remove() sets
+	// CLASS=NONE in place, which would otherwise corrupt the value-dependent
+	// Used() prerequisite that proves we own the record.
+	m.Used([]dns.RR{dns.Copy(dhcid)}) // prerequisite: our exact DHCID must exist
+	m.Remove([]dns.RR{rr, dhcid})
+	resp, err := u.exchange(ctx, m)
+	if err != nil {
+		return err
+	}
+	switch resp.Rcode {
+	case dns.RcodeSuccess:
+		// Prerequisite held (our DHCID is present): the delete applied.
+		return nil
+	case dns.RcodeNXRrset, dns.RcodeYXRrset, dns.RcodeYXDomain, dns.RcodeNameError:
+		// The DHCID prerequisite failed: the name's DHCID is not ours (NXRRSET
+		// = our value-dependent DHCID RRset is absent; NXDOMAIN = the name is
+		// gone). Either way xpf does NOT own this record on the wire — skip the
+		// delete and count it. The reconciler still clears the ownership entry
+		// so xpf stops managing a name it no longer owns. (A name that simply
+		// vanished is also a benign "nothing to delete".)
+		if u.onConflict != nil {
+			u.onConflict()
+		}
 		return nil
 	default:
 		return rcodeError(resp.Rcode)

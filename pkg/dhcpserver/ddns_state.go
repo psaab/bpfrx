@@ -42,6 +42,17 @@ type ownedRecord struct {
 	PTRName     string `json:"ptr_name"`     // reverse name published
 	TTL         int    `json:"ttl"`          // TTL written
 	OwnerID     string `json:"owner_id"`     // deterministic node-stable watermark
+	// ClientID is the RAW DHCP client identity (v4 client-id||hwaddr, v6
+	// DUID/IAID) — the input to the RFC 4701 DHCID digest the live RFC 2136
+	// backend writes under replace-owned. It is stored verbatim (NOT the
+	// address-fallback identity used for keying) so a later delete recomputes
+	// the SAME DHCID and the DHCID-match prerequisite proves xpf created the
+	// record before it is removed. Empty when the lease had no stable
+	// identity (the backend then publishes no DHCID and uses the
+	// name-not-in-use add prerequisite instead). Omitted from older stores;
+	// an absent value degrades to the no-DHCID path on delete (safe — the
+	// exact-RR delete still only removes the firewall's own tuple).
+	ClientID string `json:"client_id,omitempty"`
 }
 
 // ownedRecordKey is the in-memory map key for an owned record: a lease's

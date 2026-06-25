@@ -29,6 +29,16 @@ type LeaseDNSRecord struct {
 	ForwardType string
 	// PTRName is the reverse-zone name (in-addr.arpa / ip6.arpa).
 	PTRName string
+	// ClientID is the stable DHCP client identity (v4: client-id||hwaddr,
+	// v6: DUID/IAID) the reconciler keys ownership on. It is the input to the
+	// RFC 4701 DHCID digest computed by the live RFC 2136 backend under the
+	// replace-owned conflict policy, so that an add only claims (and a delete
+	// only removes) a name whose DHCID proves xpf created it. Empty when the
+	// lease carried no stable identity (the backend then omits the DHCID and
+	// falls back to the name-not-in-use prerequisite — it still never adopts a
+	// pre-existing third-party RR). NOT part of the published forward/reverse
+	// RR set; carried alongside it only to derive the ownership marker.
+	ClientID string
 }
 
 // DNSUpdater is the pluggable DNS-update backend (plan §4.4). The
