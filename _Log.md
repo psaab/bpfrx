@@ -17826,3 +17826,20 @@ top.
 - **File(s)**: pkg/api/api.go, pkg/api/sessions.go, pkg/api/security.go,
   pkg/logging/eventbuf.go, pkg/api/rest_filter_failclosed_test.go,
   pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2938 — wire REST named source-NAT pool stats to the
+  userspace helper's LIVE runtime SourceNATPoolStatus instead of config
+  text (len(pool.Addresses)) + the retired-eBPF ReadNATPortCounter.
+  natPoolStatsHandler now calls s.runtimeSourceNATPools() (Status()
+  type-assertion, dedup by pool name like applied_nat_view.go) and reports
+  AddressCount / PortLow / PortHigh / UsedPorts from the runtime view;
+  TotalPorts = (PortHigh-PortLow+1)*AddressCount. Config + legacy counter
+  retained only as fallback when the helper has no entry. Added
+  TestNATPoolStatsHandlerUsesRuntimeStatus (fail-on-revert: config/legacy
+  fixture disagrees with runtime on every field — RED if reverted).
+  gRPC/CLI/metrics_nat.go named-pool surfaces noted as SSOT follow-up.
+  Gates: go build ./..., gofmt -l clean, go vet ./pkg/api/...,
+  go test ./pkg/api/... all PASS.
+- **File(s)**: pkg/api/nat.go, pkg/api/nat_stats_test.go,
+  pkg/api/README.md, _Log.md

@@ -87,6 +87,31 @@ under the daemon's errgroup. Nothing else imports this package.
   `sessions_iterator_error_test.go` in this package and in `pkg/grpcapi`
   / `pkg/cli` (CLI top-talkers fails the command; NAT summaries print a
   stderr warning).
+- Named source-NAT pool stats are sourced from the userspace helper's
+  LIVE runtime status, not config text (#2938). `natPoolStatsHandler`
+  (`/security/nat/source/pools`) reads `s.runtimeSourceNATPools()` — the
+  helper's `ProcessStatus.SourceNATPools` (`SourceNATPoolStatus`),
+  deduplicated by pool name (rules sharing a pool reference the same
+  `Arc<PortAllocatorShared>` and report identical occupancy, so one entry
+  per pool is kept, never summed — same contract as
+  `pkg/dataplane/userspace/applied_nat_view.go`). The reported
+  `AddressCount`, port window (`PortLow`/`PortHigh`), and `UsedPorts` come
+  from that runtime view; `TotalPorts` = `(PortHigh-PortLow+1) *
+  AddressCount`. The helper is authoritative because it rejects malformed
+  addresses, splits pools by IP family, shares allocator state across
+  rules, and reports actual used ports — config text + the retired-eBPF
+  `ReadNATPortCounter` could over-report capacity or report a dead-map
+  count under the AF_XDP dataplane. The config-derived window +
+  `ReadNATPortCounter` path remains ONLY as a fallback when the helper has
+  no runtime entry for a pool (helper not running / before the first
+  apply lands). Pinned by `TestNATPoolStatsHandlerUsesRuntimeStatus`
+  (fail-on-revert) in `nat_stats_test.go`. The gRPC `GetNATPoolStats`,
+  CLI `show security nat source pool`, and the Prometheus
+  `xpf_nat_pool_total_ports` / `xpf_nat_pool_used_ports` collector
+  (`metrics_nat.go`) still derive named-pool capacity/used from config +
+  the legacy counter and are the follow-up SSOT surfaces (the Prometheus
+  `xpf_userspace_snat_pool_*` family in `metrics_userspace.go` already
+  exposes the runtime per-pool view).
 - Query-filter parsing fails CLOSED, matching the gRPC contract
   (#2934/#2935/#2939). A filter sentinel of `0`/`""` means "no filter",
   so a *malformed* filter value must error rather than silently fall
