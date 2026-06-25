@@ -333,6 +333,31 @@ surfaced via `Coordinator::session_install_stale_ignored_total()` /
 `session_delete_stale_ignored_total()`. See `docs/sync-protocol.md` and
 `docs/research/2170-ha-deferred-delete/plan.md`.
 
+### Per-policy log flags on the session-sync wire (#2785)
+
+A locally-admitted session stamps the admitting policy's `then log
+session-init`/`session-close` selection onto `SessionMetadata.log_session_init`
+/`log_session_close` (the #2508 path). Before #2785 the HA sync-import path
+hard-coded both flags `false`, so a session that failed over to the standby
+emitted no per-policy RT_FLOW SESSION_CREATE/CLOSE syslog records on the new
+active node.
+
+#2785 carries the selection across the full sync path:
+
+1. **Open frame** (`event_stream/codec.rs`): `FLAG_LOG_SESSION_INIT` (1<<3) /
+   `FLAG_LOG_SESSION_CLOSE` (1<<4) on the existing flags byte, encoded from
+   `metadata.log_session_init/close`.
+2. **Go control plane**: decoded into `SessionDeltaInfo`, stamped onto
+   `dataplane.SessionValue.LogFlags` (`LogFlagSessionInit`/`Close`, bits 0/1),
+   which already rides the cluster wire (`pkg/cluster/sync_protocol.go`).
+3. **Install**: `SessionSyncRequest.log_session_init/close` ->
+   `build_synced_session_entry` -> the synced session's metadata.
+
+`serde(default)`/`omitempty` make this rolling-upgrade safe: an old peer that
+omits the fields decodes to `false` (no per-policy log) — bit-identical to
+pre-#2785 behavior. The JSON RPC-fallback delta (`SessionDeltaInfo` in
+`protocol/binding.rs`) carries the same fields at parity with the binary frame.
+
 ## Per-IP session-limit lifecycle (#2134; #2128 leak-fix preserved)
 
 Junos `set security screen ids-option <name> limit-session
