@@ -59,6 +59,19 @@ type Manager struct {
 	addrWatcherStarts  int  // guarded by mu — observability/test seam
 	subscribeAddrs     func(ch chan<- netlink.AddrUpdate, done <-chan struct{}) error
 
+	// desiredIfaces is the set of interface NAMES from the most recent
+	// UpdateInstances desired set (#2788). It lets the addr-watcher recognise
+	// an address event for a CONFIGURED interface that has no instance yet —
+	// the late-appearing-interface case: a member/VLAN/RETH netdev that did
+	// not exist (or was unresolvable) at the UpdateInstances that last ran, so
+	// resolveIface failed and no instance was built and added to m.instances.
+	// Such an interface is absent from BOTH addrwatch match loops (cached
+	// ifindex and name-drift), so its first address event would be dropped and
+	// the instance would wait up to ~2s for the periodic reconcile to retry
+	// the build. Recording the desired names lets us schedule an immediate
+	// reconcile on that first event instead. Guarded by mu.
+	desiredIfaces map[string]struct{}
+
 	// resolveLinkName maps a kernel ifindex to its current link NAME. The
 	// addr-watcher (#2707) calls it ONLY on a cached-ifindex miss — when an
 	// address event arrives for an ifindex no instance is bound to. A
@@ -294,11 +307,15 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Build desired map.
+	// Build desired map. Also record the set of desired interface NAMES so the
+	// addr-watcher can recognise an address event for a configured interface
+	// that has no instance built yet (#2788, late-appearing interface).
 	desiredMap := make(map[instanceKey]*Instance, len(desired))
+	desiredIfaces := make(map[string]struct{}, len(desired))
 	for _, inst := range desired {
 		key := instanceKey{iface: inst.Interface, groupID: inst.GroupID}
 		desiredMap[key] = inst
+		desiredIfaces[inst.Interface] = struct{}{}
 		// Lazily start the singleton link watcher once any instance
 		// tracks an interface (#1814). Idempotent under m.mu — repeat
 		// UpdateInstances churn never spawns a second goroutine.
@@ -311,6 +328,10 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 		// this is ungated. Idempotent under m.mu.
 		m.ensureAddrWatcherLocked()
 	}
+	// Publish the desired-name set for the addr-watcher (#2788). Replaced
+	// wholesale every reconcile so a removed interface stops being treated as
+	// late-appearing.
+	m.desiredIfaces = desiredIfaces
 
 	// Remove instances no longer desired.
 	for key, vi := range m.instances {

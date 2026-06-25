@@ -127,6 +127,16 @@ func (m *Manager) clearAddrWatcherLatch(stop chan struct{}) {
 // ~2s-deferred. Mutating vi.iface here would race the run-loop reads in
 // sendPacket/sendPacketIPv6, so we deliberately do not; the reconcile owns the
 // rebind.
+//
+// Late-appearing interface (#2788): the same cached-ifindex-miss path also
+// catches an address event for a CONFIGURED interface that has NO instance yet.
+// If a member/VLAN/RETH netdev did not exist at the last UpdateInstances,
+// resolveIface failed and no instance was built (or added to m.instances), so
+// the interface is absent from BOTH match loops above. When the event's
+// resolved name is in m.desiredIfaces but no instance is bound to it, we treat
+// the event as a creation signal and schedule the same immediate reconcile —
+// UpdateInstances then builds and starts the instance event-driven rather than
+// after the ~2s periodic reconcile.
 func (m *Manager) reresolveAddrFor(ifindex int) {
 	m.mu.RLock()
 	matched := false
@@ -157,20 +167,41 @@ func (m *Manager) reresolveAddrFor(ifindex int) {
 
 	m.mu.RLock()
 	driftDetected := false
+	boundByName := false
 	for _, vi := range m.instances {
-		if vi.iface != nil && vi.cfg.Interface == name && vi.iface.Index != ifindex {
-			driftDetected = true
-			slog.Info("vrrp: address event on recreated link, scheduling reconcile",
-				"key", vi.key(), "interface", name,
-				"old_ifindex", vi.iface.Index, "new_ifindex", ifindex)
+		if vi.iface != nil && vi.cfg.Interface == name {
+			boundByName = true
+			if vi.iface.Index != ifindex {
+				driftDetected = true
+				slog.Info("vrrp: address event on recreated link, scheduling reconcile",
+					"key", vi.key(), "interface", name,
+					"old_ifindex", vi.iface.Index, "new_ifindex", ifindex)
+			}
+		}
+	}
+	// Late-appearing interface (#2788): the event is for a CONFIGURED interface
+	// that has no instance bound yet. This happens when the member/VLAN/RETH
+	// netdev did not exist (or was unresolvable) at the UpdateInstances that
+	// last ran, so resolveIface failed and the instance was never built. Both
+	// addrwatch match loops require an existing instance, so without this the
+	// first address event on the newly-created interface is dropped and the
+	// instance waits up to ~2s for the periodic reconcile to retry the build.
+	// Schedule an immediate reconcile so UpdateInstances builds it now.
+	lateAppearing := false
+	if !boundByName {
+		if _, desired := m.desiredIfaces[name]; desired {
+			lateAppearing = true
+			slog.Info("vrrp: address event on late-appearing configured interface, scheduling reconcile",
+				"interface", name, "ifindex", ifindex)
 		}
 	}
 	m.mu.RUnlock()
 
-	if driftDetected && onDrop != nil {
+	if (driftDetected || lateAppearing) && onDrop != nil {
 		// Reuse the immediate-reconcile lever (the daemon wires onEventDrop to
 		// schedule a reconcile pass). UpdateInstances then rebinds the drifted
-		// instance to the new ifindex and re-resolves the source.
+		// instance to the new ifindex and re-resolves the source (#2707), or
+		// builds the late-appearing configured interface's instance (#2788).
 		onDrop()
 	}
 }
