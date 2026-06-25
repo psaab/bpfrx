@@ -13,6 +13,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/linuxsock"
 )
 
 // ensureFabricIPVLAN creates an IPVLAN L2 interface on top of parent for
@@ -278,7 +279,7 @@ func (d *Daemon) probeFabricNeighbor(ctx context.Context, fabIface string, peerI
 // shelling out to ping. Non-blocking: sendto MSG_DONTWAIT.
 func sendICMPProbe(iface string, target net.IP) {
 	if target.To4() != nil {
-		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)
+		fd, err := linuxsock.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)
 		if err != nil {
 			return
 		}
@@ -290,7 +291,7 @@ func sendICMPProbe(iface string, target net.IP) {
 		copy(sa.Addr[:], target.To4())
 		_ = unix.Sendto(fd, icmp[:], unix.MSG_DONTWAIT, sa)
 	} else {
-		fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_ICMPV6)
+		fd, err := linuxsock.Socket(unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_ICMPV6)
 		if err != nil {
 			return
 		}
@@ -312,7 +313,7 @@ func sendICMPProbe(iface string, target net.IP) {
 // for discovering the fabric peer's MAC when IPv4 ARP fails (e.g. after
 // crash recovery with RETH MAC changes on IPVLAN overlays).
 func sendIPv6MulticastProbe(iface string, ifindex int) {
-	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_ICMPV6)
+	fd, err := linuxsock.Socket(unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_ICMPV6)
 	if err != nil {
 		return
 	}
