@@ -171,6 +171,43 @@ func TestSchema2448_NextHop_AcceptsValidForms(t *testing.T) {
 	}
 }
 
+// A PLAIN next-hop with an explicit egress interface must commit. The
+// compiler (compiler_routing.go) supports this for IPv6 link-local
+// gateways in BOTH the hierarchical `next-hop fe80::50 { interface
+// reth0.50; }` and the flat/inline `next-hop fe80::50 interface reth0.50`
+// shapes. Modeling next-hop as a typed value-leaf REGRESSED this to
+// `unknown modifier "reth0.50"` (the interface value token was rejected);
+// the container model with a keyValidator restores it. Pinning both shapes
+// (the AcceptsValid masked the gap by only covering qualified-next-hop).
+func TestSchema2448_NextHop_AcceptsExplicitInterface(t *testing.T) {
+	// hierarchical: interface is a block child of next-hop.
+	if err := schemaCheck(t, `routing-options {
+    static {
+        route ::/0 {
+            next-hop fe80::50 {
+                interface reth0.50;
+            }
+        }
+    }
+}`); err != nil {
+		t.Fatalf("hierarchical next-hop <ip> interface <iface> should commit: %v", err)
+	}
+	// flat/inline: interface follows the gateway on one set line.
+	if err := flatSchemaCheck(t,
+		"set routing-options static route ::/0 next-hop fe80::50 interface reth0.50",
+	); err != nil {
+		t.Fatalf("flat-inline next-hop <ip> interface <iface> should commit: %v", err)
+	}
+	// The gateway is still validated even when an interface is present: a
+	// malformed gateway with an interface must be rejected (the keyValidator
+	// runs on the gateway identity arg, not bypassed by the child).
+	if err := flatSchemaCheck(t,
+		"set routing-options static route ::/0 next-hop 2001:db8::garbage interface reth0.50",
+	); err == nil {
+		t.Fatal("malformed gateway with interface should still be rejected, got nil")
+	}
+}
+
 // discard / next-table routes (no next-hop) and qualified-next-hop with a
 // link-local IPv6 + interface must all still commit.
 func TestSchema2448_Route_AcceptsDiscardAndQualified(t *testing.T) {

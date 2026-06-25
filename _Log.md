@@ -15201,3 +15201,24 @@ top.
   all green. Doc: docs/config-schema.md #2448 subsection.
 - **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_routing.go,
   pkg/config/schema_validate_route_2448_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2448 review fold — fix over-rejection regression flagged in the
+  hostile review of PR #2752. Modeling `next-hop` as a typed value-leaf routed
+  its `interface <iface>` child through the presence-only modifier path, so a
+  PLAIN `next-hop <ip> interface <iface>` (the IPv6 link-local form the
+  compiler supports in both AST shapes) was rejected as
+  `unknown modifier "<iface>"`. Re-modeled next-hop as a CONTAINER with a
+  keyValidator (keyValueType/keyValueDesc/keyValueExamples/keyValidator =
+  ValidateStaticNextHop) so the gateway is still validated while the
+  `interface` child walks as a normal value-bearing child. Added
+  TestSchema2448_NextHop_AcceptsExplicitInterface covering the hierarchical
+  child form AND the flat inline form (both now PASS; rejected before the
+  fold), plus a negative that a malformed gateway WITH an interface is still
+  rejected. All 9 RejectsBad fail-on-revert cases still go RED when the two
+  keyValidators are stripped. Gates: go build ./..., gofmt -l clean, go vet
+  clean, go test ./pkg/config/... ./pkg/cmdtree/... ./pkg/frr/...
+  ./pkg/configstore/... all green. Doc: docs/config-schema.md next-hop
+  container/explicit-interface paragraph.
+- **File(s)**: pkg/config/schema_routing.go,
+  pkg/config/schema_validate_route_2448_test.go, docs/config-schema.md, _Log.md
