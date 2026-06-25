@@ -88,7 +88,35 @@ func (m *Manager) ensureLinkWatcherLocked() {
 	}
 	m.watcherRunning = true
 	m.watcherStarts++
-	go m.runLinkWatcher()
+	// Capture the current run-generation stop channel and hand it to the
+	// goroutine. A Stop()->Start() cycle re-allocates m.watcherStop
+	// (resetRunStateLocked, #2625); pinning the channel here means this
+	// watcher always cancels on, and clears the latch against, its OWN
+	// generation — a lingering pre-Stop watcher can never read the new
+	// generation's channel nor clobber the new watcher's latch.
+	stop := m.watcherStop
+	go m.runLinkWatcher(stop)
+}
+
+// clearLinkWatcherLatch resets the singleton link-watcher latch so a future
+// UpdateInstances can re-start the watcher after the watcher goroutine
+// returns (Stop()-driven cancellation, or the poller fallback exiting).
+// Mirrors clearAddrWatcherLatch (#2528). Resetting on exit keeps the latch
+// honest: a watcher that has returned is not "running", so a later
+// ensureLinkWatcherLocked must be free to spawn a fresh one (#2625).
+//
+// The stop arg is the generation token: the latch is cleared ONLY if it still
+// belongs to this watcher's generation (m.watcherStop unchanged since spawn).
+// After a Stop()->Start() the channel is re-allocated and a fresh watcher may
+// already be latched — a lingering old watcher must NOT reset that newer
+// latch. Stop() itself clears the latch on the next Start() via
+// resetRunStateLocked, so this is the in-process belt-and-suspenders.
+func (m *Manager) clearLinkWatcherLatch(stop chan struct{}) {
+	m.mu.Lock()
+	if m.watcherStop == stop {
+		m.watcherRunning = false
+	}
+	m.mu.Unlock()
 }
 
 // runLinkWatcher is the singleton tracked-link watcher (#1814). It
@@ -101,27 +129,33 @@ func (m *Manager) ensureLinkWatcherLocked() {
 // same channel. On subscribe failure (or unexpected subscription close)
 // it degrades to a 1 s poll that runs only while tracked instances
 // exist.
-func (m *Manager) runLinkWatcher() {
+func (m *Manager) runLinkWatcher(stop chan struct{}) {
+	// Clear the singleton latch on ANY exit (Stop() cancellation, or the
+	// poller fallback returning) so a later UpdateInstances can re-spawn the
+	// watcher on a reused Manager (#2625). runLinkPoller is called
+	// synchronously (a tail-call within this goroutine, not a new go), so a
+	// single defer here covers every exit path including the poller's.
+	defer m.clearLinkWatcherLatch(stop)
 	ch := make(chan netlink.LinkUpdate, 64)
-	if err := m.subscribeLinks(ch, m.watcherStop); err != nil {
+	if err := m.subscribeLinks(ch, stop); err != nil {
 		slog.Warn("vrrp: link subscribe failed, falling back to 1s link polling", "err", err)
-		m.runLinkPoller()
+		m.runLinkPoller(stop)
 		return
 	}
 	slog.Info("vrrp: link watcher started (interface tracking)")
 	for {
 		select {
-		case <-m.watcherStop:
+		case <-stop:
 			return
 		case u, ok := <-ch:
 			if !ok {
 				select {
-				case <-m.watcherStop:
+				case <-stop:
 					return
 				default:
 				}
 				slog.Warn("vrrp: link subscription closed, falling back to 1s link polling")
-				m.runLinkPoller()
+				m.runLinkPoller(stop)
 				return
 			}
 			attrs := u.Attrs()
@@ -136,13 +170,14 @@ func (m *Manager) runLinkWatcher() {
 
 // runLinkPoller is the subscribe-failure fallback: poll tracked link
 // state at 1 s. pollTrackedLinks performs no netlink queries while no
-// instance tracks an interface.
-func (m *Manager) runLinkPoller() {
+// instance tracks an interface. stop is the watcher's pinned run-generation
+// cancellation channel (#2625).
+func (m *Manager) runLinkPoller(stop chan struct{}) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-m.watcherStop:
+		case <-stop:
 			return
 		case <-ticker.C:
 			m.pollTrackedLinks()

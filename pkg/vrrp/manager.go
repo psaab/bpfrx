@@ -113,10 +113,43 @@ func NewManager() *Manager {
 }
 
 // Start initializes the manager (no shared socket — each instance has its own).
+//
+// Start is reuse-safe: a Manager that was previously Stop()ped can be
+// Start()ed again. Stop() closes the run-scoped channels (watcherStop,
+// eventCh) and cancels the context; Start() re-allocates those channels,
+// resets the sync.Once guards, and clears the singleton watcher latches so
+// the next UpdateInstances cleanly re-spawns the link/addr watchers
+// (#2625). Without this re-init a Stop->Start cycle would: hand callers a
+// closed eventCh (send-on-closed panic), make every freshly-spawned
+// watcher observe the already-closed watcherStop and exit immediately, and
+// leave watcherRunning/addrWatcherRunning latched true so ensure*Locked
+// never re-spawns. Production creates the Manager once and only Stop()s at
+// shutdown, so this is a latent-lifecycle fix; the unit tests are the
+// safety net (the cluster failover gate exercises the single-run path).
 func (m *Manager) Start(ctx context.Context) error {
+	m.mu.Lock()
+	m.resetRunStateLocked()
 	_, m.cancel = context.WithCancel(ctx)
+	m.mu.Unlock()
 	slog.Info("vrrp: manager started")
 	return nil
+}
+
+// resetRunStateLocked re-initializes the per-run channels, once-guards, and
+// singleton watcher latches so the Manager is safe to Start() after a Stop().
+// Caller MUST hold m.mu. It is also invoked implicitly from NewManager's
+// equivalent field initialization — the values here mirror NewManager's
+// run-scoped defaults so a fresh-construct and a reuse-after-Stop converge on
+// the same state. It deliberately does NOT touch instances, seams
+// (linkState/subscribe*/resolve*/run/stop/open), or the onEventDrop callback:
+// those are construction-time or caller-owned, not run-scoped.
+func (m *Manager) resetRunStateLocked() {
+	m.watcherStop = make(chan struct{})
+	m.watcherStopOnce = sync.Once{}
+	m.eventCh = make(chan VRRPEvent, 256)
+	m.closeEventOnce = sync.Once{}
+	m.watcherRunning = false
+	m.addrWatcherRunning = false
 }
 
 // Stop stops all instances, removes VIPs, and cancels the context.
@@ -130,6 +163,14 @@ func (m *Manager) Stop() {
 		instances[k] = v
 	}
 	m.instances = make(map[instanceKey]*vrrpInstance)
+	// Capture the run-scoped channels + once-guards under the lock so a
+	// concurrent Start() (which re-allocates them via resetRunStateLocked,
+	// #2625) cannot race the close below onto a half-swapped channel.
+	watcherStop := m.watcherStop
+	watcherStopOnce := &m.watcherStopOnce
+	eventCh := m.eventCh
+	closeEventOnce := &m.closeEventOnce
+	cancel := m.cancel
 	m.mu.Unlock()
 
 	// Stop all instances (removes VIPs, sends priority-0, closes per-instance socket).
@@ -137,15 +178,17 @@ func (m *Manager) Stop() {
 		vi.stop()
 	}
 
-	// Stop the singleton link watcher (done-channel cancellation; the
-	// netlink subscription observes the same channel).
-	m.watcherStopOnce.Do(func() { close(m.watcherStop) })
+	// Stop the singleton link/addr watchers (done-channel cancellation; the
+	// netlink subscriptions observe the same channel). Both watchers pinned
+	// this exact channel at spawn time, so closing it cancels precisely this
+	// run-generation's goroutines.
+	watcherStopOnce.Do(func() { close(watcherStop) })
 
 	// Close events channel so watchers (e.g. daemon's watchVRRPEvents) unblock.
-	m.closeEventOnce.Do(func() { close(m.eventCh) })
+	closeEventOnce.Do(func() { close(eventCh) })
 
-	if m.cancel != nil {
-		m.cancel()
+	if cancel != nil {
+		cancel()
 	}
 	slog.Info("vrrp: manager stopped")
 }

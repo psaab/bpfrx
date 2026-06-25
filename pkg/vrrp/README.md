@@ -19,8 +19,26 @@ This is the package that drives chassis-cluster failover.
   immediately** after wiring `m.cancel`. Per-instance goroutines run
   independently and observe their own `stopCh`, **not** the parent
   context. Stop them via `Stop()`, which closes each instance's
-  `stopCh`.
-- `Stop()` — `manager.go`.
+  `stopCh`. **Reuse-safe (#2625):** `Start()` calls
+  `resetRunStateLocked` under `m.mu` to re-allocate the run-scoped
+  channels (`watcherStop`, `eventCh`), reset their `sync.Once` guards,
+  and clear the singleton watcher latches (`watcherRunning`,
+  `addrWatcherRunning`). A Manager that was `Stop()`ped can therefore be
+  `Start()`ed again: the next `UpdateInstances` cleanly re-spawns the
+  link/addr watchers instead of handing callers a closed `eventCh`
+  (send-on-closed panic) or spawning watchers that immediately observe
+  the already-closed `watcherStop` and exit. Production creates the
+  Manager once and only `Stop()`s at shutdown (a daemon restart is a
+  fresh process), so this is a latent-lifecycle guard — the cluster
+  failover gate exercises only the single-run path; the reuse safety net
+  is `manager_reuse_test.go`.
+- `Stop()` — `manager.go`. Stops every instance, closes the run-scoped
+  channels via their once-guards (captured under `m.mu` so a concurrent
+  `Start()` cannot race a half-swapped channel), and cancels the
+  context. The link/addr watchers each pin their run-generation
+  `watcherStop` at spawn time, so closing it cancels precisely that
+  generation's goroutines and their deferred latch-clear only resets the
+  latch if it still belongs to that generation.
 - `UpdateInstances(desired []*Instance) error` — `manager.go`.
   Diffs the running instance set against the desired set. A VIP change
   forces an instance restart, which is done **build-before-teardown**
@@ -160,7 +178,12 @@ load/peer-sync compile paths.
   `Stop()`; on subscribe failure it degrades to a 1 s poll. Initial
   state is seeded with `netlink.LinkByName` at instance create/update
   (a missing tracked interface counts as down). The tracked-ifname →
-  instance mapping is re-read under lock per event.
+  instance mapping is re-read under lock per event. **On ANY exit
+  (Stop()-driven cancellation or the poller fallback returning) the
+  goroutine clears `watcherRunning` via `clearLinkWatcherLatch` (#2625),
+  mirroring the addr-watcher (#2528)** — the latch is generation-gated
+  on the pinned `watcherStop` so a lingering pre-Stop watcher never
+  resets a fresh post-Start watcher's latch.
 - **Takeover latency** — a demoted MASTER keeps advertising at the
   lower effective priority; a preempt-enabled backup hearing a LOWER
   advert ignores it and waits for masterDown expiry, so takeover lands
