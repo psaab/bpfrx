@@ -15030,6 +15030,38 @@ top.
   bind flake on origin/master — confirmed failing with my changes stashed,
   and this PR touches zero pkg/ra code.
 
+## 2026-06-25 — #2475 proxy-ARP/NDP sysctl disable-on-removal
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix #2475 — the proxy responder sysctl
+  (`net.ipv4.conf.<if>.proxy_arp` / `net.ipv6.conf.<if>.proxy_ndp`) was
+  enabled when proxy-arp was configured (#2160) but NEVER disabled when the
+  config was removed, leaking an over-broad ARP/NDP responder across config
+  changes until reboot. Made the teardown symmetric with the enable path.
+- **File(s)**:
+  - `pkg/dataplane/proxyarp.go` — `writeProxyResponderSysctl` gained an
+    `enable bool` (writes `1`/`0`); `enableProxyResponders` +
+    `disableProxyResponders` now share `toggleProxyResponders`; exported
+    `DisableProxyResponders`; `ReconcileProxyARP` returns the enabled
+    `(iface -> families)` set so the stateful daemon can diff it.
+  - `pkg/daemon/daemon.go` — added `Daemon.proxyARPEnabled` + `…Mu`.
+  - `pkg/daemon/daemon_proxyarp.go` — `reconcileProxyARP` diffs the fresh
+    enabled set against the remembered one (`diffProxyResponders`) and
+    disables the dropped pairs; no longer early-returns on empty config when
+    there is prior state to tear down; `proxyARPDisableFn` seam.
+  - `pkg/dataplane/proxyarp_test.go` — seam carries the enable/disable bit.
+  - `pkg/daemon/daemon_proxyarp_test.go` — `TestDiffProxyResponders`
+    (hermetic table fail-on-revert anchor) + `TestReconcileProxyARP_`
+    `DisablesOnRemoval` (privileged integration over `lo`).
+  - `docs/research/2197-proxyarp-followups/plan.md`, `docs/feature-gaps.md`
+    — recorded the teardown (item 4).
+- **Validation**: fail-on-revert proven twice — (1) hermetic
+  `TestDiffProxyResponders` goes RED when `diffProxyResponders` is stubbed to
+  report nothing stale; (2) privileged `TestReconcileProxyARP_DisablesOnRemoval`
+  goes RED when `reconcileProxyARP` is reverted to the pre-fix early-return.
+  Both restored and green. Gates: GOCACHE go build ./... clean; go vet
+  ./pkg/dataplane/... ./pkg/daemon/... clean; gofmt clean; go test
+  ./pkg/dataplane/... ./pkg/daemon/... ./pkg/config/... green.
 ## #2416 NAT match source-address-name resolution for DNAT/SNAT
 
 - **Timestamp**: 2026-06-25

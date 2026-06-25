@@ -449,6 +449,19 @@ type Daemon struct {
 	// constructed unconditionally (C1) so the bootstrap-exit reconcile wires
 	// every subsystem.
 	bootstrapMode atomic.Bool
+
+	// proxyARPEnabled tracks the (interface name → enabled families) set the
+	// proxy-ARP/NDP responder sysctl was last enabled for (#2475). On each
+	// reconcile the daemon diffs the new desired set against this remembered
+	// set and disables net.ipv4.conf.<if>.proxy_arp /
+	// net.ipv6.conf.<if>.proxy_ndp on any (interface, family) that dropped out
+	// — a day-2 commit removing proxy-arp must drive the leaked sysctl back to
+	// 0 (the dataplane reconcile is stateless across commits, so the daemon
+	// owns this teardown state). Guarded by proxyARPEnabledMu because the apply
+	// path (under applySem) and the always-on re-assert loop (NOT under
+	// applySem) both run the reconcile.
+	proxyARPEnabledMu sync.Mutex
+	proxyARPEnabled   map[string]map[int]struct{}
 }
 
 func (d *Daemon) applyResult() *dataplane.ApplyResult {
