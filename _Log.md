@@ -14674,3 +14674,28 @@ top.
   **File(s)**: pkg/config/compiler_routing.go,
   pkg/config/compiler_prefix_list_merge_2641_test.go,
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2726 — surface Surface A DDNS SkippedNoBackend on all three
+  operator surfaces (Prometheus / CLI / gRPC) + correct stale
+  tunnel_tcp_mss docstring (post-#2715). (a) Mirrored the lease-path
+  no-backend surfacing: added the
+  xpf_ddns_surface_a_skipped_total{reason="no-backend"} series in
+  collectSurfaceADDNSMetrics (descriptor already had the reason label,
+  closed-cardinality — only the comment's reason set updated); added
+  no-backend to the CLI + gRPC "Skipped:" formatted lines. No proto
+  change (both render formatted strings). New fail-on-revert test drives
+  collectSurfaceADDNSMetrics directly and asserts the no-backend series.
+  (b) Doc-only: rewrote the tunnel_tcp_mss docstring to describe the
+  ACTUAL behavior — the WG MSS clamp uses tunnel_outer_mtu
+  (tx_ifindex→egress→logical, 1500 floor), NOT the #2715 route-resolved
+  encap-guard path — and note it is safe (route-resolved WG endpoints
+  NoRoute on this AF_XDP builder; clamp errs smaller, can't reintroduce
+  encap_mtu_drops).
+  Gates: gofmt clean; go build ./... clean; go test ./pkg/api/...
+  ./pkg/cli/... ./pkg/grpcapi/... ./pkg/ddns/... green; cargo build
+  --release clean (doc-only).
+  **File(s)**: pkg/api/metrics_system.go,
+  pkg/api/metrics_surface_a_ddns_test.go, pkg/cli/cli_show_services.go,
+  pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
+  userspace-dp/src/afxdp/forwarding/mod.rs, _Log.md

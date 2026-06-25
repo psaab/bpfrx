@@ -841,7 +841,19 @@ pub(super) fn tunnel_outer_mtu(
 /// A SYN clamped with the GRE value lets the peer send full-MSS data
 /// segments that the WG encap MTU guard then silently drops
 /// (`encap_mtu_drops`). Route WG-bound SYNs through `wg::mss::wg_tcp_mss`
-/// instead, derived from the SAME outer MTU the encap guard reads.
+/// instead, derived from `tunnel_outer_mtu` (resolve the transport
+/// `tx_ifindex`/`tx_vlan` → egress, falling back to `egress_ifindex`
+/// then the endpoint's `logical_ifindex`, with a 1500 floor).
+///
+/// NOTE (#2715): this is NOT the same path the encap MTU guard now
+/// reads. Post-#2715 the encap guard route-resolves the physical egress
+/// via the peer endpoint address; the MSS clamp still uses the
+/// `tunnel_outer_mtu` (tx_ifindex→egress→logical) chain above. That
+/// divergence is safe here, not a live bug: a route-resolved WG endpoint
+/// returns NoRoute on this AF_XDP builder (no synthetic egress to read),
+/// and the clamp errs toward a SMALLER MSS, so it can never advertise an
+/// MSS larger than the encap guard tolerates — it cannot reintroduce
+/// `encap_mtu_drops`.
 ///
 /// Non-WG endpoints (and the plain-forward path, `tunnel_endpoint_id ==
 /// 0`) keep the GRE formula bit-for-bit. No new branch on the

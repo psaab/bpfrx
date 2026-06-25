@@ -82,7 +82,7 @@ func (c *xpfCollector) collectDDNSMetrics(ch chan<- prometheus.Metric) {
 // Surface A (router/interface-address) DDNS manager snapshot (#2691 P2). The
 // family is omitted entirely when no SurfaceAStatsFn is wired or it returns nil
 // (NoDataplane). Label cardinality is CLOSED: result in {ok,fail}; reason in
-// {unchanged,backoff}.
+// {unchanged,backoff,no-backend}.
 func (c *xpfCollector) collectSurfaceADDNSMetrics(ch chan<- prometheus.Metric) {
 	if c.srv.surfaceAStatsFn == nil {
 		return
@@ -103,6 +103,8 @@ func (c *xpfCollector) collectSurfaceADDNSMetrics(ch chan<- prometheus.Metric) {
 		float64(st.Skipped), "unchanged")
 	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSSkippedTotal, prometheus.CounterValue,
 		float64(st.BackedOff), "backoff")
+	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSSkippedTotal, prometheus.CounterValue,
+		float64(st.SkippedNoBackend), "no-backend")
 	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSScopes, prometheus.GaugeValue,
 		float64(st.Scopes))
 }
