@@ -177,6 +177,39 @@ all files stay in `package ipsec`, so the public API is unchanged.
     timeout / NXDOMAIN / SERVFAIL it returns family 0 (agnostic) — a slow or
     unreachable resolver degrades to the interface-decides path and NEVER
     stalls `commit` / apply for the full glibc resolver timeout.
+  - **IPv6 link-local local binds (#2885):** the candidate filter
+    `matchFamily` (`policy.go`) admits an IPv6 link-local unicast source
+    (`fe80::/10`) when the gateway family hint is IPv6 (family 6). The
+    earlier `IsGlobalUnicast()` gate rejected link-local outright, so an
+    IPsec local-bind on a point-to-point / link-local IPv6 link could never
+    source from `fe80::` — the documented dynamic-routing local-source over
+    such links was unreachable. Link-local is admitted ONLY under an explicit
+    family-6 hint: it is excluded from family-4 selection (and IPv4
+    link-local `169.254.0.0/16` is never a usable source) and from
+    family-agnostic (hint 0) selection, so it never wins implicitly over a
+    global address on a dual-stack interface. Multicast, unspecified, and
+    loopback stay excluded for every family.
+    - **Global wins, order-independent** (`selectFamilyAddress`): family-6
+      selection feeds a first-match loop over candidates (config order in
+      `selectUnitAddress`; kernel enumeration order in
+      `resolveKernelInterfaceAddress`). To keep a global address from losing
+      to a link-local one that merely happens to be enumerated first,
+      family-6 selection scans twice — pass 1 admits only global-unicast
+      addresses, and a link-local is accepted only if NO global is present.
+      The common case (kernel lists globals first, configs carry no SLAAC
+      `fe80::`) was already safe, but enumeration order is not guaranteed,
+      so the preference is made explicit rather than relied upon. Family-4
+      and family-agnostic selection need only one pass (link-local is never
+      admitted by `matchFamily` there).
+    - **Zone-qualified link-local source** (`zoneQualify`): a bare
+      `local_addrs = fe80::1` is ambiguous to strongSwan / the kernel when
+      more than one interface carries an `fe80::` address. When the selected
+      source is link-local, the resolver appends the IPv6 zone
+      (`%<iface>`) — e.g. `fe80::1%ge-0-0-3` — using the kernel interface
+      name it already has in scope (`config.LinuxIfName(base)` for the
+      configured path, the looked-up interface name for the kernel path).
+      Global and IPv4 sources are emitted bare; an address already carrying
+      a zone is left unchanged.
 - **IKE policy chain → proposal cross-reference (#2270).** A gateway's
   `ike-policy` reference walks gateway → `ike-policy` → `ike-proposal`
   (`resolveIKESettings`, `ike.go`). When that chain breaks — the
