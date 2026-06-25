@@ -11,11 +11,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// sysctlWrite records a single (iface, family) proxy-responder sysctl write
-// captured through the proxyARPSysctlSeam test hook.
+// sysctlWrite records a single (iface, family, enable) proxy-responder sysctl
+// write captured through the proxyARPSysctlSeam test hook. enable distinguishes
+// the enable ("1") path from the #2475 disable ("0") teardown path.
 type sysctlWrite struct {
 	iface  string
 	family int
+	enable bool
 }
 
 // captureProxySysctl installs a fake proxyARPSysctlSeam that records every
@@ -25,8 +27,8 @@ func captureProxySysctl(t *testing.T, fail bool) *[]sysctlWrite {
 	t.Helper()
 	prev := proxyARPSysctlSeam
 	var writes []sysctlWrite
-	proxyARPSysctlSeam = func(iface string, family int) error {
-		writes = append(writes, sysctlWrite{iface, family})
+	proxyARPSysctlSeam = func(iface string, family int, enable bool) error {
+		writes = append(writes, sysctlWrite{iface, family, enable})
 		if fail {
 			return errors.New("simulated procfs failure")
 		}
@@ -56,8 +58,8 @@ func TestEnableProxyResponders_IPv4(t *testing.T) {
 		t.Fatalf("got %d sysctl writes, want 1: %+v", len(*writes), *writes)
 	}
 	w := (*writes)[0]
-	if w.iface != "ge-0-0-1" || w.family != unix.AF_INET {
-		t.Fatalf("write = %+v, want {ge-0-0-1, AF_INET}", w)
+	if w.iface != "ge-0-0-1" || w.family != unix.AF_INET || !w.enable {
+		t.Fatalf("write = %+v, want {ge-0-0-1, AF_INET, enable}", w)
 	}
 }
 
@@ -77,8 +79,8 @@ func TestEnableProxyResponders_IPv6(t *testing.T) {
 		t.Fatalf("got %d sysctl writes, want 1", len(*writes))
 	}
 	w := (*writes)[0]
-	if w.iface != "ge-0-0-1" || w.family != unix.AF_INET6 {
-		t.Fatalf("write = %+v, want {ge-0-0-1, AF_INET6}", w)
+	if w.iface != "ge-0-0-1" || w.family != unix.AF_INET6 || !w.enable {
+		t.Fatalf("write = %+v, want {ge-0-0-1, AF_INET6, enable}", w)
 	}
 }
 
@@ -161,7 +163,7 @@ func TestEnableProxyResponders_Empty(t *testing.T) {
 // writer rejects a family it has no procfs path for, rather than writing to a
 // bogus path.
 func TestWriteProxyResponderSysctl_UnsupportedFamily(t *testing.T) {
-	err := writeProxyResponderSysctl("ge-0-0-1", unix.AF_PACKET)
+	err := writeProxyResponderSysctl("ge-0-0-1", unix.AF_PACKET, true)
 	if err == nil {
 		t.Fatal("expected error for unsupported family, got nil")
 	}
@@ -214,7 +216,7 @@ func TestReconcileProxyARP_V6InstallsPneigh(t *testing.T) {
 	}
 	ifaceMap := map[string]int{"ge-0-0-2": idx}
 
-	added, err := ReconcileProxyARP(cfg, ifaceMap)
+	added, _, err := ReconcileProxyARP(cfg, ifaceMap)
 	if err != nil {
 		t.Fatalf("ReconcileProxyARP: %v", err)
 	}
@@ -280,7 +282,7 @@ func TestReconcileProxyARP_V6StaleRemoval(t *testing.T) {
 	}
 	ifaceMap := map[string]int{"ge-0-0-2": idx}
 
-	if _, err := ReconcileProxyARP(cfg, ifaceMap); err != nil {
+	if _, _, err := ReconcileProxyARP(cfg, ifaceMap); err != nil {
 		t.Fatalf("ReconcileProxyARP: %v", err)
 	}
 
@@ -307,7 +309,7 @@ func TestReconcileProxyARP_V4MappedClassifiesAsV4(t *testing.T) {
 	}
 	ifaceMap := map[string]int{"ge-0-0-2": 7}
 
-	if _, err := ReconcileProxyARP(cfg, ifaceMap); err != nil {
+	if _, _, err := ReconcileProxyARP(cfg, ifaceMap); err != nil {
 		t.Fatalf("ReconcileProxyARP: %v", err)
 	}
 	if len(*sets) != 1 {
@@ -340,7 +342,7 @@ func TestReconcileProxyARP_V6Idempotent(t *testing.T) {
 	}
 	ifaceMap := map[string]int{"ge-0-0-2": idx}
 
-	if _, err := ReconcileProxyARP(cfg, ifaceMap); err != nil {
+	if _, _, err := ReconcileProxyARP(cfg, ifaceMap); err != nil {
 		t.Fatalf("ReconcileProxyARP: %v", err)
 	}
 	if len(*sets) != 0 {
@@ -378,7 +380,7 @@ func TestReconcileProxyARP_EnablesSysctl(t *testing.T) {
 	// install inside ReconcileProxyARP, so if the install errors we cannot
 	// reach the sysctl step — skip rather than false-fail in an unprivileged
 	// sandbox.
-	if _, err := ReconcileProxyARP(cfg, ifaceMap); err != nil {
+	if _, _, err := ReconcileProxyARP(cfg, ifaceMap); err != nil {
 		t.Skipf("ReconcileProxyARP needs privileges in this env: %v", err)
 	}
 	// Clean up the NTF_PROXY neighbor entry this test installed on lo so the
@@ -426,7 +428,7 @@ func TestReconcileProxyARP_V6InstallsPneighLive(t *testing.T) {
 	}
 	ifaceMap := map[string]int{"lo": lo.Index}
 
-	if _, err := ReconcileProxyARP(cfg, ifaceMap); err != nil {
+	if _, _, err := ReconcileProxyARP(cfg, ifaceMap); err != nil {
 		t.Skipf("ReconcileProxyARP needs privileges in this env: %v", err)
 	}
 	t.Cleanup(func() {
