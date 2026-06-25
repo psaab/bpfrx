@@ -140,38 +140,159 @@ pub(in crate::afxdp) struct MirrorRuntimeConfig {
     pub(in crate::afxdp) rate: u32,
 }
 
+/// One resolved equal-cost next-hop candidate for a static route (#2389).
+/// A route with multiple configured next-hops retains every resolved
+/// candidate so the lookup can distribute flows across them and skip a
+/// dead candidate. `next_hop == None` with a non-zero `ifindex` is an
+/// interface-only ("via <if>") candidate.
 #[derive(Clone, Copy, Debug)]
-pub(in crate::afxdp) struct ConnectedRouteV4 {
-    pub(in crate::afxdp) prefix: PrefixV4,
+pub(in crate::afxdp) struct RouteNextHopV4 {
+    pub(in crate::afxdp) next_hop: Option<Ipv4Addr>,
     pub(in crate::afxdp) ifindex: i32,
     pub(in crate::afxdp) tunnel_endpoint_id: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(in crate::afxdp) struct RouteNextHopV6 {
+    pub(in crate::afxdp) next_hop: Option<Ipv6Addr>,
+    pub(in crate::afxdp) ifindex: i32,
+    pub(in crate::afxdp) tunnel_endpoint_id: u16,
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::afxdp) struct ConnectedRouteV4 {
+    pub(in crate::afxdp) prefix: PrefixV4,
+    pub(in crate::afxdp) ifindex: i32,
+    pub(in crate::afxdp) tunnel_endpoint_id: u16,
+    /// #2388: canonical routing-table name this connected route belongs to
+    /// (e.g. "inet.0" or "tenant-a.inet.0"). The lookup filters connected
+    /// routes by table so a per-VRF / next-table lookup never matches a
+    /// connected prefix owned by a different routing-instance. The
+    /// connected vec holds one entry per interface address, so the
+    /// per-packet linear scan plus a string compare stays cheap.
+    pub(in crate::afxdp) table: String,
+}
+
+#[derive(Clone, Debug)]
 pub(in crate::afxdp) struct ConnectedRouteV6 {
     pub(in crate::afxdp) prefix: PrefixV6,
     pub(in crate::afxdp) ifindex: i32,
     pub(in crate::afxdp) tunnel_endpoint_id: u16,
+    /// #2388: canonical routing-table name. See `ConnectedRouteV4::table`.
+    pub(in crate::afxdp) table: String,
 }
 
 #[derive(Clone, Debug)]
 pub(in crate::afxdp) struct RouteEntryV4 {
     pub(in crate::afxdp) prefix: PrefixV4,
-    pub(in crate::afxdp) ifindex: i32,
-    pub(in crate::afxdp) tunnel_endpoint_id: u16,
-    pub(in crate::afxdp) next_hop: Option<Ipv4Addr>,
+    /// #2389: all resolved equal-cost next-hops. Always non-empty for a
+    /// forwarding (non-discard, non-next-table) route; built from the full
+    /// `RouteSnapshot.next_hops` vector. The legacy single `next_hop` /
+    /// `ifindex` / `tunnel_endpoint_id` accessors below select the FIRST
+    /// candidate so existing call sites are unchanged; the multipath
+    /// selector reads the whole slice.
+    pub(in crate::afxdp) next_hops: Vec<RouteNextHopV4>,
     pub(in crate::afxdp) discard: bool,
     pub(in crate::afxdp) next_table: String,
+    /// #2390: Junos route preference (admin distance; lower = preferred).
+    pub(in crate::afxdp) preference: i32,
 }
 
 #[derive(Clone, Debug)]
 pub(in crate::afxdp) struct RouteEntryV6 {
     pub(in crate::afxdp) prefix: PrefixV6,
-    pub(in crate::afxdp) ifindex: i32,
-    pub(in crate::afxdp) tunnel_endpoint_id: u16,
-    pub(in crate::afxdp) next_hop: Option<Ipv6Addr>,
+    /// #2389: all resolved equal-cost next-hops. See `RouteEntryV4`.
+    pub(in crate::afxdp) next_hops: Vec<RouteNextHopV6>,
     pub(in crate::afxdp) discard: bool,
     pub(in crate::afxdp) next_table: String,
+    /// #2390: Junos route preference (admin distance; lower = preferred).
+    pub(in crate::afxdp) preference: i32,
+}
+
+impl RouteEntryV4 {
+    /// First (primary) next-hop ifindex, or 0 if the route has no resolved
+    /// next-hop (discard / next-table). Preserves the pre-#2389 single
+    /// next-hop accessor for call sites that do not multipath-select.
+    pub(in crate::afxdp) fn ifindex(&self) -> i32 {
+        self.next_hops.first().map(|nh| nh.ifindex).unwrap_or(0)
+    }
+    pub(in crate::afxdp) fn tunnel_endpoint_id(&self) -> u16 {
+        self.next_hops
+            .first()
+            .map(|nh| nh.tunnel_endpoint_id)
+            .unwrap_or(0)
+    }
+    pub(in crate::afxdp) fn next_hop(&self) -> Option<Ipv4Addr> {
+        self.next_hops.first().and_then(|nh| nh.next_hop)
+    }
+}
+
+impl RouteEntryV6 {
+    pub(in crate::afxdp) fn ifindex(&self) -> i32 {
+        self.next_hops.first().map(|nh| nh.ifindex).unwrap_or(0)
+    }
+    pub(in crate::afxdp) fn tunnel_endpoint_id(&self) -> u16 {
+        self.next_hops
+            .first()
+            .map(|nh| nh.tunnel_endpoint_id)
+            .unwrap_or(0)
+    }
+    pub(in crate::afxdp) fn next_hop(&self) -> Option<Ipv6Addr> {
+        self.next_hops.first().and_then(|nh| nh.next_hop)
+    }
+}
+
+#[cfg(test)]
+impl RouteEntryV4 {
+    /// Test-only single-next-hop constructor preserving the pre-#2389
+    /// `{ ifindex, tunnel_endpoint_id, next_hop }` shape so existing FIB
+    /// tests read straightforwardly.
+    pub(in crate::afxdp) fn single(
+        prefix: PrefixV4,
+        ifindex: i32,
+        tunnel_endpoint_id: u16,
+        next_hop: Option<Ipv4Addr>,
+        discard: bool,
+        next_table: String,
+        preference: i32,
+    ) -> Self {
+        RouteEntryV4 {
+            prefix,
+            next_hops: vec![RouteNextHopV4 {
+                next_hop,
+                ifindex,
+                tunnel_endpoint_id,
+            }],
+            discard,
+            next_table,
+            preference,
+        }
+    }
+}
+
+#[cfg(test)]
+impl RouteEntryV6 {
+    pub(in crate::afxdp) fn single(
+        prefix: PrefixV6,
+        ifindex: i32,
+        tunnel_endpoint_id: u16,
+        next_hop: Option<Ipv6Addr>,
+        discard: bool,
+        next_table: String,
+        preference: i32,
+    ) -> Self {
+        RouteEntryV6 {
+            prefix,
+            next_hops: vec![RouteNextHopV6 {
+                next_hop,
+                ifindex,
+                tunnel_endpoint_id,
+            }],
+            discard,
+            next_table,
+            preference,
+        }
+    }
 }
 
 #[allow(dead_code)]

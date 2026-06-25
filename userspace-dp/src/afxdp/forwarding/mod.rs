@@ -1383,10 +1383,15 @@ pub(super) fn lookup_forwarding_resolution_v4(
         .routes_v4
         .get(table)
         .and_then(|routes| routes.iter().find(|entry| entry.prefix.contains(ip)));
+    // #2388: connected routes are table-scoped — only consider a connected
+    // prefix that belongs to the table being resolved, so a per-VRF /
+    // next-table lookup never matches another routing-instance's connected
+    // prefix. The vec is sorted longest-prefix-first, so the first matching
+    // in-table entry is the most specific.
     let connected_match = state
         .connected_v4
         .iter()
-        .find(|entry| entry.prefix.contains(ip));
+        .find(|entry| entry.table == table && entry.prefix.contains(ip));
     match choose_v4_route(static_match, connected_match) {
         Some(ResolvedRouteV4::Connected {
             ifindex,
@@ -1423,27 +1428,22 @@ pub(super) fn lookup_forwarding_resolution_v4(
             populate_egress_resolution(state, ifindex, &mut resolution);
             resolution
         }
-        Some(ResolvedRouteV4::Static {
-            ifindex,
-            tunnel_endpoint_id,
-            next_hop,
-            discard,
-            next_table,
-        }) => {
-            if discard {
+        Some(ResolvedRouteV4::Static(route)) => {
+            if route.discard {
                 return ForwardingResolution {
                     disposition: ForwardingDisposition::DiscardRoute,
                     local_ifindex: 0,
-                    egress_ifindex: ifindex,
-                    tx_ifindex: ifindex,
-                    tunnel_endpoint_id,
-                    next_hop: next_hop.map(IpAddr::V4),
+                    egress_ifindex: 0,
+                    tx_ifindex: 0,
+                    tunnel_endpoint_id: 0,
+                    next_hop: None,
                     neighbor_mac: None,
                     src_mac: None,
                     tx_vlan_id: 0,
                 };
             }
-            if let Some(next_table_name) = next_table {
+            if !route.next_table.is_empty() {
+                let next_table_name = route.next_table.as_str();
                 if next_table_name == table {
                     return ForwardingResolution {
                         disposition: ForwardingDisposition::NextTableUnsupported,
@@ -1457,6 +1457,8 @@ pub(super) fn lookup_forwarding_resolution_v4(
                         tx_vlan_id: 0,
                     };
                 }
+                // Clone needed: the recursive call borrows `state` again.
+                let next_table_name = route.next_table.clone();
                 return lookup_forwarding_resolution_v4(
                     state,
                     dynamic_neighbors,
@@ -1466,6 +1468,18 @@ pub(super) fn lookup_forwarding_resolution_v4(
                     allow_tunnels,
                 );
             }
+            // #2389: select one equal-cost next-hop, skipping a dead one.
+            let ip_hash = ecmp_hash_v4(ip);
+            let selected = select_route_next_hop(&route.next_hops, ip_hash, |nh| {
+                let target = nh.next_hop.unwrap_or(ip);
+                nh.ifindex > 0
+                    && lookup_neighbor_entry(state, dynamic_neighbors, nh.ifindex, IpAddr::V4(target))
+                        .is_some()
+            });
+            let (next_hop, ifindex, tunnel_endpoint_id) = match selected {
+                Some(nh) => (nh.next_hop, nh.ifindex, nh.tunnel_endpoint_id),
+                None => (None, 0, 0),
+            };
             if tunnel_endpoint_id != 0 {
                 return if allow_tunnels {
                     resolve_tunnel_forwarding_resolution(
@@ -1531,10 +1545,11 @@ pub(super) fn lookup_forwarding_resolution_v6(
         .routes_v6
         .get(table)
         .and_then(|routes| routes.iter().find(|entry| entry.prefix.contains(ip)));
+    // #2388: connected routes are table-scoped (see the v4 lookup).
     let connected_match = state
         .connected_v6
         .iter()
-        .find(|entry| entry.prefix.contains(ip));
+        .find(|entry| entry.table == table && entry.prefix.contains(ip));
     match choose_v6_route(static_match, connected_match) {
         Some(ResolvedRouteV6::Connected {
             ifindex,
@@ -1571,27 +1586,22 @@ pub(super) fn lookup_forwarding_resolution_v6(
             populate_egress_resolution(state, ifindex, &mut resolution);
             resolution
         }
-        Some(ResolvedRouteV6::Static {
-            ifindex,
-            tunnel_endpoint_id,
-            next_hop,
-            discard,
-            next_table,
-        }) => {
-            if discard {
+        Some(ResolvedRouteV6::Static(route)) => {
+            if route.discard {
                 return ForwardingResolution {
                     disposition: ForwardingDisposition::DiscardRoute,
                     local_ifindex: 0,
-                    egress_ifindex: ifindex,
-                    tx_ifindex: ifindex,
-                    tunnel_endpoint_id,
-                    next_hop: next_hop.map(IpAddr::V6),
+                    egress_ifindex: 0,
+                    tx_ifindex: 0,
+                    tunnel_endpoint_id: 0,
+                    next_hop: None,
                     neighbor_mac: None,
                     src_mac: None,
                     tx_vlan_id: 0,
                 };
             }
-            if let Some(next_table_name) = next_table {
+            if !route.next_table.is_empty() {
+                let next_table_name = route.next_table.as_str();
                 if next_table_name == table {
                     return ForwardingResolution {
                         disposition: ForwardingDisposition::NextTableUnsupported,
@@ -1605,6 +1615,7 @@ pub(super) fn lookup_forwarding_resolution_v6(
                         tx_vlan_id: 0,
                     };
                 }
+                let next_table_name = route.next_table.clone();
                 return lookup_forwarding_resolution_v6(
                     state,
                     dynamic_neighbors,
@@ -1614,6 +1625,18 @@ pub(super) fn lookup_forwarding_resolution_v6(
                     allow_tunnels,
                 );
             }
+            // #2389: select one equal-cost next-hop, skipping a dead one.
+            let ip_hash = ecmp_hash_v6(ip);
+            let selected = select_route_next_hop(&route.next_hops, ip_hash, |nh| {
+                let target = nh.next_hop.unwrap_or(ip);
+                nh.ifindex > 0
+                    && lookup_neighbor_entry(state, dynamic_neighbors, nh.ifindex, IpAddr::V6(target))
+                        .is_some()
+            });
+            let (next_hop, ifindex, tunnel_endpoint_id) = match selected {
+                Some(nh) => (nh.next_hop, nh.ifindex, nh.tunnel_endpoint_id),
+                None => (None, 0, 0),
+            };
             if tunnel_endpoint_id != 0 {
                 return if allow_tunnels {
                     resolve_tunnel_forwarding_resolution(
@@ -1825,38 +1848,26 @@ pub(super) fn parse_neighbor_entries(output: &str) -> Vec<(IpAddr, NeighborEntry
     out
 }
 
-enum ResolvedRouteV4 {
+enum ResolvedRouteV4<'a> {
     Connected {
         ifindex: i32,
         tunnel_endpoint_id: u16,
     },
-    Static {
-        ifindex: i32,
-        tunnel_endpoint_id: u16,
-        next_hop: Option<Ipv4Addr>,
-        discard: bool,
-        next_table: Option<String>,
-    },
+    Static(&'a RouteEntryV4),
 }
 
-enum ResolvedRouteV6 {
+enum ResolvedRouteV6<'a> {
     Connected {
         ifindex: i32,
         tunnel_endpoint_id: u16,
     },
-    Static {
-        ifindex: i32,
-        tunnel_endpoint_id: u16,
-        next_hop: Option<Ipv6Addr>,
-        discard: bool,
-        next_table: Option<String>,
-    },
+    Static(&'a RouteEntryV6),
 }
 
-fn choose_v4_route(
-    static_match: Option<&RouteEntryV4>,
-    connected_match: Option<&ConnectedRouteV4>,
-) -> Option<ResolvedRouteV4> {
+fn choose_v4_route<'a>(
+    static_match: Option<&'a RouteEntryV4>,
+    connected_match: Option<&'a ConnectedRouteV4>,
+) -> Option<ResolvedRouteV4<'a>> {
     match (static_match, connected_match) {
         (Some(route), Some(conn)) if conn.prefix.prefix_len() >= route.prefix.prefix_len() => {
             Some(ResolvedRouteV4::Connected {
@@ -1864,17 +1875,7 @@ fn choose_v4_route(
                 tunnel_endpoint_id: conn.tunnel_endpoint_id,
             })
         }
-        (Some(route), _) => Some(ResolvedRouteV4::Static {
-            ifindex: route.ifindex,
-            tunnel_endpoint_id: route.tunnel_endpoint_id,
-            next_hop: route.next_hop,
-            discard: route.discard,
-            next_table: if route.next_table.is_empty() {
-                None
-            } else {
-                Some(route.next_table.clone())
-            },
-        }),
+        (Some(route), _) => Some(ResolvedRouteV4::Static(route)),
         (None, Some(conn)) => Some(ResolvedRouteV4::Connected {
             ifindex: conn.ifindex,
             tunnel_endpoint_id: conn.tunnel_endpoint_id,
@@ -1883,10 +1884,10 @@ fn choose_v4_route(
     }
 }
 
-fn choose_v6_route(
-    static_match: Option<&RouteEntryV6>,
-    connected_match: Option<&ConnectedRouteV6>,
-) -> Option<ResolvedRouteV6> {
+fn choose_v6_route<'a>(
+    static_match: Option<&'a RouteEntryV6>,
+    connected_match: Option<&'a ConnectedRouteV6>,
+) -> Option<ResolvedRouteV6<'a>> {
     match (static_match, connected_match) {
         (Some(route), Some(conn)) if conn.prefix.prefix_len() >= route.prefix.prefix_len() => {
             Some(ResolvedRouteV6::Connected {
@@ -1894,22 +1895,62 @@ fn choose_v6_route(
                 tunnel_endpoint_id: conn.tunnel_endpoint_id,
             })
         }
-        (Some(route), _) => Some(ResolvedRouteV6::Static {
-            ifindex: route.ifindex,
-            tunnel_endpoint_id: route.tunnel_endpoint_id,
-            next_hop: route.next_hop,
-            discard: route.discard,
-            next_table: if route.next_table.is_empty() {
-                None
-            } else {
-                Some(route.next_table.clone())
-            },
-        }),
+        (Some(route), _) => Some(ResolvedRouteV6::Static(route)),
         (None, Some(conn)) => Some(ResolvedRouteV6::Connected {
             ifindex: conn.ifindex,
             tunnel_endpoint_id: conn.tunnel_endpoint_id,
         }),
         (None, None) => None,
+    }
+}
+
+/// #2389: select one equal-cost next-hop candidate for a forwarding
+/// static route. Prefers a candidate whose neighbor is resolved (skips a
+/// dead/unresolved first next-hop — the load-bearing correctness fix); if
+/// several resolve, distributes deterministically by destination IP; if
+/// none resolve, falls back to the same dst-hashed pick so the kernel
+/// slow-path can drive ARP/NDP. `ip` is hashed for the spread.
+///
+/// Distribution is per-DESTINATION (the only flow identity available at
+/// this resolution layer — the 5-tuple flow hash is not plumbed here).
+/// True per-flow ECMP spread would require threading the session flow
+/// hash into the forwarding-resolution path; tracked as a follow-up. The
+/// retained candidate vector makes that a localized change.
+/// Deterministic per-destination ECMP spread key. A fixed-seed splitmix64
+/// finalizer over the address bytes — stable across reloads and workers so
+/// every worker maps the same destination to the same equal-cost path
+/// (a flow's packets never split across paths). Not a security hash.
+fn ecmp_hash_bytes(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn ecmp_hash_v4(ip: Ipv4Addr) -> u64 {
+    ecmp_hash_bytes(u32::from(ip) as u64)
+}
+
+fn ecmp_hash_v6(ip: Ipv6Addr) -> u64 {
+    let bits = u128::from(ip);
+    ecmp_hash_bytes((bits as u64) ^ ((bits >> 64) as u64))
+}
+
+fn select_route_next_hop<'a, T: Copy>(
+    candidates: &'a [T],
+    ip_hash: u64,
+    is_live: impl Fn(&T) -> bool,
+) -> Option<&'a T> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let live: usize = candidates.iter().filter(|c| is_live(c)).count();
+    let pool_len = if live > 0 { live } else { candidates.len() };
+    let pick = (ip_hash % pool_len as u64) as usize;
+    if live > 0 {
+        candidates.iter().filter(|c| is_live(c)).nth(pick)
+    } else {
+        candidates.get(pick)
     }
 }
 

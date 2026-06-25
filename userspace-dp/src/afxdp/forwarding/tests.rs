@@ -2409,3 +2409,290 @@ fn is_ipsec_traffic_rejects_non_ipsec() {
         "GRE (proto 47) is not IPsec passthrough"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2388 / #2389 / #2390 — Rust FIB route-snapshot correctness regressions.
+// Each test FAILS if the corresponding fix is reverted.
+// ---------------------------------------------------------------------------
+
+/// #2388: connected routes must be table-scoped. Two routing-instances own
+/// the SAME connected prefix (10.0.0.0/24) on different interfaces. A
+/// lookup in tenant-b's table must resolve to tenant-b's interface, never
+/// leak to tenant-a's connected route. Revert (drop the `entry.table ==
+/// table` filter in the connected scan) → the global scan returns
+/// tenant-a's interface (pushed first) → egress mismatch → RED.
+#[test]
+fn connected_routes_are_table_scoped_no_cross_vrf_leak() {
+    let snapshot = crate::ConfigSnapshot {
+        zones: vec![
+            crate::ZoneSnapshot {
+                name: "za".to_string(),
+                id: TEST_TRUST_ZONE_ID,
+            },
+            crate::ZoneSnapshot {
+                name: "zb".to_string(),
+                id: TEST_UNTRUST_ZONE_ID,
+            },
+        ],
+        interfaces: vec![
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/1.80".to_string(),
+                zone: "za".to_string(),
+                routing_instance: "tenant-a".to_string(),
+                linux_name: "ge-0-0-1.80".to_string(),
+                ifindex: 101,
+                hardware_addr: "02:00:00:00:00:a1".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.0.0.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/1.90".to_string(),
+                zone: "zb".to_string(),
+                routing_instance: "tenant-b".to_string(),
+                linux_name: "ge-0-0-1.90".to_string(),
+                ifindex: 202,
+                hardware_addr: "02:00:00:00:00:b2".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.0.0.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+
+    // A lookup directed into tenant-b's table for a host in the overlapping
+    // prefix must egress tenant-b's interface (202), never tenant-a's (101).
+    let resolved = lookup_forwarding_resolution_v4(
+        &state,
+        None,
+        Ipv4Addr::new(10, 0, 0, 42),
+        "tenant-b.inet.0",
+        0,
+        true,
+    );
+    assert_eq!(
+        resolved.egress_ifindex, 202,
+        "tenant-b lookup must resolve tenant-b's connected interface, not tenant-a's (cross-VRF leak)",
+    );
+
+    // And the mirror: tenant-a's table resolves tenant-a's interface.
+    let resolved_a = lookup_forwarding_resolution_v4(
+        &state,
+        None,
+        Ipv4Addr::new(10, 0, 0, 42),
+        "tenant-a.inet.0",
+        0,
+        true,
+    );
+    assert_eq!(resolved_a.egress_ifindex, 101);
+}
+
+/// #2389: a static route with two next-hops must retain BOTH in the FIB
+/// (equal-cost), and a dead first next-hop must fall back to a live
+/// alternate. Revert the build to `next_hops.first()` → only one candidate
+/// retained → len 1 → RED; revert the selection → a dead NH[0] blackholes.
+#[test]
+fn ecmp_static_route_retains_all_next_hops_and_skips_dead() {
+    let snapshot = crate::ConfigSnapshot {
+        zones: vec![crate::ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+        }],
+        interfaces: vec![
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/1".to_string(),
+                zone: "wan".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                ifindex: 11,
+                hardware_addr: "02:00:00:00:00:11".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "192.0.2.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/2".to_string(),
+                zone: "wan".to_string(),
+                linux_name: "ge-0-0-2".to_string(),
+                ifindex: 22,
+                hardware_addr: "02:00:00:00:00:22".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "192.0.3.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        routes: vec![crate::RouteSnapshot {
+            table: "inet.0".to_string(),
+            family: "inet".to_string(),
+            destination: "203.0.113.0/24".to_string(),
+            // Two equal-cost next-hops, each via a distinct interface.
+            next_hops: vec![
+                "192.0.2.2@ge-0/0/1".to_string(),
+                "192.0.3.2@ge-0/0/2".to_string(),
+            ],
+            discard: false,
+            next_table: String::new(),
+            preference: 5,
+        }],
+        // Only the SECOND next-hop's neighbor is resolved; the first is dead.
+        neighbors: vec![crate::NeighborSnapshot {
+            interface: "ge-0-0-2".to_string(),
+            ifindex: 22,
+            family: "inet".to_string(),
+            ip: "192.0.3.2".to_string(),
+            mac: "00:11:22:33:44:66".to_string(),
+            state: "reachable".to_string(),
+            router: true,
+            link_local: false,
+        }],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+
+    // Build retains BOTH next-hops (not just the first).
+    let route = &state.routes_v4.get("inet.0").expect("table")[0];
+    assert_eq!(
+        route.next_hops.len(),
+        2,
+        "ECMP route must retain all next-hops, not collapse to the first",
+    );
+
+    // Selection skips the dead first next-hop and forwards via the live
+    // second (egress ge-0/0/2 = ifindex 22), producing a ForwardCandidate
+    // rather than a MissingNeighbor blackhole on NH[0].
+    let resolved = lookup_forwarding_resolution_v4(
+        &state,
+        None,
+        Ipv4Addr::new(203, 0, 113, 5),
+        "inet.0",
+        0,
+        true,
+    );
+    assert_eq!(
+        resolved.disposition,
+        ForwardingDisposition::ForwardCandidate,
+        "live alternate next-hop must forward despite a dead first next-hop",
+    );
+    assert_eq!(
+        resolved.egress_ifindex, 22,
+        "must egress the live next-hop's interface",
+    );
+}
+
+/// #2390: two same-prefix static routes with different preference must
+/// select the lower-preference one regardless of insertion order. The
+/// worse route is inserted FIRST. Revert (sort by prefix length only) →
+/// insertion order wins → the worse next-hop is selected → RED.
+#[test]
+fn same_prefix_routes_tie_break_by_preference_not_insertion_order() {
+    let snapshot = crate::ConfigSnapshot {
+        zones: vec![crate::ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+        }],
+        interfaces: vec![
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/1".to_string(),
+                zone: "wan".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                ifindex: 11,
+                hardware_addr: "02:00:00:00:00:11".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "192.0.2.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/2".to_string(),
+                zone: "wan".to_string(),
+                linux_name: "ge-0-0-2".to_string(),
+                ifindex: 22,
+                hardware_addr: "02:00:00:00:00:22".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "192.0.3.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        routes: vec![
+            // WORSE route first (higher preference = less preferred).
+            crate::RouteSnapshot {
+                table: "inet.0".to_string(),
+                family: "inet".to_string(),
+                destination: "203.0.113.0/24".to_string(),
+                next_hops: vec!["192.0.2.2@ge-0/0/1".to_string()],
+                discard: false,
+                next_table: String::new(),
+                preference: 50,
+            },
+            // BETTER route second (lower preference).
+            crate::RouteSnapshot {
+                table: "inet.0".to_string(),
+                family: "inet".to_string(),
+                destination: "203.0.113.0/24".to_string(),
+                next_hops: vec!["192.0.3.2@ge-0/0/2".to_string()],
+                discard: false,
+                next_table: String::new(),
+                preference: 5,
+            },
+        ],
+        neighbors: vec![
+            crate::NeighborSnapshot {
+                interface: "ge-0-0-1".to_string(),
+                ifindex: 11,
+                family: "inet".to_string(),
+                ip: "192.0.2.2".to_string(),
+                mac: "00:11:22:33:44:55".to_string(),
+                state: "reachable".to_string(),
+                router: true,
+                link_local: false,
+            },
+            crate::NeighborSnapshot {
+                interface: "ge-0-0-2".to_string(),
+                ifindex: 22,
+                family: "inet".to_string(),
+                ip: "192.0.3.2".to_string(),
+                mac: "00:11:22:33:44:66".to_string(),
+                state: "reachable".to_string(),
+                router: true,
+                link_local: false,
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+
+    let resolved = lookup_forwarding_resolution_v4(
+        &state,
+        None,
+        Ipv4Addr::new(203, 0, 113, 5),
+        "inet.0",
+        0,
+        true,
+    );
+    assert_eq!(
+        resolved.disposition,
+        ForwardingDisposition::ForwardCandidate
+    );
+    assert_eq!(
+        resolved.egress_ifindex, 22,
+        "lower-preference route (pref 5, ge-0/0/2) must win over the higher-preference route (pref 50, ge-0/0/1) inserted first",
+    );
+}

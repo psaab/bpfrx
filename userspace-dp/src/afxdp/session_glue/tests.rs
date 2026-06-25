@@ -86,6 +86,7 @@ fn test_forwarding_state() -> ForwardingState {
         prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(10, 0, 61, 0), 24).unwrap()),
         ifindex: 6,
         tunnel_endpoint_id: 0,
+        table: "inet.0".to_string(),
     });
     forwarding.neighbors.insert(
         (6, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
@@ -439,6 +440,7 @@ fn resolve_flow_session_decision_promotes_stale_fabric_shared_hit_to_local_owner
         prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(172, 16, 80, 0), 24).unwrap()),
         ifindex: 12,
         tunnel_endpoint_id: 0,
+        table: "inet.0".to_string(),
     });
     forwarding.neighbors.insert(
         (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
@@ -1316,6 +1318,7 @@ fn resolve_flow_session_decision_promotes_translated_shared_hit_on_active_fabric
         prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(172, 16, 80, 0), 24).unwrap()),
         ifindex: 12,
         tunnel_endpoint_id: 0,
+        table: "inet.0".to_string(),
     });
     forwarding.neighbors.insert(
         (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
@@ -1414,6 +1417,7 @@ fn resolve_flow_session_decision_promotes_local_synced_translated_hit_on_active_
         prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(172, 16, 80, 0), 24).unwrap()),
         ifindex: 12,
         tunnel_endpoint_id: 0,
+        table: "inet.0".to_string(),
     });
     forwarding.neighbors.insert(
         (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
@@ -1499,6 +1503,7 @@ fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inacti
         prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(172, 16, 80, 0), 24).unwrap()),
         ifindex: 12,
         tunnel_endpoint_id: 0,
+        table: "inet.0".to_string(),
     });
     forwarding.neighbors.insert(
         (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
@@ -1582,6 +1587,7 @@ fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inacti
         prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(172, 16, 80, 0), 24).unwrap()),
         ifindex: 12,
         tunnel_endpoint_id: 0,
+        table: "inet.0".to_string(),
     });
     forwarding.neighbors.insert(
         (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
@@ -1664,6 +1670,7 @@ fn resolve_flow_session_decision_keeps_local_synced_translated_hit_transient_on_
         prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(172, 16, 80, 0), 24).unwrap()),
         ifindex: 12,
         tunnel_endpoint_id: 0,
+        table: "inet.0".to_string(),
     });
     forwarding.neighbors.insert(
         (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
@@ -3734,6 +3741,7 @@ fn synced_session_hit_recomputes_local_resolution_after_failover() {
         prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(172, 16, 80, 0), 24).unwrap()),
         ifindex: 12,
         tunnel_endpoint_id: 0,
+        table: "inet.0".to_string(),
     });
     forwarding.neighbors.insert(
         (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),

@@ -39,6 +39,14 @@ pub(crate) struct InterfaceSnapshot {
     pub name: String,
     #[serde(default)]
     pub zone: String,
+    /// Bare routing-instance name this interface belongs to ("" = the
+    /// default instance). Used to scope connected routes rebuilt from
+    /// interface addresses to the owning routing table (#2388). Additive
+    /// via serde default: absent on snapshots from an old Go binary, in
+    /// which case the interface is treated as the default instance (the
+    /// pre-#2388 global behavior).
+    #[serde(rename = "routing_instance", default)]
+    pub routing_instance: String,
     #[serde(rename = "linux_name", default)]
     pub linux_name: String,
     #[serde(rename = "parent_linux_name", default)]
@@ -131,6 +139,15 @@ pub(crate) struct RouteSnapshot {
     pub discard: bool,
     #[serde(rename = "next_table", default)]
     pub next_table: String,
+    /// Junos route preference (administrative distance; lower = more
+    /// preferred, default 5). The FIB tie-breaks two same-prefix routes in
+    /// a table by ascending preference BEFORE insertion order (#2390).
+    /// serde default 0 keeps wire parity with an old Go binary that omits
+    /// the field (0 is the most-preferred value; for the common
+    /// single-route-per-prefix case the tie-break never fires, so behavior
+    /// is unchanged).
+    #[serde(default)]
+    pub preference: i32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

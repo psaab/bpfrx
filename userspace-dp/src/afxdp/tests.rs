@@ -4198,6 +4198,7 @@ fn poll_descriptor_input_filter_log_path_emits_rt_flow_event() {
         next_hops: vec!["172.16.80.200@reth0.80".to_string()],
         discard: false,
         next_table: String::new(),
+        preference: 0,
     }];
     snapshot.filters = vec![FirewallFilterSnapshot {
         name: "log-input".to_string(),
@@ -7107,6 +7108,7 @@ fn txn_tunnel_marked_missing_neighbor_not_buffered() {
         next_hops: vec!["@gr-0/0/0.0".to_string()],
         discard: false,
         next_table: String::new(),
+        preference: 0,
     });
     // No neighbors: the tunnel's OUTER destination (203.0.113.9 via the
     // 172.16.80.1 default gateway) is unresolved -> MissingNeighbor
@@ -8689,6 +8691,7 @@ fn inbound_nptv6_snapshot(policy: PolicyRuleSnapshot) -> ConfigSnapshot {
         next_hops: vec!["fd35:1940:27:100::102@reth1.0".to_string()],
         discard: false,
         next_table: String::new(),
+        preference: 0,
     });
     snapshot.neighbors.push(NeighborSnapshot {
         interface: "reth1.0".to_string(),

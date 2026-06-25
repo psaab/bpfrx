@@ -27,6 +27,48 @@ slow-path-injected.
 - `MAX_NEXT_TABLE_DEPTH = 8` — bounded recursion across `next-table`
   chains to keep a misconfigured loop from running forever.
 
+## FIB route model
+
+Route metadata crosses the Go→Rust snapshot boundary as `RouteSnapshot`
+(`protocol/snapshot.rs`) and is built into per-table FIBs by
+`forwarding_build/fib.rs`. Three correctness rules govern selection:
+
+- **Connected routes are table-scoped (#2388).** Connected prefixes are
+  rebuilt from interface addresses into the global `connected_v[46]`
+  vectors, but each entry carries its routing-table name
+  (`ConnectedRouteV4::table`), derived from the interface's
+  `routing_instance` (`""` = default → `inet.0`/`inet6.0`; a named
+  instance → `<ri>.inet.0`/`<ri>.inet6.0`). The lookup filters connected
+  candidates on the resolving table, so a per-VRF / `next-table` lookup
+  never matches another routing-instance's connected prefix. (Gateway →
+  egress inference at build time, `infer_connected_route_target_*`,
+  stays global — that resolves "which interface reaches this gateway IP",
+  not a destination egress.)
+- **ECMP: all next-hops retained, dead ones skipped (#2389).** A static
+  route keeps EVERY configured next-hop (`RouteEntryV4::next_hops:
+  Vec<RouteNextHopV4>`). `select_route_next_hop` prefers a candidate with
+  a resolved neighbor (so a dead first next-hop no longer blackholes a
+  route with a healthy alternate), then distributes across the live
+  candidates by a fixed-seed hash of the destination IP (`ecmp_hash_*`).
+  Distribution is per-DESTINATION today — the 5-tuple flow hash is not
+  plumbed into the resolution layer; true per-flow ECMP spread is a
+  localized follow-up enabled by the retained candidate vector. The
+  legacy `RouteEntryV4::{ifindex,next_hop,tunnel_endpoint_id}` accessors
+  return the FIRST candidate for non-multipath call sites.
+- **Preference tie-break before insertion order (#2390).**
+  `RouteSnapshot.preference` (Junos admin distance; lower = more
+  preferred, default 5) is carried on the wire and used as the secondary
+  sort key in `sort_routes` (descending prefix length, then ascending
+  preference). Two same-prefix routes in a table select by operator
+  preference, not insertion order; same-prefix/same-preference routes
+  keep insertion order (stable sort).
+
+All three wire fields (`routing_instance`, `next_hops`, `preference`)
+are additive: an old Rust helper ignores them (pre-fix behavior) and an
+old Go binary omits them (serde defaults: default instance, empty
+next-hops, preference 0). The wire specimen lives in
+`tests/fixtures/protocol_wire_v1.json`.
+
 ## Where it sits
 
 - Reads the live snapshot Arcs (FIB, NAT, neighbor table) supplied

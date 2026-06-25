@@ -840,6 +840,7 @@ mod tests {
             prefix: crate::prefix::PrefixV4::from_net(cidr.parse().expect("cidr")),
             ifindex: ICMP_IFINDEX,
             tunnel_endpoint_id: 0,
+            table: "inet.0".to_string(),
         });
         state
     }

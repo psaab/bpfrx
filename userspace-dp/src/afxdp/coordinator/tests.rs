@@ -1700,14 +1700,15 @@ fn warm_test_coordinator(rg_id: i32) -> (Coordinator, Receiver<WarmItem>) {
     );
     coord.forwarding.routes_v4.insert(
         "inet.0".to_string(),
-        vec![RouteEntryV4 {
-            prefix: PrefixV4::from_net("0.0.0.0/0".parse().unwrap()),
-            ifindex: egress_ifindex,
-            tunnel_endpoint_id: 0,
-            next_hop: Some(Ipv4Addr::new(172, 16, 80, 1)),
-            discard: false,
-            next_table: String::new(),
-        }],
+        vec![RouteEntryV4::single(
+            PrefixV4::from_net("0.0.0.0/0".parse().unwrap()),
+            egress_ifindex,
+            0,
+            Some(Ipv4Addr::new(172, 16, 80, 1)),
+            false,
+            String::new(),
+            5,
+        )],
     );
     (coord, rx)
 }
@@ -1764,7 +1765,7 @@ fn queue_warm_pass_skips_tunnel_routes() {
     // of warm scope. The warmer must skip it rather than gate it on the
     // wrong RG.
     let (mut coord, rx) = warm_test_coordinator(0);
-    coord.forwarding.routes_v4.get_mut("inet.0").unwrap()[0].tunnel_endpoint_id = 7;
+    coord.forwarding.routes_v4.get_mut("inet.0").unwrap()[0].next_hops[0].tunnel_endpoint_id = 7;
     coord.queue_warm_pass(false);
     assert!(rx.try_recv().is_err(), "tunnel route must not be warmed");
 }
@@ -1773,7 +1774,7 @@ fn queue_warm_pass_skips_tunnel_routes() {
 fn queue_warm_pass_skips_invalid_addresses() {
     let (mut coord, rx) = warm_test_coordinator(0);
     // Replace the route's next-hop with a multicast address.
-    coord.forwarding.routes_v4.get_mut("inet.0").unwrap()[0].next_hop =
+    coord.forwarding.routes_v4.get_mut("inet.0").unwrap()[0].next_hops[0].next_hop =
         Some(Ipv4Addr::new(224, 0, 0, 1));
     coord.queue_warm_pass(false);
     assert!(rx.try_recv().is_err(), "multicast next-hop must be filtered");
@@ -1785,14 +1786,15 @@ fn queue_warm_pass_dedups_within_one_call() {
     // Two routes with the SAME (ifindex, next-hop) in different tables.
     coord.forwarding.routes_v4.insert(
         "vrf-a.inet.0".to_string(),
-        vec![RouteEntryV4 {
-            prefix: PrefixV4::from_net("0.0.0.0/0".parse().unwrap()),
-            ifindex: 80,
-            tunnel_endpoint_id: 0,
-            next_hop: Some(Ipv4Addr::new(172, 16, 80, 1)),
-            discard: false,
-            next_table: String::new(),
-        }],
+        vec![RouteEntryV4::single(
+            PrefixV4::from_net("0.0.0.0/0".parse().unwrap()),
+            80,
+            0,
+            Some(Ipv4Addr::new(172, 16, 80, 1)),
+            false,
+            String::new(),
+            5,
+        )],
     );
     coord.queue_warm_pass(false);
     assert!(rx.try_recv().is_ok(), "first item expected");
@@ -1846,14 +1848,15 @@ fn queue_warm_pass_noop_without_worker_queue() {
         .store(Arc::new(BTreeMap::from([(0i32, warm_active_ha_runtime(now_secs))])));
     coord.forwarding.routes_v4.insert(
         "inet.0".to_string(),
-        vec![RouteEntryV4 {
-            prefix: PrefixV4::from_net("0.0.0.0/0".parse().unwrap()),
-            ifindex: 80,
-            tunnel_endpoint_id: 0,
-            next_hop: Some(Ipv4Addr::new(172, 16, 80, 1)),
-            discard: false,
-            next_table: String::new(),
-        }],
+        vec![RouteEntryV4::single(
+            PrefixV4::from_net("0.0.0.0/0".parse().unwrap()),
+            80,
+            0,
+            Some(Ipv4Addr::new(172, 16, 80, 1)),
+            false,
+            String::new(),
+            5,
+        )],
     );
     coord.queue_warm_pass(false); // must not panic
 }

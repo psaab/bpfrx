@@ -163,8 +163,17 @@ type ZoneSnapshot struct {
 }
 
 type InterfaceSnapshot struct {
-	Name                      string                     `json:"name"`
-	Zone                      string                     `json:"zone,omitempty"`
+	Name string `json:"name"`
+	Zone string `json:"zone,omitempty"`
+	// RoutingInstance is the bare routing-instance name this interface
+	// belongs to ("" = the default instance). The Rust dataplane derives
+	// the connected-route table (<ri>.inet.0 / <ri>.inet6.0, or
+	// inet.0/inet6.0 for the default instance) from it so connected routes
+	// rebuilt from interface addresses are table-scoped and do not leak
+	// across VRF boundaries (#2388). Additive: an old Rust helper that does
+	// not know the field treats every interface as the default instance
+	// (the pre-#2388 global behavior); an old Go binary omits it.
+	RoutingInstance           string                     `json:"routing_instance,omitempty"`
 	LinuxName                 string                     `json:"linux_name,omitempty"`
 	ParentLinuxName           string                     `json:"parent_linux_name,omitempty"`
 	Ifindex                   int                        `json:"ifindex,omitempty"`
@@ -705,6 +714,17 @@ type RouteSnapshot struct {
 	NextHops    []string `json:"next_hops,omitempty"`
 	Discard     bool     `json:"discard"`
 	NextTable   string   `json:"next_table,omitempty"`
+	// Preference is the Junos route preference (administrative distance;
+	// lower = more preferred, default 5). The Rust FIB tie-breaks two
+	// same-prefix routes in a table by preference BEFORE insertion order
+	// (#2390); without it, two competing same-prefix statics selected by
+	// insertion order, ignoring operator intent. Additive: an old Rust
+	// helper ignores it (insertion-order tie-break, the pre-#2390 behavior)
+	// and an old Go binary omits it (Rust sees 0, the most-preferred value,
+	// which for the common single-route-per-prefix case is a no-op). 0 is a
+	// legitimate value (it deserializes back to 0 under serde default), so
+	// omitempty only suppresses the wire byte for an explicit preference 0.
+	Preference int `json:"preference,omitempty"`
 }
 
 type NeighborSnapshot struct {

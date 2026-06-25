@@ -14674,3 +14674,47 @@ top.
   **File(s)**: pkg/config/compiler_routing.go,
   pkg/config/compiler_prefix_list_merge_2641_test.go,
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-25T00:00Z
+  **Action**: #2388/#2389/#2390 — three coupled Rust FIB route-snapshot
+  correctness fixes (one PR). (#2388) connected routes are now table-scoped
+  in the Rust FIB: each ConnectedRouteV4/V6 carries its routing-table name
+  (derived from the new InterfaceSnapshot.routing_instance wire field), and
+  the lookup filters connected candidates by the resolving table — no more
+  cross-VRF connected-route leak. (#2389) ECMP static routes retain ALL
+  next-hops (RouteEntry.next_hops: Vec<RouteNextHop>); select_route_next_hop
+  prefers a candidate with a resolved neighbor (dead-first-NH no longer
+  blackholes) then distributes by a fixed-seed dst-IP hash; neighbor-warm
+  loop warms every NH. Per-flow (5-tuple) ECMP spread deferred — flow hash
+  not plumbed into the resolution layer. (#2390) StaticRoute.Preference is
+  serialized (RouteSnapshot.preference wire field) and used as the secondary
+  sort key (prefix-len desc, then preference asc) so same-prefix routes
+  tie-break by operator preference, not insertion order. Wire: added
+  routing_instance (InterfaceSnapshot) + preference (RouteSnapshot) — both
+  additive/serde-default both sides; regenerated protocol_wire_v1.json.
+  Tests: 3 fail-on-revert Rust tests (forwarding/tests.rs) + 3 Go tests
+  (routes_fib_metadata_test.go), all verified RED on revert.
+  Gates: cargo build --release clean; cargo test --release green
+  (2781 passed; the lone intermittent worker_queue concurrency test is a
+  pre-existing flake, passes in isolation); go build ./... + go vet +
+  gofmt clean; go test ./pkg/dataplane/userspace/... green.
+  **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/routes.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/routes_fib_metadata_test.go,
+  userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/fib.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/icmp_ptb_tests.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs, userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json, _Log.md

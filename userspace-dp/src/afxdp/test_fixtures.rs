@@ -40,6 +40,7 @@ pub(super) fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {
                 next_hops: vec!["172.16.50.1@ge-0/0/0.50".to_string()],
                 discard: false,
                 next_table: String::new(),
+                preference: 0,
             },
             RouteSnapshot {
                 table: "inet6.0".to_string(),
@@ -48,6 +49,7 @@ pub(super) fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {
                 next_hops: vec!["2001:559:8585:50::1@ge-0/0/0.50".to_string()],
                 discard: false,
                 next_table: String::new(),
+                preference: 0,
             },
         ],
         neighbors: if include_neighbor {
@@ -159,6 +161,7 @@ pub(super) fn native_gre_snapshot(include_neighbor: bool) -> ConfigSnapshot {
                 next_hops: vec!["2001:559:8585:80::1@reth0.80".to_string()],
                 discard: false,
                 next_table: String::new(),
+                preference: 0,
             },
             RouteSnapshot {
                 table: "sfmix.inet.0".to_string(),
@@ -167,6 +170,7 @@ pub(super) fn native_gre_snapshot(include_neighbor: bool) -> ConfigSnapshot {
                 next_hops: vec!["10.255.192.41".to_string()],
                 discard: false,
                 next_table: String::new(),
+                preference: 0,
             },
         ],
         neighbors: if include_neighbor {
@@ -276,6 +280,7 @@ pub(super) fn wg_outer_mtu_snapshot() -> ConfigSnapshot {
             next_hops: vec!["172.16.80.1@reth0.80".to_string()],
             discard: false,
             next_table: String::new(),
+            preference: 0,
         }],
         ..Default::default()
     }
@@ -360,6 +365,7 @@ pub(super) fn forwarding_snapshot_with_next_table(include_neighbor: bool) -> Con
                 next_hops: vec![],
                 discard: false,
                 next_table: "blue.inet.0".to_string(),
+                preference: 0,
             },
             RouteSnapshot {
                 table: "blue.inet.0".to_string(),
@@ -368,6 +374,7 @@ pub(super) fn forwarding_snapshot_with_next_table(include_neighbor: bool) -> Con
                 next_hops: vec!["172.16.50.1@ge-0/0/0.50".to_string()],
                 discard: false,
                 next_table: String::new(),
+                preference: 0,
             },
             RouteSnapshot {
                 table: "inet6.0".to_string(),
@@ -376,6 +383,7 @@ pub(super) fn forwarding_snapshot_with_next_table(include_neighbor: bool) -> Con
                 next_hops: vec![],
                 discard: false,
                 next_table: "blue.inet6.0".to_string(),
+                preference: 0,
             },
             RouteSnapshot {
                 table: "blue.inet6.0".to_string(),
@@ -384,6 +392,7 @@ pub(super) fn forwarding_snapshot_with_next_table(include_neighbor: bool) -> Con
                 next_hops: vec!["2001:559:8585:50::1@ge-0/0/0.50".to_string()],
                 discard: false,
                 next_table: String::new(),
+                preference: 0,
             },
         ],
         neighbors: if include_neighbor {
@@ -425,6 +434,7 @@ pub(super) fn forwarding_snapshot_with_next_table_loop() -> ConfigSnapshot {
             next_hops: vec![],
             discard: false,
             next_table: "inet.0".to_string(),
+            preference: 0,
         }],
         ..Default::default()
     }
@@ -496,6 +506,7 @@ pub(super) fn nat_snapshot() -> ConfigSnapshot {
                 next_hops: vec!["172.16.80.1@reth0.80".to_string()],
                 discard: false,
                 next_table: String::new(),
+                preference: 0,
             },
             RouteSnapshot {
                 table: "inet6.0".to_string(),
@@ -504,6 +515,7 @@ pub(super) fn nat_snapshot() -> ConfigSnapshot {
                 next_hops: vec!["2001:559:8585:80::1@reth0.80".to_string()],
                 discard: false,
                 next_table: String::new(),
+                preference: 0,
             },
         ],
         source_nat_rules: vec![
@@ -728,6 +740,7 @@ pub(super) fn static_nat_snapshot() -> ConfigSnapshot {
             next_hops: vec!["203.0.113.254@ge-0/0/1".to_string()],
             discard: false,
             next_table: String::new(),
+            preference: 0,
         }],
         static_nat_rules: vec![StaticNATRuleSnapshot {
             counter_id: 0,
