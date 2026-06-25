@@ -577,7 +577,8 @@ func (c *CLI) showDHCPDynamicDNS(detail bool) error {
 	fmt.Printf("    Reconciles: ok=%d fail=%d\n", st.ReconcileOK, st.ReconcileFail)
 	fmt.Printf("    Skipped:    no-name=%d no-backend=%d conflict=%d ptr-notauth=%d\n",
 		st.SkippedNoName, st.SkippedNoBackend, st.SkippedConflict, st.SkippedPTRNotAuth)
-	fmt.Printf("    PTR deferred: %d (forward published, reverse PTR retry pending)\n", st.PTRDeferred)
+	fmt.Printf("    PTR deferred: %d total (lifetime), %d pending now\n",
+		st.PTRDeferred, st.PTRPendingNow)
 	fmt.Printf("    Owned records: %d\n", st.OwnedRecords)
 	if !st.LastReconcile.IsZero() {
 		fmt.Printf("    Last reconcile: %s (%d leases)\n",
@@ -590,10 +591,14 @@ func (c *CLI) showDHCPDynamicDNS(detail bool) error {
 		if len(recs) == 0 {
 			fmt.Println("    none")
 		} else {
-			fmt.Printf("    %-32s %-6s %-39s %s\n", "FQDN", "Type", "Address", "PTR")
+			fmt.Printf("    %-32s %-6s %-39s %-26s %s\n", "FQDN", "Type", "Address", "PTR", "Pending")
 			for _, r := range recs {
-				fmt.Printf("    %-32s %-6s %-39s %s\n",
-					r.FQDN, r.ForwardType, r.Address, r.PTRName)
+				pending := "-"
+				if r.PTRPending {
+					pending = "PTR"
+				}
+				fmt.Printf("    %-32s %-6s %-39s %-26s %s\n",
+					r.FQDN, r.ForwardType, r.Address, r.PTRName, pending)
 			}
 		}
 	}

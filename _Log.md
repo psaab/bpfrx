@@ -1,3 +1,42 @@
+## 2026-06-25 — #2699 / #2700 / #2708 DDNS spine re-verify + fix (one PR)
+
+- **Timestamp**: 2026-06-25
+- **Action**: Re-verified three pre-#2691-redesign DDNS spine bugs against
+  current master (966dea4b8, all of #2691 P0-P3 merged). All THREE still
+  genuine on the lease (Surface B) path — the P2/P3 fail-closed work landed on
+  the Surface A (`SurfaceAManager`) path only. Fixed all three in one PR with
+  reconcile-layer fail-on-revert tests driving the real rfc2136 backend against
+  the in-process stateful fake DNS server (per the P2 lesson: no fakeUpdater
+  bypass for an ownership/orphan correctness test).
+  - **#2699** — `deleteOwnedLocked` dropped ownership through `nopUpdater` after
+    a restart / backend removal, orphaning the live RR. Fix: keep ownership,
+    count `deleteFail`, return new sentinel `errDDNSNoBackendToWithdraw`
+    (swallowed by `reconcileOnceLocked` / `withdrawAllLocked` so a legit
+    disabled-with-no-backend pass is not failed). Mirrors the Surface A
+    `withdrawOwnedLocked` precedent. (The pre-#2691 inc-1 invariant — "nop never
+    published, nothing to orphan" — no longer holds: a live backend publishes,
+    and ownership is recorded ONLY by a live backend.)
+  - **#2700** — shared RFC 4701 DHCID (digest folds client-id||FQDN, NOT the
+    address) deleted on a partial dual-stack teardown left the surviving family
+    unprotected + leaked. Fix: `Manager.dhcidSharedWithOther` scans the store;
+    `LeaseDNSRecord.KeepForwardDHCID` threads through `DeleteLease` →
+    `sendRemoveForward(..., keepDHCID)`, which removes only the A/AAAA and
+    leaves the shared DHCID (DHCID-match prereq still sent). DHCID removed only
+    with the last family's record.
+  - **#2708** — `PTRPending` persisted but not surfaced. Fix:
+    `OwnedRecordView.PTRPending` + copy in `OwnedRecordViews`; new
+    `Stats.PTRPendingNow` current gauge (distinct from cumulative
+    `PTRDeferred`); CLI + gRPC detail `Pending` column; Prometheus
+    `xpf_dhcp_ddns_ptr_pending` gauge.
+- **File(s)**: pkg/ddns/manager.go, pkg/ddns/backend.go,
+  pkg/ddns/backend_rfc2136.go, pkg/ddns/manager_test.go,
+  pkg/ddns/spine_fixes_test.go (new), pkg/cli/cli_show_services.go,
+  pkg/grpcapi/server_show_dhcp_lldp_snmp.go, pkg/api/metrics.go,
+  pkg/api/metrics_descriptors.go, pkg/api/metrics_system.go, pkg/ddns/README.md
+- **Validation**: go build ./... clean; go test ./pkg/ddns/... ./pkg/dhcpserver/...
+  ./pkg/daemon/... ./pkg/cli/... ./pkg/grpcapi/... ./pkg/api/... green;
+  -race ./pkg/ddns green; gofmt clean; all three new tests proven fail-on-revert.
+
 ## 2026-06-24 — #2719 fix: stale pkg/daemon event-stream test fixture (post-#2467 wire widen)
 
 - **Timestamp**: 2026-06-24

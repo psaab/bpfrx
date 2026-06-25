@@ -13,6 +13,20 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
+// errDDNSNoBackendToWithdraw is returned by deleteOwnedLocked when an owned
+// record must be withdrawn but only the no-op backend is wired (#2699). The
+// wire RR was NOT removed and ownership is DELIBERATELY KEPT (so the record
+// stays cleanable once a real backend is reconfigured), so the delete is
+// reported as a failure rather than a silent ownership drop. reconcileOnceLocked
+// treats it like any other delete error (the record is left in the store, its
+// identity/address/FQDN are blocked from re-add this cycle, and a later
+// reconcile retries) — but it is NOT a wire-level error, so it does not fail
+// the whole reconcile pass: a turn-off / restart with no backend resolves to
+// nop legitimately, and wedging the pass on it would be noise. The next
+// reconcile that resolves a live backend (or the next-cycle withdraw guard
+// supplying the prior live updater) performs the real withdraw.
+var errDDNSNoBackendToWithdraw = errors.New("ddns: no live backend to withdraw owned record (ownership kept for retry)")
+
 // manager.go (moved verbatim from pkg/dhcpserver/ddns.go in #2691 P1a): the
 // DHCP dynamic-DNS manager + reconciler core (#1387, per
 // docs/research/1387-dhcp-ddns/plan.md). This is the config-driven policy,
@@ -182,8 +196,17 @@ type Stats struct {
 	// PTRDeferred counts upserts where the forward A/AAAA published but the
 	// reverse PTR add failed with a non-skippable (transient) error: ownership
 	// is recorded for the live forward (never orphaned) and the PTR is retried
-	// on the next reconcile (#2661).
+	// on the next reconcile (#2661). It is a CUMULATIVE lifetime counter (every
+	// deferral ever), NOT the count of records CURRENTLY pending — use
+	// PTRPendingNow for the current gauge (#2708).
 	PTRDeferred uint64
+	// PTRPendingNow is the CURRENT count of owned records whose forward A/AAAA
+	// is published but whose reverse PTR is still owed (ownedRecord.PTRPending,
+	// #2708). Distinct from the cumulative PTRDeferred: this falls back to 0
+	// once every pending PTR finally publishes, so it is the live "how many
+	// records are half-published right now" gauge an operator watches for
+	// recovery. Surfaced in `show ... dynamic-dns` and Prometheus.
+	PTRPendingNow int
 	// ReconcileOK / ReconcileFail count whole reconcile passes by outcome
 	// (a pass is "fail" when at least one record op errored this cycle).
 	ReconcileOK    uint64
@@ -609,6 +632,36 @@ func (m *Manager) familyOwnsRecords(family int) bool {
 	return false
 }
 
+// dhcidSharedWithOther reports whether ANOTHER owned record (a different store
+// key) shares the SAME RFC 4701 DHCID as `owned` — i.e. the same non-empty
+// ClientID and the same canonical FQDN (#2700). The DHCID digest is
+// SHA-256(client-identity || canonical-FQDN-in-wire-form) and folds in NEITHER
+// the address NOR the family, so a dual-stack client (an A and an AAAA under
+// one FQDN, same client identity) produces ONE shared DHCID across both
+// records. When such a sibling exists, deleting one family's A/AAAA must keep
+// the shared DHCID on the wire so the surviving family's record stays
+// DHCID-protected and its eventual delete still satisfies the DHCID-match
+// prerequisite — otherwise the survivor is left unprotected (a hijack window)
+// and then leaks on the wire (its delete prereq fails). Records with an empty
+// ClientID never wrote a DHCID (the delete takes the plain exact-RR path), so
+// they are never siblings. Caller holds m.mu.
+func (m *Manager) dhcidSharedWithOther(owned ownedRecord) bool {
+	if owned.ClientID == "" {
+		return false
+	}
+	ownedKey := ownedRecordKey(owned.scopeOf(), owned.Identity, owned.Address)
+	ownedFQDN := dnsCanonicalFQDN(owned.FQDN)
+	for k, r := range m.state.records {
+		if k == ownedKey {
+			continue
+		}
+		if r.ClientID == owned.ClientID && dnsCanonicalFQDN(r.FQDN) == ownedFQDN {
+			return true
+		}
+	}
+	return false
+}
+
 // parseLeases reads a family's active leases via the injected LeaseParser
 // (#2691 P1a). A nil parser (the spine constructed without a Kea-memfile
 // parser) yields an empty, trusted lease set — identical to a healthy memfile
@@ -797,7 +850,15 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, env *reconcileEnv, le
 		// (the desired pass below re-adds the new form). Delete only the
 		// EXACT owned tuple — never anything not in the store.
 		if err := m.deleteOwnedLocked(ctx, env.updaterFor(owned.Family), owned); err != nil {
-			noteErr(err)
+			// errDDNSNoBackendToWithdraw is a "kept ownership, no backend"
+			// non-failure (#2699): the record stays owned + cleanable, but no
+			// wire op was attempted, so it must NOT fail the reconcile pass (a
+			// legitimate turn-off / restart with no backend resolves to nop).
+			// Still BLOCK a re-add of the same tuple this cycle — the record is
+			// still considered live/owned, not expired.
+			if !errors.Is(err, errDDNSNoBackendToWithdraw) {
+				noteErr(err)
+			}
 			blockedIdentity[owned.Identity] = struct{}{}
 			blockedAddress[owned.Address] = struct{}{}
 			blockedFQDN[owned.FQDN] = struct{}{}
@@ -856,7 +917,13 @@ func (m *Manager) withdrawAllLocked(ctx context.Context) error {
 	}
 	var firstErr error
 	for _, r := range owned {
-		if err := m.deleteOwnedLocked(ctx, m.updater, r); err != nil && firstErr == nil {
+		// errDDNSNoBackendToWithdraw (#2699) keeps ownership and is not a wire
+		// failure: a withdraw-all with no live backend (DDNS disabled before a
+		// real backend was ever resolved, or a restart that has not yet built
+		// one) legitimately resolves to nop. Do NOT surface it — the records are
+		// kept and a later reconcile with a live backend withdraws them.
+		if err := m.deleteOwnedLocked(ctx, m.updater, r); err != nil &&
+			!errors.Is(err, errDDNSNoBackendToWithdraw) && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -1035,23 +1102,47 @@ func (m *Manager) deleteOwnedLocked(ctx context.Context, updater DNSUpdater, own
 	// backend recomputes the same RFC 4701 DHCID — the delete prerequisite
 	// then proves xpf owns the record before removing it.
 	rec.ClientID = owned.ClientID
+	// #2700: if ANOTHER owned record still shares this record's FQDN + ClientID
+	// (a dual-stack client whose A and AAAA carry the SAME shared DHCID — the
+	// DHCID digest folds in client-identity||FQDN, NOT the address, so both
+	// families produce one DHCID), keep the shared DHCID on the wire so the
+	// surviving family's record stays DHCID-protected (RFC 4703) and its later
+	// delete still satisfies the DHCID-match prerequisite. Only when THIS is the
+	// last owned record under the name is the DHCID removed with it.
+	rec.KeepForwardDHCID = m.dhcidSharedWithOther(owned)
 	if err := updater.DeleteLease(ctx, rec); err != nil {
 		m.deleteFail.Add(1)
 		return err
 	}
 	if isNopUpdater(updater) {
-		// No live backend: the delete was a logged no-op. Still drop the
-		// ownership entry. For increment 1 this is CORRECT: nopUpdater never
-		// published anything, so there is nothing in DNS to orphan by
-		// forgetting ownership. CAVEAT (increment 2+): if a real backend is
-		// ever wired, publishes records, and is later removed (a downgrade
-		// back to no-backend), dropping ownership here would orphan those
-		// previously-published records in DNS. Handling that downgrade is an
-		// increment-2 concern; there is NO logic change for inc-1, where the
-		// store can only ever hold records nopUpdater "wrote" (i.e. none).
+		// No live backend: the delete was a logged no-op — the wire RR (if any)
+		// was NOT removed. KEEP the ownership entry so the record stays
+		// cleanable once a real backend is reconfigured; do NOT drop it (#2699).
+		//
+		// The pre-#2699 path dropped ownership here, justified by the inc-1
+		// invariant "nopUpdater never published, so there is nothing to orphan."
+		// That invariant no longer holds: a real RFC 2136 backend now publishes
+		// records (inc-2), and ownership can ONLY be recorded by a live backend
+		// (upsertLocked's nop branch records NO ownership and write-aheads no
+		// intent — manager.go upsertLocked). So any owned entry reaching this
+		// path was published by a real backend; if the backend is later removed
+		// (DDNS disabled / update-server cleared) OR the process restarts before
+		// it resolves a live backend, dropping ownership would ORPHAN the live
+		// A/AAAA/PTR/DHCID in the authoritative zone — xpf would forget the only
+		// record that lets it ever clean them (the stale-record / split-ownership
+		// class #1387 exists to prevent). Instead, treat the no-op delete as a
+		// FAILURE (count deleteFail, surface the error) and KEEP ownership: a
+		// later reconcile that resolves a live backend (the same family's backend
+		// re-appears, or the next-cycle withdraw guard supplies the prior live
+		// updater) withdraws it for real. This mirrors the Surface A precedent
+		// (SurfaceAManager.withdrawOwnedLocked, surface_a.go) which already treats
+		// a no-op backend as a delete failure rather than dropping ownership.
 		m.skippedNoBackend.Add(1)
-		m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
-		return nil
+		m.deleteFail.Add(1)
+		slog.Warn("ddns: cannot withdraw record — no live backend wired; "+
+			"keeping ownership for retry (record stays cleanable)",
+			"fqdn", owned.FQDN, "address", owned.Address, "type", owned.ForwardType)
+		return errDDNSNoBackendToWithdraw
 	}
 	m.deleteOK.Add(1)
 	m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
@@ -1079,6 +1170,11 @@ type OwnedRecordView struct {
 	Address     string
 	PTRName     string
 	TTL         int
+	// PTRPending is true when the forward A/AAAA is published but the reverse
+	// PTR is still owed (a non-skippable PTR add failure, #2661). It surfaces
+	// the half-published condition per record so an operator can distinguish a
+	// settled record from one whose PTR is missing and watch it recover (#2708).
+	PTRPending bool
 }
 
 // OwnedRecordViews returns a stable-ordered snapshot of the records this
@@ -1096,6 +1192,7 @@ func (m *Manager) OwnedRecordViews() []OwnedRecordView {
 			Address:     r.Address,
 			PTRName:     r.PTRName,
 			TTL:         r.TTL,
+			PTRPending:  r.PTRPending,
 		})
 	}
 	return out
@@ -1105,6 +1202,12 @@ func (m *Manager) OwnedRecordViews() []OwnedRecordView {
 func (m *Manager) Stats() Stats {
 	m.mu.Lock()
 	n := len(m.state.records)
+	pendingNow := 0
+	for _, r := range m.state.records {
+		if r.PTRPending {
+			pendingNow++
+		}
+	}
 	m.mu.Unlock()
 
 	st := Stats{
@@ -1117,6 +1220,7 @@ func (m *Manager) Stats() Stats {
 		SkippedPTRNotAuth: m.skippedPTRNotAuth.Load(),
 		SkippedConflict:   m.skippedConflict.Load(),
 		PTRDeferred:       m.ptrDeferred.Load(),
+		PTRPendingNow:     pendingNow,
 		ReconcileOK:       m.reconcileOK.Load(),
 		ReconcileFail:     m.reconcileFail.Load(),
 		OwnedRecords:      n,
