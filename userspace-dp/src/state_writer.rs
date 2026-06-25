@@ -1,4 +1,5 @@
 use io_uring::IoUring;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -33,6 +34,46 @@ fn sync_all(f: &File) -> io::Result<()> {
 #[inline]
 fn sync_all(f: &File) -> io::Result<()> {
     real_sync_all(f)
+}
+
+/// Liveness seam: report whether `pid` is a live process. Indirected through a
+/// function pointer so the orphan-temp sweep can be tested deterministically
+/// (a test marks specific pids dead/alive without spawning real processes) and
+/// so a test FAILS if the dead-pid gate is removed. Production always uses
+/// [`real_pid_is_alive`].
+#[cfg(test)]
+type PidAliveFn = fn(u32) -> bool;
+
+/// A pid is "alive" if `/proc/<pid>` exists. This is the concurrency-safety
+/// gate for the orphan sweep (#2714): the unique-per-write temp scheme leaks
+/// `<dest>.<pid>.<seq>.tmp` on a crash between create and rename, but a naive
+/// glob-sweep would re-introduce the #2705 cross-writer hazard by deleting a
+/// still-live OTHER writer's in-flight temp. Removing only temps whose embedded
+/// pid is no longer running preserves any concurrent live writer's temp.
+fn real_pid_is_alive(pid: u32) -> bool {
+    // The writer's own process is always alive; never treat its in-flight temps
+    // as orphans regardless of /proc visibility quirks.
+    if pid == std::process::id() {
+        return true;
+    }
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(test)]
+thread_local! {
+    static PID_ALIVE_HOOK: std::cell::Cell<PidAliveFn> =
+        const { std::cell::Cell::new(real_pid_is_alive) };
+}
+
+#[cfg(test)]
+fn pid_is_alive(pid: u32) -> bool {
+    PID_ALIVE_HOOK.with(|h| (h.get())(pid))
+}
+
+#[cfg(not(test))]
+#[inline]
+fn pid_is_alive(pid: u32) -> bool {
+    real_pid_is_alive(pid)
 }
 
 enum WriteMode {
@@ -92,7 +133,17 @@ impl StateWriter {
                     }
                 };
 
+                // Destinations whose stale-orphan sweep has already run this
+                // process lifetime. The sweep removes `<dest>.<pid>.<seq>.tmp`
+                // leaked by a crash between create and rename (#2714); running
+                // it once per distinct destination keeps it off the per-write
+                // hot path while still cleaning up at process start.
+                let mut swept: HashSet<String> = HashSet::new();
+
                 while let Ok(req) = rx.recv() {
+                    if swept.insert(req.path.clone()) {
+                        sweep_stale_temps(&req.path);
+                    }
                     let result = persist_with_mode(&mut write_mode, &req.path, &req.data);
                     if let Err(err) = &result {
                         if let Ok(mut last) = last_error_bg.lock() {
@@ -266,6 +317,88 @@ fn temporary_path(path: &str) -> PathBuf {
     tmp
 }
 
+/// Parse the embedded pid out of a temp file NAME (not a full path) produced by
+/// [`temporary_path`]. The format is `<stem>[.<ext>].<pid>.<seq>.tmp`, so after
+/// stripping the trailing `.tmp` the last two dot-components are `<pid>.<seq>`
+/// (pid second-to-last, seq last). Returns `None` if `name` does not match that
+/// shape — a foreign file that merely ends in `.tmp` is left untouched.
+fn pid_from_temp_name(name: &str) -> Option<u32> {
+    let body = name.strip_suffix(".tmp")?;
+    let mut parts = body.rsplitn(3, '.');
+    let _seq: &str = parts.next()?; // trailing <seq>
+    let pid_str = parts.next()?; // <pid> immediately before <seq>
+    let stem = parts.next()?; // at least one leading stem component must exist
+    if stem.is_empty() {
+        return None;
+    }
+    // Both the seq and pid components must be all-digits to be one of our temps.
+    if !_seq.bytes().all(|b| b.is_ascii_digit()) || _seq.is_empty() {
+        return None;
+    }
+    if pid_str.is_empty() || !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid_str.parse::<u32>().ok()
+}
+
+/// Best-effort removal of stale `<dest>.<pid>.<seq>.tmp` orphans left in `dest`'s
+/// directory by a crash between temp create and atomic rename (#2714).
+///
+/// Concurrency safety (the #2705 hazard): a unique-per-write temp belonging to a
+/// DIFFERENT, still-running writer (e.g. a replacement helper started before the
+/// old one fully exits) must NEVER be removed — deleting its in-flight temp
+/// would break its atomic write. This sweep therefore removes a candidate ONLY
+/// when its embedded pid is no longer a live process. The current process's own
+/// pid is always treated as alive, so this never races our own writes.
+///
+/// Scoped to siblings of `dest` whose name starts with `dest`'s file name plus a
+/// dot, so it cannot touch unrelated files or temps for other destinations in
+/// the same directory. Fail-safe: any error (unreadable dir, racey unlink) is
+/// swallowed so a sweep failure can never break the subsequent write.
+fn sweep_stale_temps(dest: &str) {
+    let dest_path = Path::new(dest);
+    let dir = match dest_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(p) => p,
+        None => Path::new("."),
+    };
+    let dest_name = match dest_path.file_name().and_then(|n| n.to_str()) {
+        Some(n) if !n.is_empty() => n,
+        _ => return,
+    };
+    // Our temps for this destination are named `<dest_name>.<pid>.<seq>.tmp`.
+    let prefix = format!("{dest_name}.");
+
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return, // dir may not exist yet on first write — nothing to sweep
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = match name.to_str() {
+            Some(n) => n,
+            None => continue,
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+            continue;
+        }
+        let pid = match pid_from_temp_name(name) {
+            Some(p) => p,
+            None => continue, // not one of our `<pid>.<seq>.tmp` temps
+        };
+        if pid_is_alive(pid) {
+            continue; // a live writer (possibly another helper) may still hold it
+        }
+        let victim = entry.path();
+        match fs::remove_file(&victim) {
+            Ok(()) => eprintln!(
+                "xpf-state-writer: swept stale orphan temp {} (dead pid {pid})",
+                victim.display()
+            ),
+            Err(_) => { /* best-effort: raced unlink or perms — ignore */ }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +452,36 @@ mod tests {
     impl Drop for SyncGuard {
         fn drop(&mut self) {
             SYNC_ALL_HOOK.with(|h| h.set(real_sync_all));
+        }
+    }
+
+    thread_local! {
+        // Pids the test has marked DEAD; the live-check hook reports any pid in
+        // this set as not-alive and everything else as alive. Deterministic, no
+        // real processes spawned.
+        static DEAD_PIDS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn test_pid_is_alive(pid: u32) -> bool {
+        DEAD_PIDS.with(|d| !d.borrow().contains(&pid))
+    }
+
+    /// Installs a deterministic pid-liveness hook for the orphan sweep and lets
+    /// the test declare specific pids dead. Restores the real check on drop.
+    struct PidGuard;
+    impl PidGuard {
+        fn install() -> Self {
+            DEAD_PIDS.with(|d| d.borrow_mut().clear());
+            PID_ALIVE_HOOK.with(|h| h.set(test_pid_is_alive));
+            PidGuard
+        }
+        fn mark_dead(&self, pid: u32) {
+            DEAD_PIDS.with(|d| d.borrow_mut().push(pid));
+        }
+    }
+    impl Drop for PidGuard {
+        fn drop(&mut self) {
+            PID_ALIVE_HOOK.with(|h| h.set(real_pid_is_alive));
         }
     }
 
@@ -548,6 +711,116 @@ mod tests {
         assert!(err.contains("fsync parent dir"), "unexpected error: {err}");
         // Both fsyncs were attempted (file succeeded, dir failed) -> 2 calls.
         assert_eq!(guard.calls(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pid_from_temp_name_parses_our_format_only() {
+        // `<stem>.<pid>.<seq>.tmp` and `<stem>.<ext>.<pid>.<seq>.tmp`.
+        assert_eq!(pid_from_temp_name("state.1234.0.tmp"), Some(1234));
+        assert_eq!(pid_from_temp_name("state.json.999.42.tmp"), Some(999));
+        // Foreign / non-matching names must NOT be parsed (so they are skipped).
+        assert_eq!(pid_from_temp_name("state.json"), None);
+        assert_eq!(pid_from_temp_name("state.tmp"), None); // no pid.seq
+        assert_eq!(pid_from_temp_name("state.0.tmp"), None); // only one number
+        assert_eq!(pid_from_temp_name("state.abc.0.tmp"), None); // pid not numeric
+        assert_eq!(pid_from_temp_name("state.1.def.tmp"), None); // seq not numeric
+        assert_eq!(pid_from_temp_name(".1234.0.tmp"), None); // empty stem
+    }
+
+    // Fail-on-revert (#2714): a dead-pid orphan must be swept while a live
+    // writer's in-flight temp (and unrelated files) are preserved. Reverting the
+    // sweep (sweep_stale_temps a no-op) leaves the orphan and fails this test.
+    #[test]
+    fn sweep_removes_dead_pid_orphan_preserves_live_and_foreign() {
+        let dir = tmpdir();
+        let dest = dir.join("state.json");
+        let dest_str = dest.to_str().unwrap();
+
+        // Orphan from a CRASHED writer (dead pid) — must be removed.
+        let dead_pid = 4242u32;
+        let dead_orphan = dir.join(format!("state.json.{dead_pid}.7.tmp"));
+        fs::write(&dead_orphan, b"crashed mid-write").unwrap();
+
+        // In-flight temp of a LIVE other writer (#2705 hazard) — must survive.
+        let live_pid = 5151u32;
+        let live_temp = dir.join(format!("state.json.{live_pid}.3.tmp"));
+        fs::write(&live_temp, b"another writer in flight").unwrap();
+
+        // A temp for a DIFFERENT destination, dead pid — out of scope, survives.
+        let other_dest_temp = dir.join(format!("other.json.{dead_pid}.1.tmp"));
+        fs::write(&other_dest_temp, b"other dest").unwrap();
+
+        // A foreign .tmp not matching our pid.seq format — survives.
+        let foreign = dir.join("state.json.backup.tmp");
+        fs::write(&foreign, b"foreign").unwrap();
+
+        // An existing published destination — never a sweep candidate.
+        fs::write(&dest, b"existing good state").unwrap();
+
+        let pids = PidGuard::install();
+        pids.mark_dead(dead_pid); // live_pid stays alive
+
+        sweep_stale_temps(dest_str);
+
+        assert!(
+            !dead_orphan.exists(),
+            "dead-pid orphan must be swept (revert -> still present, RED)"
+        );
+        assert!(
+            live_temp.exists(),
+            "a live writer's in-flight temp must be preserved (#2705)"
+        );
+        assert!(
+            other_dest_temp.exists(),
+            "a temp for a different destination must be out of scope"
+        );
+        assert!(
+            foreign.exists(),
+            "a non-format foreign .tmp must be preserved"
+        );
+        assert!(
+            dest.exists(),
+            "the published destination must never be touched"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"existing good state");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_sweeps_stale_orphan_before_write() {
+        // End-to-end through persist_sync's caller-visible effect: pre-seed a
+        // dead-pid orphan, then drive a real write; the sweep that the writer
+        // runs once per destination must have removed the orphan, leaving only
+        // the freshly published destination.
+        let dir = tmpdir();
+        let dest = dir.join("state.json");
+        let dest_str = dest.to_str().unwrap();
+
+        let dead_pid = 31337u32;
+        let orphan = dir.join(format!("state.json.{dead_pid}.0.tmp"));
+        fs::write(&orphan, b"leaked").unwrap();
+
+        let pids = PidGuard::install();
+        pids.mark_dead(dead_pid);
+
+        // Mirror the writer-thread contract: sweep once for this destination,
+        // then persist.
+        sweep_stale_temps(dest_str);
+        persist_sync(dest_str, b"fresh state").expect("persist");
+
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec!["state.json".to_string()],
+            "only the published destination should remain after sweep+write"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"fresh state");
         let _ = fs::remove_dir_all(&dir);
     }
 }

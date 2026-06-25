@@ -15343,3 +15343,28 @@ top.
   pkg/ddns/README.md, pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
   pkg/api/metrics_system.go, pkg/cli/cli_show_services.go,
   pkg/grpcapi/server_show_dhcp_lldp_snmp.go, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2714 — state_writer: sweep stale `<dest>.<pid>.<seq>.tmp`
+  orphans left by a crash between temp-create and atomic rename. The
+  #2712 unique-per-write temp scheme leaks one orphan per crash; without
+  cleanup they accumulate unbounded. Added a best-effort sweep that runs
+  ONCE per distinct destination in the io_uring writer thread (kept off
+  the per-write hot path) and removes only siblings matching
+  `<dest_name>.<pid>.<seq>.tmp` whose embedded pid is no longer a live
+  process (`/proc/<pid>`). Concurrency-safe: a still-running OTHER
+  writer's in-flight temp is preserved, so the sweep cannot re-introduce
+  the #2705 cross-writer hazard. Scoped to the destination's filename
+  prefix (other destinations' temps + foreign `.tmp` files untouched);
+  fail-safe (a sweep error is swallowed and never breaks the write). Own
+  pid always treated alive. Added a `pid_is_alive` test seam mirroring
+  the existing `sync_all` durability seam (#1968 pattern). Fail-on-revert
+  tests: a dead-pid orphan is swept while a live-pid temp, a different
+  destination's temp, a non-format foreign `.tmp`, and the published
+  destination are all preserved; reverting the sweep to a no-op turns
+  both sweep tests RED (proven). Doc: state-file persistence section in
+  docs/userspace-dataplane-architecture.md. cargo build green; state_writer
+  tests 10/10; touched code cargo-fmt clean (pre-existing file fmt diffs
+  left untouched).
+- **File(s)**: userspace-dp/src/state_writer.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
