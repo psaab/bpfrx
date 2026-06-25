@@ -1,3 +1,30 @@
+## 2026-06-25 — #2876: HA demotion drain reports DrainComplete below the target fence
+
+- **Timestamp**: 2026-06-25
+- **Action**: The demotion-prep drain reported success even when the drained
+  sequence never reached the target fence (last-applied seq at demotion).
+  `SendDrainRequest` returned the first `DrainComplete` seq with no
+  `seq >= targetSeq` check, and the Rust helper's `handle_drain_request`
+  emitted `DrainComplete` carrying `replay_buf.back().seq` even on a 200 ms
+  timeout below the fence — so sessions created after the fence were never
+  flushed to the peer before takeover (silent HA session loss on failover).
+  Fix (both sides): Go `SendDrainRequest` now rejects `seq < targetSeq` as a
+  hard error; the Rust helper tracks `reached_target` and WITHHOLDS
+  `DrainComplete` on a below-fence timeout (Go ctx then errors). No wire
+  change — existing DrainRequest target seq / DrainComplete seq reused.
+  Siblings #2882/#2877/#2883 left out of scope.
+- **File(s)**: pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/eventstream_test.go,
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  docs/session-sync-architecture.md, _Log.md
+- **Validation**: go build/vet/gofmt clean; go test -race
+  ./pkg/dataplane/... ./pkg/cluster/... green; cargo build --release +
+  cargo test (event_stream/drain) green. Fail-on-revert proven RED on both
+  sides (Go gate removed → TestEventStreamDrainBelowFenceFails fails; Rust
+  reached_target gate removed → test_drain_below_fence_withholds_drain_complete
+  fails).
+
 ## 2026-06-25 — #2867: VRRP GARP/NA burst follow-up loops keep poisoning after abdication
 
 - **Timestamp**: 2026-06-25

@@ -185,6 +185,15 @@ func (es *EventStream) SendResume() error {
 
 // SendDrainRequest sends a DrainRequest frame and blocks until DrainComplete
 // arrives or the context expires. Returns the drain-complete sequence number.
+//
+// The drain is only reported successful when the helper's DrainComplete seq has
+// reached the target fence (the last fully-applied sequence at demotion time).
+// A DrainComplete carrying seq < targetSeq means the helper timed out below the
+// fence (#2876): the events after the fence have NOT been flushed to the peer,
+// so demotion must NOT proceed. That case is returned as a hard error rather
+// than silently accepted as success, which would cause HA session loss on the
+// subsequent failover. A context expiry (helper never replied, or never reached
+// the fence and so withheld DrainComplete) is likewise an error.
 func (es *EventStream) SendDrainRequest(ctx context.Context) (uint64, error) {
 	// Drain any stale DrainComplete signal.
 	es.drainCompleteMu.Lock()
@@ -203,6 +212,12 @@ func (es *EventStream) SendDrainRequest(ctx context.Context) (uint64, error) {
 
 	select {
 	case seq := <-es.drainCompleteCh:
+		if seq < targetSeq {
+			// Fence not reached: the helper drained below the target
+			// (timeout below fence). Treat as failure so demotion does
+			// not proceed past an unflushed fence.
+			return seq, fmt.Errorf("drain incomplete: helper acked seq %d below target %d", seq, targetSeq)
+		}
 		return seq, nil
 	case <-ctx.Done():
 		return 0, ctx.Err()
