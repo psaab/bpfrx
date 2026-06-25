@@ -105,6 +105,7 @@ type VRRPGroup struct {
 	VirtualAddresses   []string // virtual IP addresses
 	Priority           int      // 1-255, default 100
 	Preempt            bool
+	PreemptHoldTime    int // seconds a higher-priority backup waits before preempting a live lower-priority master; 0 = immediate (Junos `preempt hold-time`)
 	AcceptData         bool
 	AdvertiseInterval  int    // seconds, default 1
 	AuthType           string // "md5" or ""
