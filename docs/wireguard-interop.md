@@ -227,6 +227,24 @@ ceiling constants — the compile-time assert in `engine.rs` and the
 `wgEngineMaxInnerMTU != 4096` guard in the Go test fail loudly if one side
 drifts.
 
+**#2910 (decap is length-driven, NOT padding-validating).** WG §5.4.6
+padding is a SEND-side rule (the sender zero-pads plaintext to a 16-byte
+multiple). On RECEIVE the transport is length-driven:
+`engine::inner_ip_len_after_decap` reads the inner-IP length (IPv4
+`total_length` / IPv6 40 + `payload_length`), bounds it against the
+AEAD-validated plaintext (`claimed > pkt.len()` → drop — the only real
+length invariant, since `pkt` is `read_message`'s `ciphertext_len − 16`
+output), then truncates `DecapOutcome.len` to that inner length. The
+trailing pad bytes are DISCARDED, never forwarded. The receiver does NOT
+validate that the padding is all-zero: the Poly1305 tag already
+authenticates the entire plaintext including the padding, so non-zero
+padding cannot be forged — rejecting it bought no security but broke
+interop with conforming peers (kernel WireGuard / wireguard-go do not
+require zero padding; a peer may randomize it for traffic-analysis
+resistance). The pre-#2910 `if pkt[claimed..].any(|b| b != 0) { drop }`
+check surfaced such records as `MalformedInner` and was removed. Fail-on-
+revert: `decap_accepts_nonzero_trailing_padding_and_bounds_to_inner_len`.
+
 **#2701 (transit-egress OUTER SOURCE).** The #2680 MTU fix resolved the
 physical underlay egress for the MTU guard but left the OUTER IP SOURCE
 still read from `decision.resolution.egress_ifindex` (the LOGICAL tunnel

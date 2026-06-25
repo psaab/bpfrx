@@ -1671,6 +1671,117 @@ func TestEventStreamDrainRequestComplete(t *testing.T) {
 	}
 }
 
+// TestEventStreamDrainBelowFenceFails is the #2876 fail-on-revert guard: a
+// DrainComplete whose seq is BELOW the target fence must be rejected as a hard
+// error (helper timed out below the fence, post-fence sessions not flushed), and
+// a DrainComplete that reaches the fence must succeed. This goes RED if the
+// `seq < targetSeq` gate in SendDrainRequest is removed.
+func TestEventStreamDrainBelowFenceFails(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "test-events.sock")
+
+	es := NewEventStream(sockPath)
+	var applied atomic.Int32
+	es.SetOnEvent(func(uint8, uint64, SessionDeltaInfo) bool {
+		applied.Add(1)
+		return true
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	es.Start(ctx)
+	defer es.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !es.IsConnected() {
+		if time.Now().After(deadline) {
+			t.Fatal("not connected")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Apply 5 events so the fence (lastAppliedSeq) is 5.
+	payload := buildSessionOpenV4Payload(
+		6, 1000, 80,
+		[4]byte{10, 0, 1, 1}, [4]byte{10, 0, 2, 1},
+		[4]byte{}, [4]byte{},
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		[6]byte{}, [6]byte{}, [4]byte{},
+	)
+	for i := uint64(1); i <= 5; i++ {
+		if err := writeFrame(conn, EventTypeSessionOpen, i, payload); err != nil {
+			t.Fatalf("write event %d: %v", i, err)
+		}
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for applied.Load() < 5 {
+		if time.Now().After(deadline) {
+			t.Fatalf("applied = %d, want 5", applied.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// drainOnce issues a DrainRequest and replies with DrainComplete carrying
+	// completeSeq, returning the (seq, err) from SendDrainRequest.
+	drainOnce := func(completeSeq uint64) (uint64, error) {
+		type res struct {
+			seq uint64
+			err error
+		}
+		out := make(chan res, 1)
+		go func() {
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer drainCancel()
+			seq, err := es.SendDrainRequest(drainCtx)
+			out <- res{seq, err}
+		}()
+
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for {
+			typ, seq, _, rerr := readFrame(conn)
+			if rerr != nil {
+				t.Fatalf("read drain request: %v", rerr)
+			}
+			if typ == EventTypeDrainRequest {
+				if seq != 5 {
+					t.Fatalf("drain target seq = %d, want 5", seq)
+				}
+				break
+			}
+		}
+		if werr := writeFrame(conn, EventTypeDrainComplete, completeSeq, nil); werr != nil {
+			t.Fatalf("write DrainComplete %d: %v", completeSeq, werr)
+		}
+		select {
+		case r := <-out:
+			return r.seq, r.err
+		case <-time.After(2 * time.Second):
+			t.Fatal("SendDrainRequest did not return")
+			return 0, nil
+		}
+	}
+
+	// Below the fence: must be a hard error (the #2876 guard).
+	if seq, err := drainOnce(4); err == nil {
+		t.Fatalf("drain below fence (seq 4 < target 5) returned nil error, want failure (seq=%d)", seq)
+	}
+
+	// At the fence: must succeed.
+	if seq, err := drainOnce(5); err != nil {
+		t.Fatalf("drain at fence (seq 5 == target 5) returned error %v, want success", err)
+	} else if seq != 5 {
+		t.Fatalf("drain at fence returned seq %d, want 5", seq)
+	}
+}
+
 func TestEventStreamDisconnectReconnect(t *testing.T) {
 	dir := t.TempDir()
 	sockPath := filepath.Join(dir, "test-events.sock")
