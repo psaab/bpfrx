@@ -75,12 +75,17 @@ func newDyndns2Backend(p *config.DDNSProvider) (*dyndns2Backend, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Bind the dial to the configured source-address/interface/VRF (#2846).
+	client, err := newProviderHTTPClient(p)
+	if err != nil {
+		return nil, fmt.Errorf("ddns dyndns2: provider %q: %w", p.Name, err)
+	}
 	return &dyndns2Backend{
 		name:     p.Name,
 		endpoint: endpoint,
 		username: p.Username,
 		password: p.Password.Reveal(),
-		client:   newHTTPClient(),
+		client:   client,
 	}, nil
 }
 

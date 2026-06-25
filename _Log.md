@@ -16906,6 +16906,33 @@ top.
   **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/serialize_test.go,
   pkg/ra/README.md, _Log.md
 
+- **Timestamp**: 2026-06-25
+  **Action**: #2846 — bind DDNS HTTP backends + checkip to the configured
+  source-address/destination-interface/routing-instance. Before this only the
+  RFC 2136 backend honored the source binding; the HTTP backends
+  (dyndns2/cloudflare/route53/generic) and the external checkip probe built a
+  plain newHTTPClient() with no DialContext and egressed from the kernel default
+  route. Added newHTTPClientBound(bindConfig) (wires backend_bind.go's
+  source/interface/VRF Dialer into Transport.DialContext),
+  resolveProviderBindConfig + newProviderHTTPClient (adapt config.DDNSProvider
+  leaves onto resolveBindConfig), exported NewCheckIPClient for the daemon, and
+  threaded the bound client into all four HTTP backend constructors + the daemon
+  checkip call site. newHTTPClient() is the no-bind alias (default behaviour
+  unchanged when source-address unset). Malformed source-address = hard error
+  (constructor degrades to no-op; checkip falls back to unbound default + logs),
+  mirroring rfc2136 fail-open. FAIL-ON-REVERT test
+  (backend_http_sourcebind_2846_test.go) asserts a configured source-address
+  dials with that LocalAddr (loopback 127.0.0.2 source proof) for both the HTTP
+  client and checkip, and that the unbound path installs NO DialContext; goes RED
+  if the bind is removed (verified: 3 bind tests FAIL on revert, green on
+  restore). Gates: go build ./... OK, gofmt -l clean, go vet ./pkg/ddns/... OK,
+  go test ./pkg/ddns/... ok.
+  **File(s)**: pkg/ddns/backend_http.go, pkg/ddns/backend_cloudflare.go,
+  pkg/ddns/backend_dyndns2.go, pkg/ddns/backend_route53.go,
+  pkg/ddns/backend_generic.go, pkg/ddns/checkip.go,
+  pkg/ddns/backend_http_sourcebind_2846_test.go,
+  pkg/daemon/daemon_ddns_surface_a.go, pkg/config/types_system.go,
+  pkg/ddns/README.md, _Log.md
 ## 2026-06-25 — #2847 FRR policy render: metric/MED 0 silently dropped
 
 - **Timestamp**: 2026-06-25

@@ -249,7 +249,17 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 			ctx, cancel := context.WithTimeout(context.Background(), surfaceACheckIPTimeout)
 			defer cancel()
 			allow := ddns.ParseAllowlist(scope.Provider.CheckIPAllowlist)
-			a, ok := ddns.CheckIP(ctx, nil, scope.Provider.CheckIPURL, af4, allow)
+			// Bind the checkip probe to the provider's configured source-address /
+			// interface / VRF (#2846) so it egresses from the same source as the
+			// DDNS updates — not the kernel default route. A malformed source-
+			// address yields the unbound default client (the commit warning already
+			// fired); the probe is a transient observation, never a withdraw.
+			client, berr := ddns.NewCheckIPClient(scope.Provider)
+			if berr != nil {
+				slog.Warn("ddns surface-a: checkip source bind unusable; probing from default route",
+					"provider", scope.Provider.Name, "err", berr)
+			}
+			a, ok := ddns.CheckIP(ctx, client, scope.Provider.CheckIPURL, af4, allow)
 			if !ok {
 				return ddns.AddressObservation{}, false
 			}
