@@ -1191,6 +1191,93 @@ fn static_nat_match_port_without_mapped_port_scopes_reverse_snat() {
     );
 }
 
+// #2864: a port-specific static-NAT DNAT entry whose `from_zone` does NOT match
+// the packet's ingress zone MUST NOT short-circuit the lookup to `None`. It must
+// fall through to the whole-address `(dst_ip, None)` entry, which carries its own
+// (matching/empty) zone constraint. Before #2864 the zone check ran ONCE after
+// the `or_else()` precedence resolved, so a zone-mismatched port-specific entry
+// returned `None` and the whole-address rule was silently bypassed.
+//
+// Fail-on-revert: removing the per-candidate `.filter(zone_ok)` fall-through in
+// match_dnat_with_counter (so a port-specific zone-fail short-circuits to None)
+// turns the `fallback match` expect RED.
+#[test]
+fn static_nat_dnat_port_zone_mismatch_falls_back_to_whole_address() {
+    let ext: IpAddr = "203.0.113.1".parse().unwrap();
+    let table = StaticNatTable::from_snapshots(
+        &[
+            // Port-specific entry constrained to a DIFFERENT zone than the
+            // packet will arrive on. (203.0.113.1:8080 from "dmz" -> 10.0.0.5:80)
+            StaticNATRuleSnapshot {
+                counter_id: 0,
+                name: "port-dmz".to_string(),
+                from_zone: "dmz".to_string(),
+                external_ip: "203.0.113.1/32".to_string(),
+                internal_ip: "10.0.0.5/32".to_string(),
+                match_destination_port: 8080,
+                mapped_port: 80,
+            },
+            // Whole-address entry valid for the packet's actual ingress zone.
+            StaticNATRuleSnapshot {
+                counter_id: 0,
+                name: "whole-untrust".to_string(),
+                from_zone: "untrust".to_string(),
+                external_ip: "203.0.113.1/32".to_string(),
+                internal_ip: "10.0.0.9/32".to_string(),
+                match_destination_port: 0,
+                mapped_port: 0,
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+
+    // A packet to the port-specific port (8080) but from the WRONG zone for the
+    // port entry ("untrust", not "dmz") must NOT short-circuit: it falls back to
+    // the whole-address entry, whose zone ("untrust") matches.
+    let (whole_dec, _) = table
+        .match_dnat_with_counter(ext, 8080, "untrust")
+        .expect("fallback match — port-specific zone-fail must fall through to whole-address");
+    assert_eq!(
+        whole_dec.rewrite_dst,
+        Some("10.0.0.9".parse().unwrap()),
+        "must translate via the whole-address entry, not the zone-mismatched port entry"
+    );
+    assert_eq!(
+        whole_dec.rewrite_dst_port, None,
+        "whole-address entry has no mapped-port"
+    );
+
+    // Port-specific precedence is preserved when its zone DOES match: a packet
+    // to 8080 from "dmz" hits the port entry (mapped-port rewrite), NOT the
+    // whole-address entry.
+    let (port_dec, _) = table
+        .match_dnat_with_counter(ext, 8080, "dmz")
+        .expect("port-specific entry wins when its zone matches");
+    assert_eq!(port_dec.rewrite_dst, Some("10.0.0.5".parse().unwrap()));
+    assert_eq!(port_dec.rewrite_dst_port, Some(80));
+
+    // A non-port packet from "dmz" — the port entry does not key, and the
+    // whole-address entry's zone ("untrust") does not match "dmz" → no DNAT.
+    assert!(
+        table.match_dnat_with_counter(ext, 443, "dmz").is_none(),
+        "no candidate matches the ingress zone → no DNAT"
+    );
+
+    // A non-port packet from "untrust" hits the whole-address entry.
+    let (any_dec, _) = table
+        .match_dnat_with_counter(ext, 443, "untrust")
+        .expect("whole-address entry matches its own zone on any port");
+    assert_eq!(any_dec.rewrite_dst, Some("10.0.0.9".parse().unwrap()));
+
+    // No entry for an unknown IP → no DNAT.
+    assert!(
+        table
+            .match_dnat_with_counter("203.0.113.250".parse().unwrap(), 8080, "untrust")
+            .is_none(),
+        "unknown destination IP → no DNAT"
+    );
+}
+
 // --- DNAT table tests ---
 
 #[test]
