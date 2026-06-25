@@ -117,18 +117,65 @@ func TestSurfaceAStandaloneGateNil(t *testing.T) {
 }
 
 func TestStaticUnitAddr(t *testing.T) {
-	unit := &config.InterfaceUnit{Addresses: []string{"203.0.113.5/24", "2001:db8::8/64"}}
+	// Genuinely globally-routable unicast addresses are accepted.
+	unit := &config.InterfaceUnit{Addresses: []string{"198.51.99.5/24", "2606:4700:4700::1111/64"}}
 	a4, ok := staticUnitAddr(unit, true)
-	if !ok || a4 != netip.MustParseAddr("203.0.113.5") {
+	if !ok || a4 != netip.MustParseAddr("198.51.99.5") {
 		t.Fatalf("v4 static addr = %v ok=%v", a4, ok)
 	}
 	a6, ok := staticUnitAddr(unit, false)
-	if !ok || a6 != netip.MustParseAddr("2001:db8::8") {
+	if !ok || a6 != netip.MustParseAddr("2606:4700:4700::1111") {
 		t.Fatalf("v6 static addr = %v ok=%v", a6, ok)
 	}
 	// Link-local / loopback are skipped.
 	llUnit := &config.InterfaceUnit{Addresses: []string{"fe80::1/64"}}
 	if _, ok := staticUnitAddr(llUnit, false); ok {
 		t.Fatal("link-local must not be selected as a Surface A address")
+	}
+}
+
+// TestStaticUnitAddrPublicGate is the #2776 fail-on-revert gate for the
+// Surface A static-address fallback. A configured static address that is NOT
+// globally-routable unicast (multicast, reserved, ULA, CGNAT, documentation,
+// IANA special-purpose) must be SKIPPED — never published as the router's
+// A/AAAA record — and a genuine public static address must be selected. This
+// goes RED if the ddns.IsPublicAddr gate is removed from staticUnitAddr: each
+// rejected entry below would then be returned ok=true.
+func TestStaticUnitAddrPublicGate(t *testing.T) {
+	rejectV4 := []string{
+		"224.0.0.1/24",       // 224/4 multicast
+		"240.0.0.1/24",       // 240/4 reserved-for-future-use
+		"10.1.2.3/24",        // 10/8 private
+		"100.64.0.1/24",      // 100.64/10 CGNAT
+		"192.0.2.5/24",       // 192.0.2/24 TEST-NET-1 documentation
+		"203.0.113.5/24",     // 203.0.113/24 TEST-NET-3 documentation
+		"198.18.0.1/24",      // 198.18/15 benchmarking
+		"255.255.255.255/32", // limited broadcast
+	}
+	for _, cidr := range rejectV4 {
+		u := &config.InterfaceUnit{Addresses: []string{cidr}}
+		if a, ok := staticUnitAddr(u, true); ok {
+			t.Errorf("staticUnitAddr(%s) = %v ok=true, want skipped (non-public)", cidr, a)
+		}
+	}
+	rejectV6 := []string{
+		"ff02::1/64",     // ff00::/8 multicast
+		"fc00::1/64",     // fc00::/7 ULA
+		"fd00::1/64",     // fc00::/7 ULA
+		"2001:db8::1/64", // 2001:db8::/32 documentation
+		"64:ff9b::1/96",  // 64:ff9b::/96 NAT64 well-known
+	}
+	for _, cidr := range rejectV6 {
+		u := &config.InterfaceUnit{Addresses: []string{cidr}}
+		if a, ok := staticUnitAddr(u, false); ok {
+			t.Errorf("staticUnitAddr(%s) = %v ok=true, want skipped (non-public)", cidr, a)
+		}
+	}
+	// A genuine public static address IS selected, even when listed after a
+	// rejected one (the gate skips, it does not abort the scan).
+	mixed := &config.InterfaceUnit{Addresses: []string{"224.0.0.1/24", "8.8.4.4/24"}}
+	a, ok := staticUnitAddr(mixed, true)
+	if !ok || a != netip.MustParseAddr("8.8.4.4") {
+		t.Fatalf("public addr after a rejected one = %v ok=%v, want 8.8.4.4 ok=true", a, ok)
 	}
 }

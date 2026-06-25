@@ -358,6 +358,15 @@ func (d *Daemon) observeInterfaceAddr(linuxName string, af4 bool, unit *config.I
 
 // staticUnitAddr returns the first configured static address of the given
 // family on a unit (CIDR → bare addr), if any.
+//
+// The candidate is gated through ddns.IsPublicAddr (#2776), the SAME
+// globally-routable-unicast predicate the netlink and checkip address sources
+// use. Without this gate the fallback applied only a loopback/link-local/
+// unspecified filter and could publish a multicast, ULA, CGNAT, documentation,
+// or otherwise-reserved configured address as the router's A/AAAA record when
+// the kernel interface is absent/addressless. A mis-scoped static address is
+// skipped and surfaced at WARN rather than silently published (never-blackhole:
+// a bad static address must not masquerade as a usable answer).
 func staticUnitAddr(unit *config.InterfaceUnit, af4 bool) (netip.Addr, bool) {
 	if unit == nil {
 		return netip.Addr{}, false
@@ -371,7 +380,9 @@ func staticUnitAddr(unit *config.InterfaceUnit, af4 bool) (netip.Addr, bool) {
 		if a.Is4() != af4 {
 			continue
 		}
-		if a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsUnspecified() {
+		if !ddns.IsPublicAddr(a) {
+			slog.Warn("surface-a: skipping non-public static address",
+				"address", a.String(), "cidr", cidr)
 			continue
 		}
 		return a, true
