@@ -1,3 +1,33 @@
+## 2026-06-25 — #2775: ddns/surface-a netlink selection honors IPv6 address lifetime
+
+- **Timestamp**: 2026-06-25
+- **Action**: Surface A interface-address selection (`observeInterfaceAddr` in
+  `pkg/daemon/daemon_ddns_surface_a.go`) ignored IPv6 address-lifetime state and
+  published the first non-link-local/loopback/multicast netlink address — it
+  could publish a `deprecated` (soon-invalid) or a `tentative`/`dadfailed`
+  (DAD-incomplete/duplicate) address as the router's AAAA record. Extracted the
+  selection into a pure, testable `selectInterfaceAddr([]netlink.Addr, af4)`
+  that: skips `IFA_F_TENTATIVE | IFA_F_DADFAILED | IFA_F_OPTIMISTIC`; PREFERS an
+  RFC 4862 preferred address, falling back to a `IFA_F_DEPRECATED` address only
+  when no preferred exists (never-blackhole); and still gates every candidate
+  through `ddns.IsPublicAddr` (#2776 composition — a preferred-but-ULA address
+  is rejected). The IFA_F_* flags were ALREADY parsed off netlink into
+  `netlink.Addr.Flags` — no extra netlink plumbing was needed, they were simply
+  ignored in selection. Preserves #2776's static-fallback public gate.
+- **File(s)**: `pkg/daemon/daemon_ddns_surface_a.go`,
+  `pkg/daemon/daemon_ddns_surface_a_test.go`, `pkg/ddns/README.md`, `_Log.md`.
+- **Fail-on-revert proof**: `TestSelectInterfaceAddrLifetime` (copy-restore).
+  Reverted the deprecated-deferral (return first eligible incl. deprecated) →
+  RED: subtest "prefer preferred over deprecated (deprecated listed first)"
+  got `2606:4700:4700::2222` (deprecated) want `...::1111` (preferred). Restored
+  → GREEN; file byte-identical (`diff` clean). Also covers deprecated-only
+  fallback, tentative/dadfailed/optimistic never-selected, preferred-ULA
+  rejection (composes #2776), and v4 family filter.
+- **Gates**: `go build ./...` OK; `gofmt -l` clean; `go vet ./pkg/daemon/...
+  ./pkg/ddns/...` clean; `go test ./pkg/daemon/ -run
+  'SurfaceA|ObserveInterface|StaticUnitAddr|SelectInterfaceAddr' ./pkg/ddns/...`
+  PASS.
+
 ## 2026-06-25 — #2776: ddns/surface-a static-address fallback is now public-gated
 
 - **Timestamp**: 2026-06-25

@@ -1,8 +1,12 @@
 package daemon
 
 import (
+	"net"
 	"net/netip"
 	"testing"
+
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
@@ -177,5 +181,136 @@ func TestStaticUnitAddrPublicGate(t *testing.T) {
 	a, ok := staticUnitAddr(mixed, true)
 	if !ok || a != netip.MustParseAddr("8.8.4.4") {
 		t.Fatalf("public addr after a rejected one = %v ok=%v, want 8.8.4.4 ok=true", a, ok)
+	}
+}
+
+// mkAddr builds a synthetic netlink.Addr with the given CIDR and IFA_F_* flags
+// for selectInterfaceAddr table tests (no kernel interface required).
+func mkAddr(cidr string, flags int) netlink.Addr {
+	ip, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		panic(err)
+	}
+	ipnet.IP = ip
+	return netlink.Addr{IPNet: ipnet, Flags: flags}
+}
+
+// TestSelectInterfaceAddrLifetime is the #2775 fail-on-revert gate for IPv6
+// address-lifetime-aware selection. observeInterfaceAddr (via this pure helper)
+// must honor RFC 4862 address state:
+//
+//   - PREFER a `preferred` address over a `deprecated` one. Goes RED if the
+//     lifetime-preference logic is reverted (a deprecated address wrongly
+//     selected over a preferred one).
+//   - fall back to `deprecated` only when no preferred exists (never blackhole).
+//   - NEVER select tentative / dadfailed / optimistic (DAD not succeeded).
+//   - the selected address STILL passes ddns.IsPublicAddr (composes with #2776):
+//     a preferred-but-ULA address is rejected.
+func TestSelectInterfaceAddrLifetime(t *testing.T) {
+	pref6 := netip.MustParseAddr("2606:4700:4700::1111")
+	dep6 := netip.MustParseAddr("2606:4700:4700::2222")
+	pref4 := netip.MustParseAddr("198.51.99.5")
+
+	tests := []struct {
+		name  string
+		addrs []netlink.Addr
+		af4   bool
+		want  netip.Addr
+		ok    bool
+	}{
+		{
+			// Core fail-on-revert: preferred wins over deprecated even though the
+			// deprecated address is listed FIRST (netlink order must not decide).
+			name: "prefer preferred over deprecated (deprecated listed first)",
+			addrs: []netlink.Addr{
+				mkAddr("2606:4700:4700::2222/64", unix.IFA_F_DEPRECATED),
+				mkAddr("2606:4700:4700::1111/64", 0),
+			},
+			af4:  false,
+			want: pref6,
+			ok:   true,
+		},
+		{
+			// Only deprecated available → use it (never blackhole).
+			name: "deprecated only falls back, no blackhole",
+			addrs: []netlink.Addr{
+				mkAddr("2606:4700:4700::2222/64", unix.IFA_F_DEPRECATED),
+			},
+			af4:  false,
+			want: dep6,
+			ok:   true,
+		},
+		{
+			// tentative / dadfailed / optimistic are never publishable, even if
+			// they are the only globally-routable addresses present.
+			name: "tentative never selected",
+			addrs: []netlink.Addr{
+				mkAddr("2606:4700:4700::1111/64", unix.IFA_F_TENTATIVE),
+			},
+			af4:  false,
+			want: netip.Addr{},
+			ok:   false,
+		},
+		{
+			name: "dadfailed never selected",
+			addrs: []netlink.Addr{
+				mkAddr("2606:4700:4700::1111/64", unix.IFA_F_DADFAILED),
+			},
+			af4:  false,
+			want: netip.Addr{},
+			ok:   false,
+		},
+		{
+			name: "optimistic never selected",
+			addrs: []netlink.Addr{
+				mkAddr("2606:4700:4700::1111/64", unix.IFA_F_OPTIMISTIC),
+			},
+			af4:  false,
+			want: netip.Addr{},
+			ok:   false,
+		},
+		{
+			// Composition with #2776: a preferred ULA is still rejected; the
+			// preferred GUA listed after it is selected.
+			name: "preferred-but-ULA rejected, GUA selected",
+			addrs: []netlink.Addr{
+				mkAddr("fd00::1/64", 0),
+				mkAddr("2606:4700:4700::1111/64", 0),
+			},
+			af4:  false,
+			want: pref6,
+			ok:   true,
+		},
+		{
+			// A tentative preferred + a deprecated valid → deprecated wins (the
+			// tentative is skipped, the deprecated is the only usable address).
+			name: "tentative preferred skipped, deprecated used",
+			addrs: []netlink.Addr{
+				mkAddr("2606:4700:4700::1111/64", unix.IFA_F_TENTATIVE),
+				mkAddr("2606:4700:4700::2222/64", unix.IFA_F_DEPRECATED),
+			},
+			af4:  false,
+			want: dep6,
+			ok:   true,
+		},
+		{
+			// IPv4 family filter + preferred selection.
+			name: "v4 preferred selected, v6 ignored",
+			addrs: []netlink.Addr{
+				mkAddr("2606:4700:4700::1111/64", 0),
+				mkAddr("198.51.99.5/24", 0),
+			},
+			af4:  true,
+			want: pref4,
+			ok:   true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := selectInterfaceAddr(tc.addrs, tc.af4)
+			if ok != tc.ok || got != tc.want {
+				t.Fatalf("selectInterfaceAddr() = %v, %v; want %v, %v", got, ok, tc.want, tc.ok)
+			}
+		})
 	}
 }

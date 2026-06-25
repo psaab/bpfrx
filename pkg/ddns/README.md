@@ -327,6 +327,27 @@ its OWN learned address — on top of the SAME spine, without forking the engine
   longer use divergent publishability predicates (the netlink path already
   rejected multicast; the fallback previously filtered only loopback/
   link-local-unicast/unspecified).
+  **IPv6 address-lifetime-aware netlink selection (#2775):** the netlink
+  selection (`selectInterfaceAddr`, the pure core of `observeInterfaceAddr`)
+  now honors RFC 4862 address state instead of publishing the first
+  non-link-local/loopback/multicast address. (1) It NEVER selects an address
+  whose DAD has not succeeded — `IFA_F_TENTATIVE` (DAD in progress),
+  `IFA_F_DADFAILED` (duplicate detected), or `IFA_F_OPTIMISTIC` (RFC 4429
+  optimistic DAD, not yet DAD-confirmed) — publishing one risks a
+  duplicate/black-holed answer. (2) It PREFERS an RFC 4862 `preferred` address
+  over a `deprecated` one (`IFA_F_DEPRECATED`): a deprecated address is being
+  phased out (renumber / PD churn / privacy-address rotation) and will soon be
+  invalid, so publishing it black-holes inbound reachability. The first eligible
+  preferred address wins; a deprecated address is used ONLY when no preferred
+  address exists (never-blackhole — a still-valid deprecated address beats no
+  answer). (3) Every candidate STILL passes `ddns.IsPublicAddr`, so a
+  preferred-but-ULA (or otherwise reserved) address is rejected — the same gate
+  as the static fallback (#2776) and the checkip source. The IFA_F_* flags are
+  already parsed off the netlink `RTM_NEWADDR` message into
+  `netlink.Addr.Flags` (no extra netlink plumbing was needed — they were simply
+  ignored in selection before). A per-family `preferred-address` operator
+  override for multi-address interfaces (the issue's secondary ask) remains a
+  future refinement.
 - **HA gate** is the SAME per-RG `ScopeGate` (a router record on a reth/virtual
   interface publishes only on the RG master; stop-writing-never-withdraw
   otherwise). Standalone (nil gate) always publishes.
