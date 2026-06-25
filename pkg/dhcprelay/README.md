@@ -284,6 +284,20 @@ OFFER/ACK to forward in the first place; clients still dedupe on
 
 - The interface must have an IPv4 address — that's what fills `giaddr`. If
   it is missing at boot the relay retries (see above) rather than failing.
+- **Primary-vs-secondary giaddr selection (#2849).** When an interface
+  carries a primary address plus secondary subnet aliases, the kernel returns
+  them in netlink maintenance order — NOT guaranteed primary-first.
+  `defaultIfaceResolver` therefore selects the **PRIMARY** IPv4, not the first
+  one: on Linux it enumerates addresses via `netlink.AddrList`
+  (`relay_giaddr_linux.go`), records each address's `IFA_F_SECONDARY` flag,
+  and `selectPrimaryIPv4` (`relay.go`) prefers the first non-secondary
+  address. `net.Interface.Addrs()` drops the secondary flag, so a portable
+  fallback (used only when netlink fails, and on non-Linux) cannot distinguish
+  them and reports every address as primary — preserving the historical
+  first-address behavior. Picking a secondary alias as `giaddr` would make the
+  upstream server lease from the wrong subnet pool. If netlink enumeration
+  fails the resolver falls back to the portable lister rather than failing
+  closed (a transient netlink hiccup must not strand a relay).
 - Option 82 sub-option 1 (`circuit-id`) is set to the interface name; on
   the reply path it's stripped before forwarding to the client.
 - Server addresses must be **literal IPs**. `Apply()` calls
