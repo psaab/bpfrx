@@ -15672,3 +15672,9 @@ top.
   userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
   userspace-dp/src/afxdp/coordinator/mod.rs,
   userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md
+
+## 2026-06-25 — #2769 static-nat match-port-without-mapped-port reverse SNAT scoping
+- **Action**: Fix HIGH security/correctness bug: a `match destination-port` static-NAT rule WITHOUT a `mapped-port` broadened reverse SNAT to the whole internal host. Rust now keys the reverse SNAT entry on `(internal_ip, Some(match_dst_port))` instead of `(internal_ip, None)` (fail-closed backstop); Go strict commit-check rejects the half-config (mirror of the mapped-port-without-match-port rejection).
+- **File(s)**: userspace-dp/src/nat/static_nat.rs (snat_port = mapped_port.or(match_dst_port)), userspace-dp/src/nat/tests.rs (fail-on-revert test static_nat_match_port_without_mapped_port_scopes_reverse_snat), pkg/config/compiler_nat.go (strict reject), pkg/config/static_nat_mapped_port_2491_test.go (TestStaticNATMatchPortWithoutMappedPortRejected), docs/config-schema.md
+- **Wire**: no wire change (reuses existing StaticNATRuleSnapshot match_destination_port / mapped_port fields).
+- **Validation**: go build/vet/gofmt clean; go test ./pkg/config/... ./pkg/dataplane/userspace/... ok; cargo build --release ok; cargo test --release --bin xpf-userspace-dp -- nat static_nat → 452 passed. Fail-on-revert proven RED both sides (Rust snat_port=mapped_port → off-port lookup matches; Go guard removal → CompileConfig accepts), restored.
