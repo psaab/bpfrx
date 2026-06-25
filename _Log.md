@@ -17365,3 +17365,21 @@ top.
   go vet ./pkg/ra/..., go test -race ./pkg/ra/... PASS.
   **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/serialize_test.go,
   pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2901 — DDNS source-binding dialer family gate. The shared
+  bindConfig.dialer Control hook (pkg/ddns/backend_bind.go) called unix.Bind by
+  the SOURCE family regardless of the dial socket family, so a dual-stack
+  endpoint (A+AAAA) whose Happy-Eyeballs picked the non-matching family hit
+  EAFNOSUPPORT/EINVAL and aborted the whole connection. Gated the source-bind on
+  sourceMatchesDialFamily(src, network) keyed off the Dialer.Control "network"
+  arg (tcp4/tcp6/udp4/udp6); on a family mismatch the bind is SKIPPED and the
+  dial proceeds with the kernel-chosen source (operator configured a source only
+  for the matching family). SO_BINDTODEVICE stays family-agnostic, applied
+  always. DDNS analog of the #2757/#2832 ipsec family-selection work. FAIL-ON-
+  REVERT: TestDialerSourceBindFamilyGate drives the Control hook over real
+  AF_INET/AF_INET6 fds — match binds cleanly, mismatch returns nil; RED (EINVAL)
+  when the gate is removed (verified). Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/ddns/..., go test ./pkg/ddns/... PASS.
+  **File(s)**: pkg/ddns/backend_bind.go, pkg/ddns/backend_bind_test.go,
+  pkg/ddns/README.md, _Log.md
