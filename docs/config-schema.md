@@ -830,6 +830,21 @@ reserved for whole-dataplane selection where a rewrite shim
       canonicalization. Contract: every name that passes commit is a fixed
       point of `sanitizeFQDN` (cross-package test
       `pkg/ddns/surface_a_hostname_2779_test.go`).
+    - **`source-address` is a TYPED leaf (#2780, `ValueIPAddress` +
+      `ValidateIPAddress`, reusing the GRE/tunnel IP-literal validator).** It
+      was free-form. The runtime feeds it to `netip.ParseAddr`
+      (`pkg/ddns/backend_bind.go` `resolveBindConfig`), where an unparseable
+      value is a HARD error: the backend then falls back to a no-op for that
+      scope and the binding SILENTLY stops emitting UPDATEs. Typing the leaf
+      rejects a non-IP literal at commit (naming the `source-address` leaf)
+      instead of committing garbage that disables the scope at runtime. A bare
+      IP only (v4 or v6, no prefix length) — matching `netip.ParseAddr`. The
+      validator has no family context (the leaf closure receives only the raw
+      value), so either family literal commits under either `inet`/`inet6`
+      parent; a genuine v4-record / v6-bind family mismatch is left to the
+      runtime + Surface A status (not a commit-time gate). Regression coverage:
+      `pkg/config/schema_validate_ddns_source_address_2780_test.go`
+      (fail-on-revert accept/reject table).
   - **Reuses the pkg/ddns spine** (`pkg/ddns/surface_a.go`,
     `SurfaceAManager`): the SAME `DNSUpdater`/rfc2136 backend (self-ownership —
     no DHCID), the SAME `ScopeKey`, and the SAME durable-state shape (a separate

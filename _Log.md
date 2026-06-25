@@ -16613,3 +16613,30 @@ top.
   passed / 0 failed.
   **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
   docs/wireguard-interop.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2780 — type the per-interface Surface A `dynamic-dns
+  source-address` leaf (`ValueIPAddress` + `ValidateIPAddress`, reusing
+  the existing GRE/tunnel IP-literal validator — NO new validator added).
+  The leaf was free-form (placeholder only), so any string committed
+  cleanly. The runtime feeds it to `netip.ParseAddr`
+  (`pkg/ddns/backend_bind.go` `resolveBindConfig`), where an unparseable
+  value is a HARD error → the backend falls back to a no-op for that
+  scope and the binding silently stops emitting UPDATEs. The typed leaf
+  rejects a non-IP literal at COMMIT (riding the generic #1319
+  `SchemaValidate` gate: strict at commit via `compileTreeStrict`,
+  lenient/warn on boot-load + peer-sync, identical to the #2779 hostname
+  leaf). Mirrors the #2779 `ValueHostname`/`ValidateDDNSHostname`
+  pattern. Family-mismatch enforcement (v4 record / v6 bind) is left to
+  the runtime + Surface A status — the schema leaf closure has no family
+  context.
+  FAIL-ON-REVERT: copied `schema_interfaces.go` aside, reverted the leaf
+  to the old free-form `{placeholder:"<ip>"}` form, ran
+  `go test ./pkg/config/ -run TestSchemaValidate_DDNSSourceAddress_2780`
+  → FAILED (all 14 reject cases got nil); restored from the copy, green.
+  Gates: go build ./... clean; gofmt -l clean; go vet ./pkg/config/...
+  ./pkg/ddns/... clean; go test ./pkg/config/... ./pkg/ddns/...
+  ./pkg/cmdtree/... all ok.
+  **File(s)**: pkg/config/schema_interfaces.go,
+  pkg/config/schema_validate_ddns_source_address_2780_test.go,
+  docs/config-schema.md, _Log.md
