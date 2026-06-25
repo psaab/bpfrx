@@ -504,6 +504,14 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				fmt.Fprintf(&b, " interface %s area %s\n", iface.Name, area.ID)
 			}
 		}
+		// IPv6 OSPF ECMP mirrors the OSPFv4 block: FRR ospf6d requires an
+		// explicit "maximum-paths <N>" under "router ospf6" to install
+		// equal-cost multipath. OSPFv3 reuses the same global forwarding-table
+		// ECMP knob (ecmpMaxPaths) as OSPFv4 — there is no separate OSPFv3
+		// maximum-paths config leaf (#2997).
+		if ecmpMaxPaths > 1 {
+			fmt.Fprintf(&b, " maximum-paths %d\n", ecmpMaxPaths)
+		}
 		for _, export := range ospfv3.Export {
 			b.WriteString(m.resolveRedistribute(export, policyOptions, "ospf6"))
 		}
