@@ -33,6 +33,40 @@
   above the budget break made the Local test report counter 1 vs 0 → red.
   #2624's `vmin_cadence_persists_across_small_drain_calls` and #941's
   `vmin_prepared_drain_arms_hard_cap_after_repeated_throttle` still green.
+## 2026-06-24 — #2661 fix: forward A/AAAA orphaned when reverse PTR update fails
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fixed a HIGH stale-state bug in the RFC 2136 DDNS backend.
+  `UpsertLease` published the forward A/AAAA first, then the reverse PTR;
+  if the forward SUCCEEDED but the PTR add returned a non-skippable error
+  (SERVFAIL/timeout), it returned a plain error so `upsertLocked` recorded
+  NO ownership — leaving the forward RR LIVE in DNS but untracked, hence
+  orphaned (no later release could withdraw it). Chose RECORD-OWNERSHIP
+  over compensating-delete (the reconcile loop re-runs UpsertLease every
+  cycle, so recording ownership + retrying the PTR converges; the forward
+  stays, the PTR eventually publishes). Added `errDDNSPTRPending` (wraps
+  the cause): `UpsertLease` returns it on a non-skippable PTR failure after
+  a forward success; `upsertLocked` classifies it like a partial success —
+  records ownership with a new `ownedRecord.PTRPending` flag, counts a new
+  `PTRDeferred` counter, logs a WARN, and does NOT fail the pass. The
+  reconcile Pass-1 match branch leaves a PTR-pending record OWNED (never
+  deletes the live forward) but does not mark it settled, so Pass 2 re-runs
+  the idempotent forward re-add and re-attempts the PTR until it lands. A
+  NOTAUTH/REFUSED PTR stays a permanent counted skip (owned, not pending →
+  no retry churn). Surfaced `PTRDeferred` in the CLI/gRPC `show ...
+  dynamic-dns` counters and the Prometheus skipped-total (`ptr-deferred`).
+  Also hardened the stateful fake DNS server so an error rcode override
+  SUPPRESSES the in-memory apply (a real server does not apply a SERVFAILed
+  update), which the PTR-retry test depends on.
+- **File(s)**: pkg/dhcpserver/ddns_rfc2136.go, pkg/dhcpserver/ddns.go,
+  pkg/dhcpserver/ddns_state.go, pkg/dhcpserver/ddns_rfc2136_test.go,
+  pkg/dhcpserver/ddns_manager_inc2_test.go, pkg/api/metrics_system.go,
+  pkg/cli/cli_show_services.go, pkg/grpcapi/server_show_dhcp_lldp_snmp.go
+- **Validation**: `go test -race ./pkg/dhcpserver/...` green; build +
+  go test ./pkg/api ./pkg/cli ./pkg/grpcapi green; gofmt clean; go vet
+  clean on touched files (cli.go:441 unreachable-code is pre-existing on
+  master). fail-on-revert verified: reverting UpsertLease to the plain
+  error turns the new manager + updater tests red (orphaned forward).
 
 ## 2026-06-24 — #2639 fix: Phase-2 dh-group silently dropped the group<N> spelling
 

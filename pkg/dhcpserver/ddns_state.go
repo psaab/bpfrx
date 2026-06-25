@@ -53,6 +53,16 @@ type ownedRecord struct {
 	// an absent value degrades to the no-DHCID path on delete (safe — the
 	// exact-RR delete still only removes the firewall's own tuple).
 	ClientID string `json:"client_id,omitempty"`
+	// PTRPending marks an ownership record whose forward A/AAAA was published
+	// but whose reverse PTR add failed with a non-skippable (transient) error
+	// (#2661). Ownership is still recorded so the live forward is tracked +
+	// cleanable (never orphaned), and this flag tells the reconciler the PTR
+	// is still owed: a record with PTRPending=true is NOT considered settled,
+	// so the next reconcile re-runs UpsertLease (an idempotent forward re-add)
+	// to re-attempt the PTR. Cleared once the PTR finally publishes. Omitted
+	// from the JSON when false; an absent value (older stores, fully-published
+	// records) degrades to "settled", the safe default.
+	PTRPending bool `json:"ptr_pending,omitempty"`
 }
 
 // ownedRecordKey is the in-memory map key for an owned record: a lease's

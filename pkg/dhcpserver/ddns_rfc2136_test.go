@@ -149,7 +149,14 @@ func (s *fakeDNSServer) handle(w dns.ResponseWriter, r *dns.Msg) {
 	tcpDelay := s.tcpReplyDelay
 	statefulRcode := 0
 	statefulSet := false
-	if s.stateful {
+	// A real authoritative server that answers an error rcode (SERVFAIL,
+	// NOTAUTH, REFUSED, ...) does NOT apply the update. An explicit error
+	// override therefore SUPPRESSES the stateful apply, so a re-attempt of a
+	// failed update sees the record as still-absent (the #2661 PTR-retry path
+	// depends on this: a PTR that SERVFAILed must not silently land in the
+	// zone, or the retry's name-not-in-use prerequisite would falsely collide).
+	overrideIsError := hasOverride && override != dns.RcodeSuccess
+	if s.stateful && !overrideIsError {
 		statefulRcode = s.evalStatefulLocked(r)
 		statefulSet = true
 	}
@@ -564,6 +571,33 @@ func TestRFC2136PTRNotAuthIsCountedSkipNotFatal(t *testing.T) {
 	}
 	if ptr != 1 {
 		t.Errorf("ptr-notauth skip counter = %d, want 1", ptr)
+	}
+}
+
+// TestRFC2136ForwardPublishedPTRFailReturnsPendingSentinel proves the #2661
+// updater contract: when the forward A publishes but the reverse PTR add fails
+// with a NON-skippable error (SERVFAIL — not NOTAUTH/REFUSED), UpsertLease
+// returns the errDDNSPTRPending sentinel (so the manager records ownership of
+// the live forward instead of orphaning it). The forward A is on the wire.
+func TestRFC2136ForwardPublishedPTRFailReturnsPendingSentinel(t *testing.T) {
+	srv := newFakeDNSServer(t, nil)
+	srv.setStateful(true)
+	srv.setRcode("1.0.10.in-addr.arpa.", dns.RcodeServerFailure)
+	var ptr, conf int
+	u := testUpdater(t, srv, &config.DHCPDynamicDNSConfig{Enabled: true, Domain: "example.com"}, &ptr, &conf)
+
+	err := u.UpsertLease(context.Background(), recV4("laptop.example.com", "10.0.1.5", 300))
+	if !errors.Is(err, errDDNSPTRPending) {
+		t.Fatalf("a non-skippable PTR failure after a forward success must return the "+
+			"PTR-pending sentinel (#2661); got %v", err)
+	}
+	// The non-skippable PTR error is NOT counted as a NOTAUTH skip.
+	if ptr != 0 {
+		t.Errorf("ptr-notauth skip counter = %d, want 0 (SERVFAIL is not a NOTAUTH skip)", ptr)
+	}
+	// The forward A is live (the orphan-risk record the manager must now own).
+	if !srv.zoneHas(&dns.A{Hdr: dns.RR_Header{Name: "laptop.example.com.", Rrtype: dns.TypeA}, A: net.ParseIP("10.0.1.5")}) {
+		t.Errorf("forward A was not published")
 	}
 }
 
