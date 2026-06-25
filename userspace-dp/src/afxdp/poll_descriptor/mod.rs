@@ -842,17 +842,48 @@ pub(super) fn poll_binding_process_descriptor(
                             meta,
                             ingress_zone_override,
                         );
+                        // #2617: emit the matched input-filter `then log` event
+                        // on THIS (session-miss / first) packet, regardless of
+                        // the term's terminal action. Previously the emit fired
+                        // only inside the `action != Accept` branch below and at
+                        // the ForwardCandidate session-install success site
+                        // (~L1850); the install emit was removed in this fix in
+                        // favour of this single early site. The old layout left
+                        // two accept-path gaps:
+                        //
+                        //   - LocalDelivery (host-bound) accepted flows never
+                        //     reached the install emit, so an accepted `then log`
+                        //     never fired on the miss packet.
+                        //   - A ForwardCandidate flow whose session install was
+                        //     refused (max-sessions admission) dropped via
+                        //     `continue` BEFORE the install emit, losing the
+                        //     audit record entirely for a cache-declined /
+                        //     short-lived permitted flow.
+                        //
+                        // Emitting once here — before the action branch — gives
+                        // exactly-once miss-packet semantics across every accept
+                        // exit (forward, local-delivery, install-refused) and is
+                        // bit-identical to the non-accept path's prior immediate
+                        // emit. The log_match comes from the SAME counted
+                        // evaluation at ~L838, so emitting it does not re-count
+                        // the filter hit. The flow-cache descriptor populated
+                        // later (~L2615) stores the log via
+                        // evaluate_non_pbr_input_filter_log_only (the
+                        // non-counting variant) for cache-hit replay on
+                        // SUBSEQUENT packets; the miss packet does not take the
+                        // cache-hit path, so the same packet is never
+                        // double-logged.
+                        if let Some(cached_log) = input_filter_eval.cached_log {
+                            emit_input_filter_log_match(
+                                worker_ctx.forwarding,
+                                worker_ctx.event_stream,
+                                flow,
+                                meta,
+                                cached_log,
+                                now_ns,
+                            );
+                        }
                         if input_filter_eval.action != crate::filter::FilterAction::Accept {
-                            if let Some(cached_log) = input_filter_eval.cached_log {
-                                emit_input_filter_log_match(
-                                    worker_ctx.forwarding,
-                                    worker_ctx.event_stream,
-                                    flow,
-                                    meta,
-                                    cached_log,
-                                    now_ns,
-                                );
-                            }
                             // #2521: filter `then reject` synthesizes an active
                             // reply (TCP RST / ICMP unreachable) like policy
                             // reject; `discard` remains a silent drop.
@@ -1846,16 +1877,16 @@ pub(super) fn poll_binding_process_descriptor(
                                             worker_ctx.peer_worker_commands,
                                             &forward_entry,
                                         );
-                                        if let Some(cached_log) = input_filter_eval.cached_log {
-                                            emit_input_filter_log_match(
-                                                worker_ctx.forwarding,
-                                                worker_ctx.event_stream,
-                                                flow,
-                                                meta,
-                                                cached_log,
-                                                now_ns,
-                                            );
-                                        }
+                                        // #2617: the input-filter `then log`
+                                        // emit moved to the single early site at
+                                        // the accept fall-through (~L876), so it
+                                        // now fires once per miss packet across
+                                        // every accept exit (forward,
+                                        // local-delivery, install-refused). The
+                                        // former per-install emit here would
+                                        // double-log a successfully installed
+                                        // ForwardCandidate flow once the early
+                                        // site is in place.
                                     } else {
                                         // #1861: only reachable when
                                         // track_in_userspace == false (a true

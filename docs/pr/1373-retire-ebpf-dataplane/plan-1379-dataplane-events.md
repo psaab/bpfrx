@@ -49,10 +49,20 @@ Current implementation status after the 2026-05-19 closeout slice:
   `discard`/`reject` actions are terminal before route lookup and policy
   evaluation; logged terminal actions emit `source=input` with deny RT_FLOW
   action because this userspace path fails closed without synthesizing an
-  ICMP/RST reject packet yet. If the first permitted packet installs a
-  flow-cache entry,
-  the matched input log term and ingress-zone ID are stored in that entry and
-  cached hits re-emit `source=input` without rescanning filter terms.
+  ICMP/RST reject packet yet. A matched input filter `then log` term emits
+  `source=input` on the session-miss (first) packet itself, regardless of the
+  term's terminal action: the emit is a single early site at the accept
+  fall-through in `poll_descriptor`, so it fires exactly once per miss packet
+  across every accept exit — forward-candidate (whether or not the session
+  install succeeds), local-delivery, and the install-refused (max-sessions)
+  drop path. (#2617 closed the prior gap where an accepted `then log` fired
+  only inside the per-install success branch, so a local-delivery or
+  install-refused permitted flow lost its first — and, if short-lived or
+  cache-declined, only — audit record.) For a forward-candidate flow that
+  installs a flow-cache entry, the matched input log term and ingress-zone ID
+  are also stored in that entry and SUBSEQUENT cached hits re-emit
+  `source=input` without rescanning filter terms. The miss packet does not
+  take the cache-hit path, so the same packet is never double-logged.
 - Input/output filters with DSCP match terms are deliberately not
   flow-cached because DSCP is per-packet metadata outside the session cache
   key. Established session hits re-evaluate DSCP-sensitive input filters, and
