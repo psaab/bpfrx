@@ -4797,6 +4797,90 @@ func TestBuildClassOfServiceSnapshotSkipsUndefinedSchedulerMapClass(t *testing.T
 	}
 }
 
+// #2704: a DSCP classifier, 802.1p classifier, or DSCP rewrite-rule entry
+// referencing a forwarding-class that is not defined in
+// `class-of-service forwarding-classes` is only a NON-FATAL warning at commit
+// (compiler_validate_warn.go). The emitter must SKIP such an entry (mirroring
+// the scheduler-map skip) so the classifier/rewrite loss is no longer SILENT —
+// the pre-fix emitter carried the entry unfiltered and the Rust side then
+// silently dropped/no-op'd it. fail-on-revert: removing the filter lets the
+// undefined-class entry cross the wire and the surviving-entry asserts go red.
+func TestBuildClassOfServiceSnapshotSkipsUndefinedClassifierAndRewriteClass(t *testing.T) {
+	cfg := &config.Config{
+		ClassOfService: &config.ClassOfServiceConfig{
+			ForwardingClasses: map[string]*config.CoSForwardingClass{
+				"best-effort": {Name: "best-effort", Queue: 0},
+			},
+			DSCPClassifiers: map[string]*config.CoSDSCPClassifier{
+				"dscp-cl": {
+					Name: "dscp-cl",
+					Entries: []*config.CoSDSCPClassifierEntry{
+						{ForwardingClass: "best-effort", DSCPValues: []uint8{0}},
+						// undefined class — warning-only at commit, must be skipped
+						{ForwardingClass: "voice", DSCPValues: []uint8{46}},
+					},
+				},
+			},
+			IEEE8021Classifiers: map[string]*config.CoSIEEE8021Classifier{
+				"pcp-cl": {
+					Name: "pcp-cl",
+					Entries: []*config.CoSIEEE8021ClassifierEntry{
+						{ForwardingClass: "best-effort", CodePoints: []uint8{0}},
+						{ForwardingClass: "voice", CodePoints: []uint8{5}},
+					},
+				},
+			},
+			DSCPRewriteRules: map[string]*config.CoSDSCPRewriteRule{
+				"rw": {
+					Name: "rw",
+					Entries: []*config.CoSDSCPRewriteRuleEntry{
+						{ForwardingClass: "best-effort", DSCPValue: 0},
+						{ForwardingClass: "voice", DSCPValue: 46},
+					},
+				},
+			},
+		},
+	}
+
+	snap := buildClassOfServiceSnapshot(cfg)
+	if snap == nil {
+		t.Fatal("expected non-nil class-of-service snapshot")
+	}
+
+	if len(snap.DSCPClassifiers) != 1 {
+		t.Fatalf("DSCPClassifiers len = %d, want 1", len(snap.DSCPClassifiers))
+	}
+	dscpEntries := snap.DSCPClassifiers[0].Entries
+	if len(dscpEntries) != 1 {
+		t.Fatalf("dscp classifier entries = %d, want 1 (undefined-class entry must be skipped)", len(dscpEntries))
+	}
+	if dscpEntries[0].ForwardingClass != "best-effort" {
+		t.Fatalf("dscp surviving class = %q, want best-effort", dscpEntries[0].ForwardingClass)
+	}
+
+	if len(snap.IEEE8021Classifiers) != 1 {
+		t.Fatalf("IEEE8021Classifiers len = %d, want 1", len(snap.IEEE8021Classifiers))
+	}
+	pcpEntries := snap.IEEE8021Classifiers[0].Entries
+	if len(pcpEntries) != 1 {
+		t.Fatalf("802.1p classifier entries = %d, want 1 (undefined-class entry must be skipped)", len(pcpEntries))
+	}
+	if pcpEntries[0].ForwardingClass != "best-effort" {
+		t.Fatalf("802.1p surviving class = %q, want best-effort", pcpEntries[0].ForwardingClass)
+	}
+
+	if len(snap.DSCPRewriteRules) != 1 {
+		t.Fatalf("DSCPRewriteRules len = %d, want 1", len(snap.DSCPRewriteRules))
+	}
+	rwEntries := snap.DSCPRewriteRules[0].Entries
+	if len(rwEntries) != 1 {
+		t.Fatalf("rewrite entries = %d, want 1 (undefined-class entry must be skipped)", len(rwEntries))
+	}
+	if rwEntries[0].ForwardingClass != "best-effort" {
+		t.Fatalf("rewrite surviving class = %q, want best-effort", rwEntries[0].ForwardingClass)
+	}
+}
+
 // #1746: the equal-flow target policy reaches the scheduler snapshot,
 // and an UNSET policy keeps the serialized snapshot byte-identical to
 // the pre-#1746 wire (omitempty) — the byte-unchanged-default proof.

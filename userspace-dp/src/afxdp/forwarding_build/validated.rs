@@ -104,3 +104,48 @@ impl QueueId {
         self.0
     }
 }
+
+/// A validated egress interface MTU.
+///
+/// #2706: the pre-fix code narrowed the snapshot `mtu` with
+/// `iface.mtu.max(0) as usize`, so a NEGATIVE (malformed / version-drifted)
+/// value silently collapsed to `0`. The egress MTU guard
+/// (`forwarded_egress_mtu_decision`) treats `mtu == 0` as "unknown; forward"
+/// (fail-open: never invent an MTU smaller than the link), so a negative MTU
+/// silently DISABLED PTB / drop enforcement instead of failing the snapshot.
+///
+/// `0` is the LEGITIMATE "unknown MTU" sentinel the Go control plane emits
+/// (an interface whose link could not be resolved — `buildLinkSnapshot`
+/// returns mtu 0, dropped on the wire by `json:"mtu,omitempty"` and decoded
+/// back to 0). That permissive case is preserved unchanged: `0` maps to
+/// `InterfaceMtu(0)`. Only a NEGATIVE value (which a healthy Go path never
+/// produces — netlink MTUs are non-negative) is REJECTED, consistent with the
+/// #2410/#2696 fail-closed boundary: rejecting the whole snapshot keeps the
+/// previous live forwarding state rather than installing an interface with MTU
+/// enforcement silently switched off.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::afxdp) struct InterfaceMtu(usize);
+
+impl InterfaceMtu {
+    /// Decode an interface snapshot `mtu` (an `i32`). `0` (and only 0) is the
+    /// legitimate "unknown, forward permissively" sentinel and maps to
+    /// `InterfaceMtu(0)`. A NEGATIVE value is REJECTED (the pre-fix `.max(0)`
+    /// silently turned it into the permissive 0, disabling egress MTU
+    /// enforcement). A positive value passes through unchanged.
+    pub(in crate::afxdp) fn try_from_snapshot(
+        mtu: i32,
+        interface: &str,
+    ) -> Result<Self, SnapshotIntegrityError> {
+        usize::try_from(mtu).map(Self).map_err(|_| {
+            SnapshotIntegrityError::InterfaceMtuInvalid {
+                interface: interface.to_string(),
+                mtu,
+            }
+        })
+    }
+
+    #[inline]
+    pub(in crate::afxdp) fn get(self) -> usize {
+        self.0
+    }
+}
