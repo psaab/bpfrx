@@ -231,6 +231,24 @@ sync.
   runs only when an ICMP error is about to be generated, never on the
   per-packet fast path. No new counter — a suppressed error folds into
   the existing fail-closed silent drop.
+  #2487: the SOURCE-side sibling of #2411. A locally generated ICMP error
+  is addressed TO the trigger packet's source, so a *subnet-directed
+  broadcast* SOURCE (the all-ones host of a connected prefix, e.g.
+  `10.0.1.255` for `10.0.1.0/24`) produces an error emitted to that
+  directed broadcast — delivered to every host on the segment
+  (Smurf-style amplification / backscatter). The limited-broadcast test
+  in `source_is_invalid_for_icmp_error` (`is_broadcast()`) only catches
+  `255.255.255.255`; a subnet-directed broadcast is a plain unicast to it
+  and needs the configured subnet MASK. The new shared
+  `src_is_directed_broadcast` predicate (`frame/inspect.rs`) reuses the
+  SAME `connected_v4` scan (extracted into the shared
+  `v4_addr_is_directed_broadcast` helper that `dest_is_directed_broadcast`
+  also now calls) and the SAME `/31`/`/32` prefix-length guards. The IPv4
+  arms of `can_generate_icmp_error_reply` and `ptb_reply_suppressed` call
+  it alongside the existing source check (v4-only — IPv6 has no
+  broadcast), so the reject, Time-Exceeded, and PTB paths apply ONE
+  bad-source set covering both the limited and directed broadcast. Same
+  cold-path scan, no new counter, fail-closed silent drop.
   #2472: AFTER the RFC suppression + output-classification gates, all three
   locally-generated error reasons (Time Exceeded, PTB/Frag-Needed, and
   policy/filter `reject`) now also pass through a per-reason token-bucket

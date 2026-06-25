@@ -15094,6 +15094,25 @@ top.
   docs/userspace-dnat-plan.md
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2487 — extend ICMP-error source validation to subnet-directed
+  broadcast. `source_is_invalid_for_icmp_error` only caught the limited
+  broadcast (`255.255.255.255` via `is_broadcast()`); a directed-broadcast
+  SOURCE (all-ones host of a connected prefix) slipped through, so a locally
+  generated ICMP error addressed to that source went to the whole segment
+  (Smurf backscatter). Extracted `v4_addr_is_directed_broadcast` from
+  `dest_is_directed_broadcast` and added the SOURCE sibling
+  `src_is_directed_broadcast(&ForwardingState, packet)`; wired into the IPv4
+  arms of `can_generate_icmp_error_reply` (icmp.rs) and `ptb_reply_suppressed`
+  (icmp_ptb.rs), v4-only. Added 6 fail-on-revert tests (reject + PTB paths:
+  directed-broadcast src suppressed, unicast-in-subnet still allowed, /32
+  host all-ones-octet still allowed). RED-on-revert proven for the reject
+  path. README updated with the #2487 source-side paragraph. Read-side only,
+  no wire change.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/icmp_ptb.rs,
+  userspace-dp/src/afxdp/icmp_ptb_tests.rs,
+  userspace-dp/src/afxdp/README.md
   **Action**: #2372 — reconcile the LLDP service on day-2 config commits
   (was boot-only, requiring a daemon restart). Extracted the boot-time LLDP
   start into `Daemon.reconcileLLDP` (single source of truth), wired it into
