@@ -17,6 +17,8 @@ entries by TTL.
 - `Running()` — `lldp.go`. Reports whether a live generation has at least one
   active interface session. Used by the daemon's day-2 reconcile (#2372) and
   its tests to observe the start/stop transition.
+- `ApplyCount()` — `lldp.go`. Number of `Apply()` calls. Test seam for the
+  day-2 reconcile diff-guard (#2372) — an unrelated commit must not re-`Apply`.
 - `Neighbors()` — `lldp.go`. Snapshot consumed by `show lldp
   neighbors`.
 
@@ -71,12 +73,29 @@ Standard library + `golang.org/x/sys/unix`. No internal `pkg/*` imports.
 The daemon owns the manager and reconciles it on every commit, not just at
 boot. `Daemon.reconcileLLDP` (`pkg/daemon/daemon_apply.go`) is the single
 source of truth: `daemon_run.go` calls it at boot and `applyConfigLocked`
-calls it on every commit. It lazily instantiates the manager on the first
-commit that enables LLDP (so a daemon that never runs LLDP never allocates the
-sockets) and `Stop()`s it when a commit disables or empties the stanza. Because
-`Apply()` is reconcile-shaped (stop-then-start), an interface-set,
-`transmit-interval`, or `hold-multiplier` change takes effect on commit without
-a daemon restart.
+calls it on every commit. An interface-set, `transmit-interval`, or
+`hold-multiplier` change takes effect on commit without a daemon restart, and
+a disabled/empty stanza `Stop()`s the running service.
+
+Two properties keep this safe (#2372 review findings 3 + 6):
+
+- **Construct-once.** The `Manager` is created exactly once, at boot
+  (`daemon_run.go`, unconditionally — mirroring `dhcpRelay`), so the
+  `d.lldpMgr` pointer is written before any handler runs. `reconcileLLDP`
+  only ever calls `Apply()`/`Stop()` on it and NEVER reassigns the pointer.
+  The `show lldp neighbors` gRPC/CLI handlers read `d.lldpMgr` lock-free on a
+  handler goroutine, so a day-2 reassignment would be a data race on the
+  pointer field — construct-once eliminates the write entirely. (A daemon that
+  never enables LLDP allocates the manager but no sockets/goroutines.)
+- **Change-guarded.** `Apply()` unconditionally `Stop()`s the current
+  generation (closing every socket, joining goroutines, and wiping the
+  neighbor table) before rebuilding. So `reconcileLLDP` compares the new
+  effective LLDP config (`effectiveLLDPConfig`) against the last-applied one
+  and calls `Apply()`/`Stop()` only when it actually changed. An unrelated
+  day-2 commit (e.g. a firewall-policy change) therefore leaves a healthy LLDP
+  generation untouched — `show lldp neighbors` does not blank and sockets do
+  not churn. This matches the diff discipline of the adjacent
+  `reconcileDHCPRelay` (#2348).
 
 ## Gotchas
 

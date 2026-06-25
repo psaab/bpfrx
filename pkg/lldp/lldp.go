@@ -12,6 +12,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -90,6 +91,12 @@ type Manager struct {
 	// generation. Stop() closes each one to unblock the parked RX Recvfrom
 	// immediately, so shutdown does not wait out a read timeout. Guarded by mu.
 	sessions []*ifSession
+
+	// applyCount counts Apply() calls. It exists so the daemon's day-2 reconcile
+	// diff-guard (#2372) can be regression-tested — an unrelated commit must not
+	// re-Apply (which would Stop()/rebuild the generation and wipe the neighbor
+	// table). Atomic so a test reading it does not race a concurrent Apply.
+	applyCount atomic.Uint64
 }
 
 // ifSession owns the RX and TX AF_PACKET sockets for one interface for the life
@@ -193,6 +200,7 @@ func New() *Manager {
 
 // Apply starts LLDP on the configured interfaces.
 func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
+	m.applyCount.Add(1)
 	m.Stop()
 
 	if cfg == nil || cfg.Disable || len(cfg.Interfaces) == 0 {
@@ -315,6 +323,13 @@ func (m *Manager) Running() bool {
 	return len(m.sessions) > 0
 }
 
+// ApplyCount returns the number of times Apply() has been called on this
+// manager. It exists for the day-2 reconcile diff-guard regression test
+// (#2372): an unrelated commit must leave this unchanged.
+func (m *Manager) ApplyCount() uint64 {
+	return m.applyCount.Load()
+}
+
 // Neighbors returns a sorted snapshot of all discovered neighbors.
 func (m *Manager) Neighbors() []*Neighbor {
 	m.mu.RLock()
@@ -377,9 +392,12 @@ func (m *Manager) sendFrame(sess *ifSession, ttl int, sysName, sysDesc string) {
 // non-shutdown) recv error before retrying. A persistent operational error
 // (e.g. an interface flapped down so recv keeps erroring) must not become a
 // tight busy-spin, but it also must not permanently kill the receiver — nothing
-// restarts rxLoop short of a daemon restart, because LLDP is Apply()'d once at
-// startup (daemon_run.go) and Stop()'d only at shutdown. A var so tests can
-// shrink it; production keeps the 1s default.
+// restarts rxLoop within a generation. rxLoop lives only for the life of the
+// Apply() that started it; the daemon re-Apply()s only on a `protocols lldp`
+// change (#2372 diff-guard), which Stop()s the old generation and starts a
+// fresh one. So a permanent exit on a transient flap would silently kill
+// discovery until the next LLDP config change or a daemon restart. A var so
+// tests can shrink it; production keeps the 1s default.
 var rxErrorBackoff = 1 * time.Second
 
 // rxLoop receives LLDP frames on the session's interface and updates the

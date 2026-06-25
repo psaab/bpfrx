@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -1382,59 +1383,95 @@ func (d *Daemon) reconcileDHCPRelay(cfg *config.Config) {
 	d.dhcpRelay.Apply(ctx, cfg.ForwardingOptions.DHCPRelay)
 }
 
-// reconcileLLDP re-applies the LLDP service config on every commit (#2372). It
-// is the single source of truth for LLDP lifecycle — daemon_run.go calls it at
-// boot, and applyConfigLocked calls it on every day-2 commit, so a change to
-// `protocols lldp` takes effect without a daemon restart.
-//
-// Unlike the DHCP relay Manager (always created at boot), the LLDP Manager is
-// instantiated lazily on the first commit that enables LLDP, so a daemon that
-// never runs LLDP never allocates the manager or its sockets. lldp.Manager.Apply
-// is itself reconcile-shaped: it Stop()s the current generation (closing every
-// per-interface socket and clearing the neighbor table) before starting the new
-// one, so calling it repeatedly is idempotent and a disabled/empty config stops
-// the running service.
-//
-// The manager is bound to d.daemonCtx (the daemon lifetime) — NOT a
-// request-scoped context — so the TX/RX/expiry goroutines survive past this
-// apply call and are torn down only at daemon stop (or the next reconcile that
-// disables LLDP).
-func (d *Daemon) reconcileLLDP(cfg *config.Config) {
-	enabled := cfg != nil && cfg.Protocols.LLDP != nil &&
-		!cfg.Protocols.LLDP.Disable && len(cfg.Protocols.LLDP.Interfaces) > 0
-
-	if !enabled {
-		// Nothing to run. Stop a manager that was started by an earlier commit;
-		// if LLDP was never enabled, d.lldpMgr is nil and this is a no-op (no
-		// manager is allocated just to immediately stop it).
-		if d.lldpMgr != nil {
-			d.lldpMgr.Stop()
-		}
-		return
+// effectiveLLDPConfig translates the typed `protocols lldp` stanza into the
+// lldp.LLDPConfig the manager consumes, or returns nil when LLDP is disabled,
+// empty, or absent (the "stop the service" signal). It is the single mapping
+// used by both boot and the day-2 reconcile, so the diff-guard in reconcileLLDP
+// compares like-for-like.
+func effectiveLLDPConfig(cfg *config.Config) *lldp.LLDPConfig {
+	if cfg == nil || cfg.Protocols.LLDP == nil ||
+		cfg.Protocols.LLDP.Disable || len(cfg.Protocols.LLDP.Interfaces) == 0 {
+		return nil
 	}
-
-	if d.lldpMgr == nil {
-		d.lldpMgr = lldp.New()
-	}
-
-	var lldpIfaces []lldp.LLDPInterface
+	lldpIfaces := make([]lldp.LLDPInterface, 0, len(cfg.Protocols.LLDP.Interfaces))
 	for _, iface := range cfg.Protocols.LLDP.Interfaces {
 		lldpIfaces = append(lldpIfaces, lldp.LLDPInterface{
 			Name:    iface.Name,
 			Disable: iface.Disable,
 		})
 	}
+	return &lldp.LLDPConfig{
+		Interfaces:     lldpIfaces,
+		Interval:       cfg.Protocols.LLDP.Interval,
+		HoldMultiplier: cfg.Protocols.LLDP.HoldMultiplier,
+		SystemName:     cfg.System.HostName,
+	}
+}
+
+// reconcileLLDP re-applies the LLDP service config on every commit (#2372). It
+// is the single source of truth for LLDP lifecycle — daemon_run.go calls it at
+// boot, and applyConfigLocked calls it on every day-2 commit, so a change to
+// `protocols lldp` takes effect without a daemon restart.
+//
+// The manager itself is constructed exactly once at boot (daemon_run.go),
+// mirroring d.dhcpRelay. reconcileLLDP NEVER reassigns the d.lldpMgr pointer —
+// it only calls Apply()/Stop() on the already-constructed manager. This keeps
+// the lock-free d.lldpMgr reads on the `show lldp neighbors` handler goroutines
+// race-free against a concurrent commit (finding 3): the pointer is written
+// once, before any handler can run.
+//
+// Change-guarded (finding 6): lldp.Manager.Apply unconditionally Stop()s the
+// current generation — closing every per-interface socket, joining goroutines,
+// AND wiping the neighbor table — before rebuilding. Calling it on every commit
+// would blank `show lldp neighbors` and churn sockets on any unrelated day-2
+// commit (e.g. a firewall-policy change) while neighbors re-learn. So Apply (or
+// Stop) is invoked only when the effective LLDP config actually changed from the
+// last-applied one, matching the diff discipline of the adjacent
+// reconcileDHCPRelay (#2348). The first call (boot) always applies.
+//
+// The manager is bound to d.daemonCtx (the daemon lifetime) — NOT a
+// request-scoped context — so the TX/RX/expiry goroutines survive past this
+// apply call and are torn down only at daemon stop (or the next reconcile that
+// disables LLDP).
+func (d *Daemon) reconcileLLDP(cfg *config.Config) {
+	if d.lldpMgr == nil {
+		// Defensive: a test harness or a boot path that skipped the construct-
+		// once wiring leaves the manager nil. Nothing to reconcile.
+		return
+	}
+
+	want := effectiveLLDPConfig(cfg)
+
+	// Skip when the effective config is unchanged since the last reconcile, so
+	// an unrelated commit never bounces a healthy LLDP generation (sockets +
+	// neighbor table). The first reconcile (boot) always runs.
+	if d.lldpApplyInit && lldpConfigEqual(d.lldpApplied, want) {
+		return
+	}
+	d.lldpApplyInit = true
+	d.lldpApplied = want
+
+	if want == nil {
+		// Disabled / empty: stop the running service (idempotent if already
+		// stopped).
+		d.lldpMgr.Stop()
+		return
+	}
 
 	ctx := d.daemonCtx
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	d.lldpMgr.Apply(ctx, &lldp.LLDPConfig{
-		Interfaces:     lldpIfaces,
-		Interval:       cfg.Protocols.LLDP.Interval,
-		HoldMultiplier: cfg.Protocols.LLDP.HoldMultiplier,
-		SystemName:     cfg.System.HostName,
-	})
+	d.lldpMgr.Apply(ctx, want)
+}
+
+// lldpConfigEqual reports whether two effective LLDP configs are equivalent for
+// reconcile purposes (both nil, or deeply equal). nil means "service stopped".
+func lldpConfigEqual(a, b *lldp.LLDPConfig) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return reflect.DeepEqual(a, b)
 }
 
 func (d *Daemon) publishInitialPolicySchedulerStateLocked(cfg *config.Config, activeState map[string]bool, applyResult *dataplane.ApplyResult) {

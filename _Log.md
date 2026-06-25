@@ -15104,3 +15104,20 @@ top.
   **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon_run.go,
   pkg/daemon/daemon_lldp_reconcile_test.go, pkg/lldp/lldp.go,
   pkg/lldp/README.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2372 review fold — addressed hostile-review findings 3 + 6 on
+  PR #2748. (3) Data race on d.lldpMgr: construct the manager ONCE at boot
+  (unconditionally, mirroring d.dhcpRelay); reconcileLLDP now never reassigns
+  the pointer (only Apply/Stop), so the lock-free `show lldp neighbors`
+  handler reads can't race a day-2 commit. (6) Per-commit thrash: added a
+  reconcile-level diff-guard (effectiveLLDPConfig + lldpConfigEqual,
+  lldpApplied/lldpApplyInit on Daemon) so an unrelated commit no longer
+  Stop()/rebuilds the LLDP generation (which wipes the neighbor table + churns
+  sockets). Added lldp.Manager.ApplyCount() seam + two fail-on-revert tests
+  (manager-identity-stable; skips-unchanged-commit), both proven RED on revert.
+  go test -race ./pkg/daemon/ ./pkg/lldp/ green; disable-stops test PASS under
+  CAP_NET_RAW.
+  **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_run.go, pkg/daemon/daemon_lldp_reconcile_test.go,
+  pkg/lldp/lldp.go, pkg/lldp/README.md

@@ -931,10 +931,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.reconcileRPM(cfg)
 	}
 
-	// Start LLDP if configured. reconcileLLDP is the single source of truth
+	// Start LLDP if configured. The Manager is always created here (not gated
+	// on a non-nil/enabled LLDP config), mirroring d.dhcpRelay above: the
+	// d.lldpMgr pointer is then written exactly once, at boot, so the lock-free
+	// reads on the gRPC / CLI `show lldp neighbors` handler goroutines never
+	// race a day-2 commit (#2372 finding 3 — a lazy day-2 reassignment would be
+	// a data race on the pointer). reconcileLLDP is the single source of truth
 	// for LLDP start/stop/reconfigure: it runs here at boot and again on every
-	// day-2 commit from applyConfigLocked (#2372), so a config change to
-	// `protocols lldp` takes effect without a daemon restart.
+	// day-2 commit from applyConfigLocked, so a config change to `protocols
+	// lldp` takes effect without a daemon restart, and it only ever calls
+	// Apply()/Stop() on this already-constructed manager.
+	d.lldpMgr = lldp.New()
 	if cfg := d.store.ActiveConfig(); cfg != nil {
 		d.reconcileLLDP(cfg)
 	}
