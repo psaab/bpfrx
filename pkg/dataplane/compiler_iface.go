@@ -13,6 +13,13 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// defaultSynFloodAttackThreshold is the Junos SRX default attack-threshold
+// (SYN segments per second) used when a syn-flood screen is enabled without an
+// explicit attack-threshold. The config compiler seeds this at parse time; the
+// buildScreenConfig gate also applies it defensively (#3024). MUST match
+// pkg/config defaultSynFloodAttackThreshold.
+const defaultSynFloodAttackThreshold = 200
+
 // protectedInterfaceResolver returns the #1922 management protected set — the
 // interfaces (fxp0, the lifeline NIC, an explicit `system
 // management-interface` leaf) that the reconcile path must NEVER mark
@@ -1281,9 +1288,20 @@ func buildScreenConfig(profile *config.ScreenProfile, synCookie bool) ScreenConf
 	if profile.IP.TearDrop {
 		sc.Flags |= ScreenTearDrop
 	}
-	if profile.TCP.SynFlood != nil && profile.TCP.SynFlood.AttackThreshold > 0 {
+	if profile.TCP.SynFlood != nil {
+		// SYN-flood screening is armed whenever the operator configures
+		// `tcp syn-flood`, even without an explicit attack-threshold. The
+		// config compiler seeds the Junos default (200 SYN seg/s) at parse
+		// time (defaultSynFloodAttackThreshold in pkg/config); this gate is
+		// defensive so a SynFloodConfig that reaches the dataplane with a
+		// zero/unset attack-threshold still arms the screen (and syn-cookie)
+		// at the default rather than silently disabling protection (#3024).
 		sc.Flags |= ScreenSynFlood
-		sc.SynFloodThresh = uint32(profile.TCP.SynFlood.AttackThreshold)
+		thresh := profile.TCP.SynFlood.AttackThreshold
+		if thresh <= 0 {
+			thresh = defaultSynFloodAttackThreshold
+		}
+		sc.SynFloodThresh = uint32(thresh)
 		if profile.TCP.SynFlood.SourceThreshold > 0 {
 			sc.SynFloodSrcThresh = uint32(profile.TCP.SynFlood.SourceThreshold)
 		}

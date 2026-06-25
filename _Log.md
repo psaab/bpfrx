@@ -18381,3 +18381,31 @@ top.
   go test ./pkg/dhcprelay/... ok.
 - **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
   pkg/dhcprelay/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #3024 syn-flood default attack-threshold — when a `tcp syn-flood`
+  screen was enabled WITHOUT an explicit `attack-threshold`, AttackThreshold
+  stayed 0 and the dataplane gate in pkg/dataplane/compiler_iface.go
+  (buildScreenConfig) required `AttackThreshold > 0`, so it never set
+  ScreenSynFlood — SYN-flood protection (and the nested syn-cookie challenge)
+  was silently disabled even though the operator configured it. Matching Junos
+  SRX, the fix applies the default of 200 SYN segments/second when
+  attack-threshold is unset. Two layers: (1) the config compiler
+  (compileScreen in pkg/config/compiler_security.go) seeds
+  defaultSynFloodAttackThreshold=200 at parse time when sf.AttackThreshold<=0;
+  (2) buildScreenConfig now arms whenever profile.TCP.SynFlood != nil and
+  applies the same 200 default defensively if a zero/unset threshold reaches
+  the dataplane. An explicitly-configured attack-threshold is preserved (never
+  overridden). Fail-on-revert tests:
+  pkg/config TestSynFloodDefaultAttackThreshold (syn-flood with only
+  destination-threshold compiles to threshold=200) +
+  TestSynFloodExplicitAttackThresholdPreserved (explicit 1500 kept), and
+  pkg/dataplane TestBuildScreenConfig case "unset attack-threshold defaults
+  and enables". Verified RED by reverting both gates (config seed removed +
+  dataplane gate back to `> 0`): config test got AttackThreshold=0, dataplane
+  test got Flags=0/Thresh=0. Gates: go build ./... OK, gofmt clean (touched
+  files), go vet ./pkg/config/... OK, go test ./pkg/config/... 1492 pass,
+  go test ./pkg/dataplane/ -run TestBuildScreenConfig pass.
+- **File(s)**: pkg/config/compiler_security.go,
+  pkg/config/parser_security_test.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/compiler_test.go, docs/syn-cookie-flood-protection.md, _Log.md

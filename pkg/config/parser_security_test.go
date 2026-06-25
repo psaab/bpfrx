@@ -2834,6 +2834,64 @@ func TestScreenSetSyntax(t *testing.T) {
 	}
 }
 
+// TestSynFloodDefaultAttackThreshold is a fail-on-revert guard for #3024: a
+// syn-flood screen enabled WITHOUT an explicit attack-threshold must compile to
+// the Junos default of 200 SYN segments/second, not 0. A zero attack-threshold
+// is the value the dataplane gate (pkg/dataplane/compiler_iface.go) treated as
+// "disabled" — leaving SYN-flood protection (and nested syn-cookie) silently
+// off even though the operator configured it. RED if the parse-time default in
+// pkg/config/compiler_security.go is reverted.
+func TestSynFloodDefaultAttackThreshold(t *testing.T) {
+	tree := &ConfigTree{}
+	// syn-flood enabled with only destination-threshold + timeout — NO
+	// explicit attack-threshold (the bug's trigger).
+	for _, cmd := range []string{
+		"set security screen ids-option untrust-screen tcp syn-flood destination-threshold 4000",
+		"set security screen ids-option untrust-screen tcp syn-flood timeout 20",
+	} {
+		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	profile := cfg.Security.Screen["untrust-screen"]
+	if profile == nil || profile.TCP.SynFlood == nil {
+		t.Fatal("syn-flood profile not found")
+	}
+	if profile.TCP.SynFlood.AttackThreshold != defaultSynFloodAttackThreshold {
+		t.Errorf("AttackThreshold = %d, want default %d",
+			profile.TCP.SynFlood.AttackThreshold, defaultSynFloodAttackThreshold)
+	}
+	if profile.TCP.SynFlood.DestinationThreshold != 4000 {
+		t.Errorf("DestinationThreshold = %d, want 4000",
+			profile.TCP.SynFlood.DestinationThreshold)
+	}
+}
+
+// TestSynFloodExplicitAttackThresholdPreserved guards that the #3024 default
+// does NOT override an operator-supplied attack-threshold.
+func TestSynFloodExplicitAttackThresholdPreserved(t *testing.T) {
+	tree := &ConfigTree{}
+	if err := tree.SetPath(strings.Fields("security screen ids-option untrust-screen tcp syn-flood attack-threshold 1500")); err != nil {
+		t.Fatalf("SetPath: %v", err)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	profile := cfg.Security.Screen["untrust-screen"]
+	if profile == nil || profile.TCP.SynFlood == nil {
+		t.Fatal("syn-flood profile not found")
+	}
+	if profile.TCP.SynFlood.AttackThreshold != 1500 {
+		t.Errorf("AttackThreshold = %d, want explicit 1500 (default must not override)",
+			profile.TCP.SynFlood.AttackThreshold)
+	}
+}
+
 func TestNATSourceSetSyntax(t *testing.T) {
 	tree := &ConfigTree{}
 	for _, cmd := range []string{"set security nat source pool snat-pool address 203.0.113.0/24", "set security nat source rule-set trust-to-untrust from zone trust", "set security nat source rule-set trust-to-untrust to zone untrust", "set security nat source rule-set trust-to-untrust rule snat-rule match source-address 10.0.0.0/8", "set security nat source rule-set trust-to-untrust rule snat-rule then source-nat interface"} {
