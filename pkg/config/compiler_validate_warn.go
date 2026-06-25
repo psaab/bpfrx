@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strings"
@@ -987,6 +988,31 @@ func ddnsCheckIPURLValid(u string) bool {
 	return strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https")
 }
 
+// ddnsAllowlistMalformedTokens mirrors pkg/ddns.ParseAllowlistChecked's
+// tokenization for the commit-time warning ONLY (config cannot import pkg/ddns:
+// pkg/ddns imports pkg/config). It returns the comma/space/tab-separated tokens
+// that are not valid IP addresses. It must stay in sync with the splitter in
+// ddns.ParseAllowlistChecked; a divergence only affects whether the operator
+// gets a warning at commit — the runtime parse in pkg/ddns is authoritative and
+// drops the same tokens (logging once per provider) regardless (#2839).
+func ddnsAllowlistMalformedTokens(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	var bad []string
+	fields := strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' })
+	for _, f := range fields {
+		tok := strings.TrimSpace(f)
+		if tok == "" {
+			continue
+		}
+		if _, err := netip.ParseAddr(tok); err != nil {
+			bad = append(bad, tok)
+		}
+	}
+	return bad
+}
+
 // validateSurfaceADDNSWarnings emits WARN-only commit-time messages for the
 // Surface A router/interface-address DDNS bindings + provider catalog (#2691
 // P2). It never returns an error: the typed schema already accepts the leaves,
@@ -1084,6 +1110,21 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 			warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
 				"provider %q checkip-url %q is not a valid http(s) URL with a host; "+
 				"scopes using address-source checkip publish nothing", name, p.CheckIPURL))
+		}
+
+		// checkip-allowlist is a bogus-IP safety gate: each entry is an address
+		// the checkip parser may accept even though it is otherwise special-purpose
+		// (anycast resolvers, etc.). A malformed token (operator typo, e.g.
+		// "8.8.8.8x") is otherwise SILENTLY DROPPED by ddns.ParseAllowlist, so the
+		// gate silently shrinks and the checkip parser admits the very IP the
+		// operator meant to suppress (#2839). Surface the offending tokens at
+		// commit; the runtime allowlist parse mirrors this and fails lenient (it
+		// logs once per provider and keeps the valid entries). Parsing is mirrored
+		// here (not via pkg/ddns) because pkg/ddns imports pkg/config.
+		for _, tok := range ddnsAllowlistMalformedTokens(p.CheckIPAllowlist) {
+			warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+				"provider %q checkip-allowlist entry %q is not a valid IP address; "+
+				"it is ignored, shrinking the bogus-IP allowlist", name, tok))
 		}
 	}
 

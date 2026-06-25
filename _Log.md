@@ -16960,3 +16960,26 @@ top.
   go vet ./pkg/frr/... ./pkg/config/... ; go test ./pkg/frr/...
   ./pkg/config/... (PASS). Fail-on-revert confirmed: reverting the gate
   to `term.Metric > 0` makes TestGeneratePolicyOptionsMetricZero RED.
+
+## 2026-06-25 — #2839 DDNS checkip-allowlist: surface malformed tokens (no silent drop)
+- **Timestamp**: 2026-06-25
+- **Action**: `ddns.ParseAllowlist` silently dropped malformed checkip-allowlist
+  tokens, shrinking the bogus-IP safety gate with no operator feedback. Added
+  `ddns.ParseAllowlistChecked(s) (list, malformed)` (lenient `ParseAllowlist`
+  now delegates); wired a commit-time WARNING that names each offending token
+  via `ddnsAllowlistMalformedTokens` (mirrored in the compiler — `pkg/ddns`
+  imports `pkg/config`); the surface-A observer logs ONCE per
+  `(provider, allowlist)` so the per-poll-tick path does not flood. Semantics:
+  WARN (fail-open), matching the sibling `checkip-url` idiom (#2773) — valid
+  tokens are retained, the bad one is dropped, the operator is told.
+- **File(s)**: pkg/ddns/checkip.go, pkg/ddns/checkip_test.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_p3_http_providers_test.go, pkg/daemon/daemon.go,
+  pkg/daemon/daemon_ddns_surface_a.go, docs/config-schema.md
+- **Validation**: go build ./... ; gofmt -l (clean on touched files);
+  go vet ./pkg/ddns/... ./pkg/config/... ./pkg/daemon/... ; go test
+  ./pkg/ddns/... ./pkg/config/... ./pkg/daemon/... (PASS). Fail-on-revert
+  confirmed twice: reverting the ddns parse to a silent drop makes
+  TestParseAllowlistChecked RED ("expected 2 malformed tokens, got 0");
+  reverting the compiler helper to return nil makes
+  TestP3CheckIPAllowlistMalformedWarns RED (no allowlist warning emitted).

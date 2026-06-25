@@ -886,8 +886,9 @@ reserved for whole-dataplane selection where a rewrite shim
       (success-substring matcher; default good/nochg/ok/true/updated).
     - checkip (opt-in, behind-NAT address source): `checkip-url` +
       `checkip-allowlist` (comma/space bogus addresses to ignore, e.g. the
-      embedded `1.1.1.1` in a /cdn-cgi/trace page). The per-interface binding's
-      `address-source` enum gains `checkip`.
+      embedded `1.1.1.1` in a /cdn-cgi/trace page; a malformed token is no
+      longer silently dropped — it warns at commit, naming the token, #2839).
+      The per-interface binding's `address-source` enum gains `checkip`.
   - **Security** (plan §8.1): every credential is `config.Secret` (revealed only
     at the transport boundary, never in a URL/error/log; `DDNSProvider.String()`
     redacts all of them); HTTPS with system-trust cert+hostname verification
@@ -904,7 +905,18 @@ reserved for whole-dataplane selection where a rewrite shim
     masqueraded forever as a transient observation failure, suppressing
     publishing indefinitely. The runtime `ddns.CheckIP` gate
     (`validateCheckIPURL`) fails closed on the same malformed URL regardless, so
-    a URL that slips past commit cannot reach a fetch. Regression coverage:
+    a URL that slips past commit cannot reach a fetch. A malformed
+    `checkip-allowlist` token (operator typo, e.g. `8.8.8.8x`) also warns at
+    commit and NAMES the offending token (#2839); the allowlist is a bogus-IP
+    safety gate, so a token that was previously SILENTLY DROPPED shrank the gate
+    and let the checkip parser admit the very IP the operator meant to suppress.
+    Valid tokens are still retained; the runtime parse
+    (`ddns.ParseAllowlistChecked`) mirrors this and fails lenient — it drops the
+    bad token, keeps the valid entries, and logs ONCE per `(provider, allowlist)`
+    in the surface-A observer (the per-poll-tick path must not flood). The
+    commit-warn parse is mirrored in `ddnsAllowlistMalformedTokens`
+    (`compiler_validate_warn.go`) because `pkg/ddns` imports `pkg/config`.
+    Regression coverage:
     `pkg/config/compiler_p3_http_providers_test.go`,
     `pkg/ddns/backend_http_test.go` / `backend_cloudflare_test.go` /
     `backend_route53_test.go` / `sigv4_test.go` / `checkip_test.go` /
