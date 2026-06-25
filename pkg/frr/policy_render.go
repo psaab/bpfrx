@@ -1389,6 +1389,15 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 						fmt.Fprintf(&b, " set community %s\n", term.Community)
 					}
 				}
+				// AS-path prepend (#2892). Junos `then as-path-prepend
+				// "<asn> <asn> ..."` → FRR `set as-path prepend <asn> <asn>
+				// ...`. The repeated ASNs lengthen the advertised AS_PATH so
+				// peers prefer a shorter alternate path. Emit every ASN in
+				// order (repetition is the mechanism) on a single clause; skip
+				// entirely when no ASNs were configured.
+				if len(term.ASPathPrepend) > 0 {
+					fmt.Fprintf(&b, " set as-path prepend %s\n", strings.Join(term.ASPathPrepend, " "))
+				}
 				if term.Origin != "" {
 					fmt.Fprintf(&b, " set origin %s\n", term.Origin)
 				}

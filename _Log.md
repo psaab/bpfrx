@@ -17458,3 +17458,8 @@ top.
   go vet ./pkg/ddns/..., go test ./pkg/ddns/... PASS.
   **File(s)**: pkg/ddns/backend_bind.go, pkg/ddns/backend_bind_test.go,
   pkg/ddns/README.md, _Log.md
+
+## #2892 — BGP policy `then as-path-prepend` (AS-path prepending)
+- **Timestamp**: 2026-06-25
+- **Action**: Implement Junos `then as-path-prepend "<asn> ..."` → FRR `set as-path prepend <asn> ...` end-to-end (schema typed leaf, typed struct field, compiler both AST paths, renderer). Add fail-on-revert render test + multi-ASN parse tests.
+- **File(s)**: pkg/config/types_routing.go (ASPathPrepend []string), pkg/config/schema_routing.go (then as-path-prepend multi:true leaf), pkg/config/compiler_routing.go (parsePolicyTermChildren + parsePolicyTermInlineKeys + policyTermInlineKeywords), pkg/frr/policy_render.go (set as-path prepend clause), pkg/frr/policy_as_path_prepend_2892_test.go (new), pkg/config/compiler_as_path_prepend_2892_test.go (new), pkg/frr/README.md, docs/config-schema.md, docs/feature-gaps.md
