@@ -1,3 +1,36 @@
+## 2026-06-25 — #2776: ddns/surface-a static-address fallback is now public-gated
+
+- **Timestamp**: 2026-06-25
+- **Action**: The Surface A static-address fallback (`staticUnitAddr` in
+  `pkg/daemon/daemon_ddns_surface_a.go`, used by `observeInterfaceAddr` when the
+  kernel interface is absent/addressless) filtered only loopback/
+  link-local-unicast/unspecified, while the netlink path also rejected
+  multicast — divergent publishability predicates. A mis-scoped configured
+  static address (multicast, reserved, ULA, CGNAT, documentation, IANA
+  special-purpose) could be published as the router's A/AAAA record. Fix: gate
+  the static candidate through the SAME `ddns.IsPublicAddr` predicate the
+  netlink and checkip sources use. Exported `isPublicAddr` → `IsPublicAddr` in
+  `pkg/ddns/checkip.go` (same package as the existing `#2774` gate; reused, not
+  duplicated — no second IANA range list). A non-public static address is now
+  SKIPPED and surfaced at `slog.Warn` (never-blackhole: a bad static address
+  must not silently publish a martian). Scope kept to the static-fallback path
+  only — no other surface_a address-selection refactor (#2775/#2779/#2780 are
+  separate lanes).
+- **File(s)**: `pkg/ddns/checkip.go` (export `IsPublicAddr` + callers/comment),
+  `pkg/ddns/checkip_test.go` (rename refs), `pkg/daemon/daemon_ddns_surface_a.go`
+  (`staticUnitAddr` gate + WARN), `pkg/daemon/daemon_ddns_surface_a_test.go`
+  (`TestStaticUnitAddr` updated to genuinely-public addrs since the prior fixture
+  used TEST-NET-3/2001:db8 which the gate correctly rejects;
+  `TestStaticUnitAddrPublicGate` fail-on-revert), `pkg/ddns/README.md`.
+- **Fail-on-revert proof**: copied `daemon_ddns_surface_a.go` aside, replaced
+  `ddns.IsPublicAddr(a)` with the OLD partial loopback/link-local/unspecified
+  filter → `go test ./pkg/daemon/ -run StaticUnitAddrPublicGate` went RED (all
+  8 v4 + 5 v6 special-purpose entries returned ok=true, plus the
+  skip-then-select-next-public case failed). Restored from the copy → GREEN.
+- **Gates**: `go build ./...` clean, `gofmt -l` clean, `go vet ./pkg/ddns/...`
+  clean, `go test ./pkg/ddns/...` + `go test ./pkg/daemon/ -run
+  'StaticUnitAddr|SurfaceA'` pass.
+
 ## 2026-06-25 — #2778: ddns/surface-a no longer holds the manager mutex across provider I/O
 
 - **Timestamp**: 2026-06-25
