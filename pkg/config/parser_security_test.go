@@ -3446,8 +3446,8 @@ func TestPolicyStatementNextHopAndLoadBalance(t *testing.T) {
 	if len(term.FromProtocols) != 1 || term.FromProtocols[0] != "direct" {
 		t.Errorf("from protocol = %v, want [direct]", term.FromProtocols)
 	}
-	if term.PrefixList != "management-hosts" {
-		t.Errorf("prefix-list = %q, want management-hosts", term.PrefixList)
+	if len(term.PrefixList) != 1 || term.PrefixList[0] != "management-hosts" {
+		t.Errorf("prefix-list = %v, want [management-hosts]", term.PrefixList)
 	}
 	if term.NextHop != "peer-address" {
 		t.Errorf("next-hop = %q, want peer-address", term.NextHop)
@@ -3487,8 +3487,8 @@ func TestPolicyStatementSetSyntax(t *testing.T) {
 		t.Fatalf("got %d terms, want 1", len(peer.Terms))
 	}
 	term := peer.Terms[0]
-	if term.PrefixList != "mgmt" {
-		t.Errorf("prefix-list = %q, want mgmt", term.PrefixList)
+	if len(term.PrefixList) != 1 || term.PrefixList[0] != "mgmt" {
+		t.Errorf("prefix-list = %v, want [mgmt]", term.PrefixList)
 	}
 	if term.NextHop != "peer-address" {
 		t.Errorf("next-hop = %q, want peer-address", term.NextHop)

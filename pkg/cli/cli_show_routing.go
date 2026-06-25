@@ -788,8 +788,14 @@ func (c *CLI) showPolicyOptions() error {
 				} else if len(t.FromProtocols) > 1 {
 					fmt.Printf("      from protocol [ %s ]\n", strings.Join(t.FromProtocols, " "))
 				}
-				if t.PrefixList != "" {
-					fmt.Printf("      from prefix-list %s\n", t.PrefixList)
+				for _, pl := range t.PrefixList {
+					fmt.Printf("      from prefix-list %s\n", pl)
+				}
+				for _, c := range t.FromCommunity {
+					fmt.Printf("      from community %s\n", c)
+				}
+				for _, ap := range t.FromASPath {
+					fmt.Printf("      from as-path %s\n", ap)
 				}
 				for _, rf := range t.RouteFilters {
 					match := rf.MatchType
