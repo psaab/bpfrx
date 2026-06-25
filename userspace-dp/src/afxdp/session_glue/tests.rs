@@ -4719,3 +4719,117 @@ fn upsert_local_entries_stay_out_of_owner_rg_bulk_export() {
         "peer-synced-origin local-tunnel entries must not bulk-export"
     );
 }
+
+/// #2669: a drained Close delta must reach its binding-INDEPENDENT
+/// consumers (shared session/conntrack tables, HA peer-worker delete
+/// replication, recent-deltas RPC buffer, event stream) even when the
+/// worker has NO bindings — i.e. `flush_session_deltas` is invoked with
+/// `live = None`. The pre-fix code drained the delta off the ring and then
+/// skipped the whole flush when `bindings.first()` was `None`, silently
+/// discarding the close. This test exercises the `live = None` path
+/// directly: reverting the fix (re-gating the flush on a binding, or
+/// passing `&binding.live` only) makes none of these consumers observe the
+/// delete, so the assertions go red — fail-on-revert.
+#[test]
+fn flush_session_deltas_without_binding_reaches_global_consumers() {
+    let key = test_key();
+    let decision = test_decision();
+    let metadata = test_metadata();
+
+    // Seed the shared session table so the Close delete has something to
+    // remove (the binding-independent shared-table consumer).
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let shared_entry = SyncedSessionEntry {
+        key: key.clone(),
+        decision,
+        metadata: metadata.clone(),
+        origin: SessionOrigin::ForwardFlow,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+    };
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &shared_entry,
+    );
+    assert!(
+        !shared_sessions.lock().expect("shared sessions").is_empty(),
+        "precondition: shared session seeded"
+    );
+
+    // One peer-worker command queue — the HA delete-replication sink.
+    let peer_queue: Arc<Mutex<VecDeque<WorkerCommand>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
+    let peer_worker_commands = vec![peer_queue.clone()];
+    let recent_session_deltas = Arc::new(Mutex::new(VecDeque::new()));
+    let forwarding = ForwardingState::default();
+
+    let delta = SessionDelta {
+        kind: SessionDeltaKind::Close,
+        key: key.clone(),
+        decision,
+        metadata,
+        origin: SessionOrigin::ForwardFlow,
+        fabric_redirect_sync: false,
+        created_ns: 0,
+        last_seen_ns: 0,
+    };
+
+    // Synthesize a binding identity with labels only — exactly what the
+    // worker loop does when `bindings` is empty — and flush with NO live
+    // RPC queue and the fd-less (-1) map fds.
+    let ident = BindingIdentity {
+        slot: 0,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from(""),
+        ifindex: -1,
+    };
+    flush_session_deltas(
+        &ident,
+        None,
+        -1,
+        -1,
+        -1,
+        &[delta],
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &recent_session_deltas,
+        &peer_worker_commands,
+        &None,
+        &forwarding,
+    );
+
+    // Binding-independent consumer 1: shared session table cleared.
+    assert!(
+        shared_sessions.lock().expect("shared sessions").is_empty(),
+        "Close delta must remove the shared session even with no binding"
+    );
+    // Binding-independent consumer 2: HA peer-worker delete replication.
+    let replicated: Vec<_> = peer_queue
+        .lock()
+        .expect("peer queue")
+        .iter()
+        .cloned()
+        .collect();
+    assert!(
+        replicated
+            .iter()
+            .any(|cmd| matches!(cmd, WorkerCommand::DeleteSynced(k) if *k == key)),
+        "Close delta must replicate a DeleteSynced to the HA peer even with no binding"
+    );
+    // Binding-independent consumer 3: recent-deltas RPC buffer.
+    let recent = recent_session_deltas.lock().expect("recent deltas");
+    assert!(
+        recent.iter().any(|info| info.event == "close"),
+        "Close delta must reach the recent-deltas buffer even with no binding"
+    );
+}

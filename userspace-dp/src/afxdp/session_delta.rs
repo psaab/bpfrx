@@ -34,9 +34,22 @@ pub(super) fn purge_queued_flows_for_closed_deltas(
     }
 }
 
+// #2669: `live` is `Option` because a drain cycle can coincide with an
+// empty `bindings` slice (XSK sockets admin-down / unconfigured during a
+// reload or transaction while the session table is still aging entries
+// out). The drained deltas MUST still reach every binding-independent
+// consumer — the shared session/conntrack tables, the peer-worker command
+// queues, the HA delete replication, the recent-deltas RPC buffer, and the
+// event stream — so they are flushed unconditionally below. Only the
+// per-binding RPC fallback push (`live.push_session_delta`) is gated on a
+// binding existing: with no binding there is no interface-local RPC queue
+// to push into. Previously the entire flush was skipped when `bindings`
+// was empty, but the deltas were still drained off the ring — silently
+// discarding session-close/expire events and desynchronizing peers,
+// sibling workers, and CLI/gRPC visibility.
 pub(super) fn flush_session_deltas(
     ident: &BindingIdentity,
-    live: &BindingLiveState,
+    live: Option<&BindingLiveState>,
     session_map_fd: c_int,
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
@@ -139,7 +152,12 @@ pub(super) fn flush_session_deltas(
                 || delta.decision.resolution.disposition == ForwardingDisposition::FabricRedirect,
             fabric_ingress: delta.metadata.fabric_ingress,
         };
-        live.push_session_delta(info.clone());
+        // #2669: per-binding RPC fallback push is the ONLY binding-dependent
+        // step. Skipped when no binding exists; every consumer below is
+        // binding-independent and runs regardless.
+        if let Some(live) = live {
+            live.push_session_delta(info.clone());
+        }
         // Push to event stream (new path) alongside existing RPC fallback.
         if let Some(es) = event_stream {
             es.push_delta(delta, zone_name_to_id);
