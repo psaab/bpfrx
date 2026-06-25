@@ -245,6 +245,34 @@ pub(crate) struct WgEngineConfig {
 /// when the integration layer needs it.
 const PADDED_PLAINTEXT_MAX: usize = 4080 + 16;
 
+/// The largest INNER IP packet length (pre-§5.4.6 padding) the engine
+/// can encrypt in one transport message, i.e. the largest `L` for which
+/// `pad_to_16(L) <= PADDED_PLAINTEXT_MAX`.
+///
+/// Because `pad_to_16` rounds up to a 16-byte multiple and
+/// `PADDED_PLAINTEXT_MAX` is itself a multiple of 16, the largest
+/// accepted unpadded inner length is exactly `PADDED_PLAINTEXT_MAX`
+/// (a 4096-byte inner pads to 4096 and is accepted; a 4097-byte inner
+/// pads to 4112 and is rejected — see the `encap` guard at line ~908).
+///
+/// This is the hard ceiling that any ADVERTISED or CONFIGURED inner
+/// (wgN-interface) MTU must be clamped to: a sender that honors an
+/// advertised inner MTU above this value still has its packets dropped
+/// at the encap `padded_len > PADDED_PLAINTEXT_MAX` guard
+/// (`encap_mtu_drops`). `wg::mss::wg_inner_mtu` clamps to this value
+/// (#2457); the Go control plane mirrors it as
+/// `pkg/routing/tunnel.go::wgEngineMaxInnerMTU`.
+pub(crate) const WG_ENGINE_MAX_INNER_MTU: usize = PADDED_PLAINTEXT_MAX;
+
+// Compile-time proof that WG_ENGINE_MAX_INNER_MTU is the true ceiling:
+// it must itself pad to <= PADDED_PLAINTEXT_MAX (accepted) while the
+// next byte does not (rejected). If PADDED_PLAINTEXT_MAX ever changes
+// to a non-16-multiple, this catches the silent off-by-pad drift.
+const _: () = {
+    assert!(pad_to_16(WG_ENGINE_MAX_INNER_MTU) <= PADDED_PLAINTEXT_MAX);
+    assert!(pad_to_16(WG_ENGINE_MAX_INNER_MTU + 1) > PADDED_PLAINTEXT_MAX);
+};
+
 /// Round `n` up to the nearest multiple of 16. WG spec §5.4.6.
 #[inline]
 const fn pad_to_16(n: usize) -> usize {

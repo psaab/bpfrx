@@ -1132,6 +1132,23 @@ const (
 	wgPadWorst   = 15
 )
 
+// wgEngineMaxInnerMTU is the largest INNER IP packet (pre-§5.4.6 padding)
+// the WireGuard engine can encrypt in one transport message. It MUST mirror
+// userspace-dp afxdp/wg/engine.rs WG_ENGINE_MAX_INNER_MTU
+// (= PADDED_PLAINTEXT_MAX = 4096). The engine rejects an inner whose
+// 16-byte-padded length exceeds PADDED_PLAINTEXT_MAX; because
+// PADDED_PLAINTEXT_MAX is itself a 16-multiple, the largest accepted unpadded
+// inner length is exactly 4096.
+//
+// #2457: the configured / derived wgN inner MTU MUST be clamped to this
+// ceiling. Without the clamp, an operator who sets `mtu 9000` on a wgN
+// interface (or a jumbo underlay deriving a >4096 inner budget) hands the
+// engine plaintext above its encryptable maximum, so every oversized packet
+// is silently dropped at the encap `padded_len > PADDED_PLAINTEXT_MAX` guard
+// (`encap_mtu_drops`). Clamping makes the advertised/configured inner MTU
+// match what the engine actually accepts.
+const wgEngineMaxInnerMTU = 4080 + 16 // 4096
+
 // wgDefaultOuterMTU is the assumed underlay (outer-link) MTU used to
 // derive the wgN inner MTU when the operator has not set an explicit
 // `mtu` on the tunnel (#2300). It mirrors the Rust control-thread
@@ -1166,8 +1183,15 @@ func wgTunMTUForEndpoint(tc *config.TunnelConfig) int {
 	// the inner wgN MTU. This is the divergence #2300 closes — the prior
 	// code ignored tc.MTU entirely and always derived from 1500, so a
 	// lowered-underlay deployment could not set a smaller wgN MTU.
+	//
+	// #2457: clamp the override to the engine's encryptable ceiling. An
+	// operator who sets `mtu 9000` on a jumbo wgN device would otherwise
+	// have the kernel hand the WG engine plaintext above
+	// wgEngineMaxInnerMTU (4096), which the encap guard silently drops
+	// (`encap_mtu_drops`). Clamping keeps the configured device MTU at or
+	// below what the engine can actually encrypt.
 	if tc.MTU > 0 {
-		return tc.MTU
+		return min(tc.MTU, wgEngineMaxInnerMTU)
 	}
 	// A configured v4 endpoint uses the v4 overhead; a v6 endpoint (or a
 	// responder-only/roaming endpoint with no configured address, which
@@ -1181,7 +1205,11 @@ func wgTunMTUForEndpoint(tc *config.TunnelConfig) int {
 	if !tc.WgOuterFamilyV6() && tc.WgHasEndpoint() {
 		overhead = wgOverheadV4
 	}
-	return wgDefaultOuterMTU - overhead - wgPadWorst
+	// #2457: the default-derived value also clamps to the engine ceiling
+	// so a jumbo wgDefaultOuterMTU (were it ever raised) cannot derive an
+	// inner budget the engine cannot encrypt. At the shipped 1500 default
+	// this is a no-op.
+	return min(wgDefaultOuterMTU-overhead-wgPadWorst, wgEngineMaxInnerMTU)
 }
 
 // applyWireguardTunLocked creates (or reuses) the persistent wgN TUN

@@ -150,11 +150,12 @@ clamp / post-transform PMTUD (#2299/#2330/#2457). Conservative fallback: an
 unresolvable outer route falls back to the resolution's `egress_ifindex` MTU
 (the pre-#2680 behaviour) then 1500 — never tighter than before.
 On the Go side, `wgTunMTUForEndpoint` honors an operator-set `mtu` on the
-tunnel interface (the supported sub-1500 / jumbo override — PPPoE 1492,
-cloud overlays ~1450); with no operator MTU it derives the wgN inner MTU
-from `wgDefaultOuterMTU` minus the family overhead. The pre-#2300 code
-ignored `tc.MTU` entirely and always derived from 1500, so a
-lowered-underlay deployment could not set a smaller wgN MTU.
+tunnel interface (the supported sub-1500 override — PPPoE 1492, cloud
+overlays ~1450); with no operator MTU it derives the wgN inner MTU from
+`wgDefaultOuterMTU` minus the family overhead. The pre-#2300 code ignored
+`tc.MTU` entirely and always derived from 1500, so a lowered-underlay
+deployment could not set a smaller wgN MTU. Both branches are clamped to the
+engine ceiling (#2457, below).
 
 **#2684 (PTB advertisement — the #2680 sibling on the same SSOT).** The
 post-transform PMTUD path (`post_transform_inner_mtu`, the TX dispatcher's
@@ -187,6 +188,44 @@ admits against, so the PTB and the guard now agree. Conservative fallback
 `egress_ifindex` MTU — the pre-#2684 value, never worse. GRE is unaffected:
 its `endpoint.destination` is the real outer hop, so `tunnel_outer_mtu`
 already resolves to the physical underlay for `native_gre_inner_mtu`.
+
+**#2457 (advertised/configured inner MTU clamped to the engine ceiling).**
+The WG engine encrypts at most `PADDED_PLAINTEXT_MAX = 4096` bytes of
+§5.4.6-padded plaintext per transport message; the encap path rejects any
+inner whose 16-byte-padded length exceeds that, counting `encap_mtu_drops`.
+Because `PADDED_PLAINTEXT_MAX` is itself a 16-multiple, the largest
+ENCRYPTABLE unpadded inner IP packet is exactly 4096 — exported as
+`engine::WG_ENGINE_MAX_INNER_MTU` (compile-time-asserted: 4096 pads to ≤4096
+and is accepted, 4097 pads to 4112 and is rejected). This is a HARD ceiling
+INDEPENDENT of the outer link: the prior MTU math was purely
+`outer_mtu − overhead − pad`, so on a jumbo underlay (or an operator
+`set interfaces wgN unit U family inet mtu 9000`) the advertised / configured
+inner MTU could exceed 4096. A sender that honored the larger advertised MTU
+still had every oversized inner packet silently dropped at the engine cap —
+advertised-vs-encryptable mismatch.
+
+Both surfaces now clamp to the ceiling:
+
+- Rust `wg::mss::wg_inner_mtu` (the pad-aware SSOT feeding TCP segmentation
+  AND the #2684 PTB advertisement) returns
+  `min(outer_mtu − overhead − pad, WG_ENGINE_MAX_INNER_MTU)`. At a normal
+  ≤1500 underlay the clamp is a no-op; on a jumbo underlay it caps both the
+  segmentation budget and the PTB the engine advertises to inner senders at
+  4096. This is distinct from #2684, which fixed WHICH outer MTU the PTB
+  reads (logical→physical); #2457 caps the RESULT against what the engine can
+  encrypt regardless of how large the (now-correct) physical underlay is.
+- Go `pkg/routing/tunnel.go::wgTunMTUForEndpoint` clamps the configured wgN
+  DEVICE MTU — an operator `mtu` override (and the default-derived value) is
+  `min(value, wgEngineMaxInnerMTU)`, where `wgEngineMaxInnerMTU = 4096`
+  mirrors the Rust constant. This keeps the kernel from handing the engine a
+  plaintext above the encryptable maximum in the first place.
+
+A jumbo WireGuard inner (>4096) is therefore intentionally NOT supported
+today; raising it is a coordinated bump of `PADDED_PLAINTEXT_MAX` (with
+proven stack/heap safety for the larger staging buffer) plus the two mirrored
+ceiling constants — the compile-time assert in `engine.rs` and the
+`wgEngineMaxInnerMTU != 4096` guard in the Go test fail loudly if one side
+drifts.
 
 **#2701 (transit-egress OUTER SOURCE).** The #2680 MTU fix resolved the
 physical underlay egress for the MTU guard but left the OUTER IP SOURCE

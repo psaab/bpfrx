@@ -1,3 +1,44 @@
+## 2026-06-25 — #2457: WG advertised/configured inner MTU clamped to engine PADDED_PLAINTEXT_MAX (4096)
+
+- **Timestamp**: 2026-06-25
+- **Action**: The WireGuard engine encrypts at most
+  `PADDED_PLAINTEXT_MAX = 4096` bytes of §5.4.6-padded plaintext per
+  transport message (encap rejects oversized inners → `encap_mtu_drops`),
+  but the inner-MTU derivation was purely `outer_mtu − overhead − pad` with
+  NO clamp to that ceiling. On a jumbo underlay (or an operator-set
+  `mtu 9000` on a wgN device) the advertised/configured inner MTU could
+  exceed 4096, so a sender honoring it still had every oversized inner
+  packet silently dropped at the engine cap (advertised-vs-encryptable
+  mismatch; codex review-033 finding 033-19). Fix: clamp BOTH inner-MTU
+  surfaces to the engine ceiling. Rust: exported
+  `engine::WG_ENGINE_MAX_INNER_MTU` (= `PADDED_PLAINTEXT_MAX`, compile-time
+  asserted as the true unpadded ceiling) and made `wg::mss::wg_inner_mtu`
+  return `min(outer_derived, WG_ENGINE_MAX_INNER_MTU)` — this is the
+  pad-aware SSOT feeding TCP segmentation AND the #2684 PTB advertisement,
+  so both are now capped. Go: `pkg/routing/tunnel.go::wgTunMTUForEndpoint`
+  clamps the configured wgN device MTU (operator override AND default-
+  derived) to `wgEngineMaxInnerMTU = 4096`, mirroring the Rust constant.
+  Distinct from #2684 (which fixed WHICH outer MTU the PTB reads) — #2457
+  caps the RESULT against the engine's hard encryptable limit. Did NOT
+  touch `icmp_ptb.rs` (#2684 surface), `frame/wg.rs` egress (#2792), or the
+  udp6 checksum (#2651). No wire change (`protocol_wire_v1.json` untouched).
+- **File(s)**: `userspace-dp/src/afxdp/wg/engine.rs`,
+  `userspace-dp/src/afxdp/wg/mss.rs`, `pkg/routing/tunnel.go`,
+  `pkg/routing/tunnel_reconcile_test.go`, `docs/wireguard-interop.md`,
+  `_Log.md`.
+- **Fail-on-revert proof (copy-restore, no git checkout)**:
+  - Rust: `cp mss.rs mss.rs.bak`; stripped the `.min(WG_ENGINE_MAX_INNER_MTU)`
+    clamp → `wg_inner_mtu_jumbo_clamped_to_engine_max` and
+    `wg_inner_mtu_below_ceiling_passes_unchanged` both FAILED (jumbo returned
+    the unclamped 8925/8905, boundary at-ceiling returned 4097); restored
+    from backup → all 10 `wg_inner_mtu` tests pass.
+  - Go: `cp tunnel.go tunnel.go.bak`; stripped the operator-override
+    `min(tc.MTU, wgEngineMaxInnerMTU)` → `TestWgTunMTUForEndpointClampsToEngineMax`
+    FAILED ("jumbo override mtu 9000: got 9000, want 4096"); restored → pass.
+- **Gates**: `cargo build --release -p xpf-userspace-dp` OK;
+  `cargo test --release --bin xpf-userspace-dp -- wg mtu` 244/0;
+  `go build`/`gofmt`/`go vet`/`go test ./pkg/routing/` all clean.
+
 ## 2026-06-25 — #2651: WG IPv6 outer UDP checksum uses the AVX2 checksum16_ipv6 helper
 
 - **Timestamp**: 2026-06-25
