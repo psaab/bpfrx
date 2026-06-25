@@ -361,8 +361,12 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
 ) {
     let now_secs = now_ns / 1_000_000_000;
 
-    sessions.iter_with_idle(now_ns, |key, _decision, metadata, idle_ns| {
+    sessions.iter_with_idle_and_counters(now_ns, |key, metadata, idle_ns, counters| {
         // Only refresh forward entries — reverse entries mirror the forward.
+        // #2501: the forward SessionEntry carries BOTH directions' counters
+        // (the reverse entry shares them via the canonical forward key the
+        // hot path accounts under), so the forward-only mirror surfaces the
+        // full fwd+rev volume.
         if metadata.is_reverse {
             return;
         }
@@ -388,6 +392,12 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
                     // Compute last_seen from session's actual idle, not now.
                     let actual_last_seen = now_secs.saturating_sub(idle_ns / 1_000_000_000);
                     value.last_seen = actual_last_seen;
+                    // #2501: surface live per-session volume so `show security
+                    // flow session` reports real byte/packet counts.
+                    value.fwd_packets = counters.fwd_packets;
+                    value.fwd_bytes = counters.fwd_bytes;
+                    value.rev_packets = counters.rev_packets;
+                    value.rev_bytes = counters.rev_bytes;
                     let _ = unsafe {
                         libbpf_sys::bpf_map_update_elem(
                             conntrack_v4_fd,
@@ -418,6 +428,11 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
                 if rc == 0 {
                     let actual_last_seen = now_secs.saturating_sub(idle_ns / 1_000_000_000);
                     value.last_seen = actual_last_seen;
+                    // #2501: surface live per-session volume (see v4 arm).
+                    value.fwd_packets = counters.fwd_packets;
+                    value.fwd_bytes = counters.fwd_bytes;
+                    value.rev_packets = counters.rev_packets;
+                    value.rev_bytes = counters.rev_bytes;
                     let _ = unsafe {
                         libbpf_sys::bpf_map_update_elem(
                             conntrack_v6_fd,

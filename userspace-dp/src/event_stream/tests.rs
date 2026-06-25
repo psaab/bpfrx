@@ -56,7 +56,8 @@ fn test_close_delta(kind: crate::session::SessionDeltaKind) -> crate::session::S
     use crate::afxdp::{ForwardingDisposition, ForwardingResolution};
     use crate::nat::NatDecision;
     use crate::session::{
-        SessionDecision, SessionDelta, SessionKey, SessionMetadata, SessionOrigin,
+        SessionCounters, SessionDecision, SessionDelta, SessionKey, SessionMetadata,
+        SessionOrigin,
     };
     SessionDelta {
         kind,
@@ -103,6 +104,7 @@ fn test_close_delta(kind: crate::session::SessionDeltaKind) -> crate::session::S
         fabric_redirect_sync: false,
         created_ns: 0,
         last_seen_ns: 0,
+        counters: SessionCounters::default(),
     }
 }
 

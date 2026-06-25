@@ -15740,3 +15740,29 @@ top.
   userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
   userspace-dp/src/afxdp/umem/tests.rs,
   userspace-dp/src/filter/tests.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2501 — add per-session byte/packet accounting on the AF_XDP
+  forwarding hot path (worker-owned plain-u64 SessionCounters: fwd/rev
+  packets+bytes; account_packet on flow-cache hit + slow-path forward-build,
+  direction derived from the resolved entry, both directions folded onto the
+  canonical forward entry). Surfaced with NO new wire field: counters mirrored
+  into the BPF conntrack map by refresh_bpf_conntrack_last_seen (~1s, for `show
+  security flow session`) and harvested onto the close SessionDelta → written
+  into the SESSION_CLOSE RT_FLOW frame's already-reserved
+  [56:64]/[64:72]/[112:120]/[120:128] slots (NetFlow/IPFIX volume). Updated
+  Go flow.go doc + session README. Fail-on-revert tests added + proven RED.
+  **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/entry.rs, userspace-dp/src/session/install.rs,
+  userspace-dp/src/session/expire.rs, userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/ha.rs,
+  userspace-dp/src/afxdp/bpf_map/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/codec_tests.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  pkg/dataplane/userspace/flow.go, _Log.md

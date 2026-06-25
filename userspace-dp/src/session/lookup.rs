@@ -251,4 +251,24 @@ impl SessionTable {
             }
         }
     }
+
+    /// #2501: iterate sessions with idle time AND the per-direction
+    /// byte/packet counters. Used by the BPF-conntrack-map refresh
+    /// (`refresh_bpf_conntrack_last_seen`) so `show security flow session`
+    /// surfaces live volume on the ~1s GC cadence. Cold path: a `Copy` of
+    /// the four-`u64` snapshot per session in addition to the existing
+    /// idle-time walk.
+    pub fn iter_with_idle_and_counters(
+        &self,
+        now_ns: u64,
+        mut f: impl FnMut(&SessionKey, &SessionMetadata, u64, SessionCounters),
+    ) {
+        for (key, handle) in &self.key_to_handle {
+            if let Some(record) = self.entries.get(*handle as usize) {
+                let entry = &record.entry;
+                let idle_ns = now_ns.saturating_sub(entry.last_seen_ns);
+                f(key, &entry.metadata, idle_ns, entry.counters);
+            }
+        }
+    }
 }

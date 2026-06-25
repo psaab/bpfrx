@@ -1892,6 +1892,7 @@ fn reference_update_session(
             fabric_redirect_sync: false,
             created_ns,
             last_seen_ns: now_ns,
+            counters: SessionCounters::default(),
         });
     }
     true
@@ -4195,6 +4196,7 @@ fn open_delta(key: SessionKey) -> SessionDelta {
         fabric_redirect_sync: false,
         created_ns: 0,
         last_seen_ns: 0,
+        counters: SessionCounters::default(),
     }
 }
 
@@ -4510,4 +4512,109 @@ fn seeded_session_table_round_trips_lookup() {
         table.lookup(&other, now, 0x10).is_none(),
         "a non-inserted key must miss under the seeded index"
     );
+}
+
+// ── #2501: per-session byte/packet accounting ───────────────────────────
+
+/// A reverse SessionMetadata mirrors `metadata()` with `is_reverse: true`.
+fn metadata_reverse() -> SessionMetadata {
+    SessionMetadata {
+        is_reverse: true,
+        ..metadata()
+    }
+}
+
+#[test]
+fn account_packet_forward_increments_fwd_counters() {
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let now = 1_000_000_000u64;
+    assert!(table.install_with_protocol(key.clone(), decision(), metadata(), now, PROTO_TCP, 0x10));
+
+    table.account_packet(&key, 100);
+    table.account_packet(&key, 250);
+
+    let c = table.session_counters(&key).expect("forward entry exists");
+    // FAIL-ON-REVERT: revert the hot-path increment and these go to 0.
+    assert_eq!(c.fwd_packets, 2);
+    assert_eq!(c.fwd_bytes, 350);
+    assert_eq!(c.rev_packets, 0);
+    assert_eq!(c.rev_bytes, 0);
+}
+
+#[test]
+fn account_packet_reverse_folds_onto_forward_entry() {
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let fwd = key_v4();
+    // No-NAT reverse wire key is the src/dst-swapped forward tuple — exactly
+    // what `reverse_session_key(fwd, default_nat)` recovers.
+    let rev = reverse_session_key(&fwd, NatDecision::default());
+
+    // Install BOTH halves: forward (is_reverse=false) keyed by `fwd`, and the
+    // reverse companion (is_reverse=true) keyed by `rev`. This mirrors the
+    // poll_descriptor forward+reverse install pair.
+    assert!(table.install_with_protocol(fwd.clone(), decision(), metadata(), now, PROTO_TCP, 0x10));
+    assert!(table.install_with_protocol(
+        rev.clone(),
+        decision(),
+        metadata_reverse(),
+        now,
+        PROTO_TCP,
+        0x10,
+    ));
+
+    // A forward packet (keyed by the forward tuple) and a reverse packet
+    // (keyed by the reply tuple).
+    table.account_packet(&fwd, 1000);
+    table.account_packet(&rev, 40);
+    table.account_packet(&rev, 60);
+
+    // Both directions must land on the canonical FORWARD entry so the
+    // forward-only BPF mirror / close harvest sees the complete picture.
+    let c = table.session_counters(&fwd).expect("forward entry exists");
+    assert_eq!(c.fwd_packets, 1, "forward packet counted once");
+    assert_eq!(c.fwd_bytes, 1000);
+    // FAIL-ON-REVERT: drop the reverse→forward fold and rev_* stays 0 on the
+    // forward entry (the reverse volume would be lost by the forward-only
+    // conntrack mirror).
+    assert_eq!(c.rev_packets, 2, "two reverse packets folded onto fwd entry");
+    assert_eq!(c.rev_bytes, 100);
+}
+
+#[test]
+fn account_packet_miss_is_noop() {
+    let mut table = SessionTable::new();
+    // No session installed — accounting an unknown key must not panic or
+    // create state.
+    table.account_packet(&key_v4(), 9999);
+    assert!(table.session_counters(&key_v4()).is_none());
+}
+
+#[test]
+fn close_delta_carries_harvested_counters() {
+    let mut table = SessionTable::new();
+    let then = 1_000_000_000u64;
+    let key = key_v4();
+    assert!(table.install_with_protocol(key.clone(), decision(), metadata(), then, PROTO_TCP, 0x10));
+    // Drain the Open delta so the next drain only sees the Close.
+    let _ = table.drain_deltas(8);
+
+    table.account_packet(&key, 500);
+    table.account_packet(&key, 700);
+
+    // Force expiry.
+    table.last_gc_ns = then + 301_000_000_000;
+    let expired = table.expire_stale_entries(then + 302_000_000_000);
+    assert_eq!(expired.len(), 1);
+
+    let deltas = table.drain_deltas(8);
+    let close = deltas
+        .iter()
+        .find(|d| d.kind == SessionDeltaKind::Close)
+        .expect("a Close delta was produced");
+    // FAIL-ON-REVERT: stop harvesting `removed.counters` onto the Close delta
+    // and these revert to 0 — the SESSION_CLOSE RT_FLOW frame loses volume.
+    assert_eq!(close.counters.fwd_packets, 2);
+    assert_eq!(close.counters.fwd_bytes, 1200);
 }

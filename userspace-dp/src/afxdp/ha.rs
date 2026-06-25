@@ -510,6 +510,11 @@ impl super::Coordinator {
                         // so these are 0/unknown.
                         created_ns: 0,
                         last_seen_ns: 0,
+                        // #2501: the shared SyncedSessionEntry carries no
+                        // per-direction counters, and this purge uses
+                        // push_delta_lossless (not the RT_FLOW exporter), so
+                        // volume is 0/unknown here.
+                        counters: crate::session::SessionCounters::default(),
                     });
                 }
             }
@@ -599,6 +604,9 @@ impl super::Coordinator {
                 // no duration, so 0/unknown is correct here.
                 created_ns: 0,
                 last_seen_ns: 0,
+                // #2501: HA bulk-export Open delta; no volume yet (and the
+                // synced entry carries no per-direction counters).
+                counters: crate::session::SessionCounters::default(),
             });
         }
         drop(sessions);

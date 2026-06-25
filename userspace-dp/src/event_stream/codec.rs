@@ -485,6 +485,12 @@ impl EventFrame {
         close_unix_ns: u64,
         application_id: u16,
         ingress_ifindex: u32,
+        // #2501: per-direction byte/packet volume harvested from the
+        // closing session's worker-owned counters.
+        fwd_packets: u64,
+        fwd_bytes: u64,
+        rev_packets: u64,
+        rev_bytes: u64,
     ) -> Self {
         let mut buf = [0u8; 256];
         let base = FRAME_HEADER_SIZE;
@@ -518,7 +524,12 @@ impl EventFrame {
         // rendering as a value — both close formatters skip it.
         buf[base + 54] = 0;
         buf[base + 55] = wire_af;
-        // [56:64] session_packets, [64:72] session_bytes — 0 (#2501).
+        // [56:64] session_packets (forward), [64:72] session_bytes (forward)
+        // — #2501: real per-session forward volume harvested from the closing
+        // entry's worker-owned counters. LITTLE-endian to match the Go
+        // logging.DecodeRawEventRecord reads (data[56:64]/data[64:72]).
+        buf[base + 56..base + 64].copy_from_slice(&fwd_packets.to_le_bytes());
+        buf[base + 64..base + 72].copy_from_slice(&fwd_bytes.to_le_bytes());
         // [72:88] nat src ip, [88:104] nat dst ip.
         write_ip_opt_16(&mut buf, base + 72, nat_src_ip);
         write_ip_opt_16(&mut buf, base + 88, nat_dst_ip);
@@ -530,7 +541,11 @@ impl EventFrame {
         // binary.LittleEndian.Uint32 read). The exporters use this as the flow
         // StartTime; 0 means "unknown" and triggers the packet-count fallback.
         buf[base + 108..base + 112].copy_from_slice(&created_unix_secs.to_le_bytes());
-        // [112:120] rev packets, [120:128] rev bytes — 0 (#2501).
+        // [112:120] rev packets, [120:128] rev bytes — #2501: real per-session
+        // reverse (reply-direction) volume. LITTLE-endian to match the Go
+        // reads (data[112:120]/data[120:128]).
+        buf[base + 112..base + 120].copy_from_slice(&rev_packets.to_le_bytes());
+        buf[base + 120..base + 128].copy_from_slice(&rev_bytes.to_le_bytes());
         // [128:132] ingress ifindex — #2615: the closing binding's interface
         // (LITTLE-endian u32, decoded by the Go side as
         // `binary.LittleEndian.Uint32` -> resolved to the RT_FLOW
