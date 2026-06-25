@@ -362,12 +362,8 @@ func (m *Manager) ClearAllSessions() (int, int, error) {
 		if val.IsReverse == 0 &&
 			val.Flags&SessFlagSNAT != 0 &&
 			val.Flags&SessFlagStaticNAT == 0 {
-			snatDNATKeys = append(snatDNATKeys, DNATKey{
-				Protocol: key.Protocol,
-				DstIP:    val.NATSrcIP,
-				DstPort:  val.NATSrcPort,
-				FromZone: 0,
-			})
+			// Must match the write-side key encoding (#2406: host-order port).
+			snatDNATKeys = append(snatDNATKeys, dnatKeyForSessionV4(key, val))
 		}
 		return true
 	}); err != nil {
@@ -390,12 +386,8 @@ func (m *Manager) ClearAllSessions() (int, int, error) {
 		if val.IsReverse == 0 &&
 			val.Flags&SessFlagSNAT != 0 &&
 			val.Flags&SessFlagStaticNAT == 0 {
-			snatDNATKeysV6 = append(snatDNATKeysV6, DNATKeyV6{
-				Protocol: key.Protocol,
-				DstIP:    val.NATSrcIP,
-				DstPort:  val.NATSrcPort,
-				FromZone: 0,
-			})
+			// Must match the write-side key encoding (#2406: host-order port).
+			snatDNATKeysV6 = append(snatDNATKeysV6, dnatKeyForSessionV6(key, val))
 		}
 		return true
 	}); err != nil {

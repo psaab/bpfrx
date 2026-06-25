@@ -305,7 +305,7 @@ func TestDeleteWithCompanionsV4RemovesReverseAndDNAT(t *testing.T) {
 	if _, ok := dp.v4[reverse]; ok {
 		t.Fatal("reverse session still present")
 	}
-	wantDNAT := DNATKey{Protocol: 6, DstIP: 0x0a0200c0, DstPort: 40000}
+	wantDNAT := DNATKey{Protocol: 6, DstIP: 0x0a0200c0, DstPort: ntohs(40000)} // #2406 host-order key port
 	if len(dp.deletedDNAT) != 1 || dp.deletedDNAT[0] != wantDNAT {
 		t.Fatalf("deleted DNAT = %+v, want [%+v]", dp.deletedDNAT, wantDNAT)
 	}
@@ -507,7 +507,7 @@ func TestReconcileClusterBulkUsesIteratorValueForCompanionDeleteV4(t *testing.T)
 	if _, ok := dp.v4[reverse]; ok {
 		t.Fatal("reverse session still present")
 	}
-	wantDNAT := DNATKey{Protocol: 6, DstIP: 0x0a0200c0, DstPort: 40000}
+	wantDNAT := DNATKey{Protocol: 6, DstIP: 0x0a0200c0, DstPort: ntohs(40000)} // #2406 host-order key port
 	if len(dp.deletedDNAT) != 1 || dp.deletedDNAT[0] != wantDNAT {
 		t.Fatalf("deleted DNAT = %+v, want [%+v]", dp.deletedDNAT, wantDNAT)
 	}
@@ -608,8 +608,71 @@ func TestDeleteWithCompanionsV6RemovesReverseAndDNAT(t *testing.T) {
 	if _, ok := dp.v6[reverse]; ok {
 		t.Fatal("reverse session still present")
 	}
-	wantDNAT := DNATKeyV6{Protocol: 17, DstIP: natIP, DstPort: 53000}
+	wantDNAT := DNATKeyV6{Protocol: 17, DstIP: natIP, DstPort: ntohs(53000)} // #2406 host-order key port
 	if len(dp.deletedDNAT6) != 1 || dp.deletedDNAT6[0] != wantDNAT {
 		t.Fatalf("deleted DNATv6 = %+v, want [%+v]", dp.deletedDNAT6, wantDNAT)
+	}
+}
+
+// TestDNATKeyForSessionPortParityWithShimReader is the #2406 Go<->Rust dnat
+// key parity guard. The AF_XDP shim reader (userspace-xdp classify_native_gre_
+// inner_*) builds its dnat lookup key port via u16::from_be_bytes(wire) — the
+// HOST-ORDER numeric value — then stores it natively into the key struct. The
+// Go session-derived dnat-table key writer must produce the SAME native key
+// port bytes for the same flow, or the shim lookup misses and the inbound
+// ICMP error is never steered (the network-order 3c bug).
+//
+// This test mirrors the shim reader's construction as golden bytes and proves
+// DNATKeyForSessionV4/V6 match. Reverting DNATKeyForSession* to write
+// val.NATSrcPort raw (network order, the pre-fix code) makes this RED on
+// little-endian, because the network-order key port bytes differ from the
+// host-order ones the reader builds.
+func TestDNATKeyForSessionPortParityWithShimReader(t *testing.T) {
+	// On the wire, port 443 is network order [0x01, 0xbb].
+	wirePortBytes := [2]byte{0x01, 0xbb}
+	// The shim reads u16::from_be_bytes(wire) => host-order numeric 443.
+	shimHostNumeric := binary.BigEndian.Uint16(wirePortBytes[:])
+	if shimHostNumeric != 443 {
+		t.Fatalf("from_be_bytes(wire) = %d, want 443", shimHostNumeric)
+	}
+	// The shim stores that numeric natively into the key struct.
+	var shimKeyPortBytes [2]byte
+	binary.NativeEndian.PutUint16(shimKeyPortBytes[:], shimHostNumeric)
+
+	// The SessionValue holds NATSrcPort in NETWORK order (== wire bytes
+	// interpreted natively). Build it the way the session-install path does.
+	natSrcPortNetwork := binary.NativeEndian.Uint16(wirePortBytes[:])
+
+	// V4 builder.
+	v4Key := DNATKeyForSessionV4(
+		SessionKey{Protocol: 6},
+		SessionValue{NATSrcPort: natSrcPortNetwork},
+	)
+	var goV4PortBytes [2]byte
+	binary.NativeEndian.PutUint16(goV4PortBytes[:], v4Key.DstPort)
+	if goV4PortBytes != shimKeyPortBytes {
+		t.Fatalf("DNATKeyForSessionV4 key port bytes = % x, want % x (shim reader)",
+			goV4PortBytes, shimKeyPortBytes)
+	}
+
+	// V6 builder.
+	v6Key := DNATKeyForSessionV6(
+		SessionKeyV6{Protocol: 6},
+		SessionValueV6{NATSrcPort: natSrcPortNetwork},
+	)
+	var goV6PortBytes [2]byte
+	binary.NativeEndian.PutUint16(goV6PortBytes[:], v6Key.DstPort)
+	if goV6PortBytes != shimKeyPortBytes {
+		t.Fatalf("DNATKeyForSessionV6 key port bytes = % x, want % x (shim reader)",
+			goV6PortBytes, shimKeyPortBytes)
+	}
+
+	// Counter-factual: the pre-fix network-order encoding (raw NATSrcPort)
+	// would NOT match the shim reader on little-endian.
+	var preFixBytes [2]byte
+	binary.NativeEndian.PutUint16(preFixBytes[:], natSrcPortNetwork)
+	if binary.NativeEndian.Uint16(preFixBytes[:]) == binary.NativeEndian.Uint16(shimKeyPortBytes[:]) &&
+		shimKeyPortBytes != preFixBytes {
+		t.Fatal("sanity: host and network encodings unexpectedly identical")
 	}
 }

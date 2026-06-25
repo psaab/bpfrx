@@ -8486,18 +8486,61 @@ fn dnat_v6_entry_bytes_matches_struct_layout() {
     let orig: Ipv6Addr = "2001:559:8585:61::100".parse().unwrap();
     let (dk, dv) = dnat_v6_entry_bytes(PROTO_TCP, snat, 54321, orig, 12345);
 
-    // struct dnat_key_v6 (24B): protocol, 3B pad, 16B dst_ip, BE dst_port, from_zone.
+    // struct dnat_key_v6 (24B): protocol, 3B pad, 16B dst_ip, dst_port, from_zone.
     assert_eq!(dk[0], PROTO_TCP, "key protocol");
     assert_eq!(&dk[1..4], &[0u8; 3], "key pad must be zero");
     assert_eq!(&dk[4..20], &snat.octets(), "key dst_ip = SNAT address");
-    assert_eq!(&dk[20..22], &54321u16.to_be_bytes(), "key dst_port = SNAT port (BE)");
+    // #2406 FAIL-ON-REVERT: the KEY port is HOST-ORDER numeric serialized
+    // natively (to_ne_bytes), matching the AF_XDP shim reader. The pre-fix
+    // code wrote to_be_bytes (network order); on little-endian x86 those byte
+    // arrays differ ([0x31,0xd4] host vs [0xd4,0x31] network for 54321), so
+    // reverting dnat_v6_entry_bytes to to_be_bytes makes this assertion RED.
+    assert_eq!(
+        &dk[20..22],
+        &54321u16.to_ne_bytes(),
+        "key dst_port = SNAT port HOST-ORDER (native) to match shim from_be_bytes reader"
+    );
     assert_eq!(&dk[22..24], &[0u8; 2], "key from_zone = 0");
 
-    // struct dnat_value_v6 (20B): 16B new_dst_ip, BE new_dst_port, flags, pad.
+    // struct dnat_value_v6 (20B): 16B new_dst_ip, new_dst_port, flags, pad.
+    // VALUE is never read by the shim; encoding is inert (kept network-order).
     assert_eq!(&dv[0..16], &orig.octets(), "value new_dst_ip = original source");
-    assert_eq!(&dv[16..18], &12345u16.to_be_bytes(), "value new_dst_port = orig source port (BE)");
+    assert_eq!(&dv[16..18], &12345u16.to_be_bytes(), "value new_dst_port (inert)");
     assert_eq!(dv[18], 0, "value flags = 0 (dynamic SNAT-return)");
     assert_eq!(dv[19], 0, "value pad = 0");
+}
+
+// #2406 Go<->Rust dnat-key PARITY: the bytes the Rust publisher writes for
+// the dnat_table_v6 KEY (port field) must EXACTLY equal what the AF_XDP shim
+// reader builds for the same (proto, snat_ip, snat_port) tuple. The shim
+// reader builds its key port via u16::from_be_bytes(wire) (host-order
+// numeric) and stores it natively. The Go publisher (DNATKeyForSessionV6 /
+// dnat_v6_entry_bytes here) must produce the SAME native bytes. This is the
+// regression guard that would have caught the 3c network-order bug: the only
+// correct encoding for a host-order numeric port P, stored natively, is
+// P.to_ne_bytes(). Mirror the shim's reader construction here as golden bytes.
+#[test]
+fn dnat_v6_key_port_parity_with_shim_reader() {
+    // Wire bytes for port 443 on the packet: network order [0x01, 0xbb].
+    // The shim reads them as u16::from_be_bytes([0x01,0xbb]) = 443 (host),
+    // then stores the key struct natively => key port bytes = 443.to_ne_bytes().
+    let wire_port_bytes = [0x01u8, 0xbb]; // network-order 443 on the wire
+    let shim_host_numeric = u16::from_be_bytes(wire_port_bytes); // == 443
+    let shim_key_port_bytes = shim_host_numeric.to_ne_bytes(); // native store
+
+    // The publisher is handed snat_port as a HOST-ORDER numeric (443).
+    let snat: Ipv6Addr = "2001:559:8585:80::8".parse().unwrap();
+    let orig: Ipv6Addr = "2001:559:8585:61::100".parse().unwrap();
+    let (dk, _dv) = dnat_v6_entry_bytes(PROTO_TCP, snat, 443, orig, 12345);
+
+    assert_eq!(
+        &dk[20..22],
+        &shim_key_port_bytes,
+        "Rust dnat_table_v6 KEY port bytes must equal the shim reader's key port bytes for port 443"
+    );
+    // Numeric sanity: 443 host-order on LE x86 is [0xbb,0x01]; the OLD network
+    // encoding (to_be_bytes) would be [0x01,0xbb] and FAIL this parity check.
+    assert_eq!(shim_host_numeric, 443, "from_be_bytes of network wire yields host numeric");
 }
 
 #[test]

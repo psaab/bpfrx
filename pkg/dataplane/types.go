@@ -559,11 +559,20 @@ const (
 )
 
 // DNATKey mirrors the C struct dnat_key.
+//
+// #2406 BYTE-ORDER: DstPort is HOST-ORDER numeric (NOT network order). The
+// AF_XDP shim is the only reader of this BPF map key; it builds its lookup
+// key port via u16::from_be_bytes(wire) — the host-order numeric value — and
+// stores it natively, identical to the proven session_map_key. Writers MUST
+// match: session-derived keys go through DNATKeyForSessionV4 (ntohs of the
+// network-order SessionValue.NATSrcPort); static-DNAT config writes the
+// already-host-order port raw (no htons). DstIP stays in network byte order
+// (the shim reads it with from_ne_bytes against octets() on both sides).
 type DNATKey struct {
 	Protocol uint8
 	Pad      [3]byte
 	DstIP    uint32 // network byte order
-	DstPort  uint16 // network byte order
+	DstPort  uint16 // host byte order (#2406 — matches shim from_be_bytes reader)
 	FromZone uint16 // 0 = wildcard / dynamic SNAT-return entry
 }
 
@@ -576,11 +585,12 @@ type DNATValue struct {
 }
 
 // DNATKeyV6 mirrors the C struct dnat_key_v6.
+// DstPort is HOST-ORDER numeric (see DNATKey doc, #2406).
 type DNATKeyV6 struct {
 	Protocol uint8
 	Pad      [3]byte
 	DstIP    [16]byte
-	DstPort  uint16 // network byte order
+	DstPort  uint16 // host byte order (#2406 — matches shim from_be_bytes reader)
 	FromZone uint16 // 0 = wildcard / dynamic SNAT-return entry
 }
 

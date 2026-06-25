@@ -214,11 +214,9 @@ func (c *CLI) clearFilteredSessions(f sessionFilter) error {
 		}
 		if val.Flags&dataplane.SessFlagSNAT != 0 &&
 			val.Flags&dataplane.SessFlagStaticNAT == 0 {
-			snatDNATKeys = append(snatDNATKeys, dataplane.DNATKey{
-				Protocol: key.Protocol,
-				DstIP:    val.NATSrcIP,
-				DstPort:  val.NATSrcPort,
-			})
+			// Companion dnat_table key must match the write-side encoding
+			// (#2406: host-order port) or the delete silently misses.
+			snatDNATKeys = append(snatDNATKeys, dataplane.DNATKeyForSessionV4(key, val))
 		}
 		return true
 	}))
@@ -255,11 +253,9 @@ func (c *CLI) clearFilteredSessions(f sessionFilter) error {
 		}
 		if val.Flags&dataplane.SessFlagSNAT != 0 &&
 			val.Flags&dataplane.SessFlagStaticNAT == 0 {
-			snatDNATKeysV6 = append(snatDNATKeysV6, dataplane.DNATKeyV6{
-				Protocol: key.Protocol,
-				DstIP:    val.NATSrcIP,
-				DstPort:  val.NATSrcPort,
-			})
+			// Companion dnat_table_v6 key must match the write-side encoding
+			// (#2406: host-order port) or the delete silently misses.
+			snatDNATKeysV6 = append(snatDNATKeysV6, dataplane.DNATKeyForSessionV6(key, val))
 		}
 		return true
 	}))

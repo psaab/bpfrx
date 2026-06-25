@@ -137,20 +137,42 @@ func ignoreSessionNotFound(err error) error {
 	return err
 }
 
-func dnatKeyForSessionV4(key SessionKey, val SessionValue) DNATKey {
+// DNATKeyForSessionV4 builds the reverse-SNAT dnat_table KEY for a forward
+// SNAT'd session. It is the single source of truth for the session-derived
+// dnat-table key encoding — every writer AND every companion-delete site (in
+// this package and in pkg/grpcapi, pkg/cli) MUST route through it so a delete
+// finds what an install wrote.
+//
+// The KEY port MUST be host-order numeric to match the AF_XDP shim reader,
+// which builds its dnat lookup key port from u16::from_be_bytes(wire)
+// (host-order numeric) and stores it natively. val.NATSrcPort is stored
+// network-order in the SessionValue, so convert it with ntohs (#2406). The
+// value side of the dnat_table is never read by the shim (steering uses
+// .is_some() only); the reverse-NAT rewrite detail lives in the helper's
+// in-memory session state, not this entry.
+func DNATKeyForSessionV4(key SessionKey, val SessionValue) DNATKey {
 	return DNATKey{
 		Protocol: key.Protocol,
 		DstIP:    val.NATSrcIP,
-		DstPort:  val.NATSrcPort,
+		DstPort:  ntohs(val.NATSrcPort),
 	}
 }
 
-func dnatKeyForSessionV6(key SessionKeyV6, val SessionValueV6) DNATKeyV6 {
+// DNATKeyForSessionV6 is the IPv6 sibling of DNATKeyForSessionV4 (#2406).
+func DNATKeyForSessionV6(key SessionKeyV6, val SessionValueV6) DNATKeyV6 {
 	return DNATKeyV6{
 		Protocol: key.Protocol,
 		DstIP:    val.NATSrcIP,
-		DstPort:  val.NATSrcPort,
+		DstPort:  ntohs(val.NATSrcPort),
 	}
+}
+
+func dnatKeyForSessionV4(key SessionKey, val SessionValue) DNATKey {
+	return DNATKeyForSessionV4(key, val)
+}
+
+func dnatKeyForSessionV6(key SessionKeyV6, val SessionValueV6) DNATKeyV6 {
+	return DNATKeyForSessionV6(key, val)
 }
 
 func (s dataPlaneSessionStore) snapshotV4(key SessionKey) (sessionSnapshotV4, error) {
@@ -248,11 +270,7 @@ func (s dataPlaneSessionStore) PutClusterSyncedV4(key SessionKey, val SessionVal
 		written = append(written, reverseSnap)
 	}
 	if val.IsReverse == 0 && val.Flags&SessFlagSNAT != 0 && val.Flags&SessFlagStaticNAT == 0 {
-		if err := s.dp.SetDNATEntry(DNATKey{
-			Protocol: key.Protocol,
-			DstIP:    val.NATSrcIP,
-			DstPort:  val.NATSrcPort,
-		}, DNATValue{
+		if err := s.dp.SetDNATEntry(dnatKeyForSessionV4(key, val), DNATValue{
 			NewDstIP:   binary.NativeEndian.Uint32(key.SrcIP[:]),
 			NewDstPort: key.SrcPort,
 		}); err != nil {
@@ -307,11 +325,7 @@ func (s dataPlaneSessionStore) PutClusterSyncedV6(key SessionKeyV6, val SessionV
 		written = append(written, reverseSnap)
 	}
 	if val.IsReverse == 0 && val.Flags&SessFlagSNAT != 0 && val.Flags&SessFlagStaticNAT == 0 {
-		if err := s.dp.SetDNATEntryV6(DNATKeyV6{
-			Protocol: key.Protocol,
-			DstIP:    val.NATSrcIP,
-			DstPort:  val.NATSrcPort,
-		}, DNATValueV6{
+		if err := s.dp.SetDNATEntryV6(dnatKeyForSessionV6(key, val), DNATValueV6{
 			NewDstIP:   key.SrcIP,
 			NewDstPort: key.SrcPort,
 		}); err != nil {

@@ -17,6 +17,19 @@ func htons(v uint16) uint16 {
 	return binary.NativeEndian.Uint16(b[:])
 }
 
+// ntohs converts a uint16 from network to host byte order. It is the inverse
+// of htons; for a u16 the operation is symmetric (byte swap on little-endian,
+// identity on big-endian). Used to convert a network-order port stored in a
+// SessionKey/SessionValue (e.g. NATSrcPort) into the host-order numeric value
+// the BPF dnat_table KEY requires — the AF_XDP shim builds its dnat lookup key
+// port from u16::from_be_bytes(wire) (host-order numeric) and stores it
+// natively, so the dnat-table key port writers must match (#2406).
+func ntohs(v uint16) uint16 {
+	var b [2]byte
+	binary.NativeEndian.PutUint16(b[:], v)
+	return binary.BigEndian.Uint16(b[:])
+}
+
 // ipToUint32BE converts a net.IP to a uint32 matching the in-memory layout
 // that BPF programs use when copying __be32 fields (e.g. iph->daddr).
 // The IP address bytes are stored as-is; on little-endian hosts this means
