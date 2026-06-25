@@ -15648,3 +15648,30 @@ top.
   userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
   userspace-dp/src/afxdp/coordinator/mod.rs,
   userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2573 — cached TX-selection records ALL matched `then count`
+  terms, not just the last. #2544 fall-through lets one packet match
+  multiple `then count` terms; the cached flow-replay descriptor held a
+  single counter `Arc` so only the LAST term incremented on a cache hit
+  (the uncached full-eval path counted each). Added `CachedFilterCounters`
+  (`SmallVec<[Arc<FilterTermCounter>; 2]>`, dedup by `Arc::ptr_eq`, built
+  once at flow-cache install, read-only `for_each` on the per-packet replay
+  → no heap alloc for the common single/dual case). Replaced the single
+  `counter` slot on `CachedTxSelectionFilterResult` and `filter_counter` on
+  `CachedTxSelectionDescriptor`; `merge_matched_cached_modifiers` now
+  `push`es every matched count term; the flow-cache hit path iterates and
+  records all. Fail-on-revert test
+  `cached_tx_selection_records_all_fallthrough_count_terms` (two
+  fall-through count terms + terminal accept) asserts both term counters
+  increment on the cached replay; reverting to last-only leaves term[0] at
+  0 → RED.
+  **File(s)**: userspace-dp/src/filter/mod.rs,
+  userspace-dp/src/filter/engine/cache_sensitive.rs,
+  userspace-dp/src/filter/README.md,
+  userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/tx/cos_classify.rs,
+  userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/umem/tests.rs,
+  userspace-dp/src/filter/tests.rs, _Log.md
