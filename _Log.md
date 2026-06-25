@@ -18363,3 +18363,21 @@ top.
   line turns the test RED. Updated pkg/frr/README.md policy_render.go row.
 - **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
   pkg/frr/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #3012 dhcp-relay read-buffer sizing — both the client-facing
+  (runRelay) and server-facing (handleServerResponses) UDP reads used a fixed
+  make([]byte, 1500). net.PacketConn.ReadFrom (UDP) MSG_TRUNCs a datagram to
+  len(buf), so a >1500-byte DHCP datagram (large option sets / jumbo-MTU links)
+  had its trailing option block truncated, dhcpv4.FromBytes failed, and the
+  packet was silently dropped. Added a named const readBufSize = 65535 (UDP/IP
+  maximum) and pointed both read sites at it. Added fail-on-revert test
+  TestRunRelay_RelaysOversizeDatagram: builds a 1858-byte BOOTREQUEST (large
+  vendor-specific option), drives it through the live runRelay loop, asserts it
+  is relayed to the server conn, parses, and the large option survives intact.
+  fakeConn.ReadFrom uses copy(p,d) which mirrors MSG_TRUNC, so reverting
+  readBufSize to 1500 makes the test RED (verified: drop, "not relayed within
+  2s"). Gates: go build ./... OK, gofmt clean, go vet ./pkg/dhcprelay/... OK,
+  go test ./pkg/dhcprelay/... ok.
+- **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/dhcprelay/README.md, _Log.md

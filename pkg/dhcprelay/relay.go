@@ -28,6 +28,20 @@ const relayPort = 67
 // clientPort is the standard DHCP client port.
 const clientPort = 68
 
+// readBufSize is the size of the per-loop read buffer for both the
+// client-facing and server-facing UDP sockets.
+//
+// net.PacketConn.ReadFrom (UDP) copies only the first len(buf) bytes of a
+// datagram and silently discards the remainder (MSG_TRUNC). A truncated DHCP
+// datagram corrupts the trailing option block, so dhcpv4.FromBytes fails and
+// the packet is dropped. DHCP itself imposes no 1500-byte limit — the Maximum
+// DHCP Message Size option is a uint16, and a UDP datagram can carry up to
+// 65535 bytes. A datagram can therefore legitimately exceed 1500 bytes (large
+// option sets — classless static routes, many search domains, Option 82,
+// vendor/PXE options — or jumbo-MTU links). Size the buffer to the UDP/IP
+// maximum so the buffer is never the truncation point (#3012).
+const readBufSize = 65535
+
 // messageTypeForceRenew is the DHCPFORCERENEW message type (RFC 3203, §3.1).
 // The insomniacslk/dhcp library only enumerates message types 1-8, so the
 // type-9 value is defined locally. A server sends FORCERENEW to a client that
@@ -957,7 +971,7 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	// defer cancel() would run only after wg.Wait() and hang (Codex r3 BLOCKER).
 	func() {
 		defer cancel()
-		buf := make([]byte, 1500)
+		buf := make([]byte, readBufSize)
 		for {
 			n, srcAddr, err := conn.ReadFrom(buf)
 			if err != nil {
@@ -1102,7 +1116,7 @@ func (m *Manager) resolveGIAddrWithRetry(ctx context.Context, ifaceName string) 
 func handleServerResponses(ctx context.Context, serverConn, clientConn net.PacketConn,
 	ir *interfaceRelay, l2 l2Replier, srcIP net.IP) {
 	ifaceName := ir.ifaceName
-	buf := make([]byte, 1500)
+	buf := make([]byte, readBufSize)
 	for {
 		n, srcAddr, err := serverConn.ReadFrom(buf)
 		if err != nil {
