@@ -671,10 +671,24 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			// neighbor import/export inclusion is #2490 (symmetric to the
 			// global-default inclusion #2473 added).
 			hasOwnPolicy := bgpEffectiveExport(n, "") != "" || bgpEffectiveImport(n, "") != ""
-			if n.FamilyInet || ((globalExport != "" || globalImport != "" || hasOwnPolicy) && !n.FamilyInet6) {
+			// The "default-activate a family-less policied neighbor under
+			// ipv4 unicast" fall-through (#2473/#2490) is correct ONLY for
+			// an IPv4 peer address. An IPv6 peer (e.g. 2001:db8::1) with a
+			// policy but no explicit `family inet6` also satisfies
+			// !n.FamilyInet6, so the pre-#2941 code activated it under
+			// `address-family ipv4 unicast` — the WRONG family. FRR cannot
+			// resolve an IPv4 next-hop over an IPv6 peer (no RFC 8950
+			// extended-next-hop) so the session drops prefixes / fails, and
+			// the neighbor never participates in ipv6 unicast. Gate the
+			// ipv4 fall-through on the peer address family, and route an
+			// IPv6-address family-less-but-policied neighbor into the ipv6
+			// set instead so it activates under ipv6 unicast (#2941).
+			isIPv6Peer := strings.Contains(n.Address, ":")
+			policyDefault := globalExport != "" || globalImport != "" || hasOwnPolicy
+			if (n.FamilyInet || (policyDefault && !n.FamilyInet6)) && !isIPv6Peer {
 				inet4Neighbors = append(inet4Neighbors, n)
 			}
-			if n.FamilyInet6 {
+			if n.FamilyInet6 || (policyDefault && !n.FamilyInet && isIPv6Peer) {
 				inet6Neighbors = append(inet6Neighbors, n)
 			}
 		}
