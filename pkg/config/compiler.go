@@ -1398,6 +1398,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #2416: NAT `match source-address-name <book-entry>` cross-reference. A
+	// source / destination NAT rule naming an address-book entry not defined
+	// under `security address-book` compiled cleanly; the snapshot builder
+	// resolves the name to no prefixes and (per the fail-closed backstop) the
+	// rule matches NOTHING. That is safe but silent — the operator's intended
+	// source scoping is gone with no signal. Strict on commit / commit-check
+	// (hard reject so the typo is operator-visible); lenient on load / peer-sync
+	// (warn so an already-persisted or peer-synced config still boots — #1960;
+	// the dataplane then fails closed for the unresolved reference). Mirrors the
+	// firewall prefix-list gate above.
+	if err := validateNATSourceAddressNameReferencesStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("NAT source-address-name reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2217 Finding C: firewall-filter `then routing-instance <name>` (FBF)
 	// cross-reference. A term naming a routing-instance not defined under
 	// `routing-instances` compiled cleanly and the dataplane steered matched

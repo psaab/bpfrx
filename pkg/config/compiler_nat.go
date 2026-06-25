@@ -993,6 +993,10 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 						if len(rule.Match.SourceAddresses) > 0 {
 							rule.Match.SourceAddress = rule.Match.SourceAddresses[0]
 						}
+					case "source-address-name":
+						// #2416: address-book reference; resolved to prefixes at
+						// snapshot-build time (appendNATSourceAddressName).
+						rule.Match.SourceAddressName = nodeVal(m)
 					case "destination-address":
 						// Support bracket lists: destination-address [ addr1 addr2 ... ]
 						if len(m.Keys) >= 2 {
