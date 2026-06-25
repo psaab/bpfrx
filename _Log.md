@@ -1,3 +1,34 @@
+## 2026-06-25 — #2918: neighbor initial dump consumed and dropped seq-0 multicast RTM_NEWNEIGH/DELNEIGH events
+
+- **Timestamp**: 2026-06-25
+- **Action**: `initial_neighbor_dump` runs on a netlink fd already joined
+  to `RTMGRP_NEIGH` (the same fd backs the steady-state monitor). Its read
+  loop skipped every message whose `nlmsg_seq != next_seq`. Async multicast
+  `RTM_NEWNEIGH`/`RTM_DELNEIGH` notifications carry `nlmsg_seq == 0`, so one
+  interleaved during the dump was consumed off the socket and dropped
+  (seq 0 != next_seq) — never redelivered, leaving the dynamic neighbor map
+  stale until an unrelated later event or re-dump (#2918, codex-review-054
+  054-04). Startup + HA failover are peak neighbor-churn, so a lost event
+  could cause a first-packet blackhole. Fix: extracted the per-recv-batch
+  parse into a pure `process_dump_batch` helper that, on an off-sequence
+  message, routes a seq-0 type-28/29 event through the same
+  `parse_neighbor_msg` path the steady-state monitor uses (absorb instead of
+  discard); all other off-seq control messages are still skipped, and the
+  dump's own `next_seq` still drives NLMSG_DONE/NLMSG_ERROR detection.
+- **File(s)**: userspace-dp/src/afxdp/neighbor.rs (process_dump_batch +
+  DumpBatchOutcome, initial_neighbor_dump rewired through it, doc-comment
+  records the #2918 rationale + seq-matching contract; dump_batch_tests
+  module with the fail-on-revert + completion-keying guards), _Log.md.
+  No separate operator/state doc edit: the neighbor module has no doc
+  describing the dump loop's seq-matching — the contract lives in the
+  `process_dump_batch` doc-comment, which now records it.
+- **Validation**: CARGO_TARGET_DIR=/tmp/cargo-2918 cargo build --release -p
+  xpf-userspace-dp OK; cargo test -p xpf-userspace-dp neighbor → 122 passed
+  / 0 failed (incl. the 2 new tests). FAIL-ON-REVERT proven: reverting
+  process_dump_batch to the bare `nlmsg_seq != next_seq { continue }` skip
+  turns dump_batch_absorbs_interleaved_seq0_multicast_newneigh RED with the
+  #2918 assertion message; restored + re-green.
+
 ## 2026-06-25 — #2876: HA demotion drain reports DrainComplete below the target fence
 
 - **Timestamp**: 2026-06-25
@@ -17519,6 +17550,10 @@ top.
   **File(s)**: pkg/ddns/backend_bind.go, pkg/ddns/backend_bind_test.go,
   pkg/ddns/README.md, _Log.md
 
+## #2892 — BGP policy `then as-path-prepend` (AS-path prepending)
+- **Timestamp**: 2026-06-25
+- **Action**: Implement Junos `then as-path-prepend "<asn> ..."` → FRR `set as-path prepend <asn> ...` end-to-end (schema typed leaf, typed struct field, compiler both AST paths, renderer). Add fail-on-revert render test + multi-ASN parse tests.
+- **File(s)**: pkg/config/types_routing.go (ASPathPrepend []string), pkg/config/schema_routing.go (then as-path-prepend multi:true leaf), pkg/config/compiler_routing.go (parsePolicyTermChildren + parsePolicyTermInlineKeys + policyTermInlineKeywords), pkg/frr/policy_render.go (set as-path prepend clause), pkg/frr/policy_as_path_prepend_2892_test.go (new), pkg/config/compiler_as_path_prepend_2892_test.go (new), pkg/frr/README.md, docs/config-schema.md, docs/feature-gaps.md
 - **Timestamp**: 2026-06-25 13:36
   **Action**: #2909 — pkg/routing xfrmi if_id collision guard. A bare
   secure-tunnel bind-interface (`st0`) and an explicit `st0.0` derive
@@ -17538,6 +17573,40 @@ top.
   **File(s)**: pkg/routing/xfrm.go, pkg/routing/iface_reuse_test.go,
   pkg/routing/README.md, _Log.md
 
+- **Timestamp**: 2026-06-25
+  **Action**: #2869 eventengine supersede() FIFO ordering fix. supersede()
+  rebuilt the bounded action queue by PREPENDING the new (superseding) action
+  ahead of drained other-policy survivors, converting the documented FIFO queue
+  into LIFO for the newest arrival and starving older queued remediations under
+  sustained event frequency. Fix: append the new action to the TAIL of the
+  survivors (`all := append(drained, a)`) so unrelated policies keep FIFO order;
+  supersede still drops/replaces only the stale same-policy entry. Added
+  fail-on-revert TestSupersede_PreservesFIFOPlacesNewAtTail (fills queue with
+  distinct other-policy actions + a stale same-policy entry, forces supersede,
+  asserts survivors keep order and the new action lands at the tail). Verified
+  RED under the reverted prepend (new action at index 0). Gates: go build ./...,
+  gofmt -l clean, go vet ./pkg/eventengine/..., go test -race
+  ./pkg/eventengine/... PASS.
+  **File(s)**: pkg/eventengine/engine.go,
+  pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2869 review fix — supersede() metrics double-count. In the
+  all-distinct-overflow case (queue full of distinct policies, a new distinct
+  policy arrives, no same-policy stale to evict) the FIFO tail-placement change
+  made the new action overflow supersede()'s refill default branch
+  (droppedQueueFull++) AND then enqueue() counted+warned again — net +2 on
+  xpf_event_actions_dropped_total{reason="queue_full"} for one dropped action.
+  Fix: guard the refill default increment with `if item.policyName !=
+  a.policyName` so supersede counts only un-replaceable SURVIVORS; the new
+  action's single count + warn is owned by enqueue (supersede returns false).
+  Added fail-on-revert TestSupersede_AllDistinctOverflowCountsDropOnce (fills 64
+  distinct, enqueues a 65th distinct, asserts droppedQueueFull delta == 1 and no
+  survivor evicted). Verified RED (delta=2) with the guard removed. Kept
+  TestSupersede_PreservesFIFOPlacesNewAtTail. Gates: go build ./..., gofmt -l
+  clean, go vet ./pkg/eventengine/..., go test -race ./pkg/eventengine/... PASS.
+  **File(s)**: pkg/eventengine/engine.go,
+  pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md, _Log.md
 ## 2026-06-25 — #2885 IPsec link-local IPv6 local-bind selection
 - **Timestamp**: 2026-06-25
 - **Action**: Fixed `matchFamily` (pkg/ipsec/policy.go) rejecting IPv6
