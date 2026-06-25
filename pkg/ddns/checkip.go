@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -40,6 +41,16 @@ var ipAddrRe = regexp.MustCompile(
 func CheckIP(ctx context.Context, client *http.Client, urlStr string, wantV4 bool, allowlist []netip.Addr) (netip.Addr, bool) {
 	if client == nil {
 		client = newHTTPClient()
+	}
+	// Fail-closed on an obviously malformed checkip-url (#2773). http.NewRequest
+	// accepts ftp://, "not a url", and http:// (no host), so without this gate a
+	// bad URL would fall through to a fetch failure and masquerade forever as a
+	// transient observation failure (ok=false), silently suppressing publishing.
+	// A malformed URL is a configuration error, not a transient — reject it here
+	// (the commit-time validateSurfaceADDNSWarnings warning is the operator-facing
+	// half; this is the runtime backstop for a URL that slipped past commit).
+	if err := validateCheckIPURL(urlStr); err != nil {
+		return netip.Addr{}, false
 	}
 	req, err := http.NewRequest(http.MethodGet, urlStr, nil)
 	if err != nil {
@@ -155,11 +166,22 @@ func ParseAllowlist(s string) []netip.Addr {
 // AddressSource values live in surface_a.go.
 const AddressSourceCheckIP AddressSource = "checkip"
 
-// checkIPAllowlistConfigError is returned for an obviously malformed checkip URL
-// at construction so the daemon can degrade the scope rather than spin on it.
+// validateCheckIPURL rejects an obviously malformed checkip URL so a typo is
+// caught at commit (validateSurfaceADDNSWarnings mirrors this) and fails closed
+// at runtime construction (CheckIP) rather than spinning forever as a phantom
+// "transient" observation failure (#2773). It requires an http(s) scheme AND a
+// host: http.NewRequest accepts ftp://, "not a url", and a host-less "http://",
+// none of which can ever fetch a public address.
 func validateCheckIPURL(u string) error {
 	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
 		return fmt.Errorf("ddns checkip: url %q must be http(s)", u)
+	}
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return fmt.Errorf("ddns checkip: url %q is not a valid URL: %w", u, err)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("ddns checkip: url %q has no host", u)
 	}
 	return nil
 }
