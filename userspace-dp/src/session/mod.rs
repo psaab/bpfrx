@@ -765,33 +765,33 @@ impl SessionTable {
     ///     recovers the forward entry's wire tuple → bump that forward
     ///     entry's `rev`.
     ///
-    /// HOT PATH: the dominant (forward) direction is a single `key_to_handle`
-    /// hash probe (warm — the forwarding stage just probed the same key) plus
-    /// one `saturating_add`. The reverse direction pays one extra probe to
-    /// hop reverse-entry → forward-entry. Worker-owned `&mut self`: plain
-    /// stores, no atomic, no allocation, no cross-core traffic. A miss
-    /// (session reaped between resolution and accounting) is a no-op — the
-    /// same fail-open posture as `touch`.
+    /// HOT PATH: the dominant (forward) direction is a SINGLE `key_to_handle`
+    /// hash probe (`entry_by_key_mut` resolves the record once; the direction
+    /// is read and the `fwd` counters mutated under that same `&mut` borrow)
+    /// plus one `saturating_add`. The reverse direction copies the bits
+    /// needed to recover the forward tuple out of that first borrow, then pays
+    /// one extra probe to hop reverse-entry → forward-entry. Worker-owned
+    /// `&mut self`: plain stores, no atomic, no allocation, no cross-core
+    /// traffic. A miss (session reaped between resolution and accounting) is a
+    /// no-op — the same fail-open posture as `touch`.
     #[inline]
     pub fn account_packet(&mut self, key: &SessionKey, len: u64) {
-        // Resolve the entry this packet's tuple keys to, and read its
-        // direction + the bits needed to recover the forward key. Copy them
-        // out so the immutable borrow ends before the mutable account below.
-        let (is_reverse, record_key, nat) = match self.record_by_key(key) {
-            Some(record) => (
-                record.entry.metadata.is_reverse,
-                record.key.clone(),
-                record.entry.decision.nat,
-            ),
+        // Single resolve. For the dominant FORWARD case this is the only
+        // session probe `account_packet` does — read the direction and mutate
+        // the `fwd` counters under this one `&mut record` borrow. For the
+        // REVERSE case, snapshot the (Copy) bits needed to recover the forward
+        // tuple and fall out of this borrow before the second resolve.
+        let (record_key, nat) = match self.record_by_key_mut(key) {
+            Some(record) => {
+                if !record.entry.metadata.is_reverse {
+                    // Forward packet → forward entry. Bump `fwd` in place.
+                    record.entry.counters.account(false, len);
+                    return;
+                }
+                (record.key.clone(), record.entry.decision.nat)
+            }
             None => return,
         };
-        if !is_reverse {
-            // Forward packet → forward entry. Bump `fwd` directly.
-            if let Some(entry) = self.entry_by_key_mut(key) {
-                entry.counters.account(false, len);
-            }
-            return;
-        }
         // Reverse packet → reverse entry. Fold onto the forward entry's `rev`.
         let fwd_key = reverse_session_key(&record_key, nat);
         if let Some(entry) = self.entry_by_key_mut(&fwd_key) {

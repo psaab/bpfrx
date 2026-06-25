@@ -15766,3 +15766,22 @@ top.
   userspace-dp/src/event_stream/codec_tests.rs,
   userspace-dp/src/event_stream/tests.rs,
   pkg/dataplane/userspace/flow.go, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2501 review fold (PR #2804 MERGE-NEEDS-MINOR finding 1) —
+  cut the FORWARD fast-path session probe count from 3→2. account_packet
+  now does a SINGLE record_by_key_mut resolve: reads is_reverse and (for the
+  dominant forward case) mutates the fwd counters under that one &mut borrow,
+  instead of the prior record_by_key + entry_by_key_mut double probe. Reverse
+  path still pays one extra probe to hop reverse→forward (fine — optimize the
+  bulk forward path). Also folded the near-dup iter_with_idle_and_counters
+  into iter_with_idle (extended its callback with the SessionCounters arg;
+  removed the now-test-only iter_with_idle_and_origin delegation), which also
+  cleared the dead-code warning my switch had introduced. 4 fail-on-revert
+  tests re-proven RED. Bulk established-flow fast path (flow_cache_hit.rs) is
+  now 2 keyed probes/packet (touch_if_stale + the merged account resolve),
+  down from 3.
+  **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/afxdp/bpf_map/mod.rs,
+  userspace-dp/src/session/tests.rs, _Log.md

@@ -361,7 +361,7 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
 ) {
     let now_secs = now_ns / 1_000_000_000;
 
-    sessions.iter_with_idle_and_counters(now_ns, |key, metadata, idle_ns, counters| {
+    sessions.iter_with_idle(now_ns, |key, _decision, metadata, idle_ns, counters| {
         // Only refresh forward entries — reverse entries mirror the forward.
         // #2501: the forward SessionEntry carries BOTH directions' counters
         // (the reverse entry shares them via the canonical forward key the

@@ -227,47 +227,25 @@ impl SessionTable {
         }
     }
 
-    /// Iterate over all session entries with idle time (in nanoseconds).
+    /// Iterate over all session entries with idle time (in nanoseconds) and,
+    /// since #2501, the per-direction byte/packet counters.
+    ///
+    /// `refresh_bpf_conntrack_last_seen` (afxdp/bpf_map) is the sole
+    /// production caller: it mirrors `idle_ns` (→ `last_seen`) and the
+    /// `SessionCounters` (→ fwd/rev packet+byte fields) into the BPF
+    /// conntrack map on the ~1s GC cadence so `show security flow session`
+    /// surfaces live idle time AND volume. Cold path: a `Copy` of the
+    /// four-`u64` counter snapshot per session on top of the idle-time walk.
     pub fn iter_with_idle(
         &self,
         now_ns: u64,
-        mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, u64),
-    ) {
-        self.iter_with_idle_and_origin(now_ns, |key, decision, metadata, _origin, idle_ns| {
-            f(key, decision, metadata, idle_ns)
-        });
-    }
-
-    pub fn iter_with_idle_and_origin(
-        &self,
-        now_ns: u64,
-        mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, SessionOrigin, u64),
+        mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, u64, SessionCounters),
     ) {
         for (key, handle) in &self.key_to_handle {
             if let Some(record) = self.entries.get(*handle as usize) {
                 let entry = &record.entry;
                 let idle_ns = now_ns.saturating_sub(entry.last_seen_ns);
-                f(key, entry.decision, &entry.metadata, entry.origin, idle_ns);
-            }
-        }
-    }
-
-    /// #2501: iterate sessions with idle time AND the per-direction
-    /// byte/packet counters. Used by the BPF-conntrack-map refresh
-    /// (`refresh_bpf_conntrack_last_seen`) so `show security flow session`
-    /// surfaces live volume on the ~1s GC cadence. Cold path: a `Copy` of
-    /// the four-`u64` snapshot per session in addition to the existing
-    /// idle-time walk.
-    pub fn iter_with_idle_and_counters(
-        &self,
-        now_ns: u64,
-        mut f: impl FnMut(&SessionKey, &SessionMetadata, u64, SessionCounters),
-    ) {
-        for (key, handle) in &self.key_to_handle {
-            if let Some(record) = self.entries.get(*handle as usize) {
-                let entry = &record.entry;
-                let idle_ns = now_ns.saturating_sub(entry.last_seen_ns);
-                f(key, &entry.metadata, idle_ns, entry.counters);
+                f(key, entry.decision, &entry.metadata, idle_ns, entry.counters);
             }
         }
     }

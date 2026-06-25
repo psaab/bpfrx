@@ -1737,7 +1737,7 @@ fn iter_with_idle_reports_idle_time() {
 
     let now = install_time + 5_000_000_000; // 5 seconds later
     let mut found = false;
-    table.iter_with_idle(now, |k, _decision, _metadata, idle_ns| {
+    table.iter_with_idle(now, |k, _decision, _metadata, idle_ns, _counters| {
         if k == &key {
             assert_eq!(idle_ns, 5_000_000_000);
             found = true;
@@ -1766,7 +1766,7 @@ fn iter_with_idle_reflects_last_seen_update() {
     // Check idle time 5 seconds after install (2 seconds after last touch)
     let now = install_time + 5_000_000_000;
     let mut idle = 0u64;
-    table.iter_with_idle(now, |k, _, _, idle_ns| {
+    table.iter_with_idle(now, |k, _, _, idle_ns, _counters| {
         if k == &key {
             idle = idle_ns;
         }
