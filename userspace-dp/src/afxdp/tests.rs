@@ -7689,6 +7689,206 @@ fn native_gre_decap_tagged_ingress_yields_self_consistent_frame_meta() {
     assert_eq!(decap.meta.addr_family, libc::AF_INET as u8);
 }
 
+/// #2782: GRE-to-self OUTER frame whose GRE header carries the optional
+/// fields selected by `flags` (any of `GRE_FLAG_CHECKSUM` / `GRE_FLAG_KEY`
+/// / `GRE_FLAG_SEQUENCE`), wrapping `inner`. When the Checksum-Present (C)
+/// bit is set the 4-byte Checksum+Reserved1 field is emitted FIRST (RFC
+/// 2890 fixed order: Checksum, Key, Sequence) and the 16-bit checksum is
+/// computed over the whole GRE header + payload (IP one's-complement,
+/// checksum field zeroed during the sum) so a conformant peer's frame is
+/// reproduced. `corrupt_checksum` flips one payload byte AFTER the
+/// checksum is written, so the C-bit frame fails verification — used to
+/// drive the invalid-checksum drop counter. The outer IPv4 Total Length
+/// is set to exactly cover the GRE header + inner (no trailing pad), so
+/// the decap-side checksum region is bounded correctly.
+fn build_gre_checksum_present_outer_frame_v4(
+    vlan_id: u16,
+    flags: u16,
+    key: u32,
+    seq: u32,
+    inner: &[u8],
+    corrupt_checksum: bool,
+) -> Vec<u8> {
+    let checksum_present = (flags & 0x8000) != 0;
+    let key_present = (flags & 0x2000) != 0;
+    let sequence_present = (flags & 0x1000) != 0;
+
+    // Build the GRE header + payload separately so we can compute the
+    // checksum over exactly that region.
+    let mut gre = Vec::new();
+    gre.extend_from_slice(&flags.to_be_bytes());
+    gre.extend_from_slice(&0x0800u16.to_be_bytes()); // inner proto IPv4
+    let checksum_field_at = if checksum_present {
+        let at = gre.len();
+        gre.extend_from_slice(&[0x00, 0x00]); // Checksum (filled below)
+        gre.extend_from_slice(&[0x00, 0x00]); // Reserved1
+        Some(at)
+    } else {
+        None
+    };
+    if key_present {
+        gre.extend_from_slice(&key.to_be_bytes());
+    }
+    if sequence_present {
+        gre.extend_from_slice(&seq.to_be_bytes());
+    }
+    gre.extend_from_slice(inner);
+    if let Some(at) = checksum_field_at {
+        let sum = checksum16(&gre);
+        gre[at] = (sum >> 8) as u8;
+        gre[at + 1] = sum as u8;
+    }
+    if corrupt_checksum {
+        // Flip a payload byte after the checksum is sealed so the C-bit
+        // verification fails (but a flagless decap would still parse it).
+        let last = gre.len() - 1;
+        gre[last] ^= 0xff;
+    }
+
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+        [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+        vlan_id,
+        0x0800,
+    );
+    let l3 = frame.len();
+    let total = (20 + gre.len()) as u16;
+    frame.extend_from_slice(&[0x45, 0x00]);
+    frame.extend_from_slice(&total.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x00, 0x01, 0x00, 0x00, 64, PROTO_GRE, 0x00, 0x00, 203, 0, 113, 9, 172, 16, 80, 8,
+    ]);
+    let ip_sum = checksum16(&frame[l3..l3 + 20]);
+    frame[l3 + 10] = (ip_sum >> 8) as u8;
+    frame[l3 + 11] = ip_sum as u8;
+    frame.extend_from_slice(&gre);
+    frame
+}
+
+/// #2782 fail-on-revert: a Checksum-Present GRE frame (C bit set, valid
+/// checksum) MUST decap to the inner packet — exactly the inner bytes at
+/// the correct offset. Before #2782 the decap path returned `None` the
+/// instant the C bit was seen (an uncounted blackhole of any checksummed
+/// peer, e.g. a vSRX with GRE checksum enabled). Reverting the
+/// skip+validate makes this row drop and the assert fires.
+#[test]
+fn native_gre_decap_checksum_present_yields_inner_packet() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_checksum_present_outer_frame_v4(
+        80,
+        crate::afxdp::gre::GRE_FLAG_CHECKSUM,
+        0,
+        0,
+        &inner,
+        false,
+    );
+    let meta = gre_to_self_outer_meta(80, frame.len());
+    let before = crate::afxdp::gre::GRE_DECAP_CHECKSUM_INVALID_DROPS.load(Ordering::Relaxed);
+    let decap = try_native_gre_decap_from_frame(&frame, meta, &forwarding)
+        .expect("checksum-present GRE frame must decap (RFC 2784 §2.1 / RFC 2890)");
+    assert_eq!(
+        &decap.frame[decap.meta.l3_offset as usize..],
+        &inner[..],
+        "decapped inner must be byte-identical and at the correct offset"
+    );
+    assert_eq!(decap.meta.addr_family, libc::AF_INET as u8);
+    assert_eq!(
+        crate::afxdp::gre::GRE_DECAP_CHECKSUM_INVALID_DROPS.load(Ordering::Relaxed),
+        before,
+        "a VALID checksum must not bump the invalid-drop counter"
+    );
+}
+
+/// #2782: composed optional fields — C + Key + Sequence all present. The
+/// Checksum+Reserved1 (4B) precedes Key (4B) precedes Sequence (4B) per
+/// RFC 2890; the decap must skip ALL three to land on the inner payload.
+/// (`key` is 0 so it matches the keyless test endpoint while still
+/// exercising the key-field offset advance.)
+#[test]
+fn native_gre_decap_checksum_key_sequence_present_yields_inner_packet() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_checksum_present_outer_frame_v4(
+        80,
+        crate::afxdp::gre::GRE_FLAG_CHECKSUM
+            | crate::afxdp::gre::GRE_FLAG_KEY
+            | crate::afxdp::gre::GRE_FLAG_SEQUENCE,
+        0,
+        0x0000_002a,
+        &inner,
+        false,
+    );
+    let meta = gre_to_self_outer_meta(80, frame.len());
+    let decap = try_native_gre_decap_from_frame(&frame, meta, &forwarding)
+        .expect("C+Key+Seq GRE frame must decap with all optional fields skipped");
+    assert_eq!(
+        &decap.frame[decap.meta.l3_offset as usize..],
+        &inner[..],
+        "decapped inner must be byte-identical with C+Key+Seq present"
+    );
+}
+
+/// #2782: a Checksum-Present frame whose checksum does NOT verify is a
+/// COUNTED drop (not a silent blackhole, not a misforward). The
+/// `gre_decap_checksum_invalid_drops_total` counter must advance by one
+/// and the decap must return `None`.
+#[test]
+fn native_gre_decap_checksum_invalid_drops_and_counts() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_checksum_present_outer_frame_v4(
+        80,
+        crate::afxdp::gre::GRE_FLAG_CHECKSUM,
+        0,
+        0,
+        &inner,
+        true, // corrupt a payload byte after sealing the checksum
+    );
+    let meta = gre_to_self_outer_meta(80, frame.len());
+    let before = crate::afxdp::gre::GRE_DECAP_CHECKSUM_INVALID_DROPS.load(Ordering::Relaxed);
+    assert!(
+        try_native_gre_decap_from_frame(&frame, meta, &forwarding).is_none(),
+        "a corrupt-checksum GRE frame must be dropped, not misforwarded"
+    );
+    assert_eq!(
+        crate::afxdp::gre::GRE_DECAP_CHECKSUM_INVALID_DROPS.load(Ordering::Relaxed),
+        before + 1,
+        "an invalid GRE checksum must bump the specific drop counter"
+    );
+}
+
+/// #2782 fail-closed: a Checksum-Present frame truncated past the 4-byte
+/// Checksum+Reserved1 field must NOT over-read — it returns `None`. Here
+/// the outer IP Total Length lies (claims a full frame) but the captured
+/// frame is cut right after the flags/proto word, so the checksum-region
+/// bound or the post-field bounds-check rejects it.
+#[test]
+fn native_gre_decap_checksum_present_truncated_header_fails_closed() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let inner = build_gre_inner_icmp_packet_v4();
+    let mut frame = build_gre_checksum_present_outer_frame_v4(
+        80,
+        crate::afxdp::gre::GRE_FLAG_CHECKSUM,
+        0,
+        0,
+        &inner,
+        false,
+    );
+    // Cut the frame so only the 4-byte GRE flags/proto word survives —
+    // the Checksum+Reserved1 field is gone. The outer IP Total Length
+    // still claims the original (longer) length.
+    let l3 = gre_to_self_outer_meta(80, frame.len()).l3_offset as usize;
+    frame.truncate(l3 + 20 + 4);
+    let meta = gre_to_self_outer_meta(80, frame.len());
+    assert!(
+        try_native_gre_decap_from_frame(&frame, meta, &forwarding).is_none(),
+        "a truncated checksum-present GRE header must fail closed (no over-read)"
+    );
+}
+
 /// #2327 fail-on-revert: a GRE (proto-47) frame whose outer tuple/key
 /// match ONLY a non-GRE (here: WireGuard) tunnel row must NOT be
 /// decapsulated as GRE. Pre-#2327 `match_tunnel_endpoint` scanned

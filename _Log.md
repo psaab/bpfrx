@@ -19,6 +19,50 @@
 - **File(s)**: `userspace-dp/src/afxdp/icmp_ptb.rs`,
   `userspace-dp/src/afxdp/icmp_ptb_tests.rs`,
   `userspace-dp/src/afxdp/README.md`
+## 2026-06-25 — #2790: validate learned ARP/NDP neighbor IP before caching
+
+- **Timestamp**: 2026-06-25
+- **Action**: `stage_link_layer_classify` learned the sender protocol
+  address from any ARP reply (and the target IP from any NDP NA) into the
+  userspace `dynamic_neighbors` map and the kernel neighbor table WITHOUT
+  validating the advertised IP — a spoofed reply claiming an unspecified
+  (`0.0.0.0`/`::`), loopback (`127/8`/`::1`), multicast (`224/4`/`ff00::/8`),
+  or IPv4 limited-broadcast (`255.255.255.255`) sender polluted the cache
+  and was programmed into the kernel (routing disruption / DoS;
+  agy-review-048 048-08). Added `frame::neighbor_ip_is_learnable(IpAddr)`
+  (unicast-only gate; rejects the classes above) mirroring the #2367/#2487
+  ICMP-source posture and the cold-neighbor warmer's existing gate, and
+  gated BOTH learn arms (ARP reply + NDP NA) on it. Fail closed: an
+  illegitimate reply is still recycled (ARP/NDP never transits) but no
+  neighbor write occurs. Read-side fix — no wire change (protocol_wire
+  green). Fail-on-revert test `arp_invalid_sender_ip_not_learned_2790`
+  (proved RED with the gate reverted) + predicate test
+  `neighbor_ip_is_learnable_rejects_non_unicast_2790`.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/poll_stages.rs, _Log.md
+
+## 2026-06-25 — #2786: VRRP IPv6 raw socket SO_BINDTODEVICE VLAN-skip (split-brain)
+
+- **Timestamp**: 2026-06-25
+- **Action**: The IPv6 VRRP raw socket (`openIPv6Socket`) bound
+  `SO_BINDTODEVICE` UNCONDITIONALLY, while the IPv4 path
+  (`openPerInterfaceSocket`) skips it on VLAN sub-interfaces (generic-XDP
+  VLAN tag handling makes the kernel interface association unreliable). On
+  a VLAN RETH member (e.g. `reth0.50`/`reth0.80`) the two families saw
+  VRRP multicast differently — the IPv6 instance could miss peer adverts
+  and both nodes hold MASTER → split-brain / dual-MASTER (agy-review-048
+  finding 048-01). Fix: extracted the single gated bind decision into
+  `maybeBindToDevice(fd, ifName, isVLAN)` (skip on VLAN) and routed BOTH
+  the v4 and v6 paths through it; added `isVLAN` to `openIPv6Socket` and
+  its instance.go call site (derived from the same
+  `strings.Contains(Interface, ".")` as v4). bindSocketToDevice is a
+  package-var seam so the gate is testable without CAP_NET_RAW. Fail-on-
+  revert: TestMaybeBindToDeviceVLANGate goes RED if the gate is reverted
+  to an unconditional bind (proven). HA code — PARENT runs
+  `make test-failover` (the split-brain gate) before merge.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance.go,
+  pkg/vrrp/bindtodevice_test.go, pkg/vrrp/README.md, _Log.md
 
 ## 2026-06-25 — #2515: reconcile no_snapshot teardown now refreshes bindings
 
@@ -15723,6 +15767,11 @@ top.
   userspace-dp/src/afxdp/coordinator/mod.rs,
   userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md
 
+## 2026-06-25 — #2769 static-nat match-port-without-mapped-port reverse SNAT scoping
+- **Action**: Fix HIGH security/correctness bug: a `match destination-port` static-NAT rule WITHOUT a `mapped-port` broadened reverse SNAT to the whole internal host. Rust now keys the reverse SNAT entry on `(internal_ip, Some(match_dst_port))` instead of `(internal_ip, None)` (fail-closed backstop); Go strict commit-check rejects the half-config (mirror of the mapped-port-without-match-port rejection).
+- **File(s)**: userspace-dp/src/nat/static_nat.rs (snat_port = mapped_port.or(match_dst_port)), userspace-dp/src/nat/tests.rs (fail-on-revert test static_nat_match_port_without_mapped_port_scopes_reverse_snat), pkg/config/compiler_nat.go (strict reject), pkg/config/static_nat_mapped_port_2491_test.go (TestStaticNATMatchPortWithoutMappedPortRejected), docs/config-schema.md
+- **Wire**: no wire change (reuses existing StaticNATRuleSnapshot match_destination_port / mapped_port fields).
+- **Validation**: go build/vet/gofmt clean; go test ./pkg/config/... ./pkg/dataplane/userspace/... ok; cargo build --release ok; cargo test --release --bin xpf-userspace-dp -- nat static_nat → 452 passed. Fail-on-revert proven RED both sides (Rust snat_port=mapped_port → off-port lookup matches; Go guard removal → CompileConfig accepts), restored.
 - **Timestamp**: 2026-06-25
   **Action**: #2791 frr/bgp — decouple BGP maximum-paths from global ECMP.
   `generateProtocols` seeded `bgpMaxPaths := ecmpMaxPaths` then only bumped
@@ -15762,3 +15811,72 @@ top.
   userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
   userspace-dp/src/afxdp/umem/tests.rs,
   userspace-dp/src/filter/tests.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2621 — verified codex review-040 finding 040-07
+  (input-filter forwarding-class/DSCP/policer modifiers before a
+  routing-instance/PBR term "dropped") is a FALSE POSITIVE, and added a
+  regression guard. The split PBR/non-PBR session-miss evaluators in
+  filter/engine/eval.rs DO discard fc/dscp/policer from the FilterResult
+  returned on a matched routing-instance term — but that FilterResult feeds
+  ONLY the verdict + log on the miss path (NonPbrInputFilterEval reads
+  action/log_match only; afxdp/poll_descriptor/filter.rs:78-154). The
+  forwarding-class queue, DSCP rewrite, and three-color policer are enforced
+  at TX time via resolve_cos_tx_selection / resolve_cached_cos_tx_selection
+  (afxdp/tx/cos_classify.rs), which re-walk the FULL ingress filter through
+  the TX-selection evaluators (filter/engine/tx_selection.rs +
+  cache_sensitive.rs). Those evaluators ACCUMULATE fc/dscp/three_color_policer
+  across every matched fall-through term (merge_matched_tx_modifiers /
+  merge_matched_cached_modifiers) and only return at the terminating
+  routing-instance term (the last relevant term) — so the earlier classify
+  term's modifiers ARE recovered. tx_selection_enabled_v{4,6} is set whenever
+  has_input_tx_selection (fc/dscp) or has_input_three_color_policer is true,
+  so the TX pass actually runs for such a filter. The single-rate
+  `then policer NAME` maps to a three_color_policer (compiler.rs:533);
+  FilterResult.policer_name is never consumed in afxdp (informational only).
+  Empirically confirmed with a unit test (live + cached TX selection at the
+  PBR-overridden egress returns EF queue + DSCP 46 + policer drop) and an
+  independent Codex source audit covering all four runtime paths (session-miss
+  first packet, session-hit, cache-hit, generated-reply — all recover). No
+  code fix; the deliverable is two named regression guards that pin the
+  recovery and go RED if the split is ever reintroduced into the TX path.
+  **File(s)**: userspace-dp/src/afxdp/tx/cos_classify_tests.rs, _Log.md
+  **Action**: #2787 — DHCP-relay supervisor no longer dies on a transient
+  socket bind/listen failure. `runRelaySession` now returns a tri-state
+  `sessionOutcome` (`sessionStop`/`sessionDrift`/`sessionRetry`) instead of
+  `bool drift`. The two `newConn` failures (client listener `0.0.0.0:67`,
+  giaddr server conn) return `sessionRetry` when the session ctx is still
+  live, and the supervisor (`runRelay`) waits the bounded ctx-cancelable
+  `retryInterval` and rebuilds rather than exiting the per-interface
+  goroutine. A cancelled session ctx on a bind failure returns `sessionStop`
+  so `Stop()` stays prompt. Fail-on-revert tests: `TestRunRelay_BindFailureRetries`
+  (fails first K binds then succeeds → supervisor survives + binds; reverting
+  to terminal → 0 factory calls, RED) and `TestRunRelay_StopDuringBindRetry`
+  (Stop during failing bind returns promptly). `go test -race
+  ./pkg/dhcprelay/... ./pkg/daemon/...` green; build/gofmt/vet clean.
+  **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/dhcprelay/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2782 — native GRE decap: handle Checksum-Present (C) bit
+  instead of silently dropping. Skip the 4-byte Checksum+Reserved1 field
+  (RFC 2784 §2.1 / RFC 2890 fixed order: Checksum, Key, Sequence) to find
+  the inner payload; validate the GRE checksum (one's-complement over the
+  GRE header+payload, region bounded by the outer IP length to exclude L2
+  pad); a corrupt checksum is now a COUNTED drop via the new
+  GRE_DECAP_CHECKSUM_INVALID_DROPS counter surfaced as
+  xpf_userspace_gre_decap_checksum_invalid_drops_total. Routing (R) bit
+  stays a drop. Added 4 fail-on-revert tests + Rust/Go counter round-trip
+  + Prometheus wiring; regenerated protocol_wire_v1.json (single key add).
+  **File(s)**: userspace-dp/src/afxdp/gre.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go, pkg/api/metrics.go,
+  pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
+  pkg/api/metrics_test.go, pkg/api/metrics_descriptor_coverage_test.go,
+  docs/userspace-native-gre-plan.md, _Log.md

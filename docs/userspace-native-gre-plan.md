@@ -348,6 +348,41 @@ produced from a short inner. #2376 is narrower — the synthetic inner
 *metadata* (`protocol`/`l4_offset`/`payload_offset`) stamped by the GRE
 decap stage itself, which #2361 did not touch.
 
+### 6c. Checksum-Present GRE On Decap (#2782)
+
+The GRE flags word (`afxdp/gre.rs`) carries optional-field bits per RFC
+2784 + RFC 2890: Checksum-Present (`C`, 0x8000), Routing-Present (`R`,
+0x4000), Key (0x2000), Sequence (0x1000). When a bit is set its field
+appears in a FIXED order right after the 4-byte flags/protocol word:
+**Checksum (2B) + Reserved1 (2B), then Key (4B), then Sequence (4B)**.
+
+`try_native_gre_decap_from_frame` already skipped the Key and Sequence
+fields to locate the inner payload, but it previously rejected the
+Checksum (and Routing) bit outright — `return None` the instant `C` was
+seen, BEFORE the field was even parsed. That made any checksummed peer
+(notably a **vSRX with GRE checksum enabled**) an **uncounted silent
+blackhole**: the frame was dropped with no `show` reason and no counter.
+
+The fix handles the `C` bit like the other optional fields, and adds the
+RFC-2784 checksum validation the bit implies:
+
+1. When `C` is set, the 4-byte Checksum+Reserved1 field is FIRST — skip
+   it (advance the inner offset by 4) before Key/Sequence, with a
+   bounds-check so a header truncated past the field fails closed.
+2. The 16-bit Checksum is the IP-style one's-complement checksum of the
+   **GRE header + payload** (checksum field counted as-is; a conformant
+   frame folds to 0). The region is bounded by the OUTER IP length
+   (`gre_checksum_region`) so trailing Ethernet min-frame padding is not
+   folded into the sum — folding pad would spuriously fail valid frames.
+3. A frame whose checksum does NOT verify is a **counted** drop:
+   `GRE_DECAP_CHECKSUM_INVALID_DROPS` → the Prometheus counter
+   `xpf_userspace_gre_decap_checksum_invalid_drops_total`. A valid
+   checksummed frame decaps normally (router-interop / vSRX parity).
+
+The **Routing-Present (`R`) bit stays a drop** — the Source Route Entry
+list is variable-length with no fixed offset and is effectively dead on
+the modern Internet; parsing it is out of scope.
+
 ## Policy-Based Routing Without A Tunnel Netdevice
 
 This is the most important control-plane question.

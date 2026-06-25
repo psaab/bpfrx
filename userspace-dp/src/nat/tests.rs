@@ -1124,6 +1124,73 @@ fn static_nat_mapped_port_without_match_port_demotes_to_whole_address() {
     assert_eq!(decision.rewrite_dst_port, None, "orphaned mapped-port must not rewrite");
 }
 
+// #2769: a `match destination-port` WITHOUT a `mapped-port` is a port-scoped
+// 1:1 (no port translation). The reverse SNAT MUST stay scoped to the matched
+// port — the internal service runs on, and its return packets leave from, the
+// matched port (no translation happened). A return packet from ANY OTHER
+// source port on the internal host MUST NOT be source-translated.
+//
+// Before #2769 the SNAT entry was keyed on `(internal_ip, None)`, so the
+// reverse SNAT matched every source port → it source-translated every service
+// on the internal host, not just the one port-scoped inbound. This is the
+// whole-host NAT broadening the issue reports.
+//
+// Fail-on-revert: reverting the `let snat_port = mapped_port.or(match_dst_port)`
+// scoping in from_snapshots back to `let snat_port = mapped_port` re-keys the
+// SNAT entry on `None`; the off-port lookup then matches the fallback entry and
+// the `is_none()` assertion goes RED.
+#[test]
+fn static_nat_match_port_without_mapped_port_scopes_reverse_snat() {
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "port-scoped-1to1".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.1/32".to_string(),
+            internal_ip: "10.0.0.5/32".to_string(),
+            match_destination_port: 8080,
+            mapped_port: 0,
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    let ext: IpAddr = "203.0.113.1".parse().unwrap();
+    let int: IpAddr = "10.0.0.5".parse().unwrap();
+
+    // Inbound DNAT is scoped to the matched port (no port-less fallback).
+    let (dnat, _) = table
+        .match_dnat_with_counter(ext, 8080, "untrust")
+        .expect("matched external port");
+    assert_eq!(dnat.rewrite_dst, Some(int), "dst IP must be the internal host");
+    assert_eq!(
+        dnat.rewrite_dst_port, None,
+        "no mapped-port: destination port is not rewritten"
+    );
+    assert!(
+        table.match_dnat_with_counter(ext, 9999, "untrust").is_none(),
+        "off-port inbound must miss (port-scoped, no whole-address fallback)"
+    );
+
+    // Reverse SNAT: a return packet leaving the internal host on the matched
+    // port (8080 — no translation happened) IS source-translated to the
+    // external IP, with NO source-port rewrite.
+    let (snat, _) = table
+        .match_snat_with_counter(int, 8080, "trust")
+        .expect("return from the port-scoped service");
+    assert_eq!(snat.rewrite_src, Some(ext), "src IP must be the external IP");
+    assert_eq!(
+        snat.rewrite_src_port, None,
+        "no port translation: source port is not rewritten"
+    );
+
+    // The bug: a packet from ANY OTHER source port on the internal host MUST
+    // NOT be source-translated. This is the whole-host broadening #2769 fixes.
+    assert!(
+        table.match_snat_with_counter(int, 1234, "trust").is_none(),
+        "off-port outbound must NOT be source-translated (reverse SNAT must \
+         stay scoped to the matched port)"
+    );
+}
+
 // --- DNAT table tests ---
 
 #[test]
