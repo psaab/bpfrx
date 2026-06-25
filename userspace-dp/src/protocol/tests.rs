@@ -2117,3 +2117,29 @@ fn session_sync_request_generation_roundtrip_2170() {
             .expect("legacy SessionSyncRequest without generation decodes");
     assert_eq!(legacy.generation, 0, "missing generation must default to 0");
 }
+
+// #2785: the per-policy log flags must round-trip on the session-sync wire,
+// and a legacy payload that omits them must decode to false (serde default)
+// so an old peer falls back to no per-policy log (pre-#2785 behavior).
+#[test]
+fn session_sync_request_log_flags_roundtrip_2785() {
+    let req = SessionSyncRequest {
+        operation: "upsert".to_string(),
+        log_session_init: true,
+        log_session_close: true,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&req).expect("serialize SessionSyncRequest");
+    let back: SessionSyncRequest =
+        serde_json::from_str(&json).expect("deserialize SessionSyncRequest");
+    assert!(back.log_session_init, "log_session_init must round-trip");
+    assert!(back.log_session_close, "log_session_close must round-trip");
+
+    let legacy: SessionSyncRequest =
+        serde_json::from_str(r#"{"operation":"upsert","src_ip":"10.0.0.1"}"#)
+            .expect("legacy SessionSyncRequest without log flags decodes");
+    assert!(
+        !legacy.log_session_init && !legacy.log_session_close,
+        "missing log flags must default to false"
+    );
+}
