@@ -15938,3 +15938,33 @@ top.
   TestAddrWatcher_UnconfiguredInterfaceNoReconcile (over-fire guard).
   **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/addrwatch.go,
   pkg/vrrp/addrwatch_test.go, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2438 — WG/GRE local-delivery TUN write paths shared the same
+  short-write packet-corruption class as #2407, but on NON-BLOCKING fds.
+  Both `afxdp/tunnel.rs` (GRE local-origin delivery, via
+  `drain_local_tunnel_deliveries`) and `afxdp/coordinator/wg_control.rs`
+  (WG decap inner-delivery) used std `Write::write_all`, whose `Ok(n)`
+  loop re-writes `buf[n..]` on a short count — injecting the remainder as
+  a second, malformed packet. Added a non-blocking sibling of #2407's
+  whole-packet helper: `slowpath::write_packet_nonblocking` (single
+  `write()`, retries the WHOLE packet on EINTR and on WouldBlock/EAGAIN —
+  legitimate backpressure on an O_NONBLOCK fd, bounded by a 1024 retry
+  budget then drops with non-fatal ENOBUFS; genuine partial drops with
+  non-fatal EMSGSIZE). Returns the underlying io::Error so each path's
+  fatal-errno classifier is unchanged. The GRE drain helper now takes a
+  packet-write closure seam instead of `&mut impl Write`; the WG site
+  calls the helper on `tun.as_raw_fd()`. Internal-only — NO control
+  message field, NO wire change. Fail-on-revert: slowpath
+  `nb_short_write_drops_no_remainder` (one full-length write, never
+  buf[n..]) and `nb_wouldblock_retries_whole_packet` (EAGAIN retries the
+  whole packet, does not drop) — both proven RED by reverting the
+  respective arm (remainder-resume → second write of len-n; EAGAIN→drop →
+  no second write); `nb_wouldblock_budget_is_bounded_and_drops` (no
+  infinite spin); tunnel `drain_gre_delivery_calls_write_seam_once_with_whole_packet`
+  (drain hands the packet to the seam exactly once at full length).
+  **File(s)**: userspace-dp/src/slowpath.rs,
+  userspace-dp/src/afxdp/tunnel.rs,
+  userspace-dp/src/afxdp/tunnel_tests.rs,
+  userspace-dp/src/afxdp/coordinator/wg_control.rs,
+  docs/xdp-io-uring-userspace-dataplane.md, _Log.md

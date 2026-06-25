@@ -625,6 +625,22 @@ io_uring helps a lot, but not in the way people often mean.
   malformed packet — corrupting the device stream. Only the positioned
   (state-writer / regular-file) io_uring path is a true byte stream and may
   resume from `offset + n`.
+- The WG/GRE local-delivery TUN writers
+  (`afxdp/coordinator/wg_control.rs` decap inner-delivery and
+  `afxdp/tunnel.rs` GRE local-origin delivery) share the same
+  packet-device hazard but open their TUN `O_NONBLOCK`, so they use the
+  NON-BLOCKING sibling `write_packet_nonblocking` (#2438) instead of std
+  `Write::write_all`. `write_all`'s `Ok(n)` loop re-writes `buf[n..]` on a
+  short count — the same #2407 corruption — so it is replaced by a single
+  `write()` with whole-packet semantics: `EINTR` retries the whole packet;
+  `WouldBlock`/`EAGAIN` is legitimate backpressure on a non-blocking fd and
+  retries the WHOLE packet (bounded by a retry budget, then drops with a
+  non-fatal `ENOBUFS`) — it does NOT drop on first EAGAIN the way the
+  blocking #2407 helper does (that would lose packets under load); a
+  genuine partial (`0 < n < len`) drops the whole packet (`EMSGSIZE`,
+  non-fatal). The returned `io::Error` preserves the errno so each path's
+  fatal-errno classifier (`local_tunnel_write_error_is_fatal`) is
+  unchanged.
 
 2. **Session sync transport**
 - replace blocking write/read goroutines with batched async I/O
