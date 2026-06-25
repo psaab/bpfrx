@@ -1,3 +1,14 @@
+## 2026-06-25 — #2578: appid tuple fallback prefers port-based over protocol-only
+
+- **Timestamp**: 2026-06-25
+- **Action**: `resolveTupleFallback` iterated the applications map first-match
+  (non-deterministic). When both a port-based app (tcp/8443) and a protocol-only
+  app (tcp) match a session, the more-specific port-based app now wins
+  deterministically; ties break by name. Display-only label path (no
+  enforcement impact). Added a 256-iteration fail-on-revert test
+  (`TestResolveTupleFallbackPrefersPortOverProtocol`); doc note in README.
+- **File(s)**: pkg/appid/runtime.go, pkg/appid/runtime_test.go, pkg/appid/README.md
+
 ## 2026-06-25 — #2447: reject out-of-range CoS DSCP/PCP code-points instead of aliasing
 
 - **Timestamp**: 2026-06-25
