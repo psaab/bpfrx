@@ -1,3 +1,27 @@
+## 2026-06-25 — #2912: slow-path RateLimiter fixed window → token bucket (no 2x burst)
+
+- **Timestamp**: 2026-06-25
+- **Action**: `RateLimiter::allow` in `userspace-dp/src/slowpath.rs` used a
+  fixed 1-second window that zeroed its packet/byte counters whenever the
+  elapsed time since `window_started` reached 1s. A fixed window admits the
+  full per-second budget at the END of window N and a full budget at the
+  START of window N+1 — up to 2x the configured rate across a short interval
+  straddling the boundary, which can overload downstream control-queue
+  processing (agy-review-053 053-08). Replaced it with a dual token bucket
+  (packets/s + bytes/s): tokens accrue continuously at the configured rate,
+  the bucket caps at one second of accumulation, and a refused frame charges
+  neither bucket. Added a clock-injectable `allow_at(now, len)` core (the
+  production `allow(len)` is a thin wrapper) so the boundary behaviour is
+  deterministically unit-testable without sleeping. FAIL-ON-REVERT:
+  `rate_limiter_refuses_subsecond_refill_after_drain` (sub-second refill is
+  below one token → refuse) and `rate_limiter_no_double_budget_across_boundary`
+  (2ms straddle must not refill a second budget) both go RED against the
+  reinstated fixed-window `allow`. Gates: cargo build --release -p
+  xpf-userspace-dp PASS; cargo test slowpath:: 30/30 PASS (incl. 6
+  rate_limiter, 3 new).
+- **File(s)**: userspace-dp/src/slowpath.rs (fix + tests),
+  userspace-dp/README.md, _Log.md
+
 ## 2026-06-25 — #2937: screen flood + SYN-cookie standby-ACK rate limiting switched from fixed wall-second window to a sliding 1-second window
 
 - **Timestamp**: 2026-06-25
