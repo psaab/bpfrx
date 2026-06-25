@@ -24,11 +24,18 @@ import (
 //
 // This backend implements the SAME DNSUpdater interface as rfc2136, so the
 // Surface A engine drives it identically. A router record carries no PTR and no
-// ClientID (the firewall owns its own name), so Upsert sends exactly one GET and
-// Delete is a best-effort offline (dyndns2 has no standard delete verb — most
-// providers offman by pointing the record at 0.0.0.0 or simply letting it
-// expire). We implement Delete as a documented no-op-with-warning rather than
-// guessing a per-provider deletion verb.
+// ClientID (the firewall owns its own name), so Upsert sends exactly one GET.
+//
+// Withdraw (#2772): the previous DeleteLease was a no-op that returned nil, so
+// the Surface A engine dropped local ownership while the public record kept
+// resolving forever (the comments assumed a provider TTL/liveness reap that is
+// NOT a portable dyndns2 contract). DeleteLease now performs the de-facto
+// dyndns2 withdraw verb — the SAME update GET with `offline=YES` — which dyn,
+// no-ip, and dns-o-matic honour by taking the hostname offline (it stops
+// resolving / serves the provider's offline redirect). The provider's body
+// verdict (good/nochg/...) is parsed exactly like the upsert path, so a failed
+// withdraw returns a non-nil error and the engine keeps ownership for retry
+// instead of silently orphaning the record.
 
 // dyndns2Endpoints maps a known dyndns2 provider name to its update base URL.
 // The provider's `backend` token selects the protocol (dyndns2); when the
@@ -103,14 +110,45 @@ func resolveDyndns2Endpoint(p *config.DDNSProvider) (string, error) {
 // ClientID fields of the record are ignored (dyndns2 is a forward-only consumer
 // protocol; the firewall owns its own name).
 func (b *dyndns2Backend) UpsertLease(ctx context.Context, rec LeaseDNSRecord) error {
+	q := url.Values{}
+	q.Set("hostname", rec.FQDN)
+	q.Set("myip", rec.Addr.Unmap().String())
+	return b.update(ctx, q)
+}
+
+// DeleteLease withdraws the firewall's own A/AAAA via the de-facto dyndns2
+// offline verb (#2772): the SAME update GET, this time with `offline=YES`, which
+// instructs the provider to take the hostname offline (stop resolving it / serve
+// the provider's offline redirect). dyndns2 has no separate "remove the RR"
+// call, so `offline=YES` is the portable withdraw the well-known dyndns2
+// services (dyn, no-ip, dns-o-matic) implement; the response is parsed exactly
+// like an upsert, so a provider failure propagates as a non-nil error and the
+// Surface A engine keeps ownership for retry rather than reporting a false
+// withdraw and orphaning the public record.
+func (b *dyndns2Backend) DeleteLease(ctx context.Context, rec LeaseDNSRecord) error {
+	q := url.Values{}
+	q.Set("hostname", rec.FQDN)
+	// myip is still required by some providers' parsers; send the address being
+	// withdrawn so the request is well-formed. offline=YES is the operative verb.
+	q.Set("myip", rec.Addr.Unmap().String())
+	q.Set("offline", "YES")
+	return b.update(ctx, q)
+}
+
+// update issues one dyndns2 GET against the resolved endpoint with the supplied
+// query, then parses the body verdict. Shared by UpsertLease and DeleteLease so
+// both paths apply identical auth, status, and response-keyword handling.
+func (b *dyndns2Backend) update(ctx context.Context, q url.Values) error {
 	u, err := url.Parse(b.endpoint)
 	if err != nil {
 		return fmt.Errorf("ddns dyndns2: bad endpoint: %w", err)
 	}
-	q := u.Query()
-	q.Set("hostname", rec.FQDN)
-	q.Set("myip", rec.Addr.Unmap().String())
-	u.RawQuery = q.Encode()
+	// Merge the caller's parameters onto any the endpoint already carries.
+	base := u.Query()
+	for k, vs := range q {
+		base[k] = vs
+	}
+	u.RawQuery = base.Encode()
 
 	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {
@@ -135,20 +173,6 @@ func (b *dyndns2Backend) UpsertLease(ctx context.Context, rec LeaseDNSRecord) er
 		return fmt.Errorf("ddns dyndns2: %s: unexpected status %d", b.name, code)
 	}
 	return parseDyndns2Response(string(body), b.name)
-}
-
-// DeleteLease is a no-op for dyndns2: the protocol has no portable delete verb,
-// and pointing the record at a bogus address (some providers' offline trick) is
-// a foot-gun we will not do implicitly. The Surface A engine treats a no-op
-// backend's withdraw as a non-success that keeps ownership for retry, but a
-// dyndns2 binding removed from config has nothing safe to do remotely, so we log
-// once and report success (no ownership orphan: the operator removed the binding
-// knowingly; the record ages out via the provider's record TTL / liveness reap).
-func (b *dyndns2Backend) DeleteLease(_ context.Context, rec LeaseDNSRecord) error {
-	// Intentionally not isNopUpdater (that would make withdrawOwnedLocked keep
-	// the ownership entry forever). dyndns2 cannot delete; report success so the
-	// ownership entry is dropped and the engine stops trying.
-	return nil
 }
 
 // parseDyndns2Response maps a dyndns2 response body's first status keyword to a

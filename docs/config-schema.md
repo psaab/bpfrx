@@ -858,7 +858,13 @@ reserved for whole-dataplane selection where a rewrite shim
     provider (dyndns2 with no server + unknown name, cloudflare missing
     api-token/zone, route53 missing keys/hosted-zone-id, generic missing
     url-template) warns and publishes nothing at runtime (fail-open, never a
-    hard reject). Regression coverage:
+    hard reject). A malformed `checkip-url` (not an http(s) URL with a host —
+    e.g. `ftp://`, `not a url`, host-less `http://`) also warns at commit
+    (#2773): without it the typo committed silently and the runtime fetch then
+    masqueraded forever as a transient observation failure, suppressing
+    publishing indefinitely. The runtime `ddns.CheckIP` gate
+    (`validateCheckIPURL`) fails closed on the same malformed URL regardless, so
+    a URL that slips past commit cannot reach a fetch. Regression coverage:
     `pkg/config/compiler_p3_http_providers_test.go`,
     `pkg/ddns/backend_http_test.go` / `backend_cloudflare_test.go` /
     `backend_route53_test.go` / `sigv4_test.go` / `checkip_test.go` /

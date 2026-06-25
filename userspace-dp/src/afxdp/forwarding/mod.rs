@@ -1018,6 +1018,25 @@ pub(super) fn lookup_forwarding_resolution_with_dynamic(
     lookup_forwarding_resolution_inner(state, Some(dynamic_neighbors), dst, None)
 }
 
+/// #2734: like `lookup_forwarding_resolution_with_dynamic`, but selects an
+/// equal-cost next-hop by the per-FLOW 5-tuple hash (from the session
+/// forward key) so distinct flows to the same destination spread across
+/// ECMP members. Used by the session forwarding-resolution path.
+pub(super) fn lookup_forwarding_resolution_with_dynamic_for_flow(
+    state: &ForwardingState,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
+    dst: IpAddr,
+    flow_key: &crate::session::SessionKey,
+) -> ForwardingResolution {
+    lookup_forwarding_resolution_inner_ecmp(
+        state,
+        Some(dynamic_neighbors),
+        dst,
+        None,
+        Some(ecmp_hash_flow(flow_key)),
+    )
+}
+
 pub(super) fn lookup_forwarding_resolution_in_table_with_dynamic(
     state: &ForwardingState,
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
@@ -1032,6 +1051,21 @@ pub(super) fn lookup_forwarding_resolution_inner(
     dynamic_neighbors: Option<&Arc<ShardedNeighborMap>>,
     dst: IpAddr,
     table: Option<&str>,
+) -> ForwardingResolution {
+    lookup_forwarding_resolution_inner_ecmp(state, dynamic_neighbors, dst, table, None)
+}
+
+/// #2734: as `lookup_forwarding_resolution_inner`, plus an optional
+/// per-flow ECMP spread key. `ecmp_flow_hash = Some(h)` selects the
+/// equal-cost member by the 5-tuple flow hash (per-flow spread); `None`
+/// falls back to the per-destination hash (#2389 behavior) for callers
+/// without a flow context.
+pub(super) fn lookup_forwarding_resolution_inner_ecmp(
+    state: &ForwardingState,
+    dynamic_neighbors: Option<&Arc<ShardedNeighborMap>>,
+    dst: IpAddr,
+    table: Option<&str>,
+    ecmp_flow_hash: Option<u64>,
 ) -> ForwardingResolution {
     match dst {
         IpAddr::V4(ip) => {
@@ -1057,7 +1091,15 @@ pub(super) fn lookup_forwarding_resolution_inner(
             let table = table
                 .map(|table| canonical_route_table(table, false))
                 .unwrap_or_else(|| DEFAULT_V4_TABLE.to_string());
-            lookup_forwarding_resolution_v4(state, dynamic_neighbors, ip, &table, 0, true)
+            lookup_forwarding_resolution_v4(
+                state,
+                dynamic_neighbors,
+                ip,
+                &table,
+                0,
+                true,
+                ecmp_flow_hash,
+            )
         }
         IpAddr::V6(ip) => {
             if state.local_v6.contains(&ip) {
@@ -1082,7 +1124,15 @@ pub(super) fn lookup_forwarding_resolution_inner(
             let table = table
                 .map(|table| canonical_route_table(table, true))
                 .unwrap_or_else(|| DEFAULT_V6_TABLE.to_string());
-            lookup_forwarding_resolution_v6(state, dynamic_neighbors, ip, &table, 0, true)
+            lookup_forwarding_resolution_v6(
+                state,
+                dynamic_neighbors,
+                ip,
+                &table,
+                0,
+                true,
+                ecmp_flow_hash,
+            )
         }
     }
 }
@@ -1377,6 +1427,7 @@ pub(super) fn lookup_forwarding_resolution_v4(
     table: &str,
     depth: usize,
     allow_tunnels: bool,
+    ecmp_flow_hash: Option<u64>,
 ) -> ForwardingResolution {
     if depth >= MAX_NEXT_TABLE_DEPTH {
         return ForwardingResolution {
@@ -1478,11 +1529,14 @@ pub(super) fn lookup_forwarding_resolution_v4(
                     &next_table_name,
                     depth + 1,
                     allow_tunnels,
+                    ecmp_flow_hash,
                 );
             }
-            // #2389: select one equal-cost next-hop, skipping a dead one.
-            let ip_hash = ecmp_hash_v4(ip);
-            let selected = select_route_next_hop(&route.next_hops, ip_hash, |nh| {
+            // #2389/#2734: select one equal-cost next-hop, skipping a dead
+            // one. Spread by the per-flow 5-tuple hash when supplied,
+            // else fall back to the per-destination hash.
+            let spread_hash = ecmp_flow_hash.unwrap_or_else(|| ecmp_hash_v4(ip));
+            let selected = select_route_next_hop(&route.next_hops, spread_hash, |nh| {
                 let target = nh.next_hop.unwrap_or(ip);
                 nh.ifindex > 0
                     && lookup_neighbor_entry(state, dynamic_neighbors, nh.ifindex, IpAddr::V4(target))
@@ -1539,6 +1593,7 @@ pub(super) fn lookup_forwarding_resolution_v6(
     table: &str,
     depth: usize,
     allow_tunnels: bool,
+    ecmp_flow_hash: Option<u64>,
 ) -> ForwardingResolution {
     if depth >= MAX_NEXT_TABLE_DEPTH {
         return ForwardingResolution {
@@ -1635,11 +1690,14 @@ pub(super) fn lookup_forwarding_resolution_v6(
                     &next_table_name,
                     depth + 1,
                     allow_tunnels,
+                    ecmp_flow_hash,
                 );
             }
-            // #2389: select one equal-cost next-hop, skipping a dead one.
-            let ip_hash = ecmp_hash_v6(ip);
-            let selected = select_route_next_hop(&route.next_hops, ip_hash, |nh| {
+            // #2389/#2734: select one equal-cost next-hop, skipping a dead
+            // one. Spread by the per-flow 5-tuple hash when supplied,
+            // else fall back to the per-destination hash.
+            let spread_hash = ecmp_flow_hash.unwrap_or_else(|| ecmp_hash_v6(ip));
+            let selected = select_route_next_hop(&route.next_hops, spread_hash, |nh| {
                 let target = nh.next_hop.unwrap_or(ip);
                 nh.ifindex > 0
                     && lookup_neighbor_entry(state, dynamic_neighbors, nh.ifindex, IpAddr::V6(target))
@@ -1722,6 +1780,9 @@ pub(super) fn resolve_tunnel_outer(
 ) -> Option<ForwardingResolution> {
     let endpoint = state.tunnel_endpoints.get(&tunnel_endpoint_id)?;
     let outer = match endpoint.destination {
+        // #2734: tunnel OUTER resolution is per-tunnel-endpoint, not
+        // per-inner-flow — no 5-tuple flow hash applies here, so pass
+        // None (per-destination spread across outer-transport ECMP).
         IpAddr::V4(ip) => lookup_forwarding_resolution_v4(
             state,
             dynamic_neighbors,
@@ -1729,6 +1790,7 @@ pub(super) fn resolve_tunnel_outer(
             &endpoint.transport_table,
             depth + 1,
             false,
+            None,
         ),
         IpAddr::V6(ip) => lookup_forwarding_resolution_v6(
             state,
@@ -1737,6 +1799,7 @@ pub(super) fn resolve_tunnel_outer(
             &endpoint.transport_table,
             depth + 1,
             false,
+            None,
         ),
     };
     if outer.disposition == ForwardingDisposition::LocalDelivery
@@ -1916,22 +1979,29 @@ fn choose_v6_route<'a>(
     }
 }
 
-/// #2389: select one equal-cost next-hop candidate for a forwarding
+/// #2389/#2734: select one equal-cost next-hop candidate for a forwarding
 /// static route. Prefers a candidate whose neighbor is resolved (skips a
 /// dead/unresolved first next-hop — the load-bearing correctness fix); if
-/// several resolve, distributes deterministically by destination IP; if
-/// none resolve, falls back to the same dst-hashed pick so the kernel
-/// slow-path can drive ARP/NDP. `ip` is hashed for the spread.
+/// several resolve, distributes deterministically by the supplied
+/// `flow_hash`; if none resolve, falls back to the same hashed pick so the
+/// kernel slow-path can drive ARP/NDP.
 ///
-/// Distribution is per-DESTINATION (the only flow identity available at
-/// this resolution layer — the 5-tuple flow hash is not plumbed here).
-/// True per-flow ECMP spread would require threading the session flow
-/// hash into the forwarding-resolution path; tracked as a follow-up. The
-/// retained candidate vector makes that a localized change.
-/// Deterministic per-destination ECMP spread key. A fixed-seed splitmix64
-/// finalizer over the address bytes — stable across reloads and workers so
-/// every worker maps the same destination to the same equal-cost path
-/// (a flow's packets never split across paths). Not a security hash.
+/// #2734: the spread key is now per-FLOW. The session resolution path
+/// threads the 5-tuple flow hash (`ecmp_hash_flow`, the same seeded
+/// FxHasher the flow cache already feeds the session 5-tuple — see
+/// `ecmp_hash_flow`) into `select_route_next_hop`, so distinct flows to
+/// the SAME destination spread across equal-cost members while every
+/// packet of a single flow pins to one member (flow-consistent — no
+/// intra-flow reordering). Callers without a flow context (tunnel outer
+/// resolution, `inject`, bare-dst lookups) pass `None`, which falls back
+/// to the per-DESTINATION hash (`ecmp_hash_v4`/`ecmp_hash_v6`) — the
+/// #2389 behavior. The retained candidate vector (Vec<RouteNextHop>) is
+/// what makes per-flow selection a localized runtime change.
+/// Deterministic ECMP spread mixer. A fixed-seed splitmix64 finalizer over
+/// the input word — used for the per-destination fallback. Stable across
+/// reloads and workers so every worker maps the same input to the same
+/// equal-cost path (a flow's packets never split across paths). Not a
+/// security hash.
 fn ecmp_hash_bytes(seed: u64) -> u64 {
     let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -1946,6 +2016,36 @@ fn ecmp_hash_v4(ip: Ipv4Addr) -> u64 {
 fn ecmp_hash_v6(ip: Ipv6Addr) -> u64 {
     let bits = u128::from(ip);
     ecmp_hash_bytes((bits as u64) ^ ((bits >> 64) as u64))
+}
+
+/// #2734: per-FLOW ECMP spread key over the full 5-tuple.
+///
+/// Hashes the session forward 5-tuple (`addr_family`/`protocol`/`src_ip`/
+/// `dst_ip`/`src_port`/`dst_port`) with the SAME per-boot, per-process
+/// seeded `FxHasher` the flow cache uses (`hot_hash_seed::hot_path_hash_seed`
+/// — #2364), so the cost is one already-vetted hash and the per-flow
+/// mapping reshuffles each restart (defeats offline collision construction)
+/// while staying stable for a flow's lifetime within a boot. The seed is
+/// node-local: ECMP selection picks among THIS node's equal-cost members
+/// and is not part of any wire/HA-synced structure, so a per-node seed is
+/// correct (HA peers re-derive their own pick under their own seed, exactly
+/// as the flow cache and fabric-queue hash do). Determinism within a boot
+/// guarantees flow consistency — every packet of one flow hashes to the
+/// same member, no intra-flow reordering. `select_route_next_hop` reduces
+/// this modulo the live-member count, so the spread tracks the live pool.
+fn ecmp_hash_flow(key: &crate::session::SessionKey) -> u64 {
+    ecmp_hash_flow_seeded(crate::hot_hash_seed::hot_path_hash_seed(), key)
+}
+
+/// Seed-parameterized core of `ecmp_hash_flow`. Split out so tests can pin
+/// the seed and assert (a) intra-seed stability (flow consistency) and
+/// (b) that distinct 5-tuples spread. Production calls through
+/// `ecmp_hash_flow`, which supplies the per-boot process seed.
+fn ecmp_hash_flow_seeded(seed: u64, key: &crate::session::SessionKey) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::with_seed(seed as usize);
+    key.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn select_route_next_hop<'a, T: Copy>(

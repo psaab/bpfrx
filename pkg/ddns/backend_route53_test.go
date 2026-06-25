@@ -113,6 +113,74 @@ func TestRoute53ErrorSurfacesCode(t *testing.T) {
 	}
 }
 
+// TestRoute53DeleteAlreadyGoneIdempotent is the #2771 fail-on-revert guard.
+// When the record is already absent at Route 53, a DELETE returns HTTP 400
+// InvalidChangeBatch "... but it was not found". DeleteLease MUST treat that as
+// idempotent success (nil) so Surface A drops ownership instead of wedging the
+// withdraw forever. Reverting the idempotency makes the already-gone error
+// propagate as a non-nil failure and this test goes RED.
+func TestRoute53DeleteAlreadyGoneIdempotent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`<?xml version="1.0"?><ErrorResponse><Error><Code>InvalidChangeBatch</Code>` +
+			`<Message>[Tried to delete resource record set [name='wan.example.net.', type='A'] but it was not found]</Message>` +
+			`</Error></ErrorResponse>`))
+	}))
+	defer srv.Close()
+	b := newR53TestBackend(t, srv)
+	if err := b.DeleteLease(context.Background(), hostRecord(t, "wan.example.net", "203.0.113.5")); err != nil {
+		t.Fatalf("already-gone DELETE must be idempotent success (nil), got %v", err)
+	}
+}
+
+// TestRoute53DeleteGenuineErrorRetries asserts the idempotency does NOT
+// over-swallow: a real failure (auth, throttle, or a non-"not found"
+// InvalidChangeBatch) must STILL return non-nil so the engine keeps retrying.
+func TestRoute53DeleteGenuineErrorRetries(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		code, msg  string
+		wantSubstr string
+	}{
+		{
+			name: "auth", status: http.StatusForbidden,
+			code: "SignatureDoesNotMatch", msg: "nope",
+			wantSubstr: "SignatureDoesNotMatch",
+		},
+		{
+			name: "throttle", status: http.StatusTooManyRequests,
+			code: "Throttling", msg: "Rate exceeded",
+			wantSubstr: "Throttling",
+		},
+		{
+			// InvalidChangeBatch that is NOT an already-gone delete (a genuine
+			// conflicting/malformed batch) must keep retrying / surface.
+			name: "invalid-batch-not-gone", status: http.StatusBadRequest,
+			code: "InvalidChangeBatch", msg: "[RRSet with DNS name ... is not permitted in zone]",
+			wantSubstr: "InvalidChangeBatch",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`<?xml version="1.0"?><ErrorResponse><Error><Code>` +
+					tc.code + `</Code><Message>` + tc.msg + `</Message></Error></ErrorResponse>`))
+			}))
+			defer srv.Close()
+			b := newR53TestBackend(t, srv)
+			err := b.DeleteLease(context.Background(), hostRecord(t, "wan.example.net", "203.0.113.5"))
+			if err == nil {
+				t.Fatalf("genuine %s failure must NOT be swallowed (want non-nil)", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Fatalf("want error containing %q, got %v", tc.wantSubstr, err)
+			}
+		})
+	}
+}
+
 func TestRoute53MissingCredsConstructError(t *testing.T) {
 	if _, err := newRoute53Backend(&config.DDNSProvider{Name: "r", Backend: "route53", HostedZoneID: "Z"}); err == nil {
 		t.Fatal("missing keys must error")

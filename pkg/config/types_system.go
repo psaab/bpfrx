@@ -294,8 +294,16 @@ type DDNSProvider struct {
 	CheckIPAllowlist string
 }
 
-// String redacts TSIGSecret so a %v/%s/slog format of a DDNSProvider never
-// leaks the shared HMAC key (logging hygiene, mirrors DHCPDynamicDNSConfig).
+// String redacts every credential-bearing field so a %v/%s/slog format of a
+// DDNSProvider never leaks an operator secret (logging hygiene, mirrors
+// DHCPDynamicDNSConfig). The Secret-typed fields (TSIGSecret, Password,
+// APIToken, AWSSecretAccessKey) redact to the secret sentinel. The URL fields
+// (Server, URLTemplate, CheckIPURL) are NOT Secret-typed — they are plain
+// strings — but the generic backend explicitly supports credentials embedded
+// in the URL template (userinfo, or a token in the query string, see
+// pkg/ddns/backend_generic.go) and a checkip-url can carry an API key, so each
+// is run through RedactURL which strips userinfo and the query string while
+// keeping the scheme/host/path for diagnostics (#2781).
 func (p *DDNSProvider) String() string {
 	if p == nil {
 		return "<nil>"
@@ -312,11 +320,11 @@ func (p *DDNSProvider) String() string {
 		"password=%q url-template=%q ok-response=%q api-token=%q zone=%q "+
 		"aws-access-key=%q aws-secret-key=%q aws-region=%q hosted-zone-id=%q "+
 		"checkip-url=%q checkip-allowlist=%q}",
-		p.Name, p.Backend, p.UpdateServer, p.TSIGKeyName, p.TSIGAlgorithm,
+		p.Name, p.Backend, RedactURL(p.UpdateServer), p.TSIGKeyName, p.TSIGAlgorithm,
 		red(p.TSIGSecret), p.SourceAddress, p.DestinationInterface, p.RoutingInstance,
-		p.Server, p.Username, red(p.Password), p.URLTemplate, p.OKResponse,
+		RedactURL(p.Server), p.Username, red(p.Password), RedactURL(p.URLTemplate), p.OKResponse,
 		red(p.APIToken), p.Zone, p.AWSAccessKeyID, red(p.AWSSecretAccessKey),
-		p.AWSRegion, p.HostedZoneID, p.CheckIPURL, p.CheckIPAllowlist)
+		p.AWSRegion, p.HostedZoneID, RedactURL(p.CheckIPURL), p.CheckIPAllowlist)
 }
 
 // SSHServiceConfig holds SSH service settings.

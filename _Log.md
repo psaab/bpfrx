@@ -49,6 +49,134 @@
   `userspace-dp/src/filter/README.md`,
   `userspace-dp/tests/fixtures/protocol_wire_v1.json`,
   `docs/config-schema.md`, `_Log.md`
+## 2026-06-25 — #2770: cloudflare withdraw is content-scoped (delete owned rows only)
+
+- **Timestamp**: 2026-06-25
+- **Action**: Cloudflare Surface A `DeleteLease` deleted whatever
+  `findRecord` returned (`recs[0]`), ignoring the owned content tuple. With
+  multiple same-name/type rows — or after a human/automation changed the
+  value xpf published — the withdraw clobbered the NEW value (or left a
+  duplicate owned row behind). Fix: split the list step into a new
+  `listRecords` (returns ALL matching records); `DeleteLease` now deletes
+  only the rows whose `content == rec.Addr.Unmap().String()`, removing
+  EVERY such row, and treats no-content-match (ownership conflict) /
+  already-gone as a success no-op — never deletes a foreign value. This
+  honours the Surface A sole-delete-authority boundary (Route 53 / RFC 2136
+  re-derive the delete from owned state too). `findRecord` gained a
+  `wantContent` arg so the upsert path prefers the content-matching row
+  (re-publish stays a no-op) before falling back to `recs[0]` for the PATCH
+  target.
+- **File(s)**: `pkg/ddns/backend_cloudflare.go`,
+  `pkg/ddns/backend_cloudflare_test.go`, `pkg/ddns/README.md`, `_Log.md`
+- **Fail-on-revert proof**: reverted `DeleteLease` to the first-only,
+  content-blind body (restored via file copy, not `git checkout`) →
+  `TestCloudflareDeleteAllOwnedRecords` and
+  `TestCloudflareDeleteOwnershipConflict` both go RED (deleted!=2 owned
+  rows / clobbered the foreign value); restored fix → all green.
+- **Gates**: `go build ./...` OK, `gofmt -l` clean, `go vet ./pkg/ddns/...`
+  OK, `go test ./pkg/ddns/...` ok.
+## 2026-06-25 — #2771: route53 already-gone DELETE is idempotent (Surface A unwedge)
+
+- **Timestamp**: 2026-06-25
+- **Action**: A Route 53 Surface A withdraw against an already-removed
+  record failed and never converged: `backend_route53.go` `DeleteLease`
+  sent a strict DELETE and a no-such-record response (HTTP 400
+  `InvalidChangeBatch` "... but it was not found") propagated as non-nil.
+  Surface A's `withdrawOwnedLocked` drops ownership only on a nil return,
+  so the withdraw wedged and retried forever while `show system services
+  dynamic-dns` reported an owned record that no longer existed. Fix: made
+  `DeleteLease` IDEMPOTENT — `change` now returns the parsed Route 53
+  error code+message, and `r53DeleteAlreadyGone` classifies the
+  already-gone case (requires BOTH `Code=InvalidChangeBatch` AND a "not
+  found" marker) as success (nil) so ownership releases. Mirrors the
+  rfc2136 backend's NXRRSET/NXDOMAIN idempotent delete (`sendRemove`).
+  Genuine transient/auth/throttle failures (`SignatureDoesNotMatch`, 5xx,
+  429, a non-"not found" `InvalidChangeBatch`) STILL return non-nil so the
+  engine retries — only the already-gone case is swallowed.
+- **Fail-on-revert proof**: copied `backend_route53.go` aside, neutered
+  the `r53DeleteAlreadyGone` branch in `DeleteLease` (return the raw
+  err) → `TestRoute53DeleteAlreadyGoneIdempotent` FAILED ("already-gone
+  DELETE must be idempotent success (nil), got ... InvalidChangeBatch:
+  [Tried to delete resource record set ...] but it was not found ...
+  unexpected status 400"); the genuine-error subtests
+  (`TestRoute53DeleteGenuineErrorRetries`) stayed GREEN through the revert
+  (no over-swallow). Restored the file → all GREEN.
+- **Gates**: `go build ./...` OK; `gofmt -l pkg/ddns/` clean; `go vet
+  ./pkg/ddns/...` clean; `go test ./pkg/ddns/...` PASS.
+- **File(s)**: `pkg/ddns/backend_route53.go`,
+  `pkg/ddns/backend_route53_test.go`, `pkg/ddns/README.md`, `_Log.md`.
+## 2026-06-25 — #2772: ddns http dyndns2 + generic withdraw is no longer a silent no-op
+
+- **Timestamp**: 2026-06-25
+- **Action**: For the dyndns2 and generic HTTP DDNS backends, `DeleteLease`
+  was a no-op that returned nil WITHOUT any remote operation. Surface A's
+  `withdrawOwnedLocked` drops local ownership only on a nil-error
+  `DeleteLease`, so when xpf withdrew a name (scope shrink, binding
+  removed, address lost) it reported the withdraw done while the public
+  record kept resolving forever — the comments assumed a provider
+  TTL/liveness reap that is NOT a portable dyndns2/generic contract.
+  Fix:
+  - **dyndns2**: `DeleteLease` now performs the de-facto dyndns2 withdraw
+    verb — the SAME update GET with `offline=YES` (which dyn/no-ip/
+    dns-o-matic honour by taking the hostname offline). Refactored the
+    request/auth/status/verdict logic into a shared `update(ctx, q)`
+    helper used by both `UpsertLease` and `DeleteLease`, so a provider
+    failure on the withdraw propagates as a non-nil error and the engine
+    keeps ownership for retry.
+  - **generic**: a single inadyn-style update template has no portable
+    delete verb and xpf exposes no per-provider delete template, so
+    `DeleteLease` now FAILS (`errGenericDeleteUnsupported`) instead of
+    returning nil. The engine increments `deleteFail` and KEEPS the
+    ownership entry, so the abandoned record stays operator-visible
+    rather than being silently reported as withdrawn.
+  - **scope**: provider-source only (`backend_dyndns2.go`,
+    `backend_generic.go` + `backend_http_test.go`). No shared file
+    (`surface_a.go`/`provider.go`/config types) touched — the existing
+    withdraw-keeps-ownership-on-error contract did the rest.
+  - **Fail-on-revert proof**: reverted both `DeleteLease` bodies to
+    `return nil` and confirmed all three new tests go RED
+    (`TestDyndns2DeleteIssuesOfflineRequest` — server never hit;
+    `TestDyndns2DeletePropagatesProviderFailure` — badauth not surfaced;
+    `TestGenericDeleteFailsNotSilentSuccess` — silent success), then
+    restored and confirmed GREEN.
+  - **Validation**: `go build ./...`, `gofmt -l pkg/ddns/` (clean),
+    `go vet ./pkg/ddns/...`, `go test ./pkg/ddns/...` all pass.
+- **File(s)**: pkg/ddns/backend_dyndns2.go, pkg/ddns/backend_generic.go,
+  pkg/ddns/backend_http_test.go, pkg/ddns/README.md, _Log.md
+
+## 2026-06-25 — #2773: wire validateCheckIPURL (dead code) into commit + runtime
+
+- **Timestamp**: 2026-06-25
+- **Action**: `ddns.validateCheckIPURL` existed but had NO callers, so a
+  malformed `checkip-url` committed with no warning and then suppressed
+  publishing indefinitely as a phantom "transient" observation failure
+  (`http.NewRequest` accepts `ftp://`, `not a url`, host-less `http://`,
+  so the bad URL fell through to a fetch failure → `ok=false` → engine
+  leaves the scope untouched forever; a previously-published record
+  stays stale). Fix: (1) hardened `validateCheckIPURL` to require an
+  http(s) scheme AND a host (was prefix-only, missed host-less
+  `http://`); (2) wired it into `ddns.CheckIP` as a fail-closed runtime
+  backstop before constructing the request; (3) mirrored the check as
+  `config.ddnsCheckIPURLValid` and emitted a commit-time warning in
+  `validateSurfaceADDNSWarnings` (config cannot import pkg/ddns — same
+  pattern as `ddnsUpdateServerParseable` / `ddnsKnownDyndns2NameSet`) so
+  an operator typo is surfaced at `commit`. Two fail-on-revert tests:
+  `config.TestP3CheckIPURLMalformedWarns` (commit warning; also asserts a
+  valid URL does NOT warn) and `ddns.TestCheckIPRejectsMalformedURL`
+  (runtime gate via a panic-on-dial transport) + `TestValidateCheckIPURL`.
+- **Fail-on-revert proof**: removed the `validateSurfaceADDNSWarnings`
+  checkip block → `TestP3CheckIPURLMalformedWarns` FAILED ("expected a
+  checkip-url warning for provider \"bad-scheme\""); removed the
+  `CheckIP` gate → `TestCheckIPRejectsMalformedURL` FAILED ("CheckIP
+  attempted a request for a malformed URL: ftp://checkip.example/").
+  Both GREEN after restore.
+- **Gates**: `go build ./...` OK; `gofmt -l` clean; `go vet
+  ./pkg/ddns/... ./pkg/config/...` clean; `go test ./pkg/ddns/...` and
+  `go test ./pkg/config/...` PASS.
+- **File(s)**: `pkg/ddns/checkip.go`, `pkg/ddns/checkip_test.go`,
+  `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/compiler_p3_http_providers_test.go`,
+  `docs/config-schema.md`, `pkg/ddns/README.md`
 
 ## 2026-06-25 — #2789: relay DHCPDECLINE to the server
 
@@ -15886,6 +16014,49 @@ top.
   userspace-dp/src/filter/tests.rs, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2501 — add per-session byte/packet accounting on the AF_XDP
+  forwarding hot path (worker-owned plain-u64 SessionCounters: fwd/rev
+  packets+bytes; account_packet on flow-cache hit + slow-path forward-build,
+  direction derived from the resolved entry, both directions folded onto the
+  canonical forward entry). Surfaced with NO new wire field: counters mirrored
+  into the BPF conntrack map by refresh_bpf_conntrack_last_seen (~1s, for `show
+  security flow session`) and harvested onto the close SessionDelta → written
+  into the SESSION_CLOSE RT_FLOW frame's already-reserved
+  [56:64]/[64:72]/[112:120]/[120:128] slots (NetFlow/IPFIX volume). Updated
+  Go flow.go doc + session README. Fail-on-revert tests added + proven RED.
+  **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/entry.rs, userspace-dp/src/session/install.rs,
+  userspace-dp/src/session/expire.rs, userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/ha.rs,
+  userspace-dp/src/afxdp/bpf_map/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/codec_tests.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  pkg/dataplane/userspace/flow.go, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2501 review fold (PR #2804 MERGE-NEEDS-MINOR finding 1) —
+  cut the FORWARD fast-path session probe count from 3→2. account_packet
+  now does a SINGLE record_by_key_mut resolve: reads is_reverse and (for the
+  dominant forward case) mutates the fwd counters under that one &mut borrow,
+  instead of the prior record_by_key + entry_by_key_mut double probe. Reverse
+  path still pays one extra probe to hop reverse→forward (fine — optimize the
+  bulk forward path). Also folded the near-dup iter_with_idle_and_counters
+  into iter_with_idle (extended its callback with the SessionCounters arg;
+  removed the now-test-only iter_with_idle_and_origin delegation), which also
+  cleared the dead-code warning my switch had introduced. 4 fail-on-revert
+  tests re-proven RED. Bulk established-flow fast path (flow_cache_hit.rs) is
+  now 2 keyed probes/packet (touch_if_stale + the merged account resolve),
+  down from 3.
+  **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/afxdp/bpf_map/mod.rs,
+  userspace-dp/src/session/tests.rs, _Log.md
   **Action**: #2458 — reject unknown non-empty CoS equal-flow-target-policy
   at the Rust helper boundary instead of silently mapping it to `Slowest`.
   `EqualFlowTargetPolicy::parse` is now fallible: `""`/`slowest`/`mean`/
@@ -15976,3 +16147,59 @@ top.
   pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
   pkg/api/metrics_test.go, pkg/api/metrics_descriptor_coverage_test.go,
   docs/userspace-native-gre-plan.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2734 — ECMP per-FLOW next-hop selection. The FIB picked the
+  equal-cost member by a fixed-seed hash of the DESTINATION IP only
+  (#2389), so every flow to one dst pinned to one member (no per-flow
+  spread). Threaded an optional per-flow ECMP hash through the
+  forwarding-resolution path: `select_route_next_hop` now takes a spread
+  hash that, on the session path, is the forward 5-tuple hashed with the
+  SAME per-boot seeded FxHasher the flow cache uses
+  (hot_hash_seed::hot_path_hash_seed, #2364) — no double-hash, one vetted
+  seed. New `lookup_forwarding_resolution_with_dynamic_for_flow` +
+  `ecmp_hash_flow`/`ecmp_hash_flow_seeded`; `_inner`/`_v4`/`_v6` carry an
+  `ecmp_flow_hash: Option<u64>` (None = per-destination fallback for
+  tunnel/WG outer + inject + bare-dst lookups). Flow-consistent (one flow
+  pins to one member, no intra-flow reorder), dead-NH fallback preserved
+  (reduce modulo live count), node-local seed (no cross-node hash-symmetry
+  invariant). Added a fail-on-revert spread test that drives the PRODUCTION
+  session path (RED-on-revert proven: per-dst collapses {11,22}->{11}) plus
+  a seeded-hash stability/spread test. No wire change (runtime selection);
+  protocol_wire green.
+  **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md, docs/multi-wan.md, _Log.md
+  **Action**: #2788 — VRRP addrwatch now schedules an immediate reconcile on an
+  address event for a CONFIGURED interface that appeared after VRRP start
+  (no instance built yet). Track desired interface names in
+  Manager.desiredIfaces (populated in UpdateInstances); reresolveAddrFor's
+  cached-ifindex-miss path treats a resolved-name-in-desiredIfaces with no
+  bound instance as a late-appearing creation signal and fires onEventDrop.
+  Composes with #2294 ifindex-drift restart, #2528 source re-resolve, #2707
+  recreated-link drift. Fail-on-revert test
+  TestAddrWatcher_LateAppearingInterfaceSchedulesReconcile +
+  TestAddrWatcher_UnconfiguredInterfaceNoReconcile (over-fire guard).
+  **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/addrwatch.go,
+  pkg/vrrp/addrwatch_test.go, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2781 — DDNSProvider.String() (pkg/config) printed url-template,
+  server, and checkip-url verbatim. The generic backend supports credentials
+  embedded in the URL template (userinfo or a token in the query string, e.g.
+  https://api.example/update?token=SECRET&host=%h) and a checkip-url can carry
+  an API key, so any %v/%s/slog of a DDNSProvider leaked those tokens. Added
+  config.RedactURL (pkg/config/secret.go): string-based (NOT net/url — the value
+  may be an inadyn template with %h/%i specifiers that url.Parse would mangle)
+  redaction that strips userinfo ("user:pass@" -> "<redacted>@") and the entire
+  query string (after the first '?' -> "<redacted>") while preserving
+  scheme/host/path for diagnostics. String() now wraps Server, URLTemplate,
+  CheckIPURL, and UpdateServer in RedactURL. Fail-on-revert proof: with
+  RedactURL removed from String(), TestDDNSProviderStringRedactsURLCredentials
+  goes RED leaking QUERY-TOKEN-1a2b3c (verified). Gates: go build ./... clean,
+  gofmt -l clean, go vet ./pkg/config/... ./pkg/ddns/... clean,
+  go test ./pkg/config/ + ./pkg/ddns/... pass.
+  **File(s)**: pkg/config/secret.go, pkg/config/types_system.go,
+  pkg/config/ddns_provider_string_test.go, pkg/ddns/README.md, _Log.md

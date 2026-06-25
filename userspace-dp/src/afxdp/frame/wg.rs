@@ -81,6 +81,8 @@ fn outer_physical_egress_ifindex(
     endpoint: &TunnelEndpoint,
     outer_dst: IpAddr,
 ) -> i32 {
+    // #2734: WG outer underlay resolution is per-tunnel-endpoint, not
+    // per-inner-flow — pass None (per-destination ECMP spread).
     let outer = match outer_dst {
         IpAddr::V4(ip) => lookup_forwarding_resolution_v4(
             forwarding,
@@ -89,6 +91,7 @@ fn outer_physical_egress_ifindex(
             &endpoint.transport_table,
             1,
             false,
+            None,
         ),
         IpAddr::V6(ip) => lookup_forwarding_resolution_v6(
             forwarding,
@@ -97,6 +100,7 @@ fn outer_physical_egress_ifindex(
             &endpoint.transport_table,
             1,
             false,
+            None,
         ),
     };
     if outer.egress_ifindex > 0

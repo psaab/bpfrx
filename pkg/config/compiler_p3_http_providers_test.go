@@ -118,3 +118,45 @@ func TestP3IncompleteHTTPProviderWarns(t *testing.T) {
 		}
 	}
 }
+
+// TestP3CheckIPURLMalformedWarns is the #2773 fail-on-revert gate: a malformed
+// checkip-url must be flagged at commit (was dead code — validateCheckIPURL had
+// no callers, so a typo committed silently and then masqueraded forever as a
+// transient observation failure that suppressed publishing). Goes GREEN with the
+// validateSurfaceADDNSWarnings wiring and RED if that wiring is removed. The
+// valid-URL providers in the same config must NOT warn (no false positives).
+func TestP3CheckIPURLMalformedWarns(t *testing.T) {
+	tree := buildTree(t, []string{
+		// Malformed checkip-urls that http.NewRequest would otherwise accept and
+		// then fail to fetch forever.
+		"set system services dynamic-dns provider bad-scheme backend dyndns2",
+		"set system services dynamic-dns provider bad-scheme server dyn.example",
+		"set system services dynamic-dns provider bad-scheme checkip-url ftp://checkip.example/",
+		"set system services dynamic-dns provider no-host backend dyndns2",
+		"set system services dynamic-dns provider no-host server dyn.example",
+		"set system services dynamic-dns provider no-host checkip-url http://",
+		"set system services dynamic-dns provider junk backend dyndns2",
+		"set system services dynamic-dns provider junk server dyn.example",
+		`set system services dynamic-dns provider junk checkip-url "not a url"`,
+		// A valid checkip-url must NOT warn.
+		"set system services dynamic-dns provider good backend dyndns2",
+		"set system services dynamic-dns provider good server dyn.example",
+		"set system services dynamic-dns provider good checkip-url https://checkip.example/",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	warns := validateSurfaceADDNSWarnings(cfg)
+	joined := strings.Join(warns, "\n")
+
+	for _, badName := range []string{"bad-scheme", "no-host", "junk"} {
+		want := "provider \"" + badName + "\" checkip-url"
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected a checkip-url warning for provider %q; got:\n%s", badName, joined)
+		}
+	}
+	if strings.Contains(joined, "provider \"good\" checkip-url") {
+		t.Fatalf("valid checkip-url should not warn; got:\n%s", joined)
+	}
+}

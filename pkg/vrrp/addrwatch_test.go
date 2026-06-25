@@ -367,6 +367,134 @@ func TestAddrWatcher_UnchangedIfindexUsesFastPath(t *testing.T) {
 	}
 }
 
+// TestAddrWatcher_LateAppearingInterfaceSchedulesReconcile is the #2788
+// fail-on-revert gate. An instance is CONFIGURED (in the desired set, recorded
+// via m.desiredIfaces) but its interface did not exist at the last
+// UpdateInstances, so resolveIface failed and no instance was built — there is
+// no entry in m.instances for it. The interface is later created and addressed,
+// emitting an AddrUpdate on its fresh ifindex. The cached-ifindex match loop
+// finds nothing (no instance), and the name-drift loop finds nothing (no
+// instance bound to the name), so before the fix the event was dropped and the
+// instance waited up to ~2s for the periodic reconcile. The fix recognises the
+// resolved name as a desired-but-unbuilt interface and schedules an immediate
+// reconcile.
+//
+// Revert proof: drop the m.desiredIfaces late-appearing branch (or stop
+// populating m.desiredIfaces) and the event matches nothing, onEventDrop never
+// fires, and this test times out RED.
+func TestAddrWatcher_LateAppearingInterfaceSchedulesReconcile(t *testing.T) {
+	m := NewManager()
+	defer stopManagerForTest(m)
+
+	updates := make(chan chan<- netlink.AddrUpdate, 1)
+	m.subscribeAddrs = func(ch chan<- netlink.AddrUpdate, done <-chan struct{}) error {
+		updates <- ch
+		return nil
+	}
+	// The freshly-created interface's ifindex (88) resolves to the configured
+	// name. No instance is bound to it yet.
+	m.resolveLinkName = func(ifindex int) (string, error) {
+		if ifindex == 88 {
+			return "reth0.50", nil
+		}
+		return "", errors.New("test: no such ifindex")
+	}
+	reconciled := make(chan struct{}, 4)
+	m.SetOnEventDrop(func() { reconciled <- struct{}{} })
+
+	// The interface is CONFIGURED (desired) but absent: resolveIface fails so
+	// UpdateInstances builds no instance. Drive UpdateInstances so it records
+	// the desired name in m.desiredIfaces (and starts the watcher).
+	m.resolveIface = func(name string) (*net.Interface, error) {
+		return nil, errors.New("test: interface not present yet")
+	}
+	desired := []*Instance{{Interface: "reth0.50", GroupID: 1, Priority: 200}}
+	if err := m.UpdateInstances(desired); err != nil {
+		t.Fatalf("UpdateInstances: %v", err)
+	}
+	m.mu.RLock()
+	_, recorded := m.desiredIfaces["reth0.50"]
+	_, built := m.instances[instanceKey{iface: "reth0.50", groupID: 1}]
+	m.mu.RUnlock()
+	if !recorded {
+		t.Fatal("desiredIfaces must record the configured interface name")
+	}
+	if built {
+		t.Fatal("no instance should be built when the interface is absent")
+	}
+
+	var ch chan<- netlink.AddrUpdate
+	select {
+	case ch = <-updates:
+	case <-time.After(2 * time.Second):
+		t.Fatal("addr watcher never subscribed")
+	}
+
+	// The interface is created and addressed — AddrUpdate on its new ifindex.
+	ch <- netlink.AddrUpdate{
+		LinkIndex:   88,
+		NewAddr:     true,
+		LinkAddress: net.IPNet{IP: net.ParseIP("172.16.50.8"), Mask: net.CIDRMask(24, 32)},
+	}
+
+	select {
+	case <-reconciled:
+		// Immediate reconcile scheduled — the build happens event-driven, not
+		// after the ~2s periodic reconcile.
+	case <-time.After(2 * time.Second):
+		t.Fatal("late-appearing configured-interface addr event did not schedule a reconcile")
+	}
+}
+
+// TestAddrWatcher_UnconfiguredInterfaceNoReconcile asserts the late-appearing
+// branch does NOT fire for an interface that is not in the desired set: an
+// address event for some unrelated netdev (not a VRRP interface) must be
+// ignored, never triggering a spurious reconcile. Guards the #2788 fix from
+// over-firing on every address event in the system.
+func TestAddrWatcher_UnconfiguredInterfaceNoReconcile(t *testing.T) {
+	m := NewManager()
+	defer stopManagerForTest(m)
+
+	updates := make(chan chan<- netlink.AddrUpdate, 1)
+	m.subscribeAddrs = func(ch chan<- netlink.AddrUpdate, done <-chan struct{}) error {
+		updates <- ch
+		return nil
+	}
+	m.resolveLinkName = func(ifindex int) (string, error) {
+		return "eth-unrelated0", nil // not a configured VRRP interface
+	}
+	reconciled := make(chan struct{}, 4)
+	m.SetOnEventDrop(func() { reconciled <- struct{}{} })
+
+	m.resolveIface = func(name string) (*net.Interface, error) {
+		return nil, errors.New("test: absent")
+	}
+	// Only reth0.50 is desired; the event below is for eth-unrelated0.
+	if err := m.UpdateInstances([]*Instance{{Interface: "reth0.50", GroupID: 1, Priority: 200}}); err != nil {
+		t.Fatalf("UpdateInstances: %v", err)
+	}
+
+	var ch chan<- netlink.AddrUpdate
+	select {
+	case ch = <-updates:
+	case <-time.After(2 * time.Second):
+		t.Fatal("addr watcher never subscribed")
+	}
+
+	ch <- netlink.AddrUpdate{
+		LinkIndex:   55,
+		NewAddr:     true,
+		LinkAddress: net.IPNet{IP: net.ParseIP("10.1.1.1"), Mask: net.CIDRMask(24, 32)},
+	}
+
+	select {
+	case <-reconciled:
+		t.Fatal("address event for an unconfigured interface must NOT schedule a reconcile")
+	case <-time.After(200 * time.Millisecond):
+		// Correct: no reconcile.
+	}
+}
+
 // TestUpdateInstances_StartsAddrWatcher asserts UpdateInstances lazily starts
 // the singleton address watcher for ANY instance (not gated on
 // TrackInterface), and that repeated churn never spawns a second goroutine.
