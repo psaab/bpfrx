@@ -59,7 +59,7 @@ use super::framing::{encode_data_header, parse_data_header};
 // handshake_session.rs (same `wg` module); the engine struct holds a map of
 // them, so it imports the type here.
 use super::handshake_session::PendingHandshake;
-use super::peer::Peer;
+use super::peer::{Peer, PeerConfig};
 use super::session::{REJECT_AFTER_MESSAGES, ReplayDecision, WgSession};
 use super::tai64n::Tai64nClock;
 use super::{
@@ -279,22 +279,46 @@ const fn pad_to_16(n: usize) -> usize {
     (n + 15) & !15
 }
 
-/// Atomically-swappable triple of peer-routing tables. The three
-/// fields are reconciled together (a new config snapshot rebuilds
-/// all three) and a hot-path reader must observe them as a unit, or
-/// else it can pair a `peer_index` from the old map with a `peers`
-/// entry from the new vec and route to the wrong peer. Holding three
-/// independent RwLocks does NOT give that property: a reader can
-/// release the index lock, the reconciler can swap, and then the
-/// reader can acquire the peers lock on the new state. Bundling all
-/// three behind a single `ArcSwap<PeerTable>` gives the reader an
-/// atomic snapshot — every load returns an `Arc<PeerTable>` that is
-/// internally consistent for its lifetime, and the writer publishes
-/// the next snapshot in one release-store.
+/// One peer's slot in a published `PeerTable` snapshot: its long-lived
+/// session/timer state (`Arc<Peer>`, reused across commits) paired with
+/// the immutable per-snapshot config tuple (`Arc<PeerConfig>`, rebuilt
+/// every commit). #2836: the config used to be interior-mutable on the
+/// reused `Peer`, so a reconcile rewrote it in place and an OLD-table
+/// reader instantly observed NEW config (a torn endpoint/keepalive/PSK
+/// mix). Freezing the config into the snapshot entry means every
+/// `.load()` returns a self-consistent `(peer, config)` pair for its
+/// lifetime — the routing-relevant tuple is captured by the same
+/// release-store that publishes `peers`/`allowed_ips`.
+pub(crate) struct PeerEntry {
+    /// Long-lived session + timer state. Same pubkey → same Arc across
+    /// commits, so the (current, previous) session pair survives.
+    pub(crate) peer: Arc<Peer>,
+    /// Immutable config for THIS snapshot. A new commit builds a fresh
+    /// bundle; readers of an older snapshot keep the older bundle.
+    pub(crate) config: Arc<PeerConfig>,
+}
+
+/// Atomically-swappable peer-routing table. The fields are reconciled
+/// together (a new config snapshot rebuilds all of them) and a hot-path
+/// reader must observe them as a unit, or else it can pair a
+/// `peer_index` from the old map with a `peers` entry from the new vec
+/// and route to the wrong peer. Holding independent RwLocks does NOT
+/// give that property: a reader can release the index lock, the
+/// reconciler can swap, and then the reader can acquire the peers lock
+/// on the new state. Bundling everything behind a single
+/// `ArcSwap<PeerTable>` gives the reader an atomic snapshot — every load
+/// returns an `Arc<PeerTable>` that is internally consistent for its
+/// lifetime, and the writer publishes the next snapshot in one
+/// release-store.
+///
+/// #2836: each `PeerEntry` also carries an immutable `Arc<PeerConfig>`
+/// (endpoint/keepalive/PSK) so the operator-facing tuple is part of the
+/// atomic snapshot too — no longer interior-mutated on the reused peer
+/// Arc behind the table's back.
 pub(crate) struct PeerTable {
     /// peer slab — one entry per configured peer. Indexed by the
     /// `peer_index` referenced from `allowed_ips`.
-    pub(crate) peers: Vec<Arc<Peer>>,
+    pub(crate) peers: Vec<PeerEntry>,
     /// peer_pubkey → index in `peers`.
     pub(crate) peer_index_by_pubkey: FxHashMap<[u8; 32], u32>,
     /// AllowedIPs LPM. Only consulted on the decap path.
@@ -491,14 +515,14 @@ impl WgEngine {
     /// Used by the control thread to drive initiator bring-up without
     /// re-plumbing the peer config through the spawn site.
     pub(crate) fn first_peer_pubkey(&self) -> Option<[u8; WG_KEY_LEN]> {
-        self.load_table().peers.first().map(|p| p.pubkey)
+        self.load_table().peers.first().map(|e| e.peer.pubkey)
     }
 
     /// The pubkeys of ALL configured peers, in table (pubkey-sorted)
     /// order (#1434). Used by the control thread's per-peer egress +
     /// timer iteration. Slow path (1s tick / TUN-read fallback).
     pub(crate) fn peer_pubkeys(&self) -> Vec<[u8; WG_KEY_LEN]> {
-        self.load_table().peers.iter().map(|p| p.pubkey).collect()
+        self.load_table().peers.iter().map(|e| e.peer.pubkey).collect()
     }
 
     /// Each peer's (pubkey, configured-or-learned endpoint), in table
@@ -508,7 +532,7 @@ impl WgEngine {
         self.load_table()
             .peers
             .iter()
-            .map(|p| (p.pubkey, *p.endpoint.read().unwrap()))
+            .map(|e| (e.peer.pubkey, e.config.endpoint))
             .collect()
     }
 
@@ -520,7 +544,7 @@ impl WgEngine {
     pub(crate) fn single_peer_pubkey(&self) -> Option<[u8; WG_KEY_LEN]> {
         let table = self.load_table();
         if table.peers.len() == 1 {
-            table.peers.first().map(|p| p.pubkey)
+            table.peers.first().map(|e| e.peer.pubkey)
         } else {
             None
         }
@@ -540,8 +564,13 @@ impl WgEngine {
     ) -> Option<([u8; WG_KEY_LEN], Option<std::net::SocketAddr>)> {
         let table = self.load_table();
         let idx = table.allowed_ips.lookup(inner_dst)?;
-        let peer = table.peers.get(idx as usize)?;
-        Some((peer.pubkey, *peer.endpoint.read().unwrap()))
+        let entry = table.peers.get(idx as usize)?;
+        // #2836 / codex-049-04: endpoint is read from the immutable
+        // per-snapshot config bundle captured by this same `load`, so
+        // the AllowedIPs match and the endpoint come from ONE atomic
+        // snapshot (no torn old-prefix/new-endpoint pairing) and the
+        // hot egress path takes NO per-packet RwLock on the endpoint.
+        Some((entry.peer.pubkey, entry.config.endpoint))
     }
 
     /// Whether the named peer currently has a confirmed (usable for
@@ -609,7 +638,7 @@ impl WgEngine {
         // hot path (readers take only the ArcSwap load).
         let _guard = self.reconcile_lock.lock().unwrap();
         let old = self.table.load_full();
-        let mut new_peers: Vec<Arc<Peer>> = Vec::with_capacity(configs.len());
+        let mut new_peers: Vec<PeerEntry> = Vec::with_capacity(configs.len());
         let mut new_index: FxHashMap<[u8; 32], u32> = FxHashMap::default();
         let mut new_allowed = AllowedIps::new();
         for (i, cfg) in configs.iter().enumerate() {
@@ -617,30 +646,29 @@ impl WgEngine {
             let existing = old
                 .peer_index_by_pubkey
                 .get(&cfg.pubkey)
-                .and_then(|old_idx| old.peers.get(*old_idx as usize).cloned());
+                .and_then(|old_idx| old.peers.get(*old_idx as usize).map(|e| e.peer.clone()));
+            // Reuse the long-lived session/timer state (same pubkey →
+            // same `Arc<Peer>`) so the (current, previous) session pair
+            // and timer pacing survive the commit. The operator-facing
+            // config (endpoint/keepalive/PSK) is NOT mutated in place
+            // anymore (#2836): a FRESH immutable `PeerConfig` is built
+            // per commit and paired with the peer in the snapshot, so a
+            // reader still holding the OLD table observes the OLD config
+            // and a reader of the NEW table observes the NEW config —
+            // never a torn mix. #1434 B2: a PSK rotation produces a new
+            // bundle that takes effect on the next handshake; the old
+            // bundle (with the superseded `Zeroizing` PSK) is wiped when
+            // the last reader of the old snapshot drops it.
             let peer = match existing {
-                Some(p) => {
-                    // Apply mutable-field updates in place. The peer
-                    // Arc is reused so the (current, previous) session
-                    // pair survives the commit. Without this in-place
-                    // update, config changes to endpoint or persistent-
-                    // keepalive on an existing pubkey would be silently
-                    // ignored until the integration layer dropped and
-                    // recreated the peer (which it does not). Codex
-                    // final pre-merge finding 3. #1434 B2: the PSK is
-                    // updated in place too so a PSK rotation on an
-                    // existing pubkey takes effect on the next handshake.
-                    p.update_config(cfg.endpoint, cfg.persistent_keepalive, cfg.preshared_key);
-                    p
-                }
-                None => Arc::new(Peer::new(
-                    cfg.pubkey,
-                    cfg.endpoint,
-                    cfg.persistent_keepalive,
-                    cfg.preshared_key,
-                )),
+                Some(p) => p,
+                None => Arc::new(Peer::new(cfg.pubkey)),
             };
-            new_peers.push(peer);
+            let config = Arc::new(PeerConfig::new(
+                cfg.endpoint,
+                cfg.persistent_keepalive,
+                cfg.preshared_key,
+            ));
+            new_peers.push(PeerEntry { peer, config });
             // r7 Codex/Claude nit: duplicate pubkeys in `configs`
             // leave an orphan `Peer` in `new_peers` (unreachable via
             // pubkey lookup) and make `new_allowed` carry entries
@@ -670,9 +698,10 @@ impl WgEngine {
             if new_index.contains_key(pubkey) {
                 continue;
             }
-            let Some(peer) = old.peers.get(*old_idx as usize) else {
+            let Some(entry) = old.peers.get(*old_idx as usize) else {
                 continue;
             };
+            let peer = &entry.peer;
             if let Some(cur) = peer.current.read().unwrap().as_ref() {
                 dropped_indices.push(cur.local_index);
             }
@@ -726,18 +755,76 @@ impl WgEngine {
     }
 
     /// Test-only accessor: same as `load_table`, exposed at module
-    /// visibility so tests can reach `peer.endpoint()` /
-    /// `peer.persistent_keepalive()` for the reconcile-updates-
-    /// existing-peer regression. Not used on the hot path.
+    /// visibility so tests can reach each `PeerEntry`'s `peer` /
+    /// `config` for the reconcile/atomicity regressions. Not used on
+    /// the hot path.
     #[cfg(test)]
     pub(crate) fn table_for_test(&self) -> Arc<PeerTable> {
         self.load_table()
     }
 
+    /// Test-only: copy-on-write a single peer's `persistent_keepalive`
+    /// without disturbing its sessions or AllowedIPs. Rebuilds the
+    /// affected `PeerEntry` with a fresh config bundle and republishes
+    /// the table atomically, mirroring how `reconcile_peers` swaps
+    /// config (#2836). Used by the timer T8 tests that need to enable
+    /// persistent keepalive on an already-established peer.
+    #[cfg(test)]
+    pub(crate) fn set_keepalive_for_test(&self, pubkey: &[u8; 32], secs: u16) {
+        let _guard = self.reconcile_lock.lock().unwrap();
+        let old = self.table.load_full();
+        let mut peers: Vec<PeerEntry> = Vec::with_capacity(old.peers.len());
+        for entry in old.peers.iter() {
+            let config = if entry.peer.pubkey == *pubkey {
+                Arc::new(PeerConfig::new(
+                    entry.config.endpoint,
+                    secs,
+                    entry.config.preshared_key(),
+                ))
+            } else {
+                entry.config.clone()
+            };
+            peers.push(PeerEntry {
+                peer: entry.peer.clone(),
+                config,
+            });
+        }
+        self.table.store(Arc::new(PeerTable {
+            peers,
+            peer_index_by_pubkey: old.peer_index_by_pubkey.clone(),
+            allowed_ips: old.allowed_ips.clone(),
+        }));
+    }
+
+    /// Long-lived session/timer state for a peer (NOT its config).
+    /// Slow-path callers that need the operator-facing config tuple use
+    /// `peer_config` / `peer_entry` instead (#2836).
     pub(in crate::afxdp::wg) fn peer_arc(&self, pubkey: &[u8; 32]) -> Option<Arc<Peer>> {
         let table = self.load_table();
         let idx = *table.peer_index_by_pubkey.get(pubkey)?;
-        table.peers.get(idx as usize).cloned()
+        table.peers.get(idx as usize).map(|e| e.peer.clone())
+    }
+
+    /// The immutable per-snapshot config bundle for a peer (#2836).
+    /// Slow path: handshake PSK selection, the keepalive timer pass.
+    pub(in crate::afxdp::wg) fn peer_config(&self, pubkey: &[u8; 32]) -> Option<Arc<PeerConfig>> {
+        let table = self.load_table();
+        let idx = *table.peer_index_by_pubkey.get(pubkey)?;
+        table.peers.get(idx as usize).map(|e| e.config.clone())
+    }
+
+    /// Both the long-lived `Peer` and its immutable per-snapshot
+    /// `PeerConfig`, taken from ONE `load` so the timer pass reads the
+    /// peer's timer atomics and its config (keepalive) from the SAME
+    /// atomic snapshot rather than two racing loads (#2836).
+    pub(in crate::afxdp::wg) fn peer_entry(
+        &self,
+        pubkey: &[u8; 32],
+    ) -> Option<(Arc<Peer>, Arc<PeerConfig>)> {
+        let table = self.load_table();
+        let idx = *table.peer_index_by_pubkey.get(pubkey)?;
+        let entry = table.peers.get(idx as usize)?;
+        Some((entry.peer.clone(), entry.config.clone()))
     }
 
     /// Install a freshly-completed transport session on a peer and
@@ -1262,8 +1349,8 @@ impl WgEngine {
         // sets that peer's PSK directly. `WG_ZERO_PSK` (no configured
         // PSK) reproduces the pre-#1434 behavior bit-for-bit.
         let psk = self
-            .peer_arc(peer_pubkey)
-            .map(|p| p.preshared_key())
+            .peer_config(peer_pubkey)
+            .map(|c| c.preshared_key())
             .unwrap_or(WG_ZERO_PSK);
         Builder::new(WG_NOISE_PATTERN.parse()?)
             .prologue(WG_PROTOCOL_ID_BYTES)?

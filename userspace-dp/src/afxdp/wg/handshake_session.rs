@@ -478,7 +478,7 @@ impl WgEngine {
             pk.copy_from_slice(rs);
             pk
         };
-        let Some(peer) = self.peer_arc(&peer_pubkey) else {
+        let Some(peer_config) = self.peer_config(&peer_pubkey) else {
             return Err(HandshakeError::UnknownInitiator);
         };
 
@@ -489,8 +489,9 @@ impl WgEngine {
         // overriding the zero PSK the builder pre-set. A peer with no
         // configured PSK keeps the zero key (pre-#1434 behavior). snow
         // 0.10.0 exposes HandshakeState::set_psk for exactly this
-        // "identify peer, then pick PSK" responder ordering.
-        let psk = peer.preshared_key();
+        // "identify peer, then pick PSK" responder ordering. #2836: the
+        // PSK comes from the immutable per-snapshot config bundle.
+        let psk = peer_config.preshared_key();
         if state.set_psk(2, &psk).is_err() {
             return Err(HandshakeError::Crypto);
         }

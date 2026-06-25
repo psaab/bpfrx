@@ -197,7 +197,8 @@ impl WgEngine {
         let _guard = self.reconcile_lock.lock().unwrap();
         let table = self.load_table();
         let mut dropped_indices: Vec<u32> = Vec::new();
-        for peer in table.peers.iter() {
+        for entry in table.peers.iter() {
+            let peer = &entry.peer;
             for slot in [&peer.current, &peer.previous] {
                 let mut guard = slot.write().unwrap();
                 if let Some(session) = guard.as_ref() {
@@ -265,7 +266,11 @@ impl WgEngine {
         endpoint_known: bool,
     ) -> TimerActions {
         let mut actions = TimerActions::idle();
-        let Some(peer) = self.peer_arc(pubkey) else {
+        // #2836: take the peer's timer state and its config from ONE
+        // table snapshot so the keepalive interval read below pairs with
+        // this peer instance, not a config that a concurrent reconcile
+        // swapped in between two loads.
+        let Some((peer, config)) = self.peer_entry(pubkey) else {
             return actions;
         };
         if !endpoint_known {
@@ -299,7 +304,7 @@ impl WgEngine {
         // authenticated traversal in EITHER direction (wireguard-go
         // `timersAnyAuthenticatedPacketTraversal`) or the last T8
         // attempt (skip-pacing), whichever is later.
-        let keepalive_secs = peer.persistent_keepalive.load(Ordering::Relaxed);
+        let keepalive_secs = config.persistent_keepalive;
         if keepalive_secs != 0 {
             let interval_ns = u64::from(keepalive_secs).saturating_mul(1_000_000_000);
             let anchor = peer
