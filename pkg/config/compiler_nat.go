@@ -265,6 +265,40 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 					}
 				}
 			}
+			// #2491: port-mapped static NAT. The `mapped-port` token rides
+			// inside the children:nil static-nat leaf, so the schema's
+			// value-slot validator never sees it; range-check it here. An
+			// out-of-range port would truncate to a wrong u16 in the snapshot,
+			// so reject it. A `mapped-port` requires a matching `match
+			// destination-port`: without an external port to match, the port
+			// rewrite has no inbound trigger and the reverse SNAT cannot
+			// recover the original port.
+			if rule.MatchDestinationPort != 0 && (rule.MatchDestinationPort < 1 || rule.MatchDestinationPort > 65535) {
+				if err := emitSuffix(fmt.Sprintf(
+					"security nat static rule-set %q rule %q match destination-port %d is out of range (1-65535)",
+					rs.Name, rule.Name, rule.MatchDestinationPort),
+					" (ignored: port match dropped by dataplane until corrected)"); err != nil {
+					return nil, err
+				}
+			}
+			if rule.MappedPort != 0 {
+				if rule.MappedPort < 1 || rule.MappedPort > 65535 {
+					if err := emitSuffix(fmt.Sprintf(
+						"security nat static rule-set %q rule %q then static-nat mapped-port %d is out of range (1-65535)",
+						rs.Name, rule.Name, rule.MappedPort),
+						" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
+						return nil, err
+					}
+				}
+				if rule.MatchDestinationPort == 0 {
+					if err := emitSuffix(fmt.Sprintf(
+						"security nat static rule-set %q rule %q then static-nat mapped-port %d requires a matching `match destination-port`",
+						rs.Name, rule.Name, rule.MappedPort),
+						" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
+						return nil, err
+					}
+				}
+			}
 		}
 	}
 
@@ -1303,6 +1337,26 @@ func parseDNATPortList(m *Node) []int {
 	return ports
 }
 
+// staticNATMappedPortFromKeys extracts the `mapped-port <port>` modifier
+// from a flat-set static-NAT leaf's collapsed Keys (#2491). The lexer
+// collapses `then static-nat prefix <ip> mapped-port <port>` onto one node
+// whose Keys are `["static-nat","prefix","<ip>","mapped-port","<port>"]`
+// because `static-nat` is a children:nil schema leaf. Returns 0 (no port
+// translation) when the keyword is absent or its value is non-numeric;
+// the schema does not yet range-check this in-leaf token, so the caller's
+// dataplane parse fails closed on an out-of-range value.
+func staticNATMappedPortFromKeys(keys []string) int {
+	for i := 0; i+1 < len(keys); i++ {
+		if keys[i] == "mapped-port" {
+			if p, err := strconv.Atoi(keys[i+1]); err == nil {
+				return p
+			}
+			return 0
+		}
+	}
+	return 0
+}
+
 func compileNATStatic(node *Node, sec *SecurityConfig) error {
 	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
 		// Parse from zones (bracket lists produce multiple keys)
@@ -1329,6 +1383,14 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 						rule.Match = nodeVal(m)
 					case "source-address":
 						rule.SourceAddress = nodeVal(m)
+					case "destination-port":
+						// #2491: external (pre-translation) destination
+						// port the inbound packet must carry. Schema
+						// already range-checks 1..65535; tolerate a
+						// non-numeric value defensively (leave 0 = any).
+						if p, err := strconv.Atoi(nodeVal(m)); err == nil {
+							rule.MatchDestinationPort = p
+						}
 					}
 				}
 			}
@@ -1347,8 +1409,30 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 							rule.IsNPTv6 = true
 						} else if len(t.Keys) >= 3 && t.Keys[1] == "prefix" {
 							rule.Then = t.Keys[2]
+							// #2491: optional trailing `mapped-port <port>`.
+							// Flat-set collapses the whole `prefix <ip>
+							// mapped-port <port>` onto this one leaf's Keys
+							// (`static-nat` is a children:nil schema leaf), so
+							// scan for the keyword + value pair.
+							rule.MappedPort = staticNATMappedPortFromKeys(t.Keys)
 						} else if pn := t.FindChild("prefix"); pn != nil {
 							rule.Then = nodeVal(pn)
+							// #2491: `then static-nat prefix <ip> mapped-port
+							// <port>` collapses onto the `prefix` child's Keys
+							// (`["prefix","<ip>","mapped-port","<port>"]`)
+							// because `static-nat` is a children:nil schema
+							// leaf, so the modifier rides on the prefix leaf,
+							// not a sibling `mapped-port` node. Scan pn.Keys.
+							rule.MappedPort = staticNATMappedPortFromKeys(pn.Keys)
+							// Hierarchical shape `static-nat { prefix X;
+							// mapped-port P; }` carries it as a sibling child.
+							if rule.MappedPort == 0 {
+								if mp := t.FindChild("mapped-port"); mp != nil {
+									if p, err := strconv.Atoi(nodeVal(mp)); err == nil {
+										rule.MappedPort = p
+									}
+								}
+							}
 						} else if t.FindChild("inet") != nil || (len(t.Keys) >= 2 && t.Keys[1] == "inet") {
 							// static-nat { inet; } — NAT64 translation
 							rule.Then = "inet"

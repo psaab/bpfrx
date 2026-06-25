@@ -379,6 +379,18 @@ type StaticNATRule struct {
 	SourceAddress string // source-address match (optional, e.g. "::/0" for NAT64)
 	Then          string // static-nat prefix (internal/private IP), or "inet" for NAT64
 	IsNPTv6       bool   // true if this is an nptv6-prefix rule (RFC 6296)
+	// MatchDestinationPort is the external (pre-translation) destination
+	// port the inbound packet must carry for this rule to apply (Junos
+	// `match destination-port`). 0 = match any port (whole-address 1:1,
+	// the legacy behaviour). #2491.
+	MatchDestinationPort int
+	// MappedPort is the internal (post-translation) destination port the
+	// 1:1 host receives (Junos `then static-nat prefix <ip> mapped-port
+	// <port>`). 0 = no port translation (whole-address 1:1). When set, the
+	// inbound DNAT rewrites the destination port to this value and the
+	// outbound return SNAT un-translates it back to MatchDestinationPort.
+	// #2491.
+	MappedPort int
 }
 
 // LimitSessionScreen configures per-IP session limiting.

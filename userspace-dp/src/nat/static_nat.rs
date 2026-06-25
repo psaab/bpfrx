@@ -12,17 +12,32 @@ pub(crate) struct StaticNatEntry {
     pub(crate) external_ip: IpAddr,
     pub(crate) internal_ip: IpAddr,
     pub(crate) from_zone: String,
+    /// #2491: external (pre-translation) destination port the inbound packet
+    /// must carry for a port-mapped rule. `None` = whole-address 1:1 (match
+    /// any port, the legacy behaviour).
+    pub(crate) match_dst_port: Option<u16>,
+    /// #2491: internal (post-translation) destination port to rewrite to.
+    /// `None` = no port translation (whole-address 1:1).
+    pub(crate) mapped_port: Option<u16>,
     /// #2218: per-rule translation hit counter (None for counter_id 0).
     pub(crate) hit_counter: Option<Arc<NatRuleCounter>>,
 }
 
-/// Lookup table for static NAT -- indexed by IP for O(1) matching.
+/// Lookup table for static NAT -- indexed by (IP, Option<port>) for O(1)
+/// matching. #2491: a single external IP can host several per-port mappings
+/// (`mapped-port`) AND a port-less whole-address 1:1 mapping, so the key
+/// carries the matched port. The port-less entry uses `None` and is the
+/// fallback when no port-specific entry matches.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StaticNatTable {
-    /// external_ip -> entry (for inbound DNAT)
-    dnat: FxHashMap<IpAddr, StaticNatEntry>,
-    /// internal_ip -> entry (for outbound SNAT)
-    snat: FxHashMap<IpAddr, StaticNatEntry>,
+    /// (external_ip, match-port) -> entry (for inbound DNAT). The match-port
+    /// is the external destination port (`Some` for a port-mapped rule,
+    /// `None` for a whole-address rule).
+    dnat: FxHashMap<(IpAddr, Option<u16>), StaticNatEntry>,
+    /// (internal_ip, mapped-port) -> entry (for outbound SNAT). The mapped-port
+    /// is the internal source port of the return packet (`Some` for a
+    /// port-mapped rule, `None` for a whole-address rule).
+    snat: FxHashMap<(IpAddr, Option<u16>), StaticNatEntry>,
 }
 
 /// Parse a static-NAT address that may carry a canonical host mask
@@ -71,14 +86,32 @@ impl StaticNatTable {
                 Some(ip) => ip,
                 None => continue,
             };
+            // #2491: a `mapped_port` without a `match_destination_port` has no
+            // inbound trigger (no external port to match) and the reverse SNAT
+            // cannot recover the original port, so fail CLOSED: drop the port
+            // translation and treat the rule as a whole-address 1:1. The Go
+            // compiler already rejects this at strict commit-check; this is the
+            // lenient-load / peer-sync backstop.
+            let (match_dst_port, mapped_port) = match (snap.match_destination_port, snap.mapped_port)
+            {
+                (0, _) => (None, None),
+                (m, 0) => (Some(m), None),
+                (m, p) => (Some(m), Some(p)),
+            };
             let entry = StaticNatEntry {
                 external_ip,
                 internal_ip,
                 from_zone: snap.from_zone.clone(),
+                match_dst_port,
+                mapped_port,
                 hit_counter: nat_counters.rule_counter(snap.counter_id),
             };
-            table.dnat.insert(external_ip, entry.clone());
-            table.snat.insert(internal_ip, entry);
+            // DNAT keyed by the external (pre-translation) destination port.
+            table.dnat.insert((external_ip, match_dst_port), entry.clone());
+            // SNAT keyed by the internal (post-translation) source port of the
+            // return packet, i.e. the mapped-port. A whole-address rule keys on
+            // `None`.
+            table.snat.insert((internal_ip, mapped_port), entry);
         }
         table
     }
@@ -88,20 +121,36 @@ impl StaticNatTable {
     /// Returns just the decision; existing callers/tests keep their
     /// `Option<NatDecision>` shape. The cold path uses
     /// [`match_dnat_with_counter`] (#2218) for the per-rule hit counter.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// #2491: the test-only port-less wrapper looks up the whole-address
+    /// entry (port `0` exercises only the `None` fallback). The production
+    /// path uses [`match_dnat_with_counter`] with the packet's destination
+    /// port so a port-mapped rule can be matched.
+    #[cfg(test)]
     pub(crate) fn match_dnat(&self, dst_ip: IpAddr, ingress_zone: &str) -> Option<NatDecision> {
-        self.match_dnat_with_counter(dst_ip, ingress_zone)
+        self.match_dnat_with_counter(dst_ip, 0, ingress_zone)
             .map(|(decision, _)| decision)
     }
 
     /// #2218: as [`match_dnat`] but also returns the matched entry's
     /// per-rule hit counter (if any).
+    ///
+    /// #2491: `dst_port` is the inbound packet's destination port. A
+    /// port-mapped entry keyed on `Some(match_dst_port)` is tried first; on a
+    /// miss the whole-address entry keyed on `None` is the fallback. When the
+    /// matched entry carries a `mapped_port`, the decision rewrites the
+    /// destination port too.
     pub(crate) fn match_dnat_with_counter(
         &self,
         dst_ip: IpAddr,
+        dst_port: u16,
         ingress_zone: &str,
     ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
-        let entry = self.dnat.get(&dst_ip)?;
+        // Port-specific entry takes precedence over the whole-address entry.
+        let entry = self
+            .dnat
+            .get(&(dst_ip, Some(dst_port)))
+            .or_else(|| self.dnat.get(&(dst_ip, None)))?;
         if !entry.from_zone.is_empty() && entry.from_zone != ingress_zone {
             return None;
         }
@@ -109,6 +158,7 @@ impl StaticNatTable {
             NatDecision {
                 rewrite_src: None,
                 rewrite_dst: Some(entry.internal_ip),
+                rewrite_dst_port: entry.mapped_port,
                 ..NatDecision::default()
             },
             entry.hit_counter.clone(),
@@ -125,24 +175,43 @@ impl StaticNatTable {
     ///
     /// Returns just the decision; the cold path uses
     /// [`match_snat_with_counter`] (#2218) for the per-rule hit counter.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// #2491: the test-only port-less wrapper looks up the whole-address
+    /// entry (port `0` exercises only the `None` fallback).
+    #[cfg(test)]
     pub(crate) fn match_snat(&self, src_ip: IpAddr, ingress_zone: &str) -> Option<NatDecision> {
-        self.match_snat_with_counter(src_ip, ingress_zone)
+        self.match_snat_with_counter(src_ip, 0, ingress_zone)
             .map(|(decision, _)| decision)
     }
 
     /// #2218: as [`match_snat`] but also returns the matched entry's
     /// per-rule hit counter (if any).
+    ///
+    /// #2491: `src_port` is the return packet's source port — for a
+    /// port-mapped flow this is the internal `mapped_port`. A port-specific
+    /// entry keyed on `Some(src_port)` is tried first; on a miss the
+    /// whole-address entry keyed on `None` is the fallback. When the matched
+    /// entry carries a `mapped_port`, the decision un-translates the source
+    /// port back to the external `match_dst_port`.
     pub(crate) fn match_snat_with_counter(
         &self,
         src_ip: IpAddr,
+        src_port: u16,
         _ingress_zone: &str,
     ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
-        let entry = self.snat.get(&src_ip)?;
+        let entry = self
+            .snat
+            .get(&(src_ip, Some(src_port)))
+            .or_else(|| self.snat.get(&(src_ip, None)))?;
+        // For a port-mapped rule, un-translate the source port back to the
+        // external (pre-translation) port; for a whole-address rule this is
+        // `None` (no port rewrite).
+        let rewrite_src_port = entry.mapped_port.and(entry.match_dst_port);
         Some((
             NatDecision {
                 rewrite_src: Some(entry.external_ip),
                 rewrite_dst: None,
+                rewrite_src_port,
                 ..NatDecision::default()
             },
             entry.hit_counter.clone(),
@@ -155,8 +224,11 @@ impl StaticNatTable {
         self.dnat.is_empty()
     }
 
-    /// Returns all external IPs (for local delivery recognition).
+    /// Returns all external IPs (for local delivery recognition). #2491: the
+    /// DNAT map is now keyed by `(IpAddr, Option<u16>)`; project the IP out.
+    /// A given external IP appears once per distinct port mapping, which is
+    /// fine for the consumers (they dedup or only test membership).
     pub(crate) fn external_ips(&self) -> impl Iterator<Item = &IpAddr> {
-        self.dnat.keys()
+        self.dnat.keys().map(|(ip, _)| ip)
     }
 }

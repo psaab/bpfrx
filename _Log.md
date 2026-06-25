@@ -1,3 +1,36 @@
+## 2026-06-25 — #2491: static NAT port / mapped-port forwarding
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added Junos static-NAT per-port forwarding so several
+  services can live behind one public IP. Grammar:
+  `match destination-port <port>` (typed ValueInteger 1..65535) +
+  `then static-nat prefix <ip> mapped-port <port>`. The inbound DNAT
+  rewrites the destination port to mapped-port; the reverse SNAT
+  un-translates the return packet's source port back to the external
+  match port. Go: `StaticNATRule.{MatchDestinationPort,MappedPort}`,
+  compiler parse (both flat-set Keys + hierarchical shapes), strict
+  commit-check range guard + "mapped-port requires match destination-port"
+  guard in `validateNATHostMaskStrict`. Snapshot wire: additive
+  `match_destination_port`/`mapped_port` u16 fields (Go omitempty + Rust
+  serde default, regenerated `protocol_wire_v1.json`). Rust dataplane:
+  `StaticNatTable` keyed by `(IpAddr, Option<u16>)` so a port-mapped rule
+  and a whole-address 1:1 rule coexist on one external IP (port-specific
+  entry wins, port-less is the fallback); `match_dnat_with_counter` /
+  `match_snat_with_counter` thread the packet port. Fail-closed: a
+  mapped-port with no match-port demotes to whole-address; an
+  out-of-range port clamps to 0 on the wire.
+- **File(s)**: pkg/config/types_security.go, pkg/config/compiler_nat.go,
+  pkg/config/schema_security.go, pkg/config/static_nat_mapped_port_2491_test.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/static_nat_mapped_port_2491_test.go,
+  userspace-dp/src/protocol/nat.rs, userspace-dp/src/nat/static_nat.rs,
+  userspace-dp/src/nat/tests.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs,
+  userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/config-schema.md, docs/feature-coverage.md,
+  docs/pr/2491-static-nat-port-fwd/plan.md, _Log.md
+
 ## 2026-06-25 — #2623: GARP/NDP burst follow-up sends now count + surface errors
 
 - **Timestamp**: 2026-06-25
