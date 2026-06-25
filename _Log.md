@@ -1,3 +1,27 @@
+## 2026-06-24 — #2701 review fold: end-to-end call-site test for the WG outer source
+
+- **Timestamp**: 2026-06-24
+- **Action**: Added two end-to-end `wg_encap_frame` tests that assert on the
+  EMITTED outer-IP source bytes of a real built frame, closing the
+  test-coverage gap flagged in review: the original
+  `outer_source_uses_physical_egress_not_tunnel_logical` test called the
+  `outer_physical_egress_ifindex` helper directly and stayed GREEN when ONLY
+  the production call-site source lookup (wg.rs) was reverted to the logical
+  `decision.resolution.egress_ifindex`. The new tests build an ESTABLISHED
+  WgEngine (real Noise IKpsk2 handshake so `try_encap` succeeds) over the
+  shared #2680 fixture, with the peer endpoint routed to the physical egress
+  (ifindex 12), and assert the built frame's outer source == the physical WAN
+  primary (172.16.80.8 v4 / 2001:559:8585:80::8 v6), NOT the tunnel-logical
+  address (10.123.0.1 / fd00:dead::1). Verified fail-on-revert at the CALL
+  SITE: reverting wg.rs's source lookup to the logical egress_ifindex turns
+  BOTH new tests RED (the helper tests stay green, confirming they alone were
+  insufficient); restoring → all green.
+- **File(s)**: `userspace-dp/src/afxdp/frame/wg.rs` (two end-to-end tests +
+  engine/inner-frame test helpers), `_Log.md`.
+- **Validation**: `cargo build --release` clean; `cargo test --release --bin
+  xpf-userspace-dp` wg_frame (11/11) + frame:: + tunnel_ttl (293 total) green.
+  Call-site fail-on-revert confirmed manually (both new tests RED on revert).
+
 ## 2026-06-24 — #2701 + #2703: tunnel outer-IP-header bugs (WG outer source, GRE/WG outer TTL)
 
 - **Timestamp**: 2026-06-24
