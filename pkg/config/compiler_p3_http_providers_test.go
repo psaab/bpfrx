@@ -160,3 +160,41 @@ func TestP3CheckIPURLMalformedWarns(t *testing.T) {
 		t.Fatalf("valid checkip-url should not warn; got:\n%s", joined)
 	}
 }
+
+// TestP3CheckIPURLUppercaseSchemeAccepted is the #2842 fail-on-revert gate: a
+// checkip-url with an uppercase/mixed-case scheme is valid per RFC 3986 §3.1
+// (the scheme is case-INSENSITIVE) and must NOT warn. Goes RED if the mirror
+// ddnsCheckIPURLValid reverts to a case-sensitive HasPrefix on the raw string.
+func TestP3CheckIPURLUppercaseSchemeAccepted(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set system services dynamic-dns provider up-http backend dyndns2",
+		"set system services dynamic-dns provider up-http server dyn.example",
+		"set system services dynamic-dns provider up-http checkip-url HTTP://checkip.example/",
+		"set system services dynamic-dns provider mixed-https backend dyndns2",
+		"set system services dynamic-dns provider mixed-https server dyn.example",
+		"set system services dynamic-dns provider mixed-https checkip-url Https://h/",
+		// A non-http scheme and a host-less URL must STILL warn (no over-accept).
+		"set system services dynamic-dns provider bad-scheme backend dyndns2",
+		"set system services dynamic-dns provider bad-scheme server dyn.example",
+		"set system services dynamic-dns provider bad-scheme checkip-url ftp://checkip.example/",
+		"set system services dynamic-dns provider no-host backend dyndns2",
+		"set system services dynamic-dns provider no-host server dyn.example",
+		"set system services dynamic-dns provider no-host checkip-url http://",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	joined := strings.Join(validateSurfaceADDNSWarnings(cfg), "\n")
+
+	for _, okName := range []string{"up-http", "mixed-https"} {
+		if strings.Contains(joined, "provider \""+okName+"\" checkip-url") {
+			t.Fatalf("uppercase-scheme checkip-url should not warn for %q; got:\n%s", okName, joined)
+		}
+	}
+	for _, badName := range []string{"bad-scheme", "no-host"} {
+		if !strings.Contains(joined, "provider \""+badName+"\" checkip-url") {
+			t.Fatalf("expected a checkip-url warning for provider %q; got:\n%s", badName, joined)
+		}
+	}
+}

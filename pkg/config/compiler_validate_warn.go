@@ -976,16 +976,15 @@ func ddnsKnownDyndns2Provider(name string) bool {
 // closed regardless (#2773). A checkip-url must be an http(s) URL with a host;
 // without that gate a typo (ftp://, "not a url", host-less "http://") commits
 // silently and then masquerades forever as a transient observation failure,
-// suppressing publishing indefinitely.
+// suppressing publishing indefinitely. The scheme check is case-INSENSITIVE per
+// RFC 3986 §3.1 ("HTTPS://host" is valid); it parses first and compares the
+// parsed scheme with EqualFold, matching pkg/ddns.validateCheckIPURL (#2842).
 func ddnsCheckIPURLValid(u string) bool {
-	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-		return false
-	}
 	parsed, err := url.Parse(u)
 	if err != nil || parsed.Host == "" {
 		return false
 	}
-	return true
+	return strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https")
 }
 
 // validateSurfaceADDNSWarnings emits WARN-only commit-time messages for the
