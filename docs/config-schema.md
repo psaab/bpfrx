@@ -120,6 +120,23 @@ covered by `TestSystemDomainSearchBracketList{FlatSet,Hierarchical}` and
 `TestSystemNameServer{BracketListFlatSet,BlockListHierarchical}` in
 `pkg/config/system_multileaf_test.go`.
 
+The routing-protocol export/import readers and the policy-options community
+`members` reader were brought onto the contract in #2587. The schema leaves
+were already `multi:true` (`schema_routing.go`: `protocols ospf export`,
+`protocols ospf3 export`, `protocols bgp export`/`import`, `protocols isis
+export`, `policy-options community <name> members`), but the compilers
+(`compileProtocols`, `compiler_protocols.go`; `compilePolicyOptions`,
+`compiler_routing.go`) read only `child.Keys[1]` with no children iteration,
+so `protocols ospf export [ connected static ]` redistributed only
+`connected` and `community c1 members [ 65000:1 65000:2 ]` truncated to the
+first member. All six now route through `firewallMatchValues`. The
+already-correct BGP **group**/**neighbor** export/import readers
+(`compiler_protocols.go`, #2490) read `Keys[1:]` directly and were left
+unchanged. Fail-on-revert covered by the `TestOSPFExport*`,
+`TestBGPExportImport*`, `TestOSPFv3Export*`, `TestISISExport*`, and
+`TestCommunityMembers*` cases in
+`pkg/config/protocols_multileaf_2587_test.go`.
+
 ## Repeated same-type sibling matches (NOT bracketed multi-value)
 
 The dual-AST contract above covers a single leaf carrying a bracketed list

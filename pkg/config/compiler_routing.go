@@ -374,14 +374,17 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 		}
 		for _, entry := range inst.node.Children {
 			if entry.Name() == "members" {
-				if v := nodeVal(entry); v != "" {
-					cd.Members = append(cd.Members, v)
-				}
+				// Multi-value leaf (#2587): `members [ c1 c2 ]` (and a
+				// hierarchical block) collapses onto entry.Keys[1:] and/or
+				// entry.Children. Read ALL via the firewallMatchValues SSOT;
+				// the prior nodeVal-only read kept just the first community.
+				cd.Members = append(cd.Members, firewallMatchValues(entry)...)
 			}
 		}
-		// Handle flat set syntax: keys like ["members", "65000:100"]
+		// Handle flat set syntax where `members` collapses onto the community
+		// instance node itself: Keys like ["members", "65000:100", ...].
 		if len(inst.node.Keys) > 1 && inst.node.Keys[0] == "members" {
-			cd.Members = append(cd.Members, inst.node.Keys[1])
+			cd.Members = append(cd.Members, inst.node.Keys[1:]...)
 		}
 	}
 

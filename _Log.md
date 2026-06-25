@@ -1,5 +1,25 @@
 # Action Log
 
+## 2026-06-24 — #2587 fix: routing-protocol export/import + community members dropped all but first bracketed value
+
+- **Timestamp**: 2026-06-24
+- **Action**: Routed six multi-value-leaf compiler readers through the
+  shared `firewallMatchValues` SSOT (Keys[1:] + child leaves) so a
+  bracketed list `[ a b c ]` (and a hierarchical block) keeps ALL
+  values on BOTH AST shapes. Affected leaves (all already `multi:true`
+  in `schema_routing.go`): OSPF `export`, BGP `export`/`import`, OSPFv3
+  `export`, IS-IS `export` (`compiler_protocols.go`), policy-options
+  community `members` (`compiler_routing.go`). The already-correct BGP
+  group/neighbor export/import readers (#2490) were left unchanged. Added
+  `protocols_multileaf_2587_test.go` with 10 fail-on-revert cases (flat-set
+  via ParseSetCommand+SetPath AND hierarchical block per reader) — all 10
+  FAIL on the pre-fix readers, pass after. Updated docs/config-schema.md
+  multi-value reader list. Gates: go build ./... clean, go test
+  ./pkg/config/... + ./pkg/frr/... green, gofmt clean.
+- **File(s)**: pkg/config/compiler_protocols.go,
+  pkg/config/compiler_routing.go,
+  pkg/config/protocols_multileaf_2587_test.go, docs/config-schema.md.
+
 ## 2026-06-24 — #2630 review fold: mark flat-set collapse FIXED in pkg/frr/README.md
 
 - **Timestamp**: 2026-06-24
