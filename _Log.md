@@ -15521,3 +15521,29 @@ top.
   pkg/grpcapi/sessions_iterator_error_test.go, pkg/cli/cli_show_flow.go,
   pkg/cli/cli_show_nat.go, pkg/cli/sessions_iterator_error_test.go,
   _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2522 — gate the 500ms mlx5 zero-copy teardown quiesce on
+  `will_rebind` (a snapshot is being applied), not just `had_live_workers`.
+  A teardown with no following bind (the `no_snapshot` / shutdown path)
+  never rebinds the queues, so the 500ms quiesce was pure dead latency
+  there. `Coordinator::reconcile` now passes `will_rebind =
+  snapshot.is_some()` into `tear_down`; the quiesce fires only when live
+  workers were torn down AND a rebind follows. Added `reconcile_quiesce_count`
+  — an INTERNAL / test counter (bumped on each quiesce), NOT wired to any
+  gRPC / Prometheus / status surface. Under `cfg(test)` the quiesce records
+  its requested duration on the PER-INSTANCE `Coordinator::last_quiesce_ms`
+  field (no process-global — each test reads its own coordinator, safe
+  under parallel `cargo test`) and skips the real sleep so the new tests
+  run fast. Three fail-on-revert tests in coordinator/tests.rs:
+  no-live-workers skip, no-snapshot skip (THE pin — RED on revert:
+  left=500 right=0), and live-workers+snapshot fires (barrier preserved).
+  Proved RED on revert, restored. EBUSY barrier is unchanged on the rebind
+  path. Review fold: M1 (replaced a process-global atomic seam with the
+  per-instance field — removed an introduced parallel-test flake), M2
+  (corrected counter wording to internal/test, not "observability").
+  Provenance: codex review-037 finding 037-03.
+  **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/teardown.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md
