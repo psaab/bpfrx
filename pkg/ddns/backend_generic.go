@@ -2,6 +2,7 @@ package ddns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -135,9 +136,25 @@ func (b *genericBackend) UpsertLease(ctx context.Context, rec LeaseDNSRecord) er
 	return fmt.Errorf("ddns generic: %s: response did not match success substring(s) %v", b.name, b.okSubstr)
 }
 
-// DeleteLease is a no-op for the generic backend: a templated update protocol
-// has no portable delete verb. Report success so a removed binding does not wedge
-// the engine (the record ages out via its TTL / the provider's liveness reap).
-func (b *genericBackend) DeleteLease(_ context.Context, _ LeaseDNSRecord) error {
-	return nil
+// errGenericDeleteUnsupported marks the generic backend's lack of a portable
+// withdraw verb (#2772). A single inadyn-style update template carries no notion
+// of "remove this record", and xpf exposes no per-provider delete template, so
+// there is nothing safe to send. Wrapped (never bare) so a caller can errors.Is
+// it and surface the abandoned record rather than treat it as a generic failure.
+var errGenericDeleteUnsupported = errors.New("ddns generic: backend has no delete/withdraw operation")
+
+// DeleteLease FAILS for the generic backend (#2772): a templated update protocol
+// has no portable delete verb, and xpf has no per-provider delete template, so
+// the backend cannot actually clear the record. The previous implementation was
+// a no-op that returned nil — the Surface A engine then dropped local ownership
+// while the public record kept resolving forever. Returning a non-nil error
+// makes the engine increment deleteFail and KEEP the ownership entry, so the
+// stale/abandoned record stays operator-visible (it shows up as a withdraw that
+// did not complete) instead of being silently reported as withdrawn. An operator
+// who needs an actual withdraw must use a backend that supports one (dyndns2's
+// offline verb, cloudflare/route53 DELETE, or rfc2136) and clear the record at
+// the provider out of band.
+func (b *genericBackend) DeleteLease(_ context.Context, rec LeaseDNSRecord) error {
+	return fmt.Errorf("ddns generic: %s: cannot withdraw %s %s: %w",
+		b.name, rec.ForwardType, rec.FQDN, errGenericDeleteUnsupported)
 }

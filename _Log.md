@@ -24,6 +24,44 @@
   rows / clobbered the foreign value); restored fix → all green.
 - **Gates**: `go build ./...` OK, `gofmt -l` clean, `go vet ./pkg/ddns/...`
   OK, `go test ./pkg/ddns/...` ok.
+## 2026-06-25 — #2772: ddns http dyndns2 + generic withdraw is no longer a silent no-op
+
+- **Timestamp**: 2026-06-25
+- **Action**: For the dyndns2 and generic HTTP DDNS backends, `DeleteLease`
+  was a no-op that returned nil WITHOUT any remote operation. Surface A's
+  `withdrawOwnedLocked` drops local ownership only on a nil-error
+  `DeleteLease`, so when xpf withdrew a name (scope shrink, binding
+  removed, address lost) it reported the withdraw done while the public
+  record kept resolving forever — the comments assumed a provider
+  TTL/liveness reap that is NOT a portable dyndns2/generic contract.
+  Fix:
+  - **dyndns2**: `DeleteLease` now performs the de-facto dyndns2 withdraw
+    verb — the SAME update GET with `offline=YES` (which dyn/no-ip/
+    dns-o-matic honour by taking the hostname offline). Refactored the
+    request/auth/status/verdict logic into a shared `update(ctx, q)`
+    helper used by both `UpsertLease` and `DeleteLease`, so a provider
+    failure on the withdraw propagates as a non-nil error and the engine
+    keeps ownership for retry.
+  - **generic**: a single inadyn-style update template has no portable
+    delete verb and xpf exposes no per-provider delete template, so
+    `DeleteLease` now FAILS (`errGenericDeleteUnsupported`) instead of
+    returning nil. The engine increments `deleteFail` and KEEPS the
+    ownership entry, so the abandoned record stays operator-visible
+    rather than being silently reported as withdrawn.
+  - **scope**: provider-source only (`backend_dyndns2.go`,
+    `backend_generic.go` + `backend_http_test.go`). No shared file
+    (`surface_a.go`/`provider.go`/config types) touched — the existing
+    withdraw-keeps-ownership-on-error contract did the rest.
+  - **Fail-on-revert proof**: reverted both `DeleteLease` bodies to
+    `return nil` and confirmed all three new tests go RED
+    (`TestDyndns2DeleteIssuesOfflineRequest` — server never hit;
+    `TestDyndns2DeletePropagatesProviderFailure` — badauth not surfaced;
+    `TestGenericDeleteFailsNotSilentSuccess` — silent success), then
+    restored and confirmed GREEN.
+  - **Validation**: `go build ./...`, `gofmt -l pkg/ddns/` (clean),
+    `go vet ./pkg/ddns/...`, `go test ./pkg/ddns/...` all pass.
+- **File(s)**: pkg/ddns/backend_dyndns2.go, pkg/ddns/backend_generic.go,
+  pkg/ddns/backend_http_test.go, pkg/ddns/README.md, _Log.md
 
 ## 2026-06-25 — #2773: wire validateCheckIPURL (dead code) into commit + runtime
 
@@ -16030,6 +16068,29 @@ top.
   docs/userspace-native-gre-plan.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2734 — ECMP per-FLOW next-hop selection. The FIB picked the
+  equal-cost member by a fixed-seed hash of the DESTINATION IP only
+  (#2389), so every flow to one dst pinned to one member (no per-flow
+  spread). Threaded an optional per-flow ECMP hash through the
+  forwarding-resolution path: `select_route_next_hop` now takes a spread
+  hash that, on the session path, is the forward 5-tuple hashed with the
+  SAME per-boot seeded FxHasher the flow cache uses
+  (hot_hash_seed::hot_path_hash_seed, #2364) — no double-hash, one vetted
+  seed. New `lookup_forwarding_resolution_with_dynamic_for_flow` +
+  `ecmp_hash_flow`/`ecmp_hash_flow_seeded`; `_inner`/`_v4`/`_v6` carry an
+  `ecmp_flow_hash: Option<u64>` (None = per-destination fallback for
+  tunnel/WG outer + inject + bare-dst lookups). Flow-consistent (one flow
+  pins to one member, no intra-flow reorder), dead-NH fallback preserved
+  (reduce modulo live count), node-local seed (no cross-node hash-symmetry
+  invariant). Added a fail-on-revert spread test that drives the PRODUCTION
+  session path (RED-on-revert proven: per-dst collapses {11,22}->{11}) plus
+  a seeded-hash stability/spread test. No wire change (runtime selection);
+  protocol_wire green.
+  **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md, docs/multi-wan.md, _Log.md
   **Action**: #2788 — VRRP addrwatch now schedules an immediate reconcile on an
   address event for a CONFIGURED interface that appeared after VRRP start
   (no instance built yet). Track desired interface names in
