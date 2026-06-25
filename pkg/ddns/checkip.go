@@ -78,7 +78,7 @@ func parseCheckIPBody(body string, wantV4 bool, allowlist []netip.Addr) (netip.A
 		if a.Is4() != wantV4 {
 			continue
 		}
-		if !isPublicAddr(a) {
+		if !IsPublicAddr(a) {
 			continue
 		}
 		if isAllowlisted(a, allowlist) {
@@ -113,7 +113,7 @@ var specialPurposeV4 = []netip.Prefix{
 }
 
 // specialPurposeV6 enumerates the IANA IPv6 Special-Purpose Address Registry
-// ranges not covered by the stdlib netip predicates used in isPublicAddr.
+// ranges not covered by the stdlib netip predicates used in IsPublicAddr.
 // IsUnspecified (::/128), IsLoopback (::1/128), IsLinkLocalUnicast (fe80::/10),
 // and IsMulticast (ff00::/8) are handled by predicates; the prefixes below add
 // ULA (fc00::/7), the documentation prefixes (2001:db8::/32, 3fff::/20), the
@@ -136,7 +136,7 @@ var specialPurposeV6 = []netip.Prefix{
 	netip.MustParsePrefix("fc00::/7"),       // unique-local / ULA (RFC 4193)
 }
 
-// isPublicAddr is the inadyn validity gate: it accepts only a globally-routable
+// IsPublicAddr is the inadyn validity gate: it accepts only a globally-routable
 // unicast address (the public address a checkip endpoint should report) and
 // rejects every IANA special-purpose range. A private/reserved/benchmark result
 // usually means the request never left the NAT, or the endpoint is hostile or
@@ -144,7 +144,12 @@ var specialPurposeV6 = []netip.Prefix{
 // record (#2774). stdlib predicates cover the loopback/link-local/multicast/
 // unspecified/RFC-1918 cases; the specialPurposeV4/V6 tables cover the rest of
 // the registry (CGNAT, benchmarking, documentation, ULA, translation, etc.).
-func isPublicAddr(a netip.Addr) bool {
+//
+// Exported (#2776) so the daemon's Surface A static-address fallback
+// (pkg/daemon/daemon_ddns_surface_a.go staticUnitAddr) gates a configured
+// static address through the SAME predicate the netlink and checkip address
+// sources use — a mis-scoped static address must not publish a martian.
+func IsPublicAddr(a netip.Addr) bool {
 	if !a.IsValid() || a.IsUnspecified() || a.IsLoopback() ||
 		a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() || a.IsMulticast() ||
 		a.IsPrivate() || a.IsInterfaceLocalMulticast() {
