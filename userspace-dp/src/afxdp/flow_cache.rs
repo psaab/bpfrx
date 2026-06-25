@@ -1,6 +1,5 @@
 use super::*;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 const FLOW_CACHE_SIZE: usize = 4096;
@@ -53,7 +52,9 @@ pub(super) struct CachedTxSelectionDescriptor {
     pub(super) queue_id: Option<u8>,
     pub(super) dscp_rewrite: Option<u8>,
     pub(super) drop: bool,
-    pub(super) filter_counter: Option<Arc<crate::filter::FilterTermCounter>>,
+    // #2573: all matched `then count` term counters for this flow, not just the
+    // last — the cached replay must increment every fall-through count term.
+    pub(super) filter_counters: crate::filter::CachedFilterCounters,
     pub(super) three_color_policers: crate::filter::CachedThreeColorPolicers,
     pub(super) filter_log: Option<crate::filter::FilterLogMatch>,
 }

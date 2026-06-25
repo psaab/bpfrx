@@ -70,13 +70,16 @@ fn evaluate_filter_ref_tx_selection_cached_v4(
 
 /// #2544: merge a matched term's modifiers into the cached TX-selection result.
 /// Used for both fall-through and terminating matches. Latest matched term wins
-/// for forwarding-class, dscp-rewrite, counter, and log; three-color policers
-/// accumulate via `extend` so a policer on every matched term still meters on
-/// the cached rebuild path. The action is set only by the caller for a
-/// terminating term. NOTE: `counter` holds a single Arc — when multiple matched
-/// fall-through terms each carry `then count`, the cached rebuild path records
-/// only the LAST (a pre-existing structural limit of CachedTxSelectionFilterResult,
-/// unchanged by this fix; the uncached full-eval path counts every term).
+/// for forwarding-class, dscp-rewrite, and log; three-color policers AND
+/// `then count` term counters accumulate so a counter/policer on every matched
+/// term still records on the cached rebuild path. The action is set only by the
+/// caller for a terminating term.
+///
+/// #2573: `counters` accumulates EVERY matched `then count` term (deduped by
+/// counter identity), not just the last. With #2544 fall-through a single packet
+/// can match multiple `then count` terms; the old single-Arc slot kept only the
+/// last, so the earlier fall-through count terms were silently under-counted on
+/// the cached replay path while the uncached full-eval path counted each.
 #[inline]
 fn merge_matched_cached_modifiers(
     acc: &mut CachedTxSelectionFilterResult,
@@ -90,7 +93,7 @@ fn merge_matched_cached_modifiers(
         acc.dscp_rewrite = term.dscp_rewrite;
     }
     if term.has_count {
-        acc.counter = Some(term.counter.clone());
+        acc.counters.push(term.counter.clone());
     }
     acc.three_color_policers
         .extend(CachedThreeColorPolicers::from_option(

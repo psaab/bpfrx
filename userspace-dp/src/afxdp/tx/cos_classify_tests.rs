@@ -1008,7 +1008,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
 
     assert_eq!(cached.queue_id, Some(1));
     assert_eq!(cached.dscp_rewrite, None);
-    assert!(cached.filter_counter.is_some());
+    assert!(!cached.filter_counters.is_empty());
 }
 
 #[test]
@@ -1243,7 +1243,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
 
     assert_eq!(cached.queue_id, Some(1));
     assert_eq!(cached.dscp_rewrite, None);
-    assert!(cached.filter_counter.is_some());
+    assert!(!cached.filter_counters.is_empty());
 }
 
 #[test]
@@ -1325,7 +1325,7 @@ fn resolve_cached_cos_tx_selection_keeps_counter_only_output_filter_hits() {
 
     assert_eq!(cached.queue_id, Some(0));
     assert_eq!(cached.dscp_rewrite, None);
-    assert!(cached.filter_counter.is_some());
+    assert!(!cached.filter_counters.is_empty());
 }
 
 #[test]
