@@ -24,14 +24,38 @@ const maxEventFramePayloadForWiringTest = 1 << 20
 
 func (p fixedEventStreamProvider) EventStream() *dpuserspace.EventStream { return p.es }
 
+// buildSessionOpenFrameV4PayloadForWiringTest builds a v4 SessionOpen payload
+// in the #2467 widened wire layout consumed by
+// pkg/dataplane/userspace.decodeSessionEvent:
+//
+//	[0]     AddrFamily (4)
+//	[1]     Protocol
+//	[2:4]   SrcPort        [4:6]   DstPort
+//	[6:8]   NATSrcPort     [8:10]  NATDstPort
+//	[10:14] OwnerRGID (int32 LE)      — #2467: widened from int16
+//	[14:18] EgressIfindex (int32 LE)  — #2467: widened from int16
+//	[18:22] TXIfindex (int32 LE)      — #2467: widened from int16
+//	[22:24] TunnelEndpointID  [24:26] TXVLANID
+//	[26] Flags [27] IngressZone [28] EgressZone [29] Disposition
+//	[30..]  src/dst/nat_src/nat_dst IPs (4 bytes each, v4)
+//	[N..]   NeighborMAC(6) SrcMAC(6) NextHop(4)
+//
+// Total v4 size: 30 + 4*4 + 6 + 6 + 4 = 62 bytes. The three identity
+// fields are seeded with 40000 (> int16 max 32767) so the full daemon
+// wire+ack path round-trips a high ifindex per the #2467 intent — a
+// revert to the old 24-byte/int16 layout makes this payload undersized
+// (decodeSessionEvent rejects it, no ACK is sent, the test times out).
 func buildSessionOpenFrameV4PayloadForWiringTest() []byte {
-	buf := make([]byte, 56)
+	buf := make([]byte, 62)
 	buf[0] = 4
 	buf[1] = 6
 	binary.LittleEndian.PutUint16(buf[2:4], 12345)
 	binary.LittleEndian.PutUint16(buf[4:6], 443)
-	copy(buf[24:28], []byte{10, 0, 1, 2})
-	copy(buf[28:32], []byte{172, 16, 0, 1})
+	binary.LittleEndian.PutUint32(buf[10:14], 40000) // OwnerRGID (>int16)
+	binary.LittleEndian.PutUint32(buf[14:18], 40001) // EgressIfindex
+	binary.LittleEndian.PutUint32(buf[18:22], 40002) // TXIfindex
+	copy(buf[30:34], []byte{10, 0, 1, 2})            // SrcIP
+	copy(buf[34:38], []byte{172, 16, 0, 1})          // DstIP
 	return buf
 }
 
