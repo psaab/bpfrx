@@ -259,28 +259,32 @@ impl EventFrame {
         buf[pos..pos + 2].copy_from_slice(&nat.rewrite_dst_port.unwrap_or(0).to_le_bytes());
         pos += 2;
 
-        // [10:12] OwnerRGID i16 LE
-        buf[pos..pos + 2].copy_from_slice(&(metadata.owner_rg_id as i16).to_le_bytes());
-        pos += 2;
+        // [10:14] OwnerRGID i32 LE
+        // #2467: widened from i16 to i32. Linux ifindexes (the sibling fields
+        // below) are a full `int` and wrap negative past 32767 on long-running
+        // systems with interface churn; owner_rg_id is widened with them to
+        // keep the record's three identity ints a uniform 32-bit width.
+        buf[pos..pos + 4].copy_from_slice(&(metadata.owner_rg_id as i32).to_le_bytes());
+        pos += 4;
 
-        // [12:14] EgressIfindex i16 LE
-        buf[pos..pos + 2]
-            .copy_from_slice(&(decision.resolution.egress_ifindex as i16).to_le_bytes());
-        pos += 2;
+        // [14:18] EgressIfindex i32 LE (#2467)
+        buf[pos..pos + 4]
+            .copy_from_slice(&(decision.resolution.egress_ifindex as i32).to_le_bytes());
+        pos += 4;
 
-        // [14:16] TXIfindex i16 LE
-        buf[pos..pos + 2].copy_from_slice(&(decision.resolution.tx_ifindex as i16).to_le_bytes());
-        pos += 2;
+        // [18:22] TXIfindex i32 LE (#2467)
+        buf[pos..pos + 4].copy_from_slice(&(decision.resolution.tx_ifindex as i32).to_le_bytes());
+        pos += 4;
 
-        // [16:18] TunnelEndpointID u16 LE
+        // [22:24] TunnelEndpointID u16 LE
         buf[pos..pos + 2].copy_from_slice(&decision.resolution.tunnel_endpoint_id.to_le_bytes());
         pos += 2;
 
-        // [18:20] TXVLANID u16 LE
+        // [24:26] TXVLANID u16 LE
         buf[pos..pos + 2].copy_from_slice(&decision.resolution.tx_vlan_id.to_le_bytes());
         pos += 2;
 
-        // [20] Flags
+        // [26] Flags
         let mut flags: u8 = 0;
         if fabric_redirect_sync
             || decision.resolution.disposition == ForwardingDisposition::FabricRedirect
@@ -296,7 +300,7 @@ impl EventFrame {
         buf[pos] = flags;
         pos += 1;
 
-        // [21] IngressZoneID u8
+        // [27] IngressZoneID u8
         // #919/#922: SessionMetadata.ingress_zone is now u16 directly;
         // no name→id round-trip. Wire format remains u8 — assert this
         // at debug time. forwarding_build.rs:80 enforces zone IDs
@@ -311,7 +315,7 @@ impl EventFrame {
         buf[pos] = ingress_id;
         pos += 1;
 
-        // [22] EgressZoneID u8
+        // [28] EgressZoneID u8
         debug_assert!(
             metadata.egress_zone < 256,
             "zone id {} exceeds wire u8 capacity",
@@ -321,7 +325,7 @@ impl EventFrame {
         buf[pos] = egress_id;
         pos += 1;
 
-        // [23] Disposition u8
+        // [29] Disposition u8
         buf[pos] = encode_disposition(decision.resolution.disposition);
         pos += 1;
 
@@ -395,9 +399,9 @@ impl EventFrame {
         pos = write_ip(&mut buf, pos, key.src_ip, is_v6);
         pos = write_ip(&mut buf, pos, key.dst_ip, is_v6);
 
-        // OwnerRGID i16 LE
-        buf[pos..pos + 2].copy_from_slice(&(owner_rg_id as i16).to_le_bytes());
-        pos += 2;
+        // OwnerRGID i32 LE (#2467: widened from i16, see encode_session_open).
+        buf[pos..pos + 4].copy_from_slice(&owner_rg_id.to_le_bytes());
+        pos += 4;
 
         // Flags
         buf[pos] = close_flags;
