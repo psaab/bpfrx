@@ -1,3 +1,26 @@
+## 2026-06-25 — fix TestShowTextGolden syn-flood attack-threshold golden drift (#3033 follow-up)
+
+- **Timestamp**: 2026-06-25
+- **Action**: master CI was RED — `TestShowTextGolden` in `pkg/grpcapi`
+  failed because PR #3033 (#3024) started applying the Junos default
+  syn-flood `attack-threshold 200` when the stanza is enabled without an
+  explicit threshold. The golden fixture
+  (`showGoldenConfigCommands`) enables `security screen ids-option
+  untrust-screen tcp syn-flood` with NO explicit threshold, so the three
+  screen show topics (`screen`, `screen-ids-option:untrust-screen`,
+  `screen-ids-option-detail:untrust-screen`) now render 200 where the
+  golden snapshot still expected 0. #3033's gates were pkg/config +
+  pkg/dataplane and missed this show-text golden. Regenerated the golden
+  via `UPDATE_SHOW_GOLDEN=1 go test ./pkg/grpcapi/ -run TestShowTextGolden`;
+  the only diff is the three `0`→`200` attack-threshold renderings, which
+  is the now-correct behavior (200 is the intended default). Confirmed no
+  other topic drifted.
+- **File(s)**: pkg/grpcapi/testdata/server_show_golden.json, _Log.md
+- **Validation**: `go test ./pkg/grpcapi/...` (154 passed), `go build
+  ./...`, `go vet ./pkg/grpcapi/...` all green. Pre-existing gofmt drift
+  in `server_show_chassis_forwarding_test.go` is on origin/master and out
+  of scope (untouched by this change).
+
 ## 2026-06-25 — #2890: eventengine runAction retry timer leak (time.After → time.NewTimer+Stop)
 
 - **Timestamp**: 2026-06-25
