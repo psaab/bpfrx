@@ -14,6 +14,18 @@ use super::*;
 pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) local_v4: FastSet<Ipv4Addr>,
     pub(in crate::afxdp) local_v6: FastSet<Ipv6Addr>,
+    /// #3182: EVERY configured interface address, decoupled from the
+    /// NAT-aware `local_v*` exclusion. `local_v4`/`local_v6` drop the IP of
+    /// any interface whose zone is an interface-mode-SNAT `to_zone`
+    /// (`nat_translated_local_exclusions`), so they are NOT a complete
+    /// "addresses this router owns" set — the SNAT/WAN interface IP is
+    /// missing. The anti-poison `owns_configured_ip` predicate is driven
+    /// from this full set instead so an unsolicited ARP/NDP (or RX-learn)
+    /// claiming the router's own WAN/SNAT interface IP is still rejected.
+    /// Built alongside `local_v*` in `populate_interfaces`, BEFORE the NAT
+    /// exclusion branch, from the same per-interface address list.
+    pub(in crate::afxdp) configured_iface_v4: FastSet<Ipv4Addr>,
+    pub(in crate::afxdp) configured_iface_v6: FastSet<Ipv6Addr>,
     pub(in crate::afxdp) interface_nat_v4: FastMap<Ipv4Addr, i32>,
     pub(in crate::afxdp) interface_nat_v6: FastMap<Ipv6Addr, i32>,
     pub(in crate::afxdp) connected_v4: Vec<ConnectedRouteV4>,
@@ -237,11 +249,11 @@ impl ForwardingState {
         self.zone_tcp_rst.get(&zone_id).copied().unwrap_or(false)
     }
 
-    /// #2851: true iff `ip` is one of the router's OWN configured interface
-    /// IPs — i.e. an address this firewall delivers to itself
-    /// (`local_v4`/`local_v6`, the same authoritative set the to-self
-    /// `LocalDelivery` disposition tests in `forwarding::mod`). The dynamic
-    /// neighbor-learn path (ARP reply / NDP NA) uses this as an
+    /// #2851/#3182: true iff `ip` is one of the router's OWN configured
+    /// interface IPs — i.e. an address this firewall must never learn from a
+    /// link-local advertisement. The dynamic
+    /// neighbor-learn path (ARP reply / NDP NA, and the #1787 RX source-MAC
+    /// learn) uses this as an
     /// anti-poisoning gate: a host on the local link must never be able to
     /// teach us `(ifindex, our_own_ip) -> attacker_mac`. RFC 826 / RFC 4861:
     /// a node does not install a neighbor entry for an address it owns from
@@ -251,14 +263,27 @@ impl ForwardingState {
     /// scoped): if `ip` is one of our addresses in ANY routing-instance,
     /// refusing to learn it is always correct — we resolve our own
     /// addresses via the to-self path, never via a dynamic neighbor entry.
-    /// NAT-translated pool addresses are deliberately NOT in `local_v4`/
-    /// `local_v6` (they are excluded at build time), so this gate scopes to
-    /// genuine configured interface IPs only.
+    ///
+    /// #3182: the gate is driven from the NAT-DECOUPLED `configured_iface_v*`
+    /// set, NOT `local_v*`. `local_v*` excludes the IP of an interface whose
+    /// zone is an interface-mode-SNAT `to_zone`
+    /// (`nat_translated_local_exclusions` — e.g. the WAN `reth0.80` IP), so
+    /// reusing it left the router's own SNAT/WAN interface IP poisonable. The
+    /// `local_v*` membership is still OR-ed in so the static-NAT-external and
+    /// DNAT-destination addresses appended to `local_v*` (late-stage
+    /// local-delivery targets the router also answers for) keep their #2851
+    /// protection; `configured_iface_v*` adds the genuine interface IPs that
+    /// the NAT exclusion stripped. NAT-translated POOL addresses are in
+    /// neither set, so the gate still scopes to addresses the router owns.
     #[inline]
     pub(in crate::afxdp) fn owns_configured_ip(&self, ip: IpAddr) -> bool {
         match ip {
-            IpAddr::V4(v4) => self.local_v4.contains(&v4),
-            IpAddr::V6(v6) => self.local_v6.contains(&v6),
+            IpAddr::V4(v4) => {
+                self.configured_iface_v4.contains(&v4) || self.local_v4.contains(&v4)
+            }
+            IpAddr::V6(v6) => {
+                self.configured_iface_v6.contains(&v6) || self.local_v6.contains(&v6)
+            }
         }
     }
 }

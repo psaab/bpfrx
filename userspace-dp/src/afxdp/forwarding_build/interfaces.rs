@@ -120,6 +120,12 @@ pub(super) fn populate_interfaces(
             })?;
             match net {
                 IpNet::V4(v4) => {
+                    // #3182: record EVERY configured interface IP in the
+                    // NAT-decoupled set BEFORE the NAT-exclusion branch, so the
+                    // anti-poison `owns_configured_ip` gate protects the
+                    // SNAT/WAN interface IP that the exclusion routes into
+                    // `interface_nat_v4` (out of `local_v4`).
+                    state.configured_iface_v4.insert(v4.addr());
                     if excluded_local_v4.contains(&v4.addr()) {
                         state.interface_nat_v4.insert(v4.addr(), iface.ifindex);
                     } else {
@@ -133,6 +139,9 @@ pub(super) fn populate_interfaces(
                     });
                 }
                 IpNet::V6(v6) => {
+                    // #3182: NAT-decoupled full interface-IP set (see the V4
+                    // arm above) — protects the SNAT/WAN IPv6 interface IP too.
+                    state.configured_iface_v6.insert(v6.addr());
                     if excluded_local_v6.contains(&v6.addr()) {
                         state.interface_nat_v6.insert(v6.addr(), iface.ifindex);
                     } else {
