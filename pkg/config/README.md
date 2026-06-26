@@ -333,6 +333,30 @@ config, VRF definitions). The tolerant load/peer-sync path downgrades to a warni
 binary silently accepted still boots — it stays applied globally (the pre-existing
 behaviour), now flagged (#1960 no-brick doctrine, same as #3018/#3055/#3060).
 
+**Ambiguous secure-tunnel `bind-interface` aliases are rejected at commit
+(#2933):** `security ipsec vpn <name> bind-interface` is a free-form 1-arg
+string stored verbatim on the typed VPN (`compiler_ipsec.go`); the runtime
+resolves it to a Linux xfrmi device name and a stable XFRM if_id via
+`XFRMIfNameAndID` (`xfrmi.go`): `if_id = stIndex<<16 | (unit+1)`, unit
+defaulting to 0. A bare `st0` is therefore the SAME device as `st0.0` (both
+if_id 1). Two VPNs binding those two distinct strings committed cleanly but
+collide at apply time — only one xfrm device can carry the if_id, so the #2929
+pkg/routing guard refuses to create EITHER device and both tunnels go down with
+a journal ERROR (before #2929 it silently leaked one VPN's SA onto the other's
+tunnel). `validateSecureTunnelBindInterfaceAST` (`compiler_ipsec_bindiface.go`)
+turns that apply-time both-down into a commit-check error: it derives the if_id
+for every VPN's bind-interface and hard-rejects when two DISTINCT strings derive
+the SAME non-zero if_id, naming each offending string, its VPN(s), and the
+shared if_id. The gate is SURGICAL — it does NOT fire when the same string is
+shared by several VPNs (one device, one if_id) nor when a bind-interface cannot
+parse as `st<N>[.unit]` (if_id 0); an unambiguous map (st0.0 + st0.1, or st0 +
+st1) commits cleanly. It is an AST pre-walk in `compileExpanded` so an
+apply-groups-inherited bind-interface is covered and an `inactive:` VPN is
+ignored. The tolerant load/peer-sync path downgrades to a warning
+(`lenientSecureTunnelBindIface`) so an already-persisted or peer-synced config
+an older binary accepted still boots (#1960 no-brick doctrine) — the #2929
+routing guard stays the runtime backstop.
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`
