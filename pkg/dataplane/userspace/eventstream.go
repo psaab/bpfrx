@@ -70,6 +70,13 @@ type EventStream struct {
 	FramesWritten       atomic.Uint64
 	DecodeErrors        atomic.Uint64
 	SeqGaps             atomic.Uint64
+	// SessionSyncResyncs counts how many times a sequence gap on a
+	// correctness-critical session-sync frame (open/close/update) forced a
+	// full bulk re-export + reconnect (#2874). Distinct from SeqGaps, which
+	// also counts benign gaps on telemetry frames (which do NOT force a
+	// resync). A growing value means the helper's lossy producer is dropping
+	// session deltas under channel backpressure.
+	SessionSyncResyncs  atomic.Uint64
 	PolicyDenyEvents    atomic.Uint64
 	ScreenDropEvents    atomic.Uint64
 	ScreenAlarmEvents   atomic.Uint64 // screen event with action=PERMIT (#2298)
@@ -235,6 +242,7 @@ func (es *EventStream) Status() EventStreamStatus {
 		FramesWritten:       es.FramesWritten.Load(),
 		DecodeErrors:        es.DecodeErrors.Load(),
 		SeqGaps:             es.SeqGaps.Load(),
+		SessionSyncResyncs:  es.SessionSyncResyncs.Load(),
 		PolicyDenyEvents:    es.PolicyDenyEvents.Load(),
 		ScreenDropEvents:    es.ScreenDropEvents.Load(),
 		ScreenAlarmEvents:   es.ScreenAlarmEvents.Load(),
@@ -378,10 +386,15 @@ func (es *EventStream) readLoop(ctx context.Context) {
 			} else {
 				delta.Event = "open" // updates treated as opens for sync
 			}
-			// Track sequence gaps.
+			// #2874: a gap on a correctness-critical session-sync frame is a
+			// HARD sync break — the helper's lossy producer dropped a session
+			// open/close (or the replay window was trimmed), so the peer's
+			// session view may have silently diverged. Force a full bulk
+			// re-export and reconnect from the last CONTIGUOUS ack instead of
+			// dispatching this frame and cumulatively ACKing past the hole.
 			if seq > prevSeq+1 && prevSeq > 0 {
-				es.SeqGaps.Add(1)
-				slog.Debug("event stream: sequence gap", "expected", prevSeq+1, "got", seq)
+				es.handleSessionSyncGap(prevSeq+1, seq)
+				return
 			}
 			prevSeq = seq
 			es.lastRecvSeq.Store(seq)
@@ -397,8 +410,11 @@ func (es *EventStream) readLoop(ctx context.Context) {
 				continue
 			}
 			delta.Event = "close"
+			// #2874: see the SessionOpen/Update case — a session-sync gap forces
+			// a resync rather than ACKing past the missing close.
 			if seq > prevSeq+1 && prevSeq > 0 {
-				es.SeqGaps.Add(1)
+				es.handleSessionSyncGap(prevSeq+1, seq)
+				return
 			}
 			prevSeq = seq
 			es.lastRecvSeq.Store(seq)
@@ -472,6 +488,44 @@ func (es *EventStream) markDroppedFrameApplied(seq uint64, prevSeq *uint64) {
 func (es *EventStream) markFrameApplied(seq uint64) {
 	es.ackBatch.Add(1)
 	es.lastAppliedSeq.Store(seq)
+}
+
+// handleSessionSyncGap responds to a detected sequence gap on a
+// correctness-critical session-sync frame (open/close/update) — the #2874 HA
+// data-loss fix.
+//
+// A gap on the session-sync stream means the helper's lossy producer dropped a
+// session open/close delta under channel backpressure (or the helper's replay
+// window was trimmed), so the standby's session view may have silently
+// diverged from the primary's table truth. This must NOT be treated like a
+// telemetry gap (which is merely counted and the stream continues): doing so
+// and then cumulatively ACKing `lastAppliedSeq` past the hole trims the
+// helper's replay buffer over the missing delta, making it permanently
+// unrecoverable until an unrelated full-sync runs.
+//
+// Recovery has two halves, both performed here:
+//   - Trigger a full bulk re-export (onFullResync → handleEventStreamFullResync)
+//     so the peer re-derives a complete session snapshot — the only path that
+//     recovers a delta the producer dropped (it never entered the replay
+//     buffer, so a plain replay cannot resend it).
+//   - Do NOT advance lastAppliedSeq past the hole, and return to the caller so
+//     the reader loop drops the connection. On reconnect the helper replays
+//     from the last CONTIGUOUS ack and the sequence tracking resets cleanly.
+//     The cumulative ACK therefore never moves past the missing sequence.
+func (es *EventStream) handleSessionSyncGap(expected, got uint64) {
+	es.SeqGaps.Add(1)
+	es.SessionSyncResyncs.Add(1)
+	slog.Warn("event stream: session-sync sequence gap; forcing full resync",
+		"expected", expected, "got", got, "last_applied", es.lastAppliedSeq.Load())
+	es.callbackMu.RLock()
+	onFullResync := es.onFullResync
+	es.callbackMu.RUnlock()
+	if onFullResync != nil {
+		// Best-effort: the reconnect below is the backstop. The helper's own
+		// replay_buffered() also re-issues a FullResync when its window cannot
+		// cover acked+1, so a missed trigger here still self-heals.
+		onFullResync()
+	}
 }
 
 func (es *EventStream) backoffCallbackNotReady(ctx context.Context) {

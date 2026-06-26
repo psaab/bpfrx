@@ -195,6 +195,38 @@ cluster-scoped.
   (see `protocol.rs`). Use `push_delta_lossless()` only when
   correctness requires every frame and the producer can tolerate
   back-pressure.
+- **HA session open/close deltas are correctness-critical and use the
+  LOSSLESS path (#2874).** `flush_session_deltas` (`afxdp/session_delta.rs`)
+  routes the type-2 session-sync open/close delta through
+  `push_delta_lossless`, NOT `push_delta`. The lossy `push_delta` burns a
+  sequence number in `encode_delta_frame` and then drops the frame on a full
+  channel, leaving a hole the Go consumer cumulatively ACKs past — which
+  trims the helper replay window over the missing open/close, so the standby
+  permanently misses a session until an unrelated full-sync runs. When the
+  lossless push cannot enqueue (peer disconnected / queue timeout — a
+  genuinely wedged consumer), `flush_session_deltas` returns `true` and the
+  worker loop latches loss-of-sync via `SessionTable::set_delta_loss`, which
+  drives the existing #2442 `take_delta_loss` resync (a full owner-RG
+  snapshot re-export). It stops attempting further lossless pushes for the
+  rest of that drain batch, so the worst-case backpressure is one lossless
+  wait (`LOSSLESS_QUEUE_TIMEOUT`) per drain cycle even on a wedged consumer —
+  the snapshot supersedes the remaining incremental deltas. The RT_FLOW
+  SESSION_CLOSE/SESSION_CREATE telemetry frames (types 14/15) stay
+  best-effort (`try_send` via the per-kind budget) — a dropped flow-export
+  record is not a correctness loss and MUST NOT force a resync.
+- **Go consumer: a sequence gap on a session-sync frame is a HARD sync
+  break (#2874).** `pkg/dataplane/userspace/eventstream.go` treats a gap on a
+  correctness-critical session-sync frame (`EventTypeSessionOpen` / `Update`
+  / `Close`) as a desync: it triggers `onFullResync`
+  (`handleEventStreamFullResync` → bulk owner-RG export, the only path that
+  recovers a producer-dropped delta) and returns from the read loop WITHOUT
+  advancing `lastAppliedSeq` past the hole, so the cumulative ACK never moves
+  past the missing sequence and the reconnect replays from the last
+  contiguous ack. A gap on a TELEMETRY frame (`EventFrameType*`, types 11-15)
+  is merely counted in `SeqGaps` and the frame is still dispatched — telemetry
+  is lossy by design and a gap there must NOT force a resync (no
+  thundering-resync regression). Session-sync resyncs are counted separately
+  in `EventStreamStatus.session_sync_resyncs`.
 - **Write-backlog cap (#2381).** The bounded mpsc channel
   (`CHANNEL_CAPACITY`) is the ONLY intended backpressure surface. The
   I/O thread's pending socket-write backlog (`write_buf`) is capped at

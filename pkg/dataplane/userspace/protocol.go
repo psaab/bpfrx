@@ -1394,6 +1394,7 @@ type EventStreamStatus struct {
 	FramesWritten       uint64 `json:"frames_written,omitempty"`
 	DecodeErrors        uint64 `json:"decode_errors,omitempty"`
 	SeqGaps             uint64 `json:"seq_gaps,omitempty"`
+	SessionSyncResyncs  uint64 `json:"session_sync_resyncs,omitempty"` // #2874
 	PolicyDenyEvents    uint64 `json:"policy_deny_events,omitempty"`
 	ScreenDropEvents    uint64 `json:"screen_drop_events,omitempty"`
 	ScreenAlarmEvents   uint64 `json:"screen_alarm_events,omitempty"`

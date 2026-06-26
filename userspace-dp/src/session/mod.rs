@@ -1218,6 +1218,19 @@ impl SessionTable {
         lossy
     }
 
+    /// #2874: latch loss-of-sync from OUTSIDE `push_delta` — specifically when
+    /// the EVENT-STREAM producer (`flush_session_deltas`) could not queue a
+    /// session open/close delta losslessly (the shared event-stream channel was
+    /// wedged or the peer disconnected). Like the #2442 in-ring overflow path
+    /// this forces the worker loop's `take_delta_loss` resync to re-export the
+    /// full owner-RG snapshot, so the peer re-derives a complete session view
+    /// instead of silently missing the dropped open/close. Single bool, so a
+    /// burst raises exactly one resync (debounced by `take_delta_loss`).
+    #[inline]
+    pub fn set_delta_loss(&mut self) {
+        self.delta_loss_pending = true;
+    }
+
     /// #2442: cumulative count of deltas dropped on ring overflow. Surfaced for
     /// health/status telemetry so operators can see the loss-of-sync episodes
     /// (each one forces a resync). Test/diagnostic accessor.
