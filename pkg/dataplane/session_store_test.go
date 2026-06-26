@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 type sessionStoreTestDP struct {
@@ -535,8 +536,8 @@ func TestDeleteWithCompanionsV4PreservesPersistentNATBinding(t *testing.T) {
 
 	pnat := NewPersistentNATTable()
 	pnat.SetPoolConfig("pool-a", PersistentNATPoolInfo{
-		Timeout:             time.Hour,
-		PermitAnyRemoteHost: true,
+		Timeout: time.Hour,
+		Permit:  config.PersistentNATPermitAnyRemoteHost,
 	})
 	pnat.RegisterNATIP(natIP, "pool-a")
 
@@ -565,9 +566,9 @@ func TestDeleteWithCompanionsV4PreservesPersistentNATBinding(t *testing.T) {
 		t.Fatalf("binding NAT tuple = %v:%d, want %v:%d",
 			binding.NatIP, binding.NatPort, natIP, 40000)
 	}
-	if !binding.PermitAnyRemoteHost || binding.Timeout != time.Hour {
+	if binding.Permit != config.PersistentNATPermitAnyRemoteHost || binding.Timeout != time.Hour {
 		t.Fatalf("binding pool metadata = permit=%v timeout=%v",
-			binding.PermitAnyRemoteHost, binding.Timeout)
+			binding.Permit, binding.Timeout)
 	}
 }
 

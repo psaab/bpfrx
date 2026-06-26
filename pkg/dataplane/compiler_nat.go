@@ -533,12 +533,13 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 							if timeout == 0 {
 								timeout = 300 * time.Second
 							}
-							// #2823: the retired-eBPF persistent NAT table keeps
-							// the binary PermitAnyRemoteHost; derive it from the
-							// enum (true only for the any-remote-host mode).
+							// #2823/#3193: carry the full three-way permit enum
+							// through the persistent NAT table so the operator
+							// SHOW path can distinguish target-host from
+							// target-host-port (was a binary any-remote-host flag).
 							pnat.SetPoolConfig(pool.Name, PersistentNATPoolInfo{
-								Timeout:             timeout,
-								PermitAnyRemoteHost: pool.PersistentNAT.Permit == config.PersistentNATPermitAnyRemoteHost,
+								Timeout: timeout,
+								Permit:  pool.PersistentNAT.Permit,
 							})
 							for _, ip := range v4IPs {
 								addr, ok := netip.AddrFromSlice(ip.To4())

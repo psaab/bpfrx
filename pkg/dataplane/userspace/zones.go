@@ -51,8 +51,11 @@ func hostInboundLifelineInterface(name string) bool {
 // BuildZoneHostInboundViews returns one ZoneHostInboundView per
 // host-inbound-CONFIGURED zone (#3070), resolving each zone's firewall-local
 // host addresses via the canonical interface-snapshot builder (the same
-// resolution that populates the dataplane), with management/cluster-control
-// lifeline interfaces (fxp0 / em0 / fab*) excluded from the address set. A zone
+// resolution that populates the dataplane) PLUS each zone's RETH VRRP virtual
+// addresses (#3172, resolved from config so they scope the deny on the backup
+// node too, where the VIP is not yet live on the kernel interface), with
+// management/cluster-control lifeline interfaces (fxp0 / em0 / fab*) excluded
+// from the address set. A zone
 // that declared NO host-inbound-traffic stanza is omitted entirely (admit-all
 // preserved — zero regression). A configured zone with no resolvable static
 // address (e.g. a DHCP-only interface) yields an empty address set; the daemon
@@ -94,6 +97,83 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 			} else if !set.seen4[host] {
 				set.seen4[host] = true
 				set.v4 = append(set.v4, host)
+			}
+		}
+	}
+
+	// VRRP RETH VIPs (#3172): the host-inbound destination address set must
+	// also include each zone's RETH virtual IPs, not only the static interface
+	// addresses resolved above. A VIP is present on the kernel interface ONLY of
+	// the node that currently owns the redundancy group (master); on the backup
+	// node the VIP is absent from buildLinkSnapshot's live address list, so
+	// without this the kernel host-inbound deny would not be scoped to the VIP
+	// and `chain input` would fall through to `policy accept` (FAIL-OPEN) for
+	// VIP-destined host-bound traffic. The VIPs are identical on both nodes, so
+	// resolving them from config (unit.VRRPGroups[*].VirtualAddresses) scopes the
+	// deny consistently regardless of mastership. The seen maps dedup against the
+	// live snapshot, so on the master node (where the VIP is already live) the
+	// result is byte-identical. Lifeline interfaces (fxp0/em0/fab*) are excluded,
+	// mirroring the static-address path; standalone (no-VRRP) zones are untouched.
+	addZoneVIP := func(zone, host string) {
+		set := byZone[zone]
+		if set == nil {
+			set = &addrSet{seen4: map[string]bool{}, seen6: map[string]bool{}}
+			byZone[zone] = set
+		}
+		if strings.Contains(host, ":") {
+			if !set.seen6[host] {
+				set.seen6[host] = true
+				set.v6 = append(set.v6, host)
+			}
+		} else if !set.seen4[host] {
+			set.seen4[host] = true
+			set.v4 = append(set.v4, host)
+		}
+	}
+	zoneByIface := buildInterfaceZoneMap(cfg)
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for n := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, n)
+	}
+	sort.Strings(ifNames)
+	for _, ifName := range ifNames {
+		iface := cfg.Interfaces.Interfaces[ifName]
+		if iface == nil {
+			continue
+		}
+		unitNums := make([]int, 0, len(iface.Units))
+		for u := range iface.Units {
+			unitNums = append(unitNums, u)
+		}
+		sort.Ints(unitNums)
+		for _, un := range unitNums {
+			unit := iface.Units[un]
+			if unit == nil || len(unit.VRRPGroups) == 0 {
+				continue
+			}
+			unitName := fmt.Sprintf("%s.%d", ifName, un)
+			if hostInboundLifelineInterface(unitName) {
+				continue
+			}
+			zone := zoneByIface[unitName]
+			if zone == "" {
+				continue
+			}
+			vgKeys := make([]string, 0, len(unit.VRRPGroups))
+			for k := range unit.VRRPGroups {
+				vgKeys = append(vgKeys, k)
+			}
+			sort.Strings(vgKeys)
+			for _, k := range vgKeys {
+				vg := unit.VRRPGroups[k]
+				if vg == nil {
+					continue
+				}
+				for _, vip := range vg.VirtualAddresses {
+					if host := hostIPFromCIDR(vip); host != "" {
+						addZoneVIP(zone, host)
+					}
+				}
 			}
 		}
 	}

@@ -373,3 +373,51 @@ func TestRenderPersistentDetailLoadedGolden(t *testing.T) {
 		t.Fatalf("detail session count != 1: %q", got)
 	}
 }
+
+// TestRenderPersistentDetailPermitModes asserts the persistent-NAT detail
+// SHOW path renders each three-way permit mode DISTINCTLY (#3193). Before
+// #3193 the renderer printed only a binary "Any remote host: yes" line, so
+// target-host and target-host-port were indistinguishable. The fail-on-
+// revert assertion below (targetHost != targetHostPort output) goes RED if
+// the renderer is reverted to the binary flag.
+func TestRenderPersistentDetailPermitModes(t *testing.T) {
+	render := func(p config.PersistentNATPermit) string {
+		pnat := dataplane.NewPersistentNATTable()
+		pnat.Save(&dataplane.PersistentNATBinding{
+			SrcIP:    netip.MustParseAddr("10.0.1.5"),
+			SrcPort:  1111,
+			NatIP:    netip.MustParseAddr("203.0.113.1"),
+			NatPort:  40000,
+			PoolName: "p-src",
+			LastSeen: time.Now(),
+			Timeout:  600 * time.Second,
+			Permit:   p,
+		})
+		var b strings.Builder
+		RenderPersistentDetail(&b, &fakeReader{pnat: pnat})
+		return b.String()
+	}
+
+	anyRemote := render(config.PersistentNATPermitAnyRemoteHost)
+	targetHost := render(config.PersistentNATPermitTargetHost)
+	targetHostPort := render(config.PersistentNATPermitTargetHostPort)
+
+	if !strings.Contains(anyRemote, "  Permit:             any-remote-host\n") {
+		t.Errorf("any-remote-host not rendered: %q", anyRemote)
+	}
+	if !strings.Contains(targetHost, "  Permit:             target-host\n") {
+		t.Errorf("target-host not rendered: %q", targetHost)
+	}
+	if !strings.Contains(targetHostPort, "  Permit:             target-host-port\n") {
+		t.Errorf("target-host-port not rendered: %q", targetHostPort)
+	}
+	// Fail-on-revert: the two non-any modes MUST render distinctly. A
+	// binary permit-any-remote-host flag would collapse both to identical
+	// output and trip this.
+	if targetHost == targetHostPort {
+		t.Fatalf("target-host and target-host-port render identically:\n%q", targetHost)
+	}
+	if anyRemote == targetHost || anyRemote == targetHostPort {
+		t.Fatalf("any-remote-host not distinct from target modes")
+	}
+}

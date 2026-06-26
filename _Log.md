@@ -19,6 +19,59 @@
 - **File(s)**: userspace-dp/src/afxdp/types/runtime.rs,
   userspace-dp/src/afxdp/coordinator/tunnel_supervision.rs,
   userspace-dp/src/afxdp/coordinator/tests.rs, docs/wireguard-interop.md
+## 2026-06-26 — #3193 persistent-nat SHOW: report the three-way permit mode
+
+- **Timestamp**: 2026-06-26
+- **Action**: Follow-up to #2823. The persistent-NAT SHOW path reported
+  only a binary any-remote-host flag, so `target-host` and
+  `target-host-port` were indistinguishable. Threaded the three-way
+  `PersistentNATPermit` mode through the persistent-NAT status surfaces:
+  (1) `pkg/dataplane` `PersistentNATBinding`/`PersistentNATPoolInfo` now
+  carry `Permit config.PersistentNATPermit` (was `PermitAnyRemoteHost
+  bool`), populated from the pool's enum in `compiler_nat.go` /
+  `session_store.go`; `RenderPersistentDetail` prints `Permit: <mode>`
+  via new `PersistentNATBinding.PermitMode()` (zero value resolves to the
+  target-host-port default). (2) Rust `status.rs` adds
+  `persistent_nat_permit` (string, via new `PersistentNatPermit::as_wire`)
+  to `SourceNatPoolStatus`; the Go wire struct + the source-NAT pool status
+  table (`format/status.go`) gain a `Permit` column. Regenerated the
+  `protocol_wire_v1.json` fixture for the new status field.
+- **File(s)**: pkg/dataplane/persistent_nat.go, pkg/dataplane/compiler_nat.go,
+  pkg/dataplane/session_store.go, pkg/natshow/persistent.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/format/status.go,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat/status.rs,
+  userspace-dp/src/protocol/nat.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/userspace-dataplane-gaps.md, plus Go/Rust tests.
+- **Tests**: Go `TestRenderPersistentDetailPermitModes` (natshow),
+  `TestPersistentNATTable_PermitMode` (dataplane); Rust
+  `pool_status_reports_three_way_persistent_permit_mode`. All proven
+  fail-on-revert RED against the binary-flag behavior.
+
+## 2026-06-26 — #3172 host-inbound: scope kernel deny to RETH VRRP VIPs
+
+- **Timestamp**: 2026-06-26
+- **Action**: Follow-up to #3070. `BuildZoneHostInboundViews` scoped the
+  kernel `xpf_hostinbound` deny rules only to STATIC interface addresses
+  resolved from the live snapshot. RETH VRRP VIPs are live on the kernel
+  interface only on the RG master; on the backup the VIP was absent from the
+  snapshot, so the deny was not scoped to it and `chain input` fell through to
+  `policy accept` (FAIL-OPEN) for VIP-destined host-bound traffic. Added a
+  config-resolved pass that folds each zone's `unit.VRRPGroups[*].VirtualAddresses`
+  into the per-zone host-inbound address set (deterministic sorted iteration,
+  deduped against the live snapshot so the master node stays byte-identical),
+  preserving the fxp0/em0/fab* lifeline exclusion (a VIP on em0 is never
+  scoped) and leaving standalone (no-VRRP) zones unchanged. Go test
+  `TestBuildZoneHostInboundViewsIncludesVRRPVIP` (wan gets static+VIP, lan
+  standalone unchanged, control/em0 lifeline contributes nothing);
+  fail-on-revert proven (neutering addZoneVIP turns the wan VIP assertion RED,
+  the pre-existing `TestBuildZoneHostInboundViews` stays GREEN). cargo
+  build/test (host_inbound 2/2, forwarding 196/0) + go test
+  ./pkg/dataplane/... ./pkg/daemon/... green.
+- **File(s)**: pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/zones_host_inbound_test.go,
+  docs/junos-cli-reference.md
 
 ## 2026-06-26 — #3182 neighbor own-IP anti-poison: NAT-excluded interface IPs + RX learn path
 

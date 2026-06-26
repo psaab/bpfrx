@@ -482,13 +482,14 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 			return rows[i].RuleName < rows[j].RuleName
 		})
 		fmt.Fprintln(&b, "Source NAT pools:")
-		fmt.Fprintf(&b, "  %-20s %-20s %-6s %-11s %-10s %-10s %-10s %-10s %-10s\n",
-			"Pool", "Rule", "Persist", "LiveFlows", "UsedPorts", "Leases", "Alloc", "Reuse", "Exhaust")
+		fmt.Fprintf(&b, "  %-20s %-20s %-6s %-16s %-11s %-10s %-10s %-10s %-10s %-10s\n",
+			"Pool", "Rule", "Persist", "Permit", "LiveFlows", "UsedPorts", "Leases", "Alloc", "Reuse", "Exhaust")
 		for _, row := range rows {
-			fmt.Fprintf(&b, "  %-20s %-20s %-6t %-11d %-10d %-10d %-10d %-10d %-10d\n",
+			fmt.Fprintf(&b, "  %-20s %-20s %-6t %-16s %-11d %-10d %-10d %-10d %-10d %-10d\n",
 				row.PoolName,
 				row.RuleName,
 				row.PersistentNAT,
+				persistentNATPermitMode(row),
 				row.LiveFlows,
 				row.UsedPorts,
 				row.PersistentLeases,
@@ -986,4 +987,23 @@ func formatStatusAge(d time.Duration) string {
 		return fmt.Sprintf("%.1fs", d.Seconds())
 	}
 	return d.Round(time.Second).String()
+}
+
+// persistentNATPermitMode renders the three-way persistent-NAT permit
+// scope for the source-NAT pool status table (#3193). For non-persistent
+// pools it returns "-". It prefers the explicit three-way wire mode and
+// falls back to the legacy binary any-remote-host flag for an older helper
+// that did not set persistent_nat_permit; an empty mode then resolves to
+// the target-host-port default.
+func persistentNATPermitMode(row userspace.SourceNATPoolStatus) string {
+	if !row.PersistentNAT {
+		return "-"
+	}
+	if row.PersistentNATPermit != "" {
+		return row.PersistentNATPermit
+	}
+	if row.PersistentNATPermitAnyRemoteHost {
+		return "any-remote-host"
+	}
+	return "target-host-port"
 }
