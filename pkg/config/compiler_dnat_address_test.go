@@ -60,15 +60,20 @@ func TestDNATAllInvalidDestinationRejected(t *testing.T) {
 	}
 }
 
-func TestDNATPartialValidDestinationAccepted(t *testing.T) {
-	// One malformed + one valid destination in a bracket list: the valid one
-	// still installs (the builder emits an entry for it and skips the typo),
-	// so this is NOT a total silent no-op. The gate must NOT reject it.
-	//
-	// Constructed at the struct level (not via flat-set syntax) because the
-	// flat-set parser collapses a `[ a b ]` destination-address list to its
-	// first token; the builder/gate operate on DestinationAddresses, which the
-	// hierarchical parser and the dataplane snapshot path populate fully.
+// #3228: a bracket list with one valid + one malformed destination (e.g.
+// `[ 203.0.113.10 web-server ]`) used to pass the gate (the old anyGood break
+// required only ONE good entry). The snapshot builder then silently `continue`s
+// past the typo, so traffic to it never translates — a partial, silent drop of
+// a forwarding-relevant config. The gate must now reject the rule, naming the
+// bad entry, so validator and builder agree (anything the builder would skip,
+// the validator rejects). Reverting the per-entry check to the anyGood break
+// makes this RED (the partial-valid rule compiles).
+//
+// Constructed at the struct level (not via flat-set syntax) because the
+// flat-set parser collapses a `[ a b ]` destination-address list to its first
+// token; the builder/gate operate on DestinationAddresses, which the
+// hierarchical parser and the dataplane snapshot path populate fully.
+func TestDNATPartialValidDestinationRejected(t *testing.T) {
 	cfg := &Config{}
 	cfg.Security.NAT.Destination = &DestinationNATConfig{
 		Pools: map[string]*NATPool{"dp": {Name: "dp", Address: "10.0.0.5"}},
@@ -77,8 +82,42 @@ func TestDNATPartialValidDestinationAccepted(t *testing.T) {
 				{
 					Name: "r1",
 					Match: NATMatch{
-						DestinationAddresses: []string{"not-an-ip", "203.0.113.10"},
-						DestinationAddress:   "not-an-ip",
+						DestinationAddresses: []string{"203.0.113.10", "web-server"},
+						DestinationAddress:   "203.0.113.10",
+					},
+					Then: NATThen{Type: NATDestination, PoolName: "dp"},
+				},
+			}},
+		},
+	}
+	err := validateDestinationNATAddressesStrict(cfg)
+	if err == nil {
+		t.Fatal("a DNAT rule with a malformed destination in an otherwise-valid " +
+			"list must be rejected at commit (the builder silently drops it)")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "destination-nat") ||
+		!strings.Contains(msg, "r1") ||
+		!strings.Contains(msg, "web-server") {
+		t.Fatalf("error must name the rule-set/rule + the malformed token, got: %v", err)
+	}
+}
+
+// #3228 (positive half): an all-valid bracket list must still pass the gate
+// unchanged — the per-entry rejection must not regress a list where every
+// entry parses. The builder's all-entries-installed behavior is covered by
+// userspace.TestBuildDestinationNATSnapshotsMultiDestination.
+func TestDNATAllValidDestinationListAccepted(t *testing.T) {
+	cfg := &Config{}
+	cfg.Security.NAT.Destination = &DestinationNATConfig{
+		Pools: map[string]*NATPool{"dp": {Name: "dp", Address: "10.0.0.5"}},
+		RuleSets: []*NATRuleSet{
+			{Name: "rs1", FromZone: "untrust", Rules: []*NATRule{
+				{
+					Name: "r1",
+					Match: NATMatch{
+						DestinationAddresses: []string{"203.0.113.10", "203.0.113.11/32", "203.0.113.12"},
+						DestinationAddress:   "203.0.113.10",
 					},
 					Then: NATThen{Type: NATDestination, PoolName: "dp"},
 				},
@@ -86,7 +125,7 @@ func TestDNATPartialValidDestinationAccepted(t *testing.T) {
 		},
 	}
 	if err := validateDestinationNATAddressesStrict(cfg); err != nil {
-		t.Fatalf("a DNAT rule with at least one valid destination must pass the gate, got: %v", err)
+		t.Fatalf("a DNAT rule whose destination list is entirely valid must pass the gate, got: %v", err)
 	}
 }
 

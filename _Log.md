@@ -1,3 +1,28 @@
+## 2026-06-26 — #3228 dest-NAT: reject a partial-valid destination-address list at commit
+
+- **Timestamp**: 2026-06-26
+- **Action**: `validateDestinationNATAddressesStrict`
+  (`pkg/config/compiler_validate_strict.go`) used an `anyGood` break — it
+  passed commit if AT LEAST ONE `match destination-address` parsed. The
+  snapshot builder (`buildDestinationNATSnapshots`,
+  `pkg/dataplane/userspace/nat.go`) skips malformed entries PER-ENTRY, so a
+  mixed list like `[ 192.0.2.1 web-server ]` committed clean while
+  `web-server` was silently dropped from the DNAT table (traffic to it never
+  translated). Replaced the `anyGood` break with a per-entry check that
+  mirrors the builder's exact skip predicate (`natCIDRIPPart` CIDR strip,
+  then empty / `net.ParseIP` test): the gate now rejects the rule on ANY
+  unparseable entry, naming the offending token. An all-valid list still
+  compiles byte-identical; the tolerant load / peer-sync path still
+  downgrades to a `destination-nat address` warning (#1960). Inverted the
+  stale `TestDNATPartialValidDestinationAccepted` test to
+  `TestDNATPartialValidDestinationRejected` and added
+  `TestDNATAllValidDestinationListAccepted`. Fail-on-revert: restoring the
+  `anyGood` break turns `TestDNATPartialValidDestinationRejected` RED while
+  the all-valid test stays GREEN.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_dnat_address_test.go, docs/userspace-dnat-plan.md,
+  _Log.md
+
 ## 2026-06-26 — #2921 WG TUN-origin egress: stale captured outer_mtu after same-engine refresh
 
 - **Timestamp**: 2026-06-26
