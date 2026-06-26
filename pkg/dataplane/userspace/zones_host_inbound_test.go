@@ -235,6 +235,106 @@ func TestBuildZoneHostInboundViewsIncludesVRRPVIP(t *testing.T) {
 	}
 }
 
+// TestBuildZoneHostInboundViewsScopesKernelLearnedAddr is the #3224
+// regression guard, and it deliberately drives the REAL production address
+// source — BuildZoneHostInboundViews -> buildInterfaceSnapshots ->
+// buildLinkSnapshot -> buildInterfaceAddressSnapshots -> netlink.AddrList(
+// FAMILY_ALL) — with NO injected/fake provider.
+//
+// #3224 was filed on the premise that a DHCP/DHCPv6-learned firewall-local
+// address (one that exists only on the kernel netdev, never in the static
+// config) would fall out of the host-inbound deny scope and FAIL OPEN to
+// `policy accept`. That premise does NOT reproduce: buildInterfaceAddressSnapshots
+// enumerates EVERY address via netlink.AddrList(FAMILY_ALL) with no
+// scope/flag/dynamic filtering, so a kernel-learned address is captured exactly
+// like a static one. This test proves that property on the real path.
+//
+// We model "a kernel address that is absent from the static config" with the
+// loopback interface (always present, no root required): the config maps a zone
+// interface onto `lo` and declares NO static address, so 127.0.0.1 / ::1 reach
+// the view ONLY through the live kernel snapshot — the identical mechanism that
+// captures a DHCP/DHCPv6 lease. If a future refactor ever filters dynamic /
+// non-config addresses out of the snapshot path (the gap #3224 feared), this
+// test goes RED.
+func TestBuildZoneHostInboundViewsScopesKernelLearnedAddr(t *testing.T) {
+	// Sanity: the loopback must carry its kernel address (it is not in any config
+	// here). If a sandbox somehow lacks it, skip rather than false-fail.
+	loSnap := liveZoneHostInboundAddrsForIface(t, "lo")
+	if !contains(loSnap, "127.0.0.1") {
+		t.Skipf("loopback has no 127.0.0.1 (got %v) — cannot exercise real netlink path", loSnap)
+	}
+
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		// Zone interface mapped onto the real `lo` netdev with NO static address:
+		// its only addresses (127.0.0.1/8, ::1/128) come from the live kernel
+		// snapshot — exactly how a DHCP/DHCPv6 lease appears (config-absent,
+		// kernel-present).
+		"lo": {Name: "lo", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0},
+		}},
+		// Static-only control: unchanged regardless of the live snapshot.
+		"reth1": {Name: "reth1", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"10.0.61.1/24"}},
+		}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"untrust": {Name: "untrust", Interfaces: []string{"lo.0"},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}}},
+		"lan": {Name: "lan", Interfaces: []string{"reth1.0"},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}}},
+	}
+
+	// REAL production entry point — no injected dynamic source.
+	views := BuildZoneHostInboundViews(cfg)
+	byZone := make(map[string]ZoneHostInboundView, len(views))
+	for _, v := range views {
+		byZone[v.Zone] = v
+	}
+
+	// untrust: the kernel-learned (config-absent) v4 address IS scoped. This is
+	// the fail-on-revert guard for the #3224 premise — the production snapshot
+	// path captures it without any static config address.
+	untrust, ok := byZone["untrust"]
+	if !ok {
+		t.Fatal("untrust view missing")
+	}
+	if !contains(untrust.V4Addrs, "127.0.0.1") {
+		t.Errorf("untrust v4 addrs = %v, want to contain 127.0.0.1 "+
+			"(kernel-learned, config-absent address must be scoped — #3224)", untrust.V4Addrs)
+	}
+	// IPv6 loopback (::1) is standard on Linux; assert it too when present so the
+	// guard also covers the v6 dynamic path (DHCPv6).
+	if contains(loSnap, "::1") && !contains(untrust.V6Addrs, "::1") {
+		t.Errorf("untrust v6 addrs = %v, want to contain ::1 "+
+			"(kernel-learned v6 address must be scoped — #3224)", untrust.V6Addrs)
+	}
+
+	// lan: static-only, untouched by the live snapshot.
+	lan, ok := byZone["lan"]
+	if !ok {
+		t.Fatal("lan view missing")
+	}
+	if !eqStr(lan.V4Addrs, []string{"10.0.61.1"}) {
+		t.Errorf("lan v4 addrs = %v, want [10.0.61.1] (static only, unchanged)", lan.V4Addrs)
+	}
+}
+
+// liveZoneHostInboundAddrsForIface returns the bare host IPs the real snapshot
+// path resolves for a single live netdev, used only to gate the loopback test on
+// the address actually being present (no fake injection).
+func liveZoneHostInboundAddrsForIface(t *testing.T, linuxName string) []string {
+	t.Helper()
+	_, _, _, addrs := buildLinkSnapshot(linuxName)
+	out := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		if host := hostIPFromCIDR(a.Address); host != "" {
+			out = append(out, host)
+		}
+	}
+	return out
+}
+
 func TestHostInboundLifelineInterface(t *testing.T) {
 	for _, name := range []string{"fxp0", "fxp0.0", "em0", "em0.0", "fab0", "fab1", "fab1.0"} {
 		if !hostInboundLifelineInterface(name) {

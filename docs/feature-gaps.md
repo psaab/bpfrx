@@ -166,7 +166,7 @@ User-based policy enforcement integrating with directory services. Not implement
 
 ## 8. NAT Enhancements
 
-xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT (with pools, hit counters, source-address-name match, protocol-only match, port rewriting, multi-port matching), static 1:1 (host AND block-to-block subnet mappings, #3031), NAT64, and exemption rules. These are additional NAT features from the vSRX.
+xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT (with pools, hit counters, source-address-name match, destination-address-name match (#3229), protocol-only match, port rewriting, multi-port matching), static 1:1 (host AND block-to-block subnet mappings, #3031), NAT64, and exemption rules. These are additional NAT features from the vSRX.
 
 > **DNAT `match destination-address` is exact-host only (#3029).** The
 > userspace `DnatTable` keys on an exact destination `IpAddr` (no prefix /

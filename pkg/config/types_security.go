@@ -331,15 +331,16 @@ type NATRule struct {
 
 // NATMatch defines what traffic a NAT rule matches.
 type NATMatch struct {
-	SourceAddress        string   // CIDR (first address, for backward compat)
-	SourceAddresses      []string // all matched source CIDRs (bracket list support)
-	SourceAddressName    string   // address-book name (resolved during compilation)
-	DestinationAddress   string   // CIDR (first address, for backward compat)
-	DestinationAddresses []string // all matched destination CIDRs (bracket list support)
-	DestinationPort      int      // primary port (first port for BPF rule)
-	DestinationPorts     []int    // all matched ports (for multi-port DNAT rules)
-	Protocol             string   // "tcp", "udp", "icmp6", "gre", or "" (auto)
-	Application          string   // application name (e.g. "junos-http")
+	SourceAddress          string   // CIDR (first address, for backward compat)
+	SourceAddresses        []string // all matched source CIDRs (bracket list support)
+	SourceAddressName      string   // address-book name (resolved during compilation)
+	DestinationAddress     string   // CIDR (first address, for backward compat)
+	DestinationAddresses   []string // all matched destination CIDRs (bracket list support)
+	DestinationAddressName string   // address-book name (resolved during compilation, #3229)
+	DestinationPort        int      // primary port (first port for BPF rule)
+	DestinationPorts       []int    // all matched ports (for multi-port DNAT rules)
+	Protocol               string   // "tcp", "udp", "icmp6", "gre", or "" (auto)
+	Application            string   // application name (e.g. "junos-http")
 }
 
 // NATThen defines the NAT translation action.

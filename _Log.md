@@ -35,6 +35,100 @@
     userspace-dp/src/filter/mod.rs, userspace-dp/src/filter/engine/matching.rs,
     userspace-dp/src/afxdp/frame/inspect.rs, userspace-dp/src/filter/tests.rs,
     userspace-dp/src/filter/README.md, docs/feature-gaps.md, _Log.md
+## 2026-06-26 — #3224 host-inbound DHCP scope: NON-REPRODUCING (doc correction + real regression test)
+
+- **Timestamp**: 2026-06-26
+- **Action**: Reworked after hostile review found the prior "SECURITY
+  fail-open fix" was byte-identical to master in production and its test
+  used an injected fake `dynAddrs` provider that never exercised the
+  production address source. VERIFIED the #3224 premise does NOT
+  reproduce: master's `BuildZoneHostInboundViews` already resolves each
+  zone's addresses through `buildInterfaceSnapshots` ->
+  `buildLinkSnapshot` -> `buildInterfaceAddressSnapshots` ->
+  `netlink.AddrList(FAMILY_ALL)`, which enumerates EVERY kernel address
+  with NO scope/flag/dynamic filtering — so DHCP/DHCPv6-learned addresses
+  were ALREADY captured and scoped by the deny. Reverted the no-op 3-source
+  refactor (and the injected-seam that enabled the misleading test) so
+  `BuildZoneHostInboundViews` code is byte-identical to master. CORRECTED
+  master's false doc comment (which claimed "a DHCP-only interface yields
+  an empty address set -> fail-open") in zones.go, daemon_nft.go, and
+  pkg/daemon/README.md to state that DHCP/DHCPv6 addresses ARE captured via
+  the live snapshot, plus the lease-change refresh path. REPLACED the fake
+  test with `TestBuildZoneHostInboundViewsScopesKernelLearnedAddr`, which
+  drives the REAL production path (`BuildZoneHostInboundViews` ->
+  `buildInterfaceSnapshots` -> `AddrList`) using the loopback interface as
+  a kernel address absent from the static config (modeling DHCP), with no
+  fake provider and no root. It asserts the kernel-learned address IS
+  scoped — a fail-on-revert guard against a future filter regression.
+- **File(s)**: pkg/dataplane/userspace/zones.go (comment only — code
+  reverted to master), pkg/dataplane/userspace/zones_host_inbound_test.go,
+  pkg/daemon/daemon_nft.go (comment), pkg/daemon/README.md
+- **Validation**: `go build ./...`; `go test ./pkg/dataplane/...
+  ./pkg/daemon/...` green. Verified empirically: the new real-path test
+  PASSES on master-equivalent code (proving master already scopes a
+  config-absent kernel address); a destructive probe that drops the live
+  snapshot loop turns it RED (untrust loses 127.0.0.1/::1) while the new
+  test isolates the dynamic-address property — restored byte-identical.
+
+## 2026-06-26 — #3229 dest-NAT: `match destination-address-name` (address-book reference)
+
+- **Timestamp**: 2026-06-26
+- **Action**: Added `destination-address-name` support to source AND
+  destination NAT, mirroring the #2416 `source-address-name` mechanism
+  exactly. New `DestinationAddressName` field on `NATMatch`
+  (`pkg/config/types_security.go`); parsed in both the source and dest NAT
+  rule blocks of `pkg/config/compiler_nat.go`; schema leaf added to both
+  match blocks in `pkg/config/schema_security.go`. Resolution:
+  `appendNATDestinationAddressName` (`pkg/dataplane/userspace/nat.go`)
+  expands the name via the same `resolveUserspaceAddressBookEntry` expander
+  the policy + source-address-name paths use and feeds the resolved prefixes
+  into the existing destination list — no new wire field (each resolved DNAT
+  host installs its own exact-host snapshot row). Called from both
+  `buildSourceNATSnapshots` and `buildDestinationNATSnapshots`. Commit-time
+  reject: `validateNATSourceAddressNameReferencesStrict`
+  (`pkg/config/compiler_validate_strict.go`) extended to gate BOTH the source
+  and destination name leaves; lenient load/peer-sync downgrades to a warning
+  (#1960) and the dataplane fails closed (unknown name = unparseable token =
+  matches nothing). Warn-only parity check also added to the retired-eBPF
+  `pkg/dataplane/compiler_nat.go`.
+- **File(s)**: pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/compiler_nat.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/compiler_nat.go,
+  pkg/config/compiler_nat_dest_address_name_3229_test.go,
+  pkg/dataplane/userspace/nat_dest_address_name_3229_test.go,
+  docs/feature-gaps.md, docs/config-schema.md
+- **Tests**: Go `pkg/config` (parse both SNAT/DNAT, reject undefined both,
+  lenient-warns) + `pkg/dataplane/userspace` (resolve DNAT, literal+name
+  union, unknown fail-closed, resolve in source builder). Fail-on-revert:
+  neutralizing the dest-builder `appendNATDestinationAddressName` call turned
+  `TestBuildDestinationNATSnapshotsResolvesDestinationAddressName` RED (empty
+  destination list, rule dropped); restored byte-identical. Rust matcher
+  unchanged (names resolve to literals on the Go side, flow through the
+  existing `destination_address` snapshot field).
+## 2026-06-26 — #3230 screen icmp/udp flood + port-scan + ip-sweep default thresholds
+
+- **Timestamp**: 2026-06-26
+- **Action**: Sibling of #3024. When icmp-flood, udp-flood, tcp port-scan,
+  or ip ip-sweep was enabled WITHOUT an explicit threshold, the screen
+  compiled to threshold 0 and the Rust screen engine's `threshold > 0`
+  gate silently skipped the check. Added Junos-aligned parse-time defaults
+  in `compileScreen` so an enabled-but-unset check arms at a nonzero rate:
+  icmp/udp flood = 1000 pps, port-scan/ip-sweep = 10 distinct destinations
+  (Junos's detection count; this engine reads the threshold as a count over
+  a fixed 10s window, not Junos's 5000us window). Explicit thresholds are
+  preserved; unconfigured checks stay off (0). New constants
+  `defaultICMPFloodThreshold`/`defaultUDPFloodThreshold`/
+  `defaultPortScanThreshold`/`defaultIPSweepThreshold`.
+- **File(s)**: pkg/config/compiler_security.go,
+  pkg/config/parser_security_test.go (TestScreenFloodScanDefaultThresholds,
+  TestScreenFloodScanExplicitThresholdsPreserved,
+  TestScreenFloodScanNotConfiguredStaysOff),
+  docs/syn-cookie-flood-protection.md, _Log.md
+- **Validation**: go build ./...; go test ./pkg/config/ ./pkg/dataplane/...
+  all green. Fail-on-revert: removing the four defaulting blocks turned
+  TestScreenFloodScanDefaultThresholds RED (icmp=0, udp=0, port-scan=0,
+  ip-sweep=0); restored byte-identical → green.
 
 ## 2026-06-26 — #3228 dest-NAT: reject a partial-valid destination-address list at commit
 
