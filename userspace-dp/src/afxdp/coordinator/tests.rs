@@ -2645,6 +2645,163 @@ fn wg1866_sweep_respawns_with_empty_linux_name_rows() {
 }
 
 // ---------------------------------------------------------------------
+// #2921 — stale captured outer_mtu after a same-engine refresh.
+//
+// The WG identity tuple (`wg_identity_unchanged`: listen port, local
+// private key, peer set) ignores the underlay transport table, the
+// resolved egress ifindex, and the egress MTU. So a refresh that only
+// changes the underlay route/table/egress MTU reuses the engine Arc and
+// — before #2921 — left the spawn-time `outer_mtu` captured by value in
+// the TUN-origin egress guard, while the transit/forwarded path
+// re-resolved per snapshot. The apply-time stale prune now restarts the
+// thread when a fresh `resolve_wg_outer_mtu` diverges from the captured
+// value, so both packet origins enforce the SAME current outer MTU.
+// ---------------------------------------------------------------------
+
+/// #2921 helper: a WG snapshot whose peer endpoint (`10.50.0.9:9`) is
+/// reachable via a SEPARATE underlay egress interface (`ge2921wan`,
+/// `10.50.0.1/24`). `resolve_wg_outer_mtu` route-looks-up the peer in
+/// the default table, lands on that interface's connected route, and
+/// returns its egress MTU (`egress_mtu`) instead of the
+/// `WG_DEFAULT_OUTER_MTU` fallback. The WG identity tuple (port +
+/// privkey + peers) is held constant, so a refresh that changes ONLY
+/// `egress_mtu` reuses the engine Arc (the #2921 stale path).
+fn wg2921_snapshot(
+    id: u16,
+    wg_ifindex: i32,
+    wg_name: &str,
+    port: u16,
+    egress_mtu: i32,
+) -> ConfigSnapshot {
+    use crate::protocol::snapshot::{
+        InterfaceAddressSnapshot, InterfaceSnapshot, TunnelEndpointSnapshot, TunnelWgPeerSnapshot,
+    };
+    ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: wg_name.to_string(),
+                linux_name: wg_name.to_string(),
+                ifindex: wg_ifindex,
+                tunnel: true,
+                ..Default::default()
+            },
+            // Underlay egress carrying the peer-endpoint subnet (a
+            // connected route in inet.0). Its MTU is the underlay outer
+            // MTU that resolve_wg_outer_mtu returns for this tunnel.
+            InterfaceSnapshot {
+                name: "ge2921wan".to_string(),
+                linux_name: "ge2921wan".to_string(),
+                ifindex: 5921,
+                mtu: egress_mtu,
+                hardware_addr: "02:00:00:29:21:01".to_string(),
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.50.0.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        tunnel_endpoints: vec![TunnelEndpointSnapshot {
+            id,
+            interface: wg_name.to_string(),
+            linux_name: wg_name.to_string(),
+            ifindex: wg_ifindex,
+            mode: "wireguard".to_string(),
+            wg_listen_port: port,
+            wg_local_privkey_hex: WG1866_PRIVKEY_A.to_string(),
+            wg_peers: vec![TunnelWgPeerSnapshot {
+                wg_peer_pubkey_hex: WG1866_PUBKEY.to_string(),
+                wg_allowed_ips: vec!["10.77.0.0/24".to_string()],
+                wg_endpoint: "10.50.0.9:9".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// #2921 regression: a same-engine refresh that changes ONLY the
+/// underlay egress MTU must RESTART the WG control thread so the
+/// TUN-origin egress guard picks up the NEW outer MTU. Before the fix
+/// the reused engine Arc kept the stale spawn-time capture.
+#[test]
+fn wg2921_outer_mtu_change_restarts_control_thread() {
+    let mut coordinator = Coordinator::new();
+    let port: u16 = 51890;
+    // First apply: peer reachable via ge2921wan @ MTU 1400.
+    coordinator.refresh_runtime_snapshot(&wg2921_snapshot(1, 4242, "wgt2921a", port, 1400));
+    let entry = coordinator.wg_control_threads.get(&1).expect("entry");
+    assert_eq!(
+        entry.spawned_outer_mtu, 1400,
+        "spawn must capture the resolved underlay egress MTU (not the 1500 default fallback)"
+    );
+    let engine_ptr_before = entry.engine_ptr;
+    // Stamp the attempt to NOW so a tombstone (open_tun fails in the test
+    // env) cannot self-respawn within the backoff window — isolating the
+    // restart to the stale-prune path under test.
+    let t0 = monotonic_nanos();
+    coordinator
+        .wg_control_threads
+        .get_mut(&1)
+        .expect("entry")
+        .last_spawn_attempt_ns = t0;
+
+    // Second apply: SAME WG identity (port/privkey/peer), underlay MTU
+    // dropped to 1280. The engine Arc is reused (wg_identity_unchanged),
+    // so only the #2921 outer-MTU prune can restart the thread.
+    coordinator.refresh_runtime_snapshot(&wg2921_snapshot(1, 4242, "wgt2921a", port, 1280));
+    let entry = coordinator.wg_control_threads.get(&1).expect("entry after MTU change");
+    assert_eq!(
+        entry.engine_ptr, engine_ptr_before,
+        "engine Arc must be REUSED (identity unchanged) — exercising the same-engine path"
+    );
+    assert_eq!(
+        entry.spawned_outer_mtu, 1280,
+        "outer-MTU change must restart the thread and re-resolve the underlay MTU"
+    );
+    assert_ne!(
+        entry.last_spawn_attempt_ns, t0,
+        "restart must re-stamp the spawn attempt"
+    );
+}
+
+/// #2921 companion: an unchanged underlay (same egress MTU) must NOT
+/// restart the thread — the common case stays byte-identical (no thread
+/// churn on the hot reconcile path).
+#[test]
+fn wg2921_unchanged_outer_mtu_keeps_control_thread() {
+    let mut coordinator = Coordinator::new();
+    let port: u16 = 51891;
+    coordinator.refresh_runtime_snapshot(&wg2921_snapshot(1, 4242, "wgt2921b", port, 1400));
+    let entry = coordinator.wg_control_threads.get(&1).expect("entry");
+    assert_eq!(entry.spawned_outer_mtu, 1400, "resolved underlay MTU captured");
+    let engine_ptr_before = entry.engine_ptr;
+    // Recent attempt stamp: suppresses any tombstone self-respawn so the
+    // assertion isolates the prune decision.
+    let t0 = monotonic_nanos();
+    coordinator
+        .wg_control_threads
+        .get_mut(&1)
+        .expect("entry")
+        .last_spawn_attempt_ns = t0;
+
+    // Identical underlay MTU — resolve_wg_outer_mtu is unchanged.
+    coordinator.refresh_runtime_snapshot(&wg2921_snapshot(1, 4242, "wgt2921b", port, 1400));
+    let entry = coordinator.wg_control_threads.get(&1).expect("entry after no-op refresh");
+    assert_eq!(
+        entry.engine_ptr, engine_ptr_before,
+        "engine Arc reused on the unchanged refresh"
+    );
+    assert_eq!(entry.spawned_outer_mtu, 1400, "captured MTU unchanged");
+    assert_eq!(
+        entry.last_spawn_attempt_ns, t0,
+        "no restart: the spawn attempt stamp must survive an unchanged-MTU refresh"
+    );
+}
+
+// ---------------------------------------------------------------------
 // #1881 — GRE local-origin thread lifecycle regression suite.
 //
 // Same shape as the wg1866 suite above: these drive the REAL spawn

@@ -116,6 +116,19 @@ pub(crate) struct WgControlEntry {
     /// unchanged WG crypto identity.
     pub(in crate::afxdp) spawned_ifindex: i32,
     pub(in crate::afxdp) spawned_tunnel_name: String,
+    /// #2921: the resolved OUTER (underlay) MTU captured at spawn and
+    /// handed by value into `wg_control_loop` (the TUN-origin egress
+    /// MTU guard). The WG identity tuple (`wg_identity_unchanged`)
+    /// ignores the transport table, the resolved egress ifindex, and
+    /// the egress MTU, so a same-engine refresh after an underlay
+    /// route/table/MTU change reuses the engine Arc and would otherwise
+    /// keep this stale value forever — the transit/forwarded path
+    /// re-resolves the underlay per-snapshot while the local TUN path
+    /// kept the spawn-time capture. The apply-time stale prune compares
+    /// this against a fresh `resolve_wg_outer_mtu` and restarts the
+    /// thread when they diverge, so both packet origins enforce the
+    /// SAME current outer MTU.
+    pub(in crate::afxdp) spawned_outer_mtu: usize,
     /// Stamped at EVERY spawn attempt (success or failure), before the
     /// outcome is known. Tombstone-respawn backoff keys off this.
     pub(in crate::afxdp) last_spawn_attempt_ns: u64,
