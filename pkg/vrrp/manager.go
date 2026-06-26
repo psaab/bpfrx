@@ -595,9 +595,31 @@ func (m *Manager) SetGARPSuppression(rgID int, suppress bool) {
 	vrid := 100 + rgID
 	for _, vi := range m.instances {
 		if vi.cfg.GroupID == vrid {
-			vi.suppressGARP.Store(suppress)
+			// Swap (not Store) so we can detect the true->false EDGE.
+			// Lifting suppression on an instance that is ALREADY MASTER
+			// (common in active-active strict-vip negotiation where the
+			// secondary briefly won the election before this node was
+			// promoted to RG primary) does NOT trigger any VRRP state
+			// transition, so becomeMaster's GARP/NA burst never fires —
+			// the VIP stays silent and traffic blackholes until the
+			// periodic timer eventually announces it. Fire a forced burst
+			// on the unsuppress edge to refresh neighbor MAC bindings
+			// immediately (#2940).
+			old := vi.suppressGARP.Swap(suppress)
 			slog.Info("vrrp: GARP suppression updated",
 				"key", vi.key(), "rgID", rgID, "suppress", suppress)
+			if old && !suppress && vi.getState() == StateMaster {
+				// force=true bypasses ONLY the 500ms time dampener so a
+				// routine GARP within the prior 500ms cannot swallow this
+				// announce; the per-epoch dedup still applies, so an
+				// idempotent re-unsuppress (or an epoch already announced)
+				// does not re-emit. Async, matching becomeMaster, so the
+				// cluster event handler is never blocked. sendGARP emits
+				// both IPv4 GARP and IPv6 NA in one burst.
+				slog.Info("vrrp: forcing GARP/NA on unsuppress while MASTER",
+					"key", vi.key(), "rgID", rgID)
+				go vi.sendGARP(true)
+			}
 		}
 	}
 }
