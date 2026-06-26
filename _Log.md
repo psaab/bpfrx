@@ -19738,3 +19738,14 @@ top.
   pkg/logging/ringbuf.go, pkg/logging/binary_test.go,
   pkg/flowexport/manager.go, pkg/flowexport/flowstart_test.go,
   pkg/flowexport/README.md, _Log.md
+
+- **Timestamp**: 2026-06-26
+- **Action**: #3105 — plumb dynamic-address feed overlay into the local CLI
+  policy simulators (`show security match-policies` / `test policy`) so they
+  agree with REST/gRPC and the dataplane. Added CLI.feedOverlayFn +
+  SetFeedOverlayFn + nil-safe feedOverlay(); wired in daemon_run.go from
+  feedSnapshotsForConfig (daemon-local, no control-socket call). New
+  fail-on-revert test.
+- **File(s)**: pkg/cli/cli.go, pkg/cli/cli_show_security.go,
+  pkg/cli/cli_request.go, pkg/daemon/daemon_run.go,
+  pkg/cli/policymatch_feed_overlay_test.go, _Log.md

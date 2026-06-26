@@ -52,6 +52,15 @@ type CLI struct {
 	ipmonStatusFn      func() []ipmon.PolicyStatus
 	natPoolAlarmsFn    func() []natpoolalarm.ActiveAlarm
 	feedsFn            func() map[string]feeds.FeedInfo
+	// feedOverlayFn returns the live dynamic-address feed-prefix overlay
+	// (#3105): an address-name -> union-of-live-feed-CIDR-strings map, the same
+	// source the REST/gRPC simulators consume (daemon SnapshotForBindings). The
+	// local `show security match-policies` / `test policy` simulators pass this
+	// into policymatch so a feed-backed address-name resolves to its live CIDRs
+	// on-box, matching what the dataplane enforces. Nil (CLI spawned outside the
+	// daemon, or no feed manager) means no overlay — exactly the pre-#3105
+	// behavior (feed-backed names resolve to static content only).
+	feedOverlayFn      func() map[string][]string
 	lldpNeighborsFn    func() []*lldp.Neighbor
 	ddnsStatsFn        func() *dhcpserver.DDNSStats
 	ddnsOwnedRecordsFn func() []dhcpserver.DDNSOwnedRecordView
@@ -175,6 +184,28 @@ func (c *CLI) SetNATPoolAlarmsFn(fn func() []natpoolalarm.ActiveAlarm) {
 // SetFeedsFn sets a callback for retrieving live dynamic address feed status.
 func (c *CLI) SetFeedsFn(fn func() map[string]feeds.FeedInfo) {
 	c.feedsFn = fn
+}
+
+// SetFeedOverlayFn sets a callback for retrieving the live dynamic-address
+// feed-prefix overlay (#3105) consumed by the local `show security
+// match-policies` / `test policy` simulators. The callback returns the same
+// address-name -> union-of-feed-CIDRs map the REST/gRPC simulators use
+// (daemon feedSnapshotsForConfig -> feeds.Manager.SnapshotForBindings), read
+// from daemon-local state — no control-socket call. Nil leaves the local
+// simulators overlay-free (feed-backed names resolve to static content only).
+func (c *CLI) SetFeedOverlayFn(fn func() map[string][]string) {
+	c.feedOverlayFn = fn
+}
+
+// feedOverlay returns the live feed-prefix overlay for the policy simulators,
+// or nil when no provider is wired (CLI spawned outside the daemon) — nil is a
+// valid policymatch.Query.FeedOverlay (no feed enforcement), so the caller
+// behaves exactly as before #3105.
+func (c *CLI) feedOverlay() map[string][]string {
+	if c == nil || c.feedOverlayFn == nil {
+		return nil
+	}
+	return c.feedOverlayFn()
 }
 
 // SetLLDPNeighborsFn sets a callback for retrieving live LLDP neighbor data.
