@@ -173,25 +173,84 @@ fn outer_physical_egress_mtu(
         .unwrap_or(1500)
 }
 
+/// The peer-endpoint outer destination whose underlay MTU the PTB must
+/// derive from, for a given inner destination (#2845).
+///
+/// The encap path selects the egress peer by the inner destination's
+/// longest-prefix match in the AllowedIPs trie
+/// (`wg_encap_frame` → `engine.peer_for_dest`) and resolves the outer hop
+/// from THAT peer's endpoint. Different peers of one wg interface can have
+/// different endpoints / underlay paths / MTUs, so the PTB must select the
+/// SAME peer rather than assuming one underlay per interface.
+///
+/// Resolution mirrors the encap path exactly: the live engine
+/// (`forwarding.wg_engines`) owns the AllowedIPs LPM and the per-snapshot
+/// endpoint binding (#2836), so the PTB and the encap agree on both the peer
+/// and its (possibly roamed) endpoint.
+///
+/// Returns:
+///   - `Some(ip)` — a covering peer was found with a known endpoint; resolve
+///     the underlay via the route to `ip`.
+///   - `None` — either no inner destination was available, no live engine is
+///     present yet, or no peer covers the inner destination: fall back to the
+///     pre-#2845 first-peer-with-endpoint behaviour (byte-identical in the
+///     single-underlay common case, the only available answer with no inner
+///     destination to select on).
+///
+/// NOTE: a covering peer found with NO endpoint (responder-only / unlearned)
+/// resolves to that peer's `None` and is returned as `None` here — the caller
+/// then uses the conservative logical-ifindex fallback rather than borrowing a
+/// DIFFERENT peer's underlay (which would reintroduce the #2845 mismatch). The
+/// encap path drops such a packet anyway, so the PTB value is moot.
+#[inline]
+fn wg_peer_outer_dst(
+    forwarding: &ForwardingState,
+    endpoint: &TunnelEndpoint,
+    inner_dst: Option<IpAddr>,
+) -> Option<IpAddr> {
+    if let Some(dst) = inner_dst {
+        if let Some(engine) = forwarding.wg_engines.get(&endpoint.id) {
+            if let Some((_pubkey, peer_endpoint)) = engine.peer_for_dest(dst) {
+                // A covering peer was found: use ITS endpoint (or None if the
+                // peer has no learned/configured endpoint — see the doc note).
+                return peer_endpoint.map(|ep| ep.ip());
+            }
+        }
+    }
+    // No inner dst, no live engine, or no covering peer: the pre-#2845
+    // first-peer-with-endpoint behaviour. Byte-identical in the single-
+    // underlay common case (one peer, or all peers on one underlay).
+    endpoint
+        .wg_peers
+        .iter()
+        .find_map(|peer| peer.endpoint.map(|ep| ep.ip()))
+}
+
 /// The PHYSICAL underlay egress MTU for a WireGuard endpoint, for the
-/// post-transform PTB inner-MTU derivation (#2684).
+/// post-transform PTB inner-MTU derivation (#2684, per-peer #2845).
 ///
 /// This is the SAME physical-underlay SSOT (`outer_physical_egress_mtu`,
 /// #2680) the encap drop guard uses, exposed so the TX dispatcher's
 /// `post_transform_inner_mtu` advertises an inner MTU consistent with what
-/// the encap guard actually admits. The PTB path runs BEFORE the per-packet
-/// peer LPM (it has no inner frame to select a peer), but the WG outer
-/// underlay is per-tunnel-endpoint, not per-inner-flow (#2734): every peer of
-/// an endpoint egresses the same physical underlay. So we resolve the
-/// physical egress via the FIRST peer endpoint that yields a route; the
-/// fallback inside `outer_physical_egress_mtu` (route unresolvable → the
+/// the encap guard actually admits.
+///
+/// #2845: the PTB path runs BEFORE the per-packet peer LPM in the builder, but
+/// the dispatcher already holds the pre-encap inner frame and threads the inner
+/// destination here. We select the SAME peer the encap path will
+/// (`wg_peer_outer_dst` → `engine.peer_for_dest`) and resolve the underlay via
+/// THAT peer's endpoint, so two peers of one wg interface with asymmetric
+/// underlay MTUs each get the PTB derived from their OWN underlay — not an
+/// arbitrary first peer's. When the inner destination is unavailable or no peer
+/// covers it, this falls back to the first peer with an endpoint (the pre-#2845
+/// per-interface behaviour, byte-identical when all peers share one underlay).
+/// The fallback inside `outer_physical_egress_mtu` (route unresolvable → the
 /// resolution's own `egress_ifindex` MTU = the tunnel LOGICAL MTU) preserves
 /// the conservative pre-#2684 behaviour, never tighter.
 ///
-/// Returns the logical-ifindex MTU fallback when the endpoint has no peer
-/// with a learned/configured endpoint address (no outer hop to route to) —
-/// the same value `tunnel_outer_mtu` would have produced, so the PTB is no
-/// worse than before in that degenerate case.
+/// Returns the logical-ifindex MTU fallback when the selected peer has no
+/// learned/configured endpoint address (no outer hop to route to) — the same
+/// value `tunnel_outer_mtu` would have produced, so the PTB is no worse than
+/// before in that degenerate case.
 ///
 /// # Why not `tunnel_outer_mtu`
 /// For a WG transit flow `endpoint.destination` is `0.0.0.0`/`::`
@@ -208,13 +267,12 @@ pub(in crate::afxdp) fn wg_endpoint_physical_outer_mtu(
     decision: &SessionDecision,
     forwarding: &ForwardingState,
     endpoint: &TunnelEndpoint,
+    inner_dst: Option<IpAddr>,
 ) -> usize {
-    // The WG underlay is per-endpoint (#2734): the first peer with a known
-    // endpoint address resolves the same physical egress as any other.
-    let outer_dst = endpoint
-        .wg_peers
-        .iter()
-        .find_map(|peer| peer.endpoint.map(|ep| ep.ip()));
+    // #2845: resolve the outer hop of the SAME peer the encap path selects
+    // for this inner destination (per-peer underlay), with the pre-#2845
+    // first-peer behaviour as the fallback.
+    let outer_dst = wg_peer_outer_dst(forwarding, endpoint, inner_dst);
     match outer_dst {
         Some(dst) => outer_physical_egress_mtu(decision, forwarding, endpoint, dst),
         // No peer endpoint to route to: fall back to the resolution's own

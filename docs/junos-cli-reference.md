@@ -278,6 +278,20 @@ From zone: guest, To zone: lan
     accepting `SSH` would itself reintroduce a split-brain). Recognized tokens
     (`ssh`, `ping`, `all`, `any-service`, `ipsec`/`ike`, `protocols all`
     routing-scoped per #3199, …) are unaffected.
+  - **RETH VRRP VIP scoping (#3172):** the kernel host-inbound chain scopes
+    its accept/deny rules to each zone's firewall-local addresses. Those
+    addresses now include the zone's RETH **VRRP virtual IPs** (the
+    `vrrp-group ... virtual-address` entries on the reth unit), resolved from
+    config rather than only from the live kernel address list. A VIP is present
+    on the kernel interface only of the node that currently owns the redundancy
+    group (master); on the BACKUP node the VIP is not yet live, so before #3172
+    a host-inbound deny was not scoped to the VIP there and `chain input` fell
+    through to `policy accept` (FAIL-OPEN) for VIP-destined host-bound traffic.
+    Resolving the VIPs from config scopes the deny identically on both nodes
+    regardless of mastership; on the master the live address dedups so the rule
+    set is byte-identical. Management/cluster-control lifeline interfaces
+    (fxp0/em0/fab*) are still excluded — a VIP on em0 is never scoped — and
+    standalone (no-VRRP) zones are unchanged.
   - **Lifeline fail-safe:** enforcement is strictly MATCH-DRIVEN. If NO
     `junos-host` policy is configured, or a host-bound flow matches no
     `junos-host` rule, behavior is UNCHANGED from before #3019 — there is no

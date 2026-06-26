@@ -880,7 +880,7 @@ fn post_transform_inner_mtu_gre_subtracts_outer_and_gre_header() {
     let mut fwd = forwarding_with_egress(1400);
     insert_tunnel_endpoint(&mut fwd, "gre", libc::AF_INET, 0);
     let decision = tunnel_decision();
-    let inner = post_transform_inner_mtu(&decision, &fwd, false, libc::AF_INET as u8, 1400);
+    let inner = post_transform_inner_mtu(&decision, &fwd, false, libc::AF_INET as u8, 1400, None);
     assert_eq!(inner, 1376, "GRE inner MTU = transport - outer_ip(20) - gre(4)");
     assert_eq!(
         inner,
@@ -895,7 +895,7 @@ fn post_transform_inner_mtu_gre_counts_key_word() {
     let mut fwd = forwarding_with_egress(1400);
     insert_tunnel_endpoint(&mut fwd, "gre", libc::AF_INET, 0xdead_beef);
     let inner =
-        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, libc::AF_INET as u8, 1400);
+        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, libc::AF_INET as u8, 1400, None);
     assert_eq!(inner, 1372, "key-present GRE counts the extra 4-byte key word");
 }
 
@@ -907,7 +907,7 @@ fn post_transform_inner_mtu_wireguard_is_pad_aware() {
     let mut fwd = forwarding_with_egress(1400);
     insert_tunnel_endpoint(&mut fwd, "wireguard", libc::AF_INET, 0);
     let inner =
-        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, libc::AF_INET as u8, 1400);
+        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, libc::AF_INET as u8, 1400, None);
     assert_eq!(inner, 1325, "WG inner MTU = outer_mtu - WG_OVERHEAD_V4 - max_pad");
     assert_eq!(
         inner,
@@ -923,7 +923,7 @@ fn post_transform_inner_mtu_unknown_tunnel_kind_fails_open() {
     let mut fwd = forwarding_with_egress(1400);
     insert_tunnel_endpoint(&mut fwd, "l2tp", libc::AF_INET, 0);
     assert_eq!(
-        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, libc::AF_INET as u8, 1400),
+        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, libc::AF_INET as u8, 1400, None),
         0,
         "unknown tunnel mode -> 0 (fail-open)"
     );
@@ -935,7 +935,7 @@ fn post_transform_inner_mtu_nat64_v6_to_v4_adds_header_delta() {
     // so a v6 inner up to egress_mtu + 20 still fits. egress 1400 -> 1420.
     let fwd = forwarding_with_egress(1400);
     let inner =
-        post_transform_inner_mtu(&nat64_decision(true), &fwd, true, libc::AF_INET6 as u8, 1400);
+        post_transform_inner_mtu(&nat64_decision(true), &fwd, true, libc::AF_INET6 as u8, 1400, None);
     assert_eq!(inner, 1420, "NAT64 v6->v4 inner MTU = egress + 20");
 }
 
@@ -945,7 +945,7 @@ fn post_transform_inner_mtu_nat64_v4_to_v6_subtracts_header_delta() {
     // so the v4 inner must be 20 bytes SMALLER. egress 1400 -> 1380.
     let fwd = forwarding_with_egress(1400);
     let inner =
-        post_transform_inner_mtu(&nat64_decision(true), &fwd, true, libc::AF_INET as u8, 1400);
+        post_transform_inner_mtu(&nat64_decision(true), &fwd, true, libc::AF_INET as u8, 1400, None);
     assert_eq!(inner, 1380, "NAT64 v4->v6 inner MTU = egress - 20");
 }
 
@@ -961,7 +961,7 @@ fn post_transform_gre_oversized_v4_df_emits_inner_ptb() {
     insert_tunnel_endpoint(&mut fwd, "gre", libc::AF_INET, 0);
     let decision = tunnel_decision();
     let inner_mtu =
-        post_transform_inner_mtu(&decision, &fwd, false, meta.addr_family, 1400);
+        post_transform_inner_mtu(&decision, &fwd, false, meta.addr_family, 1400, None);
     assert_eq!(inner_mtu, 1376);
 
     // Source-vs-egress (the WRONG pre-#2330 comparison) would advertise 1400;
@@ -996,7 +996,7 @@ fn post_transform_wireguard_oversized_v6_emits_inner_ptb() {
     let mut fwd = forwarding_with_egress(1400);
     insert_tunnel_endpoint(&mut fwd, "wireguard", libc::AF_INET, 0);
     let inner_mtu =
-        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, meta.addr_family, 1400);
+        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, meta.addr_family, 1400, None);
     assert_eq!(inner_mtu, 1325);
     let next_hop_mtu = match forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu)
     {
@@ -1023,7 +1023,7 @@ fn post_transform_nat64_v6_oversized_emits_inner_ptb() {
     let l3 = meta.l3_offset as usize;
     let fwd = forwarding_with_egress(1400);
     let inner_mtu =
-        post_transform_inner_mtu(&nat64_decision(true), &fwd, true, meta.addr_family, 1400);
+        post_transform_inner_mtu(&nat64_decision(true), &fwd, true, meta.addr_family, 1400, None);
     assert_eq!(inner_mtu, 1420, "NAT64 v6->v4 inner MTU = egress + 20");
     let next_hop_mtu = match forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu)
     {
@@ -1050,7 +1050,7 @@ fn post_transform_in_mtu_forwards_no_ptb() {
     let mut fwd = forwarding_with_egress(1400);
     insert_tunnel_endpoint(&mut fwd, "gre", libc::AF_INET, 0);
     let inner_mtu =
-        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, meta.addr_family, 1400);
+        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, meta.addr_family, 1400, None);
     assert_eq!(
         forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu),
         EgressMtuDecision::Forward,
@@ -1202,7 +1202,7 @@ fn post_transform_wg_inner_mtu_uses_physical_underlay_not_logical_v4() {
     assert_eq!(state.egress.get(&12).map(|e| e.mtu), Some(1500), "reth0.80 physical");
 
     let decision = wg_logical_tunnel_decision(400, 1);
-    let inner_mtu = post_transform_inner_mtu(&decision, &state, false, libc::AF_INET as u8, 0);
+    let inner_mtu = post_transform_inner_mtu(&decision, &state, false, libc::AF_INET as u8, 0, None);
     assert_eq!(
         inner_mtu, 1425,
         "WG PTB inner MTU MUST be wg_inner_mtu(physical 1500) = 1425, NOT \
@@ -1280,7 +1280,7 @@ fn post_transform_wg_inner_mtu_uses_physical_underlay_not_logical_v6() {
     assert_eq!(state.egress.get(&12).map(|e| e.mtu), Some(1500), "reth0.80 physical");
 
     let decision = wg_logical_tunnel_decision(400, 1);
-    let inner_mtu = post_transform_inner_mtu(&decision, &state, false, libc::AF_INET6 as u8, 0);
+    let inner_mtu = post_transform_inner_mtu(&decision, &state, false, libc::AF_INET6 as u8, 0, None);
     assert_eq!(
         inner_mtu, 1405,
         "WG PTB inner MTU (v6 outer) MUST be wg_inner_mtu(physical 1500) = 1405, \
@@ -1325,11 +1325,128 @@ fn post_transform_wg_inner_mtu_falls_back_to_logical_when_no_peer_endpoint() {
     snap.tunnel_endpoints[0].wg_peers[0].wg_endpoint = String::new(); // responder-only
     let state = build_forwarding_state(&snap);
     let decision = wg_logical_tunnel_decision(400, 1);
-    let inner_mtu = post_transform_inner_mtu(&decision, &state, false, libc::AF_INET as u8, 0);
+    let inner_mtu = post_transform_inner_mtu(&decision, &state, false, libc::AF_INET as u8, 0, None);
     // Logical egress (400) MTU 1420 → wg_inner_mtu(1420) = 1345.
     assert_eq!(
         inner_mtu, 1345,
         "no peer endpoint → fall back to logical egress MTU (1420) → 1345, \
          no worse than the pre-#2684 tunnel_outer_mtu behaviour"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #2845: per-peer underlay MTU. One wg interface, TWO peers whose endpoints
+// route over DIFFERENT physical underlays with DIFFERENT MTUs. The PTB inner
+// MTU advertised for an inner destination must reflect the underlay of the
+// SAME peer the encap path selects (by AllowedIPs LPM), NOT an arbitrary first
+// peer's. Before #2845 the helper resolved via the FIRST peer with an endpoint
+// regardless of inner destination, so traffic to peer B got peer A's underlay
+// MTU (over- or under-advertised PMTU).
+// ---------------------------------------------------------------------------
+
+/// Extend the shared single-peer WG fixture with a SECOND physical underlay
+/// (reth0.50, ifindex 13, MTU 1400) and a SECOND peer (peer B) whose endpoint
+/// routes out reth0.50. Peer A keeps the original reth0.80 (ifindex 12, MTU
+/// 1500) underlay. The two peers cover disjoint inner prefixes:
+///   - peer A: 10.123.0.0/24 → endpoint 203.0.113.7 → reth0.80 (MTU 1500)
+///   - peer B: 10.124.0.0/24 → endpoint 198.51.100.7 → reth0.50 (MTU 1400)
+/// Peer A is listed first AND given the lexicographically-smaller pubkey, so
+/// the pre-#2845 first-peer fallback always resolves to peer A's underlay
+/// (1500) — the source of the fail-on-revert RED for peer B.
+fn wg_two_peer_asymmetric_snapshot() -> crate::ConfigSnapshot {
+    let mut snap = crate::afxdp::test_fixtures::wg_outer_mtu_snapshot();
+    // Second physical underlay: reth0.50, ifindex 13, MTU 1400.
+    snap.interfaces.push(crate::InterfaceSnapshot {
+        name: "reth0.50".to_string(),
+        zone: "wan".to_string(),
+        linux_name: "ge-0-0-2.50".to_string(),
+        ifindex: 13,
+        parent_ifindex: 6,
+        vlan_id: 50,
+        mtu: 1400,
+        redundancy_group: 1,
+        hardware_addr: "02:bf:72:00:50:08".to_string(),
+        addresses: vec![crate::InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "172.16.50.8/24".to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    });
+    // Route to peer B's endpoint egresses reth0.50.
+    snap.routes.push(crate::RouteSnapshot {
+        table: "inet.0".to_string(),
+        family: "inet".to_string(),
+        destination: "198.51.100.0/24".to_string(),
+        next_hops: vec!["172.16.50.1@reth0.50".to_string()],
+        discard: false,
+        next_table: String::new(),
+        preference: 0,
+    });
+    {
+        let ep = &mut snap.tunnel_endpoints[0];
+        // Peer A: give it the smaller pubkey so it is first in any sorted order
+        // (the first-peer revert path resolves here).
+        ep.wg_peers[0].wg_peer_pubkey_hex = "0a0a0a0a".repeat(8);
+        ep.wg_peers[0].wg_allowed_ips = vec!["10.123.0.0/24".to_string()];
+        ep.wg_peers[0].wg_endpoint = "203.0.113.7:51820".to_string();
+        // Peer B: distinct prefix + endpoint routing over the smaller underlay.
+        ep.wg_peers.push(crate::TunnelWgPeerSnapshot {
+            wg_peer_pubkey_hex: "0b0b0b0b".repeat(8),
+            wg_allowed_ips: vec!["10.124.0.0/24".to_string()],
+            wg_endpoint: "198.51.100.7:51820".to_string(),
+            ..Default::default()
+        });
+    }
+    snap
+}
+
+#[test]
+fn post_transform_wg_inner_mtu_is_per_peer_underlay() {
+    let state = build_forwarding_state(&wg_two_peer_asymmetric_snapshot());
+    // Sanity: the two underlays really carry distinct MTUs, so the per-peer
+    // assertion below is meaningful.
+    assert_eq!(state.egress.get(&12).map(|e| e.mtu), Some(1500), "reth0.80 underlay");
+    assert_eq!(state.egress.get(&13).map(|e| e.mtu), Some(1400), "reth0.50 underlay");
+
+    let decision = wg_logical_tunnel_decision(400, 1);
+
+    // Inner destination covered by peer A → its underlay is reth0.80 (1500).
+    let peer_a_dst = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 123, 0, 9));
+    let mtu_a = post_transform_inner_mtu(
+        &decision,
+        &state,
+        false,
+        libc::AF_INET as u8,
+        0,
+        Some(peer_a_dst),
+    );
+    // Inner destination covered by peer B → its underlay is reth0.50 (1400).
+    let peer_b_dst = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 124, 0, 9));
+    let mtu_b = post_transform_inner_mtu(
+        &decision,
+        &state,
+        false,
+        libc::AF_INET as u8,
+        0,
+        Some(peer_b_dst),
+    );
+
+    assert_eq!(
+        mtu_a,
+        crate::afxdp::wg::mss::wg_inner_mtu(libc::AF_INET, 1500),
+        "peer A PTB inner MTU MUST derive from ITS underlay (reth0.80=1500)"
+    );
+    assert_eq!(
+        mtu_b,
+        crate::afxdp::wg::mss::wg_inner_mtu(libc::AF_INET, 1400),
+        "peer B PTB inner MTU MUST derive from ITS underlay (reth0.50=1400), \
+         NOT peer A's 1500 — reverting to the per-interface first-peer \
+         assumption returns 1500 here and fails red"
+    );
+    // The whole point: asymmetric underlays yield DIFFERENT inner MTUs.
+    assert_ne!(
+        mtu_a, mtu_b,
+        "per-peer underlay MTUs must differ for asymmetric peers"
     );
 }
