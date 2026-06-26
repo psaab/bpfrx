@@ -95,25 +95,6 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
-	// Collect valid applications
-	apps := make(map[string]bool)
-	for name := range cfg.Applications.Applications {
-		apps[name] = true
-	}
-	for name := range cfg.Applications.ApplicationSets {
-		apps[name] = true
-	}
-	// Built-in Junos application names
-	builtins := []string{"any", "junos-http", "junos-https", "junos-ssh", "junos-telnet",
-		"junos-dns-udp", "junos-dns-tcp", "junos-ping", "junos-icmp-all",
-		"junos-bgp", "junos-ospf", "junos-ntp", "junos-dhcp-relay",
-		"junos-ftp", "junos-smtp", "junos-icmp6-all", "junos-ike",
-		"junos-ipsec-nat-t", "junos-dhcp-client", "junos-dhcp-server",
-		"junos-snmp", "junos-syslog", "junos-traceroute", "junos-radius"}
-	for _, b := range builtins {
-		apps[b] = true
-	}
-
 	// Validate application port specs and protocols
 	for name, app := range cfg.Applications.Applications {
 		if err := validatePortSpec(app.DestinationPort); err != nil {
@@ -163,12 +144,13 @@ func ValidateConfig(cfg *Config) []string {
 						"policy %q: destination-address %q not in address-book", p.Name, addr))
 				}
 			}
-			for _, app := range p.Match.Applications {
-				if !apps[app] {
-					warnings = append(warnings, fmt.Sprintf(
-						"policy %q: application %q not defined", p.Name, app))
-				}
-			}
+			// An undefined `match application` reference is no longer
+			// warned here: validatePolicyMatchApplicationsStrict (#3144)
+			// hard-rejects it at commit and emits the warning on the
+			// tolerant load / peer-sync path. Resolving it here too (with a
+			// narrower 24-entry builtin list) produced a duplicate warning
+			// and a false positive for predefined apps outside that list
+			// (e.g. junos-pingv6, junos-tcp-any).
 		}
 	}
 
