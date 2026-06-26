@@ -20170,6 +20170,30 @@ top.
   userspace-dp/src/server/README.md
 
 - **Timestamp**: 2026-06-26
+  **Action**: #3063 — make `show security policies detail` Index match the
+  runtime/RT_FLOW policy ID. The detail Index was rendered from the raw
+  per-policy ordinal `policySetID*MaxRulesPerPolicy + i`, which does NOT
+  advance by application-set expansion, while the snapshot PolicyID (and the
+  RT_FLOW/event log IDs) DO — so the displayed Index drifted from the logged
+  policy ID after a multi-application policy and an operator landed on the
+  wrong row. Added exported `RuntimePolicyIDs(cfg)` in pkg/dataplane/userspace
+  (built from the SSOT `walkPolicyRuleSlots`, reusing
+  `userspacePolicyRuleExpansionCount`; added `SliceIndex` to `policyRuleSlot`)
+  returning the span-accumulated ID keyed by (policySetID, sliceIndex). The
+  CLI detail surfaces (cli_show_security.go + cli_show_security_dispatch.go,
+  zone-pair AND global) now render Index via a `runtimePolicyIndex` lookup
+  with raw-ordinal fallback. Counter lookups are UNCHANGED: the per-policy
+  store is name-keyed and the raw-ordinal handle round-trips through
+  `policyRuleIDForCounter`, so the gRPC/REST/Prometheus counter paths (which
+  never display an Index) keep passing the raw ordinal. Single-application
+  configs stay byte-identical. Added CLI + userspace fail-on-revert tests
+  (deny-ssh after a 2-term app-set shows Index 2, not 1; global at 256) and a
+  byte-identical single-app regression. Documented in junos-cli-reference.md.
+  **File(s)**: pkg/dataplane/userspace/policies.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/cli/cli_show_security_policy_index_3063_test.go,
+  pkg/dataplane/userspace/policy_runtime_ids_3063_test.go,
+  docs/junos-cli-reference.md
   **Action**: #2926 — thread ctx into applyConfigLocked so a daemon stop aborts
   the post-applySem commit/remediation apply (the #2914/#2868 follow-up: #2914
   only cancelled the pre-semaphore wait). applyConfigLocked now takes ctx and

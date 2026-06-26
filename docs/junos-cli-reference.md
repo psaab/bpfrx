@@ -215,6 +215,19 @@ From zone: guest, To zone: lan
 
 - **Zone header:** `From zone: <name>, To zone: <name>` (no indentation).
 - **Policy line:** 2-space indent, comma-separated: `Policy: <name>, State: enabled, Index: <N>, Scope Policy: 0, Sequence number: <N>, Log Profile ID: 0`
+  - **Index (#3063):** the `Index:` value is the runtime/RT_FLOW policy
+    ID — the same numeric ID printed by RT_FLOW policy-deny logs and the
+    session surfaces — so an operator can cross-reference a log line to
+    the exact detail row. It is span-accumulated: a policy whose match
+    references an application-set that expands to multiple application
+    terms advances the next policy's Index by the expansion count, not by
+    one. So the Index of a policy that follows a multi-application policy
+    is NOT its 1-based position. The global-policy block starts at a fresh
+    policy-set base (`len(zone-pair sets) * 256`). Configs with no
+    multi-application policy keep Index == the previous per-policy ordinal
+    (byte-identical to pre-#3063). The `Sequence number:` field remains
+    the 1-based per-set position. This Index is a display identity only;
+    per-policy hit counters are name-keyed internally and unaffected.
   - **Scheduler state (#3062):** the `State:` field reflects runtime
     scheduler state, not just configuration. A policy bound to a
     scheduler (`scheduler-name <name>`) that is currently inactive renders
