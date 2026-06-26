@@ -1,3 +1,35 @@
+## 2026-06-26 — #3071: zone tcp-rst wired into userspace deny enforcement
+
+- **Timestamp**: 2026-06-26
+- **Action**: Wire the parsed-but-inert `security zones <z> tcp-rst` knob into
+  the userspace dataplane. Go `ZoneConfig.TCPRst` now flows to
+  `ZoneSnapshot.TCPRst` (json `tcp_rst`, omitempty) and across the wire to the
+  Rust `ZoneSnapshot.tcp_rst` (serde rename `tcp_rst`, default false). The Rust
+  forwarding build records tcp-rst-enabled zone ids in
+  `ForwardingState.zone_tcp_rst`; both policy-deny call sites in
+  `poll_descriptor/mod.rs` now route through a unified `enqueue_deny_reply`
+  helper that, for a plain `deny` (not `then reject`), sends a TCP RST via the
+  existing #2521/#2089 reject machinery ONLY when the flow is TCP and the
+  INGRESS (from) zone has tcp-rst. Non-TCP denied traffic and a deny in a
+  non-tcp-rst zone stay silent drops; explicit `then reject` is unchanged. Zone
+  tcp-rst RSTs count under `policy_reject_sent`. Junos semantics: tcp-rst is a
+  source/from-zone property (RST goes back toward the initiator).
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/zones_tcp_rst_3071_test.go (new),
+  userspace-dp/src/protocol/snapshot.rs (field + round-trip tests),
+  userspace-dp/src/afxdp/types/forwarding.rs (field + accessor),
+  userspace-dp/src/afxdp/forwarding_build/zones.rs (populate),
+  userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs (enqueue_deny_reply +
+  tests), userspace-dp/src/afxdp/poll_descriptor/mod.rs (call sites),
+  userspace-dp/src/filter/README.md, userspace-dp/tests/fixtures/protocol_wire_v1.json
+  (regenerated), plus test-literal updates in forwarding/forwarding_build/
+  test_fixtures/tests for the new field.
+- **Validation**: cargo build --release clean; Rust reject/policy/forwarding/
+  snapshot/wire tests green incl. 6 new tcp-rst tests; fail-on-revert confirmed
+  (disabling the zone arm → deny_reply_zone_tcp_rst_tcp_enqueues_rst RED);
+  go build ./... + go test ./pkg/dataplane/... ./pkg/config/... pass; gofmt clean.
+
 ## 2026-06-25 — #3029: DNAT destination-address prefix silently narrowed to a single host
 
 - **Action**: Hard-reject a destination-NAT rule whose `match destination-address`

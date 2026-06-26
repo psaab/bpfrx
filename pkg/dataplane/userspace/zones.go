@@ -19,10 +19,17 @@ func buildZoneSnapshots(cfg *config.Config) []ZoneSnapshot {
 	sort.Strings(names)
 	out := make([]ZoneSnapshot, 0, len(names))
 	for i, name := range names {
-		out = append(out, ZoneSnapshot{
+		zs := ZoneSnapshot{
 			Name: name,
 			ID:   uint16(i + 1),
-		})
+		}
+		// #3071: carry the per-zone `tcp-rst` knob to the dataplane so a
+		// denied TCP flow whose ingress (from) zone has tcp-rst enabled
+		// gets a TCP RST instead of a silent drop.
+		if z := cfg.Security.Zones[name]; z != nil && z.TCPRst {
+			zs.TCPRst = true
+		}
+		out = append(out, zs)
 	}
 	return out
 }
