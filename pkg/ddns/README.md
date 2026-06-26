@@ -82,6 +82,28 @@ success for a withdraw they did not actually perform — doing so orphans the
 public record while xpf believes it withdrawn (the #2772 bug, originally a no-op
 that returned nil on both dyndns2 and generic).
 
+**Withdraw shares the publish error-backoff (#2813).** Both withdraw paths — the
+Pass-1 address-loss withdraw in `reconcileScopeLocked` and the Pass-2
+gone-from-config withdraw in `Reconcile` — now arm the SAME per-scope flat
+exponential backoff (`recordScopeError` → `surfaceAState.nextEligible`) the
+publish path uses, via the shared `withdrawScopeLocked` helper. Before #2813 a
+persistently-failing withdraw re-attempted (and emitted one `slog.Warn`) on
+EVERY 30s reconcile sweep — ~2880 log lines/day/scope — because only publish
+participated in the backoff machinery. Now a failing withdraw backs off (30s →
+1h cap) and its retry/warn cadence collapses to the backoff schedule. A scope is
+only ever a publish OR a withdraw candidate at one time (a gone-from-config scope
+is absent from `desired` and never reaches Pass 1), so a SINGLE shared per-scope
+backoff slot is correct — there is no separate withdraw-specific slot. A
+transient withdraw failure is still retried after the backoff window and clears
+the backoff state on success (the record is actually withdrawn — no leaked
+ownership). A withdraw that returns `errGenericDeleteUnsupported` (the generic
+backend has no portable delete verb) is treated as **terminal**: the wire delete
+is attempted at most once, a single warn is emitted, and ownership is kept (the
+abandoned RR stays operator-visible) — re-attempting a structurally-unsupported
+verb on any cadence is pointless. The terminal mark clears on a successful
+publish or a daemon restart (the runtime cache is rebuilt from the durable
+store), so a later provider change that adds a delete verb is re-probed.
+
 | backend | withdraw mechanism |
 |---|---|
 | `dyndns2` | the same update GET with `offline=YES` (the de-facto dyndns2 withdraw — dyn/no-ip/dns-o-matic take the hostname offline). Body verdict parsed like an upsert; a provider failure → non-nil error → ownership kept for retry. |

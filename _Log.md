@@ -20233,3 +20233,26 @@ top.
   pkg/daemon/daemon_snmp_reconcile_test.go,
   pkg/daemon/persistent_snat_apply_test.go,
   pkg/daemon/policy_scheduler_apply_test.go, pkg/daemon/README.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #2813 ddns/surface-a — make both withdraw paths share the publish
+  per-scope error backoff. A permanently-failing withdraw (generic backend with
+  no delete verb, or a persistently-erroring dyndns2/cloudflare/route53/rfc2136
+  delete) re-attempted on every 30s sweep and emitted one slog.Warn per sweep
+  (~2880 lines/day/scope) because only the publish path armed backoff. Refactored
+  recordScopeError to take (fqdn, maxBackoff) instead of the full scope; added
+  withdrawScopeLocked (drives DeleteLease under the shared backoff slot) +
+  markWithdrawUnsupported (terminal classification). Pass-1 (address-loss in
+  reconcileScopeLocked) and Pass-2 (gone-from-config in Reconcile) now arm the
+  same flat exponential backoff (30s→1h) and a backoff-window check skips the
+  re-attempt + warn while backed off. A scope is only ever a publish OR a
+  withdraw candidate at one time, so one shared backoff slot is correct (no
+  withdraw-specific slot). errGenericDeleteUnsupported is terminal (attempt once,
+  one warn, keep ownership; cleared on a successful publish or restart). Added
+  surface_a_withdraw_backoff_2813_test.go (4 tests: gone-from-config backoff,
+  address-loss backoff, retry-after-window-then-succeed-clears, unsupported-
+  terminal). Fail-on-revert: removing the withdraw backoff arming turned both
+  BacksOff tests RED (12 attempts over 12 sweeps); restored byte-identical.
+  go build ./... + go test ./pkg/ddns/... ./pkg/daemon/... green (837 tests).
+  **File(s)**: pkg/ddns/surface_a.go,
+  pkg/ddns/surface_a_withdraw_backoff_2813_test.go, pkg/ddns/README.md, _Log.md
