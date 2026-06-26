@@ -14,6 +14,7 @@ import (
 	"unsafe"
 
 	"github.com/psaab/xpf/pkg/appid"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 // EventCallback is called for each processed event record.
@@ -225,6 +226,14 @@ func (er *EventReader) SetPolicyNames(names map[uint32]string) {
 }
 
 func (er *EventReader) resolvePolicyName(id uint32) string {
+	// #3057: the implicit default-policy carries a reserved sentinel ID that can
+	// never equal a real configured policy ID. Render it as the fixed
+	// pseudo-policy name authoritatively (even before any policyNames map has
+	// been published) so a default-deny/reject RT_FLOW record never aliases the
+	// first configured policy (real ID 0).
+	if id == dataplane.DefaultPolicySentinelID {
+		return dataplane.DefaultPolicyName
+	}
 	er.policyNamesMu.RLock()
 	name := er.policyNames[id]
 	er.policyNamesMu.RUnlock()
