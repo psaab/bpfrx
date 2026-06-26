@@ -58,6 +58,77 @@ func TestApplyConfigLockedAbortsOnCanceledCtx(t *testing.T) {
 	}
 }
 
+// TestApplyCancelCtxAbortsApplyOnDaemonStop exercises the REAL production
+// wiring (#2926 fold): it does NOT inject a pre-canceled context directly into
+// applyConfigLocked. Instead it reproduces exactly how Run wires the cancel
+// signal — d.daemonCtx is the never-canceled context.Background() that cmd/xpfd
+// passes into Run, and the apply-abort context (d.applyCancelContext) is a
+// SEPARATE child of the SIGTERM/SIGINT signal context. The apply is then driven
+// through d.applyCancelCtx() (the production seam), and "daemon stop" is
+// simulated by canceling the signal parent, which must propagate to the
+// dedicated apply-abort child and make applyConfigLocked bail at boundary C1
+// (dp.applyCalls stays 0).
+//
+// Fail-on-revert: this is the test the ORIGINAL inert wiring fails. If
+// applyCancelCtx() reverts to returning d.daemonCtx (the pre-fold code), it
+// returns the never-canceled context.Background() set below, the apply runs to
+// completion (dp.applyCalls==1) and returns nil instead of context.Canceled —
+// the test goes RED. The earlier TestApplyConfigLockedAbortsOnCanceledCtx
+// (direct-injection) would still PASS under the inert wiring, which is why it
+// gave false confidence; this test closes that gap.
+func TestApplyCancelCtxAbortsApplyOnDaemonStop(t *testing.T) {
+	d, dp, cfg := minimalApplyCtxDaemon(t)
+
+	// Production wiring: daemonCtx is the never-canceled background context
+	// cmd/xpfd passes into Run. The apply-abort context is the separate
+	// signal-child Run creates after signal.NotifyContext.
+	d.daemonCtx = context.Background()
+	signalCtx, daemonStop := context.WithCancel(context.Background())
+	defer daemonStop()
+	d.applyCancelContext, d.applyCancel = context.WithCancel(signalCtx)
+	defer d.applyCancel()
+
+	// Simulate `systemctl stop xpfd`: the signal context is canceled, which
+	// must propagate through to the dedicated apply-abort child returned by
+	// applyCancelCtx().
+	daemonStop()
+
+	err := d.applyConfigLocked(d.applyCancelCtx(), cfg)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("applyConfigLocked(applyCancelCtx after daemon stop) = %v, "+
+			"want context.Canceled — the daemon-stop signal did not reach the "+
+			"#2926 boundary checks (inert wiring)", err)
+	}
+	if dp.applyCalls != 0 {
+		t.Fatalf("applyConfigLocked ran the dataplane sync push despite a "+
+			"daemon stop (applyCalls=%d, want 0): applyCancelCtx() is not wired "+
+			"to the signal-cancellable context", dp.applyCalls)
+	}
+}
+
+// TestApplyCancelCtxRunsFullApplyWhileDaemonLive is the live-daemon companion
+// to TestApplyCancelCtxAbortsApplyOnDaemonStop: with the apply-abort context
+// wired but NOT canceled (daemon running normally), a commit-path apply driven
+// through applyCancelCtx() must run in full (dp.applyCalls==1). This guards
+// against an over-eager wiring that would abort healthy day-2 commits.
+func TestApplyCancelCtxRunsFullApplyWhileDaemonLive(t *testing.T) {
+	d, dp, cfg := minimalApplyCtxDaemon(t)
+
+	d.daemonCtx = context.Background()
+	signalCtx, daemonStop := context.WithCancel(context.Background())
+	defer daemonStop()
+	d.applyCancelContext, d.applyCancel = context.WithCancel(signalCtx)
+	defer d.applyCancel()
+
+	if err := d.applyConfigLocked(d.applyCancelCtx(), cfg); err != nil {
+		t.Fatalf("applyConfigLocked(applyCancelCtx, daemon live) = %v, want nil", err)
+	}
+	if dp.applyCalls != 1 {
+		t.Fatalf("applyConfigLocked did not run the full apply on a live "+
+			"daemon (applyCalls=%d, want 1)", dp.applyCalls)
+	}
+}
+
 // TestApplyConfigLockedRunsFullApplyOnLiveCtx is the regression half: a live
 // (non-canceled) context must run the apply exactly as before #2926 — the
 // dataplane sync push happens (applyCalls==1) and the body returns nil. This

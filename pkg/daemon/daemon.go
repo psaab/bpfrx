@@ -344,8 +344,34 @@ type Daemon struct {
 	grpcSrv *grpcapi.Server
 
 	// daemonCtx is the parent context from Run(), used to derive
-	// independently-cancellable sub-contexts for cluster comms.
+	// independently-cancellable sub-contexts for the daemon-lifetime
+	// background goroutines (cluster comms, flow-export/IPFIX relays, RPM
+	// probe-pin retry, the policy scheduler, and the dataplane runtime
+	// dp.Start). In production cmd/xpfd passes context.Background() into Run,
+	// so daemonCtx is NEVER cancelled — those goroutines are torn down
+	// EXPLICITLY in the shutdown sequence (stopFlowExporter, rpm.StopAll,
+	// cluster.Stop, dp.Teardown, ...), and the orderly teardown (logFinalStats
+	// through dp.Telemetry, the HA rg_active clear through dp.HA()) still needs
+	// the dataplane runtime live while it runs. daemonCtx is therefore NOT the
+	// apply-abort signal; see applyCancelContext / applyCancelCtx (#2926).
 	daemonCtx context.Context
+
+	// applyCancelContext is the daemon-lifetime context whose cancellation
+	// aborts an in-flight applyConfigLocked at its coarse boundaries
+	// (C1/C2/C3) on daemon stop (#2926). Run creates it as a child of the
+	// SIGTERM/SIGINT signal context, so a real `systemctl stop xpfd` cancels
+	// it. It is kept SEPARATE from daemonCtx so the apply-abort signal does
+	// not disturb the lifetimes of the other daemonCtx-derived background
+	// goroutines (which the shutdown sequence tears down explicitly and which
+	// the orderly teardown still needs live). applyCancelCtx() returns it; a
+	// nil value (early boot / unit tests with no wiring) falls back to a
+	// non-cancellable context so an apply never aborts spuriously.
+	applyCancelContext context.Context
+
+	// applyCancel cancels applyCancelContext. Run defers it and also calls it
+	// explicitly at the start of the shutdown sequence so an in-flight apply
+	// bails before the explicit subsystem teardown runs.
+	applyCancel context.CancelFunc
 
 	// clusterCommsCancel cancels the sub-context used by startClusterComms
 	// goroutines. Set when cluster comms are started, called to restart them

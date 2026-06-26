@@ -102,8 +102,8 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 
 // applyCancelCtx returns the context whose cancellation aborts the heavy apply
 // pipeline (applyConfigLocked) at its coarse step boundaries (#2926). It is the
-// DAEMON-LIFETIME context (d.daemonCtx), deliberately NOT the request/commit
-// context:
+// dedicated DAEMON-STOP context (d.applyCancelContext), deliberately NOT the
+// request/commit context AND deliberately NOT d.daemonCtx:
 //
 //   - A daemon stop MUST abort an in-flight commit/remediation apply at the
 //     next boundary so termination is not blocked behind netlink + an FRR
@@ -119,11 +119,21 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 //     request context still governs the contended applySem wait in the commit
 //     wrappers (a slow lock holder surfaces 503), exactly as before.
 //
-// When d.daemonCtx is unset (early boot, unit tests) it falls back to a
-// non-cancellable context, so the apply never aborts spuriously.
+// Why a dedicated context and not d.daemonCtx: in production cmd/xpfd passes
+// context.Background() into Run, so d.daemonCtx is never cancelled — returning
+// it here would make the C1/C2/C3 boundary checks dead code on a real
+// `systemctl stop` (the original #2926 wiring bug). Run creates
+// d.applyCancelContext as a child of the SIGTERM/SIGINT signal context, so a
+// real daemon stop cancels it; keeping it separate from d.daemonCtx leaves the
+// other daemonCtx-derived background goroutines (flow-export, RPM, scheduler,
+// cluster comms, the dp.Start dataplane runtime) on their explicit-teardown
+// lifetimes, which the orderly shutdown sequence still needs live.
+//
+// When d.applyCancelContext is unset (early boot, unit tests with no wiring) it
+// falls back to a non-cancellable context, so the apply never aborts spuriously.
 func (d *Daemon) applyCancelCtx() context.Context {
-	if d.daemonCtx != nil {
-		return d.daemonCtx
+	if d.applyCancelContext != nil {
+		return d.applyCancelContext
 	}
 	return context.Background()
 }

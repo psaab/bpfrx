@@ -1,3 +1,28 @@
+## 2026-06-26 — #2926 fold: make the apply-cancel signal actually fire on daemon stop (was inert)
+
+- **Timestamp**: 2026-06-26
+- **Action**: folded a hostile-review MAJOR into PR #3181. #2926 threaded a ctx
+  into `applyConfigLocked` with C1/C2/C3 boundary checks, but `applyCancelCtx()`
+  returned `d.daemonCtx`, which production sets to the `context.Background()`
+  that `cmd/xpfd` passes into `Run` — never cancelled. The signal-cancellable
+  context was a LOCAL var created later by `signal.NotifyContext` and never
+  stored back, so on a real `systemctl stop` the boundary checks always saw
+  `ctx.Err()==nil` → dead code; #2926's goal unmet. Chose **Option B** (dedicated
+  `d.applyCancelContext`/`d.applyCancel`, child of the signal context, isolated
+  from `d.daemonCtx`) over Option A (reassign `d.daemonCtx`): `d.dp.Start`,
+  flow-export/IPFIX relays, RPM retry, scheduler, and cluster comms all derive
+  from `d.daemonCtx` and the orderly shutdown teardown (logFinalStats via
+  Telemetry, HA `rg_active` clear via `dp.HA()`, `dp.Teardown`) needs the
+  dataplane runtime live — so cancelling `d.daemonCtx` at SIGTERM is unsafe.
+  `Run` cancels the apply context at the start of shutdown (before subsystem
+  teardown; teardown performs no `applyConfigLocked`). Added a fail-on-revert
+  test driving the REAL `applyCancelCtx()` wiring; verified it goes RED under
+  the original inert wiring and restored byte-identical. `go build ./...` +
+  `go test ./pkg/daemon/... ./pkg/eventengine/...` green.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_run.go, pkg/daemon/apply_ctx_cancel_test.go,
+  pkg/daemon/README.md, _Log.md
+
 ## 2026-06-26 — #3064: run L3-header fragment screens on the flowless (non-first-fragment) path
 
 - **Timestamp**: 2026-06-26
