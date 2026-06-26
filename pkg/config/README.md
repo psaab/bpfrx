@@ -520,6 +520,36 @@ SURGICAL — only NAME references are checked; `then community (set|add) <value>
 carries a community VALUE (e.g. `65000:100`), not a list reference, and a defined
 community reference commits unchanged.
 
+**Policy-referenced application protocols are validated against the dataplane
+resolver (#3150 — codex-review-067 finding 067-06):** a user-defined
+`set applications application <name> protocol <token>` that is REFERENCED by a
+security policy or NAT rule's `match application` (or any application when
+`services application-identification` is on) is hard-rejected at commit by
+`validateApplicationSpecsStrict` (`compiler_validate_strict.go`) when the
+protocol token is unresolvable. The bug: that gate resolved the token via the
+LENIENT `validateProtocol`, which blanket-accepts ANY `junos-` prefix
+(`strings.HasPrefix("junos-")`). So `protocol junos-foobar` committed cleanly,
+but the dataplane resolves protocols only through `appid.ProtocolNumber`
+(`pkg/appid`), which knows only the CONCRETE junos-* aliases (`junos-ping`,
+`junos-tcp-any`, ...) — it rejects `junos-foobar`. The userspace policy
+capability gate (`pkg/dataplane/userspace`) then disarms the snapshot
+(`ForwardingSupported=false`): a commit-succeeds / apply-fails split. The fix
+resolves the application's protocol through `filterProtocolResolvable` — the
+same `appid.ProtocolNumber` mirror the firewall-filter `from protocol` gate
+(#2175) already uses, pinned to the SSOT by the `pkg/appid` drift-guard test
+`TestFilterProtocolResolvableMatchesProtocolNumber` — so a token the dataplane
+cannot represent is rejected at commit. Real protocol names, numeric 0..255
+values, and resolvable junos-* aliases still commit; only genuinely
+unresolvable tokens reject. The lenient `validateProtocol` is unchanged and
+still used by `ValidateConfig`'s warning surface (so an UNREFERENCED library
+app with a bogus protocol stays a warning, not a commit error). The tolerant
+load/peer-sync path downgrades the reject to a warning
+(`lenientApplicationSpecs`) so an already-persisted or peer-synced config an
+older binary accepted still boots (#1960 no-brick doctrine). Distinct from
+#2124/#2142 (those fixed alias drift / malformed port-or-protocol specs); this
+residual was specifically the strict app-spec path still using the blanket
+`junos-` HasPrefix.
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`

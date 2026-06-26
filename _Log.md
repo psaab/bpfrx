@@ -1,3 +1,24 @@
+## 2026-06-25 — #3150: strict app-spec protocol gate aligned to dataplane resolver
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix commit/apply split — `validateApplicationSpecsStrict`
+  resolved a policy/NAT-referenced application's `protocol` leaf via the
+  lenient `validateProtocol` (blanket `strings.HasPrefix("junos-")` accept),
+  so `protocol junos-foobar` committed cleanly while the dataplane resolver
+  `appid.ProtocolNumber` rejects it → userspace policy capability gate
+  disarms (apply fails after a green commit). Switched the strict app-spec
+  protocol check to `filterProtocolResolvable` (the existing
+  `appid.ProtocolNumber` mirror, drift-guarded). Lenient `validateProtocol`
+  unchanged (still used by `ValidateConfig` warning surface / unreferenced
+  apps). Lenient load downgrade (`lenientApplicationSpecs`) preserved.
+- **File(s)**: pkg/config/compiler_validate_strict.go (fix + comments),
+  pkg/config/compiler_application_specs_test.go (fail-on-revert tests),
+  pkg/config/README.md (gotcha note), _Log.md
+- **Validation**: go build ./..., go vet ./pkg/config/..., go test
+  ./pkg/config/... ./pkg/appid/... (1650 pass), gofmt -l clean. Fail-on-
+  revert proven: restoring the broad junos- accept makes the junos-foobar
+  reject test RED.
+
 ## 2026-06-25 — #3025: NAT64 non-fragmented L4 checksum goes incremental (RFC 1624)
 
 - **Timestamp**: 2026-06-25
