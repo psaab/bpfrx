@@ -1,3 +1,32 @@
+## 2026-06-26 — #3056: store the admitting policy ID on the session
+
+- **Timestamp**: 2026-06-26
+- **Action**: Carry the admitting policy's ID on `SessionMetadata.policy_id`
+  (in-memory, stamped at admit) and consume it in the live-session BPF-compat
+  rows, the RT_FLOW SESSION_CREATE frame ([44:48]), and the RT_FLOW
+  SESSION_CLOSE frame. The close frame uses the trailing [136:140] slot because
+  #2853 repurposed [44:48] on a close for the created-subsec-nanos; the RT_FLOW
+  event payload grew 136 -> 144 bytes (Rust `SECURITY_EVENT_PAYLOAD_SIZE`,
+  `pkg/dataplane.Event`, `pkg/logging` `rawEventWireSize`). The Go decoder
+  reads [136:140] back as PolicyID only on a close (length-guarded). Before
+  this, policy-admitted sessions published policy 0, which the Go side renders
+  as the first configured policy — a wrong attribution. Decision: in-process
+  only, NOT on the cross-node HA sync wire (a peer-promoted session still
+  resolves 0 until a follow-up adds the wire field, mirroring #2785).
+- **File(s)**: userspace-dp/src/session/entry.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/bpf_map/publish_conntrack.rs,
+  userspace-dp/src/afxdp/{shared_ops,flow_cache,neighbor_dispatch,tunnel}.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs, userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/event_stream/{codec,mod}.rs,
+  userspace-dp/src/session/README.md, userspace-dp/src/event_stream/README.md,
+  pkg/dataplane/types.go, pkg/logging/ringbuf.go, pkg/logging/binary_test.go,
+  pkg/dataplane/userspace/protocol.go, + Rust/Go fail-on-revert tests.
+- **Validation**: cargo build --release -p xpf-userspace-dp (0 errors);
+  cargo test --release (3045 passed); go test ./pkg/dataplane/... ./pkg/logging/...
+  (960 passed); gofmt clean. Fail-on-revert proven RED->GREEN both sides
+  (Rust close encoder [136:140]->0; Go close decoder PolicyID->0).
+
 ## 2026-06-25 — #3151: local-delivery resolution table-scoped (cross-VRF leak)
 
 - **Timestamp**: 2026-06-25

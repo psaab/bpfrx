@@ -63,14 +63,29 @@ type rawEvent struct {
 	// For all other event types (deny/screen/filter) this byte is 0 and
 	// unread (those frames are unconditionally logged).
 	LogSyslog uint8
+	// #3056: the admitting policy's ID on a SESSION_CLOSE frame, in the
+	// trailing [136:140] slot. Every non-close frame carries the policy id in
+	// [44:48] (PolicyID above), but #2853 repurposed [44:48] on a close for the
+	// created-subsec-nanos, so the close frame uses this slot. The decoders read
+	// [136:140] only on a SESSION_CLOSE. PadEvent2 keeps the struct 8-byte
+	// aligned at 144 bytes to match the wire payload.
+	PolicyIDClose uint32
+	PadEvent2     [4]uint8
 }
 
 const (
-	rawEventWireSize   = 136
+	// #3056: 144 (was 136). The trailing [136:140] u32 carries the admitting
+	// policy ID on a SESSION_CLOSE frame; [140:144] is reserved padding (the
+	// rawEvent / dataplane.Event mirrors carry uint64 fields, so the struct
+	// aligns to 8 and the size must be a multiple of 8).
+	rawEventWireSize   = 144
 	rawEventStructSize = int(unsafe.Sizeof(rawEvent{}))
 	// rawEventLogSyslogOffset is the wire offset of the #2508 per-policy
-	// RT_FLOW SYSLOG log gate (the final byte of the 136-byte payload).
+	// RT_FLOW SYSLOG log gate (offset 135).
 	rawEventLogSyslogOffset = 135
+	// rawEventPolicyCloseOffset is the wire offset of the #3056 admitting policy
+	// ID on a SESSION_CLOSE frame (LE u32 at [136:140]).
+	rawEventPolicyCloseOffset = 136
 )
 
 var _ [rawEventWireSize]struct{} = [rawEventStructSize]struct{}{}
@@ -479,12 +494,20 @@ func (er *EventReader) logEvent(data []byte) {
 		rec.Created = evt.Created
 		// #2853: the [44:48] policy_id slot is repurposed on a SESSION_CLOSE
 		// frame to carry the creation instant's sub-second nanosecond
-		// remainder. Reinterpret it as CreatedNanos and clear PolicyID so the
-		// close record's policy-name resolution (below) is the pre-#2853
-		// "no policy" value, not the nanosecond bits.
+		// remainder. Reinterpret it as CreatedNanos so the flow exporters keep
+		// millisecond StartTime resolution.
 		rec.CreatedNanos = evt.PolicyID
+		// #3056: the admitting policy ID rides the trailing [136:140] slot on a
+		// SESSION_CLOSE (because #2853 took [44:48]). Resolve PolicyID from there
+		// so the RT_FLOW_SESSION_CLOSE record and the NetFlow/IPFIX close
+		// exporters name the admitting policy instead of policy 0. A short
+		// (legacy 136-byte) frame leaves it 0. The policy-name resolution below
+		// reads rec.PolicyID, so it follows this value.
 		rec.PolicyID = 0
 		evt.PolicyID = 0
+		if len(data) >= rawEventWireSize {
+			rec.PolicyID = binary.LittleEndian.Uint32(data[rawEventPolicyCloseOffset : rawEventPolicyCloseOffset+4])
+		}
 		// Compute elapsed time from session creation
 		if evt.Created > 0 {
 			nowSec := uint32(evt.Timestamp / 1000000000)
@@ -525,9 +548,14 @@ func (er *EventReader) logEvent(data []byte) {
 		rec.CloseReason = closeReasonName(closeReasonCode)
 	}
 
-	// Resolve policy name (skip for screen drops which repurpose policy_id)
+	// Resolve policy name (skip for screen drops which repurpose policy_id).
+	// #3056: read rec.PolicyID, not evt.PolicyID — they match for every
+	// non-close frame, but on a SESSION_CLOSE evt.PolicyID was zeroed (it held
+	// the #2853 created-subsec-nanos) and rec.PolicyID now carries the admitting
+	// policy ID from the trailing [136:140] slot, so the close record resolves
+	// the admitting policy name instead of policy 0.
 	if evt.EventType != eventTypeScreenDrop {
-		rec.PolicyName = er.resolvePolicyName(evt.PolicyID)
+		rec.PolicyName = er.resolvePolicyName(rec.PolicyID)
 	}
 
 	// Assign monotonic session ID
@@ -782,13 +810,17 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 	}
 	if evt.EventType == eventTypeSessionClose {
 		// #2853: the [44:48] policy_id slot is repurposed on a SESSION_CLOSE
-		// frame to carry the creation instant's sub-second nanosecond remainder
-		// (the dataplane never stamps a policy id on a close). Reinterpret it as
-		// CreatedNanos so the flow exporters keep millisecond StartTime
-		// resolution, and clear PolicyID so the close record's policy id/name
-		// stays the pre-#2853 "no policy" value.
+		// frame to carry the creation instant's sub-second nanosecond remainder.
+		// Reinterpret it as CreatedNanos so the flow exporters keep millisecond
+		// StartTime resolution.
 		rec.CreatedNanos = evt.PolicyID
-		rec.PolicyID = 0
+		// #3056: the admitting policy ID rides the trailing [136:140] slot on a
+		// SESSION_CLOSE (because #2853 took [44:48]). Resolve PolicyID from there
+		// so the NetFlow/IPFIX close exporters and any consumer of this decoded
+		// record name the admitting policy instead of policy 0. A short (legacy
+		// 136-byte) frame already returned false above (len < rawEventWireSize).
+		rec.PolicyID = binary.LittleEndian.Uint32(
+			data[rawEventPolicyCloseOffset : rawEventPolicyCloseOffset+4])
 	}
 	if evt.EventType != eventTypeSessionClose {
 		rec.SessionPkts = 0

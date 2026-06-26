@@ -1072,6 +1072,7 @@ fn embedded_icmp_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
             nat64_reverse: None,
             log_session_init: false,
             log_session_close: false,
+            policy_id: 0,
         },
     };
 
@@ -1123,6 +1124,7 @@ fn embedded_icmp_no_route_uses_zone_encoded_fabric_redirect() {
             nat64_reverse: None,
             log_session_init: false,
             log_session_close: false,
+            policy_id: 0,
         },
     };
 
@@ -1174,6 +1176,7 @@ fn embedded_icmp_discard_route_uses_zone_encoded_fabric_redirect() {
             nat64_reverse: None,
             log_session_init: false,
             log_session_close: false,
+            policy_id: 0,
         },
     };
 
@@ -1221,6 +1224,7 @@ fn embedded_icmp_from_fabric_does_not_redirect_back_to_fabric() {
             nat64_reverse: None,
             log_session_init: false,
             log_session_close: false,
+            policy_id: 0,
         },
     };
 
@@ -1674,6 +1678,7 @@ fn helper_local_session_on_miss_stays_out_of_shared_alias_maps() {
         nat64_reverse: None,
         log_session_init: false,
         log_session_close: false,
+        policy_id: 0,
     };
 
     assert!(install_helper_local_session_on_miss(
@@ -1740,6 +1745,7 @@ fn helper_local_session_on_miss_clears_stale_shared_aliases() {
         nat64_reverse: None,
         log_session_init: false,
         log_session_close: false,
+        policy_id: 0,
     };
     let entry = SyncedSessionEntry {
         key: key.clone(),

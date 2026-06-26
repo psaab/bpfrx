@@ -1528,6 +1528,7 @@ fn active_flow_debug_test_entry(
             nat64_reverse: None,
             log_session_init: false,
             log_session_close: false,
+            policy_id: 0,
         },
         stamp,
         observed_bytes: 0,

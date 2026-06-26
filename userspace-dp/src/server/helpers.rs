@@ -462,6 +462,17 @@ pub(crate) fn build_synced_session_entry(
             // log), bit-identical to pre-#2785 behavior.
             log_session_init: req.log_session_init,
             log_session_close: req.log_session_close,
+            // #3056: a peer-synced session imports policy_id 0 — the admitting
+            // policy ID is NOT yet carried on the cross-node HA session-sync
+            // wire (SessionSyncRequest). Stamping the admitting policy on the
+            // session (#3056) is in-process only; carrying it across failover so
+            // a peer-PROMOTED session's live-session row / RT_FLOW records
+            // resolve the admitting policy is a deliberate follow-up that adds a
+            // `req.policy_id` wire field here, mirroring how #2785 added the
+            // log_session_{init,close} fields above (#1961 both-sides
+            // discipline). Until then a synced session resolves policy 0,
+            // bit-identical to today.
+            policy_id: 0,
         },
         origin: crate::session::SessionOrigin::SyncImport,
         // #2170: carry the peer's install generation onto the helper entry.

@@ -213,6 +213,15 @@ type Event struct {
 	AppID          uint16
 	CloseReason    uint8
 	PadEvent       uint8
+	// #3056: the admitting policy's ID on a SESSION_CLOSE frame. The other
+	// frames (deny/screen/filter/create) carry the policy id in the [44:48]
+	// PolicyID slot, but #2853 repurposed [44:48] on a close for the
+	// created-subsec-nanos remainder, so the close frame carries the policy id
+	// in this trailing [136:140] slot instead. 0 on every non-close frame and
+	// on a close with no admitting policy. PadEvent2 keeps the struct 8-byte
+	// aligned (144 bytes total) so it matches the Rust SECURITY_EVENT_PAYLOAD_SIZE.
+	PolicyIDClose uint32
+	PadEvent2     [4]uint8
 }
 
 // Close reason constants (must match C CLOSE_REASON_* defines).

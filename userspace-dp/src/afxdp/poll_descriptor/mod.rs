@@ -1278,6 +1278,9 @@ pub(super) fn poll_binding_process_descriptor(
                                 // `then log` selection.
                                 log_session_init: false,
                                 log_session_close: false,
+                                // #3056: host-local sessions are not policy-forwarded,
+                                // so they carry no admitting policy ID.
+                                policy_id: 0,
                             };
                             if install_helper_local_session_on_miss(
                                 sessions,
@@ -1793,6 +1796,12 @@ pub(super) fn poll_binding_process_descriptor(
                                         // per-policy RT_FLOW SYSLOG log selection.
                                         log_session_init: policy_result.log_session_init,
                                         log_session_close: policy_result.log_session_close,
+                                        // #3056: stamp the admitting policy's ID so
+                                        // the live-session BPF-compat publish and the
+                                        // SESSION_CREATE RT_FLOW record reference the
+                                        // policy that admitted the flow (was the `0`
+                                        // sentinel → first-configured-policy misattribution).
+                                        policy_id: policy_result.policy_id,
                                     };
                                     let forward_installed = track_in_userspace
                                         && sessions.install_with_protocol_with_origin(
@@ -2013,6 +2022,10 @@ pub(super) fn poll_binding_process_descriptor(
                                         // regardless of which entry expires it.
                                         log_session_init: policy_result.log_session_init,
                                         log_session_close: policy_result.log_session_close,
+                                        // #3056: mirror the admitting policy ID onto
+                                        // the reverse companion so a row keyed on the
+                                        // reverse tuple attributes the same policy.
+                                        policy_id: policy_result.policy_id,
                                     };
                                     // #1861 §5.2: the reverse install is gated on
                                     // forward_installed (was track_in_userspace —
@@ -3822,6 +3835,7 @@ mod new_flow_session_limit_tests {
             nat64_reverse: None,
             log_session_init: false,
             log_session_close: false,
+            policy_id: 0,
         }
     }
 

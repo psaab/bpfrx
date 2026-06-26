@@ -73,6 +73,7 @@ fn test_metadata() -> SessionMetadata {
         nat64_reverse: None,
         log_session_init: false,
         log_session_close: false,
+        policy_id: 0,
     }
 }
 
@@ -255,7 +256,7 @@ fn test_event_frame_type_values_are_stable() {
 #[test]
 fn test_encode_session_close_rt_flow_v4_wire_layout() {
     // #2460 fail-on-revert: the RT_FLOW SESSION_CLOSE frame must carry the
-    // canonical 136-byte dataplane.Event payload with the SESSION_CLOSE
+    // canonical 144-byte dataplane.Event payload with the SESSION_CLOSE
     // event-type byte at offset 52 and the real 5-tuple/NAT/zones at the
     // exact byte offsets the Go logging.DecodeRawEventRecord parser reads.
     // If the encoder drops the SESSION_CLOSE event-type byte (or the type-14
@@ -275,6 +276,7 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
         0,
         TEST_TRUST_ZONE_ID,
         TEST_UNTRUST_ZONE_ID,
+        88,              // #3056: admitting policy id (rides [136:140] on a close)
         1,
         false,           // #2508: log_syslog gate
         1_700_000_000,   // #2465: created Unix seconds
@@ -290,7 +292,7 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
 
     assert_eq!(frame.data[4], MSG_SESSION_CLOSE_RT_FLOW);
     assert_eq!(frame.seq, 99);
-    // Payload length in the header must be the canonical 136 bytes.
+    // Payload length in the header must be the canonical payload size.
     assert_eq!(
         u32::from_le_bytes(frame.data[0..4].try_into().unwrap()),
         SECURITY_EVENT_PAYLOAD_SIZE as u32
@@ -361,6 +363,17 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
     // makes this assertion fail (and the close record logs
     // packet-incoming-interface="N/A").
     assert_eq!(u32::from_le_bytes(p[128..132].try_into().unwrap()), 42);
+    // #3056 fail-on-revert: the SESSION_CLOSE frame carries the admitting policy
+    // ID in the TRAILING [136:140] slot (LE u32), NOT [44:48] (which #2853 took
+    // for the created-subsec-nanos on a close). The Go decoder reads [136:140]
+    // back as PolicyID only on a close, so the RT_FLOW_SESSION_CLOSE record and
+    // the NetFlow/IPFIX close exporters name the admitting policy. Reverting the
+    // encoder to leave [136:140] 0 makes the close record log policy 0 (the first
+    // configured policy) and this assertion fails. The payload also grew 136->144
+    // for this slot; SECURITY_EVENT_PAYLOAD_SIZE pins the length above.
+    assert_eq!(u32::from_le_bytes(p[136..140].try_into().unwrap()), 88);
+    // [136:140] must NOT collide with the #2853 created-subsec-nanos in [44:48].
+    assert_eq!(u32::from_le_bytes(p[44..48].try_into().unwrap()), 123_456_789);
 }
 
 #[test]
@@ -379,6 +392,7 @@ fn test_encode_session_close_rt_flow_v6() {
         0,
         TEST_TRUST_ZONE_ID,
         TEST_UNTRUST_ZONE_ID,
+        0,     // #3056: admitting policy id
         0,
         false, // #2508: log_syslog gate
         0,     // #2465: created Unix seconds (unknown → fallback)
@@ -424,6 +438,7 @@ fn test_session_close_rt_flow_log_gate_byte() {
             0,
             TEST_TRUST_ZONE_ID,
             TEST_UNTRUST_ZONE_ID,
+            0, // #3056: admitting policy id
             0,
             log_syslog,
             0, // #2465: created Unix seconds
@@ -473,6 +488,7 @@ fn test_session_create_rt_flow_wire_layout() {
         0,
         TEST_TRUST_ZONE_ID,
         TEST_UNTRUST_ZONE_ID,
+        42, // #3056: admitting policy id
         77, // #2615: ingress ifindex
         9,  // #2615: application id
     );
@@ -503,6 +519,12 @@ fn test_session_create_rt_flow_wire_layout() {
     // "UNKNOWN").
     assert_eq!(u32::from_le_bytes(p[128..132].try_into().unwrap()), 77);
     assert_eq!(u16::from_le_bytes([p[132], p[133]]), 9);
+    // #3056 fail-on-revert: the SESSION_CREATE frame carries the admitting
+    // policy ID in the [44:48] policy_id slot (LE u32) — the same slot the Go
+    // decoder reads as PolicyID for non-close frames and resolves a policy name
+    // from. Reverting the encoder to leave [44:48] 0 makes the create record
+    // log policy 0 (the first configured policy) and this assertion fail.
+    assert_eq!(u32::from_le_bytes(p[44..48].try_into().unwrap()), 42);
 }
 
 #[test]
@@ -788,6 +810,7 @@ fn test_close_flags() {
             nat64_reverse: None,
             log_session_init: false,
             log_session_close: false,
+            policy_id: 0,
         },
         origin: crate::session::SessionOrigin::ForwardFlow,
         fabric_redirect_sync: true,
