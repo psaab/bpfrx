@@ -174,6 +174,7 @@ pub(in crate::afxdp) fn post_transform_inner_mtu(
     is_nat64: bool,
     inner_addr_family: u8,
     egress_mtu: usize,
+    inner_dst: Option<std::net::IpAddr>,
 ) -> usize {
     if is_nat64 {
         if egress_mtu == 0 {
@@ -221,8 +222,14 @@ pub(in crate::afxdp) fn post_transform_inner_mtu(
             // match the encap drop guard's admit threshold
             // (`wg_inner_mtu(physical)`), so DF-IPv4 / IPv6 inners get the
             // same PMTU the guard tolerates instead of ~100B too small.
-            let outer_mtu =
-                crate::afxdp::frame::wg_endpoint_physical_outer_mtu(decision, forwarding, endpoint);
+            //
+            // #2845: thread the inner destination so the underlay MTU is
+            // derived from the SAME peer the encap path will select (per-peer
+            // underlay), not an arbitrary first peer's. Two peers of one wg
+            // interface can egress different underlays with different MTUs.
+            let outer_mtu = crate::afxdp::frame::wg_endpoint_physical_outer_mtu(
+                decision, forwarding, endpoint, inner_dst,
+            );
             crate::afxdp::wg::mss::wg_inner_mtu(endpoint.outer_family, outer_mtu)
         }
         TunnelKind::Unknown => 0,
