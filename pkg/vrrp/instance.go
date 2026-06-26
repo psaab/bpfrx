@@ -62,7 +62,19 @@ type vrrpInstance struct {
 	// delayed by the hold-time — there is no live master to blackhole.
 	// One-shot: cleared by the masterDownTimer.C handler. Guarded by mu.
 	skipNextPreemptHold bool
-	trackDown           bool // tracked interface (cfg.TrackInterface) is down (#1814); guarded by mu
+
+	// preemptHoldArmed tracks whether the preempt hold-time countdown (#2850)
+	// is currently running (#2900). It is set when stepBackup arms the
+	// preemptHoldTimer and cleared whenever the timer is stopped or fires. A
+	// config update arriving during the hold window (updateConfig → the
+	// configUpdatedCh case in stepBackup) reads this flag to decide whether an
+	// in-flight hold must be torn down because the new config no longer
+	// warrants it (preempt disabled, priority demoted, or hold-time changed).
+	// Mutated only by the run-loop goroutine (arm/disarm helpers); read under
+	// mu so a future cross-goroutine reader stays race-clean. Guarded by mu.
+	preemptHoldArmed bool
+
+	trackDown bool // tracked interface (cfg.TrackInterface) is down (#1814); guarded by mu
 
 	// Last-seen master advertisement (#2082). Recorded by handleBackupRx /
 	// handleMasterRx for every non-zero-priority advert from a peer, and read
@@ -138,8 +150,9 @@ type vrrpInstance struct {
 	// the link layer and works correctly. -1 means not used.
 	afPacketFD int
 
-	preemptNowCh chan struct{} // signals coordinated preemption from ReleaseSyncHold
-	resignCh     chan struct{} // signals forced resignation (manual failover)
+	preemptNowCh    chan struct{} // signals coordinated preemption from ReleaseSyncHold
+	resignCh        chan struct{} // signals forced resignation (manual failover)
+	configUpdatedCh chan struct{} // signals updateConfig mutated cfg (#2900 hold re-validate)
 
 	rxCh    chan *VRRPPacket
 	stopCh  chan struct{}
@@ -184,19 +197,20 @@ func (vi *vrrpInstance) interfaceAddrs() ([]net.Addr, error) {
 
 func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent, onEventDrop func()) *vrrpInstance {
 	return &vrrpInstance{
-		cfg:            cfg,
-		desiredPreempt: cfg.Preempt,
-		state:          StateInitialize,
-		iface:          iface,
-		eventCh:        eventCh,
-		afPacketFD:     -1,
-		ipv6FD:         -1,
-		preemptNowCh:   make(chan struct{}, 1),
-		resignCh:       make(chan struct{}, 1),
-		rxCh:           make(chan *VRRPPacket, 64),
-		stopCh:         make(chan struct{}),
-		stopped:        make(chan struct{}),
-		onEventDrop:    onEventDrop,
+		cfg:             cfg,
+		desiredPreempt:  cfg.Preempt,
+		state:           StateInitialize,
+		iface:           iface,
+		eventCh:         eventCh,
+		afPacketFD:      -1,
+		ipv6FD:          -1,
+		preemptNowCh:    make(chan struct{}, 1),
+		resignCh:        make(chan struct{}, 1),
+		configUpdatedCh: make(chan struct{}, 1),
+		rxCh:            make(chan *VRRPPacket, 64),
+		stopCh:          make(chan struct{}),
+		stopped:         make(chan struct{}),
+		onEventDrop:     onEventDrop,
 	}
 }
 
@@ -407,6 +421,13 @@ func (vi *vrrpInstance) key() string {
 
 // updateConfig updates priority, preempt, and interface-tracking config
 // in-place without restarting.
+//
+// It runs on the manager goroutine, NOT the run-loop goroutine that owns the
+// preemptHoldTimer (#2900). It therefore mutates cfg under mu and then signals
+// the run loop via configUpdatedCh rather than touching the timer directly —
+// the run loop tears down an in-flight hold whose premise the new config has
+// invalidated (preempt disabled, priority demoted, or hold-time changed). This
+// keeps all preemptHoldTimer Stop/Reset calls on the single run-loop goroutine.
 func (vi *vrrpInstance) updateConfig(cfg Instance) {
 	vi.mu.Lock()
 	vi.cfg.Priority = cfg.Priority
@@ -416,6 +437,14 @@ func (vi *vrrpInstance) updateConfig(cfg Instance) {
 	vi.cfg.TrackPriorityCost = cfg.TrackPriorityCost
 	vi.desiredPreempt = cfg.Preempt
 	vi.mu.Unlock()
+
+	// Wake the BACKUP select so an armed preempt hold-time can be re-validated
+	// against the new config. Non-blocking: a coalesced pending signal is fine
+	// (the handler re-reads the current cfg, not a per-update delta).
+	select {
+	case vi.configUpdatedCh <- struct{}{}:
+	default:
+	}
 }
 
 // suppressPreempt forces effective preempt to false while preserving the
@@ -649,6 +678,27 @@ func stopAndDrainTimer(t *time.Timer) {
 	}
 }
 
+// armPreemptHold (re)arms the preempt hold-time countdown (#2850) for `hold`
+// and records that it is running (#2900). Called only from the run-loop
+// goroutine; the preemptHoldArmed flag is mu-guarded for external readers.
+func (vi *vrrpInstance) armPreemptHold(preemptHoldTimer *time.Timer, hold time.Duration) {
+	stopAndDrainTimer(preemptHoldTimer)
+	preemptHoldTimer.Reset(hold)
+	vi.mu.Lock()
+	vi.preemptHoldArmed = true
+	vi.mu.Unlock()
+}
+
+// disarmPreemptHold stops a (possibly) armed preempt hold-time countdown and
+// clears the armed flag (#2900). Safe on an already-stopped timer. Called only
+// from the run-loop goroutine.
+func (vi *vrrpInstance) disarmPreemptHold(preemptHoldTimer *time.Timer) {
+	stopAndDrainTimer(preemptHoldTimer)
+	vi.mu.Lock()
+	vi.preemptHoldArmed = false
+	vi.mu.Unlock()
+}
+
 // stepBackup runs one iteration of the StateBackup select. It is called by the
 // run loop AND directly by unit tests (the run() preamble unconditionally
 // spawns a receiver goroutine that nil-derefs vi.conn on a test instance, so
@@ -683,23 +733,68 @@ func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer, preemptHoldTime
 		if hold := vi.preemptHoldDuration(); !skipHold && hold > 0 && vi.preemptingLiveLowerMaster() {
 			slog.Info("vrrp: preempt deferred by hold-time",
 				"key", vi.key(), "hold", hold)
-			stopAndDrainTimer(preemptHoldTimer)
-			preemptHoldTimer.Reset(hold)
+			vi.armPreemptHold(preemptHoldTimer, hold)
 			return false
 		}
 		vi.becomeMaster()
 		advertTimer.Reset(vi.advertInterval())
 	case <-preemptHoldTimer.C:
-		// The preempt hold-time elapsed (#2850). A >= -priority master
-		// returning during the hold would have re-armed masterDownTimer
-		// and stopped this timer (handleBackupRx), so reaching here means
-		// the live lower master is still present (or has gone silent in
-		// the interim) — takeover is now due.
-		slog.Info("vrrp: preempt hold-time elapsed, taking over",
-			"key", vi.key())
-		vi.becomeMaster()
-		advertTimer.Reset(vi.advertInterval())
-		masterDownTimer.Stop()
+		// The preempt hold-time elapsed (#2850). The hold is no longer
+		// armed; clear the flag before deciding (#2900).
+		vi.mu.Lock()
+		vi.preemptHoldArmed = false
+		vi.mu.Unlock()
+		// RE-VALIDATE before taking over (#2900). A >= -priority master
+		// returning during the hold would have re-armed masterDownTimer and
+		// stopped this timer (handleBackupRx), but two state changes during
+		// the hold window are NOT seen on the wire and so do not cancel it:
+		// preempt being disabled, or our effective priority being demoted
+		// below the live master by a track-interface link-down. Re-running
+		// the same gate the force/sync-hold path uses
+		// (shouldPreemptObservedMaster) honours both: preempt must still be
+		// enabled AND, when a live master is still present, our effective
+		// priority must be strictly higher than its last advert (RFC 5798
+		// §6.4.2). A master that went silent during the hold reads as stale
+		// (beyond the master-down horizon) and the gate returns true, so a
+		// genuine dead-master takeover is still immediate.
+		if vi.shouldPreemptObservedMaster() {
+			slog.Info("vrrp: preempt hold-time elapsed, taking over",
+				"key", vi.key())
+			vi.becomeMaster()
+			advertTimer.Reset(vi.advertInterval())
+			masterDownTimer.Stop()
+		} else {
+			// Preemption is no longer warranted — do NOT become MASTER.
+			// Return to a normal BACKUP tenure by re-arming masterDownTimer
+			// so a later silent-master death still triggers takeover. A
+			// still-present live master's adverts will keep resetting it
+			// (handleBackupRx), so we stay BACKUP as long as it forwards.
+			slog.Info("vrrp: preempt hold-time elapsed but preemption no longer valid, staying BACKUP",
+				"key", vi.key())
+			stopAndDrainTimer(masterDownTimer)
+			masterDownTimer.Reset(vi.masterDownInterval())
+		}
+	case <-vi.configUpdatedCh:
+		// A config update landed (updateConfig) while this BACKUP select was
+		// running (#2900). If a preempt hold-time is armed, the new config may
+		// have invalidated its premise — preempt disabled, priority demoted so
+		// we no longer outrank the live master, or a changed hold-time. The
+		// simplest correct response is to tear the in-flight hold down and
+		// re-arm masterDownTimer: the next expiry re-evaluates against the
+		// fresh config (preemptingLiveLowerMaster + the current hold-time) and
+		// either re-arms the hold with the NEW duration, takes over, or stays
+		// BACKUP. This never silently keeps a stale duration or a stale
+		// preempt decision.
+		vi.mu.RLock()
+		armed := vi.preemptHoldArmed
+		vi.mu.RUnlock()
+		if armed {
+			slog.Info("vrrp: config update during preempt hold — re-validating",
+				"key", vi.key())
+			vi.disarmPreemptHold(preemptHoldTimer)
+			stopAndDrainTimer(masterDownTimer)
+			masterDownTimer.Reset(vi.masterDownInterval())
+		}
 	case <-vi.preemptNowCh:
 		// Coordinated preemption from ReleaseSyncHold or forced transition
 		// from ForceRGMaster. The forcePreemptOnce flag allows a one-shot
@@ -721,7 +816,7 @@ func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer, preemptHoldTime
 			masterDownTimer.Stop()
 			// A coordinated/forced promotion supersedes any pending
 			// preempt hold-time countdown (#2850).
-			stopAndDrainTimer(preemptHoldTimer)
+			vi.disarmPreemptHold(preemptHoldTimer)
 		}
 	}
 	return false
@@ -1356,7 +1451,7 @@ func (vi *vrrpInstance) handleBackupRx(pkt *VRRPPacket, masterDownTimer, preempt
 		// #2082 recordMasterAdvert contract owns it.
 		slog.Info("vrrp: peer resigned (priority 0), immediate takeover",
 			"key", vi.key())
-		stopAndDrainTimer(preemptHoldTimer)
+		vi.disarmPreemptHold(preemptHoldTimer)
 		vi.mu.Lock()
 		vi.skipNextPreemptHold = true
 		vi.mu.Unlock()
@@ -1376,7 +1471,7 @@ func (vi *vrrpInstance) handleBackupRx(pkt *VRRPPacket, masterDownTimer, preempt
 	// hold once.
 	if !vi.getPreempt() || int(pkt.Priority) >= pri {
 		masterDownTimer.Reset(vi.masterDownInterval())
-		stopAndDrainTimer(preemptHoldTimer)
+		vi.disarmPreemptHold(preemptHoldTimer)
 		vi.mu.Lock()
 		vi.skipNextPreemptHold = false
 		vi.mu.Unlock()
