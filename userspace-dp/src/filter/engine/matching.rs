@@ -30,12 +30,27 @@ use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP};
 /// still matches `from { is-fragment }`.
 #[inline(always)]
 fn per_packet_l4_matches(term: &FilterTerm, protocol: u8, extra: TermMatchExtra) -> bool {
-    if let Some(mask) = term.tcp_flags_mask {
-        // A tcp-flags constraint only matches a TCP segment that actually has
-        // an L4 header. A non-TCP packet, or a non-first fragment (no L4
-        // header), never matches.
-        if !extra.l4_present || protocol != PROTO_TCP || (extra.tcp_flags & mask) != mask {
+    if term.tcp_flags_mask.is_some() || term.tcp_flags_forbidden.is_some() {
+        // A tcp-flags constraint (required and/or forbidden, #3076) only matches
+        // a TCP segment that actually has an L4 header. A non-TCP packet, or a
+        // non-first fragment (no L4 header), never matches.
+        if !extra.l4_present || protocol != PROTO_TCP {
             return false;
+        }
+        // Required bits: all must be set — (flags & required) == required.
+        if let Some(required) = term.tcp_flags_mask {
+            if (extra.tcp_flags & required) != required {
+                return false;
+            }
+        }
+        // Forbidden bits: none may be set — (flags & forbidden) == 0. This is
+        // the negated half of an expression like `syn & !ack`; without it the
+        // `!ack` constraint was silently dropped and the term matched regardless
+        // of the ACK bit (the pre-#3076 fail-open).
+        if let Some(forbidden) = term.tcp_flags_forbidden {
+            if (extra.tcp_flags & forbidden) != 0 {
+                return false;
+            }
         }
     }
     if term.is_fragment && !extra.is_fragment {

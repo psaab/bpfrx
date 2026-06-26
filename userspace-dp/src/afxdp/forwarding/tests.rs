@@ -1892,14 +1892,17 @@ fn policy_selection_deny_emits_rt_flow_event() {
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            tcp_rst: false,
         },
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         },
         ZoneSnapshot {
             name: "dmz".to_string(),
             id: TEST_DMZ_ZONE_ID,
+            tcp_rst: false,
         },
     ];
     let state = build_forwarding_state(&snapshot);
@@ -2429,10 +2432,12 @@ fn connected_routes_are_table_scoped_no_cross_vrf_leak() {
             crate::ZoneSnapshot {
                 name: "za".to_string(),
                 id: TEST_TRUST_ZONE_ID,
+                tcp_rst: false,
             },
             crate::ZoneSnapshot {
                 name: "zb".to_string(),
                 id: TEST_UNTRUST_ZONE_ID,
+                tcp_rst: false,
             },
         ],
         interfaces: vec![
@@ -2498,6 +2503,171 @@ fn connected_routes_are_table_scoped_no_cross_vrf_leak() {
     assert_eq!(resolved_a.egress_ifindex, 101);
 }
 
+/// #3151: local-delivery (to-self) resolution must be table-scoped, mirroring
+/// the #2388 route-path fix. Two routing-instances own the SAME local address
+/// (10.0.0.1) on different interfaces. A to-self packet resolved in tenant-b's
+/// table must attribute local/egress/tx ifindex to tenant-b's interface (202),
+/// never leak to tenant-a's (101, pushed first). Revert (drop the
+/// `entry.table == table` filter in the local-delivery connected scan) → the
+/// global scan returns tenant-a's interface → wrong VRF/zone/RG attribution →
+/// RED.
+#[test]
+fn local_delivery_is_table_scoped_no_cross_vrf_leak() {
+    let snapshot = crate::ConfigSnapshot {
+        zones: vec![
+            crate::ZoneSnapshot {
+                name: "za".to_string(),
+                id: TEST_TRUST_ZONE_ID,
+                tcp_rst: false,
+            },
+            crate::ZoneSnapshot {
+                name: "zb".to_string(),
+                id: TEST_UNTRUST_ZONE_ID,
+                tcp_rst: false,
+            },
+        ],
+        interfaces: vec![
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/1.80".to_string(),
+                zone: "za".to_string(),
+                routing_instance: "tenant-a".to_string(),
+                linux_name: "ge-0-0-1.80".to_string(),
+                ifindex: 101,
+                hardware_addr: "02:00:00:00:00:a1".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.0.0.1/32".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/1.90".to_string(),
+                zone: "zb".to_string(),
+                routing_instance: "tenant-b".to_string(),
+                linux_name: "ge-0-0-1.90".to_string(),
+                ifindex: 202,
+                hardware_addr: "02:00:00:00:00:b2".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.0.0.1/32".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+
+    // The destination is one of our own local addresses (to-self): it is in
+    // both VRFs' connected lists. Resolved in tenant-b's table → tenant-b's
+    // interface (202).
+    let resolved_b = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        Some("tenant-b.inet.0"),
+    );
+    assert_eq!(
+        resolved_b.disposition,
+        ForwardingDisposition::LocalDelivery,
+        "to-self traffic must be local-delivery",
+    );
+    assert_eq!(
+        resolved_b.local_ifindex, 202,
+        "tenant-b to-self must attribute tenant-b's interface, not tenant-a's (cross-VRF leak)",
+    );
+    assert_eq!(resolved_b.egress_ifindex, 202);
+
+    // Mirror: tenant-a's table resolves tenant-a's interface (101).
+    let resolved_a = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        Some("tenant-a.inet.0"),
+    );
+    assert_eq!(resolved_a.local_ifindex, 101);
+}
+
+/// #3151 (v6): identical table-scoped local-delivery guarantee for the IPv6
+/// branch (connected_v6). Revert the `entry.table == table` filter → tenant-a
+/// leak → RED.
+#[test]
+fn local_delivery_v6_is_table_scoped_no_cross_vrf_leak() {
+    let snapshot = crate::ConfigSnapshot {
+        zones: vec![
+            crate::ZoneSnapshot {
+                name: "za".to_string(),
+                id: TEST_TRUST_ZONE_ID,
+                tcp_rst: false,
+            },
+            crate::ZoneSnapshot {
+                name: "zb".to_string(),
+                id: TEST_UNTRUST_ZONE_ID,
+                tcp_rst: false,
+            },
+        ],
+        interfaces: vec![
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/1.80".to_string(),
+                zone: "za".to_string(),
+                routing_instance: "tenant-a".to_string(),
+                linux_name: "ge-0-0-1.80".to_string(),
+                ifindex: 301,
+                hardware_addr: "02:00:00:00:00:a1".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet6".to_string(),
+                    address: "2001:db8::1/128".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/1.90".to_string(),
+                zone: "zb".to_string(),
+                routing_instance: "tenant-b".to_string(),
+                linux_name: "ge-0-0-1.90".to_string(),
+                ifindex: 402,
+                hardware_addr: "02:00:00:00:00:b2".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet6".to_string(),
+                    address: "2001:db8::1/128".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+
+    let resolved_b = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        IpAddr::V6("2001:db8::1".parse().unwrap()),
+        Some("tenant-b.inet6.0"),
+    );
+    assert_eq!(
+        resolved_b.disposition,
+        ForwardingDisposition::LocalDelivery,
+    );
+    assert_eq!(
+        resolved_b.local_ifindex, 402,
+        "tenant-b to-self (v6) must attribute tenant-b's interface, not tenant-a's",
+    );
+
+    let resolved_a = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        IpAddr::V6("2001:db8::1".parse().unwrap()),
+        Some("tenant-a.inet6.0"),
+    );
+    assert_eq!(resolved_a.local_ifindex, 301);
+}
+
 /// #2389: a static route with two next-hops must retain BOTH in the FIB
 /// (equal-cost), and a dead first next-hop must fall back to a live
 /// alternate. Revert the build to `next_hops.first()` → only one candidate
@@ -2508,6 +2678,7 @@ fn ecmp_static_route_retains_all_next_hops_and_skips_dead() {
         zones: vec![crate::ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         }],
         interfaces: vec![
             crate::InterfaceSnapshot {
@@ -2936,6 +3107,7 @@ fn ecmp_static_route_spreads_per_flow_not_per_destination() {
         zones: vec![crate::ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         }],
         interfaces: vec![
             crate::InterfaceSnapshot {
@@ -3133,6 +3305,7 @@ fn same_prefix_routes_tie_break_by_preference_not_insertion_order() {
         zones: vec![crate::ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         }],
         interfaces: vec![
             crate::InterfaceSnapshot {

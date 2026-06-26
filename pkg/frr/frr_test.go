@@ -1472,6 +1472,9 @@ func TestBGPDualStackGroupActivatesByAddressVersion(t *testing.T) {
 func TestPolicyCommunityOperations(t *testing.T) {
 	tree := &config.ConfigTree{}
 	setCommands := []string{
+		// The `then community delete <name>` form references a defined
+		// community-list (#2881 cross-reference gate); define it.
+		"set policy-options community MYLIST members 65000:999",
 		// add → additive append
 		"set policy-options policy-statement P term t_add from protocol bgp",
 		"set policy-options policy-statement P term t_add then community add 65000:111",
@@ -1551,6 +1554,10 @@ func TestPolicyCommunityOperations(t *testing.T) {
 func TestPolicyCommunityDeleteMultiList(t *testing.T) {
 	tree := &config.ConfigTree{}
 	setCommands := []string{
+		// The referenced community-lists must be defined (#2881 gate).
+		"set policy-options community listA members 65000:1",
+		"set policy-options community listB members 65000:2",
+		"set policy-options community listC members 65000:3",
 		"set policy-options policy-statement P term t_del from protocol bgp",
 		// Bracketed multi-list: the lexer strips the brackets, so this
 		// flattens to delete + [listA listB listC] (the #2419 multi-value

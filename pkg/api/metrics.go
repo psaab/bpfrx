@@ -89,6 +89,7 @@ type xpfCollector struct {
 	surfaceADDNSDeletesTotal *prometheus.Desc
 	surfaceADDNSSkippedTotal *prometheus.Desc
 	surfaceADDNSScopes       *prometheus.Desc
+	surfaceADDNSDegraded     *prometheus.Desc
 
 	// System metrics
 	sysCPUUser   *prometheus.Desc
@@ -501,6 +502,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.surfaceADDNSDeletesTotal
 	ch <- c.surfaceADDNSSkippedTotal
 	ch <- c.surfaceADDNSScopes
+	ch <- c.surfaceADDNSDegraded
 	ch <- c.sysCPUUser
 	ch <- c.sysCPUSystem
 	ch <- c.sysMemTotal

@@ -181,6 +181,37 @@ fn test_monotonic_ns_to_unix_conversions() {
 }
 
 #[test]
+fn test_monotonic_ns_to_unix_secs_subnanos() {
+    // #2853: the secs+subnanos split must reconstruct the exact wall-clock
+    // nanosecond instant, preserving the sub-second remainder the seconds-only
+    // helper truncated. A creation instant 30.123456789s before a sub-second
+    // wall reference splits into the right second and the right nanos.
+    let now_mono = 1_000_000_000_000u64; // 1000s monotonic
+    let now_unix = 1_700_000_000_123_456_789u64; // 1.7e9 s + 123456789 ns
+    let created_mono = now_mono - 30 * NS_PER_SEC; // 30s ago (whole seconds)
+    let (secs, subnanos) = monotonic_ns_to_unix_secs_subnanos(created_mono, now_mono, now_unix);
+    assert_eq!(secs, 1_700_000_000 - 30);
+    assert_eq!(subnanos, 123_456_789);
+    // The seconds-only helper still returns just the truncated second.
+    assert_eq!(
+        monotonic_ns_to_unix_secs(created_mono, now_mono, now_unix),
+        1_700_000_000 - 30
+    );
+    // Reconstruction is lossless.
+    assert_eq!(
+        secs as u64 * NS_PER_SEC + subnanos as u64,
+        now_unix - 30 * NS_PER_SEC
+    );
+    // 0 / unknown maps to (0, 0).
+    assert_eq!(
+        monotonic_ns_to_unix_secs_subnanos(0, now_mono, now_unix),
+        (0, 0)
+    );
+    // subnanos is always a valid sub-second remainder.
+    assert!(subnanos < NS_PER_SEC as u32);
+}
+
+#[test]
 fn test_emit_session_close_rt_flow_carries_real_created_stamp() {
     // #2465 fail-on-revert: a close delta with a real (non-zero) created_ns
     // must produce a non-zero `created` (offset 108) and `timestamp_ns`

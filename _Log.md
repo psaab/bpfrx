@@ -41,6 +41,836 @@
   dead-code warnings only); `cargo test session::` 129 passed; fail-on-revert
   confirmed RED then GREEN after restore.
 
+## 2026-06-26 — #3071: zone tcp-rst wired into userspace deny enforcement
+
+- **Timestamp**: 2026-06-26
+- **Action**: Wire the parsed-but-inert `security zones <z> tcp-rst` knob into
+  the userspace dataplane. Go `ZoneConfig.TCPRst` now flows to
+  `ZoneSnapshot.TCPRst` (json `tcp_rst`, omitempty) and across the wire to the
+  Rust `ZoneSnapshot.tcp_rst` (serde rename `tcp_rst`, default false). The Rust
+  forwarding build records tcp-rst-enabled zone ids in
+  `ForwardingState.zone_tcp_rst`; both policy-deny call sites in
+  `poll_descriptor/mod.rs` now route through a unified `enqueue_deny_reply`
+  helper that, for a plain `deny` (not `then reject`), sends a TCP RST via the
+  existing #2521/#2089 reject machinery ONLY when the flow is TCP and the
+  INGRESS (from) zone has tcp-rst. Non-TCP denied traffic and a deny in a
+  non-tcp-rst zone stay silent drops; explicit `then reject` is unchanged. Zone
+  tcp-rst RSTs count under `policy_reject_sent`. Junos semantics: tcp-rst is a
+  source/from-zone property (RST goes back toward the initiator).
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/zones_tcp_rst_3071_test.go (new),
+  userspace-dp/src/protocol/snapshot.rs (field + round-trip tests),
+  userspace-dp/src/afxdp/types/forwarding.rs (field + accessor),
+  userspace-dp/src/afxdp/forwarding_build/zones.rs (populate),
+  userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs (enqueue_deny_reply +
+  tests), userspace-dp/src/afxdp/poll_descriptor/mod.rs (call sites),
+  userspace-dp/src/filter/README.md, userspace-dp/tests/fixtures/protocol_wire_v1.json
+  (regenerated), plus test-literal updates in forwarding/forwarding_build/
+  test_fixtures/tests for the new field.
+- **Validation**: cargo build --release clean; Rust reject/policy/forwarding/
+  snapshot/wire tests green incl. 6 new tcp-rst tests; fail-on-revert confirmed
+  (disabling the zone arm → deny_reply_zone_tcp_rst_tcp_enqueues_rst RED);
+  go build ./... + go test ./pkg/dataplane/... ./pkg/config/... pass; gofmt clean.
+
+## 2026-06-25 — #3029: DNAT destination-address prefix silently narrowed to a single host
+
+- **Action**: Hard-reject a destination-NAT rule whose `match destination-address`
+  is a MULTI-HOST prefix (e.g. `198.51.100.0/24`). The DNAT snapshot builder strips
+  the `/mask` and the Rust `DnatTable` keys on an EXACT host `IpAddr` (no prefix/LPM),
+  so only the network address translated and every other host in the block silently
+  bypassed DNAT. Contract: commit-REJECT (fail-closed, #1960 strict-with-lenient),
+  NOT honor-prefix — block-mapping semantics (1:1 vs many:one) + an LPM table are an
+  unsettled dataplane feature (issue is a /research candidate). Single-host (bare IP,
+  /32, /128) unchanged.
+- **File(s)**: pkg/config/compiler_validate_strict.go (validateDestinationNATAddressesStrict
+  extended; reuses isHostMaskAddress), pkg/config/compiler_dnat_address_test.go (4 new
+  tests: v4/v6 prefix reject, host-mask compiles, lenient warns), docs/feature-gaps.md.
+- **Validation**: go build ./...; go test ./pkg/config/... (1698 pass + new); RED->GREEN
+  confirmed (disable the gate condition -> reject tests FAIL); gofmt clean.
+
+## 2026-06-25 — #3149 (folds #3147): policy dangling/empty address-set hard-reject
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added `validatePolicyMatchAddressSetMembersStrict` — hard-rejects
+  at commit a security-policy source/destination address that names a DEFINED
+  address-book entry whose recursive members dangle, a defined-but-EMPTY
+  address-set, or a prefix-less address. Mirrors the runtime resolver
+  `resolveUserspaceAddressBookEntry`+`expandUserspacePolicyAddresses` exactly via
+  new helper `policyMatchAddressBookResolves` (fail-closed; cycle/empty-expansion
+  rejected by the outer count==0 check). Address-book sibling of #2217/#3144/#3146.
+  Folds #3147 (empty address-set) and pins the excluded-inversion safety: an empty
+  EXCLUDED set is rejected fail-CLOSED (can never commit → never inverts to
+  match-all). Strict on commit; lenient warn on load/peer-sync via new flag
+  `lenientPolicyMatchAddressSetMembers` (#1960). The warn.go address-set member
+  warning is retained for the lenient path + unreferenced sets.
+- **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/compiler_policy_match_address_set_3149_test.go (new),
+  pkg/config/README.md, _Log.md
+- **Validation**: go build ./..., go vet ./pkg/config/..., go test
+  ./pkg/config/... ./pkg/dataplane/userspace/... (2300 passed). 22 new subtests
+  green; fail-on-revert confirmed RED (stub validator body → all reject cases
+  fail). gofmt clean on changed files.
+
+- **2026-06-25**: #3011 (agy-review-059 finding 059-02) — SNAT source-port recycling changed from LIFO to FIFO. `recycled_ports_by_addr` in `userspace-dp/src/nat/allocator.rs` was a per-address `Vec<u16>` with push/pop at the BACK (LIFO): the most-recently-freed port was the FIRST reassigned, maximizing the chance of reusing a 4-tuple while the upstream still holds it in TIME_WAIT (2MSL) → SYN reject / dup-ACK / RST under high NAT churn. Switched to `VecDeque<u16>`: `push_back` on release, `pop_front` on allocation, so the OLDEST-freed port is reused first and reuse spreads across the 2MSL window (standard NAT44/conntrack behavior). Composes with the #3047 (062-10) collision-retain logic: a popped port whose owner slot is still occupied is RETAINED (re-queued at the BACK via `extend`), never discarded — collided ports sit behind the genuinely-free ports so FIFO order among free ports is preserved and the drain still terminates (each `pop_front` removes one element). No change to address-persistent / persistent-NAT lease semantics — only the recycle ORDER. Fail-on-revert verified RED→GREEN: new `pool_snat_recycle_order_is_fifo_not_lifo` (exhaust sequential range, free ports 1026/1024/1028 in that order, require next 3 allocations to reuse them in the SAME FIFO order); reverting `pop_front`→`pop_back` (LIFO) flips the result to [1028,1024,1026] and turns the test RED. Updated the #3047 collision-retain test's seed ordering to keep exercising the retain path under FIFO. Gates: cargo build --release -p xpf-userspace-dp clean; cargo test --release nat 486 pass. Files: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/tests.rs, userspace-dp/README.md
+## 2026-06-25 — #3151: local-delivery resolution table-scoped (cross-VRF leak)
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix cross-routing-instance ifindex leak in to-self
+  (local-delivery) forwarding resolution. `lookup_forwarding_resolution_inner_ecmp`
+  scanned the global `connected_v4`/`connected_v6` lists with no
+  `entry.table == table` filter, so a to-self packet in VRF A could
+  resolve its local/egress/tx ifindex to an overlapping local address
+  owned by VRF B → wrong zone/RG attribution. Mirrored the #2388
+  route-path fix: canonicalize the ingress table BEFORE the local check
+  and filter the connected scan by it in BOTH v4 and v6 branches. Default
+  routing-instance (inet.0/inet6.0) case preserved.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md
+- **Validation**: cargo build --release clean; new tests
+  `local_delivery_is_table_scoped_no_cross_vrf_leak` (+ v6 sibling)
+  GREEN; fail-on-revert RED with the filter removed; full forwarding
+  suite 193 passed.
+
+## 2026-06-25 — #3150: strict app-spec protocol gate aligned to dataplane resolver
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix commit/apply split — `validateApplicationSpecsStrict`
+  resolved a policy/NAT-referenced application's `protocol` leaf via the
+  lenient `validateProtocol` (blanket `strings.HasPrefix("junos-")` accept),
+  so `protocol junos-foobar` committed cleanly while the dataplane resolver
+  `appid.ProtocolNumber` rejects it → userspace policy capability gate
+  disarms (apply fails after a green commit). Switched the strict app-spec
+  protocol check to `filterProtocolResolvable` (the existing
+  `appid.ProtocolNumber` mirror, drift-guarded). Lenient `validateProtocol`
+  unchanged (still used by `ValidateConfig` warning surface / unreferenced
+  apps). Lenient load downgrade (`lenientApplicationSpecs`) preserved.
+- **File(s)**: pkg/config/compiler_validate_strict.go (fix + comments),
+  pkg/config/compiler_application_specs_test.go (fail-on-revert tests),
+  pkg/config/README.md (gotcha note), _Log.md
+- **Validation**: go build ./..., go vet ./pkg/config/..., go test
+  ./pkg/config/... ./pkg/appid/... (1650 pass), gofmt -l clean. Fail-on-
+  revert proven: restoring the broad junos- accept makes the junos-foobar
+  reject test RED.
+- **2026-06-25**: #3141 review fold (PR #3155) — closed a flat-path trailing-token escape in `validatePolicyThenDenyStrict`. The validator inspected only `denyNode.Keys[1]` on the FLAT path, so when a SUPPORTED token LED and an UNSUPPORTED token TRAILED, the unsupported one slipped through silently — `then deny count evilmod` compiled clean and `evilmod` was dropped (the exact silent-inert failure mode the gate exists to prevent). The hierarchical children loop already checked every direct child; the gap was flat-path-only and asymmetric (unsupported-FIRST was correctly rejected). Fix: iterate ALL collapsed tokens `Keys[1:]`, checking each against a new shared `recognizedCollapsedDenyToken` predicate (compiler_security.go) = the EXACT {log, session-init, session-close, count} set `applyCollapsedDenyModifiers` consumes, so validator and wiring agree on modifier-vs-sub-token (log may be followed by session-init/session-close; count stands alone; anything else rejected). Added fail-on-revert tests: `then deny count evilmod` and `then deny log session-init evilmod` rejected; `then deny log session-init session-close count` commits with all fields wired. Reverting to the Keys[1]-only check turns the two trailing-token reject cases RED. Gates: go build clean; go test ./pkg/config/... 1657 pass; gofmt clean. Files: pkg/config/compiler_policy_then.go, pkg/config/compiler_security.go, pkg/config/compiler_policy_then_deny_3141_test.go, pkg/config/README.md
+- **2026-06-25**: #3141 (codex-review-068 finding 068-01) — `then deny` log/count modifier wired; other collapsed deny modifiers rejected. A flat-set `then deny log session-init` collapses `log session-init` onto the deny node (Keys=["deny","log","session-init"], no children) instead of nesting a sibling `then log` node; `compilePolicy`'s `then` switch `deny` arm (compiler_security.go) read only `t.Name()` and silently dropped the collapsed tail, so deny-with-logging committed but `pol.Log` was never set — the configured audit logging was inert (a deny-rule observability/compliance failure, not a packet fail-OPEN). Unlike #3114/#3115 (pure rejects, empty allowlists) this is feature-wiring: deny+log/deny+count are LEGITIMATE Junos combinations the standalone `then log`/`then count` arms already implement. Fix WIRES the collapsed `log`/`count` modifiers in new `applyCollapsedDenyModifiers` (compiler_security.go), so deny+log works in BOTH the flat-collapsed form and the separate-node `then { deny; log session-init; }` form (latter already handled by the `log` arm). Verified `pol.Log` flows into `PolicyRuleSnapshot.LogSessionInit/Close` (pkg/dataplane/userspace/policies.go, #2508) independent of `Action`, so a deny rule emits the configured session log. Added `validatePolicyThenDenyStrict` (compiler_policy_then.go) as the safety net: hard-rejects any REMAINING `then deny <unsupported>` collapsed modifier at commit naming scope/policy/modifier; allowlist `supportedPolicyThenDenyChildren` = {log, count}, kept in lockstep with the wiring. AST pre-walk in compileExpanded, both AST shapes (Keys[1] flat / child node), zone-pair + global. Strict hard-reject on CompileConfig; lenient-warn on both lenient constructors via new `lenientPolicyThenDeny` flag (#1960 no-brick). Fail-on-revert verified RED→GREEN twice: neutralize `applyCollapsedDenyModifiers` → collapsed-log/count tests RED (separate-node still GREEN); stub `validatePolicyThenDenyStrict` → reject + lenient-warn tests RED. Files: pkg/config/compiler_security.go, pkg/config/compiler_policy_then.go, pkg/config/compiler.go, pkg/config/compiler_policy_then_deny_3141_test.go (new), pkg/config/README.md
+## 2026-06-25 — #3142: close multi-value-leaf escape in the #3113 policy-match gate
+
+- **Timestamp**: 2026-06-25
+- **Action**: Extended `validatePolicyMatchLeavesStrict` to also inspect the
+  COLLAPSED tail tokens of a supported `multi:true` match leaf (the
+  `application` leaf's `Keys[1:]` + child sub-nodes, via `firewallMatchValues`),
+  not just the direct children of `match`. A flat-set `match application <vals>
+  dynamic-application/url-category/source-identity ...` collapses the unsupported
+  match-leaf keyword onto the application leaf (the #2419 absorber), where the
+  #3113 direct-child check never saw it — the criterion escaped the gate and the
+  policy silently armed as a broad application match (fail-open). Added a
+  `unsupportedPolicyMatchLeaves` set (the KNOWN unsupported match dimensions) and
+  reject any such keyword found in the tail. A legitimate application value (e.g.
+  `[ junos-http junos-https ]`) is never one of those keywords, so it is not
+  over-rejected. Same strict-reject / lenient-warn split as #3113.
+- **File(s)**: pkg/config/compiler_policy_match.go,
+  pkg/config/compiler_policy_match_3142_test.go, pkg/config/README.md
+- **Validation**: `go build ./...`; `go test ./pkg/config/...` (all green);
+  fail-on-revert confirmed — reverting the tail scan makes the five escape
+  cases COMMIT (the genuine fail-open), turning the escape test RED; the
+  no-over-reject cases stay green. gofmt clean.
+## 2026-06-25 — #3144: undefined policy `match application` hard-reject at commit
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix codex-review-067 finding 067-02 — a security-policy
+  `match application <NAME>` referencing an UNDEFINED application (not a
+  predefined junos-* app, not a user-defined application or application-set)
+  was only WARNED at commit (`compiler_validate_warn.go`). At runtime the
+  userspace capability gate (`resolveUserspaceApplicationNames`) resolves the
+  same name set, returns false for the unknown name → the dataplane refuses to
+  arm security policies. Green commit + silently disarmed allow/deny path — a
+  commit/apply split, fail-open.
+- **Fix**: Added `validatePolicyMatchApplicationsStrict` +
+  `policyMatchApplicationError` (`compiler_validate_strict.go`) hard-rejecting
+  an undefined reference at commit (zone-pair + global + the multi-value
+  `[ a b c ]` list). Resolution mirrors the runtime gate exactly
+  (`ResolveApplication` + `ResolveApplicationSet`); `any`/empty accepted.
+  Strict on commit/commit-check; lenient-warn on load/peer-sync via new
+  `lenientPolicyMatchApplications` flag (#1960). Removed the warn.go
+  application-not-defined block (converted consistently): strict gate
+  supersedes on commit, lenient gate emits the single warning on load —
+  drops a duplicate warning + the old 24-entry builtin list's false positive
+  on predefined apps outside it. Composes with #2217 (dangling set member)
+  and #3142 (multi-value populate via the typed Match.Applications list).
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_policy_match_application_3144_test.go,
+  pkg/config/README.md, _Log.md
+- **Fold (#3146, same fail-open class)**: a DEFINED-but-EMPTY
+  application-set referenced by a policy committed clean but the runtime
+  DISARMED — the set resolves by NAME but the runtime
+  `resolveUserspaceApplicationNames` calls `ExpandApplicationSet`, gets
+  len==0, returns false → dataplane refuses to arm security policies.
+  #2217's gate `continue`s on an empty set, so nothing else caught it.
+  Fixed: the application-set branch now requires `ExpandApplicationSet`
+  to yield >= 1 member (mirroring the runtime exactly), with a distinct
+  `policyMatchEmptyAppSetError` message. Strict reject / lenient warn.
+  Updated README to drop the overstated "cannot diverge" → "mirrors
+  resolveUserspaceApplicationNames (name resolves AND, for a set, expands
+  to >= 1 member)". Closes #3146 too.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_policy_match_application_3144_test.go,
+  pkg/config/README.md, _Log.md
+- **Validation**: `go build ./...` clean; `go vet ./pkg/config/...` clean;
+  `go test ./pkg/config/... ./pkg/dataplane/userspace/...` 2249 passed;
+  gofmt clean. fail-on-revert: neutering the validator → undefined commits
+  (5 RED), restored → GREEN; dropping the empty-set expand arm → empty-set
+  commits (3 RED), restored → GREEN.
+
+## 2026-06-25 — #3025: NAT64 non-fragmented L4 checksum goes incremental (RFC 1624)
+
+- **Timestamp**: 2026-06-25
+- **Action**: NAT64's non-fragmented TCP/UDP translation now adjusts the L4
+  checksum INCREMENTALLY (RFC 1624) for the v4↔v6 pseudo-header address change
+  instead of re-summing the entire L4 payload (agy-review-061 finding 061-05,
+  performance). The transport payload is byte-identical across translation and
+  the length/protocol fields are unchanged, so only the pseudo-header addresses
+  differ — making the O(changed-words) fold byte-identical to the previous full
+  recompute (one's-complement addition is exact). Renamed the existing #2488
+  fragment helpers `adjust_l4_checksum_v{6_to_v4,4_to_v6}_fragment` →
+  `_incremental` (they now serve both fragment and non-fragment paths) and
+  routed the non-fragment TCP / non-zero-checksum UDP cases through them. ICMP,
+  v4→v6 UDP with a zero IPv4 checksum (RFC 768 "no checksum" → must GENERATE
+  one), and a defensive v6→v4 UDP zero-baseline keep the full recompute. The
+  #2488 fragment path is untouched.
+- **File(s)**: userspace-dp/src/nat64.rs (module doc + both translators + helper
+  renames), userspace-dp/src/nat64_tests.rs (8 `nat64_3025_*` tests: incremental
+  == full recompute for v6→v4 / v4→v6 TCP+UDP, v4 zero-checksum UDP generates a
+  fresh valid checksum, fail-on-revert seams that PRESERVE a corrupted input
+  checksum, and a wrong-delta pin). Validation: cargo build --release clean;
+  cargo test nat64 (99) + checksum (51) green; RED confirmed by forcing the
+  v6→v4 path back to recompute (seam test fails), restored.
+
+- **2026-06-25**: #2994 (codex-review-058 finding 058-09) — DHCP T1/T2 renewal now runs the RFC-correct unicast RENEW / broadcast REBIND instead of a full DORA / Rapid-Solicit re-acquisition. Before #2994 `runDHCPv4`/`runDHCPv6` called the full client exchange at every T1/T2, which broadcast a fresh server-selection each renewal, could move the lease to a different server, churned the address (interface-DDNS, FRR routes, ip-monitoring) and doubled WAN DHCP traffic. Fix: introduced a `dhcpExchangeMode` (acquire/renew/rebind) state machine in the run loops. v4 T1 sends a unicast RENEWING DHCPREQUEST (ciaddr = held address, no requested-IP / no server-id options per RFC 2131 Table 5) to the granting server (stored `Lease.serverID`, option 54), T2 broadcasts a REBINDING DHCPREQUEST; v6 T1 sends RENEW echoing the held IA_NA / IA_PD with the server's DUID (stored `Lease.v6ServerDUID`), T2 multicasts REBIND (no server DUID). Only lease expiry (both fail) falls back to full DISCOVER/SOLICIT. Stateless v6 stays Information-Request. Any malformed/unmatched renew is fail-safe — degrades to the prior full-acquisition path. Added run-loop seams (`doV4ExchangeForTest`/`doV6ExchangeForTest`/`afterForTest`/`waitLinkLocalForTest`) so the real `runDHCPv4`/`runDHCPv6` state machine is unit-testable without sockets or the 30 s T1 clamp. Follow-up: updated the stale pre-#2994 wire-behavior comment in `commit.go`. Tests: wire builders (`buildV4RenewRequest`/`v4RenewDest`/`buildV6RenewMessage`) + run-loop mode-sequence (acquire→renew→renew→rebind→acquire) + lease preservation; fail-on-revert (T1→acquire) confirmed RED→GREEN; -race clean. Files: pkg/dhcp/dhcp.go, pkg/dhcp/renew.go (new), pkg/dhcp/renew_test.go (new), pkg/dhcp/commit.go, pkg/dhcp/dhcp_test.go (gofmt sweep), pkg/dhcp/README.md
+## 2026-06-25 — #3120: IPv6 screen ext-header walk continues past Fragment header
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed the IPv6 extension-header walk in the screen
+  extractor so a FIRST fragment (`Fragment → Destination-Options → TCP`)
+  no longer hides the TCP header from the TCP-flag screens / SYN-cookie
+  flood challenge. The `NEXTHDR_FRAGMENT` arm now continues the bounded
+  walk past the 8-byte fragment header for fragment offset == 0 instead
+  of unconditionally `break`ing; a non-first fragment (offset > 0) still
+  stops (no L4 here — #2344/#3064). Added two Rust tests (frag→dest-opts
+  →TCP first fragment extracts seq/MSS; non-first fragment stays flowless)
+  — fail-on-revert verified RED→GREEN. Updated module doc + frame README.
+- **File(s)**: userspace-dp/src/screen/extract.rs,
+  userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/frame/README.md
+
+- **2026-06-25**: #3145 FIXED, #3143 found to be a misdiagnosis (codex-review-068 findings 068-02/068-03), on the LIVE userspace dataplane. TWO distinct numeric namespaces coexist: (a) the dataplane snapshot PolicyID is SPAN-ACCUMULATED (`policySetID*MaxRulesPerPolicy + ruleIndex`, ruleIndex advances by app-set expansion count) — serves the dataplane + RT_FLOW/event path; (b) the per-policy COUNTER read path is NAME-keyed — the helper reports each rule's packets/bytes under its stable RuleID string (`from->to/name`; expanded rules aggregate under one name), and `ReadPolicyCounters`'s numeric arg is only a HANDLE the read callers use to pick a policy. EVERY production counter caller (pkg/api/metrics_counters.go, pkg/api/security.go, pkg/cli/cli_show_security*.go, pkg/grpcapi/server_show_*.go) builds that handle as `policySetID*MaxRulesPerPolicy + sliceIndex` (raw zpp.Policies position), NOT the expanded ruleIndex. #3145 (WRITE side, REAL bug): `buildPolicySnapshotsWithSchedulerStateAndFeeds` (pkg/dataplane/userspace/policies.go) advanced ruleIndex by the expansion count with NO MaxRulesPerPolicy cap → a set whose expansion reached 256 spilled the next policy's snapshot PolicyID into the following set's base namespace (legacy guard at compiler.go:765/901 is the retired-eBPF path). Fixed: ID assignment routed through a new shared `walkPolicyRuleSlots` helper that enforces the cap fail-closed (set reaching 256 rejected at snapshot build; apply path retains prior good state). #3143 (READ side, MISDIAGNOSIS): the issue claimed `policyID % MaxRulesPerPolicy` as a slice index was wrong, but that EXACTLY matches the slice-index handle every caller passes, so master already resolved post-multi-app counters CORRECTLY. The counter store is name-keyed and the legacy bpfShim `policy_counters` array is never incremented in userspace mode (grep userspace-xdp/src confirms zero writes), so the numeric handle never indexes a span-accumulated array — nothing to round-trip; only caller/resolver agreement matters, and both use slice index. NOTE: the FIRST version of this PR changed the resolver to span-accumulated — that was ITSELF a regression (hostile review caught it: it mapped a caller's slice-index handle into the PRECEDING expanded policy's span → reported the preceding policy's count for every policy after a multi-app one). Reverted; `policyRuleIDForCounter` keeps the slice-index decode with an expanded comment documenting the dual namespace. Tests in pkg/dataplane/userspace/policy_namespace_3143_3145_test.go: 255/256/257-term cap boundary + literal ID-256 spill collision (#3145, fail-on-revert on the cap) + an end-to-end counter test combining app-set expansion with a per-policy counter assertion through the slice-index caller handle (the coverage the suite lacked; fail-on-revert against a span-accumulated resolver). Gates: go build/vet clean, gofmt clean, `go test ./pkg/dataplane/... ./pkg/config/... ./pkg/api/... ./pkg/cli/... ./pkg/grpcapi/...` 3031 passed. Files: pkg/dataplane/userspace/policies.go, pkg/dataplane/userspace/policycounters.go, pkg/dataplane/userspace/policy_namespace_3143_3145_test.go (new), docs/feature-gaps.md
+- **2026-06-25**: #3044 (codex-review-061 finding 061-03) — reject a security policy whose `match` clause omits a required Junos dimension (source-address, destination-address, application) or omits the `match` block entirely. Previously `compilePolicy` (compiler_security.go) filled each match slice only when the leaf was present, and the userspace dataplane treats an empty slice as match-ANY — so a partial policy silently widened to traffic the operator never intended (`match source-address corp; then permit` → corp->any:any; a match-less policy → zone-pair-wide permit/deny). A fail-OPEN for permit, an over-broad block for deny; on Junos this cannot commit. Added `validatePolicyRequiredMatchStrict` (new pkg/config/compiler_policy_missing_match.go), an AST pre-walk in compileExpanded (same rationale as the #3113 unsupported-match-leaf gate — a missing leaf leaves no trace in the typed *Config and SchemaValidate cannot reject an absence). Contract = Junos parity: all three dimensions REQUIRED; a missing dimension is distinct from an explicit `any` (operator must write the wildcard); source/destination-address-excluded are modifiers, not substitutes. Covers zone-pair AND global; runs on the group-expanded inactive-pruned tree. Strict hard-reject on CompileConfig naming scope/policy/every missing dimension; lenient-warn on both lenient constructors via new `lenientPolicyMissingMatch` flag (#1960 no-brick). Updated existing fixtures that relied on the dangerous shorthand to use explicit `any` (the issue directed this). Fail-on-revert verified RED→GREEN (validator stubbed to return nil → 7 reject subtests RED). Files: pkg/config/compiler_policy_missing_match.go (new), pkg/config/compiler.go, pkg/config/compiler_policy_missing_match_3044_test.go (new), pkg/config/README.md, plus fixture updates in compiler_policy_then_3114_test.go, compiler_policy_then_3115_test.go, policy_match_excluded_test.go, policy_terminal_action_3043_test.go, policy_zone_ref_test.go, reserved_zone_name_3055_test.go, parser_ast_test.go
+## 2026-06-25 — #3107: CLI `test policy` gains a source-port input
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added a `source-port` token to the CLI `test policy` command
+  (codex-review-065 finding 065-04). The shared matcher `policymatch.Match`
+  has supported a `SrcPort` term since #3042 (and REST/gRPC `MatchPolicies`
+  already accept `source_port`), but `test policy` only parsed a destination
+  port, so a source-port-constrained application was OVERMATCHED — the CLI
+  could report a PERMIT a real packet from another source port would never
+  receive. Wired source-port through every CLI-reachable surface: the local
+  CLI (`pkg/cli/cli_request.go` `testPolicy`), the remote cli→gRPC topic
+  (`cmd/cli/main.go` `testPolicy` emits a new `srcport=` key) and its backing
+  handler (`pkg/grpcapi/server_show_firewall.go` `showTestPolicy` parses
+  `srcport=`), plus the operational completion grammar
+  (`pkg/cmdtree/tree.go` `test policy`). Parsing goes through the shared
+  `policymatch.ParsePort` so the source port inherits the #3116 validation
+  (empty = unspecified / match any; malformed/out-of-range → error instead
+  of a silent 0 wildcard) and the parsed value threads into
+  `policymatch.Query.SrcPort`. Destination-port behavior unchanged.
+- **File(s)**: pkg/cli/cli_request.go, pkg/cli/testpolicy_srcport_test.go,
+  cmd/cli/main.go, cmd/cli/testpolicy_srcport_test.go,
+  pkg/grpcapi/server_show_firewall.go, pkg/grpcapi/server_show.go,
+  pkg/grpcapi/server_show_testpolicy_srcport_test.go, pkg/cmdtree/tree.go,
+  pkg/grpcapi/README.md, _Log.md
+- **Validation**: `go build ./...`, `go vet` (no new issues — the 2 vet
+  notes pre-exist in untouched files), `go test ./pkg/cli/... ./pkg/grpcapi/...
+  ./pkg/policymatch/... ./cmd/cli/... ./pkg/cmdtree/...` 419 passed, `gofmt -l`
+  clean on all touched files. Fail-on-revert: forcing the source-port wiring
+  off (token ignored / `SrcPort` stays 0) flips the wrong-src-port case from
+  Default deny to a false Policy match and drops the invalid-port diagnostics
+  → 11 RED; restoring → all GREEN.
+
+- **2026-06-25**: #3013 (agy-review-059 finding 059-03) — commit-time validation that a VRRP virtual-address falls within a subnet configured on the parent interface unit (vSRX parity). Added `validateVRRPVirtualAddressSubnet` (`compiler_validate_strict.go`, called in `compileConfigWithOpts`) asserting each `vrrp-group <id> virtual-address <vip>` is contained in the prefix of at least one address on the SAME unit for the MATCHING family (helper `vrrpVIPHostIP` parses the CIDR/bare VIP). Previously a VIP outside every on-link subnet committed cleanly and the daemon installed a route-less host address at runtime — return traffic from the VIP silently blackholed. Owner/priority-255 case (VIP == an interface address) passes for free; cross-family VIP (v4 literal under a v6-only address) is rejected (no matching-family subnet). Strict hard-reject on `CompileConfig` naming interface/unit/group/VIP/family; lenient-warn on both lenient constructors via new `lenientVRRPVirtualAddress` flag (#1960 no-brick). Config-only — never touches the VRRP runtime/state machine (no test-failover needed). Fail-on-revert verified RED->GREEN (forced lenient=true → 2 reject tests RED). Files: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/vrrp_vaddr_subnet_3013_test.go (new), pkg/config/README.md
+- **2026-06-25**: #3110 — guard global-policy evaluation against zone id 0 (unknown/unzoned) in the userspace dataplane. `evaluate_policy_result_with_len` (userspace-dp/src/policy.rs) evaluated `global_indices` after a zone-pair miss with NO `from_id != 0 && to_id != 0` guard. Zone id 0 is the reserved "unknown/no zone" sentinel (interfaces unbound to any zone, plus the #2391 over-cap collapse-to-0 path). A flow with an unknown ingress OR egress zone therefore fell through to the global policies and a configured permit-global PERMITTED it — leaking transit on an unzoned interface (agy-review-065 finding 065-03, VERIFIED). Fix: wrap both the zone-pair index lookup AND the global-indices loop in `if from_id != 0 && to_id != 0`; an unknown-zone flow now falls straight to the default action (deny, #3065). The `junos-global` sentinel (u16::MAX) is a DEFINED global zone, distinct from 0, and is unaffected — global policies still apply to all defined zone pairs (composes with #3018). Added regression `unknown_ingress_zone_does_not_match_permit_global` (from_id=0, to_id=0, both-0 → Deny; both-valid → Permit); fail-on-revert confirmed RED→GREEN. Files: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs, docs/userspace-dataplane-architecture.md
+## 2026-06-25 — #3108: policy simulators reject invalid protocol tokens
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added shared `policymatch.ValidateProtocol` and wired it across
+  all four simulator surfaces (codex-review-065 finding 065-05). Mirrors the
+  #3116 port-validation pattern. `matchApp` short-circuits to match-any before
+  the protocol is resolved, so a bogus protocol (unknown name / out-of-range
+  number) silently produced a permit/deny verdict instead of an error. Empty
+  protocol = unspecified (match any, unchanged); a non-empty token must resolve
+  via `appid.ProtocolNumber`. REST `matchPoliciesHandler` → 400, gRPC
+  `MatchPolicies` → InvalidArgument, gRPC `showTestPolicy` → "invalid protocol"
+  diagnostic, local CLI `showMatchPolicies`/`testPolicy` + remote `cli`
+  `testPolicy` → command error. Fail-on-revert verified (stub `return nil`
+  flips every want-error case red across 6 surfaces + the unit test).
+- **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/protocol_test.go,
+  pkg/policymatch/README.md, pkg/api/security.go,
+  pkg/api/rest_filter_failclosed_test.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_show_firewall.go,
+  pkg/grpcapi/server_proto_validation_test.go, pkg/cli/cli_show_security.go,
+  pkg/cli/cli_request.go, pkg/cli/policymatch_protocol_test.go,
+  cmd/cli/main.go, cmd/cli/testpolicy_protocol_test.go
+
+- **2026-06-25**: #3115 (codex-review-066 finding 066-03) — reject unsupported security-policy `then reject` children at commit (sibling of #3114). Added `validatePolicyThenRejectStrict` (AST pre-walk in `compileExpanded`) hard-rejecting a policy whose `then reject` arm carries a child the compiler does not enforce — a reject `profile <name>` (custom reject response) or a packet-type reject like `tcp-reset`. The `reject` arm in `compilePolicy`'s `then` switch set `pol.Action = PolicyReject` and never inspected `t.Children`, so the modifier was SILENTLY DROPPED — the configured custom reject response is inert (a wire-contract / operator-observability divergence, not a fail-open: reject still rejects). Checks both AST shapes (flat-set collapses modifier onto `reject` `Keys[1]`; hierarchical nests it as a child). Allowlist `supportedPolicyThenRejectChildren` is EMPTY (compiler enforces no reject child today). A bare `then reject` (no child) still commits. Strict on `CompileConfig`; lenient-warn on both lenient constructors via new `lenientPolicyThenReject` flag (#1960). Covers zone-pair AND global policies. Fail-on-revert verified RED->GREEN. Files: pkg/config/compiler_policy_then.go, pkg/config/compiler_policy_then_3115_test.go (new), pkg/config/compiler.go, pkg/config/README.md
+## 2026-06-25 — #2971: Surface A DDNS corrupt ownership state fail-closed
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed #2971 (codex-review-057 finding 057-03). The Surface A
+  router-record `SurfaceAManager` bypassed the #2650 degraded/quarantine
+  wrapper: `NewSurfaceAManager` called `loadDDNSState` directly and, on a load
+  error, logged a warning and proceeded with the returned EMPTY store — fail
+  OPEN. An empty trusted store made every configured scope look unowned, so the
+  next reconcile re-published EVERY scope (a write storm) — overwriting a
+  peer/manual owner and forgetting what to withdraw. Fix: load through the same
+  `loadStateOrDegrade` gate (added `degraded`/`degradedReason` to
+  `SurfaceAManager` + `SurfaceAStats`); `Reconcile` now fails CLOSED while
+  degraded (no publish/withdraw/save, error returned). A MISSING file (first
+  boot, incl. standalone nil-gate) stays non-degraded and publishes normally.
+  Surfaced as a CLI + gRPC `show services dynamic-dns` ALARM and a new
+  `xpf_ddns_surface_a_degraded` Prometheus gauge.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/surface_a_test.go,
+  pkg/cli/cli_show_services.go, pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_system.go,
+  pkg/ddns/README.md
+- **Validation**: go build ./...; go vet ./pkg/ddns/...; go test
+  ./pkg/ddns/... ./pkg/daemon/... ./pkg/api/... ./pkg/cli/... ./pkg/grpcapi/...
+  all green; new TestSurfaceACorruptStateFailsClosed +
+  TestSurfaceAUnsupportedVersionFailsClosed go RED when the constructor is
+  reverted to fail-open (the revert log shows the spurious "published record"
+  write); TestSurfaceAAbsentStateFirstBootStandaloneWrites stays green on revert.
+- **2026-06-25**: #3114 — reject unsupported security-policy `then permit` children at commit (fail-closed). Added `validatePolicyThenPermitStrict` (AST pre-walk in `compileExpanded`, sibling of #3113) hard-rejecting a policy whose `then permit` arm carries a child the compiler does not enforce — e.g. `application-services` (UTM/IDP/AppFW/SSL-proxy), `firewall-authentication`, `tunnel ipsec-vpn`. The `permit` arm in `compilePolicy`'s `then` switch set `pol.Action = PolicyPermit` and never inspected the permit node's children/tail, so the modifier was SILENTLY DROPPED, turning a permit-only-with-inspection rule into an unconditional permit (fail-open). Checks both AST shapes (flat-set collapses modifier onto `permit` `Keys[1]`; hierarchical nests it as a child). Allowlist `supportedPolicyThenPermitChildren` is EMPTY (compiler enforces no permit child today). Strict on `CompileConfig`; lenient-warn on both lenient constructors via new `lenientPolicyThenPermit` flag (#1960). Covers zone-pair AND global policies. Files: pkg/config/compiler_policy_then.go (new), pkg/config/compiler_policy_then_3114_test.go (new), pkg/config/compiler.go, pkg/config/README.md
+## 2026-06-26 — #3091: VLAN-child netdevs collapsed the queue-plan min to 1 worker
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fixed a HIGH forwarding regression (~6-7 Gbps). The
+  bondless-RETH WAN VLAN units `reth0.50`/`reth0.80` (Linux
+  `ge-0-0-2.50`/`ge-0-0-2.80`) are software VLAN netdevs with 1 RX queue
+  each. They entered `replan_queues`' candidate list (their `ge-` name
+  passes `include_userspace_binding_interface`; the #1921 `seen_linux`
+  dedup misses them because their netdev name differs from the physical
+  parent `ge-0-0-2`). `queue_count = min(6, 1, 1, 6, 6) = 1` → 1 worker.
+  Added a VLAN-child dedup (`vlan_child_parent_netdev` +
+  `snapshot_has_parent_candidate`): a VLAN child whose physical parent is
+  a candidate is skipped (the parent's 6 hardware queues carry its tagged
+  frames); an orphan VLAN child is re-keyed onto the parent's hardware
+  queue count. Hashed `vlan_id` + `parent_linux_name` into the binding
+  plan key (#2915/#2916 invariant). Two fail-on-revert Rust tests.
+- **File(s)**: userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/main_tests.rs, userspace-dp/README.md, _Log.md
+- **Validation**: `cargo build --release` clean; `cargo test --release`
+  3027 passed. Live on loss userspace cluster: `planned_workers` 1 → 6
+  (5 → 18 bindings), RSS restored to default 6-ring spread (no narrow),
+  ping 0% loss, iperf3 P=12 v4 7.1 → 23.0 Gbps, v6 22.9 Gbps. Manual
+  `ethtool -X ... weight 1 0 0 0 0 0` RSS workaround removed (no longer
+  needed).
+
+## 2026-06-25 — #3117: security-policy `scheduler-name` added to set-schema
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed codex-review-066 finding 066-05. A security-policy
+  `scheduler-name <name>` is compiled (`compiler_security.go`, both zone-pair
+  and global policies) and an undefined reference is strict-rejected at commit
+  (`validatePolicySchedulerReferencesStrict`), but the leaf was ABSENT from
+  `setSchema` — so it had no structural / value-slot `?` completion, violating
+  the two-SSOT rule that every compiled + validated leaf lives in the schema
+  tree. Declared `scheduler-name` under both the zone-pair policy node and the
+  global policy node as an untyped (plain string) leaf, sibling of
+  `description`/`match`/`then`. The strict reference check remains the SSOT for
+  undefined-scheduler rejection (no `treeValidator` added; no compiler/validator
+  behaviour change). Added fail-on-revert completion + schema-accept tests.
+- **File(s)**: pkg/config/schema_security.go,
+  pkg/config/schema_scheduler_name_3117_test.go, docs/config-schema.md, _Log.md
+
+- **2026-06-25**: #3113 — reject unsupported security-policy `match` leaves at commit (fail-closed). Added `validatePolicyMatchLeavesStrict` (AST pre-walk in `compileExpanded`) hard-rejecting a policy whose `match` clause carries a leaf outside the compiler-enforced allowlist (`source-address`, `destination-address`, `source-address-excluded`, `destination-address-excluded`, `application`) — e.g. `dynamic-application`/`url-category`/`source-identity`, which were silently dropped, widening the policy to a broad L3/L4 permit/deny (fail-open). Strict on `CompileConfig`; lenient-warn on both lenient constructors via new `lenientPolicyMatchLeaves` flag (#1960). Covers zone-pair AND global policies. Files: pkg/config/compiler_policy_match.go (new), pkg/config/compiler_policy_match_3113_test.go (new), pkg/config/compiler.go, pkg/config/README.md
+## 2026-06-25 — #3116: simulator port validation across REST/gRPC/CLI
+
+- **Timestamp**: 2026-06-25
+- **Action**: Reject out-of-range/negative/malformed ports in the
+  match-policies simulator instead of silently coercing to the 0 "any
+  port" wildcard. Added shared `policymatch.ValidatePort(int)` (0 =
+  unspecified, 1..65535 valid) and `policymatch.ParsePort(string)` (CLI
+  token; empty = unspecified, else parse+validate). Applied: REST adds
+  `ValidatePort` after `queryIntStrict` for dst_port/src_port (400 on
+  >65535); gRPC validates `SourcePort`/`DestinationPort` int32 before the
+  Query (InvalidArgument on negative/>65535); CLI `test policy` and
+  `show security match-policies` route destination-port/source-port
+  through `ParsePort` (command error on malformed/out-of-range), no longer
+  ignoring the Atoi error. Valid (1..65535) and absent ports unchanged.
+- **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/port_test.go,
+  pkg/policymatch/README.md, pkg/api/security.go,
+  pkg/api/rest_filter_failclosed_test.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_cluster_test.go, pkg/cli/cli_request.go,
+  pkg/cli/cli_show_security.go, pkg/cli/policymatch_port_test.go
+
+## 2026-06-25 — #3103: gRPC ShowText `test-policy:` routed through pkg/policymatch
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed codex-review-065 finding 065-01. The gRPC `ShowText`
+  `test-policy:` handler (`grpcapi.showTestPolicy`) — the backing handler for
+  the remote `cli` `test policy` command — was the ONE match-policies surface
+  #3042 missed. It still used the pre-#3042 bespoke `matchShowPolicyAddr` /
+  `matchShowPolicyApp` shadow matcher and hard-coded "Default deny" on a miss,
+  so it could report the OPPOSITE verdict from the runtime (missed predefined
+  apps, literal CIDRs, exclusions, feed overlay; ignored `default-policy
+  permit-all`). Rerouted it through `policymatch.Match` (passing the live feed
+  overlay via `Server.feedOverlayFn`, mirroring `MatchPolicies`); deleted the
+  bespoke `matchShowPolicy*` helpers + the now-unused `policyActionName` and the
+  `strconv` import from `server_cluster.go`. Output format preserved except the
+  default line now reflects the configured default-policy.
+- **File(s)**: pkg/grpcapi/server_show_firewall.go,
+  pkg/grpcapi/server_cluster.go, pkg/grpcapi/test_commands_test.go,
+  pkg/grpcapi/server_cluster_test.go, pkg/policymatch/README.md
+- **Validation**: go build/vet clean; `go test ./pkg/grpcapi/...
+  ./pkg/policymatch/... ./pkg/cli/...` 308 pass; gofmt clean. Fail-on-revert
+  proven: restoring origin/master's bespoke matcher turns the new
+  `TestShowTestPolicyAgreesWithRuntimeOnFixedCases` RED on all three sub-cases
+  (predefined-app permit, global-policy fallback, default-policy permit-all).
+- **Note (out of scope)**: `showTestPolicy` parses only `port=` (destination)
+  and `proto=`; it cannot express a source port (#3107) and does not validate
+  the protocol token (#3108). Left untouched for those issues.
+
+## 2026-06-25 — #2881: commit-time reject undefined policy community references
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add `validatePolicyCommunityReferencesStrict` reject-at-commit
+  gate. A policy-statement term's `from community <name>` (rendered FRR `match
+  community <name>`) and `then community delete <name>` (the #2848 strip-by-list
+  operation, rendered `set comm-list <name> delete`) reference an FRR
+  `bgp community-list <name>` that pkg/frr emits ONLY from a defined
+  `policy-options community <name>`. An undefined reference committed cleanly,
+  then the dangling line failed the WHOLE frr-reload of the managed section,
+  leaving dynamic routing stale (#1960-class commit-accepted-but-unloadable).
+  New validator runs on the fully-compiled `*Config`, hard-rejects on the strict
+  commit/commit-check path naming the policy, term, and missing community;
+  downgrades to a cfg.Warnings entry on the lenient load/peer-sync path
+  (`lenientPolicyCommunityRef`) so an already-persisted/peer-synced config still
+  boots. SURGICAL — only NAME refs checked; `then community (set|add) <value>`
+  carries a community VALUE, not a list ref, so it is not validated.
+- **File(s)**: pkg/config/compiler.go (compileOpts flag + 2 lenient blocks +
+  call site), pkg/config/compiler_validate_strict.go (validator),
+  pkg/config/policy_community_ref_test.go (new fail-on-revert tests),
+  pkg/config/policy_from_multileaf_2689_test.go,
+  pkg/config/compiler_policy_term_multimatch_2642_test.go,
+  pkg/config/parser_security_test.go, pkg/frr/frr_test.go (pre-existing tests:
+  define the communities they reference), pkg/config/README.md,
+  pkg/frr/README.md.
+- **Validation**: go build ./..., go vet ./pkg/config/... ./pkg/frr/...,
+  go test ./pkg/config/... ./pkg/frr/... (1806 pass). Fail-on-revert: removing
+  the validator call turns the 3 reject tests + lenient-warn test RED.
+
+- **2026-06-26T03:54:14Z**: Fix master-CI-red pkg/configstore TestCopyConfig — removed incidental `interfaces eth0.0` from the trust zone fixture. #3072/#3083's interface-multi-zone commit gate (merged this session) correctly rejects a Copy of a zone-with-interface (the interface lands in both trust and trust2). The interface was incidental to the Copy test. File: pkg/configstore/store_test.go
+
+## 2026-06-25 — #2993: feeds mixed valid/invalid body installs a partial set silently
+- **Action**: parseFeed now counts skipped malformed lines (invalidLines) +
+  bounded sample (invalidSample, maxInvalidSample=5); FeedInfo gains
+  InvalidLines/InvalidSample/Degraded. installSnapshot records them and logs
+  one slog.Warn on a degraded content change; recordFailure drop-to-empty
+  clears them. show security dynamic-address (CLI + grpcapi) prints a DEGRADED
+  line. Clean feeds unchanged (0 invalid, not degraded). Contract: skip-with-
+  count + degraded status (issue primary direction; observable, not silent).
+- **File(s)**: pkg/feeds/feeds.go, pkg/feeds/feeds_test.go,
+  pkg/feeds/README.md, pkg/cli/cli_show_security_objects.go,
+  pkg/grpcapi/server_show_security_text.go
+## 2026-06-25 — #2972: ddns surface-a RG0/non-HA scope double-write in active-active HA
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `surfaceAGate` admitting every `RGOwner==0` (RG0/non-HA)
+  Surface A scope unconditionally. In active-active HA both nodes pass the
+  node-level writer gate (each masters some RG) and both built+published the
+  identical non-HA FQDN — a public A/AAAA flap when the nodes observe different
+  WAN addresses. `RGOwner==0` is now tied to RG0 (control-plane RG) ownership
+  via new helper `surfaceARG0Writer`: the RG0-primary node is the single writer
+  and it follows RG0 failover; when RG0 is untracked (data-RG-only cluster or
+  pre-first-election) it falls back to the lowest-node-ID writer. Standalone
+  (nil gate) still writes every scope. DHCP-lease DDNS is unchanged (its
+  per-node memfiles are already master-filtered, so its `RGOwner==0` case has no
+  peer). Added fail-on-revert tests `TestSurfaceAGateRG0SingleWriter`
+  (active-active + failover) and `TestSurfaceAGateRG0FallbackNoRG0`; updated
+  `TestSurfaceAGatePerRG` for the new semantic.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
+  pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md
+## 2026-06-25 — #2933: commit-time reject ambiguous secure-tunnel bind-interface aliases
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add `validateSecureTunnelBindInterfaceAST` reject-at-commit gate.
+  Two VPNs binding two DISTINCT bind-interface strings that derive the SAME
+  XFRM if_id (e.g. `st0` and `st0.0`, both if_id 1 via `XFRMIfNameAndID`)
+  committed cleanly but collide at apply time (#2929 routing guard refuses
+  EITHER device → both tunnels down). New AST pre-walk in `compileExpanded`
+  hard-rejects on the strict commit/commit-check path naming each offending
+  bind-interface string, its VPN(s), and the shared if_id; downgrades to a
+  cfg.Warnings entry on the lenient load/peer-sync path
+  (`lenientSecureTunnelBindIface`) so an already-persisted config still boots
+  (#1960). Surgical: same-string-shared-by-many-VPNs and unparseable bindings
+  are NOT rejected; st0.0+st0.1 / st0+st1 commit cleanly.
+- **File(s)**: pkg/config/compiler_ipsec_bindiface.go (new),
+  pkg/config/compiler_ipsec_bindiface_2933_test.go (new),
+  pkg/config/compiler.go (compileOpts flag + call site + warn append),
+  pkg/config/README.md.
+- **Validation**: go build ./..., go vet ./pkg/config/..., go test
+  ./pkg/config/... (1578 passed). Fail-on-revert confirmed (stub returning
+  nil turns reject + lenient tests RED). gofmt clean.
+
+## 2026-06-25 — #2936: cap session aggregator cardinality (control-plane DoS amplifier)
+
+- **Timestamp**: 2026-06-25 19:48
+- **Action**: Bounded `SessionAggregator` source/dest maps by config, not
+  traffic. Added `maxKeys` (default `defaultMaxAggKeys`=10000) admission cap
+  in `Add()`: existing keys keep aggregating, new keys past the cap are
+  dropped and counted in `droppedSrc`/`droppedDst`. `Flush`/`flushWithDropped`
+  swap the dropped counters atomically with the maps; `flushAndLog` emits a
+  warning-severity `RT_FLOW_SESSION_AGGREGATE dropped-keys ...` line when the
+  cap is hit (incident indicator). Below-cap traffic is behavior-preserving.
+  Fail-on-revert test `TestSessionAggregator_CardinalityCap` + below-cap
+  `TestSessionAggregator_BelowCapUnchanged`. Filed Space-Saving top-K
+  accuracy follow-up #3099 (deferred, not required for the DoS fix).
+- **File(s)**: pkg/logging/aggregator.go, pkg/logging/aggregator_test.go,
+  pkg/logging/README.md, _Log.md
+
+## 2026-06-25 — #2911: reject backup-router explicit destination family-mismatch at commit
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2907 (#2891) made the EMPTY backup-router destination default
+  next-hop-family-aware (v6 next-hop → `::/0`). But an EXPLICIT destination
+  whose family MISMATCHES the next-hop — e.g. `backup-router 2001:db8::1`
+  + `destination 0.0.0.0/0` — still renders an FRR-invalid static line
+  (`ipv6 route 0.0.0.0/0 2001:db8::1 250`); frr-reload rejects it and fails
+  the ENTIRE static config load, the exact breakage #2907 set out to prevent.
+  Added `validateBackupRouterDst` (`compiler_system.go`): classifies the
+  next-hop and explicit-destination families (reusing `natAddrFamily` /
+  `natCIDRIPPart`) and hard-rejects a mismatch at commit, naming both
+  addresses and families. Strict-with-lenient #1960 split — the tolerant
+  load / peer-sync paths downgrade to a `cfg.Warnings` entry via the new
+  `lenientBackupRouterDst` flag (wired into `CompileConfigLenient` +
+  `CompileConfigForNodeLenient`) so an already-persisted bad config still
+  boots. Empty destination is left to #2907's default (never rejected);
+  matched-family explicit destinations pass.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_system.go,
+  pkg/config/backup_router_family_2911_test.go (new), pkg/config/README.md,
+  pkg/frr/README.md
+- **Validation**: `go build ./...`, `go vet ./pkg/config/... ./pkg/frr/...`,
+  `go test ./pkg/config/... ./pkg/frr/...` (1790 pass). Fail-on-revert:
+  stubbing the validator to `return nil` turns the 4 reject/lenient-warn
+  tests RED; restoring it returns GREEN.
+## 2026-06-25 — #2956: reap superseded Surface A HTTP transports on binding change
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added `httpClientCache.reap(live)` + `closeIdleConns` seam +
+  `size()` (pkg/ddns/backend_http.go); `SurfaceAManager.Reconcile` now computes
+  the set of binding keys still referenced by the committed config (configured
+  scopes' providers + catalog providers + unbound default) and reaps any cached
+  client whose key is gone — closing its idle-connection pool and dropping the
+  map entry — so the per-binding cache stays bounded under binding churn (#2904
+  left the superseded entry to linger for the daemon lifetime). Added
+  FAIL-ON-REVERT tests (close+evict via seam, all-live-kept, churn integration).
+  Updated pkg/ddns/README.md.
+- **File(s)**: pkg/ddns/backend_http.go, pkg/ddns/surface_a.go,
+  pkg/ddns/surface_a_httpcache_reap_2956_test.go, pkg/ddns/README.md, _Log.md
+
+## 2026-06-25 — #3079: reject NAT rule-set interface/routing-instance scope at commit
+
+- **Timestamp**: 2026-06-25
+- **Action**: A `security nat {source|destination|static}` rule-set whose
+  `from`/`to` clause scoped traffic by `interface` or `routing-instance`
+  (instead of the only enforced `zone`) committed cleanly but had its scope
+  SILENTLY DISCARDED — `parseZoneList` (`compiler_nat.go`) returns only `zone`
+  children and every caller widens an empty zone list to the match-any wildcard
+  `[]string{""}`, so the rule-set applied GLOBALLY, leaking translated sessions
+  across the routing boundary (a security/isolation failure). Added the interim
+  fail-closed gate `validateNATRuleSetScopeAST` (`compiler_nat_scope.go`): an
+  AST pre-walk in `compileExpanded` that hard-rejects the unsupported scope at
+  commit/commit-check (strict), naming the kind/rule-set/direction/keyword/value,
+  and downgrades to a `cfg.Warnings` entry on the tolerant load/peer-sync paths
+  (`lenientNATRuleSetScope`) so an already-persisted config still boots (#1960).
+  `from`/`to` `zone` and the no-from/to global case stay accepted. Full
+  interface-/routing-instance-scoped NAT matching is deferred to a follow-up
+  issue. Same reject-at-commit pattern as #3018/#3055/#3060.
+- **File(s)**: pkg/config/compiler_nat_scope.go (new),
+  pkg/config/compiler_nat_scope_3079_test.go (new), pkg/config/compiler.go
+  (compileOpts flag + compileExpanded call + lenient wiring), pkg/config/README.md
+- **Validation**: `go build ./...` clean; `go vet ./pkg/config/...` clean;
+  `go test ./pkg/config/...` 1559 passed; gofmt clean. Fail-on-revert confirmed:
+  stubbing the validator to `return nil, nil` turns all 8 reject sub-tests + the
+  lenient-warns test RED; restoring → GREEN.
+## 2026-06-25 — #3042: consolidate the match-policies simulator into one shared matcher
+
+- **Timestamp**: 2026-06-25
+- **Action**: Replaced the three divergent hand-written `match-policies`
+  shadow matchers (REST `matchPoliciesHandler`, gRPC `MatchPolicies`, CLI
+  `showMatchPolicies` — plus the sibling CLI `test policy`) with thin
+  adapters over a single shared simulator, `pkg/policymatch`. The new
+  matcher replicates the runtime evaluator (`userspace-dp/src/policy.rs`):
+  zone-pair → global → configured `default-policy` (not a hard-coded deny),
+  predefined apps + multi-level application-sets (`ResolveApplication` /
+  `ExpandApplicationSet`), literal CIDRs, `any-ipv4`/`any-ipv6`,
+  source/destination exclusion (empty-excluded fail-closed), source+dest
+  port terms, and the live dynamic-address feed overlay. Added a
+  `source_port` field to `MatchPoliciesRequest` (proto regen) and a
+  `FeedOverlayFn`/`src_port` to the REST + gRPC surfaces; the daemon wires
+  the live overlay via `feedSnapshotsForConfig`. Removed the now-dead narrow
+  helpers from `pkg/api`, `pkg/grpcapi`, `pkg/cli`.
+- **File(s)**: pkg/policymatch/policymatch.go (new),
+  pkg/policymatch/policymatch_test.go (new), pkg/policymatch/README.md (new),
+  pkg/api/security.go, pkg/api/server.go, pkg/api/README.md,
+  pkg/grpcapi/server_cluster.go, pkg/grpcapi/server.go, pkg/grpcapi/README.md,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_request.go, pkg/cli/cli_helpers.go,
+  pkg/cli/README.md, pkg/daemon/daemon_run.go, proto/xpf/v1/xpf.proto,
+  pkg/grpcapi/xpfv1/xpf.pb.go (regen).
+- **Fold (review MERGE-NEEDS-MINOR)**: restored the matched-policy
+  `Description` line that the local interactive `show security
+  match-policies` printed before #3042. Added a `Description` field to
+  `policymatch.Result`, populated from the matched policy (zone-pair AND
+  global) in `matchedResult`, and reprinted it (`if Description != ""`) in
+  the show handler. `test policy` output unchanged (it never printed it).
+  Pinned by `TestMatchedResultCarriesDescription`.
+
+## 2026-06-25 — #3018: reject wildcard from-zone/to-zone `any` policy at commit
+
+- **Timestamp**: 2026-06-25
+- **Action**: An ordinary zone-pair security policy whose `from-zone` or
+  `to-zone` is the literal Junos wildcard `any` committed cleanly (the #2401
+  reference gate exempts `any`) but the userspace dataplane never indexed it —
+  `PolicyState::from_snapshots` only indexes a rule when both zones resolve to a
+  declared zone-id, and `any` is never inserted into `zone_name_to_id`. Result:
+  an admitted-but-unenforced policy (silent fail-OPEN under a permit default).
+  Added `validatePolicyWildcardZoneStrict` (strict reject at commit, lenient
+  downgrade to a `cfg.Warnings` entry via `lenientPolicyWildcardZone` so an
+  already-persisted/peer-synced config still boots — #1960 no-brick). Interim
+  contract; full wildcard-zone runtime indexing deferred to a follow-up issue.
+  Flipped `TestPolicySpecialZoneTokensCommit` (no longer asserts `any` commits)
+  and added `TestPolicyWildcardZoneFailsCommit` +
+  `TestPolicyWildcardZoneLenientDowngradesToWarning`. Updated comments on
+  `reservedZoneNames`/`policyZoneSpecialTokens` (the "treats it as match-any"
+  claim was false) + a README section.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/policy_zone_ref_test.go, pkg/config/README.md, _Log.md
+
+## 2026-06-25 — #3032: cache SYN-cookie epoch wall clock once per second
+
+- **Timestamp**: 2026-06-25
+- **Action**: `SynCookieCodec::current_full_epoch()` read `SystemTime::now()`
+  on every minted/validated cookie — redundant CPU exactly under a SYN flood
+  since the cookie epoch is 64s wide. Made the leaf pure
+  (`current_full_epoch(now_secs)` = `full_epoch_from_unix_secs(now_secs)`) and
+  moved the OS clock read into `ScreenState::current_syn_cookie_full_epoch`,
+  gated to fire at most once per monotonic second (keyed by the batch-cached
+  monotonic `now_secs` already threaded into `check_packet_with_zone_id` and the
+  standby-ACK path). CLOCK-DOMAIN: the batch `now_secs` is `CLOCK_MONOTONIC`
+  (per-node, unrelated across HA peers); the cookie epoch needs Unix wall-clock
+  (NTP-synced) so a cookie minted on one node validates on its peer. So the
+  monotonic second is used ONLY as the refresh throttle; the cached value seeded
+  into the epoch is `SystemTime::now()` wall-clock seconds. Both call sites
+  (mint ~388, standby-ACK validation ~594) share one cached wall-second per
+  second; the ±1-epoch (±64s) validation window absorbs the ≤1s cache staleness.
+- **File(s)**: userspace-dp/src/screen/syncookie.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  docs/syn-cookie-flood-protection.md, _Log.md
+- **Validation**: cargo build --release -p xpf-userspace-dp (0 errors); cargo
+  test --release -p xpf-userspace-dp → 3022 passed, 2 ignored (a later run saw
+  2 unrelated afxdp concurrency flakes — wg::engine reconcile_peers_snapshot
+  and worker_queue concurrent_recovery — both pass in isolation; screen suite
+  137/137 green). Three tests:
+  `syn_cookie_current_full_epoch_is_pure_wall_clock_passthrough` (pins the leaf
+  == full_epoch_from_unix_secs for sample seconds — leaf-level guard) and
+  `syn_cookie_round_trip_with_cached_wall_secs` (mint/validate round-trip across
+  the ±1-epoch window; 2 epochs ahead fails as before — codec-level guard).
+  REVIEW FOLD: added `syn_cookie_screen_state_epoch_uses_wall_clock_not_monotonic`
+  — drives `ScreenState::current_syn_cookie_full_epoch(mono=5)` (no test
+  override) and asserts the returned epoch equals the LIVE Unix wall-clock epoch
+  (anchored via `read_unix_wall_secs()`, bracketed for 64s-boundary tolerance)
+  and is NOT `full_epoch_from_unix_secs(5)` and not 0. This is the call-site
+  clock-domain guard the leaf tests could not provide: reverting the call site to
+  `current_full_epoch(mono_now_secs)` was empirically verified RED→GREEN (RED:
+  "epoch must come from the live Unix wall clock (27850618..=27850618), got 0").
+
+## 2026-06-25 — #3060: reject accepted-but-inert bare `then log` at commit
+
+- **Timestamp**: 2026-06-25
+- **Action**: A bare security-policy `then log` (no session-init/session-close)
+  compiled to a non-nil `PolicyLog` with both flags false — reported as
+  logging-enabled over REST/gRPC/CLI but emitting NO session records (silent
+  audit gap). Added `validatePolicyLogActionStrict` (strict-with-lenient
+  #1960/#3043 pattern): hard-rejects bare `then log` at commit (Junos parity —
+  session-init/session-close required), covering both zone-pair AND global
+  policies; downgraded to a `cfg.Warnings` entry on the two lenient
+  constructors via `lenientPolicyLogAction` so a persisted/peer-synced config
+  still boots. Rejecting at commit moots the REST/gRPC/CLI display divergence.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/policy_log_action_3060_test.go,
+  pkg/config/README.md, _Log.md
+
+## 2026-06-25 — #3040: route event-log protoName through appid.ProtocolName SSOT
+
+- **Timestamp**: 2026-06-25
+- **Action**: Replaced the local 4-protocol (tcp/udp/icmp/icmpv6) map in
+  `pkg/logging/ringbuf.go`'s `protoName` with the shared
+  `appid.ProtocolName` SSOT (the same table REST #2949 and gRPC #3037 use),
+  so GRE(47)/ESP(50)/IPIP(4)/IPv6(41) security event-log (RT_FLOW / ring
+  buffer) rows render named (GRE/ESP/IPIP/IPV6) instead of numeric. Casing
+  is preserved (upper-case, ICMPv6 mixed-case for the trace contract);
+  unknown protocols keep the numeric fallback. Added `protoname_test.go`
+  fail-on-revert pin (reverting to the 4-protocol set turns proto 47/50/4/41
+  RED). Confirmed the cross-package `TestRawEventContractMatchesDataplaneEvent`
+  screen-flag contract is untouched. Updated `pkg/logging/README.md` Gotchas.
+- **File(s)**: pkg/logging/ringbuf.go, pkg/logging/protoname_test.go,
+  pkg/logging/README.md, _Log.md
+## 2026-06-25 — #3067: ICMP pseudo-port only for identifier-bearing query types
+
+- **Timestamp**: 2026-06-25
+- **Action**: `parse_flow_ports` no longer treats ICMP/ICMPv6 header bytes
+  [l4+4, l4+6) as a pseudo source port for ALL ICMP types. Those bytes are
+  the Identifier only for the query types (ICMPv4 Echo + Timestamp +
+  Information, ICMPv6 Echo). For errors / Redirect / ND-MLD the same bytes
+  are a gateway address / next-hop MTU / pointer / unused field. The arm now
+  reads the type byte at `l4` (bounded by `declared_end`) and returns `None`
+  (flowless) for every non-query type, so transit ICMP control packets take
+  the route-based session-less path instead of installing a bogus
+  identifier-keyed session (session-table pollution / spurious collisions).
+  Matching ICMP errors to the embedded inner flow stays out of scope (#2393).
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs (fix),
+  userspace-dp/src/afxdp/frame/inspect_tests.rs (5 new tests, fail-on-revert
+  RED→GREEN verified), userspace-dp/src/afxdp/frame/README.md,
+  userspace-dp/src/filter/README.md (doc), _Log.md
+- **Validation**: `cargo build --release -p xpf-userspace-dp` clean;
+  `cargo test --release inspect` 36 passed; reverting the type
+  discrimination turns the two non-query assertions RED while echo stays
+  green.
+
+## 2026-06-25 — #3055: reject a security zone using a reserved sentinel name
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added a commit-time strict validator
+  (`validateReservedZoneNamesStrict`) that hard-rejects a `security zones
+  security-zone <name>` whose name is a reserved sentinel — `junos-global`,
+  `any`, or `junos-host`. A zone literally named `junos-global` was accepted at
+  commit, but `userspace-dp/src/policy.rs` string-matches a from/to-zone equal
+  to `junos-global` and reclassifies the policy as a device-wide global fallback
+  (`JUNOS_GLOBAL_ZONE_ID = u16::MAX`) evaluated for every flow — so the zone's
+  scoped policies silently became device-wide permits across unrelated zone
+  pairs (security-boundary escape). Introduced `reservedZoneNames`
+  (`{junos-global, any, junos-host}`) used ONLY by the new definition gate.
+  Strict on commit/commit-check; downgraded to a warning on the tolerant
+  load/peer-sync paths via `lenientReservedZoneNames` (#1960 no-brick),
+  mirroring the #3066/#2401 pattern.
+- **Review fold (hostile review, MERGE-NEEDS-MINOR)**: the first cut
+  re-derived `policyZoneSpecialTokens` (the #2401 zone-REFERENCE exemption set)
+  from `reservedZoneNames`, which silently ADDED `junos-global` to the
+  reference-exempt set — re-opening the device-wide-permit class via the
+  reference path (an undefined `from-zone junos-global` reference would become
+  exempt and reach `policy.rs:1021`). DECOUPLED the two sets: the
+  reference-exempt set is reverted to its exact master literal `{"", any,
+  junos-host}` (still OMITS junos-global, so such a reference stays
+  hard-rejected + warned). Added `TestJunosGlobalNotReferenceExempt` to pin the
+  decoupling against a future re-unify.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/reserved_zone_name_3055_test.go,
+  pkg/config/README.md, _Log.md
+- **Validation**: `go build ./...`, `go vet ./pkg/config/...`,
+  `go test ./pkg/config/...` (1519 passed), `gofmt -l` clean. Fail-on-revert
+  confirmed: (a) stubbing `validateReservedZoneNamesStrict` to `return nil`
+  turns the three definition reject/lenient tests RED while the ordinary-name
+  test stays GREEN; (b) re-unifying `policyZoneSpecialTokens` with
+  `reservedZoneNames` turns `TestJunosGlobalNotReferenceExempt` RED.
+
+## 2026-06-25 — #3072: reject an interface assigned to multiple security zones
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added commit-time strict validation rejecting an interface
+  assigned to more than one security zone. Previously
+  `pkg/dataplane/userspace.buildInterfaceZoneMap` silently resolved a
+  duplicate first-writer-wins over the SORTED zone names, so a
+  multi-zone interface landed in whichever zone sorts first and traffic
+  was evaluated against the wrong zone's policy. New
+  `validateZoneInterfaceMembershipStrict` (+ `zoneIfaceLogicalKeys`
+  helper mirroring the base/unit expansion) hard-rejects at commit,
+  naming the interface and both conflicting zones; `lenientZoneInterface
+  Membership` downgrades to a warning on the tolerant load/peer-sync
+  paths (keeps deterministic first-writer-wins so a persisted config
+  still boots — #1960 doctrine). Distinct units of one physical
+  interface across zones (valid VLAN split) are NOT rejected; a bare
+  interface + one of its units across zones ARE. Fail-on-revert test
+  file `zone_interface_membership_test.go` (RED with the validator
+  neutralized). Updated pkg/config README.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/zone_interface_membership_test.go,
+  pkg/config/README.md, _Log.md
+## 2026-06-25 — #3065: unspecified default-policy fails CLOSED (deny-all) + reject-all + schema leaf
+
+- **Timestamp**: 2026-06-25
+- **Action**: Flipped the implicit no-match security default from permit-all
+  to deny-all (Junos `default-security-policy` parity, fail-closed). The
+  `PolicyAction` zero value is `PolicyPermit`, so an unset
+  `security policies default-policy` stanza was shipping permit-all to the
+  dataplane (the snapshot string `policyActionString` → Rust `parse_action`
+  → `PolicyState.default_action` no-match verdict). Fix: (1) `CompileConfig`
+  now initializes `SecurityConfig.DefaultPolicy = PolicyDeny`; (2) added a
+  `reject-all` → `PolicyReject` case to the `compilePolicies` switch (it
+  previously fell through and was silently ignored); (3) added a typed
+  `ValueEnumOf` `default-policy` leaf under `policies` in
+  `schema_security.go` so a bogus value fails `commit check`. No Rust change
+  needed — the Rust struct default was already `Deny`; the Go zero value was
+  the override. Added fail-on-revert tests
+  `compiler_default_policy_3065_test.go` (config) +
+  `default_policy_3065_test.go` (userspace snapshot string), both verified
+  RED when the init is reverted. Full `go test ./...` green (6163+ tests),
+  no fixture relied on the implicit permit-all. Updated pkg/config README +
+  docs/config-schema.md (#3065 section).
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_security.go,
+  pkg/config/schema_security.go,
+  pkg/config/compiler_default_policy_3065_test.go,
+  pkg/dataplane/userspace/default_policy_3065_test.go,
+  pkg/config/README.md, docs/config-schema.md, _Log.md
+## 2026-06-25 — #3066: undefined zone screen-profile reference is now a commit-time hard reject
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add `validateScreenProfileReferencesStrict` (#3066). A security
+  zone whose `screen <name>` references an undefined screen-ids-option profile
+  was only WARNED at commit while the Rust dataplane fails OPEN
+  (`screen/mod.rs` returns `ScreenVerdict::Pass` for a missing profile),
+  silently disabling all screen protection for that zone. Promoted to a
+  fail-closed commit/commit-check hard reject mirroring
+  `validatePolicyZoneReferencesStrict` (#2401); tolerant load/peer-sync path
+  downgrades to a warning via new `lenientScreenProfileRefs` flag (#1960
+  no-brick). Fail-on-revert test `screen_profile_ref_test.go` (RED without the
+  strict gate). Fixed two pre-existing tests that referenced an undefined
+  screen profile (`TestSetPathSchema`, `TestZoneSetSyntax`) by defining the
+  referenced profile.
+- **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/screen_profile_ref_test.go, pkg/config/parser_ast_test.go,
+  pkg/config/parser_security_test.go, pkg/config/README.md
+## 2026-06-25 — #3049: source-NAT pool subnet expanded to full CIDR range
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed source-NAT pool subnet truncation. The Rust parser
+  `parse_source_nat_rules_with_previous` stripped the mask off a pool
+  address and kept a single `IpAddr`, so a subnet-style pool like
+  `203.0.113.0/28` (16 addresses) collapsed to one host — severe pool/port
+  exhaustion with no operator signal. The Go compiler passes a bare prefix
+  verbatim (only `address X to Y` ranges were expanded), and the host-mask
+  commit gate covered only NAT64 pools. New `expand_pool_address` helper
+  enumerates the FULL prefix range (network..=broadcast inclusive) into
+  `pool_addresses_v4`/`v6` so the port allocator round-robins/hashes across
+  the whole pool; a single-host prefix (/32, /128) still yields exactly one
+  address; an over-broad prefix beyond `MAX_POOL_PREFIX_HOSTS` (65536) is
+  rejected as `SourceNatFailureReason::InvalidPool` (fail-closed). Added 3
+  fail-on-revert tests (subnet expands to 16, host-CIDR stays 1 + v6 /120
+  → 256, over-broad /8 → invalid). Updated `userspace-dp/README.md`.
+- **File(s)**: userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests.rs,
+  userspace-dp/README.md, _Log.md
+
 ## 2026-06-25 — #3059: gRPC hit-count text includes global policies
 
 - **Timestamp**: 2026-06-25
@@ -18792,3 +19622,61 @@ top.
   per #2871. No code change. Build clean; nat:: 130 / static_nat 28 still green.
 - **File(s)**: docs/feature-coverage.md,
   userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #3076 firewall filter tcp-flags expression fail-open fix. A Junos
+  `from tcp-flags` *expression* (`"syn & !ack"`, `"ack | rst"`, etc.) committed
+  (the leaf is `multi: true` with no value validator) but the snapshot builder's
+  bare-name-only `tcpFlagsMask` lookup missed the expression token and returned
+  ok=false, so the constraint was silently dropped — the term matched regardless
+  of TCP flags (security fail-open). Added `ParseTCPFlagsExpression`
+  (pkg/config/tcp_flags.go) parsing `&`/`|`/`!`/`(`/`)` into a required-bits and
+  a forbidden-bits mask; `compileFirewall` now REJECTS at commit (fail-closed)
+  any expression the conjunctive dataplane cannot enforce (disjunction, negated
+  group, unknown flag, contradiction). Representable expressions (incl.
+  `syn & !ack`) are carried via a new `tcp_flags_forbidden` wire field through
+  the Go snapshot (protocol.go), the Rust serde struct (security.rs), the
+  compiled FilterTerm (filter/mod.rs + compiler.rs), the matcher
+  (engine/matching.rs: `(flags & required)==required && (flags & forbidden)==0`)
+  and cache-sensitivity compare (cache_sensitive.rs). Regenerated
+  protocol_wire_v1.json fixture. FAIL-ON-REVERT tests: pkg/config
+  TestParseTCPFlagsExpression + TestFirewallFilterTCPFlagsCommitReject;
+  pkg/dataplane/userspace TestFilterSnapshotTCPFlagsExpressionParsed /
+  NegationOnly; Rust tcp_flags_term_forbidden_mask_excludes_negated_flag /
+  forbidden_only_mask. Gates: go build ./... clean, gofmt clean (touched files),
+  go vet ./pkg/config + ./pkg/dataplane/userspace clean, go test pkg/config 1516
+  + pkg/dataplane 833 pass, cargo filter:: 120 + wire_invariant pass.
+- **File(s)**: pkg/config/tcp_flags.go (new), pkg/config/tcp_flags_test.go (new),
+  pkg/config/compiler_firewall.go, pkg/dataplane/userspace/filters.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/filters_per_packet_match_2362_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/filter/mod.rs,
+  userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/engine/matching.rs,
+  userspace-dp/src/filter/engine/cache_sensitive.rs,
+  userspace-dp/src/filter/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  userspace-dp/src/filter/README.md, docs/config-schema.md,
+  pkg/config/README.md, _Log.md
+- **Action**: #2853 — flowexport session-creation StartTime kept only integer
+  Unix seconds (offset 108, u32), so every flow opened in the same wall-clock
+  second exported one StartTime, flattening IPFIX flowStartMilliseconds for
+  short flows. Fix: the SESSION_CLOSE RT_FLOW frame now ALSO carries the
+  creation instant's sub-second NANOSECOND remainder (0..=999_999_999) in the
+  close-unused policy_id slot (offset 44, LE u32), produced by the new
+  monotonic_ns_to_unix_secs_subnanos helper. The Go decoder reads it as
+  EventRecord.CreatedNanos and zeroes PolicyID (a close never carried a real
+  policy id, so policy-name resolution is unchanged); flowStartTime now builds
+  time.Unix(Created, CreatedNanos) for millisecond-accurate StartTime. Gates:
+  go build ./... clean, go test ./pkg/flowexport/... ./pkg/logging/... 196
+  passed, go vet clean, gofmt clean on touched files; cargo build clean,
+  event_stream:: 58 passed. Fail-on-revert proven RED both sides (Go
+  flowStartTime→whole-second; Rust [44:48] write removed).
+- **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/codec_tests.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  userspace-dp/src/event_stream/README.md, pkg/logging/eventbuf.go,
+  pkg/logging/ringbuf.go, pkg/logging/binary_test.go,
+  pkg/flowexport/manager.go, pkg/flowexport/flowstart_test.go,
+  pkg/flowexport/README.md, _Log.md

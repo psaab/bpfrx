@@ -912,6 +912,13 @@ func (c *ctl) showMatchPolicies(args []string) error {
 					req.DestinationPort = int32(v)
 				}
 			}
+		case "source-port":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil {
+					req.SourcePort = int32(v)
+				}
+			}
 		case "protocol":
 			if i+1 < len(args) {
 				i++
@@ -922,7 +929,7 @@ func (c *ctl) showMatchPolicies(args []string) error {
 
 	if req.FromZone == "" || req.ToZone == "" {
 		fmt.Println("usage: show security match-policies from-zone <zone> to-zone <zone>")
-		fmt.Println("       source-ip <ip> destination-ip <ip> destination-port <port> protocol <tcp|udp>")
+		fmt.Println("       source-ip <ip> destination-ip <ip> source-port <port> destination-port <port> protocol <tcp|udp>")
 		return nil
 	}
 

@@ -126,8 +126,8 @@ under the daemon's errgroup. Nothing else imports this package.
   through to no-filter (which widens the query to everything — a
   cross-zone observability leak). `queryUint16Strict`/`queryIntStrict`
   (`api.go`) return `(0, false)` on a malformed non-empty value; the
-  sessions/events `zone` filter and the policy-match `dst_port` return
-  HTTP 400 instead of zeroing the predicate. The session `protocol`
+  sessions/events `zone` filter and the policy-match `dst_port`/`src_port`
+  return HTTP 400 instead of zeroing the predicate. The session `protocol`
   filter (`sessions.go` `protoFilterMatches`) is case-insensitive AND
   accepts a numeric IP protocol number (`tcp`/`TCP`/`6` all match TCP),
   mirroring gRPC (`pkg/grpcapi` `protoFilterMatches`) and CLI. The event
@@ -135,6 +135,18 @@ under the daemon's errgroup. Nothing else imports this package.
   EXACTLY (case-insensitive), not by substring — `protocol=C` no longer
   over-matches TCP/ICMP/ICMPv6. These contracts are pinned by
   `rest_filter_failclosed_test.go` in this package.
+- `GET /api/v1/security/match` (`matchPoliciesHandler`) is a THIN adapter
+  over the single shared policy simulator `pkg/policymatch` (#3042). It only
+  validates/parses inputs (400 on a malformed IP/port) and renders the
+  verdict; all matching logic lives in `policymatch.Match`, which replicates
+  the runtime evaluator (`userspace-dp/src/policy.rs`): zone-pair → global →
+  configured `default-policy` (NOT a hard-coded deny), predefined apps,
+  multi-level application-sets, literal CIDRs, `any-ipv4`/`any-ipv6`,
+  source/destination exclusion, and the live feed-prefix overlay
+  (`FeedOverlayFn`). The pre-#3042 hand-written matcher scanned only
+  zone-pair policies, hard-coded `deny (default)`, and missed predefined
+  apps / literal CIDRs — so the diagnostic could report the OPPOSITE of what
+  the dataplane enforces.
 - The SSE handler reads from `pkg/logging.EventBuffer`. The buffer is
   bounded; if a consumer stops reading, events are dropped silently — by
   design.

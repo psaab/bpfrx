@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"github.com/psaab/xpf/pkg/appid"
 )
 
 // EventCallback is called for each processed event record.
@@ -474,6 +477,14 @@ func (er *EventReader) logEvent(data []byte) {
 		// #2465: surface the absolute session-creation Unix seconds for the
 		// flow exporters (a real StartTime instead of the packet-count guess).
 		rec.Created = evt.Created
+		// #2853: the [44:48] policy_id slot is repurposed on a SESSION_CLOSE
+		// frame to carry the creation instant's sub-second nanosecond
+		// remainder. Reinterpret it as CreatedNanos and clear PolicyID so the
+		// close record's policy-name resolution (below) is the pre-#2853
+		// "no policy" value, not the nanosecond bits.
+		rec.CreatedNanos = evt.PolicyID
+		rec.PolicyID = 0
+		evt.PolicyID = 0
 		// Compute elapsed time from session creation
 		if evt.Created > 0 {
 			nowSec := uint32(evt.Timestamp / 1000000000)
@@ -769,6 +780,16 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 		// packet-count heuristic. 0 = unknown (old frame / synthesized close).
 		Created: evt.Created,
 	}
+	if evt.EventType == eventTypeSessionClose {
+		// #2853: the [44:48] policy_id slot is repurposed on a SESSION_CLOSE
+		// frame to carry the creation instant's sub-second nanosecond remainder
+		// (the dataplane never stamps a policy id on a close). Reinterpret it as
+		// CreatedNanos so the flow exporters keep millisecond StartTime
+		// resolution, and clear PolicyID so the close record's policy id/name
+		// stays the pre-#2853 "no policy" value.
+		rec.CreatedNanos = evt.PolicyID
+		rec.PolicyID = 0
+	}
 	if evt.EventType != eventTypeSessionClose {
 		rec.SessionPkts = 0
 		rec.SessionBytes = 0
@@ -1048,19 +1069,25 @@ func actionName(a uint8) string {
 	}
 }
 
+// protoName renders an IP protocol number for the security event log (RT_FLOW /
+// ring buffer surface). The named protocol SET is owned by appid.ProtocolName
+// (the #2949/#3037 SSOT shared with REST, gRPC, and the app-id catalog) so
+// GRE/ESP/IPIP/IPv6 sessions display named (gre/esp/ipip/ipv6) instead of
+// numeric, matching the other operator surfaces (#3040). Casing is an
+// event-log-local concern: this surface has always rendered upper-case
+// (TCP/UDP/ICMP/ICMPv6), so the canonical lowercase name is upper-cased here.
+// ICMPv6 keeps its mixed-case spelling to match the historical rendering (the
+// trace-filter contract test asserts "ICMPv6"). Unknown protocols fall back to
+// the numeric form the old 4-protocol helper used.
 func protoName(p uint8) string {
-	switch p {
-	case 6:
-		return "TCP"
-	case 17:
-		return "UDP"
-	case 1:
-		return "ICMP"
-	case protoICMPv6:
-		return "ICMPv6"
-	default:
+	name := appid.ProtocolName(p)
+	if name == "" {
 		return fmt.Sprintf("%d", p)
 	}
+	if p == protoICMPv6 {
+		return "ICMPv6"
+	}
+	return strings.ToUpper(name)
 }
 
 func screenFlagName(flag uint32) string {

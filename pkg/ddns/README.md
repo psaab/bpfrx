@@ -191,6 +191,25 @@ no change in those packages:
   state is surfaced as a `show ... dynamic-dns` ALARM and the
   `xpf_dhcp_ddns_degraded` Prometheus gauge so the lost cleanup authority is
   never silent.
+- **Surface A ownership state fails CLOSED too (#2971)** — the Surface A
+  (router/interface-address) `SurfaceAManager` previously BYPASSED the #2650
+  wrapper: `NewSurfaceAManager` called `loadDDNSState` directly and, on any load
+  error, logged a warning and proceeded with the returned EMPTY store — fail
+  OPEN. An empty trusted store made every configured scope look unowned, so the
+  next `Reconcile` re-published EVERY scope (a write storm) — overwriting a
+  peer/manual owner (the lost ownership can no longer veto the re-claim) and
+  forgetting the records it can no longer withdraw. `NewSurfaceAManager` (and the
+  test constructor) now load through the SAME `loadStateOrDegrade` gate: a corrupt
+  / unsupported-version / unreadable file sets `SurfaceAManager.degraded` (+
+  quarantines a corrupt/unsupported file aside), and `Reconcile` then refuses the
+  WHOLE pass (no publish, no withdraw, no `save()` — the bad file is preserved)
+  until the operator resolves it. A MISSING file (first boot) is NOT degraded, so
+  a fresh node — including a STANDALONE (nil-gate) node — still publishes
+  normally; a restart with the bad file quarantined aside re-reads an absent
+  (clean-empty) store and resumes publishing. The degraded state is surfaced as a
+  `show services dynamic-dns` Surface A ALARM (CLI + gRPC) and the
+  `xpf_ddns_surface_a_degraded` Prometheus gauge, and on `SurfaceAStats.Degraded`
+  / `DegradedReason`.
 - **No secret in any error string** (TSIG secret revealed only at construction).
 
 The HA writer gate (`ddnsWriterGateOpen`) stays in `pkg/daemon/daemon_ddns.go`
@@ -321,11 +340,28 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   connects to the host a request targets; the client carries no credential/URL —
   those live on the backend object and apply per-request). The cache invalidates
   implicitly: a commit that changes a binding leaf resolves a NEW key and builds a
-  fresh bound transport, and the stale entry is simply no longer looked up.
-  Cardinality is bounded by the number of distinct configured bindings. Backed by
-  the FAIL-ON-REVERT suite `surface_a_httpcache_2904_test.go` (same-binding reuse,
-  cross-provider same-binding reuse, per-leaf invalidation, checkip↔update shared
-  pool).
+  fresh bound transport. Cardinality is bounded by the number of distinct
+  configured bindings. Backed by the FAIL-ON-REVERT suite
+  `surface_a_httpcache_2904_test.go` (same-binding reuse, cross-provider
+  same-binding reuse, per-leaf invalidation, checkip↔update shared pool).
+- **Superseded-transport reap (#2956)** — the stale entry left behind by a
+  binding-leaf change (above) was never looked up again but also never released,
+  and the `SurfaceAManager` lives for the whole daemon lifetime, so distinct
+  historical binding tuples accumulated forever (the `*http.Transport` + its
+  idle-connection pool retained until process exit, even though `IdleConnTimeout`
+  reaps the sockets). Each `Reconcile` pass now calls `httpClientCache.reap` with
+  the set of binding keys still referenced by the committed config — every
+  configured scope's provider (the per-binding `source-address` override is
+  applied on the scope's provider copy) AND every catalog provider (used by the
+  removed-binding withdraw backend rebuild) plus the unbound default. Any cached
+  client whose key is gone has its idle pool closed (`CloseIdleConnections`, via
+  the `closeIdleConns` seam) and is dropped from the map; an active binding's key
+  is always in the live set so it is never closed (only an ACTUAL key change is
+  superseded). The reap takes the cache's own mutex (the manager's `m.mu` is the
+  outer lock, so no lock-order inversion). Backed by the FAIL-ON-REVERT suite
+  `surface_a_httpcache_reap_2956_test.go` (superseded-entry close+evict via the
+  seam, all-live-bindings-kept, and a binding-churn integration test asserting the
+  map stays bounded across N commits).
 
 **HA correctness:** the per-RG gate change MUST pass `make test-failover` (the
 project rule for any gate / HA-path change). P1b adds the gate + the
@@ -459,6 +495,25 @@ its OWN learned address — on top of the SAME spine, without forking the engine
 - **HA gate** is the SAME per-RG `ScopeGate` (a router record on a reth/virtual
   interface publishes only on the RG master; stop-writing-never-withdraw
   otherwise). Standalone (nil gate) always publishes.
+  **RG0/non-HA single-writer (#2972).** A scope on a non-HA interface attributes
+  `RGOwner==0`. Unlike DHCP-lease DDNS — where each node's Kea memfile is
+  rendered master-filtered per RG, so the two nodes' lease input sets are
+  disjoint and an `RGOwner==0` lease is genuinely a non-HA pool with no peer —
+  Surface A scopes are built directly from the active config + interface
+  observer, so BOTH nodes build the IDENTICAL `RGOwner==0` scope. The node-level
+  writer gate (`ddnsWriterGateOpen`) opens on ANY-RG mastership, so in
+  active-active HA (node0 masters RG1, node1 masters RG2) BOTH nodes passed it
+  AND — before this fix — `surfaceAGate` admitted every `RGOwner==0` scope
+  unconditionally, double-writing the same configured FQDN (the public A/AAAA
+  record flaps when the nodes observe different addresses). `surfaceAGate` (in
+  `pkg/daemon/daemon_ddns_surface_a.go`) now ties `RGOwner==0` to RG0 — the
+  control-plane redundancy group — via `surfaceARG0Writer`: exactly the
+  RG0-primary node publishes the non-HA scopes, and the single writer follows
+  RG0 failover. When RG0 is not a tracked group (a non-standard cluster with
+  only data RGs, or the brief pre-first-election window), it falls back to a
+  deterministic single writer — the lowest node ID — so the scope is never
+  double-written. (`TestSurfaceAGateRG0SingleWriter`,
+  `TestSurfaceAGateRG0FallbackNoRG0`.)
 - **Lock discipline — I/O is NEVER performed under the manager mutex (#2778).**
   `SurfaceAManager.mu` guards ALL manager state (the durable ownership store, the
   per-scope runtime cache, the counters), but it is RELEASED across every

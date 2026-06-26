@@ -1354,3 +1354,64 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 
 	return nil
 }
+
+// validateBackupRouterDst (#2911) rejects a `system backup-router` whose
+// EXPLICIT `destination` prefix is a different address family than the
+// next-hop (the backup-router IP itself).
+//
+// Background: renderBackupRouter (pkg/frr) emits a fallback default route
+//
+//	<ip|ipv6> route <destination> <next-hop> 250
+//
+// where the route-prefix keyword is keyed on the next-hop family (#2907 /
+// #2891). An explicit destination of the WRONG family therefore renders a
+// mismatched-family static — e.g. `backup-router 2001:db8::1` +
+// `destination 0.0.0.0/0` → `ipv6 route 0.0.0.0/0 2001:db8::1 250`. FRR
+// rejects a mismatched-family static route, and frr-reload fails the ENTIRE
+// static config load on that one bad line, not just the offending route. That
+// is exactly the breakage #2907 set out to prevent for the empty-destination
+// case, so the explicit-mismatch case must be caught too.
+//
+// Only an EXPLICIT destination is checked. An empty destination is left to
+// #2907's next-hop-family-aware default (v6 next-hop → ::/0, v4 → 0.0.0.0/0)
+// and is never a mismatch. Unparseable tokens are not this validator's
+// concern — they are left to the existing address handling.
+//
+// Family classification reuses natAddrFamily / natCIDRIPPart so the colon
+// test (IPv4-mapped IPv6 literal → v6) matches the rest of the compiler.
+//
+// Strict (commit / commit-check): hard-reject, naming both addresses and
+// families. Lenient (load / peer-sync): warn so an already-persisted or
+// peer-synced config an older binary accepted still boots (#1960
+// fail-closed-on-load class).
+func validateBackupRouterDst(cfg *Config, lenient bool) ([]string, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	nh := cfg.System.BackupRouter
+	dst := cfg.System.BackupRouterDst
+	// Empty next-hop → no backup-router; empty destination → #2907's
+	// family-aware default applies, never a mismatch.
+	if nh == "" || dst == "" {
+		return nil, nil
+	}
+	nhFam := natAddrFamily(nh)
+	dstFam := natAddrFamily(natCIDRIPPart(dst))
+	// One side did not parse as an IP at all — not this validator's concern.
+	if nhFam == "" || dstFam == "" {
+		return nil, nil
+	}
+	if nhFam == dstFam {
+		return nil, nil
+	}
+	msg := fmt.Sprintf(
+		"system backup-router %s destination %s: destination family (%s) "+
+			"does not match next-hop family (%s); FRR rejects a "+
+			"mismatched-family static route, which fails the entire static "+
+			"config load (frr-reload)",
+		nh, dst, dstFam, nhFam)
+	if lenient {
+		return []string{msg + " (ignored: backup-router default route not installed until corrected)"}, nil
+	}
+	return nil, fmt.Errorf("%s", msg)
+}

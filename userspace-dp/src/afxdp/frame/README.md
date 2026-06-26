@@ -106,7 +106,13 @@ inspect or rewrite a packet sitting in a UMEM frame.
   GRE decap (`gre.rs`) inherits this automatically: with `flow == None`
   it stamps `(0, 0)` ports instead of synthesizing them. Composes with
   the #2293-era screen fragment classification (`extract_screen_info`),
-  which independently sees and screens non-first fragments.
+  which independently sees and screens non-first fragments. For a FIRST
+  IPv6 fragment (`extract_screen_info`, #3120) the screen walk continues
+  past the Fragment header through any trailing extension headers (e.g. a
+  `Fragment → Destination-Options → TCP` chain, valid per RFC 8200) so the
+  TCP flags/seq/MSS still reach the TCP-flag screens and the SYN-cookie
+  flood challenge; a non-first fragment carries no L4 here and stays
+  flowless.
 - **L4 ports are bounded by the IP-DECLARED packet length (#2361)**: the
   live ingress parsers (`parse_ipv4_session_flow_from_frame`, the IPv6 arm
   of `parse_session_flow_from_frame`, the meta-offset fallback in
@@ -133,6 +139,22 @@ inspect or rewrite a packet sitting in a UMEM frame.
   `meta.l4_offset` but does NOT enforce the IP-declared bound, so the meta
   readers re-derive `declared_end` from the L3 header in the frame before
   reading ports (mirroring #2357's meta-fast-path chokepoint concern).
+- **ICMP pseudo-port is only emitted for identifier-bearing query types
+  (#3067)**: in `parse_flow_ports` the 2-byte ICMP/ICMPv6 word at
+  `[l4+4, l4+6)` is the protocol Identifier ONLY for the query types — for
+  ICMPv4 that is Echo Request/Reply (8/0) and the Timestamp/Information
+  query+reply pairs (13/14/15/16, identical Identifier offset per RFC 792);
+  for ICMPv6 only Echo Request/Reply (128/129) per RFC 4443. For every other
+  type — the errors (Dest-Unreachable, Packet-Too-Big, Time-Exceeded,
+  Parameter-Problem), Redirect, and the ND/MLD control types — those two
+  bytes are part of a gateway address, the next-hop MTU, a pointer, or an
+  unused/reserved field, NOT a port. `parse_flow_ports` reads the ICMP type
+  byte at `l4` (bounded by `declared_end`) and returns `None` (flowless) for
+  every non-query type, so transit ICMP error/control packets follow the
+  route-based, session-less forward path instead of installing a bogus
+  identifier-keyed stateful session that would pollute the session table and
+  risk spurious collisions. Matching ICMP errors to their embedded inner flow
+  remains out of scope (tracked as the larger #2393 model).
 - **TCP inspection helpers are ext-header-aware (#2148)**: the read-only
   diagnostic/telemetry helpers `frame_has_tcp_rst`,
   `extract_tcp_flags_and_window`, and `extract_tcp_window` (`tcp.rs`) all

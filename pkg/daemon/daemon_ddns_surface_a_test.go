@@ -100,8 +100,9 @@ func TestSurfaceAGatePerRG(t *testing.T) {
 		rgStates: make(map[int]*rgStateMachine),
 		cluster:  cluster.NewManager(0, 1),
 	}
-	// No RG is master yet → an RG1 scope is gated CLOSED; an RG0 (non-HA)
-	// scope is always admitted.
+	// Node 0. RG1 is not master yet → an RG1 scope is gated CLOSED. RG0 is not
+	// tracked yet, so the RG0/non-HA scope falls back to the lowest-node-ID
+	// writer — node 0 is the writer, so it is admitted here (#2972).
 	gate := d.surfaceAGate()
 	if gate == nil {
 		t.Fatal("cluster daemon must produce a per-RG gate")
@@ -110,7 +111,87 @@ func TestSurfaceAGatePerRG(t *testing.T) {
 		t.Fatal("RG1 scope must be gated closed when not master for RG1")
 	}
 	if !gate(ddns.ScopeKey{RGOwner: 0}) {
-		t.Fatal("RG0 (non-HA) scope must be admitted")
+		t.Fatal("RG0/non-HA scope must be admitted on node 0 (lowest-node-ID fallback)")
+	}
+}
+
+// TestSurfaceAGateRG0SingleWriter is the #2972 fail-on-revert gate. An
+// RG0/non-HA Surface A scope (RGOwner==0) must be admitted by EXACTLY ONE node
+// in an active-active cluster — the node that is RG0 primary — not by every node
+// that happens to master some data RG. Before the fix, surfaceAGate admitted
+// every RGOwner==0 scope unconditionally, so both nodes double-wrote the same
+// configured FQDN. Reverting surfaceARG0Writer to `return true` turns this RED
+// (both nodes would admit the RG0 scope).
+func TestSurfaceAGateRG0SingleWriter(t *testing.T) {
+	// Active-active: node 0 masters RG0 (control plane) + RG1; node 1 masters
+	// RG2. Both pass the node-level writer gate (each masters some RG), so both
+	// would build the identical RGOwner==0 scope.
+	node0 := &Daemon{
+		rgStates: make(map[int]*rgStateMachine),
+		cluster:  cluster.NewManager(0, 1),
+	}
+	node0.getOrCreateRGState(0).SetCluster(true) // RG0 primary
+	node0.getOrCreateRGState(1).SetCluster(true) // RG1 primary
+	node0.getOrCreateRGState(2).SetCluster(false)
+
+	node1 := &Daemon{
+		rgStates: make(map[int]*rgStateMachine),
+		cluster:  cluster.NewManager(1, 0),
+	}
+	node1.getOrCreateRGState(0).SetCluster(false) // RG0 secondary
+	node1.getOrCreateRGState(1).SetCluster(false)
+	node1.getOrCreateRGState(2).SetCluster(true) // RG2 primary
+
+	g0 := node0.surfaceAGate()
+	g1 := node1.surfaceAGate()
+	if g0 == nil || g1 == nil {
+		t.Fatal("cluster daemons must produce per-RG gates")
+	}
+
+	rg0Scope := ddns.ScopeKey{RGOwner: 0}
+	a0 := g0(rg0Scope)
+	a1 := g1(rg0Scope)
+	if a0 == a1 {
+		t.Fatalf("RG0/non-HA scope must be admitted by exactly one node; node0=%v node1=%v (double-write)", a0, a1)
+	}
+	if !a0 {
+		t.Fatal("the RG0-primary node (node 0) must be the writer for the RG0/non-HA scope")
+	}
+
+	// Failover: RG0 moves to node 1. The single writer must follow it.
+	node0.getOrCreateRGState(0).SetCluster(false)
+	node1.getOrCreateRGState(0).SetCluster(true)
+	if node0.surfaceAGate()(rg0Scope) {
+		t.Fatal("after RG0 failover, the old RG0-primary (node 0) must stop writing the RG0 scope")
+	}
+	if !node1.surfaceAGate()(rg0Scope) {
+		t.Fatal("after RG0 failover, the new RG0-primary (node 1) must become the RG0 scope writer")
+	}
+}
+
+// TestSurfaceAGateRG0FallbackNoRG0 covers the non-standard cluster where RG0 is
+// not a tracked group (only data RGs). The RG0/non-HA scope must still have a
+// single deterministic writer — the lowest node ID — not be admitted by every
+// node (#2972).
+func TestSurfaceAGateRG0FallbackNoRG0(t *testing.T) {
+	node0 := &Daemon{
+		rgStates: make(map[int]*rgStateMachine),
+		cluster:  cluster.NewManager(0, 1),
+	}
+	node0.getOrCreateRGState(1).SetCluster(true) // masters RG1, no RG0 tracked
+
+	node1 := &Daemon{
+		rgStates: make(map[int]*rgStateMachine),
+		cluster:  cluster.NewManager(1, 0),
+	}
+	node1.getOrCreateRGState(2).SetCluster(true) // masters RG2, no RG0 tracked
+
+	rg0Scope := ddns.ScopeKey{RGOwner: 0}
+	if !node0.surfaceAGate()(rg0Scope) {
+		t.Fatal("with no RG0 tracked, the lowest-node-ID node (node 0) must write the RG0 scope")
+	}
+	if node1.surfaceAGate()(rg0Scope) {
+		t.Fatal("with no RG0 tracked, a non-lowest node (node 1) must NOT write the RG0 scope (double-write)")
 	}
 }
 

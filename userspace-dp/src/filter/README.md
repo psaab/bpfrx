@@ -263,10 +263,16 @@ on those fields.
 `IpAddr` variant carried by `src_ip` / `dst_ip` but is materialized
 on the struct for cheap branchless checks on the hot path.
 For ICMP and ICMPv6 sessions, `parse_flow_ports`
-(`userspace-dp/src/afxdp/frame/inspect.rs:212-232`) unconditionally
-reads bytes 4-5 of the ICMP header into `src_port` (the ICMP
-identifier word — meaningful for Echo Request/Reply, opaque for
-other ICMP types) and stores zero in `dst_port`. ICMP **type**
+(`userspace-dp/src/afxdp/frame/inspect.rs`) reads bytes 4-5 of the
+ICMP header into `src_port` (the ICMP identifier word) and stores
+zero in `dst_port` — but ONLY for the identifier-bearing query types
+(#3067): ICMPv4 Echo Request/Reply and the Timestamp/Information
+query+reply pairs (types 0/8/13/14/15/16), and ICMPv6 Echo
+Request/Reply (128/129). For error and control types — where bytes
+4-5 are a gateway address / next-hop MTU / pointer / unused field,
+not an identifier — `parse_flow_ports` returns `None` so no
+identifier-keyed session is installed for transit ICMP control
+traffic. ICMP **type**
 and **code** are NOT in the cache key — adding an explicit
 `icmp_type` or `icmp_code` filter match makes the filter
 cache-sensitive unless `SessionKey` or trusted per-session
@@ -287,13 +293,15 @@ exactly one of these two classes:
 | `destination_ports` | yes (TCP/UDP); ICMP-zero | `dst_port` is 0 for ICMP |
 | `dscp_values` / `dscp_bitmap` (+ `dscp_match_enabled`) | NO — cache-sensitive | see #1430 pattern below |
 | (future) `tos_match` / ECN bits (non-DSCP TOS) | NO — cache-sensitive | TOS lower bits and ECN vary per packet |
-| `tcp_flags_mask` (#2362) | NO — cache-sensitive | required-bits mask over the TCP flags byte; TCP flags vary per packet. Threaded via `TermMatchExtra` (path (b)) |
+| `tcp_flags_mask` (#2362) | NO — cache-sensitive | required-bits mask over the TCP flags byte: matches when `(flags & mask) == mask`. TCP flags vary per packet. Threaded via `TermMatchExtra` (path (b)) |
+| `tcp_flags_forbidden` (#3076) | NO — cache-sensitive | forbidden-bits mask over the same byte: matches only when `(flags & forbidden) == 0`. Carries the negated operands of a Junos tcp-flags expression (`syn & !ack` → required SYN, forbidden ACK). Independent of `tcp_flags_mask`. Unrepresentable expressions (disjunction `\|`, negated groups, unknown flags) are rejected at commit by the Go compiler, never silently dropped |
 | `is_fragment` (#2362) | NO — cache-sensitive | Junos `is-fragment`: matches ANY fragment (IPv4 MF set OR offset != 0; IPv6 fragment header present). Computed by `is_any_fragment` |
 | (future) `ihl_match` / IP options | NO — cache-sensitive | IHL varies per packet |
 | `icmp_type` / `icmp_code` (#2362) | NO — cache-sensitive | exact match on the ICMP/ICMPv6 type/code byte; non-ICMP packets never match. Could later be promoted to cache-key by adding (type, code) to `SessionKey` |
 | (future) `flex_match` | NO — cache-sensitive | byte-offset match, fully per-packet |
 
-The `tcp_flags_mask` / `is_fragment` / `icmp_type` / `icmp_code` inputs are
+The `tcp_flags_mask` / `tcp_flags_forbidden` / `is_fragment` / `icmp_type` /
+`icmp_code` inputs are
 carried in a small `TermMatchExtra` built once per packet at the filter-eval
 call sites (`term_match_extra_from_frame` and its `ForwardPacketMeta` /
 meta-only variants). The builder is fragment-safe: for a NON-FIRST fragment
@@ -572,6 +580,19 @@ DSCP/L4-sensitive session-hit re-evaluation, and both lo0 local-delivery
 paths. `apply_lo0_filter_action` returns the matched `FilterAction`
 (not a bare drop `bool`) so the caller can tell `Reject` from
 `Discard`.
+
+Zone-level Junos `tcp-rst` (#3071) reuses the same `enqueue_policy_reject_reply`
+machinery through the unified `enqueue_deny_reply` decision helper. Both
+policy-deny call sites in `poll_descriptor/mod.rs` now call
+`enqueue_deny_reply(..., is_reject, from_zone_id)`: when `is_reject` (policy
+`then reject`) it actively rejects every protocol as before; otherwise (plain
+`deny` / default-deny) it sends a TCP RST **only** when the flow is TCP and the
+INGRESS (from) zone has `tcp-rst` enabled (`ForwardingState::zone_tcp_rst_enabled`,
+populated from `ZoneSnapshot.tcp_rst`). Non-TCP denied traffic and a deny in a
+non-tcp-rst zone stay silent drops. A zone-tcp-rst RST is counted under
+`policy_reject_sent` — it is a policy-deny-driven reset. Junos applies `tcp-rst`
+to the source/from zone so the RST is sent back toward the connection
+initiator, whose interface is bound to the from-zone.
 
 Because the generated reply runs through the SAME path as policy
 reject, it inherits the #2238 output-filter / CoS / DSCP

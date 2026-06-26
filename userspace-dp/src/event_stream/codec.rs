@@ -480,6 +480,13 @@ impl EventFrame {
     /// frame or a synthesized close that carried no creation instant) do they
     /// fall back to the packet-count `estimateSessionDuration` heuristic.
     /// A `created_unix_secs` of 0 keeps the legacy fallback behavior.
+    ///
+    /// #2853: `created_subsec_nanos` carries the sub-second nanosecond remainder
+    /// of that same creation instant in the SESSION_CLOSE-unused policy_id slot
+    /// (offset 44). The Go exporters combine it with `created_unix_secs` so the
+    /// flow StartTime keeps millisecond resolution; before this, short flows
+    /// (DNS, single HTTP requests) opened in the same second all reported one
+    /// truncated integer-second start, skewing IPFIX `flowStartMilliseconds`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_session_close_rt_flow(
         seq: u64,
@@ -498,6 +505,11 @@ impl EventFrame {
         owner_rg_id: i16,
         log_syslog: bool,
         created_unix_secs: u32,
+        // #2853: sub-second nanosecond remainder (0..=999_999_999) of the
+        // creation instant. Rides the [44:48] policy_id slot (unused on a
+        // SESSION_CLOSE) so the Go exporters reconstruct a millisecond-accurate
+        // flow StartTime rather than one truncated to `created_unix_secs`.
+        created_subsec_nanos: u32,
         close_unix_ns: u64,
         application_id: u16,
         ingress_ifindex: u32,
@@ -524,7 +536,12 @@ impl EventFrame {
         // `binary.BigEndian` reads in logEvent/DecodeRawEventRecord).
         buf[base + 40..base + 42].copy_from_slice(&src_port.to_be_bytes());
         buf[base + 42..base + 44].copy_from_slice(&dst_port.to_be_bytes());
-        // [44:48] policy_id — unused for SESSION_CLOSE.
+        // [44:48] policy_id — unused for SESSION_CLOSE; #2853 repurposes it to
+        // carry the creation instant's sub-second NANOSECOND remainder
+        // (LITTLE-endian u32), which the Go SESSION_CLOSE decoder reads back as
+        // `CreatedNanos` (and zeroes PolicyID, so the policy-name resolution is
+        // unchanged) to build a millisecond-accurate flow StartTime.
+        buf[base + 44..base + 48].copy_from_slice(&created_subsec_nanos.to_le_bytes());
         // [48:50] ingress zone, [50:52] egress zone — little-endian.
         buf[base + 48..base + 50].copy_from_slice(&ingress_zone_id.to_le_bytes());
         buf[base + 50..base + 52].copy_from_slice(&egress_zone_id.to_le_bytes());

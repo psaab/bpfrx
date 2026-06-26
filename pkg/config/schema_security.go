@@ -22,6 +22,18 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 	}},
 	"policies": {desc: "Security policies", children: map[string]*schemaNode{
+		// #3065: explicit no-match default override. Unset = deny-all
+		// (fail-closed, matching the Junos default-security-policy);
+		// permit-all restores the legacy fail-open behaviour.
+		"default-policy": {
+			desc:          "Action for traffic with no matching policy (default deny-all)",
+			args:          1,
+			valueType:     ValueEnumOf,
+			valueDesc:     "No-match default action (permit-all | deny-all | reject-all)",
+			valueExamples: []string{"deny-all", "permit-all", "reject-all"},
+			validator:     ValidateEnum([]string{"permit-all", "deny-all", "reject-all"}),
+			children:      nil,
+		},
 		"from-zone": {desc: "From zone", args: 3, valueHint: ValueHintZoneName, midKeyword: "to-zone", midKeywordAt: 2, placeholder: "<zone-name>", children: map[string]*schemaNode{
 			"policy": {desc: "Policy name", args: 1, valueHint: ValueHintPolicyName, placeholder: "<policy-name>", children: map[string]*schemaNode{
 				"description": {desc: "Policy description", args: 1, placeholder: "<text>", children: nil},
@@ -36,6 +48,19 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					"log": {desc: "Log session", children: nil},
 					// permit, deny, reject, count → leaf
 				}},
+				// #3117: `scheduler-name <name>` binds a class-of-service
+				// scheduler to the policy. The compiler reads it as a plain
+				// string (compiler_security.go: polInst.node.FindChild(
+				// "scheduler-name") → nodeVal) and the strict validator
+				// rejects an undefined reference (compiler_validate_strict.go
+				// validatePolicySchedulerReferencesStrict). It was absent from
+				// setSchema, so the leaf had no structural/`?` completion —
+				// inconsistent with the two-SSOT rule that every compiled +
+				// validated leaf lives in the schema tree. Untyped (plain
+				// string) like `description`: the compiler consumes the raw
+				// token and the strict reference check stays the SSOT for
+				// undefined-scheduler rejection (no treeValidator here).
+				"scheduler-name": {desc: "Class-of-service scheduler bound to this policy", args: 1, placeholder: "<scheduler-name>", children: nil},
 			}},
 		}},
 		"global": {desc: "Global policies", children: map[string]*schemaNode{
@@ -51,6 +76,9 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				"then": {desc: "Action", children: map[string]*schemaNode{
 					"log": {desc: "Log session", children: nil},
 				}},
+				// #3117: scheduler-name on global policies — same compiler +
+				// strict-validator path as the zone-pair policy above.
+				"scheduler-name": {desc: "Class-of-service scheduler bound to this policy", args: 1, placeholder: "<scheduler-name>", children: nil},
 			}},
 		}},
 	}},

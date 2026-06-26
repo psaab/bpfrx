@@ -55,6 +55,7 @@ fn basic_accept_discard() {
                     forwarding_class: String::new(),
                     dscp_rewrite: None,
                     tcp_flags: None,
+                    tcp_flags_forbidden: None,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -82,6 +83,7 @@ fn basic_accept_discard() {
                     forwarding_class: String::new(),
                     dscp_rewrite: None,
                     tcp_flags: None,
+                    tcp_flags_forbidden: None,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -290,6 +292,7 @@ fn port_range_matching() {
                 forwarding_class: String::new(),
                 dscp_rewrite: None,
                 tcp_flags: None,
+                tcp_flags_forbidden: None,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -363,6 +366,7 @@ fn destination_port_except_negation() {
                 forwarding_class: String::new(),
                 dscp_rewrite: None,
                 tcp_flags: None,
+                tcp_flags_forbidden: None,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -451,6 +455,7 @@ fn source_port_except_negation() {
                 forwarding_class: String::new(),
                 dscp_rewrite: None,
                 tcp_flags: None,
+                tcp_flags_forbidden: None,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -519,6 +524,7 @@ fn protocol_matching() {
                 forwarding_class: String::new(),
                 dscp_rewrite: None,
                 tcp_flags: None,
+                tcp_flags_forbidden: None,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -584,6 +590,7 @@ fn dscp_rewrite_action() {
                 forwarding_class: String::new(),
                 dscp_rewrite: Some(46), // EF
                 tcp_flags: None,
+                tcp_flags_forbidden: None,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -635,6 +642,7 @@ fn dscp_rewrite_action_allows_default_zero() {
                 forwarding_class: String::new(),
                 dscp_rewrite: Some(0),
                 tcp_flags: None,
+                tcp_flags_forbidden: None,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -1501,6 +1509,7 @@ fn multiple_terms_first_match_wins() {
                     forwarding_class: String::new(),
                     dscp_rewrite: None,
                     tcp_flags: None,
+                    tcp_flags_forbidden: None,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -1528,6 +1537,7 @@ fn multiple_terms_first_match_wins() {
                     forwarding_class: String::new(),
                     dscp_rewrite: None,
                     tcp_flags: None,
+                    tcp_flags_forbidden: None,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -1594,6 +1604,7 @@ fn source_dest_address_matching() {
                 forwarding_class: String::new(),
                 dscp_rewrite: None,
                 tcp_flags: None,
+                tcp_flags_forbidden: None,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -3214,6 +3225,101 @@ fn tcp_flags_term_requires_all_listed_flags() {
         FilterAction::Accept,
         "SYN alone lacks ACK -> no match"
     );
+}
+
+#[test]
+fn tcp_flags_term_forbidden_mask_excludes_negated_flag() {
+    // #3076: `tcp-flags "syn & !ack"` -> required SYN(0x02), forbidden ACK(0x10).
+    // A bare SYN matches; a SYN+ACK does NOT (ACK is forbidden); a pure ACK does
+    // NOT (SYN missing). Before #3076 the `!ack` half was dropped on the wire, so
+    // a SYN+ACK wrongly matched (the term fired regardless of the ACK bit).
+    let filter = vec![FirewallFilterSnapshot {
+        name: "pp".into(),
+        family: "inet".into(),
+        terms: vec![
+            FirewallTermSnapshot {
+                name: "match".into(),
+                protocols: vec!["tcp".into()],
+                action: "discard".into(),
+                tcp_flags: Some(0x02),
+                tcp_flags_forbidden: Some(0x10),
+                ..Default::default()
+            },
+            FirewallTermSnapshot {
+                name: "rest".into(),
+                action: "accept".into(),
+                ..Default::default()
+            },
+        ],
+    }];
+    let state = make_filter_state(&filter, &[]);
+    let eval = |flags: u8| {
+        evaluate_filter(
+            &state,
+            "inet:pp",
+            v4(10, 0, 0, 1),
+            v4(10, 0, 0, 2),
+            PROTO_TCP,
+            1000,
+            22,
+            0,
+            extra_tcp(flags),
+        )
+        .action
+    };
+    assert_eq!(eval(0x02), FilterAction::Discard, "bare SYN must match syn & !ack");
+    assert_eq!(
+        eval(0x12),
+        FilterAction::Accept,
+        "SYN+ACK must NOT match syn & !ack (ACK forbidden) — pre-#3076 fail-open"
+    );
+    assert_eq!(
+        eval(0x10),
+        FilterAction::Accept,
+        "pure ACK must NOT match syn & !ack (SYN required)"
+    );
+}
+
+#[test]
+fn tcp_flags_term_forbidden_only_mask() {
+    // #3076: a pure-negation `!rst` -> required None, forbidden RST(0x04). Any TCP
+    // segment without RST matches; one with RST does not.
+    let filter = vec![FirewallFilterSnapshot {
+        name: "pp".into(),
+        family: "inet".into(),
+        terms: vec![
+            FirewallTermSnapshot {
+                name: "match".into(),
+                protocols: vec!["tcp".into()],
+                action: "discard".into(),
+                tcp_flags: None,
+                tcp_flags_forbidden: Some(0x04),
+                ..Default::default()
+            },
+            FirewallTermSnapshot {
+                name: "rest".into(),
+                action: "accept".into(),
+                ..Default::default()
+            },
+        ],
+    }];
+    let state = make_filter_state(&filter, &[]);
+    let eval = |flags: u8| {
+        evaluate_filter(
+            &state,
+            "inet:pp",
+            v4(10, 0, 0, 1),
+            v4(10, 0, 0, 2),
+            PROTO_TCP,
+            1000,
+            22,
+            0,
+            extra_tcp(flags),
+        )
+        .action
+    };
+    assert_eq!(eval(0x02), FilterAction::Discard, "SYN (no RST) matches !rst");
+    assert_eq!(eval(0x04), FilterAction::Accept, "RST set must NOT match !rst");
 }
 
 #[test]

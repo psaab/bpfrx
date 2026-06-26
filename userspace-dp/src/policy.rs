@@ -1245,9 +1245,37 @@ pub(crate) fn evaluate_policy_result_with_len(
     dst_port: u16,
     packet_len: u64,
 ) -> PolicyEvaluationResult {
-    let key = zone_pair_key(from_id, to_id);
-    if let Some(indices) = state.zone_pair_index.get(&key) {
-        for &idx in indices {
+    // #3110: zone id 0 is the reserved "unknown / no zone" sentinel
+    // (assigned to interfaces not bound to any security zone, and to the
+    // over-cap-zone collapse-to-0 path, #2391). A flow whose ingress OR
+    // egress zone is unknown does not belong to any DEFINED zone pair, so
+    // it must NOT be eligible for zone-pair policies OR `junos-global`
+    // policies — global rules apply to all *defined* zone pairs, never to
+    // unzoned transit. Fall straight through to the default action so an
+    // operator's permit-global cannot leak transit on an unzoned
+    // ingress/egress interface. Composes with the default-policy
+    // fail-closed (#3065) and wildcard-zone work (#3018); the
+    // `junos-global` sentinel (u16::MAX) is a DEFINED global zone, distinct
+    // from 0 (unknown), and is unaffected by this guard.
+    if from_id != 0 && to_id != 0 {
+        let key = zone_pair_key(from_id, to_id);
+        if let Some(indices) = state.zone_pair_index.get(&key) {
+            for &idx in indices {
+                if let Some(result) = try_match_rule(
+                    &state.rules[idx],
+                    state,
+                    src_ip,
+                    dst_ip,
+                    protocol,
+                    src_port,
+                    dst_port,
+                    packet_len,
+                ) {
+                    return result;
+                }
+            }
+        }
+        for &idx in &state.global_indices {
             if let Some(result) = try_match_rule(
                 &state.rules[idx],
                 state,
@@ -1260,20 +1288,6 @@ pub(crate) fn evaluate_policy_result_with_len(
             ) {
                 return result;
             }
-        }
-    }
-    for &idx in &state.global_indices {
-        if let Some(result) = try_match_rule(
-            &state.rules[idx],
-            state,
-            src_ip,
-            dst_ip,
-            protocol,
-            src_port,
-            dst_port,
-            packet_len,
-        ) {
-            return result;
         }
     }
     PolicyEvaluationResult {

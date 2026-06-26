@@ -108,6 +108,35 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+### `firewall ... from tcp-flags` — semantic validation, not just a list (#3076)
+
+`from tcp-flags` is a `multi: true` leaf, so the dual-AST contract above
+delivers its tokens uniformly (`firewallMatchValues`). But unlike a plain
+value list, the tokens form a Junos logical *expression* — `"syn & !ack"`,
+`"(syn & ack)"`, `"ack | rst"` — where `&`/`|`/`!`/`(`/`)` carry meaning.
+A quoted expression arrives as a single token string; a bracket/space list
+(`[ syn ack ]`, `"syn ack"`) is an implicit conjunction.
+
+`ParseTCPFlagsExpression` (`pkg/config/tcp_flags.go`) parses the joined tokens
+into a **required-bits** mask and a **forbidden-bits** mask over the TCP flags
+byte (`(flags & required) == required && (flags & forbidden) == 0`). The
+conjunctive AF_XDP matcher can carry one required set and one forbidden set, so
+the following are **rejected at commit** (`compileFirewall` returns an error)
+rather than silently dropped:
+
+- disjunction (`|`, e.g. `"ack | rst"`) — not a single required/forbidden pair;
+- a negated parenthesized group (`!(...)`) — a disjunction by De Morgan;
+- an unrecognized flag token;
+- a flag that is both required and forbidden (the term could never match).
+
+This is the #3076 fix: before it, the schema accepted any `tcp-flags` token
+(the leaf is `multi: true` with no value validator) and the snapshot builder's
+bare-name-only lookup silently dropped any expression it could not map — the
+filter term then matched **regardless** of TCP flags (a fail-open security
+hole). Validation is now fail-closed: an unenforceable constraint is refused at
+commit, and a representable one (including `syn & !ack`) is carried to the
+dataplane via the `tcp_flags` / `tcp_flags_forbidden` wire fields.
+
 The `system domain-search` and `system name-server` readers
 (`compileSystem`, `compiler_system.go`) are also contract-compliant via
 `firewallMatchValues`. Both are `multi:true`; before the second #2419 fold
@@ -1128,6 +1157,57 @@ conflict guard, `TestPolicyNoTerminalActionLenientDefaultsDeny` — lenient
 warn + default-to-deny, `TestPolicyExactlyOneTerminalActionCommits` —
 positive control).
 
+### #3065 — Unspecified `default-policy` is fail-closed (deny-all) + `reject-all` + schema leaf
+
+The sibling of #3043 for the IMPLICIT fallback. When a flow matches no
+zone-pair policy, no global policy, and no explicit term, the verdict is the
+*default policy*, held in `SecurityConfig.DefaultPolicy`. Because
+`PolicyAction`'s zero value is `PolicyPermit` (`types_security.go`), a config
+that omits the `security policies default-policy` stanza compiled to the zero
+value and shipped **permit-all** — a silent fail-OPEN that is the opposite of
+the Junos SRX `default-security-policy`, which denies all unmatched traffic.
+(`compiler_validate_strict.go`'s own comment flagged this.) Two adjacent
+gaps: `compilePolicies` (`compiler_security.go`) handled only `permit-all` /
+`deny-all`, so the valid Junos `reject-all` fell through the switch and was
+silently ignored; and the `default-policy` leaf was absent from
+`schema_security.go`, so a misspelled value was accepted unchecked by the
+schema walker.
+
+**Fail-closed default:** `CompileConfig` (`compiler.go`) now initializes
+`SecurityConfig.DefaultPolicy = PolicyDeny` when it constructs the typed
+`Config`. An absent stanza therefore denies unmatched zone-pair traffic
+(Junos parity). The `PolicyAction` enum zero value is left unchanged
+(matching the #3043 decision) — the default is set explicitly at construction
+rather than by flipping `iota`.
+
+**Explicit override:** an operator restores the legacy permit-all behaviour
+with `set security policies default-policy permit-all`; `deny-all` and
+`reject-all` are the other accepted values, with `reject-all` now mapped to
+`PolicyReject` in the `compilePolicies` switch.
+
+**Dataplane plumbing:** the value flows to the userspace dataplane unchanged
+via the snapshot string — `policyActionString(cfg.Security.DefaultPolicy)`
+(`pkg/dataplane/userspace/builder.go`) → `ConfigSnapshot.DefaultPolicy` →
+Rust `parse_action` → `PolicyState.default_action`
+(`userspace-dp/src/policy.rs`), which is the no-match verdict. The Rust
+struct default was already `Deny`; the Go zero value was overriding it with
+`"permit"`, so the Go init is the operative fix.
+
+**Schema leaf:** `default-policy` is a typed `ValueEnumOf` child of
+`policies` (`schema_security.go`) validated by
+`ValidateEnum([]string{"permit-all","deny-all","reject-all"})`, so a bogus
+value (`allow-everything`) fails `commit check` instead of being silently
+accepted.
+
+Regression coverage: `pkg/config/compiler_default_policy_3065_test.go`
+(`TestDefaultPolicyFailsClosed` — fail-on-revert: unset stanza must compile
+to `PolicyDeny`; `TestDefaultPolicyExplicitOverrides` — permit-all/deny-all/
+reject-all mapping; `TestDefaultPolicySchemaValidation` — enum accept/reject)
+and `pkg/dataplane/userspace/default_policy_3065_test.go`
+(`TestSnapshotDefaultPolicyFailsClosed` — the snapshot string the Rust verdict
+reads is `"deny"` for an unset config, `"permit"`/`"reject"` for the explicit
+overrides).
+
 ### #2401 — Security-policy undefined-zone references (commit fail-closed)
 
 A `set security policies from-zone <a> to-zone <b> { policy ... }` stanza
@@ -1169,6 +1249,30 @@ Regression coverage: `pkg/config/policy_zone_ref_test.go`
 an undefined from-zone and to-zone, `TestPolicySpecialZoneTokensCommit` —
 `any`/`junos-host`/global anti-over-reject, `TestPolicyDefinedZonesCommit`,
 `TestPolicyUndefinedZoneLenientDowngradesToWarning`).
+
+### #3117 — Security-policy `scheduler-name` schema leaf (completion parity)
+
+A security-policy `scheduler-name <name>` binds a class-of-service scheduler
+to the policy. It is compiled — `compiler_security.go`
+(`polInst.node.FindChild("scheduler-name")` → `nodeVal`, read for BOTH
+zone-pair and global policies) — and an undefined reference is strict-rejected
+at commit by `validatePolicySchedulerReferencesStrict`
+(`compiler_validate_strict.go`, downgraded to a warning on the tolerant load /
+peer-sync paths via `compiler_validate_warn.go`). The leaf was nonetheless
+ABSENT from `setSchema`, so `set security policies ... policy <p> scheduler-name`
+had no structural / value-slot `?` completion — a violation of the two-SSOT
+rule that every compiled + validated leaf is declared in the schema tree.
+
+The fix declares `scheduler-name` under both the zone-pair policy node and the
+global policy node in `pkg/config/schema_security.go`, as a sibling of
+`description`/`match`/`then`. It is an **untyped (plain string) leaf** like
+`description`: the compiler consumes the raw token, and the strict
+undefined-scheduler reference check remains the SSOT for rejection (no
+`treeValidator` is added, so completion and validation stay in agreement and
+no compiler/validator behaviour changes). Regression coverage:
+`pkg/config/schema_scheduler_name_3117_test.go` — the leaf is offered by
+`CompleteSetPathWithValues` for zone-pair and global policies (fail-on-revert),
+and the declared form passes `SchemaValidate` without a false reject.
 
 ### #2391 — Security-zone count cap (commit fail-closed)
 

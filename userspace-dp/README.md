@@ -47,6 +47,44 @@ all bindings in batch (`RX_BATCH_SIZE=64`, up to `MAX_RX_BATCHES_PER_POLL=4`
 per tick). Per descriptor: parse → screen → session lookup → NAT/policy
 decision → forwarding build → enqueue TX or recycle.
 
+## Queue planning (`replan_queues`)
+
+`server::helpers::replan_queues` derives the AF_XDP binding plan from the
+config snapshot. It builds a candidate list of binding-eligible Linux
+netdevs, takes `queue_count = min(rx_queues)` across all candidates, and
+emits one binding per `(netdev, queue_id)` — so `planned_workers` equals
+that per-interface RX-queue minimum. The candidate set is the shared
+binding-exclusion contract (`include_userspace_binding_interface`, the
+Rust mirror of the Go `UserspaceBoundLinuxInterfaces` allowlist): zoned,
+non-tunnel, non-local-fabric netdevs, excluding `fxp*`/`em*`/`fab*`/`lo0`
+and the mgmt/control zones.
+
+Two dedup rules keep the `queue_count` min from collapsing:
+
+- **#1921 (`seen_linux`)**: the snapshot lists both a physical interface
+  (`ge-0/0/0`) and its non-VLAN unit (`ge-0/0/0.0`); both resolve to the
+  same Linux netdev. The first wins; the duplicate is dropped (a second
+  XSK bind on the same `(netdev, queue)` returns EBUSY).
+- **#3091 (`vlan_child_parent_netdev`)**: a VLAN-child unit
+  (`reth0.50`/`reth0.80` → Linux `ge-0-0-2.50`/`ge-0-0-2.80`) is a
+  *software* VLAN device the kernel exposes with a **single** RX queue,
+  but its tagged frames are delivered on the **physical parent's**
+  hardware queues (`ge-0-0-2`, 6 queues). The child netdev name differs
+  from the parent, so the #1921 guard misses it. A VLAN child
+  (`vlan_id != 0` with a distinct non-empty `parent_linux_name`) is
+  therefore deduped onto its parent: when the parent is itself a
+  candidate it is skipped entirely; an orphan VLAN child (parent not a
+  candidate) is re-keyed onto the parent netdev using the parent's
+  hardware queue count, never the child's lone software queue. Without
+  this, `min(6, 1, 1, 6) = 1` forced a single worker (~6-7 Gbps; the
+  #3091 regression). With it the WAN parent binds all 6 hardware queues
+  and forwards at ~23 Gbps multi-worker.
+
+Both `vlan_id` and `parent_linux_name` are hashed into the binding
+plan key (`update_snapshot_binding_plan_key`) so a re-parenting or VLAN
+change always triggers a replan — the #2915/#2916 "the plan key and the
+planner agree on every layout input" invariant.
+
 ## External interfaces
 
 - **Unix socket** (`/tmp/xpf-userspace-dp.sock`): newline-delimited text
@@ -140,6 +178,39 @@ logging rules, not these specific hot-path constants.
   published or deleted by this path. Fail-on-revert: the wiring test
   `close_delta_deletes_dnat_table_entry_for_snat_flow` plus the key-SSOT
   tests in `src/afxdp/tests.rs`.
+- **Source-NAT pool subnet expansion (#3049)**: a source-NAT pool
+  address entry may be a bare IP, a host CIDR (`/32`, `/128`), or a
+  subnet CIDR (e.g. `203.0.113.0/28`). Junos uses the FULL prefix range
+  for a source-NAT pool, so `parse_source_nat_rules_with_previous`
+  (`src/nat/source.rs`) enumerates every address in the prefix
+  (network..=broadcast inclusive) via `expand_pool_address`, populating
+  `pool_addresses_v4` / `pool_addresses_v6` so the port allocator
+  round-robins / hashes across the whole range. The pre-#3049 code
+  stripped the mask and kept only the network host, silently collapsing
+  a `/28` (16 addresses) to one — severe pool/port exhaustion with no
+  signal. A single-host prefix still yields exactly one address. An
+  over-broad prefix whose host count exceeds `MAX_POOL_PREFIX_HOSTS`
+  (65536; covers up to a v4 `/16` or v6 `/112`) is rejected as an
+  invalid pool (`SourceNatFailureReason::InvalidPool`) — fail-closed, so
+  the operator gets a clear signal rather than a clamped or OOM pool.
+  Fail-on-revert: `pool_snat_subnet_expands_full_cidr_range`,
+  `pool_snat_host_cidr_yields_single_address`, and
+  `pool_snat_overbroad_prefix_marks_invalid` in `src/nat/tests.rs`.
+- **Source-NAT port recycling is FIFO (#3011)**: freed SNAT source
+  ports go into a per-address `VecDeque` (`recycled_ports_by_addr` in
+  `src/nat/allocator.rs`) — `push_back` on release, `pop_front` on
+  allocation. FIFO recycles the OLDEST-freed port first, maximizing the
+  wall-clock gap before any port is reassigned so reuse spreads across
+  the upstream's 2MSL/TIME_WAIT window. The pre-#3011 `Vec` push/pop at
+  the back was LIFO: the just-freed port was the FIRST reassigned — the
+  worst case for colliding with lingering peer TIME_WAIT state. This
+  composes with the #3047 (062-10) collision-retain logic: a popped port
+  whose owner slot is still occupied is RETAINED (re-queued at the back),
+  never discarded, so a transient collision cannot shrink the pool;
+  re-queued collided ports go behind the genuinely-free ports so FIFO
+  order among the free ports is preserved. Fail-on-revert:
+  `pool_snat_recycle_order_is_fifo_not_lifo` in `src/nat/tests.rs`
+  (reverting to a back-popping LIFO queue flips the reuse order RED).
 - `HEARTBEAT_GRACE_PERIOD_NS = 6 s` is defined in
   `userspace-dp/src/afxdp/mod.rs` but currently `#[allow(dead_code)]`
   — reserved for future XDP-shim heartbeat gating logic. Workers

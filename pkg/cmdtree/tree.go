@@ -931,6 +931,11 @@ var OperationalTree = map[string]*Node{
 				}, Children: map[string]*Node{
 					"source-ip": {Desc: "Source IP address", Children: map[string]*Node{
 						"destination-ip": {Desc: "Destination IP address", Children: map[string]*Node{
+							"source-port": {Desc: "Source port number", Children: map[string]*Node{
+								"destination-port": {Desc: "Destination port number", Children: map[string]*Node{
+									"protocol": {Desc: "IP protocol (tcp, udp)"},
+								}},
+							}},
 							"destination-port": {Desc: "Destination port number", Children: map[string]*Node{
 								"protocol": {Desc: "IP protocol (tcp, udp)"},
 							}},

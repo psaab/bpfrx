@@ -619,16 +619,25 @@ fn update_snapshot_binding_plan_key(hasher: &mut Sha256, snapshot: &ConfigSnapsh
         .iter()
         .filter(|iface| include_userspace_binding_interface(iface))
     {
+        // #3091: `vlan_id` and `parent_linux_name` are now binding-plan inputs
+        // — `replan_queues` dedups a VLAN-child netdev onto its physical parent
+        // using exactly these two fields. The #2915 invariant requires every
+        // field the planner reads to construct the layout to bump the plan key,
+        // so re-parenting or VLAN-tag changes trigger a replan (never a stale
+        // plan). Additive: an old Go binary that omits them serializes the
+        // serde defaults (0 / ""), matching the non-VLAN physical case.
         hash_update(
             hasher,
             &format!(
-                "iface={}/{}/{}/{}/{}/{};",
+                "iface={}/{}/{}/{}/{}/{}/{}/{};",
                 iface.name,
                 iface.linux_name,
                 iface.ifindex,
                 iface.parent_ifindex,
                 iface.rx_queues,
-                iface.tunnel
+                iface.tunnel,
+                iface.vlan_id,
+                iface.parent_linux_name
             ),
         );
     }
@@ -753,6 +762,52 @@ pub(crate) fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> 
     !matches!(iface.zone.as_str(), "mgmt" | "control")
 }
 
+/// #3091: a VLAN-child interface (e.g. `reth0.80` → Linux netdev
+/// `ge-0-0-2.80`) is a SOFTWARE VLAN device with a single RX queue. Its
+/// VLAN-tagged frames are delivered on the PHYSICAL PARENT's hardware RX
+/// queues (`ge-0-0-2`, 6 queues on the mlx5 VF), so the child must NOT enter
+/// the queue planner's candidate list — its lone software queue would collapse
+/// the per-interface `queue_count` min (see `replan_bindings_from_candidates`)
+/// to 1, forcing a single worker and the ~6 Gbps forwarding regression. The
+/// pre-existing #1921 `seen_linux` dedup misses VLAN children because the child
+/// netdev name (`ge-0-0-2.80`) differs from the parent (`ge-0-0-2`).
+///
+/// Returns the parent Linux netdev name when `iface` is a distinct VLAN-child
+/// netdev, else None (physical interfaces and non-VLAN units, whose
+/// `parent_linux_name` is empty or equal to their own netdev, are handled by
+/// the existing `seen_linux` dedup).
+fn vlan_child_parent_netdev<'a>(iface: &'a InterfaceSnapshot, linux_name: &str) -> Option<&'a str> {
+    if iface.vlan_id != 0
+        && !iface.parent_linux_name.is_empty()
+        && iface.parent_linux_name != linux_name
+    {
+        Some(iface.parent_linux_name.as_str())
+    } else {
+        None
+    }
+}
+
+/// #3091: true when the physical netdev `parent` is itself a binding candidate
+/// in this snapshot (a zoned, non-tunnel, non-VLAN data interface). When the
+/// parent is a candidate, a VLAN child re-keyed onto it is fully covered by the
+/// parent's per-queue XSKs (VLAN-tagged frames are captured on the parent's
+/// hardware queues), so the child can be dropped from the candidate list.
+fn snapshot_has_parent_candidate(snapshot: &ConfigSnapshot, parent: &str) -> bool {
+    snapshot.interfaces.iter().any(|p| {
+        if !include_userspace_binding_interface(p) {
+            return false;
+        }
+        let p_linux = if p.linux_name.is_empty() {
+            linux_ifname(&p.name)
+        } else {
+            p.linux_name.clone()
+        };
+        // The parent must be the physical netdev itself, not another VLAN
+        // child that happens to share the name string.
+        p_linux == parent && vlan_child_parent_netdev(p, &p_linux).is_none()
+    })
+}
+
 pub(crate) fn replan_queues(
     snapshot: Option<&ConfigSnapshot>,
     workers: usize,
@@ -782,6 +837,41 @@ pub(crate) fn replan_queues(
             } else {
                 iface.linux_name.clone()
             };
+            // #3091: dedup VLAN-child netdevs onto their physical parent. A
+            // bondless-RETH WAN VLAN unit (`reth0.50`/`reth0.80` → Linux
+            // `ge-0-0-2.50`/`ge-0-0-2.80`) is a software VLAN device with a
+            // single RX queue, but its tagged frames arrive on the PARENT
+            // netdev's hardware queues. Pushing it as a separate 1-queue
+            // candidate collapses the `queue_count` min to 1 (single worker,
+            // the #3091 ~6 Gbps regression). The #1921 `seen_linux` guard below
+            // cannot catch this — the child netdev name differs from the parent.
+            if let Some(parent) = vlan_child_parent_netdev(iface, &linux_name) {
+                if snapshot_has_parent_candidate(snapshot, parent) {
+                    // The parent's per-queue XSKs already capture this VLAN's
+                    // tagged frames; skip the 1-queue child entirely.
+                    continue;
+                }
+                // Orphan VLAN child (parent absent from the candidate set):
+                // re-key onto the parent netdev using the parent's HARDWARE
+                // queue count, never the child's single software queue, so it
+                // still cannot collapse the min.
+                let parent = parent.to_string();
+                if seen_linux.contains(&parent) {
+                    continue;
+                }
+                let rx_queues = rx_queue_count(&parent);
+                if rx_queues > 0 {
+                    let parent_ifindex = if iface.parent_ifindex > 0 {
+                        iface.parent_ifindex
+                    } else {
+                        iface.ifindex
+                    };
+                    ifindex_by_name.insert(parent.clone(), parent_ifindex);
+                    seen_linux.insert(parent.clone());
+                    candidates.push((parent, rx_queues));
+                }
+                continue;
+            }
             // #1921: dedup by Linux netdev. The snapshot lists BOTH the
             // physical interface (`ge-0/0/0`) and its unit (`ge-0/0/0.0`);
             // both start with `ge-` and (for a non-VLAN unit) resolve to the

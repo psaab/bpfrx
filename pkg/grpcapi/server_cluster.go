@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"net"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/cmdtree"
 	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/policymatch"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/vishvananda/netlink"
 	"google.golang.org/grpc/codes"
@@ -140,264 +140,62 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 
 	parsedSrc := net.ParseIP(req.SourceIp)
 	parsedDst := net.ParseIP(req.DestinationIp)
-	dstPort := int(req.DestinationPort)
 
-	for _, zpp := range cfg.Security.Policies {
-		if zpp.FromZone != req.FromZone || zpp.ToZone != req.ToZone {
-			continue
-		}
-		for _, pol := range zpp.Policies {
-			if !matchPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
-				continue
-			}
-			if !matchPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
-				continue
-			}
-			if !matchPolicyApp(pol.Match.Applications, req.Protocol, dstPort, cfg) {
-				continue
-			}
-
-			action := "permit"
-			switch pol.Action {
-			case 1:
-				action = "deny"
-			case 2:
-				action = "reject"
-			}
-
-			return &pb.MatchPoliciesResponse{
-				Matched:      true,
-				PolicyName:   pol.Name,
-				Action:       action,
-				SrcAddresses: pol.Match.SourceAddresses,
-				DstAddresses: pol.Match.DestinationAddresses,
-				Applications: pol.Match.Applications,
-			}, nil
-		}
+	// A negative or >65535 port cannot describe a real packet. The int32
+	// wire field accepts both; left unchecked they pass through to the
+	// shared matcher, whose port term gates on port > 0, so a negative
+	// value silently becomes "no port constraint" and yields a misleading
+	// verdict (#3116). 0 stays the unspecified wildcard (proto3 cannot
+	// distinguish an unset scalar from 0).
+	if err := policymatch.ValidatePort(int(req.SourcePort)); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid source-port: %v", err)
+	}
+	if err := policymatch.ValidatePort(int(req.DestinationPort)); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid destination-port: %v", err)
 	}
 
+	// A non-empty but unknown/out-of-range protocol token ("tcpp", "999") must
+	// not pass through to the shared matcher, whose matchApp short-circuits to
+	// match-any for an unresolvable protocol, yielding a misleading verdict for
+	// a policy using `application any` (#3108). An empty value stays the
+	// unspecified wildcard (match any protocol).
+	if err := policymatch.ValidateProtocol(req.Protocol); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+
+	// #3042: delegate to the single shared simulator so gRPC agrees with the
+	// runtime evaluator (zone-pair -> global -> default-policy, predefined +
+	// nested-app-set + literal-CIDR + any-ipv4/any-ipv6 + exclusion + feed
+	// overlay). The pre-#3042 loop skipped globals, hard-coded "deny
+	// (default)", and missed predefined apps / literal CIDRs.
+	var overlay map[string][]string
+	if s.feedOverlayFn != nil {
+		overlay = s.feedOverlayFn()
+	}
+	res := policymatch.Match(cfg, policymatch.Query{
+		FromZone:    req.FromZone,
+		ToZone:      req.ToZone,
+		SrcIP:       parsedSrc,
+		DstIP:       parsedDst,
+		Protocol:    req.Protocol,
+		SrcPort:     int(req.SourcePort),
+		DstPort:     int(req.DestinationPort),
+		FeedOverlay: overlay,
+	})
+	if !res.Matched {
+		return &pb.MatchPoliciesResponse{
+			Matched: false,
+			Action:  policymatch.ActionString(res.Action) + " (default)",
+		}, nil
+	}
 	return &pb.MatchPoliciesResponse{
-		Matched: false,
-		Action:  "deny (default)",
+		Matched:      true,
+		PolicyName:   res.PolicyName,
+		Action:       policymatch.ActionString(res.Action),
+		SrcAddresses: res.SrcAddresses,
+		DstAddresses: res.DstAddresses,
+		Applications: res.Applications,
 	}, nil
-}
-
-// matchPolicyAddr checks if an IP matches a list of address-book references.
-func matchPolicyAddr(addrs []string, ip net.IP, cfg *config.Config) bool {
-	if len(addrs) == 0 || ip == nil {
-		return true
-	}
-	for _, a := range addrs {
-		if a == "any" {
-			return true
-		}
-		if cfg.Security.AddressBook == nil {
-			continue
-		}
-		if addr, ok := cfg.Security.AddressBook.Addresses[a]; ok {
-			_, cidr, err := net.ParseCIDR(addr.Value)
-			if err == nil && cidr.Contains(ip) {
-				return true
-			}
-		}
-		if matchPolicyAddrSet(a, ip, cfg, 0) {
-			return true
-		}
-	}
-	return false
-}
-
-func matchPolicyAddrSet(setName string, ip net.IP, cfg *config.Config, depth int) bool {
-	if depth > 5 || cfg.Security.AddressBook == nil {
-		return false
-	}
-	as, ok := cfg.Security.AddressBook.AddressSets[setName]
-	if !ok {
-		return false
-	}
-	for _, addrName := range as.Addresses {
-		if addr, ok := cfg.Security.AddressBook.Addresses[addrName]; ok {
-			_, cidr, err := net.ParseCIDR(addr.Value)
-			if err == nil && cidr.Contains(ip) {
-				return true
-			}
-		}
-	}
-	for _, nested := range as.AddressSets {
-		if matchPolicyAddrSet(nested, ip, cfg, depth+1) {
-			return true
-		}
-	}
-	return false
-}
-
-// matchPolicyApp checks if a protocol/port matches application references.
-func matchPolicyApp(apps []string, proto string, dstPort int, cfg *config.Config) bool {
-	if len(apps) == 0 || proto == "" {
-		return true
-	}
-	for _, a := range apps {
-		if a == "any" {
-			return true
-		}
-		if matchSingleApp(a, proto, dstPort, cfg) {
-			return true
-		}
-		if cfg.Applications.ApplicationSets != nil {
-			if as, ok := cfg.Applications.ApplicationSets[a]; ok {
-				for _, appRef := range as.Applications {
-					if matchSingleApp(appRef, proto, dstPort, cfg) {
-						return true
-					}
-				}
-			}
-		}
-	}
-	return false
-}
-
-func matchSingleApp(appName, proto string, dstPort int, cfg *config.Config) bool {
-	if cfg.Applications.Applications == nil {
-		return false
-	}
-	app, ok := cfg.Applications.Applications[appName]
-	if !ok {
-		return false
-	}
-	if app.Protocol != "" && !strings.EqualFold(app.Protocol, proto) {
-		return false
-	}
-	if app.DestinationPort != "" && dstPort > 0 {
-		if strings.Contains(app.DestinationPort, "-") {
-			parts := strings.SplitN(app.DestinationPort, "-", 2)
-			lo, _ := strconv.Atoi(parts[0])
-			hi, _ := strconv.Atoi(parts[1])
-			if dstPort < lo || dstPort > hi {
-				return false
-			}
-		} else {
-			p, _ := strconv.Atoi(app.DestinationPort)
-			if p != dstPort {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// policyActionName returns a human-readable policy action name.
-func policyActionName(a config.PolicyAction) string {
-	switch a {
-	case 1:
-		return "deny"
-	case 2:
-		return "reject"
-	default:
-		return "permit"
-	}
-}
-
-// matchShowPolicyAddr checks if an IP matches a list of address-book references.
-func matchShowPolicyAddr(addrs []string, ip net.IP, cfg *config.Config) bool {
-	if len(addrs) == 0 || ip == nil {
-		return true
-	}
-	for _, a := range addrs {
-		if a == "any" {
-			return true
-		}
-		if cfg.Security.AddressBook == nil {
-			continue
-		}
-		if addr, ok := cfg.Security.AddressBook.Addresses[a]; ok {
-			_, cidr, err := net.ParseCIDR(addr.Value)
-			if err == nil && cidr.Contains(ip) {
-				return true
-			}
-		}
-		if matchShowPolicyAddrSet(a, ip, cfg, 0) {
-			return true
-		}
-	}
-	return false
-}
-
-func matchShowPolicyAddrSet(setName string, ip net.IP, cfg *config.Config, depth int) bool {
-	if depth > 5 || cfg.Security.AddressBook == nil {
-		return false
-	}
-	as, ok := cfg.Security.AddressBook.AddressSets[setName]
-	if !ok {
-		return false
-	}
-	for _, addrName := range as.Addresses {
-		if addr, ok := cfg.Security.AddressBook.Addresses[addrName]; ok {
-			_, cidr, err := net.ParseCIDR(addr.Value)
-			if err == nil && cidr.Contains(ip) {
-				return true
-			}
-		}
-	}
-	for _, nested := range as.AddressSets {
-		if matchShowPolicyAddrSet(nested, ip, cfg, depth+1) {
-			return true
-		}
-	}
-	return false
-}
-
-// matchShowPolicyApp checks if a protocol/port matches a list of application references.
-func matchShowPolicyApp(apps []string, proto string, dstPort int, cfg *config.Config) bool {
-	if len(apps) == 0 || proto == "" {
-		return true
-	}
-	for _, a := range apps {
-		if a == "any" {
-			return true
-		}
-		if matchShowSingleApp(a, proto, dstPort, cfg) {
-			return true
-		}
-		if cfg.Applications.ApplicationSets != nil {
-			if as, ok := cfg.Applications.ApplicationSets[a]; ok {
-				for _, appRef := range as.Applications {
-					if matchShowSingleApp(appRef, proto, dstPort, cfg) {
-						return true
-					}
-				}
-			}
-		}
-	}
-	return false
-}
-
-func matchShowSingleApp(appName, proto string, dstPort int, cfg *config.Config) bool {
-	if cfg.Applications.Applications == nil {
-		return false
-	}
-	app, ok := cfg.Applications.Applications[appName]
-	if !ok {
-		return false
-	}
-	if app.Protocol != "" && !strings.EqualFold(app.Protocol, proto) {
-		return false
-	}
-	if app.DestinationPort != "" && dstPort > 0 {
-		if strings.Contains(app.DestinationPort, "-") {
-			parts := strings.SplitN(app.DestinationPort, "-", 2)
-			lo, _ := strconv.Atoi(parts[0])
-			hi, _ := strconv.Atoi(parts[1])
-			if dstPort < lo || dstPort > hi {
-				return false
-			}
-		} else {
-			p, _ := strconv.Atoi(app.DestinationPort)
-			if p != dstPort {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 // grpcResolveAddress looks up a named address in the global address book and returns its CIDR suffix.

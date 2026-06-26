@@ -21,6 +21,38 @@ func buildPolicyRuleCounterIndex(status *ProcessStatus) map[string]PolicyRuleCou
 	return index
 }
 
+// policyRuleIDForCounter translates the numeric policy-counter handle used by
+// the per-policy hit-count read callers into the stable rule ID that the
+// userspace helper reports counters by.
+//
+// IMPORTANT — two distinct numeric namespaces coexist by design, and this
+// resolver intentionally lives in the SLICE-INDEX one, NOT the span-accumulated
+// snapshot-PolicyID one:
+//
+//   - The dataplane snapshot's PolicyRuleSnapshot.PolicyID (assigned by
+//     walkPolicyRuleSlots / buildPolicySnapshots) is span-accumulated:
+//     policySetID*MaxRulesPerPolicy + ruleIndex, where ruleIndex advances by the
+//     application-set expansion count. That namespace serves the dataplane and
+//     the RT_FLOW/event path.
+//   - The per-policy COUNTER read path is name-keyed: the helper reports each
+//     rule's packets/bytes under its stable RuleID string
+//     (`from->to/name`, see PolicyRuleSnapshot.RuleID and
+//     buildPolicyRuleCounterIndex). The numeric policyID passed to
+//     ReadPolicyCounters is ONLY a handle the callers use to identify which
+//     policy they want a name for. EVERY production caller
+//     (pkg/api/metrics_counters.go, pkg/api/security.go,
+//     pkg/cli/cli_show_security*.go, pkg/grpcapi/server_show_*.go) computes that
+//     handle as policySetID*MaxRulesPerPolicy + sliceIndex, where sliceIndex is
+//     the raw position in zpp.Policies — NOT the expanded ruleIndex.
+//
+// Therefore this resolver MUST decode the remainder as a direct slice index to
+// agree with the callers. Decoding it as a span-accumulated index (mapping the
+// handle into the preceding policy's expansion span) would mis-resolve the
+// counter of every policy that follows a multi-application policy to the
+// preceding policy. The counter store never indexes by the span-accumulated id
+// (the helper is name-keyed; the legacy bpfShim policy_counters array is not
+// incremented in userspace mode), so there is nothing to "round-trip" against —
+// the only requirement is caller/resolver agreement, and both use slice index.
 func policyRuleIDForCounter(cfg *config.Config, policyID uint32) string {
 	if cfg == nil {
 		return ""

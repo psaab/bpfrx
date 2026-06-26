@@ -42,6 +42,7 @@
 //! - `tests`         — relocated screen_tests.rs (loaded via #[path]).
 
 use rustc_hash::FxHashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod extract;
 mod packet;
@@ -115,6 +116,15 @@ pub(crate) struct ScreenState {
     /// there.
     syn_cookie_profile_gen: FxHashMap<String, u64>,
     syn_cookie_last_full_epoch: u64,
+    /// #3032: Unix wall-clock seconds cached for SYN-cookie epoch math,
+    /// refreshed at most once per monotonic second (see
+    /// `current_syn_cookie_full_epoch`) so the SYN-flood hot path does not
+    /// read the OS clock per packet.
+    syn_cookie_epoch_wall_secs: u64,
+    /// #3032: the monotonic second at which `syn_cookie_epoch_wall_secs` was
+    /// last refreshed. `u64::MAX` is the "never refreshed" sentinel so the
+    /// first cookie mint/validate always samples the wall clock.
+    syn_cookie_epoch_clock_mono_secs: u64,
     #[cfg(test)]
     syn_cookie_full_epoch_override: Option<u64>,
     // Advanced screen trackers (shared across all zones since they track per-IP)
@@ -136,6 +146,8 @@ impl ScreenState {
             syn_cookie_validated: SynCookieValidatedCache::default(),
             syn_cookie_profile_gen: FxHashMap::default(),
             syn_cookie_last_full_epoch: 0,
+            syn_cookie_epoch_wall_secs: 0,
+            syn_cookie_epoch_clock_mono_secs: u64::MAX,
             #[cfg(test)]
             syn_cookie_full_epoch_override: None,
             port_scan: PortScanTracker::default(),
@@ -225,14 +237,40 @@ impl ScreenState {
         }
     }
 
-    fn current_syn_cookie_full_epoch(&mut self) -> u64 {
+    /// Current SYN-cookie full epoch, latched non-decreasing.
+    ///
+    /// `mono_now_secs` is the batch-cached `CLOCK_MONOTONIC` second already
+    /// threaded into `check_packet_with_zone_id` / the standby-ACK path. It
+    /// is used ONLY as a once-per-second refresh gate (#3032): the actual
+    /// epoch is derived from a cached *Unix wall-clock* sample, not from
+    /// `mono_now_secs`. The monotonic clock is unsuitable as the epoch input
+    /// because HA peers have unrelated monotonic bases — the wall clock is
+    /// the shared (NTP-synced) domain that lets a cookie minted on one node
+    /// validate on its peer. The OS wall clock is read at most once per
+    /// monotonic second, so a SYN flood no longer pays `SystemTime::now()`
+    /// per packet (every cookie in the same second shares one 64s epoch).
+    fn current_syn_cookie_full_epoch(&mut self, mono_now_secs: u64) -> u64 {
         #[cfg(test)]
         if let Some(epoch) = self.syn_cookie_full_epoch_override {
             return epoch;
         }
-        let epoch = SynCookieCodec::current_full_epoch();
+        if self.syn_cookie_epoch_clock_mono_secs != mono_now_secs {
+            self.syn_cookie_epoch_wall_secs = Self::read_unix_wall_secs();
+            self.syn_cookie_epoch_clock_mono_secs = mono_now_secs;
+        }
+        let epoch = SynCookieCodec::current_full_epoch(self.syn_cookie_epoch_wall_secs);
         self.syn_cookie_last_full_epoch = self.syn_cookie_last_full_epoch.max(epoch);
         self.syn_cookie_last_full_epoch
+    }
+
+    /// Read Unix wall-clock seconds. The single OS-clock read behind the
+    /// SYN-cookie epoch (#3032); kept off the per-packet leaf
+    /// (`SynCookieCodec::current_full_epoch`, which is pure).
+    fn read_unix_wall_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -388,7 +426,7 @@ impl ScreenState {
                             let Some(codec) = self.syn_cookie_codec else {
                                 return ScreenVerdict::Drop("syn-cookie-unavailable");
                             };
-                            let full_epoch = self.current_syn_cookie_full_epoch();
+                            let full_epoch = self.current_syn_cookie_full_epoch(now_secs);
                             let cookie_isn = codec.mint_isn(
                                 SynCookieTuple::from_packet(pkt),
                                 zone_id,
@@ -594,7 +632,7 @@ impl ScreenState {
             };
         };
         let cookie_isn = pkt.tcp_ack.wrapping_sub(1);
-        let current_epoch = self.current_syn_cookie_full_epoch();
+        let current_epoch = self.current_syn_cookie_full_epoch(now_secs);
         if !locally_active {
             if !SynCookieCodec::wire_epoch_matches_validation_window(current_epoch, cookie_isn) {
                 return SynCookieAckVerdict::NotApplicable;

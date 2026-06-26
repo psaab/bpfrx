@@ -2,6 +2,7 @@ package logging
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -191,5 +192,118 @@ func TestSessionAggregator_Defaults(t *testing.T) {
 	}
 	if agg.topN != 10 {
 		t.Errorf("expected default topN=10, got %d", agg.topN)
+	}
+	if agg.maxKeys != defaultMaxAggKeys {
+		t.Errorf("expected default maxKeys=%d, got %d", defaultMaxAggKeys, agg.maxKeys)
+	}
+}
+
+// TestSessionAggregator_CardinalityCap is the #2936 fail-on-revert guard.
+// It drives more unique sources AND destinations than the cap through Add()
+// and asserts: (1) neither map ever exceeds the cap, (2) the dropped counters
+// increment by exactly (offered - cap), and (3) Flush still returns a valid
+// top-N over the admitted set. Reverting the cap (unbounded insert) turns this
+// RED: the maps grow past the cap and the dropped counters stay 0.
+func TestSessionAggregator_CardinalityCap(t *testing.T) {
+	const cap = 100
+	agg := NewSessionAggregator(time.Hour, 10)
+	agg.maxKeys = cap // small cap for the test; production uses defaultMaxAggKeys
+
+	const offered = cap + 250
+	for i := 0; i < offered; i++ {
+		// Distinct source AND distinct destination per session so both maps
+		// are driven past the cap independently.
+		agg.Add(EventRecord{
+			Type:         "SESSION_CLOSE",
+			SrcAddr:      fmt.Sprintf("10.10.%d.%d:1234", i/256, i%256),
+			DstAddr:      fmt.Sprintf("10.20.%d.%d:80", i/256, i%256),
+			SessionBytes: uint64(i + 1),
+		})
+	}
+
+	agg.mu.Lock()
+	srcLen := len(agg.srcs)
+	dstLen := len(agg.dsts)
+	droppedSrc := agg.droppedSrc
+	droppedDst := agg.droppedDst
+	agg.mu.Unlock()
+
+	if srcLen > cap {
+		t.Errorf("src map exceeded cap: len=%d cap=%d (cap not enforced)", srcLen, cap)
+	}
+	if dstLen > cap {
+		t.Errorf("dst map exceeded cap: len=%d cap=%d (cap not enforced)", dstLen, cap)
+	}
+	if srcLen != cap {
+		t.Errorf("expected src map at cap=%d, got %d", cap, srcLen)
+	}
+	if dstLen != cap {
+		t.Errorf("expected dst map at cap=%d, got %d", cap, dstLen)
+	}
+	if want := uint64(offered - cap); droppedSrc != want {
+		t.Errorf("droppedSrc=%d, want exactly %d (offered-cap)", droppedSrc, want)
+	}
+	if want := uint64(offered - cap); droppedDst != want {
+		t.Errorf("droppedDst=%d, want exactly %d (offered-cap)", droppedDst, want)
+	}
+
+	// Flush must still return a valid, bounded top-N over the admitted set.
+	topSrc, topDst, fdSrc, fdDst := agg.flushWithDropped()
+	if len(topSrc) != 10 || len(topDst) != 10 {
+		t.Errorf("expected top-10 from admitted set, got src=%d dst=%d", len(topSrc), len(topDst))
+	}
+	if fdSrc != uint64(offered-cap) || fdDst != uint64(offered-cap) {
+		t.Errorf("flush dropped counts src=%d dst=%d, want %d", fdSrc, fdDst, offered-cap)
+	}
+	// top-N must be sorted by bytes descending.
+	for i := 1; i < len(topSrc); i++ {
+		if topSrc[i-1].Bytes < topSrc[i].Bytes {
+			t.Errorf("topSrc not sorted descending at %d", i)
+		}
+	}
+
+	// Flush resets the dropped counters for the next window.
+	agg.mu.Lock()
+	resetSrc, resetDst := agg.droppedSrc, agg.droppedDst
+	agg.mu.Unlock()
+	if resetSrc != 0 || resetDst != 0 {
+		t.Errorf("dropped counters not reset after flush: src=%d dst=%d", resetSrc, resetDst)
+	}
+}
+
+// TestSessionAggregator_BelowCapUnchanged asserts normal-cardinality traffic
+// (below the cap) produces identical top-N output with zero dropped keys — the
+// common case is behavior-preserving.
+func TestSessionAggregator_BelowCapUnchanged(t *testing.T) {
+	agg := NewSessionAggregator(time.Hour, 10)
+	agg.maxKeys = 100
+
+	// 5 sources, all under the cap, mirroring TestSessionAggregator_TopN-style
+	// input. Highest bytes last so ordering is exercised.
+	for i := 0; i < 5; i++ {
+		agg.Add(EventRecord{
+			Type:         "SESSION_CLOSE",
+			SrcAddr:      fmt.Sprintf("10.0.1.%d:1234", i+1),
+			DstAddr:      "10.0.2.1:80",
+			SessionBytes: uint64((i + 1) * 1000),
+		})
+	}
+
+	topSrc, topDst, droppedSrc, droppedDst := agg.flushWithDropped()
+	if droppedSrc != 0 || droppedDst != 0 {
+		t.Errorf("below-cap traffic must drop nothing: src=%d dst=%d", droppedSrc, droppedDst)
+	}
+	if len(topSrc) != 5 {
+		t.Fatalf("expected 5 source entries, got %d", len(topSrc))
+	}
+	if len(topDst) != 1 {
+		t.Fatalf("expected 1 destination entry, got %d", len(topDst))
+	}
+	// Highest-bytes source (10.0.1.5, 5000 bytes) ranks first.
+	if topSrc[0].IP != "10.0.1.5" || topSrc[0].Bytes != 5000 {
+		t.Errorf("expected top source 10.0.1.5/5000, got %s/%d", topSrc[0].IP, topSrc[0].Bytes)
+	}
+	if topDst[0].IP != "10.0.2.1" || topDst[0].Sessions != 5 {
+		t.Errorf("expected dest 10.0.2.1 with 5 sessions, got %s/%d", topDst[0].IP, topDst[0].Sessions)
 	}
 }

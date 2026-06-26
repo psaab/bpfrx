@@ -351,6 +351,15 @@ pub(crate) struct ZoneSnapshot {
     pub name: String,
     #[serde(default)]
     pub id: u16,
+    /// #3071: Junos `security zones security-zone <z> tcp-rst`. When true,
+    /// a TCP flow DENIED by policy/default-deny whose INGRESS (from) zone is
+    /// this zone is answered with a TCP RST toward the source instead of the
+    /// silent drop `deny` otherwise produces. Non-TCP denied traffic is
+    /// unaffected. Additive via serde default: a snapshot from an old Go
+    /// binary lacks the field, in which case the zone is treated as tcp-rst
+    /// off (the pre-#3071 silent-drop behavior).
+    #[serde(rename = "tcp_rst", default)]
+    pub tcp_rst: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -611,6 +620,45 @@ mod wg_snapshot_tests {
         };
         let dbg = format!("{snap:?}");
         assert!(!dbg.contains("deadbeef"), "Debug must redact the private key: {dbg}");
+    }
+}
+
+#[cfg(test)]
+mod zone_tcp_rst_tests {
+    use super::*;
+
+    // #3071: the per-zone `tcp-rst` knob round-trips over the JSON control
+    // wire byte-identically with the Go ZoneSnapshot (`tcp_rst`).
+    #[test]
+    fn zone_snapshot_tcp_rst_serializes_to_tcp_rst_key() {
+        let z = ZoneSnapshot {
+            name: "trust".to_string(),
+            id: 1,
+            tcp_rst: true,
+        };
+        let json = serde_json::to_string(&z).expect("serialize");
+        assert!(
+            json.contains("\"tcp_rst\":true"),
+            "expected tcp_rst:true in wire JSON, got {json}"
+        );
+    }
+
+    // Decode the EXACT shape the Go emitter produces for a tcp-rst zone.
+    #[test]
+    fn zone_snapshot_decodes_go_tcp_rst_payload() {
+        let z: ZoneSnapshot =
+            serde_json::from_str(r#"{"name":"trust","id":1,"tcp_rst":true}"#).expect("decode");
+        assert_eq!(z.name, "trust");
+        assert_eq!(z.id, 1);
+        assert!(z.tcp_rst, "tcp_rst must decode to true");
+    }
+
+    // Cross-version default: a snapshot from an old Go binary omits the field
+    // (omitempty), and serde must default it to false (pre-#3071 silent drop).
+    #[test]
+    fn zone_snapshot_missing_tcp_rst_defaults_false() {
+        let z: ZoneSnapshot = serde_json::from_str(r#"{"name":"untrust","id":2}"#).expect("decode");
+        assert!(!z.tcp_rst, "missing tcp_rst must default to false");
     }
 }
 

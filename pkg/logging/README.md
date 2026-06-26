@@ -16,7 +16,8 @@ reports.
 - `Subscription` — `eventbuf.go`. A consumer of the event ring.
 - `LocalLogWriter` — `locallog.go`. File-based writer with
   facility/severity filters.
-- `SessionAggregator` — `aggregator.go`. Top-N per-IP rollups.
+- `SessionAggregator` — `aggregator.go`. Top-N per-IP rollups,
+  cardinality-capped (see "Aggregator cardinality cap" below).
 
 ## Callers
 
@@ -132,6 +133,17 @@ if `Handle` runs the re-entrancy guard before the client check.
   syslog delivery as the legacy eBPF ring-buffer events do.
   `DecodeRawEventRecord` is decode-only and must not be used as a
   replacement for the full reader path when audit delivery matters.
+- **Protocol names come from the `appid.ProtocolName` SSOT (#3040).** The
+  event-log `protoName` helper (`ringbuf.go`) renders an IP protocol number
+  through the shared `appid.ProtocolName` table that REST (`pkg/api`,
+  #2949) and gRPC (`pkg/grpcapi`, #3037) already use, so GRE(47)/ESP(50)/
+  IPIP(4)/IPv6(41) sessions display named (GRE/ESP/IPIP/IPV6) instead of
+  numeric — matching the other operator surfaces. Before #3040 this helper
+  carried its own tcp/udp/icmp/icmpv6 map and rendered every other protocol
+  as a bare number. Casing is an event-log-local concern (this surface
+  upper-cases, keeping ICMPv6 mixed-case for the trace-filter contract);
+  unknown protocols still fall back to the numeric form. Pin:
+  `protoname_test.go`.
 - **Event time is DECISION time, not receive time (#2465/#2470/#2511).**
   The on-wire RT_FLOW frame carries an absolute Unix-nanosecond timestamp
   in its first 8 bytes (LE u64), stamped by the userspace-dp producer at
@@ -186,3 +198,38 @@ if `Handle` runs the re-entrancy guard before the client check.
   drop silently — by design. Don't wire a slow consumer to it.
 - The session aggregator flushes on a 5-minute timer. The flushed
   snapshot is the basis for `show security session aggregate`.
+
+### Aggregator cardinality cap (#2936)
+
+`SessionAggregator` keyed its source/destination maps by every distinct
+IP seen in `SESSION_CLOSE` events with no bound. Under high-cardinality
+traffic (spoofed-source or scan traffic — exactly what a security
+appliance sees during an incident) the two maps grew for the full flush
+window, and `topEntries` then allocated and `sort.Slice`-sorted O(N) over
+the entire cardinality twice per flush. The observability feature became
+a control-plane resource-exhaustion amplifier — it degraded under the
+very traffic it is meant to report on.
+
+The interim fix bounds memory **by configuration, not by traffic
+cardinality**: each map admits at most `defaultMaxAggKeys` (10000)
+distinct keys per flush window. Once a map is at the cap, a NEW key is
+dropped and counted in `droppedSrc`/`droppedDst`; keys already admitted
+keep aggregating, so the top-N over the admitted set stays accurate. The
+per-flush allocate+sort cost is therefore bounded by the cap.
+
+When the cap is hit, `flushAndLog` emits a warning-severity
+`RT_FLOW_SESSION_AGGREGATE dropped-keys source=N destination=M cap=K`
+line in addition to the top-N report. A non-zero `dropped-keys` count is
+itself an incident indicator (cardinality exceeded the cap this window).
+Below-cap traffic produces identical top-N output with no dropped line —
+the common case is behavior-preserving. Coverage:
+`TestSessionAggregator_CardinalityCap` (fail-on-revert) and
+`TestSessionAggregator_BelowCapUnchanged`.
+
+This is a deliberate interim. Capped maps keep the top-N exact only for
+the keys admitted *before* the cap was reached; a heavy hitter whose
+first packet of the window arrives after the cap fills is missed.
+Bounded heavy-hitter accounting (Space-Saving / Misra-Gries top-K with an
+overflow bucket) would make the top-K accurate independent of arrival
+order under adversarial cardinality. That accuracy refinement is tracked
+as a follow-up and is not required to close the DoS.

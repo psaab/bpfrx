@@ -809,6 +809,91 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// validatePolicyCommunityReferencesStrict hard-rejects a policy-statement term
+// whose `from community <name>` or `then community delete <name>` references a
+// community the config never defines under `policy-options community <name>`
+// (#2881).
+//
+// xpf renders `from community <name>` as the FRR route-map clause
+// `match community <name>` and `then community delete <name>` (added in #2848)
+// as `set comm-list <name> delete`. Both clauses reference an FRR
+// `bgp community-list <name>`, which xpf emits ONLY for a defined
+// `policy-options community <name>` (policy_render.go). With no validation an
+// undefined name passes commit and breaks at FRR render time: a dangling
+// `match community` / `set comm-list ... delete` line is rejected by
+// frr-reload, and because a single vtysh -f add-batch exits non-zero on any
+// CMD_WARNING_CONFIG_FAILED, the WHOLE reload fails — leaving dynamic routing
+// stale, a commit-accepted config the routing daemon cannot load.
+//
+// Only NAME references are checked. `then community (set|add) <value>` and the
+// bare `then community <value>` carry a community VALUE (e.g. 65000:100 /
+// no-export), not a community-list reference, so they are not validated here;
+// `then community none` carries no argument. Multiple `from community` siblings
+// (FromCommunity slice) and a multi-list `then community delete [ a b ]`
+// (CommunityDelete slice) are each fully walked.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientPolicyCommunityRef) so an already-persisted or
+// peer-synced config carrying the typo still boots (#1960 fail-closed-on-load
+// class). Commit / commit-check stay strict. Runs on the fully-compiled
+// *Config so the community map is populated regardless of authoring order.
+// Mirrors validateRoutingExportReferencesStrict.
+func validatePolicyCommunityReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	defined := func(name string) bool {
+		if cfg.PolicyOptions.Communities == nil {
+			return false
+		}
+		_, ok := cfg.PolicyOptions.Communities[name]
+		return ok
+	}
+
+	// Sort policy-statement names for a deterministic first-error message
+	// (the typed-config map iteration order is otherwise random).
+	names := make([]string, 0, len(cfg.PolicyOptions.PolicyStatements))
+	for name := range cfg.PolicyOptions.PolicyStatements {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, psName := range names {
+		ps := cfg.PolicyOptions.PolicyStatements[psName]
+		if ps == nil {
+			continue
+		}
+		for _, term := range ps.Terms {
+			if term == nil {
+				continue
+			}
+			for _, c := range term.FromCommunity {
+				if c == "" || defined(c) {
+					continue
+				}
+				return fmt.Errorf("policy-statement %s term %s `from community %s` "+
+					"references undefined community %q — xpf renders no "+
+					"`bgp community-list %s`, so the `match community` line would "+
+					"fail frr-reload (failing the entire FRR config load); define "+
+					"`policy-options community %s` or fix the name",
+					psName, term.Name, c, c, c, c)
+			}
+			for _, c := range term.CommunityDelete {
+				if c == "" || defined(c) {
+					continue
+				}
+				return fmt.Errorf("policy-statement %s term %s `then community delete %s` "+
+					"references undefined community %q — xpf renders no "+
+					"`bgp community-list %s`, so the `set comm-list %s delete` line "+
+					"would fail frr-reload (failing the entire FRR config load); "+
+					"define `policy-options community %s` or fix the name",
+					psName, term.Name, c, c, c, c, c)
+			}
+		}
+	}
+	return nil
+}
+
 // frrTokenUnsafeIndex returns the byte index of the first character in s
 // that FRR's command lexer cannot carry inside a single config token, or
 // -1 if every character is safe.
@@ -1497,6 +1582,403 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 	return nil
 }
 
+// validatePolicyMatchApplicationsStrict hard-rejects a security-policy
+// `match application <name>` token that resolves to NONE of: a predefined
+// junos-* application, a user-defined `applications application <name>`, or a
+// user-defined `applications application-set <name>` (#3144). Such a token (a
+// typo or an undefined app) was only WARNED at commit
+// (compiler_validate_warn.go), yet the userspace capability gate
+// (resolveUserspaceApplicationNames in pkg/dataplane/userspace/capabilities.go)
+// resolves the SAME name set and returns false for an unknown name →
+// expandUserspacePolicyApplications fails → userspaceSupportsSecurityPolicies
+// returns false → the dataplane REFUSES TO ARM security policies. The operator
+// gets a green commit and a silently DISARMED policy engine on the firewall's
+// primary allow/deny path — a commit/apply contract split. Failing the
+// undefined reference at commit turns the silent disarm into an
+// operator-visible error.
+//
+// Resolution mirrors the runtime gate EXACTLY (ResolveApplication, which checks
+// user apps then the predefined table, plus ResolveApplicationSet) so the
+// commit gate and the runtime gate cannot diverge. The `any` keyword and the
+// empty token are always accepted. Covers both zone-pair and global policies,
+// and the multi-value `application [ a b c ]` list — pol.Match.Applications is
+// populated from every list value (compiler_security.go reads m.Keys[1:] for
+// the collapsed-bracket form and m.Children for the hierarchical form, the same
+// accumulation firewallMatchValues performs), so iterating the typed list
+// covers each element.
+//
+// Distinct from #2217 (validateApplicationSetMembersStrict), which rejects a
+// DANGLING MEMBER of a DEFINED application-set. A direct policy reference to a
+// wholly undefined name is neither an app nor a set, so #2217's
+// ExpandApplicationSet walk never sees it — this gate is the one that catches
+// it. Composes cleanly: a defined set with a bad member is #2217's error; an
+// undefined top-level name is this gate's error.
+//
+// Strict on commit / commit-check (hard reject). Lenient on load / peer-sync
+// (warn so an already-persisted or peer-synced config that an older binary
+// accepted still BOOTS — #1960 no-brick; the dataplane independently refuses to
+// arm such a policy, so a leniently-loaded bad config is no worse off than
+// before, now flagged).
+func validatePolicyMatchApplicationsStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// appRefError returns nil if the token resolves, or a tailored reject.
+	// Resolution mirrors resolveUserspaceApplicationNames
+	// (pkg/dataplane/userspace/capabilities.go) EXACTLY so the commit gate and
+	// the runtime gate cannot diverge: a name resolves only if it is a
+	// predefined / user application OR an application-set that EXPANDS to >= 1
+	// member. A defined-but-EMPTY application-set resolves by NAME but expands
+	// to zero members → the runtime gate returns false →
+	// userspaceSupportsSecurityPolicies false → the dataplane refuses to arm
+	// security policies (#3146 — the same fail-open class this gate kills).
+	// #2217's validateApplicationSetMembersStrict `continue`s on an empty set,
+	// so nothing else catches it.
+	appRefError := func(scope, policyName, name string) error {
+		switch name {
+		case "", "any":
+			return nil
+		}
+		if _, ok := ResolveApplication(name, cfg.Applications.Applications); ok {
+			return nil
+		}
+		if _, ok := ResolveApplicationSet(name, cfg.Applications.ApplicationSets); ok {
+			// A malformed member (ExpandApplicationSet error) is #2217's gate's
+			// job and runs first; here a clean expansion to zero members is the
+			// empty-set fail-open (#3146).
+			expanded, err := ExpandApplicationSet(name, &cfg.Applications)
+			if err == nil && len(expanded) == 0 {
+				return policyMatchEmptyAppSetError(scope, policyName, name)
+			}
+			return nil
+		}
+		return policyMatchApplicationError(scope, policyName, name)
+	}
+	check := func(scope string, pol *Policy) error {
+		if pol == nil {
+			return nil
+		}
+		for _, app := range pol.Match.Applications {
+			if err := appRefError(scope, pol.Name, app); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if err := check("", pol); err != nil {
+				return err
+			}
+		}
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if err := check("global", pol); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// policyMatchApplicationError formats the #3144 undefined-application reject,
+// naming the policy scope, the policy, and the unresolved application token.
+func policyMatchApplicationError(scope, policyName, app string) error {
+	where := fmt.Sprintf("policy %q", policyName)
+	if scope != "" {
+		where = fmt.Sprintf("%s policy %q", scope, policyName)
+	}
+	return fmt.Errorf(
+		"security policies %s match application %q is not defined "+
+			"(no predefined junos-* application, no `applications application "+
+			"%q`, and no `applications application-set %q`) — an undefined "+
+			"application reference commits but the userspace dataplane then "+
+			"REFUSES to arm security policies (commit/apply split, fail-open) "+
+			"— define the application/application-set or fix the name (#3144)",
+		where, app, app, app)
+}
+
+// policyMatchEmptyAppSetError formats the #3146 reject for a policy
+// referencing a DEFINED but EMPTY application-set. The set exists by name but
+// expands to zero members, so the runtime resolveUserspaceApplicationNames
+// returns false (ExpandApplicationSet len==0) and the dataplane refuses to arm
+// security policies — the same commit/apply fail-open class as #3144.
+func policyMatchEmptyAppSetError(scope, policyName, name string) error {
+	where := fmt.Sprintf("policy %q", policyName)
+	if scope != "" {
+		where = fmt.Sprintf("%s policy %q", scope, policyName)
+	}
+	return fmt.Errorf(
+		"security policies %s match application %q is a defined but EMPTY "+
+			"application-set (it expands to zero applications) — the policy "+
+			"commits but the userspace dataplane then REFUSES to arm security "+
+			"policies (commit/apply split, fail-open) — add at least one "+
+			"`applications application-set %q application <name>` member or "+
+			"remove the reference (#3146)",
+		where, name, name)
+}
+
+// policyMatchAddressBookResolves mirrors the runtime address resolver
+// resolveUserspaceAddressBookEntry + expandUserspacePolicyAddresses
+// (pkg/dataplane/userspace/capabilities.go) for a single address-book NAME
+// token. It returns nil when the name fully resolves to >= 1 literal address
+// (i.e. the runtime capability gate accepts it), or an error describing the
+// FIRST member that does not resolve / the empty expansion that makes the
+// gate refuse to arm.
+//
+// The fail-closed semantics are copied verbatim from the runtime so the commit
+// gate and the runtime gate cannot diverge:
+//
+//   - a defined `address` with a non-empty Value resolves (accumulates one
+//     literal); an `address` with an EMPTY value does NOT (the runtime returns
+//     false on addr.Value == "").
+//   - an `address-set` resolves only if EVERY direct and nested member resolves
+//     AND it has at least one member (resolvedAny). A dangling member (a name
+//     that is neither a defined address nor a defined set) fails the WHOLE set
+//     — the runtime's `if !resolve(member) { return false }`. A defined-but-
+//     EMPTY set fails (resolvedAny stays false).
+//   - a cycle short-circuits to "resolved" for the inner visit (the runtime's
+//     `if seenSets[ref] { return true }`), but a name that expands to ZERO
+//     literals (e.g. a pure self-cycle) is still rejected by the outer
+//     len(values) == 0 check that expandUserspacePolicyAddresses applies.
+//
+// `seen` is NOT backtracked (no defer delete), matching the runtime's
+// persistent seenSets — this is deliberately distinct from ExpandAddressSet
+// (predefined.go), whose visited map backtracks for a different purpose.
+func policyMatchAddressBookResolves(ab *AddressBook, name string) error {
+	seen := make(map[string]bool)
+	count := 0 // literal addresses accumulated (mirrors expanded slice length)
+	var firstErr error
+	var resolve func(ref string) bool
+	resolve = func(ref string) bool {
+		if ref == "" {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("empty member reference")
+			}
+			return false
+		}
+		if addr := ab.Addresses[ref]; addr != nil {
+			if addr.Value == "" {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("address %q has no configured prefix "+
+						"(it resolves to no usable address)", ref)
+				}
+				return false
+			}
+			count++
+			return true
+		}
+		set := ab.AddressSets[ref]
+		if set == nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("member %q is not a defined address or "+
+					"address-set", ref)
+			}
+			return false
+		}
+		if seen[ref] {
+			return true // cycle: already counted up the stack (mirror runtime)
+		}
+		seen[ref] = true
+		resolvedAny := false
+		for _, m := range set.Addresses {
+			if !resolve(m) {
+				return false
+			}
+			resolvedAny = true
+		}
+		for _, m := range set.AddressSets {
+			if !resolve(m) {
+				return false
+			}
+			resolvedAny = true
+		}
+		if !resolvedAny {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("address-set %q is empty "+
+					"(it expands to no addresses)", ref)
+			}
+			return false
+		}
+		return true
+	}
+	if !resolve(name) {
+		if firstErr == nil {
+			firstErr = fmt.Errorf("%q resolves to no address", name)
+		}
+		return firstErr
+	}
+	if count == 0 {
+		// Resolved true but accumulated no literal (e.g. a pure cycle):
+		// mirrors expandUserspacePolicyAddresses' len(values) == 0 reject.
+		return fmt.Errorf("address-set %q expands to no addresses", name)
+	}
+	return nil
+}
+
+// validatePolicyMatchAddressSetMembersStrict hard-rejects a security-policy
+// source-address / destination-address that names a DEFINED address-book entry
+// (an address or an address-set) the runtime address resolver cannot fully
+// resolve to >= 1 literal address (#3149; also folds the empty-address-set case
+// #3147). This is the address-book sibling of #2217
+// (validateApplicationSetMembersStrict, the application-set member gate) and the
+// #3144/#3146 application gate.
+//
+// The split with validatePolicyMatchAddressesStrict (#2008): that gate rejects a
+// WHOLLY UNDEFINED token (a typo that is neither a defined name, `any`, nor a
+// literal CIDR/IP). This gate handles the token that IS a defined book name but
+// whose (recursive) members dangle, or that is a defined-but-EMPTY set, or a
+// defined address with no prefix. In all of these the runtime
+// resolveUserspaceAddressBookEntry returns false / an empty expansion →
+// userspacePolicyAddressesSupported false → userspaceSupportsSecurityPolicies
+// false → the dataplane REFUSES to arm security policies. The operator got a
+// green commit (only a compiler_validate_warn.go warning) and a silently
+// DISARMED allow/deny path — the same commit/apply fail-open class #3144/#3146
+// close for applications.
+//
+// #3147 excluded-inversion safety: the resolver is applied to the SAME
+// SourceAddresses / DestinationAddresses lists the runtime gate checks,
+// regardless of the *-address-excluded flag. Rejecting an empty / dangling set
+// at COMMIT is therefore fail-CLOSED for the excluded case too: an empty
+// excluded set can never be committed, so it can never reach the dataplane and
+// invert to match-all (the historic fail-open this constraint guards against).
+//
+// Resolution mirrors resolveUserspaceAddressBookEntry +
+// expandUserspacePolicyAddresses EXACTLY (see policyMatchAddressBookResolves),
+// so the commit gate and the runtime gate cannot diverge. `any` / `any-ipv4` /
+// `any-ipv6` / the empty token and literal CIDR/IP tokens are not book names and
+// are passed through (the #2008 gate already covers literals). Covers zone-pair
+// + global policies and both source and destination, including the recursive
+// address-set-of-address-sets case.
+//
+// Strict on commit / commit-check (hard reject naming the policy scope, the
+// policy, the field, and the unresolved member). Lenient on load / peer-sync
+// (warn via opts.lenientPolicyMatchAddressSetMembers so an already-persisted or
+// peer-synced config an older binary accepted still BOOTS — #1960; the dataplane
+// independently refuses to arm such a policy, so a leniently-loaded bad config
+// is no worse off, now flagged). Same doctrine as lenientPolicyMatchApplications.
+func validatePolicyMatchAddressSetMembersStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	ab := cfg.Security.AddressBook
+	if ab == nil {
+		return nil
+	}
+	isDefinedName := func(tok string) bool {
+		if _, ok := ab.Addresses[tok]; ok {
+			return true
+		}
+		if _, ok := ab.AddressSets[tok]; ok {
+			return true
+		}
+		return false
+	}
+	checkToken := func(scope, policyName, field, tok string) error {
+		switch tok {
+		case "", "any", "any-ipv4", "any-ipv6":
+			return nil
+		}
+		// A wholly-undefined token / literal is the domain of
+		// validatePolicyMatchAddressesStrict (#2008); only inspect defined names.
+		if !isDefinedName(tok) {
+			return nil
+		}
+		if err := policyMatchAddressBookResolves(ab, tok); err != nil {
+			return policyMatchAddressSetError(scope, policyName, field, tok, err)
+		}
+		return nil
+	}
+	check := func(scope string, pol *Policy) error {
+		if pol == nil {
+			return nil
+		}
+		for _, addr := range pol.Match.SourceAddresses {
+			if err := checkToken(scope, pol.Name, "source-address", addr); err != nil {
+				return err
+			}
+		}
+		for _, addr := range pol.Match.DestinationAddresses {
+			if err := checkToken(scope, pol.Name, "destination-address", addr); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if err := check("", pol); err != nil {
+				return err
+			}
+		}
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if err := check("global", pol); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// policyMatchAddressSetError formats the #3149 / #3147 reject, naming the policy
+// scope, the policy, the match field, the unresolved book name, and the inner
+// resolution failure.
+func policyMatchAddressSetError(scope, policyName, field, name string, cause error) error {
+	where := fmt.Sprintf("policy %q", policyName)
+	if scope != "" {
+		where = fmt.Sprintf("%s policy %q", scope, policyName)
+	}
+	return fmt.Errorf(
+		"security policies %s match %s %q does not fully resolve: %w — the "+
+			"policy commits but the userspace dataplane then REFUSES to arm "+
+			"security policies (commit/apply split, fail-open) — define the "+
+			"missing address/address-set or fix the member (#3149)",
+		where, field, name, cause)
+}
+
+// reservedZoneNames is the set of tokens the dataplane / Junos grammar reserves
+// for a special context and that therefore must NEVER be the name of an
+// operator-defined `security zones security-zone <name>` (#3055). It is used
+// ONLY by the zone-DEFINITION gate (validateReservedZoneNamesStrict).
+//
+// It is DELIBERATELY DISTINCT from policyZoneSpecialTokens (the zone-REFERENCE
+// exemption set) — see that var's comment. The two gates are mutually
+// reinforcing and must not be unified: a zone named "junos-global" is rejected
+// at definition here, while a policy that REFERENCES `from-zone junos-global`
+// against no defined zone stays hard-rejected by the reference gate (NOT made
+// reference-exempt). Adding "junos-global" to the reference-exempt set would
+// silently re-open the device-wide-permit class this gate closes, because the
+// dataplane (userspace-dp/src/policy.rs:1021) classifies a "junos-global"
+// reference as a device-wide global rule.
+//
+//   - "junos-global" — the device-wide global-policy sentinel. The userspace
+//     dataplane (userspace-dp/src/policy.rs) string-matches a from-zone/to-zone
+//     literally equal to "junos-global" and reclassifies the policy as a global
+//     fallback (JUNOS_GLOBAL_ZONE_ID = u16::MAX) evaluated for EVERY flow. An
+//     operator-defined zone of this name would silently turn its zone-scoped
+//     rules into device-wide fallbacks that permit traffic for unrelated zone
+//     pairs — a security-boundary escape.
+//
+//   - "any"         — Junos wildcard zone (`from-zone any`/`to-zone any`); a
+//     reserved policy-context token, never a named zone-id lookup, so a real
+//     zone named "any" can never be selected and would shadow the wildcard.
+//     (The dataplane does NOT actually index a from-zone/to-zone `any` policy —
+//     see validatePolicyWildcardZoneStrict, #3018 — but a zone DEFINITION named
+//     "any" is rejected here regardless.)
+//
+//   - "junos-host"  — Junos reserved self-traffic zone (host-inbound / host-
+//     outbound policy context); it is never declared as a `security zone`.
+var reservedZoneNames = map[string]struct{}{
+	"junos-global": {},
+	"any":          {},
+	"junos-host":   {},
+}
+
 // policyZoneSpecialTokens is the set of reserved from-zone/to-zone tokens
 // that name a context rather than an operator-defined security zone, and so
 // must be exempt from the "zone must be defined" gate
@@ -1505,20 +1987,80 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 //   - ""            — an empty token: a zone-pair with no name compiles to no
 //     usable rule and is not an undefined-zone reference per se; leave it to
 //     the structural compiler rather than reporting a confusing `""` error.
-//   - "any"         — Junos wildcard zone (`from-zone any`/`to-zone any`); the
-//     dataplane treats it as match-any, never a named zone-id lookup.
+//   - "any"         — Junos wildcard zone (`from-zone any`/`to-zone any`); kept
+//     exempt HERE so the undefined-zone gate does not emit a confusing "define
+//     `security zones security-zone any`" error (such a zone definition is
+//     itself rejected). A from-zone/to-zone `any` is instead hard-rejected by
+//     the dedicated wildcard gate (validatePolicyWildcardZoneStrict, #3018)
+//     because the dataplane never indexes it (fail-OPEN), NOT because the zone
+//     is undefined.
 //   - "junos-host"  — Junos reserved self-traffic zone (host-inbound / host-
 //     outbound policy context); it is never declared as a `security zone`.
 //
-// Global policies (`security policies global { ... }`) are not validated here:
-// they live in cfg.Security.GlobalPolicies with no from/to-zone strings and
-// are mapped to the `junos-global` sentinel only when the dataplane snapshot is
-// built (see pkg/dataplane/userspace/policies.go), so they cannot reference an
-// undefined zone.
+// This set is DELIBERATELY NOT derived from reservedZoneNames and DELIBERATELY
+// OMITS "junos-global" (#3055). The two gates serve opposite purposes: the
+// definition gate rejects a reserved NAME, while this reference gate must keep
+// hard-rejecting (+ warning) a policy that REFERENCES `from-zone junos-global`
+// / `to-zone junos-global` when no such zone is defined — making junos-global
+// reference-exempt would let that reference reach the dataplane, which then
+// (policy.rs:1021) classifies it as a device-wide global rule: the exact
+// fail-OPEN this PR closes. The definition gate already guarantees no zone
+// named junos-global can exist, so an explicit junos-global reference is always
+// the bug, never a legitimate named-zone use. Global policies (`security
+// policies global { ... }`) are not validated here: they live in
+// cfg.Security.GlobalPolicies with no from/to-zone strings and are mapped to
+// the `junos-global` sentinel only when the dataplane snapshot is built (see
+// pkg/dataplane/userspace/policies.go), so they cannot reference an undefined
+// zone.
 var policyZoneSpecialTokens = map[string]struct{}{
 	"":           {},
 	"any":        {},
 	"junos-host": {},
+}
+
+// validateReservedZoneNamesStrict hard-rejects a `security zones security-zone
+// <name>` DEFINITION whose name is a reserved sentinel token (#3055).
+//
+// The bug: compileZones accepts any zone name, and the userspace dataplane
+// (userspace-dp/src/policy.rs) string-matches a from-zone/to-zone literally
+// equal to "junos-global" and reclassifies the policy as a device-wide global
+// fallback (JUNOS_GLOBAL_ZONE_ID = u16::MAX) evaluated for every flow. So an
+// operator-defined zone named "junos-global" turns its zone-scoped policies
+// into device-wide fallbacks that can permit traffic for unrelated zone pairs —
+// a silent security-boundary escape. "any" and "junos-host" are reserved policy
+// context tokens that must likewise never be a real zone name (a zone the
+// dataplane could never select, shadowing the wildcard / self-traffic context).
+//
+// Strict on the commit / commit-check path (CompileConfig — hard reject so the
+// operator sees it); downgraded to a cfg.Warnings entry on the tolerant load /
+// peer-sync paths (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientReservedZoneNames) so an already-persisted or peer-synced config an
+// older binary accepted still BOOTS (#1960 fail-closed-on-load doctrine).
+// Iteration is over cfg.Security.Zones in sorted name order so the first-
+// reported error is deterministic. Reserved tokens are reported in a fixed
+// order for a stable message.
+func validateReservedZoneNamesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if _, reserved := reservedZoneNames[name]; reserved {
+			return fmt.Errorf(
+				"security zone %q uses a reserved name: %q (along with \"any\" "+
+					"and \"junos-host\") is a reserved dataplane/Junos context "+
+					"token and cannot be the name of a `security zones "+
+					"security-zone` — the dataplane would reclassify the zone's "+
+					"policies as device-wide global fallbacks (or never select "+
+					"the zone), silently breaking zone isolation; rename the zone",
+				name, name)
+		}
+	}
+	return nil
 }
 
 // validatePolicyZoneReferencesStrict hard-rejects a security policy zone-pair
@@ -1572,6 +2114,125 @@ func validatePolicyZoneReferencesStrict(cfg *Config) error {
 			return fmt.Errorf(
 				"security policy from-zone %q to-zone %q references undefined to-zone %q; define `set security zones security-zone %s` in the same commit or the rule is silently never matched (zone-pair falls through to the default policy)",
 				zpp.FromZone, zpp.ToZone, zpp.ToZone, zpp.ToZone)
+		}
+	}
+	return nil
+}
+
+// validatePolicyWildcardZoneStrict hard-rejects an ordinary security policy
+// zone-pair (`from-zone <a> to-zone <b> { policy ... }`) whose from-zone or
+// to-zone is the literal Junos wildcard `any` (#3018).
+//
+// The strict zone-reference gate (validatePolicyZoneReferencesStrict) EXEMPTS
+// `any` from the "zone must be defined" check, and the historical comment
+// claimed the dataplane "treats it as match-any". It does NOT. The userspace
+// snapshot builder (pkg/dataplane/userspace/policies.go) carries the literal
+// "any" string unchanged for an ordinary zone-pair policy — only `security
+// policies global` is mapped to the junos-global sentinel — and
+// PolicyState::from_snapshots (userspace-dp/src/policy.rs) only indexes a
+// non-global rule when BOTH zones resolve via zone_name_to_id.get(). "any" is
+// never inserted into zone_name_to_id (only declared zones are), so the rule is
+// KEPT but never indexed and never evaluated. Result: `from-zone any to-zone
+// trust ... then deny` commits and looks legitimate yet never blocks traffic
+// (fail-OPEN under a permit default); `from-zone trust to-zone any then permit`
+// cannot permit under a deny default. An admitted-but-unenforced security policy
+// is a fail-open bug, so the interim fix hard-rejects it at commit rather than
+// letting it silently fail open.
+//
+// This is the INTERIM contract: full wildcard-zone runtime indexing (separate
+// ordered index lists for exact / from-any / to-any / both-any, evaluated in
+// Junos precedence before global/default) is a substantial dataplane change
+// deferred to a follow-up; until it exists a from-zone/to-zone `any` literal is
+// rejected. It does NOT touch the unrelated `any` tokens elsewhere in a policy
+// (`match source-address any` / `match application any`) — only the
+// from-zone/to-zone slot. Global policies (`security policies global`) live in
+// cfg.Security.GlobalPolicies with no from/to-zone strings and are mapped to the
+// junos-global sentinel by the snapshot builder, so they ARE enforced and are
+// not iterated here.
+//
+// Strict on commit / commit-check (CompileConfig — hard reject so the operator
+// sees the unenforceable rule); downgraded to a cfg.Warnings entry on the
+// tolerant load / peer-sync paths (CompileConfigLenient /
+// CompileConfigForNodeLenient, flag lenientPolicyWildcardZone) so an
+// already-persisted or peer-synced config carrying a from-zone/to-zone `any`
+// still BOOTS (#1960 no-brick) — it stays unenforced (the pre-existing
+// behavior), now flagged. Iteration is in cfg.Security.Policies order
+// (deterministic), so the first-reported error is stable.
+func validatePolicyWildcardZoneStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		var side string
+		switch {
+		case zpp.FromZone == "any" && zpp.ToZone == "any":
+			side = "from-zone and to-zone"
+		case zpp.FromZone == "any":
+			side = "from-zone"
+		case zpp.ToZone == "any":
+			side = "to-zone"
+		default:
+			continue
+		}
+		name := "(unnamed)"
+		if len(zpp.Policies) > 0 && zpp.Policies[0] != nil && zpp.Policies[0].Name != "" {
+			name = zpp.Policies[0].Name
+		}
+		return fmt.Errorf(
+			"security policy %q (from-zone %q to-zone %q) uses the wildcard zone `any` on its %s; the userspace dataplane does not index a from-zone/to-zone `any` policy (userspace-dp/src/policy.rs only indexes a rule when both zones resolve to a declared zone-id), so the rule would COMMIT but never be evaluated — failing open under a permit default. Rewrite it as explicit per-zone-pair policies, or as a `security policies global` policy for a device-wide rule; full wildcard-zone support is a deferred follow-up",
+			name, zpp.FromZone, zpp.ToZone, side)
+	}
+	return nil
+}
+
+// validateScreenProfileReferencesStrict hard-rejects a security zone whose
+// `screen <name>` references a screen-ids-option profile the configuration
+// never defines under `set security screen ids-option <name>` (#3066).
+//
+// Before this gate the reference was WARNED only (ValidateConfig /
+// compiler_validate_warn.go), so the commit succeeded with an unenforceable
+// reference. At runtime the userspace dataplane fails OPEN: a missing profile
+// makes ScreenEngine::check_packet_with_zone_id return ScreenVerdict::Pass
+// (userspace-dp/src/screen/mod.rs — `let Some(profile) = self.profiles.get(zone)
+// else { return ScreenVerdict::Pass; }`), so EVERY screen check (land,
+// syn-flood, ping-death, teardrop, scans, rate limits) is silently skipped for
+// that zone. A typo'd or uncreated profile name thus leaves the zone with no
+// screen protection while the operator believes screening is active — the same
+// silent fail-OPEN commit-validation class as the closed #2401 (undefined
+// policy zone references). Junos rejects an undefined `screen ids-option`
+// reference at commit; this validator restores that fail-CLOSED parity.
+//
+// Strict on the commit / commit-check path (CompileConfig — hard-reject);
+// downgraded to a cfg.Warnings entry on the tolerant load / peer-sync paths
+// (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientScreenProfileRefs) so an already-persisted or peer-synced config that
+// an older binary accepted still BOOTS (#1960 fail-closed-on-load doctrine).
+// On that tolerant path the dataplane is NOT independently safe — the missing
+// profile fails open — so the warning is the operator's only signal; the strict
+// commit gate is the real fix that keeps a bad reference from ever reaching the
+// dataplane. Iteration is over cfg.Security.Zones in sorted name order so the
+// first-reported error is deterministic.
+func validateScreenProfileReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		zone := cfg.Security.Zones[name]
+		if zone == nil || zone.ScreenProfile == "" {
+			continue
+		}
+		if _, ok := cfg.Security.Screen[zone.ScreenProfile]; !ok {
+			return fmt.Errorf(
+				"security zone %q references undefined screen profile %q; define `set security screen ids-option %s` in the same commit or the zone silently runs with NO screen protection (the dataplane fails open for a missing profile)",
+				name, zone.ScreenProfile, zone.ScreenProfile)
 		}
 	}
 	return nil
@@ -1678,6 +2339,71 @@ func validatePolicyTerminalActionStrict(cfg *Config) error {
 	return nil
 }
 
+// validatePolicyLogActionStrict hard-rejects a security policy whose `then log`
+// names neither `session-init` nor `session-close` (#3060).
+//
+// Junos requires `then log` to carry at least one of session-init /
+// session-close — a bare `then log` is not valid syntax. xpf's schema accepts
+// the bare form, and compilePolicy sets pol.Log = &PolicyLog{} for it while
+// leaving both SessionInit and SessionClose false. The result is a config that
+// REPORTS logging enabled over REST (pkg/api/security.go: `Log: rule.Log !=
+// nil`) and gRPC/CLI, yet emits NO session records because both log flags are
+// false. On a security appliance this is the worst kind of silent gap: audit
+// looks active while producing nothing.
+//
+// Rejecting the bare form at commit (Junos parity) is the strongest, simplest
+// contract: no bare-log config can exist post-commit, which moots the
+// REST/gRPC/CLI display divergence entirely (every surface agrees because a
+// reported `pol.Log != nil` always carries at least one real session flag).
+// Both per-zone-pair policies and global policies are checked. Iteration order
+// (cfg.Security.Policies, then GlobalPolicies) is deterministic, so the
+// first-reported error is stable.
+//
+// Strict on the commit / commit-check path (CompileConfig — hard-reject);
+// downgraded to a cfg.Warnings entry on the tolerant load / peer-sync paths
+// (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientPolicyLogAction) so an already-persisted or peer-synced config that an
+// older binary accepted still BOOTS (#1960 fail-closed-on-load doctrine). A
+// leniently-loaded bare-log policy is harmless: it simply logs nothing (the
+// pre-existing behavior), and the warning is the operator's signal to fix it.
+// Same doctrine as validatePolicyTerminalActionStrict.
+func validatePolicyLogActionStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(scope string, pol *Policy) error {
+		if pol == nil || pol.Log == nil {
+			return nil
+		}
+		if pol.Log.SessionInit || pol.Log.SessionClose {
+			return nil
+		}
+		detail := "`then log` requires `session-init` and/or `session-close` " +
+			"(a bare `then log` reports logging enabled but emits NO session " +
+			"records — Junos requires at least one of session-init/session-close)"
+		if scope != "" {
+			return fmt.Errorf("%s policy %q: %s", scope, pol.Name, detail)
+		}
+		return fmt.Errorf("policy %q: %s", pol.Name, detail)
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if err := check("", pol); err != nil {
+				return err
+			}
+		}
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if err := check("global", pol); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // MaxUsableZoneID is the largest security-zone id the live AF_XDP userspace
 // dataplane can carry. Zone ids are assigned sequentially 1..N in
 // pkg/dataplane/compiler.go and reach the dataplane two ways: as the per-flow
@@ -1725,12 +2451,132 @@ func validateZoneCountStrict(cfg *Config) error {
 	return nil
 }
 
+// zoneIfaceLogicalKeys returns the set of effective logical-interface keys a
+// single `set security zones security-zone <z> interfaces <iface>` entry
+// claims, mirroring how pkg/dataplane/userspace.buildInterfaceZoneMap expands a
+// zone-interface entry into the userspace interface->zone lookup (#3072). It is
+// the conflict-detection counterpart of that expansion: two zones whose key
+// sets intersect would map the same physical/logical interface to two zone ids,
+// which buildInterfaceZoneMap silently resolves first-writer-wins over the
+// sorted zone names.
+//
+//   - A unit-qualified entry (`base.unit`, e.g. `ge-0/0/0.0`) claims exactly the
+//     one logical unit key `base.unit`. It deliberately does NOT claim the bare
+//     `base` key: two DIFFERENT units of one physical interface in two zones
+//     (`ge-0/0/0.0` in trust, `ge-0/0/0.1` in untrust) is a valid VLAN sub-
+//     interface split and must not be rejected. (buildInterfaceZoneMap's bare
+//     `base` fallback for untagged lookups is a coarse first-writer-wins
+//     artifact, not an operator-visible second assignment.)
+//   - A bare entry (`base`, no unit) claims the whole physical interface: the
+//     bare key `base` plus every configured unit `base.<n>` from
+//     cfg.Interfaces. Listing the same physical interface bare in two zones, or
+//     bare in one zone and a unit of it in another, is a genuine multi-zone
+//     assignment.
+//
+// A trailing-dot form (`base.`) is treated as bare (no specific unit), matching
+// buildInterfaceZoneMap which falls through to the unit-expansion branch when
+// the unit token is empty.
+func zoneIfaceLogicalKeys(cfg *Config, iface string) []string {
+	base, unit, ok := strings.Cut(iface, ".")
+	if ok && unit != "" {
+		return []string{base + "." + unit}
+	}
+	// Bare interface: claim the physical interface and all its configured units.
+	if base == "" {
+		base = iface
+	}
+	keys := []string{base}
+	if cfg != nil {
+		if ifCfg := cfg.Interfaces.Interfaces[base]; ifCfg != nil {
+			for unitNum := range ifCfg.Units {
+				keys = append(keys, fmt.Sprintf("%s.%d", base, unitNum))
+			}
+		}
+	}
+	return keys
+}
+
+// validateZoneInterfaceMembershipStrict hard-rejects a configuration that
+// assigns the same interface to more than one security zone (#3072).
+//
+// pkg/dataplane/userspace.buildInterfaceZoneMap builds the interface->zone
+// lookup by iterating the zone names in SORTED order and writing each interface
+// (plus its base/unit aliases) first-writer-wins. So an interface listed under
+// two zones is silently accepted at commit and resolved to whichever zone name
+// sorts first — independent of operator intent or config order. A packet that
+// should be evaluated as `trust -> untrust` is instead evaluated as
+// `aaa -> untrust` purely because "aaa" < "trust", causing an unintended permit
+// or deny. Junos rejects an interface in two zones; a security appliance must
+// not silently choose one.
+//
+// This validator restores that fail-CLOSED parity. It computes, per zone (in
+// sorted order for a deterministic first-reported error), the logical-interface
+// keys each zone-interface entry claims (zoneIfaceLogicalKeys — the same
+// base/unit expansion buildInterfaceZoneMap performs) and rejects the first key
+// claimed by two different zones, naming the interface and BOTH conflicting
+// zones. Listing the same interface twice WITHIN one zone is harmless (a
+// repeated `set`) and is not flagged. Two distinct units of one physical
+// interface in two zones (a valid VLAN split) is NOT flagged — see
+// zoneIfaceLogicalKeys.
+//
+// Strict on the commit / commit-check path (CompileConfig — hard-reject);
+// downgraded to a cfg.Warnings entry on the tolerant load / peer-sync paths
+// (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientZoneInterfaceMembership) so an already-persisted or peer-synced config
+// that an older binary accepted still BOOTS (#1960 fail-closed-on-load
+// doctrine). On that tolerant path behavior is unchanged and deterministic:
+// buildInterfaceZoneMap keeps its first-writer-wins (sorted-zone) resolution, so
+// the leniently-loaded config forwards exactly as it did before this gate
+// existed — just with an operator-visible warning.
+func validateZoneInterfaceMembershipStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	type claim struct {
+		zone string
+		raw  string
+	}
+	owner := make(map[string]claim)
+	zoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		zoneNames = append(zoneNames, name)
+	}
+	sort.Strings(zoneNames)
+	for _, zoneName := range zoneNames {
+		zone := cfg.Security.Zones[zoneName]
+		if zone == nil {
+			continue
+		}
+		for _, iface := range zone.Interfaces {
+			if iface == "" {
+				continue
+			}
+			for _, key := range zoneIfaceLogicalKeys(cfg, iface) {
+				prev, exists := owner[key]
+				if exists {
+					if prev.zone != zoneName {
+						return fmt.Errorf(
+							"interface %q is assigned to security zones %q and %q; an interface must belong to exactly one security zone (the dataplane silently resolves a multi-zone interface to whichever zone name sorts first, evaluating traffic against the wrong zone's policy) — remove it from one zone",
+							iface, prev.zone, zoneName)
+					}
+					// Same zone (repeated set, or base/unit overlap within
+					// one zone): keep the first claim, not a conflict.
+					continue
+				}
+				owner[key] = claim{zone: zoneName, raw: iface}
+			}
+		}
+	}
+	return nil
+}
+
 // validateApplicationSpecsStrict hard-rejects a user-defined application
 // (`set applications application <name> ...`) whose destination-port /
 // source-port is malformed (not a valid numeric port, port range, or known
 // service name, out of 1..65535, or an inverted low>high range) or whose
-// protocol token is not a known name, a junos-*
-// alias, or a 0..255 number (#2142) — but ONLY for applications that are
+// protocol token is not a known name, a RESOLVABLE junos-* alias (one the
+// dataplane's appid.ProtocolNumber actually knows — #3150), or a 0..255 number
+// (#2142) — but ONLY for applications that are
 // actually REFERENCED by a security policy or a source/destination-NAT rule's
 // `match application` (#2187), or for ALL applications when
 // `services application-identification` is enabled (every app then compiles
@@ -1752,12 +2598,16 @@ func validateZoneCountStrict(cfg *Config) error {
 // such an app is referenced by a policy, or app-id is turned on, the gate
 // engages.
 //
-// It reuses validatePortSpec and validateProtocol — the same config-layer
-// validators that produce the warning in ValidateConfig — so no new divergent
-// port/protocol table is introduced (the dataplane's #2124 capability gate is
-// the runtime backstop, and these validators are a superset of what it admits).
-// Iteration is sorted by application name so the first-reported error is
-// deterministic across runs (Go map order is randomized).
+// It reuses validatePortSpec for ports. For the protocol it uses
+// filterProtocolResolvable (the #2124/#2175 appid.ProtocolNumber mirror) rather
+// than the lenient validateProtocol: validateProtocol blanket-accepts any
+// "junos-" prefix, so a referenced app with `protocol junos-foobar` would commit
+// cleanly while the dataplane's appid.ProtocolNumber rejects it, disarming the
+// userspace policy capability gate (a commit/apply split — #3150). Using the
+// same authority the dataplane uses keeps commit and apply in agreement (the
+// dataplane's #2124 capability gate stays the runtime backstop). Iteration is
+// sorted by application name so the first-reported error is deterministic across
+// runs (Go map order is randomized).
 func validateApplicationSpecsStrict(cfg *Config) error {
 	if cfg == nil || len(cfg.Applications.Applications) == 0 {
 		return nil
@@ -1782,10 +2632,25 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 		if err := validatePortSpec(app.SourcePort); err != nil {
 			return fmt.Errorf("application %q: source-port: %w", name, err)
 		}
-		if app.Protocol != "" {
-			if err := validateProtocol(app.Protocol); err != nil {
-				return fmt.Errorf("application %q: %w", name, err)
-			}
+		// #3150: resolve the protocol against the SAME authority the dataplane
+		// uses (appid.ProtocolNumber, mirrored by filterProtocolResolvable) — NOT
+		// the lenient validateProtocol, which blanket-accepts any "junos-" prefix.
+		// validateProtocol would commit `protocol junos-foobar` cleanly while
+		// appid.ProtocolNumber rejects it, so the userspace policy capability gate
+		// (pkg/dataplane/userspace) then disarms — a commit-succeeds / apply-fails
+		// split. filterProtocolResolvable accepts only the concrete junos-* aliases
+		// the catalog knows (e.g. junos-ping, junos-tcp-any), real protocol names,
+		// and 0..255 numbers, so a referenced app whose protocol the dataplane
+		// cannot represent is rejected at commit instead.
+		if app.Protocol != "" && !filterProtocolResolvable(app.Protocol) {
+			return fmt.Errorf(
+				"application %q: unknown protocol %q (use a protocol name such as "+
+					"tcp/udp/icmp/icmpv6/gre/esp/ah/sctp/ospf, a resolvable junos-* "+
+					"alias such as junos-ping/junos-tcp-any, or a numeric value "+
+					"0-255 — the dataplane resolves protocols via appid.ProtocolNumber "+
+					"and cannot represent an arbitrary junos-* token, so accepting it "+
+					"would commit cleanly but fail to arm the referencing policy)",
+				name, app.Protocol)
 		}
 	}
 	return nil
@@ -2050,12 +2915,15 @@ func validateFilterActionsStrict(cfg *Config) error {
 // test TestFilterProtocolResolvableMatchesProtocolNumber via the exported
 // FilterProtocolResolvable accessor.
 //
-// The acceptance set is intentionally TIGHTER than validateProtocol (used by
-// validateApplicationSpecsStrict): validateProtocol blanket-accepts ANY
-// "junos-" prefix, but appid.ProtocolNumber only resolves the specific
-// junos-* aliases below, so an unknown "junos-foobar" must be rejected here to
-// stay consistent with the dataplane SSOT — otherwise commit would pass while
-// the swallowed dataplane gate dropped the constraint.
+// The acceptance set is intentionally TIGHTER than validateProtocol (the
+// lenient validator used by ValidateConfig's warning surface): validateProtocol
+// blanket-accepts ANY "junos-" prefix, but appid.ProtocolNumber only resolves
+// the specific junos-* aliases below, so an unknown "junos-foobar" must be
+// rejected here to stay consistent with the dataplane SSOT — otherwise commit
+// would pass while the swallowed dataplane gate dropped the constraint. Since
+// #3150, validateApplicationSpecsStrict also resolves an application's own
+// `protocol` leaf through THIS helper (not validateProtocol) for the same
+// reason — the broad junos-* accept there caused a commit/apply split.
 func filterProtocolResolvable(token string) bool {
 	switch strings.ToLower(strings.TrimSpace(token)) {
 	case "tcp", "junos-tcp-any",
@@ -2528,6 +3396,32 @@ func validateDestinationNATAddressesStrict(cfg *Config) error {
 						"the rule would commit but never translate any traffic",
 					rs.Name, rule.Name, strings.Join(destAddrs, ", "))
 			}
+			// #3029: a DNAT `match destination-address` that is a MULTI-HOST
+			// prefix (a CIDR with a non-host mask, e.g. 198.51.100.0/24) is
+			// silently narrowed to a single host. The snapshot builder
+			// (buildDestinationNATSnapshots) strips the `/mask` and emits an
+			// entry for the BASE address only, and the Rust DnatTable keys on
+			// an EXACT host IP (no prefix / LPM match) — so only the network
+			// address translates and every other host in the block bypasses
+			// DNAT entirely (silent under-translation). The dataplane has no
+			// prefix-match DNAT, and block-mapping semantics (1:1 offset vs
+			// many:one) are not settled, so REJECT the rule rather than commit a
+			// silently under-translating block. Single-host destinations (a bare
+			// IP, an explicit /32, or /128) are host masks and remain accepted
+			// unchanged. Reuses isHostMaskAddress, the same host-mask predicate
+			// the static-NAT path uses, so the family-specific mask check (32 vs
+			// 128) and the IPv4-mapped-IPv6 classification stay consistent.
+			for _, raw := range destAddrs {
+				if host, parsed := isHostMaskAddress(raw); parsed && !host {
+					return fmt.Errorf(
+						"destination-nat rule-set %q rule %q: match destination-address %q "+
+							"is a multi-host prefix; the dataplane DNAT match is exact-host "+
+							"only, so the rule would translate only the network address and "+
+							"silently bypass every other host in the block (use a /32 or /128 "+
+							"host address, or split the block into per-host rules)",
+						rs.Name, rule.Name, raw)
+				}
+			}
 		}
 	}
 	return nil
@@ -2797,4 +3691,141 @@ func validateNATSourceAddressNameReferencesStrict(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// vrrpVIPHostIP returns the host IP of a VRRP virtual-address string. xpf
+// requires a /prefix (schema_interfaces.go vrrpGroupSchemaNode), so the VIP is
+// normally CIDR (e.g. 10.0.1.1/24); a bare IP is tolerated here so a leniently-
+// loaded legacy config is still classified. An unparseable value returns nil
+// and is left to the schema validator's concern.
+func vrrpVIPHostIP(vip string) net.IP {
+	if vip == "" {
+		return nil
+	}
+	if ip, _, err := net.ParseCIDR(vip); err == nil {
+		return ip
+	}
+	return net.ParseIP(vip)
+}
+
+// validateVRRPVirtualAddressSubnet (#3013) rejects a VRRP virtual-address that
+// does not fall within any subnet configured on the same interface unit for the
+// matching address family.
+//
+// Background: a `vrrp-group <id> virtual-address <vip>` block is authored under
+// a `family inet|inet6 address <prefix>` on a unit. In Junos/vSRX a VIP outside
+// every on-link subnet of the unit is a commit-time configuration error. xpf
+// accepted it: at runtime the daemon installs the VIP as a host address, but
+// with no connected route covering it return traffic sourced from the VIP has
+// no on-link subnet association — a silent misconfiguration (operator-visible
+// only as a blackhole). This check restores vSRX config-parity by catching the
+// misconfig at commit instead of at runtime.
+//
+// For each VIP the validator asserts containment in the prefix of at least one
+// address configured on the SAME unit of the MATCHING family. The owning /
+// priority-255 case (VIP equals an interface address) is covered for free — an
+// interface address is trivially contained in its own subnet. A cross-family
+// VIP (e.g. a v4 literal authored under a v6-only address) has no matching-
+// family subnet to contain it and is therefore rejected, which is the intent.
+//
+// A unit carrying a real VRRP group always has at least the parent address of
+// the VIP's family in unit.Addresses (the group is nested under it), so the
+// matching-family subnet set is non-empty in the valid case — the only empty
+// case is the genuine cross-family/out-of-subnet misconfig.
+//
+// Strict (commit / commit-check): hard-reject, naming the interface, unit,
+// group, VIP and family. Lenient (load / peer-sync): warn so an already-
+// persisted or peer-synced config an older binary accepted still boots (#1960
+// fail-closed-on-load class).
+func validateVRRPVirtualAddressSubnet(cfg *Config, lenient bool) ([]string, error) {
+	if cfg == nil || cfg.Interfaces.Interfaces == nil {
+		return nil, nil
+	}
+	var warnings []string
+	// Deterministic iteration so commit errors / warnings are stable.
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, name)
+	}
+	sort.Strings(ifNames)
+	for _, ifName := range ifNames {
+		ifc := cfg.Interfaces.Interfaces[ifName]
+		if ifc == nil {
+			continue
+		}
+		unitNums := make([]int, 0, len(ifc.Units))
+		for n := range ifc.Units {
+			unitNums = append(unitNums, n)
+		}
+		sort.Ints(unitNums)
+		for _, un := range unitNums {
+			unit := ifc.Units[un]
+			if unit == nil || len(unit.VRRPGroups) == 0 {
+				continue
+			}
+			// Pre-parse the unit's configured subnets by family. The
+			// containment test is textual-CIDR based (net.ParseCIDR), so an
+			// unparseable address is skipped — not this validator's concern.
+			var v4nets, v6nets []*net.IPNet
+			for _, a := range unit.Addresses {
+				_, ipnet, err := net.ParseCIDR(a)
+				if err != nil || ipnet == nil {
+					continue
+				}
+				if ipnet.IP.To4() != nil {
+					v4nets = append(v4nets, ipnet)
+				} else {
+					v6nets = append(v6nets, ipnet)
+				}
+			}
+			gkeys := make([]string, 0, len(unit.VRRPGroups))
+			for k := range unit.VRRPGroups {
+				gkeys = append(gkeys, k)
+			}
+			sort.Strings(gkeys)
+			for _, gk := range gkeys {
+				vg := unit.VRRPGroups[gk]
+				if vg == nil {
+					continue
+				}
+				for _, vip := range vg.VirtualAddresses {
+					ip := vrrpVIPHostIP(vip)
+					if ip == nil {
+						// Bare/garbage VIP: the schema CIDR validator is
+						// responsible for rejecting a non-address value.
+						continue
+					}
+					nets := v6nets
+					fam := "inet6"
+					if ip.To4() != nil {
+						nets = v4nets
+						fam = "inet"
+					}
+					contained := false
+					for _, n := range nets {
+						if n.Contains(ip) {
+							contained = true
+							break
+						}
+					}
+					if contained {
+						continue
+					}
+					msg := fmt.Sprintf(
+						"interfaces %s unit %d vrrp-group %d virtual-address %s: "+
+							"not within any family %s subnet configured on the unit; "+
+							"the VIP would install without a connected route and "+
+							"blackhole return traffic (vSRX rejects this at commit)",
+						ifName, un, vg.ID, vip, fam)
+					if lenient {
+						warnings = append(warnings, msg+
+							" (ignored: VIP installed without a connected route until corrected)")
+						continue
+					}
+					return nil, fmt.Errorf("%s", msg)
+				}
+			}
+		}
+	}
+	return warnings, nil
 }

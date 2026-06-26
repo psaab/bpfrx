@@ -788,6 +788,125 @@ fn teardrop_under_length_non_first_fragment_drops() {
     );
 }
 
+#[test]
+fn teardrop_v6_tiny_non_first_fragment_drops() {
+    // #3119 fail-on-revert: an IPv6 non-first Fragment-header fragment
+    // carrying a tiny data contribution (< 8 bytes) is the IPv6 teardrop
+    // signature and must DROP. Pre-#3119 `check_teardrop` was gated on
+    // AF_INET only, so this slipped through as a PASS even though the
+    // sibling ping-of-death check already screened IPv6.
+    //
+    // offset 2 units = 16 bytes (non-first); payload_len=12 with a single
+    // 8-byte fragment header (frag_data_off=8) → frag_data = 12 - 8 = 4
+    // (< 8) → teardrop. Use UDP with udp-flood disabled and a
+    // teardrop-only profile so no other screen masks the outcome.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        2,     // offset = 2 units = 16 bytes (non-first fragment)
+        false, // trailing fragment
+        12,    // payload_len; frag_data = 12 - 8 = 4 (< 8)
+        8,
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("teardrop")
+    );
+}
+
+#[test]
+fn teardrop_v6_under_length_non_first_fragment_drops() {
+    // #3119 fail-on-revert: an IPv6 non-first fragment whose declared
+    // ip_payload_len is SMALLER than the ext-header bytes already walked
+    // (frag_data_off) yields a 0-byte (saturating) data contribution —
+    // malformed, the IPv6 analogue of the #3027 zero/negative-payload
+    // case — and must DROP.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        2,     // non-first fragment
+        false,
+        4, // payload_len < frag_data_off (8) → saturating_sub → 0 (< 8)
+        8,
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("teardrop")
+    );
+}
+
+#[test]
+fn teardrop_v6_normal_fragment_passes() {
+    // Control: an IPv6 non-first fragment carrying a healthy data
+    // contribution (>= 8 bytes) must NOT be flagged as teardrop. offset
+    // 100 units = 800 bytes; payload_len=1488 with frag_data_off=8 →
+    // frag_data = 1480 (>= 8). UDP with udp-flood disabled and a
+    // teardrop-only profile so only teardrop could fire.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        100,   // 800 bytes (non-first fragment)
+        false, // mid-chain fragment
+        1488,  // frag_data = 1488 - 8 = 1480 (>= 8)
+        8,
+    );
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn teardrop_v6_first_fragment_passes() {
+    // Control: an IPv6 FIRST fragment (offset 0) is never a teardrop even
+    // with a tiny data contribution — teardrop only fires on non-first
+    // fragments. M=1, offset=0.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        0,    // offset 0 → first fragment
+        true, // MORE_FRAGMENTS
+        12,   // tiny data, but offset==0 so not a teardrop
+        8,
+    );
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn teardrop_v6_disabled_profile_passes() {
+    // Fail-on-revert guard: with teardrop OFF, even a tiny v6 non-first
+    // fragment must PASS (the IPv6 arm must be gated on the profile flag,
+    // not always-on).
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = false;
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        2,
+        false,
+        12,
+        8,
+    );
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
 // ================================================================
 // ICMP fragment
 // ================================================================
@@ -1046,6 +1165,117 @@ fn extract_screen_info_ipv6_subsequent_fragment() {
         !info.is_first_fragment,
         "IPv6 offset>0 → is_first_fragment must be 0"
     );
+}
+
+#[test]
+fn extract_screen_info_ipv6_first_fragment_extheader_after_fragment_extracts_tcp() {
+    // #3120 ext-chain TCP-flag evasion: an IPv6 FIRST fragment whose
+    // chain is `Fragment(offset 0) → Destination-Options → TCP(SYN)`.
+    // RFC 8200 permits a destination-options header AFTER the fragment
+    // header, so the L4 (TCP) header is present in this first fragment,
+    // just one extension header further along. The pre-fix walk only
+    // checked whether the header IMMEDIATELY after the fragment header was
+    // TCP and then `break`d unconditionally, leaving `tcp_offset = None` —
+    // so the TCP seq/ack/MSS were never extracted and the TCP-flag screens
+    // / SYN-cookie flood challenge were bypassed. The fix continues the
+    // walk past the fragment header for first fragments, so the trailing
+    // dest-opts header is traversed and the real TCP header is found.
+    //
+    // Layout (l3_offset = 14):
+    //   14            Ethernet
+    //   14+0          IPv6 base (40), NextHdr = 44 (FRAGMENT)
+    //   14+40 = 54    Fragment header (8): NextHdr = 60 (DEST), MF=1 off=0
+    //   54+8  = 62    Dest-Options header (8): NextHdr = 6 (TCP), len=0
+    //   62+8  = 70    TCP (20 + 4-byte MSS option)
+    let mut frame = vec![0u8; 14 + 40 + 8 + 8 + 24];
+    frame[14] = 0x60; // version=6
+    frame[14 + 6] = 44; // base NextHdr = FRAGMENT
+    // Fragment header at 54.
+    frame[54] = 60; // NextHdr = DEST (an ext header, NOT TCP)
+    let frag_off_pos = 54 + 2;
+    frame[frag_off_pos..frag_off_pos + 2].copy_from_slice(&0x0001u16.to_be_bytes()); // MF=1, off=0
+    // Destination-Options header at 62: NextHdr=TCP, HdrExtLen=0 → 8 bytes.
+    frame[62] = 6; // NextHdr = TCP
+    frame[63] = 0; // HdrExtLen = 0 → (0+1)*8 = 8 bytes
+    // TCP header at 70.
+    let tcp = 70;
+    frame[tcp + 4..tcp + 8].copy_from_slice(&0x1122_3344u32.to_be_bytes()); // seq
+    frame[tcp + 8..tcp + 12].copy_from_slice(&0x0000_0000u32.to_be_bytes()); // ack
+    frame[tcp + 12] = 0x60; // data offset = 6 words = 24 bytes (room for MSS opt)
+    frame[tcp + 20] = 2; // option kind = MSS
+    frame[tcp + 21] = 4; // option len
+    frame[tcp + 22..tcp + 24].copy_from_slice(&1400u16.to_be_bytes()); // MSS value
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET6 as u8,
+        6,    // TCP
+        0x02, // SYN — the attack-relevant flag the screens must see
+        (frame.len() - 14) as u16,
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        12345,
+        80,
+        14,
+    )
+    .expect("first fragment with ext header after fragment must parse");
+
+    assert!(info.is_fragment, "MF=1 → is_fragment");
+    assert!(info.is_first_fragment, "MF=1 && offset==0 → is_first_fragment");
+    // The walk must have continued past the fragment + dest-opts headers to
+    // the real TCP header. If the FRAGMENT arm still `break`d (the #3120
+    // bug), `tcp_offset` stays None and these fields are left at 0 — the TCP
+    // flags/seq/MSS are hidden from the screens (the evasion). The SYN flag
+    // (passed in `tcp_flags`) is still seen, but the SYN-cookie challenge
+    // consumes `tcp_mss`, which is only populated when the L4 is reached.
+    assert_eq!(info.tcp_seq, 0x1122_3344, "TCP seq must be extracted past the ext-header chain");
+    assert_eq!(info.tcp_mss, 1400, "TCP MSS option must be extracted past the ext-header chain");
+    assert_eq!(info.tcp_flags, 0x02, "SYN flag visible to the TCP-flag screens");
+}
+
+#[test]
+fn extract_screen_info_ipv6_nonfirst_fragment_extheader_stays_flowless() {
+    // #3120 non-regression (#2344/#3064): a NON-FIRST fragment (offset>0)
+    // with the same `Fragment → Dest-Options → TCP` chain shape carries no
+    // L4 header in THIS packet (the TCP header is in the first fragment).
+    // The walk must STOP at the fragment header and leave `tcp_offset`
+    // unused — the continue-past-fragment fix is gated on offset==0 only.
+    let mut frame = vec![0u8; 14 + 40 + 8 + 8 + 24];
+    frame[14] = 0x60;
+    frame[14 + 6] = 44; // FRAGMENT
+    frame[54] = 60; // NextHdr = DEST
+    let frag_off_pos = 54 + 2;
+    // offset = 1 (8-byte unit), MF=1 → 0x0009: a non-first fragment.
+    frame[frag_off_pos..frag_off_pos + 2].copy_from_slice(&0x0009u16.to_be_bytes());
+    frame[62] = 6; // would be TCP if (wrongly) walked
+    frame[63] = 0;
+    let tcp = 70;
+    frame[tcp + 4..tcp + 8].copy_from_slice(&0x1122_3344u32.to_be_bytes());
+    frame[tcp + 12] = 0x60;
+    frame[tcp + 20] = 2;
+    frame[tcp + 21] = 4;
+    frame[tcp + 22..tcp + 24].copy_from_slice(&1400u16.to_be_bytes());
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET6 as u8,
+        6,
+        0x02,
+        (frame.len() - 14) as u16,
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        12345,
+        80,
+        14,
+    )
+    .expect("non-first fragment parses");
+
+    assert!(info.is_fragment, "offset>0 → is_fragment");
+    assert!(!info.is_first_fragment, "offset>0 → not first fragment");
+    // No L4 header in this packet: the downstream gate `(!is_fragment ||
+    // is_first_fragment)` must skip extraction, so seq/MSS stay zero.
+    assert_eq!(info.tcp_seq, 0, "non-first fragment has no L4 to extract");
+    assert_eq!(info.tcp_mss, 0, "non-first fragment has no L4 to extract");
 }
 
 #[test]
@@ -1852,6 +2082,114 @@ fn syn_cookie_epoch_uses_unix_wall_clock_units() {
     assert_eq!(SynCookieCodec::full_epoch_from_unix_secs(63), 0);
     assert_eq!(SynCookieCodec::full_epoch_from_unix_secs(64), 1);
     assert_eq!(SynCookieCodec::full_epoch_from_unix_secs(64 * 33 + 9), 33);
+}
+
+#[test]
+fn syn_cookie_current_full_epoch_is_pure_wall_clock_passthrough() {
+    // #3032: the epoch leaf must be a pure function of the supplied Unix
+    // wall-clock seconds — it no longer reads the OS clock. Pinning it equal
+    // to `full_epoch_from_unix_secs` for sample seconds catches any
+    // off-by-one-epoch or clock-domain regression at the leaf.
+    for secs in [0u64, 1, 63, 64, 127, 128, 64 * 33 + 9, 1_800_000_000] {
+        assert_eq!(
+            SynCookieCodec::current_full_epoch(secs),
+            SynCookieCodec::full_epoch_from_unix_secs(secs),
+            "current_full_epoch must equal full_epoch_from_unix_secs for {secs}s",
+        );
+    }
+}
+
+#[test]
+fn syn_cookie_round_trip_with_cached_wall_secs() {
+    // #3032: minting with an epoch derived from a cached wall-clock second
+    // (as the hot path now does once per monotonic second) and validating
+    // with the same cached domain must round-trip — and must keep the same
+    // 60s+ window tolerance as before. T sits mid-epoch so the +/-1 epoch
+    // window is exercised, not a boundary artifact.
+    let codec = syn_cookie_codec();
+    let tuple = syn_cookie_tuple();
+    // 1_800_000_000 is an exact multiple of EPOCH_SECS (64), so the second
+    // sits at offset 0 within its epoch and the +/- arithmetic below stays
+    // inside / crosses epochs deterministically.
+    let mint_unix_secs = 1_800_000_000u64;
+    assert_eq!(mint_unix_secs % SynCookieCodec::EPOCH_SECS, 0);
+    let mint_epoch = SynCookieCodec::current_full_epoch(mint_unix_secs);
+    let cookie = codec.mint_isn(tuple, 7, mint_epoch, 1460);
+
+    // Validate at the same cached second.
+    assert!(
+        codec.validate_isn(tuple, 7, mint_epoch, cookie).is_some(),
+        "same-second validation must succeed",
+    );
+    // Validate from a second still inside the same epoch (cached value may be
+    // up to ~1s stale under the once-per-second refresh, well within window).
+    let same_epoch_later =
+        SynCookieCodec::current_full_epoch(mint_unix_secs + (SynCookieCodec::EPOCH_SECS - 1));
+    assert_eq!(same_epoch_later, mint_epoch);
+    assert!(
+        codec
+            .validate_isn(tuple, 7, same_epoch_later, cookie)
+            .is_some(),
+        "validation later in the same epoch must succeed",
+    );
+    // Validate one epoch ahead (next-second crossing into the next epoch) —
+    // still inside the +/-1 epoch acceptance window.
+    let next_epoch =
+        SynCookieCodec::current_full_epoch(mint_unix_secs + SynCookieCodec::EPOCH_SECS);
+    assert_eq!(next_epoch, mint_epoch + 1);
+    assert!(
+        codec.validate_isn(tuple, 7, next_epoch, cookie).is_some(),
+        "validation one epoch later must succeed (window tolerance)",
+    );
+    // Two epochs ahead is outside the window and must fail, exactly as
+    // before the cached-now change.
+    let two_epochs_ahead =
+        SynCookieCodec::current_full_epoch(mint_unix_secs + 2 * SynCookieCodec::EPOCH_SECS);
+    assert_eq!(two_epochs_ahead, mint_epoch + 2);
+    assert!(
+        codec.validate_isn(tuple, 7, two_epochs_ahead, cookie).is_none(),
+        "validation two epochs later must fail as before",
+    );
+}
+
+#[test]
+fn syn_cookie_screen_state_epoch_uses_wall_clock_not_monotonic() {
+    // #3032 (call-site clock-domain guard): `current_syn_cookie_full_epoch`
+    // takes the batch-cached MONOTONIC second purely as a once-per-second
+    // refresh throttle, but must derive the epoch from the cached Unix
+    // wall-clock seconds — NOT from the monotonic argument. This is the exact
+    // HA-breaking regression the issue feared: feeding `mono_now_secs` into
+    // the epoch (`current_full_epoch(mono_now_secs)`) would compile and pass
+    // every leaf/codec test. This test fails if that happens.
+    //
+    // No `set_syn_cookie_full_epoch_for_test` override here — that would
+    // short-circuit the very selection under test.
+    let mut state = make_state("trust", ScreenProfile::default());
+
+    // A small monotonic second lands in a wildly different epoch bucket than
+    // the live wall clock (~1.7e9s ⇒ epoch ~28M vs. epoch 0 for 5s), so the
+    // two are always distinguishable regardless of when the test runs.
+    let mono_now_secs = 5u64;
+    let monotonic_epoch = SynCookieCodec::full_epoch_from_unix_secs(mono_now_secs);
+
+    // Bracket the call with wall-clock samples from the SAME source the
+    // implementation uses, so a 64s-boundary crossing during the call cannot
+    // flake the assertion.
+    let wall_epoch_before =
+        SynCookieCodec::full_epoch_from_unix_secs(ScreenState::read_unix_wall_secs());
+    let got = state.current_syn_cookie_full_epoch(mono_now_secs);
+    let wall_epoch_after =
+        SynCookieCodec::full_epoch_from_unix_secs(ScreenState::read_unix_wall_secs());
+
+    assert!(
+        got == wall_epoch_before || got == wall_epoch_after,
+        "epoch must come from the live Unix wall clock ({wall_epoch_before}..={wall_epoch_after}), got {got}",
+    );
+    assert_ne!(
+        got, monotonic_epoch,
+        "epoch must NOT be derived from the monotonic argument ({mono_now_secs}s ⇒ epoch {monotonic_epoch})",
+    );
+    assert_ne!(got, 0, "a live wall-clock epoch is never 0 (1970)");
 }
 
 #[test]

@@ -160,6 +160,15 @@ type SnapshotSummary struct {
 type ZoneSnapshot struct {
 	Name string `json:"name"`
 	ID   uint16 `json:"id"`
+	// TCPRst carries the Junos `security zones security-zone <z> tcp-rst`
+	// knob (#3071). When true, the userspace dataplane sends a TCP RST back
+	// toward the source for a TCP flow DENIED by policy/default-deny whose
+	// INGRESS (from) zone is this zone, instead of the silent drop `deny`
+	// otherwise produces. Non-TCP denied traffic is unaffected. Additive
+	// wire field: an old Rust helper without the field treats every zone as
+	// tcp-rst off (pre-#3071 silent-drop behavior); an old Go binary omits
+	// it (omitempty).
+	TCPRst bool `json:"tcp_rst,omitempty"`
 }
 
 type InterfaceSnapshot struct {
@@ -603,9 +612,16 @@ type FirewallTermSnapshot struct {
 	//
 	// TCPFlags is a required-bits mask over the TCP flags byte (FIN=0x01,
 	// SYN=0x02, RST=0x04, PSH=0x08, ACK=0x10, URG=0x20): a TCP packet matches
-	// when (flags & mask) == mask. Nil = no tcp-flags constraint. A non-TCP
+	// when (flags & mask) == mask. Nil = no required-flags constraint. A non-TCP
 	// packet never matches a term that sets this.
 	TCPFlags *uint8 `json:"tcp_flags,omitempty"`
+	// TCPFlagsForbidden is a forbidden-bits mask over the same TCP flags byte
+	// (#3076). A TCP packet matches the term only when (flags & forbidden) == 0
+	// — i.e. none of these flags are set. It carries the negated operands of a
+	// Junos tcp-flags expression such as `syn & !ack` (required=SYN,
+	// forbidden=ACK). Nil = no forbidden-flags constraint. Required and
+	// forbidden are independent: a term may set either, both, or neither.
+	TCPFlagsForbidden *uint8 `json:"tcp_flags_forbidden,omitempty"`
 	// IsFragment matches any IP fragment (IPv4 MF set OR non-zero offset; IPv6
 	// fragment extension header present). False = no fragment constraint.
 	IsFragment bool `json:"is_fragment,omitempty"`

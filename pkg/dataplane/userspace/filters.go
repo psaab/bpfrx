@@ -145,9 +145,28 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 		// Per-packet L4 match conditions (#2362). Previously parsed but
 		// dropped on the wire — wire them through so the dataplane matches
 		// exactly what the operator authored.
-		if mask, ok := tcpFlagsMask(term.TCPFlags); ok {
-			m := mask
-			snap.TCPFlags = &m
+		// #3076: parse the full Junos tcp-flags expression (`syn & !ack`,
+		// `(syn & !ack)`, plain lists) into a required-bits mask AND a
+		// forbidden-bits mask. A TCP segment matches when
+		// (flags & required) == required && (flags & forbidden) == 0.
+		// Unrepresentable expressions (disjunction, negated groups, unknown
+		// flags) are rejected at commit by compileFirewall, so a parse error
+		// here is unreachable for a committed config; if one slips through
+		// (e.g. a hand-built snapshot) log it and leave the masks nil rather
+		// than emit a 0 mask that would match every packet (the pre-#3076
+		// fail-open).
+		if required, forbidden, ok, err := config.ParseTCPFlagsExpression(term.TCPFlags); err != nil {
+			slog.Warn("dropping unparseable tcp-flags expression from filter term",
+				"filter", filterName, "term", term.Name, "tcp_flags", term.TCPFlags, "error", err)
+		} else if ok {
+			if required != 0 {
+				r := required
+				snap.TCPFlags = &r
+			}
+			if forbidden != 0 {
+				f := forbidden
+				snap.TCPFlagsForbidden = &f
+			}
 		}
 		snap.IsFragment = term.IsFragment
 		// icmp-type / icmp-code are multi-value (#2545): emit every in-range
@@ -292,41 +311,6 @@ func resolvePrefixListAddrs(
 	// constrained, so the matcher fails closed (matches nothing) rather than
 	// matching any.
 	return positive, false, true
-}
-
-// tcpFlagsBits maps Junos TCP-flag names to their bit value in the TCP flags
-// byte. Junos also accepts aliases (e.g. `syn`, `ack`); only the literal flag
-// names the firewall-filter compiler emits as a flat list are supported here —
-// the parser does not produce the richer `(syn & !ack)` expression grammar, so
-// no negation/disjunction is representable (a parser limitation, tracked
-// separately). Bit order matches userspace-dp/src/tcp_flags.rs.
-var tcpFlagsBits = map[string]uint8{
-	"fin": 0x01,
-	"syn": 0x02,
-	"rst": 0x04,
-	"psh": 0x08,
-	"ack": 0x10,
-	"urg": 0x20,
-}
-
-// tcpFlagsMask folds a parsed flag-name list into a required-bits mask. A TCP
-// packet matches the term when (flags & mask) == mask (all listed flags set).
-// Returns ok=false when the list is empty or contains no recognized flag name,
-// so the wire field stays nil (no tcp-flags constraint) rather than a 0 mask
-// that would match every packet.
-func tcpFlagsMask(flags []string) (uint8, bool) {
-	var mask uint8
-	matched := false
-	for _, f := range flags {
-		if bit, ok := tcpFlagsBits[strings.ToLower(strings.TrimSpace(f))]; ok {
-			mask |= bit
-			matched = true
-		}
-	}
-	if !matched {
-		return 0, false
-	}
-	return mask, true
 }
 
 func buildPolicerSnapshots(cfg *config.Config) []PolicerSnapshot {
