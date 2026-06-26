@@ -156,6 +156,19 @@ path downgrades to a warning AND `compilePolicy` defaults an actionless
 policy's `Action` to `PolicyDeny`, so a leniently-loaded bad config fails
 closed rather than open. See `docs/config-schema.md` "#3043".
 
+**Zone screen-profile reference is fail-closed (#3066):** a security zone's
+`screen <name>` that references a screen-ids-option profile the config never
+defines historically committed with a warning only, and at runtime the
+userspace dataplane fails OPEN — `screen/mod.rs` returns `ScreenVerdict::Pass`
+for a missing profile, silently skipping every screen check for that zone while
+the operator believes screening is active. `validateScreenProfileReferencesStrict`
+(`compiler_validate_strict.go`) hard-rejects an undefined screen-profile
+reference at commit. Unlike the policy gates the dataplane is NOT independently
+safe on the tolerant load/peer-sync path (the missing profile still fails
+open), so that path only downgrades to a warning to preserve #1960 no-brick
+boot — the strict commit gate, which keeps a bad reference from ever reaching
+the dataplane, is the real fix.
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`
