@@ -1,3 +1,20 @@
+## 2026-06-25 — #3117: security-policy `scheduler-name` added to set-schema
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed codex-review-066 finding 066-05. A security-policy
+  `scheduler-name <name>` is compiled (`compiler_security.go`, both zone-pair
+  and global policies) and an undefined reference is strict-rejected at commit
+  (`validatePolicySchedulerReferencesStrict`), but the leaf was ABSENT from
+  `setSchema` — so it had no structural / value-slot `?` completion, violating
+  the two-SSOT rule that every compiled + validated leaf lives in the schema
+  tree. Declared `scheduler-name` under both the zone-pair policy node and the
+  global policy node as an untyped (plain string) leaf, sibling of
+  `description`/`match`/`then`. The strict reference check remains the SSOT for
+  undefined-scheduler rejection (no `treeValidator` added; no compiler/validator
+  behaviour change). Added fail-on-revert completion + schema-accept tests.
+- **File(s)**: pkg/config/schema_security.go,
+  pkg/config/schema_scheduler_name_3117_test.go, docs/config-schema.md, _Log.md
+
 ## 2026-06-25 — #3103: gRPC ShowText `test-policy:` routed through pkg/policymatch
 
 - **Timestamp**: 2026-06-25
