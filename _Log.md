@@ -1,3 +1,28 @@
+## 2026-06-26 — #3204 TCP RST reject reply L2 group/broadcast guard
+
+- **Timestamp**: 2026-06-26
+- **Action**: SECURITY/correctness fix. The TCP-RST reject reply path lacked the
+  `l2_dst_is_group_or_broadcast` guard that the ICMP-unreachable reject path has.
+  A reflected RST copies the inbound destination MAC into its own source-MAC slot
+  (`write_reply_eth_header`: out[6..12] = frame[0..6]), so a RST generated in
+  response to a frame addressed to a multicast/broadcast MAC egressed with a
+  group/broadcast SOURCE MAC — an IEEE 802.3 violation that poisons/flaps switch
+  MAC tables and can reflect/loop traffic. Fix: added the shared
+  `l2_dst_is_group_or_broadcast` guard to `build_reject_rst_frame`
+  (returns None → caller fail-closes to the silent drop it already performs),
+  mirroring `can_generate_icmp_error_reply` exactly. All three reject sources
+  (policy `then reject`, firewall-filter `then reject`, zone `tcp-rst`) funnel
+  through `enqueue_reject_reply` → `build_reject_rst_frame`, so the one-line guard
+  covers every TCP reject leg. Unicast triggers are byte-identical (RST still
+  generated). Tests: `reject_rst_suppressed_for_l2_broadcast_dst`,
+  `reject_rst_suppressed_for_l2_multicast_dst` (fail-on-revert: both go RED with
+  the guard removed), `reject_rst_still_generated_for_l2_unicast_dst`
+  (regression). cargo build --release green; reject + tcp module suites pass
+  (54 tcp, 176 reject/poll).
+- **File(s)**: userspace-dp/src/afxdp/frame/tcp.rs,
+  userspace-dp/src/afxdp/frame/tcp_tests.rs,
+  docs/userspace-icmp-te-debugging.md
+
 ## 2026-06-26 — #3199 host-inbound `protocols all` scoped to routing protocols (control-plane exposure)
 
 - **Timestamp**: 2026-06-26
