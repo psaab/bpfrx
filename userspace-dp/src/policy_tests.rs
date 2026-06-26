@@ -623,6 +623,8 @@ fn named_application_matches_protocol_and_port() {
                 protocol: "tcp".to_string(),
                 source_port: String::new(),
                 destination_port: "80".to_string(),
+                icmp_type: None,
+                icmp_code: None,
             }],
             action: "permit".to_string(),
             ..Default::default()
@@ -679,6 +681,8 @@ fn proto_only_app_rule(rule_id: &str, protocol: &str) -> PolicyRuleSnapshot {
             protocol: protocol.to_string(),
             source_port: String::new(),
             destination_port: String::new(),
+            icmp_type: None,
+            icmp_code: None,
         }],
         action: "permit".to_string(),
         ..Default::default()
@@ -892,12 +896,16 @@ fn mixed_parseable_and_unparseable_fails_closed() {
                     protocol: "esp".to_string(),
                     source_port: String::new(),
                     destination_port: String::new(),
+                    icmp_type: None,
+                    icmp_code: None,
                 },
                 PolicyApplicationSnapshot {
                     name: "bogus".to_string(),
                     protocol: "definitely-not-a-proto".to_string(),
                     source_port: String::new(),
                     destination_port: String::new(),
+                    icmp_type: None,
+                    icmp_code: None,
                 },
             ],
             action: "permit".to_string(),
@@ -936,12 +944,16 @@ fn all_parseable_terms_match_each_protocol() {
                     protocol: "esp".to_string(),
                     source_port: String::new(),
                     destination_port: String::new(),
+                    icmp_type: None,
+                    icmp_code: None,
                 },
                 PolicyApplicationSnapshot {
                     name: "https".to_string(),
                     protocol: "tcp".to_string(),
                     source_port: String::new(),
                     destination_port: "443".to_string(),
+                    icmp_type: None,
+                    icmp_code: None,
                 },
             ],
             action: "permit".to_string(),
@@ -991,12 +1003,16 @@ fn application_set_matches_any_expanded_term() {
                     protocol: "tcp".to_string(),
                     source_port: String::new(),
                     destination_port: "80".to_string(),
+                    icmp_type: None,
+                    icmp_code: None,
                 },
                 PolicyApplicationSnapshot {
                     name: "junos-https".to_string(),
                     protocol: "tcp".to_string(),
                     source_port: String::new(),
                     destination_port: "443".to_string(),
+                    icmp_type: None,
+                    icmp_code: None,
                 },
             ],
             action: "permit".to_string(),
@@ -2742,4 +2758,212 @@ fn app_catalog_empty_resolves_unknown() {
     let cat = AppCatalog::default();
     assert!(cat.is_empty());
     assert_eq!(cat.lookup(6, 51000, 443), 0);
+}
+
+// ---------------------------------------------------------------------------
+// #3020 — junos-ping / junos-pingv6 are echo-request ONLY (ICMP type 8 /
+// ICMPv6 type 128), not every ICMP type. The all-ICMP aliases stay
+// unconstrained. The matcher gates an icmp-type-constrained term on the
+// packet's ICMP type/code, which is threaded into
+// `evaluate_policy_result_with_len` as `packet_icmp`.
+// ---------------------------------------------------------------------------
+
+fn icmp_app_rule(name: &str, protocol: &str, icmp_type: Option<u8>) -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        name: name.to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec![name.to_string()],
+        application_terms: vec![PolicyApplicationSnapshot {
+            name: name.to_string(),
+            protocol: protocol.to_string(),
+            source_port: String::new(),
+            destination_port: String::new(),
+            icmp_type,
+            icmp_code: None,
+        }],
+        action: "permit".to_string(),
+        ..Default::default()
+    }
+}
+
+fn eval_icmp(state: &PolicyState, protocol: u8, icmp_type: u8, icmp_code: u8) -> PolicyAction {
+    evaluate_policy_result_with_icmp(
+        state,
+        TEST_LAN_ZONE_ID,
+        TEST_WAN_ZONE_ID,
+        "10.0.61.100".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        protocol,
+        0,
+        0,
+        Some((icmp_type, icmp_code)),
+        0,
+    )
+    .action
+}
+
+#[test]
+fn junos_ping_matches_echo_request_only() {
+    let state = parse_policy_state(
+        "deny",
+        &[icmp_app_rule("junos-ping", "icmp", Some(8))],
+        &test_zone_name_to_id(),
+    );
+    // Echo-request (type 8) is permitted.
+    assert_eq!(eval_icmp(&state, PROTO_ICMP, 8, 0), PolicyAction::Permit);
+    // Echo-reply (type 0) must NOT match — falls through to default deny.
+    assert_eq!(eval_icmp(&state, PROTO_ICMP, 0, 0), PolicyAction::Deny);
+    // Destination-unreachable (type 3) must NOT match.
+    assert_eq!(eval_icmp(&state, PROTO_ICMP, 3, 1), PolicyAction::Deny);
+}
+
+#[test]
+fn junos_pingv6_matches_echo_request_only() {
+    let state = parse_policy_state(
+        "deny",
+        &[icmp_app_rule("junos-pingv6", "icmpv6", Some(128))],
+        &test_zone_name_to_id(),
+    );
+    // ICMPv6 echo-request is type 128.
+    assert_eq!(eval_icmp(&state, PROTO_ICMPV6, 128, 0), PolicyAction::Permit);
+    // Echo-reply is 129 — must NOT match.
+    assert_eq!(eval_icmp(&state, PROTO_ICMPV6, 129, 0), PolicyAction::Deny);
+    // Neighbor solicitation (135) — must NOT match.
+    assert_eq!(eval_icmp(&state, PROTO_ICMPV6, 135, 0), PolicyAction::Deny);
+}
+
+#[test]
+fn junos_icmp_all_matches_every_type() {
+    // Regression: an UNCONSTRAINED ICMP term (junos-icmp-all) still matches
+    // every ICMP type/code, regardless of the packet's type.
+    let state = parse_policy_state(
+        "deny",
+        &[icmp_app_rule("junos-icmp-all", "icmp", None)],
+        &test_zone_name_to_id(),
+    );
+    for t in [0u8, 3, 8, 11, 13] {
+        assert_eq!(
+            eval_icmp(&state, PROTO_ICMP, t, 0),
+            PolicyAction::Permit,
+            "junos-icmp-all must match ICMP type {t}"
+        );
+    }
+}
+
+#[test]
+fn junos_ping_with_icmp_all_matches_every_type() {
+    // A rule citing BOTH junos-ping AND junos-icmp-all matches all ICMP: the
+    // unconstrained term short-circuits the type constraint.
+    let mut rule = icmp_app_rule("ping-and-all", "icmp", Some(8));
+    rule.application_terms.push(PolicyApplicationSnapshot {
+        name: "junos-icmp-all".to_string(),
+        protocol: "icmp".to_string(),
+        source_port: String::new(),
+        destination_port: String::new(),
+        icmp_type: None,
+        icmp_code: None,
+    });
+    let state = parse_policy_state("deny", &[rule], &test_zone_name_to_id());
+    assert_eq!(eval_icmp(&state, PROTO_ICMP, 8, 0), PolicyAction::Permit);
+    assert_eq!(eval_icmp(&state, PROTO_ICMP, 3, 0), PolicyAction::Permit);
+}
+
+#[test]
+fn icmp_constraint_does_not_affect_tcp_app() {
+    // A TCP application is completely unaffected by the icmp constraint path.
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            name: "allow-http".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["junos-http".to_string()],
+            application_terms: vec![PolicyApplicationSnapshot {
+                name: "junos-http".to_string(),
+                protocol: "tcp".to_string(),
+                source_port: String::new(),
+                destination_port: "80".to_string(),
+                icmp_type: None,
+                icmp_code: None,
+            }],
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    // TCP/80 permitted; a None packet_icmp (non-ICMP) is irrelevant.
+    assert_eq!(
+        evaluate_policy_result_with_icmp(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "10.0.61.100".parse().expect("src"),
+            "172.16.80.200".parse().expect("dst"),
+            PROTO_TCP,
+            40000,
+            80,
+            None,
+            0,
+        )
+        .action,
+        PolicyAction::Permit
+    );
+}
+
+#[test]
+fn junos_ping_unknown_icmp_type_fails_closed() {
+    // When the packet's ICMP type/code is unknown (truncated frame / non-first
+    // fragment → packet_icmp == None), an icmp-type-constrained term must NOT
+    // match (fail closed) rather than matching a fabricated type 0.
+    let state = parse_policy_state(
+        "deny",
+        &[icmp_app_rule("junos-ping", "icmp", Some(8))],
+        &test_zone_name_to_id(),
+    );
+    let action = evaluate_policy_result_with_icmp(
+        &state,
+        TEST_LAN_ZONE_ID,
+        TEST_WAN_ZONE_ID,
+        "10.0.61.100".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        PROTO_ICMP,
+        0,
+        0,
+        None, // type/code unknown
+        0,
+    )
+    .action;
+    assert_eq!(action, PolicyAction::Deny);
+}
+
+#[test]
+fn icmp_skew_old_snapshot_without_type_matches_all() {
+    // Version skew: a snapshot whose application term OMITS the icmp_type field
+    // (old Go control plane) decodes to icmp_type=None → the term is
+    // unconstrained and matches every ICMP type — today's pre-#3020 behavior,
+    // so skew degrades safely to match-all rather than failing to decode.
+    let json = r#"{
+        "name": "legacy-ping",
+        "from_zone": "lan",
+        "to_zone": "wan",
+        "source_addresses": ["any"],
+        "destination_addresses": ["any"],
+        "applications": ["junos-ping"],
+        "application_terms": [{"name": "junos-ping", "protocol": "icmp"}],
+        "action": "permit"
+    }"#;
+    let snap: PolicyRuleSnapshot =
+        serde_json::from_str(json).expect("legacy snapshot without icmp_type decodes");
+    assert!(
+        snap.application_terms[0].icmp_type.is_none(),
+        "omitted icmp_type must decode to None"
+    );
+    let state = parse_policy_state("deny", &[snap], &test_zone_name_to_id());
+    assert_eq!(eval_icmp(&state, PROTO_ICMP, 8, 0), PolicyAction::Permit);
+    assert_eq!(eval_icmp(&state, PROTO_ICMP, 3, 0), PolicyAction::Permit);
 }

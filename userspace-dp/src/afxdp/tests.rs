@@ -9835,6 +9835,8 @@ fn policy_inbound_dnat_matches_translated_destination_port() {
         protocol: "tcp".to_string(),
         source_port: String::new(),
         destination_port: "8443".to_string(),
+        icmp_type: None,
+        icmp_code: None,
     }];
     let snapshot = inbound_dnat_snapshot(permit);
     let forwarding = build_forwarding_state(&snapshot);

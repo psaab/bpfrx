@@ -1,3 +1,34 @@
+## 2026-06-26 — #3020 junos-ping / junos-pingv6 echo-request-only (ICMP type constraint)
+
+- **Timestamp**: 2026-06-26
+- **Action**: Constrain `junos-ping` / `junos-pingv6` to ICMP echo-request
+  only (ICMP type 8 / ICMPv6 type 128) instead of matching every ICMP type
+  like `junos-icmp-all`. Added an optional ICMP type/code constraint to the
+  predefined-application model (`config.Application.ICMPType/ICMPCode`), the
+  policy snapshot application term (`PolicyApplicationSnapshot.ICMPType/
+  ICMPCode`, Go + Rust serde with pointer/omitempty + `skip_serializing_if`
+  so the wire is additive and version-skew decodes to `None` = match-all).
+  The Rust matcher (`policy.rs`) routes an icmp-type-constrained term into a
+  per-protocol `icmp_constraints` list and matches it only when the packet's
+  type (and code, if set) equals the constraint; an unconstrained ICMP term
+  (junos-icmp-all) stays a match-all `range_terms` entry, so a rule citing
+  both still matches all ICMP. The packet's ICMP type/code is read at
+  policy-eval time via `policy_packet_icmp` (reusing the fragment/truncation-
+  safe `term_match_extra_from_frame`); unknown type/code fails closed. The
+  all-ICMP aliases are byte-identical. The app-id catalog is unchanged
+  (cosmetic naming, not enforcement). Fixture `protocol_wire_v1.json` did NOT
+  need regen (Option fields skip-serialize when None). Fail-on-revert proven:
+  routing icmp-constrained terms as match-all turns the junos-ping /
+  junos-pingv6 echo-request tests RED while junos-icmp-all stays GREEN.
+- **File(s)**: pkg/config/predefined.go, pkg/config/types_security.go,
+  pkg/config/predefined_icmp_3020_test.go, pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/capabilities.go,
+  pkg/dataplane/userspace/junos_ping_icmp_3020_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/policy.rs,
+  userspace-dp/src/policy_tests.rs, userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  docs/services-application-identification.md
+
 ## 2026-06-26 — #3035 generated SYN-cookie / reject reply classify on logical VLAN ifindex
 
 - **Timestamp**: 2026-06-26

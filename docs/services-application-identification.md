@@ -86,6 +86,48 @@ upfront what they're getting and not getting.
      `junos-ftp=21`, etc. — the 15-entry `builtinFallbacks`
      map).
 
+### ICMP type/code constraint in policy matching (#3020)
+
+`junos-ping` and `junos-pingv6` are **echo-request only** — Junos
+parity is ICMP type 8 (`junos-ping`) and ICMPv6 type 128
+(`junos-pingv6`), each with no code constraint. They are NOT the same
+as the all-ICMP aliases `junos-icmp-all` / `junos-icmp6-all`, which
+stay unconstrained and match every ICMP/ICMPv6 type/code. Before
+#3020 every predefined ICMP application carried only a protocol with
+no type/code, so `application junos-ping` matched all ICMP (identical
+to `junos-icmp-all`) — a `permit junos-ping` rule also admitted
+destination-unreachable, time-exceeded, redirect, neighbor-discovery,
+etc.
+
+The constraint is modeled as an optional `(ICMPType, ICMPCode)` on the
+predefined application (`pkg/config/predefined.go`), carried on the
+policy snapshot's application term (`PolicyApplicationSnapshot.ICMPType`
+/ `.ICMPCode`, `pkg/dataplane/userspace/protocol.go`) and the Rust
+matcher (`ApplicationMatch.icmp_type` / `.icmp_code`,
+`userspace-dp/src/policy.rs`). `nil`/`None` means "no constraint"
+(match all of the protocol — what the all-ICMP aliases keep). The wire
+field is additive: a pointer + `omitempty` on the Go side and
+`#[serde(default, skip_serializing_if = "Option::is_none")]` on the
+Rust side, so an old helper missing the field — or an old Go snapshot
+omitting it — decodes to `None` and ignores the constraint (match-all,
+the pre-#3020 behavior); version skew degrades safely rather than
+failing to decode.
+
+The Rust matcher reads the packet's ICMP type/code from the live frame
+at policy-evaluation time (`policy_packet_icmp` in
+`poll_descriptor`, reusing the fragment/truncation-safe
+`term_match_extra_from_frame`). When the type/code is unknown (a
+truncated frame or a non-first fragment) an icmp-type-constrained term
+fails closed (does not match). Policy evaluation is on the cold path
+(session miss), so the per-packet extraction cost is incurred once per
+session.
+
+This affects **policy matching** only. The app-identification catalog
+(`app_id` session stamping, above) does NOT carry ICMP type/code, so
+`junos-ping` and `junos-icmp-all` can still resolve to the same
+`app_id` for `show security flow session` display — that is cosmetic
+naming, not enforcement.
+
 ## What's parsed but not implemented
 
 These config paths are accepted at commit time and their

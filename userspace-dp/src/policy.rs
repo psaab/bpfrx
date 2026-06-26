@@ -597,6 +597,14 @@ pub(crate) struct ApplicationMatch {
     pub(crate) protocol: u8,
     pub(crate) source_ports: Vec<PortRange>,
     pub(crate) destination_ports: Vec<PortRange>,
+    /// #3020: optional ICMP/ICMPv6 type constraint. `Some(t)` restricts the
+    /// term to ICMP messages of type `t` (e.g. junos-ping = type 8); `None`
+    /// leaves the term unconstrained on type (the all-ICMP aliases). Only
+    /// meaningful when `protocol` is ICMP/ICMPv6; ignored for TCP/UDP terms.
+    pub(crate) icmp_type: Option<u8>,
+    /// #3020: optional ICMP/ICMPv6 code constraint, paired with `icmp_type`.
+    /// `None` matches any code of the constrained type.
+    pub(crate) icmp_code: Option<u8>,
 }
 
 /// Pre-indexed application matcher: groups terms by protocol for O(1) lookup.
@@ -616,6 +624,14 @@ struct ProtoTerms {
     exact_dst_ports: rustc_hash::FxHashSet<u16>,
     /// Port range terms that need linear scan (multi-port ranges).
     range_terms: Vec<(Vec<PortRange>, Vec<PortRange>)>, // (src_ranges, dst_ranges)
+    /// #3020: ICMP/ICMPv6 type[,code] constraints for icmp-constrained terms
+    /// (e.g. junos-ping = type 8). Each entry is `(type, optional code)`. A
+    /// packet matches this protocol via the icmp path iff its type (and code,
+    /// when the entry constrains it) equals one of these entries. An
+    /// UNCONSTRAINED ICMP term (junos-icmp-all) does NOT land here — it stays a
+    /// `range_terms` entry with empty ranges, which matches every ICMP packet,
+    /// so a rule citing both still matches all ICMP.
+    icmp_constraints: Vec<(u8, Option<u8>)>,
 }
 
 impl CompiledApplications {
@@ -629,8 +645,20 @@ impl CompiledApplications {
         let mut by_protocol: FxHashMap<u8, ProtoTerms> = FxHashMap::default();
         for app in apps {
             let entry = by_protocol.entry(app.protocol).or_default();
-            // Optimise the common case: single exact dst port, no src port restriction.
-            if app.source_ports.is_empty()
+            // #3020: an ICMP/ICMPv6 term with a type constraint (junos-ping)
+            // is steered to `icmp_constraints` so it matches ONLY that type
+            // (and code, when set) instead of every ICMP message. A term with
+            // NO icmp_type constraint falls through to the existing port path —
+            // an unconstrained ICMP term (junos-icmp-all) has empty ports and
+            // lands as a `range_terms` entry with empty ranges (match-all), so a
+            // rule citing both junos-ping AND junos-icmp-all still matches all
+            // ICMP. (ICMP terms never carry ports in practice; the type
+            // constraint takes precedence so a stray port is irrelevant here.)
+            if app.icmp_type.is_some() {
+                entry
+                    .icmp_constraints
+                    .push((app.icmp_type.expect("icmp_type is Some"), app.icmp_code));
+            } else if app.source_ports.is_empty()
                 && app.destination_ports.len() == 1
                 && app.destination_ports[0].low == app.destination_ports[0].high
             {
@@ -647,8 +675,22 @@ impl CompiledApplications {
         }
     }
 
+    /// #3020: `packet_icmp` carries the packet's ICMP/ICMPv6 `(type, code)` when
+    /// the protocol is ICMP-family AND the bytes were safely readable (not a
+    /// truncated frame or non-first fragment); `None` otherwise. It gates the
+    /// icmp-type-constrained terms (junos-ping): a constrained term matches only
+    /// when the type/code is known and equal, so an unknown type/code (or a
+    /// non-ICMP packet) fails closed for those terms. Port/range terms are
+    /// unaffected, so non-ICMP applications and the all-ICMP aliases behave
+    /// exactly as before.
     #[inline]
-    fn matches(&self, protocol: u8, src_port: u16, dst_port: u16) -> bool {
+    fn matches(
+        &self,
+        protocol: u8,
+        src_port: u16,
+        dst_port: u16,
+        packet_icmp: Option<(u8, u8)>,
+    ) -> bool {
         if self.match_any {
             return true;
         }
@@ -659,10 +701,26 @@ impl CompiledApplications {
         if terms.exact_dst_ports.contains(&dst_port) {
             return true;
         }
-        // Slow path: check range terms.
-        terms.range_terms.iter().any(|(src_ranges, dst_ranges)| {
+        // Slow path: check range terms (an unconstrained ICMP term, e.g.
+        // junos-icmp-all, lives here as an empty-range entry → match-all).
+        if terms.range_terms.iter().any(|(src_ranges, dst_ranges)| {
             port_ranges_match(src_ranges, src_port) && port_ranges_match(dst_ranges, dst_port)
-        })
+        }) {
+            return true;
+        }
+        // #3020: ICMP/ICMPv6 type[,code]-constrained terms (junos-ping). Match
+        // only when the packet's type/code is known and equals a constraint.
+        // When `packet_icmp` is None (non-ICMP packet, truncated frame, or
+        // non-first fragment) the constrained term does NOT match — fail closed.
+        if !terms.icmp_constraints.is_empty() {
+            if let Some((ptype, pcode)) = packet_icmp {
+                return terms
+                    .icmp_constraints
+                    .iter()
+                    .any(|&(ctype, ccode)| ctype == ptype && ccode.map_or(true, |c| c == pcode));
+            }
+        }
+        false
     }
 }
 
@@ -1255,6 +1313,10 @@ pub(crate) fn evaluate_policy_with_len(
     .action
 }
 
+/// Back-compat entry point with no ICMP type/code awareness (#3020): delegates
+/// to [`evaluate_policy_result_with_icmp`] with `packet_icmp = None`, so an
+/// icmp-type-constrained application term (junos-ping) does not match (fail
+/// closed) when the caller has no type/code. Non-ICMP flows are unaffected.
 pub(crate) fn evaluate_policy_result_with_len(
     state: &PolicyState,
     from_id: u16,
@@ -1264,6 +1326,31 @@ pub(crate) fn evaluate_policy_result_with_len(
     protocol: u8,
     src_port: u16,
     dst_port: u16,
+    packet_len: u64,
+) -> PolicyEvaluationResult {
+    evaluate_policy_result_with_icmp(
+        state, from_id, to_id, src_ip, dst_ip, protocol, src_port, dst_port, None, packet_len,
+    )
+}
+
+/// #3020: ICMP-aware policy evaluation. `packet_icmp` is the packet's
+/// ICMP/ICMPv6 `(type, code)` for ICMP-family flows whose L4 header was safely
+/// readable, else `None`. It gates the icmp-type-constrained application terms
+/// (junos-ping = echo-request only); non-ICMP flows pass `None` and are
+/// unaffected. The forwarding path (poll_descriptor) calls this directly with
+/// the per-packet type/code; the back-compat `evaluate_policy_result_with_len`
+/// and the `evaluate_policy*` test/legacy wrappers pass `None`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_policy_result_with_icmp(
+    state: &PolicyState,
+    from_id: u16,
+    to_id: u16,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    packet_icmp: Option<(u8, u8)>,
     packet_len: u64,
 ) -> PolicyEvaluationResult {
     // #3110: zone id 0 is the reserved "unknown / no zone" sentinel
@@ -1290,6 +1377,7 @@ pub(crate) fn evaluate_policy_result_with_len(
                     protocol,
                     src_port,
                     dst_port,
+                    packet_icmp,
                     packet_len,
                 ) {
                     return result;
@@ -1305,6 +1393,7 @@ pub(crate) fn evaluate_policy_result_with_len(
                 protocol,
                 src_port,
                 dst_port,
+                packet_icmp,
                 packet_len,
             ) {
                 return result;
@@ -1338,12 +1427,16 @@ fn try_match_rule(
     protocol: u8,
     src_port: u16,
     dst_port: u16,
+    packet_icmp: Option<(u8, u8)>,
     packet_len: u64,
 ) -> Option<PolicyEvaluationResult> {
     if rule.inactive {
         return None;
     }
-    if !rule.compiled_apps.matches(protocol, src_port, dst_port) {
+    if !rule
+        .compiled_apps
+        .matches(protocol, src_port, dst_port, packet_icmp)
+    {
         return None;
     }
     // #2008 H2: when a side is `*-excluded`, the rule matches every
@@ -1529,6 +1622,10 @@ fn parse_applications(terms: &[PolicyApplicationSnapshot]) -> ParsedApplications
             protocol,
             source_ports,
             destination_ports,
+            // #3020: carry the optional ICMP type/code constraint through to the
+            // compiled matcher. A non-ICMP term simply has these as None.
+            icmp_type: term.icmp_type,
+            icmp_code: term.icmp_code,
         });
     }
     ParsedApplications {
