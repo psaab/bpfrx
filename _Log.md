@@ -1,3 +1,16 @@
+## 2026-06-25 — #3045: REST /security/policies includes global policies
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `policiesHandler` (REST `GET /api/v1/security/policies`)
+  to enumerate global policies after zone-pair policies, emitting a single
+  `from_zone="*"`/`to_zone="*"` row matching gRPC `GetPolicies`, the
+  Prometheus collector, and the CLI. Global counter IDs continue from the
+  zone-pair `policySetID`. Added fail-on-revert test
+  `TestPoliciesHandlerIncludesGlobalPolicies` (RED when globals omitted).
+  Updated pkg/api README.
+- **File(s)**: pkg/api/security.go, pkg/api/security_test.go,
+  pkg/api/README.md
+
 ## 2026-06-25 — #3009: state_writer instance_is_alive self-shortcut checks full instance
 
 - **Timestamp**: 2026-06-25
@@ -18671,3 +18684,27 @@ top.
   pkg/config/policy_terminal_action_3043_test.go,
   pkg/config/policy_match_excluded_test.go, pkg/config/parser_ast_test.go,
   pkg/config/README.md, docs/config-schema.md, _Log.md
+- **Action**: #2871 static-NAT reverse (SNAT) honors egress zone — finished
+  prior agent's applied-but-uncommitted fix. SNAT now gates on the EGRESS
+  (destination) zone matching the rule's external `from zone`, mirroring the
+  merged #2864 DNAT ingress-zone gate (per-candidate `zone_ok` filter, empty
+  zone = wildcard). Fixes a cross-zone east-west leak where an outbound packet
+  from a static-NAT internal IP destined for another internal zone was
+  source-translated to the public external IP. Added fail-on-revert test
+  `static_nat_snat_honors_egress_zone` (+ empty-zone wildcard test); verified
+  RED via copy-aside gate revert. Updated 4 collateral SNAT tests (CIDR v4/v6,
+  mapped-port, port-scope #2769) to egress toward the rule's external zone.
+  Gates: cargo build --release clean; nat:: 130 passed; static_nat 28 passed.
+- **File(s)**: userspace-dp/src/nat/static_nat.rs,
+  userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs,
+  userspace-dp/src/nat/tests.rs, userspace-dp/src/afxdp/tests.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2871 review follow-up (MERGE-NEEDS-MINOR, docs-only). (1) Updated
+  docs/feature-coverage.md Static NAT row to document the symmetric egress-zone
+  reverse-SNAT gate (mirror of the #2864 DNAT ingress-zone sentence). (2) Fixed
+  the now-stale "byte-for-byte identical" provenance comment in
+  nat_exception.rs to note source_nat_decision_for_flow passes to_zone (egress)
+  per #2871. No code change. Build clean; nat:: 130 / static_nat 28 still green.
+- **File(s)**: docs/feature-coverage.md,
+  userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs, _Log.md

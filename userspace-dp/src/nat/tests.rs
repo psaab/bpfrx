@@ -661,13 +661,91 @@ fn static_nat_zone_mismatch_returns_none_for_dnat() {
             .match_dnat("203.0.113.10".parse().expect("ext"), "trust")
             .is_none()
     );
-    // SNAT does not check from_zone -- internal IP match is sufficient.
-    // Traffic from internal host gets SNAT regardless of ingress zone.
+    // #2871: SNAT (reverse) now honors the EGRESS zone symmetrically with
+    // DNAT's ingress-zone gate. A packet egressing toward a zone OTHER than
+    // the rule's external `from zone` ("untrust") must NOT be source-NAT'd.
     assert!(
         table
             .match_snat("192.168.1.10".parse().expect("int"), "dmz")
-            .is_some()
+            .is_none()
     );
+}
+
+/// #2871 FAIL-ON-REVERT: static-NAT reverse (SNAT) must honor the EGRESS zone,
+/// mirroring the #2864 DNAT ingress-zone gate. An outbound packet sourced from
+/// a static-NAT internal IP but egressing toward a DIFFERENT internal zone
+/// (east-west) must NOT be source-translated to the public external IP — that
+/// was the cross-zone leak. It MUST still translate when egressing toward the
+/// rule's external `from zone`.
+///
+/// Drop the `egress_zone` gate from `match_snat_with_counter` (the pre-#2871
+/// "internal IP match is sufficient" behaviour) and the wrong-zone assertion
+/// below flips to Some(..) — this test goes RED.
+#[test]
+fn static_nat_snat_honors_egress_zone() {
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "web-server".to_string(),
+            // External zone of the rule: reverse SNAT applies only when the
+            // packet egresses toward THIS zone.
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    let internal: IpAddr = "192.168.1.10".parse().expect("int");
+
+    // RIGHT zone: egressing toward the external zone "untrust" -> SNAT applies.
+    assert_eq!(
+        table.match_snat(internal, "untrust"),
+        Some(NatDecision {
+            rewrite_src: Some("203.0.113.10".parse().expect("ext")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        }),
+        "SNAT must apply when egressing toward the rule's external zone"
+    );
+
+    // WRONG zone: egressing toward another internal zone -> no source NAT.
+    // This is the assertion that fails without the #2871 egress-zone gate.
+    assert!(
+        table.match_snat(internal, "trust").is_none(),
+        "SNAT must NOT apply for an east-west packet egressing toward a \
+         non-external zone (cross-zone leak #2871)"
+    );
+    assert!(
+        table.match_snat(internal, "dmz").is_none(),
+        "SNAT must NOT apply when egressing toward an unrelated internal zone"
+    );
+}
+
+/// #2871: an empty external `from zone` ("any zone") still source-NATs on any
+/// egress zone — the egress-zone gate must not regress wildcard rules.
+#[test]
+fn static_nat_snat_empty_zone_matches_any_egress() {
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "wildcard".to_string(),
+            from_zone: String::new(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    let internal: IpAddr = "192.168.1.10".parse().expect("int");
+    for egress in ["untrust", "trust", "dmz"] {
+        assert!(
+            table.match_snat(internal, egress).is_some(),
+            "wildcard (empty from_zone) SNAT must match any egress zone"
+        );
+    }
 }
 
 #[test]
@@ -867,7 +945,7 @@ fn static_nat_canonical_cidr_mask_v4_installs_entry() {
     );
     // Outbound SNAT on the bare internal IP -> bare external IP.
     assert_eq!(
-        table.match_snat("10.0.0.5".parse().expect("int"), "trust"),
+        table.match_snat("10.0.0.5".parse().expect("int"), "untrust"),
         Some(NatDecision {
             rewrite_src: Some("203.0.113.5".parse().expect("ext")),
             rewrite_dst: None,
@@ -904,7 +982,7 @@ fn static_nat_canonical_cidr_mask_v6_installs_entry() {
         })
     );
     assert_eq!(
-        table.match_snat("fd00::1".parse().expect("int"), "trust"),
+        table.match_snat("fd00::1".parse().expect("int"), "untrust"),
         Some(NatDecision {
             rewrite_src: Some("2001:db8::1".parse().expect("ext")),
             rewrite_dst: None,
@@ -1057,7 +1135,7 @@ fn static_nat_mapped_port_snat_untranslates_src_port() {
     let int: IpAddr = "10.0.0.5".parse().unwrap();
 
     let (decision, _) = table
-        .match_snat_with_counter(int, 80, "trust")
+        .match_snat_with_counter(int, 80, "untrust")
         .expect("matched internal mapped-port");
     assert_eq!(decision.rewrite_src, Some(ext), "src IP must be the external IP");
     assert_eq!(
@@ -1174,7 +1252,7 @@ fn static_nat_match_port_without_mapped_port_scopes_reverse_snat() {
     // port (8080 — no translation happened) IS source-translated to the
     // external IP, with NO source-port rewrite.
     let (snat, _) = table
-        .match_snat_with_counter(int, 8080, "trust")
+        .match_snat_with_counter(int, 8080, "untrust")
         .expect("return from the port-scoped service");
     assert_eq!(snat.rewrite_src, Some(ext), "src IP must be the external IP");
     assert_eq!(
@@ -1185,7 +1263,7 @@ fn static_nat_match_port_without_mapped_port_scopes_reverse_snat() {
     // The bug: a packet from ANY OTHER source port on the internal host MUST
     // NOT be source-translated. This is the whole-host broadening #2769 fixes.
     assert!(
-        table.match_snat_with_counter(int, 1234, "trust").is_none(),
+        table.match_snat_with_counter(int, 1234, "untrust").is_none(),
         "off-port outbound must NOT be source-translated (reverse SNAT must \
          stay scoped to the matched port)"
     );

@@ -194,11 +194,23 @@ impl StaticNatTable {
 
     /// Match outbound: if src_ip is an internal IP, return SNAT decision.
     ///
-    /// Note: from_zone is NOT checked for SNAT. The zone constraint on the
-    /// static NAT rule set (`from zone X`) controls which ingress zone
-    /// triggers DNAT only. For SNAT (outbound), the internal IP match is
-    /// sufficient -- the traffic originates from the internal host regardless
-    /// of which zone it enters through.
+    /// #2871: the egress (destination) zone IS checked for SNAT, mirroring the
+    /// #2864 DNAT-direction zone gate. Static NAT is bidirectional but, per
+    /// Junos/vSRX parity, the reverse (source) translation applies only when
+    /// the packet egresses TOWARD the rule-set's external zone — the rule's
+    /// `from zone` (`entry.from_zone`). The DNAT direction matches the external
+    /// zone on INGRESS (`from_zone == ingress_zone`); the SNAT direction
+    /// symmetrically matches it on EGRESS (`from_zone == egress_zone`).
+    ///
+    /// Without this gate, an outbound packet sourced from a static-NAT internal
+    /// IP but destined for ANOTHER internal zone (trust↔dmz east-west,
+    /// peer-to-peer on internal segments) was source-translated to the public
+    /// `external_ip`, breaking internal routing, internal security-policy match
+    /// (which then saw the translated source), and intra-site connectivity —
+    /// a cross-zone leak.
+    ///
+    /// An empty `from_zone` ("any zone") matches every egress zone, preserving
+    /// the wildcard rule behaviour.
     ///
     /// Returns just the decision; the cold path uses
     /// [`match_snat_with_counter`] (#2218) for the per-rule hit counter.
@@ -206,8 +218,8 @@ impl StaticNatTable {
     /// #2491: the test-only port-less wrapper looks up the whole-address
     /// entry (port `0` exercises only the `None` fallback).
     #[cfg(test)]
-    pub(crate) fn match_snat(&self, src_ip: IpAddr, ingress_zone: &str) -> Option<NatDecision> {
-        self.match_snat_with_counter(src_ip, 0, ingress_zone)
+    pub(crate) fn match_snat(&self, src_ip: IpAddr, egress_zone: &str) -> Option<NatDecision> {
+        self.match_snat_with_counter(src_ip, 0, egress_zone)
             .map(|(decision, _)| decision)
     }
 
@@ -224,12 +236,23 @@ impl StaticNatTable {
         &self,
         src_ip: IpAddr,
         src_port: u16,
-        _ingress_zone: &str,
+        egress_zone: &str,
     ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
+        // #2871: per-candidate egress-zone gate, the SNAT-direction analog of
+        // the #2864 DNAT ingress-zone gate. An entry matches only when its
+        // external-zone constraint is empty (any zone) or equals the packet's
+        // egress (destination) zone. Evaluate the zone PER CANDIDATE so a
+        // port-specific entry whose zone does not match falls back to the
+        // whole-address entry (validated on its own zone) rather than
+        // short-circuiting to None.
+        let zone_ok = |entry: &&StaticNatEntry| {
+            entry.from_zone.is_empty() || entry.from_zone == egress_zone
+        };
         let entry = self
             .snat
             .get(&(src_ip, Some(src_port)))
-            .or_else(|| self.snat.get(&(src_ip, None)))?;
+            .filter(zone_ok)
+            .or_else(|| self.snat.get(&(src_ip, None)).filter(zone_ok))?;
         // For a port-mapped rule, un-translate the source port back to the
         // external (pre-translation) port; for a whole-address rule this is
         // `None` (no port rewrite).
