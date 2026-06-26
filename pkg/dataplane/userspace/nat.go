@@ -78,6 +78,7 @@ func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32
 			var portLow, portHigh uint16
 			var persistentNAT bool
 			var persistentNATPermitAnyRemoteHost bool
+			var persistentNATPermit string
 			var persistentNATInactivityTimeout int
 			var poolUnusable bool
 			var poolUnusableReason string
@@ -110,7 +111,19 @@ func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32
 					}
 					if pool.PersistentNAT != nil {
 						persistentNAT = true
-						persistentNATPermitAnyRemoteHost = pool.PersistentNAT.PermitAnyRemoteHost
+						// #2823: carry the full three-way permit enum. Default
+						// an unset mode to target-host-port (the pre-#2823
+						// false-flag (dst_ip, dst_port) keying) so existing
+						// configs stay byte-identical. The
+						// PermitAnyRemoteHost bool is kept on the wire for
+						// back-compat with an older helper that predates the
+						// enum (#1961 wire-skew discipline).
+						permit := pool.PersistentNAT.Permit
+						if permit == "" {
+							permit = config.PersistentNATPermitTargetHostPort
+						}
+						persistentNATPermit = string(permit)
+						persistentNATPermitAnyRemoteHost = permit == config.PersistentNATPermitAnyRemoteHost
 						persistentNATInactivityTimeout = pool.PersistentNAT.InactivityTimeout
 						if persistentNATInactivityTimeout <= 0 {
 							persistentNATInactivityTimeout = 300
@@ -133,6 +146,7 @@ func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32
 				AddressPersistent:                cfg.Security.NAT.AddressPersistent,
 				PersistentNAT:                    persistentNAT,
 				PersistentNATPermitAnyRemoteHost: persistentNATPermitAnyRemoteHost,
+				PersistentNATPermit:              persistentNATPermit,
 				PersistentNATInactivityTimeout:   persistentNATInactivityTimeout,
 				PoolUnusable:                     poolUnusable,
 				PoolUnusableReason:               poolUnusableReason,

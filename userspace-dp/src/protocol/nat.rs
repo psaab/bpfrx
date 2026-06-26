@@ -42,6 +42,12 @@ pub(crate) struct SourceNATRuleSnapshot {
     pub persistent_nat: bool,
     #[serde(rename = "persistent_nat_permit_any_remote_host", default)]
     pub persistent_nat_permit_any_remote_host: bool,
+    /// #2823: full three-way Junos `persistent-nat permit` enum as a string
+    /// ("any-remote-host" | "target-host" | "target-host-port"). Empty =>
+    /// fall back to `persistent_nat_permit_any_remote_host` for wire skew
+    /// against an older control plane that predates this field.
+    #[serde(rename = "persistent_nat_permit", default)]
+    pub persistent_nat_permit: String,
     #[serde(rename = "persistent_nat_inactivity_timeout", default)]
     pub persistent_nat_inactivity_timeout: i64,
     #[serde(rename = "pool_unusable", default)]

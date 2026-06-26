@@ -108,25 +108,65 @@ pub(crate) struct SourceNatFlowKey {
     pub(crate) dst_port: u16,
 }
 
+/// #2823: remote-endpoint scope of a persistent NAT lease, the full
+/// three-way Junos `persistent-nat permit` enum. Replaces the pre-#2823
+/// binary `permit_any_remote_host` bool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum PersistentNatPermit {
+    /// `any-remote-host`: lease keyed by the local source tuple ONLY — any
+    /// remote host reuses the same translated mapping.
+    AnyRemoteHost,
+    /// `target-host`: lease keyed by source tuple + remote destination IP
+    /// (the destination PORT is dropped) — a second flow from the same
+    /// source to a NEW port on the SAME remote host reuses the binding.
+    TargetHost,
+    /// `target-host-port`: lease keyed by source tuple + remote destination
+    /// IP + destination port — a new remote port keys to a distinct lease
+    /// and gets a fresh mapping. The pre-#2823 disabled-flag behavior, the
+    /// default mode, and the fallback for an empty wire value.
+    #[default]
+    TargetHostPort,
+}
+
+impl PersistentNatPermit {
+    /// Decode the wire fields. Prefer the explicit `persistent_nat_permit`
+    /// string; when it is empty (an older control plane that predates the
+    /// enum) fall back to the legacy `persistent_nat_permit_any_remote_host`
+    /// bool: true => AnyRemoteHost, false => TargetHostPort (the pre-#2823
+    /// disabled-flag (dst_ip, dst_port) keying).
+    pub(crate) fn from_wire(permit: &str, permit_any_remote_host: bool) -> Self {
+        match permit {
+            "any-remote-host" => Self::AnyRemoteHost,
+            "target-host" => Self::TargetHost,
+            "target-host-port" => Self::TargetHostPort,
+            _ if permit_any_remote_host => Self::AnyRemoteHost,
+            _ => Self::TargetHostPort,
+        }
+    }
+}
+
 impl SourceNatFlowKey {
     /// #2397: build the persistent-NAT lease key for this flow.
     ///
-    /// `permit_any_remote_host == true` (Junos default) keeps the historical
-    /// behavior: the lease is keyed by the local source tuple only, so any
-    /// remote host reuses the same translated mapping. When `false` (Junos
-    /// target-host[-port] scoping) the remote endpoint (destination ip/port)
-    /// is folded into the key, binding the persistent mapping to the original
-    /// remote: a second flow from the same source to a different remote 5-tuple
-    /// keys to a distinct lease and is allocated a fresh mapping.
-    pub(super) fn persistent_source_key(self, permit_any_remote_host: bool) -> PersistentSourceKey {
+    /// #2823: the scope is selected by the three-way `permit` enum:
+    ///   - `AnyRemoteHost`   -> `remote = None`: source-tuple-only key, any
+    ///     remote host reuses the mapping.
+    ///   - `TargetHost`      -> `remote = Some((dst_ip, 0))`: the destination
+    ///     IP is folded in but the port is dropped, so a second flow from the
+    ///     same source to a NEW port on the SAME remote host keys to the same
+    ///     lease and reuses the mapping.
+    ///   - `TargetHostPort`  -> `remote = Some((dst_ip, dst_port))`: the full
+    ///     remote endpoint is folded in, so a different remote port keys to a
+    ///     distinct lease and gets a fresh mapping (the pre-#2823 behavior).
+    pub(super) fn persistent_source_key(self, permit: PersistentNatPermit) -> PersistentSourceKey {
         PersistentSourceKey {
             protocol: self.protocol,
             src_ip: self.src_ip,
             src_port: self.src_port,
-            remote: if permit_any_remote_host {
-                None
-            } else {
-                Some((self.dst_ip, self.dst_port))
+            remote: match permit {
+                PersistentNatPermit::AnyRemoteHost => None,
+                PersistentNatPermit::TargetHost => Some((self.dst_ip, 0)),
+                PersistentNatPermit::TargetHostPort => Some((self.dst_ip, self.dst_port)),
             },
         }
     }
@@ -159,7 +199,9 @@ pub(crate) struct SourceNatRule {
     pub(crate) pool_failure: Option<SourceNatFailureReason>,
     pub(crate) address_persistent: bool,
     pub(crate) persistent_nat: bool,
-    pub(crate) persistent_nat_permit_any_remote_host: bool,
+    /// #2823: the three-way persistent-NAT remote scope (was a binary
+    /// `permit_any_remote_host` bool).
+    pub(crate) persistent_nat_permit: PersistentNatPermit,
     pub(crate) persistent_nat_inactivity_timeout_secs: i64,
     pub(crate) persistent_nat_timeout_ns: u64,
     pub(crate) pool_addresses_v4: Vec<Ipv4Addr>,
@@ -332,7 +374,11 @@ pub(crate) fn parse_source_nat_rules_with_previous(
             pool_mode: !snap.pool_name.is_empty() || !snap.pool_addresses.is_empty(),
             address_persistent: snap.address_persistent,
             persistent_nat: snap.persistent_nat,
-            persistent_nat_permit_any_remote_host: snap.persistent_nat_permit_any_remote_host,
+            // #2823: prefer the enum string; fall back to the legacy bool.
+            persistent_nat_permit: PersistentNatPermit::from_wire(
+                &snap.persistent_nat_permit,
+                snap.persistent_nat_permit_any_remote_host,
+            ),
             persistent_nat_inactivity_timeout_secs: timeout_secs,
             persistent_nat_timeout_ns: (timeout_secs as u64).saturating_mul(NS_PER_SEC),
             // #2218: resolve the per-rule hit counter (None for counter_id 0).
@@ -431,8 +477,7 @@ fn source_nat_runtime_compatible(new_rule: &SourceNatRule, old_rule: &SourceNatR
         && new_rule.pool_failure == old_rule.pool_failure
         && new_rule.address_persistent == old_rule.address_persistent
         && new_rule.persistent_nat == old_rule.persistent_nat
-        && new_rule.persistent_nat_permit_any_remote_host
-            == old_rule.persistent_nat_permit_any_remote_host
+        && new_rule.persistent_nat_permit == old_rule.persistent_nat_permit
         && new_rule.persistent_nat_inactivity_timeout_secs
             == old_rule.persistent_nat_inactivity_timeout_secs
         && new_rule.pool_addresses_v4 == old_rule.pool_addresses_v4
@@ -688,7 +733,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     0,
                     rule.address_persistent,
                     rule.persistent_nat,
-                    rule.persistent_nat_permit_any_remote_host,
+                    rule.persistent_nat_permit,
                     rule.persistent_nat_timeout_ns,
                     now_ns,
                 ) {
@@ -744,7 +789,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     v6_offset,
                     rule.address_persistent,
                     rule.persistent_nat,
-                    rule.persistent_nat_permit_any_remote_host,
+                    rule.persistent_nat_permit,
                     rule.persistent_nat_timeout_ns,
                     now_ns,
                 ) {

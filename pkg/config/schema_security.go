@@ -103,7 +103,36 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 	}},
 	"nat": {desc: "Network Address Translation", children: map[string]*schemaNode{
 		"source": {desc: "Source NAT configuration", children: map[string]*schemaNode{
-			"pool":               {desc: "Source NAT pool name", args: 1, valueHint: ValueHintPoolName, placeholder: "<pool-name>", children: nil},
+			// #2823: the pool body is a container. Only the persistent-nat
+			// subtree is modeled here (commit-check + completion for the
+			// three-way `permit` enum); other pool leaves (address, port,
+			// host) are unmodeled and left to the compiler per the
+			// opt-in-gate contract (schema_walk.go: unknown keywords return
+			// nil). The container also keeps SetPath grouping intact —
+			// trailing tokens always descend, and a bare `pool <name>` still
+			// emits a leaf.
+			"pool": {desc: "Source NAT pool name", args: 1, valueHint: ValueHintPoolName, placeholder: "<pool-name>", children: map[string]*schemaNode{
+				"persistent-nat": {desc: "Persistent NAT bindings", children: map[string]*schemaNode{
+					"permit": {
+						desc:          "Remote-host reuse scope for persistent bindings",
+						args:          1,
+						valueType:     ValueEnumOf,
+						valueDesc:     "Persistent NAT permit scope",
+						valueExamples: []string{"any-remote-host", "target-host", "target-host-port"},
+						validator:     ValidateEnum([]string{"any-remote-host", "target-host", "target-host-port"}),
+						children:      nil,
+					},
+					"inactivity-timeout": {
+						desc:          "Persistent binding inactivity timeout",
+						args:          1,
+						valueType:     ValueInteger,
+						valueDesc:     "Timeout in seconds",
+						valueExamples: []string{"300", "600"},
+						validator:     ValidateInteger(1, 86400),
+						children:      nil,
+					},
+				}},
+			}},
 			"address-persistent": {desc: "Always map a source IP to the same pool address", children: nil},
 			"rule-set": {desc: "Source NAT rule-set name", args: 1, placeholder: "<rule-set-name>", children: map[string]*schemaNode{
 				"from": {desc: "Source of traffic to match", children: map[string]*schemaNode{

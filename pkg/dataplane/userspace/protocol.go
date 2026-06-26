@@ -447,9 +447,15 @@ type SourceNATRuleSnapshot struct {
 	AddressPersistent                bool     `json:"address_persistent,omitempty"`
 	PersistentNAT                    bool     `json:"persistent_nat,omitempty"`
 	PersistentNATPermitAnyRemoteHost bool     `json:"persistent_nat_permit_any_remote_host,omitempty"`
-	PersistentNATInactivityTimeout   int      `json:"persistent_nat_inactivity_timeout,omitempty"`
-	PoolUnusable                     bool     `json:"pool_unusable,omitempty"`
-	PoolUnusableReason               string   `json:"pool_unusable_reason,omitempty"`
+	// PersistentNATPermit carries the full three-way Junos
+	// `persistent-nat permit` enum (#2823): "any-remote-host",
+	// "target-host", or "target-host-port". Empty => the helper falls back
+	// to the PersistentNATPermitAnyRemoteHost bool (old-Go / old-helper
+	// skew). #2823.
+	PersistentNATPermit            string `json:"persistent_nat_permit,omitempty"`
+	PersistentNATInactivityTimeout int    `json:"persistent_nat_inactivity_timeout,omitempty"`
+	PoolUnusable                   bool   `json:"pool_unusable,omitempty"`
+	PoolUnusableReason             string `json:"pool_unusable_reason,omitempty"`
 	// CounterID is the compiler-assigned per-rule translation hit counter ID
 	// (stable key-derived hash, non-zero; 0 means "no counter"). The userspace
 	// dataplane attributes each SNAT translation on this rule to this slot, and

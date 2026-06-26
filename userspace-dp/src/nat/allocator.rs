@@ -316,7 +316,7 @@ impl PortAllocator {
         family_offset: usize,
         address_persistent: bool,
         persistent_nat: bool,
-        persistent_nat_permit_any_remote_host: bool,
+        persistent_nat_permit: super::source::PersistentNatPermit,
         persistent_nat_timeout_ns: u64,
         now_ns: u64,
     ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
@@ -345,8 +345,8 @@ impl PortAllocator {
             return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
         }
 
-        let persistent_key = persistent_nat
-            .then(|| flow.persistent_source_key(persistent_nat_permit_any_remote_host));
+        let persistent_key =
+            persistent_nat.then(|| flow.persistent_source_key(persistent_nat_permit));
         if let Some(key) = persistent_key {
             if live.persistent_by_source.contains_key(&key) {
                 let mut reusable = None;

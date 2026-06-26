@@ -1045,6 +1045,7 @@
     "off": false,
     "persistent_nat": false,
     "persistent_nat_inactivity_timeout": 0,
+    "persistent_nat_permit": "",
     "persistent_nat_permit_any_remote_host": false,
     "pool_addresses": [],
     "pool_name": "",

@@ -2063,3 +2063,46 @@ disabled for iBGP routes in redundant leaf-spine / route-reflector topologies
 - **tests** — parse: `TestBGPMultipathIBGPSetSyntax` (`parser_routing_test.go`);
   render fail-on-revert: `TestGenerateProtocols_BGPMultipathIBGP` +
   `TestGenerateProtocols_BGPMultipathNoIBGP` (`frr_test.go`).
+
+### #2823 — Source-NAT pool `persistent-nat permit` three-way enum
+
+Junos `persistent-nat permit` is a three-way enum
+(`any-remote-host | target-host | target-host-port`), not a binary flag. The
+pre-#2823 model parsed only `permit any-remote-host` into a
+`PermitAnyRemoteHost bool`, so `target-host` (remote-IP-only lease scope) was
+unreachable, and the source-NAT `pool <name>` node carried NO schema body — the
+whole pool stanza (address, port, persistent-nat) was unmodeled, so
+`set ... persistent-nat permit target-host?` neither completed nor validated.
+
+- **schema** — the `pool` node under `security nat source`
+  (`schema_security.go`) gains a `children` map (it is a real container, so the
+  SetPath replace-vs-container decision is unaffected — trailing tokens always
+  descend, and a bare `pool <name>` still emits a leaf). The `persistent-nat`
+  subtree declares `permit` as a `ValueEnumOf` + `ValidateEnum(any-remote-host
+  | target-host | target-host-port)` typed leaf (same recipe as
+  `default-policy`) and `inactivity-timeout` as a `ValueInteger` +
+  `ValidateInteger(1,86400)` leaf. Other pool leaves (address/port/host) stay
+  unmodeled and are left to the compiler per the opt-in-gate contract
+  (`schema_walk.go`: unknown keywords return nil, never reject).
+- **typed field** — `PersistentNATConfig.Permit PersistentNATPermit`
+  (`types_security.go`) replaces the `PermitAnyRemoteHost bool`. The default
+  (persistent-nat configured with no `permit`) is `target-host-port`, the
+  byte-identical equivalent of the pre-#2823/#2819 false-flag `(dst_ip,
+  dst_port)` keying. The parser (`compiler_nat.go`) accepts all three values in
+  BOTH the flat-set (Keys) and hierarchical (Children) AST shapes.
+- **wire** — `SourceNATRuleSnapshot.PersistentNATPermit` (string,
+  `persistent_nat_permit`) carries the enum to the helper; the legacy
+  `persistent_nat_permit_any_remote_host` bool is still emitted for skew
+  against an older helper, which falls back to it. Additive — the only
+  `protocol_wire_v1.json` change is the new key.
+- **lease keying** (Rust, `userspace-dp/src/nat/source.rs`,
+  `PersistentNatPermit`) — `any-remote-host`→`remote=None` (source-tuple-only),
+  `target-host`→`remote=Some((dst_ip,0))` (port dropped, new remote port on the
+  same host reuses), `target-host-port`→`remote=Some((dst_ip,dst_port))`.
+- **tests** — Go parse/default/schema:
+  `pkg/config/compiler_nat_persistent_permit_test.go`. Rust per-mode reuse
+  fail-on-revert: `pool_snat_persistent_target_host_reuses_across_remote_ports`,
+  `pool_snat_persistent_target_host_port_distinct_per_remote_port`,
+  `pool_snat_persistent_any_remote_host_reuses_everywhere`,
+  `pool_snat_persistent_permit_empty_string_falls_back_to_legacy_bool`
+  (`userspace-dp/src/nat/tests.rs`).
