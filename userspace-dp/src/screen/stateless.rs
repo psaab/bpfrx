@@ -101,9 +101,9 @@ pub(super) fn check_tcp_flag_screens(
 /// Limitation (inherited from #893): a first fragment carrying IP
 /// options combined with non-first fragments without them can craft
 /// `offset_bytes + ip_total_len <= 65535` while the reassembled total
-/// overflows by up to 40 bytes. Operators concerned about this should
-/// also enable the `ip-source-route` screen, which drops any IPv4
-/// packet with `ihl > 5`.
+/// overflows by up to 40 bytes. (Note: the `ip-source-route` screen now
+/// only drops actual LSRR/SSRR options after #2973, so it no longer
+/// blanket-drops every IHL>5 packet as a side defense here.)
 ///
 /// #2293: the IPv6 path applies the same per-fragment oversize formula.
 /// The dataplane does not reassemble, so for an IPv6 fragment we size
@@ -155,6 +155,15 @@ pub(super) fn check_ping_of_death(
 }
 
 /// Teardrop: IPv4 non-first fragment with tiny payload (< 8 bytes).
+///
+/// #3027: a non-first fragment whose `ip_total_len <= hdr_len` carries
+/// zero (or, by the field's claimed length, "negative") payload. That is
+/// even more clearly malformed than the classic tiny-but-positive
+/// teardrop signature — exactly the kind of crafted fragment that
+/// confuses downstream reassembly — yet the pre-#3027 code only entered
+/// the payload-size branch when `ip_total_len > hdr_len`, so the
+/// zero/under-length case slipped through as a PASS. Treat it as a
+/// teardrop drop.
 #[inline]
 pub(super) fn check_teardrop(
     profile: &ScreenProfile,
@@ -164,11 +173,13 @@ pub(super) fn check_teardrop(
         let frag_offset = pkt.ip_frag_off & 0x1FFF;
         if frag_offset > 0 {
             let hdr_len = (pkt.ip_ihl as u16) * 4;
-            if pkt.ip_total_len > hdr_len {
-                let payload = pkt.ip_total_len - hdr_len;
-                if payload < 8 {
-                    return Some("teardrop");
-                }
+            if pkt.ip_total_len <= hdr_len {
+                // No / negative payload on a non-first fragment — malformed.
+                return Some("teardrop");
+            }
+            let payload = pkt.ip_total_len - hdr_len;
+            if payload < 8 {
+                return Some("teardrop");
             }
         }
     }
@@ -190,13 +201,26 @@ pub(super) fn check_icmp_fragment(
     None
 }
 
-/// IP source-route option: IPv4 with IHL > 5 (options present).
+/// IP source-route screen.
+///
+/// #2973: drop ONLY when an actual source-route option/header is present
+/// — IPv4 LSRR (option 131) / SSRR (option 137), or an IPv6 Routing
+/// Header (next-header 43) carrying a source-route routing type (RH0 /
+/// type 1). The extractor (`extract.rs`) decodes the IPv4 options TLVs
+/// and the IPv6 extension-header chain to set `saw_ipv4_source_route` /
+/// `saw_ipv6_routing_header`.
+///
+/// The pre-#2973 implementation dropped on ANY IPv4 IHL>5 (any options
+/// present), which false-dropped benign router-alert / record-route /
+/// timestamp / security packets, and it ignored IPv6 Routing Headers
+/// entirely — a vSRX/SRX feature-parity gap (the screen is expected to
+/// catch the source-route security intent on both families).
 #[inline]
 pub(super) fn check_source_route(
     profile: &ScreenProfile,
     pkt: &ScreenPacketInfo,
 ) -> Option<&'static str> {
-    if profile.source_route && pkt.addr_family == libc::AF_INET as u8 && pkt.ip_ihl > 5 {
+    if profile.source_route && (pkt.saw_ipv4_source_route || pkt.saw_ipv6_routing_header) {
         return Some("ip-source-route");
     }
     None

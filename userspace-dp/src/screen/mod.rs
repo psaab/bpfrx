@@ -17,9 +17,11 @@
 //! - WinNuke (URG to port 139)
 //! - Ping of death (IPv4 fragment whose offset+total-length would
 //!   reassemble past 65535 bytes — #893/#2215 formula, any protocol)
-//! - Teardrop (overlapping fragments)
+//! - Teardrop (overlapping fragments, plus a non-first fragment with no
+//!   /negative payload `ip_total_len <= hdr_len` — #3027)
 //! - ICMP fragment
-//! - IP source route options
+//! - IP source route — IPv4 LSRR/SSRR options and IPv6 Routing Header
+//!   (source-route routing type), not every IHL>5 packet (#2973)
 //! - Rate limiting (ICMP, UDP flood)
 //! - SYN flood (per-zone rate)
 //!
