@@ -1237,6 +1237,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return nil
 			},
+			// #3042: live feed-prefix overlay so the REST match-policies
+			// simulator resolves feed-backed address-names to their live
+			// CIDRs, matching what the AF_XDP helper enforces.
+			FeedOverlayFn: func() map[string][]string {
+				return d.feedSnapshotsForConfig(d.store.ActiveConfig())
+			},
 			// #1387 inc-2: DHCP dynamic-DNS counters for the
 			// xpf_dhcp_ddns_* metric family. Returns nil when the
 			// manager is absent (NoDataplane), omitting the family.
@@ -1345,6 +1351,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 					return d.feeds.AllFeeds()
 				}
 				return nil
+			},
+			// #3042: live feed-prefix overlay so the gRPC MatchPolicies
+			// simulator resolves feed-backed address-names to their live
+			// CIDRs, matching what the AF_XDP helper enforces.
+			FeedOverlayFn: func() map[string][]string {
+				return d.feedSnapshotsForConfig(d.store.ActiveConfig())
 			},
 			LLDPNeighborsFn: func() []*lldp.Neighbor {
 				if d.lldpMgr != nil {

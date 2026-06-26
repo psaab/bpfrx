@@ -14,6 +14,7 @@ import (
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/diagcmd"
+	"github.com/psaab/xpf/pkg/policymatch"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/wgkey"
 )
@@ -233,78 +234,51 @@ func (c *CLI) testPolicy(args []string) error {
 	parsedSrc := net.ParseIP(srcIP)
 	parsedDst := net.ParseIP(dstIP)
 
-	// Check zone-pair policies
-	for _, zpp := range cfg.Security.Policies {
-		if zpp.FromZone != fromZone || zpp.ToZone != toZone {
-			continue
-		}
-		for _, pol := range zpp.Policies {
-			if !matchPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
-				continue
-			}
-			if !matchPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
-				continue
-			}
-			if !matchPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
-				continue
-			}
-			action := "permit"
-			switch pol.Action {
-			case 1:
-				action = "deny"
-			case 2:
-				action = "reject"
-			}
-			fmt.Printf("Policy match:\n")
-			fmt.Printf("  From zone: %s\n  To zone:   %s\n", fromZone, toZone)
-			fmt.Printf("  Policy:    %s\n", pol.Name)
-			fmt.Printf("  Action:    %s\n", action)
-			if srcIP != "" {
-				fmt.Printf("  Source:    %s -> ", srcIP)
-			} else {
-				fmt.Printf("  Source:    any -> ")
-			}
-			if dstIP != "" {
-				fmt.Printf("%s", dstIP)
-			} else {
-				fmt.Printf("any")
-			}
-			if dstPort > 0 {
-				fmt.Printf(":%d", dstPort)
-			}
-			if proto != "" {
-				fmt.Printf(" [%s]", proto)
-			}
-			fmt.Println()
-			return nil
-		}
-	}
-
-	// Check global policies
-	for _, pol := range cfg.Security.GlobalPolicies {
-		if !matchPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
-			continue
-		}
-		if !matchPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
-			continue
-		}
-		if !matchPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
-			continue
-		}
-		action := "permit"
-		switch pol.Action {
-		case 1:
-			action = "deny"
-		case 2:
-			action = "reject"
-		}
-		fmt.Printf("Policy match (global):\n")
-		fmt.Printf("  Policy:    %s\n", pol.Name)
-		fmt.Printf("  Action:    %s\n", action)
+	// #3042: delegate to the single shared simulator (zone-pair -> global ->
+	// default-policy). The pre-#3042 loop hard-coded "Default deny" (ignoring
+	// default-policy permit-all) and used a narrow address/app matcher that
+	// missed predefined apps, nested application-sets, literal CIDRs,
+	// any-ipv4/any-ipv6, and source/destination exclusion.
+	res := policymatch.Match(cfg, policymatch.Query{
+		FromZone: fromZone,
+		ToZone:   toZone,
+		SrcIP:    parsedSrc,
+		DstIP:    parsedDst,
+		Protocol: proto,
+		DstPort:  dstPort,
+	})
+	if !res.Matched {
+		fmt.Printf("Default %s (no matching policy for %s -> %s)\n",
+			policymatch.ActionString(res.Action), fromZone, toZone)
 		return nil
 	}
-
-	fmt.Printf("Default deny (no matching policy for %s -> %s)\n", fromZone, toZone)
+	if res.Global {
+		fmt.Printf("Policy match (global):\n")
+		fmt.Printf("  Policy:    %s\n", res.PolicyName)
+		fmt.Printf("  Action:    %s\n", policymatch.ActionString(res.Action))
+		return nil
+	}
+	fmt.Printf("Policy match:\n")
+	fmt.Printf("  From zone: %s\n  To zone:   %s\n", fromZone, toZone)
+	fmt.Printf("  Policy:    %s\n", res.PolicyName)
+	fmt.Printf("  Action:    %s\n", policymatch.ActionString(res.Action))
+	if srcIP != "" {
+		fmt.Printf("  Source:    %s -> ", srcIP)
+	} else {
+		fmt.Printf("  Source:    any -> ")
+	}
+	if dstIP != "" {
+		fmt.Printf("%s", dstIP)
+	} else {
+		fmt.Printf("any")
+	}
+	if dstPort > 0 {
+		fmt.Printf(":%d", dstPort)
+	}
+	if proto != "" {
+		fmt.Printf(" [%s]", proto)
+	}
+	fmt.Println()
 	return nil
 }
 

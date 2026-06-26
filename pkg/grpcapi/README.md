@@ -67,6 +67,18 @@ contract.
   `source-nat-pool` filter matches the TRANSLATED source
   (`SessFlagSNAT` + `NATSrcIP` in the pool's address set via
   `config.SourceNATPoolNets`).
+- `MatchPolicies` is a THIN adapter over the single shared policy simulator
+  `pkg/policymatch` (#3042) — the same matcher the REST `/security/match`
+  handler and the CLI `show security match-policies` / `test policy` commands
+  use. It validates inputs, then delegates to `policymatch.Match`, which
+  replicates the runtime evaluator (zone-pair → global → configured
+  `default-policy`, predefined apps, multi-level application-sets, literal
+  CIDRs, `any-ipv4`/`any-ipv6`, source/destination exclusion, and the live
+  feed overlay via `FeedOverlayFn`). The pre-#3042 hand-written matcher
+  scanned only zone-pair policies and hard-coded `deny (default)`, so the
+  diagnostic could report the OPPOSITE of what the dataplane enforces. The
+  request gained a `source_port` field so source-port-constrained app terms
+  are simulated.
 - Server-streaming RPCs (Ping, Traceroute, MonitorPacketDrop,
   MonitorInterface) must drain on client disconnect; cancel the context
   to free buffered output.
