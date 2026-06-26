@@ -63,6 +63,37 @@ func shouldUseLogicalOnlyParentBoundRethVLAN(cfg *config.Config, ifName string, 
 	return config.LinuxIfName(cfg.ResolveReth(ifName)) != config.LinuxIfName(ifName)
 }
 
+// userspaceBindTargetNetdev returns the Linux netdev that the userspace
+// dataplane's AF_XDP socket actually binds to for a snapshot interface.
+// This is the SINGLE SOURCE OF TRUTH on the Go control plane for the
+// VLAN-unit binding contract (#2917).
+//
+// A VLAN sub-interface (e.g. reth0.80 → Linux netdev `ge-0-0-2.80`) is a
+// SOFTWARE netdev with no hardware RX queues of its own: its VLAN-tagged
+// frames are delivered on the PHYSICAL PARENT's hardware queues
+// (`ge-0-0-2`) and the kernel demuxes the tag. Zero-copy AF_XDP therefore
+// MUST bind the parent physical netdev, never the `.80` unit netdev (which
+// would fail or fall back to copy/generic and, in the queue planner,
+// collapse the per-interface queue_count to its lone software queue — the
+// #3091 single-worker regression).
+//
+// This rule mirrors the Rust planner's `vlan_child_parent_netdev`
+// (`userspace-dp/src/server/helpers.rs`) EXACTLY: redirect to the parent
+// only when the row is a distinct VLAN child (VLANID != 0, a non-empty
+// ParentLinuxName, and a parent netdev that differs from the row's own
+// netdev). For a physical interface or a non-VLAN unit the parent and own
+// netdev are the same netdev, so the bind target is the row's own
+// LinuxName — identical to what `replan_queues` pushes as a candidate. The
+// two planes MUST stay in lock-step; the cross-plane parity test in
+// snapshot_allowlist_test.go and the Rust SSOT test in main_tests.rs guard
+// against re-divergence.
+func userspaceBindTargetNetdev(iface InterfaceSnapshot) string {
+	if iface.VLANID != 0 && iface.ParentLinuxName != "" && iface.ParentLinuxName != iface.LinuxName {
+		return iface.ParentLinuxName
+	}
+	return iface.LinuxName
+}
+
 // UserspaceBoundLinuxInterfaces returns the deduplicated, sorted set of
 // Linux interface names that the userspace dataplane will bind AF_XDP
 // sockets to for the given compiled config. This is the authoritative
@@ -116,13 +147,12 @@ func UserspaceBoundLinuxInterfaces(cfg *config.Config) []string {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
 		}
-		// Prefer the parent Linux name when present (VLAN units bind on
-		// the parent physical netdev); otherwise the iface's own name.
-		if iface.ParentLinuxName != "" {
-			add(iface.ParentLinuxName)
-		} else {
-			add(iface.LinuxName)
-		}
+		// #2917: resolve the AF_XDP bind target through the single
+		// VLAN-unit binding contract (userspaceBindTargetNetdev), which
+		// mirrors the Rust planner's vlan_child_parent_netdev rule
+		// exactly. A VLAN sub-interface binds its physical PARENT netdev;
+		// everything else binds its own netdev.
+		add(userspaceBindTargetNetdev(iface))
 	}
 	for _, fab := range snap.Fabrics {
 		add(fab.ParentLinuxName)
