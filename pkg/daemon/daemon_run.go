@@ -1483,6 +1483,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			return nil
 		})
+		// #3105: live feed-prefix overlay so the in-process CLI's
+		// `show security match-policies` / `test policy` simulators resolve
+		// feed-backed address-names to their live CIDRs, matching the REST/gRPC
+		// simulators (same FeedOverlayFn) and what the AF_XDP helper enforces.
+		// Reads daemon-local state (feedSnapshotsForConfig -> the feed
+		// manager's in-memory snapshots) — no control-socket call.
+		shell.SetFeedOverlayFn(func() map[string][]string {
+			return d.feedSnapshotsForConfig(d.store.ActiveConfig())
+		})
 		shell.SetLLDPNeighborsFn(func() []*lldp.Neighbor {
 			if d.lldpMgr != nil {
 				return d.lldpMgr.Neighbors()

@@ -266,14 +266,19 @@ func (c *CLI) testPolicy(args []string) error {
 	// default-policy permit-all) and used a narrow address/app matcher that
 	// missed predefined apps, nested application-sets, literal CIDRs,
 	// any-ipv4/any-ipv6, and source/destination exclusion.
+	// #3105: pass the live dynamic-address feed-prefix overlay so a feed-backed
+	// address-name resolves to its live CIDRs on-box, matching the REST/gRPC
+	// simulators and the AF_XDP helper. Nil (CLI outside the daemon) keeps the
+	// pre-#3105 static-only behavior.
 	res := policymatch.Match(cfg, policymatch.Query{
-		FromZone: fromZone,
-		ToZone:   toZone,
-		SrcIP:    parsedSrc,
-		DstIP:    parsedDst,
-		Protocol: proto,
-		SrcPort:  srcPort,
-		DstPort:  dstPort,
+		FromZone:    fromZone,
+		ToZone:      toZone,
+		SrcIP:       parsedSrc,
+		DstIP:       parsedDst,
+		Protocol:    proto,
+		SrcPort:     srcPort,
+		DstPort:     dstPort,
+		FeedOverlay: c.feedOverlay(),
 	})
 	if !res.Matched {
 		fmt.Printf("Default %s (no matching policy for %s -> %s)\n",
