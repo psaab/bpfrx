@@ -79,6 +79,16 @@ contract.
   diagnostic could report the OPPOSITE of what the dataplane enforces. The
   request gained a `source_port` field so source-port-constrained app terms
   are simulated.
+- The `test policy` operational command (local `pkg/cli` + remote `cmd/cli`
+  → ShowText `test-policy:` topic → `showTestPolicy`) carries the same
+  source-port input (#3107). The topic adds a `srcport=` key alongside the
+  existing `port=` (destination) key; `showTestPolicy` parses it via the
+  shared `policymatch.ParsePort` (so empty = unspecified / match any source
+  port, and a malformed/out-of-range value reports `invalid source-port`
+  instead of silently coercing to the 0 wildcard, the #3116 contract) and
+  threads it into `policymatch.Query.SrcPort`. Without it a
+  source-port-constrained application was overmatched: the CLI could report a
+  PERMIT a real packet from another source port would never receive.
 - Server-streaming RPCs (Ping, Traceroute, MonitorPacketDrop,
   MonitorInterface) must drain on client disconnect; cancel the context
   to free buffered output.
