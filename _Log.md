@@ -1,3 +1,29 @@
+## 2026-06-25 — #3079: reject NAT rule-set interface/routing-instance scope at commit
+
+- **Timestamp**: 2026-06-25
+- **Action**: A `security nat {source|destination|static}` rule-set whose
+  `from`/`to` clause scoped traffic by `interface` or `routing-instance`
+  (instead of the only enforced `zone`) committed cleanly but had its scope
+  SILENTLY DISCARDED — `parseZoneList` (`compiler_nat.go`) returns only `zone`
+  children and every caller widens an empty zone list to the match-any wildcard
+  `[]string{""}`, so the rule-set applied GLOBALLY, leaking translated sessions
+  across the routing boundary (a security/isolation failure). Added the interim
+  fail-closed gate `validateNATRuleSetScopeAST` (`compiler_nat_scope.go`): an
+  AST pre-walk in `compileExpanded` that hard-rejects the unsupported scope at
+  commit/commit-check (strict), naming the kind/rule-set/direction/keyword/value,
+  and downgrades to a `cfg.Warnings` entry on the tolerant load/peer-sync paths
+  (`lenientNATRuleSetScope`) so an already-persisted config still boots (#1960).
+  `from`/`to` `zone` and the no-from/to global case stay accepted. Full
+  interface-/routing-instance-scoped NAT matching is deferred to a follow-up
+  issue. Same reject-at-commit pattern as #3018/#3055/#3060.
+- **File(s)**: pkg/config/compiler_nat_scope.go (new),
+  pkg/config/compiler_nat_scope_3079_test.go (new), pkg/config/compiler.go
+  (compileOpts flag + compileExpanded call + lenient wiring), pkg/config/README.md
+- **Validation**: `go build ./...` clean; `go vet ./pkg/config/...` clean;
+  `go test ./pkg/config/...` 1559 passed; gofmt clean. Fail-on-revert confirmed:
+  stubbing the validator to `return nil, nil` turns all 8 reject sub-tests + the
+  lenient-warns test RED; restoring → GREEN.
+
 ## 2026-06-25 — #3018: reject wildcard from-zone/to-zone `any` policy at commit
 
 - **Timestamp**: 2026-06-25

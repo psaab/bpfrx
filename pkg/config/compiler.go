@@ -699,6 +699,24 @@ type compileOpts struct {
 	// behavior), now flagged. Full wildcard-zone runtime indexing is a deferred
 	// follow-up. Same doctrine as lenientPolicyZoneRefs.
 	lenientPolicyWildcardZone bool
+	// lenientNATRuleSetScope (#3079) downgrades the NAT rule-set from/to
+	// scope gate (validateNATRuleSetScopeAST) from a hard compile error to a
+	// cfg.Warnings entry. A NAT rule-set whose `from`/`to` clause scopes
+	// traffic by `interface` or `routing-instance` (instead of the only
+	// enforced `zone`) committed cleanly but had its scope SILENTLY
+	// DISCARDED: parseZoneList returns only `zone` children, and every NAT
+	// caller falls back to the match-any wildcard when the zone list is
+	// empty, so the rule-set applied GLOBALLY — translated sessions leaked
+	// across the routing boundary the operator drew. The strict commit /
+	// commit-check path hard-rejects so the misconfiguration is operator-
+	// visible (naming the kind, rule-set, direction, keyword); the tolerant
+	// load / peer-sync paths downgrade to a warning so an already-persisted
+	// or peer-synced config an older binary silently accepted still BOOTS
+	// (#1960 fail-closed-on-load class) — it stays applied globally (the
+	// pre-existing behaviour), now flagged. Full interface-/
+	// routing-instance-scoped NAT matching is a deferred follow-up. Same
+	// doctrine as lenientPolicyWildcardZone.
+	lenientNATRuleSetScope bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -763,6 +781,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientScreenProfileRefs:           true,
 		lenientReservedZoneNames:           true,
 		lenientPolicyWildcardZone:          true,
+		lenientNATRuleSetScope:             true,
 	})
 }
 
@@ -878,6 +897,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientScreenProfileRefs:           true,
 		lenientReservedZoneNames:           true,
 		lenientPolicyWildcardZone:          true,
+		lenientNATRuleSetScope:             true,
 	})
 }
 
@@ -973,6 +993,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3079 NAT rule-set scope gate. A `security nat {source|destination|
+	// static}` rule-set whose `from`/`to` clause scopes traffic by
+	// `interface` or `routing-instance` (instead of the only enforced
+	// `zone`) compiled cleanly but had its scope silently discarded
+	// (parseZoneList returns only `zone`, and every caller widens an empty
+	// zone list to match-any), so the rule-set applied GLOBALLY — translated
+	// sessions leaked across the routing boundary. Runs on the group-
+	// expanded, inactive-pruned tree BEFORE section compilation (which is
+	// where the scope keyword is dropped) so an apply-groups-inherited scope
+	// is caught. Strict (commit / commit-check): hard-reject naming the
+	// kind/rule-set/direction/keyword. Lenient (load / peer-sync): warn so an
+	// already-persisted or peer-synced config still boots (#1960) — it stays
+	// applied globally, now flagged. Full interface-/routing-instance-scoped
+	// matching is a deferred follow-up.
+	natScopeWarnings, err := validateNATRuleSetScopeAST(
+		tree.Children, opts.lenientNATRuleSetScope)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -1008,6 +1048,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, trackWarnings...)
 	cfg.Warnings = append(cfg.Warnings, mssWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
+	cfg.Warnings = append(cfg.Warnings, natScopeWarnings...)
 
 	for _, node := range tree.Children {
 		switch node.Name() {
