@@ -1,3 +1,26 @@
+## 2026-06-25 — #3149 (folds #3147): policy dangling/empty address-set hard-reject
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added `validatePolicyMatchAddressSetMembersStrict` — hard-rejects
+  at commit a security-policy source/destination address that names a DEFINED
+  address-book entry whose recursive members dangle, a defined-but-EMPTY
+  address-set, or a prefix-less address. Mirrors the runtime resolver
+  `resolveUserspaceAddressBookEntry`+`expandUserspacePolicyAddresses` exactly via
+  new helper `policyMatchAddressBookResolves` (fail-closed; cycle/empty-expansion
+  rejected by the outer count==0 check). Address-book sibling of #2217/#3144/#3146.
+  Folds #3147 (empty address-set) and pins the excluded-inversion safety: an empty
+  EXCLUDED set is rejected fail-CLOSED (can never commit → never inverts to
+  match-all). Strict on commit; lenient warn on load/peer-sync via new flag
+  `lenientPolicyMatchAddressSetMembers` (#1960). The warn.go address-set member
+  warning is retained for the lenient path + unreferenced sets.
+- **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/compiler_policy_match_address_set_3149_test.go (new),
+  pkg/config/README.md, _Log.md
+- **Validation**: go build ./..., go vet ./pkg/config/..., go test
+  ./pkg/config/... ./pkg/dataplane/userspace/... (2300 passed). 22 new subtests
+  green; fail-on-revert confirmed RED (stub validator body → all reject cases
+  fail). gofmt clean on changed files.
+
 ## 2026-06-25 — #3151: local-delivery resolution table-scoped (cross-VRF leak)
 
 - **Timestamp**: 2026-06-25
