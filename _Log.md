@@ -1,3 +1,27 @@
+## 2026-06-26 — #3230 screen icmp/udp flood + port-scan + ip-sweep default thresholds
+
+- **Timestamp**: 2026-06-26
+- **Action**: Sibling of #3024. When icmp-flood, udp-flood, tcp port-scan,
+  or ip ip-sweep was enabled WITHOUT an explicit threshold, the screen
+  compiled to threshold 0 and the Rust screen engine's `threshold > 0`
+  gate silently skipped the check. Added Junos-aligned parse-time defaults
+  in `compileScreen` so an enabled-but-unset check arms at a nonzero rate:
+  icmp/udp flood = 1000 pps, port-scan/ip-sweep = 10 distinct destinations
+  (Junos's detection count; this engine reads the threshold as a count over
+  a fixed 10s window, not Junos's 5000us window). Explicit thresholds are
+  preserved; unconfigured checks stay off (0). New constants
+  `defaultICMPFloodThreshold`/`defaultUDPFloodThreshold`/
+  `defaultPortScanThreshold`/`defaultIPSweepThreshold`.
+- **File(s)**: pkg/config/compiler_security.go,
+  pkg/config/parser_security_test.go (TestScreenFloodScanDefaultThresholds,
+  TestScreenFloodScanExplicitThresholdsPreserved,
+  TestScreenFloodScanNotConfiguredStaysOff),
+  docs/syn-cookie-flood-protection.md, _Log.md
+- **Validation**: go build ./...; go test ./pkg/config/ ./pkg/dataplane/...
+  all green. Fail-on-revert: removing the four defaulting blocks turned
+  TestScreenFloodScanDefaultThresholds RED (icmp=0, udp=0, port-scan=0,
+  ip-sweep=0); restored byte-identical → green.
+
 ## 2026-06-26 — #3228 dest-NAT: reject a partial-valid destination-address list at commit
 
 - **Timestamp**: 2026-06-26
