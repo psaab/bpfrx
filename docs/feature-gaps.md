@@ -166,7 +166,7 @@ User-based policy enforcement integrating with directory services. Not implement
 
 ## 8. NAT Enhancements
 
-xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT (with pools, hit counters, source-address-name match, protocol-only match, port rewriting, multi-port matching), static 1:1, NAT64, and exemption rules. These are additional NAT features from the vSRX.
+xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT (with pools, hit counters, source-address-name match, protocol-only match, port rewriting, multi-port matching), static 1:1 (host AND block-to-block subnet mappings, #3031), NAT64, and exemption rules. These are additional NAT features from the vSRX.
 
 > **DNAT `match destination-address` is exact-host only (#3029).** The
 > userspace `DnatTable` keys on an exact destination `IpAddr` (no prefix /
@@ -179,8 +179,14 @@ xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT
 > no-brick). Single-host destinations (a bare IP, an explicit `/32`, or
 > `/128`) are accepted unchanged. Block-to-block destination NAT (the Junos
 > 1:1-offset / many:one block-mapping semantics) is a separate dataplane
-> feature — see #3029 (and the static-NAT block sibling #3031); honoring a
-> DNAT destination prefix needs a prefix-match table plus confirmed Junos
+> feature — see #3029. This is the DNAT-table limitation only; the
+> **static-NAT** sibling block mapping (`static-nat prefix <subnet>`, 1:1
+> by offset) is now **supported** (#3031): an equal-length source/
+> destination prefix pair installs an offset-preserving `StaticNatTable`
+> block rule (forward DNAT + reverse SNAT, host bits preserved), and the
+> commit gate accepts the valid equal-length pair while still rejecting
+> mismatched-length / mixed-family pairs. Honoring a DNAT destination
+> prefix still needs a prefix-match table plus confirmed Junos
 > block-mapping semantics.
 
 > **NAT64 inbound policy matches the SYNTHETIC IPv6 destination, not the

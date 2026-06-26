@@ -378,3 +378,66 @@ func TestIsNAT64PoolHostAddress(t *testing.T) {
 		}
 	}
 }
+
+// #3031: a valid block-to-block (subnet) static-NAT rule — equal-length
+// non-host prefixes of the same family — must now COMPILE (the dataplane
+// installs an offset-preserving 1:1 remap). It was previously rejected by the
+// host-mask gate.
+func TestStaticNATBlockToBlockV4Compiles(t *testing.T) {
+	tree := buildTree(t, staticNATSet("198.51.100.0/24", "192.168.1.0/24"))
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("equal-length /24->/24 block static-NAT must compile, got: %v", err)
+	}
+}
+
+func TestStaticNATBlockToBlockV6Compiles(t *testing.T) {
+	tree := buildTree(t, staticNATSet("2001:db8:a::/120", "fd00:1::/120"))
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("equal-length /120->/120 v6 block static-NAT must compile, got: %v", err)
+	}
+}
+
+// A mismatched-length pair (/24 -> /25) is NOT a 1:1 block map and stays
+// rejected — the dataplane skips it, so the commit gate must surface it.
+func TestStaticNATBlockMismatchedLengthRejected(t *testing.T) {
+	tree := buildTree(t, staticNATSet("198.51.100.0/24", "192.168.1.0/25"))
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("mismatched-length block static-NAT (/24 -> /25) must be rejected")
+	}
+	if !strings.Contains(err.Error(), "host route") {
+		t.Fatalf("error must still cite the host-route rule, got: %v", err)
+	}
+}
+
+// A mixed-family pair (v4 -> v6) is not a block map and stays rejected.
+func TestStaticNATBlockMixedFamilyRejected(t *testing.T) {
+	tree := buildTree(t, staticNATSet("198.51.100.0/24", "2001:db8::/120"))
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatal("mixed-family block static-NAT (v4 -> v6) must be rejected")
+	}
+}
+
+// isStaticBlockPair unit coverage.
+func TestIsStaticBlockPair(t *testing.T) {
+	cases := []struct {
+		match, then string
+		want        bool
+	}{
+		{"198.51.100.0/24", "192.168.1.0/24", true},  // equal-length block pair
+		{"2001:db8:a::/120", "fd00:1::/120", true},   // v6 equal-length pair
+		{"198.51.100.0/24", "192.168.1.0/25", false}, // mismatched length
+		{"198.51.100.0/24", "2001:db8::/120", false}, // mixed family
+		{"203.0.113.5/32", "10.0.0.5/32", false},     // both host
+		{"203.0.113.5", "10.0.0.5", false},           // bare hosts
+		{"203.0.113.5/32", "10.0.0.0/24", false},     // host vs block
+		{"198.51.100.0/24", "10.0.0.5/32", false},    // block vs host
+		{"198.51.100.0/33", "192.168.1.0/24", false}, // malformed mask
+		{"book-name", "192.168.1.0/24", false},       // non-IP token
+	}
+	for _, c := range cases {
+		if got := isStaticBlockPair(c.match, c.then); got != c.want {
+			t.Errorf("isStaticBlockPair(%q, %q) = %v, want %v", c.match, c.then, got, c.want)
+		}
+	}
+}
