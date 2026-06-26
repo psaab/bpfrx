@@ -1,3 +1,27 @@
+## 2026-06-25 — #3025: NAT64 non-fragmented L4 checksum goes incremental (RFC 1624)
+
+- **Timestamp**: 2026-06-25
+- **Action**: NAT64's non-fragmented TCP/UDP translation now adjusts the L4
+  checksum INCREMENTALLY (RFC 1624) for the v4↔v6 pseudo-header address change
+  instead of re-summing the entire L4 payload (agy-review-061 finding 061-05,
+  performance). The transport payload is byte-identical across translation and
+  the length/protocol fields are unchanged, so only the pseudo-header addresses
+  differ — making the O(changed-words) fold byte-identical to the previous full
+  recompute (one's-complement addition is exact). Renamed the existing #2488
+  fragment helpers `adjust_l4_checksum_v{6_to_v4,4_to_v6}_fragment` →
+  `_incremental` (they now serve both fragment and non-fragment paths) and
+  routed the non-fragment TCP / non-zero-checksum UDP cases through them. ICMP,
+  v4→v6 UDP with a zero IPv4 checksum (RFC 768 "no checksum" → must GENERATE
+  one), and a defensive v6→v4 UDP zero-baseline keep the full recompute. The
+  #2488 fragment path is untouched.
+- **File(s)**: userspace-dp/src/nat64.rs (module doc + both translators + helper
+  renames), userspace-dp/src/nat64_tests.rs (8 `nat64_3025_*` tests: incremental
+  == full recompute for v6→v4 / v4→v6 TCP+UDP, v4 zero-checksum UDP generates a
+  fresh valid checksum, fail-on-revert seams that PRESERVE a corrupted input
+  checksum, and a wrong-delta pin). Validation: cargo build --release clean;
+  cargo test nat64 (99) + checksum (51) green; RED confirmed by forcing the
+  v6→v4 path back to recompute (seam test fails), restored.
+
 ## 2026-06-25 — #3107: CLI `test policy` gains a source-port input
 
 - **Timestamp**: 2026-06-25
