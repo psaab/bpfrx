@@ -511,20 +511,56 @@ func staticUnitAddr(unit *config.InterfaceUnit, af4 bool) (netip.Addr, bool) {
 // surfaceAGate builds the per-RG HA writer gate for one reconcile pass (#2664,
 // plan §5.6). It REUSES the same per-RG master snapshot the lease loop uses. A
 // scope on an RG-owned (reth) interface is writable IFF this node is MASTER for
-// that RG; an RG 0 scope (a non-HA interface) is admitted (the node-level
-// writer gate already authorized the pass; no peer to double-write). Standalone
-// (no cluster) returns nil so the engine admits every scope.
+// that RG. An RG 0 scope (a non-HA interface) is bound to RG0 — the
+// control-plane redundancy group — so exactly the RG0-primary node publishes it
+// (#2972). Standalone (no cluster) returns nil so the engine admits every scope.
+//
+// Why RG0/non-HA scopes need their own gate (#2972): unlike DHCP-lease DDNS
+// (where each node's Kea memfile is rendered master-filtered per RG, so the two
+// nodes' lease input sets are disjoint), Surface A scopes are built directly
+// from the active config + the interface observer. BOTH nodes build the
+// IDENTICAL RG0 scope. The node-level writer gate (ddnsWriterGateOpen) opens on
+// ANY-RG mastership, so in active-active HA (node0 masters RG1, node1 masters
+// RG2) BOTH nodes pass it AND — before this fix — both admitted every RGOwner==0
+// scope, double-writing the same configured FQDN. If the two nodes observe
+// different WAN addresses the public A/AAAA record flaps. Tying RGOwner==0 to
+// RG0 ownership yields a single writer that follows RG0 failover.
 func (d *Daemon) surfaceAGate() ddns.ScopeGate {
 	if d.cluster == nil {
 		return nil
 	}
 	master := d.snapshotRethMasterState()
+	rg0Writer := d.surfaceARG0Writer(master)
 	return func(s ddns.ScopeKey) bool {
 		if s.RGOwner == 0 {
-			return true
+			return rg0Writer
 		}
 		return master[s.RGOwner]
 	}
+}
+
+// surfaceARG0Writer reports whether THIS node is the single writer for
+// RG0/non-HA Surface A scopes in a cluster (#2972). RG0 is the control-plane
+// redundancy group (the config-authority group, daemon_ha.go RG0 handling):
+// exactly one node is RG0 primary at any time, so binding the non-HA scopes to
+// RG0 ownership gives a deterministic single writer that follows RG0 failover.
+//
+//   - RG0 tracked (the standard cluster, RG0 configured): the per-RG master
+//     snapshot is authoritative — admit IFF this node masters RG0.
+//   - RG0 NOT tracked (a non-standard cluster with only data RGs, or the brief
+//     window before the first RG0 election settles): master[0] is absent. Fall
+//     back to a deterministic single writer — the lowest node ID (node 0) — so
+//     the non-HA scopes are still written by exactly one node and never
+//     double-written. (A standalone node returns nil from surfaceAGate and never
+//     reaches here.)
+func (d *Daemon) surfaceARG0Writer(master map[int]bool) bool {
+	if d.cluster == nil {
+		return true
+	}
+	if isMaster, tracked := master[0]; tracked {
+		return isMaster
+	}
+	return d.cluster.NodeID() == 0
 }
 
 // nudgeSurfaceADDNSReconcile requests an immediate Surface A reconcile pass

@@ -1474,8 +1474,13 @@ func TestCopyConfig(t *testing.T) {
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
+	// NOTE: deliberately no `interfaces` under trust here. Copying a zone that
+	// owns an interface would duplicate that interface into trust2, and the
+	// #3072 interface-multi-zone commit gate (correctly) rejects an interface
+	// assigned to two zones — so a zone-with-interface Copy cannot commit. This
+	// test exercises Copy of nested zone content (host-inbound) + that the
+	// copied zone exists, which does not require an interface.
 	cmds := []string{
-		"security zones security-zone trust interfaces eth0.0",
 		"security zones security-zone trust host-inbound-traffic system-services ping",
 	}
 	for _, cmd := range cmds {
