@@ -302,6 +302,7 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         state.status.event_stream_dropped = es_stats.dropped;
         state.status.event_stream_write_stalls = es_stats.write_stalls;
         state.status.event_stream_replay_evictions = es_stats.replay_evictions;
+        state.status.event_stream_invalid_acks = es_stats.invalid_acks;
         // #2512: surface the per-kind SESSION_CLOSE / SESSION_CREATE
         // producer-side sent/dropped counters so a rate-limited or
         // budget-shed close/create is observable in `show` / Prometheus.

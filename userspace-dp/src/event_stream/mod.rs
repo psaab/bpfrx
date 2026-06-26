@@ -197,6 +197,14 @@ pub(crate) struct EventStreamStats {
     /// disconnected or withheld ACKs long enough for the window to wrap).
     /// ACK-trim does NOT increment this — only the buffer-full eviction.
     pub(crate) replay_evictions: u64,
+    /// Count of MSG_ACK control frames rejected because the daemon ACKed a
+    /// sequence outside the valid `[acked_seq, next_seq]` window — either a
+    /// backward ACK (`seq < acked_seq`) or a future ACK of a sequence the
+    /// helper never allocated (`seq > next_seq`) (#2959). Such an ACK comes
+    /// from a buggy, mixed-version, or corrupted daemon listener; the helper
+    /// fails closed by ignoring it (watermark + replay buffer left intact). A
+    /// non-zero, growing value means the peer's ACK view is corrupt.
+    pub(crate) invalid_acks: u64,
     #[allow(dead_code)] // stats field for future reporting
     pub(crate) replayed: u64,
     #[allow(dead_code)] // producer-call-site wiring will surface these fields
@@ -225,6 +233,10 @@ struct EventStreamShared {
     /// ACK-trim (frames removed because they were acknowledged, which is NOT a
     /// loss): only the buffer-full eviction path increments this.
     frames_replay_evicted: AtomicU64,
+    /// MSG_ACK frames rejected because the daemon ACKed a sequence outside the
+    /// valid `[acked_seq, next_seq]` window (#2959). See `invalid_acks` in
+    /// `EventStreamStats`.
+    frames_invalid_acks: AtomicU64,
     frames_replayed: AtomicU64,
     dataplane_event_counters: DataplaneEventCounters,
     #[allow(dead_code)] // consumed by producer call sites once they are wired
@@ -254,6 +266,7 @@ impl EventStreamShared {
             frames_dropped: AtomicU64::new(0),
             frames_write_stalled: AtomicU64::new(0),
             frames_replay_evicted: AtomicU64::new(0),
+            frames_invalid_acks: AtomicU64::new(0),
             frames_replayed: AtomicU64::new(0),
             dataplane_event_counters: DataplaneEventCounters::new(),
             dataplane_event_limiter: DataplaneEventRateLimiter::new(config),
@@ -325,6 +338,7 @@ impl EventStreamSender {
             dropped: self.shared.frames_dropped.load(Ordering::Relaxed),
             write_stalls: self.shared.frames_write_stalled.load(Ordering::Relaxed),
             replay_evictions: self.shared.frames_replay_evicted.load(Ordering::Relaxed),
+            invalid_acks: self.shared.frames_invalid_acks.load(Ordering::Relaxed),
             replayed: self.shared.frames_replayed.load(Ordering::Relaxed),
             dataplane_events: self.shared.dataplane_event_counters.snapshot(),
         }
@@ -924,13 +938,43 @@ fn process_control_frames(
 
         match msg_type {
             MSG_ACK => {
-                shared.acked_seq.store(seq, Ordering::Release);
-                // Trim replay buffer: remove frames with seq <= acked
-                while let Some(front) = replay_buf.front() {
-                    if front.seq <= seq {
-                        pop_replay_frame(shared, replay_buf);
-                    } else {
-                        break;
+                // Validate the ACK watermark BEFORE mutating acked_seq or
+                // trimming the replay buffer (#2959). A correct daemon ACKs
+                // only frames it has applied, so the sequence must lie in the
+                // window [acked_seq, next_seq]:
+                //   - seq == acked_seq  -> duplicate ACK, benign no-op
+                //   - seq == next_seq   -> ACK of the latest allocated frame
+                //   - acked < seq < next -> normal forward ACK
+                // A backward ACK (seq < acked_seq) or a future ACK of a
+                // sequence the helper never allocated (seq > next_seq) means
+                // the peer's view is corrupt (buggy / mixed-version /
+                // corrupted listener). Trusting it would poison acked_seq and
+                // trim or permanently suppress replay of frames the daemon has
+                // not actually acknowledged. Fail closed: ignore the impossible
+                // ACK, leave the watermark and replay buffer intact, and
+                // surface it via the invalid_acks counter. Ignoring (rather
+                // than disconnecting) preserves the live connection and avoids
+                // a reconnect-thrash loop against a peer that keeps emitting
+                // bad ACKs; valid ACKs interleaved with the bad ones still
+                // advance the watermark normally.
+                let acked = shared.acked_seq.load(Ordering::Acquire);
+                let next = shared.next_seq.load(Ordering::Acquire);
+                if seq < acked || seq > next {
+                    shared.frames_invalid_acks.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "xpf-event-stream: ignoring out-of-range ACK seq={} \
+                         (acked={}, next={})",
+                        seq, acked, next
+                    );
+                } else {
+                    shared.acked_seq.store(seq, Ordering::Release);
+                    // Trim replay buffer: remove frames with seq <= acked
+                    while let Some(front) = replay_buf.front() {
+                        if front.seq <= seq {
+                            pop_replay_frame(shared, replay_buf);
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
