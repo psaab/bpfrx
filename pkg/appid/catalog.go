@@ -178,6 +178,54 @@ func ProtocolNumber(name string) (uint8, bool) {
 	}
 }
 
+// ProtocolName is the single source of truth for rendering an IP protocol
+// number as a canonical lowercase protocol name. It returns "" for a
+// protocol that has no display name here, letting callers fall back to the
+// numeric form.
+//
+// This renders the named protocol set the operator surfaces have
+// historically displayed (matching the prior gRPC switch); it is NOT a
+// complete inverse of ProtocolNumber. ProtocolNumber resolves additional
+// protocols (ospf/egp/igmp/pim/ah/sctp/vrrp/...) that have no display
+// mapping here, and ProtocolName(41)=="ipv6" has no reverse
+// (ProtocolNumber("ipv6") returns (0,false)). The round-trip holds only for
+// the gre/esp/ipip + icmp/icmpv6/tcp/udp set.
+//
+// This is the SSOT for the named-protocol set rendered by every operator
+// surface (REST pkg/api, gRPC pkg/grpcapi). Before #2949 each surface kept its
+// own switch: REST rendered only tcp/udp/icmp/icmpv6 while gRPC also rendered
+// gre/esp/ipip/ipv6, so a REST `protocol=gre` NAMED filter silently failed to
+// match and a GRE/ESP session displayed numeric on REST but named on gRPC.
+// Housing the table here (a leaf package importing only pkg/config) keeps the
+// REST and gRPC name sets identical from one definition.
+//
+// Casing is a per-surface concern, not part of this SSOT: REST upper-cases the
+// result to preserve its historical TCP/UDP/ICMP display; gRPC uses the
+// lowercase form directly. The named SET (which protocols are named at all) is
+// identical across surfaces.
+func ProtocolName(p uint8) string {
+	switch p {
+	case 6:
+		return "tcp"
+	case 17:
+		return "udp"
+	case 1:
+		return "icmp"
+	case 58:
+		return "icmpv6"
+	case 47:
+		return "gre"
+	case 50:
+		return "esp"
+	case 4:
+		return "ipip"
+	case 41:
+		return "ipv6"
+	default:
+		return ""
+	}
+}
+
 // catalogProtocolNumber resolves a protocol to its byte for the app-id catalog,
 // returning 0 for an unrepresentable token (the catalog's historical
 // "unknown -> 0" behavior). Delegates to ProtocolNumber (#2124) so the catalog

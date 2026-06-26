@@ -1,3 +1,32 @@
+## 2026-06-25 — #2949: unify REST + gRPC protoName on a single SSOT
+
+- **Timestamp**: 2026-06-25
+- **Action**: finished the #2949 fix. Added `appid.ProtocolName` as the
+  single source of truth for the named IP-protocol set rendered by the
+  operator surfaces (tcp/udp/icmp/icmpv6/gre/esp/ipip/ipv6); it matches
+  the prior gRPC switch and is NOT a complete inverse of ProtocolNumber
+  (which resolves ospf/igmp/... with no display mapping, and ipv6 has no
+  reverse). Rewired both surfaces: `pkg/grpcapi` `protoName` (lowercase,
+  direct) and `pkg/api` REST `protoName` (upper-cased for its historical
+  TCP/UDP/ICMP display, ICMPv6 mixed case preserved). Before #2949 REST
+  kept its own 4-protocol switch while gRPC rendered gre/esp/ipip/ipv6
+  too, so a REST `protocol=gre` NAMED filter silently returned no rows
+  and a GRE/ESP session displayed numeric on REST but named on gRPC.
+  Added the fail-on-revert tests `TestRESTProtoNameNamedSet` and
+  `TestRESTProtocolFilterNamedGRE` (a GRE-session fixture): both go RED
+  if REST reverts to the 4-protocol set (protoName(47)=="47", named
+  `gre` filter matches 0 rows). Verified RED via copy-aside revert,
+  restored. Review fold (PR #3037 MINOR): softened the ProtocolName doc
+  comment so it no longer over-claims a complete ProtocolNumber inverse.
+- **File(s)**: pkg/appid/catalog.go, pkg/api/sessions.go,
+  pkg/grpcapi/server_helpers.go, pkg/api/rest_filter_failclosed_test.go,
+  _Log.md
+- **Gates**: go build ./... clean; gofmt -l clean on changed files; go
+  vet ./pkg/api/... ./pkg/grpcapi/... ./pkg/appid/... clean; go test
+  ./pkg/api/... ./pkg/grpcapi/... ./pkg/appid/... green (the prior
+  pre-existing `TestShowTextGolden` drift was fixed+merged in #3038,
+  picked up by rebasing onto origin/master).
+
 ## 2026-06-25 — fix TestShowTextGolden syn-flood attack-threshold golden drift (#3033 follow-up)
 
 - **Timestamp**: 2026-06-25
