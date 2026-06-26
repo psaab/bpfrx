@@ -33,6 +33,7 @@
 package policymatch
 
 import (
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -40,6 +41,48 @@ import (
 	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// MaxPort is the largest valid TCP/UDP port number.
+const MaxPort = 65535
+
+// ValidatePort checks an already-parsed simulator port value (the gRPC int32
+// field and the REST query int, which arrive numeric). A zero value means
+// "unspecified" — the port dimension is not constrained, the established
+// wildcard behavior — and is accepted. Any other value outside [1, MaxPort]
+// (negative, or above the 16-bit port space) cannot describe a real packet, so
+// it is REJECTED with an error rather than silently coerced to the 0 wildcard
+// (#3116). The shared matcher gates the port term on dstPort/srcPort > 0, so a
+// malformed/negative/out-of-range value that slips through silently becomes
+// "no port constraint" and yields a verdict for a packet that cannot exist.
+func ValidatePort(port int) error {
+	if port < 0 || port > MaxPort {
+		return fmt.Errorf("port %d out of range (0-%d, 0 = unspecified)", port, MaxPort)
+	}
+	return nil
+}
+
+// ParsePort parses a simulator port token supplied as an operator string (the
+// CLI surface). An empty/whitespace token means "unspecified" and returns
+// (0, nil) — the wildcard behavior, unchanged. A non-empty token must parse to
+// an integer that ValidatePort accepts ([0, MaxPort]); a malformed ("abc"),
+// negative, or >MaxPort token is REJECTED with an error so it can never
+// silently degrade to the 0 wildcard (#3116). An explicit "0" is accepted as
+// "unspecified" for parity with the gRPC int field, where proto3 cannot
+// distinguish an unset scalar from 0.
+func ParsePort(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid port %q", s)
+	}
+	if err := ValidatePort(n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
 
 // Query is a 5-tuple policy-simulation request. A nil SrcIP/DstIP or an empty
 // Protocol means "unspecified" — the corresponding match dimension is not

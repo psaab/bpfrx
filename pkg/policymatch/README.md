@@ -12,6 +12,32 @@ Single operator-side security-policy simulator shared by every
 Each surface is a THIN adapter: it parses/validates inputs and renders the
 verdict, then delegates the matching to `policymatch.Match`.
 
+## Port input validation (#3116)
+
+`Match` gates a port term on `SrcPort/DstPort > 0`, so a port of `0` means
+"unspecified" (no port constraint — the wildcard). That makes a malformed,
+negative, or out-of-range port DANGEROUS at the adapter boundary: if it
+silently coerces to `0` it becomes "match any port" and the simulator returns a
+verdict for a packet that cannot exist on the wire (false confidence during
+policy verification / incident response). Two shared validators close this
+across every surface:
+
+- `ValidatePort(int) error` — for the already-parsed numeric inputs (the gRPC
+  `int32` field, and the REST query int after `queryIntStrict`). Accepts `0`
+  (unspecified) and `1..65535`; rejects negative or `>65535`.
+- `ParsePort(string) (int, error)` — for operator string tokens (the CLI
+  `destination-port`/`source-port` args). An empty/whitespace token is
+  unspecified `(0, nil)`; a non-empty token must parse and pass `ValidatePort`;
+  a malformed (`abc`), negative, or out-of-range token is rejected. An explicit
+  `0` is accepted as "unspecified" for parity with the gRPC `int32` field, where
+  proto3 cannot distinguish an unset scalar from `0`.
+
+A VALID port (`1..65535`) and an ABSENT port behave exactly as before; only an
+explicitly-invalid port newly errors (REST → HTTP 400, gRPC → `InvalidArgument`,
+CLI → command error). Coverage: `port_test.go` (helpers),
+`pkg/api/rest_filter_failclosed_test.go`, `pkg/grpcapi/server_cluster_test.go`,
+`pkg/cli/policymatch_port_test.go`.
+
 ## The surface #3042 missed (#3103)
 
 The original #3042 consolidation routed the REST/gRPC `MatchPolicies` and CLI

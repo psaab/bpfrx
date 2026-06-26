@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -266,12 +265,20 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 		case "destination-port":
 			if i+1 < len(args) {
 				i++
-				dstPort, _ = strconv.Atoi(args[i])
+				p, err := policymatch.ParsePort(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid destination-port: %w", err)
+				}
+				dstPort = p
 			}
 		case "source-port":
 			if i+1 < len(args) {
 				i++
-				srcPort, _ = strconv.Atoi(args[i])
+				p, err := policymatch.ParsePort(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid source-port: %w", err)
+				}
+				srcPort = p
 			}
 		case "protocol":
 			if i+1 < len(args) {

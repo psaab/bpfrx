@@ -210,3 +210,52 @@ func TestShowTestPolicyEmptyIPMatches(t *testing.T) {
 		t.Fatalf("empty-IP test-policy did not match; empty-means-any regressed: %q", resp.Output)
 	}
 }
+
+// TestMatchPoliciesRejectsInvalidPort asserts the #3116 contract for the gRPC
+// surface: a negative or >65535 port in the int32 field must be rejected with
+// InvalidArgument, not passed through to the shared matcher where a value
+// <= 0 silently becomes "no port constraint" (the matcher gates the port term
+// on port > 0). 0 stays the unspecified wildcard (proto3 cannot distinguish an
+// unset scalar from 0); a valid port proceeds.
+//
+// FAIL-ON-REVERT: removing the policymatch.ValidatePort guards in
+// MatchPolicies lets DestinationPort=-1 / DestinationPort=70000 reach the
+// matcher and return a (false) verdict instead of an error, flipping the
+// want-error cases red.
+func TestMatchPoliciesRejectsInvalidPort(t *testing.T) {
+	s := &Server{store: matchPoliciesTestStore(t)}
+
+	cases := []struct {
+		name    string
+		req     *pb.MatchPoliciesRequest
+		wantErr bool
+	}{
+		{"dst negative", &pb.MatchPoliciesRequest{FromZone: "trust", ToZone: "untrust", DestinationPort: -1}, true},
+		{"dst out of range", &pb.MatchPoliciesRequest{FromZone: "trust", ToZone: "untrust", DestinationPort: 70000}, true},
+		{"src negative", &pb.MatchPoliciesRequest{FromZone: "trust", ToZone: "untrust", SourcePort: -1}, true},
+		{"src out of range", &pb.MatchPoliciesRequest{FromZone: "trust", ToZone: "untrust", SourcePort: 65536}, true},
+		{"dst valid", &pb.MatchPoliciesRequest{FromZone: "trust", ToZone: "untrust", DestinationPort: 443}, false},
+		{"dst zero wildcard", &pb.MatchPoliciesRequest{FromZone: "trust", ToZone: "untrust", DestinationPort: 0}, false},
+		{"ports absent", &pb.MatchPoliciesRequest{FromZone: "trust", ToZone: "untrust"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := s.MatchPolicies(context.Background(), tc.req)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("%s: returned no error; resp = %+v (invalid port slipped through)", tc.name, resp)
+				}
+				if status.Code(err) != codes.InvalidArgument {
+					t.Fatalf("%s: status code = %v, want InvalidArgument", tc.name, status.Code(err))
+				}
+				if resp != nil {
+					t.Fatalf("%s: resp = %+v, want nil on InvalidArgument", tc.name, resp)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%s: error = %v, want nil", tc.name, err)
+			}
+		})
+	}
+}
