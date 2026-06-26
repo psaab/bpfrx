@@ -96,6 +96,8 @@ func TestPolicyThenRejectBareStillCommits(t *testing.T) {
 	t.Run("global bare reject", func(t *testing.T) {
 		tree := buildPolicyThenTree(t,
 			"set security policies global policy g1 match source-address any",
+			"set security policies global policy g1 match destination-address any",
+			"set security policies global policy g1 match application any",
 			"set security policies global policy g1 then reject",
 		)
 		if _, err := CompileConfig(tree); err != nil {
