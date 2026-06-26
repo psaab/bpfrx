@@ -3396,6 +3396,32 @@ func validateDestinationNATAddressesStrict(cfg *Config) error {
 						"the rule would commit but never translate any traffic",
 					rs.Name, rule.Name, strings.Join(destAddrs, ", "))
 			}
+			// #3029: a DNAT `match destination-address` that is a MULTI-HOST
+			// prefix (a CIDR with a non-host mask, e.g. 198.51.100.0/24) is
+			// silently narrowed to a single host. The snapshot builder
+			// (buildDestinationNATSnapshots) strips the `/mask` and emits an
+			// entry for the BASE address only, and the Rust DnatTable keys on
+			// an EXACT host IP (no prefix / LPM match) — so only the network
+			// address translates and every other host in the block bypasses
+			// DNAT entirely (silent under-translation). The dataplane has no
+			// prefix-match DNAT, and block-mapping semantics (1:1 offset vs
+			// many:one) are not settled, so REJECT the rule rather than commit a
+			// silently under-translating block. Single-host destinations (a bare
+			// IP, an explicit /32, or /128) are host masks and remain accepted
+			// unchanged. Reuses isHostMaskAddress, the same host-mask predicate
+			// the static-NAT path uses, so the family-specific mask check (32 vs
+			// 128) and the IPv4-mapped-IPv6 classification stay consistent.
+			for _, raw := range destAddrs {
+				if host, parsed := isHostMaskAddress(raw); parsed && !host {
+					return fmt.Errorf(
+						"destination-nat rule-set %q rule %q: match destination-address %q "+
+							"is a multi-host prefix; the dataplane DNAT match is exact-host "+
+							"only, so the rule would translate only the network address and "+
+							"silently bypass every other host in the block (use a /32 or /128 "+
+							"host address, or split the block into per-host rules)",
+						rs.Name, rule.Name, raw)
+				}
+			}
 		}
 	}
 	return nil
