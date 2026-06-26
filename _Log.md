@@ -1,3 +1,20 @@
+## 2026-06-25 — #3059: gRPC hit-count text includes global policies
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `showPoliciesHitCount` (gRPC text `show security policies
+  hit-count`) to append a global-policy section after the zone-pair loop,
+  rendering each `cfg.Security.GlobalPolicies` entry with from/to zone `"*"`.
+  Global counter IDs continue from the zone-pair `policySetID`
+  (`policySetID*MaxRulesPerPolicy + i`), keeping global hit counters aligned
+  with the dataplane and matching the gRPC detail view, CLI, Prometheus
+  collector, REST inventory (#3045/#3050), and structured GetPolicies. A
+  from/to-zone filter suppresses the global section (selects zone-pair only).
+  Added fail-on-revert test `TestShowPoliciesHitCountIncludesGlobalPolicies`
+  (RED when globals omitted). Updated pkg/grpcapi README.
+- **File(s)**: pkg/grpcapi/server_show_policies_text.go,
+  pkg/grpcapi/server_show_policies_hitcount_globals_test.go,
+  pkg/grpcapi/README.md
+
 ## 2026-06-25 — #3045: REST /security/policies includes global policies
 
 - **Timestamp**: 2026-06-25
