@@ -525,6 +525,8 @@ pub(super) fn build_missing_neighbor_session_metadata(
         policy_id: 0,
         // #3227: a neighbor-seed stub is not policy-app-matched; use global.
         inactivity_timeout_ns: None,
+        // #3073: a neighbor-seed stub is not policy-admitted; no hit counter.
+        policy_counter_idx: 0,
     }
 }
 

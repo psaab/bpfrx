@@ -1,5 +1,14 @@
 # #2118 — `show security policies hit-count` reads 0: diagnosis + display-gate unification
 
+> **SUPERSEDED IN PART BY #3073.** This plan's "the increment chain is correct,
+> the PERMIT-row 0 is the single-flow `0 is really 1` artifact (one new flow
+> bumps a permit rule by exactly packets=1)" diagnosis described the
+> *intended-at-the-time* behavior: the counter was incremented ONCE per flow on
+> the cold path. That per-flow accounting was itself the #3073 bug — operators
+> expect per-PACKET packet/byte counts (vSRX parity). #3073 adds the
+> established-fast-path / flow-cache re-count so a long-lived flow now reports
+> `packets=N`, not `1`. The display-gate unification below is unchanged.
+
 - **Status:** IMPLEMENT — diagnosis complete, fix is small + localized.
 - **Base:** origin/master `325d106838` (research base was `5fa964c13`).
 - **Research:** converged PLAN-READY (Option A) on branch

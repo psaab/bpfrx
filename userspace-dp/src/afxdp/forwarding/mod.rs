@@ -505,6 +505,9 @@ pub(super) fn cluster_peer_return_fast_path(
         // node, which never ran the admitting policy — leave the policy ID unset.
         policy_id: 0,
         inactivity_timeout_ns: None,
+        // #3073: peer-forwarded fabric-return seed; no local admitting rule, so
+        // no per-rule hit counter.
+        policy_counter_idx: 0,
     };
     Some((
         SessionDecision {

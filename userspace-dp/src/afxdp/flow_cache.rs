@@ -475,6 +475,12 @@ impl FlowCacheEntry {
                 // #3227: the real per-app idle timeout is stamped by the
                 // slow-path install; the flow-cache seed uses the global one.
                 inactivity_timeout_ns: None,
+                // #3073: the flow-cache hit path re-counts every packet against
+                // the admitting policy, so the seed needs the real handle. This
+                // constructor leaves it 0; the population site
+                // (`poll_descriptor`) stamps `entry.metadata.policy_counter_idx`
+                // from the established flow's metadata after construction.
+                policy_counter_idx: 0,
             },
             stamp: FlowCacheStamp::capture(
                 validation.config_generation,

@@ -479,6 +479,11 @@ pub(crate) fn build_synced_session_entry(
             // real-traffic refresh re-stamps it from the matched policy — a
             // deliberate follow-up mirroring the policy_id wire deferral above.
             inactivity_timeout_ns: None,
+            // #3073: the per-rule hit-counter handle is in-process only and not
+            // carried on the cross-node HA session-sync wire (mirrors the
+            // policy_id deferral above), so a peer-synced session counts nothing
+            // locally until a real-traffic re-evaluation re-stamps a handle.
+            policy_counter_idx: 0,
         },
         origin: crate::session::SessionOrigin::SyncImport,
         // #2170: carry the peer's install generation onto the helper entry.
