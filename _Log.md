@@ -18642,3 +18642,32 @@ top.
   screen 137, classify_generated_reply 6, poll_descriptor 24 all green; full
   bins 2919 passed + the same pre-existing worker_queue flake.
 - **File(s)**: userspace-dp/src/afxdp/tests.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #3043 — security policy with no/conflicting terminal action no
+  longer silently PERMITs. `PolicyAction` zero value is `PolicyPermit`, so a
+  policy whose `then` stanza named only modifiers (log-only/count-only) or a
+  typo'd `then` compiled with `Action == PolicyPermit` and admitted all
+  matching traffic (fail-OPEN); multiple terminal actions resolved last-wins
+  by parse order. Fix: `compilePolicy` now records the terminal action tokens
+  it sees in a new unexported `Policy.terminalActions` slice and defaults an
+  actionless policy's `Action` to `PolicyDeny` (fail-closed, NOT permit);
+  new `validatePolicyTerminalActionStrict` hard-rejects at commit any policy
+  (per-zone-pair AND global) that does not name exactly one of
+  permit/deny/reject. Strict on commit (`CompileConfig`), downgraded to a
+  warning on the tolerant load / peer-sync paths
+  (`lenientPolicyTerminalAction`) so an already-persisted config still boots
+  (#1960) while the runtime default-to-deny keeps it fail-closed. Updated the
+  two existing fixtures that exercised actionless policies through the strict
+  path (`TestApplyGroupsWildcard` default-deny-template gets `then deny`;
+  `TestPolicyMatchExcludedSchemaValidates` policies get `then permit`).
+  Fail-on-revert: `pkg/config/policy_terminal_action_3043_test.go` (4 anchors
+  verified RED against origin/master compiler.go + compiler_security.go).
+  Gates: go build ./... OK; gofmt clean; go vet ./pkg/config/... clean; go
+  test ./pkg/config/... 1497 passed; full go test ./... 6161 passed (1
+  unrelated pkg/ddns port-bind flake, passes in isolation).
+- **File(s)**: pkg/config/types_security.go, pkg/config/compiler_security.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/policy_terminal_action_3043_test.go,
+  pkg/config/policy_match_excluded_test.go, pkg/config/parser_ast_test.go,
+  pkg/config/README.md, docs/config-schema.md, _Log.md

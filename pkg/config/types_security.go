@@ -222,6 +222,17 @@ type Policy struct {
 	Log           *PolicyLog
 	Count         bool
 	SchedulerName string // reference to SchedulerConfig name
+	// terminalActions records, in config order, the terminal action tokens
+	// (permit/deny/reject) parsed under this policy's `then` stanza. It
+	// exists only to drive the commit-time validator
+	// (validatePolicyTerminalActionStrict, #3043): a policy MUST resolve to
+	// exactly one terminal action. Zero tokens (a log-only/count-only or
+	// typo'd `then`) historically fell through to Action's zero value
+	// (PolicyPermit) — a silent fail-OPEN; more than one token resolved
+	// last-wins (the conflicting actions were silently collapsed by child
+	// visitation order). The typed Config is never serialized, so this
+	// unexported field carries no persistence / back-compat obligation.
+	terminalActions []PolicyAction
 }
 
 // PolicyMatch defines what traffic a policy matches.
