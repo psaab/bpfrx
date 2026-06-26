@@ -696,3 +696,56 @@ fn delete_synced_session_zero_generation_is_unconditional() {
         "a gen-0 (unconditional) delete must remove the entry"
     );
 }
+
+// #2962: kicking an export for an EMPTY owner-RG set is a no-op — it must
+// not consume an export sequence and the wait must drain nothing, preserving
+// the pre-split early return semantics.
+#[test]
+fn kick_owner_rg_export_empty_set_is_noop_and_consumes_no_sequence() {
+    let coordinator = Coordinator::new();
+    let before = coordinator.sessions.export_seq.load(Ordering::Relaxed);
+    let wait = coordinator.kick_owner_rg_export(&[], 0);
+    assert_eq!(
+        coordinator.sessions.export_seq.load(Ordering::Relaxed),
+        before,
+        "empty owner-RG export must not consume a sequence"
+    );
+    assert!(
+        wait.wait_and_collect().expect("empty export").is_empty(),
+        "empty owner-RG export must drain no deltas"
+    );
+}
+
+// #2962: the locked KICK phase enqueues the export command (with the bumped
+// sequence) to every worker and returns immediately; the lock-free wait
+// completes once the worker acks. This isolates the blocking ack-wait into
+// `OwnerRgExportWait::wait_and_collect`, off the global ServerState lock.
+#[test]
+fn kick_owner_rg_export_enqueues_command_then_wait_completes_on_ack() {
+    let mut coordinator = Coordinator::new();
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    let handle = test_worker_handle(commands.clone());
+    let ack = handle.session_export_ack.clone();
+    coordinator.workers.handles.insert(0, handle);
+
+    let wait = coordinator.kick_owner_rg_export(&[1, 2], 0);
+
+    {
+        let pending = commands.lock().expect("commands");
+        assert_eq!(pending.len(), 1, "exactly one export command enqueued");
+        match pending.front().expect("front") {
+            WorkerCommand::ExportOwnerRGSessions { sequence, owner_rgs } => {
+                assert_eq!(*sequence, 1, "first export bumps the sequence to 1");
+                assert_eq!(owner_rgs, &vec![1, 2], "owner-RG set propagated verbatim");
+            }
+            other => panic!("expected ExportOwnerRGSessions, got {other:?}"),
+        }
+    }
+
+    // No real bindings, so the drain yields an empty set once the worker acks.
+    ack.store(1, Ordering::Release);
+    assert!(
+        wait.wait_and_collect().expect("export after ack").is_empty(),
+        "no bindings means no deltas to drain"
+    );
+}
