@@ -1,3 +1,16 @@
+## 2026-06-25 — #3045: REST /security/policies includes global policies
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `policiesHandler` (REST `GET /api/v1/security/policies`)
+  to enumerate global policies after zone-pair policies, emitting a single
+  `from_zone="*"`/`to_zone="*"` row matching gRPC `GetPolicies`, the
+  Prometheus collector, and the CLI. Global counter IDs continue from the
+  zone-pair `policySetID`. Added fail-on-revert test
+  `TestPoliciesHandlerIncludesGlobalPolicies` (RED when globals omitted).
+  Updated pkg/api README.
+- **File(s)**: pkg/api/security.go, pkg/api/security_test.go,
+  pkg/api/README.md
+
 ## 2026-06-25 — #3009: state_writer instance_is_alive self-shortcut checks full instance
 
 - **Timestamp**: 2026-06-25

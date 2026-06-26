@@ -26,6 +26,14 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
 - `GET /metrics` — Prometheus exposition.
 - `GET /api/v1/...` — REST mirrors of the gRPC API: sessions, routes,
   NAT, DHCP, IPsec, VRRP, OSPF, BGP, etc.
+  - `GET /api/v1/security/policies` enumerates zone-pair policies AND
+    global policies (#3045). Global rules are emitted as a single
+    trailing `PolicyInfo` row with `from_zone="*"`/`to_zone="*"`,
+    matching gRPC `GetPolicies` and the Prometheus collector. Global
+    counter IDs follow the zone-pair policy-set count (the `policySetID`
+    continues from the zone-pair loop), so per-policy hit counters stay
+    aligned with the dataplane when `policy-stats system-wide enable` is
+    set.
 - `GET /api/v1/events/stream` — Server-Sent Events stream of dataplane
   events. Backed by the `pkg/logging` event ring buffer; long-lived
   consumers must drain.
