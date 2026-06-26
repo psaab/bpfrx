@@ -684,6 +684,21 @@ type compileOpts struct {
 	// peer-synced config an older binary accepted still BOOTS (#1960 no-brick).
 	// Same doctrine as lenientPolicyZoneRefs.
 	lenientReservedZoneNames bool
+	// lenientPolicyWildcardZone (#3018) downgrades the wildcard from-zone/
+	// to-zone gate (validatePolicyWildcardZoneStrict) from a hard compile error
+	// to a cfg.Warnings entry. The strict commit / commit-check path hard-rejects
+	// an ordinary zone-pair policy whose from-zone or to-zone is the literal
+	// Junos wildcard `any`: the userspace snapshot builder carries the literal
+	// "any" string unchanged and PolicyState::from_snapshots
+	// (userspace-dp/src/policy.rs) only indexes a rule when BOTH zones resolve to
+	// a declared zone-id, so a from-zone/to-zone `any` rule is KEPT but never
+	// indexed and never evaluated — a silent fail-OPEN under a permit default.
+	// The tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config carrying a from-zone/to-zone `any`
+	// still BOOTS (#1960 no-brick) — it stays unenforced (the pre-existing
+	// behavior), now flagged. Full wildcard-zone runtime indexing is a deferred
+	// follow-up. Same doctrine as lenientPolicyZoneRefs.
+	lenientPolicyWildcardZone bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -747,6 +762,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyLogAction:             true,
 		lenientScreenProfileRefs:           true,
 		lenientReservedZoneNames:           true,
+		lenientPolicyWildcardZone:          true,
 	})
 }
 
@@ -861,6 +877,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyLogAction:             true,
 		lenientScreenProfileRefs:           true,
 		lenientReservedZoneNames:           true,
+		lenientPolicyWildcardZone:          true,
 	})
 }
 
@@ -1236,6 +1253,29 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientPolicyZoneRefs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("policy zone reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3018 security-policy wildcard from-zone/to-zone fail-open gate. Strict on
+	// commit / commit-check (hard-reject an ordinary zone-pair policy whose
+	// from-zone or to-zone is the literal `any` — the userspace snapshot builder
+	// carries the literal "any" string unchanged and the dataplane only indexes a
+	// rule when BOTH zones resolve to a declared zone-id, so a from-zone/to-zone
+	// `any` rule COMMITS but is never indexed and never evaluated, silently
+	// failing OPEN under a permit default); lenient on load / peer-sync (warn so
+	// an already-persisted or peer-synced config with a from-zone/to-zone `any`
+	// still boots — #1960 no-brick; the rule was already inert, so a leniently-
+	// loaded config behaves exactly as before, just flagged). Does NOT touch
+	// `security policies global` (handled via the junos-global sentinel) nor the
+	// unrelated `any` match-address/application tokens. Full wildcard-zone
+	// indexing is a deferred follow-up. Runs AFTER the zone-reference gate so a
+	// genuinely undefined zone still wins the first-error slot.
+	if err := validatePolicyWildcardZoneStrict(cfg); err != nil {
+		if opts.lenientPolicyWildcardZone {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("policy wildcard zone (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

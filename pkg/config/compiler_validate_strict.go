@@ -1520,9 +1520,12 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 //     rules into device-wide fallbacks that permit traffic for unrelated zone
 //     pairs — a security-boundary escape.
 //
-//   - "any"         — Junos wildcard zone (`from-zone any`/`to-zone any`); the
-//     dataplane treats it as match-any, never a named zone-id lookup, so a real
+//   - "any"         — Junos wildcard zone (`from-zone any`/`to-zone any`); a
+//     reserved policy-context token, never a named zone-id lookup, so a real
 //     zone named "any" can never be selected and would shadow the wildcard.
+//     (The dataplane does NOT actually index a from-zone/to-zone `any` policy —
+//     see validatePolicyWildcardZoneStrict, #3018 — but a zone DEFINITION named
+//     "any" is rejected here regardless.)
 //
 //   - "junos-host"  — Junos reserved self-traffic zone (host-inbound / host-
 //     outbound policy context); it is never declared as a `security zone`.
@@ -1540,8 +1543,13 @@ var reservedZoneNames = map[string]struct{}{
 //   - ""            — an empty token: a zone-pair with no name compiles to no
 //     usable rule and is not an undefined-zone reference per se; leave it to
 //     the structural compiler rather than reporting a confusing `""` error.
-//   - "any"         — Junos wildcard zone (`from-zone any`/`to-zone any`); the
-//     dataplane treats it as match-any, never a named zone-id lookup.
+//   - "any"         — Junos wildcard zone (`from-zone any`/`to-zone any`); kept
+//     exempt HERE so the undefined-zone gate does not emit a confusing "define
+//     `security zones security-zone any`" error (such a zone definition is
+//     itself rejected). A from-zone/to-zone `any` is instead hard-rejected by
+//     the dedicated wildcard gate (validatePolicyWildcardZoneStrict, #3018)
+//     because the dataplane never indexes it (fail-OPEN), NOT because the zone
+//     is undefined.
 //   - "junos-host"  — Junos reserved self-traffic zone (host-inbound / host-
 //     outbound policy context); it is never declared as a `security zone`.
 //
@@ -1663,6 +1671,75 @@ func validatePolicyZoneReferencesStrict(cfg *Config) error {
 				"security policy from-zone %q to-zone %q references undefined to-zone %q; define `set security zones security-zone %s` in the same commit or the rule is silently never matched (zone-pair falls through to the default policy)",
 				zpp.FromZone, zpp.ToZone, zpp.ToZone, zpp.ToZone)
 		}
+	}
+	return nil
+}
+
+// validatePolicyWildcardZoneStrict hard-rejects an ordinary security policy
+// zone-pair (`from-zone <a> to-zone <b> { policy ... }`) whose from-zone or
+// to-zone is the literal Junos wildcard `any` (#3018).
+//
+// The strict zone-reference gate (validatePolicyZoneReferencesStrict) EXEMPTS
+// `any` from the "zone must be defined" check, and the historical comment
+// claimed the dataplane "treats it as match-any". It does NOT. The userspace
+// snapshot builder (pkg/dataplane/userspace/policies.go) carries the literal
+// "any" string unchanged for an ordinary zone-pair policy — only `security
+// policies global` is mapped to the junos-global sentinel — and
+// PolicyState::from_snapshots (userspace-dp/src/policy.rs) only indexes a
+// non-global rule when BOTH zones resolve via zone_name_to_id.get(). "any" is
+// never inserted into zone_name_to_id (only declared zones are), so the rule is
+// KEPT but never indexed and never evaluated. Result: `from-zone any to-zone
+// trust ... then deny` commits and looks legitimate yet never blocks traffic
+// (fail-OPEN under a permit default); `from-zone trust to-zone any then permit`
+// cannot permit under a deny default. An admitted-but-unenforced security policy
+// is a fail-open bug, so the interim fix hard-rejects it at commit rather than
+// letting it silently fail open.
+//
+// This is the INTERIM contract: full wildcard-zone runtime indexing (separate
+// ordered index lists for exact / from-any / to-any / both-any, evaluated in
+// Junos precedence before global/default) is a substantial dataplane change
+// deferred to a follow-up; until it exists a from-zone/to-zone `any` literal is
+// rejected. It does NOT touch the unrelated `any` tokens elsewhere in a policy
+// (`match source-address any` / `match application any`) — only the
+// from-zone/to-zone slot. Global policies (`security policies global`) live in
+// cfg.Security.GlobalPolicies with no from/to-zone strings and are mapped to the
+// junos-global sentinel by the snapshot builder, so they ARE enforced and are
+// not iterated here.
+//
+// Strict on commit / commit-check (CompileConfig — hard reject so the operator
+// sees the unenforceable rule); downgraded to a cfg.Warnings entry on the
+// tolerant load / peer-sync paths (CompileConfigLenient /
+// CompileConfigForNodeLenient, flag lenientPolicyWildcardZone) so an
+// already-persisted or peer-synced config carrying a from-zone/to-zone `any`
+// still BOOTS (#1960 no-brick) — it stays unenforced (the pre-existing
+// behavior), now flagged. Iteration is in cfg.Security.Policies order
+// (deterministic), so the first-reported error is stable.
+func validatePolicyWildcardZoneStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		var side string
+		switch {
+		case zpp.FromZone == "any" && zpp.ToZone == "any":
+			side = "from-zone and to-zone"
+		case zpp.FromZone == "any":
+			side = "from-zone"
+		case zpp.ToZone == "any":
+			side = "to-zone"
+		default:
+			continue
+		}
+		name := "(unnamed)"
+		if len(zpp.Policies) > 0 && zpp.Policies[0] != nil && zpp.Policies[0].Name != "" {
+			name = zpp.Policies[0].Name
+		}
+		return fmt.Errorf(
+			"security policy %q (from-zone %q to-zone %q) uses the wildcard zone `any` on its %s; the userspace dataplane does not index a from-zone/to-zone `any` policy (userspace-dp/src/policy.rs only indexes a rule when both zones resolve to a declared zone-id), so the rule would COMMIT but never be evaluated — failing open under a permit default. Rewrite it as explicit per-zone-pair policies, or as a `security policies global` policy for a device-wide rule; full wildcard-zone support is a deferred follow-up",
+			name, zpp.FromZone, zpp.ToZone, side)
 	}
 	return nil
 }
