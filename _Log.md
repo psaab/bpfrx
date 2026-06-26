@@ -1,3 +1,37 @@
+## 2026-06-26 — #3199 host-inbound `protocols all` scoped to routing protocols (control-plane exposure)
+
+- **Timestamp**: 2026-06-26
+- **Action**: SECURITY fix. `host-inbound-traffic protocols all` was treated
+  as a blanket admit on both enforcement layers — the Rust classifier set
+  `ZoneHostInbound.all_protocols` which short-circuited `admits()`, and the
+  Go nft mirror's `hostInboundAllowsAll` returned true for `protocols all`
+  so `emitHostInboundZone` emitted a bare `<fam> daddr <addrs> accept` with
+  no deny. That opened EVERY host-bound service (SSH/HTTPS/SNMP/NETCONF/...)
+  to the zone's local IPs. In Junos `protocols all` means all ROUTING
+  protocols only. Fix: expand `all` to the concrete routing-protocol set
+  (ospf/bgp/rip/ripng/igmp/pim/vrrp/bfd/ldp/msdp/nhrp/router-discovery) in
+  BOTH layers. Rust: removed the `all_protocols` field + short-circuit;
+  `classify_protocol("all")` now recurses over `ROUTING_PROTOCOL_TOKENS`
+  (which never contains "all"), so the per-packet `admits()` matches routing
+  signatures via tcp/udp/ip_protocols and SSH stays denied. Go: dropped the
+  protocols branch from `hostInboundAllowsAll`, added a `case "all"` to
+  `hostInboundProtocolMatches` that expands over
+  `hostInboundRoutingProtocolTokens`, so `protocols all` flows through the
+  per-match path and still gets the catch-all drop. `system-services all` /
+  `any-service` keep their (intentionally broad) full-admit. Kernel-nft and
+  userspace decisions stay consistent; #3070 ESP/AH/ND exemptions untouched.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs, pkg/daemon/daemon_nft.go,
+  pkg/daemon/host_inbound_nft_test.go,
+  userspace-dp/src/afxdp/forwarding/README.md, _Log.md
+- **Validation**: `cargo build --release` clean; `cargo test --release`
+  forwarding/host_inbound green (97 forwarding tests). `go build ./...`;
+  `go test ./pkg/daemon/... ./pkg/config/...` 2340 passed. Fail-on-revert
+  proven: stashing the Rust source (restoring the `all_protocols`
+  short-circuit) turns `build_forwarding_state_protocols_all_admits_routing_not_system_services`
+  RED ("protocols all must NOT admit ssh"); stashing daemon_nft.go turns
+  `TestHostInboundFilterProtocolsAllScopedToRouting` RED; both restored
 ## 2026-06-26 — #3202 reject block static-NAT combined with a port match/mapped-port
 
 - **Timestamp**: 2026-06-26

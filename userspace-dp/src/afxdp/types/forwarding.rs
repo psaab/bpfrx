@@ -165,10 +165,13 @@ pub(in crate::afxdp) struct ForwardingState {
 /// destination ports; ICMP-bearing services (ping, router-discovery) and the
 /// raw `protocols` routing tokens contribute either an ICMP/ICMPv6 admit bit or
 /// an IP-protocol number. `all_services` (Junos `system-services { all }` or
-/// `any-service`) and `all_protocols` (`protocols { all }`) short-circuit to a
-/// full admit. An UNRECOGNISED token contributes nothing (fail-closed: it does
-/// not broaden the admit set), so a host-bound packet matching no listed
-/// service/protocol is denied.
+/// `any-service`) short-circuits to a full admit. `protocols { all }` is NOT a
+/// blanket admit (#3199): it expands at classify time to the routing-protocol
+/// signatures (ospf/bgp/rip/.../router-discovery), so it admits routing
+/// protocols but never a system service (SSH/HTTPS/SNMP/...) that was not
+/// separately permitted. An UNRECOGNISED token contributes nothing
+/// (fail-closed: it does not broaden the admit set), so a host-bound packet
+/// matching no listed service/protocol is denied.
 #[derive(Clone, Debug, Default)]
 pub(in crate::afxdp) struct ZoneHostInbound {
     /// `system-services { all }` / `any-service` — admit every host-bound
@@ -177,8 +180,6 @@ pub(in crate::afxdp) struct ZoneHostInbound {
     /// Junos, which scopes `all` to service traffic) keeps a `host-inbound { all }`
     /// control/heartbeat zone fully open and is the safe direction.
     pub(in crate::afxdp) all_services: bool,
-    /// `protocols { all }` — admit every routing-protocol host-bound packet.
-    pub(in crate::afxdp) all_protocols: bool,
     /// Admitted TCP destination ports (ssh=22, https=443, bgp=179, ...).
     pub(in crate::afxdp) tcp_ports: FastSet<u16>,
     /// Admitted UDP destination ports (dns=53, dhcp=67/68, ike=500/4500, ...).
@@ -199,7 +200,12 @@ impl ZoneHostInbound {
     /// Returns true iff a host-bound packet with the given L4 protocol and
     /// destination port is admitted by this zone's host-inbound set.
     pub(in crate::afxdp) fn admits(&self, protocol: u8, dst_port: u16, is_v6: bool) -> bool {
-        if self.all_services || self.all_protocols {
+        // Only `system-services { all }` / `any-service` is a full admit.
+        // `protocols { all }` is NOT a blanket bypass (#3199): it expands to the
+        // routing-protocol signatures at classify time and is matched below via
+        // tcp/udp/ip_protocols, so it can never admit a system service (SSH,
+        // HTTPS, SNMP, ...) that was not separately permitted.
+        if self.all_services {
             return true;
         }
         match protocol {

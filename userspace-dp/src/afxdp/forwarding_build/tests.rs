@@ -1091,6 +1091,88 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
     );
 }
 
+// #3199: `host-inbound-traffic protocols all` admits only the ROUTING-protocol
+// set — it must NOT open system-services (SSH/HTTPS/SNMP/...) on the box. This
+// is the Junos meaning of `protocols all` (all entries under the `protocols`
+// stanza), not a blanket bypass of the host-inbound gate.
+//
+// Fail-on-revert: restoring the old `"all" => hi.all_protocols = true` classifier
+// + the `|| self.all_protocols` short-circuit in `ZoneHostInbound::admits`
+// turns the "protocols-all ssh deny" assertions RED (the zone admits everything
+// again).
+#[test]
+fn build_forwarding_state_protocols_all_admits_routing_not_system_services() {
+    use crate::ZoneSnapshot;
+    use crate::afxdp::forwarding::host_inbound_admits;
+
+    let snapshot = ConfigSnapshot {
+        zones: vec![
+            // routing zone: `protocols all`, NO system-services.
+            ZoneSnapshot {
+                name: "routing".into(),
+                id: 21,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec![],
+                host_inbound_protocols: vec!["all".into()],
+                ..Default::default()
+            },
+            // mgmt zone: explicit `system-services ssh` — regression guard.
+            ZoneSnapshot {
+                name: "mgmt".into(),
+                id: 22,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec!["ssh".into()],
+                host_inbound_protocols: vec![],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let state = build_forwarding_state(&snapshot);
+
+    // routing (id 21): `protocols all` admits routing protocols of every kind.
+    assert!(
+        host_inbound_admits(&state, 21, 89, 0, false),
+        "protocols all admits ospf (proto 89)"
+    );
+    assert!(
+        host_inbound_admits(&state, 21, 6, 179, false),
+        "protocols all admits bgp (tcp/179)"
+    );
+    assert!(
+        host_inbound_admits(&state, 21, 112, 0, false),
+        "protocols all admits vrrp (proto 112)"
+    );
+    assert!(
+        host_inbound_admits(&state, 21, 17, 520, false),
+        "protocols all admits rip (udp/520)"
+    );
+    // ...but NOT system-services: SSH, HTTPS, SNMP must be DENIED.
+    assert!(
+        !host_inbound_admits(&state, 21, 6, 22, false),
+        "protocols all must NOT admit ssh (tcp/22)"
+    );
+    assert!(
+        !host_inbound_admits(&state, 21, 6, 443, false),
+        "protocols all must NOT admit https (tcp/443)"
+    );
+    assert!(
+        !host_inbound_admits(&state, 21, 17, 161, false),
+        "protocols all must NOT admit snmp (udp/161)"
+    );
+
+    // mgmt (id 22): explicit ssh still admits ssh (regression), denies https.
+    assert!(
+        host_inbound_admits(&state, 22, 6, 22, false),
+        "system-services ssh admits ssh"
+    );
+    assert!(
+        !host_inbound_admits(&state, 22, 6, 443, false),
+        "system-services ssh does not admit https"
+    );
+}
+
 #[test]
 fn build_forwarding_state_disables_tx_selection_when_no_cos_or_filters_exist() {
     let state = build_forwarding_state(&ConfigSnapshot::default());

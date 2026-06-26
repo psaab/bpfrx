@@ -150,10 +150,24 @@ admit-all behaviour — a deliberate, zero-regression deviation from strict
 Junos (which denies host-bound traffic to an unconfigured zone). Token
 classification covers the common Junos `system-services` (ssh, ping, dns,
 dhcp/dhcpv6, ike, ntp, snmp, ...) and `protocols` (ospf, bgp,
-router-discovery, ...) names; `all` / `any-service` short-circuit to a full
-admit; an unrecognised token contributes nothing (fail-closed). ICMP-based
-services (`ping`, `router-discovery`) admit at L4-protocol granularity, not
-ICMP sub-type.
+router-discovery, ...) names; `system-services all` / `any-service`
+short-circuit to a full admit; an unrecognised token contributes nothing
+(fail-closed). ICMP-based services (`ping`, `router-discovery`) admit at
+L4-protocol granularity, not ICMP sub-type.
+
+**`protocols all` is scoped, NOT a blanket bypass (#3199).** In Junos
+`host-inbound-traffic protocols all` admits every supported ROUTING protocol
+(the entries under the `protocols` stanza) — it is NOT `system-services all`
+and NOT a blanket accept. The classifier expands the `all` token to the
+concrete routing-protocol set (`ROUTING_PROTOCOL_TOKENS`:
+ospf/bgp/rip/ripng/igmp/pim/vrrp/bfd/ldp/msdp/nhrp/router-discovery) instead
+of setting a short-circuit flag, so a `protocols all` zone admits routing
+protocols but still DENIES SSH/HTTPS/SNMP/NETCONF unless the matching
+`system-services` token is also present. The Go nft mirror
+(`hostInboundProtocolMatches("all", ...)` over
+`hostInboundRoutingProtocolTokens`) expands the same set and still emits the
+per-zone catch-all drop, so the kernel and userspace decisions stay
+consistent.
 
 ## `junos-host` self-traffic security policy (#3019)
 

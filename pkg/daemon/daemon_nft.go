@@ -160,11 +160,12 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 //     globally so a host-inbound set omitting `ping` does not black-hole
 //     PMTUD/ND/error delivery.
 //  4. Per host-inbound-configured zone, per family with addresses:
-//     - if `all` / `any-service` / `protocols all`: <fam> daddr <addrs> accept
-//     (and no deny — the operator opened the zone fully).
-//     - else: one accept per listed service/protocol scoped to the zone addrs,
-//     then a catch-all `<fam> daddr <addrs> drop` (Junos default-deny to the
-//     host is a silent drop).
+//     - if `system-services all` / `any-service`: <fam> daddr <addrs> accept
+//     (and no deny — the operator opened the zone to all services).
+//     - else: one accept per listed service/protocol scoped to the zone addrs
+//     (`protocols all` expands to the routing-protocol set — #3199, NOT a
+//     blanket accept), then a catch-all `<fam> daddr <addrs> drop` (Junos
+//     default-deny to the host is a silent drop).
 func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) string {
 	var rules []string
 	rules = append(rules, "table inet xpf_hostinbound")
@@ -208,8 +209,10 @@ func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, fam
 		return
 	}
 	daddr := family + " daddr " + nftAddrSet(addrs)
-	// `all` / `any-service` (services) or `all` (protocols) fully opens the
-	// zone: accept everything to its addresses, emit no deny.
+	// Only `system-services all` / `any-service` fully opens the zone: accept
+	// everything to its addresses, emit no deny. `protocols all` is scoped to
+	// the routing-protocol set (#3199) and flows through the per-match path
+	// below, so it still gets a catch-all drop for non-routing traffic.
 	if hostInboundAllowsAll(v) {
 		*rules = append(*rules, "    "+daddr+" accept")
 		return
@@ -234,15 +237,14 @@ func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, fam
 }
 
 // hostInboundAllowsAll reports whether the zone's system-services contains
-// `all` / `any-service` or its protocols contains `all` (full admit).
+// `all` / `any-service` (full admit). `protocols all` is deliberately NOT a
+// full admit (#3199): in Junos it means all ROUTING protocols, not all
+// system-services and not a blanket accept. `protocols all` is expanded to the
+// concrete routing-protocol match set by hostInboundProtocolMatches instead, so
+// it never opens SSH/HTTPS/SNMP/NETCONF on the box.
 func hostInboundAllowsAll(v dpuserspace.ZoneHostInboundView) bool {
 	for _, s := range v.SystemServices {
 		if s == "all" || s == "any-service" {
-			return true
-		}
-	}
-	for _, p := range v.Protocols {
-		if p == "all" {
 			return true
 		}
 	}
@@ -351,11 +353,28 @@ func hostInboundServiceMatches(token, family string) []string {
 	}
 }
 
+// hostInboundRoutingProtocolTokens is the routing-protocol set that
+// `protocols all` expands to (#3199). One entry per unique signature
+// (`ospf3` aliases `ospf`); hostInboundMatchSet dedups. Mirrors the Rust
+// ROUTING_PROTOCOL_TOKENS in userspace-dp/src/afxdp/forwarding/host_inbound.rs.
+var hostInboundRoutingProtocolTokens = []string{
+	"ospf", "bgp", "rip", "ripng", "igmp", "pim",
+	"vrrp", "bfd", "ldp", "msdp", "nhrp", "router-discovery",
+}
+
 // hostInboundProtocolMatches maps a Junos `protocols` (routing-protocol) token
-// to nft match fragments. Returns nil for `all` (handled by hostInboundAllowsAll)
-// and for unrecognised tokens (fail-closed).
+// to nft match fragments. `all` expands to the full routing-protocol set
+// (#3199) — NOT a blanket accept (that would open every system-service). Returns
+// nil for unrecognised tokens (fail-closed).
 func hostInboundProtocolMatches(token, family string) []string {
 	switch token {
+	case "all":
+		// `protocols all` = every routing protocol, scoped to protocol traffic.
+		var out []string
+		for _, p := range hostInboundRoutingProtocolTokens {
+			out = append(out, hostInboundProtocolMatches(p, family)...)
+		}
+		return out
 	case "ospf", "ospf3":
 		return []string{"meta l4proto 89"}
 	case "bgp":

@@ -145,13 +145,42 @@ fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
     }
 }
 
+/// The routing-protocol tokens that `protocols all` expands to (#3199). In
+/// Junos `host-inbound-traffic protocols all` admits every supported ROUTING
+/// protocol — NOT every system-service and NOT a blanket bypass. Expanding the
+/// `all` token to this concrete set (rather than a short-circuit admit) keeps a
+/// `protocols all` zone from opening SSH/HTTPS/SNMP/NETCONF on the box. One
+/// entry per unique signature (`ospf3` aliases `ospf`); the caller dedups.
+const ROUTING_PROTOCOL_TOKENS: &[&str] = &[
+    "ospf",
+    "bgp",
+    "rip",
+    "ripng",
+    "igmp",
+    "pim",
+    "vrrp",
+    "bfd",
+    "ldp",
+    "msdp",
+    "nhrp",
+    "router-discovery",
+];
+
 /// Classify one Junos `protocols` (routing-protocol) token. Port-based
 /// protocols (bgp/ldp/msdp/rip) contribute TCP/UDP ports; IP-protocol-based
 /// ones (ospf/pim/igmp/vrrp) contribute a protocol number; router-discovery is
 /// ICMP/ICMPv6.
 fn classify_protocol(token: &str, hi: &mut ZoneHostInbound) {
     match token {
-        "all" => hi.all_protocols = true,
+        // `protocols all` admits only the routing-protocol set (#3199) — it
+        // expands to every entry under the `protocols` stanza, NOT system
+        // services and NOT a blanket accept. `ROUTING_PROTOCOL_TOKENS` never
+        // contains "all", so this recursion terminates.
+        "all" => {
+            for tok in ROUTING_PROTOCOL_TOKENS {
+                classify_protocol(tok, hi);
+            }
+        }
         "ospf" | "ospf3" => {
             hi.ip_protocols.insert(89);
         }
