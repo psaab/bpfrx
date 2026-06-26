@@ -20256,3 +20256,18 @@ top.
   go build ./... + go test ./pkg/ddns/... ./pkg/daemon/... green (837 tests).
   **File(s)**: pkg/ddns/surface_a.go,
   pkg/ddns/surface_a_withdraw_backoff_2813_test.go, pkg/ddns/README.md, _Log.md
+  **Action**: #3058 — DNAT/static-NAT/NPTv6 policy-DENY RT_FLOW record now
+  carries the #2345 post-translation tuple. `emit_policy_deny_event` takes
+  the deny site's `&decision.nat` and populates nat_src/dst ip+port from
+  `rewrite_*` (mirroring `emit_session_close_rt_flow`: 5-tuple = original,
+  nat_* = translated) instead of hardcoding None/0; AppID resolved from the
+  post-NAT dst port via new `resolve_policy_deny_app_id(policy_dst_port)`.
+  Non-NAT deny (default NatDecision) stays byte-identical. Threaded
+  `&decision.nat` + `policy_dst_port` through both poll_descriptor deny sites
+  (session-miss + MissingNeighbor cold path). Added 3 Rust tests
+  (dnat post-translation dst+app, source-translation nat_src, non-NAT
+  byte-identical regression guard); fail-on-revert: test1 RED, test3 GREEN.
+  **File(s)**: userspace-dp/src/afxdp/event_emit.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/event_stream/README.md
