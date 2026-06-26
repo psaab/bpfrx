@@ -472,6 +472,48 @@ impl ScreenState {
         }
     }
 
+    /// #3064: run ONLY the L3-header-based fragment screens
+    /// (ping-of-death, teardrop, icmp-fragment) for a packet that has NO
+    /// transport flow — i.e. a non-first IP fragment that
+    /// `parse_session_flow_from_bytes` deliberately leaves flowless
+    /// (#2344, to avoid treating fragment payload as L4 ports).
+    ///
+    /// `stateless.rs` documents these three checks as PER-FRAGMENT, but
+    /// the live pipeline previously short-circuited every flowless packet
+    /// to `Pass` in `stage_screen_check`, so they were DEAD for non-first
+    /// fragments — hostile Teardrop / Ping-of-Death contributions transited
+    /// unscreened. The three checks read purely the IP-header fields already
+    /// captured in `ScreenPacketInfo` (fragment offset, total/payload
+    /// length, protocol) and never touch L4 ports or any per-flow/zone
+    /// counter state, so they are safe to evaluate without a `SessionFlow`
+    /// and WITHOUT reintroducing the transport classification #2344
+    /// removed.
+    ///
+    /// Flow/session-dependent screens (land, TCP-flag, the
+    /// icmp/udp/syn-flood rate counters, scan/sweep, SYN-cookie) are
+    /// intentionally NOT run here — they require a flow and stay gated on
+    /// the flow-present `check_packet_with_zone_id` path. The drop
+    /// precedence of these three checks matches that method exactly.
+    pub(crate) fn check_fragment_screens_l3(
+        &self,
+        zone: &str,
+        pkt: &ScreenPacketInfo,
+    ) -> ScreenVerdict {
+        let Some(profile) = self.profiles.get(zone) else {
+            return ScreenVerdict::Pass;
+        };
+        if let Some(reason) = stateless::check_ping_of_death(profile, pkt) {
+            return ScreenVerdict::Drop(reason);
+        }
+        if let Some(reason) = stateless::check_teardrop(profile, pkt) {
+            return ScreenVerdict::Drop(reason);
+        }
+        if let Some(reason) = stateless::check_icmp_fragment(profile, pkt) {
+            return ScreenVerdict::Drop(reason);
+        }
+        ScreenVerdict::Pass
+    }
+
     /// #2210 + #2209: port-scan / IP-sweep evaluation at the NEW-FLOW
     /// decision, mirroring the #2134 session-limit-on-miss hook.
     ///

@@ -1,3 +1,36 @@
+## 2026-06-26 — #3064: run L3-header fragment screens on the flowless (non-first-fragment) path
+
+- **Timestamp**: 2026-06-26
+- **Action**: fixed #3064. Non-first IP fragments are deliberately flowless
+  (#2344: `parse_session_flow_from_bytes` returns `None` so the fragment
+  payload is never parsed as L4 ports), and `stage_screen_check` returned an
+  early `Continue(Pass)` for every flowless packet. That left the
+  PER-FRAGMENT L3-header screens (ping-of-death, teardrop, icmp-fragment)
+  DEAD in the live pipeline for non-first fragments — hostile Teardrop /
+  Ping-of-Death contributions transited unscreened (the stateless unit tests
+  passed only because they call the helpers directly). Decoupled the
+  L3-header fragment screens from the transport flow: zone resolution now
+  runs BEFORE the `flow` branch (it was always flow-independent), and the
+  flowless branch extracts a header-only `ScreenPacketInfo` from the IP
+  header (PLACEHOLDER L4 tuple — no port parse, no session lookup, so the
+  #2344 fast path is NOT reintroduced) and runs only the three L3 fragment
+  screens via the new `ScreenState::check_fragment_screens_l3`.
+  Flow/session-dependent screens (land, TCP-flag, flood counters,
+  scan/sweep, SYN-cookie) stay gated on the flow-present path, unchanged. A
+  truncated/unparseable header fails CLOSED (drop), matching the flow path
+  (#2146).
+- **File(s)**: `userspace-dp/src/afxdp/poll_stages.rs`,
+  `userspace-dp/src/screen/mod.rs`, `userspace-dp/src/afxdp/event_emit.rs`,
+  `userspace-dp/src/afxdp/README.md`
+- **Validation**: `cargo build --release` clean; 4 new live-pipeline tests
+  (`flowless_teardrop_fragment_dropped_3064`,
+  `flowless_ping_of_death_fragment_dropped_3064`,
+  `flowless_benign_fragment_passes_and_skips_classification_3064`,
+  `flow_path_nonfragment_still_screens_3064`) pass; `screen::` 144 passed,
+  `poll_stages::` 14 passed. Fail-on-revert: restoring the early
+  `Continue(Pass)` turns the teardrop + ping-of-death tests RED while the
+  benign-pass and flow-path-regression tests stay GREEN.
+
 ## 2026-06-26 — #3023: `*-address-excluded` over-blocked the opposite family when only one family was listed
 
 - **Timestamp**: 2026-06-26
