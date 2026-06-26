@@ -312,6 +312,14 @@ func hostInboundMatchSet(v dpuserspace.ZoneHostInboundView, family string) []str
 // fragments for the given family. Returns nil for `all` / `any-service`
 // (handled by hostInboundAllowsAll) and for unrecognised tokens (fail-closed).
 func hostInboundServiceMatches(token, family string) []string {
+	// #3225: family-specific services (dhcp=v4, dhcpv6=v6) emit ONLY on their
+	// own family. emitHostInboundZone calls this once per family with the same
+	// token set, so a family-mismatched token must contribute no match (it would
+	// otherwise be emitted under the wrong `ip`/`ip6 daddr`). The family map is
+	// the SSOT shared with the Rust classifier (config.HostInboundServiceFamily).
+	if fam, ok := config.HostInboundServiceFamily[token]; ok && fam != family {
+		return nil
+	}
 	icmp := "icmp"
 	if family == "ip6" {
 		icmp = "icmpv6"
@@ -387,8 +395,12 @@ func hostInboundServiceMatches(token, family string) []string {
 // `protocols all` expands to (#3199). One entry per unique signature
 // (`ospf3` aliases `ospf`); hostInboundMatchSet dedups. Mirrors the Rust
 // ROUTING_PROTOCOL_TOKENS in userspace-dp/src/afxdp/forwarding/host_inbound.rs.
+// ospf3 is listed alongside ospf (#3225): both ride IP protocol 89 but on
+// different families, so `protocols all` must admit proto 89 on BOTH IPv4
+// (ospf) and IPv6 (ospf3). hostInboundProtocolMatches family-gates each, so the
+// expansion emits proto 89 once per family without a wrong-family match.
 var hostInboundRoutingProtocolTokens = []string{
-	"ospf", "bgp", "rip", "ripng", "igmp", "pim",
+	"ospf", "ospf3", "bgp", "rip", "ripng", "igmp", "pim",
 	"vrrp", "bfd", "ldp", "msdp", "nhrp", "router-discovery",
 }
 
@@ -397,6 +409,14 @@ var hostInboundRoutingProtocolTokens = []string{
 // (#3199) — NOT a blanket accept (that would open every system-service). Returns
 // nil for unrecognised tokens (fail-closed).
 func hostInboundProtocolMatches(token, family string) []string {
+	// #3225: family-specific routing protocols (ospf=v4 / ospf3=v6, rip=v4 /
+	// ripng=v6, igmp=v4) emit ONLY on their own family — the SSOT is
+	// config.HostInboundProtocolFamily, shared with the Rust classifier. `all`
+	// is dual-family (absent from the map) and recurses into the per-token set,
+	// each of which family-gates itself here.
+	if fam, ok := config.HostInboundProtocolFamily[token]; ok && fam != family {
+		return nil
+	}
 	switch token {
 	case "all":
 		// `protocols all` = every routing protocol, scoped to protocol traffic.
@@ -406,6 +426,8 @@ func hostInboundProtocolMatches(token, family string) []string {
 		}
 		return out
 	case "ospf", "ospf3":
+		// OSPFv2 (ospf, IPv4) and OSPFv3 (ospf3, IPv6) both ride IP protocol 89;
+		// the family gate above scopes each to its own family.
 		return []string{"meta l4proto 89"}
 	case "bgp":
 		return []string{"tcp dport 179"}
@@ -414,9 +436,8 @@ func hostInboundProtocolMatches(token, family string) []string {
 	case "ripng":
 		return []string{"udp dport 521"}
 	case "igmp":
-		if family == "ip6" {
-			return nil // v6 multicast group membership is MLD (icmpv6), via the ND accept
-		}
+		// v6 multicast group membership is MLD (icmpv6), reached via the ND
+		// accept; the family gate restricts igmp to IPv4.
 		return []string{"meta l4proto 2"}
 	case "pim":
 		return []string{"meta l4proto 103"}

@@ -292,6 +292,67 @@ func TestHostInboundFilterExplicitSshStillAdmitted(t *testing.T) {
 	}
 }
 
+// TestHostInboundFilterFamilyAware is the #3225 fail-on-revert proof for the
+// kernel nft mirror: family-specific host-inbound tokens must emit ONLY under
+// their own family. A v4-only service/protocol (dhcp udp/67-68, rip udp/520,
+// ospf proto 89) appears under `ip daddr <v4>` but NEVER under `ip6 daddr <v6>`;
+// a v6-only one (dhcpv6 udp/546-547, ripng udp/521, ospf3 proto 89) appears
+// under `ip6` but NEVER under `ip`. Dual-family services (ssh) appear under
+// both. Removing the family gate in hostInboundServiceMatches /
+// hostInboundProtocolMatches (so a token emits under both families) turns the
+// "wrong family must NOT appear" assertions RED.
+func TestHostInboundFilterFamilyAware(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"10.5.5.1/24", "2001:db8:5::1/64"}},
+		}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"edge": {
+			Name:       "edge",
+			Interfaces: []string{"reth0.0"},
+			HostInboundTraffic: &config.HostInboundTraffic{
+				SystemServices: []string{"dhcp", "dhcpv6", "ssh"},
+				Protocols:      []string{"rip", "ripng", "ospf", "ospf3"},
+			},
+		},
+	}
+	views := buildAndCheckViews(t, cfg)
+	payload := buildHostInboundFilterPayload(views)
+
+	// v4-only tokens accepted under ip, dual-family ssh under both.
+	mustContain := []string{
+		"ip daddr 10.5.5.1 udp dport { 67, 68 } accept",         // dhcp (v4)
+		"ip daddr 10.5.5.1 udp dport 520 accept",                // rip (v4)
+		"ip daddr 10.5.5.1 meta l4proto 89 accept",              // ospf (v4, OSPFv2)
+		"ip6 daddr 2001:db8:5::1 udp dport { 546, 547 } accept", // dhcpv6 (v6)
+		"ip6 daddr 2001:db8:5::1 udp dport 521 accept",          // ripng (v6)
+		"ip6 daddr 2001:db8:5::1 meta l4proto 89 accept",        // ospf3 (v6, OSPFv3)
+		"ip daddr 10.5.5.1 tcp dport 22 accept",                 // ssh (dual)
+		"ip6 daddr 2001:db8:5::1 tcp dport 22 accept",           // ssh (dual)
+	}
+	for _, want := range mustContain {
+		if !strings.Contains(payload, want) {
+			t.Errorf("payload missing %q\n---\n%s", want, payload)
+		}
+	}
+
+	// WRONG-FAMILY emissions must be ABSENT: v4-only tokens must not appear
+	// under ip6, and v6-only tokens must not appear under ip.
+	mustNotContain := []string{
+		"ip6 daddr 2001:db8:5::1 udp dport { 67, 68 } accept", // dhcp on v6
+		"ip6 daddr 2001:db8:5::1 udp dport 520 accept",        // rip on v6
+		"ip daddr 10.5.5.1 udp dport { 546, 547 } accept",     // dhcpv6 on v4
+		"ip daddr 10.5.5.1 udp dport 521 accept",              // ripng on v4
+	}
+	for _, bad := range mustNotContain {
+		if strings.Contains(payload, bad) {
+			t.Errorf("payload emits wrong-family match %q (family-blind admit)\n---\n%s", bad, payload)
+		}
+	}
+}
+
 // buildAndCheckViews resolves the per-zone views and asserts the table would be
 // applied (at least one enforceable zone).
 func buildAndCheckViews(t *testing.T, cfg *config.Config) []dpuserspace.ZoneHostInboundView {

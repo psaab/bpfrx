@@ -1274,6 +1274,124 @@ fn build_forwarding_state_protocols_all_admits_routing_not_system_services() {
     );
 }
 
+// #3225: host-inbound service/protocol matches must be ADDRESS-FAMILY AWARE. A
+// v4-only service (dhcp) must admit its ports on IPv4 but DROP the same ports on
+// IPv6; a v6-only service (dhcpv6) / protocol (ripng, ospf3) must admit on IPv6
+// and DROP on IPv4; a dual-family service (ssh) admits on BOTH. Before #3225 the
+// admit sets were family-neutral, so a v4-only `dhcp` opened udp/67-68 on the
+// IPv6 path and `ripng` opened udp/521 on IPv4 — wrong-family host exposure.
+//
+// Fail-on-revert: restore the family-neutral classifier (insert dhcp into the
+// shared `udp_ports`, ospf/ospf3 into the shared `ip_protocols`, etc.) and the
+// "v4-only service drops on v6" / "v6-only drops on v4" assertions go RED (the
+// zone admits the wrong family again); the dual-service ssh assertions stay
+// GREEN.
+#[test]
+fn build_forwarding_state_host_inbound_is_address_family_aware() {
+    use crate::ZoneSnapshot;
+    use crate::afxdp::forwarding::host_inbound_admits;
+
+    let snapshot = ConfigSnapshot {
+        zones: vec![
+            // v4-only services + v4-only routing protocols.
+            ZoneSnapshot {
+                name: "v4svc".into(),
+                id: 41,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec!["dhcp".into()],
+                host_inbound_protocols: vec!["rip".into(), "ospf".into()],
+                ..Default::default()
+            },
+            // v6-only services + v6-only routing protocols.
+            ZoneSnapshot {
+                name: "v6svc".into(),
+                id: 42,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec!["dhcpv6".into()],
+                host_inbound_protocols: vec!["ripng".into(), "ospf3".into()],
+                ..Default::default()
+            },
+            // dual-family service (ssh) — admits on BOTH families.
+            ZoneSnapshot {
+                name: "dual".into(),
+                id: 43,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec!["ssh".into()],
+                host_inbound_protocols: vec![],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let state = build_forwarding_state(&snapshot);
+
+    // v4svc (id 41): dhcp udp/67-68 + rip udp/520 + ospf proto 89 admit on IPv4.
+    assert!(
+        host_inbound_admits(&state, 41, 17, 67, false, 0),
+        "dhcp admits udp/67 on IPv4"
+    );
+    assert!(
+        host_inbound_admits(&state, 41, 17, 520, false, 0),
+        "rip admits udp/520 on IPv4"
+    );
+    assert!(
+        host_inbound_admits(&state, 41, 89, 0, false, 0),
+        "ospf admits proto 89 on IPv4"
+    );
+    // ...but the SAME ports/proto must be DENIED on IPv6 (wrong family).
+    assert!(
+        !host_inbound_admits(&state, 41, 17, 67, true, 0),
+        "dhcp (v4-only) must NOT admit udp/67 on IPv6"
+    );
+    assert!(
+        !host_inbound_admits(&state, 41, 17, 520, true, 0),
+        "rip (v4-only) must NOT admit udp/520 on IPv6"
+    );
+    assert!(
+        !host_inbound_admits(&state, 41, 89, 0, true, 0),
+        "ospf (v4-only OSPFv2) must NOT admit proto 89 on IPv6"
+    );
+
+    // v6svc (id 42): dhcpv6 udp/546-547 + ripng udp/521 + ospf3 proto 89 admit
+    // on IPv6.
+    assert!(
+        host_inbound_admits(&state, 42, 17, 546, true, 0),
+        "dhcpv6 admits udp/546 on IPv6"
+    );
+    assert!(
+        host_inbound_admits(&state, 42, 17, 521, true, 0),
+        "ripng admits udp/521 on IPv6"
+    );
+    assert!(
+        host_inbound_admits(&state, 42, 89, 0, true, 0),
+        "ospf3 admits proto 89 on IPv6"
+    );
+    // ...but DENIED on IPv4.
+    assert!(
+        !host_inbound_admits(&state, 42, 17, 546, false, 0),
+        "dhcpv6 (v6-only) must NOT admit udp/546 on IPv4"
+    );
+    assert!(
+        !host_inbound_admits(&state, 42, 17, 521, false, 0),
+        "ripng (v6-only) must NOT admit udp/521 on IPv4"
+    );
+    assert!(
+        !host_inbound_admits(&state, 42, 89, 0, false, 0),
+        "ospf3 (v6-only OSPFv3) must NOT admit proto 89 on IPv4"
+    );
+
+    // dual (id 43): ssh admits on BOTH families (unchanged dual-family).
+    assert!(
+        host_inbound_admits(&state, 43, 6, 22, false, 0),
+        "ssh admits tcp/22 on IPv4"
+    );
+    assert!(
+        host_inbound_admits(&state, 43, 6, 22, true, 0),
+        "ssh admits tcp/22 on IPv6"
+    );
+}
+
 #[test]
 fn build_forwarding_state_disables_tx_selection_when_no_cos_or_filters_exist() {
     let state = build_forwarding_state(&ConfigSnapshot::default());

@@ -194,8 +194,16 @@ pub(in crate::afxdp) struct ZoneHostInbound {
     pub(in crate::afxdp) all_services: bool,
     /// Admitted TCP destination ports (ssh=22, https=443, bgp=179, ...).
     pub(in crate::afxdp) tcp_ports: FastSet<u16>,
-    /// Admitted UDP destination ports (dns=53, dhcp=67/68, ike=500/4500, ...).
+    /// Admitted DUAL-FAMILY UDP destination ports (dns=53, ike=500/4500, ...).
+    /// Family-specific UDP services live in `udp_ports_v4` / `udp_ports_v6`.
     pub(in crate::afxdp) udp_ports: FastSet<u16>,
+    /// #3225: IPv4-ONLY admitted UDP ports (dhcp/bootp=67/68, rip=520). Consulted
+    /// by `admits` only when the packet is IPv4, so a `system-services dhcp` zone
+    /// does not open udp/67-68 on the IPv6 path.
+    pub(in crate::afxdp) udp_ports_v4: FastSet<u16>,
+    /// #3225: IPv6-ONLY admitted UDP ports (dhcpv6=546/547, ripng=521). Consulted
+    /// by `admits` only when the packet is IPv6.
+    pub(in crate::afxdp) udp_ports_v6: FastSet<u16>,
     /// Admit ICMPv4 (ping / router-discovery contribute this). The granularity
     /// is the L4 protocol, not the ICMP type — a zone permitting `ping` OR
     /// `router-discovery` admits ICMPv4 echo and router-discovery alike. This
@@ -203,9 +211,17 @@ pub(in crate::afxdp) struct ZoneHostInbound {
     pub(in crate::afxdp) icmp: bool,
     /// Admit ICMPv6 (ping / router-discovery for v6).
     pub(in crate::afxdp) icmpv6: bool,
-    /// Admitted bare IP protocol numbers (gre=47, ospf=89, esp=50, ah=51,
-    /// vrrp=112, pim=103, igmp=2, ...). Checked for non-TCP/UDP/ICMP packets.
+    /// Admitted DUAL-FAMILY bare IP protocol numbers (gre=47, esp=50, ah=51,
+    /// vrrp=112, pim=103, ...). Checked for non-TCP/UDP/ICMP packets.
+    /// Family-specific protocols live in `ip_protocols_v4` / `ip_protocols_v6`.
     pub(in crate::afxdp) ip_protocols: FastSet<u8>,
+    /// #3225: IPv4-ONLY admitted IP protocol numbers (ospf=OSPFv2=89, igmp=2).
+    /// Consulted by `admits` only when the packet is IPv4.
+    pub(in crate::afxdp) ip_protocols_v4: FastSet<u8>,
+    /// #3225: IPv6-ONLY admitted IP protocol numbers (ospf3=OSPFv3=89). Consulted
+    /// by `admits` only when the packet is IPv6, so a `protocols ospf` (v2) zone
+    /// does not open proto 89 on IPv6 and vice versa.
+    pub(in crate::afxdp) ip_protocols_v6: FastSet<u8>,
 }
 
 impl ZoneHostInbound {
@@ -223,8 +239,16 @@ impl ZoneHostInbound {
         match protocol {
             // TCP
             6 => self.tcp_ports.contains(&dst_port),
-            // UDP
-            17 => self.udp_ports.contains(&dst_port),
+            // UDP — dual-family ports OR the family-scoped set for this packet's
+            // family (#3225: dhcp/rip are v4-only, dhcpv6/ripng v6-only).
+            17 => {
+                self.udp_ports.contains(&dst_port)
+                    || if is_v6 {
+                        self.udp_ports_v6.contains(&dst_port)
+                    } else {
+                        self.udp_ports_v4.contains(&dst_port)
+                    }
+            }
             // ICMPv4
             1 => self.icmp,
             // ICMPv6
@@ -233,7 +257,14 @@ impl ZoneHostInbound {
                 if is_v6 && other == 58 {
                     self.icmpv6
                 } else {
+                    // Bare IP protocol — dual-family OR the family-scoped set
+                    // (#3225: ospf=OSPFv2 v4-only, ospf3=OSPFv3 v6-only, igmp v4).
                     self.ip_protocols.contains(&other)
+                        || if is_v6 {
+                            self.ip_protocols_v6.contains(&other)
+                        } else {
+                            self.ip_protocols_v4.contains(&other)
+                        }
                 }
             }
         }

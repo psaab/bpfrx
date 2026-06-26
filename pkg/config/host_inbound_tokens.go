@@ -103,3 +103,46 @@ var KnownHostInboundProtocols = map[string]bool{
 	"nhrp":             true,
 	"router-discovery": true,
 }
+
+// Address-family scoping for host-inbound tokens (#3225). Several Junos
+// host-inbound tokens are family-SPECIFIC in intent: a `system-services dhcp`
+// is DHCPv4 (udp 67/68 over IPv4), `dhcpv6` is DHCPv6 (udp 546/547 over IPv6);
+// `protocols rip` is RIPv2 (IPv4), `ripng` is RIPng (IPv6); `protocols ospf` is
+// OSPFv2 (IPv4) while `ospf3` is OSPFv3 (IPv6) — both ride IP protocol 89 but on
+// different families; `igmp` is IPv4 group membership (the IPv6 equivalent is
+// MLD, carried over ICMPv6 / the always-accepted ND set).
+//
+// Before #3225 both enforcement layers compiled these tokens into family-NEUTRAL
+// matches, so e.g. `system-services dhcp` opened udp/67-68 on the IPv6 path too
+// and `protocols ripng` opened udp/521 on IPv4 — a wrong-family host exposure
+// diverging from vSRX semantics. These maps are the single source of truth for a
+// token's family; BOTH enforcement layers consult them (the nft kernel mirror
+// directly via HostInboundServiceFamily/HostInboundProtocolFamily; the Rust
+// AF_XDP classifier mirrors them into family-scoped admit sets and is kept in
+// lock-step by the comment + the Go parity test).
+//
+// A token ABSENT from the relevant map is dual-family (admitted on IPv4 AND
+// IPv6, the common case — ssh/https/ping/dns/bgp/...). A token mapped to "ip"
+// is IPv4-only; "ip6" is IPv6-only. The values use the same "ip"/"ip6" family
+// spelling the nft builder threads through hostInboundServiceMatches /
+// hostInboundProtocolMatches.
+
+// HostInboundServiceFamily maps a family-SPECIFIC `system-services` token to its
+// only valid address family. Dual-family services are absent.
+var HostInboundServiceFamily = map[string]string{
+	"dhcp":   "ip",
+	"bootp":  "ip",
+	"dhcpv6": "ip6",
+}
+
+// HostInboundProtocolFamily maps a family-SPECIFIC `protocols` (routing) token
+// to its only valid address family. Dual-family protocols (bgp, pim, vrrp, bfd,
+// ldp, msdp, nhrp, router-discovery) are absent. `ospf`/`ospf3` are split here
+// even though both ride IP protocol 89: OSPFv2 is IPv4, OSPFv3 is IPv6.
+var HostInboundProtocolFamily = map[string]string{
+	"ospf":  "ip",
+	"ospf3": "ip6",
+	"rip":   "ip",
+	"ripng": "ip6",
+	"igmp":  "ip",
+}
