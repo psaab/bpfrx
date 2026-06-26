@@ -55,7 +55,13 @@ type Config struct {
 	// `show security alarms` (#2079). nil when no monitor is wired.
 	NATPoolAlarmsFn func() []natpoolalarm.ActiveAlarm
 	FeedsFn         func() map[string]feeds.FeedInfo // returns live feed status
-	LLDPNeighborsFn func() []*lldp.Neighbor          // returns live LLDP neighbors
+	// FeedOverlayFn returns the live dynamic-address feed-prefix overlay
+	// (#2049) — an address-name -> union-of-feed-CIDRs map for the active
+	// config — consulted by the `match-policies` simulator (#3042) so a
+	// feed-backed policy address token resolves to its live feed prefixes.
+	// Optional; if nil the simulator uses static address-book content only.
+	FeedOverlayFn   func() map[string][]string
+	LLDPNeighborsFn func() []*lldp.Neighbor // returns live LLDP neighbors
 	// #1387 inc-2: DHCP dynamic-DNS status sources for
 	// `show system services dhcp-server dynamic-dns [detail]`. nil when the
 	// manager is absent (NoDataplane) — the show renders "not running".
@@ -103,6 +109,7 @@ type Server struct {
 	ipmonStatusFn         func() []ipmon.PolicyStatus
 	natPoolAlarmsFn       func() []natpoolalarm.ActiveAlarm
 	feedsFn               func() map[string]feeds.FeedInfo
+	feedOverlayFn         func() map[string][]string
 	lldpNeighborsFn       func() []*lldp.Neighbor
 	ddnsStatsFn           func() *dhcpserver.DDNSStats
 	ddnsOwnedRecordsFn    func() []dhcpserver.DDNSOwnedRecordView
@@ -158,6 +165,7 @@ func NewServer(addr string, cfg Config) *Server {
 		ipmonStatusFn:         cfg.IPMonStatusFn,
 		natPoolAlarmsFn:       cfg.NATPoolAlarmsFn,
 		feedsFn:               cfg.FeedsFn,
+		feedOverlayFn:         cfg.FeedOverlayFn,
 		lldpNeighborsFn:       cfg.LLDPNeighborsFn,
 		ddnsStatsFn:           cfg.DDNSStatsFn,
 		ddnsOwnedRecordsFn:    cfg.DDNSOwnedRecordsFn,

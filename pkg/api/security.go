@@ -5,13 +5,12 @@ import (
 	"net"
 	"net/http"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/policymatch"
 )
 
 func (s *Server) zonesHandler(w http.ResponseWriter, _ *http.Request) {
@@ -272,147 +271,52 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 
 	srcIP := net.ParseIP(srcIPStr)
 	dstIP := net.ParseIP(dstIPStr)
-	// A malformed dst_port must not silently become 0 (the "any port"
-	// wildcard) — that yields a misleading PERMIT/DENY verdict in the
+	// A malformed dst_port/src_port must not silently become 0 (the "any
+	// port" wildcard) — that yields a misleading PERMIT/DENY verdict in the
 	// simulator (#2934). Fail closed with 400.
 	dstPort, ok := queryIntStrict(r, "dst_port", 0)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid dst_port: "+r.URL.Query().Get("dst_port"))
 		return
 	}
+	srcPort, ok := queryIntStrict(r, "src_port", 0)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid src_port: "+r.URL.Query().Get("src_port"))
+		return
+	}
 	proto := r.URL.Query().Get("protocol")
 
-	for _, zpp := range cfg.Security.Policies {
-		if zpp.FromZone != fromZone || zpp.ToZone != toZone {
-			continue
-		}
-		for _, pol := range zpp.Policies {
-			if !matchPolicyAddr(pol.Match.SourceAddresses, srcIP, cfg) {
-				continue
-			}
-			if !matchPolicyAddr(pol.Match.DestinationAddresses, dstIP, cfg) {
-				continue
-			}
-			if !matchPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
-				continue
-			}
-
-			writeOK(w, MatchPoliciesResult{
-				Matched:      true,
-				PolicyName:   pol.Name,
-				Action:       policyActionStr(pol.Action),
-				SrcAddresses: pol.Match.SourceAddresses,
-				DstAddresses: pol.Match.DestinationAddresses,
-				Applications: pol.Match.Applications,
-			})
-			return
-		}
+	// #3042: delegate to the single shared simulator so REST agrees with the
+	// runtime evaluator (zone-pair -> global -> default-policy, predefined +
+	// nested-app-set + literal-CIDR + any-ipv4/any-ipv6 + exclusion + feed
+	// overlay). The pre-#3042 hand-written loop skipped globals, hard-coded
+	// "deny (default)", and missed predefined apps / literal CIDRs.
+	var overlay map[string][]string
+	if s.feedOverlayFn != nil {
+		overlay = s.feedOverlayFn()
 	}
-
-	writeOK(w, MatchPoliciesResult{Action: "deny (default)"})
-}
-
-// matchPolicyAddr checks if an IP matches any address references.
-func matchPolicyAddr(addrs []string, ip net.IP, cfg *config.Config) bool {
-	if len(addrs) == 0 || ip == nil {
-		return true
+	res := policymatch.Match(cfg, policymatch.Query{
+		FromZone:    fromZone,
+		ToZone:      toZone,
+		SrcIP:       srcIP,
+		DstIP:       dstIP,
+		Protocol:    proto,
+		SrcPort:     srcPort,
+		DstPort:     dstPort,
+		FeedOverlay: overlay,
+	})
+	if !res.Matched {
+		writeOK(w, MatchPoliciesResult{Action: policymatch.ActionString(res.Action) + " (default)"})
+		return
 	}
-	for _, a := range addrs {
-		if a == "any" {
-			return true
-		}
-		if cfg.Security.AddressBook == nil {
-			continue
-		}
-		if addr, ok := cfg.Security.AddressBook.Addresses[a]; ok {
-			_, cidr, err := net.ParseCIDR(addr.Value)
-			if err == nil && cidr.Contains(ip) {
-				return true
-			}
-		}
-		if matchPolicyAddrSet(a, ip, cfg, 0) {
-			return true
-		}
-	}
-	return false
-}
-
-func matchPolicyAddrSet(setName string, ip net.IP, cfg *config.Config, depth int) bool {
-	if depth > 5 || cfg.Security.AddressBook == nil {
-		return false
-	}
-	as, ok := cfg.Security.AddressBook.AddressSets[setName]
-	if !ok {
-		return false
-	}
-	for _, addrName := range as.Addresses {
-		if addr, ok := cfg.Security.AddressBook.Addresses[addrName]; ok {
-			_, cidr, err := net.ParseCIDR(addr.Value)
-			if err == nil && cidr.Contains(ip) {
-				return true
-			}
-		}
-	}
-	for _, nested := range as.AddressSets {
-		if matchPolicyAddrSet(nested, ip, cfg, depth+1) {
-			return true
-		}
-	}
-	return false
-}
-
-// matchPolicyApp checks if a protocol/port matches application references.
-func matchPolicyApp(apps []string, proto string, dstPort int, cfg *config.Config) bool {
-	if len(apps) == 0 || proto == "" {
-		return true
-	}
-	for _, a := range apps {
-		if a == "any" {
-			return true
-		}
-		if matchSingleApp(a, proto, dstPort, cfg) {
-			return true
-		}
-		if cfg.Applications.ApplicationSets != nil {
-			if as, ok := cfg.Applications.ApplicationSets[a]; ok {
-				for _, appRef := range as.Applications {
-					if matchSingleApp(appRef, proto, dstPort, cfg) {
-						return true
-					}
-				}
-			}
-		}
-	}
-	return false
-}
-
-func matchSingleApp(appName, proto string, dstPort int, cfg *config.Config) bool {
-	if cfg.Applications.Applications == nil {
-		return false
-	}
-	app, ok := cfg.Applications.Applications[appName]
-	if !ok {
-		return false
-	}
-	if app.Protocol != "" && !strings.EqualFold(app.Protocol, proto) {
-		return false
-	}
-	if app.DestinationPort != "" && dstPort > 0 {
-		if strings.Contains(app.DestinationPort, "-") {
-			parts := strings.SplitN(app.DestinationPort, "-", 2)
-			lo, _ := strconv.Atoi(parts[0])
-			hi, _ := strconv.Atoi(parts[1])
-			if dstPort < lo || dstPort > hi {
-				return false
-			}
-		} else {
-			p, _ := strconv.Atoi(app.DestinationPort)
-			if p != dstPort {
-				return false
-			}
-		}
-	}
-	return true
+	writeOK(w, MatchPoliciesResult{
+		Matched:      true,
+		PolicyName:   res.PolicyName,
+		Action:       policymatch.ActionString(res.Action),
+		SrcAddresses: res.SrcAddresses,
+		DstAddresses: res.DstAddresses,
+		Applications: res.Applications,
+	})
 }
 
 func policyActionStr(a config.PolicyAction) string {

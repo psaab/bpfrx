@@ -575,6 +575,9 @@ message MatchPoliciesRequest {
   string destination_ip = 4;
   int32 destination_port = 5;
   string protocol = 6;
+  // source_port lets the simulator honor source-port-constrained application
+  // terms (#3042). 0 = unspecified (does not constrain the match).
+  int32 source_port = 7;
 }
 message MatchPoliciesResponse {
   string policy_name = 1;

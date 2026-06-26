@@ -1,3 +1,35 @@
+## 2026-06-25 — #3042: consolidate the match-policies simulator into one shared matcher
+
+- **Timestamp**: 2026-06-25
+- **Action**: Replaced the three divergent hand-written `match-policies`
+  shadow matchers (REST `matchPoliciesHandler`, gRPC `MatchPolicies`, CLI
+  `showMatchPolicies` — plus the sibling CLI `test policy`) with thin
+  adapters over a single shared simulator, `pkg/policymatch`. The new
+  matcher replicates the runtime evaluator (`userspace-dp/src/policy.rs`):
+  zone-pair → global → configured `default-policy` (not a hard-coded deny),
+  predefined apps + multi-level application-sets (`ResolveApplication` /
+  `ExpandApplicationSet`), literal CIDRs, `any-ipv4`/`any-ipv6`,
+  source/destination exclusion (empty-excluded fail-closed), source+dest
+  port terms, and the live dynamic-address feed overlay. Added a
+  `source_port` field to `MatchPoliciesRequest` (proto regen) and a
+  `FeedOverlayFn`/`src_port` to the REST + gRPC surfaces; the daemon wires
+  the live overlay via `feedSnapshotsForConfig`. Removed the now-dead narrow
+  helpers from `pkg/api`, `pkg/grpcapi`, `pkg/cli`.
+- **File(s)**: pkg/policymatch/policymatch.go (new),
+  pkg/policymatch/policymatch_test.go (new), pkg/policymatch/README.md (new),
+  pkg/api/security.go, pkg/api/server.go, pkg/api/README.md,
+  pkg/grpcapi/server_cluster.go, pkg/grpcapi/server.go, pkg/grpcapi/README.md,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_request.go, pkg/cli/cli_helpers.go,
+  pkg/cli/README.md, pkg/daemon/daemon_run.go, proto/xpf/v1/xpf.proto,
+  pkg/grpcapi/xpfv1/xpf.pb.go (regen).
+- **Fold (review MERGE-NEEDS-MINOR)**: restored the matched-policy
+  `Description` line that the local interactive `show security
+  match-policies` printed before #3042. Added a `Description` field to
+  `policymatch.Result`, populated from the matched policy (zone-pair AND
+  global) in `matchedResult`, and reprinted it (`if Description != ""`) in
+  the show handler. `test policy` output unchanged (it never printed it).
+  Pinned by `TestMatchedResultCarriesDescription`.
+
 ## 2026-06-25 — #3018: reject wildcard from-zone/to-zone `any` policy at commit
 
 - **Timestamp**: 2026-06-25

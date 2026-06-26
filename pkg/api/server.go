@@ -140,6 +140,13 @@ type Config struct {
 	// last-error/last-success state are surfaced here. Optional; if nil (or
 	// it returns nil), the family is omitted.
 	FlowCollectorHealthFn func() []flowexport.ExporterCollectorHealth
+	// FeedOverlayFn returns the live dynamic-address feed-prefix overlay
+	// (#2049): an address-name -> union-of-feed-CIDRs map for the active
+	// config, the same view the AF_XDP helper enforces. It is consulted by
+	// the `match-policies` simulator (#3042) so a feed-backed policy address
+	// token resolves to its live feed prefixes. Optional; if nil the
+	// simulator resolves feed-backed names to their static content only.
+	FeedOverlayFn func() map[string][]string
 }
 
 // Server is the HTTP API server.
@@ -168,6 +175,7 @@ type Server struct {
 	ddnsStatsFn             func() *dhcpserver.DDNSStats
 	surfaceAStatsFn         func() *ddns.SurfaceAStats
 	flowCollectorHealthFn   func() []flowexport.ExporterCollectorHealth
+	feedOverlayFn           func() map[string][]string
 	startTime               time.Time
 }
 
@@ -196,6 +204,7 @@ func NewServer(cfg Config) *Server {
 		ddnsStatsFn:             cfg.DDNSStatsFn,
 		surfaceAStatsFn:         cfg.SurfaceAStatsFn,
 		flowCollectorHealthFn:   cfg.FlowCollectorHealthFn,
+		feedOverlayFn:           cfg.FeedOverlayFn,
 		startTime:               time.Now(),
 	}
 
