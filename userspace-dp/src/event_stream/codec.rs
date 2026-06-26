@@ -36,7 +36,7 @@ pub(crate) const MSG_SCREEN_DROP: u8 = 12;
 pub(crate) const MSG_FILTER_LOG: u8 = 13;
 
 // #2460: RT_FLOW SESSION_CLOSE on the raw dataplane-event channel. This
-// frame carries the canonical 136-byte `dataplane.Event` payload (the same
+// frame carries the canonical 144-byte `dataplane.Event` payload (the same
 // shape the Go `logging.DecodeRawEventRecord` / `ProcessRawEvent` parser
 // consumes for the deny/screen/filter frames above) with the event-type
 // byte set to RT_FLOW SESSION_CLOSE (2). It is what drives the Go
@@ -47,7 +47,7 @@ pub(crate) const MSG_FILTER_LOG: u8 = 13;
 pub(crate) const MSG_SESSION_CLOSE_RT_FLOW: u8 = 14;
 
 // #2508: RT_FLOW SESSION_CREATE on the raw dataplane-event channel. Same
-// 136-byte payload shape as the close frame but with the event-type byte set
+// 144-byte payload shape as the close frame but with the event-type byte set
 // to RT_FLOW SESSION_CREATE (1). Emitted ONLY for sessions admitted by a
 // policy with `then log session-init`; there is no flowexport consumer of
 // session opens, so this frame is gated at the producer (the caller checks
@@ -55,8 +55,16 @@ pub(crate) const MSG_SESSION_CLOSE_RT_FLOW: u8 = 14;
 // RT_FLOW_SESSION_CREATE syslog record.
 pub(crate) const MSG_SESSION_CREATE_RT_FLOW: u8 = 15;
 
+// #3056: 144 bytes (was 136). The trailing [136:140] u32 carries the admitting
+// policy ID on the SESSION_CLOSE frame, whose [44:48] policy_id slot is occupied
+// by the #2853 created-subsec-nanos remainder and so cannot hold the policy ID
+// the way the SESSION_CREATE / deny / screen / filter frames do. [140:144] is
+// reserved padding (keeps the Go `dataplane.Event` mirror 8-byte aligned). All
+// frame encoders emit this length; non-close frames leave [136:144] zero. The Go
+// decoder reads [136:140] only on a SESSION_CLOSE and is length-guarded, so a
+// short (legacy 136-byte) frame degrades to policy 0 rather than misparsing.
 #[allow(dead_code)]
-pub(crate) const SECURITY_EVENT_PAYLOAD_SIZE: usize = 136;
+pub(crate) const SECURITY_EVENT_PAYLOAD_SIZE: usize = 144;
 
 const RT_FLOW_AF_INET: u8 = 2;
 const RT_FLOW_AF_INET6: u8 = 10;
@@ -444,7 +452,7 @@ impl EventFrame {
     /// #2460: Encode an RT_FLOW SESSION_CLOSE (type 14) frame.
     ///
     /// Unlike `encode_session_close` (the minimal type-2 HA session-sync
-    /// delta), this frame carries the canonical 136-byte `dataplane.Event`
+    /// delta), this frame carries the canonical 144-byte `dataplane.Event`
     /// payload — byte-identical to the layout written by
     /// `encode_dataplane_event` and parsed by the Go
     /// `logging.DecodeRawEventRecord` / `EventReader.logEvent`
@@ -487,6 +495,17 @@ impl EventFrame {
     /// flow StartTime keeps millisecond resolution; before this, short flows
     /// (DNS, single HTTP requests) opened in the same second all reported one
     /// truncated integer-second start, skewing IPFIX `flowStartMilliseconds`.
+    ///
+    /// #3056: `policy_id` is the admitting policy's ID. Because #2853 took the
+    /// [44:48] slot that every other frame uses for the policy ID, the
+    /// SESSION_CLOSE frame carries it in the trailing [136:140] slot (the payload
+    /// grew 136 -> 144 for this; see `SECURITY_EVENT_PAYLOAD_SIZE`). The Go
+    /// decoder reads [136:140] back as PolicyID ONLY on a close, so the
+    /// RT_FLOW_SESSION_CLOSE syslog record and the NetFlow/IPFIX close exporters
+    /// name the admitting policy instead of policy 0. A 0 keeps the prior
+    /// "no policy" rendering (host-local / seed sessions, or a peer-PROMOTED
+    /// session that closes on a node which never ran the admitting policy —
+    /// policy_id is in-process only, not yet on the cross-node sync wire).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_session_close_rt_flow(
         seq: u64,
@@ -502,6 +521,16 @@ impl EventFrame {
         nat_dst_port: u16,
         ingress_zone_id: u16,
         egress_zone_id: u16,
+        // #3056: the admitting policy's ID, stamped on the session at install
+        // (`SessionMetadata.policy_id`). The SESSION_CLOSE frame carries it in the
+        // trailing [136:140] slot (NOT [44:48], which #2853 repurposed for the
+        // created-subsec-nanos), so the RT_FLOW_SESSION_CLOSE syslog record and
+        // the NetFlow/IPFIX close exporters name the admitting policy instead of
+        // policy 0. 0 stays the value for a session with no admitting policy
+        // (host-local / seed) and for a peer-PROMOTED session that closes on a
+        // node which never ran the policy (policy_id is in-process only, not yet
+        // on the cross-node sync wire — see server/helpers.rs).
+        policy_id: u32,
         owner_rg_id: i16,
         log_syslog: bool,
         created_unix_secs: u32,
@@ -601,6 +630,13 @@ impl EventFrame {
         buf[base + 134] = RT_FLOW_CLOSE_REASON_NONE;
         // [135] #2508 per-policy SYSLOG log gate.
         buf[base + 135] = if log_syslog { RT_FLOW_LOG_SYSLOG } else { 0 };
+        // [136:140] policy_id — #3056: the admitting policy's ID (LITTLE-endian
+        // u32). Unlike every non-close frame (which carries policy_id in [44:48]),
+        // the SESSION_CLOSE frame uses this trailing slot because [44:48] holds
+        // the #2853 created-subsec-nanos. The Go decoder reads [136:140] back as
+        // PolicyID ONLY on a SESSION_CLOSE, so the close record names the
+        // admitting policy instead of policy 0. [140:144] stays reserved padding.
+        buf[base + 136..base + 140].copy_from_slice(&policy_id.to_le_bytes());
 
         write_header(
             &mut buf,
@@ -633,6 +669,17 @@ impl EventFrame {
     /// render-only fix — no wire-format change. A 0 in either slot keeps the
     /// prior `packet-incoming-interface="N/A"` / `application="UNKNOWN"`
     /// rendering for sessions whose interface/app could not be resolved.
+    ///
+    /// #3056: the create frame now also carries the admitting policy's ID in the
+    /// [44:48] `policy_id` slot. Unlike the SESSION_CLOSE frame — whose [44:48]
+    /// was repurposed by #2853 to carry the creation instant's sub-second
+    /// nanoseconds — the SESSION_CREATE frame leaves [44:48] otherwise unused,
+    /// and the Go decoder already reads it as `PolicyID` for every non-close
+    /// frame (`pkg/logging/ringbuf.go` logEvent / DecodeRawEventRecord) and
+    /// resolves a policy name from it. So this is a render-only fix: the
+    /// RT_FLOW_SESSION_CREATE syslog record now names the admitting policy
+    /// instead of policy `0`. A 0 keeps the prior behavior (no admitting policy,
+    /// e.g. host-local/seed sessions never emit this producer-gated frame).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_session_create_rt_flow(
         seq: u64,
@@ -648,6 +695,7 @@ impl EventFrame {
         nat_dst_port: u16,
         ingress_zone_id: u16,
         egress_zone_id: u16,
+        policy_id: u32,
         ingress_ifindex: u32,
         application_id: u16,
     ) -> Self {
@@ -661,7 +709,13 @@ impl EventFrame {
         // [40:42] src port, [42:44] dst port — BIG-endian.
         buf[base + 40..base + 42].copy_from_slice(&src_port.to_be_bytes());
         buf[base + 42..base + 44].copy_from_slice(&dst_port.to_be_bytes());
-        // [44:48] policy_id — unused for the create syslog tuple.
+        // [44:48] policy_id — #3056: the admitting policy's ID (LITTLE-endian
+        // u32). The Go decoder reads this slot as PolicyID for non-close frames
+        // and resolves the policy name, so the RT_FLOW_SESSION_CREATE record
+        // names the admitting policy instead of policy 0. (On the SESSION_CLOSE
+        // frame this slot is the #2853 created-subsec-nanos; the two frames have
+        // separate encoders, so there is no collision.)
+        buf[base + 44..base + 48].copy_from_slice(&policy_id.to_le_bytes());
         // [48:50] ingress zone, [50:52] egress zone — little-endian.
         buf[base + 48..base + 50].copy_from_slice(&ingress_zone_id.to_le_bytes());
         buf[base + 50..base + 52].copy_from_slice(&egress_zone_id.to_le_bytes());
@@ -739,7 +793,7 @@ impl EventFrame {
     /// Encode a fixed-size security telemetry event using the existing
     /// RT_FLOW dataplane.Event wire shape consumed by the Go ringbuf parser.
     ///
-    /// Payload layout (136 bytes) matches `pkg/dataplane.Event`: timestamp,
+    /// Payload layout (144 bytes) matches `pkg/dataplane.Event`: timestamp,
     /// 16-byte src/dst IP slots, big-endian ports, little-endian identities
     /// and zones, event/protocol/action/address-family bytes, NAT slots, and
     /// extended ingress-ifindex/application fields.
@@ -755,7 +809,7 @@ impl EventFrame {
             // #2512: SESSION_CLOSE / SESSION_CREATE share the per-kind budget
             // accounting but NOT this generic deny/screen/filter payload
             // encoder — they have their own `encode_session_close_rt_flow` /
-            // `encode_session_create_rt_flow` builders with a distinct 136-byte
+            // `encode_session_create_rt_flow` builders with a distinct 144-byte
             // layout (no DataplaneEventPayload is ever constructed for them).
             DataplaneEventKind::SessionClose | DataplaneEventKind::SessionCreate => {
                 debug_assert!(

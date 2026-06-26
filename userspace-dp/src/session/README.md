@@ -413,6 +413,48 @@ omits the fields decodes to `false` (no per-policy log) — bit-identical to
 pre-#2785 behavior. The JSON RPC-fallback delta (`SessionDeltaInfo` in
 `protocol/binding.rs`) carries the same fields at parity with the binary frame.
 
+### Admitting policy ID on the session (#3056)
+
+A policy-admitted session stamps the admitting policy's ID onto
+`SessionMetadata.policy_id` at install (`afxdp/poll_descriptor`, both the
+forward entry and its reverse companion, from `policy_result.policy_id` — the
+same ID namespace the deny/screen/filter frames carry in [44:48] and the Go
+control plane assigns in `pkg/dataplane/userspace/policies.go`). Before #3056
+the field did not exist: the live-session BPF-compat rows and the RT_FLOW
+SESSION_CREATE/CLOSE records all published policy `0`, which the Go side renders
+as the FIRST configured policy (policyID 0) — a wrong attribution that broke
+incident response.
+
+The ID is consumed at three surfaces:
+
+1. **Live-session rows** (`afxdp/bpf_map/publish_conntrack`): the v4/v6
+   BPF-compat conntrack value's `policy_id` slot, which the Go `show security
+   flow session` / REST / gRPC surfaces read as `val.PolicyID`.
+2. **RT_FLOW SESSION_CREATE** (`event_stream/codec.rs`
+   `encode_session_create_rt_flow`): the [44:48] policy_id wire slot, which the
+   Go decoder reads as `PolicyID` for every non-close frame.
+3. **RT_FLOW SESSION_CLOSE** (`encode_session_close_rt_flow`): the *trailing*
+   [136:140] slot — NOT [44:48], which #2853 repurposed on a close for the
+   created-subsec-nanos. The RT_FLOW event payload grew 136 -> 144 bytes for
+   this slot (`SECURITY_EVENT_PAYLOAD_SIZE`; mirrored by `pkg/dataplane.Event`
+   and `pkg/logging` `rawEventWireSize` / `binary_test.go`). The Go decoder
+   reads [136:140] back as `PolicyID` ONLY on a SESSION_CLOSE and is
+   length-guarded, so a short (legacy 136-byte) frame degrades to policy 0
+   rather than misparsing.
+
+`0` stays the legitimate value for a session with no admitting policy
+(host-local, neighbor-seed, fabric-return, tunnel sync-import, flow-cache
+replay seed).
+
+**Scope — in-process, not on the cross-node sync wire.** `SessionMetadata`
+carries no serde, so `policy_id` rides the shared-session map and sibling-worker
+replicas automatically, but it does NOT cross the cross-node HA
+`SessionDeltaInfo` / `SessionSyncRequest` wire (unlike the #2785 log flags
+above). A peer-PROMOTED session therefore still resolves policy `0` on the new
+active node until a future change adds a `policy_id` wire field (mirroring how
+#2785 added the log-flag fields) — a deliberate follow-up, not a regression
+(the pre-#3056 behavior was policy 0 everywhere).
+
 ## Per-IP session-limit lifecycle (#2134; #2128 leak-fix preserved)
 
 Junos `set security screen ids-option <name> limit-session
