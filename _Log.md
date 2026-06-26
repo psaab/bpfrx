@@ -16,6 +16,27 @@
   `TestSurfaceAGatePerRG` for the new semantic.
 - **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
   pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md
+## 2026-06-25 — #2933: commit-time reject ambiguous secure-tunnel bind-interface aliases
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add `validateSecureTunnelBindInterfaceAST` reject-at-commit gate.
+  Two VPNs binding two DISTINCT bind-interface strings that derive the SAME
+  XFRM if_id (e.g. `st0` and `st0.0`, both if_id 1 via `XFRMIfNameAndID`)
+  committed cleanly but collide at apply time (#2929 routing guard refuses
+  EITHER device → both tunnels down). New AST pre-walk in `compileExpanded`
+  hard-rejects on the strict commit/commit-check path naming each offending
+  bind-interface string, its VPN(s), and the shared if_id; downgrades to a
+  cfg.Warnings entry on the lenient load/peer-sync path
+  (`lenientSecureTunnelBindIface`) so an already-persisted config still boots
+  (#1960). Surgical: same-string-shared-by-many-VPNs and unparseable bindings
+  are NOT rejected; st0.0+st0.1 / st0+st1 commit cleanly.
+- **File(s)**: pkg/config/compiler_ipsec_bindiface.go (new),
+  pkg/config/compiler_ipsec_bindiface_2933_test.go (new),
+  pkg/config/compiler.go (compileOpts flag + call site + warn append),
+  pkg/config/README.md.
+- **Validation**: go build ./..., go vet ./pkg/config/..., go test
+  ./pkg/config/... (1578 passed). Fail-on-revert confirmed (stub returning
+  nil turns reject + lenient tests RED). gofmt clean.
 
 ## 2026-06-25 — #2936: cap session aggregator cardinality (control-plane DoS amplifier)
 
