@@ -18732,3 +18732,39 @@ top.
   per #2871. No code change. Build clean; nat:: 130 / static_nat 28 still green.
 - **File(s)**: docs/feature-coverage.md,
   userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #3076 firewall filter tcp-flags expression fail-open fix. A Junos
+  `from tcp-flags` *expression* (`"syn & !ack"`, `"ack | rst"`, etc.) committed
+  (the leaf is `multi: true` with no value validator) but the snapshot builder's
+  bare-name-only `tcpFlagsMask` lookup missed the expression token and returned
+  ok=false, so the constraint was silently dropped — the term matched regardless
+  of TCP flags (security fail-open). Added `ParseTCPFlagsExpression`
+  (pkg/config/tcp_flags.go) parsing `&`/`|`/`!`/`(`/`)` into a required-bits and
+  a forbidden-bits mask; `compileFirewall` now REJECTS at commit (fail-closed)
+  any expression the conjunctive dataplane cannot enforce (disjunction, negated
+  group, unknown flag, contradiction). Representable expressions (incl.
+  `syn & !ack`) are carried via a new `tcp_flags_forbidden` wire field through
+  the Go snapshot (protocol.go), the Rust serde struct (security.rs), the
+  compiled FilterTerm (filter/mod.rs + compiler.rs), the matcher
+  (engine/matching.rs: `(flags & required)==required && (flags & forbidden)==0`)
+  and cache-sensitivity compare (cache_sensitive.rs). Regenerated
+  protocol_wire_v1.json fixture. FAIL-ON-REVERT tests: pkg/config
+  TestParseTCPFlagsExpression + TestFirewallFilterTCPFlagsCommitReject;
+  pkg/dataplane/userspace TestFilterSnapshotTCPFlagsExpressionParsed /
+  NegationOnly; Rust tcp_flags_term_forbidden_mask_excludes_negated_flag /
+  forbidden_only_mask. Gates: go build ./... clean, gofmt clean (touched files),
+  go vet ./pkg/config + ./pkg/dataplane/userspace clean, go test pkg/config 1516
+  + pkg/dataplane 833 pass, cargo filter:: 120 + wire_invariant pass.
+- **File(s)**: pkg/config/tcp_flags.go (new), pkg/config/tcp_flags_test.go (new),
+  pkg/config/compiler_firewall.go, pkg/dataplane/userspace/filters.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/filters_per_packet_match_2362_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/filter/mod.rs,
+  userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/engine/matching.rs,
+  userspace-dp/src/filter/engine/cache_sensitive.rs,
+  userspace-dp/src/filter/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  userspace-dp/src/filter/README.md, docs/config-schema.md,
+  pkg/config/README.md, _Log.md

@@ -179,6 +179,14 @@ pub(crate) struct FirewallTermSnapshot {
     // never matches a term that sets it.
     #[serde(rename = "tcp_flags", default)]
     pub tcp_flags: Option<u8>,
+    // tcp_flags_forbidden is a forbidden-bits mask over the same TCP flags byte
+    // (#3076): a TCP packet matches the term only when (flags & forbidden) == 0.
+    // It carries the negated operands of a Junos tcp-flags expression such as
+    // `syn & !ack` (tcp_flags=SYN, tcp_flags_forbidden=ACK). None = no
+    // forbidden-flags constraint. Required (`tcp_flags`) and forbidden are
+    // independent: a term may set either, both, or neither.
+    #[serde(rename = "tcp_flags_forbidden", default)]
+    pub tcp_flags_forbidden: Option<u8>,
     // is_fragment matches any IP fragment (IPv4 MF set OR non-zero offset;
     // IPv6 fragment extension header present).
     #[serde(rename = "is_fragment", default)]

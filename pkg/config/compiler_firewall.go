@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -200,6 +201,20 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 					thenNode := termInst.node.FindChild("then")
 					if thenNode != nil {
 						compileFilterThen(thenNode, term)
+					}
+
+					// #3076: reject a tcp-flags expression the dataplane cannot
+					// enforce (disjunction, a negated group, an unknown flag, or
+					// a self-contradictory required/forbidden pair) at commit.
+					// Without this gate such an expression committed cleanly and
+					// the constraint was silently dropped on the wire — the term
+					// matched regardless of flags (fail-open). Rejecting here is
+					// fail-closed: a dropped security constraint never silently
+					// passes.
+					if len(term.TCPFlags) > 0 {
+						if _, _, _, err := ParseTCPFlagsExpression(term.TCPFlags); err != nil {
+							return fmt.Errorf("firewall filter %q term %q: %w", filter.Name, term.Name, err)
+						}
 					}
 
 					filter.Terms = append(filter.Terms, term)

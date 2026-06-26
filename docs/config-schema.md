@@ -108,6 +108,35 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+### `firewall ... from tcp-flags` — semantic validation, not just a list (#3076)
+
+`from tcp-flags` is a `multi: true` leaf, so the dual-AST contract above
+delivers its tokens uniformly (`firewallMatchValues`). But unlike a plain
+value list, the tokens form a Junos logical *expression* — `"syn & !ack"`,
+`"(syn & ack)"`, `"ack | rst"` — where `&`/`|`/`!`/`(`/`)` carry meaning.
+A quoted expression arrives as a single token string; a bracket/space list
+(`[ syn ack ]`, `"syn ack"`) is an implicit conjunction.
+
+`ParseTCPFlagsExpression` (`pkg/config/tcp_flags.go`) parses the joined tokens
+into a **required-bits** mask and a **forbidden-bits** mask over the TCP flags
+byte (`(flags & required) == required && (flags & forbidden) == 0`). The
+conjunctive AF_XDP matcher can carry one required set and one forbidden set, so
+the following are **rejected at commit** (`compileFirewall` returns an error)
+rather than silently dropped:
+
+- disjunction (`|`, e.g. `"ack | rst"`) — not a single required/forbidden pair;
+- a negated parenthesized group (`!(...)`) — a disjunction by De Morgan;
+- an unrecognized flag token;
+- a flag that is both required and forbidden (the term could never match).
+
+This is the #3076 fix: before it, the schema accepted any `tcp-flags` token
+(the leaf is `multi: true` with no value validator) and the snapshot builder's
+bare-name-only lookup silently dropped any expression it could not map — the
+filter term then matched **regardless** of TCP flags (a fail-open security
+hole). Validation is now fail-closed: an unenforceable constraint is refused at
+commit, and a representable one (including `syn & !ack`) is carried to the
+dataplane via the `tcp_flags` / `tcp_flags_forbidden` wire fields.
+
 The `system domain-search` and `system name-server` readers
 (`compileSystem`, `compiler_system.go`) are also contract-compliant via
 `firewallMatchValues`. Both are `multi:true`; before the second #2419 fold

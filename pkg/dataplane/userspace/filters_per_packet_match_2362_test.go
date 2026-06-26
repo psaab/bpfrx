@@ -69,10 +69,15 @@ func TestFilterSnapshotTCPFlagsMultipleAreAnded(t *testing.T) {
 	}
 }
 
-func TestFilterSnapshotTCPFlagsUnknownYieldsNil(t *testing.T) {
-	// The parser can store the unsupported expression form (e.g. the literal
-	// "(syn & !ack)") as a single token. It is not a recognized flag name, so
-	// the mask must stay nil (no constraint) rather than 0 (matches all).
+// TestFilterSnapshotTCPFlagsExpressionParsed is the #3076 FAIL-ON-REVERT guard
+// at the snapshot layer. The Junos idiom `tcp-flags "(syn & !ack)"` (match
+// SYN-not-ACK) arrives as a single token string. It MUST compile to a required
+// mask of SYN (0x02) and a forbidden mask of ACK (0x10). Before #3076 the
+// expression token missed the bare-name lookup, so both masks stayed nil and
+// the TCP-flags constraint was silently dropped — the term matched regardless
+// of flags (fail-open). REVERT (restoring the bare-name-only lookup) makes this
+// assert FAIL because TCPFlags / TCPFlagsForbidden go nil.
+func TestFilterSnapshotTCPFlagsExpressionParsed(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
 		"f": {Name: "f", Terms: []*config.FirewallFilterTerm{{
@@ -81,8 +86,38 @@ func TestFilterSnapshotTCPFlagsUnknownYieldsNil(t *testing.T) {
 		}}},
 	}
 	snaps := buildFirewallFilterSnapshots(cfg)
-	if got := snaps[0].Terms[0].TCPFlags; got != nil {
-		t.Errorf("unrecognized tcp-flags expression should yield nil mask, got 0x%02x", *got)
+	term := snaps[0].Terms[0]
+	if term.TCPFlags == nil {
+		t.Fatal("required tcp-flags mask was dropped for \"(syn & !ack)\" (#3076 fail-open)")
+	}
+	if *term.TCPFlags != 0x02 {
+		t.Errorf("required mask = 0x%02x, want 0x02 (SYN)", *term.TCPFlags)
+	}
+	if term.TCPFlagsForbidden == nil {
+		t.Fatal("forbidden tcp-flags mask was dropped for \"(syn & !ack)\" (#3076 fail-open)")
+	}
+	if *term.TCPFlagsForbidden != 0x10 {
+		t.Errorf("forbidden mask = 0x%02x, want 0x10 (ACK)", *term.TCPFlagsForbidden)
+	}
+}
+
+// TestFilterSnapshotTCPFlagsNegationOnly checks a pure-negation expression
+// (`!rst`) carries only the forbidden mask, leaving the required mask nil.
+func TestFilterSnapshotTCPFlagsNegationOnly(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		"f": {Name: "f", Terms: []*config.FirewallFilterTerm{{
+			Name: "t", Protocols: []string{"tcp"}, TCPFlags: []string{"!rst"},
+			Action: "discard",
+		}}},
+	}
+	snaps := buildFirewallFilterSnapshots(cfg)
+	term := snaps[0].Terms[0]
+	if term.TCPFlags != nil {
+		t.Errorf("required mask should be nil for \"!rst\", got 0x%02x", *term.TCPFlags)
+	}
+	if term.TCPFlagsForbidden == nil || *term.TCPFlagsForbidden != 0x04 {
+		t.Fatalf("forbidden mask = %v, want 0x04 (RST)", term.TCPFlagsForbidden)
 	}
 }
 
@@ -132,27 +167,5 @@ func TestFilterSnapshotICMPUnsetStaysNil(t *testing.T) {
 	}
 	if len(term.ICMPCodes) != 0 {
 		t.Errorf("unset icmp-code should be empty, got %v", term.ICMPCodes)
-	}
-}
-
-func TestTCPFlagsMaskHelper(t *testing.T) {
-	cases := []struct {
-		in   []string
-		want uint8
-		ok   bool
-	}{
-		{nil, 0, false},
-		{[]string{}, 0, false},
-		{[]string{"syn"}, 0x02, true},
-		{[]string{"SYN"}, 0x02, true},
-		{[]string{"fin", "syn", "rst", "psh", "ack", "urg"}, 0x3f, true},
-		{[]string{"bogus"}, 0, false},
-		{[]string{"syn", "bogus"}, 0x02, true},
-	}
-	for _, c := range cases {
-		got, ok := tcpFlagsMask(c.in)
-		if ok != c.ok || (ok && got != c.want) {
-			t.Errorf("tcpFlagsMask(%v) = (0x%02x, %v), want (0x%02x, %v)", c.in, got, ok, c.want, c.ok)
-		}
 	}
 }
