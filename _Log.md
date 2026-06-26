@@ -1,3 +1,41 @@
+## 2026-06-26 — #2962 HA: owner-RG export ack-wait off the ServerState lock
+
+- **Timestamp**: 2026-06-26
+- **Action**: The control-socket dispatcher held the global
+  `Mutex<ServerState>` across the ENTIRE request `match`, including
+  `export_owner_rg_sessions`, whose `afxdp/ha.rs` ack-wait blocks up to 15 s
+  for every worker to ack the export sequence. A slow/stalled worker therefore
+  froze the whole control plane (status poll, session installs, snapshot/FIB
+  bumps, HA state updates) for up to 15 s — on the failover-critical path. Fix:
+  split the export into a locked KICK phase and a lock-free WAIT phase.
+  `Coordinator::kick_owner_rg_export` (under the lock) enqueues the
+  `ExportOwnerRGSessions` command to every worker, bumps `export_seq`, and
+  snapshots the lock-free handles the wait needs — the per-worker
+  `session_export_ack` atomics (`Arc<AtomicU64>`) and per-binding delta buffers
+  (`Arc<BindingLiveState>`) — returning an `OwnerRgExportWait`. The dispatcher
+  drops the `ServerState` lock, then runs `OwnerRgExportWait::wait_and_collect`
+  (the 15 s ack-wait + delta drain) off-lock, re-deriving status afterward under
+  a fresh short-lived lock. No TOCTOU: the worker set is mutated only by other
+  lock-holding handlers, so it is stable for the lock-free window; the worker
+  threads only advance monotonic ack atomics + push deltas (both Arc-shared,
+  lock-free). 15 s deadline + timeout error preserved verbatim. The old
+  single-call `export_owner_rg_sessions` wrapper was removed (unused after the
+  split). Tests (fail-on-revert proven): server-level
+  `export_owner_rg_does_not_hold_state_lock_during_ack_wait` (RED at
+  "status poll blocked 652ms ... lock held across the ack-wait" when the wait is
+  restored under the lock) + afxdp `kick_owner_rg_export_empty_set_is_noop...`
+  and `kick_owner_rg_export_enqueues_command_then_wait_completes_on_ack`. Added
+  a `#[cfg(test)]` `Coordinator::test_install_export_worker` seam. cargo
+  build/test (ha/export/server/session_glue) green.
+  **File(s)**: userspace-dp/src/afxdp/ha.rs,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/server/handlers/mod.rs,
+  userspace-dp/src/server/handlers/export.rs,
+  userspace-dp/src/server/tests.rs,
+  docs/session-sync-architecture.md
+
 ## 2026-06-26 — #2870 VRRP AF_PACKET receiver: ALLMULTI instead of PROMISC
 
 - **Timestamp**: 2026-06-26
