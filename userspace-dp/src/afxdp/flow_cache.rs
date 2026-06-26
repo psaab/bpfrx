@@ -468,6 +468,10 @@ impl FlowCacheEntry {
                 // #2508: flow-cache seed carries no per-policy `then log`.
                 log_session_init: false,
                 log_session_close: false,
+                // #3056: the flow-cache descriptor metadata is replay state for an
+                // already-installed session (the install on the slow path stamps
+                // the real policy ID); this seed value is never published itself.
+                policy_id: 0,
             },
             stamp: FlowCacheStamp::capture(
                 validation.config_generation,

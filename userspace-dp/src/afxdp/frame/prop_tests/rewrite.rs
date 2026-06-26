@@ -201,6 +201,79 @@ fn area_with_frame(frame: &[u8]) -> MmapArea {
     area
 }
 
+// #3111 FAIL-ON-REVERT: the descriptor fast path is the LIVE corruption
+// vector — `apply_rewrite_descriptor_ipv4` writes `rewrite_src_port` at the
+// L4 offset. For a port-less protocol (GRE) the TCP|UDP gate must suppress
+// that write so the GRE flags/version bytes survive; only the source IP is
+// translated. A descriptor carrying a (buggy) port must NOT be able to
+// clobber the tunnel header. Reverting the guard writes the port over the
+// GRE flags -> RED.
+#[test]
+fn descriptor_fast_path_gre_preserves_l4_header() {
+    use crate::afxdp::UserspaceDpMeta;
+
+    // eth(14) + IPv4(20, proto GRE, total_len 28) + GRE(8).
+    let frame: Vec<u8> = vec![
+        // eth dst, eth src, ethertype 0x0800
+        0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5, 0x02, 0xbf, 0x72, 0x00, 0x80, 0x08, 0x08, 0x00,
+        // IPv4 header (proto 47 = GRE, total length 28)
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 64, 47, 0x00, 0x00, 10, 0, 1, 100, 8, 8, 8,
+        8,
+        // GRE header: flags/version, protocol-type, key
+        0x30, 0x01, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef,
+    ];
+    let area = area_with_frame(&frame);
+    let desc = XdpDesc {
+        addr: DIFF_ADDR as u64,
+        len: frame.len() as u32,
+        options: 0,
+    };
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        addr_family: AF4,
+        protocol: 47, // GRE
+        ..UserspaceDpMeta::default()
+    };
+    let rd = RewriteDescriptor {
+        dst_mac: [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+        src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+        fabric_redirect: false,
+        tx_vlan_id: 0,
+        ether_type: 0x0800,
+        rewrite_src_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 1))),
+        rewrite_dst_ip: None,
+        // A buggy allocator would hand the fast path a pseudo-port; the
+        // gate must refuse to write it for a port-less protocol.
+        rewrite_src_port: Some(0xBEEF),
+        rewrite_dst_port: None,
+        ip_csum_delta: 0,
+        l4_csum_delta: 0,
+        egress_ifindex: 12,
+        tx_ifindex: 11,
+        target_binding_index: None,
+        input_filter_log: None,
+        tx_selection: CachedTxSelectionDescriptor::default(),
+        nat64: false,
+        nptv6: false,
+        apply_nat_on_fabric: false,
+    };
+
+    let res = apply_rewrite_descriptor(&area, desc, meta, &rd, None)
+        .expect("descriptor rewrite must succeed for GRE");
+    let out = area
+        .slice(res.offset as usize, res.len as usize)
+        .expect("descriptor output slice");
+
+    // Source IP translated (eth 14 + IP src offset 12 = 26).
+    assert_eq!(&out[26..30], &[203, 0, 113, 1]);
+    // GRE flags/version (eth 14 + IP 20 = 34) PRESERVED.
+    assert_eq!(
+        &out[34..36],
+        &[0x30, 0x01],
+        "GRE header must survive the descriptor fast path"
+    );
+}
+
 proptest! {
     #![proptest_config(super::cfg(128))]
 

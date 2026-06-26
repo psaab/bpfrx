@@ -38,6 +38,21 @@ pub(crate) struct SessionMetadata {
     /// exporter (#2460), which observes every close regardless.
     pub(crate) log_session_init: bool,
     pub(crate) log_session_close: bool,
+    /// #3056: the admitting policy's ID, in the same namespace Go assigns in
+    /// `pkg/dataplane/userspace/policies.go` and pushes in the policy snapshot
+    /// (mirrored back as `PolicyEvaluationResult.policy_id`). Stamped at install
+    /// from the matched policy so the live-session BPF-compat publish
+    /// (`show security flow session` rows) and the SESSION_CREATE RT_FLOW record
+    /// reference the policy that admitted the flow instead of the `0` sentinel,
+    /// which the Go side renders as the FIRST configured policy (policyID 0) — a
+    /// wrong attribution. `0` remains the legitimate value for non-policy-
+    /// forwarded sessions (firewall-local / neighbor-seed / fabric / tunnel).
+    /// In-process only: `SessionMetadata` carries no serde, so this rides the
+    /// shared-session map and sibling-worker replicas automatically but does NOT
+    /// cross the cross-node HA `SessionDeltaInfo` wire (a deliberate follow-up —
+    /// the close-event/rows on a peer-PROMOTED session still resolve `0` until
+    /// the sync delta carries it; #1961 both-sides wire discipline).
+    pub(crate) policy_id: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

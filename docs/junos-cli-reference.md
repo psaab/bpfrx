@@ -215,6 +215,16 @@ From zone: guest, To zone: lan
 
 - **Zone header:** `From zone: <name>, To zone: <name>` (no indentation).
 - **Policy line:** 2-space indent, comma-separated: `Policy: <name>, State: enabled, Index: <N>, Scope Policy: 0, Sequence number: <N>, Log Profile ID: 0`
+  - **Scheduler state (#3062):** the `State:` field reflects runtime
+    scheduler state, not just configuration. A policy bound to a
+    scheduler (`scheduler-name <name>`) that is currently inactive renders
+    `State: inactive` — the dataplane is dropping that rule for the
+    duration of the off-window. Active and non-scheduled policies render
+    `State: enabled` (bit-identical to pre-#3062 output). The state is
+    read from the daemon-maintained per-scheduler active-state map (the
+    same map that drives enforcement), not recomputed against the wall
+    clock. When the dataplane cannot report scheduler state (offline CLI),
+    every policy renders `enabled`.
 - **Policy fields:** 4-space indent, `<Key>: <value>`.
 - **Action line:** `Action: permit` or `Action: reject, log` or `Action: deny, log`.
 - Multiple addresses shown as named address entries.
@@ -260,6 +270,14 @@ Policy: log-control4, action-type: permit, services-offload:not-configured , Sta
 
 - **Policy header:** No indent. `Policy: <name>, action-type: permit, services-offload:not-configured , State: enabled, Index: <N>, Scope Policy: 0`
   - Note: space before comma after `not-configured `.
+  - **Scheduler state (#3062):** `State:` reflects runtime scheduler
+    state. A scheduler-bound policy whose scheduler is currently inactive
+    renders `State: inactive` and an extra `  Scheduler: <name> (inactive)`
+    line below `Policy Type: Configured`. Active and non-scheduled
+    policies are bit-identical to pre-#3062 (`State: enabled`, no
+    Scheduler line). The gRPC text detail surface agrees: it appends
+    `, State: inactive, Scheduler: <name>` to the per-policy
+    `action-type:` header only for inactive scheduled policies.
 - **Policy fields:** 2-space indent.
 - **Address entries:** 4-space indent. Format: `<name>(global): <prefix> ` (trailing space).
   - `(global)` suffix for global address-book entries.

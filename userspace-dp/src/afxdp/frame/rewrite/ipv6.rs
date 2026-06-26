@@ -13,6 +13,7 @@ use super::super::v6_rel_l4_offset;
 use crate::afxdp::{
     RewriteDescriptor, UserspaceDpMeta, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP,
 };
+use crate::ip_proto::has_l4_ports;
 use std::net::IpAddr;
 
 #[inline(always)]
@@ -61,7 +62,11 @@ pub(in crate::afxdp::frame) fn apply_rewrite_descriptor_ipv6(
     }
 
     // NAT: direct byte writes for L4 ports (#963 PR-B).
-    if apply_nat {
+    //
+    // #3111: gate on TCP/UDP — a port-less protocol (GRE/ESP/AH/OSPF/...)
+    // has no port field, so writing offset +0/+2 would corrupt the L4
+    // header (ESP SPI / GRE flags). Mirrors the generic rewriter's gate.
+    if apply_nat && has_l4_ports(meta.protocol) {
         if let Some(new_sport) = rd.rewrite_src_port {
             write_l4_src_port(packet, l4, new_sport);
         }

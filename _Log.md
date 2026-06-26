@@ -1,3 +1,104 @@
+## 2026-06-25 — #3046: TCP RST sessions reaped on a short timeout (not the 30s FIN close)
+
+- **Timestamp**: 2026-06-25
+- **Action**: fixed #3046. `is_closing(flags)` lumps RST with FIN, so a
+  RST-aborted TCP session was held for the full 30s `TCP_CLOSING_TIMEOUT_NS`
+  identical to a graceful FIN close — letting a reset-flood saturate the
+  session table and delay port reuse. Added `TCP_RST_TIMEOUT_NS = 2s` and a
+  sticky `SessionEntry.reset` flag; the timeout selection now picks the short
+  RST timeout whenever the session has carried a RST, keeping 30s only for a
+  FIN-only close. The reset flag is sticky so a stray reordered non-RST
+  segment after the RST cannot promote the entry back to the 30s FIN window.
+  Updated `session_timeout_ns` (install paths), `update_session` (in-place
+  refresh), and the `lookup` read path; mirrored into the test reference +
+  `entries_equiv`. FAIL-ON-REVERT test `tcp_rst_uses_short_timeout_not_fin_timeout`
+  proves RST→2s + FIN→30s + post-RST stickiness (RED left:30e9/right:2e9 when
+  the lookup selection is reverted). Doc: `userspace-dp/src/session/README.md`
+  timeout table + #3046 RST-vs-FIN note.
+- **Timestamp**: 2026-06-25 (review fold)
+- **Action**: review MINOR fold — `update_session` selected the timeout from
+  only the CURRENT segment's `has_rst(tcp_flags)` via `session_timeout_ns`,
+  ignoring the sticky `entry.reset`. A peer-synced session already carrying
+  reset=true, promoted via `promote_synced_with_origin` with a non-RST FIN
+  trigger, wrongly reverted to the 30s FIN window. Reordered the in-place
+  update to set `reset` FIRST then compute `expires_after_ns` consulting the
+  sticky flag — now byte-identical to the lookup.rs selection. Mirrored the
+  same logic into the test `reference_update_session` so the randomized
+  in-place/reference parity sweep stays equivalent. Extended
+  `tcp_rst_uses_short_timeout_not_fin_timeout` with a FAIL-ON-REVERT
+  update_session case (reset-sticky session + non-RST FIN refresh keeps 2s;
+  RED left:30e9/right:2e9 when update_session reverts to current-flag logic).
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/tests.rs, _Log.md
+- **Validation**: `cargo build --release -p xpf-userspace-dp` clean; `cargo
+  test session::` 129 passed; both fail-on-revert legs confirmed RED then
+  GREEN.
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/lookup.rs, userspace-dp/src/session/install.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
+  _Log.md
+- **Validation**: `cargo build --release -p xpf-userspace-dp` clean (pre-existing
+  dead-code warnings only); `cargo test session::` 129 passed; fail-on-revert
+  confirmed RED then GREEN after restore.
+## 2026-06-25 — #3111: pool-mode SNAT corrupts port-less protocols (GRE/ESP/AH/OSPF)
+
+- **Timestamp**: 2026-06-25
+- **Action**: Gate pool-mode source-NAT port allocation AND every L4
+  port-write site on the new `crate::ip_proto::has_l4_ports` predicate
+  (TCP/UDP only). Pool-mode SNAT used to special-case only `protocol == 0`
+  as tupleless, so GRE (47) / ESP (50) / AH (51) / OSPF (89) fell through to
+  `allocate_translation`, which returned a pseudo-port that the descriptor
+  fast-path rewriter (`rewrite/ipv4.rs`/`ipv6.rs`) wrote over the first two
+  L4 bytes — corrupting GRE flags / ESP SPI and breaking the tunnel, plus
+  leaking a pool port per flow. Fix: port-less protocols get IP-only
+  translation (no `try_next_port`, `rewrite_src_port` unset); the descriptor
+  arms now mirror the generic `apply_nat_port_rewrite` TCP|UDP gate as
+  defense-in-depth; `protocol == 0` keeps its synthetic round-robin
+  behavior (never frame-written). Added GRE/ESP fail-on-revert tests at the
+  decision level (`pool_snat_portless_protocols_translate_ip_only_no_port`),
+  the generic rewriter (`apply_nat_ipv4_gre_preserves_l4_header`,
+  `apply_nat_ipv4_esp_preserves_spi`), and the descriptor fast path
+  (`descriptor_fast_path_gre_preserves_l4_header`); repurposed
+  `pool_snat_single_address_rewrites_src_and_port` to the TCP tuple path.
+- **File(s)**: userspace-dp/src/ip_proto.rs, userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/tests.rs, userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/frame/rewrite/ipv4.rs,
+  userspace-dp/src/afxdp/frame/rewrite/ipv6.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/rewrite.rs,
+  userspace-dp/src/afxdp/frame/README.md
+- **Validation**: `cargo build --release -p xpf-userspace-dp` clean; `cargo
+  test --release nat` 480 passed; new GRE/ESP byte + no-port tests GREEN,
+  confirmed RED when each gate is reverted (allocation gate + descriptor
+  rewrite guard).
+## 2026-06-26 — #3056: store the admitting policy ID on the session
+
+- **Timestamp**: 2026-06-26
+- **Action**: Carry the admitting policy's ID on `SessionMetadata.policy_id`
+  (in-memory, stamped at admit) and consume it in the live-session BPF-compat
+  rows, the RT_FLOW SESSION_CREATE frame ([44:48]), and the RT_FLOW
+  SESSION_CLOSE frame. The close frame uses the trailing [136:140] slot because
+  #2853 repurposed [44:48] on a close for the created-subsec-nanos; the RT_FLOW
+  event payload grew 136 -> 144 bytes (Rust `SECURITY_EVENT_PAYLOAD_SIZE`,
+  `pkg/dataplane.Event`, `pkg/logging` `rawEventWireSize`). The Go decoder
+  reads [136:140] back as PolicyID only on a close (length-guarded). Before
+  this, policy-admitted sessions published policy 0, which the Go side renders
+  as the first configured policy — a wrong attribution. Decision: in-process
+  only, NOT on the cross-node HA sync wire (a peer-promoted session still
+  resolves 0 until a follow-up adds the wire field, mirroring #2785).
+- **File(s)**: userspace-dp/src/session/entry.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/bpf_map/publish_conntrack.rs,
+  userspace-dp/src/afxdp/{shared_ops,flow_cache,neighbor_dispatch,tunnel}.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs, userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/event_stream/{codec,mod}.rs,
+  userspace-dp/src/session/README.md, userspace-dp/src/event_stream/README.md,
+  pkg/dataplane/types.go, pkg/logging/ringbuf.go, pkg/logging/binary_test.go,
+  pkg/dataplane/userspace/protocol.go, + Rust/Go fail-on-revert tests.
+- **Validation**: cargo build --release -p xpf-userspace-dp (0 errors);
+  cargo test --release (3045 passed); go test ./pkg/dataplane/... ./pkg/logging/...
+  (960 passed); gofmt clean. Fail-on-revert proven RED->GREEN both sides
+  (Rust close encoder [136:140]->0; Go close decoder PolicyID->0).
+
 ## 2026-06-26 — #3071: zone tcp-rst wired into userspace deny enforcement
 
 - **Timestamp**: 2026-06-26
@@ -904,6 +1005,7 @@
   → 256, over-broad /8 → invalid). Updated `userspace-dp/README.md`.
 - **File(s)**: userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests.rs,
   userspace-dp/README.md, _Log.md
+
 ## 2026-06-25 — #3059: gRPC hit-count text includes global policies
 
 - **Timestamp**: 2026-06-25
@@ -19713,3 +19815,19 @@ top.
   pkg/logging/ringbuf.go, pkg/logging/binary_test.go,
   pkg/flowexport/manager.go, pkg/flowexport/flowstart_test.go,
   pkg/flowexport/README.md, _Log.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3062 — policy-detail show surfaces reflect runtime
+  scheduler state. Added SSOT predicate `PolicyInactive` +
+  `Manager.PolicySchedulerActiveState()` /
+  `LegacyDataPlaneAdapter.PolicySchedulerActiveState()` exports; CLI and
+  gRPC detail surfaces now render `State: inactive` (+ scheduler name)
+  for scheduler-inactive policies, bit-identical for active/non-scheduled.
+  **File(s)**: pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/cli/cli_show_policies_scheduler_3062_test.go,
+  pkg/grpcapi/server_show_policies_text.go,
+  pkg/grpcapi/server_show_policies_scheduler_3062_test.go,
+  docs/junos-cli-reference.md, _Log.md

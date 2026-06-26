@@ -67,6 +67,7 @@ fn metadata() -> SessionMetadata {
         nat64_reverse: None,
         log_session_init: false,
         log_session_close: false,
+        policy_id: 0,
     }
 }
 
@@ -812,6 +813,99 @@ fn tcp_fin_keeps_session_until_closing_timeout() {
     assert_eq!(deltas.len(), 1);
     assert_eq!(deltas[0].kind, SessionDeltaKind::Close);
     assert_eq!(deltas[0].key, key);
+}
+
+#[test]
+fn tcp_rst_uses_short_timeout_not_fin_timeout() {
+    // #3046 FAIL-ON-REVERT: a RST'd TCP session must be reaped on the short
+    // TCP_RST_TIMEOUT_NS, while a FIN-only graceful close keeps the 30s
+    // TCP_CLOSING_TIMEOUT_NS. If the RST timeout selection reverts to the FIN
+    // closing timeout (the #3046 bug — is_closing lumps RST with FIN at 30s)
+    // the first expires_after_ns assert below RED-fails.
+    assert!(
+        TCP_RST_TIMEOUT_NS < TCP_CLOSING_TIMEOUT_NS,
+        "RST timeout must be strictly shorter than the FIN close timeout"
+    );
+    let now = 1_000_000_000u64;
+
+    // --- RST path: short timeout ---
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        metadata(),
+        now,
+        PROTO_TCP,
+        0x10
+    ));
+    let _ = table.drain_deltas(8);
+    assert!(table.lookup(&key, now + 1_000_000, TCP_RST).is_some());
+    let rst_entry = table.entry_by_key(&key).expect("rst entry");
+    assert!(rst_entry.closing, "RST must mark the session closing");
+    assert!(rst_entry.reset, "RST must set the sticky reset flag");
+    assert_eq!(
+        rst_entry.expires_after_ns, TCP_RST_TIMEOUT_NS,
+        "RST'd session must use the short RST timeout, not the 30s FIN close timeout"
+    );
+
+    // --- FIN path (control): full 30s close timeout, no reset ---
+    let mut table2 = SessionTable::new();
+    let key2 = key_v4();
+    assert!(table2.install_with_protocol(
+        key2.clone(),
+        decision(),
+        metadata(),
+        now,
+        PROTO_TCP,
+        0x10
+    ));
+    let _ = table2.drain_deltas(8);
+    assert!(table2.lookup(&key2, now + 1_000_000, TCP_FIN).is_some());
+    let fin_entry = table2.entry_by_key(&key2).expect("fin entry");
+    assert!(fin_entry.closing, "FIN must mark the session closing");
+    assert!(!fin_entry.reset, "FIN-only close must NOT set the reset flag");
+    assert_eq!(
+        fin_entry.expires_after_ns, TCP_CLOSING_TIMEOUT_NS,
+        "FIN-only close must keep the 30s graceful close timeout"
+    );
+
+    // --- stickiness: a reordered non-RST segment after the RST must NOT
+    //     promote the entry back to the 30s FIN close window ---
+    assert!(table.lookup(&key, now + 2_000_000, 0x10).is_some());
+    let post_ack = table.entry_by_key(&key).expect("rst entry post-ack");
+    assert_eq!(
+        post_ack.expires_after_ns, TCP_RST_TIMEOUT_NS,
+        "a stray non-RST segment after a RST must not revert to the 30s FIN timeout"
+    );
+
+    // --- update_session sticky-reset (#3046 MINOR FAIL-ON-REVERT): a session
+    //     that already carries reset=true, refreshed via update_session with a
+    //     non-RST FIN trigger (the promote_synced_with_origin production reach),
+    //     must KEEP the short 2s RST timeout. RED if update_session selects the
+    //     timeout from only the current segment's flags
+    //     (session_timeout_ns(FIN) == 30s) instead of consulting the sticky
+    //     entry.reset — exactly mirroring the lookup.rs path.
+    let fin_req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: now + 3_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FIN,
+    };
+    assert!(table.update_session(fin_req, false));
+    let after_update = table.entry_by_key(&key).expect("entry after update_session");
+    assert!(
+        after_update.reset,
+        "reset must stay sticky across an update_session refresh"
+    );
+    assert!(after_update.closing, "FIN keeps the session closing");
+    assert_eq!(
+        after_update.expires_after_ns, TCP_RST_TIMEOUT_NS,
+        "update_session must consult the sticky reset flag: a non-RST FIN refresh of a RST'd session keeps the 2s timeout, not 30s"
+    );
 }
 
 #[test]
@@ -1877,8 +1971,20 @@ fn reference_update_session(
     entry.origin = origin;
     entry.install_epoch = table.next_epoch();
     entry.last_seen_ns = now_ns;
-    entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &table.timeouts);
+    // #3046: mirror update_session exactly — set the sticky reset flag FIRST,
+    // then select the timeout consulting it (RST→short, FIN→30s), so the
+    // in-place/reference parity sweeps stay byte-equivalent.
+    entry.reset |= matches!(protocol, PROTO_TCP) && (tcp_flags & TCP_RST) != 0;
     entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
+    entry.expires_after_ns = if entry.closing {
+        if entry.reset {
+            TCP_RST_TIMEOUT_NS
+        } else {
+            TCP_CLOSING_TIMEOUT_NS
+        }
+    } else {
+        session_timeout_ns(protocol, tcp_flags, &table.timeouts)
+    };
     let created_ns = entry.created_ns;
     table.restore_entry(key.clone(), entry);
     table.push_to_wheel(key, now_ns);
@@ -1908,6 +2014,7 @@ fn entries_equiv(a: &SessionTable, b: &SessionTable, key: &SessionKey) -> bool {
                 && ea.last_seen_ns == eb.last_seen_ns
                 && ea.expires_after_ns == eb.expires_after_ns
                 && ea.closing == eb.closing
+                && ea.reset == eb.reset
                 && ea.wheel_tick == eb.wheel_tick
         }
         (None, None) => true,

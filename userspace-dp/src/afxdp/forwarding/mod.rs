@@ -495,6 +495,9 @@ pub(super) fn cluster_peer_return_fast_path(
         // `then log` selection (the admitting node logs).
         log_session_init: false,
         log_session_close: false,
+        // #3056: the fabric-return reverse seed is created on the peer-forwarding
+        // node, which never ran the admitting policy — leave the policy ID unset.
+        policy_id: 0,
     };
     Some((
         SessionDecision {

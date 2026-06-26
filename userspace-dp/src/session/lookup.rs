@@ -85,10 +85,18 @@ impl SessionTable {
                     );
                 }
                 entry.closing = true;
+                // #3046: a RST close is reaped on the short timeout. The flag
+                // is sticky so a later reordered non-RST segment cannot promote
+                // the entry back to the 30s graceful-FIN close window.
+                entry.reset |= has_rst(tcp_flags);
             }
             entry.last_seen_ns = now_ns;
             entry.expires_after_ns = if matches!(key.protocol, PROTO_TCP) && entry.closing {
-                TCP_CLOSING_TIMEOUT_NS
+                if entry.reset {
+                    TCP_RST_TIMEOUT_NS
+                } else {
+                    TCP_CLOSING_TIMEOUT_NS
+                }
             } else {
                 session_timeout_ns(key.protocol, tcp_flags, &timeouts)
             };

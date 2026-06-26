@@ -199,6 +199,18 @@ func (a *LegacyDataPlaneAdapter) SetPolicySchedulerActiveState(activeState map[s
 	m.SetPolicySchedulerActiveState(activeState)
 }
 
+// PolicySchedulerActiveState surfaces the manager's daemon-maintained
+// scheduler active-state map to the read-only show surfaces (#3062).
+// Returns nil when no manager is attached so the CLI/gRPC detail views
+// fall back to rendering every policy enabled (bit-identical to today).
+func (a *LegacyDataPlaneAdapter) PolicySchedulerActiveState() map[string]bool {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return nil
+	}
+	return m.PolicySchedulerActiveState()
+}
+
 // SetRouteOverlay forwards the ip-monitoring overlay cache (#1827).
 func (a *LegacyDataPlaneAdapter) SetRouteOverlay(overlay []config.RouteOverlayEntry) {
 	m, err := a.managerOrErr()
