@@ -1,3 +1,36 @@
+## 2026-06-26 — #2845 WG PTB inner-MTU per-peer underlay
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fix the WireGuard Packet-Too-Big inner-MTU computation, which
+  assumed one underlay MTU per wg interface (resolved via the FIRST peer with
+  an endpoint). The encap path LPM-selects the peer by inner destination
+  (`engine.peer_for_dest`) and computes the outer hop / MTU guard from THAT
+  peer's endpoint, but the PTB path ran before peer selection — so a PTB for
+  traffic to peer B could quote peer A's underlay MTU (over-advertise → next
+  packet dropped by peer B's encap guard; or under-advertise → throughput
+  loss). Fix: the TX dispatcher now derives the pre-encap inner destination
+  and threads it into `post_transform_inner_mtu` →
+  `frame::wg_endpoint_physical_outer_mtu`, which selects the SAME peer the
+  encap path will (`engine.peer_for_dest` on the inner destination) and
+  resolves the physical underlay MTU via THAT peer's endpoint route. Falls
+  back to the pre-#2845 first-peer behaviour (byte-identical single-underlay)
+  when the inner destination is unavailable / no live engine / no covering
+  peer; a covering peer with no endpoint uses the conservative logical
+  fallback rather than borrowing a different peer's underlay.
+- **File(s)**: `userspace-dp/src/afxdp/frame/wg.rs` (new `wg_peer_outer_dst`
+  helper + `wg_endpoint_physical_outer_mtu` gains an `inner_dst` param),
+  `userspace-dp/src/afxdp/icmp_ptb.rs` (`post_transform_inner_mtu` threads
+  `inner_dst` to the WG arm), `userspace-dp/src/afxdp/tx/dispatch/mod.rs`
+  (derive inner dst from `source_frame` + pass it),
+  `userspace-dp/src/afxdp/icmp_ptb_tests.rs` (new
+  `post_transform_wg_inner_mtu_is_per_peer_underlay` two-peer asymmetric
+  fixture + existing calls updated), `userspace-dp/src/afxdp/README.md`,
+  `docs/wireguard-interop.md`.
+- **Validation**: `cargo build --release` clean; new per-peer test green;
+  fail-on-revert proven (restore first-peer assumption → the per-peer test
+  goes RED on peer B while the three single-underlay #2684 tests stay GREEN).
+  Full `cargo test --release --bin xpf-userspace-dp` = 3089 passed / 0 failed.
+
 ## 2026-06-26 — #3200 host-inbound unknown/typo token: commit validation + both-layer fail-closed
 
 - **Timestamp**: 2026-06-26

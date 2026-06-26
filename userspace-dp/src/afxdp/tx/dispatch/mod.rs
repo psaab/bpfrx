@@ -519,6 +519,21 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                 // `GRE_ENCAP_DF_OVERSIZE_DROPS` / `encap_mtu_drops`.
                 {
                     let egress_mtu = forwarded_egress_mtu(&request.decision, forwarding);
+                    // #2845: derive the inner destination so the WG PTB picks
+                    // the SAME peer (and thus the SAME underlay MTU) the encap
+                    // path will. `source_frame` IS the pre-encap inner packet
+                    // and `request.meta.addr_family` its family. Only the WG arm
+                    // of `post_transform_inner_mtu` consumes this; cheap enough
+                    // to always derive.
+                    let inner_dst = frame_l3_offset(source_frame)
+                        .or_else(|| match request.meta.l3_offset {
+                            14 | 18 => Some(request.meta.l3_offset as usize),
+                            _ => None,
+                        })
+                        .and_then(|l3| source_frame.get(l3..))
+                        .and_then(|pkt| {
+                            crate::afxdp::gre::inner_dst_ip(pkt, request.meta.addr_family)
+                        });
                     let mtu = if is_nat64 || uses_native_tunnel {
                         post_transform_inner_mtu(
                             &request.decision,
@@ -526,6 +541,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             is_nat64,
                             request.meta.addr_family,
                             egress_mtu,
+                            inner_dst,
                         )
                     } else {
                         egress_mtu
