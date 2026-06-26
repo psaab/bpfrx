@@ -1012,6 +1012,7 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
                 host_inbound_configured: true,
                 host_inbound_system_services: vec!["ping".into(), "gre".into()],
                 host_inbound_protocols: vec!["router-discovery".into()],
+                ..Default::default()
             },
             // lan: ssh + ping only.
             ZoneSnapshot {
@@ -1020,6 +1021,7 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
                 host_inbound_configured: true,
                 host_inbound_system_services: vec!["ssh".into(), "ping".into()],
                 host_inbound_protocols: vec![],
+                ..Default::default()
             },
             // control: all — fully open (heartbeat zone).
             ZoneSnapshot {
@@ -1028,6 +1030,7 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
                 host_inbound_configured: true,
                 host_inbound_system_services: vec!["all".into()],
                 host_inbound_protocols: vec![],
+                ..Default::default()
             },
             // legacy: no host-inbound stanza → admit-all preserved.
             ZoneSnapshot {

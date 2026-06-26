@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -266,12 +265,20 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 		case "destination-port":
 			if i+1 < len(args) {
 				i++
-				dstPort, _ = strconv.Atoi(args[i])
+				p, err := policymatch.ParsePort(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid destination-port: %w", err)
+				}
+				dstPort = p
 			}
 		case "source-port":
 			if i+1 < len(args) {
 				i++
-				srcPort, _ = strconv.Atoi(args[i])
+				p, err := policymatch.ParsePort(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid source-port: %w", err)
+				}
+				srcPort = p
 			}
 		case "protocol":
 			if i+1 < len(args) {
@@ -296,6 +303,15 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 	}
 	if dstIP != "" && net.ParseIP(dstIP) == nil {
 		return fmt.Errorf("invalid destination-ip %q", dstIP)
+	}
+
+	// #3108: a non-empty but unknown/out-of-range protocol token ("tcpp",
+	// "999") must not silently become "any protocol" — matchApp short-circuits
+	// to match-any for an unresolvable protocol, yielding a misleading verdict
+	// for a policy using `application any`. An empty value still means
+	// "unspecified" (match any protocol).
+	if err := policymatch.ValidateProtocol(proto); err != nil {
+		return err
 	}
 
 	parsedSrc := net.ParseIP(srcIP)

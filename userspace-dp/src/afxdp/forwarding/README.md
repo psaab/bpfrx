@@ -45,6 +45,19 @@ Route metadata crosses the Go→Rust snapshot boundary as `RouteSnapshot`
   egress inference at build time, `infer_connected_route_target_*`,
   stays global — that resolves "which interface reaches this gateway IP",
   not a destination egress.)
+  - **Local-delivery (to-self) attribution is table-scoped too (#3151).**
+    The `lookup_forwarding_resolution_inner_ecmp` shortcut for a
+    destination in `local_v[46]` resolves `local_ifindex` /
+    `egress_ifindex` / `tx_ifindex` by scanning `connected_v[46]`. That
+    scan applies the SAME `entry.table == table` filter as the route path
+    (canonicalizing the ingress table FIRST, before the local-address
+    check). Without it, when the same local IP is configured in more than
+    one routing-instance, a to-self packet in VRF A could attribute its
+    local/egress/tx ifindex to VRF B's interface — mis-feeding
+    zone/security-policy selection and HA RG ownership
+    (`owner_rg_for_flow(egress_ifindex)`). The default routing-instance
+    (`inet.0`/`inet6.0`) case still matches default-table connected
+    routes.
 - **ECMP: all next-hops retained, dead ones skipped (#2389), per-FLOW
   spread (#2734).** A static route keeps EVERY configured next-hop
   (`RouteEntryV4::next_hops: Vec<RouteNextHopV4>`). `select_route_next_hop`

@@ -5,10 +5,106 @@ Single operator-side security-policy simulator shared by every
 
 - REST `GET /api/v1/security/match` (`pkg/api` `matchPoliciesHandler`)
 - gRPC `MatchPolicies` (`pkg/grpcapi`)
+- gRPC `ShowText` `test-policy:` topic (`pkg/grpcapi` `showTestPolicy`) — the
+  backing handler for the operational `test policy` CLI command
 - CLI `show security match-policies` and `test policy` (`pkg/cli`)
 
 Each surface is a THIN adapter: it parses/validates inputs and renders the
 verdict, then delegates the matching to `policymatch.Match`.
+
+## Port input validation (#3116)
+
+`Match` gates a port term on `SrcPort/DstPort > 0`, so a port of `0` means
+"unspecified" (no port constraint — the wildcard). That makes a malformed,
+negative, or out-of-range port DANGEROUS at the adapter boundary: if it
+silently coerces to `0` it becomes "match any port" and the simulator returns a
+verdict for a packet that cannot exist on the wire (false confidence during
+policy verification / incident response). Two shared validators close this
+across every surface:
+
+- `ValidatePort(int) error` — for the already-parsed numeric inputs (the gRPC
+  `int32` field, and the REST query int after `queryIntStrict`). Accepts `0`
+  (unspecified) and `1..65535`; rejects negative or `>65535`.
+- `ParsePort(string) (int, error)` — for operator string tokens (the CLI
+  `destination-port`/`source-port` args, the gRPC `ShowText` `test-policy:`
+  `port=` token, and the remote `cli` client's `destination-port`). An
+  empty/whitespace token is unspecified `(0, nil)`; a non-empty token must parse
+  and pass `ValidatePort`; a malformed (`abc`), negative, or out-of-range token
+  is rejected. An explicit `0` is accepted as "unspecified" for parity with the
+  gRPC `int32` field, where proto3 cannot distinguish an unset scalar from `0`.
+
+This is applied at ALL FOUR simulator surfaces (matching the thin-adapter list
+above), so "all surfaces validate the port" is literally true:
+
+- REST `matchPoliciesHandler` — `queryIntStrict` (malformed/negative) +
+  `ValidatePort` (range) → HTTP 400;
+- gRPC `MatchPolicies` — `ValidatePort` on the `int32` source/dest port →
+  `InvalidArgument`;
+- gRPC `ShowText` `test-policy:` (`showTestPolicy`) — `ParsePort` on the `port=`
+  token → an "invalid port" diagnostic in the handler output (the same way a bad
+  src/dst IP is reported);
+- CLI `test policy` + `show security match-policies` (local `pkg/cli`) AND the
+  remote `cli` client (`cmd/cli`) — `ParsePort` → a command error.
+
+A VALID port (`1..65535`) and an ABSENT port behave exactly as before; only an
+explicitly-invalid port newly errors. Coverage: `port_test.go` (helpers),
+`pkg/api/rest_filter_failclosed_test.go`, `pkg/grpcapi/server_cluster_test.go`
+(`MatchPolicies` + `ShowText` `test-policy:`), `pkg/cli/policymatch_port_test.go`,
+and `cmd/cli/testpolicy_port_test.go`.
+
+## Protocol input validation (#3108)
+
+`matchApp` short-circuits to "match any application" before the query protocol
+is resolved (`len(apps)==0` or an empty `proto`, and a policy term of
+`application any` returns true immediately). That makes an unvalidated protocol
+token DANGEROUS at the adapter boundary in exactly the way an unvalidated port
+is: a non-empty but unresolvable protocol (an operator typo like `tcpp`, an
+unknown name, or an out-of-range number like `999`) is never rejected by the
+matcher — it simply fails to constrain anything and the simulator returns a
+permit/deny verdict, masking the typo. One shared validator closes this:
+
+- `ValidateProtocol(string) error` — an empty/whitespace token is "unspecified"
+  (no protocol constraint — the wildcard, unchanged); a non-empty token must
+  resolve via `appid.ProtocolNumber` (a known name/alias `tcp`/`udp`/`icmp`/
+  `ospf`/... or a numeric `0..255`); an unknown name or out-of-range/non-numeric
+  value is rejected. There is no `any` protocol keyword — omit the token for the
+  wildcard (the runtime constrains the protocol dimension only when a resolvable
+  protocol is supplied). A single string validator suffices for every surface,
+  since each accepts the protocol as a string `matchApp` resolves identically by
+  name or number (unlike ports, which arrive both as a numeric gRPC field and as
+  operator strings).
+
+This is applied at ALL FOUR simulator surfaces (mirroring the #3116 port wiring):
+
+- REST `matchPoliciesHandler` — `ValidateProtocol(protocol)` → HTTP 400;
+- gRPC `MatchPolicies` — `ValidateProtocol(req.Protocol)` → `InvalidArgument`;
+- gRPC `ShowText` `test-policy:` (`showTestPolicy`) — `ValidateProtocol` on the
+  `proto=` token → an "invalid protocol" diagnostic in the handler output (the
+  same way a bad port/src/dst is reported);
+- CLI `test policy` + `show security match-policies` (local `pkg/cli`) AND the
+  remote `cli` client (`cmd/cli`) — `ValidateProtocol` → a command error.
+
+A VALID protocol (name or `0..255`) and an ABSENT protocol behave exactly as
+before; only an explicitly-invalid protocol newly errors. Coverage:
+`protocol_test.go` (helper), `pkg/api/rest_filter_failclosed_test.go`,
+`pkg/grpcapi/server_proto_validation_test.go` (`MatchPolicies` + `ShowText`
+`test-policy:`), `pkg/cli/policymatch_protocol_test.go`, and
+`cmd/cli/testpolicy_protocol_test.go`.
+
+## The surface #3042 missed (#3103)
+
+The original #3042 consolidation routed the REST/gRPC `MatchPolicies` and CLI
+`match-policies`/`test policy` paths through this package but left the gRPC
+`ShowText` `test-policy:` handler (`grpcapi.showTestPolicy`) on its own pre-#3042
+bespoke matcher (`matchShowPolicyAddr`/`matchShowPolicyApp`). That handler is
+what the remote `cli` binary's `test policy` command actually drives, so a remote
+operator could still be told `Default deny` while the dataplane permits under
+`default-policy permit-all`, or miss a predefined-app / global / literal-CIDR /
+feed-backed match. #3103 made `showTestPolicy` a thin adapter too (passing the
+daemon's live feed overlay via `Server.feedOverlayFn`, mirroring `MatchPolicies`)
+and deleted the bespoke helpers. Its rendered output format is unchanged except
+the formerly hard-coded `Default deny` line now reflects the configured
+default-policy (`Default permit`/`Default deny`/`Default reject`).
 
 ## Why this exists (#3042)
 

@@ -178,7 +178,7 @@ func (c *CLI) testPolicy(args []string) error {
 	}
 
 	var fromZone, toZone, srcIP, dstIP, proto string
-	var dstPort int
+	var srcPort, dstPort int
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "from-zone":
@@ -201,10 +201,29 @@ func (c *CLI) testPolicy(args []string) error {
 				i++
 				dstIP = args[i]
 			}
+		case "source-port":
+			if i+1 < len(args) {
+				i++
+				// #3107: the shared matcher supports a source-port term
+				// (policymatch.Query.SrcPort), but the CLI previously had no
+				// way to express it, so a source-port-constrained application
+				// was overmatched. Parse via the shared validator (#3116) so a
+				// malformed/out-of-range value errors instead of silently
+				// coercing to the 0 "any port" wildcard.
+				p, err := policymatch.ParsePort(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid source-port: %w", err)
+				}
+				srcPort = p
+			}
 		case "destination-port":
 			if i+1 < len(args) {
 				i++
-				dstPort, _ = strconv.Atoi(args[i])
+				p, err := policymatch.ParsePort(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid destination-port: %w", err)
+				}
+				dstPort = p
 			}
 		case "protocol":
 			if i+1 < len(args) {
@@ -216,7 +235,7 @@ func (c *CLI) testPolicy(args []string) error {
 
 	if fromZone == "" || toZone == "" {
 		fmt.Println("usage: test policy from-zone <zone> to-zone <zone>")
-		fmt.Println("       source-ip <ip> destination-ip <ip> destination-port <port> protocol <tcp|udp>")
+		fmt.Println("       source-ip <ip> destination-ip <ip> source-port <port> destination-port <port> protocol <tcp|udp>")
 		return nil
 	}
 
@@ -229,6 +248,14 @@ func (c *CLI) testPolicy(args []string) error {
 	}
 	if dstIP != "" && net.ParseIP(dstIP) == nil {
 		return fmt.Errorf("invalid destination-ip %q", dstIP)
+	}
+
+	// #3108: reject a non-empty but unknown/out-of-range protocol token
+	// ("tcpp", "999") instead of letting matchApp short-circuit it to the
+	// "any protocol" wildcard, which would yield a misleading verdict for a
+	// policy using `application any`. An empty value still means "unspecified".
+	if err := policymatch.ValidateProtocol(proto); err != nil {
+		return err
 	}
 
 	parsedSrc := net.ParseIP(srcIP)
@@ -245,6 +272,7 @@ func (c *CLI) testPolicy(args []string) error {
 		SrcIP:    parsedSrc,
 		DstIP:    parsedDst,
 		Protocol: proto,
+		SrcPort:  srcPort,
 		DstPort:  dstPort,
 	})
 	if !res.Matched {

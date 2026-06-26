@@ -19,11 +19,16 @@ periodic ACK from the daemon.
   (#2460) `MSG_SESSION_CLOSE_RT_FLOW` (14), and (#2508)
   `MSG_SESSION_CREATE_RT_FLOW` (15).
   The telemetry frame payload is not a userspace-specific schema: it is
-  the same 136-byte `dataplane.Event` layout consumed by the Go ringbuf
-  logger, including AF values 2/10 and big-endian L4 ports. Userspace
-  telemetry may also populate the non-session metadata slots used by
-  the Go adapter for action, rule ID, term ID, reason, owner RG,
-  ingress ifindex, and application ID.
+  the same `dataplane.Event` layout consumed by the Go ringbuf logger,
+  including AF values 2/10 and big-endian L4 ports. The payload is 144
+  bytes (#3056 grew it from 136): the trailing [136:140] u32 carries the
+  admitting policy ID on the SESSION_CLOSE frame, whose [44:48] policy_id
+  slot is occupied by the #2853 created-subsec-nanos and so cannot hold
+  the policy ID the way every other frame does; [140:144] is reserved
+  padding (keeps the Go mirror 8-byte aligned). Userspace telemetry may
+  also populate the non-session metadata slots used by the Go adapter for
+  action, rule ID, term ID, reason, owner RG, ingress ifindex, and
+  application ID.
   (#2470) the `MSG_POLICY_DENY` / `MSG_SCREEN_DROP` (incl. the #2234
   scan-table-pressure ALARM) / `MSG_FILTER_LOG` emitters
   (`afxdp/event_emit.rs`) stamp `timestamp_ns` (offset 0, absolute Unix
@@ -59,8 +64,9 @@ periodic ACK from the daemon.
   `emit_screen_alarm_event`) deliberately keep 0: the screen parse-error
   fail-closed path (#2146) and the L4-less screen drops legitimately lack a
   resolvable 5-tuple, so fabricating an AppID there would be wrong.
-  `MSG_SESSION_CLOSE_RT_FLOW` (14) carries that same 136-byte payload
-  with the event-type byte set to RT_FLOW SESSION_CLOSE (2). It is
+  `MSG_SESSION_CLOSE_RT_FLOW` (14) carries that same 144-byte payload
+  with the event-type byte set to RT_FLOW SESSION_CLOSE (2), plus the
+  #3056 admitting policy ID in the trailing [136:140] slot. It is
   emitted once per session close (via `emit_session_close_rt_flow`,
   paired 1:1 with — and ADDITIVE to — the unchanged minimal type-2
   `MSG_SESSION_CLOSE` HA session-sync delta), and is what drives the Go
@@ -117,8 +123,10 @@ periodic ACK from the daemon.
   flowexport consumer of session opens, so `MSG_SESSION_CREATE_RT_FLOW`
   (15) is producer-gated: it is emitted (via `emit_session_create_rt_flow`)
   ONLY when the admitting policy requested `then log session-init`, carries
-  the same 136-byte payload with the event-type byte set to SESSION_OPEN
-  (1, rendered as RT_FLOW_SESSION_CREATE on the Go side), and always sets
+  the same 144-byte payload with the event-type byte set to SESSION_OPEN
+  (1, rendered as RT_FLOW_SESSION_CREATE on the Go side). The SESSION_CREATE
+  frame carries the #3056 admitting policy ID in the usual [44:48] slot (it
+  has no created-subsec-nanos), and always sets
   the gate byte. (#2615) the create frame now also threads the resolved
   application id (offset 132) and the admitting binding's ingress ifindex
   (offset 128), mirroring the close-side #2520/#2615 fix — so a logged

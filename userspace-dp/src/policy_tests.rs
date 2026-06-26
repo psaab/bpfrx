@@ -1125,6 +1125,88 @@ fn global_policy_evaluated_after_zone_specific() {
     );
 }
 
+/// #3110: a flow whose ingress OR egress zone is the reserved
+/// "unknown / no zone" sentinel (id 0 — an interface not bound to any
+/// security zone, or the over-cap-zone collapse-to-0 path) must NOT be
+/// eligible for `junos-global` policies. A configured permit-global
+/// otherwise leaks transit on an unzoned ingress/egress interface. The
+/// unknown-zone flow must fall through to the default action (deny).
+/// Reverting the `from_id != 0 && to_id != 0` guard makes these RED.
+#[test]
+fn unknown_ingress_zone_does_not_match_permit_global() {
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            name: "global-allow".to_string(),
+            from_zone: "junos-global".to_string(),
+            to_zone: "junos-global".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    // Unknown (0) ingress zone, valid egress zone -> default deny.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            0,
+            TEST_WAN_ZONE_ID,
+            "10.0.0.1".parse().expect("src"),
+            "8.8.8.8".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            80,
+        ),
+        PolicyAction::Deny
+    );
+    // Valid ingress zone, unknown (0) egress zone -> default deny.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_TRUST_ZONE_ID,
+            0,
+            "10.0.0.1".parse().expect("src"),
+            "8.8.8.8".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            80,
+        ),
+        PolicyAction::Deny
+    );
+    // Both unknown (0) -> default deny.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            0,
+            0,
+            "10.0.0.1".parse().expect("src"),
+            "8.8.8.8".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            80,
+        ),
+        PolicyAction::Deny
+    );
+    // Sanity: both zones valid still hits the permit-global as before.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_TRUST_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "10.0.0.1".parse().expect("src"),
+            "8.8.8.8".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            80,
+        ),
+        PolicyAction::Permit
+    );
+}
+
 /// #919/#922: snapshot rules whose zone names are absent from
 /// `zone_name_to_id` are dropped by `parse_policy_state` (logged
 /// and not indexed). A real `LAN→WAN` lookup therefore finds

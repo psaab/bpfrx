@@ -122,13 +122,27 @@ func newHTTPClientBound(b bindConfig) *http.Client {
 // URL — those live on the backend object and are applied per-request — so it is
 // safe to share. The cache invalidates implicitly: when an operator changes a
 // binding leaf on commit the next reconcile resolves a NEW key and builds (and
-// caches) a fresh bound transport; the stale entry is simply no longer looked
-// up. Cardinality is bounded by the number of distinct configured bindings, so
-// the map does not grow without bound.
+// caches) a fresh bound transport.
+//
+// Reap on supersede (#2956): a binding-leaf change keys a FRESH entry, so the
+// OLD entry is never looked up again — but it is not self-evicting. The
+// SurfaceAManager lives for the whole daemon lifetime, so distinct historical
+// binding tuples would otherwise accumulate forever (their *http.Transport +
+// the idle-connection pool retained until process exit even though
+// IdleConnTimeout reaps the sockets). Each reconcile pass therefore calls reap
+// with the set of binding keys still referenced by the committed config; an
+// entry whose key is gone has its idle connection pool closed and is dropped,
+// bounding the map to current config under binding churn.
 type httpClientCache struct {
 	mu      sync.Mutex
 	clients map[string]*http.Client
 }
+
+// closeIdleConns is the seam reap uses to drop a superseded client's keep-alive
+// connection pool. It is a package var so a test can record that the reap
+// actually fired (fail-on-revert for #2956). Production closes the transport's
+// idle connections via the standard *http.Client.CloseIdleConnections.
+var closeIdleConns = func(cl *http.Client) { cl.CloseIdleConnections() }
 
 // newHTTPClientCache builds an empty per-binding client cache.
 func newHTTPClientCache() *httpClientCache {
@@ -167,6 +181,42 @@ func (c *httpClientCache) clientFor(p *config.DDNSProvider) (*http.Client, error
 	cl := newHTTPClientBound(b)
 	c.clients[key] = cl
 	return cl, nil
+}
+
+// reap closes the idle-connection pool of, and evicts, every cached client whose
+// binding key is NOT in the live set (#2956). The caller (the Surface A
+// reconcile) passes the binding keys still referenced by the committed provider
+// catalog + configured scopes, so a binding-leaf change that supersedes a cache
+// entry on the next pass has its stale *http.Transport / idle pool released
+// instead of lingering for the daemon lifetime. A key still in live (the active
+// binding for a current scope) is preserved — only an actual key change is
+// superseded. Safe on a nil cache (the test/no-cache manager). Takes c.mu (the
+// same lock clientFor uses); the manager's m.mu is always the OUTER lock so
+// there is no lock-order inversion.
+func (c *httpClientCache) reap(live map[string]struct{}) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, cl := range c.clients {
+		if _, ok := live[key]; ok {
+			continue
+		}
+		closeIdleConns(cl)
+		delete(c.clients, key)
+	}
+}
+
+// size returns the number of cached clients (test observability for the #2956
+// bounded-map invariant).
+func (c *httpClientCache) size() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.clients)
 }
 
 // resolveProviderBindConfig derives the transport bindConfig (#2846) from a DDNS

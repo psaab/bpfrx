@@ -246,6 +246,12 @@ func (c *CLI) showDynamicAddress() error {
 			} else {
 				fmt.Printf("    Last fetch: never\n")
 			}
+			if fi.Degraded {
+				fmt.Printf("    DEGRADED: %d invalid line(s) skipped (partial set installed)\n", fi.InvalidLines)
+				if len(fi.InvalidSample) > 0 {
+					fmt.Printf("      Sample: %s\n", strings.Join(fi.InvalidSample, ", "))
+				}
+			}
 		}
 	}
 

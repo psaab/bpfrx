@@ -36,7 +36,7 @@ use crate::policy::evaluate_policy_result_with_len;
 
 use cookie_reply::{SynCookieReply, enqueue_syn_cookie_reply};
 use nat_exception::{record_source_nat_failure, source_nat_decision_for_flow};
-use reject_reply::{enqueue_filter_reject_reply, enqueue_policy_reject_reply};
+use reject_reply::{enqueue_deny_reply, enqueue_filter_reject_reply};
 
 use filter::{
     apply_lo0_filter_action, emit_input_filter_log_match,
@@ -1341,6 +1341,9 @@ pub(super) fn poll_binding_process_descriptor(
                                 // `then log` selection.
                                 log_session_init: false,
                                 log_session_close: false,
+                                // #3056: host-local sessions are not policy-forwarded,
+                                // so they carry no admitting policy ID.
+                                policy_id: 0,
                             };
                             if install_helper_local_session_on_miss(
                                 sessions,
@@ -1856,6 +1859,12 @@ pub(super) fn poll_binding_process_descriptor(
                                         // per-policy RT_FLOW SYSLOG log selection.
                                         log_session_init: policy_result.log_session_init,
                                         log_session_close: policy_result.log_session_close,
+                                        // #3056: stamp the admitting policy's ID so
+                                        // the live-session BPF-compat publish and the
+                                        // SESSION_CREATE RT_FLOW record reference the
+                                        // policy that admitted the flow (was the `0`
+                                        // sentinel → first-configured-policy misattribution).
+                                        policy_id: policy_result.policy_id,
                                     };
                                     let forward_installed = track_in_userspace
                                         && sessions.install_with_protocol_with_origin(
@@ -2076,6 +2085,10 @@ pub(super) fn poll_binding_process_descriptor(
                                         // regardless of which entry expires it.
                                         log_session_init: policy_result.log_session_init,
                                         log_session_close: policy_result.log_session_close,
+                                        // #3056: mirror the admitting policy ID onto
+                                        // the reverse companion so a row keyed on the
+                                        // reverse tuple attributes the same policy.
+                                        policy_id: policy_result.policy_id,
                                     };
                                     // #1861 §5.2: the reverse install is gated on
                                     // forward_installed (was track_in_userspace —
@@ -2268,25 +2281,28 @@ pub(super) fn poll_binding_process_descriptor(
                                         resolution.egress_ifindex,
                                     );
                                 }
-                                // #2089: `reject` actively rejects —
+                                // #2089/#3071: `reject` actively rejects —
                                 // synthesize a TCP RST (TCP) or ICMP
                                 // unreachable (admin-prohibited; other
-                                // protocols) back toward the source.
-                                // `deny` is unchanged (silent drop). The
-                                // reply is enqueued here before the
+                                // protocols) back toward the source. Plain
+                                // `deny` is a silent drop UNLESS the flow is
+                                // TCP and the ingress (from) zone has Junos
+                                // `tcp-rst`, in which case a TCP RST is sent.
+                                // The reply is enqueued here before the
                                 // disposition fall-through, while flow /
-                                // action / packet_frame are in scope.
-                                if matches!(policy_result.action, PolicyAction::Reject) {
-                                    enqueue_policy_reject_reply(
-                                        &mut binding.tx_pipeline,
-                                        worker_ctx.forwarding,
-                                        binding.ifindex,
-                                        packet_frame,
-                                        meta,
-                                        flow,
-                                        telemetry.counters,
-                                    );
-                                }
+                                // action / from_zone_id / packet_frame are in
+                                // scope.
+                                enqueue_deny_reply(
+                                    &mut binding.tx_pipeline,
+                                    worker_ctx.forwarding,
+                                    binding.ifindex,
+                                    packet_frame,
+                                    meta,
+                                    flow,
+                                    telemetry.counters,
+                                    matches!(policy_result.action, PolicyAction::Reject),
+                                    from_zone_id,
+                                );
                                 decision.resolution.disposition =
                                     ForwardingDisposition::PolicyDenied;
                             }
@@ -3001,21 +3017,24 @@ pub(super) fn poll_binding_process_descriptor(
                                         now_ns,
                                     );
                                     telemetry.dbg.policy_deny += 1;
-                                    // #2089: `reject` actively rejects
-                                    // (TCP RST / ICMP unreachable); `deny`
-                                    // stays a silent drop. Enqueue before
-                                    // the disposition record + recycle.
-                                    if matches!(policy_result.action, PolicyAction::Reject) {
-                                        enqueue_policy_reject_reply(
-                                            &mut binding.tx_pipeline,
-                                            worker_ctx.forwarding,
-                                            binding.ifindex,
-                                            packet_frame,
-                                            meta,
-                                            flow,
-                                            telemetry.counters,
-                                        );
-                                    }
+                                    // #2089/#3071: `reject` actively rejects
+                                    // (TCP RST / ICMP unreachable); plain
+                                    // `deny` stays a silent drop UNLESS the
+                                    // flow is TCP and the ingress (from) zone
+                                    // has Junos `tcp-rst`, in which case a TCP
+                                    // RST is sent. Enqueue before the
+                                    // disposition record + recycle.
+                                    enqueue_deny_reply(
+                                        &mut binding.tx_pipeline,
+                                        worker_ctx.forwarding,
+                                        binding.ifindex,
+                                        packet_frame,
+                                        meta,
+                                        flow,
+                                        telemetry.counters,
+                                        matches!(policy_result.action, PolicyAction::Reject),
+                                        from_zone_id,
+                                    );
                                     decision.resolution.disposition =
                                         ForwardingDisposition::PolicyDenied;
                                     record_forwarding_disposition(
@@ -3885,6 +3904,7 @@ mod new_flow_session_limit_tests {
             nat64_reverse: None,
             log_session_init: false,
             log_session_close: false,
+            policy_id: 0,
         }
     }
 

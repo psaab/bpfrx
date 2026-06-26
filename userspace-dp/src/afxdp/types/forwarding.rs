@@ -65,6 +65,11 @@ pub(in crate::afxdp) struct ForwardingState {
     /// local-delivery admit path (session miss AND session hit) to default-deny
     /// host-bound traffic whose service/protocol is not listed.
     pub(in crate::afxdp) zone_host_inbound: FastMap<u16, ZoneHostInbound>,
+    /// #3071: zone IDs (from `ZoneSnapshot.tcp_rst`) with Junos `tcp-rst`
+    /// enabled. A TCP flow DENIED by policy/default-deny whose ingress
+    /// (from) zone is present here is answered with a TCP RST toward the
+    /// source instead of a silent drop. Absent zone ⇒ tcp-rst off.
+    pub(in crate::afxdp) zone_tcp_rst: FastMap<u16, bool>,
     pub(in crate::afxdp) egress: FastMap<i32, EgressInterface>,
     pub(in crate::afxdp) ingress_logical_ifindex: FastMap<(i32, u16), i32>,
     pub(in crate::afxdp) fabrics: Vec<FabricLink>,
@@ -207,6 +212,16 @@ impl ZoneHostInbound {
                 }
             }
         }
+    }
+}
+
+impl ForwardingState {
+    /// #3071: true iff zone `zone_id` has Junos `tcp-rst` enabled. Used by the
+    /// policy-deny path to decide whether a denied TCP flow whose ingress
+    /// (from) zone is `zone_id` gets a TCP RST instead of a silent drop. An
+    /// unconfigured / unknown zone (e.g. `0`) is always tcp-rst off.
+    pub(in crate::afxdp) fn zone_tcp_rst_enabled(&self, zone_id: u16) -> bool {
+        self.zone_tcp_rst.get(&zone_id).copied().unwrap_or(false)
     }
 }
 

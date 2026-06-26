@@ -152,7 +152,7 @@ func buildZoneSnapshots(cfg *config.Config) []ZoneSnapshot {
 	sort.Strings(names)
 	out := make([]ZoneSnapshot, 0, len(names))
 	for i, name := range names {
-		z := ZoneSnapshot{
+		zs := ZoneSnapshot{
 			Name: name,
 			ID:   uint16(i + 1),
 		}
@@ -162,11 +162,17 @@ func buildZoneSnapshots(cfg *config.Config) []ZoneSnapshot {
 		// HostInboundConfigured stays false and the dataplane preserves
 		// admit-all for that zone.
 		if zone := cfg.Security.Zones[name]; zone != nil && zone.HostInboundTraffic != nil {
-			z.HostInboundConfigured = true
-			z.HostInboundSystemServices = lowerTokens(zone.HostInboundTraffic.SystemServices)
-			z.HostInboundProtocols = lowerTokens(zone.HostInboundTraffic.Protocols)
+			zs.HostInboundConfigured = true
+			zs.HostInboundSystemServices = lowerTokens(zone.HostInboundTraffic.SystemServices)
+			zs.HostInboundProtocols = lowerTokens(zone.HostInboundTraffic.Protocols)
 		}
-		out = append(out, z)
+		// #3071: carry the per-zone `tcp-rst` knob to the dataplane so a
+		// denied TCP flow whose ingress (from) zone has tcp-rst enabled
+		// gets a TCP RST instead of a silent drop.
+		if z := cfg.Security.Zones[name]; z != nil && z.TCPRst {
+			zs.TCPRst = true
+		}
+		out = append(out, zs)
 	}
 	return out
 }

@@ -10,7 +10,7 @@ use super::allocator::{
 use super::source::SourceNatFlowKey;
 use super::destination::{PROTO_ANY, PROTO_TCP, PROTO_UDP};
 use super::*;
-use crate::ip_proto::{PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6};
+use crate::ip_proto::{PROTO_ESP, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6};
 use crate::{DestinationNATRuleSnapshot, SourceNATRuleSnapshot, StaticNATRuleSnapshot};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -2485,6 +2485,12 @@ fn dnat_duplicate_any_zone_last_rule_wins() {
 
 // --- Pool-mode SNAT tests ---
 
+// #3111: a single-address pool rule applied to a TCP flow allocates a port
+// and rewrites BOTH the source IP and source port. This is the port-bearing
+// positive case that must stay byte-identical after the port-less gate. The
+// lookup uses the protocol-aware entry with TCP so the assertion exercises
+// the real `allocate_translation` path (the proto-0 `match_source_nat`
+// wrapper is now address-only — see the GRE/ESP test below).
 #[test]
 fn pool_snat_single_address_rewrites_src_and_port() {
     let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
@@ -2498,22 +2504,91 @@ fn pool_snat_single_address_rewrites_src_and_port() {
         port_high: 65535,
         ..SourceNATRuleSnapshot::default()
     }]);
-    let decision = match_source_nat(
+    let mut counter = None;
+    let d = expect_snat_decision(match_source_nat_result_for_tuple(
         &rules,
         "lan",
         "wan",
         "10.0.1.100".parse().expect("src"),
         "8.8.8.8".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        443,
         None,
         None,
-    );
-    let d = decision.expect("should match pool rule");
+        0,
+        false,
+        &mut counter,
+    ));
     assert_eq!(d.rewrite_src, Some("203.0.113.1".parse().unwrap()));
-    assert!(d.rewrite_src_port.is_some());
+    assert!(d.rewrite_src_port.is_some(), "TCP must allocate a port");
     let port = d.rewrite_src_port.unwrap();
     assert!(port >= 1024, "port {} out of range", port);
     assert_eq!(d.rewrite_dst, None);
     assert_eq!(d.rewrite_dst_port, None);
+}
+
+// #3111 FAIL-ON-REVERT: pool-mode source-NAT applied to a port-less protocol
+// (GRE/ESP/AH/OSPF/...) must translate ONLY the source IP — it must NOT
+// allocate a pool port and must leave `rewrite_src_port` unset. Before the
+// fix the gate only special-cased `protocol == 0`, so GRE (47) / ESP (50)
+// fell through to `allocate_translation`, which returned a pseudo-port that
+// the descriptor fast-path rewriter then wrote over the first two L4 bytes —
+// corrupting the GRE flags / ESP SPI and breaking the tunnel, plus leaking a
+// pool port per flow.
+//
+// Reverting the source.rs gate (allocate a port for all protocols) makes
+// `rewrite_src_port` `Some(_)` and consumes a pool port, turning both
+// assertions RED.
+#[test]
+fn pool_snat_portless_protocols_translate_ip_only_no_port() {
+    for proto in [PROTO_GRE, PROTO_ESP] {
+        let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+            name: "pool-snat".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "my-pool".to_string(),
+            pool_addresses: vec!["203.0.113.1/32".to_string()],
+            port_low: 1024,
+            port_high: 65535,
+            ..SourceNATRuleSnapshot::default()
+        }]);
+        let mut counter = None;
+        let d = expect_snat_decision(match_source_nat_result_for_tuple(
+            &rules,
+            "lan",
+            "wan",
+            "10.0.1.100".parse().expect("src"),
+            "8.8.8.8".parse().expect("dst"),
+            proto,
+            0,
+            0,
+            None,
+            None,
+            0,
+            false,
+            &mut counter,
+        ));
+        assert_eq!(
+            d.rewrite_src,
+            Some("203.0.113.1".parse().unwrap()),
+            "proto {proto}: source IP must be translated to the pool address",
+        );
+        assert_eq!(
+            d.rewrite_src_port, None,
+            "proto {proto}: a port-less protocol must NOT allocate/rewrite an L4 port",
+        );
+        assert_eq!(d.rewrite_dst, None, "proto {proto}: dst must be untouched");
+        assert_eq!(d.rewrite_dst_port, None, "proto {proto}: no dst port");
+
+        // No pool port may be consumed for a port-less flow.
+        let status = source_nat_pool_statuses(&rules);
+        assert_eq!(
+            status[0].used_ports, 0,
+            "proto {proto}: no pool port may be allocated for a port-less protocol",
+        );
+    }
 }
 
 #[test]
@@ -3471,7 +3546,10 @@ fn pool_snat_persistent_double_rollback_removes_unused_lease() {
         assert!(live.persistent_by_source.is_empty());
         assert!(live.lease_expirations.is_empty());
         assert!(live.lease_expirations_by_addr[0].is_empty());
-        assert_eq!(live.recycled_ports_by_addr[0], vec![40000]);
+        assert_eq!(
+            live.recycled_ports_by_addr[0].iter().copied().collect::<Vec<_>>(),
+            vec![40000]
+        );
     }
 }
 
@@ -4719,8 +4797,10 @@ fn pool_snat_recycled_collision_retains_port() {
         // Force the sequential cursor past the range so only the recycled
         // stack is consulted.
         live.next_port_offset_by_addr[0] = 2;
-        // Stack: pop() yields 1025 (collides) first, then 1024 (free).
-        live.recycled_ports_by_addr[0] = vec![1024, 1025];
+        // FIFO queue: pop_front() yields 1025 (collides) first, then 1024
+        // (free). Front-first ordering keeps this exercising the #3047
+        // collision-retain path after the #3011 LIFO->FIFO change.
+        live.recycled_ports_by_addr[0] = std::collections::VecDeque::from(vec![1025, 1024]);
     }
     // 1025 is occupied out-of-band, so the recycled pop of 1025 collides.
     alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), 1025);
@@ -4779,6 +4859,100 @@ fn pool_snat_recycled_collision_retains_port() {
     assert_eq!(
         translated2.port, 1025,
         "the retained recycled port must be reused, proving no leak"
+    );
+}
+
+/// #3011 fail-on-revert: freed SNAT ports must be recycled FIFO (oldest-freed
+/// reused first), NOT LIFO (most-recently-freed reused first). LIFO immediately
+/// hands a just-freed port back, maximizing the chance of colliding with the
+/// upstream's lingering TIME_WAIT/2MSL state for the prior 4-tuple. FIFO spreads
+/// reuse across the whole 2MSL window. Here we exhaust the sequential range,
+/// free three ports in a known order, and require the next three allocations to
+/// reuse them in that SAME (FIFO) order. Reverting to a back-popping LIFO queue
+/// flips the order and turns this test RED.
+#[test]
+fn pool_snat_recycle_order_is_fifo_not_lifo() {
+    let pool_ip: Ipv4Addr = "203.0.113.7".parse().unwrap();
+    let addrs = [pool_ip];
+    // 5-port range so we can fully spend the sequential phase and then force
+    // all subsequent allocations through the recycle queue.
+    let alloc = PortAllocator::new(1, 1024, 1028);
+
+    let mk_flow = |src_port: u16| SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.61.70".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port,
+        dst_port: 443,
+    };
+    let allocate = |flow: SourceNatFlowKey| {
+        alloc
+            .allocate_translation(
+                flow,
+                PoolAddressFamily::V4(&addrs),
+                0,
+                false,
+                false,
+                false,
+                0,
+                1_000,
+            )
+            .expect("sequential allocation must succeed within range")
+    };
+
+    // Spend the entire sequential range: ports 1024..=1028 go to flows in
+    // allocation order.
+    let mut seq = Vec::new();
+    for i in 0..5u16 {
+        let flow = mk_flow(5000 + i);
+        let t = allocate(flow);
+        seq.push((flow, t));
+    }
+    assert_eq!(
+        seq.iter().map(|(_, t)| t.port).collect::<Vec<_>>(),
+        vec![1024, 1025, 1026, 1027, 1028],
+        "sequential phase hands out ports in ascending order"
+    );
+
+    // Free three flows in a deliberately non-monotonic order: 1026, then 1024,
+    // then 1028. Recycle queue (FIFO) must end up [1026, 1024, 1028].
+    let free_order = [2usize, 0usize, 4usize]; // ports 1026, 1024, 1028
+    for &idx in &free_order {
+        let (flow, t) = seq[idx];
+        assert!(
+            alloc.release_flow(flow, t, 2_000),
+            "release of a live flow must succeed"
+        );
+    }
+    {
+        let live = alloc.debug_live();
+        assert_eq!(
+            live.recycled_ports_by_addr[0]
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1026, 1024, 1028],
+            "freed ports queue in release order (push_back)"
+        );
+    }
+
+    // The next three allocations must reuse the freed ports FIFO: oldest-freed
+    // (1026) first, then 1024, then 1028 — NOT the LIFO reverse (1028,1024,1026).
+    let reused: Vec<u16> = (0..3u16)
+        .map(|i| allocate(mk_flow(6000 + i)).port)
+        .collect();
+    assert_eq!(
+        reused,
+        vec![1026, 1024, 1028],
+        "recycled ports must be reused FIFO (oldest freed first), not LIFO"
+    );
+
+    // Explicit just-freed-not-immediately-reused check: while other recycled
+    // ports remain, the most-recently-freed port (1028) is the LAST handed out.
+    assert_eq!(
+        reused.last().copied(),
+        Some(1028),
+        "the most-recently-freed port must be reused LAST while others remain"
     );
 }
 

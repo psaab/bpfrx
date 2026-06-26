@@ -100,6 +100,7 @@ fn test_close_delta(kind: crate::session::SessionDeltaKind) -> crate::session::S
             nat64_reverse: None,
             log_session_init: false,
             log_session_close: false,
+            policy_id: 0,
         },
         origin: SessionOrigin::ForwardFlow,
         fabric_redirect_sync: false,
@@ -288,6 +289,43 @@ fn test_emit_session_close_rt_flow_carries_app_id() {
 }
 
 #[test]
+fn test_emit_session_close_rt_flow_carries_admitting_policy_id() {
+    // #3056 fail-on-revert: a session admitted by a policy must carry that
+    // policy's ID on the SESSION_CLOSE RT_FLOW frame so the
+    // RT_FLOW_SESSION_CLOSE syslog record (and the NetFlow/IPFIX close
+    // exporters) name the admitting policy instead of policy 0. The admit path
+    // stamps SessionMetadata.policy_id, which the Close delta carries;
+    // emit_session_close_rt_flow threads it into the trailing [136:140] wire
+    // slot — NOT [44:48], which #2853 took for the created-subsec-nanos on a
+    // close. The Go decoder reads [136:140] back as PolicyID only on a close.
+    // Reverting the stamp (metadata.policy_id) or the encode ([136:140]) back to
+    // 0 makes this assertion fail (the record would log policy 0 / the first
+    // configured policy).
+    let (handle, rx) = test_worker_handle(
+        8,
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let mut delta = test_close_delta(crate::session::SessionDeltaKind::Close);
+    // The session was admitted by policy ID 42.
+    delta.metadata.policy_id = 42;
+    handle.emit_session_close_rt_flow(&delta, 0, 0);
+    let frame = rx.try_recv().expect("RT_FLOW close frame");
+    let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
+    assert_eq!(
+        u32::from_le_bytes(p[136..140].try_into().unwrap()),
+        42,
+        "SESSION_CLOSE RT_FLOW must carry the admitting policy ID in [136:140], \
+         not the policy-0 sentinel"
+    );
+    // The event type byte must be SESSION_CLOSE (2); the policy ID rides
+    // [136:140] precisely because [44:48] is the #2853 created-subsec-nanos here.
+    assert_eq!(p[52], 2, "RT_FLOW event type must be SESSION_CLOSE (2)");
+}
+
+#[test]
 fn test_emit_session_close_rt_flow_zero_created_stays_zero() {
     // #2465: a close delta with an UNKNOWN (0) created_ns must keep the wire
     // created/timestamp fields 0 so the Go exporter falls back to the
@@ -458,6 +496,45 @@ fn test_emit_session_create_rt_flow_carries_app_id_and_ifindex() {
         77,
         "SESSION_CREATE RT_FLOW must carry the ingress ifindex, not N/A(0)"
     );
+}
+
+#[test]
+fn test_emit_session_create_rt_flow_carries_admitting_policy_id() {
+    // #3056 fail-on-revert: a session admitted by a policy must carry that
+    // policy's ID on the SESSION_CREATE RT_FLOW frame so the
+    // RT_FLOW_SESSION_CREATE syslog record names the admitting policy instead
+    // of policy 0. The admit path stamps SessionMetadata.policy_id, which the
+    // Open delta carries; emit_session_create_rt_flow threads it into the
+    // [44:48] policy_id wire slot — the same slot the Go decoder reads as
+    // PolicyID for non-close frames and resolves a policy name from. Reverting
+    // the stamp (metadata.policy_id) or the encode ([44:48]) back to 0 makes
+    // this assertion fail (the record would log policy 0 / the first configured
+    // policy).
+    let (handle, rx) = test_worker_handle(
+        8,
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let mut delta = test_close_delta(crate::session::SessionDeltaKind::Open);
+    delta.metadata.log_session_init = true;
+    // The session was admitted by policy ID 42.
+    delta.metadata.policy_id = 42;
+    handle.emit_session_create_rt_flow(&delta, 0, 0);
+    let frame = rx.try_recv().expect("RT_FLOW create frame");
+    assert_eq!(frame.data[4], MSG_SESSION_CREATE_RT_FLOW);
+    let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
+    assert_eq!(
+        u32::from_le_bytes(p[44..48].try_into().unwrap()),
+        42,
+        "SESSION_CREATE RT_FLOW must carry the admitting policy ID in [44:48], \
+         not the policy-0 sentinel"
+    );
+    // The Go decoder reads [44:48] as PolicyID for non-close frames; the event
+    // type byte must therefore be SESSION_CREATE (1), not SESSION_CLOSE (2)
+    // (whose [44:48] is repurposed by #2853).
+    assert_eq!(p[52], 1, "RT_FLOW event type must be SESSION_CREATE (1)");
 }
 
 #[test]

@@ -185,6 +185,15 @@ type ZoneSnapshot struct {
 	HostInboundConfigured     bool     `json:"host_inbound_configured,omitempty"`
 	HostInboundSystemServices []string `json:"host_inbound_system_services,omitempty"`
 	HostInboundProtocols      []string `json:"host_inbound_protocols,omitempty"`
+	// TCPRst carries the Junos `security zones security-zone <z> tcp-rst`
+	// knob (#3071). When true, the userspace dataplane sends a TCP RST back
+	// toward the source for a TCP flow DENIED by policy/default-deny whose
+	// INGRESS (from) zone is this zone, instead of the silent drop `deny`
+	// otherwise produces. Non-TCP denied traffic is unaffected. Additive
+	// wire field: an old Rust helper without the field treats every zone as
+	// tcp-rst off (pre-#3071 silent-drop behavior); an old Go binary omits
+	// it (omitempty).
+	TCPRst bool `json:"tcp_rst,omitempty"`
 }
 
 type InterfaceSnapshot struct {
@@ -2236,7 +2245,7 @@ const (
 	EventFrameTypeScreenDrop uint8 = 12 // helper → daemon (RT_FLOW screen drop)
 	EventFrameTypeFilterLog  uint8 = 13 // helper → daemon (RT_FLOW filter log)
 	// #2460: RT_FLOW SESSION_CLOSE on the raw dataplane-event channel,
-	// carrying the canonical 136-byte dataplane.Event payload with the
+	// carrying the canonical 144-byte dataplane.Event payload (#3056) with the
 	// event-type byte = dataplane.EventTypeSessionClose (2). Routed through
 	// the same decodeDataplaneEventPayload → eventReader.ProcessRawEvent
 	// path as the deny/screen/filter frames so the NetFlow/IPFIX
@@ -2245,7 +2254,7 @@ const (
 	// close; the HA sync path is unchanged.
 	EventFrameTypeSessionClose uint8 = 14 // helper → daemon (RT_FLOW session close)
 	// #2508: RT_FLOW SESSION_CREATE on the raw dataplane-event channel,
-	// carrying the canonical 136-byte dataplane.Event payload with the
+	// carrying the canonical 144-byte dataplane.Event payload (#3056) with the
 	// event-type byte = dataplane.EventTypeSessionOpen (1). Emitted by the
 	// helper ONLY for sessions admitted by a policy configured with
 	// `then log session-init` — there is no flowexport consumer of session

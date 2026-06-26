@@ -88,6 +88,63 @@ pub(super) fn enqueue_filter_reject_reply(
     )
 }
 
+/// #3071: unified deny-path reply decision shared by both policy-deny call
+/// sites in `poll_descriptor`. Replaces the bare `if action == Reject` arm so
+/// the zone-level `tcp-rst` knob is honored alongside explicit `then reject`:
+///
+/// * `is_reject` (policy `then reject`): active reject for EVERY protocol — a
+///   TCP RST for TCP, an ICMP/ICMPv6 admin-prohibited unreachable otherwise.
+///   Unchanged from #2089.
+/// * otherwise (plain `deny` / default-deny): a silent drop UNLESS the flow is
+///   TCP AND the INGRESS (from) zone has Junos `tcp-rst` enabled, in which
+///   case a TCP RST is sent back toward the source. Junos `tcp-rst` only
+///   resets TCP; non-TCP denied traffic and a deny in a non-tcp-rst zone stay
+///   silent drops.
+///
+/// Both legs reuse `enqueue_policy_reject_reply` (the #2521/#2089 synthesis +
+/// #2238 output classification + #2472 rate limit + fail-closed budget gate),
+/// so a zone-tcp-rst RST is counted under `policy_reject_sent` — it is a
+/// policy-deny-driven reset. Returns true iff a reply was enqueued; the caller
+/// still performs the silent drop regardless (fail-closed).
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn enqueue_deny_reply(
+    tx_pipeline: &mut WorkerTxPipeline,
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    packet_frame: &[u8],
+    meta: UserspaceDpMeta,
+    flow: &SessionFlow,
+    counters: &mut BatchCounters,
+    is_reject: bool,
+    from_zone_id: u16,
+) -> bool {
+    if is_reject {
+        return enqueue_policy_reject_reply(
+            tx_pipeline,
+            forwarding,
+            ingress_ifindex,
+            packet_frame,
+            meta,
+            flow,
+            counters,
+        );
+    }
+    if meta.protocol == PROTO_TCP && forwarding.zone_tcp_rst_enabled(from_zone_id) {
+        return enqueue_policy_reject_reply(
+            tx_pipeline,
+            forwarding,
+            ingress_ifindex,
+            packet_frame,
+            meta,
+            flow,
+            counters,
+        );
+    }
+    false
+}
+
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
@@ -657,5 +714,177 @@ mod tests {
         assert!(!sent, "inbound RST must not be answered");
         assert_eq!(counters.policy_reject_sent, 0);
         assert!(pipeline.pending_tx_local.is_empty());
+    }
+
+    /// #3071: an ICMP echo (non-TCP) frame for the zone-tcp-rst tests. Reused
+    /// to prove tcp-rst is TCP-only (non-TCP denied traffic stays silent).
+    fn icmp_v4_echo() -> (Vec<u8>, UserspaceDpMeta, SessionFlow) {
+        let client = std::net::Ipv4Addr::new(10, 0, 61, 102);
+        let server = std::net::Ipv4Addr::new(1, 1, 1, 1);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        frame.extend_from_slice(&[0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6]);
+        frame.extend_from_slice(&0x0800u16.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 64, PROTO_ICMP, 0, 0,
+        ]);
+        frame.extend_from_slice(&client.octets());
+        frame.extend_from_slice(&server.octets());
+        frame.extend_from_slice(&[8, 0, 0, 0, 0x12, 0x34, 0, 1]);
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 5,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            pkt_len: (frame.len() - 14) as u16,
+            ..UserspaceDpMeta::default()
+        };
+        let flow = SessionFlow {
+            src_ip: std::net::IpAddr::V4(client),
+            dst_ip: std::net::IpAddr::V4(server),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_ICMP,
+                src_ip: std::net::IpAddr::V4(client),
+                dst_ip: std::net::IpAddr::V4(server),
+                src_port: 0x1234,
+                dst_port: 0,
+            },
+        };
+        (frame, meta, flow)
+    }
+
+    /// #3071 fail-on-revert: a plain `deny` (is_reject=false) on a TCP flow
+    /// whose INGRESS (from) zone has tcp-rst enabled MUST enqueue a TCP RST.
+    /// Reverting the zone-tcp-rst arm of `enqueue_deny_reply` → no RST → RED.
+    #[test]
+    fn deny_reply_zone_tcp_rst_tcp_enqueues_rst() {
+        use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+        crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+            crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+            0,
+        );
+        let (frame, meta, flow) = tcp_v4_syn();
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        );
+        let mut forwarding = ForwardingState::default();
+        // From-zone id 7 has Junos `tcp-rst`.
+        forwarding.zone_tcp_rst.insert(7, true);
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_deny_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+            false, // plain deny, not `then reject`
+            7,     // ingress (from) zone id
+        );
+        assert!(sent, "denied TCP in a tcp-rst zone must enqueue a RST");
+        assert_eq!(counters.policy_reject_sent, 1);
+        let req = pipeline
+            .pending_tx_local
+            .pop_front()
+            .expect("zone tcp-rst RST request");
+        let tcp_flags = req.bytes[14 + 20 + 13];
+        assert_ne!(tcp_flags & 0x04, 0, "RST flag must be set");
+    }
+
+    /// #3071: a plain `deny` on a TCP flow whose from-zone does NOT have
+    /// tcp-rst stays a silent drop (no RST, no counter).
+    #[test]
+    fn deny_reply_no_zone_tcp_rst_is_silent_drop() {
+        let (frame, meta, flow) = tcp_v4_syn();
+        let mut pipeline = tx_pipeline(64, 64);
+        let forwarding = ForwardingState::default(); // zone 7 not in zone_tcp_rst
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_deny_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+            false,
+            7,
+        );
+        assert!(
+            !sent,
+            "denied TCP without zone tcp-rst must stay a silent drop"
+        );
+        assert_eq!(counters.policy_reject_sent, 0);
+        assert!(pipeline.pending_tx_local.is_empty());
+    }
+
+    /// #3071: zone tcp-rst is TCP-only — a denied NON-TCP (ICMP) flow in a
+    /// tcp-rst zone is unaffected (silent drop, no ICMP unreachable).
+    #[test]
+    fn deny_reply_zone_tcp_rst_non_tcp_is_silent_drop() {
+        let (frame, meta, flow) = icmp_v4_echo();
+        let mut pipeline = tx_pipeline(64, 64);
+        let mut forwarding = ForwardingState::default();
+        forwarding.zone_tcp_rst.insert(7, true);
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_deny_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+            false,
+            7,
+        );
+        assert!(
+            !sent,
+            "non-TCP denied traffic must not get a zone tcp-rst reply"
+        );
+        assert_eq!(counters.policy_reject_sent, 0);
+        assert!(pipeline.pending_tx_local.is_empty());
+    }
+
+    /// #3071: the unified deny-reply still drives explicit policy `reject`
+    /// (is_reject=true) through the active reject path regardless of zone
+    /// tcp-rst — a TCP RST is enqueued even when the from-zone has no tcp-rst.
+    #[test]
+    fn deny_reply_explicit_reject_still_resets_tcp() {
+        use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+        crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+            crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+            0,
+        );
+        let (frame, meta, flow) = tcp_v4_syn();
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        );
+        let forwarding = ForwardingState::default(); // no zone tcp-rst at all
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_deny_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+            true, // explicit `then reject`
+            7,
+        );
+        assert!(
+            sent,
+            "explicit reject must enqueue a RST regardless of zone tcp-rst"
+        );
+        assert_eq!(counters.policy_reject_sent, 1);
+        assert!(!pipeline.pending_tx_local.is_empty());
     }
 }

@@ -501,6 +501,9 @@ pub(super) fn cluster_peer_return_fast_path(
         // `then log` selection (the admitting node logs).
         log_session_init: false,
         log_session_close: false,
+        // #3056: the fabric-return reverse seed is created on the peer-forwarding
+        // node, which never ran the admitting policy — leave the policy ID unset.
+        policy_id: 0,
     };
     Some((
         SessionDecision {
@@ -1075,11 +1078,24 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
 ) -> ForwardingResolution {
     match dst {
         IpAddr::V4(ip) => {
+            let table = table
+                .map(|table| canonical_route_table(table, false))
+                .unwrap_or_else(|| DEFAULT_V4_TABLE.to_string());
             if state.local_v4.contains(&ip) {
+                // #3151: local-delivery (to-self) attribution is table-scoped,
+                // exactly like the route-path connected scan (#2388). When the
+                // same local IP exists in more than one routing-instance, a
+                // to-self packet in VRF A must NOT resolve its
+                // local/egress/tx ifindex to VRF B's connected entry — that
+                // would mis-attribute zone/security-policy and HA RG ownership
+                // (owner_rg_for_flow(egress_ifindex)) across VRFs. Filter the
+                // connected scan by the canonical ingress table; the default
+                // routing-instance (inet.0) case still matches default-table
+                // connected routes.
                 let local_ifindex = state
                     .connected_v4
                     .iter()
-                    .find(|entry| entry.prefix.addr() == ip)
+                    .find(|entry| entry.table == table && entry.prefix.addr() == ip)
                     .map(|entry| entry.ifindex)
                     .unwrap_or(0);
                 return ForwardingResolution {
@@ -1094,9 +1110,6 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
                     tx_vlan_id: 0,
                 };
             }
-            let table = table
-                .map(|table| canonical_route_table(table, false))
-                .unwrap_or_else(|| DEFAULT_V4_TABLE.to_string());
             lookup_forwarding_resolution_v4(
                 state,
                 dynamic_neighbors,
@@ -1108,11 +1121,16 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
             )
         }
         IpAddr::V6(ip) => {
+            let table = table
+                .map(|table| canonical_route_table(table, true))
+                .unwrap_or_else(|| DEFAULT_V6_TABLE.to_string());
             if state.local_v6.contains(&ip) {
+                // #3151: table-scoped local-delivery attribution (see the v4
+                // branch above and the #2388 route-path connected scan).
                 let local_ifindex = state
                     .connected_v6
                     .iter()
-                    .find(|entry| entry.prefix.addr() == ip)
+                    .find(|entry| entry.table == table && entry.prefix.addr() == ip)
                     .map(|entry| entry.ifindex)
                     .unwrap_or(0);
                 return ForwardingResolution {
@@ -1127,9 +1145,6 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
                     tx_vlan_id: 0,
                 };
             }
-            let table = table
-                .map(|table| canonical_route_table(table, true))
-                .unwrap_or_else(|| DEFAULT_V6_TABLE.to_string());
             lookup_forwarding_resolution_v6(
                 state,
                 dynamic_neighbors,

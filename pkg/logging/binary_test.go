@@ -135,8 +135,10 @@ func TestFormatBinaryRecord_Basic(t *testing.T) {
 }
 
 func TestRawEventWireContractSize(t *testing.T) {
-	if rawEventWireSize != 136 {
-		t.Fatalf("rawEventWireSize = %d, want 136", rawEventWireSize)
+	// #3056: grew 136 -> 144 to carry the admitting policy ID on a SESSION_CLOSE
+	// frame in the trailing [136:140] slot (#2853 occupies [44:48] on a close).
+	if rawEventWireSize != 144 {
+		t.Fatalf("rawEventWireSize = %d, want 144", rawEventWireSize)
 	}
 	if rawEventStructSize != rawEventWireSize {
 		t.Fatalf("rawEventStructSize = %d, want wire size %d",
@@ -434,7 +436,49 @@ func TestDecodeRawEventCarriesCreatedSubNanos(t *testing.T) {
 		t.Fatalf("rec.CreatedNanos = %d, want %d (offset 44 LE u32)", rec.CreatedNanos, createdNanos)
 	}
 	if rec.PolicyID != 0 {
-		t.Fatalf("rec.PolicyID = %d, want 0 (the [44:48] slot is repurposed on a close)", rec.PolicyID)
+		t.Fatalf("rec.PolicyID = %d, want 0 (the [44:48] slot is repurposed on a close; the #3056 policy slot at [136:140] is unset here)", rec.PolicyID)
+	}
+}
+
+// TestDecodeRawEventCloseCarriesAdmittingPolicyID is the #3056 cross-language
+// layout check: because #2853 took the [44:48] policy_id slot on a close for the
+// created-subsec-nanos, the Rust encoder writes the admitting policy ID into the
+// trailing [136:140] slot (LE u32) on a SESSION_CLOSE. DecodeRawEventRecord (and
+// the live logEvent path) must read [136:140] back into EventRecord.PolicyID so
+// the RT_FLOW_SESSION_CLOSE record and the NetFlow/IPFIX close exporters name the
+// admitting policy instead of policy 0. The [44:48] created-subsec-nanos must NOT
+// be clobbered. Reverting the decoder to leave the close PolicyID 0 (the
+// pre-#3056 behavior) makes this assertion fail.
+func TestDecodeRawEventCloseCarriesAdmittingPolicyID(t *testing.T) {
+	const (
+		policyID     = uint32(42)
+		createdNanos = uint32(123_456_789)
+		closeNS      = uint64(1_700_000_300_000_000_000)
+	)
+	data := make([]byte, rawEventWireSize)
+	binary.LittleEndian.PutUint64(data[0:8], closeNS)
+	data[40], data[41] = 0x30, 0x39
+	data[42], data[43] = 0x01, 0xbb
+	data[52] = eventTypeSessionClose
+	data[53] = 6
+	data[55] = addrFamilyInet
+	copy(data[8:12], net.ParseIP("10.0.1.102").To4())
+	copy(data[24:28], net.ParseIP("172.16.80.200").To4())
+	// offset 44: #2853 created-subsec-nanos (must survive).
+	binary.LittleEndian.PutUint32(data[44:48], createdNanos)
+	// offset 136: #3056 admitting policy ID (LE u32) — the close-only slot.
+	binary.LittleEndian.PutUint32(data[rawEventPolicyCloseOffset:rawEventPolicyCloseOffset+4], policyID)
+
+	rec, ok := DecodeRawEventRecord(data)
+	if !ok {
+		t.Fatal("DecodeRawEventRecord rejected a valid SESSION_CLOSE frame")
+	}
+	if rec.PolicyID != policyID {
+		t.Fatalf("rec.PolicyID = %d, want %d (offset 136 LE u32 on a close)", rec.PolicyID, policyID)
+	}
+	if rec.CreatedNanos != createdNanos {
+		t.Fatalf("rec.CreatedNanos = %d, want %d ([44:48] must not be clobbered by the policy read)",
+			rec.CreatedNanos, createdNanos)
 	}
 }
 

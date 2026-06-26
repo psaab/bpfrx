@@ -1303,6 +1303,83 @@ fn apply_nat_ipv4_recomputes_tcp_checksum() {
     assert!(tcp_checksum_ok_ipv4(&packet));
 }
 
+// #3111 FAIL-ON-REVERT: the generic NAT rewriter must NOT write an L4
+// "port" for a port-less protocol. apply_nat_ipv4 is fed a NatDecision
+// that (as a buggy pool allocator would) carries rewrite_src_port =
+// Some(_) for a GRE packet. The TCP|UDP gate in apply_nat_port_rewrite
+// must suppress the port write so the first two bytes of the GRE header
+// (flags/version) survive; only the source IP is translated. Reverting
+// that gate writes 0xBEEF over the GRE flags -> RED.
+#[test]
+fn apply_nat_ipv4_gre_preserves_l4_header() {
+    let mut packet = vec![
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 64, crate::ip_proto::PROTO_GRE, 0x00, 0x00,
+        10, 0, 1, 100, 8, 8, 8, 8,
+        // GRE header: flags/version, protocol-type, then key.
+        0x30, 0x01, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef,
+    ];
+    let ip_sum = checksum16(&packet[..20]);
+    packet[10] = (ip_sum >> 8) as u8;
+    packet[11] = ip_sum as u8;
+
+    apply_nat_ipv4(
+        &mut packet,
+        crate::ip_proto::PROTO_GRE,
+        NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+            rewrite_src_port: Some(0xBEEF),
+            ..NatDecision::default()
+        },
+        false,
+    )
+    .expect("apply nat");
+
+    // Source IP translated, destination untouched.
+    assert_eq!(&packet[12..16], &[203, 0, 113, 1]);
+    assert_eq!(&packet[16..20], &[8, 8, 8, 8]);
+    // GRE flags/version (first 2 L4 bytes) PRESERVED.
+    assert_eq!(
+        &packet[20..22],
+        &[0x30, 0x01],
+        "GRE header must not be overwritten by a NAT port"
+    );
+}
+
+// #3111 FAIL-ON-REVERT: same gate, ESP (proto 50). A port write at the L4
+// offset would land on the ESP SPI high half. The whole SPI must survive;
+// only the source IP is translated.
+#[test]
+fn apply_nat_ipv4_esp_preserves_spi() {
+    let mut packet = vec![
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 64, crate::ip_proto::PROTO_ESP, 0x00, 0x00,
+        10, 0, 1, 100, 8, 8, 8, 8,
+        // ESP header: SPI (4B) + sequence (4B).
+        0xAA, 0xBB, 0xCC, 0xDD, 0x00, 0x00, 0x00, 0x01,
+    ];
+    let ip_sum = checksum16(&packet[..20]);
+    packet[10] = (ip_sum >> 8) as u8;
+    packet[11] = ip_sum as u8;
+
+    apply_nat_ipv4(
+        &mut packet,
+        crate::ip_proto::PROTO_ESP,
+        NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+            rewrite_src_port: Some(0xBEEF),
+            ..NatDecision::default()
+        },
+        false,
+    )
+    .expect("apply nat");
+
+    assert_eq!(&packet[12..16], &[203, 0, 113, 1]);
+    assert_eq!(
+        &packet[20..24],
+        &[0xAA, 0xBB, 0xCC, 0xDD],
+        "ESP SPI must not be overwritten by a NAT port"
+    );
+}
+
 #[test]
 fn extract_l3_packet_with_nat_rewrites_reverse_snat_reply_v4() {
     let mut frame = Vec::new();

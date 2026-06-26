@@ -345,6 +345,19 @@ func compilePolicy(polInst struct {
 			case "deny":
 				pol.Action = PolicyDeny
 				pol.terminalActions = append(pol.terminalActions, PolicyDeny)
+				// #3141: a flat-set `then deny log session-init` collapses the
+				// log/count modifier onto the deny node
+				// (Keys=["deny","log","session-init",...], no children) instead
+				// of nesting it as a sibling `then log` node. The deny arm used
+				// to read only t.Name() and silently dropped the collapsed
+				// modifier, so deny-with-logging committed but never logged.
+				// Wire the collapsed log/count modifier here so deny+log works
+				// in BOTH the flat-collapsed and the separate-node
+				// (`then { deny; log session-init; }`, handled by the `log` arm)
+				// forms — matching the standalone `then log`/`then count` arms.
+				// validatePolicyThenDenyStrict rejects any OTHER (non-log,
+				// non-count) collapsed deny modifier at commit (#3141).
+				applyCollapsedDenyModifiers(pol, t)
 			case "reject":
 				pol.Action = PolicyReject
 				pol.terminalActions = append(pol.terminalActions, PolicyReject)
@@ -386,6 +399,84 @@ func compilePolicy(polInst struct {
 	}
 
 	return pol
+}
+
+// recognizedCollapsedDenyToken reports whether tok is a token that
+// applyCollapsedDenyModifiers acts on inside a FLAT-collapsed `then deny`
+// sequence — the `log`/`count` modifiers plus log's session-init/
+// session-close sub-tokens. On the flat path the lexer flattens a modifier
+// and its sub-tokens into a single Keys slice (e.g.
+// Keys=["deny","log","session-init","count"]), so the validator cannot tell
+// a modifier from a sub-token positionally; it accepts exactly the tokens
+// the wiring consumes and rejects anything else. This is the single source
+// of truth shared by applyCollapsedDenyModifiers (the wiring) and
+// validatePolicyThenDenyStrict (the reject gate) so they never disagree on
+// what is a supported token vs an unsupported modifier that would be
+// silently dropped (#3141).
+func recognizedCollapsedDenyToken(tok string) bool {
+	switch tok {
+	case "log", "session-init", "session-close", "count":
+		return true
+	default:
+		return false
+	}
+}
+
+// applyCollapsedDenyModifiers wires a `log`/`count` action modifier that a
+// flat-set `then deny <modifier>` collapsed onto the deny node, so deny+log
+// (and deny+count) work in the flat form exactly as they do as separate
+// `then` siblings (#3141). The modifier appears in TWO AST shapes:
+//   - Flat set `then deny log session-init` collapses the whole tail onto
+//     the deny node: Keys=["deny","log","session-init"] (no children).
+//     Keys[0] is "deny"; Keys[1:] carry the modifier and its sub-tokens.
+//   - A hierarchical `then { deny { log { session-init; } } }` (non-canonical
+//     but parseable) nests the modifier as a child node of deny.
+//
+// Only `log` (with session-init/session-close sub-tokens) and `count` are
+// recognized — the exact set the standalone `then log`/`then count` arms
+// support. Any OTHER collapsed deny modifier is left untouched here and
+// rejected at commit by validatePolicyThenDenyStrict, mirroring the #3114/
+// #3115 then-permit/then-reject reject-at-commit gates.
+func applyCollapsedDenyModifiers(pol *Policy, denyNode *Node) {
+	apply := func(tok string) {
+		switch tok {
+		case "log":
+			if pol.Log == nil {
+				pol.Log = &PolicyLog{}
+			}
+		case "session-init":
+			if pol.Log == nil {
+				pol.Log = &PolicyLog{}
+			}
+			pol.Log.SessionInit = true
+		case "session-close":
+			if pol.Log == nil {
+				pol.Log = &PolicyLog{}
+			}
+			pol.Log.SessionClose = true
+		case "count":
+			pol.Count = true
+		}
+	}
+	// Flat-collapsed tail: Keys[1:] (Keys[0] == "deny").
+	if len(denyNode.Keys) >= 2 {
+		for _, k := range denyNode.Keys[1:] {
+			apply(k)
+		}
+	}
+	// Hierarchical children (non-canonical shape).
+	var walk func(n *Node)
+	walk = func(n *Node) {
+		for _, k := range n.Keys {
+			apply(k)
+		}
+		for _, c := range n.Children {
+			walk(c)
+		}
+	}
+	for _, c := range denyNode.Children {
+		walk(c)
+	}
 }
 
 func compileScreen(node *Node, sec *SecurityConfig) error {

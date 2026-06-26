@@ -31,6 +31,7 @@ fn zone_snapshot_host_inbound_fields_roundtrip() {
         host_inbound_configured: true,
         host_inbound_system_services: vec!["ssh".into(), "ping".into(), "ike".into()],
         host_inbound_protocols: vec!["ospf".into(), "router-discovery".into()],
+        ..Default::default()
     };
     let value: serde_json::Value =
         serde_json::to_value(&zone).expect("serialize ZoneSnapshot to Value");

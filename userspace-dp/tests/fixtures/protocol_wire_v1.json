@@ -1143,6 +1143,7 @@
     "host_inbound_protocols": [],
     "host_inbound_system_services": [],
     "id": 0,
-    "name": ""
+    "name": "",
+    "tcp_rst": false
   }
 }

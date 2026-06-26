@@ -39,6 +39,15 @@ const SESSION_GC_INTERVAL_NS: u64 = 1_000_000_000;
 const DEFAULT_MAX_SESSIONS: usize = 131072;
 const DEFAULT_TCP_SESSION_TIMEOUT_NS: u64 = 300_000_000_000;
 const TCP_CLOSING_TIMEOUT_NS: u64 = 30_000_000_000;
+/// #3046: a session torn down by RST is reaped far faster than a graceful
+/// FIN close. A RST abruptly aborts the socket — there is no half-closed /
+/// delayed-ACK / retransmit window to keep state alive for, so holding the
+/// entry for the full 30s `TCP_CLOSING_TIMEOUT_NS` only lets a reset-flood (or
+/// any high-churn reset workload) saturate the session table with dead
+/// connections and delay port reuse. 2s matches the "reap RST quickly"
+/// posture of Junos and is well under Linux conntrack's CLOSE timeout while
+/// still tolerating a stray reordered segment after the RST.
+const TCP_RST_TIMEOUT_NS: u64 = 2_000_000_000;
 const DEFAULT_UDP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
 const DEFAULT_ICMP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
 const OTHER_SESSION_TIMEOUT_NS: u64 = 30_000_000_000;
@@ -256,6 +265,13 @@ struct SessionEntry {
     created_ns: u64,
     expires_after_ns: u64,
     closing: bool,
+    /// #3046: set once this TCP session has been seen carrying a RST. It is
+    /// sticky (never cleared back to false while the entry lives) so that a
+    /// stray reordered non-RST segment arriving after the RST cannot promote
+    /// the entry back to the 30s graceful-FIN `TCP_CLOSING_TIMEOUT_NS`. When
+    /// set together with `closing`, the timeout selection uses the short
+    /// `TCP_RST_TIMEOUT_NS` instead of the FIN close timeout.
+    reset: bool,
     /// #965: absolute wheel tick at which this session is scheduled to
     /// be checked for expiration. Updated on every push to the wheel.
     /// A WheelEntry whose `scheduled_tick != entry.wheel_tick` is a
@@ -918,8 +934,23 @@ impl SessionTable {
             record.entry.origin = origin;
             record.entry.install_epoch = epoch;
             record.entry.last_seen_ns = now_ns;
-            record.entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &self.timeouts);
+            // #3046: RST is sticky — once observed it keeps the entry on the
+            // short RST timeout even if a later (reordered) segment lacks RST.
+            // Set it BEFORE selecting the timeout so the expires decision below
+            // consults the sticky flag (mirrors lookup.rs). Otherwise a
+            // peer-synced entry that already had reset=true, promoted via a
+            // non-RST FIN trigger, would wrongly revert to the 30s FIN window.
+            record.entry.reset |= matches!(protocol, PROTO_TCP) && has_rst(tcp_flags);
             record.entry.closing = matches!(protocol, PROTO_TCP) && is_closing(tcp_flags);
+            record.entry.expires_after_ns = if record.entry.closing {
+                if record.entry.reset {
+                    TCP_RST_TIMEOUT_NS
+                } else {
+                    TCP_CLOSING_TIMEOUT_NS
+                }
+            } else {
+                session_timeout_ns(protocol, tcp_flags, &self.timeouts)
+            };
             // wheel_tick deliberately preserved (parity with restore_entry).
             // #2120: a real-traffic refresh (or a peer→local promote) means
             // this entry now genuinely lives on this node — it leaves the
@@ -1471,7 +1502,14 @@ fn session_timeout_ns(protocol: u8, tcp_flags: u8, timeouts: &SessionTimeouts) -
     match protocol {
         PROTO_TCP => {
             if is_closing(tcp_flags) {
-                TCP_CLOSING_TIMEOUT_NS
+                // #3046: a RST close is reaped on the short timeout; only a
+                // graceful FIN-only close gets the full 30s TIME_WAIT-style
+                // window.
+                if has_rst(tcp_flags) {
+                    TCP_RST_TIMEOUT_NS
+                } else {
+                    TCP_CLOSING_TIMEOUT_NS
+                }
             } else {
                 timeouts.tcp_established_ns
             }

@@ -9,6 +9,7 @@ use super::super::byte_writes::{
     write_ipv4_dst, write_ipv4_src, write_l4_dst_port, write_l4_src_port,
 };
 use crate::afxdp::{RewriteDescriptor, UserspaceDpMeta, PROTO_TCP, PROTO_UDP};
+use crate::ip_proto::has_l4_ports;
 use std::net::IpAddr;
 
 #[inline(always)]
@@ -60,7 +61,15 @@ pub(in crate::afxdp::frame) fn apply_rewrite_descriptor_ipv4(
     }
 
     // NAT: direct byte writes for L4 ports.
-    if apply_nat {
+    //
+    // #3111: only rewrite ports for protocols that actually carry a
+    // 16-bit port pair at offset +0/+2 (TCP/UDP). A port-less protocol
+    // (GRE/ESP/AH/OSPF/...) has no port field; writing here would clobber
+    // the first two L4 bytes (ESP SPI / GRE flags). The allocator already
+    // leaves `rewrite_src_port` unset for these, but this guard mirrors
+    // the generic rewriter's TCP|UDP gate so neither path can corrupt a
+    // tunnel header even if a stale descriptor still carries a port.
+    if apply_nat && has_l4_ports(meta.protocol) {
         if let Some(new_sport) = rd.rewrite_src_port {
             write_l4_src_port(packet, l4, new_sport);
         }
