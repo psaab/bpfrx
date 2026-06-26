@@ -1,3 +1,28 @@
+## 2026-06-26 — #2981 V_min lag throttle skips UNSHAPED shared-exact queues
+
+- **Timestamp**: 2026-06-26
+- **Action**: Exclude UNSHAPED shared-exact CoS queues from the V_min
+  fairness-brake. `compute_v_min_lag_threshold` sizes the per-worker drift
+  budget as `per_worker_rate × 1 ms` clamped to a 24 KB floor; for an
+  unshaped queue `transmit_rate_bytes() == 0` ("unshaped/full bucket",
+  types/cos.rs), so `per_worker_rate` is 0 and the threshold collapses to
+  the 24 KB floor (~16 MTU, <2 µs at 100 Gbps). Ordinary thread/NIC jitter
+  exceeds that, tripping the brake continuously and capping multi-core TX
+  even with no configured rate limit. Fix: `cos_queue_v_min_continue`
+  early-returns continue (resets `consecutive_v_min_skips`) when
+  `transmit_rate_bytes == 0`, the same disposition as the `!shared_exact()`
+  gate. SHAPED queues (`transmit_rate_bytes > 0`) are byte-identical —
+  threshold and gating decision unchanged. Allocation-free, one branch on
+  the existing `transmit_rate_bytes` local.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_ops/v_min.rs,
+  userspace-dp/src/afxdp/cos/queue_ops/v_min_tests.rs,
+  docs/fairness-regimes.md, _Log.md
+- **Validation**: `cargo build --release` clean; `cargo test --release
+  v_min` 32 passed; full cos suite 305 passed / 2 ignored. Three new tests:
+  `vmin_unshaped_queue_not_throttled` (RED on revert),
+  `vmin_shaped_queue_still_throttles` (GREEN — guards no over-broadening),
+  `vmin_shaped_threshold_is_byte_identical` (GREEN — pins shaped values).
+
 ## 2026-06-26 — #3082 screen lenient-path missing-profile runtime WARN (signal only)
 
 - **Timestamp**: 2026-06-26

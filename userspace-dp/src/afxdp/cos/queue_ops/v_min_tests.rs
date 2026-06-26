@@ -1517,3 +1517,148 @@ fn vmin_prepared_drain_budget_miss_does_not_advance_cadence() {
         "a confirmed pop must advance the V_min cadence counter exactly once (Prepared)",
     );
 }
+
+/// #2981: an UNSHAPED shared-exact queue (`transmit_rate_bytes == 0`)
+/// must NOT be throttled by the V_min lag check, even when the local
+/// worker's vtime is far past a participating peer's V_min — much
+/// further than the 24 KB `V_MIN_MIN_LAG_BYTES` floor that the
+/// collapsed (rate-0) threshold would otherwise enforce. With no
+/// configured rate there is nothing to be fair to, so the brake is
+/// skipped entirely (mirroring the `!shared_exact()` disposition).
+///
+/// fail-on-revert: removing the `transmit_rate_bytes == 0` early
+/// return in `cos_queue_v_min_continue` makes this queue throttle
+/// against the 24 KB floor → the assertion goes RED.
+#[test]
+fn vmin_unshaped_queue_not_throttled() {
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "iperf-c".into(),
+            priority: 5,
+            // UNSHAPED: 0 == "unshaped/full bucket" (types/cos.rs).
+            transmit_rate_bytes: 0,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: 4 * 1024 * 1024,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let queue = &mut root.queues[0];
+    let floor = attach_test_vtime_floor(queue, 4, 1);
+
+    // Peer worker 0 pegged at vtime 0; local worker 1 is 100 MB ahead
+    // — vastly past the 24 KB floor a rate-0 threshold would impose.
+    floor.slots[0].publish(0);
+    test_flow_fair_state_mut(queue).queue_vtime = 100 * 1024 * 1024;
+
+    assert!(
+        cos_queue_v_min_continue(queue, 1),
+        "UNSHAPED shared-exact queue MUST NOT be throttled by V_min \
+         (no configured rate → no fairness brake)",
+    );
+    // No throttle accounting should fire on the skip path.
+    assert_eq!(
+        queue.v_min.v_min_throttles_scratch, 0,
+        "unshaped skip must not count a throttle",
+    );
+    assert_eq!(
+        queue.v_min.consecutive_v_min_skips, 0,
+        "unshaped skip must not arm the hard-cap counter",
+    );
+}
+
+/// #2981 regression: a SHAPED shared-exact queue
+/// (`transmit_rate_bytes > 0`) STILL applies the V_min throttle at
+/// the same drift that the unshaped test above tolerates. This is the
+/// byte-for-byte unchanged shaped behavior — the fix must touch only
+/// the unshaped (rate-0) case.
+///
+/// fail-on-revert: this test stays GREEN under the revert (shaped
+/// gating is not what changed); it is the guard that the fix did not
+/// over-broaden the skip to shaped queues.
+#[test]
+fn vmin_shaped_queue_still_throttles() {
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "iperf-c".into(),
+            priority: 5,
+            // SHAPED: a real configured rate (10 Gb/s).
+            transmit_rate_bytes: 10_000_000_000 / 8,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: 4 * 1024 * 1024,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let queue = &mut root.queues[0];
+    let floor = attach_test_vtime_floor(queue, 4, 1);
+
+    // Same peer/local drift as the unshaped test — a shaped queue
+    // throttles here exactly as before the fix.
+    floor.slots[0].publish(0);
+    test_flow_fair_state_mut(queue).queue_vtime = 100 * 1024 * 1024;
+
+    assert!(
+        !cos_queue_v_min_continue(queue, 1),
+        "SHAPED shared-exact queue MUST still throttle when local \
+         vtime >> peer V_min + LAG",
+    );
+    assert_eq!(
+        queue.v_min.v_min_throttles_scratch, 1,
+        "shaped throttle still bumps the throttle counter",
+    );
+}
+
+/// #2981: the lag-threshold computation for SHAPED queues is
+/// byte-identical to before the fix. The fix lives in
+/// `cos_queue_v_min_continue`, not in `compute_v_min_lag_threshold`;
+/// this pins the representative shaped value so a future refactor of
+/// either site can't silently change shaped fairness.
+///
+/// 10 Gb/s = 1_250_000_000 B/s over 2 participating workers →
+/// 625_000_000 B/s per worker × 1 ms = 625_000 B, well above the
+/// 24 KB floor. The rate-0 (unshaped) input still returns the floor —
+/// the helper is unchanged; the throttle is skipped upstream instead.
+#[test]
+fn vmin_shaped_threshold_is_byte_identical() {
+    // Representative shaped rate: 10 Gb/s across 2 workers.
+    assert_eq!(
+        compute_v_min_lag_threshold(10_000_000_000 / 8, 2),
+        625_000,
+        "shaped per-worker-rate × 1 ms threshold must be unchanged",
+    );
+    // Single participant takes the whole rate.
+    assert_eq!(
+        compute_v_min_lag_threshold(10_000_000_000 / 8, 1),
+        1_250_000,
+        "single-worker shaped threshold must be unchanged",
+    );
+    // A small shaped rate where per-worker × 1 ms falls below the
+    // floor still clamps to V_MIN_MIN_LAG_BYTES (unchanged).
+    assert_eq!(
+        compute_v_min_lag_threshold(1_000_000, 1),
+        V_MIN_MIN_LAG_BYTES,
+        "shaped rate below the floor still clamps to V_MIN_MIN_LAG_BYTES",
+    );
+    // The rate-0 helper input is unchanged (returns the floor); the
+    // unshaped behavior change is in cos_queue_v_min_continue, not here.
+    assert_eq!(
+        compute_v_min_lag_threshold(0, 4),
+        V_MIN_MIN_LAG_BYTES,
+        "compute_v_min_lag_threshold(0, _) is unchanged — clamps to the floor",
+    );
+}
