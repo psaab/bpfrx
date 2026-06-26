@@ -147,6 +147,15 @@ type Config struct {
 	// token resolves to its live feed prefixes. Optional; if nil the
 	// simulator resolves feed-backed names to their static content only.
 	FeedOverlayFn func() map[string][]string
+	// PolicySchedulerActiveStateFn returns the live daemon-local per-scheduler
+	// active-state map (the same view Manager.PolicySchedulerActiveState
+	// exposes to the CLI/gRPC show surfaces) plus whether it could be queried
+	// (#3104). The `match-policies` simulator consults it so a scheduler-inactive
+	// policy is skipped exactly like the runtime (policy.rs try_match_rule),
+	// instead of reporting a definitive verdict the dataplane disagrees with.
+	// Optional; if nil or it returns ok=false the simulator evaluates scheduled
+	// policies as-if-active (the pre-#3104 behavior / #3062 display fallback).
+	PolicySchedulerActiveStateFn func() (map[string]bool, bool)
 }
 
 // Server is the HTTP API server.
@@ -176,6 +185,7 @@ type Server struct {
 	surfaceAStatsFn         func() *ddns.SurfaceAStats
 	flowCollectorHealthFn   func() []flowexport.ExporterCollectorHealth
 	feedOverlayFn           func() map[string][]string
+	policySchedActiveFn     func() (map[string]bool, bool)
 	startTime               time.Time
 }
 
@@ -205,6 +215,7 @@ func NewServer(cfg Config) *Server {
 		surfaceAStatsFn:         cfg.SurfaceAStatsFn,
 		flowCollectorHealthFn:   cfg.FlowCollectorHealthFn,
 		feedOverlayFn:           cfg.FeedOverlayFn,
+		policySchedActiveFn:     cfg.PolicySchedulerActiveStateFn,
 		startTime:               time.Now(),
 	}
 

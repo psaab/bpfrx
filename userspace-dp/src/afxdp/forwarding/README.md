@@ -17,6 +17,7 @@ slow-path-injected.
 | File | Purpose |
 |------|---------|
 | `mod.rs` | `classify_metadata` + the FIB / next-hop traversal entry points. |
+| `host_inbound.rs` | #3070 host-inbound-traffic admission: classifies a zone's Junos `system-services` / `protocols` tokens into a `ZoneHostInbound` set and provides `host_inbound_admits` for the local-delivery path. |
 | `tests.rs` | Co-located unit tests covering classify, FIB lookup, multi-table next-table leaking. |
 
 ## Constants
@@ -103,6 +104,56 @@ next-hops, preference 0). The wire specimen lives in
   and encode the L2 header.
 - Has no cross-binding back-edges — the per-worker hot path stays
   on its own UMEM.
+
+## Host-inbound-traffic enforcement (#3070)
+
+`security zones <z> host-inbound-traffic { system-services ...; protocols
+...; }` controls which host-bound services are admitted to a firewall-local
+interface IP (SSH, ping, routing protocols on the box itself).
+
+**Two enforcement layers — kernel is primary, this userspace check is the
+secondary edge-case path.** Ordinary host-bound traffic to an interface IP /
+VRRP VIP is shunted to the LINUX KERNEL by the XDP shim
+(`is_local_destination` → `cpumap_or_pass`/`PASS_TO_KERNEL` in
+`userspace-xdp/src/lib.rs`) BEFORE it reaches userspace-dp, so the
+authoritative host-inbound enforcement for those packets lives in the kernel
+`chain input` (table `inet xpf_hostinbound`, built in
+`pkg/daemon/daemon_nft.go` from `userspace.BuildZoneHostInboundViews`,
+mirroring the lo0-filter precedent). The userspace LocalDelivery check below
+covers only the subset that actually reaches the XSK — DNAT-to-self,
+static-NAT to a firewall service, embedded-ICMP, DNS edge cases. **Both layers
+share the same per-zone token set; keep the Go nft token→match mapping
+(`hostInboundServiceMatches`/`hostInboundProtocolMatches`) in sync with the
+Rust classifier here.**
+
+The set is parsed and modeled in Go
+(`config.ZoneConfig.HostInboundTraffic`) and crosses the snapshot boundary on
+`ZoneSnapshot`
+(`host_inbound_configured` + the raw `host_inbound_system_services` /
+`host_inbound_protocols` token slices — JSON keys byte-identical on both
+sides per #1961). `forwarding_build::zones::populate_zones` classifies the
+tokens into a `ZoneHostInbound` (`host_inbound.rs`) keyed by the same
+validated zone id and stores it in `ForwardingState::zone_host_inbound`.
+
+Enforcement runs on the **local-delivery admit path only** (transit
+traffic never pays for it), at BOTH sites in `poll_descriptor`:
+
+- **session miss** — a host-bound packet whose service/protocol is not in
+  the ingress zone's set is dropped and never cached.
+- **session hit** — re-checked every packet (mirroring the lo0-filter
+  re-check) so a tightened host-inbound config tears down an
+  already-established host-bound session WITHOUT an explicit purge.
+
+`host_inbound_admits` returns admit when the zone has **no** stanza (the
+zone is absent from `zone_host_inbound`), preserving the pre-#3070
+admit-all behaviour — a deliberate, zero-regression deviation from strict
+Junos (which denies host-bound traffic to an unconfigured zone). Token
+classification covers the common Junos `system-services` (ssh, ping, dns,
+dhcp/dhcpv6, ike, ntp, snmp, ...) and `protocols` (ospf, bgp,
+router-discovery, ...) names; `all` / `any-service` short-circuit to a full
+admit; an unrecognised token contributes nothing (fail-closed). ICMP-based
+services (`ping`, `router-discovery`) admit at L4-protocol granularity, not
+ICMP sub-type.
 
 ## Host-terminated IPsec passthrough
 

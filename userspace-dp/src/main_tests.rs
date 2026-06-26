@@ -445,6 +445,94 @@ fn plan_key_covers_every_replan_queues_input() {
     );
 }
 
+// #3007 fail-on-revert: when the snapshot carries the degenerate `rx_queues ==
+// 0` fallback, `replan_queues` reads the live channel count from sysfs
+// (`rx_queue_count`) and THAT count drives the layout. The plan key MUST hash
+// the same resolved count — otherwise two refreshes with the same (rx_queues=0)
+// snapshot but a DIFFERENT actual sysfs channel count (operator ran `ethtool -L
+// <if> combined N` out of band, no config commit) share a plan key, the
+// same-plan-skip is taken, and the queues are never re-planned to the new count.
+//
+// Revert proof: change the iface hash in `update_snapshot_binding_plan_key` back
+// to hashing `iface.rx_queues` (the raw 0) instead of `effective_rx_queues(...)`
+// and this test goes RED — both keys collapse to the same 0-derived hash.
+#[test]
+fn plan_key_folds_sysfs_resolved_rx_queues_when_snapshot_is_zero() {
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, set_rx_queue_count_override, snapshot_binding_plan_key,
+    };
+
+    // Degenerate snapshot: the Go control plane did not populate a count.
+    let mk = || ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0/0/1".to_string(),
+            linux_name: "ge-0-0-1".to_string(),
+            zone: "trust".to_string(),
+            ifindex: 11,
+            rx_queues: 0,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // sysfs reports 4 combined channels.
+    set_rx_queue_count_override("ge-0-0-1", 4);
+    let key_4 = snapshot_binding_plan_key(&mk());
+
+    // Operator runs `ethtool -L ge-0-0-1 combined 6` out of band; the snapshot
+    // is byte-identical (still rx_queues=0) but the live channel count changed.
+    set_rx_queue_count_override("ge-0-0-1", 6);
+    let key_6 = snapshot_binding_plan_key(&mk());
+
+    clear_rx_queue_count_override();
+
+    assert_ne!(
+        key_4, key_6,
+        "an out-of-band channel change (sysfs rx-queue count) MUST bump the plan \
+         key when the snapshot rx_queues is the degenerate 0 fallback (#3007); \
+         otherwise the same-plan-skip leaves a stale single-/under-queued layout"
+    );
+}
+
+// #3007 no-regression: for a NONZERO snapshot rx_queues the plan key must be
+// independent of sysfs — the resolved count equals the raw field, sysfs is never
+// read, and the key is byte-identical to the pre-#3007 hash for the normal case.
+#[test]
+fn plan_key_for_nonzero_rx_queues_ignores_sysfs() {
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, set_rx_queue_count_override, snapshot_binding_plan_key,
+    };
+
+    let snap = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0/0/1".to_string(),
+            linux_name: "ge-0-0-1".to_string(),
+            zone: "trust".to_string(),
+            ifindex: 11,
+            rx_queues: 6,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // No override: real sysfs returns 0 for the fake netdev, but rx_queues>0 so
+    // it is never consulted. This is the pre-#3007 code path (hash iface.rx_queues).
+    clear_rx_queue_count_override();
+    let baseline = snapshot_binding_plan_key(&snap);
+
+    // Even a wildly different sysfs count must NOT change the key when the
+    // snapshot already carries a real count.
+    set_rx_queue_count_override("ge-0-0-1", 999);
+    let with_override = snapshot_binding_plan_key(&snap);
+    clear_rx_queue_count_override();
+
+    assert_eq!(
+        baseline, with_override,
+        "a nonzero snapshot rx_queues must produce a plan key independent of \
+         sysfs (no regression for the normal case, #3007)"
+    );
+}
+
 // #3091 fail-on-revert: a WAN VLAN unit (`reth0.80` → Linux `ge-0-0-2.80`) is a
 // software VLAN device that the kernel exposes with a SINGLE RX queue. Its
 // physical parent (`ge-0-0-2`) carries the VLAN-tagged frames on its 6 hardware

@@ -637,6 +637,23 @@ fn update_snapshot_binding_plan_key(hasher: &mut Sha256, snapshot: &ConfigSnapsh
         // so re-parenting or VLAN-tag changes trigger a replan (never a stale
         // plan). Additive: an old Go binary that omits them serializes the
         // serde defaults (0 / ""), matching the non-VLAN physical case.
+        //
+        // #3007: hash the EFFECTIVE rx_queues, not the raw snapshot field. When
+        // the snapshot carries the degenerate `rx_queues == 0` fallback,
+        // `replan_queues` resolves the real queue count from sysfs
+        // (`rx_queue_count`), and THAT count drives `queue_count`/the layout. The
+        // plan key must hash the same resolved value, or an out-of-band channel
+        // change (`ethtool -L <if> combined N`, no config commit) would leave the
+        // snapshot at 0, keep the key identical, and take the same-plan-skip while
+        // the planner would actually produce a different layout. For a nonzero
+        // snapshot the resolved value equals the raw field (sysfs is not read), so
+        // the key is byte-identical to the pre-#3007 hash for the normal case.
+        let resolved_linux_name = if iface.linux_name.is_empty() {
+            linux_ifname(&iface.name)
+        } else {
+            iface.linux_name.clone()
+        };
+        let rx_queues = effective_rx_queues(iface.rx_queues, &resolved_linux_name);
         hash_update(
             hasher,
             &format!(
@@ -645,7 +662,7 @@ fn update_snapshot_binding_plan_key(hasher: &mut Sha256, snapshot: &ConfigSnapsh
                 iface.linux_name,
                 iface.ifindex,
                 iface.parent_ifindex,
-                iface.rx_queues,
+                rx_queues,
                 iface.tunnel,
                 iface.vlan_id,
                 iface.parent_linux_name
@@ -653,11 +670,16 @@ fn update_snapshot_binding_plan_key(hasher: &mut Sha256, snapshot: &ConfigSnapsh
         );
     }
     for fab in &snapshot.fabrics {
+        // #3007: same effective-rx_queues resolution as the fabric candidate
+        // loop in `replan_queues` — sysfs fallback when the snapshot is 0, then
+        // `.max(1)` (fabric needs at least one TX queue). Keeps the key in lock
+        // step with the value that drives the fabric candidate's queue count.
+        let rx_queues = effective_rx_queues(fab.rx_queues, &fab.parent_linux_name).max(1);
         hash_update(
             hasher,
             &format!(
                 "fabric={}/{}/{}/{};",
-                fab.name, fab.parent_linux_name, fab.parent_ifindex, fab.rx_queues
+                fab.name, fab.parent_linux_name, fab.parent_ifindex, rx_queues
             ),
         );
     }
@@ -897,11 +919,10 @@ pub(crate) fn replan_queues(
             if seen_linux.contains(&linux_name) {
                 continue;
             }
-            let rx_queues = if iface.rx_queues > 0 {
-                iface.rx_queues
-            } else {
-                rx_queue_count(&linux_name)
-            };
+            // #3007: resolve the effective rx_queues ONCE (snapshot value if
+            // nonzero, else sysfs). `snapshot_binding_plan_key` hashes the SAME
+            // helper, so the dedup key can never disagree with the layout.
+            let rx_queues = effective_rx_queues(iface.rx_queues, &linux_name);
             if rx_queues > 0 {
                 ifindex_by_name.insert(linux_name.clone(), iface.ifindex);
                 seen_linux.insert(linux_name.clone());
@@ -917,11 +938,8 @@ pub(crate) fn replan_queues(
             if seen_linux.contains(&fabric.parent_linux_name) {
                 continue;
             }
-            let rx_queues = if fabric.rx_queues > 0 {
-                fabric.rx_queues
-            } else {
-                rx_queue_count(&fabric.parent_linux_name)
-            };
+            // #3007: same effective-rx_queues resolution + plan-key hash.
+            let rx_queues = effective_rx_queues(fabric.rx_queues, &fabric.parent_linux_name);
             let rx_queues = rx_queues.max(1); // fabric needs at least 1 queue for TX
             ifindex_by_name.insert(fabric.parent_linux_name.clone(), fabric.parent_ifindex);
             seen_linux.insert(fabric.parent_linux_name.clone());
@@ -1015,7 +1033,52 @@ pub(crate) fn linux_ifname(name: &str) -> String {
     name.replace('/', "-")
 }
 
+/// Resolve the effective RX queue count that drives the binding layout: the
+/// snapshot's `rx_queues` when nonzero, otherwise the live sysfs channel count
+/// (`rx_queue_count`). This is the SINGLE resolution path consumed by BOTH the
+/// queue planner (`replan_queues`) and the same-plan dedup key
+/// (`update_snapshot_binding_plan_key`), so the key can never hash a value that
+/// disagrees with the layout (#3007). For a nonzero snapshot sysfs is never
+/// read, so the key stays byte-identical to the pre-#3007 hash for the normal
+/// case; the 0 fallback (no committed count) folds the resolved sysfs count into
+/// the key so an out-of-band `ethtool -L` channel change forces a replan.
+pub(crate) fn effective_rx_queues(snapshot_rx_queues: usize, linux_name: &str) -> usize {
+    if snapshot_rx_queues > 0 {
+        snapshot_rx_queues
+    } else {
+        rx_queue_count(linux_name)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for `rx_queue_count`, keyed by netdev name. Lets a
+    /// test drive the sysfs-resolved queue count without a real
+    /// `/sys/class/net/<if>/queues` tree. Thread-local, so parallel test
+    /// threads never cross-contaminate.
+    static RX_QUEUE_COUNT_OVERRIDE: std::cell::RefCell<std::collections::HashMap<String, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(test)]
+pub(crate) fn set_rx_queue_count_override(name: &str, count: usize) {
+    RX_QUEUE_COUNT_OVERRIDE.with(|m| {
+        m.borrow_mut().insert(name.to_string(), count);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn clear_rx_queue_count_override() {
+    RX_QUEUE_COUNT_OVERRIDE.with(|m| m.borrow_mut().clear());
+}
+
 pub(crate) fn rx_queue_count(name: &str) -> usize {
+    #[cfg(test)]
+    {
+        if let Some(count) = RX_QUEUE_COUNT_OVERRIDE.with(|m| m.borrow().get(name).copied()) {
+            return count;
+        }
+    }
     let path = format!("/sys/class/net/{name}/queues");
     let Ok(entries) = fs::read_dir(path) else {
         return 0;

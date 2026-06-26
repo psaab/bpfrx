@@ -20,6 +20,112 @@
   `test_fully_empty_excluded_source_fails_closed_both_families_3023`.
   Fail-on-revert: reverting to the per-family guard turns the v6-only/v4-only
   tests RED while the both-families-empty fail-closed test stays GREEN.
+## 2026-06-26 — #3007 queue-planner plan-key: fold sysfs-resolved rx_queues
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fixed #3007 (follow-up from PR #3001). When a binding
+  candidate's snapshot `rx_queues == 0`, `replan_queues` resolves the real
+  channel count from sysfs (`rx_queue_count`), but the plan-key hash hashed
+  the raw 0 — so an out-of-band `ethtool -L <if> combined N` (no config
+  commit) kept the key identical and the same-plan-skip left a stale queue
+  layout. Extracted `effective_rx_queues(snapshot_rx_queues, linux_name)` as
+  the single resolution path used by BOTH the planner (iface + fabric loops)
+  and `update_snapshot_binding_plan_key`, so the dedup key can never diverge
+  from the layout. Nonzero snapshot never reads sysfs → key byte-identical to
+  pre-fix for the normal case. Added a `#[cfg(test)]` thread-local override
+  on `rx_queue_count` to drive the sysfs count in tests. Did NOT touch the
+  #3091 VLAN-child dedup or the min-collapse.
+- **File(s)**: userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md
+- **Tests**: plan_key_folds_sysfs_resolved_rx_queues_when_snapshot_is_zero
+  (fail-on-revert: RED when the iface hash reverts to `iface.rx_queues`),
+  plan_key_for_nonzero_rx_queues_ignores_sysfs (no-regression). Full suite
+  3075 passed / 2 ignored / 0 failed.
+
+## 2026-06-26 — #3104: policymatch simulator skips scheduler-inactive policies (verdict companion to #3062 display)
+
+- **Timestamp**: 2026-06-26
+- **Action**: fixed #3104. The shared policy simulator (`pkg/policymatch`)
+  returned a definitive permit/deny for scheduled (runtime-inactive) policies,
+  disagreeing with the dataplane (`policy.rs try_match_rule` drops an inactive
+  rule before app/address matching). Threaded live per-scheduler active-state
+  into `policymatch.Query.PolicyInactiveFn`; `ruleMatches` now skips a
+  scheduler-inactive policy FIRST (mirroring the runtime), so the simulator
+  falls through to the next active rule / configured default-policy. Wired at
+  all simulator surfaces: REST `match-policies`, gRPC `MatchPolicies` + `test
+  policy`, and the local CLI `show security match-policies` + `test policy`.
+  The closure is built from the same daemon-local
+  `Manager.PolicySchedulerActiveState` accessor the #3062 display uses, via the
+  new SSOT builder `dataplane/userspace.PolicyInactiveFn` (wraps the shared
+  `PolicyInactive` predicate). Missing-state fallback: when live scheduler
+  state is unavailable to a caller (offline CLI / NoDataplane) the closure is
+  nil and scheduled policies are simulated as-if-active — matching #3062's
+  display fallback and keeping non-scheduled verdicts byte-identical (no
+  regression). Added `pkg/policymatch/scheduler_test.go` (4 cases: inactive
+  permit→default-deny, inactive deny→later active permit, scheduler flip,
+  non-scheduled unchanged); fail-on-revert verified (removing the skip turns
+  the 3 positive cases RED, case 4 stays green).
+- **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/scheduler_test.go,
+  pkg/dataplane/userspace/policies.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_request.go,
+  pkg/grpcapi/server_show_policies_text.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_show_firewall.go, pkg/api/server.go, pkg/api/security.go,
+  pkg/daemon/daemon_run.go, pkg/api/README.md, pkg/cli/README.md,
+  pkg/grpcapi/README.md
+
+## 2026-06-26 — #3169: RX source-MAC dynamic-neighbor learn bypassed mac_change_epoch (stale dst_mac blackhole, sibling of #3048)
+
+- **Timestamp**: 2026-06-26
+- **Action**: fixed #3169. `learn_dynamic_neighbor` (#1787 RX source-MAC
+  data-path learn) inserted under `with_all_shards(|bulk| bulk.insert(..))`
+  with no `mac_change_epoch` bump — the FIFTH neighbor-MAC write path that
+  #3048/#3165 left uncovered. Its `pair_write_needed` gate writes on a
+  genuine MAC change (`current != Some(src_mac)`), and `lookup_neighbor_entry`
+  falls back to `dynamic_neighbors` for unresolved fast-path next-hops, so an
+  RX-learned MAC change left a cached `RewriteDescriptor.dst_mac` stale until
+  session expiry (the #3048 blackhole) and could shadow the monitor's
+  `insert_if_changed`. Added `ShardedNeighborMap::learn_pair_if_changed`
+  (bump-aware multi-key insert modeled on `bulk_replace_neighbors`): snapshots
+  each key's prior MAC via `BulkShardGuard::get` under the all-shard lock,
+  inserts the pair, bumps the epoch exactly once iff any key replaces an
+  existing MAC with a different one. First sighting and same-MAC re-learn add
+  one Relaxed read per key and no bump. Routed the learn through it.
+- **File(s)**: userspace-dp/src/afxdp/sharded_neighbor.rs,
+  userspace-dp/src/afxdp/neighbor_dispatch.rs,
+  userspace-dp/src/afxdp/sharded_neighbor_tests.rs,
+  docs/flow-cache-simplification.md, _Log.md
+- **Validation**: `cargo build --release` clean; `cargo test --release`
+  3007 pass (one pre-existing flaky wg concurrency test
+  `reconcile_peers_snapshot_is_atomic_under_concurrent_load` — passes 3/3 in
+  isolation, unrelated). Added 4 tests `mac_change_epoch_rx_learn_*`;
+  fail-on-revert proven: neutralizing the bump turns
+  `mac_change_epoch_rx_learn_bumps_on_mac_change` and
+  `mac_change_epoch_rx_learn_pair_single_bump_for_both_keys` RED while the two
+  no-bump tests stay GREEN; restored byte-identical.
+## 2026-06-26 — #3070 re-gate: rebase fix/3070-host-inbound onto master
+
+- **Timestamp**: 2026-06-26
+- **Action**: merged origin/master (112 commits ahead) into the #3070
+  host-inbound enforcement branch. Resolved real code conflicts against
+  the concurrently-merged #3071 per-zone `tcp-rst` work, which touched the
+  same ZoneSnapshot wire struct and ForwardingState. Kept BOTH feature
+  sets: Go ZoneSnapshot now carries host_inbound_* (#3070) AND tcp_rst
+  (#3071); Rust snapshot/ForwardingState mirror both; the build-time zone
+  loop populates zone_host_inbound and zone_tcp_rst. Test/fixture literals
+  fixed with `..Default::default()` so neither side's missing fields break
+  compile. protocol_wire_v1.json auto-merged with both field families
+  tag-aligned (Go json tags == Rust serde renames). cargo build/test
+  (3060 passed) and go build + go test ./pkg/dataplane/... ./pkg/config/...
+  ./pkg/daemon/... all green.
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/zones.go, userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/zones.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs
 
 ## 2026-06-25 — #3046: TCP RST sessions reaped on a short timeout (not the 30s FIN close)
 
@@ -965,6 +1071,84 @@
 - **File(s)**: pkg/config/compiler_validate_strict.go,
   pkg/config/compiler.go, pkg/config/zone_interface_membership_test.go,
   pkg/config/README.md, _Log.md
+## 2026-06-25 — #3070 (layer 2): kernel-nftables host-inbound enforcement
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added the PRIMARY kernel-nftables host-inbound enforcement after
+  hostile review found the userspace-dp check (layer 1) only catches the narrow
+  XSK-reaching subset: ordinary host-bound traffic to a firewall interface IP /
+  VRRP VIP (SSH/ping/OSPF/BGP to the box) is shunted to the Linux kernel by the
+  XDP shim (`is_local_destination`) before reaching userspace-dp, and the
+  kernel `chain input` was `policy accept` with only lo0 rules. Added
+  `applyHostInboundFilter` / `buildHostInboundFilterPayload` in
+  `pkg/daemon/daemon_nft.go` (table `inet xpf_hostinbound`, same atomic flush
+  idiom as lo0), consuming a new exported
+  `userspace.BuildZoneHostInboundViews(cfg)` that resolves each
+  host-inbound-CONFIGURED zone's firewall-local host addresses via the
+  canonical interface-snapshot builder. Per zone it accepts the listed
+  system-services/protocols to the zone addrs and DROPs the rest. Token→nft
+  mapping (`hostInboundServiceMatches`/`hostInboundProtocolMatches`) mirrors the
+  Rust classifier. Wired into the apply path next to `applyLo0Filter`. Kept the
+  userspace-dp check as the secondary path (unchanged).
+- **Lifeline safety**: no-stanza zone → no deny (admit-all); management /
+  cluster-control interfaces (fxp0 / em0 / fab*) excluded from address sets
+  (`hostInboundLifelineInterface`); `ct state established,related` + IPv6 ND +
+  v4/v6 PMTUD control accepted before any deny; a configured zone resolving to
+  zero recognized matches fails OPEN (no deny) rather than locking the zone out.
+- **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/host_inbound_nft_test.go (new), pkg/daemon/README.md,
+  pkg/dataplane/userspace/zones.go (BuildZoneHostInboundViews +
+  hostInboundLifelineInterface), pkg/dataplane/userspace/zones_host_inbound_test.go,
+  userspace-dp/src/afxdp/forwarding/README.md (two-layer doc)
+- **Validation**: `go build ./...` clean; `go test ./pkg/daemon/...
+  ./pkg/dataplane/... ./pkg/config/...` green; gofmt clean. New daemon tests:
+  `TestHostInboundFilterAcceptsListedDeniesRest` (fail-on-revert: neutering
+  `emitHostInboundZone` turns it RED — verified), `...NoStanzaNoDeny`,
+  `...LifelineNeverDenied`, `...AllOpensZoneNoDeny`; userspace
+  `TestBuildZoneHostInboundViews` + `TestHostInboundLifelineInterface`. Existing
+  Rust host-inbound tests still pass (userspace path unchanged). NOTE: live
+  SSH-refusal smoke deferred until the loss cluster forwarding bug #3091 clears.
+
+## 2026-06-25 — #3070: enforce host-inbound-traffic on the userspace dataplane
+
+- **Timestamp**: 2026-06-25
+- **Action**: Closed the host-inbound-traffic security-boundary gap. The
+  zone `host-inbound-traffic { system-services; protocols; }` set was parsed
+  and modeled in Go but never reached the dataplane, so host-bound traffic
+  (SSH/ping/routing protocols to a firewall-local IP) was admitted regardless
+  of the configured set. Carried `host_inbound_configured` +
+  `host_inbound_system_services` + `host_inbound_protocols` onto `ZoneSnapshot`
+  (Go emit `pkg/dataplane/userspace/{protocol,zones}.go`; Rust decode
+  `userspace-dp/src/protocol/snapshot.rs`, byte-identical JSON per #1961). Rust
+  classifies the tokens to L4 signatures (`forwarding/host_inbound.rs`,
+  `ZoneHostInbound` in `types/forwarding.rs`, built in `forwarding_build/zones.rs`)
+  and enforces on the local-delivery admit path at BOTH the session-miss and
+  session-hit sites in `afxdp/poll_descriptor/mod.rs` (hit-path re-check tears
+  down a host-bound session when host-inbound config tightens, no explicit
+  purge). A zone with no stanza preserves admit-all (zero-regression default).
+  Added `dhcp`/`dhcpv6` to the lan zone in `docs/ha-cluster-userspace.conf`
+  (reth1.0 runs the dhcp-local-server, now requires the host-inbound entry).
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/zones_host_inbound_test.go (new),
+  userspace-dp/src/protocol/snapshot.rs, userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs (new),
+  userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  userspace-dp/src/afxdp/forwarding_build/zones.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/{tests.rs,test_fixtures.rs},
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/ha-cluster-userspace.conf
+- **Validation**: `cargo build --release -p xpf-userspace-dp` clean;
+  new Rust tests `build_forwarding_state_enforces_host_inbound_traffic` +
+  `zone_snapshot_host_inbound_fields_roundtrip` pass (fail-on-revert: neutering
+  the admit check to always-true turns the enforcement test RED). Go
+  `TestBuildZoneSnapshotsCarriesHostInbound` passes; `go build ./...` +
+  `go test ./pkg/dataplane/... ./pkg/config/...` green. gofmt clean.
+
 ## 2026-06-25 — #3065: unspecified default-policy fails CLOSED (deny-all) + reject-all + schema leaf
 
 - **Timestamp**: 2026-06-25

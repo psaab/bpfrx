@@ -478,11 +478,15 @@ pub(super) fn learn_dynamic_neighbor(
     // get the same MAC under one bulk acquisition so a reader sees
     // either both or neither, never a stale half. Genuine changes
     // (first sighting, MAC flip, removed key) keep this exact path.
-    dynamic_neighbors.with_all_shards(|bulk| {
-        for key in &keys[..n] {
-            bulk.insert(*key, NeighborEntry { mac: src_mac });
-        }
-    });
+    //
+    // #3169: route through the bump-aware bulk insert so a MAC CHANGE on
+    // an existing dynamic neighbor advances `mac_change_epoch` — without
+    // it a flow-cache `RewriteDescriptor.dst_mac` resolved from this map
+    // (lookup_neighbor_entry's dynamic_neighbors fallback) stays stale
+    // until session expiry, the #3048 blackhole class. The bump fires
+    // only on an actual MAC change; a first sighting or same-MAC re-learn
+    // adds a single Relaxed read per key and no bump.
+    dynamic_neighbors.learn_pair_if_changed(&keys[..n], NeighborEntry { mac: src_mac });
 }
 
 pub(super) fn build_missing_neighbor_session_metadata(

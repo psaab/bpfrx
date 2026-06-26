@@ -19,6 +19,43 @@
 use super::*;
 
 
+// #3070: ZoneSnapshot host-inbound-traffic fields round-trip on the Go↔Rust
+// wire. The Go control plane (pkg/dataplane/userspace) emits exactly these
+// JSON keys; an older Go binary that omits them must still decode (serde
+// default → not configured → admit-all).
+#[test]
+fn zone_snapshot_host_inbound_fields_roundtrip() {
+    let zone = ZoneSnapshot {
+        name: "wan".into(),
+        id: 11,
+        host_inbound_configured: true,
+        host_inbound_system_services: vec!["ssh".into(), "ping".into(), "ike".into()],
+        host_inbound_protocols: vec!["ospf".into(), "router-discovery".into()],
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&zone).expect("serialize ZoneSnapshot to Value");
+    assert_eq!(value["host_inbound_configured"], true);
+    assert_eq!(value["host_inbound_system_services"][0], "ssh");
+    assert_eq!(value["host_inbound_system_services"][2], "ike");
+    assert_eq!(value["host_inbound_protocols"][0], "ospf");
+
+    let back: ZoneSnapshot = serde_json::from_value(value).expect("deserialize ZoneSnapshot");
+    assert!(back.host_inbound_configured);
+    assert_eq!(back.host_inbound_system_services, vec!["ssh", "ping", "ike"]);
+    assert_eq!(back.host_inbound_protocols, vec!["ospf", "router-discovery"]);
+
+    // Backward-compat: a payload from an older Go binary without the fields
+    // decodes to "not configured" (admit-all) rather than failing.
+    let legacy: ZoneSnapshot =
+        serde_json::from_str(r#"{"name":"trust","id":3}"#).expect("decode legacy ZoneSnapshot");
+    assert_eq!(legacy.name, "trust");
+    assert_eq!(legacy.id, 3);
+    assert!(!legacy.host_inbound_configured);
+    assert!(legacy.host_inbound_system_services.is_empty());
+    assert!(legacy.host_inbound_protocols.is_empty());
+}
+
 #[test]
 fn process_status_inject_packet_tuple_protocol_version_roundtrip() {
     let status = ProcessStatus {

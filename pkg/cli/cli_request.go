@@ -279,6 +279,9 @@ func (c *CLI) testPolicy(args []string) error {
 		SrcPort:     srcPort,
 		DstPort:     dstPort,
 		FeedOverlay: c.feedOverlay(),
+		// #3104: skip scheduler-inactive policies like the runtime does, so the
+		// simulator falls through to the next active rule / default-policy.
+		PolicyInactiveFn: c.policyInactiveFn(),
 	})
 	if !res.Matched {
 		fmt.Printf("Default %s (no matching policy for %s -> %s)\n",

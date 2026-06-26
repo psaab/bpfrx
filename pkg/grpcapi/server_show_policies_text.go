@@ -44,6 +44,21 @@ func (s *Server) policySchedulerActiveState() (state map[string]bool, ok bool) {
 	return p.PolicySchedulerActiveState(), true
 }
 
+// policyInactiveFn returns a per-policy scheduler-inactivity predicate bound to
+// the live active-state snapshot for use as policymatch.Query.PolicyInactiveFn
+// (#3104), or nil when the runtime scheduler state cannot be queried. When nil
+// the policy simulator treats scheduled policies as active — the pre-#3104
+// behaviour and the same fallback the #3062 display surfaces use when no
+// provider is present — so the verdict never regresses for a surface lacking
+// live state.
+func (s *Server) policyInactiveFn() func(string) bool {
+	state, ok := s.policySchedulerActiveState()
+	if !ok {
+		return nil
+	}
+	return dpuserspace.PolicyInactiveFn(state)
+}
+
 // policyDetailStateSuffix returns the per-policy detail header suffix for
 // a scheduler-inactive policy (", State: inactive, Scheduler: <name>"),
 // or "" otherwise. haveSched gates the lookup so that when the runtime

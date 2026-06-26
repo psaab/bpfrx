@@ -181,6 +181,9 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		SrcPort:     int(req.SourcePort),
 		DstPort:     int(req.DestinationPort),
 		FeedOverlay: overlay,
+		// #3104: skip scheduler-inactive policies like the runtime does, so the
+		// simulator falls through to the next active rule / default-policy.
+		PolicyInactiveFn: s.policyInactiveFn(),
 	})
 	if !res.Matched {
 		return &pb.MatchPoliciesResponse{

@@ -9,6 +9,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/psaab/xpf/pkg/policymatch"
 )
@@ -316,15 +317,27 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	if s.feedOverlayFn != nil {
 		overlay = s.feedOverlayFn()
 	}
+	// #3104: thread live per-scheduler active-state so the simulator skips a
+	// scheduler-inactive policy exactly like the runtime (policy.rs
+	// try_match_rule), falling through to the next active rule / default-policy.
+	// When the daemon has not wired the accessor or state is unavailable, the
+	// closure stays nil and scheduled policies are simulated as-if-active.
+	var inactiveFn func(string) bool
+	if s.policySchedActiveFn != nil {
+		if state, ok := s.policySchedActiveFn(); ok {
+			inactiveFn = dpuserspace.PolicyInactiveFn(state)
+		}
+	}
 	res := policymatch.Match(cfg, policymatch.Query{
-		FromZone:    fromZone,
-		ToZone:      toZone,
-		SrcIP:       srcIP,
-		DstIP:       dstIP,
-		Protocol:    proto,
-		SrcPort:     srcPort,
-		DstPort:     dstPort,
-		FeedOverlay: overlay,
+		FromZone:         fromZone,
+		ToZone:           toZone,
+		SrcIP:            srcIP,
+		DstIP:            dstIP,
+		Protocol:         proto,
+		SrcPort:          srcPort,
+		DstPort:          dstPort,
+		FeedOverlay:      overlay,
+		PolicyInactiveFn: inactiveFn,
 	})
 	if !res.Matched {
 		writeOK(w, MatchPoliciesResult{Action: policymatch.ActionString(res.Action) + " (default)"})
