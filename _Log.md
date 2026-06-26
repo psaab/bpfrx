@@ -1,3 +1,22 @@
+## 2026-06-25 — #3066: undefined zone screen-profile reference is now a commit-time hard reject
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add `validateScreenProfileReferencesStrict` (#3066). A security
+  zone whose `screen <name>` references an undefined screen-ids-option profile
+  was only WARNED at commit while the Rust dataplane fails OPEN
+  (`screen/mod.rs` returns `ScreenVerdict::Pass` for a missing profile),
+  silently disabling all screen protection for that zone. Promoted to a
+  fail-closed commit/commit-check hard reject mirroring
+  `validatePolicyZoneReferencesStrict` (#2401); tolerant load/peer-sync path
+  downgrades to a warning via new `lenientScreenProfileRefs` flag (#1960
+  no-brick). Fail-on-revert test `screen_profile_ref_test.go` (RED without the
+  strict gate). Fixed two pre-existing tests that referenced an undefined
+  screen profile (`TestSetPathSchema`, `TestZoneSetSyntax`) by defining the
+  referenced profile.
+- **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/screen_profile_ref_test.go, pkg/config/parser_ast_test.go,
+  pkg/config/parser_security_test.go, pkg/config/README.md
+
 ## 2026-06-25 — #3045: REST /security/policies includes global policies
 
 - **Timestamp**: 2026-06-25
