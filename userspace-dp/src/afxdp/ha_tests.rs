@@ -157,6 +157,7 @@ fn test_metadata() -> SessionMetadata {
         log_session_init: false,
         log_session_close: false,
         policy_id: 0,
+        inactivity_timeout_ns: None,
     }
 }
 

@@ -169,10 +169,25 @@ const _: () = assert!(
 /// one (the wrap bug). Saturating fails toward a longer-lived session, the
 /// opposite of premature expiry.
 #[inline]
-fn secs_to_ns_saturating(secs: u64) -> u64 {
+pub(crate) fn secs_to_ns_saturating(secs: u64) -> u64 {
     secs.checked_mul(1_000_000_000)
         .unwrap_or(MAX_SESSION_TIMEOUT_NS)
         .min(MAX_SESSION_TIMEOUT_NS)
+}
+
+/// #3227: convert a matched application's per-application inactivity timeout
+/// (`PolicyEvaluationResult.inactivity_timeout`, in SECONDS) to the nanosecond
+/// session override stamped on `SessionMetadata.inactivity_timeout_ns`. `None`
+/// (or 0 seconds) maps to `None` (use the global per-protocol timeout — the
+/// historical behavior); a positive value saturates at `MAX_SESSION_TIMEOUT_NS`
+/// exactly like a configured global timeout, so a pathological config cannot
+/// wrap into a tiny window.
+#[inline]
+pub(crate) fn app_inactivity_timeout_ns(secs: Option<u32>) -> Option<u64> {
+    match secs {
+        Some(s) if s > 0 => Some(secs_to_ns_saturating(u64::from(s))),
+        _ => None,
+    }
 }
 
 /// Configurable session timeout values (in nanoseconds).
@@ -949,7 +964,14 @@ impl SessionTable {
                     TCP_CLOSING_TIMEOUT_NS
                 }
             } else {
-                session_timeout_ns(protocol, tcp_flags, &self.timeouts)
+                // #3227: a real-traffic refresh re-stamps the idle window from
+                // the (possibly updated) metadata's per-app override.
+                session_timeout_ns(
+                    protocol,
+                    tcp_flags,
+                    &self.timeouts,
+                    metadata.inactivity_timeout_ns,
+                )
             };
             // wheel_tick deliberately preserved (parity with restore_entry).
             // #2120: a real-traffic refresh (or a peer→local promote) means
@@ -1498,25 +1520,42 @@ fn remove_owner_rg_index_entry(
     }
 }
 
-fn session_timeout_ns(protocol: u8, tcp_flags: u8, timeouts: &SessionTimeouts) -> u64 {
+/// Select the idle expiry for a session.
+///
+/// #3227: `app_override_ns` is the admitting application term's per-application
+/// inactivity (idle) timeout in nanoseconds, or `None` to use the global
+/// per-protocol `SessionTimeouts`. When `Some`, it replaces the ESTABLISHED /
+/// active idle window (TCP-established, UDP, ICMP, and the OTHER-protocol
+/// fallback) — mirroring Junos `inactivity-timeout`, the idle timeout of an
+/// established session. It deliberately does NOT override the short TCP
+/// closing/RST reap windows: a FIN/RST close still reaps on the short timeout
+/// so a closed session is not held open for a long custom idle value. When
+/// `None` the result is byte-identical to pre-#3227.
+fn session_timeout_ns(
+    protocol: u8,
+    tcp_flags: u8,
+    timeouts: &SessionTimeouts,
+    app_override_ns: Option<u64>,
+) -> u64 {
     match protocol {
         PROTO_TCP => {
             if is_closing(tcp_flags) {
                 // #3046: a RST close is reaped on the short timeout; only a
                 // graceful FIN-only close gets the full 30s TIME_WAIT-style
-                // window.
+                // window. #3227: the per-app override never extends a closing
+                // session's reap window.
                 if has_rst(tcp_flags) {
                     TCP_RST_TIMEOUT_NS
                 } else {
                     TCP_CLOSING_TIMEOUT_NS
                 }
             } else {
-                timeouts.tcp_established_ns
+                app_override_ns.unwrap_or(timeouts.tcp_established_ns)
             }
         }
-        PROTO_UDP => timeouts.udp_ns,
-        PROTO_ICMP | PROTO_ICMPV6 => timeouts.icmp_ns,
-        _ => OTHER_SESSION_TIMEOUT_NS,
+        PROTO_UDP => app_override_ns.unwrap_or(timeouts.udp_ns),
+        PROTO_ICMP | PROTO_ICMPV6 => app_override_ns.unwrap_or(timeouts.icmp_ns),
+        _ => app_override_ns.unwrap_or(OTHER_SESSION_TIMEOUT_NS),
     }
 }
 

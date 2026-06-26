@@ -782,6 +782,19 @@ type PolicyApplicationSnapshot struct {
 	// version skew degrades safely to match-all rather than failing to decode.
 	ICMPType *uint8 `json:"icmp_type,omitempty"`
 	ICMPCode *uint8 `json:"icmp_code,omitempty"`
+	// #3227: optional per-application inactivity (idle) timeout in seconds,
+	// carried from a custom `set applications application <a> inactivity-timeout
+	// <n>`. 0/absent means "use the global per-protocol SessionTimeouts" — the
+	// historical behavior. When a session is admitted by a policy whose matched
+	// application term sets this, the userspace dataplane stamps it on the
+	// session and the conntrack GC ages the session out on this value instead
+	// of the global TCP/UDP/ICMP timeout. The legacy (retired-eBPF) map
+	// compiler wired the same per-app `appTimeout`, so carrying it here closes a
+	// userspace parity regression. omitempty keeps the wire additive: an old
+	// helper missing the field decodes 0 (use-global, today's behavior), and an
+	// old Go snapshot omitting it decodes to None on the Rust side the same way,
+	// so version skew degrades safely.
+	InactivityTimeout uint32 `json:"inactivity_timeout,omitempty"`
 }
 
 // AppCatalogEntrySnapshot is one row of the application-identification catalog

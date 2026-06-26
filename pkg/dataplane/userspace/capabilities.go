@@ -349,9 +349,19 @@ func expandUserspacePolicyApplications(cfg *config.Config, apps []string) ([]Pol
 				// nil stays nil (the all-ICMP aliases remain unconstrained).
 				ICMPType: app.ICMPType,
 				ICMPCode: app.ICMPCode,
+				// #3227: carry the per-application inactivity (idle) timeout so
+				// the userspace session GC ages a flow admitted by this app out
+				// on the app's timeout, not the global per-protocol timeout
+				// (the legacy eBPF maps wired this `appTimeout`; closing the
+				// userspace parity regression). 0 = use the global timeout
+				// (back-compat, byte-identical). A negative configured value is
+				// impossible (the parser stores a non-negative int), but clamp
+				// defensively so a stray value can never wrap the u32.
+				InactivityTimeout: clampNonNegU32(app.InactivityTimeout),
 			}
 			key := strings.Join([]string{snap.Name, snap.Protocol, snap.SourcePort, snap.DestinationPort,
-				icmpKeyPart(snap.ICMPType), icmpKeyPart(snap.ICMPCode)}, "\x00")
+				icmpKeyPart(snap.ICMPType), icmpKeyPart(snap.ICMPCode),
+				strconv.FormatUint(uint64(snap.InactivityTimeout), 10)}, "\x00")
 			if _, exists := seen[key]; exists {
 				continue
 			}
@@ -392,6 +402,20 @@ func icmpKeyPart(v *uint8) string {
 		return ""
 	}
 	return strconv.Itoa(int(*v))
+}
+
+// clampNonNegU32 converts a configured seconds value to the wire u32. A value
+// <= 0 means "use the global per-protocol timeout" (the back-compat sentinel),
+// so it maps to 0; a positive value passes through, saturating at the u32 max
+// so a pathological config can never wrap. #3227.
+func clampNonNegU32(v int) uint32 {
+	if v <= 0 {
+		return 0
+	}
+	if v > int(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(v)
 }
 
 func resolveUserspaceApplicationNames(cfg *config.Config, name string) ([]string, bool) {

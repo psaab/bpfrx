@@ -1540,6 +1540,8 @@ pub(super) fn poll_binding_process_descriptor(
                                 // #3056: host-local sessions are not policy-forwarded,
                                 // so they carry no admitting policy ID.
                                 policy_id: 0,
+                                // #3227: host-local sessions are not policy-app-matched.
+                                inactivity_timeout_ns: None,
                             };
                             if install_helper_local_session_on_miss(
                                 sessions,
@@ -2069,6 +2071,17 @@ pub(super) fn poll_binding_process_descriptor(
                                         // policy that admitted the flow (was the `0`
                                         // sentinel → first-configured-policy misattribution).
                                         policy_id: policy_result.policy_id,
+                                        // #3227: stamp the matched application term's
+                                        // per-application inactivity (idle) timeout
+                                        // (seconds -> ns; None = use the global
+                                        // per-protocol timeout) so the conntrack GC
+                                        // ages this flow out on the app's value,
+                                        // closing the legacy-eBPF appTimeout parity
+                                        // regression.
+                                        inactivity_timeout_ns:
+                                            crate::session::app_inactivity_timeout_ns(
+                                                policy_result.inactivity_timeout,
+                                            ),
                                     };
                                     let forward_installed = track_in_userspace
                                         && sessions.install_with_protocol_with_origin(
@@ -2293,6 +2306,14 @@ pub(super) fn poll_binding_process_descriptor(
                                         // the reverse companion so a row keyed on the
                                         // reverse tuple attributes the same policy.
                                         policy_id: policy_result.policy_id,
+                                        // #3227: mirror the matched application term's
+                                        // per-application inactivity (idle) timeout onto
+                                        // the reverse entry so whichever entry the GC
+                                        // expires uses the app's idle window.
+                                        inactivity_timeout_ns:
+                                            crate::session::app_inactivity_timeout_ns(
+                                                policy_result.inactivity_timeout,
+                                            ),
                                     };
                                     // #1861 §5.2: the reverse install is gated on
                                     // forward_installed (was track_in_userspace —
@@ -4155,6 +4176,7 @@ mod new_flow_session_limit_tests {
             log_session_init: false,
             log_session_close: false,
             policy_id: 0,
+            inactivity_timeout_ns: None,
         }
     }
 

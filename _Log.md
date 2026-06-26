@@ -21197,6 +21197,33 @@ top.
   pkg/daemon/daemon_nft.go, pkg/daemon/host_inbound_nft_test.go
 
 - **Timestamp**: 2026-06-26
+  **Action**: #3227 — carry per-application `inactivity-timeout` to the
+  userspace dataplane and apply it to session idle expiry (legacy-eBPF
+  appTimeout parity regression). Added `InactivityTimeout` to the Go
+  `PolicyApplicationSnapshot` (omitempty, 0=use-global) + Rust mirror
+  (`inactivity_timeout`, serde default + skip_serializing_if -> wire stays
+  additive, fixture byte-identical, no regen). The policy matcher now
+  returns the matched term's timeout (`PolicyEvaluationResult.
+  inactivity_timeout`); the install path stamps it on
+  `SessionMetadata.inactivity_timeout_ns` (secs->ns saturating) and
+  `session_timeout_ns` prefers it for the established/idle window on
+  install + every refresh (lookup/update_session), leaving closing/RST
+  reap windows untouched. Precedence: first matching rule, then first
+  matching app term (exact-port -> range -> icmp). Tests: Rust
+  session_timeout_ns_honors_app_override,
+  session_with_app_inactivity_timeout_expires_before_global (fail-on-revert
+  anchor), session_without_app_timeout_uses_global_timeout; Go
+  TestAppInactivityTimeoutCarriedToSnapshot + defaults/clamp/omitempty.
+  **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/capabilities.go,
+  pkg/dataplane/userspace/app_inactivity_timeout_3227_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/policy.rs,
+  userspace-dp/src/session/{entry,mod,install,lookup,tests}.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/{flow_cache,tunnel,neighbor_dispatch,shared_ops}.rs,
+  userspace-dp/src/server/helpers.rs (+ mechanical SessionMetadata field
+  across afxdp/event_stream/policy test literals),
+  userspace-dp/src/session/README.md, docs/userspace-dataplane-gaps.md
   **Action**: #3231 — fix three fail-OPEN nft lowering bugs in the lo0
   control-plane firewall filter (`nftRuleFromTerm`). nft loads the lo0 table
   atomically, so any one invalid line rejected the whole ruleset and left the

@@ -52,7 +52,7 @@ These capabilities exist in the current Rust userspace dataplane code path:
 | Three-color policers | Implemented with caveats | srTCM/trTCM runtime, forwarding-path and flow-cache-hit metering, red drops for `then discard`, status/CLI/Prometheus counters, and compatible in-process snapshot continuity. Unsupported color-aware, non-`discard`, and malformed snapshots now fail closed in Rust if they bypass Go admission. Sharded state, HA/restart continuity decision, full non-drop action propagation, and integration evidence remain production hardening work, not active feature-gap blockers. |
 | TCP MSS clamping | Implemented | Flow snapshot fields are delivered and used in Rust |
 | Embedded ICMP NAT reversal | Implemented | Includes reverse-session repair paths |
-| Configurable session timeouts | Implemented | Snapshot-driven timeouts in `session.rs` |
+| Configurable session timeouts | Implemented | Snapshot-driven global per-protocol timeouts in `session.rs`. Per-application `inactivity-timeout` (#3227) rides `PolicyApplicationSnapshot.inactivity_timeout` and is stamped on the admitted session (`SessionMetadata.inactivity_timeout_ns`) so the conntrack GC ages an app-matched flow out on the app's idle window instead of the global timeout, restoring legacy-eBPF `appTimeout` parity; first matching policy rule + first matching app term wins; closing/RST reap windows are unaffected; in-process only (not yet on the HA sync wire). |
 | VLAN handling | Implemented | Ingress VLAN tracking and egress tagging |
 | Route and neighbor lookup | Implemented | Per-table routes, neighbor cache, next-table support |
 | HA state ingestion | Implemented | Helper receives RG active/watchdog state |

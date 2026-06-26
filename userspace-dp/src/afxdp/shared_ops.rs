@@ -675,6 +675,7 @@ pub(super) fn build_reverse_session_from_forward_match(
         // materialized reverse companion attributes the same policy in its
         // BPF-compat conntrack row.
         policy_id: forward_match.metadata.policy_id,
+        inactivity_timeout_ns: None,
     };
     let decision = SessionDecision {
         resolution: redirect_session_resolution_for_metadata(forwarding, resolution, &metadata),

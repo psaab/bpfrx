@@ -403,6 +403,24 @@ pub(crate) struct PolicyApplicationSnapshot {
     pub icmp_type: Option<u8>,
     #[serde(rename = "icmp_code", default, skip_serializing_if = "Option::is_none")]
     pub icmp_code: Option<u8>,
+    /// #3227: optional per-application inactivity (idle) timeout, in SECONDS,
+    /// from a custom `set applications application <a> inactivity-timeout <n>`.
+    /// `None`/0 means "use the global per-protocol `SessionTimeouts`" — the
+    /// historical behavior. When a session is admitted by a policy whose matched
+    /// application term carries this, the dataplane stamps it on the session and
+    /// the conntrack GC ages the session out on this value instead of the global
+    /// TCP/UDP/ICMP timeout (closing the legacy-eBPF `appTimeout` parity
+    /// regression). `#[serde(default)]` makes an old Go snapshot that omits the
+    /// field decode to `None` (use-global — today's behavior), and
+    /// `skip_serializing_if = Option::is_none` keeps the default specimen (and
+    /// the `protocol_wire_v1` fixture) byte-identical, so version skew degrades
+    /// safely.
+    #[serde(
+        rename = "inactivity_timeout",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub inactivity_timeout: Option<u32>,
 }
 
 /// One row of the L3/L4 application-identification catalog (#2008 M5). Mirrors

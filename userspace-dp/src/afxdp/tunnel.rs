@@ -577,6 +577,10 @@ pub(super) fn build_local_origin_tunnel_tx_request(
             // #3056: tunnel sync-import sessions are seeded from the peer, which
             // ran the admitting policy; the local policy ID is unknown here.
             policy_id: 0,
+            // #3227: peer-seeded import; the per-app idle timeout does not
+            // cross the HA wire yet, so age on the global timeout until a
+            // real-traffic refresh re-stamps it.
+            inactivity_timeout_ns: None,
         },
         origin: SessionOrigin::SyncImport,
         protocol: meta.protocol,

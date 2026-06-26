@@ -504,6 +504,7 @@ pub(super) fn cluster_peer_return_fast_path(
         // #3056: the fabric-return reverse seed is created on the peer-forwarding
         // node, which never ran the admitting policy — leave the policy ID unset.
         policy_id: 0,
+        inactivity_timeout_ns: None,
     };
     Some((
         SessionDecision {

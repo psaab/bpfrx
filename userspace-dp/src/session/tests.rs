@@ -68,6 +68,7 @@ fn metadata() -> SessionMetadata {
         log_session_init: false,
         log_session_close: false,
         policy_id: 0,
+        inactivity_timeout_ns: None,
     }
 }
 
@@ -161,6 +162,122 @@ fn session_expire_removes_stale_entries() {
     assert_eq!(deltas.len(), 1);
     assert_eq!(deltas[0].kind, SessionDeltaKind::Close);
     assert_eq!(deltas[0].key, key);
+}
+
+// === #3227 per-application inactivity-timeout tests =========
+
+/// `metadata()` with a custom per-application inactivity (idle) timeout stamped
+/// (in nanoseconds) — mirrors the value the install path derives from a matched
+/// application term's `inactivity-timeout`.
+fn metadata_with_app_timeout(ns: u64) -> SessionMetadata {
+    SessionMetadata {
+        inactivity_timeout_ns: Some(ns),
+        ..metadata()
+    }
+}
+
+/// #3227 unit: `session_timeout_ns` uses the per-application override for an
+/// ESTABLISHED flow on every protocol, and `None` falls back byte-identically
+/// to the global per-protocol timeout. A closing/RST TCP flow ignores the
+/// override (short reap window preserved).
+#[test]
+fn session_timeout_ns_honors_app_override() {
+    let to = SessionTimeouts::default();
+    let app = 30_000_000_000u64; // 30 s
+
+    // ESTABLISHED TCP (ACK, not closing): override wins; None -> global.
+    assert_eq!(session_timeout_ns(PROTO_TCP, 0x10, &to, Some(app)), app);
+    assert_eq!(
+        session_timeout_ns(PROTO_TCP, 0x10, &to, None),
+        DEFAULT_TCP_SESSION_TIMEOUT_NS
+    );
+    // UDP / ICMP: override wins; None -> global.
+    assert_eq!(session_timeout_ns(PROTO_UDP, 0, &to, Some(app)), app);
+    assert_eq!(
+        session_timeout_ns(PROTO_UDP, 0, &to, None),
+        DEFAULT_UDP_SESSION_TIMEOUT_NS
+    );
+    assert_eq!(session_timeout_ns(PROTO_ICMP, 0, &to, Some(app)), app);
+    assert_eq!(
+        session_timeout_ns(PROTO_ICMP, 0, &to, None),
+        DEFAULT_ICMP_SESSION_TIMEOUT_NS
+    );
+    // Closing/RST TCP: the override never extends the short reap window.
+    assert_eq!(
+        session_timeout_ns(PROTO_TCP, TCP_RST, &to, Some(app)),
+        TCP_RST_TIMEOUT_NS
+    );
+    assert_eq!(
+        session_timeout_ns(PROTO_TCP, TCP_FIN, &to, Some(app)),
+        TCP_CLOSING_TIMEOUT_NS
+    );
+}
+
+/// #3227 end-to-end: a session admitted by an application with a custom
+/// `inactivity-timeout` (30 s) expires after that timeout — well before the
+/// global 300 s TCP-established timeout. This is the fail-on-revert anchor:
+/// drop the per-app stamp/read and this session survives to 300 s, so the
+/// 35 s expiry assertion goes RED.
+#[test]
+fn session_with_app_inactivity_timeout_expires_before_global() {
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let install_ns = 1_000_000_000u64;
+    // Custom 30 s app idle timeout (global TCP-established is 300 s).
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        metadata_with_app_timeout(30 * WHEEL_TICK_NS),
+        install_ns,
+        PROTO_TCP,
+        0x10, // ACK = established, not closing
+    ));
+    // Advance to install + 35 s: past the 30 s app timeout, far short of 300 s.
+    let advance = install_ns + 35 * WHEEL_TICK_NS;
+    table.last_gc_ns = advance - SESSION_GC_INTERVAL_NS;
+    let expired = table.expire_stale_entries(advance);
+    assert_eq!(
+        expired.len(),
+        1,
+        "session must expire on the 30 s app inactivity-timeout, not the 300 s global timeout"
+    );
+    assert_eq!(expired[0].key, key);
+    assert!(table.lookup(&key, advance + 1_000_000, 0).is_none());
+}
+
+/// #3227 regression: an application with NO custom inactivity-timeout (the
+/// metadata override is `None`) ages on the global per-protocol timeout exactly
+/// as before — it must NOT expire at 35 s, and DOES expire past the global
+/// timeout. Uses UDP (60 s global, inside the 256-tick wheel) so a single GC
+/// pass observes the global-timeout expiry without far-future re-bucketing.
+#[test]
+fn session_without_app_timeout_uses_global_timeout() {
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let install_ns = 1_000_000_000u64;
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        metadata(), // inactivity_timeout_ns: None
+        install_ns,
+        PROTO_UDP,
+        0,
+    ));
+    // 35 s in: still alive on the 60 s global UDP timeout.
+    let early = install_ns + 35 * WHEEL_TICK_NS;
+    table.last_gc_ns = early - SESSION_GC_INTERVAL_NS;
+    assert!(
+        table.expire_stale_entries(early).is_empty(),
+        "no per-app timeout: must survive past 35 s on the global 60 s timeout"
+    );
+    // NB: do not lookup() here — a lookup refreshes last_seen and would extend
+    // the idle window past the global timeout, masking the expiry below.
+    // Past the global 60 s timeout: now it expires.
+    let late = install_ns + 65 * WHEEL_TICK_NS;
+    table.last_gc_ns = late - SESSION_GC_INTERVAL_NS;
+    let expired = table.expire_stale_entries(late);
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].key, key);
 }
 
 // === #965 timer-wheel tests =================================
@@ -1983,7 +2100,12 @@ fn reference_update_session(
             TCP_CLOSING_TIMEOUT_NS
         }
     } else {
-        session_timeout_ns(protocol, tcp_flags, &table.timeouts)
+        session_timeout_ns(
+            protocol,
+            tcp_flags,
+            &table.timeouts,
+            entry.metadata.inactivity_timeout_ns,
+        )
     };
     let created_ns = entry.created_ns;
     table.restore_entry(key.clone(), entry);

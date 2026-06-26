@@ -625,6 +625,7 @@ fn named_application_matches_protocol_and_port() {
                 destination_port: "80".to_string(),
                 icmp_type: None,
                 icmp_code: None,
+                inactivity_timeout: None,
             }],
             action: "permit".to_string(),
             ..Default::default()
@@ -683,6 +684,7 @@ fn proto_only_app_rule(rule_id: &str, protocol: &str) -> PolicyRuleSnapshot {
             destination_port: String::new(),
             icmp_type: None,
             icmp_code: None,
+            inactivity_timeout: None,
         }],
         action: "permit".to_string(),
         ..Default::default()
@@ -898,6 +900,7 @@ fn mixed_parseable_and_unparseable_fails_closed() {
                     destination_port: String::new(),
                     icmp_type: None,
                     icmp_code: None,
+                    inactivity_timeout: None,
                 },
                 PolicyApplicationSnapshot {
                     name: "bogus".to_string(),
@@ -906,6 +909,7 @@ fn mixed_parseable_and_unparseable_fails_closed() {
                     destination_port: String::new(),
                     icmp_type: None,
                     icmp_code: None,
+                    inactivity_timeout: None,
                 },
             ],
             action: "permit".to_string(),
@@ -946,6 +950,7 @@ fn all_parseable_terms_match_each_protocol() {
                     destination_port: String::new(),
                     icmp_type: None,
                     icmp_code: None,
+                    inactivity_timeout: None,
                 },
                 PolicyApplicationSnapshot {
                     name: "https".to_string(),
@@ -954,6 +959,7 @@ fn all_parseable_terms_match_each_protocol() {
                     destination_port: "443".to_string(),
                     icmp_type: None,
                     icmp_code: None,
+                    inactivity_timeout: None,
                 },
             ],
             action: "permit".to_string(),
@@ -1005,6 +1011,7 @@ fn application_set_matches_any_expanded_term() {
                     destination_port: "80".to_string(),
                     icmp_type: None,
                     icmp_code: None,
+                    inactivity_timeout: None,
                 },
                 PolicyApplicationSnapshot {
                     name: "junos-https".to_string(),
@@ -1013,6 +1020,7 @@ fn application_set_matches_any_expanded_term() {
                     destination_port: "443".to_string(),
                     icmp_type: None,
                     icmp_code: None,
+                    inactivity_timeout: None,
                 },
             ],
             action: "permit".to_string(),
@@ -2783,6 +2791,7 @@ fn icmp_app_rule(name: &str, protocol: &str, icmp_type: Option<u8>) -> PolicyRul
             destination_port: String::new(),
             icmp_type,
             icmp_code: None,
+            inactivity_timeout: None,
         }],
         action: "permit".to_string(),
         ..Default::default()
@@ -2865,6 +2874,7 @@ fn junos_ping_with_icmp_all_matches_every_type() {
         destination_port: String::new(),
         icmp_type: None,
         icmp_code: None,
+        inactivity_timeout: None,
     });
     let state = parse_policy_state("deny", &[rule], &test_zone_name_to_id());
     assert_eq!(eval_icmp(&state, PROTO_ICMP, 8, 0), PolicyAction::Permit);
@@ -2890,6 +2900,7 @@ fn icmp_constraint_does_not_affect_tcp_app() {
                 destination_port: "80".to_string(),
                 icmp_type: None,
                 icmp_code: None,
+                inactivity_timeout: None,
             }],
             action: "permit".to_string(),
             ..Default::default()
