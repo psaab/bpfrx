@@ -1,3 +1,32 @@
+## 2026-06-26 — #2961 WG give-up advances T8 anchor (keepalive handshake-storm cooldown)
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fix a zero-cooldown handshake storm on a permanently-down
+  persistent-keepalive WG peer. The handshake attempt machine's GIVE-UP
+  branch (`drive_attempt_machine`, after the 90s `REKEY_ATTEMPT_TIME`
+  window) cleared the attempt and returned `WG_NO_DEADLINE_NS` but did
+  NOT advance the T8 pacing anchor. Since `anchor = max(last_send_any,
+  last_recv_any, t8_last_attempt)` and an unreachable peer advances
+  neither send (sends error, no route) nor recv, the anchor stayed at
+  the attempt START, so `now >= start + keepalive_interval` was already
+  true at give-up → `KeepaliveNoSession` re-fired on the next ~1s tick,
+  opening a fresh 90s window with a one-tick gap. Fix: the GIVE-UP branch
+  now calls `engine.note_t8_attempt(peer_pubkey, now_ns)` (the give-up
+  time T+90), so the next attempt is due at T+90+keepalive_interval —
+  cooldown semantics chosen: one keepalive_interval between the END of a
+  failed window and the START of the next (matches wireguard-go, which
+  stops re-initiating after REKEY_ATTEMPT_TIME until a new send/keepalive
+  is due). The success/identity-change branch does not reach the give-up
+  code, and a peer that comes back to life re-anchors on fresh traffic
+  (max() picks the newer stamp), so the live path is unchanged. Tests:
+  `giveup_paces_keepalive_no_session_by_one_interval` (fail-on-revert:
+  removing the anchor advance makes the at-give-up `initiate == None`
+  assertion RED — KeepaliveNoSession fires immediately) and
+  `live_peer_paces_on_fresh_traffic_not_giveup_cooldown`. cargo build
+  release clean; wg suite 214 passed.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/wg_control.rs,
+  userspace-dp/src/afxdp/wg/timers.rs, docs/wireguard-interop.md, _Log.md
+
 ## 2026-06-26 — #3077 firewall filter flexible-match-range wired to the userspace dataplane
 
 - **Timestamp**: 2026-06-26

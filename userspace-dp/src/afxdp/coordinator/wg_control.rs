@@ -734,6 +734,24 @@ fn drive_attempt_machine(
             let _ = engine.take_rekey_request();
             let _ = engine.take_handshake_request();
             *attempt = None;
+            // #2961: advance the T8 pacing anchor to the GIVE-UP time so
+            // a permanently-down persistent-keepalive peer waits a full
+            // keepalive_interval before the next KeepaliveNoSession
+            // attempt, rather than re-firing on the next ~1s tick. The
+            // T8 anchor is max(last_send_any, last_recv_any,
+            // t8_last_attempt); for an unreachable peer last_send_any may
+            // not advance (sends error with no route) and last_recv_any
+            // never advances, so without this the anchor stays at the
+            // attempt START — `now >= start + interval` is already true
+            // at give-up (start + 90s > start + interval for the common
+            // <90s intervals), making "keepalive due" perpetually true
+            // and producing a zero-cooldown 90s handshake storm. Stamping
+            // give-up time T+90 makes the next attempt due at
+            // T+90+interval — the intended cooldown (interval between the
+            // END of one failed window and the START of the next). The
+            // success path (identity-change branch above) does not reach
+            // here, so a live peer keeps pacing off real traffic.
+            engine.note_t8_attempt(peer_pubkey, now_ns);
             // Codex code-r1 BLOCKER: `actions` was computed BEFORE this
             // cleanup — a T7 DeadPeer (or stale-edge) trigger captured
             // in it would resurrect a fresh 90s window in the SAME
@@ -1853,6 +1871,151 @@ mod tests {
                 .load(Ordering::Relaxed),
             0,
             "no DeadPeer attempt may start in the give-up pass"
+        );
+    }
+
+    /// Build a poll-loop fixture engine whose single peer has a
+    /// persistent-keepalive of `keepalive_secs`. Mirrors
+    /// `poll_loop_fixture` but parameterizes the keepalive so the T8
+    /// pacing path can be exercised.
+    fn keepalive_engine(keepalive_secs: u16) -> std::sync::Arc<crate::afxdp::wg::WgEngine> {
+        std::sync::Arc::new(crate::afxdp::wg::WgEngine::new(
+            crate::afxdp::wg::WgEngineConfig {
+                local_private_key: [7u8; 32],
+                listen_port: 0,
+                peers: vec![crate::afxdp::wg::WgPeerConfig {
+                    pubkey: [9u8; 32],
+                    endpoint: None,
+                    persistent_keepalive: keepalive_secs,
+                    allowed_ips: vec![],
+                    preshared_key: [0u8; 32],
+                }],
+            },
+        ))
+    }
+
+    /// #2961: a persistent-keepalive peer whose handshake can NEVER
+    /// complete must NOT enter a zero-cooldown 90s handshake storm. After
+    /// the attempt machine GIVES UP at T+90, the next KeepaliveNoSession
+    /// initiation must be gated until give_up_time + keepalive_interval —
+    /// one keepalive interval of cooldown — not fired on the next ~1s
+    /// tick.
+    ///
+    /// Fail-on-revert: delete the `engine.note_t8_attempt(...)` call in
+    /// the give-up branch and the `at give-up: gated` assertion goes RED
+    /// (the un-advanced anchor makes T8 perpetually due, re-firing every
+    /// tick).
+    #[test]
+    fn giveup_paces_keepalive_no_session_by_one_interval() {
+        use crate::afxdp::wg::session::REKEY_ATTEMPT_TIME_NS;
+        use crate::afxdp::wg::timers::{InitiateReason, TimerActions, WG_NO_DEADLINE_NS};
+        let keepalive_secs: u16 = 25;
+        let interval_ns = u64::from(keepalive_secs) * 1_000_000_000;
+        let engine = keepalive_engine(keepalive_secs);
+        let pk = engine.first_peer_pubkey().unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let ep: SocketAddr = "127.0.0.1:39998".parse().unwrap();
+        let exceptions = std::sync::Arc::new(Mutex::new(VecDeque::new()));
+        let mut encap_buf = vec![0u8; 2048];
+
+        // An attempt that has run the full 90s window — the next
+        // drive_attempt_machine pass takes the GIVE-UP branch. No real
+        // sends occurred (last_send_any/last_recv_any stay 0), so the only
+        // thing that can pace T8 across the boundary is the give-up
+        // anchor advance under test.
+        let give_up = 200_000_000_000u64;
+        let mut attempt = Some(HandshakeAttempt {
+            started_ns: give_up - REKEY_ATTEMPT_TIME_NS,
+            last_tx_ns: give_up - 1_000_000_000,
+            baseline_session: None,
+        });
+        let idle_actions = TimerActions {
+            initiate: None,
+            send_keepalive: None,
+            next_deadline_ns: WG_NO_DEADLINE_NS,
+        };
+        let deadline = drive_attempt_machine(
+            &engine,
+            &socket,
+            false,
+            &pk,
+            Some(ep),
+            &idle_actions,
+            give_up,
+            &mut attempt,
+            &mut encap_buf,
+            "wg-test",
+            &exceptions,
+        );
+        assert!(attempt.is_none(), "give-up must clear the attempt");
+        assert_eq!(deadline, WG_NO_DEADLINE_NS);
+
+        // At give-up time the next attempt must be GATED (cooldown just
+        // started). This is the assertion that goes RED without the fix:
+        // an un-advanced anchor (0) makes due = 0 + interval, already
+        // past at give_up=200s → KeepaliveNoSession fires immediately.
+        let at_giveup = engine.timer_pass_for_peer(&pk, give_up, true);
+        assert_eq!(
+            at_giveup.initiate, None,
+            "give-up must start a keepalive cooldown, not re-fire immediately"
+        );
+        assert_eq!(
+            at_giveup.next_deadline_ns,
+            give_up + interval_ns,
+            "next KeepaliveNoSession due is one keepalive interval after give-up"
+        );
+
+        // One nanosecond before the cooldown elapses: still gated.
+        let just_before = engine.timer_pass_for_peer(&pk, give_up + interval_ns - 1, true);
+        assert_eq!(
+            just_before.initiate, None,
+            "must stay gated until the full keepalive interval elapses"
+        );
+
+        // At give_up + interval: the next attempt is finally due.
+        let at_due = engine.timer_pass_for_peer(&pk, give_up + interval_ns, true);
+        assert_eq!(
+            at_due.initiate,
+            Some(InitiateReason::KeepaliveNoSession),
+            "after the cooldown a fresh KeepaliveNoSession attempt may start"
+        );
+    }
+
+    /// #2961: the give-up cooldown is a FLOOR, not a ceiling — a peer
+    /// that comes back to life (authenticated traffic resumes / a
+    /// handshake succeeds) re-anchors T8 on the fresh traffic and is NOT
+    /// held back by a prior give-up's cooldown. Proves the give-up anchor
+    /// advance does not regress the live/successful peer: the T8 anchor is
+    /// max(last_send_any, last_recv_any, t8_last_attempt), so newer
+    /// traffic wins.
+    #[test]
+    fn live_peer_paces_on_fresh_traffic_not_giveup_cooldown() {
+        let keepalive_secs: u16 = 25;
+        let interval_ns = u64::from(keepalive_secs) * 1_000_000_000;
+        let engine = keepalive_engine(keepalive_secs);
+        let pk = engine.first_peer_pubkey().unwrap();
+
+        // Simulate a give-up cooldown stamped at T.
+        let give_up = 200_000_000_000u64;
+        engine.note_t8_attempt(&pk, give_up);
+
+        // Authenticated traffic resumes 5s later (e.g. a handshake
+        // finally completed and data flows) — advances last_send_any.
+        let traffic = give_up + 5_000_000_000;
+        engine.note_handshake_sent(&pk, traffic);
+
+        // T8 must now pace off the FRESH traffic anchor (traffic +
+        // interval), NOT the older give-up cooldown (give_up + interval).
+        let actions = engine.timer_pass_for_peer(&pk, traffic + interval_ns - 1, true);
+        assert_eq!(
+            actions.initiate, None,
+            "a live peer is paced off fresh traffic, not the give-up cooldown"
+        );
+        assert_eq!(
+            actions.next_deadline_ns,
+            traffic + interval_ns,
+            "the anchor follows the most recent authenticated traversal"
         );
     }
 
