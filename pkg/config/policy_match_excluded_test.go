@@ -125,8 +125,10 @@ func TestPolicyMatchExcludedSchemaValidates(t *testing.T) {
 		"set security zones security-zone untrust",
 		"set security policies from-zone trust to-zone untrust policy excl match source-address-excluded",
 		"set security policies from-zone trust to-zone untrust policy excl match destination-address-excluded",
+		"set security policies from-zone trust to-zone untrust policy excl then permit",
 		"set security policies global policy g match source-address-excluded",
 		"set security policies global policy g match destination-address-excluded",
+		"set security policies global policy g then permit",
 	}
 	tree := &ConfigTree{}
 	for _, cmd := range commands {

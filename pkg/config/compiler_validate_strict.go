@@ -1577,6 +1577,107 @@ func validatePolicyZoneReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// policyActionName renders a PolicyAction as its Junos `then` token for
+// operator-facing validator errors.
+func policyActionName(a PolicyAction) string {
+	switch a {
+	case PolicyPermit:
+		return "permit"
+	case PolicyDeny:
+		return "deny"
+	case PolicyReject:
+		return "reject"
+	default:
+		return fmt.Sprintf("action(%d)", int(a))
+	}
+}
+
+// policyTerminalActionError formats the commit-time error for a policy that
+// does not resolve to exactly one terminal action (#3043).
+func policyTerminalActionError(scope, polName, detail string) error {
+	if scope != "" {
+		return fmt.Errorf("%s policy %q: %s", scope, polName, detail)
+	}
+	return fmt.Errorf("policy %q: %s", polName, detail)
+}
+
+// validatePolicyTerminalActionStrict hard-rejects a security policy that does
+// not specify EXACTLY ONE terminal action (#3043).
+//
+// PolicyAction's zero value is PolicyPermit (types_security.go:
+// `PolicyPermit PolicyAction = iota`), so before this gate a policy whose
+// `then` stanza carried only modifiers (`then log session-init` /
+// `then count`) — or a typo'd / dropped terminal action — compiled with
+// Action == PolicyPermit and silently PERMITTED every packet matching its
+// match conditions. A rule the operator wrote as an audit/drop placeholder
+// thus became a zone-pair-wide permit: a silent fail-OPEN security hole.
+// Symmetrically, a policy that named MORE than one terminal action (e.g. a
+// group-merged `then permit` + `then deny`) resolved last-wins by child
+// visitation order rather than failing the commit, so the enforced action
+// depended on parse order.
+//
+// Junos requires every policy term to have exactly one terminal action; this
+// validator restores that fail-CLOSED parity. It checks each per-zone-pair
+// policy and each global policy: terminalActions (populated in config order by
+// compilePolicy) must have length exactly 1.
+//
+// Strict on the commit / commit-check path (CompileConfig — hard-reject);
+// downgraded to a cfg.Warnings entry on the tolerant load / peer-sync paths
+// (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientPolicyTerminalAction) so an already-persisted or peer-synced config
+// that an older binary accepted still BOOTS (#1960 fail-closed-on-load
+// doctrine). On that tolerant path the runtime is independently safe:
+// compilePolicy defaults an actionless policy's Action to PolicyDeny (NOT
+// permit), so a leniently-loaded actionless policy DENIES rather than fails
+// open. Iteration order (cfg.Security.Policies, then GlobalPolicies) is
+// deterministic, so the first-reported error is stable.
+func validatePolicyTerminalActionStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(scope string, pol *Policy) error {
+		if pol == nil {
+			return nil
+		}
+		switch len(pol.terminalActions) {
+		case 1:
+			return nil
+		case 0:
+			return policyTerminalActionError(scope, pol.Name,
+				"no terminal action; every policy must specify exactly one of "+
+					"`then permit`, `then deny`, or `then reject` (a log-only / "+
+					"count-only or typo'd policy silently PERMITTED all matching "+
+					"traffic; it now defaults to deny on load)")
+		default:
+			names := make([]string, 0, len(pol.terminalActions))
+			for _, a := range pol.terminalActions {
+				names = append(names, policyActionName(a))
+			}
+			return policyTerminalActionError(scope, pol.Name, fmt.Sprintf(
+				"%d conflicting terminal actions (%s); a policy must specify "+
+					"exactly one of permit/deny/reject (the enforced action would "+
+					"otherwise depend on parse order)",
+				len(pol.terminalActions), strings.Join(names, ", ")))
+		}
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if err := check("", pol); err != nil {
+				return err
+			}
+		}
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if err := check("global", pol); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // MaxUsableZoneID is the largest security-zone id the live AF_XDP userspace
 // dataplane can carry. Zone ids are assigned sequentially 1..N in
 // pkg/dataplane/compiler.go and reach the dataplane two ways: as the per-flow

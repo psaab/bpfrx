@@ -146,6 +146,16 @@ parser treats newlines as whitespace and merges multiple set lines into
 one giant node. This trap has bitten the project repeatedly — see
 CLAUDE.md.
 
+**Security-policy terminal action is fail-closed (#3043):** `PolicyAction`'s
+zero value is `PolicyPermit`, so a policy whose `then` stanza names no
+terminal action (log-only/count-only or a typo'd `then`) historically
+compiled to a silent PERMIT. `validatePolicyTerminalActionStrict`
+(`compiler_validate_strict.go`) hard-rejects a policy that does not name
+exactly one of permit/deny/reject at commit; the tolerant load/peer-sync
+path downgrades to a warning AND `compilePolicy` defaults an actionless
+policy's `Action` to `PolicyDeny`, so a leniently-loaded bad config fails
+closed rather than open. See `docs/config-schema.md` "#3043".
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`
