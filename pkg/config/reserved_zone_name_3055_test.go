@@ -92,6 +92,7 @@ func TestJunosGlobalNotReferenceExempt(t *testing.T) {
 				cmds = []string{
 					"set security zones security-zone trust",
 					"set security policies from-zone junos-global to-zone trust policy p match source-address any",
+					"set security policies from-zone junos-global to-zone trust policy p match destination-address any",
 					"set security policies from-zone junos-global to-zone trust policy p match application any",
 					"set security policies from-zone junos-global to-zone trust policy p then deny",
 				}
@@ -99,6 +100,7 @@ func TestJunosGlobalNotReferenceExempt(t *testing.T) {
 				cmds = []string{
 					"set security zones security-zone trust",
 					"set security policies from-zone trust to-zone junos-global policy p match source-address any",
+					"set security policies from-zone trust to-zone junos-global policy p match destination-address any",
 					"set security policies from-zone trust to-zone junos-global policy p match application any",
 					"set security policies from-zone trust to-zone junos-global policy p then deny",
 				}

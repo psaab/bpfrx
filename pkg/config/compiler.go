@@ -809,6 +809,28 @@ type compileOpts struct {
 	// pre-existing behaviour), now flagged. Reject-profile support is a
 	// deferred follow-up. Same doctrine as lenientPolicyThenPermit.
 	lenientPolicyThenReject bool
+	// lenientPolicyMissingMatch (#3044) downgrades the security-policy
+	// required-match gate (validatePolicyRequiredMatchStrict) from a hard
+	// compile error to a cfg.Warnings entry. A security policy whose `match`
+	// clause omits one of the three Junos-mandatory dimensions —
+	// source-address, destination-address, application — or that omits the
+	// `match` block entirely committed cleanly but had the missing dimension
+	// SILENTLY compiled as match-ANY: compilePolicy fills each slice only
+	// when the leaf is present and the userspace dataplane treats an empty
+	// slice as match-any. A partial policy is therefore broader than typed —
+	// `match source-address corp; then permit` permits corp->any:any, and a
+	// match-less policy becomes a zone-pair-wide permit/deny — a fail-OPEN
+	// for permit, an over-broad block for deny. On Junos this cannot commit.
+	// The strict commit / commit-check path hard-rejects so the misconfig is
+	// operator-visible (naming the policy scope, the policy, and every
+	// missing dimension); the tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config an older binary
+	// silently accepted still BOOTS (#1960 fail-closed-on-load class) — the
+	// policy keeps its match-any-for-missing compilation, now flagged. A
+	// missing dimension is distinct from an explicit `any`: the operator
+	// must write `any` for an intentional wildcard (Junos parity). Same
+	// doctrine as lenientPolicyMatchLeaves.
+	lenientPolicyMissingMatch bool
 	// lenientPolicyCommunityRef (#2881) downgrades the policy community
 	// cross-reference gate (validatePolicyCommunityReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. A policy term's
@@ -831,6 +853,22 @@ type compileOpts struct {
 	// community VALUE (e.g. 65000:100), not a list reference, and is not
 	// checked. Same doctrine as lenientRoutingExportRef.
 	lenientPolicyCommunityRef bool
+	// lenientVRRPVirtualAddress (#3013) downgrades the VRRP virtual-address
+	// subnet-containment gate (validateVRRPVirtualAddressSubnet) from a hard
+	// compile error to a cfg.Warnings entry. A VRRP virtual-address that does
+	// not fall within any subnet configured on the same interface unit for the
+	// matching family — e.g. `family inet address 10.0.61.1/24` with
+	// `vrrp-group 1 virtual-address 10.0.99.1/24` — committed cleanly but is a
+	// commit-time configuration error in Junos/vSRX. At runtime the daemon
+	// installs the VIP with no connected route covering it, so return traffic
+	// sourced from the VIP has no on-link subnet association — a silent
+	// blackhole the operator only sees as dropped traffic. The strict commit /
+	// commit-check path hard-rejects so the operator-error is visible (naming
+	// the interface, unit, group, VIP, and family); the tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config an older binary accepted still BOOTS (#1960
+	// fail-closed-on-load class). Same doctrine as lenientBackupRouterDst.
+	lenientVRRPVirtualAddress bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -901,7 +939,9 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyMatchLeaves:           true,
 		lenientPolicyThenPermit:            true,
 		lenientPolicyThenReject:            true,
+		lenientPolicyMissingMatch:          true,
 		lenientPolicyCommunityRef:          true,
+		lenientVRRPVirtualAddress:          true,
 	})
 }
 
@@ -1023,7 +1063,9 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyMatchLeaves:           true,
 		lenientPolicyThenPermit:            true,
 		lenientPolicyThenReject:            true,
+		lenientPolicyMissingMatch:          true,
 		lenientPolicyCommunityRef:          true,
+		lenientVRRPVirtualAddress:          true,
 	})
 }
 
@@ -1212,6 +1254,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3044: reject a security policy whose `match` clause omits a required
+	// Junos dimension (source-address, destination-address, application) or
+	// omits the `match` block entirely. compilePolicy fills each match slice
+	// only when the leaf is present, and the userspace dataplane treats an
+	// empty slice as match-ANY, so a partial policy silently widens to
+	// traffic the operator did not intend — a fail-open for permit, an
+	// over-broad block for deny. On Junos such a policy cannot commit. Runs
+	// on the group-expanded, inactive-pruned tree so an apply-groups-
+	// inherited dimension counts and an inactive policy is ignored. Strict
+	// (commit / commit-check): hard-reject naming the policy scope, the
+	// policy, and every missing dimension. Lenient (load / peer-sync): warn
+	// so an already-persisted or peer-synced config still boots (#1960) — the
+	// policy keeps its match-any-for-missing compilation, now flagged. A
+	// missing dimension is distinct from an explicit `any` (Junos parity).
+	policyMissingMatchWarnings, err := validatePolicyRequiredMatchStrict(
+		tree.Children, opts.lenientPolicyMissingMatch)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -1252,6 +1314,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyThenPermitWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyThenRejectWarnings...)
+	cfg.Warnings = append(cfg.Warnings, policyMissingMatchWarnings...)
 
 	for _, node := range tree.Children {
 		switch node.Name() {
@@ -2279,6 +2342,19 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 	cfg.Warnings = append(cfg.Warnings, brWarnings...)
+
+	// #3013: VRRP virtual-address subnet-containment gate. A virtual-address
+	// must fall within a subnet configured on the same interface unit for the
+	// matching family — otherwise the installed VIP has no connected route and
+	// return traffic from it blackholes. vSRX rejects this at commit; xpf did
+	// not. Strict (commit / commit-check): hard-reject naming the offending
+	// field. Lenient (load / peer-sync): warn so a config committed before this
+	// gate existed still boots (#1960 fail-closed-on-load class).
+	vaWarnings, err := validateVRRPVirtualAddressSubnet(cfg, opts.lenientVRRPVirtualAddress)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Warnings = append(cfg.Warnings, vaWarnings...)
 
 	// #2227 MAJOR-1: port-scan / ip-sweep threshold clamp warning. The AF_XDP
 	// dataplane bounds its per-(zone,source) unique-destination set at

@@ -219,6 +219,25 @@ left to #2907's next-hop-family-aware default (never a mismatch); a
 matched-family explicit destination passes. Same fail-closed-on-load
 doctrine as #3043.
 
+**VRRP virtual-address must fall within a unit subnet (#3013):** a
+`vrrp-group <id> virtual-address <vip>` is authored under a
+`family inet|inet6 address <prefix>` on an interface unit. In Junos/vSRX a
+VIP outside every on-link subnet of the unit is a commit-time configuration
+error; xpf accepted it and at runtime installed the VIP as a route-less host
+address — return traffic sourced from the VIP has no on-link subnet
+association and silently blackholes. `validateVRRPVirtualAddressSubnet`
+(`compiler_validate_strict.go`) asserts each VIP is contained in the prefix
+of at least one address configured on the SAME unit for the MATCHING family.
+The owner / priority-255 case (VIP equals an interface address) passes for
+free (an address is contained in its own subnet); a cross-family VIP (e.g. a
+v4 literal authored under a v6-only address) has no matching-family subnet
+and is rejected. The strict commit/commit-check path hard-rejects naming the
+interface, unit, group, VIP and family; the tolerant load/peer-sync path
+downgrades to a warning (`lenientVRRPVirtualAddress`) so an already-persisted
+or peer-synced config an older binary accepted still boots (#1960 no-brick).
+This is config-only commit-time validation — it never touches the VRRP
+runtime/state machine. Same fail-closed-on-load doctrine as #2911.
+
 **No-match default-policy is fail-closed (#3065):** the sibling of #3043
 for the implicit fallback. When a flow matches NO zone-pair, global, or
 default policy, the verdict is `SecurityConfig.DefaultPolicy`. Because the
@@ -420,6 +439,41 @@ follow-up. The tolerant load/peer-sync path downgrades to a warning
 (`lenientPolicyThenReject`) so an already-persisted or peer-synced config an older
 binary silently accepted still boots — the modifier stays dropped (the pre-existing
 behaviour), now flagged (#1960 no-brick doctrine, same as #3114).
+
+**Security policies missing a required `match` criterion are rejected at commit
+(#3044 — codex-review-061 finding 061-03):** Junos/vSRX requires every security
+policy `match` clause to specify all three core dimensions — `source-address`,
+`destination-address`, AND `application`; a policy missing any of them (or omitting
+the `match` block entirely) cannot commit. xpf's policy compiler (`compilePolicy`,
+`compiler_security.go`) instead treated the whole `match` block — and every leaf
+within it — as OPTIONAL: each field is filled only when the leaf is present, and an
+absent dimension simply left the corresponding slice empty. The userspace dataplane
+then interprets an empty slice as match-ANY (`capabilities.go` returns a nil app-term
+list for "no apps"; `userspace-dp/src/policy.rs` compiles an empty app list as
+`match_any:true` and defaults `source/destination_*_match_any` to true when the
+literal+book sets are empty). A partial policy is therefore SILENTLY broader than
+typed: `match source-address corp; then permit` permits `corp -> any:any`, and a
+match-less policy becomes a zone-pair-wide permit/deny. A single dropped line in an
+automation template widens a narrow rule to all traffic — a fail-OPEN for a permit
+policy, an over-broad block for a deny. `validatePolicyRequiredMatchStrict`
+(`compiler_policy_missing_match.go`) hard-rejects a policy whose `match` omits a
+required dimension at commit, naming the policy scope (zone-pair or global), the
+policy, and EVERY missing dimension, and directing the operator to add it. A missing
+dimension is treated DIFFERENTLY from an explicit wildcard: the operator must write
+`any` (or `any-ipv4`/`any-ipv6`, an address-book name, a CIDR, a named
+application/application-set) — exactly as Junos demands. `source-address-excluded` /
+`destination-address-excluded` are MODIFIERS of the base address leaf, not
+substitutes, so they do not by themselves satisfy the source/destination-address
+requirement. It is an AST pre-walk in `compileExpanded` (not a typed validator) for
+the same reasons as #3113 — a missing leaf leaves no trace in the typed `*Config`
+(an empty slice is indistinguishable from an explicit-any that also resolves to
+match-any), and `SchemaValidate` cannot REJECT an absence. The walk runs on the
+group-expanded, inactive-pruned tree, so an apply-groups-inherited dimension counts
+and an `inactive:` policy is ignored. Both zone-pair and `global` policies are
+covered. The tolerant load/peer-sync path downgrades to a warning
+(`lenientPolicyMissingMatch`) so an already-persisted or peer-synced config an older
+binary silently accepted still boots — the policy keeps its match-any-for-missing
+compilation, now flagged (#1960 no-brick doctrine, same as #3113).
 
 **Ambiguous secure-tunnel `bind-interface` aliases are rejected at commit
 (#2933):** `security ipsec vpn <name> bind-interface` is a free-form 1-arg
