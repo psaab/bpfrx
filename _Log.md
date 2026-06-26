@@ -1,3 +1,18 @@
+## 2026-06-25 — #2956: reap superseded Surface A HTTP transports on binding change
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added `httpClientCache.reap(live)` + `closeIdleConns` seam +
+  `size()` (pkg/ddns/backend_http.go); `SurfaceAManager.Reconcile` now computes
+  the set of binding keys still referenced by the committed config (configured
+  scopes' providers + catalog providers + unbound default) and reaps any cached
+  client whose key is gone — closing its idle-connection pool and dropping the
+  map entry — so the per-binding cache stays bounded under binding churn (#2904
+  left the superseded entry to linger for the daemon lifetime). Added
+  FAIL-ON-REVERT tests (close+evict via seam, all-live-kept, churn integration).
+  Updated pkg/ddns/README.md.
+- **File(s)**: pkg/ddns/backend_http.go, pkg/ddns/surface_a.go,
+  pkg/ddns/surface_a_httpcache_reap_2956_test.go, pkg/ddns/README.md, _Log.md
+
 ## 2026-06-25 — #3079: reject NAT rule-set interface/routing-instance scope at commit
 
 - **Timestamp**: 2026-06-25

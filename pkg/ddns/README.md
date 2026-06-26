@@ -321,11 +321,28 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   connects to the host a request targets; the client carries no credential/URL —
   those live on the backend object and apply per-request). The cache invalidates
   implicitly: a commit that changes a binding leaf resolves a NEW key and builds a
-  fresh bound transport, and the stale entry is simply no longer looked up.
-  Cardinality is bounded by the number of distinct configured bindings. Backed by
-  the FAIL-ON-REVERT suite `surface_a_httpcache_2904_test.go` (same-binding reuse,
-  cross-provider same-binding reuse, per-leaf invalidation, checkip↔update shared
-  pool).
+  fresh bound transport. Cardinality is bounded by the number of distinct
+  configured bindings. Backed by the FAIL-ON-REVERT suite
+  `surface_a_httpcache_2904_test.go` (same-binding reuse, cross-provider
+  same-binding reuse, per-leaf invalidation, checkip↔update shared pool).
+- **Superseded-transport reap (#2956)** — the stale entry left behind by a
+  binding-leaf change (above) was never looked up again but also never released,
+  and the `SurfaceAManager` lives for the whole daemon lifetime, so distinct
+  historical binding tuples accumulated forever (the `*http.Transport` + its
+  idle-connection pool retained until process exit, even though `IdleConnTimeout`
+  reaps the sockets). Each `Reconcile` pass now calls `httpClientCache.reap` with
+  the set of binding keys still referenced by the committed config — every
+  configured scope's provider (the per-binding `source-address` override is
+  applied on the scope's provider copy) AND every catalog provider (used by the
+  removed-binding withdraw backend rebuild) plus the unbound default. Any cached
+  client whose key is gone has its idle pool closed (`CloseIdleConnections`, via
+  the `closeIdleConns` seam) and is dropped from the map; an active binding's key
+  is always in the live set so it is never closed (only an ACTUAL key change is
+  superseded). The reap takes the cache's own mutex (the manager's `m.mu` is the
+  outer lock, so no lock-order inversion). Backed by the FAIL-ON-REVERT suite
+  `surface_a_httpcache_reap_2956_test.go` (superseded-entry close+evict via the
+  seam, all-live-bindings-kept, and a binding-churn integration test asserting the
+  map stays bounded across N commits).
 
 **HA correctness:** the per-RG gate change MUST pass `make test-failover` (the
 project rule for any gate / HA-path change). P1b adds the gate + the
