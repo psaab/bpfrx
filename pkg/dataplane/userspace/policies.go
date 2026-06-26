@@ -102,6 +102,56 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 		return nil, err
 	}
 	out := make([]PolicyRuleSnapshot, 0)
+	// walkPolicyRuleSlots is the single source of truth for the runtime
+	// policy-ID namespace (#3143/#3145). Using it on the snapshot WRITE side
+	// guarantees the IDs assigned here decode back to the same policy on the
+	// counter READ side (policyRuleIDForCounter), and enforces the
+	// MaxRulesPerPolicy cap so an app-set expansion cannot spill into the next
+	// policy set's namespace.
+	if err := walkPolicyRuleSlots(cfg, func(slot policyRuleSlot) error {
+		policyID := slot.policyID()
+		snap := buildOneRuleSnapshot(cfg, nameToID, slot.Policy, slot.FromZone, slot.ToZone, policyID, activeState)
+		out = append(out, snap)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// policyRuleSlot describes a single configured policy's assignment within the
+// runtime policy-ID namespace. The numeric runtime policy ID is
+// PolicySetID*MaxRulesPerPolicy + RuleIndex, and the policy occupies Span
+// contiguous IDs starting at that base (one per application-set expansion term).
+type policyRuleSlot struct {
+	PolicySetID uint32
+	RuleIndex   uint32 // start index within the policy set's 256-slot namespace
+	Span        uint32 // expansion slots consumed (>=1)
+	FromZone    string
+	ToZone      string
+	Policy      *config.Policy
+}
+
+func (s policyRuleSlot) policyID() uint32 {
+	return s.PolicySetID*dataplane.MaxRulesPerPolicy + s.RuleIndex
+}
+
+// walkPolicyRuleSlots invokes fn for every configured policy in config order,
+// assigning each policy its slot in the runtime policy-ID namespace. It is the
+// SHARED contract behind both the snapshot builder (the ID-WRITE side, #3145)
+// and the counter resolver (the ID-READ side, #3143) so the two can never
+// drift on how a policy ID maps to a (policy-set, rule-index) pair.
+//
+// Each policy's application-set expansion advances the per-set rule index by
+// userspacePolicyRuleExpansionCount. If a policy set's cumulative expansion
+// reaches MaxRulesPerPolicy (256), the next policy's ID would cross into the
+// following set's namespace; this mirrors the legacy compiler guard
+// (pkg/dataplane/compiler.go) and is rejected fail-closed so the apply path
+// retains the prior good dataplane state.
+func walkPolicyRuleSlots(cfg *config.Config, fn func(slot policyRuleSlot) error) error {
+	if cfg == nil {
+		return nil
+	}
 	policySetID := uint32(0)
 	for _, zpp := range cfg.Security.Policies {
 		if zpp == nil {
@@ -113,10 +163,22 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 			if pol == nil {
 				continue
 			}
-			policyID := policySetID*dataplane.MaxRulesPerPolicy + ruleIndex
-			snap := buildOneRuleSnapshot(cfg, nameToID, pol, zpp.FromZone, zpp.ToZone, policyID, activeState)
-			out = append(out, snap)
-			ruleIndex += userspacePolicyRuleExpansionCount(cfg, pol.Match.Applications)
+			span := userspacePolicyRuleExpansionCount(cfg, pol.Match.Applications)
+			if ruleIndex+span >= dataplane.MaxRulesPerPolicy {
+				return fmt.Errorf("policy %s->%s: expanded rules reach MaxRulesPerPolicy (%d) and would spill into the next policy set's ID namespace",
+					zpp.FromZone, zpp.ToZone, dataplane.MaxRulesPerPolicy)
+			}
+			if err := fn(policyRuleSlot{
+				PolicySetID: policySetID,
+				RuleIndex:   ruleIndex,
+				Span:        span,
+				FromZone:    zpp.FromZone,
+				ToZone:      zpp.ToZone,
+				Policy:      pol,
+			}); err != nil {
+				return err
+			}
+			ruleIndex += span
 		}
 		policySetID++
 	}
@@ -125,12 +187,24 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 		if pol == nil {
 			continue
 		}
-		policyID := policySetID*dataplane.MaxRulesPerPolicy + globalRuleIndex
-		snap := buildOneRuleSnapshot(cfg, nameToID, pol, "junos-global", "junos-global", policyID, activeState)
-		out = append(out, snap)
-		globalRuleIndex += userspacePolicyRuleExpansionCount(cfg, pol.Match.Applications)
+		span := userspacePolicyRuleExpansionCount(cfg, pol.Match.Applications)
+		if globalRuleIndex+span >= dataplane.MaxRulesPerPolicy {
+			return fmt.Errorf("global policy: expanded rules reach MaxRulesPerPolicy (%d) and would spill into the next policy set's ID namespace",
+				dataplane.MaxRulesPerPolicy)
+		}
+		if err := fn(policyRuleSlot{
+			PolicySetID: policySetID,
+			RuleIndex:   globalRuleIndex,
+			Span:        span,
+			FromZone:    "junos-global",
+			ToZone:      "junos-global",
+			Policy:      pol,
+		}); err != nil {
+			return err
+		}
+		globalRuleIndex += span
 	}
-	return out, nil
+	return nil
 }
 
 func buildOneRuleSnapshot(
