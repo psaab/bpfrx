@@ -468,14 +468,36 @@ fold as the address mixed case). The matcher `port_match`
 
 - positive (`except == false`), `PortMatcher::Any` while constrained → match
   NOTHING (the #2400 all-malformed fail-closed case);
-- `except == true`, `PortMatcher::Any` while constrained → match ALL (Junos
-  "all ports except {}");
+- `except == true`, `PortMatcher::Any` while constrained → match NOTHING —
+  **FAIL CLOSED (#3205, agy-070 #08)**. Unlike the address path, a port scope
+  has no prefix-list indirection: a real listed port (numeric or a resolved
+  service name) always yields a range, so `constrained + Any` can ONLY mean
+  every token was unparseable (e.g. an unresolved symbolic port name). The
+  except branch therefore must NOT invert empty into match-ALL — that was the
+  fail-OPEN hole where `destination-port-except domain` accepted every port,
+  including the one meant to be excluded. (The Junos "empty-except = match all"
+  semantic still applies to the ADDRESS path above, where an empty prefix-list
+  scope is reachable and legitimate.)
 - otherwise → `(port ∈ ranges) XOR except`.
 
-Tests: `destination_port_except_negation` / `source_port_except_negation` in
-`filter/tests.rs` (port IN the except list does NOT match, port NOT in it DOES;
-fail-on-revert). Scope is ports only — `packet-length` from the same review-039
-finding is not implemented.
+Symbolic match values resolve in Go (#3205). Named/service ports (`ssh`,
+`http`, `domain`, ...) and symbolic `icmp-type` names (`echo-request`, ...) are
+resolved to their NUMERIC value at commit time by `pkg/config`
+(`filter_match_resolve.go` — the Junos service-name + icmp-type-name SSOT; the
+icmp-type table is family-selected, ICMPv4 vs ICMPv6). An unresolved symbolic
+value is hard-rejected at commit by `validateFilterMatchValuesStrict` rather
+than silently dropped (a dropped icmp-type matched ALL ICMP; a dropped named
+port left the port set constrained-but-empty → the fail-open above). The
+dataplane therefore normally sees only numerics; the `constrained + Any`
+fail-closed guard is defense-in-depth for the tolerant load / peer-sync path,
+where an unresolved token is kept verbatim on the wire.
+
+Tests: `destination_port_except_negation` / `source_port_except_negation` /
+`destination_port_except_unresolved_fails_closed_3205` /
+`destination_port_except_resolved_name_matches_3205` in `filter/tests.rs` (port
+IN the except list does NOT match, port NOT in it DOES, an unresolved except
+port fails closed; fail-on-revert). Scope is ports only — `packet-length` from
+the same review-039 finding is not implemented.
 
 ### Path (b) runbook — cache-sensitive
 
