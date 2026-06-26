@@ -61,6 +61,66 @@ fn raise_sysctl(path: &str, target: i64) {
     }
 }
 
+/// Human-readable file-type label for a diagnostic, so a refusal names what
+/// was actually found at the path rather than a bare errno.
+fn describe_file_type(ft: &std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    if ft.is_file() {
+        "regular file"
+    } else if ft.is_dir() {
+        "directory"
+    } else if ft.is_symlink() {
+        "symlink"
+    } else if ft.is_fifo() {
+        "fifo"
+    } else if ft.is_block_device() {
+        "block device"
+    } else if ft.is_char_device() {
+        "char device"
+    } else if ft.is_socket() {
+        "socket"
+    } else {
+        "unknown"
+    }
+}
+
+/// Remove a stale Unix-domain socket at `path`, failing closed on a non-socket
+/// (#2974). The helper runs as root and takes `--control-socket` as an
+/// argument; the historical behavior was an unconditional `remove_file`, which
+/// would silently delete a regular file (or any other object) if the helper
+/// were pointed at a wrong path. Guard the unlink:
+///   * path absent (`NotFound`) -> `Ok(())` (nothing to remove; bind creates it)
+///   * path is a socket -> `remove_file` (clean up a stale socket from a prior
+///     run — the normal happy path)
+///   * path is anything else (regular file, dir, symlink, fifo, ...) -> refuse
+///     and return an error naming the path and observed type, so the caller
+///     fails closed instead of destroying it.
+///
+/// `symlink_metadata` is used so the path's own type is inspected without
+/// following symlinks: a symlink reports as `is_symlink()` (not `is_socket()`)
+/// and is therefore refused rather than followed — a deliberately conservative
+/// fail-closed choice. The subsequent `bind` then surfaces a clear error.
+fn remove_stale_socket(path: &str) -> std::io::Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    use std::os::unix::fs::FileTypeExt;
+    let ft = meta.file_type();
+    if ft.is_socket() {
+        fs::remove_file(path)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to unlink {path}: existing path is a {}, not a Unix socket",
+                describe_file_type(&ft)
+            ),
+        ))
+    }
+}
+
 pub(crate) fn run() -> Result<(), String> {
     // Increase socket buffer ceilings — needed for AF_XDP copy mode to avoid
     // drops when the kernel backlog is large. Raise-only: never lower a value
@@ -97,9 +157,14 @@ pub(crate) fn run() -> Result<(), String> {
     if let Some(parent) = Path::new(&args.state_file).parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create state dir: {e}"))?;
     }
-    let _ = fs::remove_file(&args.control_socket);
+    // Only unlink a stale Unix socket left by a prior run — never blindly
+    // delete a regular file or other object at these privileged paths (#2974).
+    // A non-socket aborts bind with a diagnostic instead of being destroyed.
+    remove_stale_socket(&args.control_socket)
+        .map_err(|e| format!("control socket {}: {e}", args.control_socket))?;
     let session_socket = derive_session_socket_path(&args.control_socket);
-    let _ = fs::remove_file(&session_socket);
+    remove_stale_socket(&session_socket)
+        .map_err(|e| format!("session socket {session_socket}: {e}"))?;
 
     let listener = UnixListener::bind(&args.control_socket)
         .map_err(|e| format!("listen {}: {e}", args.control_socket))?;
@@ -336,8 +401,19 @@ pub(crate) fn run() -> Result<(), String> {
     }
     afxdp::remove_kernel_rst_suppression();
     write_state(&args.state_file, &state)?;
-    let _ = fs::remove_file(&args.control_socket);
-    let _ = fs::remove_file(&session_socket);
+    // Shutdown cleanup mirrors the startup guard: remove only our own stale
+    // sockets, never a non-socket object (#2974). Keep the existing
+    // best-effort posture — a cleanup failure logs a warning and does not
+    // fail shutdown.
+    if let Err(e) = remove_stale_socket(&args.control_socket) {
+        eprintln!(
+            "xpf-userspace-dp: control socket cleanup {}: {e}",
+            args.control_socket
+        );
+    }
+    if let Err(e) = remove_stale_socket(&session_socket) {
+        eprintln!("xpf-userspace-dp: session socket cleanup {session_socket}: {e}");
+    }
     Ok(())
 }
 
@@ -466,6 +542,96 @@ mod ring_entries_tests {
     fn rejects_zero_and_garbage() {
         assert!(validate_ring_entries_arg("0").is_err());
         assert!(validate_ring_entries_arg("asd").is_err());
+    }
+}
+
+#[cfg(test)]
+mod stale_socket_guard_tests {
+    // #2974 fail-on-revert: the helper must unlink ONLY a stale Unix socket,
+    // never a regular file (or other object) at the configured control/session
+    // socket path. Before #2974 the startup/shutdown cleanup did an
+    // unconditional `fs::remove_file`, which would silently delete a regular
+    // file if the root helper were pointed at a wrong path. The regular-file
+    // test below goes RED (the file is deleted, no error) if reverted.
+    use super::remove_stale_socket;
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+
+    fn unique_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "xpf-2974-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn removes_a_real_socket_and_allows_rebind() {
+        let path = unique_path("sock");
+        let p = path.to_str().unwrap();
+        let _ = fs::remove_file(p);
+        // Bind a real Unix socket, then drop the listener so only the inode
+        // remains — a stale socket from a "prior run".
+        let listener = UnixListener::bind(p).expect("bind socket");
+        drop(listener);
+        assert!(fs::symlink_metadata(p).is_ok(), "socket inode should exist");
+
+        remove_stale_socket(p).expect("stale socket should be removed");
+
+        assert!(
+            fs::symlink_metadata(p).is_err(),
+            "stale socket must be gone after remove_stale_socket"
+        );
+        // A subsequent bind must succeed on the freed path (the happy path).
+        let relisten = UnixListener::bind(p).expect("rebind after cleanup");
+        drop(relisten);
+        let _ = fs::remove_file(p);
+    }
+
+    #[test]
+    fn refuses_to_delete_a_regular_file() {
+        let path = unique_path("regfile");
+        let p = path.to_str().unwrap();
+        fs::write(p, b"precious operator data").expect("write file");
+
+        let err =
+            remove_stale_socket(p).expect_err("a regular file must NOT be removed — fail closed");
+
+        // The core regression assertion: the file must still exist.
+        assert!(
+            fs::symlink_metadata(p).is_ok(),
+            "remove_stale_socket must not delete a regular file"
+        );
+        let body = fs::read_to_string(p).expect("file readable");
+        assert_eq!(body, "precious operator data", "file contents intact");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("regular file") && msg.contains(p),
+            "diagnostic must name the path and type, got: {msg}"
+        );
+        let _ = fs::remove_file(p);
+    }
+
+    #[test]
+    fn missing_path_is_ok() {
+        let path = unique_path("absent");
+        let p = path.to_str().unwrap();
+        let _ = fs::remove_file(p);
+        assert!(fs::symlink_metadata(p).is_err(), "path must be absent");
+        remove_stale_socket(p).expect("absent path is a no-op Ok");
+    }
+
+    #[test]
+    fn refuses_to_delete_a_directory() {
+        let path = unique_path("dir");
+        let p = path.to_str().unwrap();
+        let _ = fs::remove_dir_all(p);
+        fs::create_dir_all(p).expect("mkdir");
+
+        let err = remove_stale_socket(p).expect_err("a directory must NOT be removed");
+        assert!(fs::symlink_metadata(p).is_ok(), "directory must survive");
+        assert!(err.to_string().contains("directory"), "got: {err}");
+        let _ = fs::remove_dir_all(p);
     }
 }
 
