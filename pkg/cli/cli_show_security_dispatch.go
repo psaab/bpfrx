@@ -14,6 +14,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // enabledStr returns "enabled" or "disabled" for a boolean flag.
@@ -22,6 +23,41 @@ func enabledStr(v bool) string {
 		return "enabled"
 	}
 	return "disabled"
+}
+
+// policySchedulerStateProvider is the optional dataplane capability the
+// policy-detail show surfaces use to learn the live per-scheduler
+// active-state map (#3062). The userspace dataplane adapter implements
+// it; offline/legacy runtimes do not, in which case the show surfaces
+// fall back to rendering every policy enabled (bit-identical to today).
+type policySchedulerStateProvider interface {
+	PolicySchedulerActiveState() map[string]bool
+}
+
+// policySchedulerActiveState returns the live scheduler active-state map
+// and whether it could be queried. When ok is false the caller must not
+// claim any policy is scheduler-inactive (the runtime state is unknown).
+func (c *CLI) policySchedulerActiveState() (state map[string]bool, ok bool) {
+	if c == nil || c.dp == nil {
+		return nil, false
+	}
+	p, isProvider := c.dp.(policySchedulerStateProvider)
+	if !isProvider {
+		return nil, false
+	}
+	return p.PolicySchedulerActiveState(), true
+}
+
+// policyDetailState renders the Junos "State:" token for a policy detail
+// line: "inactive" when the policy is bound to a scheduler that is
+// currently runtime-inactive, otherwise "enabled". haveSched gates the
+// lookup so that when the runtime state cannot be queried the output
+// stays bit-identical to the pre-#3062 unconditional "enabled".
+func policyDetailState(schedulerName string, activeState map[string]bool, haveSched bool) string {
+	if haveSched && dpuserspace.PolicyInactive(schedulerName, activeState) {
+		return "inactive"
+	}
+	return "enabled"
 }
 
 // parsePolicyZoneFilter extracts from-zone/to-zone filters from args.
@@ -220,6 +256,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 			return nil
 		}
 
+		schedActive, haveSched := c.policySchedulerActiveState()
 		policySetID := uint32(0)
 		if !globalOnly {
 			for _, zpp := range cfg.Security.Policies {
@@ -243,8 +280,10 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					}
 					ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 					// Junos: Policy: <name>, State: enabled, Index: <N>, Scope Policy: 0, Sequence number: <N>
-					fmt.Printf("  Policy: %s, State: enabled, Index: %d, Scope Policy: 0, Sequence number: %d\n",
-						pol.Name, ruleID, i+1)
+					// #3062: a scheduler-inactive policy reports State: inactive.
+					state := policyDetailState(pol.SchedulerName, schedActive, haveSched)
+					fmt.Printf("  Policy: %s, State: %s, Index: %d, Scope Policy: 0, Sequence number: %d\n",
+						pol.Name, state, ruleID, i+1)
 					if pol.Description != "" {
 						fmt.Printf("    Description: %s\n", pol.Description)
 					}
@@ -279,8 +318,10 @@ func (c *CLI) handleShowSecurity(args []string) error {
 				}
 				ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 				// Junos global: Policy: <name>, State: enabled, Index: <N>, Scope Policy: 0, Sequence number: <N>
-				fmt.Printf("  Policy: %s, State: enabled, Index: %d, Scope Policy: 0, Sequence number: %d\n",
-					pol.Name, ruleID, i+1)
+				// #3062: a scheduler-inactive global policy reports State: inactive.
+				state := policyDetailState(pol.SchedulerName, schedActive, haveSched)
+				fmt.Printf("  Policy: %s, State: %s, Index: %d, Scope Policy: 0, Sequence number: %d\n",
+					pol.Name, state, ruleID, i+1)
 				if pol.Description != "" {
 					fmt.Printf("    Description: %s\n", pol.Description)
 				}

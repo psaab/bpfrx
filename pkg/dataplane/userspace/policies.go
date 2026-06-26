@@ -758,6 +758,20 @@ func policyRuleInactive(schedulerName string, activeState map[string]bool) bool 
 	return !ok || !active
 }
 
+// PolicyInactive reports whether a policy bound to schedulerName is
+// currently runtime-inactive given the daemon-maintained per-scheduler
+// active-state map (see Manager.PolicySchedulerActiveState). It is the
+// SSOT predicate shared between the snapshot builder (policyRuleInactive)
+// and the read-only show surfaces (#3062 CLI/gRPC policy detail), so the
+// display planes report exactly what the dataplane enforces rather than
+// recomputing wall-clock schedule windows. An empty schedulerName is
+// always active; a nil map (scheduler state not yet published) treats a
+// scheduled policy as inactive, matching the builder's fail-closed
+// behaviour — the dataplane drops such a rule until state arrives.
+func PolicyInactive(schedulerName string, activeState map[string]bool) bool {
+	return policyRuleInactive(schedulerName, activeState)
+}
+
 func policyActionString(action config.PolicyAction) string {
 	switch action {
 	case config.PolicyPermit:
