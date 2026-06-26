@@ -1963,6 +1963,7 @@ fn policy_selection_deny_emits_rt_flow_event() {
     super::super::emit_policy_deny_event(
         Some(&event_handle),
         &flow,
+        &crate::nat::NatDecision::default(),
         meta,
         from_id,
         to_id,

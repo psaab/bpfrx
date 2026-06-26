@@ -53,6 +53,20 @@ periodic ACK from the daemon.
   `afxdp::event_emit::resolve_flow_app_id`), so a policy-deny / filter-log /
   session-create / session-close record shows `application=<name>` for a
   resolvable 5-tuple instead of `application="UNKNOWN"`.
+  (#3058) a DNAT / static-NAT / inbound-NPTv6 policy-DENY record now reflects
+  what the policy was actually evaluated against (the #2345 post-translation
+  tuple), mirroring the permit / SESSION_CLOSE convention exactly: the
+  RT_FLOW 5-tuple carries the ORIGINAL (received) addresses/ports and the
+  `nat src/dst` slots (offsets 72/88 ip, 104/106 port) carry the TRANSLATED
+  values — populated from the deny site's `decision.nat`
+  (`rewrite_src/rewrite_dst/rewrite_*_port`) instead of the old hardcoded
+  None/0. The deny AppID is resolved from the POST-translation destination
+  port (`resolve_policy_deny_app_id` against `policy_dst_port`), so a public
+  `:2222` DNAT'd to inside `:22` logs the inside `nat dst 10.0.0.10:22` +
+  `application=junos-ssh` instead of an empty NAT dst + `UNKNOWN(2222)`. A
+  deny with NO translation passes a default `NatDecision` (all-None) and a
+  `policy_dst_port` equal to the original dst port, so its record stays
+  byte-identical to the pre-#3058 wire — only NAT'd denies change.
   (#2615) the SESSION_CREATE and SESSION_CLOSE frames ALSO populate the
   ingress ifindex slot (offset 128, little-endian u32) from the admitting
   binding's `ident.ifindex`, so the Go decoder resolves

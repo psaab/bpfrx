@@ -2,6 +2,7 @@ use super::*;
 use crate::event_stream::EventStreamWorkerHandle;
 use crate::event_stream::codec::{DataplaneEventKind, DataplaneEventPayload};
 use crate::filter::FilterAction;
+use crate::nat::NatDecision;
 use crate::policy::{AppCatalog, PolicyAction};
 use crate::screen::ScreenPacketInfo;
 
@@ -87,10 +88,35 @@ pub(super) fn resolve_flow_app_id(app_catalog: &AppCatalog, flow: &SessionFlow) 
     )
 }
 
+/// #3058: resolve the AppID for a policy-DENY RT_FLOW record from the
+/// POST-translation destination port the policy was actually evaluated
+/// against. #2345 moved DNAT/static-NAT/inbound-NPTv6 policy evaluation to
+/// the translated destination tuple, so the deny log's application must be
+/// resolved from that same translated port (e.g. a public `:2222` DNAT'd to
+/// inside `:22` resolves `junos-ssh`, not UNKNOWN(2222)). `policy_dst_port`
+/// is `policy_dst_port` at the deny call sites (the value fed to
+/// `evaluate_policy_result_with_len`). For a non-NAT deny it equals
+/// `flow.forward_key.dst_port`, so the result is byte-identical to
+/// `resolve_flow_app_id`. The catalog probe is the SAME `app_catalog.lookup`
+/// the forwarding hot path runs, so no resolution logic is duplicated.
+#[inline]
+pub(super) fn resolve_policy_deny_app_id(
+    app_catalog: &AppCatalog,
+    flow: &SessionFlow,
+    policy_dst_port: u16,
+) -> u16 {
+    app_catalog.lookup(
+        flow.forward_key.protocol,
+        flow.forward_key.src_port,
+        policy_dst_port,
+    )
+}
+
 #[inline]
 pub(super) fn emit_policy_deny_event(
     event_stream: Option<&EventStreamWorkerHandle>,
     flow: &SessionFlow,
+    nat: &NatDecision,
     meta: UserspaceDpMeta,
     ingress_zone_id: u16,
     egress_zone_id: u16,
@@ -108,14 +134,26 @@ pub(super) fn emit_policy_deny_event(
         addr_family: flow.forward_key.addr_family,
         protocol: flow.forward_key.protocol,
         action: policy_action_to_rt_flow(action),
+        // #3058: the 5-tuple carries the ORIGINAL (received) addresses/ports;
+        // the nat_* fields below carry the TRANSLATED values — the SAME
+        // convention `emit_session_close_rt_flow` follows for a permitted
+        // session (event_stream/mod.rs: `delta.key.*` for the tuple,
+        // `nat.rewrite_*` for the nat-* slots). A denied DNAT/static-NAT/
+        // inbound-NPTv6 flow therefore logs the public/received dst in
+        // dst_ip/dst_port AND the real internal dst in nat_dst_ip/nat_dst_port,
+        // matching how a permit record represents the same translation.
         src_ip: flow.src_ip,
         dst_ip: flow.dst_ip,
         src_port: flow.forward_key.src_port,
         dst_port: flow.forward_key.dst_port,
-        nat_src_ip: None,
-        nat_dst_ip: None,
-        nat_src_port: 0,
-        nat_dst_port: 0,
+        // #3058: populate the NAT slots from the decision the policy was
+        // evaluated against (#2345 post-translation tuple) instead of the old
+        // hardcoded None/0. A non-NAT deny passes a default `NatDecision`
+        // (all-None), so the wire is byte-identical to the pre-#3058 record.
+        nat_src_ip: nat.rewrite_src,
+        nat_dst_ip: nat.rewrite_dst,
+        nat_src_port: nat.rewrite_src_port.unwrap_or(0),
+        nat_dst_port: nat.rewrite_dst_port.unwrap_or(0),
         ingress_zone_id,
         egress_zone_id,
         ingress_ifindex: ingress_ifindex_to_wire(meta.ingress_ifindex),
@@ -472,6 +510,27 @@ mod tests {
         }
     }
 
+    /// #3058: a flow whose received destination is a PUBLIC address+port that
+    /// DNATs to an inside host (203.0.113.10:2222 -> 10.0.0.10:22). The
+    /// `forward_key` carries the original (pre-translation) tuple, exactly as
+    /// the live deny sites see it.
+    fn dnat_test_flow() -> SessionFlow {
+        let src_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50));
+        let dst_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        SessionFlow {
+            src_ip,
+            dst_ip,
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip,
+                dst_ip,
+                src_port: 51000,
+                dst_port: 2222,
+            },
+        }
+    }
+
     fn test_meta() -> UserspaceDpMeta {
         UserspaceDpMeta {
             ingress_ifindex: 42,
@@ -503,6 +562,7 @@ mod tests {
         emit_policy_deny_event(
             Some(&handle),
             &flow,
+            &NatDecision::default(),
             test_meta(),
             7,
             9,
@@ -551,6 +611,7 @@ mod tests {
         emit_policy_deny_event(
             Some(&handle),
             &flow,
+            &NatDecision::default(),
             test_meta(),
             7,
             9,
@@ -880,6 +941,7 @@ mod tests {
         emit_policy_deny_event(
             Some(&handle),
             &flow,
+            &NatDecision::default(),
             test_meta(),
             7,
             9,
@@ -931,6 +993,150 @@ mod tests {
         assert_eq!(resolve_flow_app_id(&catalog, &test_flow()), 0);
     }
 
+    /// #3058 fail-on-revert: a DNAT'd policy-deny RT_FLOW record must log the
+    /// PUBLIC dst in the 5-tuple AND the real internal dst in the nat_* fields
+    /// (the same convention `emit_session_close_rt_flow` uses for a permit),
+    /// and resolve the AppID from the POST-NAT port (22 -> junos-ssh), not the
+    /// pre-NAT port (2222 -> UNKNOWN). Reverting the emitter back to hardcoded
+    /// `nat_*: None/0` + pre-NAT AppID makes this test RED.
+    #[test]
+    fn policy_deny_event_dnat_logs_post_translation_dst_and_app() {
+        let inside = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10));
+        // TCP/22 → app_id 17 (stand-in for junos-ssh).
+        let catalog = AppCatalog::from_snapshot(&[crate::AppCatalogEntry {
+            app_id: 17,
+            protocol: PROTO_TCP,
+            dst_port_low: 22,
+            dst_port_high: 22,
+            src_port_low: 0,
+            src_port_high: 0,
+        }]);
+        let flow = dnat_test_flow();
+        let nat = NatDecision {
+            rewrite_dst: Some(inside),
+            rewrite_dst_port: Some(22),
+            ..NatDecision::default()
+        };
+        // `policy_dst_port` at the deny call site is the translated dst port.
+        let app_id = resolve_policy_deny_app_id(&catalog, &flow, 22);
+        assert_eq!(app_id, 17, "post-NAT dst port 22 must resolve junos-ssh(17)");
+        // The pre-NAT resolution (the #3058 bug) resolves UNKNOWN(0).
+        assert_eq!(
+            resolve_flow_app_id(&catalog, &flow),
+            0,
+            "pre-NAT dst port 2222 resolves UNKNOWN — the misleading old behavior"
+        );
+
+        let (handle, rx) = unlimited_handle();
+        emit_policy_deny_event(
+            Some(&handle),
+            &flow,
+            &nat,
+            test_meta(),
+            7,
+            9,
+            3,
+            101,
+            PolicyAction::Deny,
+            app_id,
+            mono_now_ns(),
+        );
+        let event = rx
+            .try_recv()
+            .expect("policy event frame")
+            .decode_dataplane_event()
+            .expect("policy event payload");
+        // 5-tuple = ORIGINAL public dst.
+        assert_eq!(event.dst_ip, flow.dst_ip);
+        assert_eq!(event.dst_port, 2222);
+        // nat_* = TRANSLATED internal dst.
+        assert_eq!(event.nat_dst_ip, Some(inside));
+        assert_eq!(event.nat_dst_port, 22);
+        // No source translation on a denied flow.
+        assert_eq!(event.nat_src_ip, None);
+        assert_eq!(event.nat_src_port, 0);
+        // AppID from the post-NAT tuple.
+        assert_eq!(event.application_id, 17);
+    }
+
+    /// #3058: a deny whose NatDecision carries a SOURCE rewrite (NPTv6 / SNAT)
+    /// must populate the nat_src_* fields, mirroring the permit/session-close
+    /// record. The emitter serializes every field from the decision.
+    #[test]
+    fn policy_deny_event_source_translation_logs_nat_src() {
+        let xlated_src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200));
+        let flow = test_flow(); // src 192.0.2.10:49152 -> dst 198.51.100.20:443
+        let nat = NatDecision {
+            rewrite_src: Some(xlated_src),
+            rewrite_src_port: Some(40000),
+            nptv6: true,
+            ..NatDecision::default()
+        };
+        let (handle, rx) = unlimited_handle();
+        emit_policy_deny_event(
+            Some(&handle),
+            &flow,
+            &nat,
+            test_meta(),
+            7,
+            9,
+            3,
+            101,
+            PolicyAction::Deny,
+            0,
+            mono_now_ns(),
+        );
+        let event = rx
+            .try_recv()
+            .expect("policy event frame")
+            .decode_dataplane_event()
+            .expect("policy event payload");
+        // 5-tuple = ORIGINAL src.
+        assert_eq!(event.src_ip, flow.src_ip);
+        assert_eq!(event.src_port, 49152);
+        // nat_* = TRANSLATED src.
+        assert_eq!(event.nat_src_ip, Some(xlated_src));
+        assert_eq!(event.nat_src_port, 40000);
+        assert_eq!(event.nat_dst_ip, None);
+        assert_eq!(event.nat_dst_port, 0);
+    }
+
+    /// #3058 regression guard (the GREEN-stays half of the fail-on-revert
+    /// exercise): a deny with NO translation (default NatDecision) keeps the
+    /// original 5-tuple and EMPTY nat fields — byte-identical to the pre-#3058
+    /// record. Only NAT'd denies change.
+    #[test]
+    fn policy_deny_event_non_nat_has_empty_nat_fields() {
+        let flow = test_flow();
+        let (handle, rx) = unlimited_handle();
+        emit_policy_deny_event(
+            Some(&handle),
+            &flow,
+            &NatDecision::default(),
+            test_meta(),
+            7,
+            9,
+            3,
+            101,
+            PolicyAction::Deny,
+            0,
+            mono_now_ns(),
+        );
+        let event = rx
+            .try_recv()
+            .expect("policy event frame")
+            .decode_dataplane_event()
+            .expect("policy event payload");
+        assert_eq!(event.src_ip, flow.src_ip);
+        assert_eq!(event.dst_ip, flow.dst_ip);
+        assert_eq!(event.src_port, 49152);
+        assert_eq!(event.dst_port, 443);
+        assert_eq!(event.nat_src_ip, None);
+        assert_eq!(event.nat_dst_ip, None);
+        assert_eq!(event.nat_src_port, 0);
+        assert_eq!(event.nat_dst_port, 0);
+    }
+
     /// #2470: two events emitted in monotonic-instant order carry
     /// non-decreasing wall-clock timestamps on the wire. This is the timeline
     /// correctness property the fix delivers: under queued / backlogged
@@ -945,6 +1151,7 @@ mod tests {
         emit_policy_deny_event(
             Some(&handle),
             &flow,
+            &NatDecision::default(),
             test_meta(),
             7,
             9,

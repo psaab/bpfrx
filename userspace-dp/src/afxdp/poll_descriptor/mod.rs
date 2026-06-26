@@ -2250,17 +2250,33 @@ pub(super) fn poll_binding_process_descriptor(
                                 emit_policy_deny_event(
                                     worker_ctx.event_stream,
                                     flow,
+                                    // #3058: carry the inbound destination NAT
+                                    // (DNAT / static-DNAT / inbound NPTv6) the
+                                    // policy was evaluated against (#2345) so the
+                                    // deny RT_FLOW record's nat_* fields show the
+                                    // real translated dst, mirroring the permit /
+                                    // session-close record. SNAT is not applied on
+                                    // a denied flow, so `decision.nat` here holds
+                                    // only the dst rewrite (None for a non-NAT
+                                    // deny → byte-identical to the old record).
+                                    &decision.nat,
                                     meta,
                                     from_zone_id,
                                     to_zone_id,
                                     owner_rg_id,
                                     policy_result.policy_id,
                                     policy_result.action,
-                                    // #2520: resolve the AppID with the same
+                                    // #2520/#3058: resolve the AppID with the same
                                     // app_catalog.lookup the session-create hot
-                                    // path runs, so the deny RT_FLOW record
-                                    // carries the application, not UNKNOWN.
-                                    resolve_flow_app_id(&worker_ctx.forwarding.app_catalog, flow),
+                                    // path runs, but from the POST-translation dst
+                                    // port the policy matched (`policy_dst_port`),
+                                    // so a DNAT'd deny logs the inside app (e.g.
+                                    // junos-ssh) instead of UNKNOWN(pre-NAT port).
+                                    resolve_policy_deny_app_id(
+                                        &worker_ctx.forwarding.app_catalog,
+                                        flow,
+                                        policy_dst_port,
+                                    ),
                                     now_ns,
                                 );
                                 telemetry.dbg.policy_deny += 1;
@@ -3010,16 +3026,26 @@ pub(super) fn poll_binding_process_descriptor(
                                     emit_policy_deny_event(
                                         worker_ctx.event_stream,
                                         flow,
+                                        // #3058: same as the ForwardCandidate deny
+                                        // site — `decision.nat` carries the inbound
+                                        // dst translation (DNAT/static-DNAT/NPTv6)
+                                        // the #2345 policy match ran against, so the
+                                        // nat_* fields log the real internal dst.
+                                        // None for a non-NAT deny (byte-identical).
+                                        &decision.nat,
                                         meta,
                                         from_zone_id,
                                         to_zone_id,
                                         owner_rg_id,
                                         policy_result.policy_id,
                                         policy_result.action,
-                                        // #2520: AppID via the hot-path lookup.
-                                        resolve_flow_app_id(
+                                        // #2520/#3058: AppID via the hot-path lookup
+                                        // from the POST-translation dst port the
+                                        // policy matched (`policy_dst_port`).
+                                        resolve_policy_deny_app_id(
                                             &worker_ctx.forwarding.app_catalog,
                                             flow,
+                                            policy_dst_port,
                                         ),
                                         now_ns,
                                     );
