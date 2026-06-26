@@ -46,6 +46,20 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
 - **startup is fail-closed.** Before the first successful fetch there is no
   snapshot; `GetPrefixes` returns empty. A policy referencing a feed-backed
   address resolves to nothing until the first good fetch (bounded to seconds).
+- **mixed valid/invalid bodies are observably degraded (#2993).** A body that
+  mixes valid prefixes with malformed lines still installs the valid prefixes
+  (a clean body is bit-identical to before), but the skipped invalid lines are
+  no longer *silent*: `parseFeed` counts every malformed (non-comment, non-CIDR,
+  non-IP) line and keeps a bounded verbatim sample (`maxInvalidSample`, 5).
+  `FeedInfo` surfaces `InvalidLines`, `InvalidSample`, and `Degraded`
+  (`InvalidLines > 0`); `show security dynamic-address` prints a `DEGRADED`
+  line. A degraded install logs one `slog.Warn` on the content change (not every
+  tick). This is **skip-with-count + degraded status**, not all-or-nothing: a
+  provider bug that mangles one line of a denylist still enforces the rest, but
+  the operator can see (and alarm on) that the installed set differs from the
+  published feed instead of it reporting a clean success. The markers are
+  cleared when a later clean body installs, and on a `hold-interval`
+  drop-to-empty.
 
 `FeedInfo` carries additive status fields (`LastSuccess`, `LastError`,
 `StaleSince`, `Hash`) alongside the legacy `URL`/`Prefixes`/`LastFetch`.
@@ -66,10 +80,12 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
   base URL.
 - Default refresh interval is 1 hour; the Junos config can override via
   `update-interval`.
-- Feed bodies are parsed line-by-line, one CIDR per line. Invalid lines
-  are skipped silently — by design, since feed providers occasionally
-  emit comments. A *scanner-level* error (overlong line / read error) is
-  NOT skipped: it fails the whole fetch (retain last-good).
+- Feed bodies are parsed line-by-line, one CIDR per line. Comment lines
+  (`#`, `//`) and blanks are skipped silently. A malformed non-comment line
+  is skipped but **counted** (`InvalidLines`/`InvalidSample`, marks the feed
+  `Degraded`, #2993) — it is no longer a silent drop. A *scanner-level* error
+  (overlong line / read error) is NOT skipped: it fails the whole fetch
+  (retain last-good).
 - A successful fetch always replaces the snapshot and stamps success, but
   the `onUpdate` recompile fires only when the canonical content hash
   changes — not on every fetch and not merely on a count change.

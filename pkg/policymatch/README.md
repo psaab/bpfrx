@@ -5,10 +5,27 @@ Single operator-side security-policy simulator shared by every
 
 - REST `GET /api/v1/security/match` (`pkg/api` `matchPoliciesHandler`)
 - gRPC `MatchPolicies` (`pkg/grpcapi`)
+- gRPC `ShowText` `test-policy:` topic (`pkg/grpcapi` `showTestPolicy`) — the
+  backing handler for the operational `test policy` CLI command
 - CLI `show security match-policies` and `test policy` (`pkg/cli`)
 
 Each surface is a THIN adapter: it parses/validates inputs and renders the
 verdict, then delegates the matching to `policymatch.Match`.
+
+## The surface #3042 missed (#3103)
+
+The original #3042 consolidation routed the REST/gRPC `MatchPolicies` and CLI
+`match-policies`/`test policy` paths through this package but left the gRPC
+`ShowText` `test-policy:` handler (`grpcapi.showTestPolicy`) on its own pre-#3042
+bespoke matcher (`matchShowPolicyAddr`/`matchShowPolicyApp`). That handler is
+what the remote `cli` binary's `test policy` command actually drives, so a remote
+operator could still be told `Default deny` while the dataplane permits under
+`default-policy permit-all`, or miss a predefined-app / global / literal-CIDR /
+feed-backed match. #3103 made `showTestPolicy` a thin adapter too (passing the
+daemon's live feed overlay via `Server.feedOverlayFn`, mirroring `MatchPolicies`)
+and deleted the bespoke helpers. Its rendered output format is unchanged except
+the formerly hard-coded `Default deny` line now reflects the configured
+default-policy (`Default permit`/`Default deny`/`Default reject`).
 
 ## Why this exists (#3042)
 

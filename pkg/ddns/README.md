@@ -476,6 +476,25 @@ its OWN learned address — on top of the SAME spine, without forking the engine
 - **HA gate** is the SAME per-RG `ScopeGate` (a router record on a reth/virtual
   interface publishes only on the RG master; stop-writing-never-withdraw
   otherwise). Standalone (nil gate) always publishes.
+  **RG0/non-HA single-writer (#2972).** A scope on a non-HA interface attributes
+  `RGOwner==0`. Unlike DHCP-lease DDNS — where each node's Kea memfile is
+  rendered master-filtered per RG, so the two nodes' lease input sets are
+  disjoint and an `RGOwner==0` lease is genuinely a non-HA pool with no peer —
+  Surface A scopes are built directly from the active config + interface
+  observer, so BOTH nodes build the IDENTICAL `RGOwner==0` scope. The node-level
+  writer gate (`ddnsWriterGateOpen`) opens on ANY-RG mastership, so in
+  active-active HA (node0 masters RG1, node1 masters RG2) BOTH nodes passed it
+  AND — before this fix — `surfaceAGate` admitted every `RGOwner==0` scope
+  unconditionally, double-writing the same configured FQDN (the public A/AAAA
+  record flaps when the nodes observe different addresses). `surfaceAGate` (in
+  `pkg/daemon/daemon_ddns_surface_a.go`) now ties `RGOwner==0` to RG0 — the
+  control-plane redundancy group — via `surfaceARG0Writer`: exactly the
+  RG0-primary node publishes the non-HA scopes, and the single writer follows
+  RG0 failover. When RG0 is not a tracked group (a non-standard cluster with
+  only data RGs, or the brief pre-first-election window), it falls back to a
+  deterministic single writer — the lowest node ID — so the scope is never
+  double-written. (`TestSurfaceAGateRG0SingleWriter`,
+  `TestSurfaceAGateRG0FallbackNoRG0`.)
 - **Lock discipline — I/O is NEVER performed under the manager mutex (#2778).**
   `SurfaceAManager.mu` guards ALL manager state (the durable ownership store, the
   per-scope runtime cache, the counters), but it is RELEASED across every

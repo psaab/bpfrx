@@ -749,6 +749,48 @@ type compileOpts struct {
 	// still BOOTS (#1960 fail-closed-on-load class) — the #2929 routing guard
 	// remains the runtime backstop. Same doctrine as lenientBackupRouterDst.
 	lenientSecureTunnelBindIface bool
+	// lenientPolicyMatchLeaves (#3113) downgrades the security-policy
+	// unsupported-match-leaf gate (validatePolicyMatchLeavesStrict) from a
+	// hard compile error to a cfg.Warnings entry. A security policy whose
+	// `match` clause carries a leaf the compiler does not enforce — e.g.
+	// `dynamic-application`, `url-category`, `source-identity` — committed
+	// cleanly but had that criterion SILENTLY DROPPED: compilePolicy's
+	// `match` switch handles only the supported subset (source/destination
+	// address, excluded, application) and the set-schema/schema_walk ignore
+	// unknown keywords. Dropping a match criterion WIDENS the policy — a
+	// rule meant to match only one dynamic-application became a broad L3/L4
+	// permit/deny over all applications, a fail-OPEN. The strict commit /
+	// commit-check path hard-rejects so the misconfiguration is operator-
+	// visible (naming the policy scope, the policy, and the unsupported
+	// leaf); the tolerant load / peer-sync paths downgrade to a warning so
+	// an already-persisted or peer-synced config an older binary silently
+	// accepted still BOOTS (#1960 fail-closed-on-load class) — the leaf
+	// stays dropped (the pre-existing behaviour), now flagged. Full
+	// support for those match types is a deferred follow-up. Same doctrine
+	// as lenientSecureTunnelBindIface.
+	lenientPolicyMatchLeaves bool
+	// lenientPolicyCommunityRef (#2881) downgrades the policy community
+	// cross-reference gate (validatePolicyCommunityReferencesStrict) from a
+	// hard compile error to a cfg.Warnings entry. A policy term's
+	// `from community <name>` (rendered `match community <name>`) and
+	// `then community delete <name>` (rendered `set comm-list <name> delete`,
+	// added in #2848) both reference an FRR `bgp community-list <name>` that
+	// xpf renders ONLY from a defined `policy-options community <name>`. With
+	// no validation, a term naming an UNDEFINED community committed cleanly and
+	// broke at FRR render time: a dangling `match community <name>` is rejected
+	// by frr-reload (a single vtysh -f add-batch exits non-zero on any
+	// CMD_WARNING_CONFIG_FAILED, failing the WHOLE reload and leaving routing
+	// stale), and a dangling `set comm-list <name> delete` is likewise
+	// rejected. The strict commit / commit-check path hard-rejects so the typo
+	// is operator-visible (naming the policy, term, and missing community); the
+	// tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config carrying the typo still BOOTS
+	// (#1960 fail-closed-on-load class). Runs on the fully-compiled *Config so
+	// the community map is populated regardless of authoring order. Only a
+	// NAME reference is validated — `then community (set|add) <value>` carries a
+	// community VALUE (e.g. 65000:100), not a list reference, and is not
+	// checked. Same doctrine as lenientRoutingExportRef.
+	lenientPolicyCommunityRef bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -816,6 +858,8 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientNATRuleSetScope:             true,
 		lenientBackupRouterDst:             true,
 		lenientSecureTunnelBindIface:       true,
+		lenientPolicyMatchLeaves:           true,
+		lenientPolicyCommunityRef:          true,
 	})
 }
 
@@ -934,6 +978,8 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientNATRuleSetScope:             true,
 		lenientBackupRouterDst:             true,
 		lenientSecureTunnelBindIface:       true,
+		lenientPolicyMatchLeaves:           true,
+		lenientPolicyCommunityRef:          true,
 	})
 }
 
@@ -1067,6 +1113,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3113 security-policy unsupported-match-leaf gate. A policy whose
+	// `match` clause carries a leaf the compiler does not enforce (e.g.
+	// `dynamic-application`, `url-category`, `source-identity`) committed
+	// cleanly but had that criterion SILENTLY DROPPED — compilePolicy's
+	// `match` switch handles only source/destination address, excluded, and
+	// application; the set-schema and schema_walk ignore unknown keywords.
+	// Dropping a match criterion WIDENS the policy into a broad L3/L4
+	// permit/deny the operator never intended — a fail-open. Runs on the
+	// group-expanded, inactive-pruned tree so an apply-groups-inherited
+	// match leaf is caught and an inactive policy is ignored. Strict
+	// (commit / commit-check): hard-reject naming the policy scope, the
+	// policy, and the unsupported leaf. Lenient (load / peer-sync): warn so
+	// an already-persisted or peer-synced config still boots (#1960) — the
+	// leaf stays dropped, now flagged. Full match-type support is a deferred
+	// follow-up.
+	policyMatchWarnings, err := validatePolicyMatchLeavesStrict(
+		tree.Children, opts.lenientPolicyMatchLeaves)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -1104,6 +1171,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, natScopeWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
+	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
 
 	for _, node := range tree.Children {
 		switch node.Name() {
@@ -1736,6 +1804,29 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientRoutingExportRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("routing export reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2881: policy community cross-reference gate. A policy term's
+	// `from community <name>` (rendered `match community <name>`) and
+	// `then community delete <name>` (rendered `set comm-list <name> delete`,
+	// added in #2848) both reference an FRR `bgp community-list <name>` that xpf
+	// renders ONLY from a defined `policy-options community <name>`. An
+	// undefined name committed unnoticed, then at FRR render time a dangling
+	// `match community` / `set comm-list ... delete` is rejected by frr-reload,
+	// failing the WHOLE reload (a single vtysh -f add-batch exits non-zero on
+	// any CMD_WARNING_CONFIG_FAILED) and leaving dynamic routing stale. Strict
+	// on commit / commit-check (hard reject naming the policy, term, and missing
+	// community); lenient on load / peer-sync (warn so an already-persisted or
+	// peer-synced config still boots — #1960). Runs on the fully-compiled
+	// *Config so the community map is populated regardless of authoring order.
+	// Mirrors validateRoutingExportReferencesStrict.
+	if err := validatePolicyCommunityReferencesStrict(cfg); err != nil {
+		if opts.lenientPolicyCommunityRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("policy community reference (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

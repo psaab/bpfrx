@@ -333,6 +333,37 @@ config, VRF definitions). The tolerant load/peer-sync path downgrades to a warni
 binary silently accepted still boots — it stays applied globally (the pre-existing
 behaviour), now flagged (#1960 no-brick doctrine, same as #3018/#3055/#3060).
 
+**Unsupported security-policy `match` leaves are rejected at commit (#3113,
+interim):** Junos SRX security policies match traffic with a rich `match`
+criteria set. Beyond the L3/L4 leaves xpf enforces, vSRX accepts unified-policy /
+identity / L7 leaves like `dynamic-application`, `url-category`, and
+`source-identity`. xpf's policy compiler (`compilePolicy`, `compiler_security.go`)
+only switches on the supported subset — `source-address`, `destination-address`,
+`source-address-excluded`, `destination-address-excluded`, and `application`; any
+other `match` child fell out of the switch with NO error and was SILENTLY DROPPED
+(the set-schema does not list the leaves and `schema_walk.go` returns nil for
+unknown keywords by design). Dropping a match criterion WIDENS the policy: a rule
+the operator wrote to match only one `dynamic-application` compiled as if that
+constraint were absent — a broad L3/L4 permit/deny over every application,
+permitting/denying traffic the operator never intended (a security fail-OPEN, not
+a cosmetic gap). `validatePolicyMatchLeavesStrict`
+(`compiler_policy_match.go`) hard-rejects a policy carrying an unsupported `match`
+leaf at commit, naming the policy scope (zone-pair or global), the policy, and the
+offending leaf, and directing the operator to remove it. It is an AST pre-walk in
+`compileExpanded` (not a typed validator) because the unsupported leaf is exactly
+what the compiler drops — by the time the typed `*Config` exists the leaf is gone
+from `PolicyMatch` — and because `SchemaValidate` returns nil for unknown keywords
+by design and cannot REJECT `match dynamic-application ...`. The allowlist is the
+EXACT set `compilePolicy` enforces (`supportedPolicyMatchLeaves`); keep the two in
+lockstep. Both zone-pair (`from-zone`/`to-zone`) and `global` policies are
+covered. This is the INTERIM contract: full support for those match types (typed
+fields + capability gate + Rust enforcement) is a substantial feature deferred to
+a follow-up. The tolerant load/peer-sync path downgrades to a warning
+(`lenientPolicyMatchLeaves`) so an already-persisted or peer-synced config an
+older binary silently accepted still boots — the leaf stays dropped (the
+pre-existing behaviour), now flagged (#1960 no-brick doctrine, same as
+#3079/#3055/#3060).
+
 **Ambiguous secure-tunnel `bind-interface` aliases are rejected at commit
 (#2933):** `security ipsec vpn <name> bind-interface` is a free-form 1-arg
 string stored verbatim on the typed VPN (`compiler_ipsec.go`); the runtime
@@ -356,6 +387,27 @@ ignored. The tolerant load/peer-sync path downgrades to a warning
 (`lenientSecureTunnelBindIface`) so an already-persisted or peer-synced config
 an older binary accepted still boots (#1960 no-brick doctrine) — the #2929
 routing guard stays the runtime backstop.
+
+**Undefined policy community references are rejected at commit (#2881):** a
+policy-statement term's `from community <name>` (rendered FRR `match community
+<name>`) and `then community delete <name>` (the strip-by-list operation added
+in #2848, rendered `set comm-list <name> delete`) both reference an FRR
+`bgp community-list <name>` that `pkg/frr` emits ONLY from a defined
+`policy-options community <name>`. With no validation a term naming an UNDEFINED
+community committed cleanly, then a dangling `match community` / `set comm-list
+... delete` line failed the WHOLE `frr-reload` of the managed section (a single
+`vtysh -f` add-batch exits non-zero on any `CMD_WARNING_CONFIG_FAILED`), leaving
+dynamic routing stale — a commit-accepted config the routing daemon cannot load.
+`validatePolicyCommunityReferencesStrict` (`compiler_validate_strict.go`) runs
+on the fully-compiled `*Config` (the community map is populated regardless of
+authoring order) and hard-rejects an undefined `from community` / `then
+community delete` reference at commit/commit-check, naming the policy, term, and
+missing community. The tolerant load/peer-sync path downgrades to a warning
+(`lenientPolicyCommunityRef`) so an already-persisted or peer-synced config an
+older binary accepted still boots (#1960 no-brick doctrine). The gate is
+SURGICAL — only NAME references are checked; `then community (set|add) <value>`
+carries a community VALUE (e.g. `65000:100`), not a list reference, and a defined
+community reference commits unchanged.
 
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map

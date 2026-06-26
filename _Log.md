@@ -29,6 +29,111 @@
   confirmed RED when each gate is reverted (allocation gate + descriptor
   rewrite guard).
 
+## 2026-06-25 — #3117: security-policy `scheduler-name` added to set-schema
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed codex-review-066 finding 066-05. A security-policy
+  `scheduler-name <name>` is compiled (`compiler_security.go`, both zone-pair
+  and global policies) and an undefined reference is strict-rejected at commit
+  (`validatePolicySchedulerReferencesStrict`), but the leaf was ABSENT from
+  `setSchema` — so it had no structural / value-slot `?` completion, violating
+  the two-SSOT rule that every compiled + validated leaf lives in the schema
+  tree. Declared `scheduler-name` under both the zone-pair policy node and the
+  global policy node as an untyped (plain string) leaf, sibling of
+  `description`/`match`/`then`. The strict reference check remains the SSOT for
+  undefined-scheduler rejection (no `treeValidator` added; no compiler/validator
+  behaviour change). Added fail-on-revert completion + schema-accept tests.
+- **File(s)**: pkg/config/schema_security.go,
+  pkg/config/schema_scheduler_name_3117_test.go, docs/config-schema.md, _Log.md
+
+- **2026-06-25**: #3113 — reject unsupported security-policy `match` leaves at commit (fail-closed). Added `validatePolicyMatchLeavesStrict` (AST pre-walk in `compileExpanded`) hard-rejecting a policy whose `match` clause carries a leaf outside the compiler-enforced allowlist (`source-address`, `destination-address`, `source-address-excluded`, `destination-address-excluded`, `application`) — e.g. `dynamic-application`/`url-category`/`source-identity`, which were silently dropped, widening the policy to a broad L3/L4 permit/deny (fail-open). Strict on `CompileConfig`; lenient-warn on both lenient constructors via new `lenientPolicyMatchLeaves` flag (#1960). Covers zone-pair AND global policies. Files: pkg/config/compiler_policy_match.go (new), pkg/config/compiler_policy_match_3113_test.go (new), pkg/config/compiler.go, pkg/config/README.md
+## 2026-06-25 — #3103: gRPC ShowText `test-policy:` routed through pkg/policymatch
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed codex-review-065 finding 065-01. The gRPC `ShowText`
+  `test-policy:` handler (`grpcapi.showTestPolicy`) — the backing handler for
+  the remote `cli` `test policy` command — was the ONE match-policies surface
+  #3042 missed. It still used the pre-#3042 bespoke `matchShowPolicyAddr` /
+  `matchShowPolicyApp` shadow matcher and hard-coded "Default deny" on a miss,
+  so it could report the OPPOSITE verdict from the runtime (missed predefined
+  apps, literal CIDRs, exclusions, feed overlay; ignored `default-policy
+  permit-all`). Rerouted it through `policymatch.Match` (passing the live feed
+  overlay via `Server.feedOverlayFn`, mirroring `MatchPolicies`); deleted the
+  bespoke `matchShowPolicy*` helpers + the now-unused `policyActionName` and the
+  `strconv` import from `server_cluster.go`. Output format preserved except the
+  default line now reflects the configured default-policy.
+- **File(s)**: pkg/grpcapi/server_show_firewall.go,
+  pkg/grpcapi/server_cluster.go, pkg/grpcapi/test_commands_test.go,
+  pkg/grpcapi/server_cluster_test.go, pkg/policymatch/README.md
+- **Validation**: go build/vet clean; `go test ./pkg/grpcapi/...
+  ./pkg/policymatch/... ./pkg/cli/...` 308 pass; gofmt clean. Fail-on-revert
+  proven: restoring origin/master's bespoke matcher turns the new
+  `TestShowTestPolicyAgreesWithRuntimeOnFixedCases` RED on all three sub-cases
+  (predefined-app permit, global-policy fallback, default-policy permit-all).
+- **Note (out of scope)**: `showTestPolicy` parses only `port=` (destination)
+  and `proto=`; it cannot express a source port (#3107) and does not validate
+  the protocol token (#3108). Left untouched for those issues.
+
+## 2026-06-25 — #2881: commit-time reject undefined policy community references
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add `validatePolicyCommunityReferencesStrict` reject-at-commit
+  gate. A policy-statement term's `from community <name>` (rendered FRR `match
+  community <name>`) and `then community delete <name>` (the #2848 strip-by-list
+  operation, rendered `set comm-list <name> delete`) reference an FRR
+  `bgp community-list <name>` that pkg/frr emits ONLY from a defined
+  `policy-options community <name>`. An undefined reference committed cleanly,
+  then the dangling line failed the WHOLE frr-reload of the managed section,
+  leaving dynamic routing stale (#1960-class commit-accepted-but-unloadable).
+  New validator runs on the fully-compiled `*Config`, hard-rejects on the strict
+  commit/commit-check path naming the policy, term, and missing community;
+  downgrades to a cfg.Warnings entry on the lenient load/peer-sync path
+  (`lenientPolicyCommunityRef`) so an already-persisted/peer-synced config still
+  boots. SURGICAL — only NAME refs checked; `then community (set|add) <value>`
+  carries a community VALUE, not a list ref, so it is not validated.
+- **File(s)**: pkg/config/compiler.go (compileOpts flag + 2 lenient blocks +
+  call site), pkg/config/compiler_validate_strict.go (validator),
+  pkg/config/policy_community_ref_test.go (new fail-on-revert tests),
+  pkg/config/policy_from_multileaf_2689_test.go,
+  pkg/config/compiler_policy_term_multimatch_2642_test.go,
+  pkg/config/parser_security_test.go, pkg/frr/frr_test.go (pre-existing tests:
+  define the communities they reference), pkg/config/README.md,
+  pkg/frr/README.md.
+- **Validation**: go build ./..., go vet ./pkg/config/... ./pkg/frr/...,
+  go test ./pkg/config/... ./pkg/frr/... (1806 pass). Fail-on-revert: removing
+  the validator call turns the 3 reject tests + lenient-warn test RED.
+
+- **2026-06-26T03:54:14Z**: Fix master-CI-red pkg/configstore TestCopyConfig — removed incidental `interfaces eth0.0` from the trust zone fixture. #3072/#3083's interface-multi-zone commit gate (merged this session) correctly rejects a Copy of a zone-with-interface (the interface lands in both trust and trust2). The interface was incidental to the Copy test. File: pkg/configstore/store_test.go
+
+## 2026-06-25 — #2993: feeds mixed valid/invalid body installs a partial set silently
+- **Action**: parseFeed now counts skipped malformed lines (invalidLines) +
+  bounded sample (invalidSample, maxInvalidSample=5); FeedInfo gains
+  InvalidLines/InvalidSample/Degraded. installSnapshot records them and logs
+  one slog.Warn on a degraded content change; recordFailure drop-to-empty
+  clears them. show security dynamic-address (CLI + grpcapi) prints a DEGRADED
+  line. Clean feeds unchanged (0 invalid, not degraded). Contract: skip-with-
+  count + degraded status (issue primary direction; observable, not silent).
+- **File(s)**: pkg/feeds/feeds.go, pkg/feeds/feeds_test.go,
+  pkg/feeds/README.md, pkg/cli/cli_show_security_objects.go,
+  pkg/grpcapi/server_show_security_text.go
+## 2026-06-25 — #2972: ddns surface-a RG0/non-HA scope double-write in active-active HA
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `surfaceAGate` admitting every `RGOwner==0` (RG0/non-HA)
+  Surface A scope unconditionally. In active-active HA both nodes pass the
+  node-level writer gate (each masters some RG) and both built+published the
+  identical non-HA FQDN — a public A/AAAA flap when the nodes observe different
+  WAN addresses. `RGOwner==0` is now tied to RG0 (control-plane RG) ownership
+  via new helper `surfaceARG0Writer`: the RG0-primary node is the single writer
+  and it follows RG0 failover; when RG0 is untracked (data-RG-only cluster or
+  pre-first-election) it falls back to the lowest-node-ID writer. Standalone
+  (nil gate) still writes every scope. DHCP-lease DDNS is unchanged (its
+  per-node memfiles are already master-filtered, so its `RGOwner==0` case has no
+  peer). Added fail-on-revert tests `TestSurfaceAGateRG0SingleWriter`
+  (active-active + failover) and `TestSurfaceAGateRG0FallbackNoRG0`; updated
+  `TestSurfaceAGatePerRG` for the new semantic.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
+  pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md
 ## 2026-06-25 — #2933: commit-time reject ambiguous secure-tunnel bind-interface aliases
 
 - **Timestamp**: 2026-06-25
