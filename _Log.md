@@ -29,6 +29,69 @@
   pass). Fail-on-revert: restoring the Atoi-silent-drop turned 6 Go tests RED;
   restoring `port_match`'s `return except` turned
   `destination_port_except_unresolved_fails_closed_3205` RED.
+## 2026-06-26 — #3199 host-inbound `protocols all` scoped to routing protocols (control-plane exposure)
+
+- **Timestamp**: 2026-06-26
+- **Action**: SECURITY fix. `host-inbound-traffic protocols all` was treated
+  as a blanket admit on both enforcement layers — the Rust classifier set
+  `ZoneHostInbound.all_protocols` which short-circuited `admits()`, and the
+  Go nft mirror's `hostInboundAllowsAll` returned true for `protocols all`
+  so `emitHostInboundZone` emitted a bare `<fam> daddr <addrs> accept` with
+  no deny. That opened EVERY host-bound service (SSH/HTTPS/SNMP/NETCONF/...)
+  to the zone's local IPs. In Junos `protocols all` means all ROUTING
+  protocols only. Fix: expand `all` to the concrete routing-protocol set
+  (ospf/bgp/rip/ripng/igmp/pim/vrrp/bfd/ldp/msdp/nhrp/router-discovery) in
+  BOTH layers. Rust: removed the `all_protocols` field + short-circuit;
+  `classify_protocol("all")` now recurses over `ROUTING_PROTOCOL_TOKENS`
+  (which never contains "all"), so the per-packet `admits()` matches routing
+  signatures via tcp/udp/ip_protocols and SSH stays denied. Go: dropped the
+  protocols branch from `hostInboundAllowsAll`, added a `case "all"` to
+  `hostInboundProtocolMatches` that expands over
+  `hostInboundRoutingProtocolTokens`, so `protocols all` flows through the
+  per-match path and still gets the catch-all drop. `system-services all` /
+  `any-service` keep their (intentionally broad) full-admit. Kernel-nft and
+  userspace decisions stay consistent; #3070 ESP/AH/ND exemptions untouched.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs, pkg/daemon/daemon_nft.go,
+  pkg/daemon/host_inbound_nft_test.go,
+  userspace-dp/src/afxdp/forwarding/README.md, _Log.md
+- **Validation**: `cargo build --release` clean; `cargo test --release`
+  forwarding/host_inbound green (97 forwarding tests). `go build ./...`;
+  `go test ./pkg/daemon/... ./pkg/config/...` 2340 passed. Fail-on-revert
+  proven: stashing the Rust source (restoring the `all_protocols`
+  short-circuit) turns `build_forwarding_state_protocols_all_admits_routing_not_system_services`
+  RED ("protocols all must NOT admit ssh"); stashing daemon_nft.go turns
+  `TestHostInboundFilterProtocolsAllScopedToRouting` RED; both restored
+## 2026-06-26 — #3202 reject block static-NAT combined with a port match/mapped-port
+
+- **Timestamp**: 2026-06-26
+- **Action**: Follow-up to #3031 (block-to-block static NAT). A subnet
+  static-NAT rule (`static-nat prefix <subnet>`) that ALSO carried a
+  `match destination-port` and/or `then static-nat mapped-port` passed
+  Go commit-compilation but the Rust `StaticNatBlock` discarded the port
+  info (it has no port fields, only an address-offset 1:1 remap). The
+  config silently degraded to an all-port, whole-subnet NAT — the
+  intended per-port mapping was lost, an over-broad NAT / policy bypass.
+  Junos `static-nat prefix` is address-only 1:1; per-port translation is
+  a host-scope (`/32`) construct. Chose the fail-closed commit-reject:
+  `validateNATHostMaskStrict` now rejects a `blockPair` rule that
+  specifies either port (strict) or warns (lenient load), and the Rust
+  `StaticNatTable::from_snapshots` drops a block snapshot carrying a
+  port instead of installing the wrong all-port block. Address-only
+  block NAT (#3031, no ports) is unchanged / byte-identical.
+- **File(s)**: pkg/config/compiler_nat.go,
+  userspace-dp/src/nat/static_nat.rs,
+  pkg/config/compiler_nat_host_mask_test.go,
+  userspace-dp/src/nat/tests.rs,
+  docs/feature-gaps.md, docs/feature-coverage.md
+- **Validation**: `go build ./...`, `go test ./pkg/config/` (1712 pass),
+  `cargo build --release`, `cargo test --release nat::` (149 pass).
+  Fail-on-revert proven both sides: neutering the Go `blockPair && port`
+  guard makes `TestStaticNATBlockWithPortRejected` go RED; deleting the
+  Rust port-skip makes `static_nat_block_with_port_is_dropped` go RED
+  (block mis-installs, 198.51.100.7 DNATs all-port). Both restored
+  byte-identical.
 
 ## 2026-06-26 — #2961 WG give-up advances T8 anchor (keepalive handshake-storm cooldown)
 
@@ -20578,3 +20641,33 @@ top.
   userspace-dp/src/afxdp/forwarding/README.md,
   pkg/dataplane/userspace/junos_host_policy_3019_test.go,
   docs/junos-cli-reference.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #2837 — REFRAMED to NON-REPRODUCING after a hostile review showed
+  the prior `tx_ifindex`-fallback fix was DEAD CODE for WireGuard. Re-confirmed
+  against the real resolver with a temporary probe (reverted byte-identical):
+  (1) the FIRST arm of `outer_physical_egress_ifindex` re-resolves the route to
+  the real peer endpoint and returns the PHYSICAL underlay egress even for a
+  dynamic-learned underlay neighbor — the route-to-peer lookup with
+  `dynamic_neighbors = None` yields `MissingNeighbor`/`egress_ifindex = 12`
+  (physical), which the first arm accepts; (2) there is no admit-time physical
+  `tx_ifindex` to fall back to — the build zeroes the WG endpoint destination
+  (`0.0.0.0`), so `resolve_tunnel_forwarding_resolution` returns
+  `NoRoute`/`egress_ifindex = 400` (logical)/`tx_ifindex = 0`, and even on a
+  routable transport `tx_ifindex` is the VLAN parent (no `egress` row). So the
+  report's failure (re-resolution drops the physical egress for a dynamic
+  underlay) cannot occur, and the prior fix's `tx_ifindex > 0` branch is never
+  taken for a real WG session. REVERTED the `tx_ifindex`-fallback branch + the
+  3 fabricated tests (which injected `tx_ifindex = 12` the resolver never
+  produces). Restored the conservative LOGICAL-ifindex fallback (pre-#2680
+  behaviour) and added 3 REAL tests driven by actual resolver values:
+  `outer_egress_returns_physical_for_dynamic_learned_underlay_neighbor`
+  (first arm returns physical 12 for `MissingNeighbor`),
+  `wg_resolver_stores_zero_tx_ifindex_so_no_tx_fallback_is_possible`
+  (real resolver → `tx_ifindex = 0`),
+  `outer_egress_falls_back_to_logical_when_peer_genuinely_unrouted`
+  (only the undeliverable NoRoute case reaches the fallback). README claim
+  corrected (the "admit-time PHYSICAL `tx_ifindex` backs the fallback" line was
+  FALSE for WG). Full frame suite 313 passed; wg suite 152 passed; build green.
+  **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/frame/README.md

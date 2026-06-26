@@ -198,6 +198,92 @@ func TestHostInboundFilterAllOpensZoneNoDeny(t *testing.T) {
 	}
 }
 
+// TestHostInboundFilterProtocolsAllScopedToRouting is the #3199 fail-on-revert
+// proof for the kernel nft mirror: `host-inbound-traffic protocols all` admits
+// the routing-protocol set (ospf/bgp/vrrp/...) but DOES NOT open
+// system-services (SSH/HTTPS/SNMP), and still emits a catch-all drop for the
+// rest. Restoring the old behaviour — hostInboundAllowsAll returning true for
+// `protocols all` (a bare `<fam> daddr <addrs> accept` with no deny) — turns
+// the "does not accept ssh" / "emits a drop" assertions RED.
+func TestHostInboundFilterProtocolsAllScopedToRouting(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"10.2.2.1/24"}},
+		}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"routing": {
+			Name:               "routing",
+			Interfaces:         []string{"reth0.0"},
+			HostInboundTraffic: &config.HostInboundTraffic{Protocols: []string{"all"}},
+		},
+	}
+	views := buildAndCheckViews(t, cfg)
+	payload := buildHostInboundFilterPayload(views)
+
+	// Routing protocols must be accepted: ospf (proto 89), bgp (tcp/179),
+	// vrrp (proto 112).
+	mustAccept := []string{
+		"ip daddr 10.2.2.1 meta l4proto 89 accept",
+		"ip daddr 10.2.2.1 tcp dport 179 accept",
+		"ip daddr 10.2.2.1 meta l4proto 112 accept",
+	}
+	for _, want := range mustAccept {
+		if !strings.Contains(payload, want) {
+			t.Errorf("protocols all must accept routing %q\n---\n%s", want, payload)
+		}
+	}
+
+	// System-services must NOT be opened: no bare accept, no ssh/https accept.
+	if strings.Contains(payload, "ip daddr 10.2.2.1 accept") {
+		t.Errorf("protocols all must NOT emit a bare full-accept (opens all services):\n%s", payload)
+	}
+	if strings.Contains(payload, "tcp dport 22") {
+		t.Errorf("protocols all must NOT accept ssh (tcp/22):\n%s", payload)
+	}
+	if strings.Contains(payload, "tcp dport 443") {
+		t.Errorf("protocols all must NOT accept https (tcp/443):\n%s", payload)
+	}
+	if strings.Contains(payload, "udp dport 161") {
+		t.Errorf("protocols all must NOT accept snmp (udp/161):\n%s", payload)
+	}
+
+	// A catch-all drop for everything else must be present (default-deny to
+	// the host for non-routing traffic).
+	if !strings.Contains(payload, "ip daddr 10.2.2.1 drop") {
+		t.Errorf("protocols all must still emit the v4 catch-all drop:\n%s", payload)
+	}
+}
+
+// TestHostInboundFilterExplicitSshStillAdmitted is the #3199 regression guard:
+// an explicit `system-services ssh` zone still accepts ssh (the protocols-all
+// scoping change must not affect explicit service lists).
+func TestHostInboundFilterExplicitSshStillAdmitted(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"10.3.3.1/24"}},
+		}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"mgmt": {
+			Name:               "mgmt",
+			Interfaces:         []string{"reth0.0"},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}},
+		},
+	}
+	views := buildAndCheckViews(t, cfg)
+	payload := buildHostInboundFilterPayload(views)
+
+	if !strings.Contains(payload, "ip daddr 10.3.3.1 tcp dport 22 accept") {
+		t.Errorf("system-services ssh must accept tcp/22:\n%s", payload)
+	}
+	if !strings.Contains(payload, "ip daddr 10.3.3.1 drop") {
+		t.Errorf("system-services ssh zone must emit a catch-all drop:\n%s", payload)
+	}
+}
+
 // buildAndCheckViews resolves the per-zone views and asserts the table would be
 // applied (at least one enforceable zone).
 func buildAndCheckViews(t *testing.T, cfg *config.Config) []dpuserspace.ZoneHostInboundView {
