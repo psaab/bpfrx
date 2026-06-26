@@ -445,6 +445,156 @@ fn plan_key_covers_every_replan_queues_input() {
     );
 }
 
+// #3091 fail-on-revert: a WAN VLAN unit (`reth0.80` → Linux `ge-0-0-2.80`) is a
+// software VLAN device that the kernel exposes with a SINGLE RX queue. Its
+// physical parent (`ge-0-0-2`) carries the VLAN-tagged frames on its 6 hardware
+// queues. The parent is already a binding candidate, so the VLAN child must be
+// deduped onto it and must NOT enter the candidate list as a separate 1-queue
+// interface — otherwise `replan_bindings_from_candidates` takes the MIN
+// rx_queues across all candidates (`min(6, 1) == 1`), plans a single queue, and
+// the dataplane runs with one worker (~6 Gbps, the regression).
+//
+// Revert proof: delete the `vlan_child_parent_netdev` dedup block in
+// `replan_queues` and this test goes RED — the child re-enters the candidate
+// list, `queue_count` collapses to 1, and the parent binds on a single queue.
+#[test]
+fn queue_planner_dedups_wan_vlan_child_onto_physical_parent() {
+    use crate::server::helpers::replan_queues;
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            // Physical WAN netdev: 6 hardware RX queues (mlx5 VF).
+            InterfaceSnapshot {
+                name: "ge-0/0/2".to_string(),
+                linux_name: "ge-0-0-2".to_string(),
+                zone: "untrust".to_string(),
+                ifindex: 12,
+                rx_queues: 6,
+                ..Default::default()
+            },
+            // VLAN unit reth0.50: software VLAN netdev, 1 RX queue.
+            InterfaceSnapshot {
+                name: "ge-0/0/2.50".to_string(),
+                linux_name: "ge-0-0-2.50".to_string(),
+                parent_linux_name: "ge-0-0-2".to_string(),
+                zone: "untrust".to_string(),
+                ifindex: 50,
+                parent_ifindex: 12,
+                vlan_id: 50,
+                rx_queues: 1,
+                ..Default::default()
+            },
+            // VLAN unit reth0.80: software VLAN netdev, 1 RX queue.
+            InterfaceSnapshot {
+                name: "ge-0/0/2.80".to_string(),
+                linux_name: "ge-0-0-2.80".to_string(),
+                parent_linux_name: "ge-0-0-2".to_string(),
+                zone: "untrust".to_string(),
+                ifindex: 80,
+                parent_ifindex: 12,
+                vlan_id: 80,
+                rx_queues: 1,
+                ..Default::default()
+            },
+            // LAN netdev: 6 hardware RX queues (also mlx5 VF).
+            InterfaceSnapshot {
+                name: "ge-0/0/1".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                zone: "trust".to_string(),
+                ifindex: 11,
+                rx_queues: 6,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+
+    // The VLAN-child netdevs must NOT be planned as separate candidates.
+    assert!(
+        bindings
+            .iter()
+            .all(|b| b.interface != "ge-0-0-2.50" && b.interface != "ge-0-0-2.80"),
+        "VLAN-child netdevs must be deduped onto the parent, not planned as \
+         separate 1-queue candidates; got {:?}",
+        bindings.iter().map(|b| &b.interface).collect::<Vec<_>>()
+    );
+
+    // The plan must span all 6 hardware queues (queue_count = min over the two
+    // remaining 6-queue physical candidates), NOT collapse to 1.
+    let queue_ids: std::collections::BTreeSet<u32> = bindings.iter().map(|b| b.queue_id).collect();
+    assert_eq!(
+        queue_ids,
+        (0..6).collect::<std::collections::BTreeSet<u32>>(),
+        "queue_count must be 6 (parent hardware queues), not collapsed to 1 by \
+         the VLAN child's single software queue"
+    );
+
+    // Both physical parents bind on all 6 queues.
+    for netdev in ["ge-0-0-1", "ge-0-0-2"] {
+        let q: std::collections::BTreeSet<u32> = bindings
+            .iter()
+            .filter(|b| b.interface == netdev)
+            .map(|b| b.queue_id)
+            .collect();
+        assert_eq!(
+            q,
+            (0..6).collect::<std::collections::BTreeSet<u32>>(),
+            "{netdev} must bind on all 6 hardware queues"
+        );
+    }
+
+    // The plan spans workers 0..5 (one per queue), i.e. multi-worker.
+    let workers: std::collections::BTreeSet<u32> = bindings.iter().map(|b| b.worker_id).collect();
+    assert_eq!(
+        workers.len(),
+        6,
+        "the plan must spread across 6 workers, not a single worker (#3091)"
+    );
+}
+
+// #3091: an ORPHAN VLAN child whose physical parent is NOT itself a binding
+// candidate must still be re-keyed onto the parent netdev with the parent's
+// HARDWARE queue count, never the child's single software queue. (This is the
+// defensive fallback path; the common case is the parent-is-candidate dedup
+// above.) Here the parent never appears as its own snapshot interface, so the
+// child resolves the parent's queue count from sysfs — in the unit-test
+// sandbox that yields 1 via `rx_queue_count`'s `.max(1)`, but the binding is
+// keyed on the PARENT netdev (`ge-0-0-9`), proving the child's own netdev name
+// never reaches the candidate list.
+#[test]
+fn queue_planner_rekeys_orphan_vlan_child_onto_parent_netdev() {
+    use crate::server::helpers::replan_queues;
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0/0/9.30".to_string(),
+            linux_name: "ge-0-0-9.30".to_string(),
+            parent_linux_name: "ge-0-0-9".to_string(),
+            zone: "untrust".to_string(),
+            ifindex: 130,
+            parent_ifindex: 19,
+            vlan_id: 30,
+            rx_queues: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let bindings = replan_queues(Some(&snapshot), 2, &[]);
+    assert!(
+        bindings.iter().all(|b| b.interface == "ge-0-0-9"),
+        "orphan VLAN child must bind on the parent netdev, not its own \
+         child netdev; got {:?}",
+        bindings.iter().map(|b| &b.interface).collect::<Vec<_>>()
+    );
+    assert!(
+        bindings.iter().all(|b| b.ifindex == 19),
+        "orphan VLAN child binding must use the parent ifindex"
+    );
+}
+
 #[test]
 fn queue_planner_excludes_tunnel_and_local_fabric_ge_interfaces() {
     // #2915: `ge-*`-named interfaces in tunnel or local-fabric contexts are

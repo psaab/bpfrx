@@ -24,6 +24,31 @@
   TestSurfaceAUnsupportedVersionFailsClosed go RED when the constructor is
   reverted to fail-open (the revert log shows the spurious "published record"
   write); TestSurfaceAAbsentStateFirstBootStandaloneWrites stays green on revert.
+- **2026-06-25**: #3114 — reject unsupported security-policy `then permit` children at commit (fail-closed). Added `validatePolicyThenPermitStrict` (AST pre-walk in `compileExpanded`, sibling of #3113) hard-rejecting a policy whose `then permit` arm carries a child the compiler does not enforce — e.g. `application-services` (UTM/IDP/AppFW/SSL-proxy), `firewall-authentication`, `tunnel ipsec-vpn`. The `permit` arm in `compilePolicy`'s `then` switch set `pol.Action = PolicyPermit` and never inspected the permit node's children/tail, so the modifier was SILENTLY DROPPED, turning a permit-only-with-inspection rule into an unconditional permit (fail-open). Checks both AST shapes (flat-set collapses modifier onto `permit` `Keys[1]`; hierarchical nests it as a child). Allowlist `supportedPolicyThenPermitChildren` is EMPTY (compiler enforces no permit child today). Strict on `CompileConfig`; lenient-warn on both lenient constructors via new `lenientPolicyThenPermit` flag (#1960). Covers zone-pair AND global policies. Files: pkg/config/compiler_policy_then.go (new), pkg/config/compiler_policy_then_3114_test.go (new), pkg/config/compiler.go, pkg/config/README.md
+## 2026-06-26 — #3091: VLAN-child netdevs collapsed the queue-plan min to 1 worker
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fixed a HIGH forwarding regression (~6-7 Gbps). The
+  bondless-RETH WAN VLAN units `reth0.50`/`reth0.80` (Linux
+  `ge-0-0-2.50`/`ge-0-0-2.80`) are software VLAN netdevs with 1 RX queue
+  each. They entered `replan_queues`' candidate list (their `ge-` name
+  passes `include_userspace_binding_interface`; the #1921 `seen_linux`
+  dedup misses them because their netdev name differs from the physical
+  parent `ge-0-0-2`). `queue_count = min(6, 1, 1, 6, 6) = 1` → 1 worker.
+  Added a VLAN-child dedup (`vlan_child_parent_netdev` +
+  `snapshot_has_parent_candidate`): a VLAN child whose physical parent is
+  a candidate is skipped (the parent's 6 hardware queues carry its tagged
+  frames); an orphan VLAN child is re-keyed onto the parent's hardware
+  queue count. Hashed `vlan_id` + `parent_linux_name` into the binding
+  plan key (#2915/#2916 invariant). Two fail-on-revert Rust tests.
+- **File(s)**: userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/main_tests.rs, userspace-dp/README.md, _Log.md
+- **Validation**: `cargo build --release` clean; `cargo test --release`
+  3027 passed. Live on loss userspace cluster: `planned_workers` 1 → 6
+  (5 → 18 bindings), RSS restored to default 6-ring spread (no narrow),
+  ping 0% loss, iperf3 P=12 v4 7.1 → 23.0 Gbps, v6 22.9 Gbps. Manual
+  `ethtool -X ... weight 1 0 0 0 0 0` RSS workaround removed (no longer
+  needed).
 
 ## 2026-06-25 — #3117: security-policy `scheduler-name` added to set-schema
 
@@ -43,6 +68,26 @@
   pkg/config/schema_scheduler_name_3117_test.go, docs/config-schema.md, _Log.md
 
 - **2026-06-25**: #3113 — reject unsupported security-policy `match` leaves at commit (fail-closed). Added `validatePolicyMatchLeavesStrict` (AST pre-walk in `compileExpanded`) hard-rejecting a policy whose `match` clause carries a leaf outside the compiler-enforced allowlist (`source-address`, `destination-address`, `source-address-excluded`, `destination-address-excluded`, `application`) — e.g. `dynamic-application`/`url-category`/`source-identity`, which were silently dropped, widening the policy to a broad L3/L4 permit/deny (fail-open). Strict on `CompileConfig`; lenient-warn on both lenient constructors via new `lenientPolicyMatchLeaves` flag (#1960). Covers zone-pair AND global policies. Files: pkg/config/compiler_policy_match.go (new), pkg/config/compiler_policy_match_3113_test.go (new), pkg/config/compiler.go, pkg/config/README.md
+## 2026-06-25 — #3116: simulator port validation across REST/gRPC/CLI
+
+- **Timestamp**: 2026-06-25
+- **Action**: Reject out-of-range/negative/malformed ports in the
+  match-policies simulator instead of silently coercing to the 0 "any
+  port" wildcard. Added shared `policymatch.ValidatePort(int)` (0 =
+  unspecified, 1..65535 valid) and `policymatch.ParsePort(string)` (CLI
+  token; empty = unspecified, else parse+validate). Applied: REST adds
+  `ValidatePort` after `queryIntStrict` for dst_port/src_port (400 on
+  >65535); gRPC validates `SourcePort`/`DestinationPort` int32 before the
+  Query (InvalidArgument on negative/>65535); CLI `test policy` and
+  `show security match-policies` route destination-port/source-port
+  through `ParsePort` (command error on malformed/out-of-range), no longer
+  ignoring the Atoi error. Valid (1..65535) and absent ports unchanged.
+- **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/port_test.go,
+  pkg/policymatch/README.md, pkg/api/security.go,
+  pkg/api/rest_filter_failclosed_test.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_cluster_test.go, pkg/cli/cli_request.go,
+  pkg/cli/cli_show_security.go, pkg/cli/policymatch_port_test.go
+
 ## 2026-06-25 — #3103: gRPC ShowText `test-policy:` routed through pkg/policymatch
 
 - **Timestamp**: 2026-06-25

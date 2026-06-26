@@ -364,6 +364,38 @@ older binary silently accepted still boots — the leaf stays dropped (the
 pre-existing behaviour), now flagged (#1960 no-brick doctrine, same as
 #3079/#3055/#3060).
 
+**Unsupported security-policy `then permit` children are rejected at commit
+(#3114, interim):** Junos SRX `then permit` accepts action modifiers that turn a
+bare permit into a permit-with-inspection or a permit-into-tunnel —
+`application-services { utm-policy X; idp; }` (UTM/IDP/AppFW/SSL-proxy/SecIntel
+attachment), `firewall-authentication`, `tunnel ipsec-vpn`, etc. xpf's policy
+compiler (`compilePolicy`, `compiler_security.go`) handles the `then` arm by
+switching only on the tokens it implements (`permit`, `deny`, `reject`, `log`,
+`count`); the `permit` arm sets `pol.Action = PolicyPermit` and NEVER inspects the
+permit node's children/tail, so any modifier under `then permit` fell out with NO
+error and was SILENTLY DROPPED (the set-schema does not list them and
+`schema_walk.go` returns nil for unknown keywords by design). Dropping a permit
+service chain turns a permit-only-with-inspection rule into an UNCONDITIONAL
+permit — an operator who writes `then permit application-services utm-policy
+strict-web` believes traffic is inspected while xpf forwards it without the chain
+(a security fail-OPEN). `validatePolicyThenPermitStrict` (`compiler_policy_then.go`)
+hard-rejects a policy whose `then permit` carries an unsupported child at commit,
+naming the policy scope (zone-pair or global), the policy, and the offending
+modifier, and directing the operator to remove it. It is an AST pre-walk in
+`compileExpanded` (not a typed validator) for the same reasons as #3113 — the
+dropped modifier is gone from the typed `*Config`, and `SchemaValidate` cannot
+REJECT an unknown keyword. The modifier appears either collapsed onto the permit
+node's `Keys[1]` (flat set) or as a child node (hierarchical block); both shapes
+are checked. The allowlist (`supportedPolicyThenPermitChildren`) is EMPTY today
+because the compiler enforces no `then permit` child — keep it in lockstep with
+`compilePolicy` so a future typed service chain is no longer rejected. Both
+zone-pair and `global` policies are covered. This is the INTERIM contract: a typed
+service-chain model + userspace capability gate + Rust enforcement is a deferred
+follow-up. The tolerant load/peer-sync path downgrades to a warning
+(`lenientPolicyThenPermit`) so an already-persisted or peer-synced config an older
+binary silently accepted still boots — the modifier stays dropped (the
+pre-existing behaviour), now flagged (#1960 no-brick doctrine, same as #3113).
+
 **Ambiguous secure-tunnel `bind-interface` aliases are rejected at commit
 (#2933):** `security ipsec vpn <name> bind-interface` is a free-form 1-arg
 string stored verbatim on the typed VPN (`compiler_ipsec.go`); the runtime

@@ -47,6 +47,44 @@ all bindings in batch (`RX_BATCH_SIZE=64`, up to `MAX_RX_BATCHES_PER_POLL=4`
 per tick). Per descriptor: parse → screen → session lookup → NAT/policy
 decision → forwarding build → enqueue TX or recycle.
 
+## Queue planning (`replan_queues`)
+
+`server::helpers::replan_queues` derives the AF_XDP binding plan from the
+config snapshot. It builds a candidate list of binding-eligible Linux
+netdevs, takes `queue_count = min(rx_queues)` across all candidates, and
+emits one binding per `(netdev, queue_id)` — so `planned_workers` equals
+that per-interface RX-queue minimum. The candidate set is the shared
+binding-exclusion contract (`include_userspace_binding_interface`, the
+Rust mirror of the Go `UserspaceBoundLinuxInterfaces` allowlist): zoned,
+non-tunnel, non-local-fabric netdevs, excluding `fxp*`/`em*`/`fab*`/`lo0`
+and the mgmt/control zones.
+
+Two dedup rules keep the `queue_count` min from collapsing:
+
+- **#1921 (`seen_linux`)**: the snapshot lists both a physical interface
+  (`ge-0/0/0`) and its non-VLAN unit (`ge-0/0/0.0`); both resolve to the
+  same Linux netdev. The first wins; the duplicate is dropped (a second
+  XSK bind on the same `(netdev, queue)` returns EBUSY).
+- **#3091 (`vlan_child_parent_netdev`)**: a VLAN-child unit
+  (`reth0.50`/`reth0.80` → Linux `ge-0-0-2.50`/`ge-0-0-2.80`) is a
+  *software* VLAN device the kernel exposes with a **single** RX queue,
+  but its tagged frames are delivered on the **physical parent's**
+  hardware queues (`ge-0-0-2`, 6 queues). The child netdev name differs
+  from the parent, so the #1921 guard misses it. A VLAN child
+  (`vlan_id != 0` with a distinct non-empty `parent_linux_name`) is
+  therefore deduped onto its parent: when the parent is itself a
+  candidate it is skipped entirely; an orphan VLAN child (parent not a
+  candidate) is re-keyed onto the parent netdev using the parent's
+  hardware queue count, never the child's lone software queue. Without
+  this, `min(6, 1, 1, 6) = 1` forced a single worker (~6-7 Gbps; the
+  #3091 regression). With it the WAN parent binds all 6 hardware queues
+  and forwards at ~23 Gbps multi-worker.
+
+Both `vlan_id` and `parent_linux_name` are hashed into the binding
+plan key (`update_snapshot_binding_plan_key`) so a re-parenting or VLAN
+change always triggers a replan — the #2915/#2916 "the plan key and the
+planner agree on every layout input" invariant.
+
 ## External interfaces
 
 - **Unix socket** (`/tmp/xpf-userspace-dp.sock`): newline-delimited text
