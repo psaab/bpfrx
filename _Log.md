@@ -32,6 +32,60 @@
   `TestFlexibleMatchRangeDefaultMaskNonStandardBitLength`. New Rust test
   `flex_match_non_byte_aligned_12bit_field` confirms the lowered length=2 /
   mask=0x0FFF selects the intended 12-bit field in the #3077 matcher.
+## 2026-06-26 — #3204 TCP RST reject reply L2 group/broadcast guard
+
+- **Timestamp**: 2026-06-26
+- **Action**: SECURITY/correctness fix. The TCP-RST reject reply path lacked the
+  `l2_dst_is_group_or_broadcast` guard that the ICMP-unreachable reject path has.
+  A reflected RST copies the inbound destination MAC into its own source-MAC slot
+  (`write_reply_eth_header`: out[6..12] = frame[0..6]), so a RST generated in
+  response to a frame addressed to a multicast/broadcast MAC egressed with a
+  group/broadcast SOURCE MAC — an IEEE 802.3 violation that poisons/flaps switch
+  MAC tables and can reflect/loop traffic. Fix: added the shared
+  `l2_dst_is_group_or_broadcast` guard to `build_reject_rst_frame`
+  (returns None → caller fail-closes to the silent drop it already performs),
+  mirroring `can_generate_icmp_error_reply` exactly. All three reject sources
+  (policy `then reject`, firewall-filter `then reject`, zone `tcp-rst`) funnel
+  through `enqueue_reject_reply` → `build_reject_rst_frame`, so the one-line guard
+  covers every TCP reject leg. Unicast triggers are byte-identical (RST still
+  generated). Tests: `reject_rst_suppressed_for_l2_broadcast_dst`,
+  `reject_rst_suppressed_for_l2_multicast_dst` (fail-on-revert: both go RED with
+  the guard removed), `reject_rst_still_generated_for_l2_unicast_dst`
+  (regression). cargo build --release green; reject + tcp module suites pass
+  (54 tcp, 176 reject/poll).
+- **File(s)**: userspace-dp/src/afxdp/frame/tcp.rs,
+  userspace-dp/src/afxdp/frame/tcp_tests.rs,
+  docs/userspace-icmp-te-debugging.md
+
+## 2026-06-26 — #3206 static-NAT unparseable match destination-address / prefix rejected at commit
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fail-closed fix. A static-NAT rule whose `match
+  destination-address` or `then static-nat prefix` was NOT a parseable
+  literal IP/CIDR (an address-book name, or a typo'd prefix) committed
+  cleanly: the existing host-mask check fires only when the value parses
+  (`parsed && !host`), so an unparseable value skipped both the host-mask
+  and block-pair checks and fell through to the Rust dataplane, where
+  `parse_nat_prefix` returns `None` and `from_snapshots` does `continue`,
+  silently dropping the WHOLE static-NAT mapping with no commit error or
+  runtime feedback. Fix: `validateNATHostMaskStrict` (compiler_nat.go) now
+  rejects an unparseable `match`/`then` FIRST (before the block-pair /
+  host-mask checks) using `natStaticPrefixInfo`'s `parsedIP == false`
+  signal, naming the rule-set, rule, slot, and offending value. Strict =
+  hard commit error; lenient (#1960) = `cfg.Warnings` entry. The Rust
+  `from_snapshots` None-drop stays as the lenient/peer-sync backstop (no
+  Rust change). Applies to BOTH the match destination-address and the
+  then static-nat prefix slots. NPTv6 / `static-nat inet` exemptions
+  unchanged; valid host (/32) and block (/24, #3031) static NAT still
+  compile byte-identical (no over-rejection).
+- **File(s)**: pkg/config/compiler_nat.go,
+  pkg/config/compiler_nat_host_mask_test.go, docs/config-schema.md, _Log.md
+- **Validation**: `go build ./...`; `go test ./pkg/config/` ok;
+  `cargo build --release` + `cargo test --release nat::` 149/0. Fail-on-revert:
+  removing the #3206 blocks turns TestStaticNATUnparseableMatchRejected,
+  TestStaticNATUnparseablePrefixRejected, TestStaticNATUnparseableLenientWarns
+  RED while TestStaticNATParseableValuesStillCompile stays GREEN; restored
+  byte-identical.
 
 ## 2026-06-26 — #3205 firewall-filter symbolic match values: resolve + fail closed
 

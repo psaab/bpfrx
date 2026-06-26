@@ -1755,8 +1755,7 @@ gate EXACTLY (shared predicate `isHostMaskAddress`):
   translation, never host-checked by the Rust parser) and `then static-nat
   inet` rules (a NAT64 translation whose `match` is the well-known prefix, e.g.
   `64:ff9b::/96`, driven by the separate NAT64 snapshot, not the static_nat
-  table). A non-IP token (an address-book name) is left to the existing address
-  handling. NPTv6 prefixes are exempt from the *host-mask* gate (a prefix is
+  table). NPTv6 prefixes are exempt from the *host-mask* gate (a prefix is
   expected, not a host), but they have their own strict gate
   (`validateNPTv6Strict`, #2240/#2241/#2380): prefix-length equality, supported
   length (`/48` or `/64`), IPv6 family, overlap rejection, and — #2380 — a
@@ -1785,10 +1784,28 @@ gate EXACTLY (shared predicate `isHostMaskAddress`):
   independently, so a leniently-loaded config is already inert for that rule —
   and the operator's next strict commit rejects it loudly.
 
+**#3206 — unparseable static-NAT match/prefix.** The host-mask check above
+fires only when the value *parses* as an IP (`parsed && !host`). A
+`match destination-address` or `then static-nat prefix` that is NOT a parseable
+literal IP/CIDR (an address-book name like `web-server`, or a typo'd prefix like
+`10.0.0.300`) therefore skipped both the host-mask and block-pair checks and
+fell through to the Rust dataplane, where `parse_nat_prefix`
+(`userspace-dp/src/nat/static_nat.rs`) returns `None` and `from_snapshots` does
+`continue`, SILENTLY dropping the WHOLE static-NAT mapping with no commit error
+or runtime feedback — the operator authored a rule that does not exist at
+runtime. `validateNATHostMaskStrict` now rejects an unparseable match/prefix
+FIRST (before the block-pair / host-mask checks) via `natStaticPrefixInfo`'s
+`parsedIP == false` signal, naming the rule-set, rule, slot, and offending
+value. Static NAT takes literal IP/CIDR endpoints, not address-book references.
+Strict = hard commit error; lenient = `cfg.Warnings` entry (the Rust
+`from_snapshots` drop remains the lenient/peer-sync backstop). Same exemptions
+apply (NPTv6, `then static-nat inet`).
+
 Regression coverage: `pkg/config/compiler_nat_host_mask_test.go` (bare/​/32/​/128
 accept; v4 + v6 non-host match/prefix reject with asserted message; NPTv6 and
 `inet` exemptions; NAT64 source-pool host vs non-host; strict-reject /
-lenient-warn / valid-no-warning; `isHostMaskAddress` table). Like
+lenient-warn / valid-no-warning; `isHostMaskAddress` table; #3206 unparseable
+match/prefix reject + parseable host/​block still-compile + lenient-warn). Like
 `pool-utilization-alarm`, this is compiler-side only — not yet a typed
 `setSchema` leaf.
 
