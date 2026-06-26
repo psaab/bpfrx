@@ -2089,6 +2089,206 @@ fn test_empty_excluded_destination_fails_closed_v6() {
     );
 }
 
+// #3023: a `*-excluded` set that legitimately lists only ONE address
+// family must NOT fail-closed for the OTHER family. A v6-only excluded
+// source has an empty v4 family but a populated v6 family — a v4 source
+// is trivially not in the (v6-only) excluded set, so it must MATCH. The
+// #2008 per-family empty guard wrongly dropped all v4 traffic here; the
+// fix gates fail-closed on emptiness across BOTH families.
+#[test]
+fn test_excluded_source_v6_only_permits_v4_3023() {
+    let mut snap = v3_rule("r-excl-src-v6only", &[], &["2001:db8::/32"]);
+    snap.source_address_excluded = true;
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    // One-family signal: v4 empty, v6 populated.
+    assert!(
+        state.rules[0].source_v4_empty,
+        "a v6-only excluded source must have an empty v4 family"
+    );
+    assert!(
+        !state.rules[0].source_v6_empty,
+        "a v6-only excluded source must have a populated v6 family"
+    );
+    // A v4 source is not in the v6-only excluded set → permit (the bug).
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "8.8.8.8".parse().expect("v4 src"),
+            "1.1.1.1".parse().expect("v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Permit,
+        "#3023: a v4 source must match when only v6 is excluded"
+    );
+    // A v6 source INSIDE the excluded set is still excluded → deny.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "2001:db8::5".parse().expect("excluded v6 src"),
+            "2001:db8:1::2".parse().expect("v6 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "a v6 source inside the excluded set must still be excluded"
+    );
+    // A v6 source OUTSIDE the excluded set → permit (inversion intact).
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "2001:dead::5".parse().expect("non-excluded v6 src"),
+            "2001:db8:1::2".parse().expect("v6 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Permit,
+        "a v6 source outside the excluded set must match"
+    );
+}
+
+// #3023 mirror: a destination-address-excluded set listing only v4 must
+// permit v6 destinations (v6 family empty, v4 populated → a v6 dst is
+// trivially not-excluded). Symmetric to the source case above.
+#[test]
+fn test_excluded_destination_v4_only_permits_v6_3023() {
+    let mut snap = v3_rule("r-excl-dst-v4only", &[], &["any"]);
+    snap.destination_literals = vec!["10.0.0.0/8".to_string()];
+    snap.destination_address_excluded = true;
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    assert!(
+        state.rules[0].destination_v6_empty,
+        "a v4-only excluded destination must have an empty v6 family"
+    );
+    assert!(
+        !state.rules[0].destination_v4_empty,
+        "a v4-only excluded destination must have a populated v4 family"
+    );
+    // A v6 destination is not in the v4-only excluded set → permit.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "2001:db8::1".parse().expect("v6 src"),
+            "2001:db8::2".parse().expect("v6 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Permit,
+        "#3023: a v6 destination must match when only v4 is excluded"
+    );
+    // A v4 destination INSIDE the excluded set is still excluded → deny.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "192.168.1.5".parse().expect("v4 src"),
+            "10.5.5.5".parse().expect("excluded v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "a v4 destination inside the excluded set must still be excluded"
+    );
+    // A v4 destination OUTSIDE the excluded set → permit.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "192.168.1.5".parse().expect("v4 src"),
+            "8.8.8.8".parse().expect("non-excluded v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Permit,
+        "a v4 destination outside the excluded set must match"
+    );
+}
+
+// #2008 contract preserved by #3023: when the excluded set is empty
+// across BOTH families (genuine typo/parse-drop), it must STILL
+// fail-closed for v4 AND v6. The one-family relief must not relax the
+// true empty-set case — this stays GREEN before and after the #3023 fix.
+#[test]
+fn test_fully_empty_excluded_source_fails_closed_both_families_3023() {
+    let mut snap = v3_rule("r-fully-empty-excl-src", &[], &["totally-bogus"]);
+    snap.source_address_excluded = true;
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    assert!(
+        state.rules[0].source_v4_empty && state.rules[0].source_v6_empty,
+        "a fully-dropped excluded source set is empty across both families"
+    );
+    // v4 packet → fail-closed.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "8.8.8.8".parse().expect("v4 src"),
+            "1.1.1.1".parse().expect("v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "a fully-empty excluded source must fail-closed for v4 (#2008)"
+    );
+    // v6 packet → fail-closed.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "2001:db8::1".parse().expect("v6 src"),
+            "2001:db8::2".parse().expect("v6 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "a fully-empty excluded source must fail-closed for v6 (#2008)"
+    );
+}
+
 // Mutation sentinel for the fail-closed change: a NON-empty excluded
 // set must STILL invert (this passes only because the fail-closed
 // guard is gated on the empty flag, not applied unconditionally — if

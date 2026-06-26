@@ -1328,14 +1328,20 @@ fn try_match_rule(
     // flag: matched != excluded.
     //
     // #2008 fail-open hardening: an `*-excluded` side whose configured
-    // set is EMPTY for this family (e.g. a typo'd address that was
-    // dropped during parse) would invert into match-ALL — a silent
-    // security bypass (a rule meant to exclude one address matches
-    // everything). Fail CLOSED: an empty excluded set never matches.
+    // set is EMPTY would invert into match-ALL — a silent security
+    // bypass (a rule meant to exclude one address matches everything).
+    // Fail CLOSED only when the set is empty across BOTH families: that
+    // is the genuine typo/parse-drop signal. #3023: when the packet's
+    // family list is empty but the OTHER family is populated, the
+    // operator legitimately listed only one family — an address in the
+    // packet's family is then trivially NOT in the excluded set, so the
+    // side matches. Fail-closing on the per-family empty flag alone
+    // over-blocked that legitimate cross-family case (a v6-only
+    // exclusion silently dropped all v4 traffic on a permit rule).
     let (src_ok, dst_ok) = match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
             let src_ok = if rule.source_excluded {
-                !rule.source_v4_empty
+                !(rule.source_v4_empty && rule.source_v6_empty)
                     && !(rule.source_literal_v4.contains(src)
                         || rule
                             .source_book_idxs
@@ -1350,7 +1356,7 @@ fn try_match_rule(
                         .any(|&i| state.books[i as usize].v4.contains(src))
             };
             let dst_ok = if rule.destination_excluded {
-                !rule.destination_v4_empty
+                !(rule.destination_v4_empty && rule.destination_v6_empty)
                     && !(rule.destination_literal_v4.contains(dst)
                         || rule
                             .destination_book_idxs
@@ -1368,7 +1374,7 @@ fn try_match_rule(
         }
         (IpAddr::V6(src), IpAddr::V6(dst)) => {
             let src_ok = if rule.source_excluded {
-                !rule.source_v6_empty
+                !(rule.source_v4_empty && rule.source_v6_empty)
                     && !(rule.source_literal_v6.contains(src)
                         || rule
                             .source_book_idxs
@@ -1383,7 +1389,7 @@ fn try_match_rule(
                         .any(|&i| state.books[i as usize].v6.contains(src))
             };
             let dst_ok = if rule.destination_excluded {
-                !rule.destination_v6_empty
+                !(rule.destination_v4_empty && rule.destination_v6_empty)
                     && !(rule.destination_literal_v6.contains(dst)
                         || rule
                             .destination_book_idxs
