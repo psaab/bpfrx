@@ -219,6 +219,43 @@ the single warning on load — eliminating both a duplicate warning and the old
 `junos-pingv6`, `junos-tcp-any`). Same fail-closed-on-load doctrine as
 #3043/#2401.
 
+**Security-policy address references must fully resolve (#3149, folds #3147):**
+the address-book sibling of #3144/#3146. A policy `match source-address` /
+`match destination-address` that names a DEFINED address-book entry (an address
+or an address-set) whose recursive members DANGLE (point at an undefined
+address/address-set), or that is a defined-but-EMPTY address-set, or a defined
+address with no configured prefix, was previously only WARNED at commit
+(`compiler_validate_warn.go`). At runtime the userspace address resolver
+(`resolveUserspaceAddressBookEntry` + `expandUserspacePolicyAddresses` in
+`pkg/dataplane/userspace/capabilities.go`) returns false for the same name — a
+dangling member fails the WHOLE set, an empty set never sets `resolvedAny`, a
+prefix-less address has an empty Value — so `userspacePolicyAddressesSupported`
+returns false → `userspaceSupportsSecurityPolicies` returns false → the
+dataplane REFUSES to arm security policies. The operator got a green commit and a
+silently DISARMED allow/deny path — a commit/apply split, fail-open.
+`validatePolicyMatchAddressSetMembersStrict` (`compiler_validate_strict.go`)
+hard-rejects such a reference (zone-pair OR global, source AND destination,
+including the recursive address-set-of-address-sets case) at commit, naming the
+policy scope, policy, field, and the inner failure. Resolution mirrors the
+runtime resolver EXACTLY (`policyMatchAddressBookResolves` replicates
+`resolveUserspaceAddressBookEntry`'s fail-closed semantics and the outer
+`len(values) == 0` reject), so the commit gate and the runtime gate cannot
+diverge. `any` / `any-ipv4` / `any-ipv6` / the empty token and literal CIDR/IP
+tokens are passed through; a wholly-undefined token stays the domain of
+`validatePolicyMatchAddressesStrict` (#2008), which runs first. **#3147
+excluded-inversion safety:** the resolver runs on the same address lists the
+runtime gate checks, regardless of `*-address-excluded`, so rejecting an empty /
+dangling set at COMMIT is fail-CLOSED for the excluded case too — an empty
+excluded set can never be committed, so it can never reach the dataplane and
+invert to MATCH-ALL (the historic fail-open this constraint guards against). The
+tolerant load/peer-sync path downgrades to a warning
+(`lenientPolicyMatchAddressSetMembers`) so an already-persisted or peer-synced
+config still boots (#1960 no-brick) — the dataplane independently refuses to arm
+such a policy, so a leniently-loaded bad config is no worse off, now flagged. The
+`compiler_validate_warn.go` address-set member warning is RETAINED for the
+lenient path and for unreferenced sets (which never reach the runtime gate, so
+they stay warn-only). Same fail-closed-on-load doctrine as #3144/#3146.
+
 **An interface belongs to exactly one security zone (#3072):**
 `pkg/dataplane/userspace.buildInterfaceZoneMap` builds the interface->zone
 lookup by iterating zone names in SORTED order and writing each interface
