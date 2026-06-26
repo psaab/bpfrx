@@ -1035,6 +1035,17 @@ type FirewallFilterTerm struct {
 	DSCPRewrite     string           // then dscp <value> — rewrite DSCP/traffic-class
 	Policer         string           // then policer <name> — reference to policer definition
 	FlexMatch       *FlexMatchConfig // flexible-match-range configuration
+	// UnknownFlexMatch records `flexible-match-range` numeric tokens that could
+	// not be parsed (byte-offset / bit-length / match-value / match-mask) OR
+	// that fell outside the representable range (#3203, agy-070 #02/#03/#04).
+	// Previously compileFilterFrom IGNORED the strconv error and left the field
+	// at its zero default — a malformed or >32-bit match-value silently became
+	// 0x0 and the term then matched the WRONG (zero) pattern with a clean
+	// commit. Mirroring UnknownActions/UnknownICMPTypes, the compile path
+	// records the offending token and validateFilterFlexMatchStrict hard-rejects
+	// the commit; the tolerant load / peer-sync path downgrades to a warning
+	// (#1960 no-brick). Populated by compileFilterFrom.
+	UnknownFlexMatch []string
 }
 
 // FlexMatchConfig defines a flexible byte-offset match condition.

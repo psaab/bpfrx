@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"net"
 	"regexp"
 	"strings"
@@ -4845,6 +4846,127 @@ func TestFlexibleMatchRangeSetSyntax(t *testing.T) {
 	}
 	if fm.Mask != 0xff000000 {
 		t.Errorf("Mask = 0x%x, want 0xff000000", fm.Mask)
+	}
+}
+
+// flexMatchSetLines builds the flat-set form of a single flexible-match-range
+// term so each #3203 case is exercised through the real commit path
+// (ParseSetCommand + SetPath + CompileConfig). `extra` carries the per-case
+// leaves (byte-offset / bit-length / range / match-value / match-mask).
+func flexMatchSetLines(extra ...string) []string {
+	base := "set firewall family inet filter f term t1 from flexible-match-range range r1 "
+	lines := []string{base + "match-start layer-3"}
+	for _, e := range extra {
+		lines = append(lines, base+e)
+	}
+	lines = append(lines, "set firewall family inet filter f term t1 then discard")
+	return lines
+}
+
+func compileFlexMatchSet(t *testing.T, extra ...string) (*Config, error) {
+	t.Helper()
+	tree := &ConfigTree{}
+	for _, line := range flexMatchSetLines(extra...) {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		tree.SetPath(cmd)
+	}
+	return CompileConfig(tree)
+}
+
+// TestFlexibleMatchRangeDefaultMaskNonStandardBitLength is the #3203 #04 guard:
+// the default mask for a NON-8/16 bit-length must be the low BitLength bits set,
+// not 0xFFFFFFFF. A 24-bit field defaults to 0x00FFFFFF and a 12-bit field to
+// 0x00000FFF — the matcher reads ceil(bits/8) bytes big-endian (right-aligned
+// in the low bits) and compares (read & mask) == value, so 0xFFFFFFFF could
+// never match a value with a zeroed high byte. REVERT (default non-8/16 to
+// 0xFFFFFFFF) -> this test FAILS.
+func TestFlexibleMatchRangeDefaultMaskNonStandardBitLength(t *testing.T) {
+	cases := []struct {
+		bits     int
+		value    string
+		wantMask uint32
+	}{
+		{24, "0x010203", 0x00FFFFFF},
+		{12, "0x0abc", 0x00000FFF},
+		{8, "0x11", 0xFF},          // unchanged from #3077
+		{16, "0x0800", 0xFFFF},     // unchanged from #3077
+		{32, "0x12345678", 0xFFFFFFFF}, // unchanged from #3077
+	}
+	for _, tc := range cases {
+		cfg, err := compileFlexMatchSet(t,
+			fmt.Sprintf("bit-length %d", tc.bits),
+			"match-value "+tc.value)
+		if err != nil {
+			t.Fatalf("bit-length %d: compile error: %v", tc.bits, err)
+		}
+		fm := cfg.Firewall.FiltersInet["f"].Terms[0].FlexMatch
+		if fm == nil {
+			t.Fatalf("bit-length %d: FlexMatch is nil", tc.bits)
+		}
+		if fm.Mask != tc.wantMask {
+			t.Errorf("bit-length %d: default Mask = 0x%08x, want 0x%08x",
+				tc.bits, fm.Mask, tc.wantMask)
+		}
+	}
+}
+
+// TestFlexibleMatchRangeRejectsMalformedValue is the #3203 #03 guard: a
+// non-numeric match-value must FAIL the commit, not silently coerce to 0.
+// REVERT (ignore the ParseUint error) -> the compile succeeds and this FAILS.
+func TestFlexibleMatchRangeRejectsMalformedValue(t *testing.T) {
+	_, err := compileFlexMatchSet(t, "bit-length 16", "match-value 0xZZZZ")
+	if err == nil {
+		t.Fatal("malformed match-value compiled cleanly; want a strict commit error")
+	}
+}
+
+// TestFlexibleMatchRangeRejectsOversizedValue is the #3203 #03 guard for a
+// value wider than the 32-bit wire field. ParseUint(...,16,32) errors on a
+// >32-bit literal; that error must reach the operator, not leave Value at 0.
+func TestFlexibleMatchRangeRejectsOversizedValue(t *testing.T) {
+	_, err := compileFlexMatchSet(t, "bit-length 32", "range 0x1FFFFFFFF/0xFFFFFFFF")
+	if err == nil {
+		t.Fatal("oversized match-value compiled cleanly; want a strict commit error")
+	}
+}
+
+// TestFlexibleMatchRangeRejectsBadBitLength is the #3203 #02 guard: a
+// bit-length outside 1..32 must FAIL the commit rather than truncate through an
+// unchecked uint8() cast (e.g. 999 -> 231).
+func TestFlexibleMatchRangeRejectsBadBitLength(t *testing.T) {
+	_, err := compileFlexMatchSet(t, "bit-length 999", "match-value 0x1")
+	if err == nil {
+		t.Fatal("out-of-range bit-length compiled cleanly; want a strict commit error")
+	}
+}
+
+// TestFlexibleMatchRangeLenientDowngradesToWarning confirms the tolerant load
+// path (#1960 no-brick) downgrades a malformed flex-match to a warning instead
+// of refusing to boot — mirroring lenientFilterMatchValues.
+func TestFlexibleMatchRangeLenientDowngradesToWarning(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, line := range flexMatchSetLines("bit-length 16", "match-value 0xZZZZ") {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		tree.SetPath(cmd)
+	}
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient compile must not hard-fail: %v", err)
+	}
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "flexible-match-range") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a flexible-match-range warning on the tolerant path, got %v", cfg.Warnings)
 	}
 }
 

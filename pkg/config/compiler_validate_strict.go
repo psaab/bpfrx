@@ -2976,6 +2976,57 @@ func validateFilterMatchValuesStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFilterFlexMatchStrict hard-rejects any firewall-filter term whose
+// `from flexible-match-range` carries a numeric token (byte-offset / bit-length
+// / match-value / match-mask) the compiler could not parse or that fell outside
+// the representable range — #3203 (agy-070 #02/#03/#04).
+//
+// Before this gate compileFilterFrom IGNORED the strconv error on each of these
+// fields, leaving the offending value at its zero default. A malformed or
+// >32-bit match-value silently became 0x0 and the rule then matched value 0
+// instead of the intended pattern; an out-of-range bit-length truncated through
+// an unchecked uint8() cast (999 -> 231). The commit succeeded cleanly, so the
+// operator never saw the misclassification — a security-policy correctness gap.
+//
+// compileFilterFrom now records each unparseable/out-of-range token on the term
+// (UnknownFlexMatch, mirroring UnknownActions); this gate makes the refusal
+// operator-visible at commit. The walk is deterministic (filters sorted by name,
+// terms in config order). On the tolerant load / peer-sync path the caller
+// downgrades the returned error to a warning (#1960 no-brick).
+func validateFilterFlexMatchStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil || len(term.UnknownFlexMatch) == 0 {
+					continue
+				}
+				return fmt.Errorf(
+					"firewall family %s filter %q term %q: invalid "+
+						"flexible-match-range %q (byte-offset 0-255, bit-length "+
+						"1-32, match-value/match-mask a hex value up to 0xFFFFFFFF)",
+					family, name, term.Name, term.UnknownFlexMatch[0])
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // filterProtocolResolvable reports whether a `from protocol <token>` is
 // representable: it INLINE-mirrors the acceptance set of
 // appid.ProtocolNumber's ok==true result (the #2124/#2175 SSOT). pkg/config
