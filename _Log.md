@@ -1,3 +1,25 @@
+## 2026-06-25 — #3067: ICMP pseudo-port only for identifier-bearing query types
+
+- **Timestamp**: 2026-06-25
+- **Action**: `parse_flow_ports` no longer treats ICMP/ICMPv6 header bytes
+  [l4+4, l4+6) as a pseudo source port for ALL ICMP types. Those bytes are
+  the Identifier only for the query types (ICMPv4 Echo + Timestamp +
+  Information, ICMPv6 Echo). For errors / Redirect / ND-MLD the same bytes
+  are a gateway address / next-hop MTU / pointer / unused field. The arm now
+  reads the type byte at `l4` (bounded by `declared_end`) and returns `None`
+  (flowless) for every non-query type, so transit ICMP control packets take
+  the route-based session-less path instead of installing a bogus
+  identifier-keyed session (session-table pollution / spurious collisions).
+  Matching ICMP errors to the embedded inner flow stays out of scope (#2393).
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs (fix),
+  userspace-dp/src/afxdp/frame/inspect_tests.rs (5 new tests, fail-on-revert
+  RED→GREEN verified), userspace-dp/src/afxdp/frame/README.md,
+  userspace-dp/src/filter/README.md (doc), _Log.md
+- **Validation**: `cargo build --release -p xpf-userspace-dp` clean;
+  `cargo test --release inspect` 36 passed; reverting the type
+  discrimination turns the two non-query assertions RED while echo stays
+  green.
+
 ## 2026-06-25 — #3065: unspecified default-policy fails CLOSED (deny-all) + reject-all + schema leaf
 
 - **Timestamp**: 2026-06-25

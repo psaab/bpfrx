@@ -263,10 +263,16 @@ on those fields.
 `IpAddr` variant carried by `src_ip` / `dst_ip` but is materialized
 on the struct for cheap branchless checks on the hot path.
 For ICMP and ICMPv6 sessions, `parse_flow_ports`
-(`userspace-dp/src/afxdp/frame/inspect.rs:212-232`) unconditionally
-reads bytes 4-5 of the ICMP header into `src_port` (the ICMP
-identifier word — meaningful for Echo Request/Reply, opaque for
-other ICMP types) and stores zero in `dst_port`. ICMP **type**
+(`userspace-dp/src/afxdp/frame/inspect.rs`) reads bytes 4-5 of the
+ICMP header into `src_port` (the ICMP identifier word) and stores
+zero in `dst_port` — but ONLY for the identifier-bearing query types
+(#3067): ICMPv4 Echo Request/Reply and the Timestamp/Information
+query+reply pairs (types 0/8/13/14/15/16), and ICMPv6 Echo
+Request/Reply (128/129). For error and control types — where bytes
+4-5 are a gateway address / next-hop MTU / pointer / unused field,
+not an identifier — `parse_flow_ports` returns `None` so no
+identifier-keyed session is installed for transit ICMP control
+traffic. ICMP **type**
 and **code** are NOT in the cache key — adding an explicit
 `icmp_type` or `icmp_code` filter match makes the filter
 cache-sensitive unless `SessionKey` or trusted per-session
