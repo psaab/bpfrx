@@ -925,6 +925,40 @@ pub(in crate::afxdp) fn parse_flow_ports(
             ))
         }
         PROTO_ICMP | PROTO_ICMPV6 => {
+            // #3067: bytes [l4+4, l4+6) are the ICMP/ICMPv6 Identifier ONLY for
+            // the identifier-bearing query types. For ICMPv4 those are Echo
+            // Request/Reply and the Timestamp/Information query+reply pairs (the
+            // Identifier sits at the same offset for all of them, per RFC 792);
+            // for ICMPv6 only Echo Request/Reply (RFC 4443). For error and
+            // control messages — Dest-Unreachable, Packet-Too-Big,
+            // Time-Exceeded, Parameter-Problem, Redirect, and the ND/MLD types —
+            // those two bytes are NOT a port: they are part of a gateway
+            // address, the next-hop MTU, a pointer, or an unused/reserved field.
+            // Treating them as a pseudo source port installed bogus
+            // identifier-keyed stateful sessions for transit ICMP control
+            // traffic, polluting the session table and risking spurious
+            // collisions. Return `None` (the caller's "flowless" sentinel) for
+            // every non-query type so the packet takes the session-less,
+            // route-based forward path instead of installing a fake session.
+            //
+            // The type byte at `l4` must itself lie within the IP-declared
+            // datagram (the #2361 fail-closed invariant); a type byte read from
+            // trailing slack past `declared_end` is not authoritative.
+            if l4 >= declared_end {
+                return None;
+            }
+            let icmp_type = *frame.get(l4)?;
+            let identifier_bearing = match protocol {
+                // Echo Reply (0) / Echo Request (8), Timestamp Request (13) /
+                // Reply (14), Information Request (15) / Reply (16).
+                PROTO_ICMP => matches!(icmp_type, 0 | 8 | 13 | 14 | 15 | 16),
+                // Echo Request (128) / Echo Reply (129).
+                PROTO_ICMPV6 => matches!(icmp_type, 128 | 129),
+                _ => false,
+            };
+            if !identifier_bearing {
+                return None;
+            }
             let ident_start = l4.checked_add(4)?;
             let ident_end = l4.checked_add(6)?;
             if ident_end > declared_end {
