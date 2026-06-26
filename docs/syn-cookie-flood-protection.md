@@ -39,6 +39,34 @@ applies the same default defensively. Previously the dataplane gate required
 `AttackThreshold > 0`, so an unset attack-threshold silently left SYN-flood
 protection disabled even when configured.
 
+### Default thresholds for the other rate/scan screens (#3230)
+
+The Rust screen engine (`userspace-dp/src/screen/mod.rs`, `scan.rs`) gates
+icmp-flood, udp-flood, tcp port-scan, and ip ip-sweep on `threshold > 0`. Like
+syn-flood before #3024, these checks had NO default: enabling one without an
+explicit threshold compiled to 0 and the check was silently skipped. The config
+compiler now seeds a Junos-aligned default at parse time
+(`pkg/config/compiler_security.go`) for each ENABLED-but-unset check. An
+explicit threshold is always preserved, and a check that is not configured stays
+off (threshold 0).
+
+| Screen check        | Default | Junos basis |
+|---------------------|---------|-------------|
+| `icmp flood`        | 1000    | Junos `icmp flood threshold` default of 1000 pps |
+| `udp flood`         | 1000    | Junos `udp flood threshold` default of 1000 pps |
+| `tcp port-scan`     | 10      | Junos flags a port scan at 10 distinct destination ports |
+| `ip ip-sweep`       | 10      | Junos flags an address sweep at 10 distinct destination addresses |
+
+Note on the scan/sweep defaults: Junos expresses the port-scan / ip-sweep
+`threshold` as a time window (default 5000 microseconds) within which 10 distinct
+ports / addresses trigger detection. This engine instead interprets the
+threshold as a DISTINCT-DESTINATION COUNT over a fixed 10-second window
+(`WINDOW_SECS` in `scan.rs`, comparison `len() > threshold`), so the default
+uses Junos's distinct-destination detection count (10) rather than its 5000-
+microsecond time-window value. Feeding 5000 here would be read as a count and
+clamped to the dataplane cap (1023, `maxScanSweepThreshold`) — effectively never
+firing.
+
 ## Algorithm
 
 ```

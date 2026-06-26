@@ -2893,6 +2893,100 @@ func TestSynFloodExplicitAttackThresholdPreserved(t *testing.T) {
 	}
 }
 
+// compileScreenProfile is a helper that compiles a set of `set` commands and
+// returns the named screen profile.
+func compileScreenProfile(t *testing.T, name string, cmds ...string) *ScreenProfile {
+	t.Helper()
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	p := cfg.Security.Screen[name]
+	if p == nil {
+		t.Fatalf("screen profile %q not found", name)
+	}
+	return p
+}
+
+// TestScreenFloodScanDefaultThresholds is a fail-on-revert guard for #3230
+// (siblings of #3024): icmp-flood, udp-flood, tcp port-scan, and ip ip-sweep
+// enabled WITHOUT an explicit threshold must compile to a NONZERO Junos default
+// so the Rust screen engine's `threshold > 0` gate fires. A zero threshold is
+// the value the dataplane treats as "disabled" — silently leaving the
+// configured screen non-functional. RED if the parse-time defaults in
+// pkg/config/compiler_security.go are reverted.
+func TestScreenFloodScanDefaultThresholds(t *testing.T) {
+	p := compileScreenProfile(t, "s",
+		"set security screen ids-option s icmp flood",
+		"set security screen ids-option s udp flood",
+		"set security screen ids-option s tcp port-scan",
+		"set security screen ids-option s ip ip-sweep",
+	)
+	if p.ICMP.FloodThreshold != defaultICMPFloodThreshold {
+		t.Errorf("icmp FloodThreshold = %d, want default %d", p.ICMP.FloodThreshold, defaultICMPFloodThreshold)
+	}
+	if p.UDP.FloodThreshold != defaultUDPFloodThreshold {
+		t.Errorf("udp FloodThreshold = %d, want default %d", p.UDP.FloodThreshold, defaultUDPFloodThreshold)
+	}
+	if p.TCP.PortScanThreshold != defaultPortScanThreshold {
+		t.Errorf("PortScanThreshold = %d, want default %d", p.TCP.PortScanThreshold, defaultPortScanThreshold)
+	}
+	if p.IP.IPSweepThreshold != defaultIPSweepThreshold {
+		t.Errorf("IPSweepThreshold = %d, want default %d", p.IP.IPSweepThreshold, defaultIPSweepThreshold)
+	}
+}
+
+// TestScreenFloodScanExplicitThresholdsPreserved guards that the #3230 defaults
+// do NOT override an operator-supplied threshold.
+func TestScreenFloodScanExplicitThresholdsPreserved(t *testing.T) {
+	p := compileScreenProfile(t, "s",
+		"set security screen ids-option s icmp flood threshold 500",
+		"set security screen ids-option s udp flood threshold 600",
+		"set security screen ids-option s tcp port-scan threshold 100",
+		"set security screen ids-option s ip ip-sweep threshold 50",
+	)
+	if p.ICMP.FloodThreshold != 500 {
+		t.Errorf("icmp FloodThreshold = %d, want explicit 500", p.ICMP.FloodThreshold)
+	}
+	if p.UDP.FloodThreshold != 600 {
+		t.Errorf("udp FloodThreshold = %d, want explicit 600", p.UDP.FloodThreshold)
+	}
+	if p.TCP.PortScanThreshold != 100 {
+		t.Errorf("PortScanThreshold = %d, want explicit 100", p.TCP.PortScanThreshold)
+	}
+	if p.IP.IPSweepThreshold != 50 {
+		t.Errorf("IPSweepThreshold = %d, want explicit 50", p.IP.IPSweepThreshold)
+	}
+}
+
+// TestScreenFloodScanNotConfiguredStaysOff guards that a screen profile which
+// does NOT enable icmp/udp flood, port-scan, or ip-sweep leaves every threshold
+// at 0 (the check stays disabled). The #3230 defaults must only apply to an
+// ENABLED-but-unset check, never spontaneously enable an unconfigured one.
+func TestScreenFloodScanNotConfiguredStaysOff(t *testing.T) {
+	p := compileScreenProfile(t, "s",
+		"set security screen ids-option s tcp land",
+	)
+	if p.ICMP.FloodThreshold != 0 {
+		t.Errorf("icmp FloodThreshold = %d, want 0 (not configured)", p.ICMP.FloodThreshold)
+	}
+	if p.UDP.FloodThreshold != 0 {
+		t.Errorf("udp FloodThreshold = %d, want 0 (not configured)", p.UDP.FloodThreshold)
+	}
+	if p.TCP.PortScanThreshold != 0 {
+		t.Errorf("PortScanThreshold = %d, want 0 (not configured)", p.TCP.PortScanThreshold)
+	}
+	if p.IP.IPSweepThreshold != 0 {
+		t.Errorf("IPSweepThreshold = %d, want 0 (not configured)", p.IP.IPSweepThreshold)
+	}
+}
+
 func TestNATSourceSetSyntax(t *testing.T) {
 	tree := &ConfigTree{}
 	for _, cmd := range []string{"set security nat source pool snat-pool address 203.0.113.0/24", "set security nat source rule-set trust-to-untrust from zone trust", "set security nat source rule-set trust-to-untrust to zone untrust", "set security nat source rule-set trust-to-untrust rule snat-rule match source-address 10.0.0.0/8", "set security nat source rule-set trust-to-untrust rule snat-rule then source-nat interface"} {
