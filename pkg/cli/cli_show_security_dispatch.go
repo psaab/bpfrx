@@ -48,6 +48,21 @@ func (c *CLI) policySchedulerActiveState() (state map[string]bool, ok bool) {
 	return p.PolicySchedulerActiveState(), true
 }
 
+// policyInactiveFn returns a per-policy scheduler-inactivity predicate bound to
+// the live active-state snapshot for use as policymatch.Query.PolicyInactiveFn
+// (#3104), or nil when the runtime scheduler state cannot be queried. When nil
+// the policy simulator treats scheduled policies as active — the pre-#3104
+// behaviour and the same fallback the #3062 display surfaces use when no
+// provider is present — so the verdict never regresses for a surface lacking
+// live state.
+func (c *CLI) policyInactiveFn() func(string) bool {
+	state, ok := c.policySchedulerActiveState()
+	if !ok {
+		return nil
+	}
+	return dpuserspace.PolicyInactiveFn(state)
+}
+
 // policyDetailState renders the Junos "State:" token for a policy detail
 // line: "inactive" when the policy is bound to a scheduler that is
 // currently runtime-inactive, otherwise "enabled". haveSched gates the

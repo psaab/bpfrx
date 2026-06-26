@@ -1,3 +1,34 @@
+## 2026-06-26 — #3104: policymatch simulator skips scheduler-inactive policies (verdict companion to #3062 display)
+
+- **Timestamp**: 2026-06-26
+- **Action**: fixed #3104. The shared policy simulator (`pkg/policymatch`)
+  returned a definitive permit/deny for scheduled (runtime-inactive) policies,
+  disagreeing with the dataplane (`policy.rs try_match_rule` drops an inactive
+  rule before app/address matching). Threaded live per-scheduler active-state
+  into `policymatch.Query.PolicyInactiveFn`; `ruleMatches` now skips a
+  scheduler-inactive policy FIRST (mirroring the runtime), so the simulator
+  falls through to the next active rule / configured default-policy. Wired at
+  all simulator surfaces: REST `match-policies`, gRPC `MatchPolicies` + `test
+  policy`, and the local CLI `show security match-policies` + `test policy`.
+  The closure is built from the same daemon-local
+  `Manager.PolicySchedulerActiveState` accessor the #3062 display uses, via the
+  new SSOT builder `dataplane/userspace.PolicyInactiveFn` (wraps the shared
+  `PolicyInactive` predicate). Missing-state fallback: when live scheduler
+  state is unavailable to a caller (offline CLI / NoDataplane) the closure is
+  nil and scheduled policies are simulated as-if-active — matching #3062's
+  display fallback and keeping non-scheduled verdicts byte-identical (no
+  regression). Added `pkg/policymatch/scheduler_test.go` (4 cases: inactive
+  permit→default-deny, inactive deny→later active permit, scheduler flip,
+  non-scheduled unchanged); fail-on-revert verified (removing the skip turns
+  the 3 positive cases RED, case 4 stays green).
+- **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/scheduler_test.go,
+  pkg/dataplane/userspace/policies.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_request.go,
+  pkg/grpcapi/server_show_policies_text.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_show_firewall.go, pkg/api/server.go, pkg/api/security.go,
+  pkg/daemon/daemon_run.go, pkg/api/README.md, pkg/cli/README.md,
+  pkg/grpcapi/README.md
+
 ## 2026-06-26 — #3169: RX source-MAC dynamic-neighbor learn bypassed mac_change_epoch (stale dst_mac blackhole, sibling of #3048)
 
 - **Timestamp**: 2026-06-26

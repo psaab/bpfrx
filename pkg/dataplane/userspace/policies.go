@@ -772,6 +772,21 @@ func PolicyInactive(schedulerName string, activeState map[string]bool) bool {
 	return policyRuleInactive(schedulerName, activeState)
 }
 
+// PolicyInactiveFn returns a per-policy scheduler-inactivity predicate bound to
+// a fixed live active-state snapshot, suitable for use as
+// policymatch.Query.PolicyInactiveFn (#3104). It wraps the SSOT PolicyInactive
+// predicate so the operator-side policy simulator skips exactly the rules the
+// dataplane drops (and the #3062 display reports inactive). The snapshot is
+// captured by value at call time; pass the result of
+// Manager.PolicySchedulerActiveState. Callers that cannot obtain live scheduler
+// state must pass nil into the Query instead of calling this, so the simulator
+// stays scheduler-unaware (evaluates scheduled policies as-if-active).
+func PolicyInactiveFn(activeState map[string]bool) func(schedulerName string) bool {
+	return func(schedulerName string) bool {
+		return policyRuleInactive(schedulerName, activeState)
+	}
+}
+
 func policyActionString(action config.PolicyAction) string {
 	switch action {
 	case config.PolicyPermit:

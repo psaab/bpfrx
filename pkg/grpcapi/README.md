@@ -78,7 +78,12 @@ contract.
   scanned only zone-pair policies and hard-coded `deny (default)`, so the
   diagnostic could report the OPPOSITE of what the dataplane enforces. The
   request gained a `source_port` field so source-port-constrained app terms
-  are simulated.
+  are simulated. #3104: `MatchPolicies` and the `test policy` ShowText surface
+  thread live per-scheduler active-state (`s.policyInactiveFn()` →
+  `policymatch.Query.PolicyInactiveFn`, sourced from the same
+  `Manager.PolicySchedulerActiveState` the #3062 policy-detail display uses) so
+  a scheduler-inactive policy is skipped like the runtime; with no live state
+  scheduled policies are simulated as-if-active.
 - The `test policy` operational command (local `pkg/cli` + remote `cmd/cli`
   → ShowText `test-policy:` topic → `showTestPolicy`) carries the same
   source-port input (#3107). The topic adds a `srcport=` key alongside the

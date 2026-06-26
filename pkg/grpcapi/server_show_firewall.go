@@ -249,6 +249,10 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			SrcPort:     srcPort,
 			DstPort:     dstPort,
 			FeedOverlay: overlay,
+			// #3104: skip scheduler-inactive policies like the runtime does, so
+			// the `test policy` diagnostic falls through to the next active rule
+			// / default-policy, agreeing with the dataplane.
+			PolicyInactiveFn: s.policyInactiveFn(),
 		})
 		switch {
 		case res.Matched && res.Global:
