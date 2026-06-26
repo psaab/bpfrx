@@ -92,6 +92,19 @@ contract.
   user-supplied target after a `--` end-of-options separator so a
   `-`-prefixed target is an operand, not a flag (option-confusion
   hardening, #2084).
+- Policy text views (`server_show_policies_text.go`) must render BOTH
+  zone-pair AND global policies (#3059). `showPoliciesHitCount` and
+  `showPoliciesDetail` loop `cfg.Security.Policies` and then append a
+  global section from `cfg.Security.GlobalPolicies` with from/to zone
+  `"*"`. Global counter IDs CONTINUE from the zone-pair loop —
+  `policySetID*dataplane.MaxRulesPerPolicy + i` where `policySetID ==
+  len(cfg.Security.Policies)` after the zone-pair loop — so global hit
+  counters stay aligned with the dataplane and match the gRPC detail
+  view, CLI, Prometheus collector, REST inventory (#3045/#3050), and
+  structured `GetPolicies`. A `from-zone`/`to-zone` filter selects
+  zone-pair policies only, so the global section is suppressed when a
+  filter is set. Omitting globals from any one surface is the #3059 /
+  #3045 class of blind-spot bug.
 - Request-supplied numeric fields are signed on the wire and must be
   range-checked before they index/slice/size anything (#2282). `Complete`
   rejects a negative `pos` with `InvalidArgument` before slicing
