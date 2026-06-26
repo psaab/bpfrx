@@ -30,6 +30,7 @@ type EventRecord struct {
 	OutZoneName     string // resolved zone name
 	ElapsedTime     uint32 // seconds since session creation (for CLOSE)
 	Created         uint32 // #2465: absolute session-creation Unix seconds (for CLOSE); 0 = unknown (exporter falls back to the packet-count estimate)
+	CreatedNanos    uint32 // #2853: sub-second nanosecond remainder (0..=999_999_999) of the session-creation instant (SESSION_CLOSE only; rides the close-unused [44:48] wire slot). Combined with Created so the flow StartTime keeps millisecond resolution.
 	PolicyName      string // resolved policy name (e.g. "allow-everything")
 	RevSessionPkts  uint64 // packets from server (for SESSION_CLOSE)
 	RevSessionBytes uint64 // bytes from server (for SESSION_CLOSE)
