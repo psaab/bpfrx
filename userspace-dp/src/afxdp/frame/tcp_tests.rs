@@ -681,6 +681,49 @@ fn reject_rst_never_answers_inbound_rst() {
     );
 }
 
+/// #3204: a TCP-RST reject triggered by a frame whose L2 destination is the
+/// broadcast MAC MUST be suppressed (no RST). A reflected RST copies the
+/// inbound destination MAC into its own source slot, so answering a broadcast
+/// frame would egress a RST with a broadcast SOURCE MAC. Mirrors the ICMP
+/// reject path's `l2_dst_is_group_or_broadcast` guard. Fail-on-revert: remove
+/// the guard in `build_reject_rst_frame` and this returns `Some(..)` instead
+/// of `None`.
+#[test]
+fn reject_rst_suppressed_for_l2_broadcast_dst() {
+    let mut frame = reject_v4_tcp_frame(TCP_FLAG_SYN, 0x1111_2222, 0);
+    frame[0..6].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    assert!(
+        build_reject_rst_frame(&frame).is_none(),
+        "must not RST a broadcast-dst frame (would source a broadcast MAC)"
+    );
+}
+
+/// #3204: same suppression for an L2 multicast destination (I/G group bit set
+/// in the first MAC octet), e.g. an IPv4 multicast 01:00:5e:.. destination.
+#[test]
+fn reject_rst_suppressed_for_l2_multicast_dst() {
+    let mut frame = reject_v6_tcp_frame(TCP_FLAG_SYN, 7, 0);
+    frame[0..6].copy_from_slice(&[0x33, 0x33, 0x00, 0x00, 0x00, 0x01]);
+    assert!(
+        build_reject_rst_frame(&frame).is_none(),
+        "must not RST a multicast-dst frame (would source a multicast MAC)"
+    );
+}
+
+/// #3204 regression: a TCP-RST reject for a normal UNICAST L2 destination
+/// still generates the RST (the guard only short-circuits group/broadcast).
+#[test]
+fn reject_rst_still_generated_for_l2_unicast_dst() {
+    // reject_v4_tcp_frame's dst MAC is 02:..:dd — unicast (I/G bit clear).
+    let frame = reject_v4_tcp_frame(TCP_FLAG_SYN, 0x1111_2222, 0);
+    assert_eq!(frame[0] & 0x01, 0, "fixture dst MAC must be unicast");
+    let out = build_reject_rst_frame(&frame).expect("RST for unicast SYN");
+    // Reflected RST: reply src MAC = inbound dst (unicast), RST flag set.
+    assert_eq!(&out[6..12], &[0x02, 0, 0, 0, 0, 0xdd]);
+    let tcp = &out[ETH_HDR_LEN + IPV4_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN + 20];
+    assert_ne!(tcp[13] & TCP_FLAG_RST, 0, "RST flag must be set");
+}
+
 /// Full v6 TCP frame with ONE Destination-Options extension header
 /// (8 bytes) between the IPv6 base header and the TCP header. Exercises
 /// the ext-header-aware seg_len path so a no-ACK RST acks exactly the
