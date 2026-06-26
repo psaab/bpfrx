@@ -154,7 +154,9 @@ pub(super) fn check_ping_of_death(
     None
 }
 
-/// Teardrop: IPv4 non-first fragment with tiny payload (< 8 bytes).
+/// Teardrop: a non-first fragment with tiny / zero / under-length payload
+/// (< 8 bytes of data) — the classic overlapping-fragment signature that
+/// confuses downstream reassemblers.
 ///
 /// #3027: a non-first fragment whose `ip_total_len <= hdr_len` carries
 /// zero (or, by the field's claimed length, "negative") payload. That is
@@ -164,12 +166,30 @@ pub(super) fn check_ping_of_death(
 /// the payload-size branch when `ip_total_len > hdr_len`, so the
 /// zero/under-length case slipped through as a PASS. Treat it as a
 /// teardrop drop.
+///
+/// #3119: this check was IPv4-only while the sibling `check_ping_of_death`
+/// already screened both families. An IPv6 teardrop (a non-first Fragment
+/// extension-header fragment with a tiny data contribution) therefore
+/// bypassed the screen entirely. The IPv6 arm mirrors the
+/// `check_ping_of_death` IPv6 sizing: the Fragment header's offset field
+/// is the upper 13 bits (8-byte units), so `ip_frag_off & 0xFFF8` is the
+/// byte offset, and this fragment's data bytes are
+/// `ip_payload_len - frag_data_off` (the L4/data region after the
+/// extension headers up to and including the 8-byte fragment header).
+/// `saturating_sub` collapses a hostile under-length (`frag_data_off`
+/// larger than the declared `ip_payload_len`) to 0, which is `< 8` and so
+/// is treated as the malformed zero/under-length teardrop case — the IPv6
+/// analogue of the #3027 IPv4 fix. Junos vSRX applies teardrop screening
+/// to both families.
 #[inline]
 pub(super) fn check_teardrop(
     profile: &ScreenProfile,
     pkt: &ScreenPacketInfo,
 ) -> Option<&'static str> {
-    if profile.teardrop && pkt.addr_family == libc::AF_INET as u8 && pkt.is_fragment {
+    if !profile.teardrop || !pkt.is_fragment {
+        return None;
+    }
+    if pkt.addr_family == libc::AF_INET as u8 {
         let frag_offset = pkt.ip_frag_off & 0x1FFF;
         if frag_offset > 0 {
             let hdr_len = (pkt.ip_ihl as u16) * 4;
@@ -179,6 +199,21 @@ pub(super) fn check_teardrop(
             }
             let payload = pkt.ip_total_len - hdr_len;
             if payload < 8 {
+                return Some("teardrop");
+            }
+        }
+    } else if pkt.addr_family == libc::AF_INET6 as u8 {
+        // IPv6 Fragment header: offset is the upper 13 bits (8-byte
+        // units); `& 0xFFF8` is the byte offset. A non-first fragment has
+        // a non-zero byte offset.
+        let offset_bytes = pkt.ip_frag_off & 0xFFF8;
+        if offset_bytes > 0 {
+            // This fragment's data bytes = payload_len minus the
+            // ext-header bytes preceding the fragment data. saturating_sub
+            // collapses a hostile under-length to 0 (< 8 → teardrop), the
+            // IPv6 analogue of the #3027 zero/negative-payload case.
+            let frag_data = pkt.ip_payload_len.saturating_sub(pkt.frag_data_off);
+            if frag_data < 8 {
                 return Some("teardrop");
             }
         }
