@@ -1,3 +1,5 @@
+- **2026-06-26T03:54:14Z**: Fix master-CI-red pkg/configstore TestCopyConfig — removed incidental `interfaces eth0.0` from the trust zone fixture. #3072/#3083's interface-multi-zone commit gate (merged this session) correctly rejects a Copy of a zone-with-interface (the interface lands in both trust and trust2). The interface was incidental to the Copy test. File: pkg/configstore/store_test.go
+
 ## 2026-06-25 — #2993: feeds mixed valid/invalid body installs a partial set silently
 - **Action**: parseFeed now counts skipped malformed lines (invalidLines) +
   bounded sample (invalidSample, maxInvalidSample=5); FeedInfo gains
