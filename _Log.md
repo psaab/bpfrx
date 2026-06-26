@@ -1,3 +1,27 @@
+## 2026-06-26 — #3172 host-inbound: scope kernel deny to RETH VRRP VIPs
+
+- **Timestamp**: 2026-06-26
+- **Action**: Follow-up to #3070. `BuildZoneHostInboundViews` scoped the
+  kernel `xpf_hostinbound` deny rules only to STATIC interface addresses
+  resolved from the live snapshot. RETH VRRP VIPs are live on the kernel
+  interface only on the RG master; on the backup the VIP was absent from the
+  snapshot, so the deny was not scoped to it and `chain input` fell through to
+  `policy accept` (FAIL-OPEN) for VIP-destined host-bound traffic. Added a
+  config-resolved pass that folds each zone's `unit.VRRPGroups[*].VirtualAddresses`
+  into the per-zone host-inbound address set (deterministic sorted iteration,
+  deduped against the live snapshot so the master node stays byte-identical),
+  preserving the fxp0/em0/fab* lifeline exclusion (a VIP on em0 is never
+  scoped) and leaving standalone (no-VRRP) zones unchanged. Go test
+  `TestBuildZoneHostInboundViewsIncludesVRRPVIP` (wan gets static+VIP, lan
+  standalone unchanged, control/em0 lifeline contributes nothing);
+  fail-on-revert proven (neutering addZoneVIP turns the wan VIP assertion RED,
+  the pre-existing `TestBuildZoneHostInboundViews` stays GREEN). cargo
+  build/test (host_inbound 2/2, forwarding 196/0) + go test
+  ./pkg/dataplane/... ./pkg/daemon/... green.
+- **File(s)**: pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/zones_host_inbound_test.go,
+  docs/junos-cli-reference.md
+
 ## 2026-06-26 — #3182 neighbor own-IP anti-poison: NAT-excluded interface IPs + RX learn path
 
 - **Timestamp**: 2026-06-26
