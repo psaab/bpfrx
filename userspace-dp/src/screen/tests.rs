@@ -3675,3 +3675,110 @@ fn ip_sweep_above_unique_cap_still_fires_at_screen_state() {
         state.scan_sweep_threshold_clamped()
     );
 }
+
+// ================================================================
+// #3082 — lenient/HA-sync missing-screen-profile runtime signal
+// ================================================================
+
+// A zone that REFERENCES a screen profile undefined at snapshot-build time
+// (no entry in `profiles`, but present in the references-missing set) must take
+// the WARN path on the None branch — yet still return Pass (no verdict change).
+// FAIL-ON-REVERT: revert the references-missing threading (the None branch no
+// longer calls `maybe_warn_missing_profile`, or the set is never populated) and
+// `missing_profile_warn_count()` stays 0 → this test goes RED.
+#[test]
+fn missing_profile_reference_warns_but_passes_and_is_rate_limited() {
+    let mut state = ScreenState::new();
+    let mut missing = FxHashMap::default();
+    missing.insert("trust".to_string(), "ghost".to_string());
+    state.update_missing_profiles(missing);
+
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
+    let pkt = tcp_pkt(src, dst, 5000, 80, TCP_SYN);
+
+    // First packet in second 1: WARN emitted, verdict Pass.
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        1,
+        "first packet to a missing-profile zone must emit exactly one WARN"
+    );
+
+    // Flood within the same second: rate-limited to the single WARN, all Pass.
+    for _ in 0..200 {
+        assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+    }
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        1,
+        "a per-packet flood within one second must be rate-limited to 1 WARN"
+    );
+
+    // A sustained flood crossing into the next second stays suppressed: the
+    // sliding-window counter carries the prior second's tally, so a misconfig
+    // under continuous traffic produces essentially one WARN, not 1/sec.
+    assert_eq!(state.check_packet("trust", &pkt, 2), ScreenVerdict::Pass);
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        1,
+        "sustained traffic into the next second must not re-WARN"
+    );
+
+    // After traffic subsides for a full window (a multi-second quiet gap), a new
+    // packet re-emits exactly one WARN.
+    assert_eq!(state.check_packet("trust", &pkt, 10), ScreenVerdict::Pass);
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        2,
+        "a packet after a quiet gap must re-WARN"
+    );
+}
+
+// A zone with NO screen configured (absent from BOTH `profiles` and the
+// references-missing set) is the legit Pass case: it must NOT warn.
+#[test]
+fn no_screen_configured_zone_passes_without_warn() {
+    let mut state = ScreenState::new();
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
+    let pkt = tcp_pkt(src, dst, 5000, 80, TCP_SYN);
+    for s in 1..6 {
+        assert_eq!(state.check_packet("nozone", &pkt, s), ScreenVerdict::Pass);
+    }
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        0,
+        "a zone with no screen configured must never WARN"
+    );
+}
+
+// A zone with a RESOLVED screen profile runs the real checks and never takes the
+// missing-profile WARN path.
+#[test]
+fn resolved_profile_zone_never_warns_missing() {
+    let mut state = make_state("trust", default_profile());
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
+    let pkt = tcp_pkt(src, dst, 5000, 80, TCP_SYN);
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        0,
+        "a resolved-profile zone must not take the missing-profile WARN path"
+    );
+}
+
+// An old-helper snapshot WITHOUT the references-missing set (empty after
+// `update_missing_profiles`) yields all-Pass and no warn — skew tolerance at
+// the dataplane mirror of the serde default.
+#[test]
+fn empty_missing_set_passes_without_warn() {
+    let mut state = ScreenState::new();
+    state.update_missing_profiles(FxHashMap::default());
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
+    let pkt = tcp_pkt(src, dst, 5000, 80, TCP_SYN);
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+    assert_eq!(state.missing_profile_warn_count(), 0);
+}

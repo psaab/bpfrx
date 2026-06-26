@@ -48,6 +48,24 @@ pub(crate) struct ScreenProfileSnapshot {
     pub ip_sweep_threshold: u32,
 }
 
+/// #3082: a zone that references a screen profile which was NOT defined when
+/// the Go control plane built the snapshot. Reachable on the lenient/HA-sync
+/// path (older-binary `active.json` on upgrade, or an HA sync from an
+/// un-upgraded primary). Without this the dataplane cannot tell "zone has no
+/// screen configured" (legit Pass) from "zone references a MISSING screen"
+/// (error) — both produce no `screens` entry. The dataplane uses this set to
+/// emit a rate-limited runtime WARN; the verdict still stays Pass (the
+/// fail-closed-vs-pass posture is a deferred decision).
+///
+/// Additive/skew-tolerant: `#[serde(default)]` on the carrying field means an
+/// old helper missing the field decodes an empty set (all-Pass, no warn).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct ScreenMissingProfileRef {
+    pub zone: String,
+    #[serde(default)]
+    pub profile: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(crate) struct FirewallFilterSnapshot {
     pub name: String,

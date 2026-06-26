@@ -25,6 +25,25 @@
 //! - Rate limiting (ICMP, UDP flood)
 //! - SYN flood (per-zone rate)
 //!
+//! ## Missing-screen-profile signal (#3082)
+//!
+//! A zone may REFERENCE a screen profile that was never defined. #3078 closed
+//! the COMMIT path (strict reject / lenient-load warn, #1960), but the
+//! dataplane still has no resolved profile for such a zone and so cannot run
+//! screen checks for it. This is reachable on the lenient/HA-sync path
+//! (older-binary `active.json` on upgrade, or an HA sync from an un-upgraded
+//! primary). The Go control plane now threads the set of zones that reference a
+//! missing profile (`ConfigSnapshot.screen_missing_profile_zones`) so the
+//! `check_packet` None branch can distinguish "zone has no screen configured"
+//! (legit Pass, silent) from "zone references a MISSING screen". For the latter
+//! it emits a runtime WARN, rate-limited to one per zone per second (sustained
+//! traffic produces essentially one WARN until it subsides) so a packet flood
+//! to a misconfigured zone cannot spam the log. The verdict STILL stays
+//! `ScreenVerdict::Pass` — a runtime fail-CLOSED posture would itself be an
+//! availability brick (the #1960 no-brick rationale), so the fail-closed-vs-pass
+//! posture is a deferred design decision (the /research half of #3082). This
+//! change only makes the lenient-path fail-open OBSERVABLE at the dataplane.
+//!
 //! Layout (#1543, Wave-5): the runtime is split across focused
 //! sibling submodules so SYN-cookie crypto can be audited
 //! independently from packet policy:
@@ -131,7 +150,24 @@ pub(crate) struct ScreenState {
     port_scan: PortScanTracker,
     ip_sweep: IpSweepTracker,
     last_cleanup_secs: u64,
+    /// #3082: zone → name of a screen profile the zone REFERENCES but that was
+    /// undefined when the snapshot was built (lenient/HA-sync path). A zone in
+    /// this map but absent from `profiles` is failing OPEN at the dataplane —
+    /// the `None` branch of `check_packet_with_zone_id` distinguishes it from a
+    /// zone with no screen configured and emits a rate-limited runtime WARN
+    /// (the verdict still stays Pass; fail-closed posture is deferred).
+    missing_profile_refs: FxHashMap<String, String>,
+    /// #3082: per-zone rate counter that bounds the missing-profile WARN to
+    /// `MISSING_PROFILE_WARN_RATE_LIMIT_PER_SEC` per zone so a flood of packets
+    /// to a misconfigured zone cannot spam the log (CLAUDE.md log-flood rule).
+    missing_profile_warn_counters: FxHashMap<String, RateCounter>,
+    /// #3082: count of WARNs actually emitted (post rate-limit). Test seam so a
+    /// unit test can assert the WARN path was taken without scraping stderr.
+    missing_profile_warn_count: u64,
 }
+
+/// #3082: at most one missing-screen-profile WARN per zone per second.
+const MISSING_PROFILE_WARN_RATE_LIMIT_PER_SEC: u32 = 1;
 
 impl ScreenState {
     pub fn new() -> Self {
@@ -153,7 +189,55 @@ impl ScreenState {
             port_scan: PortScanTracker::default(),
             ip_sweep: IpSweepTracker::default(),
             last_cleanup_secs: 0,
+            missing_profile_refs: FxHashMap::default(),
+            missing_profile_warn_counters: FxHashMap::default(),
+            missing_profile_warn_count: 0,
         }
+    }
+
+    /// #3082: replace the set of zones that reference an undefined screen
+    /// profile (called on config update alongside `update_profiles`). Retains
+    /// only the WARN rate counters for zones still in the set so a removed /
+    /// fixed reference stops warning and frees its counter.
+    pub fn update_missing_profiles(&mut self, missing: FxHashMap<String, String>) {
+        self.missing_profile_warn_counters
+            .retain(|k, _| missing.contains_key(k));
+        self.missing_profile_refs = missing;
+    }
+
+    /// #3082: emit a rate-limited runtime WARN if `zone` references a screen
+    /// profile that was undefined at snapshot-build time. The verdict is
+    /// unchanged (the caller still returns `ScreenVerdict::Pass`); this only
+    /// makes the lenient-path fail-open observable at the dataplane. O(1)
+    /// lookup; the WARN is bounded to one per zone per second.
+    fn maybe_warn_missing_profile(&mut self, zone: &str, now_secs: u64) {
+        let Some(profile) = self.missing_profile_refs.get(zone) else {
+            // Zone has no screen configured at all — legit Pass, no signal.
+            return;
+        };
+        let limited = self
+            .missing_profile_warn_counters
+            .entry(zone.to_string())
+            .or_default()
+            .increment(now_secs, MISSING_PROFILE_WARN_RATE_LIMIT_PER_SEC);
+        if !limited {
+            self.missing_profile_warn_count = self.missing_profile_warn_count.wrapping_add(1);
+            eprintln!(
+                "xpf-userspace-dp: screen WARN: zone {zone:?} references undefined \
+                 screen profile {profile:?}; dataplane is failing OPEN (Pass) for \
+                 this zone (#3082 lenient/HA-sync path) — fix the config or upgrade \
+                 the HA peer",
+                zone = zone,
+                profile = profile,
+            );
+        }
+    }
+
+    /// #3082: number of missing-profile WARNs actually emitted (post
+    /// rate-limit). Test seam.
+    #[cfg(test)]
+    pub(crate) fn missing_profile_warn_count(&self) -> u64 {
+        self.missing_profile_warn_count
     }
 
     /// Replace all screen profiles (called on config update).
@@ -331,6 +415,12 @@ impl ScreenState {
         // copy the small fields they need out of `*profile` first so the
         // immutable `profiles` borrow is not held across them.
         let Some(profile) = self.profiles.get(zone) else {
+            // #3082: no resolved profile for this zone. Distinguish the two
+            // None cases: a zone that references a MISSING screen profile
+            // (lenient/HA-sync fail-open) gets a rate-limited runtime WARN; a
+            // zone with no screen configured passes silently. The verdict is
+            // Pass in BOTH cases — the fail-closed-vs-pass posture is deferred.
+            self.maybe_warn_missing_profile(zone, now_secs);
             return ScreenVerdict::Pass;
         };
 

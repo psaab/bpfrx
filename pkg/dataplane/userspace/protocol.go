@@ -52,36 +52,51 @@ type ControlResponse struct {
 }
 
 type ConfigSnapshot struct {
-	Version            int                          `json:"version"`
-	Generation         uint64                       `json:"generation"`
-	FIBGeneration      uint32                       `json:"fib_generation,omitempty"`
-	GeneratedAt        time.Time                    `json:"generated_at"`
-	Summary            SnapshotSummary              `json:"summary"`
-	Capabilities       UserspaceCapabilities        `json:"capabilities"`
-	MapPins            UserspaceMapPins             `json:"map_pins"`
-	Zones              []ZoneSnapshot               `json:"zones,omitempty"`
-	Interfaces         []InterfaceSnapshot          `json:"interfaces,omitempty"`
-	Fabrics            []FabricSnapshot             `json:"fabrics,omitempty"`
-	TunnelEndpoints    []TunnelEndpointSnapshot     `json:"tunnel_endpoints,omitempty"`
-	Neighbors          []NeighborSnapshot           `json:"neighbors,omitempty"`
-	Routes             []RouteSnapshot              `json:"routes,omitempty"`
-	Flow               FlowSnapshot                 `json:"flow,omitempty"`
-	DefaultPolicy      string                       `json:"default_policy,omitempty"`
-	Policies           []PolicyRuleSnapshot         `json:"policies,omitempty"`
-	SourceNAT          []SourceNATRuleSnapshot      `json:"source_nat_rules,omitempty"`
-	StaticNAT          []StaticNATRuleSnapshot      `json:"static_nat_rules,omitempty"`
-	DestinationNAT     []DestinationNATRuleSnapshot `json:"destination_nat_rules,omitempty"`
-	NAT64              []NAT64RuleSnapshot          `json:"nat64_rules,omitempty"`
-	Nptv6              []Nptv6RuleSnapshot          `json:"nptv6_rules,omitempty"`
-	Screens            []ScreenProfileSnapshot      `json:"screens,omitempty"`
-	SYNCookieMasterKey string                       `json:"syn_cookie_master_key,omitempty"`
-	Filters            []FirewallFilterSnapshot     `json:"filters,omitempty"`
-	Policers           []PolicerSnapshot            `json:"policers,omitempty"`
-	ThreeColorPolicers []ThreeColorPolicerSnapshot  `json:"three_color_policers,omitempty"`
-	ClassOfService     *ClassOfServiceSnapshot      `json:"class_of_service,omitempty"`
-	FlowExport         *FlowExportSnapshot          `json:"flow_export,omitempty"`
-	MirrorConfigs      []MirrorConfigSnapshot       `json:"mirror_configs,omitempty"`
-	AddressBooks       []AddressBookSnapshot        `json:"address_books,omitempty"`
+	Version         int                          `json:"version"`
+	Generation      uint64                       `json:"generation"`
+	FIBGeneration   uint32                       `json:"fib_generation,omitempty"`
+	GeneratedAt     time.Time                    `json:"generated_at"`
+	Summary         SnapshotSummary              `json:"summary"`
+	Capabilities    UserspaceCapabilities        `json:"capabilities"`
+	MapPins         UserspaceMapPins             `json:"map_pins"`
+	Zones           []ZoneSnapshot               `json:"zones,omitempty"`
+	Interfaces      []InterfaceSnapshot          `json:"interfaces,omitempty"`
+	Fabrics         []FabricSnapshot             `json:"fabrics,omitempty"`
+	TunnelEndpoints []TunnelEndpointSnapshot     `json:"tunnel_endpoints,omitempty"`
+	Neighbors       []NeighborSnapshot           `json:"neighbors,omitempty"`
+	Routes          []RouteSnapshot              `json:"routes,omitempty"`
+	Flow            FlowSnapshot                 `json:"flow,omitempty"`
+	DefaultPolicy   string                       `json:"default_policy,omitempty"`
+	Policies        []PolicyRuleSnapshot         `json:"policies,omitempty"`
+	SourceNAT       []SourceNATRuleSnapshot      `json:"source_nat_rules,omitempty"`
+	StaticNAT       []StaticNATRuleSnapshot      `json:"static_nat_rules,omitempty"`
+	DestinationNAT  []DestinationNATRuleSnapshot `json:"destination_nat_rules,omitempty"`
+	NAT64           []NAT64RuleSnapshot          `json:"nat64_rules,omitempty"`
+	Nptv6           []Nptv6RuleSnapshot          `json:"nptv6_rules,omitempty"`
+	Screens         []ScreenProfileSnapshot      `json:"screens,omitempty"`
+	// ScreenMissingProfiles records zones that REFERENCE a screen profile
+	// which was NOT defined at snapshot-build time (#3082). On the
+	// lenient/HA-sync path (#1960 — older-binary-persisted active.json on
+	// upgrade, or an HA sync from an un-upgraded primary) a zone can
+	// reference an undefined screen profile and boot with an apply-time
+	// warning, yet the dataplane would have no `screens` entry for that zone
+	// and so silently PASS all screen checks. Both "zone has no screen
+	// configured" and "zone references a MISSING screen" otherwise produce
+	// no entry. This additive field carries the missing references so the
+	// dataplane can distinguish the two and emit a rate-limited runtime WARN
+	// (the verdict stays Pass — the fail-closed-vs-pass posture is deferred).
+	// Additive/skew-tolerant: an old helper without the field decodes it as
+	// empty (all-Pass, no warn); an old Go binary that does not emit it
+	// leaves the Rust set empty.
+	ScreenMissingProfiles []ScreenMissingProfileRef   `json:"screen_missing_profile_zones,omitempty"`
+	SYNCookieMasterKey    string                      `json:"syn_cookie_master_key,omitempty"`
+	Filters               []FirewallFilterSnapshot    `json:"filters,omitempty"`
+	Policers              []PolicerSnapshot           `json:"policers,omitempty"`
+	ThreeColorPolicers    []ThreeColorPolicerSnapshot `json:"three_color_policers,omitempty"`
+	ClassOfService        *ClassOfServiceSnapshot     `json:"class_of_service,omitempty"`
+	FlowExport            *FlowExportSnapshot         `json:"flow_export,omitempty"`
+	MirrorConfigs         []MirrorConfigSnapshot      `json:"mirror_configs,omitempty"`
+	AddressBooks          []AddressBookSnapshot       `json:"address_books,omitempty"`
 	// AppCatalog is the L3/L4 application-identification catalog (#2008 M5):
 	// the ordered (protocol, port-range) -> app_id classification table the
 	// dataplane uses to stamp app_id on a new session. Additive field — an
@@ -562,6 +577,16 @@ type ScreenProfileSnapshot struct {
 	SessionLimitDst   uint32 `json:"session_limit_dst,omitempty"`
 	PortScanThreshold uint32 `json:"port_scan_threshold,omitempty"`
 	IPSweepThreshold  uint32 `json:"ip_sweep_threshold,omitempty"`
+}
+
+// ScreenMissingProfileRef names a zone that references a screen profile which
+// was not defined when the snapshot was built (#3082). Carried on the wire so
+// the dataplane can emit a runtime WARN for the lenient-path fail-open instead
+// of silently passing all screen checks for the zone. The verdict still stays
+// Pass — see ConfigSnapshot.ScreenMissingProfiles.
+type ScreenMissingProfileRef struct {
+	Zone    string `json:"zone"`
+	Profile string `json:"profile,omitempty"`
 }
 
 type FirewallFilterSnapshot struct {

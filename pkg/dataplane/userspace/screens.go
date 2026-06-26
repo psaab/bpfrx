@@ -69,6 +69,37 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 	return out
 }
 
+// buildScreenMissingProfileRefs records every zone that REFERENCES a screen
+// profile which is NOT defined in the config (#3082). buildScreenSnapshots
+// silently skips these zones (`sp == nil`), so without this the dataplane
+// cannot tell "zone has no screen configured" (legit Pass) apart from "zone
+// references a MISSING screen" (error → should signal). Reachable on the
+// lenient/HA-sync path where a dangling screen reference loads with only an
+// apply-time warning. The dataplane uses this to emit a rate-limited runtime
+// WARN; the verdict stays Pass (the fail-closed posture is deferred).
+func buildScreenMissingProfileRefs(cfg *config.Config) []ScreenMissingProfileRef {
+	if cfg == nil || len(cfg.Security.Zones) == 0 {
+		return nil
+	}
+	var out []ScreenMissingProfileRef
+	for _, zone := range cfg.Security.Zones {
+		if zone == nil || zone.ScreenProfile == "" {
+			// No screen configured for this zone — legit Pass, not a
+			// missing reference.
+			continue
+		}
+		if cfg.Security.Screen[zone.ScreenProfile] != nil {
+			// Reference resolves to a defined profile.
+			continue
+		}
+		out = append(out, ScreenMissingProfileRef{
+			Zone:    zone.Name,
+			Profile: zone.ScreenProfile,
+		})
+	}
+	return out
+}
+
 func buildSYNCookieMasterKey(cfg *config.Config) string {
 	if !userspaceSynCookieProtectionActive(cfg) {
 		return ""

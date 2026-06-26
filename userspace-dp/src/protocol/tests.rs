@@ -56,6 +56,48 @@ fn zone_snapshot_host_inbound_fields_roundtrip() {
     assert!(legacy.host_inbound_protocols.is_empty());
 }
 
+// #3082: the references-missing-profile set is an additive, skew-tolerant wire
+// field. A snapshot from an OLD Go binary that does not emit
+// `screen_missing_profile_zones` must still decode (the field defaults to
+// empty), and a snapshot that DOES carry it must round-trip.
+#[test]
+fn screen_missing_profile_zones_wire_roundtrip_and_skew() {
+    // Old-helper skew: a snapshot serialized WITHOUT the field must still
+    // decode and yield an empty set (→ all-Pass, no warn). Start from a full
+    // default snapshot (so every other required field is present) and strip the
+    // additive key.
+    let mut v = serde_json::to_value(ConfigSnapshot::default())
+        .expect("serialize default ConfigSnapshot");
+    v.as_object_mut()
+        .expect("snapshot is a JSON object")
+        .remove("screen_missing_profile_zones");
+    let snap: ConfigSnapshot =
+        serde_json::from_value(v).expect("snapshot without the field must decode");
+    assert!(
+        snap.screen_missing_profile_zones.is_empty(),
+        "absent field must default to empty"
+    );
+
+    // Present: round-trips with both zone and profile preserved.
+    let mut v = serde_json::to_value(ConfigSnapshot::default())
+        .expect("serialize default ConfigSnapshot");
+    v.as_object_mut().expect("snapshot is a JSON object").insert(
+        "screen_missing_profile_zones".into(),
+        serde_json::json!([{"zone":"trust","profile":"ghost"}]),
+    );
+    let snap: ConfigSnapshot =
+        serde_json::from_value(v).expect("snapshot with the field must decode");
+    assert_eq!(snap.screen_missing_profile_zones.len(), 1);
+    assert_eq!(snap.screen_missing_profile_zones[0].zone, "trust");
+    assert_eq!(snap.screen_missing_profile_zones[0].profile, "ghost");
+
+    // A ref with only a zone (profile omitted) decodes with an empty profile.
+    let r: ScreenMissingProfileRef =
+        serde_json::from_str(r#"{"zone":"dmz"}"#).expect("ref with omitted profile decodes");
+    assert_eq!(r.zone, "dmz");
+    assert!(r.profile.is_empty());
+}
+
 #[test]
 fn process_status_inject_packet_tuple_protocol_version_roundtrip() {
     let status = ProcessStatus {
@@ -1526,6 +1568,7 @@ fn wire_invariant_default_specimens() {
     s.insert("queue_control_request".into(), dump(&QueueControlRequest::default()));
     s.insert("queue_status".into(), dump(&QueueStatus::default()));
     s.insert("route_snapshot".into(), dump(&RouteSnapshot::default()));
+    s.insert("screen_missing_profile_ref".into(), dump(&ScreenMissingProfileRef::default()));
     s.insert("screen_profile_snapshot".into(), dump(&ScreenProfileSnapshot::default()));
     s.insert("session_delta_drain_request".into(), dump(&SessionDeltaDrainRequest::default()));
     s.insert("session_delta_info".into(), dump(&SessionDeltaInfo::default()));
