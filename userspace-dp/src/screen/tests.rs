@@ -1855,6 +1855,74 @@ fn syn_cookie_epoch_uses_unix_wall_clock_units() {
 }
 
 #[test]
+fn syn_cookie_current_full_epoch_is_pure_wall_clock_passthrough() {
+    // #3032: the epoch leaf must be a pure function of the supplied Unix
+    // wall-clock seconds — it no longer reads the OS clock. Pinning it equal
+    // to `full_epoch_from_unix_secs` for sample seconds catches any
+    // off-by-one-epoch or clock-domain regression at the leaf.
+    for secs in [0u64, 1, 63, 64, 127, 128, 64 * 33 + 9, 1_800_000_000] {
+        assert_eq!(
+            SynCookieCodec::current_full_epoch(secs),
+            SynCookieCodec::full_epoch_from_unix_secs(secs),
+            "current_full_epoch must equal full_epoch_from_unix_secs for {secs}s",
+        );
+    }
+}
+
+#[test]
+fn syn_cookie_round_trip_with_cached_wall_secs() {
+    // #3032: minting with an epoch derived from a cached wall-clock second
+    // (as the hot path now does once per monotonic second) and validating
+    // with the same cached domain must round-trip — and must keep the same
+    // 60s+ window tolerance as before. T sits mid-epoch so the +/-1 epoch
+    // window is exercised, not a boundary artifact.
+    let codec = syn_cookie_codec();
+    let tuple = syn_cookie_tuple();
+    // 1_800_000_000 is an exact multiple of EPOCH_SECS (64), so the second
+    // sits at offset 0 within its epoch and the +/- arithmetic below stays
+    // inside / crosses epochs deterministically.
+    let mint_unix_secs = 1_800_000_000u64;
+    assert_eq!(mint_unix_secs % SynCookieCodec::EPOCH_SECS, 0);
+    let mint_epoch = SynCookieCodec::current_full_epoch(mint_unix_secs);
+    let cookie = codec.mint_isn(tuple, 7, mint_epoch, 1460);
+
+    // Validate at the same cached second.
+    assert!(
+        codec.validate_isn(tuple, 7, mint_epoch, cookie).is_some(),
+        "same-second validation must succeed",
+    );
+    // Validate from a second still inside the same epoch (cached value may be
+    // up to ~1s stale under the once-per-second refresh, well within window).
+    let same_epoch_later =
+        SynCookieCodec::current_full_epoch(mint_unix_secs + (SynCookieCodec::EPOCH_SECS - 1));
+    assert_eq!(same_epoch_later, mint_epoch);
+    assert!(
+        codec
+            .validate_isn(tuple, 7, same_epoch_later, cookie)
+            .is_some(),
+        "validation later in the same epoch must succeed",
+    );
+    // Validate one epoch ahead (next-second crossing into the next epoch) —
+    // still inside the +/-1 epoch acceptance window.
+    let next_epoch =
+        SynCookieCodec::current_full_epoch(mint_unix_secs + SynCookieCodec::EPOCH_SECS);
+    assert_eq!(next_epoch, mint_epoch + 1);
+    assert!(
+        codec.validate_isn(tuple, 7, next_epoch, cookie).is_some(),
+        "validation one epoch later must succeed (window tolerance)",
+    );
+    // Two epochs ahead is outside the window and must fail, exactly as
+    // before the cached-now change.
+    let two_epochs_ahead =
+        SynCookieCodec::current_full_epoch(mint_unix_secs + 2 * SynCookieCodec::EPOCH_SECS);
+    assert_eq!(two_epochs_ahead, mint_epoch + 2);
+    assert!(
+        codec.validate_isn(tuple, 7, two_epochs_ahead, cookie).is_none(),
+        "validation two epochs later must fail as before",
+    );
+}
+
+#[test]
 fn syn_cookie_wall_clock_epoch_survives_peer_uptime_skew() {
     let codec = syn_cookie_codec();
     let tuple = syn_cookie_tuple();

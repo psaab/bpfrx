@@ -139,7 +139,17 @@ is local, but the snapshot-published key is derived from cluster-synced root
 encrypted-password material so peers with the same committed config can
 validate cookies minted by the former active node inside the current,
 previous, or next Unix wall-clock epoch overlap. The next-epoch candidate keeps
-failover stable when peer clocks straddle a 64-second boundary. A standby peer
+failover stable when peer clocks straddle a 64-second boundary. The epoch input
+MUST be Unix wall-clock seconds (not `CLOCK_MONOTONIC`), since peers share only
+the NTP-synced wall clock — their monotonic bases are unrelated. To avoid an OS
+clock read on every minted/validated cookie under a flood (#3032), the helper
+reads `SystemTime::now()` at most once per monotonic second
+(`ScreenState::current_syn_cookie_full_epoch`, gated by the batch-cached
+monotonic second already threaded into the screen check) and caches the derived
+wall-clock seconds; every cookie in the same second reuses the cached value
+because they all map to the same 64-second epoch. The epoch leaf
+(`SynCookieCodec::current_full_epoch`) is a pure function of the supplied
+seconds and never touches the clock. A standby peer
 accepts a valid cookie ACK even when it has not locally observed the flood
 threshold; ACKs outside the transmitted-epoch window are prefiltered before
 SipHash, and plausible standby ACKs are rate-limited per zone over a sliding

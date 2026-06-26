@@ -19,6 +19,33 @@
 - **File(s)**: pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
   pkg/config/policy_zone_ref_test.go, pkg/config/README.md, _Log.md
 
+## 2026-06-25 — #3032: cache SYN-cookie epoch wall clock once per second
+
+- **Timestamp**: 2026-06-25
+- **Action**: `SynCookieCodec::current_full_epoch()` read `SystemTime::now()`
+  on every minted/validated cookie — redundant CPU exactly under a SYN flood
+  since the cookie epoch is 64s wide. Made the leaf pure
+  (`current_full_epoch(now_secs)` = `full_epoch_from_unix_secs(now_secs)`) and
+  moved the OS clock read into `ScreenState::current_syn_cookie_full_epoch`,
+  gated to fire at most once per monotonic second (keyed by the batch-cached
+  monotonic `now_secs` already threaded into `check_packet_with_zone_id` and the
+  standby-ACK path). CLOCK-DOMAIN: the batch `now_secs` is `CLOCK_MONOTONIC`
+  (per-node, unrelated across HA peers); the cookie epoch needs Unix wall-clock
+  (NTP-synced) so a cookie minted on one node validates on its peer. So the
+  monotonic second is used ONLY as the refresh throttle; the cached value seeded
+  into the epoch is `SystemTime::now()` wall-clock seconds. Both call sites
+  (mint ~388, standby-ACK validation ~594) share one cached wall-second per
+  second; the ±1-epoch (±64s) validation window absorbs the ≤1s cache staleness.
+- **File(s)**: userspace-dp/src/screen/syncookie.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  docs/syn-cookie-flood-protection.md, _Log.md
+- **Validation**: cargo build --release -p xpf-userspace-dp (0 errors); cargo
+  test --release -p xpf-userspace-dp → 3022 passed, 2 ignored. New tests:
+  `syn_cookie_current_full_epoch_is_pure_wall_clock_passthrough` (pins leaf ==
+  full_epoch_from_unix_secs for sample seconds) and
+  `syn_cookie_round_trip_with_cached_wall_secs` (mint/validate round-trip across
+  the ±1-epoch window; 2 epochs ahead fails as before).
+
 ## 2026-06-25 — #3060: reject accepted-but-inert bare `then log` at commit
 
 - **Timestamp**: 2026-06-25

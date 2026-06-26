@@ -16,7 +16,6 @@
 //!   SYN-flood counter then re-sees the connection).
 
 use std::net::IpAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::packet::ScreenPacketInfo;
 
@@ -118,12 +117,18 @@ impl SynCookieCodec {
         unix_secs / Self::EPOCH_SECS
     }
 
-    pub(super) fn current_full_epoch() -> u64 {
-        let unix_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
-        Self::full_epoch_from_unix_secs(unix_secs)
+    /// Derive the SYN-cookie full epoch from a caller-supplied Unix
+    /// wall-clock seconds value. The timestamp is read once per monotonic
+    /// second by `ScreenState::current_syn_cookie_full_epoch` rather than
+    /// per packet (#3032): under a SYN flood every minted/validated cookie
+    /// in the same second shares the same 64-second epoch, so the per-packet
+    /// `SystemTime::now()` was redundant CPU. This leaf is pure — it never
+    /// reads the OS clock. The seconds MUST be Unix wall-clock (not
+    /// `CLOCK_MONOTONIC`): HA peers derive identical epochs across failover
+    /// only because their Unix clocks are NTP-synced while their monotonic
+    /// bases are unrelated (see `ScreenState::update_syn_cookie_master_key`).
+    pub(super) fn current_full_epoch(now_secs: u64) -> u64 {
+        Self::full_epoch_from_unix_secs(now_secs)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
