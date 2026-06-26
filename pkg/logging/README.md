@@ -132,6 +132,17 @@ if `Handle` runs the re-entrancy guard before the client check.
   syslog delivery as the legacy eBPF ring-buffer events do.
   `DecodeRawEventRecord` is decode-only and must not be used as a
   replacement for the full reader path when audit delivery matters.
+- **Protocol names come from the `appid.ProtocolName` SSOT (#3040).** The
+  event-log `protoName` helper (`ringbuf.go`) renders an IP protocol number
+  through the shared `appid.ProtocolName` table that REST (`pkg/api`,
+  #2949) and gRPC (`pkg/grpcapi`, #3037) already use, so GRE(47)/ESP(50)/
+  IPIP(4)/IPv6(41) sessions display named (GRE/ESP/IPIP/IPV6) instead of
+  numeric — matching the other operator surfaces. Before #3040 this helper
+  carried its own tcp/udp/icmp/icmpv6 map and rendered every other protocol
+  as a bare number. Casing is an event-log-local concern (this surface
+  upper-cases, keeping ICMPv6 mixed-case for the trace-filter contract);
+  unknown protocols still fall back to the numeric form. Pin:
+  `protoname_test.go`.
 - **Event time is DECISION time, not receive time (#2465/#2470/#2511).**
   The on-wire RT_FLOW frame carries an absolute Unix-nanosecond timestamp
   in its first 8 bytes (LE u64), stamped by the userspace-dp producer at
