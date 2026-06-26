@@ -251,7 +251,10 @@ type SurfaceAManager struct {
 	// instead of paying a full TCP+TLS handshake every ~30s pass (#2904). The
 	// backend OBJECT is still rebuilt per pass (resolve-per-Reconcile, #2691); only
 	// the expensive transport is reused. Keyed on the binding leaves, so a commit
-	// that changes a binding resolves a fresh key and rebuilds the transport.
+	// that changes a binding resolves a fresh key and rebuilds the transport. Each
+	// Reconcile pass reaps cache entries whose binding key is no longer referenced
+	// by the committed config (#2956) — closing the superseded transport's idle
+	// pool and dropping the entry — so the map stays bounded under binding churn.
 	httpClients *httpClientCache
 
 	now func() time.Time
@@ -518,6 +521,29 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 	desired := map[string]SurfaceAScope{}
 	for _, sc := range scopes {
 		desired[sc.scopeID()] = sc
+	}
+
+	// Reap superseded HTTP transports (#2956): the per-binding client cache is
+	// populated lazily by resolveBackend/CheckIPClient and keyed on the
+	// source-binding tuple. A binding-leaf change keys a FRESH entry and the OLD
+	// entry is never looked up again, but the cache outlives any single config, so
+	// stale tuples (and their idle-connection pools) would accumulate for the
+	// daemon lifetime. Compute the set of binding keys still referenced by this
+	// pass — every configured scope's provider (the per-binding source-address
+	// override is applied on the scope's provider copy) AND every catalog provider
+	// (used by the removed-binding withdraw backend rebuild) plus the unbound
+	// default — and drop any cached client whose key is gone. An active binding is
+	// always in `live` so it is never closed.
+	if m.httpClients != nil {
+		live := make(map[string]struct{}, len(scopes)+len(catalog)+1)
+		live[""] = struct{}{} // unbound default (nil provider / fail-open client)
+		for _, sc := range scopes {
+			live[bindCacheKey(sc.Provider)] = struct{}{}
+		}
+		for _, p := range catalog {
+			live[bindCacheKey(p)] = struct{}{}
+		}
+		m.httpClients.reap(live)
 	}
 
 	// Pass 1 — publish / refresh / withdraw-on-address-loss each configured
