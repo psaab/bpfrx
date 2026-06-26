@@ -65,6 +65,36 @@ if s.IsStrictVIPOwnership() {
 
 This prevents the secondary from emitting GARP even if it briefly transitions to VRRP MASTER during a failover window.
 
+##### Unsuppress edge while already MASTER (#2940)
+
+In active-active strict-vip negotiation an instance can be in `StateMaster`
+*before* this node is promoted to RG primary (it briefly won the VRRP election
+under suppression). When the cluster event handler then promotes the node and
+calls `SetGARPSuppression(rgID, false)`, no VRRP state transition occurs — the
+instance was already MASTER — so `becomeMaster()`'s GARP/NA burst never fires.
+Merely storing `suppress=false` leaves the VIP silent and traffic blackholes
+until the periodic timer eventually announces it.
+
+`SetGARPSuppression` therefore detects the **true→false suppression edge** with
+an atomic `Swap` and, if the instance is currently MASTER, fires a forced burst:
+
+```go
+old := vi.suppressGARP.Swap(suppress)
+if old && !suppress && vi.getState() == StateMaster {
+    go vi.sendGARP(true) // async, matching becomeMaster
+}
+```
+
+- `Swap` (not `Store`) makes the burst **edge-only**: an idempotent re-apply of
+  `false` (old already `false`) does not re-burst.
+- `force=true` bypasses **only** the 500ms time dampener (so a routine GARP in
+  the prior 500ms cannot swallow the announce); the per-epoch dedup still
+  applies, so an epoch already announced is not re-emitted.
+- `sendGARP` emits both IPv4 GARP and IPv6 NA in one burst, so the VIP MAC
+  binding is refreshed for both families.
+- The burst runs in a goroutine, matching `becomeMaster`, so the cluster event
+  handler is never blocked.
+
 #### 3. GARP Epoch Dedup
 
 Each `becomeMaster()` call increments a per-instance `garpEpoch` counter. The `sendGARP()` function checks:

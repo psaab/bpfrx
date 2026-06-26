@@ -1,3 +1,62 @@
+## 2026-06-26 — #2900 VRRP: re-validate an armed preempt hold-timer
+
+- **Timestamp**: 2026-06-26
+- **Action**: An armed `preempt hold-time` countdown (#2850) was never
+  re-validated against state changes during the hold window. Two fixes:
+  (1) At expiry, `case <-preemptHoldTimer.C` now re-runs
+  `shouldPreemptObservedMaster()` before `becomeMaster()` — preempt must
+  still be enabled AND (when a live master is still present) our effective
+  priority must still be strictly > its last advert (RFC 5798 §6.4.2). If
+  invalid (preempt disabled or track-down demotion mid-hold) the node stays
+  BACKUP and re-arms `masterDownTimer`; a silent master reads stale and still
+  takes over. (2) `updateConfig` now signals the run loop via a new
+  `configUpdatedCh`; the BACKUP select tears any in-flight hold down
+  (`disarmPreemptHold`) and re-arms `masterDownTimer` so the next expiry
+  re-evaluates against the fresh config (changed hold-time arms the next
+  countdown with the new value). Added `preemptHoldArmed` (mu-guarded) +
+  `armPreemptHold`/`disarmPreemptHold` helpers; all timer Stop/Reset stays on
+  the run-loop goroutine. Added
+  `pkg/vrrp/instance_preempt_hold_revalidate_test.go` (6 tests). Fail-on-revert
+  verified: reverting the expiry gate reds the preempt-disabled +
+  priority-demoted expiry tests; reverting the updateConfig disarm reds the
+  config-update test. `go test -race ./pkg/vrrp/...` + `go test
+  ./pkg/daemon/...` green. Doc: config-schema.md #2900 note.
+- **File(s)**: pkg/vrrp/instance.go,
+  pkg/vrrp/instance_preempt_hold_revalidate_test.go,
+  docs/config-schema.md, _Log.md
+## 2026-06-26 — #2898 direct-mode GARP/NA burst follow-up loop gated on ownership
+
+- **Timestamp**: 2026-06-26
+- **Action**: `daemon.directSendGARPs` now captures `directAnnounceSeq[rgID]`
+  at burst start and threads a `directBurstStillValid(rgID, seq)` predicate
+  (true only while `directVIPOwned[rgID]` AND the sequence is unchanged) into
+  the gated cluster burst senders via new `directGARPBurstFn`/`directNABurstFn`
+  seams. An abdication or a newer announce now stops the inner 50ms follow-up
+  loop instead of re-poisoning neighbor caches for a VIP it no longer owns —
+  the direct-mode sibling of #2867/#2894. The first (immediate) frame stays
+  unconditional; only follow-ups are gated. Predicate holds the announce/VIP
+  locks only momentarily, never across a sleep. Added
+  `pkg/daemon/direct_garp_gate_test.go` (recorder-based abdicate-stops +
+  full-burst-while-owned + predicate transitions; fail-on-revert verified —
+  abdicate test goes RED to 18 frames against the ungated nil predicate).
+- **File(s)**: pkg/daemon/daemon_ha_vip.go,
+  pkg/daemon/direct_garp_gate_test.go, docs/bugs.md, _Log.md
+
+## 2026-06-26 — #2940 VRRP strict-VIP: force GARP/NA on unsuppress edge while MASTER
+
+- **Timestamp**: 2026-06-26
+- **Action**: `SetGARPSuppression` now detects the true→false suppression edge
+  (atomic `Swap`) and, if the instance is already in `StateMaster`, fires a
+  forced async GARP/NA burst (`go vi.sendGARP(true)`). Fixes the strict-vip
+  blackhole where promoting an already-MASTER instance left the VIP silent
+  until the periodic timer. `force=true` defeats the 500ms dampener; the
+  per-epoch dedup still applies (edge-only, idempotent re-apply does not
+  re-burst). Added `pkg/vrrp/manager_garp_unsuppress_test.go` (6 tests,
+  fail-on-revert verified against `Store`). Doc: ha-same-l2-vip-ownership.md.
+- **File(s)**: pkg/vrrp/manager.go,
+  pkg/vrrp/manager_garp_unsuppress_test.go,
+  docs/next-features/ha-same-l2-vip-ownership.md, _Log.md
+
 ## 2026-06-26 — #3225 host-inbound: address-family-aware service/protocol matches
 
 - **Timestamp**: 2026-06-26
