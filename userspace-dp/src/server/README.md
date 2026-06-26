@@ -23,6 +23,19 @@ this surface over a Unix socket using a newline-delimited text protocol.
     than a fight. Earlier the helper unconditionally wrote 16 MiB and
     clobbered Go's 64 MiB (and any operator-tuned larger value) back
     down, reintroducing receive drops.
+  - **Stale-socket-only unlink guard (#2974).** Before binding the control
+    and derived session sockets, `run()` clears any leftover inode via
+    `remove_stale_socket`, which `symlink_metadata`-inspects the path and
+    removes it ONLY when it is a real Unix socket (a stale socket from a
+    prior run — the happy path). A regular file, directory, symlink, or any
+    other object at the path is refused with a diagnostic naming the path
+    and observed type, and the startup sites propagate that as a bind abort
+    — the root helper takes `--control-socket` as an argument, so it must
+    fail closed rather than silently delete a wrong path. The shutdown
+    cleanup uses the same guard but keeps its best-effort posture: a
+    non-socket logs a warning and does not fail shutdown. (`symlink_metadata`
+    does not follow symlinks, so a symlink reports as a symlink, not a
+    socket, and is left in place.)
 - `state.rs` — `ServerState`: coordinator handle, latest config
   snapshot, session-table handle, policy state.
 - `handlers/` — request dispatch (`handlers/mod.rs` is the

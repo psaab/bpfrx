@@ -20099,3 +20099,17 @@ top.
   userspace-dp/src/afxdp/tests.rs,
   userspace-dp/src/afxdp/forwarding/tests.rs,
   docs/userspace-icmp-te-debugging.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #2974 — guard control/session socket unlink so the root helper
+  removes ONLY a stale Unix socket, never a regular file or other object at
+  the configured path. Added `remove_stale_socket` (symlink_metadata +
+  `FileTypeExt::is_socket`): absent path -> Ok; real socket -> remove (happy
+  path); anything else -> fail-closed Err naming path + observed file type.
+  Wired at all three unlink sites — both startup binds (abort with
+  diagnostic) and shutdown cleanup (best-effort warn, no shutdown failure).
+  Added 4 Rust unit tests incl. the core regression (a regular file must
+  survive + Err) with fail-on-revert proof. Documented the guard in the
+  server README socket-lifecycle section.
+  **File(s)**: userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/src/server/README.md
