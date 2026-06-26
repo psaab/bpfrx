@@ -2556,6 +2556,134 @@ fn pool_snat_multiple_addresses_round_robin() {
     );
 }
 
+// #3049: a subnet-style source-NAT pool address must enumerate the FULL
+// prefix range, not collapse to the single network host. This is the
+// fail-on-revert guard: pre-#3049 the parser stripped the `/28` mask and kept
+// only `203.0.113.0`, so the pool had ONE address. With the fix a `/28` pool
+// expands to all 16 host addresses and round-robin spreads across them.
+#[test]
+fn pool_snat_subnet_expands_full_cidr_range() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-subnet".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "subnet-pool".to_string(),
+        // A /28 is 16 addresses: 203.0.113.0 .. 203.0.113.15.
+        pool_addresses: vec!["203.0.113.0/28".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    // FAIL-ON-REVERT: the whole /28 must be enumerated. Pre-#3049 this was 1.
+    assert_eq!(
+        rules[0].pool_addresses_v4.len(),
+        16,
+        "a /28 source-NAT pool must expand to all 16 host addresses, not be \
+         truncated to a single host"
+    );
+    assert_eq!(
+        rules[0].pool_addresses_v4[0],
+        "203.0.113.0".parse::<std::net::Ipv4Addr>().unwrap()
+    );
+    assert_eq!(
+        rules[0].pool_addresses_v4[15],
+        "203.0.113.15".parse::<std::net::Ipv4Addr>().unwrap()
+    );
+
+    // The allocator must actually hand out more than one address from the
+    // expanded range — a single-host truncation would only ever return one.
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..64u8 {
+        let src = format!("10.0.1.{}", i);
+        let d = match_source_nat(
+            &rules,
+            "lan",
+            "wan",
+            src.parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+            None,
+            None,
+        )
+        .expect("should match subnet pool rule");
+        if let Some(IpAddr::V4(addr)) = d.rewrite_src {
+            seen.insert(addr);
+        }
+    }
+    assert!(
+        seen.len() > 1,
+        "expected SNAT to spread across multiple pool addresses, saw {:?}",
+        seen
+    );
+}
+
+// #3049: a single-host pool prefix (/32, /128) must still yield exactly one
+// address — the expansion must not over-broaden a host route.
+#[test]
+fn pool_snat_host_cidr_yields_single_address() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-host".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "host-pool".to_string(),
+        pool_addresses: vec!["203.0.113.7/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    assert_eq!(rules[0].pool_addresses_v4.len(), 1);
+    assert_eq!(
+        rules[0].pool_addresses_v4[0],
+        "203.0.113.7".parse::<std::net::Ipv4Addr>().unwrap()
+    );
+
+    // A v6 /120 expands to 256 addresses; a /128 stays a single host.
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-v6".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["::/0".to_string()],
+        pool_name: "v6-pool".to_string(),
+        pool_addresses: vec!["2001:db8::/120".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    assert_eq!(rules[0].pool_addresses_v6.len(), 256);
+}
+
+// #3049: an over-broad pool prefix (host count beyond MAX_POOL_PREFIX_HOSTS)
+// is rejected as an invalid pool rather than silently clamped or OOM-expanded.
+#[test]
+fn pool_snat_overbroad_prefix_marks_invalid() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-huge".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "huge-pool".to_string(),
+        // /8 = ~16M hosts, far beyond the cap.
+        pool_addresses: vec!["10.0.0.0/8".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    assert!(rules[0].pool_addresses_v4.is_empty());
+    let d = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "10.0.1.100".parse().unwrap(),
+        "8.8.8.8".parse().unwrap(),
+        None,
+        None,
+    );
+    // An invalid pool yields no usable translation (fail-closed, not a single
+    // truncated host).
+    assert!(d.is_none());
+}
+
 // --- #1827 PR-3: per-uplink SNAT pool selection by to-zone ---
 //
 // Multi-WAN per-uplink pools need NO new matcher: the to-zone fed to

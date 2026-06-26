@@ -1,3 +1,23 @@
+## 2026-06-25 — #3049: source-NAT pool subnet expanded to full CIDR range
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed source-NAT pool subnet truncation. The Rust parser
+  `parse_source_nat_rules_with_previous` stripped the mask off a pool
+  address and kept a single `IpAddr`, so a subnet-style pool like
+  `203.0.113.0/28` (16 addresses) collapsed to one host — severe pool/port
+  exhaustion with no operator signal. The Go compiler passes a bare prefix
+  verbatim (only `address X to Y` ranges were expanded), and the host-mask
+  commit gate covered only NAT64 pools. New `expand_pool_address` helper
+  enumerates the FULL prefix range (network..=broadcast inclusive) into
+  `pool_addresses_v4`/`v6` so the port allocator round-robins/hashes across
+  the whole pool; a single-host prefix (/32, /128) still yields exactly one
+  address; an over-broad prefix beyond `MAX_POOL_PREFIX_HOSTS` (65536) is
+  rejected as `SourceNatFailureReason::InvalidPool` (fail-closed). Added 3
+  fail-on-revert tests (subnet expands to 16, host-CIDR stays 1 + v6 /120
+  → 256, over-broad /8 → invalid). Updated `userspace-dp/README.md`.
+- **File(s)**: userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests.rs,
+  userspace-dp/README.md, _Log.md
+
 ## 2026-06-25 — #3045: REST /security/policies includes global policies
 
 - **Timestamp**: 2026-06-25
