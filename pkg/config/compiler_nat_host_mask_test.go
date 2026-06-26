@@ -418,6 +418,57 @@ func TestStaticNATBlockMixedFamilyRejected(t *testing.T) {
 	}
 }
 
+// #3202: a block-to-block (subnet) static-NAT rule that ALSO specifies a
+// `match destination-port` and `then static-nat mapped-port` MUST be rejected
+// at strict commit-check. The dataplane installs a block as an address-only,
+// all-port 1:1 remap (StaticNatBlock has no port fields), so the port mapping
+// would be silently dropped and "NAT only port 80 of this /24 -> 8080"
+// degrades to "NAT every port of the /24". Reject so the operator authors a
+// /32 host rule for the port forward, or drops the port tokens.
+//
+// Fail-on-revert: deleting the `if blockPair && (... port ...)` guard in
+// validateNATHostMaskStrict makes this config compile cleanly → test RED.
+func TestStaticNATBlockWithPortRejected(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set security zones security-zone untrust",
+		"set security nat static rule-set rs1 from zone untrust",
+		"set security nat static rule-set rs1 rule r1 match destination-address 198.51.100.0/24",
+		"set security nat static rule-set rs1 rule r1 match destination-port 80",
+		"set security nat static rule-set rs1 rule r1 then static-nat prefix 192.168.1.0/24 mapped-port 8080",
+	})
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("block static-NAT (/24 -> /24) with match destination-port + mapped-port must be rejected")
+	}
+	if !strings.Contains(err.Error(), "subnet") || !strings.Contains(err.Error(), "address-only") {
+		t.Fatalf("error must explain the subnet/address-only conflict, got: %v", err)
+	}
+}
+
+// A block rule with ONLY a match destination-port (no mapped-port) is equally
+// not representable by StaticNatBlock and must be rejected.
+func TestStaticNATBlockWithMatchPortOnlyRejected(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set security zones security-zone untrust",
+		"set security nat static rule-set rs1 from zone untrust",
+		"set security nat static rule-set rs1 rule r1 match destination-address 198.51.100.0/24",
+		"set security nat static rule-set rs1 rule r1 match destination-port 80",
+		"set security nat static rule-set rs1 rule r1 then static-nat prefix 192.168.1.0/24",
+	})
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatal("block static-NAT with a match destination-port (no mapped-port) must be rejected")
+	}
+}
+
+// Regression (#3031): the address-only block static-NAT rule (NO port tokens)
+// must still compile — the #3202 guard must not reject a portless block pair.
+func TestStaticNATBlockNoPortStillCompiles(t *testing.T) {
+	tree := buildTree(t, staticNATSet("198.51.100.0/24", "192.168.1.0/24"))
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("portless /24->/24 block static-NAT must still compile (#3031), got: %v", err)
+	}
+}
+
 // isStaticBlockPair unit coverage.
 func TestIsStaticBlockPair(t *testing.T) {
 	cases := []struct {

@@ -185,9 +185,15 @@ xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT
 > destination prefix pair installs an offset-preserving `StaticNatTable`
 > block rule (forward DNAT + reverse SNAT, host bits preserved), and the
 > commit gate accepts the valid equal-length pair while still rejecting
-> mismatched-length / mixed-family pairs. Honoring a DNAT destination
-> prefix still needs a prefix-match table plus confirmed Junos
-> block-mapping semantics.
+> mismatched-length / mixed-family pairs. A subnet block map is
+> **address-only 1:1** — it cannot carry a `match destination-port` /
+> `then static-nat mapped-port` (per-port translation is a host-scope
+> construct on a `/32`; `StaticNatBlock` has no port fields and would
+> silently widen "port 80 of this /24 -> 8080" into an all-port /24 NAT).
+> The commit gate now REJECTS a block pair that also specifies a port,
+> and the dataplane lenient-load path drops it rather than mis-installing
+> an all-port block (#3202). Honoring a DNAT destination prefix still
+> needs a prefix-match table plus confirmed Junos block-mapping semantics.
 
 > **NAT64 inbound policy matches the SYNTHETIC IPv6 destination, not the
 > real internal IPv4 host (#2358).** For inbound NAT64 flows the security
