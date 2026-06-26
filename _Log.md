@@ -1,3 +1,22 @@
+## 2026-06-25 — #2972: ddns surface-a RG0/non-HA scope double-write in active-active HA
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `surfaceAGate` admitting every `RGOwner==0` (RG0/non-HA)
+  Surface A scope unconditionally. In active-active HA both nodes pass the
+  node-level writer gate (each masters some RG) and both built+published the
+  identical non-HA FQDN — a public A/AAAA flap when the nodes observe different
+  WAN addresses. `RGOwner==0` is now tied to RG0 (control-plane RG) ownership
+  via new helper `surfaceARG0Writer`: the RG0-primary node is the single writer
+  and it follows RG0 failover; when RG0 is untracked (data-RG-only cluster or
+  pre-first-election) it falls back to the lowest-node-ID writer. Standalone
+  (nil gate) still writes every scope. DHCP-lease DDNS is unchanged (its
+  per-node memfiles are already master-filtered, so its `RGOwner==0` case has no
+  peer). Added fail-on-revert tests `TestSurfaceAGateRG0SingleWriter`
+  (active-active + failover) and `TestSurfaceAGateRG0FallbackNoRG0`; updated
+  `TestSurfaceAGatePerRG` for the new semantic.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
+  pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md
+
 ## 2026-06-25 — #2936: cap session aggregator cardinality (control-plane DoS amplifier)
 
 - **Timestamp**: 2026-06-25 19:48
