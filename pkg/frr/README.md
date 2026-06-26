@@ -386,6 +386,24 @@ also carries operator content:
   (uncommon); a literal-only definition stays `standard` (anchored exact
   match) and is unaffected. This is the same fail-closed-the-whole-reload
   class as the route-filter `ge`/`le` bounds above (#1880).
+- **Policy community references are validated at commit (#2881).** A
+  policy-statement term's `from community <name>` renders `match community
+  <name>` and `then community delete <name>` (the strip-by-list operation
+  added in #2848) renders `set comm-list <name> delete`. Both reference an
+  FRR `bgp community-list <name>` that `generatePolicyOptions` emits ONLY
+  for a defined `policy-options community <name>`. With no validation a term
+  naming an UNDEFINED community committed cleanly, then a dangling `match
+  community` / `set comm-list ... delete` line failed the WHOLE `frr-reload`
+  of the managed section (a single `vtysh -f` add-batch exits non-zero on any
+  `CMD_WARNING_CONFIG_FAILED`), leaving dynamic routing stale — a
+  commit-accepted config the routing daemon cannot load.
+  `validatePolicyCommunityReferencesStrict` (`pkg/config`) hard-rejects an
+  undefined `from community` / `then community delete` reference at
+  commit/commit-check, naming the policy, term, and missing community; lenient
+  (warn) on load/HA-sync (#1960). Only NAME references are checked — `then
+  community (set|add) <value>` carries a community VALUE (e.g. `65000:100`),
+  not a list reference, and is not validated. Same fail-closed-the-whole-reload
+  class as the community-list definition gate above.
 - `vtysh -c` is run synchronously in batch mode for state queries. There
   is no streaming; long output is buffered.
 - All `vtysh` and `frr-reload.py` shell-outs route through the

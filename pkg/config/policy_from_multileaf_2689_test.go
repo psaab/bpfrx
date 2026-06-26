@@ -31,6 +31,10 @@ import "testing"
 
 func TestPolicyFromCommunityBracketFlatSet_2689(t *testing.T) {
 	cfg, err := compileSet(t, []string{
+		// Communities must be defined (#2881) or the from-community
+		// cross-reference gate rejects the term before this assertion runs.
+		"set policy-options community c1 members 65000:1",
+		"set policy-options community c2 members 65000:2",
 		"set policy-options policy-statement P term T from community [ c1 c2 ]",
 		"set policy-options policy-statement P term T then accept",
 	})
@@ -46,6 +50,8 @@ func TestPolicyFromCommunityBracketFlatSet_2689(t *testing.T) {
 
 func TestPolicyFromCommunityBracketHierarchical_2689(t *testing.T) {
 	src := `policy-options {
+    community c1 members 65000:1;
+    community c2 members 65000:2;
     policy-statement P {
         term T {
             from {
@@ -68,6 +74,9 @@ func TestPolicyFromCommunityBracketHierarchical_2689(t *testing.T) {
 // values accumulate, then the sibling appends, neither overwriting the other.
 func TestPolicyFromCommunityBracketPlusSibling_2689(t *testing.T) {
 	cfg, err := compileSet(t, []string{
+		"set policy-options community c1 members 65000:1",
+		"set policy-options community c2 members 65000:2",
+		"set policy-options community c3 members 65000:3",
 		"set policy-options policy-statement P term T from community [ c1 c2 ]",
 		"set policy-options policy-statement P term T from community c3",
 		"set policy-options policy-statement P term T then accept",

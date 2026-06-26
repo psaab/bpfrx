@@ -15,7 +15,10 @@ import "testing"
 // overwriting the previous one (see TestPolicyTermMultiMatch_FlatSet_2630).
 
 func TestPolicyTermMultiMatch_Hierarchical_2642(t *testing.T) {
+	// Communities must be defined (#2881 cross-reference gate).
 	cfg := `policy-options {
+    community c1 members 65000:1;
+    community c2 members 65000:2;
     policy-statement P {
         term t1 {
             from {
@@ -61,7 +64,9 @@ func TestPolicyTermMultiMatch_Hierarchical_2642(t *testing.T) {
 // A single same-type match in the hierarchical path keeps working (regression
 // guard for the common case).
 func TestPolicyTermSingleMatch_Hierarchical_2642(t *testing.T) {
+	// Community must be defined (#2881 cross-reference gate).
 	cfg := `policy-options {
+    community c1 members 65000:1;
     policy-statement P {
         term t1 {
             from {
@@ -104,6 +109,9 @@ func TestPolicyTermSingleMatch_Hierarchical_2642(t *testing.T) {
 func TestPolicyTermMultiMatch_FlatSet_2630(t *testing.T) {
 	tree := &ConfigTree{}
 	cmds := []string{
+		// Communities must be defined (#2881 cross-reference gate).
+		"set policy-options community c1 members 65000:1",
+		"set policy-options community c2 members 65000:2",
 		"set policy-options policy-statement P term t1 from community c1",
 		"set policy-options policy-statement P term t1 from community c2",
 		"set policy-options policy-statement P term t1 from prefix-list pl1",

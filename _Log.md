@@ -1,3 +1,32 @@
+## 2026-06-25 — #2881: commit-time reject undefined policy community references
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add `validatePolicyCommunityReferencesStrict` reject-at-commit
+  gate. A policy-statement term's `from community <name>` (rendered FRR `match
+  community <name>`) and `then community delete <name>` (the #2848 strip-by-list
+  operation, rendered `set comm-list <name> delete`) reference an FRR
+  `bgp community-list <name>` that pkg/frr emits ONLY from a defined
+  `policy-options community <name>`. An undefined reference committed cleanly,
+  then the dangling line failed the WHOLE frr-reload of the managed section,
+  leaving dynamic routing stale (#1960-class commit-accepted-but-unloadable).
+  New validator runs on the fully-compiled `*Config`, hard-rejects on the strict
+  commit/commit-check path naming the policy, term, and missing community;
+  downgrades to a cfg.Warnings entry on the lenient load/peer-sync path
+  (`lenientPolicyCommunityRef`) so an already-persisted/peer-synced config still
+  boots. SURGICAL — only NAME refs checked; `then community (set|add) <value>`
+  carries a community VALUE, not a list ref, so it is not validated.
+- **File(s)**: pkg/config/compiler.go (compileOpts flag + 2 lenient blocks +
+  call site), pkg/config/compiler_validate_strict.go (validator),
+  pkg/config/policy_community_ref_test.go (new fail-on-revert tests),
+  pkg/config/policy_from_multileaf_2689_test.go,
+  pkg/config/compiler_policy_term_multimatch_2642_test.go,
+  pkg/config/parser_security_test.go, pkg/frr/frr_test.go (pre-existing tests:
+  define the communities they reference), pkg/config/README.md,
+  pkg/frr/README.md.
+- **Validation**: go build ./..., go vet ./pkg/config/... ./pkg/frr/...,
+  go test ./pkg/config/... ./pkg/frr/... (1806 pass). Fail-on-revert: removing
+  the validator call turns the 3 reject tests + lenient-warn test RED.
+
 - **2026-06-26T03:54:14Z**: Fix master-CI-red pkg/configstore TestCopyConfig — removed incidental `interfaces eth0.0` from the trust zone fixture. #3072/#3083's interface-multi-zone commit gate (merged this session) correctly rejects a Copy of a zone-with-interface (the interface lands in both trust and trust2). The interface was incidental to the Copy test. File: pkg/configstore/store_test.go
 
 ## 2026-06-25 — #2993: feeds mixed valid/invalid body installs a partial set silently

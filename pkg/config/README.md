@@ -357,6 +357,27 @@ ignored. The tolerant load/peer-sync path downgrades to a warning
 an older binary accepted still boots (#1960 no-brick doctrine) — the #2929
 routing guard stays the runtime backstop.
 
+**Undefined policy community references are rejected at commit (#2881):** a
+policy-statement term's `from community <name>` (rendered FRR `match community
+<name>`) and `then community delete <name>` (the strip-by-list operation added
+in #2848, rendered `set comm-list <name> delete`) both reference an FRR
+`bgp community-list <name>` that `pkg/frr` emits ONLY from a defined
+`policy-options community <name>`. With no validation a term naming an UNDEFINED
+community committed cleanly, then a dangling `match community` / `set comm-list
+... delete` line failed the WHOLE `frr-reload` of the managed section (a single
+`vtysh -f` add-batch exits non-zero on any `CMD_WARNING_CONFIG_FAILED`), leaving
+dynamic routing stale — a commit-accepted config the routing daemon cannot load.
+`validatePolicyCommunityReferencesStrict` (`compiler_validate_strict.go`) runs
+on the fully-compiled `*Config` (the community map is populated regardless of
+authoring order) and hard-rejects an undefined `from community` / `then
+community delete` reference at commit/commit-check, naming the policy, term, and
+missing community. The tolerant load/peer-sync path downgrades to a warning
+(`lenientPolicyCommunityRef`) so an already-persisted or peer-synced config an
+older binary accepted still boots (#1960 no-brick doctrine). The gate is
+SURGICAL — only NAME references are checked; `then community (set|add) <value>`
+carries a community VALUE (e.g. `65000:100`), not a list reference, and a defined
+community reference commits unchanged.
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`
