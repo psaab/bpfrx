@@ -133,7 +133,15 @@ fn self_instance() -> ProcInstance {
 fn instance_is_alive(inst: ProcInstance) -> bool {
     // The writer's own process is always alive; never treat its in-flight temps
     // as orphans regardless of /proc visibility quirks or start-time read races.
-    if inst.pid == self_instance().pid {
+    // The shortcut MUST match the FULL instance (pid AND start time), not the
+    // bare pid: after our predecessor crashed, Linux can recycle its pid as OUR
+    // pid. A stale orphan then embeds (our pid, the predecessor's start time).
+    // A bare-pid shortcut would preserve that recycled-pid debris forever — the
+    // exact PID-reuse hazard #2957 closed, re-opened for the one pid that equals
+    // ours (#3009). Comparing the whole instance preserves only our genuine
+    // in-flight temp (pid AND start time match) and lets the normal path below
+    // sweep a recycled-pid orphan (same pid, different embedded start time).
+    if inst == self_instance() {
         return true;
     }
     match lookup_start_time(inst.pid) {
@@ -1086,6 +1094,65 @@ mod tests {
         assert!(
             live_temp.exists(),
             "a genuinely-live writer's temp (pid+start match) must be preserved"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Fail-on-revert (#3009): the self-process shortcut in `instance_is_alive`
+    // must match the FULL instance (pid AND start time), not the bare pid. The
+    // #2957 PID-reuse fix left a residual: if a crashed writer's pid is recycled
+    // as the CURRENT helper's pid, the orphan temp embeds (our pid, the dead
+    // writer's start time). A bare-pid self-shortcut returns `true` for it and
+    // pins the dead writer's debris for the rest of our lifetime — exactly the
+    // PID-reuse hazard #2957 set out to close, for the one pid equal to ours.
+    //
+    // This test drives the real `instance_is_alive`/sweep gate:
+    //   * a recycled-pid orphan (pid == OUR pid, but a DIFFERENT embedded start
+    //     time) MUST be swept;
+    //   * our OWN genuine in-flight temp (pid AND start time == self) MUST be
+    //     preserved.
+    // With the bare-pid shortcut (`inst.pid == self_instance().pid`) the orphan
+    // is preserved and the first assertion goes RED.
+    #[test]
+    fn sweep_removes_self_pid_orphan_with_mismatched_start_time() {
+        let dir = tmpdir();
+        let dest = dir.join("state.json");
+        let dest_str = dest.to_str().unwrap();
+
+        let me = self_instance();
+
+        // A crashed predecessor whose pid Linux later recycled as ours: the
+        // orphan embeds OUR pid but the predecessor's start time. Guard against
+        // the (vanishingly unlikely) case where our real start time is 0 or
+        // collides with the chosen impostor value.
+        let impostor_start = if me.start_time == 0 { 1 } else { 0 };
+        let recycled_orphan =
+            dir.join(format!("state.json.{}_{impostor_start}.5.tmp", me.pid));
+        fs::write(&recycled_orphan, b"crashed predecessor, our pid recycled").unwrap();
+
+        // Our OWN in-flight temp: pid AND start time match self exactly.
+        let self_temp =
+            dir.join(format!("state.json.{}_{}.2.tmp", me.pid, me.start_time));
+        fs::write(&self_temp, b"our genuine in-flight write").unwrap();
+
+        let pids = PidGuard::install();
+        // Our pid is, of course, LIVE — and `/proc` reports OUR real start time.
+        // The recycled orphan's embedded start (impostor_start) therefore does
+        // not match, so the normal (pid,start) gate must sweep it; our own temp
+        // (start == me.start_time) must survive.
+        pids.mark_live_with_start(me.pid, me.start_time);
+
+        sweep_stale_temps(dest_str);
+
+        assert!(
+            !recycled_orphan.exists(),
+            "an orphan with OUR pid but a mismatched start time must be swept \
+             (bare-pid self-shortcut preserves it -> RED)"
+        );
+        assert!(
+            self_temp.exists(),
+            "our own in-flight temp (pid+start match self) must be preserved"
         );
 
         let _ = fs::remove_dir_all(&dir);

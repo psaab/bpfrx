@@ -1,3 +1,15 @@
+## 2026-06-25 — #3009: state_writer instance_is_alive self-shortcut checks full instance
+
+- **Timestamp**: 2026-06-25
+- **Action**: finished the #3009 fix. The `instance_is_alive` self-process
+  shortcut now compares the FULL `ProcInstance` (pid AND start_time) instead
+  of bare pid, closing the #2957 PID-reuse residual: a recycled-pid orphan
+  (our pid, predecessor's start_time) is now swept while our genuine in-flight
+  temp (pid+start_time match) is preserved. Added fail-on-revert test
+  `sweep_removes_self_pid_orphan_with_mismatched_start_time` (verified RED
+  with the bare-pid shortcut, GREEN with the fix). Gates: cargo build
+  --release clean; cargo test state_writer 13 passed.
+- **File(s)**: userspace-dp/src/state_writer.rs, _Log.md
 ## 2026-06-25 — #2949: unify REST + gRPC protoName on a single SSOT
 
 - **Timestamp**: 2026-06-25
