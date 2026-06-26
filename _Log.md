@@ -1,3 +1,14 @@
+## 2026-06-25 — #2993: feeds mixed valid/invalid body installs a partial set silently
+- **Action**: parseFeed now counts skipped malformed lines (invalidLines) +
+  bounded sample (invalidSample, maxInvalidSample=5); FeedInfo gains
+  InvalidLines/InvalidSample/Degraded. installSnapshot records them and logs
+  one slog.Warn on a degraded content change; recordFailure drop-to-empty
+  clears them. show security dynamic-address (CLI + grpcapi) prints a DEGRADED
+  line. Clean feeds unchanged (0 invalid, not degraded). Contract: skip-with-
+  count + degraded status (issue primary direction; observable, not silent).
+- **File(s)**: pkg/feeds/feeds.go, pkg/feeds/feeds_test.go,
+  pkg/feeds/README.md, pkg/cli/cli_show_security_objects.go,
+  pkg/grpcapi/server_show_security_text.go
 ## 2026-06-25 — #2972: ddns surface-a RG0/non-HA scope double-write in active-active HA
 
 - **Timestamp**: 2026-06-25
