@@ -297,6 +297,41 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			if rule.Then == "inet" {
 				continue
 			}
+			// #3206: a `match destination-address` / `then static-nat
+			// prefix` that is not a parseable literal IP or CIDR (an
+			// address-book name, or a typo'd prefix) is NOT caught by the
+			// host-mask check below — that check fires only when the value
+			// parses (`parsed && !host`). An unparseable value falls all the
+			// way through to the Rust dataplane, where `parse_nat_prefix`
+			// returns None and `from_snapshots` does `continue`, SILENTLY
+			// dropping the entire static-NAT mapping with no commit error or
+			// runtime feedback (the operator authored a rule that simply does
+			// not exist at runtime). Static NAT takes literal IP/CIDR
+			// endpoints, not address-book references, so reject an
+			// unparseable value at commit. `natStaticPrefixInfo` mirrors the
+			// Rust `parse_nat_prefix` classification; its `parsedIP == false`
+			// is precisely the silently-dropped case. Run this BEFORE the
+			// blockPair / host-mask checks so an unparseable value reports its
+			// own (clearer) error rather than being skipped as "not a block
+			// pair".
+			if rule.Match != "" {
+				if _, _, _, parsedIP := natStaticPrefixInfo(rule.Match); !parsedIP {
+					if err := emit(fmt.Sprintf(
+						"security nat static rule-set %q rule %q match destination-address %q is not a valid IP address or CIDR prefix (static NAT requires a literal address or prefix, not an address-book name or a typo'd value)",
+						rs.Name, rule.Name, rule.Match)); err != nil {
+						return nil, err
+					}
+				}
+			}
+			if rule.Then != "" {
+				if _, _, _, parsedIP := natStaticPrefixInfo(rule.Then); !parsedIP {
+					if err := emit(fmt.Sprintf(
+						"security nat static rule-set %q rule %q then static-nat prefix %q is not a valid IP address or CIDR prefix (static NAT requires a literal address or prefix, not an address-book name or a typo'd value)",
+						rs.Name, rule.Name, rule.Then)); err != nil {
+						return nil, err
+					}
+				}
+			}
 			// #3031: a valid block-to-block (subnet) static-NAT rule —
 			// equal-length non-host prefixes of the same family — is now
 			// installed by the dataplane (offset-preserving 1:1 remap), so do

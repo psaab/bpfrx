@@ -195,7 +195,7 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 
 					fromNode := termInst.node.FindChild("from")
 					if fromNode != nil {
-						compileFilterFrom(fromNode, term)
+						compileFilterFrom(fromNode, term, af)
 					}
 
 					thenNode := termInst.node.FindChild("then")
@@ -253,7 +253,10 @@ func firewallMatchValues(child *Node) []string {
 	return vals
 }
 
-func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
+// compileFilterFrom compiles a firewall-filter term's `from` match block. The
+// family ("inet" / "inet6") selects the ICMPv4 vs ICMPv6 icmp-type name table
+// when resolving symbolic icmp-type values (#3205).
+func compileFilterFrom(node *Node, term *FirewallFilterTerm, family string) {
 	for _, child := range node.Children {
 		switch child.Name() {
 		case "dscp", "traffic-class":
@@ -272,7 +275,9 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
 		case "destination-address":
 			term.DestAddresses = append(term.DestAddresses, firewallMatchValues(child)...)
 		case "destination-port":
-			term.DestinationPorts = append(term.DestinationPorts, firewallMatchValues(child)...)
+			// #3205: resolve named/service ports to numerics and record any
+			// unresolved token for the strict commit gate (fail closed).
+			term.DestinationPorts = append(term.DestinationPorts, resolveFilterPortTokens(firewallMatchValues(child), term)...)
 		case "source-prefix-list":
 			// Block form: source-prefix-list { mgmt-hosts except; }
 			for _, plNode := range child.Children {
@@ -291,24 +296,35 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
 				term.DestPrefixLists = append(term.DestPrefixLists, ref)
 			}
 		case "source-port":
-			term.SourcePorts = append(term.SourcePorts, firewallMatchValues(child)...)
+			term.SourcePorts = append(term.SourcePorts, resolveFilterPortTokens(firewallMatchValues(child), term)...)
 		case "destination-port-except":
 			// #2622 negated port match: match all destination ports EXCEPT
 			// these. Multi-value/bracket-list, same accumulation as the
-			// positive destination-port case.
-			term.DestPortsExcept = append(term.DestPortsExcept, firewallMatchValues(child)...)
+			// positive destination-port case. #3205: resolve named ports and
+			// record unresolved tokens — an unresolved except port that slips
+			// through fails OPEN (matches all ports) in the dataplane.
+			term.DestPortsExcept = append(term.DestPortsExcept, resolveFilterPortTokens(firewallMatchValues(child), term)...)
 		case "source-port-except":
-			term.SourcePortsExcept = append(term.SourcePortsExcept, firewallMatchValues(child)...)
+			term.SourcePortsExcept = append(term.SourcePortsExcept, resolveFilterPortTokens(firewallMatchValues(child), term)...)
 		case "icmp-type":
+			// #3205: resolve symbolic icmp-type names (echo-request, ...) to
+			// their numeric value using the family-appropriate Junos table.
+			// strconv.Atoi alone silently dropped every name, leaving the type
+			// set empty (matches ALL ICMP — a policy bypass). An unresolved
+			// token is recorded for the strict commit gate (fail closed).
 			for _, v := range firewallMatchValues(child) {
-				if n, err := strconv.Atoi(v); err == nil {
+				if n, ok := resolveICMPTypeToken(v, family); ok {
 					term.ICMPTypes = append(term.ICMPTypes, n)
+				} else {
+					term.UnknownICMPTypes = append(term.UnknownICMPTypes, v)
 				}
 			}
 		case "icmp-code":
 			for _, v := range firewallMatchValues(child) {
-				if n, err := strconv.Atoi(v); err == nil {
+				if n, ok := resolveICMPCodeToken(v); ok {
 					term.ICMPCodes = append(term.ICMPCodes, n)
+				} else {
+					term.UnknownICMPCodes = append(term.UnknownICMPCodes, v)
 				}
 			}
 		case "tcp-flags":

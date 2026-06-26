@@ -492,3 +492,75 @@ func TestIsStaticBlockPair(t *testing.T) {
 		}
 	}
 }
+
+// #3206: a static-NAT match destination-address / then static-nat prefix that
+// is NOT a parseable literal IP/CIDR (an address-book name, or a typo'd
+// prefix) committed cleanly before this gate — the host-mask check only fires
+// when the value parses, so an unparseable value fell through to the Rust
+// dataplane, where parse_nat_prefix returns None and from_snapshots `continue`
+// silently drops the WHOLE static-NAT mapping. The commit gate now rejects it.
+//
+// Fail-on-revert: delete the `#3206` blocks in validateNATHostMaskStrict and
+// these reject tests compile cleanly → RED. The valid host (/32) and block
+// (/24) tests in this file stay GREEN (no over-rejection of legit configs).
+
+func TestStaticNATUnparseableMatchRejected(t *testing.T) {
+	// An address-book name in the match destination-address slot.
+	tree := buildTree(t, staticNATSet("web-server", "10.0.0.5/32"))
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("static-NAT match with an unparseable address (address-book name) must be rejected")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "match destination-address") ||
+		!strings.Contains(msg, "web-server") ||
+		!strings.Contains(msg, "not a valid IP address or CIDR prefix") {
+		t.Fatalf("error must name the slot + offending value + reason, got: %v", err)
+	}
+}
+
+func TestStaticNATUnparseablePrefixRejected(t *testing.T) {
+	// A typo'd prefix in the then static-nat prefix slot (not a literal IP).
+	tree := buildTree(t, staticNATSet("203.0.113.5/32", "10.0.0.300"))
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("static-NAT prefix with an unparseable value (typo) must be rejected")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "then static-nat prefix") ||
+		!strings.Contains(msg, "10.0.0.300") ||
+		!strings.Contains(msg, "not a valid IP address or CIDR prefix") {
+		t.Fatalf("error must name the prefix slot + offending value + reason, got: %v", err)
+	}
+}
+
+// A valid host (/32) and a valid block (/24) static NAT must still compile —
+// the #3206 unparseable gate must not over-reject legitimate literal values.
+func TestStaticNATParseableValuesStillCompile(t *testing.T) {
+	cases := [][]string{
+		staticNATSet("203.0.113.5", "10.0.0.5"),              // bare hosts
+		staticNATSet("203.0.113.5/32", "10.0.0.5/32"),        // /32 host pair
+		staticNATSet("2001:db8::5/128", "2001:db8:1::5/128"), // /128 host pair
+		staticNATSet("198.51.100.0/24", "192.168.1.0/24"),    // /24 block pair (#3031)
+	}
+	for i, lines := range cases {
+		if _, err := CompileConfig(buildTree(t, lines)); err != nil {
+			t.Fatalf("case %d: parseable static-NAT must compile, got: %v", i, err)
+		}
+	}
+}
+
+// Lenient load must NOT brick the daemon on an unparseable static-NAT value —
+// it accepts and warns (the dataplane independently drops the rule).
+func TestStaticNATUnparseableLenientWarns(t *testing.T) {
+	cfg, err := CompileConfigLenient(buildTree(t, staticNATSet("web-server", "10.0.0.5/32")))
+	if err != nil {
+		t.Fatalf("CompileConfigLenient must NOT fail (brick-on-restart), got: %v", err)
+	}
+	if !hasWarningContaining(cfg.Warnings, "not a valid IP address or CIDR prefix") {
+		t.Fatalf("lenient load must warn about the unparseable value, warnings=%v", cfg.Warnings)
+	}
+	if !hasWarningContaining(cfg.Warnings, "rule dropped by dataplane") {
+		t.Fatalf("warning must say the rule is dropped by the dataplane, warnings=%v", cfg.Warnings)
+	}
+}
