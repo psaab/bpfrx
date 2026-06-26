@@ -413,6 +413,22 @@ type compileOpts struct {
 	// independently, so it is already inert. Same doctrine as
 	// lenientApplicationSpecs.
 	lenientApplicationSetMembers bool
+	// lenientPolicyMatchApplications (#3144) downgrades the policy
+	// match-application definedness gate
+	// (validatePolicyMatchApplicationsStrict) from a hard compile error to a
+	// cfg.Warnings entry. A security-policy `match application <name>` token
+	// resolving to no predefined junos-* application, no user-defined
+	// application, and no application-set was previously only WARNED at commit
+	// — yet the userspace capability gate resolves the same name set and
+	// REFUSES to arm security policies for an unknown name, silently disarming
+	// the firewall's allow/deny path (a commit/apply split, fail-open). The
+	// strict commit / commit-check path hard-rejects so the typo is
+	// operator-visible; the tolerant load / peer-sync paths warn so an
+	// already-persisted or peer-synced config that an older binary accepted
+	// still BOOTS (#1960) — the dataplane independently refuses such a policy,
+	// so a leniently-loaded bad config is no worse off, now flagged. Same
+	// doctrine as lenientApplicationSetMembers.
+	lenientPolicyMatchApplications bool
 	// lenientRibGroupRefs (#2226) downgrades the rib-group import-rib
 	// cross-reference gate (validateRibGroupImportRibReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. An `import-rib` naming a rib
@@ -932,6 +948,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFlowServerTemplateRef:       true,
 		lenientSamplingInstanceConflicts:   true,
 		lenientApplicationSetMembers:       true,
+		lenientPolicyMatchApplications:     true,
 		lenientRibGroupRefs:                true,
 		lenientDHCPStaticBindings:          true,
 		lenientWireguardPeers:              true,
@@ -1057,6 +1074,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFlowServerTemplateRef:       true,
 		lenientSamplingInstanceConflicts:   true,
 		lenientApplicationSetMembers:       true,
+		lenientPolicyMatchApplications:     true,
 		lenientRibGroupRefs:                true,
 		lenientDHCPStaticBindings:          true,
 		lenientWireguardPeers:              true,
@@ -2223,6 +2241,34 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientApplicationSetMembers {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("application-set member (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3144 security-policy match-application definedness gate. A policy
+	// `match application <name>` token resolving to no predefined junos-*
+	// application, no user-defined application, and no application-set was
+	// previously only WARNED at commit — yet the userspace capability gate
+	// (resolveUserspaceApplicationNames) resolves the SAME name set and returns
+	// false for an unknown name, so the dataplane REFUSES to arm security
+	// policies. The operator gets a green commit and a silently DISARMED policy
+	// engine on the firewall's allow/deny path (a commit/apply split,
+	// fail-open). Strict on commit / commit-check (hard reject naming the
+	// policy scope, the policy, and the undefined app); lenient on load /
+	// peer-sync (warn — #1960; the dataplane independently refuses the policy,
+	// so a leniently-loaded bad config is no worse off, now flagged). Resolves
+	// via ResolveApplication / ResolveApplicationSet — the EXACT name set the
+	// runtime gate uses — so commit and runtime cannot diverge. Covers
+	// zone-pair + global policies and the multi-value application list. Runs
+	// AFTER the application-set member gate (#2217) so a dangling member of a
+	// DEFINED set still wins the first-error slot; this gate catches a wholly
+	// undefined top-level reference that #2217's ExpandApplicationSet never
+	// sees.
+	if err := validatePolicyMatchApplicationsStrict(cfg); err != nil {
+		if opts.lenientPolicyMatchApplications {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("policy match application (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

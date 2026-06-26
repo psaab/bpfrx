@@ -61,6 +61,54 @@
   fail-on-revert confirmed — reverting the tail scan makes the five escape
   cases COMMIT (the genuine fail-open), turning the escape test RED; the
   no-over-reject cases stay green. gofmt clean.
+## 2026-06-25 — #3144: undefined policy `match application` hard-reject at commit
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix codex-review-067 finding 067-02 — a security-policy
+  `match application <NAME>` referencing an UNDEFINED application (not a
+  predefined junos-* app, not a user-defined application or application-set)
+  was only WARNED at commit (`compiler_validate_warn.go`). At runtime the
+  userspace capability gate (`resolveUserspaceApplicationNames`) resolves the
+  same name set, returns false for the unknown name → the dataplane refuses to
+  arm security policies. Green commit + silently disarmed allow/deny path — a
+  commit/apply split, fail-open.
+- **Fix**: Added `validatePolicyMatchApplicationsStrict` +
+  `policyMatchApplicationError` (`compiler_validate_strict.go`) hard-rejecting
+  an undefined reference at commit (zone-pair + global + the multi-value
+  `[ a b c ]` list). Resolution mirrors the runtime gate exactly
+  (`ResolveApplication` + `ResolveApplicationSet`); `any`/empty accepted.
+  Strict on commit/commit-check; lenient-warn on load/peer-sync via new
+  `lenientPolicyMatchApplications` flag (#1960). Removed the warn.go
+  application-not-defined block (converted consistently): strict gate
+  supersedes on commit, lenient gate emits the single warning on load —
+  drops a duplicate warning + the old 24-entry builtin list's false positive
+  on predefined apps outside it. Composes with #2217 (dangling set member)
+  and #3142 (multi-value populate via the typed Match.Applications list).
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_policy_match_application_3144_test.go,
+  pkg/config/README.md, _Log.md
+- **Fold (#3146, same fail-open class)**: a DEFINED-but-EMPTY
+  application-set referenced by a policy committed clean but the runtime
+  DISARMED — the set resolves by NAME but the runtime
+  `resolveUserspaceApplicationNames` calls `ExpandApplicationSet`, gets
+  len==0, returns false → dataplane refuses to arm security policies.
+  #2217's gate `continue`s on an empty set, so nothing else caught it.
+  Fixed: the application-set branch now requires `ExpandApplicationSet`
+  to yield >= 1 member (mirroring the runtime exactly), with a distinct
+  `policyMatchEmptyAppSetError` message. Strict reject / lenient warn.
+  Updated README to drop the overstated "cannot diverge" → "mirrors
+  resolveUserspaceApplicationNames (name resolves AND, for a set, expands
+  to >= 1 member)". Closes #3146 too.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_policy_match_application_3144_test.go,
+  pkg/config/README.md, _Log.md
+- **Validation**: `go build ./...` clean; `go vet ./pkg/config/...` clean;
+  `go test ./pkg/config/... ./pkg/dataplane/userspace/...` 2249 passed;
+  gofmt clean. fail-on-revert: neutering the validator → undefined commits
+  (5 RED), restored → GREEN; dropping the empty-set expand arm → empty-set
+  commits (3 RED), restored → GREEN.
 
 ## 2026-06-25 — #3025: NAT64 non-fragmented L4 checksum goes incremental (RFC 1624)
 

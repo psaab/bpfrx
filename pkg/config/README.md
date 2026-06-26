@@ -182,6 +182,43 @@ peer-synced config still boots (#1960 no-brick) — a leniently-loaded bare-log
 policy simply logs nothing, exactly as before. Same fail-closed-on-load
 doctrine as #3043.
 
+**Security-policy `match application` must be defined (#3144):** a policy
+`match application <name>` token resolving to NONE of {predefined junos-*
+application, user-defined `applications application <name>`, user-defined
+`applications application-set <name>`} was previously only WARNED at commit
+(`compiler_validate_warn.go`). But at runtime the userspace capability gate
+(`resolveUserspaceApplicationNames` in `pkg/dataplane/userspace/capabilities.go`)
+resolves the SAME name set and returns false for an unknown name →
+`expandUserspacePolicyApplications` fails → `userspaceSupportsSecurityPolicies`
+returns false → the dataplane REFUSES to arm security policies. The operator
+got a green commit and a silently DISARMED policy engine on the firewall's
+primary allow/deny path — a commit/apply split, fail-open.
+`validatePolicyMatchApplicationsStrict` (`compiler_validate_strict.go`)
+hard-rejects an undefined reference (zone-pair OR global, including every
+element of a `match application [ a b c ]` list) at commit, naming the policy
+scope, the policy, and the undefined token. Resolution mirrors the runtime gate
+`resolveUserspaceApplicationNames`: a name resolves only if it is a predefined /
+user application (`ResolveApplication` — user apps then the predefined table)
+OR an `application-set` that EXPANDS to >= 1 member (`ResolveApplicationSet` +
+`ExpandApplicationSet`, the exact runtime check). `any` and the empty token are
+always accepted. A defined-but-EMPTY application-set (#3146) is rejected with a
+distinct message: the set resolves by name but expands to zero applications, so
+the runtime gate returns false and the dataplane refuses to arm — the same
+fail-open class. (#2217's `validateApplicationSetMembersStrict` `continue`s on
+an empty set, so this gate is the one that catches it.) The tolerant load/peer-sync path downgrades to
+a warning (`lenientPolicyMatchApplications`) so an already-persisted or
+peer-synced config still boots (#1960 no-brick) — the dataplane independently
+refuses the policy, so a leniently-loaded bad config is no worse off, now
+flagged. Distinct from #2217 (`validateApplicationSetMembersStrict`), which
+rejects a dangling MEMBER of a DEFINED application-set; this gate catches a
+wholly undefined top-level reference that #2217's `ExpandApplicationSet` walk
+never sees. The `compiler_validate_warn.go` application warning was removed
+(converted): the strict gate supersedes it on commit and the lenient gate emits
+the single warning on load — eliminating both a duplicate warning and the old
+24-entry builtin list's false positive on predefined apps outside it (e.g.
+`junos-pingv6`, `junos-tcp-any`). Same fail-closed-on-load doctrine as
+#3043/#2401.
+
 **An interface belongs to exactly one security zone (#3072):**
 `pkg/dataplane/userspace.buildInterfaceZoneMap` builds the interface->zone
 lookup by iterating zone names in SORTED order and writing each interface
