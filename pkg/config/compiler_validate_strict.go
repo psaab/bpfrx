@@ -2907,6 +2907,75 @@ func validateFilterActionsStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFilterMatchValuesStrict hard-rejects any firewall-filter term that
+// carries a SYMBOLIC match value (icmp-type / icmp-code name or a named port)
+// the compiler could not resolve to a number — #3205 (agy-070 #07/#08).
+//
+// Before this gate the compiler silently dropped an unresolved symbolic value:
+//
+//   - an unresolved icmp-type left ICMPTypes empty, which means "match ANY
+//     ICMP" — a term meant to narrow to one type (e.g. `then accept` of
+//     echo-request only) silently permitted every ICMP type (policy bypass);
+//   - an unresolved named port left the port set constrained-but-empty, and a
+//     `*-port-except` term then matched ALL ports — it accepted the very port
+//     it was meant to exclude (fail open).
+//
+// compileFilterFrom records each unresolved token on the term (UnknownICMPTypes
+// / UnknownICMPCodes / UnknownPorts, mirroring UnknownActions); this gate is
+// what makes the refusal operator-visible at commit. The walk is deterministic
+// (filters sorted by name, terms in config order). On the tolerant load /
+// peer-sync path the caller downgrades the returned error to a warning (#1960
+// no-brick); the unresolved token is kept verbatim on the wire so the dataplane
+// fails CLOSED (constrained-but-unparseable) independently.
+func validateFilterMatchValuesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil {
+					continue
+				}
+				if len(term.UnknownICMPTypes) > 0 {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: unknown icmp-type %q "+
+							"(use a numeric value 0-255 or a Junos icmp-type name such as "+
+							"echo-request/echo-reply/destination-unreachable/time-exceeded)",
+						family, name, term.Name, term.UnknownICMPTypes[0])
+				}
+				if len(term.UnknownICMPCodes) > 0 {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: unknown icmp-code %q "+
+							"(use a numeric value 0-255)",
+						family, name, term.Name, term.UnknownICMPCodes[0])
+				}
+				if len(term.UnknownPorts) > 0 {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: unknown port %q "+
+							"(use a numeric port 1-65535, a `low-high` range, or a Junos "+
+							"service name such as ssh/http/https/domain)",
+						family, name, term.Name, term.UnknownPorts[0])
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // filterProtocolResolvable reports whether a `from protocol <token>` is
 // representable: it INLINE-mirrors the acceptance set of
 // appid.ProtocolNumber's ok==true result (the #2124/#2175 SSOT). pkg/config
