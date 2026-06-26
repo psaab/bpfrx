@@ -2,11 +2,144 @@ package userspace
 
 import (
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// ZoneHostInboundView is the per-zone host-inbound-traffic enforcement view for
+// the KERNEL-nftables primary path (#3070). Ordinary host-bound traffic to a
+// firewall interface IP / VRRP VIP (SSH, ping, OSPF/BGP to the box) is shunted
+// to the Linux kernel by the XDP shim before it ever reaches userspace-dp, so
+// the authoritative host-inbound enforcement for those packets must live in the
+// kernel `chain input` (mirroring the lo0-filter precedent). The userspace-dp
+// LocalDelivery check (forwarding/host_inbound.rs) remains the secondary path
+// for the narrow subset that DOES reach the XSK (DNAT-to-self, static-NAT to a
+// firewall service, embedded-ICMP, DNS edge cases).
+//
+// One view is produced per host-inbound-CONFIGURED zone, carrying the zone's
+// allowed Junos tokens plus its resolved firewall-local host addresses (bare
+// IPs, prefix stripped), split by family. The daemon maps the tokens to nft
+// matches and emits accept-the-listed / deny-the-rest rules scoped to those
+// addresses.
+type ZoneHostInboundView struct {
+	Zone           string
+	SystemServices []string
+	Protocols      []string
+	V4Addrs        []string // bare host IPv4 addresses (no prefix)
+	V6Addrs        []string // bare host IPv6 addresses (no prefix)
+}
+
+// hostInboundLifelineInterface reports whether the given logical interface name
+// is a management / cluster-control LIFELINE that must NEVER be subjected to a
+// host-inbound deny: fxp0 (out-of-band management), em0 (cluster control plane
+// / heartbeat), and the fabric links (fab*). Denying host-bound traffic on
+// these would strand management or break HA. fxp0 is DHCP-managed (no static
+// config address) and the canonical `control` zone is `system-services { all }`
+// anyway, so this is defense-in-depth on top of those facts. The base name
+// (before the unit suffix) is matched so "fxp0.0" / "em0.0" are caught too.
+func hostInboundLifelineInterface(name string) bool {
+	base := name
+	if i := strings.IndexByte(base, '.'); i >= 0 {
+		base = base[:i]
+	}
+	return base == "fxp0" || base == "em0" || strings.HasPrefix(base, "fab")
+}
+
+// BuildZoneHostInboundViews returns one ZoneHostInboundView per
+// host-inbound-CONFIGURED zone (#3070), resolving each zone's firewall-local
+// host addresses via the canonical interface-snapshot builder (the same
+// resolution that populates the dataplane), with management/cluster-control
+// lifeline interfaces (fxp0 / em0 / fab*) excluded from the address set. A zone
+// that declared NO host-inbound-traffic stanza is omitted entirely (admit-all
+// preserved — zero regression). A configured zone with no resolvable static
+// address (e.g. a DHCP-only interface) yields an empty address set; the daemon
+// emits no deny for it (cannot scope a deny without an address — fail-open is
+// the safe direction for a lifeline-adjacent feature).
+func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
+	if cfg == nil || len(cfg.Security.Zones) == 0 {
+		return nil
+	}
+	ifaceSnaps := buildInterfaceSnapshots(cfg)
+	// Gather per-zone host addresses from the resolved interface snapshots,
+	// skipping lifeline interfaces.
+	type addrSet struct {
+		v4    []string
+		v6    []string
+		seen4 map[string]bool
+		seen6 map[string]bool
+	}
+	byZone := make(map[string]*addrSet)
+	for _, snap := range ifaceSnaps {
+		if snap.Zone == "" || hostInboundLifelineInterface(snap.Name) {
+			continue
+		}
+		set := byZone[snap.Zone]
+		if set == nil {
+			set = &addrSet{seen4: map[string]bool{}, seen6: map[string]bool{}}
+			byZone[snap.Zone] = set
+		}
+		for _, a := range snap.Addresses {
+			host := hostIPFromCIDR(a.Address)
+			if host == "" {
+				continue
+			}
+			if strings.Contains(host, ":") {
+				if !set.seen6[host] {
+					set.seen6[host] = true
+					set.v6 = append(set.v6, host)
+				}
+			} else if !set.seen4[host] {
+				set.seen4[host] = true
+				set.v4 = append(set.v4, host)
+			}
+		}
+	}
+
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]ZoneHostInboundView, 0)
+	for _, name := range names {
+		zone := cfg.Security.Zones[name]
+		if zone == nil || zone.HostInboundTraffic == nil {
+			continue // no stanza → admit-all preserved, no deny emitted
+		}
+		set := byZone[name]
+		view := ZoneHostInboundView{
+			Zone:           name,
+			SystemServices: lowerTokens(zone.HostInboundTraffic.SystemServices),
+			Protocols:      lowerTokens(zone.HostInboundTraffic.Protocols),
+		}
+		if set != nil {
+			view.V4Addrs = set.v4
+			view.V6Addrs = set.v6
+		}
+		out = append(out, view)
+	}
+	return out
+}
+
+// hostIPFromCIDR returns the bare host IP of a "ip/prefix" string (or a bare
+// IP). Returns "" if unparseable.
+func hostIPFromCIDR(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if ip, _, err := net.ParseCIDR(s); err == nil && ip != nil {
+		return ip.String()
+	}
+	if ip := net.ParseIP(s); ip != nil {
+		return ip.String()
+	}
+	return ""
+}
 
 func buildZoneSnapshots(cfg *config.Config) []ZoneSnapshot {
 	if cfg == nil || len(cfg.Security.Zones) == 0 {

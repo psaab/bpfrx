@@ -240,6 +240,26 @@ never lock an operator out of a remote box it manages.
   an nft parse error that silently dropped the whole filter (#2069).
   `TestLo0FilterPayloadNftParses` parse-checks the real payload with
   `nft -c -f -` when nft is on PATH.
+- host-inbound-traffic (`security zones <z> host-inbound-traffic`) is the
+  PRIMARY kernel enforcement for host-bound traffic to a firewall interface IP
+  / VRRP VIP (SSH, ping, OSPF/BGP to the box — #3070). Such traffic is shunted
+  to the kernel by the XDP shim before reaching userspace-dp, so
+  `daemon_nft.go:applyHostInboundFilter` builds an `inet xpf_hostinbound`
+  table (same atomic flush idiom as lo0) via `buildHostInboundFilterPayload`,
+  consuming `userspace.BuildZoneHostInboundViews(cfg)`. Per
+  host-inbound-CONFIGURED zone it accepts the listed system-services/protocols
+  to that zone's addresses and DROPs the rest; the userspace-dp LocalDelivery
+  check (`forwarding/host_inbound.rs`) is the secondary path for the XSK-reaching
+  subset. **Lifeline safety:** a zone with NO stanza emits no deny (admit-all);
+  management/cluster-control interfaces (fxp0 / em0 / fab*) are excluded from
+  the address sets so a host-inbound deny can never strand management or break
+  HA; `ct state established,related` and IPv6 ND + v4/v6 PMTUD control messages
+  are accepted before any deny; a configured zone that resolves to zero
+  recognized matches fails OPEN (no deny) rather than locking the zone out.
+  Token→nft mapping (`hostInboundServiceMatches`/`hostInboundProtocolMatches`)
+  mirrors the Rust classifier and must stay in sync. Tests:
+  `host_inbound_nft_test.go` (accept-listed / deny-rest fail-on-revert,
+  no-stanza-no-deny, lifeline-never-denied, `all`-opens-zone).
 
 ## RPM + ip-monitoring wiring (#1827)
 

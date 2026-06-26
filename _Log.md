@@ -225,6 +225,44 @@
 - **File(s)**: pkg/config/compiler_validate_strict.go,
   pkg/config/compiler.go, pkg/config/zone_interface_membership_test.go,
   pkg/config/README.md, _Log.md
+## 2026-06-25 — #3070 (layer 2): kernel-nftables host-inbound enforcement
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added the PRIMARY kernel-nftables host-inbound enforcement after
+  hostile review found the userspace-dp check (layer 1) only catches the narrow
+  XSK-reaching subset: ordinary host-bound traffic to a firewall interface IP /
+  VRRP VIP (SSH/ping/OSPF/BGP to the box) is shunted to the Linux kernel by the
+  XDP shim (`is_local_destination`) before reaching userspace-dp, and the
+  kernel `chain input` was `policy accept` with only lo0 rules. Added
+  `applyHostInboundFilter` / `buildHostInboundFilterPayload` in
+  `pkg/daemon/daemon_nft.go` (table `inet xpf_hostinbound`, same atomic flush
+  idiom as lo0), consuming a new exported
+  `userspace.BuildZoneHostInboundViews(cfg)` that resolves each
+  host-inbound-CONFIGURED zone's firewall-local host addresses via the
+  canonical interface-snapshot builder. Per zone it accepts the listed
+  system-services/protocols to the zone addrs and DROPs the rest. Token→nft
+  mapping (`hostInboundServiceMatches`/`hostInboundProtocolMatches`) mirrors the
+  Rust classifier. Wired into the apply path next to `applyLo0Filter`. Kept the
+  userspace-dp check as the secondary path (unchanged).
+- **Lifeline safety**: no-stanza zone → no deny (admit-all); management /
+  cluster-control interfaces (fxp0 / em0 / fab*) excluded from address sets
+  (`hostInboundLifelineInterface`); `ct state established,related` + IPv6 ND +
+  v4/v6 PMTUD control accepted before any deny; a configured zone resolving to
+  zero recognized matches fails OPEN (no deny) rather than locking the zone out.
+- **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/host_inbound_nft_test.go (new), pkg/daemon/README.md,
+  pkg/dataplane/userspace/zones.go (BuildZoneHostInboundViews +
+  hostInboundLifelineInterface), pkg/dataplane/userspace/zones_host_inbound_test.go,
+  userspace-dp/src/afxdp/forwarding/README.md (two-layer doc)
+- **Validation**: `go build ./...` clean; `go test ./pkg/daemon/...
+  ./pkg/dataplane/... ./pkg/config/...` green; gofmt clean. New daemon tests:
+  `TestHostInboundFilterAcceptsListedDeniesRest` (fail-on-revert: neutering
+  `emitHostInboundZone` turns it RED — verified), `...NoStanzaNoDeny`,
+  `...LifelineNeverDenied`, `...AllOpensZoneNoDeny`; userspace
+  `TestBuildZoneHostInboundViews` + `TestHostInboundLifelineInterface`. Existing
+  Rust host-inbound tests still pass (userspace path unchanged). NOTE: live
+  SSH-refusal smoke deferred until the loss cluster forwarding bug #3091 clears.
+
 ## 2026-06-25 — #3070: enforce host-inbound-traffic on the userspace dataplane
 
 - **Timestamp**: 2026-06-25

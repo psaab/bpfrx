@@ -96,9 +96,26 @@ next-hops, preference 0). The wire specimen lives in
 
 `security zones <z> host-inbound-traffic { system-services ...; protocols
 ...; }` controls which host-bound services are admitted to a firewall-local
-interface IP (SSH, ping, routing protocols on the box itself). The set is
-parsed and modeled in Go (`config.ZoneConfig.HostInboundTraffic`) and now
-crosses the snapshot boundary on `ZoneSnapshot`
+interface IP (SSH, ping, routing protocols on the box itself).
+
+**Two enforcement layers — kernel is primary, this userspace check is the
+secondary edge-case path.** Ordinary host-bound traffic to an interface IP /
+VRRP VIP is shunted to the LINUX KERNEL by the XDP shim
+(`is_local_destination` → `cpumap_or_pass`/`PASS_TO_KERNEL` in
+`userspace-xdp/src/lib.rs`) BEFORE it reaches userspace-dp, so the
+authoritative host-inbound enforcement for those packets lives in the kernel
+`chain input` (table `inet xpf_hostinbound`, built in
+`pkg/daemon/daemon_nft.go` from `userspace.BuildZoneHostInboundViews`,
+mirroring the lo0-filter precedent). The userspace LocalDelivery check below
+covers only the subset that actually reaches the XSK — DNAT-to-self,
+static-NAT to a firewall service, embedded-ICMP, DNS edge cases. **Both layers
+share the same per-zone token set; keep the Go nft token→match mapping
+(`hostInboundServiceMatches`/`hostInboundProtocolMatches`) in sync with the
+Rust classifier here.**
+
+The set is parsed and modeled in Go
+(`config.ZoneConfig.HostInboundTraffic`) and crosses the snapshot boundary on
+`ZoneSnapshot`
 (`host_inbound_configured` + the raw `host_inbound_system_services` /
 `host_inbound_protocols` token slices — JSON keys byte-identical on both
 sides per #1961). `forwarding_build::zones::populate_zones` classifies the
