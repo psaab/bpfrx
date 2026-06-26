@@ -1972,6 +1972,192 @@ func TestEventStreamSequenceGapDetection(t *testing.T) {
 	}
 }
 
+// TestEventStreamSessionGapTriggersResyncWithholdsAck is the #2874 regression
+// for the Go consumer half: a sequence gap on a correctness-critical
+// session-sync frame must (a) trigger a full bulk re-export and (b) NOT advance
+// the cumulative ACK past the missing sequence (which would trim the helper's
+// replay window over the dropped delta → permanent standby session loss).
+//
+// Fail-on-revert: with the pre-fix behavior the gapped frame is dispatched and
+// markFrameApplied advances lastAppliedSeq to the gapped seq (ACKing past the
+// hole) and onFullResync is never called, so both assertions go red.
+func TestEventStreamSessionGapTriggersResyncWithholdsAck(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "test-events.sock")
+
+	es := NewEventStream(sockPath)
+	es.SetOnEvent(func(uint8, uint64, SessionDeltaInfo) bool { return true })
+	var resyncCalled atomic.Bool
+	es.SetOnFullResync(func() bool {
+		resyncCalled.Store(true)
+		return true
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	es.Start(ctx)
+	defer es.Close()
+
+	time.Sleep(50 * time.Millisecond)
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	dl := time.Now().Add(2 * time.Second)
+	for !es.IsConnected() {
+		if time.Now().After(dl) {
+			t.Fatal("not connected")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	payload := buildSessionOpenV4Payload(
+		6, 1000, 80,
+		[4]byte{10, 0, 1, 1}, [4]byte{10, 0, 2, 1},
+		[4]byte{}, [4]byte{},
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		[6]byte{}, [6]byte{}, [4]byte{},
+	)
+
+	// Send the first contiguous frame and wait for it to be applied + acked so
+	// the ACK watermark is established at seq 1.
+	if err := writeFrame(conn, EventTypeSessionOpen, 1, payload); err != nil {
+		t.Fatalf("write seq 1: %v", err)
+	}
+	dl = time.Now().Add(2 * time.Second)
+	for es.lastAppliedSeq.Load() != 1 {
+		if time.Now().After(dl) {
+			t.Fatalf("seq 1 not applied; lastApplied=%d", es.lastAppliedSeq.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Now skip to seq 5 — a gap on a session-sync frame.
+	if err := writeFrame(conn, EventTypeSessionOpen, 5, payload); err != nil {
+		t.Fatalf("write seq 5: %v", err)
+	}
+
+	dl = time.Now().Add(2 * time.Second)
+	for !resyncCalled.Load() {
+		if time.Now().After(dl) {
+			t.Fatal("onFullResync not called on session-sync gap")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if es.SessionSyncResyncs.Load() != 1 {
+		t.Fatalf("SessionSyncResyncs = %d, want 1", es.SessionSyncResyncs.Load())
+	}
+	// The cumulative ACK must NOT have advanced past the hole: lastAppliedSeq
+	// stays at the last contiguous sequence (1), never 5.
+	if applied := es.lastAppliedSeq.Load(); applied != 1 {
+		t.Fatalf("lastAppliedSeq advanced past hole: got %d, want 1", applied)
+	}
+	if acked := es.lastAckSeq.Load(); acked > 1 {
+		t.Fatalf("ACK advanced past hole: lastAckSeq=%d, want <=1", acked)
+	}
+}
+
+// TestEventStreamTelemetryGapDoesNotTriggerResync is the #2874 guard against a
+// thundering-resync regression: a gap on a TELEMETRY (RT_FLOW) frame must NOT
+// force a full resync. Telemetry is lossy by design; the frame is still
+// dispatched and the ACK advances normally.
+//
+// Fail-on-revert: if the gap-as-resync policy were (incorrectly) applied to
+// telemetry frames, onFullResync would fire and the gapped frame would not be
+// dispatched, failing both assertions.
+func TestEventStreamTelemetryGapDoesNotTriggerResync(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "test-events.sock")
+
+	es := NewEventStream(sockPath)
+	gotSeqs := make(chan uint64, 4)
+	es.SetOnRawDataplaneEvent(func(seq uint64, _ []byte) {
+		gotSeqs <- seq
+	})
+	var resyncCalled atomic.Bool
+	es.SetOnFullResync(func() bool {
+		resyncCalled.Store(true)
+		return true
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	es.Start(ctx)
+	defer es.Close()
+
+	time.Sleep(50 * time.Millisecond)
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	dl := time.Now().Add(2 * time.Second)
+	for !es.IsConnected() {
+		if time.Now().After(dl) {
+			t.Fatal("not connected")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	payload := buildDataplaneEventV4Payload(
+		6, 1111, 443,
+		[4]byte{10, 0, 1, 5}, [4]byte{172, 16, 80, 200},
+		[4]byte{172, 16, 80, 8},
+		40000,
+		1, 2,
+		0, 77,
+		0,
+	)
+
+	// Send a contiguous telemetry frame, then skip — a gap on a telemetry frame.
+	if err := writeFrame(conn, EventFrameTypePolicyDeny, 1, payload); err != nil {
+		t.Fatalf("write seq 1: %v", err)
+	}
+	if err := writeFrame(conn, EventFrameTypePolicyDeny, 5, payload); err != nil {
+		t.Fatalf("write seq 5: %v", err)
+	}
+
+	// Both frames must be dispatched despite the gap.
+	want := map[uint64]bool{1: false, 5: false}
+	dl = time.Now().Add(2 * time.Second)
+	for {
+		select {
+		case s := <-gotSeqs:
+			want[s] = true
+		case <-time.After(time.Until(dl)):
+		}
+		if want[1] && want[5] {
+			break
+		}
+		if time.Now().After(dl) {
+			t.Fatalf("telemetry frames not all dispatched: %v", want)
+		}
+	}
+
+	// A telemetry gap is counted but must NOT force a resync.
+	if es.SeqGaps.Load() != 1 {
+		t.Fatalf("SeqGaps = %d, want 1", es.SeqGaps.Load())
+	}
+	if resyncCalled.Load() {
+		t.Fatal("telemetry-frame gap must NOT trigger a full resync")
+	}
+	if es.SessionSyncResyncs.Load() != 0 {
+		t.Fatalf("SessionSyncResyncs = %d, want 0 for telemetry gap", es.SessionSyncResyncs.Load())
+	}
+	// The ACK advances normally past a telemetry gap.
+	dl = time.Now().Add(2 * time.Second)
+	for es.lastAppliedSeq.Load() != 5 {
+		if time.Now().After(dl) {
+			t.Fatalf("telemetry lastAppliedSeq = %d, want 5", es.lastAppliedSeq.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestEventSocketPathRemoved(t *testing.T) {
 	dir := t.TempDir()
 	sockPath := filepath.Join(dir, "test-events.sock")

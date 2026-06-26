@@ -19,6 +19,49 @@
   pkg/dataplane/userspace/snapshot_allowlist_test.go,
   userspace-dp/src/server/helpers.rs, userspace-dp/src/main_tests.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+## 2026-06-26 — #2900 VRRP: re-validate an armed preempt hold-timer
+
+- **Timestamp**: 2026-06-26
+- **Action**: An armed `preempt hold-time` countdown (#2850) was never
+  re-validated against state changes during the hold window. Two fixes:
+  (1) At expiry, `case <-preemptHoldTimer.C` now re-runs
+  `shouldPreemptObservedMaster()` before `becomeMaster()` — preempt must
+  still be enabled AND (when a live master is still present) our effective
+  priority must still be strictly > its last advert (RFC 5798 §6.4.2). If
+  invalid (preempt disabled or track-down demotion mid-hold) the node stays
+  BACKUP and re-arms `masterDownTimer`; a silent master reads stale and still
+  takes over. (2) `updateConfig` now signals the run loop via a new
+  `configUpdatedCh`; the BACKUP select tears any in-flight hold down
+  (`disarmPreemptHold`) and re-arms `masterDownTimer` so the next expiry
+  re-evaluates against the fresh config (changed hold-time arms the next
+  countdown with the new value). Added `preemptHoldArmed` (mu-guarded) +
+  `armPreemptHold`/`disarmPreemptHold` helpers; all timer Stop/Reset stays on
+  the run-loop goroutine. Added
+  `pkg/vrrp/instance_preempt_hold_revalidate_test.go` (6 tests). Fail-on-revert
+  verified: reverting the expiry gate reds the preempt-disabled +
+  priority-demoted expiry tests; reverting the updateConfig disarm reds the
+  config-update test. `go test -race ./pkg/vrrp/...` + `go test
+  ./pkg/daemon/...` green. Doc: config-schema.md #2900 note.
+- **File(s)**: pkg/vrrp/instance.go,
+  pkg/vrrp/instance_preempt_hold_revalidate_test.go,
+  docs/config-schema.md, _Log.md
+## 2026-06-26 — #2898 direct-mode GARP/NA burst follow-up loop gated on ownership
+
+- **Timestamp**: 2026-06-26
+- **Action**: `daemon.directSendGARPs` now captures `directAnnounceSeq[rgID]`
+  at burst start and threads a `directBurstStillValid(rgID, seq)` predicate
+  (true only while `directVIPOwned[rgID]` AND the sequence is unchanged) into
+  the gated cluster burst senders via new `directGARPBurstFn`/`directNABurstFn`
+  seams. An abdication or a newer announce now stops the inner 50ms follow-up
+  loop instead of re-poisoning neighbor caches for a VIP it no longer owns —
+  the direct-mode sibling of #2867/#2894. The first (immediate) frame stays
+  unconditional; only follow-ups are gated. Predicate holds the announce/VIP
+  locks only momentarily, never across a sleep. Added
+  `pkg/daemon/direct_garp_gate_test.go` (recorder-based abdicate-stops +
+  full-burst-while-owned + predicate transitions; fail-on-revert verified —
+  abdicate test goes RED to 18 frames against the ungated nil predicate).
+- **File(s)**: pkg/daemon/daemon_ha_vip.go,
+  pkg/daemon/direct_garp_gate_test.go, docs/bugs.md, _Log.md
 
 ## 2026-06-26 — #2940 VRRP strict-VIP: force GARP/NA on unsuppress edge while MASTER
 
@@ -21283,3 +21326,37 @@ top.
   `go test ./pkg/daemon/... ./pkg/config/...` green.
   **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/lo0_filter_test.go,
   docs/feature-gaps.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #2874 — fix CRITICAL HA session-sync data loss: route session
+  open/close deltas through the LOSSLESS producer + treat a session-sync seq
+  gap on the Go consumer as a hard sync break (resync, no ACK past the hole).
+  Rust producer: `flush_session_deltas` now uses `push_delta_lossless` (not the
+  lossy `push_delta` which burns a seq then silently drops on a full channel)
+  for the type-2 HA open/close delta; on a genuine enqueue failure (peer
+  disconnect / queue timeout) it returns `true` and the worker-loop macro
+  latches loss-of-sync via the new `SessionTable::set_delta_loss`, driving the
+  existing #2442 `take_delta_loss` full owner-RG re-export. It stops further
+  lossless pushes for the rest of the batch (snapshot supersedes them), bounding
+  the worst case to one `LOSSLESS_QUEUE_TIMEOUT` wait per drain cycle. RT_FLOW
+  telemetry frames stay best-effort. Go consumer: a seq gap on a session-sync
+  frame (open/update/close) now calls `handleSessionSyncGap` → triggers
+  `onFullResync` and returns from the read loop WITHOUT advancing
+  `lastAppliedSeq`, so the cumulative ACK never passes the hole and the
+  reconnect replays from the last contiguous ack. Telemetry-frame gaps stay
+  count-only (no resync — avoids thundering-resync). New counter
+  `EventStreamStatus.session_sync_resyncs`. Tests (all fail-on-revert proven
+  RED): Rust `flush_session_deltas_event_stream_drop_latches_out_of_sync`
+  (session_glue) + `session_delta_lossless_surfaces_failure_while_telemetry_drops`
+  (event_stream); Go `TestEventStreamSessionGapTriggersResyncWithholdsAck` +
+  `TestEventStreamTelemetryGapDoesNotTriggerResync`. cargo build/test +
+  go build ./... + go test ./pkg/dataplane/... green.
+  **File(s)**: userspace-dp/src/afxdp/session_delta.rs,
+  userspace-dp/src/session/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  userspace-dp/src/event_stream/README.md,
+  pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/eventstream_test.go,
+  pkg/dataplane/userspace/protocol.go

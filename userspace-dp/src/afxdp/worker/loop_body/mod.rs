@@ -139,7 +139,7 @@ pub(crate) fn worker_loop(
     macro_rules! flush_drained_session_deltas {
         ($deltas:expr) => {{
             let deltas_ref: &[SessionDelta] = $deltas;
-            match bindings.first() {
+            let event_stream_out_of_sync = match bindings.first() {
                 Some(binding) => {
                     let ident = binding.identity();
                     flush_session_deltas(
@@ -158,7 +158,7 @@ pub(crate) fn worker_loop(
                         &peer_worker_commands,
                         &event_stream,
                         forwarding.as_ref(),
-                    );
+                    )
                 }
                 None => {
                     let ident = BindingIdentity {
@@ -184,8 +184,16 @@ pub(crate) fn worker_loop(
                         &peer_worker_commands,
                         &event_stream,
                         forwarding.as_ref(),
-                    );
+                    )
                 }
+            };
+            if event_stream_out_of_sync {
+                // #2874: a correctness-critical HA session open/close delta
+                // could not be queued losslessly to the event-stream consumer.
+                // Latch loss-of-sync so the `take_delta_loss` check below
+                // re-exports the full owner-RG snapshot (the #2442 recovery
+                // path), instead of silently leaving the peer short a session.
+                sessions.set_delta_loss();
             }
         }};
     }

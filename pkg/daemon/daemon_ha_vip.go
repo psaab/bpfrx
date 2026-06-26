@@ -482,6 +482,45 @@ func (d *Daemon) scheduleDirectAnnounce(rgID int, reason string) {
 	}()
 }
 
+// directGARPBurstFn and directNABurstFn are seams over the cluster gated burst
+// senders so directSendGARPs' #2898 abdication gate is unit-testable without
+// raw-socket I/O. Production wires them to the cluster gated senders, which send
+// the first (immediate) frame unconditionally and gate only the 50ms follow-up
+// loop on the supplied BurstStillValid predicate.
+var (
+	directGARPBurstFn = cluster.SendGratuitousARPBurstGated
+	directNABurstFn   = cluster.SendGratuitousIPv6BurstGated
+)
+
+// directBurstStillValid returns a cluster.BurstStillValid predicate for the
+// direct-mode GARP/NA follow-up loops (#2898). seq is the directAnnounceSeq
+// captured at burst start. The predicate reports true only while this RG still
+// owns its VIPs (directVIPOwned) AND no newer announce has superseded this burst
+// (directAnnounceSeq unchanged). It takes the same locks as the rest of the
+// direct-mode announce machinery and holds them only momentarily — it is invoked
+// once per follow-up frame, between the loop's 50ms sleeps, never across a sleep.
+//
+// This is the direct-mode analogue of the VRRP garpEpoch/master-state gate from
+// #2867/#2894: an abdication (applyDirectVIPOwnership want=false →
+// cancelDirectAnnounce bumps the sequence and clears directVIPOwned) or a newer
+// announce (sequence bump) during the count*50ms burst window stops the
+// remaining follow-up frames, so an abdicated RG stops re-poisoning neighbor
+// caches for a VIP it no longer owns.
+func (d *Daemon) directBurstStillValid(rgID int, seq uint64) cluster.BurstStillValid {
+	return func() bool {
+		d.directAnnounceMu.Lock()
+		curSeq := d.directAnnounceSeq[rgID]
+		d.directAnnounceMu.Unlock()
+		if curSeq != seq {
+			return false
+		}
+		d.directVIPMu.Lock()
+		owned := d.directVIPOwned != nil && d.directVIPOwned[rgID]
+		d.directVIPMu.Unlock()
+		return owned
+	}
+}
+
 // directSendGARPs sends gratuitous ARP/IPv6 NA bursts for all VIPs in the
 // given RG. Reads per-RG GratuitousARPCount (default 3).
 func (d *Daemon) directSendGARPs(rgID int) {
@@ -489,6 +528,14 @@ func (d *Daemon) directSendGARPs(rgID int) {
 	if cfg == nil {
 		return
 	}
+	// #2898: capture the announce sequence at burst start and gate every 50ms
+	// follow-up frame on continued direct-mode ownership of this RG's VIPs. The
+	// first (immediate) frame in each cluster burst is sent unconditionally;
+	// only the follow-ups are gated (mirrors the VRRP path in #2867/#2894).
+	d.directAnnounceMu.Lock()
+	seq := d.directAnnounceSeq[rgID]
+	d.directAnnounceMu.Unlock()
+	stillValid := d.directBurstStillValid(rgID, seq)
 	// Read per-RG GARP count.
 	garpCount := 3
 	if cc := cfg.Chassis.Cluster; cc != nil {
@@ -507,7 +554,7 @@ func (d *Daemon) directSendGARPs(rgID int) {
 				continue
 			}
 			if ip.To4() != nil {
-				if err := cluster.SendGratuitousARPBurst(ifName, ip, garpCount); err != nil {
+				if err := directGARPBurstFn(ifName, ip, garpCount, stillValid); err != nil {
 					slog.Warn("directSendGARPs: GARP failed", "iface", ifName, "ip", ip, "err", err)
 				}
 				// Send ARP probe to gateway (.1) to update upstream ARP caches.
@@ -528,7 +575,7 @@ func (d *Daemon) directSendGARPs(rgID int) {
 					}
 				}
 			} else {
-				if err := cluster.SendGratuitousIPv6Burst(ifName, ip, garpCount); err != nil {
+				if err := directNABurstFn(ifName, ip, garpCount, stillValid); err != nil {
 					slog.Warn("directSendGARPs: IPv6 NA failed", "iface", ifName, "ip", ip, "err", err)
 				}
 			}
@@ -566,7 +613,7 @@ func (d *Daemon) directSendGARPs(rgID int) {
 			// Send on base interface.
 			if !seen[linuxName] {
 				seen[linuxName] = true
-				if err := cluster.SendGratuitousIPv6Burst(linuxName, routerLL, garpCount); err != nil {
+				if err := directNABurstFn(linuxName, routerLL, garpCount, stillValid); err != nil {
 					slog.Warn("directSendGARPs: router link-local NA failed",
 						"iface", linuxName, "ip", routerLL, "err", err)
 				}
@@ -577,7 +624,7 @@ func (d *Daemon) directSendGARPs(rgID int) {
 					subIface := fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
 					if !seen[subIface] {
 						seen[subIface] = true
-						if err := cluster.SendGratuitousIPv6Burst(subIface, routerLL, garpCount); err != nil {
+						if err := directNABurstFn(subIface, routerLL, garpCount, stillValid); err != nil {
 							slog.Warn("directSendGARPs: router link-local NA failed",
 								"iface", subIface, "ip", routerLL, "err", err)
 						}
