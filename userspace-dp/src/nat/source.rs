@@ -4,6 +4,17 @@
 // pipeline, and the public release/rollback entry points that
 // drive the allocator. Pool ownership / persistent lease state
 // machine lives in the sibling allocator.rs.
+//
+// #3111: pool-mode SNAT only allocates/translates an L4 port for
+// protocols that actually carry one (TCP/UDP, via
+// `crate::ip_proto::has_l4_ports`). A port-less protocol
+// (GRE/ESP/AH/OSPF/ICMP/...) gets IP-only translation — no pool port
+// is consumed and `rewrite_src_port` is left unset, so the packet
+// rewriters never overwrite its first two L4 bytes (GRE flags / ESP
+// SPI). `protocol == 0` is the synthetic "L4 tuple unknown" sentinel
+// used by the address-only `match_source_nat` callers; it keeps its
+// historical round-robin `try_next_port` behavior (never frame-written,
+// because the rewriters gate every L4 write on `has_l4_ports`).
 
 use super::allocator::{
     NS_PER_SEC, PersistentSourceKey, PoolAddressFamily, PortAllocator, TranslatedTuple,
@@ -618,10 +629,30 @@ pub(crate) fn match_source_nat_result_for_tuple(
         }
         // Pool-mode SNAT: pick address by source-IP hash when
         // address-persistent is enabled, otherwise round-robin by family.
-        let tupleless_lookup = protocol == 0 && src_port == 0 && dst_port == 0;
+        //
+        // #3111: only TCP/UDP carry a 16-bit L4 port at offset +0/+2 that
+        // pool-mode SNAT may translate via the flow-keyed allocator. A
+        // protocol with NO L4 port concept (GRE/ESP/AH/OSPF/ICMP/...) must
+        // NOT have a port allocated or written: pick a pool address and
+        // leave `rewrite_src_port` unset so the packet rewriter touches
+        // ONLY the IP address. Allocating a pseudo-port for these both
+        // leaks a pool port per flow AND (via the descriptor fast path)
+        // overwrites the first two L4 bytes, corrupting the tunnel header
+        // (ESP SPI / GRE flags). The previous gate special-cased only
+        // `protocol == 0`, so GRE/ESP/AH/OSPF fell through to
+        // `allocate_translation` and were corrupted.
+        //
+        // `protocol == 0` is the synthetic "L4 tuple unknown" sentinel used
+        // by the address-only `match_source_nat` callers (never a real
+        // packet). It keeps its historical behavior — a round-robin port
+        // via `try_next_port` with no flow-keyed mapping — because the
+        // packet rewriters gate every L4 write on `has_l4_ports`, so the
+        // port it returns can never be written to a frame.
+        let port_less = protocol != 0 && !crate::ip_proto::has_l4_ports(protocol);
+        let tuple_unknown = protocol == 0;
         match src_ip {
             IpAddr::V4(_) if !rule.pool_addresses_v4.is_empty() => {
-                if tupleless_lookup {
+                if port_less || tuple_unknown {
                     let addr_idx = rule.pool_allocator.address_index(
                         src_ip,
                         0,
@@ -629,18 +660,24 @@ pub(crate) fn match_source_nat_result_for_tuple(
                         rule.address_persistent,
                     );
                     let pool_addr = rule.pool_addresses_v4[addr_idx];
-                    let port = match rule.pool_allocator.try_next_port(addr_idx) {
-                        Ok(port) => port,
-                        Err(reason) => {
-                            return SourceNatLookup::Unavailable(SourceNatFailure::for_rule(
-                                rule, reason,
-                            ));
+                    // Port-less: IP-only translation. Tuple-unknown: a
+                    // round-robin port (legacy, never frame-written).
+                    let port = if tuple_unknown {
+                        match rule.pool_allocator.try_next_port(addr_idx) {
+                            Ok(port) => Some(port),
+                            Err(reason) => {
+                                return SourceNatLookup::Unavailable(
+                                    SourceNatFailure::for_rule(rule, reason),
+                                );
+                            }
                         }
+                    } else {
+                        None
                     };
                     return SourceNatLookup::Matched(NatDecision {
                         rewrite_src: Some(IpAddr::V4(pool_addr)),
                         rewrite_dst: None,
-                        rewrite_src_port: Some(port),
+                        rewrite_src_port: port,
                         rewrite_dst_port: None,
                         ..NatDecision::default()
                     });
@@ -672,7 +709,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
             }
             IpAddr::V6(_) if !rule.pool_addresses_v6.is_empty() => {
                 let v6_offset = rule.pool_addresses_v4.len();
-                if tupleless_lookup {
+                if port_less || tuple_unknown {
                     let addr_idx = rule.pool_allocator.address_index(
                         src_ip,
                         v6_offset,
@@ -681,18 +718,22 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     );
                     let v6_idx = addr_idx - v6_offset;
                     let pool_addr = rule.pool_addresses_v6[v6_idx];
-                    let port = match rule.pool_allocator.try_next_port(addr_idx) {
-                        Ok(port) => port,
-                        Err(reason) => {
-                            return SourceNatLookup::Unavailable(SourceNatFailure::for_rule(
-                                rule, reason,
-                            ));
+                    let port = if tuple_unknown {
+                        match rule.pool_allocator.try_next_port(addr_idx) {
+                            Ok(port) => Some(port),
+                            Err(reason) => {
+                                return SourceNatLookup::Unavailable(
+                                    SourceNatFailure::for_rule(rule, reason),
+                                );
+                            }
                         }
+                    } else {
+                        None
                     };
                     return SourceNatLookup::Matched(NatDecision {
                         rewrite_src: Some(IpAddr::V6(pool_addr)),
                         rewrite_dst: None,
-                        rewrite_src_port: Some(port),
+                        rewrite_src_port: port,
                         rewrite_dst_port: None,
                         ..NatDecision::default()
                     });
