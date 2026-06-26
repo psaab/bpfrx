@@ -169,6 +169,24 @@ pub(in crate::afxdp) fn cos_queue_v_min_continue(
         return true;
     }
     let transmit_rate_bytes = queue.transmit_rate_bytes();
+    // #2981: UNSHAPED shared-exact queues have no configured rate
+    // (`transmit_rate_bytes() == 0` ↔ "unshaped/full bucket", see
+    // types/cos.rs `transmit_rate_bytes`). The V_min lag throttle
+    // exists to keep SHAPED workers within a per-worker-rate × 1 ms
+    // drift budget of each other; with no rate the
+    // `compute_v_min_lag_threshold` budget collapses to the
+    // V_MIN_MIN_LAG_BYTES floor (24 KB ≈ <2 µs at 100 Gbps), so
+    // ordinary thread/NIC jitter trips the brake continuously and
+    // caps multi-core TX even though the operator configured no
+    // limit. There is no rate to be fair to, so skip the throttle
+    // entirely (same disposition as the `!shared_exact()` gate
+    // above) and let the drain continue. SHAPED queues
+    // (`transmit_rate_bytes > 0`) are unaffected — their threshold
+    // and gating decision are byte-identical to before.
+    if transmit_rate_bytes == 0 {
+        queue.v_min.consecutive_v_min_skips = 0;
+        return true;
+    }
     // Invariant: shared_exact queues are also flow_fair (set together
     // in promote_cos_queue_flow_fair) and therefore have flow_fair_state
     // allocated. Silent fall-through here would skip the V_min lag

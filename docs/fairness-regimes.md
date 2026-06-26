@@ -1017,7 +1017,25 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
   otherwise skip a mandatory/cadence peer snapshot and count a phantom pop
   in exactly the low-budget bursty regime this brake serves. The
   gate-throttle (hard-cap) path is unchanged; only the post-gate pre-pop
-  breaks now also skip the advance.
+  breaks now also skip the advance. UNSHAPED shared-exact queues are
+  EXCLUDED from this brake entirely (#2981): `cos_queue_v_min_continue`
+  early-returns continue for `transmit_rate_bytes == 0` queues
+  ("unshaped/full bucket"), the same disposition as the `!shared_exact()`
+  gate. There is no configured rate for an unshaped queue to be fair to,
+  so the V_min lag throttle must not apply: were it reached, the
+  threshold (`per_worker_rate × 1 ms`, `per_worker_rate == 0`) would
+  collapse to the 24 KB floor (~16 MTU, < 2 µs at 100 Gbps) and fire on
+  ordinary thread/NIC jitter. This is a DEFENSIVE GUARD — in the current
+  build the state is unreachable: a queue is only `shared_exact` when
+  `queue_uses_shared_exact_service` admits it, which requires
+  `transmit_rate_bytes >= COS_SHARED_EXACT_MIN_RATE_BYTES` (2.5 Gbps),
+  and the pre-existing `!shared_exact()` gate already excludes every
+  rate-0 queue. The early-return hardens the invariant "unshaped ⇒ not
+  V_min-throttled" against any future change that admits a rate-0
+  shared-exact queue (mirrors the #917 Codex-Q8 defensive gate); it is
+  NOT a fix for an observed runaway throttle. SHAPED queues
+  (`transmit_rate_bytes > 0`) are byte-identical — threshold and gating
+  decision unchanged.
 - **`xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total{binding_slot=..., queue_id=..., worker_id=..., iface=...}`**
   counter (#1831): V_MIN_CONSECUTIVE_SKIP_HARD_CAP escape-hatch
   activations — after that many back-to-back throttle decisions the
