@@ -1,3 +1,109 @@
+## 2026-06-26 — #3225 host-inbound: address-family-aware service/protocol matches
+
+- **Timestamp**: 2026-06-26
+- **Action**: Made host-inbound `system-services` / `protocols` matches
+  ADDRESS-FAMILY AWARE on BOTH enforcement layers (nft kernel mirror + Rust
+  AF_XDP classifier), closing the wrong-family admit gap #3225. Family-specific
+  tokens (dhcp/bootp=v4, dhcpv6=v6, rip=v4, ripng=v6, ospf=OSPFv2-v4,
+  ospf3=OSPFv3-v6, igmp=v4) now emit/admit ONLY on their own family; dual-family
+  services (ssh/https/ping/dns/bgp/...) admit on both as before. Added the
+  cross-layer SSOT `config.HostInboundServiceFamily` /
+  `config.HostInboundProtocolFamily` (`pkg/config/host_inbound_tokens.go`); the
+  nft builder gates `hostInboundServiceMatches` / `hostInboundProtocolMatches`
+  on it directly and `ospf3` was added to `hostInboundRoutingProtocolTokens` so
+  `protocols all` opens proto 89 on each family. Rust `ZoneHostInbound` gained
+  family-scoped sets (`udp_ports_v4/v6`, `ip_protocols_v4/v6`); `admits` checks
+  the dual set OR the packet-family set; the classifier mirrors the same
+  families and adds `ospf3` to `ROUTING_PROTOCOL_TOKENS`. Preserves #3070
+  ESP/AH/ND exemptions, #3171 ICMP-error, #3199 protocols-all, #3200 token
+  validation. Parity test loosened to "recognized in EITHER family" (ospf3/
+  ripng are v6-only → nil for ip). New tests: Rust
+  `build_forwarding_state_host_inbound_is_address_family_aware` (v4-only admits
+  v4/drops v6, v6-only admits v6/drops v4, ssh both); Go
+  `TestHostInboundFilterFamilyAware` (v4-only emitted under ip only, v6-only
+  under ip6 only, ssh both). Fail-on-revert PROVEN: family-neutral classifier →
+  Rust "dhcp must NOT admit udp/67 on IPv6" RED + Go "wrong-family match" RED;
+  dual-service ssh stays GREEN; restored byte-identical. cargo build --release +
+  cargo test host_inbound green; go build ./... + go test ./pkg/daemon/...
+  ./pkg/config/... green.
+- **File(s)**: pkg/config/host_inbound_tokens.go, pkg/daemon/daemon_nft.go,
+  pkg/daemon/host_inbound_parity_test.go, pkg/daemon/host_inbound_nft_test.go,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md
+## 2026-06-26 — #3232 flexible-match-range: implement match-start layer-4, reject payload
+
+- **Timestamp**: 2026-06-26
+- **Action**: `flexible-match-range match-start <X>` stored `MatchStart` but the
+  wire builder + Rust matcher (#3077) ignored it and were ALWAYS L3-relative,
+  so `match-start layer-4`/`payload` committed clean and silently matched the
+  WRONG offset (treated as L3 — a security evasion). Fix (chosen path:
+  IMPLEMENT layer-4 since `meta.l4_offset` is cleanly available; FAIL-CLOSED
+  reject payload/unknown since payload start needs the L4 header length, not
+  cleanly available to the matcher):
+    - Go compiler (`compiler_firewall.go`): allowlist `match-start` to
+      `layer-3`/`layer-4`; any other value (incl. `payload`) is recorded on
+      `term.UnknownFlexMatch` → `validateFilterFlexMatchStrict` fails the commit
+      (downgraded to a warning on the tolerant peer-sync path, #1960).
+    - Wire (`protocol.go` + `filters.go`): added `FlexMatchSnapshot.MatchStart`
+      (json `match_start,omitempty`). layer-3 maps to "" so the wire stays
+      byte-identical for every pre-#3232 term; only `layer-4` emits a value.
+    - Rust (`security.rs`, `compiler.rs`, `filter/mod.rs`, `engine/matching.rs`,
+      `afxdp/frame/inspect.rs`): new `FlexMatchStart` enum
+      (Layer3/Layer4/Unsupported, serde `match_start` default + skip-if-empty,
+      so the protocol_wire_v1 fixture is unchanged). `TermMatchExtra` gains
+      `flex_l4` (the transport-header slice at `meta.l4_offset`, None on a
+      non-first fragment / meta-only / deferred path). `flex_matches` selects
+      the base slice by `flex_match_start`; Unsupported fails closed.
+  - **Fail-on-revert proven**: Rust `flex_match_layer4_matches_at_l4_offset`
+    goes RED if the matcher ignores `flex_match_start` (reads L3); Go
+    `TestFlexibleMatchRangeRejectsPayloadStart` goes RED if the allowlist is
+    removed (payload compiles clean).
+  - **File(s)**: pkg/config/compiler_firewall.go,
+    pkg/config/compiler_validate_strict.go,
+    pkg/config/parser_security_test.go,
+    pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/filters.go,
+    pkg/dataplane/userspace/filters_flex_match_3077_test.go,
+    userspace-dp/src/protocol/security.rs, userspace-dp/src/filter/compiler.rs,
+    userspace-dp/src/filter/mod.rs, userspace-dp/src/filter/engine/matching.rs,
+    userspace-dp/src/afxdp/frame/inspect.rs, userspace-dp/src/filter/tests.rs,
+    userspace-dp/src/filter/README.md, docs/feature-gaps.md, _Log.md
+## 2026-06-26 — #3224 host-inbound DHCP scope: NON-REPRODUCING (doc correction + real regression test)
+
+- **Timestamp**: 2026-06-26
+- **Action**: Reworked after hostile review found the prior "SECURITY
+  fail-open fix" was byte-identical to master in production and its test
+  used an injected fake `dynAddrs` provider that never exercised the
+  production address source. VERIFIED the #3224 premise does NOT
+  reproduce: master's `BuildZoneHostInboundViews` already resolves each
+  zone's addresses through `buildInterfaceSnapshots` ->
+  `buildLinkSnapshot` -> `buildInterfaceAddressSnapshots` ->
+  `netlink.AddrList(FAMILY_ALL)`, which enumerates EVERY kernel address
+  with NO scope/flag/dynamic filtering — so DHCP/DHCPv6-learned addresses
+  were ALREADY captured and scoped by the deny. Reverted the no-op 3-source
+  refactor (and the injected-seam that enabled the misleading test) so
+  `BuildZoneHostInboundViews` code is byte-identical to master. CORRECTED
+  master's false doc comment (which claimed "a DHCP-only interface yields
+  an empty address set -> fail-open") in zones.go, daemon_nft.go, and
+  pkg/daemon/README.md to state that DHCP/DHCPv6 addresses ARE captured via
+  the live snapshot, plus the lease-change refresh path. REPLACED the fake
+  test with `TestBuildZoneHostInboundViewsScopesKernelLearnedAddr`, which
+  drives the REAL production path (`BuildZoneHostInboundViews` ->
+  `buildInterfaceSnapshots` -> `AddrList`) using the loopback interface as
+  a kernel address absent from the static config (modeling DHCP), with no
+  fake provider and no root. It asserts the kernel-learned address IS
+  scoped — a fail-on-revert guard against a future filter regression.
+- **File(s)**: pkg/dataplane/userspace/zones.go (comment only — code
+  reverted to master), pkg/dataplane/userspace/zones_host_inbound_test.go,
+  pkg/daemon/daemon_nft.go (comment), pkg/daemon/README.md
+- **Validation**: `go build ./...`; `go test ./pkg/dataplane/...
+  ./pkg/daemon/...` green. Verified empirically: the new real-path test
+  PASSES on master-equivalent code (proving master already scopes a
+  config-absent kernel address); a destructive probe that drops the live
+  snapshot loop turns it RED (untrust loses 127.0.0.1/::1) while the new
+  test isolates the dynamic-address property — restored byte-identical.
+
 ## 2026-06-26 — #3229 dest-NAT: `match destination-address-name` (address-book reference)
 
 - **Timestamp**: 2026-06-26
@@ -21118,3 +21224,25 @@ top.
   userspace-dp/src/server/helpers.rs (+ mechanical SessionMetadata field
   across afxdp/event_stream/policy test literals),
   userspace-dp/src/session/README.md, docs/userspace-dataplane-gaps.md
+  **Action**: #3231 — fix three fail-OPEN nft lowering bugs in the lo0
+  control-plane firewall filter (`nftRuleFromTerm`). nft loads the lo0 table
+  atomically, so any one invalid line rejected the whole ruleset and left the
+  host filter with no rules. (1) TCP-flags AND-semantics (071-06): replaced the
+  raw comma-join (`tcp flags syn,&,!ack`, invalid; and the disjunctive
+  `tcp flags syn,ack`) with the canonical masked-equality form
+  `tcp flags & (mentioned-mask) == required`, reusing the commit-validated
+  `config.ParseTCPFlagsExpression` for required/forbidden masks (new helpers
+  `nftTCPFlagsMatch` / `nftTCPFlagNames`). (2) port-except (071-08):
+  `source-port-except` / `destination-port-except` were dropped; now emit
+  `th sport != …` / `th dport != …` (single + nft negated set). (3) IPv6
+  is-fragment (071-09): `ip frag-off …` was emitted unconditionally even in the
+  inet6 chain (syntax error → fail-open); now family-conditioned —
+  `ip frag-off & 0x1fff != 0` for ip, `exthdr frag exists` for ip6. Did NOT
+  touch the atomic-load fail-open path itself (071-07, /research design
+  question). Extended `lo0_filter_test.go` (TCPFlags single/list/negated,
+  PortExcept src+dst single+set, Fragment ip4+ip6); each proven fail-on-revert
+  RED. Generated forms syntax-validated with `nft -c` (parse OK; only the
+  expected post-parse netlink/permission error). `go build ./...` +
+  `go test ./pkg/daemon/... ./pkg/config/...` green.
+  **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/lo0_filter_test.go,
+  docs/feature-gaps.md

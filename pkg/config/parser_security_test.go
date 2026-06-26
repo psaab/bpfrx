@@ -5064,6 +5064,72 @@ func TestFlexibleMatchRangeLenientDowngradesToWarning(t *testing.T) {
 	}
 }
 
+// compileFlexMatchStart builds a flexible-match-range term with an explicit
+// match-start and a complete byte-offset/bit-length/range so only the
+// match-start under test can drive the result, then runs the real strict commit
+// path (#3232).
+func compileFlexMatchStart(t *testing.T, start string) (*Config, error) {
+	t.Helper()
+	base := "set firewall family inet filter f term t1 from flexible-match-range range r1 "
+	lines := []string{
+		base + "match-start " + start,
+		base + "byte-offset 0",
+		base + "bit-length 16",
+		base + "range 0x0800/0xffff",
+		"set firewall family inet filter f term t1 then discard",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		cmd, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		tree.SetPath(cmd)
+	}
+	return CompileConfig(tree)
+}
+
+// TestFlexibleMatchRangeLayer4Compiles is the #3232 implement-path guard: a
+// `match-start layer-4` term compiles and carries MatchStart "layer-4" through
+// to the typed config (and thence to the wire builder, which the dataplane
+// matcher reads from the L4 base). layer-3 is the byte-identical default.
+func TestFlexibleMatchRangeLayer4Compiles(t *testing.T) {
+	for _, start := range []string{"layer-3", "layer-4"} {
+		cfg, err := compileFlexMatchStart(t, start)
+		if err != nil {
+			t.Fatalf("match-start %s: compile error: %v", start, err)
+		}
+		fm := cfg.Firewall.FiltersInet["f"].Terms[0].FlexMatch
+		if fm == nil {
+			t.Fatalf("match-start %s: FlexMatch is nil", start)
+		}
+		if fm.MatchStart != start {
+			t.Errorf("match-start %s: FlexMatch.MatchStart = %q, want %q",
+				start, fm.MatchStart, start)
+		}
+	}
+}
+
+// TestFlexibleMatchRangeRejectsPayloadStart is the #3232 fail-closed guard:
+// `match-start payload` (and any other non-layer-3/layer-4 value) is valid Junos
+// but NOT implemented in the dataplane matcher. Before #3232 it committed clean
+// and was silently evaluated at the L3 base — a wrong-offset / security-evasion
+// match. It must now FAIL the commit.
+//
+// FAIL-ON-REVERT: remove the match-start allowlist in compileFilterFrom (store
+// any value verbatim, as before) and this test FAILS — payload compiles clean.
+func TestFlexibleMatchRangeRejectsPayloadStart(t *testing.T) {
+	for _, start := range []string{"payload", "bogus"} {
+		_, err := compileFlexMatchStart(t, start)
+		if err == nil {
+			t.Fatalf("match-start %s compiled cleanly; want a strict commit error", start)
+		}
+		if !strings.Contains(err.Error(), "match-start") {
+			t.Errorf("match-start %s: error %q does not mention match-start", start, err)
+		}
+	}
+}
+
 func TestScreenSessionLimitCompilation(t *testing.T) {
 	tree := &ConfigTree{}
 	setCommands := []string{"set security screen ids-option wan-screen limit-session source-ip-based 100", "set security screen ids-option wan-screen limit-session destination-ip-based 200", "set security screen ids-option wan-screen tcp land"}

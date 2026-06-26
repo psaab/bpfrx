@@ -68,14 +68,17 @@ fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
             hi.tcp_ports.insert(53);
         }
         // dhcp server listens on udp/67; client replies arrive on udp/68. Admit
-        // both so a `dhcp-local-server` on the zone interface works.
+        // both so a `dhcp-local-server` on the zone interface works. #3225:
+        // DHCPv4 is IPv4-only — these ports must NOT open on the v6 path (the
+        // family map config.HostInboundServiceFamily is the cross-layer SSOT).
         "dhcp" | "bootp" => {
-            hi.udp_ports.insert(67);
-            hi.udp_ports.insert(68);
+            hi.udp_ports_v4.insert(67);
+            hi.udp_ports_v4.insert(68);
         }
+        // #3225: DHCPv6 is IPv6-only — these ports stay off the v4 path.
         "dhcpv6" => {
-            hi.udp_ports.insert(546);
-            hi.udp_ports.insert(547);
+            hi.udp_ports_v6.insert(546);
+            hi.udp_ports_v6.insert(547);
         }
         "ntp" => {
             hi.udp_ports.insert(123);
@@ -157,7 +160,11 @@ fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
 /// `protocols all` zone from opening SSH/HTTPS/SNMP/NETCONF on the box. One
 /// entry per unique signature (`ospf3` aliases `ospf`); the caller dedups.
 const ROUTING_PROTOCOL_TOKENS: &[&str] = &[
+    // #3225: ospf (OSPFv2, IPv4) and ospf3 (OSPFv3, IPv6) are BOTH listed so
+    // `protocols all` admits proto 89 on each family; classify_protocol scopes
+    // each to its own family.
     "ospf",
+    "ospf3",
     "bgp",
     "rip",
     "ripng",
@@ -186,20 +193,29 @@ fn classify_protocol(token: &str, hi: &mut ZoneHostInbound) {
                 classify_protocol(tok, hi);
             }
         }
-        "ospf" | "ospf3" => {
-            hi.ip_protocols.insert(89);
+        // #3225: OSPFv2 (ospf) is IPv4-only, OSPFv3 (ospf3) is IPv6-only — both
+        // ride IP protocol 89 but on different families (SSOT:
+        // config.HostInboundProtocolFamily).
+        "ospf" => {
+            hi.ip_protocols_v4.insert(89);
+        }
+        "ospf3" => {
+            hi.ip_protocols_v6.insert(89);
         }
         "bgp" => {
             hi.tcp_ports.insert(179);
         }
+        // #3225: RIPv2 is IPv4-only, RIPng is IPv6-only.
         "rip" => {
-            hi.udp_ports.insert(520);
+            hi.udp_ports_v4.insert(520);
         }
         "ripng" => {
-            hi.udp_ports.insert(521);
+            hi.udp_ports_v6.insert(521);
         }
+        // #3225: IGMP is IPv4 group membership; the IPv6 equivalent is MLD over
+        // ICMPv6 (the always-accepted ND set), so igmp is IPv4-only here.
         "igmp" => {
-            hi.ip_protocols.insert(2);
+            hi.ip_protocols_v4.insert(2);
         }
         "pim" => {
             hi.ip_protocols.insert(103);

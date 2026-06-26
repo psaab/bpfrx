@@ -470,6 +470,18 @@ pub(in crate::afxdp) fn term_match_extra_from_frame(
         // shorter than l3_offset, in which case the matcher's bounds check fails
         // the flex term closed.
         flex_l3: l3_packet,
+        // #3232: the L4 header slice (match-start layer-4) backs a layer-4
+        // flexible-match-range. The byte offset is relative to the start of the
+        // transport header (`meta.l4_offset`). A NON-FIRST fragment carries no
+        // L4 header there (its post-IP bytes are payload), so it gets None and a
+        // layer-4 flex term fails closed. `frame.get` is None if the frame is
+        // shorter than l4_offset, in which case the matcher's bounds check fails
+        // closed too.
+        flex_l4: if non_first_fragment {
+            None
+        } else {
+            frame.get(meta.l4_offset as usize..)
+        },
     }
 }
 
@@ -522,6 +534,14 @@ pub(in crate::afxdp) fn term_match_extra_from_frame_fwd(
         // #3077: L3 header slice for flexible-match-range (see the input-filter
         // builder above). Same fail-closed-on-too-short bounds check applies.
         flex_l3: l3_packet,
+        // #3232: L4 header slice for a layer-4 flexible-match-range (see the
+        // input-filter builder above). None on a non-first fragment so a
+        // layer-4 flex term fails closed.
+        flex_l4: if non_first_fragment {
+            None
+        } else {
+            frame.get(meta.l4_offset as usize..)
+        },
     }
 }
 
@@ -574,6 +594,9 @@ pub(in crate::afxdp) fn term_match_extra_from_meta(
         // bytes to read. A flex-constrained term fails closed here (the
         // flow-cache declines for such filters, so this path never carries one).
         flex_l3: None,
+        // #3232: likewise no L4 bytes on the meta-only path — a layer-4 flex
+        // term fails closed.
+        flex_l4: None,
     }
 }
 

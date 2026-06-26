@@ -37,12 +37,15 @@ func TestHostInboundNftMatchesKnownTokens(t *testing.T) {
 		}
 	}
 
-	// Every known protocol must be recognized by the nft builder. Family "ip"
-	// is exercised because a few routing protocols (igmp, router-discovery) map
-	// to the always-accepted ND set in v6 and intentionally return nil for ip6.
+	// Every known protocol must be recognized by the nft builder in AT LEAST
+	// one family. Some routing protocols are family-specific (#3225): ospf3 /
+	// ripng admit only on IPv6 (return nil for ip), ospf / rip / igmp only on
+	// IPv4 (nil for ip6); igmp/router-discovery v6 map to the always-accepted ND
+	// set. So a token recognized by the SSOT must classify in ip OR ip6.
 	for tok := range config.KnownHostInboundProtocols {
-		if len(hostInboundProtocolMatches(tok, "ip")) == 0 {
-			t.Errorf("known protocol %q produces no nft match for family ip — "+
+		if len(hostInboundProtocolMatches(tok, "ip")) == 0 &&
+			len(hostInboundProtocolMatches(tok, "ip6")) == 0 {
+			t.Errorf("known protocol %q produces no nft match in either family — "+
 				"nft builder and config SSOT diverge", tok)
 		}
 	}

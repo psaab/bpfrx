@@ -129,10 +129,14 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) {
 }
 
 // hostInboundHasEnforceableView reports whether at least one view carries a
-// resolvable address. A configured zone with no address (e.g. DHCP-only) cannot
-// be scoped to a deny, so it produces nothing; if NO zone is enforceable the
-// whole table is removed (fail-open is the safe direction for this
-// lifeline-adjacent feature).
+// resolvable address. Static, VRRP-VIP and DHCP/DHCPv6-learned addresses all
+// count: the live interface snapshot enumerates every kernel address via
+// AddrList(FAMILY_ALL), so a DHCP-only interface with a live lease IS scoped
+// (#3224 — see BuildZoneHostInboundViews). The only no-address case left is a
+// configured zone whose interfaces have no static address AND no live address
+// yet (e.g. a DHCP WAN before its first lease). That zone produces nothing; if
+// NO zone is enforceable the whole table is removed (it self-heals once an
+// address appears, because the lease-change / commit paths re-render).
 func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool {
 	for _, v := range views {
 		if len(v.V4Addrs) > 0 || len(v.V6Addrs) > 0 {
@@ -308,6 +312,14 @@ func hostInboundMatchSet(v dpuserspace.ZoneHostInboundView, family string) []str
 // fragments for the given family. Returns nil for `all` / `any-service`
 // (handled by hostInboundAllowsAll) and for unrecognised tokens (fail-closed).
 func hostInboundServiceMatches(token, family string) []string {
+	// #3225: family-specific services (dhcp=v4, dhcpv6=v6) emit ONLY on their
+	// own family. emitHostInboundZone calls this once per family with the same
+	// token set, so a family-mismatched token must contribute no match (it would
+	// otherwise be emitted under the wrong `ip`/`ip6 daddr`). The family map is
+	// the SSOT shared with the Rust classifier (config.HostInboundServiceFamily).
+	if fam, ok := config.HostInboundServiceFamily[token]; ok && fam != family {
+		return nil
+	}
 	icmp := "icmp"
 	if family == "ip6" {
 		icmp = "icmpv6"
@@ -383,8 +395,12 @@ func hostInboundServiceMatches(token, family string) []string {
 // `protocols all` expands to (#3199). One entry per unique signature
 // (`ospf3` aliases `ospf`); hostInboundMatchSet dedups. Mirrors the Rust
 // ROUTING_PROTOCOL_TOKENS in userspace-dp/src/afxdp/forwarding/host_inbound.rs.
+// ospf3 is listed alongside ospf (#3225): both ride IP protocol 89 but on
+// different families, so `protocols all` must admit proto 89 on BOTH IPv4
+// (ospf) and IPv6 (ospf3). hostInboundProtocolMatches family-gates each, so the
+// expansion emits proto 89 once per family without a wrong-family match.
 var hostInboundRoutingProtocolTokens = []string{
-	"ospf", "bgp", "rip", "ripng", "igmp", "pim",
+	"ospf", "ospf3", "bgp", "rip", "ripng", "igmp", "pim",
 	"vrrp", "bfd", "ldp", "msdp", "nhrp", "router-discovery",
 }
 
@@ -393,6 +409,14 @@ var hostInboundRoutingProtocolTokens = []string{
 // (#3199) — NOT a blanket accept (that would open every system-service). Returns
 // nil for unrecognised tokens (fail-closed).
 func hostInboundProtocolMatches(token, family string) []string {
+	// #3225: family-specific routing protocols (ospf=v4 / ospf3=v6, rip=v4 /
+	// ripng=v6, igmp=v4) emit ONLY on their own family — the SSOT is
+	// config.HostInboundProtocolFamily, shared with the Rust classifier. `all`
+	// is dual-family (absent from the map) and recurses into the per-token set,
+	// each of which family-gates itself here.
+	if fam, ok := config.HostInboundProtocolFamily[token]; ok && fam != family {
+		return nil
+	}
 	switch token {
 	case "all":
 		// `protocols all` = every routing protocol, scoped to protocol traffic.
@@ -402,6 +426,8 @@ func hostInboundProtocolMatches(token, family string) []string {
 		}
 		return out
 	case "ospf", "ospf3":
+		// OSPFv2 (ospf, IPv4) and OSPFv3 (ospf3, IPv6) both ride IP protocol 89;
+		// the family gate above scopes each to its own family.
 		return []string{"meta l4proto 89"}
 	case "bgp":
 		return []string{"tcp dport 179"}
@@ -410,9 +436,8 @@ func hostInboundProtocolMatches(token, family string) []string {
 	case "ripng":
 		return []string{"udp dport 521"}
 	case "igmp":
-		if family == "ip6" {
-			return nil // v6 multicast group membership is MLD (icmpv6), via the ND accept
-		}
+		// v6 multicast group membership is MLD (icmpv6), reached via the ND
+		// accept; the family gate restricts igmp to IPv4.
 		return []string{"meta l4proto 2"}
 	case "pim":
 		return []string{"meta l4proto 103"}
@@ -520,6 +545,23 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		parts = append(parts, "th dport { "+strings.Join(term.DestinationPorts, ", ")+" }")
 	}
 
+	// Negated (except) port matching (#3231). `source-port-except` /
+	// `destination-port-except` (parsed since #2622/#3205) were dropped here,
+	// so a `discard` term blocked the ports it should have exempted and an
+	// accept-all-except-SSH term silently permitted SSH — a control-plane
+	// bypass on the lo0 input filter. Emit the nft negated form mirroring the
+	// positive port emission above (`th sport != ...` / `th dport != ...`).
+	if len(term.SourcePortsExcept) == 1 {
+		parts = append(parts, "th sport != "+term.SourcePortsExcept[0])
+	} else if len(term.SourcePortsExcept) > 1 {
+		parts = append(parts, "th sport != { "+strings.Join(term.SourcePortsExcept, ", ")+" }")
+	}
+	if len(term.DestPortsExcept) == 1 {
+		parts = append(parts, "th dport != "+term.DestPortsExcept[0])
+	} else if len(term.DestPortsExcept) > 1 {
+		parts = append(parts, "th dport != { "+strings.Join(term.DestPortsExcept, ", ")+" }")
+	}
+
 	// DSCP / traffic-class matching (#2545: multi-value).
 	if len(term.DSCPs) > 0 {
 		dscpKey := "ip dscp "
@@ -549,14 +591,42 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		}
 	}
 
-	// TCP flags matching
+	// TCP flags matching (#3231). The Junos `tcp-flags` value is an
+	// AND-conjunction with optional negation (`syn & !ack` = SYN required,
+	// ACK forbidden). The pre-fix code joined the RAW tokens with commas
+	// (`tcp flags syn,&,!ack`), which is invalid nft — and because nft loads
+	// the lo0 ruleset atomically, that single syntax error rejected the WHOLE
+	// ruleset and left the host control-plane filter fail-OPEN. Even a plain
+	// list (`tcp flags syn,ack`) is wrong: nft reads a comma list as a
+	// disjunctive set, not the Junos conjunction, and forbidden flags are not
+	// representable that way at all. Reuse the commit-validated parser to get
+	// the required/forbidden masks and emit the canonical
+	// `tcp flags & (mentioned-mask) == required` form. A parse error is
+	// unreachable for a committed config (compileFirewall rejects
+	// unrepresentable expressions), but if one slips through we drop the
+	// constraint with a warning rather than emit garbage that fails the whole
+	// ruleset open — mirroring the userspace lowering in
+	// pkg/dataplane/userspace/filters.go.
 	if len(term.TCPFlags) > 0 {
-		parts = append(parts, "tcp flags "+strings.Join(term.TCPFlags, ","))
+		if required, forbidden, ok, err := config.ParseTCPFlagsExpression(term.TCPFlags); err != nil {
+			slog.Warn("dropping unrepresentable tcp-flags expression from lo0 filter term",
+				"term", term.Name, "tcp_flags", term.TCPFlags, "error", err)
+		} else if ok {
+			parts = append(parts, nftTCPFlagsMatch(required, forbidden))
+		}
 	}
 
-	// IP fragment matching
+	// IP fragment matching (#3231). `ip frag-off` is an IPv4-only header field;
+	// emitting it in the inet6 chain is an nft syntax error that (atomic load)
+	// rejected the whole ruleset and failed the lo0 filter open. Family-condition
+	// the match: the IPv4 fragment-offset test for ip, and the IPv6 fragment
+	// extension-header existence test for ip6.
 	if term.IsFragment {
-		parts = append(parts, "ip frag-off & 0x1fff != 0")
+		if family == "ip6" {
+			parts = append(parts, "exthdr frag exists")
+		} else {
+			parts = append(parts, "ip frag-off & 0x1fff != 0")
+		}
 	}
 
 	// Action: discard → drop (silent), reject → reject (ICMP unreachable), accept → accept
@@ -574,6 +644,61 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		return action
 	}
 	return strings.Join(parts, " ") + " " + action
+}
+
+// nftTCPFlagOrder lists the TCP flag bits in canonical low-to-high bit order
+// with their nftables symbolic names. The bit values match config.tcpFlagBits
+// (the SSOT consumed by ParseTCPFlagsExpression) and userspace-dp/src/tcp_flags.rs.
+var nftTCPFlagOrder = []struct {
+	bit  uint8
+	name string
+}{
+	{0x01, "fin"},
+	{0x02, "syn"},
+	{0x04, "rst"},
+	{0x08, "psh"},
+	{0x10, "ack"},
+	{0x20, "urg"},
+}
+
+// nftTCPFlagNames renders a TCP-flags bit mask as the nftables symbolic flag
+// list joined with " | " (e.g. 0x12 -> "syn | ack"). An empty mask renders as
+// the numeric "0x0" so it is a valid right-hand side for the `== 0` (all-clear)
+// case.
+func nftTCPFlagNames(mask uint8) string {
+	var names []string
+	for _, f := range nftTCPFlagOrder {
+		if mask&f.bit != 0 {
+			names = append(names, f.name)
+		}
+	}
+	if len(names) == 0 {
+		return "0x0"
+	}
+	return strings.Join(names, " | ")
+}
+
+// nftTCPFlagsMatch renders the canonical nftables masked-equality TCP-flags
+// match for a required/forbidden mask pair, the form that expresses the Junos
+// AND-conjunction semantics (a segment matches when (flags & required) ==
+// required && (flags & forbidden) == 0):
+//
+//	tcp flags & (<required|forbidden flag names>) == <required flag names>
+//
+// Both sides are parenthesized when they name more than one flag so nft's `|`
+// precedence cannot reassociate the right-hand side across the `==`. A single
+// flag, or the all-clear "0x0" right-hand side, needs no parentheses.
+func nftTCPFlagsMatch(required, forbidden uint8) string {
+	mask := required | forbidden
+	maskExpr := nftTCPFlagNames(mask)
+	if mask&(mask-1) != 0 { // more than one bit set
+		maskExpr = "(" + maskExpr + ")"
+	}
+	reqExpr := nftTCPFlagNames(required)
+	if required&(required-1) != 0 { // more than one bit set
+		reqExpr = "(" + reqExpr + ")"
+	}
+	return "tcp flags & " + maskExpr + " == " + reqExpr
 }
 
 // nftDSCPValue converts a Junos DSCP name to the nftables symbolic name.
