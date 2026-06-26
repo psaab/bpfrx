@@ -295,7 +295,17 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid src_port: "+err.Error())
 		return
 	}
+	// A non-empty but unknown/out-of-range protocol token (e.g. "tcpp", "999")
+	// must NOT silently become "any protocol" — the shared matcher's matchApp
+	// short-circuits to match-any for an empty/unresolvable protocol, yielding a
+	// misleading PERMIT/DENY verdict for a policy using `application any`
+	// (#3108). Reject it with 400. An empty value still means "unspecified"
+	// (match any protocol), unchanged.
 	proto := r.URL.Query().Get("protocol")
+	if err := policymatch.ValidateProtocol(proto); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// #3042: delegate to the single shared simulator so REST agrees with the
 	// runtime evaluator (zone-pair -> global -> default-policy, predefined +

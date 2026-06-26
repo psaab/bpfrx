@@ -1,3 +1,25 @@
+## 2026-06-25 — #3108: policy simulators reject invalid protocol tokens
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added shared `policymatch.ValidateProtocol` and wired it across
+  all four simulator surfaces (codex-review-065 finding 065-05). Mirrors the
+  #3116 port-validation pattern. `matchApp` short-circuits to match-any before
+  the protocol is resolved, so a bogus protocol (unknown name / out-of-range
+  number) silently produced a permit/deny verdict instead of an error. Empty
+  protocol = unspecified (match any, unchanged); a non-empty token must resolve
+  via `appid.ProtocolNumber`. REST `matchPoliciesHandler` → 400, gRPC
+  `MatchPolicies` → InvalidArgument, gRPC `showTestPolicy` → "invalid protocol"
+  diagnostic, local CLI `showMatchPolicies`/`testPolicy` + remote `cli`
+  `testPolicy` → command error. Fail-on-revert verified (stub `return nil`
+  flips every want-error case red across 6 surfaces + the unit test).
+- **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/protocol_test.go,
+  pkg/policymatch/README.md, pkg/api/security.go,
+  pkg/api/rest_filter_failclosed_test.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_show_firewall.go,
+  pkg/grpcapi/server_proto_validation_test.go, pkg/cli/cli_show_security.go,
+  pkg/cli/cli_request.go, pkg/cli/policymatch_protocol_test.go,
+  cmd/cli/main.go, cmd/cli/testpolicy_protocol_test.go
+
 ## 2026-06-25 — #2971: Surface A DDNS corrupt ownership state fail-closed
 
 - **Timestamp**: 2026-06-25
