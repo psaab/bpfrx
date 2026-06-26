@@ -734,6 +734,21 @@ type compileOpts struct {
 	// BOOTS (#1960 fail-closed-on-load class). Same doctrine as
 	// lenientNATRuleSetScope.
 	lenientBackupRouterDst bool
+	// lenientSecureTunnelBindIface (#2933) downgrades the secure-tunnel
+	// bind-interface alias-collision gate (validateSecureTunnelBindInterfaceAST)
+	// from a hard compile error to a cfg.Warnings entry. Two VPNs that bind two
+	// DISTINCT bind-interface strings deriving the SAME XFRM if_id (e.g.
+	// `bind-interface st0` and `bind-interface st0.0`, both if_id 1 via
+	// XFRMIfNameAndID) committed cleanly but collide at apply time: only one
+	// xfrm device can carry the if_id, so the routing manager (#2929 guard)
+	// refuses to create EITHER and both tunnels go down. The strict commit /
+	// commit-check path hard-rejects so the operator-error is visible (naming
+	// the offending bind-interface strings, their VPNs, and the shared if_id);
+	// the tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config an older binary silently accepted
+	// still BOOTS (#1960 fail-closed-on-load class) — the #2929 routing guard
+	// remains the runtime backstop. Same doctrine as lenientBackupRouterDst.
+	lenientSecureTunnelBindIface bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -800,6 +815,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyWildcardZone:          true,
 		lenientNATRuleSetScope:             true,
 		lenientBackupRouterDst:             true,
+		lenientSecureTunnelBindIface:       true,
 	})
 }
 
@@ -917,6 +933,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyWildcardZone:          true,
 		lenientNATRuleSetScope:             true,
 		lenientBackupRouterDst:             true,
+		lenientSecureTunnelBindIface:       true,
 	})
 }
 
@@ -1032,6 +1049,24 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #2933 secure-tunnel bind-interface alias-collision gate. Two VPNs that
+	// bind two DISTINCT bind-interface strings deriving the SAME XFRM if_id
+	// (e.g. `bind-interface st0` and `bind-interface st0.0`, both if_id 1 via
+	// XFRMIfNameAndID) committed cleanly but collide at apply time — only one
+	// xfrm device can carry the if_id, so the #2929 routing guard refuses to
+	// create EITHER and both tunnels go down with a journal ERROR. Runs on the
+	// group-expanded, inactive-pruned tree so an apply-groups-inherited
+	// bind-interface is caught. Strict (commit / commit-check): hard-reject
+	// naming the offending bind-interface strings, their VPNs, and the shared
+	// if_id. Lenient (load / peer-sync): warn so an already-persisted or
+	// peer-synced config still boots (#1960) — the #2929 routing guard stays
+	// the runtime backstop.
+	bindIfaceWarnings, err := validateSecureTunnelBindInterfaceAST(
+		tree.Children, opts.lenientSecureTunnelBindIface)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -1068,6 +1103,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, mssWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, natScopeWarnings...)
+	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
 
 	for _, node := range tree.Children {
 		switch node.Name() {
