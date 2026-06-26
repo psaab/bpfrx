@@ -259,3 +259,51 @@ func TestMatchPoliciesRejectsInvalidPort(t *testing.T) {
 		})
 	}
 }
+
+// TestShowTestPolicyRejectsInvalidPort covers the #3116 gap on the ShowText
+// "test-policy:" simulator (the operational `test policy` command served via
+// gRPC, routed through pkg/policymatch since #3103). A malformed or
+// out-of-range port must surface an "invalid port" diagnostic and must NOT
+// produce a "Policy match" line — a port that silently coerced to the 0
+// wildcard would yield a verdict for a packet that cannot exist. A valid port
+// and an absent port still evaluate normally.
+//
+// FAIL-ON-REVERT: restoring `dstPort, _ = strconv.Atoi(parts[1])` in
+// showTestPolicy makes "abc"/"70000" coerce to 0/garbage with no diagnostic,
+// so the want-"invalid port" cases (and the no-"Policy match" assertion) flip
+// red.
+func TestShowTestPolicyRejectsInvalidPort(t *testing.T) {
+	s := &Server{store: matchPoliciesTestStore(t)}
+
+	cases := []struct {
+		name      string
+		topic     string
+		wantBad   bool // expect "invalid port" diagnostic, no policy match
+		wantMatch bool // expect a "Policy match" line (valid path)
+	}{
+		{"malformed", "test-policy:from=trust,to=untrust,port=abc", true, false},
+		{"out of range", "test-policy:from=trust,to=untrust,port=70000", true, false},
+		{"valid", "test-policy:from=trust,to=untrust,src=10.0.1.5,dst=10.0.1.6,port=443", false, true},
+		{"absent", "test-policy:from=trust,to=untrust,src=10.0.1.5,dst=10.0.1.6", false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := s.ShowText(context.Background(), &pb.ShowTextRequest{Topic: tc.topic})
+			if err != nil {
+				t.Fatalf("ShowText(%q) error = %v", tc.topic, err)
+			}
+			if tc.wantBad {
+				if !strings.Contains(resp.Output, "invalid port") {
+					t.Fatalf("%s: output = %q, want an invalid-port diagnostic", tc.name, resp.Output)
+				}
+				if strings.Contains(resp.Output, "Policy match") {
+					t.Fatalf("%s: invalid port produced a policy match (silent wildcard): %q", tc.name, resp.Output)
+				}
+				return
+			}
+			if tc.wantMatch && !strings.Contains(resp.Output, "Policy match") {
+				t.Fatalf("%s: output = %q, want a Policy match (valid/absent port regressed)", tc.name, resp.Output)
+			}
+		})
+	}
+}

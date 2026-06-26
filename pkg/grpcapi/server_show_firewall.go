@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"net"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -166,6 +165,7 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 	params := strings.TrimPrefix(req.Topic, "test-policy:")
 	var fromZone, toZone, srcIP, dstIP, proto string
 	var dstPort int
+	var portErr error
 	for _, kv := range strings.Split(params, ",") {
 		parts := strings.SplitN(kv, "=", 2)
 		if len(parts) != 2 {
@@ -181,7 +181,12 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 		case "dst":
 			dstIP = parts[1]
 		case "port":
-			dstPort, _ = strconv.Atoi(parts[1])
+			// #3116: a malformed/out-of-range port must NOT silently coerce to
+			// the 0 "any port" wildcard (the shared matcher gates the port term
+			// on dstPort > 0), which would yield a verdict for a packet that
+			// cannot exist. Route through the shared validator and report the
+			// error the way a bad src/dst is reported below.
+			dstPort, portErr = policymatch.ParsePort(parts[1])
 		case "proto":
 			proto = parts[1]
 		}
@@ -191,6 +196,8 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 		buf.WriteString("No active configuration\n")
 	case fromZone == "" || toZone == "":
 		buf.WriteString("Missing from/to zone parameters\n")
+	case portErr != nil:
+		fmt.Fprintf(buf, "invalid port: %v\n", portErr)
 	case srcIP != "" && net.ParseIP(srcIP) == nil:
 		// A non-empty but malformed src would otherwise parse to nil and be
 		// treated as a wildcard, yielding a false-positive policy match

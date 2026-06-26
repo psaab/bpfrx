@@ -26,17 +26,31 @@ across every surface:
   `int32` field, and the REST query int after `queryIntStrict`). Accepts `0`
   (unspecified) and `1..65535`; rejects negative or `>65535`.
 - `ParsePort(string) (int, error)` — for operator string tokens (the CLI
-  `destination-port`/`source-port` args). An empty/whitespace token is
-  unspecified `(0, nil)`; a non-empty token must parse and pass `ValidatePort`;
-  a malformed (`abc`), negative, or out-of-range token is rejected. An explicit
-  `0` is accepted as "unspecified" for parity with the gRPC `int32` field, where
-  proto3 cannot distinguish an unset scalar from `0`.
+  `destination-port`/`source-port` args, the gRPC `ShowText` `test-policy:`
+  `port=` token, and the remote `cli` client's `destination-port`). An
+  empty/whitespace token is unspecified `(0, nil)`; a non-empty token must parse
+  and pass `ValidatePort`; a malformed (`abc`), negative, or out-of-range token
+  is rejected. An explicit `0` is accepted as "unspecified" for parity with the
+  gRPC `int32` field, where proto3 cannot distinguish an unset scalar from `0`.
+
+This is applied at ALL FOUR simulator surfaces (matching the thin-adapter list
+above), so "all surfaces validate the port" is literally true:
+
+- REST `matchPoliciesHandler` — `queryIntStrict` (malformed/negative) +
+  `ValidatePort` (range) → HTTP 400;
+- gRPC `MatchPolicies` — `ValidatePort` on the `int32` source/dest port →
+  `InvalidArgument`;
+- gRPC `ShowText` `test-policy:` (`showTestPolicy`) — `ParsePort` on the `port=`
+  token → an "invalid port" diagnostic in the handler output (the same way a bad
+  src/dst IP is reported);
+- CLI `test policy` + `show security match-policies` (local `pkg/cli`) AND the
+  remote `cli` client (`cmd/cli`) — `ParsePort` → a command error.
 
 A VALID port (`1..65535`) and an ABSENT port behave exactly as before; only an
-explicitly-invalid port newly errors (REST → HTTP 400, gRPC → `InvalidArgument`,
-CLI → command error). Coverage: `port_test.go` (helpers),
-`pkg/api/rest_filter_failclosed_test.go`, `pkg/grpcapi/server_cluster_test.go`,
-`pkg/cli/policymatch_port_test.go`.
+explicitly-invalid port newly errors. Coverage: `port_test.go` (helpers),
+`pkg/api/rest_filter_failclosed_test.go`, `pkg/grpcapi/server_cluster_test.go`
+(`MatchPolicies` + `ShowText` `test-policy:`), `pkg/cli/policymatch_port_test.go`,
+and `cmd/cli/testpolicy_port_test.go`.
 
 ## The surface #3042 missed (#3103)
 
