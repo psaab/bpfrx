@@ -155,6 +155,28 @@ short-circuit to a full admit; an unrecognised token contributes nothing
 (fail-closed). ICMP-based services (`ping`, `router-discovery`) admit echo /
 solicitation at L4-protocol granularity, not ICMP sub-type.
 
+**Service/protocol matches are address-family aware (#3225).** Several Junos
+host-inbound tokens are family-SPECIFIC in intent: `system-services dhcp` is
+DHCPv4 (udp 67/68 over IPv4) while `dhcpv6` is DHCPv6 (udp 546/547 over IPv6);
+`protocols rip` is RIPv2 (IPv4) and `ripng` is RIPng (IPv6); `protocols ospf` is
+OSPFv2 (IPv4) and `ospf3` is OSPFv3 (IPv6) — both ride IP protocol 89 but on
+different families; `igmp` is IPv4 group membership (the IPv6 equivalent is MLD,
+carried over ICMPv6 / the always-accepted ND set). Before #3225 both enforcement
+layers compiled these into family-NEUTRAL matches, so a v4-only `dhcp` opened
+udp/67-68 on the IPv6 path and `ripng` opened udp/521 on IPv4 — wrong-family host
+exposure. `ZoneHostInbound` now carries family-scoped sets (`udp_ports_v4` /
+`udp_ports_v6`, `ip_protocols_v4` / `ip_protocols_v6`) alongside the dual-family
+`udp_ports` / `ip_protocols`; `admits(protocol, port, is_v6)` consults the
+dual-family set OR the set matching the packet's family. The single source of
+truth for a token's family is `config.HostInboundServiceFamily` /
+`config.HostInboundProtocolFamily` (Go side): the nft kernel mirror gates
+`hostInboundServiceMatches` / `hostInboundProtocolMatches` on it directly, and
+the Rust classifier mirrors the same families into the scoped sets — so both
+layers agree exactly. Dual-family services (ssh/https/ping/dns/bgp/...) are
+absent from the maps and admit on both families as before. `protocols all`
+expands to the routing set INCLUDING both `ospf` and `ospf3`, so it admits proto
+89 on each family (and rip on v4, ripng on v6).
+
 **ICMP error / PMTUD control messages are always admitted (#3171).** Before
 the per-zone lookup, `host_inbound_admits` exempts ICMP/ICMPv6 *error* subtypes
 (`is_icmp_host_inbound_error`: ICMPv4 destination-unreachable/time-exceeded/
@@ -172,7 +194,8 @@ lock-step with the kernel chain's `icmp`/`icmpv6` accept lines.
 (the entries under the `protocols` stanza) — it is NOT `system-services all`
 and NOT a blanket accept. The classifier expands the `all` token to the
 concrete routing-protocol set (`ROUTING_PROTOCOL_TOKENS`:
-ospf/bgp/rip/ripng/igmp/pim/vrrp/bfd/ldp/msdp/nhrp/router-discovery) instead
+ospf/ospf3/bgp/rip/ripng/igmp/pim/vrrp/bfd/ldp/msdp/nhrp/router-discovery,
+each family-scoped per #3225) instead
 of setting a short-circuit flag, so a `protocols all` zone admits routing
 protocols but still DENIES SSH/HTTPS/SNMP/NETCONF unless the matching
 `system-services` token is also present. The Go nft mirror

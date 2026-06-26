@@ -1,3 +1,38 @@
+## 2026-06-26 — #3225 host-inbound: address-family-aware service/protocol matches
+
+- **Timestamp**: 2026-06-26
+- **Action**: Made host-inbound `system-services` / `protocols` matches
+  ADDRESS-FAMILY AWARE on BOTH enforcement layers (nft kernel mirror + Rust
+  AF_XDP classifier), closing the wrong-family admit gap #3225. Family-specific
+  tokens (dhcp/bootp=v4, dhcpv6=v6, rip=v4, ripng=v6, ospf=OSPFv2-v4,
+  ospf3=OSPFv3-v6, igmp=v4) now emit/admit ONLY on their own family; dual-family
+  services (ssh/https/ping/dns/bgp/...) admit on both as before. Added the
+  cross-layer SSOT `config.HostInboundServiceFamily` /
+  `config.HostInboundProtocolFamily` (`pkg/config/host_inbound_tokens.go`); the
+  nft builder gates `hostInboundServiceMatches` / `hostInboundProtocolMatches`
+  on it directly and `ospf3` was added to `hostInboundRoutingProtocolTokens` so
+  `protocols all` opens proto 89 on each family. Rust `ZoneHostInbound` gained
+  family-scoped sets (`udp_ports_v4/v6`, `ip_protocols_v4/v6`); `admits` checks
+  the dual set OR the packet-family set; the classifier mirrors the same
+  families and adds `ospf3` to `ROUTING_PROTOCOL_TOKENS`. Preserves #3070
+  ESP/AH/ND exemptions, #3171 ICMP-error, #3199 protocols-all, #3200 token
+  validation. Parity test loosened to "recognized in EITHER family" (ospf3/
+  ripng are v6-only → nil for ip). New tests: Rust
+  `build_forwarding_state_host_inbound_is_address_family_aware` (v4-only admits
+  v4/drops v6, v6-only admits v6/drops v4, ssh both); Go
+  `TestHostInboundFilterFamilyAware` (v4-only emitted under ip only, v6-only
+  under ip6 only, ssh both). Fail-on-revert PROVEN: family-neutral classifier →
+  Rust "dhcp must NOT admit udp/67 on IPv6" RED + Go "wrong-family match" RED;
+  dual-service ssh stays GREEN; restored byte-identical. cargo build --release +
+  cargo test host_inbound green; go build ./... + go test ./pkg/daemon/...
+  ./pkg/config/... green.
+- **File(s)**: pkg/config/host_inbound_tokens.go, pkg/daemon/daemon_nft.go,
+  pkg/daemon/host_inbound_parity_test.go, pkg/daemon/host_inbound_nft_test.go,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md
+
 ## 2026-06-26 — #3229 dest-NAT: `match destination-address-name` (address-book reference)
 
 - **Timestamp**: 2026-06-26
