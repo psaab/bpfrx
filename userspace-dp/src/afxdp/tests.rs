@@ -917,15 +917,16 @@ fn static_nat_dnat_routes_to_internal_ip() {
 fn static_nat_snat_rewrites_outbound_source() {
     let state = build_forwarding_state(&static_nat_snapshot());
     // Simulate outbound: packet from 192.168.1.10 -> 198.51.100.1
-    // coming from trust zone. Static NAT SNAT should rewrite src
-    // to external IP 203.0.113.10.
-    // SNAT does not check from_zone -- internal IP match is sufficient.
+    // egressing TOWARD the rule's external `from zone` (untrust). Static NAT
+    // SNAT should rewrite src to external IP 203.0.113.10.
+    // #2871: the SNAT match is gated on the EGRESS (destination) zone equalling
+    // the rule's external `from zone` ("untrust" in static_nat_snapshot()).
     let snat = state
         .static_nat
-        .match_snat("192.168.1.10".parse().unwrap(), "trust");
+        .match_snat("192.168.1.10".parse().unwrap(), "untrust");
     assert!(
         snat.is_some(),
-        "SNAT should match internal IP regardless of zone"
+        "SNAT should match internal IP when egressing toward the external zone"
     );
     assert_eq!(
         snat.unwrap().rewrite_src,

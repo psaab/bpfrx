@@ -35,10 +35,15 @@ pub(super) fn source_nat_decision_for_flow(
     matched_counter: &mut Option<std::sync::Arc<crate::nat::NatRuleCounter>>,
 ) -> Result<NatDecision, SourceNatFailure> {
     *matched_counter = None;
+    // #2871: static-NAT reverse (source) translation is gated on the EGRESS
+    // (destination) zone matching the rule's external `from zone`, mirroring
+    // the #2864 DNAT ingress-zone gate. Pass `to_zone` (where the packet is
+    // headed), NOT `from_zone` — an outbound packet from a static-NAT internal
+    // IP destined for another internal zone must NOT be source-translated.
     if let Some((decision, counter)) = forwarding.static_nat.match_snat_with_counter(
         flow.src_ip,
         flow.forward_key.src_port,
-        from_zone,
+        to_zone,
     ) {
         *matched_counter = counter;
         return Ok(decision);

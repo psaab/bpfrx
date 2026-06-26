@@ -18642,3 +18642,19 @@ top.
   screen 137, classify_generated_reply 6, poll_descriptor 24 all green; full
   bins 2919 passed + the same pre-existing worker_queue flake.
 - **File(s)**: userspace-dp/src/afxdp/tests.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2871 static-NAT reverse (SNAT) honors egress zone — finished
+  prior agent's applied-but-uncommitted fix. SNAT now gates on the EGRESS
+  (destination) zone matching the rule's external `from zone`, mirroring the
+  merged #2864 DNAT ingress-zone gate (per-candidate `zone_ok` filter, empty
+  zone = wildcard). Fixes a cross-zone east-west leak where an outbound packet
+  from a static-NAT internal IP destined for another internal zone was
+  source-translated to the public external IP. Added fail-on-revert test
+  `static_nat_snat_honors_egress_zone` (+ empty-zone wildcard test); verified
+  RED via copy-aside gate revert. Updated 4 collateral SNAT tests (CIDR v4/v6,
+  mapped-port, port-scope #2769) to egress toward the rule's external zone.
+  Gates: cargo build --release clean; nat:: 130 passed; static_nat 28 passed.
+- **File(s)**: userspace-dp/src/nat/static_nat.rs,
+  userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs,
+  userspace-dp/src/nat/tests.rs, userspace-dp/src/afxdp/tests.rs, _Log.md
