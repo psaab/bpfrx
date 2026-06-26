@@ -15,10 +15,13 @@
 //   port) advances past it instead of aborting the whole allocation
 //   (062-05). The common case claims on the first probe.
 // - Recycled phase: when the sequential range is spent, recycled ports are
-//   drained; a popped port whose owner slot is occupied is RETAINED (re-
-//   queued), never discarded, so a transient collision cannot permanently
-//   shrink the reusable pool (062-10). The retain buffer allocates lazily
-//   only when a collision actually occurs.
+//   drained FIFO (oldest-freed first, pop_front) so a just-freed port is the
+//   LAST to be reassigned — this spreads port reuse across the upstream's
+//   2MSL/TIME_WAIT window instead of immediately recycling the most recent
+//   port (#3011). A popped port whose owner slot is occupied is RETAINED (re-
+//   queued at the back), never discarded, so a transient collision cannot
+//   permanently shrink the reusable pool (062-10). The retain buffer allocates
+//   lazily only when a collision actually occurs.
 //
 // Cross-submodule visibility (per #1542 plan v3):
 // - PortAllocator and PortAllocatorSnapshot are pub(crate) at definition
@@ -36,7 +39,7 @@
 
 use super::source::SourceNatFlowKey;
 use rustc_hash::FxHashMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::hash::Hasher;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -126,7 +129,12 @@ pub(super) struct PortAllocatorLiveState {
     pub(super) lease_expirations: BTreeSet<(u64, PersistentSourceKey)>,
     pub(super) lease_expirations_by_addr: Vec<BTreeSet<(u64, PersistentSourceKey)>>,
     pub(super) next_port_offset_by_addr: Vec<u32>,
-    pub(super) recycled_ports_by_addr: Vec<Vec<u16>>,
+    // #3011: FIFO recycle queue (push_back on release, pop_front on
+    // allocation). FIFO maximizes the wall-clock gap before a freed port is
+    // reassigned, spreading reuse across the upstream's 2MSL/TIME_WAIT window
+    // instead of immediately handing back the just-freed port (the LIFO
+    // worst case). VecDeque keeps both ends O(1) so the hot path is unchanged.
+    pub(super) recycled_ports_by_addr: Vec<VecDeque<u16>>,
     gc_counter: u32,
 }
 
@@ -135,7 +143,7 @@ impl PortAllocatorLiveState {
         Self {
             lease_expirations_by_addr: vec![BTreeSet::new(); addr_count],
             next_port_offset_by_addr: vec![0; addr_count],
-            recycled_ports_by_addr: vec![Vec::new(); addr_count],
+            recycled_ports_by_addr: vec![VecDeque::new(); addr_count],
             ..Self::default()
         }
     }
@@ -247,7 +255,7 @@ impl PortAllocator {
     }
 
     /// Test-only: release a synthetic owner seeded via `debug_seed_owner`
-    /// without pushing the port onto the recycled stack.
+    /// without pushing the port onto the recycled queue.
     #[cfg(test)]
     pub(super) fn debug_clear_owner(&self, translated_ip: IpAddr, port: u16) {
         let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
@@ -506,16 +514,20 @@ impl PortAllocator {
             }
         }
 
-        // #3047 (062-10): drain the recycled stack, but RETAIN any popped port
-        // whose owner slot is occupied (an out-of-band collision) instead of
-        // discarding it. A discarded recycled port is permanently lost from the
-        // pool; re-queueing it keeps the usable range from shrinking over time.
-        // `retained` allocates lazily only when a collision is actually hit, so
-        // the common (first pop succeeds / stack empty) path stays allocation
-        // free.
+        // #3011 + #3047 (062-10): drain the recycled queue FRONT-first (FIFO)
+        // so the OLDEST-freed port is reused first, maximizing the time before
+        // any port is reassigned (avoids the LIFO 2MSL/TIME_WAIT reuse
+        // collision). RETAIN any popped port whose owner slot is occupied (an
+        // out-of-band collision) instead of discarding it: a discarded recycled
+        // port is permanently lost from the pool; re-queueing it keeps the
+        // usable range from shrinking over time. `retained` allocates lazily
+        // only when a collision is actually hit, so the common (first pop
+        // succeeds / queue empty) path stays allocation free. Collided ports
+        // are re-queued at the back — they are not free right now, so FIFO order
+        // among the genuinely-free ports is preserved.
         let mut retained: Vec<u16> = Vec::new();
         let mut claimed = None;
-        while let Some(port) = live.recycled_ports_by_addr[addr_index].pop() {
+        while let Some(port) = live.recycled_ports_by_addr[addr_index].pop_front() {
             let translated = TranslatedTuple {
                 ip: translated_ip,
                 port,
@@ -527,7 +539,7 @@ impl PortAllocator {
             retained.push(port);
         }
         if !retained.is_empty() {
-            live.recycled_ports_by_addr[addr_index].append(&mut retained);
+            live.recycled_ports_by_addr[addr_index].extend(retained);
         }
         claimed
     }
@@ -568,7 +580,9 @@ impl PortAllocator {
         if translated.port < self.port_low || translated.port > self.port_high {
             return true;
         }
-        live.recycled_ports_by_addr[addr_index].push(translated.port);
+        // #3011: push freed ports to the BACK; allocation pops from the FRONT
+        // (FIFO), so a just-freed port is the LAST recycled port to be reused.
+        live.recycled_ports_by_addr[addr_index].push_back(translated.port);
         true
     }
 
