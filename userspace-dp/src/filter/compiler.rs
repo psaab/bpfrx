@@ -532,6 +532,10 @@ fn parse_term(
         // Go side already omits a 0 mask; this is a guard against a
         // hand-crafted snapshot.
         tcp_flags_mask: snap.tcp_flags.filter(|&m| m != 0),
+        // #3076 forbidden-bits mask (negated tcp-flags operands). Same 0->None
+        // fold as the required mask: a 0 forbidden mask is "no constraint", and
+        // the Go side already omits a 0; this guards a hand-crafted snapshot.
+        tcp_flags_forbidden: snap.tcp_flags_forbidden.filter(|&m| m != 0),
         is_fragment: snap.is_fragment,
         // #2545: icmp-type / icmp-code are SET membership (match-ANY). An empty
         // list = no constraint (`*_match_enabled` false → match any), preserving

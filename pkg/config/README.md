@@ -36,6 +36,16 @@ nothing internal.
   Note: this is the **AST → typed Go struct** stage; the BPF-map
   compilation (zones, policies, NAT IDs, etc.) happens later in
   `pkg/dataplane.Manager.Compile`.
+  This stage also performs a few **fail-closed semantic checks** that the
+  `setSchema` typed-leaf gate cannot express. `compileFirewall` rejects a
+  firewall-filter `from tcp-flags` expression the conjunctive dataplane
+  matcher cannot enforce — disjunction (`|`), a negated group (`!(...)`),
+  an unknown flag, or a contradictory required/forbidden pair (#3076) —
+  via `ParseTCPFlagsExpression` (`tcp_flags.go`). Before this gate such an
+  expression committed cleanly and the constraint was silently dropped on
+  the wire (the term matched regardless of flags — a fail-open hole); a
+  representable expression such as `syn & !ack` is parsed into
+  required-bits + forbidden-bits masks and carried to the dataplane.
 - `ValueType` — `value_type.go`. Classifies a typed leaf's value
   (`ValueRate`, `ValueByteSizeOrPercent`, `ValueEnumOf`, ...) and supplies
   the `?`-completion placeholder via `Placeholder()`. Lives here (not

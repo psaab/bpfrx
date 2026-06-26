@@ -181,6 +181,7 @@ fn filter_term_semantics_match(old: &FilterTerm, new: &FilterTerm) -> bool {
         && old.dscp_bitmap == new.dscp_bitmap
         && old.dscp_match_enabled == new.dscp_match_enabled
         && old.tcp_flags_mask == new.tcp_flags_mask
+        && old.tcp_flags_forbidden == new.tcp_flags_forbidden
         && old.is_fragment == new.is_fragment
         && old.icmp_type_bitmap == new.icmp_type_bitmap
         && old.icmp_type_match_enabled == new.icmp_type_match_enabled

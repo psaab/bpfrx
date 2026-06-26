@@ -153,6 +153,14 @@ pub(crate) struct FilterTerm {
     // matches when (flags & mask) == mask. None = no constraint. Only TCP can
     // match a term that sets this.
     pub(crate) tcp_flags_mask: Option<u8>,
+    // tcp_flags_forbidden: forbidden-bits mask over the TCP flags byte (#3076).
+    // A TCP packet matches only when (flags & forbidden) == 0. Carries the
+    // negated operands of a Junos tcp-flags expression such as `syn & !ack`
+    // (tcp_flags_mask=SYN, tcp_flags_forbidden=ACK). None = no forbidden
+    // constraint. Independent of tcp_flags_mask: a term may set either, both, or
+    // neither. Cache-sensitive (NOT in SessionKey) — see has_per_packet_l4_match
+    // and cache_sensitive.rs.
+    pub(crate) tcp_flags_forbidden: Option<u8>,
     // is_fragment: matches any IP fragment.
     pub(crate) is_fragment: bool,
     // icmp_type / icmp_code: SET membership over the ICMP/ICMPv6 type/code byte
@@ -197,6 +205,7 @@ impl FilterTerm {
     #[inline]
     pub(crate) fn has_per_packet_l4_match(&self) -> bool {
         self.tcp_flags_mask.is_some()
+            || self.tcp_flags_forbidden.is_some()
             || self.is_fragment
             || self.icmp_type_match_enabled
             || self.icmp_code_match_enabled
