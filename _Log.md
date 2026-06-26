@@ -1,3 +1,23 @@
+## 2026-06-25 — #3151: local-delivery resolution table-scoped (cross-VRF leak)
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix cross-routing-instance ifindex leak in to-self
+  (local-delivery) forwarding resolution. `lookup_forwarding_resolution_inner_ecmp`
+  scanned the global `connected_v4`/`connected_v6` lists with no
+  `entry.table == table` filter, so a to-self packet in VRF A could
+  resolve its local/egress/tx ifindex to an overlapping local address
+  owned by VRF B → wrong zone/RG attribution. Mirrored the #2388
+  route-path fix: canonicalize the ingress table BEFORE the local check
+  and filter the connected scan by it in BOTH v4 and v6 branches. Default
+  routing-instance (inet.0/inet6.0) case preserved.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md
+- **Validation**: cargo build --release clean; new tests
+  `local_delivery_is_table_scoped_no_cross_vrf_leak` (+ v6 sibling)
+  GREEN; fail-on-revert RED with the filter removed; full forwarding
+  suite 193 passed.
+
 ## 2026-06-25 — #3120: IPv6 screen ext-header walk continues past Fragment header
 
 - **Timestamp**: 2026-06-25
