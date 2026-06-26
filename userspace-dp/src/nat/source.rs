@@ -208,6 +208,76 @@ impl SourceNatRule {
     }
 }
 
+/// Upper bound on how many host addresses a single source-NAT pool prefix is
+/// expanded into (#3049). Realistic SNAT pools are far smaller; the cap bounds
+/// memory and the allocator's per-address port table for an over-broad prefix
+/// (an unbounded `/8` would be ~16M entries, and any v6 prefix shorter than
+/// `/112` is astronomically large). A prefix whose host count exceeds this is
+/// rejected as an invalid pool so the operator gets a clear commit/runtime
+/// signal rather than a silently clamped pool.
+pub(crate) const MAX_POOL_PREFIX_HOSTS: u64 = 65536;
+
+/// Expand one source-NAT pool address entry into its constituent host
+/// addresses (#3049). A pool entry is either a bare IP, a host CIDR
+/// (`/32`, `/128`), or a subnet CIDR (e.g. `203.0.113.0/28`). Junos uses the
+/// FULL prefix range for a source-NAT pool, so a subnet must enumerate every
+/// address in the prefix (network..=broadcast inclusive) rather than collapse
+/// to the single network host — the pre-#3049 bug that stripped the mask and
+/// kept only one address. A single-host prefix yields exactly one address.
+///
+/// Returns `false` if the entry does not parse or expands beyond
+/// `MAX_POOL_PREFIX_HOSTS` (caller marks the pool invalid).
+fn expand_pool_address(
+    addr_str: &str,
+    out_v4: &mut Vec<Ipv4Addr>,
+    out_v6: &mut Vec<Ipv6Addr>,
+) -> bool {
+    if addr_str.contains('/') {
+        // CIDR form: enumerate every address in the prefix range.
+        match addr_str.parse::<IpNet>() {
+            Ok(IpNet::V4(net)) => {
+                let host_bits = (32 - net.prefix_len()) as u32;
+                let count = 1u64 << host_bits; // 1 for /32
+                if count > MAX_POOL_PREFIX_HOSTS {
+                    return false;
+                }
+                let base = u32::from(net.network());
+                for i in 0..count {
+                    out_v4.push(Ipv4Addr::from(base.wrapping_add(i as u32)));
+                }
+                true
+            }
+            Ok(IpNet::V6(net)) => {
+                let host_bits = (128 - net.prefix_len()) as u32;
+                // host_bits >= 17 already exceeds the cap; avoid 1u128 << 64+.
+                if host_bits >= 64 || (1u128 << host_bits) > MAX_POOL_PREFIX_HOSTS as u128 {
+                    return false;
+                }
+                let count = 1u128 << host_bits; // 1 for /128
+                let base = u128::from(net.network());
+                for i in 0..count {
+                    out_v6.push(Ipv6Addr::from(base.wrapping_add(i)));
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    } else {
+        // Bare IP (no mask): exactly one host.
+        match addr_str.parse::<IpAddr>() {
+            Ok(IpAddr::V4(v4)) => {
+                out_v4.push(v4);
+                true
+            }
+            Ok(IpAddr::V6(v6)) => {
+                out_v6.push(v6);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_source_nat_rules(snaps: &[SourceNATRuleSnapshot]) -> Vec<SourceNatRule> {
     parse_source_nat_rules_with_previous(snaps, None, &NatCounterStore::default())
@@ -283,14 +353,16 @@ pub(crate) fn parse_source_nat_rules_with_previous(
         // Parse pool addresses and port range for pool-mode SNAT.
         let mut invalid_pool_address = false;
         for addr_str in &snap.pool_addresses {
-            // Pool addresses may be bare IPs or /32 CIDRs — strip the mask.
-            let ip_str = addr_str.split('/').next().unwrap_or(addr_str);
-            if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                match ip {
-                    IpAddr::V4(v4) => rule.pool_addresses_v4.push(v4),
-                    IpAddr::V6(v6) => rule.pool_addresses_v6.push(v6),
-                }
-            } else {
+            // #3049: a pool entry may be a bare IP, a host CIDR (/32, /128), or
+            // a subnet CIDR. A subnet must enumerate the FULL prefix range — the
+            // pre-#3049 code stripped the mask and kept only the network host, so
+            // a `203.0.113.0/28` pool collapsed to a single address. A single-
+            // host prefix still yields exactly one address.
+            if !expand_pool_address(
+                addr_str,
+                &mut rule.pool_addresses_v4,
+                &mut rule.pool_addresses_v6,
+            ) {
                 invalid_pool_address = true;
             }
         }
