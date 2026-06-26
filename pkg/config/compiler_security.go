@@ -29,6 +29,34 @@ const maxScanSweepThreshold = 1023
 // parse and the dataplane gate in pkg/dataplane/compiler_iface.go (#3024).
 const defaultSynFloodAttackThreshold = 200
 
+// Junos SRX default thresholds applied when the corresponding screen check is
+// enabled WITHOUT an explicit threshold. The Rust screen engine
+// (userspace-dp/src/screen/mod.rs, scan.rs) gates every check on
+// `threshold > 0`, so an enabled-but-unset check would compile to 0 and be
+// silently skipped. These are the siblings of #3024 (#3230).
+const (
+	// defaultICMPFloodThreshold matches the Junos SRX `icmp flood threshold`
+	// default of 1000 ICMP packets per second.
+	defaultICMPFloodThreshold = 1000
+
+	// defaultUDPFloodThreshold matches the Junos SRX `udp flood threshold`
+	// default of 1000 UDP packets per second.
+	defaultUDPFloodThreshold = 1000
+
+	// defaultPortScanThreshold / defaultIPSweepThreshold supply a default for
+	// `tcp port-scan` / `ip ip-sweep` when enabled without a threshold. Junos
+	// flags a port scan / address sweep when one source reaches 10 distinct
+	// destination ports / addresses within a 5000-microsecond window. This
+	// engine interprets the threshold as a DISTINCT-DESTINATION COUNT over a
+	// fixed 10-second window (WINDOW_SECS in scan.rs, `len() > threshold`), so
+	// the default uses Junos's distinct-destination detection count (10), NOT
+	// its 5000-microsecond time-window value — feeding 5000 here would be read
+	// as a count and clamped to the dataplane cap (1023), effectively never
+	// firing.
+	defaultPortScanThreshold = 10
+	defaultIPSweepThreshold  = 10
+)
+
 // validateScreenScanSweepThresholds emits a WARNING (never a hard reject) for
 // any screen profile whose port-scan or ip-sweep threshold exceeds
 // maxScanSweepThreshold. The dataplane clamps the effective threshold to that
@@ -499,6 +527,12 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 							profile.ICMP.FloodThreshold = n
 						}
 					}
+					// icmp flood enabled without an explicit threshold: arm at
+					// the Junos default (1000 pps) so the dataplane `>0` gate
+					// fires rather than silently skipping the check (#3230).
+					if profile.ICMP.FloodThreshold <= 0 {
+						profile.ICMP.FloodThreshold = defaultICMPFloodThreshold
+					}
 				}
 			}
 		}
@@ -522,6 +556,13 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 								profile.IP.IPSweepThreshold = n
 							}
 						}
+					}
+					// ip-sweep enabled without an explicit threshold: arm at the
+					// Junos distinct-address detection count (10) so the
+					// dataplane `>0` gate fires rather than skipping the check
+					// (#3230).
+					if profile.IP.IPSweepThreshold <= 0 {
+						profile.IP.IPSweepThreshold = defaultIPSweepThreshold
 					}
 				}
 			}
@@ -589,6 +630,13 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 							}
 						}
 					}
+					// port-scan enabled without an explicit threshold: arm at
+					// the Junos distinct-port detection count (10) so the
+					// dataplane `>0` gate fires rather than skipping the check
+					// (#3230).
+					if profile.TCP.PortScanThreshold <= 0 {
+						profile.TCP.PortScanThreshold = defaultPortScanThreshold
+					}
 				}
 			}
 		}
@@ -606,6 +654,12 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 						if n, err := strconv.Atoi(v); err == nil {
 							profile.UDP.FloodThreshold = n
 						}
+					}
+					// udp flood enabled without an explicit threshold: arm at
+					// the Junos default (1000 pps) so the dataplane `>0` gate
+					// fires rather than silently skipping the check (#3230).
+					if profile.UDP.FloodThreshold <= 0 {
+						profile.UDP.FloodThreshold = defaultUDPFloodThreshold
 					}
 				}
 			}
