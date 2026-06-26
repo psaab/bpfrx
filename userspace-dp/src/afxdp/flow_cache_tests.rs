@@ -104,6 +104,7 @@ fn make_entry(
         stamp,
         observed_bytes: 0,
         last_used_epoch: 0,
+        neighbor_mac_epoch: 0,
     }
 }
 
@@ -2593,3 +2594,51 @@ fn flow_cache_not_populated_by_control_segment_via_insertion_site() {
              reseed did not break the precomputed flood (#2364)"
         );
     }
+
+// ── #3048: cached dst_mac eviction on neighbor MAC change ─────────────
+// End-to-end at the flow-cache layer: a descriptor is stamped with the
+// live neighbor mac_change_epoch at insert. The worker fast path keeps
+// the entry while the epoch is unchanged (same-MAC refresh) and evicts
+// it once the neighbor table records a genuine MAC change. Reverting the
+// `mac_change_epoch.fetch_add` in ShardedNeighborMap::insert_if_changed
+// leaves the epoch at 0 after the change → neighbor_mac_epoch_stale()
+// returns false → the stale dst_mac persists → this test goes RED.
+#[test]
+fn cached_descriptor_evicted_only_on_neighbor_mac_change() {
+    use crate::afxdp::sharded_neighbor::ShardedNeighborMap;
+    use crate::afxdp::types::NeighborEntry;
+    use std::net::Ipv4Addr;
+
+    let neighbors = ShardedNeighborMap::new();
+    let nh = (6i32, IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1)));
+    // Resolve the gateway with its initial MAC (first insert — no bump).
+    neighbors.insert_if_changed(nh, NeighborEntry { mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01] });
+
+    // Build a cached forwarding descriptor and stamp it with the live
+    // epoch exactly as poll_descriptor does at insert time.
+    let stamp = FlowCacheStamp {
+        config_generation: 5,
+        fib_generation: 3,
+        owner_rg_id: 1,
+        owner_rg_epoch: 0,
+        owner_rg_lease_until: 0,
+    };
+    let mut entry = make_entry(make_key(), stamp, 1);
+    entry.neighbor_mac_epoch = neighbors.mac_change_epoch();
+
+    // Steady state: a same-MAC ARP/NDP refresh must NOT evict the entry.
+    neighbors.insert_if_changed(nh, NeighborEntry { mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01] });
+    assert!(
+        !entry.neighbor_mac_epoch_stale(neighbors.mac_change_epoch()),
+        "same-MAC refresh must not evict the cached descriptor (#3048)"
+    );
+
+    // Gateway VRRP failover: the neighbor's MAC changes. The cached
+    // dst_mac is now stale and the entry MUST be evicted so the next
+    // packet re-resolves the current MAC.
+    neighbors.insert_if_changed(nh, NeighborEntry { mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x99] });
+    assert!(
+        entry.neighbor_mac_epoch_stale(neighbors.mac_change_epoch()),
+        "neighbor MAC change must evict the cached stale dst_mac (#3048)"
+    );
+}

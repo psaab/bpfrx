@@ -37,6 +37,16 @@ sync.
   `(ifindex, ip) -> mac` binding into `dynamic_neighbors` AND the kernel
   neighbor table, so these parsers are a MAC->IP write primitive — they
   MUST fail closed on untrusted input.
+  - **MAC-change invalidation (`#3048`):** the learn goes through
+    `insert_if_changed`, NOT a plain `insert`, so a MAC change observed
+    directly on the wire (e.g. an upstream gateway VRRP failover whose
+    ARP reply / NDP NA traverses our XSK) advances the neighbor
+    `mac_change_epoch` and evicts the now-stale cached `dst_mac`. A plain
+    insert would write the new MAC first and then SHADOW the kernel-monitor
+    RTM_NEWNEIGH that follows `add_kernel_neighbor` (the monitor would see
+    `prior == new` and not bump), leaving the flow cache stale until session
+    expiry. See `docs/flow-cache-simplification.md` "Neighbor MAC-change
+    invalidation".
   - **Logical-ifindex keying (`#2370`):** the `ifindex` in that
     `(ifindex, ip)` key is the LOGICAL (L3) ifindex, NOT the physical
     ingress port. For a frame arriving on a VLAN sub-interface,

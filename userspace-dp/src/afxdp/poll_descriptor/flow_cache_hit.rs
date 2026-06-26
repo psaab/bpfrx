@@ -98,20 +98,33 @@ pub(super) fn stage_flow_cache_hit(
         &worker_ctx.rg_epochs,
         meta.pkt_len,
     ) {
-        if !cached_flow_decision_valid(
-            worker_ctx.forwarding,
-            worker_ctx.ha_state,
-            worker_ctx.dynamic_neighbors,
-            now_secs,
-            cached.stamp.owner_rg_id,
-            packet_fabric_ingress,
-            resolution_target_for_session(flow, cached.decision),
-            cached.decision.resolution,
-        ) {
+        // #3048: a kernel ARP/NDP update may have REPLACED this
+        // descriptor's next-hop MAC since it was cached (gateway VRRP
+        // failover, NIC swap). The neighbor map advances its
+        // mac_change_epoch only on a genuine MAC change — never on a
+        // same-MAC refresh — so this comparison is free of steady-state
+        // re-misses. A mismatch means the cached dst_mac may be stale;
+        // evict and re-resolve on the slow path. Read the epoch once
+        // before the &cached borrow is needed mutably below.
+        let neighbor_mac_stale =
+            cached.neighbor_mac_epoch_stale(worker_ctx.dynamic_neighbors.mac_change_epoch());
+        if neighbor_mac_stale
+            || !cached_flow_decision_valid(
+                worker_ctx.forwarding,
+                worker_ctx.ha_state,
+                worker_ctx.dynamic_neighbors,
+                now_secs,
+                cached.stamp.owner_rg_id,
+                packet_fabric_ingress,
+                resolution_target_for_session(flow, cached.decision),
+                cached.decision.resolution,
+            )
+        {
             flow_state
                 .flow_cache
                 .invalidate_slot(&flow.forward_key, meta.ingress_ifindex as i32);
-            // Fall through to slow path for full HA resolution → fabric redirect.
+            // Fall through to slow path for full HA resolution / re-resolve
+            // the current neighbor MAC (#3048) / fabric redirect.
             return FlowCacheOutcome::FallThrough;
         }
         let cached_decision = cached.decision;

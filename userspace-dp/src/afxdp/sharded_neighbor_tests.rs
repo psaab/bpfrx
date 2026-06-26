@@ -288,3 +288,121 @@ fn concurrent_per_key_with_bulk_replace_no_deadlock() {
     // Map remains usable.
     assert!(map.len() > 0);
 }
+
+// ── #3048: neighbor MAC-change epoch ─────────────────────────────────
+// The worker flow cache stamps `mac_change_epoch()` into each cached
+// forwarding descriptor and re-reads it on every fast-path hit. The
+// epoch MUST advance only on a genuine MAC CHANGE so a stale cached
+// dst_mac is evicted; it MUST NOT advance on a first insert or a
+// same-MAC refresh, or steady-state traffic would re-miss the cache on
+// every neighbor refresh. Reverting any `mac_change_epoch.fetch_add`
+// makes the corresponding "change bumps" assertion fail (RED), so these
+// are the fail-on-revert guards for the #3048 invalidation.
+
+#[test]
+fn mac_change_epoch_starts_at_zero() {
+    let map = ShardedNeighborMap::new();
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_not_bumped_on_first_insert() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    // A brand-new neighbor: no cached flow can reference a MAC that did
+    // not previously exist, so the epoch must stay put.
+    assert!(map.insert_if_changed(k, entry(0xAB)));
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_not_bumped_on_same_mac_refresh() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    assert!(map.insert_if_changed(k, entry(0xAB)));
+    // The common case: a periodic ARP/NDP refresh re-learning the SAME
+    // MAC must not bump the epoch (else the whole flow cache flushes on
+    // every neighbor refresh and the fast-path hit rate collapses).
+    assert!(!map.insert_if_changed(k, entry(0xAB)));
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_bumped_on_mac_change() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    assert!(map.insert_if_changed(k, entry(0xAB)));
+    assert_eq!(map.mac_change_epoch(), 0);
+    // Genuine MAC change (gateway VRRP failover / NIC swap): the epoch
+    // MUST advance so the worker fast path evicts cached descriptors
+    // holding the old dst_mac. Fail-on-revert guard for insert_if_changed.
+    assert!(map.insert_if_changed(k, entry(0xCD)));
+    assert_eq!(map.mac_change_epoch(), 1);
+    // A subsequent same-MAC refresh does not advance it further.
+    assert!(!map.insert_if_changed(k, entry(0xCD)));
+    assert_eq!(map.mac_change_epoch(), 1);
+    // Another distinct change bumps again.
+    assert!(map.insert_if_changed(k, entry(0xEF)));
+    assert_eq!(map.mac_change_epoch(), 2);
+}
+
+#[test]
+fn mac_change_epoch_per_key_independent_changes_accumulate() {
+    let map = ShardedNeighborMap::new();
+    let k1 = key_v4(7, 1);
+    let k2 = key_v4(7, 2);
+    map.insert_if_changed(k1, entry(0x11));
+    map.insert_if_changed(k2, entry(0x22));
+    assert_eq!(map.mac_change_epoch(), 0);
+    // A MAC change on either key bumps the single global epoch (the
+    // flow cache is keyed by flow 5-tuple, not next-hop, so #3048 uses a
+    // coarse global epoch — documented tradeoff).
+    map.insert_if_changed(k1, entry(0x99));
+    assert_eq!(map.mac_change_epoch(), 1);
+    map.insert_if_changed(k2, entry(0x88));
+    assert_eq!(map.mac_change_epoch(), 2);
+}
+
+#[test]
+fn mac_change_epoch_confirmed_resolver_first_insert_no_bump() {
+    use std::sync::atomic::AtomicU64;
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    let generation = AtomicU64::new(5);
+    // Resolver servicing a missing next-hop: prior == None, no bump.
+    assert!(map.insert_confirmed_if_unchanged(k, entry(0xAB), &generation, 5));
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_confirmed_resolver_bumps_on_change() {
+    use std::sync::atomic::AtomicU64;
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    let generation = AtomicU64::new(5);
+    assert!(map.insert_confirmed_if_unchanged(k, entry(0xAB), &generation, 5));
+    assert_eq!(map.mac_change_epoch(), 0);
+    // A confirmed re-resolution observing a different MAC must bump,
+    // matching the monitor path. Fail-on-revert guard for the resolver.
+    assert!(map.insert_confirmed_if_unchanged(k, entry(0xCD), &generation, 5));
+    assert_eq!(map.mac_change_epoch(), 1);
+    // Same MAC re-confirm does not bump.
+    assert!(map.insert_confirmed_if_unchanged(k, entry(0xCD), &generation, 5));
+    assert_eq!(map.mac_change_epoch(), 1);
+}
+
+#[test]
+fn mac_change_epoch_confirmed_resolver_epoch_reject_no_bump() {
+    use std::sync::atomic::AtomicU64;
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    let generation = AtomicU64::new(5);
+    map.insert_confirmed_if_unchanged(k, entry(0xAB), &generation, 5);
+    // A monitor event advanced the generation between the resolver's GET
+    // and its insert: the insert is rejected entirely, so no MAC is
+    // written and the epoch must not move.
+    generation.store(6, std::sync::atomic::Ordering::Release);
+    assert!(!map.insert_confirmed_if_unchanged(k, entry(0xCD), &generation, 5));
+    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.get(&k), Some(entry(0xAB)));
+}

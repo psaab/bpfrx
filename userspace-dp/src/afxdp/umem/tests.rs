@@ -1532,6 +1532,7 @@ fn active_flow_debug_test_entry(
         stamp,
         observed_bytes: 0,
         last_used_epoch: 0,
+        neighbor_mac_epoch: 0,
     }
 }
 

@@ -46,6 +46,48 @@
 - **Validation**: go build ./...; go test ./pkg/config/... (1698 pass + new); RED->GREEN
   confirmed (disable the gate condition -> reject tests FAIL); gofmt clean.
 
+## 2026-06-26 — #3048: flow cache invalidated on neighbor (ARP/NDP) MAC change
+
+- **Timestamp**: 2026-06-26
+- **Action**: A cached `RewriteDescriptor` carries the resolved next-hop
+  `dst_mac`, but no flow-cache stamp gate covered a bare kernel ARP/NDP MAC
+  change with the route unchanged (gateway VRRP failover / NIC swap) — cached
+  flows kept rewriting to the stale MAC until session expiry, blackholing
+  long-lived flows. Added a single monotonic `mac_change_epoch` (`AtomicU32`)
+  to `ShardedNeighborMap`, bumped ONLY when a write REPLACES an existing
+  neighbor's hwaddr with a DIFFERENT MAC — never on a first insert and never
+  on a same-MAC refresh (the common case; bumping there would flush the whole
+  flow cache and collapse the hit rate). Covered all three write paths:
+  netlink monitor (`insert_if_changed`), data-path ARP/NDP learn
+  (`poll_stages.rs`, switched from plain `insert` to `insert_if_changed` so
+  the wire-observed change isn't shadowed by the later kernel-monitor event),
+  and the on-demand resolver (`insert_confirmed_if_unchanged`).
+  `FlowCacheEntry` carries a `neighbor_mac_epoch` stamped at the single insert
+  site; the worker fast path (`flow_cache_hit.rs`) re-reads it every hit and
+  evicts a stale slot (`neighbor_mac_epoch_stale`), re-resolving on the slow
+  path. Lazy epoch-compare mirroring `rg_epochs` (chosen over an explicit
+  cross-worker `FlushFlowCaches`). Scope: the cache is 5-tuple-keyed, not
+  next-hop-indexed, so this is a single GLOBAL epoch — any genuine MAC change
+  lazily invalidates all cached flows (the "coarser flush" #3048 accepts);
+  documented tradeoff.
+- **File(s)**: userspace-dp/src/afxdp/sharded_neighbor.rs,
+  userspace-dp/src/afxdp/sharded_neighbor_tests.rs,
+  userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/flow_cache_tests.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/umem/tests.rs,
+  docs/flow-cache-simplification.md, userspace-dp/src/afxdp/README.md
+- **Validation**: `cargo build --release -p xpf-userspace-dp` (0 errors);
+  `cargo test --release` mac_change_epoch (8), flow_cache (64), neighbor +
+  poll_stages + sharded_neighbor (141 combined) — all GREEN. Fail-on-revert:
+  neutralizing `mac_change_epoch.fetch_add` turns
+  `mac_change_epoch_bumped_on_mac_change`,
+  `mac_change_epoch_per_key_independent_changes_accumulate`, and
+  `cached_descriptor_evicted_only_on_neighbor_mac_change` RED (verified).
+
 ## 2026-06-25 — #3149 (folds #3147): policy dangling/empty address-set hard-reject
 
 - **Timestamp**: 2026-06-25

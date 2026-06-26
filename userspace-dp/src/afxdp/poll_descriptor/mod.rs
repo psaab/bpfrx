@@ -2676,7 +2676,7 @@ pub(super) fn poll_binding_process_descriptor(
                         // false and cache as before.
                         if !flow_cache_install_failed
                             && let Some(flow) = flow.as_ref()
-                            && let Some(entry) = FlowCacheEntry::from_forward_decision(
+                            && let Some(mut entry) = FlowCacheEntry::from_forward_decision(
                                 flow,
                                 meta,
                                 validation,
@@ -2697,6 +2697,13 @@ pub(super) fn poll_binding_process_descriptor(
                                 &worker_ctx.rg_epochs,
                             )
                         {
+                            // #3048: stamp the live neighbor-MAC-change
+                            // epoch so a later kernel ARP/NDP MAC change
+                            // for this descriptor's next-hop evicts the
+                            // cached stale dst_mac on the next fast-path
+                            // hit (see neighbor_mac_epoch_stale).
+                            entry.neighbor_mac_epoch =
+                                worker_ctx.dynamic_neighbors.mac_change_epoch();
                             binding.flow.flow_cache.insert(entry);
                         }
                         // ── End flow cache population ────────────────

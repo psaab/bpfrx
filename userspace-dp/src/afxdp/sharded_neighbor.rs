@@ -29,6 +29,7 @@ use super::types::{FastMap, NeighborEntry};
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 pub(super) const NUM_SHARDS: usize = 64;
@@ -47,6 +48,24 @@ impl PaddedShard {
 /// 64-shard mutex map for the dynamic neighbor cache.
 pub(crate) struct ShardedNeighborMap {
     shards: [PaddedShard; NUM_SHARDS],
+    /// #3048: monotonic epoch bumped ONLY when a kernel ARP/NDP update
+    /// REPLACES an existing neighbor's hwaddr with a different MAC
+    /// (gateway VRRP failover, host NIC swap, upstream MAC change). The
+    /// worker flow cache stamps this counter into each cached forwarding
+    /// descriptor and re-reads it on every fast-path hit; a mismatch
+    /// means the descriptor's `dst_mac` may be stale, so the entry is
+    /// evicted and the next packet re-resolves the current MAC.
+    ///
+    /// It is deliberately NOT bumped on:
+    ///   * a first insert of a brand-new neighbor (no cached flow can
+    ///     reference a neighbor that did not previously exist), nor
+    ///   * a periodic ARP/NDP REFRESH that re-learns the SAME MAC (the
+    ///     overwhelmingly common case) — bumping there would flush the
+    ///     whole flow cache on every neighbor refresh and collapse the
+    ///     fast-path hit rate.
+    /// `insert_if_changed` distinguishes these because it reads the prior
+    /// entry under the shard lock before overwriting.
+    mac_change_epoch: AtomicU32,
 }
 
 /// Shard index for a key. The Knuth multiplier `0x9E3779B97F4A7C15`
@@ -71,7 +90,17 @@ impl ShardedNeighborMap {
     pub(crate) fn new() -> Self {
         Self {
             shards: std::array::from_fn(|_| PaddedShard::new()),
+            mac_change_epoch: AtomicU32::new(0),
         }
+    }
+
+    /// #3048: current neighbor-MAC-change epoch. Read by the worker flow
+    /// cache at descriptor insert (stamp) and on every fast-path hit
+    /// (re-validate). A single relaxed atomic load — mirrors the
+    /// `rg_epochs` lazy-invalidation pattern in `flow_cache.rs`.
+    #[inline]
+    pub(crate) fn mac_change_epoch(&self) -> u32 {
+        self.mac_change_epoch.load(Ordering::Relaxed)
     }
 
     fn lock_shard(
@@ -128,6 +157,19 @@ impl ShardedNeighborMap {
         if generation.load(std::sync::atomic::Ordering::Acquire) != expected_generation {
             return false;
         }
+        // #3048: if the confirmed GETNEIGH result REPLACES an existing
+        // neighbor's MAC, that is a genuine MAC change — advance the
+        // mac_change_epoch so cached forwarding descriptors holding the
+        // old dst_mac are evicted on their next fast-path hit. The
+        // resolver normally services a missing next-hop (prior == None,
+        // first insert, no bump), but a re-resolution that observes a new
+        // MAC must invalidate just like the monitor path. A re-confirm of
+        // the SAME MAC does not bump.
+        if let Some(prior) = shard.get(&key)
+            && prior.mac != val.mac
+        {
+            self.mac_change_epoch.fetch_add(1, Ordering::Relaxed);
+        }
         shard.insert(key, val);
         true
     }
@@ -141,8 +183,20 @@ impl ShardedNeighborMap {
         val: NeighborEntry,
     ) -> bool {
         let mut shard = self.lock_shard(shard_idx(&key));
-        if shard.get(&key).map(|existing| existing.mac) == Some(val.mac) {
+        let prior_mac = shard.get(&key).map(|existing| existing.mac);
+        if prior_mac == Some(val.mac) {
             return false;
+        }
+        // #3048: a genuine MAC CHANGE (an existing entry whose hwaddr is
+        // being replaced by a different one) invalidates any flow-cache
+        // forwarding descriptor that captured the old MAC. Advance the
+        // epoch so the worker fast path evicts those entries on their next
+        // hit. A FIRST insert (`prior_mac == None`) does NOT advance it:
+        // no cached flow can hold a stale MAC for a neighbor that did not
+        // exist. The same-MAC refresh case already returned above.
+        if let Some(old_mac) = prior_mac {
+            debug_assert_ne!(old_mac, val.mac, "same-MAC case must have returned early");
+            self.mac_change_epoch.fetch_add(1, Ordering::Relaxed);
         }
         shard.insert(key, val);
         true
