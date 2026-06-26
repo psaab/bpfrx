@@ -13,21 +13,29 @@ import (
 // every successful exchange through commitLease and return to the T1
 // wait; only failure at both T1 and T2 falls back to re-acquisition.
 //
-// Wire-behavior note (Codex review on PR #1832): the T1/T2 attempts
-// still use the client's full exchange on the wire (v4: nclient4
-// Discover/Offer/Request/Ack — force-discover; v6: Information-Request
-// or Rapid Solicit), NOT RFC-style unicast RENEW/REBIND messages, so a
-// different server can answer and the address-move path below handles
-// that. The RFC 2131 §4.4.5 / RFC 8415 §18.2.4-5 citations describe
-// the TIMER-AND-FALLBACK structure this loop implements (T1 → T2 →
-// re-acquire), not the wire messages. Switching to true unicast renew
-// (nclient4.Client.Renew) is a possible follow-up, deliberately out of
-// scope here.
+// Wire-behavior note (#2994): the T1/T2 attempts now run the
+// RFC-correct renewal exchange, not a full re-acquisition. At T1 the v4
+// client unicasts a RENEWING DHCPREQUEST to the granting server (ciaddr
+// set to the held address, no DISCOVER) and the v6 client sends a RENEW
+// echoing the held IA_NA/IA_PD with the granting server's DUID; at T2
+// the v4 client broadcasts a REBINDING DHCPREQUEST and the v6 client
+// multicasts a REBIND (no server DUID). Only lease expiry (both renew
+// and rebind failed) falls back to a full DISCOVER/SOLICIT. The RFC 2131
+// §4.4.5 / RFC 8415 §18.2.4-5 citations now describe both the
+// TIMER-AND-FALLBACK structure (T1 → T2 → re-acquire) and the wire
+// messages. A renew that nonetheless lands on a different server is
+// handled by the address-move path below. This supersedes the pre-#2994
+// force-DORA / Rapid-Solicit behavior (the old #1832 review note).
 //
-// The run loops themselves are not unit-testable (doDHCPv4/doDHCPv6
-// open real AF_PACKET/UDP sockets via nclient4/nclient6, and the T1
-// wait has a 30s clamp with no injectable clock), so the decision
-// logic lives here as directly testable helpers — see commit_test.go.
+// The decision helpers live here as directly testable functions (see
+// commit_test.go). The run-loop state machine itself — the
+// acquire→renew→rebind→re-acquire transitions and lease preservation —
+// is exercised through the doV4ExchangeForTest / doV6ExchangeForTest /
+// afterForTest / waitLinkLocalForTest seams (#2994); the real run loops
+// otherwise open AF_PACKET/UDP sockets via nclient4/nclient6 and clamp
+// the T1 wait to 30s. The wire builders (buildV4RenewRequest,
+// v4RenewDest, buildV6RenewMessage in renew.go) are pure and
+// unit-tested directly — see renew_test.go.
 
 // renewalTimers computes the two waits of one renewal cycle from a
 // lease duration: t1 is the wait until the renew attempt (50% of the

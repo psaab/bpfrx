@@ -17,6 +17,17 @@ use super::packet::{PROTO_TCP, ScreenPacketInfo, ScreenParseError};
 /// a truncated FRAGMENT header bypass the `syn-frag` screen — the exact
 /// IDS-evasion the screen claims to defend against now that the BPF
 /// screen path (#1373/#1476) that masked it is gone.
+///
+/// #3120: the IPv6 walk now CONTINUES past the Fragment header for a
+/// FIRST fragment (fragment offset == 0) instead of stopping at it, so a
+/// `Fragment → Destination-Options → TCP` chain (RFC 8200 permits an
+/// extension header after the fragment header) still reaches the real L4
+/// header and exposes the TCP seq/ack/flags/MSS to the TCP-flag screens
+/// and the SYN-cookie flood challenge. A NON-FIRST fragment (offset > 0)
+/// genuinely carries no L4 header in this packet, so the walk still stops
+/// there (the #2344/#3064 flowless handling). The continuation stays
+/// bounded by the `for _ in 0..8` extension-header cap and the
+/// top-of-loop `offset > frame.len()` fail-closed check (#2361).
 pub(crate) fn extract_screen_info(
     frame: &[u8],
     addr_family: u8,
@@ -212,10 +223,36 @@ pub(crate) fn extract_screen_info(
                     // underflow.
                     info.frag_data_off =
                         ((offset + 8).saturating_sub(l3_offset + 40)) as u16;
-                    if frame[offset] == PROTO_TCP {
-                        tcp_offset = Some(offset + 8);
+                    // #3120: a NON-FIRST fragment (fragment offset > 0)
+                    // genuinely carries no L4 header in THIS packet — the
+                    // TCP header lives in the first fragment — so stopping
+                    // the walk is correct (the downstream gate
+                    // `(!is_fragment || is_first_fragment)` then keeps any
+                    // `tcp_offset` unused for it; see #2344/#3064). But for
+                    // the FIRST fragment (offset == 0) the real L4 header
+                    // DOES follow the extension-header chain, and RFC 8200
+                    // permits another extension header (e.g.
+                    // destination-options) AFTER the fragment header. The
+                    // pre-fix code only checked whether the IMMEDIATELY
+                    // following header was TCP and then unconditionally
+                    // `break`d, so a `frag → dest-opts → TCP` chain left
+                    // `tcp_offset = None` and hid the TCP seq/ack/flags/MSS
+                    // from the TCP-flag screens and the SYN-cookie flood
+                    // challenge — an extension-chain IDS evasion. CONTINUE
+                    // the walk past this fixed 8-byte fragment header (set
+                    // `nexthdr` from the fragment header's own NextHdr field
+                    // and advance `offset` by 8) so the trailing ext-header
+                    // chain is traversed to the real L4 header. The walk
+                    // stays bounded by the enclosing `for _ in 0..8` cap and
+                    // the top-of-loop `offset > frame.len()` fail-closed
+                    // check (#2146/#2189/#2361), so a malicious chain can
+                    // neither loop forever nor over-read.
+                    if (frag_off & 0xFFF8) != 0 {
+                        // Non-first fragment: no L4 header is present here.
+                        break;
                     }
-                    break;
+                    nexthdr = frame[offset];
+                    offset += 8;
                 }
                 PROTO_TCP => {
                     tcp_offset = Some(offset);

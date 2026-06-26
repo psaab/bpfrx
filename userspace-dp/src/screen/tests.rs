@@ -1168,6 +1168,117 @@ fn extract_screen_info_ipv6_subsequent_fragment() {
 }
 
 #[test]
+fn extract_screen_info_ipv6_first_fragment_extheader_after_fragment_extracts_tcp() {
+    // #3120 ext-chain TCP-flag evasion: an IPv6 FIRST fragment whose
+    // chain is `Fragment(offset 0) → Destination-Options → TCP(SYN)`.
+    // RFC 8200 permits a destination-options header AFTER the fragment
+    // header, so the L4 (TCP) header is present in this first fragment,
+    // just one extension header further along. The pre-fix walk only
+    // checked whether the header IMMEDIATELY after the fragment header was
+    // TCP and then `break`d unconditionally, leaving `tcp_offset = None` —
+    // so the TCP seq/ack/MSS were never extracted and the TCP-flag screens
+    // / SYN-cookie flood challenge were bypassed. The fix continues the
+    // walk past the fragment header for first fragments, so the trailing
+    // dest-opts header is traversed and the real TCP header is found.
+    //
+    // Layout (l3_offset = 14):
+    //   14            Ethernet
+    //   14+0          IPv6 base (40), NextHdr = 44 (FRAGMENT)
+    //   14+40 = 54    Fragment header (8): NextHdr = 60 (DEST), MF=1 off=0
+    //   54+8  = 62    Dest-Options header (8): NextHdr = 6 (TCP), len=0
+    //   62+8  = 70    TCP (20 + 4-byte MSS option)
+    let mut frame = vec![0u8; 14 + 40 + 8 + 8 + 24];
+    frame[14] = 0x60; // version=6
+    frame[14 + 6] = 44; // base NextHdr = FRAGMENT
+    // Fragment header at 54.
+    frame[54] = 60; // NextHdr = DEST (an ext header, NOT TCP)
+    let frag_off_pos = 54 + 2;
+    frame[frag_off_pos..frag_off_pos + 2].copy_from_slice(&0x0001u16.to_be_bytes()); // MF=1, off=0
+    // Destination-Options header at 62: NextHdr=TCP, HdrExtLen=0 → 8 bytes.
+    frame[62] = 6; // NextHdr = TCP
+    frame[63] = 0; // HdrExtLen = 0 → (0+1)*8 = 8 bytes
+    // TCP header at 70.
+    let tcp = 70;
+    frame[tcp + 4..tcp + 8].copy_from_slice(&0x1122_3344u32.to_be_bytes()); // seq
+    frame[tcp + 8..tcp + 12].copy_from_slice(&0x0000_0000u32.to_be_bytes()); // ack
+    frame[tcp + 12] = 0x60; // data offset = 6 words = 24 bytes (room for MSS opt)
+    frame[tcp + 20] = 2; // option kind = MSS
+    frame[tcp + 21] = 4; // option len
+    frame[tcp + 22..tcp + 24].copy_from_slice(&1400u16.to_be_bytes()); // MSS value
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET6 as u8,
+        6,    // TCP
+        0x02, // SYN — the attack-relevant flag the screens must see
+        (frame.len() - 14) as u16,
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        12345,
+        80,
+        14,
+    )
+    .expect("first fragment with ext header after fragment must parse");
+
+    assert!(info.is_fragment, "MF=1 → is_fragment");
+    assert!(info.is_first_fragment, "MF=1 && offset==0 → is_first_fragment");
+    // The walk must have continued past the fragment + dest-opts headers to
+    // the real TCP header. If the FRAGMENT arm still `break`d (the #3120
+    // bug), `tcp_offset` stays None and these fields are left at 0 — the TCP
+    // flags/seq/MSS are hidden from the screens (the evasion). The SYN flag
+    // (passed in `tcp_flags`) is still seen, but the SYN-cookie challenge
+    // consumes `tcp_mss`, which is only populated when the L4 is reached.
+    assert_eq!(info.tcp_seq, 0x1122_3344, "TCP seq must be extracted past the ext-header chain");
+    assert_eq!(info.tcp_mss, 1400, "TCP MSS option must be extracted past the ext-header chain");
+    assert_eq!(info.tcp_flags, 0x02, "SYN flag visible to the TCP-flag screens");
+}
+
+#[test]
+fn extract_screen_info_ipv6_nonfirst_fragment_extheader_stays_flowless() {
+    // #3120 non-regression (#2344/#3064): a NON-FIRST fragment (offset>0)
+    // with the same `Fragment → Dest-Options → TCP` chain shape carries no
+    // L4 header in THIS packet (the TCP header is in the first fragment).
+    // The walk must STOP at the fragment header and leave `tcp_offset`
+    // unused — the continue-past-fragment fix is gated on offset==0 only.
+    let mut frame = vec![0u8; 14 + 40 + 8 + 8 + 24];
+    frame[14] = 0x60;
+    frame[14 + 6] = 44; // FRAGMENT
+    frame[54] = 60; // NextHdr = DEST
+    let frag_off_pos = 54 + 2;
+    // offset = 1 (8-byte unit), MF=1 → 0x0009: a non-first fragment.
+    frame[frag_off_pos..frag_off_pos + 2].copy_from_slice(&0x0009u16.to_be_bytes());
+    frame[62] = 6; // would be TCP if (wrongly) walked
+    frame[63] = 0;
+    let tcp = 70;
+    frame[tcp + 4..tcp + 8].copy_from_slice(&0x1122_3344u32.to_be_bytes());
+    frame[tcp + 12] = 0x60;
+    frame[tcp + 20] = 2;
+    frame[tcp + 21] = 4;
+    frame[tcp + 22..tcp + 24].copy_from_slice(&1400u16.to_be_bytes());
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET6 as u8,
+        6,
+        0x02,
+        (frame.len() - 14) as u16,
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        12345,
+        80,
+        14,
+    )
+    .expect("non-first fragment parses");
+
+    assert!(info.is_fragment, "offset>0 → is_fragment");
+    assert!(!info.is_first_fragment, "offset>0 → not first fragment");
+    // No L4 header in this packet: the downstream gate `(!is_fragment ||
+    // is_first_fragment)` must skip extraction, so seq/MSS stay zero.
+    assert_eq!(info.tcp_seq, 0, "non-first fragment has no L4 to extract");
+    assert_eq!(info.tcp_mss, 0, "non-first fragment has no L4 to extract");
+}
+
+#[test]
 fn extract_screen_info_ipv6_truncated_fragment_fails_closed() {
     // #2146 IDS-evasion: an IPv6 frame whose base header advertises
     // NextHdr=FRAGMENT (44) but whose captured bytes are TOO SHORT to
