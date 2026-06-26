@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
@@ -365,17 +366,20 @@ func protoFilterMatches(p uint8, filter string) bool {
 	return false
 }
 
+// protoName renders an IP protocol number for the REST surface. The named
+// protocol SET is owned by appid.ProtocolName (the #2949 SSOT shared with gRPC
+// and the catalog) so a NAMED `protocol=gre` REST filter matches and GRE/ESP/
+// IPIP/IPv6 sessions display named instead of numeric. Casing is a REST-local
+// concern: REST has always rendered upper-case (TCP/UDP/ICMP/ICMPv6), so the
+// canonical lowercase name is upper-cased here. ICMPv6 keeps its mixed-case
+// spelling to match the historical REST rendering.
 func protoName(p uint8) string {
-	switch p {
-	case 6:
-		return "TCP"
-	case 17:
-		return "UDP"
-	case 1:
-		return "ICMP"
-	case dataplane.ProtoICMPv6:
-		return "ICMPv6"
-	default:
+	name := appid.ProtocolName(p)
+	if name == "" {
 		return fmt.Sprintf("%d", p)
 	}
+	if p == dataplane.ProtoICMPv6 {
+		return "ICMPv6"
+	}
+	return strings.ToUpper(name)
 }

@@ -196,6 +196,110 @@ func TestRESTProtocolFilterCaseInsensitiveNumeric(t *testing.T) {
 	}
 }
 
+// greSessionDP is an apiRuntimeDataPlane that yields exactly one forward
+// IPv4 GRE (proto 47) session, so the #2949 named-protocol rendering and
+// NAMED protocol-filter contract can be exercised end-to-end.
+type greSessionDP struct {
+	*dataplane.Manager
+}
+
+func (d *greSessionDP) IsLoaded() bool { return true }
+
+func (d *greSessionDP) IterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	key := dataplane.SessionKey{
+		SrcIP:    [4]byte{10, 0, 1, 5},
+		DstIP:    [4]byte{10, 0, 2, 7},
+		Protocol: 47, // GRE
+	}
+	val := dataplane.SessionValue{
+		State:       dataplane.SessStateEstablished,
+		IsReverse:   0,
+		IngressZone: 2,
+		EgressZone:  3,
+	}
+	fn(key, val)
+	return nil
+}
+
+func (d *greSessionDP) IterateSessionsV6(func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	return nil
+}
+
+// TestRESTProtoNameNamedSet asserts the #2949 contract: the REST protoName
+// renders the SAME named protocol SET as gRPC (appid.ProtocolName SSOT), so
+// gre/esp/ipip/ipv6 sessions display a name instead of a bare number. REST
+// upper-cases its rendering (its historical TCP/UDP/ICMP display), but the
+// named SET — which protocols are named at all — must match gRPC.
+//
+// FAIL-ON-REVERT: restoring REST's old 4-protocol switch (tcp/udp/icmp/
+// icmpv6 only) makes protoName(47)=="47" instead of "GRE", flipping the
+// gre/esp/ipip/ipv6 rows of this table red.
+func TestRESTProtoNameNamedSet(t *testing.T) {
+	cases := []struct {
+		proto uint8
+		want  string
+	}{
+		{6, "TCP"},
+		{17, "UDP"},
+		{1, "ICMP"},
+		{58, "ICMPv6"},
+		{47, "GRE"},
+		{50, "ESP"},
+		{4, "IPIP"},
+		{41, "IPV6"},
+		{99, "99"}, // unnamed -> numeric fallback
+	}
+	for _, tc := range cases {
+		if got := protoName(tc.proto); got != tc.want {
+			t.Fatalf("protoName(%d) = %q, want %q", tc.proto, got, tc.want)
+		}
+	}
+}
+
+// TestRESTProtocolFilterNamedGRE asserts the #2949 contract end-to-end: a
+// NAMED `protocol=gre` REST session filter (and its numeric form) matches a
+// GRE session, and the rendered row displays the named protocol — exactly
+// like the gRPC surface. Before #2949, REST rendered GRE numeric and a
+// `protocol=gre` filter silently returned no rows.
+//
+// FAIL-ON-REVERT: restoring REST's old 4-protocol protoName switch makes
+// protoName(47)=="47", so the named "gre" filter no longer matches (0 rows)
+// and the displayed protocol reverts to "47", flipping the want-1/"GRE"
+// assertions red.
+func TestRESTProtocolFilterNamedGRE(t *testing.T) {
+	s := &Server{dp: &greSessionDP{Manager: dataplane.New()}}
+
+	cases := []struct {
+		filter string
+		want   int
+	}{
+		{"gre", 1},
+		{"GRE", 1},
+		{"47", 1},
+		{"esp", 0},
+		{"50", 0},
+	}
+	for _, tc := range cases {
+		t.Run("protocol="+tc.filter, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			s.sessionsHandler(rr, httptest.NewRequest("GET",
+				"/api/v1/security/sessions?protocol="+tc.filter, nil))
+			if rr.Code != 200 {
+				t.Fatalf("protocol=%s: status %d, want 200; body: %s",
+					tc.filter, rr.Code, rr.Body.String())
+			}
+			sess := decodeSessions(t, rr.Body.Bytes()).Sessions
+			if len(sess) != tc.want {
+				t.Fatalf("protocol=%s: %d sessions, want %d", tc.filter, len(sess), tc.want)
+			}
+			if tc.want == 1 && sess[0].Protocol != "GRE" {
+				t.Fatalf("protocol=%s: rendered protocol = %q, want %q",
+					tc.filter, sess[0].Protocol, "GRE")
+			}
+		})
+	}
+}
+
 // TestEventFilterExactNotSubstring asserts the #2939 contract: the event
 // filter must match protocol/action EXACTLY (case-insensitive), not as a
 // substring. protocol=C must NOT match TCP/ICMP/ICMPv6.

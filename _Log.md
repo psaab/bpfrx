@@ -10,6 +10,77 @@
   with the bare-pid shortcut, GREEN with the fix). Gates: cargo build
   --release clean; cargo test state_writer 13 passed.
 - **File(s)**: userspace-dp/src/state_writer.rs, _Log.md
+## 2026-06-25 — #2949: unify REST + gRPC protoName on a single SSOT
+
+- **Timestamp**: 2026-06-25
+- **Action**: finished the #2949 fix. Added `appid.ProtocolName` as the
+  single source of truth for the named IP-protocol set rendered by the
+  operator surfaces (tcp/udp/icmp/icmpv6/gre/esp/ipip/ipv6); it matches
+  the prior gRPC switch and is NOT a complete inverse of ProtocolNumber
+  (which resolves ospf/igmp/... with no display mapping, and ipv6 has no
+  reverse). Rewired both surfaces: `pkg/grpcapi` `protoName` (lowercase,
+  direct) and `pkg/api` REST `protoName` (upper-cased for its historical
+  TCP/UDP/ICMP display, ICMPv6 mixed case preserved). Before #2949 REST
+  kept its own 4-protocol switch while gRPC rendered gre/esp/ipip/ipv6
+  too, so a REST `protocol=gre` NAMED filter silently returned no rows
+  and a GRE/ESP session displayed numeric on REST but named on gRPC.
+  Added the fail-on-revert tests `TestRESTProtoNameNamedSet` and
+  `TestRESTProtocolFilterNamedGRE` (a GRE-session fixture): both go RED
+  if REST reverts to the 4-protocol set (protoName(47)=="47", named
+  `gre` filter matches 0 rows). Verified RED via copy-aside revert,
+  restored. Review fold (PR #3037 MINOR): softened the ProtocolName doc
+  comment so it no longer over-claims a complete ProtocolNumber inverse.
+- **File(s)**: pkg/appid/catalog.go, pkg/api/sessions.go,
+  pkg/grpcapi/server_helpers.go, pkg/api/rest_filter_failclosed_test.go,
+  _Log.md
+- **Gates**: go build ./... clean; gofmt -l clean on changed files; go
+  vet ./pkg/api/... ./pkg/grpcapi/... ./pkg/appid/... clean; go test
+  ./pkg/api/... ./pkg/grpcapi/... ./pkg/appid/... green (the prior
+  pre-existing `TestShowTextGolden` drift was fixed+merged in #3038,
+  picked up by rebasing onto origin/master).
+
+## 2026-06-25 — fix TestShowTextGolden syn-flood attack-threshold golden drift (#3033 follow-up)
+
+- **Timestamp**: 2026-06-25
+- **Action**: master CI was RED — `TestShowTextGolden` in `pkg/grpcapi`
+  failed because PR #3033 (#3024) started applying the Junos default
+  syn-flood `attack-threshold 200` when the stanza is enabled without an
+  explicit threshold. The golden fixture
+  (`showGoldenConfigCommands`) enables `security screen ids-option
+  untrust-screen tcp syn-flood` with NO explicit threshold, so the three
+  screen show topics (`screen`, `screen-ids-option:untrust-screen`,
+  `screen-ids-option-detail:untrust-screen`) now render 200 where the
+  golden snapshot still expected 0. #3033's gates were pkg/config +
+  pkg/dataplane and missed this show-text golden. Regenerated the golden
+  via `UPDATE_SHOW_GOLDEN=1 go test ./pkg/grpcapi/ -run TestShowTextGolden`;
+  the only diff is the three `0`→`200` attack-threshold renderings, which
+  is the now-correct behavior (200 is the intended default). Confirmed no
+  other topic drifted.
+- **File(s)**: pkg/grpcapi/testdata/server_show_golden.json, _Log.md
+- **Validation**: `go test ./pkg/grpcapi/...` (154 passed), `go build
+  ./...`, `go vet ./pkg/grpcapi/...` all green. Pre-existing gofmt drift
+  in `server_show_chassis_forwarding_test.go` is on origin/master and out
+  of scope (untouched by this change).
+
+## 2026-06-25 — #2890: eventengine runAction retry timer leak (time.After → time.NewTimer+Stop)
+
+- **Timestamp**: 2026-06-25
+- **Action**: fixed the lock-held retry select in `runAction`. The backoff
+  sleep used `case <-time.After(backoff)`, whose runtime timer cannot be
+  stopped — when `stopCh` fired before the backoff elapsed (daemon shutdown or
+  `Apply` churn) the armed timer leaked until it fired. With the doubling
+  backoff toward the 5 s ceiling, orphaned timers accumulate across restart
+  churn. Replaced with an explicit `time.NewTimer` + `Stop()` exposed through a
+  test-injectable `newRetryTimer`/`newTimerFn` seam; the stopCh branch now
+  stops the timer before returning. The #2868 engine-lifetime `lifeCtx` /
+  `commitContext` plumbing is preserved unchanged.
+- **File(s)**: pkg/eventengine/engine.go,
+  pkg/eventengine/engine_integration_test.go, pkg/eventengine/README.md
+- **Validation**: `go build ./...`, `gofmt -l pkg/eventengine` (clean),
+  `go vet ./pkg/eventengine/...`, `go test -race ./pkg/eventengine/...` (26
+  passed). Fail-on-revert proven: reverting the select to `time.After` makes
+  `TestRetry_TimerStoppedOnEngineStop` go RED (the injected `newTimerFn` seam
+  is never consulted on the stop branch).
 
 ## 2026-06-25 — #2923 (review fold, PR #2984 MINOR): forwardable-disposition tunnel-liveness gate
 

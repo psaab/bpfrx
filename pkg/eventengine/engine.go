@@ -176,6 +176,14 @@ type Engine struct {
 	// Injectable clock for tests; nil means time.Now.
 	nowFn func() time.Time
 
+	// Injectable retry-backoff timer for tests; nil means newRetryTimer
+	// (backed by time.NewTimer). Returns the fire channel plus a stop func
+	// that releases the underlying timer when the retry is cancelled before
+	// the backoff elapses (#2890 — a plain time.After cannot be stopped, so
+	// its runtime timer leaks until it fires). A test can substitute this to
+	// assert the stop func is invoked on the stopCh branch.
+	newTimerFn func(time.Duration) (<-chan time.Time, func() bool)
+
 	// Lock-retry tuning, overridable in tests. Zero means the package
 	// defaults (lockRetryInitial/Max/Deadline).
 	retryInitial  time.Duration
@@ -232,6 +240,21 @@ func (e *Engine) now() time.Time {
 		return e.nowFn()
 	}
 	return time.Now()
+}
+
+// newRetryTimer returns the backoff fire channel plus a stop func for the
+// runAction retry select (#2890). Using an explicit time.NewTimer (rather than
+// time.After) lets the retry release the runtime timer immediately when stopCh
+// fires before the backoff elapses, instead of leaking an armed timer until it
+// fires on shutdown/restart churn. The stop func reports whether it stopped the
+// timer before it fired (so a caller may drain a fired-but-unread channel),
+// mirroring time.Timer.Stop. Overridable in tests via newTimerFn.
+func (e *Engine) newRetryTimer(d time.Duration) (<-chan time.Time, func() bool) {
+	if e.newTimerFn != nil {
+		return e.newTimerFn(d)
+	}
+	t := time.NewTimer(d)
+	return t.C, t.Stop
 }
 
 // Apply loads new event-options policies, RECONCILING per-policy runtime state
@@ -522,10 +545,17 @@ func (e *Engine) runAction(a plannedAction) {
 			e.counters.retried.Add(1)
 			slog.Debug("event-options: config lock held, will retry",
 				"policy", a.policyName, "backoff", backoff)
+			// Explicit timer (NOT time.After) so the runtime timer is
+			// released the instant stopCh fires before the backoff elapses,
+			// rather than leaking an armed timer until it fires (#2890). The
+			// stop func is only meaningful on the stopCh branch; on the timer
+			// branch the timer has already fired and stopping is a no-op.
+			timerC, stopTimer := e.newRetryTimer(backoff)
 			select {
 			case <-e.stopCh:
+				stopTimer()
 				return
-			case <-time.After(backoff):
+			case <-timerC:
 			}
 			backoff *= 2
 			if backoff > maxBackoff {
