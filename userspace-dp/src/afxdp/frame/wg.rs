@@ -69,12 +69,46 @@ fn wg_encapped_size(inner_len: usize, outer_v6: bool) -> usize {
 /// zeroed endpoint destination, cannot be reused here — it always NoRoutes
 /// for WG.)
 ///
+/// #2837 (NON-REPRODUCING — investigated, no fix applicable): the original
+/// report was that this re-resolution "drops the known physical tx_ifindex and
+/// falls back to the logical wg ifindex when the underlay neighbor was
+/// dynamic-learned". It does not reproduce, for two independent reasons both
+/// confirmed against the real resolver:
+///
+///  1. Passing `None` for the dynamic-neighbor map does NOT lose the physical
+///     egress for a dynamic-learned underlay. The egress ifindex is
+///     ROUTE-derived, not neighbor-derived: a route whose next-hop neighbor is
+///     unresolved resolves to disposition `MissingNeighbor` (NOT `NoRoute`)
+///     with the PHYSICAL `egress_ifindex` still populated, and the FIRST arm
+///     below accepts `MissingNeighbor`. (Verified: the route to the real peer
+///     endpoint with `dynamic_neighbors = None` yields
+///     `MissingNeighbor`/`egress_ifindex = <physical>`.) So the dynamic map
+///     would only change the disposition/`neighbor_mac` (neither read here),
+///     never the returned ifindex — the first arm already returns the physical
+///     underlay egress for the dynamic-learned case. The fallback is reached
+///     ONLY on a genuine NoRoute to the peer endpoint, in which case there is
+///     no underlay to deliver on regardless of which ifindex is chosen.
+///
+///  2. There is no admit-time physical `tx_ifindex` to fall back TO for a WG
+///     session. `forwarding_build::tunnels` zeroes the WG endpoint destination
+///     (`0.0.0.0`/`::` — the peer carries the real outer hop), so
+///     `resolve_tunnel_forwarding_resolution` NoRoutes the outer and stores
+///     `tx_ifindex = 0` (verified: the real resolver returns
+///     `NoRoute`/`egress_ifindex = <logical>`/`tx_ifindex = 0` for the WG
+///     endpoint). Even on a routable transport `populate_egress_resolution`
+///     stores `tx_ifindex = egress.bind_ifindex` = the VLAN PARENT, which has
+///     no `state.egress` row (rows are keyed by the L3 subif), so it could not
+///     back the outer-source lookup anyway. A `tx_ifindex`-based fallback is
+///     therefore dead code for WireGuard.
+///
 /// Fallback (conservative): if the outer route cannot be resolved (no FIB
 /// entry / non-positive egress / the resolved egress is itself a tunnel
 /// interface) fall back to the resolution's own `egress_ifindex` (the LOGICAL
 /// ifindex). For the MTU guard this never makes it tighter than the pre-#2680
-/// logical-MTU behaviour; for the source it preserves the pre-#2701 lookup,
-/// so an unresolvable outer is no worse than before.
+/// logical-MTU behaviour; for the source it preserves the pre-#2701 lookup, so
+/// an unresolvable outer is no worse than before. This case is only reached
+/// when the peer endpoint genuinely has no route (undeliverable), so the
+/// choice of ifindex here cannot rescue the packet.
 #[inline]
 fn outer_physical_egress_ifindex(
     decision: &SessionDecision,
@@ -677,7 +711,116 @@ mod wg_frame_tests {
         assert_eq!(
             outer_physical_egress_ifindex(&decision, &state, endpoint, unrouted),
             400,
-            "unresolvable outer falls back to the logical egress_ifindex"
+            "unresolvable outer with no stored tx_ifindex falls back to the \
+             logical egress_ifindex"
+        );
+    }
+
+    // === #2837 (NON-REPRODUCING): the report claimed outer re-resolution
+    // drops the physical tx_ifindex and falls back to the logical wg ifindex
+    // for a dynamic-learned underlay neighbor. It does not reproduce: the
+    // FIRST arm of `outer_physical_egress_ifindex` re-resolves the route to the
+    // real peer endpoint and returns the PHYSICAL underlay egress even when the
+    // neighbor is unresolved (dynamic-learned), because the egress ifindex is
+    // ROUTE-derived, not neighbor-derived. These tests drive the helper with
+    // the REAL resolver values a WG session actually produces (tx_ifindex = 0,
+    // dynamic_neighbors visible only through the route). No fabricated
+    // tx_ifindex is used — the real resolver never produces a usable one for
+    // WG (it stores tx_ifindex = 0, or the VLAN parent which has no egress
+    // row). See the helper doc comment for the full analysis. ===
+
+    #[test]
+    fn outer_egress_returns_physical_for_dynamic_learned_underlay_neighbor() {
+        // #2837 core claim, refuted. The fixture has NO static neighbor for the
+        // peer-endpoint next-hop (172.16.80.1), so resolving the route to the
+        // real peer endpoint with the dynamic-neighbor map elided (the
+        // `outer_physical_egress_ifindex` helper passes `None`) yields
+        // disposition `MissingNeighbor` — exactly the dynamic-learned-underlay
+        // case the report worried about. The route still resolves the PHYSICAL
+        // egress (reth0.80, ifindex 12), and the FIRST arm accepts
+        // `MissingNeighbor`, so the helper returns the physical underlay (12),
+        // NOT the logical wg ifindex (400). The dynamic map (if threaded) would
+        // only change the disposition / neighbor_mac, never this ifindex.
+        let state = build_forwarding_state(&wg_outer_mtu_snapshot());
+        let endpoint = state.tunnel_endpoints.get(&1).expect("wg endpoint present");
+
+        // The real resolver value for this route, with the dynamic-neighbor map
+        // elided: MissingNeighbor (no static neighbor) but the PHYSICAL egress.
+        let real = lookup_forwarding_resolution_v4(
+            &state,
+            None,
+            std::net::Ipv4Addr::new(203, 0, 113, 7),
+            &endpoint.transport_table,
+            1,
+            false,
+            None,
+        );
+        assert_eq!(
+            real.disposition,
+            ForwardingDisposition::MissingNeighbor,
+            "the dynamic-learned-underlay case must be MissingNeighbor, not NoRoute"
+        );
+        assert_eq!(
+            real.egress_ifindex, 12,
+            "MissingNeighbor still carries the route-derived PHYSICAL egress"
+        );
+
+        let decision = wg_tunnel_decision(400, 1);
+        assert_eq!(
+            outer_physical_egress_ifindex(&decision, &state, endpoint, WG_PEER_OUTER_DST),
+            12,
+            "the first arm returns the PHYSICAL underlay (12) for a \
+             dynamic-learned underlay neighbor, NOT the logical wg ifindex (400)"
+        );
+    }
+
+    #[test]
+    fn wg_resolver_stores_zero_tx_ifindex_so_no_tx_fallback_is_possible() {
+        // #2837 second leg, refuted: there is no admit-time physical
+        // `tx_ifindex` to fall back TO for a WG session. The build zeroes the
+        // WG endpoint destination, so `resolve_tunnel_forwarding_resolution`
+        // NoRoutes the outer and stores `tx_ifindex = 0` with `egress_ifindex`
+        // = the LOGICAL tunnel ifindex. A `tx_ifindex`-based fallback would be
+        // dead code; the conservative fallback is the logical ifindex.
+        let state = build_forwarding_state(&wg_outer_mtu_snapshot());
+        let endpoint = state.tunnel_endpoints.get(&1).expect("wg endpoint present");
+        // The build zeroed the WG outer destination.
+        assert_eq!(
+            endpoint.destination,
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            "WG endpoint destination is zeroed by the build (peer carries the hop)"
+        );
+        let real = resolve_tunnel_forwarding_resolution(&state, None, 1, 0);
+        assert_eq!(
+            real.disposition,
+            ForwardingDisposition::NoRoute,
+            "the WG admit-time outer resolution NoRoutes (zeroed destination)"
+        );
+        assert_eq!(
+            real.tx_ifindex, 0,
+            "the real WG resolver stores tx_ifindex = 0 — no physical underlay \
+             tx_ifindex exists to fall back to"
+        );
+        assert_eq!(
+            real.egress_ifindex, 400,
+            "egress_ifindex is the LOGICAL tunnel ifindex"
+        );
+    }
+
+    #[test]
+    fn outer_egress_falls_back_to_logical_when_peer_genuinely_unrouted() {
+        // The only case that reaches the fallback: the peer endpoint genuinely
+        // has no route (undeliverable). The helper falls back to the LOGICAL
+        // egress_ifindex (400) — the conservative pre-#2680/#2701 behaviour. No
+        // ifindex choice can rescue an undeliverable packet here.
+        let state = build_forwarding_state(&wg_outer_mtu_snapshot());
+        let endpoint = state.tunnel_endpoints.get(&1).expect("wg endpoint present");
+        let decision = wg_tunnel_decision(400, 1);
+        let unrouted = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 9));
+        assert_eq!(
+            outer_physical_egress_ifindex(&decision, &state, endpoint, unrouted),
+            400,
+            "a genuinely unrouted peer endpoint falls back to the logical ifindex"
         );
     }
 

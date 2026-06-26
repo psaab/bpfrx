@@ -20546,3 +20546,33 @@ top.
   userspace-dp/src/afxdp/forwarding/README.md,
   pkg/dataplane/userspace/junos_host_policy_3019_test.go,
   docs/junos-cli-reference.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #2837 — REFRAMED to NON-REPRODUCING after a hostile review showed
+  the prior `tx_ifindex`-fallback fix was DEAD CODE for WireGuard. Re-confirmed
+  against the real resolver with a temporary probe (reverted byte-identical):
+  (1) the FIRST arm of `outer_physical_egress_ifindex` re-resolves the route to
+  the real peer endpoint and returns the PHYSICAL underlay egress even for a
+  dynamic-learned underlay neighbor — the route-to-peer lookup with
+  `dynamic_neighbors = None` yields `MissingNeighbor`/`egress_ifindex = 12`
+  (physical), which the first arm accepts; (2) there is no admit-time physical
+  `tx_ifindex` to fall back to — the build zeroes the WG endpoint destination
+  (`0.0.0.0`), so `resolve_tunnel_forwarding_resolution` returns
+  `NoRoute`/`egress_ifindex = 400` (logical)/`tx_ifindex = 0`, and even on a
+  routable transport `tx_ifindex` is the VLAN parent (no `egress` row). So the
+  report's failure (re-resolution drops the physical egress for a dynamic
+  underlay) cannot occur, and the prior fix's `tx_ifindex > 0` branch is never
+  taken for a real WG session. REVERTED the `tx_ifindex`-fallback branch + the
+  3 fabricated tests (which injected `tx_ifindex = 12` the resolver never
+  produces). Restored the conservative LOGICAL-ifindex fallback (pre-#2680
+  behaviour) and added 3 REAL tests driven by actual resolver values:
+  `outer_egress_returns_physical_for_dynamic_learned_underlay_neighbor`
+  (first arm returns physical 12 for `MissingNeighbor`),
+  `wg_resolver_stores_zero_tx_ifindex_so_no_tx_fallback_is_possible`
+  (real resolver → `tx_ifindex = 0`),
+  `outer_egress_falls_back_to_logical_when_peer_genuinely_unrouted`
+  (only the undeliverable NoRoute case reaches the fallback). README claim
+  corrected (the "admit-time PHYSICAL `tx_ifindex` backs the fallback" line was
+  FALSE for WG). Full frame suite 313 passed; wg suite 152 passed; build green.
+  **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/frame/README.md
