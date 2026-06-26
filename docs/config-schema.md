@@ -1250,6 +1250,30 @@ an undefined from-zone and to-zone, `TestPolicySpecialZoneTokensCommit` —
 `any`/`junos-host`/global anti-over-reject, `TestPolicyDefinedZonesCommit`,
 `TestPolicyUndefinedZoneLenientDowngradesToWarning`).
 
+### #3117 — Security-policy `scheduler-name` schema leaf (completion parity)
+
+A security-policy `scheduler-name <name>` binds a class-of-service scheduler
+to the policy. It is compiled — `compiler_security.go`
+(`polInst.node.FindChild("scheduler-name")` → `nodeVal`, read for BOTH
+zone-pair and global policies) — and an undefined reference is strict-rejected
+at commit by `validatePolicySchedulerReferencesStrict`
+(`compiler_validate_strict.go`, downgraded to a warning on the tolerant load /
+peer-sync paths via `compiler_validate_warn.go`). The leaf was nonetheless
+ABSENT from `setSchema`, so `set security policies ... policy <p> scheduler-name`
+had no structural / value-slot `?` completion — a violation of the two-SSOT
+rule that every compiled + validated leaf is declared in the schema tree.
+
+The fix declares `scheduler-name` under both the zone-pair policy node and the
+global policy node in `pkg/config/schema_security.go`, as a sibling of
+`description`/`match`/`then`. It is an **untyped (plain string) leaf** like
+`description`: the compiler consumes the raw token, and the strict
+undefined-scheduler reference check remains the SSOT for rejection (no
+`treeValidator` is added, so completion and validation stay in agreement and
+no compiler/validator behaviour changes). Regression coverage:
+`pkg/config/schema_scheduler_name_3117_test.go` — the leaf is offered by
+`CompleteSetPathWithValues` for zone-pair and global policies (fail-on-revert),
+and the declared form passes `SchemaValidate` without a false reject.
+
 ### #2391 — Security-zone count cap (commit fail-closed)
 
 Security-zone ids are assigned sequentially `1..N` over the sorted zone names
