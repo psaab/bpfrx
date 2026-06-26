@@ -913,6 +913,16 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
 			Screen: make(map[string]*ScreenProfile),
+			// #3065: fail-CLOSED no-match default. The PolicyAction zero
+			// value is PolicyPermit (iota==0), so an unset default-policy
+			// would otherwise ship as permit-all — the opposite of the
+			// Junos SRX default-security-policy (deny-all). Initialize the
+			// fallback to PolicyDeny here so an absent
+			// `security policies default-policy` stanza denies unmatched
+			// zone-pair traffic. An operator opts back into permit-all
+			// explicitly via `set security policies default-policy
+			// permit-all` (handled in compilePolicies).
+			DefaultPolicy: PolicyDeny,
 		},
 		Interfaces: InterfacesConfig{
 			Interfaces: make(map[string]*InterfaceConfig),

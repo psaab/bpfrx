@@ -1,3 +1,29 @@
+## 2026-06-25 — #3065: unspecified default-policy fails CLOSED (deny-all) + reject-all + schema leaf
+
+- **Timestamp**: 2026-06-25
+- **Action**: Flipped the implicit no-match security default from permit-all
+  to deny-all (Junos `default-security-policy` parity, fail-closed). The
+  `PolicyAction` zero value is `PolicyPermit`, so an unset
+  `security policies default-policy` stanza was shipping permit-all to the
+  dataplane (the snapshot string `policyActionString` → Rust `parse_action`
+  → `PolicyState.default_action` no-match verdict). Fix: (1) `CompileConfig`
+  now initializes `SecurityConfig.DefaultPolicy = PolicyDeny`; (2) added a
+  `reject-all` → `PolicyReject` case to the `compilePolicies` switch (it
+  previously fell through and was silently ignored); (3) added a typed
+  `ValueEnumOf` `default-policy` leaf under `policies` in
+  `schema_security.go` so a bogus value fails `commit check`. No Rust change
+  needed — the Rust struct default was already `Deny`; the Go zero value was
+  the override. Added fail-on-revert tests
+  `compiler_default_policy_3065_test.go` (config) +
+  `default_policy_3065_test.go` (userspace snapshot string), both verified
+  RED when the init is reverted. Full `go test ./...` green (6163+ tests),
+  no fixture relied on the implicit permit-all. Updated pkg/config README +
+  docs/config-schema.md (#3065 section).
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_security.go,
+  pkg/config/schema_security.go,
+  pkg/config/compiler_default_policy_3065_test.go,
+  pkg/dataplane/userspace/default_policy_3065_test.go,
+  pkg/config/README.md, docs/config-schema.md, _Log.md
 ## 2026-06-25 — #3066: undefined zone screen-profile reference is now a commit-time hard reject
 
 - **Timestamp**: 2026-06-25

@@ -1128,6 +1128,57 @@ conflict guard, `TestPolicyNoTerminalActionLenientDefaultsDeny` — lenient
 warn + default-to-deny, `TestPolicyExactlyOneTerminalActionCommits` —
 positive control).
 
+### #3065 — Unspecified `default-policy` is fail-closed (deny-all) + `reject-all` + schema leaf
+
+The sibling of #3043 for the IMPLICIT fallback. When a flow matches no
+zone-pair policy, no global policy, and no explicit term, the verdict is the
+*default policy*, held in `SecurityConfig.DefaultPolicy`. Because
+`PolicyAction`'s zero value is `PolicyPermit` (`types_security.go`), a config
+that omits the `security policies default-policy` stanza compiled to the zero
+value and shipped **permit-all** — a silent fail-OPEN that is the opposite of
+the Junos SRX `default-security-policy`, which denies all unmatched traffic.
+(`compiler_validate_strict.go`'s own comment flagged this.) Two adjacent
+gaps: `compilePolicies` (`compiler_security.go`) handled only `permit-all` /
+`deny-all`, so the valid Junos `reject-all` fell through the switch and was
+silently ignored; and the `default-policy` leaf was absent from
+`schema_security.go`, so a misspelled value was accepted unchecked by the
+schema walker.
+
+**Fail-closed default:** `CompileConfig` (`compiler.go`) now initializes
+`SecurityConfig.DefaultPolicy = PolicyDeny` when it constructs the typed
+`Config`. An absent stanza therefore denies unmatched zone-pair traffic
+(Junos parity). The `PolicyAction` enum zero value is left unchanged
+(matching the #3043 decision) — the default is set explicitly at construction
+rather than by flipping `iota`.
+
+**Explicit override:** an operator restores the legacy permit-all behaviour
+with `set security policies default-policy permit-all`; `deny-all` and
+`reject-all` are the other accepted values, with `reject-all` now mapped to
+`PolicyReject` in the `compilePolicies` switch.
+
+**Dataplane plumbing:** the value flows to the userspace dataplane unchanged
+via the snapshot string — `policyActionString(cfg.Security.DefaultPolicy)`
+(`pkg/dataplane/userspace/builder.go`) → `ConfigSnapshot.DefaultPolicy` →
+Rust `parse_action` → `PolicyState.default_action`
+(`userspace-dp/src/policy.rs`), which is the no-match verdict. The Rust
+struct default was already `Deny`; the Go zero value was overriding it with
+`"permit"`, so the Go init is the operative fix.
+
+**Schema leaf:** `default-policy` is a typed `ValueEnumOf` child of
+`policies` (`schema_security.go`) validated by
+`ValidateEnum([]string{"permit-all","deny-all","reject-all"})`, so a bogus
+value (`allow-everything`) fails `commit check` instead of being silently
+accepted.
+
+Regression coverage: `pkg/config/compiler_default_policy_3065_test.go`
+(`TestDefaultPolicyFailsClosed` — fail-on-revert: unset stanza must compile
+to `PolicyDeny`; `TestDefaultPolicyExplicitOverrides` — permit-all/deny-all/
+reject-all mapping; `TestDefaultPolicySchemaValidation` — enum accept/reject)
+and `pkg/dataplane/userspace/default_policy_3065_test.go`
+(`TestSnapshotDefaultPolicyFailsClosed` — the snapshot string the Rust verdict
+reads is `"deny"` for an unset config, `"permit"`/`"reject"` for the explicit
+overrides).
+
 ### #2401 — Security-policy undefined-zone references (commit fail-closed)
 
 A `set security policies from-zone <a> to-zone <b> { policy ... }` stanza
