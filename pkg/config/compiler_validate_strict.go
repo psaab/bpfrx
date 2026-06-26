@@ -3502,20 +3502,28 @@ func validateDestinationNATAddressesStrict(cfg *Config) error {
 				// No destination match at all — out of scope.
 				continue
 			}
-			anyGood := false
+			// #3228: reject the rule if ANY listed destination-address is
+			// unparseable, not just when they ALL are. The snapshot builder
+			// (buildDestinationNATSnapshots) strips the CIDR suffix and then
+			// per-entry `continue`s past any token that is empty or fails
+			// net.ParseIP — silently dropping it from the installed DNAT
+			// table. A mixed list such as `[ 192.0.2.1 web-server ]` would
+			// otherwise commit clean (the old anyGood break) while
+			// `web-server` never translates. Mirror the builder's exact skip
+			// predicate (CIDR strip via natCIDRIPPart, then empty/ParseIP
+			// check) so the validator rejects precisely what the builder
+			// would drop: validator and dataplane view agree, and an
+			// all-valid list still compiles byte-identical.
 			for _, raw := range destAddrs {
 				ipPart := natCIDRIPPart(raw)
-				if ipPart != "" && net.ParseIP(ipPart) != nil {
-					anyGood = true
-					break
+				if ipPart == "" || net.ParseIP(ipPart) == nil {
+					return fmt.Errorf(
+						"destination-nat rule-set %q rule %q: match destination-address "+
+							"%q is not a valid IP/CIDR; the rule would commit but the "+
+							"dataplane silently drops the malformed entry, leaving traffic "+
+							"to it untranslated (full list: %s)",
+						rs.Name, rule.Name, raw, strings.Join(destAddrs, ", "))
 				}
-			}
-			if !anyGood {
-				return fmt.Errorf(
-					"destination-nat rule-set %q rule %q: no valid destination-address "+
-						"(every match destination-address is malformed: %s); "+
-						"the rule would commit but never translate any traffic",
-					rs.Name, rule.Name, strings.Join(destAddrs, ", "))
 			}
 			// #3029: a DNAT `match destination-address` that is a MULTI-HOST
 			// prefix (a CIDR with a non-host mask, e.g. 198.51.100.0/24) is

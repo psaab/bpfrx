@@ -441,3 +441,25 @@ is unchanged).
 
 The rewrite target (translated destination/port from the pool) is unchanged —
 only the MATCH set grows from one destination to all configured destinations.
+
+### 11.1 Per-entry commit gate on a partial-valid list (#3228)
+
+The all-malformed fail-closed posture above (no snapshot row when EVERY
+destination is malformed) is caught at commit by
+`validateDestinationNATAddressesStrict` (`compiler_validate_strict.go`). That
+gate originally used an `anyGood` break: it passed commit as long as AT LEAST
+ONE destination parsed. But the builder skips malformed entries PER-ENTRY, so a
+MIXED list such as `match destination-address [ 192.0.2.1 web-server ]`
+committed clean (one good entry satisfied `anyGood`) while `web-server` was
+silently dropped from the installed DNAT table — traffic to it was never
+translated, a partial, silent drop of a forwarding-relevant config (#3228).
+
+The gate now rejects the rule if ANY listed destination-address fails to parse,
+mirroring the builder's exact skip predicate (`natCIDRIPPart` CIDR strip, then
+empty / `net.ParseIP` check). Validator and dataplane view agree: anything the
+builder would drop, the validator rejects, naming the offending entry. An
+all-valid list still compiles byte-identical and installs every entry (the
+multi-destination behavior above is unchanged). On the tolerant load / peer-sync
+path the rejection is downgraded to a `destination-nat address` warning (#1960
+no-brick), consistent with the all-malformed (#2396(c)) and multi-host-prefix
+(#3029) gates that share this validator.
