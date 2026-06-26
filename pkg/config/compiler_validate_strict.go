@@ -1577,6 +1577,56 @@ func validatePolicyZoneReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// validateScreenProfileReferencesStrict hard-rejects a security zone whose
+// `screen <name>` references a screen-ids-option profile the configuration
+// never defines under `set security screen ids-option <name>` (#3066).
+//
+// Before this gate the reference was WARNED only (ValidateConfig /
+// compiler_validate_warn.go), so the commit succeeded with an unenforceable
+// reference. At runtime the userspace dataplane fails OPEN: a missing profile
+// makes ScreenEngine::check_packet_with_zone_id return ScreenVerdict::Pass
+// (userspace-dp/src/screen/mod.rs — `let Some(profile) = self.profiles.get(zone)
+// else { return ScreenVerdict::Pass; }`), so EVERY screen check (land,
+// syn-flood, ping-death, teardrop, scans, rate limits) is silently skipped for
+// that zone. A typo'd or uncreated profile name thus leaves the zone with no
+// screen protection while the operator believes screening is active — the same
+// silent fail-OPEN commit-validation class as the closed #2401 (undefined
+// policy zone references). Junos rejects an undefined `screen ids-option`
+// reference at commit; this validator restores that fail-CLOSED parity.
+//
+// Strict on the commit / commit-check path (CompileConfig — hard-reject);
+// downgraded to a cfg.Warnings entry on the tolerant load / peer-sync paths
+// (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientScreenProfileRefs) so an already-persisted or peer-synced config that
+// an older binary accepted still BOOTS (#1960 fail-closed-on-load doctrine).
+// On that tolerant path the dataplane is NOT independently safe — the missing
+// profile fails open — so the warning is the operator's only signal; the strict
+// commit gate is the real fix that keeps a bad reference from ever reaching the
+// dataplane. Iteration is over cfg.Security.Zones in sorted name order so the
+// first-reported error is deterministic.
+func validateScreenProfileReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		zone := cfg.Security.Zones[name]
+		if zone == nil || zone.ScreenProfile == "" {
+			continue
+		}
+		if _, ok := cfg.Security.Screen[zone.ScreenProfile]; !ok {
+			return fmt.Errorf(
+				"security zone %q references undefined screen profile %q; define `set security screen ids-option %s` in the same commit or the zone silently runs with NO screen protection (the dataplane fails open for a missing profile)",
+				name, zone.ScreenProfile, zone.ScreenProfile)
+		}
+	}
+	return nil
+}
+
 // policyActionName renders a PolicyAction as its Junos `then` token for
 // operator-facing validator errors.
 func policyActionName(a PolicyAction) string {

@@ -140,6 +140,24 @@ logging rules, not these specific hot-path constants.
   published or deleted by this path. Fail-on-revert: the wiring test
   `close_delta_deletes_dnat_table_entry_for_snat_flow` plus the key-SSOT
   tests in `src/afxdp/tests.rs`.
+- **Source-NAT pool subnet expansion (#3049)**: a source-NAT pool
+  address entry may be a bare IP, a host CIDR (`/32`, `/128`), or a
+  subnet CIDR (e.g. `203.0.113.0/28`). Junos uses the FULL prefix range
+  for a source-NAT pool, so `parse_source_nat_rules_with_previous`
+  (`src/nat/source.rs`) enumerates every address in the prefix
+  (network..=broadcast inclusive) via `expand_pool_address`, populating
+  `pool_addresses_v4` / `pool_addresses_v6` so the port allocator
+  round-robins / hashes across the whole range. The pre-#3049 code
+  stripped the mask and kept only the network host, silently collapsing
+  a `/28` (16 addresses) to one — severe pool/port exhaustion with no
+  signal. A single-host prefix still yields exactly one address. An
+  over-broad prefix whose host count exceeds `MAX_POOL_PREFIX_HOSTS`
+  (65536; covers up to a v4 `/16` or v6 `/112`) is rejected as an
+  invalid pool (`SourceNatFailureReason::InvalidPool`) — fail-closed, so
+  the operator gets a clear signal rather than a clamped or OOM pool.
+  Fail-on-revert: `pool_snat_subnet_expands_full_cidr_range`,
+  `pool_snat_host_cidr_yields_single_address`, and
+  `pool_snat_overbroad_prefix_marks_invalid` in `src/nat/tests.rs`.
 - `HEARTBEAT_GRACE_PERIOD_NS = 6 s` is defined in
   `userspace-dp/src/afxdp/mod.rs` but currently `#[allow(dead_code)]`
   — reserved for future XDP-shim heartbeat gating logic. Workers

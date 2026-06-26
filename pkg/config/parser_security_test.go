@@ -2647,7 +2647,7 @@ func TestIPsecProposalSetSyntax(t *testing.T) {
 
 func TestZoneSetSyntax(t *testing.T) {
 	tree := &ConfigTree{}
-	for _, cmd := range []string{"set security zones security-zone trust interfaces trust0", "set security zones security-zone trust interfaces trust1", "set security zones security-zone trust screen untrust-screen", "set security zones security-zone trust host-inbound-traffic system-services ping", "set security zones security-zone trust host-inbound-traffic system-services ssh", "set security zones security-zone trust host-inbound-traffic protocols ospf", "set security zones security-zone untrust interfaces untrust0"} {
+	for _, cmd := range []string{"set security zones security-zone trust interfaces trust0", "set security zones security-zone trust interfaces trust1", "set security zones security-zone trust screen untrust-screen", "set security screen ids-option untrust-screen tcp land", "set security zones security-zone trust host-inbound-traffic system-services ping", "set security zones security-zone trust host-inbound-traffic system-services ssh", "set security zones security-zone trust host-inbound-traffic protocols ospf", "set security zones security-zone untrust interfaces untrust0"} {
 		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}

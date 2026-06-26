@@ -205,6 +205,13 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 				sec.DefaultPolicy = PolicyPermit
 			case "deny-all":
 				sec.DefaultPolicy = PolicyDeny
+			case "reject-all":
+				// #3065: reject-all is valid Junos; previously it fell
+				// through this switch and left the (now deny) default
+				// untouched. Map it to PolicyReject so the dataplane
+				// no-match verdict sends an ICMP/RST reject instead of a
+				// silent drop.
+				sec.DefaultPolicy = PolicyReject
 			}
 			continue
 		}

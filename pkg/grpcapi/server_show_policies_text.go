@@ -89,6 +89,43 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 		}
 		policySetID++
 	}
+	// Global policies (#3059): the runtime evaluates global policies after
+	// the exact zone-pair policies, and the gRPC detail view, CLI,
+	// Prometheus collector, and structured GetPolicies all expose them.
+	// The hit-count text surface must too — otherwise an operator using
+	// the exact command meant to prove which policy is catching traffic
+	// sees zero evidence for a global emergency deny/permit. Render globals
+	// with from/to zone "*" (matching the other surfaces). Counter IDs
+	// continue from the zone-pair loop: policySetID*MaxRulesPerPolicy + i,
+	// keeping the global slots aligned with the dataplane (#3045/#3050 did
+	// the same for the REST inventory). A from/to-zone filter selects
+	// zone-pair policies only, so suppress globals when one is set.
+	if len(cfg.Security.GlobalPolicies) > 0 && filterFrom == "" && filterTo == "" {
+		for i, pol := range cfg.Security.GlobalPolicies {
+			if pol == nil {
+				continue
+			}
+			action := "permit"
+			switch pol.Action {
+			case 1:
+				action = "deny"
+			case 2:
+				action = "reject"
+			}
+			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+			var pkts, bytes uint64
+			if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
+				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
+					pkts = counters.Packets
+					bytes = counters.Bytes
+				}
+			}
+			totalPkts += pkts
+			totalBytes += bytes
+			fmt.Fprintf(buf, "%-12s %-12s %-24s %-8s %12d %16d\n",
+				"*", "*", pol.Name, action, pkts, bytes)
+		}
+	}
 	fmt.Fprintln(buf, strings.Repeat("-", 88))
 	fmt.Fprintf(buf, "%-48s %8s %12d %16d\n", "Total", "", totalPkts, totalBytes)
 }

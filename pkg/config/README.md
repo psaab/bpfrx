@@ -175,6 +175,36 @@ zones (`ge-0/0/0.0` in trust, `ge-0/0/0.1` in untrust — a valid VLAN
 split) are NOT rejected; a bare physical interface and one of its units
 across zones ARE (same logical interface). Same fail-closed-on-load
 doctrine as #3043/#2401.
+**No-match default-policy is fail-closed (#3065):** the sibling of #3043
+for the implicit fallback. When a flow matches NO zone-pair, global, or
+default policy, the verdict is `SecurityConfig.DefaultPolicy`. Because the
+`PolicyAction` zero value is `PolicyPermit`, an unset
+`security policies default-policy` stanza historically compiled to
+permit-all — fail-OPEN, the opposite of the Junos SRX
+`default-security-policy` (deny-all). `CompileConfig` now initializes
+`SecurityConfig.DefaultPolicy = PolicyDeny` (`compiler.go`), so an absent
+stanza denies unmatched traffic. An operator opts back into the legacy
+permit-all explicitly with `set security policies default-policy
+permit-all`; `deny-all` and `reject-all` are the other accepted values
+(`compilePolicies`, `compiler_security.go` — `reject-all` previously fell
+through the switch and was silently ignored). The value is plumbed to the
+userspace dataplane via the `ConfigSnapshot.DefaultPolicy` string
+(`policyActionString` → Rust `parse_action` → `PolicyState.default_action`,
+the no-match verdict). The `default-policy` leaf is a typed `ValueEnumOf`
+in `schema_security.go`, so a bogus value fails `commit check`. See
+`docs/config-schema.md` "#3065".
+**Zone screen-profile reference is fail-closed (#3066):** a security zone's
+`screen <name>` that references a screen-ids-option profile the config never
+defines historically committed with a warning only, and at runtime the
+userspace dataplane fails OPEN — `screen/mod.rs` returns `ScreenVerdict::Pass`
+for a missing profile, silently skipping every screen check for that zone while
+the operator believes screening is active. `validateScreenProfileReferencesStrict`
+(`compiler_validate_strict.go`) hard-rejects an undefined screen-profile
+reference at commit. Unlike the policy gates the dataplane is NOT independently
+safe on the tolerant load/peer-sync path (the missing profile still fails
+open), so that path only downgrades to a warning to preserve #1960 no-brick
+boot — the strict commit gate, which keeps a bad reference from ever reaching
+the dataplane, is the real fix.
 
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map

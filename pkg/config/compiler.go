@@ -640,6 +640,23 @@ type compileOpts struct {
 	// permit), so a leniently-loaded actionless policy DENIES rather than
 	// fails open. Same doctrine as lenientPolicyZoneRefs / lenientPolicyMatchAddress.
 	lenientPolicyTerminalAction bool
+	// lenientScreenProfileRefs (#3066) downgrades the zone screen-profile
+	// reference gate (validateScreenProfileReferencesStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit / commit-check
+	// path hard-rejects a security zone whose `screen <name>` references a
+	// screen-ids-option profile the config never defines. Before this gate the
+	// reference was warned only, so the commit succeeded; at runtime the
+	// userspace dataplane fails OPEN (screen/mod.rs returns ScreenVerdict::Pass
+	// for a missing profile), silently skipping every screen check for the zone
+	// while the operator believes screening is active. The tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config that an older binary accepted still BOOTS (#1960
+	// no-brick). Unlike the policy gates, the dataplane is NOT independently
+	// safe on the lenient path (a missing profile fails open), so the strict
+	// commit gate — keeping a bad reference from ever reaching the dataplane —
+	// is the real fix; the warning is the only signal on a leniently-loaded
+	// config. Same doctrine as lenientPolicyZoneRefs.
+	lenientScreenProfileRefs bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -700,6 +717,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRouterID:                    true,
 		lenientSNMPTrapGroup:               true,
 		lenientPolicyTerminalAction:        true,
+		lenientScreenProfileRefs:           true,
 	})
 }
 
@@ -811,6 +829,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRouterID:                    true,
 		lenientSNMPTrapGroup:               true,
 		lenientPolicyTerminalAction:        true,
+		lenientScreenProfileRefs:           true,
 	})
 }
 
@@ -910,6 +929,16 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
 			Screen: make(map[string]*ScreenProfile),
+			// #3065: fail-CLOSED no-match default. The PolicyAction zero
+			// value is PolicyPermit (iota==0), so an unset default-policy
+			// would otherwise ship as permit-all — the opposite of the
+			// Junos SRX default-security-policy (deny-all). Initialize the
+			// fallback to PolicyDeny here so an absent
+			// `security policies default-policy` stanza denies unmatched
+			// zone-pair traffic. An operator opts back into permit-all
+			// explicitly via `set security policies default-policy
+			// permit-all` (handled in compilePolicies).
+			DefaultPolicy: PolicyDeny,
 		},
 		Interfaces: InterfacesConfig{
 			Interfaces: make(map[string]*InterfaceConfig),
@@ -1195,6 +1224,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientPolicyTerminalAction {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("policy terminal action (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3066 zone screen-profile reference fail-open gate. Strict on commit /
+	// commit-check (hard-reject a zone whose `screen <name>` references a
+	// screen-ids-option profile the config never defines — at runtime the
+	// dataplane fails OPEN for a missing profile, silently skipping every
+	// screen check for that zone); lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960 no-brick).
+	// Unlike the policy gates the runtime is NOT independently safe on the
+	// lenient path, so the strict commit gate is the real fix.
+	if err := validateScreenProfileReferencesStrict(cfg); err != nil {
+		if opts.lenientScreenProfileRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("zone screen profile reference (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

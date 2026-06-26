@@ -20,6 +20,85 @@
 - **File(s)**: pkg/config/compiler_validate_strict.go,
   pkg/config/compiler.go, pkg/config/zone_interface_membership_test.go,
   pkg/config/README.md, _Log.md
+## 2026-06-25 — #3065: unspecified default-policy fails CLOSED (deny-all) + reject-all + schema leaf
+
+- **Timestamp**: 2026-06-25
+- **Action**: Flipped the implicit no-match security default from permit-all
+  to deny-all (Junos `default-security-policy` parity, fail-closed). The
+  `PolicyAction` zero value is `PolicyPermit`, so an unset
+  `security policies default-policy` stanza was shipping permit-all to the
+  dataplane (the snapshot string `policyActionString` → Rust `parse_action`
+  → `PolicyState.default_action` no-match verdict). Fix: (1) `CompileConfig`
+  now initializes `SecurityConfig.DefaultPolicy = PolicyDeny`; (2) added a
+  `reject-all` → `PolicyReject` case to the `compilePolicies` switch (it
+  previously fell through and was silently ignored); (3) added a typed
+  `ValueEnumOf` `default-policy` leaf under `policies` in
+  `schema_security.go` so a bogus value fails `commit check`. No Rust change
+  needed — the Rust struct default was already `Deny`; the Go zero value was
+  the override. Added fail-on-revert tests
+  `compiler_default_policy_3065_test.go` (config) +
+  `default_policy_3065_test.go` (userspace snapshot string), both verified
+  RED when the init is reverted. Full `go test ./...` green (6163+ tests),
+  no fixture relied on the implicit permit-all. Updated pkg/config README +
+  docs/config-schema.md (#3065 section).
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_security.go,
+  pkg/config/schema_security.go,
+  pkg/config/compiler_default_policy_3065_test.go,
+  pkg/dataplane/userspace/default_policy_3065_test.go,
+  pkg/config/README.md, docs/config-schema.md, _Log.md
+## 2026-06-25 — #3066: undefined zone screen-profile reference is now a commit-time hard reject
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add `validateScreenProfileReferencesStrict` (#3066). A security
+  zone whose `screen <name>` references an undefined screen-ids-option profile
+  was only WARNED at commit while the Rust dataplane fails OPEN
+  (`screen/mod.rs` returns `ScreenVerdict::Pass` for a missing profile),
+  silently disabling all screen protection for that zone. Promoted to a
+  fail-closed commit/commit-check hard reject mirroring
+  `validatePolicyZoneReferencesStrict` (#2401); tolerant load/peer-sync path
+  downgrades to a warning via new `lenientScreenProfileRefs` flag (#1960
+  no-brick). Fail-on-revert test `screen_profile_ref_test.go` (RED without the
+  strict gate). Fixed two pre-existing tests that referenced an undefined
+  screen profile (`TestSetPathSchema`, `TestZoneSetSyntax`) by defining the
+  referenced profile.
+- **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/screen_profile_ref_test.go, pkg/config/parser_ast_test.go,
+  pkg/config/parser_security_test.go, pkg/config/README.md
+## 2026-06-25 — #3049: source-NAT pool subnet expanded to full CIDR range
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed source-NAT pool subnet truncation. The Rust parser
+  `parse_source_nat_rules_with_previous` stripped the mask off a pool
+  address and kept a single `IpAddr`, so a subnet-style pool like
+  `203.0.113.0/28` (16 addresses) collapsed to one host — severe pool/port
+  exhaustion with no operator signal. The Go compiler passes a bare prefix
+  verbatim (only `address X to Y` ranges were expanded), and the host-mask
+  commit gate covered only NAT64 pools. New `expand_pool_address` helper
+  enumerates the FULL prefix range (network..=broadcast inclusive) into
+  `pool_addresses_v4`/`v6` so the port allocator round-robins/hashes across
+  the whole pool; a single-host prefix (/32, /128) still yields exactly one
+  address; an over-broad prefix beyond `MAX_POOL_PREFIX_HOSTS` (65536) is
+  rejected as `SourceNatFailureReason::InvalidPool` (fail-closed). Added 3
+  fail-on-revert tests (subnet expands to 16, host-CIDR stays 1 + v6 /120
+  → 256, over-broad /8 → invalid). Updated `userspace-dp/README.md`.
+- **File(s)**: userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests.rs,
+  userspace-dp/README.md, _Log.md
+## 2026-06-25 — #3059: gRPC hit-count text includes global policies
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `showPoliciesHitCount` (gRPC text `show security policies
+  hit-count`) to append a global-policy section after the zone-pair loop,
+  rendering each `cfg.Security.GlobalPolicies` entry with from/to zone `"*"`.
+  Global counter IDs continue from the zone-pair `policySetID`
+  (`policySetID*MaxRulesPerPolicy + i`), keeping global hit counters aligned
+  with the dataplane and matching the gRPC detail view, CLI, Prometheus
+  collector, REST inventory (#3045/#3050), and structured GetPolicies. A
+  from/to-zone filter suppresses the global section (selects zone-pair only).
+  Added fail-on-revert test `TestShowPoliciesHitCountIncludesGlobalPolicies`
+  (RED when globals omitted). Updated pkg/grpcapi README.
+- **File(s)**: pkg/grpcapi/server_show_policies_text.go,
+  pkg/grpcapi/server_show_policies_hitcount_globals_test.go,
+  pkg/grpcapi/README.md
 
 ## 2026-06-25 — #3045: REST /security/policies includes global policies
 
@@ -18755,3 +18834,27 @@ top.
   per #2871. No code change. Build clean; nat:: 130 / static_nat 28 still green.
 - **File(s)**: docs/feature-coverage.md,
   userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2853 — flowexport session-creation StartTime kept only integer
+  Unix seconds (offset 108, u32), so every flow opened in the same wall-clock
+  second exported one StartTime, flattening IPFIX flowStartMilliseconds for
+  short flows. Fix: the SESSION_CLOSE RT_FLOW frame now ALSO carries the
+  creation instant's sub-second NANOSECOND remainder (0..=999_999_999) in the
+  close-unused policy_id slot (offset 44, LE u32), produced by the new
+  monotonic_ns_to_unix_secs_subnanos helper. The Go decoder reads it as
+  EventRecord.CreatedNanos and zeroes PolicyID (a close never carried a real
+  policy id, so policy-name resolution is unchanged); flowStartTime now builds
+  time.Unix(Created, CreatedNanos) for millisecond-accurate StartTime. Gates:
+  go build ./... clean, go test ./pkg/flowexport/... ./pkg/logging/... 196
+  passed, go vet clean, gofmt clean on touched files; cargo build clean,
+  event_stream:: 58 passed. Fail-on-revert proven RED both sides (Go
+  flowStartTime→whole-second; Rust [44:48] write removed).
+- **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/codec_tests.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  userspace-dp/src/event_stream/README.md, pkg/logging/eventbuf.go,
+  pkg/logging/ringbuf.go, pkg/logging/binary_test.go,
+  pkg/flowexport/manager.go, pkg/flowexport/flowstart_test.go,
+  pkg/flowexport/README.md, _Log.md
