@@ -48,6 +48,8 @@ pub(crate) fn extract_screen_info(
         ip_total_len: 0,
         ip_payload_len: 0,
         frag_data_off: 0,
+        saw_ipv4_source_route: false,
+        saw_ipv6_routing_header: false,
     };
 
     let mut tcp_offset: Option<usize> = None;
@@ -64,7 +66,49 @@ pub(crate) fn extract_screen_info(
         info.is_fragment = (info.ip_frag_off & 0x3FFF) != 0;
         info.is_first_fragment =
             (info.ip_frag_off & 0x2000) != 0 && (info.ip_frag_off & 0x1FFF) == 0;
-        tcp_offset = Some(l3_offset + (info.ip_ihl as usize) * 4);
+        // #2973: scan the IPv4 options region (bytes 20..ihl*4) for an
+        // actual source-route option. The `source-route` screen used to
+        // drop on ANY IHL>5 (any options present), which also dropped
+        // benign router-alert/record-route/timestamp/security packets.
+        // Detect only LSRR (option type 131 = copied|control|9) and
+        // SSRR (137 = copied|control|11). Bounded TLV walk; EOOL(0) ends,
+        // NOP(1) is one byte, every other option is length-prefixed.
+        let ihl_bytes = (info.ip_ihl as usize) * 4;
+        if info.ip_ihl > 5 && l3_offset + ihl_bytes <= frame.len() {
+            const IPOPT_EOOL: u8 = 0;
+            const IPOPT_NOP: u8 = 1;
+            const IPOPT_LSRR: u8 = 131;
+            const IPOPT_SSRR: u8 = 137;
+            let opt_end = l3_offset + ihl_bytes;
+            let mut pos = l3_offset + 20;
+            while pos < opt_end {
+                let kind = frame[pos];
+                if kind == IPOPT_EOOL {
+                    break;
+                }
+                if kind == IPOPT_NOP {
+                    pos += 1;
+                    continue;
+                }
+                if kind == IPOPT_LSRR || kind == IPOPT_SSRR {
+                    info.saw_ipv4_source_route = true;
+                    break;
+                }
+                // Length-prefixed option: byte at pos+1 is the total
+                // option length (including the kind/length bytes). A
+                // malformed length (<2 or running past the options end)
+                // ends the walk to avoid an infinite/over-read loop.
+                if pos + 1 >= opt_end {
+                    break;
+                }
+                let opt_len = frame[pos + 1] as usize;
+                if opt_len < 2 || pos + opt_len > opt_end {
+                    break;
+                }
+                pos += opt_len;
+            }
+        }
+        tcp_offset = Some(l3_offset + ihl_bytes);
     } else if addr_family == libc::AF_INET6 as u8 {
         // IPv6: walk the extension header chain looking for
         // NEXTHDR_FRAGMENT (44). Fixed IPv6 base header is 40 bytes.
@@ -111,7 +155,26 @@ pub(crate) fn extract_screen_info(
                 return Err(ScreenParseError::TruncatedIpv6ExtChain);
             }
             match nexthdr {
-                NEXTHDR_HOP | NEXTHDR_ROUTING | NEXTHDR_DEST => {
+                NEXTHDR_ROUTING => {
+                    // #2973: an IPv6 Routing Header. Byte at offset+2 is
+                    // the routing type. Type 0 (RH0, the deprecated
+                    // source-route routing header, RFC 5095) and the
+                    // legacy/experimental type 1 are source routing;
+                    // type 2 (Mobile IPv6) and other types are not. We
+                    // need offset+4 to safely read the type byte (the
+                    // generic HOP/DEST arm only needs offset+2). Mirror
+                    // the IPv4 LSRR/SSRR `source-route` screen for parity.
+                    if offset + 4 > frame.len() {
+                        return Err(ScreenParseError::TruncatedIpv6ExtChain);
+                    }
+                    let routing_type = frame[offset + 2];
+                    if routing_type == 0 || routing_type == 1 {
+                        info.saw_ipv6_routing_header = true;
+                    }
+                    nexthdr = frame[offset];
+                    offset += (frame[offset + 1] as usize + 1) * 8;
+                }
+                NEXTHDR_HOP | NEXTHDR_DEST => {
                     if offset + 2 > frame.len() {
                         return Err(ScreenParseError::TruncatedIpv6ExtChain);
                     }
