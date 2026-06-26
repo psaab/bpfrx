@@ -396,6 +396,31 @@ follow-up. The tolerant load/peer-sync path downgrades to a warning
 binary silently accepted still boots — the modifier stays dropped (the
 pre-existing behaviour), now flagged (#1960 no-brick doctrine, same as #3113).
 
+**Unsupported security-policy `then reject` children are rejected at commit
+(#3115, interim — codex-review-066 finding 066-03):** the sibling of #3114 for the
+`reject` arm. Junos SRX `then reject` accepts a custom reject-response `profile
+<name>` and a per-packet-type reject (e.g. `tcp-reset`). `compilePolicy`'s `then`
+switch `reject` arm sets `pol.Action = PolicyReject` and NEVER inspects
+`t.Children`, so any modifier under `then reject` fell out with NO error and was
+SILENTLY DROPPED (set-schema does not list reject children and `schema_walk.go`
+returns nil for unknown keywords). Unlike #3114 this is not a fail-OPEN (reject
+still rejects), but the configured custom reject response is inert — a wire-contract
+/ operator-observability divergence the operator cannot detect at commit.
+`validatePolicyThenRejectStrict` (`compiler_policy_then.go`) hard-rejects a policy
+whose `then reject` carries an unsupported child at commit, naming the policy scope
+(zone-pair or global), the policy, and the offending modifier; a bare `then reject`
+(no child) still commits. It is an AST pre-walk in `compileExpanded` for the same
+reasons as #3114, checks both AST shapes (`Keys[1]` flat-set / child node
+hierarchical), and covers zone-pair and `global` policies. The allowlist
+(`supportedPolicyThenRejectChildren`) is EMPTY today because the compiler enforces
+no `then reject` child — keep it in lockstep with `compilePolicy` so a future
+synthesized reject response / packet-type reset is no longer rejected. Reject-profile
+support (a typed reject-response model + dataplane synthesis) is a deferred
+follow-up. The tolerant load/peer-sync path downgrades to a warning
+(`lenientPolicyThenReject`) so an already-persisted or peer-synced config an older
+binary silently accepted still boots — the modifier stays dropped (the pre-existing
+behaviour), now flagged (#1960 no-brick doctrine, same as #3114).
+
 **Ambiguous secure-tunnel `bind-interface` aliases are rejected at commit
 (#2933):** `security ipsec vpn <name> bind-interface` is a free-form 1-arg
 string stored verbatim on the typed VPN (`compiler_ipsec.go`); the runtime
