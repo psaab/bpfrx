@@ -80,8 +80,30 @@ pub(crate) fn monotonic_ns_to_unix_ns(mono_ns: u64, now_mono_ns: u64, now_unix_n
 /// the `created` wire field (offset 108, u32). Truncates toward the epoch;
 /// 0/unknown stays 0; values beyond u32 (year 2106) saturate.
 pub(crate) fn monotonic_ns_to_unix_secs(mono_ns: u64, now_mono_ns: u64, now_unix_ns: u64) -> u32 {
+    monotonic_ns_to_unix_secs_subnanos(mono_ns, now_mono_ns, now_unix_ns).0
+}
+
+/// #2853: convert a monotonic instant to absolute wall-clock Unix SECONDS plus
+/// the sub-second NANOSECOND remainder (0..=999_999_999). The integer seconds
+/// ride the `created` wire field (offset 108, u32); the sub-second nanos ride
+/// the SESSION_CLOSE-unused policy_id slot (offset 44, u32) so the Go flow
+/// exporters can build a MILLISECOND-accurate flow StartTime instead of one
+/// truncated to the whole second (the #2853 defect: short flows — DNS, single
+/// HTTP requests — all collapsed onto the same integer-second start).
+///
+/// 0/unknown stays `(0, 0)`; a seconds value beyond u32 (year 2106) saturates
+/// to `(u32::MAX, 0)` so the saturated record carries no misleading remainder.
+pub(crate) fn monotonic_ns_to_unix_secs_subnanos(
+    mono_ns: u64,
+    now_mono_ns: u64,
+    now_unix_ns: u64,
+) -> (u32, u32) {
     let unix_ns = monotonic_ns_to_unix_ns(mono_ns, now_mono_ns, now_unix_ns);
-    (unix_ns / NS_PER_SEC).min(u32::MAX as u64) as u32
+    let secs = unix_ns / NS_PER_SEC;
+    if secs > u32::MAX as u64 {
+        return (u32::MAX, 0);
+    }
+    (secs as u32, (unix_ns % NS_PER_SEC) as u32)
 }
 
 /// #2470: convert a CLOCK_MONOTONIC instant (the `now_ns`/`now_secs`-derived
@@ -496,8 +518,13 @@ impl EventStreamWorkerHandle {
         // taken here at emit time. A 0 created_ns stays 0 on the wire and
         // triggers the Go-side packet-count fallback.
         let (now_mono_ns, now_unix_ns) = read_mono_and_wall_clocks();
-        let created_unix_secs =
-            monotonic_ns_to_unix_secs(delta.created_ns, now_mono_ns, now_unix_ns);
+        // #2853: carry BOTH the integer Unix second (offset 108) and the
+        // sub-second nanosecond remainder (offset 44, the close-unused policy_id
+        // slot) so the Go exporters render a millisecond-accurate flow
+        // StartTime. The pre-#2853 code stamped only the truncated second, so
+        // every flow opened in the same second shared one start instant.
+        let (created_unix_secs, created_subsec_nanos) =
+            monotonic_ns_to_unix_secs_subnanos(delta.created_ns, now_mono_ns, now_unix_ns);
         let close_unix_ns =
             monotonic_ns_to_unix_ns(delta.last_seen_ns, now_mono_ns, now_unix_ns);
         // #2512: route through the per-kind rate limiter + queue budget +
@@ -535,6 +562,9 @@ impl EventStreamWorkerHandle {
                     // RT_FLOW_SESSION_CLOSE syslog record.
                     delta.metadata.log_session_close,
                     created_unix_secs,
+                    // #2853: sub-second nanosecond remainder of the creation
+                    // instant, rides the [44:48] slot (unused on a close).
+                    created_subsec_nanos,
                     close_unix_ns,
                     // #2520: carry the resolved AppID in the [132:134] wire
                     // slot so SESSION_CLOSE RT_FLOW records (and the

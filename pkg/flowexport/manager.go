@@ -711,7 +711,13 @@ type SessionCloseData struct {
 // can bump an "estimated-duration-used" counter for operator visibility.
 func flowStartTime(rec logging.EventRecord, proto uint8) (time.Time, bool) {
 	if rec.Created > 0 {
-		created := time.Unix(int64(rec.Created), 0)
+		// #2853: combine the integer Unix second (rec.Created) with the
+		// sub-second nanosecond remainder (rec.CreatedNanos, carried on the
+		// [44:48] wire slot) so the StartTime keeps millisecond resolution.
+		// Pre-#2853 this truncated to the whole second, collapsing every flow
+		// opened in the same second onto one start instant and flattening
+		// IPFIX flowStartMilliseconds for short flows.
+		created := time.Unix(int64(rec.Created), int64(rec.CreatedNanos))
 		// Guard against a created stamp at or after the close time (clock skew
 		// across the monotonic→wall conversion): clamp to the EndTime so the
 		// flow never reports a negative duration.

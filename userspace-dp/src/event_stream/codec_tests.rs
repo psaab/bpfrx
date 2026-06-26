@@ -278,6 +278,7 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
         1,
         false,           // #2508: log_syslog gate
         1_700_000_000,   // #2465: created Unix seconds
+        123_456_789,     // #2853: created sub-second nanos (123.456789 ms)
         1_700_000_123_000_000_000, // #2465: close instant Unix ns
         7,               // #2520: application id
         42,              // #2615: ingress ifindex
@@ -333,6 +334,15 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
         u32::from_le_bytes(p[108..112].try_into().unwrap()),
         1_700_000_000
     ); // created Unix secs
+    // #2853 fail-on-revert: the creation instant's sub-second nanosecond
+    // remainder rides the [44:48] policy_id slot (LITTLE-endian u32), which the
+    // Go SESSION_CLOSE decoder reads as CreatedNanos to build a
+    // millisecond-accurate flow StartTime. Reverting the encoder to leave this
+    // slot 0 collapses every same-second flow onto one integer-second start.
+    assert_eq!(
+        u32::from_le_bytes(p[44..48].try_into().unwrap()),
+        123_456_789
+    ); // created sub-second nanos
     assert_eq!(
         u64::from_le_bytes(p[0..8].try_into().unwrap()),
         1_700_000_123_000_000_000
@@ -372,6 +382,7 @@ fn test_encode_session_close_rt_flow_v6() {
         0,
         false, // #2508: log_syslog gate
         0,     // #2465: created Unix seconds (unknown → fallback)
+        0,     // #2853: created sub-second nanos (unknown)
         0,     // #2465: close instant Unix ns
         0,     // #2520: application id (unknown)
         0,     // #2615: ingress ifindex (unknown)
@@ -416,6 +427,7 @@ fn test_session_close_rt_flow_log_gate_byte() {
             0,
             log_syslog,
             0, // #2465: created Unix seconds
+            0, // #2853: created sub-second nanos
             0, // #2465: close instant Unix ns
             0, // #2520: application id
             0, // #2615: ingress ifindex
