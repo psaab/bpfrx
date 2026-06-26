@@ -21,6 +21,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/policymatch"
 )
 
 // showFirewall renders the `cli show firewall` output. Writes to
@@ -185,69 +186,60 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			proto = parts[1]
 		}
 	}
-	if cfg == nil {
+	switch {
+	case cfg == nil:
 		buf.WriteString("No active configuration\n")
-	} else if fromZone == "" || toZone == "" {
+	case fromZone == "" || toZone == "":
 		buf.WriteString("Missing from/to zone parameters\n")
-	} else if srcIP != "" && net.ParseIP(srcIP) == nil {
-		// A non-empty but malformed src would parse to nil and be treated
-		// as a wildcard by matchShowPolicyAddr, yielding a false-positive
-		// policy match (#1711). Report it instead. Empty still means any.
+	case srcIP != "" && net.ParseIP(srcIP) == nil:
+		// A non-empty but malformed src would otherwise parse to nil and be
+		// treated as a wildcard, yielding a false-positive policy match
+		// (#1711). Report it instead. Empty still means any.
 		fmt.Fprintf(buf, "invalid src %q\n", srcIP)
-	} else if dstIP != "" && net.ParseIP(dstIP) == nil {
+	case dstIP != "" && net.ParseIP(dstIP) == nil:
 		fmt.Fprintf(buf, "invalid dst %q\n", dstIP)
-	} else {
-		parsedSrc := net.ParseIP(srcIP)
-		parsedDst := net.ParseIP(dstIP)
-		found := false
-		for _, zpp := range cfg.Security.Policies {
-			if zpp.FromZone != fromZone || zpp.ToZone != toZone {
-				continue
-			}
-			for _, pol := range zpp.Policies {
-				if !matchShowPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
-					continue
-				}
-				if !matchShowPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
-					continue
-				}
-				if !matchShowPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
-					continue
-				}
-				action := policyActionName(pol.Action)
-				fmt.Fprintf(buf, "Policy match:\n")
-				fmt.Fprintf(buf, "  From zone: %s\n  To zone:   %s\n", fromZone, toZone)
-				fmt.Fprintf(buf, "  Policy:    %s\n", pol.Name)
-				fmt.Fprintf(buf, "  Action:    %s\n", action)
-				found = true
-				break
-			}
-			if found {
-				break
-			}
+	default:
+		// #3103: route the gRPC `test policy` diagnostic through the single
+		// shared simulator (pkg/policymatch) so it agrees with the runtime
+		// policy evaluator — zone-pair -> global -> configured default-policy,
+		// with predefined/nested-app-set applications, literal-CIDR /
+		// any-ipv4 / any-ipv6 / address-exclusion / feed-overlay address
+		// matching, and source/destination-port terms. The pre-#3103 bespoke
+		// matchShowPolicy* helpers skipped the configured default-policy
+		// (hard-coded "Default deny"), missed predefined apps and literal
+		// CIDRs, and ignored the feed overlay — exactly the operator-lie class
+		// #3042 removed from the REST/gRPC MatchPolicies and CLI
+		// match-policies surfaces. This was the one surface #3042 missed.
+		var overlay map[string][]string
+		if s.feedOverlayFn != nil {
+			overlay = s.feedOverlayFn()
 		}
-		if !found {
-			// Check global policies
-			for _, pol := range cfg.Security.GlobalPolicies {
-				if !matchShowPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
-					continue
-				}
-				if !matchShowPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
-					continue
-				}
-				if !matchShowPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
-					continue
-				}
-				action := policyActionName(pol.Action)
-				fmt.Fprintf(buf, "Policy match (global):\n")
-				fmt.Fprintf(buf, "  Policy:    %s\n", pol.Name)
-				fmt.Fprintf(buf, "  Action:    %s\n", action)
-				found = true
-				break
-			}
-		}
-		if !found {
-			fmt.Fprintf(buf, "Default deny (no matching policy for %s -> %s)\n", fromZone, toZone)
+		res := policymatch.Match(cfg, policymatch.Query{
+			FromZone:    fromZone,
+			ToZone:      toZone,
+			SrcIP:       net.ParseIP(srcIP),
+			DstIP:       net.ParseIP(dstIP),
+			Protocol:    proto,
+			DstPort:     dstPort,
+			FeedOverlay: overlay,
+		})
+		switch {
+		case res.Matched && res.Global:
+			fmt.Fprintf(buf, "Policy match (global):\n")
+			fmt.Fprintf(buf, "  Policy:    %s\n", res.PolicyName)
+			fmt.Fprintf(buf, "  Action:    %s\n", policymatch.ActionString(res.Action))
+		case res.Matched:
+			fmt.Fprintf(buf, "Policy match:\n")
+			fmt.Fprintf(buf, "  From zone: %s\n  To zone:   %s\n", fromZone, toZone)
+			fmt.Fprintf(buf, "  Policy:    %s\n", res.PolicyName)
+			fmt.Fprintf(buf, "  Action:    %s\n", policymatch.ActionString(res.Action))
+		default:
+			// No zone-pair or global policy matched: report the configured
+			// default-policy, NOT a hard-coded "deny" (#3103). When the
+			// default-policy is deny this still reads "Default deny (...)",
+			// preserving the pre-#3103 wording for that case.
+			fmt.Fprintf(buf, "Default %s (no matching policy for %s -> %s)\n",
+				policymatch.ActionString(res.Action), fromZone, toZone)
 		}
 	}
 	return &pb.ShowTextResponse{Output: buf.String()}, nil
