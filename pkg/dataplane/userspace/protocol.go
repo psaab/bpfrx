@@ -160,6 +160,31 @@ type SnapshotSummary struct {
 type ZoneSnapshot struct {
 	Name string `json:"name"`
 	ID   uint16 `json:"id"`
+	// HostInbound* carry the zone's `host-inbound-traffic` admission set
+	// (#3070). Before #3070 the zone's host-inbound system-service / protocol
+	// set was parsed and modeled in Go but NEVER reached the dataplane, so
+	// host-bound traffic (traffic destined to a firewall-local interface IP:
+	// SSH, ping, routing protocols on the box itself) was admitted regardless
+	// of the configured set — a security-boundary gap.
+	//
+	// HostInboundConfigured records whether the zone declared a
+	// host-inbound-traffic stanza at all. When false the dataplane preserves
+	// the historical admit-all behaviour for host-bound (local-delivery)
+	// traffic on this zone (a conservative, zero-regression default: zones
+	// that never opted into the feature are unaffected). When true the
+	// dataplane default-denies host-bound traffic whose system-service /
+	// protocol is not in the configured set (Junos host-inbound posture).
+	//
+	// The token slices mirror config.HostInboundTraffic verbatim (lower-cased,
+	// order-preserved). The Rust side classifies the tokens to L4 signatures
+	// (proto + port / icmp) — keeping the wire as the raw Junos tokens means
+	// the Go↔Rust contract stays byte-identical and the (large) token→port
+	// mapping lives in one place (#1961 discipline). serde(default) on the
+	// Rust side keeps wire parity with an older Go control plane that omits
+	// these fields.
+	HostInboundConfigured     bool     `json:"host_inbound_configured,omitempty"`
+	HostInboundSystemServices []string `json:"host_inbound_system_services,omitempty"`
+	HostInboundProtocols      []string `json:"host_inbound_protocols,omitempty"`
 	// TCPRst carries the Junos `security zones security-zone <z> tcp-rst`
 	// knob (#3071). When true, the userspace dataplane sends a TCP RST back
 	// toward the source for a TCP flow DENIED by policy/default-deny whose

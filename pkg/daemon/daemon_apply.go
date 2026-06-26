@@ -1161,6 +1161,7 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	d.applyTimezone(cfg)
 	d.applyKernelTuning(cfg)
 	d.applyLo0Filter(cfg)
+	d.applyHostInboundFilter(cfg)
 
 	// 9.6. Write SSH known hosts file
 	d.applySSHKnownHosts(cfg)

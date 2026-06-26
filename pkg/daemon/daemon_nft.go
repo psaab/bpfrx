@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // applyLo0Filter applies loopback filter rules for host-bound traffic.
@@ -88,6 +89,316 @@ func buildLo0FilterPayload(cfg *config.Config, filterV4, filterV6 string) string
 	rules = append(rules, "}")
 
 	return strings.Join(rules, "\n") + "\n"
+}
+
+// applyHostInboundFilter is the KERNEL-nftables PRIMARY enforcement of
+// `security zones <z> host-inbound-traffic` (#3070). Ordinary host-bound
+// traffic to a firewall interface IP / VRRP VIP (SSH, ping, OSPF/BGP to the
+// box — exactly what host-inbound-traffic governs) is shunted to the Linux
+// kernel by the XDP shim before it reaches userspace-dp, so the userspace
+// LocalDelivery check (forwarding/host_inbound.rs) only catches the narrow
+// subset that actually reaches the XSK. This kernel chain enforces the
+// host-inbound set for the rest, mirroring the lo0-filter precedent.
+//
+// Safety: only zones that DECLARED a host-inbound-traffic stanza get any rule;
+// a zone with no stanza is admit-all (unchanged). Management / cluster-control
+// lifeline interfaces (fxp0 / em0 / fab*) are excluded from the address sets by
+// BuildZoneHostInboundViews, so a host-inbound deny can never strand management
+// or break HA. Established sessions and IPv6 ND / PMTUD control messages are
+// accepted before any deny.
+func (d *Daemon) applyHostInboundFilter(cfg *config.Config) {
+	views := dpuserspace.BuildZoneHostInboundViews(cfg)
+	if !hostInboundHasEnforceableView(views) {
+		// No host-inbound-configured zone with a resolvable address — nothing
+		// to enforce. Remove any stale table (idempotent; delete fails benignly
+		// when the table is absent). Timeout-bounded (#1794).
+		_, _ = runCommandTimeout("nft", "delete", "table", "inet", "xpf_hostinbound")
+		return
+	}
+	nftConf := buildHostInboundFilterPayload(views)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
+	cmd.WaitDelay = 5 * time.Second
+	cmd.Stdin = strings.NewReader(nftConf)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		slog.Warn("failed to apply host-inbound filter", "err", err, "output", string(out))
+	} else {
+		slog.Info("host-inbound filter applied", "zones", len(views))
+	}
+}
+
+// hostInboundHasEnforceableView reports whether at least one view carries a
+// resolvable address. A configured zone with no address (e.g. DHCP-only) cannot
+// be scoped to a deny, so it produces nothing; if NO zone is enforceable the
+// whole table is removed (fail-open is the safe direction for this
+// lifeline-adjacent feature).
+func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool {
+	for _, v := range views {
+		if len(v.V4Addrs) > 0 || len(v.V6Addrs) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// buildHostInboundFilterPayload assembles the exact `nft -f -` payload for the
+// host-inbound kernel chain. Split out as a pure function so tests can
+// parse-check the full payload without invoking nft. Uses the same atomic
+// create/flush/redefine idiom as buildLo0FilterPayload (a syntax error on any
+// line rejects the WHOLE payload, so the chain fails closed-as-absent rather
+// than half-applied).
+//
+// Layout of `chain input` (type filter hook input priority 0; policy accept):
+//  1. ct state established,related accept   — return/ongoing host traffic.
+//  2. meta l4proto { 50, 51 } accept — raw ESP/AH exemption for host-terminated
+//     IPsec (mirrors the userspace stage_ipsec_passthrough_check); the kernel
+//     XFRM stack decrypts before any host-inbound deny can apply.
+//  3. icmpv6 ND + PacketTooBig + dest-unreachable accept, icmp dest-unreachable
+//     accept — IPv6 Neighbor Discovery and v4/v6 PMTUD/error control messages
+//     are mandatory link operation, never a "service" exposure; accepted
+//     globally so a host-inbound set omitting `ping` does not black-hole
+//     PMTUD/ND/error delivery.
+//  4. Per host-inbound-configured zone, per family with addresses:
+//     - if `all` / `any-service` / `protocols all`: <fam> daddr <addrs> accept
+//     (and no deny — the operator opened the zone fully).
+//     - else: one accept per listed service/protocol scoped to the zone addrs,
+//     then a catch-all `<fam> daddr <addrs> drop` (Junos default-deny to the
+//     host is a silent drop).
+func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) string {
+	var rules []string
+	rules = append(rules, "table inet xpf_hostinbound")
+	rules = append(rules, "flush table inet xpf_hostinbound")
+	rules = append(rules, "table inet xpf_hostinbound {")
+	rules = append(rules, "  chain input {")
+	rules = append(rules, "    type filter hook input priority 0; policy accept;")
+	rules = append(rules, "    ct state established,related accept")
+	// Raw ESP (50) / AH (51) are exempt from host-inbound enforcement so the
+	// kernel XFRM stack can decrypt host-terminated IPsec — mirroring the
+	// userspace stage_ipsec_passthrough_check, which runs BEFORE
+	// host_inbound_admits (poll_descriptor mod.rs). Standard vSRX configures the
+	// IPsec external zone with host-inbound `system-services { ike; }` (IKE
+	// alone; ESP implicitly permitted): the `ike` token already accepts udp
+	// 500/4500 (so IKE and NAT-T survive), and this exempts the raw ESP/AH data
+	// plane (typical site-to-site). Without it a scoped `daddr <wan-ip> drop`
+	// would black-hole the tunnel AFTER IKE succeeds — a silent upgrade
+	// regression once #3070 turns a previously-no-op `ike` stanza into real
+	// enforcement.
+	rules = append(rules, "    meta l4proto { 50, 51 } accept")
+	// IPv6 ND + v4/v6 PMTUD/error control messages — accepted regardless of the
+	// host-inbound set so enforcement never breaks core L3 operation. icmpv6
+	// type 1 (destination-unreachable) + 2 (packet-too-big) carry v6 error /
+	// PMTUD signalling; 133-137 are Neighbor Discovery.
+	rules = append(rules, "    icmpv6 type { 1, 2, 133, 134, 135, 136, 137 } accept")
+	rules = append(rules, "    icmp type destination-unreachable accept")
+
+	for _, v := range views {
+		emitHostInboundZone(&rules, v, "ip", v.V4Addrs)
+		emitHostInboundZone(&rules, v, "ip6", v.V6Addrs)
+	}
+	rules = append(rules, "  }")
+	rules = append(rules, "}")
+	return strings.Join(rules, "\n") + "\n"
+}
+
+// emitHostInboundZone appends the accept(+drop) rules for one zone/family to
+// rules. No-op when the zone has no address in this family.
+func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, family string, addrs []string) {
+	if len(addrs) == 0 {
+		return
+	}
+	daddr := family + " daddr " + nftAddrSet(addrs)
+	// `all` / `any-service` (services) or `all` (protocols) fully opens the
+	// zone: accept everything to its addresses, emit no deny.
+	if hostInboundAllowsAll(v) {
+		*rules = append(*rules, "    "+daddr+" accept")
+		return
+	}
+	matches := hostInboundMatchSet(v, family)
+	if len(matches) == 0 {
+		// Zero recognized service/protocol matches for this configured zone
+		// (empty stanza, or every token unrecognized). Emit NOTHING — a bare
+		// catch-all drop here would lock the whole zone out of the kernel based
+		// on tokens we could not classify, a lifeline hazard. This fails OPEN
+		// for the pathological case only; any zone with at least one recognized
+		// token is fully enforced. (The userspace-dp secondary path still
+		// applies its own check to the XSK-reaching subset.)
+		return
+	}
+	for _, m := range matches {
+		*rules = append(*rules, "    "+daddr+" "+m+" accept")
+	}
+	// Catch-all deny for anything else destined to this zone's addresses
+	// (Junos default-deny to the host is a silent drop).
+	*rules = append(*rules, "    "+daddr+" drop")
+}
+
+// hostInboundAllowsAll reports whether the zone's system-services contains
+// `all` / `any-service` or its protocols contains `all` (full admit).
+func hostInboundAllowsAll(v dpuserspace.ZoneHostInboundView) bool {
+	for _, s := range v.SystemServices {
+		if s == "all" || s == "any-service" {
+			return true
+		}
+	}
+	for _, p := range v.Protocols {
+		if p == "all" {
+			return true
+		}
+	}
+	return false
+}
+
+// hostInboundMatchSet returns the de-duplicated nft match fragments (each a
+// match clause WITHOUT the leading daddr or trailing accept) admitted by the
+// zone's system-services + protocols for the given family ("ip" / "ip6").
+//
+// This is the Go/nftables MIRROR of the Rust classifier in
+// userspace-dp/src/afxdp/forwarding/host_inbound.rs — keep the two token sets
+// in sync. An unrecognised token contributes nothing here; if it leaves the
+// zone with zero recognized matches, emitHostInboundZone fails OPEN (no deny)
+// rather than locking the zone out on unclassifiable tokens. The token set
+// below covers the common Junos system-services/protocols; strict commit-time
+// rejection of unknown tokens is a noted follow-up (schema_security.go).
+func hostInboundMatchSet(v dpuserspace.ZoneHostInboundView, family string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(m string) {
+		if m == "" || seen[m] {
+			return
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	for _, s := range v.SystemServices {
+		for _, m := range hostInboundServiceMatches(s, family) {
+			add(m)
+		}
+	}
+	for _, p := range v.Protocols {
+		for _, m := range hostInboundProtocolMatches(p, family) {
+			add(m)
+		}
+	}
+	return out
+}
+
+// hostInboundServiceMatches maps a Junos `system-services` token to nft match
+// fragments for the given family. Returns nil for `all` / `any-service`
+// (handled by hostInboundAllowsAll) and for unrecognised tokens (fail-closed).
+func hostInboundServiceMatches(token, family string) []string {
+	icmp := "icmp"
+	if family == "ip6" {
+		icmp = "icmpv6"
+	}
+	switch token {
+	case "ssh":
+		return []string{"tcp dport 22"}
+	case "telnet":
+		return []string{"tcp dport 23"}
+	case "ftp":
+		return []string{"tcp dport 21"}
+	case "http", "webapi-clear-text":
+		return []string{"tcp dport 80"}
+	case "https", "webapi-ssl":
+		return []string{"tcp dport 443"}
+	case "ping":
+		return []string{icmp + " type echo-request"}
+	case "dns":
+		return []string{"udp dport 53", "tcp dport 53"}
+	case "dhcp", "bootp":
+		return []string{"udp dport { 67, 68 }"}
+	case "dhcpv6":
+		return []string{"udp dport { 546, 547 }"}
+	case "ntp":
+		return []string{"udp dport 123"}
+	case "snmp":
+		return []string{"udp dport 161"}
+	case "snmp-trap":
+		return []string{"udp dport 162"}
+	case "ike":
+		return []string{"udp dport { 500, 4500 }"}
+	case "tftp":
+		return []string{"udp dport 69"}
+	case "netconf":
+		return []string{"tcp dport 830"}
+	case "ssh-netconf", "netconf-ssh":
+		return []string{"tcp dport { 22, 830 }"}
+	case "finger":
+		return []string{"tcp dport 79"}
+	case "ident-reset":
+		return []string{"tcp dport 113"}
+	case "lsping":
+		return []string{"udp dport 3503"}
+	case "sip":
+		return []string{"udp dport 5060", "tcp dport 5060"}
+	case "r-login", "rlogin":
+		return []string{"tcp dport 513"}
+	case "r-sh", "rsh":
+		return []string{"tcp dport 514"}
+	case "r-exec", "rexec":
+		return []string{"tcp dport 512"}
+	case "xnm-clear-text":
+		return []string{"tcp dport 3221"}
+	case "xnm-ssl":
+		return []string{"tcp dport 3220"}
+	case "traceroute":
+		return []string{"udp dport 33434-33523"}
+	case "gre":
+		return []string{"meta l4proto 47"}
+	default:
+		return nil
+	}
+}
+
+// hostInboundProtocolMatches maps a Junos `protocols` (routing-protocol) token
+// to nft match fragments. Returns nil for `all` (handled by hostInboundAllowsAll)
+// and for unrecognised tokens (fail-closed).
+func hostInboundProtocolMatches(token, family string) []string {
+	switch token {
+	case "ospf", "ospf3":
+		return []string{"meta l4proto 89"}
+	case "bgp":
+		return []string{"tcp dport 179"}
+	case "rip":
+		return []string{"udp dport 520"}
+	case "ripng":
+		return []string{"udp dport 521"}
+	case "igmp":
+		if family == "ip6" {
+			return nil // v6 multicast group membership is MLD (icmpv6), via the ND accept
+		}
+		return []string{"meta l4proto 2"}
+	case "pim":
+		return []string{"meta l4proto 103"}
+	case "vrrp":
+		return []string{"meta l4proto 112"}
+	case "bfd":
+		return []string{"udp dport { 3784, 3785 }"}
+	case "ldp":
+		return []string{"tcp dport 646", "udp dport 646"}
+	case "msdp":
+		return []string{"tcp dport 639"}
+	case "nhrp":
+		return []string{"meta l4proto 54"}
+	case "router-discovery":
+		if family == "ip6" {
+			// v6 RS/RA are part of the always-accepted ND set above.
+			return nil
+		}
+		return []string{"icmp type { 9, 10 }"}
+	default:
+		return nil
+	}
+}
+
+// nftAddrSet renders a single address as a bare token or multiple as an nft
+// anonymous set.
+func nftAddrSet(addrs []string) string {
+	if len(addrs) == 1 {
+		return addrs[0]
+	}
+	return "{ " + strings.Join(addrs, ", ") + " }"
 }
 
 // nftRuleFromTerm converts a firewall filter term to an nftables rule string.
