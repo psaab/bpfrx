@@ -260,6 +260,34 @@ to a warning (`lenientReservedZoneNames`) so an already-persisted or peer-synced
 config an older binary accepted still boots — #1960 no-brick doctrine, same as
 #3066/#2401.
 
+**Wildcard from-zone/to-zone `any` is rejected at commit (#3018, interim):** an
+ordinary zone-pair policy whose `from-zone` or `to-zone` is the literal Junos
+wildcard `any` historically committed cleanly — the #2401 reference gate exempts
+`any` (`policyZoneSpecialTokens`) and the old comment claimed the dataplane
+"treats it as match-any". It does NOT: the userspace snapshot builder
+(`pkg/dataplane/userspace/policies.go`) carries the literal `"any"` string
+unchanged for an ordinary zone-pair policy (only `security policies global` maps
+to the `junos-global` sentinel), and `PolicyState::from_snapshots`
+(`userspace-dp/src/policy.rs`) only indexes a non-global rule when BOTH zones
+resolve via `zone_name_to_id.get()`. `any` is never inserted into that map, so a
+`from-zone any` / `to-zone any` rule is KEPT but never indexed and never
+evaluated: `from-zone any to-zone trust ... then deny` commits and looks
+legitimate yet never blocks traffic (silent fail-OPEN under a permit default);
+`from-zone trust to-zone any then permit` cannot permit under a deny default.
+`validatePolicyWildcardZoneStrict` (`compiler_validate_strict.go`) hard-rejects
+such a policy at commit, naming the policy and which side is `any`. This is the
+INTERIM contract: full wildcard-zone runtime indexing (separate ordered index
+lists for exact / from-any / to-any / both-any, evaluated in Junos precedence
+before global/default; no N×N hot-path expansion) is a substantial dataplane
+change deferred to a follow-up. The gate does NOT touch `security policies
+global` (enforced via the `junos-global` sentinel) nor the unrelated `any`
+tokens elsewhere in a policy (`match source-address any` / `match application
+any`) — only the from-zone/to-zone slot. The tolerant load/peer-sync path
+downgrades to a warning (`lenientPolicyWildcardZone`) so an already-persisted or
+peer-synced config carrying a from-zone/to-zone `any` still boots — the rule was
+already inert, so a leniently-loaded config behaves exactly as before, just
+flagged (#1960 no-brick doctrine, same as #3066/#3055/#2401).
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`

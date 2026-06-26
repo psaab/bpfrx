@@ -1,3 +1,24 @@
+## 2026-06-25 — #3018: reject wildcard from-zone/to-zone `any` policy at commit
+
+- **Timestamp**: 2026-06-25
+- **Action**: An ordinary zone-pair security policy whose `from-zone` or
+  `to-zone` is the literal Junos wildcard `any` committed cleanly (the #2401
+  reference gate exempts `any`) but the userspace dataplane never indexed it —
+  `PolicyState::from_snapshots` only indexes a rule when both zones resolve to a
+  declared zone-id, and `any` is never inserted into `zone_name_to_id`. Result:
+  an admitted-but-unenforced policy (silent fail-OPEN under a permit default).
+  Added `validatePolicyWildcardZoneStrict` (strict reject at commit, lenient
+  downgrade to a `cfg.Warnings` entry via `lenientPolicyWildcardZone` so an
+  already-persisted/peer-synced config still boots — #1960 no-brick). Interim
+  contract; full wildcard-zone runtime indexing deferred to a follow-up issue.
+  Flipped `TestPolicySpecialZoneTokensCommit` (no longer asserts `any` commits)
+  and added `TestPolicyWildcardZoneFailsCommit` +
+  `TestPolicyWildcardZoneLenientDowngradesToWarning`. Updated comments on
+  `reservedZoneNames`/`policyZoneSpecialTokens` (the "treats it as match-any"
+  claim was false) + a README section.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/policy_zone_ref_test.go, pkg/config/README.md, _Log.md
+
 ## 2026-06-25 — #3060: reject accepted-but-inert bare `then log` at commit
 
 - **Timestamp**: 2026-06-25
