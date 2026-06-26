@@ -22,6 +22,18 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 	}},
 	"policies": {desc: "Security policies", children: map[string]*schemaNode{
+		// #3065: explicit no-match default override. Unset = deny-all
+		// (fail-closed, matching the Junos default-security-policy);
+		// permit-all restores the legacy fail-open behaviour.
+		"default-policy": {
+			desc:          "Action for traffic with no matching policy (default deny-all)",
+			args:          1,
+			valueType:     ValueEnumOf,
+			valueDesc:     "No-match default action (permit-all | deny-all | reject-all)",
+			valueExamples: []string{"deny-all", "permit-all", "reject-all"},
+			validator:     ValidateEnum([]string{"permit-all", "deny-all", "reject-all"}),
+			children:      nil,
+		},
 		"from-zone": {desc: "From zone", args: 3, valueHint: ValueHintZoneName, midKeyword: "to-zone", midKeywordAt: 2, placeholder: "<zone-name>", children: map[string]*schemaNode{
 			"policy": {desc: "Policy name", args: 1, valueHint: ValueHintPolicyName, placeholder: "<policy-name>", children: map[string]*schemaNode{
 				"description": {desc: "Policy description", args: 1, placeholder: "<text>", children: nil},

@@ -156,6 +156,25 @@ path downgrades to a warning AND `compilePolicy` defaults an actionless
 policy's `Action` to `PolicyDeny`, so a leniently-loaded bad config fails
 closed rather than open. See `docs/config-schema.md` "#3043".
 
+**No-match default-policy is fail-closed (#3065):** the sibling of #3043
+for the implicit fallback. When a flow matches NO zone-pair, global, or
+default policy, the verdict is `SecurityConfig.DefaultPolicy`. Because the
+`PolicyAction` zero value is `PolicyPermit`, an unset
+`security policies default-policy` stanza historically compiled to
+permit-all — fail-OPEN, the opposite of the Junos SRX
+`default-security-policy` (deny-all). `CompileConfig` now initializes
+`SecurityConfig.DefaultPolicy = PolicyDeny` (`compiler.go`), so an absent
+stanza denies unmatched traffic. An operator opts back into the legacy
+permit-all explicitly with `set security policies default-policy
+permit-all`; `deny-all` and `reject-all` are the other accepted values
+(`compilePolicies`, `compiler_security.go` — `reject-all` previously fell
+through the switch and was silently ignored). The value is plumbed to the
+userspace dataplane via the `ConfigSnapshot.DefaultPolicy` string
+(`policyActionString` → Rust `parse_action` → `PolicyState.default_action`,
+the no-match verdict). The `default-policy` leaf is a typed `ValueEnumOf`
+in `schema_security.go`, so a bogus value fails `commit check`. See
+`docs/config-schema.md` "#3065".
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`
