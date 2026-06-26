@@ -769,6 +769,26 @@ type compileOpts struct {
 	// support for those match types is a deferred follow-up. Same doctrine
 	// as lenientSecureTunnelBindIface.
 	lenientPolicyMatchLeaves bool
+	// lenientPolicyThenPermit (#3114) downgrades the security-policy
+	// unsupported-then-permit-child gate (validatePolicyThenPermitStrict)
+	// from a hard compile error to a cfg.Warnings entry. A security policy
+	// whose `then permit` arm carries a child the compiler does not
+	// enforce — e.g. `application-services` (UTM/IDP/AppFW/SSL-proxy),
+	// `firewall-authentication`, `tunnel ipsec-vpn` — committed cleanly but
+	// had that modifier SILENTLY DROPPED: compilePolicy's `then` switch
+	// `permit` arm sets pol.Action = PolicyPermit and never inspects
+	// t.Children, and the set-schema/schema_walk ignore unknown keywords.
+	// Dropping a then-permit service chain turns a permit-only-with-
+	// inspection rule into an UNCONDITIONAL permit — a fail-OPEN. The strict
+	// commit / commit-check path hard-rejects so the misconfiguration is
+	// operator-visible (naming the policy scope, the policy, and the
+	// unsupported child); the tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config an older binary
+	// silently accepted still BOOTS (#1960 fail-closed-on-load class) — the
+	// child stays dropped (the pre-existing behaviour), now flagged. Full
+	// service-chain support is a deferred follow-up. Same doctrine as
+	// lenientPolicyMatchLeaves.
+	lenientPolicyThenPermit bool
 	// lenientPolicyCommunityRef (#2881) downgrades the policy community
 	// cross-reference gate (validatePolicyCommunityReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. A policy term's
@@ -859,6 +879,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientBackupRouterDst:             true,
 		lenientSecureTunnelBindIface:       true,
 		lenientPolicyMatchLeaves:           true,
+		lenientPolicyThenPermit:            true,
 		lenientPolicyCommunityRef:          true,
 	})
 }
@@ -979,6 +1000,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientBackupRouterDst:             true,
 		lenientSecureTunnelBindIface:       true,
 		lenientPolicyMatchLeaves:           true,
+		lenientPolicyThenPermit:            true,
 		lenientPolicyCommunityRef:          true,
 	})
 }
@@ -1134,6 +1156,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3114: reject a security-policy `then permit <child>` carrying an
+	// unsupported action modifier (application-services / UTM / IDP / AppFW
+	// / SSL-proxy, firewall-authentication, tunnel). compilePolicy's `then`
+	// switch `permit` arm sets pol.Action = PolicyPermit and never inspects
+	// the children, so the modifier is silently dropped — turning a
+	// permit-only-with-inspection rule into an unconditional permit, a
+	// fail-open. Runs on the group-expanded, inactive-pruned tree so an
+	// apply-groups-inherited child is caught and an inactive policy is
+	// ignored. Strict (commit / commit-check): hard-reject naming the
+	// policy scope, the policy, and the unsupported child. Lenient (load /
+	// peer-sync): warn so an already-persisted or peer-synced config still
+	// boots (#1960) — the child stays dropped, now flagged. Full
+	// then-permit service-chain support is a deferred follow-up.
+	policyThenPermitWarnings, err := validatePolicyThenPermitStrict(
+		tree.Children, opts.lenientPolicyThenPermit)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -1172,6 +1213,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, natScopeWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
+	cfg.Warnings = append(cfg.Warnings, policyThenPermitWarnings...)
 
 	for _, node := range tree.Children {
 		switch node.Name() {

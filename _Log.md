@@ -1,3 +1,29 @@
+- **2026-06-25**: #3114 — reject unsupported security-policy `then permit` children at commit (fail-closed). Added `validatePolicyThenPermitStrict` (AST pre-walk in `compileExpanded`, sibling of #3113) hard-rejecting a policy whose `then permit` arm carries a child the compiler does not enforce — e.g. `application-services` (UTM/IDP/AppFW/SSL-proxy), `firewall-authentication`, `tunnel ipsec-vpn`. The `permit` arm in `compilePolicy`'s `then` switch set `pol.Action = PolicyPermit` and never inspected the permit node's children/tail, so the modifier was SILENTLY DROPPED, turning a permit-only-with-inspection rule into an unconditional permit (fail-open). Checks both AST shapes (flat-set collapses modifier onto `permit` `Keys[1]`; hierarchical nests it as a child). Allowlist `supportedPolicyThenPermitChildren` is EMPTY (compiler enforces no permit child today). Strict on `CompileConfig`; lenient-warn on both lenient constructors via new `lenientPolicyThenPermit` flag (#1960). Covers zone-pair AND global policies. Files: pkg/config/compiler_policy_then.go (new), pkg/config/compiler_policy_then_3114_test.go (new), pkg/config/compiler.go, pkg/config/README.md
+## 2026-06-26 — #3091: VLAN-child netdevs collapsed the queue-plan min to 1 worker
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fixed a HIGH forwarding regression (~6-7 Gbps). The
+  bondless-RETH WAN VLAN units `reth0.50`/`reth0.80` (Linux
+  `ge-0-0-2.50`/`ge-0-0-2.80`) are software VLAN netdevs with 1 RX queue
+  each. They entered `replan_queues`' candidate list (their `ge-` name
+  passes `include_userspace_binding_interface`; the #1921 `seen_linux`
+  dedup misses them because their netdev name differs from the physical
+  parent `ge-0-0-2`). `queue_count = min(6, 1, 1, 6, 6) = 1` → 1 worker.
+  Added a VLAN-child dedup (`vlan_child_parent_netdev` +
+  `snapshot_has_parent_candidate`): a VLAN child whose physical parent is
+  a candidate is skipped (the parent's 6 hardware queues carry its tagged
+  frames); an orphan VLAN child is re-keyed onto the parent's hardware
+  queue count. Hashed `vlan_id` + `parent_linux_name` into the binding
+  plan key (#2915/#2916 invariant). Two fail-on-revert Rust tests.
+- **File(s)**: userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/main_tests.rs, userspace-dp/README.md, _Log.md
+- **Validation**: `cargo build --release` clean; `cargo test --release`
+  3027 passed. Live on loss userspace cluster: `planned_workers` 1 → 6
+  (5 → 18 bindings), RSS restored to default 6-ring spread (no narrow),
+  ping 0% loss, iperf3 P=12 v4 7.1 → 23.0 Gbps, v6 22.9 Gbps. Manual
+  `ethtool -X ... weight 1 0 0 0 0 0` RSS workaround removed (no longer
+  needed).
+
 ## 2026-06-25 — #3117: security-policy `scheduler-name` added to set-schema
 
 - **Timestamp**: 2026-06-25
