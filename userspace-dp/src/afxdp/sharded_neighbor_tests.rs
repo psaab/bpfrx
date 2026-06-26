@@ -288,3 +288,189 @@ fn concurrent_per_key_with_bulk_replace_no_deadlock() {
     // Map remains usable.
     assert!(map.len() > 0);
 }
+
+// ── #3048: neighbor MAC-change epoch ─────────────────────────────────
+// The worker flow cache stamps `mac_change_epoch()` into each cached
+// forwarding descriptor and re-reads it on every fast-path hit. The
+// epoch MUST advance only on a genuine MAC CHANGE so a stale cached
+// dst_mac is evicted; it MUST NOT advance on a first insert or a
+// same-MAC refresh, or steady-state traffic would re-miss the cache on
+// every neighbor refresh. Reverting any `mac_change_epoch.fetch_add`
+// makes the corresponding "change bumps" assertion fail (RED), so these
+// are the fail-on-revert guards for the #3048 invalidation.
+
+#[test]
+fn mac_change_epoch_starts_at_zero() {
+    let map = ShardedNeighborMap::new();
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_not_bumped_on_first_insert() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    // A brand-new neighbor: no cached flow can reference a MAC that did
+    // not previously exist, so the epoch must stay put.
+    assert!(map.insert_if_changed(k, entry(0xAB)));
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_not_bumped_on_same_mac_refresh() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    assert!(map.insert_if_changed(k, entry(0xAB)));
+    // The common case: a periodic ARP/NDP refresh re-learning the SAME
+    // MAC must not bump the epoch (else the whole flow cache flushes on
+    // every neighbor refresh and the fast-path hit rate collapses).
+    assert!(!map.insert_if_changed(k, entry(0xAB)));
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_bumped_on_mac_change() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    assert!(map.insert_if_changed(k, entry(0xAB)));
+    assert_eq!(map.mac_change_epoch(), 0);
+    // Genuine MAC change (gateway VRRP failover / NIC swap): the epoch
+    // MUST advance so the worker fast path evicts cached descriptors
+    // holding the old dst_mac. Fail-on-revert guard for insert_if_changed.
+    assert!(map.insert_if_changed(k, entry(0xCD)));
+    assert_eq!(map.mac_change_epoch(), 1);
+    // A subsequent same-MAC refresh does not advance it further.
+    assert!(!map.insert_if_changed(k, entry(0xCD)));
+    assert_eq!(map.mac_change_epoch(), 1);
+    // Another distinct change bumps again.
+    assert!(map.insert_if_changed(k, entry(0xEF)));
+    assert_eq!(map.mac_change_epoch(), 2);
+}
+
+#[test]
+fn mac_change_epoch_per_key_independent_changes_accumulate() {
+    let map = ShardedNeighborMap::new();
+    let k1 = key_v4(7, 1);
+    let k2 = key_v4(7, 2);
+    map.insert_if_changed(k1, entry(0x11));
+    map.insert_if_changed(k2, entry(0x22));
+    assert_eq!(map.mac_change_epoch(), 0);
+    // A MAC change on either key bumps the single global epoch (the
+    // flow cache is keyed by flow 5-tuple, not next-hop, so #3048 uses a
+    // coarse global epoch — documented tradeoff).
+    map.insert_if_changed(k1, entry(0x99));
+    assert_eq!(map.mac_change_epoch(), 1);
+    map.insert_if_changed(k2, entry(0x88));
+    assert_eq!(map.mac_change_epoch(), 2);
+}
+
+#[test]
+fn mac_change_epoch_confirmed_resolver_first_insert_no_bump() {
+    use std::sync::atomic::AtomicU64;
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    let generation = AtomicU64::new(5);
+    // Resolver servicing a missing next-hop: prior == None, no bump.
+    assert!(map.insert_confirmed_if_unchanged(k, entry(0xAB), &generation, 5));
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_confirmed_resolver_bumps_on_change() {
+    use std::sync::atomic::AtomicU64;
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    let generation = AtomicU64::new(5);
+    assert!(map.insert_confirmed_if_unchanged(k, entry(0xAB), &generation, 5));
+    assert_eq!(map.mac_change_epoch(), 0);
+    // A confirmed re-resolution observing a different MAC must bump,
+    // matching the monitor path. Fail-on-revert guard for the resolver.
+    assert!(map.insert_confirmed_if_unchanged(k, entry(0xCD), &generation, 5));
+    assert_eq!(map.mac_change_epoch(), 1);
+    // Same MAC re-confirm does not bump.
+    assert!(map.insert_confirmed_if_unchanged(k, entry(0xCD), &generation, 5));
+    assert_eq!(map.mac_change_epoch(), 1);
+}
+
+#[test]
+fn mac_change_epoch_bulk_replace_bumps_on_mac_change() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    // Seed an existing neighbor (e.g. the gateway) at MAC 0xAB.
+    map.insert(k, entry(0xAB));
+    assert_eq!(map.mac_change_epoch(), 0);
+    // The Go control-plane snapshot push (apply_manager_neighbors with
+    // NeighborReplace: true) removes the old key and re-inserts the same
+    // key with a DIFFERENT MAC — the VRRP-failover gateway MAC change
+    // that overflowed the in-process monitor. The bulk path snapshots
+    // the prior MAC BEFORE the remove, detects the change, and bumps.
+    // Fail-on-revert guard for bulk_replace_neighbors: neutralizing its
+    // fetch_add makes this assertion go RED.
+    let remove = [k];
+    let insert = [(7, k.1, entry(0xCD))];
+    map.bulk_replace_neighbors(&remove, &insert);
+    assert_eq!(map.get(&k), Some(entry(0xCD)));
+    assert_eq!(map.mac_change_epoch(), 1);
+}
+
+#[test]
+fn mac_change_epoch_bulk_replace_no_bump_on_same_mac() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    map.insert(k, entry(0xAB));
+    assert_eq!(map.mac_change_epoch(), 0);
+    // A pure refresh: the snapshot re-learns the SAME MAC for every key.
+    // Even though replace removes then re-inserts, the prior-MAC snapshot
+    // (taken before the remove) equals the incoming MAC, so the epoch
+    // must NOT advance — otherwise steady-state Go snapshot pushes would
+    // flush the whole flow cache. This case must stay GREEN when the
+    // bump is neutralized.
+    let remove = [k];
+    let insert = [(7, k.1, entry(0xAB))];
+    map.bulk_replace_neighbors(&remove, &insert);
+    assert_eq!(map.get(&k), Some(entry(0xAB)));
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_bulk_replace_no_bump_on_brand_new_keys() {
+    let map = ShardedNeighborMap::new();
+    // A snapshot that only ADDS neighbors with no prior entry: no cached
+    // flow can hold a stale MAC for a neighbor that did not exist, so the
+    // epoch stays put even though the set membership changed.
+    let insert: Vec<_> = (0..5u8).map(|i| (7, key_v4(7, i).1, entry(0x22))).collect();
+    map.bulk_replace_neighbors(&[], &insert);
+    assert_eq!(map.len(), 5);
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_bulk_replace_single_bump_for_batch() {
+    let map = ShardedNeighborMap::new();
+    let k1 = key_v4(7, 1);
+    let k2 = key_v4(7, 2);
+    map.insert(k1, entry(0x11));
+    map.insert(k2, entry(0x22));
+    // Two keys change MAC in one snapshot push. The flow-cache flush is
+    // a coarse global epoch, so the whole batch bumps the epoch exactly
+    // ONCE (not once per changed key).
+    let remove = [k1, k2];
+    let insert = [(7, k1.1, entry(0x99)), (7, k2.1, entry(0x88))];
+    map.bulk_replace_neighbors(&remove, &insert);
+    assert_eq!(map.mac_change_epoch(), 1);
+}
+
+#[test]
+fn mac_change_epoch_confirmed_resolver_epoch_reject_no_bump() {
+    use std::sync::atomic::AtomicU64;
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    let generation = AtomicU64::new(5);
+    map.insert_confirmed_if_unchanged(k, entry(0xAB), &generation, 5);
+    // A monitor event advanced the generation between the resolver's GET
+    // and its insert: the insert is rejected entirely, so no MAC is
+    // written and the epoch must not move.
+    generation.store(6, std::sync::atomic::Ordering::Release);
+    assert!(!map.insert_confirmed_if_unchanged(k, entry(0xCD), &generation, 5));
+    assert_eq!(map.mac_change_epoch(), 0);
+    assert_eq!(map.get(&k), Some(entry(0xAB)));
+}

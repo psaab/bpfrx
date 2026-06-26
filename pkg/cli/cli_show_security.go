@@ -90,6 +90,7 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 // showPoliciesDetail displays an expanded Junos-style detail view of security policies.
 
 func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) error {
+	schedActive, haveSched := c.policySchedulerActiveState()
 	policySetID := uint32(0)
 	seqNum := 1
 	for _, zpp := range cfg.Security.Policies {
@@ -110,9 +111,17 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 				action = "reject"
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-			fmt.Printf("Policy: %s, action-type: %s, State: enabled, Index: %d, Scope Policy: 0\n",
-				pol.Name, action, ruleID)
+			// #3062: reflect runtime scheduler state — a policy bound to a
+			// currently-inactive scheduler reports State: inactive (the
+			// dataplane is dropping its rule). Active/non-scheduled policies
+			// stay bit-identical (State: enabled, no Scheduler line).
+			state := policyDetailState(pol.SchedulerName, schedActive, haveSched)
+			fmt.Printf("Policy: %s, action-type: %s, State: %s, Index: %d, Scope Policy: 0\n",
+				pol.Name, action, state, ruleID)
 			fmt.Printf("  Policy Type: Configured\n")
+			if state == "inactive" {
+				fmt.Printf("  Scheduler: %s (inactive)\n", pol.SchedulerName)
+			}
 			fmt.Printf("  Sequence number: %d\n", seqNum)
 			fmt.Printf("  From zone: %s, To zone: %s\n", zpp.FromZone, zpp.ToZone)
 			if pol.Description != "" {
@@ -173,9 +182,14 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 				action = "reject"
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-			fmt.Printf("Policy: %s, action-type: %s, State: enabled, Index: %d, Scope Policy: 0\n",
-				pol.Name, action, ruleID)
+			// #3062: scheduler-inactive global policy reports State: inactive.
+			state := policyDetailState(pol.SchedulerName, schedActive, haveSched)
+			fmt.Printf("Policy: %s, action-type: %s, State: %s, Index: %d, Scope Policy: 0\n",
+				pol.Name, action, state, ruleID)
 			fmt.Printf("  Policy Type: Configured\n")
+			if state == "inactive" {
+				fmt.Printf("  Scheduler: %s (inactive)\n", pol.SchedulerName)
+			}
 			fmt.Printf("  Sequence number: %d\n", seqNum)
 			fmt.Printf("  From zone: junos-global, To zone: junos-global\n")
 			if pol.Description != "" {

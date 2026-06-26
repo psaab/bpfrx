@@ -18,7 +18,44 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
+
+// policySchedulerStateProvider is the optional dataplane capability the
+// gRPC policy-detail text surface uses to learn the live per-scheduler
+// active-state map (#3062). The userspace dataplane adapter implements
+// it; when it is unavailable the surface renders every policy enabled
+// (bit-identical to the pre-#3062 output).
+type policySchedulerStateProvider interface {
+	PolicySchedulerActiveState() map[string]bool
+}
+
+// policySchedulerActiveState returns the live scheduler active-state map
+// and whether it could be queried. ok=false means the runtime state is
+// unknown and the caller must not claim any policy is scheduler-inactive.
+func (s *Server) policySchedulerActiveState() (state map[string]bool, ok bool) {
+	if s == nil || s.dp == nil {
+		return nil, false
+	}
+	p, isProvider := s.dp.(policySchedulerStateProvider)
+	if !isProvider {
+		return nil, false
+	}
+	return p.PolicySchedulerActiveState(), true
+}
+
+// policyDetailStateSuffix returns the per-policy detail header suffix for
+// a scheduler-inactive policy (", State: inactive, Scheduler: <name>"),
+// or "" otherwise. haveSched gates the lookup so that when the runtime
+// state cannot be queried the suffix is empty and the header stays
+// bit-identical to the pre-#3062 output for active/non-scheduled
+// policies (#3062).
+func policyDetailStateSuffix(schedulerName string, activeState map[string]bool, haveSched bool) string {
+	if haveSched && dpuserspace.PolicyInactive(schedulerName, activeState) {
+		return fmt.Sprintf(", State: inactive, Scheduler: %s", schedulerName)
+	}
+	return ""
+}
 
 // showPoliciesHitCount renders the per-policy packet/byte hit counters
 // with a fixed-width tabular format. `filter` is parsed for
@@ -157,6 +194,7 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 	// the "Session statistics" block is per-policy hit-count display, so
 	// it must honor the knob for cross-surface consistency.
 	statsEnabled := cfg.Security.PolicyStatsEnabled
+	schedActive, haveSched := s.policySchedulerActiveState()
 	policySetID := uint32(0)
 	for _, zpp := range cfg.Security.Policies {
 		if (filterFrom != "" && zpp.FromZone != filterFrom) ||
@@ -175,7 +213,12 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			}
 			capAction := strings.ToUpper(action[:1]) + action[1:]
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-			fmt.Fprintf(buf, "\n  Policy: %s, action-type: %s\n", pol.Name, capAction)
+			// #3062: a scheduler-inactive policy appends State: inactive +
+			// the scheduler name. Active/non-scheduled policies stay
+			// bit-identical (no suffix), keeping the gRPC text plane in
+			// agreement with the CLI detail surface.
+			fmt.Fprintf(buf, "\n  Policy: %s, action-type: %s%s\n", pol.Name, capAction,
+				policyDetailStateSuffix(pol.SchedulerName, schedActive, haveSched))
 			if pol.Description != "" {
 				fmt.Fprintf(buf, "    Description: %s\n", pol.Description)
 			}
@@ -227,7 +270,9 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			}
 			capAction := strings.ToUpper(action[:1]) + action[1:]
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-			fmt.Fprintf(buf, "\n  Policy: %s, action-type: %s\n", pol.Name, capAction)
+			// #3062: scheduler-inactive global policy appends State: inactive.
+			fmt.Fprintf(buf, "\n  Policy: %s, action-type: %s%s\n", pol.Name, capAction,
+				policyDetailStateSuffix(pol.SchedulerName, schedActive, haveSched))
 			if pol.Description != "" {
 				fmt.Fprintf(buf, "    Description: %s\n", pol.Description)
 			}

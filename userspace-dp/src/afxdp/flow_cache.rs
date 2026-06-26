@@ -186,6 +186,29 @@ pub(super) struct FlowCacheEntry {
     /// active window, so a wrapped `current_epoch` can never re-match a
     /// dead flow ("ghost resurrection" over-count).
     pub(super) last_used_epoch: u16,
+    /// #3048: the `ShardedNeighborMap::mac_change_epoch()` value captured
+    /// when this descriptor was built. The descriptor caches the resolved
+    /// next-hop `dst_mac`; if a kernel ARP/NDP update later REPLACES that
+    /// neighbor's MAC, the neighbor map advances its epoch past this
+    /// stamp. The worker fast path compares the two on every hit
+    /// (`neighbor_mac_epoch_stale`) and evicts a stale descriptor so the
+    /// next packet re-resolves the current MAC — closing the post-failover
+    /// stale-MAC blackhole. A periodic refresh that re-learns the SAME MAC
+    /// does NOT advance the epoch, so steady-state traffic never re-misses.
+    pub(super) neighbor_mac_epoch: u32,
+}
+
+impl FlowCacheEntry {
+    /// #3048: true when the neighbor table has recorded a genuine MAC
+    /// change since this descriptor was cached, i.e. its captured
+    /// `dst_mac` may be stale. `current` is `dynamic_neighbors
+    /// .mac_change_epoch()` read live on the hot path. Equal epochs (the
+    /// steady-state case, including same-MAC ARP refreshes which never
+    /// advance the counter) keep the entry; an advance evicts it.
+    #[inline]
+    pub(super) fn neighbor_mac_epoch_stale(&self, current: u32) -> bool {
+        self.neighbor_mac_epoch != current
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -461,6 +484,12 @@ impl FlowCacheEntry {
             // #1219: 0 = "never touched"; first lookup hit will stamp
             // it with the current epoch.
             last_used_epoch: 0,
+            // #3048: the neighbor-MAC-change epoch is captured by the
+            // caller at insert time (it owns the `dynamic_neighbors`
+            // handle), immediately before `FlowCache::insert`. Seeded to 0
+            // here; the live value is read from
+            // `ShardedNeighborMap::mac_change_epoch()` at the insert site.
+            neighbor_mac_epoch: 0,
         })
     }
 }

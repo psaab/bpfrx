@@ -351,18 +351,17 @@ impl Coordinator {
         }
         // #949: replace + insert under a single bulk acquisition so
         // readers see either the pre-replace or post-replace state,
-        // never a half-replaced set. `with_all_shards` locks all 64
-        // shards in shard-index order (deadlock-free invariant).
-        self.neighbors.dynamic.with_all_shards(|bulk| {
-            if replace {
-                for key in &old_manager_keys {
-                    bulk.remove(key);
-                }
-            }
-            for (ifindex, ip, entry) in neighbors {
-                bulk.insert((*ifindex, *ip), *entry);
-            }
-        });
+        // never a half-replaced set. `bulk_replace_neighbors` locks all
+        // 64 shards in shard-index order (deadlock-free invariant).
+        // #3048: it also bumps `mac_change_epoch` when this Go-snapshot
+        // push REPLACES a neighbor's MAC with a different one (the
+        // fourth neighbor-MAC write path — the in-process monitor, the
+        // data-path learn, and the on-demand resolver are the other
+        // three). `old_manager_keys` is empty when `!replace`, so the
+        // removes are skipped exactly as before.
+        self.neighbors
+            .dynamic
+            .bulk_replace_neighbors(&old_manager_keys, neighbors);
         if replace {
             for key in &old_manager_keys {
                 self.forwarding.neighbors.remove(key);
