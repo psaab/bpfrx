@@ -2325,8 +2325,9 @@ func validatePolicyTerminalActionStrict(cfg *Config) error {
 		if zpp == nil {
 			continue
 		}
+		scope := fmt.Sprintf("from-zone %s to-zone %s", zpp.FromZone, zpp.ToZone)
 		for _, pol := range zpp.Policies {
-			if err := check("", pol); err != nil {
+			if err := check(scope, pol); err != nil {
 				return err
 			}
 		}

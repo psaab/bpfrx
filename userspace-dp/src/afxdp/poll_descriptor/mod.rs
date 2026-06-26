@@ -644,6 +644,14 @@ pub(super) fn poll_binding_process_descriptor(
                                 meta.protocol,
                                 resolved.key.dst_port,
                                 matches!(flow.dst_ip, IpAddr::V6(_)),
+                                // #3171: first L4 byte = ICMP/ICMPv6 type, so an
+                                // error/PMTUD control message stays admitted on a
+                                // ping-less zone (mirrors the kernel chain). 0
+                                // for non-ICMP (ignored by host_inbound_admits).
+                                raw_frame
+                                    .get(meta.l4_offset as usize)
+                                    .copied()
+                                    .unwrap_or(0),
                             )
                         {
                             delete_terminal_filtered_session(
@@ -1459,6 +1467,14 @@ pub(super) fn poll_binding_process_descriptor(
                                 meta.protocol,
                                 flow.forward_key.dst_port,
                                 matches!(flow.dst_ip, IpAddr::V6(_)),
+                                // #3171: first L4 byte = ICMP/ICMPv6 type, so
+                                // error/PMTUD control messages are admitted on a
+                                // ping-less zone (mirrors the kernel chain). 0
+                                // for non-ICMP (ignored by host_inbound_admits).
+                                raw_frame
+                                    .get(meta.l4_offset as usize)
+                                    .copied()
+                                    .unwrap_or(0),
                             )
                         {
                             telemetry.dbg.local += 1;

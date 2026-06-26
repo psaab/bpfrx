@@ -30,6 +30,45 @@
   fail-on-revert proven (restore first-peer assumption → the per-peer test
   goes RED on peer B while the three single-underlay #2684 tests stay GREEN).
   Full `cargo test --release --bin xpf-userspace-dp` = 3089 passed / 0 failed.
+## 2026-06-26 — #3175 queue-planner: orphan VLAN child plan-key follows parent's rx_queues
+
+- **Timestamp**: 2026-06-26
+- **Action**: Follow-up to #3007/#3131/#3173. In
+  `update_snapshot_binding_plan_key` the plan-key loop hashed the CHILD's own
+  `effective_rx_queues` for an ORPHAN VLAN child (a VLAN unit whose physical
+  parent is NOT itself a binding candidate), but `replan_queues`' LAYOUT loop
+  re-keys that child onto its parent using `rx_queue_count(parent)`. So an
+  out-of-band `ethtool -L <parent> combined N` (no config commit) on the parent
+  of an orphan VLAN child did NOT bump the plan key → same-plan-skip → stale
+  layout. Added `plan_key_rx_queues(snapshot, iface, linux_name)` as the single
+  resolution path for the hash: orphan VLAN child → `rx_queue_count(parent)`
+  (mirrors the layout); normal VLAN child (parent IS a candidate) and
+  physical/non-VLAN ifaces → `effective_rx_queues(...)` exactly as #3007 (no
+  change). The #3131 VLAN-child-dedup-onto-physical-parent and the min-collapse
+  are untouched. Two new fail-on-revert tests
+  (`plan_key_folds_parent_sysfs_queues_for_orphan_vlan_child`,
+  `plan_key_for_normal_vlan_child_ignores_parent_sysfs`); reverting the orphan
+  branch turns the orphan test RED (keys collide) while the normal/nonzero tests
+  stay green. `cargo build --release` + `cargo test --release` green (plan_key
+  7/7, queue_planner 13/13).
+- **File(s)**: userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md
+
+## 2026-06-26 — #3207 policy terminal-action validation error: thread zone-pair context
+
+- **Timestamp**: 2026-06-26
+- **Action**: The zone-pair arm of `validatePolicyTerminalActionStrict`
+  called `check("", pol)` with an EMPTY scope, so a missing/conflicting
+  terminal-action error named only the policy (no from/to-zone). With
+  duplicate policy names across zone-pairs the offending policy was hard to
+  locate. Threaded the real scope `fmt.Sprintf("from-zone %s to-zone %s",
+  zpp.FromZone, zpp.ToZone)` (the established convention in
+  compiler_policy_then.go / compiler_policy_match.go) into the error; global
+  policies keep "global". Pure message/context improvement — the set of
+  accepted/rejected configs is unchanged. Added two fail-on-revert tests
+  (zone-pair names the pair + policy; global names "global" + policy).
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/policy_terminal_action_3043_test.go
 
 ## 2026-06-26 — #3200 host-inbound unknown/typo token: commit validation + both-layer fail-closed
 
@@ -20833,3 +20872,27 @@ top.
   FALSE for WG). Full frame suite 313 passed; wg suite 152 passed; build green.
   **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
   userspace-dp/src/afxdp/frame/README.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3171 host-inbound: admit ICMP/ICMPv6 error/PMTUD control
+  messages on a configured ping-less zone so the userspace LocalDelivery
+  classifier matches the kernel host-inbound chain. Added
+  `is_icmp_host_inbound_error` (ICMPv4 dest-unreachable/time-exceeded/
+  parameter-problem; ICMPv6 type 1/2/3/4 = dest-unreachable/packet-too-big/
+  time-exceeded/parameter-problem) and an early-return exemption in
+  `host_inbound_admits` BEFORE the per-zone lookup; threaded the first L4 byte
+  (ICMP type) into both poll_descriptor call sites (session miss + session
+  hit). Echo-request (v4 type 8 / v6 type 128) is NOT exempt — still gated on
+  the `ping` system-service. Broadened the kernel nft chain to the same set
+  (`icmp type { destination-unreachable, time-exceeded, parameter-problem }`,
+  `icmpv6 type { 1, 2, 3, 4, 133..137 }`) so kernel + userspace stay
+  consistent. Reconciled the #3070 README embedded-ICMP claim. Rust test
+  `build_forwarding_state_admits_icmp_errors_on_pingless_zone` +
+  Go `TestHostInboundFilterExemptsIPsecAndV6Errors` updated; fail-on-revert
+  proven (disabling the early-return turns "admits dest-unreachable" RED,
+  "drops echo without ping" stays GREEN).
+  **File(s)**: userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  pkg/daemon/daemon_nft.go, pkg/daemon/host_inbound_nft_test.go

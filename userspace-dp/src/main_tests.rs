@@ -683,6 +683,121 @@ fn queue_planner_rekeys_orphan_vlan_child_onto_parent_netdev() {
     );
 }
 
+// #3175 fail-on-revert: an ORPHAN VLAN child (a VLAN unit whose physical parent
+// is NOT itself a binding candidate) is re-keyed in the LAYOUT onto its parent
+// netdev using the parent's HARDWARE queue count (`rx_queue_count(parent)`). The
+// plan key MUST hash the SAME value. Before #3175 the key loop hashed the
+// child's own software-queue count (`effective_rx_queues(child.rx_queues, ...)`,
+// the lone 1-queue VLAN device), so an out-of-band `ethtool -L <parent> combined
+// N` on the parent (no config commit) left the key unchanged → same-plan-skip →
+// stale layout while `replan_queues` would actually re-plan to the new count.
+//
+// Revert proof: change `plan_key_rx_queues` back to returning
+// `effective_rx_queues(iface.rx_queues, resolved_linux_name)` for the orphan
+// case and this test goes RED — the child's rx_queues=1 is hashed for both
+// counts, so key_4 == key_6.
+#[test]
+fn plan_key_folds_parent_sysfs_queues_for_orphan_vlan_child() {
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, set_rx_queue_count_override, snapshot_binding_plan_key,
+    };
+
+    // Orphan VLAN child only: its physical parent `ge-0-0-9` is NOT present as
+    // its own snapshot interface, so it is not a binding candidate. The child is
+    // a real software VLAN device with a single RX queue (rx_queues=1, nonzero),
+    // proving the key must NOT hash the child's own count.
+    let mk = || ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0/0/9.30".to_string(),
+            linux_name: "ge-0-0-9.30".to_string(),
+            parent_linux_name: "ge-0-0-9".to_string(),
+            zone: "untrust".to_string(),
+            ifindex: 130,
+            parent_ifindex: 19,
+            vlan_id: 30,
+            rx_queues: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // Parent sysfs reports 4 combined channels.
+    set_rx_queue_count_override("ge-0-0-9", 4);
+    let key_4 = snapshot_binding_plan_key(&mk());
+
+    // Operator runs `ethtool -L ge-0-0-9 combined 6` out of band; the snapshot is
+    // byte-identical (child still rx_queues=1) but the parent's live channel
+    // count changed.
+    set_rx_queue_count_override("ge-0-0-9", 6);
+    let key_6 = snapshot_binding_plan_key(&mk());
+
+    clear_rx_queue_count_override();
+
+    assert_ne!(
+        key_4, key_6,
+        "an out-of-band channel change on the parent of an ORPHAN VLAN child MUST \
+         bump the plan key — the key must hash rx_queue_count(parent), the same \
+         value the layout uses, not the child's lone software queue (#3175)"
+    );
+}
+
+// #3175 no-regression: a NORMAL VLAN child (parent IS a binding candidate) keeps
+// the pre-#3175 behavior. The layout dedups the child onto the candidate parent
+// (which carries its own physical key entry), so the child's key contribution
+// stays `effective_rx_queues(child.rx_queues, ...)` and must NOT reach into the
+// parent's sysfs channel count. Overriding the parent's sysfs must leave the
+// plan key byte-identical.
+#[test]
+fn plan_key_for_normal_vlan_child_ignores_parent_sysfs() {
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, set_rx_queue_count_override, snapshot_binding_plan_key,
+    };
+
+    let snap = ConfigSnapshot {
+        interfaces: vec![
+            // Physical parent IS a candidate (nonzero rx_queues).
+            InterfaceSnapshot {
+                name: "ge-0/0/2".to_string(),
+                linux_name: "ge-0-0-2".to_string(),
+                zone: "untrust".to_string(),
+                ifindex: 12,
+                rx_queues: 6,
+                ..Default::default()
+            },
+            // Normal VLAN child (parent present as a candidate above).
+            InterfaceSnapshot {
+                name: "ge-0/0/2.80".to_string(),
+                linux_name: "ge-0-0-2.80".to_string(),
+                parent_linux_name: "ge-0-0-2".to_string(),
+                zone: "untrust".to_string(),
+                ifindex: 80,
+                parent_ifindex: 12,
+                vlan_id: 80,
+                rx_queues: 1,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    clear_rx_queue_count_override();
+    let baseline = snapshot_binding_plan_key(&snap);
+
+    // A wildly different parent sysfs count must NOT change the key: the parent's
+    // own rx_queues (6) is nonzero so sysfs is never consulted, and the normal
+    // VLAN child must NOT take the orphan branch (parent IS a candidate).
+    set_rx_queue_count_override("ge-0-0-2", 999);
+    let with_override = snapshot_binding_plan_key(&snap);
+    clear_rx_queue_count_override();
+
+    assert_eq!(
+        baseline, with_override,
+        "a normal VLAN child (parent IS a candidate) must keep the #3007 \
+         behavior — the plan key stays independent of the parent's sysfs channel \
+         count (only the orphan case re-keys onto the parent, #3175)"
+    );
+}
+
 #[test]
 fn queue_planner_excludes_tunnel_and_local_fabric_ge_interfaces() {
     // #2915: `ge-*`-named interfaces in tunnel or local-fabric contexts are
