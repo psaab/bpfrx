@@ -298,13 +298,17 @@ exactly one of these two classes:
 | `is_fragment` (#2362) | NO — cache-sensitive | Junos `is-fragment`: matches ANY fragment (IPv4 MF set OR offset != 0; IPv6 fragment header present). Computed by `is_any_fragment` |
 | (future) `ihl_match` / IP options | NO — cache-sensitive | IHL varies per packet |
 | `icmp_type` / `icmp_code` (#2362) | NO — cache-sensitive | exact match on the ICMP/ICMPv6 type/code byte; non-ICMP packets never match. Could later be promoted to cache-key by adding (type, code) to `SessionKey` |
-| (future) `flex_match` | NO — cache-sensitive | byte-offset match, fully per-packet |
+| `flex_match` (#3077) | NO — cache-sensitive | Junos `from flexible-match-range`: reads `length` bytes (1..4) at `offset` from the START of the L3 header (match-start layer-3), ANDs with `mask`, requires `== value`. Byte-offset read, fully per-packet. Threaded via `TermMatchExtra::flex_l3` (the L3 slice) — `None` (no frame / deferred CoS path) or a packet too short for the window FAILS CLOSED (no match, no OOB). Compiled from `FlexMatchSnapshot`; before #3077 the constraint was parsed but dropped on the wire, so the term matched too broadly (fail-open) |
 
 The `tcp_flags_mask` / `tcp_flags_forbidden` / `is_fragment` / `icmp_type` /
-`icmp_code` inputs are
+`icmp_code` inputs (and the #3077 `flex_match` L3 slice, `flex_l3`) are
 carried in a small `TermMatchExtra` built once per packet at the filter-eval
 call sites (`term_match_extra_from_frame` and its `ForwardPacketMeta` /
-meta-only variants). The builder is fragment-safe: for a NON-FIRST fragment
+meta-only variants). `flex_l3` borrows the live frame's L3 header, so
+`TermMatchExtra` is parameterized by a lifetime; the deferred CoS/TX-selection
+snapshot drops the borrow (`to_static()` → `flex_l3 = None`) and the flex term
+fails closed there (the frame may be recycled). The builder is fragment-safe:
+for a NON-FIRST fragment
 (no L4 header at `l4_offset` — its bytes are payload) it sets an explicit
 `l4_present = false`, and the matcher (`per_packet_l4_matches`) gates the
 tcp-flags / icmp-type / icmp-code constraints on that flag — NOT on the byte

@@ -27,7 +27,7 @@ pub(crate) fn evaluate_filter_ref_tx_selection_counted<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> TxSelectionFilterResult<'a> {
     evaluate_filter_ref_tx_selection_runtime(
@@ -52,7 +52,7 @@ pub(crate) fn evaluate_filter_ref_tx_selection_runtime_counted<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
     now_ns: u64,
 ) -> TxSelectionFilterResult<'a> {
@@ -79,7 +79,7 @@ fn evaluate_filter_ref_tx_selection_runtime<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
     now_ns: Option<u64>,
 ) -> TxSelectionFilterResult<'a> {
@@ -121,7 +121,7 @@ fn evaluate_filter_ref_tx_selection_counted_v4<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
     now_ns: Option<u64>,
 ) -> TxSelectionFilterResult<'a> {
@@ -188,7 +188,7 @@ fn evaluate_filter_ref_tx_selection_counted_v6<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
     now_ns: Option<u64>,
 ) -> TxSelectionFilterResult<'a> {
@@ -222,7 +222,7 @@ pub(crate) fn evaluate_interface_filter_tx_selection_counted<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> TxSelectionFilterResult<'a> {
     let filter = if is_v6 {
@@ -256,7 +256,7 @@ pub(crate) fn evaluate_interface_output_filter_tx_selection_counted<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> TxSelectionFilterResult<'a> {
     let filter = if is_v6 {

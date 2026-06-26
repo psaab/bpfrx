@@ -689,6 +689,35 @@ type FirewallTermSnapshot struct {
 	// kept only the last, dropping the earlier constraint.
 	ICMPTypes WireUint8List `json:"icmp_types,omitempty"`
 	ICMPCodes WireUint8List `json:"icmp_codes,omitempty"`
+	// FlexMatch is the Junos `from flexible-match-range` byte-offset match
+	// (#3077). Before this wiring it was parsed + compiled for the retired
+	// legacy dataplane but DROPPED on the userspace wire, so the byte-offset
+	// constraint vanished and the term matched too broadly (fail-open). The
+	// match reads FlexLength bytes at FlexOffset from the start of the L3
+	// header (match-start layer-3, the only start point the compiler emits),
+	// interprets them big-endian, ANDs with FlexMask, and requires the result
+	// to equal FlexValue. FlexValue is already pre-masked by the compiler. A
+	// nil pointer means the term carries no flex constraint — identical to the
+	// pre-#3077 behavior for every term that did not use the feature. Like the
+	// #2362 per-packet L4 fields this is NOT part of the 5-tuple SessionKey, so
+	// a filter carrying it is cache-sensitive (the Rust flow-cache declines).
+	// serde(default) on the Rust side keeps wire parity with an older Go
+	// control plane that omits the field (#1961).
+	FlexMatch *FlexMatchSnapshot `json:"flex_match,omitempty"`
+}
+
+// FlexMatchSnapshot is the wire form of a firewall-filter term's
+// flexible-match-range byte-offset match (#3077). It mirrors the fields the
+// legacy dataplane consumed (pkg/dataplane/compiler_filter.go FlexOffset/
+// FlexLength/FlexValue/FlexMask). Offset is the byte offset from the start of
+// the L3 header (match-start layer-3); Length is the match width in BYTES
+// (1..4, derived from the Junos bit-length); Value is the expected value AFTER
+// masking; Mask is applied to the read bytes before the equality compare.
+type FlexMatchSnapshot struct {
+	Offset uint8  `json:"offset"`
+	Length uint8  `json:"length"`
+	Value  uint32 `json:"value"`
+	Mask   uint32 `json:"mask"`
 }
 
 type PolicerSnapshot struct {

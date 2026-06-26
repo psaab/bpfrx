@@ -92,7 +92,15 @@ pub(in crate::afxdp) struct PendingForwardRequest {
     /// have been recycled, so it cannot re-read the frame — it consumes this
     /// snapshot. Built fragment-safe (a non-first fragment zeroes the
     /// L4-derived fields). Default for non-frame-derived requests.
-    pub(in crate::afxdp) filter_match_extra: crate::filter::TermMatchExtra,
+    ///
+    /// #3077: this is a `'static` snapshot — it carries NO borrowed frame slice.
+    /// The deferred CoS/TX-selection path runs after the UMEM frame may be
+    /// recycled, so the flexible-match-range byte-offset condition cannot be
+    /// re-evaluated and fails closed here (under-matches → default
+    /// forwarding-class). Use `TermMatchExtra::to_static()` to build this from a
+    /// frame-derived value. The security ACCEPT/DISCARD decision is taken on the
+    /// immediate filter-eval path, which retains the live slice.
+    pub(in crate::afxdp) filter_match_extra: crate::filter::TermMatchExtra<'static>,
 }
 
 pub(in crate::afxdp) struct PreparedTxRequest {

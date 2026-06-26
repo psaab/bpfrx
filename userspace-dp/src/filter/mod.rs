@@ -174,6 +174,22 @@ pub(crate) struct FilterTerm {
     pub(crate) icmp_type_match_enabled: bool,
     pub(crate) icmp_code_bitmap: [u64; 4],
     pub(crate) icmp_code_match_enabled: bool,
+    // flexible-match-range (#3077): a byte-offset match against the L3 header
+    // (match-start layer-3, the only start point the Go compiler emits). When
+    // `flex_enabled` the matcher reads `flex_length` bytes (1..4) at
+    // `flex_offset` from the start of the L3 header (carried in
+    // TermMatchExtra::flex_l3), interprets them big-endian into a u32, ANDs with
+    // `flex_mask`, and requires the result to equal `flex_value` (pre-masked by
+    // the Go control plane). A packet too short to hold the window, or any path
+    // without the L3 bytes (flex_l3 == None), makes the term FAIL CLOSED (no
+    // match) — never the pre-#3077 fail-open where the constraint was dropped
+    // entirely. NOT in the SessionKey, so it is cache-sensitive (see
+    // has_per_packet_l4_match): the flow-cache declines for filters using it.
+    pub(crate) flex_enabled: bool,
+    pub(crate) flex_offset: u8,
+    pub(crate) flex_length: u8,
+    pub(crate) flex_value: u32,
+    pub(crate) flex_mask: u32,
     pub(crate) action: FilterAction,
     // #2544: fall-through. When true, this term carries NO terminating action
     // (an explicit `then next term` OR a modifier-only term). On a MATCH the
@@ -209,6 +225,10 @@ impl FilterTerm {
             || self.is_fragment
             || self.icmp_type_match_enabled
             || self.icmp_code_match_enabled
+            // #3077: flexible-match-range reads raw packet bytes, not the
+            // 5-tuple, so it is cache-sensitive exactly like the other
+            // per-packet conditions — the flow-cache must decline for it.
+            || self.flex_enabled
     }
 }
 
@@ -219,8 +239,17 @@ impl FilterTerm {
 /// callers that cannot cheaply compute these (cached/TX-selection rebuild
 /// paths, which never carry an L4-match term because the flow-cache declines
 /// for such filters) stay behavior-compatible AND fail closed.
+///
+/// #3077: `flex_l3` carries the L3-header byte slice (match-start layer-3) for
+/// the flexible-match-range byte-offset match. It is `None` on every path that
+/// has no contiguous frame (cached/TX-selection rebuilds, meta-only synthetic
+/// TX) and on the `Default` value, which makes a flex-constrained term FAIL
+/// CLOSED there — those paths never carry a flex term (the flow-cache declines),
+/// and fail-closed is the correct posture if one ever reaches them. The slice
+/// borrows the frame, hence the lifetime; `TermMatchExtra` stays `Copy` because
+/// `Option<&[u8]>` is `Copy`.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct TermMatchExtra {
+pub(crate) struct TermMatchExtra<'a> {
     /// Raw TCP flags byte (only meaningful when protocol == TCP and
     /// `l4_present`).
     pub(crate) tcp_flags: u8,
@@ -242,6 +271,32 @@ pub(crate) struct TermMatchExtra {
     /// `icmp-type 0` / `icmp-code 0`. `is_fragment` is L3-derived and is NOT
     /// gated by this flag.
     pub(crate) l4_present: bool,
+    /// #3077: the L3-header byte slice (start of the IP header) for the
+    /// flexible-match-range byte-offset match. `None` => no L3 bytes available
+    /// on this path => a flex-constrained term fails closed. See the struct doc.
+    pub(crate) flex_l3: Option<&'a [u8]>,
+}
+
+impl<'a> TermMatchExtra<'a> {
+    /// #3077: drop the borrowed L3 slice, yielding a `'static`-lifetime copy
+    /// safe to STORE in a deferred request (`PendingForwardRequest`) that
+    /// outlives the UMEM frame. The frame may be recycled before the deferred
+    /// TX-selection / CoS path consumes the request, so the flex byte-offset
+    /// condition cannot be re-evaluated there — a flex-constrained term FAILS
+    /// CLOSED (under-matches → default forwarding-class), never fail-open. The
+    /// security ACCEPT/DISCARD decision is taken on the immediate filter-eval
+    /// path, which keeps the live slice. All non-borrow fields are preserved.
+    #[inline]
+    pub(crate) fn to_static(self) -> TermMatchExtra<'static> {
+        TermMatchExtra {
+            tcp_flags: self.tcp_flags,
+            is_fragment: self.is_fragment,
+            icmp_type: self.icmp_type,
+            icmp_code: self.icmp_code,
+            l4_present: self.l4_present,
+            flex_l3: None,
+        }
+    }
 }
 
 /// Inclusive port range.

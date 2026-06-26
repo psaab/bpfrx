@@ -4,6 +4,10 @@
 // Loaded as a sibling submodule via `#[path = "tests.rs"]` from filter/mod.rs.
 
 use super::*;
+// #3077: the flexible-match-range wire struct lives in protocol::security; it is
+// only referenced by the flex tests below, so import it here rather than in the
+// non-test filter module (which would warn unused in release builds).
+use crate::FlexMatchSnapshot;
 
 fn make_filter_state(
     filters: &[FirewallFilterSnapshot],
@@ -59,6 +63,7 @@ fn basic_accept_discard() {
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
+                    flex_match: None,
                     source_ports_except: vec![],
                     destination_ports_except: vec![],
                 },
@@ -87,6 +92,7 @@ fn basic_accept_discard() {
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
+                    flex_match: None,
                     source_ports_except: vec![],
                     destination_ports_except: vec![],
                 },
@@ -296,6 +302,7 @@ fn port_range_matching() {
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
+                flex_match: None,
                 source_ports_except: vec![],
                 destination_ports_except: vec![],
             }],
@@ -370,6 +377,7 @@ fn destination_port_except_negation() {
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
+                flex_match: None,
                 source_ports_except: vec![],
                 destination_ports_except: vec!["22".into(), "80".into()],
             }],
@@ -459,6 +467,7 @@ fn source_port_except_negation() {
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
+                flex_match: None,
                 source_ports_except: vec!["53".into()],
                 destination_ports_except: vec![],
             }],
@@ -528,6 +537,7 @@ fn protocol_matching() {
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
+                flex_match: None,
                 source_ports_except: vec![],
                 destination_ports_except: vec![],
             }],
@@ -594,6 +604,7 @@ fn dscp_rewrite_action() {
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
+                flex_match: None,
                 source_ports_except: vec![],
                 destination_ports_except: vec![],
             }],
@@ -646,6 +657,7 @@ fn dscp_rewrite_action_allows_default_zero() {
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
+                flex_match: None,
                 source_ports_except: vec![],
                 destination_ports_except: vec![],
             }],
@@ -1513,6 +1525,7 @@ fn multiple_terms_first_match_wins() {
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
+                    flex_match: None,
                     source_ports_except: vec![],
                     destination_ports_except: vec![],
                 },
@@ -1541,6 +1554,7 @@ fn multiple_terms_first_match_wins() {
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
+                    flex_match: None,
                     source_ports_except: vec![],
                     destination_ports_except: vec![],
                 },
@@ -1608,6 +1622,7 @@ fn source_dest_address_matching() {
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
+                flex_match: None,
                 source_ports_except: vec![],
                 destination_ports_except: vec![],
             }],
@@ -3122,12 +3137,13 @@ fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(a, b, c, d))
 }
 
-fn extra_tcp(flags: u8) -> TermMatchExtra {
+fn extra_tcp(flags: u8) -> TermMatchExtra<'static> {
     TermMatchExtra {
         tcp_flags: flags,
         // A real (first/atomic) TCP segment has an L4 header — the matcher
         // gates tcp-flags on l4_present (#2362 fold A).
         l4_present: true,
+        flex_l3: None,
         ..Default::default()
     }
 }
@@ -3399,6 +3415,7 @@ fn icmp_type_term_matches_only_that_type_v4() {
     let echo = TermMatchExtra {
         icmp_type: 8,
         l4_present: true,
+        flex_l3: None,
         ..Default::default()
     };
     let drop = evaluate_filter(
@@ -3420,6 +3437,7 @@ fn icmp_type_term_matches_only_that_type_v4() {
     let reply = TermMatchExtra {
         icmp_type: 0,
         l4_present: true,
+        flex_l3: None,
         ..Default::default()
     };
     let pass = evaluate_filter(
@@ -3451,6 +3469,7 @@ fn icmp_type_term_matches_icmpv6() {
     let echo = TermMatchExtra {
         icmp_type: 128,
         l4_present: true,
+        flex_l3: None,
         ..Default::default()
     };
     let drop = evaluate_filter(
@@ -3468,6 +3487,7 @@ fn icmp_type_term_matches_icmpv6() {
     let na = TermMatchExtra {
         icmp_type: 136,
         l4_present: true,
+        flex_l3: None,
         ..Default::default()
     };
     let pass = evaluate_filter(
@@ -3499,6 +3519,7 @@ fn icmp_code_term_narrows_within_type() {
         icmp_type: 3,
         icmp_code: 4,
         l4_present: true,
+        flex_l3: None,
         ..Default::default()
     };
     let drop = evaluate_filter(
@@ -3517,6 +3538,7 @@ fn icmp_code_term_narrows_within_type() {
         icmp_type: 3,
         icmp_code: 0,
         l4_present: true,
+        flex_l3: None,
         ..Default::default()
     };
     let pass = evaluate_filter(
@@ -3549,6 +3571,7 @@ fn icmp_term_does_not_match_non_icmp() {
         tcp_flags: 0x02,
         icmp_type: 8,
         l4_present: true,
+        flex_l3: None,
         ..Default::default()
     };
     let pass = evaluate_filter(
@@ -3686,6 +3709,7 @@ fn non_first_fragment_does_not_match_icmp_type_zero() {
     // l4_present false, icmp bytes forced 0, is_fragment true.
     let frag = TermMatchExtra {
         l4_present: false,
+        flex_l3: None,
         icmp_type: 0,
         is_fragment: true,
         ..Default::default()
@@ -3709,6 +3733,7 @@ fn non_first_fragment_does_not_match_icmp_type_zero() {
     // Anti-over-gate: a real echo-reply (type 0, l4_present) DOES match.
     let echo_reply = TermMatchExtra {
         l4_present: true,
+        flex_l3: None,
         icmp_type: 0,
         ..Default::default()
     };
@@ -3738,6 +3763,7 @@ fn non_first_fragment_does_not_match_icmp_code_zero() {
     );
     let frag = TermMatchExtra {
         l4_present: false,
+        flex_l3: None,
         icmp_code: 0,
         is_fragment: true,
         ..Default::default()
@@ -3760,6 +3786,7 @@ fn non_first_fragment_does_not_match_icmp_code_zero() {
     );
     let real = TermMatchExtra {
         l4_present: true,
+        flex_l3: None,
         icmp_code: 0,
         ..Default::default()
     };
@@ -3799,6 +3826,7 @@ fn meta_only_icmp_does_not_match_icmp_type_zero_but_known_type_does() {
     // packet: l4_present FALSE (type/code unknown), icmp bytes 0, not a fragment.
     let meta_icmp = TermMatchExtra {
         l4_present: false,
+        flex_l3: None,
         icmp_type: 0,
         is_fragment: false,
         ..Default::default()
@@ -3822,6 +3850,7 @@ fn meta_only_icmp_does_not_match_icmp_type_zero_but_known_type_does() {
     // A genuinely-known echo-reply (type 0, L4 parsed) DOES match.
     let known = TermMatchExtra {
         l4_present: true,
+        flex_l3: None,
         icmp_type: 0,
         ..Default::default()
     };
@@ -3849,6 +3878,7 @@ fn non_first_fragment_still_matches_is_fragment() {
     let state = make_filter_state(&per_packet_filter("inet", "", None, true, None, None), &[]);
     let frag = TermMatchExtra {
         l4_present: false,
+        flex_l3: None,
         is_fragment: true,
         ..Default::default()
     };
@@ -3911,6 +3941,7 @@ fn icmp_type_multi_value_matches_any_in_set_2545() {
             TermMatchExtra {
                 icmp_type: t,
                 l4_present: true,
+                flex_l3: None,
                 ..Default::default()
             },
         )
@@ -3945,6 +3976,7 @@ fn icmp_type_empty_set_matches_any_2545() {
         TermMatchExtra {
             icmp_type: 42,
             l4_present: true,
+            flex_l3: None,
             ..Default::default()
         },
     );
@@ -4447,6 +4479,7 @@ fn term_2400_composes_with_2362_tcp_flags() {
     let syn_extra = TermMatchExtra {
         tcp_flags: 0x02,
         l4_present: true,
+        flex_l3: None,
         ..Default::default()
     };
     let in_scope_syn = evaluate_filter(
@@ -6287,5 +6320,315 @@ fn pbr_session_hit_path_counts_fallthrough_term_per_packet() {
         filter.terms[0].counter.packets.load(Ordering::Relaxed),
         2,
         "session-hit re-eval counts the fall-through term per packet (#2620 finding 3)"
+    );
+}
+
+// ===================================================================
+// #3077 flexible-match-range byte-offset match
+// ===================================================================
+
+// Build a one-term filter carrying a flexible-match-range constraint, then a
+// trailing accept-all term so a non-match is observably Accept.
+fn flex_filter(
+    family: &str,
+    proto: &str,
+    flex: FlexMatchSnapshot,
+) -> Vec<FirewallFilterSnapshot> {
+    vec![FirewallFilterSnapshot {
+        name: "fx".into(),
+        family: family.into(),
+        terms: vec![
+            FirewallTermSnapshot {
+                name: "match".into(),
+                protocols: if proto.is_empty() {
+                    vec![]
+                } else {
+                    vec![proto.into()]
+                },
+                action: "discard".into(),
+                flex_match: Some(flex),
+                ..Default::default()
+            },
+            FirewallTermSnapshot {
+                name: "rest".into(),
+                action: "accept".into(),
+                ..Default::default()
+            },
+        ],
+    }]
+}
+
+// TermMatchExtra carrying an L3-header slice for the flex byte-offset read.
+fn extra_flex(l3: &[u8]) -> TermMatchExtra<'_> {
+    TermMatchExtra {
+        l4_present: true,
+        flex_l3: Some(l3),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn flex_match_matches_when_masked_bytes_equal_value() {
+    // Match 2 bytes at L3 offset 0 (the IPv4 version/IHL + DSCP bytes), mask
+    // 0xFFFF, expect 0x4500 (IPv4, IHL 5, DSCP 0). A packet whose first two L3
+    // bytes are 0x45,0x00 matches and is discarded.
+    let state = make_filter_state(
+        &flex_filter(
+            "inet",
+            "tcp",
+            FlexMatchSnapshot {
+                offset: 0,
+                length: 2,
+                value: 0x4500,
+                mask: 0xFFFF,
+            },
+        ),
+        &[],
+    );
+    let l3 = [0x45u8, 0x00, 0x00, 0x28, 0xde, 0xad];
+    let hit = evaluate_filter(
+        &state,
+        "inet:fx",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        extra_flex(&l3),
+    );
+    assert_eq!(
+        hit.action,
+        FilterAction::Discard,
+        "L3 bytes 0x4500 at offset 0 must match flex value 0x4500"
+    );
+}
+
+#[test]
+fn flex_match_does_not_match_when_bytes_differ() {
+    // Same term, but the packet's first two L3 bytes are 0x46,0x00 — the masked
+    // value 0x4600 != 0x4500, so the discard term must NOT match (the trailing
+    // accept term wins). This is the #3077 fail-OPEN regression guard: before
+    // the wire fix the flex constraint was dropped and EVERY packet matched the
+    // discard term (matched too broadly).
+    let state = make_filter_state(
+        &flex_filter(
+            "inet",
+            "tcp",
+            FlexMatchSnapshot {
+                offset: 0,
+                length: 2,
+                value: 0x4500,
+                mask: 0xFFFF,
+            },
+        ),
+        &[],
+    );
+    let l3 = [0x46u8, 0x00, 0x00, 0x28, 0xde, 0xad];
+    let miss = evaluate_filter(
+        &state,
+        "inet:fx",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        extra_flex(&l3),
+    );
+    assert_eq!(
+        miss.action,
+        FilterAction::Accept,
+        "L3 bytes 0x4600 must NOT match flex value 0x4500 (fail-open guard)"
+    );
+}
+
+#[test]
+fn flex_match_respects_mask() {
+    // Mask 0x00FF over 2 bytes at offset 2: only the low byte matters. Value
+    // 0x0028 matches any packet whose 4th L3 byte is 0x28 regardless of byte 3.
+    let state = make_filter_state(
+        &flex_filter(
+            "inet",
+            "",
+            FlexMatchSnapshot {
+                offset: 2,
+                length: 2,
+                value: 0x0028,
+                mask: 0x00FF,
+            },
+        ),
+        &[],
+    );
+    let l3 = [0x45u8, 0x00, 0xff, 0x28];
+    let hit = evaluate_filter(
+        &state,
+        "inet:fx",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        extra_flex(&l3),
+    );
+    assert_eq!(
+        hit.action,
+        FilterAction::Discard,
+        "masked low byte 0x28 must match value 0x0028 with mask 0x00FF"
+    );
+    let l3_miss = [0x45u8, 0x00, 0xff, 0x29];
+    let miss = evaluate_filter(
+        &state,
+        "inet:fx",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        extra_flex(&l3_miss),
+    );
+    assert_eq!(miss.action, FilterAction::Accept, "low byte 0x29 must not match");
+}
+
+#[test]
+fn flex_match_fails_closed_on_short_packet() {
+    // The window (offset 4, length 4 -> bytes [4,8)) lies beyond a 6-byte L3
+    // slice. The flex condition must be FALSE (term does not match) and must NOT
+    // panic / read out of bounds. Fail-closed: the accept term wins.
+    let state = make_filter_state(
+        &flex_filter(
+            "inet",
+            "tcp",
+            FlexMatchSnapshot {
+                offset: 4,
+                length: 4,
+                value: 0,
+                mask: 0,
+            },
+        ),
+        &[],
+    );
+    let l3 = [0x45u8, 0x00, 0x00, 0x28, 0xde, 0xad]; // only 6 bytes
+    let res = evaluate_filter(
+        &state,
+        "inet:fx",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        extra_flex(&l3),
+    );
+    assert_eq!(
+        res.action,
+        FilterAction::Accept,
+        "a packet too short for the flex window must fail closed (no match, no panic)"
+    );
+}
+
+#[test]
+fn flex_match_fails_closed_without_l3_slice() {
+    // No L3 bytes available on this path (flex_l3 == None) — the flex term must
+    // fail closed rather than silently passing (the pre-#3077 fail-open).
+    let state = make_filter_state(
+        &flex_filter(
+            "inet",
+            "tcp",
+            FlexMatchSnapshot {
+                offset: 0,
+                length: 2,
+                value: 0x4500,
+                mask: 0xFFFF,
+            },
+        ),
+        &[],
+    );
+    let res = evaluate_filter(
+        &state,
+        "inet:fx",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        TermMatchExtra {
+            l4_present: true,
+            flex_l3: None,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        res.action,
+        FilterAction::Accept,
+        "no L3 slice => flex term fails closed (no match)"
+    );
+}
+
+#[test]
+fn term_without_flex_is_unaffected() {
+    // A term carrying NO flex constraint behaves exactly as before: it matches
+    // on its other criteria regardless of flex_l3. Here a protocol-only discard
+    // term matches a TCP packet even though flex_l3 is None.
+    let mut filters = flex_filter(
+        "inet",
+        "tcp",
+        FlexMatchSnapshot {
+            offset: 0,
+            length: 2,
+            value: 0x4500,
+            mask: 0xFFFF,
+        },
+    );
+    // Strip the flex constraint from the discard term.
+    filters[0].terms[0].flex_match = None;
+    let state = make_filter_state(&filters, &[]);
+    let res = evaluate_filter(
+        &state,
+        "inet:fx",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        TermMatchExtra {
+            l4_present: true,
+            flex_l3: None,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        res.action,
+        FilterAction::Discard,
+        "a term without flex-match matches on its other criteria, unaffected by flex_l3"
+    );
+}
+
+#[test]
+fn flex_match_marks_filter_cache_sensitive() {
+    // A flex-constrained term reads raw packet bytes (not the 5-tuple), so the
+    // filter MUST be flagged cache-sensitive so the flow-cache declines it
+    // (#1431 / #3077). Mirrors the tcp-flags / icmp per-packet behavior.
+    let state = make_filter_state(
+        &flex_filter(
+            "inet",
+            "tcp",
+            FlexMatchSnapshot {
+                offset: 0,
+                length: 2,
+                value: 0x4500,
+                mask: 0xFFFF,
+            },
+        ),
+        &[],
+    );
+    let filter = state.filters.get("inet:fx").expect("filter present");
+    assert!(
+        filter.has_per_packet_l4_match_terms,
+        "a flex-match term must mark the filter cache-sensitive"
     );
 }

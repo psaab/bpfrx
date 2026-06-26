@@ -544,6 +544,24 @@ fn parse_term(
         icmp_type_match_enabled: !snap.icmp_types.is_empty(),
         icmp_code_bitmap: build_u8_match_bitmap(&snap.icmp_codes),
         icmp_code_match_enabled: !snap.icmp_codes.is_empty(),
+        // #3077 flexible-match-range. Lower the wire snapshot into the per-term
+        // match fields. A flex match is only enabled when the length is a sane
+        // 1..=4 bytes (the wire value is a u32); a 0 or out-of-range length is
+        // treated as "no constraint" rather than a degenerate always-fail match,
+        // mirroring the Go side which already caps length to 4 and drops 0. The
+        // value is pre-masked by the Go control plane; we re-AND defensively so
+        // a hand-built snapshot with value bits outside the mask cannot match.
+        flex_enabled: snap
+            .flex_match
+            .as_ref()
+            .is_some_and(|f| (1..=4).contains(&f.length)),
+        flex_offset: snap.flex_match.as_ref().map_or(0, |f| f.offset),
+        flex_length: snap.flex_match.as_ref().map_or(0, |f| f.length),
+        flex_value: snap
+            .flex_match
+            .as_ref()
+            .map_or(0, |f| f.value & f.mask),
+        flex_mask: snap.flex_match.as_ref().map_or(0, |f| f.mask),
         action,
         // #2544: this term falls through (applies modifiers, continues to the
         // next term) when it carries no terminating action. The Go control

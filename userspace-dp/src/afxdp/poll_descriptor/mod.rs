@@ -2885,8 +2885,14 @@ pub(super) fn poll_binding_process_descriptor(
                         // further down would otherwise borrow `packet_frame`
                         // after the take. TermMatchExtra is a small Copy value
                         // holding no borrow.
+                        // #3077: to_static() drops the borrowed frame slice so this
+                        // value holds no borrow (as the comment above requires) and
+                        // survives the frame take below. The flex byte-offset term
+                        // is not re-evaluated on this log-only path (under-matches,
+                        // harmless — it only affects flow-cache log metadata).
                         let filter_match_extra =
-                            crate::afxdp::frame::term_match_extra_from_frame(packet_frame, meta);
+                            crate::afxdp::frame::term_match_extra_from_frame(packet_frame, meta)
+                                .to_static();
                         request.frame = owned_packet_frame
                             .take()
                             .map(PendingForwardFrame::Owned)
