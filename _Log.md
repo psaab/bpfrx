@@ -31,6 +31,38 @@
   userspace-dp/src/afxdp/poll_stages.rs,
   userspace-dp/src/afxdp/README.md
 
+## 2026-06-26 — #2845 WG PTB inner-MTU per-peer underlay
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fix the WireGuard Packet-Too-Big inner-MTU computation, which
+  assumed one underlay MTU per wg interface (resolved via the FIRST peer with
+  an endpoint). The encap path LPM-selects the peer by inner destination
+  (`engine.peer_for_dest`) and computes the outer hop / MTU guard from THAT
+  peer's endpoint, but the PTB path ran before peer selection — so a PTB for
+  traffic to peer B could quote peer A's underlay MTU (over-advertise → next
+  packet dropped by peer B's encap guard; or under-advertise → throughput
+  loss). Fix: the TX dispatcher now derives the pre-encap inner destination
+  and threads it into `post_transform_inner_mtu` →
+  `frame::wg_endpoint_physical_outer_mtu`, which selects the SAME peer the
+  encap path will (`engine.peer_for_dest` on the inner destination) and
+  resolves the physical underlay MTU via THAT peer's endpoint route. Falls
+  back to the pre-#2845 first-peer behaviour (byte-identical single-underlay)
+  when the inner destination is unavailable / no live engine / no covering
+  peer; a covering peer with no endpoint uses the conservative logical
+  fallback rather than borrowing a different peer's underlay.
+- **File(s)**: `userspace-dp/src/afxdp/frame/wg.rs` (new `wg_peer_outer_dst`
+  helper + `wg_endpoint_physical_outer_mtu` gains an `inner_dst` param),
+  `userspace-dp/src/afxdp/icmp_ptb.rs` (`post_transform_inner_mtu` threads
+  `inner_dst` to the WG arm), `userspace-dp/src/afxdp/tx/dispatch/mod.rs`
+  (derive inner dst from `source_frame` + pass it),
+  `userspace-dp/src/afxdp/icmp_ptb_tests.rs` (new
+  `post_transform_wg_inner_mtu_is_per_peer_underlay` two-peer asymmetric
+  fixture + existing calls updated), `userspace-dp/src/afxdp/README.md`,
+  `docs/wireguard-interop.md`.
+- **Validation**: `cargo build --release` clean; new per-peer test green;
+  fail-on-revert proven (restore first-peer assumption → the per-peer test
+  goes RED on peer B while the three single-underlay #2684 tests stay GREEN).
+  Full `cargo test --release --bin xpf-userspace-dp` = 3089 passed / 0 failed.
 ## 2026-06-26 — #3175 queue-planner: orphan VLAN child plan-key follows parent's rx_queues
 
 - **Timestamp**: 2026-06-26
@@ -20873,3 +20905,27 @@ top.
   FALSE for WG). Full frame suite 313 passed; wg suite 152 passed; build green.
   **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
   userspace-dp/src/afxdp/frame/README.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3171 host-inbound: admit ICMP/ICMPv6 error/PMTUD control
+  messages on a configured ping-less zone so the userspace LocalDelivery
+  classifier matches the kernel host-inbound chain. Added
+  `is_icmp_host_inbound_error` (ICMPv4 dest-unreachable/time-exceeded/
+  parameter-problem; ICMPv6 type 1/2/3/4 = dest-unreachable/packet-too-big/
+  time-exceeded/parameter-problem) and an early-return exemption in
+  `host_inbound_admits` BEFORE the per-zone lookup; threaded the first L4 byte
+  (ICMP type) into both poll_descriptor call sites (session miss + session
+  hit). Echo-request (v4 type 8 / v6 type 128) is NOT exempt — still gated on
+  the `ping` system-service. Broadened the kernel nft chain to the same set
+  (`icmp type { destination-unreachable, time-exceeded, parameter-problem }`,
+  `icmpv6 type { 1, 2, 3, 4, 133..137 }`) so kernel + userspace stay
+  consistent. Reconciled the #3070 README embedded-ICMP claim. Rust test
+  `build_forwarding_state_admits_icmp_errors_on_pingless_zone` +
+  Go `TestHostInboundFilterExemptsIPsecAndV6Errors` updated; fail-on-revert
+  proven (disabling the early-return turns "admits dest-unreachable" RED,
+  "drops echo without ping" stays GREEN).
+  **File(s)**: userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  pkg/daemon/daemon_nft.go, pkg/daemon/host_inbound_nft_test.go

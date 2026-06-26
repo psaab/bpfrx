@@ -116,9 +116,17 @@ func TestHostInboundFilterExemptsIPsecAndV6Errors(t *testing.T) {
 	if !strings.Contains(payload, espAH) {
 		t.Errorf("payload missing raw ESP/AH exemption %q\n---\n%s", espAH, payload)
 	}
-	// icmpv6 type 1 (destination-unreachable) must be in the accepted set.
-	if !strings.Contains(payload, "icmpv6 type { 1, 2, 133, 134, 135, 136, 137 } accept") {
-		t.Errorf("payload missing icmpv6 type-1 (dest-unreachable) in the global accept:\n%s", payload)
+	// icmpv6 error/PMTUD types 1-4 + ND 133-137 must be in the accepted set.
+	if !strings.Contains(payload, "icmpv6 type { 1, 2, 3, 4, 133, 134, 135, 136, 137 } accept") {
+		t.Errorf("payload missing icmpv6 error/PMTUD (1-4) + ND in the global accept:\n%s", payload)
+	}
+	// #3171: the ICMPv4 error/PMTUD set must agree with the userspace
+	// host-inbound exemption (is_icmp_host_inbound_error) so the kernel chain and
+	// the XSK LocalDelivery classifier admit the same ICMP errors on a ping-less
+	// zone. Fail-on-revert: narrowing this back to bare destination-unreachable
+	// turns this RED.
+	if !strings.Contains(payload, "icmp type { destination-unreachable, time-exceeded, parameter-problem } accept") {
+		t.Errorf("payload missing icmpv4 error/PMTUD (dest-unreachable/time-exceeded/parameter-problem) accept:\n%s", payload)
 	}
 
 	// The ESP/AH exemption MUST precede every per-zone scoped drop, otherwise a

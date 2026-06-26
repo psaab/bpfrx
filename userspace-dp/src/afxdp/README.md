@@ -293,6 +293,21 @@ sync.
     IPv4 inner stays fragmentable → `Forward` → the #2331 drop guard remains
     the backstop). `mtu == 0` (no MTU resolvable / unknown tunnel kind)
     fails open to `Forward`.
+    **Per-peer WG underlay (#2845):** for WireGuard the underlay MTU is
+    NOT one-per-interface — different peers of one wg endpoint can have
+    different endpoints / transport routes / underlay MTUs. The dispatcher
+    threads the pre-encap inner destination into `post_transform_inner_mtu`,
+    which passes it to `frame::wg_endpoint_physical_outer_mtu`. That helper
+    selects the SAME peer the encap path will (`engine.peer_for_dest` —
+    AllowedIPs LPM on the inner destination) and resolves the physical
+    underlay MTU via THAT peer's endpoint route, so the advertised inner PMTU
+    matches the underlay the encap guard will actually admit the packet onto.
+    When the inner destination is unavailable, no live engine is present, or
+    no peer covers it, it falls back to the first peer with an endpoint (the
+    pre-#2845 per-interface behaviour — byte-identical when all peers share
+    one underlay). A covering peer with NO endpoint resolves to the
+    conservative logical-ifindex MTU rather than borrowing a different peer's
+    underlay.
 - `icmp_ptb.rs` — #2301 PMTUD error generators for the generic
   forwarder: the egress-MTU decision plus the ICMPv4 Frag-Needed /
   ICMPv6 Packet-Too-Big builders (MTU in the body). Mirrors

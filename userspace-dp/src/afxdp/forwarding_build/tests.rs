@@ -1053,41 +1053,142 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
 
     // wan (id 11): ping (icmp) admitted, gre (proto 47) admitted, ssh (tcp/22)
     // DENIED, ospf (proto 89) DENIED.
-    assert!(host_inbound_admits(&state, 11, 1, 0, false), "wan ping");
-    assert!(host_inbound_admits(&state, 11, 47, 0, false), "wan gre");
-    assert!(!host_inbound_admits(&state, 11, 6, 22, false), "wan ssh deny");
-    assert!(!host_inbound_admits(&state, 11, 89, 0, false), "wan ospf deny");
+    assert!(host_inbound_admits(&state, 11, 1, 0, false, 0), "wan ping");
+    assert!(host_inbound_admits(&state, 11, 47, 0, false, 0), "wan gre");
+    assert!(
+        !host_inbound_admits(&state, 11, 6, 22, false, 0),
+        "wan ssh deny"
+    );
+    assert!(
+        !host_inbound_admits(&state, 11, 89, 0, false, 0),
+        "wan ospf deny"
+    );
 
     // lan (id 12): ssh (tcp/22) admitted, ping admitted, telnet (tcp/23)
     // DENIED, dhcp (udp/67) DENIED (not listed).
-    assert!(host_inbound_admits(&state, 12, 6, 22, false), "lan ssh");
-    assert!(host_inbound_admits(&state, 12, 1, 0, false), "lan ping");
-    assert!(!host_inbound_admits(&state, 12, 6, 23, false), "lan telnet deny");
-    assert!(!host_inbound_admits(&state, 12, 17, 67, false), "lan dhcp deny");
+    assert!(host_inbound_admits(&state, 12, 6, 22, false, 0), "lan ssh");
+    assert!(host_inbound_admits(&state, 12, 1, 0, false, 0), "lan ping");
+    assert!(
+        !host_inbound_admits(&state, 12, 6, 23, false, 0),
+        "lan telnet deny"
+    );
+    assert!(
+        !host_inbound_admits(&state, 12, 17, 67, false, 0),
+        "lan dhcp deny"
+    );
 
     // control (id 13): all → admit everything.
     assert!(
-        host_inbound_admits(&state, 13, 6, 12345, false),
+        host_inbound_admits(&state, 13, 6, 12345, false, 0),
         "control all tcp"
     );
     assert!(
-        host_inbound_admits(&state, 13, 89, 0, false),
+        host_inbound_admits(&state, 13, 89, 0, false, 0),
         "control all ospf"
     );
 
     // legacy (id 14): unconfigured → admit everything (pre-#3070 behaviour).
     assert!(
-        host_inbound_admits(&state, 14, 6, 22, false),
+        host_inbound_admits(&state, 14, 6, 22, false, 0),
         "legacy admit-all"
     );
     assert!(
-        host_inbound_admits(&state, 14, 89, 0, false),
+        host_inbound_admits(&state, 14, 89, 0, false, 0),
         "legacy admit-all proto"
     );
     // A zone id that does not exist at all also admits (no entry).
     assert!(
-        host_inbound_admits(&state, 99, 6, 22, false),
+        host_inbound_admits(&state, 99, 6, 22, false, 0),
         "unknown zone admit"
+    );
+}
+
+// #3171: a CONFIGURED ping-less zone must still admit ICMP/ICMPv6 ERROR /
+// PMTUD control messages (destination-unreachable, packet-too-big, time-
+// exceeded, parameter-problem) reaching the XSK LocalDelivery path — mirroring
+// the kernel host-inbound chain's global ICMP-error accept — while still
+// DENYING ICMP echo-request when `ping` is not configured. A zone WITH `ping`
+// still admits echo-request.
+//
+// Fail-on-revert: deleting the `is_icmp_host_inbound_error` early-return in
+// `host_inbound_admits` (the blanket ICMP-drop behaviour) turns the
+// "admits dest-unreachable" assertions RED while the "drops echo without ping"
+// assertions stay GREEN.
+#[test]
+fn build_forwarding_state_admits_icmp_errors_on_pingless_zone() {
+    use crate::ZoneSnapshot;
+    use crate::afxdp::forwarding::host_inbound_admits;
+
+    let snapshot = ConfigSnapshot {
+        zones: vec![
+            // ping-less zone: ssh only, NO ping.
+            ZoneSnapshot {
+                name: "wan-noping".into(),
+                id: 31,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec!["ssh".into()],
+                host_inbound_protocols: vec![],
+                ..Default::default()
+            },
+            // ping zone: echo-request must still be admitted.
+            ZoneSnapshot {
+                name: "lan-ping".into(),
+                id: 32,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec!["ping".into()],
+                host_inbound_protocols: vec![],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let state = build_forwarding_state(&snapshot);
+
+    // ping-less zone (id 31) ADMITS ICMPv4 error / PMTUD control messages even
+    // though it lists no `ping`: destination-unreachable (3), time-exceeded
+    // (11), parameter-problem (12).
+    assert!(
+        host_inbound_admits(&state, 31, 1, 0, false, 3),
+        "ping-less zone admits icmp destination-unreachable (PMTUD)"
+    );
+    assert!(
+        host_inbound_admits(&state, 31, 1, 0, false, 11),
+        "ping-less zone admits icmp time-exceeded (traceroute)"
+    );
+    assert!(
+        host_inbound_admits(&state, 31, 1, 0, false, 12),
+        "ping-less zone admits icmp parameter-problem"
+    );
+    // ...and ICMPv6 destination-unreachable (1) + packet-too-big (2, PMTUD).
+    assert!(
+        host_inbound_admits(&state, 31, 58, 0, true, 1),
+        "ping-less zone admits icmpv6 destination-unreachable"
+    );
+    assert!(
+        host_inbound_admits(&state, 31, 58, 0, true, 2),
+        "ping-less zone admits icmpv6 packet-too-big (PMTUD)"
+    );
+
+    // ...but echo-request (v4 type 8 / v6 type 128) is STILL DENIED — it is
+    // gated on the `ping` system-service, which this zone does not list.
+    assert!(
+        !host_inbound_admits(&state, 31, 1, 0, false, 8),
+        "ping-less zone DENIES icmp echo-request"
+    );
+    assert!(
+        !host_inbound_admits(&state, 31, 58, 0, true, 128),
+        "ping-less zone DENIES icmpv6 echo-request"
+    );
+
+    // ping zone (id 32) admits echo-request on both families.
+    assert!(
+        host_inbound_admits(&state, 32, 1, 0, false, 8),
+        "ping zone admits icmp echo-request"
+    );
+    assert!(
+        host_inbound_admits(&state, 32, 58, 0, true, 128),
+        "ping zone admits icmpv6 echo-request"
     );
 }
 
@@ -1133,42 +1234,42 @@ fn build_forwarding_state_protocols_all_admits_routing_not_system_services() {
 
     // routing (id 21): `protocols all` admits routing protocols of every kind.
     assert!(
-        host_inbound_admits(&state, 21, 89, 0, false),
+        host_inbound_admits(&state, 21, 89, 0, false, 0),
         "protocols all admits ospf (proto 89)"
     );
     assert!(
-        host_inbound_admits(&state, 21, 6, 179, false),
+        host_inbound_admits(&state, 21, 6, 179, false, 0),
         "protocols all admits bgp (tcp/179)"
     );
     assert!(
-        host_inbound_admits(&state, 21, 112, 0, false),
+        host_inbound_admits(&state, 21, 112, 0, false, 0),
         "protocols all admits vrrp (proto 112)"
     );
     assert!(
-        host_inbound_admits(&state, 21, 17, 520, false),
+        host_inbound_admits(&state, 21, 17, 520, false, 0),
         "protocols all admits rip (udp/520)"
     );
     // ...but NOT system-services: SSH, HTTPS, SNMP must be DENIED.
     assert!(
-        !host_inbound_admits(&state, 21, 6, 22, false),
+        !host_inbound_admits(&state, 21, 6, 22, false, 0),
         "protocols all must NOT admit ssh (tcp/22)"
     );
     assert!(
-        !host_inbound_admits(&state, 21, 6, 443, false),
+        !host_inbound_admits(&state, 21, 6, 443, false, 0),
         "protocols all must NOT admit https (tcp/443)"
     );
     assert!(
-        !host_inbound_admits(&state, 21, 17, 161, false),
+        !host_inbound_admits(&state, 21, 17, 161, false, 0),
         "protocols all must NOT admit snmp (udp/161)"
     );
 
     // mgmt (id 22): explicit ssh still admits ssh (regression), denies https.
     assert!(
-        host_inbound_admits(&state, 22, 6, 22, false),
+        host_inbound_admits(&state, 22, 6, 22, false, 0),
         "system-services ssh admits ssh"
     );
     assert!(
-        !host_inbound_admits(&state, 22, 6, 443, false),
+        !host_inbound_admits(&state, 22, 6, 443, false, 0),
         "system-services ssh does not admit https"
     );
 }

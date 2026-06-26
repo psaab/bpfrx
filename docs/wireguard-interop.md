@@ -176,18 +176,36 @@ but unnecessary fragmentation pressure / throughput loss).
 
 The WG arm now derives the outer MTU from the PHYSICAL underlay via
 `frame::wg_endpoint_physical_outer_mtu`, a thin wrapper over the same #2680
-`outer_physical_egress_mtu` SSOT the encap guard uses. The PTB path runs
-before the per-packet peer LPM (it has no inner frame), but the WG underlay
-is per-tunnel-endpoint, not per-inner-flow (#2734) — so it route-resolves
-the physical egress via the FIRST peer that carries an endpoint address.
+`outer_physical_egress_mtu` SSOT the encap guard uses.
 Corrected formula: advertised inner MTU = `wg_inner_mtu(outer_family,
 physical_underlay_mtu)` = `physical_mtu − WG_OVERHEAD_{V4,V6} −
 WG_MAX_PADDING` — EXACTLY the inverse of `wg_encapped_size` the encap guard
-admits against, so the PTB and the guard now agree. Conservative fallback
-(no peer endpoint to route to / unresolvable outer) reverts to the logical
-`egress_ifindex` MTU — the pre-#2684 value, never worse. GRE is unaffected:
+admits against, so the PTB and the guard now agree. GRE is unaffected:
 its `endpoint.destination` is the real outer hop, so `tunnel_outer_mtu`
 already resolves to the physical underlay for `native_gre_inner_mtu`.
+
+**#2845 (per-peer underlay — the #2684 follow-up).** #2684 originally
+resolved the physical egress via the FIRST peer that carried an endpoint
+address, on the assumption that the WG underlay is per-tunnel-endpoint, not
+per-inner-flow (#2734). That assumption is wrong when one wg interface has
+peers on DIFFERENT underlay paths: the encap path LPM-selects the peer by
+inner destination (`engine.peer_for_dest`) and computes the outer hop / MTU
+guard from THAT peer's endpoint, but the PTB ran before peer selection and
+used the first peer's endpoint. So a PTB for traffic to peer B could quote
+peer A's underlay MTU — over-advertising (next packet dropped by peer B's
+encap guard) or under-advertising (needless throughput loss). The dispatcher
+now threads the pre-encap inner destination into `post_transform_inner_mtu`,
+which passes it to `wg_endpoint_physical_outer_mtu`. The helper selects the
+SAME peer the encap path will (`engine.peer_for_dest` on the inner
+destination — the live engine owns the AllowedIPs LPM and the per-snapshot
+endpoint binding, #2836) and resolves the underlay via THAT peer's endpoint
+route. Conservative fallback (no inner destination available, no live engine,
+or no peer covers the destination) reverts to the first peer with an endpoint
+— byte-identical when all peers share one underlay; the pre-#2684 logical
+`egress_ifindex` MTU when even that has no endpoint. A covering peer with NO
+endpoint resolves to the logical fallback rather than borrowing a different
+peer's underlay (the encap path drops such a packet anyway, so the PTB value
+is moot).
 
 **#2457 (advertised/configured inner MTU clamped to the engine ceiling).**
 The WG engine encrypts at most `PADDED_PLAINTEXT_MAX = 4096` bytes of
