@@ -19,6 +19,44 @@
 - **File(s)**: pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
   pkg/config/policy_zone_ref_test.go, pkg/config/README.md, _Log.md
 
+## 2026-06-25 — #3032: cache SYN-cookie epoch wall clock once per second
+
+- **Timestamp**: 2026-06-25
+- **Action**: `SynCookieCodec::current_full_epoch()` read `SystemTime::now()`
+  on every minted/validated cookie — redundant CPU exactly under a SYN flood
+  since the cookie epoch is 64s wide. Made the leaf pure
+  (`current_full_epoch(now_secs)` = `full_epoch_from_unix_secs(now_secs)`) and
+  moved the OS clock read into `ScreenState::current_syn_cookie_full_epoch`,
+  gated to fire at most once per monotonic second (keyed by the batch-cached
+  monotonic `now_secs` already threaded into `check_packet_with_zone_id` and the
+  standby-ACK path). CLOCK-DOMAIN: the batch `now_secs` is `CLOCK_MONOTONIC`
+  (per-node, unrelated across HA peers); the cookie epoch needs Unix wall-clock
+  (NTP-synced) so a cookie minted on one node validates on its peer. So the
+  monotonic second is used ONLY as the refresh throttle; the cached value seeded
+  into the epoch is `SystemTime::now()` wall-clock seconds. Both call sites
+  (mint ~388, standby-ACK validation ~594) share one cached wall-second per
+  second; the ±1-epoch (±64s) validation window absorbs the ≤1s cache staleness.
+- **File(s)**: userspace-dp/src/screen/syncookie.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  docs/syn-cookie-flood-protection.md, _Log.md
+- **Validation**: cargo build --release -p xpf-userspace-dp (0 errors); cargo
+  test --release -p xpf-userspace-dp → 3022 passed, 2 ignored (a later run saw
+  2 unrelated afxdp concurrency flakes — wg::engine reconcile_peers_snapshot
+  and worker_queue concurrent_recovery — both pass in isolation; screen suite
+  137/137 green). Three tests:
+  `syn_cookie_current_full_epoch_is_pure_wall_clock_passthrough` (pins the leaf
+  == full_epoch_from_unix_secs for sample seconds — leaf-level guard) and
+  `syn_cookie_round_trip_with_cached_wall_secs` (mint/validate round-trip across
+  the ±1-epoch window; 2 epochs ahead fails as before — codec-level guard).
+  REVIEW FOLD: added `syn_cookie_screen_state_epoch_uses_wall_clock_not_monotonic`
+  — drives `ScreenState::current_syn_cookie_full_epoch(mono=5)` (no test
+  override) and asserts the returned epoch equals the LIVE Unix wall-clock epoch
+  (anchored via `read_unix_wall_secs()`, bracketed for 64s-boundary tolerance)
+  and is NOT `full_epoch_from_unix_secs(5)` and not 0. This is the call-site
+  clock-domain guard the leaf tests could not provide: reverting the call site to
+  `current_full_epoch(mono_now_secs)` was empirically verified RED→GREEN (RED:
+  "epoch must come from the live Unix wall clock (27850618..=27850618), got 0").
+
 ## 2026-06-25 — #3060: reject accepted-but-inert bare `then log` at commit
 
 - **Timestamp**: 2026-06-25
