@@ -3614,6 +3614,9 @@ func TestPolicyStatementRouteMapAttributesSetSyntax(t *testing.T) {
 // land on term.Community and CommunityOp would stay empty).
 func TestPolicyCommunityOperationsCompile(t *testing.T) {
 	cmds := []string{
+		// The `then community delete <name>` form references a defined
+		// community-list (#2881 cross-reference gate); define it.
+		"set policy-options community MYLIST members 65000:999",
 		"set policy-options policy-statement P term t_add then community add 65000:111",
 		"set policy-options policy-statement P term t_del then community delete MYLIST",
 		"set policy-options policy-statement P term t_set then community set 65000:222",
@@ -3679,6 +3682,9 @@ func TestPolicyCommunityOperationsCompile(t *testing.T) {
 // dropping listB... RED if applyCommunityAction reads only the first list value.
 func TestPolicyCommunityDeleteMultiListCompile(t *testing.T) {
 	cmds := []string{
+		// The referenced community-lists must be defined (#2881 gate).
+		"set policy-options community listA members 65000:1",
+		"set policy-options community listB members 65000:2",
 		"set policy-options policy-statement P term t_del then community delete [ listA listB ]",
 	}
 	tree := &ConfigTree{}

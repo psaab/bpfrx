@@ -809,6 +809,91 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// validatePolicyCommunityReferencesStrict hard-rejects a policy-statement term
+// whose `from community <name>` or `then community delete <name>` references a
+// community the config never defines under `policy-options community <name>`
+// (#2881).
+//
+// xpf renders `from community <name>` as the FRR route-map clause
+// `match community <name>` and `then community delete <name>` (added in #2848)
+// as `set comm-list <name> delete`. Both clauses reference an FRR
+// `bgp community-list <name>`, which xpf emits ONLY for a defined
+// `policy-options community <name>` (policy_render.go). With no validation an
+// undefined name passes commit and breaks at FRR render time: a dangling
+// `match community` / `set comm-list ... delete` line is rejected by
+// frr-reload, and because a single vtysh -f add-batch exits non-zero on any
+// CMD_WARNING_CONFIG_FAILED, the WHOLE reload fails — leaving dynamic routing
+// stale, a commit-accepted config the routing daemon cannot load.
+//
+// Only NAME references are checked. `then community (set|add) <value>` and the
+// bare `then community <value>` carry a community VALUE (e.g. 65000:100 /
+// no-export), not a community-list reference, so they are not validated here;
+// `then community none` carries no argument. Multiple `from community` siblings
+// (FromCommunity slice) and a multi-list `then community delete [ a b ]`
+// (CommunityDelete slice) are each fully walked.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientPolicyCommunityRef) so an already-persisted or
+// peer-synced config carrying the typo still boots (#1960 fail-closed-on-load
+// class). Commit / commit-check stay strict. Runs on the fully-compiled
+// *Config so the community map is populated regardless of authoring order.
+// Mirrors validateRoutingExportReferencesStrict.
+func validatePolicyCommunityReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	defined := func(name string) bool {
+		if cfg.PolicyOptions.Communities == nil {
+			return false
+		}
+		_, ok := cfg.PolicyOptions.Communities[name]
+		return ok
+	}
+
+	// Sort policy-statement names for a deterministic first-error message
+	// (the typed-config map iteration order is otherwise random).
+	names := make([]string, 0, len(cfg.PolicyOptions.PolicyStatements))
+	for name := range cfg.PolicyOptions.PolicyStatements {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, psName := range names {
+		ps := cfg.PolicyOptions.PolicyStatements[psName]
+		if ps == nil {
+			continue
+		}
+		for _, term := range ps.Terms {
+			if term == nil {
+				continue
+			}
+			for _, c := range term.FromCommunity {
+				if c == "" || defined(c) {
+					continue
+				}
+				return fmt.Errorf("policy-statement %s term %s `from community %s` "+
+					"references undefined community %q — xpf renders no "+
+					"`bgp community-list %s`, so the `match community` line would "+
+					"fail frr-reload (failing the entire FRR config load); define "+
+					"`policy-options community %s` or fix the name",
+					psName, term.Name, c, c, c, c)
+			}
+			for _, c := range term.CommunityDelete {
+				if c == "" || defined(c) {
+					continue
+				}
+				return fmt.Errorf("policy-statement %s term %s `then community delete %s` "+
+					"references undefined community %q — xpf renders no "+
+					"`bgp community-list %s`, so the `set comm-list %s delete` line "+
+					"would fail frr-reload (failing the entire FRR config load); "+
+					"define `policy-options community %s` or fix the name",
+					psName, term.Name, c, c, c, c, c)
+			}
+		}
+	}
+	return nil
+}
+
 // frrTokenUnsafeIndex returns the byte index of the first character in s
 // that FRR's command lexer cannot carry inside a single config token, or
 // -1 if every character is safe.
