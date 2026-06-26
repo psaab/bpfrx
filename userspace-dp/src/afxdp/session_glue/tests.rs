@@ -5015,6 +5015,96 @@ fn flush_session_deltas_without_binding_reaches_global_consumers() {
     );
 }
 
+/// #2874 FAIL-ON-REVERT: a correctness-critical HA session OPEN delta that
+/// cannot be queued losslessly to the event-stream consumer must be reported as
+/// out-of-sync (flush_session_deltas returns true) so the worker loop forces a
+/// full owner-RG resync — it must NOT be silently dropped.
+///
+/// `test_worker_handle` yields a DISCONNECTED handle (connected=false), so
+/// `push_delta_lossless` fails immediately the same way a wedged/disconnected
+/// consumer would after exhausting its bounded backpressure — no 5s wait in the
+/// unit test.
+///
+/// Fail-on-revert: restore `es.push_delta(...)` (the lossy `try_send`) and the
+/// open delta is queued into the empty (capacity-1) channel WITHOUT surfacing a
+/// failure, so flush_session_deltas returns false and the assertion goes red —
+/// exactly the silent standby session loss #2874 describes.
+#[test]
+fn flush_session_deltas_event_stream_drop_latches_out_of_sync() {
+    let key = test_key();
+    let decision = test_decision();
+    let metadata = test_metadata();
+
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+    let recent_session_deltas = Arc::new(Mutex::new(VecDeque::new()));
+    let forwarding = ForwardingState::default();
+
+    // Disconnected event-stream handle (capacity 1, connected=false): the
+    // lossless producer fails immediately on a session-sync push.
+    let (handle, _rx) = crate::event_stream::test_worker_handle(
+        1,
+        crate::event_stream::DataplaneEventRateLimitConfig::default(),
+    );
+    let event_stream = Some(handle);
+
+    let open = SessionDelta {
+        kind: SessionDeltaKind::Open,
+        key: key.clone(),
+        decision,
+        metadata,
+        origin: SessionOrigin::ForwardFlow,
+        fabric_redirect_sync: false,
+        created_ns: 0,
+        last_seen_ns: 0,
+        counters: crate::session::SessionCounters::default(),
+    };
+
+    let ident = BindingIdentity {
+        slot: 0,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from(""),
+        ifindex: -1,
+    };
+    let dnat_fds = crate::afxdp::checksum::DnatTableFds::default();
+    let out_of_sync = flush_session_deltas(
+        &ident,
+        None,
+        -1,
+        -1,
+        -1,
+        &dnat_fds,
+        &[open],
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &recent_session_deltas,
+        &peer_worker_commands,
+        &event_stream,
+        &forwarding,
+    );
+
+    assert!(
+        out_of_sync,
+        "a session-sync OPEN delta that cannot be queued losslessly must latch out-of-sync, not be silently dropped (#2874)"
+    );
+    // The binding-independent recent-deltas consumer still observes the open —
+    // the out-of-sync signal is additive, not a skip of the other consumers.
+    assert!(
+        recent_session_deltas
+            .lock()
+            .expect("recent deltas")
+            .iter()
+            .any(|info| info.event == "open"),
+        "open delta must still reach the recent-deltas buffer"
+    );
+}
+
 /// #2979 FAIL-ON-REVERT: a Close delta for an SNAT'd session must delete the
 /// dynamic reverse-NAT `dnat_table` entry that `publish_dnat_table_entry`
 /// inserted at session install. The maps are `BPF_MAP_TYPE_HASH` (non-LRU,

@@ -21305,3 +21305,37 @@ top.
   `go test ./pkg/daemon/... ./pkg/config/...` green.
   **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/lo0_filter_test.go,
   docs/feature-gaps.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #2874 — fix CRITICAL HA session-sync data loss: route session
+  open/close deltas through the LOSSLESS producer + treat a session-sync seq
+  gap on the Go consumer as a hard sync break (resync, no ACK past the hole).
+  Rust producer: `flush_session_deltas` now uses `push_delta_lossless` (not the
+  lossy `push_delta` which burns a seq then silently drops on a full channel)
+  for the type-2 HA open/close delta; on a genuine enqueue failure (peer
+  disconnect / queue timeout) it returns `true` and the worker-loop macro
+  latches loss-of-sync via the new `SessionTable::set_delta_loss`, driving the
+  existing #2442 `take_delta_loss` full owner-RG re-export. It stops further
+  lossless pushes for the rest of the batch (snapshot supersedes them), bounding
+  the worst case to one `LOSSLESS_QUEUE_TIMEOUT` wait per drain cycle. RT_FLOW
+  telemetry frames stay best-effort. Go consumer: a seq gap on a session-sync
+  frame (open/update/close) now calls `handleSessionSyncGap` → triggers
+  `onFullResync` and returns from the read loop WITHOUT advancing
+  `lastAppliedSeq`, so the cumulative ACK never passes the hole and the
+  reconnect replays from the last contiguous ack. Telemetry-frame gaps stay
+  count-only (no resync — avoids thundering-resync). New counter
+  `EventStreamStatus.session_sync_resyncs`. Tests (all fail-on-revert proven
+  RED): Rust `flush_session_deltas_event_stream_drop_latches_out_of_sync`
+  (session_glue) + `session_delta_lossless_surfaces_failure_while_telemetry_drops`
+  (event_stream); Go `TestEventStreamSessionGapTriggersResyncWithholdsAck` +
+  `TestEventStreamTelemetryGapDoesNotTriggerResync`. cargo build/test +
+  go build ./... + go test ./pkg/dataplane/... green.
+  **File(s)**: userspace-dp/src/afxdp/session_delta.rs,
+  userspace-dp/src/session/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  userspace-dp/src/event_stream/README.md,
+  pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/eventstream_test.go,
+  pkg/dataplane/userspace/protocol.go

@@ -1255,6 +1255,43 @@ fn test_lossless_send_waits_for_capacity() {
     assert_eq!(shared.frames_dropped.load(Ordering::Relaxed), 0);
 }
 
+// #2874: the HA session-sync delta must route through the LOSSLESS producer
+// (which surfaces a queue failure) while RT_FLOW telemetry stays best-effort
+// (silently drops on a full channel). This documents the lossless-vs-telemetry
+// split that `flush_session_deltas` relies on.
+#[test]
+fn session_delta_lossless_surfaces_failure_while_telemetry_drops() {
+    let (tx, _rx) = mpsc::sync_channel::<EventFrame>(1);
+    let shared = Arc::new(EventStreamShared::new()); // connected=false
+    let handle = EventStreamWorkerHandle {
+        tx,
+        shared: shared.clone(),
+    };
+    let zone_map = FxHashMap::default();
+    let open = test_close_delta(crate::session::SessionDeltaKind::Open);
+
+    // Session-sync delta: lossless surfaces the failure (NOT silently dropped).
+    let err = handle
+        .push_delta_lossless(&open, &zone_map)
+        .expect_err("session-sync delta must not be silently dropped");
+    assert!(err.contains("not connected"), "unexpected error: {err}");
+
+    // Telemetry stays best-effort: try_send fills then silently drops.
+    assert!(
+        handle.try_send(EventFrame::encode_drain_complete(1)),
+        "first telemetry frame fills the channel"
+    );
+    assert!(
+        !handle.try_send(EventFrame::encode_drain_complete(2)),
+        "telemetry frame must silently drop on a full channel"
+    );
+    assert_eq!(
+        shared.frames_dropped.load(Ordering::Relaxed),
+        1,
+        "the silently-dropped telemetry frame is counted in frames_dropped"
+    );
+}
+
 #[test]
 fn test_lossless_send_fails_when_not_connected() {
     let (tx, _rx) = mpsc::sync_channel::<EventFrame>(1);
