@@ -643,6 +643,159 @@ fn static_nat_snat_matches_internal_ip_v6() {
     );
 }
 
+// #3031: block-to-block (subnet) static NAT — 1:1 by offset. A source
+// host maps to the same offset in the destination block (network bits
+// replaced, host bits preserved), both directions.
+
+fn block_snapshot(ext: &str, int: &str, from_zone: &str) -> StaticNATRuleSnapshot {
+    StaticNATRuleSnapshot {
+        counter_id: 0,
+        name: "block-1".to_string(),
+        from_zone: from_zone.to_string(),
+        external_ip: ext.to_string(),
+        internal_ip: int.to_string(),
+        match_destination_port: 0,
+        mapped_port: 0,
+    }
+}
+
+#[test]
+fn static_nat_block_dnat_v4_preserves_offset() {
+    // 198.51.100.0/24 (external) -> 192.168.1.0/24 (internal). An inbound
+    // packet to 198.51.100.7 DNATs to 192.168.1.7 (offset .7 preserved).
+    let table = StaticNatTable::from_snapshots(
+        &[block_snapshot("198.51.100.0/24", "192.168.1.0/24", "untrust")],
+        &crate::nat::NatCounterStore::default(),
+    );
+    let decision = table.match_dnat("198.51.100.7".parse().expect("ext host"), "untrust");
+    assert_eq!(
+        decision,
+        Some(NatDecision {
+            rewrite_src: None,
+            rewrite_dst: Some("192.168.1.7".parse().expect("int host")),
+            ..NatDecision::default()
+        })
+    );
+}
+
+#[test]
+fn static_nat_block_snat_v4_reverses_offset() {
+    // Reverse: an outbound packet from 192.168.1.7 SNATs back to
+    // 198.51.100.7 (the inverse offset map), so return traffic matches.
+    let table = StaticNatTable::from_snapshots(
+        &[block_snapshot("198.51.100.0/24", "192.168.1.0/24", "untrust")],
+        &crate::nat::NatCounterStore::default(),
+    );
+    let decision = table.match_snat("192.168.1.7".parse().expect("int host"), "untrust");
+    assert_eq!(
+        decision,
+        Some(NatDecision {
+            rewrite_src: Some("198.51.100.7".parse().expect("ext host")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        })
+    );
+}
+
+#[test]
+fn static_nat_block_v6_preserves_offset_both_directions() {
+    // /120 -> /120 v6 block map. Offset ::7 preserved both directions.
+    let table = StaticNatTable::from_snapshots(
+        &[block_snapshot("2001:db8:a::/120", "fd00:1::/120", "untrust")],
+        &crate::nat::NatCounterStore::default(),
+    );
+    let dnat = table.match_dnat("2001:db8:a::7".parse().expect("ext v6"), "untrust");
+    assert_eq!(
+        dnat,
+        Some(NatDecision {
+            rewrite_src: None,
+            rewrite_dst: Some("fd00:1::7".parse().expect("int v6")),
+            ..NatDecision::default()
+        })
+    );
+    let snat = table.match_snat("fd00:1::7".parse().expect("int v6"), "untrust");
+    assert_eq!(
+        snat,
+        Some(NatDecision {
+            rewrite_src: Some("2001:db8:a::7".parse().expect("ext v6")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        })
+    );
+}
+
+#[test]
+fn static_nat_block_does_not_translate_outside_source_block() {
+    // An address OUTSIDE the external block is not DNAT'd, and an address
+    // outside the internal block is not SNAT'd.
+    let table = StaticNatTable::from_snapshots(
+        &[block_snapshot("198.51.100.0/24", "192.168.1.0/24", "untrust")],
+        &crate::nat::NatCounterStore::default(),
+    );
+    assert_eq!(
+        table.match_dnat("198.51.101.7".parse().expect("outside ext"), "untrust"),
+        None
+    );
+    assert_eq!(
+        table.match_snat("192.168.2.7".parse().expect("outside int"), "untrust"),
+        None
+    );
+}
+
+#[test]
+fn static_nat_block_mismatched_length_is_skipped() {
+    // A /24 -> /25 pair is not a 1:1 block map; the rule is skipped (no
+    // table entry, no translation), preserving the #2122 skip rationale.
+    let table = StaticNatTable::from_snapshots(
+        &[block_snapshot("198.51.100.0/24", "192.168.1.0/25", "untrust")],
+        &crate::nat::NatCounterStore::default(),
+    );
+    assert!(table.is_empty());
+    assert_eq!(
+        table.match_dnat("198.51.100.7".parse().expect("ext host"), "untrust"),
+        None
+    );
+}
+
+#[test]
+fn static_nat_host_v4_unchanged_with_block_support() {
+    // #3031 regression: a /32 host rule still behaves byte-identical to
+    // pre-#3031 (exact 1:1, no offset math). Both directions.
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "static-1".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.10/32".to_string(),
+            internal_ip: "192.168.1.10/32".to_string(),
+            match_destination_port: 0,
+            mapped_port: 0,
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    assert_eq!(
+        table.match_dnat("203.0.113.10".parse().expect("ext"), "untrust"),
+        Some(NatDecision {
+            rewrite_src: None,
+            rewrite_dst: Some("192.168.1.10".parse().expect("int")),
+            ..NatDecision::default()
+        })
+    );
+    assert_eq!(
+        table.match_snat("192.168.1.10".parse().expect("int"), "untrust"),
+        Some(NatDecision {
+            rewrite_src: Some("203.0.113.10".parse().expect("ext")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        })
+    );
+    // A non-mapped host (not the /32) is not translated.
+    assert_eq!(
+        table.match_dnat("203.0.113.11".parse().expect("other"), "untrust"),
+        None
+    );
+}
+
 #[test]
 fn static_nat_zone_mismatch_returns_none_for_dnat() {
     let table = StaticNatTable::from_snapshots(

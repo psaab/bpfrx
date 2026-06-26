@@ -119,6 +119,56 @@ func isHostMaskAddress(addr string) (host bool, parsed bool) {
 	return maskPart == wantMask, true
 }
 
+// natStaticPrefixInfo classifies a static-NAT address the way the Rust
+// parse_nat_prefix (static_nat.rs, #3031) does: it returns the family, the
+// prefix length, whether the value is a host route, and whether it parsed as
+// an IP at all. A bare address is a host route (len == max). A `/N` mask is
+// parsed numerically; bits < 0 flags a malformed/out-of-range mask (a
+// non-numeric or `/33`/`/129` suffix) so the caller leaves the existing
+// host-route rejection to fire. A non-IP token (address-book name) returns
+// parsedIP == false and is not this validator's concern.
+func natStaticPrefixInfo(addr string) (fam string, bits int, isHost, parsedIP bool) {
+	slash := strings.IndexByte(addr, '/')
+	ipPart := addr
+	if slash >= 0 {
+		ipPart = addr[:slash]
+	}
+	fam = natAddrFamily(ipPart)
+	if fam == "" {
+		return "", -1, false, false
+	}
+	max := 128
+	if fam == "v4" {
+		max = 32
+	}
+	if slash < 0 {
+		return fam, max, true, true
+	}
+	n, err := strconv.Atoi(addr[slash+1:])
+	if err != nil || n < 0 || n > max {
+		return fam, -1, false, true
+	}
+	return fam, n, n == max, true
+}
+
+// isStaticBlockPair reports whether (match, then) is a valid block-to-block
+// (subnet) static-NAT 1:1 mapping (#3031): both sides parse as IPs, both are
+// non-host prefixes of the SAME family with EQUAL prefix length. The Rust
+// dataplane installs exactly this case (offset-preserving remap); a
+// host-vs-block, mismatched-length, mixed-family, or malformed-mask pair is
+// NOT a block pair and falls through to the existing host-route rejection.
+func isStaticBlockPair(match, then string) bool {
+	mf, mb, mh, mp := natStaticPrefixInfo(match)
+	tf, tb, th, tp := natStaticPrefixInfo(then)
+	if !mp || !tp {
+		return false // a non-IP token — leave to existing handling
+	}
+	if mh || th || mb < 0 || tb < 0 {
+		return false // a host side or a malformed mask — not a block pair
+	}
+	return mf == tf && mb == tb
+}
+
 // isNAT64PoolHostAddress reports whether addr is an IPv4 host route the
 // NAT64 source pool can install. It mirrors EXACTLY the Rust parse_pool_v4
 // gate (userspace-dp/src/nat64.rs): the NAT64 pool holds IPv4 source
@@ -247,7 +297,14 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			if rule.Then == "inet" {
 				continue
 			}
-			if rule.Match != "" {
+			// #3031: a valid block-to-block (subnet) static-NAT rule —
+			// equal-length non-host prefixes of the same family — is now
+			// installed by the dataplane (offset-preserving 1:1 remap), so do
+			// NOT reject it as a non-host mask. Only the genuinely-invalid
+			// non-host cases (host-vs-block, mismatched length, mixed family,
+			// malformed mask) fall through to the host-route rejection below.
+			blockPair := isStaticBlockPair(rule.Match, rule.Then)
+			if rule.Match != "" && !blockPair {
 				if host, parsed := isHostMaskAddress(rule.Match); parsed && !host {
 					if err := emit(fmt.Sprintf(
 						"security nat static rule-set %q rule %q match destination-address %q must be a host route (/32 for IPv4, /128 for IPv6); a non-host mask is silently dropped by the dataplane",
@@ -256,7 +313,7 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 					}
 				}
 			}
-			if rule.Then != "" {
+			if rule.Then != "" && !blockPair {
 				if host, parsed := isHostMaskAddress(rule.Then); parsed && !host {
 					if err := emit(fmt.Sprintf(
 						"security nat static rule-set %q rule %q then static-nat prefix %q must be a host route (/32 for IPv4, /128 for IPv6); a non-host mask is silently dropped by the dataplane",

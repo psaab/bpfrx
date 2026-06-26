@@ -1,3 +1,33 @@
+## 2026-06-26 — #3031 static-NAT block-to-block (subnet) mappings
+
+- **Timestamp**: 2026-06-26
+- **Action**: Implement block-to-block (subnet) static NAT, 1:1 by offset.
+  `parse_nat_addr` rejected any non-host prefix, so a valid Junos
+  `static-nat prefix <subnet>` rule (e.g. `198.51.100.0/24 -> 192.168.1.0/24`)
+  was silently dropped during Rust snapshot parsing. Replaced with
+  `parse_nat_prefix` (returns base + len, canonicalizes host bits); host
+  (`/32`/`/128`/bare) keeps the exact-IP map path byte-identical. A
+  non-host pair installs a `StaticNatBlock` (Vec, linear-scanned on the
+  cold path) ONLY when the source/destination prefixes are the same family
+  and equal length; mismatched-length / mixed-family pairs are skipped
+  (#2122 rationale). Forward DNAT and reverse SNAT remap by offset
+  (`dst_base | (addr & host_mask(len))`), v4 (u32) and v6 (u128), with
+  `len >= max` shift guards. The decision still carries only
+  `rewrite_dst`/`rewrite_src` (an `IpAddr`), so the existing host static-NAT
+  checksum fixup applies unchanged. Relaxed the Go strict commit gate
+  (`validateNATHostMaskStrict`) to accept an equal-length block pair
+  (`isStaticBlockPair`) while still rejecting the invalid non-host cases.
+- **File(s)**: userspace-dp/src/nat/static_nat.rs, userspace-dp/src/nat/tests.rs,
+  pkg/config/compiler_nat.go, pkg/config/compiler_nat_host_mask_test.go,
+  docs/feature-gaps.md
+- **Validation**: cargo build --release (0 errors); cargo test --release
+  nat:: (143 passed). New Rust tests: block dnat/snat v4 offset, v6 both
+  directions, outside-block no-translate, mismatched-length skip, host /32
+  regression — fail-on-revert confirmed (host-only parse → 3 block tests
+  RED, host regression GREEN). go build ./... + go test ./pkg/config/
+  (1703 passed); new Go tests for block compile / mismatch+mixed-family
+  reject / isStaticBlockPair unit.
+
 ## 2026-06-26 — #2981 V_min lag throttle skips UNSHAPED shared-exact queues
 
 - **Timestamp**: 2026-06-26
