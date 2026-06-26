@@ -24,6 +24,59 @@
   pkg/config/compiler_default_policy_3065_test.go,
   pkg/dataplane/userspace/default_policy_3065_test.go,
   pkg/config/README.md, docs/config-schema.md, _Log.md
+## 2026-06-25 — #3066: undefined zone screen-profile reference is now a commit-time hard reject
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add `validateScreenProfileReferencesStrict` (#3066). A security
+  zone whose `screen <name>` references an undefined screen-ids-option profile
+  was only WARNED at commit while the Rust dataplane fails OPEN
+  (`screen/mod.rs` returns `ScreenVerdict::Pass` for a missing profile),
+  silently disabling all screen protection for that zone. Promoted to a
+  fail-closed commit/commit-check hard reject mirroring
+  `validatePolicyZoneReferencesStrict` (#2401); tolerant load/peer-sync path
+  downgrades to a warning via new `lenientScreenProfileRefs` flag (#1960
+  no-brick). Fail-on-revert test `screen_profile_ref_test.go` (RED without the
+  strict gate). Fixed two pre-existing tests that referenced an undefined
+  screen profile (`TestSetPathSchema`, `TestZoneSetSyntax`) by defining the
+  referenced profile.
+- **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/screen_profile_ref_test.go, pkg/config/parser_ast_test.go,
+  pkg/config/parser_security_test.go, pkg/config/README.md
+## 2026-06-25 — #3049: source-NAT pool subnet expanded to full CIDR range
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed source-NAT pool subnet truncation. The Rust parser
+  `parse_source_nat_rules_with_previous` stripped the mask off a pool
+  address and kept a single `IpAddr`, so a subnet-style pool like
+  `203.0.113.0/28` (16 addresses) collapsed to one host — severe pool/port
+  exhaustion with no operator signal. The Go compiler passes a bare prefix
+  verbatim (only `address X to Y` ranges were expanded), and the host-mask
+  commit gate covered only NAT64 pools. New `expand_pool_address` helper
+  enumerates the FULL prefix range (network..=broadcast inclusive) into
+  `pool_addresses_v4`/`v6` so the port allocator round-robins/hashes across
+  the whole pool; a single-host prefix (/32, /128) still yields exactly one
+  address; an over-broad prefix beyond `MAX_POOL_PREFIX_HOSTS` (65536) is
+  rejected as `SourceNatFailureReason::InvalidPool` (fail-closed). Added 3
+  fail-on-revert tests (subnet expands to 16, host-CIDR stays 1 + v6 /120
+  → 256, over-broad /8 → invalid). Updated `userspace-dp/README.md`.
+- **File(s)**: userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests.rs,
+  userspace-dp/README.md, _Log.md
+## 2026-06-25 — #3059: gRPC hit-count text includes global policies
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `showPoliciesHitCount` (gRPC text `show security policies
+  hit-count`) to append a global-policy section after the zone-pair loop,
+  rendering each `cfg.Security.GlobalPolicies` entry with from/to zone `"*"`.
+  Global counter IDs continue from the zone-pair `policySetID`
+  (`policySetID*MaxRulesPerPolicy + i`), keeping global hit counters aligned
+  with the dataplane and matching the gRPC detail view, CLI, Prometheus
+  collector, REST inventory (#3045/#3050), and structured GetPolicies. A
+  from/to-zone filter suppresses the global section (selects zone-pair only).
+  Added fail-on-revert test `TestShowPoliciesHitCountIncludesGlobalPolicies`
+  (RED when globals omitted). Updated pkg/grpcapi README.
+- **File(s)**: pkg/grpcapi/server_show_policies_text.go,
+  pkg/grpcapi/server_show_policies_hitcount_globals_test.go,
+  pkg/grpcapi/README.md
 
 ## 2026-06-25 — #3045: REST /security/policies includes global policies
 

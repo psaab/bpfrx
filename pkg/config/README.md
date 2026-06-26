@@ -174,6 +174,18 @@ userspace dataplane via the `ConfigSnapshot.DefaultPolicy` string
 the no-match verdict). The `default-policy` leaf is a typed `ValueEnumOf`
 in `schema_security.go`, so a bogus value fails `commit check`. See
 `docs/config-schema.md` "#3065".
+**Zone screen-profile reference is fail-closed (#3066):** a security zone's
+`screen <name>` that references a screen-ids-option profile the config never
+defines historically committed with a warning only, and at runtime the
+userspace dataplane fails OPEN — `screen/mod.rs` returns `ScreenVerdict::Pass`
+for a missing profile, silently skipping every screen check for that zone while
+the operator believes screening is active. `validateScreenProfileReferencesStrict`
+(`compiler_validate_strict.go`) hard-rejects an undefined screen-profile
+reference at commit. Unlike the policy gates the dataplane is NOT independently
+safe on the tolerant load/peer-sync path (the missing profile still fails
+open), so that path only downgrades to a warning to preserve #1960 no-brick
+boot — the strict commit gate, which keeps a bad reference from ever reaching
+the dataplane, is the real fix.
 
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
