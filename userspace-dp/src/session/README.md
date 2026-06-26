@@ -55,10 +55,22 @@ structure.)
 | TCP   | 300 s |
 | UDP   | 60 s |
 | ICMP  | 60 s |
-| TCP closing | 30 s |
+| TCP closing (graceful FIN) | 30 s |
+| TCP closing (RST) | 2 s |
 
 Per-application overrides come from the typed config and land here as
 per-entry `expires_after_ns`.
+
+**RST vs FIN close (#3046).** A graceful FIN close keeps the full 30 s
+`TCP_CLOSING_TIMEOUT_NS` (TIME_WAIT-style window for half-closed /
+delayed-ACK transitions). A connection torn down by RST is an abrupt
+abort with no retransmit window, so it is reaped on the much shorter 2 s
+`TCP_RST_TIMEOUT_NS` — this prevents a reset-flood (or any high-churn
+reset workload) from saturating the session table with dead connections
+and delays port reuse far less. The RST state is sticky (`SessionEntry.reset`):
+once a session has carried a RST it stays on the short timeout even if a
+later reordered non-RST segment arrives, so it can never be promoted back
+to the 30 s FIN window.
 
 **Seconds→nanoseconds bound (#2441).** Configured TCP/UDP/ICMP timeouts
 arrive in the snapshot as `u64` seconds and are converted in

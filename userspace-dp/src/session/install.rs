@@ -151,6 +151,7 @@ impl SessionTable {
                 created_ns: now_ns,
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && is_closing(tcp_flags),
+                reset: matches!(protocol, PROTO_TCP) && has_rst(tcp_flags),
                 wheel_tick: 0,
                 // #2120: a freshly-installed entry has never been HELD and
                 // has not yet been self-healed. 0 is the never-self-healed
@@ -275,6 +276,7 @@ impl SessionTable {
                 created_ns: now_ns,
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && is_closing(tcp_flags),
+                reset: matches!(protocol, PROTO_TCP) && has_rst(tcp_flags),
                 wheel_tick: 0,
                 // #2120: a re-imported synced entry leaves the held world
                 // with a fresh `last_seen_ns`, so it carries no carried-over

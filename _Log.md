@@ -1,3 +1,28 @@
+## 2026-06-25 — #3046: TCP RST sessions reaped on a short timeout (not the 30s FIN close)
+
+- **Timestamp**: 2026-06-25
+- **Action**: fixed #3046. `is_closing(flags)` lumps RST with FIN, so a
+  RST-aborted TCP session was held for the full 30s `TCP_CLOSING_TIMEOUT_NS`
+  identical to a graceful FIN close — letting a reset-flood saturate the
+  session table and delay port reuse. Added `TCP_RST_TIMEOUT_NS = 2s` and a
+  sticky `SessionEntry.reset` flag; the timeout selection now picks the short
+  RST timeout whenever the session has carried a RST, keeping 30s only for a
+  FIN-only close. The reset flag is sticky so a stray reordered non-RST
+  segment after the RST cannot promote the entry back to the 30s FIN window.
+  Updated `session_timeout_ns` (install paths), `update_session` (in-place
+  refresh), and the `lookup` read path; mirrored into the test reference +
+  `entries_equiv`. FAIL-ON-REVERT test `tcp_rst_uses_short_timeout_not_fin_timeout`
+  proves RST→2s + FIN→30s + post-RST stickiness (RED left:30e9/right:2e9 when
+  the lookup selection is reverted). Doc: `userspace-dp/src/session/README.md`
+  timeout table + #3046 RST-vs-FIN note.
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/lookup.rs, userspace-dp/src/session/install.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
+  _Log.md
+- **Validation**: `cargo build --release -p xpf-userspace-dp` clean (pre-existing
+  dead-code warnings only); `cargo test session::` 129 passed; fail-on-revert
+  confirmed RED then GREEN after restore.
+
 ## 2026-06-25 — #3059: gRPC hit-count text includes global policies
 
 - **Timestamp**: 2026-06-25
