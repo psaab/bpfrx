@@ -1,3 +1,29 @@
+## 2026-06-26 — #2900 VRRP: re-validate an armed preempt hold-timer
+
+- **Timestamp**: 2026-06-26
+- **Action**: An armed `preempt hold-time` countdown (#2850) was never
+  re-validated against state changes during the hold window. Two fixes:
+  (1) At expiry, `case <-preemptHoldTimer.C` now re-runs
+  `shouldPreemptObservedMaster()` before `becomeMaster()` — preempt must
+  still be enabled AND (when a live master is still present) our effective
+  priority must still be strictly > its last advert (RFC 5798 §6.4.2). If
+  invalid (preempt disabled or track-down demotion mid-hold) the node stays
+  BACKUP and re-arms `masterDownTimer`; a silent master reads stale and still
+  takes over. (2) `updateConfig` now signals the run loop via a new
+  `configUpdatedCh`; the BACKUP select tears any in-flight hold down
+  (`disarmPreemptHold`) and re-arms `masterDownTimer` so the next expiry
+  re-evaluates against the fresh config (changed hold-time arms the next
+  countdown with the new value). Added `preemptHoldArmed` (mu-guarded) +
+  `armPreemptHold`/`disarmPreemptHold` helpers; all timer Stop/Reset stays on
+  the run-loop goroutine. Added
+  `pkg/vrrp/instance_preempt_hold_revalidate_test.go` (6 tests). Fail-on-revert
+  verified: reverting the expiry gate reds the preempt-disabled +
+  priority-demoted expiry tests; reverting the updateConfig disarm reds the
+  config-update test. `go test -race ./pkg/vrrp/...` + `go test
+  ./pkg/daemon/...` green. Doc: config-schema.md #2900 note.
+- **File(s)**: pkg/vrrp/instance.go,
+  pkg/vrrp/instance_preempt_hold_revalidate_test.go,
+  docs/config-schema.md, _Log.md
 ## 2026-06-26 — #2898 direct-mode GARP/NA burst follow-up loop gated on ownership
 
 - **Timestamp**: 2026-06-26

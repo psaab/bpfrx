@@ -564,7 +564,26 @@ reserved for whole-dataplane selection where a rewrite shim
   dynamic routing converges before failback); a dead/silent master or a
   graceful priority-0 resignation is never delayed
   (`pkg/vrrp/instance.go` `preemptHoldDuration` /
-  `preemptingLiveLowerMaster`). The WireGuard `peer` node is a NAMED-INSTANCE
+  `preemptingLiveLowerMaster`). **#2900 — armed-hold re-validation:** an
+  armed hold is re-validated at two points the original #2850 arming did
+  not cover. (1) At expiry, before promoting, the hold-elapsed case re-runs
+  `shouldPreemptObservedMaster` (the same RFC 5798 §6.4.2 gate the
+  force/sync-hold path uses): preemption must still be enabled AND, while a
+  live master is still present, our effective priority must still be
+  strictly higher than its last advert. If preempt was disabled or our
+  priority was demoted below the live master (track-interface link-down)
+  during the hold, the node does NOT take over — it returns to a normal
+  BACKUP tenure by re-arming `masterDownTimer`. A master that went silent
+  during the hold reads as stale and still triggers a dead-master takeover.
+  (2) `updateConfig` (manager goroutine) signals the run loop via
+  `configUpdatedCh` after mutating cfg; the BACKUP select tears any in-flight
+  hold down (`disarmPreemptHold`) and re-arms `masterDownTimer`, so the next
+  expiry re-evaluates against the fresh config — a changed `hold-time` arms
+  the NEXT countdown with the new duration, and a disabled preempt /
+  demotion no longer fires a spurious takeover at the old expiry. All
+  `preemptHoldTimer` Stop/Reset calls stay on the single run-loop goroutine;
+  `preemptHoldArmed` (mu-guarded) tracks the armed state across the two
+  goroutines. The WireGuard `peer` node is a NAMED-INSTANCE
   container keyed by the peer public key (#1434 multi-peer):
   `set interfaces <wg> tunnel wireguard peer <public-key>
   { allowed-ips <cidr>; endpoint <ip:port>; persistent-keepalive <s>;
