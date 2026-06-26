@@ -67,6 +67,90 @@ fn policy_packet_icmp(packet_frame: &[u8], meta: UserspaceDpMeta) -> Option<(u8,
     }
 }
 
+/// #3019: enforce a configured `to-zone junos-host` security policy on the
+/// host-bound (LocalDelivery) path. MUST be called AFTER `host_inbound_admits`
+/// (Junos order: host-inbound-traffic admission first, then security policy),
+/// so a `then permit` can never re-admit what host-inbound already rejected.
+///
+/// Returns `true` iff the packet must be DROPPED — a `to-zone junos-host` rule
+/// MATCHED with `deny`/`reject`. On a deny/reject it emits the policy-deny
+/// RT_FLOW (mirroring the transit deny path) and synthesizes a `reject` / zone
+/// `tcp-rst` reply. Returns `false` (continue local delivery) when no
+/// junos-host policy is configured, none matches, or a matching rule permits —
+/// preserving pre-#3019 host-bound behavior so management traffic is never
+/// newly denied (the lifeline guarantee). Cold path only (LocalDelivery).
+#[allow(clippy::too_many_arguments)]
+fn junos_host_policy_drops(
+    forwarding: &ForwardingState,
+    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
+    tx_pipeline: &mut crate::afxdp::worker::WorkerTxPipeline,
+    ingress_ifindex: i32,
+    packet_frame: &[u8],
+    counters: &mut BatchCounters,
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    from_zone_id: u16,
+    packet_len: u64,
+    now_ns: u64,
+) -> bool {
+    let policy_icmp = policy_packet_icmp(packet_frame, meta);
+    let Some(result) = crate::policy::evaluate_junos_host_policy(
+        &forwarding.policy,
+        from_zone_id,
+        flow.src_ip,
+        flow.dst_ip,
+        flow.forward_key.protocol,
+        flow.forward_key.src_port,
+        flow.forward_key.dst_port,
+        policy_icmp,
+        packet_len,
+    ) else {
+        return false;
+    };
+    match result.action {
+        PolicyAction::Permit => false,
+        PolicyAction::Deny | PolicyAction::Reject => {
+            emit_policy_deny_event(
+                event_stream,
+                flow,
+                // LocalDelivery applies no NAT — the deny record carries no
+                // nat_* translation (byte-identical to a non-NAT transit deny).
+                &crate::nat::NatDecision::default(),
+                meta,
+                from_zone_id,
+                // The egress "zone" is the firewall host itself. The reserved
+                // JUNOS_HOST_ZONE_ID (u16::MAX-1) does not fit the u8 wire
+                // zone-id slot (#919/#922), so the deny RT_FLOW carries 0
+                // ("unknown / host", the #3110 sentinel) rather than a value
+                // that would truncate into a real zone id on the wire.
+                0,
+                // Host-local sessions are not policy-forwarded; owner_rg_id 0.
+                0,
+                result.policy_id,
+                result.action,
+                resolve_policy_deny_app_id(
+                    &forwarding.app_catalog,
+                    flow,
+                    flow.forward_key.dst_port,
+                ),
+                now_ns,
+            );
+            enqueue_deny_reply(
+                tx_pipeline,
+                forwarding,
+                ingress_ifindex,
+                packet_frame,
+                meta,
+                flow,
+                counters,
+                matches!(result.action, PolicyAction::Reject),
+                from_zone_id,
+            );
+            true
+        }
+    }
+}
+
 // Per-batch packet processing lifted from `poll_binding` (#678).
 //
 // Runs `binding.xsk.rx.receive(available)` + the descriptor while-let +
@@ -560,6 +644,51 @@ pub(super) fn poll_binding_process_descriptor(
                                 meta.protocol,
                                 resolved.key.dst_port,
                                 matches!(flow.dst_ip, IpAddr::V6(_)),
+                            )
+                        {
+                            delete_terminal_filtered_session(
+                                sessions,
+                                binding.bpf_maps.session_map_fd,
+                                conntrack_v4_fd,
+                                conntrack_v6_fd,
+                                worker_ctx.shared_sessions,
+                                worker_ctx.shared_nat_sessions,
+                                worker_ctx.shared_forward_wire_sessions,
+                                &worker_ctx.shared_owner_rg_indexes,
+                                worker_ctx.peer_worker_commands,
+                                &resolved.key,
+                                resolved.decision,
+                                &resolved.metadata,
+                                resolved.origin,
+                            );
+                            telemetry.dbg.local += 1;
+                            telemetry.dbg.policy_deny += 1;
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
+                        // #3019: `to-zone junos-host` security policy on the
+                        // session-HIT local-delivery path, mirroring the #3070
+                        // host-inbound re-check above: re-evaluated on every hit
+                        // so a tightened junos-host deny tears down an already
+                        // established host-bound session WITHOUT an explicit
+                        // purge. Runs AFTER host-inbound admission (Junos order).
+                        // A matching deny/reject drops + emits the policy-deny
+                        // RT_FLOW; permit / no-match continue. No-op unless a
+                        // junos-host policy is configured.
+                        if resolved.decision.resolution.disposition
+                            == ForwardingDisposition::LocalDelivery
+                            && junos_host_policy_drops(
+                                worker_ctx.forwarding,
+                                worker_ctx.event_stream,
+                                &mut binding.tx_pipeline,
+                                binding.ifindex,
+                                packet_frame,
+                                telemetry.counters,
+                                flow,
+                                meta,
+                                resolved.metadata.ingress_zone,
+                                desc.len as u64,
+                                now_ns,
                             )
                         {
                             delete_terminal_filtered_session(
@@ -1330,6 +1459,34 @@ pub(super) fn poll_binding_process_descriptor(
                                 meta.protocol,
                                 flow.forward_key.dst_port,
                                 matches!(flow.dst_ip, IpAddr::V6(_)),
+                            )
+                        {
+                            telemetry.dbg.local += 1;
+                            telemetry.dbg.policy_deny += 1;
+                            telemetry.counters.touched = true;
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
+                        // #3019: `to-zone junos-host` security policy on the
+                        // session-MISS local-delivery path, AFTER host-inbound
+                        // admission (Junos order). A matching junos-host deny/
+                        // reject drops the host-bound packet (and emits the
+                        // policy-deny RT_FLOW + reject/tcp-rst reply); a permit
+                        // or no-match continues to local delivery unchanged.
+                        // No-op unless a junos-host policy is configured.
+                        if resolution.disposition == ForwardingDisposition::LocalDelivery
+                            && junos_host_policy_drops(
+                                worker_ctx.forwarding,
+                                worker_ctx.event_stream,
+                                &mut binding.tx_pipeline,
+                                binding.ifindex,
+                                packet_frame,
+                                telemetry.counters,
+                                flow,
+                                meta,
+                                from_zone_id,
+                                desc.len as u64,
+                                now_ns,
                             )
                         {
                             telemetry.dbg.local += 1;

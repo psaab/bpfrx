@@ -20451,3 +20451,25 @@ top.
   userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/status.rs,
   userspace-dp/src/nat/tests.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json,
   docs/userspace-dataplane-gaps.md, docs/config-schema.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3019 — enforce `to-zone junos-host` self-traffic security
+  policy on the dataplane LocalDelivery path (it previously committed +
+  documented but was never evaluated). Reserve `JUNOS_HOST_ZONE_ID`
+  (`u16::MAX-1`); `PolicyState::from_snapshots` now INDEXES junos-host rules
+  via `resolve_policy_zone_id` (+ `has_junos_host_rules` gate). New
+  `evaluate_junos_host_policy` (match-driven, no implicit default-deny =
+  lifeline fail-safe). Wired `junos_host_policy_drops` into BOTH
+  poll_descriptor LocalDelivery sites (session-miss + session-hit) AFTER
+  `host_inbound_admits` (Junos order: host-inbound THEN policy). Deny/reject
+  emits the policy-deny RT_FLOW + reject/tcp-rst reply and tears down a cached
+  host-local session. `from-zone junos-host` indexed but not consulted
+  (host-originated path = follow-up). Tests: 5 policy unit + 3 poll-path
+  (miss deny + no-policy GREEN pair + hit deny) Rust, 1 Go snapshot test;
+  fail-on-revert verified (miss deny RED, no-policy GREEN). Docs updated.
+  **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  pkg/dataplane/userspace/junos_host_policy_3019_test.go,
+  docs/junos-cli-reference.md

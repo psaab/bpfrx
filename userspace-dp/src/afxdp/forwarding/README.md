@@ -155,6 +155,36 @@ admit; an unrecognised token contributes nothing (fail-closed). ICMP-based
 services (`ping`, `router-discovery`) admit at L4-protocol granularity, not
 ICMP sub-type.
 
+## `junos-host` self-traffic security policy (#3019)
+
+Host-bound (LocalDelivery) traffic is also subject to the Junos
+`from-zone <z> to-zone junos-host` security policy. Junos order is
+**host-inbound admission FIRST, then security policy** — so the
+`junos_host_policy_drops` gate runs immediately AFTER `host_inbound_admits`
+at BOTH local-delivery sites in `poll_descriptor` (session miss and session
+hit). A packet host-inbound already rejected never reaches policy, so a
+`to-zone junos-host then permit` cannot re-admit it.
+
+`policy::evaluate_junos_host_policy` resolves the reserved `junos-host` zone
+name to `JUNOS_HOST_ZONE_ID` (`u16::MAX-1`, the bottom of the reserved range,
+never on the wire because zone ids are u8) and looks up the
+`(ingress_zone_id, JUNOS_HOST_ZONE_ID)` zone pair in the SAME `zone_pair_index`
+as transit rules — `parse_policy_state_with_counters` now INDEXES junos-host rules
+via `resolve_policy_zone_id` (pre-#3019 they were kept-but-not-indexed, like the
+wildcard-`any` case). A matched deny/reject drops the packet, emits the
+policy-deny RT_FLOW (egress zone reported as `0`/host since the synthetic id
+does not fit the u8 wire slot), synthesizes a `reject`/zone-`tcp-rst` reply, and
+on the hit path tears down the cached host-local session.
+
+Enforcement is MATCH-DRIVEN and fail-safe: the gate is a NO-OP unless
+`PolicyState::has_junos_host_rules` is set (some junos-host rule configured),
+and a no-match falls through to today's behavior (local delivery proceeds).
+There is NO implicit junos-host default-deny — the deliberate lifeline
+guarantee that configuring junos-host policy can never silently brick
+management/host traffic. `from-zone junos-host` (host-ORIGINATED) rules are
+indexed but not consulted here (locally-generated traffic does not traverse
+this ingress path) — a documented follow-up.
+
 ## Host-terminated IPsec passthrough
 
 `is_ipsec_traffic(protocol, dst_port)` recognizes packets destined for
