@@ -46,6 +46,41 @@
 - **Validation**: go build ./...; go test ./pkg/config/... (1698 pass + new); RED->GREEN
   confirmed (disable the gate condition -> reject tests FAIL); gofmt clean.
 
+## 2026-06-26 — #3048 fold: cover the Go control-plane bulk-replace write path
+
+- **Timestamp**: 2026-06-26
+- **Action**: Hostile-review MAJOR fold. The first #3048 cut covered only
+  THREE neighbor-MAC write paths and missed the FOURTH: the Go control-plane
+  snapshot push (the authoritative #1197 mechanism). The Go neighbor listener
+  (`daemon_neighbor_listener.go` → `Manager.RegenerateNeighborSnapshot` →
+  `update_neighbors` with `NeighborReplace: true`) lands at
+  `Coordinator::apply_manager_neighbors`, which did `bulk.remove(old)` +
+  `bulk.insert(new)` with NO epoch bump. Reachable on a VRRP-failover
+  RTM_NEWNEIGH burst when the in-process monitor's bounded rcvbuf overflows
+  (silently drops events) and the Go listener pushes the new gateway MAC —
+  epoch never advanced → cached `dst_mac` stayed stale → blackhole until
+  session expiry. A naive change-check in the per-key `insert` is INSUFFICIENT
+  because `replace=true` removes the old entry BEFORE the matching insert, so
+  the prior MAC is already gone at insert time. Fix: new
+  `ShardedNeighborMap::bulk_replace_neighbors` centralizes the bulk path —
+  snapshots each incoming key's prior MAC UNDER the bulk lock BEFORE the
+  removes, then bumps `mac_change_epoch` exactly once for the whole batch if
+  any incoming MAC differs (same-MAC refresh + brand-new keys do NOT bump);
+  `apply_manager_neighbors` now delegates to it. Added `BulkShardGuard::get`
+  for the under-lock prior-MAC snapshot. HA peer-promoted closes remain out
+  of scope.
+- **File(s)**: userspace-dp/src/afxdp/sharded_neighbor.rs,
+  userspace-dp/src/afxdp/sharded_neighbor_tests.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  docs/flow-cache-simplification.md, _Log.md
+- **Validation**: `cargo test --release` GREEN (mac_change_epoch now 12,
+  full suite passes). Fail-on-revert: neutralizing the new
+  `bulk_replace_neighbors` `fetch_add` turns
+  `mac_change_epoch_bulk_replace_bumps_on_mac_change` and
+  `mac_change_epoch_bulk_replace_single_bump_for_batch` RED while
+  `..._no_bump_on_same_mac` and `..._no_bump_on_brand_new_keys` stay GREEN
+  (verified, then restored byte-identical).
+
 ## 2026-06-26 — #3048: flow cache invalidated on neighbor (ARP/NDP) MAC change
 
 - **Timestamp**: 2026-06-26

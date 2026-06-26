@@ -392,6 +392,74 @@ fn mac_change_epoch_confirmed_resolver_bumps_on_change() {
 }
 
 #[test]
+fn mac_change_epoch_bulk_replace_bumps_on_mac_change() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    // Seed an existing neighbor (e.g. the gateway) at MAC 0xAB.
+    map.insert(k, entry(0xAB));
+    assert_eq!(map.mac_change_epoch(), 0);
+    // The Go control-plane snapshot push (apply_manager_neighbors with
+    // NeighborReplace: true) removes the old key and re-inserts the same
+    // key with a DIFFERENT MAC — the VRRP-failover gateway MAC change
+    // that overflowed the in-process monitor. The bulk path snapshots
+    // the prior MAC BEFORE the remove, detects the change, and bumps.
+    // Fail-on-revert guard for bulk_replace_neighbors: neutralizing its
+    // fetch_add makes this assertion go RED.
+    let remove = [k];
+    let insert = [(7, k.1, entry(0xCD))];
+    map.bulk_replace_neighbors(&remove, &insert);
+    assert_eq!(map.get(&k), Some(entry(0xCD)));
+    assert_eq!(map.mac_change_epoch(), 1);
+}
+
+#[test]
+fn mac_change_epoch_bulk_replace_no_bump_on_same_mac() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    map.insert(k, entry(0xAB));
+    assert_eq!(map.mac_change_epoch(), 0);
+    // A pure refresh: the snapshot re-learns the SAME MAC for every key.
+    // Even though replace removes then re-inserts, the prior-MAC snapshot
+    // (taken before the remove) equals the incoming MAC, so the epoch
+    // must NOT advance — otherwise steady-state Go snapshot pushes would
+    // flush the whole flow cache. This case must stay GREEN when the
+    // bump is neutralized.
+    let remove = [k];
+    let insert = [(7, k.1, entry(0xAB))];
+    map.bulk_replace_neighbors(&remove, &insert);
+    assert_eq!(map.get(&k), Some(entry(0xAB)));
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_bulk_replace_no_bump_on_brand_new_keys() {
+    let map = ShardedNeighborMap::new();
+    // A snapshot that only ADDS neighbors with no prior entry: no cached
+    // flow can hold a stale MAC for a neighbor that did not exist, so the
+    // epoch stays put even though the set membership changed.
+    let insert: Vec<_> = (0..5u8).map(|i| (7, key_v4(7, i).1, entry(0x22))).collect();
+    map.bulk_replace_neighbors(&[], &insert);
+    assert_eq!(map.len(), 5);
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_bulk_replace_single_bump_for_batch() {
+    let map = ShardedNeighborMap::new();
+    let k1 = key_v4(7, 1);
+    let k2 = key_v4(7, 2);
+    map.insert(k1, entry(0x11));
+    map.insert(k2, entry(0x22));
+    // Two keys change MAC in one snapshot push. The flow-cache flush is
+    // a coarse global epoch, so the whole batch bumps the epoch exactly
+    // ONCE (not once per changed key).
+    let remove = [k1, k2];
+    let insert = [(7, k1.1, entry(0x99)), (7, k2.1, entry(0x88))];
+    map.bulk_replace_neighbors(&remove, &insert);
+    assert_eq!(map.mac_change_epoch(), 1);
+}
+
+#[test]
 fn mac_change_epoch_confirmed_resolver_epoch_reject_no_bump() {
     use std::sync::atomic::AtomicU64;
     let map = ShardedNeighborMap::new();

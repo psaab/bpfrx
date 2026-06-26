@@ -237,6 +237,62 @@ impl ShardedNeighborMap {
         f(&mut bulk)
     }
 
+    /// #3048: atomic bulk neighbor replace used by the Go control-plane
+    /// snapshot push (`Coordinator::apply_manager_neighbors`, the #1197
+    /// authoritative neighbor mechanism). Removes `remove_keys`, then
+    /// inserts `insert_entries`, all under a single all-shard lock so
+    /// readers see either the pre- or post-replace set, never a partial
+    /// one. Bumps `mac_change_epoch` exactly once if ANY incoming key
+    /// REPLACES an existing neighbor's MAC with a different one.
+    ///
+    /// This is the FOURTH neighbor-MAC write path and the only one that
+    /// removes the prior entry BEFORE installing the new one (a Go
+    /// snapshot push uses `NeighborReplace: true`). The prior MAC for
+    /// each incoming key is therefore snapshotted UNDER the bulk lock
+    /// BEFORE the removes — reading it at insert time would always see
+    /// `None` (the old entry is already gone) and never detect a change,
+    /// which is exactly the bulk-path gap #3048's first cut missed.
+    ///
+    /// Semantics match the per-key paths: a pure refresh where every key
+    /// keeps the same MAC does NOT bump; a brand-new key with no prior
+    /// does NOT force a bump on its own (no cached flow can reference a
+    /// neighbor that did not previously exist). Reachable on a
+    /// VRRP-failover RTM_NEWNEIGH burst when the in-process monitor's
+    /// bounded rcvbuf overflows and the Go neighbor listener pushes the
+    /// new gateway MAC through this path.
+    pub(crate) fn bulk_replace_neighbors(
+        &self,
+        remove_keys: &[(i32, IpAddr)],
+        insert_entries: &[(i32, IpAddr, NeighborEntry)],
+    ) {
+        self.with_all_shards(|bulk| {
+            // Snapshot the prior MAC for every INCOMING key BEFORE any
+            // removal — the replace removes the old entry before the
+            // matching insert, so reading after would always miss it.
+            let mut mac_changed = false;
+            for (ifindex, ip, entry) in insert_entries {
+                if let Some(prior) = bulk.get(&(*ifindex, *ip))
+                    && prior.mac != entry.mac
+                {
+                    mac_changed = true;
+                }
+            }
+            for key in remove_keys {
+                bulk.remove(key);
+            }
+            for (ifindex, ip, entry) in insert_entries {
+                bulk.insert((*ifindex, *ip), *entry);
+            }
+            // Bump under the same bulk lock as the mutation so a
+            // concurrent fast-path hit never observes the new MAC with
+            // the old epoch. A single fetch_add covers the whole batch:
+            // the flow-cache invalidation is a coarse global epoch.
+            if mac_changed {
+                self.mac_change_epoch.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
     /// Total entry count summed across shards. Locks all shards in
     /// order. Used by `coordinator::dynamic_neighbor_status`.
     pub(crate) fn len(&self) -> usize {
@@ -278,6 +334,14 @@ impl<'a> BulkShardGuard<'a> {
     pub(crate) fn remove(&mut self, key: &(i32, IpAddr)) {
         let i = shard_idx(key);
         self.guards[i].remove(key);
+    }
+
+    /// #3048: read the entry for `key` from its shard while every shard
+    /// is locked. Used by `bulk_replace_neighbors` to snapshot a prior
+    /// MAC BEFORE the replace removes it.
+    pub(crate) fn get(&self, key: &(i32, IpAddr)) -> Option<NeighborEntry> {
+        let i = shard_idx(key);
+        self.guards[i].get(key).copied()
     }
 
     /// Iterate every shard's underlying map mutably. Used for
