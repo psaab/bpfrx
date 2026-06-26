@@ -640,6 +640,20 @@ type compileOpts struct {
 	// permit), so a leniently-loaded actionless policy DENIES rather than
 	// fails open. Same doctrine as lenientPolicyZoneRefs / lenientPolicyMatchAddress.
 	lenientPolicyTerminalAction bool
+	// lenientPolicyLogAction (#3060) downgrades the security-policy `then log`
+	// gate (validatePolicyLogActionStrict) from a hard compile error to a
+	// cfg.Warnings entry. The strict commit / commit-check path hard-rejects a
+	// policy whose `then log` names neither session-init nor session-close: a
+	// bare `then log` compiles to pol.Log = &PolicyLog{} with both flags false,
+	// so the policy REPORTS logging enabled over REST/gRPC/CLI yet emits NO
+	// session records — audit looks active while producing nothing (a silent
+	// gap on a security appliance). Junos requires at least one of
+	// session-init/session-close. The tolerant load / peer-sync paths downgrade
+	// to a warning so an already-persisted or peer-synced config an older binary
+	// accepted still BOOTS (#1960 no-brick); a leniently-loaded bare-log policy
+	// is harmless (it logs nothing, the pre-existing behavior). Same doctrine as
+	// lenientPolicyTerminalAction.
+	lenientPolicyLogAction bool
 	// lenientScreenProfileRefs (#3066) downgrades the zone screen-profile
 	// reference gate (validateScreenProfileReferencesStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit / commit-check
@@ -730,6 +744,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRouterID:                    true,
 		lenientSNMPTrapGroup:               true,
 		lenientPolicyTerminalAction:        true,
+		lenientPolicyLogAction:             true,
 		lenientScreenProfileRefs:           true,
 		lenientReservedZoneNames:           true,
 	})
@@ -843,6 +858,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRouterID:                    true,
 		lenientSNMPTrapGroup:               true,
 		lenientPolicyTerminalAction:        true,
+		lenientPolicyLogAction:             true,
 		lenientScreenProfileRefs:           true,
 		lenientReservedZoneNames:           true,
 	})
@@ -1239,6 +1255,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientPolicyTerminalAction {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("policy terminal action (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3060 security-policy `then log` accepted-but-inert gate. Strict on commit
+	// / commit-check (hard-reject a policy whose `then log` names neither
+	// session-init nor session-close — a bare `then log` compiles to a non-nil
+	// PolicyLog with both flags false, so the policy REPORTS logging enabled
+	// over REST/gRPC/CLI yet emits NO session records; Junos requires at least
+	// one of session-init/session-close). Lenient on load / peer-sync (warn so
+	// an already-persisted or peer-synced config still boots — #1960 no-brick; a
+	// leniently-loaded bare-log policy simply logs nothing, the pre-existing
+	// behavior). Covers both per-zone-pair and global policies. Runs after the
+	// terminal-action gate so a missing/conflicting terminal action still wins
+	// the first-error slot.
+	if err := validatePolicyLogActionStrict(cfg); err != nil {
+		if opts.lenientPolicyLogAction {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("policy log action (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
