@@ -32,7 +32,7 @@ use super::poll_stages::{
     stage_screen_syn_cookie_ack_on_session_miss,
 };
 use super::*;
-use crate::policy::evaluate_policy_result_with_len;
+use crate::policy::evaluate_policy_result_with_icmp;
 
 use cookie_reply::{SynCookieReply, enqueue_syn_cookie_reply};
 use nat_exception::{record_source_nat_failure, source_nat_decision_for_flow};
@@ -43,6 +43,29 @@ use filter::{
     evaluate_dscp_sensitive_input_filter_on_session_hit, evaluate_non_pbr_input_filter,
     evaluate_non_pbr_input_filter_log_only,
 };
+
+/// #3020: extract the ICMP/ICMPv6 `(type, code)` for policy matching. Returns
+/// `None` for non-ICMP protocols, and for ICMP/ICMPv6 frames whose type/code
+/// bytes are not safely readable (a truncated frame or a non-first fragment),
+/// so an icmp-type-constrained application term (junos-ping = echo-request only)
+/// fails closed rather than matching against a fabricated type/code of 0.
+///
+/// Reuses the canonical, fragment/truncation-safe extractor
+/// `term_match_extra_from_frame` (the same one the firewall-filter icmp-type
+/// terms consume), so the policy and filter planes agree on which type/code a
+/// frame carries. Cold-path only (policy is evaluated on session miss).
+#[inline]
+fn policy_packet_icmp(packet_frame: &[u8], meta: UserspaceDpMeta) -> Option<(u8, u8)> {
+    if !matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        return None;
+    }
+    let extra = crate::afxdp::frame::term_match_extra_from_frame(packet_frame, meta);
+    if extra.l4_present {
+        Some((extra.icmp_type, extra.icmp_code))
+    } else {
+        None
+    }
+}
 
 // Per-batch packet processing lifted from `poll_binding` (#678).
 //
@@ -1585,7 +1608,14 @@ pub(super) fn poll_binding_process_descriptor(
                             // translated-dst zone. `policy_dst_ip` /
                             // `policy_dst_port` collapse to the original dst when
                             // no inbound destination translation applies.
-                            let policy_result = evaluate_policy_result_with_len(
+                            // #3020: extract the ICMP/ICMPv6 type/code so an
+                            // icmp-type-constrained application term (junos-ping
+                            // = echo-request only) is enforced. `None` for
+                            // non-ICMP flows and for ICMP frames whose L4 header
+                            // is not safely readable (truncated / non-first
+                            // fragment), so such terms fail closed.
+                            let policy_icmp = policy_packet_icmp(packet_frame, meta);
+                            let policy_result = evaluate_policy_result_with_icmp(
                                 &worker_ctx.forwarding.policy,
                                 from_zone_id,
                                 to_zone_id,
@@ -1594,6 +1624,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 flow.forward_key.protocol,
                                 flow.forward_key.src_port,
                                 policy_dst_port,
+                                policy_icmp,
                                 desc.len as u64,
                             );
                             // #1620: cold-path latency histogram post-eval record.
@@ -2974,7 +3005,13 @@ pub(super) fn poll_binding_process_descriptor(
                                     .nat
                                     .rewrite_dst_port
                                     .unwrap_or(flow.forward_key.dst_port);
-                                let policy_result = evaluate_policy_result_with_len(
+                                // #3020: same ICMP type/code extraction as the
+                                // ForwardCandidate path so a denied/permitted
+                                // verdict for an icmp-type-constrained term
+                                // (junos-ping) is identical whether or not the
+                                // next-hop neighbor is already resolved.
+                                let policy_icmp = policy_packet_icmp(packet_frame, meta);
+                                let policy_result = evaluate_policy_result_with_icmp(
                                     &worker_ctx.forwarding.policy,
                                     from_zone_id,
                                     to_zone_id,
@@ -2983,6 +3020,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     flow.forward_key.protocol,
                                     flow.forward_key.src_port,
                                     policy_dst_port,
+                                    policy_icmp,
                                     desc.len as u64,
                                 );
                                 if cp_sample_tag {

@@ -343,8 +343,15 @@ func expandUserspacePolicyApplications(cfg *config.Config, apps []string) ([]Pol
 				Protocol:        proto,
 				SourcePort:      app.SourcePort,
 				DestinationPort: app.DestinationPort,
+				// #3020: carry the optional ICMP/ICMPv6 type/code constraint so
+				// the Rust matcher enforces junos-ping == echo-request only,
+				// rather than matching every ICMP type like junos-icmp-all.
+				// nil stays nil (the all-ICMP aliases remain unconstrained).
+				ICMPType: app.ICMPType,
+				ICMPCode: app.ICMPCode,
 			}
-			key := strings.Join([]string{snap.Name, snap.Protocol, snap.SourcePort, snap.DestinationPort}, "\x00")
+			key := strings.Join([]string{snap.Name, snap.Protocol, snap.SourcePort, snap.DestinationPort,
+				icmpKeyPart(snap.ICMPType), icmpKeyPart(snap.ICMPCode)}, "\x00")
 			if _, exists := seen[key]; exists {
 				continue
 			}
@@ -362,9 +369,29 @@ func expandUserspacePolicyApplications(cfg *config.Config, apps []string) ([]Pol
 		if expanded[i].SourcePort != expanded[j].SourcePort {
 			return expanded[i].SourcePort < expanded[j].SourcePort
 		}
-		return expanded[i].DestinationPort < expanded[j].DestinationPort
+		if expanded[i].DestinationPort != expanded[j].DestinationPort {
+			return expanded[i].DestinationPort < expanded[j].DestinationPort
+		}
+		// #3020: keep ICMP type/code in the sort key so two terms differing
+		// ONLY by the ICMP constraint (e.g. junos-ping vs junos-icmp-all, both
+		// proto icmp, no ports) order deterministically across HA peers.
+		if k := icmpKeyPart(expanded[i].ICMPType); k != icmpKeyPart(expanded[j].ICMPType) {
+			return k < icmpKeyPart(expanded[j].ICMPType)
+		}
+		return icmpKeyPart(expanded[i].ICMPCode) < icmpKeyPart(expanded[j].ICMPCode)
 	})
 	return expanded, true
+}
+
+// icmpKeyPart renders an optional ICMP type/code constraint as a stable string
+// for snapshot-term dedup + deterministic ordering (#3020). A nil constraint
+// (match-all) sorts before any concrete value so it is distinct from type/code
+// 0 (the "" vs "0" distinction the dedup key relies on).
+func icmpKeyPart(v *uint8) string {
+	if v == nil {
+		return ""
+	}
+	return strconv.Itoa(int(*v))
 }
 
 func resolveUserspaceApplicationNames(cfg *config.Config, name string) ([]string, bool) {

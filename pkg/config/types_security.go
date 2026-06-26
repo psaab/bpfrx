@@ -529,6 +529,13 @@ type Application struct {
 	InactivityTimeout int    // seconds (0 = default)
 	ALG               string // "ssh", "ftp", etc. (informational)
 	Description       string
+	// ICMPType / ICMPCode constrain an ICMP/ICMPv6 application to a single
+	// message type (and optionally code), e.g. junos-ping = ICMP type 8
+	// (echo-request) and junos-pingv6 = ICMPv6 type 128. nil means "no
+	// constraint" — the application matches every type/code of its protocol
+	// (the historical behavior and what the all-ICMP aliases keep). #3020.
+	ICMPType *uint8
+	ICMPCode *uint8
 }
 
 // IPsecConfig holds IPsec VPN configuration.

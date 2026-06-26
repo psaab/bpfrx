@@ -2,6 +2,10 @@ package config
 
 import "fmt"
 
+// u8p returns a pointer to a uint8 literal, used to set the optional ICMP
+// type/code constraint on a predefined application (#3020).
+func u8p(v uint8) *uint8 { return &v }
+
 // PredefinedApplications contains built-in Junos application definitions.
 // Based on the official Junos OS predefined application list.
 var PredefinedApplications = map[string]*Application{
@@ -125,8 +129,12 @@ var PredefinedApplications = map[string]*Application{
 	"junos-ns-global-pro": {Name: "junos-ns-global-pro", Protocol: "tcp", DestinationPort: "15397"},
 
 	// --- ICMP / ICMPv6 ---
-	"junos-ping":      {Name: "junos-ping", Protocol: "icmp"},
-	"junos-pingv6":    {Name: "junos-pingv6", Protocol: "icmpv6"},
+	// #3020: junos-ping / junos-pingv6 are echo-request ONLY (Junos parity:
+	// ICMP type 8 / ICMPv6 type 128), NOT every ICMP type. The all-ICMP
+	// aliases below stay unconstrained (match any type/code) so they remain
+	// distinct from the ping applications.
+	"junos-ping":      {Name: "junos-ping", Protocol: "icmp", ICMPType: u8p(8)},
+	"junos-pingv6":    {Name: "junos-pingv6", Protocol: "icmpv6", ICMPType: u8p(128)},
 	"junos-icmp-all":  {Name: "junos-icmp-all", Protocol: "icmp"},
 	"junos-icmp6-all": {Name: "junos-icmp6-all", Protocol: "icmpv6"},
 

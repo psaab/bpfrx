@@ -734,6 +734,16 @@ type PolicyApplicationSnapshot struct {
 	Protocol        string `json:"protocol,omitempty"`
 	SourcePort      string `json:"source_port,omitempty"`
 	DestinationPort string `json:"destination_port,omitempty"`
+	// #3020: optional ICMP/ICMPv6 type (and code) constraint. nil = "no
+	// constraint" — the term matches every type/code of its protocol (the
+	// historical behavior, kept by the all-ICMP aliases). junos-ping sets
+	// ICMPType=8, junos-pingv6 sets ICMPType=128. omitempty + pointer keeps
+	// the wire additive: an old helper missing the field decodes None and
+	// ignores the constraint (match-all, today's behavior), and an old Go
+	// snapshot omitting it decodes to None on the Rust side the same way, so
+	// version skew degrades safely to match-all rather than failing to decode.
+	ICMPType *uint8 `json:"icmp_type,omitempty"`
+	ICMPCode *uint8 `json:"icmp_code,omitempty"`
 }
 
 // AppCatalogEntrySnapshot is one row of the application-identification catalog
