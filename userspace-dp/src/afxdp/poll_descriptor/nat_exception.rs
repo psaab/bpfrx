@@ -10,8 +10,12 @@
 // exception bodies out of the hot ingress loop's codegen unit and
 // cache lines.
 //
-// The bodies are byte-for-byte identical to their previous location in
-// mod.rs; only the enclosing module and the inline attributes change.
+// The bodies were lifted byte-for-byte from their previous location in
+// mod.rs (only the enclosing module and inline attributes changed),
+// EXCEPT that source_nat_decision_for_flow now passes the EGRESS zone
+// (to_zone) instead of from_zone to static_nat.match_snat_with_counter
+// per #2871 — the static-NAT reverse-SNAT egress-zone gate, symmetric
+// with the #2864 DNAT ingress-zone gate.
 
 use super::*;
 

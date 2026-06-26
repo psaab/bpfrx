@@ -18658,3 +18658,13 @@ top.
 - **File(s)**: userspace-dp/src/nat/static_nat.rs,
   userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs,
   userspace-dp/src/nat/tests.rs, userspace-dp/src/afxdp/tests.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2871 review follow-up (MERGE-NEEDS-MINOR, docs-only). (1) Updated
+  docs/feature-coverage.md Static NAT row to document the symmetric egress-zone
+  reverse-SNAT gate (mirror of the #2864 DNAT ingress-zone sentence). (2) Fixed
+  the now-stale "byte-for-byte identical" provenance comment in
+  nat_exception.rs to note source_nat_decision_for_flow passes to_zone (egress)
+  per #2871. No code change. Build clean; nat:: 130 / static_nat 28 still green.
+- **File(s)**: docs/feature-coverage.md,
+  userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs, _Log.md
