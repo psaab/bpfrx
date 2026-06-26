@@ -85,7 +85,7 @@ pub(super) struct NonPbrInputFilterEval {
 #[inline(never)]
 pub(super) fn evaluate_non_pbr_input_filter(
     forwarding: &ForwardingState,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     flow: Option<&SessionFlow>,
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
@@ -158,7 +158,7 @@ pub(super) fn evaluate_non_pbr_input_filter(
 #[inline(never)]
 pub(super) fn evaluate_non_pbr_input_filter_log_only(
     forwarding: &ForwardingState,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     flow: Option<&SessionFlow>,
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
@@ -354,7 +354,7 @@ fn emit_cached_output_filter_log_tail(
 #[inline(never)]
 pub(super) fn apply_lo0_filter_action(
     forwarding: &ForwardingState,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
     flow: Option<&SessionFlow>,
     meta: UserspaceDpMeta,

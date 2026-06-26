@@ -183,6 +183,31 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 				snap.ICMPCodes = append(snap.ICMPCodes, uint8(c))
 			}
 		}
+		// Flexible-match-range (#3077). Previously parsed + compiled for the
+		// retired legacy dataplane (pkg/dataplane/compiler_filter.go) but
+		// silently dropped here, so the byte-offset constraint never reached the
+		// sole runtime dataplane and the term matched too broadly (fail-open).
+		// Mirror the legacy lowering: FlexLength is the match width in BYTES
+		// (BitLength/8, defaulted to 4 == 32-bit when unset, capped at 4 since
+		// the wire value is a u32), and the compared value is pre-masked. The
+		// byte offset is L3-relative (match-start layer-3, the only start point
+		// the compiler emits). A zero effective length is dropped (no
+		// constraint) rather than emitted as a degenerate always-fail match.
+		if fm := term.FlexMatch; fm != nil {
+			length := fm.BitLength / 8
+			if length == 0 {
+				length = 4 // default 32-bit, matching compiler_filter.go
+			}
+			if length > 4 {
+				length = 4 // the wire value is a u32; cap defensively
+			}
+			snap.FlexMatch = &FlexMatchSnapshot{
+				Offset: fm.ByteOffset,
+				Length: length,
+				Value:  fm.Value & fm.Mask,
+				Mask:   fm.Mask,
+			}
+		}
 		terms = append(terms, snap)
 	}
 	return terms

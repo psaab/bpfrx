@@ -215,6 +215,10 @@ pub(super) fn build_live_forward_request_from_frame(
         // #2362 fold B: snapshot the fragment-safe per-packet match inputs so a
         // later deferred TX-selection recompute keeps the same verdict even
         // after the UMEM frame is recycled.
-        filter_match_extra: crate::afxdp::frame::term_match_extra_from_frame(frame, meta),
+        // #3077: stored on the deferred CoS/TX-selection path — strip the
+        // borrowed frame slice (to_static) since the frame may be recycled
+        // before this is consumed. The flex byte-offset term fails closed here.
+        filter_match_extra: crate::afxdp::frame::term_match_extra_from_frame(frame, meta)
+            .to_static(),
     })
 }

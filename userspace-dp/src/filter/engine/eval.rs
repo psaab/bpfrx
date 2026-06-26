@@ -25,7 +25,7 @@ pub(crate) fn evaluate_filter(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
 ) -> FilterResult {
     evaluate_filter_counted(
         state, filter_key, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra, 0,
@@ -41,7 +41,7 @@ pub(crate) fn evaluate_filter_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> FilterResult {
     let Some(filter) = state.filters.get(filter_key) else {
@@ -69,7 +69,7 @@ pub(super) fn evaluate_filter_ref_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> FilterResult {
     match (src_ip, dst_ip) {
@@ -108,7 +108,7 @@ fn evaluate_filter_ref_counted_v4(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> FilterResult {
     // #2544: accumulate modifiers across fall-through terms. A matched
@@ -193,7 +193,7 @@ fn evaluate_filter_ref_counted_v6(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> FilterResult {
     // #2544: see evaluate_filter_ref_counted_v4 — accumulate fall-through
@@ -260,7 +260,7 @@ fn evaluate_filter_ref_non_routing_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
     count_policy: NonRoutingCountPolicy,
 ) -> FilterResult {
@@ -302,7 +302,7 @@ fn evaluate_filter_ref_non_routing_counted_v4(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
     count_policy: NonRoutingCountPolicy,
 ) -> FilterResult {
@@ -377,7 +377,7 @@ fn count_matched_non_routing_terms_v4(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
     terminal: &FilterTerm,
 ) {
@@ -407,7 +407,7 @@ fn evaluate_filter_ref_non_routing_counted_v6(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
     count_policy: NonRoutingCountPolicy,
 ) -> FilterResult {
@@ -463,7 +463,7 @@ fn count_matched_non_routing_terms_v6(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
     terminal: &FilterTerm,
 ) {
@@ -500,7 +500,7 @@ fn evaluate_filter_ref_routing_instance_counted_v4<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> Option<FilterRoutingInstanceResult<'a>> {
     let mut acc_log: Option<FilterLogMatch> = None;
@@ -562,7 +562,7 @@ fn evaluate_filter_ref_routing_instance_counted_v6<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> Option<FilterRoutingInstanceResult<'a>> {
     let mut acc_log: Option<FilterLogMatch> = None;
@@ -615,7 +615,7 @@ pub(crate) fn evaluate_lo0_filter(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
 ) -> FilterResult {
     evaluate_lo0_filter_counted(
         state, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra, 0,
@@ -631,7 +631,7 @@ pub(crate) fn evaluate_lo0_filter_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> FilterResult {
     let filter = if is_v6 {
@@ -664,7 +664,7 @@ pub(crate) fn evaluate_lo0_filter_log_match(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
 ) -> Option<FilterLogMatch> {
     let filter = if is_v6 {
         state.lo0_filter_v6_fast.as_deref()
@@ -687,7 +687,7 @@ pub(crate) fn evaluate_interface_filter(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
 ) -> FilterResult {
     evaluate_interface_filter_counted(
         state, ifindex, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra, 0,
@@ -704,7 +704,7 @@ pub(crate) fn evaluate_interface_filter_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> FilterResult {
     let filter = if is_v6 {
@@ -749,7 +749,7 @@ pub(crate) fn evaluate_interface_filter_non_routing_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
     count_policy: NonRoutingCountPolicy,
 ) -> FilterResult {
@@ -785,7 +785,7 @@ pub(crate) fn evaluate_interface_filter_log_match(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     skip_routing_instance: bool,
 ) -> Option<FilterLogMatch> {
     let filter = if is_v6 {
@@ -816,7 +816,7 @@ pub(crate) fn evaluate_interface_filter_routing_instance_counted<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> Option<&'a str> {
     evaluate_interface_filter_routing_instance_event_counted(
@@ -845,7 +845,7 @@ pub(crate) fn evaluate_interface_filter_routing_instance_event_counted<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> Option<FilterRoutingInstanceResult<'a>> {
     let filter = if is_v6 {
@@ -891,7 +891,7 @@ fn evaluate_filter_ref_log_match(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     skip_routing_instance: bool,
 ) -> Option<FilterLogMatch> {
     if !filter.has_log_terms {
@@ -956,7 +956,7 @@ pub(crate) fn evaluate_interface_output_filter(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
 ) -> FilterResult {
     evaluate_interface_output_filter_counted(
         state, ifindex, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra, 0,
@@ -973,7 +973,7 @@ pub(crate) fn evaluate_interface_output_filter_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
     packet_bytes: u64,
 ) -> FilterResult {
     let filter = if is_v6 {

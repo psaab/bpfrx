@@ -219,6 +219,36 @@ pub(crate) struct FirewallTermSnapshot {
     pub icmp_types: Vec<u8>,
     #[serde(rename = "icmp_codes", default)]
     pub icmp_codes: Vec<u8>,
+    // flex_match is the Junos `from flexible-match-range` byte-offset match
+    // (#3077). It was parsed + compiled for the retired legacy dataplane but
+    // dropped on the userspace wire, so the byte-offset constraint vanished and
+    // the term matched too broadly (fail-open). The match reads `length` bytes
+    // at `offset` from the start of the L3 header (match-start layer-3),
+    // interprets them big-endian, ANDs with `mask`, and requires the result to
+    // equal `value` (already pre-masked by the Go compiler). None = no flex
+    // constraint (the common case). Like the #2362 per-packet L4 fields this is
+    // NOT in the SessionKey, so a filter carrying it is cache-sensitive — see
+    // FilterTerm::has_per_packet_l4_match. serde(default) keeps wire parity with
+    // an older Go control plane that omits the field (#1961).
+    #[serde(rename = "flex_match", default)]
+    pub flex_match: Option<FlexMatchSnapshot>,
+}
+
+// FlexMatchSnapshot mirrors the Go FlexMatchSnapshot wire form (#3077): the
+// firewall-filter flexible-match-range byte-offset match. `offset` is the byte
+// offset from the start of the L3 header (match-start layer-3); `length` is the
+// match width in BYTES (1..4); `value` is the expected value AFTER masking;
+// `mask` is applied to the read bytes before the equality compare.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct FlexMatchSnapshot {
+    #[serde(default)]
+    pub offset: u8,
+    #[serde(default)]
+    pub length: u8,
+    #[serde(default)]
+    pub value: u32,
+    #[serde(default)]
+    pub mask: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

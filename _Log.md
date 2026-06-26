@@ -1,3 +1,47 @@
+## 2026-06-26 — #3077 firewall filter flexible-match-range wired to the userspace dataplane
+
+- **Timestamp**: 2026-06-26
+- **Action**: Implement `from flexible-match-range` on the sole runtime
+  (AF_XDP userspace) dataplane. The byte-offset match was parsed + compiled
+  for the retired legacy dataplane but DROPPED on the userspace wire, so the
+  constraint vanished and the filter term matched too broadly (fail-open).
+  Serialized it into the snapshot (`FlexMatchSnapshot` on the Go + Rust
+  `FirewallTermSnapshot`, `#[serde(default)]` for #1961 version-skew) with
+  offset / length(bytes, BitLength/8 capped 4) / pre-masked value / mask,
+  mirroring the legacy `compiler_filter.go` lowering. Implemented the matcher
+  in the Rust filter engine (`per_packet_l4_matches` → `flex_matches`): at
+  `offset` (match-start layer-3 = relative to the start of the L3/IP header,
+  the only start the compiler emits) read `length` bytes big-endian into a
+  u32, AND with `mask`, require `== value`. FAIL-CLOSED: a packet too short
+  for `offset+length`, or any path with no L3 slice, does NOT match (never
+  fail-open, never OOB). The L3 slice is threaded through a new lifetime on
+  `TermMatchExtra` (`flex_l3: Option<&[u8]>`); the deferred CoS/TX-selection
+  snapshot drops the borrow via `to_static()` (frame may be recycled) so flex
+  under-matches there (default forwarding-class). Marked cache-sensitive
+  (`has_per_packet_l4_match`) so the flow-cache declines. Regenerated
+  `protocol_wire_v1.json` (single additive key `flex_match`). Fail-on-revert
+  proven (Rust): omitting the flex check turns `flex_match_does_not_match_*`,
+  `_respects_mask`, `_fails_closed_*` RED while `term_without_flex_is_
+  unaffected` stays GREEN; Go: dropping the serialization turns
+  `TestFilterSnapshotFlexMatchSerialized` RED.
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/filters.go,
+  pkg/dataplane/userspace/filters_flex_match_3077_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/filter/mod.rs,
+  userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/engine/matching.rs,
+  userspace-dp/src/filter/engine/eval.rs,
+  userspace-dp/src/filter/engine/tx_selection.rs,
+  userspace-dp/src/filter/tests.rs,
+  userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/types/tx.rs,
+  userspace-dp/src/afxdp/forward_request.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/src/filter/README.md, docs/feature-gaps.md,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json, _Log.md
+  (plus mechanical `flex_l3: None` / `flex_match: None` in test literals)
+
 ## 2026-06-26 — #3020 junos-ping / junos-pingv6 echo-request-only (ICMP type constraint)
 
 - **Timestamp**: 2026-06-26

@@ -29,7 +29,7 @@ use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP};
 /// header) and is therefore NOT gated by `l4_present` — a non-first fragment
 /// still matches `from { is-fragment }`.
 #[inline(always)]
-fn per_packet_l4_matches(term: &FilterTerm, protocol: u8, extra: TermMatchExtra) -> bool {
+fn per_packet_l4_matches(term: &FilterTerm, protocol: u8, extra: TermMatchExtra<'_>) -> bool {
     if term.tcp_flags_mask.is_some() || term.tcp_flags_forbidden.is_some() {
         // A tcp-flags constraint (required and/or forbidden, #3076) only matches
         // a TCP segment that actually has an L4 header. A non-TCP packet, or a
@@ -76,7 +76,57 @@ fn per_packet_l4_matches(term: &FilterTerm, protocol: u8, extra: TermMatchExtra)
             return false;
         }
     }
+    // #3077 flexible-match-range: a byte-offset match against the L3 header.
+    if !flex_matches(term, extra.flex_l3) {
+        return false;
+    }
     true
+}
+
+/// #3077: evaluate a term's flexible-match-range byte-offset condition. A term
+/// without the constraint (`flex_enabled == false`) is a no-op (returns true).
+/// Otherwise the match reads `flex_length` bytes (compiler-bounded to 1..=4) at
+/// `flex_offset` from the START of the L3 header (`flex_l3`, match-start
+/// layer-3 — the only start point the Go compiler emits), assembles them
+/// big-endian (network order) into a u32, ANDs with `flex_mask`, and requires
+/// the result to equal `flex_value` (pre-masked).
+///
+/// FAIL-CLOSED contract (the #3077 fix): the term matches ONLY when the window
+/// fully lies within the available L3 bytes. If `flex_l3` is `None` (no frame
+/// on this path) or the packet is too short to hold `offset + length` bytes, the
+/// condition is FALSE — the term does not match. This is the opposite of the
+/// pre-fix behavior, where the constraint was dropped on the wire and the term
+/// matched every packet (fail-open). Bounds are checked before indexing, so a
+/// truncated/short packet can never read out of bounds or panic.
+#[inline(always)]
+fn flex_matches(term: &FilterTerm, flex_l3: Option<&[u8]>) -> bool {
+    if !term.flex_enabled {
+        return true;
+    }
+    let len = term.flex_length as usize;
+    // The compiler only enables flex for len in 1..=4, but re-check so a stray
+    // value can never under/over-read; a bad length fails closed.
+    if !(1..=4).contains(&len) {
+        return false;
+    }
+    let Some(l3) = flex_l3 else {
+        // No L3 bytes on this path — cannot evaluate the constraint, so it must
+        // NOT match (fail closed), never silently pass.
+        return false;
+    };
+    let off = term.flex_offset as usize;
+    let Some(end) = off.checked_add(len) else {
+        return false;
+    };
+    if end > l3.len() {
+        // Packet too short to reach the match window — fail closed.
+        return false;
+    }
+    let mut val: u32 = 0;
+    for &b in &l3[off..end] {
+        val = (val << 8) | u32::from(b);
+    }
+    (val & term.flex_mask) == term.flex_value
 }
 
 /// Check whether a single filter term matches the given packet fields.
@@ -90,7 +140,7 @@ pub(super) fn term_matches(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
 ) -> bool {
     match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
@@ -113,7 +163,7 @@ pub(super) fn term_matches_v4(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
 ) -> bool {
     if term.protocol_match_enabled
         && (term.protocol_bitmap[(protocol / 64) as usize] & (1u64 << (protocol % 64))) == 0
@@ -246,7 +296,7 @@ pub(super) fn term_matches_v6(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
-    extra: TermMatchExtra,
+    extra: TermMatchExtra<'_>,
 ) -> bool {
     if term.protocol_match_enabled
         && (term.protocol_bitmap[(protocol / 64) as usize] & (1u64 << (protocol % 64))) == 0

@@ -416,7 +416,7 @@ pub(in crate::afxdp) fn is_any_fragment(packet: &[u8], addr_family: u8) -> bool 
 pub(in crate::afxdp) fn term_match_extra_from_frame(
     frame: &[u8],
     meta: UserspaceDpMeta,
-) -> crate::filter::TermMatchExtra {
+) -> crate::filter::TermMatchExtra<'_> {
     use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6};
     let l3_packet = frame.get(meta.l3_offset as usize..);
     let is_fragment = l3_packet.is_some_and(|packet| is_any_fragment(packet, meta.addr_family));
@@ -464,6 +464,12 @@ pub(in crate::afxdp) fn term_match_extra_from_frame(
         // this (a zeroed icmp byte is otherwise a valid icmp-type 0 / icmp-code
         // 0 match).
         l4_present: !non_first_fragment && !l4_truncated,
+        // #3077: the L3 header slice (match-start layer-3) backs the
+        // flexible-match-range byte-offset match. The byte offset is relative to
+        // the start of the IP header. `l3_packet` is None if the frame is
+        // shorter than l3_offset, in which case the matcher's bounds check fails
+        // the flex term closed.
+        flex_l3: l3_packet,
     }
 }
 
@@ -479,7 +485,7 @@ pub(in crate::afxdp) fn term_match_extra_from_frame(
 pub(in crate::afxdp) fn term_match_extra_from_frame_fwd(
     frame: &[u8],
     meta: ForwardPacketMeta,
-) -> crate::filter::TermMatchExtra {
+) -> crate::filter::TermMatchExtra<'_> {
     use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6};
     let l3_packet = frame.get(meta.l3_offset as usize..);
     let is_fragment = l3_packet.is_some_and(|packet| is_any_fragment(packet, meta.addr_family));
@@ -513,6 +519,9 @@ pub(in crate::afxdp) fn term_match_extra_from_frame_fwd(
         icmp_type,
         icmp_code,
         l4_present: !non_first_fragment && !l4_truncated,
+        // #3077: L3 header slice for flexible-match-range (see the input-filter
+        // builder above). Same fail-closed-on-too-short bounds check applies.
+        flex_l3: l3_packet,
     }
 }
 
@@ -542,7 +551,7 @@ pub(in crate::afxdp) fn term_match_extra_from_frame_fwd(
 #[inline]
 pub(in crate::afxdp) fn term_match_extra_from_meta(
     meta: ForwardPacketMeta,
-) -> crate::filter::TermMatchExtra {
+) -> crate::filter::TermMatchExtra<'static> {
     use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6};
     // #3008: the ICMP type/code bytes are unknown on the meta-only path (no
     // frame). A 0 byte is a real `icmp-type 0` / `icmp-code 0` value, so we must
@@ -561,6 +570,10 @@ pub(in crate::afxdp) fn term_match_extra_from_meta(
         // icmp-type/code terms closed); TRUE otherwise so the shim-stamped
         // tcp_flags still drives tcp-flags matching on synthetic/local TX.
         l4_present: !is_icmp,
+        // #3077: no contiguous frame on this meta-only path, so there are no L3
+        // bytes to read. A flex-constrained term fails closed here (the
+        // flow-cache declines for such filters, so this path never carries one).
+        flex_l3: None,
     }
 }
 
