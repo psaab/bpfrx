@@ -156,6 +156,7 @@ fn test_metadata() -> SessionMetadata {
         nat64_reverse: None,
         log_session_init: false,
         log_session_close: false,
+        policy_id: 0,
     }
 }
 

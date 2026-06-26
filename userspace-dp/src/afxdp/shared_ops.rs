@@ -671,6 +671,10 @@ pub(super) fn build_reverse_session_from_forward_match(
         // the reverse companion's close delta carries a consistent gate.
         log_session_init: forward_match.metadata.log_session_init,
         log_session_close: forward_match.metadata.log_session_close,
+        // #3056: inherit the admitting policy ID from the forward session so a
+        // materialized reverse companion attributes the same policy in its
+        // BPF-compat conntrack row.
+        policy_id: forward_match.metadata.policy_id,
     };
     let decision = SessionDecision {
         resolution: redirect_session_resolution_for_metadata(forwarding, resolution, &metadata),

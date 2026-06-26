@@ -502,6 +502,9 @@ pub(super) fn build_missing_neighbor_session_metadata(
         // #2508: neighbor-seed sessions carry no per-policy `then log`.
         log_session_init: false,
         log_session_close: false,
+        // #3056: a neighbor-seed session is a transient pre-resolution stub,
+        // not a policy-admitted flow, so it carries no admitting policy ID.
+        policy_id: 0,
     }
 }
 

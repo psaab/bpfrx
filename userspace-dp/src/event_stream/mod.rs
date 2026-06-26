@@ -554,6 +554,12 @@ impl EventStreamWorkerHandle {
                     nat.rewrite_dst_port.unwrap_or(0),
                     delta.metadata.ingress_zone,
                     delta.metadata.egress_zone,
+                    // #3056: the admitting policy ID stamped on the session at
+                    // install, so the SESSION_CLOSE RT_FLOW record (and the
+                    // NetFlow/IPFIX close exporters) name the policy that
+                    // admitted the flow instead of policy 0. Rides the trailing
+                    // [136:140] slot because #2853 took [44:48] on a close.
+                    delta.metadata.policy_id,
                     delta.metadata.owner_rg_id as i16,
                     // #2508: per-policy RT_FLOW SYSLOG gate byte. The frame is
                     // sent unconditionally (the Go NetFlow/IPFIX exporter
@@ -634,6 +640,10 @@ impl EventStreamWorkerHandle {
                     nat.rewrite_dst_port.unwrap_or(0),
                     delta.metadata.ingress_zone,
                     delta.metadata.egress_zone,
+                    // #3056: the admitting policy ID stamped on the session at
+                    // install, so the SESSION_CREATE RT_FLOW record names the
+                    // policy that admitted the flow instead of policy 0.
+                    delta.metadata.policy_id,
                     // #2615: ingress ifindex ([128:132]) + resolved AppID
                     // ([132:134]) so the SESSION_CREATE RT_FLOW record shows
                     // the admitting interface and application instead of
