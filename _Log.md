@@ -1,3 +1,33 @@
+## 2026-06-26 — #3206 static-NAT unparseable match destination-address / prefix rejected at commit
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fail-closed fix. A static-NAT rule whose `match
+  destination-address` or `then static-nat prefix` was NOT a parseable
+  literal IP/CIDR (an address-book name, or a typo'd prefix) committed
+  cleanly: the existing host-mask check fires only when the value parses
+  (`parsed && !host`), so an unparseable value skipped both the host-mask
+  and block-pair checks and fell through to the Rust dataplane, where
+  `parse_nat_prefix` returns `None` and `from_snapshots` does `continue`,
+  silently dropping the WHOLE static-NAT mapping with no commit error or
+  runtime feedback. Fix: `validateNATHostMaskStrict` (compiler_nat.go) now
+  rejects an unparseable `match`/`then` FIRST (before the block-pair /
+  host-mask checks) using `natStaticPrefixInfo`'s `parsedIP == false`
+  signal, naming the rule-set, rule, slot, and offending value. Strict =
+  hard commit error; lenient (#1960) = `cfg.Warnings` entry. The Rust
+  `from_snapshots` None-drop stays as the lenient/peer-sync backstop (no
+  Rust change). Applies to BOTH the match destination-address and the
+  then static-nat prefix slots. NPTv6 / `static-nat inet` exemptions
+  unchanged; valid host (/32) and block (/24, #3031) static NAT still
+  compile byte-identical (no over-rejection).
+- **File(s)**: pkg/config/compiler_nat.go,
+  pkg/config/compiler_nat_host_mask_test.go, docs/config-schema.md, _Log.md
+- **Validation**: `go build ./...`; `go test ./pkg/config/` ok;
+  `cargo build --release` + `cargo test --release nat::` 149/0. Fail-on-revert:
+  removing the #3206 blocks turns TestStaticNATUnparseableMatchRejected,
+  TestStaticNATUnparseablePrefixRejected, TestStaticNATUnparseableLenientWarns
+  RED while TestStaticNATParseableValuesStillCompile stays GREEN; restored
+  byte-identical.
+
 ## 2026-06-26 — #3205 firewall-filter symbolic match values: resolve + fail closed
 
 - **Timestamp**: 2026-06-26
