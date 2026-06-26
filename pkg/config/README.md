@@ -201,6 +201,24 @@ zones (`ge-0/0/0.0` in trust, `ge-0/0/0.1` in untrust — a valid VLAN
 split) are NOT rejected; a bare physical interface and one of its units
 across zones ARE (same logical interface). Same fail-closed-on-load
 doctrine as #3043/#2401.
+
+**Backup-router destination family must match the next-hop (#2911):**
+`renderBackupRouter` (`pkg/frr/config_render.go`) keys the static-route
+prefix keyword (`ip` vs `ipv6`) on the NEXT-HOP family (#2891/#2907). An
+explicit `system backup-router <nh> destination <prefix>` whose prefix is a
+DIFFERENT family than the next-hop therefore renders a mismatched-family
+static — e.g. `backup-router 2001:db8::1 destination 0.0.0.0/0` →
+`ipv6 route 0.0.0.0/0 2001:db8::1 250` — which frr-reload rejects, failing
+the ENTIRE static config load (the exact breakage #2907 fixed for the
+empty-destination case). `validateBackupRouterDst` (`compiler_system.go`)
+hard-rejects an explicit family mismatch at commit, naming both addresses
+and families; the tolerant load/peer-sync path downgrades to a warning
+(`lenientBackupRouterDst`) so an already-persisted or peer-synced config an
+older binary accepted still boots (#1960 no-brick). An EMPTY destination is
+left to #2907's next-hop-family-aware default (never a mismatch); a
+matched-family explicit destination passes. Same fail-closed-on-load
+doctrine as #3043.
+
 **No-match default-policy is fail-closed (#3065):** the sibling of #3043
 for the implicit fallback. When a flow matches NO zone-pair, global, or
 default policy, the verdict is `SecurityConfig.DefaultPolicy`. Because the

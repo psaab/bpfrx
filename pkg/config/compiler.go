@@ -717,6 +717,23 @@ type compileOpts struct {
 	// routing-instance-scoped NAT matching is a deferred follow-up. Same
 	// doctrine as lenientPolicyWildcardZone.
 	lenientNATRuleSetScope bool
+	// lenientBackupRouterDst (#2911) downgrades the backup-router
+	// destination/next-hop family-mismatch gate (validateBackupRouterDst)
+	// from a hard compile error to a cfg.Warnings entry. #2907 (#2891)
+	// made the EMPTY backup-router destination default next-hop-family-aware
+	// (a v6 next-hop with no explicit destination defaults to ::/0), but an
+	// EXPLICIT destination whose family MISMATCHES the next-hop — e.g.
+	// `backup-router 2001:db8::1` + `destination 0.0.0.0/0` — still renders an
+	// FRR-invalid static line (`ipv6 route 0.0.0.0/0 2001:db8::1 250`).
+	// frr-reload rejects a mismatched-family static and that failure fails the
+	// ENTIRE static config load, not just the one line — exactly the breakage
+	// #2907 set out to prevent. The strict commit / commit-check path hard-
+	// rejects so the operator-error is visible (naming both addresses and
+	// families); the tolerant load / peer-sync paths downgrade to a warning so
+	// an already-persisted or peer-synced config an older binary accepted still
+	// BOOTS (#1960 fail-closed-on-load class). Same doctrine as
+	// lenientNATRuleSetScope.
+	lenientBackupRouterDst bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -782,6 +799,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientReservedZoneNames:           true,
 		lenientPolicyWildcardZone:          true,
 		lenientNATRuleSetScope:             true,
+		lenientBackupRouterDst:             true,
 	})
 }
 
@@ -898,6 +916,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientReservedZoneNames:           true,
 		lenientPolicyWildcardZone:          true,
 		lenientNATRuleSetScope:             true,
+		lenientBackupRouterDst:             true,
 	})
 }
 
@@ -2038,6 +2057,21 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 	cfg.Warnings = append(cfg.Warnings, napWarnings...)
+
+	// #2911: backup-router destination/next-hop family-mismatch gate. #2907
+	// (#2891) made the EMPTY destination default next-hop-family-aware, but an
+	// EXPLICIT destination whose family differs from the next-hop still renders
+	// an FRR-invalid static line (e.g. `ipv6 route 0.0.0.0/0 <v6nh>`), which
+	// frr-reload rejects and which fails the ENTIRE static config load. Strict
+	// (commit / commit-check): hard-reject. Lenient (load / peer-sync): warn so
+	// a config committed before this gate existed still boots (renderBackupRouter
+	// still emits the bad line, but the rest of the static config no longer
+	// depends on this validator to load — the operator is told to correct it).
+	brWarnings, err := validateBackupRouterDst(cfg, opts.lenientBackupRouterDst)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Warnings = append(cfg.Warnings, brWarnings...)
 
 	// #2227 MAJOR-1: port-scan / ip-sweep threshold clamp warning. The AF_XDP
 	// dataplane bounds its per-(zone,source) unique-destination set at

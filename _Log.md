@@ -1,3 +1,28 @@
+## 2026-06-25 — #2911: reject backup-router explicit destination family-mismatch at commit
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2907 (#2891) made the EMPTY backup-router destination default
+  next-hop-family-aware (v6 next-hop → `::/0`). But an EXPLICIT destination
+  whose family MISMATCHES the next-hop — e.g. `backup-router 2001:db8::1`
+  + `destination 0.0.0.0/0` — still renders an FRR-invalid static line
+  (`ipv6 route 0.0.0.0/0 2001:db8::1 250`); frr-reload rejects it and fails
+  the ENTIRE static config load, the exact breakage #2907 set out to prevent.
+  Added `validateBackupRouterDst` (`compiler_system.go`): classifies the
+  next-hop and explicit-destination families (reusing `natAddrFamily` /
+  `natCIDRIPPart`) and hard-rejects a mismatch at commit, naming both
+  addresses and families. Strict-with-lenient #1960 split — the tolerant
+  load / peer-sync paths downgrade to a `cfg.Warnings` entry via the new
+  `lenientBackupRouterDst` flag (wired into `CompileConfigLenient` +
+  `CompileConfigForNodeLenient`) so an already-persisted bad config still
+  boots. Empty destination is left to #2907's default (never rejected);
+  matched-family explicit destinations pass.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_system.go,
+  pkg/config/backup_router_family_2911_test.go (new), pkg/config/README.md,
+  pkg/frr/README.md
+- **Validation**: `go build ./...`, `go vet ./pkg/config/... ./pkg/frr/...`,
+  `go test ./pkg/config/... ./pkg/frr/...` (1790 pass). Fail-on-revert:
+  stubbing the validator to `return nil` turns the 4 reject/lenient-warn
+  tests RED; restoring it returns GREEN.
 ## 2026-06-25 — #2956: reap superseded Surface A HTTP transports on binding change
 
 - **Timestamp**: 2026-06-25
