@@ -1,3 +1,38 @@
+## 2026-06-26 — #3224 host-inbound DHCP scope: NON-REPRODUCING (doc correction + real regression test)
+
+- **Timestamp**: 2026-06-26
+- **Action**: Reworked after hostile review found the prior "SECURITY
+  fail-open fix" was byte-identical to master in production and its test
+  used an injected fake `dynAddrs` provider that never exercised the
+  production address source. VERIFIED the #3224 premise does NOT
+  reproduce: master's `BuildZoneHostInboundViews` already resolves each
+  zone's addresses through `buildInterfaceSnapshots` ->
+  `buildLinkSnapshot` -> `buildInterfaceAddressSnapshots` ->
+  `netlink.AddrList(FAMILY_ALL)`, which enumerates EVERY kernel address
+  with NO scope/flag/dynamic filtering — so DHCP/DHCPv6-learned addresses
+  were ALREADY captured and scoped by the deny. Reverted the no-op 3-source
+  refactor (and the injected-seam that enabled the misleading test) so
+  `BuildZoneHostInboundViews` code is byte-identical to master. CORRECTED
+  master's false doc comment (which claimed "a DHCP-only interface yields
+  an empty address set -> fail-open") in zones.go, daemon_nft.go, and
+  pkg/daemon/README.md to state that DHCP/DHCPv6 addresses ARE captured via
+  the live snapshot, plus the lease-change refresh path. REPLACED the fake
+  test with `TestBuildZoneHostInboundViewsScopesKernelLearnedAddr`, which
+  drives the REAL production path (`BuildZoneHostInboundViews` ->
+  `buildInterfaceSnapshots` -> `AddrList`) using the loopback interface as
+  a kernel address absent from the static config (modeling DHCP), with no
+  fake provider and no root. It asserts the kernel-learned address IS
+  scoped — a fail-on-revert guard against a future filter regression.
+- **File(s)**: pkg/dataplane/userspace/zones.go (comment only — code
+  reverted to master), pkg/dataplane/userspace/zones_host_inbound_test.go,
+  pkg/daemon/daemon_nft.go (comment), pkg/daemon/README.md
+- **Validation**: `go build ./...`; `go test ./pkg/dataplane/...
+  ./pkg/daemon/...` green. Verified empirically: the new real-path test
+  PASSES on master-equivalent code (proving master already scopes a
+  config-absent kernel address); a destructive probe that drops the live
+  snapshot loop turns it RED (untrust loses 127.0.0.1/::1) while the new
+  test isolates the dynamic-address property — restored byte-identical.
+
 ## 2026-06-26 — #3193 persistent-nat SHOW: report the three-way permit mode
 
 - **Timestamp**: 2026-06-26

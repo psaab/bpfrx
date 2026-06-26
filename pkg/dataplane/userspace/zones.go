@@ -55,12 +55,31 @@ func hostInboundLifelineInterface(name string) bool {
 // addresses (#3172, resolved from config so they scope the deny on the backup
 // node too, where the VIP is not yet live on the kernel interface), with
 // management/cluster-control lifeline interfaces (fxp0 / em0 / fab*) excluded
-// from the address set. A zone
-// that declared NO host-inbound-traffic stanza is omitted entirely (admit-all
-// preserved — zero regression). A configured zone with no resolvable static
-// address (e.g. a DHCP-only interface) yields an empty address set; the daemon
-// emits no deny for it (cannot scope a deny without an address — fail-open is
-// the safe direction for a lifeline-adjacent feature).
+// from the address set.
+//
+// Address completeness (#3224 — non-reproducing): the snapshot builder resolves
+// each interface's addresses through buildLinkSnapshot -> AddrList(FAMILY_ALL),
+// which enumerates EVERY kernel address with no scope/flag/dynamic filtering.
+// So DHCP / DHCPv6-learned addresses are captured exactly like static ones —
+// a DHCP-only interface with a live lease yields a NON-empty address set and IS
+// scoped by the deny. (xpfd disables IPv6 RA on every managed interface in
+// pkg/networkd, so DHCPv6 is the only IPv6 dynamic-address path and the same
+// snapshot captures it; SLAAC is not a separate case.) The deny is also
+// re-rendered on every DHCP/DHCPv6 lease change on a dataplane interface
+// (onDHCPAddressChange -> dhcpLeaseChangeRequiresRecompile -> applyConfig ->
+// applyHostInboundFilter), so a renewed/flapped lease re-scopes within one
+// reconcile pass. #3224 was filed on the premise that DHCP addresses fell out
+// of scope (FAIL OPEN); that does not reproduce because the live snapshot has
+// always carried them — see TestBuildZoneHostInboundViewsScopesKernelLearnedAddr,
+// which exercises this real path with a config-absent kernel address.
+//
+// A zone that declared NO host-inbound-traffic stanza is omitted entirely
+// (admit-all preserved — zero regression). The only no-address case left is a
+// configured zone whose interfaces have neither a static config address nor any
+// live kernel address yet (e.g. a DHCP WAN before its first lease, or a backup
+// node before VIP install): it yields an empty address set, the daemon emits no
+// deny for it, and it self-heals once an address appears because the
+// lease-change / commit paths re-render.
 func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 	if cfg == nil || len(cfg.Security.Zones) == 0 {
 		return nil
