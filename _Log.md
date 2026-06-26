@@ -1,3 +1,19 @@
+## 2026-06-25 — #3120: IPv6 screen ext-header walk continues past Fragment header
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed the IPv6 extension-header walk in the screen
+  extractor so a FIRST fragment (`Fragment → Destination-Options → TCP`)
+  no longer hides the TCP header from the TCP-flag screens / SYN-cookie
+  flood challenge. The `NEXTHDR_FRAGMENT` arm now continues the bounded
+  walk past the 8-byte fragment header for fragment offset == 0 instead
+  of unconditionally `break`ing; a non-first fragment (offset > 0) still
+  stops (no L4 here — #2344/#3064). Added two Rust tests (frag→dest-opts
+  →TCP first fragment extracts seq/MSS; non-first fragment stays flowless)
+  — fail-on-revert verified RED→GREEN. Updated module doc + frame README.
+- **File(s)**: userspace-dp/src/screen/extract.rs,
+  userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/frame/README.md
+
 ## 2026-06-25 — #3108: policy simulators reject invalid protocol tokens
 
 - **Timestamp**: 2026-06-25
