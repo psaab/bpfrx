@@ -648,12 +648,19 @@ fn update_snapshot_binding_plan_key(hasher: &mut Sha256, snapshot: &ConfigSnapsh
         // the planner would actually produce a different layout. For a nonzero
         // snapshot the resolved value equals the raw field (sysfs is not read), so
         // the key is byte-identical to the pre-#3007 hash for the normal case.
+        //
+        // #3175: for an ORPHAN VLAN child (parent NOT a candidate) the layout
+        // re-keys onto the parent's hardware queue count, so `plan_key_rx_queues`
+        // hashes `rx_queue_count(parent)` here too — otherwise the child's lone
+        // software-queue count is hashed and an out-of-band `ethtool -L <parent>`
+        // would not bump the key. The normal VLAN case (parent IS a candidate)
+        // and physical ifaces keep the #3007 `effective_rx_queues` behavior.
         let resolved_linux_name = if iface.linux_name.is_empty() {
             linux_ifname(&iface.name)
         } else {
             iface.linux_name.clone()
         };
-        let rx_queues = effective_rx_queues(iface.rx_queues, &resolved_linux_name);
+        let rx_queues = plan_key_rx_queues(snapshot, iface, &resolved_linux_name);
         hash_update(
             hasher,
             &format!(
@@ -839,6 +846,38 @@ fn snapshot_has_parent_candidate(snapshot: &ConfigSnapshot, parent: &str) -> boo
         // child that happens to share the name string.
         p_linux == parent && vlan_child_parent_netdev(p, &p_linux).is_none()
     })
+}
+
+/// #3175: resolve the rx_queue count the PLAN KEY must hash for `iface`,
+/// mirroring exactly what `replan_queues`' candidate loop feeds the LAYOUT.
+///
+/// For an ORPHAN VLAN child — a VLAN unit whose physical parent is NOT itself a
+/// binding candidate — `replan_queues` re-keys the child onto its parent netdev
+/// and uses the parent's HARDWARE queue count (`rx_queue_count(parent)`), never
+/// the child's lone software queue. The plan-key loop previously hashed the
+/// child's own `effective_rx_queues`, so an out-of-band `ethtool -L <parent>
+/// combined N` (no config commit) left the key unchanged → same-plan-skip →
+/// stale layout. Hash the parent's count for the orphan case so the key follows
+/// the layout, single-sourcing the resolution exactly as #3007 unified the
+/// `rx_queues == 0` sysfs fallback.
+///
+/// The NORMAL VLAN case (parent IS a candidate) and physical/non-VLAN ifaces are
+/// unchanged: the layout drops the normal VLAN child (it is covered by the
+/// parent's own physical key entry), and physical ifaces use
+/// `effective_rx_queues` exactly as before.
+pub(crate) fn plan_key_rx_queues(
+    snapshot: &ConfigSnapshot,
+    iface: &InterfaceSnapshot,
+    resolved_linux_name: &str,
+) -> usize {
+    if let Some(parent) = vlan_child_parent_netdev(iface, resolved_linux_name) {
+        if !snapshot_has_parent_candidate(snapshot, parent) {
+            // Orphan VLAN child: the layout re-keys onto the parent's hardware
+            // queue count. Hash the same value so the key follows the layout.
+            return rx_queue_count(parent);
+        }
+    }
+    effective_rx_queues(iface.rx_queues, resolved_linux_name)
 }
 
 pub(crate) fn replan_queues(
