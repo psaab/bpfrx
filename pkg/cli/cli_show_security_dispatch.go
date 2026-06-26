@@ -272,6 +272,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		}
 
 		schedActive, haveSched := c.policySchedulerActiveState()
+		// #3063: render the detail Index from the span-accumulated runtime
+		// policy-ID namespace so it matches the RT_FLOW/event log policy ID.
+		runtimeIDs := dpuserspace.RuntimePolicyIDs(cfg)
 		policySetID := uint32(0)
 		if !globalOnly {
 			for _, zpp := range cfg.Security.Policies {
@@ -293,7 +296,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					case 2:
 						action = "reject"
 					}
-					ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+					ruleID := runtimePolicyIndex(runtimeIDs, policySetID, uint32(i))
 					// Junos: Policy: <name>, State: enabled, Index: <N>, Scope Policy: 0, Sequence number: <N>
 					// #3062: a scheduler-inactive policy reports State: inactive.
 					state := policyDetailState(pol.SchedulerName, schedActive, haveSched)
@@ -331,7 +334,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 				case 2:
 					action = "reject"
 				}
-				ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+				ruleID := runtimePolicyIndex(runtimeIDs, policySetID, uint32(i))
 				// Junos global: Policy: <name>, State: enabled, Index: <N>, Scope Policy: 0, Sequence number: <N>
 				// #3062: a scheduler-inactive global policy reports State: inactive.
 				state := policyDetailState(pol.SchedulerName, schedActive, haveSched)

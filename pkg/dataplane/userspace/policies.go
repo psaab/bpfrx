@@ -126,6 +126,7 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 type policyRuleSlot struct {
 	PolicySetID uint32
 	RuleIndex   uint32 // start index within the policy set's 256-slot namespace
+	SliceIndex  uint32 // raw position within the set's policy slice (display key)
 	Span        uint32 // expansion slots consumed (>=1)
 	FromZone    string
 	ToZone      string
@@ -134,6 +135,37 @@ type policyRuleSlot struct {
 
 func (s policyRuleSlot) policyID() uint32 {
 	return s.PolicySetID*dataplane.MaxRulesPerPolicy + s.RuleIndex
+}
+
+// RuntimePolicyIDs returns the span-accumulated runtime/RT_FLOW policy ID for
+// every configured policy, keyed by [policySetID, sliceIndex] where policySetID
+// is the zone-pair set index (global policies occupy set len(Policies)) and
+// sliceIndex is the raw position within that set's policy slice — exactly the
+// (policySetID, i) loop variables the read-only show surfaces already track.
+//
+// The IDs are computed by walkPolicyRuleSlots, the same SSOT that assigns
+// PolicyRuleSnapshot.PolicyID on the dataplane write side, so a display surface
+// keying off this lookup prints the identical numeric ID the RT_FLOW/event path
+// logs (#3063). Before this, the CLI policy-detail Index used the raw ordinal
+// policySetID*MaxRulesPerPolicy + i, which does NOT advance by application-set
+// expansion, so the displayed Index drifted from the logged policy ID after a
+// multi-application policy and an operator cross-referencing a policy-deny log
+// landed on the wrong row.
+//
+// Returned IDs are display identity only; they are NOT the counter handle. The
+// per-policy counter store is name-keyed and ReadPolicyCounters takes the raw
+// ordinal handle that round-trips through policyRuleIDForCounter — callers MUST
+// keep passing the raw ordinal to ReadPolicyCounters. On a config that would
+// overflow MaxRulesPerPolicy the walk stops early and the partial map omits the
+// offending entries; a caller falls back to the raw ordinal for any missing key
+// (such a config cannot be applied anyway, so the dataplane never enforces it).
+func RuntimePolicyIDs(cfg *config.Config) map[[2]uint32]uint32 {
+	out := make(map[[2]uint32]uint32)
+	_ = walkPolicyRuleSlots(cfg, func(slot policyRuleSlot) error {
+		out[[2]uint32{slot.PolicySetID, slot.SliceIndex}] = slot.policyID()
+		return nil
+	})
+	return out
 }
 
 // walkPolicyRuleSlots invokes fn for every configured policy in config order,
@@ -159,7 +191,7 @@ func walkPolicyRuleSlots(cfg *config.Config, fn func(slot policyRuleSlot) error)
 			continue
 		}
 		ruleIndex := uint32(0)
-		for _, pol := range zpp.Policies {
+		for sliceIdx, pol := range zpp.Policies {
 			if pol == nil {
 				continue
 			}
@@ -171,6 +203,7 @@ func walkPolicyRuleSlots(cfg *config.Config, fn func(slot policyRuleSlot) error)
 			if err := fn(policyRuleSlot{
 				PolicySetID: policySetID,
 				RuleIndex:   ruleIndex,
+				SliceIndex:  uint32(sliceIdx),
 				Span:        span,
 				FromZone:    zpp.FromZone,
 				ToZone:      zpp.ToZone,
@@ -183,7 +216,7 @@ func walkPolicyRuleSlots(cfg *config.Config, fn func(slot policyRuleSlot) error)
 		policySetID++
 	}
 	globalRuleIndex := uint32(0)
-	for _, pol := range cfg.Security.GlobalPolicies {
+	for sliceIdx, pol := range cfg.Security.GlobalPolicies {
 		if pol == nil {
 			continue
 		}
@@ -195,6 +228,7 @@ func walkPolicyRuleSlots(cfg *config.Config, fn func(slot policyRuleSlot) error)
 		if err := fn(policyRuleSlot{
 			PolicySetID: policySetID,
 			RuleIndex:   globalRuleIndex,
+			SliceIndex:  uint32(sliceIdx),
 			Span:        span,
 			FromZone:    "junos-global",
 			ToZone:      "junos-global",

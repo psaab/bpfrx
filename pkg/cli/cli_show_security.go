@@ -7,8 +7,24 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/policymatch"
 )
+
+// runtimePolicyIndex returns the span-accumulated runtime/RT_FLOW policy ID for
+// the policy at (policySetID, sliceIndex), used as the displayed detail `Index`
+// so it matches the numeric policy ID the RT_FLOW/event path logs (#3063). It
+// falls back to the raw ordinal policySetID*MaxRulesPerPolicy + sliceIndex when
+// the lookup has no entry (e.g. a config the dataplane would reject for
+// MaxRulesPerPolicy overflow), which is byte-identical to the pre-#3063 value.
+// This is a DISPLAY identity only — it is NOT the counter handle passed to
+// ReadPolicyCounters (that stays the raw ordinal; see policyRuleIDForCounter).
+func runtimePolicyIndex(ids map[[2]uint32]uint32, policySetID, sliceIndex uint32) uint32 {
+	if id, ok := ids[[2]uint32{policySetID, sliceIndex}]; ok {
+		return id
+	}
+	return policySetID*dataplane.MaxRulesPerPolicy + sliceIndex
+}
 
 func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) error {
 	if c.dp == nil || !c.dp.IsLoaded() {
@@ -91,6 +107,12 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 
 func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) error {
 	schedActive, haveSched := c.policySchedulerActiveState()
+	// #3063: the displayed Index must equal the runtime/RT_FLOW policy ID,
+	// which advances by application-set expansion. RuntimePolicyIDs mirrors the
+	// snapshot's PolicyID assignment so an operator cross-referencing a
+	// policy-deny log lands on the correct detail row even after a multi-app
+	// policy shifts the ID namespace.
+	runtimeIDs := dpuserspace.RuntimePolicyIDs(cfg)
 	policySetID := uint32(0)
 	seqNum := 1
 	for _, zpp := range cfg.Security.Policies {
@@ -110,7 +132,7 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 			case 2:
 				action = "reject"
 			}
-			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+			ruleID := runtimePolicyIndex(runtimeIDs, policySetID, uint32(i))
 			// #3062: reflect runtime scheduler state — a policy bound to a
 			// currently-inactive scheduler reports State: inactive (the
 			// dataplane is dropping its rule). Active/non-scheduled policies
@@ -164,8 +186,6 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 				}
 			}
 			seqNum++
-
-			_ = ruleID // available for future counter display
 		}
 		policySetID++
 		fmt.Println()
@@ -181,7 +201,7 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 			case 2:
 				action = "reject"
 			}
-			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+			ruleID := runtimePolicyIndex(runtimeIDs, policySetID, uint32(i))
 			// #3062: scheduler-inactive global policy reports State: inactive.
 			state := policyDetailState(pol.SchedulerName, schedActive, haveSched)
 			fmt.Printf("Policy: %s, action-type: %s, State: %s, Index: %d, Scope Policy: 0\n",
