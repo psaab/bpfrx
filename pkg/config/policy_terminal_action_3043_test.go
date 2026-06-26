@@ -166,3 +166,58 @@ func TestPolicyExactlyOneTerminalActionCommits(t *testing.T) {
 		t.Errorf("block policy action = %s, want deny", policyActionName(pol.Action))
 	}
 }
+
+// TestPolicyTerminalActionErrorNamesZonePair is the #3207 fail-on-revert
+// anchor: a zone-pair policy with no terminal action must produce an error
+// that NAMES the offending from/to-zone pair (not just the policy name).
+// Before #3207 the zone-pair loop called check("", pol) with an EMPTY scope,
+// so the message omitted the zone-pair context and a duplicate policy name
+// across zone-pairs was impossible to locate. Restoring the empty scope makes
+// the "from-zone trust to-zone untrust" assertion go RED.
+func TestPolicyTerminalActionErrorNamesZonePair(t *testing.T) {
+	cmds := []string{
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
+		"set security policies from-zone trust to-zone untrust policy audit match source-address any",
+		"set security policies from-zone trust to-zone untrust policy audit match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy audit match application any",
+		"set security policies from-zone trust to-zone untrust policy audit then log session-init",
+	}
+	tree := buildPolicyTree(t, cmds)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig accepted a zone-pair policy with no terminal action")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "from-zone trust to-zone untrust") {
+		t.Errorf("terminal-action error omits the zone-pair context; got %q", msg)
+	}
+	if !strings.Contains(msg, `"audit"`) {
+		t.Errorf("terminal-action error omits the policy name; got %q", msg)
+	}
+}
+
+// TestGlobalPolicyTerminalActionErrorNamesGlobal asserts the global-policy arm
+// of the #3207 context fix: a global policy with no terminal action names
+// "global" (not a zone-pair) so the operator can distinguish it from a
+// same-named zone-pair policy.
+func TestGlobalPolicyTerminalActionErrorNamesGlobal(t *testing.T) {
+	cmds := []string{
+		"set security policies global policy g match source-address any",
+		"set security policies global policy g match destination-address any",
+		"set security policies global policy g match application any",
+		"set security policies global policy g then count",
+	}
+	tree := buildPolicyTree(t, cmds)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig accepted a global policy with no terminal action")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "global policy") {
+		t.Errorf("terminal-action error omits the global scope; got %q", msg)
+	}
+	if !strings.Contains(msg, `"g"`) {
+		t.Errorf("terminal-action error omits the policy name; got %q", msg)
+	}
+}

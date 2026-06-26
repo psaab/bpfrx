@@ -122,6 +122,21 @@ combined N`, no config commit) bumps the key and forces a replan instead of
 taking the same-plan-skip. `plan_key_folds_sysfs_resolved_rx_queues_when_snapshot_is_zero`
 and `plan_key_for_nonzero_rx_queues_ignores_sysfs` pin both halves.
 
+For an ORPHAN VLAN child — a VLAN unit whose physical parent is NOT itself a
+binding candidate — the planner re-keys the child onto its parent netdev and
+uses the parent's HARDWARE queue count (`rx_queue_count(parent)`), never the
+child's lone software queue (#3091). The plan key must hash the SAME value, so
+`plan_key_rx_queues(snapshot, iface, linux_name)` is the single resolution path
+for the hash: for the orphan case it returns `rx_queue_count(parent)`, matching
+the layout; for the normal VLAN case (parent IS a candidate, child deduped onto
+it and covered by the parent's own physical key entry) and physical/non-VLAN
+ifaces it returns `effective_rx_queues(...)` exactly as #3007. Before #3175 the
+key hashed the child's own software-queue count, so an out-of-band `ethtool -L
+<parent> combined N` on the parent of an orphan VLAN child did NOT bump the key
+→ same-plan-skip → stale layout. `plan_key_folds_parent_sysfs_queues_for_orphan_vlan_child`
+and `plan_key_for_normal_vlan_child_ignores_parent_sysfs` pin the orphan re-key
+and the normal-case no-regression.
+
 The Rust planner does:
 
 ```rust

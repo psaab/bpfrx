@@ -1,3 +1,43 @@
+## 2026-06-26 — #3175 queue-planner: orphan VLAN child plan-key follows parent's rx_queues
+
+- **Timestamp**: 2026-06-26
+- **Action**: Follow-up to #3007/#3131/#3173. In
+  `update_snapshot_binding_plan_key` the plan-key loop hashed the CHILD's own
+  `effective_rx_queues` for an ORPHAN VLAN child (a VLAN unit whose physical
+  parent is NOT itself a binding candidate), but `replan_queues`' LAYOUT loop
+  re-keys that child onto its parent using `rx_queue_count(parent)`. So an
+  out-of-band `ethtool -L <parent> combined N` (no config commit) on the parent
+  of an orphan VLAN child did NOT bump the plan key → same-plan-skip → stale
+  layout. Added `plan_key_rx_queues(snapshot, iface, linux_name)` as the single
+  resolution path for the hash: orphan VLAN child → `rx_queue_count(parent)`
+  (mirrors the layout); normal VLAN child (parent IS a candidate) and
+  physical/non-VLAN ifaces → `effective_rx_queues(...)` exactly as #3007 (no
+  change). The #3131 VLAN-child-dedup-onto-physical-parent and the min-collapse
+  are untouched. Two new fail-on-revert tests
+  (`plan_key_folds_parent_sysfs_queues_for_orphan_vlan_child`,
+  `plan_key_for_normal_vlan_child_ignores_parent_sysfs`); reverting the orphan
+  branch turns the orphan test RED (keys collide) while the normal/nonzero tests
+  stay green. `cargo build --release` + `cargo test --release` green (plan_key
+  7/7, queue_planner 13/13).
+- **File(s)**: userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md
+
+## 2026-06-26 — #3207 policy terminal-action validation error: thread zone-pair context
+
+- **Timestamp**: 2026-06-26
+- **Action**: The zone-pair arm of `validatePolicyTerminalActionStrict`
+  called `check("", pol)` with an EMPTY scope, so a missing/conflicting
+  terminal-action error named only the policy (no from/to-zone). With
+  duplicate policy names across zone-pairs the offending policy was hard to
+  locate. Threaded the real scope `fmt.Sprintf("from-zone %s to-zone %s",
+  zpp.FromZone, zpp.ToZone)` (the established convention in
+  compiler_policy_then.go / compiler_policy_match.go) into the error; global
+  policies keep "global". Pure message/context improvement — the set of
+  accepted/rejected configs is unchanged. Added two fail-on-revert tests
+  (zone-pair names the pair + policy; global names "global" + policy).
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/policy_terminal_action_3043_test.go
+
 ## 2026-06-26 — #3200 host-inbound unknown/typo token: commit validation + both-layer fail-closed
 
 - **Timestamp**: 2026-06-26
