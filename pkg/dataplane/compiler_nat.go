@@ -691,6 +691,14 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					}
 				}
 
+				// #3229: validate destination-address-name (config compat)
+				if rule.Match.DestinationAddressName != "" {
+					if _, ok := result.AddrIDs[rule.Match.DestinationAddressName]; !ok {
+						slog.Warn("DNAT destination-address-name not found in address-book",
+							"rule", rule.Name, "name", rule.Match.DestinationAddressName)
+					}
+				}
+
 				// Parse match destination address
 				if rule.Match.DestinationAddress == "" {
 					slog.Warn("DNAT rule has no match destination-address",

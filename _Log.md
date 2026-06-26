@@ -33,6 +33,112 @@
   snapshot loop turns it RED (untrust loses 127.0.0.1/::1) while the new
   test isolates the dynamic-address property — restored byte-identical.
 
+## 2026-06-26 — #3229 dest-NAT: `match destination-address-name` (address-book reference)
+
+- **Timestamp**: 2026-06-26
+- **Action**: Added `destination-address-name` support to source AND
+  destination NAT, mirroring the #2416 `source-address-name` mechanism
+  exactly. New `DestinationAddressName` field on `NATMatch`
+  (`pkg/config/types_security.go`); parsed in both the source and dest NAT
+  rule blocks of `pkg/config/compiler_nat.go`; schema leaf added to both
+  match blocks in `pkg/config/schema_security.go`. Resolution:
+  `appendNATDestinationAddressName` (`pkg/dataplane/userspace/nat.go`)
+  expands the name via the same `resolveUserspaceAddressBookEntry` expander
+  the policy + source-address-name paths use and feeds the resolved prefixes
+  into the existing destination list — no new wire field (each resolved DNAT
+  host installs its own exact-host snapshot row). Called from both
+  `buildSourceNATSnapshots` and `buildDestinationNATSnapshots`. Commit-time
+  reject: `validateNATSourceAddressNameReferencesStrict`
+  (`pkg/config/compiler_validate_strict.go`) extended to gate BOTH the source
+  and destination name leaves; lenient load/peer-sync downgrades to a warning
+  (#1960) and the dataplane fails closed (unknown name = unparseable token =
+  matches nothing). Warn-only parity check also added to the retired-eBPF
+  `pkg/dataplane/compiler_nat.go`.
+- **File(s)**: pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/compiler_nat.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/compiler_nat.go,
+  pkg/config/compiler_nat_dest_address_name_3229_test.go,
+  pkg/dataplane/userspace/nat_dest_address_name_3229_test.go,
+  docs/feature-gaps.md, docs/config-schema.md
+- **Tests**: Go `pkg/config` (parse both SNAT/DNAT, reject undefined both,
+  lenient-warns) + `pkg/dataplane/userspace` (resolve DNAT, literal+name
+  union, unknown fail-closed, resolve in source builder). Fail-on-revert:
+  neutralizing the dest-builder `appendNATDestinationAddressName` call turned
+  `TestBuildDestinationNATSnapshotsResolvesDestinationAddressName` RED (empty
+  destination list, rule dropped); restored byte-identical. Rust matcher
+  unchanged (names resolve to literals on the Go side, flow through the
+  existing `destination_address` snapshot field).
+## 2026-06-26 — #3230 screen icmp/udp flood + port-scan + ip-sweep default thresholds
+
+- **Timestamp**: 2026-06-26
+- **Action**: Sibling of #3024. When icmp-flood, udp-flood, tcp port-scan,
+  or ip ip-sweep was enabled WITHOUT an explicit threshold, the screen
+  compiled to threshold 0 and the Rust screen engine's `threshold > 0`
+  gate silently skipped the check. Added Junos-aligned parse-time defaults
+  in `compileScreen` so an enabled-but-unset check arms at a nonzero rate:
+  icmp/udp flood = 1000 pps, port-scan/ip-sweep = 10 distinct destinations
+  (Junos's detection count; this engine reads the threshold as a count over
+  a fixed 10s window, not Junos's 5000us window). Explicit thresholds are
+  preserved; unconfigured checks stay off (0). New constants
+  `defaultICMPFloodThreshold`/`defaultUDPFloodThreshold`/
+  `defaultPortScanThreshold`/`defaultIPSweepThreshold`.
+- **File(s)**: pkg/config/compiler_security.go,
+  pkg/config/parser_security_test.go (TestScreenFloodScanDefaultThresholds,
+  TestScreenFloodScanExplicitThresholdsPreserved,
+  TestScreenFloodScanNotConfiguredStaysOff),
+  docs/syn-cookie-flood-protection.md, _Log.md
+- **Validation**: go build ./...; go test ./pkg/config/ ./pkg/dataplane/...
+  all green. Fail-on-revert: removing the four defaulting blocks turned
+  TestScreenFloodScanDefaultThresholds RED (icmp=0, udp=0, port-scan=0,
+  ip-sweep=0); restored byte-identical → green.
+
+## 2026-06-26 — #3228 dest-NAT: reject a partial-valid destination-address list at commit
+
+- **Timestamp**: 2026-06-26
+- **Action**: `validateDestinationNATAddressesStrict`
+  (`pkg/config/compiler_validate_strict.go`) used an `anyGood` break — it
+  passed commit if AT LEAST ONE `match destination-address` parsed. The
+  snapshot builder (`buildDestinationNATSnapshots`,
+  `pkg/dataplane/userspace/nat.go`) skips malformed entries PER-ENTRY, so a
+  mixed list like `[ 192.0.2.1 web-server ]` committed clean while
+  `web-server` was silently dropped from the DNAT table (traffic to it never
+  translated). Replaced the `anyGood` break with a per-entry check that
+  mirrors the builder's exact skip predicate (`natCIDRIPPart` CIDR strip,
+  then empty / `net.ParseIP` test): the gate now rejects the rule on ANY
+  unparseable entry, naming the offending token. An all-valid list still
+  compiles byte-identical; the tolerant load / peer-sync path still
+  downgrades to a `destination-nat address` warning (#1960). Inverted the
+  stale `TestDNATPartialValidDestinationAccepted` test to
+  `TestDNATPartialValidDestinationRejected` and added
+  `TestDNATAllValidDestinationListAccepted`. Fail-on-revert: restoring the
+  `anyGood` break turns `TestDNATPartialValidDestinationRejected` RED while
+  the all-valid test stays GREEN.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_dnat_address_test.go, docs/userspace-dnat-plan.md,
+  _Log.md
+
+## 2026-06-26 — #2921 WG TUN-origin egress: stale captured outer_mtu after same-engine refresh
+
+- **Timestamp**: 2026-06-26
+- **Action**: The WG control thread is handed the resolved underlay
+  `outer_mtu` BY VALUE at spawn (TUN-origin egress guard). The engine
+  reuse identity (`wg_identity_unchanged`) ignores the transport table,
+  resolved egress ifindex, and egress MTU, so a refresh changing only the
+  underlay route/table/MTU reused the engine Arc, skipped the stale prune,
+  and kept the stale spawn-time MTU — while the transit/forwarded path
+  re-resolves per snapshot. Same tunnel, different outer MTU by packet
+  origin → configuration-dependent tail loss. Fix: capture the resolved
+  MTU in `WgControlEntry.spawned_outer_mtu`; add an `outer_mtu_changed`
+  stale reason to the apply-time prune (`spawn_wg_control_threads`)
+  comparing a fresh `resolve_wg_outer_mtu` against the captured value.
+  Restart only on divergence (apply cadence, never per-packet); unchanged
+  case byte-identical. Two fail-on-revert tests in coordinator/tests.rs
+  (`wg2921_outer_mtu_change_restarts_control_thread` RED on revert,
+  `wg2921_unchanged_outer_mtu_keeps_control_thread` stays green).
+- **File(s)**: userspace-dp/src/afxdp/types/runtime.rs,
+  userspace-dp/src/afxdp/coordinator/tunnel_supervision.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs, docs/wireguard-interop.md
 ## 2026-06-26 — #3193 persistent-nat SHOW: report the three-way permit mode
 
 - **Timestamp**: 2026-06-26

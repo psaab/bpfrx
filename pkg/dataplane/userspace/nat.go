@@ -49,6 +49,33 @@ func appendNATSourceAddressName(cfg *config.Config, sourceAddrs []string, name s
 	return append(sourceAddrs, name)
 }
 
+// appendNATDestinationAddressName resolves a NAT rule's `match
+// destination-address-name <book-entry>` into concrete destination prefixes and
+// appends them to the rule's destination list (#3229). It is the destination
+// twin of appendNATSourceAddressName and shares the same address-book expander
+// (resolveUserspaceAddressBookEntry) the security-policy and source-address-name
+// paths use, so a name-scoped destination matches the same prefixes a literal
+// `match destination-address` would.
+//
+// Fail-closed on an unknown / unresolvable name: the raw token is appended so
+// the destination list stays NON-EMPTY (the rule does not collapse to no
+// destination = skip), while the token itself fails IP parse downstream and
+// contributes no installed table entry — the rule then matches NOTHING rather
+// than broadening. Backstopped at commit by
+// validateNATSourceAddressNameReferencesStrict, which also gates
+// destination-address-name.
+func appendNATDestinationAddressName(cfg *config.Config, destAddrs []string, name string) []string {
+	if name == "" {
+		return destAddrs
+	}
+	if values, ok := resolveUserspaceAddressBookEntry(cfg, name); ok && len(values) > 0 {
+		return append(destAddrs, values...)
+	}
+	// Unknown / empty book entry: keep the list non-empty but unmatchable
+	// (fail-closed). The raw name cannot parse as an IP.
+	return append(destAddrs, name)
+}
+
 func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32) []SourceNATRuleSnapshot {
 	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
 		return nil
@@ -74,6 +101,11 @@ func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32
 			if len(destAddrs) == 0 && rule.Match.DestinationAddress != "" {
 				destAddrs = append(destAddrs, rule.Match.DestinationAddress)
 			}
+			// #3229: resolve `match destination-address-name` the same way the
+			// source path resolves source-address-name — without this a
+			// name-scoped destination constraint published an EMPTY list =
+			// match-any destination (fail-open).
+			destAddrs = appendNATDestinationAddressName(cfg, destAddrs, rule.Match.DestinationAddressName)
 			var poolAddresses []string
 			var portLow, portHigh uint16
 			var persistentNAT bool
@@ -276,6 +308,21 @@ func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]u
 			if len(destAddrs) == 0 && rule.Match.DestinationAddress != "" {
 				destAddrs = append(destAddrs, rule.Match.DestinationAddress)
 			}
+			// #3229: `match destination-address-name <book-entry>` selects the
+			// translated destination by an address-book reference instead of a
+			// literal prefix. It was parsed into DestinationAddressName but never
+			// resolved into the destination list the DNAT table is keyed on, so a
+			// name-scoped DNAT rule installed NO table entry (silently dropped).
+			// Resolve the name to its concrete prefixes via the same address-book
+			// expander the source path uses (appendNATDestinationAddressName).
+			// Each resolved host installs its own table entry below; a non-host
+			// prefix is stripped to its network address like a literal CIDR
+			// destination. On an unknown name the raw token is appended: it
+			// cannot parse as an IP and is skipped in the emit loop, so the rule
+			// matches NOTHING (fail-closed). The commit-time strict gate
+			// (validateNATSourceAddressNameReferencesStrict) makes the typo
+			// operator-visible.
+			destAddrs = appendNATDestinationAddressName(cfg, destAddrs, rule.Match.DestinationAddressName)
 			if len(destAddrs) == 0 {
 				continue
 			}
