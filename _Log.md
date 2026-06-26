@@ -1,3 +1,21 @@
+## 2026-06-26 — #2898 direct-mode GARP/NA burst follow-up loop gated on ownership
+
+- **Timestamp**: 2026-06-26
+- **Action**: `daemon.directSendGARPs` now captures `directAnnounceSeq[rgID]`
+  at burst start and threads a `directBurstStillValid(rgID, seq)` predicate
+  (true only while `directVIPOwned[rgID]` AND the sequence is unchanged) into
+  the gated cluster burst senders via new `directGARPBurstFn`/`directNABurstFn`
+  seams. An abdication or a newer announce now stops the inner 50ms follow-up
+  loop instead of re-poisoning neighbor caches for a VIP it no longer owns —
+  the direct-mode sibling of #2867/#2894. The first (immediate) frame stays
+  unconditional; only follow-ups are gated. Predicate holds the announce/VIP
+  locks only momentarily, never across a sleep. Added
+  `pkg/daemon/direct_garp_gate_test.go` (recorder-based abdicate-stops +
+  full-burst-while-owned + predicate transitions; fail-on-revert verified —
+  abdicate test goes RED to 18 frames against the ungated nil predicate).
+- **File(s)**: pkg/daemon/daemon_ha_vip.go,
+  pkg/daemon/direct_garp_gate_test.go, docs/bugs.md, _Log.md
+
 ## 2026-06-26 — #2940 VRRP strict-VIP: force GARP/NA on unsuppress edge while MASTER
 
 - **Timestamp**: 2026-06-26
