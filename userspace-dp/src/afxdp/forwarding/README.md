@@ -152,8 +152,20 @@ classification covers the common Junos `system-services` (ssh, ping, dns,
 dhcp/dhcpv6, ike, ntp, snmp, ...) and `protocols` (ospf, bgp,
 router-discovery, ...) names; `system-services all` / `any-service`
 short-circuit to a full admit; an unrecognised token contributes nothing
-(fail-closed). ICMP-based services (`ping`, `router-discovery`) admit at
-L4-protocol granularity, not ICMP sub-type.
+(fail-closed). ICMP-based services (`ping`, `router-discovery`) admit echo /
+solicitation at L4-protocol granularity, not ICMP sub-type.
+
+**ICMP error / PMTUD control messages are always admitted (#3171).** Before
+the per-zone lookup, `host_inbound_admits` exempts ICMP/ICMPv6 *error* subtypes
+(`is_icmp_host_inbound_error`: ICMPv4 destination-unreachable/time-exceeded/
+parameter-problem, ICMPv6 type 1/2/3/4) regardless of whether the ingress zone
+lists `ping`. This mirrors the kernel `chain input` global ICMP-error accept
+(`pkg/daemon/daemon_nft.go`) so the embedded-ICMP / DNAT-to-self subset listed
+above — e.g. a PMTUD packet-too-big or traceroute time-exceeded landing on the
+XSK LocalDelivery path — is no longer fail-toward-dropped on a configured
+ping-less zone. ECHO-REQUEST (v4 type 8 / v6 type 128) is **not** in the error
+set, so a ping-less zone still drops echo. Keep `is_icmp_host_inbound_error` in
+lock-step with the kernel chain's `icmp`/`icmpv6` accept lines.
 
 **`protocols all` is scoped, NOT a blanket bypass (#3199).** In Junos
 `host-inbound-traffic protocols all` admits every supported ROUTING protocol

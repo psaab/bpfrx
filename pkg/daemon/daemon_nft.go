@@ -154,11 +154,13 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 //  2. meta l4proto { 50, 51 } accept — raw ESP/AH exemption for host-terminated
 //     IPsec (mirrors the userspace stage_ipsec_passthrough_check); the kernel
 //     XFRM stack decrypts before any host-inbound deny can apply.
-//  3. icmpv6 ND + PacketTooBig + dest-unreachable accept, icmp dest-unreachable
-//     accept — IPv6 Neighbor Discovery and v4/v6 PMTUD/error control messages
-//     are mandatory link operation, never a "service" exposure; accepted
-//     globally so a host-inbound set omitting `ping` does not black-hole
-//     PMTUD/ND/error delivery.
+//  3. icmpv6 ND + error/PMTUD accept, icmp error/PMTUD accept — IPv6 Neighbor
+//     Discovery and v4/v6 PMTUD/error control messages (dest-unreachable,
+//     packet-too-big, time-exceeded, parameter-problem) are mandatory link
+//     operation, never a "service" exposure; accepted globally so a host-inbound
+//     set omitting `ping` does not black-hole PMTUD/ND/error delivery. This set
+//     is mirrored by the userspace host-inbound exemption (#3171) so kernel and
+//     XSK LocalDelivery agree. Echo-request stays gated on the `ping` service.
 //  4. Per host-inbound-configured zone, per family with addresses:
 //     - if `system-services all` / `any-service`: <fam> daddr <addrs> accept
 //     (and no deny — the operator opened the zone to all services).
@@ -187,11 +189,19 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) stri
 	// enforcement.
 	rules = append(rules, "    meta l4proto { 50, 51 } accept")
 	// IPv6 ND + v4/v6 PMTUD/error control messages — accepted regardless of the
-	// host-inbound set so enforcement never breaks core L3 operation. icmpv6
-	// type 1 (destination-unreachable) + 2 (packet-too-big) carry v6 error /
-	// PMTUD signalling; 133-137 are Neighbor Discovery.
-	rules = append(rules, "    icmpv6 type { 1, 2, 133, 134, 135, 136, 137 } accept")
-	rules = append(rules, "    icmp type destination-unreachable accept")
+	// host-inbound set so enforcement never breaks core L3 operation. The ICMP
+	// error subtypes accepted here MUST stay in lock-step with the userspace
+	// host-inbound exemption (`is_icmp_host_inbound_error` in
+	// userspace-dp/.../forwarding/host_inbound.rs, #3171) so the kernel chain and
+	// the XSK LocalDelivery classifier agree on a configured ping-less zone.
+	// icmpv6 type 1 (destination-unreachable), 2 (packet-too-big, PMTUD), 3
+	// (time-exceeded), 4 (parameter-problem) carry v6 error/PMTUD/traceroute
+	// signalling; 133-137 are Neighbor Discovery. ICMPv4 destination-unreachable
+	// (3, also PMTUD frag-needed code 4), time-exceeded (11, traceroute) and
+	// parameter-problem (12) are the v4 error set. Echo-request is NOT here — it
+	// stays gated on the per-zone `ping` system-service.
+	rules = append(rules, "    icmpv6 type { 1, 2, 3, 4, 133, 134, 135, 136, 137 } accept")
+	rules = append(rules, "    icmp type { destination-unreachable, time-exceeded, parameter-problem } accept")
 
 	for _, v := range views {
 		emitHostInboundZone(&rules, v, "ip", v.V4Addrs)
