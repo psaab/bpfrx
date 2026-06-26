@@ -288,6 +288,33 @@ peer-synced config carrying a from-zone/to-zone `any` still boots — the rule w
 already inert, so a leniently-loaded config behaves exactly as before, just
 flagged (#1960 no-brick doctrine, same as #3066/#3055/#2401).
 
+**NAT rule-set `from`/`to` `interface`/`routing-instance` scope is rejected at
+commit (#3079, interim):** Junos NAT rule-sets scope matched traffic with a
+`from`/`to` clause taking one of `zone | interface | routing-instance`. xpf's
+compiler only ever extracted the `zone` children (`parseZoneList`,
+`compiler_nat.go`), so an `interface`- or `routing-instance`-scoped rule-set
+COMMITTED cleanly but had its scope SILENTLY DISCARDED: every caller
+(`compileNATSource` / `compileNATDestination` / `compileNATStatic`) falls back to
+the match-any wildcard `[]string{""}` when the returned zone list is empty, so the
+rule-set applied GLOBALLY — translated sessions leaked across the routing boundary
+the operator drew (a security/isolation failure, not a cosmetic gap).
+`validateNATRuleSetScopeAST` (`compiler_nat_scope.go`) hard-rejects such a
+rule-set at commit, naming the NAT kind, rule-set, direction, the unsupported
+keyword, and its value. It is an AST pre-walk in `compileExpanded` (not a typed
+validator) because the scope keyword is exactly what the compiler drops — by the
+time the typed `*Config` exists the information is gone — and because
+`SchemaValidate` returns nil for unknown keywords by design and cannot REJECT
+`from interface ...`. This is the INTERIM contract: full interface-/
+routing-instance-scoped NAT matching (preserve the scope on the typed
+`NATRuleSet`, enforce it per-flow) is a substantial dataplane change deferred to a
+follow-up. The gate touches ONLY the NAT rule-set from/to scope — not the
+supported `from`/`to` `zone` scope, the legitimate global (no-from/to) case, nor
+the unrelated `interface`/`routing-instance` keywords elsewhere (real interface
+config, VRF definitions). The tolerant load/peer-sync path downgrades to a warning
+(`lenientNATRuleSetScope`) so an already-persisted or peer-synced config an older
+binary silently accepted still boots — it stays applied globally (the pre-existing
+behaviour), now flagged (#1960 no-brick doctrine, same as #3018/#3055/#3060).
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`
