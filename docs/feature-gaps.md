@@ -168,6 +168,21 @@ User-based policy enforcement integrating with directory services. Not implement
 
 xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT (with pools, hit counters, source-address-name match, protocol-only match, port rewriting, multi-port matching), static 1:1, NAT64, and exemption rules. These are additional NAT features from the vSRX.
 
+> **DNAT `match destination-address` is exact-host only (#3029).** The
+> userspace `DnatTable` keys on an exact destination `IpAddr` (no prefix /
+> LPM match), so a destination-NAT rule whose `match destination-address` is
+> a multi-host prefix (e.g. `198.51.100.0/24`) cannot be honored — the
+> snapshot builder would strip the mask and translate only the network
+> address, silently bypassing every other host in the block. Such a rule is
+> **hard-rejected at commit** (`validateDestinationNATAddressesStrict`),
+> downgraded to a warning on the tolerant load / peer-sync path (#1960
+> no-brick). Single-host destinations (a bare IP, an explicit `/32`, or
+> `/128`) are accepted unchanged. Block-to-block destination NAT (the Junos
+> 1:1-offset / many:one block-mapping semantics) is a separate dataplane
+> feature — see #3029 (and the static-NAT block sibling #3031); honoring a
+> DNAT destination prefix needs a prefix-match table plus confirmed Junos
+> block-mapping semantics.
+
 > **NAT64 inbound policy matches the SYNTHETIC IPv6 destination, not the
 > real internal IPv4 host (#2358).** For inbound NAT64 flows the security
 > policy is evaluated against the synthetic IPv6 destination the v6 client

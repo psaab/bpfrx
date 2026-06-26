@@ -1720,6 +1720,227 @@ func policyMatchEmptyAppSetError(scope, policyName, name string) error {
 		where, name, name)
 }
 
+// policyMatchAddressBookResolves mirrors the runtime address resolver
+// resolveUserspaceAddressBookEntry + expandUserspacePolicyAddresses
+// (pkg/dataplane/userspace/capabilities.go) for a single address-book NAME
+// token. It returns nil when the name fully resolves to >= 1 literal address
+// (i.e. the runtime capability gate accepts it), or an error describing the
+// FIRST member that does not resolve / the empty expansion that makes the
+// gate refuse to arm.
+//
+// The fail-closed semantics are copied verbatim from the runtime so the commit
+// gate and the runtime gate cannot diverge:
+//
+//   - a defined `address` with a non-empty Value resolves (accumulates one
+//     literal); an `address` with an EMPTY value does NOT (the runtime returns
+//     false on addr.Value == "").
+//   - an `address-set` resolves only if EVERY direct and nested member resolves
+//     AND it has at least one member (resolvedAny). A dangling member (a name
+//     that is neither a defined address nor a defined set) fails the WHOLE set
+//     — the runtime's `if !resolve(member) { return false }`. A defined-but-
+//     EMPTY set fails (resolvedAny stays false).
+//   - a cycle short-circuits to "resolved" for the inner visit (the runtime's
+//     `if seenSets[ref] { return true }`), but a name that expands to ZERO
+//     literals (e.g. a pure self-cycle) is still rejected by the outer
+//     len(values) == 0 check that expandUserspacePolicyAddresses applies.
+//
+// `seen` is NOT backtracked (no defer delete), matching the runtime's
+// persistent seenSets — this is deliberately distinct from ExpandAddressSet
+// (predefined.go), whose visited map backtracks for a different purpose.
+func policyMatchAddressBookResolves(ab *AddressBook, name string) error {
+	seen := make(map[string]bool)
+	count := 0 // literal addresses accumulated (mirrors expanded slice length)
+	var firstErr error
+	var resolve func(ref string) bool
+	resolve = func(ref string) bool {
+		if ref == "" {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("empty member reference")
+			}
+			return false
+		}
+		if addr := ab.Addresses[ref]; addr != nil {
+			if addr.Value == "" {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("address %q has no configured prefix "+
+						"(it resolves to no usable address)", ref)
+				}
+				return false
+			}
+			count++
+			return true
+		}
+		set := ab.AddressSets[ref]
+		if set == nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("member %q is not a defined address or "+
+					"address-set", ref)
+			}
+			return false
+		}
+		if seen[ref] {
+			return true // cycle: already counted up the stack (mirror runtime)
+		}
+		seen[ref] = true
+		resolvedAny := false
+		for _, m := range set.Addresses {
+			if !resolve(m) {
+				return false
+			}
+			resolvedAny = true
+		}
+		for _, m := range set.AddressSets {
+			if !resolve(m) {
+				return false
+			}
+			resolvedAny = true
+		}
+		if !resolvedAny {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("address-set %q is empty "+
+					"(it expands to no addresses)", ref)
+			}
+			return false
+		}
+		return true
+	}
+	if !resolve(name) {
+		if firstErr == nil {
+			firstErr = fmt.Errorf("%q resolves to no address", name)
+		}
+		return firstErr
+	}
+	if count == 0 {
+		// Resolved true but accumulated no literal (e.g. a pure cycle):
+		// mirrors expandUserspacePolicyAddresses' len(values) == 0 reject.
+		return fmt.Errorf("address-set %q expands to no addresses", name)
+	}
+	return nil
+}
+
+// validatePolicyMatchAddressSetMembersStrict hard-rejects a security-policy
+// source-address / destination-address that names a DEFINED address-book entry
+// (an address or an address-set) the runtime address resolver cannot fully
+// resolve to >= 1 literal address (#3149; also folds the empty-address-set case
+// #3147). This is the address-book sibling of #2217
+// (validateApplicationSetMembersStrict, the application-set member gate) and the
+// #3144/#3146 application gate.
+//
+// The split with validatePolicyMatchAddressesStrict (#2008): that gate rejects a
+// WHOLLY UNDEFINED token (a typo that is neither a defined name, `any`, nor a
+// literal CIDR/IP). This gate handles the token that IS a defined book name but
+// whose (recursive) members dangle, or that is a defined-but-EMPTY set, or a
+// defined address with no prefix. In all of these the runtime
+// resolveUserspaceAddressBookEntry returns false / an empty expansion →
+// userspacePolicyAddressesSupported false → userspaceSupportsSecurityPolicies
+// false → the dataplane REFUSES to arm security policies. The operator got a
+// green commit (only a compiler_validate_warn.go warning) and a silently
+// DISARMED allow/deny path — the same commit/apply fail-open class #3144/#3146
+// close for applications.
+//
+// #3147 excluded-inversion safety: the resolver is applied to the SAME
+// SourceAddresses / DestinationAddresses lists the runtime gate checks,
+// regardless of the *-address-excluded flag. Rejecting an empty / dangling set
+// at COMMIT is therefore fail-CLOSED for the excluded case too: an empty
+// excluded set can never be committed, so it can never reach the dataplane and
+// invert to match-all (the historic fail-open this constraint guards against).
+//
+// Resolution mirrors resolveUserspaceAddressBookEntry +
+// expandUserspacePolicyAddresses EXACTLY (see policyMatchAddressBookResolves),
+// so the commit gate and the runtime gate cannot diverge. `any` / `any-ipv4` /
+// `any-ipv6` / the empty token and literal CIDR/IP tokens are not book names and
+// are passed through (the #2008 gate already covers literals). Covers zone-pair
+// + global policies and both source and destination, including the recursive
+// address-set-of-address-sets case.
+//
+// Strict on commit / commit-check (hard reject naming the policy scope, the
+// policy, the field, and the unresolved member). Lenient on load / peer-sync
+// (warn via opts.lenientPolicyMatchAddressSetMembers so an already-persisted or
+// peer-synced config an older binary accepted still BOOTS — #1960; the dataplane
+// independently refuses to arm such a policy, so a leniently-loaded bad config
+// is no worse off, now flagged). Same doctrine as lenientPolicyMatchApplications.
+func validatePolicyMatchAddressSetMembersStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	ab := cfg.Security.AddressBook
+	if ab == nil {
+		return nil
+	}
+	isDefinedName := func(tok string) bool {
+		if _, ok := ab.Addresses[tok]; ok {
+			return true
+		}
+		if _, ok := ab.AddressSets[tok]; ok {
+			return true
+		}
+		return false
+	}
+	checkToken := func(scope, policyName, field, tok string) error {
+		switch tok {
+		case "", "any", "any-ipv4", "any-ipv6":
+			return nil
+		}
+		// A wholly-undefined token / literal is the domain of
+		// validatePolicyMatchAddressesStrict (#2008); only inspect defined names.
+		if !isDefinedName(tok) {
+			return nil
+		}
+		if err := policyMatchAddressBookResolves(ab, tok); err != nil {
+			return policyMatchAddressSetError(scope, policyName, field, tok, err)
+		}
+		return nil
+	}
+	check := func(scope string, pol *Policy) error {
+		if pol == nil {
+			return nil
+		}
+		for _, addr := range pol.Match.SourceAddresses {
+			if err := checkToken(scope, pol.Name, "source-address", addr); err != nil {
+				return err
+			}
+		}
+		for _, addr := range pol.Match.DestinationAddresses {
+			if err := checkToken(scope, pol.Name, "destination-address", addr); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if err := check("", pol); err != nil {
+				return err
+			}
+		}
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if err := check("global", pol); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// policyMatchAddressSetError formats the #3149 / #3147 reject, naming the policy
+// scope, the policy, the match field, the unresolved book name, and the inner
+// resolution failure.
+func policyMatchAddressSetError(scope, policyName, field, name string, cause error) error {
+	where := fmt.Sprintf("policy %q", policyName)
+	if scope != "" {
+		where = fmt.Sprintf("%s policy %q", scope, policyName)
+	}
+	return fmt.Errorf(
+		"security policies %s match %s %q does not fully resolve: %w — the "+
+			"policy commits but the userspace dataplane then REFUSES to arm "+
+			"security policies (commit/apply split, fail-open) — define the "+
+			"missing address/address-set or fix the member (#3149)",
+		where, field, name, cause)
+}
+
 // reservedZoneNames is the set of tokens the dataplane / Junos grammar reserves
 // for a special context and that therefore must NEVER be the name of an
 // operator-defined `security zones security-zone <name>` (#3055). It is used
@@ -3174,6 +3395,32 @@ func validateDestinationNATAddressesStrict(cfg *Config) error {
 						"(every match destination-address is malformed: %s); "+
 						"the rule would commit but never translate any traffic",
 					rs.Name, rule.Name, strings.Join(destAddrs, ", "))
+			}
+			// #3029: a DNAT `match destination-address` that is a MULTI-HOST
+			// prefix (a CIDR with a non-host mask, e.g. 198.51.100.0/24) is
+			// silently narrowed to a single host. The snapshot builder
+			// (buildDestinationNATSnapshots) strips the `/mask` and emits an
+			// entry for the BASE address only, and the Rust DnatTable keys on
+			// an EXACT host IP (no prefix / LPM match) — so only the network
+			// address translates and every other host in the block bypasses
+			// DNAT entirely (silent under-translation). The dataplane has no
+			// prefix-match DNAT, and block-mapping semantics (1:1 offset vs
+			// many:one) are not settled, so REJECT the rule rather than commit a
+			// silently under-translating block. Single-host destinations (a bare
+			// IP, an explicit /32, or /128) are host masks and remain accepted
+			// unchanged. Reuses isHostMaskAddress, the same host-mask predicate
+			// the static-NAT path uses, so the family-specific mask check (32 vs
+			// 128) and the IPv4-mapped-IPv6 classification stay consistent.
+			for _, raw := range destAddrs {
+				if host, parsed := isHostMaskAddress(raw); parsed && !host {
+					return fmt.Errorf(
+						"destination-nat rule-set %q rule %q: match destination-address %q "+
+							"is a multi-host prefix; the dataplane DNAT match is exact-host "+
+							"only, so the rule would translate only the network address and "+
+							"silently bypass every other host in the block (use a /32 or /128 "+
+							"host address, or split the block into per-host rules)",
+						rs.Name, rule.Name, raw)
+				}
 			}
 		}
 	}
