@@ -1,3 +1,30 @@
+## 2026-06-25 — #2971: Surface A DDNS corrupt ownership state fail-closed
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed #2971 (codex-review-057 finding 057-03). The Surface A
+  router-record `SurfaceAManager` bypassed the #2650 degraded/quarantine
+  wrapper: `NewSurfaceAManager` called `loadDDNSState` directly and, on a load
+  error, logged a warning and proceeded with the returned EMPTY store — fail
+  OPEN. An empty trusted store made every configured scope look unowned, so the
+  next reconcile re-published EVERY scope (a write storm) — overwriting a
+  peer/manual owner and forgetting what to withdraw. Fix: load through the same
+  `loadStateOrDegrade` gate (added `degraded`/`degradedReason` to
+  `SurfaceAManager` + `SurfaceAStats`); `Reconcile` now fails CLOSED while
+  degraded (no publish/withdraw/save, error returned). A MISSING file (first
+  boot, incl. standalone nil-gate) stays non-degraded and publishes normally.
+  Surfaced as a CLI + gRPC `show services dynamic-dns` ALARM and a new
+  `xpf_ddns_surface_a_degraded` Prometheus gauge.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/surface_a_test.go,
+  pkg/cli/cli_show_services.go, pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_system.go,
+  pkg/ddns/README.md
+- **Validation**: go build ./...; go vet ./pkg/ddns/...; go test
+  ./pkg/ddns/... ./pkg/daemon/... ./pkg/api/... ./pkg/cli/... ./pkg/grpcapi/...
+  all green; new TestSurfaceACorruptStateFailsClosed +
+  TestSurfaceAUnsupportedVersionFailsClosed go RED when the constructor is
+  reverted to fail-open (the revert log shows the spurious "published record"
+  write); TestSurfaceAAbsentStateFirstBootStandaloneWrites stays green on revert.
+
 ## 2026-06-25 — #3117: security-policy `scheduler-name` added to set-schema
 
 - **Timestamp**: 2026-06-25
