@@ -170,7 +170,12 @@ impl WgEngine {
 
     /// Advance the T8 pacing anchor — called whenever the control loop
     /// ACTS on a T8 due-tick (keepalive send attempt, handshake
-    /// initiation, or skip), success or failure (AGY r3 G1).
+    /// initiation, or skip), success or failure (AGY r3 G1). Also called
+    /// by the handshake attempt machine's GIVE-UP branch (#2961) with the
+    /// give-up time, so a permanently-down persistent-keepalive peer
+    /// observes a full keepalive-interval cooldown before the next
+    /// `KeepaliveNoSession` attempt instead of re-firing a fresh 90s
+    /// window every tick.
     pub(crate) fn note_t8_attempt(&self, pubkey: &[u8; 32], now_ns: u64) {
         if let Some(peer) = self.peer_arc(pubkey) {
             peer.t8_last_attempt_ns.store(now_ns.max(1), Ordering::Relaxed);
