@@ -137,6 +137,36 @@ sync.
     the #2368 NA fail-closed discipline. Only opcode-2 replies are ever
     learned; ARP requests (opcode 1) classify `OtherArp` and never write
     the cache.
+  - **Own-IP anti-poison (`#2851` / `#3182`, RFC 826 / RFC 4861):** the
+    learn paths refuse to install a neighbor entry for an address the
+    router OWNS, so a host on the local link cannot teach us
+    `(ifindex, our_own_ip) -> attacker_mac`. The gate is the
+    `ForwardingState::owns_configured_ip(ip)` predicate, applied at three
+    sites BEFORE the cache write (so a rejected own-IP neither inserts nor
+    bumps `mac_change_epoch`):
+      - the ARP-reply arm and the NDP-NA arm of `stage_link_layer_classify`
+        (`poll_stages.rs`), and
+      - the **RX source-MAC learn path** `learn_dynamic_neighbor`
+        (`neighbor_dispatch.rs`, the #1787 learn reached via
+        `stage_parse_flow_and_learn`), which would otherwise cache
+        `(ingress_ifindex, flow.src_ip) -> src_mac` from a transit packet
+        whose source IP is spoofed to one of our own IPs.
+    **`owns_configured_ip` reads the NAT-DECOUPLED `configured_iface_v*`
+    set, NOT `local_v*` (`#3182`).** `local_v4`/`local_v6` exclude the IP of
+    any interface whose zone is an interface-mode-SNAT `to_zone`
+    (`nat_translated_local_exclusions` routes it into `interface_nat_v*`),
+    so under #2851 the router's own WAN/SNAT interface IP (e.g.
+    `reth0.80`'s `172.16.80.8`) was NOT protected and an unsolicited
+    ARP/NDP/RX-learn claiming it WAS cached. `configured_iface_v4`/
+    `configured_iface_v6` capture EVERY configured interface address
+    regardless of NAT role (populated in `populate_interfaces` BEFORE the
+    NAT-exclusion branch); the predicate OR-s in `local_v*` so the
+    late-stage static-NAT-external and DNAT-destination local-delivery
+    targets appended to `local_v*` keep their protection too. NAT-translated
+    POOL addresses are in neither set, so the gate stays scoped to addresses
+    the router actually owns. `local_v*` continues to drive the
+    `LocalDelivery` to-self disposition unchanged — only the anti-poison
+    predicate switched sets.
 - `neighbor.rs` — netlink neighbor monitor (`neigh_monitor_thread`),
   startup dump (`initial_neighbor_dump` / `process_dump_batch`), the
   on-demand resolver glue, and `worker::pin_current_thread`. The monitor

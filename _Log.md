@@ -1,3 +1,36 @@
+## 2026-06-26 — #3182 neighbor own-IP anti-poison: NAT-excluded interface IPs + RX learn path
+
+- **Timestamp**: 2026-06-26
+- **Action**: Follow-up to the merged #2851/#3180 own-IP anti-poison guard.
+  Two residuals. (1) `owns_configured_ip` reused the NAT-aware `local_v*` set,
+  which `nat_translated_local_exclusions` strips of any interface-mode-SNAT
+  `to_zone` interface IP (e.g. WAN `reth0.80` 172.16.80.8) — so an unsolicited
+  ARP/NDP claiming the router's own WAN IP was NOT rejected. Added a decoupled
+  `configured_iface_v4`/`configured_iface_v6` set on `ForwardingState`,
+  populated in `populate_interfaces` BEFORE the NAT-exclusion branch (every
+  configured interface address, regardless of NAT role). Switched
+  `owns_configured_ip` to read `configured_iface_v*` OR `local_v*` (the OR
+  keeps the late-stage static-NAT-external / DNAT-destination protections;
+  `local_v*` still drives `LocalDelivery` unchanged). (2) The #1787 RX
+  source-MAC learn path `learn_dynamic_neighbor` had NO own-IP guard; added
+  `if forwarding.owns_configured_ip(src_ip) { return; }` at the top, before the
+  dedup pre-check / `learn_pair_if_changed` insert, mirroring the ARP/NDP gate.
+  Legitimate non-own learning (ARP/NDP + RX) byte-identical, incl. the
+  #3048/#3169 `mac_change_epoch` bump on a real MAC change. Three new
+  fail-on-revert tests in poll_stages.rs
+  (`arp_nat_excluded_wan_ip_not_learned_3182`,
+  `ndp_nat_excluded_wan_ip_not_learned_3182`,
+  `rx_learn_own_wan_ip_rejected_3182`): reverting the guard to the NAT-excluded
+  `local_v*` set + removing the RX-learn guard turns all three RED while the
+  two #2851 tests stay GREEN. `cargo build --release` + `cargo test --release`
+  green (poll_stages 19/19 incl. 3 new + 2 #2851, neighbor 144/144,
+  forwarding 195/195).
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/neighbor_dispatch.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/README.md
+
 ## 2026-06-26 — #2845 WG PTB inner-MTU per-peer underlay
 
 - **Timestamp**: 2026-06-26

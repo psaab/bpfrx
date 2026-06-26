@@ -429,6 +429,20 @@ pub(super) fn learn_dynamic_neighbor(
     src_ip: IpAddr,
     src_mac: [u8; 6],
 ) {
+    // #3182: anti-poisoning own-IP gate on the #1787 RX source-MAC learn
+    // path, mirroring the #2851 ARP/NDP gate in poll_stages.rs. An attacker
+    // can spoof a transit packet whose SOURCE IP is one of the router's own
+    // configured interface IPs; never cache `(ingress_ifindex, our_own_ip)
+    // -> attacker_mac`. Driven from the NAT-decoupled
+    // `configured_iface_v*` set (via `owns_configured_ip`) so the
+    // NAT-excluded WAN/SNAT interface IP — the only forwarding-relevant
+    // own-IP overlap on this path — is rejected too. Runs BEFORE the
+    // dedup pre-check / `learn_pair_if_changed` insert so a rejected own-IP
+    // neither caches nor bumps `mac_change_epoch` (#3048/#3169). Genuine
+    // non-own neighbors are unaffected.
+    if forwarding.owns_configured_ip(src_ip) {
+        return;
+    }
     // #1787: stack array, no per-packet heap alloc. At most 2 keys:
     // the physical ingress ifindex plus the resolved logical (VLAN
     // sub-) ifindex when it differs. keys[1] stays an unused
