@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -58,7 +59,7 @@ func TestApplyConfigLockedReconcilesSNMPAuthorization(t *testing.T) {
 		opts:      Options{NoDataplane: true},
 	}
 
-	if err := d.applyConfigLocked(snmpDowngradeConfig()); err != nil {
+	if err := d.applyConfigLocked(context.Background(), snmpDowngradeConfig()); err != nil {
 		t.Fatalf("applyConfigLocked: %v", err)
 	}
 
@@ -108,7 +109,7 @@ func TestApplyConfigLockedReconcilesSNMPBeforeDataplaneAbort(t *testing.T) {
 		opts:      Options{NoDataplane: true},
 	}
 
-	err := d.applyConfigLocked(snmpDowngradeConfig())
+	err := d.applyConfigLocked(context.Background(), snmpDowngradeConfig())
 	if !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
 		t.Fatalf("applyConfigLocked error = %v, want early abort on "+
 			"ErrPolicySchedulerProtocolIncompatible (the early-return path "+

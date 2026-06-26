@@ -292,7 +292,7 @@ func TestApplyConfigLockedReconcilesFlowExporters(t *testing.T) {
 	}
 	t.Cleanup(d.stopFlowExporter)
 
-	if err := d.applyConfigLocked(flowSamplingConfig("127.0.0.1", 100)); err != nil {
+	if err := d.applyConfigLocked(context.Background(), flowSamplingConfig("127.0.0.1", 100)); err != nil {
 		t.Fatalf("applyConfigLocked: %v", err)
 	}
 

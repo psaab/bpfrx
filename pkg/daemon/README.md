@@ -219,6 +219,49 @@ never lock an operator out of a remote box it manages.
 - `commitFn` and `commitConfirmedFn` are passed to `pkg/cli` and
   `pkg/grpcapi`; they hold the apply semaphore across the commit + apply
   pair so concurrent committers serialize.
+- **Cancellable apply at coarse boundaries (#2926, follow-up to #2914/#2868).**
+  `applyConfigLocked(ctx, cfg)` checks `ctx.Err()` at three phase boundaries and
+  returns the ctx error at the next one rather than completing the netlink + FRR
+  reload + Rust control-socket sync: **C1** before the netlink reconcile phase
+  (step 0), **C2** before the dataplane apply / Rust sync push (step 2), and
+  **C3** before the FRR reload (step 3). The checks sit only at boundaries where
+  bailing leaves a consistent, restart-recoverable state — each major
+  side-effecting phase (and the RETH MAC / VIP / worker-rebind sequence between
+  C2 and C3) runs to completion once started, so the apply is never interrupted
+  mid-phase; on the next boot the boot-time apply re-runs the whole pipeline
+  against the active config, so a skipped tail converges. The cancellation
+  signal is a **dedicated daemon-stop** context (`applyCancelCtx` →
+  `d.applyCancelContext`), *not* the request/commit context: a daemon stop
+  aborts an in-flight commit/remediation apply (the eventengine remediation path
+  that #2914 made cancellable only at the pre-semaphore wait), but a mere request
+  cancellation (HTTP/gRPC client disconnect) is deliberately ignored after
+  `store.Commit` — aborting a promoted commit on a still-running daemon would
+  leave the store ahead of the dataplane/FRR with no automatic re-apply to
+  converge. The boot / DHCP / feed applies (`applyConfig`) and the
+  confirmed-rollback re-apply (`executeConfirmedRollback`) pass a non-cancellable
+  `context.Background()` so they always complete.
+  - **Wiring (the part that makes this actually fire on `systemctl stop`).**
+    `applyCancelCtx` deliberately does **not** return `d.daemonCtx`. In
+    production `cmd/xpfd` passes `context.Background()` into `Run`, and that
+    `context.Background()` is what `d.daemonCtx` holds — it is never cancelled
+    (the signal-cancellable context is a *local* `ctx` created later by
+    `signal.NotifyContext`). Returning `d.daemonCtx` would make C1/C2/C3 dead
+    code on a real stop. Instead `Run` creates `d.applyCancelContext` as a
+    **child of the SIGTERM/SIGINT signal context** (right after
+    `signal.NotifyContext`), so a real `systemctl stop xpfd` cancels it, and the
+    next coarse boundary observes `ctx.Err() != nil` and bails. `d.daemonCtx`
+    stays the (uncancelled) parent of the long-lived background goroutines —
+    flow-export/IPFIX relays, RPM probe-pin retry, the policy scheduler, cluster
+    comms, and the `dp.Start` dataplane runtime. Those are torn down
+    **explicitly** in the shutdown sequence, and the orderly teardown
+    (`logFinalStats` through `dp.Telemetry`, the HA `rg_active` clear through
+    `dp.HA()`, `dp.Teardown`) still needs the dataplane runtime live while it
+    runs — which is why the apply-abort signal is isolated from `d.daemonCtx`
+    rather than cancelling it. `Run` cancels `d.applyCancelContext` at the very
+    start of the shutdown sequence (before the explicit subsystem teardown), and
+    the teardown itself performs no `applyConfigLocked`, so the cancel aborts
+    only a genuinely in-flight commit/remediation apply, never the shutdown's own
+    cleanup.
 - FRR reload runs with a 15 s context timeout to keep `systemctl reload
   frr` from hanging. The systemd unit has `TimeoutStopSec=20` as a safety
   net.

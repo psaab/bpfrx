@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,7 +49,7 @@ func TestApplyConfigLocked_EmptyManagedSetSweepsStale(t *testing.T) {
 		ManagedInterfaces: nil,
 	})
 
-	if err := d.applyConfigLocked(cfg); err != nil {
+	if err := d.applyConfigLocked(context.Background(), cfg); err != nil {
 		t.Fatalf("applyConfigLocked: %v", err)
 	}
 
@@ -84,7 +85,7 @@ func TestApplyConfigLocked_EmptyManagedSetPreservesLifeline(t *testing.T) {
 	// the mgmt leaf so the lifeline files are exempt from the sweep.
 	d.networkd.SetProtectedResolver(func() map[string]bool { return map[string]bool{"fxp0": true} })
 
-	if err := d.applyConfigLocked(cfg); err != nil {
+	if err := d.applyConfigLocked(context.Background(), cfg); err != nil {
 		t.Fatalf("applyConfigLocked: %v", err)
 	}
 
@@ -120,7 +121,7 @@ func TestApplyConfigLocked_NetworkdWriteErrorFailsCommit(t *testing.T) {
 		}},
 	})
 
-	err := d.applyConfigLocked(cfg)
+	err := d.applyConfigLocked(context.Background(), cfg)
 	if err == nil {
 		t.Fatal("applyConfigLocked must fail when networkd.Apply cannot write a generated file (got nil — error swallowed)")
 	}

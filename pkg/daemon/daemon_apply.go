@@ -91,9 +91,51 @@ func (d *Daemon) bootstrapFromFile() error {
 func (d *Daemon) applyConfig(cfg *config.Config) {
 	_ = d.applySem.Acquire(context.Background(), 1)
 	defer d.applySem.Release(1)
-	if err := d.applyConfigLocked(cfg); err != nil {
+	// Boot / DHCP-callback / feed / config-poll applies must always run to
+	// completion (they are not request-bound and there is no operator waiting
+	// to cancel them), so the heavy pipeline is driven with a non-cancellable
+	// context — byte-identical to the pre-#2926 behavior.
+	if err := d.applyConfigLocked(context.Background(), cfg); err != nil {
 		slog.Warn("apply config failed", "err", err)
 	}
+}
+
+// applyCancelCtx returns the context whose cancellation aborts the heavy apply
+// pipeline (applyConfigLocked) at its coarse step boundaries (#2926). It is the
+// dedicated DAEMON-STOP context (d.applyCancelContext), deliberately NOT the
+// request/commit context AND deliberately NOT d.daemonCtx:
+//
+//   - A daemon stop MUST abort an in-flight commit/remediation apply at the
+//     next boundary so termination is not blocked behind netlink + an FRR
+//     reload + a Rust control-socket sync (the #2914/#2868 follow-up). On the
+//     next boot the daemon re-applies the active config in full, so skipping
+//     the tail of an apply during shutdown always converges.
+//   - A mere request cancellation (an HTTP/gRPC client disconnect, or a CLI
+//     commit whose context is canceled) MUST NOT abort the apply. By the time
+//     applyConfigLocked runs, store.Commit() has already promoted+persisted the
+//     new config; aborting the apply on a still-running daemon would leave the
+//     store ahead of the dataplane/FRR with no automatic re-apply to converge —
+//     a silent forwarding/policy divergence strictly worse than today. The
+//     request context still governs the contended applySem wait in the commit
+//     wrappers (a slow lock holder surfaces 503), exactly as before.
+//
+// Why a dedicated context and not d.daemonCtx: in production cmd/xpfd passes
+// context.Background() into Run, so d.daemonCtx is never cancelled — returning
+// it here would make the C1/C2/C3 boundary checks dead code on a real
+// `systemctl stop` (the original #2926 wiring bug). Run creates
+// d.applyCancelContext as a child of the SIGTERM/SIGINT signal context, so a
+// real daemon stop cancels it; keeping it separate from d.daemonCtx leaves the
+// other daemonCtx-derived background goroutines (flow-export, RPM, scheduler,
+// cluster comms, the dp.Start dataplane runtime) on their explicit-teardown
+// lifetimes, which the orderly shutdown sequence still needs live.
+//
+// When d.applyCancelContext is unset (early boot, unit tests with no wiring) it
+// falls back to a non-cancellable context, so the apply never aborts spuriously.
+func (d *Daemon) applyCancelCtx() context.Context {
+	if d.applyCancelContext != nil {
+		return d.applyCancelContext
+	}
+	return context.Background()
 }
 
 // commitAndApply atomically promotes the candidate config and
@@ -103,11 +145,16 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 // state). Optionally syncs to the cluster peer inside the lock.
 //
 // If ctx is canceled before the semaphore is acquired, returns
-// ctx.Err() and NEITHER commit nor apply runs — no divergence. Once
-// the semaphore is held, commit and apply run to completion;
-// cancellation past that point is ignored (applyConfigLocked is not
-// safe to interrupt mid-stream — kernel route writes, FRR reload,
-// etc.).
+// ctx.Err() and NEITHER commit nor apply runs — no divergence.
+//
+// Once the semaphore is held, store.Commit() promotes the config and the
+// apply runs. The apply itself (applyConfigLocked) is cancellable at coarse
+// boundaries via the DAEMON-LIFETIME context (applyCancelCtx), NOT this
+// request ctx (#2926): a daemon stop aborts an in-flight apply so termination
+// is not blocked behind netlink + FRR reload + Rust sync, while a request
+// cancellation after store.Commit is deliberately ignored (aborting a
+// promoted commit on a still-running daemon would diverge the store from the
+// dataplane). See applyCancelCtx for the full rationale.
 func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bool) (*config.Config, error) {
 	// #1922 Item 2 first-takeover gate (OQ-B, blunt resolution). In
 	// bootstrap mode a plain `commit` is refused: the first commit on a
@@ -160,7 +207,7 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 	if err != nil {
 		return nil, err
 	}
-	if err := d.applyConfigLocked(compiled); err != nil {
+	if err := d.applyConfigLocked(d.applyCancelCtx(), compiled); err != nil {
 		return nil, err
 	}
 	if syncPeer {
@@ -185,7 +232,7 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		return nil, err
 	}
 	if compiled != nil {
-		if err := d.applyConfigLocked(compiled); err != nil {
+		if err := d.applyConfigLocked(d.applyCancelCtx(), compiled); err != nil {
 			return nil, err
 		}
 		// #1956 V-1 passive-node device-map admission gate (OQ-15.1 option
@@ -257,7 +304,7 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 	if err != nil {
 		return nil, err
 	}
-	if err := d.applyConfigLocked(compiled); err != nil {
+	if err := d.applyConfigLocked(d.applyCancelCtx(), compiled); err != nil {
 		return nil, err
 	}
 	if syncPeer {
@@ -316,7 +363,12 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 	// this fires the target is KNOWN-safe. Aborting here would diverge the
 	// already-promoted store from the running dataplane (split-brain), which
 	// is strictly worse than applying a validated target.
-	if err := d.applyConfigLocked(prevCfg); err != nil {
+	//
+	// The rollback re-apply is driven with a non-cancellable context (#2926):
+	// the store has already been promoted to the rollback target, so the
+	// dataplane MUST be brought into agreement unconditionally — aborting here
+	// would re-open the split-brain this transaction exists to close.
+	if err := d.applyConfigLocked(context.Background(), prevCfg); err != nil {
 		slog.Error("commit confirmed auto-rollback dataplane apply failed", "err", err)
 	}
 	slog.Warn("commit confirmed timed out, configuration rolled back")
@@ -324,7 +376,19 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 
 // applyConfigLocked runs the actual reconcile pipeline. MUST be
 // called with d.applySem held.
-func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
+//
+// ctx is honored at the coarse phase boundaries marked below (#2926): when it
+// is canceled the apply returns ctx.Err() at the NEXT boundary rather than
+// completing the netlink + FRR reload + Rust control-socket sync. This lets a
+// daemon stop abort an in-flight commit/remediation apply once it is past the
+// applySem (the pre-semaphore wait was already cancelled by #2914). The
+// boundaries are chosen so a bail leaves a consistent, restart-recoverable
+// state — each major side-effecting phase is allowed to finish once started
+// (no abort mid-phase), and the next boot re-applies the active config in full.
+// Commit callers pass the daemon-lifetime context (applyCancelCtx); the boot /
+// DHCP / feed and confirmed-rollback callers pass a non-cancellable context so
+// their applies always complete (see applyConfig / executeConfirmedRollback).
+func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) error {
 	if d.applyBodyForTest != nil {
 		d.applyBodyForTest(cfg)
 		return nil
@@ -388,6 +452,15 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// Log config validation warnings
 	for _, w := range cfg.Warnings {
 		slog.Warn("config validation", "warning", w)
+	}
+
+	// #2926 boundary C1: before the netlink reconcile phase. Nothing in the
+	// kernel / dataplane / FRR has been touched yet (the SNMP swap above is an
+	// idempotent in-memory pointer flip), so a cancellation here skips the
+	// entire pipeline cleanly. This is the cheapest, safest place to honor a
+	// daemon stop.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// 0. Reconcile VRF devices (routing-instance VRFs + management VRF).
@@ -688,6 +761,17 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		setter.SetFeedSnapshots(d.feedSnapshotsForConfig(cfg))
 	}
 
+	// #2926 boundary C2: before the dataplane apply (the Rust control-socket
+	// sync push). The fabric-IPVLAN / VRF / tunnel / bond netlink reconciles
+	// above are idempotent and have each run to completion, so bailing here
+	// leaves a consistent kernel state with the dataplane untouched. Once
+	// d.dp.ApplyConfig and the RETH MAC / VIP / worker-rebind sequence that
+	// follows it begin, they run as one unit (no mid-sequence abort) — the
+	// next boundary is before the FRR reload.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	// 2. Apply dataplane config through the runtime config sink.
 	var applyResult *dataplane.ApplyResult
 	if d.dp != nil {
@@ -958,6 +1042,18 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		if d.cluster != nil {
 			d.cluster.RestartHeartbeat()
 		}
+	}
+
+	// #2926 boundary C3: before the FRR reload. The dataplane apply and the
+	// RETH MAC / VIP / worker-rebind sequence above have completed; FRR still
+	// holds the previous render. Bailing here skips the FRR reload and the
+	// remaining service reconciles (IPsec, DHCP, RA, VRRP, syslog, exporters);
+	// on the next boot the boot-time apply re-renders FRR and re-runs every
+	// service step against the active config, so the skip converges. (After
+	// store.Commit the store already holds the new config, so this is a clean
+	// "apply the rest on next start" boundary, not a divergence.)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// 3. Apply all routes + dynamic protocols via FRR.
