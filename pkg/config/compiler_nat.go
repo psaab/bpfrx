@@ -304,6 +304,29 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// non-host cases (host-vs-block, mismatched length, mixed family,
 			// malformed mask) fall through to the host-route rejection below.
 			blockPair := isStaticBlockPair(rule.Match, rule.Then)
+			// #3202: a block-to-block (subnet) static-NAT rule that ALSO
+			// carries a `match destination-port` or a `then static-nat
+			// mapped-port` is not representable in the dataplane. The Rust
+			// `StaticNatBlock` (static_nat.rs `from_snapshots`) stores only the
+			// address prefixes and performs an offset-preserving, ALL-PORT 1:1
+			// remap — it has no `match_dst_port`/`mapped_port` fields. So the
+			// port match/mapping is SILENTLY discarded and "NAT only port 80 of
+			// this /24, remap to 8080" degrades to "NAT every port of the /24"
+			// (over-broad NAT / policy bypass). This also matches Junos: a
+			// `static-nat prefix` is an address-only 1:1 subnet map; per-port
+			// translation is a host-scope construct (`static-nat ... mapped-port`
+			// on a /32). Reject the combination at strict commit-check so the
+			// operator authors a host static-NAT rule for the port forward, or
+			// drops the port tokens for a whole-subnet 1:1. (#3031 added the
+			// address-only block map; it did not add this rejection.)
+			if blockPair && (rule.MatchDestinationPort != 0 || rule.MappedPort != 0) {
+				if err := emitSuffix(fmt.Sprintf(
+					"security nat static rule-set %q rule %q maps a subnet (block-to-block prefix) but also specifies a port (match destination-port / then static-nat mapped-port); subnet static NAT is address-only 1:1 and the dataplane cannot translate per-port for a block, so the port mapping is silently dropped (use a /32 host match+prefix for a port forward, or drop the port tokens for a whole-subnet 1:1)",
+					rs.Name, rule.Name),
+					" (ignored: port mapping dropped by dataplane until corrected)"); err != nil {
+					return nil, err
+				}
+			}
 			if rule.Match != "" && !blockPair {
 				if host, parsed := isHostMaskAddress(rule.Match); parsed && !host {
 					if err := emit(fmt.Sprintf(
