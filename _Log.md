@@ -21195,3 +21195,27 @@ top.
   userspace-dp/src/afxdp/forwarding_build/tests.rs,
   userspace-dp/src/afxdp/forwarding/README.md,
   pkg/daemon/daemon_nft.go, pkg/daemon/host_inbound_nft_test.go
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3231 — fix three fail-OPEN nft lowering bugs in the lo0
+  control-plane firewall filter (`nftRuleFromTerm`). nft loads the lo0 table
+  atomically, so any one invalid line rejected the whole ruleset and left the
+  host filter with no rules. (1) TCP-flags AND-semantics (071-06): replaced the
+  raw comma-join (`tcp flags syn,&,!ack`, invalid; and the disjunctive
+  `tcp flags syn,ack`) with the canonical masked-equality form
+  `tcp flags & (mentioned-mask) == required`, reusing the commit-validated
+  `config.ParseTCPFlagsExpression` for required/forbidden masks (new helpers
+  `nftTCPFlagsMatch` / `nftTCPFlagNames`). (2) port-except (071-08):
+  `source-port-except` / `destination-port-except` were dropped; now emit
+  `th sport != …` / `th dport != …` (single + nft negated set). (3) IPv6
+  is-fragment (071-09): `ip frag-off …` was emitted unconditionally even in the
+  inet6 chain (syntax error → fail-open); now family-conditioned —
+  `ip frag-off & 0x1fff != 0` for ip, `exthdr frag exists` for ip6. Did NOT
+  touch the atomic-load fail-open path itself (071-07, /research design
+  question). Extended `lo0_filter_test.go` (TCPFlags single/list/negated,
+  PortExcept src+dst single+set, Fragment ip4+ip6); each proven fail-on-revert
+  RED. Generated forms syntax-validated with `nft -c` (parse OK; only the
+  expected post-parse netlink/permission error). `go build ./...` +
+  `go test ./pkg/daemon/... ./pkg/config/...` green.
+  **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/lo0_filter_test.go,
+  docs/feature-gaps.md

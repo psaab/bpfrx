@@ -545,6 +545,23 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		parts = append(parts, "th dport { "+strings.Join(term.DestinationPorts, ", ")+" }")
 	}
 
+	// Negated (except) port matching (#3231). `source-port-except` /
+	// `destination-port-except` (parsed since #2622/#3205) were dropped here,
+	// so a `discard` term blocked the ports it should have exempted and an
+	// accept-all-except-SSH term silently permitted SSH — a control-plane
+	// bypass on the lo0 input filter. Emit the nft negated form mirroring the
+	// positive port emission above (`th sport != ...` / `th dport != ...`).
+	if len(term.SourcePortsExcept) == 1 {
+		parts = append(parts, "th sport != "+term.SourcePortsExcept[0])
+	} else if len(term.SourcePortsExcept) > 1 {
+		parts = append(parts, "th sport != { "+strings.Join(term.SourcePortsExcept, ", ")+" }")
+	}
+	if len(term.DestPortsExcept) == 1 {
+		parts = append(parts, "th dport != "+term.DestPortsExcept[0])
+	} else if len(term.DestPortsExcept) > 1 {
+		parts = append(parts, "th dport != { "+strings.Join(term.DestPortsExcept, ", ")+" }")
+	}
+
 	// DSCP / traffic-class matching (#2545: multi-value).
 	if len(term.DSCPs) > 0 {
 		dscpKey := "ip dscp "
@@ -574,14 +591,42 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		}
 	}
 
-	// TCP flags matching
+	// TCP flags matching (#3231). The Junos `tcp-flags` value is an
+	// AND-conjunction with optional negation (`syn & !ack` = SYN required,
+	// ACK forbidden). The pre-fix code joined the RAW tokens with commas
+	// (`tcp flags syn,&,!ack`), which is invalid nft — and because nft loads
+	// the lo0 ruleset atomically, that single syntax error rejected the WHOLE
+	// ruleset and left the host control-plane filter fail-OPEN. Even a plain
+	// list (`tcp flags syn,ack`) is wrong: nft reads a comma list as a
+	// disjunctive set, not the Junos conjunction, and forbidden flags are not
+	// representable that way at all. Reuse the commit-validated parser to get
+	// the required/forbidden masks and emit the canonical
+	// `tcp flags & (mentioned-mask) == required` form. A parse error is
+	// unreachable for a committed config (compileFirewall rejects
+	// unrepresentable expressions), but if one slips through we drop the
+	// constraint with a warning rather than emit garbage that fails the whole
+	// ruleset open — mirroring the userspace lowering in
+	// pkg/dataplane/userspace/filters.go.
 	if len(term.TCPFlags) > 0 {
-		parts = append(parts, "tcp flags "+strings.Join(term.TCPFlags, ","))
+		if required, forbidden, ok, err := config.ParseTCPFlagsExpression(term.TCPFlags); err != nil {
+			slog.Warn("dropping unrepresentable tcp-flags expression from lo0 filter term",
+				"term", term.Name, "tcp_flags", term.TCPFlags, "error", err)
+		} else if ok {
+			parts = append(parts, nftTCPFlagsMatch(required, forbidden))
+		}
 	}
 
-	// IP fragment matching
+	// IP fragment matching (#3231). `ip frag-off` is an IPv4-only header field;
+	// emitting it in the inet6 chain is an nft syntax error that (atomic load)
+	// rejected the whole ruleset and failed the lo0 filter open. Family-condition
+	// the match: the IPv4 fragment-offset test for ip, and the IPv6 fragment
+	// extension-header existence test for ip6.
 	if term.IsFragment {
-		parts = append(parts, "ip frag-off & 0x1fff != 0")
+		if family == "ip6" {
+			parts = append(parts, "exthdr frag exists")
+		} else {
+			parts = append(parts, "ip frag-off & 0x1fff != 0")
+		}
 	}
 
 	// Action: discard → drop (silent), reject → reject (ICMP unreachable), accept → accept
@@ -599,6 +644,61 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		return action
 	}
 	return strings.Join(parts, " ") + " " + action
+}
+
+// nftTCPFlagOrder lists the TCP flag bits in canonical low-to-high bit order
+// with their nftables symbolic names. The bit values match config.tcpFlagBits
+// (the SSOT consumed by ParseTCPFlagsExpression) and userspace-dp/src/tcp_flags.rs.
+var nftTCPFlagOrder = []struct {
+	bit  uint8
+	name string
+}{
+	{0x01, "fin"},
+	{0x02, "syn"},
+	{0x04, "rst"},
+	{0x08, "psh"},
+	{0x10, "ack"},
+	{0x20, "urg"},
+}
+
+// nftTCPFlagNames renders a TCP-flags bit mask as the nftables symbolic flag
+// list joined with " | " (e.g. 0x12 -> "syn | ack"). An empty mask renders as
+// the numeric "0x0" so it is a valid right-hand side for the `== 0` (all-clear)
+// case.
+func nftTCPFlagNames(mask uint8) string {
+	var names []string
+	for _, f := range nftTCPFlagOrder {
+		if mask&f.bit != 0 {
+			names = append(names, f.name)
+		}
+	}
+	if len(names) == 0 {
+		return "0x0"
+	}
+	return strings.Join(names, " | ")
+}
+
+// nftTCPFlagsMatch renders the canonical nftables masked-equality TCP-flags
+// match for a required/forbidden mask pair, the form that expresses the Junos
+// AND-conjunction semantics (a segment matches when (flags & required) ==
+// required && (flags & forbidden) == 0):
+//
+//	tcp flags & (<required|forbidden flag names>) == <required flag names>
+//
+// Both sides are parenthesized when they name more than one flag so nft's `|`
+// precedence cannot reassociate the right-hand side across the `==`. A single
+// flag, or the all-clear "0x0" right-hand side, needs no parentheses.
+func nftTCPFlagsMatch(required, forbidden uint8) string {
+	mask := required | forbidden
+	maskExpr := nftTCPFlagNames(mask)
+	if mask&(mask-1) != 0 { // more than one bit set
+		maskExpr = "(" + maskExpr + ")"
+	}
+	reqExpr := nftTCPFlagNames(required)
+	if required&(required-1) != 0 { // more than one bit set
+		reqExpr = "(" + reqExpr + ")"
+	}
+	return "tcp flags & " + maskExpr + " == " + reqExpr
 }
 
 // nftDSCPValue converts a Junos DSCP name to the nftables symbolic name.
