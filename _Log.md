@@ -1,3 +1,30 @@
+## 2026-06-25 — #3103: gRPC ShowText `test-policy:` routed through pkg/policymatch
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed codex-review-065 finding 065-01. The gRPC `ShowText`
+  `test-policy:` handler (`grpcapi.showTestPolicy`) — the backing handler for
+  the remote `cli` `test policy` command — was the ONE match-policies surface
+  #3042 missed. It still used the pre-#3042 bespoke `matchShowPolicyAddr` /
+  `matchShowPolicyApp` shadow matcher and hard-coded "Default deny" on a miss,
+  so it could report the OPPOSITE verdict from the runtime (missed predefined
+  apps, literal CIDRs, exclusions, feed overlay; ignored `default-policy
+  permit-all`). Rerouted it through `policymatch.Match` (passing the live feed
+  overlay via `Server.feedOverlayFn`, mirroring `MatchPolicies`); deleted the
+  bespoke `matchShowPolicy*` helpers + the now-unused `policyActionName` and the
+  `strconv` import from `server_cluster.go`. Output format preserved except the
+  default line now reflects the configured default-policy.
+- **File(s)**: pkg/grpcapi/server_show_firewall.go,
+  pkg/grpcapi/server_cluster.go, pkg/grpcapi/test_commands_test.go,
+  pkg/grpcapi/server_cluster_test.go, pkg/policymatch/README.md
+- **Validation**: go build/vet clean; `go test ./pkg/grpcapi/...
+  ./pkg/policymatch/... ./pkg/cli/...` 308 pass; gofmt clean. Fail-on-revert
+  proven: restoring origin/master's bespoke matcher turns the new
+  `TestShowTestPolicyAgreesWithRuntimeOnFixedCases` RED on all three sub-cases
+  (predefined-app permit, global-policy fallback, default-policy permit-all).
+- **Note (out of scope)**: `showTestPolicy` parses only `port=` (destination)
+  and `proto=`; it cannot express a source port (#3107) and does not validate
+  the protocol token (#3108). Left untouched for those issues.
+
 ## 2026-06-25 — #2881: commit-time reject undefined policy community references
 
 - **Timestamp**: 2026-06-25
