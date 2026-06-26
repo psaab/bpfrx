@@ -169,7 +169,7 @@ hit). A packet host-inbound already rejected never reaches policy, so a
 name to `JUNOS_HOST_ZONE_ID` (`u16::MAX-1`, the bottom of the reserved range,
 never on the wire because zone ids are u8) and looks up the
 `(ingress_zone_id, JUNOS_HOST_ZONE_ID)` zone pair in the SAME `zone_pair_index`
-as transit rules — `PolicyState::from_snapshots` now INDEXES junos-host rules
+as transit rules — `parse_policy_state_with_counters` now INDEXES junos-host rules
 via `resolve_policy_zone_id` (pre-#3019 they were kept-but-not-indexed, like the
 wildcard-`any` case). A matched deny/reject drops the packet, emits the
 policy-deny RT_FLOW (egress zone reported as `0`/host since the synthetic id
