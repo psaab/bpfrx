@@ -165,6 +165,18 @@ type surfaceAState struct {
 	// SurfaceAStateUnpublished status row so a never-published scope is visible to
 	// the operator instead of silently omitted (#2843).
 	noBackend bool
+	// withdrawUnsupported records that the scope's backend can NEVER perform a
+	// withdraw (errGenericDeleteUnsupported — the generic HTTP backend has no
+	// portable delete verb, #2772/#2811). Unlike a transient failure this arms NO
+	// retry: re-attempting a structurally-unsupported delete on the backoff
+	// cadence is pointless churn plus a recurring warn (#2813). The wire delete is
+	// attempted at most once; a single warn is emitted; the scope KEEPS ownership
+	// so the abandoned RR stays operator-visible. Both withdraw paths skip the
+	// wire attempt while set. Cleared on a successful publish (the full rt reset)
+	// and on restart (the runtime cache is rebuilt from the durable store, which
+	// only seeds lastAddr), so a later provider change that adds a delete verb is
+	// re-probed.
+	withdrawUnsupported bool
 }
 
 // Surface A scope status states for the operator view (#2843). A configured
@@ -647,12 +659,40 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 			delete(m.runtime, owned.scopeOf().scopePrefix())
 			continue
 		}
+		// Per-scope error backoff for the gone-from-config withdraw (#2813): a
+		// persistently-failing withdraw (a generic backend with no delete verb, or
+		// a dyndns2/cloudflare/route53/rfc2136 delete that keeps erroring) must back
+		// off its retry cadence instead of re-attempting — and warning — on every
+		// 30s sweep. This reuses the SAME per-scope runtime backoff slot the publish
+		// path arms (keyed by scopePrefix == sid); the runtime entry was seeded from
+		// the durable store at startup (seedFromStore), so it usually already exists.
+		// A scope is only ever a publish OR a withdraw candidate at one time (a
+		// gone-from-config scope is absent from `desired` and never reaches Pass 1),
+		// so a single shared backoff slot is correct — no withdraw-specific slot.
+		rt := m.runtime[sid]
+		if rt == nil {
+			rt = &surfaceAState{}
+			m.runtime[sid] = rt
+		}
+		if rt.withdrawUnsupported {
+			// Terminal: the backend can never withdraw (#2813). Keep ownership (the
+			// RR stays operator-visible) and do not re-attempt the wire delete.
+			continue
+		}
+		if !rt.nextEligible.IsZero() && now.Before(rt.nextEligible) {
+			// Still inside the error-backoff window — skip the wire delete this pass.
+			m.backedOff++
+			slog.Debug("ddns surface-a: gone-from-config scope in withdraw backoff; skipping this pass",
+				"fqdn", owned.FQDN, "next-eligible", rt.nextEligible)
+			continue
+		}
 		backend, err := m.backendForOwned(owned, catalog)
 		if err != nil {
+			m.recordScopeError(rt, owned.FQDN, 0, err, now)
 			noteErr(err)
 			continue
 		}
-		noteErr(m.withdrawOwnedLocked(ctx, owned, backend))
+		noteErr(m.withdrawScopeLocked(ctx, owned, backend, rt, owned.FQDN, 0, now))
 	}
 
 	if err := m.state.save(); err != nil {
@@ -699,15 +739,28 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 		// #2691 P2 MAJOR-2 fix; backendForOwned is only needed for the gone-from-
 		// config Pass 2 withdraw where the scope no longer exists).
 		if owned, exists := m.state.get(sc.effectiveKey(), surfaceAIdentity, ""); exists {
+			if rt.withdrawUnsupported {
+				// Terminal: the resolved backend has no withdraw verb (#2813). Do not
+				// re-attempt the wire delete every sweep — keep ownership (the RR is
+				// operator-visible) and stay quiet (the single warn already fired).
+				slog.Debug("ddns surface-a: withdraw unsupported by backend; not re-attempting (record kept)",
+					"fqdn", sc.FQDN)
+				return nil
+			}
 			backend, err := m.backendFor(sc)
 			if err != nil {
+				// Could not even build the backend: arm the SAME per-scope backoff the
+				// publish path uses (#2813) so a persistent resolve failure backs off
+				// instead of re-attempting (and warning) every 30s sweep. The backoff
+				// window check at the top of reconcileScopeLocked skips the next sweeps.
 				m.deleteFail++
+				m.recordScopeError(rt, sc.FQDN, sc.ErrorBackoffMax, err, now)
 				return err
 			}
-			if err := m.withdrawOwnedLocked(ctx, owned, backend); err != nil {
-				return err
-			}
-			delete(m.runtime, sid)
+			// withdrawScopeLocked drives the delete under the shared backoff machinery:
+			// success clears the scope state (the runtime entry is dropped), a transient
+			// failure arms exponential backoff, an unsupported-verb failure is terminal.
+			return m.withdrawScopeLocked(ctx, owned, backend, rt, sc.FQDN, sc.ErrorBackoffMax, now)
 		}
 		return nil
 	}
@@ -761,7 +814,7 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 			// would resurrect a stale map entry, so we swallow without touching rt.
 			return nil
 		}
-		m.recordScopeError(rt, sc, err, now)
+		m.recordScopeError(rt, sc.FQDN, sc.ErrorBackoffMax, err, now)
 		return err
 	}
 	// Success: clear backoff, update the last-published cache.
@@ -772,6 +825,7 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 	rt.lastErr = ""
 	rt.lastErrAt = time.Time{}
 	rt.noBackend = false
+	rt.withdrawUnsupported = false
 	return nil
 }
 
@@ -1071,8 +1125,13 @@ func (m *SurfaceAManager) backendForOwned(owned ownedRecord, catalog map[string]
 // recordScopeError records a failure on a scope and advances its flat error
 // backoff (inadyn idea #8): nextEligible = now + backoff, doubling from
 // surfaceABaseBackoff up to the cap. Surfaced via lastErr for observability.
-func (m *SurfaceAManager) recordScopeError(rt *surfaceAState, sc SurfaceAScope, err error, now time.Time) {
-	maxBackoff := sc.ErrorBackoffMax
+//
+// Shared by the publish AND both withdraw paths (#2813): a scope is only ever a
+// publish OR a withdraw candidate at one time, so one per-scope backoff slot is
+// correct. fqdn is for the log line; maxBackoff is the per-binding cap (0 ⇒ the
+// package default, which is what the gone-from-config withdraw uses since its
+// binding — and its configured cap — is gone).
+func (m *SurfaceAManager) recordScopeError(rt *surfaceAState, fqdn string, maxBackoff time.Duration, err error, now time.Time) {
 	if maxBackoff <= 0 {
 		maxBackoff = defaultErrorBackoffMax
 	}
@@ -1088,8 +1147,54 @@ func (m *SurfaceAManager) recordScopeError(rt *surfaceAState, sc SurfaceAScope, 
 	rt.lastErr = err.Error()
 	rt.lastErrAt = now
 	rt.noBackend = false
-	slog.Warn("ddns surface-a: scope publish failed; backing off",
-		"fqdn", sc.FQDN, "backoff", rt.backoff, "err", err)
+	slog.Warn("ddns surface-a: scope DNS update failed; backing off",
+		"fqdn", fqdn, "backoff", rt.backoff, "err", err)
+}
+
+// withdrawScopeLocked drives ONE withdraw of an owned record through `backend`
+// under the SAME per-scope backoff machinery the publish path uses (#2813). The
+// caller MUST have already passed the backoff-window / terminal checks (so this
+// is invoked only when the scope is eligible to attempt the wire delete) and
+// holds m.mu. Outcomes:
+//
+//   - success: withdrawOwnedLocked already dropped the durable ownership AND the
+//     runtime entry, so the scope's error/backoff state is implicitly cleared;
+//     return nil.
+//   - errGenericDeleteUnsupported: the backend can NEVER withdraw (no portable
+//     delete verb, #2772/#2811). Mark the scope terminal (a single warn, no
+//     exponential-backoff churn) and SWALLOW the error so the reconcile pass does
+//     not warn every sweep; ownership is kept (the RR stays operator-visible).
+//   - any other (transient) failure: arm the shared exponential backoff and
+//     RETURN the error so the pass reports it ONCE per eligible attempt — the
+//     backoff window then skips the next sweeps, collapsing the per-sweep spam.
+func (m *SurfaceAManager) withdrawScopeLocked(ctx context.Context, owned ownedRecord, backend DNSUpdater, rt *surfaceAState, fqdn string, maxBackoff time.Duration, now time.Time) error {
+	err := m.withdrawOwnedLocked(ctx, owned, backend)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, errGenericDeleteUnsupported) {
+		m.markWithdrawUnsupported(rt, fqdn, now)
+		return nil
+	}
+	m.recordScopeError(rt, fqdn, maxBackoff, err, now)
+	return err
+}
+
+// markWithdrawUnsupported flags a scope whose backend has no withdraw verb so
+// the withdraw is attempted at most once (#2813). It is idempotent — the single
+// warn fires only on the first transition — and records the reason for the
+// status surface. The scope KEEPS ownership; the abandoned RR stays
+// operator-visible. The flag is cleared by a successful publish (the full rt
+// reset) or a restart (the runtime cache is rebuilt from the durable store).
+func (m *SurfaceAManager) markWithdrawUnsupported(rt *surfaceAState, fqdn string, now time.Time) {
+	rt.lastErr = errGenericDeleteUnsupported.Error()
+	rt.lastErrAt = now
+	if rt.withdrawUnsupported {
+		return
+	}
+	rt.withdrawUnsupported = true
+	slog.Warn("ddns surface-a: backend has no withdraw verb; abandoning withdraw retries (record kept, operator-visible)",
+		"fqdn", fqdn)
 }
 
 // StatusViews returns a stable-ordered snapshot of EVERY configured Surface A
