@@ -232,18 +232,64 @@ fn classify_protocol(token: &str, hi: &mut ZoneHostInbound) {
     }
 }
 
+/// #3171: ICMP/ICMPv6 error (control) message subtypes that the host-inbound
+/// layer admits UNCONDITIONALLY — regardless of whether the ingress zone lists
+/// `ping` — so the userspace LocalDelivery classifier matches the kernel
+/// host-inbound chain's global ICMP-error accept (`pkg/daemon/daemon_nft.go`:
+/// `icmp type { destination-unreachable, time-exceeded, parameter-problem }`
+/// and `icmpv6 type { 1, 2, 3, 4, 133..137 }`). These carry PMTUD / unreachable
+/// / traceroute-to-self signalling that must reach a firewall-local address
+/// (e.g. a DNAT-to-self embedded ICMP error landing on the XSK) even on a
+/// configured ping-less zone. Without this exemption the userspace path dropped
+/// them while the kernel chain accepted them — a fail-toward-drop edge and the
+/// doc-vs-behavior inconsistency #3070's README flagged for embedded-ICMP.
+///
+/// This set is deliberately NARROWER than `icmp::is_icmp_error` (the
+/// embedded-NAT reversal set, which also includes v4 Source Quench (4) and
+/// Redirect (5)): Source Quench is deprecated (RFC 6633) and Redirect is
+/// link-scoped — neither is a control message we admit to the host. ECHO
+/// REQUEST (v4 type 8 / v6 type 128) is NOT here: it stays gated on the `ping`
+/// system-service, so a ping-less zone still drops echo.
+///
+/// Keep this set in lock-step with the kernel chain in
+/// `pkg/daemon/daemon_nft.go` and its
+/// `TestHostInboundFilterExemptsIPsecAndV6Errors` accept assertions.
+fn is_icmp_host_inbound_error(protocol: u8, icmp_type: u8) -> bool {
+    match protocol {
+        // ICMPv4: destination-unreachable (3, also carries PMTUD
+        // "fragmentation needed" as code 4), time-exceeded (11),
+        // parameter-problem (12).
+        1 => matches!(icmp_type, 3 | 11 | 12),
+        // ICMPv6: destination-unreachable (1), packet-too-big (2, PMTUD),
+        // time-exceeded (3), parameter-problem (4).
+        58 => matches!(icmp_type, 1 | 2 | 3 | 4),
+        _ => false,
+    }
+}
+
 /// Per-packet host-inbound admit check for a host-bound (local-delivery)
-/// packet ingressing `ingress_zone_id`. Returns true (admit) when the zone has
-/// no host-inbound stanza (absent from the table — the admit-all default) or
-/// when the packet's service/protocol is in the zone's set. Returns false
-/// (deny) only when the zone IS configured and the packet matches nothing.
+/// packet ingressing `ingress_zone_id`. Returns true (admit) when the packet is
+/// an ICMP/ICMPv6 error/PMTUD control message (#3171 — always exempt, mirroring
+/// the kernel chain), when the zone has no host-inbound stanza (absent from the
+/// table — the admit-all default), or when the packet's service/protocol is in
+/// the zone's set. Returns false (deny) only when the zone IS configured and the
+/// packet matches nothing. `icmp_type` is the first L4 byte for ICMP/ICMPv6
+/// packets and is ignored for every other protocol (pass 0).
 pub(in crate::afxdp) fn host_inbound_admits(
     state: &ForwardingState,
     ingress_zone_id: u16,
     protocol: u8,
     dst_port: u16,
     is_v6: bool,
+    icmp_type: u8,
 ) -> bool {
+    // #3171: error/PMTUD control messages are admitted before the zone lookup
+    // so PMTUD / unreachable / traceroute-to-self works on a configured zone
+    // that omits `ping`, matching the kernel host-inbound chain. Echo-request is
+    // not in this set, so it stays gated on the `ping` system-service below.
+    if is_icmp_host_inbound_error(protocol, icmp_type) {
+        return true;
+    }
     match state.zone_host_inbound.get(&ingress_zone_id) {
         None => true,
         Some(hi) => hi.admits(protocol, dst_port, is_v6),

@@ -20800,3 +20800,27 @@ top.
   FALSE for WG). Full frame suite 313 passed; wg suite 152 passed; build green.
   **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
   userspace-dp/src/afxdp/frame/README.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3171 host-inbound: admit ICMP/ICMPv6 error/PMTUD control
+  messages on a configured ping-less zone so the userspace LocalDelivery
+  classifier matches the kernel host-inbound chain. Added
+  `is_icmp_host_inbound_error` (ICMPv4 dest-unreachable/time-exceeded/
+  parameter-problem; ICMPv6 type 1/2/3/4 = dest-unreachable/packet-too-big/
+  time-exceeded/parameter-problem) and an early-return exemption in
+  `host_inbound_admits` BEFORE the per-zone lookup; threaded the first L4 byte
+  (ICMP type) into both poll_descriptor call sites (session miss + session
+  hit). Echo-request (v4 type 8 / v6 type 128) is NOT exempt — still gated on
+  the `ping` system-service. Broadened the kernel nft chain to the same set
+  (`icmp type { destination-unreachable, time-exceeded, parameter-problem }`,
+  `icmpv6 type { 1, 2, 3, 4, 133..137 }`) so kernel + userspace stay
+  consistent. Reconciled the #3070 README embedded-ICMP claim. Rust test
+  `build_forwarding_state_admits_icmp_errors_on_pingless_zone` +
+  Go `TestHostInboundFilterExemptsIPsecAndV6Errors` updated; fail-on-revert
+  proven (disabling the early-return turns "admits dest-unreachable" RED,
+  "drops echo without ping" stays GREEN).
+  **File(s)**: userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  pkg/daemon/daemon_nft.go, pkg/daemon/host_inbound_nft_test.go
