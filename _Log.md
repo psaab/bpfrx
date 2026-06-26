@@ -1,3 +1,25 @@
+## 2026-06-25 — #3072: reject an interface assigned to multiple security zones
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added commit-time strict validation rejecting an interface
+  assigned to more than one security zone. Previously
+  `pkg/dataplane/userspace.buildInterfaceZoneMap` silently resolved a
+  duplicate first-writer-wins over the SORTED zone names, so a
+  multi-zone interface landed in whichever zone sorts first and traffic
+  was evaluated against the wrong zone's policy. New
+  `validateZoneInterfaceMembershipStrict` (+ `zoneIfaceLogicalKeys`
+  helper mirroring the base/unit expansion) hard-rejects at commit,
+  naming the interface and both conflicting zones; `lenientZoneInterface
+  Membership` downgrades to a warning on the tolerant load/peer-sync
+  paths (keeps deterministic first-writer-wins so a persisted config
+  still boots — #1960 doctrine). Distinct units of one physical
+  interface across zones (valid VLAN split) are NOT rejected; a bare
+  interface + one of its units across zones ARE. Fail-on-revert test
+  file `zone_interface_membership_test.go` (RED with the validator
+  neutralized). Updated pkg/config README.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/zone_interface_membership_test.go,
+  pkg/config/README.md, _Log.md
 ## 2026-06-25 — #3065: unspecified default-policy fails CLOSED (deny-all) + reject-all + schema leaf
 
 - **Timestamp**: 2026-06-25
