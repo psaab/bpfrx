@@ -1,3 +1,19 @@
+## 2026-06-26 — #3207 policy terminal-action validation error: thread zone-pair context
+
+- **Timestamp**: 2026-06-26
+- **Action**: The zone-pair arm of `validatePolicyTerminalActionStrict`
+  called `check("", pol)` with an EMPTY scope, so a missing/conflicting
+  terminal-action error named only the policy (no from/to-zone). With
+  duplicate policy names across zone-pairs the offending policy was hard to
+  locate. Threaded the real scope `fmt.Sprintf("from-zone %s to-zone %s",
+  zpp.FromZone, zpp.ToZone)` (the established convention in
+  compiler_policy_then.go / compiler_policy_match.go) into the error; global
+  policies keep "global". Pure message/context improvement — the set of
+  accepted/rejected configs is unchanged. Added two fail-on-revert tests
+  (zone-pair names the pair + policy; global names "global" + policy).
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/policy_terminal_action_3043_test.go
+
 ## 2026-06-26 — #3200 host-inbound unknown/typo token: commit validation + both-layer fail-closed
 
 - **Timestamp**: 2026-06-26
