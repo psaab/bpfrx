@@ -20,6 +20,7 @@ import (
 	"github.com/chzyer/readline"
 	"github.com/psaab/xpf/pkg/cmdtree"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/policymatch"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -467,7 +468,16 @@ func (c *ctl) testPolicy(args []string) error {
 		case "destination-port":
 			if i+1 < len(args) {
 				i++
-				dstPort, _ = strconv.Atoi(args[i])
+				// #3116: reject a malformed/out-of-range port instead of
+				// silently coercing to the 0 "any port" wildcard (which the
+				// backend matcher treats as "no port constraint", yielding a
+				// verdict for a packet that cannot exist). Mirror the local
+				// CLI `test policy` invalid-port error.
+				p, err := policymatch.ParsePort(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid destination-port: %w", err)
+				}
+				dstPort = p
 			}
 		case "protocol":
 			if i+1 < len(args) {

@@ -273,15 +273,26 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	dstIP := net.ParseIP(dstIPStr)
 	// A malformed dst_port/src_port must not silently become 0 (the "any
 	// port" wildcard) — that yields a misleading PERMIT/DENY verdict in the
-	// simulator (#2934). Fail closed with 400.
+	// simulator (#2934). Fail closed with 400. queryIntStrict rejects
+	// malformed/negative values; policymatch.ValidatePort additionally
+	// rejects an out-of-range port (>65535) that cannot describe a real
+	// packet (#3116). 0/absent stays the unspecified wildcard.
 	dstPort, ok := queryIntStrict(r, "dst_port", 0)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid dst_port: "+r.URL.Query().Get("dst_port"))
 		return
 	}
+	if err := policymatch.ValidatePort(dstPort); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid dst_port: "+err.Error())
+		return
+	}
 	srcPort, ok := queryIntStrict(r, "src_port", 0)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid src_port: "+r.URL.Query().Get("src_port"))
+		return
+	}
+	if err := policymatch.ValidatePort(srcPort); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid src_port: "+err.Error())
 		return
 	}
 	proto := r.URL.Query().Get("protocol")

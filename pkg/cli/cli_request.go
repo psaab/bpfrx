@@ -204,7 +204,11 @@ func (c *CLI) testPolicy(args []string) error {
 		case "destination-port":
 			if i+1 < len(args) {
 				i++
-				dstPort, _ = strconv.Atoi(args[i])
+				p, err := policymatch.ParsePort(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid destination-port: %w", err)
+				}
+				dstPort = p
 			}
 		case "protocol":
 			if i+1 < len(args) {
