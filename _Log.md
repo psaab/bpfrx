@@ -19695,3 +19695,19 @@ top.
   pkg/logging/ringbuf.go, pkg/logging/binary_test.go,
   pkg/flowexport/manager.go, pkg/flowexport/flowstart_test.go,
   pkg/flowexport/README.md, _Log.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3062 — policy-detail show surfaces reflect runtime
+  scheduler state. Added SSOT predicate `PolicyInactive` +
+  `Manager.PolicySchedulerActiveState()` /
+  `LegacyDataPlaneAdapter.PolicySchedulerActiveState()` exports; CLI and
+  gRPC detail surfaces now render `State: inactive` (+ scheduler name)
+  for scheduler-inactive policies, bit-identical for active/non-scheduled.
+  **File(s)**: pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/cli/cli_show_policies_scheduler_3062_test.go,
+  pkg/grpcapi/server_show_policies_text.go,
+  pkg/grpcapi/server_show_policies_scheduler_3062_test.go,
+  docs/junos-cli-reference.md, _Log.md
