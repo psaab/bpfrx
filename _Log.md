@@ -18656,6 +18656,30 @@ top.
   bins 2919 passed + the same pre-existing worker_queue flake.
 - **File(s)**: userspace-dp/src/afxdp/tests.rs, _Log.md
 
+## 2026-06-25 — #3047: SNAT port allocator collision-probe + recycled-port retain
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `claim_free_port_locked` in the userspace-dp SNAT pool
+  port allocator (`userspace-dp/src/nat/allocator.rs`). Two related defects
+  from agy-review-062 (062-05 + 062-10): (a) the sequential phase tested only
+  ONE port per call and fell through on a collision with an out-of-band
+  occupant, so a single collision could spuriously exhaust an otherwise-free
+  range; (b) the recycled-port drain discarded a popped port whose owner slot
+  was occupied, permanently shrinking the reusable pool (leak). Fix: the
+  sequential phase now probes the monotonic cursor FORWARD until a free port
+  is claimed or the range is genuinely exhausted; the recycled phase RETAINS
+  (re-queues) a collided port instead of dropping it. The retain buffer
+  allocates lazily, so the common path stays hot-path-cheap. Promoted
+  `next_port_offset_by_addr` to `pub(super)` and added `#[cfg(test)]`
+  `debug_seed_owner`/`debug_clear_owner` white-box seams to model an
+  out-of-band occupant. Added two fail-on-revert tests
+  (`pool_snat_sequential_collision_probes_next_free_port`,
+  `pool_snat_recycled_collision_retains_port`) — both verified RED against the
+  pre-fix logic (panic: spurious exhaustion / leaked recycled port) and GREEN
+  with the fix. Updated the allocator module-header doc with the collision-
+  handling contract. Gates: `cargo build --release -p xpf-userspace-dp` clean;
+  full `cargo test -p xpf-userspace-dp` 3001 passed, 2 ignored.
+- **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/tests.rs, _Log.md
 - **Timestamp**: 2026-06-25
 - **Action**: #3043 — security policy with no/conflicting terminal action no
   longer silently PERMITs. `PolicyAction` zero value is `PolicyPermit`, so a
