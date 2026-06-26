@@ -233,6 +233,20 @@ type SurfaceAManager struct {
 	mu    sync.Mutex
 	state *ddnsState // durable ownership store (interface-ddns-state.json)
 
+	// degraded fails the manager CLOSED when the ownership state file could not
+	// be loaded (corrupt / unsupported-version / unreadable, #2971). It mirrors
+	// the DHCP-lease Manager's #2650 posture: the durable store is the ONLY
+	// authority for which router records this node published, so a load failure
+	// must NOT be treated as "owns nothing" (fail-open) — that empty store would
+	// re-publish every scope (overwriting a peer/manual owner, a write storm) and
+	// permanently forget what to withdraw. While degraded, Reconcile is a
+	// no-op-with-error: no publish, no withdraw, no save (the empty in-memory
+	// store is never written, so a corrupt/quarantined file is preserved). A
+	// MISSING file (first boot) is NOT degraded — it is a legitimately-empty
+	// store, so a fresh (including standalone) node still publishes normally.
+	degraded       bool
+	degradedReason string
+
 	// runtime is the per-scope engine state (change-detect / forced-refresh /
 	// backoff), keyed by scopeID. NOT persisted: it is rebuilt on restart from
 	// the durable store (seedFromStore) so a restart does not blast a redundant
@@ -278,20 +292,24 @@ type SurfaceAManager struct {
 }
 
 // NewSurfaceAManager constructs the production Surface A manager (plan §5.5). It
-// loads the durable ownership store from defaultSurfaceAStatePath (a corrupt
-// store is reset to empty, fail-open) and resolves the live RFC 2136 backend
-// per provider at reconcile time. The runtime cache is seeded from the durable
-// store so a restart does not republish an unchanged address.
+// loads the durable ownership store from defaultSurfaceAStatePath. A corrupt /
+// unsupported-version / unreadable store puts the manager into the FAIL-CLOSED
+// degraded state (#2971, mirroring the DHCP-lease Manager's #2650 posture): the
+// manager is still constructible (the daemon starts) but Reconcile refuses to
+// publish or withdraw any record until the operator resolves the bad file
+// (corrupt/unsupported files are quarantined aside). A MISSING file (first boot)
+// is NOT degraded — a fresh node publishes normally. It resolves the live RFC
+// 2136 backend per provider at reconcile time. The runtime cache is seeded from
+// the durable store so a restart does not republish an unchanged address.
 func NewSurfaceAManager() *SurfaceAManager {
-	st, err := loadDDNSState(defaultSurfaceAStatePath)
-	if err != nil {
-		slog.Warn("ddns surface-a: ownership state load failed; starting empty", "err", err)
-	}
+	st, degraded, reason := loadStateOrDegrade(defaultSurfaceAStatePath, time.Now)
 	m := &SurfaceAManager{
-		state:       st,
-		runtime:     map[string]*surfaceAState{},
-		httpClients: newHTTPClientCache(),
-		now:         time.Now,
+		state:          st,
+		degraded:       degraded,
+		degradedReason: reason,
+		runtime:        map[string]*surfaceAState{},
+		httpClients:    newHTTPClientCache(),
+		now:            time.Now,
 	}
 	// resolveBackend closes over the manager's per-binding HTTP client cache
 	// (#2904) so every HTTP backend the reconcile path builds reuses the cached
@@ -303,14 +321,24 @@ func NewSurfaceAManager() *SurfaceAManager {
 
 // newSurfaceAManagerForTesting builds a manager with an in-memory state file
 // path, an injected backend, and an injectable clock — no real /var/lib path,
-// no network. Used by surface_a_test.go.
+// no network. Used by surface_a_test.go. It loads the durable store through the
+// SAME loadStateOrDegrade gate as production (#2971), so a corrupt/unreadable
+// state file at statePath drives the manager into the fail-closed degraded state
+// in tests exactly as it would in production; a missing file (the common case)
+// yields a clean empty store.
 func newSurfaceAManagerForTesting(statePath string, backend DNSUpdater, now func() time.Time) *SurfaceAManager {
-	st, _ := loadDDNSState(statePath)
+	nowFn := now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	st, degraded, reason := loadStateOrDegrade(statePath, nowFn)
 	m := &SurfaceAManager{
-		state:   st,
-		runtime: map[string]*surfaceAState{},
-		backend: backend,
-		now:     now,
+		state:          st,
+		degraded:       degraded,
+		degradedReason: reason,
+		runtime:        map[string]*surfaceAState{},
+		backend:        backend,
+		now:            now,
 	}
 	m.seedFromStore()
 	return m
@@ -500,6 +528,22 @@ func (m *SurfaceAManager) providerIO(fn func() error) error {
 func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope, observe AddressObserver, gate ScopeGate, catalog map[string]*config.DDNSProvider) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// FAIL CLOSED (#2971, mirroring the DHCP-lease #2650 gate): the ownership
+	// state could not be loaded, so we cannot prove which router records this
+	// node published. Acting now is unsafe — a publish could overwrite a
+	// peer/manual owner (the lost ownership can no longer veto the re-claim) and
+	// would re-publish EVERY configured scope every pass (a write storm), while a
+	// withdraw has no trustworthy owned set to delete against. Refuse the whole
+	// pass and DO NOT touch the state file: the empty in-memory store is never
+	// saved, so the corrupt/quarantined file is preserved for the operator. A
+	// standalone (nil gate) node fails closed the same way — losing the only
+	// authority is no safer without a peer; a restart with the bad file
+	// quarantined aside re-reads an absent (clean-empty) store and resumes
+	// publishing.
+	if m.degraded {
+		return fmt.Errorf("ddns surface-a: reconcile suspended (state degraded): %s", m.degradedReason)
+	}
 
 	now := m.now()
 	var firstErr error
@@ -1155,6 +1199,13 @@ type SurfaceAStats struct {
 	Skipped          uint64
 	BackedOff        uint64
 	SkippedNoBackend uint64
+	// Degraded is the FAIL-CLOSED alarm (#2971): the ownership state file could
+	// not be loaded (corrupt / unsupported-version / unreadable), so Reconcile
+	// refuses every publish/withdraw until the operator resolves it.
+	Degraded bool
+	// DegradedReason is a human-readable explanation of Degraded (the load error
+	// plus the quarantine path of the bad file, if any). Empty when not degraded.
+	DegradedReason string
 }
 
 // Stats returns the current Surface A counters.
@@ -1170,6 +1221,8 @@ func (m *SurfaceAManager) Stats() SurfaceAStats {
 		Skipped:          m.skipped,
 		BackedOff:        m.backedOff,
 		SkippedNoBackend: m.skippedNoBackend,
+		Degraded:         m.degraded,
+		DegradedReason:   m.degradedReason,
 	}
 }
 
