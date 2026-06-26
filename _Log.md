@@ -27,6 +27,78 @@
   (960 passed); gofmt clean. Fail-on-revert proven RED->GREEN both sides
   (Rust close encoder [136:140]->0; Go close decoder PolicyID->0).
 
+## 2026-06-26 — #3071: zone tcp-rst wired into userspace deny enforcement
+
+- **Timestamp**: 2026-06-26
+- **Action**: Wire the parsed-but-inert `security zones <z> tcp-rst` knob into
+  the userspace dataplane. Go `ZoneConfig.TCPRst` now flows to
+  `ZoneSnapshot.TCPRst` (json `tcp_rst`, omitempty) and across the wire to the
+  Rust `ZoneSnapshot.tcp_rst` (serde rename `tcp_rst`, default false). The Rust
+  forwarding build records tcp-rst-enabled zone ids in
+  `ForwardingState.zone_tcp_rst`; both policy-deny call sites in
+  `poll_descriptor/mod.rs` now route through a unified `enqueue_deny_reply`
+  helper that, for a plain `deny` (not `then reject`), sends a TCP RST via the
+  existing #2521/#2089 reject machinery ONLY when the flow is TCP and the
+  INGRESS (from) zone has tcp-rst. Non-TCP denied traffic and a deny in a
+  non-tcp-rst zone stay silent drops; explicit `then reject` is unchanged. Zone
+  tcp-rst RSTs count under `policy_reject_sent`. Junos semantics: tcp-rst is a
+  source/from-zone property (RST goes back toward the initiator).
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/zones_tcp_rst_3071_test.go (new),
+  userspace-dp/src/protocol/snapshot.rs (field + round-trip tests),
+  userspace-dp/src/afxdp/types/forwarding.rs (field + accessor),
+  userspace-dp/src/afxdp/forwarding_build/zones.rs (populate),
+  userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs (enqueue_deny_reply +
+  tests), userspace-dp/src/afxdp/poll_descriptor/mod.rs (call sites),
+  userspace-dp/src/filter/README.md, userspace-dp/tests/fixtures/protocol_wire_v1.json
+  (regenerated), plus test-literal updates in forwarding/forwarding_build/
+  test_fixtures/tests for the new field.
+- **Validation**: cargo build --release clean; Rust reject/policy/forwarding/
+  snapshot/wire tests green incl. 6 new tcp-rst tests; fail-on-revert confirmed
+  (disabling the zone arm → deny_reply_zone_tcp_rst_tcp_enqueues_rst RED);
+  go build ./... + go test ./pkg/dataplane/... ./pkg/config/... pass; gofmt clean.
+
+## 2026-06-25 — #3029: DNAT destination-address prefix silently narrowed to a single host
+
+- **Action**: Hard-reject a destination-NAT rule whose `match destination-address`
+  is a MULTI-HOST prefix (e.g. `198.51.100.0/24`). The DNAT snapshot builder strips
+  the `/mask` and the Rust `DnatTable` keys on an EXACT host `IpAddr` (no prefix/LPM),
+  so only the network address translated and every other host in the block silently
+  bypassed DNAT. Contract: commit-REJECT (fail-closed, #1960 strict-with-lenient),
+  NOT honor-prefix — block-mapping semantics (1:1 vs many:one) + an LPM table are an
+  unsettled dataplane feature (issue is a /research candidate). Single-host (bare IP,
+  /32, /128) unchanged.
+- **File(s)**: pkg/config/compiler_validate_strict.go (validateDestinationNATAddressesStrict
+  extended; reuses isHostMaskAddress), pkg/config/compiler_dnat_address_test.go (4 new
+  tests: v4/v6 prefix reject, host-mask compiles, lenient warns), docs/feature-gaps.md.
+- **Validation**: go build ./...; go test ./pkg/config/... (1698 pass + new); RED->GREEN
+  confirmed (disable the gate condition -> reject tests FAIL); gofmt clean.
+
+## 2026-06-25 — #3149 (folds #3147): policy dangling/empty address-set hard-reject
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added `validatePolicyMatchAddressSetMembersStrict` — hard-rejects
+  at commit a security-policy source/destination address that names a DEFINED
+  address-book entry whose recursive members dangle, a defined-but-EMPTY
+  address-set, or a prefix-less address. Mirrors the runtime resolver
+  `resolveUserspaceAddressBookEntry`+`expandUserspacePolicyAddresses` exactly via
+  new helper `policyMatchAddressBookResolves` (fail-closed; cycle/empty-expansion
+  rejected by the outer count==0 check). Address-book sibling of #2217/#3144/#3146.
+  Folds #3147 (empty address-set) and pins the excluded-inversion safety: an empty
+  EXCLUDED set is rejected fail-CLOSED (can never commit → never inverts to
+  match-all). Strict on commit; lenient warn on load/peer-sync via new flag
+  `lenientPolicyMatchAddressSetMembers` (#1960). The warn.go address-set member
+  warning is retained for the lenient path + unreferenced sets.
+- **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/compiler_policy_match_address_set_3149_test.go (new),
+  pkg/config/README.md, _Log.md
+- **Validation**: go build ./..., go vet ./pkg/config/..., go test
+  ./pkg/config/... ./pkg/dataplane/userspace/... (2300 passed). 22 new subtests
+  green; fail-on-revert confirmed RED (stub validator body → all reject cases
+  fail). gofmt clean on changed files.
+
+- **2026-06-25**: #3011 (agy-review-059 finding 059-02) — SNAT source-port recycling changed from LIFO to FIFO. `recycled_ports_by_addr` in `userspace-dp/src/nat/allocator.rs` was a per-address `Vec<u16>` with push/pop at the BACK (LIFO): the most-recently-freed port was the FIRST reassigned, maximizing the chance of reusing a 4-tuple while the upstream still holds it in TIME_WAIT (2MSL) → SYN reject / dup-ACK / RST under high NAT churn. Switched to `VecDeque<u16>`: `push_back` on release, `pop_front` on allocation, so the OLDEST-freed port is reused first and reuse spreads across the 2MSL window (standard NAT44/conntrack behavior). Composes with the #3047 (062-10) collision-retain logic: a popped port whose owner slot is still occupied is RETAINED (re-queued at the BACK via `extend`), never discarded — collided ports sit behind the genuinely-free ports so FIFO order among free ports is preserved and the drain still terminates (each `pop_front` removes one element). No change to address-persistent / persistent-NAT lease semantics — only the recycle ORDER. Fail-on-revert verified RED→GREEN: new `pool_snat_recycle_order_is_fifo_not_lifo` (exhaust sequential range, free ports 1026/1024/1028 in that order, require next 3 allocations to reuse them in the SAME FIFO order); reverting `pop_front`→`pop_back` (LIFO) flips the result to [1028,1024,1026] and turns the test RED. Updated the #3047 collision-retain test's seed ordering to keep exercising the retain path under FIFO. Gates: cargo build --release -p xpf-userspace-dp clean; cargo test --release nat 486 pass. Files: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/tests.rs, userspace-dp/README.md
 ## 2026-06-25 — #3151: local-delivery resolution table-scoped (cross-VRF leak)
 
 - **Timestamp**: 2026-06-25

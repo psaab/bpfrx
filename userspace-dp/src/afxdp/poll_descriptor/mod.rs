@@ -36,7 +36,7 @@ use crate::policy::evaluate_policy_result_with_len;
 
 use cookie_reply::{SynCookieReply, enqueue_syn_cookie_reply};
 use nat_exception::{record_source_nat_failure, source_nat_decision_for_flow};
-use reject_reply::{enqueue_filter_reject_reply, enqueue_policy_reject_reply};
+use reject_reply::{enqueue_deny_reply, enqueue_filter_reject_reply};
 
 use filter::{
     apply_lo0_filter_action, emit_input_filter_log_match,
@@ -2218,25 +2218,28 @@ pub(super) fn poll_binding_process_descriptor(
                                         resolution.egress_ifindex,
                                     );
                                 }
-                                // #2089: `reject` actively rejects —
+                                // #2089/#3071: `reject` actively rejects —
                                 // synthesize a TCP RST (TCP) or ICMP
                                 // unreachable (admin-prohibited; other
-                                // protocols) back toward the source.
-                                // `deny` is unchanged (silent drop). The
-                                // reply is enqueued here before the
+                                // protocols) back toward the source. Plain
+                                // `deny` is a silent drop UNLESS the flow is
+                                // TCP and the ingress (from) zone has Junos
+                                // `tcp-rst`, in which case a TCP RST is sent.
+                                // The reply is enqueued here before the
                                 // disposition fall-through, while flow /
-                                // action / packet_frame are in scope.
-                                if matches!(policy_result.action, PolicyAction::Reject) {
-                                    enqueue_policy_reject_reply(
-                                        &mut binding.tx_pipeline,
-                                        worker_ctx.forwarding,
-                                        binding.ifindex,
-                                        packet_frame,
-                                        meta,
-                                        flow,
-                                        telemetry.counters,
-                                    );
-                                }
+                                // action / from_zone_id / packet_frame are in
+                                // scope.
+                                enqueue_deny_reply(
+                                    &mut binding.tx_pipeline,
+                                    worker_ctx.forwarding,
+                                    binding.ifindex,
+                                    packet_frame,
+                                    meta,
+                                    flow,
+                                    telemetry.counters,
+                                    matches!(policy_result.action, PolicyAction::Reject),
+                                    from_zone_id,
+                                );
                                 decision.resolution.disposition =
                                     ForwardingDisposition::PolicyDenied;
                             }
@@ -2951,21 +2954,24 @@ pub(super) fn poll_binding_process_descriptor(
                                         now_ns,
                                     );
                                     telemetry.dbg.policy_deny += 1;
-                                    // #2089: `reject` actively rejects
-                                    // (TCP RST / ICMP unreachable); `deny`
-                                    // stays a silent drop. Enqueue before
-                                    // the disposition record + recycle.
-                                    if matches!(policy_result.action, PolicyAction::Reject) {
-                                        enqueue_policy_reject_reply(
-                                            &mut binding.tx_pipeline,
-                                            worker_ctx.forwarding,
-                                            binding.ifindex,
-                                            packet_frame,
-                                            meta,
-                                            flow,
-                                            telemetry.counters,
-                                        );
-                                    }
+                                    // #2089/#3071: `reject` actively rejects
+                                    // (TCP RST / ICMP unreachable); plain
+                                    // `deny` stays a silent drop UNLESS the
+                                    // flow is TCP and the ingress (from) zone
+                                    // has Junos `tcp-rst`, in which case a TCP
+                                    // RST is sent. Enqueue before the
+                                    // disposition record + recycle.
+                                    enqueue_deny_reply(
+                                        &mut binding.tx_pipeline,
+                                        worker_ctx.forwarding,
+                                        binding.ifindex,
+                                        packet_frame,
+                                        meta,
+                                        flow,
+                                        telemetry.counters,
+                                        matches!(policy_result.action, PolicyAction::Reject),
+                                        from_zone_id,
+                                    );
                                     decision.resolution.disposition =
                                         ForwardingDisposition::PolicyDenied;
                                     record_forwarding_disposition(

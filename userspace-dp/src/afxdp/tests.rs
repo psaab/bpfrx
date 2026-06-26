@@ -4129,14 +4129,17 @@ fn poll_descriptor_policy_deny_path_emits_rt_flow_event() {
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            tcp_rst: false,
         },
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         },
         ZoneSnapshot {
             name: "dmz".to_string(),
             id: TEST_DMZ_ZONE_ID,
+            tcp_rst: false,
         },
     ];
     snapshot.neighbors = vec![NeighborSnapshot {
@@ -4320,14 +4323,17 @@ fn poll_descriptor_policy_deny_keys_logical_ingress_zone_3021() {
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            tcp_rst: false,
         },
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         },
         ZoneSnapshot {
             name: "dmz".to_string(),
             id: TEST_DMZ_ZONE_ID,
+            tcp_rst: false,
         },
     ];
     // Add a SECOND VLAN sub-interface (logical ifindex 13, VID 50) on the
@@ -4556,10 +4562,12 @@ fn run_input_filter_accept_log_poll(
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            tcp_rst: false,
         },
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         },
     ];
     snapshot.interfaces[0].filter_input_v4 = "log-input".to_string();
@@ -4778,10 +4786,12 @@ fn poll_descriptor_input_filter_discard_drops_and_logs() {
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            tcp_rst: false,
         },
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         },
     ];
     snapshot.interfaces[0].filter_input_v4 = "drop-input".to_string();
@@ -4946,10 +4956,12 @@ fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            tcp_rst: false,
         },
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         },
     ];
     snapshot.interfaces[0].filter_input_v4 = "drop-ef-input".to_string();
@@ -5155,10 +5167,12 @@ fn poll_descriptor_lo0_filter_discard_drops_without_reinject() {
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            tcp_rst: false,
         },
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         },
     ];
     snapshot.interfaces[0].addresses = vec![InterfaceAddressSnapshot {
@@ -5330,10 +5344,12 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            tcp_rst: false,
         },
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         },
     ];
     snapshot.interfaces[0].addresses = vec![InterfaceAddressSnapshot {
@@ -7633,10 +7649,12 @@ fn txn_policy_denied_missing_neighbor_is_dropped_not_reinjected() {
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            tcp_rst: false,
         },
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         },
     ];
     // No neighbor for 172.16.80.200: the connected WAN route resolves
@@ -7695,10 +7713,12 @@ fn txn_policy_denied_missing_neighbor_skips_neg_cache_fast_fail() {
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            tcp_rst: false,
         },
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         },
     ];
     snapshot.neighbors.clear();

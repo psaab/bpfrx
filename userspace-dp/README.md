@@ -196,6 +196,21 @@ logging rules, not these specific hot-path constants.
   Fail-on-revert: `pool_snat_subnet_expands_full_cidr_range`,
   `pool_snat_host_cidr_yields_single_address`, and
   `pool_snat_overbroad_prefix_marks_invalid` in `src/nat/tests.rs`.
+- **Source-NAT port recycling is FIFO (#3011)**: freed SNAT source
+  ports go into a per-address `VecDeque` (`recycled_ports_by_addr` in
+  `src/nat/allocator.rs`) — `push_back` on release, `pop_front` on
+  allocation. FIFO recycles the OLDEST-freed port first, maximizing the
+  wall-clock gap before any port is reassigned so reuse spreads across
+  the upstream's 2MSL/TIME_WAIT window. The pre-#3011 `Vec` push/pop at
+  the back was LIFO: the just-freed port was the FIRST reassigned — the
+  worst case for colliding with lingering peer TIME_WAIT state. This
+  composes with the #3047 (062-10) collision-retain logic: a popped port
+  whose owner slot is still occupied is RETAINED (re-queued at the back),
+  never discarded, so a transient collision cannot shrink the pool;
+  re-queued collided ports go behind the genuinely-free ports so FIFO
+  order among the free ports is preserved. Fail-on-revert:
+  `pool_snat_recycle_order_is_fifo_not_lifo` in `src/nat/tests.rs`
+  (reverting to a back-popping LIFO queue flips the reuse order RED).
 - `HEARTBEAT_GRACE_PERIOD_NS = 6 s` is defined in
   `userspace-dp/src/afxdp/mod.rs` but currently `#[allow(dead_code)]`
   — reserved for future XDP-shim heartbeat gating logic. Workers
