@@ -1,3 +1,18 @@
+## 2026-06-26 — #2940 VRRP strict-VIP: force GARP/NA on unsuppress edge while MASTER
+
+- **Timestamp**: 2026-06-26
+- **Action**: `SetGARPSuppression` now detects the true→false suppression edge
+  (atomic `Swap`) and, if the instance is already in `StateMaster`, fires a
+  forced async GARP/NA burst (`go vi.sendGARP(true)`). Fixes the strict-vip
+  blackhole where promoting an already-MASTER instance left the VIP silent
+  until the periodic timer. `force=true` defeats the 500ms dampener; the
+  per-epoch dedup still applies (edge-only, idempotent re-apply does not
+  re-burst). Added `pkg/vrrp/manager_garp_unsuppress_test.go` (6 tests,
+  fail-on-revert verified against `Store`). Doc: ha-same-l2-vip-ownership.md.
+- **File(s)**: pkg/vrrp/manager.go,
+  pkg/vrrp/manager_garp_unsuppress_test.go,
+  docs/next-features/ha-same-l2-vip-ownership.md, _Log.md
+
 ## 2026-06-26 — #3225 host-inbound: address-family-aware service/protocol matches
 
 - **Timestamp**: 2026-06-26
