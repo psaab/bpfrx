@@ -5969,8 +5969,11 @@ type MatchPoliciesRequest struct {
 	DestinationIp   string                 `protobuf:"bytes,4,opt,name=destination_ip,json=destinationIp,proto3" json:"destination_ip,omitempty"`
 	DestinationPort int32                  `protobuf:"varint,5,opt,name=destination_port,json=destinationPort,proto3" json:"destination_port,omitempty"`
 	Protocol        string                 `protobuf:"bytes,6,opt,name=protocol,proto3" json:"protocol,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// source_port lets the simulator honor source-port-constrained application
+	// terms (#3042). 0 = unspecified (does not constrain the match).
+	SourcePort    int32 `protobuf:"varint,7,opt,name=source_port,json=sourcePort,proto3" json:"source_port,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *MatchPoliciesRequest) Reset() {
@@ -6043,6 +6046,13 @@ func (x *MatchPoliciesRequest) GetProtocol() string {
 		return x.Protocol
 	}
 	return ""
+}
+
+func (x *MatchPoliciesRequest) GetSourcePort() int32 {
+	if x != nil {
+		return x.SourcePort
+	}
+	return 0
 }
 
 type MatchPoliciesResponse struct {
@@ -7393,14 +7403,16 @@ const file_xpf_proto_rawDesc = "" +
 	"\x05state\x18\x03 \x01(\tR\x05state\x12\x1a\n" +
 	"\bpriority\x18\x04 \x01(\x05R\bpriority\x12+\n" +
 	"\x11virtual_addresses\x18\x05 \x03(\tR\x10virtualAddresses\x12\x18\n" +
-	"\apreempt\x18\x06 \x01(\bR\apreempt\"\xd7\x01\n" +
+	"\apreempt\x18\x06 \x01(\bR\apreempt\"\xf8\x01\n" +
 	"\x14MatchPoliciesRequest\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12\x1b\n" +
 	"\tsource_ip\x18\x03 \x01(\tR\bsourceIp\x12%\n" +
 	"\x0edestination_ip\x18\x04 \x01(\tR\rdestinationIp\x12)\n" +
 	"\x10destination_port\x18\x05 \x01(\x05R\x0fdestinationPort\x12\x1a\n" +
-	"\bprotocol\x18\x06 \x01(\tR\bprotocol\"\xd8\x01\n" +
+	"\bprotocol\x18\x06 \x01(\tR\bprotocol\x12\x1f\n" +
+	"\vsource_port\x18\a \x01(\x05R\n" +
+	"sourcePort\"\xd8\x01\n" +
 	"\x15MatchPoliciesResponse\x12\x1f\n" +
 	"\vpolicy_name\x18\x01 \x01(\tR\n" +
 	"policyName\x12\x16\n" +

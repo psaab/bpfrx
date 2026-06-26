@@ -8,6 +8,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/policymatch"
 )
 
 func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) error {
@@ -239,7 +240,7 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 	// Parse arguments: from-zone <z> to-zone <z> source-ip <ip> destination-ip <ip>
 	//                   destination-port <p> protocol <proto>
 	var fromZone, toZone, srcIP, dstIP, proto string
-	var dstPort int
+	var dstPort, srcPort int
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "from-zone":
@@ -266,6 +267,11 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 			if i+1 < len(args) {
 				i++
 				dstPort, _ = strconv.Atoi(args[i])
+			}
+		case "source-port":
+			if i+1 < len(args) {
+				i++
+				srcPort, _ = strconv.Atoi(args[i])
 			}
 		case "protocol":
 			if i+1 < len(args) {
@@ -295,48 +301,39 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 	parsedSrc := net.ParseIP(srcIP)
 	parsedDst := net.ParseIP(dstIP)
 
-	// Find the zone-pair policy
-	for _, zpp := range cfg.Security.Policies {
-		if zpp.FromZone != fromZone || zpp.ToZone != toZone {
-			continue
-		}
-
-		for _, pol := range zpp.Policies {
-			// Check source address match
-			if !matchPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
-				continue
-			}
-			// Check destination address match
-			if !matchPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
-				continue
-			}
-			// Check application match
-			if !matchPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
-				continue
-			}
-
-			// Found a match
-			action := "permit"
-			switch pol.Action {
-			case 1:
-				action = "deny"
-			case 2:
-				action = "reject"
-			}
-			fmt.Printf("Matching policy:\n")
-			fmt.Printf("  From zone: %s, To zone: %s\n", fromZone, toZone)
-			fmt.Printf("  Policy: %s\n", pol.Name)
-			if pol.Description != "" {
-				fmt.Printf("    Description: %s\n", pol.Description)
-			}
-			fmt.Printf("    Source addresses: %v\n", pol.Match.SourceAddresses)
-			fmt.Printf("    Destination addresses: %v\n", pol.Match.DestinationAddresses)
-			fmt.Printf("    Applications: %v\n", pol.Match.Applications)
-			fmt.Printf("    Action: %s\n", action)
-			return nil
-		}
+	// #3042: delegate to the single shared simulator so the CLI agrees with
+	// the runtime evaluator. The pre-#3042 loop scanned only zone-pair
+	// policies (never globals), hard-coded "default deny" (ignoring
+	// default-policy permit-all), and used a narrow address/app matcher that
+	// missed predefined apps, nested application-sets, literal CIDRs,
+	// any-ipv4/any-ipv6, and source/destination exclusion.
+	res := policymatch.Match(cfg, policymatch.Query{
+		FromZone: fromZone,
+		ToZone:   toZone,
+		SrcIP:    parsedSrc,
+		DstIP:    parsedDst,
+		Protocol: proto,
+		SrcPort:  srcPort,
+		DstPort:  dstPort,
+	})
+	if !res.Matched {
+		fmt.Printf("No matching policy found for %s -> %s (default %s)\n",
+			fromZone, toZone, policymatch.ActionString(res.Action))
+		return nil
 	}
-
-	fmt.Printf("No matching policy found for %s -> %s (default deny)\n", fromZone, toZone)
+	if res.Global {
+		fmt.Printf("Matching policy (global):\n")
+	} else {
+		fmt.Printf("Matching policy:\n")
+	}
+	fmt.Printf("  From zone: %s, To zone: %s\n", fromZone, toZone)
+	fmt.Printf("  Policy: %s\n", res.PolicyName)
+	if res.Description != "" {
+		fmt.Printf("    Description: %s\n", res.Description)
+	}
+	fmt.Printf("    Source addresses: %v\n", res.SrcAddresses)
+	fmt.Printf("    Destination addresses: %v\n", res.DstAddresses)
+	fmt.Printf("    Applications: %v\n", res.Applications)
+	fmt.Printf("    Action: %s\n", policymatch.ActionString(res.Action))
 	return nil
 }

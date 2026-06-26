@@ -49,3 +49,14 @@ both the daemon-local CLI (xpfd in TTY mode) and the remote CLI
   because an empty `ClearSessionsRequest` means clear-all to the peer.
   Key ports are network byte order (`ntohs` before comparing) and
   dataplane IPv4 NAT fields decode with NativeEndian (`uint32ToIP`).
+- `show security match-policies` (`showMatchPolicies`) and `test policy`
+  (`testPolicy`) are THIN adapters over the single shared policy simulator
+  `pkg/policymatch` (#3042) — the same matcher the REST and gRPC surfaces
+  use. The pre-#3042 hand-written CLI matchers (the removed
+  `matchPolicyAddr`/`matchPolicyApp`/`matchSingleApp` in `cli_helpers.go`)
+  scanned only zone-pair policies, hard-coded a `default deny` message, and
+  missed predefined apps, multi-level application-sets, literal CIDRs,
+  `any-ipv4`/`any-ipv6`, and source/destination exclusion — so the
+  diagnostic could report the OPPOSITE of what the dataplane enforces.
+  `policymatch.Match` now honors the configured `default-policy` and reports
+  whether a global policy matched.
