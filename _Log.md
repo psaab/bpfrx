@@ -40,11 +40,22 @@
   userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
   docs/syn-cookie-flood-protection.md, _Log.md
 - **Validation**: cargo build --release -p xpf-userspace-dp (0 errors); cargo
-  test --release -p xpf-userspace-dp → 3022 passed, 2 ignored. New tests:
-  `syn_cookie_current_full_epoch_is_pure_wall_clock_passthrough` (pins leaf ==
-  full_epoch_from_unix_secs for sample seconds) and
+  test --release -p xpf-userspace-dp → 3022 passed, 2 ignored (a later run saw
+  2 unrelated afxdp concurrency flakes — wg::engine reconcile_peers_snapshot
+  and worker_queue concurrent_recovery — both pass in isolation; screen suite
+  137/137 green). Three tests:
+  `syn_cookie_current_full_epoch_is_pure_wall_clock_passthrough` (pins the leaf
+  == full_epoch_from_unix_secs for sample seconds — leaf-level guard) and
   `syn_cookie_round_trip_with_cached_wall_secs` (mint/validate round-trip across
-  the ±1-epoch window; 2 epochs ahead fails as before).
+  the ±1-epoch window; 2 epochs ahead fails as before — codec-level guard).
+  REVIEW FOLD: added `syn_cookie_screen_state_epoch_uses_wall_clock_not_monotonic`
+  — drives `ScreenState::current_syn_cookie_full_epoch(mono=5)` (no test
+  override) and asserts the returned epoch equals the LIVE Unix wall-clock epoch
+  (anchored via `read_unix_wall_secs()`, bracketed for 64s-boundary tolerance)
+  and is NOT `full_epoch_from_unix_secs(5)` and not 0. This is the call-site
+  clock-domain guard the leaf tests could not provide: reverting the call site to
+  `current_full_epoch(mono_now_secs)` was empirically verified RED→GREEN (RED:
+  "epoch must come from the live Unix wall clock (27850618..=27850618), got 0").
 
 ## 2026-06-25 — #3060: reject accepted-but-inert bare `then log` at commit
 

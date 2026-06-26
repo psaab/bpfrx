@@ -1923,6 +1923,46 @@ fn syn_cookie_round_trip_with_cached_wall_secs() {
 }
 
 #[test]
+fn syn_cookie_screen_state_epoch_uses_wall_clock_not_monotonic() {
+    // #3032 (call-site clock-domain guard): `current_syn_cookie_full_epoch`
+    // takes the batch-cached MONOTONIC second purely as a once-per-second
+    // refresh throttle, but must derive the epoch from the cached Unix
+    // wall-clock seconds — NOT from the monotonic argument. This is the exact
+    // HA-breaking regression the issue feared: feeding `mono_now_secs` into
+    // the epoch (`current_full_epoch(mono_now_secs)`) would compile and pass
+    // every leaf/codec test. This test fails if that happens.
+    //
+    // No `set_syn_cookie_full_epoch_for_test` override here — that would
+    // short-circuit the very selection under test.
+    let mut state = make_state("trust", ScreenProfile::default());
+
+    // A small monotonic second lands in a wildly different epoch bucket than
+    // the live wall clock (~1.7e9s ⇒ epoch ~28M vs. epoch 0 for 5s), so the
+    // two are always distinguishable regardless of when the test runs.
+    let mono_now_secs = 5u64;
+    let monotonic_epoch = SynCookieCodec::full_epoch_from_unix_secs(mono_now_secs);
+
+    // Bracket the call with wall-clock samples from the SAME source the
+    // implementation uses, so a 64s-boundary crossing during the call cannot
+    // flake the assertion.
+    let wall_epoch_before =
+        SynCookieCodec::full_epoch_from_unix_secs(ScreenState::read_unix_wall_secs());
+    let got = state.current_syn_cookie_full_epoch(mono_now_secs);
+    let wall_epoch_after =
+        SynCookieCodec::full_epoch_from_unix_secs(ScreenState::read_unix_wall_secs());
+
+    assert!(
+        got == wall_epoch_before || got == wall_epoch_after,
+        "epoch must come from the live Unix wall clock ({wall_epoch_before}..={wall_epoch_after}), got {got}",
+    );
+    assert_ne!(
+        got, monotonic_epoch,
+        "epoch must NOT be derived from the monotonic argument ({mono_now_secs}s ⇒ epoch {monotonic_epoch})",
+    );
+    assert_ne!(got, 0, "a live wall-clock epoch is never 0 (1970)");
+}
+
+#[test]
 fn syn_cookie_wall_clock_epoch_survives_peer_uptime_skew() {
     let codec = syn_cookie_codec();
     let tuple = syn_cookie_tuple();
