@@ -52,6 +52,12 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
         let nat = fwd.decision.nat;
         let original_src = fwd.key.src_ip;
         let original_src_port = fwd.key.src_port;
+        // #3112: forward session key holds the ORIGINAL (pre-NAT) tuple;
+        // its dst is the public address the client used. DNAT66/static
+        // sets rewrite_dst so the builder un-NATs the embedded dst; for
+        // an SNAT-only flow this equals the embedded dst (no-op).
+        let original_dst = fwd.key.dst_ip;
+        let original_dst_port = fwd.key.dst_port;
         let resolution = embedded_icmp_return_resolution(
             ctx,
             &fwd.key,
@@ -63,6 +69,8 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
             nat,
             original_src,
             original_src_port,
+            original_dst,
+            original_dst_port,
             embedded_proto: hdr.proto,
             resolution,
             metadata: fwd.metadata,
@@ -115,6 +123,10 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
             nat: sl.decision.nat,
             original_src: emb_src_lookup,
             original_src_port: hdr.src_port,
+            // Plain (non-forward-NAT) match: nothing to un-DNAT, so the
+            // embedded dst is preserved unchanged (#3112 no-op).
+            original_dst: hdr.dst,
+            original_dst_port: hdr.dst_port,
             embedded_proto: hdr.proto,
             resolution,
             metadata: sl.metadata,

@@ -20025,3 +20025,22 @@ top.
   pkg/grpcapi/server_show_policies_text.go,
   pkg/grpcapi/server_show_policies_scheduler_3062_test.go,
   docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3112 — embedded-ICMP DNAT/static destination reversal. Added
+  `original_dst`/`original_dst_port` to `EmbeddedIcmpMatch`, populated from
+  the forward session key (`fwd.key.dst_ip`/`dst_port`) at the v4/v6 NAT
+  match sites. The v4/v6 builders now un-DNAT the embedded (quoted)
+  destination IP + transport port and rewrite the outer source when the
+  matched session carries a destination NAT (`rewrite_dst.is_some()`),
+  recomputing the embedded IPv4 and outer ICMP/ICMPv6 checksums. Gated off
+  for SNAT-only/no-NAT flows (byte-identical). Added 4 Rust tests (v4 DNAT,
+  v4 static, v4 SNAT-only regression guard, v6 DNAT66) + fail-on-revert
+  proof. Doc: `docs/userspace-icmp-te-debugging.md`.
+  **File(s)**: userspace-dp/src/afxdp/icmp_embed/mod.rs,
+  userspace-dp/src/afxdp/icmp_embed/nat_match_v4.rs,
+  userspace-dp/src/afxdp/icmp_embed/nat_match_v6.rs,
+  userspace-dp/src/afxdp/icmp_embed/builders.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  docs/userspace-icmp-te-debugging.md
