@@ -129,10 +129,14 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) {
 }
 
 // hostInboundHasEnforceableView reports whether at least one view carries a
-// resolvable address. A configured zone with no address (e.g. DHCP-only) cannot
-// be scoped to a deny, so it produces nothing; if NO zone is enforceable the
-// whole table is removed (fail-open is the safe direction for this
-// lifeline-adjacent feature).
+// resolvable address. Static, VRRP-VIP and DHCP/DHCPv6-learned addresses all
+// count: the live interface snapshot enumerates every kernel address via
+// AddrList(FAMILY_ALL), so a DHCP-only interface with a live lease IS scoped
+// (#3224 — see BuildZoneHostInboundViews). The only no-address case left is a
+// configured zone whose interfaces have no static address AND no live address
+// yet (e.g. a DHCP WAN before its first lease). That zone produces nothing; if
+// NO zone is enforceable the whole table is removed (it self-heals once an
+// address appears, because the lease-change / commit paths re-render).
 func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool {
 	for _, v := range views {
 		if len(v.V4Addrs) > 0 || len(v.V6Addrs) > 0 {

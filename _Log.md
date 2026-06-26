@@ -32,6 +32,77 @@
   userspace-dp/src/afxdp/forwarding/host_inbound.rs,
   userspace-dp/src/afxdp/forwarding_build/tests.rs,
   userspace-dp/src/afxdp/forwarding/README.md
+## 2026-06-26 — #3232 flexible-match-range: implement match-start layer-4, reject payload
+
+- **Timestamp**: 2026-06-26
+- **Action**: `flexible-match-range match-start <X>` stored `MatchStart` but the
+  wire builder + Rust matcher (#3077) ignored it and were ALWAYS L3-relative,
+  so `match-start layer-4`/`payload` committed clean and silently matched the
+  WRONG offset (treated as L3 — a security evasion). Fix (chosen path:
+  IMPLEMENT layer-4 since `meta.l4_offset` is cleanly available; FAIL-CLOSED
+  reject payload/unknown since payload start needs the L4 header length, not
+  cleanly available to the matcher):
+    - Go compiler (`compiler_firewall.go`): allowlist `match-start` to
+      `layer-3`/`layer-4`; any other value (incl. `payload`) is recorded on
+      `term.UnknownFlexMatch` → `validateFilterFlexMatchStrict` fails the commit
+      (downgraded to a warning on the tolerant peer-sync path, #1960).
+    - Wire (`protocol.go` + `filters.go`): added `FlexMatchSnapshot.MatchStart`
+      (json `match_start,omitempty`). layer-3 maps to "" so the wire stays
+      byte-identical for every pre-#3232 term; only `layer-4` emits a value.
+    - Rust (`security.rs`, `compiler.rs`, `filter/mod.rs`, `engine/matching.rs`,
+      `afxdp/frame/inspect.rs`): new `FlexMatchStart` enum
+      (Layer3/Layer4/Unsupported, serde `match_start` default + skip-if-empty,
+      so the protocol_wire_v1 fixture is unchanged). `TermMatchExtra` gains
+      `flex_l4` (the transport-header slice at `meta.l4_offset`, None on a
+      non-first fragment / meta-only / deferred path). `flex_matches` selects
+      the base slice by `flex_match_start`; Unsupported fails closed.
+  - **Fail-on-revert proven**: Rust `flex_match_layer4_matches_at_l4_offset`
+    goes RED if the matcher ignores `flex_match_start` (reads L3); Go
+    `TestFlexibleMatchRangeRejectsPayloadStart` goes RED if the allowlist is
+    removed (payload compiles clean).
+  - **File(s)**: pkg/config/compiler_firewall.go,
+    pkg/config/compiler_validate_strict.go,
+    pkg/config/parser_security_test.go,
+    pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/filters.go,
+    pkg/dataplane/userspace/filters_flex_match_3077_test.go,
+    userspace-dp/src/protocol/security.rs, userspace-dp/src/filter/compiler.rs,
+    userspace-dp/src/filter/mod.rs, userspace-dp/src/filter/engine/matching.rs,
+    userspace-dp/src/afxdp/frame/inspect.rs, userspace-dp/src/filter/tests.rs,
+    userspace-dp/src/filter/README.md, docs/feature-gaps.md, _Log.md
+## 2026-06-26 — #3224 host-inbound DHCP scope: NON-REPRODUCING (doc correction + real regression test)
+
+- **Timestamp**: 2026-06-26
+- **Action**: Reworked after hostile review found the prior "SECURITY
+  fail-open fix" was byte-identical to master in production and its test
+  used an injected fake `dynAddrs` provider that never exercised the
+  production address source. VERIFIED the #3224 premise does NOT
+  reproduce: master's `BuildZoneHostInboundViews` already resolves each
+  zone's addresses through `buildInterfaceSnapshots` ->
+  `buildLinkSnapshot` -> `buildInterfaceAddressSnapshots` ->
+  `netlink.AddrList(FAMILY_ALL)`, which enumerates EVERY kernel address
+  with NO scope/flag/dynamic filtering — so DHCP/DHCPv6-learned addresses
+  were ALREADY captured and scoped by the deny. Reverted the no-op 3-source
+  refactor (and the injected-seam that enabled the misleading test) so
+  `BuildZoneHostInboundViews` code is byte-identical to master. CORRECTED
+  master's false doc comment (which claimed "a DHCP-only interface yields
+  an empty address set -> fail-open") in zones.go, daemon_nft.go, and
+  pkg/daemon/README.md to state that DHCP/DHCPv6 addresses ARE captured via
+  the live snapshot, plus the lease-change refresh path. REPLACED the fake
+  test with `TestBuildZoneHostInboundViewsScopesKernelLearnedAddr`, which
+  drives the REAL production path (`BuildZoneHostInboundViews` ->
+  `buildInterfaceSnapshots` -> `AddrList`) using the loopback interface as
+  a kernel address absent from the static config (modeling DHCP), with no
+  fake provider and no root. It asserts the kernel-learned address IS
+  scoped — a fail-on-revert guard against a future filter regression.
+- **File(s)**: pkg/dataplane/userspace/zones.go (comment only — code
+  reverted to master), pkg/dataplane/userspace/zones_host_inbound_test.go,
+  pkg/daemon/daemon_nft.go (comment), pkg/daemon/README.md
+- **Validation**: `go build ./...`; `go test ./pkg/dataplane/...
+  ./pkg/daemon/...` green. Verified empirically: the new real-path test
+  PASSES on master-equivalent code (proving master already scopes a
+  config-absent kernel address); a destructive probe that drops the live
+  snapshot loop turns it RED (untrust loses 127.0.0.1/::1) while the new
+  test isolates the dynamic-address property — restored byte-identical.
 
 ## 2026-06-26 — #3229 dest-NAT: `match destination-address-name` (address-book reference)
 

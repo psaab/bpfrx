@@ -208,11 +208,21 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 			if length > 4 {
 				length = 4 // the wire value is a u32; cap defensively
 			}
+			// #3232: carry the match-start base. layer-3 (default) maps to ""
+			// so the wire stays byte-identical for every pre-#3232 term
+			// (omitempty); only an explicit layer-4 emits a value. The compiler
+			// has already rejected payload/unknown at commit, so MatchStart is
+			// only ever "layer-3" or "layer-4" here.
+			matchStart := ""
+			if fm.MatchStart == "layer-4" {
+				matchStart = "layer-4"
+			}
 			snap.FlexMatch = &FlexMatchSnapshot{
-				Offset: fm.ByteOffset,
-				Length: uint8(length),
-				Value:  fm.Value & fm.Mask,
-				Mask:   fm.Mask,
+				Offset:     fm.ByteOffset,
+				Length:     uint8(length),
+				Value:      fm.Value & fm.Mask,
+				Mask:       fm.Mask,
+				MatchStart: matchStart,
 			}
 		}
 		terms = append(terms, snap)

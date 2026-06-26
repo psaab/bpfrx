@@ -3016,7 +3016,8 @@ func validateFilterFlexMatchStrict(cfg *Config) error {
 				return fmt.Errorf(
 					"firewall family %s filter %q term %q: invalid "+
 						"flexible-match-range %q (byte-offset 0-255, bit-length "+
-						"1-32, match-value/match-mask a hex value up to 0xFFFFFFFF)",
+						"1-32, match-value/match-mask a hex value up to "+
+						"0xFFFFFFFF, match-start layer-3 or layer-4)",
 					family, name, term.Name, term.UnknownFlexMatch[0])
 			}
 		}

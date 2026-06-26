@@ -76,30 +76,42 @@ fn per_packet_l4_matches(term: &FilterTerm, protocol: u8, extra: TermMatchExtra<
             return false;
         }
     }
-    // #3077 flexible-match-range: a byte-offset match against the L3 header.
-    if !flex_matches(term, extra.flex_l3) {
+    // #3077 flexible-match-range: a byte-offset match against the L3 header
+    // (match-start layer-3) or, since #3232, the L4 header (match-start
+    // layer-4). The base slice is selected by the term's `flex_match_start`.
+    if !flex_matches(term, extra.flex_l3, extra.flex_l4) {
         return false;
     }
     true
 }
 
-/// #3077: evaluate a term's flexible-match-range byte-offset condition. A term
-/// without the constraint (`flex_enabled == false`) is a no-op (returns true).
-/// Otherwise the match reads `flex_length` bytes (compiler-bounded to 1..=4) at
-/// `flex_offset` from the START of the L3 header (`flex_l3`, match-start
-/// layer-3 — the only start point the Go compiler emits), assembles them
-/// big-endian (network order) into a u32, ANDs with `flex_mask`, and requires
-/// the result to equal `flex_value` (pre-masked).
+/// #3077/#3232: evaluate a term's flexible-match-range byte-offset condition. A
+/// term without the constraint (`flex_enabled == false`) is a no-op (returns
+/// true). Otherwise the match reads `flex_length` bytes (compiler-bounded to
+/// 1..=4) at `flex_offset` from the START of the base header selected by the
+/// term's `flex_match_start`:
+///   - `Layer3` (match-start layer-3, the #3077 default): from `flex_l3`, the
+///     start of the L3/IP header.
+///   - `Layer4` (match-start layer-4, #3232): from `flex_l4`, the start of the
+///     L4/transport header (`meta.l4_offset`).
+///   - `Unsupported` (an unrecognized match-start, e.g. `payload`, that slipped
+///     past the Go commit gate on the tolerant peer-sync path): always FALSE —
+///     fail closed rather than evaluate at the wrong base.
+/// The chosen bytes are assembled big-endian (network order) into a u32, ANDed
+/// with `flex_mask`, and required to equal `flex_value` (pre-masked).
 ///
-/// FAIL-CLOSED contract (the #3077 fix): the term matches ONLY when the window
-/// fully lies within the available L3 bytes. If `flex_l3` is `None` (no frame
-/// on this path) or the packet is too short to hold `offset + length` bytes, the
-/// condition is FALSE — the term does not match. This is the opposite of the
-/// pre-fix behavior, where the constraint was dropped on the wire and the term
-/// matched every packet (fail-open). Bounds are checked before indexing, so a
+/// FAIL-CLOSED contract (the #3077 fix, extended by #3232): the term matches
+/// ONLY when the window fully lies within the available base bytes. If the base
+/// slice is `None` (no frame on this path; or, for layer-4, a non-first fragment
+/// or meta-only path with no L4 header) or the packet is too short to hold
+/// `offset + length` bytes, the condition is FALSE — the term does not match.
+/// This is the opposite of the pre-#3077 behavior, where the constraint was
+/// dropped on the wire and the term matched every packet (fail-open), and of the
+/// pre-#3232 behavior, where a layer-4/payload match was silently evaluated at
+/// the L3 base (wrong-offset match). Bounds are checked before indexing, so a
 /// truncated/short packet can never read out of bounds or panic.
 #[inline(always)]
-fn flex_matches(term: &FilterTerm, flex_l3: Option<&[u8]>) -> bool {
+fn flex_matches(term: &FilterTerm, flex_l3: Option<&[u8]>, flex_l4: Option<&[u8]>) -> bool {
     if !term.flex_enabled {
         return true;
     }
@@ -109,21 +121,29 @@ fn flex_matches(term: &FilterTerm, flex_l3: Option<&[u8]>) -> bool {
     if !(1..=4).contains(&len) {
         return false;
     }
-    let Some(l3) = flex_l3 else {
-        // No L3 bytes on this path — cannot evaluate the constraint, so it must
-        // NOT match (fail closed), never silently pass.
+    // #3232: select the base slice for the configured match-start. An
+    // unsupported start (e.g. payload, on the tolerant peer-sync path) fails
+    // closed — never evaluated at the wrong base.
+    let base = match term.flex_match_start {
+        FlexMatchStart::Layer3 => flex_l3,
+        FlexMatchStart::Layer4 => flex_l4,
+        FlexMatchStart::Unsupported => return false,
+    };
+    let Some(bytes) = base else {
+        // No base bytes on this path — cannot evaluate the constraint, so it
+        // must NOT match (fail closed), never silently pass.
         return false;
     };
     let off = term.flex_offset as usize;
     let Some(end) = off.checked_add(len) else {
         return false;
     };
-    if end > l3.len() {
+    if end > bytes.len() {
         // Packet too short to reach the match window — fail closed.
         return false;
     }
     let mut val: u32 = 0;
-    for &b in &l3[off..end] {
+    for &b in &bytes[off..end] {
         val = (val << 8) | u32::from(b);
     }
     (val & term.flex_mask) == term.flex_value
