@@ -136,6 +136,105 @@ func TestBuildZoneHostInboundViews(t *testing.T) {
 	}
 }
 
+// TestBuildZoneHostInboundViewsIncludesVRRPVIP verifies #3172: a zone whose
+// RETH unit carries VRRP virtual addresses (VIPs) gets those VIPs into its
+// host-inbound destination address set, so the kernel deny is scoped to the VIP
+// on BOTH cluster nodes — including the backup, where the VIP is not yet live on
+// the kernel interface (and thus absent from the live address snapshot). A
+// standalone zone with no VIP is unchanged, and a VIP configured on a lifeline
+// interface (em0) is still excluded.
+func TestBuildZoneHostInboundViewsIncludesVRRPVIP(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
+			50: {
+				Number:    50,
+				VlanID:    50,
+				Addresses: []string{"172.16.50.8/24", "2001:db8:50::8/64"},
+				VRRPGroups: map[string]*config.VRRPGroup{
+					"172.16.50.8/24":    {ID: 50, VirtualAddresses: []string{"172.16.50.1"}},
+					"2001:db8:50::8/64": {ID: 51, VirtualAddresses: []string{"2001:db8:50::1"}},
+				},
+			},
+		}},
+		// standalone zone interface — no VRRP, must be unchanged.
+		"reth1": {Name: "reth1", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"10.0.61.1/24"}},
+		}},
+		// lifeline (cluster control plane) with a VRRP group — its VIP must NOT
+		// be scoped (denying on em0 could break HA).
+		"em0": {Name: "em0", Units: map[int]*config.InterfaceUnit{
+			0: {
+				Number:    0,
+				Addresses: []string{"10.99.0.1/24"},
+				VRRPGroups: map[string]*config.VRRPGroup{
+					"10.99.0.1/24": {ID: 99, VirtualAddresses: []string{"10.99.0.254"}},
+				},
+			},
+		}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"wan": {
+			Name:               "wan",
+			Interfaces:         []string{"reth0.50"},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}},
+		},
+		"lan": {
+			Name:               "lan",
+			Interfaces:         []string{"reth1.0"},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}},
+		},
+		"control": {
+			Name:               "control",
+			Interfaces:         []string{"em0"},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"all"}},
+		},
+	}
+
+	views := BuildZoneHostInboundViews(cfg)
+	byZone := make(map[string]ZoneHostInboundView, len(views))
+	for _, v := range views {
+		byZone[v.Zone] = v
+	}
+
+	wan, ok := byZone["wan"]
+	if !ok {
+		t.Fatal("wan view missing")
+	}
+	// Static interface address first, then the VRRP VIP (#3172). Without the
+	// VIP-inclusion the VIP entries are absent and the deny is unscoped for the
+	// VIP (fail-open) — this assertion is the fail-on-revert guard.
+	if !eqStr(wan.V4Addrs, []string{"172.16.50.8", "172.16.50.1"}) {
+		t.Errorf("wan v4 addrs = %v, want [172.16.50.8 172.16.50.1] (static + VIP)", wan.V4Addrs)
+	}
+	if !eqStr(wan.V6Addrs, []string{"2001:db8:50::8", "2001:db8:50::1"}) {
+		t.Errorf("wan v6 addrs = %v, want [2001:db8:50::8 2001:db8:50::1] (static + VIP)", wan.V6Addrs)
+	}
+
+	// lan has no VRRP group → byte-identical to pre-#3172 (static only).
+	lan, ok := byZone["lan"]
+	if !ok {
+		t.Fatal("lan view missing")
+	}
+	if !eqStr(lan.V4Addrs, []string{"10.0.61.1"}) {
+		t.Errorf("lan v4 addrs = %v, want [10.0.61.1] (standalone, unchanged)", lan.V4Addrs)
+	}
+	if len(lan.V6Addrs) != 0 {
+		t.Errorf("lan v6 addrs = %v, want empty", lan.V6Addrs)
+	}
+
+	// control/em0 is a lifeline → neither its static address nor its VIP is
+	// scoped (no deny, can never break HA).
+	control, ok := byZone["control"]
+	if !ok {
+		t.Fatal("control view missing")
+	}
+	if len(control.V4Addrs) != 0 || len(control.V6Addrs) != 0 {
+		t.Errorf("control/em0 lifeline must contribute no addresses (incl. VIP), got v4=%v v6=%v",
+			control.V4Addrs, control.V6Addrs)
+	}
+}
+
 func TestHostInboundLifelineInterface(t *testing.T) {
 	for _, name := range []string{"fxp0", "fxp0.0", "em0", "em0.0", "fab0", "fab1", "fab1.0"} {
 		if !hostInboundLifelineInterface(name) {
