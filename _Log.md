@@ -1,3 +1,19 @@
+## 2026-06-25 — #3060: reject accepted-but-inert bare `then log` at commit
+
+- **Timestamp**: 2026-06-25
+- **Action**: A bare security-policy `then log` (no session-init/session-close)
+  compiled to a non-nil `PolicyLog` with both flags false — reported as
+  logging-enabled over REST/gRPC/CLI but emitting NO session records (silent
+  audit gap). Added `validatePolicyLogActionStrict` (strict-with-lenient
+  #1960/#3043 pattern): hard-rejects bare `then log` at commit (Junos parity —
+  session-init/session-close required), covering both zone-pair AND global
+  policies; downgraded to a `cfg.Warnings` entry on the two lenient
+  constructors via `lenientPolicyLogAction` so a persisted/peer-synced config
+  still boots. Rejecting at commit moots the REST/gRPC/CLI display divergence.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/policy_log_action_3060_test.go,
+  pkg/config/README.md, _Log.md
+
 ## 2026-06-25 — #3067: ICMP pseudo-port only for identifier-bearing query types
 
 - **Timestamp**: 2026-06-25

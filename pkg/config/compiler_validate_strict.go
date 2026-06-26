@@ -1818,6 +1818,71 @@ func validatePolicyTerminalActionStrict(cfg *Config) error {
 	return nil
 }
 
+// validatePolicyLogActionStrict hard-rejects a security policy whose `then log`
+// names neither `session-init` nor `session-close` (#3060).
+//
+// Junos requires `then log` to carry at least one of session-init /
+// session-close — a bare `then log` is not valid syntax. xpf's schema accepts
+// the bare form, and compilePolicy sets pol.Log = &PolicyLog{} for it while
+// leaving both SessionInit and SessionClose false. The result is a config that
+// REPORTS logging enabled over REST (pkg/api/security.go: `Log: rule.Log !=
+// nil`) and gRPC/CLI, yet emits NO session records because both log flags are
+// false. On a security appliance this is the worst kind of silent gap: audit
+// looks active while producing nothing.
+//
+// Rejecting the bare form at commit (Junos parity) is the strongest, simplest
+// contract: no bare-log config can exist post-commit, which moots the
+// REST/gRPC/CLI display divergence entirely (every surface agrees because a
+// reported `pol.Log != nil` always carries at least one real session flag).
+// Both per-zone-pair policies and global policies are checked. Iteration order
+// (cfg.Security.Policies, then GlobalPolicies) is deterministic, so the
+// first-reported error is stable.
+//
+// Strict on the commit / commit-check path (CompileConfig — hard-reject);
+// downgraded to a cfg.Warnings entry on the tolerant load / peer-sync paths
+// (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientPolicyLogAction) so an already-persisted or peer-synced config that an
+// older binary accepted still BOOTS (#1960 fail-closed-on-load doctrine). A
+// leniently-loaded bare-log policy is harmless: it simply logs nothing (the
+// pre-existing behavior), and the warning is the operator's signal to fix it.
+// Same doctrine as validatePolicyTerminalActionStrict.
+func validatePolicyLogActionStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(scope string, pol *Policy) error {
+		if pol == nil || pol.Log == nil {
+			return nil
+		}
+		if pol.Log.SessionInit || pol.Log.SessionClose {
+			return nil
+		}
+		detail := "`then log` requires `session-init` and/or `session-close` " +
+			"(a bare `then log` reports logging enabled but emits NO session " +
+			"records — Junos requires at least one of session-init/session-close)"
+		if scope != "" {
+			return fmt.Errorf("%s policy %q: %s", scope, pol.Name, detail)
+		}
+		return fmt.Errorf("policy %q: %s", pol.Name, detail)
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if err := check("", pol); err != nil {
+				return err
+			}
+		}
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if err := check("global", pol); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // MaxUsableZoneID is the largest security-zone id the live AF_XDP userspace
 // dataplane can carry. Zone ids are assigned sequentially 1..N in
 // pkg/dataplane/compiler.go and reach the dataplane two ways: as the per-flow

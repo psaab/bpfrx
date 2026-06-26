@@ -166,6 +166,22 @@ path downgrades to a warning AND `compilePolicy` defaults an actionless
 policy's `Action` to `PolicyDeny`, so a leniently-loaded bad config fails
 closed rather than open. See `docs/config-schema.md` "#3043".
 
+**Security-policy `then log` requires session-init/session-close (#3060):**
+the schema accepts a bare `then log`, and `compilePolicy` compiles it to a
+non-nil `PolicyLog` with both `SessionInit` and `SessionClose` false. The
+policy then REPORTS logging enabled over REST (`pkg/api/security.go`:
+`Log: rule.Log != nil`), gRPC, and CLI, yet emits NO session records — on a
+security appliance, audit looks active while producing nothing. Junos
+requires at least one of session-init/session-close under `then log`.
+`validatePolicyLogActionStrict` (`compiler_validate_strict.go`) hard-rejects
+a policy (zone-pair OR global) whose `then log` names neither at commit;
+rejecting the bare form moots the REST/gRPC/CLI display divergence (no
+bare-log config can exist post-commit). The tolerant load/peer-sync path
+downgrades to a warning (`lenientPolicyLogAction`) so an already-persisted or
+peer-synced config still boots (#1960 no-brick) — a leniently-loaded bare-log
+policy simply logs nothing, exactly as before. Same fail-closed-on-load
+doctrine as #3043.
+
 **An interface belongs to exactly one security zone (#3072):**
 `pkg/dataplane/userspace.buildInterfaceZoneMap` builds the interface->zone
 lookup by iterating zone names in SORTED order and writing each interface
