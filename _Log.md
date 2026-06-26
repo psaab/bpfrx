@@ -1,3 +1,39 @@
+## 2026-06-26 — #3229 dest-NAT: `match destination-address-name` (address-book reference)
+
+- **Timestamp**: 2026-06-26
+- **Action**: Added `destination-address-name` support to source AND
+  destination NAT, mirroring the #2416 `source-address-name` mechanism
+  exactly. New `DestinationAddressName` field on `NATMatch`
+  (`pkg/config/types_security.go`); parsed in both the source and dest NAT
+  rule blocks of `pkg/config/compiler_nat.go`; schema leaf added to both
+  match blocks in `pkg/config/schema_security.go`. Resolution:
+  `appendNATDestinationAddressName` (`pkg/dataplane/userspace/nat.go`)
+  expands the name via the same `resolveUserspaceAddressBookEntry` expander
+  the policy + source-address-name paths use and feeds the resolved prefixes
+  into the existing destination list — no new wire field (each resolved DNAT
+  host installs its own exact-host snapshot row). Called from both
+  `buildSourceNATSnapshots` and `buildDestinationNATSnapshots`. Commit-time
+  reject: `validateNATSourceAddressNameReferencesStrict`
+  (`pkg/config/compiler_validate_strict.go`) extended to gate BOTH the source
+  and destination name leaves; lenient load/peer-sync downgrades to a warning
+  (#1960) and the dataplane fails closed (unknown name = unparseable token =
+  matches nothing). Warn-only parity check also added to the retired-eBPF
+  `pkg/dataplane/compiler_nat.go`.
+- **File(s)**: pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/compiler_nat.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/compiler_nat.go,
+  pkg/config/compiler_nat_dest_address_name_3229_test.go,
+  pkg/dataplane/userspace/nat_dest_address_name_3229_test.go,
+  docs/feature-gaps.md, docs/config-schema.md
+- **Tests**: Go `pkg/config` (parse both SNAT/DNAT, reject undefined both,
+  lenient-warns) + `pkg/dataplane/userspace` (resolve DNAT, literal+name
+  union, unknown fail-closed, resolve in source builder). Fail-on-revert:
+  neutralizing the dest-builder `appendNATDestinationAddressName` call turned
+  `TestBuildDestinationNATSnapshotsResolvesDestinationAddressName` RED (empty
+  destination list, rule dropped); restored byte-identical. Rust matcher
+  unchanged (names resolve to literals on the Go side, flow through the
+  existing `destination_address` snapshot field).
 ## 2026-06-26 — #3230 screen icmp/udp flood + port-scan + ip-sweep default thresholds
 
 - **Timestamp**: 2026-06-26

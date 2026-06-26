@@ -2284,7 +2284,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	if err := validateNATSourceAddressNameReferencesStrict(cfg); err != nil {
 		if opts.lenientFirewallRefs {
 			cfg.Warnings = append(cfg.Warnings,
-				fmt.Sprintf("NAT source-address-name reference (downgraded to warning on tolerant path): %v", err))
+				fmt.Sprintf("NAT address-name reference (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

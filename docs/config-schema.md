@@ -752,6 +752,22 @@ reserved for whole-dataplane selection where a rewrite shim
     plus a port-less whole-address 1:1 rule (the dataplane keys the
     static-NAT tables by `(IP, Option<port>)` and falls back to the
     port-less entry).
+  - `security nat source/destination rule-set rule match
+    destination-address-name <book-entry>` (#3229) — the destination twin
+    of the `source-address-name` leaf (#2416). It references an
+    `security address-book` address / address-set instead of a literal
+    prefix; the snapshot builder
+    (`appendNATDestinationAddressName`, `pkg/dataplane/userspace/nat.go`)
+    resolves the name through the same address-book expander the policy +
+    source-address-name paths use and feeds the resolved prefixes into the
+    existing destination list (no new wire field). For DNAT each resolved
+    host installs its own exact-host `DnatTable` entry; a non-host prefix is
+    stripped to its network address exactly like a literal `match
+    destination-address` CIDR. An undefined name is hard-rejected at commit
+    (`validateNATSourceAddressNameReferencesStrict`, which gates BOTH the
+    source and destination name leaves) and fails closed on the lenient
+    load / peer-sync path (the unresolved raw token cannot parse as an IP,
+    so the rule matches NOTHING rather than broadening to match-any).
   - `protocols router-advertisement interface` — typed the
     second-denominated leaves (`max/min-advertisement-interval`,
     `default-lifetime`, `link-mtu`; the latter was tightened from
