@@ -835,6 +835,57 @@ drift) closed in `fix/2008-quickwins-batch1`:
   cluster config has only explicit permit rules + `default-policy deny-all`,
   so blocked traffic rides the implicit default-deny — which bumps the
   aggregate `policy_deny` counter, not any per-rule counter).
+- **Runtime policy-ID namespaces under app-set expansion — #3145 FIXED,
+  #3143 found to be a misdiagnosis.** TWO distinct numeric namespaces coexist
+  by design, and conflating them is the trap this work clarified:
+  - The **dataplane snapshot PolicyID** is span-accumulated:
+    `policySetID*MaxRulesPerPolicy + ruleIndex`, where `ruleIndex` advances by
+    the application-set expansion count (one slot per expanded term). This
+    namespace serves the dataplane and the RT_FLOW/event path and is assigned
+    by `walkPolicyRuleSlots` / `buildPolicySnapshots`
+    (`pkg/dataplane/userspace/policies.go`).
+  - The **per-policy COUNTER read path is name-keyed.** The userspace helper
+    reports each rule's packets/bytes under its stable RuleID string
+    (`from->to/name`); the expanded rules of a multi-app policy aggregate
+    under that one name. `ReadPolicyCounters`'s numeric `policyID` argument is
+    only a HANDLE the read callers use to ask "which policy do I want a name
+    for", and EVERY production caller (`pkg/api/metrics_counters.go`,
+    `pkg/api/security.go`, `pkg/cli/cli_show_security*.go`,
+    `pkg/grpcapi/server_show_*.go`) builds that handle as
+    `policySetID*MaxRulesPerPolicy + sliceIndex` — the raw position in
+    `zpp.Policies`, NOT the expanded `ruleIndex`.
+
+  **#3145 (WRITE side, real bug — FIXED):** `buildPolicySnapshots` advanced
+  `ruleIndex` by the expansion count with no `MaxRulesPerPolicy` guard. A set
+  whose cumulative expansion reached 256 pushed the next policy's snapshot
+  PolicyID into the following set's base namespace, mis-attributing RT_FLOW
+  policy IDs and colliding the dataplane/event namespace. The legacy guard at
+  `compiler.go:765/901` is the retired-eBPF path and never fires here. The fix
+  routes ID assignment through `walkPolicyRuleSlots`, which enforces the cap
+  fail-closed — a set whose expansion reaches 256 is rejected at snapshot
+  build (the apply path retains the prior good dataplane state).
+
+  **#3143 (READ side, misdiagnosis — no functional change):** the issue
+  assumed `policyRuleIDForCounter`'s `policyID % MaxRulesPerPolicy` was wrong
+  because it read the remainder as a slice index. In fact that exactly matches
+  the slice-index handle every counter caller passes, so on master a policy
+  AFTER a multi-app policy already resolved to the CORRECT counter. The
+  counter store is name-keyed and the legacy `bpfShim` `policy_counters` array
+  is never incremented in userspace mode, so the numeric handle never indexes
+  a span-accumulated array — there is nothing to "round-trip" against; the
+  only requirement is caller/resolver agreement, and both use the slice index.
+  An initial attempt to make the resolver span-accumulated was itself a
+  regression (it mapped a caller's slice-index handle into the preceding
+  expanded policy's span) and was reverted; the resolver retains the
+  slice-index decode with an expanded comment documenting the dual namespace.
+
+  Regression tests in
+  `pkg/dataplane/userspace/policy_namespace_3143_3145_test.go`: the 255/256/257
+  -term cap boundary plus a literal spill-collision (#3145, fail-on-revert on
+  the cap), and an end-to-end counter test combining app-set expansion with a
+  per-policy counter assertion through the slice-index caller handle (the
+  coverage the suite lacked — fail-on-revert against a span-accumulated
+  resolver).
 - **Per-policy hit-count reset semantics — INTENTIONAL Junos divergence
   (FLAGGED, behavior unchanged).** Junos resets per-policy hit counters on a
   commit that changes the policy. xpf PRESERVES counts across recompile as

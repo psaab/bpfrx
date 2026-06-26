@@ -1582,6 +1582,144 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 	return nil
 }
 
+// validatePolicyMatchApplicationsStrict hard-rejects a security-policy
+// `match application <name>` token that resolves to NONE of: a predefined
+// junos-* application, a user-defined `applications application <name>`, or a
+// user-defined `applications application-set <name>` (#3144). Such a token (a
+// typo or an undefined app) was only WARNED at commit
+// (compiler_validate_warn.go), yet the userspace capability gate
+// (resolveUserspaceApplicationNames in pkg/dataplane/userspace/capabilities.go)
+// resolves the SAME name set and returns false for an unknown name →
+// expandUserspacePolicyApplications fails → userspaceSupportsSecurityPolicies
+// returns false → the dataplane REFUSES TO ARM security policies. The operator
+// gets a green commit and a silently DISARMED policy engine on the firewall's
+// primary allow/deny path — a commit/apply contract split. Failing the
+// undefined reference at commit turns the silent disarm into an
+// operator-visible error.
+//
+// Resolution mirrors the runtime gate EXACTLY (ResolveApplication, which checks
+// user apps then the predefined table, plus ResolveApplicationSet) so the
+// commit gate and the runtime gate cannot diverge. The `any` keyword and the
+// empty token are always accepted. Covers both zone-pair and global policies,
+// and the multi-value `application [ a b c ]` list — pol.Match.Applications is
+// populated from every list value (compiler_security.go reads m.Keys[1:] for
+// the collapsed-bracket form and m.Children for the hierarchical form, the same
+// accumulation firewallMatchValues performs), so iterating the typed list
+// covers each element.
+//
+// Distinct from #2217 (validateApplicationSetMembersStrict), which rejects a
+// DANGLING MEMBER of a DEFINED application-set. A direct policy reference to a
+// wholly undefined name is neither an app nor a set, so #2217's
+// ExpandApplicationSet walk never sees it — this gate is the one that catches
+// it. Composes cleanly: a defined set with a bad member is #2217's error; an
+// undefined top-level name is this gate's error.
+//
+// Strict on commit / commit-check (hard reject). Lenient on load / peer-sync
+// (warn so an already-persisted or peer-synced config that an older binary
+// accepted still BOOTS — #1960 no-brick; the dataplane independently refuses to
+// arm such a policy, so a leniently-loaded bad config is no worse off than
+// before, now flagged).
+func validatePolicyMatchApplicationsStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// appRefError returns nil if the token resolves, or a tailored reject.
+	// Resolution mirrors resolveUserspaceApplicationNames
+	// (pkg/dataplane/userspace/capabilities.go) EXACTLY so the commit gate and
+	// the runtime gate cannot diverge: a name resolves only if it is a
+	// predefined / user application OR an application-set that EXPANDS to >= 1
+	// member. A defined-but-EMPTY application-set resolves by NAME but expands
+	// to zero members → the runtime gate returns false →
+	// userspaceSupportsSecurityPolicies false → the dataplane refuses to arm
+	// security policies (#3146 — the same fail-open class this gate kills).
+	// #2217's validateApplicationSetMembersStrict `continue`s on an empty set,
+	// so nothing else catches it.
+	appRefError := func(scope, policyName, name string) error {
+		switch name {
+		case "", "any":
+			return nil
+		}
+		if _, ok := ResolveApplication(name, cfg.Applications.Applications); ok {
+			return nil
+		}
+		if _, ok := ResolveApplicationSet(name, cfg.Applications.ApplicationSets); ok {
+			// A malformed member (ExpandApplicationSet error) is #2217's gate's
+			// job and runs first; here a clean expansion to zero members is the
+			// empty-set fail-open (#3146).
+			expanded, err := ExpandApplicationSet(name, &cfg.Applications)
+			if err == nil && len(expanded) == 0 {
+				return policyMatchEmptyAppSetError(scope, policyName, name)
+			}
+			return nil
+		}
+		return policyMatchApplicationError(scope, policyName, name)
+	}
+	check := func(scope string, pol *Policy) error {
+		if pol == nil {
+			return nil
+		}
+		for _, app := range pol.Match.Applications {
+			if err := appRefError(scope, pol.Name, app); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if err := check("", pol); err != nil {
+				return err
+			}
+		}
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if err := check("global", pol); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// policyMatchApplicationError formats the #3144 undefined-application reject,
+// naming the policy scope, the policy, and the unresolved application token.
+func policyMatchApplicationError(scope, policyName, app string) error {
+	where := fmt.Sprintf("policy %q", policyName)
+	if scope != "" {
+		where = fmt.Sprintf("%s policy %q", scope, policyName)
+	}
+	return fmt.Errorf(
+		"security policies %s match application %q is not defined "+
+			"(no predefined junos-* application, no `applications application "+
+			"%q`, and no `applications application-set %q`) — an undefined "+
+			"application reference commits but the userspace dataplane then "+
+			"REFUSES to arm security policies (commit/apply split, fail-open) "+
+			"— define the application/application-set or fix the name (#3144)",
+		where, app, app, app)
+}
+
+// policyMatchEmptyAppSetError formats the #3146 reject for a policy
+// referencing a DEFINED but EMPTY application-set. The set exists by name but
+// expands to zero members, so the runtime resolveUserspaceApplicationNames
+// returns false (ExpandApplicationSet len==0) and the dataplane refuses to arm
+// security policies — the same commit/apply fail-open class as #3144.
+func policyMatchEmptyAppSetError(scope, policyName, name string) error {
+	where := fmt.Sprintf("policy %q", policyName)
+	if scope != "" {
+		where = fmt.Sprintf("%s policy %q", scope, policyName)
+	}
+	return fmt.Errorf(
+		"security policies %s match application %q is a defined but EMPTY "+
+			"application-set (it expands to zero applications) — the policy "+
+			"commits but the userspace dataplane then REFUSES to arm security "+
+			"policies (commit/apply split, fail-open) — add at least one "+
+			"`applications application-set %q application <name>` member or "+
+			"remove the reference (#3146)",
+		where, name, name)
+}
+
 // reservedZoneNames is the set of tokens the dataplane / Junos grammar reserves
 // for a special context and that therefore must NEVER be the name of an
 // operator-defined `security zones security-zone <name>` (#3055). It is used
@@ -2215,8 +2353,9 @@ func validateZoneInterfaceMembershipStrict(cfg *Config) error {
 // (`set applications application <name> ...`) whose destination-port /
 // source-port is malformed (not a valid numeric port, port range, or known
 // service name, out of 1..65535, or an inverted low>high range) or whose
-// protocol token is not a known name, a junos-*
-// alias, or a 0..255 number (#2142) — but ONLY for applications that are
+// protocol token is not a known name, a RESOLVABLE junos-* alias (one the
+// dataplane's appid.ProtocolNumber actually knows — #3150), or a 0..255 number
+// (#2142) — but ONLY for applications that are
 // actually REFERENCED by a security policy or a source/destination-NAT rule's
 // `match application` (#2187), or for ALL applications when
 // `services application-identification` is enabled (every app then compiles
@@ -2238,12 +2377,16 @@ func validateZoneInterfaceMembershipStrict(cfg *Config) error {
 // such an app is referenced by a policy, or app-id is turned on, the gate
 // engages.
 //
-// It reuses validatePortSpec and validateProtocol — the same config-layer
-// validators that produce the warning in ValidateConfig — so no new divergent
-// port/protocol table is introduced (the dataplane's #2124 capability gate is
-// the runtime backstop, and these validators are a superset of what it admits).
-// Iteration is sorted by application name so the first-reported error is
-// deterministic across runs (Go map order is randomized).
+// It reuses validatePortSpec for ports. For the protocol it uses
+// filterProtocolResolvable (the #2124/#2175 appid.ProtocolNumber mirror) rather
+// than the lenient validateProtocol: validateProtocol blanket-accepts any
+// "junos-" prefix, so a referenced app with `protocol junos-foobar` would commit
+// cleanly while the dataplane's appid.ProtocolNumber rejects it, disarming the
+// userspace policy capability gate (a commit/apply split — #3150). Using the
+// same authority the dataplane uses keeps commit and apply in agreement (the
+// dataplane's #2124 capability gate stays the runtime backstop). Iteration is
+// sorted by application name so the first-reported error is deterministic across
+// runs (Go map order is randomized).
 func validateApplicationSpecsStrict(cfg *Config) error {
 	if cfg == nil || len(cfg.Applications.Applications) == 0 {
 		return nil
@@ -2268,10 +2411,25 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 		if err := validatePortSpec(app.SourcePort); err != nil {
 			return fmt.Errorf("application %q: source-port: %w", name, err)
 		}
-		if app.Protocol != "" {
-			if err := validateProtocol(app.Protocol); err != nil {
-				return fmt.Errorf("application %q: %w", name, err)
-			}
+		// #3150: resolve the protocol against the SAME authority the dataplane
+		// uses (appid.ProtocolNumber, mirrored by filterProtocolResolvable) — NOT
+		// the lenient validateProtocol, which blanket-accepts any "junos-" prefix.
+		// validateProtocol would commit `protocol junos-foobar` cleanly while
+		// appid.ProtocolNumber rejects it, so the userspace policy capability gate
+		// (pkg/dataplane/userspace) then disarms — a commit-succeeds / apply-fails
+		// split. filterProtocolResolvable accepts only the concrete junos-* aliases
+		// the catalog knows (e.g. junos-ping, junos-tcp-any), real protocol names,
+		// and 0..255 numbers, so a referenced app whose protocol the dataplane
+		// cannot represent is rejected at commit instead.
+		if app.Protocol != "" && !filterProtocolResolvable(app.Protocol) {
+			return fmt.Errorf(
+				"application %q: unknown protocol %q (use a protocol name such as "+
+					"tcp/udp/icmp/icmpv6/gre/esp/ah/sctp/ospf, a resolvable junos-* "+
+					"alias such as junos-ping/junos-tcp-any, or a numeric value "+
+					"0-255 — the dataplane resolves protocols via appid.ProtocolNumber "+
+					"and cannot represent an arbitrary junos-* token, so accepting it "+
+					"would commit cleanly but fail to arm the referencing policy)",
+				name, app.Protocol)
 		}
 	}
 	return nil
@@ -2536,12 +2694,15 @@ func validateFilterActionsStrict(cfg *Config) error {
 // test TestFilterProtocolResolvableMatchesProtocolNumber via the exported
 // FilterProtocolResolvable accessor.
 //
-// The acceptance set is intentionally TIGHTER than validateProtocol (used by
-// validateApplicationSpecsStrict): validateProtocol blanket-accepts ANY
-// "junos-" prefix, but appid.ProtocolNumber only resolves the specific
-// junos-* aliases below, so an unknown "junos-foobar" must be rejected here to
-// stay consistent with the dataplane SSOT — otherwise commit would pass while
-// the swallowed dataplane gate dropped the constraint.
+// The acceptance set is intentionally TIGHTER than validateProtocol (the
+// lenient validator used by ValidateConfig's warning surface): validateProtocol
+// blanket-accepts ANY "junos-" prefix, but appid.ProtocolNumber only resolves
+// the specific junos-* aliases below, so an unknown "junos-foobar" must be
+// rejected here to stay consistent with the dataplane SSOT — otherwise commit
+// would pass while the swallowed dataplane gate dropped the constraint. Since
+// #3150, validateApplicationSpecsStrict also resolves an application's own
+// `protocol` leaf through THIS helper (not validateProtocol) for the same
+// reason — the broad junos-* accept there caused a commit/apply split.
 func filterProtocolResolvable(token string) bool {
 	switch strings.ToLower(strings.TrimSpace(token)) {
 	case "tcp", "junos-tcp-any",

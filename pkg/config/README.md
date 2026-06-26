@@ -182,6 +182,43 @@ peer-synced config still boots (#1960 no-brick) — a leniently-loaded bare-log
 policy simply logs nothing, exactly as before. Same fail-closed-on-load
 doctrine as #3043.
 
+**Security-policy `match application` must be defined (#3144):** a policy
+`match application <name>` token resolving to NONE of {predefined junos-*
+application, user-defined `applications application <name>`, user-defined
+`applications application-set <name>`} was previously only WARNED at commit
+(`compiler_validate_warn.go`). But at runtime the userspace capability gate
+(`resolveUserspaceApplicationNames` in `pkg/dataplane/userspace/capabilities.go`)
+resolves the SAME name set and returns false for an unknown name →
+`expandUserspacePolicyApplications` fails → `userspaceSupportsSecurityPolicies`
+returns false → the dataplane REFUSES to arm security policies. The operator
+got a green commit and a silently DISARMED policy engine on the firewall's
+primary allow/deny path — a commit/apply split, fail-open.
+`validatePolicyMatchApplicationsStrict` (`compiler_validate_strict.go`)
+hard-rejects an undefined reference (zone-pair OR global, including every
+element of a `match application [ a b c ]` list) at commit, naming the policy
+scope, the policy, and the undefined token. Resolution mirrors the runtime gate
+`resolveUserspaceApplicationNames`: a name resolves only if it is a predefined /
+user application (`ResolveApplication` — user apps then the predefined table)
+OR an `application-set` that EXPANDS to >= 1 member (`ResolveApplicationSet` +
+`ExpandApplicationSet`, the exact runtime check). `any` and the empty token are
+always accepted. A defined-but-EMPTY application-set (#3146) is rejected with a
+distinct message: the set resolves by name but expands to zero applications, so
+the runtime gate returns false and the dataplane refuses to arm — the same
+fail-open class. (#2217's `validateApplicationSetMembersStrict` `continue`s on
+an empty set, so this gate is the one that catches it.) The tolerant load/peer-sync path downgrades to
+a warning (`lenientPolicyMatchApplications`) so an already-persisted or
+peer-synced config still boots (#1960 no-brick) — the dataplane independently
+refuses the policy, so a leniently-loaded bad config is no worse off, now
+flagged. Distinct from #2217 (`validateApplicationSetMembersStrict`), which
+rejects a dangling MEMBER of a DEFINED application-set; this gate catches a
+wholly undefined top-level reference that #2217's `ExpandApplicationSet` walk
+never sees. The `compiler_validate_warn.go` application warning was removed
+(converted): the strict gate supersedes it on commit and the lenient gate emits
+the single warning on load — eliminating both a duplicate warning and the old
+24-entry builtin list's false positive on predefined apps outside it (e.g.
+`junos-pingv6`, `junos-tcp-any`). Same fail-closed-on-load doctrine as
+#3043/#2401.
+
 **An interface belongs to exactly one security zone (#3072):**
 `pkg/dataplane/userspace.buildInterfaceZoneMap` builds the interface->zone
 lookup by iterating zone names in SORTED order and writing each interface
@@ -578,6 +615,36 @@ older binary accepted still boots (#1960 no-brick doctrine). The gate is
 SURGICAL — only NAME references are checked; `then community (set|add) <value>`
 carries a community VALUE (e.g. `65000:100`), not a list reference, and a defined
 community reference commits unchanged.
+
+**Policy-referenced application protocols are validated against the dataplane
+resolver (#3150 — codex-review-067 finding 067-06):** a user-defined
+`set applications application <name> protocol <token>` that is REFERENCED by a
+security policy or NAT rule's `match application` (or any application when
+`services application-identification` is on) is hard-rejected at commit by
+`validateApplicationSpecsStrict` (`compiler_validate_strict.go`) when the
+protocol token is unresolvable. The bug: that gate resolved the token via the
+LENIENT `validateProtocol`, which blanket-accepts ANY `junos-` prefix
+(`strings.HasPrefix("junos-")`). So `protocol junos-foobar` committed cleanly,
+but the dataplane resolves protocols only through `appid.ProtocolNumber`
+(`pkg/appid`), which knows only the CONCRETE junos-* aliases (`junos-ping`,
+`junos-tcp-any`, ...) — it rejects `junos-foobar`. The userspace policy
+capability gate (`pkg/dataplane/userspace`) then disarms the snapshot
+(`ForwardingSupported=false`): a commit-succeeds / apply-fails split. The fix
+resolves the application's protocol through `filterProtocolResolvable` — the
+same `appid.ProtocolNumber` mirror the firewall-filter `from protocol` gate
+(#2175) already uses, pinned to the SSOT by the `pkg/appid` drift-guard test
+`TestFilterProtocolResolvableMatchesProtocolNumber` — so a token the dataplane
+cannot represent is rejected at commit. Real protocol names, numeric 0..255
+values, and resolvable junos-* aliases still commit; only genuinely
+unresolvable tokens reject. The lenient `validateProtocol` is unchanged and
+still used by `ValidateConfig`'s warning surface (so an UNREFERENCED library
+app with a bogus protocol stays a warning, not a commit error). The tolerant
+load/peer-sync path downgrades the reject to a warning
+(`lenientApplicationSpecs`) so an already-persisted or peer-synced config an
+older binary accepted still boots (#1960 no-brick doctrine). Distinct from
+#2124/#2142 (those fixed alias drift / malformed port-or-protocol specs); this
+residual was specifically the strict app-spec path still using the blanket
+`junos-` HasPrefix.
 
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
