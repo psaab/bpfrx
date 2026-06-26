@@ -1,3 +1,44 @@
+## 2026-06-26 — #3200 host-inbound unknown/typo token: commit validation + both-layer fail-closed
+
+- **Timestamp**: 2026-06-26
+- **Action**: SECURITY/correctness fix. An unknown/typo'd
+  `host-inbound-traffic system-services`/`protocols` token committed silently
+  (schema models the leaves as untyped containers; the compiler copied tokens
+  verbatim with no validation). At runtime the two enforcement layers then
+  DISAGREED: the nft kernel mirror emitted no match for the token and, for an
+  all-unknown/empty stanza, failed OPEN (emitted nothing), while the Rust
+  AF_XDP classifier ignored the token and denied everything else (fail CLOSED)
+  — split-brain posture from one typo. Fix: (1) added a shared recognized-token
+  SSOT `KnownHostInboundSystemServices`/`KnownHostInboundProtocols`
+  (`pkg/config/host_inbound_tokens.go`) — the same sets the nft builder + Rust
+  classifier recognize — and a strict compiler validator
+  `validateHostInboundTokensStrict` that HARD-REJECTS an unknown token at
+  commit / commit-check (case-sensitive, since the nft switch is
+  case-sensitive), downgraded to a warning on the tolerant load / peer-sync
+  paths (`lenientHostInboundTokens`, #1960 no-brick). (2) Changed the nft
+  zero-match branch in `emitHostInboundZone` to emit the catch-all DROP (fail
+  CLOSED) instead of nothing, matching the Rust classifier for a
+  configured-but-empty stanza; lifeline interfaces are already excluded from the
+  address set and established/ESP-AH/ND/PMTUD accepts precede the drop, so a
+  zero-match zone cannot strand management. (3) Mapped the legitimate Junos
+  `ipsec` system-service as an alias of `ike` (udp 500/4500; ESP/AH already
+  globally exempt) in BOTH the nft matcher and the Rust classifier so the
+  existing `TestHostInboundIPsec` config stays valid and both layers agree.
+- **File(s)**: pkg/config/host_inbound_tokens.go (new),
+  pkg/config/host_inbound_tokens_test.go (new), pkg/config/compiler.go
+  (lenientHostInboundTokens option + gate dispatch),
+  pkg/config/compiler_validate_strict.go (validateHostInboundTokensStrict),
+  pkg/daemon/daemon_nft.go (zero-match fail-closed + `ipsec` alias + comments),
+  pkg/daemon/host_inbound_parity_test.go (new),
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs (`ipsec` alias),
+  docs/junos-cli-reference.md, docs/config-schema.md, _Log.md
+- **Validation**: `go build ./...`; `go test ./pkg/config/ ./pkg/daemon/...`
+  all green; `cargo build --release` clean; `cargo test --release host_inbound`
+  green. Fail-on-revert proven TWICE: neutering the validator dispatch turns
+  `TestHostInboundUnknownTokenFailsCommit` RED (typo'd config compiles), and
+  reverting the nft zero-match branch to emit nothing turns
+  `TestHostInboundEmptyStanzaFailsClosed` RED; both restored byte-identical.
+
 ## 2026-06-26 — #3199 host-inbound `protocols all` scoped to routing protocols (control-plane exposure)
 
 - **Timestamp**: 2026-06-26

@@ -3829,3 +3829,56 @@ func validateVRRPVirtualAddressSubnet(cfg *Config, lenient bool) ([]string, erro
 	}
 	return warnings, nil
 }
+
+// validateHostInboundTokensStrict rejects an unknown / typo'd
+// `security zones <z> host-inbound-traffic { system-services <tok>; protocols
+// <tok>; }` token at commit (#3200). The schema models system-services /
+// protocols as untyped containers and the compiler copies every child token
+// verbatim, so before this gate a typo such as `system-services sssh` committed
+// cleanly. At runtime the two enforcement layers then DISAGREED: the nftables
+// kernel mirror emitted no match for the unknown token (and, for a stanza whose
+// tokens were all unrecognized, fell OPEN), while the Rust AF_XDP classifier
+// ignored the unknown token and denied everything else — fail CLOSED. One typo
+// silently produced a split-brain posture.
+//
+// The recognized token sets are the shared SSOT in host_inbound_tokens.go
+// (KnownHostInboundSystemServices / KnownHostInboundProtocols), the same sets
+// the nft builder + Rust classifier understand. Matching is case-sensitive
+// against the canonical lowercase spellings: the nft matcher switch is
+// case-sensitive, so accepting a wrong-case token here would itself reintroduce
+// a split-brain (Rust lowercases, nft does not). Zones are walked in sorted
+// order so the first-reported error is deterministic.
+func validateHostInboundTokensStrict(cfg *Config) error {
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		zone := cfg.Security.Zones[name]
+		if zone == nil || zone.HostInboundTraffic == nil {
+			continue
+		}
+		for _, svc := range zone.HostInboundTraffic.SystemServices {
+			if !KnownHostInboundSystemServices[svc] {
+				return fmt.Errorf(
+					"security zone %q host-inbound-traffic system-services %q "+
+						"is not a recognized system-service; an unknown token "+
+						"commits but enforces inconsistently (kernel nft path vs "+
+						"Rust dataplane disagree) — fix the typo or remove it",
+					name, svc)
+			}
+		}
+		for _, proto := range zone.HostInboundTraffic.Protocols {
+			if !KnownHostInboundProtocols[proto] {
+				return fmt.Errorf(
+					"security zone %q host-inbound-traffic protocols %q is not a "+
+						"recognized protocol; an unknown token commits but "+
+						"enforces inconsistently (kernel nft path vs Rust "+
+						"dataplane disagree) — fix the typo or remove it",
+					name, proto)
+			}
+		}
+	}
+	return nil
+}

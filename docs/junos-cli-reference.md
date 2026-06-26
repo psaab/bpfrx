@@ -254,6 +254,30 @@ From zone: guest, To zone: lan
   policy-deny RT_FLOW + `reject`/zone-`tcp-rst` reply as a transit deny) and
   tears down any cached host-local session on the next hit. Hit counters for
   these rules now advance.
+  - **Token validation (#3200):** `host-inbound-traffic system-services
+    <tok>` / `protocols <tok>` is now validated at commit against the
+    recognized-token SSOT (`pkg/config/host_inbound_tokens.go`:
+    `KnownHostInboundSystemServices` / `KnownHostInboundProtocols`). An
+    unknown/typo token (e.g. `system-services sssh`) is HARD-REJECTED at
+    `commit` / `commit check` with a clear error. Before #3200 such a typo
+    committed silently and the two enforcement layers then disagreed — the
+    nftables kernel mirror emitted no match (and, for an all-unknown stanza,
+    failed OPEN) while the Rust AF_XDP classifier ignored the token and denied
+    everything else (failed CLOSED) — a split-brain posture from one typo. The
+    SSOT is the same set the nft builder (`pkg/daemon` host-inbound matchers)
+    and the Rust classifier (`classify_system_service`/`classify_protocol`)
+    recognize, so the runtime only ever sees a token both layers agree on; a
+    Go parity test (`TestHostInboundNftMatchesKnownTokens`) keeps the nft
+    matcher domain equal to the SSOT. The tolerant load / peer-sync paths
+    downgrade the rejection to a warning so an already-persisted or peer-synced
+    config still boots (#1960 no-brick), and a zone whose stanza yields zero
+    recognized matches (an empty `host-inbound-traffic { }`) now emits a
+    catch-all kernel drop — fail CLOSED, matching the Rust classifier — instead
+    of the pre-#3200 fail-open. Matching is case-sensitive against the
+    canonical lowercase spellings (the nft matcher switch is case-sensitive, so
+    accepting `SSH` would itself reintroduce a split-brain). Recognized tokens
+    (`ssh`, `ping`, `all`, `any-service`, `ipsec`/`ike`, `protocols all`
+    routing-scoped per #3199, …) are unaffected.
   - **Lifeline fail-safe:** enforcement is strictly MATCH-DRIVEN. If NO
     `junos-host` policy is configured, or a host-bound flow matches no
     `junos-host` rule, behavior is UNCHANGED from before #3019 — there is no
