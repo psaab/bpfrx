@@ -569,10 +569,22 @@ impl super::Coordinator {
                                     .get(&ep.logical_ifindex)
                                     .is_some_and(|name| *name == entry.spawned_tunnel_name)
                         });
-                    if attach_ok {
-                        None
-                    } else {
+                    if !attach_ok {
                         Some("attachment_changed")
+                    } else if self.resolve_wg_outer_mtu(*id) != entry.spawned_outer_mtu {
+                        // #2921: the WG identity tuple ignores the underlay
+                        // route/table/egress MTU, so a same-engine refresh
+                        // reuses the Arc and keeps the spawn-time
+                        // `outer_mtu` captured by value in the TUN-origin
+                        // egress guard. Re-resolve the underlay MTU the same
+                        // way `spawn_one_wg_control_thread` does; when it has
+                        // changed, restart the thread so the local TUN path
+                        // enforces the SAME current outer MTU as the
+                        // transit/forwarded path (which re-resolves per
+                        // snapshot).
+                        Some("outer_mtu_changed")
+                    } else {
+                        None
                     }
                 }
             };
@@ -805,6 +817,7 @@ impl super::Coordinator {
                 engine_ptr,
                 spawned_ifindex,
                 spawned_tunnel_name: tunnel_name,
+                spawned_outer_mtu: outer_mtu,
                 last_spawn_attempt_ns: monotonic_nanos(),
             },
         );

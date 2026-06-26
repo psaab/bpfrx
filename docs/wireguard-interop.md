@@ -119,6 +119,28 @@ route-looks-up the peer endpoint in the endpoint's transport table).
 `WG_DEFAULT_OUTER_MTU` (1500) is now ONLY the last-resort fallback for an
 unconfigured/unroutable endpoint.
 
+**#2921 (stale captured outer_mtu after a same-engine refresh).** The
+control thread is handed `outer_mtu` BY VALUE at spawn, but the WG engine
+reuse identity (`wg_identity_unchanged`, `forwarding_build/wg.rs`) compares
+only the listen port, local private key, and peer set — it ignores the
+transport table, the resolved egress ifindex, and the egress MTU. So a
+refresh that changes ONLY the underlay route/table/egress MTU (e.g. an
+operator lowers the WAN MTU, or a route flips to a different egress
+interface) reused the engine `Arc`, did NOT trip the stale prune
+(`spawn_wg_control_threads`), and left the TUN-origin egress guard on the
+spawn-time MTU forever — while the transit/forwarded path re-resolves the
+underlay per snapshot (#2680). The same tunnel then enforced DIFFERENT
+outer MTUs by packet origin: after an MTU increase the local path kept
+dropping packets that now fit; after a decrease it emitted datagrams the
+kernel had to fragment/reject. The fix captures the resolved MTU in
+`WgControlEntry.spawned_outer_mtu` and adds an `outer_mtu_changed` stale
+reason to the apply-time prune: when a fresh `resolve_wg_outer_mtu`
+diverges from the captured value (and the attachment is otherwise stable),
+the thread is stopped + respawned against the current underlay MTU. The
+re-resolution is cheap and runs ONLY at apply time per endpoint (the same
+cadence the engine-Arc/attachment prune already runs at), never
+per-packet; the unchanged common case is byte-identical (no thread churn).
+
 **#2517 (GRE inner-MTU shares the same fallback).** The native-GRE
 inner-MTU resolver `native_gre_inner_mtu` now resolves its outer/transport
 MTU through the SAME `tunnel_outer_mtu` SSOT helper the WG MSS clamp uses,

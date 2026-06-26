@@ -1,3 +1,24 @@
+## 2026-06-26 — #2921 WG TUN-origin egress: stale captured outer_mtu after same-engine refresh
+
+- **Timestamp**: 2026-06-26
+- **Action**: The WG control thread is handed the resolved underlay
+  `outer_mtu` BY VALUE at spawn (TUN-origin egress guard). The engine
+  reuse identity (`wg_identity_unchanged`) ignores the transport table,
+  resolved egress ifindex, and egress MTU, so a refresh changing only the
+  underlay route/table/MTU reused the engine Arc, skipped the stale prune,
+  and kept the stale spawn-time MTU — while the transit/forwarded path
+  re-resolves per snapshot. Same tunnel, different outer MTU by packet
+  origin → configuration-dependent tail loss. Fix: capture the resolved
+  MTU in `WgControlEntry.spawned_outer_mtu`; add an `outer_mtu_changed`
+  stale reason to the apply-time prune (`spawn_wg_control_threads`)
+  comparing a fresh `resolve_wg_outer_mtu` against the captured value.
+  Restart only on divergence (apply cadence, never per-packet); unchanged
+  case byte-identical. Two fail-on-revert tests in coordinator/tests.rs
+  (`wg2921_outer_mtu_change_restarts_control_thread` RED on revert,
+  `wg2921_unchanged_outer_mtu_keeps_control_thread` stays green).
+- **File(s)**: userspace-dp/src/afxdp/types/runtime.rs,
+  userspace-dp/src/afxdp/coordinator/tunnel_supervision.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs, docs/wireguard-interop.md
 ## 2026-06-26 — #3193 persistent-nat SHOW: report the three-way permit mode
 
 - **Timestamp**: 2026-06-26
