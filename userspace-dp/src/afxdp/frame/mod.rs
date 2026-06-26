@@ -1002,7 +1002,10 @@ pub(in crate::afxdp::frame) fn apply_nat_port_rewrite(
     family: ChecksumFamily,
     nat: NatDecision,
 ) -> Option<()> {
-    if !matches!(protocol, PROTO_TCP | PROTO_UDP) {
+    // #3111: shared "has a rewritable L4 port" predicate (TCP/UDP) so the
+    // generic and descriptor-fast-path rewriters cannot drift on which
+    // protocols may have their first L4 bytes touched.
+    if !crate::ip_proto::has_l4_ports(protocol) {
         return Some(());
     }
     if packet.len() < l4_offset + 4 {

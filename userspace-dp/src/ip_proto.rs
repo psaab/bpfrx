@@ -22,6 +22,29 @@ pub(crate) const PROTO_PIM: u8 = 103;
 pub(crate) const PROTO_VRRP: u8 = 112;
 pub(crate) const PROTO_SCTP: u8 = 132;
 
+/// Authoritative "this protocol carries a rewritable 16-bit L4 port pair"
+/// predicate (#3111). True only for TCP and UDP — the protocols whose L4
+/// header begins with a source port at offset +0 and a destination port at
+/// +2 that source/destination NAT may translate.
+///
+/// Everything else is port-less for NAT purposes and MUST NOT have its
+/// first L4 bytes rewritten:
+///   - GRE (47) / ESP (50) / AH (51) / OSPF (89) / ICMP / ... have no port
+///     field; writing a pseudo-port at offset +0/+2 corrupts the L4 header
+///     (ESP SPI high half, GRE flags/version, OSPF type), breaking the
+///     tunnel/adjacency.
+///   - protocol 0 is the "L4 tuple unknown" sentinel used by the
+///     address-only `match_source_nat` callers.
+///   - SCTP (132) does have ports, but a CRC32c checksum rather than the
+///     internet checksum the incremental-delta rewriters assume, so SNAT
+///     has never rewritten SCTP ports — keeping it out of this predicate
+///     preserves that long-standing behavior (one source of truth shared
+///     by the allocator and the packet rewriters so the two cannot drift).
+#[inline]
+pub(crate) fn has_l4_ports(protocol: u8) -> bool {
+    matches!(protocol, PROTO_TCP | PROTO_UDP)
+}
+
 /// Resolve a config-level protocol token to its IANA number.
 ///
 /// #2396: the DNAT snapshot carries `protocol` as the Junos config string
