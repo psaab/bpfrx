@@ -1,3 +1,39 @@
+## 2026-06-25 — #3055: reject a security zone using a reserved sentinel name
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added a commit-time strict validator
+  (`validateReservedZoneNamesStrict`) that hard-rejects a `security zones
+  security-zone <name>` whose name is a reserved sentinel — `junos-global`,
+  `any`, or `junos-host`. A zone literally named `junos-global` was accepted at
+  commit, but `userspace-dp/src/policy.rs` string-matches a from/to-zone equal
+  to `junos-global` and reclassifies the policy as a device-wide global fallback
+  (`JUNOS_GLOBAL_ZONE_ID = u16::MAX`) evaluated for every flow — so the zone's
+  scoped policies silently became device-wide permits across unrelated zone
+  pairs (security-boundary escape). Introduced `reservedZoneNames`
+  (`{junos-global, any, junos-host}`) used ONLY by the new definition gate.
+  Strict on commit/commit-check; downgraded to a warning on the tolerant
+  load/peer-sync paths via `lenientReservedZoneNames` (#1960 no-brick),
+  mirroring the #3066/#2401 pattern.
+- **Review fold (hostile review, MERGE-NEEDS-MINOR)**: the first cut
+  re-derived `policyZoneSpecialTokens` (the #2401 zone-REFERENCE exemption set)
+  from `reservedZoneNames`, which silently ADDED `junos-global` to the
+  reference-exempt set — re-opening the device-wide-permit class via the
+  reference path (an undefined `from-zone junos-global` reference would become
+  exempt and reach `policy.rs:1021`). DECOUPLED the two sets: the
+  reference-exempt set is reverted to its exact master literal `{"", any,
+  junos-host}` (still OMITS junos-global, so such a reference stays
+  hard-rejected + warned). Added `TestJunosGlobalNotReferenceExempt` to pin the
+  decoupling against a future re-unify.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/reserved_zone_name_3055_test.go,
+  pkg/config/README.md, _Log.md
+- **Validation**: `go build ./...`, `go vet ./pkg/config/...`,
+  `go test ./pkg/config/...` (1519 passed), `gofmt -l` clean. Fail-on-revert
+  confirmed: (a) stubbing `validateReservedZoneNamesStrict` to `return nil`
+  turns the three definition reject/lenient tests RED while the ordinary-name
+  test stays GREEN; (b) re-unifying `policyZoneSpecialTokens` with
+  `reservedZoneNames` turns `TestJunosGlobalNotReferenceExempt` RED.
+
 ## 2026-06-25 — #3072: reject an interface assigned to multiple security zones
 
 - **Timestamp**: 2026-06-25

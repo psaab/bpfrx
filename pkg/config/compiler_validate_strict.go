@@ -1497,6 +1497,41 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 	return nil
 }
 
+// reservedZoneNames is the set of tokens the dataplane / Junos grammar reserves
+// for a special context and that therefore must NEVER be the name of an
+// operator-defined `security zones security-zone <name>` (#3055). It is used
+// ONLY by the zone-DEFINITION gate (validateReservedZoneNamesStrict).
+//
+// It is DELIBERATELY DISTINCT from policyZoneSpecialTokens (the zone-REFERENCE
+// exemption set) — see that var's comment. The two gates are mutually
+// reinforcing and must not be unified: a zone named "junos-global" is rejected
+// at definition here, while a policy that REFERENCES `from-zone junos-global`
+// against no defined zone stays hard-rejected by the reference gate (NOT made
+// reference-exempt). Adding "junos-global" to the reference-exempt set would
+// silently re-open the device-wide-permit class this gate closes, because the
+// dataplane (userspace-dp/src/policy.rs:1021) classifies a "junos-global"
+// reference as a device-wide global rule.
+//
+//   - "junos-global" — the device-wide global-policy sentinel. The userspace
+//     dataplane (userspace-dp/src/policy.rs) string-matches a from-zone/to-zone
+//     literally equal to "junos-global" and reclassifies the policy as a global
+//     fallback (JUNOS_GLOBAL_ZONE_ID = u16::MAX) evaluated for EVERY flow. An
+//     operator-defined zone of this name would silently turn its zone-scoped
+//     rules into device-wide fallbacks that permit traffic for unrelated zone
+//     pairs — a security-boundary escape.
+//
+//   - "any"         — Junos wildcard zone (`from-zone any`/`to-zone any`); the
+//     dataplane treats it as match-any, never a named zone-id lookup, so a real
+//     zone named "any" can never be selected and would shadow the wildcard.
+//
+//   - "junos-host"  — Junos reserved self-traffic zone (host-inbound / host-
+//     outbound policy context); it is never declared as a `security zone`.
+var reservedZoneNames = map[string]struct{}{
+	"junos-global": {},
+	"any":          {},
+	"junos-host":   {},
+}
+
 // policyZoneSpecialTokens is the set of reserved from-zone/to-zone tokens
 // that name a context rather than an operator-defined security zone, and so
 // must be exempt from the "zone must be defined" gate
@@ -1510,15 +1545,70 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 //   - "junos-host"  — Junos reserved self-traffic zone (host-inbound / host-
 //     outbound policy context); it is never declared as a `security zone`.
 //
-// Global policies (`security policies global { ... }`) are not validated here:
-// they live in cfg.Security.GlobalPolicies with no from/to-zone strings and
-// are mapped to the `junos-global` sentinel only when the dataplane snapshot is
-// built (see pkg/dataplane/userspace/policies.go), so they cannot reference an
-// undefined zone.
+// This set is DELIBERATELY NOT derived from reservedZoneNames and DELIBERATELY
+// OMITS "junos-global" (#3055). The two gates serve opposite purposes: the
+// definition gate rejects a reserved NAME, while this reference gate must keep
+// hard-rejecting (+ warning) a policy that REFERENCES `from-zone junos-global`
+// / `to-zone junos-global` when no such zone is defined — making junos-global
+// reference-exempt would let that reference reach the dataplane, which then
+// (policy.rs:1021) classifies it as a device-wide global rule: the exact
+// fail-OPEN this PR closes. The definition gate already guarantees no zone
+// named junos-global can exist, so an explicit junos-global reference is always
+// the bug, never a legitimate named-zone use. Global policies (`security
+// policies global { ... }`) are not validated here: they live in
+// cfg.Security.GlobalPolicies with no from/to-zone strings and are mapped to
+// the `junos-global` sentinel only when the dataplane snapshot is built (see
+// pkg/dataplane/userspace/policies.go), so they cannot reference an undefined
+// zone.
 var policyZoneSpecialTokens = map[string]struct{}{
 	"":           {},
 	"any":        {},
 	"junos-host": {},
+}
+
+// validateReservedZoneNamesStrict hard-rejects a `security zones security-zone
+// <name>` DEFINITION whose name is a reserved sentinel token (#3055).
+//
+// The bug: compileZones accepts any zone name, and the userspace dataplane
+// (userspace-dp/src/policy.rs) string-matches a from-zone/to-zone literally
+// equal to "junos-global" and reclassifies the policy as a device-wide global
+// fallback (JUNOS_GLOBAL_ZONE_ID = u16::MAX) evaluated for every flow. So an
+// operator-defined zone named "junos-global" turns its zone-scoped policies
+// into device-wide fallbacks that can permit traffic for unrelated zone pairs —
+// a silent security-boundary escape. "any" and "junos-host" are reserved policy
+// context tokens that must likewise never be a real zone name (a zone the
+// dataplane could never select, shadowing the wildcard / self-traffic context).
+//
+// Strict on the commit / commit-check path (CompileConfig — hard reject so the
+// operator sees it); downgraded to a cfg.Warnings entry on the tolerant load /
+// peer-sync paths (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientReservedZoneNames) so an already-persisted or peer-synced config an
+// older binary accepted still BOOTS (#1960 fail-closed-on-load doctrine).
+// Iteration is over cfg.Security.Zones in sorted name order so the first-
+// reported error is deterministic. Reserved tokens are reported in a fixed
+// order for a stable message.
+func validateReservedZoneNamesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if _, reserved := reservedZoneNames[name]; reserved {
+			return fmt.Errorf(
+				"security zone %q uses a reserved name: %q (along with \"any\" "+
+					"and \"junos-host\") is a reserved dataplane/Junos context "+
+					"token and cannot be the name of a `security zones "+
+					"security-zone` — the dataplane would reclassify the zone's "+
+					"policies as device-wide global fallbacks (or never select "+
+					"the zone), silently breaking zone isolation; rename the zone",
+				name, name)
+		}
+	}
+	return nil
 }
 
 // validatePolicyZoneReferencesStrict hard-rejects a security policy zone-pair
