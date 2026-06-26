@@ -1139,6 +1139,9 @@
     "worker_id": 0
   },
   "zone_snapshot": {
+    "host_inbound_configured": false,
+    "host_inbound_protocols": [],
+    "host_inbound_system_services": [],
     "id": 0,
     "name": "",
     "tcp_rst": false

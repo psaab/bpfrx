@@ -942,12 +942,12 @@ fn build_forwarding_state_keeps_parent_bound_vlan_units_distinct() {
             ZoneSnapshot {
                 name: "wan".into(),
                 id: 11,
-                tcp_rst: false,
+                ..Default::default()
             },
             ZoneSnapshot {
                 name: "dmz".into(),
                 id: 12,
-                tcp_rst: false,
+                ..Default::default()
             },
         ],
         interfaces: vec![
@@ -992,6 +992,103 @@ fn build_forwarding_state_keeps_parent_bound_vlan_units_distinct() {
     );
     assert!(state.cos.interfaces.contains_key(&20080));
     assert!(state.cos.interfaces.contains_key(&20081));
+}
+
+// #3070: host-inbound-traffic enforcement. A configured zone admits only its
+// listed system-services / protocols for host-bound (local-delivery) traffic;
+// an unconfigured zone admits everything (admit-all default). Reverting the
+// enforcement (treating every zone as admit-all) turns the deny assertions RED.
+#[test]
+fn build_forwarding_state_enforces_host_inbound_traffic() {
+    use crate::ZoneSnapshot;
+    use crate::afxdp::forwarding::host_inbound_admits;
+
+    let snapshot = ConfigSnapshot {
+        zones: vec![
+            // wan: ping + gre + router-discovery (mirrors the repo cluster cfg).
+            ZoneSnapshot {
+                name: "wan".into(),
+                id: 11,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec!["ping".into(), "gre".into()],
+                host_inbound_protocols: vec!["router-discovery".into()],
+                ..Default::default()
+            },
+            // lan: ssh + ping only.
+            ZoneSnapshot {
+                name: "lan".into(),
+                id: 12,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec!["ssh".into(), "ping".into()],
+                host_inbound_protocols: vec![],
+                ..Default::default()
+            },
+            // control: all — fully open (heartbeat zone).
+            ZoneSnapshot {
+                name: "control".into(),
+                id: 13,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec!["all".into()],
+                host_inbound_protocols: vec![],
+                ..Default::default()
+            },
+            // legacy: no host-inbound stanza → admit-all preserved.
+            ZoneSnapshot {
+                name: "legacy".into(),
+                id: 14,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let state = build_forwarding_state(&snapshot);
+
+    // Only the three configured zones populate the table; the unconfigured one
+    // is absent (admit-all path).
+    assert!(state.zone_host_inbound.contains_key(&11));
+    assert!(state.zone_host_inbound.contains_key(&12));
+    assert!(state.zone_host_inbound.contains_key(&13));
+    assert!(!state.zone_host_inbound.contains_key(&14));
+
+    // wan (id 11): ping (icmp) admitted, gre (proto 47) admitted, ssh (tcp/22)
+    // DENIED, ospf (proto 89) DENIED.
+    assert!(host_inbound_admits(&state, 11, 1, 0, false), "wan ping");
+    assert!(host_inbound_admits(&state, 11, 47, 0, false), "wan gre");
+    assert!(!host_inbound_admits(&state, 11, 6, 22, false), "wan ssh deny");
+    assert!(!host_inbound_admits(&state, 11, 89, 0, false), "wan ospf deny");
+
+    // lan (id 12): ssh (tcp/22) admitted, ping admitted, telnet (tcp/23)
+    // DENIED, dhcp (udp/67) DENIED (not listed).
+    assert!(host_inbound_admits(&state, 12, 6, 22, false), "lan ssh");
+    assert!(host_inbound_admits(&state, 12, 1, 0, false), "lan ping");
+    assert!(!host_inbound_admits(&state, 12, 6, 23, false), "lan telnet deny");
+    assert!(!host_inbound_admits(&state, 12, 17, 67, false), "lan dhcp deny");
+
+    // control (id 13): all → admit everything.
+    assert!(
+        host_inbound_admits(&state, 13, 6, 12345, false),
+        "control all tcp"
+    );
+    assert!(
+        host_inbound_admits(&state, 13, 89, 0, false),
+        "control all ospf"
+    );
+
+    // legacy (id 14): unconfigured → admit everything (pre-#3070 behaviour).
+    assert!(
+        host_inbound_admits(&state, 14, 6, 22, false),
+        "legacy admit-all"
+    );
+    assert!(
+        host_inbound_admits(&state, 14, 89, 0, false),
+        "legacy admit-all proto"
+    );
+    // A zone id that does not exist at all also admits (no entry).
+    assert!(
+        host_inbound_admits(&state, 99, 6, 22, false),
+        "unknown zone admit"
+    );
 }
 
 #[test]
@@ -1048,17 +1145,17 @@ fn build_forwarding_state_rejects_reserved_zone_ids() {
             ZoneSnapshot {
                 name: "ok".into(),
                 id: 5,
-                tcp_rst: false,
+                ..Default::default()
             },
             ZoneSnapshot {
                 name: "reserved-edge".into(),
                 id: crate::policy::ZONE_ID_RESERVED_MIN,
-                tcp_rst: false,
+                ..Default::default()
             },
             ZoneSnapshot {
                 name: "global-sentinel".into(),
                 id: crate::policy::JUNOS_GLOBAL_ZONE_ID,
-                tcp_rst: false,
+                ..Default::default()
             },
         ],
         ..Default::default()
@@ -1090,7 +1187,7 @@ fn ifindex_to_zone_id_populated_from_snapshot_at_build_time() {
         zones: vec![ZoneSnapshot {
             name: "trust".into(),
             id: 7,
-            tcp_rst: false,
+            ..Default::default()
         }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/0".into(),
@@ -1114,7 +1211,7 @@ fn egress_interface_zone_id_set_from_snapshot() {
         zones: vec![ZoneSnapshot {
             name: "wan".into(),
             id: 11,
-            tcp_rst: false,
+            ..Default::default()
         }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/1".into(),
@@ -1142,7 +1239,7 @@ fn interface_pointing_at_skipped_zone_fails_closed() {
         zones: vec![ZoneSnapshot {
             name: "reserved".into(),
             id: crate::policy::ZONE_ID_RESERVED_MIN, // dropped at populate_zones
-            tcp_rst: false,
+            ..Default::default()
         }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/2".into(),
@@ -1177,7 +1274,7 @@ fn interface_with_unknown_zone_name_fails_closed() {
         zones: vec![ZoneSnapshot {
             name: "trust".into(),
             id: 3,
-            tcp_rst: false,
+            ..Default::default()
         }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/3".into(),
