@@ -1,3 +1,19 @@
+## 2026-06-25 — #2936: cap session aggregator cardinality (control-plane DoS amplifier)
+
+- **Timestamp**: 2026-06-25 19:48
+- **Action**: Bounded `SessionAggregator` source/dest maps by config, not
+  traffic. Added `maxKeys` (default `defaultMaxAggKeys`=10000) admission cap
+  in `Add()`: existing keys keep aggregating, new keys past the cap are
+  dropped and counted in `droppedSrc`/`droppedDst`. `Flush`/`flushWithDropped`
+  swap the dropped counters atomically with the maps; `flushAndLog` emits a
+  warning-severity `RT_FLOW_SESSION_AGGREGATE dropped-keys ...` line when the
+  cap is hit (incident indicator). Below-cap traffic is behavior-preserving.
+  Fail-on-revert test `TestSessionAggregator_CardinalityCap` + below-cap
+  `TestSessionAggregator_BelowCapUnchanged`. Filed Space-Saving top-K
+  accuracy follow-up #3099 (deferred, not required for the DoS fix).
+- **File(s)**: pkg/logging/aggregator.go, pkg/logging/aggregator_test.go,
+  pkg/logging/README.md, _Log.md
+
 ## 2026-06-25 — #2911: reject backup-router explicit destination family-mismatch at commit
 
 - **Timestamp**: 2026-06-25
