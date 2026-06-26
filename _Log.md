@@ -1,3 +1,25 @@
+## 2026-06-25 — #3142: close multi-value-leaf escape in the #3113 policy-match gate
+
+- **Timestamp**: 2026-06-25
+- **Action**: Extended `validatePolicyMatchLeavesStrict` to also inspect the
+  COLLAPSED tail tokens of a supported `multi:true` match leaf (the
+  `application` leaf's `Keys[1:]` + child sub-nodes, via `firewallMatchValues`),
+  not just the direct children of `match`. A flat-set `match application <vals>
+  dynamic-application/url-category/source-identity ...` collapses the unsupported
+  match-leaf keyword onto the application leaf (the #2419 absorber), where the
+  #3113 direct-child check never saw it — the criterion escaped the gate and the
+  policy silently armed as a broad application match (fail-open). Added a
+  `unsupportedPolicyMatchLeaves` set (the KNOWN unsupported match dimensions) and
+  reject any such keyword found in the tail. A legitimate application value (e.g.
+  `[ junos-http junos-https ]`) is never one of those keywords, so it is not
+  over-rejected. Same strict-reject / lenient-warn split as #3113.
+- **File(s)**: pkg/config/compiler_policy_match.go,
+  pkg/config/compiler_policy_match_3142_test.go, pkg/config/README.md
+- **Validation**: `go build ./...`; `go test ./pkg/config/...` (all green);
+  fail-on-revert confirmed — reverting the tail scan makes the five escape
+  cases COMMIT (the genuine fail-open), turning the escape test RED; the
+  no-over-reject cases stay green. gofmt clean.
+
 ## 2026-06-25 — #3120: IPv6 screen ext-header walk continues past Fragment header
 
 - **Timestamp**: 2026-06-25

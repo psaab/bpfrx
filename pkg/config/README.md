@@ -383,6 +383,26 @@ older binary silently accepted still boots — the leaf stays dropped (the
 pre-existing behaviour), now flagged (#1960 no-brick doctrine, same as
 #3079/#3055/#3060).
 
+The #3113 gate originally inspected only the DIRECT children of `match`, which
+left a multi-value-leaf ESCAPE (#3142, codex-review-067 finding 067-01). `match
+application` is a `multi:true` leaf (`schema_security.go`), so the flat-set
+absorber collapses every trailing non-sibling token onto the application leaf's
+OWN node (`Keys[1:]` plus child sub-nodes — the #2419 collapse), not as a
+sibling of `match`. So `set ... policy p match application any dynamic-application
+junos:FTP` compiles to a single `application` leaf with tail tokens `[any
+dynamic-application junos:FTP]`; the direct-child scan saw only the supported
+`application` leaf and never the tail, so the unsupported `dynamic-application`
+criterion escaped the gate and the policy silently armed as a broad application
+match (`capabilities.go` short-circuits on the first `any`) — the same fail-open
+#3113 closes, reached via the multi-value path. `validatePolicyMatchLeavesStrict`
+now also scans the collapsed tail of a supported match leaf
+(`firewallMatchValues`) and rejects any token in `unsupportedPolicyMatchLeaves`
+(the KNOWN unsupported match dimensions: `dynamic-application`, `url-category`,
+`source-identity`). A legitimate application VALUE is never one of those keywords,
+so a real bracketed list like `match application [ junos-http junos-https ]` is
+NOT over-rejected — only a known unsupported match-leaf keyword masquerading as
+an application value is. Same strict-reject / lenient-warn split as #3113.
+
 **Unsupported security-policy `then permit` children are rejected at commit
 (#3114, interim):** Junos SRX `then permit` accepts action modifiers that turn a
 bare permit into a permit-with-inspection or a permit-into-tunnel —
