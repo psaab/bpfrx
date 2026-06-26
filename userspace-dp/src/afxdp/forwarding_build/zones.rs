@@ -42,5 +42,12 @@ pub(super) fn populate_zones(snapshot: &ConfigSnapshot, state: &mut ForwardingSt
         }
         state.zone_name_to_id.insert(zone.name.clone(), zone.id);
         state.zone_id_to_name.insert(zone.id, zone.name.clone());
+        // #3071: record the per-zone Junos `tcp-rst` knob keyed by zone id so
+        // the policy-deny hot path can answer a denied TCP flow whose ingress
+        // (from) zone has tcp-rst with a RST instead of a silent drop. Only
+        // tcp-rst-enabled zones are inserted; the absence of a key is "off".
+        if zone.tcp_rst {
+            state.zone_tcp_rst.insert(zone.id, true);
+        }
     }
 }
