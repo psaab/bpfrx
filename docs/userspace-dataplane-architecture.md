@@ -567,6 +567,19 @@ supports protocol + port ranges. `rule.inactive` is the policy-scheduler result
 published by the Go daemon; inactive scheduled rules are skipped before any
 match side effects or counters.
 
+**Unknown-zone guard (#3110).** Zone id `0` is the reserved "unknown / no
+zone" sentinel — assigned to interfaces not bound to any security zone and to
+the over-cap-zone collapse-to-0 path (#2391). `evaluate_policy_result_with_len`
+evaluates zone-pair rules AND `junos-global` rules only when
+`from_id != 0 && to_id != 0`. A flow whose ingress OR egress zone is unknown
+does not belong to any *defined* zone pair, so it is ineligible for both
+zone-scoped and global policies and falls straight through to the default
+action (deny, per #3065). This prevents a configured permit-global from leaking
+transit on an unzoned ingress/egress interface. The `junos-global` sentinel
+zone-id (`u16::MAX`) is a *defined* global zone, distinct from `0` (unknown),
+and is unaffected by the guard — global policies still apply to every defined
+zone pair (#3018 wildcard-zone work composes unchanged).
+
 #### Static NAT zone scoping (`nat/static_nat.rs`)
 
 A static 1:1 rule-set may carry a `from zone <name>` scope. The dataplane

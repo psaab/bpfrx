@@ -1,4 +1,27 @@
 - **2026-06-25**: #3013 (agy-review-059 finding 059-03) — commit-time validation that a VRRP virtual-address falls within a subnet configured on the parent interface unit (vSRX parity). Added `validateVRRPVirtualAddressSubnet` (`compiler_validate_strict.go`, called in `compileConfigWithOpts`) asserting each `vrrp-group <id> virtual-address <vip>` is contained in the prefix of at least one address on the SAME unit for the MATCHING family (helper `vrrpVIPHostIP` parses the CIDR/bare VIP). Previously a VIP outside every on-link subnet committed cleanly and the daemon installed a route-less host address at runtime — return traffic from the VIP silently blackholed. Owner/priority-255 case (VIP == an interface address) passes for free; cross-family VIP (v4 literal under a v6-only address) is rejected (no matching-family subnet). Strict hard-reject on `CompileConfig` naming interface/unit/group/VIP/family; lenient-warn on both lenient constructors via new `lenientVRRPVirtualAddress` flag (#1960 no-brick). Config-only — never touches the VRRP runtime/state machine (no test-failover needed). Fail-on-revert verified RED->GREEN (forced lenient=true → 2 reject tests RED). Files: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/vrrp_vaddr_subnet_3013_test.go (new), pkg/config/README.md
+- **2026-06-25**: #3110 — guard global-policy evaluation against zone id 0 (unknown/unzoned) in the userspace dataplane. `evaluate_policy_result_with_len` (userspace-dp/src/policy.rs) evaluated `global_indices` after a zone-pair miss with NO `from_id != 0 && to_id != 0` guard. Zone id 0 is the reserved "unknown/no zone" sentinel (interfaces unbound to any zone, plus the #2391 over-cap collapse-to-0 path). A flow with an unknown ingress OR egress zone therefore fell through to the global policies and a configured permit-global PERMITTED it — leaking transit on an unzoned interface (agy-review-065 finding 065-03, VERIFIED). Fix: wrap both the zone-pair index lookup AND the global-indices loop in `if from_id != 0 && to_id != 0`; an unknown-zone flow now falls straight to the default action (deny, #3065). The `junos-global` sentinel (u16::MAX) is a DEFINED global zone, distinct from 0, and is unaffected — global policies still apply to all defined zone pairs (composes with #3018). Added regression `unknown_ingress_zone_does_not_match_permit_global` (from_id=0, to_id=0, both-0 → Deny; both-valid → Permit); fail-on-revert confirmed RED→GREEN. Files: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs, docs/userspace-dataplane-architecture.md
+## 2026-06-25 — #3108: policy simulators reject invalid protocol tokens
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added shared `policymatch.ValidateProtocol` and wired it across
+  all four simulator surfaces (codex-review-065 finding 065-05). Mirrors the
+  #3116 port-validation pattern. `matchApp` short-circuits to match-any before
+  the protocol is resolved, so a bogus protocol (unknown name / out-of-range
+  number) silently produced a permit/deny verdict instead of an error. Empty
+  protocol = unspecified (match any, unchanged); a non-empty token must resolve
+  via `appid.ProtocolNumber`. REST `matchPoliciesHandler` → 400, gRPC
+  `MatchPolicies` → InvalidArgument, gRPC `showTestPolicy` → "invalid protocol"
+  diagnostic, local CLI `showMatchPolicies`/`testPolicy` + remote `cli`
+  `testPolicy` → command error. Fail-on-revert verified (stub `return nil`
+  flips every want-error case red across 6 surfaces + the unit test).
+- **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/protocol_test.go,
+  pkg/policymatch/README.md, pkg/api/security.go,
+  pkg/api/rest_filter_failclosed_test.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_show_firewall.go,
+  pkg/grpcapi/server_proto_validation_test.go, pkg/cli/cli_show_security.go,
+  pkg/cli/cli_request.go, pkg/cli/policymatch_protocol_test.go,
+  cmd/cli/main.go, cmd/cli/testpolicy_protocol_test.go
+
 - **2026-06-25**: #3115 (codex-review-066 finding 066-03) — reject unsupported security-policy `then reject` children at commit (sibling of #3114). Added `validatePolicyThenRejectStrict` (AST pre-walk in `compileExpanded`) hard-rejecting a policy whose `then reject` arm carries a child the compiler does not enforce — a reject `profile <name>` (custom reject response) or a packet-type reject like `tcp-reset`. The `reject` arm in `compilePolicy`'s `then` switch set `pol.Action = PolicyReject` and never inspected `t.Children`, so the modifier was SILENTLY DROPPED — the configured custom reject response is inert (a wire-contract / operator-observability divergence, not a fail-open: reject still rejects). Checks both AST shapes (flat-set collapses modifier onto `reject` `Keys[1]`; hierarchical nests it as a child). Allowlist `supportedPolicyThenRejectChildren` is EMPTY (compiler enforces no reject child today). A bare `then reject` (no child) still commits. Strict on `CompileConfig`; lenient-warn on both lenient constructors via new `lenientPolicyThenReject` flag (#1960). Covers zone-pair AND global policies. Fail-on-revert verified RED->GREEN. Files: pkg/config/compiler_policy_then.go, pkg/config/compiler_policy_then_3115_test.go (new), pkg/config/compiler.go, pkg/config/README.md
 ## 2026-06-25 — #2971: Surface A DDNS corrupt ownership state fail-closed
 

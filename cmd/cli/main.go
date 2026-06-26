@@ -493,6 +493,14 @@ func (c *ctl) testPolicy(args []string) error {
 		return nil
 	}
 
+	// #3108: reject a non-empty but unknown/out-of-range protocol token locally
+	// (mirroring the local CLI `test policy`) rather than forwarding it to the
+	// backend where matchApp would short-circuit it to the "any protocol"
+	// wildcard and return a misleading verdict. An empty value is unspecified.
+	if err := policymatch.ValidateProtocol(proto); err != nil {
+		return fmt.Errorf("invalid protocol: %w", err)
+	}
+
 	topic := fmt.Sprintf("test-policy:from=%s,to=%s", fromZone, toZone)
 	if srcIP != "" {
 		topic += ",src=" + srcIP

@@ -165,7 +165,7 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 	params := strings.TrimPrefix(req.Topic, "test-policy:")
 	var fromZone, toZone, srcIP, dstIP, proto string
 	var dstPort int
-	var portErr error
+	var portErr, protoErr error
 	for _, kv := range strings.Split(params, ",") {
 		parts := strings.SplitN(kv, "=", 2)
 		if len(parts) != 2 {
@@ -188,7 +188,14 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			// error the way a bad src/dst is reported below.
 			dstPort, portErr = policymatch.ParsePort(parts[1])
 		case "proto":
+			// #3108: a non-empty but unknown/out-of-range protocol token must
+			// NOT silently coerce to the empty "any protocol" wildcard (the
+			// shared matcher's matchApp short-circuits to match-any for an
+			// unresolvable protocol), which would yield a verdict for traffic
+			// that cannot exist. Validate via the shared helper and report the
+			// error the way a bad port/src is reported below.
 			proto = parts[1]
+			protoErr = policymatch.ValidateProtocol(proto)
 		}
 	}
 	switch {
@@ -198,6 +205,8 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 		buf.WriteString("Missing from/to zone parameters\n")
 	case portErr != nil:
 		fmt.Fprintf(buf, "invalid port: %v\n", portErr)
+	case protoErr != nil:
+		fmt.Fprintf(buf, "%v\n", protoErr)
 	case srcIP != "" && net.ParseIP(srcIP) == nil:
 		// A non-empty but malformed src would otherwise parse to nil and be
 		// treated as a wildcard, yielding a false-positive policy match

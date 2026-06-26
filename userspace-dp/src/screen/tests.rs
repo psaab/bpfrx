@@ -788,6 +788,125 @@ fn teardrop_under_length_non_first_fragment_drops() {
     );
 }
 
+#[test]
+fn teardrop_v6_tiny_non_first_fragment_drops() {
+    // #3119 fail-on-revert: an IPv6 non-first Fragment-header fragment
+    // carrying a tiny data contribution (< 8 bytes) is the IPv6 teardrop
+    // signature and must DROP. Pre-#3119 `check_teardrop` was gated on
+    // AF_INET only, so this slipped through as a PASS even though the
+    // sibling ping-of-death check already screened IPv6.
+    //
+    // offset 2 units = 16 bytes (non-first); payload_len=12 with a single
+    // 8-byte fragment header (frag_data_off=8) → frag_data = 12 - 8 = 4
+    // (< 8) → teardrop. Use UDP with udp-flood disabled and a
+    // teardrop-only profile so no other screen masks the outcome.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        2,     // offset = 2 units = 16 bytes (non-first fragment)
+        false, // trailing fragment
+        12,    // payload_len; frag_data = 12 - 8 = 4 (< 8)
+        8,
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("teardrop")
+    );
+}
+
+#[test]
+fn teardrop_v6_under_length_non_first_fragment_drops() {
+    // #3119 fail-on-revert: an IPv6 non-first fragment whose declared
+    // ip_payload_len is SMALLER than the ext-header bytes already walked
+    // (frag_data_off) yields a 0-byte (saturating) data contribution —
+    // malformed, the IPv6 analogue of the #3027 zero/negative-payload
+    // case — and must DROP.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        2,     // non-first fragment
+        false,
+        4, // payload_len < frag_data_off (8) → saturating_sub → 0 (< 8)
+        8,
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("teardrop")
+    );
+}
+
+#[test]
+fn teardrop_v6_normal_fragment_passes() {
+    // Control: an IPv6 non-first fragment carrying a healthy data
+    // contribution (>= 8 bytes) must NOT be flagged as teardrop. offset
+    // 100 units = 800 bytes; payload_len=1488 with frag_data_off=8 →
+    // frag_data = 1480 (>= 8). UDP with udp-flood disabled and a
+    // teardrop-only profile so only teardrop could fire.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        100,   // 800 bytes (non-first fragment)
+        false, // mid-chain fragment
+        1488,  // frag_data = 1488 - 8 = 1480 (>= 8)
+        8,
+    );
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn teardrop_v6_first_fragment_passes() {
+    // Control: an IPv6 FIRST fragment (offset 0) is never a teardrop even
+    // with a tiny data contribution — teardrop only fires on non-first
+    // fragments. M=1, offset=0.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        0,    // offset 0 → first fragment
+        true, // MORE_FRAGMENTS
+        12,   // tiny data, but offset==0 so not a teardrop
+        8,
+    );
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn teardrop_v6_disabled_profile_passes() {
+    // Fail-on-revert guard: with teardrop OFF, even a tiny v6 non-first
+    // fragment must PASS (the IPv6 arm must be gated on the profile flag,
+    // not always-on).
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = false;
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        2,
+        false,
+        12,
+        8,
+    );
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
 // ================================================================
 // ICMP fragment
 // ================================================================

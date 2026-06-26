@@ -84,6 +84,37 @@ func ParsePort(s string) (int, error) {
 	return n, nil
 }
 
+// ValidateProtocol checks an explicitly-supplied simulator protocol token. An
+// empty/whitespace token means "unspecified" — the protocol dimension is not
+// constrained (the established match-any wildcard) — and is accepted. A
+// non-empty token must resolve to an IANA protocol number via
+// appid.ProtocolNumber: a known name/alias ("tcp", "udp", "icmp", "ospf", ...)
+// or a numeric value in 0-255. An unknown name ("notaproto") or an
+// out-of-range / non-numeric value ("999", "tcpp") is REJECTED with an error
+// rather than silently treated as "any protocol" (#3108).
+//
+// This is the protocol analogue of ValidatePort/ParsePort (#3116). The shared
+// matcher (matchApp) short-circuits to match-any when the query protocol is the
+// empty string, so an invalid token that slips through unvalidated silently
+// becomes "no protocol constraint" and yields a permit/deny verdict for traffic
+// that cannot exist — masking an operator typo. There is no "any" protocol
+// keyword: omit the token (empty) for the protocol wildcard, matching the
+// runtime evaluator which constrains the protocol dimension only when a
+// resolvable protocol is supplied.
+//
+// A single string validator covers every simulator surface (REST query, gRPC
+// field, CLI/remote-cli token, gRPC test-policy), since each accepts the
+// protocol as a string that matchApp resolves identically by name or number.
+func ValidateProtocol(proto string) error {
+	if strings.TrimSpace(proto) == "" {
+		return nil
+	}
+	if _, ok := appid.ProtocolNumber(proto); !ok {
+		return fmt.Errorf("invalid protocol %q", proto)
+	}
+	return nil
+}
+
 // Query is a 5-tuple policy-simulation request. A nil SrcIP/DstIP or an empty
 // Protocol means "unspecified" — the corresponding match dimension is not
 // constrained (the established diagnostic behavior). A zero SrcPort/DstPort
