@@ -182,6 +182,12 @@ pub(crate) struct SourceNatPoolStatus {
     pub persistent_nat: bool,
     #[serde(rename = "persistent_nat_permit_any_remote_host", default)]
     pub persistent_nat_permit_any_remote_host: bool,
+    /// #3193: the full three-way Junos `persistent-nat permit` mode
+    /// ("any-remote-host" / "target-host" / "target-host-port"). An empty
+    /// string (older helper) falls back to the binary flag above on the
+    /// control-plane render side.
+    #[serde(rename = "persistent_nat_permit", default)]
+    pub persistent_nat_permit: String,
     #[serde(rename = "persistent_nat_inactivity_timeout", default)]
     pub persistent_nat_inactivity_timeout: i64,
     #[serde(rename = "live_flows", default)]

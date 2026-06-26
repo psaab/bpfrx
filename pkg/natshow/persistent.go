@@ -104,9 +104,11 @@ func RenderPersistentDetail(w io.Writer, dp Reader) {
 		fmt.Fprintf(w, "  Reflexive IP:       %s\n", b.NatIP)
 		fmt.Fprintf(w, "  Reflexive port:     %d\n", b.NatPort)
 		fmt.Fprintf(w, "  Pool:               %s\n", b.PoolName)
-		if b.PermitAnyRemoteHost {
-			fmt.Fprintf(w, "  Any remote host:    yes\n")
-		}
+		// #3193: render the full three-way persistent-NAT permit mode
+		// (any-remote-host / target-host / target-host-port), not the
+		// pre-#3193 binary any-remote-host flag — an operator could not
+		// otherwise tell target-host from target-host-port.
+		fmt.Fprintf(w, "  Permit:             %s\n", b.PermitMode())
 		fmt.Fprintf(w, "  Current sessions:   %d\n", sessions)
 		fmt.Fprintf(w, "  Left time:          %s\n", remaining.Truncate(time.Second))
 		fmt.Fprintf(w, "  Configured timeout: %ds\n", int(b.Timeout.Seconds()))

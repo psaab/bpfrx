@@ -3437,6 +3437,51 @@ fn pool_snat_persistent_any_remote_host_reuses_everywhere() {
     assert_persistent_expiry_indexes_consistent(&rules[0]);
 }
 
+/// #3193 FAIL-ON-REVERT: the source-NAT pool STATUS surface must carry the
+/// full three-way `persistent_nat_permit` mode so the operator SHOW path can
+/// distinguish target-host from target-host-port. Before #3193 the status
+/// exposed only the binary `persistent_nat_permit_any_remote_host` flag, which
+/// is identical (false) for BOTH target-host and target-host-port. Reverting
+/// `status.rs` to emit only that bool turns the target-host != target-host-port
+/// assertion below RED.
+#[test]
+fn pool_status_reports_three_way_persistent_permit_mode() {
+    let any = source_nat_pool_statuses(&persistent_pool_rules_permit(
+        300,
+        40000,
+        40010,
+        "any-remote-host",
+    ));
+    let host = source_nat_pool_statuses(&persistent_pool_rules_permit(
+        300,
+        40000,
+        40010,
+        "target-host",
+    ));
+    let host_port = source_nat_pool_statuses(&persistent_pool_rules_permit(
+        300,
+        40000,
+        40010,
+        "target-host-port",
+    ));
+
+    assert_eq!(any[0].persistent_nat_permit, "any-remote-host");
+    assert_eq!(host[0].persistent_nat_permit, "target-host");
+    assert_eq!(host_port[0].persistent_nat_permit, "target-host-port");
+
+    // The legacy binary flag CANNOT tell the two target modes apart.
+    assert_eq!(
+        host[0].persistent_nat_permit_any_remote_host,
+        host_port[0].persistent_nat_permit_any_remote_host,
+        "the legacy bool is identical for target-host and target-host-port"
+    );
+    // The three-way mode MUST.
+    assert_ne!(
+        host[0].persistent_nat_permit, host_port[0].persistent_nat_permit,
+        "target-host and target-host-port must be distinguishable in status (#3193)"
+    );
+}
+
 /// #2823: an EMPTY wire `persistent_nat_permit` string (old control plane)
 /// falls back to the legacy bool. bool=false must mean target-host-port (the
 /// pre-#2823 (dst_ip, dst_port) keying), so a new remote port does NOT reuse.

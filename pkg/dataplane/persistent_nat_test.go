@@ -4,6 +4,8 @@ import (
 	"net/netip"
 	"testing"
 	"time"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func TestPersistentNATTable_SaveAndLookup(t *testing.T) {
@@ -140,8 +142,8 @@ func TestPersistentNATTable_PoolConfig(t *testing.T) {
 
 	// Register pool config
 	table.SetPoolConfig("snat-pool", PersistentNATPoolInfo{
-		Timeout:             600 * time.Second,
-		PermitAnyRemoteHost: true,
+		Timeout: 600 * time.Second,
+		Permit:  config.PersistentNATPermitAnyRemoteHost,
 	})
 
 	natIP := netip.MustParseAddr("203.0.113.1")
@@ -158,8 +160,8 @@ func TestPersistentNATTable_PoolConfig(t *testing.T) {
 	if cfg.Timeout != 600*time.Second {
 		t.Errorf("timeout = %s, want 600s", cfg.Timeout)
 	}
-	if !cfg.PermitAnyRemoteHost {
-		t.Error("expected PermitAnyRemoteHost = true")
+	if cfg.Permit != config.PersistentNATPermitAnyRemoteHost {
+		t.Errorf("expected Permit = any-remote-host, got %q", cfg.Permit)
 	}
 
 	// Unknown IP should not find a pool
@@ -219,29 +221,50 @@ func TestPersistentNATTable_InactivityTimeout(t *testing.T) {
 	}
 }
 
-func TestPersistentNATTable_PermitAnyRemoteHostFlag(t *testing.T) {
+func TestPersistentNATTable_PermitMode(t *testing.T) {
 	table := NewPersistentNATTable()
 
 	srcIP := netip.MustParseAddr("192.168.1.1")
 	natIP := netip.MustParseAddr("203.0.113.5")
 
 	table.Save(&PersistentNATBinding{
-		SrcIP:               srcIP,
-		SrcPort:             8080,
-		NatIP:               natIP,
-		NatPort:             40000,
-		PoolName:            "perm-pool",
-		LastSeen:            time.Now(),
-		Timeout:             300 * time.Second,
-		PermitAnyRemoteHost: true,
+		SrcIP:    srcIP,
+		SrcPort:  8080,
+		NatIP:    natIP,
+		NatPort:  40000,
+		PoolName: "perm-pool",
+		LastSeen: time.Now(),
+		Timeout:  300 * time.Second,
+		Permit:   config.PersistentNATPermitAnyRemoteHost,
 	})
 
 	got := table.Lookup(srcIP, 8080, "perm-pool")
 	if got == nil {
 		t.Fatal("expected binding")
 	}
-	if !got.PermitAnyRemoteHost {
-		t.Error("expected PermitAnyRemoteHost = true on binding")
+	if got.Permit != config.PersistentNATPermitAnyRemoteHost {
+		t.Errorf("expected Permit = any-remote-host, got %q", got.Permit)
+	}
+
+	// #3193: PermitMode renders each three-way mode distinctly, and the
+	// zero value resolves to the target-host-port default.
+	cases := []struct {
+		permit config.PersistentNATPermit
+		want   string
+	}{
+		{config.PersistentNATPermitAnyRemoteHost, "any-remote-host"},
+		{config.PersistentNATPermitTargetHost, "target-host"},
+		{config.PersistentNATPermitTargetHostPort, "target-host-port"},
+		{"", "target-host-port"},
+	}
+	for _, c := range cases {
+		b := &PersistentNATBinding{Permit: c.permit}
+		if got := b.PermitMode(); got != c.want {
+			t.Errorf("PermitMode(%q) = %q, want %q", c.permit, got, c.want)
+		}
+	}
+	if mode := (&PersistentNATBinding{Permit: config.PersistentNATPermitTargetHost}).PermitMode(); mode == (&PersistentNATBinding{Permit: config.PersistentNATPermitTargetHostPort}).PermitMode() {
+		t.Fatalf("target-host and target-host-port must render distinctly, both = %q", mode)
 	}
 }
 
@@ -276,20 +299,20 @@ func TestPersistentNATTable_IPv6(t *testing.T) {
 	natIP := netip.MustParseAddr("2001:db8:ff::100")
 
 	table.SetPoolConfig("v6pool", PersistentNATPoolInfo{
-		Timeout:             600 * time.Second,
-		PermitAnyRemoteHost: true,
+		Timeout: 600 * time.Second,
+		Permit:  config.PersistentNATPermitAnyRemoteHost,
 	})
 	table.RegisterNATIP(natIP, "v6pool")
 
 	table.Save(&PersistentNATBinding{
-		SrcIP:               srcIP,
-		SrcPort:             443,
-		NatIP:               natIP,
-		NatPort:             50000,
-		PoolName:            "v6pool",
-		LastSeen:            time.Now(),
-		Timeout:             600 * time.Second,
-		PermitAnyRemoteHost: true,
+		SrcIP:    srcIP,
+		SrcPort:  443,
+		NatIP:    natIP,
+		NatPort:  50000,
+		PoolName: "v6pool",
+		LastSeen: time.Now(),
+		Timeout:  600 * time.Second,
+		Permit:   config.PersistentNATPermitAnyRemoteHost,
 	})
 
 	got := table.Lookup(srcIP, 443, "v6pool")

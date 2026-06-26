@@ -1352,14 +1352,19 @@ type SourceNATPoolStatus struct {
 	PortHigh                         uint16 `json:"port_high,omitempty"`
 	PersistentNAT                    bool   `json:"persistent_nat,omitempty"`
 	PersistentNATPermitAnyRemoteHost bool   `json:"persistent_nat_permit_any_remote_host,omitempty"`
-	PersistentNATInactivityTimeout   int    `json:"persistent_nat_inactivity_timeout,omitempty"`
-	LiveFlows                        uint64 `json:"live_flows,omitempty"`
-	UsedPorts                        uint64 `json:"used_ports,omitempty"`
-	PersistentLeases                 uint64 `json:"persistent_leases,omitempty"`
-	MaxTrackedFlows                  uint64 `json:"max_tracked_flows,omitempty"`
-	AllocationsTotal                 uint64 `json:"allocations_total,omitempty"`
-	ReusesTotal                      uint64 `json:"reuses_total,omitempty"`
-	ExhaustionTotal                  uint64 `json:"exhaustion_total,omitempty"`
+	// PersistentNATPermit carries the full three-way Junos `persistent-nat
+	// permit` mode (#3193): "any-remote-host" / "target-host" /
+	// "target-host-port". Empty from an older helper that only set the
+	// binary PersistentNATPermitAnyRemoteHost flag.
+	PersistentNATPermit            string `json:"persistent_nat_permit,omitempty"`
+	PersistentNATInactivityTimeout int    `json:"persistent_nat_inactivity_timeout,omitempty"`
+	LiveFlows                      uint64 `json:"live_flows,omitempty"`
+	UsedPorts                      uint64 `json:"used_ports,omitempty"`
+	PersistentLeases               uint64 `json:"persistent_leases,omitempty"`
+	MaxTrackedFlows                uint64 `json:"max_tracked_flows,omitempty"`
+	AllocationsTotal               uint64 `json:"allocations_total,omitempty"`
+	ReusesTotal                    uint64 `json:"reuses_total,omitempty"`
+	ExhaustionTotal                uint64 `json:"exhaustion_total,omitempty"`
 }
 
 type EventStreamStatus struct {
