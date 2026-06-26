@@ -1,3 +1,18 @@
+## 2026-06-25 — #3040: route event-log protoName through appid.ProtocolName SSOT
+
+- **Timestamp**: 2026-06-25
+- **Action**: Replaced the local 4-protocol (tcp/udp/icmp/icmpv6) map in
+  `pkg/logging/ringbuf.go`'s `protoName` with the shared
+  `appid.ProtocolName` SSOT (the same table REST #2949 and gRPC #3037 use),
+  so GRE(47)/ESP(50)/IPIP(4)/IPv6(41) security event-log (RT_FLOW / ring
+  buffer) rows render named (GRE/ESP/IPIP/IPV6) instead of numeric. Casing
+  is preserved (upper-case, ICMPv6 mixed-case for the trace contract);
+  unknown protocols keep the numeric fallback. Added `protoname_test.go`
+  fail-on-revert pin (reverting to the 4-protocol set turns proto 47/50/4/41
+  RED). Confirmed the cross-package `TestRawEventContractMatchesDataplaneEvent`
+  screen-flag contract is untouched. Updated `pkg/logging/README.md` Gotchas.
+- **File(s)**: pkg/logging/ringbuf.go, pkg/logging/protoname_test.go,
+  pkg/logging/README.md, _Log.md
 ## 2026-06-25 — #3067: ICMP pseudo-port only for identifier-bearing query types
 
 - **Timestamp**: 2026-06-25
