@@ -831,6 +831,32 @@ func openPerInterfaceSocket(ifName string, iface *net.Interface, isVLAN bool) (*
 // flags (notably SOCK_CLOEXEC) without needing CAP_NET_RAW.
 var afPacketSocket = unix.Socket
 
+// VRRP advertisement multicast destination MACs. IPv4 VRRP adverts go to
+// 224.0.0.18 which maps to the Ethernet multicast MAC 01:00:5e:00:00:12; IPv6
+// VRRP adverts go to ff02::12 which maps to 33:33:00:00:00:12. These are kept
+// as named constants for documentation and for any future PACKET_MR_MULTICAST
+// (specific-group) membership; the current receiver joins via ALLMULTI (see
+// buildAfPacketMembership / #2870).
+var (
+	vrrpGroupMACv4 = [6]byte{0x01, 0x00, 0x5e, 0x00, 0x00, 0x12}
+	vrrpGroupMACv6 = [6]byte{0x33, 0x33, 0x00, 0x00, 0x00, 0x12}
+)
+
+// buildAfPacketMembership builds the PACKET_ADD_MEMBERSHIP request that the
+// VRRP AF_PACKET receiver applies to its capture socket. It returns a
+// PACKET_MR_ALLMULTI membership (receive all multicast) rather than
+// PACKET_MR_PROMISC (receive everything) -- ALLMULTI delivers the VRRP group
+// multicast adverts without disabling unicast hardware filtering, fixing the
+// tenant-unicast leak and the all-frames-to-CPU overhead of promisc (#2870).
+// Factored out so a unit test can assert the membership type without needing
+// CAP_NET_RAW.
+func buildAfPacketMembership(ifIndex int) unix.PacketMreq {
+	return unix.PacketMreq{
+		Ifindex: int32(ifIndex),
+		Type:    unix.PACKET_MR_ALLMULTI,
+	}
+}
+
 // openAfPacketReceiver opens an AF_PACKET SOCK_RAW socket bound to the
 // given interface for receiving VRRP packets. This is used on VLAN sub-
 // interfaces where raw IP sockets don't reliably receive multicast.
@@ -867,16 +893,35 @@ func openAfPacketReceiver(ifIndex int) (int, error) {
 		return -1, fmt.Errorf("set rcvtimeo: %w", err)
 	}
 
-	// Promiscuous mode is required to receive multicast frames from
-	// remote peers on VLAN sub-interfaces. Without it, only locally-
-	// generated multicast (IP-layer loopback) is delivered. This matches
-	// tcpdump's behavior, which also sets PACKET_MR_PROMISC.
-	mreq := &unix.PacketMreq{
-		Ifindex: int32(ifIndex),
-		Type:    unix.PACKET_MR_PROMISC,
-	}
-	if err := unix.SetsockoptPacketMreq(fd, unix.SOL_PACKET, unix.PACKET_ADD_MEMBERSHIP, mreq); err != nil {
-		slog.Debug("vrrp: failed to set promisc", "err", err)
+	// Put the NIC into receive-all-multicast (ALLMULTI) mode rather than full
+	// promiscuous mode (#2870). VRRP advertisements are ALWAYS sent to a
+	// multicast destination MAC -- 01:00:5e:00:00:12 for IPv4 (224.0.0.18) and
+	// 33:33:00:00:00:12 for IPv6 (ff02::12) -- so ALLMULTI delivers every frame
+	// the old PROMISC membership delivered for VRRP, while leaving hardware
+	// UNICAST filtering intact. That closes two PROMISC problems: the NIC no
+	// longer copies every tenant unicast frame on a data-bearing RETH VLAN to
+	// the host CPU (perf), and the raw capture socket no longer sees other
+	// tenants' unicast traffic (isolation).
+	//
+	// ALLMULTI is provably non-regressive for VRRP reception relative to the
+	// previous PROMISC: on a VLAN sub-interface both flags propagate to the
+	// physical parent through the SAME kernel path (vlan_dev_change_rx_flags ->
+	// dev_set_allmulti / dev_set_promiscuity on the real device), and every
+	// frame PROMISC delivered with a multicast destination MAC is also
+	// delivered under ALLMULTI. The only frames no longer delivered are unicast
+	// frames not addressed to our MAC -- exactly the leak we are closing.
+	//
+	// A tighter PACKET_MR_MULTICAST membership for just the two VRRP group MACs
+	// (hardware-filtering to the group instead of all multicast) is the
+	// theoretical optimum, but it routes through a different propagation path
+	// (dev_mc_add -> dev_mc_sync -> the VF's rx-mode programming) whose
+	// reliability on the mlx5 SR-IOV VFs under a VLAN sub-interface is not
+	// confirmed; a silent MC-filter miss there would drop adverts and cause
+	// split-brain. ALLMULTI is the conservative correct choice. See
+	// docs/vrrp-afpacket-receiver.md.
+	mreq := buildAfPacketMembership(ifIndex)
+	if err := unix.SetsockoptPacketMreq(fd, unix.SOL_PACKET, unix.PACKET_ADD_MEMBERSHIP, &mreq); err != nil {
+		slog.Debug("vrrp: failed to set allmulti", "err", err)
 	}
 
 	// BPF filter: accept VRRP for IPv4, IPv6, and 802.1Q-tagged variants.

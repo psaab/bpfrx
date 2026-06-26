@@ -848,5 +848,29 @@ fn build_mirror_target_map(
 }
 
 #[cfg(test)]
+impl Coordinator {
+    /// #2962 test seam: install a worker handle whose `session_export_ack`
+    /// never advances on its own, and return the ack atomic so the caller
+    /// (e.g. the server-level dispatcher test in `crate::server::tests`) can
+    /// control when the owner-RG export ack-wait completes. Lets a test
+    /// prove the global `ServerState` lock is NOT held across the wait.
+    pub(crate) fn test_install_export_worker(&mut self, worker_id: u32) -> Arc<AtomicU64> {
+        let ack = Arc::new(AtomicU64::new(0));
+        let handle = WorkerHandle {
+            stop: Arc::new(AtomicBool::new(false)),
+            heartbeat: Arc::new(AtomicU64::new(0)),
+            commands: Arc::new(Mutex::new(VecDeque::new())),
+            session_export_ack: ack.clone(),
+            cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            runtime_atomics: Arc::new(super::worker_runtime::WorkerRuntimeAtomics::new()),
+            cold_path_atomics: Arc::new(super::cold_path_hist::WorkerColdPathAtomics::new()),
+            join: None,
+        };
+        self.workers.handles.insert(worker_id, handle);
+        ack
+    }
+}
+
+#[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

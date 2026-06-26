@@ -339,6 +339,32 @@ all userspace sessions owned by the demoting RGs. This is not the same thing as
 the steady-state delta drain. It is an explicit republish step used to reduce
 handoff loss.
 
+**The export ack-wait runs OFF the global `ServerState` lock (#2962).** The
+helper-side control-socket dispatcher (`server/handlers/mod.rs`) holds a single
+`Mutex<ServerState>` across its request `match`, which serializes every control
+RPC (status poll, session install, snapshot/FIB bump, HA state update, neighbor
+update). The owner-RG export blocks up to 15 s waiting for every worker to ack
+the export sequence — so doing that wait under the lock would freeze the whole
+control plane for up to 15 s whenever a worker is slow or stalled (exactly the
+failover-critical moment). The handler is therefore split into two phases:
+
+- **Locked phase** (`Coordinator::kick_owner_rg_export`): enqueue the
+  `ExportOwnerRGSessions` command to every worker, bump `export_seq`, and
+  snapshot the lock-free handles the wait needs — the per-worker
+  `session_export_ack` atomics (`Arc<AtomicU64>`) and the per-binding delta
+  buffers (`Arc<BindingLiveState>`). Returns an `OwnerRgExportWait` immediately.
+- **Lock-free phase** (`OwnerRgExportWait::wait_and_collect`): the dispatcher
+  drops the `ServerState` lock, then runs the 15 s ack-wait + delta drain on the
+  snapshotted `Arc`s. Status is re-derived afterward under a fresh short-lived
+  lock acquisition. While one export drains, all other control RPCs proceed.
+
+There is no TOCTOU: the worker SET (`workers.handles` / `workers.live`) is only
+mutated by other control-socket handlers, which all hold the same lock, so the
+worker set cannot change during the lock-free wait. The worker THREADS only
+advance their ack atomics (monotonic seq) and push into their delta buffers —
+both `Arc`-shared and lock-free — so the snapshot observes their progress
+faithfully. The 15 s deadline and the timeout error are preserved verbatim.
+
 ### Delta-ring overflow → loss-of-sync resync (#2442)
 
 Each worker buffers session open/close deltas in an in-worker ring
