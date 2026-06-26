@@ -1,6 +1,6 @@
 use super::{
     BindingStatus, ConfigSnapshot, ExceptionStatus, HAGroupStatus, InjectPacketRequest,
-    InterfaceSnapshot, PacketResolution, SessionDeltaInfo,
+    InterfaceSnapshot, PacketResolution, SessionDeltaInfo, ZoneSnapshot,
 };
 use crate::nat::{
     DnatTable, NatDecision, SourceNatFailure, SourceNatLookup, SourceNatRule, StaticNatTable,

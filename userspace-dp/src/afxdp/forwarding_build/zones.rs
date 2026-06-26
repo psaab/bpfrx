@@ -42,5 +42,13 @@ pub(super) fn populate_zones(snapshot: &ConfigSnapshot, state: &mut ForwardingSt
         }
         state.zone_name_to_id.insert(zone.name.clone(), zone.id);
         state.zone_id_to_name.insert(zone.id, zone.name.clone());
+        // #3070: build the host-inbound admission set for zones that declared a
+        // `host-inbound-traffic` stanza, keyed by the SAME validated id. Zones
+        // without a stanza are left absent → admit-all (pre-#3070 behaviour).
+        if zone.host_inbound_configured {
+            state
+                .zone_host_inbound
+                .insert(zone.id, zone_host_inbound_from_snapshot(zone));
+        }
     }
 }

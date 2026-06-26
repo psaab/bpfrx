@@ -57,6 +57,14 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) ifindex_to_zone_id: FastMap<i32, u16>,
     pub(in crate::afxdp) zone_name_to_id: FastMap<String, u16>,
     pub(in crate::afxdp) zone_id_to_name: FastMap<u16, String>,
+    /// #3070: per-zone host-inbound-traffic admission set, keyed by the same
+    /// validated zone id as `zone_id_to_name`. A zone is present here only when
+    /// the config declared a `host-inbound-traffic` stanza for it; an absent
+    /// entry means "not configured" → the dataplane preserves admit-all for
+    /// host-bound (local-delivery) traffic ingressing that zone. Read on the
+    /// local-delivery admit path (session miss AND session hit) to default-deny
+    /// host-bound traffic whose service/protocol is not listed.
+    pub(in crate::afxdp) zone_host_inbound: FastMap<u16, ZoneHostInbound>,
     pub(in crate::afxdp) egress: FastMap<i32, EgressInterface>,
     pub(in crate::afxdp) ingress_logical_ifindex: FastMap<(i32, u16), i32>,
     pub(in crate::afxdp) fabrics: Vec<FabricLink>,
@@ -132,6 +140,74 @@ pub(in crate::afxdp) struct ForwardingState {
     /// via `lookup_slot`. Rotated via the ForwardingState ArcSwap.
     pub(in crate::afxdp) cold_path_slot_map:
         std::sync::Arc<crate::afxdp::cold_path_hist::ColdPathSlotMap>,
+}
+
+/// #3070: a zone's compiled host-inbound-traffic admission set. Built from the
+/// raw Junos `system-services` / `protocols` tokens on the wire
+/// (`ZoneSnapshot`) at config-apply time (`zone_host_inbound_from_snapshot`),
+/// then read on the per-packet local-delivery admit path. A `ForwardingState`
+/// only holds a `ZoneHostInbound` for zones that declared a stanza; an absent
+/// entry means admit-all (the pre-#3070 behaviour) for that zone.
+///
+/// Service tokens are classified to L4 signatures: TCP/UDP services contribute
+/// destination ports; ICMP-bearing services (ping, router-discovery) and the
+/// raw `protocols` routing tokens contribute either an ICMP/ICMPv6 admit bit or
+/// an IP-protocol number. `all_services` (Junos `system-services { all }` or
+/// `any-service`) and `all_protocols` (`protocols { all }`) short-circuit to a
+/// full admit. An UNRECOGNISED token contributes nothing (fail-closed: it does
+/// not broaden the admit set), so a host-bound packet matching no listed
+/// service/protocol is denied.
+#[derive(Clone, Debug, Default)]
+pub(in crate::afxdp) struct ZoneHostInbound {
+    /// `system-services { all }` / `any-service` — admit every host-bound
+    /// packet regardless of service. Operators use `all` as the catch-all
+    /// "let everything in"; treating it as a full admit (slightly broader than
+    /// Junos, which scopes `all` to service traffic) keeps a `host-inbound { all }`
+    /// control/heartbeat zone fully open and is the safe direction.
+    pub(in crate::afxdp) all_services: bool,
+    /// `protocols { all }` — admit every routing-protocol host-bound packet.
+    pub(in crate::afxdp) all_protocols: bool,
+    /// Admitted TCP destination ports (ssh=22, https=443, bgp=179, ...).
+    pub(in crate::afxdp) tcp_ports: FastSet<u16>,
+    /// Admitted UDP destination ports (dns=53, dhcp=67/68, ike=500/4500, ...).
+    pub(in crate::afxdp) udp_ports: FastSet<u16>,
+    /// Admit ICMPv4 (ping / router-discovery contribute this). The granularity
+    /// is the L4 protocol, not the ICMP type — a zone permitting `ping` OR
+    /// `router-discovery` admits ICMPv4 echo and router-discovery alike. This
+    /// is documented, slightly-lenient-vs-Junos-icmp-subtype behaviour.
+    pub(in crate::afxdp) icmp: bool,
+    /// Admit ICMPv6 (ping / router-discovery for v6).
+    pub(in crate::afxdp) icmpv6: bool,
+    /// Admitted bare IP protocol numbers (gre=47, ospf=89, esp=50, ah=51,
+    /// vrrp=112, pim=103, igmp=2, ...). Checked for non-TCP/UDP/ICMP packets.
+    pub(in crate::afxdp) ip_protocols: FastSet<u8>,
+}
+
+impl ZoneHostInbound {
+    /// Returns true iff a host-bound packet with the given L4 protocol and
+    /// destination port is admitted by this zone's host-inbound set.
+    pub(in crate::afxdp) fn admits(&self, protocol: u8, dst_port: u16, is_v6: bool) -> bool {
+        if self.all_services || self.all_protocols {
+            return true;
+        }
+        match protocol {
+            // TCP
+            6 => self.tcp_ports.contains(&dst_port),
+            // UDP
+            17 => self.udp_ports.contains(&dst_port),
+            // ICMPv4
+            1 => self.icmp,
+            // ICMPv6
+            58 => self.icmpv6,
+            other => {
+                if is_v6 && other == 58 {
+                    self.icmpv6
+                } else {
+                    self.ip_protocols.contains(&other)
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

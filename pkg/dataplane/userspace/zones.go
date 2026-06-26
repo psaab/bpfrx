@@ -19,10 +19,43 @@ func buildZoneSnapshots(cfg *config.Config) []ZoneSnapshot {
 	sort.Strings(names)
 	out := make([]ZoneSnapshot, 0, len(names))
 	for i, name := range names {
-		out = append(out, ZoneSnapshot{
+		z := ZoneSnapshot{
 			Name: name,
 			ID:   uint16(i + 1),
-		})
+		}
+		// #3070: carry the zone's host-inbound-traffic admission set onto the
+		// wire so the dataplane can enforce it for host-bound (local-delivery)
+		// traffic. A nil HostInboundTraffic means the zone declared no stanza:
+		// HostInboundConfigured stays false and the dataplane preserves
+		// admit-all for that zone.
+		if zone := cfg.Security.Zones[name]; zone != nil && zone.HostInboundTraffic != nil {
+			z.HostInboundConfigured = true
+			z.HostInboundSystemServices = lowerTokens(zone.HostInboundTraffic.SystemServices)
+			z.HostInboundProtocols = lowerTokens(zone.HostInboundTraffic.Protocols)
+		}
+		out = append(out, z)
+	}
+	return out
+}
+
+// lowerTokens returns a lower-cased, trimmed copy of the host-inbound token
+// slice (system-services / protocols). Empty/whitespace tokens are dropped.
+// The Rust classifier lower-cases on its side too, but normalizing here keeps
+// the wire canonical and the Go emit test deterministic.
+func lowerTokens(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, t := range in {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t == "" {
+			continue
+		}
+		out = append(out, t)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

@@ -351,6 +351,23 @@ pub(crate) struct ZoneSnapshot {
     pub name: String,
     #[serde(default)]
     pub id: u16,
+    /// #3070: whether the zone declared a `host-inbound-traffic` stanza. When
+    /// false the dataplane preserves admit-all for host-bound (local-delivery)
+    /// traffic on this zone; when true it default-denies host-bound traffic
+    /// whose system-service / protocol is not in the sets below (Junos
+    /// host-inbound posture). serde(default) keeps wire parity with an older Go
+    /// control plane that omits the field (#1961).
+    #[serde(rename = "host_inbound_configured", default)]
+    pub host_inbound_configured: bool,
+    /// #3070: the zone's `host-inbound-traffic system-services` tokens
+    /// (lower-cased Junos names: ssh, ping, dhcp, ike, ...). Classified to L4
+    /// signatures at build time (`zone_host_inbound_from_snapshot`).
+    #[serde(rename = "host_inbound_system_services", default)]
+    pub host_inbound_system_services: Vec<String>,
+    /// #3070: the zone's `host-inbound-traffic protocols` tokens (lower-cased
+    /// Junos names: ospf, bgp, router-discovery, ...).
+    #[serde(rename = "host_inbound_protocols", default)]
+    pub host_inbound_protocols: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

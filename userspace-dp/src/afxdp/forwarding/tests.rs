@@ -1892,14 +1892,17 @@ fn policy_selection_deny_emits_rt_flow_event() {
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            ..Default::default()
         },
         ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            ..Default::default()
         },
         ZoneSnapshot {
             name: "dmz".to_string(),
             id: TEST_DMZ_ZONE_ID,
+            ..Default::default()
         },
     ];
     let state = build_forwarding_state(&snapshot);
@@ -2429,10 +2432,12 @@ fn connected_routes_are_table_scoped_no_cross_vrf_leak() {
             crate::ZoneSnapshot {
                 name: "za".to_string(),
                 id: TEST_TRUST_ZONE_ID,
+                ..Default::default()
             },
             crate::ZoneSnapshot {
                 name: "zb".to_string(),
                 id: TEST_UNTRUST_ZONE_ID,
+                ..Default::default()
             },
         ],
         interfaces: vec![
@@ -2508,6 +2513,7 @@ fn ecmp_static_route_retains_all_next_hops_and_skips_dead() {
         zones: vec![crate::ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            ..Default::default()
         }],
         interfaces: vec![
             crate::InterfaceSnapshot {
@@ -2936,6 +2942,7 @@ fn ecmp_static_route_spreads_per_flow_not_per_destination() {
         zones: vec![crate::ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            ..Default::default()
         }],
         interfaces: vec![
             crate::InterfaceSnapshot {
@@ -3133,6 +3140,7 @@ fn same_prefix_routes_tie_break_by_preference_not_insertion_order() {
         zones: vec![crate::ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            ..Default::default()
         }],
         interfaces: vec![
             crate::InterfaceSnapshot {

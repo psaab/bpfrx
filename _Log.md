@@ -225,6 +225,46 @@
 - **File(s)**: pkg/config/compiler_validate_strict.go,
   pkg/config/compiler.go, pkg/config/zone_interface_membership_test.go,
   pkg/config/README.md, _Log.md
+## 2026-06-25 — #3070: enforce host-inbound-traffic on the userspace dataplane
+
+- **Timestamp**: 2026-06-25
+- **Action**: Closed the host-inbound-traffic security-boundary gap. The
+  zone `host-inbound-traffic { system-services; protocols; }` set was parsed
+  and modeled in Go but never reached the dataplane, so host-bound traffic
+  (SSH/ping/routing protocols to a firewall-local IP) was admitted regardless
+  of the configured set. Carried `host_inbound_configured` +
+  `host_inbound_system_services` + `host_inbound_protocols` onto `ZoneSnapshot`
+  (Go emit `pkg/dataplane/userspace/{protocol,zones}.go`; Rust decode
+  `userspace-dp/src/protocol/snapshot.rs`, byte-identical JSON per #1961). Rust
+  classifies the tokens to L4 signatures (`forwarding/host_inbound.rs`,
+  `ZoneHostInbound` in `types/forwarding.rs`, built in `forwarding_build/zones.rs`)
+  and enforces on the local-delivery admit path at BOTH the session-miss and
+  session-hit sites in `afxdp/poll_descriptor/mod.rs` (hit-path re-check tears
+  down a host-bound session when host-inbound config tightens, no explicit
+  purge). A zone with no stanza preserves admit-all (zero-regression default).
+  Added `dhcp`/`dhcpv6` to the lan zone in `docs/ha-cluster-userspace.conf`
+  (reth1.0 runs the dhcp-local-server, now requires the host-inbound entry).
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/zones_host_inbound_test.go (new),
+  userspace-dp/src/protocol/snapshot.rs, userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs (new),
+  userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  userspace-dp/src/afxdp/forwarding_build/zones.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/{tests.rs,test_fixtures.rs},
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/ha-cluster-userspace.conf
+- **Validation**: `cargo build --release -p xpf-userspace-dp` clean;
+  new Rust tests `build_forwarding_state_enforces_host_inbound_traffic` +
+  `zone_snapshot_host_inbound_fields_roundtrip` pass (fail-on-revert: neutering
+  the admit check to always-true turns the enforcement test RED). Go
+  `TestBuildZoneSnapshotsCarriesHostInbound` passes; `go build ./...` +
+  `go test ./pkg/dataplane/... ./pkg/config/...` green. gofmt clean.
+
 ## 2026-06-25 — #3065: unspecified default-policy fails CLOSED (deny-all) + reject-all + schema leaf
 
 - **Timestamp**: 2026-06-25

@@ -520,6 +520,45 @@ pub(super) fn poll_binding_process_descriptor(
                             binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }
+                        // #3070: host-inbound-traffic enforcement on the
+                        // session-HIT local-delivery path. Re-checked on every
+                        // hit (mirroring the lo0 re-check above) so a
+                        // host-inbound config change is enforced on an already
+                        // established host-bound session WITHOUT an explicit
+                        // purge: if the tightened set no longer admits the
+                        // service, the session is torn down here and the packet
+                        // dropped. The ingress zone is the session metadata's
+                        // recorded ingress_zone.
+                        if resolved.decision.resolution.disposition
+                            == ForwardingDisposition::LocalDelivery
+                            && !host_inbound_admits(
+                                worker_ctx.forwarding,
+                                resolved.metadata.ingress_zone,
+                                meta.protocol,
+                                resolved.key.dst_port,
+                                matches!(flow.dst_ip, IpAddr::V6(_)),
+                            )
+                        {
+                            delete_terminal_filtered_session(
+                                sessions,
+                                binding.bpf_maps.session_map_fd,
+                                conntrack_v4_fd,
+                                conntrack_v6_fd,
+                                worker_ctx.shared_sessions,
+                                worker_ctx.shared_nat_sessions,
+                                worker_ctx.shared_forward_wire_sessions,
+                                &worker_ctx.shared_owner_rg_indexes,
+                                worker_ctx.peer_worker_commands,
+                                &resolved.key,
+                                resolved.decision,
+                                &resolved.metadata,
+                                resolved.origin,
+                            );
+                            telemetry.dbg.local += 1;
+                            telemetry.dbg.policy_deny += 1;
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
                         // TTL/hop-limit check on session-hit path: generate
                         // ICMP Time Exceeded for packets that would expire
                         // after decrement. The session-miss path handles this
@@ -1249,6 +1288,30 @@ pub(super) fn poll_binding_process_descriptor(
                             }
                             telemetry.dbg.local += 1;
                             telemetry.dbg.policy_deny += 1;
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
+                        // #3070: host-inbound-traffic enforcement on the
+                        // session-MISS local-delivery path. A host-bound packet
+                        // (destined to a firewall-local interface IP) whose
+                        // system-service / protocol is not in the INGRESS
+                        // zone's host-inbound set is denied (silent drop, Junos
+                        // posture) and never cached. A zone with no host-inbound
+                        // stanza admits everything (admit-all default), so
+                        // existing configs are unaffected. Gated on
+                        // LocalDelivery so transit traffic never pays for it.
+                        if resolution.disposition == ForwardingDisposition::LocalDelivery
+                            && !host_inbound_admits(
+                                worker_ctx.forwarding,
+                                from_zone_id,
+                                meta.protocol,
+                                flow.forward_key.dst_port,
+                                matches!(flow.dst_ip, IpAddr::V6(_)),
+                            )
+                        {
+                            telemetry.dbg.local += 1;
+                            telemetry.dbg.policy_deny += 1;
+                            telemetry.counters.touched = true;
                             binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }
