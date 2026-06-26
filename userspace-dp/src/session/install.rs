@@ -149,7 +149,13 @@ impl SessionTable {
                 // #2465: stamp the creation instant once at install. Never
                 // re-stamped, so the close delta reports the true session age.
                 created_ns: now_ns,
-                expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
+                expires_after_ns: session_timeout_ns(
+                    protocol,
+                    tcp_flags,
+                    &self.timeouts,
+                    // #3227: per-application idle timeout override (None = global).
+                    metadata.inactivity_timeout_ns,
+                ),
                 closing: matches!(protocol, PROTO_TCP) && is_closing(tcp_flags),
                 reset: matches!(protocol, PROTO_TCP) && has_rst(tcp_flags),
                 wheel_tick: 0,
@@ -274,7 +280,13 @@ impl SessionTable {
                 // stamp is the local re-import time; the local close that
                 // follows reports age from here.
                 created_ns: now_ns,
-                expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
+                expires_after_ns: session_timeout_ns(
+                    protocol,
+                    tcp_flags,
+                    &self.timeouts,
+                    // #3227: per-application idle timeout override (None = global).
+                    metadata.inactivity_timeout_ns,
+                ),
                 closing: matches!(protocol, PROTO_TCP) && is_closing(tcp_flags),
                 reset: matches!(protocol, PROTO_TCP) && has_rst(tcp_flags),
                 wheel_tick: 0,

@@ -472,6 +472,9 @@ impl FlowCacheEntry {
                 // already-installed session (the install on the slow path stamps
                 // the real policy ID); this seed value is never published itself.
                 policy_id: 0,
+                // #3227: the real per-app idle timeout is stamped by the
+                // slow-path install; the flow-cache seed uses the global one.
+                inactivity_timeout_ns: None,
             },
             stamp: FlowCacheStamp::capture(
                 validation.config_generation,

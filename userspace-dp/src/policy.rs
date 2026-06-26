@@ -407,6 +407,13 @@ pub(crate) struct PolicyEvaluationResult {
     /// the session metadata.
     pub(crate) log_session_init: bool,
     pub(crate) log_session_close: bool,
+    /// #3227: the matched application term's per-application inactivity (idle)
+    /// timeout in SECONDS, carried so the session-install path can stamp it so
+    /// the conntrack GC ages the session out on the app's value instead of the
+    /// global per-protocol timeout. `None` means "use the global timeout"
+    /// (the default-action path and any non-app-timeout match), which is
+    /// byte-identical to pre-#3227 behavior.
+    pub(crate) inactivity_timeout: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -623,6 +630,12 @@ pub(crate) struct ApplicationMatch {
     /// #3020: optional ICMP/ICMPv6 code constraint, paired with `icmp_type`.
     /// `None` matches any code of the constrained type.
     pub(crate) icmp_code: Option<u8>,
+    /// #3227: optional per-application inactivity (idle) timeout in SECONDS.
+    /// `Some(t)` (t > 0) overrides the global per-protocol session timeout for a
+    /// flow admitted by this term; `None` (or 0) leaves the global timeout in
+    /// effect (back-compat). Carried from the matched term into the session at
+    /// install so the conntrack GC ages the session out on the app's value.
+    pub(crate) inactivity_timeout: Option<u32>,
 }
 
 /// Pre-indexed application matcher: groups terms by protocol for O(1) lookup.
@@ -639,17 +652,22 @@ struct CompiledApplications {
 #[derive(Clone, Debug, Default)]
 struct ProtoTerms {
     /// Exact destination port set (single-port terms compiled for O(1) lookup).
-    exact_dst_ports: rustc_hash::FxHashSet<u16>,
+    /// #3227: the value is the term's per-application inactivity timeout
+    /// (`None` = use the global per-protocol timeout). First writer wins on an
+    /// overlapping port (matches the catalog "first match wins" convention).
+    exact_dst_ports: FxHashMap<u16, Option<u32>>,
     /// Port range terms that need linear scan (multi-port ranges).
-    range_terms: Vec<(Vec<PortRange>, Vec<PortRange>)>, // (src_ranges, dst_ranges)
+    /// #3227: third tuple element is the term's inactivity timeout.
+    range_terms: Vec<(Vec<PortRange>, Vec<PortRange>, Option<u32>)>, // (src, dst, timeout)
     /// #3020: ICMP/ICMPv6 type[,code] constraints for icmp-constrained terms
-    /// (e.g. junos-ping = type 8). Each entry is `(type, optional code)`. A
-    /// packet matches this protocol via the icmp path iff its type (and code,
-    /// when the entry constrains it) equals one of these entries. An
-    /// UNCONSTRAINED ICMP term (junos-icmp-all) does NOT land here — it stays a
-    /// `range_terms` entry with empty ranges, which matches every ICMP packet,
-    /// so a rule citing both still matches all ICMP.
-    icmp_constraints: Vec<(u8, Option<u8>)>,
+    /// (e.g. junos-ping = type 8). Each entry is `(type, optional code,
+    /// inactivity timeout)`. A packet matches this protocol via the icmp path
+    /// iff its type (and code, when the entry constrains it) equals one of these
+    /// entries. An UNCONSTRAINED ICMP term (junos-icmp-all) does NOT land here —
+    /// it stays a `range_terms` entry with empty ranges, which matches every
+    /// ICMP packet, so a rule citing both still matches all ICMP. #3227 added
+    /// the trailing timeout.
+    icmp_constraints: Vec<(u8, Option<u8>, Option<u32>)>,
 }
 
 impl CompiledApplications {
@@ -673,18 +691,29 @@ impl CompiledApplications {
             // ICMP. (ICMP terms never carry ports in practice; the type
             // constraint takes precedence so a stray port is irrelevant here.)
             if app.icmp_type.is_some() {
-                entry
-                    .icmp_constraints
-                    .push((app.icmp_type.expect("icmp_type is Some"), app.icmp_code));
+                entry.icmp_constraints.push((
+                    app.icmp_type.expect("icmp_type is Some"),
+                    app.icmp_code,
+                    // #3227: carry the term's idle timeout onto the constraint.
+                    app.inactivity_timeout,
+                ));
             } else if app.source_ports.is_empty()
                 && app.destination_ports.len() == 1
                 && app.destination_ports[0].low == app.destination_ports[0].high
             {
-                entry.exact_dst_ports.insert(app.destination_ports[0].low);
-            } else {
+                // #3227: store the term timeout keyed by exact port. First
+                // writer wins on an overlapping port so precedence is stable.
                 entry
-                    .range_terms
-                    .push((app.source_ports.clone(), app.destination_ports.clone()));
+                    .exact_dst_ports
+                    .entry(app.destination_ports[0].low)
+                    .or_insert(app.inactivity_timeout);
+            } else {
+                entry.range_terms.push((
+                    app.source_ports.clone(),
+                    app.destination_ports.clone(),
+                    // #3227: carry the term's idle timeout onto the range entry.
+                    app.inactivity_timeout,
+                ));
             }
         }
         Self {
@@ -701,6 +730,17 @@ impl CompiledApplications {
     /// non-ICMP packet) fails closed for those terms. Port/range terms are
     /// unaffected, so non-ICMP applications and the all-ICMP aliases behave
     /// exactly as before.
+    ///
+    /// #3227: the return type carries the matched term's per-application
+    /// inactivity timeout so the install path can stamp it on the session:
+    ///   - `None`              → no application term matched (rule does not apply)
+    ///   - `Some(None)`        → matched, no custom timeout (use the global one)
+    ///   - `Some(Some(secs))`  → matched, use this per-app idle timeout
+    /// Precedence among a rule's terms is the lookup order: the exact
+    /// destination-port term wins first, then range terms in config order, then
+    /// ICMP-type-constrained terms — the first hit supplies the timeout. The
+    /// match-any short-circuit yields `Some(None)` (use-global), so an
+    /// `application any` rule is byte-identical to today.
     #[inline]
     fn matches(
         &self,
@@ -708,23 +748,21 @@ impl CompiledApplications {
         src_port: u16,
         dst_port: u16,
         packet_icmp: Option<(u8, u8)>,
-    ) -> bool {
+    ) -> Option<Option<u32>> {
         if self.match_any {
-            return true;
+            return Some(None);
         }
-        let Some(terms) = self.by_protocol.get(&protocol) else {
-            return false;
-        };
+        let terms = self.by_protocol.get(&protocol)?;
         // Fast path: check exact dst port set first (O(1)).
-        if terms.exact_dst_ports.contains(&dst_port) {
-            return true;
+        if let Some(&timeout) = terms.exact_dst_ports.get(&dst_port) {
+            return Some(timeout);
         }
         // Slow path: check range terms (an unconstrained ICMP term, e.g.
         // junos-icmp-all, lives here as an empty-range entry → match-all).
-        if terms.range_terms.iter().any(|(src_ranges, dst_ranges)| {
+        if let Some(&(_, _, timeout)) = terms.range_terms.iter().find(|(src_ranges, dst_ranges, _)| {
             port_ranges_match(src_ranges, src_port) && port_ranges_match(dst_ranges, dst_port)
         }) {
-            return true;
+            return Some(timeout);
         }
         // #3020: ICMP/ICMPv6 type[,code]-constrained terms (junos-ping). Match
         // only when the packet's type/code is known and equals a constraint.
@@ -732,13 +770,16 @@ impl CompiledApplications {
         // non-first fragment) the constrained term does NOT match — fail closed.
         if !terms.icmp_constraints.is_empty() {
             if let Some((ptype, pcode)) = packet_icmp {
-                return terms
+                if let Some(&(_, _, timeout)) = terms
                     .icmp_constraints
                     .iter()
-                    .any(|&(ctype, ccode)| ctype == ptype && ccode.map_or(true, |c| c == pcode));
+                    .find(|&&(ctype, ccode, _)| ctype == ptype && ccode.map_or(true, |c| c == pcode))
+                {
+                    return Some(timeout);
+                }
             }
         }
-        false
+        None
     }
 }
 
@@ -1443,6 +1484,9 @@ pub(crate) fn evaluate_policy_result_with_icmp(
         // #2508: the implicit default policy has no `then log` selection.
         log_session_init: false,
         log_session_close: false,
+        // #3227: the implicit default policy carries no per-app timeout; the
+        // session ages on the global per-protocol timeout (today's behavior).
+        inactivity_timeout: None,
     }
 }
 
@@ -1542,12 +1586,11 @@ fn try_match_rule(
     if rule.inactive {
         return None;
     }
-    if !rule
+    // #3227: `matches` now returns the matched application term's optional
+    // inactivity timeout (`None` outer = no app match → rule does not apply).
+    let app_inactivity_timeout = rule
         .compiled_apps
-        .matches(protocol, src_port, dst_port, packet_icmp)
-    {
-        return None;
-    }
+        .matches(protocol, src_port, dst_port, packet_icmp)?;
     // #2008 H2: when a side is `*-excluded`, the rule matches every
     // address EXCEPT those in the configured set, so the match-any
     // short-circuit must NOT apply (it would always-match and the
@@ -1644,6 +1687,9 @@ fn try_match_rule(
             // selection so the install path can stamp the session.
             log_session_init: rule.log_session_init,
             log_session_close: rule.log_session_close,
+            // #3227: surface the matched application term's idle timeout so the
+            // install path can stamp it onto the admitted session.
+            inactivity_timeout: app_inactivity_timeout,
         })
     } else {
         None
@@ -1735,6 +1781,11 @@ fn parse_applications(terms: &[PolicyApplicationSnapshot]) -> ParsedApplications
             // compiled matcher. A non-ICMP term simply has these as None.
             icmp_type: term.icmp_type,
             icmp_code: term.icmp_code,
+            // #3227: carry the per-application inactivity timeout through to the
+            // compiled matcher so a session admitted by this term can stamp it.
+            // A 0 seconds value collapses to None (use-global) so the override
+            // is only set when the operator configured a positive timeout.
+            inactivity_timeout: term.inactivity_timeout.filter(|&t| t > 0),
         });
     }
     ParsedApplications {

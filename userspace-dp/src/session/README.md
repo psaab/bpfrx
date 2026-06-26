@@ -58,8 +58,32 @@ structure.)
 | TCP closing (graceful FIN) | 30 s |
 | TCP closing (RST) | 2 s |
 
-Per-application overrides come from the typed config and land here as
-per-entry `expires_after_ns`.
+**Per-application inactivity-timeout (#3227).** A custom application's
+`inactivity-timeout` (`set applications application <a> inactivity-timeout
+<secs>`) overrides the global per-protocol timeout for the ESTABLISHED /
+idle window of any session admitted by a policy whose matched application
+term carries it. It rides the wire on `PolicyApplicationSnapshot.
+inactivity_timeout` (seconds, omitempty — 0/absent = use-global), is
+surfaced by the matcher as `PolicyEvaluationResult.inactivity_timeout`,
+and is stamped at install onto `SessionMetadata.inactivity_timeout_ns`
+(seconds->ns, saturating). `session_timeout_ns` then prefers that override
+for the established TCP / UDP / ICMP idle window on install AND on every
+real-traffic refresh (`lookup.rs` / `update_session`), so the conntrack
+GC ages the flow out on the app's value. It deliberately does NOT extend
+the short TCP closing/RST reap windows (a FIN/RST close still reaps on
+`TCP_CLOSING_TIMEOUT_NS` / `TCP_RST_TIMEOUT_NS`), matching Junos, where
+`inactivity-timeout` is the idle timeout of an established session.
+**Precedence:** the first matching policy rule wins (policy order), and
+within that rule the first matching application term supplies the timeout
+— the exact destination-port term is consulted first, then range terms in
+config order, then ICMP-type-constrained terms. An application with no
+custom timeout (`None`) is byte-identical to pre-#3227 and ages on the
+global per-protocol timeout. This restores the legacy-eBPF `appTimeout`
+parity (the retired maps wired the same per-app value). **HA caveat:**
+like `policy_id`, the override is in-process only — it is NOT yet carried
+on the cross-node session-sync wire, so a peer-promoted session ages on
+the global timeout until a real-traffic refresh re-stamps it (a
+documented follow-up).
 
 **RST vs FIN close (#3046).** A graceful FIN close keeps the full 30 s
 `TCP_CLOSING_TIMEOUT_NS` (TIME_WAIT-style window for half-closed /

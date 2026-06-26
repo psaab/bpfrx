@@ -101,6 +101,7 @@ fn test_close_delta(kind: crate::session::SessionDeltaKind) -> crate::session::S
             log_session_init: false,
             log_session_close: false,
             policy_id: 0,
+            inactivity_timeout_ns: None,
         },
         origin: SessionOrigin::ForwardFlow,
         fabric_redirect_sync: false,

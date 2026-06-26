@@ -523,6 +523,8 @@ pub(super) fn build_missing_neighbor_session_metadata(
         // #3056: a neighbor-seed session is a transient pre-resolution stub,
         // not a policy-admitted flow, so it carries no admitting policy ID.
         policy_id: 0,
+        // #3227: a neighbor-seed stub is not policy-app-matched; use global.
+        inactivity_timeout_ns: None,
     }
 }
 

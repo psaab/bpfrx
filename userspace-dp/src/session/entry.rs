@@ -53,6 +53,22 @@ pub(crate) struct SessionMetadata {
     /// the close-event/rows on a peer-PROMOTED session still resolve `0` until
     /// the sync delta carries it; #1961 both-sides wire discipline).
     pub(crate) policy_id: u32,
+    /// #3227: the admitting application term's per-application inactivity (idle)
+    /// timeout in NANOSECONDS, stamped at install from the matched policy's
+    /// `PolicyEvaluationResult.inactivity_timeout` (seconds → ns). `None` means
+    /// "use the global per-protocol `SessionTimeouts`" — the historical
+    /// behavior, byte-identical for every flow whose application has no custom
+    /// `inactivity-timeout`. When `Some`, `session_timeout_ns` uses it as the
+    /// ESTABLISHED/idle expiry for the session, so the conntrack GC ages the
+    /// session out on the app's value instead of the global timeout (closing the
+    /// legacy-eBPF `appTimeout` parity regression). It does NOT override the
+    /// short TCP closing/RST reap windows, matching Junos (inactivity-timeout is
+    /// the idle timeout of an established session). In-process only: like
+    /// `policy_id`, this rides the shared-session map and worker replicas but
+    /// does NOT cross the cross-node HA `SessionDeltaInfo` wire yet, so a
+    /// peer-promoted session ages on the global timeout until a real-traffic
+    /// refresh re-stamps it (a deliberate follow-up).
+    pub(crate) inactivity_timeout_ns: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

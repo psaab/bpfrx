@@ -473,6 +473,12 @@ pub(crate) fn build_synced_session_entry(
             // discipline). Until then a synced session resolves policy 0,
             // bit-identical to today.
             policy_id: 0,
+            // #3227: like policy_id, the per-application idle timeout is not yet
+            // carried on the cross-node HA session-sync wire. A peer-synced
+            // session ages on the global per-protocol timeout until a
+            // real-traffic refresh re-stamps it from the matched policy — a
+            // deliberate follow-up mirroring the policy_id wire deferral above.
+            inactivity_timeout_ns: None,
         },
         origin: crate::session::SessionOrigin::SyncImport,
         // #2170: carry the peer's install generation onto the helper entry.

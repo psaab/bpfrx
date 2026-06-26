@@ -98,7 +98,15 @@ impl SessionTable {
                     TCP_CLOSING_TIMEOUT_NS
                 }
             } else {
-                session_timeout_ns(key.protocol, tcp_flags, &timeouts)
+                // #3227: re-apply the admitting application's per-app idle
+                // timeout on every established refresh so the session keeps
+                // aging on the app's value, not the global per-protocol one.
+                session_timeout_ns(
+                    key.protocol,
+                    tcp_flags,
+                    &timeouts,
+                    entry.metadata.inactivity_timeout_ns,
+                )
             };
             (
                 (
