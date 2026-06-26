@@ -86,6 +86,16 @@ inspect or rewrite a packet sitting in a UMEM frame.
   `packet_rel_l4_offset_and_protocol` so MSS clamping reaches
   ext-headered v6 SYNs (the shared helper is left unchanged — GRE decap
   and tunnel local-origin read it to forward fragmented inner packets).
+- **Port-less protocols never get an L4 port written (#3111)**: only
+  TCP/UDP carry a rewritable 16-bit port pair at L4 offset +0/+2. Every
+  port-write site — the generic `apply_nat_port_rewrite` and the
+  descriptor fast-path arms (`rewrite/ipv4.rs`, `rewrite/ipv6.rs`) — gates
+  on the single `crate::ip_proto::has_l4_ports` predicate (TCP|UDP) so a
+  GRE/ESP/AH/OSPF/ICMP packet's first two L4 bytes (GRE flags, ESP SPI)
+  are NEVER overwritten with a NAT port. The allocator side is gated too:
+  pool-mode SNAT in `nat/source.rs` allocates NO pool port and leaves
+  `rewrite_src_port` unset for a port-less protocol (IP-only translation),
+  so the descriptor never even carries a stray port for these.
 - **Non-first fragments build NO ported SessionFlow (#2344)**: #1852
   gated only the NAT rewrite leaves; the generic session-flow parsers
   (`parse_session_flow_from_bytes` / `parse_session_flow_from_frame` /
