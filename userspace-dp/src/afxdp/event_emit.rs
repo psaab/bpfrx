@@ -601,6 +601,42 @@ mod tests {
     }
 
     #[test]
+    fn policy_deny_event_emit_carries_default_policy_sentinel() {
+        // #3057: a deny produced by the implicit default-policy passes the
+        // reserved sentinel ID through emit_policy_deny_event. The wire
+        // policy_id (and the mirrored rule_id) must carry it unchanged so the
+        // Go side renders "default-policy" instead of the first rule's name.
+        let (handle, rx) = unlimited_handle();
+        let flow = test_flow();
+
+        emit_policy_deny_event(
+            Some(&handle),
+            &flow,
+            &NatDecision::default(),
+            test_meta(),
+            7,
+            9,
+            3,
+            crate::policy::DEFAULT_POLICY_SENTINEL_ID,
+            PolicyAction::Deny,
+            0,
+            mono_now_ns(),
+        );
+
+        let event = rx
+            .try_recv()
+            .expect("policy event frame")
+            .decode_dataplane_event()
+            .expect("policy event payload");
+        assert_eq!(event.policy_id, crate::policy::DEFAULT_POLICY_SENTINEL_ID);
+        assert_eq!(event.rule_id, crate::policy::DEFAULT_POLICY_SENTINEL_ID);
+        assert_ne!(
+            event.policy_id, 0,
+            "the default-policy sentinel must not alias the first policy ID 0"
+        );
+    }
+
+    #[test]
     fn policy_deny_event_emit_reject_maps_to_reject_action() {
         // #2089: the policy-deny path now synthesizes a TCP RST / ICMP
         // unreachable for `reject`, so the RT_FLOW action must report

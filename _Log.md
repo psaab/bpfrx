@@ -20271,3 +20271,24 @@ top.
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/afxdp/forwarding/tests.rs,
   userspace-dp/src/event_stream/README.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3057 — give the implicit default-policy a distinct, non-colliding
+  identity. The no-match default deny/reject emitted policy_id 0, aliasing the
+  FIRST configured policy (also ID 0); when that rule is a permit the RT_FLOW
+  default-deny logged with the permit's name (misleading audit). Added a
+  reserved sentinel: Rust `DEFAULT_POLICY_SENTINEL_ID = u32::MAX` (policy.rs)
+  and Go `dataplane.DefaultPolicySentinelID = 0xFFFFFFFF` +
+  `dataplane.DefaultPolicyName = "default-policy"` (types.go), kept byte-
+  identical on the existing policy_id u32 wire field (no layout change). The
+  no-match return now emits the sentinel; `compilePolicies` seeds the sentinel
+  name into PolicyNames; `resolvePolicyName` resolves it authoritatively.
+  Sentinel can never be a real ID (real = policySetID*256+ruleIndex). Hit
+  counters unaffected (name-keyed, only matched rules increment). Contract test
+  reads policy.rs to pin Go==Rust. Fail-on-revert: emit-0 → Rust sentinel test
+  RED; ringbuf-revert → Go misattribution test RED; restored byte-identical.
+  **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+  userspace-dp/src/afxdp/event_emit.rs, pkg/dataplane/types.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/retirement_boundary_canary_test.go,
+  pkg/logging/ringbuf.go, pkg/logging/default_policy_sentinel_3057_test.go,
+  pkg/logging/README.md, docs/pr/1373-retire-ebpf-dataplane/README.md

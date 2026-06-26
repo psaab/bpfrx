@@ -359,6 +359,27 @@ impl Default for PolicyAction {
     }
 }
 
+/// #3057: reserved sentinel policy ID for the IMPLICIT default-policy
+/// (deny-all / permit-all) result returned when a flow matches no configured
+/// zone-pair or `junos-global` policy.
+///
+/// A real configured policy ID is `policy_set_id * MAX_RULES_PER_POLICY +
+/// rule_index` (see `pkg/dataplane/userspace/policies.go`), where `rule_index`
+/// is capped strictly below MAX_RULES_PER_POLICY (256) and `policy_set_id` is
+/// the number of configured zone-pair policy blocks (plus one for the global
+/// set) — far below 16,777,216 in any real config. Reaching `u32::MAX`
+/// (=0xFFFF_FFFF) as a real ID would require ~16.7M zone-pair policy sets, which
+/// is impossible, so this sentinel can never collide with a configured policy's
+/// ID. Emitting it (instead of the old `0`, which aliased the FIRST configured
+/// policy) lets the Go log/display planes render the implicit default as
+/// `default-policy` rather than mis-attributing the deny to the first rule.
+///
+/// The value travels in the existing `policy_id` u32 field on the wire — NO
+/// wire-layout/size change. The Go side mirrors it as
+/// `dataplane.DefaultPolicySentinelID`; the two MUST stay byte-identical (pinned
+/// by a cross-language contract test in pkg/dataplane/userspace).
+pub(crate) const DEFAULT_POLICY_SENTINEL_ID: u32 = u32::MAX;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PolicyEvaluationResult {
     pub(crate) action: PolicyAction,
@@ -1292,7 +1313,12 @@ pub(crate) fn evaluate_policy_result_with_len(
     }
     PolicyEvaluationResult {
         action: state.default_action,
-        policy_id: 0,
+        // #3057: the implicit default-policy carries a reserved sentinel ID,
+        // NOT 0. Emitting 0 here aliased the FIRST configured policy (also ID
+        // 0), so a default-policy deny logged as that rule's name — actively
+        // misleading when the first rule is a permit. The sentinel is rendered
+        // as `default-policy` by the Go log/display planes.
+        policy_id: DEFAULT_POLICY_SENTINEL_ID,
         // #2508: the implicit default policy has no `then log` selection.
         log_session_init: false,
         log_session_close: false,

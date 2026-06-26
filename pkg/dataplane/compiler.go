@@ -699,6 +699,13 @@ func compilePolicies(dp DataPlane, cfg *config.Config, result *CompileResult) er
 	// Track written keys for populate-before-clear.
 	writtenPolicySets := make(map[ZonePairKey]bool)
 	result.PolicyNames = make(map[uint32]string)
+	// #3057: seed the reserved implicit default-policy sentinel so a
+	// default-deny/reject RT_FLOW event (policy_id = DefaultPolicySentinelID,
+	// emitted by the Rust dataplane when no configured policy matched) resolves
+	// to "default-policy" instead of mis-attributing to the first configured
+	// policy (real ID 0). Seeded unconditionally — the implicit default fires
+	// even when zero policies are configured.
+	result.PolicyNames[DefaultPolicySentinelID] = DefaultPolicyName
 
 	policySetID := uint32(0)
 
