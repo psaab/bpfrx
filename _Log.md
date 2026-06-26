@@ -20113,3 +20113,28 @@ top.
   server README socket-lifecycle section.
   **File(s)**: userspace-dp/src/server/lifecycle.rs,
   userspace-dp/src/server/README.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #2926 — thread ctx into applyConfigLocked so a daemon stop aborts
+  the post-applySem commit/remediation apply (the #2914/#2868 follow-up: #2914
+  only cancelled the pre-semaphore wait). applyConfigLocked now takes ctx and
+  checks ctx.Err() at three coarse boundaries — C1 before the netlink reconcile
+  phase, C2 before the dataplane apply / Rust control-socket sync push, C3
+  before the FRR reload — returning ctx.Err() at the next boundary instead of
+  completing netlink + FRR + Rust sync. Boundaries are placed so a bail leaves a
+  restart-recoverable state (no mid-phase abort; RETH MAC/VIP/rebind between C2
+  and C3 runs as one unit). The cancellation signal is the DAEMON-LIFETIME ctx
+  (new applyCancelCtx → d.daemonCtx), NOT the request ctx — a request disconnect
+  after store.Commit must not abort (would diverge a running daemon). Commit
+  wrappers (commitAndApply/syncAndApply/commitConfirmedAndApply) pass
+  applyCancelCtx; applyConfig (boot/DHCP/feeds) and executeConfirmedRollback
+  pass context.Background(). Added apply_ctx_cancel_test.go (cancel-aborts +
+  live-runs-full) with fail-on-revert proof; updated test call sites to pass a
+  ctx; updated pkg/daemon/README.md.
+  **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/apply_ctx_cancel_test.go,
+  pkg/daemon/daemon_apply_runtime_test.go,
+  pkg/daemon/daemon_flowexport_reconcile_test.go,
+  pkg/daemon/daemon_networkd_apply_test.go,
+  pkg/daemon/daemon_snmp_reconcile_test.go,
+  pkg/daemon/persistent_snat_apply_test.go,
+  pkg/daemon/policy_scheduler_apply_test.go, pkg/daemon/README.md

@@ -201,7 +201,7 @@ func TestApplyConfigClearsDeferWorkersOnAbortCompileError(t *testing.T) {
 		},
 	}
 
-	if err := d.applyConfigLocked(cfg); !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
+	if err := d.applyConfigLocked(context.Background(), cfg); !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
 		t.Fatalf("applyConfigLocked error = %v, want protocol incompatibility", err)
 	}
 	if dp.compileCalls != 1 {
@@ -235,7 +235,7 @@ func TestApplyConfigProtocolAbortPreservesExistingScheduler(t *testing.T) {
 		},
 	}
 
-	if err := d.applyConfigLocked(newCfg); !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
+	if err := d.applyConfigLocked(context.Background(), newCfg); !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
 		t.Fatalf("applyConfigLocked error = %v, want protocol incompatibility", err)
 	}
 	if d.scheduler != oldScheduler {
@@ -280,7 +280,7 @@ func TestApplyConfigUsesRuntimeConfigSinkWithoutLegacyDataplane(t *testing.T) {
 		opts: Options{NoDataplane: true},
 	}
 
-	err := d.applyConfigLocked(&config.Config{})
+	err := d.applyConfigLocked(context.Background(), &config.Config{})
 	if !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
 		t.Fatalf("applyConfigLocked error = %v, want runtime apply error", err)
 	}
@@ -312,7 +312,7 @@ func TestApplyConfigSeedsUserspacePolicySchedulerStateBeforeCompile(t *testing.T
 	d := &Daemon{dp: dp}
 	cfg := testPolicySchedulerApplyConfig()
 
-	if err := d.applyConfigLocked(cfg); !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
+	if err := d.applyConfigLocked(context.Background(), cfg); !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
 		t.Fatalf("applyConfigLocked error = %v, want protocol incompatibility", err)
 	}
 

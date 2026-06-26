@@ -219,6 +219,27 @@ never lock an operator out of a remote box it manages.
 - `commitFn` and `commitConfirmedFn` are passed to `pkg/cli` and
   `pkg/grpcapi`; they hold the apply semaphore across the commit + apply
   pair so concurrent committers serialize.
+- **Cancellable apply at coarse boundaries (#2926, follow-up to #2914/#2868).**
+  `applyConfigLocked(ctx, cfg)` checks `ctx.Err()` at three phase boundaries and
+  returns the ctx error at the next one rather than completing the netlink + FRR
+  reload + Rust control-socket sync: **C1** before the netlink reconcile phase
+  (step 0), **C2** before the dataplane apply / Rust sync push (step 2), and
+  **C3** before the FRR reload (step 3). The checks sit only at boundaries where
+  bailing leaves a consistent, restart-recoverable state — each major
+  side-effecting phase (and the RETH MAC / VIP / worker-rebind sequence between
+  C2 and C3) runs to completion once started, so the apply is never interrupted
+  mid-phase; on the next boot the boot-time apply re-runs the whole pipeline
+  against the active config, so a skipped tail converges. The cancellation
+  signal is the **daemon-lifetime** context (`applyCancelCtx` → `d.daemonCtx`),
+  *not* the request/commit context: a daemon stop aborts an in-flight
+  commit/remediation apply (the eventengine remediation path that #2914 made
+  cancellable only at the pre-semaphore wait), but a mere request cancellation
+  (HTTP/gRPC client disconnect) is deliberately ignored after `store.Commit` —
+  aborting a promoted commit on a still-running daemon would leave the store
+  ahead of the dataplane/FRR with no automatic re-apply to converge. The boot /
+  DHCP / feed applies (`applyConfig`) and the confirmed-rollback re-apply
+  (`executeConfirmedRollback`) pass a non-cancellable `context.Background()` so
+  they always complete.
 - FRR reload runs with a 15 s context timeout to keep `systemctl reload
   frr` from hanging. The systemd unit has `TimeoutStopSec=20` as a safety
   net.
