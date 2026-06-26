@@ -299,6 +299,78 @@ func TestLinkWatcher_EventUpdatesTrackedInstances(t *testing.T) {
 	}
 }
 
+// TestLinkWatcher_RenameAwayDemotes covers #2944: a runtime kernel rename of a
+// tracked interface (wan0 -> wan1) arrives as a SINGLE RTM_NEWLINK carrying the
+// SAME ifindex with the NEW name and NO RTM_DELLINK for the old name. An
+// instance tracking the configured name (wan0) must DEMOTE because the named
+// interface no longer exists — it must NOT silently follow the ifindex to wan1
+// and stay up. Reverting applyLinkEvent to the old name-only matching makes the
+// rename event match nothing and the tracker stays at full priority (RED).
+func TestLinkWatcher_RenameAwayDemotes(t *testing.T) {
+	m := NewManager()
+	defer stopManagerForTest(m)
+	// wan0 no longer resolves after the rename (LinkByName fails -> down); any
+	// other name is up. This is what the kernel does post-rename.
+	m.linkState = func(name string) (bool, error) {
+		if name == "wan0" {
+			return false, errors.New("no such link")
+		}
+		return true, nil
+	}
+
+	updates := make(chan chan<- netlink.LinkUpdate, 1)
+	m.subscribeLinks = func(ch chan<- netlink.LinkUpdate, done <-chan struct{}) error {
+		updates <- ch
+		return nil
+	}
+	m.subscribeAddrs = func(ch chan<- netlink.AddrUpdate, done <-chan struct{}) error { return nil }
+
+	tracker := newTrackTestInstance(200, 50, "wan0")
+	m.mu.Lock()
+	m.instances[instanceKey{iface: "eth0", groupID: 101}] = tracker
+	m.ensureLinkWatcherLocked()
+	m.mu.Unlock()
+
+	var ch chan<- netlink.LinkUpdate
+	select {
+	case ch = <-updates:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher never subscribed")
+	}
+
+	const ifindex = 5
+	// First sighting at ifindex 5 with the configured name wan0, up. Represents
+	// the ListExisting seed / a prior up event; warms the ifindex->name cache.
+	ch <- netlink.LinkUpdate{
+		Header: unix.NlMsghdr{Type: unix.RTM_NEWLINK},
+		Link:   &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: ifindex, Name: "wan0", OperState: netlink.OperUp}},
+	}
+	// Settle: tracker should be up (priority 200) after the wan0-up event.
+	deadline := time.After(2 * time.Second)
+	for tracker.getPriority() != 200 {
+		select {
+		case <-deadline:
+			t.Fatalf("tracker priority = %d, want 200 after wan0 up event", tracker.getPriority())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// The rename: SAME ifindex, NEW name wan1, still OperUp, NO RTM_DELLINK for
+	// wan0. The instance tracking wan0 must demote.
+	ch <- netlink.LinkUpdate{
+		Header: unix.NlMsghdr{Type: unix.RTM_NEWLINK},
+		Link:   &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: ifindex, Name: "wan1", OperState: netlink.OperUp}},
+	}
+	deadline = time.After(2 * time.Second)
+	for tracker.getPriority() != 150 {
+		select {
+		case <-deadline:
+			t.Fatalf("tracker priority = %d, want 150 after wan0 renamed away to wan1", tracker.getPriority())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 func TestPollTrackedLinks(t *testing.T) {
 	m := NewManager()
 	defer stopManagerForTest(m)

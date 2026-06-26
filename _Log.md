@@ -1,3 +1,34 @@
+## 2026-06-26 — #2944 VRRP link watcher robust to runtime interface rename
+
+- **Timestamp**: 2026-06-26
+- **Action**: The link watcher (`runLinkWatcher`) applied tracked-link state
+  strictly by interface NAME. A runtime kernel rename (e.g. `wan0`->`wan1`)
+  arrives as a SINGLE `RTM_NEWLINK` carrying the SAME ifindex with the NEW
+  name and NO `RTM_DELLINK` for the old name, so an instance tracking `wan0`
+  never saw the event and kept its last (typically up) `trackDown` forever —
+  it never demoted even though the configured interface no longer existed.
+  Fix: route each event through a new `applyLinkEvent(ifindex, name, del, up)`
+  that maintains a per-run ifindex->name cache (`Manager.linkNames`). The
+  event's own up/down is authoritative for instances tracking the event's
+  CURRENT name (normal path, no extra syscall); when the ifindex previously
+  carried a DIFFERENT name, that old name has been renamed away and is
+  re-evaluated against the kernel via `reevaluateTrackedName` (LinkByName
+  fails -> down), so the instance demotes. This matches Junos semantics —
+  tracking follows the configured NAME, and a renamed-away name is treated as
+  down rather than silently following the ifindex to the new name. The
+  production subscribe seam now uses `LinkSubscribeWithOptions{ListExisting:
+  true}` (`netlinkLinkSubscribe`) so the cache is seeded from current kernel
+  state at watcher start, closing the cold-start window for an interface up
+  since boot. `linkNames` is reset in `resetRunStateLocked` so a Stop()->Start()
+  re-warms cleanly. The poller fallback (`pollTrackedLinks`) already handled
+  rename correctly (LinkByName err -> down), so it is unchanged. Added
+  `TestLinkWatcher_RenameAwayDemotes`; fail-on-revert verified (reverting the
+  watcher to name-only matching reds the rename test, normal up/down stays
+  green). `go build ./...` + `go test -race ./pkg/vrrp/...` + `go test
+  ./pkg/daemon/...` green.
+- **File(s)**: pkg/vrrp/track.go, pkg/vrrp/manager.go,
+  pkg/vrrp/track_test.go, docs/feature-coverage.md, _Log.md
+
 ## 2026-06-26 — #2917 VLAN-unit AF_XDP bind-target SSOT (Go ↔ Rust parity)
 
 - **Timestamp**: 2026-06-26

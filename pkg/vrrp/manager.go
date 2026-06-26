@@ -47,6 +47,16 @@ type Manager struct {
 	linkState      func(name string) (bool, error)
 	subscribeLinks func(ch chan<- netlink.LinkUpdate, done <-chan struct{}) error
 
+	// linkNames is the link-watcher's ifindex -> current-name cache (#2944).
+	// The kernel emits a runtime rename as a SINGLE RTM_NEWLINK carrying the
+	// SAME ifindex with the NEW name and NO RTM_DELLINK for the old name, so
+	// name-only matching would leave an instance tracking the old name stuck at
+	// its last (typically up) state forever. Keying on the stable ifindex lets
+	// the watcher notice that an ifindex's name CHANGED and re-evaluate the old
+	// (now-vanished) name so the tracking instance demotes. Guarded by mu;
+	// owned by the singleton link-watcher goroutine and reset per run.
+	linkNames map[int]string
+
 	// Source-address watcher (#2528): ONE singleton goroutine subscribing to
 	// netlink ADDRESS updates so an instance's cached advert source
 	// (localIP/localIPv6) is re-resolved when the interface's address changes
@@ -114,8 +124,9 @@ func NewManager() *Manager {
 		instances:          make(map[instanceKey]*vrrpInstance),
 		eventCh:            make(chan VRRPEvent, 256),
 		watcherStop:        make(chan struct{}),
+		linkNames:          make(map[int]string),
 		linkState:          netlinkLinkState,
-		subscribeLinks:     netlink.LinkSubscribe,
+		subscribeLinks:     netlinkLinkSubscribe,
 		subscribeAddrs:     netlink.AddrSubscribe,
 		resolveLinkName:    netlinkLinkName,
 		resolveIface:       net.InterfaceByName,
@@ -163,6 +174,10 @@ func (m *Manager) resetRunStateLocked() {
 	m.closeEventOnce = sync.Once{}
 	m.watcherRunning = false
 	m.addrWatcherRunning = false
+	// Drop the previous run's ifindex->name cache (#2944): a re-subscribe
+	// re-seeds it from current kernel state (ListExisting), so a stale mapping
+	// from before the Stop() must not survive into the new run.
+	m.linkNames = make(map[int]string)
 }
 
 // Stop stops all instances, removes VIPs, and cancels the context.
