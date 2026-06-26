@@ -223,6 +223,31 @@ impl ForwardingState {
     pub(in crate::afxdp) fn zone_tcp_rst_enabled(&self, zone_id: u16) -> bool {
         self.zone_tcp_rst.get(&zone_id).copied().unwrap_or(false)
     }
+
+    /// #2851: true iff `ip` is one of the router's OWN configured interface
+    /// IPs — i.e. an address this firewall delivers to itself
+    /// (`local_v4`/`local_v6`, the same authoritative set the to-self
+    /// `LocalDelivery` disposition tests in `forwarding::mod`). The dynamic
+    /// neighbor-learn path (ARP reply / NDP NA) uses this as an
+    /// anti-poisoning gate: a host on the local link must never be able to
+    /// teach us `(ifindex, our_own_ip) -> attacker_mac`. RFC 826 / RFC 4861:
+    /// a node does not install a neighbor entry for an address it owns from
+    /// an unsolicited advertisement.
+    ///
+    /// The membership test is intentionally global (not routing-table
+    /// scoped): if `ip` is one of our addresses in ANY routing-instance,
+    /// refusing to learn it is always correct — we resolve our own
+    /// addresses via the to-self path, never via a dynamic neighbor entry.
+    /// NAT-translated pool addresses are deliberately NOT in `local_v4`/
+    /// `local_v6` (they are excluded at build time), so this gate scopes to
+    /// genuine configured interface IPs only.
+    #[inline]
+    pub(in crate::afxdp) fn owns_configured_ip(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => self.local_v4.contains(&v4),
+            IpAddr::V6(v6) => self.local_v6.contains(&v6),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

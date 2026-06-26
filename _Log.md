@@ -1,3 +1,34 @@
+## 2026-06-26 — #2851: reject dynamic neighbor-learning of the router's own configured IPs (ARP/NDP anti-poisoning)
+
+- **Timestamp**: 2026-06-26
+- **Action**: fixed #2851. The dynamic neighbor-learn path
+  (`stage_link_layer_classify`) cached incoming ARP replies / NDP NAs into
+  `dynamic_neighbors` + the kernel neighbor table after only the #2790
+  `neighbor_ip_is_learnable` unicast-only gate. That gate never checked the
+  advertised IP against the router's OWN configured interface IPs, so a host
+  on the local link could send an unsolicited/spoofed ARP reply or NDP NA
+  claiming one of the firewall's own interface addresses and poison
+  `(ifindex, router_ip) -> attacker_mac`. Added an ADDITIONAL own-IP gate:
+  `ForwardingState::owns_configured_ip` (reuses `local_v4`/`local_v6`, the
+  same authoritative to-self `LocalDelivery` set) is checked on BOTH the
+  ARP-reply and NDP-NA arms BEFORE the `insert_if_changed` learn so a
+  rejected own-IP learn neither inserts nor bumps `mac_change_epoch`
+  (#3048/#3169). Legitimate non-own neighbors learn exactly as before.
+  Solicited-only learning (only caching replies to probes we actually sent)
+  is a larger, separate concern — left as an explicit follow-up.
+- **File(s)**: `userspace-dp/src/afxdp/types/forwarding.rs` (new
+  `owns_configured_ip` predicate), `userspace-dp/src/afxdp/poll_stages.rs`
+  (own-IP gate on both learn arms + parameterized `ndp_na_frame_with_target`
+  + tests `arp_own_ip_reply_not_learned_2851` /
+  `ndp_own_ip_advert_not_learned_2851`), `_Log.md`.
+- **Validation**: `cargo build --release` clean; `cargo test --release`
+  3092 passed / 0 failed / 2 ignored. Fail-on-revert: removing the two
+  own-IP guards makes both 2851 tests go RED on the "must NOT be learned"
+  assert while the non-own learn asserts stay GREEN; restored byte-identical.
+  No dedicated neighbor-learning markdown doc exists (the #2790 gate this
+  extends documented behavior in code-comments + `_Log.md`); behavior is
+  captured in the new doc-comments on `owns_configured_ip` and both gates.
+
 ## 2026-06-26 — #3064: run L3-header fragment screens on the flowless (non-first-fragment) path
 
 - **Timestamp**: 2026-06-26

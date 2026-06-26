@@ -119,7 +119,22 @@ pub(super) fn stage_link_layer_classify(
             // the ARP frame (it never transits) but skip learning, mirroring
             // the #2369 fail-closed-on-malformed-ARP posture and the cold
             // neighbor warmer's unicast-only gate.
-            if neighbor_ip_is_learnable(arp.sender_ip) {
+            // #2851: anti-poisoning own-IP gate, ADDITIONAL to the #2790
+            // unicast-only gate above. Refuse to learn an ARP reply whose
+            // advertised sender IP equals one of the router's OWN configured
+            // interface IPs. A host on the local link could otherwise send an
+            // unsolicited/spoofed reply claiming our own interface address and
+            // teach us `(ifindex, our_ip) -> attacker_mac` in both
+            // `dynamic_neighbors` and the kernel ARP table (RFC 826 — do not
+            // install a neighbor entry for an address we own). This MUST run
+            // BEFORE the `insert_if_changed` below so a rejected own-IP learn
+            // neither inserts nor bumps `mac_change_epoch` (#3048/#3169).
+            // (Solicited-only learning — only caching replies to probes we
+            // actually sent — is a larger, separate concern, tracked as a
+            // follow-up; this fix is the bounded own-IP rejection.)
+            if neighbor_ip_is_learnable(arp.sender_ip)
+                && !worker_ctx.forwarding.owns_configured_ip(arp.sender_ip)
+            {
                 let ifindex = learn_ifindex();
                 // #3048: route the data-path learn through insert_if_changed
                 // so a MAC change observed directly from an ARP reply
@@ -153,6 +168,14 @@ pub(super) fn stage_link_layer_classify(
         // unicast). The NA frame still transits (falls through below);
         // only the neighbor write is suppressed.
         && neighbor_ip_is_learnable(na.target_ip)
+        // #2851: same anti-poisoning own-IP gate as the ARP-reply arm above.
+        // An NDP NA advertising one of the router's OWN configured IPv6
+        // addresses must not be learned — a local attacker could otherwise
+        // poison `(ifindex, our_v6) -> attacker_mac` (RFC 4861: do not learn
+        // an entry for an address we own from an unsolicited advert). Runs
+        // BEFORE the `insert_if_changed` below so a rejected learn neither
+        // inserts nor bumps `mac_change_epoch`.
+        && !worker_ctx.forwarding.owns_configured_ip(na.target_ip)
     {
         let ifindex = learn_ifindex();
         // #3048: same change-detecting learn for NDP NA — a target-MAC
@@ -1556,6 +1579,17 @@ mod tests {
     /// builder; the checksum is stamped so the strict #2368 NA parser
     /// accepts it.
     fn ndp_na_frame() -> (Vec<u8>, IpAddr, [u8; 6]) {
+        // Default advertised target: fe80::abcd:ef01:0:42 (a legitimate,
+        // non-own unicast neighbor). #2851 tests pass an own-IP target.
+        ndp_na_frame_with_target([
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0xab, 0xcd, 0xef, 0x01, 0x00, 0x00, 0x00, 0x42,
+        ])
+    }
+
+    /// Same builder, but with a caller-supplied advertised target address.
+    /// Used by the #2851 own-IP anti-poisoning tests to advertise one of
+    /// the router's OWN configured IPv6 addresses.
+    fn ndp_na_frame_with_target(target_bytes: [u8; 16]) -> (Vec<u8>, IpAddr, [u8; 6]) {
         const NEXT_HEADER_ICMPV6: u8 = 58;
         const ICMPV6_TYPE_NA: u8 = 136;
         const NDP_OPT_TARGET_LL: u8 = 2;
@@ -1581,10 +1615,7 @@ mod tests {
         f.push(0); // code
         f.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
         f.extend_from_slice(&[0; 4]); // flags
-        // target fe80::abcd:ef01:0:42
-        let target_bytes = [
-            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0xab, 0xcd, 0xef, 0x01, 0x00, 0x00, 0x00, 0x42,
-        ];
+        // target (caller-supplied)
         f.extend_from_slice(&target_bytes);
         // TLLA option
         f.push(NDP_OPT_TARGET_LL);
@@ -1676,6 +1707,113 @@ mod tests {
         assert!(!neighbor_ip_is_learnable(IpAddr::V6(Ipv6Addr::new(
             0xff02, 0, 0, 0, 0, 0, 0, 1
         ))));
+    }
+
+    /// #2851 fail-on-revert (ARP own-IP anti-poisoning). An ARP reply
+    /// claiming one of the router's OWN configured interface IPs
+    /// (`reth1.0` = 10.0.61.1 in the `nat_snapshot` fixture) must NOT be
+    /// learned — neither into `dynamic_neighbors` nor (by extension) the
+    /// kernel ARP table. A legitimate NON-own neighbor on the same
+    /// interface must still learn unchanged (the own-IP gate must not
+    /// over-reject). The frame is still recycled (ARP never transits).
+    ///
+    /// Reverting the `!worker_ctx.forwarding.owns_configured_ip(...)`
+    /// guard in `stage_link_layer_classify` caches `(24, 10.0.61.1) ->
+    /// attacker_mac`, so the "must NOT be present" assert fails RED; the
+    /// non-own learn assert keeps the gate honest.
+    #[test]
+    fn arp_own_ip_reply_not_learned_2851() {
+        let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+            &super::super::test_fixtures::nat_snapshot(),
+        )));
+        // The router's own reth1.0 (lan zone, ifindex 24) IPv4 must be in
+        // the local-delivery set — the authoritative own-IP set this gate
+        // reuses. (The wan reth0.80 IP is excluded as an interface-mode
+        // SNAT translated address, which is why we assert on the lan IP.)
+        let own_ip = Ipv4Addr::new(10, 0, 61, 1);
+        assert!(
+            forwarding.owns_configured_ip(IpAddr::V4(own_ip)),
+            "test precondition: reth1.0 10.0.61.1 must be a configured \
+             own IP in local_v4"
+        );
+        let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+        let meta = link_layer_meta(24, 0);
+
+        // 1) Spoofed reply claiming the router's OWN IP — must NOT learn.
+        let attacker_mac = [0x02, 0x00, 0x00, 0x00, 0xba, 0xad];
+        let outcome =
+            stage_link_layer_classify(&arp_reply_frame(own_ip, attacker_mac), meta, ctx);
+        assert!(
+            matches!(outcome, StageOutcome::RecycleAndContinue),
+            "an ARP reply (even an own-IP one) is still recycled"
+        );
+        assert!(
+            neighbors.get(&(24, IpAddr::V4(own_ip))).is_none(),
+            "an ARP reply claiming the router's OWN configured IP must NOT \
+             be learned (#2851 anti-poisoning gate)"
+        );
+
+        // 2) A legitimate NON-own neighbor on the same interface still
+        //    learns — the own-IP gate must not over-reject.
+        let good_ip = Ipv4Addr::new(10, 0, 61, 50);
+        let good_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x18];
+        let _ = stage_link_layer_classify(&arp_reply_frame(good_ip, good_mac), meta, ctx);
+        assert_eq!(
+            neighbors.get(&(24, IpAddr::V4(good_ip))).map(|e| e.mac),
+            Some(good_mac),
+            "a legitimate non-own ARP neighbor must still be learned"
+        );
+    }
+
+    /// #2851 fail-on-revert (NDP NA own-IP anti-poisoning). A Neighbor
+    /// Advertisement advertising one of the router's OWN configured IPv6
+    /// addresses (`reth1.0` = 2001:559:8585:ef00::1) must NOT be learned.
+    /// A legitimate non-own NA still learns. Mirrors the ARP test above.
+    #[test]
+    fn ndp_own_ip_advert_not_learned_2851() {
+        let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+            &super::super::test_fixtures::nat_snapshot(),
+        )));
+        let own_v6_bytes = [
+            0x20, 0x01, 0x05, 0x59, 0x85, 0x85, 0xef, 0x00, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
+        let own_v6 = IpAddr::V6(Ipv6Addr::from(own_v6_bytes));
+        assert!(
+            forwarding.owns_configured_ip(own_v6),
+            "test precondition: reth1.0 2001:559:8585:ef00::1 must be a \
+             configured own IP in local_v6"
+        );
+        let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+        // reth1.0 is untagged logical==physical ifindex 24; the NA learn
+        // resolves to ifindex 24 too. (The own-IP gate is global, so the
+        // exact learn ifindex is immaterial to the rejection.)
+        let meta = link_layer_meta(24, 0);
+
+        // 1) NA advertising the router's OWN IPv6 — must NOT learn.
+        let (frame, target_ip, _mac) = ndp_na_frame_with_target(own_v6_bytes);
+        assert_eq!(target_ip, own_v6, "frame target must be the own IPv6");
+        let outcome = stage_link_layer_classify(&frame, meta, ctx);
+        assert!(matches!(outcome, StageOutcome::Continue(())));
+        assert!(
+            neighbors.get(&(24, own_v6)).is_none(),
+            "an NDP NA advertising the router's OWN configured IPv6 must \
+             NOT be learned (#2851 anti-poisoning gate)"
+        );
+
+        // 2) A legitimate non-own NA still learns (own-IP gate must not
+        //    over-reject). The default `ndp_na_frame()` advertises
+        //    fe80::abcd:ef01:0:42 (non-own).
+        let (good_frame, good_target, good_mac) = ndp_na_frame();
+        assert!(
+            !forwarding.owns_configured_ip(good_target),
+            "the default NA target must be a non-own neighbor"
+        );
+        let _ = stage_link_layer_classify(&good_frame, meta, ctx);
+        assert_eq!(
+            neighbors.get(&(24, good_target)).map(|e| e.mac),
+            Some(good_mac),
+            "a legitimate non-own NDP NA neighbor must still be learned"
+        );
     }
 
     // ===================================================================
