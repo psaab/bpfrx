@@ -705,6 +705,24 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer stop()
 
+	// #2926: dedicated apply-abort context. A child of the signal context
+	// above, so a real daemon stop (SIGTERM, plus SIGINT in daemon mode)
+	// cancels an in-flight commit/remediation apply at its next coarse
+	// boundary (applyConfigLocked C1/C2/C3) instead of blocking termination
+	// behind netlink + an FRR reload + a Rust control-socket sync. It is kept
+	// SEPARATE from d.daemonCtx: d.daemonCtx stays the (production-uncancelled,
+	// context.Background) parent of the long-lived background goroutines —
+	// flow-export/IPFIX relays, RPM probe-pin retry, the policy scheduler,
+	// cluster comms, and the dp.Start dataplane runtime — which the shutdown
+	// sequence below tears down EXPLICITLY and which the orderly teardown
+	// (logFinalStats through dp.Telemetry, the HA rg_active clear through
+	// dp.HA()) still needs live. applyCancelCtx() returns this context; only
+	// the commit/sync/confirmed-commit applies route through it. The boot /
+	// DHCP / feed applies and executeConfirmedRollback still pass
+	// context.Background() unconditionally so they always run to completion.
+	d.applyCancelContext, d.applyCancel = context.WithCancel(ctx)
+	defer d.applyCancel()
+
 	// Create event buffer (shared between event reader and CLI)
 	eventBuf := logging.NewEventBuffer(1000)
 	d.eventBuf = eventBuf
@@ -1590,6 +1608,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Info("daemon mode (non-interactive), waiting for signals")
 		<-ctx.Done()
 		slog.Info("signal received, shutting down")
+	}
+
+	// #2926: explicitly abort any in-flight commit/remediation apply NOW, at the
+	// very start of the shutdown sequence and BEFORE the explicit subsystem
+	// teardown below (FRR Stop, HA rg_active clear, dp.Teardown). applyCancelCtx
+	// callers (commit/sync/confirmed-commit) then bail at their next coarse
+	// boundary instead of completing netlink + an FRR reload + a Rust sync while
+	// we tear down. applyCancelContext is a child of the signal context, so a
+	// signal-driven stop has already cancelled it; this call also covers the
+	// interactive CLI-exit path and is idempotent. The teardown itself performs
+	// no applyConfigLocked, so nothing legitimate is aborted here.
+	if d.applyCancel != nil {
+		d.applyCancel()
 	}
 
 	// Cancel context to stop background goroutines, then wait for them.

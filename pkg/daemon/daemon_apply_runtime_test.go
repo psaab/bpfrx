@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,7 +57,7 @@ func TestApplyConfigRuntimeResultDrivesDownstreamConsumers(t *testing.T) {
 		},
 	}
 
-	if err := d.applyConfigLocked(cfg); err != nil {
+	if err := d.applyConfigLocked(context.Background(), cfg); err != nil {
 		t.Fatalf("applyConfigLocked: %v", err)
 	}
 	if dp.applyCalls != 1 {

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -63,7 +64,7 @@ func TestApplyConfigLockedAbortsCommitOnPersistentSourceNATProtocolMismatch(t *t
 		opts:    Options{NoDataplane: true},
 	}
 
-	err := d.applyConfigLocked(persistentSourceNATConfig())
+	err := d.applyConfigLocked(context.Background(), persistentSourceNATConfig())
 	if !errors.Is(err, dpuserspace.ErrPersistentSourceNATProtocolIncompatible) {
 		t.Fatalf("applyConfigLocked error = %v, want ErrPersistentSourceNATProtocolIncompatible "+
 			"(commit must abort on a required protocol-gate mismatch)", err)
