@@ -5301,6 +5301,46 @@ func TestBuildScreenSnapshotsIncludesSynFragOnlyProfile(t *testing.T) {
 	}
 }
 
+// #3082: a zone that REFERENCES an undefined screen profile must be recorded
+// in the references-missing set so the dataplane can emit a runtime WARN
+// (instead of silently passing all screen checks). A zone with no screen
+// configured, and a zone whose reference resolves, must NOT be recorded.
+func TestBuildScreenMissingProfileRefs(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust":   {Name: "trust", ScreenProfile: "ghost"}, // references missing
+		"untrust": {Name: "untrust", ScreenProfile: "real"},
+		"dmz":     {Name: "dmz"}, // no screen configured
+	}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"real": {Name: "real", TCP: config.TCPScreen{Land: true}},
+	}
+	refs := buildScreenMissingProfileRefs(cfg)
+	if len(refs) != 1 {
+		t.Fatalf("len(refs) = %d, want 1 (only the dangling reference); refs=%+v", len(refs), refs)
+	}
+	if refs[0].Zone != "trust" || refs[0].Profile != "ghost" {
+		t.Fatalf("refs[0] = %+v, want {Zone:trust Profile:ghost}", refs[0])
+	}
+}
+
+// #3082: a zone with a valid screen reference and a zone with no screen at all
+// must produce NO missing-profile refs even when other zones reference missing
+// profiles is not the case here (pure-negative guard).
+func TestBuildScreenMissingProfileRefsNoneWhenResolved(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust", ScreenProfile: "real"},
+		"dmz":   {Name: "dmz"}, // no screen
+	}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"real": {Name: "real", TCP: config.TCPScreen{Land: true}},
+	}
+	if refs := buildScreenMissingProfileRefs(cfg); len(refs) != 0 {
+		t.Fatalf("len(refs) = %d, want 0; refs=%+v", len(refs), refs)
+	}
+}
+
 func TestBuildFlowExportSnapshot(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Services.FlowMonitoring = &config.FlowMonitoringConfig{

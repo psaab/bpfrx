@@ -13,7 +13,8 @@ use super::nat::{
 };
 use super::security::{
     AddressBookSnapshot, AppCatalogEntry, FirewallFilterSnapshot, FlowExportSnapshot,
-    PolicerSnapshot, PolicyRuleSnapshot, ScreenProfileSnapshot, ThreeColorPolicerSnapshot,
+    PolicerSnapshot, PolicyRuleSnapshot, ScreenMissingProfileRef, ScreenProfileSnapshot,
+    ThreeColorPolicerSnapshot,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -263,6 +264,13 @@ pub(crate) struct ConfigSnapshot {
     pub nptv6_rules: Vec<Nptv6RuleSnapshot>,
     #[serde(default)]
     pub screens: Vec<ScreenProfileSnapshot>,
+    /// #3082: zones referencing a screen profile that was undefined at
+    /// snapshot-build time. Additive + `#[serde(default)]` for skew tolerance
+    /// — an old Go binary that does not emit this leaves the set empty (no
+    /// warn, all-Pass). The dataplane emits a rate-limited runtime WARN for
+    /// these zones; the verdict still stays Pass.
+    #[serde(rename = "screen_missing_profile_zones", default)]
+    pub screen_missing_profile_zones: Vec<ScreenMissingProfileRef>,
     #[serde(rename = "syn_cookie_master_key", default)]
     pub syn_cookie_master_key: String,
     #[serde(default)]

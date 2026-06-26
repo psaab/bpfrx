@@ -263,6 +263,7 @@
     "policers": [],
     "policies": [],
     "routes": [],
+    "screen_missing_profile_zones": [],
     "screens": [],
     "source_nat_rules": [],
     "static_nat_rules": [],
@@ -891,6 +892,10 @@
     "next_table": "",
     "preference": 0,
     "table": ""
+  },
+  "screen_missing_profile_ref": {
+    "profile": "",
+    "zone": ""
   },
   "screen_profile_snapshot": {
     "fin_no_ack": false,

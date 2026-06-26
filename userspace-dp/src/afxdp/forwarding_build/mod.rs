@@ -113,6 +113,24 @@ pub(super) fn build_screen_profiles(snapshot: &ConfigSnapshot) -> FxHashMap<Stri
     profiles
 }
 
+/// #3082: build the zone → missing-screen-profile-name map from the snapshot's
+/// `screen_missing_profile_zones`. These are zones that REFERENCE a screen
+/// profile undefined at snapshot-build time (lenient/HA-sync path). The
+/// dataplane uses this to distinguish "no screen configured" (Pass) from
+/// "references a missing screen" (Pass + rate-limited runtime WARN).
+pub(super) fn build_screen_missing_profiles(
+    snapshot: &ConfigSnapshot,
+) -> FxHashMap<String, String> {
+    let mut out = FxHashMap::default();
+    for r in &snapshot.screen_missing_profile_zones {
+        if r.zone.is_empty() {
+            continue;
+        }
+        out.insert(r.zone.clone(), r.profile.clone());
+    }
+    out
+}
+
 fn parse_syn_cookie_master_key(key: &str) -> Option<[u8; 16]> {
     if key.len() != 32 {
         return None;
@@ -249,6 +267,7 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     // commit-time gate).
     state.nptv6 = Nptv6State::try_from_snapshots(&snapshot.nptv6_rules)?;
     state.screen_profiles = build_screen_profiles(snapshot);
+    state.screen_missing_profiles = build_screen_missing_profiles(snapshot);
     state.syn_cookie_master_key = parse_syn_cookie_master_key(&snapshot.syn_cookie_master_key);
     state.tcp_mss_all_tcp = snapshot.flow.tcp_mss_all_tcp;
     state.tcp_mss_ipsec_vpn = snapshot.flow.tcp_mss_ipsec_vpn;

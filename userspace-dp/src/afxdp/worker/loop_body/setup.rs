@@ -120,6 +120,9 @@ pub(super) fn worker_loop_setup(
     let mut sessions = SessionTable::new();
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
+    // #3082: thread the references-missing-profile set so the screen None
+    // branch can WARN (still Pass) for the lenient/HA-sync fail-open.
+    screen_state.update_missing_profiles(forwarding.screen_missing_profiles.clone());
     screen_state.update_syn_cookie_master_key(forwarding.syn_cookie_master_key);
     sessions.set_timeouts(forwarding.session_timeouts);
     // #2134: drive the per-IP session-limit OFF-gate from the applied

@@ -95,6 +95,13 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) nat64: Nat64State,
     pub(in crate::afxdp) nptv6: Nptv6State,
     pub(in crate::afxdp) screen_profiles: FastMap<String, ScreenProfile>,
+    /// #3082: zone → name of a screen profile the zone REFERENCES but that was
+    /// undefined when the snapshot was built. Distinct from `screen_profiles`
+    /// (which only holds resolved profiles): a zone present here but absent
+    /// from `screen_profiles` is a lenient-path fail-open — the dataplane
+    /// emits a rate-limited runtime WARN for it (verdict still Pass). A zone
+    /// in neither map simply has no screen configured (legit Pass).
+    pub(in crate::afxdp) screen_missing_profiles: FastMap<String, String>,
     pub(in crate::afxdp) syn_cookie_master_key: Option<[u8; 16]>,
     pub(in crate::afxdp) tunnel_interfaces: FastSet<i32>,
     pub(in crate::afxdp) filter_state: crate::filter::FilterState,

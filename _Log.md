@@ -1,3 +1,28 @@
+## 2026-06-26 — #3082 screen lenient-path missing-profile runtime WARN (signal only)
+
+- **Timestamp**: 2026-06-26
+- **Action**: thread a "references-missing screen profile" marker from the Go
+  control plane into the screen snapshot so the userspace dataplane can
+  distinguish "zone has no screen configured" (legit Pass) from "zone
+  references a MISSING screen" (lenient/HA-sync fail-open). The screen
+  `check_packet` None branch now emits a rate-limited runtime WARN (one per
+  zone per second) for the latter and STILL returns `ScreenVerdict::Pass`. The
+  runtime fail-CLOSED-vs-Pass posture is explicitly deferred (the /research
+  half of #3082, #1960 no-brick rationale). Additive/skew-tolerant wire field
+  `screen_missing_profile_zones` (Go `ScreenMissingProfileRef`, Rust
+  `#[serde(default)]`); `protocol_wire_v1.json` regenerated (additive only).
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/screens.go, pkg/dataplane/userspace/builder.go,
+  pkg/dataplane/userspace/manager_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/setup.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json
+
 ## 2026-06-26 — #2996 RA configured-link-local source picked from any unit (subinterface support)
 
 - **Timestamp**: 2026-06-26

@@ -387,6 +387,10 @@ pub(crate) fn worker_loop(
             // Use NEW values for dependent state updates (forwarding-site
             // ordering — old `forwarding` is stale once rotated).
             screen_state.update_profiles(new_forwarding.screen_profiles.clone());
+            // #3082: re-thread the references-missing-profile set on every
+            // runtime forwarding-snapshot rotation so a newly-introduced
+            // dangling screen reference starts WARNing (and a fixed one stops).
+            screen_state.update_missing_profiles(new_forwarding.screen_missing_profiles.clone());
             screen_state.update_syn_cookie_master_key(new_forwarding.syn_cookie_master_key);
             sessions.set_timeouts(new_forwarding.session_timeouts);
             // #2134: re-derive the per-IP session-limit OFF-gate on every
