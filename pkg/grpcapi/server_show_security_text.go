@@ -743,6 +743,12 @@ func (s *Server) showDynamicAddress(cfg *config.Config, buf *strings.Builder) {
 				} else {
 					fmt.Fprintf(buf, "  Last fetch: never\n")
 				}
+				if fi.Degraded {
+					fmt.Fprintf(buf, "  DEGRADED: %d invalid line(s) skipped (partial set installed)\n", fi.InvalidLines)
+					if len(fi.InvalidSample) > 0 {
+						fmt.Fprintf(buf, "    Sample: %s\n", strings.Join(fi.InvalidSample, ", "))
+					}
+				}
 			}
 			buf.WriteString("\n")
 		}
