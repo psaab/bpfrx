@@ -40,7 +40,7 @@ func TestHostInboundUnknownTokenFailsCommit(t *testing.T) {
 			wantSub: `protocols "ospff"`,
 		},
 		{
-			name: "wrong-case system-service (nft is case-sensitive)",
+			name: "wrong-case system-service (rejected at commit for typo-hygiene)",
 			cmds: []string{
 				"set security zones security-zone trust host-inbound-traffic system-services SSH",
 			},

@@ -3844,10 +3844,11 @@ func validateVRRPVirtualAddressSubnet(cfg *Config, lenient bool) ([]string, erro
 // The recognized token sets are the shared SSOT in host_inbound_tokens.go
 // (KnownHostInboundSystemServices / KnownHostInboundProtocols), the same sets
 // the nft builder + Rust classifier understand. Matching is case-sensitive
-// against the canonical lowercase spellings: the nft matcher switch is
-// case-sensitive, so accepting a wrong-case token here would itself reintroduce
-// a split-brain (Rust lowercases, nft does not). Zones are walked in sorted
-// order so the first-reported error is deterministic.
+// against the canonical lowercase spellings. Runtime normalizes case on both
+// layers (nft via lowerTokens, Rust via to_ascii_lowercase), so wrong-case is
+// not a runtime split-brain; we reject it at commit for Junos-parity/typo-
+// hygiene (host-inbound keywords are lowercase-canonical). Zones are walked in
+// sorted order so the first-reported error is deterministic.
 func validateHostInboundTokensStrict(cfg *Config) error {
 	names := make([]string, 0, len(cfg.Security.Zones))
 	for name := range cfg.Security.Zones {

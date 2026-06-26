@@ -27,10 +27,13 @@ package config
 // token, and both enforcement layers therefore agree. The pkg/daemon nft
 // matchers reference these sets for a parity test; the Rust classifier mirrors
 // them (kept in sync by comment + the Go-side parity test). Tokens are matched
-// case-sensitively against the canonical lowercase spellings: the nft matcher
-// switch is case-sensitive, so accepting `SSH` at commit would itself reintroduce
-// a split-brain (Rust lowercases, nft does not). Junos host-inbound keywords are
-// lowercase, so this rejects only genuine typos / wrong-case input.
+// case-sensitively against the canonical lowercase spellings. At runtime BOTH
+// layers normalize case (the nft path lowercases via lowerTokens before its
+// switch; the Rust classifier lowercases too), so a wrong-case token would in
+// fact enforce identically on both — there is no runtime split-brain. We still
+// reject wrong-case at commit for Junos-parity/typo-hygiene: Junos host-inbound
+// keywords are lowercase-canonical, so wrong-case input is a typo worth flagging
+// (lenient load only warns, so a persisted/sync'd config is never bricked).
 
 // KnownHostInboundSystemServices is the canonical set of recognized
 // host-inbound-traffic `system-services` tokens, including documented aliases
