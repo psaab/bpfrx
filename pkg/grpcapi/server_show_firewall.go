@@ -164,8 +164,8 @@ func (s *Server) showFirewall(cfg *config.Config, buf *strings.Builder) {
 func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
 	params := strings.TrimPrefix(req.Topic, "test-policy:")
 	var fromZone, toZone, srcIP, dstIP, proto string
-	var dstPort int
-	var portErr, protoErr error
+	var srcPort, dstPort int
+	var srcPortErr, portErr, protoErr error
 	for _, kv := range strings.Split(params, ",") {
 		parts := strings.SplitN(kv, "=", 2)
 		if len(parts) != 2 {
@@ -180,6 +180,14 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			srcIP = parts[1]
 		case "dst":
 			dstIP = parts[1]
+		case "srcport":
+			// #3107: a source-port constraint must thread into the shared
+			// matcher's Query.SrcPort term (previously inexpressible from the
+			// CLI `test policy` topic, overmatching source-port-constrained
+			// applications). Validate via the shared helper (#3116) so a
+			// malformed/out-of-range value reports an error instead of
+			// silently coercing to the 0 "any port" wildcard.
+			srcPort, srcPortErr = policymatch.ParsePort(parts[1])
 		case "port":
 			// #3116: a malformed/out-of-range port must NOT silently coerce to
 			// the 0 "any port" wildcard (the shared matcher gates the port term
@@ -203,6 +211,8 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 		buf.WriteString("No active configuration\n")
 	case fromZone == "" || toZone == "":
 		buf.WriteString("Missing from/to zone parameters\n")
+	case srcPortErr != nil:
+		fmt.Fprintf(buf, "invalid source-port: %v\n", srcPortErr)
 	case portErr != nil:
 		fmt.Fprintf(buf, "invalid port: %v\n", portErr)
 	case protoErr != nil:
@@ -236,6 +246,7 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			SrcIP:       net.ParseIP(srcIP),
 			DstIP:       net.ParseIP(dstIP),
 			Protocol:    proto,
+			SrcPort:     srcPort,
 			DstPort:     dstPort,
 			FeedOverlay: overlay,
 		})

@@ -1,3 +1,35 @@
+## 2026-06-25 — #3107: CLI `test policy` gains a source-port input
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added a `source-port` token to the CLI `test policy` command
+  (codex-review-065 finding 065-04). The shared matcher `policymatch.Match`
+  has supported a `SrcPort` term since #3042 (and REST/gRPC `MatchPolicies`
+  already accept `source_port`), but `test policy` only parsed a destination
+  port, so a source-port-constrained application was OVERMATCHED — the CLI
+  could report a PERMIT a real packet from another source port would never
+  receive. Wired source-port through every CLI-reachable surface: the local
+  CLI (`pkg/cli/cli_request.go` `testPolicy`), the remote cli→gRPC topic
+  (`cmd/cli/main.go` `testPolicy` emits a new `srcport=` key) and its backing
+  handler (`pkg/grpcapi/server_show_firewall.go` `showTestPolicy` parses
+  `srcport=`), plus the operational completion grammar
+  (`pkg/cmdtree/tree.go` `test policy`). Parsing goes through the shared
+  `policymatch.ParsePort` so the source port inherits the #3116 validation
+  (empty = unspecified / match any; malformed/out-of-range → error instead
+  of a silent 0 wildcard) and the parsed value threads into
+  `policymatch.Query.SrcPort`. Destination-port behavior unchanged.
+- **File(s)**: pkg/cli/cli_request.go, pkg/cli/testpolicy_srcport_test.go,
+  cmd/cli/main.go, cmd/cli/testpolicy_srcport_test.go,
+  pkg/grpcapi/server_show_firewall.go, pkg/grpcapi/server_show.go,
+  pkg/grpcapi/server_show_testpolicy_srcport_test.go, pkg/cmdtree/tree.go,
+  pkg/grpcapi/README.md, _Log.md
+- **Validation**: `go build ./...`, `go vet` (no new issues — the 2 vet
+  notes pre-exist in untouched files), `go test ./pkg/cli/... ./pkg/grpcapi/...
+  ./pkg/policymatch/... ./cmd/cli/... ./pkg/cmdtree/...` 419 passed, `gofmt -l`
+  clean on all touched files. Fail-on-revert: forcing the source-port wiring
+  off (token ignored / `SrcPort` stays 0) flips the wrong-src-port case from
+  Default deny to a false Policy match and drops the invalid-port diagnostics
+  → 11 RED; restoring → all GREEN.
+
 ## 2026-06-25 — #3108: policy simulators reject invalid protocol tokens
 
 - **Timestamp**: 2026-06-25
