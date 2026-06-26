@@ -53,6 +53,20 @@ pub(crate) struct ScreenPacketInfo {
     /// L4/data bytes this fragment contributes to the reassembled
     /// datagram. 0 when there is no fragment header.
     pub frag_data_off: u16,
+    /// #2973: an actual IPv4 source-route option (LSRR=131 or SSRR=137)
+    /// was found in the IPv4 options region. The `source-route` screen
+    /// drops ONLY when this is set, not on every IHL>5 packet — benign
+    /// options (router-alert, record-route, timestamp, security) no
+    /// longer trigger a false `ip-source-route` drop.
+    pub saw_ipv4_source_route: bool,
+    /// #2973: an IPv6 Routing Header (next-header 43) carrying a
+    /// source-route routing type was found in the extension-header
+    /// chain. The `source-route` screen drops on this for IPv6 parity
+    /// with the IPv4 LSRR/SSRR detection. Type-0 (RH0, the deprecated
+    /// source-route routing type) and the legacy/experimental type-1
+    /// are treated as source routing; type-2 (Mobile IPv6) and other
+    /// non-source-route types do not set this.
+    pub saw_ipv6_routing_header: bool,
 }
 
 /// Screen profile configuration for a zone. Mirrors the BPF `screen_config`.

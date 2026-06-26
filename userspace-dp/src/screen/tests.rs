@@ -52,6 +52,8 @@ fn tcp_pkt(src: IpAddr, dst: IpAddr, src_port: u16, dst_port: u16, flags: u8) ->
         ip_total_len: 60,
         ip_payload_len: 0,
         frag_data_off: 0,
+        saw_ipv4_source_route: false,
+        saw_ipv6_routing_header: false,
     }
 }
 
@@ -82,6 +84,8 @@ fn icmp_pkt(src: IpAddr, dst: IpAddr, pkt_len: u16) -> ScreenPacketInfo {
         ip_total_len: pkt_len,
         ip_payload_len: 0,
         frag_data_off: 0,
+        saw_ipv4_source_route: false,
+        saw_ipv6_routing_header: false,
     }
 }
 
@@ -108,6 +112,8 @@ fn udp_pkt(src: IpAddr, dst: IpAddr) -> ScreenPacketInfo {
         ip_total_len: 100,
         ip_payload_len: 0,
         frag_data_off: 0,
+        saw_ipv4_source_route: false,
+        saw_ipv6_routing_header: false,
     }
 }
 
@@ -407,6 +413,8 @@ fn ipv4_fragment(
         ip_total_len,
         ip_payload_len: 0,
         frag_data_off: 0,
+        saw_ipv4_source_route: false,
+        saw_ipv6_routing_header: false,
     }
 }
 
@@ -546,6 +554,8 @@ fn ipv6_fragment(
         ip_total_len: 0,
         ip_payload_len: payload_len,
         frag_data_off,
+        saw_ipv4_source_route: false,
+        saw_ipv6_routing_header: false,
     }
 }
 
@@ -679,6 +689,8 @@ fn teardrop_drops() {
         ip_total_len: 24,             // 20 byte header + 4 byte payload (< 8)
         ip_payload_len: 0,
         frag_data_off: 0,
+        saw_ipv4_source_route: false,
+        saw_ipv6_routing_header: false,
     };
     assert_eq!(
         state.check_packet("trust", &pkt, 1),
@@ -712,6 +724,8 @@ fn teardrop_first_fragment_passes() {
         ip_total_len: 24,
         ip_payload_len: 0,
         frag_data_off: 0,
+        saw_ipv4_source_route: false,
+        saw_ipv6_routing_header: false,
     };
     // First fragment (offset=0) — teardrop only triggers on non-first
     // However no_flag check will trigger first since tcp_flags=0
@@ -720,6 +734,58 @@ fn teardrop_first_fragment_passes() {
     profile.teardrop = true;
     let mut st = make_state("trust", profile);
     assert_eq!(st.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn teardrop_zero_payload_non_first_fragment_drops() {
+    // #3027 fail-on-revert: a non-first fragment whose ip_total_len is
+    // EQUAL to the header length (zero payload) is malformed and must
+    // DROP as teardrop. ip_ihl=5 → hdr_len=20, ip_total_len=20.
+    //
+    // The pre-#3027 code only entered the payload-size branch when
+    // ip_total_len > hdr_len, so 20 > 20 is false and this packet
+    // slipped through as a PASS. Reverting the fix makes this assert
+    // fail (Pass instead of Drop). A teardrop-only profile isolates the
+    // check from the no-flag / other screens.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv4_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_TCP,
+        2,     // frag offset = 2 (non-first fragment)
+        false, // no MORE_FRAGMENTS — a trailing fragment
+        20,    // ip_total_len == hdr_len (ihl=5*4) → zero payload
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("teardrop")
+    );
+}
+
+#[test]
+fn teardrop_under_length_non_first_fragment_drops() {
+    // #3027 fail-on-revert: a non-first fragment whose claimed
+    // ip_total_len is LESS than the header length ("negative" payload)
+    // is malformed and must DROP. ip_ihl=5 → hdr_len=20,
+    // ip_total_len=18. Pre-#3027 (ip_total_len > hdr_len gate) PASSed
+    // this; the subtraction would also have underflowed.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv4_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_TCP,
+        2,     // non-first fragment
+        false,
+        18, // ip_total_len < hdr_len (20) → under-length / "negative"
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("teardrop")
+    );
 }
 
 // ================================================================
@@ -1246,7 +1312,8 @@ fn tcp_syn_fin_passes_on_subsequent_fragment_with_syn_fin_bytes() {
 // ================================================================
 
 #[test]
-fn source_route_drops() {
+fn source_route_actual_lsrr_drops() {
+    // #2973: an actual LSRR (option 131) source-route packet must DROP.
     let mut state = make_state("trust", default_profile());
     let mut pkt = tcp_pkt(
         IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
@@ -1255,7 +1322,8 @@ fn source_route_drops() {
         80,
         TCP_SYN,
     );
-    pkt.ip_ihl = 6; // Options present (IHL > 5)
+    pkt.ip_ihl = 6;
+    pkt.saw_ipv4_source_route = true; // extractor decoded LSRR/SSRR
     assert_eq!(
         state.check_packet("trust", &pkt, 1),
         ScreenVerdict::Drop("ip-source-route")
@@ -1263,7 +1331,29 @@ fn source_route_drops() {
 }
 
 #[test]
-fn source_route_ipv6_ignored() {
+fn source_route_benign_options_pass() {
+    // #2973 fail-on-revert: a packet with IPv4 options present (IHL>5)
+    // but NO source-route option (e.g. router-alert/record-route/
+    // timestamp) must PASS. The pre-#2973 check dropped on ANY IHL>5;
+    // reverting to that makes this assertion fail.
+    let mut state = make_state("trust", default_profile());
+    let mut pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        1234,
+        80,
+        TCP_SYN,
+    );
+    pkt.ip_ihl = 6; // options present, but not source route
+    pkt.saw_ipv4_source_route = false;
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn source_route_ipv6_routing_header_drops() {
+    // #2973 fail-on-revert: an IPv6 Routing Header (source-route routing
+    // type) must DROP for vSRX parity. The pre-#2973 check ignored IPv6
+    // entirely; reverting makes this PASS instead of DROP.
     let mut state = make_state("trust", default_profile());
     let mut pkt = tcp_pkt(
         IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
@@ -1272,8 +1362,149 @@ fn source_route_ipv6_ignored() {
         80,
         TCP_SYN,
     );
-    pkt.ip_ihl = 6; // IPv6 doesn't use IHL, should be ignored
-    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+    pkt.saw_ipv6_routing_header = true; // extractor saw RH0/type-1
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("ip-source-route")
+    );
+}
+
+#[test]
+fn extract_screen_info_ipv4_lsrr_detected() {
+    // #2973: an IPv4 header carrying an LSRR (131) option sets
+    // saw_ipv4_source_route. Header: version=4, ihl=7 (28 bytes = 20
+    // base + 8 options), LSRR option {131, len=7, ptr=4, addr...} then
+    // padding/EOOL.
+    let ihl_words = 7u8;
+    let hdr_len = (ihl_words as usize) * 4; // 28
+    let mut frame = vec![0u8; 14 + hdr_len + 20];
+    let ip = 14;
+    frame[ip] = 0x40 | ihl_words; // version=4, ihl=7
+    frame[ip + 2..ip + 4].copy_from_slice(&((hdr_len + 20) as u16).to_be_bytes());
+    frame[ip + 9] = 6; // TCP
+    // options begin at ip+20
+    let opt = ip + 20;
+    frame[opt] = 131; // LSRR
+    frame[opt + 1] = 7; // option length
+    frame[opt + 2] = 4; // pointer
+    // bytes opt+3.. : route data (zeroed), then opt+7 = EOOL(0)
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET as u8,
+        6,
+        0x02,
+        (hdr_len + 20) as u16,
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+        12345,
+        80,
+        14,
+    )
+    .expect("valid IPv4 LSRR packet parses");
+    assert!(
+        info.saw_ipv4_source_route,
+        "LSRR (option 131) must set saw_ipv4_source_route"
+    );
+}
+
+#[test]
+fn extract_screen_info_ipv4_router_alert_not_source_route() {
+    // #2973 fail-on-revert: an IPv4 header with a benign router-alert
+    // option (148, length 4) must NOT set saw_ipv4_source_route.
+    let ihl_words = 6u8;
+    let hdr_len = (ihl_words as usize) * 4; // 24
+    let mut frame = vec![0u8; 14 + hdr_len + 20];
+    let ip = 14;
+    frame[ip] = 0x40 | ihl_words;
+    frame[ip + 2..ip + 4].copy_from_slice(&((hdr_len + 20) as u16).to_be_bytes());
+    frame[ip + 9] = 6;
+    let opt = ip + 20;
+    frame[opt] = 148; // router alert
+    frame[opt + 1] = 4; // length
+    // opt+2,opt+3 = value (0); fills the 4-byte option exactly.
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET as u8,
+        6,
+        0x02,
+        (hdr_len + 20) as u16,
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+        12345,
+        80,
+        14,
+    )
+    .expect("valid IPv4 router-alert packet parses");
+    assert!(
+        !info.saw_ipv4_source_route,
+        "router-alert (option 148) must NOT set saw_ipv4_source_route"
+    );
+}
+
+#[test]
+fn extract_screen_info_ipv6_routing_header_detected() {
+    // #2973: an IPv6 Routing Header (NextHdr=43) with routing type 0
+    // (RH0, the deprecated source-route type) sets
+    // saw_ipv6_routing_header. Routing ext header is 8 bytes:
+    // {nexthdr, hdr_ext_len=0, routing_type=0, segs_left, ...}.
+    let mut frame = vec![0u8; 14 + 40 + 8 + 20];
+    frame[14] = 0x60; // version=6
+    frame[14 + 6] = 43; // NextHdr = ROUTING
+    let rh = 14 + 40;
+    frame[rh] = 6; // inner nexthdr = TCP
+    frame[rh + 1] = 0; // hdr_ext_len = 0 → 8 bytes
+    frame[rh + 2] = 0; // routing type 0 = RH0 (source route)
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET6 as u8,
+        6,
+        0x02,
+        28,
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        12345,
+        80,
+        14,
+    )
+    .expect("valid IPv6 routing-header packet parses");
+    assert!(
+        info.saw_ipv6_routing_header,
+        "IPv6 RH0 (routing type 0) must set saw_ipv6_routing_header"
+    );
+}
+
+#[test]
+fn extract_screen_info_ipv6_routing_type2_not_source_route() {
+    // #2973: routing type 2 is Mobile IPv6, NOT source routing — it must
+    // NOT set saw_ipv6_routing_header.
+    let mut frame = vec![0u8; 14 + 40 + 8 + 20];
+    frame[14] = 0x60;
+    frame[14 + 6] = 43;
+    let rh = 14 + 40;
+    frame[rh] = 6;
+    frame[rh + 1] = 0;
+    frame[rh + 2] = 2; // routing type 2 = Mobile IPv6 (not source route)
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET6 as u8,
+        6,
+        0x02,
+        28,
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        12345,
+        80,
+        14,
+    )
+    .expect("valid IPv6 type-2 routing-header packet parses");
+    assert!(
+        !info.saw_ipv6_routing_header,
+        "IPv6 routing type 2 (Mobile IPv6) must NOT set saw_ipv6_routing_header"
+    );
 }
 
 // ================================================================

@@ -611,6 +611,21 @@ type compileOpts struct {
 	// zero-target group and never reads an unknown key — so a leniently-loaded
 	// bad group is harmless. Same doctrine as lenientRouterID.
 	lenientSNMPTrapGroup bool
+	// lenientPolicyTerminalAction (#3043) downgrades the security-policy
+	// terminal-action gate (validatePolicyTerminalActionStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects a policy that does not name EXACTLY one
+	// terminal action: a log-only / count-only or typo'd policy compiled with
+	// Action == PolicyPermit (the zero value) and silently PERMITTED all
+	// matching traffic — a fail-OPEN security hole — while a policy naming
+	// more than one terminal action resolved last-wins by parse order. The
+	// tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config that an older binary accepted
+	// still BOOTS (#1960 no-brick); the runtime is independently safe because
+	// compilePolicy defaults an actionless policy's Action to PolicyDeny (NOT
+	// permit), so a leniently-loaded actionless policy DENIES rather than
+	// fails open. Same doctrine as lenientPolicyZoneRefs / lenientPolicyMatchAddress.
+	lenientPolicyTerminalAction bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -669,6 +684,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientBGPNeighborPeerAS:           true,
 		lenientRouterID:                    true,
 		lenientSNMPTrapGroup:               true,
+		lenientPolicyTerminalAction:        true,
 	})
 }
 
@@ -778,6 +794,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientBGPNeighborPeerAS:           true,
 		lenientRouterID:                    true,
 		lenientSNMPTrapGroup:               true,
+		lenientPolicyTerminalAction:        true,
 	})
 }
 
@@ -1143,6 +1160,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientPolicyZoneRefs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("policy zone reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3043 security-policy terminal-action fail-open gate. Strict on commit /
+	// commit-check (hard-reject a policy that does not name exactly one of
+	// permit/deny/reject — a log-only/count-only or typo'd policy compiled to
+	// the PolicyPermit zero value and silently PERMITTED all matching traffic,
+	// and multiple terminal actions resolved last-wins by parse order);
+	// lenient on load / peer-sync (warn so an already-persisted or peer-synced
+	// config still boots — #1960 no-brick; compilePolicy defaults an actionless
+	// policy to DENY, so a leniently-loaded bad config fails closed rather than
+	// open). Runs AFTER the policy zone-reference gate so a structural error, a
+	// bad match-address, and a bad zone reference still win the first-error slot.
+	if err := validatePolicyTerminalActionStrict(cfg); err != nil {
+		if opts.lenientPolicyTerminalAction {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("policy terminal action (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

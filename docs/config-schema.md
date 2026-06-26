@@ -1077,6 +1077,57 @@ reserved for whole-dataplane selection where a rewrite shim
   `reservations` render, **dotted/uppercase MAC canonicalization**,
   no-binding omits the key).
 
+### #3043 — Security-policy missing/conflicting terminal action (commit fail-closed)
+
+`PolicyAction`'s zero value is `PolicyPermit` (`types_security.go`:
+`PolicyPermit PolicyAction = iota`). `compilePolicy` builds the typed
+`Policy` and only mutates `Action` when it sees `then permit` / `then deny`
+/ `then reject`; `then log` / `then count` set modifiers only. So a policy
+whose `then` stanza carried ONLY modifiers (an audit/drop placeholder such
+as `then log session-init`) — or whose terminal action was dropped or
+typo'd — compiled with `Action == PolicyPermit` and silently **PERMITTED**
+every packet matching its match conditions: a zone-pair-wide silent
+fail-OPEN. Symmetrically, a policy that named MORE than one terminal action
+(e.g. a group-merged `then permit` + `then deny`) resolved last-wins by
+child visitation order rather than failing the commit, so the enforced
+action depended on parse order. Junos requires every policy term to specify
+exactly one terminal action.
+
+**`validatePolicyTerminalActionStrict`** (`compiler_validate_strict.go`)
+restores that fail-CLOSED parity. `compilePolicy` records the terminal
+action tokens it sees in the unexported `Policy.terminalActions` slice (the
+typed `Config` is never serialized, so the field carries no persistence /
+back-compat obligation); the validator requires exactly one such token per
+per-zone-pair policy AND per global policy, rejecting zero (no terminal
+action) and more than one (conflicting actions). It iterates
+`cfg.Security.Policies` then `cfg.Security.GlobalPolicies` in deterministic
+order, so the first-reported error is stable.
+
+**Runtime fail-closed default:** `compilePolicy` now defaults an actionless
+policy's `Action` to **`PolicyDeny`** (not the `PolicyPermit` zero value).
+This makes the tolerant load / HA-sync path safe: a leniently-loaded
+actionless policy DENIES rather than fails open. The `PolicyAction` enum
+zero value is left unchanged (changing it is invasive and unnecessary once
+the actionless policy is explicitly set to deny at compile).
+
+**Strict/lenient split (flag `lenientPolicyTerminalAction`):** strict on the
+commit / commit-check path (`CompileConfig` — hard-reject), downgraded to a
+`cfg.Warnings` entry on the tolerant load / peer-sync paths
+(`CompileConfigLenient` / `CompileConfigForNodeLenient`) so an
+already-persisted or peer-synced config that an older binary accepted still
+BOOTS (#1960 fail-closed-on-load doctrine) — the runtime default-to-deny
+keeps a leniently-loaded actionless policy fail-closed. The gate runs AFTER
+`validatePolicyZoneReferencesStrict`, mirroring the sibling fail-open
+validators, so a structural error, a bad match-address, and a bad zone
+reference still win the first-error slot.
+Regression coverage: `pkg/config/policy_terminal_action_3043_test.go`
+(`TestPolicyNoTerminalActionFailsCommit` and
+`TestGlobalPolicyNoTerminalActionFailsCommit` — fail-on-revert reject
+guards, `TestPolicyConflictingTerminalActionsFailsCommit` — last-wins
+conflict guard, `TestPolicyNoTerminalActionLenientDefaultsDeny` — lenient
+warn + default-to-deny, `TestPolicyExactlyOneTerminalActionCommits` —
+positive control).
+
 ### #2401 — Security-policy undefined-zone references (commit fail-closed)
 
 A `set security policies from-zone <a> to-zone <b> { policy ... }` stanza

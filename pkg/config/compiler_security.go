@@ -334,10 +334,13 @@ func compilePolicy(polInst struct {
 			switch t.Name() {
 			case "permit":
 				pol.Action = PolicyPermit
+				pol.terminalActions = append(pol.terminalActions, PolicyPermit)
 			case "deny":
 				pol.Action = PolicyDeny
+				pol.terminalActions = append(pol.terminalActions, PolicyDeny)
 			case "reject":
 				pol.Action = PolicyReject
+				pol.terminalActions = append(pol.terminalActions, PolicyReject)
 			case "log":
 				pol.Log = &PolicyLog{}
 				for _, logOpt := range t.Children {
@@ -352,6 +355,20 @@ func compilePolicy(polInst struct {
 				pol.Count = true
 			}
 		}
+	}
+
+	// #3043 fail-closed default: a policy with NO explicit terminal action
+	// (a log-only / count-only stanza, or a typo'd `then`) must NOT inherit
+	// PolicyPermit (the PolicyAction zero value) — that was a silent
+	// fail-OPEN. Default the runtime action to DENY so the tolerant
+	// load / HA-sync path (which only WARNS, see
+	// validatePolicyTerminalActionStrict + lenientPolicyTerminalAction)
+	// fails closed; the strict commit path rejects the actionless policy
+	// outright (terminalActions is empty). Conflicting actions keep the
+	// pre-existing last-wins runtime value so a leniently-loaded config
+	// still boots; the strict gate rejects the conflict at commit.
+	if len(pol.terminalActions) == 0 {
+		pol.Action = PolicyDeny
 	}
 
 	if descNode := polInst.node.FindChild("description"); descNode != nil {

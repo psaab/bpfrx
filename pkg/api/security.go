@@ -121,6 +121,58 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 		result = append(result, pi)
 		policySetID++
 	}
+
+	// Global policies (#3045): the CLI, gRPC GetPolicies, and the
+	// Prometheus collector all expose globals; the REST inventory
+	// endpoint must too, otherwise automation/dashboards cannot audit
+	// rules the dataplane actively enforces. Emit a single global row
+	// with from_zone="*"/to_zone="*" (matching gRPC) after the zone-pair
+	// rows, preserving the policy-counter ID ordering: global counter IDs
+	// start after the zone-pair policy-set count (policySetID continues
+	// from the loop above).
+	if len(cfg.Security.GlobalPolicies) > 0 {
+		pi := PolicyInfo{
+			FromZone: "*",
+			ToZone:   "*",
+		}
+		for i, rule := range cfg.Security.GlobalPolicies {
+			if rule == nil {
+				continue
+			}
+			pr := PolicyRule{
+				Name:         rule.Name,
+				Action:       policyActionStr(rule.Action),
+				SrcAddresses: rule.Match.SourceAddresses,
+				DstAddresses: rule.Match.DestinationAddresses,
+				Applications: rule.Match.Applications,
+				Log:          rule.Log != nil,
+				Count:        rule.Count,
+			}
+			if pr.SrcAddresses == nil {
+				pr.SrcAddresses = []string{}
+			}
+			if pr.DstAddresses == nil {
+				pr.DstAddresses = []string{}
+			}
+			if pr.Applications == nil {
+				pr.Applications = []string{}
+			}
+
+			if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
+				policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
+					pr.HitPackets = ctrs.Packets
+					pr.HitBytes = ctrs.Bytes
+				}
+			}
+			pi.Rules = append(pi.Rules, pr)
+		}
+		if pi.Rules == nil {
+			pi.Rules = []PolicyRule{}
+		}
+		result = append(result, pi)
+	}
+
 	writeOK(w, result)
 }
 
