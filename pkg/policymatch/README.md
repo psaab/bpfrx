@@ -52,6 +52,45 @@ explicitly-invalid port newly errors. Coverage: `port_test.go` (helpers),
 (`MatchPolicies` + `ShowText` `test-policy:`), `pkg/cli/policymatch_port_test.go`,
 and `cmd/cli/testpolicy_port_test.go`.
 
+## Protocol input validation (#3108)
+
+`matchApp` short-circuits to "match any application" before the query protocol
+is resolved (`len(apps)==0` or an empty `proto`, and a policy term of
+`application any` returns true immediately). That makes an unvalidated protocol
+token DANGEROUS at the adapter boundary in exactly the way an unvalidated port
+is: a non-empty but unresolvable protocol (an operator typo like `tcpp`, an
+unknown name, or an out-of-range number like `999`) is never rejected by the
+matcher — it simply fails to constrain anything and the simulator returns a
+permit/deny verdict, masking the typo. One shared validator closes this:
+
+- `ValidateProtocol(string) error` — an empty/whitespace token is "unspecified"
+  (no protocol constraint — the wildcard, unchanged); a non-empty token must
+  resolve via `appid.ProtocolNumber` (a known name/alias `tcp`/`udp`/`icmp`/
+  `ospf`/... or a numeric `0..255`); an unknown name or out-of-range/non-numeric
+  value is rejected. There is no `any` protocol keyword — omit the token for the
+  wildcard (the runtime constrains the protocol dimension only when a resolvable
+  protocol is supplied). A single string validator suffices for every surface,
+  since each accepts the protocol as a string `matchApp` resolves identically by
+  name or number (unlike ports, which arrive both as a numeric gRPC field and as
+  operator strings).
+
+This is applied at ALL FOUR simulator surfaces (mirroring the #3116 port wiring):
+
+- REST `matchPoliciesHandler` — `ValidateProtocol(protocol)` → HTTP 400;
+- gRPC `MatchPolicies` — `ValidateProtocol(req.Protocol)` → `InvalidArgument`;
+- gRPC `ShowText` `test-policy:` (`showTestPolicy`) — `ValidateProtocol` on the
+  `proto=` token → an "invalid protocol" diagnostic in the handler output (the
+  same way a bad port/src/dst is reported);
+- CLI `test policy` + `show security match-policies` (local `pkg/cli`) AND the
+  remote `cli` client (`cmd/cli`) — `ValidateProtocol` → a command error.
+
+A VALID protocol (name or `0..255`) and an ABSENT protocol behave exactly as
+before; only an explicitly-invalid protocol newly errors. Coverage:
+`protocol_test.go` (helper), `pkg/api/rest_filter_failclosed_test.go`,
+`pkg/grpcapi/server_proto_validation_test.go` (`MatchPolicies` + `ShowText`
+`test-policy:`), `pkg/cli/policymatch_protocol_test.go`, and
+`cmd/cli/testpolicy_protocol_test.go`.
+
 ## The surface #3042 missed (#3103)
 
 The original #3042 consolidation routed the REST/gRPC `MatchPolicies` and CLI

@@ -1,3 +1,25 @@
+## 2026-06-25 — #3108: policy simulators reject invalid protocol tokens
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added shared `policymatch.ValidateProtocol` and wired it across
+  all four simulator surfaces (codex-review-065 finding 065-05). Mirrors the
+  #3116 port-validation pattern. `matchApp` short-circuits to match-any before
+  the protocol is resolved, so a bogus protocol (unknown name / out-of-range
+  number) silently produced a permit/deny verdict instead of an error. Empty
+  protocol = unspecified (match any, unchanged); a non-empty token must resolve
+  via `appid.ProtocolNumber`. REST `matchPoliciesHandler` → 400, gRPC
+  `MatchPolicies` → InvalidArgument, gRPC `showTestPolicy` → "invalid protocol"
+  diagnostic, local CLI `showMatchPolicies`/`testPolicy` + remote `cli`
+  `testPolicy` → command error. Fail-on-revert verified (stub `return nil`
+  flips every want-error case red across 6 surfaces + the unit test).
+- **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/protocol_test.go,
+  pkg/policymatch/README.md, pkg/api/security.go,
+  pkg/api/rest_filter_failclosed_test.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_show_firewall.go,
+  pkg/grpcapi/server_proto_validation_test.go, pkg/cli/cli_show_security.go,
+  pkg/cli/cli_request.go, pkg/cli/policymatch_protocol_test.go,
+  cmd/cli/main.go, cmd/cli/testpolicy_protocol_test.go
+
 - **2026-06-25**: #3115 (codex-review-066 finding 066-03) — reject unsupported security-policy `then reject` children at commit (sibling of #3114). Added `validatePolicyThenRejectStrict` (AST pre-walk in `compileExpanded`) hard-rejecting a policy whose `then reject` arm carries a child the compiler does not enforce — a reject `profile <name>` (custom reject response) or a packet-type reject like `tcp-reset`. The `reject` arm in `compilePolicy`'s `then` switch set `pol.Action = PolicyReject` and never inspected `t.Children`, so the modifier was SILENTLY DROPPED — the configured custom reject response is inert (a wire-contract / operator-observability divergence, not a fail-open: reject still rejects). Checks both AST shapes (flat-set collapses modifier onto `reject` `Keys[1]`; hierarchical nests it as a child). Allowlist `supportedPolicyThenRejectChildren` is EMPTY (compiler enforces no reject child today). A bare `then reject` (no child) still commits. Strict on `CompileConfig`; lenient-warn on both lenient constructors via new `lenientPolicyThenReject` flag (#1960). Covers zone-pair AND global policies. Fail-on-revert verified RED->GREEN. Files: pkg/config/compiler_policy_then.go, pkg/config/compiler_policy_then_3115_test.go (new), pkg/config/compiler.go, pkg/config/README.md
 ## 2026-06-25 — #2971: Surface A DDNS corrupt ownership state fail-closed
 

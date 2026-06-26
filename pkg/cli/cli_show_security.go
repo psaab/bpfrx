@@ -305,6 +305,15 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 		return fmt.Errorf("invalid destination-ip %q", dstIP)
 	}
 
+	// #3108: a non-empty but unknown/out-of-range protocol token ("tcpp",
+	// "999") must not silently become "any protocol" — matchApp short-circuits
+	// to match-any for an unresolvable protocol, yielding a misleading verdict
+	// for a policy using `application any`. An empty value still means
+	// "unspecified" (match any protocol).
+	if err := policymatch.ValidateProtocol(proto); err != nil {
+		return err
+	}
+
 	parsedSrc := net.ParseIP(srcIP)
 	parsedDst := net.ParseIP(dstIP)
 
