@@ -248,6 +248,23 @@ best-effort).
   MAC degrades to a soft-logged warning (the caller only `slog.Warn`s the
   error); the explicit `source-link-local` config and the `listen()` retry
   loop (now in the owner goroutine, see below) are the recovery path.
+- **Configured source link-local is picked from ANY unit (#2996).** The
+  daemon's `buildRAConfigs` (`pkg/daemon/daemon_ra.go`) seeds each RA's
+  `SourceLinkLocal` from an operator-configured `fe80::/10` address on the RA
+  interface, so the sender binds to that address instead of an auto-selected
+  transient EUI-64. `protocols router-advertisement interface <name>` may name
+  a bare interface (`reth1`, `ge-0/0/2`) or a VLAN subinterface
+  (`ge-0/0/2.50`, `reth0.50`); `cfg.Interfaces.Interfaces` is keyed by the
+  BASE name with logical units under `ifc.Units`, so `resolveRASourceLinkLocal`
+  splits the unit off the RA name before the lookup. Selection rule
+  (deterministic across reconciles): a **unit-qualified** RA name uses the
+  link-local configured on THAT unit; a **bare** name scans units lowest-first
+  and uses the lowest-numbered unit that carries a configured link-local
+  (byte-identical to the historical unit-0-only lookup when unit 0 holds it).
+  When no unit carries a configured link-local, a RETH interface still falls
+  back to `cluster.StableRethLinkLocal`. Before #2996 the lookup only ever read
+  `Units[0]`, so an RA on a subinterface (link-local under a non-zero unit)
+  silently ignored the configured source.
 - **Bind retry runs UNLOCKED, in the owner goroutine (#2453).** `start()` no
   longer opens the NDP conn synchronously. It just launches `run()` and returns,
   so `Manager.startLocked` holds `m.mu` only for the cheap `InterfaceByName`

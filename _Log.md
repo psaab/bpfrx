@@ -1,3 +1,19 @@
+## 2026-06-26 — #2996 RA configured-link-local source picked from any unit (subinterface support)
+
+- **Timestamp**: 2026-06-26
+- **Action**: fixed `buildRAConfigs` so the operator-configured IPv6 link-local
+  source is detected on ANY logical unit, not just `Units[0]`. RA on a
+  subinterface (VLAN unit with its own `fe80::/64`) previously fell back to an
+  auto EUI-64 link-local because the lookup only read unit 0. Also handle a
+  unit-qualified RA interface name (`ge-0/0/2.50`, `reth0.50`): the interfaces
+  map is keyed by base name, so the new `resolveRASourceLinkLocal` splits the
+  unit off before the lookup and prefers the bound unit's link-local;
+  unqualified names scan units lowest-first (byte-identical to the old unit-0
+  path when unit 0 holds the link-local). RETH stable-link-local fallback
+  preserved.
+- **File(s)**: pkg/daemon/daemon_ra.go, pkg/daemon/ra_source_test.go,
+  pkg/ra/README.md, _Log.md
+
 ## 2026-06-26 — #2926 fold: make the apply-cancel signal actually fire on daemon stop (was inert)
 
 - **Timestamp**: 2026-06-26
