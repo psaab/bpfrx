@@ -2967,3 +2967,159 @@ fn icmp_skew_old_snapshot_without_type_matches_all() {
     assert_eq!(eval_icmp(&state, PROTO_ICMP, 8, 0), PolicyAction::Permit);
     assert_eq!(eval_icmp(&state, PROTO_ICMP, 3, 0), PolicyAction::Permit);
 }
+
+// ---------------------------------------------------------------------------
+// #3019: `to-zone junos-host` / `from-zone junos-host` self-traffic policy.
+// ---------------------------------------------------------------------------
+
+fn junos_host_deny_snapshot(action: &str) -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        name: "host-ssh".to_string(),
+        from_zone: "trust".to_string(),
+        to_zone: JUNOS_HOST_ZONE_NAME.to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: action.to_string(),
+        ..Default::default()
+    }
+}
+
+/// #3019: a `to-zone junos-host` rule is INDEXED under the reserved synthetic
+/// zone id (mirroring a normal zone-pair) and arms `has_junos_host_rules`.
+/// Pre-fix the rule was kept-but-not-indexed (like the wildcard-`any` case),
+/// so the LocalDelivery gate could never reach it.
+#[test]
+fn junos_host_rule_is_indexed_under_reserved_zone_id() {
+    let state = parse_policy_state("permit", &[junos_host_deny_snapshot("deny")], &test_zone_name_to_id());
+    assert!(state.has_junos_host_rules, "junos-host rule must arm the gate");
+    let key = zone_pair_key(TEST_TRUST_ZONE_ID, JUNOS_HOST_ZONE_ID);
+    assert!(
+        state.zone_pair_index.contains_key(&key),
+        "trust->junos-host rule must be indexed under (trust_id, JUNOS_HOST_ZONE_ID)"
+    );
+}
+
+/// #3019: a configured `from-zone trust to-zone junos-host then deny` DENIES a
+/// host-bound flow from trust (the deny test). The eval consults the
+/// junos-host zone-pair and returns the matched Deny action.
+#[test]
+fn junos_host_policy_denies_matching_host_bound_flow() {
+    let state = parse_policy_state("permit", &[junos_host_deny_snapshot("deny")], &test_zone_name_to_id());
+    let result = evaluate_junos_host_policy(
+        &state,
+        TEST_TRUST_ZONE_ID,
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 102)),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 1)),
+        PROTO_TCP,
+        12345,
+        22,
+        None,
+        64,
+    );
+    assert_eq!(
+        result.map(|r| r.action),
+        Some(PolicyAction::Deny),
+        "trust->junos-host deny must match and deny"
+    );
+}
+
+/// #3019: `then permit` admits the host-bound flow (returns Permit). Ordering:
+/// host-inbound admission runs FIRST in the caller, so this permit cannot
+/// re-admit what host-inbound rejected — that is enforced by the poll-path
+/// call order, not here.
+#[test]
+fn junos_host_policy_permits_matching_host_bound_flow() {
+    let state = parse_policy_state("deny", &[junos_host_deny_snapshot("permit")], &test_zone_name_to_id());
+    let result = evaluate_junos_host_policy(
+        &state,
+        TEST_TRUST_ZONE_ID,
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 102)),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 1)),
+        PROTO_TCP,
+        12345,
+        22,
+        None,
+        64,
+    );
+    assert_eq!(result.map(|r| r.action), Some(PolicyAction::Permit));
+}
+
+/// #3019 lifeline fail-safe: with NO junos-host policy configured at all, the
+/// gate is a NO-OP (`None`) regardless of the (deny) default policy — host-
+/// bound traffic keeps pre-#3019 behavior and can never be newly denied.
+#[test]
+fn junos_host_policy_no_op_without_configured_rule() {
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            name: "transit".to_string(),
+            from_zone: "trust".to_string(),
+            to_zone: "untrust".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    assert!(!state.has_junos_host_rules);
+    assert!(
+        evaluate_junos_host_policy(
+            &state,
+            TEST_TRUST_ZONE_ID,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 102)),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 1)),
+            PROTO_TCP,
+            12345,
+            22,
+            None,
+            64,
+        )
+        .is_none(),
+        "no junos-host policy configured: gate must be a no-op"
+    );
+}
+
+/// #3019 fail-safe: a junos-host policy is configured for trust, but a flow
+/// from a DIFFERENT ingress zone (untrust) matches no junos-host rule for that
+/// pair → `None` (no implicit default-deny — host-bound traffic from untrust
+/// is unaffected). Also covers the unzoned (id 0) ingress short-circuit.
+#[test]
+fn junos_host_policy_no_match_falls_through_to_today_behavior() {
+    let state = parse_policy_state("permit", &[junos_host_deny_snapshot("deny")], &test_zone_name_to_id());
+    // Different ingress zone, no junos-host rule for (untrust, junos-host).
+    assert!(
+        evaluate_junos_host_policy(
+            &state,
+            TEST_UNTRUST_ZONE_ID,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 102)),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 1)),
+            PROTO_TCP,
+            12345,
+            22,
+            None,
+            64,
+        )
+        .is_none(),
+        "no junos-host rule for this ingress zone: no implicit default-deny"
+    );
+    // Unzoned (id 0) ingress is never eligible (mirror #3110).
+    assert!(
+        evaluate_junos_host_policy(
+            &state,
+            0,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 102)),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 1)),
+            PROTO_TCP,
+            12345,
+            22,
+            None,
+            64,
+        )
+        .is_none(),
+        "unzoned ingress must not be eligible for junos-host policy"
+    );
+}

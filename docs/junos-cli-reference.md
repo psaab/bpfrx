@@ -241,6 +241,31 @@ From zone: guest, To zone: lan
 - **Policy fields:** 4-space indent, `<Key>: <value>`.
 - **Action line:** `Action: permit` or `Action: reject, log` or `Action: deny, log`.
 - Multiple addresses shown as named address entries.
+- **`junos-host` self-traffic policy (#3019):** a `from-zone <z> to-zone
+  junos-host` policy is the Junos self-traffic (host-bound) security policy.
+  As of #3019 these policies are ENFORCED on the dataplane LocalDelivery path
+  (host-bound traffic destined to a firewall-local interface IP), not merely
+  accepted at commit. Ordering follows Junos: **host-inbound-traffic admission
+  (`set security zones security-zone <z> host-inbound-traffic ...`, #3070)
+  runs FIRST**, then the `to-zone junos-host` security policy. A packet that
+  host-inbound already rejected never reaches policy, so a `to-zone junos-host
+  then permit` cannot re-admit a service host-inbound denies. A matching
+  `then deny`/`then reject` drops the host-bound packet (emitting the same
+  policy-deny RT_FLOW + `reject`/zone-`tcp-rst` reply as a transit deny) and
+  tears down any cached host-local session on the next hit. Hit counters for
+  these rules now advance.
+  - **Lifeline fail-safe:** enforcement is strictly MATCH-DRIVEN. If NO
+    `junos-host` policy is configured, or a host-bound flow matches no
+    `junos-host` rule, behavior is UNCHANGED from before #3019 — there is no
+    implicit junos-host default-deny, so configuring some junos-host policy
+    cannot silently brick management/host traffic that does not match a deny
+    rule. (The stricter Junos "any configured junos-host zone-pair implies a
+    default-deny for that pair" posture is intentionally deferred.)
+  - **Scope:** `to-zone junos-host` (host-INBOUND) is enforced.
+    `from-zone junos-host` (host-ORIGINATED / locally-generated traffic) rules
+    are accepted and indexed but NOT yet consulted — locally-generated traffic
+    does not traverse the ingress LocalDelivery path; that direction is a
+    documented follow-up.
 
 ### Filtering
 

@@ -341,6 +341,24 @@ pub(crate) fn zone_pair_key(from_id: u16, to_id: u16) -> ZonePairKey {
 pub(crate) const JUNOS_GLOBAL_ZONE_ID: u16 = u16::MAX;
 pub(crate) const ZONE_ID_RESERVED_MIN: u16 = u16::MAX - 1;
 
+/// #3019: synthetic reserved zone id for the Junos `junos-host` self-traffic
+/// zone (`to-zone junos-host` / `from-zone junos-host` security policies). It
+/// lives at the BOTTOM of the reserved range (`ZONE_ID_RESERVED_MIN`), so a
+/// configured zone can never collide: `forwarding_build::populate_zones`
+/// already skips any snapshot zone whose id is `>= ZONE_ID_RESERVED_MIN`, and
+/// `configured_zone_pairs` excludes both sentinels from the cold-path
+/// histogram. The id is never put on the wire (the event-stream codec writes
+/// zone ids as u8); it exists only as the in-runtime key so a `junos-host`
+/// rule is INDEXED in `zone_pair_index` and reachable by the LocalDelivery
+/// policy gate. The Go control plane emits the `junos-host` zone NAME string
+/// in the rule snapshot; `parse_policy_state_with_counters` resolves that name
+/// to this id (Go↔Rust agreement is on the reserved name, not a wire id).
+pub(crate) const JUNOS_HOST_ZONE_ID: u16 = u16::MAX - 1;
+
+/// #3019: reserved Junos self-traffic zone name, recognized in policy
+/// from/to zone resolution and mapped to [`JUNOS_HOST_ZONE_ID`].
+pub(crate) const JUNOS_HOST_ZONE_NAME: &str = "junos-host";
+
 use crate::ip_proto::{
     PROTO_AH, PROTO_EGP, PROTO_ESP, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, PROTO_IGMP, PROTO_IPIP,
     PROTO_OSPF, PROTO_PIM, PROTO_SCTP, PROTO_TCP, PROTO_UDP, PROTO_VRRP,
@@ -859,6 +877,11 @@ pub(crate) struct PolicyState {
     pub(crate) books: Vec<BookEntry>,
     /// #1606: wire-ID → dense-index map used at parse time only.
     book_id_to_idx: FxHashMap<u32, u32>,
+    /// #3019: true iff at least one rule names `junos-host` as its from OR to
+    /// zone. The LocalDelivery junos-host policy gate is a NO-OP unless this is
+    /// set, so a config with no junos-host policy keeps pre-#3019 host-bound
+    /// behavior exactly (no risk of newly denying management traffic).
+    has_junos_host_rules: bool,
 }
 
 impl Default for PolicyState {
@@ -870,6 +893,7 @@ impl Default for PolicyState {
             global_indices: Vec::new(),
             books: Vec::new(),
             book_id_to_idx: FxHashMap::default(),
+            has_junos_host_rules: false,
         }
     }
 }
@@ -931,6 +955,8 @@ pub(crate) fn parse_policy_state_with_counters(
         global_indices: Vec::new(),
         books: Vec::with_capacity(address_books.len()),
         book_id_to_idx: FxHashMap::default(),
+        // #3019: armed below if any rule names the `junos-host` self zone.
+        has_junos_host_rules: false,
     };
 
     // #1606: build the dense book table first. Hard-fail on
@@ -1100,12 +1126,18 @@ pub(crate) fn parse_policy_state_with_counters(
         let is_global = rule.from_zone == "junos-global" || rule.to_zone == "junos-global";
         state.rules.push(rule);
 
+        // #3019: arm the LocalDelivery junos-host policy gate iff a rule
+        // actually names the reserved self zone on either side.
+        if snap.from_zone == JUNOS_HOST_ZONE_NAME || snap.to_zone == JUNOS_HOST_ZONE_NAME {
+            state.has_junos_host_rules = true;
+        }
+
         if is_global {
             state.global_indices.push(idx);
         } else {
             match (
-                zone_name_to_id.get(&snap.from_zone).copied(),
-                zone_name_to_id.get(&snap.to_zone).copied(),
+                resolve_policy_zone_id(zone_name_to_id, &snap.from_zone),
+                resolve_policy_zone_id(zone_name_to_id, &snap.to_zone),
             ) {
                 (Some(from_id), Some(to_id)) => {
                     let key = zone_pair_key(from_id, to_id);
@@ -1412,6 +1444,83 @@ pub(crate) fn evaluate_policy_result_with_icmp(
         log_session_init: false,
         log_session_close: false,
     }
+}
+
+/// #3019: resolve a policy rule's from/to zone NAME to a numeric id, mapping
+/// the reserved `junos-host` self zone to [`JUNOS_HOST_ZONE_ID`]. A configured
+/// zone can never be named `junos-host` (the Go strict validator + definition
+/// gate reject it), so this never shadows a real zone. All other names resolve
+/// through `zone_name_to_id` exactly as before.
+fn resolve_policy_zone_id(
+    zone_name_to_id: &FxHashMap<String, u16>,
+    name: &str,
+) -> Option<u16> {
+    if name == JUNOS_HOST_ZONE_NAME {
+        Some(JUNOS_HOST_ZONE_ID)
+    } else {
+        zone_name_to_id.get(name).copied()
+    }
+}
+
+/// #3019: evaluate a configured `to-zone junos-host` security policy for a
+/// host-bound (LocalDelivery) flow whose ingress (from) zone id is `from_id`.
+///
+/// Junos ordering: host-inbound-traffic admission runs FIRST in the caller; a
+/// packet only reaches this gate after host-inbound has admitted it, so a
+/// `then permit` here can never override a host-inbound reject.
+///
+/// CONSERVATIVE / FAIL-SAFE semantics, by design (#3019 brief): enforcement is
+/// strictly MATCH-DRIVEN. Returns:
+///   - `None` when no `junos-host` policy is configured at all
+///     (`has_junos_host_rules == false`), when the ingress zone is unknown
+///     (id 0, mirroring the #3110 unzoned guard), or when no `junos-host` rule
+///     MATCHES the flow.
+///   - `Some(result)` only when a `to-zone junos-host` rule MATCHES.
+///
+/// Crucially there is NO implicit default-deny here: an unmatched host-bound
+/// flow falls through to today's behavior (local delivery proceeds). This is
+/// the deliberate lifeline guarantee — configuring some junos-host policy
+/// cannot silently brick management/host traffic that does not match a deny
+/// rule. The stricter Junos "configured zone-pair implies default-deny"
+/// posture is intentionally deferred (see docs/junos-cli-reference.md).
+///
+/// `from-zone junos-host` (host-ORIGINATED) rules are indexed by the same name
+/// resolution but are NOT consulted here: locally-generated traffic does not
+/// traverse the ingress LocalDelivery path. That direction is a documented
+/// follow-up.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_junos_host_policy(
+    state: &PolicyState,
+    from_id: u16,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    packet_icmp: Option<(u8, u8)>,
+    packet_len: u64,
+) -> Option<PolicyEvaluationResult> {
+    if !state.has_junos_host_rules || from_id == 0 {
+        return None;
+    }
+    let key = zone_pair_key(from_id, JUNOS_HOST_ZONE_ID);
+    let indices = state.zone_pair_index.get(&key)?;
+    for &idx in indices {
+        if let Some(result) = try_match_rule(
+            &state.rules[idx],
+            state,
+            src_ip,
+            dst_ip,
+            protocol,
+            src_port,
+            dst_port,
+            packet_icmp,
+            packet_len,
+        ) {
+            return Some(result);
+        }
+    }
+    None
 }
 
 /// Try to match a single policy rule against packet fields.

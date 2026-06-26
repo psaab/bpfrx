@@ -8400,6 +8400,372 @@ fn unencapsulated_local_delivery_reinjects_slow_path_exactly_once() {
     );
 }
 
+/// #3019: gre_to_self_snapshot (default-permit, lan ingress, 10.255.0.1 local)
+/// optionally extended with a `from-zone lan to-zone junos-host` policy.
+fn junos_host_local_delivery_snapshot(action: Option<&str>) -> ConfigSnapshot {
+    let mut snapshot = gre_to_self_snapshot();
+    if let Some(act) = action {
+        snapshot.policies.push(PolicyRuleSnapshot {
+            name: "host-policy".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "junos-host".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: act.to_string(),
+            ..Default::default()
+        });
+    }
+    snapshot
+}
+
+/// #3019 LITERAL fail-on-revert (session-MISS): a `from-zone lan to-zone
+/// junos-host then deny` policy DROPS a host-bound packet on the LocalDelivery
+/// session-miss path, AFTER host-inbound admission. The packet is denied
+/// (dbg.policy_deny == 1), never reaches the slow-path reinject
+/// (slow_path_drops == 0), and no host-local session is cached. Remove the
+/// `junos_host_policy_drops` call in the session-miss LocalDelivery arm and
+/// this test goes RED (the packet would reinject to the slow path instead),
+/// while `poll_descriptor_no_junos_host_policy_local_delivery_unchanged_session_miss`
+/// stays GREEN.
+#[test]
+fn poll_descriptor_junos_host_deny_drops_local_delivery_session_miss() {
+    let forwarding = build_forwarding_state(&junos_host_local_delivery_snapshot(Some("deny")));
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(10, 255, 0, 1),
+        12345,
+        179,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+
+    let (tx, rx) = mpsc::sync_channel(8);
+    let wake = Arc::new(TunnelWake::new().expect("eventfd"));
+    let mut deliveries = BTreeMap::new();
+    deliveries.insert(77, LocalTunnelDelivery { tx, wake });
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(deliveries));
+
+    let (_batch, dbg) = txn_run_descriptor_with_deliveries(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+        &local_tunnel_deliveries,
+    );
+
+    assert_eq!(dbg.local, 1, "packet must take the LocalDelivery arm");
+    assert_eq!(
+        dbg.policy_deny, 1,
+        "to-zone junos-host deny must drop the host-bound packet"
+    );
+    assert_eq!(
+        binding.live.slow_path_drops.load(Ordering::Relaxed),
+        0,
+        "a junos-host-denied host-bound packet must NOT reach the slow-path \
+         reinject (#3019 — the deny short-circuits before should_cache)"
+    );
+    assert_eq!(
+        sessions.len(),
+        0,
+        "no host-local session may be cached for a junos-host-denied flow"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a denied packet must not reach any delivery channel"
+    );
+}
+
+/// #3019 lifeline fail-safe (session-MISS GREEN pair): with NO junos-host
+/// policy configured, a host-bound packet keeps pre-#3019 behavior — admitted
+/// (dbg.policy_deny == 0) and reinjected to the slow path (slow_path_drops ==
+/// 1). This stays GREEN when the LocalDelivery policy-eval call is removed,
+/// proving the deny test above is the literal fail-on-revert sentinel and that
+/// the change cannot newly deny management/host traffic.
+#[test]
+fn poll_descriptor_no_junos_host_policy_local_delivery_unchanged_session_miss() {
+    let forwarding = build_forwarding_state(&junos_host_local_delivery_snapshot(None));
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(10, 255, 0, 1),
+        12345,
+        179,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+
+    let (tx, rx) = mpsc::sync_channel(8);
+    let wake = Arc::new(TunnelWake::new().expect("eventfd"));
+    let mut deliveries = BTreeMap::new();
+    deliveries.insert(77, LocalTunnelDelivery { tx, wake });
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(deliveries));
+
+    let (_batch, dbg) = txn_run_descriptor_with_deliveries(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+        &local_tunnel_deliveries,
+    );
+
+    assert_eq!(dbg.local, 1, "packet must take the LocalDelivery arm");
+    assert_eq!(
+        dbg.policy_deny, 0,
+        "no junos-host policy: host-bound packet must not be policy-denied"
+    );
+    assert_eq!(
+        binding.live.slow_path_drops.load(Ordering::Relaxed),
+        1,
+        "no junos-host policy: host-bound packet keeps pre-#3019 slow-path reinject"
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+/// #3019 LITERAL fail-on-revert (session-HIT): a tightened `to-zone junos-host
+/// then deny` tears down an ALREADY ESTABLISHED host-bound session on the next
+/// hit (mirroring the #3070 host-inbound re-check) and emits the policy-deny
+/// RT_FLOW. Remove the `junos_host_policy_drops` call in the session-HIT
+/// LocalDelivery arm and this test goes RED (the session would survive and no
+/// PolicyDeny event would be emitted).
+#[test]
+fn poll_descriptor_junos_host_deny_drops_local_delivery_session_hit() {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.default_policy = "permit".to_string();
+    snapshot.policies = vec![PolicyRuleSnapshot {
+        name: "host-deny".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "junos-host".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "deny".to_string(),
+        ..Default::default()
+    }];
+    snapshot.interfaces[0].addresses = vec![InterfaceAddressSnapshot {
+        family: "inet".to_string(),
+        address: "10.0.61.1/24".to_string(),
+        scope: 0,
+    }];
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut frame = build_policy_deny_tcp_syn_frame();
+    set_ipv4_dst(&mut frame, Ipv4Addr::new(10, 0, 61, 1));
+    let meta_len = std::mem::size_of::<UserspaceDpMeta>();
+    let frame_offset = 128;
+    let meta_offset = frame_offset - meta_len;
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: meta_len as u16,
+        ingress_ifindex: 24,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 54,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_SYN,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    let meta_bytes = unsafe {
+        std::slice::from_raw_parts((&meta as *const UserspaceDpMeta).cast::<u8>(), meta_len)
+    };
+    unsafe {
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(meta_offset, meta_len)
+            .expect("meta slice")
+            .copy_from_slice(meta_bytes);
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(frame_offset, frame.len())
+            .expect("frame slice")
+            .copy_from_slice(&frame);
+    }
+    binding.xsk.rx.push_for_test(XdpDesc {
+        addr: frame_offset as u64,
+        len: frame.len() as u32,
+        options: 0,
+    });
+
+    let ident = binding.identity();
+    let binding_lookup = WorkerBindingLookup::from_bindings(std::slice::from_ref(&binding));
+    let mirror_targets = MirrorTargetMap::default();
+    let ha_state = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let (event_handle, event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let worker_ctx = WorkerContext {
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        mirror_targets: &mirror_targets,
+        forwarding: &forwarding,
+        ha_state: &ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        neighbor_resolver: None,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        slow_path: None,
+        event_stream: Some(&event_handle),
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
+    };
+    let mut sessions = SessionTable::new();
+    let flow_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1)),
+        src_port: 12345,
+        dst_port: 5201,
+    };
+    let local_decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::LocalDelivery,
+            local_ifindex: 24,
+            egress_ifindex: 24,
+            tx_ifindex: 24,
+            tunnel_endpoint_id: 0,
+            next_hop: None,
+            neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    };
+    let local_metadata = SessionMetadata {
+        ingress_zone: TEST_LAN_ZONE_ID,
+        egress_zone: TEST_LAN_ZONE_ID,
+        owner_rg_id: 0,
+        fabric_ingress: false,
+        is_reverse: false,
+        nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
+        policy_id: 0,
+    };
+    assert!(sessions.install_with_protocol_with_origin(
+        flow_key.clone(),
+        local_decision,
+        local_metadata.clone(),
+        SessionOrigin::LocalMiss,
+        123_000_000_000,
+        PROTO_TCP,
+        TCP_FLAG_SYN,
+    ));
+    let shared_entry = SyncedSessionEntry {
+        key: flow_key.clone(),
+        decision: local_decision,
+        metadata: local_metadata,
+        origin: SessionOrigin::LocalMiss,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_SYN,
+        generation: 0,
+    };
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &shared_entry,
+    );
+    assert_eq!(sessions.drain_deltas(16).len(), 1, "initial open delta");
+    let mut screen = ScreenState::new();
+    let mut batch = BatchCounters::default();
+    let mut dbg = DebugPollCounters::default();
+    let mut telemetry = TelemetryContext {
+        dbg: &mut dbg,
+        counters: &mut batch,
+    };
+    let area_ptr = binding.umem.area() as *const MmapArea;
+
+    poll_binding_process_descriptor(
+        &mut binding,
+        0,
+        area_ptr,
+        1,
+        &mut sessions,
+        &mut screen,
+        ValidationState {
+            snapshot_installed: true,
+            config_generation: 7,
+            fib_generation: 9,
+        },
+        123_000_000_000,
+        123,
+        0,
+        0,
+        -1,
+        -1,
+        &worker_ctx,
+        &mut telemetry,
+    );
+
+    let event = event_rx
+        .try_recv()
+        .expect("policy-deny event from junos-host deny on cached local session hit")
+        .decode_dataplane_event()
+        .expect("policy-deny payload");
+    assert_eq!(
+        event.kind,
+        crate::event_stream::codec::DataplaneEventKind::PolicyDeny
+    );
+    assert_eq!(event.ingress_zone_id, TEST_LAN_ZONE_ID);
+    assert_eq!(event.src_port, 12345);
+    assert_eq!(event.dst_port, 5201);
+    assert_eq!(sessions.len(), 0, "junos-host deny must tear down the cached session");
+    let deltas = sessions.drain_deltas(16);
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0].kind, SessionDeltaKind::Close);
+    assert_eq!(deltas[0].key, flow_key);
+    assert!(telemetry.dbg.policy_deny >= 1);
+    assert_eq!(event_handle.dataplane_event_stats().policy_deny.sent, 1);
+}
+
 /// #1885 decap-level consistency pin: on VLAN-TAGGED ingress the decap
 /// must produce a synthetic frame and an inner meta that describe EACH
 /// OTHER — `synthetic[meta.l3_offset..]` IS the inner packet. (The
