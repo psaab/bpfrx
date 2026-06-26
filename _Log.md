@@ -1,3 +1,27 @@
+## 2026-06-25 — #3025: NAT64 non-fragmented L4 checksum goes incremental (RFC 1624)
+
+- **Timestamp**: 2026-06-25
+- **Action**: NAT64's non-fragmented TCP/UDP translation now adjusts the L4
+  checksum INCREMENTALLY (RFC 1624) for the v4↔v6 pseudo-header address change
+  instead of re-summing the entire L4 payload (agy-review-061 finding 061-05,
+  performance). The transport payload is byte-identical across translation and
+  the length/protocol fields are unchanged, so only the pseudo-header addresses
+  differ — making the O(changed-words) fold byte-identical to the previous full
+  recompute (one's-complement addition is exact). Renamed the existing #2488
+  fragment helpers `adjust_l4_checksum_v{6_to_v4,4_to_v6}_fragment` →
+  `_incremental` (they now serve both fragment and non-fragment paths) and
+  routed the non-fragment TCP / non-zero-checksum UDP cases through them. ICMP,
+  v4→v6 UDP with a zero IPv4 checksum (RFC 768 "no checksum" → must GENERATE
+  one), and a defensive v6→v4 UDP zero-baseline keep the full recompute. The
+  #2488 fragment path is untouched.
+- **File(s)**: userspace-dp/src/nat64.rs (module doc + both translators + helper
+  renames), userspace-dp/src/nat64_tests.rs (8 `nat64_3025_*` tests: incremental
+  == full recompute for v6→v4 / v4→v6 TCP+UDP, v4 zero-checksum UDP generates a
+  fresh valid checksum, fail-on-revert seams that PRESERVE a corrupted input
+  checksum, and a wrong-delta pin). Validation: cargo build --release clean;
+  cargo test nat64 (99) + checksum (51) green; RED confirmed by forcing the
+  v6→v4 path back to recompute (seam test fails), restored.
+
 - **2026-06-25**: #2994 (codex-review-058 finding 058-09) — DHCP T1/T2 renewal now runs the RFC-correct unicast RENEW / broadcast REBIND instead of a full DORA / Rapid-Solicit re-acquisition. Before #2994 `runDHCPv4`/`runDHCPv6` called the full client exchange at every T1/T2, which broadcast a fresh server-selection each renewal, could move the lease to a different server, churned the address (interface-DDNS, FRR routes, ip-monitoring) and doubled WAN DHCP traffic. Fix: introduced a `dhcpExchangeMode` (acquire/renew/rebind) state machine in the run loops. v4 T1 sends a unicast RENEWING DHCPREQUEST (ciaddr = held address, no requested-IP / no server-id options per RFC 2131 Table 5) to the granting server (stored `Lease.serverID`, option 54), T2 broadcasts a REBINDING DHCPREQUEST; v6 T1 sends RENEW echoing the held IA_NA / IA_PD with the server's DUID (stored `Lease.v6ServerDUID`), T2 multicasts REBIND (no server DUID). Only lease expiry (both fail) falls back to full DISCOVER/SOLICIT. Stateless v6 stays Information-Request. Any malformed/unmatched renew is fail-safe — degrades to the prior full-acquisition path. Added run-loop seams (`doV4ExchangeForTest`/`doV6ExchangeForTest`/`afterForTest`/`waitLinkLocalForTest`) so the real `runDHCPv4`/`runDHCPv6` state machine is unit-testable without sockets or the 30 s T1 clamp. Follow-up: updated the stale pre-#2994 wire-behavior comment in `commit.go`. Tests: wire builders (`buildV4RenewRequest`/`v4RenewDest`/`buildV6RenewMessage`) + run-loop mode-sequence (acquire→renew→renew→rebind→acquire) + lease preservation; fail-on-revert (T1→acquire) confirmed RED→GREEN; -race clean. Files: pkg/dhcp/dhcp.go, pkg/dhcp/renew.go (new), pkg/dhcp/renew_test.go (new), pkg/dhcp/commit.go, pkg/dhcp/dhcp_test.go (gofmt sweep), pkg/dhcp/README.md
 ## 2026-06-25 — #3120: IPv6 screen ext-header walk continues past Fragment header
 
