@@ -101,6 +101,42 @@ func TestHostInboundFilterAcceptsListedDeniesRest(t *testing.T) {
 	}
 }
 
+// TestHostInboundFilterExemptsIPsecAndV6Errors verifies the global exemptions
+// that must agree with the userspace stage_ipsec_passthrough_check: raw ESP/AH
+// (proto 50/51) and v6 ND/error/PMTUD control are accepted BEFORE any per-zone
+// drop, so an IPsec-terminating zone configured `host-inbound { ike; }` keeps
+// its tunnel data plane and v6 error delivery is never gapped. The ESP/AH
+// accept is fail-on-revert: removing it turns this RED.
+func TestHostInboundFilterExemptsIPsecAndV6Errors(t *testing.T) {
+	cfg := hostInboundTestConfig()
+	views := buildAndCheckViews(t, cfg)
+	payload := buildHostInboundFilterPayload(views)
+
+	espAH := "meta l4proto { 50, 51 } accept"
+	if !strings.Contains(payload, espAH) {
+		t.Errorf("payload missing raw ESP/AH exemption %q\n---\n%s", espAH, payload)
+	}
+	// icmpv6 type 1 (destination-unreachable) must be in the accepted set.
+	if !strings.Contains(payload, "icmpv6 type { 1, 2, 133, 134, 135, 136, 137 } accept") {
+		t.Errorf("payload missing icmpv6 type-1 (dest-unreachable) in the global accept:\n%s", payload)
+	}
+
+	// The ESP/AH exemption MUST precede every per-zone scoped drop, otherwise a
+	// zone's `daddr <wan-ip> drop` would catch outer ESP before XFRM decrypts.
+	idxESP := strings.Index(payload, espAH)
+	if idxESP < 0 {
+		t.Fatalf("ESP/AH accept not found")
+	}
+	for _, drop := range []string{
+		"ip daddr 172.16.50.8 drop",
+		"ip6 daddr 2001:db8:50::8 drop",
+	} {
+		if idxDrop := strings.Index(payload, drop); idxDrop >= 0 && idxESP > idxDrop {
+			t.Errorf("ESP/AH exemption must precede the per-zone drop %q", drop)
+		}
+	}
+}
+
 // TestHostInboundFilterNoStanzaNoDeny verifies a zone with NO
 // host-inbound-traffic stanza (lan) emits no deny — admit-all preserved
 // (zero-regression lifeline guarantee for unconfigured zones).

@@ -151,11 +151,15 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 //
 // Layout of `chain input` (type filter hook input priority 0; policy accept):
 //  1. ct state established,related accept   — return/ongoing host traffic.
-//  2. icmpv6 ND + PacketTooBig + dest-unreachable accept, icmp dest-unreachable
-//     accept — IPv6 Neighbor Discovery and v4/v6 PMTUD control messages are
-//     mandatory link operation, never a "service" exposure; accepted globally
-//     so a host-inbound set omitting `ping` does not black-hole PMTUD/ND.
-//  3. Per host-inbound-configured zone, per family with addresses:
+//  2. meta l4proto { 50, 51 } accept — raw ESP/AH exemption for host-terminated
+//     IPsec (mirrors the userspace stage_ipsec_passthrough_check); the kernel
+//     XFRM stack decrypts before any host-inbound deny can apply.
+//  3. icmpv6 ND + PacketTooBig + dest-unreachable accept, icmp dest-unreachable
+//     accept — IPv6 Neighbor Discovery and v4/v6 PMTUD/error control messages
+//     are mandatory link operation, never a "service" exposure; accepted
+//     globally so a host-inbound set omitting `ping` does not black-hole
+//     PMTUD/ND/error delivery.
+//  4. Per host-inbound-configured zone, per family with addresses:
 //     - if `all` / `any-service` / `protocols all`: <fam> daddr <addrs> accept
 //     (and no deny — the operator opened the zone fully).
 //     - else: one accept per listed service/protocol scoped to the zone addrs,
@@ -169,9 +173,23 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) stri
 	rules = append(rules, "  chain input {")
 	rules = append(rules, "    type filter hook input priority 0; policy accept;")
 	rules = append(rules, "    ct state established,related accept")
-	// IPv6 ND + v4/v6 PMTUD control messages — accepted regardless of the
-	// host-inbound set so enforcement never breaks core L3 operation.
-	rules = append(rules, "    icmpv6 type { 2, 133, 134, 135, 136, 137 } accept")
+	// Raw ESP (50) / AH (51) are exempt from host-inbound enforcement so the
+	// kernel XFRM stack can decrypt host-terminated IPsec — mirroring the
+	// userspace stage_ipsec_passthrough_check, which runs BEFORE
+	// host_inbound_admits (poll_descriptor mod.rs). Standard vSRX configures the
+	// IPsec external zone with host-inbound `system-services { ike; }` (IKE
+	// alone; ESP implicitly permitted): the `ike` token already accepts udp
+	// 500/4500 (so IKE and NAT-T survive), and this exempts the raw ESP/AH data
+	// plane (typical site-to-site). Without it a scoped `daddr <wan-ip> drop`
+	// would black-hole the tunnel AFTER IKE succeeds — a silent upgrade
+	// regression once #3070 turns a previously-no-op `ike` stanza into real
+	// enforcement.
+	rules = append(rules, "    meta l4proto { 50, 51 } accept")
+	// IPv6 ND + v4/v6 PMTUD/error control messages — accepted regardless of the
+	// host-inbound set so enforcement never breaks core L3 operation. icmpv6
+	// type 1 (destination-unreachable) + 2 (packet-too-big) carry v6 error /
+	// PMTUD signalling; 133-137 are Neighbor Discovery.
+	rules = append(rules, "    icmpv6 type { 1, 2, 133, 134, 135, 136, 137 } accept")
 	rules = append(rules, "    icmp type destination-unreachable accept")
 
 	for _, v := range views {
