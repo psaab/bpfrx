@@ -20,6 +20,64 @@
   discrimination turns the two non-query assertions RED while echo stays
   green.
 
+## 2026-06-25 — #3055: reject a security zone using a reserved sentinel name
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added a commit-time strict validator
+  (`validateReservedZoneNamesStrict`) that hard-rejects a `security zones
+  security-zone <name>` whose name is a reserved sentinel — `junos-global`,
+  `any`, or `junos-host`. A zone literally named `junos-global` was accepted at
+  commit, but `userspace-dp/src/policy.rs` string-matches a from/to-zone equal
+  to `junos-global` and reclassifies the policy as a device-wide global fallback
+  (`JUNOS_GLOBAL_ZONE_ID = u16::MAX`) evaluated for every flow — so the zone's
+  scoped policies silently became device-wide permits across unrelated zone
+  pairs (security-boundary escape). Introduced `reservedZoneNames`
+  (`{junos-global, any, junos-host}`) used ONLY by the new definition gate.
+  Strict on commit/commit-check; downgraded to a warning on the tolerant
+  load/peer-sync paths via `lenientReservedZoneNames` (#1960 no-brick),
+  mirroring the #3066/#2401 pattern.
+- **Review fold (hostile review, MERGE-NEEDS-MINOR)**: the first cut
+  re-derived `policyZoneSpecialTokens` (the #2401 zone-REFERENCE exemption set)
+  from `reservedZoneNames`, which silently ADDED `junos-global` to the
+  reference-exempt set — re-opening the device-wide-permit class via the
+  reference path (an undefined `from-zone junos-global` reference would become
+  exempt and reach `policy.rs:1021`). DECOUPLED the two sets: the
+  reference-exempt set is reverted to its exact master literal `{"", any,
+  junos-host}` (still OMITS junos-global, so such a reference stays
+  hard-rejected + warned). Added `TestJunosGlobalNotReferenceExempt` to pin the
+  decoupling against a future re-unify.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/reserved_zone_name_3055_test.go,
+  pkg/config/README.md, _Log.md
+- **Validation**: `go build ./...`, `go vet ./pkg/config/...`,
+  `go test ./pkg/config/...` (1519 passed), `gofmt -l` clean. Fail-on-revert
+  confirmed: (a) stubbing `validateReservedZoneNamesStrict` to `return nil`
+  turns the three definition reject/lenient tests RED while the ordinary-name
+  test stays GREEN; (b) re-unifying `policyZoneSpecialTokens` with
+  `reservedZoneNames` turns `TestJunosGlobalNotReferenceExempt` RED.
+
+## 2026-06-25 — #3072: reject an interface assigned to multiple security zones
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added commit-time strict validation rejecting an interface
+  assigned to more than one security zone. Previously
+  `pkg/dataplane/userspace.buildInterfaceZoneMap` silently resolved a
+  duplicate first-writer-wins over the SORTED zone names, so a
+  multi-zone interface landed in whichever zone sorts first and traffic
+  was evaluated against the wrong zone's policy. New
+  `validateZoneInterfaceMembershipStrict` (+ `zoneIfaceLogicalKeys`
+  helper mirroring the base/unit expansion) hard-rejects at commit,
+  naming the interface and both conflicting zones; `lenientZoneInterface
+  Membership` downgrades to a warning on the tolerant load/peer-sync
+  paths (keeps deterministic first-writer-wins so a persisted config
+  still boots — #1960 doctrine). Distinct units of one physical
+  interface across zones (valid VLAN split) are NOT rejected; a bare
+  interface + one of its units across zones ARE. Fail-on-revert test
+  file `zone_interface_membership_test.go` (RED with the validator
+  neutralized). Updated pkg/config README.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/zone_interface_membership_test.go,
+  pkg/config/README.md, _Log.md
 ## 2026-06-25 — #3065: unspecified default-policy fails CLOSED (deny-all) + reject-all + schema leaf
 
 - **Timestamp**: 2026-06-25
@@ -18836,6 +18894,40 @@ top.
   userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs, _Log.md
 
 - **Timestamp**: 2026-06-25
+- **Action**: #3076 firewall filter tcp-flags expression fail-open fix. A Junos
+  `from tcp-flags` *expression* (`"syn & !ack"`, `"ack | rst"`, etc.) committed
+  (the leaf is `multi: true` with no value validator) but the snapshot builder's
+  bare-name-only `tcpFlagsMask` lookup missed the expression token and returned
+  ok=false, so the constraint was silently dropped — the term matched regardless
+  of TCP flags (security fail-open). Added `ParseTCPFlagsExpression`
+  (pkg/config/tcp_flags.go) parsing `&`/`|`/`!`/`(`/`)` into a required-bits and
+  a forbidden-bits mask; `compileFirewall` now REJECTS at commit (fail-closed)
+  any expression the conjunctive dataplane cannot enforce (disjunction, negated
+  group, unknown flag, contradiction). Representable expressions (incl.
+  `syn & !ack`) are carried via a new `tcp_flags_forbidden` wire field through
+  the Go snapshot (protocol.go), the Rust serde struct (security.rs), the
+  compiled FilterTerm (filter/mod.rs + compiler.rs), the matcher
+  (engine/matching.rs: `(flags & required)==required && (flags & forbidden)==0`)
+  and cache-sensitivity compare (cache_sensitive.rs). Regenerated
+  protocol_wire_v1.json fixture. FAIL-ON-REVERT tests: pkg/config
+  TestParseTCPFlagsExpression + TestFirewallFilterTCPFlagsCommitReject;
+  pkg/dataplane/userspace TestFilterSnapshotTCPFlagsExpressionParsed /
+  NegationOnly; Rust tcp_flags_term_forbidden_mask_excludes_negated_flag /
+  forbidden_only_mask. Gates: go build ./... clean, gofmt clean (touched files),
+  go vet ./pkg/config + ./pkg/dataplane/userspace clean, go test pkg/config 1516
+  + pkg/dataplane 833 pass, cargo filter:: 120 + wire_invariant pass.
+- **File(s)**: pkg/config/tcp_flags.go (new), pkg/config/tcp_flags_test.go (new),
+  pkg/config/compiler_firewall.go, pkg/dataplane/userspace/filters.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/filters_per_packet_match_2362_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/filter/mod.rs,
+  userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/engine/matching.rs,
+  userspace-dp/src/filter/engine/cache_sensitive.rs,
+  userspace-dp/src/filter/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  userspace-dp/src/filter/README.md, docs/config-schema.md,
+  pkg/config/README.md, _Log.md
 - **Action**: #2853 — flowexport session-creation StartTime kept only integer
   Unix seconds (offset 108, u32), so every flow opened in the same wall-clock
   second exported one StartTime, flattening IPFIX flowStartMilliseconds for

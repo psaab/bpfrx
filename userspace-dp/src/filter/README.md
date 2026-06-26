@@ -293,13 +293,15 @@ exactly one of these two classes:
 | `destination_ports` | yes (TCP/UDP); ICMP-zero | `dst_port` is 0 for ICMP |
 | `dscp_values` / `dscp_bitmap` (+ `dscp_match_enabled`) | NO — cache-sensitive | see #1430 pattern below |
 | (future) `tos_match` / ECN bits (non-DSCP TOS) | NO — cache-sensitive | TOS lower bits and ECN vary per packet |
-| `tcp_flags_mask` (#2362) | NO — cache-sensitive | required-bits mask over the TCP flags byte; TCP flags vary per packet. Threaded via `TermMatchExtra` (path (b)) |
+| `tcp_flags_mask` (#2362) | NO — cache-sensitive | required-bits mask over the TCP flags byte: matches when `(flags & mask) == mask`. TCP flags vary per packet. Threaded via `TermMatchExtra` (path (b)) |
+| `tcp_flags_forbidden` (#3076) | NO — cache-sensitive | forbidden-bits mask over the same byte: matches only when `(flags & forbidden) == 0`. Carries the negated operands of a Junos tcp-flags expression (`syn & !ack` → required SYN, forbidden ACK). Independent of `tcp_flags_mask`. Unrepresentable expressions (disjunction `\|`, negated groups, unknown flags) are rejected at commit by the Go compiler, never silently dropped |
 | `is_fragment` (#2362) | NO — cache-sensitive | Junos `is-fragment`: matches ANY fragment (IPv4 MF set OR offset != 0; IPv6 fragment header present). Computed by `is_any_fragment` |
 | (future) `ihl_match` / IP options | NO — cache-sensitive | IHL varies per packet |
 | `icmp_type` / `icmp_code` (#2362) | NO — cache-sensitive | exact match on the ICMP/ICMPv6 type/code byte; non-ICMP packets never match. Could later be promoted to cache-key by adding (type, code) to `SessionKey` |
 | (future) `flex_match` | NO — cache-sensitive | byte-offset match, fully per-packet |
 
-The `tcp_flags_mask` / `is_fragment` / `icmp_type` / `icmp_code` inputs are
+The `tcp_flags_mask` / `tcp_flags_forbidden` / `is_fragment` / `icmp_type` /
+`icmp_code` inputs are
 carried in a small `TermMatchExtra` built once per packet at the filter-eval
 call sites (`term_match_extra_from_frame` and its `ForwardPacketMeta` /
 meta-only variants). The builder is fragment-safe: for a NON-FIRST fragment

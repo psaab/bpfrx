@@ -1497,6 +1497,41 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 	return nil
 }
 
+// reservedZoneNames is the set of tokens the dataplane / Junos grammar reserves
+// for a special context and that therefore must NEVER be the name of an
+// operator-defined `security zones security-zone <name>` (#3055). It is used
+// ONLY by the zone-DEFINITION gate (validateReservedZoneNamesStrict).
+//
+// It is DELIBERATELY DISTINCT from policyZoneSpecialTokens (the zone-REFERENCE
+// exemption set) — see that var's comment. The two gates are mutually
+// reinforcing and must not be unified: a zone named "junos-global" is rejected
+// at definition here, while a policy that REFERENCES `from-zone junos-global`
+// against no defined zone stays hard-rejected by the reference gate (NOT made
+// reference-exempt). Adding "junos-global" to the reference-exempt set would
+// silently re-open the device-wide-permit class this gate closes, because the
+// dataplane (userspace-dp/src/policy.rs:1021) classifies a "junos-global"
+// reference as a device-wide global rule.
+//
+//   - "junos-global" — the device-wide global-policy sentinel. The userspace
+//     dataplane (userspace-dp/src/policy.rs) string-matches a from-zone/to-zone
+//     literally equal to "junos-global" and reclassifies the policy as a global
+//     fallback (JUNOS_GLOBAL_ZONE_ID = u16::MAX) evaluated for EVERY flow. An
+//     operator-defined zone of this name would silently turn its zone-scoped
+//     rules into device-wide fallbacks that permit traffic for unrelated zone
+//     pairs — a security-boundary escape.
+//
+//   - "any"         — Junos wildcard zone (`from-zone any`/`to-zone any`); the
+//     dataplane treats it as match-any, never a named zone-id lookup, so a real
+//     zone named "any" can never be selected and would shadow the wildcard.
+//
+//   - "junos-host"  — Junos reserved self-traffic zone (host-inbound / host-
+//     outbound policy context); it is never declared as a `security zone`.
+var reservedZoneNames = map[string]struct{}{
+	"junos-global": {},
+	"any":          {},
+	"junos-host":   {},
+}
+
 // policyZoneSpecialTokens is the set of reserved from-zone/to-zone tokens
 // that name a context rather than an operator-defined security zone, and so
 // must be exempt from the "zone must be defined" gate
@@ -1510,15 +1545,70 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 //   - "junos-host"  — Junos reserved self-traffic zone (host-inbound / host-
 //     outbound policy context); it is never declared as a `security zone`.
 //
-// Global policies (`security policies global { ... }`) are not validated here:
-// they live in cfg.Security.GlobalPolicies with no from/to-zone strings and
-// are mapped to the `junos-global` sentinel only when the dataplane snapshot is
-// built (see pkg/dataplane/userspace/policies.go), so they cannot reference an
-// undefined zone.
+// This set is DELIBERATELY NOT derived from reservedZoneNames and DELIBERATELY
+// OMITS "junos-global" (#3055). The two gates serve opposite purposes: the
+// definition gate rejects a reserved NAME, while this reference gate must keep
+// hard-rejecting (+ warning) a policy that REFERENCES `from-zone junos-global`
+// / `to-zone junos-global` when no such zone is defined — making junos-global
+// reference-exempt would let that reference reach the dataplane, which then
+// (policy.rs:1021) classifies it as a device-wide global rule: the exact
+// fail-OPEN this PR closes. The definition gate already guarantees no zone
+// named junos-global can exist, so an explicit junos-global reference is always
+// the bug, never a legitimate named-zone use. Global policies (`security
+// policies global { ... }`) are not validated here: they live in
+// cfg.Security.GlobalPolicies with no from/to-zone strings and are mapped to
+// the `junos-global` sentinel only when the dataplane snapshot is built (see
+// pkg/dataplane/userspace/policies.go), so they cannot reference an undefined
+// zone.
 var policyZoneSpecialTokens = map[string]struct{}{
 	"":           {},
 	"any":        {},
 	"junos-host": {},
+}
+
+// validateReservedZoneNamesStrict hard-rejects a `security zones security-zone
+// <name>` DEFINITION whose name is a reserved sentinel token (#3055).
+//
+// The bug: compileZones accepts any zone name, and the userspace dataplane
+// (userspace-dp/src/policy.rs) string-matches a from-zone/to-zone literally
+// equal to "junos-global" and reclassifies the policy as a device-wide global
+// fallback (JUNOS_GLOBAL_ZONE_ID = u16::MAX) evaluated for every flow. So an
+// operator-defined zone named "junos-global" turns its zone-scoped policies
+// into device-wide fallbacks that can permit traffic for unrelated zone pairs —
+// a silent security-boundary escape. "any" and "junos-host" are reserved policy
+// context tokens that must likewise never be a real zone name (a zone the
+// dataplane could never select, shadowing the wildcard / self-traffic context).
+//
+// Strict on the commit / commit-check path (CompileConfig — hard reject so the
+// operator sees it); downgraded to a cfg.Warnings entry on the tolerant load /
+// peer-sync paths (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientReservedZoneNames) so an already-persisted or peer-synced config an
+// older binary accepted still BOOTS (#1960 fail-closed-on-load doctrine).
+// Iteration is over cfg.Security.Zones in sorted name order so the first-
+// reported error is deterministic. Reserved tokens are reported in a fixed
+// order for a stable message.
+func validateReservedZoneNamesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if _, reserved := reservedZoneNames[name]; reserved {
+			return fmt.Errorf(
+				"security zone %q uses a reserved name: %q (along with \"any\" "+
+					"and \"junos-host\") is a reserved dataplane/Junos context "+
+					"token and cannot be the name of a `security zones "+
+					"security-zone` — the dataplane would reclassify the zone's "+
+					"policies as device-wide global fallbacks (or never select "+
+					"the zone), silently breaking zone isolation; rename the zone",
+				name, name)
+		}
+	}
+	return nil
 }
 
 // validatePolicyZoneReferencesStrict hard-rejects a security policy zone-pair
@@ -1771,6 +1861,125 @@ func validateZoneCountStrict(cfg *Config) error {
 		return fmt.Errorf(
 			"configuration defines %d security zones, but the dataplane can address at most %d (zone ids are carried in a u8 wire field); reduce the zone count to %d or fewer — zones beyond the limit are dropped by the dataplane and their interfaces silently fall back to the \"unknown\" zone",
 			n, MaxUsableZoneID, MaxUsableZoneID)
+	}
+	return nil
+}
+
+// zoneIfaceLogicalKeys returns the set of effective logical-interface keys a
+// single `set security zones security-zone <z> interfaces <iface>` entry
+// claims, mirroring how pkg/dataplane/userspace.buildInterfaceZoneMap expands a
+// zone-interface entry into the userspace interface->zone lookup (#3072). It is
+// the conflict-detection counterpart of that expansion: two zones whose key
+// sets intersect would map the same physical/logical interface to two zone ids,
+// which buildInterfaceZoneMap silently resolves first-writer-wins over the
+// sorted zone names.
+//
+//   - A unit-qualified entry (`base.unit`, e.g. `ge-0/0/0.0`) claims exactly the
+//     one logical unit key `base.unit`. It deliberately does NOT claim the bare
+//     `base` key: two DIFFERENT units of one physical interface in two zones
+//     (`ge-0/0/0.0` in trust, `ge-0/0/0.1` in untrust) is a valid VLAN sub-
+//     interface split and must not be rejected. (buildInterfaceZoneMap's bare
+//     `base` fallback for untagged lookups is a coarse first-writer-wins
+//     artifact, not an operator-visible second assignment.)
+//   - A bare entry (`base`, no unit) claims the whole physical interface: the
+//     bare key `base` plus every configured unit `base.<n>` from
+//     cfg.Interfaces. Listing the same physical interface bare in two zones, or
+//     bare in one zone and a unit of it in another, is a genuine multi-zone
+//     assignment.
+//
+// A trailing-dot form (`base.`) is treated as bare (no specific unit), matching
+// buildInterfaceZoneMap which falls through to the unit-expansion branch when
+// the unit token is empty.
+func zoneIfaceLogicalKeys(cfg *Config, iface string) []string {
+	base, unit, ok := strings.Cut(iface, ".")
+	if ok && unit != "" {
+		return []string{base + "." + unit}
+	}
+	// Bare interface: claim the physical interface and all its configured units.
+	if base == "" {
+		base = iface
+	}
+	keys := []string{base}
+	if cfg != nil {
+		if ifCfg := cfg.Interfaces.Interfaces[base]; ifCfg != nil {
+			for unitNum := range ifCfg.Units {
+				keys = append(keys, fmt.Sprintf("%s.%d", base, unitNum))
+			}
+		}
+	}
+	return keys
+}
+
+// validateZoneInterfaceMembershipStrict hard-rejects a configuration that
+// assigns the same interface to more than one security zone (#3072).
+//
+// pkg/dataplane/userspace.buildInterfaceZoneMap builds the interface->zone
+// lookup by iterating the zone names in SORTED order and writing each interface
+// (plus its base/unit aliases) first-writer-wins. So an interface listed under
+// two zones is silently accepted at commit and resolved to whichever zone name
+// sorts first — independent of operator intent or config order. A packet that
+// should be evaluated as `trust -> untrust` is instead evaluated as
+// `aaa -> untrust` purely because "aaa" < "trust", causing an unintended permit
+// or deny. Junos rejects an interface in two zones; a security appliance must
+// not silently choose one.
+//
+// This validator restores that fail-CLOSED parity. It computes, per zone (in
+// sorted order for a deterministic first-reported error), the logical-interface
+// keys each zone-interface entry claims (zoneIfaceLogicalKeys — the same
+// base/unit expansion buildInterfaceZoneMap performs) and rejects the first key
+// claimed by two different zones, naming the interface and BOTH conflicting
+// zones. Listing the same interface twice WITHIN one zone is harmless (a
+// repeated `set`) and is not flagged. Two distinct units of one physical
+// interface in two zones (a valid VLAN split) is NOT flagged — see
+// zoneIfaceLogicalKeys.
+//
+// Strict on the commit / commit-check path (CompileConfig — hard-reject);
+// downgraded to a cfg.Warnings entry on the tolerant load / peer-sync paths
+// (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientZoneInterfaceMembership) so an already-persisted or peer-synced config
+// that an older binary accepted still BOOTS (#1960 fail-closed-on-load
+// doctrine). On that tolerant path behavior is unchanged and deterministic:
+// buildInterfaceZoneMap keeps its first-writer-wins (sorted-zone) resolution, so
+// the leniently-loaded config forwards exactly as it did before this gate
+// existed — just with an operator-visible warning.
+func validateZoneInterfaceMembershipStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	type claim struct {
+		zone string
+		raw  string
+	}
+	owner := make(map[string]claim)
+	zoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		zoneNames = append(zoneNames, name)
+	}
+	sort.Strings(zoneNames)
+	for _, zoneName := range zoneNames {
+		zone := cfg.Security.Zones[zoneName]
+		if zone == nil {
+			continue
+		}
+		for _, iface := range zone.Interfaces {
+			if iface == "" {
+				continue
+			}
+			for _, key := range zoneIfaceLogicalKeys(cfg, iface) {
+				prev, exists := owner[key]
+				if exists {
+					if prev.zone != zoneName {
+						return fmt.Errorf(
+							"interface %q is assigned to security zones %q and %q; an interface must belong to exactly one security zone (the dataplane silently resolves a multi-zone interface to whichever zone name sorts first, evaluating traffic against the wrong zone's policy) — remove it from one zone",
+							iface, prev.zone, zoneName)
+					}
+					// Same zone (repeated set, or base/unit overlap within
+					// one zone): keep the first claim, not a conflict.
+					continue
+				}
+				owner[key] = claim{zone: zoneName, raw: iface}
+			}
+		}
 	}
 	return nil
 }

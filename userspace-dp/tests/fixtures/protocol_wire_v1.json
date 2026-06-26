@@ -509,7 +509,8 @@
     "source_except": false,
     "source_ports": [],
     "source_ports_except": [],
-    "tcp_flags": null
+    "tcp_flags": null,
+    "tcp_flags_forbidden": null
   },
   "flow_export_snapshot": {
     "active_timeout": 0,

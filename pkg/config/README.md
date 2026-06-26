@@ -36,6 +36,16 @@ nothing internal.
   Note: this is the **AST → typed Go struct** stage; the BPF-map
   compilation (zones, policies, NAT IDs, etc.) happens later in
   `pkg/dataplane.Manager.Compile`.
+  This stage also performs a few **fail-closed semantic checks** that the
+  `setSchema` typed-leaf gate cannot express. `compileFirewall` rejects a
+  firewall-filter `from tcp-flags` expression the conjunctive dataplane
+  matcher cannot enforce — disjunction (`|`), a negated group (`!(...)`),
+  an unknown flag, or a contradictory required/forbidden pair (#3076) —
+  via `ParseTCPFlagsExpression` (`tcp_flags.go`). Before this gate such an
+  expression committed cleanly and the constraint was silently dropped on
+  the wire (the term matched regardless of flags — a fail-open hole); a
+  representable expression such as `syn & !ack` is parsed into
+  required-bits + forbidden-bits masks and carried to the dataplane.
 - `ValueType` — `value_type.go`. Classifies a typed leaf's value
   (`ValueRate`, `ValueByteSizeOrPercent`, `ValueEnumOf`, ...) and supplies
   the `?`-completion placeholder via `Placeholder()`. Lives here (not
@@ -156,6 +166,25 @@ path downgrades to a warning AND `compilePolicy` defaults an actionless
 policy's `Action` to `PolicyDeny`, so a leniently-loaded bad config fails
 closed rather than open. See `docs/config-schema.md` "#3043".
 
+**An interface belongs to exactly one security zone (#3072):**
+`pkg/dataplane/userspace.buildInterfaceZoneMap` builds the interface->zone
+lookup by iterating zone names in SORTED order and writing each interface
+(plus its base/unit aliases) first-writer-wins. An interface listed under
+two zones was therefore silently accepted at commit and resolved to
+whichever zone name sorts first — independent of operator intent — so
+traffic was evaluated against the wrong zone's policy.
+`validateZoneInterfaceMembershipStrict` (`compiler_validate_strict.go`)
+hard-rejects a config that assigns the same interface to more than one
+zone, naming the interface and both conflicting zones; the tolerant
+load/peer-sync path downgrades to a warning
+(`lenientZoneInterfaceMembership`) so an already-persisted or peer-synced
+config still boots (`buildInterfaceZoneMap` keeps its deterministic
+first-writer-wins resolution, so the leniently-loaded config forwards
+exactly as before). Two DIFFERENT units of one physical interface in two
+zones (`ge-0/0/0.0` in trust, `ge-0/0/0.1` in untrust — a valid VLAN
+split) are NOT rejected; a bare physical interface and one of its units
+across zones ARE (same logical interface). Same fail-closed-on-load
+doctrine as #3043/#2401.
 **No-match default-policy is fail-closed (#3065):** the sibling of #3043
 for the implicit fallback. When a flow matches NO zone-pair, global, or
 default policy, the verdict is `SecurityConfig.DefaultPolicy`. Because the
@@ -186,6 +215,34 @@ safe on the tolerant load/peer-sync path (the missing profile still fails
 open), so that path only downgrades to a warning to preserve #1960 no-brick
 boot — the strict commit gate, which keeps a bad reference from ever reaching
 the dataplane, is the real fix.
+
+**Reserved zone names are rejected at definition (#3055):** a `security zones
+security-zone <name>` whose name is a reserved sentinel — `junos-global`, `any`,
+or `junos-host` — historically compiled cleanly. `junos-global` is the
+device-wide global-policy sentinel: the userspace dataplane
+(`userspace-dp/src/policy.rs`) string-matches a from-zone/to-zone literally
+equal to `junos-global` and reclassifies the policy as a global fallback
+(`JUNOS_GLOBAL_ZONE_ID = u16::MAX`) evaluated for EVERY flow, so an
+operator-defined zone of that name silently turns its zone-scoped policies into
+device-wide permits across unrelated zone pairs — a security-boundary escape.
+`any`/`junos-host` are reserved policy context tokens that must likewise never
+be a real zone name. `validateReservedZoneNamesStrict`
+(`compiler_validate_strict.go`) hard-rejects such a definition at commit. The
+DEFINITION-reject set (`reservedZoneNames` = `{junos-global, any, junos-host}`)
+is DELIBERATELY DISTINCT from the zone-REFERENCE exemption set
+(`policyZoneSpecialTokens` = `{"", any, junos-host}`, unchanged from #2401): the
+two gates are mutually reinforcing and must NOT be unified. `policyZoneSpecialTokens`
+must keep OMITTING `junos-global` — a policy that *references* `from-zone
+junos-global` / `to-zone junos-global` against no defined zone stays hard-rejected
+(and warned) by the #2401 reference gate. Making it reference-exempt would let
+the reference reach the dataplane, which (`policy.rs:1021`) then classifies it as
+a device-wide global rule — re-opening the exact fail-open this gate closes.
+Because the definition gate guarantees no zone named `junos-global` can exist, an
+explicit `junos-global` reference is always the bug, never a legitimate
+named-zone use. The tolerant load/peer-sync path downgrades the definition gate
+to a warning (`lenientReservedZoneNames`) so an already-persisted or peer-synced
+config an older binary accepted still boots — #1960 no-brick doctrine, same as
+#3066/#2401.
 
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
