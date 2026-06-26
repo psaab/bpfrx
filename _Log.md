@@ -13,6 +13,63 @@
   screen-flag contract is untouched. Updated `pkg/logging/README.md` Gotchas.
 - **File(s)**: pkg/logging/ringbuf.go, pkg/logging/protoname_test.go,
   pkg/logging/README.md, _Log.md
+## 2026-06-25 — #3067: ICMP pseudo-port only for identifier-bearing query types
+
+- **Timestamp**: 2026-06-25
+- **Action**: `parse_flow_ports` no longer treats ICMP/ICMPv6 header bytes
+  [l4+4, l4+6) as a pseudo source port for ALL ICMP types. Those bytes are
+  the Identifier only for the query types (ICMPv4 Echo + Timestamp +
+  Information, ICMPv6 Echo). For errors / Redirect / ND-MLD the same bytes
+  are a gateway address / next-hop MTU / pointer / unused field. The arm now
+  reads the type byte at `l4` (bounded by `declared_end`) and returns `None`
+  (flowless) for every non-query type, so transit ICMP control packets take
+  the route-based session-less path instead of installing a bogus
+  identifier-keyed session (session-table pollution / spurious collisions).
+  Matching ICMP errors to the embedded inner flow stays out of scope (#2393).
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs (fix),
+  userspace-dp/src/afxdp/frame/inspect_tests.rs (5 new tests, fail-on-revert
+  RED→GREEN verified), userspace-dp/src/afxdp/frame/README.md,
+  userspace-dp/src/filter/README.md (doc), _Log.md
+- **Validation**: `cargo build --release -p xpf-userspace-dp` clean;
+  `cargo test --release inspect` 36 passed; reverting the type
+  discrimination turns the two non-query assertions RED while echo stays
+  green.
+
+## 2026-06-25 — #3055: reject a security zone using a reserved sentinel name
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added a commit-time strict validator
+  (`validateReservedZoneNamesStrict`) that hard-rejects a `security zones
+  security-zone <name>` whose name is a reserved sentinel — `junos-global`,
+  `any`, or `junos-host`. A zone literally named `junos-global` was accepted at
+  commit, but `userspace-dp/src/policy.rs` string-matches a from/to-zone equal
+  to `junos-global` and reclassifies the policy as a device-wide global fallback
+  (`JUNOS_GLOBAL_ZONE_ID = u16::MAX`) evaluated for every flow — so the zone's
+  scoped policies silently became device-wide permits across unrelated zone
+  pairs (security-boundary escape). Introduced `reservedZoneNames`
+  (`{junos-global, any, junos-host}`) used ONLY by the new definition gate.
+  Strict on commit/commit-check; downgraded to a warning on the tolerant
+  load/peer-sync paths via `lenientReservedZoneNames` (#1960 no-brick),
+  mirroring the #3066/#2401 pattern.
+- **Review fold (hostile review, MERGE-NEEDS-MINOR)**: the first cut
+  re-derived `policyZoneSpecialTokens` (the #2401 zone-REFERENCE exemption set)
+  from `reservedZoneNames`, which silently ADDED `junos-global` to the
+  reference-exempt set — re-opening the device-wide-permit class via the
+  reference path (an undefined `from-zone junos-global` reference would become
+  exempt and reach `policy.rs:1021`). DECOUPLED the two sets: the
+  reference-exempt set is reverted to its exact master literal `{"", any,
+  junos-host}` (still OMITS junos-global, so such a reference stays
+  hard-rejected + warned). Added `TestJunosGlobalNotReferenceExempt` to pin the
+  decoupling against a future re-unify.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/reserved_zone_name_3055_test.go,
+  pkg/config/README.md, _Log.md
+- **Validation**: `go build ./...`, `go vet ./pkg/config/...`,
+  `go test ./pkg/config/...` (1519 passed), `gofmt -l` clean. Fail-on-revert
+  confirmed: (a) stubbing `validateReservedZoneNamesStrict` to `return nil`
+  turns the three definition reject/lenient tests RED while the ordinary-name
+  test stays GREEN; (b) re-unifying `policyZoneSpecialTokens` with
+  `reservedZoneNames` turns `TestJunosGlobalNotReferenceExempt` RED.
 
 ## 2026-06-25 — #3072: reject an interface assigned to multiple security zones
 

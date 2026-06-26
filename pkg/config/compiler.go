@@ -657,6 +657,19 @@ type compileOpts struct {
 	// is the real fix; the warning is the only signal on a leniently-loaded
 	// config. Same doctrine as lenientPolicyZoneRefs.
 	lenientScreenProfileRefs bool
+	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
+	// definition gate (validateReservedZoneNamesStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a `security zones security-zone <name>` whose name is a
+	// reserved sentinel ("junos-global", "any", "junos-host"). A zone named
+	// "junos-global" is reclassified by the userspace dataplane
+	// (userspace-dp/src/policy.rs) as a device-wide global fallback evaluated
+	// for every flow, so its zone-scoped policies silently permit traffic for
+	// unrelated zone pairs — a security-boundary escape. The tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config an older binary accepted still BOOTS (#1960 no-brick).
+	// Same doctrine as lenientPolicyZoneRefs.
+	lenientReservedZoneNames bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -718,6 +731,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientSNMPTrapGroup:               true,
 		lenientPolicyTerminalAction:        true,
 		lenientScreenProfileRefs:           true,
+		lenientReservedZoneNames:           true,
 	})
 }
 
@@ -830,6 +844,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientSNMPTrapGroup:               true,
 		lenientPolicyTerminalAction:        true,
 		lenientScreenProfileRefs:           true,
+		lenientReservedZoneNames:           true,
 	})
 }
 
@@ -1241,6 +1256,24 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientScreenProfileRefs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("zone screen profile reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3055 reserved zone-name definition gate. Strict on commit / commit-check
+	// (hard-reject a `security zones security-zone <name>` whose name is a
+	// reserved sentinel — "junos-global" is reclassified by the userspace
+	// dataplane as a device-wide global fallback evaluated for every flow, so a
+	// zone of that name silently turns its zone-scoped policies into global
+	// permits across unrelated zone pairs; "any"/"junos-host" are reserved
+	// policy context tokens); lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config an older binary accepted still
+	// boots — #1960 no-brick).
+	if err := validateReservedZoneNamesStrict(cfg); err != nil {
+		if opts.lenientReservedZoneNames {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("reserved zone name (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

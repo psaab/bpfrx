@@ -289,3 +289,103 @@ fn meta_fast_path_oversized_ihl_truncated_buffer_no_panic() {
         "meta fast path must not panic on an oversized IHL truncated frame"
     );
 }
+
+// ---- #3067: ICMP identifier is a pseudo-port ONLY for query types ----
+//
+// `parse_flow_ports` reads bytes [l4+4, l4+6) of the ICMP/ICMPv6 header as a
+// pseudo source port. Those two bytes are the Identifier ONLY for the query
+// types (Echo, and for ICMPv4 the Timestamp/Information pairs). For error and
+// control types (Dest-Unreachable, Packet-Too-Big, Time-Exceeded,
+// Parameter-Problem, Redirect, ND/MLD) they are part of a gateway address /
+// next-hop MTU / pointer / unused field — NOT a port — so treating them as one
+// installed bogus identifier-keyed sessions for transit ICMP control traffic.
+// These tests pin the type discrimination. Reverting it (back to an
+// unconditional `Some((ident, 0))`) turns the non-query assertions RED.
+
+/// Build an 8-byte ICMP/ICMPv6 header L4 payload: type, code, 2-byte checksum,
+/// then a 2-byte "identifier" word (bytes [4..6]) and a 2-byte sequence word.
+fn icmp_l4(icmp_type: u8, ident: u16) -> [u8; 8] {
+    let id = ident.to_be_bytes();
+    [icmp_type, 0x00, 0x00, 0x00, id[0], id[1], 0x00, 0x01]
+}
+
+const ICMP_IDENT: u16 = 0xABCD;
+// Reachable l4/declared_end for the helper-built frames: eth(14) + IP header.
+const V4_ICMP_L4: usize = 14 + 20;
+const V6_ICMP_L4: usize = 14 + 40;
+
+#[test]
+fn icmpv4_echo_request_reply_still_yields_identifier_pseudo_port() {
+    for icmp_type in [8u8, 0u8] {
+        let frame = v4_frame(PROTO_ICMP, 28, &icmp_l4(icmp_type, ICMP_IDENT));
+        let declared_end = ipv4_declared_l3_end(&frame, 14).expect("v4 declared end");
+        assert_eq!(
+            parse_flow_ports(&frame, V4_ICMP_L4, PROTO_ICMP, declared_end),
+            Some((ICMP_IDENT, 0)),
+            "ICMPv4 echo type {icmp_type} must still carry the identifier as the pseudo-port"
+        );
+    }
+}
+
+#[test]
+fn icmpv4_timestamp_information_query_types_yield_identifier() {
+    // RFC 792 query types whose Identifier sits at the same [4..6] offset.
+    for icmp_type in [13u8, 14u8, 15u8, 16u8] {
+        let frame = v4_frame(PROTO_ICMP, 28, &icmp_l4(icmp_type, ICMP_IDENT));
+        let declared_end = ipv4_declared_l3_end(&frame, 14).unwrap();
+        assert_eq!(
+            parse_flow_ports(&frame, V4_ICMP_L4, PROTO_ICMP, declared_end),
+            Some((ICMP_IDENT, 0)),
+            "ICMPv4 query type {icmp_type} carries an identifier at [4..6]"
+        );
+    }
+}
+
+#[test]
+fn icmpv4_error_control_types_yield_no_pseudo_port() {
+    // Dest-Unreachable (3), Time-Exceeded (11), Parameter-Problem (12),
+    // Redirect (5). Bytes [4..6] here are NOT an identifier — they are part of
+    // the unused word / gateway address / pointer. Must be flowless (None) so
+    // no bogus identifier-keyed session is installed.
+    for icmp_type in [3u8, 5u8, 11u8, 12u8] {
+        // The "identifier" bytes are present in the slice (proving the old
+        // unconditional read would have returned them as a fake port).
+        let frame = v4_frame(PROTO_ICMP, 28, &icmp_l4(icmp_type, ICMP_IDENT));
+        let declared_end = ipv4_declared_l3_end(&frame, 14).unwrap();
+        assert_eq!(
+            parse_flow_ports(&frame, V4_ICMP_L4, PROTO_ICMP, declared_end),
+            None,
+            "ICMPv4 error/control type {icmp_type} must NOT install a pseudo-port"
+        );
+    }
+}
+
+#[test]
+fn icmpv6_echo_request_reply_still_yields_identifier_pseudo_port() {
+    for icmp_type in [128u8, 129u8] {
+        let frame = v6_frame(PROTO_ICMPV6, 8, &icmp_l4(icmp_type, ICMP_IDENT));
+        let declared_end = ipv6_declared_l3_end(&frame, 14).expect("v6 declared end");
+        assert_eq!(
+            parse_flow_ports(&frame, V6_ICMP_L4, PROTO_ICMPV6, declared_end),
+            Some((ICMP_IDENT, 0)),
+            "ICMPv6 echo type {icmp_type} must still carry the identifier as the pseudo-port"
+        );
+    }
+}
+
+#[test]
+fn icmpv6_packet_too_big_redirect_nd_yield_no_pseudo_port() {
+    // Packet-Too-Big (2) — bytes [4..6] are the high half of the next-hop MTU.
+    // Dest-Unreachable (1), Time-Exceeded (3), Parameter-Problem (4),
+    // Redirect (137), Router/Neighbor Solicit/Advert (133..136). None is an
+    // identifier-bearing query type -> flowless.
+    for icmp_type in [1u8, 2u8, 3u8, 4u8, 133u8, 134u8, 135u8, 136u8, 137u8] {
+        let frame = v6_frame(PROTO_ICMPV6, 8, &icmp_l4(icmp_type, ICMP_IDENT));
+        let declared_end = ipv6_declared_l3_end(&frame, 14).unwrap();
+        assert_eq!(
+            parse_flow_ports(&frame, V6_ICMP_L4, PROTO_ICMPV6, declared_end),
+            None,
+            "ICMPv6 error/control/ND type {icmp_type} must NOT install a pseudo-port"
+        );
+    }
+}
