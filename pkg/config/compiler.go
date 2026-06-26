@@ -484,6 +484,20 @@ type compileOpts struct {
 	// leniently-loaded over-cap config is inert (the overflow zones do not
 	// forward) rather than mis-attributed. Same doctrine as lenientPolicyZoneRefs.
 	lenientZoneCount bool
+	// lenientZoneInterfaceMembership (#3072) downgrades the zone-interface
+	// membership gate (validateZoneInterfaceMembershipStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit / commit-check
+	// path hard-rejects a config that assigns the same interface to more than
+	// one security zone — pkg/dataplane/userspace.buildInterfaceZoneMap resolves
+	// such a duplicate first-writer-wins over the SORTED zone names, so the
+	// interface silently lands in whichever zone sorts first and traffic is
+	// evaluated against the wrong zone's policy. The tolerant load / peer-sync
+	// paths downgrade to a warning so an already-persisted or peer-synced config
+	// an older binary accepted still BOOTS (#1960 no-brick) — buildInterfaceZoneMap
+	// keeps its deterministic first-writer-wins resolution, so the leniently-
+	// loaded config forwards exactly as before, just with an operator-visible
+	// warning. Same doctrine as lenientPolicyZoneRefs.
+	lenientZoneInterfaceMembership bool
 	// lenientDestNATAddresses (#2396) downgrades the destination-NAT
 	// destination-address gate (validateDestinationNATAddressesStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -676,6 +690,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientWireguardPeers:              true,
 		lenientPolicyZoneRefs:              true,
 		lenientZoneCount:                   true,
+		lenientZoneInterfaceMembership:     true,
 		lenientDestNATAddresses:            true,
 		lenientRPMSourceAddress:            true,
 		lenientRPMLinkLocalZone:            true,
@@ -786,6 +801,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientWireguardPeers:              true,
 		lenientPolicyZoneRefs:              true,
 		lenientZoneCount:                   true,
+		lenientZoneInterfaceMembership:     true,
 		lenientDestNATAddresses:            true,
 		lenientRPMSourceAddress:            true,
 		lenientRPMLinkLocalZone:            true,
@@ -1198,6 +1214,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientZoneCount {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("zone count (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3072 zone-interface membership gate. Strict on commit / commit-check
+	// (hard-reject a config that assigns the same interface to more than one
+	// security zone — the userspace interface->zone map resolves a duplicate
+	// first-writer-wins over the SORTED zone names, so the interface silently
+	// lands in whichever zone sorts first and traffic is evaluated against the
+	// wrong zone's policy); lenient on load / peer-sync (warn so an already-
+	// persisted or peer-synced config still boots — #1960 no-brick; the
+	// interface->zone map keeps its deterministic first-writer-wins resolution,
+	// so a leniently-loaded duplicate forwards exactly as before). Runs AFTER the
+	// zone-count gate so a structural / policy / zone-count error still wins the
+	// first-error slot.
+	if err := validateZoneInterfaceMembershipStrict(cfg); err != nil {
+		if opts.lenientZoneInterfaceMembership {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("zone interface membership (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

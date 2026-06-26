@@ -1725,6 +1725,125 @@ func validateZoneCountStrict(cfg *Config) error {
 	return nil
 }
 
+// zoneIfaceLogicalKeys returns the set of effective logical-interface keys a
+// single `set security zones security-zone <z> interfaces <iface>` entry
+// claims, mirroring how pkg/dataplane/userspace.buildInterfaceZoneMap expands a
+// zone-interface entry into the userspace interface->zone lookup (#3072). It is
+// the conflict-detection counterpart of that expansion: two zones whose key
+// sets intersect would map the same physical/logical interface to two zone ids,
+// which buildInterfaceZoneMap silently resolves first-writer-wins over the
+// sorted zone names.
+//
+//   - A unit-qualified entry (`base.unit`, e.g. `ge-0/0/0.0`) claims exactly the
+//     one logical unit key `base.unit`. It deliberately does NOT claim the bare
+//     `base` key: two DIFFERENT units of one physical interface in two zones
+//     (`ge-0/0/0.0` in trust, `ge-0/0/0.1` in untrust) is a valid VLAN sub-
+//     interface split and must not be rejected. (buildInterfaceZoneMap's bare
+//     `base` fallback for untagged lookups is a coarse first-writer-wins
+//     artifact, not an operator-visible second assignment.)
+//   - A bare entry (`base`, no unit) claims the whole physical interface: the
+//     bare key `base` plus every configured unit `base.<n>` from
+//     cfg.Interfaces. Listing the same physical interface bare in two zones, or
+//     bare in one zone and a unit of it in another, is a genuine multi-zone
+//     assignment.
+//
+// A trailing-dot form (`base.`) is treated as bare (no specific unit), matching
+// buildInterfaceZoneMap which falls through to the unit-expansion branch when
+// the unit token is empty.
+func zoneIfaceLogicalKeys(cfg *Config, iface string) []string {
+	base, unit, ok := strings.Cut(iface, ".")
+	if ok && unit != "" {
+		return []string{base + "." + unit}
+	}
+	// Bare interface: claim the physical interface and all its configured units.
+	if base == "" {
+		base = iface
+	}
+	keys := []string{base}
+	if cfg != nil {
+		if ifCfg := cfg.Interfaces.Interfaces[base]; ifCfg != nil {
+			for unitNum := range ifCfg.Units {
+				keys = append(keys, fmt.Sprintf("%s.%d", base, unitNum))
+			}
+		}
+	}
+	return keys
+}
+
+// validateZoneInterfaceMembershipStrict hard-rejects a configuration that
+// assigns the same interface to more than one security zone (#3072).
+//
+// pkg/dataplane/userspace.buildInterfaceZoneMap builds the interface->zone
+// lookup by iterating the zone names in SORTED order and writing each interface
+// (plus its base/unit aliases) first-writer-wins. So an interface listed under
+// two zones is silently accepted at commit and resolved to whichever zone name
+// sorts first — independent of operator intent or config order. A packet that
+// should be evaluated as `trust -> untrust` is instead evaluated as
+// `aaa -> untrust` purely because "aaa" < "trust", causing an unintended permit
+// or deny. Junos rejects an interface in two zones; a security appliance must
+// not silently choose one.
+//
+// This validator restores that fail-CLOSED parity. It computes, per zone (in
+// sorted order for a deterministic first-reported error), the logical-interface
+// keys each zone-interface entry claims (zoneIfaceLogicalKeys — the same
+// base/unit expansion buildInterfaceZoneMap performs) and rejects the first key
+// claimed by two different zones, naming the interface and BOTH conflicting
+// zones. Listing the same interface twice WITHIN one zone is harmless (a
+// repeated `set`) and is not flagged. Two distinct units of one physical
+// interface in two zones (a valid VLAN split) is NOT flagged — see
+// zoneIfaceLogicalKeys.
+//
+// Strict on the commit / commit-check path (CompileConfig — hard-reject);
+// downgraded to a cfg.Warnings entry on the tolerant load / peer-sync paths
+// (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientZoneInterfaceMembership) so an already-persisted or peer-synced config
+// that an older binary accepted still BOOTS (#1960 fail-closed-on-load
+// doctrine). On that tolerant path behavior is unchanged and deterministic:
+// buildInterfaceZoneMap keeps its first-writer-wins (sorted-zone) resolution, so
+// the leniently-loaded config forwards exactly as it did before this gate
+// existed — just with an operator-visible warning.
+func validateZoneInterfaceMembershipStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	type claim struct {
+		zone string
+		raw  string
+	}
+	owner := make(map[string]claim)
+	zoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		zoneNames = append(zoneNames, name)
+	}
+	sort.Strings(zoneNames)
+	for _, zoneName := range zoneNames {
+		zone := cfg.Security.Zones[zoneName]
+		if zone == nil {
+			continue
+		}
+		for _, iface := range zone.Interfaces {
+			if iface == "" {
+				continue
+			}
+			for _, key := range zoneIfaceLogicalKeys(cfg, iface) {
+				prev, exists := owner[key]
+				if exists {
+					if prev.zone != zoneName {
+						return fmt.Errorf(
+							"interface %q is assigned to security zones %q and %q; an interface must belong to exactly one security zone (the dataplane silently resolves a multi-zone interface to whichever zone name sorts first, evaluating traffic against the wrong zone's policy) — remove it from one zone",
+							iface, prev.zone, zoneName)
+					}
+					// Same zone (repeated set, or base/unit overlap within
+					// one zone): keep the first claim, not a conflict.
+					continue
+				}
+				owner[key] = claim{zone: zoneName, raw: iface}
+			}
+		}
+	}
+	return nil
+}
+
 // validateApplicationSpecsStrict hard-rejects a user-defined application
 // (`set applications application <name> ...`) whose destination-port /
 // source-port is malformed (not a valid numeric port, port range, or known
