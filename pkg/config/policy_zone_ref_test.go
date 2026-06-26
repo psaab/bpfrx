@@ -77,10 +77,12 @@ func TestPolicySpecialZoneTokensCommit(t *testing.T) {
 		"set security zones security-zone trust",
 		// junos-host self-traffic context on both sides
 		"set security policies from-zone trust to-zone junos-host policy host match source-address any",
+		"set security policies from-zone trust to-zone junos-host policy host match destination-address any",
 		"set security policies from-zone trust to-zone junos-host policy host match application any",
 		"set security policies from-zone trust to-zone junos-host policy host then permit",
 		// a global policy (no from/to-zone) must not be flagged
 		"set security policies global policy g match source-address any",
+		"set security policies global policy g match destination-address any",
 		"set security policies global policy g match application any",
 		"set security policies global policy g then permit",
 	})
@@ -115,6 +117,7 @@ func TestPolicyWildcardZoneFailsCommit(t *testing.T) {
 			cmds: []string{
 				"set security zones security-zone trust",
 				"set security policies from-zone any to-zone trust policy P match source-address any",
+				"set security policies from-zone any to-zone trust policy P match destination-address any",
 				"set security policies from-zone any to-zone trust policy P match application any",
 				"set security policies from-zone any to-zone trust policy P then deny",
 			},
@@ -125,6 +128,7 @@ func TestPolicyWildcardZoneFailsCommit(t *testing.T) {
 			cmds: []string{
 				"set security zones security-zone trust",
 				"set security policies from-zone trust to-zone any policy P match source-address any",
+				"set security policies from-zone trust to-zone any policy P match destination-address any",
 				"set security policies from-zone trust to-zone any policy P match application any",
 				"set security policies from-zone trust to-zone any policy P then permit",
 			},
@@ -187,6 +191,7 @@ func TestPolicyJunosHostNoWarningOrReject(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set security zones security-zone trust",
 		"set security policies from-zone trust to-zone junos-host policy host match source-address any",
+		"set security policies from-zone trust to-zone junos-host policy host match destination-address any",
 		"set security policies from-zone trust to-zone junos-host policy host match application any",
 		"set security policies from-zone trust to-zone junos-host policy host then permit",
 	})

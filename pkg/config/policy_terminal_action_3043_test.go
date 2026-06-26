@@ -53,6 +53,7 @@ func TestGlobalPolicyNoTerminalActionFailsCommit(t *testing.T) {
 	cmds := []string{
 		"set security policies global policy g match source-address any",
 		"set security policies global policy g match destination-address any",
+		"set security policies global policy g match application any",
 		"set security policies global policy g then count",
 	}
 	tree := buildPolicyTree(t, cmds)

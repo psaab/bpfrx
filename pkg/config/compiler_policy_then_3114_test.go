@@ -116,8 +116,12 @@ func TestPolicyThenPermitBareStillCommits(t *testing.T) {
 			"set security zones security-zone trust",
 			"set security zones security-zone untrust",
 			"set security policies from-zone trust to-zone untrust policy d1 match source-address any",
+			"set security policies from-zone trust to-zone untrust policy d1 match destination-address any",
+			"set security policies from-zone trust to-zone untrust policy d1 match application any",
 			"set security policies from-zone trust to-zone untrust policy d1 then deny",
 			"set security policies from-zone trust to-zone untrust policy r1 match source-address any",
+			"set security policies from-zone trust to-zone untrust policy r1 match destination-address any",
+			"set security policies from-zone trust to-zone untrust policy r1 match application any",
 			"set security policies from-zone trust to-zone untrust policy r1 then reject",
 		)
 		if _, err := CompileConfig(tree); err != nil {
@@ -127,6 +131,8 @@ func TestPolicyThenPermitBareStillCommits(t *testing.T) {
 	t.Run("global bare permit", func(t *testing.T) {
 		tree := buildPolicyThenTree(t,
 			"set security policies global policy g1 match source-address any",
+			"set security policies global policy g1 match destination-address any",
+			"set security policies global policy g1 match application any",
 			"set security policies global policy g1 then permit",
 		)
 		if _, err := CompileConfig(tree); err != nil {

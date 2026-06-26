@@ -440,6 +440,41 @@ follow-up. The tolerant load/peer-sync path downgrades to a warning
 binary silently accepted still boots — the modifier stays dropped (the pre-existing
 behaviour), now flagged (#1960 no-brick doctrine, same as #3114).
 
+**Security policies missing a required `match` criterion are rejected at commit
+(#3044 — codex-review-061 finding 061-03):** Junos/vSRX requires every security
+policy `match` clause to specify all three core dimensions — `source-address`,
+`destination-address`, AND `application`; a policy missing any of them (or omitting
+the `match` block entirely) cannot commit. xpf's policy compiler (`compilePolicy`,
+`compiler_security.go`) instead treated the whole `match` block — and every leaf
+within it — as OPTIONAL: each field is filled only when the leaf is present, and an
+absent dimension simply left the corresponding slice empty. The userspace dataplane
+then interprets an empty slice as match-ANY (`capabilities.go` returns a nil app-term
+list for "no apps"; `userspace-dp/src/policy.rs` compiles an empty app list as
+`match_any:true` and defaults `source/destination_*_match_any` to true when the
+literal+book sets are empty). A partial policy is therefore SILENTLY broader than
+typed: `match source-address corp; then permit` permits `corp -> any:any`, and a
+match-less policy becomes a zone-pair-wide permit/deny. A single dropped line in an
+automation template widens a narrow rule to all traffic — a fail-OPEN for a permit
+policy, an over-broad block for a deny. `validatePolicyRequiredMatchStrict`
+(`compiler_policy_missing_match.go`) hard-rejects a policy whose `match` omits a
+required dimension at commit, naming the policy scope (zone-pair or global), the
+policy, and EVERY missing dimension, and directing the operator to add it. A missing
+dimension is treated DIFFERENTLY from an explicit wildcard: the operator must write
+`any` (or `any-ipv4`/`any-ipv6`, an address-book name, a CIDR, a named
+application/application-set) — exactly as Junos demands. `source-address-excluded` /
+`destination-address-excluded` are MODIFIERS of the base address leaf, not
+substitutes, so they do not by themselves satisfy the source/destination-address
+requirement. It is an AST pre-walk in `compileExpanded` (not a typed validator) for
+the same reasons as #3113 — a missing leaf leaves no trace in the typed `*Config`
+(an empty slice is indistinguishable from an explicit-any that also resolves to
+match-any), and `SchemaValidate` cannot REJECT an absence. The walk runs on the
+group-expanded, inactive-pruned tree, so an apply-groups-inherited dimension counts
+and an `inactive:` policy is ignored. Both zone-pair and `global` policies are
+covered. The tolerant load/peer-sync path downgrades to a warning
+(`lenientPolicyMissingMatch`) so an already-persisted or peer-synced config an older
+binary silently accepted still boots — the policy keeps its match-any-for-missing
+compilation, now flagged (#1960 no-brick doctrine, same as #3113).
+
 **Ambiguous secure-tunnel `bind-interface` aliases are rejected at commit
 (#2933):** `security ipsec vpn <name> bind-interface` is a free-form 1-arg
 string stored verbatim on the typed VPN (`compiler_ipsec.go`); the runtime
