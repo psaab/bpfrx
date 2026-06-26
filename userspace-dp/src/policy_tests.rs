@@ -3134,3 +3134,206 @@ fn junos_host_policy_no_match_falls_through_to_today_behavior() {
         "unzoned ingress must not be eligible for junos-host policy"
     );
 }
+
+// ── #3073: established-session policy hit-count (per-packet) ──────────
+//
+// Before #3073 the per-rule packet/byte hit counter was incremented
+// exactly once per flow — on the cold (session-miss) path inside
+// `try_match_rule`. The established fast path
+// (`poll_descriptor`/`flow_cache_hit`) now resolves the admitting rule's
+// counter via `PolicyState::hit_counter_by_idx` (using the 1-based handle
+// carried on the session metadata) and calls `record_policy_hit_counter`
+// for EVERY packet. These tests exercise that resolution + counting
+// sequence at the mechanism level (driving the real poll loop would
+// require a full BindingWorker/WorkerContext).
+
+#[test]
+fn policy_hit_count_evaluation_emits_one_based_counter_handle() {
+    let rule_id = "security-policy:lan:wan:permit-web".to_string();
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            rule_id: rule_id.clone(),
+            name: "permit-web".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+
+    let res = evaluate_policy_result_with_len(
+        &state,
+        TEST_LAN_ZONE_ID,
+        TEST_WAN_ZONE_ID,
+        "10.0.61.100".parse().expect("src"),
+        "10.0.2.5".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        80,
+        100,
+    );
+    assert_eq!(res.action, PolicyAction::Permit);
+    // The sole configured rule sits at rules[0] -> 1-based handle 1.
+    assert_eq!(
+        res.policy_counter_idx, 1,
+        "the admitting rule must surface a non-zero (1-based) counter handle"
+    );
+    // The handle resolves back to that rule's counter.
+    assert!(
+        state.hit_counter_by_idx(res.policy_counter_idx).is_some(),
+        "the handle must resolve to the admitting rule's counter"
+    );
+    // The implicit default-deny (an unconfigured zone pair: wan->lan has no
+    // rule) carries NO handle, so the fast path counts nothing for it.
+    let defaulted = evaluate_policy_result_with_len(
+        &state,
+        TEST_WAN_ZONE_ID,
+        TEST_LAN_ZONE_ID,
+        "10.0.2.5".parse().expect("src"),
+        "10.0.61.100".parse().expect("dst"),
+        PROTO_TCP,
+        80,
+        12345,
+        100,
+    );
+    assert_eq!(defaulted.action, PolicyAction::Deny);
+    assert_eq!(
+        defaulted.policy_counter_idx, 0,
+        "the implicit default-policy must carry no per-rule counter handle"
+    );
+}
+
+#[test]
+fn hit_counter_by_idx_guards_sentinel_and_stale() {
+    let rule_id = "security-policy:lan:wan:permit-web".to_string();
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            rule_id,
+            name: "permit-web".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    // 0 = "no per-rule counter" sentinel.
+    assert!(state.hit_counter_by_idx(0).is_none());
+    // 1-based handle for the single rule resolves.
+    assert!(state.hit_counter_by_idx(1).is_some());
+    // A stale handle past the (now smaller) rule table resolves to None —
+    // never a panic, never a wrong-rule increment off the table end.
+    assert!(state.hit_counter_by_idx(2).is_none());
+    assert!(state.hit_counter_by_idx(u32::MAX).is_none());
+}
+
+#[test]
+fn policy_hit_count_counts_every_established_packet_not_just_first() {
+    let rule_id = "security-policy:lan:wan:permit-web".to_string();
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            rule_id: rule_id.clone(),
+            name: "permit-web".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+
+    // Packet 1: the cold (session-miss) path runs policy evaluation, which
+    // increments the counter once inside `try_match_rule` and hands back the
+    // counter handle to stamp on the new session.
+    const FIRST_LEN: u64 = 100;
+    let res = evaluate_policy_result_with_len(
+        &state,
+        TEST_LAN_ZONE_ID,
+        TEST_WAN_ZONE_ID,
+        "10.0.61.100".parse().expect("src"),
+        "10.0.2.5".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        80,
+        FIRST_LEN,
+    );
+    assert_eq!(res.action, PolicyAction::Permit);
+    assert_ne!(res.policy_counter_idx, 0);
+
+    // Packets 2..=N+1: the established fast path resolves the stamped handle
+    // and records each packet (this is the per-packet increment #3073 adds;
+    // reverting it makes this assertion read packets == 1 -> RED).
+    const N: u64 = 999;
+    const PKT_LEN: u64 = 1500;
+    for _ in 0..N {
+        let counter = state
+            .hit_counter_by_idx(res.policy_counter_idx)
+            .expect("stamped handle must resolve to the admitting rule");
+        record_policy_hit_counter(counter, PKT_LEN);
+    }
+
+    let snap = policy_counter(&state, &rule_id);
+    assert_eq!(
+        snap.packets,
+        N + 1,
+        "a long-lived flow must count the cold-path first packet PLUS every \
+         established fast-path packet (pre-#3073 this read 1)"
+    );
+    assert_eq!(
+        snap.bytes,
+        FIRST_LEN + N * PKT_LEN,
+        "byte counter must accumulate every packet's length, not just the \
+         first frame"
+    );
+}
+
+#[test]
+fn policy_hit_count_single_packet_flow_reads_one() {
+    // Back-compat: a flow whose only packet rides the cold path (no
+    // established follow-on packets) still reports exactly 1 packet and the
+    // first frame's bytes — identical to pre-#3073 behavior.
+    let rule_id = "security-policy:lan:wan:permit-web".to_string();
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            rule_id: rule_id.clone(),
+            name: "permit-web".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    let res = evaluate_policy_result_with_len(
+        &state,
+        TEST_LAN_ZONE_ID,
+        TEST_WAN_ZONE_ID,
+        "10.0.61.100".parse().expect("src"),
+        "10.0.2.5".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        80,
+        64,
+    );
+    assert_eq!(res.action, PolicyAction::Permit);
+    let snap = policy_counter(&state, &rule_id);
+    assert_eq!(snap.packets, 1, "single-packet flow must read exactly 1");
+    assert_eq!(snap.bytes, 64);
+}

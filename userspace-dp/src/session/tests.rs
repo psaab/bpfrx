@@ -69,6 +69,7 @@ fn metadata() -> SessionMetadata {
         log_session_close: false,
         policy_id: 0,
         inactivity_timeout_ns: None,
+        policy_counter_idx: 0,
     }
 }
 
@@ -172,6 +173,7 @@ fn session_expire_removes_stale_entries() {
 fn metadata_with_app_timeout(ns: u64) -> SessionMetadata {
     SessionMetadata {
         inactivity_timeout_ns: Some(ns),
+        policy_counter_idx: 0,
         ..metadata()
     }
 }

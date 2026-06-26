@@ -38,6 +38,7 @@ fn synced_forward_metadata() -> SessionMetadata {
         log_session_close: false,
         policy_id: 0,
         inactivity_timeout_ns: None,
+        policy_counter_idx: 0,
     }
 }
 
@@ -232,6 +233,7 @@ fn session_map_redirect_keys_for_forward_session_include_nat_aliases() {
         log_session_close: false,
         policy_id: 0,
         inactivity_timeout_ns: None,
+        policy_counter_idx: 0,
     };
 
     let keys = session_map_redirect_keys_for_session(

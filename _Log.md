@@ -1,3 +1,36 @@
+## 2026-06-26 — #3073 policy hit-count per-packet on the established fast path
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fixed `show security policies hit-count` reporting only the FIRST
+  frame of each flow. The per-rule packet/byte counter was incremented exactly
+  once per flow on the cold (session-miss) path in `try_match_rule`; the
+  established session fast path and flow-cache hit replay never re-counted the
+  admitting rule. Added a stable 1-based hit-counter handle
+  (`PolicyEvaluationResult.policy_counter_idx` → `SessionMetadata.policy_counter_idx`,
+  resolved by `PolicyState::hit_counter_by_idx`) stamped at install, and
+  re-count every established packet on both fast paths via a per-worker
+  thread-local coalescer (`record_policy_hit_counter` /
+  `flush_recorded_policy_hit_counters`, mirroring `filter::record_filter_counter`).
+  Cold path still counts the first packet once → exactly-once. Flow-cache seed
+  stamped with the real handle at population. Reverse traffic counts via the
+  reverse-companion/shared-materialize metadata inheritance. In-process only
+  (not on the HA wire yet, mirroring #3056). Coalescer flushed once per RX
+  batch beside the filter-counter flush.
+- **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+  userspace-dp/src/session/entry.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/{shared_ops,tunnel,neighbor_dispatch}.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs, userspace-dp/src/server/helpers.rs,
+  (+ test construction sites), docs/feature-gaps.md,
+  docs/pr/2118-policy-hit-count/plan.md, _Log.md
+- **Validation**: `cargo build --release` + `cargo test --release` (3184 passed,
+  0 failed) + `go build ./...`. Fail-on-revert: neutering
+  `record_policy_hit_counter` made
+  `policy_hit_count_counts_every_established_packet_not_just_first` read 1 (RED);
+  restored byte-identical.
 ## 2026-06-26 — #2962 HA: owner-RG export ack-wait off the ServerState lock
 
 - **Timestamp**: 2026-06-26

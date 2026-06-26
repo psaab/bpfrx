@@ -414,6 +414,18 @@ pub(crate) struct PolicyEvaluationResult {
     /// (the default-action path and any non-app-timeout match), which is
     /// byte-identical to pre-#3227 behavior.
     pub(crate) inactivity_timeout: Option<u32>,
+    /// #3073: a stable 1-based handle to the admitting rule's per-rule hit
+    /// counter (`PolicyState::rules[idx-1].hit_counter`), carried so the
+    /// session-install path can stamp it onto the session metadata. The
+    /// established fast path then resolves the counter via
+    /// [`PolicyState::hit_counter_by_idx`] and counts every packet of the
+    /// flow (not just the first). `0` means "no per-rule counter" — the
+    /// implicit default-policy result and every non-policy-forwarded session
+    /// (firewall-local / neighbor-seed / fabric / tunnel) — so those flows
+    /// keep counting nothing on the fast path. A 1-based handle is used so
+    /// `0` is an unambiguous sentinel distinct from rule index 0 (the FIRST
+    /// configured rule, which also carries `policy_id` 0).
+    pub(crate) policy_counter_idx: u32,
 }
 
 #[derive(Debug)]
@@ -562,6 +574,20 @@ impl PolicyRuleCounter {
         }
     }
 
+    /// #3073: coalesced multi-packet add used by the per-worker hit-count
+    /// flush (`flush_recorded_policy_hit_counters`). Folds a whole batch of
+    /// established-session fast-path packets into ONE pair of relaxed
+    /// `fetch_add`s on the shared counter, so the hot path never hammers the
+    /// shared cacheline per packet (mirrors `filter::FilterTermCounter`).
+    fn add_batch(&self, packets: u64, bytes: u64) {
+        if packets != 0 {
+            self.packets.fetch_add(packets, Ordering::Relaxed);
+        }
+        if bytes != 0 {
+            self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
     fn reset(&self) {
         self.packets.store(0, Ordering::Relaxed);
         self.bytes.store(0, Ordering::Relaxed);
@@ -610,6 +636,111 @@ impl PolicyCounterStore {
         counter
     }
 }
+
+// ── #3073: per-worker established-session policy hit-count coalescer ──
+//
+// Before #3073 the policy packet/byte hit counter was incremented exactly
+// ONCE per flow — on the cold (session-miss) path inside `try_match_rule`.
+// A permitted TCP session moving millions of packets therefore reported
+// `packets=1` and only the first frame's bytes, defeating audits and vSRX
+// parity. The established fast path (`poll_descriptor` session-hit and the
+// flow-cache hit replay) now increments the admitting policy's counter on
+// EVERY packet via `record_policy_hit_counter`.
+//
+// To keep the hot path off the shared counter cacheline, increments are
+// coalesced in a thread-local (per-worker) accumulator and folded into the
+// shared `PolicyRuleCounter` in batches — the SAME technique
+// `filter::record_filter_counter` uses for `then count` term counters. The
+// accumulator holds the current rule's counter `Arc`; a different rule (or
+// the per-batch `flush_recorded_policy_hit_counters` call at the end of the
+// RX batch) flushes the pending tally first. `Arc::ptr_eq` keeps the common
+// run of same-flow packets on a pure thread-local add.
+struct PendingPolicyHitRecord {
+    counter: Option<Arc<PolicyRuleCounter>>,
+    packets: u64,
+    bytes: u64,
+}
+
+impl Default for PendingPolicyHitRecord {
+    fn default() -> Self {
+        Self {
+            counter: None,
+            packets: 0,
+            bytes: 0,
+        }
+    }
+}
+
+#[cfg(not(test))]
+const POLICY_HIT_FLUSH_PACKETS: u64 = 64;
+
+#[cfg(not(test))]
+thread_local! {
+    static PENDING_POLICY_HIT_RECORD: std::cell::RefCell<PendingPolicyHitRecord> =
+        std::cell::RefCell::new(PendingPolicyHitRecord::default());
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn flush_pending_policy_hit_record(record: &mut PendingPolicyHitRecord) {
+    let Some(counter) = record.counter.take() else {
+        return;
+    };
+    counter.add_batch(record.packets, record.bytes);
+    record.packets = 0;
+    record.bytes = 0;
+}
+
+/// #3073: record one established-session packet against the admitting
+/// policy's hit counter, coalesced per worker. Called from the
+/// `poll_descriptor` session-hit fast path and the flow-cache hit replay —
+/// NOT the cold path, which already counts the first packet in
+/// `try_match_rule`, so every packet is counted exactly once.
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn record_policy_hit_counter(counter: &Arc<PolicyRuleCounter>, packet_bytes: u64) {
+    PENDING_POLICY_HIT_RECORD.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if pending
+            .counter
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, counter))
+        {
+            pending.packets = pending.packets.saturating_add(1);
+            pending.bytes = pending.bytes.saturating_add(packet_bytes);
+        } else {
+            flush_pending_policy_hit_record(&mut pending);
+            pending.counter = Some(counter.clone());
+            pending.packets = 1;
+            pending.bytes = packet_bytes;
+        }
+        if pending.packets >= POLICY_HIT_FLUSH_PACKETS {
+            flush_pending_policy_hit_record(&mut pending);
+        }
+    });
+}
+
+// In tests the coalescer is bypassed so a single recorded packet is
+// immediately visible in `counter_snapshots()` (deterministic assertions).
+#[cfg(test)]
+#[inline(always)]
+pub(crate) fn record_policy_hit_counter(counter: &Arc<PolicyRuleCounter>, packet_bytes: u64) {
+    counter.add(packet_bytes);
+}
+
+/// #3073: flush this worker's pending policy hit-count tally to the shared
+/// counters. Called once per RX batch (alongside
+/// `filter::flush_recorded_filter_counters`) so `show security policies
+/// hit-count` converges within one poll tick.
+#[cfg(not(test))]
+pub(crate) fn flush_recorded_policy_hit_counters() {
+    PENDING_POLICY_HIT_RECORD.with(|pending| {
+        flush_pending_policy_hit_record(&mut pending.borrow_mut());
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn flush_recorded_policy_hit_counters() {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PortRange {
@@ -945,6 +1076,25 @@ impl PolicyState {
             .iter()
             .map(|rule| rule.hit_counter.snapshot(&rule.rule_id))
             .collect()
+    }
+
+    /// #3073: resolve the 1-based hit-counter handle stamped onto a session at
+    /// install (`SessionMetadata::policy_counter_idx`) back to the admitting
+    /// rule's shared counter, so the established fast path can re-count every
+    /// packet of the flow. `0` (no counter) and any stale handle past the
+    /// current rule table (a config reload shrank the policy set) resolve to
+    /// `None` and are silently skipped — never a panic, never a wrong-rule
+    /// increment past the table end. A handle that still points within the
+    /// table after an unrelated config change may briefly attribute packets to
+    /// whatever rule now sits at that index; counters are advisory and this
+    /// only affects in-flight sessions across a live policy edit.
+    pub(crate) fn hit_counter_by_idx(&self, idx: u32) -> Option<&Arc<PolicyRuleCounter>> {
+        if idx == 0 {
+            return None;
+        }
+        self.rules
+            .get((idx - 1) as usize)
+            .map(|rule| &rule.hit_counter)
     }
 
     /// #1635: the set of concrete `(from_zone_id, to_zone_id)` pairs the
@@ -1442,7 +1592,7 @@ pub(crate) fn evaluate_policy_result_with_icmp(
         let key = zone_pair_key(from_id, to_id);
         if let Some(indices) = state.zone_pair_index.get(&key) {
             for &idx in indices {
-                if let Some(result) = try_match_rule(
+                if let Some(mut result) = try_match_rule(
                     &state.rules[idx],
                     state,
                     src_ip,
@@ -1453,12 +1603,15 @@ pub(crate) fn evaluate_policy_result_with_icmp(
                     packet_icmp,
                     packet_len,
                 ) {
+                    // #3073: 1-based handle so the fast path can re-count
+                    // every packet of this flow against the same counter.
+                    result.policy_counter_idx = (idx as u32).saturating_add(1);
                     return result;
                 }
             }
         }
         for &idx in &state.global_indices {
-            if let Some(result) = try_match_rule(
+            if let Some(mut result) = try_match_rule(
                 &state.rules[idx],
                 state,
                 src_ip,
@@ -1469,6 +1622,8 @@ pub(crate) fn evaluate_policy_result_with_icmp(
                 packet_icmp,
                 packet_len,
             ) {
+                // #3073: 1-based handle (see zone-pair branch above).
+                result.policy_counter_idx = (idx as u32).saturating_add(1);
                 return result;
             }
         }
@@ -1487,6 +1642,8 @@ pub(crate) fn evaluate_policy_result_with_icmp(
         // #3227: the implicit default policy carries no per-app timeout; the
         // session ages on the global per-protocol timeout (today's behavior).
         inactivity_timeout: None,
+        // #3073: the implicit default policy has no per-rule hit counter.
+        policy_counter_idx: 0,
     }
 }
 
@@ -1550,7 +1707,7 @@ pub(crate) fn evaluate_junos_host_policy(
     let key = zone_pair_key(from_id, JUNOS_HOST_ZONE_ID);
     let indices = state.zone_pair_index.get(&key)?;
     for &idx in indices {
-        if let Some(result) = try_match_rule(
+        if let Some(mut result) = try_match_rule(
             &state.rules[idx],
             state,
             src_ip,
@@ -1561,6 +1718,8 @@ pub(crate) fn evaluate_junos_host_policy(
             packet_icmp,
             packet_len,
         ) {
+            // #3073: 1-based handle (see `evaluate_policy_result_with_icmp`).
+            result.policy_counter_idx = (idx as u32).saturating_add(1);
             return Some(result);
         }
     }
@@ -1690,6 +1849,10 @@ fn try_match_rule(
             // #3227: surface the matched application term's idle timeout so the
             // install path can stamp it onto the admitted session.
             inactivity_timeout: app_inactivity_timeout,
+            // #3073: set by the caller (`evaluate_policy_result_with_icmp`),
+            // which knows this rule's stable index. `try_match_rule` itself
+            // has only `&rule`, so it leaves the sentinel here.
+            policy_counter_idx: 0,
         })
     } else {
         None

@@ -69,6 +69,25 @@ pub(crate) struct SessionMetadata {
     /// peer-promoted session ages on the global timeout until a real-traffic
     /// refresh re-stamps it (a deliberate follow-up).
     pub(crate) inactivity_timeout_ns: Option<u64>,
+    /// #3073: a stable 1-based handle to the admitting policy rule's per-rule
+    /// hit counter (`PolicyState::rules[idx-1].hit_counter`, resolved via
+    /// `PolicyState::hit_counter_by_idx`). Stamped at install from the matched
+    /// policy's `PolicyEvaluationResult.policy_counter_idx`. The established
+    /// fast path (`poll_descriptor` session-hit and the flow-cache hit replay)
+    /// uses it to increment the admitting policy's packet/byte counters on
+    /// EVERY packet, so `show security policies hit-count` reflects the traffic
+    /// the rule actually carries instead of only the first frame of each flow
+    /// (the pre-#3073 cold-path-only count). `0` means "no per-rule counter":
+    /// the implicit default-policy and every non-policy-forwarded session
+    /// (firewall-local / neighbor-seed / fabric / tunnel), which the fast path
+    /// then leaves uncounted. The cold path still counts the first packet once
+    /// in `try_match_rule`, so each packet is counted exactly once. In-process
+    /// only: like `policy_id` (#3056), this rides the shared-session map and
+    /// sibling-worker replicas but does NOT cross the cross-node HA
+    /// `SessionDeltaInfo` wire — a peer-promoted session counts nothing on the
+    /// promoting node's policy counter until a local re-evaluation re-stamps a
+    /// handle (a deliberate follow-up, mirroring the #3056 wire note).
+    pub(crate) policy_counter_idx: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

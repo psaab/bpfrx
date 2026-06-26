@@ -138,6 +138,21 @@ pub(super) fn stage_flow_cache_hit(
             .for_each(|counter| {
                 crate::filter::record_filter_counter(counter, meta.pkt_len as u64);
             });
+        // #3073: re-count this cached established-session packet against the
+        // admitting policy's hit counter, mirroring the `then count` filter
+        // replay above. This is the hot path for long-lived flows (most
+        // packets of a permitted flow are served from the flow cache), so
+        // without it `show security policies hit-count` would still show only
+        // the first frame. Counted before the policer/drop checks below to
+        // match the cold-path "count at policy match" semantics. The
+        // per-worker coalescer keeps it off the shared counter cacheline.
+        if let Some(counter) = worker_ctx
+            .forwarding
+            .policy
+            .hit_counter_by_idx(cached_metadata.policy_counter_idx)
+        {
+            crate::policy::record_policy_hit_counter(counter, meta.pkt_len as u64);
+        }
         let policer_action = crate::filter::apply_cached_three_color_policers(
             &cached_descriptor.tx_selection.three_color_policers,
             now_ns,

@@ -437,6 +437,12 @@ pub(super) fn poll_binding_process_descriptor(
                     .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
                 let mut session_ingress_zone: Option<u16> = None;
                 let mut flow_cache_owner_rg_id = 0i32;
+                // #3073: the admitting policy rule's 1-based hit-counter handle
+                // for this flow (0 = none). Set from the resolved session
+                // metadata (hit) or the install metadata (miss) below, then
+                // stamped onto the flow-cache entry so its hit path re-counts
+                // every cached packet against the same policy.
+                let mut flow_cache_policy_counter_idx: u32 = 0;
                 let mut apply_nat_on_fabric = false;
                 // #1861 §5.4: true when a session install was attempted
                 // for this packet's decision and refused (max_sessions).
@@ -479,6 +485,24 @@ pub(super) fn poll_binding_process_descriptor(
                     ) {
                         telemetry.counters.session_hits += 1;
                         telemetry.dbg.session_hit += 1;
+                        // #3073: re-count this established-session packet against
+                        // the admitting policy's hit counter. The cold path
+                        // counts the first packet in `try_match_rule`; this
+                        // covers every subsequent packet that hits the session
+                        // (and reply traffic on the reverse companion), so
+                        // `show security policies hit-count` reflects the real
+                        // load the rule carries — not just the first frame.
+                        // `resolve_flow_session_decision` never runs policy
+                        // evaluation, so a packet reaching here was never counted
+                        // by the cold path: exactly-once holds. The per-worker
+                        // coalescer keeps this off the shared counter cacheline.
+                        if let Some(counter) = worker_ctx
+                            .forwarding
+                            .policy
+                            .hit_counter_by_idx(resolved.metadata.policy_counter_idx)
+                        {
+                            crate::policy::record_policy_hit_counter(counter, desc.len as u64);
+                        }
                         flow_cache_install_failed = resolved.install_failed;
                         if resolved.created {
                             telemetry.counters.session_creates += 1;
@@ -529,6 +553,10 @@ pub(super) fn poll_binding_process_descriptor(
                         }
                         session_ingress_zone = Some(resolved.metadata.ingress_zone);
                         flow_cache_owner_rg_id = resolved.metadata.owner_rg_id;
+                        // #3073: carry the admitting rule's hit-counter handle so
+                        // the flow-cache entry populated below re-counts cached
+                        // packets against the same policy.
+                        flow_cache_policy_counter_idx = resolved.metadata.policy_counter_idx;
                         apply_nat_on_fabric = true;
                         if let Some(input_filter_eval) =
                             evaluate_dscp_sensitive_input_filter_on_session_hit(
@@ -1542,6 +1570,9 @@ pub(super) fn poll_binding_process_descriptor(
                                 policy_id: 0,
                                 // #3227: host-local sessions are not policy-app-matched.
                                 inactivity_timeout_ns: None,
+                                // #3073: host-local sessions are not policy-forwarded,
+                                // so they carry no per-rule hit counter.
+                                policy_counter_idx: 0,
                             };
                             if install_helper_local_session_on_miss(
                                 sessions,
@@ -2082,7 +2113,16 @@ pub(super) fn poll_binding_process_descriptor(
                                             crate::session::app_inactivity_timeout_ns(
                                                 policy_result.inactivity_timeout,
                                             ),
+                                        // #3073: stamp the admitting rule's hit-counter
+                                        // handle so the established fast path re-counts
+                                        // every forward packet of this flow.
+                                        policy_counter_idx: policy_result.policy_counter_idx,
                                     };
+                                    // #3073: carry the admitting rule's handle so
+                                    // the flow-cache entry populated for this new
+                                    // flow re-counts its cached packets.
+                                    flow_cache_policy_counter_idx =
+                                        policy_result.policy_counter_idx;
                                     let forward_installed = track_in_userspace
                                         && sessions.install_with_protocol_with_origin(
                                             flow.forward_key.clone(),
@@ -2314,6 +2354,11 @@ pub(super) fn poll_binding_process_descriptor(
                                             crate::session::app_inactivity_timeout_ns(
                                                 policy_result.inactivity_timeout,
                                             ),
+                                        // #3073: mirror the admitting rule's hit-counter
+                                        // handle onto the reverse companion so reply
+                                        // traffic of the flow counts against the same
+                                        // policy as the forward direction.
+                                        policy_counter_idx: policy_result.policy_counter_idx,
                                     };
                                     // #1861 §5.2: the reverse install is gated on
                                     // forward_installed (was track_in_userspace —
@@ -3027,6 +3072,13 @@ pub(super) fn poll_binding_process_descriptor(
                             // hit (see neighbor_mac_epoch_stale).
                             entry.neighbor_mac_epoch =
                                 worker_ctx.dynamic_neighbors.mac_change_epoch();
+                            // #3073: stamp the admitting rule's hit-counter handle
+                            // onto the cached entry (the seed constructor leaves
+                            // it 0). The flow-cache hit path
+                            // (`stage_flow_cache_hit`) then re-counts every cached
+                            // packet against the same policy, so cacheable flows
+                            // count their full load — not just the first frame.
+                            entry.metadata.policy_counter_idx = flow_cache_policy_counter_idx;
                             binding.flow.flow_cache.insert(entry);
                         }
                         // ── End flow cache population ────────────────
@@ -4177,6 +4229,7 @@ mod new_flow_session_limit_tests {
             log_session_close: false,
             policy_id: 0,
             inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
         }
     }
 

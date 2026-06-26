@@ -581,6 +581,10 @@ pub(super) fn build_local_origin_tunnel_tx_request(
             // cross the HA wire yet, so age on the global timeout until a
             // real-traffic refresh re-stamps it.
             inactivity_timeout_ns: None,
+            // #3073: peer-seeded import; the hit-counter handle does not cross
+            // the HA wire yet, so this flow counts nothing locally until a
+            // real-traffic re-evaluation re-stamps a handle.
+            policy_counter_idx: 0,
         },
         origin: SessionOrigin::SyncImport,
         protocol: meta.protocol,

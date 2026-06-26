@@ -75,6 +75,7 @@ fn test_metadata() -> SessionMetadata {
         log_session_close: false,
         policy_id: 0,
         inactivity_timeout_ns: None,
+        policy_counter_idx: 0,
     }
 }
 
@@ -813,6 +814,7 @@ fn test_close_flags() {
             log_session_close: false,
             policy_id: 0,
             inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
         },
         origin: crate::session::SessionOrigin::ForwardFlow,
         fabric_redirect_sync: true,
