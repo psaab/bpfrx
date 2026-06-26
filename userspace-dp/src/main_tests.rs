@@ -683,6 +683,79 @@ fn queue_planner_rekeys_orphan_vlan_child_onto_parent_netdev() {
     );
 }
 
+// #2917 SSOT fail-on-revert: the AF_XDP bind target for a VLAN unit MUST be the
+// physical PARENT netdev on BOTH planes. The Go control plane resolves the same
+// target via `userspaceBindTargetNetdev` (mirrored from `vlan_child_parent_netdev`)
+// and emits it from `UserspaceBoundLinuxInterfaces` (the D3/RSS allowlist); the
+// Rust planner must bind the identical netdev so the allowlist, RSS steering, and
+// shim maps all target one netdev. A non-VLAN unit binds its OWN netdev (its unit
+// netdev and physical netdev are the same device).
+//
+// Revert proof: change `vlan_child_parent_netdev` to return `None` (or change
+// `replan_queues` to push `linux_name` for the VLAN child) and this test goes RED
+// — the VLAN child `ge-0-0-2.80` re-enters the candidate list, so a binding with
+// `interface == "ge-0-0-2.80"` appears and the parent-only assertion fails.
+#[test]
+fn replan_queues_binds_vlan_unit_on_parent_netdev() {
+    use crate::server::helpers::replan_queues;
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            // Physical WAN netdev parent of the VLAN unit: 6 hardware queues.
+            InterfaceSnapshot {
+                name: "ge-0/0/2".to_string(),
+                linux_name: "ge-0-0-2".to_string(),
+                zone: "untrust".to_string(),
+                ifindex: 12,
+                rx_queues: 6,
+                ..Default::default()
+            },
+            // Tagged VLAN unit reth0.80 → software netdev `ge-0-0-2.80`.
+            InterfaceSnapshot {
+                name: "ge-0/0/2.80".to_string(),
+                linux_name: "ge-0-0-2.80".to_string(),
+                parent_linux_name: "ge-0-0-2".to_string(),
+                zone: "untrust".to_string(),
+                ifindex: 80,
+                parent_ifindex: 12,
+                vlan_id: 80,
+                rx_queues: 1,
+                ..Default::default()
+            },
+            // Plain non-VLAN LAN netdev: binds its OWN netdev, 6 queues.
+            InterfaceSnapshot {
+                name: "ge-0/0/1".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                zone: "trust".to_string(),
+                ifindex: 11,
+                rx_queues: 6,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let bound: std::collections::BTreeSet<&str> =
+        bindings.iter().map(|b| b.interface.as_str()).collect();
+
+    // The VLAN unit binds the PARENT netdev, never its `.80` unit netdev.
+    assert!(
+        bound.contains("ge-0-0-2"),
+        "VLAN unit must bind its physical parent `ge-0-0-2`; bound: {bound:?}"
+    );
+    assert!(
+        !bound.contains("ge-0-0-2.80"),
+        "VLAN unit MUST NOT bind its `.80` software unit netdev (no hw queues); \
+         bound: {bound:?}"
+    );
+    // The non-VLAN interface binds its own netdev.
+    assert!(
+        bound.contains("ge-0-0-1"),
+        "non-VLAN interface must bind its own netdev `ge-0-0-1`; bound: {bound:?}"
+    );
+}
+
 // #3175 fail-on-revert: an ORPHAN VLAN child (a VLAN unit whose physical parent
 // is NOT itself a binding candidate) is re-keyed in the LAYOUT onto its parent
 // netdev using the parent's HARDWARE queue count (`rx_queue_count(parent)`). The
