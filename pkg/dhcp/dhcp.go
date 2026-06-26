@@ -41,6 +41,41 @@ type Lease struct {
 	DNS       []netip.Addr
 	LeaseTime time.Duration
 	Obtained  time.Time
+
+	// serverID is the DHCPv4 server-identifier (option 54) from the ACK
+	// that granted this lease. It is the unicast destination for the
+	// RFC 2131 §4.3.6 RENEWING DHCPREQUEST at T1. Unexported: internal
+	// renewal state, not part of the public lease surface and never
+	// compared by leaseContentChanged (#2994).
+	serverID netip.Addr
+
+	// v6ServerDUID is the DHCPv6 Server-Identifier (DUID) from the Reply
+	// that granted this lease, echoed in the RFC 8415 §18.2.4 RENEW so
+	// the original server matches the binding. Unexported (#2994).
+	v6ServerDUID dhcpv6.DUID
+}
+
+// dhcpExchangeMode selects which RFC exchange a renewal cycle step runs.
+// The pre-#2994 client ran a full DISCOVER/Rapid-Solicit (exchangeAcquire)
+// at every T1/T2; the fix sends a true unicast RENEW at T1 and a broadcast
+// REBIND at T2, falling back to a full acquisition only on lease expiry.
+type dhcpExchangeMode int
+
+const (
+	exchangeAcquire dhcpExchangeMode = iota // DHCPv4 DISCOVER / DHCPv6 SOLICIT
+	exchangeRenew                           // T1: unicast REQUEST(RENEW) / RENEW
+	exchangeRebind                          // T2: broadcast REQUEST(REBIND) / REBIND
+)
+
+func (mode dhcpExchangeMode) String() string {
+	switch mode {
+	case exchangeRenew:
+		return "renew"
+	case exchangeRebind:
+		return "rebind"
+	default:
+		return "acquire"
+	}
 }
 
 type clientKey struct {
@@ -120,6 +155,17 @@ type Manager struct {
 	// tests so reconcile/registry behavior can be exercised without
 	// real DHCP traffic. nil in production.
 	runClientForTest func(ctx context.Context, ifaceName string, af AddressFamily)
+
+	// Renewal seams (#2994). When non-nil they replace the real wire
+	// exchange / the renewal wait so the run-loop state machine (the
+	// DISCOVER→RENEW→REBIND→re-acquire transitions) is unit-testable
+	// without sockets or the 30 s T1 clamp. nil in production.
+	doV4ExchangeForTest func(ctx context.Context, ifaceName string, mode dhcpExchangeMode, prev *Lease) (*Lease, error)
+	doV6ExchangeForTest func(ctx context.Context, ifaceName string, mode dhcpExchangeMode, prev *Lease, prevPDs []DelegatedPrefix) (*dhcpv6Result, error)
+	afterForTest        func(d time.Duration) <-chan time.Time
+	// waitLinkLocalForTest replaces the DHCPv6 link-local wait so the v6
+	// run loop is drivable without a real interface. nil in production.
+	waitLinkLocalForTest func(ctx context.Context, ifaceName string, timeout time.Duration) error
 }
 
 // New creates a DHCP manager. stateDir is where DUID files are persisted.
@@ -605,13 +651,14 @@ func (m *Manager) LeaseFor(ifaceName string, af AddressFamily) *Lease {
 // and which clobbered the other family's servers with no merge — is
 // removed.
 
-// runDHCPv4 runs the DHCPv4 acquisition and renewal cycle. Each
-// exchange is a full DORA (Discover→Offer→Request→Ack) — effectively
-// force-discover behavior, so the ForceDiscover option requires no
-// special handling. A successful T1 renew or T2 rebind commits the
-// renewed lease via commitLease and returns to the T1 wait (#1777);
-// only when both attempts fail (or the renewed lease cannot be
-// applied) does the loop fall back to a fresh acquisition.
+// runDHCPv4 runs the DHCPv4 acquisition and renewal cycle. The initial
+// acquisition is a full DORA (Discover→Offer→Request→Ack). At T1 the
+// loop sends a true RFC 2131 §4.3.6 RENEWING DHCPREQUEST — unicast to
+// the granting server (the stored server-identifier), ciaddr set to the
+// current address, NO DISCOVER — and at T2 a REBINDING broadcast
+// DHCPREQUEST (#2994). A successful renew/rebind commits via commitLease
+// and returns to the T1 wait (#1777); only when both fail (lease
+// expiry) does the loop fall back to a fresh full DORA acquisition.
 func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 	key := clientKey{iface: ifaceName, family: AFInet}
 
@@ -643,7 +690,7 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 
 		slog.Info("DHCPv4: starting discovery", "interface", ifaceName)
 
-		lease, err := m.doDHCPv4(ctx, ifaceName)
+		lease, err := m.v4Exchange(ctx, ifaceName, exchangeAcquire, nil)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -689,7 +736,7 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 
 			// Wait for T1 (50% of lease time) for renewal
 			select {
-			case <-time.After(t1):
+			case <-m.after(t1):
 				slog.Info("DHCPv4: T1 expired, renewing", "interface", ifaceName)
 			case <-ctx.Done():
 				m.removeAddress(ifaceName, committed)
@@ -699,8 +746,9 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 				return
 			}
 
-			// T1 renewal attempt
-			renewed, rerr := m.doDHCPv4(ctx, ifaceName)
+			// T1 renewal attempt — unicast RENEW to the granting server,
+			// NOT a fresh DISCOVER (#2994).
+			renewed, rerr := m.v4Exchange(ctx, ifaceName, exchangeRenew, committed)
 			if rerr == nil {
 				if cerr := m.commitLease(key, renewed, committed, nil, nil); cerr != nil {
 					slog.Warn("DHCPv4: failed to apply renewed lease, re-acquiring",
@@ -718,7 +766,7 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 
 			// Wait for T2 (87.5% of lease) — remaining time after T1
 			select {
-			case <-time.After(t2Remaining):
+			case <-m.after(t2Remaining):
 			case <-ctx.Done():
 				m.removeAddress(ifaceName, committed)
 				m.mu.Lock()
@@ -727,8 +775,8 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 				return
 			}
 
-			// T2 rebind attempt
-			renewed, rerr = m.doDHCPv4(ctx, ifaceName)
+			// T2 rebind attempt — broadcast REBIND (#2994).
+			renewed, rerr = m.v4Exchange(ctx, ifaceName, exchangeRebind, committed)
 			if rerr == nil {
 				if cerr := m.commitLease(key, renewed, committed, nil, nil); cerr != nil {
 					slog.Warn("DHCPv4: failed to apply rebound lease, re-acquiring",
@@ -748,8 +796,12 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 	}
 }
 
-// doDHCPv4 performs a single DORA exchange.
-func (m *Manager) doDHCPv4(ctx context.Context, ifaceName string) (*Lease, error) {
+// doDHCPv4 performs a single DHCPv4 exchange for the given mode:
+// exchangeAcquire runs a full DORA; exchangeRenew sends a unicast
+// RENEWING DHCPREQUEST to the server that granted prev; exchangeRebind
+// sends a broadcast REBINDING DHCPREQUEST (#2994). prev is the currently
+// committed lease (nil only for acquire).
+func (m *Manager) doDHCPv4(ctx context.Context, ifaceName string, mode dhcpExchangeMode, prev *Lease) (*Lease, error) {
 	client, err := nclient4.New(ifaceName)
 	if err != nil {
 		return nil, fmt.Errorf("create DHCPv4 client: %w", err)
@@ -769,14 +821,42 @@ func (m *Manager) doDHCPv4(ctx context.Context, ifaceName string) (*Lease, error
 		mods = append(mods, dhcpv4.WithLeaseTime(uint32(opts.LeaseTime)))
 	}
 
-	dhcpLease, err := client.Request(exCtx, mods...)
-	if err != nil {
-		return nil, fmt.Errorf("DHCPv4 request: %w", err)
+	var ack *dhcpv4.DHCPv4
+	switch mode {
+	case exchangeRenew, exchangeRebind:
+		if prev == nil || !prev.Address.IsValid() {
+			return nil, fmt.Errorf("DHCPv4 renew without a prior lease")
+		}
+		rebind := mode == exchangeRebind
+		req, err := buildV4RenewRequest(client.InterfaceAddr(), prev, mods)
+		if err != nil {
+			return nil, fmt.Errorf("DHCPv4 build renew request: %w", err)
+		}
+		dest := v4RenewDest(prev, rebind)
+		resp, err := client.SendAndRead(exCtx, dest, req,
+			nclient4.IsMessageType(dhcpv4.MessageTypeAck, dhcpv4.MessageTypeNak))
+		if err != nil {
+			return nil, fmt.Errorf("DHCPv4 %s: %w", mode, err)
+		}
+		if resp.MessageType() == dhcpv4.MessageTypeNak {
+			return nil, fmt.Errorf("DHCPv4 %s: server sent NAK", mode)
+		}
+		ack = resp
+	default:
+		dhcpLease, err := client.Request(exCtx, mods...)
+		if err != nil {
+			return nil, fmt.Errorf("DHCPv4 request: %w", err)
+		}
+		ack = dhcpLease.ACK
 	}
 
-	ack := dhcpLease.ACK
+	return leaseFromACKv4(ifaceName, ack)
+}
 
-	// Extract lease info
+// leaseFromACKv4 parses a DHCPv4 ACK into a Lease, capturing the
+// server-identifier needed to unicast a later RENEW (#2994). Shared by
+// the acquire, renew, and rebind paths.
+func leaseFromACKv4(ifaceName string, ack *dhcpv4.DHCPv4) (*Lease, error) {
 	yourIP := ack.YourIPAddr
 	if yourIP == nil || yourIP.IsUnspecified() {
 		return nil, fmt.Errorf("no IP in DHCP ACK")
@@ -799,6 +879,13 @@ func (m *Manager) doDHCPv4(ctx context.Context, ifaceName string) (*Lease, error
 		Family:    AFInet,
 		Address:   netip.PrefixFrom(addr, ones),
 		Obtained:  time.Now(),
+	}
+
+	// Server identifier — the unicast destination for the next RENEW.
+	if sid := ack.ServerIdentifier(); sid != nil {
+		if s, ok := netip.AddrFromSlice(sid.To4()); ok {
+			lease.serverID = s
+		}
 	}
 
 	// Gateway
@@ -825,10 +912,15 @@ func (m *Manager) doDHCPv4(ctx context.Context, ifaceName string) (*Lease, error
 }
 
 // runDHCPv6 runs the DHCPv6 solicit/request cycle with retries and
-// renewal. A successful T1 renew or T2 rebind commits the renewed
-// lease (and any delegated prefixes) via commitLease and returns to
-// the T1 wait (#1777); only when both attempts fail does the loop fall
-// back to a fresh solicit / information-request.
+// renewal. Initial acquisition is a Rapid-Solicit (or Information-Request
+// in stateless mode). At T1 the loop sends an RFC 8415 §18.2.4 RENEW to
+// the granting server (echoing the assigned IA_NA / IA_PD with the
+// server's DUID) and at T2 an §18.2.5 REBIND (multicast, no server DUID)
+// — NOT a fresh Solicit (#2994). A successful renew/rebind commits the
+// renewed lease (and any delegated prefixes) via commitLease and returns
+// to the T1 wait (#1777); only when both attempts fail (lease expiry)
+// does the loop fall back to a fresh solicit. Stateless mode has no
+// binding, so every refresh is an Information-Request regardless of mode.
 func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 	key := clientKey{iface: ifaceName, family: AFInet6}
 	backoff := time.Second
@@ -840,7 +932,7 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 	stateless := v6opts != nil && v6opts.Stateless
 
 	// Wait for link-local address
-	if err := m.waitForLinkLocal(ctx, ifaceName, 30*time.Second); err != nil {
+	if err := m.waitLinkLocal(ctx, ifaceName, 30*time.Second); err != nil {
 		slog.Warn("DHCPv6: no link-local address, aborting",
 			"interface", ifaceName, "err", err)
 		return
@@ -866,7 +958,7 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 			slog.Info("DHCPv6: starting solicit", "interface", ifaceName)
 		}
 
-		result, err := m.doDHCPv6(ctx, ifaceName)
+		result, err := m.v6Exchange(ctx, ifaceName, exchangeAcquire, nil, nil)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -917,7 +1009,7 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 
 			// Wait for T1
 			select {
-			case <-time.After(t1):
+			case <-m.after(t1):
 				slog.Info("DHCPv6: T1 expired, renewing", "interface", ifaceName)
 			case <-ctx.Done():
 				if committed.Address.IsValid() {
@@ -930,8 +1022,9 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 				return
 			}
 
-			// T1 renewal attempt
-			renewed, rerr := m.doDHCPv6(ctx, ifaceName)
+			// T1 renewal attempt — RENEW to the granting server, NOT a
+			// fresh Solicit (#2994).
+			renewed, rerr := m.v6Exchange(ctx, ifaceName, exchangeRenew, committed, committedPDs)
 			if rerr == nil {
 				if cerr := m.commitLease(key, renewed.lease, committed, renewed.prefixes, committedPDs); cerr != nil {
 					slog.Warn("DHCPv6: failed to apply renewed lease, re-acquiring",
@@ -954,7 +1047,7 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 
 			// Wait for T2 (87.5% of lease) — remaining time after T1
 			select {
-			case <-time.After(t2Remaining):
+			case <-m.after(t2Remaining):
 			case <-ctx.Done():
 				if committed.Address.IsValid() {
 					m.removeAddress(ifaceName, committed)
@@ -966,8 +1059,8 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 				return
 			}
 
-			// T2 rebind attempt
-			renewed, rerr = m.doDHCPv6(ctx, ifaceName)
+			// T2 rebind attempt — REBIND (multicast, no server DUID) (#2994).
+			renewed, rerr = m.v6Exchange(ctx, ifaceName, exchangeRebind, committed, committedPDs)
 			if rerr == nil {
 				if cerr := m.commitLease(key, renewed.lease, committed, renewed.prefixes, committedPDs); cerr != nil {
 					slog.Warn("DHCPv6: failed to apply rebound lease, re-acquiring",
@@ -998,8 +1091,14 @@ type dhcpv6Result struct {
 	prefixes []DelegatedPrefix
 }
 
-// doDHCPv6 performs a single DHCPv6 solicit/request exchange.
-func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string) (*dhcpv6Result, error) {
+// doDHCPv6 performs a single DHCPv6 exchange for the given mode.
+// exchangeAcquire runs a Rapid-Solicit (or Information-Request in
+// stateless mode); exchangeRenew sends an RFC 8415 §18.2.4 RENEW to the
+// granting server (server DUID echoed) and exchangeRebind an §18.2.5
+// REBIND (no server DUID), both echoing the assigned IA_NA / IA_PD from
+// prev / prevPDs (#2994). Stateless mode ignores the mode (no binding to
+// renew — every refresh is an Information-Request).
+func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string, mode dhcpExchangeMode, prev *Lease, prevPDs []DelegatedPrefix) (*dhcpv6Result, error) {
 	client, err := nclient6.New(ifaceName)
 	if err != nil {
 		return nil, fmt.Errorf("create DHCPv6 client: %w", err)
@@ -1018,7 +1117,8 @@ func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string) (*dhcpv6Result
 
 	stateless := v6opts != nil && v6opts.Stateless
 
-	// Stateless mode: send Information-Request (no IA_NA/IA_PD)
+	// Stateless mode: send Information-Request (no IA_NA/IA_PD). There is
+	// no lease binding, so renew/rebind collapse to the same refresh.
 	if stateless {
 		msg, err := dhcpv6.NewMessage()
 		if err != nil {
@@ -1063,11 +1163,38 @@ func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string) (*dhcpv6Result
 		return &dhcpv6Result{lease: lease}, nil
 	}
 
-	adv, err := client.RapidSolicit(exCtx, mods...)
-	if err != nil {
-		return nil, fmt.Errorf("DHCPv6 solicit: %w", err)
+	var adv *dhcpv6.Message
+	switch mode {
+	case exchangeRenew, exchangeRebind:
+		rebind := mode == exchangeRebind
+		// Renew/rebind echo the actual held IA_NA/IA_PD, so use only the
+		// client-id + ORO modifiers — NOT the acquisition IA_PD hint
+		// (which would merge a hint prefix into our real IA_PD).
+		renewMods := m.buildDHCPv6RenewModifiers(ifaceName, v6opts)
+		msg, err := buildV6RenewMessage(client.InterfaceAddr(), prev, prevPDs, rebind, renewMods)
+		if err != nil {
+			return nil, fmt.Errorf("DHCPv6 build %s: %w", mode, err)
+		}
+		adv, err = client.SendAndRead(exCtx, nclient6.AllDHCPRelayAgentsAndServers, msg,
+			nclient6.IsMessageType(dhcpv6.MessageTypeReply))
+		if err != nil {
+			return nil, fmt.Errorf("DHCPv6 %s: %w", mode, err)
+		}
+	default:
+		adv, err = client.RapidSolicit(exCtx, mods...)
+		if err != nil {
+			return nil, fmt.Errorf("DHCPv6 solicit: %w", err)
+		}
 	}
 
+	return m.parseV6Reply(ctx, ifaceName, adv, v6opts)
+}
+
+// parseV6Reply extracts the lease (IA_NA address, lifetime, DNS, gateway)
+// and any delegated prefixes (IA_PD) from a DHCPv6 Reply/Advertise. It is
+// shared by the solicit, renew, and rebind paths (#2994); the server DUID
+// is captured so the next RENEW can echo it.
+func (m *Manager) parseV6Reply(ctx context.Context, ifaceName string, adv *dhcpv6.Message, v6opts *DHCPv6Options) (*dhcpv6Result, error) {
 	result := &dhcpv6Result{}
 	now := time.Now()
 
@@ -1131,6 +1258,10 @@ func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string) (*dhcpv6Result
 		Obtained:  now,
 	}
 
+	// Server identifier (DUID) — echoed in the next RENEW so the original
+	// server matches our binding (#2994).
+	lease.v6ServerDUID = adv.Options.ServerID()
+
 	if addr.IsValid() {
 		lease.Address = netip.PrefixFrom(addr, 128)
 		lease.LeaseTime = validLT
@@ -1160,6 +1291,34 @@ func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string) (*dhcpv6Result
 
 	result.lease = lease
 	return result, nil
+}
+
+// buildDHCPv6RenewModifiers constructs the modifiers for a RENEW/REBIND
+// message: the persistent client-id and the requested-option list, but
+// NOT the IA_NA/IA_PD options (the renew echoes the held bindings, which
+// buildV6RenewMessage adds explicitly). Reusing buildDHCPv6Modifiers here
+// would merge the acquisition IA_PD hint into our real IA_PD (#2994).
+func (m *Manager) buildDHCPv6RenewModifiers(ifaceName string, opts *DHCPv6Options) []dhcpv6.Modifier {
+	var mods []dhcpv6.Modifier
+	if duid, err := m.getDUID(ifaceName); err == nil {
+		mods = append(mods, dhcpv6.WithClientID(duid))
+	}
+	if opts == nil {
+		return mods
+	}
+	var oroCodes []dhcpv6.OptionCode
+	for _, opt := range opts.ReqOptions {
+		switch opt {
+		case "dns-server":
+			oroCodes = append(oroCodes, dhcpv6.OptionDNSRecursiveNameServer)
+		case "domain-name":
+			oroCodes = append(oroCodes, dhcpv6.OptionDomainSearchList)
+		}
+	}
+	if len(oroCodes) > 0 {
+		mods = append(mods, dhcpv6.WithRequestedOptions(oroCodes...))
+	}
+	return mods
 }
 
 // buildDHCPv6Modifiers constructs DHCPv6 message modifiers from interface options.

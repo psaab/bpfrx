@@ -326,7 +326,7 @@ func TestDelegatedPrefixesForRA(t *testing.T) {
 		},
 		v6opts: map[string]*DHCPv6Options{
 			"wan0": {RAIface: "trust0", PDSubLen: 64},
-			"wan1": {RAIface: ""},       // no RA interface
+			"wan1": {RAIface: ""}, // no RA interface
 		},
 	}
 

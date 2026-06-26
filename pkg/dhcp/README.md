@@ -67,14 +67,21 @@ without DHCP no longer disables DHCP for the daemon's lifetime.
   so a dead client can never permanently block a future `Start` for
   the same key.
 
-## Renewal semantics (#1777)
+## Renewal semantics (#1777, RFC wire renewal #2994)
 
-> Wire note: T1/T2 attempts still run the full client exchange
-> (v4 force-discover DORA; v6 Information-Request/Rapid Solicit), not
-> unicast RFC RENEW/REBIND — the RFC citations below describe the
-> timer/fallback structure only. True unicast renew is a possible
-> follow-up (#1832 review note).
-
+> Wire behavior (#2994): T1/T2 now run the RFC-correct renewal exchange,
+> not a full re-acquisition. At T1 the v4 client sends a unicast
+> RENEWING `DHCPREQUEST` to the granting server (ciaddr = held address,
+> no DISCOVER) and the v6 client sends a `RENEW` echoing the held IA_NA /
+> IA_PD with the server's DUID; at T2 the v4 client broadcasts a
+> REBINDING `DHCPREQUEST` and the v6 client multicasts a `REBIND` (no
+> server DUID). Only lease expiry (both renew and rebind failed) falls
+> back to a full DISCOVER / SOLICIT. This supersedes the pre-#2994
+> force-DORA / Rapid-Solicit-at-every-T1 behavior (the old #1832 review
+> note), which broadcast a fresh server-selection every renewal and
+> could move the lease to a different server, churn the address (and
+> therefore interface-DDNS / FRR routes / ip-monitoring), and double the
+> WAN DHCP traffic.
 
 Acquisition and renewal share one commit path, `commitLease`
 (`commit.go`): remove the old address if the server moved us, apply the
@@ -86,11 +93,22 @@ the debounced `onAddressChange` callback when content changed.
   lease. Pre-#1777 the renewal result was dead-assigned and the loop
   re-entered a full DORA / Solicit, discarding the renewal (changed
   DNS, delegated prefixes) and doubling the DHCP traffic.
+- **Wire renewal (#2994)**: the run loop drives an
+  `acquire → renew → rebind → re-acquire` exchange-mode state machine
+  (`dhcpExchangeMode` in `dhcp.go`; wire builders `buildV4RenewRequest`
+  / `v4RenewDest` / `buildV6RenewMessage` in `renew.go`). The server
+  identifier (v4 option 54) and server DUID (v6) are captured on the
+  granting reply and stored on the (unexported) `Lease.serverID` /
+  `Lease.v6ServerDUID` fields so a later RENEW can target the original
+  server. DHCPv6 stateless mode has no binding, so every refresh stays
+  an Information-Request regardless of mode.
 - **Only renewal failure re-acquires**: a NAK/timeout at T1 falls
   through to the T2 rebind; a second failure (or a failure to apply
   the renewed address) falls back to full re-acquisition — RFC 2131
   §4.4.5 / RFC 8415 §18.2.4-5 behavior. A transient renew failure
   retains the old lease and address until then (`docs/dns-ownership.md`).
+  Any malformed/unmatched renew is therefore fail-safe: it degrades to
+  the previous full-acquisition path, never to a worse state.
 - **Address moves are re-acquisition-equivalent**: if a renewal returns
   a different address, the old one is removed and the new one applied
   via the same netlink mechanisms the fresh-acquisition path uses.
@@ -101,11 +119,16 @@ the debounced `onAddressChange` callback when content changed.
   so a fire is never a restart-loop hazard — only recompile churn.
   An IA_PD reply with no prefixes retains previously delegated prefixes
   (and does not count as a change).
-- The run loops are not unit-testable (real sockets via
-  nclient4/nclient6; the T1 wait has an uninjectable 30 s clamp), so
-  the decision logic is concentrated in `commitLease` /
-  `renewalTimers` / `leaseContentChanged` / `delegatedPrefixesChanged`
-  and pinned by `commit_test.go`.
+- The decision logic is concentrated in `commitLease` / `renewalTimers`
+  / `leaseContentChanged` / `delegatedPrefixesChanged` and pinned by
+  `commit_test.go`. The run-loop state machine itself (the
+  acquire→renew→rebind→re-acquire transitions and lease preservation)
+  is exercised through the `doV4ExchangeForTest` / `doV6ExchangeForTest`
+  / `afterForTest` / `waitLinkLocalForTest` seams (#2994), which replace
+  the real socket exchange and the 30 s T1 wait so a test drives the
+  real `runDHCPv4` / `runDHCPv6` without traffic — see `renew_test.go`.
+  The wire builders (`buildV4RenewRequest`, `v4RenewDest`,
+  `buildV6RenewMessage`) are pure and unit-tested directly.
 
 ## Callers
 
