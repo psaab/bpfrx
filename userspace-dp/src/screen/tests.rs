@@ -736,6 +736,58 @@ fn teardrop_first_fragment_passes() {
     assert_eq!(st.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
 }
 
+#[test]
+fn teardrop_zero_payload_non_first_fragment_drops() {
+    // #3027 fail-on-revert: a non-first fragment whose ip_total_len is
+    // EQUAL to the header length (zero payload) is malformed and must
+    // DROP as teardrop. ip_ihl=5 → hdr_len=20, ip_total_len=20.
+    //
+    // The pre-#3027 code only entered the payload-size branch when
+    // ip_total_len > hdr_len, so 20 > 20 is false and this packet
+    // slipped through as a PASS. Reverting the fix makes this assert
+    // fail (Pass instead of Drop). A teardrop-only profile isolates the
+    // check from the no-flag / other screens.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv4_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_TCP,
+        2,     // frag offset = 2 (non-first fragment)
+        false, // no MORE_FRAGMENTS — a trailing fragment
+        20,    // ip_total_len == hdr_len (ihl=5*4) → zero payload
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("teardrop")
+    );
+}
+
+#[test]
+fn teardrop_under_length_non_first_fragment_drops() {
+    // #3027 fail-on-revert: a non-first fragment whose claimed
+    // ip_total_len is LESS than the header length ("negative" payload)
+    // is malformed and must DROP. ip_ihl=5 → hdr_len=20,
+    // ip_total_len=18. Pre-#3027 (ip_total_len > hdr_len gate) PASSed
+    // this; the subtraction would also have underflowed.
+    let mut profile = ScreenProfile::default();
+    profile.teardrop = true;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv4_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_TCP,
+        2,     // non-first fragment
+        false,
+        18, // ip_total_len < hdr_len (20) → under-length / "negative"
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("teardrop")
+    );
+}
+
 // ================================================================
 // ICMP fragment
 // ================================================================

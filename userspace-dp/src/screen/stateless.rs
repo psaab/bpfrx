@@ -155,6 +155,15 @@ pub(super) fn check_ping_of_death(
 }
 
 /// Teardrop: IPv4 non-first fragment with tiny payload (< 8 bytes).
+///
+/// #3027: a non-first fragment whose `ip_total_len <= hdr_len` carries
+/// zero (or, by the field's claimed length, "negative") payload. That is
+/// even more clearly malformed than the classic tiny-but-positive
+/// teardrop signature — exactly the kind of crafted fragment that
+/// confuses downstream reassembly — yet the pre-#3027 code only entered
+/// the payload-size branch when `ip_total_len > hdr_len`, so the
+/// zero/under-length case slipped through as a PASS. Treat it as a
+/// teardrop drop.
 #[inline]
 pub(super) fn check_teardrop(
     profile: &ScreenProfile,
@@ -164,11 +173,13 @@ pub(super) fn check_teardrop(
         let frag_offset = pkt.ip_frag_off & 0x1FFF;
         if frag_offset > 0 {
             let hdr_len = (pkt.ip_ihl as u16) * 4;
-            if pkt.ip_total_len > hdr_len {
-                let payload = pkt.ip_total_len - hdr_len;
-                if payload < 8 {
-                    return Some("teardrop");
-                }
+            if pkt.ip_total_len <= hdr_len {
+                // No / negative payload on a non-first fragment — malformed.
+                return Some("teardrop");
+            }
+            let payload = pkt.ip_total_len - hdr_len;
+            if payload < 8 {
+                return Some("teardrop");
             }
         }
     }
