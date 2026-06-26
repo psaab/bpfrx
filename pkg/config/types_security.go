@@ -371,10 +371,39 @@ type NATPool struct {
 	Deterministic *DeterministicNATConfig
 }
 
+// PersistentNATPermit selects the remote-endpoint scope of a persistent
+// NAT binding (Junos `persistent-nat permit`, #2823). It replaces the
+// pre-#2823 binary PermitAnyRemoteHost bool with the full three-way enum.
+type PersistentNATPermit string
+
+const (
+	// PersistentNATPermitAnyRemoteHost: any external host reuses the
+	// binding. The lease is keyed by the local source tuple only (no
+	// remote endpoint in the key). Junos `permit any-remote-host`.
+	PersistentNATPermitAnyRemoteHost PersistentNATPermit = "any-remote-host"
+	// PersistentNATPermitTargetHost: scoped to the original remote HOST.
+	// The lease is keyed by the source tuple + remote destination IP only
+	// (the remote PORT is dropped), so a new flow to a NEW remote port on
+	// the SAME host reuses the binding. Junos `permit target-host`.
+	PersistentNATPermitTargetHost PersistentNATPermit = "target-host"
+	// PersistentNATPermitTargetHostPort: scoped to the original remote
+	// host:PORT. The lease is keyed by the source tuple + remote
+	// destination IP + destination port, so a new remote port keys to a
+	// distinct lease. Junos `permit target-host-port`. This is the
+	// pre-#2823 false-flag behavior and the default when `persistent-nat`
+	// is configured without an explicit `permit` (preserves #2819).
+	PersistentNATPermitTargetHostPort PersistentNATPermit = "target-host-port"
+)
+
 // PersistentNATConfig configures persistent NAT bindings for a pool.
 type PersistentNATConfig struct {
-	PermitAnyRemoteHost bool
-	InactivityTimeout   int // seconds (default 300)
+	// Permit is the remote-host reuse scope. The default (when
+	// `persistent-nat` is configured with no `permit`) is
+	// PersistentNATPermitTargetHostPort, matching the pre-#2823 binary
+	// model's false-flag (dst_ip, dst_port) keying so existing configs are
+	// byte-identical. #2823.
+	Permit            PersistentNATPermit
+	InactivityTimeout int // seconds (default 300)
 }
 
 // DeterministicNATConfig configures CGNAT deterministic port allocation.

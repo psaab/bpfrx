@@ -938,12 +938,44 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 					pool.Deterministic = detCfg
 				}
 			case "persistent-nat":
-				pnat := &PersistentNATConfig{InactivityTimeout: 300}
+				// #2823: default is target-host-port (the pre-#2823
+				// false-flag (dst_ip, dst_port) keying) so a config that
+				// configures persistent-nat with no explicit permit keeps
+				// the #2819 behavior byte-identical.
+				pnat := &PersistentNATConfig{
+					InactivityTimeout: 300,
+					Permit:            PersistentNATPermitTargetHostPort,
+				}
+				parsePermit := func(v string) {
+					switch v {
+					case "any-remote-host":
+						pnat.Permit = PersistentNATPermitAnyRemoteHost
+					case "target-host":
+						pnat.Permit = PersistentNATPermitTargetHost
+					case "target-host-port":
+						pnat.Permit = PersistentNATPermitTargetHostPort
+					}
+				}
+				// Flat-set shape: persistent-nat collapses trailing tokens
+				// onto Keys (e.g. ["persistent-nat","permit","target-host"]
+				// or ["persistent-nat","inactivity-timeout","600"]).
+				for i := 1; i+1 < len(prop.Keys); i++ {
+					switch prop.Keys[i] {
+					case "permit":
+						parsePermit(prop.Keys[i+1])
+					case "inactivity-timeout":
+						if n, err := strconv.Atoi(prop.Keys[i+1]); err == nil {
+							pnat.InactivityTimeout = n
+						}
+					}
+				}
+				// Hierarchical / schema-grouped shape: permit and
+				// inactivity-timeout arrive as child leaves.
 				for _, pnProp := range prop.Children {
 					switch pnProp.Name() {
 					case "permit":
-						if v := nodeVal(pnProp); v == "any-remote-host" {
-							pnat.PermitAnyRemoteHost = true
+						if v := nodeVal(pnProp); v != "" {
+							parsePermit(v)
 						}
 					case "inactivity-timeout":
 						if v := nodeVal(pnProp); v != "" {

@@ -20397,3 +20397,26 @@ top.
   pkg/dataplane/compiler.go, pkg/dataplane/retirement_boundary_canary_test.go,
   pkg/logging/ringbuf.go, pkg/logging/default_policy_sentinel_3057_test.go,
   pkg/logging/README.md, docs/pr/1373-retire-ebpf-dataplane/README.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #2823 — replace the binary persistent-nat `PermitAnyRemoteHost`
+  bool with the full three-way Junos `persistent-nat permit` enum
+  (`any-remote-host | target-host | target-host-port`) end-to-end. Config type
+  `PersistentNATConfig.Permit` (default `target-host-port` = byte-identical
+  pre-#2823/#2819 false-flag keying); parser accepts all three in flat-set +
+  hierarchical shapes; schema gives the source `pool` node a body with a
+  `ValueEnumOf`/`ValidateEnum` `permit` leaf + `ValidateInteger` timeout leaf
+  (completion + commit-check). Wire: additive `persistent_nat_permit` string
+  (legacy bool kept for skew, helper falls back to it). Rust `PersistentNatPermit`
+  enum + `from_wire`: lease key is source-tuple-only (any-remote-host), dst_ip
+  only (target-host), or dst_ip+dst_port (target-host-port). Fail-on-revert:
+  collapsing target-host→dst_ip+port turns the reuse-across-ports test RED,
+  target-host-port stays GREEN. Wire fixture regenerated (one new key).
+  **File(s)**: pkg/config/types_security.go, pkg/config/compiler_nat.go,
+  pkg/config/schema_security.go, pkg/config/compiler_nat_persistent_permit_test.go,
+  pkg/dataplane/compiler_nat.go, pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/manager_test.go,
+  userspace-dp/src/protocol/nat.rs, userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/status.rs,
+  userspace-dp/src/nat/tests.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/userspace-dataplane-gaps.md, docs/config-schema.md

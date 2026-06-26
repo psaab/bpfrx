@@ -19,7 +19,10 @@ pub(crate) fn source_nat_pool_statuses(rules: &[SourceNatRule]) -> Vec<SourceNat
                 port_low: rule.pool_allocator.port_low,
                 port_high: rule.pool_allocator.port_high,
                 persistent_nat: rule.persistent_nat,
-                persistent_nat_permit_any_remote_host: rule.persistent_nat_permit_any_remote_host,
+                // #2823: the show/status wire keeps the binary
+                // permit-any-remote-host flag; derive it from the enum.
+                persistent_nat_permit_any_remote_host: rule.persistent_nat_permit
+                    == crate::nat::source::PersistentNatPermit::AnyRemoteHost,
                 persistent_nat_inactivity_timeout: rule.persistent_nat_inactivity_timeout_secs,
                 live_flows: snap.live_flows,
                 used_ports: snap.used_ports,

@@ -2219,7 +2219,7 @@ func TestBuildSourceNATSnapshotsPopulatesPoolFields(t *testing.T) {
 			Addresses:     []string{"203.0.113.10/32", "203.0.113.11/32", "2001:db8:80::10/128"},
 			PortLow:       40000,
 			PortHigh:      40100,
-			PersistentNAT: &config.PersistentNATConfig{PermitAnyRemoteHost: true, InactivityTimeout: 900},
+			PersistentNAT: &config.PersistentNATConfig{Permit: config.PersistentNATPermitAnyRemoteHost, InactivityTimeout: 900},
 		},
 	}
 	cfg.Security.NAT.Source = []*config.NATRuleSet{{
@@ -2261,6 +2261,9 @@ func TestBuildSourceNATSnapshotsPopulatesPoolFields(t *testing.T) {
 	}
 	if got.PersistentNATInactivityTimeout != 900 {
 		t.Fatalf("PersistentNATInactivityTimeout = %d, want 900", got.PersistentNATInactivityTimeout)
+	}
+	if got.PersistentNATPermit != "any-remote-host" {
+		t.Fatalf("PersistentNATPermit = %q, want any-remote-host", got.PersistentNATPermit)
 	}
 	wantAddrs := []string{"203.0.113.10/32", "203.0.113.11/32", "2001:db8:80::10/128"}
 	if !reflect.DeepEqual(got.PoolAddresses, wantAddrs) {

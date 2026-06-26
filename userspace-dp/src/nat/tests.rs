@@ -7,7 +7,7 @@ use super::allocator::{
     ALLOCATION_GC_BUDGET, NS_PER_SEC, PersistentLease, PersistentSourceKey, PoolAddressFamily,
     sticky_pool_index,
 };
-use super::source::SourceNatFlowKey;
+use super::source::{PersistentNatPermit, SourceNatFlowKey};
 use super::destination::{PROTO_ANY, PROTO_TCP, PROTO_UDP};
 use super::*;
 use crate::ip_proto::{PROTO_ESP, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6};
@@ -3283,6 +3283,144 @@ fn pool_snat_persistent_permit_any_remote_reuses_across_remotes() {
     assert_persistent_expiry_indexes_consistent(&rules[0]);
 }
 
+/// #2823: build a persistent-NAT pool rule with an explicit three-way
+/// `permit` mode string ("any-remote-host" | "target-host" |
+/// "target-host-port"), exercising the full enum wire path through
+/// `PersistentNatPermit::from_wire`.
+fn persistent_pool_rules_permit(
+    timeout_secs: i64,
+    port_low: u16,
+    port_high: u16,
+    permit: &str,
+) -> Vec<SourceNatRule> {
+    let mut snapshot =
+        persistent_pool_snapshot(timeout_secs, port_low, port_high, vec!["203.0.113.10"], false);
+    // Clear the legacy bool so the string is the sole source of truth.
+    snapshot.persistent_nat_permit_any_remote_host = false;
+    snapshot.persistent_nat_permit = permit.to_string();
+    parse_source_nat_rules(&[snapshot])
+}
+
+/// #2823 FAIL-ON-REVERT: `permit target-host` scopes the persistent lease
+/// to the remote HOST only (dst_ip), dropping the remote PORT from the key.
+/// A second flow from the same local source to a NEW remote PORT on the
+/// SAME remote host MUST reuse the first translated mapping. Reverting the
+/// target-host branch to (dst_ip, dst_port) keying makes the new-port flow
+/// allocate a distinct mapping and turns the reuse assertion RED — while the
+/// sibling `target-host-port` test (which expects no-reuse) stays GREEN.
+#[test]
+fn pool_snat_persistent_target_host_reuses_across_remote_ports() {
+    let rules = persistent_pool_rules_permit(300, 40000, 40010, "target-host");
+
+    // First flow: same local source to remote 8.8.8.8:53.
+    let first = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    // Second flow: SAME local source, SAME remote HOST, DIFFERENT remote PORT.
+    let second = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 443, 2));
+
+    assert_eq!(
+        (first.rewrite_src, first.rewrite_src_port),
+        (second.rewrite_src, second.rewrite_src_port),
+        "permit target-host must reuse the persistent mapping for a NEW remote \
+         port on the SAME remote host (issue #2823)"
+    );
+
+    // A DIFFERENT remote HOST must get a distinct lease (the scope is the
+    // remote host, not global).
+    let other_host = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "1.1.1.1", 53, 3));
+    assert_ne!(
+        (first.rewrite_src, first.rewrite_src_port),
+        (other_host.rewrite_src, other_host.rewrite_src_port),
+        "permit target-host must scope the lease to the remote host: a \
+         different remote host must get a distinct mapping"
+    );
+
+    let status = source_nat_pool_statuses(&rules);
+    // Two distinct remote HOSTS => two leases; the new-port reuse adds a reuse.
+    assert_eq!(status[0].persistent_leases, 2);
+    assert_eq!(status[0].allocations_total, 2);
+    assert_eq!(status[0].reuses_total, 1);
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
+}
+
+/// #2823: `permit target-host-port` keys the lease by the full remote
+/// endpoint (dst_ip + dst_port). A second flow from the same local source to
+/// the SAME remote host but a DIFFERENT remote PORT must NOT reuse the first
+/// mapping — it gets a distinct lease and port. This is the pre-#2823
+/// behavior and the back-compat default.
+#[test]
+fn pool_snat_persistent_target_host_port_distinct_per_remote_port() {
+    let rules = persistent_pool_rules_permit(300, 40000, 40010, "target-host-port");
+
+    let first = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    let second = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 443, 2));
+
+    assert_ne!(
+        (first.rewrite_src, first.rewrite_src_port),
+        (second.rewrite_src, second.rewrite_src_port),
+        "permit target-host-port must scope the lease to the remote host:PORT: \
+         a different remote port must get a distinct mapping (issue #2823)"
+    );
+
+    // Returning to the ORIGINAL remote host:port reuses its own lease.
+    let third = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 3));
+    assert_eq!(
+        (third.rewrite_src, third.rewrite_src_port),
+        (first.rewrite_src, first.rewrite_src_port),
+        "returning to the original remote host:port must reuse its lease"
+    );
+
+    let status = source_nat_pool_statuses(&rules);
+    assert_eq!(status[0].persistent_leases, 2);
+    assert_eq!(status[0].allocations_total, 2);
+    assert_eq!(status[0].reuses_total, 1);
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
+}
+
+/// #2823: `permit any-remote-host` keys the lease by the local source tuple
+/// only — ANY remote (different host AND/OR port) reuses the mapping. Driven
+/// through the enum string wire path.
+#[test]
+fn pool_snat_persistent_any_remote_host_reuses_everywhere() {
+    let rules = persistent_pool_rules_permit(300, 40000, 40010, "any-remote-host");
+
+    let first = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    // Different host AND different port.
+    let second = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "1.1.1.1", 443, 2));
+
+    assert_eq!(
+        (first.rewrite_src, first.rewrite_src_port),
+        (second.rewrite_src, second.rewrite_src_port),
+        "permit any-remote-host must reuse the persistent mapping across any \
+         remote host:port (issue #2823)"
+    );
+
+    let status = source_nat_pool_statuses(&rules);
+    assert_eq!(status[0].persistent_leases, 1);
+    assert_eq!(status[0].allocations_total, 1);
+    assert_eq!(status[0].reuses_total, 1);
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
+}
+
+/// #2823: an EMPTY wire `persistent_nat_permit` string (old control plane)
+/// falls back to the legacy bool. bool=false must mean target-host-port (the
+/// pre-#2823 (dst_ip, dst_port) keying), so a new remote port does NOT reuse.
+#[test]
+fn pool_snat_persistent_permit_empty_string_falls_back_to_legacy_bool() {
+    // Empty string + bool=false => TargetHostPort.
+    let mut snapshot = persistent_pool_snapshot(300, 40000, 40010, vec!["203.0.113.10"], false);
+    snapshot.persistent_nat_permit_any_remote_host = false;
+    snapshot.persistent_nat_permit = String::new();
+    let rules = parse_source_nat_rules(&[snapshot]);
+
+    let first = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    let second = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 443, 2));
+    assert_ne!(
+        (first.rewrite_src, first.rewrite_src_port),
+        (second.rewrite_src, second.rewrite_src_port),
+        "empty permit string + legacy bool=false must behave as target-host-port"
+    );
+}
+
 #[test]
 fn pool_snat_persistent_reassigns_after_timeout() {
     let rules = persistent_pool_rules(2, 40000, 40001);
@@ -4920,7 +5058,7 @@ fn pool_snat_sequential_collision_probes_next_free_port() {
         0,
         false,
         false,
-        false,
+        PersistentNatPermit::TargetHostPort,
         0,
         1_000,
     );
@@ -4971,7 +5109,7 @@ fn pool_snat_recycled_collision_retains_port() {
         0,
         false,
         false,
-        false,
+        PersistentNatPermit::TargetHostPort,
         0,
         1_000,
     );
@@ -5004,7 +5142,7 @@ fn pool_snat_recycled_collision_retains_port() {
         0,
         false,
         false,
-        false,
+        PersistentNatPermit::TargetHostPort,
         0,
         1_000,
     );
@@ -5046,7 +5184,7 @@ fn pool_snat_recycle_order_is_fifo_not_lifo() {
                 0,
                 false,
                 false,
-                false,
+                PersistentNatPermit::TargetHostPort,
                 0,
                 1_000,
             )
