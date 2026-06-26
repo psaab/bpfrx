@@ -6632,3 +6632,119 @@ fn flex_match_marks_filter_cache_sensitive() {
         "a flex-match term must mark the filter cache-sensitive"
     );
 }
+
+// === #3205 (agy-070 #08): port-except must FAIL CLOSED on an unresolved port ===
+//
+// A `destination-port-except <name>` whose name the dataplane cannot parse to a
+// port range (e.g. an unresolved symbolic name that slipped past the Go commit
+// gate on a tolerant load) leaves the port set constrained-but-empty
+// (PortMatcher::Any). The except path must NOT invert that empty set into
+// "match ALL ports" — that was the fail-OPEN hole where an `accept` term
+// accepted every port, including the one it was meant to exclude.
+//
+// FAIL-ON-REVERT: restore `port_match`'s `return except` (the constrained+Any
+// branch returning match-all for except) and the assertion below flips to
+// Accept -> RED.
+#[test]
+fn destination_port_except_unresolved_fails_closed_3205() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "accept-except-unresolved".into(),
+                    protocols: vec!["tcp".into()],
+                    // Unparseable token: non-empty (so the direction is
+                    // constrained) but yields ZERO ranges -> PortMatcher::Any.
+                    destination_ports_except: vec!["notaport".into()],
+                    action: "accept".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "default-discard".into(),
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    // A packet on ANY port must NOT be accepted by the broken except term; it
+    // must fall through to the terminal discard (fail closed).
+    let r = evaluate_filter(
+        &state,
+        "inet:f",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        54321,
+        12345,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Discard,
+        "an unresolved port-except (constrained + zero ranges) must NOT invert \
+         to match-ALL — the accept term must match NOTHING and the packet must \
+         fall through to the terminal discard (#3205 fail-open)"
+    );
+}
+
+// === #3205: a RESOLVED named port-except still matches correctly ===
+//
+// The fail-closed change must not regress the normal path: a port-except whose
+// name the dataplane DOES resolve (ssh -> 22) must except exactly that port and
+// match every other port.
+#[test]
+fn destination_port_except_resolved_name_matches_3205() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "discard-except-ssh".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports_except: vec!["ssh".into()], // resolves to 22
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    // Port 22 IS excepted -> term does NOT match -> implicit accept.
+    let r = evaluate_filter(
+        &state,
+        "inet:f",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        54321,
+        22,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Accept,
+        "port 22 (ssh) is in the resolved except list, must NOT match the discard term"
+    );
+    // Port 9999 is NOT excepted -> term matches -> discard.
+    let r = evaluate_filter(
+        &state,
+        "inet:f",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        54321,
+        9999,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Discard,
+        "port 9999 is NOT excepted, must match the discard term"
+    );
+}

@@ -991,9 +991,22 @@ type FirewallFilterTerm struct {
 	DestPortsExcept   []string // destination ports to EXCLUDE (match all others)
 	ICMPTypes         []int    // ICMP/ICMPv6 type bytes (0..255); empty = not set
 	ICMPCodes         []int    // ICMP/ICMPv6 code bytes (0..255); empty = not set
-	TCPFlags          []string // TCP flags: "syn", "ack", "fin", "rst", "psh", "urg"
-	IsFragment        bool     // match IP fragments
-	Action            string   // "accept", "reject", "discard", ""
+	// UnknownICMPTypes / UnknownICMPCodes / UnknownPorts record symbolic match
+	// values that could not be resolved to a number at compile time (#3205,
+	// agy-070 #07/#08). Previously such a value was silently dropped: an
+	// unresolved icmp-type left the type set empty (matches ALL ICMP — a policy
+	// bypass) and an unresolved named port left the port set constrained-but-
+	// empty (the `*-port-except` term matched ALL ports — fail open). These are
+	// the deferred-reject channel (mirroring UnknownActions): the compile path
+	// records the offending token and validateFilterMatchValuesStrict
+	// hard-rejects the commit; the tolerant load / peer-sync path downgrades to
+	// a warning, and the kept-verbatim token makes the dataplane fail CLOSED.
+	UnknownICMPTypes []string
+	UnknownICMPCodes []string
+	UnknownPorts     []string
+	TCPFlags         []string // TCP flags: "syn", "ack", "fin", "rst", "psh", "urg"
+	IsFragment       bool     // match IP fragments
+	Action           string   // "accept", "reject", "discard", ""
 	// UnknownActions records `then` tokens that are neither a recognized
 	// terminating action nor a recognized modifier (#2399 finding 032-16).
 	// An unknown or misspelled action would otherwise be silently dropped
