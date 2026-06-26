@@ -1,3 +1,31 @@
+## 2026-06-26 — #2870 VRRP AF_PACKET receiver: ALLMULTI instead of PROMISC
+
+- **Timestamp**: 2026-06-26
+- **Action**: `openAfPacketReceiver` (`pkg/vrrp/manager.go`) put the capture
+  interface into full promiscuous mode (`PACKET_MR_PROMISC`), which disables
+  the NIC's hardware unicast filter and copies every frame on the segment to
+  the host CPU — a perf hit on data-bearing RETH VLANs and a tenant-traffic
+  leak to the raw control-plane socket. Replaced with `PACKET_MR_ALLMULTI`
+  (receive-all-multicast) via a new testable helper `buildAfPacketMembership`.
+  VRRP adverts always use a multicast destination MAC (IPv4 224.0.0.18 ->
+  01:00:5e:00:00:12, IPv6 ff02::12 -> 33:33:00:00:00:12), so ALLMULTI delivers
+  every advert PROMISC did while restoring unicast filtering. ALLMULTI is
+  provably non-regressive: on a VLAN sub-interface both flags propagate to the
+  physical parent through the same kernel path (vlan_dev_change_rx_flags ->
+  dev_set_allmulti / dev_set_promiscuity). Specific-group PACKET_MR_MULTICAST
+  was NOT chosen: its dev_mc_add -> dev_mc_sync -> VF rx-mode propagation is
+  unconfirmed on the mlx5 SR-IOV VFs under a VLAN subif, and a silent MC-filter
+  miss there = split-brain (STOP-ON-FORK; group-MAC constants left in place for
+  a future live-validated switch). cBPF delivery filter unchanged.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/afpacket_membership_test.go,
+  docs/vrrp-afpacket-receiver.md, _Log.md
+- **Validation**: `go build ./...`; `go test ./pkg/vrrp/... ./pkg/daemon/...`
+  green. New unit tests TestAfPacketMembershipUsesAllmultiNotPromisc (membership
+  type) + TestVRRPGroupMACsAreCorrect (group MACs); fail-on-revert confirmed
+  (flip helper back to PROMISC -> RED). Live `make test-failover` on the loss
+  userspace cluster is the gating check before merge (broken receiver = no
+  failover).
+
 ## 2026-06-26 — #2944 VRRP link watcher robust to runtime interface rename
 
 - **Timestamp**: 2026-06-26
