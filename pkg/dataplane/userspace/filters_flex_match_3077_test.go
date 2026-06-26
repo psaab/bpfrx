@@ -56,6 +56,45 @@ func TestFilterSnapshotFlexMatchSerialized(t *testing.T) {
 	}
 }
 
+// TestFilterSnapshotFlexMatchStart is the #3232 wire guard: a `match-start
+// layer-4` term carries MatchStart "layer-4" on the wire so the Rust matcher
+// reads from the L4 base; layer-3 (the default) maps to "" so the wire stays
+// byte-identical to every pre-#3232 term (omitempty). REVERT (drop MatchStart
+// from the snapshot builder) makes the layer-4 case carry "" and this FAILS.
+func TestFilterSnapshotFlexMatchStart(t *testing.T) {
+	cases := []struct {
+		start string
+		want  string
+	}{
+		{"layer-3", ""}, // default base — omitted on the wire (byte-identical)
+		{"", ""},        // unset also means layer-3
+		{"layer-4", "layer-4"},
+	}
+	for _, tc := range cases {
+		cfg := &config.Config{}
+		cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+			"f": {Name: "f", Terms: []*config.FirewallFilterTerm{{
+				Name:   "t",
+				Action: "discard",
+				FlexMatch: &config.FlexMatchConfig{
+					MatchStart: tc.start,
+					ByteOffset: 0,
+					BitLength:  16,
+					Value:      0x0800,
+					Mask:       0xFFFF,
+				},
+			}}},
+		}
+		fm := buildFirewallFilterSnapshots(cfg)[0].Terms[0].FlexMatch
+		if fm == nil {
+			t.Fatalf("match-start %q: flex dropped", tc.start)
+		}
+		if fm.MatchStart != tc.want {
+			t.Errorf("match-start %q: wire MatchStart = %q, want %q", tc.start, fm.MatchStart, tc.want)
+		}
+	}
+}
+
 // TestFilterSnapshotFlexMatchValuePreMasked checks the compiled value is ANDed
 // with the mask on the wire (mirrors the legacy dataplane FlexValue =
 // Value & Mask lowering), so a snapshot value can never carry bits outside the

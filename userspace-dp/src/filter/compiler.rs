@@ -562,6 +562,21 @@ fn parse_term(
             .as_ref()
             .map_or(0, |f| f.value & f.mask),
         flex_mask: snap.flex_match.as_ref().map_or(0, |f| f.mask),
+        // #3232: the match-start base. "" / "layer-3" => L3 base (the #3077
+        // default); "layer-4" => transport-header base. The Go control plane
+        // rejects payload/unknown at commit, but the tolerant peer-sync path
+        // could still deliver one, so an unrecognized value lowers to
+        // Unsupported and the matcher fails the term closed (never the
+        // pre-#3232 silent L3-base mis-match).
+        flex_match_start: match snap
+            .flex_match
+            .as_ref()
+            .map(|f| f.match_start.as_str())
+        {
+            None | Some("") | Some("layer-3") => FlexMatchStart::Layer3,
+            Some("layer-4") => FlexMatchStart::Layer4,
+            Some(_) => FlexMatchStart::Unsupported,
+        },
         action,
         // #2544: this term falls through (applies modifiers, continues to the
         // next term) when it carries no terminating action. The Go control

@@ -718,6 +718,15 @@ type FlexMatchSnapshot struct {
 	Length uint8  `json:"length"`
 	Value  uint32 `json:"value"`
 	Mask   uint32 `json:"mask"`
+	// MatchStart is the Junos `match-start` base the byte Offset is relative
+	// to (#3232). "" (omitted) and "layer-3" both mean the L3/IP-header base
+	// — the historical, default behavior — so a layer-3 term stays
+	// byte-identical on the wire (omitempty). "layer-4" offsets from the
+	// transport (L4) header instead. `payload` and any other value are
+	// rejected at commit (validateFilterFlexMatchStrict), so they never reach
+	// the wire. omitempty + the Rust serde default keep parity with an older
+	// control plane that omits the field (#1961).
+	MatchStart string `json:"match_start,omitempty"`
 }
 
 type PolicerSnapshot struct {

@@ -339,7 +339,20 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm, family string) {
 					switch rc.Name() {
 					case "match-start":
 						if v := nodeVal(rc); v != "" {
-							fm.MatchStart = v
+							// #3232: only layer-3 (the default) and layer-4 are
+							// implemented in the userspace matcher. `payload` (and
+							// any other token) would previously be stored but
+							// silently evaluated at the L3 base by the wire builder
+							// and Rust matcher — a wrong-offset match (security
+							// evasion). layer-3/layer-4 carry through to the wire;
+							// everything else is recorded so
+							// validateFilterFlexMatchStrict fails the commit closed.
+							switch v {
+							case "layer-3", "layer-4":
+								fm.MatchStart = v
+							default:
+								term.UnknownFlexMatch = append(term.UnknownFlexMatch, "match-start "+v)
+							}
 						}
 					case "byte-offset":
 						if v := nodeVal(rc); v != "" {

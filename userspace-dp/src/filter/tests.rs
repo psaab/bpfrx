@@ -6381,6 +6381,7 @@ fn flex_match_matches_when_masked_bytes_equal_value() {
                 length: 2,
                 value: 0x4500,
                 mask: 0xFFFF,
+                match_start: String::new(),
             },
         ),
         &[],
@@ -6420,6 +6421,7 @@ fn flex_match_does_not_match_when_bytes_differ() {
                 length: 2,
                 value: 0x4500,
                 mask: 0xFFFF,
+                match_start: String::new(),
             },
         ),
         &[],
@@ -6463,6 +6465,7 @@ fn flex_match_non_byte_aligned_12bit_field() {
                 length: 2,
                 value: 0x0ABC,
                 mask: 0x0FFF,
+                match_start: String::new(),
             },
         ),
         &[],
@@ -6518,6 +6521,7 @@ fn flex_match_respects_mask() {
                 length: 2,
                 value: 0x0028,
                 mask: 0x00FF,
+                match_start: String::new(),
             },
         ),
         &[],
@@ -6568,6 +6572,7 @@ fn flex_match_fails_closed_on_short_packet() {
                 length: 4,
                 value: 0,
                 mask: 0,
+                match_start: String::new(),
             },
         ),
         &[],
@@ -6604,6 +6609,7 @@ fn flex_match_fails_closed_without_l3_slice() {
                 length: 2,
                 value: 0x4500,
                 mask: 0xFFFF,
+                match_start: String::new(),
             },
         ),
         &[],
@@ -6643,6 +6649,7 @@ fn term_without_flex_is_unaffected() {
             length: 2,
             value: 0x4500,
             mask: 0xFFFF,
+            match_start: String::new(),
         },
     );
     // Strip the flex constraint from the discard term.
@@ -6684,6 +6691,7 @@ fn flex_match_marks_filter_cache_sensitive() {
                 length: 2,
                 value: 0x4500,
                 mask: 0xFFFF,
+                match_start: String::new(),
             },
         ),
         &[],
@@ -6692,6 +6700,191 @@ fn flex_match_marks_filter_cache_sensitive() {
     assert!(
         filter.has_per_packet_l4_match_terms,
         "a flex-match term must mark the filter cache-sensitive"
+    );
+}
+
+// === #3232: flexible-match-range match-start layer-4 ===
+//
+// A `match-start layer-4` flex term must read its byte window relative to the
+// L4/transport header (TermMatchExtra::flex_l4), NOT the L3 header. Before #3232
+// the wire builder + Rust matcher ignored match-start and always read from the
+// L3 base, so a layer-4 config silently matched the wrong bytes.
+
+// TermMatchExtra carrying BOTH an L3 slice and a distinct L4 slice, so a test
+// can prove the matcher reads from the correct base.
+fn extra_flex_l3_l4<'a>(l3: &'a [u8], l4: &'a [u8]) -> TermMatchExtra<'a> {
+    TermMatchExtra {
+        l4_present: true,
+        flex_l3: Some(l3),
+        flex_l4: Some(l4),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn flex_match_layer4_matches_at_l4_offset() {
+    // offset 0, length 2, value 0xABCD over the L4 header. The L3 bytes at the
+    // same offset are 0x4500 (a real IPv4 version/IHL+DSCP), DIFFERENT from the
+    // L4 bytes 0xABCD — so a match proves the read came from the L4 base.
+    //
+    // FAIL-ON-REVERT: make `flex_matches` ignore `flex_match_start` and always
+    // read `flex_l3` (the pre-#3232 behavior); the L3 bytes 0x4500 != 0xABCD, so
+    // the discard term no longer matches and the action flips to Accept -> RED.
+    let state = make_filter_state(
+        &flex_filter(
+            "inet",
+            "tcp",
+            FlexMatchSnapshot {
+                offset: 0,
+                length: 2,
+                value: 0xABCD,
+                mask: 0xFFFF,
+                match_start: "layer-4".into(),
+            },
+        ),
+        &[],
+    );
+    let l3 = [0x45u8, 0x00, 0x00, 0x28, 0xde, 0xad];
+    let l4 = [0xABu8, 0xCD, 0x00, 0x50]; // e.g. src port 0xABCD
+    let hit = evaluate_filter(
+        &state,
+        "inet:fx",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        extra_flex_l3_l4(&l3, &l4),
+    );
+    assert_eq!(
+        hit.action,
+        FilterAction::Discard,
+        "match-start layer-4 must read the L4 bytes 0xABCD, not the L3 bytes 0x4500"
+    );
+}
+
+#[test]
+fn flex_match_layer3_default_still_reads_l3_when_l4_differs() {
+    // The layer-3 control for the test above: same packet, but match-start
+    // layer-3 (default). The matcher must read the L3 bytes 0x4500 and IGNORE
+    // the L4 bytes 0xABCD. Proves layer-3 is byte-identical to pre-#3232.
+    let state = make_filter_state(
+        &flex_filter(
+            "inet",
+            "tcp",
+            FlexMatchSnapshot {
+                offset: 0,
+                length: 2,
+                value: 0x4500,
+                mask: 0xFFFF,
+                match_start: String::new(), // layer-3 default
+            },
+        ),
+        &[],
+    );
+    let l3 = [0x45u8, 0x00, 0x00, 0x28, 0xde, 0xad];
+    let l4 = [0xABu8, 0xCD, 0x00, 0x50];
+    let hit = evaluate_filter(
+        &state,
+        "inet:fx",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        extra_flex_l3_l4(&l3, &l4),
+    );
+    assert_eq!(
+        hit.action,
+        FilterAction::Discard,
+        "match-start layer-3 (default) must read the L3 bytes 0x4500"
+    );
+}
+
+#[test]
+fn flex_match_layer4_fails_closed_without_l4_slice() {
+    // match-start layer-4 but flex_l4 == None (a non-first fragment, or the
+    // meta-only / deferred path). The term must FAIL CLOSED (no match) rather
+    // than fall back to the L3 base. The L3 slice is present and would match if
+    // the matcher wrongly read it.
+    let state = make_filter_state(
+        &flex_filter(
+            "inet",
+            "tcp",
+            FlexMatchSnapshot {
+                offset: 0,
+                length: 2,
+                value: 0x4500, // would match the L3 bytes if read from L3
+                mask: 0xFFFF,
+                match_start: "layer-4".into(),
+            },
+        ),
+        &[],
+    );
+    let l3 = [0x45u8, 0x00, 0x00, 0x28, 0xde, 0xad];
+    let res = evaluate_filter(
+        &state,
+        "inet:fx",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        TermMatchExtra {
+            l4_present: true,
+            flex_l3: Some(&l3),
+            flex_l4: None,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        res.action,
+        FilterAction::Accept,
+        "match-start layer-4 with no L4 slice must fail closed, not read the L3 base"
+    );
+}
+
+#[test]
+fn flex_match_unsupported_start_fails_closed() {
+    // Defense-in-depth for the tolerant peer-sync path: a match-start the Go
+    // commit gate rejects (e.g. "payload") could still arrive on the wire. It
+    // lowers to FlexMatchStart::Unsupported and must FAIL CLOSED — never be
+    // silently evaluated at the L3 base (the #3232 bug). The L3/L4 bytes both
+    // match the value, so only the Unsupported gate can produce a non-match.
+    let state = make_filter_state(
+        &flex_filter(
+            "inet",
+            "tcp",
+            FlexMatchSnapshot {
+                offset: 0,
+                length: 2,
+                value: 0x4500,
+                mask: 0xFFFF,
+                match_start: "payload".into(),
+            },
+        ),
+        &[],
+    );
+    let l3 = [0x45u8, 0x00, 0x00, 0x28, 0xde, 0xad];
+    let l4 = [0x45u8, 0x00, 0x00, 0x50];
+    let res = evaluate_filter(
+        &state,
+        "inet:fx",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        extra_flex_l3_l4(&l3, &l4),
+    );
+    assert_eq!(
+        res.action,
+        FilterAction::Accept,
+        "an unsupported match-start must fail closed, not evaluate at the L3 base"
     );
 }
 
