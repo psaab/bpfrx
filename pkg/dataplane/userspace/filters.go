@@ -194,7 +194,14 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 		// the compiler emits). A zero effective length is dropped (no
 		// constraint) rather than emitted as a degenerate always-fail match.
 		if fm := term.FlexMatch; fm != nil {
-			length := fm.BitLength / 8
+			// #3203: round UP to whole bytes so a non-multiple-of-8 bit length
+			// (e.g. 12 bits -> 2 bytes) reads enough bytes to cover the field.
+			// Integer truncation (BitLength/8) gave 1 byte for 12 bits, dropping
+			// the partial trailing byte so the match always failed closed. The
+			// Go compiler's default mask zeroes the extra bits within the ceil
+			// byte, so the matcher's (read & mask) == value comparison stays
+			// correct for a sub-byte field.
+			length := (int(fm.BitLength) + 7) / 8
 			if length == 0 {
 				length = 4 // default 32-bit, matching compiler_filter.go
 			}
@@ -203,7 +210,7 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 			}
 			snap.FlexMatch = &FlexMatchSnapshot{
 				Offset: fm.ByteOffset,
-				Length: length,
+				Length: uint8(length),
 				Value:  fm.Value & fm.Mask,
 				Mask:   fm.Mask,
 			}

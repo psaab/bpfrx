@@ -344,6 +344,18 @@ type compileOpts struct {
 	// no-brick); the unresolved token is kept verbatim so the dataplane fails
 	// CLOSED independently. Same doctrine as lenientFilterActions.
 	lenientFilterMatchValues bool
+	// lenientFlexMatch (#3203, agy-070 #02/#03/#04) downgrades the
+	// firewall-filter flexible-match-range gate (validateFilterFlexMatchStrict)
+	// from a hard compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects a term whose byte-offset/bit-length/
+	// match-value/match-mask could not be parsed or fell outside the
+	// representable range. Before this gate such a token was silently ignored,
+	// leaving the field at its zero default — a malformed or >32-bit
+	// match-value became 0x0 and the rule matched the WRONG pattern with a clean
+	// commit. The tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config still BOOTS (#1960 no-brick).
+	// Same doctrine as lenientFilterMatchValues.
+	lenientFlexMatch bool
 	// lenientNPTv6 (#2240) downgrades the NPTv6 (RFC 6296) validation gate
 	// (validateNPTv6Strict) from a hard compile error to a cfg.Warnings entry.
 	// The strict commit / commit-check path hard-rejects an NPTv6 static-NAT
@@ -973,6 +985,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFilterProtocols:              true,
 		lenientFilterActions:                true,
 		lenientFilterMatchValues:            true,
+		lenientFlexMatch:                    true,
 		lenientNPTv6:                        true,
 		lenientFirewallRefs:                 true,
 		lenientFlowServerTemplateRef:        true,
@@ -1101,6 +1114,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFilterProtocols:              true,
 		lenientFilterActions:                true,
 		lenientFilterMatchValues:            true,
+		lenientFlexMatch:                    true,
 		lenientNPTv6:                        true,
 		lenientFirewallRefs:                 true,
 		lenientFlowServerTemplateRef:        true,
@@ -1934,6 +1948,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFilterMatchValues {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("firewall filter match value (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3203 (agy-070 #02/#03/#04) firewall-filter flexible-match-range gate.
+	// Strict on commit / commit-check (hard-reject a term whose byte-offset/
+	// bit-length/match-value/match-mask could not be parsed or fell outside the
+	// representable range). Before this gate such a token was silently ignored
+	// by compileFilterFrom, leaving the field at its zero default — a malformed
+	// or >32-bit match-value became 0x0 and the rule matched the WRONG (zero)
+	// pattern with a clean commit. Lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960 no-brick).
+	// Runs on the fully-compiled *Config so the typed term list (with
+	// UnknownFlexMatch populated by compileFilterFrom) is available.
+	if err := validateFilterFlexMatchStrict(cfg); err != nil {
+		if opts.lenientFlexMatch {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter flexible-match-range (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

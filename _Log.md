@@ -1,3 +1,38 @@
+## 2026-06-26 — #3203 flexible-match-range compiler edge cases (agy-070 #02/#03/#04)
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fix three coupled lowering bugs in the firewall-filter
+  flexible-match-range compiler (follow-ups to #3077). (#02) Byte length now
+  ceil-rounds `(BitLength+7)/8` (capped at 4) in the userspace snapshot builder,
+  so a non-multiple-of-8 bit-length (e.g. 12 bits → 2 bytes) reads the whole
+  field instead of truncating to 1 byte and silently failing closed. (#03) A
+  parse error on ANY flex numeric token (byte-offset, bit-length, match-value,
+  match-mask) — or an out-of-range bit-length (>32) / oversized value (>32-bit)
+  — is recorded on the term (`UnknownFlexMatch`) and hard-rejected at commit by
+  the new `validateFilterFlexMatchStrict` gate (lenient → warning on the
+  tolerant load/peer-sync path per #1960). Before, the error was ignored and the
+  field stayed at its zero default, so a malformed/oversized match-value became
+  0x0 and matched the WRONG pattern with a clean commit. (#04) The default mask
+  is now the low `BitLength` bits for ANY 1..32-bit length (24-bit → 0x00FFFFFF,
+  12-bit → 0x00000FFF), not 0xFFFFFFFF for every non-8/16 length, which the
+  ceil-byte read could never satisfy. Byte-aligned 8/16/32-bit configs stay
+  byte-identical to the #3077 result.
+- **File(s)**: pkg/dataplane/userspace/filters.go,
+  pkg/config/compiler_firewall.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/types_system.go,
+  pkg/config/parser_security_test.go,
+  pkg/dataplane/userspace/filters_flex_match_3077_test.go,
+  userspace-dp/src/filter/tests.rs, docs/feature-gaps.md
+- **Validation**: `go build ./...`, `go test ./pkg/config/ ./pkg/dataplane/...`,
+  `cargo build --release` + `cargo test --release flex_match`. Fail-on-revert:
+  restoring `BitLength/8` truncation reds `TestFilterSnapshotFlexMatchCeilByteLength`;
+  restoring the ignored ParseUint error reds
+  `TestFlexibleMatchRangeRejectsMalformedValue` / `...RejectsOversizedValue`;
+  restoring the 8/16-only default mask reds
+  `TestFlexibleMatchRangeDefaultMaskNonStandardBitLength`. New Rust test
+  `flex_match_non_byte_aligned_12bit_field` confirms the lowered length=2 /
+  mask=0x0FFF selects the intended 12-bit field in the #3077 matcher.
+
 ## 2026-06-26 — #3205 firewall-filter symbolic match values: resolve + fail closed
 
 - **Timestamp**: 2026-06-26
