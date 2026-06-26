@@ -195,3 +195,160 @@ func validatePolicyThenPermitStrict(nodes []*Node, lenient bool) ([]string, erro
 	}
 	return warnings, nil
 }
+
+// supportedPolicyThenRejectChildren is the EXACT set of `then reject`
+// children the policy compiler (compilePolicy in compiler_security.go)
+// enforces. The `reject` arm sets pol.Action = PolicyReject and reads NO
+// children, so today the supported set is EMPTY — any child under
+// `then reject` (a Junos reject-profile `profile <name>`, a packet-type
+// reject like `tcp-reset`, or any other modifier) is silently dropped and
+// is rejected by validatePolicyThenRejectStrict. Keep this in lockstep
+// with compilePolicy's `then` switch `reject` arm: if the compiler ever
+// learns to enforce a `then reject` modifier (a synthesized reject
+// response or a per-packet-type reset), add it here so it is no longer
+// rejected.
+var supportedPolicyThenRejectChildren = map[string]bool{}
+
+// validatePolicyThenRejectStrict walks the `security policies` subtree of
+// the group-expanded AST and rejects any policy whose `then reject` action
+// arm carries a child the compiler does not enforce — the #3115 sibling of
+// validatePolicyThenPermitStrict (#3114).
+//
+// The defect: compilePolicy's `then` switch `reject` arm sets
+// `pol.Action = PolicyReject` and NEVER inspects `t.Children`. A
+// `then reject profile <name>` (a custom reject-response profile) or a
+// `then reject tcp-reset` (a packet-type reject) therefore commits cleanly
+// but has its profile / packet-type SILENTLY DROPPED — the dataplane emits
+// generic reject behaviour regardless of what the operator configured. The
+// set-schema (schema_security.go) does not list `reject` children and
+// schema_walk.go returns nil for unknown keywords, so nothing rejects them
+// either. The configured wire-contract / blocked-content semantics are
+// lost without any commit-time signal: the operator cannot tell the
+// profile is inert.
+//
+// Unlike #3114 (a dropped `then permit application-services` turns a
+// permit-with-inspection rule into an UNCONDITIONAL permit — a fail-open)
+// this is not a fail-open: reject still rejects. But it is a wire-contract
+// and operator-observability divergence — until reject profiles / packet-
+// type rejects are implemented the SAFE behaviour is to REJECT an
+// unsupported `then reject` child at commit rather than silently strip it.
+// A bare `then reject` (no child) is fully supported and commits.
+//
+// Same AST-pre-walk rationale, dual-shape (flat-set Keys[1] + hierarchical
+// Children) handling, both-scope (zone-pair + global) coverage, and
+// #1960 strict-with-lenient doctrine as validatePolicyThenPermitStrict.
+func validatePolicyThenRejectStrict(nodes []*Node, lenient bool) ([]string, error) {
+	var security *Node
+	for _, n := range nodes {
+		if n.Name() == "security" {
+			security = n
+			break
+		}
+	}
+	if security == nil {
+		return nil, nil
+	}
+	policies := security.FindChild("policies")
+	if policies == nil {
+		return nil, nil
+	}
+
+	var warnings []string
+	emit := func(scope, policyName, child string) error {
+		msg := fmt.Sprintf(
+			"security policies %s policy %q then reject %q is not supported "+
+				"(xpf emits a generic reject only; it does not implement "+
+				"reject profiles or per-packet-type reject responses such as "+
+				"tcp-reset — an unsupported then-reject child is silently "+
+				"dropped, so the configured custom reject response is inert and "+
+				"the operator cannot tell from commit that it has no effect) — "+
+				"remove the %q modifier under then reject (a bare then reject "+
+				"still works) (#3115)",
+			scope, policyName, child, child,
+		)
+		if !lenient {
+			return fmt.Errorf("%s", msg)
+		}
+		warnings = append(warnings, msg)
+		return nil
+	}
+
+	checkPolicy := func(scope, policyName string, polNode *Node) error {
+		thenNode := polNode.FindChild("then")
+		if thenNode == nil {
+			return nil
+		}
+		rejectNode := thenNode.FindChild("reject")
+		if rejectNode == nil {
+			return nil
+		}
+		// A bare `then reject` (flat-set: a `reject` node with
+		// Keys=["reject"] and no children; hierarchical: an empty `reject`
+		// block) is fully supported. Only `then reject <modifier>` carries
+		// an unsupported child, in TWO AST shapes:
+		//   - Flat set `then reject profile blocked-web` collapses the tail
+		//     onto the reject node: Keys=["reject","profile","blocked-web"].
+		//     The unsupported modifier is Keys[1]; Keys[2:] are its args.
+		//   - Hierarchical `then { reject { profile {...} } }` nests the
+		//     modifier as a child node of reject.
+		// Report the first offending modifier in either shape.
+		if len(rejectNode.Keys) >= 2 {
+			child := rejectNode.Keys[1]
+			if !supportedPolicyThenRejectChildren[child] {
+				if err := emit(scope, policyName, child); err != nil {
+					return err
+				}
+			}
+		}
+		for _, c := range rejectNode.Children {
+			child := c.Name()
+			if supportedPolicyThenRejectChildren[child] {
+				continue
+			}
+			if err := emit(scope, policyName, child); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	for _, child := range policies.Children {
+		switch child.Name() {
+		case "global":
+			for _, polInst := range namedInstances(child.FindChildren("policy")) {
+				if err := checkPolicy("global", polInst.name, polInst.node); err != nil {
+					return nil, err
+				}
+			}
+		case "from-zone":
+			// Mirror compilePolicies' two AST shapes.
+			type zonePair struct {
+				from, to   string
+				policyNode *Node
+			}
+			var pairs []zonePair
+			if len(child.Keys) >= 4 {
+				pairs = append(pairs, zonePair{child.Keys[1], child.Keys[3], child})
+			} else {
+				for _, fzSub := range child.Children {
+					tzNode := fzSub.FindChild("to-zone")
+					if tzNode == nil {
+						continue
+					}
+					for _, tzSub := range tzNode.Children {
+						pairs = append(pairs, zonePair{fzSub.Name(), tzSub.Name(), tzSub})
+					}
+				}
+			}
+			for _, zp := range pairs {
+				scope := fmt.Sprintf("from-zone %s to-zone %s", zp.from, zp.to)
+				for _, polInst := range namedInstances(zp.policyNode.FindChildren("policy")) {
+					if err := checkPolicy(scope, polInst.name, polInst.node); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+	}
+	return warnings, nil
+}

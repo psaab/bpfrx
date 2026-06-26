@@ -235,6 +235,14 @@ func (c *CLI) testPolicy(args []string) error {
 		return fmt.Errorf("invalid destination-ip %q", dstIP)
 	}
 
+	// #3108: reject a non-empty but unknown/out-of-range protocol token
+	// ("tcpp", "999") instead of letting matchApp short-circuit it to the
+	// "any protocol" wildcard, which would yield a misleading verdict for a
+	// policy using `application any`. An empty value still means "unspecified".
+	if err := policymatch.ValidateProtocol(proto); err != nil {
+		return err
+	}
+
 	parsedSrc := net.ParseIP(srcIP)
 	parsedDst := net.ParseIP(dstIP)
 

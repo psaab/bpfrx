@@ -154,6 +154,15 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		return nil, status.Errorf(codes.InvalidArgument, "invalid destination-port: %v", err)
 	}
 
+	// A non-empty but unknown/out-of-range protocol token ("tcpp", "999") must
+	// not pass through to the shared matcher, whose matchApp short-circuits to
+	// match-any for an unresolvable protocol, yielding a misleading verdict for
+	// a policy using `application any` (#3108). An empty value stays the
+	// unspecified wildcard (match any protocol).
+	if err := policymatch.ValidateProtocol(req.Protocol); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+
 	// #3042: delegate to the single shared simulator so gRPC agrees with the
 	// runtime evaluator (zone-pair -> global -> default-policy, predefined +
 	// nested-app-set + literal-CIDR + any-ipv4/any-ipv6 + exclusion + feed

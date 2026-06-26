@@ -789,6 +789,26 @@ type compileOpts struct {
 	// service-chain support is a deferred follow-up. Same doctrine as
 	// lenientPolicyMatchLeaves.
 	lenientPolicyThenPermit bool
+	// lenientPolicyThenReject (#3115) downgrades the security-policy
+	// unsupported-then-reject-child gate (validatePolicyThenRejectStrict)
+	// from a hard compile error to a cfg.Warnings entry. A security policy
+	// whose `then reject` arm carries a child the compiler does not enforce
+	// — a reject `profile <name>` (custom reject response) or a packet-type
+	// reject like `tcp-reset` — committed cleanly but had that modifier
+	// SILENTLY DROPPED: compilePolicy's `then` switch `reject` arm sets
+	// pol.Action = PolicyReject and never inspects t.Children, and the
+	// set-schema/schema_walk ignore unknown keywords. Unlike #3114 this is
+	// not a fail-open (reject still rejects), but the configured custom
+	// reject response is inert — a wire-contract / operator-observability
+	// divergence the operator cannot detect at commit. The strict commit /
+	// commit-check path hard-rejects so it is operator-visible (naming the
+	// policy scope, the policy, and the unsupported child); the tolerant
+	// load / peer-sync paths downgrade to a warning so an already-persisted
+	// or peer-synced config an older binary silently accepted still BOOTS
+	// (#1960 fail-closed-on-load class) — the child stays dropped (the
+	// pre-existing behaviour), now flagged. Reject-profile support is a
+	// deferred follow-up. Same doctrine as lenientPolicyThenPermit.
+	lenientPolicyThenReject bool
 	// lenientPolicyCommunityRef (#2881) downgrades the policy community
 	// cross-reference gate (validatePolicyCommunityReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. A policy term's
@@ -880,6 +900,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientSecureTunnelBindIface:       true,
 		lenientPolicyMatchLeaves:           true,
 		lenientPolicyThenPermit:            true,
+		lenientPolicyThenReject:            true,
 		lenientPolicyCommunityRef:          true,
 	})
 }
@@ -1001,6 +1022,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientSecureTunnelBindIface:       true,
 		lenientPolicyMatchLeaves:           true,
 		lenientPolicyThenPermit:            true,
+		lenientPolicyThenReject:            true,
 		lenientPolicyCommunityRef:          true,
 	})
 }
@@ -1175,6 +1197,21 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3115: reject any policy whose `then reject` arm carries a child the
+	// compiler does not enforce (a reject `profile <name>` custom response,
+	// or a packet-type reject like `tcp-reset`). compilePolicy's `then`
+	// switch `reject` arm sets pol.Action = PolicyReject and never inspects
+	// the children, so the modifier is silently dropped — the configured
+	// custom reject response is inert and the operator cannot tell from
+	// commit. Sibling of the #3114 then-permit gate above; same group-
+	// expanded / inactive-pruned tree, same strict-with-lenient (#1960)
+	// doctrine. Reject-profile support is a deferred follow-up.
+	policyThenRejectWarnings, err := validatePolicyThenRejectStrict(
+		tree.Children, opts.lenientPolicyThenReject)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -1214,6 +1251,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyThenPermitWarnings...)
+	cfg.Warnings = append(cfg.Warnings, policyThenRejectWarnings...)
 
 	for _, node := range tree.Children {
 		switch node.Name() {
