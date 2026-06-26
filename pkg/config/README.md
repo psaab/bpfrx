@@ -219,6 +219,25 @@ left to #2907's next-hop-family-aware default (never a mismatch); a
 matched-family explicit destination passes. Same fail-closed-on-load
 doctrine as #3043.
 
+**VRRP virtual-address must fall within a unit subnet (#3013):** a
+`vrrp-group <id> virtual-address <vip>` is authored under a
+`family inet|inet6 address <prefix>` on an interface unit. In Junos/vSRX a
+VIP outside every on-link subnet of the unit is a commit-time configuration
+error; xpf accepted it and at runtime installed the VIP as a route-less host
+address — return traffic sourced from the VIP has no on-link subnet
+association and silently blackholes. `validateVRRPVirtualAddressSubnet`
+(`compiler_validate_strict.go`) asserts each VIP is contained in the prefix
+of at least one address configured on the SAME unit for the MATCHING family.
+The owner / priority-255 case (VIP equals an interface address) passes for
+free (an address is contained in its own subnet); a cross-family VIP (e.g. a
+v4 literal authored under a v6-only address) has no matching-family subnet
+and is rejected. The strict commit/commit-check path hard-rejects naming the
+interface, unit, group, VIP and family; the tolerant load/peer-sync path
+downgrades to a warning (`lenientVRRPVirtualAddress`) so an already-persisted
+or peer-synced config an older binary accepted still boots (#1960 no-brick).
+This is config-only commit-time validation — it never touches the VRRP
+runtime/state machine. Same fail-closed-on-load doctrine as #2911.
+
 **No-match default-policy is fail-closed (#3065):** the sibling of #3043
 for the implicit fallback. When a flow matches NO zone-pair, global, or
 default policy, the verdict is `SecurityConfig.DefaultPolicy`. Because the

@@ -3284,3 +3284,140 @@ func validateNATSourceAddressNameReferencesStrict(cfg *Config) error {
 	}
 	return nil
 }
+
+// vrrpVIPHostIP returns the host IP of a VRRP virtual-address string. xpf
+// requires a /prefix (schema_interfaces.go vrrpGroupSchemaNode), so the VIP is
+// normally CIDR (e.g. 10.0.1.1/24); a bare IP is tolerated here so a leniently-
+// loaded legacy config is still classified. An unparseable value returns nil
+// and is left to the schema validator's concern.
+func vrrpVIPHostIP(vip string) net.IP {
+	if vip == "" {
+		return nil
+	}
+	if ip, _, err := net.ParseCIDR(vip); err == nil {
+		return ip
+	}
+	return net.ParseIP(vip)
+}
+
+// validateVRRPVirtualAddressSubnet (#3013) rejects a VRRP virtual-address that
+// does not fall within any subnet configured on the same interface unit for the
+// matching address family.
+//
+// Background: a `vrrp-group <id> virtual-address <vip>` block is authored under
+// a `family inet|inet6 address <prefix>` on a unit. In Junos/vSRX a VIP outside
+// every on-link subnet of the unit is a commit-time configuration error. xpf
+// accepted it: at runtime the daemon installs the VIP as a host address, but
+// with no connected route covering it return traffic sourced from the VIP has
+// no on-link subnet association — a silent misconfiguration (operator-visible
+// only as a blackhole). This check restores vSRX config-parity by catching the
+// misconfig at commit instead of at runtime.
+//
+// For each VIP the validator asserts containment in the prefix of at least one
+// address configured on the SAME unit of the MATCHING family. The owning /
+// priority-255 case (VIP equals an interface address) is covered for free — an
+// interface address is trivially contained in its own subnet. A cross-family
+// VIP (e.g. a v4 literal authored under a v6-only address) has no matching-
+// family subnet to contain it and is therefore rejected, which is the intent.
+//
+// A unit carrying a real VRRP group always has at least the parent address of
+// the VIP's family in unit.Addresses (the group is nested under it), so the
+// matching-family subnet set is non-empty in the valid case — the only empty
+// case is the genuine cross-family/out-of-subnet misconfig.
+//
+// Strict (commit / commit-check): hard-reject, naming the interface, unit,
+// group, VIP and family. Lenient (load / peer-sync): warn so an already-
+// persisted or peer-synced config an older binary accepted still boots (#1960
+// fail-closed-on-load class).
+func validateVRRPVirtualAddressSubnet(cfg *Config, lenient bool) ([]string, error) {
+	if cfg == nil || cfg.Interfaces.Interfaces == nil {
+		return nil, nil
+	}
+	var warnings []string
+	// Deterministic iteration so commit errors / warnings are stable.
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, name)
+	}
+	sort.Strings(ifNames)
+	for _, ifName := range ifNames {
+		ifc := cfg.Interfaces.Interfaces[ifName]
+		if ifc == nil {
+			continue
+		}
+		unitNums := make([]int, 0, len(ifc.Units))
+		for n := range ifc.Units {
+			unitNums = append(unitNums, n)
+		}
+		sort.Ints(unitNums)
+		for _, un := range unitNums {
+			unit := ifc.Units[un]
+			if unit == nil || len(unit.VRRPGroups) == 0 {
+				continue
+			}
+			// Pre-parse the unit's configured subnets by family. The
+			// containment test is textual-CIDR based (net.ParseCIDR), so an
+			// unparseable address is skipped — not this validator's concern.
+			var v4nets, v6nets []*net.IPNet
+			for _, a := range unit.Addresses {
+				_, ipnet, err := net.ParseCIDR(a)
+				if err != nil || ipnet == nil {
+					continue
+				}
+				if ipnet.IP.To4() != nil {
+					v4nets = append(v4nets, ipnet)
+				} else {
+					v6nets = append(v6nets, ipnet)
+				}
+			}
+			gkeys := make([]string, 0, len(unit.VRRPGroups))
+			for k := range unit.VRRPGroups {
+				gkeys = append(gkeys, k)
+			}
+			sort.Strings(gkeys)
+			for _, gk := range gkeys {
+				vg := unit.VRRPGroups[gk]
+				if vg == nil {
+					continue
+				}
+				for _, vip := range vg.VirtualAddresses {
+					ip := vrrpVIPHostIP(vip)
+					if ip == nil {
+						// Bare/garbage VIP: the schema CIDR validator is
+						// responsible for rejecting a non-address value.
+						continue
+					}
+					nets := v6nets
+					fam := "inet6"
+					if ip.To4() != nil {
+						nets = v4nets
+						fam = "inet"
+					}
+					contained := false
+					for _, n := range nets {
+						if n.Contains(ip) {
+							contained = true
+							break
+						}
+					}
+					if contained {
+						continue
+					}
+					msg := fmt.Sprintf(
+						"interfaces %s unit %d vrrp-group %d virtual-address %s: "+
+							"not within any family %s subnet configured on the unit; "+
+							"the VIP would install without a connected route and "+
+							"blackhole return traffic (vSRX rejects this at commit)",
+						ifName, un, vg.ID, vip, fam)
+					if lenient {
+						warnings = append(warnings, msg+
+							" (ignored: VIP installed without a connected route until corrected)")
+						continue
+					}
+					return nil, fmt.Errorf("%s", msg)
+				}
+			}
+		}
+	}
+	return warnings, nil
+}

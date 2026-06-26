@@ -831,6 +831,22 @@ type compileOpts struct {
 	// community VALUE (e.g. 65000:100), not a list reference, and is not
 	// checked. Same doctrine as lenientRoutingExportRef.
 	lenientPolicyCommunityRef bool
+	// lenientVRRPVirtualAddress (#3013) downgrades the VRRP virtual-address
+	// subnet-containment gate (validateVRRPVirtualAddressSubnet) from a hard
+	// compile error to a cfg.Warnings entry. A VRRP virtual-address that does
+	// not fall within any subnet configured on the same interface unit for the
+	// matching family — e.g. `family inet address 10.0.61.1/24` with
+	// `vrrp-group 1 virtual-address 10.0.99.1/24` — committed cleanly but is a
+	// commit-time configuration error in Junos/vSRX. At runtime the daemon
+	// installs the VIP with no connected route covering it, so return traffic
+	// sourced from the VIP has no on-link subnet association — a silent
+	// blackhole the operator only sees as dropped traffic. The strict commit /
+	// commit-check path hard-rejects so the operator-error is visible (naming
+	// the interface, unit, group, VIP, and family); the tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config an older binary accepted still BOOTS (#1960
+	// fail-closed-on-load class). Same doctrine as lenientBackupRouterDst.
+	lenientVRRPVirtualAddress bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -902,6 +918,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyThenPermit:            true,
 		lenientPolicyThenReject:            true,
 		lenientPolicyCommunityRef:          true,
+		lenientVRRPVirtualAddress:          true,
 	})
 }
 
@@ -1024,6 +1041,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyThenPermit:            true,
 		lenientPolicyThenReject:            true,
 		lenientPolicyCommunityRef:          true,
+		lenientVRRPVirtualAddress:          true,
 	})
 }
 
@@ -2279,6 +2297,19 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 	cfg.Warnings = append(cfg.Warnings, brWarnings...)
+
+	// #3013: VRRP virtual-address subnet-containment gate. A virtual-address
+	// must fall within a subnet configured on the same interface unit for the
+	// matching family — otherwise the installed VIP has no connected route and
+	// return traffic from it blackholes. vSRX rejects this at commit; xpf did
+	// not. Strict (commit / commit-check): hard-reject naming the offending
+	// field. Lenient (load / peer-sync): warn so a config committed before this
+	// gate existed still boots (#1960 fail-closed-on-load class).
+	vaWarnings, err := validateVRRPVirtualAddressSubnet(cfg, opts.lenientVRRPVirtualAddress)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Warnings = append(cfg.Warnings, vaWarnings...)
 
 	// #2227 MAJOR-1: port-scan / ip-sweep threshold clamp warning. The AF_XDP
 	// dataplane bounds its per-(zone,source) unique-destination set at
