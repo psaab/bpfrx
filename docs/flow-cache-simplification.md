@@ -392,7 +392,7 @@ REPLACES an existing neighbor's hwaddr with a DIFFERENT MAC — never on a
 first insert of a new neighbor (no cached flow can reference a MAC that did
 not previously exist) and never on a same-MAC ARP/NDP refresh (the
 overwhelmingly common case; bumping there would flush the whole flow cache on
-every neighbor refresh and collapse the fast-path hit rate). All FOUR
+every neighbor refresh and collapse the fast-path hit rate). All FIVE
 neighbor write paths are covered:
 
 - the netlink monitor (`insert_if_changed`, the primary RTM_NEWNEIGH path);
@@ -423,7 +423,27 @@ neighbor write paths are covered:
   removes, then bumps the epoch exactly once for the whole batch if any
   incoming MAC differs from its snapshotted prior (a pure same-MAC refresh
   and brand-new keys with no prior do NOT bump). HA peer-promoted session
-  closes remain out of scope.
+  closes remain out of scope;
+- the #1787 RX source-MAC data-path learn (`learn_dynamic_neighbor` in
+  `neighbor_dispatch.rs`), now routed through
+  `ShardedNeighborMap::learn_pair_if_changed` (#3169). This learn snoops the
+  source MAC off every received frame and writes it under up to two keys (the
+  physical ingress ifindex plus the resolved logical VLAN sub-ifindex) in the
+  #949 pair-write. Its `pair_write_needed` gate fires on a genuine MAC change
+  (`current != Some(src_mac)`), not just a first sighting, so it really does
+  mutate an existing neighbor's MAC — and `lookup_neighbor_entry`
+  (`forwarding/mod.rs`) falls back to `dynamic_neighbors` for a next-hop
+  absent from the manager set, the common AF_XDP fast-path case where the
+  kernel never ARP-resolves the next-hop because zero-copy bypasses the
+  stack. Without a bump an RX-learned MAC change would leave the cached
+  `dst_mac` stale until session expiry (the #3048 blackhole class), and it
+  could also SHADOW the kernel monitor's `insert_if_changed` (the monitor
+  then observes `prior == new` and does not bump). `learn_pair_if_changed`
+  snapshots each key's prior MAC via `BulkShardGuard::get` under the same
+  all-shard lock as the insert, then bumps the epoch exactly once for the
+  pair if any key replaces an existing MAC with a different one — first
+  sighting and same-MAC re-learn add a single Relaxed read per key and no
+  bump, matching the per-key semantics.
 
 `FlowCacheEntry` carries a `neighbor_mac_epoch` stamped at insert
 (`poll_descriptor/mod.rs`, the single insert site, reading the live
@@ -452,7 +472,10 @@ accumulating on the single global epoch, the three resolver cases
 epoch-reject no-bump), and the four bulk-replace cases
 (`mac_change_epoch_bulk_replace_*`: change bumps — fail-on-revert for
 `bulk_replace_neighbors` —, same-MAC refresh no-bump, brand-new-keys
-no-bump, and a single bump for a multi-key batch).
+no-bump, and a single bump for a multi-key batch), and the four RX-learn
+cases (`mac_change_epoch_rx_learn_*`: first-sighting no-bump, same-MAC
+re-learn no-bump, change bumps — fail-on-revert for `learn_pair_if_changed`
+—, and a single bump for the multi-key #949 pair-write).
 `cached_descriptor_evicted_only_on_neighbor_mac_change`
 (flow_cache_tests.rs) is the end-to-end fail-on-revert: a descriptor stamped
 at the live epoch survives a same-MAC refresh and is evicted on a MAC change.
