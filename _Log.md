@@ -1,3 +1,25 @@
+## 2026-06-26 — #3007 queue-planner plan-key: fold sysfs-resolved rx_queues
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fixed #3007 (follow-up from PR #3001). When a binding
+  candidate's snapshot `rx_queues == 0`, `replan_queues` resolves the real
+  channel count from sysfs (`rx_queue_count`), but the plan-key hash hashed
+  the raw 0 — so an out-of-band `ethtool -L <if> combined N` (no config
+  commit) kept the key identical and the same-plan-skip left a stale queue
+  layout. Extracted `effective_rx_queues(snapshot_rx_queues, linux_name)` as
+  the single resolution path used by BOTH the planner (iface + fabric loops)
+  and `update_snapshot_binding_plan_key`, so the dedup key can never diverge
+  from the layout. Nonzero snapshot never reads sysfs → key byte-identical to
+  pre-fix for the normal case. Added a `#[cfg(test)]` thread-local override
+  on `rx_queue_count` to drive the sysfs count in tests. Did NOT touch the
+  #3091 VLAN-child dedup or the min-collapse.
+- **File(s)**: userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md
+- **Tests**: plan_key_folds_sysfs_resolved_rx_queues_when_snapshot_is_zero
+  (fail-on-revert: RED when the iface hash reverts to `iface.rx_queues`),
+  plan_key_for_nonzero_rx_queues_ignores_sysfs (no-regression). Full suite
+  3075 passed / 2 ignored / 0 failed.
+
 ## 2026-06-26 — #3104: policymatch simulator skips scheduler-inactive policies (verdict companion to #3062 display)
 
 - **Timestamp**: 2026-06-26

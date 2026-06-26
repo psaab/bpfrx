@@ -96,6 +96,19 @@ worker layout. `plan_key_covers_every_replan_queues_input` (#2916) pins this:
 mutating any planner-consumed field bumps the key (and is shown to change the
 produced layout), so a dropped hash field goes RED.
 
+`rx_queues` is folded in via its EFFECTIVE value, not the raw snapshot field
+(#3007). When the snapshot carries the degenerate `rx_queues == 0` fallback,
+`replan_queues` resolves the real channel count from sysfs
+(`rx_queue_count` → `/sys/class/net/<if>/queues`), and THAT count drives the
+layout. `effective_rx_queues(snapshot_rx_queues, linux_name)` is the single
+resolution path shared by both the planner and the hash, so the dedup key can
+never disagree with the layout: a nonzero snapshot never reads sysfs (the key
+stays byte-identical to the raw-field hash), while a 0 snapshot folds the
+sysfs-resolved count in — so an out-of-band channel change (`ethtool -L <if>
+combined N`, no config commit) bumps the key and forces a replan instead of
+taking the same-plan-skip. `plan_key_folds_sysfs_resolved_rx_queues_when_snapshot_is_zero`
+and `plan_key_for_nonzero_rx_queues_ignores_sysfs` pin both halves.
+
 The Rust planner does:
 
 ```rust
