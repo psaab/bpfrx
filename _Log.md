@@ -1,3 +1,19 @@
+## 2026-06-25 — #3120: IPv6 screen ext-header walk continues past Fragment header
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed the IPv6 extension-header walk in the screen
+  extractor so a FIRST fragment (`Fragment → Destination-Options → TCP`)
+  no longer hides the TCP header from the TCP-flag screens / SYN-cookie
+  flood challenge. The `NEXTHDR_FRAGMENT` arm now continues the bounded
+  walk past the 8-byte fragment header for fragment offset == 0 instead
+  of unconditionally `break`ing; a non-first fragment (offset > 0) still
+  stops (no L4 here — #2344/#3064). Added two Rust tests (frag→dest-opts
+  →TCP first fragment extracts seq/MSS; non-first fragment stays flowless)
+  — fail-on-revert verified RED→GREEN. Updated module doc + frame README.
+- **File(s)**: userspace-dp/src/screen/extract.rs,
+  userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/frame/README.md
+
 - **2026-06-25**: #3044 (codex-review-061 finding 061-03) — reject a security policy whose `match` clause omits a required Junos dimension (source-address, destination-address, application) or omits the `match` block entirely. Previously `compilePolicy` (compiler_security.go) filled each match slice only when the leaf was present, and the userspace dataplane treats an empty slice as match-ANY — so a partial policy silently widened to traffic the operator never intended (`match source-address corp; then permit` → corp->any:any; a match-less policy → zone-pair-wide permit/deny). A fail-OPEN for permit, an over-broad block for deny; on Junos this cannot commit. Added `validatePolicyRequiredMatchStrict` (new pkg/config/compiler_policy_missing_match.go), an AST pre-walk in compileExpanded (same rationale as the #3113 unsupported-match-leaf gate — a missing leaf leaves no trace in the typed *Config and SchemaValidate cannot reject an absence). Contract = Junos parity: all three dimensions REQUIRED; a missing dimension is distinct from an explicit `any` (operator must write the wildcard); source/destination-address-excluded are modifiers, not substitutes. Covers zone-pair AND global; runs on the group-expanded inactive-pruned tree. Strict hard-reject on CompileConfig naming scope/policy/every missing dimension; lenient-warn on both lenient constructors via new `lenientPolicyMissingMatch` flag (#1960 no-brick). Updated existing fixtures that relied on the dangerous shorthand to use explicit `any` (the issue directed this). Fail-on-revert verified RED→GREEN (validator stubbed to return nil → 7 reject subtests RED). Files: pkg/config/compiler_policy_missing_match.go (new), pkg/config/compiler.go, pkg/config/compiler_policy_missing_match_3044_test.go (new), pkg/config/README.md, plus fixture updates in compiler_policy_then_3114_test.go, compiler_policy_then_3115_test.go, policy_match_excluded_test.go, policy_terminal_action_3043_test.go, policy_zone_ref_test.go, reserved_zone_name_3055_test.go, parser_ast_test.go
 ## 2026-06-25 — #3107: CLI `test policy` gains a source-port input
 
