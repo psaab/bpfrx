@@ -59,4 +59,8 @@ both the daemon-local CLI (xpfd in TTY mode) and the remote CLI
   `any-ipv4`/`any-ipv6`, and source/destination exclusion — so the
   diagnostic could report the OPPOSITE of what the dataplane enforces.
   `policymatch.Match` now honors the configured `default-policy` and reports
-  whether a global policy matched.
+  whether a global policy matched. #3104: `show security match-policies` and
+  `test policy` thread live per-scheduler active-state
+  (`c.policyInactiveFn()` → `policymatch.Query.PolicyInactiveFn`) so a
+  scheduler-inactive policy is skipped like the runtime; with no live state
+  (offline CLI) scheduled policies are simulated as-if-active.

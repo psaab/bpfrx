@@ -474,3 +474,71 @@ fn mac_change_epoch_confirmed_resolver_epoch_reject_no_bump() {
     assert_eq!(map.mac_change_epoch(), 0);
     assert_eq!(map.get(&k), Some(entry(0xAB)));
 }
+
+// ── #3169: RX source-MAC data-path learn (learn_pair_if_changed) ─────
+// The fifth neighbor-MAC write path. learn_dynamic_neighbor routes its
+// #949 pair-write through learn_pair_if_changed, which must follow the
+// same epoch semantics as the other four paths: a genuine MAC change on
+// an existing dynamic neighbor bumps mac_change_epoch (so a flow-cache
+// dst_mac resolved via the dynamic_neighbors fallback is evicted), while
+// a first sighting and a same-MAC re-learn do not.
+
+#[test]
+fn mac_change_epoch_rx_learn_no_bump_on_first_sighting() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    // A brand-new RX-learned neighbor: no cached flow can hold a stale
+    // MAC for a neighbor that did not exist, so the epoch stays put.
+    map.learn_pair_if_changed(&[k], entry(0xAB));
+    assert_eq!(map.get(&k), Some(entry(0xAB)));
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_rx_learn_no_bump_on_same_mac_relearn() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    map.learn_pair_if_changed(&[k], entry(0xAB));
+    // A re-learn of the SAME source MAC (the steady-state case) must not
+    // bump, else every RX packet from a known source would flush the
+    // flow cache. This case must stay GREEN when the bump is neutralized.
+    map.learn_pair_if_changed(&[k], entry(0xAB));
+    assert_eq!(map.mac_change_epoch(), 0);
+}
+
+#[test]
+fn mac_change_epoch_rx_learn_bumps_on_mac_change() {
+    let map = ShardedNeighborMap::new();
+    let k = key_v4(7, 42);
+    map.learn_pair_if_changed(&[k], entry(0xAB));
+    assert_eq!(map.mac_change_epoch(), 0);
+    // An RX-learned MAC change for an existing dynamic neighbor (the
+    // pair_write_needed gate fires on `current != Some(src_mac)`, not
+    // just first sighting). lookup_neighbor_entry falls back to this map
+    // for unresolved fast-path next-hops, so the epoch MUST advance to
+    // evict the stale cached dst_mac (#3169). Fail-on-revert guard for
+    // learn_pair_if_changed: neutralizing its fetch_add makes this RED.
+    map.learn_pair_if_changed(&[k], entry(0xCD));
+    assert_eq!(map.get(&k), Some(entry(0xCD)));
+    assert_eq!(map.mac_change_epoch(), 1);
+    // A subsequent same-MAC re-learn does not advance it further.
+    map.learn_pair_if_changed(&[k], entry(0xCD));
+    assert_eq!(map.mac_change_epoch(), 1);
+}
+
+#[test]
+fn mac_change_epoch_rx_learn_pair_single_bump_for_both_keys() {
+    let map = ShardedNeighborMap::new();
+    // The #949 pair-write installs the same MAC under the physical and
+    // the resolved logical (VLAN sub-) ifindex. Seed both, then change
+    // the MAC on both in one learn: the coarse global epoch bumps exactly
+    // ONCE for the pair, not once per key.
+    let phys = key_v4(7, 42);
+    let logical = key_v4(99, 42);
+    map.learn_pair_if_changed(&[phys, logical], entry(0xAB));
+    assert_eq!(map.mac_change_epoch(), 0);
+    map.learn_pair_if_changed(&[phys, logical], entry(0xCD));
+    assert_eq!(map.get(&phys), Some(entry(0xCD)));
+    assert_eq!(map.get(&logical), Some(entry(0xCD)));
+    assert_eq!(map.mac_change_epoch(), 1);
+}

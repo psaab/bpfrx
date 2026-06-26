@@ -146,7 +146,14 @@ under the daemon's errgroup. Nothing else imports this package.
   (`FeedOverlayFn`). The pre-#3042 hand-written matcher scanned only
   zone-pair policies, hard-coded `deny (default)`, and missed predefined
   apps / literal CIDRs — so the diagnostic could report the OPPOSITE of what
-  the dataplane enforces.
+  the dataplane enforces. #3104: the handler also threads live per-scheduler
+  active-state (`PolicySchedulerActiveStateFn`, wired from the daemon-local
+  `Manager.PolicySchedulerActiveState`) into `policymatch.Query.PolicyInactiveFn`,
+  so a scheduler-inactive policy is SKIPPED exactly like the runtime
+  (`policy.rs try_match_rule`) and the verdict falls through to the next active
+  rule / default-policy. When live state is unavailable (no dataplane) the
+  simulator evaluates scheduled policies as-if-active (the #3062 display
+  fallback) — a non-scheduled policy is unaffected either way.
 - The SSE handler reads from `pkg/logging.EventBuffer`. The buffer is
   bounded; if a consumer stops reading, events are dropped silently — by
   design.

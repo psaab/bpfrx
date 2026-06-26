@@ -1243,6 +1243,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 			FeedOverlayFn: func() map[string][]string {
 				return d.feedSnapshotsForConfig(d.store.ActiveConfig())
 			},
+			// #3104: live per-scheduler active-state so the REST
+			// match-policies simulator skips a scheduler-inactive policy
+			// exactly like the runtime, instead of returning a verdict the
+			// dataplane disagrees with. Sourced from the same daemon-local
+			// accessor the CLI/gRPC show surfaces use
+			// (Manager.PolicySchedulerActiveState via the dataplane adapter).
+			// ok=false when the dataplane is absent (NoDataplane) so the
+			// simulator falls back to evaluating scheduled policies as-active.
+			PolicySchedulerActiveStateFn: func() (map[string]bool, bool) {
+				if d.dp == nil {
+					return nil, false
+				}
+				p, ok := d.dp.(interface {
+					PolicySchedulerActiveState() map[string]bool
+				})
+				if !ok {
+					return nil, false
+				}
+				return p.PolicySchedulerActiveState(), true
+			},
 			// #1387 inc-2: DHCP dynamic-DNS counters for the
 			// xpf_dhcp_ddns_* metric family. Returns nil when the
 			// manager is absent (NoDataplane), omitting the family.

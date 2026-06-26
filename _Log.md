@@ -20,6 +20,66 @@
   plan_key_for_nonzero_rx_queues_ignores_sysfs (no-regression). Full suite
   3075 passed / 2 ignored / 0 failed.
 
+## 2026-06-26 — #3104: policymatch simulator skips scheduler-inactive policies (verdict companion to #3062 display)
+
+- **Timestamp**: 2026-06-26
+- **Action**: fixed #3104. The shared policy simulator (`pkg/policymatch`)
+  returned a definitive permit/deny for scheduled (runtime-inactive) policies,
+  disagreeing with the dataplane (`policy.rs try_match_rule` drops an inactive
+  rule before app/address matching). Threaded live per-scheduler active-state
+  into `policymatch.Query.PolicyInactiveFn`; `ruleMatches` now skips a
+  scheduler-inactive policy FIRST (mirroring the runtime), so the simulator
+  falls through to the next active rule / configured default-policy. Wired at
+  all simulator surfaces: REST `match-policies`, gRPC `MatchPolicies` + `test
+  policy`, and the local CLI `show security match-policies` + `test policy`.
+  The closure is built from the same daemon-local
+  `Manager.PolicySchedulerActiveState` accessor the #3062 display uses, via the
+  new SSOT builder `dataplane/userspace.PolicyInactiveFn` (wraps the shared
+  `PolicyInactive` predicate). Missing-state fallback: when live scheduler
+  state is unavailable to a caller (offline CLI / NoDataplane) the closure is
+  nil and scheduled policies are simulated as-if-active — matching #3062's
+  display fallback and keeping non-scheduled verdicts byte-identical (no
+  regression). Added `pkg/policymatch/scheduler_test.go` (4 cases: inactive
+  permit→default-deny, inactive deny→later active permit, scheduler flip,
+  non-scheduled unchanged); fail-on-revert verified (removing the skip turns
+  the 3 positive cases RED, case 4 stays green).
+- **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/scheduler_test.go,
+  pkg/dataplane/userspace/policies.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_request.go,
+  pkg/grpcapi/server_show_policies_text.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_show_firewall.go, pkg/api/server.go, pkg/api/security.go,
+  pkg/daemon/daemon_run.go, pkg/api/README.md, pkg/cli/README.md,
+  pkg/grpcapi/README.md
+
+## 2026-06-26 — #3169: RX source-MAC dynamic-neighbor learn bypassed mac_change_epoch (stale dst_mac blackhole, sibling of #3048)
+
+- **Timestamp**: 2026-06-26
+- **Action**: fixed #3169. `learn_dynamic_neighbor` (#1787 RX source-MAC
+  data-path learn) inserted under `with_all_shards(|bulk| bulk.insert(..))`
+  with no `mac_change_epoch` bump — the FIFTH neighbor-MAC write path that
+  #3048/#3165 left uncovered. Its `pair_write_needed` gate writes on a
+  genuine MAC change (`current != Some(src_mac)`), and `lookup_neighbor_entry`
+  falls back to `dynamic_neighbors` for unresolved fast-path next-hops, so an
+  RX-learned MAC change left a cached `RewriteDescriptor.dst_mac` stale until
+  session expiry (the #3048 blackhole) and could shadow the monitor's
+  `insert_if_changed`. Added `ShardedNeighborMap::learn_pair_if_changed`
+  (bump-aware multi-key insert modeled on `bulk_replace_neighbors`): snapshots
+  each key's prior MAC via `BulkShardGuard::get` under the all-shard lock,
+  inserts the pair, bumps the epoch exactly once iff any key replaces an
+  existing MAC with a different one. First sighting and same-MAC re-learn add
+  one Relaxed read per key and no bump. Routed the learn through it.
+- **File(s)**: userspace-dp/src/afxdp/sharded_neighbor.rs,
+  userspace-dp/src/afxdp/neighbor_dispatch.rs,
+  userspace-dp/src/afxdp/sharded_neighbor_tests.rs,
+  docs/flow-cache-simplification.md, _Log.md
+- **Validation**: `cargo build --release` clean; `cargo test --release`
+  3007 pass (one pre-existing flaky wg concurrency test
+  `reconcile_peers_snapshot_is_atomic_under_concurrent_load` — passes 3/3 in
+  isolation, unrelated). Added 4 tests `mac_change_epoch_rx_learn_*`;
+  fail-on-revert proven: neutralizing the bump turns
+  `mac_change_epoch_rx_learn_bumps_on_mac_change` and
+  `mac_change_epoch_rx_learn_pair_single_bump_for_both_keys` RED while the two
+  no-bump tests stay GREEN; restored byte-identical.
 ## 2026-06-26 — #3070 re-gate: rebase fix/3070-host-inbound onto master
 
 - **Timestamp**: 2026-06-26

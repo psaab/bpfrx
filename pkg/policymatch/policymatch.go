@@ -26,10 +26,22 @@
 // Go snapshot builder (pkg/dataplane/userspace/policies.go). Where the runtime
 // and the old per-surface matchers disagreed, the runtime wins.
 //
-// Note on scheduler state: the runtime honors a policy's scheduler-driven
-// `inactive` flag. This simulator evaluates the configured policy set without
-// applying live scheduler activation (matching the pre-#3042 surfaces), so a
-// scheduled policy is simulated as if active.
+// Note on scheduler state (#3104): the runtime honors a policy's
+// scheduler-driven `inactive` flag — policy.rs try_match_rule returns None for
+// an inactive rule BEFORE app/address matching, and the snapshot builder
+// (pkg/dataplane/userspace/policies.go) stamps that Inactive flag and fails
+// closed on missing scheduler state. This simulator is schedule-aware when the
+// caller threads live per-scheduler active-state into Query.PolicyInactiveFn:
+// it then SKIPS a scheduler-inactive policy exactly like the runtime, falling
+// through to the next active rule / configured default-policy. When
+// PolicyInactiveFn is nil (the caller has no live scheduler state — an offline
+// surface, or the daemon-local dataplane has not published state yet), the
+// simulator falls back to evaluating the configured policy set as-if-active,
+// matching both the pre-#3042 surfaces and the #3062 display fallback. A
+// NON-scheduled policy is unaffected in either case: PolicyInactiveFn is only
+// ever consulted with a policy's scheduler name, and the SSOT predicate
+// (dataplane/userspace.PolicyInactive) reports an empty scheduler name as
+// always active.
 package policymatch
 
 import (
@@ -138,6 +150,25 @@ type Query struct {
 	// name then resolves to its static content only, matching the runtime
 	// fail-closed-before-first-fetch behavior.
 	FeedOverlay map[string][]string
+
+	// PolicyInactiveFn, when non-nil, reports whether a policy bound to the
+	// given scheduler name is currently runtime-inactive (#3104). It mirrors
+	// the runtime's per-rule scheduler gate (policy.rs try_match_rule, which
+	// drops an inactive rule before app/address matching). A policy for which
+	// this returns true is SKIPPED, so the simulator falls through to the next
+	// active rule / configured default-policy — agreeing with the dataplane.
+	//
+	// Callers build this from the live daemon-local per-scheduler active-state
+	// map via dataplane/userspace.PolicyInactiveFn, which wraps the SSOT
+	// PolicyInactive predicate shared with the snapshot builder and the #3062
+	// display surfaces. An empty scheduler name reports active, so a
+	// NON-scheduled policy is never skipped.
+	//
+	// nil is valid and means "no live scheduler state": the simulator evaluates
+	// scheduled policies as-if-active (the pre-#3104 behavior / #3062 display
+	// fallback). The runtime/dataplane callers always supply it when scheduler
+	// state has been published; only offline surfaces leave it nil.
+	PolicyInactiveFn func(schedulerName string) bool
 }
 
 // Result is the simulator verdict.
@@ -211,6 +242,16 @@ func matchedResult(pol *config.Policy, global bool) Result {
 }
 
 func ruleMatches(cfg *config.Config, q Query, pol *config.Policy) bool {
+	// #3104: scheduler gate, FIRST — mirror policy.rs try_match_rule, which
+	// returns None for a scheduler-inactive rule before any app/address
+	// matching. Skipping here lets Match fall through to the next active rule
+	// or the default-policy, exactly as the runtime does. PolicyInactiveFn is
+	// nil when the caller has no live scheduler state (simulate as-if-active),
+	// and reports an empty scheduler name as active, so a non-scheduled policy
+	// is never skipped.
+	if q.PolicyInactiveFn != nil && q.PolicyInactiveFn(pol.SchedulerName) {
+		return false
+	}
 	if !matchAddr(cfg, q.FeedOverlay, pol.Match.SourceAddresses, pol.Match.SourceAddressExcluded, q.SrcIP) {
 		return false
 	}
