@@ -86,7 +86,12 @@ fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
         "snmp-trap" => {
             hi.udp_ports.insert(162);
         }
-        "ike" => {
+        // `ipsec` is the Junos system-service that permits host-terminated
+        // IPsec. It opens IKE (udp 500 / NAT-T 4500); the raw ESP/AH data plane
+        // is handled by the kernel XFRM stack / stage_ipsec_passthrough_check
+        // before host-inbound enforcement, so `ipsec` is effectively a superset
+        // of `ike`. Aliased to keep parity with the nft mirror + the #3200 SSOT.
+        "ike" | "ipsec" => {
             hi.udp_ports.insert(500);
             hi.udp_ports.insert(4500);
         }

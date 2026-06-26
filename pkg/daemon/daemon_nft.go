@@ -218,16 +218,22 @@ func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, fam
 		return
 	}
 	matches := hostInboundMatchSet(v, family)
-	if len(matches) == 0 {
-		// Zero recognized service/protocol matches for this configured zone
-		// (empty stanza, or every token unrecognized). Emit NOTHING — a bare
-		// catch-all drop here would lock the whole zone out of the kernel based
-		// on tokens we could not classify, a lifeline hazard. This fails OPEN
-		// for the pathological case only; any zone with at least one recognized
-		// token is fully enforced. (The userspace-dp secondary path still
-		// applies its own check to the XSK-reaching subset.)
-		return
-	}
+	// Zero recognized service/protocol matches for this configured zone — an
+	// empty `host-inbound-traffic { }` stanza (or, on the tolerant load path,
+	// a zone whose every token was an unrecognized typo that commit-time
+	// validation downgraded to a warning rather than rejected). Fall through to
+	// emit ONLY the catch-all drop below: a configured-but-empty stanza means
+	// the operator opened nothing, so Junos denies all host-bound traffic to
+	// the zone, and the Rust AF_XDP classifier already fails CLOSED for the
+	// same case (host_inbound_admits returns deny when the zone is configured
+	// but matches nothing). Emitting nothing here would fail OPEN and leave the
+	// kernel and Rust paths in disagreement — the #3200 split-brain. Management
+	// / cluster-control lifeline interfaces are excluded from v.V4Addrs /
+	// v.V6Addrs by BuildZoneHostInboundViews, and the established / ESP-AH / ND
+	// / PMTUD accepts precede this drop, so a zero-match zone cannot strand
+	// management or break HA. The strict commit path rejects unknown tokens
+	// outright (validateHostInboundTokensStrict), so this zero-match branch is
+	// normally reachable only for a genuinely empty stanza.
 	for _, m := range matches {
 		*rules = append(*rules, "    "+daddr+" "+m+" accept")
 	}
@@ -257,11 +263,14 @@ func hostInboundAllowsAll(v dpuserspace.ZoneHostInboundView) bool {
 //
 // This is the Go/nftables MIRROR of the Rust classifier in
 // userspace-dp/src/afxdp/forwarding/host_inbound.rs — keep the two token sets
-// in sync. An unrecognised token contributes nothing here; if it leaves the
-// zone with zero recognized matches, emitHostInboundZone fails OPEN (no deny)
-// rather than locking the zone out on unclassifiable tokens. The token set
-// below covers the common Junos system-services/protocols; strict commit-time
-// rejection of unknown tokens is a noted follow-up (schema_security.go).
+// in sync (the recognized-token SSOT is config.KnownHostInboundSystemServices /
+// config.KnownHostInboundProtocols; TestHostInboundNftMatchesKnownTokens
+// asserts this matcher's domain equals that SSOT). An unrecognised token
+// contributes nothing here; if it leaves the zone with zero recognized matches,
+// emitHostInboundZone emits a catch-all drop (fail CLOSED, matching the Rust
+// classifier). Strict commit-time rejection of unknown tokens lands in
+// validateHostInboundTokensStrict (#3200), so a zero-match zone normally only
+// arises from a genuinely empty `host-inbound-traffic { }` stanza.
 func hostInboundMatchSet(v dpuserspace.ZoneHostInboundView, family string) []string {
 	var out []string
 	seen := map[string]bool{}
@@ -318,7 +327,14 @@ func hostInboundServiceMatches(token, family string) []string {
 		return []string{"udp dport 161"}
 	case "snmp-trap":
 		return []string{"udp dport 162"}
-	case "ike":
+	case "ike", "ipsec":
+		// `ipsec` is the Junos system-service that permits host-terminated
+		// IPsec: IKE negotiation (udp 500 / NAT-T 4500) plus the ESP/AH data
+		// plane. The raw ESP (50) / AH (51) data plane is already accepted
+		// globally in buildHostInboundFilterPayload (so the kernel XFRM stack
+		// can decrypt), so the per-zone match only needs to open IKE — making
+		// `ipsec` a superset of `ike`. Treating them as one case keeps the nft
+		// mirror in parity with the Rust classifier.
 		return []string{"udp dport { 500, 4500 }"}
 	case "tftp":
 		return []string{"udp dport 69"}

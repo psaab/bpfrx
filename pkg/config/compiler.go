@@ -555,6 +555,21 @@ type compileOpts struct {
 	// loaded config forwards exactly as before, just with an operator-visible
 	// warning. Same doctrine as lenientPolicyZoneRefs.
 	lenientZoneInterfaceMembership bool
+	// lenientHostInboundTokens (#3200) downgrades the host-inbound-traffic
+	// token gate (validateHostInboundTokensStrict) from a hard compile error
+	// to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a `host-inbound-traffic system-services`/`protocols` token
+	// that is not in the recognized SSOT (host_inbound_tokens.go) — such a
+	// typo committed cleanly and then enforced inconsistently across the
+	// nftables kernel mirror (fail OPEN for an all-unknown stanza) and the
+	// Rust AF_XDP classifier (fail CLOSED), a split-brain posture. The
+	// tolerant load / peer-sync paths downgrade to a warning so an already-
+	// persisted or peer-synced config carrying a stale token still BOOTS
+	// (#1960 no-brick) — both enforcement layers independently ignore the
+	// unknown token (Rust ignores it; nft now emits a catch-all drop for the
+	// zone so it too fails CLOSED), so a leniently-loaded bad config is inert
+	// and consistent. Same doctrine as lenientPolicyZoneRefs.
+	lenientHostInboundTokens bool
 	// lenientDestNATAddresses (#2396) downgrades the destination-NAT
 	// destination-address gate (validateDestinationNATAddressesStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -999,6 +1014,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyZoneRefs:               true,
 		lenientZoneCount:                    true,
 		lenientZoneInterfaceMembership:      true,
+		lenientHostInboundTokens:            true,
 		lenientDestNATAddresses:             true,
 		lenientRPMSourceAddress:             true,
 		lenientRPMLinkLocalZone:             true,
@@ -1128,6 +1144,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyZoneRefs:               true,
 		lenientZoneCount:                    true,
 		lenientZoneInterfaceMembership:      true,
+		lenientHostInboundTokens:            true,
 		lenientDestNATAddresses:             true,
 		lenientRPMSourceAddress:             true,
 		lenientRPMLinkLocalZone:             true,
@@ -1799,6 +1816,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientZoneInterfaceMembership {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("zone interface membership (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3200 host-inbound-traffic token gate. Strict on commit / commit-check
+	// (hard-reject an unknown/typo system-services or protocols token that
+	// would commit but enforce inconsistently — nft kernel mirror fails OPEN
+	// for an all-unknown stanza while the Rust classifier fails CLOSED, a
+	// split-brain posture); lenient on load / peer-sync (downgrade to a warning
+	// so an already-persisted or peer-synced config carrying a stale token
+	// still boots — #1960 no-brick; both enforcement layers ignore the unknown
+	// token and the nft path now fails CLOSED for a zero-match zone, so a
+	// leniently-loaded bad config is inert and consistent). Runs AFTER the zone
+	// gates so a structural/zone-reference error still wins the first-error slot.
+	if err := validateHostInboundTokensStrict(cfg); err != nil {
+		if opts.lenientHostInboundTokens {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("host-inbound-traffic token (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

@@ -852,6 +852,26 @@ reserved for whole-dataplane selection where a rewrite shim
   no-op knob, not a false dataplane/identity promise — and its real
   implementation is split to /research. Regression coverage:
   `pkg/config/compiler_interfaces_unsupported_test.go`.
+- **#3200 (host-inbound-traffic token validation):** `security zones <z>
+  host-inbound-traffic { system-services <tok>; protocols <tok>; }` keeps its
+  untyped-container schema shape (the leaves stay `children: nil` so flat-set
+  grouping and `?` completion are unaffected), but the token VALUE is now
+  validated in the compiler by `validateHostInboundTokensStrict`
+  (`compiler_validate_strict.go`) against the recognized-token SSOT in
+  `host_inbound_tokens.go` (`KnownHostInboundSystemServices` /
+  `KnownHostInboundProtocols`). An unknown/typo token is hard-rejected at
+  commit / commit-check. This is the SAME doctrine as the IPsec/log/scheduler
+  reference validators above — a value the runtime cannot honor is a commit
+  rejection rather than a schema enum (an enum would have to be re-derived from
+  the dataplane classifier anyway, and the SSOT keeps the nft kernel mirror +
+  the Rust AF_XDP classifier in agreement so a committed token never enforces
+  inconsistently). Strict on commit, downgraded to a warning on the tolerant
+  load / peer-sync paths (`lenientHostInboundTokens`, #1960 no-brick). Matching
+  is case-sensitive against the canonical lowercase spellings (the nft matcher
+  switch is case-sensitive). Regression coverage:
+  `pkg/config/host_inbound_tokens_test.go` (commit reject + accept + lenient
+  downgrade) and `pkg/daemon/host_inbound_parity_test.go` (nft-matcher-domain
+  == SSOT parity + zero-match-zone fail-closed).
 - **#1387 (DHCP dynamic-DNS — live rfc2136 backend):** added an opt-in
   `dynamic-dns` subtree under BOTH `services dhcp-local-server` and
   `services dhcpv6-local-server` (a single shared `config.DHCPDynamicDNSConfig`
