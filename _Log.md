@@ -1,3 +1,26 @@
+## 2026-06-26 — #3023: `*-address-excluded` over-blocked the opposite family when only one family was listed
+
+- **Timestamp**: 2026-06-26
+- **Action**: fixed #3023. The #2008 fail-closed guard on
+  `source-address-excluded`/`destination-address-excluded` gated on the
+  PER-FAMILY empty flag (`!rule.source_v4_empty && ...`). An excluded set
+  that legitimately listed only one family (e.g. only IPv6) left the other
+  family empty, so a packet in that family was wrongly dropped to
+  default-deny even though it was trivially not in the excluded set. Changed
+  the fail-closed condition to "empty across BOTH families"
+  (`!(source_v4_empty && source_v6_empty)`) for all four branches (src/dst ×
+  v4/v6), preserving the #2008 contract for the genuine typo/parse-drop case
+  (both families empty → still deny) while letting the legitimate one-family
+  case match cross-family traffic.
+- **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+  docs/feature-gaps.md
+- **Validation**: `cargo build --release` clean; `cargo test --release` all
+  pass. New tests: `test_excluded_source_v6_only_permits_v4_3023`,
+  `test_excluded_destination_v4_only_permits_v6_3023`,
+  `test_fully_empty_excluded_source_fails_closed_both_families_3023`.
+  Fail-on-revert: reverting to the per-family guard turns the v6-only/v4-only
+  tests RED while the both-families-empty fail-closed test stays GREEN.
+
 ## 2026-06-25 — #3046: TCP RST sessions reaped on a short timeout (not the 30s FIN close)
 
 - **Timestamp**: 2026-06-25
