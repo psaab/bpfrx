@@ -649,7 +649,9 @@ mod tests {
     /// → an 802.1p priority tag (TPID 0x8100, PCP 5, **VID 0**), so the
     /// L3 header starts at offset 18 while `ingress_vlan_id` is 0. The
     /// IPv4 header is built with `ihl` 32-bit words (5 = no options;
-    /// 6 = one option word, which trips the `ip-source-route` screen).
+    /// 6 = one option word carrying an LSRR source-route option, which
+    /// trips the `ip-source-route` screen — #2973 requires a real
+    /// LSRR/SSRR option, not just `ihl > 5`).
     fn tcp_v4_syn_frame_with_l2(vlan: Vlan, ihl: u8) -> Vec<u8> {
         let mut frame = Vec::new();
         let dst_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
@@ -675,8 +677,18 @@ mod tests {
         frame.extend_from_slice(&[0x00, 0x01, 0x40, 0x00, 64, PROTO_TCP, 0x00, 0x00]);
         frame.extend_from_slice(&Ipv4Addr::new(192, 0, 2, 10).octets());
         frame.extend_from_slice(&Ipv4Addr::new(198, 51, 100, 20).octets());
-        // IPv4 options as NOP (0x01) to reach `ihl_bytes`.
+        // IPv4 options to reach `ihl_bytes`. When options are present
+        // (ihl > 5) the first option is an actual LSRR (Loose Source
+        // Route, option type 131) so the `ip-source-route` screen fires.
+        // #2973 made that screen require a real LSRR/SSRR option (the
+        // extractor decodes the options TLVs) instead of dropping on any
+        // ihl > 5, so a NOP-only options region no longer trips it. The
+        // remaining bytes stay NOP (0x01); the extractor detects the
+        // source-route option from the kind byte alone.
         frame.resize(l3 + ihl_bytes, 0x01);
+        if ihl > 5 {
+            frame[l3 + 20] = 131; // LSRR
+        }
         let ip_csum = checksum16(&frame[l3..l3 + ihl_bytes]);
         frame[l3 + 10..l3 + 12].copy_from_slice(&ip_csum.to_be_bytes());
         // TCP SYN.
@@ -727,9 +739,10 @@ mod tests {
     }
 
     /// Screen state with only the IP source-route check armed. The
-    /// check fires purely on `ip_ihl > 5` read from the frame at the
-    /// computed L3 offset, so the verdict is a direct probe of whether
-    /// the screen stage parsed the IP header at the right offset.
+    /// check fires on an actual LSRR/SSRR option decoded from the IPv4
+    /// options region (post-#2973) read from the frame at the computed
+    /// L3 offset, so the verdict is a direct probe of whether the screen
+    /// stage parsed the IP header at the right offset.
     fn source_route_screen() -> ScreenState {
         let mut profiles = FxHashMap::default();
         profiles.insert(
@@ -952,9 +965,10 @@ mod tests {
     /// (`ingress_vlan_present = 1`, `ingress_vlan_id = 0`) must have its
     /// IP header parsed at offset 18 by the screen + SYN-cookie stages,
     /// not at the untagged offset 14. The screen carries an IPv4 header
-    /// with IHL = 6, so the `ip-source-route` check fires *iff* the
-    /// stage reads `ip_ihl` from the real header at offset 18. Pre-fix
-    /// (`ingress_vlan_id > 0`) the stage used offset 14, read the
+    /// with IHL = 6 holding an LSRR source-route option, so the
+    /// `ip-source-route` check fires *iff* the stage reads the IP header
+    /// (and decodes the option) from the real header at offset 18.
+    /// Pre-fix (`ingress_vlan_id > 0`) the stage used offset 14, read the
     /// 802.1Q TPID byte (0x81) as the IP header → `ip_ihl = 1`,
     /// source-route did NOT fire, and the SYN passed. An untagged
     /// control frame (with the same IHL-6 header at offset 14) keeps

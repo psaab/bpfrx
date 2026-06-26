@@ -268,6 +268,8 @@ pub(super) fn screen_parse_error_info(
         ip_total_len: 0,
         ip_payload_len: 0,
         frag_data_off: 0,
+        saw_ipv4_source_route: false,
+        saw_ipv6_routing_header: false,
     }
 }
 
@@ -547,6 +549,8 @@ mod tests {
             ip_total_len: 60,
             ip_payload_len: 0,
             frag_data_off: 0,
+            saw_ipv4_source_route: false,
+            saw_ipv6_routing_header: false,
         };
 
         emit_screen_drop_event(Some(&handle), &pkt, test_meta(), 11, "land-attack", mono_now_ns());
@@ -597,6 +601,8 @@ mod tests {
             ip_total_len: 60,
             ip_payload_len: 0,
             frag_data_off: 0,
+            saw_ipv4_source_route: false,
+            saw_ipv6_routing_header: false,
         };
 
         emit_screen_alarm_event(Some(&handle), &pkt, test_meta(), 2, "scan-table-pressure", mono_now_ns());
@@ -643,6 +649,8 @@ mod tests {
             ip_total_len: 60,
             ip_payload_len: 0,
             frag_data_off: 0,
+            saw_ipv4_source_route: false,
+            saw_ipv6_routing_header: false,
         };
 
         emit_screen_drop_event(Some(&handle), &pkt, test_meta(), 11, "icmp-fragment", mono_now_ns());

@@ -19,7 +19,8 @@
 //!   reassemble past 65535 bytes — #893/#2215 formula, any protocol)
 //! - Teardrop (overlapping fragments)
 //! - ICMP fragment
-//! - IP source route options
+//! - IP source route — IPv4 LSRR/SSRR options and IPv6 Routing Header
+//!   (source-route routing type), not every IHL>5 packet (#2973)
 //! - Rate limiting (ICMP, UDP flood)
 //! - SYN flood (per-zone rate)
 //!
