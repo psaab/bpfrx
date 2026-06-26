@@ -333,6 +333,37 @@ config, VRF definitions). The tolerant load/peer-sync path downgrades to a warni
 binary silently accepted still boots — it stays applied globally (the pre-existing
 behaviour), now flagged (#1960 no-brick doctrine, same as #3018/#3055/#3060).
 
+**Unsupported security-policy `match` leaves are rejected at commit (#3113,
+interim):** Junos SRX security policies match traffic with a rich `match`
+criteria set. Beyond the L3/L4 leaves xpf enforces, vSRX accepts unified-policy /
+identity / L7 leaves like `dynamic-application`, `url-category`, and
+`source-identity`. xpf's policy compiler (`compilePolicy`, `compiler_security.go`)
+only switches on the supported subset — `source-address`, `destination-address`,
+`source-address-excluded`, `destination-address-excluded`, and `application`; any
+other `match` child fell out of the switch with NO error and was SILENTLY DROPPED
+(the set-schema does not list the leaves and `schema_walk.go` returns nil for
+unknown keywords by design). Dropping a match criterion WIDENS the policy: a rule
+the operator wrote to match only one `dynamic-application` compiled as if that
+constraint were absent — a broad L3/L4 permit/deny over every application,
+permitting/denying traffic the operator never intended (a security fail-OPEN, not
+a cosmetic gap). `validatePolicyMatchLeavesStrict`
+(`compiler_policy_match.go`) hard-rejects a policy carrying an unsupported `match`
+leaf at commit, naming the policy scope (zone-pair or global), the policy, and the
+offending leaf, and directing the operator to remove it. It is an AST pre-walk in
+`compileExpanded` (not a typed validator) because the unsupported leaf is exactly
+what the compiler drops — by the time the typed `*Config` exists the leaf is gone
+from `PolicyMatch` — and because `SchemaValidate` returns nil for unknown keywords
+by design and cannot REJECT `match dynamic-application ...`. The allowlist is the
+EXACT set `compilePolicy` enforces (`supportedPolicyMatchLeaves`); keep the two in
+lockstep. Both zone-pair (`from-zone`/`to-zone`) and `global` policies are
+covered. This is the INTERIM contract: full support for those match types (typed
+fields + capability gate + Rust enforcement) is a substantial feature deferred to
+a follow-up. The tolerant load/peer-sync path downgrades to a warning
+(`lenientPolicyMatchLeaves`) so an already-persisted or peer-synced config an
+older binary silently accepted still boots — the leaf stays dropped (the
+pre-existing behaviour), now flagged (#1960 no-brick doctrine, same as
+#3079/#3055/#3060).
+
 **Ambiguous secure-tunnel `bind-interface` aliases are rejected at commit
 (#2933):** `security ipsec vpn <name> bind-interface` is a free-form 1-arg
 string stored verbatim on the typed VPN (`compiler_ipsec.go`); the runtime

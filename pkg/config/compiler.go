@@ -749,6 +749,26 @@ type compileOpts struct {
 	// still BOOTS (#1960 fail-closed-on-load class) — the #2929 routing guard
 	// remains the runtime backstop. Same doctrine as lenientBackupRouterDst.
 	lenientSecureTunnelBindIface bool
+	// lenientPolicyMatchLeaves (#3113) downgrades the security-policy
+	// unsupported-match-leaf gate (validatePolicyMatchLeavesStrict) from a
+	// hard compile error to a cfg.Warnings entry. A security policy whose
+	// `match` clause carries a leaf the compiler does not enforce — e.g.
+	// `dynamic-application`, `url-category`, `source-identity` — committed
+	// cleanly but had that criterion SILENTLY DROPPED: compilePolicy's
+	// `match` switch handles only the supported subset (source/destination
+	// address, excluded, application) and the set-schema/schema_walk ignore
+	// unknown keywords. Dropping a match criterion WIDENS the policy — a
+	// rule meant to match only one dynamic-application became a broad L3/L4
+	// permit/deny over all applications, a fail-OPEN. The strict commit /
+	// commit-check path hard-rejects so the misconfiguration is operator-
+	// visible (naming the policy scope, the policy, and the unsupported
+	// leaf); the tolerant load / peer-sync paths downgrade to a warning so
+	// an already-persisted or peer-synced config an older binary silently
+	// accepted still BOOTS (#1960 fail-closed-on-load class) — the leaf
+	// stays dropped (the pre-existing behaviour), now flagged. Full
+	// support for those match types is a deferred follow-up. Same doctrine
+	// as lenientSecureTunnelBindIface.
+	lenientPolicyMatchLeaves bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -816,6 +836,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientNATRuleSetScope:             true,
 		lenientBackupRouterDst:             true,
 		lenientSecureTunnelBindIface:       true,
+		lenientPolicyMatchLeaves:           true,
 	})
 }
 
@@ -934,6 +955,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientNATRuleSetScope:             true,
 		lenientBackupRouterDst:             true,
 		lenientSecureTunnelBindIface:       true,
+		lenientPolicyMatchLeaves:           true,
 	})
 }
 
@@ -1067,6 +1089,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3113 security-policy unsupported-match-leaf gate. A policy whose
+	// `match` clause carries a leaf the compiler does not enforce (e.g.
+	// `dynamic-application`, `url-category`, `source-identity`) committed
+	// cleanly but had that criterion SILENTLY DROPPED — compilePolicy's
+	// `match` switch handles only source/destination address, excluded, and
+	// application; the set-schema and schema_walk ignore unknown keywords.
+	// Dropping a match criterion WIDENS the policy into a broad L3/L4
+	// permit/deny the operator never intended — a fail-open. Runs on the
+	// group-expanded, inactive-pruned tree so an apply-groups-inherited
+	// match leaf is caught and an inactive policy is ignored. Strict
+	// (commit / commit-check): hard-reject naming the policy scope, the
+	// policy, and the unsupported leaf. Lenient (load / peer-sync): warn so
+	// an already-persisted or peer-synced config still boots (#1960) — the
+	// leaf stays dropped, now flagged. Full match-type support is a deferred
+	// follow-up.
+	policyMatchWarnings, err := validatePolicyMatchLeavesStrict(
+		tree.Children, opts.lenientPolicyMatchLeaves)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -1104,6 +1147,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, natScopeWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
+	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
 
 	for _, node := range tree.Children {
 		switch node.Name() {
