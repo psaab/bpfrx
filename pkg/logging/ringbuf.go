@@ -474,6 +474,14 @@ func (er *EventReader) logEvent(data []byte) {
 		// #2465: surface the absolute session-creation Unix seconds for the
 		// flow exporters (a real StartTime instead of the packet-count guess).
 		rec.Created = evt.Created
+		// #2853: the [44:48] policy_id slot is repurposed on a SESSION_CLOSE
+		// frame to carry the creation instant's sub-second nanosecond
+		// remainder. Reinterpret it as CreatedNanos and clear PolicyID so the
+		// close record's policy-name resolution (below) is the pre-#2853
+		// "no policy" value, not the nanosecond bits.
+		rec.CreatedNanos = evt.PolicyID
+		rec.PolicyID = 0
+		evt.PolicyID = 0
 		// Compute elapsed time from session creation
 		if evt.Created > 0 {
 			nowSec := uint32(evt.Timestamp / 1000000000)
@@ -768,6 +776,16 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 		// NetFlow/IPFIX exporters can set a real flow StartTime instead of the
 		// packet-count heuristic. 0 = unknown (old frame / synthesized close).
 		Created: evt.Created,
+	}
+	if evt.EventType == eventTypeSessionClose {
+		// #2853: the [44:48] policy_id slot is repurposed on a SESSION_CLOSE
+		// frame to carry the creation instant's sub-second nanosecond remainder
+		// (the dataplane never stamps a policy id on a close). Reinterpret it as
+		// CreatedNanos so the flow exporters keep millisecond StartTime
+		// resolution, and clear PolicyID so the close record's policy id/name
+		// stays the pre-#2853 "no policy" value.
+		rec.CreatedNanos = evt.PolicyID
+		rec.PolicyID = 0
 	}
 	if evt.EventType != eventTypeSessionClose {
 		rec.SessionPkts = 0

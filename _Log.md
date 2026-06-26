@@ -18786,3 +18786,27 @@ top.
   per #2871. No code change. Build clean; nat:: 130 / static_nat 28 still green.
 - **File(s)**: docs/feature-coverage.md,
   userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2853 — flowexport session-creation StartTime kept only integer
+  Unix seconds (offset 108, u32), so every flow opened in the same wall-clock
+  second exported one StartTime, flattening IPFIX flowStartMilliseconds for
+  short flows. Fix: the SESSION_CLOSE RT_FLOW frame now ALSO carries the
+  creation instant's sub-second NANOSECOND remainder (0..=999_999_999) in the
+  close-unused policy_id slot (offset 44, LE u32), produced by the new
+  monotonic_ns_to_unix_secs_subnanos helper. The Go decoder reads it as
+  EventRecord.CreatedNanos and zeroes PolicyID (a close never carried a real
+  policy id, so policy-name resolution is unchanged); flowStartTime now builds
+  time.Unix(Created, CreatedNanos) for millisecond-accurate StartTime. Gates:
+  go build ./... clean, go test ./pkg/flowexport/... ./pkg/logging/... 196
+  passed, go vet clean, gofmt clean on touched files; cargo build clean,
+  event_stream:: 58 passed. Fail-on-revert proven RED both sides (Go
+  flowStartTime→whole-second; Rust [44:48] write removed).
+- **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/codec_tests.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  userspace-dp/src/event_stream/README.md, pkg/logging/eventbuf.go,
+  pkg/logging/ringbuf.go, pkg/logging/binary_test.go,
+  pkg/flowexport/manager.go, pkg/flowexport/flowstart_test.go,
+  pkg/flowexport/README.md, _Log.md

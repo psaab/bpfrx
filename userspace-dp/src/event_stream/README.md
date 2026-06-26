@@ -80,7 +80,16 @@ periodic ACK from the daemon.
   in `mod.rs`). The Go exporters use `created` as the flow StartTime
   directly, falling back to the packet-count
   `estimateSessionDuration(SessionPkts)` heuristic only when it is 0 (an
-  explicit-delete / HA-purge close that carried no creation instant). The
+  explicit-delete / HA-purge close that carried no creation instant).
+  (#2853) the `created` second is too coarse on its own — every flow
+  opened in the same second exported the same StartTime, flattening IPFIX
+  `flowStartMilliseconds` for short flows. The close frame now ALSO carries
+  the creation instant's sub-second **nanosecond** remainder
+  (0..=999,999,999) in the close-unused `policy_id` slot (offset 44,
+  little-endian u32), produced by `monotonic_ns_to_unix_secs_subnanos`. The
+  Go decoder reads it as `EventRecord.CreatedNanos` (and zeroes `PolicyID`,
+  which a close never carried) so `flowStartTime` builds a
+  millisecond-accurate `time.Unix(Created, CreatedNanos)`. The
   byte/packet **volume** counters remain 0 pending the per-session
   accounting follow-up #2501 — only the timing is real. (#2512) the close
   frame now rides the SAME per-kind rate limiter + queue budget +

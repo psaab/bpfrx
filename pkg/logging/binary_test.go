@@ -399,6 +399,73 @@ func TestDecodeRawEventCarriesCreatedStamp(t *testing.T) {
 	}
 }
 
+// TestDecodeRawEventCarriesCreatedSubNanos is the #2853 cross-language layout
+// check: the Rust encoder writes the creation instant's sub-second NANOSECOND
+// remainder into the SESSION_CLOSE-unused policy_id slot at offset 44 (LE u32).
+// DecodeRawEventRecord must surface it into EventRecord.CreatedNanos AND clear
+// PolicyID (so the close record's policy id/name stays the "no policy" value,
+// not the nanosecond bits). Reverting the decoder to read [44:48] as PolicyID
+// (the pre-#2853 behavior) makes CreatedNanos 0 and PolicyID nonzero — both
+// assertions catch that.
+func TestDecodeRawEventCarriesCreatedSubNanos(t *testing.T) {
+	const (
+		createdSecs  = uint32(1_700_000_000)
+		createdNanos = uint32(123_456_789) // 123.456789 ms into the second
+		closeNS      = uint64(1_700_000_300_000_000_000)
+	)
+	data := make([]byte, rawEventWireSize)
+	binary.LittleEndian.PutUint64(data[0:8], closeNS)
+	data[40], data[41] = 0x30, 0x39
+	data[42], data[43] = 0x01, 0xbb
+	data[52] = eventTypeSessionClose
+	data[53] = 6
+	data[55] = addrFamilyInet
+	copy(data[8:12], net.ParseIP("10.0.1.102").To4())
+	copy(data[24:28], net.ParseIP("172.16.80.200").To4())
+	binary.LittleEndian.PutUint32(data[108:112], createdSecs)
+	// offset 44: created sub-second nanos (LE u32) — the #2853 repurposed slot.
+	binary.LittleEndian.PutUint32(data[44:48], createdNanos)
+
+	rec, ok := DecodeRawEventRecord(data)
+	if !ok {
+		t.Fatal("DecodeRawEventRecord rejected a valid SESSION_CLOSE frame")
+	}
+	if rec.CreatedNanos != createdNanos {
+		t.Fatalf("rec.CreatedNanos = %d, want %d (offset 44 LE u32)", rec.CreatedNanos, createdNanos)
+	}
+	if rec.PolicyID != 0 {
+		t.Fatalf("rec.PolicyID = %d, want 0 (the [44:48] slot is repurposed on a close)", rec.PolicyID)
+	}
+}
+
+// TestDecodeRawEventPolicyDenyKeepsPolicyID guards the #2853 negative: a
+// non-SESSION_CLOSE frame must still read [44:48] as the real PolicyID (the
+// repurpose is close-only). A POLICY_DENY carrying a policy id must surface it.
+func TestDecodeRawEventPolicyDenyKeepsPolicyID(t *testing.T) {
+	const policyID = uint32(4242)
+	data := make([]byte, rawEventWireSize)
+	data[40], data[41] = 0x30, 0x39
+	data[42], data[43] = 0x01, 0xbb
+	data[52] = eventTypePolicyDeny
+	data[53] = 6
+	data[54] = actionDeny
+	data[55] = addrFamilyInet
+	copy(data[8:12], net.ParseIP("192.0.2.10").To4())
+	copy(data[24:28], net.ParseIP("198.51.100.20").To4())
+	binary.LittleEndian.PutUint32(data[44:48], policyID)
+
+	rec, ok := DecodeRawEventRecord(data)
+	if !ok {
+		t.Fatal("DecodeRawEventRecord rejected a valid POLICY_DENY frame")
+	}
+	if rec.PolicyID != policyID {
+		t.Fatalf("rec.PolicyID = %d, want %d (non-close frames keep the real policy id)", rec.PolicyID, policyID)
+	}
+	if rec.CreatedNanos != 0 {
+		t.Fatalf("rec.CreatedNanos = %d, want 0 (only SESSION_CLOSE repurposes [44:48])", rec.CreatedNanos)
+	}
+}
+
 // TestDecodeRawEventPolicyDenyUsesDecisionTimestamp pins the #2470 contract on
 // the Go side: an RT_FLOW deny/screen/filter-log event carries the dataplane
 // DECISION instant at offset 0 (LE u64, absolute Unix ns). When it is nonzero

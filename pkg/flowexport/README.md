@@ -59,6 +59,23 @@ bumps a per-exporter `EstimatedDurations()` counter so operators can see
 how often the heuristic is still in play. The byte/packet **volume**
 counters remain 0 pending #2501 — only the timing is now real.
 
+**#2853 — the flow StartTime keeps MILLISECOND resolution.** #2465's
+`created` field is integer Unix **seconds** (offset 108, u32), so every
+flow opened in the same wall-clock second exported the same StartTime —
+up to ~1000ms of error for short flows (DNS, single HTTP requests),
+flattening IPFIX `flowStartMilliseconds` / `flowStartMicroseconds` and
+making the data unusable for micro-burst analysis or sub-second billing.
+The SESSION_CLOSE RT_FLOW frame now ALSO carries the creation instant's
+sub-second **nanosecond** remainder (0..=999,999,999) in the
+close-unused `policy_id` slot (offset 44, little-endian u32). The Go
+decoder surfaces it as `logging.EventRecord.CreatedNanos` (and zeroes
+`PolicyID`, since a close never carried a real policy id, so the
+close-record policy-name resolution is unchanged); `flowStartTime`
+combines both as `time.Unix(Created, CreatedNanos)`. The exported
+`flowStartMilliseconds` (`StartTime.UnixMilli()`) and NetFlow
+`uptimeMs` now reflect the true sub-second start. The fallback path
+(`Created == 0`) is unchanged.
+
 **#2526 — the exporters now carry the post-NAT (translated) tuple.**
 Before #2526 both the NetFlow v9 and IPFIX templates/encoders exported
 only the pre-NAT 5-tuple, so a collector saw the private endpoint of a
