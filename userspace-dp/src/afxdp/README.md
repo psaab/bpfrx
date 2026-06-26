@@ -93,7 +93,17 @@ sync.
         `forwarding.egress`), NOT the physical `target_ifindex` /
         `bind_ifindex`. `target_ifindex` (physical) is still used for the
         XSK transmit.
-    Untagged ports resolve physical == logical, so all four sites are
+      - **#3035 — generated SYN-cookie / reject reply:**
+        `poll_descriptor/cookie_reply.rs` (SYN-cookie SYN-ACK / ACK-RST)
+        and `poll_descriptor/reject_reply.rs` (policy/filter `reject` TCP
+        RST or ICMP/ICMPv6 unreachable, and zone `tcp-rst`) classify the
+        generated reply (CoS queue / DSCP rewrite / output filter) on the
+        LOGICAL egress unit ifindex resolved from the physical bind /
+        ingress ifindex via the SSOT, NOT the raw physical index. These two
+        pre-date #3034 (#2238) and were out of its scope; the physical
+        index is still used for the reflected-reply build and the XSK
+        transmit (`egress_ifindex`).
+    Untagged ports resolve physical == logical, so all six sites are
     no-ops there (non-VLAN behavior preserved).
   - **NA validation (`#2368`, RFC 4861 §7.1.2 / RFC 4443):** before an
     NA learns a Target Link-Layer Address, `parse_ndp_neighbor_advert`
