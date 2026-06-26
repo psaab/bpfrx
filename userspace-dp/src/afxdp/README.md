@@ -137,6 +137,36 @@ sync.
     the #2368 NA fail-closed discipline. Only opcode-2 replies are ever
     learned; ARP requests (opcode 1) classify `OtherArp` and never write
     the cache.
+  - **Own-IP anti-poison (`#2851` / `#3182`, RFC 826 / RFC 4861):** the
+    learn paths refuse to install a neighbor entry for an address the
+    router OWNS, so a host on the local link cannot teach us
+    `(ifindex, our_own_ip) -> attacker_mac`. The gate is the
+    `ForwardingState::owns_configured_ip(ip)` predicate, applied at three
+    sites BEFORE the cache write (so a rejected own-IP neither inserts nor
+    bumps `mac_change_epoch`):
+      - the ARP-reply arm and the NDP-NA arm of `stage_link_layer_classify`
+        (`poll_stages.rs`), and
+      - the **RX source-MAC learn path** `learn_dynamic_neighbor`
+        (`neighbor_dispatch.rs`, the #1787 learn reached via
+        `stage_parse_flow_and_learn`), which would otherwise cache
+        `(ingress_ifindex, flow.src_ip) -> src_mac` from a transit packet
+        whose source IP is spoofed to one of our own IPs.
+    **`owns_configured_ip` reads the NAT-DECOUPLED `configured_iface_v*`
+    set, NOT `local_v*` (`#3182`).** `local_v4`/`local_v6` exclude the IP of
+    any interface whose zone is an interface-mode-SNAT `to_zone`
+    (`nat_translated_local_exclusions` routes it into `interface_nat_v*`),
+    so under #2851 the router's own WAN/SNAT interface IP (e.g.
+    `reth0.80`'s `172.16.80.8`) was NOT protected and an unsolicited
+    ARP/NDP/RX-learn claiming it WAS cached. `configured_iface_v4`/
+    `configured_iface_v6` capture EVERY configured interface address
+    regardless of NAT role (populated in `populate_interfaces` BEFORE the
+    NAT-exclusion branch); the predicate OR-s in `local_v*` so the
+    late-stage static-NAT-external and DNAT-destination local-delivery
+    targets appended to `local_v*` keep their protection too. NAT-translated
+    POOL addresses are in neither set, so the gate stays scoped to addresses
+    the router actually owns. `local_v*` continues to drive the
+    `LocalDelivery` to-self disposition unchanged — only the anti-poison
+    predicate switched sets.
 - `neighbor.rs` — netlink neighbor monitor (`neigh_monitor_thread`),
   startup dump (`initial_neighbor_dump` / `process_dump_batch`), the
   on-demand resolver glue, and `worker::pin_current_thread`. The monitor
@@ -263,6 +293,21 @@ sync.
     IPv4 inner stays fragmentable → `Forward` → the #2331 drop guard remains
     the backstop). `mtu == 0` (no MTU resolvable / unknown tunnel kind)
     fails open to `Forward`.
+    **Per-peer WG underlay (#2845):** for WireGuard the underlay MTU is
+    NOT one-per-interface — different peers of one wg endpoint can have
+    different endpoints / transport routes / underlay MTUs. The dispatcher
+    threads the pre-encap inner destination into `post_transform_inner_mtu`,
+    which passes it to `frame::wg_endpoint_physical_outer_mtu`. That helper
+    selects the SAME peer the encap path will (`engine.peer_for_dest` —
+    AllowedIPs LPM on the inner destination) and resolves the physical
+    underlay MTU via THAT peer's endpoint route, so the advertised inner PMTU
+    matches the underlay the encap guard will actually admit the packet onto.
+    When the inner destination is unavailable, no live engine is present, or
+    no peer covers it, it falls back to the first peer with an endpoint (the
+    pre-#2845 per-interface behaviour — byte-identical when all peers share
+    one underlay). A covering peer with NO endpoint resolves to the
+    conservative logical-ifindex MTU rather than borrowing a different peer's
+    underlay.
 - `icmp_ptb.rs` — #2301 PMTUD error generators for the generic
   forwarder: the egress-MTU decision plus the ICMPv4 Frag-Needed /
   ICMPv6 Packet-Too-Big builders (MTU in the body). Mirrors

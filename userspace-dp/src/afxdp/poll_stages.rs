@@ -1816,6 +1816,169 @@ mod tests {
         );
     }
 
+    /// #3182 fail-on-revert (ARP own-IP anti-poison, NAT-EXCLUDED interface
+    /// IP). The `nat_snapshot` fixture has `reth0.80` (wan zone, logical
+    /// ifindex 12) with IP `172.16.80.8`. The wan zone is an interface-mode
+    /// SNAT `to_zone`, so `nat_translated_local_exclusions` strips
+    /// `172.16.80.8` from `local_v4` (it lands in `interface_nat_v4`). Under
+    /// #2851 the anti-poison gate read `local_v4`, so an ARP reply claiming
+    /// the router's OWN WAN IP was NOT rejected — it was learned + written to
+    /// the kernel ARP table. The #3182 gate is driven from the NAT-decoupled
+    /// `configured_iface_v4` set, so it is now REJECTED.
+    ///
+    /// Reverting `owns_configured_ip` to the NAT-excluded `local_v4` set
+    /// (`self.local_v4.contains(&v4)`) makes the "must NOT be present" assert
+    /// fail RED (172.16.80.8 is not in `local_v4`); the non-own learn assert
+    /// keeps the gate honest.
+    #[test]
+    fn arp_nat_excluded_wan_ip_not_learned_3182() {
+        let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+            &super::super::test_fixtures::nat_snapshot(),
+        )));
+        let wan_ip = Ipv4Addr::new(172, 16, 80, 8);
+        // Precondition that distinguishes #3182 from #2851: the WAN/SNAT IP
+        // is NAT-excluded from local_v4 yet IS an owned interface IP via the
+        // decoupled set. (If this IP were in local_v4 the test would not
+        // prove the decoupling.)
+        assert!(
+            !forwarding.local_v4.contains(&wan_ip),
+            "test precondition: the interface-mode-SNAT WAN IP must be \
+             NAT-excluded from local_v4"
+        );
+        assert!(
+            forwarding.owns_configured_ip(IpAddr::V4(wan_ip)),
+            "the WAN IP must be owned via the decoupled configured_iface_v4 set"
+        );
+        let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+        // Arrive on (parent=11, vlan=80) → logical reth0.80 (ifindex 12).
+        let meta = link_layer_meta(11, 80);
+
+        // 1) Spoofed reply claiming the router's OWN WAN IP — must NOT learn.
+        let attacker_mac = [0x02, 0x00, 0x00, 0x00, 0xba, 0xad];
+        let outcome =
+            stage_link_layer_classify(&arp_reply_frame(wan_ip, attacker_mac), meta, ctx);
+        assert!(matches!(outcome, StageOutcome::RecycleAndContinue));
+        assert!(
+            neighbors.get(&(12, IpAddr::V4(wan_ip))).is_none(),
+            "an ARP reply claiming the router's OWN NAT-excluded WAN IP must \
+             NOT be learned (#3182)"
+        );
+        assert!(
+            neighbors.get(&(11, IpAddr::V4(wan_ip))).is_none(),
+            "and not under the physical/parent ifindex either"
+        );
+
+        // 2) A legitimate NON-own neighbor on the same VLAN still learns.
+        let good_ip = Ipv4Addr::new(172, 16, 80, 9);
+        let good_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x09];
+        let _ = stage_link_layer_classify(&arp_reply_frame(good_ip, good_mac), meta, ctx);
+        assert_eq!(
+            neighbors.get(&(12, IpAddr::V4(good_ip))).map(|e| e.mac),
+            Some(good_mac),
+            "a legitimate non-own ARP neighbor on the WAN VLAN must still learn"
+        );
+    }
+
+    /// #3182 — same NAT-excluded own-IP anti-poison, NDP NA / IPv6 side.
+    /// `reth0.80`'s IPv6 `2001:559:8585:80::8` is NAT-excluded from
+    /// `local_v6` (interface-mode SNAT to_zone), so the #2851 gate did not
+    /// reject an NA advertising it. The #3182 decoupled set does.
+    #[test]
+    fn ndp_nat_excluded_wan_ip_not_learned_3182() {
+        let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+            &super::super::test_fixtures::nat_snapshot(),
+        )));
+        let wan_v6_bytes = [
+            0x20, 0x01, 0x05, 0x59, 0x85, 0x85, 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x08,
+        ];
+        let wan_v6 = IpAddr::V6(Ipv6Addr::from(wan_v6_bytes));
+        assert!(
+            !forwarding.local_v6.contains(&Ipv6Addr::from(wan_v6_bytes)),
+            "test precondition: the SNAT WAN IPv6 must be NAT-excluded from \
+             local_v6"
+        );
+        assert!(
+            forwarding.owns_configured_ip(wan_v6),
+            "the WAN IPv6 must be owned via the decoupled configured_iface_v6 set"
+        );
+        let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+        let meta = link_layer_meta(11, 80);
+
+        let (frame, target_ip, _mac) = ndp_na_frame_with_target(wan_v6_bytes);
+        assert_eq!(target_ip, wan_v6, "frame target must be the own WAN IPv6");
+        let outcome = stage_link_layer_classify(&frame, meta, ctx);
+        assert!(matches!(outcome, StageOutcome::Continue(())));
+        assert!(
+            neighbors.get(&(12, wan_v6)).is_none() && neighbors.get(&(11, wan_v6)).is_none(),
+            "an NDP NA advertising the router's OWN NAT-excluded WAN IPv6 must \
+             NOT be learned (#3182)"
+        );
+    }
+
+    /// #3182 fail-on-revert (RX source-MAC learn path own-IP anti-poison).
+    /// `learn_dynamic_neighbor` (the #1787 RX learn, reached via
+    /// `stage_parse_flow_and_learn`) caches `(ingress_ifindex, flow.src_ip)
+    /// -> src_mac` from every transit packet's source. An attacker can spoof
+    /// a packet whose SOURCE is one of the router's own interface IPs. The
+    /// #3182 guard rejects such a learn before the `learn_pair_if_changed`
+    /// insert; a non-own source still caches.
+    ///
+    /// Removing the `if forwarding.owns_configured_ip(src_ip) { return; }`
+    /// guard at the top of `learn_dynamic_neighbor` makes the "own-IP must
+    /// NOT be present" asserts fail RED; the non-own assert keeps it honest.
+    #[test]
+    fn rx_learn_own_wan_ip_rejected_3182() {
+        let forwarding = build_forwarding_state(&super::super::test_fixtures::nat_snapshot());
+        let neighbors = Arc::new(ShardedNeighborMap::default());
+
+        let wan_ip = Ipv4Addr::new(172, 16, 80, 8);
+        let own_wan = IpAddr::V4(wan_ip);
+        assert!(
+            !forwarding.local_v4.contains(&wan_ip),
+            "test precondition: the WAN IP is NAT-excluded from local_v4"
+        );
+        assert!(
+            forwarding.owns_configured_ip(own_wan),
+            "the WAN IP is owned via the decoupled set"
+        );
+
+        // 1) Spoofed transit packet sourced FROM the router's own WAN IP —
+        //    must NOT be cached under either the physical (11) or logical
+        //    (12) ifindex.
+        let attacker_mac = [0x02, 0x00, 0x00, 0x00, 0xba, 0xad];
+        crate::afxdp::neighbor_dispatch::learn_dynamic_neighbor(
+            &forwarding,
+            &neighbors,
+            11,
+            80,
+            own_wan,
+            attacker_mac,
+        );
+        assert!(
+            neighbors.get(&(12, own_wan)).is_none() && neighbors.get(&(11, own_wan)).is_none(),
+            "the RX learn path must reject an own-IP source (#3182)"
+        );
+
+        // 2) A non-own transit source still caches (under the logical
+        //    ifindex 12, the route-egress key).
+        let good = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 9));
+        let good_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x09];
+        crate::afxdp::neighbor_dispatch::learn_dynamic_neighbor(
+            &forwarding,
+            &neighbors,
+            11,
+            80,
+            good,
+            good_mac,
+        );
+        assert_eq!(
+            neighbors.get(&(12, good)).map(|e| e.mac),
+            Some(good_mac),
+            "a non-own RX-learned source must still cache (#3182 guard must \
+             not over-reject)"
+        );
+    }
+
     // ===================================================================
     // #3021 / #3022 — the ingress ZONE lookup (zone-pair policy for
     // forwarding, and screen/SYN-cookie zone resolution) must key on the

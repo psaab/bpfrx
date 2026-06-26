@@ -22,6 +22,71 @@
   pkg/dataplane/userspace/zones_host_inbound_test.go,
   docs/junos-cli-reference.md
 
+## 2026-06-26 — #3182 neighbor own-IP anti-poison: NAT-excluded interface IPs + RX learn path
+
+- **Timestamp**: 2026-06-26
+- **Action**: Follow-up to the merged #2851/#3180 own-IP anti-poison guard.
+  Two residuals. (1) `owns_configured_ip` reused the NAT-aware `local_v*` set,
+  which `nat_translated_local_exclusions` strips of any interface-mode-SNAT
+  `to_zone` interface IP (e.g. WAN `reth0.80` 172.16.80.8) — so an unsolicited
+  ARP/NDP claiming the router's own WAN IP was NOT rejected. Added a decoupled
+  `configured_iface_v4`/`configured_iface_v6` set on `ForwardingState`,
+  populated in `populate_interfaces` BEFORE the NAT-exclusion branch (every
+  configured interface address, regardless of NAT role). Switched
+  `owns_configured_ip` to read `configured_iface_v*` OR `local_v*` (the OR
+  keeps the late-stage static-NAT-external / DNAT-destination protections;
+  `local_v*` still drives `LocalDelivery` unchanged). (2) The #1787 RX
+  source-MAC learn path `learn_dynamic_neighbor` had NO own-IP guard; added
+  `if forwarding.owns_configured_ip(src_ip) { return; }` at the top, before the
+  dedup pre-check / `learn_pair_if_changed` insert, mirroring the ARP/NDP gate.
+  Legitimate non-own learning (ARP/NDP + RX) byte-identical, incl. the
+  #3048/#3169 `mac_change_epoch` bump on a real MAC change. Three new
+  fail-on-revert tests in poll_stages.rs
+  (`arp_nat_excluded_wan_ip_not_learned_3182`,
+  `ndp_nat_excluded_wan_ip_not_learned_3182`,
+  `rx_learn_own_wan_ip_rejected_3182`): reverting the guard to the NAT-excluded
+  `local_v*` set + removing the RX-learn guard turns all three RED while the
+  two #2851 tests stay GREEN. `cargo build --release` + `cargo test --release`
+  green (poll_stages 19/19 incl. 3 new + 2 #2851, neighbor 144/144,
+  forwarding 195/195).
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/neighbor_dispatch.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/README.md
+
+## 2026-06-26 — #2845 WG PTB inner-MTU per-peer underlay
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fix the WireGuard Packet-Too-Big inner-MTU computation, which
+  assumed one underlay MTU per wg interface (resolved via the FIRST peer with
+  an endpoint). The encap path LPM-selects the peer by inner destination
+  (`engine.peer_for_dest`) and computes the outer hop / MTU guard from THAT
+  peer's endpoint, but the PTB path ran before peer selection — so a PTB for
+  traffic to peer B could quote peer A's underlay MTU (over-advertise → next
+  packet dropped by peer B's encap guard; or under-advertise → throughput
+  loss). Fix: the TX dispatcher now derives the pre-encap inner destination
+  and threads it into `post_transform_inner_mtu` →
+  `frame::wg_endpoint_physical_outer_mtu`, which selects the SAME peer the
+  encap path will (`engine.peer_for_dest` on the inner destination) and
+  resolves the physical underlay MTU via THAT peer's endpoint route. Falls
+  back to the pre-#2845 first-peer behaviour (byte-identical single-underlay)
+  when the inner destination is unavailable / no live engine / no covering
+  peer; a covering peer with no endpoint uses the conservative logical
+  fallback rather than borrowing a different peer's underlay.
+- **File(s)**: `userspace-dp/src/afxdp/frame/wg.rs` (new `wg_peer_outer_dst`
+  helper + `wg_endpoint_physical_outer_mtu` gains an `inner_dst` param),
+  `userspace-dp/src/afxdp/icmp_ptb.rs` (`post_transform_inner_mtu` threads
+  `inner_dst` to the WG arm), `userspace-dp/src/afxdp/tx/dispatch/mod.rs`
+  (derive inner dst from `source_frame` + pass it),
+  `userspace-dp/src/afxdp/icmp_ptb_tests.rs` (new
+  `post_transform_wg_inner_mtu_is_per_peer_underlay` two-peer asymmetric
+  fixture + existing calls updated), `userspace-dp/src/afxdp/README.md`,
+  `docs/wireguard-interop.md`.
+- **Validation**: `cargo build --release` clean; new per-peer test green;
+  fail-on-revert proven (restore first-peer assumption → the per-peer test
+  goes RED on peer B while the three single-underlay #2684 tests stay GREEN).
+  Full `cargo test --release --bin xpf-userspace-dp` = 3089 passed / 0 failed.
 ## 2026-06-26 — #3175 queue-planner: orphan VLAN child plan-key follows parent's rx_queues
 
 - **Timestamp**: 2026-06-26
