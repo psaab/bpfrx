@@ -221,6 +221,17 @@ impl StaticNatTable {
                 {
                     continue;
                 }
+                // #3202: a block (subnet) pair that ALSO carries a port match or
+                // a mapped-port is not representable here. `StaticNatBlock` does
+                // an address-only, ALL-PORT offset remap with no port fields, so
+                // installing it would SILENTLY widen "port 80 of this /24 -> 8080"
+                // into "every port of the /24". Drop the rule instead of
+                // mis-installing it (fail CLOSED). The Go strict commit-check
+                // already rejects this; this is the lenient-load / peer-sync
+                // backstop, mirroring the host-side #2491 fail-closed behavior.
+                if snap.match_destination_port != 0 || snap.mapped_port != 0 {
+                    continue;
+                }
                 table.blocks.push(StaticNatBlock {
                     external: ext_prefix,
                     internal: int_prefix,

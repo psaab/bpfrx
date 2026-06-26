@@ -32,6 +32,34 @@
   short-circuit) turns `build_forwarding_state_protocols_all_admits_routing_not_system_services`
   RED ("protocols all must NOT admit ssh"); stashing daemon_nft.go turns
   `TestHostInboundFilterProtocolsAllScopedToRouting` RED; both restored
+## 2026-06-26 — #3202 reject block static-NAT combined with a port match/mapped-port
+
+- **Timestamp**: 2026-06-26
+- **Action**: Follow-up to #3031 (block-to-block static NAT). A subnet
+  static-NAT rule (`static-nat prefix <subnet>`) that ALSO carried a
+  `match destination-port` and/or `then static-nat mapped-port` passed
+  Go commit-compilation but the Rust `StaticNatBlock` discarded the port
+  info (it has no port fields, only an address-offset 1:1 remap). The
+  config silently degraded to an all-port, whole-subnet NAT — the
+  intended per-port mapping was lost, an over-broad NAT / policy bypass.
+  Junos `static-nat prefix` is address-only 1:1; per-port translation is
+  a host-scope (`/32`) construct. Chose the fail-closed commit-reject:
+  `validateNATHostMaskStrict` now rejects a `blockPair` rule that
+  specifies either port (strict) or warns (lenient load), and the Rust
+  `StaticNatTable::from_snapshots` drops a block snapshot carrying a
+  port instead of installing the wrong all-port block. Address-only
+  block NAT (#3031, no ports) is unchanged / byte-identical.
+- **File(s)**: pkg/config/compiler_nat.go,
+  userspace-dp/src/nat/static_nat.rs,
+  pkg/config/compiler_nat_host_mask_test.go,
+  userspace-dp/src/nat/tests.rs,
+  docs/feature-gaps.md, docs/feature-coverage.md
+- **Validation**: `go build ./...`, `go test ./pkg/config/` (1712 pass),
+  `cargo build --release`, `cargo test --release nat::` (149 pass).
+  Fail-on-revert proven both sides: neutering the Go `blockPair && port`
+  guard makes `TestStaticNATBlockWithPortRejected` go RED; deleting the
+  Rust port-skip makes `static_nat_block_with_port_is_dropped` go RED
+  (block mis-installs, 198.51.100.7 DNATs all-port). Both restored
   byte-identical.
 
 ## 2026-06-26 — #2961 WG give-up advances T8 anchor (keepalive handshake-storm cooldown)

@@ -758,6 +758,42 @@ fn static_nat_block_mismatched_length_is_skipped() {
 }
 
 #[test]
+fn static_nat_block_with_port_is_dropped() {
+    // #3202: a block (subnet) pair that ALSO carries a port match / mapped-port
+    // is NOT representable by StaticNatBlock (address-only, all-port offset
+    // remap). Installing it would silently widen "port 80 of this /24 -> 8080"
+    // into "every port of the /24". The lenient-load backstop drops the rule
+    // (fail closed) instead of mis-installing it. The Go strict commit-check
+    // rejects this; this test pins the dataplane backstop.
+    //
+    // Fail-on-revert: removing the `snap.match_destination_port != 0 ||
+    // snap.mapped_port != 0` skip in from_snapshots installs an all-port block
+    // → table is non-empty and 198.51.100.7 DNATs to 192.168.1.7 → RED.
+    let mut snap = block_snapshot("198.51.100.0/24", "192.168.1.0/24", "untrust");
+    snap.match_destination_port = 80;
+    snap.mapped_port = 8080;
+    let table = StaticNatTable::from_snapshots(&[snap], &crate::nat::NatCounterStore::default());
+    assert!(
+        table.is_empty(),
+        "a block pair with a port mapping must be dropped, not installed as an all-port block"
+    );
+    assert_eq!(
+        table.match_dnat("198.51.100.7".parse().expect("ext host"), "untrust"),
+        None
+    );
+}
+
+#[test]
+fn static_nat_block_with_match_port_only_is_dropped() {
+    // A block pair with only a match destination-port (no mapped-port) is
+    // equally not representable — also dropped by the #3202 backstop.
+    let mut snap = block_snapshot("198.51.100.0/24", "192.168.1.0/24", "untrust");
+    snap.match_destination_port = 80;
+    let table = StaticNatTable::from_snapshots(&[snap], &crate::nat::NatCounterStore::default());
+    assert!(table.is_empty());
+}
+
+#[test]
 fn static_nat_host_v4_unchanged_with_block_support() {
     // #3031 regression: a /32 host rule still behaves byte-identical to
     // pre-#3031 (exact 1:1, no offset math). Both directions.
