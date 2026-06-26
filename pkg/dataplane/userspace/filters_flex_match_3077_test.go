@@ -133,3 +133,47 @@ func TestFilterSnapshotFlexMatchDefaultLength(t *testing.T) {
 		t.Errorf("flex length = %d, want 4 (default 32-bit)", fm.Length)
 	}
 }
+
+// TestFilterSnapshotFlexMatchCeilByteLength is the #3203 #02 guard: a
+// non-multiple-of-8 bit-length must round UP to whole bytes so the matcher
+// reads enough bytes to cover the field. The old BitLength/8 truncation gave 1
+// byte for 12 bits (dropping the trailing nibble) and 2 bytes for 24 bits. The
+// byte-aligned 8/16/32-bit cases must stay byte-identical to the #3077 result.
+// REVERT (BitLength/8 truncation) -> the 12/24-bit rows FAIL.
+func TestFilterSnapshotFlexMatchCeilByteLength(t *testing.T) {
+	cases := []struct {
+		bits    uint8
+		wantLen uint8
+	}{
+		{8, 1},   // byte-aligned, unchanged
+		{12, 2},  // non-multiple-of-8 -> ceil to 2 bytes (was truncated to 1)
+		{16, 2},  // byte-aligned, unchanged
+		{24, 3},  // byte-aligned, unchanged (was truncated to 2 only if non-mult)
+		{20, 3},  // non-multiple-of-8 -> ceil to 3 bytes
+		{32, 4},  // byte-aligned, unchanged
+	}
+	for _, tc := range cases {
+		cfg := &config.Config{}
+		cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+			"f": {Name: "f", Terms: []*config.FirewallFilterTerm{{
+				Name:   "t",
+				Action: "discard",
+				FlexMatch: &config.FlexMatchConfig{
+					MatchStart: "layer-3",
+					ByteOffset: 0,
+					BitLength:  tc.bits,
+					Value:      0x1,
+					Mask:       0xFFFFFFFF,
+				},
+			}}},
+		}
+		snaps := buildFirewallFilterSnapshots(cfg)
+		fm := snaps[0].Terms[0].FlexMatch
+		if fm == nil {
+			t.Fatalf("bit-length %d: flexible-match-range dropped", tc.bits)
+		}
+		if fm.Length != tc.wantLen {
+			t.Errorf("bit-length %d: flex length = %d, want %d", tc.bits, fm.Length, tc.wantLen)
+		}
+	}
+}

@@ -6444,6 +6444,68 @@ fn flex_match_does_not_match_when_bytes_differ() {
 }
 
 #[test]
+fn flex_match_non_byte_aligned_12bit_field() {
+    // #3203: a 12-bit field lowers (Go control plane) to length=2 (ceil(12/8))
+    // and the default mask 0x0FFF (low 12 bits). The matcher reads 2 bytes
+    // big-endian, ANDs the mask, and compares. A packet whose 12-bit field
+    // equals 0x0ABC must match regardless of the upper 4 bits; one whose field
+    // differs must NOT. Before #3203 the Go side truncated length to 1 byte (so
+    // this read only the high byte) AND defaulted the mask to 0xFFFFFFFF (which
+    // a 2-byte read could never satisfy) — both made a 12-bit match impossible
+    // (silent fail-closed). These lowered values are what the Go compiler now
+    // emits; this test confirms they select the intended field.
+    let state = make_filter_state(
+        &flex_filter(
+            "inet",
+            "tcp",
+            FlexMatchSnapshot {
+                offset: 0,
+                length: 2,
+                value: 0x0ABC,
+                mask: 0x0FFF,
+            },
+        ),
+        &[],
+    );
+    // High nibble 0x1 is outside the 12-bit mask: 0x1ABC & 0x0FFF == 0x0ABC.
+    let l3_hit = [0x1Au8, 0xBC, 0x00, 0x00];
+    let hit = evaluate_filter(
+        &state,
+        "inet:fx",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        extra_flex(&l3_hit),
+    );
+    assert_eq!(
+        hit.action,
+        FilterAction::Discard,
+        "12-bit field 0x0ABC (bytes 0x1A,0xBC masked 0x0FFF) must match"
+    );
+    // Field 0x0ABD != 0x0ABC -> the discard term must NOT match.
+    let l3_miss = [0x1Au8, 0xBD, 0x00, 0x00];
+    let miss = evaluate_filter(
+        &state,
+        "inet:fx",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        extra_flex(&l3_miss),
+    );
+    assert_eq!(
+        miss.action,
+        FilterAction::Accept,
+        "12-bit field 0x0ABD must NOT match flex value 0x0ABC"
+    );
+}
+
+#[test]
 fn flex_match_respects_mask() {
     // Mask 0x00FF over 2 bytes at offset 2: only the low byte matters. Value
     // 0x0028 matches any packet whose 4th L3 byte is 0x28 regardless of byte 3.

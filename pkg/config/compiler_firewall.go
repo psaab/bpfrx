@@ -343,36 +343,59 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm, family string) {
 						}
 					case "byte-offset":
 						if v := nodeVal(rc); v != "" {
-							if n, err := strconv.Atoi(v); err == nil {
+							// #3203: a parse error (or a value outside 0..255,
+							// the wire field width) must FAIL CLOSED at commit,
+							// not silently coerce the offset to 0. Record the
+							// token for validateFilterFlexMatchStrict.
+							if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 255 {
 								fm.ByteOffset = uint8(n)
+							} else {
+								term.UnknownFlexMatch = append(term.UnknownFlexMatch, "byte-offset "+v)
 							}
 						}
 					case "bit-length":
 						if v := nodeVal(rc); v != "" {
-							if n, err := strconv.Atoi(v); err == nil {
+							// #3203: bit-length must be 1..32 (the wire value is a
+							// u32 read of ceil(bits/8) bytes). strconv.Atoi
+							// followed by an unchecked uint8() cast previously
+							// truncated an out-of-range value (e.g. 999 -> 231)
+							// silently; a non-numeric token was ignored, leaving
+							// bit-length 0 (later defaulted to 32). Fail closed on
+							// either by recording the token.
+							if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 32 {
 								fm.BitLength = uint8(n)
+							} else {
+								term.UnknownFlexMatch = append(term.UnknownFlexMatch, "bit-length "+v)
 							}
 						}
 					case "range", "match-value":
 						if v := nodeVal(rc); v != "" {
-							// Format: "0xVALUE/0xMASK" or just "0xVALUE"
+							// Format: "0xVALUE/0xMASK" or just "0xVALUE".
+							// #3203: a ParseUint error (malformed hex or a value
+							// wider than 32 bits) previously left fm.Value/fm.Mask
+							// at the zero default — the rule then matched value 0
+							// instead of the intended pattern, with a clean
+							// commit. Fail closed: record the unparseable token.
 							parts := strings.SplitN(v, "/", 2)
-							val, err := strconv.ParseUint(strings.TrimPrefix(parts[0], "0x"), 16, 32)
-							if err == nil {
+							if val, err := strconv.ParseUint(strings.TrimPrefix(parts[0], "0x"), 16, 32); err == nil {
 								fm.Value = uint32(val)
+							} else {
+								term.UnknownFlexMatch = append(term.UnknownFlexMatch, "match-value "+parts[0])
 							}
 							if len(parts) == 2 {
-								mask, err := strconv.ParseUint(strings.TrimPrefix(parts[1], "0x"), 16, 32)
-								if err == nil {
+								if mask, err := strconv.ParseUint(strings.TrimPrefix(parts[1], "0x"), 16, 32); err == nil {
 									fm.Mask = uint32(mask)
+								} else {
+									term.UnknownFlexMatch = append(term.UnknownFlexMatch, "match-mask "+parts[1])
 								}
 							}
 						}
 					case "match-mask":
 						if v := nodeVal(rc); v != "" {
-							mask, err := strconv.ParseUint(strings.TrimPrefix(v, "0x"), 16, 32)
-							if err == nil {
+							if mask, err := strconv.ParseUint(strings.TrimPrefix(v, "0x"), 16, 32); err == nil {
 								fm.Mask = uint32(mask)
+							} else {
+								term.UnknownFlexMatch = append(term.UnknownFlexMatch, "match-mask "+v)
 							}
 						}
 					}
@@ -381,14 +404,18 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm, family string) {
 					fm.BitLength = 32 // default to 32-bit match
 				}
 				if fm.Mask == 0 {
-					// Default mask based on bit-length
-					switch fm.BitLength {
-					case 8:
-						fm.Mask = 0xFF
-					case 16:
-						fm.Mask = 0xFFFF
-					default:
+					// #3203: default mask = the low BitLength bits set, for ANY
+					// 1..32-bit length (not just 8/16). The Rust matcher
+					// (userspace-dp/src/filter/engine/matching.rs) reads
+					// ceil(bits/8) bytes big-endian into a u32 (right-aligned in
+					// the low bits) and compares (read & mask) == value, so a
+					// 24-bit field needs 0x00FFFFFF. The old code defaulted every
+					// non-8/16 length to 0xFFFFFFFF, which that read could never
+					// satisfy for a value with a non-zero high byte.
+					if fm.BitLength >= 32 {
 						fm.Mask = 0xFFFFFFFF
+					} else {
+						fm.Mask = uint32(1)<<fm.BitLength - 1
 					}
 				}
 				term.FlexMatch = fm
