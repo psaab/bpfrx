@@ -29,6 +29,27 @@
 - **File(s)**: pkg/vrrp/track.go, pkg/vrrp/manager.go,
   pkg/vrrp/track_test.go, docs/feature-coverage.md, _Log.md
 
+## 2026-06-26 — #2917 VLAN-unit AF_XDP bind-target SSOT (Go ↔ Rust parity)
+
+- **Timestamp**: 2026-06-26
+- **Action**: Made the VLAN-unit AF_XDP binding target a single documented
+  contract across both planes. The Rust planner already binds the physical
+  PARENT netdev for VLAN children (resolved by #3091/#3175 after #2917 was
+  filed against now-stale line numbers); the Go allowlist used a coarser
+  "always prefer ParentLinuxName" rule that diverged from the planner for a
+  degenerate non-VLAN unit numbered > 0. Extracted `userspaceBindTargetNetdev`
+  (mirrors Rust `vlan_child_parent_netdev` exactly: VLAN child → parent, else
+  own netdev) and routed `UserspaceBoundLinuxInterfaces` through it. Added the
+  cross-plane SSOT tests (Go: VLANUnitBindsParent, BindTargetNetdev_Contract,
+  MatchesBindTargetSSOT; Rust: replan_queues_binds_vlan_unit_on_parent_netdev)
+  — fail-on-revert verified RED on both planes. Documented the contract in
+  docs/userspace-dataplane-architecture.md and cross-referenced it from both
+  the Go helper and the Rust predicate. No fork: parent is unambiguously
+  correct (software VLAN netdev has no hardware RX queues).
+- **File(s)**: pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/snapshot_allowlist_test.go,
+  userspace-dp/src/server/helpers.rs, userspace-dp/src/main_tests.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
 ## 2026-06-26 — #2900 VRRP: re-validate an armed preempt hold-timer
 
 - **Timestamp**: 2026-06-26

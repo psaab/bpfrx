@@ -424,6 +424,39 @@ Each binding manages four rings:
   contains mlx5/copy-mode mitigations and debugging around fill-ring pressure,
   so do not read "AF_XDP" as meaning "always zero-copy" on current `master`.
 
+#### VLAN unit AF_XDP binding target: the parent-netdev SSOT (#2917)
+
+AF_XDP binds a socket to a netdev's **hardware RX queues**. A VLAN
+sub-interface (`reth0.80` → Linux netdev `ge-0-0-2.80`) is a *software*
+netdev with no hardware queues of its own — its VLAN-tagged frames are
+delivered on the **physical parent's** hardware queues (`ge-0-0-2`, e.g. 6
+queues on an mlx5 VF) and the kernel demuxes the tag. Zero-copy AF_XDP for
+a VLAN unit therefore **MUST bind the parent physical netdev**; binding the
+`.80` unit netdev would fail (or fall back to copy/generic) and, in the
+queue planner, collapse the per-interface `queue_count` min to the child's
+lone software queue → a single worker (the #3091 ~6 Gbps regression).
+
+This is a single contract enforced on **both** planes from one rule:
+
+- **Rust planner** (`replan_queues` / `vlan_child_parent_netdev`,
+  `userspace-dp/src/server/helpers.rs`): a VLAN child (`vlan_id != 0`, a
+  non-empty `parent_linux_name` that differs from the row's own netdev) is
+  deduped onto its parent — skipped when the parent is itself a candidate
+  (the parent's per-queue XSKs already capture the tagged frames), else
+  re-keyed onto the parent using the parent's *hardware* queue count
+  (#3175). A physical interface or non-VLAN unit binds its own netdev.
+- **Go control plane** (`userspaceBindTargetNetdev` →
+  `UserspaceBoundLinuxInterfaces`, `pkg/dataplane/userspace/interfaces.go`):
+  mirrors the same rule exactly so the D3/RSS allowlist, XDP steering, and
+  shim maps all target the parent netdev the planner binds. The allowlist
+  never contains a VLAN-suffixed unit netdev.
+
+Cross-plane parity is guarded by `replan_queues_binds_vlan_unit_on_parent_netdev`
+(Rust, `main_tests.rs`) and `TestUserspaceBoundLinuxInterfaces_VLANUnitBindsParent`
++ `TestUserspaceBoundLinuxInterfaces_MatchesBindTargetSSOT` (Go,
+`snapshot_allowlist_test.go`). Changing one plane's rule without the other
+turns these RED.
+
 #### Session Table (`session.rs`)
 
 Per-worker hash table using a SEEDED `FxHasher` (`FxSeededState`, fast
