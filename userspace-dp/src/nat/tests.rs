@@ -4,8 +4,10 @@
 // allocator.rs / destination.rs.
 
 use super::allocator::{
-    ALLOCATION_GC_BUDGET, NS_PER_SEC, PersistentLease, PersistentSourceKey, sticky_pool_index,
+    ALLOCATION_GC_BUDGET, NS_PER_SEC, PersistentLease, PersistentSourceKey, PoolAddressFamily,
+    sticky_pool_index,
 };
+use super::source::SourceNatFlowKey;
 use super::destination::{PROTO_ANY, PROTO_TCP, PROTO_UDP};
 use super::*;
 use crate::ip_proto::{PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6};
@@ -4450,6 +4452,128 @@ fn port_allocator_basic() {
     assert_eq!(mixed.address_index(src_v6, 2, 2, false), 2);
     assert_eq!(mixed.address_index(src_v4, 0, 2, false), 1);
     assert_eq!(mixed.address_index(src_v6, 2, 2, false), 3);
+}
+
+/// #3047 (062-05) fail-on-revert: a single collision on the sequential
+/// candidate port must NOT spuriously exhaust the allocator. With the next two
+/// sequential ports occupied out-of-band (a persistent lease / HA-synced
+/// install sitting inside the range), the allocator must probe forward and
+/// hand out the next free port. Before the fix `claim_free_port_locked` tried
+/// only one port per call; `allocate_translation`'s two-shot retry then both
+/// hit an occupied port and the flow was wrongly refused as exhausted.
+#[test]
+fn pool_snat_sequential_collision_probes_next_free_port() {
+    let pool_ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let addrs = [pool_ip];
+    // Range 1024..=1027 (4 ports). Occupy the first two sequential candidates.
+    let alloc = PortAllocator::new(1, 1024, 1027);
+    alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), 1024);
+    alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), 1025);
+
+    let flow = SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.61.50".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40000,
+        dst_port: 443,
+    };
+    let result = alloc.allocate_translation(
+        flow,
+        PoolAddressFamily::V4(&addrs),
+        0,
+        false,
+        false,
+        false,
+        0,
+        1_000,
+    );
+    let translated = result.expect("collision must not exhaust an otherwise-free range");
+    assert_eq!(translated.ip, IpAddr::V4(pool_ip));
+    assert_eq!(
+        translated.port, 1026,
+        "must probe past the two occupied ports to the next free one"
+    );
+}
+
+/// #3047 (062-10) fail-on-revert: a recycled port that collides with an
+/// out-of-band owner must be RETAINED on the recycled stack, not discarded.
+/// Before the fix the colliding port was popped and dropped, permanently
+/// shrinking the reusable pool. Here the sequential cursor is exhausted so the
+/// recycled stack is the only source; the top entry collides and the second is
+/// free. The allocation must succeed with the free port AND leave the collided
+/// port still recyclable.
+#[test]
+fn pool_snat_recycled_collision_retains_port() {
+    let pool_ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let addrs = [pool_ip];
+    // Range 1024..=1025 (2 ports).
+    let alloc = PortAllocator::new(1, 1024, 1025);
+    {
+        let mut live = alloc.debug_live();
+        // Force the sequential cursor past the range so only the recycled
+        // stack is consulted.
+        live.next_port_offset_by_addr[0] = 2;
+        // Stack: pop() yields 1025 (collides) first, then 1024 (free).
+        live.recycled_ports_by_addr[0] = vec![1024, 1025];
+    }
+    // 1025 is occupied out-of-band, so the recycled pop of 1025 collides.
+    alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), 1025);
+
+    let flow = SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.61.51".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40001,
+        dst_port: 443,
+    };
+    let result = alloc.allocate_translation(
+        flow,
+        PoolAddressFamily::V4(&addrs),
+        0,
+        false,
+        false,
+        false,
+        0,
+        1_000,
+    );
+    let translated = result.expect("free recycled port must be allocated");
+    assert_eq!(translated.port, 1024, "must hand out the free recycled port");
+
+    // The collided recycled port must NOT have been leaked: it is still on the
+    // recycled stack, so once its out-of-band owner clears it is reusable.
+    {
+        let live = alloc.debug_live();
+        assert!(
+            live.recycled_ports_by_addr[0].contains(&1025),
+            "collided recycled port must be retained, not discarded (leak)"
+        );
+    }
+
+    // Prove reusability: clear the out-of-band owner and allocate again — the
+    // retained port 1025 must be handed out instead of a spurious exhaustion.
+    alloc.debug_clear_owner(IpAddr::V4(pool_ip), 1025);
+    let flow2 = SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.61.52".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40002,
+        dst_port: 443,
+    };
+    let result2 = alloc.allocate_translation(
+        flow2,
+        PoolAddressFamily::V4(&addrs),
+        0,
+        false,
+        false,
+        false,
+        0,
+        1_000,
+    );
+    let translated2 = result2.expect("retained recycled port must be reusable after owner clears");
+    assert_eq!(
+        translated2.port, 1025,
+        "the retained recycled port must be reused, proving no leak"
+    );
 }
 
 #[test]

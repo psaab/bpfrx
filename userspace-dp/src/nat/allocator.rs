@@ -7,6 +7,19 @@
 // counters and totals are correct only because the mutex provides
 // happens-before for the user-visible state.
 //
+// Port claim (claim_free_port_locked) collision handling (#3047):
+// - Sequential phase: the monotonic per-address cursor is probed FORWARD,
+//   one offset at a time, until a free port is claimed or the range is
+//   genuinely exhausted. A single collision with an out-of-band occupant
+//   (a persistent lease or an HA-synced install sitting at the cursor's
+//   port) advances past it instead of aborting the whole allocation
+//   (062-05). The common case claims on the first probe.
+// - Recycled phase: when the sequential range is spent, recycled ports are
+//   drained; a popped port whose owner slot is occupied is RETAINED (re-
+//   queued), never discarded, so a transient collision cannot permanently
+//   shrink the reusable pool (062-10). The retain buffer allocates lazily
+//   only when a collision actually occurs.
+//
 // Cross-submodule visibility (per #1542 plan v3):
 // - PortAllocator and PortAllocatorSnapshot are pub(crate) at definition
 //   (re-exported by nat/mod.rs).
@@ -112,7 +125,7 @@ pub(super) struct PortAllocatorLiveState {
     pub(super) persistent_by_source: FxHashMap<PersistentSourceKey, PersistentLease>,
     pub(super) lease_expirations: BTreeSet<(u64, PersistentSourceKey)>,
     pub(super) lease_expirations_by_addr: Vec<BTreeSet<(u64, PersistentSourceKey)>>,
-    next_port_offset_by_addr: Vec<u32>,
+    pub(super) next_port_offset_by_addr: Vec<u32>,
     pub(super) recycled_ports_by_addr: Vec<Vec<u16>>,
     gc_counter: u32,
 }
@@ -209,6 +222,41 @@ impl PortAllocator {
     #[cfg(test)]
     pub(super) fn debug_live(&self) -> MutexGuard<'_, PortAllocatorLiveState> {
         self.shared.live.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Test-only: mark a translated tuple as owned by a synthetic flow without
+    /// advancing the sequential cursor. Models an out-of-band occupant (a
+    /// persistent lease or an HA-synced install) sitting inside the sequential
+    /// port range — the precondition for the #3047 collision/leak paths.
+    #[cfg(test)]
+    pub(super) fn debug_seed_owner(&self, addr_index: usize, translated_ip: IpAddr, port: u16) {
+        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        let translated = TranslatedTuple {
+            ip: translated_ip,
+            port,
+        };
+        let owner = AllocationOwner::Flow(SourceNatFlowKey {
+            protocol: 6,
+            src_ip: translated_ip,
+            dst_ip: translated_ip,
+            src_port: port,
+            dst_port: 0,
+        });
+        live.owner_by_translated.insert(translated, owner);
+        live.addr_index_by_translated.insert(translated, addr_index);
+    }
+
+    /// Test-only: release a synthetic owner seeded via `debug_seed_owner`
+    /// without pushing the port onto the recycled stack.
+    #[cfg(test)]
+    pub(super) fn debug_clear_owner(&self, translated_ip: IpAddr, port: u16) {
+        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        let translated = TranslatedTuple {
+            ip: translated_ip,
+            port,
+        };
+        live.owner_by_translated.remove(&translated);
+        live.addr_index_by_translated.remove(&translated);
     }
 
     /// Pick a pool address index for the current address family.
@@ -434,10 +482,21 @@ impl PortAllocator {
             return None;
         }
         let range = (self.port_high as u32).saturating_sub(self.port_low as u32) + 1;
-        let next_offset = &mut live.next_port_offset_by_addr[addr_index];
-        if *next_offset < range {
-            let port = self.port_low + *next_offset as u16;
-            *next_offset += 1;
+
+        // #3047 (062-05): probe forward from the monotonic cursor until a free
+        // port is claimed or the sequential range is genuinely exhausted. A
+        // single collision with an out-of-band occupant (e.g. a persistent
+        // lease or HA-synced install sitting at this offset) no longer aborts
+        // the whole allocation — the cursor advances past it and the next free
+        // port is tried. The common case still claims on the first iteration,
+        // so this stays hot-path-cheap.
+        loop {
+            let next_offset = live.next_port_offset_by_addr[addr_index];
+            if next_offset >= range {
+                break;
+            }
+            let port = self.port_low + next_offset as u16;
+            live.next_port_offset_by_addr[addr_index] = next_offset + 1;
             let translated = TranslatedTuple {
                 ip: translated_ip,
                 port,
@@ -447,16 +506,30 @@ impl PortAllocator {
             }
         }
 
+        // #3047 (062-10): drain the recycled stack, but RETAIN any popped port
+        // whose owner slot is occupied (an out-of-band collision) instead of
+        // discarding it. A discarded recycled port is permanently lost from the
+        // pool; re-queueing it keeps the usable range from shrinking over time.
+        // `retained` allocates lazily only when a collision is actually hit, so
+        // the common (first pop succeeds / stack empty) path stays allocation
+        // free.
+        let mut retained: Vec<u16> = Vec::new();
+        let mut claimed = None;
         while let Some(port) = live.recycled_ports_by_addr[addr_index].pop() {
             let translated = TranslatedTuple {
                 ip: translated_ip,
                 port,
             };
             if self.assign_owner_locked(live, addr_index, translated, flow, persistent_key) {
-                return Some(translated);
+                claimed = Some(translated);
+                break;
             }
+            retained.push(port);
         }
-        None
+        if !retained.is_empty() {
+            live.recycled_ports_by_addr[addr_index].append(&mut retained);
+        }
+        claimed
     }
 
     fn assign_owner_locked(
