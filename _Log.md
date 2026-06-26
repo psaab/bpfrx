@@ -18,6 +18,29 @@
   ./pkg/config/... ./pkg/appid/... (1650 pass), gofmt -l clean. Fail-on-
   revert proven: restoring the broad junos- accept makes the junos-foobar
   reject test RED.
+- **2026-06-25**: #3141 review fold (PR #3155) — closed a flat-path trailing-token escape in `validatePolicyThenDenyStrict`. The validator inspected only `denyNode.Keys[1]` on the FLAT path, so when a SUPPORTED token LED and an UNSUPPORTED token TRAILED, the unsupported one slipped through silently — `then deny count evilmod` compiled clean and `evilmod` was dropped (the exact silent-inert failure mode the gate exists to prevent). The hierarchical children loop already checked every direct child; the gap was flat-path-only and asymmetric (unsupported-FIRST was correctly rejected). Fix: iterate ALL collapsed tokens `Keys[1:]`, checking each against a new shared `recognizedCollapsedDenyToken` predicate (compiler_security.go) = the EXACT {log, session-init, session-close, count} set `applyCollapsedDenyModifiers` consumes, so validator and wiring agree on modifier-vs-sub-token (log may be followed by session-init/session-close; count stands alone; anything else rejected). Added fail-on-revert tests: `then deny count evilmod` and `then deny log session-init evilmod` rejected; `then deny log session-init session-close count` commits with all fields wired. Reverting to the Keys[1]-only check turns the two trailing-token reject cases RED. Gates: go build clean; go test ./pkg/config/... 1657 pass; gofmt clean. Files: pkg/config/compiler_policy_then.go, pkg/config/compiler_security.go, pkg/config/compiler_policy_then_deny_3141_test.go, pkg/config/README.md
+- **2026-06-25**: #3141 (codex-review-068 finding 068-01) — `then deny` log/count modifier wired; other collapsed deny modifiers rejected. A flat-set `then deny log session-init` collapses `log session-init` onto the deny node (Keys=["deny","log","session-init"], no children) instead of nesting a sibling `then log` node; `compilePolicy`'s `then` switch `deny` arm (compiler_security.go) read only `t.Name()` and silently dropped the collapsed tail, so deny-with-logging committed but `pol.Log` was never set — the configured audit logging was inert (a deny-rule observability/compliance failure, not a packet fail-OPEN). Unlike #3114/#3115 (pure rejects, empty allowlists) this is feature-wiring: deny+log/deny+count are LEGITIMATE Junos combinations the standalone `then log`/`then count` arms already implement. Fix WIRES the collapsed `log`/`count` modifiers in new `applyCollapsedDenyModifiers` (compiler_security.go), so deny+log works in BOTH the flat-collapsed form and the separate-node `then { deny; log session-init; }` form (latter already handled by the `log` arm). Verified `pol.Log` flows into `PolicyRuleSnapshot.LogSessionInit/Close` (pkg/dataplane/userspace/policies.go, #2508) independent of `Action`, so a deny rule emits the configured session log. Added `validatePolicyThenDenyStrict` (compiler_policy_then.go) as the safety net: hard-rejects any REMAINING `then deny <unsupported>` collapsed modifier at commit naming scope/policy/modifier; allowlist `supportedPolicyThenDenyChildren` = {log, count}, kept in lockstep with the wiring. AST pre-walk in compileExpanded, both AST shapes (Keys[1] flat / child node), zone-pair + global. Strict hard-reject on CompileConfig; lenient-warn on both lenient constructors via new `lenientPolicyThenDeny` flag (#1960 no-brick). Fail-on-revert verified RED→GREEN twice: neutralize `applyCollapsedDenyModifiers` → collapsed-log/count tests RED (separate-node still GREEN); stub `validatePolicyThenDenyStrict` → reject + lenient-warn tests RED. Files: pkg/config/compiler_security.go, pkg/config/compiler_policy_then.go, pkg/config/compiler.go, pkg/config/compiler_policy_then_deny_3141_test.go (new), pkg/config/README.md
+## 2026-06-25 — #3142: close multi-value-leaf escape in the #3113 policy-match gate
+
+- **Timestamp**: 2026-06-25
+- **Action**: Extended `validatePolicyMatchLeavesStrict` to also inspect the
+  COLLAPSED tail tokens of a supported `multi:true` match leaf (the
+  `application` leaf's `Keys[1:]` + child sub-nodes, via `firewallMatchValues`),
+  not just the direct children of `match`. A flat-set `match application <vals>
+  dynamic-application/url-category/source-identity ...` collapses the unsupported
+  match-leaf keyword onto the application leaf (the #2419 absorber), where the
+  #3113 direct-child check never saw it — the criterion escaped the gate and the
+  policy silently armed as a broad application match (fail-open). Added a
+  `unsupportedPolicyMatchLeaves` set (the KNOWN unsupported match dimensions) and
+  reject any such keyword found in the tail. A legitimate application value (e.g.
+  `[ junos-http junos-https ]`) is never one of those keywords, so it is not
+  over-rejected. Same strict-reject / lenient-warn split as #3113.
+- **File(s)**: pkg/config/compiler_policy_match.go,
+  pkg/config/compiler_policy_match_3142_test.go, pkg/config/README.md
+- **Validation**: `go build ./...`; `go test ./pkg/config/...` (all green);
+  fail-on-revert confirmed — reverting the tail scan makes the five escape
+  cases COMMIT (the genuine fail-open), turning the escape test RED; the
+  no-over-reject cases stay green. gofmt clean.
 
 ## 2026-06-25 — #3025: NAT64 non-fragmented L4 checksum goes incremental (RFC 1624)
 
