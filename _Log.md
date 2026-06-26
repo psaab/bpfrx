@@ -18,6 +18,75 @@
   GREEN; fail-on-revert RED with the filter removed; full forwarding
   suite 193 passed.
 
+## 2026-06-25 — #3150: strict app-spec protocol gate aligned to dataplane resolver
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fix commit/apply split — `validateApplicationSpecsStrict`
+  resolved a policy/NAT-referenced application's `protocol` leaf via the
+  lenient `validateProtocol` (blanket `strings.HasPrefix("junos-")` accept),
+  so `protocol junos-foobar` committed cleanly while the dataplane resolver
+  `appid.ProtocolNumber` rejects it → userspace policy capability gate
+  disarms (apply fails after a green commit). Switched the strict app-spec
+  protocol check to `filterProtocolResolvable` (the existing
+  `appid.ProtocolNumber` mirror, drift-guarded). Lenient `validateProtocol`
+  unchanged (still used by `ValidateConfig` warning surface / unreferenced
+  apps). Lenient load downgrade (`lenientApplicationSpecs`) preserved.
+- **File(s)**: pkg/config/compiler_validate_strict.go (fix + comments),
+  pkg/config/compiler_application_specs_test.go (fail-on-revert tests),
+  pkg/config/README.md (gotcha note), _Log.md
+- **Validation**: go build ./..., go vet ./pkg/config/..., go test
+  ./pkg/config/... ./pkg/appid/... (1650 pass), gofmt -l clean. Fail-on-
+  revert proven: restoring the broad junos- accept makes the junos-foobar
+  reject test RED.
+- **2026-06-25**: #3141 review fold (PR #3155) — closed a flat-path trailing-token escape in `validatePolicyThenDenyStrict`. The validator inspected only `denyNode.Keys[1]` on the FLAT path, so when a SUPPORTED token LED and an UNSUPPORTED token TRAILED, the unsupported one slipped through silently — `then deny count evilmod` compiled clean and `evilmod` was dropped (the exact silent-inert failure mode the gate exists to prevent). The hierarchical children loop already checked every direct child; the gap was flat-path-only and asymmetric (unsupported-FIRST was correctly rejected). Fix: iterate ALL collapsed tokens `Keys[1:]`, checking each against a new shared `recognizedCollapsedDenyToken` predicate (compiler_security.go) = the EXACT {log, session-init, session-close, count} set `applyCollapsedDenyModifiers` consumes, so validator and wiring agree on modifier-vs-sub-token (log may be followed by session-init/session-close; count stands alone; anything else rejected). Added fail-on-revert tests: `then deny count evilmod` and `then deny log session-init evilmod` rejected; `then deny log session-init session-close count` commits with all fields wired. Reverting to the Keys[1]-only check turns the two trailing-token reject cases RED. Gates: go build clean; go test ./pkg/config/... 1657 pass; gofmt clean. Files: pkg/config/compiler_policy_then.go, pkg/config/compiler_security.go, pkg/config/compiler_policy_then_deny_3141_test.go, pkg/config/README.md
+- **2026-06-25**: #3141 (codex-review-068 finding 068-01) — `then deny` log/count modifier wired; other collapsed deny modifiers rejected. A flat-set `then deny log session-init` collapses `log session-init` onto the deny node (Keys=["deny","log","session-init"], no children) instead of nesting a sibling `then log` node; `compilePolicy`'s `then` switch `deny` arm (compiler_security.go) read only `t.Name()` and silently dropped the collapsed tail, so deny-with-logging committed but `pol.Log` was never set — the configured audit logging was inert (a deny-rule observability/compliance failure, not a packet fail-OPEN). Unlike #3114/#3115 (pure rejects, empty allowlists) this is feature-wiring: deny+log/deny+count are LEGITIMATE Junos combinations the standalone `then log`/`then count` arms already implement. Fix WIRES the collapsed `log`/`count` modifiers in new `applyCollapsedDenyModifiers` (compiler_security.go), so deny+log works in BOTH the flat-collapsed form and the separate-node `then { deny; log session-init; }` form (latter already handled by the `log` arm). Verified `pol.Log` flows into `PolicyRuleSnapshot.LogSessionInit/Close` (pkg/dataplane/userspace/policies.go, #2508) independent of `Action`, so a deny rule emits the configured session log. Added `validatePolicyThenDenyStrict` (compiler_policy_then.go) as the safety net: hard-rejects any REMAINING `then deny <unsupported>` collapsed modifier at commit naming scope/policy/modifier; allowlist `supportedPolicyThenDenyChildren` = {log, count}, kept in lockstep with the wiring. AST pre-walk in compileExpanded, both AST shapes (Keys[1] flat / child node), zone-pair + global. Strict hard-reject on CompileConfig; lenient-warn on both lenient constructors via new `lenientPolicyThenDeny` flag (#1960 no-brick). Fail-on-revert verified RED→GREEN twice: neutralize `applyCollapsedDenyModifiers` → collapsed-log/count tests RED (separate-node still GREEN); stub `validatePolicyThenDenyStrict` → reject + lenient-warn tests RED. Files: pkg/config/compiler_security.go, pkg/config/compiler_policy_then.go, pkg/config/compiler.go, pkg/config/compiler_policy_then_deny_3141_test.go (new), pkg/config/README.md
+## 2026-06-25 — #3142: close multi-value-leaf escape in the #3113 policy-match gate
+
+- **Timestamp**: 2026-06-25
+- **Action**: Extended `validatePolicyMatchLeavesStrict` to also inspect the
+  COLLAPSED tail tokens of a supported `multi:true` match leaf (the
+  `application` leaf's `Keys[1:]` + child sub-nodes, via `firewallMatchValues`),
+  not just the direct children of `match`. A flat-set `match application <vals>
+  dynamic-application/url-category/source-identity ...` collapses the unsupported
+  match-leaf keyword onto the application leaf (the #2419 absorber), where the
+  #3113 direct-child check never saw it — the criterion escaped the gate and the
+  policy silently armed as a broad application match (fail-open). Added a
+  `unsupportedPolicyMatchLeaves` set (the KNOWN unsupported match dimensions) and
+  reject any such keyword found in the tail. A legitimate application value (e.g.
+  `[ junos-http junos-https ]`) is never one of those keywords, so it is not
+  over-rejected. Same strict-reject / lenient-warn split as #3113.
+- **File(s)**: pkg/config/compiler_policy_match.go,
+  pkg/config/compiler_policy_match_3142_test.go, pkg/config/README.md
+- **Validation**: `go build ./...`; `go test ./pkg/config/...` (all green);
+  fail-on-revert confirmed — reverting the tail scan makes the five escape
+  cases COMMIT (the genuine fail-open), turning the escape test RED; the
+  no-over-reject cases stay green. gofmt clean.
+
+## 2026-06-25 — #3025: NAT64 non-fragmented L4 checksum goes incremental (RFC 1624)
+
+- **Timestamp**: 2026-06-25
+- **Action**: NAT64's non-fragmented TCP/UDP translation now adjusts the L4
+  checksum INCREMENTALLY (RFC 1624) for the v4↔v6 pseudo-header address change
+  instead of re-summing the entire L4 payload (agy-review-061 finding 061-05,
+  performance). The transport payload is byte-identical across translation and
+  the length/protocol fields are unchanged, so only the pseudo-header addresses
+  differ — making the O(changed-words) fold byte-identical to the previous full
+  recompute (one's-complement addition is exact). Renamed the existing #2488
+  fragment helpers `adjust_l4_checksum_v{6_to_v4,4_to_v6}_fragment` →
+  `_incremental` (they now serve both fragment and non-fragment paths) and
+  routed the non-fragment TCP / non-zero-checksum UDP cases through them. ICMP,
+  v4→v6 UDP with a zero IPv4 checksum (RFC 768 "no checksum" → must GENERATE
+  one), and a defensive v6→v4 UDP zero-baseline keep the full recompute. The
+  #2488 fragment path is untouched.
+- **File(s)**: userspace-dp/src/nat64.rs (module doc + both translators + helper
+  renames), userspace-dp/src/nat64_tests.rs (8 `nat64_3025_*` tests: incremental
+  == full recompute for v6→v4 / v4→v6 TCP+UDP, v4 zero-checksum UDP generates a
+  fresh valid checksum, fail-on-revert seams that PRESERVE a corrupted input
+  checksum, and a wrong-delta pin). Validation: cargo build --release clean;
+  cargo test nat64 (99) + checksum (51) green; RED confirmed by forcing the
+  v6→v4 path back to recompute (seam test fails), restored.
+
+- **2026-06-25**: #2994 (codex-review-058 finding 058-09) — DHCP T1/T2 renewal now runs the RFC-correct unicast RENEW / broadcast REBIND instead of a full DORA / Rapid-Solicit re-acquisition. Before #2994 `runDHCPv4`/`runDHCPv6` called the full client exchange at every T1/T2, which broadcast a fresh server-selection each renewal, could move the lease to a different server, churned the address (interface-DDNS, FRR routes, ip-monitoring) and doubled WAN DHCP traffic. Fix: introduced a `dhcpExchangeMode` (acquire/renew/rebind) state machine in the run loops. v4 T1 sends a unicast RENEWING DHCPREQUEST (ciaddr = held address, no requested-IP / no server-id options per RFC 2131 Table 5) to the granting server (stored `Lease.serverID`, option 54), T2 broadcasts a REBINDING DHCPREQUEST; v6 T1 sends RENEW echoing the held IA_NA / IA_PD with the server's DUID (stored `Lease.v6ServerDUID`), T2 multicasts REBIND (no server DUID). Only lease expiry (both fail) falls back to full DISCOVER/SOLICIT. Stateless v6 stays Information-Request. Any malformed/unmatched renew is fail-safe — degrades to the prior full-acquisition path. Added run-loop seams (`doV4ExchangeForTest`/`doV6ExchangeForTest`/`afterForTest`/`waitLinkLocalForTest`) so the real `runDHCPv4`/`runDHCPv6` state machine is unit-testable without sockets or the 30 s T1 clamp. Follow-up: updated the stale pre-#2994 wire-behavior comment in `commit.go`. Tests: wire builders (`buildV4RenewRequest`/`v4RenewDest`/`buildV6RenewMessage`) + run-loop mode-sequence (acquire→renew→renew→rebind→acquire) + lease preservation; fail-on-revert (T1→acquire) confirmed RED→GREEN; -race clean. Files: pkg/dhcp/dhcp.go, pkg/dhcp/renew.go (new), pkg/dhcp/renew_test.go (new), pkg/dhcp/commit.go, pkg/dhcp/dhcp_test.go (gofmt sweep), pkg/dhcp/README.md
 ## 2026-06-25 — #3120: IPv6 screen ext-header walk continues past Fragment header
 
 - **Timestamp**: 2026-06-25

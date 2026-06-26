@@ -2648,3 +2648,287 @@ fn v6_to_v4_tcp_checksum_not_remapped() {
         "expected to find a TCP header that folds the checksum to zero"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #3025: non-fragmented NAT64 packets adjust the L4 checksum INCREMENTALLY
+// (RFC 1624) for the pseudo-header address change instead of recomputing the
+// full L4 checksum over the whole payload. The incremental result is BYTE-
+// IDENTICAL to a full recompute (one's-complement addition is exact), so the
+// translated packet must always validate AND match the value a full recompute
+// would write. The "uses incremental, not recompute" tests are the fail-on-
+// revert seam: a deliberately-corrupted INPUT checksum is preserved (adjusted)
+// by the incremental path but would be SILENTLY REPAIRED by a full recompute,
+// so reverting to recompute flips those assertions RED.
+// ---------------------------------------------------------------------------
+
+/// Build an IPv6 + UDP packet (no Ethernet) with a correct mandatory checksum.
+fn make_ipv6_udp_packet(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let udp_len = 8 + payload.len();
+    let mut pkt = vec![0u8; 40 + udp_len];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    pkt[6] = PROTO_UDP;
+    pkt[7] = 64;
+    pkt[8..24].copy_from_slice(&src.octets());
+    pkt[24..40].copy_from_slice(&dst.octets());
+    pkt[40..42].copy_from_slice(&src_port.to_be_bytes());
+    pkt[42..44].copy_from_slice(&dst_port.to_be_bytes());
+    pkt[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    pkt[48..48 + payload.len()].copy_from_slice(payload);
+    pkt[46..48].copy_from_slice(&[0, 0]);
+    let sum = checksum16_ipv6_pseudo(src, dst, PROTO_UDP, &pkt[40..]);
+    let final_sum = if sum == 0 { 0xFFFF } else { sum };
+    pkt[46..48].copy_from_slice(&final_sum.to_be_bytes());
+    pkt
+}
+
+/// Build an IPv4 + UDP packet (no Ethernet). When `with_checksum` is false the
+/// UDP checksum field is left 0x0000 = "no checksum present" (legal in IPv4).
+fn make_ipv4_udp_packet(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+    with_checksum: bool,
+) -> Vec<u8> {
+    let udp_len = 8 + payload.len();
+    let total_len = 20 + udp_len;
+    let mut pkt = vec![0u8; total_len];
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF, non-fragmented
+    pkt[8] = 64;
+    pkt[9] = PROTO_UDP;
+    pkt[12..16].copy_from_slice(&src.octets());
+    pkt[16..20].copy_from_slice(&dst.octets());
+    pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    pkt[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    pkt[28..28 + payload.len()].copy_from_slice(payload);
+    pkt[10..12].copy_from_slice(&[0, 0]);
+    let ip_sum = checksum16(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+    pkt[26..28].copy_from_slice(&[0, 0]);
+    if with_checksum {
+        let sum = checksum16_ipv4_pseudo(src, dst, PROTO_UDP, &pkt[20..]);
+        let final_sum = if sum == 0 { 0xFFFF } else { sum };
+        pkt[26..28].copy_from_slice(&final_sum.to_be_bytes());
+    }
+    pkt
+}
+
+#[test]
+fn nat64_3025_v6_to_v4_tcp_incremental_equals_recompute() {
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 50);
+
+    let v6 = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"incremental");
+    let v4 = translate_v6_to_v4(&v6, snat_v4, dst_v4, false).expect("translate");
+
+    // Translated TCP checksum must validate.
+    assert_eq!(
+        checksum16_ipv4_pseudo(snat_v4, dst_v4, PROTO_TCP, &v4[20..]),
+        0,
+        "incrementally adjusted v6->v4 TCP checksum must validate"
+    );
+    // ...and be bit-identical to an independent full recompute.
+    let on_wire = u16::from_be_bytes([v4[36], v4[37]]);
+    let mut ref_l4 = v4[20..].to_vec();
+    ref_l4[16..18].copy_from_slice(&[0, 0]);
+    let full = checksum16_ipv4_pseudo(snat_v4, dst_v4, PROTO_TCP, &ref_l4);
+    assert_eq!(on_wire, full, "incremental result must equal full recompute");
+}
+
+#[test]
+fn nat64_3025_v6_to_v4_udp_incremental_equals_recompute() {
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    let v6 = make_ipv6_udp_packet(src_v6, dst_v6, 12345, 53, b"\x00\x01\x02\x03\x04");
+    let v4 = translate_v6_to_v4(&v6, snat_v4, dst_v4, false).expect("translate");
+
+    assert_eq!(
+        checksum16_ipv4_pseudo(snat_v4, dst_v4, PROTO_UDP, &v4[20..]),
+        0,
+        "incrementally adjusted v6->v4 UDP checksum must validate"
+    );
+    let on_wire = u16::from_be_bytes([v4[26], v4[27]]);
+    let mut ref_l4 = v4[20..].to_vec();
+    ref_l4[6..8].copy_from_slice(&[0, 0]);
+    let raw = checksum16_ipv4_pseudo(snat_v4, dst_v4, PROTO_UDP, &ref_l4);
+    let full = if raw == 0 { 0xFFFF } else { raw };
+    assert_eq!(on_wire, full, "incremental result must equal full recompute");
+}
+
+#[test]
+fn nat64_3025_v4_to_v6_tcp_incremental_equals_recompute() {
+    let src_v4 = Ipv4Addr::new(198, 51, 100, 50);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let src_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+    let v4 = make_ipv4_tcp_packet(src_v4, dst_v4, 80, 12345, b"incremental");
+    let v6 = translate_v4_to_v6(&v4, src_v6, dst_v6).expect("translate");
+
+    assert_eq!(
+        checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_TCP, &v6[40..]),
+        0,
+        "incrementally adjusted v4->v6 TCP checksum must validate"
+    );
+    let on_wire = u16::from_be_bytes([v6[56], v6[57]]);
+    let mut ref_l4 = v6[40..].to_vec();
+    ref_l4[16..18].copy_from_slice(&[0, 0]);
+    let full = checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_TCP, &ref_l4);
+    assert_eq!(on_wire, full, "incremental result must equal full recompute");
+}
+
+#[test]
+fn nat64_3025_v4_to_v6_udp_incremental_equals_recompute() {
+    let src_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let src_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+    let v4 = make_ipv4_udp_packet(src_v4, dst_v4, 53, 12345, b"\x10\x20\x30\x40\x50", true);
+    let v6 = translate_v4_to_v6(&v4, src_v6, dst_v6).expect("translate");
+
+    // UDP checksum field at v6[40+6..40+8] = v6[46..48].
+    assert_eq!(
+        checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_UDP, &v6[40..]),
+        0,
+        "incrementally adjusted v4->v6 UDP checksum must validate"
+    );
+    let on_wire = u16::from_be_bytes([v6[46], v6[47]]);
+    let mut ref_l4 = v6[40..].to_vec();
+    ref_l4[6..8].copy_from_slice(&[0, 0]);
+    let raw = checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_UDP, &ref_l4);
+    let full = if raw == 0 { 0xFFFF } else { raw };
+    assert_eq!(on_wire, full, "incremental result must equal full recompute");
+}
+
+#[test]
+fn nat64_3025_v4_to_v6_udp_zero_checksum_generates_fresh() {
+    // An IPv4 UDP datagram with checksum 0 = "no checksum present". IPv6 UDP
+    // mandates a checksum, so the non-fragment path must take the full recompute
+    // to GENERATE one (no baseline to adjust). The output must be a valid,
+    // non-zero IPv6 UDP checksum.
+    let src_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let src_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+    let v4 = make_ipv4_udp_packet(src_v4, dst_v4, 53, 12345, b"query-bytes", false);
+    assert_eq!(&v4[26..28], &[0, 0], "input v4 UDP checksum must be zero");
+
+    let v6 = translate_v4_to_v6(&v4, src_v6, dst_v6).expect("translate");
+    let on_wire = u16::from_be_bytes([v6[46], v6[47]]);
+    assert_ne!(on_wire, 0, "IPv6 UDP checksum is mandatory; must be generated");
+    assert_eq!(
+        checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_UDP, &v6[40..]),
+        0,
+        "generated IPv6 UDP checksum must validate"
+    );
+}
+
+#[test]
+fn nat64_3025_v6_to_v4_uses_incremental_not_recompute() {
+    // FAIL-ON-REVERT seam. Corrupt the INPUT v6 TCP checksum. The incremental
+    // path adjusts that (wrong) baseline by the address delta, so the output is
+    // ALSO wrong and does NOT validate. A full recompute would IGNORE the input
+    // and produce a correct, validating checksum — so reverting flips this RED.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 50);
+
+    let mut v6 = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"corrupt");
+    // TCP checksum field is at v6[56..58]; flip a bit to corrupt the baseline.
+    let bad = u16::from_be_bytes([v6[56], v6[57]]) ^ 0x0001;
+    v6[56..58].copy_from_slice(&bad.to_be_bytes());
+
+    let v4 = translate_v6_to_v4(&v6, snat_v4, dst_v4, false).expect("translate");
+    assert_ne!(
+        checksum16_ipv4_pseudo(snat_v4, dst_v4, PROTO_TCP, &v4[20..]),
+        0,
+        "incremental path must PRESERVE the corrupted baseline (would validate if \
+         reverted to a full recompute)"
+    );
+}
+
+#[test]
+fn nat64_3025_v4_to_v6_uses_incremental_not_recompute() {
+    // FAIL-ON-REVERT seam for the reverse direction.
+    let src_v4 = Ipv4Addr::new(198, 51, 100, 50);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let src_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+    let mut v4 = make_ipv4_tcp_packet(src_v4, dst_v4, 80, 12345, b"corrupt");
+    // TCP checksum field is at v4[36..38]; flip a bit to corrupt the baseline.
+    let bad = u16::from_be_bytes([v4[36], v4[37]]) ^ 0x0001;
+    v4[36..38].copy_from_slice(&bad.to_be_bytes());
+
+    let v6 = translate_v4_to_v6(&v4, src_v6, dst_v6).expect("translate");
+    assert_ne!(
+        checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_TCP, &v6[40..]),
+        0,
+        "incremental path must PRESERVE the corrupted baseline (would validate if \
+         reverted to a full recompute)"
+    );
+}
+
+#[test]
+fn nat64_3025_incremental_helper_wrong_delta_breaks() {
+    // Pin the delta math: applying the CORRECT pseudo-header address delta makes
+    // the translated checksum validate; a WRONG delta does not. RED if the
+    // incremental address-fold math is wrong.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let v6 = make_ipv6_tcp_packet(src_v6, dst_v6, 1111, 2222, b"abcde");
+
+    let snat_v4 = Ipv4Addr::new(192, 0, 2, 1);
+    let dst_v4 = Ipv4Addr::new(203, 0, 113, 9);
+
+    // Build a v4-shaped buffer: 20-byte v4 header + the verbatim v6 L4 (still
+    // carrying the original IPv6-pseudo-header checksum), exactly as the
+    // translator does before adjusting the L4 checksum.
+    let v6_l4 = &v6[40..];
+    let mut out = vec![0u8; 20 + v6_l4.len()];
+    out[0] = 0x45;
+    out[9] = PROTO_TCP;
+    out[12..16].copy_from_slice(&snat_v4.octets());
+    out[16..20].copy_from_slice(&dst_v4.octets());
+    out[20..].copy_from_slice(v6_l4);
+    let mut v6_addrs = [0u8; 32];
+    v6_addrs.copy_from_slice(&v6[8..40]);
+
+    let mut good = out.clone();
+    adjust_l4_checksum_v6_to_v4_incremental(&mut good, PROTO_TCP, &v6_addrs, snat_v4, dst_v4)
+        .expect("adjust");
+    assert_eq!(
+        checksum16_ipv4_pseudo(snat_v4, dst_v4, PROTO_TCP, &good[20..]),
+        0,
+        "correct delta must validate against the real v4 addresses"
+    );
+
+    let mut bad = out.clone();
+    let wrong_dst = Ipv4Addr::new(203, 0, 113, 10);
+    adjust_l4_checksum_v6_to_v4_incremental(&mut bad, PROTO_TCP, &v6_addrs, snat_v4, wrong_dst)
+        .expect("adjust");
+    assert_ne!(
+        checksum16_ipv4_pseudo(snat_v4, dst_v4, PROTO_TCP, &bad[20..]),
+        0,
+        "a wrong address delta must NOT validate against the real v4 addresses"
+    );
+}

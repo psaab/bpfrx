@@ -2215,8 +2215,9 @@ func validateZoneInterfaceMembershipStrict(cfg *Config) error {
 // (`set applications application <name> ...`) whose destination-port /
 // source-port is malformed (not a valid numeric port, port range, or known
 // service name, out of 1..65535, or an inverted low>high range) or whose
-// protocol token is not a known name, a junos-*
-// alias, or a 0..255 number (#2142) — but ONLY for applications that are
+// protocol token is not a known name, a RESOLVABLE junos-* alias (one the
+// dataplane's appid.ProtocolNumber actually knows — #3150), or a 0..255 number
+// (#2142) — but ONLY for applications that are
 // actually REFERENCED by a security policy or a source/destination-NAT rule's
 // `match application` (#2187), or for ALL applications when
 // `services application-identification` is enabled (every app then compiles
@@ -2238,12 +2239,16 @@ func validateZoneInterfaceMembershipStrict(cfg *Config) error {
 // such an app is referenced by a policy, or app-id is turned on, the gate
 // engages.
 //
-// It reuses validatePortSpec and validateProtocol — the same config-layer
-// validators that produce the warning in ValidateConfig — so no new divergent
-// port/protocol table is introduced (the dataplane's #2124 capability gate is
-// the runtime backstop, and these validators are a superset of what it admits).
-// Iteration is sorted by application name so the first-reported error is
-// deterministic across runs (Go map order is randomized).
+// It reuses validatePortSpec for ports. For the protocol it uses
+// filterProtocolResolvable (the #2124/#2175 appid.ProtocolNumber mirror) rather
+// than the lenient validateProtocol: validateProtocol blanket-accepts any
+// "junos-" prefix, so a referenced app with `protocol junos-foobar` would commit
+// cleanly while the dataplane's appid.ProtocolNumber rejects it, disarming the
+// userspace policy capability gate (a commit/apply split — #3150). Using the
+// same authority the dataplane uses keeps commit and apply in agreement (the
+// dataplane's #2124 capability gate stays the runtime backstop). Iteration is
+// sorted by application name so the first-reported error is deterministic across
+// runs (Go map order is randomized).
 func validateApplicationSpecsStrict(cfg *Config) error {
 	if cfg == nil || len(cfg.Applications.Applications) == 0 {
 		return nil
@@ -2268,10 +2273,25 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 		if err := validatePortSpec(app.SourcePort); err != nil {
 			return fmt.Errorf("application %q: source-port: %w", name, err)
 		}
-		if app.Protocol != "" {
-			if err := validateProtocol(app.Protocol); err != nil {
-				return fmt.Errorf("application %q: %w", name, err)
-			}
+		// #3150: resolve the protocol against the SAME authority the dataplane
+		// uses (appid.ProtocolNumber, mirrored by filterProtocolResolvable) — NOT
+		// the lenient validateProtocol, which blanket-accepts any "junos-" prefix.
+		// validateProtocol would commit `protocol junos-foobar` cleanly while
+		// appid.ProtocolNumber rejects it, so the userspace policy capability gate
+		// (pkg/dataplane/userspace) then disarms — a commit-succeeds / apply-fails
+		// split. filterProtocolResolvable accepts only the concrete junos-* aliases
+		// the catalog knows (e.g. junos-ping, junos-tcp-any), real protocol names,
+		// and 0..255 numbers, so a referenced app whose protocol the dataplane
+		// cannot represent is rejected at commit instead.
+		if app.Protocol != "" && !filterProtocolResolvable(app.Protocol) {
+			return fmt.Errorf(
+				"application %q: unknown protocol %q (use a protocol name such as "+
+					"tcp/udp/icmp/icmpv6/gre/esp/ah/sctp/ospf, a resolvable junos-* "+
+					"alias such as junos-ping/junos-tcp-any, or a numeric value "+
+					"0-255 — the dataplane resolves protocols via appid.ProtocolNumber "+
+					"and cannot represent an arbitrary junos-* token, so accepting it "+
+					"would commit cleanly but fail to arm the referencing policy)",
+				name, app.Protocol)
 		}
 	}
 	return nil
@@ -2536,12 +2556,15 @@ func validateFilterActionsStrict(cfg *Config) error {
 // test TestFilterProtocolResolvableMatchesProtocolNumber via the exported
 // FilterProtocolResolvable accessor.
 //
-// The acceptance set is intentionally TIGHTER than validateProtocol (used by
-// validateApplicationSpecsStrict): validateProtocol blanket-accepts ANY
-// "junos-" prefix, but appid.ProtocolNumber only resolves the specific
-// junos-* aliases below, so an unknown "junos-foobar" must be rejected here to
-// stay consistent with the dataplane SSOT — otherwise commit would pass while
-// the swallowed dataplane gate dropped the constraint.
+// The acceptance set is intentionally TIGHTER than validateProtocol (the
+// lenient validator used by ValidateConfig's warning surface): validateProtocol
+// blanket-accepts ANY "junos-" prefix, but appid.ProtocolNumber only resolves
+// the specific junos-* aliases below, so an unknown "junos-foobar" must be
+// rejected here to stay consistent with the dataplane SSOT — otherwise commit
+// would pass while the swallowed dataplane gate dropped the constraint. Since
+// #3150, validateApplicationSpecsStrict also resolves an application's own
+// `protocol` leaf through THIS helper (not validateProtocol) for the same
+// reason — the broad junos-* accept there caused a commit/apply split.
 func filterProtocolResolvable(token string) bool {
 	switch strings.ToLower(strings.TrimSpace(token)) {
 	case "tcp", "junos-tcp-any",

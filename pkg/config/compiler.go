@@ -809,6 +809,24 @@ type compileOpts struct {
 	// pre-existing behaviour), now flagged. Reject-profile support is a
 	// deferred follow-up. Same doctrine as lenientPolicyThenPermit.
 	lenientPolicyThenReject bool
+	// lenientPolicyThenDeny (#3141) downgrades the security-policy
+	// unsupported-then-deny-modifier gate (validatePolicyThenDenyStrict)
+	// from a hard compile error to a cfg.Warnings entry. A flat-set
+	// `then deny log session-init` collapses `log session-init` onto the
+	// deny node (Keys=["deny","log","session-init"]) instead of nesting a
+	// sibling `then log` node; compilePolicy's `then` switch `deny` arm used
+	// to read only t.Name() and silently dropped the collapsed modifier, so
+	// deny-with-logging committed but `pol.Log` was never set (a deny-rule
+	// observability / compliance failure). #3141 WIRES the legitimate
+	// log/count modifiers (applyCollapsedDenyModifiers) so deny+log works in
+	// both the flat-collapsed and the separate-node forms; this gate is the
+	// safety net for any REMAINING collapsed deny modifier the compiler
+	// cannot enforce — the strict commit / commit-check path hard-rejects so
+	// it is operator-visible, the tolerant load / peer-sync paths downgrade
+	// to a warning so an already-persisted or peer-synced config an older
+	// binary silently accepted still BOOTS (#1960). Same doctrine as
+	// lenientPolicyThenReject.
+	lenientPolicyThenDeny bool
 	// lenientPolicyMissingMatch (#3044) downgrades the security-policy
 	// required-match gate (validatePolicyRequiredMatchStrict) from a hard
 	// compile error to a cfg.Warnings entry. A security policy whose `match`
@@ -939,6 +957,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyMatchLeaves:           true,
 		lenientPolicyThenPermit:            true,
 		lenientPolicyThenReject:            true,
+		lenientPolicyThenDeny:              true,
 		lenientPolicyMissingMatch:          true,
 		lenientPolicyCommunityRef:          true,
 		lenientVRRPVirtualAddress:          true,
@@ -1063,6 +1082,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyMatchLeaves:           true,
 		lenientPolicyThenPermit:            true,
 		lenientPolicyThenReject:            true,
+		lenientPolicyThenDeny:              true,
 		lenientPolicyMissingMatch:          true,
 		lenientPolicyCommunityRef:          true,
 		lenientVRRPVirtualAddress:          true,
@@ -1254,6 +1274,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3141: a flat-set `then deny log session-init` collapses the
+	// log/count modifier onto the deny node (Keys=["deny","log",
+	// "session-init"]) instead of nesting a sibling `then log` node.
+	// compilePolicy's `then` switch `deny` arm used to read only t.Name()
+	// and silently dropped the collapsed modifier, so deny-with-logging
+	// committed but never logged. #3141 WIRES the legitimate log/count
+	// modifiers (applyCollapsedDenyModifiers); this gate rejects any
+	// REMAINING collapsed deny modifier the compiler cannot enforce.
+	// Sibling of the #3114 then-permit / #3115 then-reject gates above;
+	// same group-expanded / inactive-pruned tree, same strict-with-lenient
+	// (#1960) doctrine.
+	policyThenDenyWarnings, err := validatePolicyThenDenyStrict(
+		tree.Children, opts.lenientPolicyThenDeny)
+	if err != nil {
+		return nil, err
+	}
+
 	// #3044: reject a security policy whose `match` clause omits a required
 	// Junos dimension (source-address, destination-address, application) or
 	// omits the `match` block entirely. compilePolicy fills each match slice
@@ -1314,6 +1351,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyThenPermitWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyThenRejectWarnings...)
+	cfg.Warnings = append(cfg.Warnings, policyThenDenyWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMissingMatchWarnings...)
 
 	for _, node := range tree.Children {
