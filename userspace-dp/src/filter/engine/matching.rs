@@ -269,19 +269,30 @@ fn nets_match_v6(constrained: bool, except: bool, nets: &[PrefixV6], ip: Ipv6Add
 ///   is `PortMatcher::Any` and matches any port — unchanged unscoped behavior.
 ///   `except` is irrelevant: there is no port scope to invert.
 /// - `constrained == true` but the matcher is `PortMatcher::Any` (every
-///   configured port spec failed to parse, leaving zero ranges):
-///     * positive (`except == false`): match NOTHING — fail closed (#2400).
-///     * `except == true`: "match all ports EXCEPT {}" = match ALL — the Junos
-///       empty-except-set semantic (mirrors `nets_match_v4`).
+///   configured port spec was a non-empty token that FAILED to parse, leaving
+///   zero ranges): FAIL CLOSED in BOTH directions — `#3205` (agy-070 #08).
+///   Unlike the address path, a port scope has no prefix-list indirection: a
+///   real listed port (numeric or a resolved service name) always yields a
+///   range, so `constrained && Any` can ONLY mean every token was unparseable
+///   (e.g. an unresolved symbolic port name). A positive match returns NOTHING
+///   (#2400); an `except` match must NOT invert empty into match-ALL — that was
+///   the fail-OPEN hole where `destination-port-except domain` accepted every
+///   port including the one meant to be excluded. The Go commit gate
+///   (validateFilterMatchValuesStrict) now rejects such a term, so this is
+///   defense-in-depth on the tolerant load / peer-sync path. (The Junos
+///   "empty-except = match all" semantic still applies to the ADDRESS path —
+///   `nets_match_v4`/`nets_match_v6` — where an empty prefix-list scope is
+///   reachable and legitimate.)
 /// - otherwise: `matcher.matches(port) XOR except`. `except == false` is the
 ///   plain positive membership; `except == true` matches every port NOT in the
 ///   set.
 #[inline(always)]
 fn port_match(constrained: bool, except: bool, matcher: &PortMatcher, port: u16) -> bool {
     if constrained && matches!(matcher, PortMatcher::Any) {
-        // Constrained but no range survived parsing. Positive -> match nothing
-        // (fail closed). Except -> "all ports but none" = match all.
-        return except;
+        // Constrained but no range survived parsing (every token unparseable).
+        // Fail CLOSED both ways: positive -> match nothing; except -> do NOT
+        // invert empty into match-all (the #3205 fail-open).
+        return false;
     }
     matcher.matches(port) ^ except
 }

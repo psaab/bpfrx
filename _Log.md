@@ -28,6 +28,37 @@
   RED while TestStaticNATParseableValuesStillCompile stays GREEN; restored
   byte-identical.
 
+## 2026-06-26 — #3205 firewall-filter symbolic match values: resolve + fail closed
+
+- **Timestamp**: 2026-06-26
+- **Action**: Resolve symbolic firewall-filter match values (icmp-type/code
+  names, named/service ports) to numbers at commit and FAIL CLOSED on an
+  unresolved value (agy-070 #07/#08). Before this, `from icmp-type echo-request`
+  was parsed with `strconv.Atoi`, the error ignored, the name dropped → empty
+  type set → matches ALL ICMP (policy bypass); a named port the dataplane
+  could not parse (e.g. `domain`) left the port set constrained-but-empty →
+  `destination-port-except domain` matched ALL ports (fail open). New SSOT
+  `pkg/config/filter_match_resolve.go` (Junos service-name + family-selected
+  icmp-type-name tables) resolves names in `compileFilterFrom` (now takes the
+  filter family); unresolved tokens are recorded on the term
+  (`UnknownICMPTypes`/`UnknownICMPCodes`/`UnknownPorts`) and
+  `validateFilterMatchValuesStrict` (wired in `compiler.go`, lenient on
+  load/peer-sync per #1960) hard-rejects them at commit. Rust `port_match`
+  (`engine/matching.rs`) now fails CLOSED for the constrained+empty `except`
+  case (was inverting empty → match-all). Resolved ports are rewritten to
+  numerics so the dataplane sees only numbers; the Rust guard is
+  defense-in-depth for the kept-verbatim tolerant path.
+- **File(s)**: pkg/config/filter_match_resolve.go (new),
+  pkg/config/compiler_firewall.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/types_system.go,
+  pkg/config/firewall_symbolic_match_3205_test.go (new),
+  userspace-dp/src/filter/engine/matching.rs, userspace-dp/src/filter/tests.rs,
+  userspace-dp/src/filter/README.md, docs/config-schema.md
+- **Validation**: `go build ./...`; `go test ./pkg/config/ ./pkg/dataplane/...`
+  (2568+7 pass); `cargo build --release`; `cargo test --release filter` (195
+  pass). Fail-on-revert: restoring the Atoi-silent-drop turned 6 Go tests RED;
+  restoring `port_match`'s `return except` turned
+  `destination_port_except_unresolved_fails_closed_3205` RED.
 ## 2026-06-26 — #3199 host-inbound `protocols all` scoped to routing protocols (control-plane exposure)
 
 - **Timestamp**: 2026-06-26

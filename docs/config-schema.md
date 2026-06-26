@@ -137,6 +137,45 @@ hole). Validation is now fail-closed: an unenforceable constraint is refused at
 commit, and a representable one (including `syn & !ack`) is carried to the
 dataplane via the `tcp_flags` / `tcp_flags_forbidden` wire fields.
 
+### `firewall ... from icmp-type` / named ports — resolve + fail closed (#3205)
+
+`from icmp-type` / `icmp-code` and the four port leaves (`source-port`,
+`destination-port`, `source-port-except`, `destination-port-except`) accept
+SYMBOLIC Junos match values: icmp-type names (`echo-request`, `echo-reply`,
+`destination-unreachable`, ...) and service/port names (`ssh`, `http`,
+`domain`, ...). `pkg/config/filter_match_resolve.go` is the SSOT that resolves
+these to numbers at compile time — the icmp-type table is **family-selected**
+(ICMPv4 for `family inet`, ICMPv6 for `family inet6`: `echo-request` = 8 vs
+128), and the port table is the canonical Junos service-name set (e.g.
+`domain` = 53). Resolved ports are rewritten to numeric form so the dataplane
+only ever sees numerics.
+
+This is the #3205 fix (agy-070 #07/#08). Before it:
+
+- `icmp-type`/`icmp-code` were parsed with `strconv.Atoi` and the error was
+  IGNORED, so a symbolic name was silently dropped — the type/code set went
+  empty, and an empty set matches **ALL** ICMP, so an `accept` term meant to
+  permit only `echo-request` silently permitted every ICMP type (a policy
+  bypass);
+- an unknown named port left the port set constrained-but-empty, and a
+  `*-port-except` term then matched **ALL** ports (fail open — it permitted the
+  very port it was meant to exclude).
+
+`validateFilterMatchValuesStrict` (`compiler_validate_strict.go`) **rejects at
+commit** any term whose icmp-type/icmp-code name or port name could not be
+resolved (the unresolved token is recorded on the term as
+`UnknownICMPTypes`/`UnknownICMPCodes`/`UnknownPorts`, mirroring
+`UnknownActions`). On the tolerant load / peer-sync path the error is
+downgraded to a warning (#1960 no-brick) and the token is kept verbatim so the
+dataplane fails CLOSED independently (the Rust `port_match` constrained+empty
+guard now fails closed for `except` too — see `userspace-dp/src/filter/
+README.md`). Symbolic icmp-CODE names are not resolved (Junos code names are
+type-dependent) — a numeric 0-255 is required and a symbolic code is rejected.
+Fail-on-revert: `TestFilterICMPTypeNameResolves{V4,V6}_3205`,
+`TestFilterUnknown{ICMPType,Port}Rejected_3205`,
+`TestFilterNamedPortExceptResolves_3205` in
+`pkg/config/firewall_symbolic_match_3205_test.go`.
+
 The `system domain-search` and `system name-server` readers
 (`compileSystem`, `compiler_system.go`) are also contract-compliant via
 `firewallMatchValues`. Both are `multi:true`; before the second #2419 fold

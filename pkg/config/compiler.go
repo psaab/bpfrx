@@ -332,6 +332,18 @@ type compileOpts struct {
 	// peer-synced config carrying an unknown action still BOOTS (#1960
 	// no-brick). Same doctrine as lenientFilterProtocols.
 	lenientFilterActions bool
+	// lenientFilterMatchValues (#3205, agy-070 #07/#08) downgrades the
+	// firewall-filter symbolic-match-value gate (validateFilterMatchValuesStrict)
+	// from a hard compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects a term whose icmp-type/icmp-code name or
+	// named port could not be resolved to a number. Before this gate such a value
+	// was silently dropped: an unresolved icmp-type matched ALL ICMP (policy
+	// bypass) and an unresolved named port made a `*-port-except` term match ALL
+	// ports (fail open). The tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config still BOOTS (#1960
+	// no-brick); the unresolved token is kept verbatim so the dataplane fails
+	// CLOSED independently. Same doctrine as lenientFilterActions.
+	lenientFilterMatchValues bool
 	// lenientNPTv6 (#2240) downgrades the NPTv6 (RFC 6296) validation gate
 	// (validateNPTv6Strict) from a hard compile error to a cfg.Warnings entry.
 	// The strict commit / commit-check path hard-rejects an NPTv6 static-NAT
@@ -960,6 +972,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientApplicationSpecs:             true,
 		lenientFilterProtocols:              true,
 		lenientFilterActions:                true,
+		lenientFilterMatchValues:            true,
 		lenientNPTv6:                        true,
 		lenientFirewallRefs:                 true,
 		lenientFlowServerTemplateRef:        true,
@@ -1087,6 +1100,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientApplicationSpecs:             true,
 		lenientFilterProtocols:              true,
 		lenientFilterActions:                true,
+		lenientFilterMatchValues:            true,
 		lenientNPTv6:                        true,
 		lenientFirewallRefs:                 true,
 		lenientFlowServerTemplateRef:        true,
@@ -1899,6 +1913,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFilterActions {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("firewall filter action (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3205 (agy-070 #07/#08) firewall-filter symbolic-match-value gate. Strict
+	// on commit / commit-check (hard-reject a term whose icmp-type/icmp-code
+	// name or named port could not be resolved to a number by compileFilterFrom).
+	// Before this gate such a value was silently dropped: an unresolved icmp-type
+	// left the type set empty and matched ALL ICMP (a policy bypass for an
+	// `accept` term), and an unresolved named port made a `*-port-except` term
+	// match ALL ports (fail open — it permitted the excluded port). Lenient on
+	// load / peer-sync (warn so an already-persisted or peer-synced config still
+	// boots — #1960 no-brick; the dataplane fails CLOSED on the kept-verbatim
+	// token independently). Runs on the fully-compiled *Config so the typed term
+	// list (with UnknownICMPTypes/UnknownICMPCodes/UnknownPorts populated by
+	// compileFilterFrom) is available.
+	if err := validateFilterMatchValuesStrict(cfg); err != nil {
+		if opts.lenientFilterMatchValues {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter match value (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
