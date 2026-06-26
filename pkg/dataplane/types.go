@@ -402,6 +402,32 @@ const MaxZones = 64
 // MaxRulesPerPolicy is the maximum number of rules in a single policy set.
 const MaxRulesPerPolicy = 256
 
+// DefaultPolicySentinelID is the reserved policy ID the userspace dataplane
+// stamps on an RT_FLOW deny/reject event produced by the IMPLICIT
+// default-policy (a flow matched no configured zone-pair or junos-global
+// policy). #3057.
+//
+// A real configured policy ID is policySetID*MaxRulesPerPolicy + ruleIndex
+// (see pkg/dataplane/userspace/policies.go and compiler.go), where ruleIndex is
+// capped strictly below MaxRulesPerPolicy (256) and policySetID counts the
+// configured zone-pair policy blocks (plus one for the global set) — far below
+// 16,777,216 in any real config. Reaching 0xFFFFFFFF as a real ID would require
+// ~16.7M policy sets, which is impossible, so this sentinel can never collide
+// with a configured policy ID (in particular not the first policy's ID 0, the
+// value the default used to emit and which mis-attributed the deny to the first
+// rule). It is rendered as DefaultPolicyName in logs and session displays.
+//
+// MUST equal DEFAULT_POLICY_SENTINEL_ID in userspace-dp/src/policy.rs — the
+// value travels in the existing policy_id u32 wire field (no layout change) and
+// is pinned by a cross-language contract test.
+const DefaultPolicySentinelID uint32 = 0xFFFFFFFF
+
+// DefaultPolicyName is the human-readable pseudo-policy name rendered for the
+// implicit default-policy sentinel (DefaultPolicySentinelID) in RT_FLOW logs,
+// `show security flow session` displays, and gRPC session entries. It matches
+// the Junos `security policies default-policy` config stanza. #3057.
+const DefaultPolicyName = "default-policy"
+
 // MaxSNATRulesPerPair must match MAX_SNAT_RULES_PER_PAIR in xpf_maps.h.
 const MaxSNATRulesPerPair = 8
 

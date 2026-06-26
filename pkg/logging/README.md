@@ -189,6 +189,30 @@ if `Handle` runs the re-entrancy guard before the client check.
   omission is scoped to the open event type only — POLICY_DENY,
   SCREEN_DROP, and FILTER_LOG (the genuine deny/reject paths) still render
   `action`. Golden coverage: `session_create_format_test.go`.
+- **Implicit default-policy renders as `policy-name="default-policy"`
+  (#3057).** A flow that matches no configured zone-pair or `junos-global`
+  policy is decided by the implicit `security policies default-policy`
+  (deny-all / permit-all). The userspace-dp producer stamps a RESERVED
+  sentinel policy ID on that deny/reject event —
+  `DEFAULT_POLICY_SENTINEL_ID = u32::MAX` (`0xFFFFFFFF`,
+  `userspace-dp/src/policy.rs`), mirrored on the Go side as
+  `dataplane.DefaultPolicySentinelID`. A real configured policy ID is
+  `policySetID*MaxRulesPerPolicy + ruleIndex`, so `0xFFFFFFFF` can never be a
+  real ID (it would need ~16.7M policy sets); the two stay byte-identical on
+  the shared `policy_id` u32 wire field (no layout change) and are pinned by
+  `TestDefaultPolicySentinelLockstepWithRust`. Before #3057 the default
+  emitted `0`, which ALIASED the FIRST configured policy (also ID 0): a
+  default deny then logged with the first rule's name — actively misleading
+  when that rule is a permit. `resolvePolicyName` now resolves the sentinel
+  to `dataplane.DefaultPolicyName` (`"default-policy"`) authoritatively (even
+  before any policyNames map is published); `compilePolicies` also seeds the
+  sentinel into the `PolicyNames` map so `show security flow session` and the
+  gRPC session entries render it consistently. The sentinel is display-only —
+  the implicit default touches NO per-rule hit counter (those are name-keyed
+  per #3143/#3154 and only the matched-rule path in `try_match_rule`
+  increments one). Coverage: `default_policy_sentinel_3057_test.go`
+  (Go) + `default_policy_no_match_emits_sentinel_policy_id` /
+  `policy_deny_event_emit_carries_default_policy_sentinel` (Rust).
 - `pkg/dataplane/userspace/eventstream_test.go` owns the deterministic
   local syslog harness for userspace RT_FLOW policy-deny, screen-drop, and
   filter-log frames. It sends raw event-stream frames through

@@ -1245,6 +1245,75 @@ fn evaluate_policy_unknown_zone_pair_returns_default_action() {
     );
 }
 
+/// #3057: a flow that matches NO configured policy rides the implicit
+/// default-policy, whose evaluation result MUST carry the reserved
+/// DEFAULT_POLICY_SENTINEL_ID — NOT 0, which aliased the first configured
+/// policy (also ID 0) and caused the Go log/display planes to mis-attribute the
+/// default deny to the first rule. The first configured rule here is a PERMIT
+/// with policy_id 0; the no-match default deny must NOT borrow that identity.
+#[test]
+fn default_policy_no_match_emits_sentinel_policy_id() {
+    let zones = test_zone_name_to_id();
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            // The first configured policy explicitly takes runtime ID 0 — the
+            // value the old default-policy path collided with.
+            policy_id: 0,
+            name: "allow-web".into(),
+            from_zone: "lan".into(),
+            to_zone: "wan".into(),
+            source_addresses: vec!["10.0.61.0/24".into()],
+            destination_addresses: vec!["any".into()],
+            applications: vec!["any".into()],
+            application_terms: Vec::new(),
+            action: "permit".into(),
+            ..Default::default()
+        }],
+        &zones,
+    );
+
+    // A LAN→WAN flow whose source is OUTSIDE allow-web's 10.0.61.0/24 matches
+    // no rule and rides the implicit default deny.
+    let default_hit = evaluate_policy_result_with_len(
+        &state,
+        TEST_LAN_ZONE_ID,
+        TEST_WAN_ZONE_ID,
+        "203.0.113.7".parse().expect("src"),
+        "8.8.8.8".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        80,
+        64,
+    );
+    assert_eq!(default_hit.action, PolicyAction::Deny);
+    assert_eq!(
+        default_hit.policy_id,
+        DEFAULT_POLICY_SENTINEL_ID,
+        "the implicit default-policy must emit the reserved sentinel ID, not 0"
+    );
+    assert_ne!(
+        default_hit.policy_id, 0,
+        "policy_id 0 aliases the first configured policy (the #3057 bug)"
+    );
+
+    // Sanity: a flow that DOES match the first rule still carries its real
+    // ID 0 — the sentinel only moves the implicit default, never a real policy.
+    let matched = evaluate_policy_result_with_len(
+        &state,
+        TEST_LAN_ZONE_ID,
+        TEST_WAN_ZONE_ID,
+        "10.0.61.100".parse().expect("src"),
+        "8.8.8.8".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        80,
+        64,
+    );
+    assert_eq!(matched.action, PolicyAction::Permit);
+    assert_eq!(matched.policy_id, 0, "the real first policy keeps ID 0");
+}
+
 /// #923: legacy permissive parse — addresses that fail to parse
 /// are silently dropped by `parse_address`. If ALL configured
 /// addresses are malformed the resulting Vec is empty, which
