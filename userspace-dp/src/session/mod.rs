@@ -934,11 +934,23 @@ impl SessionTable {
             record.entry.origin = origin;
             record.entry.install_epoch = epoch;
             record.entry.last_seen_ns = now_ns;
-            record.entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &self.timeouts);
-            record.entry.closing = matches!(protocol, PROTO_TCP) && is_closing(tcp_flags);
             // #3046: RST is sticky — once observed it keeps the entry on the
             // short RST timeout even if a later (reordered) segment lacks RST.
+            // Set it BEFORE selecting the timeout so the expires decision below
+            // consults the sticky flag (mirrors lookup.rs). Otherwise a
+            // peer-synced entry that already had reset=true, promoted via a
+            // non-RST FIN trigger, would wrongly revert to the 30s FIN window.
             record.entry.reset |= matches!(protocol, PROTO_TCP) && has_rst(tcp_flags);
+            record.entry.closing = matches!(protocol, PROTO_TCP) && is_closing(tcp_flags);
+            record.entry.expires_after_ns = if record.entry.closing {
+                if record.entry.reset {
+                    TCP_RST_TIMEOUT_NS
+                } else {
+                    TCP_CLOSING_TIMEOUT_NS
+                }
+            } else {
+                session_timeout_ns(protocol, tcp_flags, &self.timeouts)
+            };
             // wheel_tick deliberately preserved (parity with restore_entry).
             // #2120: a real-traffic refresh (or a peer→local promote) means
             // this entry now genuinely lives on this node — it leaves the

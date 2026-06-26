@@ -877,6 +877,34 @@ fn tcp_rst_uses_short_timeout_not_fin_timeout() {
         post_ack.expires_after_ns, TCP_RST_TIMEOUT_NS,
         "a stray non-RST segment after a RST must not revert to the 30s FIN timeout"
     );
+
+    // --- update_session sticky-reset (#3046 MINOR FAIL-ON-REVERT): a session
+    //     that already carries reset=true, refreshed via update_session with a
+    //     non-RST FIN trigger (the promote_synced_with_origin production reach),
+    //     must KEEP the short 2s RST timeout. RED if update_session selects the
+    //     timeout from only the current segment's flags
+    //     (session_timeout_ns(FIN) == 30s) instead of consulting the sticky
+    //     entry.reset — exactly mirroring the lookup.rs path.
+    let fin_req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: now + 3_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FIN,
+    };
+    assert!(table.update_session(fin_req, false));
+    let after_update = table.entry_by_key(&key).expect("entry after update_session");
+    assert!(
+        after_update.reset,
+        "reset must stay sticky across an update_session refresh"
+    );
+    assert!(after_update.closing, "FIN keeps the session closing");
+    assert_eq!(
+        after_update.expires_after_ns, TCP_RST_TIMEOUT_NS,
+        "update_session must consult the sticky reset flag: a non-RST FIN refresh of a RST'd session keeps the 2s timeout, not 30s"
+    );
 }
 
 #[test]
@@ -1942,11 +1970,20 @@ fn reference_update_session(
     entry.origin = origin;
     entry.install_epoch = table.next_epoch();
     entry.last_seen_ns = now_ns;
-    entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &table.timeouts);
-    entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
-    // #3046: RST is sticky on the in-place path; mirror it here so the
-    // reference stays byte-equivalent.
+    // #3046: mirror update_session exactly — set the sticky reset flag FIRST,
+    // then select the timeout consulting it (RST→short, FIN→30s), so the
+    // in-place/reference parity sweeps stay byte-equivalent.
     entry.reset |= matches!(protocol, PROTO_TCP) && (tcp_flags & TCP_RST) != 0;
+    entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
+    entry.expires_after_ns = if entry.closing {
+        if entry.reset {
+            TCP_RST_TIMEOUT_NS
+        } else {
+            TCP_CLOSING_TIMEOUT_NS
+        }
+    } else {
+        session_timeout_ns(protocol, tcp_flags, &table.timeouts)
+    };
     let created_ns = entry.created_ns;
     table.restore_entry(key.clone(), entry);
     table.push_to_wheel(key, now_ns);

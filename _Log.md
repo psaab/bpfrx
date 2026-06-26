@@ -15,6 +15,24 @@
   proves RST→2s + FIN→30s + post-RST stickiness (RED left:30e9/right:2e9 when
   the lookup selection is reverted). Doc: `userspace-dp/src/session/README.md`
   timeout table + #3046 RST-vs-FIN note.
+- **Timestamp**: 2026-06-25 (review fold)
+- **Action**: review MINOR fold — `update_session` selected the timeout from
+  only the CURRENT segment's `has_rst(tcp_flags)` via `session_timeout_ns`,
+  ignoring the sticky `entry.reset`. A peer-synced session already carrying
+  reset=true, promoted via `promote_synced_with_origin` with a non-RST FIN
+  trigger, wrongly reverted to the 30s FIN window. Reordered the in-place
+  update to set `reset` FIRST then compute `expires_after_ns` consulting the
+  sticky flag — now byte-identical to the lookup.rs selection. Mirrored the
+  same logic into the test `reference_update_session` so the randomized
+  in-place/reference parity sweep stays equivalent. Extended
+  `tcp_rst_uses_short_timeout_not_fin_timeout` with a FAIL-ON-REVERT
+  update_session case (reset-sticky session + non-RST FIN refresh keeps 2s;
+  RED left:30e9/right:2e9 when update_session reverts to current-flag logic).
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/tests.rs, _Log.md
+- **Validation**: `cargo build --release -p xpf-userspace-dp` clean; `cargo
+  test session::` 129 passed; both fail-on-revert legs confirmed RED then
+  GREEN.
 - **File(s)**: userspace-dp/src/session/mod.rs,
   userspace-dp/src/session/lookup.rs, userspace-dp/src/session/install.rs,
   userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
