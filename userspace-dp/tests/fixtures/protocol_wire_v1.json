@@ -1140,6 +1140,7 @@
   },
   "zone_snapshot": {
     "id": 0,
-    "name": ""
+    "name": "",
+    "tcp_rst": false
   }
 }

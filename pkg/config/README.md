@@ -182,6 +182,80 @@ peer-synced config still boots (#1960 no-brick) — a leniently-loaded bare-log
 policy simply logs nothing, exactly as before. Same fail-closed-on-load
 doctrine as #3043.
 
+**Security-policy `match application` must be defined (#3144):** a policy
+`match application <name>` token resolving to NONE of {predefined junos-*
+application, user-defined `applications application <name>`, user-defined
+`applications application-set <name>`} was previously only WARNED at commit
+(`compiler_validate_warn.go`). But at runtime the userspace capability gate
+(`resolveUserspaceApplicationNames` in `pkg/dataplane/userspace/capabilities.go`)
+resolves the SAME name set and returns false for an unknown name →
+`expandUserspacePolicyApplications` fails → `userspaceSupportsSecurityPolicies`
+returns false → the dataplane REFUSES to arm security policies. The operator
+got a green commit and a silently DISARMED policy engine on the firewall's
+primary allow/deny path — a commit/apply split, fail-open.
+`validatePolicyMatchApplicationsStrict` (`compiler_validate_strict.go`)
+hard-rejects an undefined reference (zone-pair OR global, including every
+element of a `match application [ a b c ]` list) at commit, naming the policy
+scope, the policy, and the undefined token. Resolution mirrors the runtime gate
+`resolveUserspaceApplicationNames`: a name resolves only if it is a predefined /
+user application (`ResolveApplication` — user apps then the predefined table)
+OR an `application-set` that EXPANDS to >= 1 member (`ResolveApplicationSet` +
+`ExpandApplicationSet`, the exact runtime check). `any` and the empty token are
+always accepted. A defined-but-EMPTY application-set (#3146) is rejected with a
+distinct message: the set resolves by name but expands to zero applications, so
+the runtime gate returns false and the dataplane refuses to arm — the same
+fail-open class. (#2217's `validateApplicationSetMembersStrict` `continue`s on
+an empty set, so this gate is the one that catches it.) The tolerant load/peer-sync path downgrades to
+a warning (`lenientPolicyMatchApplications`) so an already-persisted or
+peer-synced config still boots (#1960 no-brick) — the dataplane independently
+refuses the policy, so a leniently-loaded bad config is no worse off, now
+flagged. Distinct from #2217 (`validateApplicationSetMembersStrict`), which
+rejects a dangling MEMBER of a DEFINED application-set; this gate catches a
+wholly undefined top-level reference that #2217's `ExpandApplicationSet` walk
+never sees. The `compiler_validate_warn.go` application warning was removed
+(converted): the strict gate supersedes it on commit and the lenient gate emits
+the single warning on load — eliminating both a duplicate warning and the old
+24-entry builtin list's false positive on predefined apps outside it (e.g.
+`junos-pingv6`, `junos-tcp-any`). Same fail-closed-on-load doctrine as
+#3043/#2401.
+
+**Security-policy address references must fully resolve (#3149, folds #3147):**
+the address-book sibling of #3144/#3146. A policy `match source-address` /
+`match destination-address` that names a DEFINED address-book entry (an address
+or an address-set) whose recursive members DANGLE (point at an undefined
+address/address-set), or that is a defined-but-EMPTY address-set, or a defined
+address with no configured prefix, was previously only WARNED at commit
+(`compiler_validate_warn.go`). At runtime the userspace address resolver
+(`resolveUserspaceAddressBookEntry` + `expandUserspacePolicyAddresses` in
+`pkg/dataplane/userspace/capabilities.go`) returns false for the same name — a
+dangling member fails the WHOLE set, an empty set never sets `resolvedAny`, a
+prefix-less address has an empty Value — so `userspacePolicyAddressesSupported`
+returns false → `userspaceSupportsSecurityPolicies` returns false → the
+dataplane REFUSES to arm security policies. The operator got a green commit and a
+silently DISARMED allow/deny path — a commit/apply split, fail-open.
+`validatePolicyMatchAddressSetMembersStrict` (`compiler_validate_strict.go`)
+hard-rejects such a reference (zone-pair OR global, source AND destination,
+including the recursive address-set-of-address-sets case) at commit, naming the
+policy scope, policy, field, and the inner failure. Resolution mirrors the
+runtime resolver EXACTLY (`policyMatchAddressBookResolves` replicates
+`resolveUserspaceAddressBookEntry`'s fail-closed semantics and the outer
+`len(values) == 0` reject), so the commit gate and the runtime gate cannot
+diverge. `any` / `any-ipv4` / `any-ipv6` / the empty token and literal CIDR/IP
+tokens are passed through; a wholly-undefined token stays the domain of
+`validatePolicyMatchAddressesStrict` (#2008), which runs first. **#3147
+excluded-inversion safety:** the resolver runs on the same address lists the
+runtime gate checks, regardless of `*-address-excluded`, so rejecting an empty /
+dangling set at COMMIT is fail-CLOSED for the excluded case too — an empty
+excluded set can never be committed, so it can never reach the dataplane and
+invert to MATCH-ALL (the historic fail-open this constraint guards against). The
+tolerant load/peer-sync path downgrades to a warning
+(`lenientPolicyMatchAddressSetMembers`) so an already-persisted or peer-synced
+config still boots (#1960 no-brick) — the dataplane independently refuses to arm
+such a policy, so a leniently-loaded bad config is no worse off, now flagged. The
+`compiler_validate_warn.go` address-set member warning is RETAINED for the
+lenient path and for unreferenced sets (which never reach the runtime gate, so
+they stay warn-only). Same fail-closed-on-load doctrine as #3144/#3146.
+
 **An interface belongs to exactly one security zone (#3072):**
 `pkg/dataplane/userspace.buildInterfaceZoneMap` builds the interface->zone
 lookup by iterating zone names in SORTED order and writing each interface
@@ -218,6 +292,25 @@ older binary accepted still boots (#1960 no-brick). An EMPTY destination is
 left to #2907's next-hop-family-aware default (never a mismatch); a
 matched-family explicit destination passes. Same fail-closed-on-load
 doctrine as #3043.
+
+**VRRP virtual-address must fall within a unit subnet (#3013):** a
+`vrrp-group <id> virtual-address <vip>` is authored under a
+`family inet|inet6 address <prefix>` on an interface unit. In Junos/vSRX a
+VIP outside every on-link subnet of the unit is a commit-time configuration
+error; xpf accepted it and at runtime installed the VIP as a route-less host
+address — return traffic sourced from the VIP has no on-link subnet
+association and silently blackholes. `validateVRRPVirtualAddressSubnet`
+(`compiler_validate_strict.go`) asserts each VIP is contained in the prefix
+of at least one address configured on the SAME unit for the MATCHING family.
+The owner / priority-255 case (VIP equals an interface address) passes for
+free (an address is contained in its own subnet); a cross-family VIP (e.g. a
+v4 literal authored under a v6-only address) has no matching-family subnet
+and is rejected. The strict commit/commit-check path hard-rejects naming the
+interface, unit, group, VIP and family; the tolerant load/peer-sync path
+downgrades to a warning (`lenientVRRPVirtualAddress`) so an already-persisted
+or peer-synced config an older binary accepted still boots (#1960 no-brick).
+This is config-only commit-time validation — it never touches the VRRP
+runtime/state machine. Same fail-closed-on-load doctrine as #2911.
 
 **No-match default-policy is fail-closed (#3065):** the sibling of #3043
 for the implicit fallback. When a flow matches NO zone-pair, global, or
@@ -364,6 +457,157 @@ older binary silently accepted still boots — the leaf stays dropped (the
 pre-existing behaviour), now flagged (#1960 no-brick doctrine, same as
 #3079/#3055/#3060).
 
+The #3113 gate originally inspected only the DIRECT children of `match`, which
+left a multi-value-leaf ESCAPE (#3142, codex-review-067 finding 067-01). `match
+application` is a `multi:true` leaf (`schema_security.go`), so the flat-set
+absorber collapses every trailing non-sibling token onto the application leaf's
+OWN node (`Keys[1:]` plus child sub-nodes — the #2419 collapse), not as a
+sibling of `match`. So `set ... policy p match application any dynamic-application
+junos:FTP` compiles to a single `application` leaf with tail tokens `[any
+dynamic-application junos:FTP]`; the direct-child scan saw only the supported
+`application` leaf and never the tail, so the unsupported `dynamic-application`
+criterion escaped the gate and the policy silently armed as a broad application
+match (`capabilities.go` short-circuits on the first `any`) — the same fail-open
+#3113 closes, reached via the multi-value path. `validatePolicyMatchLeavesStrict`
+now also scans the collapsed tail of a supported match leaf
+(`firewallMatchValues`) and rejects any token in `unsupportedPolicyMatchLeaves`
+(the KNOWN unsupported match dimensions: `dynamic-application`, `url-category`,
+`source-identity`). A legitimate application VALUE is never one of those keywords,
+so a real bracketed list like `match application [ junos-http junos-https ]` is
+NOT over-rejected — only a known unsupported match-leaf keyword masquerading as
+an application value is. Same strict-reject / lenient-warn split as #3113.
+
+**Unsupported security-policy `then permit` children are rejected at commit
+(#3114, interim):** Junos SRX `then permit` accepts action modifiers that turn a
+bare permit into a permit-with-inspection or a permit-into-tunnel —
+`application-services { utm-policy X; idp; }` (UTM/IDP/AppFW/SSL-proxy/SecIntel
+attachment), `firewall-authentication`, `tunnel ipsec-vpn`, etc. xpf's policy
+compiler (`compilePolicy`, `compiler_security.go`) handles the `then` arm by
+switching only on the tokens it implements (`permit`, `deny`, `reject`, `log`,
+`count`); the `permit` arm sets `pol.Action = PolicyPermit` and NEVER inspects the
+permit node's children/tail, so any modifier under `then permit` fell out with NO
+error and was SILENTLY DROPPED (the set-schema does not list them and
+`schema_walk.go` returns nil for unknown keywords by design). Dropping a permit
+service chain turns a permit-only-with-inspection rule into an UNCONDITIONAL
+permit — an operator who writes `then permit application-services utm-policy
+strict-web` believes traffic is inspected while xpf forwards it without the chain
+(a security fail-OPEN). `validatePolicyThenPermitStrict` (`compiler_policy_then.go`)
+hard-rejects a policy whose `then permit` carries an unsupported child at commit,
+naming the policy scope (zone-pair or global), the policy, and the offending
+modifier, and directing the operator to remove it. It is an AST pre-walk in
+`compileExpanded` (not a typed validator) for the same reasons as #3113 — the
+dropped modifier is gone from the typed `*Config`, and `SchemaValidate` cannot
+REJECT an unknown keyword. The modifier appears either collapsed onto the permit
+node's `Keys[1]` (flat set) or as a child node (hierarchical block); both shapes
+are checked. The allowlist (`supportedPolicyThenPermitChildren`) is EMPTY today
+because the compiler enforces no `then permit` child — keep it in lockstep with
+`compilePolicy` so a future typed service chain is no longer rejected. Both
+zone-pair and `global` policies are covered. This is the INTERIM contract: a typed
+service-chain model + userspace capability gate + Rust enforcement is a deferred
+follow-up. The tolerant load/peer-sync path downgrades to a warning
+(`lenientPolicyThenPermit`) so an already-persisted or peer-synced config an older
+binary silently accepted still boots — the modifier stays dropped (the
+pre-existing behaviour), now flagged (#1960 no-brick doctrine, same as #3113).
+
+**Unsupported security-policy `then reject` children are rejected at commit
+(#3115, interim — codex-review-066 finding 066-03):** the sibling of #3114 for the
+`reject` arm. Junos SRX `then reject` accepts a custom reject-response `profile
+<name>` and a per-packet-type reject (e.g. `tcp-reset`). `compilePolicy`'s `then`
+switch `reject` arm sets `pol.Action = PolicyReject` and NEVER inspects
+`t.Children`, so any modifier under `then reject` fell out with NO error and was
+SILENTLY DROPPED (set-schema does not list reject children and `schema_walk.go`
+returns nil for unknown keywords). Unlike #3114 this is not a fail-OPEN (reject
+still rejects), but the configured custom reject response is inert — a wire-contract
+/ operator-observability divergence the operator cannot detect at commit.
+`validatePolicyThenRejectStrict` (`compiler_policy_then.go`) hard-rejects a policy
+whose `then reject` carries an unsupported child at commit, naming the policy scope
+(zone-pair or global), the policy, and the offending modifier; a bare `then reject`
+(no child) still commits. It is an AST pre-walk in `compileExpanded` for the same
+reasons as #3114, checks both AST shapes (`Keys[1]` flat-set / child node
+hierarchical), and covers zone-pair and `global` policies. The allowlist
+(`supportedPolicyThenRejectChildren`) is EMPTY today because the compiler enforces
+no `then reject` child — keep it in lockstep with `compilePolicy` so a future
+synthesized reject response / packet-type reset is no longer rejected. Reject-profile
+support (a typed reject-response model + dataplane synthesis) is a deferred
+follow-up. The tolerant load/peer-sync path downgrades to a warning
+(`lenientPolicyThenReject`) so an already-persisted or peer-synced config an older
+binary silently accepted still boots — the modifier stays dropped (the pre-existing
+behaviour), now flagged (#1960 no-brick doctrine, same as #3114).
+
+**`then deny` log/count modifier wired; other collapsed deny modifiers
+rejected (#3141 — codex-review-068 finding 068-01):** the deny sibling of
+#3114/#3115, but NOT a pure reject. `then deny` legitimately combines with the
+observability modifiers `log` (with `session-init`/`session-close`) and `count`,
+which the standalone `then log`/`then count` arms already implement. A flat-set
+`then deny log session-init` collapses the modifier onto the deny node
+(`Keys=["deny","log","session-init"]`, no children) instead of nesting a sibling
+`then log` node; `compilePolicy`'s `then` switch `deny` arm read only `t.Name()`
+and silently dropped the collapsed tail, so deny-with-logging committed but
+`pol.Log` was never set — the configured audit logging was inert (a deny-rule
+observability / compliance failure, not a packet fail-OPEN). The fix WIRES the
+collapsed `log`/`count` modifiers in `applyCollapsedDenyModifiers`
+(`compiler_security.go`), so deny+log works in BOTH the flat-collapsed form and
+the separate-node `then { deny; log session-init; }` form (the latter already
+handled by the `log` arm); `pol.Log` flows into the policy snapshot
+(`PolicyRuleSnapshot.LogSessionInit/Close`, #2508) independent of `Action`, so a
+deny rule emits the configured session log. The safety net for any REMAINING
+collapsed deny modifier the compiler cannot enforce is
+`validatePolicyThenDenyStrict` (`compiler_policy_then.go`): it hard-rejects a
+`then deny <unsupported>` modifier at commit, naming the policy scope (zone-pair
+or global), the policy, and the offending modifier; a bare `then deny`,
+`then deny log`, and `then deny count` still commit. AST pre-walk in
+`compileExpanded`, both AST shapes, zone-pair and `global` coverage. On the
+flat path the lexer flattens a modifier and its sub-tokens into one
+`Keys` slice (`["deny","log","session-init","count"]`), so the gate inspects
+EVERY collapsed token (`Keys[1:]`) against `recognizedCollapsedDenyToken` —
+the exact `{log, session-init, session-close, count}` set
+`applyCollapsedDenyModifiers` consumes — not just `Keys[1]`; checking only
+the first token let a supported-leads / unsupported-trails sequence like
+`then deny count evilmod` slip through silently. On the hierarchical path a
+direct child of `deny` is a top-level modifier, checked against the
+`supportedPolicyThenDenyChildren` allowlist (`log`/`count`); its sub-tokens
+nest deeper. Keep `recognizedCollapsedDenyToken` /
+`supportedPolicyThenDenyChildren` in lockstep with
+`applyCollapsedDenyModifiers`. The tolerant load/peer-sync path downgrades
+to a warning (`lenientPolicyThenDeny`) so an already-persisted or peer-synced
+config an older binary silently accepted still boots (#1960 no-brick doctrine,
+same as #3114/#3115).
+
+**Security policies missing a required `match` criterion are rejected at commit
+(#3044 — codex-review-061 finding 061-03):** Junos/vSRX requires every security
+policy `match` clause to specify all three core dimensions — `source-address`,
+`destination-address`, AND `application`; a policy missing any of them (or omitting
+the `match` block entirely) cannot commit. xpf's policy compiler (`compilePolicy`,
+`compiler_security.go`) instead treated the whole `match` block — and every leaf
+within it — as OPTIONAL: each field is filled only when the leaf is present, and an
+absent dimension simply left the corresponding slice empty. The userspace dataplane
+then interprets an empty slice as match-ANY (`capabilities.go` returns a nil app-term
+list for "no apps"; `userspace-dp/src/policy.rs` compiles an empty app list as
+`match_any:true` and defaults `source/destination_*_match_any` to true when the
+literal+book sets are empty). A partial policy is therefore SILENTLY broader than
+typed: `match source-address corp; then permit` permits `corp -> any:any`, and a
+match-less policy becomes a zone-pair-wide permit/deny. A single dropped line in an
+automation template widens a narrow rule to all traffic — a fail-OPEN for a permit
+policy, an over-broad block for a deny. `validatePolicyRequiredMatchStrict`
+(`compiler_policy_missing_match.go`) hard-rejects a policy whose `match` omits a
+required dimension at commit, naming the policy scope (zone-pair or global), the
+policy, and EVERY missing dimension, and directing the operator to add it. A missing
+dimension is treated DIFFERENTLY from an explicit wildcard: the operator must write
+`any` (or `any-ipv4`/`any-ipv6`, an address-book name, a CIDR, a named
+application/application-set) — exactly as Junos demands. `source-address-excluded` /
+`destination-address-excluded` are MODIFIERS of the base address leaf, not
+substitutes, so they do not by themselves satisfy the source/destination-address
+requirement. It is an AST pre-walk in `compileExpanded` (not a typed validator) for
+the same reasons as #3113 — a missing leaf leaves no trace in the typed `*Config`
+(an empty slice is indistinguishable from an explicit-any that also resolves to
+match-any), and `SchemaValidate` cannot REJECT an absence. The walk runs on the
+group-expanded, inactive-pruned tree, so an apply-groups-inherited dimension counts
+and an `inactive:` policy is ignored. Both zone-pair and `global` policies are
+covered. The tolerant load/peer-sync path downgrades to a warning
+(`lenientPolicyMissingMatch`) so an already-persisted or peer-synced config an older
+binary silently accepted still boots — the policy keeps its match-any-for-missing
+compilation, now flagged (#1960 no-brick doctrine, same as #3113).
+
 **Ambiguous secure-tunnel `bind-interface` aliases are rejected at commit
 (#2933):** `security ipsec vpn <name> bind-interface` is a free-form 1-arg
 string stored verbatim on the typed VPN (`compiler_ipsec.go`); the runtime
@@ -408,6 +652,36 @@ older binary accepted still boots (#1960 no-brick doctrine). The gate is
 SURGICAL — only NAME references are checked; `then community (set|add) <value>`
 carries a community VALUE (e.g. `65000:100`), not a list reference, and a defined
 community reference commits unchanged.
+
+**Policy-referenced application protocols are validated against the dataplane
+resolver (#3150 — codex-review-067 finding 067-06):** a user-defined
+`set applications application <name> protocol <token>` that is REFERENCED by a
+security policy or NAT rule's `match application` (or any application when
+`services application-identification` is on) is hard-rejected at commit by
+`validateApplicationSpecsStrict` (`compiler_validate_strict.go`) when the
+protocol token is unresolvable. The bug: that gate resolved the token via the
+LENIENT `validateProtocol`, which blanket-accepts ANY `junos-` prefix
+(`strings.HasPrefix("junos-")`). So `protocol junos-foobar` committed cleanly,
+but the dataplane resolves protocols only through `appid.ProtocolNumber`
+(`pkg/appid`), which knows only the CONCRETE junos-* aliases (`junos-ping`,
+`junos-tcp-any`, ...) — it rejects `junos-foobar`. The userspace policy
+capability gate (`pkg/dataplane/userspace`) then disarms the snapshot
+(`ForwardingSupported=false`): a commit-succeeds / apply-fails split. The fix
+resolves the application's protocol through `filterProtocolResolvable` — the
+same `appid.ProtocolNumber` mirror the firewall-filter `from protocol` gate
+(#2175) already uses, pinned to the SSOT by the `pkg/appid` drift-guard test
+`TestFilterProtocolResolvableMatchesProtocolNumber` — so a token the dataplane
+cannot represent is rejected at commit. Real protocol names, numeric 0..255
+values, and resolvable junos-* aliases still commit; only genuinely
+unresolvable tokens reject. The lenient `validateProtocol` is unchanged and
+still used by `ValidateConfig`'s warning surface (so an UNREFERENCED library
+app with a bogus protocol stays a warning, not a commit error). The tolerant
+load/peer-sync path downgrades the reject to a warning
+(`lenientApplicationSpecs`) so an already-persisted or peer-synced config an
+older binary accepted still boots (#1960 no-brick doctrine). Distinct from
+#2124/#2142 (those fixed alias drift / malformed port-or-protocol specs); this
+residual was specifically the strict app-spec path still using the blanket
+`junos-` HasPrefix.
 
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map

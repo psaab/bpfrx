@@ -80,6 +80,35 @@ var supportedPolicyMatchLeaves = map[string]bool{
 	"application":                  true,
 }
 
+// unsupportedPolicyMatchLeaves enumerates the KNOWN vSRX `match` leaves xpf
+// does not enforce. #3113 rejects them when they appear as a DIRECT child of
+// `match`. #3142 closes the multi-value-leaf escape: `match application` (and
+// the other `multi:true` match leaves) absorb every trailing non-sibling
+// token onto the SAME node (the #2419 flat-set collapse — values land in
+// child.Keys[1:] and/or child sub-nodes, not as siblings of `match`). So
+//
+//	set ... policy p match application any dynamic-application junos:FTP
+//
+// compiles to one `application` leaf whose tail tokens are
+// `[any dynamic-application junos:FTP]`. The #3113 direct-child scan only
+// sees the supported `application` leaf and never inspects the tail, so the
+// unsupported `dynamic-application` criterion escapes the gate and the policy
+// silently arms as a broad application match — the same fail-open #3113
+// closes, reached via the multi-value-leaf path.
+//
+// These keywords are not legitimate application names (an app value is
+// `junos-http`, `junos:FTP`, a user-defined app, or `any` — never one of
+// these match-dimension keywords), so a token from this set appearing in a
+// supported match leaf's collapsed tail is unambiguously the unsupported
+// criterion masquerading as a value, and is rejected exactly as a direct
+// child would be. Keep in lockstep with the vSRX match dimensions xpf does
+// not yet enforce.
+var unsupportedPolicyMatchLeaves = map[string]bool{
+	"dynamic-application": true,
+	"url-category":        true,
+	"source-identity":     true,
+}
+
 // validatePolicyMatchLeavesStrict walks the `security policies` subtree of
 // the group-expanded AST and rejects any policy whose `match` clause
 // carries a leaf the compiler does not enforce (see file header). Covers
@@ -127,6 +156,22 @@ func validatePolicyMatchLeavesStrict(nodes []*Node, lenient bool) ([]string, err
 		for _, m := range matchNode.Children {
 			leaf := m.Name()
 			if supportedPolicyMatchLeaves[leaf] {
+				// #3142: a multi:true match leaf (application/source-address/
+				// destination-address) absorbs trailing non-sibling tokens
+				// onto its own node (Keys[1:] + child sub-nodes — the #2419
+				// collapse). An unsupported match-leaf keyword written after
+				// the supported leaf's value lands in this tail, invisible to
+				// the direct-child scan above. Re-apply the reject to any
+				// known unsupported match-leaf keyword found in the collapsed
+				// tail (a real value is never one of these keywords, so legit
+				// `application [ junos-http junos-https ]` is not over-rejected).
+				for _, tok := range firewallMatchValues(m) {
+					if unsupportedPolicyMatchLeaves[tok] {
+						if err := emit(scope, policyName, tok); err != nil {
+							return err
+						}
+					}
+				}
 				continue
 			}
 			if err := emit(scope, policyName, leaf); err != nil {

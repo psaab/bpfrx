@@ -112,6 +112,11 @@ func (c *xpfCollector) collectSurfaceADDNSMetrics(ch chan<- prometheus.Metric) {
 		float64(st.SkippedNoBackend), "no-backend")
 	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSScopes, prometheus.GaugeValue,
 		float64(st.Scopes))
+	var degraded float64
+	if st.Degraded {
+		degraded = 1
+	}
+	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSDegraded, prometheus.GaugeValue, degraded)
 }
 
 // collectFlowExportMetrics emits the xpf_flow_export_collector_* family

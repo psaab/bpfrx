@@ -574,6 +574,9 @@ pub(super) fn build_local_origin_tunnel_tx_request(
             // `then log` selection (see server/helpers.rs note).
             log_session_init: false,
             log_session_close: false,
+            // #3056: tunnel sync-import sessions are seeded from the peer, which
+            // ran the admitting policy; the local policy ID is unknown here.
+            policy_id: 0,
         },
         origin: SessionOrigin::SyncImport,
         protocol: meta.protocol,

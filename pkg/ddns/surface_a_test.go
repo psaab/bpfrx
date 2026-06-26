@@ -2,7 +2,9 @@ package ddns
 
 import (
 	"context"
+	"errors"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -399,4 +401,135 @@ func contains(xs []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// TestSurfaceACorruptStateFailsClosed is the #2971 fail-on-revert test: a
+// corrupt Surface A ownership state file must put the manager into the DEGRADED
+// (fail-closed) state — Reconcile refuses to publish AND to withdraw any record,
+// never silently resetting to an empty store and reconciling-from-empty (which
+// would re-publish EVERY scope, overwriting a peer/manual owner, and leak the
+// records it can no longer withdraw). It also proves the bad file is quarantined
+// (preserved, not overwritten) and the alarm is surfaced in Stats. Reverting
+// NewSurfaceAManager/newSurfaceAManagerForTesting to the old fail-open path
+// (loadDDNSState + log-and-continue with the empty store) makes this RED: the
+// reconcile would publish the observed address and the no-op + degraded
+// assertions fail.
+func TestSurfaceACorruptStateFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "iface-ddns.json")
+	// A corrupt store left behind by a crash / disk fault.
+	if err := os.WriteFile(statePath, []byte("{ this is not valid json at all"), 0o600); err != nil {
+		t.Fatalf("seed corrupt state: %v", err)
+	}
+
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceAManagerForTesting(statePath, fu, func() time.Time { return now })
+
+	// Degraded must be set at construction and surfaced in Stats.
+	if !m.degraded {
+		t.Fatal("manager must be DEGRADED after loading a corrupt Surface A state file")
+	}
+	if st := m.Stats(); !st.Degraded || st.DegradedReason == "" {
+		t.Fatalf("Stats must report Degraded with a reason, got %+v", st)
+	}
+
+	// The corrupt file must be quarantined aside (preserved for inspection), not
+	// left in place to be overwritten by a later save.
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("corrupt state file must be quarantined (renamed away); stat err=%v", err)
+	}
+	matches, _ := filepath.Glob(statePath + ".corrupt-*")
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly one quarantined copy, found %v", matches)
+	}
+
+	// A reconcile of a configured scope with a valid observed address must FAIL
+	// CLOSED: no publish, no withdraw, an error returned, and the state file NOT
+	// recreated. A standalone (nil gate) run is used deliberately — losing the
+	// only ownership authority is no safer without a peer.
+	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
+	err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil, nil)
+	if err == nil {
+		t.Fatal("reconcile must return an error while degraded (fail closed)")
+	}
+	if got := len(fu.upserts); got != 0 {
+		t.Fatalf("degraded manager must NOT publish any record, got %d upserts", got)
+	}
+	if got := len(fu.deletes); got != 0 {
+		t.Fatalf("degraded manager must NOT withdraw any record, got %d deletes", got)
+	}
+	// The reconcile must NOT have written a fresh (empty) state file — that would
+	// erase the only signal that ownership was lost.
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatal("degraded manager must not recreate the ownership state file")
+	}
+}
+
+// TestSurfaceAUnsupportedVersionFailsClosed proves the unknown-future-version
+// path also fails closed + quarantines (#2971, sibling of the corrupt path):
+// the manager must not trust records from a format it cannot decode.
+func TestSurfaceAUnsupportedVersionFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "iface-ddns.json")
+	if err := os.WriteFile(statePath,
+		[]byte(`{"version":99,"records":[{"family":4,"identity":"router-self","address":"","fqdn":"wan.example.net","forward_type":"A","ttl":300,"addr_text":"203.0.113.5"}]}`),
+		0o600); err != nil {
+		t.Fatalf("seed unsupported-version state: %v", err)
+	}
+
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceAManagerForTesting(statePath, fu, func() time.Time { return now })
+
+	if !m.degraded {
+		t.Fatal("unsupported-version state must put the manager into the degraded state")
+	}
+	// No record from the future-version file leaked into the in-memory store.
+	if len(m.state.records) != 0 {
+		t.Fatalf("unsupported-version records must not load, got %d", len(m.state.records))
+	}
+	matches, _ := filepath.Glob(statePath + ".corrupt-*")
+	if len(matches) != 1 {
+		t.Fatalf("unsupported-version file must be quarantined, found %v", matches)
+	}
+
+	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil, nil); err == nil {
+		t.Fatal("reconcile must return an error while degraded (fail closed)")
+	}
+	if got := len(fu.upserts); got != 0 {
+		t.Fatalf("degraded manager must NOT publish, got %d upserts", got)
+	}
+}
+
+// TestSurfaceAAbsentStateFirstBootStandaloneWrites pins the OTHER half of the
+// #2971 contract: a MISSING state file (first boot) is a legitimately-empty
+// store, NOT degraded, so a fresh standalone (nil gate) node still publishes its
+// records. Distinguishing absent (fail-open OK) from corrupt (fail-closed) is
+// the whole point — this proves the fix did not over-apply fail-closed into
+// never-writing for a first-boot node.
+func TestSurfaceAAbsentStateFirstBootStandaloneWrites(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "iface-ddns.json")
+	// Deliberately do NOT create the file: first boot.
+	if _, err := os.Stat(statePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("precondition: state file must be absent, stat err=%v", err)
+	}
+
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceAManagerForTesting(statePath, fu, func() time.Time { return now })
+
+	if m.degraded {
+		t.Fatalf("an absent (first-boot) state file must NOT be degraded; reason=%q", m.degradedReason)
+	}
+
+	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, fixedObserver("203.0.113.5"), nil, nil); err != nil {
+		t.Fatalf("first-boot standalone reconcile must succeed: %v", err)
+	}
+	if got := len(fu.upserts); got != 1 {
+		t.Fatalf("first-boot standalone node must publish its record, got %d upserts", got)
+	}
 }

@@ -48,6 +48,38 @@
 //!   forward translation silently stops (a fail-open in the retired-eBPF
 //!   enforcement plane).
 //!
+//! ## Incremental L4 checksum on translation (#3025)
+//!
+//! NAT64 changes only the IP layer: the transport payload is copied verbatim
+//! (for TCP/UDP) and the transport length + protocol number are identical
+//! across the v4↔v6 forms, so the ONLY input to the L4 checksum that changes is
+//! the pseudo-header source/destination address pair. The translators therefore
+//! adjust the verbatim-copied L4 checksum INCREMENTALLY (RFC 1624 eqn 3,
+//! [`adjust_l4_checksum_v6_to_v4_incremental`] /
+//! [`adjust_l4_checksum_v4_to_v6_incremental`]) — folding the old address words
+//! out and the new ones in — instead of re-summing the whole payload. Because
+//! 16-bit one's-complement addition is exact, the incremental result is
+//! BYTE-IDENTICAL to a full recompute (folding `0xFFFF` is a one's-complement
+//! no-op, so the address words cancel exactly); it is a pure O(changed-words)
+//! optimization, not a behavior change. This was already the case for #2488
+//! FRAGMENTs (where a full recompute is impossible); #3025 extends it to the
+//! non-fragmented fast path that previously re-summed the entire L4 payload.
+//!
+//! Three cases still take the full recompute, by design:
+//!   * **ICMP** — ICMPv4↔ICMPv6 rewrites the message body, and ICMPv4 has no
+//!     pseudo-header while ICMPv6 does, so the checksum genuinely changes.
+//!   * **v4→v6 UDP with a zero IPv4 checksum** — RFC 768 "no checksum present";
+//!     there is no baseline to adjust and IPv6 UDP mandates a checksum, so one
+//!     must be GENERATED.
+//!   * **v6→v4 UDP with a zero (illegal) IPv6 checksum** — no trustworthy
+//!     baseline; defended against with a recompute.
+//!
+//! Pinned by the `nat64_3025_*` tests: the incremental output equals an
+//! independent full recompute (v6→v4 / v4→v6, TCP + UDP), the v4 zero-checksum
+//! UDP edge generates a fresh valid checksum, and the fail-on-revert seam — a
+//! deliberately-corrupted input checksum is PRESERVED (adjusted) by the
+//! incremental path but would be silently repaired by a full recompute.
+//!
 //! ## Single Ethernet-header writer (#2844)
 //!
 //! The NAT64 frame builders ([`build_nat64_v6_to_v4_frame`] /
@@ -819,22 +851,34 @@ pub(crate) fn write_v6_to_v4_into(
     let ipv4_total_len = 20 + l4_len;
     out[2..4].copy_from_slice(&(ipv4_total_len as u16).to_be_bytes());
 
-    // Recompute L4 checksum (pseudo-header changes from IPv6 to IPv4). ICMPv4
-    // does not use a pseudo-header, so its checksum is recomputed inside
-    // `translate_icmpv6_message_to_icmpv4`; the generic helper still rewrites it
-    // identically and is a no-op for the already-correct ICMP case.
+    // L4 checksum after the IPv6→IPv4 pseudo-header change. The L4 payload is
+    // byte-identical across NAT64 translation (verbatim copy for TCP/UDP), and
+    // the transport length + protocol number are unchanged, so ONLY the
+    // pseudo-header addresses differ between the v6 and v4 forms. That makes an
+    // O(1) RFC 1624 incremental adjustment of the verbatim-copied L4 checksum
+    // BYTE-IDENTICAL to a full recompute over the whole payload (one's-complement
+    // addition is exact), but without re-summing every byte:
     //
-    // #2488: a TCP/UDP FRAGMENT carries only part of the transport payload, so
-    // the L4 checksum cannot be recomputed from scratch (the field present in
-    // the first fragment was computed over the whole reassembled payload). Only
-    // the IP pseudo-header changed (v6→v4 addresses; the transport length and
-    // protocol number are identical), so adjust the existing checksum
-    // incrementally (RFC 1624). The verbatim-copied first-fragment L4 header
-    // still holds the original v6 checksum at this point.
-    if frag_info.is_some() && matches!(ipv4_protocol, PROTO_TCP | PROTO_UDP) {
+    //   * #2488 FRAGMENT (TCP/UDP): a full recompute is IMPOSSIBLE — the first
+    //     fragment's checksum covers the whole reassembled payload that is not
+    //     present here — so the incremental adjustment is mandatory.
+    //   * #3025 NON-fragment (TCP, or UDP with a non-zero baseline checksum):
+    //     a full recompute is possible but wasteful; the incremental adjustment
+    //     produces the identical wire result at O(changed-words) cost.
+    //   * ICMP: ICMPv6→ICMPv4 genuinely rewrites the message and ICMPv4 carries
+    //     no pseudo-header, so `translate_icmpv6_message_to_icmpv4` already set
+    //     the correct checksum and the generic recompute re-affirms it.
+    //   * Non-fragment UDP with a 0x0000 baseline: an IPv6 UDP checksum of zero
+    //     is illegal (no trustworthy baseline to adjust), so fall back to a full
+    //     recompute to GENERATE a valid one.
+    let nonfrag_incremental = frag_info.is_none()
+        && (ipv4_protocol == PROTO_TCP
+            || (ipv4_protocol == PROTO_UDP && out.get(26..28) != Some(&[0, 0][..])));
+    let frag_incremental = frag_info.is_some() && matches!(ipv4_protocol, PROTO_TCP | PROTO_UDP);
+    if frag_incremental || nonfrag_incremental {
         let mut v6_addrs = [0u8; 32];
         v6_addrs.copy_from_slice(&packet[8..40]);
-        adjust_l4_checksum_v6_to_v4_fragment(
+        adjust_l4_checksum_v6_to_v4_incremental(
             &mut out[..ipv4_total_len],
             ipv4_protocol,
             &v6_addrs,
@@ -1036,18 +1080,27 @@ pub(crate) fn write_v4_to_v6_into(
     let ipv6_total_len = 40 + ipv6_payload_len;
     dst[4..6].copy_from_slice(&(ipv6_payload_len as u16).to_be_bytes());
 
-    // Recompute L4 checksum (pseudo-header changes from IPv4 to IPv6).
+    // L4 checksum after the IPv4→IPv6 pseudo-header change. The L4 payload is
+    // byte-identical across translation and the transport length + protocol
+    // number are unchanged, so ONLY the pseudo-header addresses differ — making
+    // an O(1) RFC 1624 incremental adjustment BYTE-IDENTICAL to a full recompute
+    // (see the v6→v4 twin for the full rationale).
     //
-    // #2488: a TCP/UDP FRAGMENT carries only part of the transport payload, so
-    // the checksum cannot be recomputed from scratch. Only the IP pseudo-header
-    // changed (v4→v6 addresses; the transport length and protocol number are
-    // identical), so adjust the existing first-fragment checksum incrementally
-    // (RFC 1624). The non-fragment path is byte-identical to before (full
-    // recompute at the fixed offset 40). Fragmented ICMP keeps whatever
-    // `translate_icmpv4_message_to_icmpv6` produced — a degenerate edge that is
-    // moot because non-first fragments never reach this translator (no L4 ports
-    // to match the reverse NAT64 session), so a fragmented datagram never
-    // reassembles regardless.
+    //   * #2488 FRAGMENT (TCP/UDP): incremental adjustment is mandatory (the
+    //     transport payload is incomplete). Fragmented ICMP keeps whatever
+    //     `translate_icmpv4_message_to_icmpv6` produced — a degenerate edge that
+    //     is moot because non-first fragments never reach this translator (no L4
+    //     ports to match the reverse NAT64 session), so a fragmented datagram
+    //     never reassembles regardless.
+    //   * #3025 NON-fragment (TCP, or UDP with a non-zero IPv4 checksum): the
+    //     incremental adjustment replaces the previous full recompute at no
+    //     change to the wire result.
+    //   * ICMP: ICMPv4→ICMPv6 rewrites the message AND ICMPv6 (unlike ICMPv4)
+    //     uses a pseudo-header, so the checksum genuinely changes — full
+    //     recompute.
+    //   * Non-fragment UDP with a 0x0000 IPv4 checksum: RFC 768 "no checksum
+    //     present". There is no baseline to adjust and IPv6 UDP REQUIRES a
+    //     checksum, so a full recompute GENERATES one.
     if is_fragment {
         if matches!(next_header, PROTO_TCP | PROTO_UDP) {
             let mut v6_addrs = [0u8; 32];
@@ -1056,7 +1109,7 @@ pub(crate) fn write_v4_to_v6_into(
             let mut v4_addrs = [0u8; 8];
             v4_addrs[..4].copy_from_slice(&packet[12..16]);
             v4_addrs[4..].copy_from_slice(&packet[16..20]);
-            adjust_l4_checksum_v4_to_v6_fragment(
+            adjust_l4_checksum_v4_to_v6_incremental(
                 &mut dst[..ipv6_total_len],
                 next_header,
                 l4_off,
@@ -1065,7 +1118,25 @@ pub(crate) fn write_v4_to_v6_into(
             )?;
         }
     } else {
-        recompute_l4_checksum_after_nat64_v4_to_v6(&mut dst[..ipv6_total_len], next_header)?;
+        let udp_no_baseline = next_header == PROTO_UDP
+            && dst.get(l4_off + 6..l4_off + 8) == Some(&[0, 0][..]);
+        if matches!(next_header, PROTO_TCP | PROTO_UDP) && !udp_no_baseline {
+            let mut v6_addrs = [0u8; 32];
+            v6_addrs[..16].copy_from_slice(&src_v6.octets());
+            v6_addrs[16..].copy_from_slice(&dst_v6.octets());
+            let mut v4_addrs = [0u8; 8];
+            v4_addrs[..4].copy_from_slice(&packet[12..16]);
+            v4_addrs[4..].copy_from_slice(&packet[16..20]);
+            adjust_l4_checksum_v4_to_v6_incremental(
+                &mut dst[..ipv6_total_len],
+                next_header,
+                l4_off,
+                &v4_addrs,
+                &v6_addrs,
+            )?;
+        } else {
+            recompute_l4_checksum_after_nat64_v4_to_v6(&mut dst[..ipv6_total_len], next_header)?;
+        }
     }
 
     Some(ipv6_total_len)
@@ -1757,12 +1828,21 @@ fn checksum16_incremental(old_cksum: u16, old_bytes: &[u8], new_bytes: &[u8]) ->
     !(sum as u16)
 }
 
-/// Adjust a translated v6→v4 TCP/UDP FRAGMENT's L4 checksum for the
-/// pseudo-header address change only (#2488). The L4 header at `out[20..]` was
-/// copied verbatim and still holds the IPv6-pseudo-header checksum; fold the
-/// 32-byte v6 address pair out and the 8-byte v4 address pair in. The L4 length
-/// and protocol number are identical across the translation so they cancel.
-fn adjust_l4_checksum_v6_to_v4_fragment(
+/// Adjust a translated v6→v4 TCP/UDP L4 checksum for the pseudo-header address
+/// change only (RFC 1624 incremental). The L4 header at `out[20..]` was copied
+/// verbatim and still holds the IPv6-pseudo-header checksum; fold the 32-byte v6
+/// address pair out and the 8-byte v4 address pair in. The L4 length and
+/// protocol number are identical across the translation so they cancel.
+///
+/// Used for BOTH the #2488 FRAGMENT path (where the transport payload is
+/// incomplete and a full recompute is impossible) AND the #3025 non-fragment
+/// fast path (where the payload IS present but only the pseudo-header changed, so
+/// the O(1) adjustment is byte-identical to a full recompute over the whole
+/// payload — one's-complement addition is exact, RFC 1624 §3). The caller must
+/// only invoke this when the verbatim L4 checksum is a trustworthy baseline: for
+/// non-fragment UDP a zero baseline means "no checksum present" on the v6 input
+/// (illegal, but defended against) and must take the full recompute instead.
+fn adjust_l4_checksum_v6_to_v4_incremental(
     out: &mut [u8],
     protocol: u8,
     v6_src_dst: &[u8; 32],
@@ -1791,12 +1871,21 @@ fn adjust_l4_checksum_v6_to_v4_fragment(
     Some(())
 }
 
-/// Adjust a translated v4→v6 TCP/UDP FRAGMENT's L4 checksum for the
-/// pseudo-header address change only (#2488). The L4 header sits at `dst[l4_off..]`
-/// (past the inserted IPv6 Fragment Header) and still holds the IPv4-pseudo-header
-/// checksum; fold the 8-byte v4 address pair out and the 32-byte v6 address pair
-/// in.
-fn adjust_l4_checksum_v4_to_v6_fragment(
+/// Adjust a translated v4→v6 TCP/UDP L4 checksum for the pseudo-header address
+/// change only (RFC 1624 incremental). The L4 header sits at `dst[l4_off..]`
+/// (past any inserted IPv6 Fragment Header) and still holds the
+/// IPv4-pseudo-header checksum; fold the 8-byte v4 address pair out and the
+/// 32-byte v6 address pair in.
+///
+/// Used for BOTH the #2488 FRAGMENT path AND the #3025 non-fragment fast path
+/// (byte-identical to a full recompute; see the v6→v4 twin). The caller must
+/// only invoke this when the verbatim IPv4 L4 checksum is a trustworthy
+/// baseline: an IPv4 UDP checksum of 0 means "no checksum present" (RFC 768), so
+/// there is no baseline to adjust and — because IPv6 UDP mandates a checksum —
+/// that case MUST take the full recompute to GENERATE one. (A zero IPv4 UDP
+/// checksum was already rejected upstream for a fragment, so on the fragment
+/// path `old` is non-zero here.)
+fn adjust_l4_checksum_v4_to_v6_incremental(
     dst: &mut [u8],
     next_header: u8,
     l4_off: usize,
@@ -1813,8 +1902,9 @@ fn adjust_l4_checksum_v4_to_v6_fragment(
     let old = u16::from_be_bytes([cksum[0], cksum[1]]);
     let updated = checksum16_incremental(old, v4_src_dst, v6_src_dst);
     // UDP over IPv6: a zero checksum is illegal, so a computed 0x0000 is written
-    // as 0xFFFF. (A zero IPv4 UDP checksum was already rejected upstream for a
-    // fragment, so `old` is non-zero here.)
+    // as 0xFFFF. (Both callers guarantee a non-zero `old`: the fragment path
+    // rejects a zero IPv4 UDP checksum upstream, and the #3025 non-fragment path
+    // routes a zero baseline to the full recompute instead.)
     let final_sum = if next_header == PROTO_UDP && updated == 0 {
         0xFFFF
     } else {

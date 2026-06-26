@@ -11,6 +11,7 @@ pub(super) fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {
         zones: vec![ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/0.50".to_string(),
@@ -96,10 +97,12 @@ pub(super) fn native_gre_snapshot(include_neighbor: bool) -> ConfigSnapshot {
             ZoneSnapshot {
                 name: "wan".to_string(),
                 id: TEST_WAN_ZONE_ID,
+                tcp_rst: false,
             },
             ZoneSnapshot {
                 name: "sfmix".to_string(),
                 id: TEST_SFMIX_ZONE_ID,
+                tcp_rst: false,
             },
         ],
         interfaces: vec![
@@ -204,10 +207,12 @@ pub(super) fn wg_outer_mtu_snapshot() -> ConfigSnapshot {
             ZoneSnapshot {
                 name: "wan".to_string(),
                 id: TEST_WAN_ZONE_ID,
+                tcp_rst: false,
             },
             ZoneSnapshot {
                 name: "sfmix".to_string(),
                 id: TEST_SFMIX_ZONE_ID,
+                tcp_rst: false,
             },
         ],
         interfaces: vec![
@@ -293,6 +298,7 @@ pub(super) fn native_gre_pbr_snapshot(include_neighbor: bool) -> ConfigSnapshot 
         ZoneSnapshot {
             name: "lan".to_string(),
             id: TEST_LAN_ZONE_ID,
+            tcp_rst: false,
         },
     );
     snapshot.interfaces.push(InterfaceSnapshot {
@@ -336,6 +342,7 @@ pub(super) fn forwarding_snapshot_with_next_table(include_neighbor: bool) -> Con
         zones: vec![ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
+            tcp_rst: false,
         }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/0.50".to_string(),
@@ -446,10 +453,12 @@ pub(super) fn nat_snapshot() -> ConfigSnapshot {
             ZoneSnapshot {
                 name: "lan".to_string(),
                 id: TEST_LAN_ZONE_ID,
+                tcp_rst: false,
             },
             ZoneSnapshot {
                 name: "wan".to_string(),
                 id: TEST_WAN_ZONE_ID,
+                tcp_rst: false,
             },
         ],
         interfaces: vec![
@@ -616,14 +625,17 @@ pub(super) fn policy_deny_snapshot() -> ConfigSnapshot {
             ZoneSnapshot {
                 name: "lan".to_string(),
                 id: TEST_LAN_ZONE_ID,
+                tcp_rst: false,
             },
             ZoneSnapshot {
                 name: "wan".to_string(),
                 id: TEST_WAN_ZONE_ID,
+                tcp_rst: false,
             },
             ZoneSnapshot {
                 name: "dmz".to_string(),
                 id: TEST_DMZ_ZONE_ID,
+                tcp_rst: false,
             },
         ],
         interfaces: vec![
@@ -699,10 +711,12 @@ pub(super) fn static_nat_snapshot() -> ConfigSnapshot {
             ZoneSnapshot {
                 name: "trust".to_string(),
                 id: TEST_TRUST_ZONE_ID,
+                tcp_rst: false,
             },
             ZoneSnapshot {
                 name: "untrust".to_string(),
                 id: TEST_UNTRUST_ZONE_ID,
+                tcp_rst: false,
             },
         ],
         interfaces: vec![

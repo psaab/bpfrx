@@ -158,6 +158,82 @@ func TestRESTPolicyMatchDstPortFailsClosed(t *testing.T) {
 	}
 }
 
+// TestRESTPolicyMatchPortRange asserts the #3116 contract: an out-of-range
+// (>65535) dst_port/src_port must 400, not silently evaluate a verdict for a
+// port that cannot exist on the wire. A malformed port still 400s (#2934), a
+// valid port and an absent port proceed (HTTP 200) unchanged.
+//
+// FAIL-ON-REVERT: removing the policymatch.ValidatePort guard after
+// queryIntStrict makes dst_port=70000 / src_port=70000 pass through (queryIntStrict
+// only rejects negatives/malformed, not >65535) and the handler returns HTTP 200,
+// flipping the want-400 range cases red.
+func TestRESTPolicyMatchPortRange(t *testing.T) {
+	s := &Server{store: newPolicyMatchStore(t)}
+
+	base := "/api/v1/security/policies/match?from_zone=trust&to_zone=untrust"
+	cases := []struct {
+		name string
+		url  string
+		want int
+	}{
+		{"dst_port out of range", base + "&dst_port=70000", 400},
+		{"dst_port one past top", base + "&dst_port=65536", 400},
+		{"src_port out of range", base + "&src_port=70000", 400},
+		{"src_port malformed", base + "&src_port=abc", 400},
+		{"dst_port valid", base + "&dst_port=443", 200},
+		{"src_port valid high bound", base + "&src_port=65535", 200},
+		{"both ports absent", base, 200},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			s.matchPoliciesHandler(rr, httptest.NewRequest("GET", tc.url, nil))
+			if rr.Code != tc.want {
+				t.Fatalf("%s: status = %d, want %d; body: %s",
+					tc.name, rr.Code, tc.want, rr.Body.String())
+			}
+		})
+	}
+}
+
+// TestRESTPolicyMatchProtocol asserts the #3108 contract for the policy-match
+// simulator: a non-empty but unknown/out-of-range protocol token must 400, not
+// silently become the "any protocol" wildcard (the shared matcher's matchApp
+// short-circuits an unresolvable protocol to match-any, and the fixture policy
+// uses `application any`, so the protocol is the only constraining dimension).
+// A valid name/number and an absent protocol proceed (HTTP 200) unchanged.
+//
+// FAIL-ON-REVERT: removing the policymatch.ValidateProtocol guard in
+// matchPoliciesHandler makes protocol=notaproto / protocol=999 pass through and
+// the handler returns HTTP 200, flipping the want-400 cases red.
+func TestRESTPolicyMatchProtocol(t *testing.T) {
+	s := &Server{store: newPolicyMatchStore(t)}
+
+	base := "/api/v1/security/policies/match?from_zone=trust&to_zone=untrust"
+	cases := []struct {
+		name string
+		url  string
+		want int
+	}{
+		{"unknown name", base + "&protocol=notaproto", 400},
+		{"typo", base + "&protocol=tcpp", 400},
+		{"out of range", base + "&protocol=999", 400},
+		{"valid name", base + "&protocol=tcp", 200},
+		{"valid number", base + "&protocol=6", 200},
+		{"absent wildcard", base, 200},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			s.matchPoliciesHandler(rr, httptest.NewRequest("GET", tc.url, nil))
+			if rr.Code != tc.want {
+				t.Fatalf("%s: status = %d, want %d; body: %s",
+					tc.name, rr.Code, tc.want, rr.Body.String())
+			}
+		})
+	}
+}
+
 // TestRESTProtocolFilterCaseInsensitiveNumeric asserts the #2935 contract:
 // the REST session protocol filter must be case-insensitive AND accept a
 // numeric IP protocol number, mirroring gRPC/CLI. The fixture yields one

@@ -942,10 +942,12 @@ fn build_forwarding_state_keeps_parent_bound_vlan_units_distinct() {
             ZoneSnapshot {
                 name: "wan".into(),
                 id: 11,
+                tcp_rst: false,
             },
             ZoneSnapshot {
                 name: "dmz".into(),
                 id: 12,
+                tcp_rst: false,
             },
         ],
         interfaces: vec![
@@ -1046,14 +1048,17 @@ fn build_forwarding_state_rejects_reserved_zone_ids() {
             ZoneSnapshot {
                 name: "ok".into(),
                 id: 5,
+                tcp_rst: false,
             },
             ZoneSnapshot {
                 name: "reserved-edge".into(),
                 id: crate::policy::ZONE_ID_RESERVED_MIN,
+                tcp_rst: false,
             },
             ZoneSnapshot {
                 name: "global-sentinel".into(),
                 id: crate::policy::JUNOS_GLOBAL_ZONE_ID,
+                tcp_rst: false,
             },
         ],
         ..Default::default()
@@ -1085,6 +1090,7 @@ fn ifindex_to_zone_id_populated_from_snapshot_at_build_time() {
         zones: vec![ZoneSnapshot {
             name: "trust".into(),
             id: 7,
+            tcp_rst: false,
         }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/0".into(),
@@ -1108,6 +1114,7 @@ fn egress_interface_zone_id_set_from_snapshot() {
         zones: vec![ZoneSnapshot {
             name: "wan".into(),
             id: 11,
+            tcp_rst: false,
         }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/1".into(),
@@ -1135,6 +1142,7 @@ fn interface_pointing_at_skipped_zone_fails_closed() {
         zones: vec![ZoneSnapshot {
             name: "reserved".into(),
             id: crate::policy::ZONE_ID_RESERVED_MIN, // dropped at populate_zones
+            tcp_rst: false,
         }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/2".into(),
@@ -1169,6 +1177,7 @@ fn interface_with_unknown_zone_name_fails_closed() {
         zones: vec![ZoneSnapshot {
             name: "trust".into(),
             id: 3,
+            tcp_rst: false,
         }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/3".into(),

@@ -413,6 +413,39 @@ type compileOpts struct {
 	// independently, so it is already inert. Same doctrine as
 	// lenientApplicationSpecs.
 	lenientApplicationSetMembers bool
+	// lenientPolicyMatchApplications (#3144) downgrades the policy
+	// match-application definedness gate
+	// (validatePolicyMatchApplicationsStrict) from a hard compile error to a
+	// cfg.Warnings entry. A security-policy `match application <name>` token
+	// resolving to no predefined junos-* application, no user-defined
+	// application, and no application-set was previously only WARNED at commit
+	// — yet the userspace capability gate resolves the same name set and
+	// REFUSES to arm security policies for an unknown name, silently disarming
+	// the firewall's allow/deny path (a commit/apply split, fail-open). The
+	// strict commit / commit-check path hard-rejects so the typo is
+	// operator-visible; the tolerant load / peer-sync paths warn so an
+	// already-persisted or peer-synced config that an older binary accepted
+	// still BOOTS (#1960) — the dataplane independently refuses such a policy,
+	// so a leniently-loaded bad config is no worse off, now flagged. Same
+	// doctrine as lenientApplicationSetMembers.
+	lenientPolicyMatchApplications bool
+	// lenientPolicyMatchAddressSetMembers (#3149, folds #3147) downgrades the
+	// policy match address-set member / empty-set gate
+	// (validatePolicyMatchAddressSetMembersStrict) from a hard compile error to
+	// a cfg.Warnings entry. A security-policy source/destination address naming
+	// a DEFINED address-book entry whose (recursive) members dangle, or that is
+	// a defined-but-EMPTY address-set / prefix-less address, was previously only
+	// WARNED at commit — yet the runtime address resolver
+	// (resolveUserspaceAddressBookEntry) returns false for the same name and the
+	// userspace gate then REFUSES to arm security policies, silently disarming
+	// the firewall's allow/deny path (a commit/apply split, fail-open; the
+	// address-book sibling of #3144/#3146). The strict commit / commit-check
+	// path hard-rejects so the gap is operator-visible; the tolerant load /
+	// peer-sync paths warn so an already-persisted or peer-synced config that an
+	// older binary accepted still BOOTS (#1960) — the dataplane independently
+	// refuses such a policy, so a leniently-loaded bad config is no worse off,
+	// now flagged. Same doctrine as lenientPolicyMatchApplications.
+	lenientPolicyMatchAddressSetMembers bool
 	// lenientRibGroupRefs (#2226) downgrades the rib-group import-rib
 	// cross-reference gate (validateRibGroupImportRibReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. An `import-rib` naming a rib
@@ -769,6 +802,86 @@ type compileOpts struct {
 	// support for those match types is a deferred follow-up. Same doctrine
 	// as lenientSecureTunnelBindIface.
 	lenientPolicyMatchLeaves bool
+	// lenientPolicyThenPermit (#3114) downgrades the security-policy
+	// unsupported-then-permit-child gate (validatePolicyThenPermitStrict)
+	// from a hard compile error to a cfg.Warnings entry. A security policy
+	// whose `then permit` arm carries a child the compiler does not
+	// enforce — e.g. `application-services` (UTM/IDP/AppFW/SSL-proxy),
+	// `firewall-authentication`, `tunnel ipsec-vpn` — committed cleanly but
+	// had that modifier SILENTLY DROPPED: compilePolicy's `then` switch
+	// `permit` arm sets pol.Action = PolicyPermit and never inspects
+	// t.Children, and the set-schema/schema_walk ignore unknown keywords.
+	// Dropping a then-permit service chain turns a permit-only-with-
+	// inspection rule into an UNCONDITIONAL permit — a fail-OPEN. The strict
+	// commit / commit-check path hard-rejects so the misconfiguration is
+	// operator-visible (naming the policy scope, the policy, and the
+	// unsupported child); the tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config an older binary
+	// silently accepted still BOOTS (#1960 fail-closed-on-load class) — the
+	// child stays dropped (the pre-existing behaviour), now flagged. Full
+	// service-chain support is a deferred follow-up. Same doctrine as
+	// lenientPolicyMatchLeaves.
+	lenientPolicyThenPermit bool
+	// lenientPolicyThenReject (#3115) downgrades the security-policy
+	// unsupported-then-reject-child gate (validatePolicyThenRejectStrict)
+	// from a hard compile error to a cfg.Warnings entry. A security policy
+	// whose `then reject` arm carries a child the compiler does not enforce
+	// — a reject `profile <name>` (custom reject response) or a packet-type
+	// reject like `tcp-reset` — committed cleanly but had that modifier
+	// SILENTLY DROPPED: compilePolicy's `then` switch `reject` arm sets
+	// pol.Action = PolicyReject and never inspects t.Children, and the
+	// set-schema/schema_walk ignore unknown keywords. Unlike #3114 this is
+	// not a fail-open (reject still rejects), but the configured custom
+	// reject response is inert — a wire-contract / operator-observability
+	// divergence the operator cannot detect at commit. The strict commit /
+	// commit-check path hard-rejects so it is operator-visible (naming the
+	// policy scope, the policy, and the unsupported child); the tolerant
+	// load / peer-sync paths downgrade to a warning so an already-persisted
+	// or peer-synced config an older binary silently accepted still BOOTS
+	// (#1960 fail-closed-on-load class) — the child stays dropped (the
+	// pre-existing behaviour), now flagged. Reject-profile support is a
+	// deferred follow-up. Same doctrine as lenientPolicyThenPermit.
+	lenientPolicyThenReject bool
+	// lenientPolicyThenDeny (#3141) downgrades the security-policy
+	// unsupported-then-deny-modifier gate (validatePolicyThenDenyStrict)
+	// from a hard compile error to a cfg.Warnings entry. A flat-set
+	// `then deny log session-init` collapses `log session-init` onto the
+	// deny node (Keys=["deny","log","session-init"]) instead of nesting a
+	// sibling `then log` node; compilePolicy's `then` switch `deny` arm used
+	// to read only t.Name() and silently dropped the collapsed modifier, so
+	// deny-with-logging committed but `pol.Log` was never set (a deny-rule
+	// observability / compliance failure). #3141 WIRES the legitimate
+	// log/count modifiers (applyCollapsedDenyModifiers) so deny+log works in
+	// both the flat-collapsed and the separate-node forms; this gate is the
+	// safety net for any REMAINING collapsed deny modifier the compiler
+	// cannot enforce — the strict commit / commit-check path hard-rejects so
+	// it is operator-visible, the tolerant load / peer-sync paths downgrade
+	// to a warning so an already-persisted or peer-synced config an older
+	// binary silently accepted still BOOTS (#1960). Same doctrine as
+	// lenientPolicyThenReject.
+	lenientPolicyThenDeny bool
+	// lenientPolicyMissingMatch (#3044) downgrades the security-policy
+	// required-match gate (validatePolicyRequiredMatchStrict) from a hard
+	// compile error to a cfg.Warnings entry. A security policy whose `match`
+	// clause omits one of the three Junos-mandatory dimensions —
+	// source-address, destination-address, application — or that omits the
+	// `match` block entirely committed cleanly but had the missing dimension
+	// SILENTLY compiled as match-ANY: compilePolicy fills each slice only
+	// when the leaf is present and the userspace dataplane treats an empty
+	// slice as match-any. A partial policy is therefore broader than typed —
+	// `match source-address corp; then permit` permits corp->any:any, and a
+	// match-less policy becomes a zone-pair-wide permit/deny — a fail-OPEN
+	// for permit, an over-broad block for deny. On Junos this cannot commit.
+	// The strict commit / commit-check path hard-rejects so the misconfig is
+	// operator-visible (naming the policy scope, the policy, and every
+	// missing dimension); the tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config an older binary
+	// silently accepted still BOOTS (#1960 fail-closed-on-load class) — the
+	// policy keeps its match-any-for-missing compilation, now flagged. A
+	// missing dimension is distinct from an explicit `any`: the operator
+	// must write `any` for an intentional wildcard (Junos parity). Same
+	// doctrine as lenientPolicyMatchLeaves.
+	lenientPolicyMissingMatch bool
 	// lenientPolicyCommunityRef (#2881) downgrades the policy community
 	// cross-reference gate (validatePolicyCommunityReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. A policy term's
@@ -791,6 +904,22 @@ type compileOpts struct {
 	// community VALUE (e.g. 65000:100), not a list reference, and is not
 	// checked. Same doctrine as lenientRoutingExportRef.
 	lenientPolicyCommunityRef bool
+	// lenientVRRPVirtualAddress (#3013) downgrades the VRRP virtual-address
+	// subnet-containment gate (validateVRRPVirtualAddressSubnet) from a hard
+	// compile error to a cfg.Warnings entry. A VRRP virtual-address that does
+	// not fall within any subnet configured on the same interface unit for the
+	// matching family — e.g. `family inet address 10.0.61.1/24` with
+	// `vrrp-group 1 virtual-address 10.0.99.1/24` — committed cleanly but is a
+	// commit-time configuration error in Junos/vSRX. At runtime the daemon
+	// installs the VIP with no connected route covering it, so return traffic
+	// sourced from the VIP has no on-link subnet association — a silent
+	// blackhole the operator only sees as dropped traffic. The strict commit /
+	// commit-check path hard-rejects so the operator-error is visible (naming
+	// the interface, unit, group, VIP, and family); the tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config an older binary accepted still BOOTS (#1960
+	// fail-closed-on-load class). Same doctrine as lenientBackupRouterDst.
+	lenientVRRPVirtualAddress bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -812,54 +941,61 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 // #1830 (e) — the dataplane no longer caps equal-flow at 32 workers.)
 func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 	return compileConfigWithOpts(tree, compileOpts{
-		sanitizeFreeTextControlChars:       true,
-		lenientVRRPTrackDuplicates:         true,
-		lenientDeviceMap:                   true,
-		lenientPolicyMatchAddress:          true,
-		lenientTCPMSSRange:                 true,
-		lenientEventAttributesMatch:        true,
-		lenientIPsecPolicyProposalRef:      true,
-		lenientIPsecGatewayRefs:            true,
-		lenientIKEPolicyChainRef:           true,
-		lenientLogProfileStreamRef:         true,
-		lenientNATPoolAlarmThreshold:       true,
-		lenientNATHostMask:                 true,
-		lenientUnsupportedInterfaceStanzas: true,
-		lenientRoutingExportRef:            true,
-		lenientFRRAuthValues:               true,
-		lenientRouteFilterMatchTypes:       true,
-		lenientApplicationSpecs:            true,
-		lenientFilterProtocols:             true,
-		lenientFilterActions:               true,
-		lenientNPTv6:                       true,
-		lenientFirewallRefs:                true,
-		lenientFlowServerTemplateRef:       true,
-		lenientSamplingInstanceConflicts:   true,
-		lenientApplicationSetMembers:       true,
-		lenientRibGroupRefs:                true,
-		lenientDHCPStaticBindings:          true,
-		lenientWireguardPeers:              true,
-		lenientPolicyZoneRefs:              true,
-		lenientZoneCount:                   true,
-		lenientZoneInterfaceMembership:     true,
-		lenientDestNATAddresses:            true,
-		lenientRPMSourceAddress:            true,
-		lenientRPMLinkLocalZone:            true,
-		lenientRPMHTTPGetScheme:            true,
-		lenientRPMRoutingInstance:          true,
-		lenientBGPNeighborPeerAS:           true,
-		lenientRouterID:                    true,
-		lenientSNMPTrapGroup:               true,
-		lenientPolicyTerminalAction:        true,
-		lenientPolicyLogAction:             true,
-		lenientScreenProfileRefs:           true,
-		lenientReservedZoneNames:           true,
-		lenientPolicyWildcardZone:          true,
-		lenientNATRuleSetScope:             true,
-		lenientBackupRouterDst:             true,
-		lenientSecureTunnelBindIface:       true,
-		lenientPolicyMatchLeaves:           true,
-		lenientPolicyCommunityRef:          true,
+		sanitizeFreeTextControlChars:        true,
+		lenientVRRPTrackDuplicates:          true,
+		lenientDeviceMap:                    true,
+		lenientPolicyMatchAddress:           true,
+		lenientTCPMSSRange:                  true,
+		lenientEventAttributesMatch:         true,
+		lenientIPsecPolicyProposalRef:       true,
+		lenientIPsecGatewayRefs:             true,
+		lenientIKEPolicyChainRef:            true,
+		lenientLogProfileStreamRef:          true,
+		lenientNATPoolAlarmThreshold:        true,
+		lenientNATHostMask:                  true,
+		lenientUnsupportedInterfaceStanzas:  true,
+		lenientRoutingExportRef:             true,
+		lenientFRRAuthValues:                true,
+		lenientRouteFilterMatchTypes:        true,
+		lenientApplicationSpecs:             true,
+		lenientFilterProtocols:              true,
+		lenientFilterActions:                true,
+		lenientNPTv6:                        true,
+		lenientFirewallRefs:                 true,
+		lenientFlowServerTemplateRef:        true,
+		lenientSamplingInstanceConflicts:    true,
+		lenientApplicationSetMembers:        true,
+		lenientPolicyMatchApplications:      true,
+		lenientPolicyMatchAddressSetMembers: true,
+		lenientRibGroupRefs:                 true,
+		lenientDHCPStaticBindings:           true,
+		lenientWireguardPeers:               true,
+		lenientPolicyZoneRefs:               true,
+		lenientZoneCount:                    true,
+		lenientZoneInterfaceMembership:      true,
+		lenientDestNATAddresses:             true,
+		lenientRPMSourceAddress:             true,
+		lenientRPMLinkLocalZone:             true,
+		lenientRPMHTTPGetScheme:             true,
+		lenientRPMRoutingInstance:           true,
+		lenientBGPNeighborPeerAS:            true,
+		lenientRouterID:                     true,
+		lenientSNMPTrapGroup:                true,
+		lenientPolicyTerminalAction:         true,
+		lenientPolicyLogAction:              true,
+		lenientScreenProfileRefs:            true,
+		lenientReservedZoneNames:            true,
+		lenientPolicyWildcardZone:           true,
+		lenientNATRuleSetScope:              true,
+		lenientBackupRouterDst:              true,
+		lenientSecureTunnelBindIface:        true,
+		lenientPolicyMatchLeaves:            true,
+		lenientPolicyThenPermit:             true,
+		lenientPolicyThenReject:             true,
+		lenientPolicyThenDeny:               true,
+		lenientPolicyMissingMatch:           true,
+		lenientPolicyCommunityRef:           true,
+		lenientVRRPVirtualAddress:           true,
 	})
 }
 
@@ -932,54 +1068,61 @@ func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) {
 // the candidate-commit path — see CompileConfigLenient.
 func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) {
 	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{
-		sanitizeFreeTextControlChars:       true,
-		lenientVRRPTrackDuplicates:         true,
-		lenientDeviceMap:                   true,
-		lenientPolicyMatchAddress:          true,
-		lenientTCPMSSRange:                 true,
-		lenientEventAttributesMatch:        true,
-		lenientIPsecPolicyProposalRef:      true,
-		lenientIPsecGatewayRefs:            true,
-		lenientIKEPolicyChainRef:           true,
-		lenientLogProfileStreamRef:         true,
-		lenientNATPoolAlarmThreshold:       true,
-		lenientNATHostMask:                 true,
-		lenientUnsupportedInterfaceStanzas: true,
-		lenientRoutingExportRef:            true,
-		lenientFRRAuthValues:               true,
-		lenientRouteFilterMatchTypes:       true,
-		lenientApplicationSpecs:            true,
-		lenientFilterProtocols:             true,
-		lenientFilterActions:               true,
-		lenientNPTv6:                       true,
-		lenientFirewallRefs:                true,
-		lenientFlowServerTemplateRef:       true,
-		lenientSamplingInstanceConflicts:   true,
-		lenientApplicationSetMembers:       true,
-		lenientRibGroupRefs:                true,
-		lenientDHCPStaticBindings:          true,
-		lenientWireguardPeers:              true,
-		lenientPolicyZoneRefs:              true,
-		lenientZoneCount:                   true,
-		lenientZoneInterfaceMembership:     true,
-		lenientDestNATAddresses:            true,
-		lenientRPMSourceAddress:            true,
-		lenientRPMLinkLocalZone:            true,
-		lenientRPMHTTPGetScheme:            true,
-		lenientRPMRoutingInstance:          true,
-		lenientBGPNeighborPeerAS:           true,
-		lenientRouterID:                    true,
-		lenientSNMPTrapGroup:               true,
-		lenientPolicyTerminalAction:        true,
-		lenientPolicyLogAction:             true,
-		lenientScreenProfileRefs:           true,
-		lenientReservedZoneNames:           true,
-		lenientPolicyWildcardZone:          true,
-		lenientNATRuleSetScope:             true,
-		lenientBackupRouterDst:             true,
-		lenientSecureTunnelBindIface:       true,
-		lenientPolicyMatchLeaves:           true,
-		lenientPolicyCommunityRef:          true,
+		sanitizeFreeTextControlChars:        true,
+		lenientVRRPTrackDuplicates:          true,
+		lenientDeviceMap:                    true,
+		lenientPolicyMatchAddress:           true,
+		lenientTCPMSSRange:                  true,
+		lenientEventAttributesMatch:         true,
+		lenientIPsecPolicyProposalRef:       true,
+		lenientIPsecGatewayRefs:             true,
+		lenientIKEPolicyChainRef:            true,
+		lenientLogProfileStreamRef:          true,
+		lenientNATPoolAlarmThreshold:        true,
+		lenientNATHostMask:                  true,
+		lenientUnsupportedInterfaceStanzas:  true,
+		lenientRoutingExportRef:             true,
+		lenientFRRAuthValues:                true,
+		lenientRouteFilterMatchTypes:        true,
+		lenientApplicationSpecs:             true,
+		lenientFilterProtocols:              true,
+		lenientFilterActions:                true,
+		lenientNPTv6:                        true,
+		lenientFirewallRefs:                 true,
+		lenientFlowServerTemplateRef:        true,
+		lenientSamplingInstanceConflicts:    true,
+		lenientApplicationSetMembers:        true,
+		lenientPolicyMatchApplications:      true,
+		lenientPolicyMatchAddressSetMembers: true,
+		lenientRibGroupRefs:                 true,
+		lenientDHCPStaticBindings:           true,
+		lenientWireguardPeers:               true,
+		lenientPolicyZoneRefs:               true,
+		lenientZoneCount:                    true,
+		lenientZoneInterfaceMembership:      true,
+		lenientDestNATAddresses:             true,
+		lenientRPMSourceAddress:             true,
+		lenientRPMLinkLocalZone:             true,
+		lenientRPMHTTPGetScheme:             true,
+		lenientRPMRoutingInstance:           true,
+		lenientBGPNeighborPeerAS:            true,
+		lenientRouterID:                     true,
+		lenientSNMPTrapGroup:                true,
+		lenientPolicyTerminalAction:         true,
+		lenientPolicyLogAction:              true,
+		lenientScreenProfileRefs:            true,
+		lenientReservedZoneNames:            true,
+		lenientPolicyWildcardZone:           true,
+		lenientNATRuleSetScope:              true,
+		lenientBackupRouterDst:              true,
+		lenientSecureTunnelBindIface:        true,
+		lenientPolicyMatchLeaves:            true,
+		lenientPolicyThenPermit:             true,
+		lenientPolicyThenReject:             true,
+		lenientPolicyThenDeny:               true,
+		lenientPolicyMissingMatch:           true,
+		lenientPolicyCommunityRef:           true,
+		lenientVRRPVirtualAddress:           true,
 	})
 }
 
@@ -1134,6 +1277,77 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3114: reject a security-policy `then permit <child>` carrying an
+	// unsupported action modifier (application-services / UTM / IDP / AppFW
+	// / SSL-proxy, firewall-authentication, tunnel). compilePolicy's `then`
+	// switch `permit` arm sets pol.Action = PolicyPermit and never inspects
+	// the children, so the modifier is silently dropped — turning a
+	// permit-only-with-inspection rule into an unconditional permit, a
+	// fail-open. Runs on the group-expanded, inactive-pruned tree so an
+	// apply-groups-inherited child is caught and an inactive policy is
+	// ignored. Strict (commit / commit-check): hard-reject naming the
+	// policy scope, the policy, and the unsupported child. Lenient (load /
+	// peer-sync): warn so an already-persisted or peer-synced config still
+	// boots (#1960) — the child stays dropped, now flagged. Full
+	// then-permit service-chain support is a deferred follow-up.
+	policyThenPermitWarnings, err := validatePolicyThenPermitStrict(
+		tree.Children, opts.lenientPolicyThenPermit)
+	if err != nil {
+		return nil, err
+	}
+
+	// #3115: reject any policy whose `then reject` arm carries a child the
+	// compiler does not enforce (a reject `profile <name>` custom response,
+	// or a packet-type reject like `tcp-reset`). compilePolicy's `then`
+	// switch `reject` arm sets pol.Action = PolicyReject and never inspects
+	// the children, so the modifier is silently dropped — the configured
+	// custom reject response is inert and the operator cannot tell from
+	// commit. Sibling of the #3114 then-permit gate above; same group-
+	// expanded / inactive-pruned tree, same strict-with-lenient (#1960)
+	// doctrine. Reject-profile support is a deferred follow-up.
+	policyThenRejectWarnings, err := validatePolicyThenRejectStrict(
+		tree.Children, opts.lenientPolicyThenReject)
+	if err != nil {
+		return nil, err
+	}
+
+	// #3141: a flat-set `then deny log session-init` collapses the
+	// log/count modifier onto the deny node (Keys=["deny","log",
+	// "session-init"]) instead of nesting a sibling `then log` node.
+	// compilePolicy's `then` switch `deny` arm used to read only t.Name()
+	// and silently dropped the collapsed modifier, so deny-with-logging
+	// committed but never logged. #3141 WIRES the legitimate log/count
+	// modifiers (applyCollapsedDenyModifiers); this gate rejects any
+	// REMAINING collapsed deny modifier the compiler cannot enforce.
+	// Sibling of the #3114 then-permit / #3115 then-reject gates above;
+	// same group-expanded / inactive-pruned tree, same strict-with-lenient
+	// (#1960) doctrine.
+	policyThenDenyWarnings, err := validatePolicyThenDenyStrict(
+		tree.Children, opts.lenientPolicyThenDeny)
+	if err != nil {
+		return nil, err
+	}
+
+	// #3044: reject a security policy whose `match` clause omits a required
+	// Junos dimension (source-address, destination-address, application) or
+	// omits the `match` block entirely. compilePolicy fills each match slice
+	// only when the leaf is present, and the userspace dataplane treats an
+	// empty slice as match-ANY, so a partial policy silently widens to
+	// traffic the operator did not intend — a fail-open for permit, an
+	// over-broad block for deny. On Junos such a policy cannot commit. Runs
+	// on the group-expanded, inactive-pruned tree so an apply-groups-
+	// inherited dimension counts and an inactive policy is ignored. Strict
+	// (commit / commit-check): hard-reject naming the policy scope, the
+	// policy, and every missing dimension. Lenient (load / peer-sync): warn
+	// so an already-persisted or peer-synced config still boots (#1960) — the
+	// policy keeps its match-any-for-missing compilation, now flagged. A
+	// missing dimension is distinct from an explicit `any` (Junos parity).
+	policyMissingMatchWarnings, err := validatePolicyRequiredMatchStrict(
+		tree.Children, opts.lenientPolicyMissingMatch)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -1172,6 +1386,10 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, natScopeWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
+	cfg.Warnings = append(cfg.Warnings, policyThenPermitWarnings...)
+	cfg.Warnings = append(cfg.Warnings, policyThenRejectWarnings...)
+	cfg.Warnings = append(cfg.Warnings, policyThenDenyWarnings...)
+	cfg.Warnings = append(cfg.Warnings, policyMissingMatchWarnings...)
 
 	for _, node := range tree.Children {
 		switch node.Name() {
@@ -2047,6 +2265,56 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3144 security-policy match-application definedness gate. A policy
+	// `match application <name>` token resolving to no predefined junos-*
+	// application, no user-defined application, and no application-set was
+	// previously only WARNED at commit — yet the userspace capability gate
+	// (resolveUserspaceApplicationNames) resolves the SAME name set and returns
+	// false for an unknown name, so the dataplane REFUSES to arm security
+	// policies. The operator gets a green commit and a silently DISARMED policy
+	// engine on the firewall's allow/deny path (a commit/apply split,
+	// fail-open). Strict on commit / commit-check (hard reject naming the
+	// policy scope, the policy, and the undefined app); lenient on load /
+	// peer-sync (warn — #1960; the dataplane independently refuses the policy,
+	// so a leniently-loaded bad config is no worse off, now flagged). Resolves
+	// via ResolveApplication / ResolveApplicationSet — the EXACT name set the
+	// runtime gate uses — so commit and runtime cannot diverge. Covers
+	// zone-pair + global policies and the multi-value application list. Runs
+	// AFTER the application-set member gate (#2217) so a dangling member of a
+	// DEFINED set still wins the first-error slot; this gate catches a wholly
+	// undefined top-level reference that #2217's ExpandApplicationSet never
+	// sees.
+	if err := validatePolicyMatchApplicationsStrict(cfg); err != nil {
+		if opts.lenientPolicyMatchApplications {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("policy match application (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3149 (folds #3147): policy match address-set member / empty-set
+	// fail-open gate. A security-policy source/destination address naming a
+	// DEFINED address-book entry whose members dangle, or a defined-but-empty
+	// address-set / prefix-less address, was only WARNED at commit
+	// (compiler_validate_warn.go) — yet the runtime address resolver returns
+	// false for the same name and the userspace gate then REFUSES to arm
+	// security policies, silently disarming the allow/deny path (commit/apply
+	// split, fail-open; address-book sibling of #3144/#3146). Strict on commit /
+	// commit-check (hard reject); lenient on load / peer-sync (warn — #1960; the
+	// dataplane independently refuses such a policy, so a leniently-loaded bad
+	// config is no worse off, now flagged). Runs AFTER the #2008 token gate
+	// (which catches a wholly-undefined token) so a defined-name resolution
+	// failure is this gate's first-error.
+	if err := validatePolicyMatchAddressSetMembersStrict(cfg); err != nil {
+		if opts.lenientPolicyMatchAddressSetMembers {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("policy match address-set members (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2226: rib-group `import-rib <rib>` cross-reference. An import-rib naming
 	// a rib that resolves to no real routing table (a typo, a non-existent
 	// instance, or unparseable garbage) compiled cleanly; the applier mapped
@@ -2199,6 +2467,19 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 	cfg.Warnings = append(cfg.Warnings, brWarnings...)
+
+	// #3013: VRRP virtual-address subnet-containment gate. A virtual-address
+	// must fall within a subnet configured on the same interface unit for the
+	// matching family — otherwise the installed VIP has no connected route and
+	// return traffic from it blackholes. vSRX rejects this at commit; xpf did
+	// not. Strict (commit / commit-check): hard-reject naming the offending
+	// field. Lenient (load / peer-sync): warn so a config committed before this
+	// gate existed still boots (#1960 fail-closed-on-load class).
+	vaWarnings, err := validateVRRPVirtualAddressSubnet(cfg, opts.lenientVRRPVirtualAddress)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Warnings = append(cfg.Warnings, vaWarnings...)
 
 	// #2227 MAJOR-1: port-scan / ip-sweep threshold clamp warning. The AF_XDP
 	// dataplane bounds its per-(zone,source) unique-destination set at

@@ -236,3 +236,86 @@ func TestApplicationSpec_ReferencedBad_LenientWarns(t *testing.T) {
 		t.Fatalf("expected lenient path to record an application-spec downgrade warning, got %v", cfg.Warnings)
 	}
 }
+
+// referencedProtoApp wires the issue's exact #3150 trigger: a policy that
+// matches an application whose `protocol` leaf is the supplied token.
+func referencedProtoApp(proto string) []string {
+	return []string{
+		"set applications application BAD protocol " + proto,
+		"set applications application BAD destination-port 80",
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
+		"set security policies from-zone trust to-zone untrust policy p match source-address any",
+		"set security policies from-zone trust to-zone untrust policy p match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy p match application BAD",
+		"set security policies from-zone trust to-zone untrust policy p then deny",
+	}
+}
+
+// #3150: validateProtocol blanket-accepts ANY "junos-" prefix, so a
+// policy-referenced application with `protocol junos-foobar` committed cleanly
+// while the dataplane resolver (appid.ProtocolNumber, mirrored by
+// filterProtocolResolvable) rejects it — disarming the userspace policy
+// capability gate (a commit-succeeds / apply-fails split). The strict gate must
+// resolve the protocol through the SAME authority the dataplane uses, so an
+// unresolvable junos-* token is rejected at COMMIT.
+//
+// Fail-on-revert: restoring the broad `strings.HasPrefix("junos-")` accept in
+// validateApplicationSpecsStrict makes this commit SUCCEED, turning the test RED.
+func TestApplicationSpec_ReferencedUnknownJunosProtocol_RejectsAtCommit(t *testing.T) {
+	tree := flatTreeFromSets(t, referencedProtoApp("junos-foobar")...)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected commit to reject application BAD with protocol junos-foobar " +
+			"(the dataplane's appid.ProtocolNumber cannot resolve it)")
+	}
+	if !strings.Contains(err.Error(), "BAD") ||
+		!strings.Contains(err.Error(), "junos-foobar") {
+		t.Fatalf("error %q must name application BAD and the bad protocol junos-foobar", err.Error())
+	}
+}
+
+// Non-tautological companion: a RESOLVABLE junos-* alias the catalog actually
+// knows (junos-ping → ICMP) must still commit cleanly, proving the #3150 reject
+// is scoped to genuinely-unresolvable tokens and does not break legitimate
+// junos-* protocol aliases.
+func TestApplicationSpec_ReferencedResolvableJunosProtocol_AcceptsAtCommit(t *testing.T) {
+	for _, proto := range []string{"junos-ping", "junos-tcp-any", "junos-gre"} {
+		tree := flatTreeFromSets(t, referencedProtoApp(proto)...)
+		if _, err := CompileConfig(tree); err != nil {
+			t.Fatalf("expected commit to accept application BAD with resolvable protocol %q: %v", proto, err)
+		}
+	}
+}
+
+// A numeric protocol referenced by a policy must commit (appid.ProtocolNumber
+// resolves any 0..255 numeric, including the deliberate "0" / HOPOPT).
+func TestApplicationSpec_ReferencedNumericProtocol_AcceptsAtCommit(t *testing.T) {
+	for _, proto := range []string{"0", "47", "255"} {
+		tree := flatTreeFromSets(t, referencedProtoApp(proto)...)
+		if _, err := CompileConfig(tree); err != nil {
+			t.Fatalf("expected commit to accept application BAD with numeric protocol %q: %v", proto, err)
+		}
+	}
+}
+
+// No-brick (#1960): a config persisted/synced with a policy-referenced
+// unresolvable junos-* protocol must still LOAD on the tolerant path
+// (CompileConfigLenient) — downgraded to a warning — so an upgraded node does
+// not fail closed on boot.
+func TestApplicationSpec_ReferencedUnknownJunosProtocol_LenientWarns(t *testing.T) {
+	tree := flatTreeFromSets(t, referencedProtoApp("junos-foobar")...)
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient load of a referenced bad-protocol app must not fail: %v", err)
+	}
+	var warned bool
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "application spec") && strings.Contains(w, "junos-foobar") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("expected lenient path to record an application-spec downgrade warning, got %v", cfg.Warnings)
+	}
+}

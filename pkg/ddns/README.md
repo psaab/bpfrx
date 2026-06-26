@@ -191,6 +191,25 @@ no change in those packages:
   state is surfaced as a `show ... dynamic-dns` ALARM and the
   `xpf_dhcp_ddns_degraded` Prometheus gauge so the lost cleanup authority is
   never silent.
+- **Surface A ownership state fails CLOSED too (#2971)** — the Surface A
+  (router/interface-address) `SurfaceAManager` previously BYPASSED the #2650
+  wrapper: `NewSurfaceAManager` called `loadDDNSState` directly and, on any load
+  error, logged a warning and proceeded with the returned EMPTY store — fail
+  OPEN. An empty trusted store made every configured scope look unowned, so the
+  next `Reconcile` re-published EVERY scope (a write storm) — overwriting a
+  peer/manual owner (the lost ownership can no longer veto the re-claim) and
+  forgetting the records it can no longer withdraw. `NewSurfaceAManager` (and the
+  test constructor) now load through the SAME `loadStateOrDegrade` gate: a corrupt
+  / unsupported-version / unreadable file sets `SurfaceAManager.degraded` (+
+  quarantines a corrupt/unsupported file aside), and `Reconcile` then refuses the
+  WHOLE pass (no publish, no withdraw, no `save()` — the bad file is preserved)
+  until the operator resolves it. A MISSING file (first boot) is NOT degraded, so
+  a fresh node — including a STANDALONE (nil-gate) node — still publishes
+  normally; a restart with the bad file quarantined aside re-reads an absent
+  (clean-empty) store and resumes publishing. The degraded state is surfaced as a
+  `show services dynamic-dns` Surface A ALARM (CLI + gRPC) and the
+  `xpf_ddns_surface_a_degraded` Prometheus gauge, and on `SurfaceAStats.Degraded`
+  / `DegradedReason`.
 - **No secret in any error string** (TSIG secret revealed only at construction).
 
 The HA writer gate (`ddnsWriterGateOpen`) stays in `pkg/daemon/daemon_ddns.go`

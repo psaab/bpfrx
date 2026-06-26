@@ -159,7 +159,13 @@ pub(super) fn publish_v4_session(
         created: now_secs,
         last_seen: now_secs,
         timeout: 1800, // default 30min; Go GC is SkipSweep'd, helper owns lifetime (#333)
-        policy_id: 0,
+        // #3056: the admitting policy's ID, stamped on the session at install.
+        // The Go session-row surfaces (`show security flow session`, REST,
+        // gRPC) read this slot as `val.PolicyID` and resolve a policy name from
+        // it; it was hardcoded `0`, which the Go side renders as the FIRST
+        // configured policy (a wrong attribution). `0` stays the value for
+        // non-policy-forwarded sessions (their metadata carries `policy_id: 0`).
+        policy_id: metadata.policy_id,
         ingress_zone: ingress_zone_id,
         egress_zone: egress_zone_id,
         nat_src_ip,
@@ -262,7 +268,9 @@ pub(super) fn publish_v6_session(
         created: now_secs,
         last_seen: now_secs,
         timeout: 1800,
-        policy_id: 0,
+        // #3056: see publish_v4_session — stamp the admitting policy ID so the
+        // IPv6 live-session rows attribute the policy that admitted the flow.
+        policy_id: metadata.policy_id,
         ingress_zone: ingress_zone_id,
         egress_zone: egress_zone_id,
         nat_src_ip,

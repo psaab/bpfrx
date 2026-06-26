@@ -288,6 +288,12 @@ func newCollector(srv *Server) *xpfCollector {
 			"Current number of Surface A DDNS records this node owns in DNS.",
 			nil, nil,
 		),
+		surfaceADDNSDegraded: prometheus.NewDesc(
+			"xpf_ddns_surface_a_degraded",
+			"1 when the Surface A DDNS ownership state is unloadable and the "+
+				"manager is fail-closed (publishing/withdrawals suspended), else 0.",
+			nil, nil,
+		),
 
 		sysCPUUser: prometheus.NewDesc(
 			"xpf_system_cpu_user_percent",

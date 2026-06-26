@@ -273,10 +273,17 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	dstIP := net.ParseIP(dstIPStr)
 	// A malformed dst_port/src_port must not silently become 0 (the "any
 	// port" wildcard) — that yields a misleading PERMIT/DENY verdict in the
-	// simulator (#2934). Fail closed with 400.
+	// simulator (#2934). Fail closed with 400. queryIntStrict rejects
+	// malformed/negative values; policymatch.ValidatePort additionally
+	// rejects an out-of-range port (>65535) that cannot describe a real
+	// packet (#3116). 0/absent stays the unspecified wildcard.
 	dstPort, ok := queryIntStrict(r, "dst_port", 0)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid dst_port: "+r.URL.Query().Get("dst_port"))
+		return
+	}
+	if err := policymatch.ValidatePort(dstPort); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid dst_port: "+err.Error())
 		return
 	}
 	srcPort, ok := queryIntStrict(r, "src_port", 0)
@@ -284,7 +291,21 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid src_port: "+r.URL.Query().Get("src_port"))
 		return
 	}
+	if err := policymatch.ValidatePort(srcPort); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid src_port: "+err.Error())
+		return
+	}
+	// A non-empty but unknown/out-of-range protocol token (e.g. "tcpp", "999")
+	// must NOT silently become "any protocol" — the shared matcher's matchApp
+	// short-circuits to match-any for an empty/unresolvable protocol, yielding a
+	// misleading PERMIT/DENY verdict for a policy using `application any`
+	// (#3108). Reject it with 400. An empty value still means "unspecified"
+	// (match any protocol), unchanged.
 	proto := r.URL.Query().Get("protocol")
+	if err := policymatch.ValidateProtocol(proto); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// #3042: delegate to the single shared simulator so REST agrees with the
 	// runtime evaluator (zone-pair -> global -> default-policy, predefined +

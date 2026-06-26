@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"net"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -165,7 +164,8 @@ func (s *Server) showFirewall(cfg *config.Config, buf *strings.Builder) {
 func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
 	params := strings.TrimPrefix(req.Topic, "test-policy:")
 	var fromZone, toZone, srcIP, dstIP, proto string
-	var dstPort int
+	var srcPort, dstPort int
+	var srcPortErr, portErr, protoErr error
 	for _, kv := range strings.Split(params, ",") {
 		parts := strings.SplitN(kv, "=", 2)
 		if len(parts) != 2 {
@@ -180,10 +180,30 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			srcIP = parts[1]
 		case "dst":
 			dstIP = parts[1]
+		case "srcport":
+			// #3107: a source-port constraint must thread into the shared
+			// matcher's Query.SrcPort term (previously inexpressible from the
+			// CLI `test policy` topic, overmatching source-port-constrained
+			// applications). Validate via the shared helper (#3116) so a
+			// malformed/out-of-range value reports an error instead of
+			// silently coercing to the 0 "any port" wildcard.
+			srcPort, srcPortErr = policymatch.ParsePort(parts[1])
 		case "port":
-			dstPort, _ = strconv.Atoi(parts[1])
+			// #3116: a malformed/out-of-range port must NOT silently coerce to
+			// the 0 "any port" wildcard (the shared matcher gates the port term
+			// on dstPort > 0), which would yield a verdict for a packet that
+			// cannot exist. Route through the shared validator and report the
+			// error the way a bad src/dst is reported below.
+			dstPort, portErr = policymatch.ParsePort(parts[1])
 		case "proto":
+			// #3108: a non-empty but unknown/out-of-range protocol token must
+			// NOT silently coerce to the empty "any protocol" wildcard (the
+			// shared matcher's matchApp short-circuits to match-any for an
+			// unresolvable protocol), which would yield a verdict for traffic
+			// that cannot exist. Validate via the shared helper and report the
+			// error the way a bad port/src is reported below.
 			proto = parts[1]
+			protoErr = policymatch.ValidateProtocol(proto)
 		}
 	}
 	switch {
@@ -191,6 +211,12 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 		buf.WriteString("No active configuration\n")
 	case fromZone == "" || toZone == "":
 		buf.WriteString("Missing from/to zone parameters\n")
+	case srcPortErr != nil:
+		fmt.Fprintf(buf, "invalid source-port: %v\n", srcPortErr)
+	case portErr != nil:
+		fmt.Fprintf(buf, "invalid port: %v\n", portErr)
+	case protoErr != nil:
+		fmt.Fprintf(buf, "%v\n", protoErr)
 	case srcIP != "" && net.ParseIP(srcIP) == nil:
 		// A non-empty but malformed src would otherwise parse to nil and be
 		// treated as a wildcard, yielding a false-positive policy match
@@ -220,6 +246,7 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			SrcIP:       net.ParseIP(srcIP),
 			DstIP:       net.ParseIP(dstIP),
 			Protocol:    proto,
+			SrcPort:     srcPort,
 			DstPort:     dstPort,
 			FeedOverlay: overlay,
 		})
