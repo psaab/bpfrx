@@ -1,3 +1,28 @@
+## 2026-06-26 — #3035 generated SYN-cookie / reject reply classify on logical VLAN ifindex
+
+- **Timestamp**: 2026-06-26
+- **Action**: Route the two remaining generated-reply egress classifications
+  through the `resolve_ingress_logical_ifindex` SSOT, mirroring #3034 (#3026).
+  `cookie_reply.rs::enqueue_syn_cookie_reply` classified the SYN-cookie
+  SYN-ACK / ACK-RST on the physical bind `ifindex`, and
+  `reject_reply.rs::enqueue_reject_reply` (policy/filter `reject` + zone
+  `tcp-rst`) classified the TCP RST / ICMP unreachable on the physical
+  `ingress_ifindex`. On a VLAN sub-interface that applied the parent's (or
+  first sub-interface's) CoS queue / DSCP rewrite / output filter instead of
+  the unit's. Both now resolve `(physical, meta.ingress_vlan_id) -> logical`
+  before `classify_generated_reply`, falling back to the physical index when
+  there is no mapping (untagged ports → byte-identical). The physical index
+  is still used for the reflected-reply build and the XSK transmit. These two
+  pre-date #3034 (#2238) and were out of its scope.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/cookie_reply.rs,
+  userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
+- **Validation**: `cargo build --release` clean. Four new fail-on-revert
+  tests (`syn_cookie_reply_classifies_on_logical_vlan_ifindex_3035`,
+  `reject_reply_classifies_on_logical_vlan_ifindex_3035`, plus two non-VLAN
+  regression tests) pass; reverting the classify to the physical index turns
+  the two VLAN tests RED while the non-VLAN tests stay GREEN.
+
 ## 2026-06-26 — #3031 static-NAT block-to-block (subnet) mappings
 
 - **Timestamp**: 2026-06-26

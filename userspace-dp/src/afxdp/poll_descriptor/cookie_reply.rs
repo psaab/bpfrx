@@ -82,8 +82,22 @@ pub(super) fn enqueue_syn_cookie_reply(
     // a legitimate (rare) choice. Pre-#2238 this enqueued an UNCLASSIFIED
     // TxRequest the drain path honored verbatim — no output filter / CoS /
     // DSCP was applied to the reply.
+    //
+    // #3035: classify on the LOGICAL egress ifindex, NOT the physical bind
+    // `ifindex`. CoS interfaces (forwarding_build/cos.rs) and output filters
+    // (filter/compiler.rs) are keyed by the logical unit ifindex; on a VLAN
+    // subinterface `ifindex` is the physical parent index, so classifying by
+    // it applied the parent's (or first subinterface's) CoS queue / DSCP
+    // rewrite / output filter instead of this unit's. Mirrors the #3026
+    // generated-ICMP-error fix and the filter/CoS sites via the
+    // `resolve_ingress_logical_ifindex` SSOT; the physical `ifindex` is still
+    // used for the XSK transmit (`egress_ifindex`) below. For a non-VLAN port
+    // the logical and physical indexes coincide, so this is a no-op there.
     let now_ns = monotonic_nanos();
-    let verdict = classify_generated_reply(forwarding, ifindex, &bytes, now_ns);
+    let classify_ifindex =
+        resolve_ingress_logical_ifindex(forwarding, ifindex, meta.ingress_vlan_id)
+            .unwrap_or(ifindex);
+    let verdict = classify_generated_reply(forwarding, classify_ifindex, &bytes, now_ns);
     if verdict.drop {
         counters.touched = true;
         if verdict.parse_error {
@@ -299,6 +313,160 @@ mod tests {
         assert_eq!(counters.syn_cookie_output_filter_drops, 1);
         assert_eq!(counters.generated_reply_classify_parse_errors, 0);
         assert!(pipeline.pending_tx_local.is_empty());
+    }
+
+    /// #3035: build a forwarding state where the VLAN unit reth0.80 (logical
+    /// ifindex 202, parent 11, VID 80) carries a TCP-discard output filter and
+    /// the physical parent 11 carries NONE. Used to prove the SYN-cookie reply
+    /// is classified on the LOGICAL unit ifindex, not the physical bind port.
+    fn vlan_drop_tcp_snapshot() -> crate::ConfigSnapshot {
+        crate::ConfigSnapshot {
+            interfaces: vec![crate::InterfaceSnapshot {
+                name: "reth0.80".into(),
+                ifindex: 202,
+                parent_ifindex: 11,
+                vlan_id: 80,
+                hardware_addr: "02:bf:72:00:80:08".into(),
+                filter_output_v4: "drop-tcp".into(),
+                ..Default::default()
+            }],
+            filters: vec![crate::FirewallFilterSnapshot {
+                name: "drop-tcp".into(),
+                family: "inet".into(),
+                terms: vec![crate::FirewallTermSnapshot {
+                    name: "drop-tcp".into(),
+                    action: "discard".into(),
+                    protocols: vec!["tcp".into()],
+                    ..Default::default()
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// #3035 fail-on-revert: a SYN-cookie reply for a SYN arriving on a VLAN
+    /// sub-interface must be classified (output filter / CoS) on the LOGICAL
+    /// unit ifindex, not the physical bind port. The logical unit reth0.80
+    /// (202) carries a TCP-discard output filter; the physical parent 11 does
+    /// not. Driving the real enqueue with the physical bind ifindex 11 must
+    /// resolve the logical unit and drop the reply. If the classify reverts to
+    /// the physical `ifindex`, the parent has no filter and the reply is
+    /// wrongly admitted -> this test goes RED.
+    #[test]
+    fn syn_cookie_reply_classifies_on_logical_vlan_ifindex_3035() {
+        let (frame, mut meta, flow) = tcp_v4_syn_frame();
+        // Inbound SYN arrives on physical parent ifindex 11, tagged VID 80.
+        meta.ingress_ifindex = 11;
+        meta.ingress_vlan_id = 80;
+        let forwarding = build_forwarding_state(&vlan_drop_tcp_snapshot());
+
+        // Fixture sanity + divergence: logical-keyed classify drops (the
+        // unit's drop-tcp filter), physical-parent-keyed classify admits.
+        assert_eq!(
+            resolve_ingress_logical_ifindex(&forwarding, 11, 80),
+            Some(202),
+            "parent 11 / VLAN 80 must resolve to logical ifindex 202"
+        );
+        let now_ns = monotonic_nanos();
+        assert!(
+            classify_generated_reply(&forwarding, 202, &frame, now_ns).drop,
+            "logical-keyed classify must hit the VLAN unit's drop-tcp filter"
+        );
+        assert!(
+            !classify_generated_reply(&forwarding, 11, &frame, now_ns).drop,
+            "physical-parent-keyed classify has no filter and would wrongly admit"
+        );
+
+        // Drive the real enqueue with the PHYSICAL bind ifindex 11.
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+            0,
+        );
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_syn_cookie_reply(
+            &mut pipeline,
+            &forwarding,
+            11, // physical parent bind ifindex
+            &frame,
+            meta,
+            Some(&flow),
+            SynCookieReply::SynAck(SynCookieChallenge {
+                cookie_isn: 0xaabb_ccdd,
+                peer_mss: 1460,
+            }),
+            &mut counters,
+        );
+        assert!(
+            !sent,
+            "SYN-cookie reply on a VLAN unit must be dropped by the unit's output filter"
+        );
+        assert_eq!(counters.syn_cookie_output_filter_drops, 1);
+        assert_eq!(counters.syn_cookie_syn_ack_sent, 0);
+        assert_eq!(counters.generated_reply_classify_parse_errors, 0);
+        assert!(pipeline.pending_tx_local.is_empty());
+    }
+
+    /// #3035 non-VLAN regression: on an untagged interface the logical unit IS
+    /// the bind ifindex (no (parent, vlan) mapping), so `resolve_ingress_-
+    /// logical_ifindex` returns None and the classify falls back to the
+    /// physical ifindex unchanged — behavior is byte-identical to pre-#3035.
+    #[test]
+    fn syn_cookie_reply_non_vlan_classify_unchanged_3035() {
+        let (frame, meta, flow) = tcp_v4_syn_frame(); // ingress_ifindex 5, vlan 0
+        let snapshot = crate::ConfigSnapshot {
+            interfaces: vec![crate::InterfaceSnapshot {
+                name: "ge-0/0/1.0".into(),
+                ifindex: 5,
+                hardware_addr: "02:bf:72:00:00:05".into(),
+                filter_output_v4: "drop-tcp".into(),
+                ..Default::default()
+            }],
+            filters: vec![crate::FirewallFilterSnapshot {
+                name: "drop-tcp".into(),
+                family: "inet".into(),
+                terms: vec![crate::FirewallTermSnapshot {
+                    name: "drop-tcp".into(),
+                    action: "discard".into(),
+                    protocols: vec!["tcp".into()],
+                    ..Default::default()
+                }],
+            }],
+            ..Default::default()
+        };
+        let forwarding = build_forwarding_state(&snapshot);
+        // An untagged unit maps to ITSELF (logical == physical == 5), so the
+        // resolve is a no-op and the classify ifindex is unchanged.
+        assert_eq!(
+            resolve_ingress_logical_ifindex(&forwarding, 5, 0),
+            Some(5),
+            "an untagged port resolves logical == physical; the classify ifindex is unchanged"
+        );
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+            0,
+        );
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_syn_cookie_reply(
+            &mut pipeline,
+            &forwarding,
+            5, // logical == physical for an untagged port
+            &frame,
+            meta,
+            Some(&flow),
+            SynCookieReply::SynAck(SynCookieChallenge {
+                cookie_isn: 0xaabb_ccdd,
+                peer_mss: 1460,
+            }),
+            &mut counters,
+        );
+        assert!(
+            !sent,
+            "untagged interface still applies its own output filter (unchanged)"
+        );
+        assert_eq!(counters.syn_cookie_output_filter_drops, 1);
+        assert_eq!(counters.syn_cookie_syn_ack_sent, 0);
     }
 
     #[test]
