@@ -350,6 +350,9 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 		SrcPort:     srcPort,
 		DstPort:     dstPort,
 		FeedOverlay: c.feedOverlay(),
+		// #3104: skip scheduler-inactive policies like the runtime does, so the
+		// simulator falls through to the next active rule / default-policy.
+		PolicyInactiveFn: c.policyInactiveFn(),
 	})
 	if !res.Matched {
 		fmt.Printf("No matching policy found for %s -> %s (default %s)\n",
