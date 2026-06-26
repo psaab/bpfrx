@@ -156,6 +156,23 @@ sync.
   (`meta.ingress_vlan_present != 0`), not `vlan_id > 0` — 802.1p
   priority-tagged frames carry a real 802.1Q tag with VID 0, so a
   VID-based test would mis-read the IP header at offset 14 (#2145).
+  - **#3064 — L3 fragment screens on the flowless path:**
+    `stage_screen_check` now resolves the ingress zone BEFORE branching on
+    `flow`, and on the flowless branch (`flow == None`) it runs ONLY the
+    L3-header fragment screens — ping-of-death, teardrop, icmp-fragment
+    (`ScreenState::check_fragment_screens_l3`) — against the zone profile.
+    A non-first IP fragment is deliberately flowless (`#2344`:
+    `parse_session_flow_from_bytes` returns `None` so the fragment payload
+    is never parsed as L4 ports); before #3064 it short-circuited to `Pass`,
+    leaving those per-fragment screens DEAD in the live pipeline so hostile
+    Teardrop / Ping-of-Death contributions transited unscreened. The
+    flowless branch extracts a header-only `ScreenPacketInfo` straight from
+    the IP header with a PLACEHOLDER L4 tuple (it never reads ports or does
+    a session lookup), so the #2344 flowless fast path is NOT reintroduced.
+    Flow/session-dependent screens (land, TCP-flag, icmp/udp/syn-flood
+    counters, scan/sweep, SYN-cookie) stay gated on the flow-present path
+    and are unchanged. A truncated/unparseable header fails CLOSED (drop),
+    matching the flow path (`#2146`).
 - `frame/` — packet parsing (L2 / L3 / L4), checksum helpers, TCP MSS
   clamp. `tests.rs` was relocated out of `mod.rs` in #1046 Phase 1.
   `headers.rs` holds the consolidated outer-header serializers (#1440).

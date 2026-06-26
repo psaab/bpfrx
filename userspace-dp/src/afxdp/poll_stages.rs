@@ -299,9 +299,12 @@ pub(super) fn stage_screen_check(
     if !screen.has_profiles() {
         return StageOutcome::Continue(ScreenCheckOutcome::Pass);
     }
-    let Some(flow) = flow else {
-        return StageOutcome::Continue(ScreenCheckOutcome::Pass);
-    };
+    // Zone resolution is flow-INDEPENDENT: it is keyed on the packet's
+    // ingress context (logical ifindex / VLAN / fabric override), not on the
+    // transport flow. Resolving it BEFORE branching on `flow` lets the
+    // flowless non-first-fragment path (#3064) reach the very same zone
+    // screen profile the flow path uses.
+    //
     // #3022: resolve the LOGICAL ingress ifindex before the zone lookup.
     // `ifindex_to_zone_id` is keyed by the logical unit ifindex; the raw
     // physical bind ifindex either misses (no zone on the parent → screen
@@ -346,6 +349,89 @@ pub(super) fn stage_screen_check(
         18
     } else {
         14
+    };
+    // #3064: a non-first IP fragment has no transport flow —
+    // `parse_session_flow_from_bytes` returns `None` for it (#2344, so the
+    // fragment payload is never parsed as L4 ports). Such a fragment used to
+    // return `Pass` here, which made the PER-FRAGMENT L3-header screens
+    // (ping-of-death, teardrop, icmp-fragment) DEAD in the live pipeline —
+    // hostile Teardrop / Ping-of-Death fragment contributions transited
+    // unscreened. Run ONLY the L3-header fragment screens on the flowless
+    // path: extract a header-only `ScreenPacketInfo` straight from the IP
+    // header (placeholder L4 tuple — we never parse the fragment payload, so
+    // the #2344 flowless fast path is NOT reintroduced) and evaluate the
+    // three L3 fragment screens. Flow/session-dependent screens (land,
+    // TCP-flag, flood counters, scan/sweep, SYN-cookie) stay on the
+    // flow-present path below.
+    let Some(flow) = flow else {
+        // Placeholder L4 tuple: the L3 fragment screens (ping-of-death /
+        // teardrop / icmp-fragment) never read src/dst IP or ports — they
+        // operate purely on fragment offset / total/payload length /
+        // protocol. tcp_flags is 0 because a non-first fragment carries no
+        // L4 header. Unspecified addresses keep the drop-event log sane
+        // without re-deriving the L3 addresses (out of scope for #3064).
+        let (placeholder_src, placeholder_dst) = if meta.addr_family == libc::AF_INET6 as u8 {
+            (
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            )
+        } else {
+            (
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            )
+        };
+        let screen_pkt = match extract_screen_info(
+            packet_frame,
+            meta.addr_family,
+            meta.protocol,
+            0,
+            meta.pkt_len,
+            placeholder_src,
+            placeholder_dst,
+            0,
+            0,
+            l3_off,
+        ) {
+            Ok(pkt) => pkt,
+            // FAIL-CLOSED (#2146 parity): a frame whose L3/extension-header
+            // chain cannot be parsed far enough to evaluate the fragment
+            // screens is dropped on the flow path, so drop it here too rather
+            // than admit an unparseable fragment unscreened.
+            Err(err) => {
+                let reason = err.screen_reason();
+                emit_screen_drop_event(
+                    worker_ctx.event_stream,
+                    &screen_parse_error_info_flowless(meta.addr_family),
+                    meta,
+                    zone_id,
+                    reason,
+                    event_now_ns_from_secs(now_secs),
+                );
+                counters.touched = true;
+                counters.screen_drops += 1;
+                return StageOutcome::RecycleAndContinue;
+            }
+        };
+        return match screen.check_fragment_screens_l3(zone_name, &screen_pkt) {
+            ScreenVerdict::Drop(reason) => {
+                emit_screen_drop_event(
+                    worker_ctx.event_stream,
+                    &screen_pkt,
+                    meta,
+                    zone_id,
+                    reason,
+                    event_now_ns_from_secs(now_secs),
+                );
+                counters.touched = true;
+                counters.screen_drops += 1;
+                StageOutcome::RecycleAndContinue
+            }
+            // The L3 fragment screens only ever return Pass or Drop — they
+            // never mint a SYN-cookie challenge/bypass (those are
+            // flow/TCP-only and stay on the flow-present path).
+            _ => StageOutcome::Continue(ScreenCheckOutcome::Pass),
+        };
     };
     let screen_pkt = match extract_screen_info(
         packet_frame,
@@ -1817,6 +1903,283 @@ mod tests {
             matches!(outcome_untagged, StageOutcome::RecycleAndContinue),
             "the untagged reth1.0 unit (logical == physical 24, zone lan) \
              still drops the source-route SYN — non-VLAN behavior unchanged"
+        );
+    }
+
+    /// Build an untagged IPv4 fragment frame (#3064 tests). `frag_off` is
+    /// the raw 16-bit fragment-offset field (top 3 bits flags: 0x2000=MF;
+    /// low 13 bits = offset in 8-byte units). `payload_len` bytes of zeroed
+    /// L4/data follow the fixed 20-byte IPv4 header. IHL is 5 (no options).
+    fn ipv4_fragment_frame(frag_off: u16, protocol: u8, payload_len: usize) -> Vec<u8> {
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x0800,
+        );
+        let l3 = frame.len();
+        frame.push(0x45); // IPv4, IHL 5
+        frame.push(0x00); // DSCP/ECN
+        let total_len = (20 + payload_len) as u16;
+        frame.extend_from_slice(&total_len.to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x01]); // identification
+        frame.extend_from_slice(&frag_off.to_be_bytes()); // flags + frag offset
+        frame.push(64); // TTL
+        frame.push(protocol);
+        frame.extend_from_slice(&[0x00, 0x00]); // header checksum placeholder
+        frame.extend_from_slice(&Ipv4Addr::new(192, 0, 2, 10).octets());
+        frame.extend_from_slice(&Ipv4Addr::new(198, 51, 100, 20).octets());
+        let ip_csum = checksum16(&frame[l3..l3 + 20]);
+        frame[l3 + 10..l3 + 12].copy_from_slice(&ip_csum.to_be_bytes());
+        frame.resize(frame.len() + payload_len, 0x00);
+        frame
+    }
+
+    /// Metadata for the untagged IPv4 fragment frame above: L3 at offset 14,
+    /// ingress on ifindex 24 (zone `lan` in `nat_snapshot`). `tcp_flags` is
+    /// 0 — a non-first fragment carries no L4 header.
+    fn ipv4_fragment_meta(frame: &[u8], protocol: u8) -> UserspaceDpMeta {
+        UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: 24,
+            ingress_vlan_id: 0,
+            ingress_vlan_present: 0,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 34,
+            pkt_len: (frame.len() - 14) as u16,
+            addr_family: libc::AF_INET as u8,
+            protocol,
+            tcp_flags: 0,
+            ..UserspaceDpMeta::default()
+        }
+    }
+
+    /// Screen profile (zone `lan`) arming the L3 fragment screens
+    /// (ping-of-death, teardrop, icmp-fragment) PLUS three flow/L4-only
+    /// screens (land, syn-fin, no-flag). The flow-only screens are armed
+    /// deliberately: on the flowless non-first-fragment path they MUST NOT
+    /// run. In particular `land` would drop the placeholder unspecified
+    /// (src == dst) tuple if the flowless path wrongly invoked the full
+    /// `check_packet_with_zone_id`, so a PASS on a benign fragment proves
+    /// the #2344 flowless fast path is preserved (no transport
+    /// classification, no land/flag screens).
+    fn fragment_screen() -> ScreenState {
+        let mut profiles = FxHashMap::default();
+        profiles.insert(
+            "lan".to_string(),
+            ScreenProfile {
+                ping_death: true,
+                teardrop: true,
+                icmp_fragment: true,
+                land: true,
+                syn_fin: true,
+                no_flag: true,
+                ..ScreenProfile::default()
+            },
+        );
+        let mut screen = ScreenState::new();
+        screen.update_profiles(profiles);
+        screen
+    }
+
+    /// Drive ONE packet through the live `stage_screen_check` against a
+    /// `nat_snapshot` forwarding state (ifindex 24 -> zone `lan`). Returns
+    /// `(dropped, screen_drops)`. The whole worker context is built and torn
+    /// down inside this helper so the #3064 cases below can be independent
+    /// `#[test]` functions (each observable under fail-on-revert).
+    fn run_stage_screen(
+        screen: &mut ScreenState,
+        frame: &[u8],
+        meta: UserspaceDpMeta,
+        flow: Option<&SessionFlow>,
+    ) -> (bool, u64) {
+        let forwarding = build_forwarding_state(&super::super::test_fixtures::nat_snapshot());
+        let ident = BindingIdentity {
+            slot: 0,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("reth1.0"),
+            ifindex: 24,
+        };
+        let binding_lookup = WorkerBindingLookup::default();
+        let mirror_targets = MirrorTargetMap::default();
+        let ha_state = BTreeMap::new();
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+        let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+        let last_resolution = Arc::new(Mutex::new(None));
+        let peer_worker_commands = Vec::new();
+        let dnat_fds = DnatTableFds::default();
+        let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+        let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+            8,
+            DataplaneEventRateLimitConfig {
+                events_per_second: 0,
+                burst: 0,
+            },
+        );
+        let worker_ctx = WorkerContext {
+            ident: &ident,
+            binding_lookup: &binding_lookup,
+            mirror_targets: &mirror_targets,
+            forwarding: &forwarding,
+            ha_state: &ha_state,
+            dynamic_neighbors: &dynamic_neighbors,
+            neighbor_resolver: None,
+            shared_sessions: &shared_sessions,
+            shared_nat_sessions: &shared_nat_sessions,
+            shared_forward_wire_sessions: &shared_forward_wire_sessions,
+            shared_owner_rg_indexes: &shared_owner_rg_indexes,
+            slow_path: None,
+            event_stream: Some(&event_handle),
+            local_tunnel_deliveries: &local_tunnel_deliveries,
+            recent_exceptions: &recent_exceptions,
+            last_resolution: &last_resolution,
+            peer_worker_commands: &peer_worker_commands,
+            dnat_fds: &dnat_fds,
+            rg_epochs: &rg_epochs,
+            cold_path_sample_mask: 0xff,
+        };
+        let mut counters = BatchCounters::default();
+        let outcome = stage_screen_check(
+            flow,
+            frame,
+            meta,
+            None,
+            TEST_NOW_SECS,
+            screen,
+            &mut counters,
+            &worker_ctx,
+        );
+        (
+            matches!(outcome, StageOutcome::RecycleAndContinue),
+            counters.screen_drops,
+        )
+    }
+
+    const FRAG_PROTO_UDP: u8 = 17;
+
+    /// #3064 fail-on-revert (1/4): a Teardrop non-first fragment (offset 1
+    /// unit = 8 bytes, MF=0, payload 4 < 8) is DROPPED by the LIVE
+    /// `stage_screen_check` even though it is flowless (#2344). Restoring the
+    /// early `Continue(Pass)` on `flow == None` turns this RED.
+    #[test]
+    fn flowless_teardrop_fragment_dropped_3064() {
+        let frame = ipv4_fragment_frame(0x0001, FRAG_PROTO_UDP, 4);
+        let meta = ipv4_fragment_meta(&frame, FRAG_PROTO_UDP);
+        assert!(
+            parse_session_flow_from_bytes(&frame, meta).is_none(),
+            "a non-first fragment must be flowless (#2344) so the live \
+             screen stage sees flow == None"
+        );
+        let mut screen = fragment_screen();
+        let (dropped, drops) = run_stage_screen(&mut screen, &frame, meta, None);
+        assert!(
+            dropped && drops == 1,
+            "teardrop non-first fragment (payload < 8) must be DROPPED by \
+             the flowless screen path (#3064)"
+        );
+    }
+
+    /// #3064 fail-on-revert (2/4): a Ping-of-Death non-first fragment whose
+    /// offset*8 + total length overflows the 65535 reassembly ceiling is
+    /// DROPPED. frag_off 0x1FFE -> offset 8190 units -> 65520 bytes;
+    /// total_len = 20 + 64 = 84 -> 65604 > 65535. Restoring the early
+    /// `Continue(Pass)` on `flow == None` turns this RED.
+    #[test]
+    fn flowless_ping_of_death_fragment_dropped_3064() {
+        let frame = ipv4_fragment_frame(0x1FFE, FRAG_PROTO_UDP, 64);
+        let meta = ipv4_fragment_meta(&frame, FRAG_PROTO_UDP);
+        assert!(parse_session_flow_from_bytes(&frame, meta).is_none());
+        let mut screen = fragment_screen();
+        let (dropped, drops) = run_stage_screen(&mut screen, &frame, meta, None);
+        assert!(
+            dropped && drops == 1,
+            "ping-of-death non-first fragment (offset*8 + total > 65535) \
+             must be DROPPED by the flowless screen path (#3064)"
+        );
+    }
+
+    /// #3064 fail-on-revert (3/4): a benign non-first fragment (offset 10
+    /// units = 80 bytes, 100-byte payload, UDP) PASSES — no L3 fragment
+    /// screen fires AND no flow/port classification happens. The flow-only
+    /// `land`/`syn-fin`/`no-flag` screens are armed but MUST NOT run on the
+    /// flowless path (if the full `check_packet` ran, `land` would drop the
+    /// placeholder src == dst tuple). This proves the #2344 flowless fast
+    /// path is preserved, and it STAYS GREEN under the early-return revert.
+    #[test]
+    fn flowless_benign_fragment_passes_and_skips_classification_3064() {
+        let frame = ipv4_fragment_frame(0x000A, FRAG_PROTO_UDP, 100);
+        let meta = ipv4_fragment_meta(&frame, FRAG_PROTO_UDP);
+        assert!(
+            parse_session_flow_from_bytes(&frame, meta).is_none(),
+            "benign non-first fragment is flowless — proves the #2344 fast \
+             path is intact (no port classification)"
+        );
+        let mut screen = fragment_screen();
+        let (dropped, drops) = run_stage_screen(&mut screen, &frame, meta, None);
+        assert!(
+            !dropped && drops == 0,
+            "benign non-first fragment must PASS — no false positive and no \
+             flow/port classification (land/syn-fin/no-flag must not fire)"
+        );
+    }
+
+    /// #3064 fail-on-revert (4/4) — regression: a non-fragmented packet
+    /// still takes the FLOW path and is screened by the full `check_packet`.
+    /// `land` (a flow-only screen) fires on src == dst; a benign packet
+    /// passes. This proves the flow-present path behaves exactly as before
+    /// the #3064 change, and it STAYS GREEN under the early-return revert.
+    #[test]
+    fn flow_path_nonfragment_still_screens_3064() {
+        let land_frame = tcp_v4_frame(
+            Ipv4Addr::new(203, 0, 113, 7),
+            Ipv4Addr::new(203, 0, 113, 7),
+            40000,
+            443,
+            TCP_FLAG_SYN,
+            1,
+            0,
+        );
+        let land_meta = tcp_v4_meta(&land_frame, TCP_FLAG_SYN);
+        let land_flow = parse_session_flow_from_bytes(&land_frame, land_meta)
+            .expect("non-fragmented TCP yields a session flow (flow path)");
+        let mut screen = fragment_screen();
+        let (dropped, drops) = run_stage_screen(&mut screen, &land_frame, land_meta, Some(&land_flow));
+        assert!(
+            dropped && drops == 1,
+            "regression: a non-fragmented packet still flows through the \
+             flow path and the full check_packet runs land (src == dst)"
+        );
+
+        let benign_frame = tcp_v4_frame(
+            Ipv4Addr::new(203, 0, 113, 7),
+            Ipv4Addr::new(203, 0, 113, 9),
+            40000,
+            443,
+            TCP_FLAG_ACK,
+            1,
+            1,
+        );
+        let benign_meta = tcp_v4_meta(&benign_frame, TCP_FLAG_ACK);
+        let benign_flow = parse_session_flow_from_bytes(&benign_frame, benign_meta)
+            .expect("non-fragmented TCP yields a session flow (flow path)");
+        let mut screen = fragment_screen();
+        let (dropped, drops) =
+            run_stage_screen(&mut screen, &benign_frame, benign_meta, Some(&benign_flow));
+        assert!(
+            !dropped && drops == 0,
+            "regression: a benign non-fragmented packet still passes the \
+             flow path with no false positive"
         );
     }
 }

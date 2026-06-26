@@ -273,6 +273,51 @@ pub(super) fn screen_parse_error_info(
     }
 }
 
+/// #3064: flowless variant of `screen_parse_error_info`. The non-first
+/// fragment path has no `SessionFlow` (it is deliberately left flowless
+/// by #2344 so the fragment payload is never parsed as L4 ports), so
+/// there is no 5-tuple to log. Build the same minimal `ScreenPacketInfo`
+/// for the fail-closed drop event with unspecified addresses/ports —
+/// the verdict is already DROP, so the fragment/TCP fields are never
+/// consulted for a decision; only `addr_family`/`protocol`/`pkt_len`
+/// carry useful context.
+#[inline]
+pub(super) fn screen_parse_error_info_flowless(addr_family: u8) -> ScreenPacketInfo {
+    let (src_ip, dst_ip) = if addr_family == libc::AF_INET6 as u8 {
+        (
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        )
+    } else {
+        (
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        )
+    };
+    ScreenPacketInfo {
+        addr_family,
+        protocol: 0,
+        tcp_flags: 0,
+        src_ip,
+        dst_ip,
+        src_port: 0,
+        dst_port: 0,
+        tcp_seq: 0,
+        tcp_ack: 0,
+        tcp_mss: 0,
+        pkt_len: 0,
+        is_fragment: false,
+        is_first_fragment: false,
+        ip_ihl: 5,
+        ip_frag_off: 0,
+        ip_total_len: 0,
+        ip_payload_len: 0,
+        frag_data_off: 0,
+        saw_ipv4_source_route: false,
+        saw_ipv6_routing_header: false,
+    }
+}
+
 #[inline]
 pub(super) fn emit_filter_log_event(
     event_stream: Option<&EventStreamWorkerHandle>,
