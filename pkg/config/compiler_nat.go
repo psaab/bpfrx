@@ -1211,6 +1211,10 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 						} else {
 							rule.Match.DestinationAddress = nodeVal(m)
 						}
+					case "destination-address-name":
+						// #3229: address-book reference; resolved to prefixes at
+						// snapshot-build time (appendNATDestinationAddressName).
+						rule.Match.DestinationAddressName = nodeVal(m)
 					case "destination-port":
 						if len(m.Children) > 0 {
 							for _, child := range m.Children {
@@ -1352,6 +1356,10 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 						} else {
 							rule.Match.DestinationAddress = nodeVal(m)
 						}
+					case "destination-address-name":
+						// #3229: address-book reference; resolved to prefixes at
+						// snapshot-build time (appendNATDestinationAddressName).
+						rule.Match.DestinationAddressName = nodeVal(m)
 					case "destination-port":
 						rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, parseDNATPortList(m)...)
 						if rule.Match.DestinationPort == 0 && len(rule.Match.DestinationPorts) > 0 {

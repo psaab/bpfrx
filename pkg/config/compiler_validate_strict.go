@@ -3755,8 +3755,9 @@ func validatePrefixLengthRange(rf *RouteFilter) error {
 }
 
 // validateNATSourceAddressNameReferencesStrict hard-rejects a source or
-// destination NAT rule whose `match source-address-name <name>` names an
-// address-book entry not defined under `security address-book` (#2416).
+// destination NAT rule whose `match source-address-name <name>` OR `match
+// destination-address-name <name>` (#3229) names an address-book entry not
+// defined under `security address-book` (#2416).
 //
 // The name is resolved to concrete source prefixes at snapshot-build time
 // (appendNATSourceAddressName). A dangling reference contributes no prefix and
@@ -3790,20 +3791,35 @@ func validateNATSourceAddressNameReferencesStrict(cfg *Config) error {
 			return nil
 		}
 		for _, rule := range rs.Rules {
-			if rule == nil || rule.Match.SourceAddressName == "" {
+			if rule == nil {
 				continue
 			}
-			if defined(rule.Match.SourceAddressName) {
-				continue
+			if rule.Match.SourceAddressName != "" && !defined(rule.Match.SourceAddressName) {
+				return fmt.Errorf(
+					"%s NAT rule-set %q rule %q references undefined "+
+						"source-address-name %q (define `security address-book "+
+						"address %s` / `address-set %s`, or fix the name — the "+
+						"source scope would otherwise be silently lost and the "+
+						"rule would match no traffic)",
+					natType, rs.Name, rule.Name, rule.Match.SourceAddressName,
+					rule.Match.SourceAddressName, rule.Match.SourceAddressName)
 			}
-			return fmt.Errorf(
-				"%s NAT rule-set %q rule %q references undefined "+
-					"source-address-name %q (define `security address-book "+
-					"address %s` / `address-set %s`, or fix the name — the "+
-					"source scope would otherwise be silently lost and the "+
-					"rule would match no traffic)",
-				natType, rs.Name, rule.Name, rule.Match.SourceAddressName,
-				rule.Match.SourceAddressName, rule.Match.SourceAddressName)
+			// #3229: destination-address-name is the destination twin of
+			// source-address-name and resolves through the same address-book
+			// expander (appendNATDestinationAddressName). A dangling reference
+			// installs no destination = the rule matches nothing (fail-closed
+			// but silent); gate it here so the typo is operator-visible at
+			// commit, exactly like the source name above.
+			if rule.Match.DestinationAddressName != "" && !defined(rule.Match.DestinationAddressName) {
+				return fmt.Errorf(
+					"%s NAT rule-set %q rule %q references undefined "+
+						"destination-address-name %q (define `security address-book "+
+						"address %s` / `address-set %s`, or fix the name — the "+
+						"destination scope would otherwise be silently lost and the "+
+						"rule would match no traffic)",
+					natType, rs.Name, rule.Name, rule.Match.DestinationAddressName,
+					rule.Match.DestinationAddressName, rule.Match.DestinationAddressName)
+			}
 		}
 		return nil
 	}

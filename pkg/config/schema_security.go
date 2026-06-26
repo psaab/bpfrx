@@ -143,11 +143,12 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				}},
 				"rule": {desc: "Source NAT rule name", args: 1, placeholder: "<rule-name>", children: map[string]*schemaNode{
 					"match": {desc: "Match criteria", children: map[string]*schemaNode{
-						"source-address":      {desc: "Source address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
-						"source-address-name": {desc: "Source address book entry to match", args: 1, multi: true, placeholder: "<address-name>", children: nil},
-						"destination-address": {desc: "Destination address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
-						"destination-port":    {desc: "Destination port to match", args: 1, multi: true, placeholder: "<port>", children: nil},
-						"application":         {desc: "Application to match", args: 1, multi: true, placeholder: "<application>", children: nil},
+						"source-address":           {desc: "Source address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
+						"source-address-name":      {desc: "Source address book entry to match", args: 1, multi: true, placeholder: "<address-name>", children: nil},
+						"destination-address":      {desc: "Destination address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
+						"destination-address-name": {desc: "Destination address book entry to match", args: 1, multi: true, placeholder: "<address-name>", children: nil},
+						"destination-port":         {desc: "Destination port to match", args: 1, multi: true, placeholder: "<port>", children: nil},
+						"application":              {desc: "Application to match", args: 1, multi: true, placeholder: "<application>", children: nil},
 					}},
 					"then": {desc: "Source NAT action", children: map[string]*schemaNode{
 						"source-nat": {desc: "Source NAT translation", children: map[string]*schemaNode{
@@ -170,12 +171,13 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				}},
 				"rule": {desc: "Destination NAT rule name", args: 1, placeholder: "<rule-name>", children: map[string]*schemaNode{
 					"match": {desc: "Match criteria", children: map[string]*schemaNode{
-						"source-address":      {desc: "Source address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
-						"source-address-name": {desc: "Source address book entry to match", args: 1, multi: true, placeholder: "<address-name>", children: nil},
-						"destination-address": {desc: "Destination address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
-						"destination-port":    {desc: "Destination port or range to match", args: 1, multi: true, placeholder: "<port>", children: nil},
-						"protocol":            {desc: "IP protocol to match", args: 1, multi: true, placeholder: "<protocol>", children: nil},
-						"application":         {desc: "Application to match", args: 1, multi: true, placeholder: "<application>", children: nil},
+						"source-address":           {desc: "Source address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
+						"source-address-name":      {desc: "Source address book entry to match", args: 1, multi: true, placeholder: "<address-name>", children: nil},
+						"destination-address":      {desc: "Destination address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
+						"destination-address-name": {desc: "Destination address book entry to match", args: 1, multi: true, placeholder: "<address-name>", children: nil},
+						"destination-port":         {desc: "Destination port or range to match", args: 1, multi: true, placeholder: "<port>", children: nil},
+						"protocol":                 {desc: "IP protocol to match", args: 1, multi: true, placeholder: "<protocol>", children: nil},
+						"application":              {desc: "Application to match", args: 1, multi: true, placeholder: "<application>", children: nil},
 					}},
 					"then": {desc: "Destination NAT action", children: map[string]*schemaNode{
 						"destination-nat": {desc: "Destination NAT translation", children: map[string]*schemaNode{
