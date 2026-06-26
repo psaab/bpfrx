@@ -121,7 +121,16 @@ pub(super) fn stage_link_layer_classify(
             // neighbor warmer's unicast-only gate.
             if neighbor_ip_is_learnable(arp.sender_ip) {
                 let ifindex = learn_ifindex();
-                worker_ctx.dynamic_neighbors.insert(
+                // #3048: route the data-path learn through insert_if_changed
+                // so a MAC change observed directly from an ARP reply
+                // (e.g. an upstream gateway VRRP failover whose reply
+                // traverses our XSK ingress) advances the neighbor
+                // mac_change_epoch and evicts stale cached dst_macs. A plain
+                // insert would silently overwrite the userspace map with the
+                // new MAC, then SHADOW the kernel-monitor RTM_NEWNEIGH that
+                // follows add_kernel_neighbor (the monitor would see
+                // prior == new and not bump), leaving the flow cache stale.
+                let _ = worker_ctx.dynamic_neighbors.insert_if_changed(
                     (ifindex, arp.sender_ip),
                     NeighborEntry {
                         mac: arp.sender_mac,
@@ -146,9 +155,12 @@ pub(super) fn stage_link_layer_classify(
         && neighbor_ip_is_learnable(na.target_ip)
     {
         let ifindex = learn_ifindex();
-        worker_ctx
+        // #3048: same change-detecting learn for NDP NA — a target-MAC
+        // change observed on the data path must bump mac_change_epoch and
+        // evict stale cached dst_macs (see the ARP-reply arm above).
+        let _ = worker_ctx
             .dynamic_neighbors
-            .insert((ifindex, na.target_ip), NeighborEntry { mac });
+            .insert_if_changed((ifindex, na.target_ip), NeighborEntry { mac });
         add_kernel_neighbor(ifindex, na.target_ip, mac);
     }
     StageOutcome::Continue(())

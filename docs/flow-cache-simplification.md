@@ -374,6 +374,91 @@ Validation:
 - `descriptor_generic_differential` (unmasked) — existing same-family parity
   unaffected.
 
+## Neighbor MAC-change invalidation (#3048)
+
+A cached `RewriteDescriptor` carries the resolved next-hop destination MAC
+(`dst_mac`, set from `decision.resolution.neighbor_mac`). The stamp gates
+(`config_generation`, `fib_generation`, the RG epoch/lease) did NOT cover a
+bare kernel ARP/NDP MAC change with the route unchanged: when an upstream
+gateway fails over (VRRP), a NIC is swapped, or a host's MAC otherwise
+changes, the `dst_mac` in every cached forwarding decision for that next-hop
+went stale and kept rewriting to the old MAC until the session expired or an
+unrelated config/route event bumped `fib_generation` — blackholing
+long-lived flows.
+
+The fix adds a single monotonic `mac_change_epoch` (`AtomicU32`) to
+`ShardedNeighborMap` (`sharded_neighbor.rs`). It is bumped ONLY when a write
+REPLACES an existing neighbor's hwaddr with a DIFFERENT MAC — never on a
+first insert of a new neighbor (no cached flow can reference a MAC that did
+not previously exist) and never on a same-MAC ARP/NDP refresh (the
+overwhelmingly common case; bumping there would flush the whole flow cache on
+every neighbor refresh and collapse the fast-path hit rate). All FOUR
+neighbor write paths are covered:
+
+- the netlink monitor (`insert_if_changed`, the primary RTM_NEWNEIGH path);
+- the data-path ARP-reply / NDP-NA learn (`poll_stages.rs`), now routed
+  through `insert_if_changed` so a MAC change observed directly on the wire
+  bumps the epoch. A plain `insert` there would write the new MAC first and
+  then SHADOW the kernel-monitor event that follows `add_kernel_neighbor`
+  (the monitor would see `prior == new` and not bump), leaving the cache
+  stale;
+- the on-demand resolver (`insert_confirmed_if_unchanged`), which bumps when
+  a confirmed GETNEIGH result replaces an existing MAC (its epoch-reject
+  path writes nothing and so never bumps);
+- the Go control-plane snapshot push (`apply_manager_neighbors` →
+  `ShardedNeighborMap::bulk_replace_neighbors`), the authoritative #1197
+  neighbor mechanism. This path is REACHABLE for the exact #3048 headline
+  case: under a VRRP-failover RTM_NEWNEIGH multicast burst the in-process
+  monitor's bounded rcvbuf can overflow and silently drop events, after
+  which the Go neighbor listener (separate socket + resubscribe + 15s
+  force-probe) pushes the new gateway MAC through this path. A shadowing
+  race exists even without overflow: if the Go push lands first, the monitor
+  then sees `prior == new` and does not bump. Either way the epoch must
+  advance here or the cached `dst_mac` stays stale until session expiry —
+  a blackhole. The bump CANNOT be a naive change-check inside the per-key
+  `insert`: a snapshot push uses `NeighborReplace: true`, which does
+  `remove(old)` BEFORE `insert(new)` under the bulk lock, so the prior MAC
+  is already gone by insert time. `bulk_replace_neighbors` therefore
+  SNAPSHOTS each incoming key's prior MAC UNDER the bulk lock BEFORE the
+  removes, then bumps the epoch exactly once for the whole batch if any
+  incoming MAC differs from its snapshotted prior (a pure same-MAC refresh
+  and brand-new keys with no prior do NOT bump). HA peer-promoted session
+  closes remain out of scope.
+
+`FlowCacheEntry` carries a `neighbor_mac_epoch` stamped at insert
+(`poll_descriptor/mod.rs`, the single insert site, reading the live
+`dynamic_neighbors.mac_change_epoch()`). The worker fast path
+(`poll_descriptor/flow_cache_hit.rs`) re-reads the epoch on every hit; a
+mismatch (`FlowCacheEntry::neighbor_mac_epoch_stale`) evicts the slot and
+falls through to the slow path, which re-resolves the current MAC. This is
+the same lazy epoch-compare pattern as `rg_epochs` — chosen over an explicit
+cross-worker `FlushFlowCaches` so invalidation is lock-free and self-healing
+on the next packet.
+
+**Scope / tradeoff (documented per #3048):** the flow cache is keyed by the
+flow 5-tuple, not by next-hop, so next-hop-scoped invalidation is not
+possible without a second index. `mac_change_epoch` is therefore a SINGLE
+global epoch: any genuine neighbor MAC change lazily invalidates ALL cached
+flows (each re-misses once on its next packet and re-resolves). This is the
+"coarser flush" the issue accepts — acceptable because genuine MAC changes
+are rare (failover / NIC swap) while same-MAC refreshes (which never bump)
+are the steady-state norm.
+
+Validation: `mac_change_epoch_*` (sharded_neighbor_tests.rs) cover
+starts-at-zero, no-bump-on-first-insert, no-bump-on-same-mac-refresh,
+bump-on-change (fail-on-revert for `insert_if_changed`), per-key changes
+accumulating on the single global epoch, the three resolver cases
+(first-insert no-bump, change bumps — fail-on-revert for the resolver —,
+epoch-reject no-bump), and the four bulk-replace cases
+(`mac_change_epoch_bulk_replace_*`: change bumps — fail-on-revert for
+`bulk_replace_neighbors` —, same-MAC refresh no-bump, brand-new-keys
+no-bump, and a single bump for a multi-key batch).
+`cached_descriptor_evicted_only_on_neighbor_mac_change`
+(flow_cache_tests.rs) is the end-to-end fail-on-revert: a descriptor stamped
+at the live epoch survives a same-MAC refresh and is evicted on a MAC change.
+Neutralizing either `mac_change_epoch.fetch_add` turns the change/eviction
+assertions RED.
+
 ## Recommended Next Step
 
 Implement Phase 1 next:
