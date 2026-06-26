@@ -134,6 +134,10 @@ func (c *CLI) showServicesDynamicDNS(detail bool) error {
 		fmt.Println("\n  Runtime counters: unavailable (manager not running)")
 		return nil
 	}
+	if st.Degraded {
+		fmt.Printf("\n  ALARM: Surface A DDNS DEGRADED (fail-closed) — %s\n", st.DegradedReason)
+		fmt.Println("    Publishing and withdrawals are SUSPENDED until the ownership state is resolved.")
+	}
 	fmt.Println("\n  Counters:")
 	fmt.Printf("    Publishes: ok=%d fail=%d\n", st.UpsertOK, st.UpsertFail)
 	fmt.Printf("    Withdraws: ok=%d fail=%d\n", st.DeleteOK, st.DeleteFail)

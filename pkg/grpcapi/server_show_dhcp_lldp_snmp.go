@@ -321,6 +321,10 @@ func (s *Server) showServicesDynamicDNS(cfg *config.Config, buf *strings.Builder
 		buf.WriteString("\n  Runtime counters: unavailable (manager not running)\n")
 		return
 	}
+	if st.Degraded {
+		fmt.Fprintf(buf, "\n  ALARM: Surface A DDNS DEGRADED (fail-closed) — %s\n", st.DegradedReason)
+		buf.WriteString("    Publishing and withdrawals are SUSPENDED until the ownership state is resolved.\n")
+	}
 	buf.WriteString("\n  Counters:\n")
 	fmt.Fprintf(buf, "    Publishes: ok=%d fail=%d\n", st.UpsertOK, st.UpsertFail)
 	fmt.Fprintf(buf, "    Withdraws: ok=%d fail=%d\n", st.DeleteOK, st.DeleteFail)

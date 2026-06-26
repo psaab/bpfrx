@@ -1,4 +1,52 @@
-- **2026-06-25**: #3119 — extend the `teardrop` screen to IPv6 (was IPv4-only; agy-review-066 finding 066-07). `check_teardrop` (userspace-dp/src/screen/stateless.rs) was gated on `AF_INET` only, while the sibling `check_ping_of_death` already screened both families (#2293). So an IPv6 teardrop — a non-first Fragment-extension-header fragment with a tiny data contribution — bypassed the screen entirely. Added an `AF_INET6` arm mirroring ping-of-death's IPv6 sizing: the Fragment header offset is the upper 13 bits (8-byte units), so `ip_frag_off & 0xFFF8` is the byte offset (non-first when > 0), and this fragment's data bytes = `ip_payload_len.saturating_sub(frag_data_off)`; `< 8` (which also captures the saturating-to-0 under-length/zero-payload case, the IPv6 analogue of #3027) drops as `teardrop`. The IPv4 arm is byte-identical. Added 5 Rust tests (tiny v6 frag drops, under-length v6 frag drops, normal v6 frag passes, v6 first-fragment passes, teardrop-disabled profile passes); fail-on-revert verified RED (removing the v6 arm flips the two v6 drop tests to Pass). Gates: cargo build release clean; `cargo test screen` 152 passed; `cargo test teardrop` 9 passed. Files: userspace-dp/src/screen/stateless.rs, userspace-dp/src/screen/tests.rs, userspace-dp/src/FEATURES.md
+## 2026-06-25 — #3108: policy simulators reject invalid protocol tokens
+
+- **Timestamp**: 2026-06-25
+- **Action**: Added shared `policymatch.ValidateProtocol` and wired it across
+  all four simulator surfaces (codex-review-065 finding 065-05). Mirrors the
+  #3116 port-validation pattern. `matchApp` short-circuits to match-any before
+  the protocol is resolved, so a bogus protocol (unknown name / out-of-range
+  number) silently produced a permit/deny verdict instead of an error. Empty
+  protocol = unspecified (match any, unchanged); a non-empty token must resolve
+  via `appid.ProtocolNumber`. REST `matchPoliciesHandler` → 400, gRPC
+  `MatchPolicies` → InvalidArgument, gRPC `showTestPolicy` → "invalid protocol"
+  diagnostic, local CLI `showMatchPolicies`/`testPolicy` + remote `cli`
+  `testPolicy` → command error. Fail-on-revert verified (stub `return nil`
+  flips every want-error case red across 6 surfaces + the unit test).
+- **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/protocol_test.go,
+  pkg/policymatch/README.md, pkg/api/security.go,
+  pkg/api/rest_filter_failclosed_test.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_show_firewall.go,
+  pkg/grpcapi/server_proto_validation_test.go, pkg/cli/cli_show_security.go,
+  pkg/cli/cli_request.go, pkg/cli/policymatch_protocol_test.go,
+  cmd/cli/main.go, cmd/cli/testpolicy_protocol_test.go
+
+- **2026-06-25**: #3115 (codex-review-066 finding 066-03) — reject unsupported security-policy `then reject` children at commit (sibling of #3114). Added `validatePolicyThenRejectStrict` (AST pre-walk in `compileExpanded`) hard-rejecting a policy whose `then reject` arm carries a child the compiler does not enforce — a reject `profile <name>` (custom reject response) or a packet-type reject like `tcp-reset`. The `reject` arm in `compilePolicy`'s `then` switch set `pol.Action = PolicyReject` and never inspected `t.Children`, so the modifier was SILENTLY DROPPED — the configured custom reject response is inert (a wire-contract / operator-observability divergence, not a fail-open: reject still rejects). Checks both AST shapes (flat-set collapses modifier onto `reject` `Keys[1]`; hierarchical nests it as a child). Allowlist `supportedPolicyThenRejectChildren` is EMPTY (compiler enforces no reject child today). A bare `then reject` (no child) still commits. Strict on `CompileConfig`; lenient-warn on both lenient constructors via new `lenientPolicyThenReject` flag (#1960). Covers zone-pair AND global policies. Fail-on-revert verified RED->GREEN. Files: pkg/config/compiler_policy_then.go, pkg/config/compiler_policy_then_3115_test.go (new), pkg/config/compiler.go, pkg/config/README.md
+## 2026-06-25 — #2971: Surface A DDNS corrupt ownership state fail-closed
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed #2971 (codex-review-057 finding 057-03). The Surface A
+  router-record `SurfaceAManager` bypassed the #2650 degraded/quarantine
+  wrapper: `NewSurfaceAManager` called `loadDDNSState` directly and, on a load
+  error, logged a warning and proceeded with the returned EMPTY store — fail
+  OPEN. An empty trusted store made every configured scope look unowned, so the
+  next reconcile re-published EVERY scope (a write storm) — overwriting a
+  peer/manual owner and forgetting what to withdraw. Fix: load through the same
+  `loadStateOrDegrade` gate (added `degraded`/`degradedReason` to
+  `SurfaceAManager` + `SurfaceAStats`); `Reconcile` now fails CLOSED while
+  degraded (no publish/withdraw/save, error returned). A MISSING file (first
+  boot, incl. standalone nil-gate) stays non-degraded and publishes normally.
+  Surfaced as a CLI + gRPC `show services dynamic-dns` ALARM and a new
+  `xpf_ddns_surface_a_degraded` Prometheus gauge.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/surface_a_test.go,
+  pkg/cli/cli_show_services.go, pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_system.go,
+  pkg/ddns/README.md
+- **Validation**: go build ./...; go vet ./pkg/ddns/...; go test
+  ./pkg/ddns/... ./pkg/daemon/... ./pkg/api/... ./pkg/cli/... ./pkg/grpcapi/...
+  all green; new TestSurfaceACorruptStateFailsClosed +
+  TestSurfaceAUnsupportedVersionFailsClosed go RED when the constructor is
+  reverted to fail-open (the revert log shows the spurious "published record"
+  write); TestSurfaceAAbsentStateFirstBootStandaloneWrites stays green on revert.
 - **2026-06-25**: #3114 — reject unsupported security-policy `then permit` children at commit (fail-closed). Added `validatePolicyThenPermitStrict` (AST pre-walk in `compileExpanded`, sibling of #3113) hard-rejecting a policy whose `then permit` arm carries a child the compiler does not enforce — e.g. `application-services` (UTM/IDP/AppFW/SSL-proxy), `firewall-authentication`, `tunnel ipsec-vpn`. The `permit` arm in `compilePolicy`'s `then` switch set `pol.Action = PolicyPermit` and never inspected the permit node's children/tail, so the modifier was SILENTLY DROPPED, turning a permit-only-with-inspection rule into an unconditional permit (fail-open). Checks both AST shapes (flat-set collapses modifier onto `permit` `Keys[1]`; hierarchical nests it as a child). Allowlist `supportedPolicyThenPermitChildren` is EMPTY (compiler enforces no permit child today). Strict on `CompileConfig`; lenient-warn on both lenient constructors via new `lenientPolicyThenPermit` flag (#1960). Covers zone-pair AND global policies. Files: pkg/config/compiler_policy_then.go (new), pkg/config/compiler_policy_then_3114_test.go (new), pkg/config/compiler.go, pkg/config/README.md
 ## 2026-06-26 — #3091: VLAN-child netdevs collapsed the queue-plan min to 1 worker
 
