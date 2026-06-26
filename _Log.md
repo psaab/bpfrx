@@ -15,6 +15,7 @@
 - **File(s)**: pkg/config/schema_security.go,
   pkg/config/schema_scheduler_name_3117_test.go, docs/config-schema.md, _Log.md
 
+- **2026-06-25**: #3113 — reject unsupported security-policy `match` leaves at commit (fail-closed). Added `validatePolicyMatchLeavesStrict` (AST pre-walk in `compileExpanded`) hard-rejecting a policy whose `match` clause carries a leaf outside the compiler-enforced allowlist (`source-address`, `destination-address`, `source-address-excluded`, `destination-address-excluded`, `application`) — e.g. `dynamic-application`/`url-category`/`source-identity`, which were silently dropped, widening the policy to a broad L3/L4 permit/deny (fail-open). Strict on `CompileConfig`; lenient-warn on both lenient constructors via new `lenientPolicyMatchLeaves` flag (#1960). Covers zone-pair AND global policies. Files: pkg/config/compiler_policy_match.go (new), pkg/config/compiler_policy_match_3113_test.go (new), pkg/config/compiler.go, pkg/config/README.md
 ## 2026-06-25 — #3103: gRPC ShowText `test-policy:` routed through pkg/policymatch
 
 - **Timestamp**: 2026-06-25
