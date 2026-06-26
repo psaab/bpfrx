@@ -1,3 +1,33 @@
+## 2026-06-26 — #3193 persistent-nat SHOW: report the three-way permit mode
+
+- **Timestamp**: 2026-06-26
+- **Action**: Follow-up to #2823. The persistent-NAT SHOW path reported
+  only a binary any-remote-host flag, so `target-host` and
+  `target-host-port` were indistinguishable. Threaded the three-way
+  `PersistentNATPermit` mode through the persistent-NAT status surfaces:
+  (1) `pkg/dataplane` `PersistentNATBinding`/`PersistentNATPoolInfo` now
+  carry `Permit config.PersistentNATPermit` (was `PermitAnyRemoteHost
+  bool`), populated from the pool's enum in `compiler_nat.go` /
+  `session_store.go`; `RenderPersistentDetail` prints `Permit: <mode>`
+  via new `PersistentNATBinding.PermitMode()` (zero value resolves to the
+  target-host-port default). (2) Rust `status.rs` adds
+  `persistent_nat_permit` (string, via new `PersistentNatPermit::as_wire`)
+  to `SourceNatPoolStatus`; the Go wire struct + the source-NAT pool status
+  table (`format/status.go`) gain a `Permit` column. Regenerated the
+  `protocol_wire_v1.json` fixture for the new status field.
+- **File(s)**: pkg/dataplane/persistent_nat.go, pkg/dataplane/compiler_nat.go,
+  pkg/dataplane/session_store.go, pkg/natshow/persistent.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/format/status.go,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat/status.rs,
+  userspace-dp/src/protocol/nat.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/userspace-dataplane-gaps.md, plus Go/Rust tests.
+- **Tests**: Go `TestRenderPersistentDetailPermitModes` (natshow),
+  `TestPersistentNATTable_PermitMode` (dataplane); Rust
+  `pool_status_reports_three_way_persistent_permit_mode`. All proven
+  fail-on-revert RED against the binary-flag behavior.
+
 ## 2026-06-26 — #3175 queue-planner: orphan VLAN child plan-key follows parent's rx_queues
 
 - **Timestamp**: 2026-06-26

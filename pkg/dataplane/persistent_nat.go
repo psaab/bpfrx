@@ -4,18 +4,35 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // PersistentNATBinding holds a NAT port mapping that survives session GC.
 type PersistentNATBinding struct {
-	SrcIP               netip.Addr
-	SrcPort             uint16
-	NatIP               netip.Addr
-	NatPort             uint16
-	PoolName            string
-	LastSeen            time.Time
-	Timeout             time.Duration
-	PermitAnyRemoteHost bool
+	SrcIP    netip.Addr
+	SrcPort  uint16
+	NatIP    netip.Addr
+	NatPort  uint16
+	PoolName string
+	LastSeen time.Time
+	Timeout  time.Duration
+	// Permit is the three-way persistent-NAT remote scope (#2823/#3193):
+	// any-remote-host / target-host / target-host-port. The pre-#2823
+	// binary PermitAnyRemoteHost bool could not distinguish target-host
+	// from target-host-port in the operator SHOW path (#3193).
+	Permit config.PersistentNATPermit
+}
+
+// PermitMode returns the human-readable persistent-NAT permit scope for
+// the SHOW path, resolving the zero value to the target-host-port default
+// (#2823 default / #3193). It renders the actual three-way mode rather
+// than the pre-#3193 binary any-remote-host flag.
+func (b *PersistentNATBinding) PermitMode() string {
+	if b.Permit == "" {
+		return string(config.PersistentNATPermitTargetHostPort)
+	}
+	return string(b.Permit)
 }
 
 type persistentNATKey struct {
@@ -26,8 +43,9 @@ type persistentNATKey struct {
 
 // PersistentNATPoolInfo holds per-pool persistent NAT configuration.
 type PersistentNATPoolInfo struct {
-	Timeout             time.Duration
-	PermitAnyRemoteHost bool
+	Timeout time.Duration
+	// Permit is the three-way persistent-NAT remote scope (#2823/#3193).
+	Permit config.PersistentNATPermit
 }
 
 // PersistentNATTable stores NAT bindings that persist after session close.

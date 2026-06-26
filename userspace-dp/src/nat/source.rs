@@ -143,6 +143,17 @@ impl PersistentNatPermit {
             _ => Self::TargetHostPort,
         }
     }
+
+    /// Junos wire string for the status surface (#3193). The control plane
+    /// renders this verbatim as `Permit:` in `show security nat source`, so
+    /// the operator sees the actual three-way mode rather than a binary flag.
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            Self::AnyRemoteHost => "any-remote-host",
+            Self::TargetHost => "target-host",
+            Self::TargetHostPort => "target-host-port",
+        }
+    }
 }
 
 impl SourceNatFlowKey {
