@@ -44,6 +44,14 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
         let nat = fwd.decision.nat;
         let original_src = fwd.key.src_ip;
         let original_src_port = fwd.key.src_port;
+        // #3112: the forward session key carries the ORIGINAL (pre-NAT)
+        // tuple, so its dst is the public address the client sent to. For
+        // a DNAT/static flow this is the address the ICMP error must
+        // appear to quote (and originate from); for an SNAT-only flow it
+        // equals the embedded dst, making the builder's dst rewrite a
+        // no-op.
+        let original_dst = fwd.key.dst_ip;
+        let original_dst_port = fwd.key.dst_port;
         let resolution = embedded_icmp_return_resolution(
             ctx,
             &fwd.key,
@@ -55,6 +63,8 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
             nat,
             original_src,
             original_src_port,
+            original_dst,
+            original_dst_port,
             embedded_proto: hdr.proto,
             resolution,
             metadata: fwd.metadata,
@@ -94,6 +104,10 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
             nat: sl.decision.nat,
             original_src: emb_src,
             original_src_port: hdr.src_port,
+            // Plain (non-forward-NAT) match: no pre-DNAT public dst to
+            // recover, so the embedded dst stays as-is (#3112 no-op).
+            original_dst: emb_dst,
+            original_dst_port: hdr.dst_port,
             embedded_proto: hdr.proto,
             resolution,
             metadata: sl.metadata,

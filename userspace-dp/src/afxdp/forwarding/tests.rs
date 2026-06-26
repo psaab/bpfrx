@@ -1051,6 +1051,8 @@ fn embedded_icmp_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
         },
         original_src: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
         original_src_port: 33434,
+        original_dst: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+        original_dst_port: 33434,
         embedded_proto: PROTO_UDP,
         resolution: ForwardingResolution {
             disposition: ForwardingDisposition::ForwardCandidate,
@@ -1103,6 +1105,8 @@ fn embedded_icmp_no_route_uses_zone_encoded_fabric_redirect() {
         },
         original_src: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
         original_src_port: 33434,
+        original_dst: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+        original_dst_port: 33434,
         embedded_proto: PROTO_UDP,
         resolution: ForwardingResolution {
             disposition: ForwardingDisposition::NoRoute,
@@ -1155,6 +1159,8 @@ fn embedded_icmp_discard_route_uses_zone_encoded_fabric_redirect() {
         },
         original_src: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
         original_src_port: 33434,
+        original_dst: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+        original_dst_port: 33434,
         embedded_proto: PROTO_UDP,
         resolution: ForwardingResolution {
             disposition: ForwardingDisposition::DiscardRoute,
@@ -1203,6 +1209,8 @@ fn embedded_icmp_from_fabric_does_not_redirect_back_to_fabric() {
         },
         original_src: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
         original_src_port: 33434,
+        original_dst: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+        original_dst_port: 33434,
         embedded_proto: PROTO_UDP,
         resolution: ForwardingResolution {
             disposition: ForwardingDisposition::ForwardCandidate,

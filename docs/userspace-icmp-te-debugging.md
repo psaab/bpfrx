@@ -23,6 +23,37 @@ ICMP Time Exceeded (type 11) from intermediate routers arrives at the firewall's
 5. Recompute all checksums (outer IP, outer ICMP, embedded IP)
 6. Forward the rewritten ICMP error to the original client
 
+### Destination reversal for DNAT / static-NAT (#3112)
+
+Steps 3-4 above describe the SOURCE reversal that un-SNATs outbound flows.
+The symmetric DESTINATION reversal handles INBOUND DNAT/static-NAT'd
+servers. For a flow `client C -> public P` that the firewall DNATs to a
+private server `S`, the ICMP error returns from `S` quoting a packet
+addressed to `S` (and originating, on the outer header, from `S`). The
+client opened its socket to `P`, so it silently discards an error that
+quotes `S` — breaking PMTUD and traceroute to NAT'd servers.
+
+When the matched forward session carries a destination NAT
+(`NatDecision.rewrite_dst.is_some()`), the builders additionally:
+
+- rewrite the **outer source** IP `S -> P` (the public address the client
+  used), so the error appears to originate from `P`;
+- rewrite the **embedded (quoted) destination** IP `S -> P`;
+- rewrite the **embedded transport destination port** to the pre-DNAT
+  public port (TCP/UDP only; ICMP echo carries no destination port);
+- recompute the embedded IP-header checksum (IPv4) and the outer
+  ICMP/ICMPv6 checksum (the ICMPv6 pseudo-header picks up the rewritten
+  outer source automatically).
+
+The pre-DNAT public destination + port are recovered from the forward
+session key (`fwd.key.dst_ip` / `fwd.key.dst_port`), which holds the
+ORIGINAL pre-NAT tuple, and are carried on `EmbeddedIcmpMatch` as
+`original_dst` / `original_dst_port`. When the flow has **no** destination
+NAT (SNAT-only or plain transit), these equal the embedded destination and
+the rewrites are gated off — the output is byte-identical to the
+source-only path, so transit/intermediate-router errors keep their real
+outer source.
+
 ### Which ICMP error types are reversed (`is_icmp_error`)
 
 The embedded-NAT reversal only runs for ICMP messages that quote the

@@ -36,6 +36,15 @@ pub(super) struct EmbeddedIcmpMatch {
     pub(super) original_src: IpAddr,
     /// The original source port (if port SNAT was applied).
     pub(super) original_src_port: u16,
+    /// The original (pre-DNAT/static) destination IP the client used —
+    /// i.e. the public address before destination NAT. For a flow with
+    /// NO destination NAT this equals the embedded packet's destination,
+    /// so the destination rewrite in the builders is a no-op and
+    /// SNAT-only / no-NAT behaviour stays byte-identical (#3112).
+    pub(super) original_dst: IpAddr,
+    /// The original (pre-DNAT) destination port. Equals the embedded
+    /// destination port when no port DNAT was applied (no-op rewrite).
+    pub(super) original_dst_port: u16,
     /// The embedded packet's L4 protocol.
     pub(super) embedded_proto: u8,
     /// Forwarding resolution toward the original client.

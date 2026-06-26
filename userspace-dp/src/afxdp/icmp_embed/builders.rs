@@ -27,6 +27,14 @@ pub(in crate::afxdp::icmp_embed) fn build_nat_reversed_icmp_error_v4(
         IpAddr::V4(v4) => v4,
         _ => return None,
     };
+    // #3112: pre-DNAT public destination. Only rewritten when the flow
+    // actually had destination NAT (DNAT/static); otherwise the writes
+    // below are gated off and the output stays byte-identical.
+    let original_dst = match icmp_match.original_dst {
+        IpAddr::V4(v4) => v4,
+        _ => return None,
+    };
+    let had_dst_nat = icmp_match.nat.rewrite_dst.is_some();
 
     #[cfg(feature = "debug-log")]
     let _eth_len = l3;
@@ -57,6 +65,15 @@ pub(in crate::afxdp::icmp_embed) fn build_nat_reversed_icmp_error_v4(
     pkt.get_mut(16..20)?
         .copy_from_slice(&original_client.octets());
 
+    // #3112: when destination NAT was applied, rewrite the outer SOURCE
+    // so the error appears to originate from the public address the
+    // client sent to (mirrors the unconditional outer-dst rewrite above,
+    // but gated on dst-NAT to leave transit/intermediate-router errors
+    // and SNAT-only flows untouched).
+    if had_dst_nat {
+        pkt.get_mut(12..16)?.copy_from_slice(&original_dst.octets());
+    }
+
     let icmp_offset = ihl;
     let emb_ip_offset = icmp_offset + 8;
     if pkt.len() < emb_ip_offset + 20 {
@@ -69,6 +86,14 @@ pub(in crate::afxdp::icmp_embed) fn build_nat_reversed_icmp_error_v4(
 
     pkt.get_mut(emb_ip_offset + 12..emb_ip_offset + 16)?
         .copy_from_slice(&original_client.octets());
+
+    // #3112: un-DNAT the embedded (quoted) destination so the client's
+    // stack can match the error to the session it opened to the public
+    // dst. Done before the embedded IP-header checksum recompute below.
+    if had_dst_nat {
+        pkt.get_mut(emb_ip_offset + 16..emb_ip_offset + 20)?
+            .copy_from_slice(&original_dst.octets());
+    }
 
     {
         pkt.get_mut(emb_ip_offset + 10..emb_ip_offset + 12)?
@@ -115,6 +140,23 @@ pub(in crate::afxdp::icmp_embed) fn build_nat_reversed_icmp_error_v4(
         }
     }
 
+    // #3112: un-DNAT the embedded transport DESTINATION port (TCP/UDP).
+    // Same fragment gate as the source restore above. The embedded L4
+    // checksum is intentionally NOT adjusted here — exactly as the
+    // source-port restore omits it: the quoted L4 header is truncated and
+    // unverifiable, and only the outer ICMP checksum (recomputed below
+    // over the whole payload) covers these bytes. ICMP echo (no dst port)
+    // is excluded — its dst_port is 0 and original_dst_port a no-op.
+    if !emb_non_first_fragment
+        && (icmp_match.nat.rewrite_dst_port.is_some() || icmp_match.nat.rewrite_dst.is_some())
+    {
+        let emb_proto = icmp_match.embedded_proto;
+        if matches!(emb_proto, PROTO_TCP | PROTO_UDP) && pkt.len() >= emb_l4_offset + 4 {
+            pkt.get_mut(emb_l4_offset + 2..emb_l4_offset + 4)?
+                .copy_from_slice(&icmp_match.original_dst_port.to_be_bytes());
+        }
+    }
+
     pkt.get_mut(icmp_offset + 2..icmp_offset + 4)?
         .copy_from_slice(&[0, 0]);
     let icmp_data = pkt.get(icmp_offset..)?;
@@ -152,6 +194,14 @@ pub(in crate::afxdp::icmp_embed) fn build_nat_reversed_icmp_error_v6(
         IpAddr::V6(v6) => v6.octets(),
         _ => return None,
     };
+    // #3112: pre-DNAT public destination (DNAT66/static). Only applied
+    // when the flow had destination NAT; otherwise gated off so the
+    // output is byte-identical to the SNAT-only / no-NAT path.
+    let original_dst_bytes = match icmp_match.original_dst {
+        IpAddr::V6(v6) => v6.octets(),
+        _ => return None,
+    };
+    let had_dst_nat = icmp_match.nat.rewrite_dst.is_some();
 
     let dst_mac = icmp_match.resolution.neighbor_mac?;
     let src_mac = icmp_match.resolution.src_mac?;
@@ -180,6 +230,14 @@ pub(in crate::afxdp::icmp_embed) fn build_nat_reversed_icmp_error_v6(
 
     pkt.get_mut(24..40)?.copy_from_slice(&original_client_bytes);
 
+    // #3112: rewrite the outer SOURCE to the public dst on dst-NAT flows
+    // so the error appears to come from the address the client used. The
+    // ICMPv6 checksum recompute below reads the (rewritten) outer src/dst
+    // for its pseudo-header, so the order is correct.
+    if had_dst_nat {
+        pkt.get_mut(8..24)?.copy_from_slice(&original_dst_bytes);
+    }
+
     // Outer ICMPv6 offset: ext-aware via the shared #1838 helper (the
     // outer NAT match in icmp_embed/mod.rs reads the ICMP type at
     // meta.l4_offset, so an outer-ext error MATCHES — a fixed 40 here
@@ -192,6 +250,15 @@ pub(in crate::afxdp::icmp_embed) fn build_nat_reversed_icmp_error_v6(
     }
     pkt.get_mut(emb_ip_offset + 8..emb_ip_offset + 24)?
         .copy_from_slice(&original_client_bytes);
+
+    // #3112: un-DNAT the embedded (quoted) destination so the client can
+    // match the error to its session. v6 has no IP-header checksum, so no
+    // recompute is needed for this rewrite (the outer ICMPv6 checksum
+    // below covers the whole quoted payload).
+    if had_dst_nat {
+        pkt.get_mut(emb_ip_offset + 24..emb_ip_offset + 40)?
+            .copy_from_slice(&original_dst_bytes);
+    }
 
     // Embedded L4 offset: fragment-aware walk over the quoted packet
     // (plan §5.7). None — e.g. a quoted non-first fragment, which has
@@ -221,6 +288,22 @@ pub(in crate::afxdp::icmp_embed) fn build_nat_reversed_icmp_error_v6(
                         .copy_from_slice(&new_csum.to_be_bytes());
                 }
             }
+        }
+    }
+
+    // #3112: un-DNAT the embedded transport DESTINATION port (TCP/UDP),
+    // mirroring the source-port restore above. Same fragment-aware gate
+    // (skip when the quoted packet has no L4 header). The embedded L4
+    // checksum is left as-is — the outer ICMPv6 checksum recompute below
+    // covers the quoted bytes. ICMPv6 echo carries no dst port.
+    if (icmp_match.nat.rewrite_dst_port.is_some() || icmp_match.nat.rewrite_dst.is_some())
+        && let Some((emb_rel_l4, _)) = emb_l4
+    {
+        let emb_l4_offset = emb_ip_offset.checked_add(emb_rel_l4)?;
+        let emb_proto = icmp_match.embedded_proto;
+        if matches!(emb_proto, PROTO_TCP | PROTO_UDP) && pkt.len() >= emb_l4_offset + 4 {
+            pkt.get_mut(emb_l4_offset + 2..emb_l4_offset + 4)?
+                .copy_from_slice(&icmp_match.original_dst_port.to_be_bytes());
         }
     }
 

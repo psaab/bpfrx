@@ -2673,6 +2673,8 @@ fn icmp_te_nat_reversal_v4_rewrites_outer_dst_and_embedded_src() {
         },
         original_src: IpAddr::V4(client_ip),
         original_src_port: client_port,
+        original_dst: IpAddr::V4(server_ip),
+        original_dst_port: 80,
         embedded_proto: PROTO_TCP,
         resolution: ForwardingResolution {
             disposition: ForwardingDisposition::ForwardCandidate,
@@ -2798,6 +2800,8 @@ fn icmp_te_nat_reversal_v4_with_port_snat() {
         },
         original_src: IpAddr::V4(client_ip),
         original_src_port: client_port,
+        original_dst: IpAddr::V4(server_ip),
+        original_dst_port: 53,
         embedded_proto: PROTO_UDP,
         resolution: ForwardingResolution {
             disposition: ForwardingDisposition::ForwardCandidate,
@@ -2916,6 +2920,8 @@ fn icmp_dest_unreach_nat_reversal_v4() {
         },
         original_src: IpAddr::V4(client_ip),
         original_src_port: 12345,
+        original_dst: IpAddr::V4(server_ip),
+        original_dst_port: 80,
         embedded_proto: PROTO_TCP,
         resolution: ForwardingResolution {
             disposition: ForwardingDisposition::ForwardCandidate,
@@ -2957,6 +2963,244 @@ fn icmp_dest_unreach_nat_reversal_v4() {
     assert_eq!(ip_csum_check, 0);
     let icmp_csum_check = checksum16(&result[34..]);
     assert_eq!(icmp_csum_check, 0);
+}
+
+// === #3112: embedded-DESTINATION reversal for DNAT/static-NAT ===
+
+/// Shared meta for the IPv4 embedded-ICMP builder tests.
+fn icmp_err_meta_v4() -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+/// Resolution + metadata block shared by the v4 #3112 fixtures.
+fn icmp_err_resolution_v4(next_hop: Ipv4Addr) -> ForwardingResolution {
+    ForwardingResolution {
+        disposition: ForwardingDisposition::ForwardCandidate,
+        local_ifindex: 0,
+        egress_ifindex: 5,
+        tx_ifindex: 5,
+        tunnel_endpoint_id: 0,
+        next_hop: Some(IpAddr::V4(next_hop)),
+        neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+        src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+        tx_vlan_id: 0,
+    }
+}
+
+fn icmp_err_metadata() -> SessionMetadata {
+    SessionMetadata {
+        ingress_zone: TEST_UNTRUST_ZONE_ID,
+        egress_zone: TEST_TRUST_ZONE_ID,
+        owner_rg_id: 0,
+        fabric_ingress: false,
+        is_reverse: false,
+        nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
+        policy_id: 0,
+    }
+}
+
+#[test]
+fn icmp_dnat_reversal_v4_rewrites_embedded_dst_and_outer_src() {
+    // Scenario: client C -> public P:80, DNAT to private S:8080. The
+    // server S returns an ICMP error quoting the packet it received
+    // (src=C, dst=S:8080), with outer src=S, outer dst=C. For the client
+    // to match the error to the session it opened to P:80, the embedded
+    // destination must be un-DNAT'd S:8080 -> P:80 and the outer source
+    // rewritten S -> P. (#3112)
+    let client_c = Ipv4Addr::new(10, 0, 61, 102);
+    let public_p = Ipv4Addr::new(203, 0, 113, 9);
+    let private_s = Ipv4Addr::new(10, 0, 90, 50);
+    let client_port: u16 = 51000;
+    let public_port: u16 = 80;
+    let private_port: u16 = 8080;
+
+    // build_icmp_te_frame_v4(outer_src, outer_dst, embedded_dst,
+    //   embedded_src_port, embedded_dst_port, proto): the "snat_ip"
+    // parameter doubles as outer-dst AND embedded-src, which for the DNAT
+    // return is the client.
+    let frame = build_icmp_te_frame_v4(
+        private_s,    // outer src = server that emitted the error
+        client_c,     // outer dst + embedded src = client
+        private_s,    // embedded dst = the DNAT'd private server
+        client_port,  // embedded src port
+        private_port, // embedded dst port (the DNAT'd port)
+        PROTO_TCP,
+    );
+
+    let icmp_match = EmbeddedIcmpMatch {
+        nat: NatDecision {
+            rewrite_dst: Some(IpAddr::V4(private_s)),
+            rewrite_dst_port: Some(private_port),
+            ..NatDecision::default()
+        },
+        original_src: IpAddr::V4(client_c),
+        original_src_port: client_port,
+        original_dst: IpAddr::V4(public_p),
+        original_dst_port: public_port,
+        embedded_proto: PROTO_TCP,
+        resolution: icmp_err_resolution_v4(client_c),
+        metadata: icmp_err_metadata(),
+    };
+
+    let result = build_nat_reversed_icmp_error_v4(&frame, icmp_err_meta_v4(), &icmp_match)
+        .expect("should build NAT-reversed frame");
+
+    // Outer src is now the public address the client used.
+    let outer_src = Ipv4Addr::new(result[26], result[27], result[28], result[29]);
+    assert_eq!(outer_src, public_p, "outer src must be un-DNAT'd to public P");
+    // Outer dst is still the client.
+    let outer_dst = Ipv4Addr::new(result[30], result[31], result[32], result[33]);
+    assert_eq!(outer_dst, client_c, "outer dst stays the client");
+
+    let emb = 42; // eth(14)+outer ip(20)+icmp(8)
+    let emb_src = Ipv4Addr::new(result[emb + 12], result[emb + 13], result[emb + 14], result[emb + 15]);
+    assert_eq!(emb_src, client_c, "embedded src (client) unchanged");
+    let emb_dst = Ipv4Addr::new(result[emb + 16], result[emb + 17], result[emb + 18], result[emb + 19]);
+    assert_eq!(emb_dst, public_p, "embedded dst must be un-DNAT'd to public P");
+
+    // Embedded transport ports: src unchanged (no SNAT), dst un-DNAT'd.
+    let emb_l4 = emb + 20;
+    assert_eq!(
+        u16::from_be_bytes([result[emb_l4], result[emb_l4 + 1]]),
+        client_port,
+        "embedded src port unchanged"
+    );
+    assert_eq!(
+        u16::from_be_bytes([result[emb_l4 + 2], result[emb_l4 + 3]]),
+        public_port,
+        "embedded dst port must be un-DNAT'd to the public port"
+    );
+
+    // All checksums valid.
+    assert_eq!(checksum16(&result[14..34]), 0, "outer IP checksum");
+    assert_eq!(checksum16(&result[34..]), 0, "outer ICMP checksum");
+    assert_eq!(checksum16(&result[emb..emb + 20]), 0, "embedded IP checksum");
+}
+
+#[test]
+fn icmp_static_nat_reversal_v4_rewrites_embedded_dst() {
+    // Static 1:1 inbound: client C -> public P, statically mapped to
+    // private S (IP-only, no port translation). The embedded dst must be
+    // rewritten S -> P; ports are unchanged (original_dst_port == the
+    // embedded dst port, so the gated dst-port write is a no-op).
+    let client_c = Ipv4Addr::new(10, 0, 61, 102);
+    let public_p = Ipv4Addr::new(198, 51, 100, 7);
+    let private_s = Ipv4Addr::new(10, 0, 90, 51);
+    let client_port: u16 = 52000;
+    let server_port: u16 = 443;
+
+    let frame = build_icmp_te_frame_v4(
+        private_s,
+        client_c,
+        private_s,
+        client_port,
+        server_port,
+        PROTO_TCP,
+    );
+
+    let icmp_match = EmbeddedIcmpMatch {
+        nat: NatDecision {
+            // static 1:1 reverses dst only (IP), no port DNAT.
+            rewrite_dst: Some(IpAddr::V4(private_s)),
+            ..NatDecision::default()
+        },
+        original_src: IpAddr::V4(client_c),
+        original_src_port: client_port,
+        original_dst: IpAddr::V4(public_p),
+        original_dst_port: server_port, // unchanged port -> no-op
+        embedded_proto: PROTO_TCP,
+        resolution: icmp_err_resolution_v4(client_c),
+        metadata: icmp_err_metadata(),
+    };
+
+    let result = build_nat_reversed_icmp_error_v4(&frame, icmp_err_meta_v4(), &icmp_match)
+        .expect("should build NAT-reversed frame");
+
+    let outer_src = Ipv4Addr::new(result[26], result[27], result[28], result[29]);
+    assert_eq!(outer_src, public_p, "outer src un-NAT'd to public P");
+    let emb = 42;
+    let emb_dst = Ipv4Addr::new(result[emb + 16], result[emb + 17], result[emb + 18], result[emb + 19]);
+    assert_eq!(emb_dst, public_p, "embedded dst un-NAT'd to public P");
+    let emb_l4 = emb + 20;
+    assert_eq!(
+        u16::from_be_bytes([result[emb_l4 + 2], result[emb_l4 + 3]]),
+        server_port,
+        "embedded dst port unchanged (IP-only static NAT)"
+    );
+    assert_eq!(checksum16(&result[14..34]), 0);
+    assert_eq!(checksum16(&result[34..]), 0);
+    assert_eq!(checksum16(&result[emb..emb + 20]), 0);
+}
+
+#[test]
+fn icmp_snat_only_reversal_v4_leaves_destination_untouched() {
+    // Regression guard (#3112 fail-on-revert pair): with NO destination
+    // NAT (rewrite_dst == None), the destination-side rewrites are gated
+    // OFF — outer src, embedded dst, and embedded dst port stay exactly
+    // as on the wire, even when original_dst is (deliberately) bogus.
+    // This is the byte-identical SNAT-only path.
+    let router = Ipv4Addr::new(10, 0, 0, 1);
+    let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+    let snat_port: u16 = 40000;
+    let client_port: u16 = 12345;
+
+    let frame = build_icmp_te_frame_v4(router, snat_ip, server_ip, snat_port, 80, PROTO_TCP);
+
+    let icmp_match = EmbeddedIcmpMatch {
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V4(snat_ip)),
+            rewrite_src_port: Some(snat_port),
+            // rewrite_dst stays None -> destination rewrite must not fire.
+            ..NatDecision::default()
+        },
+        original_src: IpAddr::V4(client_ip),
+        original_src_port: client_port,
+        // Deliberately bogus values: must be ignored because no dst NAT.
+        original_dst: IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+        original_dst_port: 65000,
+        embedded_proto: PROTO_TCP,
+        resolution: icmp_err_resolution_v4(client_ip),
+        metadata: icmp_err_metadata(),
+    };
+
+    let result = build_nat_reversed_icmp_error_v4(&frame, icmp_err_meta_v4(), &icmp_match)
+        .expect("should build NAT-reversed frame");
+
+    // Outer src stays the router (NOT the bogus original_dst).
+    let outer_src = Ipv4Addr::new(result[26], result[27], result[28], result[29]);
+    assert_eq!(outer_src, router, "SNAT-only: outer src untouched");
+    let emb = 42;
+    let emb_dst = Ipv4Addr::new(result[emb + 16], result[emb + 17], result[emb + 18], result[emb + 19]);
+    assert_eq!(emb_dst, server_ip, "SNAT-only: embedded dst untouched");
+    let emb_l4 = emb + 20;
+    assert_eq!(
+        u16::from_be_bytes([result[emb_l4 + 2], result[emb_l4 + 3]]),
+        80,
+        "SNAT-only: embedded dst port untouched"
+    );
+    // Source-side reversal still applies (unchanged behaviour).
+    let emb_src = Ipv4Addr::new(result[emb + 12], result[emb + 13], result[emb + 14], result[emb + 15]);
+    assert_eq!(emb_src, client_ip, "SNAT-only: source still reversed");
+    assert_eq!(
+        u16::from_be_bytes([result[emb_l4], result[emb_l4 + 1]]),
+        client_port
+    );
+    assert_eq!(checksum16(&result[14..34]), 0);
+    assert_eq!(checksum16(&result[34..]), 0);
+    assert_eq!(checksum16(&result[emb..emb + 20]), 0);
 }
 
 /// Build an IPv6 ICMPv6 Time Exceeded frame with an embedded TCP packet.
@@ -3051,6 +3295,8 @@ fn icmpv6_te_nat_reversal_v6_rewrites_outer_dst_and_embedded_src() {
         },
         original_src: IpAddr::V6(client_ip),
         original_src_port: client_port,
+        original_dst: IpAddr::V6(client_ip),
+        original_dst_port: client_port,
         embedded_proto: PROTO_TCP,
         resolution: ForwardingResolution {
             disposition: ForwardingDisposition::ForwardCandidate,
@@ -3138,6 +3384,107 @@ fn icmpv6_te_nat_reversal_v6_rewrites_outer_dst_and_embedded_src() {
         actual_csum, expected_csum,
         "ICMPv6 checksum should be valid"
     );
+}
+
+#[test]
+fn icmpv6_dnat66_reversal_v6_rewrites_embedded_dst_and_outer_src() {
+    // DNAT66: client C -> public P:443, mapped to internal S:8443. The
+    // returning ICMPv6 error from S quotes (src=C, dst=S:8443) with outer
+    // src=S, outer dst=C. The embedded dst must be un-NAT'd S:8443 ->
+    // P:443 and the outer source rewritten S -> P, with a valid ICMPv6
+    // checksum (pseudo-header over the rewritten outer addresses). (#3112)
+    let client_c: Ipv6Addr = "fd00::102".parse().unwrap();
+    let public_p: Ipv6Addr = "2001:db8:cafe::1".parse().unwrap();
+    let internal_s: Ipv6Addr = "fd00:90::50".parse().unwrap();
+    let client_port: u16 = 51000;
+    let public_port: u16 = 443;
+    let internal_port: u16 = 8443;
+
+    // build_icmpv6_te_frame(outer_src, outer_dst+embedded_src,
+    //   embedded_dst, embedded_src_port, embedded_dst_port, proto).
+    let frame = build_icmpv6_te_frame(
+        internal_s,
+        client_c,
+        internal_s,
+        client_port,
+        internal_port,
+        PROTO_TCP,
+    );
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 54,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        ..UserspaceDpMeta::default()
+    };
+
+    let icmp_match = EmbeddedIcmpMatch {
+        nat: NatDecision {
+            rewrite_dst: Some(IpAddr::V6(internal_s)),
+            rewrite_dst_port: Some(internal_port),
+            ..NatDecision::default()
+        },
+        original_src: IpAddr::V6(client_c),
+        original_src_port: client_port,
+        original_dst: IpAddr::V6(public_p),
+        original_dst_port: public_port,
+        embedded_proto: PROTO_TCP,
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 5,
+            tx_ifindex: 5,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V6(client_c)),
+            neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+            tx_vlan_id: 0,
+        },
+        metadata: icmp_err_metadata(),
+    };
+
+    let result = build_nat_reversed_icmp_error_v6(&frame, meta, &icmp_match)
+        .expect("should build NAT-reversed ICMPv6 frame");
+
+    // Outer src un-NAT'd to public P (bytes 22..38), outer dst stays C.
+    let outer_src = Ipv6Addr::from(<[u8; 16]>::try_from(&result[22..38]).unwrap());
+    assert_eq!(outer_src, public_p, "outer IPv6 src un-NAT'd to public P");
+    let outer_dst = Ipv6Addr::from(<[u8; 16]>::try_from(&result[38..54]).unwrap());
+    assert_eq!(outer_dst, client_c, "outer IPv6 dst stays the client");
+
+    let emb = 62; // eth(14)+outer(40)+icmp6(8)
+    let emb_src = Ipv6Addr::from(<[u8; 16]>::try_from(&result[emb + 8..emb + 24]).unwrap());
+    assert_eq!(emb_src, client_c, "embedded src (client) unchanged");
+    let emb_dst = Ipv6Addr::from(<[u8; 16]>::try_from(&result[emb + 24..emb + 40]).unwrap());
+    assert_eq!(emb_dst, public_p, "embedded dst un-NAT'd to public P");
+
+    let emb_l4 = emb + 40;
+    assert_eq!(
+        u16::from_be_bytes([result[emb_l4], result[emb_l4 + 1]]),
+        client_port,
+        "embedded src port unchanged"
+    );
+    assert_eq!(
+        u16::from_be_bytes([result[emb_l4 + 2], result[emb_l4 + 3]]),
+        public_port,
+        "embedded dst port un-NAT'd to the public port"
+    );
+
+    // ICMPv6 checksum valid over the rewritten outer pseudo-header.
+    let icmp6_start = 54;
+    let mut icmp6_copy = result[icmp6_start..].to_vec();
+    icmp6_copy[2] = 0;
+    icmp6_copy[3] = 0;
+    let expected = {
+        let c = checksum16_ipv6(outer_src, outer_dst, PROTO_ICMPV6, &icmp6_copy);
+        if c == 0 { 0xffff } else { c }
+    };
+    let actual = u16::from_be_bytes([result[icmp6_start + 2], result[icmp6_start + 3]]);
+    assert_eq!(actual, expected, "ICMPv6 checksum valid after dst reversal");
 }
 
 /// Flexible ICMPv6 Time Exceeded fixture for the #1838 §5.7 builder
@@ -3237,6 +3584,8 @@ fn icmpv6_te_match_fixture(
         },
         original_src: IpAddr::V6(client_ip),
         original_src_port: client_port,
+        original_dst: IpAddr::V6(client_ip),
+        original_dst_port: client_port,
         embedded_proto: PROTO_TCP,
         resolution: ForwardingResolution {
             disposition: ForwardingDisposition::ForwardCandidate,
