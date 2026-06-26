@@ -25,7 +25,7 @@ type EventSource interface {
 	Close() error
 }
 
-// rawEvent mirrors the fixed 136-byte RT_FLOW event wire shape produced by the
+// rawEvent mirrors the fixed 144-byte RT_FLOW event wire shape produced by the
 // runtime event sources. The decoder below still reads by offset so that port
 // byte order stays explicit.
 type rawEvent struct {

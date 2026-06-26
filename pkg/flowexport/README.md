@@ -24,7 +24,9 @@ fired and userspace session-close export was silently non-functional
 (per-packet deny/screen/filter RT_FLOW export already worked). The helper
 now emits, on every session close, an ADDITIONAL RT_FLOW SESSION_CLOSE
 frame (`EventFrameTypeSessionClose`, type 14) carrying the canonical
-136-byte `dataplane.Event` payload on the raw channel. The daemon decodes
+144-byte `dataplane.Event` payload on the raw channel (the trailing
+`policy_id` LE u32 at [136:140] carries the admitting policy ID on close,
+[140:144] reserved; #3056). The daemon decodes
 it into a `Type:"SESSION_CLOSE"` `EventRecord` via
 `eventReader.ProcessRawEvent`, which fires the callbacks below. The type-2
 HA delta is unchanged and emitted as a 1:1 pair with the type-14 frame —
@@ -132,7 +134,7 @@ templates previously advertised `ipClassOfService`/SrcTos (5),
 but the SESSION_CLOSE builder (`ExportSessionClose`) never set
 `FlowRecord.{TOS,TCPFlags,Direction,InIf,OutIf}` — and there is nowhere
 to set them from. The dataplane→Go SESSION_CLOSE RT_FLOW frame is a fixed
-136-byte wire shape (`pkg/logging/ringbuf.go`) that carries no DSCP/TOS,
+144-byte wire shape (`pkg/logging/ringbuf.go`) that carries no DSCP/TOS,
 no observed TCP flags, no per-flow direction and no egress ifindex, and
 the Rust encoder hardcodes the ingress-ifindex slot to 0 on close frames
 (`userspace-dp/.../codec.rs::encode_session_close_rt_flow`). So every one
@@ -146,7 +148,7 @@ and `egressInterface`/OutputSNMP (14) — still have no SESSION_CLOSE wire
 source and stay dropped (their absence is still pinned by
 `dropped_fields_test.go`). But the ingress ifindex IS on the wire: #2615
 stamps the closing binding's ifindex into the [128:132] slot of the
-136-byte RT_FLOW close frame (the Rust encoder no longer hardcodes 0).
+144-byte RT_FLOW close frame (the Rust encoder no longer hardcodes 0).
 `pkg/logging/ringbuf.go` already read that slot to resolve a human-facing
 interface NAME; #2749 also retains the raw numeric value
 (`EventRecord.IngressIfindex`), the daemon flow-export callbacks copy it
