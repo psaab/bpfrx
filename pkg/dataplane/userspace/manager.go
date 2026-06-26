@@ -396,6 +396,16 @@ func (m *Manager) policySchedulerActiveStateSnapshot() map[string]bool {
 	return copyPolicySchedulerActiveState(m.policySchedulerActive)
 }
 
+// PolicySchedulerActiveState returns a copy of the daemon-maintained
+// per-scheduler active-state map (scheduler name -> currently active).
+// Read-only show surfaces (#3062 CLI/gRPC policy detail) consult it via
+// PolicyInactive to render runtime scheduler-driven policy state without
+// recomputing wall-clock schedule windows. A nil result means no
+// scheduler state has been published yet.
+func (m *Manager) PolicySchedulerActiveState() map[string]bool {
+	return m.policySchedulerActiveStateSnapshot()
+}
+
 // SetPolicySchedulerActiveState seeds the active-state map used by the next
 // full snapshot build. The daemon calls this while holding applySem so config
 // commits and scheduler flips cannot publish hybrid policy snapshots.
