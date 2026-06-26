@@ -123,7 +123,11 @@ func (m *Manager) clearLinkWatcherLatch(stop chan struct{}) {
 // subscribes to netlink link updates and pushes trackDown into every
 // instance tracking the affected interface. The tracked-ifname →
 // instance mapping is re-read from the manager under lock on EVERY
-// event — instance churn is never captured stale. Cancellation follows
+// event — instance churn is never captured stale. Each event is fed
+// through applyLinkEvent, which keys on the stable ifindex so a runtime
+// kernel rename (a single RTM_NEWLINK with the same ifindex but a new
+// name) demotes an instance tracking the now-vanished old name (#2944).
+// Cancellation follows
 // the done-channel pattern (pkg/daemon/daemon_flow.go): m.watcherStop
 // is closed from Manager.Stop and the netlink subscription observes the
 // same channel. On subscribe failure (or unexpected subscription close)
@@ -162,8 +166,9 @@ func (m *Manager) runLinkWatcher(stop chan struct{}) {
 			if attrs == nil {
 				continue
 			}
-			up := u.Header.Type != unix.RTM_DELLINK && linkAttrsUp(attrs)
-			m.applyTrackedLinkState(attrs.Name, up)
+			del := u.Header.Type == unix.RTM_DELLINK
+			up := !del && linkAttrsUp(attrs)
+			m.applyLinkEvent(attrs.Index, attrs.Name, del, up)
 		}
 	}
 }
@@ -205,6 +210,64 @@ func (m *Manager) pollTrackedLinks() {
 	}
 }
 
+// applyLinkEvent feeds a single netlink link event into interface tracking,
+// robust to a runtime kernel rename (#2944).
+//
+// The kernel emits a rename (e.g. wan0 -> wan1) as a SINGLE RTM_NEWLINK that
+// carries the SAME ifindex with the NEW name and NO RTM_DELLINK for the old
+// name. The pre-#2944 watcher applied state strictly by the event's name, so
+// an instance tracking the old name never saw the event and kept its last
+// (typically up) trackDown forever — it never demoted even though the
+// configured interface no longer existed.
+//
+// We key rename detection on the stable ifindex via the m.linkNames cache:
+//   - The event's own up/down is authoritative for instances tracking the
+//     event's CURRENT name (the normal up/down/delete path, no extra syscall).
+//   - When this ifindex previously carried a DIFFERENT name, that old name has
+//     been renamed away. We re-evaluate it against the kernel (linkState):
+//     LinkByName fails for a name that no longer exists, so the instance
+//     tracking it demotes. This matches Junos semantics — tracking follows the
+//     configured NAME, and a name that has been renamed away is treated as
+//     down (it does NOT silently follow the ifindex to the new name).
+//
+// The cache is seeded at watcher start by the ListExisting subscribe
+// (netlinkLinkSubscribe), so an interface that has been up since boot — and
+// thus produced no prior event — is already known when its first runtime event
+// (the rename) arrives.
+func (m *Manager) applyLinkEvent(ifindex int, name string, del, up bool) {
+	m.mu.Lock()
+	prev, hadPrev := m.linkNames[ifindex]
+	if del {
+		delete(m.linkNames, ifindex)
+	} else {
+		m.linkNames[ifindex] = name
+	}
+	m.mu.Unlock()
+
+	// Apply the event's operational state to instances tracking the event's
+	// name. A delete is unconditionally down regardless of the carried attrs.
+	if name != "" {
+		m.applyTrackedLinkState(name, up && !del)
+	}
+
+	// Rename / replacement detection: this ifindex used to carry a different
+	// name, which is now gone from it. Settle that old name against current
+	// kernel state so an instance tracking the renamed-away name demotes.
+	if hadPrev && prev != "" && prev != name {
+		m.reevaluateTrackedName(prev)
+	}
+}
+
+// reevaluateTrackedName queries current kernel state for a single interface
+// name and applies it to every instance tracking that name (#2944). Used to
+// settle the OLD name after a rename: linkState (LinkByName) returns an error
+// for a name that no longer resolves to any link, which counts as down — the
+// same convention pollTrackedLinks uses.
+func (m *Manager) reevaluateTrackedName(name string) {
+	up, err := m.linkState(name)
+	m.applyTrackedLinkState(name, err == nil && up)
+}
+
 // applyTrackedLinkState updates trackDown on every instance tracking
 // ifName. Takes only the manager read lock; setTrackDown takes the
 // per-instance lock (no reverse ordering exists — instances never take
@@ -236,6 +299,21 @@ func (m *Manager) seedTrackState(vi *vrrpInstance, trackIface string) {
 		return
 	}
 	vi.setTrackDown(!up)
+}
+
+// netlinkLinkSubscribe is the production subscribeLinks seam. It subscribes to
+// netlink link updates with ListExisting=true so the kernel replays every
+// current link as an RTM_NEWLINK immediately after subscribe. This seeds the
+// watcher's ifindex->name cache (m.linkNames) from current state, so a
+// runtime rename of an interface that has been up since boot — and thus
+// produced no prior event — is still detected on its first event (#2944).
+// ListExisting only front-loads current state; the watcher's event handling is
+// idempotent, so the replay sets each tracked interface to its current up/down
+// (consistent with seedTrackState) and matches nothing for untracked names.
+func netlinkLinkSubscribe(ch chan<- netlink.LinkUpdate, done <-chan struct{}) error {
+	return netlink.LinkSubscribeWithOptions(ch, done, netlink.LinkSubscribeOptions{
+		ListExisting: true,
+	})
 }
 
 // netlinkLinkState is the production linkState seam: report whether the

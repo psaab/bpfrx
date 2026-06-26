@@ -36,6 +36,86 @@
   userspace-dp/src/server/tests.rs,
   docs/session-sync-architecture.md
 
+## 2026-06-26 — #2870 VRRP AF_PACKET receiver: ALLMULTI instead of PROMISC
+
+- **Timestamp**: 2026-06-26
+- **Action**: `openAfPacketReceiver` (`pkg/vrrp/manager.go`) put the capture
+  interface into full promiscuous mode (`PACKET_MR_PROMISC`), which disables
+  the NIC's hardware unicast filter and copies every frame on the segment to
+  the host CPU — a perf hit on data-bearing RETH VLANs and a tenant-traffic
+  leak to the raw control-plane socket. Replaced with `PACKET_MR_ALLMULTI`
+  (receive-all-multicast) via a new testable helper `buildAfPacketMembership`.
+  VRRP adverts always use a multicast destination MAC (IPv4 224.0.0.18 ->
+  01:00:5e:00:00:12, IPv6 ff02::12 -> 33:33:00:00:00:12), so ALLMULTI delivers
+  every advert PROMISC did while restoring unicast filtering. ALLMULTI is
+  provably non-regressive: on a VLAN sub-interface both flags propagate to the
+  physical parent through the same kernel path (vlan_dev_change_rx_flags ->
+  dev_set_allmulti / dev_set_promiscuity). Specific-group PACKET_MR_MULTICAST
+  was NOT chosen: its dev_mc_add -> dev_mc_sync -> VF rx-mode propagation is
+  unconfirmed on the mlx5 SR-IOV VFs under a VLAN subif, and a silent MC-filter
+  miss there = split-brain (STOP-ON-FORK; group-MAC constants left in place for
+  a future live-validated switch). cBPF delivery filter unchanged.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/afpacket_membership_test.go,
+  docs/vrrp-afpacket-receiver.md, _Log.md
+- **Validation**: `go build ./...`; `go test ./pkg/vrrp/... ./pkg/daemon/...`
+  green. New unit tests TestAfPacketMembershipUsesAllmultiNotPromisc (membership
+  type) + TestVRRPGroupMACsAreCorrect (group MACs); fail-on-revert confirmed
+  (flip helper back to PROMISC -> RED). Live `make test-failover` on the loss
+  userspace cluster is the gating check before merge (broken receiver = no
+  failover).
+
+## 2026-06-26 — #2944 VRRP link watcher robust to runtime interface rename
+
+- **Timestamp**: 2026-06-26
+- **Action**: The link watcher (`runLinkWatcher`) applied tracked-link state
+  strictly by interface NAME. A runtime kernel rename (e.g. `wan0`->`wan1`)
+  arrives as a SINGLE `RTM_NEWLINK` carrying the SAME ifindex with the NEW
+  name and NO `RTM_DELLINK` for the old name, so an instance tracking `wan0`
+  never saw the event and kept its last (typically up) `trackDown` forever —
+  it never demoted even though the configured interface no longer existed.
+  Fix: route each event through a new `applyLinkEvent(ifindex, name, del, up)`
+  that maintains a per-run ifindex->name cache (`Manager.linkNames`). The
+  event's own up/down is authoritative for instances tracking the event's
+  CURRENT name (normal path, no extra syscall); when the ifindex previously
+  carried a DIFFERENT name, that old name has been renamed away and is
+  re-evaluated against the kernel via `reevaluateTrackedName` (LinkByName
+  fails -> down), so the instance demotes. This matches Junos semantics —
+  tracking follows the configured NAME, and a renamed-away name is treated as
+  down rather than silently following the ifindex to the new name. The
+  production subscribe seam now uses `LinkSubscribeWithOptions{ListExisting:
+  true}` (`netlinkLinkSubscribe`) so the cache is seeded from current kernel
+  state at watcher start, closing the cold-start window for an interface up
+  since boot. `linkNames` is reset in `resetRunStateLocked` so a Stop()->Start()
+  re-warms cleanly. The poller fallback (`pollTrackedLinks`) already handled
+  rename correctly (LinkByName err -> down), so it is unchanged. Added
+  `TestLinkWatcher_RenameAwayDemotes`; fail-on-revert verified (reverting the
+  watcher to name-only matching reds the rename test, normal up/down stays
+  green). `go build ./...` + `go test -race ./pkg/vrrp/...` + `go test
+  ./pkg/daemon/...` green.
+- **File(s)**: pkg/vrrp/track.go, pkg/vrrp/manager.go,
+  pkg/vrrp/track_test.go, docs/feature-coverage.md, _Log.md
+
+## 2026-06-26 — #2917 VLAN-unit AF_XDP bind-target SSOT (Go ↔ Rust parity)
+
+- **Timestamp**: 2026-06-26
+- **Action**: Made the VLAN-unit AF_XDP binding target a single documented
+  contract across both planes. The Rust planner already binds the physical
+  PARENT netdev for VLAN children (resolved by #3091/#3175 after #2917 was
+  filed against now-stale line numbers); the Go allowlist used a coarser
+  "always prefer ParentLinuxName" rule that diverged from the planner for a
+  degenerate non-VLAN unit numbered > 0. Extracted `userspaceBindTargetNetdev`
+  (mirrors Rust `vlan_child_parent_netdev` exactly: VLAN child → parent, else
+  own netdev) and routed `UserspaceBoundLinuxInterfaces` through it. Added the
+  cross-plane SSOT tests (Go: VLANUnitBindsParent, BindTargetNetdev_Contract,
+  MatchesBindTargetSSOT; Rust: replan_queues_binds_vlan_unit_on_parent_netdev)
+  — fail-on-revert verified RED on both planes. Documented the contract in
+  docs/userspace-dataplane-architecture.md and cross-referenced it from both
+  the Go helper and the Rust predicate. No fork: parent is unambiguously
+  correct (software VLAN netdev has no hardware RX queues).
+- **File(s)**: pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/snapshot_allowlist_test.go,
+  userspace-dp/src/server/helpers.rs, userspace-dp/src/main_tests.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
 ## 2026-06-26 — #2900 VRRP: re-validate an armed preempt hold-timer
 
 - **Timestamp**: 2026-06-26

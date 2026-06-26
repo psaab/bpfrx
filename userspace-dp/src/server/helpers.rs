@@ -822,6 +822,16 @@ pub(crate) fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> 
 /// netdev, else None (physical interfaces and non-VLAN units, whose
 /// `parent_linux_name` is empty or equal to their own netdev, are handled by
 /// the existing `seen_linux` dedup).
+///
+/// #2917 SSOT: this predicate is the single source of truth for the AF_XDP
+/// VLAN-unit binding target across BOTH planes. The Go control plane mirrors it
+/// exactly in `userspaceBindTargetNetdev`
+/// (`pkg/dataplane/userspace/interfaces.go`), which feeds
+/// `UserspaceBoundLinuxInterfaces` (the D3/RSS allowlist). A VLAN unit binds its
+/// physical PARENT netdev on both planes; a non-VLAN unit binds its own netdev.
+/// Keep the two implementations in lock-step — the Rust SSOT test
+/// (`replan_queues_binds_vlan_unit_on_parent_netdev`, `main_tests.rs`) and the
+/// Go cross-plane parity test (`snapshot_allowlist_test.go`) fail on divergence.
 fn vlan_child_parent_netdev<'a>(iface: &'a InterfaceSnapshot, linux_name: &str) -> Option<&'a str> {
     if iface.vlan_id != 0
         && !iface.parent_linux_name.is_empty()

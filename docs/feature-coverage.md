@@ -71,7 +71,12 @@ the userspace dataplane admission boundary is in
 - **Chassis cluster** with ~60ms failover (30ms VRRP intervals).
 - **Native VRRPv3**: Go state machine, AF_PACKET, per-instance sockets,
   IPv6 NODAD, 30ms RETH advertisements, async GARP burst, single-interface
-  tracking (nested `track-interface <if> priority-cost <n>`).
+  tracking (nested `track-interface <if> priority-cost <n>`). Tracking
+  follows the configured interface NAME (Junos semantics) and is robust to a
+  runtime kernel rename: the link watcher keys rename detection on the stable
+  ifindex, so when the tracked name is renamed away (a single `RTM_NEWLINK`
+  with the same ifindex but a new name, no `RTM_DELLINK`) the instance demotes
+  rather than holding stale "up" state (#2944).
 - **Bondless RETH**: VRRP on physical member interfaces, per-node virtual
   MAC (`02:bf:72:CC:RR:NN`), no Linux bonding required.
 - **Session sync**: incremental 1s sweep + ring buffer + GC delete
