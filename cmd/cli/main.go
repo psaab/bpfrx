@@ -442,7 +442,7 @@ func (c *ctl) handleTest(args []string) error {
 
 func (c *ctl) testPolicy(args []string) error {
 	var fromZone, toZone, srcIP, dstIP, proto string
-	var dstPort int
+	var srcPort, dstPort int
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "from-zone":
@@ -464,6 +464,20 @@ func (c *ctl) testPolicy(args []string) error {
 			if i+1 < len(args) {
 				i++
 				dstIP = args[i]
+			}
+		case "source-port":
+			if i+1 < len(args) {
+				i++
+				// #3107: thread a source-port constraint into the shared
+				// matcher's Query.SrcPort term (previously inexpressible from
+				// the remote CLI, overmatching source-port-constrained apps).
+				// Validate via the shared helper (#3116) so a bad value errors
+				// instead of silently coercing to the 0 "any port" wildcard.
+				p, err := policymatch.ParsePort(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid source-port: %w", err)
+				}
+				srcPort = p
 			}
 		case "destination-port":
 			if i+1 < len(args) {
@@ -489,7 +503,7 @@ func (c *ctl) testPolicy(args []string) error {
 
 	if fromZone == "" || toZone == "" {
 		fmt.Println("usage: test policy from-zone <zone> to-zone <zone>")
-		fmt.Println("       source-ip <ip> destination-ip <ip> destination-port <port> protocol <tcp|udp>")
+		fmt.Println("       source-ip <ip> destination-ip <ip> source-port <port> destination-port <port> protocol <tcp|udp>")
 		return nil
 	}
 
@@ -507,6 +521,9 @@ func (c *ctl) testPolicy(args []string) error {
 	}
 	if dstIP != "" {
 		topic += ",dst=" + dstIP
+	}
+	if srcPort > 0 {
+		topic += ",srcport=" + strconv.Itoa(srcPort)
 	}
 	if dstPort > 0 {
 		topic += ",port=" + strconv.Itoa(dstPort)

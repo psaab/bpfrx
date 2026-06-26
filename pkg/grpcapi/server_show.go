@@ -54,7 +54,7 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		return s.showScreenIDSOptionDetail(req, cfg, &buf)
 	}
 
-	// test policy: "test-policy:from=X,to=Y,src=A,dst=B,port=P,proto=TCP"
+	// test policy: "test-policy:from=X,to=Y,src=A,dst=B,srcport=Q,port=P,proto=TCP"
 	if strings.HasPrefix(req.Topic, "test-policy:") {
 		return s.showTestPolicy(req, cfg, &buf)
 	}
