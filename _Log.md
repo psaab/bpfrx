@@ -1,4 +1,59 @@
 - **2026-06-25**: #3113 — reject unsupported security-policy `match` leaves at commit (fail-closed). Added `validatePolicyMatchLeavesStrict` (AST pre-walk in `compileExpanded`) hard-rejecting a policy whose `match` clause carries a leaf outside the compiler-enforced allowlist (`source-address`, `destination-address`, `source-address-excluded`, `destination-address-excluded`, `application`) — e.g. `dynamic-application`/`url-category`/`source-identity`, which were silently dropped, widening the policy to a broad L3/L4 permit/deny (fail-open). Strict on `CompileConfig`; lenient-warn on both lenient constructors via new `lenientPolicyMatchLeaves` flag (#1960). Covers zone-pair AND global policies. Files: pkg/config/compiler_policy_match.go (new), pkg/config/compiler_policy_match_3113_test.go (new), pkg/config/compiler.go, pkg/config/README.md
+## 2026-06-25 — #3103: gRPC ShowText `test-policy:` routed through pkg/policymatch
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed codex-review-065 finding 065-01. The gRPC `ShowText`
+  `test-policy:` handler (`grpcapi.showTestPolicy`) — the backing handler for
+  the remote `cli` `test policy` command — was the ONE match-policies surface
+  #3042 missed. It still used the pre-#3042 bespoke `matchShowPolicyAddr` /
+  `matchShowPolicyApp` shadow matcher and hard-coded "Default deny" on a miss,
+  so it could report the OPPOSITE verdict from the runtime (missed predefined
+  apps, literal CIDRs, exclusions, feed overlay; ignored `default-policy
+  permit-all`). Rerouted it through `policymatch.Match` (passing the live feed
+  overlay via `Server.feedOverlayFn`, mirroring `MatchPolicies`); deleted the
+  bespoke `matchShowPolicy*` helpers + the now-unused `policyActionName` and the
+  `strconv` import from `server_cluster.go`. Output format preserved except the
+  default line now reflects the configured default-policy.
+- **File(s)**: pkg/grpcapi/server_show_firewall.go,
+  pkg/grpcapi/server_cluster.go, pkg/grpcapi/test_commands_test.go,
+  pkg/grpcapi/server_cluster_test.go, pkg/policymatch/README.md
+- **Validation**: go build/vet clean; `go test ./pkg/grpcapi/...
+  ./pkg/policymatch/... ./pkg/cli/...` 308 pass; gofmt clean. Fail-on-revert
+  proven: restoring origin/master's bespoke matcher turns the new
+  `TestShowTestPolicyAgreesWithRuntimeOnFixedCases` RED on all three sub-cases
+  (predefined-app permit, global-policy fallback, default-policy permit-all).
+- **Note (out of scope)**: `showTestPolicy` parses only `port=` (destination)
+  and `proto=`; it cannot express a source port (#3107) and does not validate
+  the protocol token (#3108). Left untouched for those issues.
+
+## 2026-06-25 — #2881: commit-time reject undefined policy community references
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add `validatePolicyCommunityReferencesStrict` reject-at-commit
+  gate. A policy-statement term's `from community <name>` (rendered FRR `match
+  community <name>`) and `then community delete <name>` (the #2848 strip-by-list
+  operation, rendered `set comm-list <name> delete`) reference an FRR
+  `bgp community-list <name>` that pkg/frr emits ONLY from a defined
+  `policy-options community <name>`. An undefined reference committed cleanly,
+  then the dangling line failed the WHOLE frr-reload of the managed section,
+  leaving dynamic routing stale (#1960-class commit-accepted-but-unloadable).
+  New validator runs on the fully-compiled `*Config`, hard-rejects on the strict
+  commit/commit-check path naming the policy, term, and missing community;
+  downgrades to a cfg.Warnings entry on the lenient load/peer-sync path
+  (`lenientPolicyCommunityRef`) so an already-persisted/peer-synced config still
+  boots. SURGICAL — only NAME refs checked; `then community (set|add) <value>`
+  carries a community VALUE, not a list ref, so it is not validated.
+- **File(s)**: pkg/config/compiler.go (compileOpts flag + 2 lenient blocks +
+  call site), pkg/config/compiler_validate_strict.go (validator),
+  pkg/config/policy_community_ref_test.go (new fail-on-revert tests),
+  pkg/config/policy_from_multileaf_2689_test.go,
+  pkg/config/compiler_policy_term_multimatch_2642_test.go,
+  pkg/config/parser_security_test.go, pkg/frr/frr_test.go (pre-existing tests:
+  define the communities they reference), pkg/config/README.md,
+  pkg/frr/README.md.
+- **Validation**: go build ./..., go vet ./pkg/config/... ./pkg/frr/...,
+  go test ./pkg/config/... ./pkg/frr/... (1806 pass). Fail-on-revert: removing
+  the validator call turns the 3 reject tests + lenient-warn test RED.
 
 - **2026-06-26T03:54:14Z**: Fix master-CI-red pkg/configstore TestCopyConfig — removed incidental `interfaces eth0.0` from the trust zone fixture. #3072/#3083's interface-multi-zone commit gate (merged this session) correctly rejects a Copy of a zone-with-interface (the interface lands in both trust and trust2). The interface was incidental to the Copy test. File: pkg/configstore/store_test.go
 

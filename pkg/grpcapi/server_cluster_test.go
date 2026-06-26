@@ -173,9 +173,11 @@ func TestMatchPoliciesValidIPOutsideTermNoFalsePositive(t *testing.T) {
 }
 
 // TestShowTestPolicyRejectsInvalidIP covers the ShowText "test-policy:"
-// simulator (the operational `test policy` command served via gRPC),
-// which is a separate copy of the matcher (matchShowPolicyAddr). A
-// non-empty malformed IP must not produce a "Policy match" line.
+// simulator (the operational `test policy` command served via gRPC).
+// Since #3103 this routes through the shared pkg/policymatch simulator,
+// but it must still reject a non-empty malformed IP rather than collapse
+// it to a wildcard "any" (the #1711 false-positive): such input must not
+// produce a "Policy match" line.
 func TestShowTestPolicyRejectsInvalidIP(t *testing.T) {
 	s := &Server{store: matchPoliciesTestStore(t)}
 

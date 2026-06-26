@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/cluster"
@@ -175,121 +174,6 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		DstAddresses: res.DstAddresses,
 		Applications: res.Applications,
 	}, nil
-}
-
-// policyActionName returns a human-readable policy action name.
-func policyActionName(a config.PolicyAction) string {
-	switch a {
-	case 1:
-		return "deny"
-	case 2:
-		return "reject"
-	default:
-		return "permit"
-	}
-}
-
-// matchShowPolicyAddr checks if an IP matches a list of address-book references.
-func matchShowPolicyAddr(addrs []string, ip net.IP, cfg *config.Config) bool {
-	if len(addrs) == 0 || ip == nil {
-		return true
-	}
-	for _, a := range addrs {
-		if a == "any" {
-			return true
-		}
-		if cfg.Security.AddressBook == nil {
-			continue
-		}
-		if addr, ok := cfg.Security.AddressBook.Addresses[a]; ok {
-			_, cidr, err := net.ParseCIDR(addr.Value)
-			if err == nil && cidr.Contains(ip) {
-				return true
-			}
-		}
-		if matchShowPolicyAddrSet(a, ip, cfg, 0) {
-			return true
-		}
-	}
-	return false
-}
-
-func matchShowPolicyAddrSet(setName string, ip net.IP, cfg *config.Config, depth int) bool {
-	if depth > 5 || cfg.Security.AddressBook == nil {
-		return false
-	}
-	as, ok := cfg.Security.AddressBook.AddressSets[setName]
-	if !ok {
-		return false
-	}
-	for _, addrName := range as.Addresses {
-		if addr, ok := cfg.Security.AddressBook.Addresses[addrName]; ok {
-			_, cidr, err := net.ParseCIDR(addr.Value)
-			if err == nil && cidr.Contains(ip) {
-				return true
-			}
-		}
-	}
-	for _, nested := range as.AddressSets {
-		if matchShowPolicyAddrSet(nested, ip, cfg, depth+1) {
-			return true
-		}
-	}
-	return false
-}
-
-// matchShowPolicyApp checks if a protocol/port matches a list of application references.
-func matchShowPolicyApp(apps []string, proto string, dstPort int, cfg *config.Config) bool {
-	if len(apps) == 0 || proto == "" {
-		return true
-	}
-	for _, a := range apps {
-		if a == "any" {
-			return true
-		}
-		if matchShowSingleApp(a, proto, dstPort, cfg) {
-			return true
-		}
-		if cfg.Applications.ApplicationSets != nil {
-			if as, ok := cfg.Applications.ApplicationSets[a]; ok {
-				for _, appRef := range as.Applications {
-					if matchShowSingleApp(appRef, proto, dstPort, cfg) {
-						return true
-					}
-				}
-			}
-		}
-	}
-	return false
-}
-
-func matchShowSingleApp(appName, proto string, dstPort int, cfg *config.Config) bool {
-	if cfg.Applications.Applications == nil {
-		return false
-	}
-	app, ok := cfg.Applications.Applications[appName]
-	if !ok {
-		return false
-	}
-	if app.Protocol != "" && !strings.EqualFold(app.Protocol, proto) {
-		return false
-	}
-	if app.DestinationPort != "" && dstPort > 0 {
-		if strings.Contains(app.DestinationPort, "-") {
-			parts := strings.SplitN(app.DestinationPort, "-", 2)
-			lo, _ := strconv.Atoi(parts[0])
-			hi, _ := strconv.Atoi(parts[1])
-			if dstPort < lo || dstPort > hi {
-				return false
-			}
-		} else {
-			p, _ := strconv.Atoi(app.DestinationPort)
-			if p != dstPort {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 // grpcResolveAddress looks up a named address in the global address book and returns its CIDR suffix.

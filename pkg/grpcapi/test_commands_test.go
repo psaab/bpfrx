@@ -1,103 +1,184 @@
 package grpcapi
 
 import (
-	"net"
+	"context"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/policymatch"
 )
 
-func TestPolicyActionName(t *testing.T) {
-	tests := []struct {
-		action config.PolicyAction
-		want   string
-	}{
-		{0, "permit"},
-		{1, "deny"},
-		{2, "reject"},
-		{99, "permit"},
+// testPolicyStore builds an active config from a raw Junos override and
+// returns a configstore.Store with it committed, for driving the gRPC
+// ShowText "test-policy:" handler.
+func testPolicyStore(t *testing.T, override string) *configstore.Store {
+	t.Helper()
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure() error = %v", err)
 	}
-	for _, tt := range tests {
-		got := policyActionName(tt.action)
-		if got != tt.want {
-			t.Errorf("policyActionName(%d) = %q, want %q", tt.action, got, tt.want)
-		}
+	if err := store.LoadOverride(override); err != nil {
+		t.Fatalf("LoadOverride() error = %v", err)
 	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	return store
 }
 
-func TestMatchShowPolicyAddr(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.Security.AddressBook = &config.AddressBook{
-		Addresses: map[string]*config.Address{
-			"trust-net": {Value: "10.0.1.0/24"},
-			"server1":   {Value: "192.168.1.1/32"},
-		},
-		AddressSets: map[string]*config.AddressSet{
-			"all-internal": {Addresses: []string{"trust-net", "server1"}},
-		},
+func showTestPolicyOutput(t *testing.T, store *configstore.Store, topic string) string {
+	t.Helper()
+	s := &Server{store: store}
+	resp, err := s.ShowText(context.Background(), &pb.ShowTextRequest{Topic: topic})
+	if err != nil {
+		t.Fatalf("ShowText(%q) error = %v", topic, err)
 	}
+	return resp.GetOutput()
+}
 
-	tests := []struct {
-		name  string
-		addrs []string
-		ip    net.IP
-		want  bool
+// TestShowTestPolicyAgreesWithRuntimeOnFixedCases is the #3103 fail-on-revert
+// guard. Before #3103 the gRPC ShowText "test-policy:" handler used a bespoke
+// shadow matcher (matchShowPolicyAddr / matchShowPolicyApp) that diverged from
+// the runtime evaluator. Each sub-case below is one the OLD matcher got wrong:
+//
+//   - predefined-app permit: the old matcher read only
+//     cfg.Applications.Applications, so a predefined Junos application
+//     (junos-http) never matched and the case fell through to "Default deny";
+//   - global-policy fallback: the old matcher looped only the zone-pair sets,
+//     never cfg.Security.GlobalPolicies, so a global policy was reported as
+//     "Default deny";
+//   - default-policy permit-all: the old matcher hard-coded "Default deny" on
+//     a miss even when `default-policy permit-all` was configured.
+//
+// Routing through pkg/policymatch (the same simulator the REST/gRPC
+// MatchPolicies and CLI surfaces use since #3042) makes ShowText agree with
+// the runtime. We assert the rendered ShowText output AND cross-check it
+// against policymatch.Match directly so reverting showTestPolicy to the
+// bespoke matcher turns this RED.
+func TestShowTestPolicyAgreesWithRuntimeOnFixedCases(t *testing.T) {
+	cases := []struct {
+		name       string
+		override   string
+		topic      string
+		wantSubstr []string // all must be present in the ShowText output
+		notSubstr  []string // none may be present
+		// policymatch cross-check inputs (the runtime ground truth):
+		query      policymatch.Query
+		wantAction config.PolicyAction
 	}{
-		{"any matches", []string{"any"}, net.ParseIP("1.2.3.4"), true},
-		{"empty addrs matches", nil, net.ParseIP("1.2.3.4"), true},
-		{"nil IP matches", []string{"trust-net"}, nil, true},
-		{"addr match", []string{"trust-net"}, net.ParseIP("10.0.1.50"), true},
-		{"addr no match", []string{"trust-net"}, net.ParseIP("10.0.2.50"), false},
-		{"addr-set match", []string{"all-internal"}, net.ParseIP("192.168.1.1"), true},
-		{"addr-set no match", []string{"all-internal"}, net.ParseIP("172.16.0.1"), false},
+		{
+			name: "predefined-app permit",
+			override: `
+security {
+    zones {
+        security-zone trust;
+        security-zone untrust;
+    }
+    policies {
+        from-zone trust to-zone untrust {
+            policy allow-http {
+                match { source-address any; destination-address any; application junos-http; }
+                then { permit; }
+            }
+        }
+    }
+}
+`,
+			// junos-http is a PREDEFINED application (tcp/80). The old matcher
+			// only knew about user applications, so it missed this entirely.
+			topic:      "test-policy:from=trust,to=untrust,src=10.0.1.1,dst=10.0.2.1,port=80,proto=tcp",
+			wantSubstr: []string{"Policy match:", "Policy:    allow-http", "Action:    permit"},
+			notSubstr:  []string{"Default", "global"},
+			query: policymatch.Query{
+				FromZone: "trust", ToZone: "untrust", Protocol: "tcp", DstPort: 80,
+			},
+			wantAction: config.PolicyPermit,
+		},
+		{
+			name: "global-policy fallback",
+			override: `
+security {
+    zones {
+        security-zone trust;
+        security-zone untrust;
+    }
+    policies {
+        global {
+            policy global-allow {
+                match { source-address any; destination-address any; application junos-http; }
+                then { permit; }
+            }
+        }
+    }
+}
+`,
+			// Only a global policy exists, and it matches on a PREDEFINED app
+			// (junos-http). The old matcher's global loop used the user-apps-only
+			// matchShowPolicyApp, so junos-http never matched and it reported
+			// "Default deny". The new path resolves predefined apps and matches
+			// the global rule.
+			topic:      "test-policy:from=trust,to=untrust,src=10.0.1.1,dst=10.0.2.1,port=80,proto=tcp",
+			wantSubstr: []string{"Policy match (global):", "Policy:    global-allow", "Action:    permit"},
+			notSubstr:  []string{"Default"},
+			query: policymatch.Query{
+				FromZone: "trust", ToZone: "untrust", Protocol: "tcp", DstPort: 80,
+			},
+			wantAction: config.PolicyPermit,
+		},
+		{
+			name: "default-policy permit-all",
+			override: `
+security {
+    zones {
+        security-zone trust;
+        security-zone untrust;
+    }
+    policies {
+        default-policy permit-all;
+    }
+}
+`,
+			// No matching policy: the runtime applies the configured
+			// default-policy (permit-all). The old matcher hard-coded
+			// "Default deny" here — the opposite verdict.
+			topic:      "test-policy:from=trust,to=untrust,src=10.0.1.1,dst=10.0.2.1,port=80,proto=tcp",
+			wantSubstr: []string{"Default permit"},
+			notSubstr:  []string{"Default deny", "Policy match"},
+			query: policymatch.Query{
+				FromZone: "trust", ToZone: "untrust", Protocol: "tcp", DstPort: 80,
+			},
+			wantAction: config.PolicyPermit,
+		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := matchShowPolicyAddr(tt.addrs, tt.ip, cfg)
-			if got != tt.want {
-				t.Errorf("matchShowPolicyAddr(%v, %v) = %v, want %v", tt.addrs, tt.ip, got, tt.want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := testPolicyStore(t, tc.override)
+			out := showTestPolicyOutput(t, store, tc.topic)
+			for _, want := range tc.wantSubstr {
+				if !strings.Contains(out, want) {
+					t.Errorf("ShowText output missing %q\n--- got ---\n%s", want, out)
+				}
 			}
-		})
-	}
-}
+			for _, bad := range tc.notSubstr {
+				if strings.Contains(out, bad) {
+					t.Errorf("ShowText output unexpectedly contains %q\n--- got ---\n%s", bad, out)
+				}
+			}
 
-func TestMatchShowPolicyApp(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.Applications.Applications = map[string]*config.Application{
-		"junos-http":   {Protocol: "tcp", DestinationPort: "80"},
-		"junos-ssh":    {Protocol: "tcp", DestinationPort: "22"},
-		"custom-range": {Protocol: "tcp", DestinationPort: "8000-9000"},
-	}
-	cfg.Applications.ApplicationSets = map[string]*config.ApplicationSet{
-		"web-apps": {Applications: []string{"junos-http"}},
-	}
-
-	tests := []struct {
-		name    string
-		apps    []string
-		proto   string
-		dstPort int
-		want    bool
-	}{
-		{"any matches", []string{"any"}, "tcp", 80, true},
-		{"empty apps matches", nil, "tcp", 80, true},
-		{"empty proto matches", []string{"junos-http"}, "", 80, true},
-		{"exact app match", []string{"junos-http"}, "tcp", 80, true},
-		{"app wrong port", []string{"junos-http"}, "tcp", 443, false},
-		{"app wrong proto", []string{"junos-http"}, "udp", 80, false},
-		{"range match", []string{"custom-range"}, "tcp", 8080, true},
-		{"range no match", []string{"custom-range"}, "tcp", 7999, false},
-		{"app-set match", []string{"web-apps"}, "tcp", 80, true},
-		{"app-set no match", []string{"web-apps"}, "tcp", 22, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := matchShowPolicyApp(tt.apps, tt.proto, tt.dstPort, cfg)
-			if got != tt.want {
-				t.Errorf("matchShowPolicyApp(%v, %q, %d) = %v, want %v",
-					tt.apps, tt.proto, tt.dstPort, got, tt.want)
+			// Cross-check against the shared simulator (the runtime ground
+			// truth). The ShowText handler MUST agree with it.
+			cfg := store.ActiveConfig()
+			res := policymatch.Match(cfg, tc.query)
+			if res.Action != tc.wantAction {
+				t.Errorf("policymatch action = %v, want %v", res.Action, tc.wantAction)
+			}
+			if got := policymatch.ActionString(res.Action); !strings.Contains(out, got) {
+				t.Errorf("ShowText output %q does not contain runtime action %q", out, got)
 			}
 		})
 	}
