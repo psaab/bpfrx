@@ -352,3 +352,172 @@ func validatePolicyThenRejectStrict(nodes []*Node, lenient bool) ([]string, erro
 	}
 	return warnings, nil
 }
+
+// supportedPolicyThenDenyChildren is the EXACT set of collapsed `then deny`
+// modifiers the policy compiler enforces. Unlike the then-permit (#3114) and
+// then-reject (#3115) arms — whose supported sets are EMPTY because no
+// permit/reject modifier is implemented — `then deny` legitimately combines
+// with the observability modifiers `log` (with session-init/session-close)
+// and `count`, which the standalone `then log`/`then count` arms already
+// implement. compilePolicy's `deny` arm wires these collapsed modifiers via
+// applyCollapsedDenyModifiers (#3141), so they are SUPPORTED here. Any OTHER
+// collapsed deny modifier is silently dropped by the compiler and is rejected
+// by validatePolicyThenDenyStrict. Keep this in lockstep with
+// applyCollapsedDenyModifiers: if the compiler learns to enforce a new
+// collapsed `then deny` modifier, add it here so it is no longer rejected.
+var supportedPolicyThenDenyChildren = map[string]bool{
+	"log":   true,
+	"count": true,
+}
+
+// validatePolicyThenDenyStrict walks the `security policies` subtree of the
+// group-expanded AST and rejects any policy whose `then deny` action arm
+// carries a collapsed modifier the compiler does not enforce — the #3141
+// sibling of validatePolicyThenPermitStrict (#3114) and
+// validatePolicyThenRejectStrict (#3115). Covers both zone-pair and global
+// policies.
+//
+// The defect (codex-review-068 finding 068-01): compilePolicy's `then`
+// switch `deny` arm set `pol.Action = PolicyDeny` and NEVER inspected the
+// collapsed tail. A flat-set `then deny log session-init` collapses
+// `log session-init` onto the deny node (Keys=["deny","log","session-init"])
+// rather than nesting it as a sibling `then log` node, so the deny arm
+// dropped it — the policy denied traffic but `pol.Log` was never set and the
+// configured audit logging was silently inert (a deny-rule observability /
+// compliance failure, not a packet fail-open). #3141 fixes the LEGITIMATE
+// deny+log/deny+count case by wiring those collapsed modifiers in the
+// compiler (applyCollapsedDenyModifiers). This validator is the safety net
+// for the REMAINING collapsed modifiers the compiler still cannot enforce:
+// they are rejected at commit rather than silently stripped.
+//
+// Same AST-pre-walk rationale, dual-shape (flat-set Keys[1] + hierarchical
+// Children) handling, both-scope (zone-pair + global) coverage, and #1960
+// strict-with-lenient doctrine as validatePolicyThenPermitStrict. A bare
+// `then deny`, and a `then deny log`/`then deny count` (now wired), commit.
+func validatePolicyThenDenyStrict(nodes []*Node, lenient bool) ([]string, error) {
+	var security *Node
+	for _, n := range nodes {
+		if n.Name() == "security" {
+			security = n
+			break
+		}
+	}
+	if security == nil {
+		return nil, nil
+	}
+	policies := security.FindChild("policies")
+	if policies == nil {
+		return nil, nil
+	}
+
+	var warnings []string
+	emit := func(scope, policyName, child string) error {
+		msg := fmt.Sprintf(
+			"security policies %s policy %q then deny %q is not supported "+
+				"(xpf denies on L3/L4 and supports only the log "+
+				"(session-init/session-close) and count modifiers under "+
+				"then deny — an unsupported then-deny modifier is silently "+
+				"dropped, so the configured behavior is inert and the operator "+
+				"cannot tell from commit that it has no effect) — remove the "+
+				"%q modifier under then deny (a bare then deny, then deny log, "+
+				"or then deny count still works) (#3141)",
+			scope, policyName, child, child,
+		)
+		if !lenient {
+			return fmt.Errorf("%s", msg)
+		}
+		warnings = append(warnings, msg)
+		return nil
+	}
+
+	checkPolicy := func(scope, policyName string, polNode *Node) error {
+		thenNode := polNode.FindChild("then")
+		if thenNode == nil {
+			return nil
+		}
+		denyNode := thenNode.FindChild("deny")
+		if denyNode == nil {
+			return nil
+		}
+		// A bare `then deny` (flat-set: a `deny` node with Keys=["deny"] and
+		// no children; hierarchical: an empty `deny` block) is fully
+		// supported. Only `then deny <modifier>` carries a collapsed child,
+		// in TWO AST shapes:
+		//   - Flat set `then deny log session-init count` collapses the WHOLE
+		//     tail onto the deny node:
+		//     Keys=["deny","log","session-init","count"]. EVERY token in
+		//     Keys[1:] is a flattened modifier or modifier sub-token; they
+		//     must ALL be recognized. Checking only Keys[1] missed a
+		//     supported-leads / unsupported-trails sequence like
+		//     `then deny count evilmod`, which slipped through and was
+		//     silently dropped — exactly the failure mode this gate prevents
+		//     (#3141 review fold). The recognized set
+		//     (recognizedCollapsedDenyToken) is the EXACT set
+		//     applyCollapsedDenyModifiers acts on — the `log`/`count`
+		//     modifiers plus log's session-init/session-close sub-tokens — so
+		//     the validator and the wiring agree on what is a modifier vs a
+		//     sub-token. Report the first unrecognized token.
+		//   - Hierarchical `then { deny { profile {...} } }` nests the
+		//     modifier as a DIRECT child node of deny; the modifier's own
+		//     sub-tokens nest deeper, so a direct child must be a top-level
+		//     modifier — checked against supportedPolicyThenDenyChildren
+		//     ({log, count}).
+		for _, tok := range denyNode.Keys[1:] {
+			if !recognizedCollapsedDenyToken(tok) {
+				if err := emit(scope, policyName, tok); err != nil {
+					return err
+				}
+			}
+		}
+		for _, c := range denyNode.Children {
+			child := c.Name()
+			if supportedPolicyThenDenyChildren[child] {
+				continue
+			}
+			if err := emit(scope, policyName, child); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	for _, child := range policies.Children {
+		switch child.Name() {
+		case "global":
+			for _, polInst := range namedInstances(child.FindChildren("policy")) {
+				if err := checkPolicy("global", polInst.name, polInst.node); err != nil {
+					return nil, err
+				}
+			}
+		case "from-zone":
+			// Mirror compilePolicies' two AST shapes.
+			type zonePair struct {
+				from, to   string
+				policyNode *Node
+			}
+			var pairs []zonePair
+			if len(child.Keys) >= 4 {
+				pairs = append(pairs, zonePair{child.Keys[1], child.Keys[3], child})
+			} else {
+				for _, fzSub := range child.Children {
+					tzNode := fzSub.FindChild("to-zone")
+					if tzNode == nil {
+						continue
+					}
+					for _, tzSub := range tzNode.Children {
+						pairs = append(pairs, zonePair{fzSub.Name(), tzSub.Name(), tzSub})
+					}
+				}
+			}
+			for _, zp := range pairs {
+				scope := fmt.Sprintf("from-zone %s to-zone %s", zp.from, zp.to)
+				for _, polInst := range namedInstances(zp.policyNode.FindChildren("policy")) {
+					if err := checkPolicy(scope, polInst.name, polInst.node); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+	}
+	return warnings, nil
+}

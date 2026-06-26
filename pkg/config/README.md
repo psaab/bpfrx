@@ -460,6 +460,45 @@ follow-up. The tolerant load/peer-sync path downgrades to a warning
 binary silently accepted still boots — the modifier stays dropped (the pre-existing
 behaviour), now flagged (#1960 no-brick doctrine, same as #3114).
 
+**`then deny` log/count modifier wired; other collapsed deny modifiers
+rejected (#3141 — codex-review-068 finding 068-01):** the deny sibling of
+#3114/#3115, but NOT a pure reject. `then deny` legitimately combines with the
+observability modifiers `log` (with `session-init`/`session-close`) and `count`,
+which the standalone `then log`/`then count` arms already implement. A flat-set
+`then deny log session-init` collapses the modifier onto the deny node
+(`Keys=["deny","log","session-init"]`, no children) instead of nesting a sibling
+`then log` node; `compilePolicy`'s `then` switch `deny` arm read only `t.Name()`
+and silently dropped the collapsed tail, so deny-with-logging committed but
+`pol.Log` was never set — the configured audit logging was inert (a deny-rule
+observability / compliance failure, not a packet fail-OPEN). The fix WIRES the
+collapsed `log`/`count` modifiers in `applyCollapsedDenyModifiers`
+(`compiler_security.go`), so deny+log works in BOTH the flat-collapsed form and
+the separate-node `then { deny; log session-init; }` form (the latter already
+handled by the `log` arm); `pol.Log` flows into the policy snapshot
+(`PolicyRuleSnapshot.LogSessionInit/Close`, #2508) independent of `Action`, so a
+deny rule emits the configured session log. The safety net for any REMAINING
+collapsed deny modifier the compiler cannot enforce is
+`validatePolicyThenDenyStrict` (`compiler_policy_then.go`): it hard-rejects a
+`then deny <unsupported>` modifier at commit, naming the policy scope (zone-pair
+or global), the policy, and the offending modifier; a bare `then deny`,
+`then deny log`, and `then deny count` still commit. AST pre-walk in
+`compileExpanded`, both AST shapes, zone-pair and `global` coverage. On the
+flat path the lexer flattens a modifier and its sub-tokens into one
+`Keys` slice (`["deny","log","session-init","count"]`), so the gate inspects
+EVERY collapsed token (`Keys[1:]`) against `recognizedCollapsedDenyToken` —
+the exact `{log, session-init, session-close, count}` set
+`applyCollapsedDenyModifiers` consumes — not just `Keys[1]`; checking only
+the first token let a supported-leads / unsupported-trails sequence like
+`then deny count evilmod` slip through silently. On the hierarchical path a
+direct child of `deny` is a top-level modifier, checked against the
+`supportedPolicyThenDenyChildren` allowlist (`log`/`count`); its sub-tokens
+nest deeper. Keep `recognizedCollapsedDenyToken` /
+`supportedPolicyThenDenyChildren` in lockstep with
+`applyCollapsedDenyModifiers`. The tolerant load/peer-sync path downgrades
+to a warning (`lenientPolicyThenDeny`) so an already-persisted or peer-synced
+config an older binary silently accepted still boots (#1960 no-brick doctrine,
+same as #3114/#3115).
+
 **Security policies missing a required `match` criterion are rejected at commit
 (#3044 — codex-review-061 finding 061-03):** Junos/vSRX requires every security
 policy `match` clause to specify all three core dimensions — `source-address`,
