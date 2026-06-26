@@ -1,3 +1,19 @@
+## 2026-06-25 — #3029: DNAT destination-address prefix silently narrowed to a single host
+
+- **Action**: Hard-reject a destination-NAT rule whose `match destination-address`
+  is a MULTI-HOST prefix (e.g. `198.51.100.0/24`). The DNAT snapshot builder strips
+  the `/mask` and the Rust `DnatTable` keys on an EXACT host `IpAddr` (no prefix/LPM),
+  so only the network address translated and every other host in the block silently
+  bypassed DNAT. Contract: commit-REJECT (fail-closed, #1960 strict-with-lenient),
+  NOT honor-prefix — block-mapping semantics (1:1 vs many:one) + an LPM table are an
+  unsettled dataplane feature (issue is a /research candidate). Single-host (bare IP,
+  /32, /128) unchanged.
+- **File(s)**: pkg/config/compiler_validate_strict.go (validateDestinationNATAddressesStrict
+  extended; reuses isHostMaskAddress), pkg/config/compiler_dnat_address_test.go (4 new
+  tests: v4/v6 prefix reject, host-mask compiles, lenient warns), docs/feature-gaps.md.
+- **Validation**: go build ./...; go test ./pkg/config/... (1698 pass + new); RED->GREEN
+  confirmed (disable the gate condition -> reject tests FAIL); gofmt clean.
+
 ## 2026-06-25 — #3149 (folds #3147): policy dangling/empty address-set hard-reject
 
 - **Timestamp**: 2026-06-25
