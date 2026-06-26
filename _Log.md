@@ -25,6 +25,66 @@
   and `proto=`; it cannot express a source port (#3107) and does not validate
   the protocol token (#3108). Left untouched for those issues.
 
+## 2026-06-25 — #2881: commit-time reject undefined policy community references
+
+- **Timestamp**: 2026-06-25
+- **Action**: Add `validatePolicyCommunityReferencesStrict` reject-at-commit
+  gate. A policy-statement term's `from community <name>` (rendered FRR `match
+  community <name>`) and `then community delete <name>` (the #2848 strip-by-list
+  operation, rendered `set comm-list <name> delete`) reference an FRR
+  `bgp community-list <name>` that pkg/frr emits ONLY from a defined
+  `policy-options community <name>`. An undefined reference committed cleanly,
+  then the dangling line failed the WHOLE frr-reload of the managed section,
+  leaving dynamic routing stale (#1960-class commit-accepted-but-unloadable).
+  New validator runs on the fully-compiled `*Config`, hard-rejects on the strict
+  commit/commit-check path naming the policy, term, and missing community;
+  downgrades to a cfg.Warnings entry on the lenient load/peer-sync path
+  (`lenientPolicyCommunityRef`) so an already-persisted/peer-synced config still
+  boots. SURGICAL — only NAME refs checked; `then community (set|add) <value>`
+  carries a community VALUE, not a list ref, so it is not validated.
+- **File(s)**: pkg/config/compiler.go (compileOpts flag + 2 lenient blocks +
+  call site), pkg/config/compiler_validate_strict.go (validator),
+  pkg/config/policy_community_ref_test.go (new fail-on-revert tests),
+  pkg/config/policy_from_multileaf_2689_test.go,
+  pkg/config/compiler_policy_term_multimatch_2642_test.go,
+  pkg/config/parser_security_test.go, pkg/frr/frr_test.go (pre-existing tests:
+  define the communities they reference), pkg/config/README.md,
+  pkg/frr/README.md.
+- **Validation**: go build ./..., go vet ./pkg/config/... ./pkg/frr/...,
+  go test ./pkg/config/... ./pkg/frr/... (1806 pass). Fail-on-revert: removing
+  the validator call turns the 3 reject tests + lenient-warn test RED.
+
+- **2026-06-26T03:54:14Z**: Fix master-CI-red pkg/configstore TestCopyConfig — removed incidental `interfaces eth0.0` from the trust zone fixture. #3072/#3083's interface-multi-zone commit gate (merged this session) correctly rejects a Copy of a zone-with-interface (the interface lands in both trust and trust2). The interface was incidental to the Copy test. File: pkg/configstore/store_test.go
+
+## 2026-06-25 — #2993: feeds mixed valid/invalid body installs a partial set silently
+- **Action**: parseFeed now counts skipped malformed lines (invalidLines) +
+  bounded sample (invalidSample, maxInvalidSample=5); FeedInfo gains
+  InvalidLines/InvalidSample/Degraded. installSnapshot records them and logs
+  one slog.Warn on a degraded content change; recordFailure drop-to-empty
+  clears them. show security dynamic-address (CLI + grpcapi) prints a DEGRADED
+  line. Clean feeds unchanged (0 invalid, not degraded). Contract: skip-with-
+  count + degraded status (issue primary direction; observable, not silent).
+- **File(s)**: pkg/feeds/feeds.go, pkg/feeds/feeds_test.go,
+  pkg/feeds/README.md, pkg/cli/cli_show_security_objects.go,
+  pkg/grpcapi/server_show_security_text.go
+## 2026-06-25 — #2972: ddns surface-a RG0/non-HA scope double-write in active-active HA
+
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `surfaceAGate` admitting every `RGOwner==0` (RG0/non-HA)
+  Surface A scope unconditionally. In active-active HA both nodes pass the
+  node-level writer gate (each masters some RG) and both built+published the
+  identical non-HA FQDN — a public A/AAAA flap when the nodes observe different
+  WAN addresses. `RGOwner==0` is now tied to RG0 (control-plane RG) ownership
+  via new helper `surfaceARG0Writer`: the RG0-primary node is the single writer
+  and it follows RG0 failover; when RG0 is untracked (data-RG-only cluster or
+  pre-first-election) it falls back to the lowest-node-ID writer. Standalone
+  (nil gate) still writes every scope. DHCP-lease DDNS is unchanged (its
+  per-node memfiles are already master-filtered, so its `RGOwner==0` case has no
+  peer). Added fail-on-revert tests `TestSurfaceAGateRG0SingleWriter`
+  (active-active + failover) and `TestSurfaceAGateRG0FallbackNoRG0`; updated
+  `TestSurfaceAGatePerRG` for the new semantic.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
+  pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md
 ## 2026-06-25 — #2933: commit-time reject ambiguous secure-tunnel bind-interface aliases
 
 - **Timestamp**: 2026-06-25

@@ -32,6 +32,12 @@ const retainForever time.Duration = 0
 // fetch (bufio.ErrTooLong) rather than a silent truncation — see fetchFeed.
 const maxLineBytes = 1 << 20 // 1 MiB
 
+// maxInvalidSample bounds how many distinct malformed lines are retained for
+// operator display (#2993). A degraded feed records the total invalid-line
+// count plus a small verbatim sample so an operator can identify the bad lines
+// without the sample growing unbounded for a wholesale-garbage body.
+const maxInvalidSample = 5
+
 // Manager manages dynamic address feed servers and their periodic updates.
 type Manager struct {
 	mu       sync.RWMutex
@@ -56,6 +62,15 @@ type feedState struct {
 	prefixes    []string
 	hash        [32]byte // sha256 over the canonical join; zero when no snapshot
 	hasSnapshot bool     // true once a good fetch has installed a snapshot
+
+	// Parse-quality of the INSTALLED snapshot (#2993). A feed body may mix
+	// valid + invalid lines: the valid prefixes are installed but the skipped
+	// invalid lines are no longer silent. invalidLines counts every malformed
+	// line in the last successfully-installed body; invalidSample keeps up to
+	// maxInvalidSample verbatim offenders for display. Both are zero/nil for a
+	// clean body (no behaviour change) and are cleared on a drop-to-empty.
+	invalidLines  int
+	invalidSample []string
 
 	// Fetch status (separate from the active snapshot).
 	lastFetch   time.Time // last SUCCESSFUL fetch (kept name for show-path compat)
@@ -286,13 +301,16 @@ func (m *Manager) AllFeeds() map[string]FeedInfo {
 			hash = fmt.Sprintf("%x", fs.hash)
 		}
 		result[name] = FeedInfo{
-			URL:         fs.url,
-			Prefixes:    len(fs.prefixes),
-			LastFetch:   fs.lastFetch,
-			LastSuccess: fs.lastSuccess,
-			LastError:   fs.lastError,
-			StaleSince:  fs.staleSince,
-			Hash:        hash,
+			URL:           fs.url,
+			Prefixes:      len(fs.prefixes),
+			LastFetch:     fs.lastFetch,
+			LastSuccess:   fs.lastSuccess,
+			LastError:     fs.lastError,
+			StaleSince:    fs.staleSince,
+			Hash:          hash,
+			InvalidLines:  fs.invalidLines,
+			InvalidSample: append([]string(nil), fs.invalidSample...),
+			Degraded:      fs.invalidLines > 0,
 		}
 	}
 	return result
@@ -314,6 +332,16 @@ type FeedInfo struct {
 	// hold-interval drop cleared the retained snapshot.
 	StaleSince time.Time
 	Hash       string // hex sha256 of the canonical prefix set ("" if none)
+
+	// Parse-quality of the installed snapshot (#2993). InvalidLines is the
+	// number of malformed lines skipped while parsing the last
+	// successfully-installed body; InvalidSample is a bounded verbatim sample
+	// of those lines. Degraded is true when InvalidLines > 0 — the feed
+	// installed a PARTIAL set (some published lines were dropped), which an
+	// operator should investigate even though valid prefixes are enforced.
+	InvalidLines  int
+	InvalidSample []string
+	Degraded      bool
 }
 
 func (m *Manager) refreshLoop(ctx context.Context, fs *feedState, interval time.Duration) {
@@ -338,6 +366,12 @@ func (m *Manager) refreshLoop(ctx context.Context, fs *feedState, interval time.
 type fetchResult struct {
 	prefixes []string // canonicalized, deduped, sorted
 	hash     [32]byte
+
+	// invalidLines counts malformed lines skipped during parse; invalidSample
+	// holds up to maxInvalidSample verbatim offenders (#2993). A clean body
+	// leaves both zero/nil.
+	invalidLines  int
+	invalidSample []string
 }
 
 // fetchFeed performs a single GET, parses + canonicalizes the body, and applies
@@ -384,6 +418,8 @@ func (m *Manager) readFeed(ctx context.Context, fs *feedState) (fetchResult, err
 // Reads io.Reader (not http.Response) so it is unit-testable in isolation.
 func parseFeed(r io.Reader) (fetchResult, error) {
 	var prefixes []string
+	var invalidLines int
+	var invalidSample []string
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
 	for scanner.Scan() {
@@ -401,9 +437,18 @@ func parseFeed(r io.Reader) (fetchResult, error) {
 			} else {
 				prefixes = append(prefixes, fmt.Sprintf("%s/128", ip.String()))
 			}
+		} else {
+			// A non-comment line that is neither a CIDR nor a bare IP. Feed
+			// providers occasionally emit stray text, but a malformed line can
+			// also be THE line that matters for a denylist (#2993). We still
+			// skip it (the published valid prefixes are installed), but it is no
+			// longer silent: count it and keep a bounded sample so the fetch is
+			// observably degraded rather than reporting a clean success.
+			invalidLines++
+			if len(invalidSample) < maxInvalidSample {
+				invalidSample = append(invalidSample, line)
+			}
 		}
-		// Invalid lines are skipped (feed providers occasionally emit comments
-		// or stray text); only a scanner-level error fails the whole fetch.
 	}
 	if err := scanner.Err(); err != nil {
 		// Overlong line (bufio.ErrTooLong) or transport read error mid-stream.
@@ -418,7 +463,12 @@ func parseFeed(r io.Reader) (fetchResult, error) {
 		return fetchResult{}, fmt.Errorf("feed returned no usable prefixes")
 	}
 
-	return fetchResult{prefixes: canon, hash: hashPrefixes(canon)}, nil
+	return fetchResult{
+		prefixes:      canon,
+		hash:          hashPrefixes(canon),
+		invalidLines:  invalidLines,
+		invalidSample: invalidSample,
+	}, nil
 }
 
 // canonicalize dedups and sorts the prefix list. Input prefixes are already in
@@ -468,11 +518,23 @@ func (m *Manager) installSnapshot(fs *feedState, res fetchResult) {
 	fs.lastSuccess = now
 	fs.lastError = ""
 	fs.staleSince = time.Time{}
+	fs.invalidLines = res.invalidLines
+	fs.invalidSample = res.invalidSample
 	m.mu.Unlock()
 
 	slog.Info("dynamic-address: feed updated",
 		"name", fs.name, "prefixes", len(res.prefixes), "previous", oldCount,
-		"changed", changed)
+		"changed", changed, "invalid_lines", res.invalidLines)
+
+	// A degraded install (some published lines skipped) is loud, but only on a
+	// content change so a persistently-malformed-but-stable feed does not flood
+	// the journal on every refresh tick (#2993). The per-fetch invalid count is
+	// always carried in the Info line above and surfaced via FeedInfo.
+	if changed && res.invalidLines > 0 {
+		slog.Warn("dynamic-address: feed installed a PARTIAL set — skipped invalid lines (degraded)",
+			"name", fs.name, "prefixes", len(res.prefixes),
+			"invalid_lines", res.invalidLines, "invalid_sample", res.invalidSample)
+	}
 
 	if changed && m.onUpdate != nil {
 		m.onUpdate()
@@ -515,6 +577,10 @@ func (m *Manager) recordFailure(fs *feedState, ferr error) {
 			// Copilot #2: no snapshot is retained as stale anymore — clear
 			// StaleSince so FeedInfo.StaleSince matches its docstring.
 			fs.staleSince = time.Time{}
+			// No snapshot remains, so its parse-quality is meaningless — clear
+			// the degraded markers too (#2993).
+			fs.invalidLines = 0
+			fs.invalidSample = nil
 			dropped = true
 		}
 	}

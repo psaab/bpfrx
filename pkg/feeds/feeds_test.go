@@ -3,6 +3,7 @@ package feeds
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -78,6 +79,144 @@ func TestParseFeedCanonicalizesAndDedups(t *testing.T) {
 		if !gotSet[w] {
 			t.Errorf("missing canonical prefix %q in %v", w, got)
 		}
+	}
+}
+
+// TestParseFeedCountsInvalidLines is the #2993 fail-on-revert test. A feed body
+// mixing valid + invalid lines must install the valid prefixes AND surface the
+// count (plus a bounded sample) of the skipped invalid lines — not silently
+// drop them and report a clean parse. Reverting the parse-side counting makes
+// invalidLines == 0 and turns this RED.
+func TestParseFeedCountsInvalidLines(t *testing.T) {
+	body := strings.Join([]string{
+		"192.0.2.0/24",
+		"garbage one",                  // invalid
+		"203.0.113.0/24",               // valid
+		"203.0.113.0/24 trailing-junk", // CIDR + stray text -> invalid
+		"not-an-ip",                    // invalid
+		"10.0.0.0/8",                   // valid
+		"# a comment",                  // skipped, not counted invalid
+	}, "\n")
+
+	res, err := parseFeed(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("parseFeed error: %v", err)
+	}
+	if len(res.prefixes) != 3 {
+		t.Fatalf("got %d valid prefixes %v, want 3 (valid lines still installed)",
+			len(res.prefixes), res.prefixes)
+	}
+	if res.invalidLines != 3 {
+		t.Fatalf("invalidLines = %d, want 3 (mixed body must count skipped lines, not silently drop)",
+			res.invalidLines)
+	}
+	if len(res.invalidSample) == 0 {
+		t.Fatal("invalidSample empty; want a bounded verbatim sample of skipped lines")
+	}
+	for _, s := range res.invalidSample {
+		if s == "# a comment" || s == "192.0.2.0/24" {
+			t.Errorf("invalidSample contains a non-invalid line %q", s)
+		}
+	}
+}
+
+// TestInvalidSampleIsBounded confirms the sample never exceeds maxInvalidSample
+// even for a wholesale-garbage body, while the total count is exact.
+func TestInvalidSampleIsBounded(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("192.0.2.0/24\n") // one valid prefix so parse succeeds
+	const garbage = 50
+	for i := 0; i < garbage; i++ {
+		fmt.Fprintf(&b, "junk-line-%d\n", i)
+	}
+	res, err := parseFeed(strings.NewReader(b.String()))
+	if err != nil {
+		t.Fatalf("parseFeed error: %v", err)
+	}
+	if res.invalidLines != garbage {
+		t.Errorf("invalidLines = %d, want %d", res.invalidLines, garbage)
+	}
+	if len(res.invalidSample) != maxInvalidSample {
+		t.Errorf("invalidSample len = %d, want bounded to %d", len(res.invalidSample), maxInvalidSample)
+	}
+}
+
+// TestMixedFeedDegradedStatus confirms a mixed body installs valid prefixes and
+// surfaces a degraded status with the invalid-line count through AllFeeds.
+func TestMixedFeedDegradedStatus(t *testing.T) {
+	m := New(func() {})
+	srv := &bodyServer{}
+	srv.set("192.0.2.0/24\nnot-an-ip\n203.0.113.0/24\n", http.StatusOK)
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+
+	fs := m.newFeed("mixed", ts.URL, time.Hour)
+	m.fetchFeed(context.Background(), fs)
+
+	info := m.AllFeeds()["mixed"]
+	if info.Prefixes != 2 {
+		t.Errorf("Prefixes = %d, want 2 (valid lines installed)", info.Prefixes)
+	}
+	if info.InvalidLines != 1 {
+		t.Errorf("InvalidLines = %d, want 1", info.InvalidLines)
+	}
+	if !info.Degraded {
+		t.Error("Degraded = false despite a skipped invalid line; want true")
+	}
+	if len(info.InvalidSample) != 1 || info.InvalidSample[0] != "not-an-ip" {
+		t.Errorf("InvalidSample = %v, want [not-an-ip]", info.InvalidSample)
+	}
+}
+
+// TestCleanFeedNotDegraded is the no-behaviour-change guard: an all-valid feed
+// installs fully with zero invalid lines and is NOT marked degraded.
+func TestCleanFeedNotDegraded(t *testing.T) {
+	m := New(func() {})
+	srv := &bodyServer{}
+	srv.set("192.0.2.0/24\n203.0.113.0/24\n", http.StatusOK)
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+
+	fs := m.newFeed("clean", ts.URL, time.Hour)
+	m.fetchFeed(context.Background(), fs)
+
+	info := m.AllFeeds()["clean"]
+	if info.Prefixes != 2 {
+		t.Errorf("Prefixes = %d, want 2", info.Prefixes)
+	}
+	if info.InvalidLines != 0 {
+		t.Errorf("InvalidLines = %d, want 0 for a clean feed", info.InvalidLines)
+	}
+	if info.Degraded {
+		t.Error("clean feed marked Degraded")
+	}
+	if len(info.InvalidSample) != 0 {
+		t.Errorf("InvalidSample = %v, want empty for a clean feed", info.InvalidSample)
+	}
+}
+
+// TestDegradedClearsAfterCleanRefetch confirms a feed that recovers (provider
+// fixes the body) drops the degraded markers on the next clean install.
+func TestDegradedClearsAfterCleanRefetch(t *testing.T) {
+	m := New(func() {})
+	srv := &bodyServer{}
+	srv.set("192.0.2.0/24\nbad-line\n", http.StatusOK)
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+
+	fs := m.newFeed("f", ts.URL, time.Hour)
+	ctx := context.Background()
+	m.fetchFeed(ctx, fs)
+	if info := m.AllFeeds()["f"]; !info.Degraded || info.InvalidLines != 1 {
+		t.Fatalf("first fetch not degraded: %+v", info)
+	}
+
+	// Provider fixes the body — a clean content change.
+	srv.set("192.0.2.0/24\n198.51.100.0/24\n", http.StatusOK)
+	m.fetchFeed(ctx, fs)
+	info := m.AllFeeds()["f"]
+	if info.Degraded || info.InvalidLines != 0 {
+		t.Errorf("degraded markers not cleared after clean refetch: %+v", info)
 	}
 }
 
