@@ -286,22 +286,113 @@ func TestNftRuleFromTermDSCP(t *testing.T) {
 	}
 }
 
+// TestNftRuleFromTermTCPFlags covers the #3231 fix for the TCP-flags
+// AND-semantics bug (071-06). The single-flag, plain-list, and negated
+// (`syn & !ack`) forms must all lower to the canonical nft masked-equality
+// form `tcp flags & (mask) == required`, NOT the pre-fix raw comma-join
+// (`tcp flags syn,&,!ack`) which is an nft syntax error that rejects the whole
+// atomically-loaded ruleset and fails the lo0 control-plane filter OPEN.
 func TestNftRuleFromTermTCPFlags(t *testing.T) {
 	prefixLists := map[string]*config.PrefixList{}
 
-	term := &config.FirewallFilterTerm{
-		Name:      "syn-only",
-		Protocols: []string{"tcp"},
-		TCPFlags:  []string{"syn"},
-		Action:    "discard",
+	cases := []struct {
+		name  string
+		flags []string
+		want  string
+	}{
+		{
+			// Single required flag — no parentheses needed on either side.
+			name:  "syn-only",
+			flags: []string{"syn"},
+			want:  "meta l4proto tcp tcp flags & syn == syn drop",
+		},
+		{
+			// Plain list is the Junos AND-conjunction (both required), NOT a
+			// disjunctive comma set. mask == required == syn|ack.
+			name:  "syn-ack-list",
+			flags: []string{"syn", "ack"},
+			want:  "meta l4proto tcp tcp flags & (syn | ack) == (syn | ack) drop",
+		},
+		{
+			// Negated form: SYN required, ACK forbidden. The mentioned mask is
+			// syn|ack; the required side is just syn (ACK must be clear).
+			name:  "syn-not-ack",
+			flags: []string{"syn", "&", "!ack"},
+			want:  "meta l4proto tcp tcp flags & (syn | ack) == syn drop",
+		},
 	}
-	rule := nftRuleFromTerm(term, "ip", prefixLists)
-	want := "meta l4proto tcp tcp flags syn drop"
-	if rule != want {
-		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			term := &config.FirewallFilterTerm{
+				Name:      c.name,
+				Protocols: []string{"tcp"},
+				TCPFlags:  c.flags,
+				Action:    "discard",
+			}
+			rule := nftRuleFromTerm(term, "ip", prefixLists)
+			if rule != c.want {
+				t.Errorf("flags %v\n got:  %s\n want: %s", c.flags, rule, c.want)
+			}
+			// The pre-fix raw-join must never reappear (it is invalid nft).
+			if strings.Contains(rule, "tcp flags "+strings.Join(c.flags, ",")) {
+				t.Errorf("flags %v lowered to the raw comma-join (#3231 regression): %s", c.flags, rule)
+			}
+		})
 	}
 }
 
+// TestNftRuleFromTermPortExcept covers the #3231 fix for dropped port-except
+// matches (071-08). source-port-except / destination-port-except must emit the
+// nft negated form; before the fix they were silently ignored, so a discard
+// term blocked the exempt ports and an accept-all-except term bypassed them.
+func TestNftRuleFromTermPortExcept(t *testing.T) {
+	prefixLists := map[string]*config.PrefixList{}
+
+	// destination-port-except, single value.
+	term := &config.FirewallFilterTerm{
+		Name:            "accept-except-ssh",
+		Protocols:       []string{"tcp"},
+		DestPortsExcept: []string{"22"},
+		Action:          "accept",
+	}
+	rule := nftRuleFromTerm(term, "ip", prefixLists)
+	want := "meta l4proto tcp th dport != 22 accept"
+	if rule != want {
+		t.Errorf("dest-port-except single:\n got:  %s\n want: %s", rule, want)
+	}
+
+	// destination-port-except, multi value (nft negated set).
+	term2 := &config.FirewallFilterTerm{
+		Name:            "accept-except-web",
+		Protocols:       []string{"tcp"},
+		DestPortsExcept: []string{"80", "443"},
+		Action:          "accept",
+	}
+	rule2 := nftRuleFromTerm(term2, "ip", prefixLists)
+	want2 := "meta l4proto tcp th dport != { 80, 443 } accept"
+	if rule2 != want2 {
+		t.Errorf("dest-port-except multi:\n got:  %s\n want: %s", rule2, want2)
+	}
+
+	// source-port-except.
+	term3 := &config.FirewallFilterTerm{
+		Name:              "src-except",
+		Protocols:         []string{"udp"},
+		SourcePortsExcept: []string{"123"},
+		Action:            "discard",
+	}
+	rule3 := nftRuleFromTerm(term3, "ip", prefixLists)
+	want3 := "meta l4proto udp th sport != 123 drop"
+	if rule3 != want3 {
+		t.Errorf("source-port-except:\n got:  %s\n want: %s", rule3, want3)
+	}
+}
+
+// TestNftRuleFromTermFragment covers the #3231 fix for the IPv6 is-fragment
+// bug (071-09). The ip4 chain emits the IPv4 fragment-offset test; the ip6
+// chain must emit the IPv6 fragment extension-header test (`exthdr frag
+// exists`), NOT `ip frag-off`, which is an inet6 syntax error that rejects the
+// whole ruleset and fails the lo0 filter OPEN.
 func TestNftRuleFromTermFragment(t *testing.T) {
 	prefixLists := map[string]*config.PrefixList{}
 
@@ -310,9 +401,19 @@ func TestNftRuleFromTermFragment(t *testing.T) {
 		IsFragment: true,
 		Action:     "discard",
 	}
+
 	rule := nftRuleFromTerm(term, "ip", prefixLists)
 	want := "ip frag-off & 0x1fff != 0 drop"
 	if rule != want {
-		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
+		t.Errorf("ip4 fragment:\n got:  %s\n want: %s", rule, want)
+	}
+
+	rule6 := nftRuleFromTerm(term, "ip6", prefixLists)
+	want6 := "exthdr frag exists drop"
+	if rule6 != want6 {
+		t.Errorf("ip6 fragment:\n got:  %s\n want: %s", rule6, want6)
+	}
+	if strings.Contains(rule6, "ip frag-off") {
+		t.Errorf("ip6 chain emitted IPv4-only `ip frag-off` (#3231 regression): %s", rule6)
 	}
 }
