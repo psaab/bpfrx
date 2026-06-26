@@ -249,6 +249,15 @@ pub(crate) struct FlexMatchSnapshot {
     pub value: u32,
     #[serde(default)]
     pub mask: u32,
+    /// #3232: the Junos `match-start` base the `offset` is relative to. ""
+    /// (omitted) and "layer-3" both mean the L3/IP-header base (the historical
+    /// default); "layer-4" offsets from the transport header. The Go control
+    /// plane rejects `payload`/unknown at commit, so only ""/"layer-3"/
+    /// "layer-4" reach the wire. `default` + `skip_serializing_if` keep wire
+    /// parity with an older control plane that omits the field (#1961) and keep
+    /// the layer-3 specimen byte-identical (the protocol_wire_v1 fixture).
+    #[serde(rename = "match_start", default, skip_serializing_if = "String::is_empty")]
+    pub match_start: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

@@ -81,6 +81,22 @@ pub(crate) enum FilterAction {
 // for the classification table, the path (a) / path (b) recipes,
 // and the canonical reference tests.
 // ============================================================
+/// #3232: the Junos `flexible-match-range match-start` base the term's
+/// `flex_offset` is measured from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FlexMatchStart {
+    /// Offset from the start of the L3/IP header — the #3077 default ("" /
+    /// "layer-3" on the wire).
+    #[default]
+    Layer3,
+    /// Offset from the start of the L4/transport header ("layer-4").
+    Layer4,
+    /// An unrecognized match-start (e.g. "payload") that slipped past the Go
+    /// commit gate on the tolerant peer-sync path. The matcher fails the flex
+    /// term CLOSED rather than silently evaluate it at the wrong base.
+    Unsupported,
+}
+
 /// Compiled filter term with pre-parsed match criteria.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -190,6 +206,14 @@ pub(crate) struct FilterTerm {
     pub(crate) flex_length: u8,
     pub(crate) flex_value: u32,
     pub(crate) flex_mask: u32,
+    // #3232: the base `flex_offset` is measured from. Layer3 (default) reads
+    // from the L3/IP header (TermMatchExtra::flex_l3) — the #3077 behavior;
+    // Layer4 reads from the transport header (TermMatchExtra::flex_l4). The Go
+    // compiler rejects `payload`/unknown match-start at commit, but the tolerant
+    // peer-sync path could still deliver one, so an unrecognized value lowers to
+    // `Unsupported`, which fails the term CLOSED in the matcher (never the
+    // pre-#3232 silent L3-base mis-match).
+    pub(crate) flex_match_start: FlexMatchStart,
     pub(crate) action: FilterAction,
     // #2544: fall-through. When true, this term carries NO terminating action
     // (an explicit `then next term` OR a modifier-only term). On a MATCH the
@@ -275,6 +299,12 @@ pub(crate) struct TermMatchExtra<'a> {
     /// flexible-match-range byte-offset match. `None` => no L3 bytes available
     /// on this path => a flex-constrained term fails closed. See the struct doc.
     pub(crate) flex_l3: Option<&'a [u8]>,
+    /// #3232: the L4/transport-header byte slice (start at `meta.l4_offset`) for
+    /// a `match-start layer-4` flexible-match-range. `None` => no L4 header on
+    /// this path (meta-only/deferred rebuilds, OR a non-first fragment whose
+    /// post-IP bytes are payload, not an L4 header) => a layer-4 flex term fails
+    /// closed. A layer-3 flex term ignores this and uses `flex_l3`.
+    pub(crate) flex_l4: Option<&'a [u8]>,
 }
 
 impl<'a> TermMatchExtra<'a> {
@@ -295,6 +325,10 @@ impl<'a> TermMatchExtra<'a> {
             icmp_code: self.icmp_code,
             l4_present: self.l4_present,
             flex_l3: None,
+            // #3232: drop the borrowed L4 slice too — a deferred path cannot
+            // re-read the frame, so a layer-4 flex term fails closed (same
+            // contract as flex_l3).
+            flex_l4: None,
         }
     }
 }
