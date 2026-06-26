@@ -1,3 +1,33 @@
+## 2026-06-26 — #3169: RX source-MAC dynamic-neighbor learn bypassed mac_change_epoch (stale dst_mac blackhole, sibling of #3048)
+
+- **Timestamp**: 2026-06-26
+- **Action**: fixed #3169. `learn_dynamic_neighbor` (#1787 RX source-MAC
+  data-path learn) inserted under `with_all_shards(|bulk| bulk.insert(..))`
+  with no `mac_change_epoch` bump — the FIFTH neighbor-MAC write path that
+  #3048/#3165 left uncovered. Its `pair_write_needed` gate writes on a
+  genuine MAC change (`current != Some(src_mac)`), and `lookup_neighbor_entry`
+  falls back to `dynamic_neighbors` for unresolved fast-path next-hops, so an
+  RX-learned MAC change left a cached `RewriteDescriptor.dst_mac` stale until
+  session expiry (the #3048 blackhole) and could shadow the monitor's
+  `insert_if_changed`. Added `ShardedNeighborMap::learn_pair_if_changed`
+  (bump-aware multi-key insert modeled on `bulk_replace_neighbors`): snapshots
+  each key's prior MAC via `BulkShardGuard::get` under the all-shard lock,
+  inserts the pair, bumps the epoch exactly once iff any key replaces an
+  existing MAC with a different one. First sighting and same-MAC re-learn add
+  one Relaxed read per key and no bump. Routed the learn through it.
+- **File(s)**: userspace-dp/src/afxdp/sharded_neighbor.rs,
+  userspace-dp/src/afxdp/neighbor_dispatch.rs,
+  userspace-dp/src/afxdp/sharded_neighbor_tests.rs,
+  docs/flow-cache-simplification.md, _Log.md
+- **Validation**: `cargo build --release` clean; `cargo test --release`
+  3007 pass (one pre-existing flaky wg concurrency test
+  `reconcile_peers_snapshot_is_atomic_under_concurrent_load` — passes 3/3 in
+  isolation, unrelated). Added 4 tests `mac_change_epoch_rx_learn_*`;
+  fail-on-revert proven: neutralizing the bump turns
+  `mac_change_epoch_rx_learn_bumps_on_mac_change` and
+  `mac_change_epoch_rx_learn_pair_single_bump_for_both_keys` RED while the two
+  no-bump tests stay GREEN; restored byte-identical.
+
 ## 2026-06-25 — #3046: TCP RST sessions reaped on a short timeout (not the 30s FIN close)
 
 - **Timestamp**: 2026-06-25

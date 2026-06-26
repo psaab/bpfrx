@@ -293,6 +293,53 @@ impl ShardedNeighborMap {
         });
     }
 
+    /// #3169: bump-aware atomic multi-key insert for the #1787 RX
+    /// source-MAC data-path learn (`learn_dynamic_neighbor`). Installs
+    /// the SAME MAC under up to N keys (the #949 pair-write: the physical
+    /// ingress ifindex plus the resolved logical VLAN sub-ifindex) under
+    /// ONE all-shard lock so a reader sees either both or neither, never a
+    /// stale half — and bumps `mac_change_epoch` exactly once if ANY key
+    /// REPLACES an existing neighbor's MAC with a different one.
+    ///
+    /// This is the FIFTH neighbor-MAC write path. Its `pair_write_needed`
+    /// caller gate fires on a genuine MAC change (`current != Some(mac)`),
+    /// not just first sighting, so the learn really does mutate an
+    /// existing neighbor's MAC — and `lookup_neighbor_entry` falls back to
+    /// `dynamic_neighbors` for a next-hop the kernel never ARP-resolves
+    /// (the common AF_XDP fast-path case), so a stale cached `dst_mac`
+    /// would blackhole until session expiry without this bump (#3169).
+    ///
+    /// Semantics match the per-key paths exactly: a first insert
+    /// (`prior == None`) and a same-MAC re-learn do NOT bump; only a
+    /// differing prior MAC does. The prior MAC is read via
+    /// `BulkShardGuard::get` under the same bulk lock as the insert and
+    /// the bump, so a concurrent fast-path hit never observes the new MAC
+    /// paired with the old epoch.
+    pub(crate) fn learn_pair_if_changed(
+        &self,
+        keys: &[(i32, IpAddr)],
+        val: NeighborEntry,
+    ) {
+        self.with_all_shards(|bulk| {
+            let mut mac_changed = false;
+            for key in keys {
+                if let Some(prior) = bulk.get(key)
+                    && prior.mac != val.mac
+                {
+                    mac_changed = true;
+                }
+            }
+            for key in keys {
+                bulk.insert(*key, val);
+            }
+            // A single fetch_add covers the whole pair: the flow-cache
+            // invalidation is a coarse global epoch.
+            if mac_changed {
+                self.mac_change_epoch.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
     /// Total entry count summed across shards. Locks all shards in
     /// order. Used by `coordinator::dynamic_neighbor_status`.
     pub(crate) fn len(&self) -> usize {
