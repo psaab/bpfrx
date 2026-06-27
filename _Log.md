@@ -22542,3 +22542,24 @@ top.
   **File(s)**: pkg/api/metrics_counters.go,
   pkg/api/metrics_scoped_global_3286_test.go, docs/phases.md,
   pkg/api/README.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3293 — remove dead userspaceSupportsSecurityPolicies oracle (and
+  its now-orphaned wrappers userspacePolicyAddressesSupported /
+  userspacePolicyApplicationsSupported); re-point/delete tests; refresh stale
+  doc + comment references to point at the #3261 sentinel mechanism
+  **File(s)**: pkg/dataplane/userspace/capabilities.go,
+  pkg/dataplane/userspace/manager_test.go,
+  pkg/dataplane/userspace/protocol_failopen_2124_test.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/README.md,
+  pkg/config/compiler_policy_match_address_set_3149_test.go
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3298 — emit policy application terms in CONFIG order (drop the
+  lexical name-sort in expandUserspacePolicyApplications and the application-set
+  member sort in resolveUserspaceApplicationNames) so the Rust first-writer-wins
+  inactivity-timeout precedence follows policy / application-set config order,
+  not alphabetical name. Added fail-on-revert precedence tests + gaps-doc note.
+  **File(s)**: pkg/dataplane/userspace/capabilities.go,
+  pkg/dataplane/userspace/app_inactivity_timeout_precedence_3298_test.go,
+  docs/userspace-dataplane-gaps.md

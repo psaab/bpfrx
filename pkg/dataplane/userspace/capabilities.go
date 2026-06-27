@@ -144,45 +144,6 @@ func userspaceSupportsThreeColorPolicers(cfg *config.Config) bool {
 	return true
 }
 
-func userspaceSupportsSecurityPolicies(cfg *config.Config) bool {
-	if cfg == nil {
-		return true
-	}
-	for _, pol := range cfg.Security.GlobalPolicies {
-		if pol == nil {
-			continue
-		}
-		// SchedulerName and Count are informational — not forwarding-critical.
-		// Schedulers define time windows (not DSCP), and counters are advisory.
-		if !userspacePolicyAddressesSupported(cfg, pol.Match.SourceAddresses) ||
-			!userspacePolicyAddressesSupported(cfg, pol.Match.DestinationAddresses) ||
-			!userspacePolicyApplicationsSupported(cfg, pol.Match.Applications) {
-			return false
-		}
-	}
-	for _, zpp := range cfg.Security.Policies {
-		if zpp == nil {
-			continue
-		}
-		for _, pol := range zpp.Policies {
-			if pol == nil {
-				continue
-			}
-			if !userspacePolicyAddressesSupported(cfg, pol.Match.SourceAddresses) ||
-				!userspacePolicyAddressesSupported(cfg, pol.Match.DestinationAddresses) ||
-				!userspacePolicyApplicationsSupported(cfg, pol.Match.Applications) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func userspacePolicyAddressesSupported(cfg *config.Config, addrs []string) bool {
-	_, ok := expandUserspacePolicyAddresses(cfg, addrs)
-	return ok
-}
-
 func expandUserspacePolicyAddresses(cfg *config.Config, addrs []string) ([]string, bool) {
 	if len(addrs) == 0 {
 		return nil, true
@@ -295,11 +256,6 @@ func resolveUserspaceAddressBookEntry(cfg *config.Config, name string) ([]string
 	return expanded, true
 }
 
-func userspacePolicyApplicationsSupported(cfg *config.Config, apps []string) bool {
-	_, ok := expandUserspacePolicyApplications(cfg, apps)
-	return ok
-}
-
 func expandUserspacePolicyApplications(cfg *config.Config, apps []string) ([]PolicyApplicationSnapshot, bool) {
 	if len(apps) == 0 {
 		return nil, true
@@ -324,12 +280,13 @@ func expandUserspacePolicyApplications(cfg *config.Config, apps []string) ([]Pol
 				return nil, false
 			}
 			// #2124: fail closed on any protocol the Rust matcher cannot
-			// represent. Returning ok=false trips the existing
-			// ForwardingSupported=false refuse-to-arm gate
-			// (userspaceSupportsSecurityPolicies). Without this a named
-			// protocol like esp/ah/sctp (accepted at commit, only lowercased
-			// here) reaches the matcher, gets dropped, and the rule collapses
-			// to match-any — permitting ALL traffic for the zone pair.
+			// represent. Returning ok=false makes buildOneRuleSnapshot emit
+			// the reserved __unsupported__ sentinel term so the helper
+			// integrity preflight rejects the whole snapshot (#3261). Without
+			// this a named protocol like esp/ah/sctp (accepted at commit, only
+			// lowercased here) reaches the matcher, gets dropped, and the rule
+			// collapses to match-any — permitting ALL traffic for the zone
+			// pair.
 			num, ok := appid.ProtocolNumber(proto)
 			if !ok {
 				return nil, false
@@ -386,27 +343,21 @@ func expandUserspacePolicyApplications(cfg *config.Config, apps []string) ([]Pol
 			expanded = append(expanded, snap)
 		}
 	}
-	sort.Slice(expanded, func(i, j int) bool {
-		if expanded[i].Name != expanded[j].Name {
-			return expanded[i].Name < expanded[j].Name
-		}
-		if expanded[i].Protocol != expanded[j].Protocol {
-			return expanded[i].Protocol < expanded[j].Protocol
-		}
-		if expanded[i].SourcePort != expanded[j].SourcePort {
-			return expanded[i].SourcePort < expanded[j].SourcePort
-		}
-		if expanded[i].DestinationPort != expanded[j].DestinationPort {
-			return expanded[i].DestinationPort < expanded[j].DestinationPort
-		}
-		// #3020: keep ICMP type/code in the sort key so two terms differing
-		// ONLY by the ICMP constraint (e.g. junos-ping vs junos-icmp-all, both
-		// proto icmp, no ports) order deterministically across HA peers.
-		if k := icmpKeyPart(expanded[i].ICMPType); k != icmpKeyPart(expanded[j].ICMPType) {
-			return k < icmpKeyPart(expanded[j].ICMPType)
-		}
-		return icmpKeyPart(expanded[i].ICMPCode) < icmpKeyPart(expanded[j].ICMPCode)
-	})
+	// #3298: emit the application terms in CONFIG order — the order the apps
+	// appear in the policy `match application` list, and within an
+	// application-set the order its members are configured (ExpandApplicationSet
+	// preserves member order; resolveUserspaceApplicationNames no longer sorts).
+	// The Rust matcher resolves an overlapping per-application inactivity-timeout
+	// first-writer-wins on the exact port (policy.rs `exact_dst_ports.or_insert`,
+	// #3227), so the emit order decides which timeout wins. Sorting by Name here
+	// made that precedence alphabetical — contradicting #3227's
+	// first-writer-wins-by-config-order contract and Junos/operator intent (two
+	// overlapping apps would resolve to the timeout of whichever name sorts
+	// first, not whichever the operator listed first). Config order is identical
+	// on both HA peers (they compile the same config), so emission stays
+	// deterministic across peers without the lexical sort. Term-level dedup is
+	// the order-independent `seen` map above, so dropping the sort does not
+	// re-introduce duplicate terms.
 	return expanded, true
 }
 
@@ -443,12 +394,18 @@ func resolveUserspaceApplicationNames(cfg *config.Config, name string) ([]string
 		return []string{name}, true
 	}
 	if _, ok := config.ResolveApplicationSet(name, cfg.Applications.ApplicationSets); ok {
+		// #3298: ExpandApplicationSet already dedups (its `seen` map) and
+		// returns members in CONFIG order. Do NOT sort here — a lexical sort
+		// would make an overlapping per-application inactivity-timeout within an
+		// application-set resolve by alphabetical member name instead of the
+		// configured member order (the Rust matcher is first-writer-wins on the
+		// exact port, #3227). The set-name dedup is handled upstream by the
+		// `seen` term key in expandUserspacePolicyApplications.
 		expanded, err := config.ExpandApplicationSet(name, &cfg.Applications)
 		if err != nil || len(expanded) == 0 {
 			return nil, false
 		}
-		sort.Strings(expanded)
-		return slices.Compact(expanded), true
+		return expanded, true
 	}
 	return nil, false
 }

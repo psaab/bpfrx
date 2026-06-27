@@ -77,9 +77,6 @@ func TestUserspaceGateAcceptsAndCanonicalizesNamedProtocol(t *testing.T) {
 	if terms[0].Protocol != "50" {
 		t.Fatalf("esp canonicalized Protocol = %q, want \"50\"", terms[0].Protocol)
 	}
-	if !userspaceSupportsSecurityPolicies(cfg) {
-		t.Fatal("userspaceSupportsSecurityPolicies = false, want true for esp policy")
-	}
 }
 
 func TestUserspaceGateFailsClosedOnUnknownProtocol(t *testing.T) {
@@ -90,9 +87,6 @@ func TestUserspaceGateFailsClosedOnUnknownProtocol(t *testing.T) {
 	cfg := twoZonePolicyCfg(&config.Application{Name: "weird", Protocol: "definitely-not-a-proto"}, "weird")
 	if _, ok := expandUserspacePolicyApplications(cfg, []string{"weird"}); ok {
 		t.Fatal("expandUserspacePolicyApplications = ok=true, want false for unknown protocol")
-	}
-	if userspaceSupportsSecurityPolicies(cfg) {
-		t.Fatal("userspaceSupportsSecurityPolicies = true, want false for unknown protocol")
 	}
 }
 

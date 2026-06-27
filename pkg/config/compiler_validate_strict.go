@@ -1590,8 +1590,9 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 // (compiler_validate_warn.go), yet the userspace capability gate
 // (resolveUserspaceApplicationNames in pkg/dataplane/userspace/capabilities.go)
 // resolves the SAME name set and returns false for an unknown name →
-// expandUserspacePolicyApplications fails → userspaceSupportsSecurityPolicies
-// returns false → the dataplane REFUSES TO ARM security policies. The operator
+// expandUserspacePolicyApplications fails → the built rule carries the reserved
+// __unsupported__ sentinel term → the dataplane refuses to arm that policy
+// (#3261, helper integrity preflight). The operator
 // gets a green commit and a silently DISARMED policy engine on the firewall's
 // primary allow/deny path — a commit/apply contract split. Failing the
 // undefined reference at commit turns the silent disarm into an
@@ -1629,9 +1630,9 @@ func validatePolicyMatchApplicationsStrict(cfg *Config) error {
 	// the runtime gate cannot diverge: a name resolves only if it is a
 	// predefined / user application OR an application-set that EXPANDS to >= 1
 	// member. A defined-but-EMPTY application-set resolves by NAME but expands
-	// to zero members → the runtime gate returns false →
-	// userspaceSupportsSecurityPolicies false → the dataplane refuses to arm
-	// security policies (#3146 — the same fail-open class this gate kills).
+	// to zero members → the runtime gate returns false → the built rule carries
+	// the __unsupported__ sentinel → the dataplane refuses to arm that policy
+	// (#3146 — the same fail-open class this gate kills).
 	// #2217's validateApplicationSetMembersStrict `continue`s on an empty set,
 	// so nothing else catches it.
 	appRefError := func(scope, policyName, name string) error {
@@ -1832,8 +1833,9 @@ func policyMatchAddressBookResolves(ab *AddressBook, name string) error {
 // whose (recursive) members dangle, or that is a defined-but-EMPTY set, or a
 // defined address with no prefix. In all of these the runtime
 // resolveUserspaceAddressBookEntry returns false / an empty expansion →
-// userspacePolicyAddressesSupported false → userspaceSupportsSecurityPolicies
-// false → the dataplane REFUSES to arm security policies. The operator got a
+// expandUserspacePolicyAddresses fails → the built rule carries the
+// __unsupported_address__ sentinel → the dataplane refuses to arm that policy.
+// The operator got a
 // green commit (only a compiler_validate_warn.go warning) and a silently
 // DISARMED allow/deny path — the same commit/apply fail-open class #3144/#3146
 // close for applications.
