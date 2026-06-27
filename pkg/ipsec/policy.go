@@ -512,6 +512,61 @@ func PrepareConfig(cfg *config.Config) *config.IPsecConfig {
 	return out
 }
 
+// HasDHCPBoundGateway reports whether any IPsec gateway resolves its
+// local bind address DYNAMICALLY from a DHCP-managed interface — i.e.
+// the gateway sets external-interface, carries no explicit
+// local-address (so PrepareConfig resolves local_addrs at apply time),
+// and the referenced interface unit is DHCP/DHCPv6-managed. Such a
+// gateway's swanctl local_addrs tracks the lease, so a runtime lease
+// change (DHCP renew to a new address) must trigger a swanctl
+// re-render; otherwise strongSwan keeps binding to the stale IP and the
+// tunnel cannot re-establish (#2884).
+//
+// It returns false when no gateway is lease-dependent, letting the
+// daemon skip the swanctl re-render on unrelated DHCP lease refreshes
+// (e.g. a management-only interface no IPsec gateway uses) and avoid an
+// SA-resetting reload storm.
+func HasDHCPBoundGateway(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, gw := range cfg.Security.IPsec.Gateways {
+		if gw == nil || gw.ExternalIface == "" || gw.LocalAddress != "" {
+			continue
+		}
+		if interfaceRefIsDHCP(cfg, gw.ExternalIface) {
+			return true
+		}
+	}
+	return false
+}
+
+// interfaceRefIsDHCP reports whether the interface reference (e.g.
+// "ge-0/0/0" or "ge-0/0/0.0") names a unit configured for DHCPv4 or
+// DHCPv6. A bare reference (no unit) matches if ANY of the interface's
+// units is DHCP-managed. Mirrors resolveConfiguredInterfaceAddress's
+// base/unit parsing so the two derivations cannot drift.
+func interfaceRefIsDHCP(cfg *config.Config, ifaceRef string) bool {
+	parts := strings.SplitN(ifaceRef, ".", 2)
+	ifc, ok := cfg.Interfaces.Interfaces[parts[0]]
+	if !ok || ifc == nil {
+		return false
+	}
+	if len(parts) == 2 {
+		if n, err := strconv.Atoi(parts[1]); err == nil {
+			unit, ok := ifc.Units[n]
+			return ok && unit != nil && (unit.DHCP || unit.DHCPv6)
+		}
+		return false
+	}
+	for _, unit := range ifc.Units {
+		if unit != nil && (unit.DHCP || unit.DHCPv6) {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveInterfaceAddress selects the local-address to bind for an IKE SA
 // from the external interface, constrained to the remote gateway's address
 // family. family is the resolved remote family hint (4, 6, or 0 for

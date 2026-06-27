@@ -152,8 +152,9 @@ classification covers the common Junos `system-services` (ssh, ping, dns,
 dhcp/dhcpv6, ike, ntp, snmp, ...) and `protocols` (ospf, bgp,
 router-discovery, ...) names; `system-services all` / `any-service`
 short-circuit to a full admit; an unrecognised token contributes nothing
-(fail-closed). ICMP-based services (`ping`, `router-discovery`) admit echo /
-solicitation at L4-protocol granularity, not ICMP sub-type.
+(fail-closed). ICMP-based services admit only the specific ICMP **sub-types**
+they imply (#3201/#3240), matching the nft chain exactly — see "ICMP admission
+is sub-type specific" below.
 
 **Service/protocol matches are address-family aware (#3225).** Several Junos
 host-inbound tokens are family-SPECIFIC in intent: `system-services dhcp` is
@@ -177,17 +178,46 @@ absent from the maps and admit on both families as before. `protocols all`
 expands to the routing set INCLUDING both `ospf` and `ospf3`, so it admits proto
 89 on each family (and rip on v4, ripng on v6).
 
-**ICMP error / PMTUD control messages are always admitted (#3171).** Before
-the per-zone lookup, `host_inbound_admits` exempts ICMP/ICMPv6 *error* subtypes
-(`is_icmp_host_inbound_error`: ICMPv4 destination-unreachable/time-exceeded/
-parameter-problem, ICMPv6 type 1/2/3/4) regardless of whether the ingress zone
-lists `ping`. This mirrors the kernel `chain input` global ICMP-error accept
-(`pkg/daemon/daemon_nft.go`) so the embedded-ICMP / DNAT-to-self subset listed
-above — e.g. a PMTUD packet-too-big or traceroute time-exceeded landing on the
-XSK LocalDelivery path — is no longer fail-toward-dropped on a configured
-ping-less zone. ECHO-REQUEST (v4 type 8 / v6 type 128) is **not** in the error
-set, so a ping-less zone still drops echo. Keep `is_icmp_host_inbound_error` in
-lock-step with the kernel chain's `icmp`/`icmpv6` accept lines.
+**ICMP admission is sub-type specific (#3201/#3240).** A host-inbound service
+admits only the ICMP **types** it implies, mirroring the nft chain's named-type
+matches (`pkg/daemon/daemon_nft.go`) rather than opening the whole ICMP/ICMPv6
+L4 protocol. `ZoneHostInbound` carries per-family type sets `icmp_types_v4` /
+`icmp_types_v6`, and `admits(protocol, port, is_v6, icmp_type)` checks membership
+for protocol 1 / 58:
+
+- `ping` → echo-request only (v4 type 8 / v6 type 128) — nft `icmp/icmpv6 type
+  echo-request`. A ping zone NO LONGER admits redirect / timestamp /
+  router-advertisement.
+- `router-discovery` → IPv4 router-advertisement (9) + router-solicitation (10)
+  only — nft `icmp type { 9, 10 }`. On v6 it contributes NOTHING per-zone: v6
+  RS/RA ride the global ND accept (below), exactly as the nft chain returns nil
+  for v6 router-discovery and relies on the global ND accept (#3240).
+
+Before #3201 both `ping` and `router-discovery` set a protocol-wide `icmp` /
+`icmpv6` bit, so the AF_XDP fast path admitted ANY ICMP type the nft chain would
+drop (a ping zone admitted router-advertisement / timestamp; a router-discovery
+zone admitted echo). The per-zone Rust admit set now equals the nft chain's
+per-service type set.
+
+**ICMP error / PMTUD + IPv6 ND are always admitted (#3171/#3201).** Before the
+per-zone lookup, `host_inbound_admits` exempts a global ICMP set
+(`is_icmp_host_inbound_global_accept`) regardless of which services the ingress
+zone lists, mirroring the kernel `chain input` global accepts
+(`pkg/daemon/daemon_nft.go`):
+
+- ICMPv4 *error* subtypes — destination-unreachable (3) / time-exceeded (11) /
+  parameter-problem (12) — so PMTUD / unreachable / traceroute-to-self landing
+  on the XSK LocalDelivery path is not fail-toward-dropped on a ping-less zone.
+- ICMPv6 *error* (1/2/3/4) PLUS the **Neighbor Discovery** set (133 RS, 134 RA,
+  135 NS, 136 NA, 137 Redirect). ND is core L3 operation accepted globally by
+  the nft chain; admitting it here is what lets per-zone `router-discovery` carry
+  nothing on v6 while still matching nft.
+
+ECHO-REQUEST (v4 8 / v6 128) and IPv4 router-advert/solicit (9/10) are **not** in
+the global set — they stay gated on the `ping` / `router-discovery` tokens, so a
+zone that omits them still drops those types. Keep
+`is_icmp_host_inbound_global_accept` in lock-step with the kernel chain's
+`icmp`/`icmpv6` global accept lines.
 
 **`protocols all` is scoped, NOT a blanket bypass (#3199).** In Junos
 `host-inbound-traffic protocols all` admits every supported ROUTING protocol
