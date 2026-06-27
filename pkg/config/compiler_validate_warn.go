@@ -501,6 +501,11 @@ func ValidateConfig(cfg *Config) []string {
 	}
 
 	if fm := cfg.Services.FlowMonitoring; fm != nil {
+		// #3270: flow-dir is derived from the per-zone sampling-direction
+		// (`sampling input`/`output`). With no sampling-direction configured
+		// anywhere the derived flowDirection is always 0 (ingress), so the
+		// exported IE 61 would be a constant — warn the operator in that case.
+		hasSampling := anySamplingDirectionConfigured(cfg)
 		checkExtWarning := func(kind, name string, exts []string) {
 			for _, ext := range exts {
 				switch ext {
@@ -508,13 +513,14 @@ func ValidateConfig(cfg *Config) []string {
 					warnings = append(warnings, fmt.Sprintf(
 						"flow-monitoring %s template %s: export-extension app-id configured but application data is not available in flow records", kind, name))
 				case "flow-dir":
-					// #2613: flowDirection (IE 61) was dropped from the v9/IPFIX
-					// templates because the SESSION_CLOSE wire frame carries no
-					// per-flow direction — exporting it produced authoritative
-					// zeros at the collector. The extension is still accepted but
-					// no longer adds the field; warn rather than silently lie.
-					warnings = append(warnings, fmt.Sprintf(
-						"flow-monitoring %s template %s: export-extension flow-dir configured but flow-direction data is not available in flow records (the field is no longer exported)", kind, name))
+					// #3270: flowDirection (IE 61) is exported again, derived in
+					// Go from the per-zone sampling-direction. It is only
+					// meaningful when at least one zone has `sampling input` or
+					// `sampling output`; otherwise every record reports 0.
+					if !hasSampling {
+						warnings = append(warnings, fmt.Sprintf(
+							"flow-monitoring %s template %s: export-extension flow-dir configured but no interface has sampling input/output; flowDirection will always be 0 (ingress)", kind, name))
+					}
 				}
 			}
 		}
@@ -1391,4 +1397,26 @@ func validateCoSOversubscriptionWarnings(cos *ClassOfServiceConfig) []string {
 		}
 	}
 	return warnings
+}
+
+// anySamplingDirectionConfigured reports whether any interface unit has
+// sampling input or output enabled (#3270). It mirrors what
+// flowexport.BuildSamplingZones consumes per zone: flow-dir derivation reads
+// the per-zone sampling-direction, which is empty when no unit sets either
+// flag, in which case the exported flowDirection is a constant 0.
+func anySamplingDirectionConfigured(cfg *Config) bool {
+	for _, iface := range cfg.Interfaces.Interfaces {
+		if iface == nil {
+			continue
+		}
+		for _, unit := range iface.Units {
+			if unit == nil {
+				continue
+			}
+			if unit.SamplingInput || unit.SamplingOutput {
+				return true
+			}
+		}
+	}
+	return false
 }

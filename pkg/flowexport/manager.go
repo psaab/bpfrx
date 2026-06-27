@@ -84,6 +84,16 @@ type ExportConfig struct {
 	ServesInet     bool
 	ServesInet6    bool
 	V9TemplateOpts V9TemplateOptions // optional v9 template field control
+	// IncludeFlowDir is the resolved `export-extension flow-dir` knob for THIS
+	// template group (#3270). When set, the NetFlow v9 / IPFIX template
+	// advertises flowDirection (IE 61) and the encoder writes the per-flow
+	// direction derived from the per-zone sampling-direction (see
+	// FlowDirection). It is opt-in: a group whose template did not request
+	// flow-dir leaves IE 61 absent so a collector never ingests a synthetic
+	// zero (the #2613 regression). For NetFlow v9 this mirrors
+	// V9TemplateOpts.IncludeFlowDir (the v9 template builder reads the latter);
+	// the IPFIX exporter, which has no V9TemplateOptions, reads this field.
+	IncludeFlowDir bool
 	// sampleCounter is the monotonic 1-in-N counter. It is a POINTER so all
 	// ExportConfig template groups of one INSTANCE share a single counter
 	// (the sampling rate is a per-instance property; #2462). Two different
@@ -243,6 +253,11 @@ type templateContext struct {
 	inactiveTimeout time.Duration
 	refreshRate     time.Duration
 	v9opts          V9TemplateOptions
+	// includeFlowDir is the resolved `export-extension flow-dir` knob (#3270).
+	// It is family-agnostic (set by both the v9 and IPFIX template-context
+	// resolvers); the v9 path also mirrors it into v9opts.IncludeFlowDir for
+	// the existing v9 template builder.
+	includeFlowDir bool
 }
 
 // defaultTemplateContext is the timeout/refresh fallback used for a
@@ -274,14 +289,19 @@ func v9TemplateContext(tmpl *config.NetFlowV9Template) templateContext {
 	}
 	for _, ext := range tmpl.ExportExtensions {
 		if ext == "flow-dir" {
+			// #3270: flow-dir is applied again, derived in Go from the per-zone
+			// sampling-direction (see ExportConfig.FlowDirection). Set both the
+			// v9 template toggle and the family-agnostic flag.
 			tc.v9opts.IncludeFlowDir = true
+			tc.includeFlowDir = true
 		}
 	}
 	return tc
 }
 
 // ipfixTemplateContext resolves one IPFIX template definition into a
-// templateContext (IPFIX has no v9 field options).
+// templateContext. IPFIX has no v9 field options, but it honours the
+// `export-extension flow-dir` knob (#3270) the same way version9 does.
 func ipfixTemplateContext(tmpl *config.NetFlowIPFIXTemplate) templateContext {
 	tc := defaultTemplateContext()
 	if tmpl == nil {
@@ -295,6 +315,11 @@ func ipfixTemplateContext(tmpl *config.NetFlowIPFIXTemplate) templateContext {
 	}
 	if tmpl.TemplateRefreshRate > 0 {
 		tc.refreshRate = time.Duration(tmpl.TemplateRefreshRate) * time.Second
+	}
+	for _, ext := range tmpl.ExportExtensions {
+		if ext == "flow-dir" {
+			tc.includeFlowDir = true
+		}
 	}
 	return tc
 }
@@ -414,6 +439,7 @@ func ResolveV9TemplateGroups(svc *config.ServicesConfig, fo *config.ForwardingOp
 				FlowInactiveTimeout: ctx.inactiveTimeout,
 				TemplateRefreshRate: ctx.refreshRate,
 				V9TemplateOpts:      ctx.v9opts,
+				IncludeFlowDir:      ctx.includeFlowDir,
 				SamplingRate:        rate,
 				ServesInet:          servesInet,
 				ServesInet6:         servesInet6,
@@ -473,6 +499,7 @@ func ResolveIPFIXTemplateGroups(svc *config.ServicesConfig, fo *config.Forwardin
 				FlowActiveTimeout:   ctx.activeTimeout,
 				FlowInactiveTimeout: ctx.inactiveTimeout,
 				TemplateRefreshRate: ctx.refreshRate,
+				IncludeFlowDir:      ctx.includeFlowDir,
 				SamplingRate:        rate,
 				ServesInet:          servesInet,
 				ServesInet6:         servesInet6,
@@ -575,6 +602,36 @@ func (ec *ExportConfig) ShouldExport(inZone, outZone uint16) bool {
 		return n%uint64(ec.SamplingRate) == 0
 	}
 	return true
+}
+
+// FlowDirection derives the NetFlow/IPFIX flowDirection (IE 61) for a flow
+// from the per-zone sampling-direction configuration (#3270). RFC 5102:
+// 0 = ingress (observed at the ingress observation point), 1 = egress.
+//
+// xpf exports one record per bidirectional session anchored at the initiator
+// tuple, so the direction is the OBSERVATION anchor, derived from which
+// sampling direction selected the flow for export — exactly the signal
+// ShouldExport already consults:
+//
+//   - the INGRESS zone has `sampling input`  -> 0 (ingress)
+//   - else the EGRESS zone has `sampling output` -> 1 (egress)
+//   - neither (or no sampling configured) -> 0 (default ingress)
+//
+// Ingress wins ties (both directions sampled): it matches the record's
+// initiator-tuple anchor and Junos SRX inline active-flow-monitoring, which
+// applies input sampling first. The result is a pure function of the flow's
+// two zone IDs and the static sampling config; it is meaningful only when the
+// group advertises IE 61 (IncludeFlowDir) — the encoder writes it only then,
+// and a commit-time warning fires when flow-dir is enabled with no
+// sampling-direction configured (the field would always read 0).
+func (ec *ExportConfig) FlowDirection(inZone, outZone uint16) uint8 {
+	if d, ok := ec.SamplingZones[inZone]; ok && d.Input {
+		return 0
+	}
+	if d, ok := ec.SamplingZones[outZone]; ok && d.Output {
+		return 1
+	}
+	return 0
 }
 
 // ServesFamily reports whether this instance's ExportConfig should handle a
@@ -704,6 +761,12 @@ type SessionCloseData struct {
 	TOS      uint8
 	TCPFlags uint8
 	OutIf    uint32
+	// Direction is the NetFlow/IPFIX flowDirection (IE 61) derived in the
+	// daemon callback from the per-zone sampling-direction via
+	// ExportConfig.FlowDirection (#3270): 0 = ingress, 1 = egress. It is
+	// always computed but only encoded by a group whose template enabled
+	// `export-extension flow-dir` (IncludeFlowDir).
+	Direction uint8
 }
 
 // flowStartTime resolves the flow record StartTime for a session-close event.

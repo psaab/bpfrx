@@ -68,6 +68,12 @@ type CLI struct {
 	// `show services dynamic-dns [detail]`.
 	surfaceADDNSStatsFn  func() *ddnspkg.SurfaceAStats
 	surfaceADDNSStatusFn func() []ddnspkg.SurfaceAStatusView
+	// surfaceADDNSForceFn is the operator force-now / check-now verb for
+	// `request system dynamic-dns update|check` (#3276). It arms the Surface A
+	// force latch + nudges an immediate reconcile (force=true) or only nudges a
+	// re-observe pass (force=false), honoring the per-RG owner gate. Returns
+	// (ok, message). Nil when the manager is absent (NoDataplane).
+	surfaceADDNSForceFn func(force bool) (bool, string)
 	// flowCollectorHealthFn surfaces live per-collector NetFlow v9 / IPFIX
 	// write-health for `show flow-monitoring statistics` (#2464). Nil
 	// leaves the show reporting "no flow export configured".
@@ -244,6 +250,12 @@ func (c *CLI) SetSurfaceADDNSStatsFn(fn func() *ddnspkg.SurfaceAStats) {
 // P2).
 func (c *CLI) SetSurfaceADDNSStatusFn(fn func() []ddnspkg.SurfaceAStatusView) {
 	c.surfaceADDNSStatusFn = fn
+}
+
+// SetSurfaceADDNSForceFn sets the operator force-now / check-now callback for
+// `request system dynamic-dns update|check` (#3276).
+func (c *CLI) SetSurfaceADDNSForceFn(fn func(force bool) (bool, string)) {
+	c.surfaceADDNSForceFn = fn
 }
 
 // SetVersion sets the software version string for show version.

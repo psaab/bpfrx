@@ -67,23 +67,25 @@ type templateField struct {
 // V9TemplateOptions controls which optional fields are included in v9
 // templates.
 //
-// #2613: IncludeFlowDir formerly toggled fieldDirection (IE 61) in the v9
-// templates. fieldDirection — together with SrcTos (5), TCPFlags (6),
-// InputSNMP (10) and OutputSNMP (14) — has been removed because the
-// SESSION_CLOSE wire frame carries no real value for any of them, so the
-// fields exported authoritative zeros to collectors. The option is retained
-// (still set by the `export-extension flow-dir` config knob, which the
-// schema already documents as "accepted; not applied") but no longer changes
-// the emitted template. It becomes load-bearing again only if a future
-// Rust<->Go wire-format extension threads real per-flow direction.
+// #3270: IncludeFlowDir toggles fieldDirection (IE 61) in the v9 template
+// again. Unlike the pre-#2613 version (which exported a synthetic zero), the
+// field now carries a REAL per-flow value derived in Go from the per-zone
+// sampling-direction (ExportConfig.FlowDirection): a flow whose ingress zone
+// has `sampling input` is ingress (0), a flow selected only by its egress
+// zone's `sampling output` is egress (1). It is opt-in: only a template that
+// configured `export-extension flow-dir` advertises IE 61, so a config that
+// did not request it keeps the field absent (no synthetic-zero regression).
 type V9TemplateOptions struct {
-	IncludeFlowDir bool // accepted; no longer changes the template (#2613)
+	IncludeFlowDir bool // #3270: advertise + populate flowDirection (IE 61)
 }
 
-// #2613: SrcTos/TCPFlags/Direction/InputSNMP/OutputSNMP dropped — no wire
-// data backs them on the SESSION_CLOSE path. The IncludeFlowDir/NoDir split
-// collapsed with fieldDirection's removal, so there is a single template per
-// address family.
+// netflowTemplateFieldsV4/V6 are the BASE templates (flow-dir absent), emitted
+// when `export-extension flow-dir` is not configured. #2613 dropped
+// SrcTos/TCPFlags/Direction/InputSNMP/OutputSNMP; #2749 re-introduced
+// SrcTos/TCPFlags/InputSNMP/OutputSNMP with real values; #3270 re-introduces
+// flowDirection (IE 61) but only conditionally — buildTemplateFieldsV4/V6
+// splice it in before the post-NAT trailer when IncludeFlowDir is set, so the
+// base slices stay flow-dir-free.
 var (
 	netflowTemplateFieldsV4 = []templateField{
 		{fieldIPv4SrcAddr, 4},
@@ -101,9 +103,7 @@ var (
 		// value — the ingress ifindex carried on the SESSION_CLOSE frame
 		// since #2615. Placed before the post-NAT tuple so the latter stays
 		// the trailing block (#2526 invariant); the proto->packet-counter
-		// adjacency the #2613 fail-on-revert pin checks is preserved either
-		// way. The other four #2613 drops (SrcTos 5 / TCPFlags 6 /
-		// remains absent — flowDirection has no real per-flow value yet.
+		// adjacency the #2613 fail-on-revert pin checks is preserved either way.
 		{fieldInputSNMP, 4},
 		// #2749: class-of-service + egress interface re-introduced with REAL
 		// values from the extended SESSION_CLOSE frame ([144:152]). srcTos
@@ -111,8 +111,10 @@ var (
 		// control bits; OutputSNMP (IE 14, 4B) = egress ifindex. Placed after
 		// ingressInterface and before the post-NAT tuple so the latter stays
 		// the trailing block (#2526) and the proto->packet-counter adjacency the
-		// #2613 fail-on-revert pin checks is preserved. Direction (IE 61) stays
-		// absent — see V9TemplateOptions.
+		// #2613 fail-on-revert pin checks is preserved. #3270: flowDirection
+		// (IE 61) is NOT in this base slice — buildTemplateFieldsV4 splices it
+		// in (just after OutputSNMP, before the post-NAT trailer) when
+		// IncludeFlowDir is set.
 		{fieldSrcTos, 1},
 		{fieldTCPFlags, 1},
 		{fieldOutputSNMP, 4},
@@ -148,20 +150,45 @@ var (
 	}
 )
 
-// DefaultV9TemplateOptions returns options with all extensions enabled (backward compat).
+// DefaultV9TemplateOptions returns the default template options: flow-dir is
+// OFF (#3270). flow-dir is opt-in via `export-extension flow-dir`, so the
+// default template matches a config that did not request any extension.
 func DefaultV9TemplateOptions() V9TemplateOptions {
-	return V9TemplateOptions{IncludeFlowDir: true}
+	return V9TemplateOptions{IncludeFlowDir: false}
 }
 
-// buildTemplateFieldsV4 returns the IPv4 template fields. #2613: the option no
-// longer changes the field set (fieldDirection removed); the parameter is kept
-// for call-site stability and future re-introduction.
-func buildTemplateFieldsV4(_ V9TemplateOptions) []templateField {
+// spliceFlowDir returns base with a {fieldDirection,1} field inserted before
+// the trailing post-NAT block (the first IE >= fieldPostNatSrcIPv4), keeping
+// the #2526 post-NAT trailer last. base is not mutated.
+func spliceFlowDir(base []templateField) []templateField {
+	idx := len(base)
+	for i, f := range base {
+		if f.fieldType >= fieldPostNatSrcIPv4 {
+			idx = i
+			break
+		}
+	}
+	out := make([]templateField, 0, len(base)+1)
+	out = append(out, base[:idx]...)
+	out = append(out, templateField{fieldDirection, 1})
+	out = append(out, base[idx:]...)
+	return out
+}
+
+// buildTemplateFieldsV4 returns the IPv4 template fields. #3270: flowDirection
+// (IE 61) is spliced in before the post-NAT trailer when IncludeFlowDir is set.
+func buildTemplateFieldsV4(opts V9TemplateOptions) []templateField {
+	if opts.IncludeFlowDir {
+		return spliceFlowDir(netflowTemplateFieldsV4)
+	}
 	return netflowTemplateFieldsV4
 }
 
 // buildTemplateFieldsV6 returns the IPv6 template fields. See buildTemplateFieldsV4.
-func buildTemplateFieldsV6(_ V9TemplateOptions) []templateField {
+func buildTemplateFieldsV6(opts V9TemplateOptions) []templateField {
+	if opts.IncludeFlowDir {
+		return spliceFlowDir(netflowTemplateFieldsV6)
+	}
 	return netflowTemplateFieldsV6
 }
 
@@ -249,7 +276,7 @@ func encodeDataFlowSet(records []FlowRecord, bootTime time.Time, opts V9Template
 	tmplID, fields, recSize := netflowTemplateConfig(records[0].IsIPv6, opts)
 	totalLen := dataFlowSetLen(len(records), recSize)
 	b := make([]byte, totalLen)
-	encodeDataFlowSetInto(b, records, bootTime, tmplID, fields, recSize)
+	encodeDataFlowSetInto(b, records, bootTime, tmplID, fields, recSize, opts.IncludeFlowDir)
 	return b
 }
 
@@ -269,7 +296,7 @@ func dataFlowSetLen(recordCount, recSize int) int {
 }
 
 func encodeDataFlowSetInto(b []byte, records []FlowRecord, bootTime time.Time,
-	tmplID uint16, fields []templateField, recSize int,
+	tmplID uint16, fields []templateField, recSize int, includeDir bool,
 ) {
 	if len(records) == 0 {
 		return
@@ -279,19 +306,19 @@ func encodeDataFlowSetInto(b []byte, records []FlowRecord, bootTime time.Time,
 	binary.BigEndian.PutUint16(b[2:4], uint16(totalLen))
 	off := 4
 	isV6 := records[0].IsIPv6
-	_ = fields // template field set is fixed per family (#2613)
+	_ = fields // template field set is derived per family + IncludeFlowDir
 	for _, r := range records {
 		if isV6 {
-			off = encodeRecordV6(b, off, r, bootTime, recSize)
+			off = encodeRecordV6(b, off, r, bootTime, recSize, includeDir)
 		} else {
-			off = encodeRecordV4(b, off, r, bootTime, recSize)
+			off = encodeRecordV4(b, off, r, bootTime, recSize, includeDir)
 		}
 	}
 	clear(b[off:totalLen])
 }
 
 func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time,
-	recSize int,
+	recSize int, includeDir bool,
 ) int {
 	startOff := off
 	src4 := r.SrcIP.To4()
@@ -339,6 +366,13 @@ func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time,
 	off++
 	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
 	off += 4
+	// #3270: flowDirection (IE 61, 1B) — 0 ingress / 1 egress, derived from the
+	// per-zone sampling-direction. Written only when the template advertises it
+	// (IncludeFlowDir), before the post-NAT trailer.
+	if includeDir {
+		b[off] = r.Direction
+		off++
+	}
 	// #2526: post-NAT (translated) tuple — 225/226/227/228.
 	natSrc4 := r.NATSrcIP.To4()
 	natDst4 := r.NATDstIP.To4()
@@ -360,7 +394,7 @@ func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time,
 }
 
 func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time,
-	recSize int,
+	recSize int, includeDir bool,
 ) int {
 	startOff := off
 	src16 := r.SrcIP.To16()
@@ -404,6 +438,11 @@ func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time,
 	off++
 	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
 	off += 4
+	// #3270: flowDirection (IE 61, 1B) — see encodeRecordV4.
+	if includeDir {
+		b[off] = r.Direction
+		off++
+	}
 	// #2526: post-NAT (translated) tuple — 281/282 (16B) + 227/228 (2B).
 	natSrc16 := r.NATSrcIP.To16()
 	natDst16 := r.NATDstIP.To16()
@@ -559,6 +598,9 @@ func (e *Exporter) ExportSessionClose(rec logging.EventRecord, evt SessionCloseD
 		TOS:        evt.TOS,
 		TCPFlags:   evt.TCPFlags,
 		OutIf:      evt.OutIf,
+		// #3270: flowDirection (IE 61), derived from sampling-direction in the
+		// daemon callback. Encoded only when the group enabled flow-dir.
+		Direction:  evt.Direction,
 		NATSrcIP:   natSrcIP,
 		NATDstIP:   natDstIP,
 		NATSrcPort: natSrcPort,
@@ -679,7 +721,7 @@ func (e *Exporter) sendRecords(records []FlowRecord) {
 		pkt := make([]byte, 20+dataLen)
 		encodeHeaderInto(pkt[:20], hdr)
 		encodeDataFlowSetInto(pkt[20:], batch, e.bootTime,
-			tmplID, fields, recSize)
+			tmplID, fields, recSize, e.cfg.V9TemplateOpts.IncludeFlowDir)
 		e.conns.writeAll(pkt, "netflow data send failed")
 
 		e.exportedFlows.Add(uint64(len(batch)))

@@ -40,6 +40,22 @@ type fakeBpfrxClient struct {
 	showTextCalls  int
 	showTextTopic  string
 	showTextOutput string
+
+	// MatchPolicies recorder (#3283/#3284 remote-surface coverage).
+	matchPoliciesCalls int
+	matchPoliciesReq   *pb.MatchPoliciesRequest
+	matchPoliciesResp  *pb.MatchPoliciesResponse
+}
+
+func (f *fakeBpfrxClient) MatchPolicies(
+	_ context.Context, in *pb.MatchPoliciesRequest, _ ...grpc.CallOption,
+) (*pb.MatchPoliciesResponse, error) {
+	f.matchPoliciesCalls++
+	f.matchPoliciesReq = in
+	if f.matchPoliciesResp != nil {
+		return f.matchPoliciesResp, nil
+	}
+	return &pb.MatchPoliciesResponse{}, nil
 }
 
 func (f *fakeBpfrxClient) ShowText(

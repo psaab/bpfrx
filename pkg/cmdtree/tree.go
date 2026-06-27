@@ -905,6 +905,10 @@ var OperationalTree = map[string]*Node{
 			"software": {Desc: "Software management", Children: map[string]*Node{
 				"in-service-upgrade": {Desc: "Prepare node for in-service software upgrade (ISSU)"},
 			}},
+			"dynamic-dns": {Desc: "Force a dynamic-DNS update out-of-band of the poll cycle (#3276)", Children: map[string]*Node{
+				"update": {Desc: "Force an immediate publish of all DDNS records owned by this node"},
+				"check":  {Desc: "Re-check the WAN/interface address now and publish only if it changed"},
+			}},
 		}},
 	}},
 	"test": {Desc: "Perform diagnostic testing", Children: map[string]*Node{

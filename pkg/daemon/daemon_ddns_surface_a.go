@@ -576,6 +576,47 @@ func (d *Daemon) nudgeSurfaceADDNSReconcile() {
 	}
 }
 
+// ForceDDNSUpdate is the operator force-now verb (#3276, the daemon half of
+// `request system dynamic-dns update`). When force is true it arms the Surface A
+// force-now latch (re-assert every owned scope's wire record on the next pass,
+// bypassing change-detection + the forced-refresh floor) and nudges an immediate
+// reconcile; when force is false it only nudges a re-observe/publish-if-changed
+// pass (the `check` verb). Both honor the per-RG HA writer gate via the SAME
+// node-level fast path the reconcile loops use: on a node that masters NO RG
+// (the backup) it takes NO action and returns ok=false with a clear message, so
+// the verb never double-writes from the standby (the RG owner publishes, #2972).
+// A standalone node (no cluster) is always the writer. Returns (ok, message)
+// for the operator surface.
+func (d *Daemon) ForceDDNSUpdate(force bool) (bool, string) {
+	if d.surfaceA == nil && d.ddns == nil {
+		return false, "dynamic-dns: DDNS engine not running (dataplane disabled)"
+	}
+	// Per-RG owner gate (#2972): only a node that masters at least one RG may
+	// publish. The backup must not re-assert records the peer master owns — that
+	// would double-write the same FQDN (and flap the public record if the two
+	// nodes observe different addresses). The per-scope gate inside Reconcile
+	// further restricts a multi-RG-active node to only its own RGs' scopes.
+	if !d.ddnsWriterGateOpen() {
+		return false, "dynamic-dns: this node is not the active writer for any " +
+			"redundancy group; the redundancy-group owner publishes (no action " +
+			"taken on the backup)"
+	}
+	if force && d.surfaceA != nil {
+		d.surfaceA.ForceRefresh()
+	}
+	// Nudge both DDNS reconcile loops immediately (Surface A router records and
+	// the DHCP-lease Surface B path) so the forced/checked pass runs now rather
+	// than waiting for the next 30s tick.
+	d.nudgeSurfaceADDNSReconcile()
+	d.nudgeDDNSReconcile()
+	if force {
+		return true, "dynamic-dns: forced an immediate update of all DDNS " +
+			"records owned by this node"
+	}
+	return true, "dynamic-dns: triggered an immediate DDNS check on this node " +
+		"(publishes only changed records)"
+}
+
 // SurfaceAStats returns the Surface A counter snapshot for the API collector /
 // show command, or nil when the manager is not constructed (NoDataplane).
 func (d *Daemon) SurfaceAStats() *ddns.SurfaceAStats {

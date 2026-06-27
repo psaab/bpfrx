@@ -1,3 +1,55 @@
+## 2026-06-27 — #3276 DDNS operator force-now / check-now verb
+
+- **Timestamp**: 2026-06-27
+- **Action**: Add `request system dynamic-dns update` (force-now) and
+  `request system dynamic-dns check` (check-now) operator verbs. The Surface A
+  DDNS engine already had a forced-refresh path decoupled from the poll (P2
+  #2717) but no operator trigger. Engine: new one-shot `SurfaceAManager.
+  ForceRefresh()` latch consumed by the next non-degraded reconcile pass — makes
+  every configured scope refresh-due so the RG owner re-asserts the wire record
+  even for an unchanged address inside the forced-refresh floor; the latch does
+  NOT bypass the per-RG HA writer gate (#2972). Daemon: `ForceDDNSUpdate(force)`
+  arms the latch (force=true) + nudges both DDNS reconcile loops; honors the
+  node-level owner gate (`ddnsWriterGateOpen`) — on a backup it is a no-op with a
+  clear "not the active writer" message. Wiring: cmdtree node →
+  gRPC `SystemAction("dynamic-dns-update"|"dynamic-dns-check")` → local CLI
+  (`handleRequestSystemDynamicDNS` + `SetSurfaceADDNSForceFn`) + remote CLI.
+  Tests (fail-on-revert): pkg/ddns force-republishes-unchanged + gate-respected;
+  pkg/daemon owner-gate (standalone/backup/master); pkg/grpcapi dispatch +
+  unavailable; pkg/cmdtree completion. Closes #3276.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/surface_a_test.go,
+  pkg/daemon/daemon_ddns_surface_a.go, pkg/daemon/daemon_ddns_surface_a_test.go,
+  pkg/daemon/daemon_run.go, pkg/grpcapi/server.go, pkg/grpcapi/server_diag.go,
+  pkg/grpcapi/system_action_test.go, pkg/cmdtree/tree.go,
+  pkg/cmdtree/tree_test.go, pkg/cli/cli.go, pkg/cli/cli_request.go,
+  cmd/cli/request.go, pkg/ddns/README.md
+## 2026-06-27 — #2930 doc-only: correct demotion-path drift, mark DrainRequest reserved/dormant
+
+- **Timestamp**: 2026-06-27
+- **Action**: Doc + comment only (no behavior change). The /research plan
+  (campaign-8) PLAN-KILLED the correctness-bug framing: the seq-fenced
+  DrainRequest/DrainComplete pair (SendDrainRequest / handle_drain_request,
+  MSG_DRAIN_REQUEST=7) is dormant (no production caller) but the live demotion
+  path has no correctness gap — it uses SessionSync.WaitForPeerBarrier + the
+  continuous lossless event stream, and republish uses
+  ExportOwnerRGSessions(rgIDs, 0) (an unbounded full-conntrack snapshot) fired
+  on event-stream FullResync (#2874 gap / #2442 overflow), NOT on demotion-prep.
+  Verified against master: prepareUserspaceRGDemotionWithTimeout does only the
+  single WaitForPeerBarrier; PrepareRGDemotion does not exist;
+  WaitForIdle/WaitForPeerBarriersDrained/PauseIncrementalSync have no live
+  caller; ExportOwnerRGSessions has one live caller — handleEventStreamFullResync.
+  Corrected docs/session-sync-architecture.md (live demotion path; reframed the
+  stale 10-step "Graceful Demotion" sequence; "Export During Demotion Prep" →
+  "Bulk Owner-RG Export (FullResync republish)"; marked the DrainRequest fence
+  RESERVED/DORMANT; v4 revision entry). Added reserved/dormant doc-comments at
+  SendDrainRequest (eventstream.go) and handle_drain_request (event_stream/mod.rs)
+  and a reserved/dormant note in userspace-dp/src/event_stream/README.md.
+- **File(s)**: docs/session-sync-architecture.md,
+  pkg/dataplane/userspace/eventstream.go,
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/README.md, _Log.md
+- **Validation**: go build ./... clean (doc + comment only, no test needed).
+
 ## 2026-06-26 — #3148 review fold: explicit `any`→Any + reject junos-host global match
 
 - **Timestamp**: 2026-06-26
@@ -22384,3 +22436,109 @@ top.
   **File(s)**: pkg/dataplane/userspace/policies.go,
   pkg/dataplane/userspace/lenient_keep_armed_3261_test.go,
   pkg/policymatch/policymatch.go, docs/userspace-dataplane-gaps.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3270 — populate flowDirection (IPFIX/NetFlow v9 IE 61) from the
+  per-zone sampling-direction, opt-in via `export-extension flow-dir`. Added
+  `ExportConfig.FlowDirection` (ingress `sampling input`→0, egress-only
+  `sampling output`→1, ingress-wins tie) + `SessionCloseData.Direction`;
+  daemon callbacks derive it at dispatch. v9/IPFIX templates splice IE 61
+  before the post-NAT trailer only when IncludeFlowDir is set (no #2613
+  synthetic-zero); IPFIX record 70/118→71/119 with flow-dir, v9 absorbs the
+  byte into FlowSet padding. Commit-time warning now fires only when flow-dir
+  is set with no sampling-direction configured. Go-only — no Rust/wire change
+  ([146] stays reserved). Flipped TestV9TemplateFlowDirAlwaysAbsent→Conditional,
+  reframed dropped_fields IE-61 pin to base-template, added
+  TestFlowDirectionFromSampling + conditional/encode/size pins + daemon
+  end-to-end TestSessionCloseFlowDirectionEgress (fail-on-revert verified).
+  **File(s)**: pkg/flowexport/manager.go, pkg/flowexport/netflow.go,
+  pkg/flowexport/ipfix.go, pkg/flowexport/exporter_test.go,
+  pkg/flowexport/dropped_fields_test.go, pkg/flowexport/flowdir_test.go,
+  pkg/daemon/daemon_flowexport.go,
+  pkg/daemon/daemon_flowexport_flowdir_test.go,
+  pkg/config/compiler_validate_warn.go, pkg/flowexport/README.md
+  **Action**: #3277 — derive host-inbound lifeline interface set from chassis-cluster config (configured control-interface / fabric interfaces) instead of the hardcoded fxp0/em0/fab* list, so a non-default `control-interface fxp1` is excluded from host-inbound deny scoping (fixes latent HA split-brain). Added fail-on-revert tests at the predicate and full-payload levels; updated host-inbound lifeline doc.
+  **File(s)**: pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/zones_host_inbound_test.go,
+  pkg/daemon/host_inbound_nft_test.go,
+  docs/junos-cli-reference.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3283 — policymatch simulator parity with dataplane wildcard-zone (#3090) and scoped-global (#3148) precedence. Restructured Match() into the dataplane tier chain: exact zone-pair -> single-wildcard (from-any/to-any merged in config order) -> both-any -> global (gated by the optional #3148 from/to-zone match scope, undefined-zone scope fails closed) -> default. Added globalScopeMatches replicating GlobalZoneScope::matches + build_global_zone_scope. Updated stale precedence comments on every surface and the README. Added fail-on-revert table tests.
+  **File(s)**: pkg/policymatch/policymatch.go,
+  pkg/policymatch/wildcard_scoped_test.go,
+  pkg/policymatch/README.md, pkg/api/security.go,
+  pkg/cli/cli_request.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_show_firewall.go
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3284 — policymatch simulator now enforces ICMP/ICMPv6 type/code application constraints (junos-ping = type 8, junos-pingv6 = type 128) like the dataplane (policy.rs CompiledApplications.matches). Added Query.ICMPType/ICMPCode (*uint8), enforcement in matchSingleApp (fail-closed when the query omits the type for a type-constrained term), and the ParseICMPValue shared parser. Plumbed type/code through every simulator surface: proto3 optional icmp_type/icmp_code on MatchPoliciesRequest (regenerated), REST icmp_type/icmp_code query params, gRPC test-policy ictype=/iccode= topic keys, and CLI/remote-CLI icmp-type/icmp-code tokens. Added fail-on-revert table tests.
+  **File(s)**: pkg/policymatch/policymatch.go,
+  pkg/policymatch/icmp_test.go, pkg/policymatch/README.md,
+  proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/grpcapi/server_cluster.go, pkg/grpcapi/server_show_firewall.go,
+  pkg/api/security.go, pkg/cli/cli_request.go,
+  pkg/cli/cli_show_security.go, cmd/cli/main.go, cmd/cli/show.go
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3285 — policymatch simulator now mirrors the dataplane host gate (evaluate_junos_host_policy) for to-zone junos-host queries: exact from-zone <ingress> to-zone junos-host then from-zone any to-zone junos-host, with NO global/default transit fallback (and to-zone any / both-any NOT consulted). Added Match() branch + matchJunosHost + Result.HostInboundUnmatched; surfaced through REST (host_inbound_unmatched JSON), gRPC MatchPolicies (new proto bool field), gRPC test-policy text, and local/remote CLI rendering. Added fail-on-revert tests.
+  **File(s)**: pkg/policymatch/policymatch.go,
+  pkg/policymatch/junos_host_test.go, pkg/policymatch/README.md,
+  proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/grpcapi/server_cluster.go, pkg/grpcapi/server_show_firewall.go,
+  pkg/api/security.go, pkg/api/types.go, pkg/cli/cli_request.go,
+  pkg/cli/cli_show_security.go, cmd/cli/show.go
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3287 — resolveZoneLocalAddressBooks now rewrites a scoped global policy's (#3148) source/dest address tokens under its match from-zone/to-zone scope, so a zone-local (#3061) address reference in a scoped global resolves to the zone-qualified global-book entry instead of silently match-none / commit-reject. Unscoped globals (empty/any scope) are left to the global book. Both the simulator (pkg/policymatch) and the dataplane snapshot builder consume the post-fold book, keeping them in agreement. Added a fail-on-revert test that compiles a real config and asserts the simulator resolves the zone-local ref.
+  **File(s)**: pkg/config/compiler_security.go,
+  pkg/policymatch/scoped_global_zonelocal_test.go,
+  docs/config-schema.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: PR #3289 quad-review fold (5 findings). (1) Remote CLI `show security match-policies` no-match path now renders the server-provided resp.Action ("<action> (default)") instead of hard-coded "default deny" — the #3283 drift class on the remote surface (wrong verdict under default-policy permit-all). (2) Remote CLI icmp-type/icmp-code now route through policymatch.ParseICMPValue and return an explicit error on invalid/out-of-range input (was a silent inline strconv.Atoi drop). (3) Corrected the stale matchApp docstring (now documents the empty-protocol match-any short-circuit as a diagnostic convenience and the ICMP type/code enforcement). (4) matchSingleApp now gates an ICMP-type-constrained app term on the query being ICMP(1)/ICMPv6(58) so a type-constrained term cannot match a TCP/UDP flow (mirrors the dataplane keying icmp_constraints under the ICMP protocol). (5) Documented the intentional REST-vs-gRPC Action asymmetry for host-inbound-unmatched in the policymatch README. Added 3 fail-on-revert tests (all RED on revert).
+  **File(s)**: cmd/cli/show.go, cmd/cli/nontty_test.go,
+  cmd/cli/show_matchpolicies_test.go, pkg/policymatch/policymatch.go,
+  pkg/policymatch/icmp_test.go, pkg/policymatch/README.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3286 — surface scoped-global-policy zone context (#3148
+  `match from-zone`/`to-zone`) on every policy inventory/show surface.
+  Previously only the dataplane enforced the scope; REST, gRPC, and CLI
+  rendered scoped globals as all-zones (`*`/`*`, junos-global, any),
+  hiding the scope from audit and making scoped-global hit counters
+  ambiguous. Added `match_from_zone`/`match_to_zone` to the REST
+  `PolicyRule` (omitempty) and the protobuf `PolicyRule` (fields 11/12,
+  regenerated), populated from `Policy.Match.FromZone/ToZone` in the
+  global loops; rendered the scoped zones in the CLI standard, detail,
+  brief, and hit-count views and the gRPC text hit-count/detail views.
+  Unscoped globals unchanged. Fail-on-revert tests across all three
+  packages (REST, gRPC structured + text, CLI all four views).
+  **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/api/types.go, pkg/api/security.go,
+  pkg/grpcapi/server_show_zones.go,
+  pkg/grpcapi/server_show_policies_text.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/api/security_scoped_global_3286_test.go,
+  pkg/grpcapi/server_show_zones_scoped_global_3286_test.go,
+  pkg/cli/cli_show_security_scoped_global_3286_test.go,
+  docs/junos-cli-reference.md, pkg/api/README.md, pkg/grpcapi/README.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3286 follow-up (Claude-SMR NEEDS-MINOR) — fold in the 4th
+  inventory surface the first pass missed: the Prometheus
+  `xpf_policy_hits_total` collector emitted `from_zone="*"`/`to_zone="*"`
+  for ALL global policies, scoped included. Prometheus is the canonical
+  counter-validation surface the issue's "scoped-global hit counters...
+  ambiguous" concern names directly. metrics_counters.go now uses the
+  policy's Match.FromZone/ToZone for the from_zone/to_zone labels when set
+  (identical conditional to the REST/gRPC/CLI surfaces); unscoped globals
+  keep `*`/`*`. Added a fail-on-revert metrics test (RED when reverted to
+  `*`/`*`). Confirmed no 5th surface: remaining `junos-global`/`*` uses are
+  the group-level PolicyInfo row (correct) and the dataplane
+  snapshot/counter-key computation (by design — tier classification +
+  stable counter IDs, real scope carried out-of-band in MatchFromZone/
+  ToZone and enforced in policy.rs), neither operator-facing display.
+  **File(s)**: pkg/api/metrics_counters.go,
+  pkg/api/metrics_scoped_global_3286_test.go, docs/phases.md,
+  pkg/api/README.md
