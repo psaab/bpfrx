@@ -43,6 +43,25 @@ func twoZonePolicyCfg(app *config.Application, appName string) *config.Config {
 	return cfg
 }
 
+// colorAwarePolicerCfg returns a config whose ONLY unsupported feature is a
+// color-AWARE three-color policer — a class-(ii) genuine semantic gap with no
+// fail-closed snapshot representation. deriveUserspaceCapabilities sets
+// ForwardingSupported=false (the legitimate disarm), and crucially leaves
+// PolicyContentRejected empty (it is NOT the #3261 keep-armed class).
+func colorAwarePolicerCfg() *config.Config {
+	cfg := &config.Config{}
+	cfg.Firewall.ThreeColorPolicers = map[string]*config.ThreeColorPolicerConfig{
+		"tcp-3color": {
+			Name:       "tcp-3color",
+			ColorBlind: false, // color-aware: unsupported (class ii)
+			ThenAction: "discard",
+			CIR:        1_000_000,
+			CBS:        100_000,
+		},
+	}
+	return cfg
+}
+
 func TestUserspaceGateAcceptsAndCanonicalizesNamedProtocol(t *testing.T) {
 	// esp must be supported (so a legit esp-only policy works) AND canonicalized
 	// to its numeric wire form so an older helper that lacks the named-protocol
@@ -65,15 +84,15 @@ func TestUserspaceGateAcceptsAndCanonicalizesNamedProtocol(t *testing.T) {
 
 func TestUserspaceGateFailsClosedOnUnknownProtocol(t *testing.T) {
 	// A user-defined application with a protocol neither the Rust matcher nor
-	// the centralized appid table can represent must fail the capability gate so
-	// the dataplane refuses to arm (ForwardingSupported=false). Pre-fix this
-	// returned ok=true (the fail-open).
+	// the centralized appid table can represent must fail the content gate so
+	// buildOneRuleSnapshot emits the __unsupported__ sentinel. Pre-#2124 the
+	// expansion returned ok=true (the term-level fail-open).
 	cfg := twoZonePolicyCfg(&config.Application{Name: "weird", Protocol: "definitely-not-a-proto"}, "weird")
 	if _, ok := expandUserspacePolicyApplications(cfg, []string{"weird"}); ok {
 		t.Fatal("expandUserspacePolicyApplications = ok=true, want false for unknown protocol")
 	}
 	if userspaceSupportsSecurityPolicies(cfg) {
-		t.Fatal("userspaceSupportsSecurityPolicies = true, want false (refuse to arm) for unknown protocol")
+		t.Fatal("userspaceSupportsSecurityPolicies = true, want false for unknown protocol")
 	}
 }
 
@@ -189,30 +208,89 @@ func recordingControlServer(t *testing.T) (string, chan ControlRequest) {
 	return sock, reqCh
 }
 
+// snapForDisarm builds a publishable snapshot (with feed-aware Capabilities)
+// for the disarm-gate tests, mirroring the real publish path which passes the
+// built snapshot — not the raw cfg — to disarmBeforeUnsupportedPublishLocked.
+func snapForDisarm(t *testing.T, cfg *config.Config) *ConfigSnapshot {
+	t.Helper()
+	snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	return snap
+}
+
 func TestDisarmBeforeUnsupportedPublishLocked(t *testing.T) {
-	t.Run("unsupported config disarms before publish", func(t *testing.T) {
+	t.Run("genuinely-unsupported semantic disarms before publish", func(t *testing.T) {
 		sock, reqCh := recordingControlServer(t)
 		m := New()
 		m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
 		m.cfg.ControlSocket = sock
 		m.lastStatus.ForwardingArmed = true
-		// A policy naming an unrepresentable-protocol application -> caps say
-		// ForwardingSupported=false.
-		cfg := twoZonePolicyCfg(&config.Application{Name: "weird", Protocol: "definitely-not-a-proto"}, "weird")
+		m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion // current helper
+		// A class-(ii) genuine semantic gap (a color-AWARE three-color policer)
+		// has no fail-closed snapshot representation -> ForwardingSupported=false
+		// -> the legitimate disarm still fires regardless of helper version.
+		snap := snapForDisarm(t, colorAwarePolicerCfg())
 		// The disarm CONTROL REQUEST is the security-critical behavior under
 		// test. applyHelperStatusLocked touches a BPF map that is absent in a
 		// unit test ("userspace_ctrl map not loaded"), so the function may
 		// return that local-bookkeeping error AFTER the wire disarm succeeds;
 		// that env artifact must not mask the assertion that the disarm was
 		// actually issued.
-		_ = m.disarmBeforeUnsupportedPublishLocked(cfg)
+		_ = m.disarmBeforeUnsupportedPublishLocked(snap)
 		select {
 		case req := <-reqCh:
 			if req.Type != "set_forwarding_state" || req.Forwarding == nil || req.Forwarding.Armed {
 				t.Fatalf("got request %+v, want set_forwarding_state{Armed:false}", req)
 			}
 		case <-time.After(2 * time.Second):
-			t.Fatal("no disarm request sent for unsupported config")
+			t.Fatal("no disarm request sent for genuinely-unsupported semantic")
+		}
+	})
+
+	t.Run("unrepresentable content does NOT disarm a current helper (#3261)", func(t *testing.T) {
+		// #3261: class-(i) unrepresentable policy CONTENT must NOT disarm a
+		// current helper. The published snapshot carries the __unsupported__
+		// sentinel and the helper integrity preflight rejects it while staying
+		// armed (previous-good retained). Disarming here is the kernel
+		// fail-OPEN this fixes. Revert the keep-armed change and this RED-flips.
+		sock, reqCh := recordingControlServer(t)
+		m := New()
+		m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+		m.cfg.ControlSocket = sock
+		m.lastStatus.ForwardingArmed = true
+		m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion // current helper
+		snap := snapForDisarm(t, twoZonePolicyCfg(&config.Application{Name: "weird", Protocol: "definitely-not-a-proto"}, "weird"))
+		if err := m.disarmBeforeUnsupportedPublishLocked(snap); err != nil {
+			t.Fatalf("disarmBeforeUnsupportedPublishLocked: %v", err)
+		}
+		select {
+		case req := <-reqCh:
+			t.Fatalf("unexpected disarm for unrepresentable content on current helper: %+v", req)
+		case <-time.After(200 * time.Millisecond):
+		}
+	})
+
+	t.Run("unrepresentable content DOES disarm a pre-preflight helper", func(t *testing.T) {
+		// The one exception: an OLDER local helper (snapshot protocol version <
+		// current) cannot be trusted to reject the sentinel, so the narrow
+		// version-keyed disarm still fires for class-(i) content.
+		sock, reqCh := recordingControlServer(t)
+		m := New()
+		m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+		m.cfg.ControlSocket = sock
+		m.lastStatus.ForwardingArmed = true
+		m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion - 1 // old helper
+		snap := snapForDisarm(t, twoZonePolicyCfg(&config.Application{Name: "weird", Protocol: "definitely-not-a-proto"}, "weird"))
+		_ = m.disarmBeforeUnsupportedPublishLocked(snap)
+		select {
+		case req := <-reqCh:
+			if req.Type != "set_forwarding_state" || req.Forwarding == nil || req.Forwarding.Armed {
+				t.Fatalf("got request %+v, want set_forwarding_state{Armed:false}", req)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("no disarm request sent for unrepresentable content on pre-preflight helper")
 		}
 	})
 
@@ -222,8 +300,9 @@ func TestDisarmBeforeUnsupportedPublishLocked(t *testing.T) {
 		m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
 		m.cfg.ControlSocket = sock
 		m.lastStatus.ForwardingArmed = true
-		cfg := twoZonePolicyCfg(&config.Application{Name: "esp-only", Protocol: "esp"}, "esp-only")
-		if err := m.disarmBeforeUnsupportedPublishLocked(cfg); err != nil {
+		m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
+		snap := snapForDisarm(t, twoZonePolicyCfg(&config.Application{Name: "esp-only", Protocol: "esp"}, "esp-only"))
+		if err := m.disarmBeforeUnsupportedPublishLocked(snap); err != nil {
 			t.Fatalf("disarmBeforeUnsupportedPublishLocked: %v", err)
 		}
 		select {
@@ -236,8 +315,8 @@ func TestDisarmBeforeUnsupportedPublishLocked(t *testing.T) {
 	t.Run("no helper is a no-op", func(t *testing.T) {
 		m := New()
 		m.lastStatus.ForwardingArmed = true
-		cfg := twoZonePolicyCfg(&config.Application{Name: "weird", Protocol: "definitely-not-a-proto"}, "weird")
-		if err := m.disarmBeforeUnsupportedPublishLocked(cfg); err != nil {
+		snap := snapForDisarm(t, twoZonePolicyCfg(&config.Application{Name: "weird", Protocol: "definitely-not-a-proto"}, "weird"))
+		if err := m.disarmBeforeUnsupportedPublishLocked(snap); err != nil {
 			t.Fatalf("disarmBeforeUnsupportedPublishLocked with no helper: %v", err)
 		}
 	})
@@ -248,8 +327,8 @@ func TestDisarmBeforeUnsupportedPublishLocked(t *testing.T) {
 		m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
 		m.cfg.ControlSocket = sock
 		m.lastStatus.ForwardingArmed = false
-		cfg := twoZonePolicyCfg(&config.Application{Name: "weird", Protocol: "definitely-not-a-proto"}, "weird")
-		if err := m.disarmBeforeUnsupportedPublishLocked(cfg); err != nil {
+		snap := snapForDisarm(t, twoZonePolicyCfg(&config.Application{Name: "weird", Protocol: "definitely-not-a-proto"}, "weird"))
+		if err := m.disarmBeforeUnsupportedPublishLocked(snap); err != nil {
 			t.Fatalf("disarmBeforeUnsupportedPublishLocked: %v", err)
 		}
 		select {

@@ -398,7 +398,7 @@ func (m *Manager) syncSnapshotLocked() error {
 	// publishing an unsupported-config snapshot here too, so an old
 	// same-protocol-version helper that drops the `__unsupported__` sentinel
 	// cannot process the resulting match-any rule while still armed.
-	if err := m.disarmBeforeUnsupportedPublishLocked(publishSnap.Config); err != nil {
+	if err := m.disarmBeforeUnsupportedPublishLocked(&publishSnap); err != nil {
 		return err
 	}
 	var status ProcessStatus

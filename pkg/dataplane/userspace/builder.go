@@ -50,6 +50,14 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 	if err != nil {
 		return nil, err
 	}
+	// #3261: compute the class-(i) content-rejection diagnostic from the ACTUAL
+	// built rules (feed-aware), then stamp it onto the capabilities below. The
+	// cfg-only deriveUserspaceCapabilities cannot see the feed overlay, so this
+	// is the single accurate source for "the helper integrity preflight will
+	// reject this snapshot" (drives the diagnostic + the narrow old-helper
+	// disarm). Class (ii) — genuine semantic gaps — comes from the cfg gate.
+	caps := deriveUserspaceCapabilities(cfg)
+	caps.PolicyContentRejected = collectPolicyContentRejections(policies)
 	addressBooks, _, err := buildAddressBookTableWithFeeds(cfg, feedOverlay)
 	if err != nil {
 		return nil, err
@@ -59,7 +67,7 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 		Generation:            generation,
 		FIBGeneration:         fibGeneration,
 		GeneratedAt:           time.Now().UTC(),
-		Capabilities:          deriveUserspaceCapabilities(cfg),
+		Capabilities:          caps,
 		MapPins:               userspaceMapPins(),
 		Userspace:             ucfg,
 		Zones:                 buildZoneSnapshots(cfg),

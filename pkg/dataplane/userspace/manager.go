@@ -146,17 +146,26 @@ func Boot() dataplane.RuntimeDataPlane {
 type Manager struct {
 	bpfShim *dataplane.Manager
 
-	mu                    sync.Mutex
-	sessionMu             sync.Mutex // separate lock for session sync requests (Phase 3)
-	proc                  *exec.Cmd
-	cfg                   config.UserspaceConfig
-	clusterHA             bool
-	generation            uint64
-	syncCancel            context.CancelFunc
-	lastStatus            ProcessStatus
-	lastSnapshot          *ConfigSnapshot
-	lastApply             *dataplane.ApplyResult
-	policySchedulerActive map[string]bool
+	mu           sync.Mutex
+	sessionMu    sync.Mutex // separate lock for session sync requests (Phase 3)
+	proc         *exec.Cmd
+	cfg          config.UserspaceConfig
+	clusterHA    bool
+	generation   uint64
+	syncCancel   context.CancelFunc
+	lastStatus   ProcessStatus
+	lastSnapshot *ConfigSnapshot
+	lastApply    *dataplane.ApplyResult
+	// lastSnapshotRejectReasons holds the #3261 diagnostic: the reasons the
+	// most recently built snapshot carries unrepresentable policy content that
+	// the helper integrity preflight rejects (previous-good retained, or
+	// fresh-boot default-deny — never fail-open). Set under m.mu at every full
+	// snapshot build, surfaced via ProcessStatus.LastSnapshotRejectReasons and
+	// the xpf_userspace_policy_content_rejected gauge so the Go/Rust skew
+	// (ForwardingSupported=true while the helper rejected the snapshot) is
+	// observable. nil/empty means the last build was fully representable.
+	lastSnapshotRejectReasons []string
+	policySchedulerActive     map[string]bool
 	// routeOverlay is the ip-monitoring effective-route overlay
 	// (#1827 PR-1b). Cached so the FULL apply path
 	// (buildSnapshotWithSchedulerState in ApplyConfig) preserves the
@@ -379,6 +388,30 @@ func (m *Manager) recordApplyResultLocked(result *dataplane.ApplyResult, caps Us
 	m.lastApply = result.Clone()
 }
 
+// recordPolicyContentRejectionLocked tracks the #3261 diagnostic for the
+// just-built snapshot: the reasons (if any) it carries unrepresentable policy
+// content that the helper integrity preflight will reject. It is called at the
+// snapshot-build site BEFORE the publish so it is recorded even when the
+// publish is rejected (the helper keeps previous-good / default-deny while
+// staying armed — never fail-open). A one-shot slog line fires only on a
+// transition (per the logging rules — NOT per apply): a Warn when content
+// becomes unrepresentable (the operator must see the snapshot is being
+// rejected) and an Info when it becomes representable again.
+func (m *Manager) recordPolicyContentRejectionLocked(reasons []string) {
+	had := len(m.lastSnapshotRejectReasons) > 0
+	now := len(reasons) > 0
+	m.lastSnapshotRejectReasons = append([]string(nil), reasons...)
+	switch {
+	case now && !had:
+		slog.Warn(
+			"userspace: snapshot carries unrepresentable policy content; the helper integrity preflight rejects it and retains the previous-good state (fresh boot: default-deny). Helper stays armed — no kernel fail-open. Edit out the offending application/address and re-commit to restore enforcement.",
+			"reasons", reasons,
+		)
+	case had && !now:
+		slog.Info("userspace: policy content is representable again; snapshot will publish normally")
+	}
+}
+
 func copyPolicySchedulerActiveState(activeState map[string]bool) map[string]bool {
 	if activeState == nil {
 		return nil
@@ -549,6 +582,13 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// #3261: record whether this snapshot carries unrepresentable policy
+	// content BEFORE the publish, so the diagnostic is captured even when the
+	// helper rejects the snapshot (the publish path returns early on the
+	// integrity error, before recordApplyResultLocked). The helper stays armed
+	// for this class; the reject retains previous-good (or leaves the fresh-boot
+	// default-deny), never fail-open.
+	m.recordPolicyContentRejectionLocked(snap.Capabilities.PolicyContentRejected)
 	m.clusterHA = cfg != nil && cfg.Chassis.Cluster != nil
 	m.seedHAGroupInventoryLocked(cfg)
 	prevPlanKey := snapshotBindingPlanKey(m.lastSnapshot)
@@ -636,7 +676,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		snap.DeferWorkers = true
 	}
 	var status ProcessStatus
-	if err := m.disarmBeforeUnsupportedPublishLocked(snap.Config); err != nil {
+	if err := m.disarmBeforeUnsupportedPublishLocked(snap); err != nil {
 		return result, err
 	}
 	// #1197 v5 (Codex code-review v4 #2): apply_snapshot must
@@ -757,6 +797,11 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 		return
 	}
 	next.Policies = policies
+	// #3261: the policies were rebuilt, so recompute the (feed-aware)
+	// content-rejection diagnostic from the new rules' sentinels; the copied
+	// lastSnapshot value would be stale. Class (ii) (ForwardingSupported /
+	// UnsupportedReasons) is unchanged by a scheduler-only republish.
+	next.Capabilities.PolicyContentRejected = collectPolicyContentRejections(policies)
 	// #1606: refresh the address-book table alongside the policies
 	// so book IDs cited in the new policies always resolve on the
 	// dataplane side.
@@ -772,7 +817,7 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 	var status ProcessStatus
 	// #2124: disarm before publishing an unsupported-config snapshot (see
 	// disarmBeforeUnsupportedPublishLocked). cfg is this snapshot's config.
-	if err := m.disarmBeforeUnsupportedPublishLocked(cfg); err != nil {
+	if err := m.disarmBeforeUnsupportedPublishLocked(&publishSnap); err != nil {
 		slog.Warn("userspace: failed to disarm before unsupported-config policy scheduler publish", "err", err)
 		return
 	}
@@ -933,7 +978,7 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 	publishSnap.Neighbors = filterPublishableNeighbors(next.Neighbors)
 	var status ProcessStatus
 	// #2124: disarm before publishing an unsupported-config snapshot.
-	if err := m.disarmBeforeUnsupportedPublishLocked(next.Config); err != nil {
+	if err := m.disarmBeforeUnsupportedPublishLocked(&next); err != nil {
 		return false, err
 	}
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
@@ -1078,6 +1123,12 @@ func (m *Manager) recordHelperStatusLocked(status *ProcessStatus) {
 	status.ConfiguredMode = m.configuredMode.String()
 	status.EntryPrograms = m.entryProgramsLocked()
 	status.DegradedPathCounters = m.readDegradedPathStatsLocked()
+	// #3261: stamp the manager-owned snapshot-reject diagnostic onto the status
+	// the helper round-trip cannot carry (the helper has no PolicyContentRejected
+	// field and strips it on decode). This keeps the rejected-snapshot state
+	// observable in `show`/metrics even though the helper reports the
+	// previous-good capabilities.
+	status.LastSnapshotRejectReasons = append([]string(nil), m.lastSnapshotRejectReasons...)
 	if m.eventStream != nil {
 		es := m.eventStream.Status()
 		status.EventStream = &es

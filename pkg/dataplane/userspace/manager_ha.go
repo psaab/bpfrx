@@ -379,32 +379,56 @@ func (m *Manager) configHasDataRGLocked() bool {
 }
 
 // disarmBeforeUnsupportedPublishLocked disarms helper forwarding BEFORE a full
-// apply_snapshot publish when the snapshot's config capabilities forbid
-// forwarding (#2124). A policy that names an application the userspace matcher
-// cannot represent makes deriveUserspaceCapabilities return
-// ForwardingSupported=false, and buildOneRuleSnapshot emits a `__unsupported__`
-// sentinel term. A current-version helper rejects that sentinel via its
-// integrity preflight, but an OLDER same-protocol-version helper that predates
-// the preflight would silently drop the sentinel and could process the
-// resulting match-any rule with forwarding still armed in the window before the
-// post-publish syncDesiredForwardingStateLocked() disarm — including via the
-// XSK-startup deferred same-plan publish path (process.go), which publishes
-// independently of Compile(). Disarming first, at EVERY full publish site,
-// closes that window for every helper version.
+// apply_snapshot publish, but ONLY when keeping the helper armed would fail
+// OPEN. There are two distinct cases (#3261 refines the original #2124 disarm):
 //
-// caps are derived from the snapshot's own config (not m.lastStatus, which
-// still reflects the prior good config). The disarm is issued only when a
-// running helper currently believes it is armed, so steady-state supported
-// configs take no extra control round-trip. The post-publish desired-state
-// sync still reconciles the final state.
-func (m *Manager) disarmBeforeUnsupportedPublishLocked(cfg *config.Config) error {
-	if cfg == nil {
+// CLASS (ii) — a genuinely-unsupported dataplane semantic
+// (deriveUserspaceCapabilities returns ForwardingSupported=false: screen
+// SYN-cookie material, color-aware 3-color policers, persistent SNAT under HA).
+// These have NO fail-closed snapshot representation — there is no sentinel the
+// helper integrity preflight can reject — so the dataplane genuinely cannot
+// forward and the legitimate disarm still applies.
+//
+// CLASS (i) — unrepresentable policy CONTENT (caps.PolicyContentRejected is
+// non-empty: a policy names an application protocol/port or address the matcher
+// cannot represent). buildOneRuleSnapshot emits the `__unsupported__` sentinel
+// for such a rule, and a CURRENT helper rejects it via its non-mutating
+// integrity preflight while staying armed (keeping previous-good, or leaving
+// the default-deny PolicyState on a fresh boot). Disarming here would XDP_PASS
+// transit to the kernel and bypass that reject — the fail-OPEN #3261 closes —
+// so we KEEP the helper armed. The ONLY exception is an OLDER local helper that
+// predates the preflight: it would silently drop the sentinel and process the
+// resulting match-any rule with forwarding armed. We disarm just that narrow
+// case, keyed on the helper's reported snapshot protocol version (the helper
+// ships in the same .deb as the daemon, so this is only a transient
+// helper-upgrade-lag window on a single node), NOT on the content being
+// unrepresentable.
+//
+// caps are read from the snapshot being published (snap.Capabilities), NOT
+// re-derived from cfg: only the snapshot value is feed-aware (#2049) and
+// reflects the ACTUAL per-rule sentinels, so a healthy dynamic-address feed
+// policy is not mistaken for unrepresentable content. The disarm is issued only
+// when a running helper currently believes it is armed, so steady-state
+// representable configs take no extra control round-trip. The post-publish
+// desired-state sync still reconciles the final state.
+func (m *Manager) disarmBeforeUnsupportedPublishLocked(snap *ConfigSnapshot) error {
+	if snap == nil || snap.Config == nil {
 		return nil
 	}
 	if m.proc == nil || m.proc.Process == nil || !m.lastStatus.ForwardingArmed {
 		return nil
 	}
-	if deriveUserspaceCapabilities(cfg).ForwardingSupported {
+	caps := snap.Capabilities
+	disarm := !caps.ForwardingSupported // class (ii): genuine semantic gap
+	reason := "unsupported-config"
+	if !disarm && len(caps.PolicyContentRejected) > 0 &&
+		m.lastStatus.ConfigSnapshotProtocolVersion < ProtocolVersion {
+		// class (i) on a pre-preflight helper: it cannot be trusted to reject
+		// the sentinel, so disarming is the only fail-closed option here.
+		disarm = true
+		reason = "unrepresentable-policy-content-on-pre-preflight-helper"
+	}
+	if !disarm {
 		return nil
 	}
 	var status ProcessStatus
@@ -412,7 +436,7 @@ func (m *Manager) disarmBeforeUnsupportedPublishLocked(cfg *config.Config) error
 		Type:       "set_forwarding_state",
 		Forwarding: &ForwardingControlRequest{Armed: false},
 	}, &status); err != nil {
-		return fmt.Errorf("disarm userspace forwarding before unsupported-config publish: %w", err)
+		return fmt.Errorf("disarm userspace forwarding before %s publish: %w", reason, err)
 	}
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return fmt.Errorf("sync helper status after pre-publish disarm: %w", err)

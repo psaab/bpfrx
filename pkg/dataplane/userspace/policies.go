@@ -22,6 +22,24 @@ import (
 // by both appid.ProtocolNumber and userspace-dp parse_protocol.
 const unsupportedApplicationSentinel = "__unsupported__"
 
+// unsupportedAddressSentinel is the reserved address literal emitted in a policy
+// rule's source/destination address fields (#3261) when the userspace matcher
+// cannot represent the rule's configured addresses — an undefined address-book
+// name, or a defined book whose value is a non-literal (Junos dns-name /
+// wildcard-address / range-address). It is the ADDRESS analog of
+// unsupportedApplicationSentinel: without it the raw address strings fall
+// through to the Rust matcher, which silently drops an unparseable literal
+// (parse_literal_cidr_into) or empties a non-literal book, collapsing the side
+// to MatchNone. A `deny <unrepresentable-address>` rule would then match
+// nothing and fall through to a later permit / default-permit — a deny
+// fail-OPEN. Emitting this sentinel makes the Rust integrity preflight raise
+// SnapshotIntegrityError::UnrepresentableAddress, rejecting the WHOLE snapshot
+// (previous-good retained; fresh-boot default-deny), symmetric to the
+// application path. It is deliberately not a valid CIDR/IP so it can never
+// match real traffic even on an older helper that lacks the preflight arm.
+// Must stay in lock-step with userspace-dp policy.rs UNREPRESENTABLE_ADDRESS_SENTINEL.
+const unsupportedAddressSentinel = "__unsupported_address__"
+
 // addressBookProbeLimit bounds the deterministic linear probe used to resolve
 // a folded-hash collision when assigning a u32 address-book content ID. The
 // folded FNV hash gives a starting slot; on a collision we walk forward by one
@@ -101,6 +119,43 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 	if err != nil {
 		return nil, err
 	}
+	// addrRepresentable reports whether the userspace matcher can represent a
+	// single policy address token. A token is representable iff it is match-any,
+	// a valid literal CIDR/IP, a feed-bound name (in the overlay — an empty feed
+	// is MatchNone BY DESIGN per #2049, NOT unrepresentable), or a known book/
+	// address-set that is STRUCTURALLY representable (nameRepresentable: every
+	// resolved member parses to a concrete prefix or is itself feed-bound).
+	//
+	// #3261: the structural check (not "row has >=1 prefix") is what closes the
+	// two fail-opens Codex caught. (A) An address-book entry whose value is a
+	// Junos dns-name / wildcard-address / range-address compiles to Value==""
+	// (compiler_validate_warn.go) and expandBookNameToCIDRs USED to widen "" to
+	// 0.0.0.0/0 — so a `deny <dns-name-book>` installed an overbroad deny-all
+	// and a `permit` widened to permit-any. (B) A book MIXING a literal and a
+	// dns-name member had row content from the literal, so a "row non-empty"
+	// check called it representable while the dns-name member was silently
+	// dropped (deny narrowing / under-match). nameRepresentable rejects BOTH
+	// (any unrepresentable member taints the name) so the address sentinel is
+	// emitted and the Rust preflight rejects the whole snapshot (previous-good
+	// retained / fresh-boot default-deny). A set that merely CONTAINS a
+	// feed-bound member stays representable (the member resolves via the overlay),
+	// so feeds are never falsely rejected.
+	addrRepresentable := func(tok string) bool {
+		switch tok {
+		case "", "any", "any4", "any6":
+			return true
+		}
+		if isUserspaceLiteralAddress(tok) {
+			return true
+		}
+		if _, feedBound := feedOverlay[tok]; feedBound {
+			return true
+		}
+		if _, known := nameToID[tok]; known {
+			return nameRepresentable(cfg.Security.AddressBook, feedOverlay, tok, make(map[string]bool))
+		}
+		return false
+	}
 	out := make([]PolicyRuleSnapshot, 0)
 	// walkPolicyRuleSlots is the single source of truth for the runtime
 	// policy-ID namespace (#3143/#3145). Using it on the snapshot WRITE side
@@ -110,7 +165,7 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 	// policy set's namespace.
 	if err := walkPolicyRuleSlots(cfg, func(slot policyRuleSlot) error {
 		policyID := slot.policyID()
-		snap := buildOneRuleSnapshot(cfg, nameToID, slot.Policy, slot.FromZone, slot.ToZone, policyID, activeState)
+		snap := buildOneRuleSnapshot(cfg, nameToID, addrRepresentable, slot.Policy, slot.FromZone, slot.ToZone, policyID, activeState)
 		out = append(out, snap)
 		return nil
 	}); err != nil {
@@ -244,6 +299,7 @@ func walkPolicyRuleSlots(cfg *config.Config, fn func(slot policyRuleSlot) error)
 func buildOneRuleSnapshot(
 	cfg *config.Config,
 	nameToID map[string]uint32,
+	addrRepresentable func(tok string) bool,
 	pol *config.Policy,
 	fromZone, toZone string,
 	policyID uint32,
@@ -258,6 +314,23 @@ func buildOneRuleSnapshot(
 	destinationAddresses, okDst := expandUserspacePolicyAddresses(cfg, pol.Match.DestinationAddresses)
 	if !okDst {
 		destinationAddresses = append([]string(nil), pol.Match.DestinationAddresses...)
+	}
+	// #3261: a side that names an address the matcher cannot represent (an
+	// undefined book name, or a static book that resolves to no prefix — but
+	// NOT a feed-bound name, whose empty content is MatchNone by design) must
+	// reject the WHOLE snapshot rather than silently collapse to MatchNone. The
+	// raw address strings otherwise fall through to the Rust matcher, which
+	// drops an unparseable literal / empties a non-literal book; a
+	// `deny <unrepresentable-address>` rule would then match nothing and fall
+	// through to a later permit / default-permit (deny fail-OPEN). The sentinel
+	// is the address analog of the application sentinel below.
+	srcUnrepresentable := !allAddressTokensRepresentable(addrRepresentable, pol.Match.SourceAddresses)
+	dstUnrepresentable := !allAddressTokensRepresentable(addrRepresentable, pol.Match.DestinationAddresses)
+	if srcUnrepresentable {
+		sourceAddresses = []string{unsupportedAddressSentinel}
+	}
+	if dstUnrepresentable {
+		destinationAddresses = []string{unsupportedAddressSentinel}
 	}
 	applicationTerms, ok := expandUserspacePolicyApplications(cfg, pol.Match.Applications)
 	if !ok {
@@ -280,6 +353,18 @@ func buildOneRuleSnapshot(
 	// reference" vs "free-form literal".
 	srcBookIDs, srcLiterals := classifyPolicyAddresses(cfg, nameToID, pol.Match.SourceAddresses)
 	dstBookIDs, dstLiterals := classifyPolicyAddresses(cfg, nameToID, pol.Match.DestinationAddresses)
+	// #3261: force the unrepresentable-address sentinel onto BOTH the v3
+	// (book-ids + literals) and the legacy (sourceAddresses, set above) address
+	// shapes, clearing the book IDs, so the Rust preflight raises
+	// UnrepresentableAddress no matter which shape it reads. Covers an undefined
+	// book name (classified as a literal Rust would drop) AND a static
+	// non-literal book (classified as a book ID whose table entry is empty).
+	if srcUnrepresentable {
+		srcBookIDs, srcLiterals = nil, []string{unsupportedAddressSentinel}
+	}
+	if dstUnrepresentable {
+		dstBookIDs, dstLiterals = nil, []string{unsupportedAddressSentinel}
+	}
 	schedulerName := pol.SchedulerName
 	// #2508: carry the per-policy `then log session-init`/`session-close`
 	// selection into the snapshot so the dataplane can gate the per-policy
@@ -320,6 +405,66 @@ func buildOneRuleSnapshot(
 		MatchFromZone: pol.Match.FromZone,
 		MatchToZone:   pol.Match.ToZone,
 	}
+}
+
+// collectPolicyContentRejections scans the BUILT policy rules for the #3261
+// fail-closed sentinels and returns a human-readable reason per offending rule.
+// This is the ACCURATE, feed-aware signal that the published snapshot will be
+// rejected by the helper integrity preflight (the application __unsupported__
+// term or the __unsupported_address__ literal) — unlike the cfg-only capability
+// gate, it sees the feed overlay already folded into the rules, so a healthy
+// dynamic-address feed policy does NOT false-positive. A non-empty result means
+// the helper keeps the previous-good state (or fresh-boot default-deny) and
+// stays armed; an empty result means every rule is representable.
+func collectPolicyContentRejections(policies []PolicyRuleSnapshot) []string {
+	var reasons []string
+	for i := range policies {
+		rule := &policies[i]
+		appBad := false
+		for _, term := range rule.ApplicationTerms {
+			if term.Protocol == unsupportedApplicationSentinel || term.Name == unsupportedApplicationSentinel {
+				appBad = true
+				break
+			}
+		}
+		addrBad := addressListHasSentinel(rule.SourceLiterals) ||
+			addressListHasSentinel(rule.DestinationLiterals) ||
+			addressListHasSentinel(rule.SourceAddresses) ||
+			addressListHasSentinel(rule.DestinationAddresses)
+		switch {
+		case appBad && addrBad:
+			reasons = append(reasons, fmt.Sprintf("policy %q names an unrepresentable application AND address", rule.Name))
+		case appBad:
+			reasons = append(reasons, fmt.Sprintf("policy %q names an application the userspace matcher cannot represent", rule.Name))
+		case addrBad:
+			reasons = append(reasons, fmt.Sprintf("policy %q names an address the userspace matcher cannot represent", rule.Name))
+		}
+	}
+	return reasons
+}
+
+func addressListHasSentinel(addrs []string) bool {
+	for _, a := range addrs {
+		if a == unsupportedAddressSentinel {
+			return true
+		}
+	}
+	return false
+}
+
+// allAddressTokensRepresentable reports whether EVERY token in a policy
+// address list is representable by the userspace matcher (#3261). An empty list
+// is "any" (representable). A single unrepresentable token taints the whole
+// side so buildOneRuleSnapshot emits the address sentinel and the Rust
+// integrity preflight rejects the snapshot (fail closed) instead of silently
+// dropping that token and narrowing/collapsing the match.
+func allAddressTokensRepresentable(addrRepresentable func(tok string) bool, addrs []string) bool {
+	for _, tok := range addrs {
+		if !addrRepresentable(tok) {
+			return false
+		}
+	}
+	return true
 }
 
 // classifyPolicyAddresses splits the policy's address-token list
@@ -596,7 +741,17 @@ func expandBookNameToCIDRs(cfg *config.Config, name string) ([]string, []string)
 	values := expandBookNameRecursive(ab, name, visited, 0)
 	var v4, v6 []string
 	for _, value := range values {
-		if value == "" || value == "any" {
+		if value == "" {
+			// #3261: an entry with no compiled prefix (a Junos dns-name /
+			// wildcard-address / range-address sub-stanza, or a genuinely empty
+			// entry) contributes NOTHING. It must NOT widen to 0.0.0.0/0 + ::/0
+			// (the pre-#3261 fail-open: an overbroad deny-all / a permit-any).
+			// The referencing policy is rejected upstream via nameRepresentable
+			// (the address sentinel -> whole-snapshot reject); this keeps the
+			// book row itself honest (match-nothing, per the Junos #2229 intent).
+			continue
+		}
+		if value == "any" {
 			v4 = append(v4, "0.0.0.0/0")
 			v6 = append(v6, "::/0")
 			continue
@@ -646,6 +801,173 @@ func expandBookNameRecursive(ab *config.AddressBook, name string, visited map[st
 		return out
 	}
 	return nil
+}
+
+// nameRepresentable reports whether an address-book name (Address or
+// AddressSet, recursively) is FULLY representable by the userspace matcher
+// (#3261). It is structural and content-independent: every resolved member must
+// be a feed-bound name (resolved via the snapshot overlay, #2049), or an
+// Address whose value parses to a concrete prefix (CIDR / bare IP / "any"), or
+// an AddressSet all of whose members are representable AND that contributes at
+// least one CONCRETE prefix. An Address with an empty or unparseable value (a
+// Junos dns-name / wildcard-address / range-address that compiled to
+// Value=="") or an undefined reference makes the name UNREPRESENTABLE — so
+// buildOneRuleSnapshot emits the address sentinel and the Rust preflight
+// rejects the whole snapshot rather than (A) widening an empty value to
+// 0.0.0.0/0 match-any, or (B) silently dropping the unrepresentable member of
+// an otherwise-populated book (deny narrowing). Because the check does not
+// inspect the per-name feed-overlay merge, a DIRECT policy token that names a
+// feed (not inside a set) stays representable (no false reject); the empty-feed
+// = MatchNone semantics are by design (#2049).
+//
+// #3261 convergent MAJOR (Codex MAJOR 2 + Claude-SMR): the SET branch
+// additionally requires that at least one recursively-resolved member
+// contributes a concrete prefix. Without this an EMPTY address-set, a pure
+// self-cycle (X -> X), or a set whose ONLY members are feed-bound names were
+// VACUOUSLY representable — no sentinel emitted — yet they compile to an EMPTY
+// book row (feed prefixes are merged only for the TOP-LEVEL overlay name in
+// buildAddressBookTableWithFeeds, never for a set MEMBER; Codex MAJOR 1). An
+// empty-row deny side decodes to MatchNone, so a `deny <empty/cycle/feed-only
+// set>` matches nothing and falls through to a later permit / default-permit —
+// a deny fail-OPEN on the exact lenient-load / peer-sync path this mechanism
+// guards (the strict commit gate is downgraded to a warning there). A set
+// MIXING a feed member and >=1 concrete member stays representable (the
+// feed-portion under-deny is the deferred #2049 feed-prefixes-not-merged-into-
+// sets residual, OUT OF SCOPE here).
+func nameRepresentable(ab *config.AddressBook, feedOverlay map[string][]string, name string, visited map[string]bool) bool {
+	// The closure must be BOTH structurally resolvable AND contribute >=1
+	// concrete prefix. The >=1-concrete requirement is enforced HERE, exactly
+	// once at the top, mirroring strict's single `count==0` reject after
+	// resolve(name) succeeds. An empty / pure-cycle / feed-only top-level set is
+	// structurally resolvable (r=true) but has no concrete contribution (c=false)
+	// -> rejected; a mutual-cycle-with-concrete set is (true,true) -> accepted.
+	// (A direct feed name never reaches here — addrRepresentable short-circuits
+	// it via feedOverlay, preserving the #2049 direct-feed exemption.)
+	r, c := nameRepresentability(ab, feedOverlay, name, visited)
+	return r && c
+}
+
+// nameRepresentability returns (representable, concrete) for an address-book
+// name as TWO INDEPENDENT bits — structural-resolvability is DECOUPLED from
+// concrete-ness. This is the parity contract with the strict commit validator
+// `policyMatchAddressBookResolves` (pkg/config/compiler_validate_strict.go):
+// the dataplane's accept/reject decision must EXACTLY equal strict's so a
+// commit-valid config never has its snapshot silently over-rejected (Codex
+// MERGE-NEEDS-MAJOR).
+//
+//   - `representable` (structurally resolvable) is false ONLY if a member is
+//     structurally invalid: an empty-string ref, an Address with Value=="",
+//     an undefined reference, OR a nested set that is itself unresolvable OR
+//     EMPTY (hasMember==false). This mirrors strict's `resolve()==false`
+//     poisoning the parent. Crucially, a mutual or self cycle does NOT taint a
+//     set that ALSO has its own resolvable member — the cycle revisit returns
+//     representable (strict's `if seen[ref] { return true }`).
+//   - `concrete` reports whether the name contributes at least one CONCRETE
+//     prefix to a book row: a CIDR / bare-IP / explicit-`any` Address, or a
+//     nested set that itself has a concrete contribution. A feed-bound name and
+//     a cycle revisit are representable-but-NOT-concrete (a feed member's
+//     prefixes are not merged into an enclosing set's row, and a cycle revisit
+//     contributes nothing, matching expandBookNameRecursive's nil-on-revisit).
+//
+// The SET branch returns (hasMember, anyConcrete): an empty set is
+// (false,false) (matches strict's resolvedAny==false reject); a structurally
+// valid set with >=1 member, all members representable, cycles OK, is
+// representable EVEN IF its own concrete contribution is false (concrete then
+// propagates separately up the stack). The >=1-concrete-in-closure requirement
+// is NOT enforced here — it is checked EXACTLY ONCE at the top in
+// nameRepresentable (`r && c`), mirroring strict's single top-level `count==0`
+// reject AFTER resolve(name) succeeds. This decouple fixes the mutual-cycle-
+// with-concrete over-reject: `A { address concrete; address-set B }`,
+// `B { address-set A }` — when A is the entry, B's only member is the cycle
+// revisit of A (representable, not concrete), so B is (true,false); the old
+// `return anyConcrete, anyConcrete` made B (false,false), which poisoned A and
+// discarded A's own concrete. strict ACCEPTS this config, so the dataplane now
+// must too.
+//
+// The direct Address / direct feed-name paths do not require `concrete`
+// (addrRepresentable short-circuits feed names BEFORE nameRepresentable, so a
+// policy referencing a feed name directly never reaches the top `r && c` gate),
+// preserving the #2049 direct-feed exemption.
+func nameRepresentability(ab *config.AddressBook, feedOverlay map[string][]string, name string, visited map[string]bool) (representable, concrete bool) {
+	if name == "" {
+		return false, false
+	}
+	if visited[name] {
+		// Cycle revisit: matches expandBookNameRecursive's nil-on-revisit and
+		// strict's `if seen[ref] { return true }` — representable (does NOT taint
+		// the name), but contributes nothing concrete. The top-level
+		// >=1-concrete gate in nameRepresentable is what rejects a pure cycle.
+		return true, false
+	}
+	if _, feedBound := feedOverlay[name]; feedBound {
+		// Feed-bound name: representable, but its prefixes are merged only for
+		// the top-level overlay name, never into an enclosing set's row — so it
+		// is NOT a concrete contribution toward a set's representability.
+		return true, false
+	}
+	if ab == nil {
+		return false, false
+	}
+	if addr, ok := ab.Addresses[name]; ok {
+		if addressValueRepresentable(addr.Value) {
+			return true, true
+		}
+		return false, false
+	}
+	set, ok := ab.AddressSets[name]
+	if !ok {
+		// Neither a static address/set nor a feed-bound name: an undefined
+		// reference is unrepresentable.
+		return false, false
+	}
+	visited[name] = true
+	defer delete(visited, name)
+	hasMember := false
+	anyConcrete := false
+	for _, member := range set.Addresses {
+		hasMember = true
+		r, c := nameRepresentability(ab, feedOverlay, member, visited)
+		if !r {
+			// A structurally-invalid member poisons the parent — matches strict's
+			// abort on resolve()==false (also fires when the member is an EMPTY
+			// nested set, which returns hasMember=false here).
+			return false, false
+		}
+		anyConcrete = anyConcrete || c
+	}
+	for _, nested := range set.AddressSets {
+		hasMember = true
+		r, c := nameRepresentability(ab, feedOverlay, nested, visited)
+		if !r {
+			return false, false
+		}
+		anyConcrete = anyConcrete || c
+	}
+	// Structural resolvability and concrete-ness are returned as INDEPENDENT
+	// bits. A set with >=1 member, all representable (cycles OK), is structurally
+	// resolvable even if its own concrete contribution is false; concrete
+	// propagates separately. An EMPTY set is (false,false) — matches strict's
+	// resolvedAny==false. The >=1-concrete-in-closure rule is enforced ONCE at
+	// the top in nameRepresentable, NOT here.
+	return hasMember, anyConcrete
+}
+
+// addressValueRepresentable reports whether a single address-book entry VALUE
+// resolves to a concrete matcher prefix. Mirrors the value handling in
+// expandBookNameToCIDRs: "any" is match-any (representable); a CIDR or bare IP
+// is representable; an empty value (#3261: a dns-name/wildcard/range sub-stanza
+// that compiled to "") or any other unparseable token is NOT.
+func addressValueRepresentable(value string) bool {
+	switch value {
+	case "any":
+		return true
+	case "":
+		return false
+	}
+	if isV4CIDR(value) || isV6CIDR(value) {
+		return true
+	}
+	return net.ParseIP(value) != nil
 }
 
 func normalizeAnyInCIDRs(v4, v6 []string) ([]string, []string) {

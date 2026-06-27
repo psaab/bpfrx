@@ -27,6 +27,20 @@ pub(crate) enum SnapshotIntegrityError {
     /// preflight keeps the previous good state) is action-agnostic: it never
     /// turns a deny into a pass nor a permit into match-any.
     UnrepresentableApplicationProtocol { rule_id: String },
+    /// #3261: a policy rule carries the reserved `__unsupported_address__`
+    /// sentinel in its source/destination address fields. The Go capability
+    /// gate emits it when a policy names an address it cannot represent — an
+    /// undefined address-book name, or a defined book whose value is a
+    /// non-literal (Junos dns-name / wildcard-address / range-address). This is
+    /// the ADDRESS analog of `UnrepresentableApplicationProtocol`: without the
+    /// reject, the raw address strings reach the matcher, which SILENTLY drops
+    /// an unparseable literal (`parse_literal_cidr_into`) or empties a
+    /// non-literal book, collapsing the side to `MatchNone`. A
+    /// `deny <unrepresentable-address>` rule would then match nothing and fall
+    /// through to a later permit / default-permit — a deny fail-OPEN. Rejecting
+    /// the whole snapshot (the preflight keeps the previous good state; a fresh
+    /// boot keeps the default-deny `PolicyState`) is action-agnostic.
+    UnrepresentableAddress { rule_id: String },
     /// #2212: a NAT64 rule snapshot carried an unparseable field — a prefix
     /// that is empty / malformed / not /96, or a pool address that is neither a
     /// bare IPv4 nor a `/32` host. (A pool that is genuinely UNCONFIGURED — no
@@ -224,6 +238,11 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 "rule {:?} has an unrepresentable application term (unparseable protocol or port) — refusing to fail open by dropping it",
                 rule_id
             ),
+            Self::UnrepresentableAddress { rule_id } => write!(
+                f,
+                "rule {:?} has an unrepresentable address (undefined address book, or a non-literal dns-name/wildcard/range value) — refusing to fail open by collapsing the side to match-none (which lets a deny fall through)",
+                rule_id
+            ),
             Self::Nat64UnparseableRule { rule_name, field } => write!(
                 f,
                 "nat64 rule {:?} has an unparseable {} — refusing to fail open by silently dropping the rule",
@@ -317,6 +336,26 @@ impl std::fmt::Display for SnapshotIntegrityError {
 }
 
 impl std::error::Error for SnapshotIntegrityError {}
+
+/// #3261: reserved address literal the Go capability gate emits for a policy
+/// whose source/destination address it cannot represent. Detected in the
+/// integrity preflight to reject the whole snapshot (fail closed). Must stay in
+/// lock-step with the Go `unsupportedAddressSentinel`. It is deliberately not a
+/// parseable CIDR/IP, so even an older helper that lacks the preflight arm
+/// drops it to `MatchNone` and never matches real traffic.
+pub(crate) const UNREPRESENTABLE_ADDRESS_SENTINEL: &str = "__unsupported_address__";
+
+/// #3261: true iff any of the rule's address fields (v3 literals or the legacy
+/// expanded lists, source or destination) carries the unrepresentable-address
+/// sentinel. The Go side stamps it onto BOTH shapes for the failed side, so a
+/// scan of all four lists catches it regardless of which shape the matcher uses.
+fn rule_has_unrepresentable_address_sentinel(snap: &PolicyRuleSnapshot) -> bool {
+    let hit = |list: &[String]| list.iter().any(|a| a == UNREPRESENTABLE_ADDRESS_SENTINEL);
+    hit(&snap.source_literals)
+        || hit(&snap.destination_literals)
+        || hit(&snap.source_addresses)
+        || hit(&snap.destination_addresses)
+}
 
 /// #1606: one row of the deduplicated address-book table.
 #[derive(Clone, Debug, Default)]
@@ -1310,6 +1349,18 @@ pub(crate) fn parse_policy_state_with_counters(
         };
 
         let rule_id = stable_policy_rule_id(snap);
+
+        // #3261: reject the WHOLE snapshot if the rule carries the
+        // unrepresentable-address sentinel (undefined book name, or a defined
+        // book whose value is a non-literal dns-name/wildcard/range). Mirrors
+        // the application-term `dropped_any` reject below. Without it the
+        // address side would silently collapse to MatchNone and a
+        // `deny <unrepresentable-address>` rule would fall through to a later
+        // permit / default-permit (deny fail-open). Checked BEFORE any literal
+        // parsing / book resolution so the preflight stays non-mutating.
+        if rule_has_unrepresentable_address_sentinel(snap) {
+            return Err(SnapshotIntegrityError::UnrepresentableAddress { rule_id });
+        }
 
         // Resolve book IDs to dense indices. Sort + dedup + hard
         // fail on unknown.

@@ -22333,6 +22333,111 @@ top.
   userspace-dp/tests/fixtures/protocol_wire_v1.json
 
 - **Timestamp**: 2026-06-27
+  **Action**: #3261 — keep the userspace helper ARMED for unrepresentable
+  policy content; rely on the existing Rust whole-snapshot integrity reject
+  (the #2124 fail-closed family) instead of disarming into kernel forwarding.
+  Root cause: a leniently-loaded / peer-synced unrepresentable-content config
+  (e.g. a protocol-less application) made `deriveUserspaceCapabilities` return
+  `ForwardingSupported=false` → the pre-publish disarm fired → the XDP shim
+  `XDP_PASS`ed transit to the kernel, BYPASSING the integrity reject that would
+  have retained the previous-good snapshot. Fail-closed intent failed OPEN.
+  Fix (Go only, no Rust contract change): split the capability gate into class
+  (i) unrepresentable policy *content* (recorded in `caps.PolicyContentRejected`,
+  does NOT clear `ForwardingSupported`) and class (ii) genuinely-unsupported
+  *semantics* (still disarm). `disarmBeforeUnsupportedPublishLocked` keeps a
+  narrow disarm for class (i) only on an OLD helper
+  (`ConfigSnapshotProtocolVersion < ProtocolVersion`, which cannot be trusted to
+  reject the sentinel). Surfaced the reject via
+  `ProcessStatus.LastSnapshotRejectReasons`, a one-shot `slog.Warn`, and the
+  `xpf_userspace_policy_content_rejected` 0/1 gauge. Running node → previous-good
+  retained; fresh boot → default-deny `PolicyState`; deny-rule stays fail-CLOSED.
+  Validation: fail-on-revert proven (3 Go tests flip RED on revert); full
+  `cargo build --release` + `cargo test --release` (0 failures); `go build ./...`
+  + `go test ./pkg/dataplane/... ./pkg/config/...` green.
+  **File(s)**: pkg/dataplane/userspace/capabilities.go,
+  pkg/dataplane/userspace/manager_ha.go, pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/protocol_failopen_2124_test.go,
+  pkg/dataplane/userspace/lenient_keep_armed_3261_test.go,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
+  pkg/api/metrics_userspace.go, userspace-dp/src/policy_tests.rs,
+  docs/userspace-dataplane-gaps.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3261 review fold (NEEDS-MAJOR) — close the ADDRESS half of the
+  keep-armed fix. The application path had a sentinel + Rust reject backstop,
+  but an unrepresentable ADDRESS (undefined address-book name, or a static book
+  whose value is a non-literal dns-name/wildcard that resolves to no prefix) had
+  NONE: the raw strings reached the Rust matcher, which silently dropped an
+  unparseable literal / emptied a non-literal book -> the side collapsed to
+  MatchNone -> a `deny <bad-address>` rule matched nothing and fell through to a
+  later permit / default-permit (deny fail-OPEN on exactly #3261's
+  lenient/peer-sync path). Fix: emit a reserved `__unsupported_address__`
+  sentinel (Go, onto both v3 and legacy address shapes) + a matching
+  `SnapshotIntegrityError::UnrepresentableAddress` reject arm (Rust), symmetric
+  to the application path. The detection is FEED-AWARE: representability is
+  computed per-token (any-ish | valid literal | feed-bound name in the overlay |
+  known book with content), so a dynamic-address feed policy (#2049) — including
+  a transiently-EMPTY feed (overlay key present = MatchNone by design) — is NOT
+  rejected. Moved the class-(i) `PolicyContentRejected` diagnostic out of the
+  cfg-only `deriveUserspaceCapabilities` (which is feed-blind and would
+  false-positive every feed deployment) and onto the ACTUAL built snapshot via
+  `collectPolicyContentRejections`; `disarmBeforeUnsupportedPublishLocked` now
+  reads `snap.Capabilities` instead of re-deriving from cfg. Incidentally fixes
+  a latent bug: a feed-backed policy previously made the cfg gate return
+  ForwardingSupported=false -> the helper was DISARMED.
+  Validation: fail-on-revert proven for the address override (both sub-cases
+  RED) and the Rust reject (deny-address test RED); feed non-regression +
+  empty-feed (#2049) tests green; full `cargo test --release` (0 failures beyond
+  the known concurrent_recovery flake); `go build ./...` + `go test
+  ./pkg/dataplane/... ./pkg/config/... ./pkg/api/` green.
+  **File(s)**: pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/builder.go, pkg/dataplane/userspace/capabilities.go,
+  pkg/dataplane/userspace/manager.go, pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/process.go, userspace-dp/src/policy.rs,
+  userspace-dp/src/policy_tests.rs,
+  pkg/dataplane/userspace/protocol_failopen_2124_test.go,
+  pkg/dataplane/userspace/lenient_keep_armed_3261_test.go,
+  pkg/dataplane/userspace/feed_enforcement_test.go,
+  docs/userspace-dataplane-gaps.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3261 review fold #2 (Codex 4th-reviewer, NEEDS-MAJOR) — close the
+  REAL address fail-open the prior fold missed for subcase-2b. Two distinct
+  bugs: (A) an address-book entry whose value is a Junos
+  dns-name/wildcard/range compiles to Value=="" (compiler_validate_warn.go),
+  and expandBookNameToCIDRs widened "" to 0.0.0.0/0 + ::/0 (match-any) -> a
+  `deny <dns-name-book>` installed an overbroad deny-all and a `permit` widened
+  to permit-any; idHasContent was therefore TRUE -> no sentinel -> no reject.
+  (B) a book MIXING a literal + a dns-name member had row content from the
+  literal -> "row non-empty" looked representable while the dns-name member was
+  silently dropped (deny narrowing). The prior test used Value:"www.example.com"
+  (parses to empty via the bare-IP path), NOT the real Value=="" shape, so it
+  missed (A). Fix: (1) expandBookNameToCIDRs skips an empty value (contributes
+  nothing; explicit `any` still -> 0.0.0.0/0); (2) replaced the "row has >=1
+  prefix" idHasContent check with a STRUCTURAL, content-independent,
+  feed-aware nameRepresentable (a name is representable iff every recursively
+  resolved member is feed-bound, an Address whose value parses to a concrete
+  prefix, or an AddressSet of representable members) -> any unrepresentable
+  member taints the name -> __unsupported_address__ sentinel -> whole-snapshot
+  reject; (3) mirrored the empty-value->match-nothing change in the
+  pkg/policymatch simulator (addCIDRValue) for show-match-policies parity.
+  nameRepresentable also REMOVES a feed-in-set false-positive the prior
+  idHasContent check had (a set containing a feed member is representable, not
+  rejected). Audited all expandBookNameToCIDRs consumers (only the book-table
+  builder; policymatch has a parallel copy, also fixed).
+  Validation: real-shape tests added (empty-value + partial-set sub-cases) +
+  explicit-`any` no-regression + a direct expandBookNameToCIDRs unit test;
+  fail-on-revert proven twice (revert Part A -> empty-expands-to-0.0.0.0/0 test
+  RED; revert the structural empty check -> empty-value + partial-set RED);
+  feed + empty-feed (#2049) guards green; full cargo test --release (0 failures
+  beyond the known concurrent_recovery flake), go build ./..., go test
+  ./pkg/dataplane/... ./pkg/config/... ./pkg/api/ ./pkg/policymatch/ green.
+  **File(s)**: pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/lenient_keep_armed_3261_test.go,
+  pkg/policymatch/policymatch.go, docs/userspace-dataplane-gaps.md
+
+- **Timestamp**: 2026-06-27
   **Action**: #3270 — populate flowDirection (IPFIX/NetFlow v9 IE 61) from the
   per-zone sampling-direction, opt-in via `export-extension flow-dir`. Added
   `ExportConfig.FlowDirection` (ingress `sampling input`→0, egress-only
