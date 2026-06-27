@@ -237,6 +237,151 @@ func TestApplicationSpec_ReferencedBad_LenientWarns(t *testing.T) {
 	}
 }
 
+// #3109: a custom application with a port (or any spec) but NO `protocol` was
+// accepted at commit (validateApplicationSpecsStrict only checked a NON-empty
+// protocol, compiler_validate_strict.go), then was unrepresentable at runtime: the
+// Go capability gate (normalizeUserspaceApplicationProtocol("") → ok=false) trips
+// #2124's refuse-to-arm and sets ForwardingSupported=false for the WHOLE userspace
+// dataplane, so ONE protocol-less app silently disabled security-policy enforcement
+// for the entire config (a system-level fail-OPEN to the kernel slow path); the Rust
+// snapshot builder likewise hard-errors UnrepresentableApplicationProtocol. Junos
+// requires `protocol`, so the fix rejects a protocol-less referenced application at
+// COMMIT, naming the one offending app instead of silently disabling everything.
+
+// A referenced protocol-less (port-only) application must reject at commit, naming
+// the application and "protocol".
+func TestApplicationSpec_ReferencedProtocollessApp_RejectsAtCommit(t *testing.T) {
+	tree := flatTreeFromSets(t,
+		// No `protocol` leaf — only a destination-port. This is the issue's exact
+		// trigger.
+		"set applications application BAD destination-port 443",
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
+		"set security policies from-zone trust to-zone untrust policy p match source-address any",
+		"set security policies from-zone trust to-zone untrust policy p match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy p match application BAD",
+		"set security policies from-zone trust to-zone untrust policy p then permit",
+	)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected commit to reject protocol-less application BAD (port-only, no protocol)")
+	}
+	if !strings.Contains(err.Error(), "BAD") ||
+		!strings.Contains(err.Error(), "protocol") {
+		t.Fatalf("error %q must name application BAD and mention protocol", err.Error())
+	}
+}
+
+// Blast-radius containment / non-tautology: a config that references BOTH a
+// normal protocol-bearing application (GOOD) AND a protocol-less one (BAD) must
+// reject at commit with an error that pinpoints BAD — the failure is isolated to
+// the one offending app, NOT a vague global break. The GOOD app's spec is valid,
+// proving the reject is caused solely by the protocol-less BAD.
+//
+// Fail-on-revert: removing the `if app.Protocol == ""` guard in
+// validateApplicationSpecsStrict restores the pre-fix whole-table-failure
+// behavior — the config COMMITS (BAD passes the strict gate), and at runtime the
+// #2124 capability gate sets ForwardingSupported=false for the entire userspace
+// dataplane (one protocol-less app disables policy enforcement for GOOD's policy
+// too). With the guard removed CompileConfig returns nil, so this test's
+// `err == nil` assertion fires and the test goes RED.
+func TestApplicationSpec_ProtocollessApp_DoesNotDisableOtherApps(t *testing.T) {
+	tree := flatTreeFromSets(t,
+		"set applications application GOOD protocol tcp destination-port 80",
+		"set applications application BAD destination-port 443",
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
+		// p_good references the well-formed GOOD app.
+		"set security policies from-zone trust to-zone untrust policy p_good match source-address any",
+		"set security policies from-zone trust to-zone untrust policy p_good match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy p_good match application GOOD",
+		"set security policies from-zone trust to-zone untrust policy p_good then permit",
+		// p_bad references the protocol-less BAD app.
+		"set security policies from-zone trust to-zone untrust policy p_bad match source-address any",
+		"set security policies from-zone trust to-zone untrust policy p_bad match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy p_bad match application BAD",
+		"set security policies from-zone trust to-zone untrust policy p_bad then deny",
+	)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected commit to reject protocol-less application BAD so it can " +
+			"never reach the runtime and globally disable enforcement (GOOD's policy included)")
+	}
+	if !strings.Contains(err.Error(), "BAD") {
+		t.Fatalf("error %q must pinpoint the protocol-less application BAD (blast radius is one named app)", err.Error())
+	}
+	// The error must isolate BAD, not implicate the well-formed GOOD app.
+	if strings.Contains(err.Error(), "GOOD") {
+		t.Fatalf("error %q must not implicate the well-formed application GOOD", err.Error())
+	}
+}
+
+// The same config, but with GOOD only (no protocol-less app) and BAD given a
+// protocol, must commit cleanly — proving the reject above is caused by the
+// missing protocol and not the surrounding two-policy structure.
+func TestApplicationSpec_BothAppsHaveProtocol_AcceptsAtCommit(t *testing.T) {
+	tree := flatTreeFromSets(t,
+		"set applications application GOOD protocol tcp destination-port 80",
+		"set applications application BAD protocol tcp destination-port 443",
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
+		"set security policies from-zone trust to-zone untrust policy p_good match source-address any",
+		"set security policies from-zone trust to-zone untrust policy p_good match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy p_good match application GOOD",
+		"set security policies from-zone trust to-zone untrust policy p_good then permit",
+		"set security policies from-zone trust to-zone untrust policy p_bad match source-address any",
+		"set security policies from-zone trust to-zone untrust policy p_bad match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy p_bad match application BAD",
+		"set security policies from-zone trust to-zone untrust policy p_bad then deny",
+	)
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("expected commit to accept two protocol-bearing applications: %v", err)
+	}
+}
+
+// No-brick (#1960): a config persisted/synced with a policy-referenced
+// protocol-less application must still LOAD on the tolerant path
+// (CompileConfigLenient) — downgraded to a warning — so an upgraded node does
+// not fail closed on boot. The #2124 runtime gate keeps that one app's policy
+// inert (refuse-to-arm) rather than silently mis-matching.
+func TestApplicationSpec_ReferencedProtocollessApp_LenientWarns(t *testing.T) {
+	tree := flatTreeFromSets(t,
+		"set applications application BAD destination-port 443",
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
+		"set security policies from-zone trust to-zone untrust policy p match source-address any",
+		"set security policies from-zone trust to-zone untrust policy p match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy p match application BAD",
+		"set security policies from-zone trust to-zone untrust policy p then permit",
+	)
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient load of a referenced protocol-less app must not fail: %v", err)
+	}
+	var warned bool
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "application spec") && strings.Contains(w, "BAD") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("expected lenient path to record an application-spec downgrade warning, got %v", cfg.Warnings)
+	}
+}
+
+// An UNREFERENCED protocol-less application with app-id DISABLED stays a warning
+// (the referenced-vs-unreferenced distinction): it is not matchable by anything,
+// so it cannot disable a live policy and must not block an operator iterating on
+// a not-yet-wired application library.
+func TestApplicationSpec_UnreferencedProtocollessApp_WarnsNotRejected(t *testing.T) {
+	tree := flatTreeFromSets(t,
+		"set applications application BAD destination-port 443",
+	)
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("unreferenced protocol-less app must not reject at commit: %v", err)
+	}
+}
+
 // referencedProtoApp wires the issue's exact #3150 trigger: a policy that
 // matches an application whose `protocol` leaf is the supplied token.
 func referencedProtoApp(proto string) []string {

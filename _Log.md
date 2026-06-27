@@ -1,3 +1,26 @@
+## 2026-06-26 — #3109 protocol-less application rejected at commit
+
+- **Timestamp**: 2026-06-26
+- **Action**: a custom `applications application <name>` with a port but NO
+  `protocol` committed cleanly (the strict validator only checked a NON-empty
+  protocol) then disabled ALL userspace security-policy enforcement at apply:
+  `compileApplications` defaults a protocol-less app to the empty protocol, which
+  trips #2124's Go capability gate (`ForwardingSupported=false` for the whole
+  dataplane) and the Rust snapshot integrity check
+  (`UnrepresentableApplicationProtocol`). One bad app silently disabled the whole
+  config (system-level fail-OPEN to the kernel slow path). Junos requires
+  `protocol`, so the fix (Option A — strict-at-commit, #1960 doctrine) hard-rejects
+  a protocol-less REFERENCED application in `validateApplicationSpecsStrict` with a
+  clear error naming the one offending app; downgraded to a warning on the
+  tolerant load / peer-sync path (no-brick). Blast radius is now one named app at
+  commit instead of a global disable at apply. Added the explicit empty-protocol
+  guard and dropped the now-redundant `app.Protocol != ""` precondition on the
+  #3150 check (defense-in-depth). No Rust change — its integrity check stays the
+  backstop.
+- **File(s)**: `pkg/config/compiler_validate_strict.go`,
+  `pkg/config/compiler_application_specs_test.go`,
+  `docs/services-application-identification.md`
+
 ## 2026-06-26 — #2883 event-stream idle keepalive rides write_buf backpressure
 
 - **Timestamp**: 2026-06-26

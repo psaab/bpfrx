@@ -2576,7 +2576,9 @@ func validateZoneInterfaceMembershipStrict(cfg *Config) error {
 // source-port is malformed (not a valid numeric port, port range, or known
 // service name, out of 1..65535, or an inverted low>high range) or whose
 // protocol token is not a known name, a RESOLVABLE junos-* alias (one the
-// dataplane's appid.ProtocolNumber actually knows — #3150), or a 0..255 number
+// dataplane's appid.ProtocolNumber actually knows — #3150), is MISSING entirely
+// (a protocol-less port-only application the matcher cannot represent — #3109),
+// or a 0..255 number
 // (#2142) — but ONLY for applications that are
 // actually REFERENCED by a security policy or a source/destination-NAT rule's
 // `match application` (#2187), or for ALL applications when
@@ -2633,6 +2635,42 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 		if err := validatePortSpec(app.SourcePort); err != nil {
 			return fmt.Errorf("application %q: source-port: %w", name, err)
 		}
+		// #3109: a referenced application with NO protocol is unrepresentable by
+		// the userspace matcher, which keys every term on a protocol number
+		// (appid.ProtocolNumber) plus the port — a port has no meaning without a
+		// protocol. compileApplications defaults a protocol-less application to the
+		// empty protocol (compiler_applications.go: `protocols = []string{""}`),
+		// which the runtime then cannot represent on EITHER side: the Go capability
+		// gate (pkg/dataplane/userspace/capabilities.go
+		// normalizeUserspaceApplicationProtocol == "" → expandUserspacePolicyApplications
+		// ok=false) trips #2124's refuse-to-arm, which sets ForwardingSupported=false
+		// for the WHOLE userspace dataplane — one protocol-less app silently disables
+		// security-policy enforcement for the entire config (it falls to the kernel
+		// slow path, a system-level fail-OPEN); and the Rust snapshot builder rejects
+		// the snapshot with SnapshotIntegrityError::UnrepresentableApplicationProtocol
+		// (parse_protocol("") => None). Junos requires `protocol` for a usable
+		// application, so the Junos-parity fix is to reject the protocol-less spec at
+		// COMMIT (the same strict-at-commit / #1960 fail-closed doctrine as the #3150
+		// unresolvable-protocol case below and the #2142 malformed-port case above).
+		// The blast radius is now one NAMED application caught at commit instead of a
+		// silent whole-dataplane disable at apply. On the tolerant load / peer-sync
+		// path the call site (compiler.go, lenientApplicationSpecs) downgrades this to
+		// a warning so an already-persisted or older-peer-synced config still BOOTS;
+		// the #2124 runtime gate then keeps that one referenced app's policy inert
+		// (refuse-to-arm) — the deliberate fail-closed backstop, now operator-visible.
+		if app.Protocol == "" {
+			return fmt.Errorf(
+				"application %q: no protocol specified; an application referenced by "+
+					"a security policy or NAT rule (or any application when "+
+					"`services application-identification` is enabled) must set "+
+					"`protocol` (e.g. tcp/udp/icmp/icmpv6/gre, a junos-* alias such "+
+					"as junos-ping, or a numeric value 0-255). The userspace matcher "+
+					"keys on protocol+port and cannot represent a protocol-less "+
+					"application — accepting it would disarm the userspace dataplane "+
+					"for the whole config (the referencing policy's enforcement falls "+
+					"to the kernel slow path)",
+				name)
+		}
 		// #3150: resolve the protocol against the SAME authority the dataplane
 		// uses (appid.ProtocolNumber, mirrored by filterProtocolResolvable) — NOT
 		// the lenient validateProtocol, which blanket-accepts any "junos-" prefix.
@@ -2643,7 +2681,7 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 		// the catalog knows (e.g. junos-ping, junos-tcp-any), real protocol names,
 		// and 0..255 numbers, so a referenced app whose protocol the dataplane
 		// cannot represent is rejected at commit instead.
-		if app.Protocol != "" && !filterProtocolResolvable(app.Protocol) {
+		if !filterProtocolResolvable(app.Protocol) {
 			return fmt.Errorf(
 				"application %q: unknown protocol %q (use a protocol name such as "+
 					"tcp/udp/icmp/icmpv6/gre/esp/ah/sctp/ospf, a resolvable junos-* "+
