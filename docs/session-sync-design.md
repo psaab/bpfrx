@@ -559,6 +559,22 @@ backlog (`write_buf`) and writes non-blocking; on `WouldBlock` it keeps the
 remainder for the next cycle. Daemon detects gaps via sequence numbers and can
 request a full reconciliation.
 
+The reconnect **replay** (`replay_buffered`) and demotion **drain**
+(`handle_drain_request`) paths write on the SAME nonblocking socket via a
+bounded, stop-aware writer (`write_all_backpressured`, #2877) — they do NOT
+flip the socket to blocking and call `write_all`. On `WouldBlock` the writer
+sleeps `REPLAY_DRAIN_WRITE_POLL` and retries, polling the I/O-thread stop flag
+each cycle and bailing at a `REPLAY_DRAIN_WRITE_DEADLINE` (5s) shared across the
+whole pass. Before #2877 these two paths used a blocking `write_all` with no
+deadline and no stop check: a daemon that connected but stopped reading wedged
+the I/O thread in the blocking write, and because `EventStreamSender::stop`
+joins that thread, the write-blocked thread could not observe the stop flag —
+so helper stop / RG demotion hung. The stop flag now lives in the shared state
+(`EventStreamShared.stop`) so every I/O-thread function observes it; a stuck
+reader during replay forces a reconnect, and during drain causes DrainComplete
+to be withheld (the daemon then times out and refuses demotion, #2876) instead
+of wedging.
+
 The bounded channel is the ONLY backpressure surface. The write backlog is
 capped at `WRITE_BACKLOG_MAX_BYTES` (16 MiB ≈ 8× a fully-drained 8192×256 B
 channel, since `EventFrame` is a fixed `[u8; 256]`; `drain_channel_into_write_buf`

@@ -1,3 +1,34 @@
+## 2026-06-26 — #2877 event-stream replay/drain stop-aware nonblocking writes
+
+- **Timestamp**: 2026-06-26
+- **Action**: `replay_buffered` and `handle_drain_request`
+  (`userspace-dp/src/event_stream/mod.rs`) flipped the event-stream socket to
+  BLOCKING and called `write_all` with no write deadline and no stop check. A
+  daemon that connected but stopped reading wedged the helper I/O thread in the
+  blocking write; because `EventStreamSender::stop` joins that thread, a
+  write-blocked thread could not observe the stop flag, so helper stop / RG
+  demotion hung — violating the slow-consumer invariant
+  (`docs/session-sync-design.md`). Fix: moved the stop flag into the shared
+  state (`EventStreamShared.stop`) so every I/O-thread function observes it, and
+  routed replay/drain writes through a new `write_all_backpressured` helper that
+  keeps the socket NONBLOCKING (the canonical data-frame mode) and, on
+  `WouldBlock`, sleeps `REPLAY_DRAIN_WRITE_POLL` and retries while polling
+  `shared.stop` and bailing at a `REPLAY_DRAIN_WRITE_DEADLINE` (5s) shared
+  across the pass. Replay returns Err -> reconnect; drain withholds
+  DrainComplete on a write failure so the daemon times out and refuses demotion
+  (#2876) rather than reporting a false drain. Removed `write_frame_blocking`
+  and the standalone `stop: Arc<AtomicBool>` threaded into `io_thread_main` /
+  `run_connected_loop` / `try_connect`.
+- **File(s)**: `userspace-dp/src/event_stream/mod.rs`,
+  `userspace-dp/src/event_stream/tests.rs`,
+  `userspace-dp/src/event_stream/README.md`,
+  `docs/session-sync-design.md`
+- **Tests**: `test_replay_does_not_wedge_on_stuck_reader_2877`,
+  `test_drain_does_not_wedge_on_stuck_reader_2877` — a stuck (non-reading)
+  connected daemon during replay/drain; assert the I/O-thread function observes
+  the stop flag and returns within 2s instead of wedging. Both go RED when the
+  writer is reverted to the blocking `write_all`.
+
 ## 2026-06-26 — #2959 event-stream MSG_ACK watermark validation
 
 - **Timestamp**: 2026-06-26

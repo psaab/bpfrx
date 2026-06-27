@@ -664,7 +664,6 @@ fn dataplane_event_budget_stays_held_after_connected_loop_drains_channel() {
         tx,
         shared: shared.clone(),
     };
-    let stop = Arc::new(AtomicBool::new(false));
 
     assert_eq!(
         handle.try_emit_dataplane_event_at(
@@ -675,7 +674,6 @@ fn dataplane_event_budget_stays_held_after_connected_loop_drains_channel() {
     );
 
     let loop_shared = shared.clone();
-    let loop_stop = stop.clone();
     let loop_join = thread::spawn(move || {
         let mut replay_buf: VecDeque<EventFrame> = VecDeque::with_capacity(REPLAY_BUFFER_CAPACITY);
         let mut ctrl_read_buf: Vec<u8> = Vec::new();
@@ -683,7 +681,6 @@ fn dataplane_event_budget_stays_held_after_connected_loop_drains_channel() {
             &rx,
             &helper_side,
             &loop_shared,
-            &loop_stop,
             &mut replay_buf,
             &mut ctrl_read_buf,
         );
@@ -729,7 +726,7 @@ fn dataplane_event_budget_stays_held_after_connected_loop_drains_channel() {
         }
     }
 
-    stop.store(true, Ordering::Release);
+    shared.stop.store(true, Ordering::Release);
     assert!(
         !loop_join.join().expect("connected loop thread"),
         "test loop should stop without requesting reconnect"
@@ -891,7 +888,6 @@ fn replay_evictions_surface_in_event_stream_stats_2382() {
         tx: mpsc::sync_channel(1).0,
         shared: Arc::new(EventStreamShared::new()),
         io_thread: None,
-        stop: Arc::new(AtomicBool::new(false)),
     };
     sender
         .shared
@@ -1022,14 +1018,12 @@ fn stalled_consumer_does_not_grow_backlog_unbounded_end_to_end() {
     let capacity = 64;
     let (tx, rx) = mpsc::sync_channel::<EventFrame>(capacity);
     let shared = Arc::new(EventStreamShared::new());
-    let stop = Arc::new(AtomicBool::new(false));
     let handle = EventStreamWorkerHandle {
         tx: tx.clone(),
         shared: shared.clone(),
     };
 
     let loop_shared = shared.clone();
-    let loop_stop = stop.clone();
     let loop_join = thread::spawn(move || {
         let mut replay_buf: VecDeque<EventFrame> = VecDeque::with_capacity(REPLAY_BUFFER_CAPACITY);
         let mut ctrl_read_buf: Vec<u8> = Vec::new();
@@ -1037,7 +1031,6 @@ fn stalled_consumer_does_not_grow_backlog_unbounded_end_to_end() {
             &rx,
             &helper_side,
             &loop_shared,
-            &loop_stop,
             &mut replay_buf,
             &mut ctrl_read_buf,
         )
@@ -1082,7 +1075,7 @@ fn stalled_consumer_does_not_grow_backlog_unbounded_end_to_end() {
         thread::sleep(Duration::from_millis(1));
     }
 
-    stop.store(true, Ordering::Release);
+    shared.stop.store(true, Ordering::Release);
     let _ = loop_join.join();
 
     assert!(
@@ -1116,7 +1109,6 @@ fn keeping_up_consumer_sees_full_fidelity_and_no_stalls() {
     let capacity = 16;
     let (tx, rx) = mpsc::sync_channel::<EventFrame>(capacity);
     let shared = Arc::new(EventStreamShared::new());
-    let stop = Arc::new(AtomicBool::new(false));
     let handle = EventStreamWorkerHandle {
         tx: tx.clone(),
         shared: shared.clone(),
@@ -1129,7 +1121,6 @@ fn keeping_up_consumer_sees_full_fidelity_and_no_stalls() {
     }
 
     let loop_shared = shared.clone();
-    let loop_stop = stop.clone();
     let loop_join = thread::spawn(move || {
         let mut replay_buf: VecDeque<EventFrame> = VecDeque::with_capacity(REPLAY_BUFFER_CAPACITY);
         let mut ctrl_read_buf: Vec<u8> = Vec::new();
@@ -1137,7 +1128,6 @@ fn keeping_up_consumer_sees_full_fidelity_and_no_stalls() {
             &rx,
             &helper_side,
             &loop_shared,
-            &loop_stop,
             &mut replay_buf,
             &mut ctrl_read_buf,
         )
@@ -1182,7 +1172,7 @@ fn keeping_up_consumer_sees_full_fidelity_and_no_stalls() {
     }
 
     let got = read_join.join().expect("reader thread");
-    stop.store(true, Ordering::Release);
+    shared.stop.store(true, Ordering::Release);
     let _ = loop_join.join();
 
     assert_eq!(got.len(), want, "every frame byte must be delivered");
@@ -1651,4 +1641,102 @@ fn test_drain_at_fence_emits_drain_complete() {
         }
     }
     assert!(saw_complete, "helper did not emit DrainComplete at fence");
+}
+
+// Fill a nonblocking socket's send buffer so subsequent writes return
+// WouldBlock. Used to simulate a daemon that connected but stopped reading.
+fn fill_send_buffer(stream: &std::os::unix::net::UnixStream) {
+    let junk = [0u8; 65536];
+    loop {
+        match (&*stream).write(&junk) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+}
+
+// #2877 fail-on-revert guard: a daemon that connects but stops reading must NOT
+// wedge the I/O thread during REPLAY. With the old blocking `write_all`
+// (set_nonblocking(false)) the replay write blocks forever on a full socket and
+// cannot observe the stop flag, so `EventStreamSender::stop` (which joins the
+// I/O thread) hangs. The fixed `write_all_backpressured` keeps the socket
+// nonblocking and polls `shared.stop`, so replay returns promptly once stop is
+// raised. Reverting to the blocking write makes this time out -> RED.
+#[test]
+fn test_replay_does_not_wedge_on_stuck_reader_2877() {
+    let (daemon_side, helper_side) = std::os::unix::net::UnixStream::pair().unwrap();
+    helper_side.set_nonblocking(true).unwrap();
+    // Daemon never reads -> fill the send buffer so every write WouldBlocks.
+    fill_send_buffer(&helper_side);
+
+    let shared = Arc::new(EventStreamShared::new());
+    // One buffered frame to replay (seq 1 > acked 0, no gap).
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    replay_buf.push_back(replay_seq_frame(1));
+
+    let (done_tx, done_rx) = mpsc::channel::<bool>();
+    let h_shared = shared.clone();
+    let handle = thread::spawn(move || {
+        let r = replay_buffered(&helper_side, &mut replay_buf, 0, &h_shared);
+        done_tx.send(r.is_err()).ok();
+    });
+
+    // Let the replay write block on the full socket, then ask the helper to
+    // stop. A stop-aware writer must observe this within one poll interval.
+    thread::sleep(Duration::from_millis(50));
+    shared.stop.store(true, Ordering::Release);
+
+    let completed = done_rx.recv_timeout(Duration::from_secs(2));
+    assert!(
+        completed.is_ok(),
+        "replay wedged on a stuck reader and never observed stop (#2877 regression)"
+    );
+    assert!(
+        completed.unwrap(),
+        "replay against a stuck/stopping reader must return Err, not succeed"
+    );
+
+    drop(daemon_side);
+    let _ = handle.join();
+}
+
+// #2877 fail-on-revert guard: a stuck daemon reader must NOT wedge the I/O
+// thread during DRAIN either. handle_drain_request used to flip the socket to
+// blocking and `write_all` all frames; on a full socket that blocks forever and
+// the stop flag is never seen. The fixed path uses `write_all_backpressured`,
+// which bails on stop. Reverting makes this time out -> RED.
+#[test]
+fn test_drain_does_not_wedge_on_stuck_reader_2877() {
+    let (daemon_side, helper_side) = std::os::unix::net::UnixStream::pair().unwrap();
+    helper_side.set_nonblocking(true).unwrap();
+    fill_send_buffer(&helper_side);
+
+    let shared = Arc::new(EventStreamShared::new());
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    for seq in 1..=3u64 {
+        replay_buf.push_back(replay_seq_frame(seq));
+    }
+    // Keep `tx` alive so the drain loop sees Empty (not Disconnected) and
+    // reaches the fence via replay_buf.back().seq (3) >= target (3).
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let h_shared = shared.clone();
+    let handle = thread::spawn(move || {
+        handle_drain_request(3, &rx, &helper_side, &h_shared, &mut replay_buf);
+        done_tx.send(()).ok();
+    });
+
+    thread::sleep(Duration::from_millis(50));
+    shared.stop.store(true, Ordering::Release);
+
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "drain wedged on a stuck reader and never observed stop (#2877 regression)"
+    );
+
+    drop(daemon_side);
+    let _ = handle.join();
 }

@@ -172,6 +172,20 @@ const WRITE_BACKLOG_MAX_BYTES: usize = 16 * 1024 * 1024;
 const LOSSLESS_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOSSLESS_QUEUE_RETRY_DELAY: Duration = Duration::from_micros(50);
 
+/// Bounded time the stop-aware replay/drain writer (`write_all_backpressured`)
+/// will spend backpressured on a slow/stuck reader before giving up — i.e.
+/// reconnecting (replay) or withholding DrainComplete (drain). This caps how
+/// long a wedged daemon can hold the I/O thread in the replay/drain write even
+/// if the stop flag is never raised (#2877). The replay/drain paths used to
+/// flip the socket to BLOCKING and `write_all` with no deadline, so a daemon
+/// that stopped reading wedged the I/O thread indefinitely — and because
+/// `EventStreamSender::stop` joins that thread, stop/demotion hung.
+const REPLAY_DRAIN_WRITE_DEADLINE: Duration = Duration::from_secs(5);
+/// Sleep between `WouldBlock` retries in `write_all_backpressured`. Also the
+/// worst-case latency for that writer to observe a raised stop flag, so
+/// stop/demotion never waits more than one poll interval on a stuck reader.
+const REPLAY_DRAIN_WRITE_POLL: Duration = Duration::from_millis(1);
+
 // ---------------------------------------------------------------------------
 // Shared state between I/O thread and workers
 // ---------------------------------------------------------------------------
@@ -218,6 +232,15 @@ struct EventStreamShared {
     acked_seq: AtomicU64,
     /// Set by Pause, cleared by Resume.
     paused: AtomicBool,
+    /// Raised once by `EventStreamSender::stop` (and `Drop`) to ask the I/O
+    /// thread to exit. Lives in the shared state — rather than as a separately
+    /// threaded `Arc<AtomicBool>` — so every I/O-thread function that already
+    /// holds `shared` (connect, replay, drain, the connected loop) can observe
+    /// it. This is what makes the bounded replay/drain writer
+    /// (`write_all_backpressured`) stop-aware: a write that keeps hitting
+    /// `WouldBlock` against a stuck reader bails out as soon as this is set, so
+    /// the stop-join can never deadlock behind a wedged write (#2877).
+    stop: AtomicBool,
     /// True when the event socket is connected.
     connected: AtomicBool,
     /// Counters.
@@ -261,6 +284,7 @@ impl EventStreamShared {
             next_seq: AtomicU64::new(0),
             acked_seq: AtomicU64::new(0),
             paused: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             frames_sent: AtomicU64::new(0),
             frames_dropped: AtomicU64::new(0),
@@ -290,7 +314,6 @@ pub(crate) struct EventStreamSender {
     tx: SyncSender<EventFrame>,
     shared: Arc<EventStreamShared>,
     io_thread: Option<JoinHandle<()>>,
-    stop: Arc<AtomicBool>,
 }
 
 impl EventStreamSender {
@@ -299,16 +322,14 @@ impl EventStreamSender {
     pub(crate) fn new(socket_path: &str) -> Self {
         let (tx, rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let shared = Arc::new(EventStreamShared::new());
-        let stop = Arc::new(AtomicBool::new(false));
 
         let shared_clone = shared.clone();
-        let stop_clone = stop.clone();
         let path = socket_path.to_string();
 
         let io_thread = thread::Builder::new()
             .name("xpf-event-stream".to_string())
             .spawn(move || {
-                io_thread_main(rx, shared_clone, stop_clone, path);
+                io_thread_main(rx, shared_clone, path);
             })
             .expect("spawn event stream I/O thread");
 
@@ -316,7 +337,6 @@ impl EventStreamSender {
             tx,
             shared,
             io_thread: Some(io_thread),
-            stop,
         }
     }
 
@@ -345,8 +365,13 @@ impl EventStreamSender {
     }
 
     /// Signal the I/O thread to stop and wait for it to exit.
+    ///
+    /// The stop flag lives in `shared`, so a replay/drain write that is
+    /// currently backpressured against a stuck reader observes it within one
+    /// `REPLAY_DRAIN_WRITE_POLL` and bails out — the join below cannot deadlock
+    /// behind a wedged blocking write (#2877).
     pub(crate) fn stop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.shared.stop.store(true, Ordering::Release);
         if let Some(join) = self.io_thread.take() {
             let _ = join.join();
         }
@@ -677,15 +702,14 @@ impl EventStreamWorkerHandle {
 fn io_thread_main(
     rx: mpsc::Receiver<EventFrame>,
     shared: Arc<EventStreamShared>,
-    stop: Arc<AtomicBool>,
     socket_path: String,
 ) {
     let mut replay_buf: VecDeque<EventFrame> = VecDeque::with_capacity(REPLAY_BUFFER_CAPACITY);
     let mut ctrl_read_buf: Vec<u8> = Vec::with_capacity(128);
 
-    while !stop.load(Ordering::Acquire) {
+    while !shared.stop.load(Ordering::Acquire) {
         // ---- Connect phase ----
-        let stream = match try_connect(&socket_path, &stop) {
+        let stream = match try_connect(&socket_path, &shared) {
             Some(s) => s,
             None => break, // stop requested during connect
         };
@@ -708,7 +732,6 @@ fn io_thread_main(
             &rx,
             &stream,
             &shared,
-            &stop,
             &mut replay_buf,
             &mut ctrl_read_buf,
         );
@@ -728,9 +751,9 @@ fn io_thread_main(
 
 /// Try to connect to the daemon event socket, retrying every 100ms.
 /// Returns None if stop is requested.
-fn try_connect(path: &str, stop: &Arc<AtomicBool>) -> Option<UnixStream> {
+fn try_connect(path: &str, shared: &Arc<EventStreamShared>) -> Option<UnixStream> {
     loop {
-        if stop.load(Ordering::Acquire) {
+        if shared.stop.load(Ordering::Acquire) {
             return None;
         }
         match UnixStream::connect(path) {
@@ -750,6 +773,12 @@ fn replay_buffered(
     acked_seq: u64,
     shared: &Arc<EventStreamShared>,
 ) -> io::Result<()> {
+    // One shared deadline bounds the whole replay so a stuck reader cannot hold
+    // the I/O thread for `frames * deadline` (#2877). `write_all_backpressured`
+    // keeps the socket NONBLOCKING (the canonical data-frame mode) and polls
+    // the stop flag each WouldBlock cycle; on stop/deadline/error it returns
+    // Err and the caller reconnects.
+    let deadline = Instant::now() + REPLAY_DRAIN_WRITE_DEADLINE;
     // Check if replay buffer covers what we need. On a true fresh start
     // (acked_seq == 0 and no buffered frames), start clean. Otherwise any gap
     // at acked+1 requires FullResync, including the acked_seq==0 case where an
@@ -759,7 +788,7 @@ fn replay_buffered(
     if has_gap {
         let seq = shared.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let frame = EventFrame::encode_full_resync(seq);
-        write_frame_blocking(stream, &frame)?;
+        write_all_backpressured(stream, frame.as_bytes(), shared, deadline)?;
         shared.frames_sent.fetch_add(1, Ordering::Relaxed);
         eprintln!(
             "xpf-event-stream: sent FullResync (buffer gap: acked={}, oldest_buffered={})",
@@ -775,7 +804,7 @@ fn replay_buffered(
     let mut replayed = 0u64;
     for frame in replay_buf.iter() {
         if frame.seq > acked_seq {
-            write_frame_blocking(stream, frame)?;
+            write_all_backpressured(stream, frame.as_bytes(), shared, deadline)?;
             replayed += 1;
         }
     }
@@ -788,14 +817,62 @@ fn replay_buffered(
     Ok(())
 }
 
-/// Write a full frame to the stream (blocking).
-fn write_frame_blocking(stream: &UnixStream, frame: &EventFrame) -> io::Result<()> {
+/// Write all of `bytes` to the NONBLOCKING `stream`, honoring backpressure
+/// without ever wedging the I/O thread (#2877).
+///
+/// The replay (`replay_buffered`) and drain (`handle_drain_request`) paths must
+/// push frames to a socket whose daemon reader may have stalled. The old
+/// `write_frame_blocking` flipped the socket to BLOCKING and called `write_all`
+/// with no deadline and no stop check, so a stuck reader held the I/O thread in
+/// the blocking write forever — and since `EventStreamSender::stop` joins that
+/// thread, a write-blocked thread could not observe the stop flag and
+/// stop/demotion hung. That violates the slow-consumer invariant in
+/// `docs/session-sync-design.md`: a slow telemetry/session consumer must never
+/// stall the helper.
+///
+/// This writer keeps the socket nonblocking (the same mode the steady-state
+/// data-frame writes use) and, on `WouldBlock`, sleeps `REPLAY_DRAIN_WRITE_POLL`
+/// and retries — polling `shared.stop` every cycle and bailing at `deadline`.
+/// It returns `Err` on stop (Interrupted), deadline (TimedOut), or a real
+/// socket error so the caller reconnects / withholds DrainComplete rather than
+/// blocking indefinitely. `deadline` is shared across all frames in one
+/// replay/drain pass so total time is bounded even if stop is never raised.
+fn write_all_backpressured(
+    stream: &UnixStream,
+    bytes: &[u8],
+    shared: &Arc<EventStreamShared>,
+    deadline: Instant,
+) -> io::Result<()> {
     use std::io::Write;
-    // Temporarily set blocking for reliable writes during replay/drain
-    stream.set_nonblocking(false).ok();
-    let result = (&*stream).write_all(frame.as_bytes());
-    stream.set_nonblocking(true).ok();
-    result
+    let mut written = 0usize;
+    while written < bytes.len() {
+        if shared.stop.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "event stream stop requested during replay/drain write",
+            ));
+        }
+        match (&*stream).write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "event stream replay/drain write returned 0",
+                ));
+            }
+            Ok(n) => written += n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "event stream replay/drain write deadline exceeded",
+                    ));
+                }
+                thread::sleep(REPLAY_DRAIN_WRITE_POLL);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Main connected loop. Returns true if we should reconnect, false if stopping.
@@ -803,7 +880,6 @@ fn run_connected_loop(
     rx: &mpsc::Receiver<EventFrame>,
     stream: &UnixStream,
     shared: &Arc<EventStreamShared>,
-    stop: &Arc<AtomicBool>,
     replay_buf: &mut VecDeque<EventFrame>,
     ctrl_read_buf: &mut Vec<u8>,
 ) -> bool {
@@ -815,7 +891,7 @@ fn run_connected_loop(
     let mut last_write = Instant::now();
 
     loop {
-        if stop.load(Ordering::Acquire) {
+        if shared.stop.load(Ordering::Acquire) {
             return false;
         }
 
@@ -1010,9 +1086,6 @@ fn handle_drain_request(
     shared: &Arc<EventStreamShared>,
     replay_buf: &mut VecDeque<EventFrame>,
 ) {
-    use std::io::Write;
-    use std::time::Instant;
-
     let deadline = Instant::now() + Duration::from_millis(200);
     let was_paused = shared.paused.load(Ordering::Acquire);
 
@@ -1055,30 +1128,39 @@ fn handle_drain_request(
         }
     }
 
-    // Write all replay-buffered frames to socket (blocking)
-    stream.set_nonblocking(false).ok();
+    // Write replay-buffered frames to the socket using the canonical
+    // nonblocking + stop-aware backpressure writer (#2877). The socket stays
+    // nonblocking (the connected loop set it so); a stuck reader can no longer
+    // wedge the I/O thread in a blocking write, and a raised stop flag is
+    // observed within one poll interval. A shared deadline bounds the whole
+    // drain write.
+    let write_deadline = Instant::now() + REPLAY_DRAIN_WRITE_DEADLINE;
+    let mut write_failed = false;
     for frame in replay_buf.iter() {
-        if let Err(e) = (&*stream).write_all(frame.as_bytes()) {
+        if let Err(e) = write_all_backpressured(stream, frame.as_bytes(), shared, write_deadline) {
             eprintln!("xpf-event-stream: drain write error: {e}");
+            write_failed = true;
             break;
         }
     }
 
-    // Send DrainComplete ONLY when the target fence was reached. If the drain
-    // timed out below the fence, withhold DrainComplete: the daemon's
+    // Send DrainComplete ONLY when the target fence was reached AND every frame
+    // was flushed. If the drain timed out below the fence, or a write failed
+    // against a stuck/stopping reader, withhold DrainComplete: the daemon's
     // SendDrainRequest then times out (or rejects a below-target seq) and
     // refuses to proceed with demotion, rather than silently losing the
-    // post-fence sessions on failover (#2876).
+    // post-fence sessions on failover (#2876/#2877).
     let drain_seq = replay_buf.back().map(|f| f.seq).unwrap_or(target_seq);
-    if reached_target {
+    if reached_target && !write_failed {
         let complete_frame = EventFrame::encode_drain_complete(drain_seq);
-        if let Err(e) = (&*stream).write_all(complete_frame.as_bytes()) {
+        if let Err(e) =
+            write_all_backpressured(stream, complete_frame.as_bytes(), shared, write_deadline)
+        {
             eprintln!("xpf-event-stream: drain complete write error: {e}");
         } else {
             shared.frames_sent.fetch_add(1, Ordering::Relaxed);
         }
     }
-    stream.set_nonblocking(true).ok();
 
     // Restore pause state
     if was_paused {
