@@ -353,6 +353,54 @@ func TestHostInboundFilterFamilyAware(t *testing.T) {
 	}
 }
 
+// TestHostInboundFilterConfiguredControlInterfaceLifeline is the #3277
+// fail-on-revert proof through the full payload path: a chassis cluster whose
+// `control-interface` is the operator-renamed fxp1 (NOT the default em0) must
+// have fxp1's address excluded from host-inbound deny scoping, exactly like the
+// default em0. Reverting the lifeline set to the hardcoded fxp0/em0/fab* list
+// leaves fxp1 SUBJECT to deny scoping -> its address appears in the payload ->
+// this goes RED (the latent HA split-brain the issue describes).
+func TestHostInboundFilterConfiguredControlInterfaceLifeline(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chassis.Cluster = &config.ClusterConfig{ControlInterface: "fxp1"}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"172.16.50.8/24"}},
+		}},
+		// Control link rides the non-default-named fxp1 with a static address.
+		"fxp1": {Name: "fxp1", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"10.99.0.1/24"}},
+		}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		// An enforced zone so the table is actually emitted.
+		"wan": {
+			Name:               "wan",
+			Interfaces:         []string{"reth0.0"},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}},
+		},
+		// The control zone scopes `all` but, more importantly, fxp1 must never be
+		// subjected to a deny regardless of its zone's stanza.
+		"control": {
+			Name:               "control",
+			Interfaces:         []string{"fxp1.0"},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}},
+		},
+	}
+	views := buildAndCheckViews(t, cfg)
+	payload := buildHostInboundFilterPayload(views)
+
+	// fxp1's control-link address must NEVER appear (accept or drop): it is the
+	// configured cluster control-interface and so a lifeline (#3277).
+	if strings.Contains(payload, "10.99.0.1") {
+		t.Errorf("configured control-interface fxp1 address must never appear in host-inbound payload:\n%s", payload)
+	}
+	// Sanity: the enforced wan zone still scopes its own address.
+	if !strings.Contains(payload, "172.16.50.8 drop") {
+		t.Errorf("wan zone must still emit a scoped deny:\n%s", payload)
+	}
+}
+
 // buildAndCheckViews resolves the per-zone views and asserts the table would be
 // applied (at least one enforceable zone).
 func buildAndCheckViews(t *testing.T, cfg *config.Config) []dpuserspace.ZoneHostInboundView {

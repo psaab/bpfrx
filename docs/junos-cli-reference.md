@@ -292,6 +292,19 @@ From zone: guest, To zone: lan
     set is byte-identical. Management/cluster-control lifeline interfaces
     (fxp0/em0/fab*) are still excluded — a VIP on em0 is never scoped — and
     standalone (no-VRRP) zones are unchanged.
+  - **Lifeline set derived from cluster config (#3277):** the lifeline
+    interfaces excluded from host-inbound deny scoping are no longer a fixed
+    fxp0/em0/fab* hardcode. The set is now `fxp0` (always-mgmt) UNION the
+    configured chassis-cluster `control-interface` and `fabric-interface` /
+    `fabric1-interface` names, UNION the backward-compatible defaults em0 and
+    fab*. So a deployment whose control/heartbeat link rides a non-default name
+    (e.g. `set chassis cluster control-interface fxp1`) has that interface
+    correctly excluded — its address is never subjected to a host-inbound deny,
+    closing a latent HA split-brain (heartbeat drop) gap that would surface once
+    the control zone's host-inbound set is scoped rather than full-admit.
+    Canonical em0/fab*-named configs are byte-identical (the defaults still
+    match unconditionally); a standalone config with no chassis-cluster stanza
+    keeps fxp0 as its only lifeline (#1960).
   - **Lifeline fail-safe:** enforcement is strictly MATCH-DRIVEN. If NO
     `junos-host` policy is configured, or a host-bound flow matches no
     `junos-host` rule, behavior is UNCHANGED from before #3019 — there is no

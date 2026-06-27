@@ -22279,3 +22279,10 @@ top.
   userspace-dp/src/afxdp/coordinator/status.rs,
   userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/test_fixtures.rs,
   userspace-dp/tests/fixtures/protocol_wire_v1.json
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3277 — derive host-inbound lifeline interface set from chassis-cluster config (configured control-interface / fabric interfaces) instead of the hardcoded fxp0/em0/fab* list, so a non-default `control-interface fxp1` is excluded from host-inbound deny scoping (fixes latent HA split-brain). Added fail-on-revert tests at the predicate and full-payload levels; updated host-inbound lifeline doc.
+  **File(s)**: pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/zones_host_inbound_test.go,
+  pkg/daemon/host_inbound_nft_test.go,
+  docs/junos-cli-reference.md
