@@ -22575,3 +22575,16 @@ top.
   **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
   pkg/config/compiler_dynamic_address_feed_ref_3300_test.go,
   docs/config-schema.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3300 residual (Codex MERGE-NEEDS-MAJOR): a feed-server with no
+  url AND no hostname is SKIPPED by feeds.Manager.Apply (resolveBaseURL=="")
+  → registers no feeds → a bound address-name still resolves empty → the
+  silent match-none persists, and the declared-set parity claim was
+  overstated. Added validateDynamicAddressFeedServerEndpointStrict (replicates
+  resolveBaseURL emptiness, no pkg/feeds import) dispatched BEFORE the feed-ref
+  gate, sharing lenientDynamicAddressFeedRef. Fixed the now-exact parity
+  docstring. Fail-on-revert test + url/hostname positive controls.
+  **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/compiler_dynamic_address_feed_ref_3300_test.go,
+  docs/config-schema.md

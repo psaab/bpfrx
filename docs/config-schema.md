@@ -1371,18 +1371,36 @@ set is computed exactly as `feeds.Manager` keys feeds (`feeds.go` Start): each
 `feed-server`'s `feed-name` entries, or — for a single-feed server with no
 explicit `feed-name` — the server name itself.
 
-**Strict/lenient split (flag `lenientDynamicAddressFeedRef`):** strict on the
-commit / commit-check path (`CompileConfig` — hard-reject), downgraded to a
-`cfg.Warnings` entry on the tolerant load / peer-sync paths
-(`CompileConfigLenient` / `CompileConfigForNodeLenient`) so an
+A second gate closes the same fail-open at the feed-server **root**:
+**`validateDynamicAddressFeedServerEndpointStrict`** (run just before the
+cross-reference gate) hard-rejects a `feed-server` with neither `url` nor
+`hostname`. `feeds.Manager.Apply` derives a server's base URL via
+`resolveBaseURL` (explicit `url`, else `https://<hostname>`, else `""`) and
+SKIPS a server whose base URL is empty — it registers NONE of its feeds. Such
+a server still compiles into `DynamicAddress.FeedServers`, so its feed names
+are syntactically "declared", but no feed exists at runtime: a bound
+address-name resolves to a match-nothing book exactly as a typo'd feed-name
+would. Rejecting the endpoint-less server at its root ALSO makes the
+cross-reference gate's declared-feed set EXACT — every server it trusts is one
+`Apply` would actually register. The gate replicates `resolveBaseURL`'s
+emptiness condition (`URL == "" && Hostname == ""`) directly on the
+`FeedServer` struct rather than importing `pkg/feeds` (no import cycle); keep
+in sync with `resolveBaseURL`.
+
+**Strict/lenient split (flag `lenientDynamicAddressFeedRef`, shared by both
+gates):** strict on the commit / commit-check path (`CompileConfig` —
+hard-reject), downgraded to a `cfg.Warnings` entry on the tolerant load /
+peer-sync paths (`CompileConfigLenient` / `CompileConfigForNodeLenient`) so an
 already-persisted config (older binaries never validated the reference) or a
 peer-synced config still BOOTS (#1960 / #3261 fail-closed-on-load doctrine) —
-the runtime stays fail-closed (match-none) for the unknown feed, so a
-leniently-loaded typo denies nothing rather than bricking. Regression
-coverage: `pkg/config/compiler_dynamic_address_feed_ref_3300_test.go`
+the runtime stays fail-closed (match-none) for the unknown feed or skipped
+server, so a leniently-loaded typo/endpoint-less server denies nothing rather
+than bricking. Regression coverage:
+`pkg/config/compiler_dynamic_address_feed_ref_3300_test.go`
 (`TestValidateDynamicAddressFeedReferences` — the fail-on-revert guard plus
 feed-entry / single-feed / server-name positive controls and the lenient
-downgrade).
+downgrade; `TestValidateDynamicAddressFeedServerEndpoint` — endpoint-less
+reject, url / hostname-only positive controls, lenient downgrade).
 
 ### #3117 — Security-policy `scheduler-name` schema leaf (completion parity)
 

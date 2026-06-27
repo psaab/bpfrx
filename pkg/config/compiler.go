@@ -2155,6 +2155,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3300 residual: an endpoint-less dynamic-address feed-server (no url
+	// AND no hostname) is SKIPPED by feeds.Manager.Apply (resolveBaseURL ==
+	// "" registers none of its feeds), so an address-name bound to it
+	// resolves to an empty match-nothing book and a feed-backed deny policy
+	// silently denies nothing — the #3300 symptom at the feed-server root.
+	// Reject it so the runtime-nonfunctional config fails at commit. This
+	// must run BEFORE the feed-name cross-reference gate below so the
+	// declared-feed set the latter trusts is exact (no skipped servers in
+	// it). Strict on commit / commit-check; lenient on load / peer-sync
+	// (warn — the runtime already drops the server, so a bound address-name
+	// is fail-closed rather than bricking the load — #1960 / #3261).
+	if err := validateDynamicAddressFeedServerEndpointStrict(cfg); err != nil {
+		if opts.lenientDynamicAddressFeedRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("dynamic-address feed-server endpoint (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #3300 dynamic-address feed cross-reference gate. A
 	// `security dynamic-address address-name <addr> profile feed-name <feed>`
 	// whose feed-name resolves to no declared feed-server feed records an

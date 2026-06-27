@@ -379,6 +379,66 @@ func validateLogProfileStreamReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// validateDynamicAddressFeedServerEndpointStrict hard-rejects a
+// `security dynamic-address feed-server <name>` that configures no endpoint —
+// neither `url` nor `hostname` (#3300 residual). feeds.Manager.Apply derives
+// each server's base URL via resolveBaseURL (feeds.go): explicit `url`, else
+// `https://<hostname>`, else the empty string — and an empty base URL makes
+// Apply SKIP the whole server (it registers NONE of its feeds, including any
+// nested feed-name entries). The endpoint-less server still compiles into
+// SecurityConfig.DynamicAddress.FeedServers, so its feed names are
+// syntactically "declared", but at runtime no feed exists: an address-name
+// bound to one resolves to an empty (match-nothing) address book and a
+// feed-backed deny policy silently denies nothing — the same #3300 fail-open
+// symptom one layer up, at the feed-server root rather than the binding.
+//
+// This gate replicates resolveBaseURL's emptiness condition directly on the
+// FeedServer config struct (URL == "" AND Hostname == "") rather than
+// importing pkg/feeds (pkg/config must not depend on pkg/feeds). Keep in sync
+// with resolveBaseURL.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientDynamicAddressFeedRef, shared with the feed-name
+// cross-reference gate) so an already-persisted or peer-synced config carrying
+// an endpoint-less server still boots — the runtime already drops the server
+// (registers no feed), so any bound address-name is fail-closed match-none
+// rather than bricking the load (#1960 / #3261 class). Commit / commit-check
+// stay strict. Mirrors validateLogProfileStreamReferencesStrict.
+func validateDynamicAddressFeedServerEndpointStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	servers := cfg.Security.DynamicAddress.FeedServers
+	if len(servers) == 0 {
+		return nil
+	}
+	// FeedServers is a map (unordered); sort keys so the first-error
+	// commit-check message is deterministic across runs.
+	names := make([]string, 0, len(servers))
+	for name := range servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		fs := servers[name]
+		if fs == nil {
+			continue
+		}
+		// Mirror feeds.resolveBaseURL: empty iff no url AND no hostname.
+		if fs.URL == "" && fs.Hostname == "" {
+			display := fs.Name
+			if display == "" {
+				display = name
+			}
+			return fmt.Errorf("security dynamic-address feed-server %q has no "+
+				"url or hostname so it registers no feeds — any address-name "+
+				"bound to it silently matches nothing; set a url or hostname",
+				display)
+		}
+	}
+	return nil
+}
+
 // validateDynamicAddressFeedReferencesStrict hard-rejects a
 // `security dynamic-address address-name <addr> profile feed-name <feed>`
 // binding whose `<feed>` resolves to no declared feed (#3300). The
@@ -397,13 +457,16 @@ func validateLogProfileStreamReferencesStrict(cfg *Config) error {
 // feed-name does not resolve to a declared feed at commit; this gate
 // restores that behavior.
 //
-// The valid feed-name set mirrors exactly the keys feeds.Manager registers
-// (feeds.go Start): a feed-server with per-feed entries contributes each
-// FeedEntry.Name; a single-feed server contributes its FeedName, or the
-// server name itself when no explicit feed-name is set. The schema accepts
-// `profile feed-name` as a free-form value leaf (schema_security.go), so the
-// undefined-token gate (#2008/#2009) does NOT cover a typo here — only this
-// cross-reference does.
+// The valid feed-name set mirrors the keys feeds.Manager registers (feeds.go
+// Start): a feed-server with per-feed entries contributes each FeedEntry.Name;
+// a single-feed server contributes its FeedName, or the server name itself
+// when no explicit feed-name is set. This parity is EXACT because
+// validateDynamicAddressFeedServerEndpointStrict (run just before this gate)
+// rejects any feed-server with no url/hostname — the only servers
+// feeds.Manager.Apply silently SKIPS — so every server in the declared set is
+// one Apply would actually register. The schema accepts `profile feed-name` as
+// a free-form value leaf (schema_security.go), so the undefined-token gate
+// (#2008/#2009) does NOT cover a typo here — only this cross-reference does.
 //
 // On the tolerant load / peer-sync paths the call site downgrades this to a
 // warning (opts.lenientDynamicAddressFeedRef) so an already-persisted config

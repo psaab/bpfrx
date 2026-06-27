@@ -106,3 +106,71 @@ func TestValidateDynamicAddressFeedReferences(t *testing.T) {
 		}
 	})
 }
+
+// TestValidateDynamicAddressFeedServerEndpoint covers the #3300 residual: a
+// feed-server with neither url nor hostname is SKIPPED by feeds.Manager.Apply
+// (resolveBaseURL == "") and registers no feeds, so an address-name bound to
+// it resolves to a match-nothing book. Such a server must be rejected at
+// commit (strict); a server with a url or a hostname is accepted; the
+// tolerant load path downgrades to a warning.
+func TestValidateDynamicAddressFeedServerEndpoint(t *testing.T) {
+	t.Run("commit rejects feed-server with no url or hostname", func(t *testing.T) {
+		// A feed-server that declares a feed-name but no endpoint: it
+		// registers nothing at runtime, so the bound address-name is a
+		// silent match-none — the same #3300 fail-open at the server root.
+		tree := buildTree3300(t, []string{
+			"set security dynamic-address feed-server threat feed-name malware path /malware.txt",
+			"set security dynamic-address address-name bad-actors profile feed-name malware",
+		})
+		_, err := CompileConfig(tree)
+		if err == nil {
+			t.Fatalf("CompileConfig should reject feed-server with no url/hostname")
+		}
+		if !strings.Contains(err.Error(), "threat") {
+			t.Fatalf("error should name the endpoint-less feed-server, got: %v", err)
+		}
+	})
+
+	t.Run("commit accepts feed-server with url", func(t *testing.T) {
+		tree := buildTree3300(t, []string{
+			"set security dynamic-address feed-server threat url https://feeds.example/list.txt",
+			"set security dynamic-address feed-server threat feed-name malware path /malware.txt",
+			"set security dynamic-address address-name bad-actors profile feed-name malware",
+		})
+		if _, err := CompileConfig(tree); err != nil {
+			t.Fatalf("feed-server with url should compile, got: %v", err)
+		}
+	})
+
+	t.Run("commit accepts feed-server with hostname only", func(t *testing.T) {
+		tree := buildTree3300(t, []string{
+			"set security dynamic-address feed-server threat hostname feeds.example.com",
+			"set security dynamic-address feed-server threat feed-name malware path /malware.txt",
+			"set security dynamic-address address-name bad-actors profile feed-name malware",
+		})
+		if _, err := CompileConfig(tree); err != nil {
+			t.Fatalf("feed-server with hostname should compile, got: %v", err)
+		}
+	})
+
+	t.Run("lenient load downgrades endpoint-less server to warning", func(t *testing.T) {
+		tree := buildTree3300(t, []string{
+			"set security dynamic-address feed-server threat feed-name malware path /malware.txt",
+			"set security dynamic-address address-name bad-actors profile feed-name malware",
+		})
+		cfg, err := CompileConfigLenient(tree)
+		if err != nil {
+			t.Fatalf("lenient compile should not fail on endpoint-less server, got: %v", err)
+		}
+		found := false
+		for _, w := range cfg.Warnings {
+			if strings.Contains(w, "threat") && strings.Contains(w, "feed-server") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("lenient compile should record a feed-server endpoint warning, warnings=%v", cfg.Warnings)
+		}
+	})
+}
