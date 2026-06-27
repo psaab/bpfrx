@@ -1,3 +1,26 @@
+## 2026-06-26 — #2884 IPsec re-binds local_addrs on a runtime DHCP lease change
+
+- **Timestamp**: 2026-06-26
+- **Action**: an IPsec gateway with an `external-interface` and no
+  explicit `local-address` resolves `local_addrs` from the interface's
+  current address at `PrepareConfig` time. A DHCP lease change on a
+  DATAPLANE interface already re-renders IPsec via the full `applyConfig`
+  recompile, but a lease change on a MANAGEMENT-only interface skipped the
+  recompile entirely, so swanctl kept the stale local bind until the next
+  commit. Added `ipsec.HasDHCPBoundGateway` (scoping predicate:
+  external-interface set, no explicit local-address, unit is
+  DHCP/DHCPv6-managed) and wired `reapplyIPsecForLeaseChange` into
+  `onDHCPAddressChange`'s management-only branch — it re-renders + reloads
+  swanctl under the apply semaphore only when a lease-dependent gateway
+  exists (no reload storm / SA churn on unrelated renews). Added
+  `ipsec.NewWithConfigDir` so tests redirect the swanctl conf off the real
+  tree. Fail-on-revert: disabling the re-render makes
+  `TestReapplyIPsecForLeaseChange_RebindsLocalAddr` go RED (swanctl conf
+  never written / stale address retained).
+- **File(s)**: `pkg/ipsec/policy.go`, `pkg/ipsec/manager.go`,
+  `pkg/ipsec/dhcp_rebind_test.go`, `pkg/ipsec/README.md`,
+  `pkg/daemon/daemon_dhcp.go`, `pkg/daemon/ipsec_lease_rebind_test.go`
+
 ## 2026-06-26 — #2883 event-stream idle keepalive rides write_buf backpressure
 
 - **Timestamp**: 2026-06-26
