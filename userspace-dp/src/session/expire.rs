@@ -309,6 +309,13 @@ impl SessionTable {
                                 // SESSION_CLOSE RT_FLOW frame so NetFlow/IPFIX
                                 // reports real volume instead of 0.
                                 counters: removed.counters,
+                                // #2749: harvest the observed forward ToS +
+                                // cumulative TCP control bits off the expiring
+                                // entry so the SESSION_CLOSE RT_FLOW frame
+                                // carries real NetFlow/IPFIX class-of-service
+                                // and TCP-flags values.
+                                observed_tos: removed.observed_tos,
+                                observed_tcp_flags: removed.observed_tcp_flags,
                             });
                         }
                         expired_entries.push(ExpiredSession {

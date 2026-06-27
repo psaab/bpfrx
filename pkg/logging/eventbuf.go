@@ -43,6 +43,19 @@ type EventRecord struct {
 	// (IE 10 / IN_SNMP), which is an SNMP ifIndex, not a name (#2749).
 	// 0 means the dataplane could not attribute an ingress interface.
 	IngressIfindex uint32
+	// #2749: class-of-service / interface-attribution fields carried on the
+	// SESSION_CLOSE wire frame's additive [144:152] block. TOS is the IP ToS
+	// byte (DSCP<<2, ECN cleared) observed on the forward direction;
+	// TCPControlBits is the OR of every TCP flag byte seen over the flow;
+	// EgressIfindex is the SNMP ifIndex of the session's resolved output
+	// interface. They drive the re-introduced NetFlow v9 srcTos (IE 5) /
+	// tcpFlags (IE 6) / OutputSNMP (IE 14) and the IPFIX ipClassOfService /
+	// tcpControlBits / egressInterface close-record fields. 0 keeps the
+	// collector's "unknown" sentinel for a frame that did not carry them
+	// (a short legacy frame, or a non-close event).
+	TOS            uint8
+	TCPControlBits uint8
+	EgressIfindex  uint32
 	CloseReason    string // "idle Timeout", "TCP FIN", "TCP RST", etc.
 	SessionID      uint64 // unique session identifier
 }

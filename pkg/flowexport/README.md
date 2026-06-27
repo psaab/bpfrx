@@ -102,11 +102,14 @@ RFC 8158) are appended LAST in every template:
 | postNATDestinationIPv6Address | 282 | ipv6Address | 16 | v6 |
 
 NetFlow v9 reuses the same IANA element type IDs in its template
-FlowSet. With the #2613 drop and the #2749 re-add of `ingressInterface`
-(IE 10, 4B, below) the IPv4 IPFIX record is 61 bytes (45 pre-NAT body +
-4 ingressInterface + 12 post-NAT) and the IPv6 record is 109 bytes (69 +
-4 + 36); the NetFlow v9 record sizes derive from the template via
-`recordSize` (4-byte padded), so they track the template automatically.
+FlowSet. With the #2613 drop and the #2749 re-adds of `ingressInterface`
+(IE 10, 4B), `ipClassOfService` (IE 5, 1B), `tcpControlBits` (IE 6, 2B) and
+`egressInterface` (IE 14, 4B) the IPv4 IPFIX record is 70 bytes (45 pre-NAT
+body + 2 src/dst mask + 4 ingressInterface + 7 CoS/egress + 12 post-NAT) and
+the IPv6 record is 118 bytes (69 + 2 + 4 + 7 + 36); the NetFlow v9 record
+sizes derive from the template via `recordSize` (4-byte padded, 64 v4 / 112
+v6 — NetFlow `tcpFlags` is 1B not 2B), so they track the template
+automatically.
 An init-time
 assertion in `ipfix.go` pins `ipfixRecordSizeV4/V6` to the sum of their
 template field lengths so a template/encoder length drift fails the
@@ -142,35 +145,45 @@ of those IEs reached collectors as an authoritative zero. The five fields
 were removed from both NetFlow v9 templates and the IPFIX v4/v6 templates
 (and their record encoders / size constants).
 
-**#2749 — `ingressInterface` (IE 10 / IN_SNMP) re-introduced with a real
-value.** The remaining four — SrcTos (5), TCPFlags (6), Direction (61)
-and `egressInterface`/OutputSNMP (14) — still have no SESSION_CLOSE wire
-source and stay dropped (their absence is still pinned by
-`dropped_fields_test.go`). But the ingress ifindex IS on the wire: #2615
-stamps the closing binding's ifindex into the [128:132] slot of the
-144-byte RT_FLOW close frame (the Rust encoder no longer hardcodes 0).
-`pkg/logging/ringbuf.go` already read that slot to resolve a human-facing
-interface NAME; #2749 also retains the raw numeric value
-(`EventRecord.IngressIfindex`), the daemon flow-export callbacks copy it
-into `SessionCloseData.InIf`, and `ExportSessionClose` threads it into
-`FlowRecord.InIf`. Both exporters re-advertise IE 10 (4 bytes, placed
-before the post-NAT trailing block so #2526 offsets are unchanged) and
-write the value. This is a **Go-only** change — no wire-format change was
-needed because the ifindex was already carried since #2615. Presence
-with a real value is pinned by `ingress_interface_test.go`
-(`TestNetflowIngressInterfacePopulated` / `TestIPFIXIngressInterfacePopulated`:
-template advertises IE 10 AND the encoded record carries the session's
-ifindex, not zero). Populating SrcTos/TCPFlags/Direction/`egressInterface`
-for real still needs the Rust↔Go wire-format extension (re-lay/extend the
-close frame + conntrack-side TCP-flag/TOS stamping + egress-ifindex
-tracking on the forwarding path), which remains the deferred scope of
-#2749. The `export-extension flow-dir` config knob is still accepted but
-no longer adds `flowDirection`; the compiler warns when it is configured
-(`compiler_validate_warn.go`), mirroring the `app-id` warn-not-lie
-precedent. The remaining fail-on-revert pins live in
-`dropped_fields_test.go` (template-absence walk + record-layout golden
-that proves the bytes after `protocol` are the real counters, not a
-sentinel TOS/flags block).
+**#2749 — `ingressInterface` (IE 10) restored, then `ipClassOfService` (5),
+`tcpControlBits` (6) and `egressInterface`/OutputSNMP (14) restored with real
+values.** The ingress half came first: #2615 stamps the closing binding's
+ifindex into the `[128:132]` slot of the RT_FLOW close frame (the Rust encoder
+no longer hardcodes 0); `pkg/logging/ringbuf.go` retains the raw numeric value
+(`EventRecord.IngressIfindex`), the daemon callbacks copy it into
+`SessionCloseData.InIf`, and `ExportSessionClose` threads it into
+`FlowRecord.InIf` — a **Go-only** change (the ifindex was already on the wire).
+
+The remaining three needed a **wire-format extension**, which #2749 added: the
+SESSION_CLOSE RT_FLOW frame grew 144 → 152 bytes with an ADDITIVE `[144:152]`
+block — `[144]` src ToS (DSCP<<2), `[145]` cumulative TCP control bits,
+`[148:152]` egress ifindex (`[146:148]` reserved for a future flowDirection).
+Conntrack-side, `SessionEntry.observed_tos` / `observed_tcp_flags` are stamped
+on the AF_XDP forwarding path (`account_packet` — forward DSCP, OR of TCP flags
+both directions) and harvested onto the close `SessionDelta` in
+`session/expire.rs` like the #2501 counters; the egress ifindex comes off the
+session's `ForwardingResolution`. The Go reader decodes the block into
+`EventRecord.{TOS,TCPControlBits,EgressIfindex}` (length-guarded — the minimum
+frame stays 144, so the growth is rolling-upgrade-safe in BOTH directions), the
+daemon callbacks copy them into `SessionCloseData.{TOS,TCPFlags,OutIf}`, and
+both exporters re-advertise the IEs (placed after `ingressInterface`, before
+the post-NAT trailing block so #2526 offsets are unchanged) and write the
+values. Presence-with-real-value is pinned by `cos_fields_test.go`
+(`TestNetflowCosFieldsPopulated` / `TestIPFIXCosFieldsPopulated`) and the
+ingress pins in `ingress_interface_test.go`; the Rust side pins the stamping
+(`close_delta_carries_observed_tos_and_tcp_flags`) and the wire encode
+(`test_encode_session_close_rt_flow_v4_wire_layout`); the Go decode round-trip
+is pinned by `TestDecodeRawEventCloseCarriesCosBlock`.
+
+**Deferred — `flowDirection` (IE 61).** It stays dropped: the close path has no
+real per-flow inbound/outbound signal, and a constant ingress=0 would
+re-introduce the exact synthetic-zero #2613 fixed. Its absence is still pinned
+by `dropped_fields_test.go`. The `export-extension flow-dir` config knob is
+still accepted but does not add `flowDirection`; the compiler warns when it is
+configured (`compiler_validate_warn.go`), mirroring the `app-id` warn-not-lie
+precedent. The remaining fail-on-revert pins live in `dropped_fields_test.go`
+(template-absence walk for IE 61 + record-layout golden that proves the bytes
+after `protocol` are the real counters, not a sentinel CoS block).
 
 **#2866 — `srcMask` / `dstMask` populated from the FIB.** The NetFlow v9
 templates advertised `srcMask` (IE 9) / `dstMask` (IE 13) and the IPv6

@@ -482,6 +482,56 @@ func TestDecodeRawEventCloseCarriesAdmittingPolicyID(t *testing.T) {
 	}
 }
 
+// TestDecodeRawEventCloseCarriesCosBlock is the #2749 Go-side round-trip pin:
+// an EXTENDED (152-byte) SESSION_CLOSE frame — the shape the Rust
+// encode_session_close_rt_flow now emits — must decode its [144:152]
+// class-of-service / interface-attribution block into EventRecord.TOS /
+// TCPControlBits / EgressIfindex with the real values, not zero. Reverting the
+// ringbuf reads (or the Rust encoder writes) flips this RED.
+func TestDecodeRawEventCloseCarriesCosBlock(t *testing.T) {
+	const (
+		tos      = uint8(0xB8) // DSCP EF (46) << 2
+		tcpBits  = uint8(0x13) // SYN|FIN|ACK
+		egressIf = uint32(0xFEEDFACE)
+	)
+	data := make([]byte, rawEventExtSize)
+	data[52] = eventTypeSessionClose
+	data[53] = 6
+	data[55] = addrFamilyInet
+	copy(data[8:12], net.ParseIP("10.0.1.102").To4())
+	copy(data[24:28], net.ParseIP("172.16.80.200").To4())
+	data[rawEventTOSOffset] = tos
+	data[rawEventTCPBitOffset] = tcpBits
+	binary.LittleEndian.PutUint32(data[rawEventEgressOffset:rawEventEgressOffset+4], egressIf)
+
+	rec, ok := DecodeRawEventRecord(data)
+	if !ok {
+		t.Fatal("DecodeRawEventRecord rejected a valid extended SESSION_CLOSE frame")
+	}
+	if rec.TOS != tos {
+		t.Fatalf("rec.TOS = 0x%02x, want 0x%02x ([144] read reverted)", rec.TOS, tos)
+	}
+	if rec.TCPControlBits != tcpBits {
+		t.Fatalf("rec.TCPControlBits = 0x%02x, want 0x%02x ([145] read reverted)", rec.TCPControlBits, tcpBits)
+	}
+	if rec.EgressIfindex != egressIf {
+		t.Fatalf("rec.EgressIfindex = 0x%08x, want 0x%08x ([148:152] read reverted)", rec.EgressIfindex, egressIf)
+	}
+
+	// Additive/back-compat: a legacy 144-byte close frame must still decode
+	// (minimum acceptance is rawEventWireSize, not the extended size) and leave
+	// the CoS block at the 0 "unknown" default.
+	legacy := data[:rawEventWireSize]
+	lrec, ok := DecodeRawEventRecord(legacy)
+	if !ok {
+		t.Fatal("DecodeRawEventRecord rejected a legacy 144-byte SESSION_CLOSE frame")
+	}
+	if lrec.TOS != 0 || lrec.TCPControlBits != 0 || lrec.EgressIfindex != 0 {
+		t.Fatalf("legacy 144-byte frame must leave CoS block zero, got {0x%02x 0x%02x 0x%08x}",
+			lrec.TOS, lrec.TCPControlBits, lrec.EgressIfindex)
+	}
+}
+
 // TestDecodeRawEventPolicyDenyKeepsPolicyID guards the #2853 negative: a
 // non-SESSION_CLOSE frame must still read [44:48] as the real PolicyID (the
 // repurpose is close-only). A POLICY_DENY carrying a policy id must surface it.

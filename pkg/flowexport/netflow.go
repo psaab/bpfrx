@@ -103,8 +103,19 @@ var (
 		// the trailing block (#2526 invariant); the proto->packet-counter
 		// adjacency the #2613 fail-on-revert pin checks is preserved either
 		// way. The other four #2613 drops (SrcTos 5 / TCPFlags 6 /
-		// OutputSNMP 14 / Direction 61) remain absent — no wire source yet.
+		// remains absent — flowDirection has no real per-flow value yet.
 		{fieldInputSNMP, 4},
+		// #2749: class-of-service + egress interface re-introduced with REAL
+		// values from the extended SESSION_CLOSE frame ([144:152]). srcTos
+		// (IE 5, 1B) = forward DSCP<<2; tcpFlags (IE 6, 1B) = cumulative TCP
+		// control bits; OutputSNMP (IE 14, 4B) = egress ifindex. Placed after
+		// ingressInterface and before the post-NAT tuple so the latter stays
+		// the trailing block (#2526) and the proto->packet-counter adjacency the
+		// #2613 fail-on-revert pin checks is preserved. Direction (IE 61) stays
+		// absent — see V9TemplateOptions.
+		{fieldSrcTos, 1},
+		{fieldTCPFlags, 1},
+		{fieldOutputSNMP, 4},
 		// #2526: post-NAT (translated) tuple, appended last.
 		{fieldPostNatSrcIPv4, 4},
 		{fieldPostNatDstIPv4, 4},
@@ -125,6 +136,10 @@ var (
 		{fieldIPv6DstMask, 1},
 		// #2749: ingressInterface (IN_SNMP, IE 10) — see the V4 template note.
 		{fieldInputSNMP, 4},
+		// #2749: srcTos (IE 5) / tcpFlags (IE 6) / OutputSNMP (IE 14) — see V4.
+		{fieldSrcTos, 1},
+		{fieldTCPFlags, 1},
+		{fieldOutputSNMP, 4},
 		// #2526: post-NAT (translated) tuple, appended last (v6 addrs 16B).
 		{fieldPostNatSrcIPv6, 16},
 		{fieldPostNatDstIPv6, 16},
@@ -316,6 +331,14 @@ func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time,
 	// post-NAT tuple to match the template field order.
 	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
 	off += 4
+	// #2749: srcTos (IE 5) / tcpFlags (IE 6) / OutputSNMP (IE 14) — real
+	// class-of-service + egress attribution from the extended close frame.
+	b[off] = r.TOS
+	off++
+	b[off] = r.TCPFlags
+	off++
+	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
+	off += 4
 	// #2526: post-NAT (translated) tuple — 225/226/227/228.
 	natSrc4 := r.NATSrcIP.To4()
 	natDst4 := r.NATDstIP.To4()
@@ -373,6 +396,13 @@ func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time,
 	off++
 	// #2749: ingressInterface (IN_SNMP, IE 10) — see encodeRecordV4.
 	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
+	off += 4
+	// #2749: srcTos (IE 5) / tcpFlags (IE 6) / OutputSNMP (IE 14) — see V4.
+	b[off] = r.TOS
+	off++
+	b[off] = r.TCPFlags
+	off++
+	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
 	off += 4
 	// #2526: post-NAT (translated) tuple — 281/282 (16B) + 227/228 (2B).
 	natSrc16 := r.NATSrcIP.To16()
@@ -523,8 +553,12 @@ func (e *Exporter) ExportSessionClose(rec logging.EventRecord, evt SessionCloseD
 		IsIPv6:    evt.IsIPv6,
 		SrcMask:   srcMask,
 		DstMask:   dstMask,
-		// #2749: ingress ifindex (SNMP ifIndex) -> NetFlow IE 10.
+		// #2749: ingress ifindex (SNMP ifIndex) -> NetFlow IE 10; plus the
+		// re-introduced srcTos (IE 5) / tcpFlags (IE 6) / OutputSNMP (IE 14).
 		InIf:       evt.InIf,
+		TOS:        evt.TOS,
+		TCPFlags:   evt.TCPFlags,
+		OutIf:      evt.OutIf,
 		NATSrcIP:   natSrcIP,
 		NATDstIP:   natDstIP,
 		NATSrcPort: natSrcPort,

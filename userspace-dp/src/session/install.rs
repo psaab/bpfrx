@@ -171,6 +171,13 @@ impl SessionTable {
                 first_held_ns: 0,
                 // #2501: a fresh entry has forwarded no packets yet.
                 counters: SessionCounters::default(),
+                // #2749: seed the cumulative TCP control bits with the trigger
+                // packet's flags (typically the SYN) so even a flow that closes
+                // before any further forward packet is accounted reports a
+                // non-empty tcpControlBits. The forward ToS is unknown until the
+                // first packet is accounted on its forwarding pass.
+                observed_tos: 0,
+                observed_tcp_flags: tcp_flags,
             },
         };
         let raw = self.entries.insert(record);
@@ -216,6 +223,10 @@ impl SessionTable {
                 // packets yet (the trigger packet is accounted on its own
                 // forwarding pass).
                 counters: SessionCounters::default(),
+                // #2749: mirror the entry's seed flags on the Open delta
+                // (informational — Open deltas have no flowexport consumer).
+                observed_tos: 0,
+                observed_tcp_flags: tcp_flags,
             });
         }
         true
@@ -311,6 +322,12 @@ impl SessionTable {
                 first_held_ns: 0,
                 // #2501: a fresh entry has forwarded no packets yet.
                 counters: SessionCounters::default(),
+                // #2749: a re-imported synced entry observes its own ToS / TCP
+                // flags once local traffic forwards through it (the peer's
+                // observed values are not carried on the HA session-sync delta).
+                // Seed with the trigger flags, ToS unknown until first forward.
+                observed_tos: 0,
+                observed_tcp_flags: tcp_flags,
             },
         };
         let raw = self.entries.insert(record);
@@ -361,6 +378,9 @@ impl SessionTable {
             last_seen_ns: 0,
             // #2501: an open carries no volume yet.
             counters: SessionCounters::default(),
+            // #2749: explicit Open-delta emit, no entry in hand.
+            observed_tos: 0,
+            observed_tcp_flags: 0,
         });
     }
 
@@ -393,6 +413,12 @@ impl SessionTable {
             // same fallback as the timestamps above). The dominant close
             // path (idle/age expiry) harvests the real counters.
             counters: SessionCounters::default(),
+            // #2749: the entry was already removed by the explicit-close
+            // caller, so its observed ToS / TCP flags are no longer in hand —
+            // emit 0 (the dominant idle/age close path harvests the real
+            // values off the expiring entry).
+            observed_tos: 0,
+            observed_tcp_flags: 0,
         });
     }
 
