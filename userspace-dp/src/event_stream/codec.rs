@@ -55,16 +55,27 @@ pub(crate) const MSG_SESSION_CLOSE_RT_FLOW: u8 = 14;
 // RT_FLOW_SESSION_CREATE syslog record.
 pub(crate) const MSG_SESSION_CREATE_RT_FLOW: u8 = 15;
 
-// #3056: 144 bytes (was 136). The trailing [136:140] u32 carries the admitting
-// policy ID on the SESSION_CLOSE frame, whose [44:48] policy_id slot is occupied
-// by the #2853 created-subsec-nanos remainder and so cannot hold the policy ID
-// the way the SESSION_CREATE / deny / screen / filter frames do. [140:144] is
-// reserved padding (keeps the Go `dataplane.Event` mirror 8-byte aligned). All
-// frame encoders emit this length; non-close frames leave [136:144] zero. The Go
-// decoder reads [136:140] only on a SESSION_CLOSE and is length-guarded, so a
-// short (legacy 136-byte) frame degrades to policy 0 rather than misparsing.
+// #2749: 152 bytes (was 144). The trailing [144:152] block carries the
+// class-of-service / interface-attribution fields the NetFlow v9 + IPFIX
+// SESSION_CLOSE exporters re-introduce: [144] src ToS byte (DSCP<<2),
+// [145] accumulated TCP control bits, [146] flow direction (reserved, 0 —
+// deferred follow-up), [147] reserved, [148:152] egress ifindex (LE u32).
+// Only the SESSION_CLOSE frame populates these; every other frame leaves
+// [144:152] zero. The growth is purely ADDITIVE: the Go side keeps its
+// minimum-frame acceptance at the legacy 144 bytes (`rawEventWireSize`) and
+// reads [144:152] only when the frame actually carries them
+// (`len(data) >= 152`), so a new daemon still accepts an old (144-byte)
+// helper's frames and an old daemon ignores the trailing 8 bytes — both
+// rolling-upgrade directions are safe (#1961 both-sides wire discipline).
+//
+// #3056: [136:140] carries the admitting policy ID on the SESSION_CLOSE
+// frame, whose [44:48] policy_id slot is occupied by the #2853
+// created-subsec-nanos remainder and so cannot hold the policy ID the way the
+// SESSION_CREATE / deny / screen / filter frames do. [140:144] stays reserved
+// padding. All frame encoders emit this length; non-close frames leave
+// [136:152] zero.
 #[allow(dead_code)]
-pub(crate) const SECURITY_EVENT_PAYLOAD_SIZE: usize = 144;
+pub(crate) const SECURITY_EVENT_PAYLOAD_SIZE: usize = 152;
 
 const RT_FLOW_AF_INET: u8 = 2;
 const RT_FLOW_AF_INET6: u8 = 10;
@@ -548,6 +559,17 @@ impl EventFrame {
         fwd_bytes: u64,
         rev_packets: u64,
         rev_bytes: u64,
+        // #2749: class-of-service / interface-attribution fields for the
+        // re-introduced NetFlow v9 + IPFIX close-record fields. `src_tos` is
+        // the IP ToS byte (DSCP in the high 6 bits, ECN cleared — the shim
+        // meta carries only the 6-bit DSCP) observed on the forward
+        // direction; `tcp_control_bits` is the OR of every TCP flag byte seen
+        // over the flow's lifetime; `egress_ifindex` is the resolved output
+        // interface (from the session's forwarding resolution). All ride the
+        // additive [144:152] block. 0 keeps the prior "field absent" rendering.
+        src_tos: u8,
+        tcp_control_bits: u8,
+        egress_ifindex: u32,
     ) -> Self {
         let mut buf = [0u8; 256];
         let base = FRAME_HEADER_SIZE;
@@ -637,6 +659,16 @@ impl EventFrame {
         // PolicyID ONLY on a SESSION_CLOSE, so the close record names the
         // admitting policy instead of policy 0. [140:144] stays reserved padding.
         buf[base + 136..base + 140].copy_from_slice(&policy_id.to_le_bytes());
+        // #2749: [144] src ToS byte, [145] accumulated TCP control bits,
+        // [146] flow direction (reserved — 0; a real per-flow inbound/outbound
+        // classification is a deferred follow-up), [147] reserved, [148:152]
+        // egress ifindex (LITTLE-endian u32). The Go decoder reads this block
+        // only when the frame carries it (len >= 152) and only on a
+        // SESSION_CLOSE, so a short legacy (144-byte) frame degrades to the
+        // prior all-absent behavior rather than misparsing.
+        buf[base + 144] = src_tos;
+        buf[base + 145] = tcp_control_bits;
+        buf[base + 148..base + 152].copy_from_slice(&egress_ifindex.to_le_bytes());
 
         write_header(
             &mut buf,

@@ -4967,6 +4967,8 @@ fn flush_session_deltas_without_binding_reaches_global_consumers() {
         created_ns: 0,
         last_seen_ns: 0,
         counters: crate::session::SessionCounters::default(),
+        observed_tos: 0,
+        observed_tcp_flags: 0,
     };
 
     // Synthesize a binding identity with labels only — exactly what the
@@ -5070,6 +5072,8 @@ fn flush_session_deltas_event_stream_drop_latches_out_of_sync() {
         created_ns: 0,
         last_seen_ns: 0,
         counters: crate::session::SessionCounters::default(),
+        observed_tos: 0,
+        observed_tcp_flags: 0,
     };
 
     let ident = BindingIdentity {
@@ -5159,6 +5163,8 @@ fn close_delta_deletes_dnat_table_entry_for_snat_flow() {
             created_ns: 0,
             last_seen_ns: 0,
             counters: crate::session::SessionCounters::default(),
+            observed_tos: 0,
+            observed_tcp_flags: 0,
         }
     };
 

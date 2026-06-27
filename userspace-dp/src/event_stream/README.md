@@ -20,15 +20,25 @@ periodic ACK from the daemon.
   `MSG_SESSION_CREATE_RT_FLOW` (15).
   The telemetry frame payload is not a userspace-specific schema: it is
   the same `dataplane.Event` layout consumed by the Go ringbuf logger,
-  including AF values 2/10 and big-endian L4 ports. The payload is 144
-  bytes (#3056 grew it from 136): the trailing [136:140] u32 carries the
-  admitting policy ID on the SESSION_CLOSE frame, whose [44:48] policy_id
-  slot is occupied by the #2853 created-subsec-nanos and so cannot hold
-  the policy ID the way every other frame does; [140:144] is reserved
-  padding (keeps the Go mirror 8-byte aligned). Userspace telemetry may
-  also populate the non-session metadata slots used by the Go adapter for
-  action, rule ID, term ID, reason, owner RG, ingress ifindex, and
-  application ID.
+  including AF values 2/10 and big-endian L4 ports. The payload is 152
+  bytes (`SECURITY_EVENT_PAYLOAD_SIZE`): #3056 grew it 136 -> 144 (the
+  trailing [136:140] u32 carries the admitting policy ID on the
+  SESSION_CLOSE frame, whose [44:48] policy_id slot is occupied by the
+  #2853 created-subsec-nanos and so cannot hold the policy ID the way
+  every other frame does; [140:144] is reserved padding), and #2749 grew
+  it again 144 -> 152 with an ADDITIVE class-of-service / interface block
+  at [144:152] on the SESSION_CLOSE RT_FLOW frame: [144] src ToS byte
+  (DSCP<<2), [145] cumulative TCP control bits, [146:148] reserved
+  (flowDirection, deferred), [148:152] egress ifindex (LITTLE-endian u32).
+  The growth is additive and rolling-upgrade-safe: the Go reader keeps its
+  minimum-frame acceptance at the legacy 144 bytes and decodes the
+  [144:152] block ONLY when the frame carries it (`len >= 152`) AND on a
+  SESSION_CLOSE, so a new daemon still accepts an old helper's 144-byte
+  frames and an old daemon ignores the trailing 8 bytes (#1961). Every
+  frame encoder emits 152 bytes; non-close frames leave [144:152] zero.
+  Userspace telemetry may also populate the non-session metadata slots
+  used by the Go adapter for action, rule ID, term ID, reason, owner RG,
+  ingress ifindex, and application ID.
   (#2470) the `MSG_POLICY_DENY` / `MSG_SCREEN_DROP` (incl. the #2234
   scan-table-pressure ALARM) / `MSG_FILTER_LOG` emitters
   (`afxdp/event_emit.rs`) stamp `timestamp_ns` (offset 0, absolute Unix
@@ -78,9 +88,11 @@ periodic ACK from the daemon.
   `emit_screen_alarm_event`) deliberately keep 0: the screen parse-error
   fail-closed path (#2146) and the L4-less screen drops legitimately lack a
   resolvable 5-tuple, so fabricating an AppID there would be wrong.
-  `MSG_SESSION_CLOSE_RT_FLOW` (14) carries that same 144-byte payload
+  `MSG_SESSION_CLOSE_RT_FLOW` (14) carries that same 152-byte payload
   with the event-type byte set to RT_FLOW SESSION_CLOSE (2), plus the
-  #3056 admitting policy ID in the trailing [136:140] slot. It is
+  #3056 admitting policy ID in the trailing [136:140] slot and the #2749
+  class-of-service / interface block at [144:152] (src ToS, cumulative TCP
+  control bits, egress ifindex). It is
   emitted once per session close (via `emit_session_close_rt_flow`,
   paired 1:1 with — and ADDITIVE to — the unchanged minimal type-2
   `MSG_SESSION_CLOSE` HA session-sync delta), and is what drives the Go
@@ -137,8 +149,9 @@ periodic ACK from the daemon.
   flowexport consumer of session opens, so `MSG_SESSION_CREATE_RT_FLOW`
   (15) is producer-gated: it is emitted (via `emit_session_create_rt_flow`)
   ONLY when the admitting policy requested `then log session-init`, carries
-  the same 144-byte payload with the event-type byte set to SESSION_OPEN
-  (1, rendered as RT_FLOW_SESSION_CREATE on the Go side). The SESSION_CREATE
+  the same 152-byte payload with the event-type byte set to SESSION_OPEN
+  (1, rendered as RT_FLOW_SESSION_CREATE on the Go side; the create frame
+  leaves the #2749 [144:152] class-of-service block zero). The SESSION_CREATE
   frame carries the #3056 admitting policy ID in the usual [44:48] slot (it
   has no created-subsec-nanos), and always sets
   the gate byte. (#2615) the create frame now also threads the resolved

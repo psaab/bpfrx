@@ -16,6 +16,8 @@ const (
 	ipfixOctetDeltaCount          = 1
 	ipfixPacketDeltaCount         = 2
 	ipfixProtocolIdentifier       = 4
+	ipfixIPClassOfService         = 5 // #2749 ipClassOfService (IE 5), unsigned8
+	ipfixTCPControlBits           = 6 // #2749 tcpControlBits (IE 6), unsigned16
 	ipfixSourceTransportPort      = 7
 	ipfixSourceIPv4Address        = 8
 	ipfixSourceIPv4PrefixLength   = 9 // #2866 srcMask (IE 9), unsigned8
@@ -23,6 +25,7 @@ const (
 	ipfixDestinationTransportPort = 11
 	ipfixDestinationIPv4Address   = 12
 	ipfixDestIPv4PrefixLength     = 13 // #2866 dstMask (IE 13), unsigned8
+	ipfixEgressInterface          = 14 // #2749 egressInterface (IE 14), unsigned32
 	ipfixSourceIPv6Address        = 27
 	ipfixDestinationIPv6Address   = 28
 	ipfixSourceIPv6PrefixLength   = 29 // #2866 srcMask v6 (IE 29), unsigned8
@@ -99,8 +102,18 @@ var ipfixTemplateV4 = []ipfixField{
 	// ingress ifindex on the SESSION_CLOSE frame since #2615. Placed before
 	// the post-NAT tuple so the latter stays the trailing block (#2526
 	// invariant). The other four #2613 drops (ipClassOfService 5 /
-	// tcpControlBits 6 / egressInterface 14 / flowDirection 61) stay absent.
+	// flowDirection 61) stays absent — no real per-flow value yet.
 	{ipfixIngressInterface, 4},
+	// #2749: class-of-service + egress interface re-introduced with REAL
+	// values from the extended SESSION_CLOSE frame ([144:152]).
+	// ipClassOfService (IE 5, 1B) = forward DSCP<<2; tcpControlBits (IE 6, 2B,
+	// unsigned16) = cumulative TCP control bits; egressInterface (IE 14, 4B) =
+	// egress ifindex. Placed after ingressInterface and before the post-NAT
+	// tuple so the latter stays the trailing block (#2526). flowDirection
+	// (IE 61) stays absent.
+	{ipfixIPClassOfService, 1},
+	{ipfixTCPControlBits, 2},
+	{ipfixEgressInterface, 4},
 	// #2526: post-NAT (translated) tuple, appended last.
 	{ipfixPostNatSourceIPv4Address, 4},
 	{ipfixPostNatDestinationIPv4Address, 4},
@@ -124,6 +137,11 @@ var ipfixTemplateV6 = []ipfixField{
 	{ipfixDestIPv6PrefixLength, 1},
 	// #2749: ingressInterface (IE 10) — see the V4 template note.
 	{ipfixIngressInterface, 4},
+	// #2749: ipClassOfService (IE 5) / tcpControlBits (IE 6) / egressInterface
+	// (IE 14) — see the V4 template note.
+	{ipfixIPClassOfService, 1},
+	{ipfixTCPControlBits, 2},
+	{ipfixEgressInterface, 4},
 	// #2526: post-NAT (translated) tuple, appended last. v6 addresses use the
 	// 16-byte RFC 8158 elements; ports reuse the family-agnostic 227/228.
 	{ipfixPostNatSourceIPv6Address, 16},
@@ -137,16 +155,20 @@ var ipfixTemplateV6 = []ipfixField{
 // from the former 69-byte record. pre-NAT body = 45; #2526 post-NAT tuple
 // (4+4+2+2) = 12 → 57. #2749 re-added ingressInterface (IE 10, 4B) with a
 // real value → 61. #2866 added srcMask+dstMask (IE 9/13, 1B each) → 63.
-// 4+4+2+2+1+8+8+8+8 + 1+1 + 4 + 4+4+2+2 = 63
-const ipfixRecordSizeV4 = 63
+// #2749 re-added ipClassOfService(1)+tcpControlBits(2)+egressInterface(4) = 7
+// with real values → 70.
+// 4+4+2+2+1+8+8+8+8 + 1+1 + 4 + 1+2+4 + 4+4+2+2 = 70
+const ipfixRecordSizeV4 = 70
 
 // ipfixRecordSizeV6 is the byte size of a single IPv6 IPFIX data record.
 // #2613 dropped the same 12 unpopulated bytes from the former 117. pre-NAT
 // body = 69; #2526 post-NAT tuple (16+16+2+2) = 36 → 105. #2749 re-added
 // ingressInterface (IE 10, 4B) with a real value → 109. #2866 added the IPv6
 // srcMask+dstMask (IE 29/30, 1B each) → 111.
-// 16+16+2+2+1+8+8+8+8 + 1+1 + 4 + 16+16+2+2 = 111
-const ipfixRecordSizeV6 = 111
+// #2749 re-added ipClassOfService(1)+tcpControlBits(2)+egressInterface(4) = 7
+// with real values → 118.
+// 16+16+2+2+1+8+8+8+8 + 1+1 + 4 + 1+2+4 + 16+16+2+2 = 118
+const ipfixRecordSizeV6 = 118
 
 // ipfixRecordSizeV4 / V6 must equal the sum of their template field lengths.
 // A drift between the template (what the collector parses) and the encoder
@@ -314,6 +336,14 @@ func encodeIPFIXRecordV4(b []byte, off int, r FlowRecord) int {
 	// tuple to match the template field order.
 	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
 	off += 4
+	// #2749: ipClassOfService (IE 5, 1B) / tcpControlBits (IE 6, 2B) /
+	// egressInterface (IE 14, 4B) — real class-of-service + egress attribution.
+	b[off] = r.TOS
+	off++
+	binary.BigEndian.PutUint16(b[off:off+2], uint16(r.TCPFlags))
+	off += 2
+	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
+	off += 4
 	// #2526: post-NAT (translated) tuple — 225/226/227/228.
 	natSrc4 := r.NATSrcIP.To4()
 	natDst4 := r.NATDstIP.To4()
@@ -369,6 +399,14 @@ func encodeIPFIXRecordV6(b []byte, off int, r FlowRecord) int {
 	off++
 	// #2749: ingressInterface (IE 10) — see encodeIPFIXRecordV4.
 	binary.BigEndian.PutUint32(b[off:off+4], r.InIf)
+	off += 4
+	// #2749: ipClassOfService (IE 5) / tcpControlBits (IE 6) / egressInterface
+	// (IE 14) — see encodeIPFIXRecordV4.
+	b[off] = r.TOS
+	off++
+	binary.BigEndian.PutUint16(b[off:off+2], uint16(r.TCPFlags))
+	off += 2
+	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
 	off += 4
 	// #2526: post-NAT (translated) tuple — 281/282 (16B) + 227/228 (2B).
 	natSrc16 := r.NATSrcIP.To16()
@@ -492,8 +530,13 @@ func (e *IPFIXExporter) ExportSessionClose(rec logging.EventRecord, evt SessionC
 		NATDstIP:   natDstIP,
 		NATSrcPort: natSrcPort,
 		NATDstPort: natDstPort,
-		// #2749: ingress ifindex (SNMP ifIndex) -> IPFIX ingressInterface.
-		InIf: evt.InIf,
+		// #2749: ingress ifindex (SNMP ifIndex) -> IPFIX ingressInterface; plus
+		// the re-introduced ipClassOfService (IE 5) / tcpControlBits (IE 6) /
+		// egressInterface (IE 14).
+		InIf:     evt.InIf,
+		TOS:      evt.TOS,
+		TCPFlags: evt.TCPFlags,
+		OutIf:    evt.OutIf,
 	}
 
 	e.batch.add(fr)

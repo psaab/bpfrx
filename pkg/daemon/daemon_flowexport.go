@@ -364,6 +364,11 @@ func (d *Daemon) flowExportCallback(rec logging.EventRecord, raw []byte) {
 		// #2749: ingress ifindex (SNMP ifIndex) for the NetFlow v9
 		// ingressInterface field; carried on the close frame since #2615.
 		InIf: rec.IngressIfindex,
+		// #2749: class-of-service + egress-interface attribution carried on the
+		// extended SESSION_CLOSE frame's [144:152] block.
+		TOS:      rec.TOS,
+		TCPFlags: rec.TCPControlBits,
+		OutIf:    rec.EgressIfindex,
 	}
 	sd.SrcIP, sd.DstIP, sd.IsIPv6 = parseAddrPair(rec.SrcAddr, rec.DstAddr)
 	// #2526: parse the post-NAT translated tuple; the exporter falls back to
@@ -409,6 +414,11 @@ func (d *Daemon) ipfixExportCallback(rec logging.EventRecord, raw []byte) {
 		// #2749: ingress ifindex (SNMP ifIndex) for the IPFIX
 		// ingressInterface field; carried on the close frame since #2615.
 		InIf: rec.IngressIfindex,
+		// #2749: class-of-service + egress-interface attribution carried on the
+		// extended SESSION_CLOSE frame's [144:152] block.
+		TOS:      rec.TOS,
+		TCPFlags: rec.TCPControlBits,
+		OutIf:    rec.EgressIfindex,
 	}
 	sd.SrcIP, sd.DstIP, sd.IsIPv6 = parseAddrPair(rec.SrcAddr, rec.DstAddr)
 	// #2526: parse the post-NAT translated tuple; the exporter falls back to

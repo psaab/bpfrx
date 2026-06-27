@@ -461,7 +461,8 @@ The ID is consumed at three surfaces:
    [136:140] slot — NOT [44:48], which #2853 repurposed on a close for the
    created-subsec-nanos. The RT_FLOW event payload grew 136 -> 144 bytes for
    this slot (`SECURITY_EVENT_PAYLOAD_SIZE`; mirrored by `pkg/dataplane.Event`
-   and `pkg/logging` `rawEventWireSize` / `binary_test.go`). The Go decoder
+   and `pkg/logging` `rawEventWireSize` / `binary_test.go`); #2749 later grew it
+   again 144 -> 152 for the class-of-service block (see below). The Go decoder
    reads [136:140] back as `PolicyID` ONLY on a SESSION_CLOSE and is
    length-guarded, so a short (legacy 136-byte) frame degrades to policy 0
    rather than misparsing.
@@ -478,6 +479,51 @@ above). A peer-PROMOTED session therefore still resolves policy `0` on the new
 active node until a future change adds a `policy_id` wire field (mirroring how
 #2785 added the log-flag fields) — a deliberate follow-up, not a regression
 (the pre-#3056 behavior was policy 0 everywhere).
+
+### Class-of-service + interface attribution on the close frame (#2749)
+
+#2613 dropped five fields from the NetFlow v9 / IPFIX templates because the
+close frame carried no real value for them: `srcTos`/`ipClassOfService` (IE 5),
+`tcpFlags`/`tcpControlBits` (IE 6), `flowDirection` (IE 61),
+`ingressInterface`/`InputSNMP` (IE 10) and `egressInterface`/`OutputSNMP`
+(IE 14). #2615 restored IE 10 (the binding's ingress ifindex). #2749 restores
+the class-of-service + egress fields with REAL values by **extending the
+SESSION_CLOSE RT_FLOW frame from 144 to 152 bytes** — an ADDITIVE block at
+`[144:152]`:
+
+| Offset | Field | Source |
+|--------|-------|--------|
+| `[144]` | src ToS byte (DSCP<<2, ECN cleared) | `SessionEntry.observed_tos`, stamped from `meta.dscp` on each FORWARD packet (`account_packet`) |
+| `[145]` | accumulated TCP control bits | `SessionEntry.observed_tcp_flags`, OR of `meta.tcp_flags` over BOTH directions |
+| `[146]` | flow direction | reserved, 0 — **deferred** (no real per-flow inbound/outbound signal yet) |
+| `[147]` | reserved | 0 |
+| `[148:152]` | egress ifindex (LE u32) | `SessionDecision.resolution.egress_ifindex` (already on the session) |
+
+The two observed bytes ride the close `SessionDelta` (`observed_tos` /
+`observed_tcp_flags`), harvested off the expiring entry in `session/expire.rs`
+exactly like the #2501 counters; the egress ifindex comes straight off the
+session's forwarding resolution. `encode_session_close_rt_flow`
+(`SECURITY_EVENT_PAYLOAD_SIZE = 152`) writes the block; the Go
+`pkg/logging/ringbuf.go` reader decodes it into
+`EventRecord.TOS`/`TCPControlBits`/`EgressIfindex`, and
+`pkg/flowexport` re-adds the template fields + encoder writes (NetFlow v9
+srcTos/tcpFlags/OutputSNMP and IPFIX ipClassOfService/tcpControlBits/
+egressInterface).
+
+**Additive / rolling-safe (#1961 both-sides discipline).** The Go minimum-frame
+acceptance stays at the legacy 144 bytes (`rawEventWireSize`); the `[144:152]`
+slots are read ONLY when the frame carries them (`len >= rawEventExtSize`, 152)
+AND only on a SESSION_CLOSE. So a NEW daemon still accepts an OLD helper's
+144-byte frames (CoS block stays 0/"unknown"), and an OLD daemon ignores the
+trailing 8 bytes of a new helper's frame. The `rawEvent` Go struct mirror is
+intentionally NOT grown — the extended block is read directly from the slice —
+so the `dataplane.Event` size contract (`binary_test.go`) is unchanged.
+
+**Deferred — flowDirection (IE 61).** Re-adding it would require a real
+inbound/outbound classification the close path does not carry; a constant
+ingress=0 would re-introduce the exact synthetic-zero #2613 fixed. The
+`export-extension flow-dir` knob stays accepted-but-not-applied
+(`V9TemplateOptions`) until that signal exists.
 
 ## Per-IP session-limit lifecycle (#2134; #3122 peer-synced fix; #2128 leak-fix preserved)
 

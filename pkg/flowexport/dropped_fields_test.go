@@ -13,21 +13,25 @@ import (
 // the SESSION_CLOSE wire frame carried no real value for any of them, so
 // advertising them made collectors ingest authoritative zeros.
 //
-// #2749: ingressInterface/InputSNMP (10) is RE-INTRODUCED with a real value —
-// the ingress ifindex carried on the SESSION_CLOSE frame since #2615. It is
-// appended LAST in both templates, so the proto->packet-counter adjacency the
-// record-layout goldens below check is preserved. The presence-with-real-value
-// of IE 10 is now pinned by TestNetflowIngressInterfacePopulated /
-// TestIPFIXIngressInterfacePopulated.
+// #2749: ingressInterface/InputSNMP (10) was re-introduced with a real value
+// (the ingress ifindex on the close frame since #2615), and the extended
+// SESSION_CLOSE frame ([144:152]) now also threads REAL ipClassOfService/SrcTos
+// (5), tcpControlBits/TCPFlags (6) and egressInterface/OutputSNMP (14). So all
+// four are now advertised again WITH real values — pinned present by
+// TestNetflowCosFieldsPopulated / TestIPFIXCosFieldsPopulated and the ingress
+// pins. They are placed after FlowEnd (never between the protocol byte and the
+// packet counter), so the proto->packet-counter adjacency the record-layout
+// goldens below check is preserved.
 //
-// The remaining four (5/6/61/14) stay absent — no wire source exists yet.
+// Only flowDirection/Direction (61) stays absent — there is no real per-flow
+// inbound/outbound classification on the close path yet (a deliberate
+// deferral; see docs/flow-export.md).
 //
-// These tests are fail-on-revert pins: re-adding any of the four still-dropped
-// IEs to a template slice (and re-introducing the matching encoder write)
-// shifts the record layout and re-fails both the template-absence walk AND the
-// record-layout golden, which assert that the bytes immediately after the
-// protocol byte are the packet/byte counters (carrying the REAL values), not
-// a zero TOS/flags/direction block.
+// These tests are fail-on-revert pins: re-adding flowDirection (IE 61) to a
+// template (with a synthetic-zero encoder write) re-fails the template-absence
+// walk; the record-layout goldens still prove the bytes immediately after the
+// protocol byte are the packet/byte counters (the REAL values), never a
+// class-of-service block.
 
 // --- IPFIX template-absence ------------------------------------------------
 
@@ -36,14 +40,11 @@ import (
 // asserted as literals (independent of the package constants) so a renamed or
 // removed constant cannot make the test agree with itself.
 func TestIPFIXTemplateDroppedFieldsAbsent(t *testing.T) {
-	// #2749: IE 10 (ingressInterface) is intentionally NOT in this set — it is
-	// re-introduced with a real value and pinned present by
-	// TestIPFIXIngressInterfacePopulated.
+	// #2749: IEs 5/6/10/14 are intentionally NOT in this set — they are
+	// re-introduced with real values and pinned present by the *Populated
+	// tests. Only flowDirection (61) stays absent.
 	dropped := map[uint16]string{
-		5:  "ipClassOfService",
-		6:  "tcpControlBits",
 		61: "flowDirection",
-		14: "egressInterface",
 	}
 	for _, tmpl := range [][]ipfixField{ipfixTemplateV4, ipfixTemplateV6} {
 		for _, f := range tmpl {

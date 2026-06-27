@@ -524,6 +524,11 @@ impl super::Coordinator {
                         // push_delta_lossless (not the RT_FLOW exporter), so
                         // volume is 0/unknown here.
                         counters: crate::session::SessionCounters::default(),
+                        // #2749: shared purge path; no observed ToS / TCP
+                        // flags in hand (and not routed through the RT_FLOW
+                        // exporter).
+                        observed_tos: 0,
+                        observed_tcp_flags: 0,
                     });
                 }
             }
@@ -664,6 +669,10 @@ impl super::Coordinator {
                 // #2501: HA bulk-export Open delta; no volume yet (and the
                 // synced entry carries no per-direction counters).
                 counters: crate::session::SessionCounters::default(),
+                // #2749: HA bulk-export Open delta; no observed ToS / TCP
+                // flags (and not routed through the RT_FLOW close exporter).
+                observed_tos: 0,
+                observed_tcp_flags: 0,
             });
         }
         drop(sessions);

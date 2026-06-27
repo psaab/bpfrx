@@ -694,6 +694,16 @@ type SessionCloseData struct {
 	// ingress interface (the collector then sees ifIndex 0, the
 	// conventional "unknown interface" value).
 	InIf uint32
+	// #2749: class-of-service / egress-interface attribution carried on the
+	// SESSION_CLOSE wire frame's [144:152] block. TOS is the IP ToS byte
+	// (DSCP<<2) observed on the forward direction → NetFlow srcTos (IE 5) /
+	// IPFIX ipClassOfService. TCPFlags is the cumulative TCP control bits →
+	// NetFlow tcpFlags (IE 6) / IPFIX tcpControlBits. OutIf is the egress SNMP
+	// ifIndex → NetFlow OutputSNMP (IE 14) / IPFIX egressInterface. 0 means the
+	// dataplane reported no value (collector "unknown" sentinel).
+	TOS      uint8
+	TCPFlags uint8
+	OutIf    uint32
 }
 
 // flowStartTime resolves the flow record StartTime for a session-close event.

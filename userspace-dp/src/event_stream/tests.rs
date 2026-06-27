@@ -109,6 +109,10 @@ fn test_close_delta(kind: crate::session::SessionDeltaKind) -> crate::session::S
         created_ns: 0,
         last_seen_ns: 0,
         counters: SessionCounters::default(),
+        // #2749: ToS byte 0xB8 (DSCP EF=46 << 2) and TCP flags SYN|FIN|ACK so
+        // the close-emit / round-trip tests can assert real wire values.
+        observed_tos: 0xB8,
+        observed_tcp_flags: 0x13,
     }
 }
 

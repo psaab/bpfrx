@@ -705,6 +705,18 @@ impl EventStreamWorkerHandle {
                     delta.counters.fwd_bytes,
                     delta.counters.rev_packets,
                     delta.counters.rev_bytes,
+                    // #2749: observed forward ToS + cumulative TCP control
+                    // bits harvested off the closing entry, and the session's
+                    // resolved egress (output) interface. These drive the
+                    // re-introduced NetFlow v9 / IPFIX close-record fields
+                    // (srcTos/ipClassOfService, tcpControlBits, egressInterface
+                    // / OutputSNMP). A kernel ifindex is positive; a 0/unset or
+                    // negative (no concrete egress, e.g. local delivery)
+                    // resolution maps to 0 — the collector's "unknown
+                    // interface" sentinel.
+                    delta.observed_tos,
+                    delta.observed_tcp_flags,
+                    u32::try_from(delta.decision.resolution.egress_ifindex).unwrap_or(0),
                 )
             },
         );

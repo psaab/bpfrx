@@ -290,6 +290,9 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
         222_333,         // #2501: fwd bytes
         44,              // #2501: rev packets
         55_666,          // #2501: rev bytes
+        0xB8,            // #2749: src ToS (DSCP EF=46 << 2)
+        0x13,            // #2749: TCP control bits (SYN|FIN|ACK)
+        9,               // #2749: egress ifindex
     );
 
     assert_eq!(frame.data[4], MSG_SESSION_CLOSE_RT_FLOW);
@@ -347,6 +350,17 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
         u32::from_le_bytes(p[44..48].try_into().unwrap()),
         123_456_789
     ); // created sub-second nanos
+    // #2749 fail-on-revert: the class-of-service / interface-attribution block
+    // rides the additive [144:152] slots — [144] src ToS, [145] cumulative TCP
+    // control bits, [148:152] egress ifindex (LE). Reverting the encoder to
+    // drop these makes the NetFlow/IPFIX close record report 0 for srcTos /
+    // tcpControlBits / egressInterface again (the #2613 regression #2749
+    // fixes). The payload itself must be 152 bytes.
+    assert_eq!(SECURITY_EVENT_PAYLOAD_SIZE, 152);
+    assert_eq!(p.len(), 152);
+    assert_eq!(p[144], 0xB8); // src ToS
+    assert_eq!(p[145], 0x13); // TCP control bits
+    assert_eq!(u32::from_le_bytes(p[148..152].try_into().unwrap()), 9); // egress ifindex
     assert_eq!(
         u64::from_le_bytes(p[0..8].try_into().unwrap()),
         1_700_000_123_000_000_000
@@ -406,6 +420,9 @@ fn test_encode_session_close_rt_flow_v6() {
         0,     // #2501: fwd bytes
         0,     // #2501: rev packets
         0,     // #2501: rev bytes
+        0,     // #2749: src ToS
+        0,     // #2749: TCP control bits
+        0,     // #2749: egress ifindex
     );
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     assert_eq!(p[52], RT_FLOW_EVENT_SESSION_CLOSE);
@@ -452,6 +469,9 @@ fn test_session_close_rt_flow_log_gate_byte() {
             0, // #2501: fwd bytes
             0, // #2501: rev packets
             0, // #2501: rev bytes
+            0, // #2749: src ToS
+            0, // #2749: TCP control bits
+            0, // #2749: egress ifindex
         )
     };
     let gated_off = mk(false);
@@ -821,6 +841,8 @@ fn test_close_flags() {
         created_ns: 0,
         last_seen_ns: 0,
         counters: crate::session::SessionCounters::default(),
+        observed_tos: 0,
+        observed_tcp_flags: 0,
     };
     let flags = close_flags(&delta);
     assert_eq!(flags & FLAG_FABRIC_REDIRECT, FLAG_FABRIC_REDIRECT);

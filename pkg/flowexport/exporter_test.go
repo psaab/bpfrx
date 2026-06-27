@@ -627,20 +627,18 @@ func TestV9TemplateFlowDirAlwaysAbsent(t *testing.T) {
 }
 
 // TestV9TemplateDroppedFieldsAbsent walks the encoded template FlowSet bytes
-// and asserts the still-dropped #2613 IEs (SrcTos/TCPFlags/Direction/
-// OutputSNMP) are NOT advertised. Re-adding any of them to the template slices
-// re-fails this test (fail-on-revert).
+// and asserts the still-dropped #2613 IE (Direction) is NOT advertised.
+// Re-adding it (with a synthetic-zero encoder write) re-fails this test
+// (fail-on-revert).
 //
-// #2749: InputSNMP (IE 10) is NO LONGER in this set — it is re-introduced with
-// a real value (ingress ifindex) and pinned PRESENT by
-// TestNetflowIngressInterfacePopulated. Only OutputSNMP (14) stays dropped on
-// the interface side (no egress-ifindex wire source yet).
+// #2749: SrcTos (5), TCPFlags (6), InputSNMP (10) and OutputSNMP (14) are NO
+// LONGER in this set — they are re-introduced with real values (forward DSCP,
+// cumulative TCP control bits, ingress/egress ifindex) and pinned PRESENT by
+// TestNetflowIngressInterfacePopulated / TestNetflowCosFieldsPopulated. Only
+// flowDirection (61) stays dropped (no real per-flow direction yet).
 func TestV9TemplateDroppedFieldsAbsent(t *testing.T) {
 	dropped := map[uint16]string{
-		fieldSrcTos:     "SrcTos",
-		fieldTCPFlags:   "TCPFlags",
-		fieldDirection:  "Direction",
-		fieldOutputSNMP: "OutputSNMP",
+		fieldDirection: "Direction",
 	}
 	for _, includeDir := range []bool{true, false} {
 		tmplFS := encodeTemplateFlowSet(V9TemplateOptions{IncludeFlowDir: includeDir})
