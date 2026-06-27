@@ -356,6 +356,22 @@ type compileOpts struct {
 	// already-persisted or peer-synced config still BOOTS (#1960 no-brick).
 	// Same doctrine as lenientFilterMatchValues.
 	lenientFlexMatch bool
+	// lenientFilterPortExcept (#3297) downgrades the firewall-filter
+	// positive-vs-except port mutual-exclusion gate
+	// (validateFilterPortExceptStrict) from a hard compile error to a
+	// cfg.Warnings entry. The strict commit / commit-check path hard-rejects a
+	// term that carries BOTH a positive port match (source-port /
+	// destination-port) AND the negated *-port-except list in the SAME
+	// direction — Junos treats those as mutually exclusive match families and
+	// rejects the term at commit. Before this gate xpf accepted the ambiguous
+	// term and the Rust matcher resolved it deterministically as positive-wins
+	// (the except side silently dropped) — fail-safe at runtime but a
+	// Junos-invalid config accepted with one side of the operator's intent
+	// lost. The tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config still BOOTS (#1960 no-brick); the
+	// dataplane's positive-wins fallback keeps that direction fail-safe. Same
+	// doctrine as lenientFilterMatchValues.
+	lenientFilterPortExcept bool
 	// lenientNPTv6 (#2240) downgrades the NPTv6 (RFC 6296) validation gate
 	// (validateNPTv6Strict) from a hard compile error to a cfg.Warnings entry.
 	// The strict commit / commit-check path hard-rejects an NPTv6 static-NAT
@@ -985,6 +1001,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFilterActions:                true,
 		lenientFilterMatchValues:            true,
 		lenientFlexMatch:                    true,
+		lenientFilterPortExcept:             true,
 		lenientNPTv6:                        true,
 		lenientFirewallRefs:                 true,
 		lenientFlowServerTemplateRef:        true,
@@ -1114,6 +1131,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFilterActions:                true,
 		lenientFilterMatchValues:            true,
 		lenientFlexMatch:                    true,
+		lenientFilterPortExcept:             true,
 		lenientNPTv6:                        true,
 		lenientFirewallRefs:                 true,
 		lenientFlowServerTemplateRef:        true,
@@ -1992,6 +2010,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFlexMatch {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("firewall filter flexible-match-range (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3297 firewall-filter positive-vs-except port mutual-exclusion gate.
+	// Strict on commit / commit-check (hard-reject a term carrying BOTH a
+	// positive port match and the negated *-port-except list in the same
+	// direction — Junos rejects this as ambiguous). Before this gate xpf
+	// accepted the term and the Rust matcher silently applied positive-wins,
+	// dropping the except side. Lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960 no-brick; the
+	// dataplane's positive-wins fallback keeps that direction fail-safe). Runs
+	// on the fully-compiled *Config so the typed term list (with
+	// SourcePorts/DestinationPorts and SourcePortsExcept/DestPortsExcept
+	// populated by compileFilterFrom) is available.
+	if err := validateFilterPortExceptStrict(cfg); err != nil {
+		if opts.lenientFilterPortExcept {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter port-except (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
