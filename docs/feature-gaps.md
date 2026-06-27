@@ -195,23 +195,25 @@ xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT
 > an all-port block (#3202). Honoring a DNAT destination prefix still
 > needs a prefix-match table plus confirmed Junos block-mapping semantics.
 
-> **NAT64 inbound policy matches the SYNTHETIC IPv6 destination, not the
-> real internal IPv4 host (#2358).** For inbound NAT64 flows the security
-> policy is evaluated against the synthetic IPv6 destination the v6 client
-> sent to (the NAT64-prefixed address), NOT the real internal IPv4 server
-> the traffic is translated to. This is because `policy.rs::evaluate_policy`
-> requires the source and destination to be the same address family — a
-> `(V6 src, V4 dst)` tuple matches no rule and would default-deny, which
-> would break all NAT64. Same-family DNAT/static-DNAT/NPTv6 *do* match the
-> translated destination tuple (#2345), but NAT64 is excluded by that
-> same-family constraint. **Operator impact:** write NAT64 inbound security
-> policy against the synthetic IPv6 destination *prefix*, not the real IPv4
-> host address/zone. This diverges from Junos/SRX, where inbound
-> destination translation precedes the policy lookup so the policy matches
-> the real internal destination. Cross-family policy matching (match the
-> v6 source zone against the extracted IPv4 host + its zone) is the
-> separate design change tracked in **#2358**; this is a documented
-> behavior, not a deny regression.
+> **NAT64 inbound policy now matches the real internal IPv4 host (#2358,
+> resolved).** For inbound NAT64 flows the security policy is evaluated
+> against the POST-translation tuple — the v6 client source matched in the
+> IPv6 ingress zone, and the real internal IPv4 server the synthetic NAT64
+> address was extracted to, matched in the destination zone. This matches
+> Junos/SRX, where inbound destination translation precedes the policy
+> lookup. NAT64 is a cross-family translation `(V6 src, V4 dst)`;
+> `policy.rs::try_match_rule` grew a dedicated cross-family arm (#2358) that
+> matches the source against the rule's IPv6 source set and the destination
+> against the rule's IPv4 destination set, so an operator authors a NAT64
+> policy against the real IPv4 host. This composes with the same-family
+> DNAT/static-DNAT/NPTv6 post-translation matching from #2345. **Migration:**
+> NAT64 policies previously authored against the synthetic IPv6
+> NAT64-prefix destination no longer match — rewrite them against the real
+> IPv4 host address + its destination zone. Note the legacy parse
+> convention that an address set with no IPv4 prefix and no `any-ipv4`
+> wildcard treats the IPv4 family as match-any still applies, so scope the
+> destination to the real IPv4 host explicitly. The reverse `(V4 src, V6
+> dst)` tuple (NAT46, unsupported) still fails closed.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|

@@ -1,3 +1,31 @@
+## 2026-06-26 — #2358 NAT64 inbound cross-family policy matching
+
+- **Timestamp**: 2026-06-26
+- **Action**: Inbound NAT64 security policy now evaluates the
+  POST-translation tuple (v6 client source in the IPv6 ingress zone, real
+  internal IPv4 destination in the destination zone), matching Junos/SRX
+  order-of-operations and composing with the same-family #2345
+  DNAT/static-DNAT/NPTv6 post-translation matching. Added a dedicated
+  cross-family `(V6 src, V4 dst)` arm to `policy.rs::try_match_rule`
+  (source matched against the rule's IPv6 source set, destination against
+  the IPv4 destination set; `*-excluded` empty-set fail-closed and
+  per-family any-match semantics mirror the same-family arms; reverse
+  `(V4 src, V6 dst)` NAT46 still fails closed). Changed the
+  ForwardCandidate `policy_dst_ip` to feed `effective_resolution_target`
+  (the extracted real IPv4 dst) for NAT64 instead of the synthetic
+  `flow.dst_ip`. Updated the MissingNeighbor comment (that arm does not
+  classify NAT64). Added 5 policy tests (matches-real-v4,
+  source-any-to-v4, wrong-v4-host-denies, wrong-v6-source-denies,
+  NAT46-never-matches); verified fail-on-revert (matches-real-v4 flips to
+  Deny when the cross-family arm is removed). Full cargo suite green
+  (3153+46+8+16+1, 0 fail, 2 ignored). Docs: twice-nat.md NAT64 section
+  flipped excluded->implemented with migration note, feature-gaps.md +
+  userspace-dataplane-gaps.md NAT64 rows updated.
+- **File(s)**: userspace-dp/src/policy.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/policy_tests.rs, docs/next-features/twice-nat.md,
+  docs/feature-gaps.md, docs/userspace-dataplane-gaps.md
+
 ## 2026-06-26 — #3233 NPTv6: skip the word fixup for a checksum-neutral prefix pair
 
 - **Timestamp**: 2026-06-26
