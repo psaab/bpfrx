@@ -467,3 +467,126 @@ func TestFeedPlusConcreteAddressSetIsRepresentable(t *testing.T) {
 		t.Fatal("{feed + concrete} set must route through a book ID (carries the concrete-member prefix)")
 	}
 }
+
+// TestMutualCycleWithConcreteAddressSetIsRepresentable is the Codex
+// MERGE-NEEDS-MAJOR POSITIVE control: a MUTUAL cycle whose entry set ALSO has
+// its own concrete member —
+//
+//	address-set A { address <concrete>; address-set B; }
+//	address-set B { address-set A; }
+//
+// — is COMMIT-VALID (the strict validator policyMatchAddressBookResolves accepts
+// it: the cycle revisit of A inside B returns true, B contributes no concrete,
+// A's own `<concrete>` gives count=1, count!=0 so no reject). The dataplane's
+// representability decision MUST EXACTLY equal strict's, so this config must
+// stay representable: NO sentinel, NO PolicyContentRejected, a real book ID.
+//
+// This test is RED on the pre-fix head: the old `return anyConcrete, anyConcrete`
+// COUPLED structural-resolvability with concrete-ness, so when A is the entry, B
+// (whose only member is the now-visited A) had anyConcrete=false and returned
+// (false,false), which poisoned A via `if !r { return false, false }` and
+// DISCARDED A's own concrete -> A returned (false,false) -> __unsupported_address__
+// sentinel -> the whole snapshot over-rejected and a legitimate deny dropped.
+// The decoupled `return hasMember, anyConcrete` + top-level `r && c` gate fixes
+// it: B is (true,false) structurally resolvable, A is (true,true), accepted.
+func TestMutualCycleWithConcreteAddressSetIsRepresentable(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.DefaultPolicy = config.PolicyPermit
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"lan": {Name: "lan", Interfaces: []string{"reth1"}},
+		"wan": {Name: "wan", Interfaces: []string{"reth0.80"}},
+	}
+	cfg.Security.AddressBook = &config.AddressBook{
+		Addresses: map[string]*config.Address{
+			"concrete-host": {Name: "concrete-host", Value: "172.16.80.200/32"},
+		},
+		AddressSets: map[string]*config.AddressSet{
+			// A has a concrete member AND references B; B references back to A.
+			"set-a": {Name: "set-a", Addresses: []string{"concrete-host"}, AddressSets: []string{"set-b"}},
+			"set-b": {Name: "set-b", AddressSets: []string{"set-a"}},
+		},
+	}
+	cfg.Security.Policies = []*config.ZonePairPolicies{{
+		FromZone: "lan",
+		ToZone:   "wan",
+		Policies: []*config.Policy{{
+			Name: "deny-mutual-cycle",
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"set-a"},
+				Applications:         []string{"any"},
+			},
+			Action: config.PolicyDeny,
+		}},
+	}}
+	snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	if len(snap.Capabilities.PolicyContentRejected) != 0 {
+		t.Fatalf("PolicyContentRejected = %v, want empty: a mutual cycle with a concrete member is commit-valid (strict accepts) and must stay representable (Codex over-reject)", snap.Capabilities.PolicyContentRejected)
+	}
+	if len(snap.Policies) != 1 {
+		t.Fatalf("len(Policies) = %d, want 1", len(snap.Policies))
+	}
+	rule := snap.Policies[0]
+	if addressListHasSentinel(rule.DestinationLiterals) || addressListHasSentinel(rule.DestinationAddresses) {
+		t.Fatalf("mutual-cycle-with-concrete set must NOT carry the address sentinel: lit=%v addr=%v", rule.DestinationLiterals, rule.DestinationAddresses)
+	}
+	if len(rule.DestinationBookIDs) == 0 {
+		t.Fatal("mutual-cycle-with-concrete set must route through a book ID (carries the concrete-member prefix)")
+	}
+}
+
+// TestAddressSetWithEmptyNestedSetIsRejected is the parity NEGATIVE for the
+// decouple: a set with a concrete member AND an EMPTY nested set —
+//
+//	address-set outer { address <concrete>; address-set inner-empty; }
+//	address-set inner-empty { }
+//
+// — must STILL be rejected, because strict aborts (resolve(inner-empty) hits
+// resolvedAny==false). The decoupled dataplane matches: the empty nested set
+// returns hasMember=false -> (false,false), which poisons `outer` via
+// `if !r { return false, false }` even though `outer` has its own concrete. Both
+// validators reject -> parity preserved.
+func TestAddressSetWithEmptyNestedSetIsRejected(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.DefaultPolicy = config.PolicyPermit
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"lan": {Name: "lan", Interfaces: []string{"reth1"}},
+		"wan": {Name: "wan", Interfaces: []string{"reth0.80"}},
+	}
+	cfg.Security.AddressBook = &config.AddressBook{
+		Addresses: map[string]*config.Address{
+			"concrete-host": {Name: "concrete-host", Value: "172.16.80.200/32"},
+		},
+		AddressSets: map[string]*config.AddressSet{
+			"outer":       {Name: "outer", Addresses: []string{"concrete-host"}, AddressSets: []string{"inner-empty"}},
+			"inner-empty": {Name: "inner-empty"},
+		},
+	}
+	cfg.Security.Policies = []*config.ZonePairPolicies{{
+		FromZone: "lan",
+		ToZone:   "wan",
+		Policies: []*config.Policy{{
+			Name: "deny-empty-nested",
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"outer"},
+				Applications:         []string{"any"},
+			},
+			Action: config.PolicyDeny,
+		}},
+	}}
+	snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	if len(snap.Capabilities.PolicyContentRejected) == 0 {
+		t.Fatal("PolicyContentRejected empty, want a reason: a set with an EMPTY nested set is rejected by strict and must be rejected by the dataplane (parity)")
+	}
+	rule := snap.Policies[0]
+	if !addressListHasSentinel(rule.DestinationLiterals) || !addressListHasSentinel(rule.DestinationAddresses) {
+		t.Fatalf("empty-nested-set must carry the __unsupported_address__ sentinel: lit=%v addr=%v", rule.DestinationLiterals, rule.DestinationAddresses)
+	}
+}
