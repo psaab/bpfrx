@@ -115,34 +115,31 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 	if cfg == nil || (len(cfg.Security.Policies) == 0 && len(cfg.Security.GlobalPolicies) == 0) {
 		return nil, nil
 	}
-	books, nameToID, err := buildAddressBookTableWithFeeds(cfg, feedOverlay)
+	_, nameToID, err := buildAddressBookTableWithFeeds(cfg, feedOverlay)
 	if err != nil {
 		return nil, err
-	}
-	// #3261: a book ID has representable content iff its built row carries at
-	// least one prefix. Keyed by ID (not row Name) because the table dedups by
-	// CONTENT — many declaring names (address aliases, address-set members)
-	// share one row, and nameToID maps EVERY such name to that row's ID while
-	// the row's Name field carries only the representative. Used (with the feed
-	// binding set below) to tell a genuinely-unrepresentable address (undefined
-	// name, or a static book whose value is a non-literal dns-name/wildcard/range
-	// -> empty row) apart from a feed-backed name whose CURRENT content may
-	// legitimately be empty (#2049).
-	idHasContent := make(map[uint32]bool, len(books))
-	for i := range books {
-		if len(books[i].PrefixesV4) > 0 || len(books[i].PrefixesV6) > 0 {
-			idHasContent[books[i].ID] = true
-		}
 	}
 	// addrRepresentable reports whether the userspace matcher can represent a
 	// single policy address token. A token is representable iff it is match-any,
 	// a valid literal CIDR/IP, a feed-bound name (in the overlay — an empty feed
 	// is MatchNone BY DESIGN per #2049, NOT unrepresentable), or a known book/
-	// address-set whose resolved content is non-empty. Everything else (an
-	// undefined book name, or a static book that resolves to no prefix) is
-	// unrepresentable and must reject the whole snapshot via the address
-	// sentinel rather than silently collapse the side to MatchNone (a deny
-	// fail-open). #3261.
+	// address-set that is STRUCTURALLY representable (nameRepresentable: every
+	// resolved member parses to a concrete prefix or is itself feed-bound).
+	//
+	// #3261: the structural check (not "row has >=1 prefix") is what closes the
+	// two fail-opens Codex caught. (A) An address-book entry whose value is a
+	// Junos dns-name / wildcard-address / range-address compiles to Value==""
+	// (compiler_validate_warn.go) and expandBookNameToCIDRs USED to widen "" to
+	// 0.0.0.0/0 — so a `deny <dns-name-book>` installed an overbroad deny-all
+	// and a `permit` widened to permit-any. (B) A book MIXING a literal and a
+	// dns-name member had row content from the literal, so a "row non-empty"
+	// check called it representable while the dns-name member was silently
+	// dropped (deny narrowing / under-match). nameRepresentable rejects BOTH
+	// (any unrepresentable member taints the name) so the address sentinel is
+	// emitted and the Rust preflight rejects the whole snapshot (previous-good
+	// retained / fresh-boot default-deny). A set that merely CONTAINS a
+	// feed-bound member stays representable (the member resolves via the overlay),
+	// so feeds are never falsely rejected.
 	addrRepresentable := func(tok string) bool {
 		switch tok {
 		case "", "any", "any4", "any6":
@@ -154,8 +151,8 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 		if _, feedBound := feedOverlay[tok]; feedBound {
 			return true
 		}
-		if id, known := nameToID[tok]; known {
-			return idHasContent[id]
+		if _, known := nameToID[tok]; known {
+			return nameRepresentable(cfg.Security.AddressBook, feedOverlay, tok, make(map[string]bool))
 		}
 		return false
 	}
@@ -744,7 +741,17 @@ func expandBookNameToCIDRs(cfg *config.Config, name string) ([]string, []string)
 	values := expandBookNameRecursive(ab, name, visited, 0)
 	var v4, v6 []string
 	for _, value := range values {
-		if value == "" || value == "any" {
+		if value == "" {
+			// #3261: an entry with no compiled prefix (a Junos dns-name /
+			// wildcard-address / range-address sub-stanza, or a genuinely empty
+			// entry) contributes NOTHING. It must NOT widen to 0.0.0.0/0 + ::/0
+			// (the pre-#3261 fail-open: an overbroad deny-all / a permit-any).
+			// The referencing policy is rejected upstream via nameRepresentable
+			// (the address sentinel -> whole-snapshot reject); this keeps the
+			// book row itself honest (match-nothing, per the Junos #2229 intent).
+			continue
+		}
+		if value == "any" {
 			v4 = append(v4, "0.0.0.0/0")
 			v6 = append(v6, "::/0")
 			continue
@@ -794,6 +801,77 @@ func expandBookNameRecursive(ab *config.AddressBook, name string, visited map[st
 		return out
 	}
 	return nil
+}
+
+// nameRepresentable reports whether an address-book name (Address or
+// AddressSet, recursively) is FULLY representable by the userspace matcher
+// (#3261). It is structural and content-independent: every resolved member must
+// be a feed-bound name (resolved via the snapshot overlay, #2049), or an
+// Address whose value parses to a concrete prefix (CIDR / bare IP / "any"), or
+// an AddressSet all of whose members are representable. An Address with an
+// empty or unparseable value (a Junos dns-name / wildcard-address /
+// range-address that compiled to Value=="") or an undefined reference makes the
+// name UNREPRESENTABLE — so buildOneRuleSnapshot emits the address sentinel and
+// the Rust preflight rejects the whole snapshot rather than (A) widening an
+// empty value to 0.0.0.0/0 match-any, or (B) silently dropping the
+// unrepresentable member of an otherwise-populated book (deny narrowing).
+// Because the check does not inspect the per-name feed-overlay merge, a set
+// that merely CONTAINS a feed member stays representable (no false reject).
+func nameRepresentable(ab *config.AddressBook, feedOverlay map[string][]string, name string, visited map[string]bool) bool {
+	if name == "" {
+		return false
+	}
+	if visited[name] {
+		// Cycle: matches expandBookNameRecursive's nil-on-revisit (no extra
+		// contribution) — do not let a self-referential set fail closed.
+		return true
+	}
+	if _, feedBound := feedOverlay[name]; feedBound {
+		return true
+	}
+	if ab == nil {
+		return false
+	}
+	if addr, ok := ab.Addresses[name]; ok {
+		return addressValueRepresentable(addr.Value)
+	}
+	set, ok := ab.AddressSets[name]
+	if !ok {
+		// Neither a static address/set nor a feed-bound name: an undefined
+		// reference is unrepresentable.
+		return false
+	}
+	visited[name] = true
+	defer delete(visited, name)
+	for _, member := range set.Addresses {
+		if !nameRepresentable(ab, feedOverlay, member, visited) {
+			return false
+		}
+	}
+	for _, nested := range set.AddressSets {
+		if !nameRepresentable(ab, feedOverlay, nested, visited) {
+			return false
+		}
+	}
+	return true
+}
+
+// addressValueRepresentable reports whether a single address-book entry VALUE
+// resolves to a concrete matcher prefix. Mirrors the value handling in
+// expandBookNameToCIDRs: "any" is match-any (representable); a CIDR or bare IP
+// is representable; an empty value (#3261: a dns-name/wildcard/range sub-stanza
+// that compiled to "") or any other unparseable token is NOT.
+func addressValueRepresentable(value string) bool {
+	switch value {
+	case "any":
+		return true
+	case "":
+		return false
+	}
+	if isV4CIDR(value) || isV6CIDR(value) {
+		return true
+	}
+	return net.ParseIP(value) != nil
 }
 
 func normalizeAnyInCIDRs(v4, v6 []string) ([]string, []string) {

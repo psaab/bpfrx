@@ -22348,3 +22348,39 @@ top.
   pkg/dataplane/userspace/lenient_keep_armed_3261_test.go,
   pkg/dataplane/userspace/feed_enforcement_test.go,
   docs/userspace-dataplane-gaps.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3261 review fold #2 (Codex 4th-reviewer, NEEDS-MAJOR) — close the
+  REAL address fail-open the prior fold missed for subcase-2b. Two distinct
+  bugs: (A) an address-book entry whose value is a Junos
+  dns-name/wildcard/range compiles to Value=="" (compiler_validate_warn.go),
+  and expandBookNameToCIDRs widened "" to 0.0.0.0/0 + ::/0 (match-any) -> a
+  `deny <dns-name-book>` installed an overbroad deny-all and a `permit` widened
+  to permit-any; idHasContent was therefore TRUE -> no sentinel -> no reject.
+  (B) a book MIXING a literal + a dns-name member had row content from the
+  literal -> "row non-empty" looked representable while the dns-name member was
+  silently dropped (deny narrowing). The prior test used Value:"www.example.com"
+  (parses to empty via the bare-IP path), NOT the real Value=="" shape, so it
+  missed (A). Fix: (1) expandBookNameToCIDRs skips an empty value (contributes
+  nothing; explicit `any` still -> 0.0.0.0/0); (2) replaced the "row has >=1
+  prefix" idHasContent check with a STRUCTURAL, content-independent,
+  feed-aware nameRepresentable (a name is representable iff every recursively
+  resolved member is feed-bound, an Address whose value parses to a concrete
+  prefix, or an AddressSet of representable members) -> any unrepresentable
+  member taints the name -> __unsupported_address__ sentinel -> whole-snapshot
+  reject; (3) mirrored the empty-value->match-nothing change in the
+  pkg/policymatch simulator (addCIDRValue) for show-match-policies parity.
+  nameRepresentable also REMOVES a feed-in-set false-positive the prior
+  idHasContent check had (a set containing a feed member is representable, not
+  rejected). Audited all expandBookNameToCIDRs consumers (only the book-table
+  builder; policymatch has a parallel copy, also fixed).
+  Validation: real-shape tests added (empty-value + partial-set sub-cases) +
+  explicit-`any` no-regression + a direct expandBookNameToCIDRs unit test;
+  fail-on-revert proven twice (revert Part A -> empty-expands-to-0.0.0.0/0 test
+  RED; revert the structural empty check -> empty-value + partial-set RED);
+  feed + empty-feed (#2049) guards green; full cargo test --release (0 failures
+  beyond the known concurrent_recovery flake), go build ./..., go test
+  ./pkg/dataplane/... ./pkg/config/... ./pkg/api/ ./pkg/policymatch/ green.
+  **File(s)**: pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/lenient_keep_armed_3261_test.go,
+  pkg/policymatch/policymatch.go, docs/userspace-dataplane-gaps.md

@@ -184,30 +184,57 @@ func TestFeedBackedAddressIsRepresentableNoSentinel(t *testing.T) {
 	}
 }
 
-// unrepresentableAddressCfg builds a config whose deny rule names an
-// unrepresentable DESTINATION address. Two sub-cases:
-//   - useDefinedBook=false: an UNDEFINED address-book name (classified as a
-//     literal the Rust matcher would silently drop).
-//   - useDefinedBook=true: a DEFINED book whose value is a non-literal Junos
-//     dns-name (classified as a book ID whose table entry the matcher would
-//     silently empty).
+// unrepresentableAddressCfg builds a config whose deny rule (over a
+// default-PERMIT, so a silently-dropped deny is a real fail-open) names an
+// unrepresentable DESTINATION address. kind selects the sub-case:
+//   - "undefined": an UNDEFINED address-book name.
+//   - "empty-value": a DEFINED book whose value is EMPTY — the REAL compiled
+//     shape of a Junos dns-name / wildcard-address / range-address sub-stanza
+//     (compiler_validate_warn.go). This is the path Codex caught: pre-fix
+//     expandBookNameToCIDRs widened "" to 0.0.0.0/0 match-any (overbroad
+//     deny-all / permit-any), so it was NOT rejected.
+//   - "unparseable-value": a DEFINED book whose value is a non-CIDR token.
+//   - "partial-set": an address-set MIXING a valid literal AND an empty-value
+//     (dns-name) member — pre-fix the literal gave the row content so the book
+//     looked representable while the dns-name member was silently dropped
+//     (deny narrowing). The whole set must be unrepresentable.
 //
-// Both make expandUserspacePolicyAddresses return ok=false, so the snapshot
-// must carry the __unsupported_address__ sentinel and stay armed (#3261).
-func unrepresentableAddressCfg(useDefinedBook bool) *config.Config {
+// All must make the snapshot carry the __unsupported_address__ sentinel and
+// stay armed (#3261).
+func unrepresentableAddressCfg(kind string) *config.Config {
 	cfg := &config.Config{}
-	cfg.Security.DefaultPolicy = config.PolicyPermit // default-PERMIT makes a dropped deny a real fail-open
+	cfg.Security.DefaultPolicy = config.PolicyPermit
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
 		"lan": {Name: "lan", Interfaces: []string{"reth1"}},
 		"wan": {Name: "wan", Interfaces: []string{"reth0.80"}},
 	}
 	dstName := "undefined-book"
-	if useDefinedBook {
+	switch kind {
+	case "empty-value":
 		dstName = "dns-book"
 		cfg.Security.AddressBook = &config.AddressBook{
 			Addresses: map[string]*config.Address{
-				// Non-literal value (a Junos dns-name) — not a CIDR/IP.
+				// REAL compiled shape: a dns-name/wildcard/range sub-stanza
+				// leaves Value=="" (no CIDR prefix).
+				"dns-book": {Name: "dns-book", Value: ""},
+			},
+		}
+	case "unparseable-value":
+		dstName = "dns-book"
+		cfg.Security.AddressBook = &config.AddressBook{
+			Addresses: map[string]*config.Address{
 				"dns-book": {Name: "dns-book", Value: "www.example.com"},
+			},
+		}
+	case "partial-set":
+		dstName = "mixed-set"
+		cfg.Security.AddressBook = &config.AddressBook{
+			Addresses: map[string]*config.Address{
+				"good-host":  {Name: "good-host", Value: "172.16.80.200/32"},
+				"dns-member": {Name: "dns-member", Value: ""}, // dns-name member
+			},
+			AddressSets: map[string]*config.AddressSet{
+				"mixed-set": {Name: "mixed-set", Addresses: []string{"good-host", "dns-member"}},
 			},
 		}
 	}
@@ -228,15 +255,9 @@ func unrepresentableAddressCfg(useDefinedBook bool) *config.Config {
 }
 
 func TestUnrepresentableAddressKeepsArmedAndCarriesSentinel(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		definedBook bool
-	}{
-		{"undefined-book-name", false},
-		{"defined-non-literal-book", true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := unrepresentableAddressCfg(tc.definedBook)
+	for _, kind := range []string{"undefined", "empty-value", "unparseable-value", "partial-set"} {
+		t.Run(kind, func(t *testing.T) {
+			cfg := unrepresentableAddressCfg(kind)
 			caps := deriveUserspaceCapabilities(cfg)
 			if !caps.ForwardingSupported {
 				t.Fatalf("ForwardingSupported = false, want true: an unrepresentable address must NOT disarm (#3261). UnsupportedReasons=%v", caps.UnsupportedReasons)
@@ -276,5 +297,75 @@ func TestUnrepresentableAddressKeepsArmedAndCarriesSentinel(t *testing.T) {
 				t.Fatalf("DestinationBookIDs = %v, want empty (sentinel override clears book IDs)", rule.DestinationBookIDs)
 			}
 		})
+	}
+}
+
+// TestExpandBookNameToCIDRsEmptyValueContributesNothing pins the root data bug
+// Codex caught (#3261 Part A): an address-book entry with an EMPTY value (the
+// compiled shape of a dns-name/wildcard/range sub-stanza) must contribute NO
+// prefix — it must NOT widen to 0.0.0.0/0 + ::/0 (match-any). Reverting the
+// expandBookNameToCIDRs fix makes this RED (the empty value becomes 0.0.0.0/0).
+func TestExpandBookNameToCIDRsEmptyValueContributesNothing(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.AddressBook = &config.AddressBook{
+		Addresses: map[string]*config.Address{
+			"dns-book": {Name: "dns-book", Value: ""},
+		},
+	}
+	v4, v6 := expandBookNameToCIDRs(cfg, "dns-book")
+	if len(v4) != 0 || len(v6) != 0 {
+		t.Fatalf("empty-value book expanded to v4=%v v6=%v, want both empty (must NOT widen to 0.0.0.0/0 match-any)", v4, v6)
+	}
+	// Explicit `any` must still widen to the full prefixes (no regression).
+	cfg.Security.AddressBook.Addresses["any-book"] = &config.Address{Name: "any-book", Value: "any"}
+	a4, a6 := expandBookNameToCIDRs(cfg, "any-book")
+	if len(a4) != 1 || a4[0] != "0.0.0.0/0" || len(a6) != 1 || a6[0] != "::/0" {
+		t.Fatalf("explicit `any` book expanded to v4=%v v6=%v, want [0.0.0.0/0] / [::/0]", a4, a6)
+	}
+}
+
+// TestExplicitAnyAddressBookIsMatchAnyNotRejected guards the Part-A boundary:
+// an address-book entry whose value is the explicit `any` keyword is legitimate
+// match-any (0.0.0.0/0 + ::/0), NOT unrepresentable. It must build a normal
+// expanded rule with no sentinel — only an EMPTY value (no prefix) is the
+// fail-open #3261 closes.
+func TestExplicitAnyAddressBookIsMatchAnyNotRejected(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.DefaultPolicy = config.PolicyDeny
+	cfg.Security.AddressBook = &config.AddressBook{
+		Addresses: map[string]*config.Address{
+			"any-book": {Name: "any-book", Value: "any"},
+		},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"lan": {Name: "lan", Interfaces: []string{"reth1"}},
+		"wan": {Name: "wan", Interfaces: []string{"reth0.80"}},
+	}
+	cfg.Security.Policies = []*config.ZonePairPolicies{{
+		FromZone: "lan",
+		ToZone:   "wan",
+		Policies: []*config.Policy{{
+			Name: "permit-any-book",
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"any-book"},
+				Applications:         []string{"any"},
+			},
+			Action: config.PolicyPermit,
+		}},
+	}}
+	snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	if len(snap.Capabilities.PolicyContentRejected) != 0 {
+		t.Fatalf("PolicyContentRejected = %v, want empty: an explicit `any` book is match-any, not unrepresentable", snap.Capabilities.PolicyContentRejected)
+	}
+	rule := snap.Policies[0]
+	if addressListHasSentinel(rule.DestinationLiterals) || addressListHasSentinel(rule.DestinationAddresses) {
+		t.Fatalf("explicit `any` book must NOT carry the address sentinel: lit=%v addr=%v", rule.DestinationLiterals, rule.DestinationAddresses)
+	}
+	if len(rule.DestinationBookIDs) == 0 {
+		t.Fatal("explicit `any` book must route through a book ID (the 0.0.0.0/0 + ::/0 row)")
 	}
 }

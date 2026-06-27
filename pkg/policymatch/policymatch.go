@@ -361,7 +361,14 @@ func resolveToken(cfg *config.Config, overlay map[string][]string, tok string) (
 // wildcard) and appends it to the appropriate family set / wildcard flag.
 func addCIDRValue(val string, v4nets, v6nets *[]*net.IPNet, anyV4, anyV6 *bool) {
 	switch val {
-	case "", "any":
+	case "":
+		// #3261: an address-book entry with no compiled prefix (a Junos
+		// dns-name / wildcard-address / range-address that compiled to
+		// Value=="") contributes NOTHING — it must NOT widen to match-any.
+		// Mirrors the dataplane's expandBookNameToCIDRs, which now skips an
+		// empty value instead of emitting 0.0.0.0/0 (the pre-#3261 fail-open).
+		return
+	case "any":
 		*anyV4 = true
 		*anyV6 = true
 		return
