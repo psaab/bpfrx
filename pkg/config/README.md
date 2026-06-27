@@ -265,13 +265,21 @@ book via the shared `parseAddressBookEntries`). Resolution order follows
 Junos scoping: a policy's `match source-address` resolves against its
 FROM-zone book first, `match destination-address` against its TO-zone book
 first, then both fall back to the global book. `resolveZoneLocalAddressBooks`
-(`compiler_security.go`, run at the end of `compileSecurity`) folds every
-zone-local entry into the global `SecurityConfig.AddressBook` under a
-`/`-separated zone-qualified internal name (`zone-local/<zone>/<name>` — both
-components are `/`-free so the synthetic name can never collide with an
-operator-typed identifier) and rewrites each policy match token that resolves
-zone-locally to that qualified name. A token NOT defined in the policy's zone
-book is left unchanged so it resolves against the global book. After this pass
+(`compiler_security.go`, run from `compileExpanded` after the name gate below)
+folds every zone-local entry into the global `SecurityConfig.AddressBook`
+under a `/`-separated zone-qualified internal name (`zone-local/<zone>/<name>`)
+and rewrites each policy match token that resolves zone-locally to that
+qualified name. A token NOT defined in the policy's zone book is left unchanged
+so it resolves against the global book. The synthetic `zone-local/` namespace
+is collision-proof: the lexer permits `/` in an identifier token (needed for
+IP literals like `10.0.0.0/24`), but `validateAddressBookEntryNamesStrict`
+(#3061, run BEFORE the fold on the pristine global book) hard-rejects `/` in
+any address-book entry name (global or zone-local) and any security-zone name
+at commit — matching Junos object-naming rules — so no operator-typed name can
+contain `/` and therefore none can equal a synthetic name (only the NAME is
+checked, never the address VALUE/prefix; the fold also skips an already-present
+key as a defence-in-depth no-clobber on the tolerant load path, which warns
+rather than rejects per #1960). After this pass
 the entire downstream path (wire snapshot, `nameToID`,
 `classifyPolicyAddresses`, the strict/warn validators, the
 `resolveUserspaceAddressBookEntry` runtime resolver) keeps operating on a

@@ -4079,3 +4079,82 @@ func validateHostInboundTokensStrict(cfg *Config) error {
 	}
 	return nil
 }
+
+// validateAddressBookEntryNamesStrict (#3061) hard-rejects a `/` character in
+// any address-book entry NAME — a global `address`/`address-set` name, a
+// zone-local `address`/`address-set` name — or any security-zone NAME. Junos
+// object-naming rules disallow `/` in such identifiers, but the xpf lexer
+// permits `/` in an identifier token (it is needed for IP-literal values like
+// 10.0.0.0/24), and no other validator rejected it.
+//
+// This is load-bearing for the zone-local address-book fold
+// (resolveZoneLocalAddressBooks): the fold mints synthetic global names of the
+// form zone-local/<zone>/<name>. If an operator could type a name containing
+// `/` (e.g. a global address literally named zone-local/trust/web-server),
+// that name could collide with a synthetic name and be silently clobbered by
+// the fold — wrong policy address resolution with no commit error. Rejecting
+// `/` in every operator-typed name makes the synthetic `zone-local/...`
+// namespace collision-proof.
+//
+// IMPORTANT: only the NAME token is checked, never an address VALUE/prefix —
+// `address web-server 10.0.0.0/24` is fine (the name is web-server; the
+// 10.0.0.0/24 prefix is the value, not validated here).
+//
+// MUST run on the PRISTINE global book, i.e. BEFORE resolveZoneLocalAddressBooks
+// injects the `/`-bearing synthetic names; the caller enforces that ordering.
+func validateAddressBookEntryNamesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	checkName := func(kind, name string) error {
+		if strings.Contains(name, "/") {
+			return fmt.Errorf(
+				"%s name %q must not contain '/'; '/' is reserved for "+
+					"address prefixes and for the internal zone-local "+
+					"address-book namespace — rename the object", kind, name)
+		}
+		return nil
+	}
+	checkBook := func(kind string, ab *AddressBook) error {
+		if ab == nil {
+			return nil
+		}
+		names := make([]string, 0, len(ab.Addresses)+len(ab.AddressSets))
+		for n := range ab.Addresses {
+			names = append(names, n)
+		}
+		for n := range ab.AddressSets {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			if err := checkName(kind, n); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if err := checkBook("address-book entry", cfg.Security.AddressBook); err != nil {
+		return err
+	}
+
+	zoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for z := range cfg.Security.Zones {
+		zoneNames = append(zoneNames, z)
+	}
+	sort.Strings(zoneNames)
+	for _, z := range zoneNames {
+		if err := checkName("security-zone", z); err != nil {
+			return err
+		}
+		zone := cfg.Security.Zones[z]
+		if zone == nil {
+			continue
+		}
+		if err := checkBook(fmt.Sprintf("security-zone %q address-book entry", z), zone.AddressBook); err != nil {
+			return err
+		}
+	}
+	return nil
+}

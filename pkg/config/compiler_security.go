@@ -174,14 +174,19 @@ func compileSecurity(node *Node, sec *SecurityConfig) error {
 			}
 		}
 	}
-	resolveZoneLocalAddressBooks(sec)
 	return nil
 }
 
 // zoneLocalNamePrefix marks a zone-qualified internal address-book name
 // minted by resolveZoneLocalAddressBooks (#3061). The `/` separators make
-// the synthetic name impossible to collide with an operator-typed Junos
-// identifier (zone names and address names cannot contain `/`).
+// the synthetic name collision-proof against operator-typed names: the lexer
+// permits `/` in an identifier (needed for IP literals like 10.0.0.0/24), but
+// validateAddressBookEntryNamesStrict hard-rejects `/` in any address-book
+// entry name and any security-zone name at commit, so no operator name can
+// contain `/` and therefore none can equal a synthetic `zone-local/...` name.
+// The fold also skips a key already present in the global book as a
+// defence-in-depth no-clobber for the tolerant load path (a persisted
+// pre-validator config that an older binary accepted).
 const zoneLocalNamePrefix = "zone-local/"
 
 // zoneLocalQualify mints the global-book key for a zone-local address-book
@@ -246,10 +251,16 @@ func resolveZoneLocalAddressBooks(sec *SecurityConfig) {
 		}
 		for name, addr := range z.AddressBook.Addresses {
 			q := zoneLocalQualify(zoneName, name)
+			if _, exists := gb.Addresses[q]; exists {
+				continue // no-clobber (see zoneLocalNamePrefix); strict path never hits this
+			}
 			gb.Addresses[q] = &Address{Name: q, Value: addr.Value, Description: addr.Description}
 		}
 		for name, set := range z.AddressBook.AddressSets {
 			q := zoneLocalQualify(zoneName, name)
+			if _, exists := gb.AddressSets[q]; exists {
+				continue // no-clobber (see zoneLocalNamePrefix)
+			}
 			ns := &AddressSet{Name: q}
 			for _, m := range set.Addresses {
 				if localDefines(zoneName, m) {

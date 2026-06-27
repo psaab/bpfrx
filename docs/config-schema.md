@@ -1442,14 +1442,28 @@ parses it into `ZoneConfig.AddressBook` via the shared
 **Resolution order (Junos scoping):** a policy's `match source-address`
 resolves against its FROM-zone book first, `match destination-address` against
 its TO-zone book first, then both fall back to the global book.
-`resolveZoneLocalAddressBooks` (run at the end of `compileSecurity`) folds
-every zone-local entry into the global `SecurityConfig.AddressBook` under a
-zone-qualified internal name (`zone-local/<zone>/<name>` — both components are
-`/`-free, so the synthetic name can never collide with an operator-typed
-identifier) and rewrites each policy match token that resolves zone-locally to
-that qualified name. A token NOT defined in the policy's zone book is left
-unchanged so it resolves against the global book; when a name exists in BOTH,
-the zone-local value WINS. After this pass the whole downstream resolution path
+`resolveZoneLocalAddressBooks` (run from `compileExpanded` after the name gate
+below) folds every zone-local entry into the global
+`SecurityConfig.AddressBook` under a zone-qualified internal name
+(`zone-local/<zone>/<name>`) and rewrites each policy match token that resolves
+zone-locally to that qualified name. A token NOT defined in the policy's zone
+book is left unchanged so it resolves against the global book; when a name
+exists in BOTH, the zone-local value WINS.
+
+**Collision-proof synthetic namespace:** the lexer permits `/` in an identifier
+token (it is needed for IP-literal VALUES like `10.0.0.0/24`), so without a
+guard an operator could name a global address `zone-local/trust/web-server` and
+have it silently clobbered by the fold. `validateAddressBookEntryNamesStrict`
+(run BEFORE the fold, on the pristine global book) hard-rejects `/` in any
+address-book entry NAME (global or zone-local `address`/`address-set`) and any
+security-zone NAME at commit — matching Junos object-naming rules — so no
+operator name can contain `/` and none can equal a synthetic `zone-local/...`
+name. Only the NAME is checked, never the address VALUE/prefix. Strict on
+commit / commit-check; the tolerant load / peer-sync path (`lenientAddressBookNames`)
+downgrades to a warning (#1960 no-brick), backstopped by the fold's
+no-clobber guard (it skips a global-book key that already exists).
+
+After this pass the whole downstream resolution path
 (wire snapshot, `nameToID`, `classifyPolicyAddresses`, the strict/warn
 validators, the `resolveUserspaceAddressBookEntry` runtime resolver) keeps
 operating on a single flat global book.
@@ -1462,7 +1476,13 @@ Junos treats an undefined reference. NAT rule address-name references
 scoped to security-policy match addresses. Regression coverage:
 `pkg/dataplane/userspace/zone_local_addressbook_3061_test.go`
 (`TestZoneLocalAddressBookResolves` — fail-on-revert resolution guard,
-`TestZoneLocalAddressBookScoping` — precedence + cross-zone isolation).
+`TestZoneLocalAddressBookScoping` — precedence + cross-zone isolation) and
+`pkg/config/addressbook_name_slash_3061_test.go`
+(`TestAddressBookGlobalNameSlashRejected`,
+`TestAddressBookZoneLocalNameSlashRejected`,
+`TestSecurityZoneNameSlashRejected` — collision-safety fail-on-revert guards,
+`TestAddressBookNameSlashNormalConfigUnaffected` — prefix-value anti-over-reject,
+`TestAddressBookNameSlashLenientDowngrades` — tolerant-path warning).
 
 ### #2399 — firewall-filter unknown `then` action + unsupported `from protocol` (commit fail-closed)
 

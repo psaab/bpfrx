@@ -21841,3 +21841,24 @@ top.
   pkg/config/compiler_security.go,
   pkg/dataplane/userspace/zone_local_addressbook_3061_test.go,
   pkg/config/README.md, docs/config-schema.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3061 review fold (NEEDS-MINOR) — close the synthetic-name
+  collision hole. The lexer permits `/` in identifiers (for IP literals), so an
+  operator could name a global address `zone-local/trust/web-server` and have
+  the zone-local fold silently clobber it (wrong resolution, no commit error).
+  Added validateAddressBookEntryNamesStrict (compiler_validate_strict.go):
+  hard-rejects `/` in any address-book entry NAME (global + zone-local
+  address/address-set) and any security-zone NAME — only the NAME, never the
+  address VALUE/prefix. Strict on commit; lenientAddressBookNames downgrades to
+  a warning on tolerant load/peer-sync (#1960). Moved resolveZoneLocalAddressBooks
+  out of compileSecurity into compileExpanded so the name gate runs on the
+  PRISTINE global book BEFORE the fold injects `/`-bearing synthetic names; added
+  a no-clobber guard in the fold (skip an existing global-book key). Tightened
+  the now-true collision-proof claim in the comment + README + config-schema. 5
+  new tests (3 reject = fail-on-revert RED, normal-config anti-over-reject incl.
+  prefix value with `/`, lenient downgrade).
+  **File(s)**: pkg/config/compiler.go, pkg/config/compiler_security.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/addressbook_name_slash_3061_test.go,
+  pkg/config/README.md, docs/config-schema.md
