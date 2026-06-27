@@ -569,6 +569,163 @@ fn nptv6_source_composes_with_dnat_decision() {
     assert!(reverse.nptv6, "reverse decision must keep the nptv6 flag");
 }
 
+// #3233: a checksum-neutral prefix pair (internal and external prefixes with
+// EQUAL ones-complement sums) precomputes an adjustment of ones-complement zero.
+// `compute_adjustment` represents that zero as 0xFFFF (negative zero), NOT the
+// literal 0x0000 the issue text used. Pin the actual value so the fail-on-revert
+// guard below targets the real trigger.
+#[test]
+fn checksum_neutral_pair_has_ones_complement_zero_adjustment() {
+    // 2001:db8:1 and 2001:1:db8 share the same word set -> equal ones-complement
+    // sums -> checksum-neutral, but DIFFERENT prefixes (not the trivial identity
+    // pair).
+    let internal = [0x2001u16, 0x0db8, 0x0001, 0x0000];
+    let external = [0x2001u16, 0x0001, 0x0db8, 0x0000];
+    let adj = compute_adjustment(&internal, &external, 3);
+    assert_eq!(
+        adj, 0xFFFF,
+        "a checksum-neutral pair must yield ones-complement-zero (0xFFFF), \
+         not the literal 0x0000 — adjust_word would otherwise corrupt a 0xFFFF host word"
+    );
+    assert!(is_zero_adjustment(adj));
+    // The general (non-neutral) case must NOT be treated as zero.
+    let g_int = [0xfd00u16, 0x0001, 0x0000, 0x0000];
+    let g_ext = [0x2001u16, 0x0db8, 0x0001, 0x0000];
+    let gadj = compute_adjustment(&g_int, &g_ext, 3);
+    assert_ne!(gadj, 0);
+    assert!(!is_zero_adjustment(gadj));
+}
+
+// #3233 fail-on-revert (THE bug): a checksum-neutral /48 prefix pair and a host
+// whose adjustment word (word[3]) is 0xFFFF. Outbound must swap the prefix and
+// leave word[3] == 0xFFFF (NOT fold it to 0x0000). Revert the adj==zero skip in
+// translate_outbound -> word[3] collapses to 0x0000 -> this assert goes RED.
+#[test]
+fn checksum_neutral_0xffff_host_word_survives_outbound() {
+    let state = Nptv6State::from_snapshots(&[Nptv6RuleSnapshot {
+        name: "neutral".to_string(),
+        from_zone: String::new(),
+        // Same word set, different ordering -> equal ones-complement sums.
+        internal_prefix: "2001:db8:1::/48".to_string(),
+        external_prefix: "2001:1:db8::/48".to_string(),
+    }]);
+    // word[3] = 0xffff (the adjustment word for a /48).
+    let mut src: Ipv6Addr = "2001:db8:1:ffff::1".parse().unwrap();
+    assert!(state.translate_outbound(&mut src));
+    let words = ipv6_to_words(&src);
+    // Prefix swapped to external.
+    assert_eq!(words[0], 0x2001);
+    assert_eq!(words[1], 0x0001);
+    assert_eq!(words[2], 0x0db8);
+    // The adjustment word MUST survive identity (the #3233 bug folded it to 0).
+    assert_eq!(
+        words[3], 0xffff,
+        "checksum-neutral pair must leave the 0xFFFF host word identity, not fold to 0x0000"
+    );
+    assert_eq!(words[7], 1);
+}
+
+// #3233 fail-on-revert (collision): the 0xFFFF host and the 0x0000 host must
+// translate to DISTINCT external addresses. Pre-fix both collapsed to a word[3]
+// of 0x0000, so return traffic for the 0xFFFF host was misdelivered.
+#[test]
+fn checksum_neutral_0xffff_and_0x0000_hosts_stay_distinct() {
+    let state = Nptv6State::from_snapshots(&[Nptv6RuleSnapshot {
+        name: "neutral".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "2001:db8:1::/48".to_string(),
+        external_prefix: "2001:1:db8::/48".to_string(),
+    }]);
+    let mut host_ffff: Ipv6Addr = "2001:db8:1:ffff::1".parse().unwrap();
+    let mut host_0000: Ipv6Addr = "2001:db8:1:0:0:0:0:1".parse().unwrap();
+    assert!(state.translate_outbound(&mut host_ffff));
+    assert!(state.translate_outbound(&mut host_0000));
+    assert_ne!(
+        host_ffff, host_0000,
+        "the 0xFFFF host must not collapse onto the 0x0000 host (the #3233 collision)"
+    );
+    assert_eq!(ipv6_to_words(&host_ffff)[3], 0xffff);
+    assert_eq!(ipv6_to_words(&host_0000)[3], 0x0000);
+}
+
+// #3233 round-trip: for a checksum-neutral pair, outbound then inbound is
+// identity even for a 0xFFFF host word. Revert the inbound skip -> the 0xFFFF
+// host is never restored (inbound folds to 0x0000) and this RED.
+#[test]
+fn checksum_neutral_round_trip_preserves_0xffff_host() {
+    let state = Nptv6State::from_snapshots(&[Nptv6RuleSnapshot {
+        name: "neutral".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "2001:db8:1::/48".to_string(),
+        external_prefix: "2001:1:db8::/48".to_string(),
+    }]);
+    for addr_str in [
+        "2001:db8:1:ffff::1",
+        "2001:db8:1:0:0:0:0:1",
+        "2001:db8:1:abcd:1234:5678:9abc:def0",
+    ] {
+        let original: Ipv6Addr = addr_str.parse().unwrap();
+        let mut addr = original;
+        assert!(state.translate_outbound(&mut addr));
+        assert!(state.translate_inbound(&mut addr));
+        assert_eq!(addr, original, "checksum-neutral round-trip failed for {original}");
+    }
+    // Inbound on an external dst with a 0xFFFF host word also survives.
+    let mut dst: Ipv6Addr = "2001:1:db8:ffff::9".parse().unwrap();
+    assert!(state.translate_inbound(&mut dst));
+    let words = ipv6_to_words(&dst);
+    assert_eq!(words[0], 0x2001);
+    assert_eq!(words[1], 0x0db8);
+    assert_eq!(words[2], 0x0001);
+    assert_eq!(words[3], 0xffff, "inbound must leave the 0xFFFF host word identity");
+}
+
+// #3233 checksum neutrality is preserved for a neutral pair WITHOUT any word
+// fixup: the ones-complement sum over all 8 words is unchanged by the pure
+// prefix swap.
+#[test]
+fn checksum_neutral_pair_is_checksum_neutral_without_fixup() {
+    let state = Nptv6State::from_snapshots(&[Nptv6RuleSnapshot {
+        name: "neutral".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "2001:db8:1::/48".to_string(),
+        external_prefix: "2001:1:db8::/48".to_string(),
+    }]);
+    let original: Ipv6Addr = "2001:db8:1:ffff::42".parse().unwrap();
+    let orig_sum = ones_complement_sum(&ipv6_to_words(&original));
+    let mut translated = original;
+    assert!(state.translate_outbound(&mut translated));
+    let xlat_sum = ones_complement_sum(&ipv6_to_words(&translated));
+    assert_eq!(
+        orig_sum, xlat_sum,
+        "checksum-neutral prefix swap must remain checksum-neutral with no word fixup"
+    );
+}
+
+// #3233 NO-REGRESSION: the general (non-neutral) case keeps the RFC-6296
+// 0xFFFF -> 0x0000 fold. Pin an existing general-case translation: the
+// adjustment is nonzero, so adjust_word still runs and the result is never
+// 0xFFFF.
+#[test]
+fn general_case_still_folds_0xffff_to_0x0000() {
+    let state = Nptv6State::from_snapshots(&[Nptv6RuleSnapshot {
+        name: "general".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "fd00:1::/48".to_string(),
+        external_prefix: "2001:db8:1::/48".to_string(),
+    }]);
+    // This pair is NOT checksum-neutral.
+    let internal = [0xfd00u16, 0x0001, 0x0000, 0x0000];
+    let external = [0x2001u16, 0x0db8, 0x0001, 0x0000];
+    let adj = compute_adjustment(&internal, &external, 3);
+    assert!(!is_zero_adjustment(adj), "general case must not be ones-complement zero");
+    // Outbound on a host whose word[3] folds to 0xFFFF still becomes 0x0000 and
+    // is never left at 0xFFFF (the RFC 6296 convention for the general case).
+    let mut src: Ipv6Addr = "fd00:1:0:abcd::1".parse().unwrap();
+    assert!(state.translate_outbound(&mut src));
+    assert_ne!(ipv6_to_words(&src)[3], 0xFFFF, "adjusted word must never be 0xFFFF");
+}
+
 /// Compute ones-complement sum of 8 words (for checksum neutrality test).
 fn ones_complement_sum(words: &[u16; 8]) -> u16 {
     let mut sum: u32 = 0;

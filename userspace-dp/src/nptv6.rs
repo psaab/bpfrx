@@ -9,6 +9,16 @@
 //! - Adjust the next word (word[3] for /48, word[4] for /64) using
 //!   ones-complement arithmetic to maintain checksum neutrality.
 //! - If the adjusted word becomes 0xFFFF, replace with 0x0000.
+//! - **#3233 corner (RFC 6296 §3.7):** when the internal and external prefixes
+//!   have EQUAL ones-complement sums (a *checksum-neutral* prefix pair) the
+//!   precomputed adjustment is ones-complement zero, so NO interface-ID word
+//!   fixup is required — the translation is a pure prefix swap. The fixup is
+//!   SKIPPED in that case ([`adjust_word`] is not applied). Applying it anyway
+//!   would fold a host whose adjustment word is 0xFFFF down to 0x0000 (and the
+//!   inbound side never restores it), collapsing that host onto the 0x0000
+//!   host. Note that `compute_adjustment` represents ones-complement zero as
+//!   `0xFFFF` (NOT `0x0000`) for a checksum-neutral pair — see
+//!   [`is_zero_adjustment`].
 //!
 //! Two module invariants the rest of the crate relies on:
 //!
@@ -98,6 +108,24 @@ fn adjust_word(word: u16, adj: u16) -> u16 {
     sum = (sum & 0xFFFF) + (sum >> 16);
     let result = sum as u16;
     if result == 0xFFFF { 0x0000 } else { result }
+}
+
+/// #3233: is the precomputed RFC 6296 adjustment ones-complement ZERO?
+///
+/// A *checksum-neutral* prefix pair (internal and external prefixes with equal
+/// ones-complement sums) needs no interface-ID word fixup — the translation is a
+/// pure prefix swap. [`compute_adjustment`] represents that zero as `0xFFFF`
+/// (negative zero in ones-complement: `S + !S = 0xFFFF`), and it never produces
+/// the positive-zero `0x0000` representation, but both are accepted defensively.
+///
+/// When this holds the translator MUST skip [`adjust_word`]: applying it would
+/// fold a host whose adjustment word is `0xFFFF` to `0x0000` outbound and never
+/// restore it inbound, collapsing the `0xFFFF` host onto the `0x0000` host. The
+/// RFC-6296-mandated `0xFFFF -> 0x0000` fold is preserved for the general
+/// (non-neutral, adjustment != ones-complement-zero) case.
+#[inline]
+fn is_zero_adjustment(adj: u16) -> bool {
+    adj == 0x0000 || adj == 0xFFFF
 }
 
 /// Extract 16-bit words from an Ipv6Addr.
@@ -282,9 +310,15 @@ impl Nptv6State {
                     words[i] = rule.internal_prefix[i];
                 }
                 // Adjust the word after the prefix: inbound uses ~adjustment.
-                let adj_word = if rule.prefix_words >= 4 { 4 } else { 3 };
-                let inv_adj = !rule.adjustment; // ones-complement NOT
-                words[adj_word] = adjust_word(words[adj_word], inv_adj);
+                // #3233: skip the fixup entirely for a checksum-neutral prefix
+                // pair (ones-complement-zero adjustment) so a valid 0xFFFF
+                // host-ID word survives the round trip; a pure prefix swap is
+                // already checksum-neutral.
+                if !is_zero_adjustment(rule.adjustment) {
+                    let adj_word = if rule.prefix_words >= 4 { 4 } else { 3 };
+                    let inv_adj = !rule.adjustment; // ones-complement NOT
+                    words[adj_word] = adjust_word(words[adj_word], inv_adj);
+                }
                 *dst = words_to_ipv6(&words);
                 return true;
             }
@@ -304,8 +338,14 @@ impl Nptv6State {
                     words[i] = rule.external_prefix[i];
                 }
                 // Adjust the word after the prefix: outbound uses adjustment directly.
-                let adj_word = if rule.prefix_words >= 4 { 4 } else { 3 };
-                words[adj_word] = adjust_word(words[adj_word], rule.adjustment);
+                // #3233: skip the fixup entirely for a checksum-neutral prefix
+                // pair (ones-complement-zero adjustment) — the prefix swap is
+                // already checksum-neutral, and applying adjust_word would fold
+                // a valid 0xFFFF host-ID word to 0x0000.
+                if !is_zero_adjustment(rule.adjustment) {
+                    let adj_word = if rule.prefix_words >= 4 { 4 } else { 3 };
+                    words[adj_word] = adjust_word(words[adj_word], rule.adjustment);
+                }
                 *src = words_to_ipv6(&words);
                 return true;
             }

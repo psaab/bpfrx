@@ -2115,6 +2115,55 @@ fn try_match_rule(
             };
             (src_ok, dst_ok)
         }
+        // #2358: cross-family NAT64 inbound tuple — IPv6 source (the v6
+        // client) with the POST-translation IPv4 destination (the real
+        // internal server the synthetic NAT64 address was extracted to).
+        // Junos/SRX evaluates the inbound security policy AFTER destination
+        // translation, so a NAT64 policy is authored against the real IPv4
+        // host + its destination zone, with the source matched in the IPv6
+        // ingress zone. The forwarding path (poll_descriptor) feeds this
+        // mixed tuple ONLY for NAT64 (the source stays v6, the dst is the
+        // extracted v4); no other flow produces a (V6 src, V4 dst) tuple,
+        // so this arm is inert for non-NAT64 traffic. The source side
+        // matches the rule's IPv6 source set; the destination side matches
+        // the rule's IPv4 destination set. The `*-excluded` empty-set
+        // fail-closed and per-family any-match semantics mirror the
+        // same-family arms above.
+        (IpAddr::V6(src), IpAddr::V4(dst)) => {
+            let src_ok = if rule.source_excluded {
+                !(rule.source_v4_empty && rule.source_v6_empty)
+                    && !(rule.source_literal_v6.contains(src)
+                        || rule
+                            .source_book_idxs
+                            .iter()
+                            .any(|&i| state.books[i as usize].v6.contains(src)))
+            } else {
+                rule.source_v6_match_any
+                    || rule.source_literal_v6.contains(src)
+                    || rule
+                        .source_book_idxs
+                        .iter()
+                        .any(|&i| state.books[i as usize].v6.contains(src))
+            };
+            let dst_ok = if rule.destination_excluded {
+                !(rule.destination_v4_empty && rule.destination_v6_empty)
+                    && !(rule.destination_literal_v4.contains(dst)
+                        || rule
+                            .destination_book_idxs
+                            .iter()
+                            .any(|&i| state.books[i as usize].v4.contains(dst)))
+            } else {
+                rule.destination_v4_match_any
+                    || rule.destination_literal_v4.contains(dst)
+                    || rule
+                        .destination_book_idxs
+                        .iter()
+                        .any(|&i| state.books[i as usize].v4.contains(dst))
+            };
+            (src_ok, dst_ok)
+        }
+        // (V4 src, V6 dst) has no inbound translation that produces it
+        // (NAT46 is not supported), so it never matches — fail closed.
         _ => return None,
     };
     if src_ok && dst_ok {

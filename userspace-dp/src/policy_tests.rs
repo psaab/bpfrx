@@ -3717,3 +3717,196 @@ fn global_policy_explicit_any_matches_all_zones() {
     assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Permit);
     assert_eq!(eval(&state, TEST_UNTRUST_ZONE_ID, TEST_TRUST_ZONE_ID), PolicyAction::Permit);
 }
+// === #2358: NAT64 inbound cross-family (V6 src, V4 dst) policy matching ===
+//
+// For an inbound NAT64 flow the source remains the IPv6 client while the
+// destination is translated to the real internal IPv4 host BEFORE the
+// security-policy lookup (Junos/SRX order of operations). The forwarding
+// path therefore evaluates the policy on a mixed (V6 src, V4 dst) tuple.
+// These tests pin that a policy authored against the real IPv4 destination
+// permits the flow, and that a policy authored only against the synthetic
+// IPv6 NAT64 prefix no longer spuriously matches the translated tuple.
+
+#[test]
+fn nat64_inbound_policy_matches_real_v4_destination() {
+    // from-zone wan (v6 ingress) -> to-zone lan (v4 server zone). The
+    // operator writes the policy against the REAL internal v4 host.
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            name: "permit-nat64-to-v4-host".to_string(),
+            from_zone: "wan".to_string(),
+            to_zone: "lan".to_string(),
+            source_addresses: vec!["2001:559:8585:ef00::/64".to_string()],
+            destination_addresses: vec!["172.16.80.200/32".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    // (V6 src, V4 dst): the post-translation tuple the dataplane feeds for
+    // a NAT64 flow. FAIL-ON-REVERT: drop the policy.rs (V6 src, V4 dst)
+    // arm and this returns Deny (mixed tuple matches no rule).
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_WAN_ZONE_ID,
+            TEST_LAN_ZONE_ID,
+            "2001:559:8585:ef00::100".parse().expect("v6 src"),
+            "172.16.80.200".parse().expect("translated v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Permit,
+        "NAT64 inbound must match the real translated IPv4 destination"
+    );
+}
+
+#[test]
+fn nat64_inbound_policy_v6_source_any_dest_v4_host() {
+    // `source-address any` (family-unscoped) must still admit the v6
+    // source against the v4-destination rule.
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            name: "permit-any-to-v4-host".to_string(),
+            from_zone: "wan".to_string(),
+            to_zone: "lan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["172.16.80.200/32".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_WAN_ZONE_ID,
+            TEST_LAN_ZONE_ID,
+            "2001:559:8585:ef00::100".parse().expect("v6 src"),
+            "172.16.80.200".parse().expect("translated v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Permit,
+        "source-address any must admit a v6 NAT64 source to the v4 host"
+    );
+}
+
+#[test]
+fn nat64_inbound_policy_specific_to_wrong_v4_host_denies() {
+    // A policy scoped to a DIFFERENT real IPv4 host must NOT match the
+    // translated destination — proving the v4 destination is actually
+    // matched (not blanket match-any). With a concrete v4 prefix the
+    // destination v4 set is non-empty, so the legacy "empty family =
+    // match-any" convention does not apply and the wrong host falls to the
+    // default deny.
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            name: "permit-other-v4-host".to_string(),
+            from_zone: "wan".to_string(),
+            to_zone: "lan".to_string(),
+            source_addresses: vec!["2001:559:8585:ef00::/64".to_string()],
+            destination_addresses: vec!["172.16.80.201/32".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_WAN_ZONE_ID,
+            TEST_LAN_ZONE_ID,
+            "2001:559:8585:ef00::100".parse().expect("v6 src"),
+            "172.16.80.200".parse().expect("translated v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "a policy scoped to a different v4 host must not match the translated dst"
+    );
+}
+
+#[test]
+fn nat64_inbound_wrong_v6_source_denies() {
+    // The v6 source side is still matched against the rule's IPv6 source
+    // set: a v6 client outside the configured source prefix must be denied
+    // even when the v4 destination matches.
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            name: "permit-scoped-v6-src".to_string(),
+            from_zone: "wan".to_string(),
+            to_zone: "lan".to_string(),
+            source_addresses: vec!["2001:559:8585:ef00::/64".to_string()],
+            destination_addresses: vec!["172.16.80.200/32".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_WAN_ZONE_ID,
+            TEST_LAN_ZONE_ID,
+            "2001:dead::1".parse().expect("off-prefix v6 src"),
+            "172.16.80.200".parse().expect("translated v4 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "a v6 source outside the configured prefix must be denied"
+    );
+}
+
+#[test]
+fn nat46_v4_src_v6_dst_tuple_never_matches() {
+    // The reverse cross-family tuple (V4 src, V6 dst) has no inbound
+    // translation that produces it (NAT46 unsupported) and must fail
+    // closed regardless of how permissive the rule is.
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            name: "permit-all".to_string(),
+            from_zone: "wan".to_string(),
+            to_zone: "lan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_WAN_ZONE_ID,
+            TEST_LAN_ZONE_ID,
+            "10.0.61.100".parse().expect("v4 src"),
+            "2001:559:8585:80::200".parse().expect("v6 dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "(V4 src, V6 dst) must never match — NAT46 is unsupported"
+    );
+}
