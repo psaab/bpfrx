@@ -444,7 +444,10 @@ func hostInboundProtocolMatches(token, family string) []string {
 	case "vrrp":
 		return []string{"meta l4proto 112"}
 	case "bfd":
-		return []string{"udp dport { 3784, 3785 }"}
+		// #3299: single-hop control (3784) + echo (3785) AND multi-hop
+		// control (4784, RFC 5883). Keep this set in lockstep with the
+		// AF_XDP host_inbound classifier (host_inbound.rs "bfd" arm).
+		return []string{"udp dport { 3784, 3785, 4784 }"}
 	case "ldp":
 		return []string{"tcp dport 646", "udp dport 646"}
 	case "msdp":

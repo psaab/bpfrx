@@ -67,6 +67,26 @@ func TestHostInboundNftMatchesKnownTokens(t *testing.T) {
 	}
 }
 
+// TestHostInboundBfdAdmitsMultiHop asserts the nft host-inbound rule for
+// `protocols bfd` admits multi-hop BFD control (UDP 4784, RFC 5883) in addition
+// to single-hop control (3784) + echo (3785). Operators running BFD-assisted
+// multi-hop BGP (or BFD over multi-hop static routes) to the firewall depend on
+// 4784 reaching the host (#3299). This must stay in lockstep with the AF_XDP
+// host_inbound classifier ("bfd" arm in host_inbound.rs). Fail-on-revert:
+// dropping 4784 from the dport set turns this RED.
+func TestHostInboundBfdAdmitsMultiHop(t *testing.T) {
+	matches := hostInboundProtocolMatches("bfd", "ip")
+	if len(matches) == 0 {
+		t.Fatalf("bfd produced no nft match for ip family")
+	}
+	joined := strings.Join(matches, " ; ")
+	for _, port := range []string{"3784", "3785", "4784"} {
+		if !strings.Contains(joined, port) {
+			t.Errorf("bfd nft match %q missing UDP dport %s (single-hop 3784/echo 3785 + multi-hop 4784 RFC 5883)", joined, port)
+		}
+	}
+}
+
 // TestHostInboundEmptyStanzaFailsClosed asserts that a host-inbound-CONFIGURED
 // zone whose stanza yields zero recognized matches (an empty
 // `host-inbound-traffic { }`, or — on the tolerant load path — a zone whose

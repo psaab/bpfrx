@@ -1109,6 +1109,60 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
     );
 }
 
+// #3299: `host-inbound-traffic protocols bfd` must admit multi-hop BFD control
+// (UDP 4784, RFC 5883) in addition to single-hop control (3784) + echo (3785).
+// Multi-hop BFD (for multi-hop BGP / BFD over multi-hop static routes) carries
+// control packets on UDP/4784; before this fix the "bfd" arm inserted only
+// 3784/3785 so 4784 was denied by host-inbound admission. Fail-on-revert:
+// removing `hi.udp_ports.insert(4784)` from the "bfd" arm in host_inbound.rs
+// turns the 4784-admit assertion RED. Keep in lockstep with the nft rule
+// (`hostInboundProtocolMatches` "bfd", pkg/daemon/daemon_nft.go).
+#[test]
+fn build_forwarding_state_bfd_admits_multihop_control() {
+    use crate::ZoneSnapshot;
+    use crate::afxdp::forwarding::host_inbound_admits;
+
+    let snapshot = ConfigSnapshot {
+        zones: vec![ZoneSnapshot {
+            name: "wan".into(),
+            id: 41,
+            host_inbound_configured: true,
+            host_inbound_system_services: vec![],
+            host_inbound_protocols: vec!["bfd".into()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let state = build_forwarding_state(&snapshot);
+    assert!(state.zone_host_inbound.contains_key(&41));
+
+    // Single-hop control (3784) + echo (3785) still admitted.
+    assert!(
+        host_inbound_admits(&state, 41, 17, 3784, false, 0),
+        "bfd single-hop control udp/3784 admitted"
+    );
+    assert!(
+        host_inbound_admits(&state, 41, 17, 3785, false, 0),
+        "bfd echo udp/3785 admitted"
+    );
+    // Multi-hop control (4784, RFC 5883) admitted — the #3299 fix.
+    assert!(
+        host_inbound_admits(&state, 41, 17, 4784, false, 0),
+        "bfd multi-hop control udp/4784 (RFC 5883) admitted"
+    );
+    // Also admitted on IPv6 (BFD runs over both families).
+    assert!(
+        host_inbound_admits(&state, 41, 17, 4784, true, 0),
+        "bfd multi-hop control udp/4784 admitted on v6"
+    );
+    // A non-BFD UDP port stays DENIED (the arm did not open all of UDP).
+    assert!(
+        !host_inbound_admits(&state, 41, 17, 4783, false, 0),
+        "bfd zone does not admit unrelated udp/4783"
+    );
+}
+
 // #3171: a CONFIGURED ping-less zone must still admit ICMP/ICMPv6 ERROR /
 // PMTUD control messages (destination-unreachable, packet-too-big, time-
 // exceeded, parameter-problem) reaching the XSK LocalDelivery path — mirroring
