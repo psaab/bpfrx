@@ -128,15 +128,56 @@ the OPPOSITE of what the dataplane actually enforces (a dangerous bug for a
 The semantics replicate `userspace-dp/src/policy.rs`
 (`evaluate_policy_result_with_len` + `try_match_rule` + `parse_v3_literal_set`
 + `CompiledApplications`) fed by the Go snapshot builder
-(`pkg/dataplane/userspace/policies.go`). Precedence: **exact zone-pair → global
-→ configured default-policy**. Address matching honors literal CIDRs, address
+(`pkg/dataplane/userspace/policies.go`). Transit precedence, first-match
+terminating:
+
+1. **exact zone-pair** (both zones concrete);
+2. **single-wildcard tier** (#3090) — `from-zone any to-zone <X>` and
+   `from-zone <X> to-zone any`, merged in config order;
+3. **both-any** (#3090) — `from-zone any to-zone any`;
+4. **global** (`junos-global`), gated by the optional `match from-zone` /
+   `match to-zone` scope (#3148): an empty/`any` scope applies to every zone, a
+   typo'd/undefined-zone scope fails closed (matches nothing);
+5. **configured default-policy**.
+
+A `to-zone junos-host` query takes the separate **host gate** (#3285,
+`matchJunosHost` ↔ `evaluate_junos_host_policy`): exact `from-zone <ingress>
+to-zone junos-host` then `from-zone any to-zone junos-host`, with **no** global
+or default transit fallback (and `to-zone any` / `from-zone any to-zone any` are
+NOT pulled onto the host path). An unmatched host-bound flow returns
+`Result.HostInboundUnmatched` — local delivery proceeds (the management lifeline
+guarantee), never an inherited transit verdict. The surfaces render this as
+"host-inbound: local delivery proceeds (transit global/default-policy NOT
+applied)"; the gRPC `MatchPolicies` response carries it as
+`host_inbound_unmatched`.
+
+Surface asymmetry (intentional, not a bug): for a host-inbound-unmatched
+result the REST `match-policies` response fills `action` with the descriptive
+string "host-inbound (local delivery; not governed by transit/global/default
+policy)" so a bare REST consumer reads a meaningful verdict, whereas the gRPC
+`MatchPolicies` response leaves `action` EMPTY and sets `matched=false` +
+`host_inbound_unmatched=true`, delegating the wording to the client (the remote
+CLI formats the two-line host-inbound message above). Both convey the same
+"no transit verdict applies" fact; they differ only in where the human string is
+composed.
+
+Address matching honors literal CIDRs, address
 books (recursive set expansion), `any`/`any-ipv4`/`any-ipv6`, source/destination
 exclusion (with the #2008 empty-excluded fail-closed rule), and the live
 dynamic-address feed overlay (`Query.FeedOverlay`, supplied by the daemon via
 `feeds.Manager.SnapshotForBindings`). Application matching resolves predefined +
 user apps via `config.ResolveApplication`, expands application-sets recursively
 via `config.ExpandApplicationSet`, compares protocols by IANA number via
-`appid.ProtocolNumber`, and honors both source-port and destination-port terms.
+`appid.ProtocolNumber`, honors both source-port and destination-port terms, and
+enforces ICMP/ICMPv6 type/code constraints (#3284, junos-ping = type 8,
+junos-pingv6 = type 128) from `Query.ICMPType` / `Query.ICMPCode`. A
+type-constrained application term matches only when the query's type is known
+and equal (and the code too, when the term constrains a code); a query that
+omits the type fails closed for that term, mirroring the dataplane's
+`packet_icmp = None` path. An unconstrained ICMP application (junos-icmp-all) is
+unaffected. The surfaces accept the type/code as `icmp_type`/`icmp_code` (REST
+query, gRPC `MatchPolicies` optional fields), `icmp-type`/`icmp-code` (CLI
+tokens), and `ictype=`/`iccode=` (gRPC `test policy` topic).
 
 Where the runtime and the old simulators disagreed, the runtime wins.
 

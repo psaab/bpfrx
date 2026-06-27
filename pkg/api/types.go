@@ -241,6 +241,11 @@ type MatchPoliciesResult struct {
 	SrcAddresses []string `json:"src_addresses,omitempty"`
 	DstAddresses []string `json:"dst_addresses,omitempty"`
 	Applications []string `json:"applications,omitempty"`
+	// HostInboundUnmatched is true for a `to-zone junos-host` query that matched
+	// no host-bound policy (#3285): the dataplane host gate returns None (local
+	// delivery; no transit global/default fallback), so Action is not a
+	// default-policy verdict for this case.
+	HostInboundUnmatched bool `json:"host_inbound_unmatched,omitempty"`
 }
 
 // ClearSessionsResult holds session clear results.

@@ -5992,7 +5992,14 @@ type MatchPoliciesRequest struct {
 	Protocol        string                 `protobuf:"bytes,6,opt,name=protocol,proto3" json:"protocol,omitempty"`
 	// source_port lets the simulator honor source-port-constrained application
 	// terms (#3042). 0 = unspecified (does not constrain the match).
-	SourcePort    int32 `protobuf:"varint,7,opt,name=source_port,json=sourcePort,proto3" json:"source_port,omitempty"`
+	SourcePort int32 `protobuf:"varint,7,opt,name=source_port,json=sourcePort,proto3" json:"source_port,omitempty"`
+	// icmp_type / icmp_code let the simulator honor ICMP/ICMPv6 type-constrained
+	// application terms (#3284, junos-ping = type 8). proto3 `optional` so the
+	// simulator can distinguish "unspecified" (a type-constrained app term then
+	// fails closed, mirroring the dataplane's packet_icmp = None) from a valid
+	// type/code 0 (ICMP type 0 = echo-reply).
+	IcmpType      *uint32 `protobuf:"varint,8,opt,name=icmp_type,json=icmpType,proto3,oneof" json:"icmp_type,omitempty"`
+	IcmpCode      *uint32 `protobuf:"varint,9,opt,name=icmp_code,json=icmpCode,proto3,oneof" json:"icmp_code,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6076,16 +6083,37 @@ func (x *MatchPoliciesRequest) GetSourcePort() int32 {
 	return 0
 }
 
+func (x *MatchPoliciesRequest) GetIcmpType() uint32 {
+	if x != nil && x.IcmpType != nil {
+		return *x.IcmpType
+	}
+	return 0
+}
+
+func (x *MatchPoliciesRequest) GetIcmpCode() uint32 {
+	if x != nil && x.IcmpCode != nil {
+		return *x.IcmpCode
+	}
+	return 0
+}
+
 type MatchPoliciesResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	PolicyName    string                 `protobuf:"bytes,1,opt,name=policy_name,json=policyName,proto3" json:"policy_name,omitempty"`
-	Action        string                 `protobuf:"bytes,2,opt,name=action,proto3" json:"action,omitempty"`
-	SrcAddresses  []string               `protobuf:"bytes,3,rep,name=src_addresses,json=srcAddresses,proto3" json:"src_addresses,omitempty"`
-	DstAddresses  []string               `protobuf:"bytes,4,rep,name=dst_addresses,json=dstAddresses,proto3" json:"dst_addresses,omitempty"`
-	Applications  []string               `protobuf:"bytes,5,rep,name=applications,proto3" json:"applications,omitempty"`
-	Matched       bool                   `protobuf:"varint,6,opt,name=matched,proto3" json:"matched,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	PolicyName   string                 `protobuf:"bytes,1,opt,name=policy_name,json=policyName,proto3" json:"policy_name,omitempty"`
+	Action       string                 `protobuf:"bytes,2,opt,name=action,proto3" json:"action,omitempty"`
+	SrcAddresses []string               `protobuf:"bytes,3,rep,name=src_addresses,json=srcAddresses,proto3" json:"src_addresses,omitempty"`
+	DstAddresses []string               `protobuf:"bytes,4,rep,name=dst_addresses,json=dstAddresses,proto3" json:"dst_addresses,omitempty"`
+	Applications []string               `protobuf:"bytes,5,rep,name=applications,proto3" json:"applications,omitempty"`
+	Matched      bool                   `protobuf:"varint,6,opt,name=matched,proto3" json:"matched,omitempty"`
+	// host_inbound_unmatched is true ONLY for a `to-zone junos-host` query that
+	// matched no host-bound policy (#3285). The dataplane host gate returns None
+	// here — no implicit host default-deny and NO transit global/default
+	// fallback — so local delivery proceeds. When set, `matched` is false and
+	// `action` is empty; clients must render "host-inbound (local delivery; not
+	// governed by transit/global/default policy)", NOT a default-policy verdict.
+	HostInboundUnmatched bool `protobuf:"varint,7,opt,name=host_inbound_unmatched,json=hostInboundUnmatched,proto3" json:"host_inbound_unmatched,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *MatchPoliciesResponse) Reset() {
@@ -6156,6 +6184,13 @@ func (x *MatchPoliciesResponse) GetApplications() []string {
 func (x *MatchPoliciesResponse) GetMatched() bool {
 	if x != nil {
 		return x.Matched
+	}
+	return false
+}
+
+func (x *MatchPoliciesResponse) GetHostInboundUnmatched() bool {
+	if x != nil {
+		return x.HostInboundUnmatched
 	}
 	return false
 }
@@ -7426,7 +7461,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\x05state\x18\x03 \x01(\tR\x05state\x12\x1a\n" +
 	"\bpriority\x18\x04 \x01(\x05R\bpriority\x12+\n" +
 	"\x11virtual_addresses\x18\x05 \x03(\tR\x10virtualAddresses\x12\x18\n" +
-	"\apreempt\x18\x06 \x01(\bR\apreempt\"\xf8\x01\n" +
+	"\apreempt\x18\x06 \x01(\bR\apreempt\"\xd8\x02\n" +
 	"\x14MatchPoliciesRequest\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12\x1b\n" +
@@ -7435,7 +7470,13 @@ const file_xpf_proto_rawDesc = "" +
 	"\x10destination_port\x18\x05 \x01(\x05R\x0fdestinationPort\x12\x1a\n" +
 	"\bprotocol\x18\x06 \x01(\tR\bprotocol\x12\x1f\n" +
 	"\vsource_port\x18\a \x01(\x05R\n" +
-	"sourcePort\"\xd8\x01\n" +
+	"sourcePort\x12 \n" +
+	"\ticmp_type\x18\b \x01(\rH\x00R\bicmpType\x88\x01\x01\x12 \n" +
+	"\ticmp_code\x18\t \x01(\rH\x01R\bicmpCode\x88\x01\x01B\f\n" +
+	"\n" +
+	"_icmp_typeB\f\n" +
+	"\n" +
+	"_icmp_code\"\x8e\x02\n" +
 	"\x15MatchPoliciesResponse\x12\x1f\n" +
 	"\vpolicy_name\x18\x01 \x01(\tR\n" +
 	"policyName\x12\x16\n" +
@@ -7443,7 +7484,8 @@ const file_xpf_proto_rawDesc = "" +
 	"\rsrc_addresses\x18\x03 \x03(\tR\fsrcAddresses\x12#\n" +
 	"\rdst_addresses\x18\x04 \x03(\tR\fdstAddresses\x12\"\n" +
 	"\fapplications\x18\x05 \x03(\tR\fapplications\x12\x18\n" +
-	"\amatched\x18\x06 \x01(\bR\amatched\"N\n" +
+	"\amatched\x18\x06 \x01(\bR\amatched\x124\n" +
+	"\x16host_inbound_unmatched\x18\a \x01(\bR\x14hostInboundUnmatched\"N\n" +
 	"\x16GetNATRuleStatsRequest\x12\x19\n" +
 	"\brule_set\x18\x01 \x01(\tR\aruleSet\x12\x19\n" +
 	"\bnat_type\x18\x02 \x01(\tR\anatType\"E\n" +
@@ -7850,6 +7892,7 @@ func file_xpf_proto_init() {
 	if File_xpf_proto != nil {
 		return
 	}
+	file_xpf_proto_msgTypes[101].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

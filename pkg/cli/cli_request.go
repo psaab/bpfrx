@@ -179,6 +179,7 @@ func (c *CLI) testPolicy(args []string) error {
 
 	var fromZone, toZone, srcIP, dstIP, proto string
 	var srcPort, dstPort int
+	var icmpType, icmpCode *uint8
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "from-zone":
@@ -230,6 +231,26 @@ func (c *CLI) testPolicy(args []string) error {
 				i++
 				proto = args[i]
 			}
+		case "icmp-type":
+			if i+1 < len(args) {
+				i++
+				// #3284: thread an ICMP/ICMPv6 type into the shared matcher so a
+				// type-constrained app term (junos-ping = type 8) is honored.
+				v, err := policymatch.ParseICMPValue(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid icmp-type: %w", err)
+				}
+				icmpType = v
+			}
+		case "icmp-code":
+			if i+1 < len(args) {
+				i++
+				v, err := policymatch.ParseICMPValue(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid icmp-code: %w", err)
+				}
+				icmpCode = v
+			}
 		}
 	}
 
@@ -261,11 +282,12 @@ func (c *CLI) testPolicy(args []string) error {
 	parsedSrc := net.ParseIP(srcIP)
 	parsedDst := net.ParseIP(dstIP)
 
-	// #3042: delegate to the single shared simulator (zone-pair -> global ->
-	// default-policy). The pre-#3042 loop hard-coded "Default deny" (ignoring
-	// default-policy permit-all) and used a narrow address/app matcher that
-	// missed predefined apps, nested application-sets, literal CIDRs,
-	// any-ipv4/any-ipv6, and source/destination exclusion.
+	// #3042: delegate to the single shared simulator (exact zone-pair ->
+	// wildcard-zone tiers (#3090) -> scoped global (#3148) -> default-policy).
+	// The pre-#3042 loop hard-coded "Default deny" (ignoring default-policy
+	// permit-all) and used a narrow address/app matcher that missed predefined
+	// apps, nested application-sets, literal CIDRs, any-ipv4/any-ipv6, and
+	// source/destination exclusion.
 	// #3105: pass the live dynamic-address feed-prefix overlay so a feed-backed
 	// address-name resolves to its live CIDRs on-box, matching the REST/gRPC
 	// simulators and the AF_XDP helper. Nil (CLI outside the daemon) keeps the
@@ -278,11 +300,19 @@ func (c *CLI) testPolicy(args []string) error {
 		Protocol:    proto,
 		SrcPort:     srcPort,
 		DstPort:     dstPort,
+		ICMPType:    icmpType,
+		ICMPCode:    icmpCode,
 		FeedOverlay: c.feedOverlay(),
 		// #3104: skip scheduler-inactive policies like the runtime does, so the
 		// simulator falls through to the next active rule / default-policy.
 		PolicyInactiveFn: c.policyInactiveFn(),
 	})
+	if res.HostInboundUnmatched {
+		// #3285: host-bound traffic — no transit global/default fallback.
+		fmt.Printf("No matching to-zone junos-host policy for %s -> junos-host\n", fromZone)
+		fmt.Printf("  host-inbound: local delivery proceeds (transit global/default-policy NOT applied)\n")
+		return nil
+	}
 	if !res.Matched {
 		fmt.Printf("Default %s (no matching policy for %s -> %s)\n",
 			policymatch.ActionString(res.Action), fromZone, toZone)

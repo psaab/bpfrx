@@ -22359,6 +22359,44 @@ top.
   docs/junos-cli-reference.md
 
 - **Timestamp**: 2026-06-27
+  **Action**: #3283 — policymatch simulator parity with dataplane wildcard-zone (#3090) and scoped-global (#3148) precedence. Restructured Match() into the dataplane tier chain: exact zone-pair -> single-wildcard (from-any/to-any merged in config order) -> both-any -> global (gated by the optional #3148 from/to-zone match scope, undefined-zone scope fails closed) -> default. Added globalScopeMatches replicating GlobalZoneScope::matches + build_global_zone_scope. Updated stale precedence comments on every surface and the README. Added fail-on-revert table tests.
+  **File(s)**: pkg/policymatch/policymatch.go,
+  pkg/policymatch/wildcard_scoped_test.go,
+  pkg/policymatch/README.md, pkg/api/security.go,
+  pkg/cli/cli_request.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_show_firewall.go
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3284 — policymatch simulator now enforces ICMP/ICMPv6 type/code application constraints (junos-ping = type 8, junos-pingv6 = type 128) like the dataplane (policy.rs CompiledApplications.matches). Added Query.ICMPType/ICMPCode (*uint8), enforcement in matchSingleApp (fail-closed when the query omits the type for a type-constrained term), and the ParseICMPValue shared parser. Plumbed type/code through every simulator surface: proto3 optional icmp_type/icmp_code on MatchPoliciesRequest (regenerated), REST icmp_type/icmp_code query params, gRPC test-policy ictype=/iccode= topic keys, and CLI/remote-CLI icmp-type/icmp-code tokens. Added fail-on-revert table tests.
+  **File(s)**: pkg/policymatch/policymatch.go,
+  pkg/policymatch/icmp_test.go, pkg/policymatch/README.md,
+  proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/grpcapi/server_cluster.go, pkg/grpcapi/server_show_firewall.go,
+  pkg/api/security.go, pkg/cli/cli_request.go,
+  pkg/cli/cli_show_security.go, cmd/cli/main.go, cmd/cli/show.go
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3285 — policymatch simulator now mirrors the dataplane host gate (evaluate_junos_host_policy) for to-zone junos-host queries: exact from-zone <ingress> to-zone junos-host then from-zone any to-zone junos-host, with NO global/default transit fallback (and to-zone any / both-any NOT consulted). Added Match() branch + matchJunosHost + Result.HostInboundUnmatched; surfaced through REST (host_inbound_unmatched JSON), gRPC MatchPolicies (new proto bool field), gRPC test-policy text, and local/remote CLI rendering. Added fail-on-revert tests.
+  **File(s)**: pkg/policymatch/policymatch.go,
+  pkg/policymatch/junos_host_test.go, pkg/policymatch/README.md,
+  proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/grpcapi/server_cluster.go, pkg/grpcapi/server_show_firewall.go,
+  pkg/api/security.go, pkg/api/types.go, pkg/cli/cli_request.go,
+  pkg/cli/cli_show_security.go, cmd/cli/show.go
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3287 — resolveZoneLocalAddressBooks now rewrites a scoped global policy's (#3148) source/dest address tokens under its match from-zone/to-zone scope, so a zone-local (#3061) address reference in a scoped global resolves to the zone-qualified global-book entry instead of silently match-none / commit-reject. Unscoped globals (empty/any scope) are left to the global book. Both the simulator (pkg/policymatch) and the dataplane snapshot builder consume the post-fold book, keeping them in agreement. Added a fail-on-revert test that compiles a real config and asserts the simulator resolves the zone-local ref.
+  **File(s)**: pkg/config/compiler_security.go,
+  pkg/policymatch/scoped_global_zonelocal_test.go,
+  docs/config-schema.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: PR #3289 quad-review fold (5 findings). (1) Remote CLI `show security match-policies` no-match path now renders the server-provided resp.Action ("<action> (default)") instead of hard-coded "default deny" — the #3283 drift class on the remote surface (wrong verdict under default-policy permit-all). (2) Remote CLI icmp-type/icmp-code now route through policymatch.ParseICMPValue and return an explicit error on invalid/out-of-range input (was a silent inline strconv.Atoi drop). (3) Corrected the stale matchApp docstring (now documents the empty-protocol match-any short-circuit as a diagnostic convenience and the ICMP type/code enforcement). (4) matchSingleApp now gates an ICMP-type-constrained app term on the query being ICMP(1)/ICMPv6(58) so a type-constrained term cannot match a TCP/UDP flow (mirrors the dataplane keying icmp_constraints under the ICMP protocol). (5) Documented the intentional REST-vs-gRPC Action asymmetry for host-inbound-unmatched in the policymatch README. Added 3 fail-on-revert tests (all RED on revert).
+  **File(s)**: cmd/cli/show.go, cmd/cli/nontty_test.go,
+  cmd/cli/show_matchpolicies_test.go, pkg/policymatch/policymatch.go,
+  pkg/policymatch/icmp_test.go, pkg/policymatch/README.md
+
+- **Timestamp**: 2026-06-27
   **Action**: #3286 — surface scoped-global-policy zone context (#3148
   `match from-zone`/`to-zone`) on every policy inventory/show surface.
   Previously only the dataplane enforced the scope; REST, gRPC, and CLI

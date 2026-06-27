@@ -296,6 +296,7 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 	//                   destination-port <p> protocol <proto>
 	var fromZone, toZone, srcIP, dstIP, proto string
 	var dstPort, srcPort int
+	var icmpType, icmpCode *uint8
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "from-zone":
@@ -340,6 +341,26 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 			if i+1 < len(args) {
 				i++
 				proto = args[i]
+			}
+		case "icmp-type":
+			if i+1 < len(args) {
+				i++
+				// #3284: honor ICMP/ICMPv6 type-constrained app terms
+				// (junos-ping = type 8).
+				v, err := policymatch.ParseICMPValue(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid icmp-type: %w", err)
+				}
+				icmpType = v
+			}
+		case "icmp-code":
+			if i+1 < len(args) {
+				i++
+				v, err := policymatch.ParseICMPValue(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid icmp-code: %w", err)
+				}
+				icmpCode = v
 			}
 		}
 	}
@@ -391,11 +412,19 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 		Protocol:    proto,
 		SrcPort:     srcPort,
 		DstPort:     dstPort,
+		ICMPType:    icmpType,
+		ICMPCode:    icmpCode,
 		FeedOverlay: c.feedOverlay(),
 		// #3104: skip scheduler-inactive policies like the runtime does, so the
 		// simulator falls through to the next active rule / default-policy.
 		PolicyInactiveFn: c.policyInactiveFn(),
 	})
+	if res.HostInboundUnmatched {
+		// #3285: host-bound traffic — no transit global/default fallback.
+		fmt.Printf("No matching to-zone junos-host policy for %s -> junos-host\n", fromZone)
+		fmt.Printf("  host-inbound: local delivery proceeds (transit global/default-policy NOT applied)\n")
+		return nil
+	}
 	if !res.Matched {
 		fmt.Printf("No matching policy found for %s -> %s (default %s)\n",
 			fromZone, toZone, policymatch.ActionString(res.Action))

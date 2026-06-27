@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/policymatch"
 )
 
 func (c *ctl) handleShow(args []string) error {
@@ -924,6 +925,35 @@ func (c *ctl) showMatchPolicies(args []string) error {
 				i++
 				req.Protocol = args[i]
 			}
+		case "icmp-type":
+			if i+1 < len(args) {
+				i++
+				// #3284: thread an ICMP/ICMPv6 type so a type-constrained app
+				// term (junos-ping = type 8) is honored by the backend matcher.
+				// Route through the shared validator so an invalid/out-of-range
+				// token errors instead of silently dropping to the unconstrained
+				// nil wildcard (mirrors every other surface).
+				v, err := policymatch.ParseICMPValue(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid icmp-type: %w", err)
+				}
+				if v != nil {
+					u := uint32(*v)
+					req.IcmpType = &u
+				}
+			}
+		case "icmp-code":
+			if i+1 < len(args) {
+				i++
+				v, err := policymatch.ParseICMPValue(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid icmp-code: %w", err)
+				}
+				if v != nil {
+					u := uint32(*v)
+					req.IcmpCode = &u
+				}
+			}
 		}
 	}
 
@@ -946,8 +976,18 @@ func (c *ctl) showMatchPolicies(args []string) error {
 		fmt.Printf("    Destination addresses: %v\n", resp.DstAddresses)
 		fmt.Printf("    Applications: %v\n", resp.Applications)
 		fmt.Printf("    Action: %s\n", resp.Action)
+	} else if resp.HostInboundUnmatched {
+		// #3285: host-bound traffic — no transit global/default fallback.
+		fmt.Printf("No matching to-zone junos-host policy for %s -> junos-host\n", req.FromZone)
+		fmt.Printf("  host-inbound: local delivery proceeds (transit global/default-policy NOT applied)\n")
 	} else {
-		fmt.Printf("No matching policy found for %s -> %s (default deny)\n", req.FromZone, req.ToZone)
+		// #3283: render the SERVER-provided default verdict (resp.Action carries
+		// "<action> (default)" from the configured default-policy), NOT a
+		// hard-coded "default deny". Under `default-policy permit-all` the old
+		// literal reported the OPPOSITE of the dataplane — the same simulator
+		// drift class #3283 fixes — and diverged from the local CLI / gRPC text
+		// surfaces, which already report resp.Action.
+		fmt.Printf("No matching policy found for %s -> %s (%s)\n", req.FromZone, req.ToZone, resp.Action)
 	}
 	return nil
 }

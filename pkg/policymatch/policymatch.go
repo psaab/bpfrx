@@ -57,6 +57,21 @@ import (
 // MaxPort is the largest valid TCP/UDP port number.
 const MaxPort = 65535
 
+// icmpProtoNum / icmpv6ProtoNum are the IANA protocol numbers for ICMP and
+// ICMPv6. They gate an ICMP-type-constrained application term (#3284) so it can
+// only match an ICMP-family flow, mirroring the dataplane keying its
+// icmp_constraints under the ICMP protocol (policy.rs CompiledApplications).
+const (
+	icmpProtoNum   uint8 = 1
+	icmpv6ProtoNum uint8 = 58
+)
+
+// JunosHostZone is the reserved self-traffic zone name. A query whose ToZone is
+// this name is host-bound (LocalDelivery) traffic; it is evaluated by the
+// dataplane's separate host gate (evaluate_junos_host_policy), not the transit
+// precedence chain. See matchJunosHost / Result.HostInboundUnmatched (#3285).
+const JunosHostZone = "junos-host"
+
 // ValidatePort checks an already-parsed simulator port value (the gRPC int32
 // field and the REST query int, which arrive numeric). A zero value means
 // "unspecified" — the port dimension is not constrained, the established
@@ -94,6 +109,30 @@ func ParsePort(s string) (int, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+// ParseICMPValue parses an operator-supplied ICMP type or code token (#3284)
+// into a *uint8 the simulator threads into Query.ICMPType / Query.ICMPCode. An
+// empty/whitespace token means "unspecified" and returns (nil, nil) — the
+// dimension is not constrained, the established wildcard behavior. A non-empty
+// token must parse to an integer in [0, 255] (the 8-bit ICMP type/code space);
+// a malformed, negative, or >255 token is REJECTED with an error so it can
+// never silently degrade to the nil wildcard. The pointer return distinguishes
+// "unspecified" from a valid 0 (ICMP type 0 = echo-reply, code 0 is common).
+func ParseICMPValue(s string) (*uint8, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return nil, fmt.Errorf("invalid icmp type/code %q", s)
+	}
+	if n < 0 || n > 255 {
+		return nil, fmt.Errorf("icmp type/code %d out of range (0-255)", n)
+	}
+	v := uint8(n)
+	return &v, nil
 }
 
 // ValidateProtocol checks an explicitly-supplied simulator protocol token. An
@@ -141,6 +180,21 @@ type Query struct {
 	SrcPort  int
 	DstPort  int
 
+	// ICMPType / ICMPCode carry the query packet's ICMP/ICMPv6 type and code
+	// (#3284). They mirror the dataplane's per-packet `packet_icmp` tuple
+	// (policy.rs evaluate_policy_result_with_icmp): a type-constrained
+	// application term (junos-ping = ICMP type 8, junos-pingv6 = ICMPv6
+	// type 128) matches ONLY when the query's type is known and equal (and the
+	// code too, when the term constrains a code). A nil ICMPType means the
+	// query did not specify a type: a type-constrained term then fails closed
+	// (does NOT match), exactly like the runtime passing `packet_icmp = None`.
+	// An UNCONSTRAINED ICMP application (junos-icmp-all) is unaffected by these
+	// fields — it matches every ICMP packet on protocol alone. Pointers
+	// distinguish "unspecified" from a valid type/code 0 (ICMP type 0 is
+	// echo-reply, code 0 is common), which a plain int could not.
+	ICMPType *uint8
+	ICMPCode *uint8
+
 	// FeedOverlay is the dynamic-address feed-prefix overlay (#2049): an
 	// address-name -> union-of-live-feed-CIDR-strings map, the same shape the
 	// snapshot builder consumes (feeds.Manager.SnapshotForBindings). When a
@@ -183,6 +237,17 @@ type Result struct {
 	// default-policy.
 	DefaultUsed bool
 
+	// HostInboundUnmatched is true ONLY for a `to-zone junos-host` query that
+	// matched no host-bound policy (#3285). The dataplane host gate
+	// (evaluate_junos_host_policy) returns None here — there is no implicit
+	// host default-deny and NO transit global/default fallback, so local
+	// delivery proceeds (the management lifeline). Matched is false and
+	// DefaultUsed is false; callers must render this as "host-inbound, not
+	// governed by transit/global/default policy", NOT as the default-policy
+	// verdict. Action is unset (PolicyPermit zero value) and carries no
+	// meaning in this case.
+	HostInboundUnmatched bool
+
 	PolicyName   string
 	Description  string
 	Action       config.PolicyAction
@@ -192,31 +257,93 @@ type Result struct {
 }
 
 // Match runs the simulator against the active config and returns the verdict
-// with the same precedence the runtime enforces: an exact zone-pair policy
-// match wins first, then a global policy, then the configured default-policy.
+// with the SAME precedence the runtime enforces (userspace-dp/src/policy.rs
+// evaluate_policy_result_with_icmp / try_match_rule), first-match terminating:
+//
+//  1. exact zone-pair (both zones concrete)
+//  2. single-wildcard tier — `from-zone any to-zone <X>` and
+//     `from-zone <X> to-zone any`, MERGED in config order (#3090)
+//  3. both-any — `from-zone any to-zone any` (#3090)
+//  4. global (`junos-global`), gated by the optional `match from-zone` /
+//     `match to-zone` scope (#3148); an empty/`any` scope applies to every
+//     zone, an undefined-zone scope fails closed (matches nothing)
+//  5. configured default-policy
+//
+// A `to-zone junos-host` query is host-bound and takes the separate host-gate
+// path (matchJunosHost, #3285): exact ingress->junos-host then
+// `from-zone any`->junos-host, with NO global/default transit fallback.
 func Match(cfg *config.Config, q Query) Result {
 	if cfg == nil {
 		return Result{DefaultUsed: true, Action: config.PolicyDeny}
 	}
 
-	// 1) Exact zone-pair policies, in config order (first match wins).
+	// #3285: host-bound (LocalDelivery) traffic is governed by the dataplane's
+	// host gate, which does NOT apply transit global/default fallback. Branch
+	// before the transit tiers so that invariant cannot regress.
+	if q.ToZone == JunosHostZone {
+		return matchJunosHost(cfg, q)
+	}
+
+	// Tier 1: exact zone-pair policies, in config order (first match wins).
+	// q.FromZone/q.ToZone are concrete zone names; a wildcard set
+	// (FromZone/ToZone == "any") never compares equal, so it is excluded here.
 	for _, zpp := range cfg.Security.Policies {
 		if zpp == nil || zpp.FromZone != q.FromZone || zpp.ToZone != q.ToZone {
 			continue
 		}
 		for _, pol := range zpp.Policies {
-			if pol == nil {
-				continue
-			}
-			if ruleMatches(cfg, q, pol) {
+			if pol != nil && ruleMatches(cfg, q, pol) {
 				return matchedResult(pol, false)
 			}
 		}
 	}
 
-	// 2) Global policies (junos-global), in config order.
+	// Tier 2: single-wildcard tier (#3090) — `from-zone any to-zone <q.ToZone>`
+	// OR `from-zone <q.FromZone> to-zone any`, MERGED in config order. The
+	// dataplane two-pointer-merges its from_any/to_any index buckets by global
+	// rule index; the snapshot builder (walkPolicyRuleSlots) emits rules in
+	// cfg.Security.Policies slice order with each set's policies contiguous, so
+	// a single in-order pass over the sets reproduces that merge exactly.
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		fromAny := zpp.FromZone == "any"
+		toAny := zpp.ToZone == "any"
+		if fromAny == toAny {
+			continue // both-any (Tier 3) or neither (Tier 1) — not single-wildcard
+		}
+		applies := (fromAny && zpp.ToZone == q.ToZone) || (toAny && zpp.FromZone == q.FromZone)
+		if !applies {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol != nil && ruleMatches(cfg, q, pol) {
+				return matchedResult(pol, false)
+			}
+		}
+	}
+
+	// Tier 3: both-any (`from-zone any to-zone any`), in config order.
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil || zpp.FromZone != "any" || zpp.ToZone != "any" {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol != nil && ruleMatches(cfg, q, pol) {
+				return matchedResult(pol, false)
+			}
+		}
+	}
+
+	// Tier 4: global policies (junos-global), in config order, gated by the
+	// optional #3148 from-zone/to-zone match scope.
 	for _, pol := range cfg.Security.GlobalPolicies {
 		if pol == nil {
+			continue
+		}
+		if !globalScopeMatches(cfg, pol.Match.FromZone, q.FromZone) ||
+			!globalScopeMatches(cfg, pol.Match.ToZone, q.ToZone) {
 			continue
 		}
 		if ruleMatches(cfg, q, pol) {
@@ -224,8 +351,61 @@ func Match(cfg *config.Config, q Query) Result {
 		}
 	}
 
-	// 3) Configured default-policy (NOT a hard-coded deny).
+	// Tier 5: configured default-policy (NOT a hard-coded deny).
 	return Result{DefaultUsed: true, Action: cfg.Security.DefaultPolicy}
+}
+
+// matchJunosHost mirrors the dataplane host gate evaluate_junos_host_policy
+// (policy.rs) for a `to-zone junos-host` query (#3285). It consults ONLY exact
+// `from-zone <ingress> to-zone junos-host` rules, then the
+// `from-zone any to-zone junos-host` wildcard — in that order. There is NO
+// implicit host default-deny and NO global / transit-default fallback: an
+// unmatched host-bound flow falls through to local delivery (the management
+// lifeline guarantee), so the simulator returns HostInboundUnmatched rather
+// than inheriting the transit global/default verdict. `to-zone any` and
+// `from-zone any to-zone any` are deliberately NOT pulled onto the host path,
+// matching the runtime gate.
+func matchJunosHost(cfg *config.Config, q Query) Result {
+	// Exact ingress -> junos-host.
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil || zpp.ToZone != JunosHostZone || zpp.FromZone != q.FromZone {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol != nil && ruleMatches(cfg, q, pol) {
+				return matchedResult(pol, false)
+			}
+		}
+	}
+	// from-zone any -> junos-host.
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil || zpp.ToZone != JunosHostZone || zpp.FromZone != "any" {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol != nil && ruleMatches(cfg, q, pol) {
+				return matchedResult(pol, false)
+			}
+		}
+	}
+	// No host-bound rule matched: local delivery proceeds. Do NOT fall through
+	// to global/default — the dataplane host gate returns None here.
+	return Result{HostInboundUnmatched: true}
+}
+
+// globalScopeMatches replicates GlobalZoneScope::matches + build_global_zone_scope
+// (policy.rs, #3148). An empty or explicit "any" scope applies to every zone.
+// Any other name must resolve to a DEFINED zone and equal the flow's zone; an
+// undefined (typo'd, or reserved like junos-host) scope fails closed — it
+// matches nothing, never silently widening to all-zones.
+func globalScopeMatches(cfg *config.Config, scopeZone, flowZone string) bool {
+	if scopeZone == "" || scopeZone == "any" {
+		return true
+	}
+	if _, ok := cfg.Security.Zones[scopeZone]; !ok {
+		return false // Unresolved → matches nothing
+	}
+	return scopeZone == flowZone
 }
 
 func matchedResult(pol *config.Policy, global bool) Result {
@@ -258,7 +438,7 @@ func ruleMatches(cfg *config.Config, q Query, pol *config.Policy) bool {
 	if !matchAddr(cfg, q.FeedOverlay, pol.Match.DestinationAddresses, pol.Match.DestinationAddressExcluded, q.DstIP) {
 		return false
 	}
-	return matchApp(cfg, pol.Match.Applications, q.Protocol, q.SrcPort, q.DstPort)
+	return matchApp(cfg, pol.Match.Applications, q.Protocol, q.SrcPort, q.DstPort, q.ICMPType, q.ICMPCode)
 }
 
 // matchAddr replicates policy.rs try_match_rule's per-side address logic.
@@ -437,12 +617,18 @@ func expandBookName(cfg *config.Config, name string, visited map[string]bool) []
 // matchApp replicates policy.rs CompiledApplications.matches fed by the
 // snapshot builder's application expansion: predefined + user applications via
 // ResolveApplication, recursive application-set expansion via
-// ExpandApplicationSet, and BOTH source-port and destination-port terms.
+// ExpandApplicationSet, BOTH source-port and destination-port terms, and the
+// ICMP/ICMPv6 type/code constraints enforced in matchSingleApp (#3284).
 //
-// An empty application list is the runtime match-any case. An unspecified
-// query protocol does not constrain the match (the established diagnostic
-// behavior).
-func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort int) bool {
+// An empty application list is the runtime match-any case. An empty query
+// protocol short-circuits to match-any here — a diagnostic convenience (the
+// runtime always has a concrete protocol), NOT a claim that a protocol-bearing
+// app term would match a protocol-less packet. Once a non-empty protocol is
+// supplied, matchSingleApp constrains by protocol (and ICMP type/code for a
+// type-constrained term), failing closed exactly like the dataplane; a
+// non-empty but UNRESOLVABLE protocol therefore fails closed for every
+// protocol-constrained app term.
+func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort int, icmpType, icmpCode *uint8) bool {
 	if len(apps) == 0 {
 		return true
 	}
@@ -463,20 +649,20 @@ func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort 
 				continue
 			}
 			for _, m := range members {
-				if matchSingleApp(cfg, m, queryProto, queryProtoOK, srcPort, dstPort) {
+				if matchSingleApp(cfg, m, queryProto, queryProtoOK, srcPort, dstPort, icmpType, icmpCode) {
 					return true
 				}
 			}
 			continue
 		}
-		if matchSingleApp(cfg, a, queryProto, queryProtoOK, srcPort, dstPort) {
+		if matchSingleApp(cfg, a, queryProto, queryProtoOK, srcPort, dstPort, icmpType, icmpCode) {
 			return true
 		}
 	}
 	return false
 }
 
-func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryProtoOK bool, srcPort, dstPort int) bool {
+func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryProtoOK bool, srcPort, dstPort int, icmpType, icmpCode *uint8) bool {
 	app, ok := config.ResolveApplication(appName, cfg.Applications.Applications)
 	if !ok {
 		return false
@@ -487,6 +673,30 @@ func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryP
 	if app.Protocol != "" {
 		appProto, appOK := appid.ProtocolNumber(app.Protocol)
 		if !appOK || !queryProtoOK || appProto != queryProto {
+			return false
+		}
+	}
+	// #3284: ICMP/ICMPv6 type[,code] constraint (junos-ping = type 8). Mirror
+	// policy.rs CompiledApplications.matches: a type-constrained term matches
+	// ONLY when the query's ICMP type is known and equal — and the code too,
+	// when the term constrains a code. A nil query type fails closed for the
+	// term (the runtime's `packet_icmp == None` path). An application with NO
+	// ICMP type constraint (junos-icmp-all, or any non-ICMP app) is unaffected:
+	// it matches on protocol/ports alone, exactly as before.
+	if app.ICMPType != nil {
+		// The dataplane keys icmp_constraints under the app's ICMP protocol, so
+		// the type constraint is only ever consulted for an ICMP-family packet.
+		// A predefined ICMP app pins app.Protocol (handled by the check above),
+		// but a custom app could carry an icmp-type without a pinned protocol;
+		// require the query to be ICMP (1) / ICMPv6 (58) so a type-constrained
+		// term can never match a TCP/UDP flow.
+		if !queryProtoOK || (queryProto != icmpProtoNum && queryProto != icmpv6ProtoNum) {
+			return false
+		}
+		if icmpType == nil || *icmpType != *app.ICMPType {
+			return false
+		}
+		if app.ICMPCode != nil && (icmpCode == nil || *icmpCode != *app.ICMPCode) {
 			return false
 		}
 	}

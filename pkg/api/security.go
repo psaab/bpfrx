@@ -312,12 +312,27 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// #3284: optional ICMP/ICMPv6 type/code so a type-constrained application
+	// term (junos-ping = type 8) is honored. An empty value is unspecified (a
+	// type-constrained term then fails closed, mirroring the dataplane); a
+	// malformed/out-of-range value is rejected, never coerced.
+	icmpType, err := policymatch.ParseICMPValue(r.URL.Query().Get("icmp_type"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid icmp_type: "+err.Error())
+		return
+	}
+	icmpCode, err := policymatch.ParseICMPValue(r.URL.Query().Get("icmp_code"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid icmp_code: "+err.Error())
+		return
+	}
 
 	// #3042: delegate to the single shared simulator so REST agrees with the
-	// runtime evaluator (zone-pair -> global -> default-policy, predefined +
-	// nested-app-set + literal-CIDR + any-ipv4/any-ipv6 + exclusion + feed
-	// overlay). The pre-#3042 hand-written loop skipped globals, hard-coded
-	// "deny (default)", and missed predefined apps / literal CIDRs.
+	// runtime evaluator (exact zone-pair -> wildcard-zone tiers (#3090) ->
+	// scoped global (#3148) -> default-policy, predefined + nested-app-set +
+	// literal-CIDR + any-ipv4/any-ipv6 + exclusion + feed overlay). The
+	// pre-#3042 hand-written loop skipped globals, hard-coded "deny (default)",
+	// and missed predefined apps / literal CIDRs.
 	var overlay map[string][]string
 	if s.feedOverlayFn != nil {
 		overlay = s.feedOverlayFn()
@@ -341,9 +356,23 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		Protocol:         proto,
 		SrcPort:          srcPort,
 		DstPort:          dstPort,
+		ICMPType:         icmpType,
+		ICMPCode:         icmpCode,
 		FeedOverlay:      overlay,
 		PolicyInactiveFn: inactiveFn,
 	})
+	// #3285: a `to-zone junos-host` query that matched no host-bound policy is
+	// not a transit default — the dataplane host gate returns None (local
+	// delivery; no global/default fallback). Surface it explicitly so the
+	// caller does not read a misleading default-policy verdict for the host
+	// path.
+	if res.HostInboundUnmatched {
+		writeOK(w, MatchPoliciesResult{
+			HostInboundUnmatched: true,
+			Action:               "host-inbound (local delivery; not governed by transit/global/default policy)",
+		})
+		return
+	}
 	if !res.Matched {
 		writeOK(w, MatchPoliciesResult{Action: policymatch.ActionString(res.Action) + " (default)"})
 		return

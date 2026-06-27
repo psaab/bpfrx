@@ -1418,10 +1418,26 @@ policy is not evaluated on the host-bound (LocalDelivery) path, so
 `to-zone junos-host` at commit (rather than committing a silent never-match);
 real junos-host global-zone-context support is a follow-up.
 
+**Zone-local address books in a scoped global (#3287).** A scoped global
+(`match from-zone <z>` / `match to-zone <z>`) resolves a zone-local
+address-book reference (#3061) against that zone's local book — the same
+zone-qualified resolution `resolveZoneLocalAddressBooks` already applied to
+zone-pair policies. It rewrites a scoped global's `source-address` tokens under
+its `match from-zone` scope and `destination-address` tokens under its `match
+to-zone` scope to the `zone-local/<zone>/<name>` qualified entry. Without this,
+the bare token kept pointing at the global book (which holds the entry only
+under its qualified name), so the constraint silently resolved to match-none and
+legitimate zone-scoped global traffic fell through to default-deny (or was
+rejected at commit as an undefined address). An UNSCOPED global (empty / `any`
+scope) names no single zone-local book and is left to resolve against the global
+book. Because the simulator (`pkg/policymatch`) and the dataplane snapshot
+builder both consume the post-fold compiled book, this keeps them in agreement.
+
 Regression coverage:
 `pkg/config/compiler_policy_global_zone_3148_test.go`,
-`pkg/dataplane/userspace/policy_global_zone_3148_test.go`, and the Rust
-`global_policy_*` tests in `userspace-dp/src/policy_tests.rs`.
+`pkg/dataplane/userspace/policy_global_zone_3148_test.go`, the Rust
+`global_policy_*` tests in `userspace-dp/src/policy_tests.rs`, and
+`pkg/policymatch/scoped_global_zonelocal_test.go` (#3287).
 
 ### #2391 — Security-zone count cap (commit fail-closed)
 
