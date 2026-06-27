@@ -292,6 +292,49 @@ func bgpEffectiveImport(n *config.BGPNeighbor, globalImport string) string {
 	return globalImport
 }
 
+// collectBGPRouteMapPolicies records, into dst, every DEFINED
+// policy-statement name that is rendered as a BGP `route-map in`/`out`
+// for any neighbor in bgp. These are exactly the policies whose Junos
+// fall-off-the-end default action is ACCEPT: a BGP import OR export policy
+// that reaches its end without a terminating term falls through to the BGP
+// default policy, which permits the route (vSRX advertises/accepts the
+// unmatched route unmodified). This is unlike a redistribute /
+// forwarding-table export policy, whose protocol default is REJECT
+// (#2998).
+//
+// The set MIRRORS the exact emit conditions in generateProtocols
+// (effective import/export per neighbor, guarded by
+// isDefinedPolicyStatement), so a name lands here IFF a `route-map <name>
+// in|out` line is actually produced. globalExport/globalImport are
+// resolved the same way the BGP renderer resolves them (last DEFINED
+// policy-statement wins; bare protocol tokens take the redistribute path
+// and never become a route-map name).
+func collectBGPRouteMapPolicies(bgp *config.BGPConfig, po *config.PolicyOptionsConfig, dst map[string]bool) {
+	if bgp == nil || po == nil {
+		return
+	}
+	globalExport := ""
+	for _, e := range bgp.Export {
+		if e != "" && isDefinedPolicyStatement(e, po) {
+			globalExport = e
+		}
+	}
+	globalImport := ""
+	for _, e := range bgp.Import {
+		if e != "" && isDefinedPolicyStatement(e, po) {
+			globalImport = e
+		}
+	}
+	for _, n := range bgp.Neighbors {
+		if rm := bgpEffectiveExport(n, globalExport); rm != "" && isDefinedPolicyStatement(rm, po) {
+			dst[rm] = true
+		}
+		if rm := bgpEffectiveImport(n, globalImport); rm != "" && isDefinedPolicyStatement(rm, po) {
+			dst[rm] = true
+		}
+	}
+}
+
 // bfdProfile holds a unique BFD profile (interval + multiplier).
 type bfdProfile struct {
 	interval   int
@@ -1201,7 +1244,20 @@ func communityMemberIsRegex(member string) bool {
 
 // generatePolicyOptions emits FRR prefix-list / route-map / community-list /
 // as-path-access-list config from the typed Junos policy-options.
-func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
+//
+// The optional bgpAccept variadic carries the set of policy-statement names
+// that are referenced as a BGP `route-map in`/`out` (built by
+// collectBGPRouteMapPolicies at the GenerateConfig call site). A
+// policy-statement in that set with NO explicit policy-level default action
+// renders a terminating `permit` so an unmatched route follows the Junos BGP
+// default-ACCEPT instead of being dropped by FRR's implicit deny (#2998).
+// Direct/test callers omit the argument, preserving the historical
+// fail-closed `deny` default for every policy.
+func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccept ...map[string]bool) string {
+	var bgpAcceptDefault map[string]bool
+	if len(bgpAccept) > 0 {
+		bgpAcceptDefault = bgpAccept[0]
+	}
 	var b strings.Builder
 
 	// Generate FRR prefix-lists from Junos prefix-lists
@@ -1650,12 +1706,35 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			}
 		}
 
-		// Default action
-		if ps.DefaultAction == "reject" || ps.DefaultAction == "" {
+		// Default action. A Junos policy-statement that reaches its end
+		// without a terminating term falls through to the PROTOCOL default
+		// policy, which is application-specific: BGP import AND export both
+		// default-ACCEPT the unmatched route, while a redistribute /
+		// forwarding-table export policy defaults to REJECT. FRR route-maps
+		// carry an implicit trailing deny, so a BGP policy that only tweaks
+		// attributes on a few terms and expects the rest to pass unmodified
+		// would blackhole every non-matching route under a blanket trailing
+		// `deny` (#2998).
+		//
+		//   - explicit `then accept`  → permit (Junos-explicit)
+		//   - explicit `then reject`  → deny   (Junos-explicit)
+		//   - no policy default + BGP route-map in/out context → permit
+		//     (BGP default-accept; bgpAcceptDefault carries these names)
+		//   - no policy default elsewhere (redistribute / forwarding-table
+		//     export / standalone) → deny (fail-closed, matches the OSPF/
+		//     redistribute Junos default and FRR's implicit deny)
+		switch {
+		case ps.DefaultAction == "accept":
+			fmt.Fprintf(&b, "route-map %s permit %d\n", name, seq)
+			b.WriteString("exit\n")
+		case ps.DefaultAction == "reject":
 			fmt.Fprintf(&b, "route-map %s deny %d\n", name, seq)
 			b.WriteString("exit\n")
-		} else if ps.DefaultAction == "accept" {
+		case bgpAcceptDefault[name]:
 			fmt.Fprintf(&b, "route-map %s permit %d\n", name, seq)
+			b.WriteString("exit\n")
+		default:
+			fmt.Fprintf(&b, "route-map %s deny %d\n", name, seq)
 			b.WriteString("exit\n")
 		}
 		b.WriteString("!\n")

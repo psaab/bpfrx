@@ -128,7 +128,7 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var pkts, bytes uint64
-			if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
+			if (statsEnabled || pol.Count) && s.dp != nil && s.dp.IsLoaded() {
 				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
 					pkts = counters.Packets
 					bytes = counters.Bytes
@@ -166,7 +166,7 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var pkts, bytes uint64
-			if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
+			if (statsEnabled || pol.Count) && s.dp != nil && s.dp.IsLoaded() {
 				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
 					pkts = counters.Packets
 					bytes = counters.Bytes
@@ -262,7 +262,7 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			if pol.Count {
 				fmt.Fprintf(buf, "      count\n")
 			}
-			if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
+			if (statsEnabled || pol.Count) && s.dp != nil && s.dp.IsLoaded() {
 				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
 					fmt.Fprintf(buf, "    Session statistics:\n")
 					fmt.Fprintf(buf, "      %d packets, %d bytes\n", counters.Packets, counters.Bytes)
@@ -314,7 +314,7 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			if pol.Count {
 				fmt.Fprintf(buf, "      count\n")
 			}
-			if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
+			if (statsEnabled || pol.Count) && s.dp != nil && s.dp.IsLoaded() {
 				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
 					fmt.Fprintf(buf, "    Session statistics:\n")
 					fmt.Fprintf(buf, "      %d packets, %d bytes\n", counters.Packets, counters.Bytes)

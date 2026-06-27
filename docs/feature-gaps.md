@@ -334,7 +334,7 @@ xpf has security logging with mode (stream/event), format, streams with host/por
 | **Transport Protocol Selection** | `security log stream ... transport protocol tcp/tls` | Send security logs over TCP or TLS instead of UDP for reliable delivery | Medium | Done (TCP and TLS transport implemented) |
 | **Per-Policy Logging** | `security policies ... then log session-init session-close` | Emit RT_FLOW SYSLOG session-init/close records ONLY for the policies configured with `then log` | Medium | Done (#2508 — the flags are stamped onto session metadata at install, carried on the userspace-dp SESSION_CREATE/SESSION_CLOSE frames, and gate the SYSLOG/local-log/slog consumers; the global NetFlow/IPFIX session-close exporter (#2460) still observes every close. All key fields: policy-name, app, ingress-iface, client/server split, close-reason, session-id. #2785 closed the HA gap: the per-policy log flags now ride the session-sync wire (open-frame flags bits 1<<3/1<<4 -> `dataplane.LogFlagSessionInit/Close` on the cluster wire -> `SessionSyncRequest.log_session_init/close` -> the synced session's metadata), so a session that fails over to the standby emits the same RT_FLOW SESSION_CREATE/CLOSE records on the new active node. An old peer that omits the fields decodes to false (no per-policy log), bit-identical to pre-#2785 behavior) |
 | **Log Event Mode** | `security log mode event` | Route security logs through eventd (control plane) for on-box processing, slower but allows local processing | Low | Done (event mode writes to local file) |
-| **Session Aggregation Logs** | `security log ... report` | Aggregate session logs for top-N reporting (top talkers, top applications) | Low | Done (session aggregation reporting implemented) |
+| **Session Aggregation Logs** | `security log ... report` | Aggregate session logs for top-N reporting (top talkers, top applications) | Low | Done (Space-Saving top-K, bounded memory + arrival-order-independent, #3099) |
 | **Log Profile** | `security log profile <name> { stream-name; default-profile; category ... }` | Named log-routing profile targeting a stream, with a default-profile designation (#2008 H7) | Low | Done (compiled to `LogConfig.Profiles`; `stream-name` cross-referenced at commit. Per-stream routing is already a Junos superset, so no dispatch change; `category field-extra-name` accepted but not yet used to alter emitted SD) |
 
 ---
@@ -863,6 +863,29 @@ drift) closed in `fix/2008-quickwins-batch1`:
   cluster config has only explicit permit rules + `default-policy deny-all`,
   so blocked traffic rides the implicit default-deny — which bumps the
   aggregate `policy_deny` counter, not any per-rule counter).
+  **#3074 per-policy `then count` override (DONE):** before #3074 the
+  per-policy Junos `then count` modifier was parsed/stored (`Policy.Count`,
+  `pkg/config/types_security.go`) but carried NO runtime meaning — the six
+  display surfaces above gated solely on the system-wide
+  `policy-stats system-wide enable` knob, so a `then count` policy reported
+  0 unless the operator ALSO enabled the global knob (the issue's "inert
+  compatibility" complaint). #3074 makes `then count` a per-policy display
+  selector: every surface now admits a rule's counter when
+  `statsEnabled || pol.Count` (`||rule.Count`), so a `then count` policy
+  reports its packets/bytes independent of the global knob (Junos
+  per-policy `count`), while a policy without `then count` keeps the
+  pre-#3074 behavior (0 with the knob off). REUSE-not-rebuild decision: the
+  Rust per-rule counter is already always-on and per-packet (#3073), and
+  the gate was already display-only with no dataplane read of the knob, so
+  `then count` needs NO new Rust counter and NO wire field — it is a
+  Go-side display selection over the existing #3073 counter, using the
+  `Policy.Count` flag already present in the active config. Fail-on-revert
+  tests: `pkg/cli/cli_show_policies_thencount_3074_test.go`,
+  `pkg/grpcapi/server_show_policies_thencount_3074_test.go`, plus the
+  #3074-aware updates to the M4/#2118 gate tests
+  (`pkg/api/metrics_test.go`, `pkg/api/policy_counters_test.go`,
+  `pkg/grpcapi/server_show_zones_test.go`): a `then count` policy surfaces
+  its live counts with the knob OFF; a sibling without it stays 0.
 - **Runtime policy-ID namespaces under app-set expansion — #3145 FIXED,
   #3143 found to be a misdiagnosis.** TWO distinct numeric namespaces coexist
   by design, and conflating them is the trap this work clarified:

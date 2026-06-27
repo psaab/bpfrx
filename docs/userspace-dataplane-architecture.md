@@ -600,6 +600,26 @@ supports protocol + port ranges. `rule.inactive` is the policy-scheduler result
 published by the Go daemon; inactive scheduled rules are skipped before any
 match side effects or counters.
 
+**Wildcard zone tiers (#3090).** A policy whose `from-zone` or `to-zone` is the
+Junos wildcard `any` is indexed into one of three dedicated lists alongside the
+exact `zone_pair_index`: **from-any** (key = concrete to-zone id), **to-any**
+(key = concrete from-zone id), and **both-any** (matches every pair).
+`evaluate_policy_result_with_icmp` consults them in Junos most-specific-first
+precedence:
+
+```
+exact (from,to)  →  single-wildcard (from-any ∪ to-any, merged in config order)
+                 →  both-any  →  junos-global  →  default policy
+```
+
+Each tier is an O(1) FxHashMap probe (or a small Vec scan only when wildcard
+rules exist), so a config with no wildcard policy pays only two empty-slice
+probes per cold-path evaluation — no N×N materialization of concrete pairs. A
+`from-zone any to-zone junos-host` rule is enforced on the host-bound path too
+(`evaluate_junos_host_policy`); `to-zone any` / `from-zone any to-zone any` are
+deliberately not applied to host-bound traffic to preserve the management
+lifeline guarantee. This lifted the #3018 interim commit reject.
+
 **Unknown-zone guard (#3110).** Zone id `0` is the reserved "unknown / no
 zone" sentinel — assigned to interfaces not bound to any security zone and to
 the over-cap-zone collapse-to-0 path (#2391). `evaluate_policy_result_with_len`
@@ -611,7 +631,9 @@ action (deny, per #3065). This prevents a configured permit-global from leaking
 transit on an unzoned ingress/egress interface. The `junos-global` sentinel
 zone-id (`u16::MAX`) is a *defined* global zone, distinct from `0` (unknown),
 and is unaffected by the guard — global policies still apply to every defined
-zone pair (#3018 wildcard-zone work composes unchanged).
+zone pair. The #3090 wildcard-zone tiers (from-any / to-any / both-any) live
+inside the same `from_id != 0 && to_id != 0` guard, so an unzoned flow falls
+through to the default action exactly like a global policy.
 
 #### Static NAT zone scoping (`nat/static_nat.rs`)
 

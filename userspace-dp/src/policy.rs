@@ -1042,6 +1042,22 @@ pub(crate) struct PolicyState {
     /// Zone-pair index: maps `(from_id, to_id)` packed u32 →
     /// indices into `rules`. Avoids scanning unrelated zone-pairs.
     zone_pair_index: FxHashMap<ZonePairKey, Vec<usize>>,
+    /// #3090: wildcard `from-zone any` index — key = the concrete to-zone id,
+    /// value = indices (config order) of rules whose from-zone is the Junos
+    /// wildcard `any` and whose to-zone is that concrete zone. Such a rule
+    /// matches a flow into that to-zone REGARDLESS of ingress zone. Consulted
+    /// in the single-wildcard precedence tier (after the exact zone pair,
+    /// before both-any and global).
+    from_any_index: FxHashMap<u16, Vec<usize>>,
+    /// #3090: wildcard `to-zone any` index — key = the concrete from-zone id,
+    /// value = indices (config order) of rules whose to-zone is `any` and whose
+    /// from-zone is that concrete zone. Matches a flow OUT of that from-zone
+    /// regardless of egress zone.
+    to_any_index: FxHashMap<u16, Vec<usize>>,
+    /// #3090: `from-zone any to-zone any` rules (the least-specific wildcard
+    /// tier), in config order. Matches every defined zone pair. Consulted after
+    /// the single-wildcard tier and before global rules.
+    both_any_indices: Vec<usize>,
     /// Indices of global rules (from_zone or to_zone = "junos-global").
     global_indices: Vec<usize>,
     /// #1606: deduplicated address-book table. Rules reference
@@ -1062,6 +1078,9 @@ impl Default for PolicyState {
             default_action: PolicyAction::Deny,
             rules: Vec::new(),
             zone_pair_index: FxHashMap::default(),
+            from_any_index: FxHashMap::default(),
+            to_any_index: FxHashMap::default(),
+            both_any_indices: Vec::new(),
             global_indices: Vec::new(),
             books: Vec::new(),
             book_id_to_idx: FxHashMap::default(),
@@ -1143,6 +1162,9 @@ pub(crate) fn parse_policy_state_with_counters(
         default_action: parse_action(default_policy),
         rules: Vec::with_capacity(rules.len()),
         zone_pair_index: FxHashMap::default(),
+        from_any_index: FxHashMap::default(),
+        to_any_index: FxHashMap::default(),
+        both_any_indices: Vec::new(),
         global_indices: Vec::new(),
         books: Vec::with_capacity(address_books.len()),
         book_id_to_idx: FxHashMap::default(),
@@ -1326,19 +1348,59 @@ pub(crate) fn parse_policy_state_with_counters(
         if is_global {
             state.global_indices.push(idx);
         } else {
-            match (
-                resolve_policy_zone_id(zone_name_to_id, &snap.from_zone),
-                resolve_policy_zone_id(zone_name_to_id, &snap.to_zone),
-            ) {
-                (Some(from_id), Some(to_id)) => {
-                    let key = zone_pair_key(from_id, to_id);
-                    state.zone_pair_index.entry(key).or_default().push(idx);
+            // #3090: classify the rule by its wildcard-zone shape. A from-zone
+            // / to-zone literal `any` is the Junos wildcard; it is routed to a
+            // dedicated index list so `evaluate_policy_result_with_icmp` can
+            // consult it in most-specific-first precedence without an N×N
+            // expansion. A concrete zone can never be named `any` (the Go
+            // strict validator rejects such a zone definition), so the literal
+            // is unambiguously the wildcard. `junos-global` is already handled
+            // above; `junos-host` resolves to its reserved id via
+            // `resolve_policy_zone_id`.
+            let from_any = snap.from_zone == "any";
+            let to_any = snap.to_zone == "any";
+            match (from_any, to_any) {
+                (true, true) => {
+                    state.both_any_indices.push(idx);
                 }
-                _ => {
-                    eprintln!(
-                        "xpf-userspace-dp: policy rule references unknown zone(s): from={:?} to={:?} (rule kept, but not indexed)",
-                        snap.from_zone, snap.to_zone
-                    );
+                (true, false) => match resolve_policy_zone_id(zone_name_to_id, &snap.to_zone) {
+                    Some(to_id) => {
+                        state.from_any_index.entry(to_id).or_default().push(idx);
+                    }
+                    None => {
+                        eprintln!(
+                            "xpf-userspace-dp: policy rule from-zone any references unknown to-zone {:?} (rule kept, but not indexed)",
+                            snap.to_zone
+                        );
+                    }
+                },
+                (false, true) => match resolve_policy_zone_id(zone_name_to_id, &snap.from_zone) {
+                    Some(from_id) => {
+                        state.to_any_index.entry(from_id).or_default().push(idx);
+                    }
+                    None => {
+                        eprintln!(
+                            "xpf-userspace-dp: policy rule to-zone any references unknown from-zone {:?} (rule kept, but not indexed)",
+                            snap.from_zone
+                        );
+                    }
+                },
+                (false, false) => {
+                    match (
+                        resolve_policy_zone_id(zone_name_to_id, &snap.from_zone),
+                        resolve_policy_zone_id(zone_name_to_id, &snap.to_zone),
+                    ) {
+                        (Some(from_id), Some(to_id)) => {
+                            let key = zone_pair_key(from_id, to_id);
+                            state.zone_pair_index.entry(key).or_default().push(idx);
+                        }
+                        _ => {
+                            eprintln!(
+                                "xpf-userspace-dp: policy rule references unknown zone(s): from={:?} to={:?} (rule kept, but not indexed)",
+                                snap.from_zone, snap.to_zone
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1610,6 +1672,78 @@ pub(crate) fn evaluate_policy_result_with_icmp(
                 }
             }
         }
+        // #3090: wildcard-zone tiers, in Junos most-specific-first precedence
+        // AFTER the exact zone pair and BEFORE global/default.
+        //
+        //  Tier 1 — single wildcard: `from-zone any` (keyed by to_id) and
+        //  `to-zone any` (keyed by from_id). The two lists are merged in
+        //  config (ascending rule-index) order so a rule's relative position
+        //  is honored regardless of which wildcard side it used — e.g. a
+        //  `from-zone any to-zone trust deny` configured before a `from-zone
+        //  untrust to-zone any permit` wins for an untrust->trust flow.
+        //
+        //  Tier 2 — both-any: `from-zone any to-zone any` in config order.
+        //
+        // Each tier is a single FxHashMap O(1) lookup (or a Vec scan only when
+        // such rules exist), so a config with no wildcard policy pays only two
+        // empty-slice probes per cold-path evaluation — no N×N materialization.
+        let from_any = state
+            .from_any_index
+            .get(&to_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let to_any = state
+            .to_any_index
+            .get(&from_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mut i = 0usize;
+        let mut j = 0usize;
+        while i < from_any.len() || j < to_any.len() {
+            // Both slices are ascending (rules are appended in config order),
+            // so a two-pointer merge yields global config order. Indices are
+            // unique across the buckets (each rule lands in exactly one), so no
+            // dedup is needed.
+            let idx = if j >= to_any.len() || (i < from_any.len() && from_any[i] <= to_any[j]) {
+                let v = from_any[i];
+                i += 1;
+                v
+            } else {
+                let v = to_any[j];
+                j += 1;
+                v
+            };
+            if let Some(mut result) = try_match_rule(
+                &state.rules[idx],
+                state,
+                src_ip,
+                dst_ip,
+                protocol,
+                src_port,
+                dst_port,
+                packet_icmp,
+                packet_len,
+            ) {
+                result.policy_counter_idx = (idx as u32).saturating_add(1);
+                return result;
+            }
+        }
+        for &idx in &state.both_any_indices {
+            if let Some(mut result) = try_match_rule(
+                &state.rules[idx],
+                state,
+                src_ip,
+                dst_ip,
+                protocol,
+                src_port,
+                dst_port,
+                packet_icmp,
+                packet_len,
+            ) {
+                result.policy_counter_idx = (idx as u32).saturating_add(1);
+                return result;
+            }
+        }
         for &idx in &state.global_indices {
             if let Some(mut result) = try_match_rule(
                 &state.rules[idx],
@@ -1704,23 +1838,54 @@ pub(crate) fn evaluate_junos_host_policy(
     if !state.has_junos_host_rules || from_id == 0 {
         return None;
     }
+    // Most-specific first: an exact `from-zone <ingress> to-zone junos-host`
+    // pair before the `from-zone any to-zone junos-host` wildcard.
     let key = zone_pair_key(from_id, JUNOS_HOST_ZONE_ID);
-    let indices = state.zone_pair_index.get(&key)?;
-    for &idx in indices {
-        if let Some(mut result) = try_match_rule(
-            &state.rules[idx],
-            state,
-            src_ip,
-            dst_ip,
-            protocol,
-            src_port,
-            dst_port,
-            packet_icmp,
-            packet_len,
-        ) {
-            // #3073: 1-based handle (see `evaluate_policy_result_with_icmp`).
-            result.policy_counter_idx = (idx as u32).saturating_add(1);
-            return Some(result);
+    if let Some(indices) = state.zone_pair_index.get(&key) {
+        for &idx in indices {
+            if let Some(mut result) = try_match_rule(
+                &state.rules[idx],
+                state,
+                src_ip,
+                dst_ip,
+                protocol,
+                src_port,
+                dst_port,
+                packet_icmp,
+                packet_len,
+            ) {
+                // #3073: 1-based handle (see `evaluate_policy_result_with_icmp`).
+                result.policy_counter_idx = (idx as u32).saturating_add(1);
+                return Some(result);
+            }
+        }
+    }
+    // #3090: a `from-zone any to-zone junos-host` wildcard governs host-bound
+    // traffic from EVERY ingress zone. It MUST be consulted here — once the
+    // #3018 interim commit reject is lifted such a rule commits, and leaving it
+    // unindexed on the host path would re-introduce the exact silent fail-open
+    // #3018 closed. `to-zone any` / `from-zone any to-zone any` are deliberately
+    // NOT pulled into the host path: the junos-host gate stays conservative and
+    // strictly match-driven (no implicit default-deny — see this function's doc
+    // comment), mirroring the existing rule that global policies are not applied
+    // to host-bound traffic, so a broad `to any` rule cannot silently brick the
+    // management lifeline.
+    if let Some(indices) = state.from_any_index.get(&JUNOS_HOST_ZONE_ID) {
+        for &idx in indices {
+            if let Some(mut result) = try_match_rule(
+                &state.rules[idx],
+                state,
+                src_ip,
+                dst_ip,
+                protocol,
+                src_port,
+                dst_port,
+                packet_icmp,
+                packet_len,
+            ) {
+                result.policy_counter_idx = (idx as u32).saturating_add(1);
+                return Some(result);
+            }
         }
     }
     None

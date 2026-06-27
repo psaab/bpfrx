@@ -541,6 +541,19 @@ type compileOpts struct {
 	// leniently-loaded over-cap config is inert (the overflow zones do not
 	// forward) rather than mis-attributed. Same doctrine as lenientPolicyZoneRefs.
 	lenientZoneCount bool
+	// lenientAddressBookNames (#3061) downgrades the address-book / zone name
+	// `/`-character gate (validateAddressBookEntryNamesStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit / commit-check
+	// path hard-rejects a `/` in any address-book entry name (global or
+	// zone-local address / address-set) or any security-zone name — matching
+	// Junos object-naming rules and making the synthetic `zone-local/<zone>/
+	// <name>` internal name (resolveZoneLocalAddressBooks) collision-proof. The
+	// tolerant load / peer-sync paths downgrade to a warning so an already-
+	// persisted config an older binary accepted (before this gate existed) still
+	// BOOTS (#1960 no-brick); the fold's no-clobber guard keeps such a config
+	// from silently overwriting an operator entry. Same doctrine as
+	// lenientZoneCount.
+	lenientAddressBookNames bool
 	// lenientZoneInterfaceMembership (#3072) downgrades the zone-interface
 	// membership gate (validateZoneInterfaceMembershipStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit / commit-check
@@ -756,21 +769,6 @@ type compileOpts struct {
 	// peer-synced config an older binary accepted still BOOTS (#1960 no-brick).
 	// Same doctrine as lenientPolicyZoneRefs.
 	lenientReservedZoneNames bool
-	// lenientPolicyWildcardZone (#3018) downgrades the wildcard from-zone/
-	// to-zone gate (validatePolicyWildcardZoneStrict) from a hard compile error
-	// to a cfg.Warnings entry. The strict commit / commit-check path hard-rejects
-	// an ordinary zone-pair policy whose from-zone or to-zone is the literal
-	// Junos wildcard `any`: the userspace snapshot builder carries the literal
-	// "any" string unchanged and PolicyState::from_snapshots
-	// (userspace-dp/src/policy.rs) only indexes a rule when BOTH zones resolve to
-	// a declared zone-id, so a from-zone/to-zone `any` rule is KEPT but never
-	// indexed and never evaluated — a silent fail-OPEN under a permit default.
-	// The tolerant load / peer-sync paths downgrade to a warning so an
-	// already-persisted or peer-synced config carrying a from-zone/to-zone `any`
-	// still BOOTS (#1960 no-brick) — it stays unenforced (the pre-existing
-	// behavior), now flagged. Full wildcard-zone runtime indexing is a deferred
-	// follow-up. Same doctrine as lenientPolicyZoneRefs.
-	lenientPolicyWildcardZone bool
 	// lenientNATRuleSetScope (#3079) downgrades the NAT rule-set from/to
 	// scope gate (validateNATRuleSetScopeAST) from a hard compile error to a
 	// cfg.Warnings entry. A NAT rule-set whose `from`/`to` clause scopes
@@ -787,7 +785,7 @@ type compileOpts struct {
 	// (#1960 fail-closed-on-load class) — it stays applied globally (the
 	// pre-existing behaviour), now flagged. Full interface-/
 	// routing-instance-scoped NAT matching is a deferred follow-up. Same
-	// doctrine as lenientPolicyWildcardZone.
+	// doctrine as lenientPolicyZoneRefs.
 	lenientNATRuleSetScope bool
 	// lenientBackupRouterDst (#2911) downgrades the backup-router
 	// destination/next-hop family-mismatch gate (validateBackupRouterDst)
@@ -1013,6 +1011,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientWireguardPeers:               true,
 		lenientPolicyZoneRefs:               true,
 		lenientZoneCount:                    true,
+		lenientAddressBookNames:             true,
 		lenientZoneInterfaceMembership:      true,
 		lenientHostInboundTokens:            true,
 		lenientDestNATAddresses:             true,
@@ -1027,7 +1026,6 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyLogAction:              true,
 		lenientScreenProfileRefs:            true,
 		lenientReservedZoneNames:            true,
-		lenientPolicyWildcardZone:           true,
 		lenientNATRuleSetScope:              true,
 		lenientBackupRouterDst:              true,
 		lenientSecureTunnelBindIface:        true,
@@ -1143,6 +1141,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientWireguardPeers:               true,
 		lenientPolicyZoneRefs:               true,
 		lenientZoneCount:                    true,
+		lenientAddressBookNames:             true,
 		lenientZoneInterfaceMembership:      true,
 		lenientHostInboundTokens:            true,
 		lenientDestNATAddresses:             true,
@@ -1157,7 +1156,6 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyLogAction:              true,
 		lenientScreenProfileRefs:            true,
 		lenientReservedZoneNames:            true,
-		lenientPolicyWildcardZone:           true,
 		lenientNATRuleSetScope:              true,
 		lenientBackupRouterDst:              true,
 		lenientSecureTunnelBindIface:        true,
@@ -1592,6 +1590,33 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3061 — reject `/` in operator-typed address-book entry names and
+	// security-zone names BEFORE folding zone-local books, so the synthetic
+	// zone-local/<zone>/<name> internal names minted by
+	// resolveZoneLocalAddressBooks are collision-proof (an operator name can no
+	// longer contain `/` and so can never equal a synthetic name). This MUST
+	// run on the pristine global book — i.e. before the fold injects the
+	// `/`-bearing synthetic names — so it is placed here rather than in the
+	// post-fold accumulator. Strict on commit / commit-check (hard-reject);
+	// tolerant load / peer-sync downgrade to a warning (#1960 no-brick — a `/`
+	// name was unusual but accepted before this gate existed; the fold's
+	// no-clobber guard keeps it from silently overwriting an operator entry).
+	if err := validateAddressBookEntryNamesStrict(cfg); err != nil {
+		if opts.lenientAddressBookNames {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("address-book/zone name (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+	// #3061 — fold zone-local address books into the global book under
+	// zone-qualified internal names and rewrite policy match tokens. Runs after
+	// the name gate (above) and before the policy match-address resolution
+	// validators (validatePolicyMatchAddressesStrict /
+	// validatePolicyMatchAddressSetMembersStrict), which depend on the rewritten
+	// tokens and synthetic global entries.
+	resolveZoneLocalAddressBooks(&cfg.Security)
+
 	// #1538 — accumulate independent strict-validator families so
 	// `commit check` surfaces one error per family in a single
 	// response. This saves operator round-trips on first-touch
@@ -1685,28 +1710,16 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
-	// #3018 security-policy wildcard from-zone/to-zone fail-open gate. Strict on
-	// commit / commit-check (hard-reject an ordinary zone-pair policy whose
-	// from-zone or to-zone is the literal `any` — the userspace snapshot builder
-	// carries the literal "any" string unchanged and the dataplane only indexes a
-	// rule when BOTH zones resolve to a declared zone-id, so a from-zone/to-zone
-	// `any` rule COMMITS but is never indexed and never evaluated, silently
-	// failing OPEN under a permit default); lenient on load / peer-sync (warn so
-	// an already-persisted or peer-synced config with a from-zone/to-zone `any`
-	// still boots — #1960 no-brick; the rule was already inert, so a leniently-
-	// loaded config behaves exactly as before, just flagged). Does NOT touch
-	// `security policies global` (handled via the junos-global sentinel) nor the
-	// unrelated `any` match-address/application tokens. Full wildcard-zone
-	// indexing is a deferred follow-up. Runs AFTER the zone-reference gate so a
-	// genuinely undefined zone still wins the first-error slot.
-	if err := validatePolicyWildcardZoneStrict(cfg); err != nil {
-		if opts.lenientPolicyWildcardZone {
-			cfg.Warnings = append(cfg.Warnings,
-				fmt.Sprintf("policy wildcard zone (downgraded to warning on tolerant path): %v", err))
-		} else {
-			return nil, err
-		}
-	}
+	// #3090: the from-zone/to-zone `any` wildcard is now properly indexed and
+	// enforced by the userspace dataplane (PolicyState's from-any / to-any /
+	// both-any tiers, evaluated in Junos most-specific-first precedence before
+	// global/default — userspace-dp/src/policy.rs). The #3018 interim commit
+	// reject (validatePolicyWildcardZoneStrict) is therefore lifted: a
+	// from-zone/to-zone `any` policy commits AND is enforced. The undefined-zone
+	// gate (validatePolicyZoneReferencesStrict) still exempts `any` via
+	// policyZoneSpecialTokens, so the wildcard is accepted without being mistaken
+	// for an undefined zone, and a `security zone` named `any` is still rejected
+	// by validateReservedZoneNamesStrict.
 
 	// #3043 security-policy terminal-action fail-open gate. Strict on commit /
 	// commit-check (hard-reject a policy that does not name exactly one of

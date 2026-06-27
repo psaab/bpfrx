@@ -1423,6 +1423,67 @@ first-error slot. Regression coverage: `pkg/config/zone_count_cap_test.go`
 `interface_with_empty_zone_builds_with_zone_zero` tests in
 `userspace-dp/src/afxdp/forwarding_build/tests.rs`.
 
+### #3061 — Zone-local address books
+
+Junos supports a per-zone address book attached inline under the zone, in
+addition to the global `security address-book global`:
+
+```
+set security zones security-zone trust address-book address web-server 10.0.1.100/32
+set security zones security-zone trust address-book address-set servers address web-server
+```
+
+The entry grammar is identical to the global book (`address` / `address-set`),
+only the attachment point differs (no `global` wrapper). The schema leaf lives
+under `security-zone` in `setSchema` (`schema_security.go`); `compileZones`
+parses it into `ZoneConfig.AddressBook` via the shared
+`parseAddressBookEntries`.
+
+**Resolution order (Junos scoping):** a policy's `match source-address`
+resolves against its FROM-zone book first, `match destination-address` against
+its TO-zone book first, then both fall back to the global book.
+`resolveZoneLocalAddressBooks` (run from `compileExpanded` after the name gate
+below) folds every zone-local entry into the global
+`SecurityConfig.AddressBook` under a zone-qualified internal name
+(`zone-local/<zone>/<name>`) and rewrites each policy match token that resolves
+zone-locally to that qualified name. A token NOT defined in the policy's zone
+book is left unchanged so it resolves against the global book; when a name
+exists in BOTH, the zone-local value WINS.
+
+**Collision-proof synthetic namespace:** the lexer permits `/` in an identifier
+token (it is needed for IP-literal VALUES like `10.0.0.0/24`), so without a
+guard an operator could name a global address `zone-local/trust/web-server` and
+have it silently clobbered by the fold. `validateAddressBookEntryNamesStrict`
+(run BEFORE the fold, on the pristine global book) hard-rejects `/` in any
+address-book entry NAME (global or zone-local `address`/`address-set`) and any
+security-zone NAME at commit — matching Junos object-naming rules — so no
+operator name can contain `/` and none can equal a synthetic `zone-local/...`
+name. Only the NAME is checked, never the address VALUE/prefix. Strict on
+commit / commit-check; the tolerant load / peer-sync path (`lenientAddressBookNames`)
+downgrades to a warning (#1960 no-brick), backstopped by the fold's
+no-clobber guard (it skips a global-book key that already exists).
+
+After this pass the whole downstream resolution path
+(wire snapshot, `nameToID`, `classifyPolicyAddresses`, the strict/warn
+validators, the `resolveUserspaceAddressBookEntry` runtime resolver) keeps
+operating on a single flat global book.
+
+**Scoping:** a name present only in zone A's book is invisible to a policy in
+zone B. If B's policy references it and the global book has no such entry,
+`validatePolicyMatchAddressesStrict` (#2008) rejects it at commit, exactly as
+Junos treats an undefined reference. NAT rule address-name references
+(`source-address-name` etc.) remain global-only; zone-local resolution is
+scoped to security-policy match addresses. Regression coverage:
+`pkg/dataplane/userspace/zone_local_addressbook_3061_test.go`
+(`TestZoneLocalAddressBookResolves` — fail-on-revert resolution guard,
+`TestZoneLocalAddressBookScoping` — precedence + cross-zone isolation) and
+`pkg/config/addressbook_name_slash_3061_test.go`
+(`TestAddressBookGlobalNameSlashRejected`,
+`TestAddressBookZoneLocalNameSlashRejected`,
+`TestSecurityZoneNameSlashRejected` — collision-safety fail-on-revert guards,
+`TestAddressBookNameSlashNormalConfigUnaffected` — prefix-value anti-over-reject,
+`TestAddressBookNameSlashLenientDowngrades` — tolerant-path warning).
+
 ### #2399 — firewall-filter unknown `then` action + unsupported `from protocol` (commit fail-closed)
 
 Two fail-OPEN behaviors in the firewall-filter compiler, both now rejected

@@ -1,3 +1,51 @@
+## 2026-06-26 — #3074 wire per-policy `then count` to the display surfaces
+
+- **Timestamp**: 2026-06-26
+- **Action**: The Junos `security policies ... policy <p> then count` modifier
+  was parsed and stored (`Policy.Count`) but inert — the six per-policy
+  counter display surfaces gated solely on the system-wide
+  `policy-stats system-wide enable` knob, so a `then count` policy reported 0
+  unless the global knob was also on. Made `then count` a per-policy display
+  selector: every surface now admits the counter when
+  `statsEnabled || <policy>.Count`. REUSE-not-rebuild over #3073 — the Rust
+  per-rule counter is already always-on and per-packet, and the knob was never
+  read by the dataplane, so this is a Go-side display selection with NO new
+  Rust counter and NO wire field. A policy without `then count` keeps the
+  pre-#3074 behavior (0 with the knob off).
+- **File(s)**: pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/grpcapi/server_show_policies_text.go, pkg/grpcapi/server_show_zones.go,
+  pkg/api/security.go, pkg/api/metrics_counters.go,
+  pkg/cli/cli_show_policies_thencount_3074_test.go (new),
+  pkg/grpcapi/server_show_policies_thencount_3074_test.go (new),
+  pkg/api/metrics_test.go, pkg/api/policy_counters_test.go,
+  pkg/grpcapi/server_show_zones_test.go (gate tests made #3074-aware),
+  docs/feature-gaps.md.
+## 2026-06-26 — #2998 FRR policy-statement default action follows the BGP protocol default
+
+- **Timestamp**: 2026-06-26
+- **Action**: A Junos policy-statement with no explicit policy-level default
+  action (`DefaultAction == ""`) was unconditionally rendered as a terminating
+  FRR `route-map <name> deny <seq>`. For a BGP import/export policy that only
+  modifies attributes on specific terms and expects the rest to pass
+  unmodified, that trailing deny (plus FRR's own implicit deny) BLACKHOLES every
+  non-matching route — divergence from Junos, where BGP import AND export
+  default-ACCEPT the unmatched route. Redistribute / forwarding-table export
+  policies correctly default to REJECT. Fix: thread the protocol-application
+  context. `buildManagedSection` builds the set of policy-statements applied as
+  a BGP `route-map in`/`out` (`collectBGPRouteMapPolicies`, default instance +
+  every VRF, mirroring the exact `generateProtocols` emit conditions) and passes
+  it to `generatePolicyOptions` (new optional `bgpAccept ...map[string]bool`
+  variadic). The default-action switch now renders: explicit accept → permit;
+  explicit reject → deny; no-default + BGP route-map context → permit (the fix);
+  no-default elsewhere → deny (fail-closed, unchanged). Direct/test callers omit
+  the variadic and keep the historical deny default.
+- **File(s)**: `pkg/frr/policy_render.go`, `pkg/frr/manager.go`,
+  `pkg/frr/policy_default_action_2998_test.go`, `pkg/frr/README.md`, `_Log.md`
+- **Validation**: `go build ./...`; `go test ./pkg/frr/...` green;
+  fail-on-revert confirmed (forcing the BGP-context default back to `deny`
+  makes `TestBuildManagedSection_BGPPolicyDefaultAccept` render
+  `route-map BGP-IN deny 20` → RED).
+
 ## 2026-06-26 — #3122 count peer-synced sessions toward the per-IP session limit
 
 - **Timestamp**: 2026-06-26
@@ -21866,3 +21914,76 @@ top.
   snat_contract_doc_guard passes (count=2, doc-parse=2), 0 failures total.
   **File(s)**: userspace-dp/tests/snat_contract_doc_guard.rs,
   docs/pr/1373-retire-ebpf-dataplane/plan-1377-snat-pools.md
+  **Action**: #3061 zone-local address books — parse `security zones
+  security-zone <z> address-book { address; address-set }` into
+  ZoneConfig.AddressBook (schema leaf + compileZones via shared
+  parseAddressBookEntries). resolveZoneLocalAddressBooks (end of
+  compileSecurity) folds zone-local entries into the global AddressBook under
+  zone-qualified internal names (zone-local/<zone>/<name>) and rewrites each
+  policy match token that resolves zone-locally; source-address scopes to
+  from-zone, destination-address to to-zone, zone-local wins over global,
+  global is the fallback. Downstream resolution (wire snapshot, nameToID,
+  validators, runtime resolveUserspaceAddressBookEntry) stays global-only. A
+  name only in zone A's book is invisible to zone B (undefined → #2008 commit
+  reject). 2 fail-on-revert tests (resolution + precedence/scoping).
+  **File(s)**: pkg/config/schema_security.go, pkg/config/types_security.go,
+  pkg/config/compiler_security.go,
+  pkg/dataplane/userspace/zone_local_addressbook_3061_test.go,
+  pkg/config/README.md, docs/config-schema.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3061 review fold (NEEDS-MINOR) — close the synthetic-name
+  collision hole. The lexer permits `/` in identifiers (for IP literals), so an
+  operator could name a global address `zone-local/trust/web-server` and have
+  the zone-local fold silently clobber it (wrong resolution, no commit error).
+  Added validateAddressBookEntryNamesStrict (compiler_validate_strict.go):
+  hard-rejects `/` in any address-book entry NAME (global + zone-local
+  address/address-set) and any security-zone NAME — only the NAME, never the
+  address VALUE/prefix. Strict on commit; lenientAddressBookNames downgrades to
+  a warning on tolerant load/peer-sync (#1960). Moved resolveZoneLocalAddressBooks
+  out of compileSecurity into compileExpanded so the name gate runs on the
+  PRISTINE global book BEFORE the fold injects `/`-bearing synthetic names; added
+  a no-clobber guard in the fold (skip an existing global-book key). Tightened
+  the now-true collision-proof claim in the comment + README + config-schema. 5
+  new tests (3 reject = fail-on-revert RED, normal-config anti-over-reject incl.
+  prefix value with `/`, lenient downgrade).
+  **File(s)**: pkg/config/compiler.go, pkg/config/compiler_security.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/addressbook_name_slash_3061_test.go,
+  pkg/config/README.md, docs/config-schema.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3090 — implement wildcard from-zone/to-zone `any` policy
+  indexing in the userspace dataplane, lifting the #3018 interim commit reject.
+  PolicyState gains three dedicated index lists — from-any (keyed by concrete
+  to-zone id), to-any (keyed by concrete from-zone id), both-any — populated by
+  `parse_policy_state_with_counters`. `evaluate_policy_result_with_icmp`
+  consults them in Junos most-specific-first precedence (exact → single-wildcard
+  merged in config order → both-any → junos-global → default), all O(1) hashmap
+  probes (no N×N expansion). `evaluate_junos_host_policy` consults
+  `from-zone any to-zone junos-host` so the host path is not a new fail-open;
+  to-any / both-any are intentionally excluded from the host path (lifeline).
+  Go: removed `validatePolicyWildcardZoneStrict` + `lenientPolicyWildcardZone`
+  flag/dispatch; flipped the #3018 tests to assert commit-and-enforce. 9 new
+  Rust tests (fail-on-revert: disabling the tiers turns 7 RED, incl.
+  from_zone_any_matches_across_ingress_zones /
+  to_zone_any_matches_across_egress_zones). No wire-field change (snapshot
+  already carries zone strings as literals).
+  **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+  pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/policy_zone_ref_test.go, pkg/config/README.md,
+  docs/userspace-dataplane-architecture.md
+  **Action**: #3099 — replace the capped-exact-map session aggregator with a
+  Space-Saving (Metwally et al.) top-K counter set. K = defaultMaxAggKeys
+  (10000) per direction; map + min-heap keyed on bytes (O(log K) Add); each
+  counter carries (bytes,bytesErr) with the standard
+  bytes-bytesErr<=true<=bytes guarantee; bytes stay the ranking key; the
+  per-window overflow (eviction) count keeps surfacing on the
+  RT_FLOW_SESSION_AGGREGATE dropped-keys warning line. Top-K is now
+  arrival-order independent (a late heavy hitter evicts the min instead of
+  being dropped). Added fail-on-revert tests
+  (TestSessionAggregator_LateHeavyHitterArrivalOrder — RED on the old capped
+  map, TestSessionAggregator_SpaceSavingErrorGuarantee) and migrated
+  TestSessionAggregator_CardinalityCap to the new internals.
+  **File(s)**: pkg/logging/aggregator.go, pkg/logging/aggregator_test.go,
+  docs/phases.md, docs/feature-gaps.md
