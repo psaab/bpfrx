@@ -22279,3 +22279,24 @@ top.
   userspace-dp/src/afxdp/coordinator/status.rs,
   userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/test_fixtures.rs,
   userspace-dp/tests/fixtures/protocol_wire_v1.json
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3270 — populate flowDirection (IPFIX/NetFlow v9 IE 61) from the
+  per-zone sampling-direction, opt-in via `export-extension flow-dir`. Added
+  `ExportConfig.FlowDirection` (ingress `sampling input`→0, egress-only
+  `sampling output`→1, ingress-wins tie) + `SessionCloseData.Direction`;
+  daemon callbacks derive it at dispatch. v9/IPFIX templates splice IE 61
+  before the post-NAT trailer only when IncludeFlowDir is set (no #2613
+  synthetic-zero); IPFIX record 70/118→71/119 with flow-dir, v9 absorbs the
+  byte into FlowSet padding. Commit-time warning now fires only when flow-dir
+  is set with no sampling-direction configured. Go-only — no Rust/wire change
+  ([146] stays reserved). Flipped TestV9TemplateFlowDirAlwaysAbsent→Conditional,
+  reframed dropped_fields IE-61 pin to base-template, added
+  TestFlowDirectionFromSampling + conditional/encode/size pins + daemon
+  end-to-end TestSessionCloseFlowDirectionEgress (fail-on-revert verified).
+  **File(s)**: pkg/flowexport/manager.go, pkg/flowexport/netflow.go,
+  pkg/flowexport/ipfix.go, pkg/flowexport/exporter_test.go,
+  pkg/flowexport/dropped_fields_test.go, pkg/flowexport/flowdir_test.go,
+  pkg/daemon/daemon_flowexport.go,
+  pkg/daemon/daemon_flowexport_flowdir_test.go,
+  pkg/config/compiler_validate_warn.go, pkg/flowexport/README.md

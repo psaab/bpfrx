@@ -601,12 +601,13 @@ func TestBuildIPFIXExportConfig_DistinctSourceAddressesAreNotDeduped(t *testing.
 	}
 }
 
-// TestV9TemplateFlowDirAlwaysAbsent pins the #2613 contract: fieldDirection
-// (IE 61) is no longer advertised in the v9 templates regardless of the
-// IncludeFlowDir option, because the SESSION_CLOSE wire frame carries no
-// per-flow direction (it would always be 0 at the collector). The option is
-// retained as an accepted no-op.
-func TestV9TemplateFlowDirAlwaysAbsent(t *testing.T) {
+// TestV9TemplateFlowDirConditional pins the #3270 contract: fieldDirection
+// (IE 61) appears in the v9 template IFF IncludeFlowDir is set. Opt-out keeps
+// it absent (no #2613 synthetic-zero regression); opt-in advertises it so the
+// collector parses the real sampling-direction-derived value. Reverting the
+// splice (so the field never appears even with IncludeFlowDir) re-fails the
+// present-when-enabled half.
+func TestV9TemplateFlowDirConditional(t *testing.T) {
 	for _, includeDir := range []bool{true, false} {
 		opts := V9TemplateOptions{IncludeFlowDir: includeDir}
 		for _, tc := range []struct {
@@ -616,31 +617,37 @@ func TestV9TemplateFlowDirAlwaysAbsent(t *testing.T) {
 			{"v4", buildTemplateFieldsV4(opts)},
 			{"v6", buildTemplateFieldsV6(opts)},
 		} {
+			found := false
 			for _, f := range tc.fields {
 				if f.fieldType == fieldDirection {
-					t.Errorf("includeDir=%v %s: fieldDirection must not appear (#2613)",
-						includeDir, tc.name)
+					found = true
 				}
+			}
+			if found != includeDir {
+				t.Errorf("includeDir=%v %s: fieldDirection present=%v, want %v",
+					includeDir, tc.name, found, includeDir)
 			}
 		}
 	}
 }
 
 // TestV9TemplateDroppedFieldsAbsent walks the encoded template FlowSet bytes
-// and asserts the still-dropped #2613 IE (Direction) is NOT advertised.
-// Re-adding it (with a synthetic-zero encoder write) re-fails this test
-// (fail-on-revert).
+// and asserts the genuinely-dropped #2613 IEs stay absent.
 //
 // #2749: SrcTos (5), TCPFlags (6), InputSNMP (10) and OutputSNMP (14) are NO
 // LONGER in this set — they are re-introduced with real values (forward DSCP,
 // cumulative TCP control bits, ingress/egress ifindex) and pinned PRESENT by
-// TestNetflowIngressInterfacePopulated / TestNetflowCosFieldsPopulated. Only
-// flowDirection (61) stays dropped (no real per-flow direction yet).
+// TestNetflowIngressInterfacePopulated / TestNetflowCosFieldsPopulated.
+//
+// #3270: flowDirection (61) is no longer unconditionally dropped — it is
+// advertised when `export-extension flow-dir` is set, pinned conditionally by
+// TestV9TemplateFlowDirConditional. This test walks the BASE template
+// (IncludeFlowDir off) so IE 61 must still be absent there.
 func TestV9TemplateDroppedFieldsAbsent(t *testing.T) {
 	dropped := map[uint16]string{
 		fieldDirection: "Direction",
 	}
-	for _, includeDir := range []bool{true, false} {
+	for _, includeDir := range []bool{false} {
 		tmplFS := encodeTemplateFlowSet(V9TemplateOptions{IncludeFlowDir: includeDir})
 		if setID := binary.BigEndian.Uint16(tmplFS[0:2]); setID != 0 {
 			t.Errorf("flowset ID = %d, want 0", setID)
