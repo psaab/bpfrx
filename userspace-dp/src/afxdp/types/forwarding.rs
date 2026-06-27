@@ -174,9 +174,10 @@ pub(in crate::afxdp) struct ForwardingState {
 /// entry means admit-all (the pre-#3070 behaviour) for that zone.
 ///
 /// Service tokens are classified to L4 signatures: TCP/UDP services contribute
-/// destination ports; ICMP-bearing services (ping, router-discovery) and the
-/// raw `protocols` routing tokens contribute either an ICMP/ICMPv6 admit bit or
-/// an IP-protocol number. `all_services` (Junos `system-services { all }` or
+/// destination ports; ICMP-bearing services (ping, router-discovery) contribute
+/// the specific ICMP/ICMPv6 *types* they imply (#3201/#3240 — not the whole
+/// protocol); the raw `protocols` routing tokens contribute an IP-protocol
+/// number. `all_services` (Junos `system-services { all }` or
 /// `any-service`) short-circuits to a full admit. `protocols { all }` is NOT a
 /// blanket admit (#3199): it expands at classify time to the routing-protocol
 /// signatures (ospf/bgp/rip/.../router-discovery), so it admits routing
@@ -204,13 +205,21 @@ pub(in crate::afxdp) struct ZoneHostInbound {
     /// #3225: IPv6-ONLY admitted UDP ports (dhcpv6=546/547, ripng=521). Consulted
     /// by `admits` only when the packet is IPv6.
     pub(in crate::afxdp) udp_ports_v6: FastSet<u16>,
-    /// Admit ICMPv4 (ping / router-discovery contribute this). The granularity
-    /// is the L4 protocol, not the ICMP type — a zone permitting `ping` OR
-    /// `router-discovery` admits ICMPv4 echo and router-discovery alike. This
-    /// is documented, slightly-lenient-vs-Junos-icmp-subtype behaviour.
-    pub(in crate::afxdp) icmp: bool,
-    /// Admit ICMPv6 (ping / router-discovery for v6).
-    pub(in crate::afxdp) icmpv6: bool,
+    /// #3201/#3240: admitted ICMPv4 *types* (not the whole protocol). A service
+    /// contributes only the ICMP subtypes it implies — `ping` → echo-request
+    /// (8); `router-discovery` → router-advertisement/solicitation (9, 10) —
+    /// mirroring the kernel nft chain (`pkg/daemon/daemon_nft.go`
+    /// `hostInboundServiceMatches` / `hostInboundProtocolMatches`), so the
+    /// AF_XDP fast-path admit set equals the nft chain's per-service type set.
+    /// ICMP *error* / PMTUD subtypes are admitted globally and unconditionally
+    /// by `is_icmp_host_inbound_global_accept` (#3171), so they are NOT carried
+    /// per-zone here.
+    pub(in crate::afxdp) icmp_types_v4: FastSet<u8>,
+    /// #3201/#3240: admitted ICMPv6 *types* — `ping` → echo-request (128).
+    /// `router-discovery` adds nothing on v6 (RS/RA ride the globally-accepted
+    /// ND set in `is_icmp_host_inbound_global_accept`, matching the nft chain
+    /// which returns nil for v6 router-discovery).
+    pub(in crate::afxdp) icmp_types_v6: FastSet<u8>,
     /// Admitted DUAL-FAMILY bare IP protocol numbers (gre=47, esp=50, ah=51,
     /// vrrp=112, pim=103, ...). Checked for non-TCP/UDP/ICMP packets.
     /// Family-specific protocols live in `ip_protocols_v4` / `ip_protocols_v6`.
@@ -225,9 +234,17 @@ pub(in crate::afxdp) struct ZoneHostInbound {
 }
 
 impl ZoneHostInbound {
-    /// Returns true iff a host-bound packet with the given L4 protocol and
-    /// destination port is admitted by this zone's host-inbound set.
-    pub(in crate::afxdp) fn admits(&self, protocol: u8, dst_port: u16, is_v6: bool) -> bool {
+    /// Returns true iff a host-bound packet with the given L4 protocol,
+    /// destination port and (for ICMP/ICMPv6) type is admitted by this zone's
+    /// host-inbound set. `icmp_type` is the first L4 byte for protocol 1 / 58
+    /// and is ignored for every other protocol.
+    pub(in crate::afxdp) fn admits(
+        &self,
+        protocol: u8,
+        dst_port: u16,
+        is_v6: bool,
+        icmp_type: u8,
+    ) -> bool {
         // Only `system-services { all }` / `any-service` is a full admit.
         // `protocols { all }` is NOT a blanket bypass (#3199): it expands to the
         // routing-protocol signatures at classify time and is matched below via
@@ -249,23 +266,21 @@ impl ZoneHostInbound {
                         self.udp_ports_v4.contains(&dst_port)
                     }
             }
-            // ICMPv4
-            1 => self.icmp,
-            // ICMPv6
-            58 => self.icmpv6,
+            // ICMPv4 — admit only the configured subtypes (#3201/#3240), e.g.
+            // `ping` → echo-request (8), `router-discovery` → 9/10. Error /
+            // PMTUD subtypes are admitted earlier by the global exemption.
+            1 => self.icmp_types_v4.contains(&icmp_type),
+            // ICMPv6 — admit only the configured subtypes (#3201/#3240).
+            58 => self.icmp_types_v6.contains(&icmp_type),
             other => {
-                if is_v6 && other == 58 {
-                    self.icmpv6
-                } else {
-                    // Bare IP protocol — dual-family OR the family-scoped set
-                    // (#3225: ospf=OSPFv2 v4-only, ospf3=OSPFv3 v6-only, igmp v4).
-                    self.ip_protocols.contains(&other)
-                        || if is_v6 {
-                            self.ip_protocols_v6.contains(&other)
-                        } else {
-                            self.ip_protocols_v4.contains(&other)
-                        }
-                }
+                // Bare IP protocol — dual-family OR the family-scoped set
+                // (#3225: ospf=OSPFv2 v4-only, ospf3=OSPFv3 v6-only, igmp v4).
+                self.ip_protocols.contains(&other)
+                    || if is_v6 {
+                        self.ip_protocols_v6.contains(&other)
+                    } else {
+                        self.ip_protocols_v4.contains(&other)
+                    }
             }
         }
     }

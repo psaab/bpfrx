@@ -22,6 +22,16 @@
 
 use super::*;
 
+// #3201/#3240: ICMP type numbers carried per-zone for subtype-specific
+// host-inbound admission. These mirror the nft chain's named-type matches
+// (`pkg/daemon/daemon_nft.go`): `ping` → echo-request, IPv4 `router-discovery`
+// → router-advertisement/solicitation (types 9/10). Error/PMTUD and IPv6 ND
+// subtypes are admitted globally instead (see `is_icmp_host_inbound_global_accept`).
+const ICMP4_ECHO_REQUEST: u8 = 8;
+const ICMP4_ROUTER_ADVERTISEMENT: u8 = 9;
+const ICMP4_ROUTER_SOLICITATION: u8 = 10;
+const ICMP6_ECHO_REQUEST: u8 = 128;
+
 /// Build the per-zone host-inbound admission table from the snapshot. Only
 /// zones with `host_inbound_configured == true` get an entry. The zone id used
 /// as the key MUST be the same validated id `populate_zones` accepted (caller
@@ -59,9 +69,13 @@ fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
         "https" | "webapi-ssl" => {
             hi.tcp_ports.insert(443);
         }
+        // #3201/#3240: `ping` admits ICMP echo-request ONLY (v4 type 8, v6 type
+        // 128), matching the nft chain (`hostInboundServiceMatches`:
+        // `icmp/icmpv6 type echo-request`) — NOT the whole ICMP protocol. ICMP
+        // error/PMTUD subtypes are admitted separately + globally (#3171).
         "ping" => {
-            hi.icmp = true;
-            hi.icmpv6 = true;
+            hi.icmp_types_v4.insert(ICMP4_ECHO_REQUEST);
+            hi.icmp_types_v6.insert(ICMP6_ECHO_REQUEST);
         }
         "dns" => {
             hi.udp_ports.insert(53);
@@ -237,48 +251,66 @@ fn classify_protocol(token: &str, hi: &mut ZoneHostInbound) {
         "nhrp" => {
             hi.ip_protocols.insert(54);
         }
-        // router-discovery is ICMP router solicitation/advertisement (v4) and
-        // ND RS/RA (v6). Admit ICMP/ICMPv6 at the protocol granularity.
+        // #3201/#3240: router-discovery admits ICMPv4 router-advertisement (9)
+        // and router-solicitation (10) ONLY — matching the nft chain
+        // (`hostInboundProtocolMatches`: `icmp type { 9, 10 }`). On v6, RS/RA
+        // are part of the always-accepted ND set (types 133-137) handled
+        // globally by `is_icmp_host_inbound_global_accept`, so router-discovery
+        // contributes nothing per-zone on v6 — exactly as the nft chain returns
+        // nil for v6 router-discovery and relies on the global ND accept.
         "router-discovery" => {
-            hi.icmp = true;
-            hi.icmpv6 = true;
+            hi.icmp_types_v4.insert(ICMP4_ROUTER_ADVERTISEMENT);
+            hi.icmp_types_v4.insert(ICMP4_ROUTER_SOLICITATION);
         }
         // Unknown / unmapped protocol token: ignore (fail-closed).
         _ => {}
     }
 }
 
-/// #3171: ICMP/ICMPv6 error (control) message subtypes that the host-inbound
-/// layer admits UNCONDITIONALLY — regardless of whether the ingress zone lists
-/// `ping` — so the userspace LocalDelivery classifier matches the kernel
-/// host-inbound chain's global ICMP-error accept (`pkg/daemon/daemon_nft.go`:
+/// #3171/#3201/#3240: ICMP/ICMPv6 subtypes that the host-inbound layer admits
+/// UNCONDITIONALLY — regardless of which services/protocols the ingress zone
+/// lists — so the userspace LocalDelivery classifier matches the kernel
+/// host-inbound chain's GLOBAL accepts at the top of the chain
+/// (`pkg/daemon/daemon_nft.go` `buildHostInboundFilterPayload`):
 /// `icmp type { destination-unreachable, time-exceeded, parameter-problem }`
-/// and `icmpv6 type { 1, 2, 3, 4, 133..137 }`). These carry PMTUD / unreachable
-/// / traceroute-to-self signalling that must reach a firewall-local address
-/// (e.g. a DNAT-to-self embedded ICMP error landing on the XSK) even on a
-/// configured ping-less zone. Without this exemption the userspace path dropped
-/// them while the kernel chain accepted them — a fail-toward-drop edge and the
-/// doc-vs-behavior inconsistency #3070's README flagged for embedded-ICMP.
+/// and `icmpv6 type { 1, 2, 3, 4, 133, 134, 135, 136, 137 }`.
 ///
-/// This set is deliberately NARROWER than `icmp::is_icmp_error` (the
+/// Two categories ride this global accept:
+///   1. ERROR / PMTUD control messages (#3171) — destination-unreachable,
+///      packet-too-big, time-exceeded, parameter-problem — which carry PMTUD /
+///      unreachable / traceroute-to-self signalling that must reach a
+///      firewall-local address (e.g. a DNAT-to-self embedded ICMP error landing
+///      on the XSK) even on a configured ping-less zone.
+///   2. IPv6 Neighbor Discovery (#3201/#3240) — RS (133), RA (134), NS (135),
+///      NA (136), Redirect (137). ND is core L3 operation, accepted globally by
+///      the nft chain (never a per-service exposure). Admitting it here is what
+///      lets the per-zone `router-discovery` token carry NOTHING on v6 while
+///      still matching nft — i.e. v6 RS/RA reach the host via this global ND
+///      accept on any host-inbound-configured zone, exactly as nft does.
+///
+/// The ICMPv4 set is deliberately NARROWER than `icmp::is_icmp_error` (the
 /// embedded-NAT reversal set, which also includes v4 Source Quench (4) and
-/// Redirect (5)): Source Quench is deprecated (RFC 6633) and Redirect is
-/// link-scoped — neither is a control message we admit to the host. ECHO
-/// REQUEST (v4 type 8 / v6 type 128) is NOT here: it stays gated on the `ping`
-/// system-service, so a ping-less zone still drops echo.
+/// Redirect (5)): Source Quench is deprecated (RFC 6633) and v4 Redirect is
+/// link-scoped — neither is a control message we admit to the host, and neither
+/// is in the nft v4 global accept. ECHO REQUEST (v4 type 8 / v6 type 128) is NOT
+/// here: it stays gated on the `ping` system-service (per-zone `icmp_types_*`),
+/// so a ping-less zone still drops echo. IPv4 router-advertisement/solicitation
+/// (9/10) are likewise NOT global — they are gated on `router-discovery` per
+/// zone (nft `icmp type { 9, 10 }`).
 ///
 /// Keep this set in lock-step with the kernel chain in
 /// `pkg/daemon/daemon_nft.go` and its
 /// `TestHostInboundFilterExemptsIPsecAndV6Errors` accept assertions.
-fn is_icmp_host_inbound_error(protocol: u8, icmp_type: u8) -> bool {
+fn is_icmp_host_inbound_global_accept(protocol: u8, icmp_type: u8) -> bool {
     match protocol {
         // ICMPv4: destination-unreachable (3, also carries PMTUD
         // "fragmentation needed" as code 4), time-exceeded (11),
         // parameter-problem (12).
         1 => matches!(icmp_type, 3 | 11 | 12),
-        // ICMPv6: destination-unreachable (1), packet-too-big (2, PMTUD),
-        // time-exceeded (3), parameter-problem (4).
-        58 => matches!(icmp_type, 1 | 2 | 3 | 4),
+        // ICMPv6 errors: destination-unreachable (1), packet-too-big (2,
+        // PMTUD), time-exceeded (3), parameter-problem (4); PLUS the ND set:
+        // RS (133), RA (134), NS (135), NA (136), Redirect (137).
+        58 => matches!(icmp_type, 1 | 2 | 3 | 4 | 133 | 134 | 135 | 136 | 137),
         _ => false,
     }
 }
@@ -299,15 +331,17 @@ pub(in crate::afxdp) fn host_inbound_admits(
     is_v6: bool,
     icmp_type: u8,
 ) -> bool {
-    // #3171: error/PMTUD control messages are admitted before the zone lookup
-    // so PMTUD / unreachable / traceroute-to-self works on a configured zone
-    // that omits `ping`, matching the kernel host-inbound chain. Echo-request is
-    // not in this set, so it stays gated on the `ping` system-service below.
-    if is_icmp_host_inbound_error(protocol, icmp_type) {
+    // #3171/#3201/#3240: error/PMTUD control messages AND the IPv6 ND set are
+    // admitted before the zone lookup so PMTUD / unreachable / traceroute-to-self
+    // and v6 RS/RA work on a configured zone that omits `ping` / scopes
+    // router-discovery, matching the kernel host-inbound chain's global accepts.
+    // Echo-request and IPv4 router-advert/solicit are NOT in this set, so they
+    // stay gated on the `ping` / `router-discovery` tokens below.
+    if is_icmp_host_inbound_global_accept(protocol, icmp_type) {
         return true;
     }
     match state.zone_host_inbound.get(&ingress_zone_id) {
         None => true,
-        Some(hi) => hi.admits(protocol, dst_port, is_v6),
+        Some(hi) => hi.admits(protocol, dst_port, is_v6, icmp_type),
     }
 }

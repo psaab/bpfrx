@@ -1,3 +1,31 @@
+## 2026-06-26 — #3201/#3240 host-inbound ICMP admission is sub-type specific
+
+- **Timestamp**: 2026-06-26
+- **Action**: the Rust host-inbound classifier admitted ICMP at L4-PROTOCOL
+  granularity (`ping`/`router-discovery` set `icmp=true; icmpv6=true`), so the
+  AF_XDP fast-path local-delivery admit was BROADER than the nft chain — a
+  `ping` zone admitted any ICMP type (timestamp/redirect/router-advert), a
+  `router-discovery` zone admitted echo. Replaced the `icmp`/`icmpv6` bools on
+  `ZoneHostInbound` with per-family ICMP-type sets `icmp_types_v4` /
+  `icmp_types_v6`; `admits` now takes the `icmp_type` (already extracted at both
+  poll_descriptor call sites for #3171) and checks membership. `ping` →
+  echo-request only (v4 8 / v6 128); IPv4 `router-discovery` → types 9/10; v6
+  RS/RA ride the global ND accept. Renamed `is_icmp_host_inbound_error` →
+  `is_icmp_host_inbound_global_accept` and extended the v6 arm to also admit the
+  ND set (133-137), matching the nft chain's global
+  `icmpv6 type { 1,2,3,4,133,134,135,136,137 } accept` — this is what lets v6
+  router-discovery carry nothing per-zone while staying at parity (#3240). The
+  per-zone Rust admit set now equals the nft chain's per-service type set for
+  every ICMP service. No wire change (derived Rust-side from the existing
+  host_inbound token list, like #3225). Preserves #3171 error/PMTUD admission
+  and #3225 family-awareness. Fail-on-revert: restoring protocol-wide ICMP
+  (`!icmp_types_v4.is_empty()`) turns the new "ping DROPS timestamp-request"
+  assertion RED.
+- **File(s)**: `userspace-dp/src/afxdp/types/forwarding.rs`,
+  `userspace-dp/src/afxdp/forwarding/host_inbound.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/afxdp/forwarding/README.md`
+
 ## 2026-06-26 — #2883 event-stream idle keepalive rides write_buf backpressure
 
 - **Timestamp**: 2026-06-26
