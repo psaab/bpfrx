@@ -834,6 +834,86 @@ fn go_unsupported_sentinel_fails_closed() {
 }
 
 #[test]
+fn deny_rule_with_unrepresentable_app_rejects_whole_snapshot_no_fall_through() {
+    // #3261 doctrine guard (plan test #4): a `deny` rule naming an
+    // unrepresentable application AHEAD of a later `permit application any` in
+    // the same zone-pair must reject the WHOLE snapshot — the bad traffic must
+    // NOT fall through to the permit. This is exactly the deny-rule fail-open
+    // Option B would have reintroduced; Option A keeps it fail-CLOSED via the
+    // whole-snapshot integrity reject (previous-good retained; fresh boot =
+    // default-deny). A per-rule drop of the deny term would let the blocked
+    // traffic reach the permit — the regression this pins.
+    let store = PolicyCounterStore::default();
+    let deny_bad = PolicyRuleSnapshot {
+        rule_id: "deny-bad".to_string(),
+        name: "deny-bad".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["__unsupported__".to_string()],
+        application_terms: vec![PolicyApplicationSnapshot {
+            name: "__unsupported__".to_string(),
+            protocol: "__unsupported__".to_string(),
+            source_port: String::new(),
+            destination_port: String::new(),
+            icmp_type: None,
+            icmp_code: None,
+            inactivity_timeout: None,
+        }],
+        action: "deny".to_string(),
+        ..Default::default()
+    };
+    let permit_any = PolicyRuleSnapshot {
+        rule_id: "permit-any".to_string(),
+        name: "permit-any".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "permit".to_string(),
+        ..Default::default()
+    };
+    let result = parse_policy_state_with_counters(
+        "deny",
+        &[deny_bad, permit_any],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(SnapshotIntegrityError::UnrepresentableApplicationProtocol { .. })
+        ),
+        "deny+unrepresentable ahead of permit-any must reject the whole snapshot \
+         (no fall-through), got {result:?}"
+    );
+}
+
+#[test]
+fn fresh_boot_default_policy_state_denies_all_transit() {
+    // #3261 (plan test #3, fresh-boot half): when the FIRST-ever snapshot is
+    // rejected by the integrity preflight, the helper stays armed with the
+    // default PolicyState — whose default_action is Deny. So a fresh boot with
+    // only a bad config DENIES all transit (NOT kernel fail-open). This pins
+    // the safe-side outcome of Option A's one degraded-vs-ideal scenario.
+    let state = PolicyState::default();
+    assert_eq!(state.default_action, PolicyAction::Deny);
+    let src = "10.0.61.100".parse().expect("src");
+    let dst = "172.16.80.200".parse().expect("dst");
+    assert_eq!(
+        evaluate_policy(
+            &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_TCP, 40000, 443,
+        ),
+        PolicyAction::Deny,
+        "fresh-boot default PolicyState must deny all transit"
+    );
+}
+
+#[test]
 fn empty_application_terms_stay_match_any() {
     // Regression guard: genuinely-empty application_terms (Junos
     // `application any` / no match application) must remain match-any and parse

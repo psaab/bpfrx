@@ -22279,3 +22279,34 @@ top.
   userspace-dp/src/afxdp/coordinator/status.rs,
   userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/test_fixtures.rs,
   userspace-dp/tests/fixtures/protocol_wire_v1.json
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3261 — keep the userspace helper ARMED for unrepresentable
+  policy content; rely on the existing Rust whole-snapshot integrity reject
+  (the #2124 fail-closed family) instead of disarming into kernel forwarding.
+  Root cause: a leniently-loaded / peer-synced unrepresentable-content config
+  (e.g. a protocol-less application) made `deriveUserspaceCapabilities` return
+  `ForwardingSupported=false` → the pre-publish disarm fired → the XDP shim
+  `XDP_PASS`ed transit to the kernel, BYPASSING the integrity reject that would
+  have retained the previous-good snapshot. Fail-closed intent failed OPEN.
+  Fix (Go only, no Rust contract change): split the capability gate into class
+  (i) unrepresentable policy *content* (recorded in `caps.PolicyContentRejected`,
+  does NOT clear `ForwardingSupported`) and class (ii) genuinely-unsupported
+  *semantics* (still disarm). `disarmBeforeUnsupportedPublishLocked` keeps a
+  narrow disarm for class (i) only on an OLD helper
+  (`ConfigSnapshotProtocolVersion < ProtocolVersion`, which cannot be trusted to
+  reject the sentinel). Surfaced the reject via
+  `ProcessStatus.LastSnapshotRejectReasons`, a one-shot `slog.Warn`, and the
+  `xpf_userspace_policy_content_rejected` 0/1 gauge. Running node → previous-good
+  retained; fresh boot → default-deny `PolicyState`; deny-rule stays fail-CLOSED.
+  Validation: fail-on-revert proven (3 Go tests flip RED on revert); full
+  `cargo build --release` + `cargo test --release` (0 failures); `go build ./...`
+  + `go test ./pkg/dataplane/... ./pkg/config/...` green.
+  **File(s)**: pkg/dataplane/userspace/capabilities.go,
+  pkg/dataplane/userspace/manager_ha.go, pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/protocol_failopen_2124_test.go,
+  pkg/dataplane/userspace/lenient_keep_armed_3261_test.go,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
+  pkg/api/metrics_userspace.go, userspace-dp/src/policy_tests.rs,
+  docs/userspace-dataplane-gaps.md

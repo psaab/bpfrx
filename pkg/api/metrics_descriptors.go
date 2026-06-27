@@ -349,6 +349,20 @@ func newCollector(srv *Server) *xpfCollector {
 				"when config persistence is healthy.",
 			nil, nil,
 		),
+		userspacePolicyContentRejected: prometheus.NewDesc(
+			"xpf_userspace_policy_content_rejected",
+			"1 while the most recently built userspace snapshot carries "+
+				"unrepresentable policy content (a policy names an "+
+				"application protocol/port or address the matcher cannot "+
+				"represent) that the helper integrity preflight rejects "+
+				"(#3261). The helper stays armed and retains the "+
+				"previous-good policy state (a fresh boot lands on "+
+				"default-deny) — it never fails open to the kernel. Nonzero "+
+				"means the running dataplane policy is NOT the committed "+
+				"config; edit out the offending application/address and "+
+				"re-commit. 0 when the last build was fully representable.",
+			nil, nil,
+		),
 		rpmPinInstallFailures: prometheus.NewDesc(
 			"xpf_rpm_probe_pin_install_failures",
 			"Number of RPM next-hop probe pins whose kernel fwmark rule / "+

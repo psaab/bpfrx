@@ -963,6 +963,21 @@ type UserspaceMapPins struct {
 type UserspaceCapabilities struct {
 	ForwardingSupported bool     `json:"forwarding_supported"`
 	UnsupportedReasons  []string `json:"unsupported_reasons,omitempty"`
+	// PolicyContentRejected lists the reasons the published snapshot carries
+	// the reserved __unsupported__ sentinel term and will be REJECTED by the
+	// helper's non-mutating integrity preflight (the #2124 fail-closed family).
+	// UNLIKE UnsupportedReasons, these entries do NOT disarm the helper
+	// (#3261): the snapshot still publishes, the current helper rejects it via
+	// SnapshotIntegrityError and KEEPS the previous-good PolicyState (running
+	// node) or leaves the default-deny PolicyState (fresh boot) — it never
+	// fails open to the kernel. Setting ForwardingSupported=false for this
+	// class instead DISARMS the helper, so the XDP shim XDP_PASSes transit to
+	// the kernel and bypasses the integrity reject — the system-level
+	// fail-OPEN #3261 closes. Go-side diagnostic only; omitempty so
+	// representable configs keep their exact wire shape (and snapshot hash).
+	// The Rust helper has no field for this and (lacking deny_unknown_fields)
+	// silently ignores it on decode.
+	PolicyContentRejected []string `json:"policy_content_rejected,omitempty"`
 }
 
 type ProcessStatus struct {
@@ -982,13 +997,24 @@ type ProcessStatus struct {
 	Enabled                          bool                  `json:"enabled"`
 	ForwardingArmed                  bool                  `json:"forwarding_armed,omitempty"`
 	Capabilities                     UserspaceCapabilities `json:"capabilities"`
-	LastSnapshotGeneration           uint64                `json:"last_snapshot_generation"`
-	LastFIBGeneration                uint32                `json:"last_fib_generation,omitempty"`
-	LastSnapshotAt                   time.Time             `json:"last_snapshot_at,omitempty"`
-	InterfaceAddresses               int                   `json:"interface_addresses,omitempty"`
-	NeighborEntries                  int                   `json:"neighbor_entries,omitempty"`
-	SessionTableEntries              uint64                `json:"session_table_entries,omitempty"`
-	MaxSessions                      uint64                `json:"max_sessions,omitempty"`
+	// LastSnapshotRejectReasons is the manager-owned (#3261) diagnostic
+	// recording why the most recent snapshot build carries unrepresentable
+	// policy content that the helper integrity preflight rejects (previous-good
+	// retained / fresh-boot default-deny — never fail-open). It is STAMPED by
+	// recordHelperStatusLocked from m.lastSnapshotRejectReasons, NOT reported
+	// by the helper (which strips the unknown PolicyContentRejected field on
+	// round-trip). Empty means the last build was fully representable. Surfaced
+	// as xpf_userspace_policy_content_rejected so the Go/Rust status skew
+	// (ForwardingSupported=true while the helper rejected the snapshot) is
+	// observable.
+	LastSnapshotRejectReasons []string  `json:"last_snapshot_reject_reasons,omitempty"`
+	LastSnapshotGeneration    uint64    `json:"last_snapshot_generation"`
+	LastFIBGeneration         uint32    `json:"last_fib_generation,omitempty"`
+	LastSnapshotAt            time.Time `json:"last_snapshot_at,omitempty"`
+	InterfaceAddresses        int       `json:"interface_addresses,omitempty"`
+	NeighborEntries           int       `json:"neighbor_entries,omitempty"`
+	SessionTableEntries       uint64    `json:"session_table_entries,omitempty"`
+	MaxSessions               uint64    `json:"max_sessions,omitempty"`
 	// #1760: aggregate NAT reverse-key displacement events summed across
 	// the per-worker session tables -- the latent 1:N collision (#1758)
 	// made observable. Near-precise upper bound on live collisions (counts

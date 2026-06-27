@@ -68,7 +68,7 @@ final-validation artifact set are closed. The explicit gates live in
 
 | Feature/config shape | Userspace status | Tracker / disposition |
 |----------------------|-------------|--------------------|
-| Unsupported policy shapes | Gated | Address/application expansion must succeed for userspace. #2124: an application term whose protocol the matcher cannot represent (sctp/esp/ah/vrrp/igmp/pim/egp now parse and are canonicalized to their IANA number; anything else, or a malformed port, is unrepresentable) fails the capability gate (`expandUserspacePolicyApplications` -> `ForwardingSupported=false`, refuse-to-arm) rather than collapsing the rule to match-any. On a failed expansion the daemon emits a reserved `__unsupported__` sentinel term so the Rust matcher rejects the whole snapshot via `SnapshotIntegrityError` (keeping the previous good state) — an action-agnostic fail-closed that never turns a permit into match-any nor a deny into a pass, closing the publish-before-disarm window. |
+| Unsupported policy shapes | Gated | Address/application expansion must succeed for userspace. #2124: an application term whose protocol the matcher cannot represent (sctp/esp/ah/vrrp/igmp/pim/egp now parse and are canonicalized to their IANA number; anything else, or a malformed port, is unrepresentable) fails `expandUserspacePolicyApplications`. On a failed expansion the daemon emits a reserved `__unsupported__` sentinel term so the Rust matcher rejects the whole snapshot via `SnapshotIntegrityError` (keeping the previous good state) — an action-agnostic fail-closed that never turns a permit into match-any nor a deny into a pass. **#3261 refinement (the keep-armed contract):** unrepresentable policy *content* (this class) is now treated DISTINCTLY from a genuinely-unsupported dataplane *semantic*. It is recorded in `caps.PolicyContentRejected` and does **NOT** set `ForwardingSupported=false` / does NOT disarm the helper. Disarming would `XDP_PASS` transit to the kernel and BYPASS the integrity reject — a system-level fail-OPEN. Instead the helper stays armed, publishes the sentinel snapshot, and the helper's non-mutating integrity preflight rejects it: a running node RETAINS the previous-good policy state; a fresh boot whose first-ever snapshot is bad lands on the default-deny `PolicyState` (never kernel-forwarded). The deny-rule case stays fail-CLOSED (the whole-snapshot reject keeps a dropped `deny BAD` term from letting blocked traffic fall through to a later permit). The reject is observable: `ProcessStatus.LastSnapshotRejectReasons`, a one-shot `slog.Warn` on the transition, and the `xpf_userspace_policy_content_rejected` 0/1 gauge surface the deliberate Go/Rust skew (`ForwardingSupported=true` while the helper rejected the snapshot). It is in-band recoverable: the config still loads via `CompileConfigLenient`, so the operator edits out the offending application/address and re-commits. The ONE narrow disarm kept for this class is keyed on the helper's snapshot protocol version: an OLDER local helper that predates the integrity preflight cannot be trusted to reject the sentinel, so `disarmBeforeUnsupportedPublishLocked` disarms only when `ConfigSnapshotProtocolVersion < ProtocolVersion`. GENUINELY-unsupported semantics with no fail-closed snapshot representation (color-aware three-color policers, SYN-cookie screen material, persistent SNAT under HA) still set `ForwardingSupported=false` and still disarm — that legitimate path is unchanged. |
 | Screen behavior requiring SYN cookies | Supported | Closed feature-gap (#1374); #1477 final validation closed |
 | HA with per-pool source NAT `persistent-nat` | Gated | Closed/documented contract: helper-memory persistent-NAT leases are not HA-synchronized, so HA configs that reference persistent source-NAT pools are not admitted |
 | Port mirroring | Supported | Closed feature-gap (#1376); #1477 final validation closed |
@@ -152,9 +152,13 @@ There are two distinct fallback boundaries:
      `ErrEBPFBackendRetired`. The deprecation-warning surface that
      preceded the hard reject is gone.
    - The Go manager keeps `xdp_userspace_prog` as the userspace-mode
-     XDP entry. Capability gates disarm helper forwarding rather than
-     swapping userspace runtime traffic into the (now-deleted)
-     `xdp_main_prog`.
+     XDP entry. Capability gates for genuinely-unsupported *semantics*
+     (class ii: color-aware policers, SYN-cookie material, persistent
+     SNAT under HA) disarm helper forwarding rather than swapping
+     userspace runtime traffic into the (now-deleted) `xdp_main_prog`.
+     Unrepresentable policy *content* (class i) does NOT disarm (#3261):
+     it relies on the helper integrity reject (previous-good retained /
+     fresh-boot default-deny) so it never fails open to the kernel.
 
 2. **Runtime XDP decision**
    - Even when `xdp_userspace_prog` is active, the XDP shim can still:

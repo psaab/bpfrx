@@ -50,9 +50,33 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 		caps.ForwardingSupported = false
 		caps.UnsupportedReasons = append(caps.UnsupportedReasons, reason)
 	}
+	// #3261: distinguish unrepresentable policy CONTENT from a genuinely
+	// undeliverable dataplane semantic.
+	//
+	// CLASS (i) — unrepresentable policy content (a security policy naming an
+	// application protocol/port or address the userspace matcher cannot
+	// represent). This must NOT disarm the helper. buildOneRuleSnapshot already
+	// emits the reserved __unsupported__ sentinel term for such a rule, and the
+	// helper's non-mutating integrity preflight rejects the WHOLE snapshot
+	// (UnrepresentableApplicationProtocol, #2124) — keeping the previous-good
+	// PolicyState on a running node, or leaving the default-deny PolicyState on
+	// a fresh boot. Setting ForwardingSupported=false here instead would DISARM
+	// the helper, so the XDP shim XDP_PASSes transit to the kernel and bypasses
+	// the integrity reject (the kernel forwards with NO xpf policy) — the
+	// system-level fail-OPEN #3261 closes. The deny-rule case is the doctrine
+	// guard: dropping a `deny BAD` term would let blocked traffic fall through;
+	// the whole-snapshot reject keeps it fail-CLOSED. Record this as a
+	// separate, non-disarming diagnostic (surfaced into status + a one-shot
+	// log + Prometheus so the resulting Go/Rust skew stays observable).
 	if !userspaceSupportsSecurityPolicies(cfg) {
-		addReason("full security policy semantics are not implemented in the userspace dataplane")
+		caps.PolicyContentRejected = append(
+			caps.PolicyContentRejected,
+			"security policy names application/address content the userspace matcher cannot represent: snapshot rejected by the integrity preflight, previous-good retained (fresh boot: default-deny), helper stays armed",
+		)
 	}
+	// CLASS (ii) — genuinely-unsupported semantics with NO fail-closed snapshot
+	// representation. There is no sentinel/reject backstop for these, so the
+	// dataplane legitimately cannot forward at all: keep disarming.
 	// Pool-mode source NAT is now implemented in the userspace dataplane
 	// (PortAllocator with round-robin address + port allocation).
 	// NAT64 is supported — NATv6v4 config (no-v6-frag-header option) is fine

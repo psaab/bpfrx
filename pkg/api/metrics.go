@@ -108,6 +108,15 @@ type xpfCollector struct {
 	// yet succeeded (restart would load a stale config).
 	configPersistDegraded *prometheus.Desc
 
+	// #3261: 0/1 gauge — 1 while the most recently built userspace snapshot
+	// carries unrepresentable policy content that the helper integrity
+	// preflight rejects (previous-good retained / fresh-boot default-deny —
+	// never fail-open). Nonzero means the running dataplane policy is NOT the
+	// committed config; edit out the offending application/address and
+	// re-commit. Surfaces the deliberate Go/Rust skew (ForwardingSupported=true
+	// while the helper rejected the snapshot) so it is observable.
+	userspacePolicyContentRejected *prometheus.Desc
+
 	// #1827: services ip-monitoring observability. #1844 adds the
 	// unresolved interface-typed next-hop gauge (preferred routes of
 	// FAILED policies skipped from the overlay for lack of a
@@ -512,6 +521,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.neighborPeriodicAge
 	ch <- c.frrReloadDegraded
 	ch <- c.configPersistDegraded
+	ch <- c.userspacePolicyContentRejected
 	ch <- c.ipmonPolicyFailed
 	ch <- c.ipmonPolicyTransitions
 	ch <- c.ipmonRoutesApplied

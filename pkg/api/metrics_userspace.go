@@ -48,6 +48,20 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 	c.emitNeighborWarmCounters(ch, status)
 	c.emitNeighborColdStartCapture(ch, status)
 	c.emitWireguardTelemetry(ch, status)
+	c.emitPolicyContentRejected(ch, status)
+}
+
+// emitPolicyContentRejected exposes the #3261 0/1 gauge: 1 while the last
+// userspace snapshot build carried unrepresentable policy content the helper
+// integrity preflight rejects (previous-good retained / fresh-boot
+// default-deny — never fail-open). Emitted unconditionally so 0 is a real
+// "representable" signal, not an absent series.
+func (c *xpfCollector) emitPolicyContentRejected(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	v := 0.0
+	if len(status.LastSnapshotRejectReasons) > 0 {
+		v = 1.0
+	}
+	ch <- prometheus.MustNewConstMetric(c.userspacePolicyContentRejected, prometheus.GaugeValue, v)
 }
 
 // emitWireguardTelemetry exposes the #1865 per-WG-tunnel telemetry
