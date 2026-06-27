@@ -1,3 +1,25 @@
+## 2026-06-26 — #3109 correct false lenient-path claim + file #3261
+
+- **Timestamp**: 2026-06-26
+- **Action**: hostile review of PR #3257 proved the original commit/PR/doc/comment
+  claim FALSE: the lenient load / HA-config-sync path does NOT keep "that one
+  referenced app's policy inert (refuse-to-arm)". `deriveUserspaceCapabilities`
+  is coarse — ANY unrepresentable application sets `ForwardingSupported=false`
+  for the WHOLE userspace dataplane; `SetForwardingArmed` then errors and the
+  XDP shim XDP_PASSes to the kernel `ip_forward` path (system-level fail-OPEN),
+  so one protocol-less app still disables enforcement globally on that path.
+  Corrected the code comment (compiler_validate_strict.go), docs, and PR body to
+  state the true behavior. Did NOT implement per-policy lenient isolation: it is
+  genuinely design-sensitive — a clean per-policy drop is fail-OPEN for deny
+  rules (a dropped `deny` falls through to a later `permit`; verified
+  try_match_rule returns None on no-match, default action Deny), which conflicts
+  with the deliberate #2124 whole-snapshot-reject fail-closed family
+  (#2124/#2142/#2173/#2212/#2240/#2241/#2391/#2505 in userspace-dp/src/policy.rs;
+  the doc comment there explicitly rejects term-dropping as fail-open for deny).
+  Filed #3261 (A/B/C options) for /research. Strict commit reject (PART 1) stays.
+- **File(s)**: `pkg/config/compiler_validate_strict.go`,
+  `docs/services-application-identification.md`, `_Log.md`
+
 ## 2026-06-26 — #3109 protocol-less application rejected at commit
 
 - **Timestamp**: 2026-06-26

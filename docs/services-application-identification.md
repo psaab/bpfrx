@@ -196,11 +196,22 @@ runtime effect is the L3/L4 catalog classification above
     `SnapshotIntegrityError::UnrepresentableApplicationProtocol`
     (`parse_protocol("") => None`). The commit gate
     (`validateApplicationSpecsStrict`) now names the one offending
-    application instead of letting it disable everything at apply time.
-    On the tolerant LOAD / peer-sync path it is downgraded to a warning
-    (no-brick): an already-persisted / older-peer-synced config still
-    BOOTS, and the #2124 runtime gate keeps that one referenced app's
-    policy inert (refuse-to-arm) rather than mis-matching.
+    application, so a NEW config can no longer reach the dataplane and
+    disable everything at apply time. **Caveat — the lenient/HA-sync path
+    is NOT yet isolated (#3261):** on the tolerant LOAD / peer-sync path
+    the error is downgraded to a warning (no-brick) so an
+    already-persisted / older-peer-synced config still BOOTS, but the
+    #2124 runtime gate is COARSE — an unrepresentable application still
+    makes `deriveUserspaceCapabilities` set `ForwardingSupported=false`
+    for the **whole** userspace dataplane, disarming userspace forwarding
+    and falling back to the kernel slow path (a system-level fail-OPEN).
+    So one protocol-less app on the lenient path STILL disables
+    enforcement globally; the strict commit gate is the real fix (it
+    stops such an app from ever being committed). Per-policy fail-closed
+    isolation of the lenient path is design-sensitive — a clean
+    per-policy *drop* is fail-open for deny rules, conflicting with the
+    deliberate #2124 whole-snapshot-reject fail-closed family — and is
+    tracked in #3261.
 - `applications application-set` — expands into individual
   applications at compile time. Members may be either
   `application <name>` references or nested

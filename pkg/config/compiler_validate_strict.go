@@ -2652,12 +2652,24 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 		// application, so the Junos-parity fix is to reject the protocol-less spec at
 		// COMMIT (the same strict-at-commit / #1960 fail-closed doctrine as the #3150
 		// unresolvable-protocol case below and the #2142 malformed-port case above).
-		// The blast radius is now one NAMED application caught at commit instead of a
-		// silent whole-dataplane disable at apply. On the tolerant load / peer-sync
-		// path the call site (compiler.go, lenientApplicationSpecs) downgrades this to
-		// a warning so an already-persisted or older-peer-synced config still BOOTS;
-		// the #2124 runtime gate then keeps that one referenced app's policy inert
-		// (refuse-to-arm) — the deliberate fail-closed backstop, now operator-visible.
+		// The blast radius of a NEW config is now one NAMED application caught at
+		// commit instead of a silent whole-dataplane disable at apply. On the
+		// tolerant load / peer-sync path the call site (compiler.go,
+		// lenientApplicationSpecs) downgrades this to a warning so an
+		// already-persisted or older-peer-synced config still BOOTS (no-brick).
+		//
+		// IMPORTANT (truthful caveat, see #3261): the #2124 runtime gate does NOT
+		// isolate this to one policy. deriveUserspaceCapabilities
+		// (pkg/dataplane/userspace/capabilities.go) is coarse — ANY policy whose
+		// application is unrepresentable sets ForwardingSupported=false for the
+		// WHOLE userspace dataplane, which disarms userspace forwarding and falls
+		// back to the kernel slow path (a system-level fail-OPEN). So on the lenient
+		// path a single protocol-less app STILL disables enforcement globally. This
+		// strict commit gate is the real fix: it keeps such an app from ever being
+		// committed. Per-policy fail-closed isolation of the lenient/HA-sync path is
+		// design-sensitive (it conflicts with the #2124 whole-snapshot-reject
+		// fail-closed family — term-dropping is fail-open for deny rules) and is
+		// tracked separately in #3261.
 		if app.Protocol == "" {
 			return fmt.Errorf(
 				"application %q: no protocol specified; an application referenced by "+
