@@ -177,6 +177,41 @@ runtime effect is the L3/L4 catalog classification above
     (`ForwardingSupported=false`) for a referenced app it cannot
     represent, so the leniently-loaded bad app is inert rather than
     silently mis-matching.
+  - **#3109 protocol-less application (fail-closed):** a custom
+    application with a port (or any spec) but **no `protocol`** is
+    likewise **rejected at commit** under the same referenced-only
+    scope. Junos requires `protocol` for a usable application, and the
+    userspace matcher keys every term on a protocol *number*
+    (`appid.ProtocolNumber`) plus the port — a port is meaningless
+    without a protocol. `compileApplications` defaults a protocol-less
+    application to the empty protocol (`protocols = []string{""}`),
+    which is unrepresentable on **both** sides: the Go capability gate
+    (`normalizeUserspaceApplicationProtocol("")` →
+    `expandUserspacePolicyApplications` `ok=false`) trips #2124's
+    refuse-to-arm and sets `ForwardingSupported=false` for the **whole**
+    userspace dataplane — so *one* protocol-less app used to silently
+    disable security-policy enforcement for the entire config (a
+    system-level fail-OPEN, traffic falling to the kernel slow path) —
+    and the Rust snapshot builder hard-errors
+    `SnapshotIntegrityError::UnrepresentableApplicationProtocol`
+    (`parse_protocol("") => None`). The commit gate
+    (`validateApplicationSpecsStrict`) now names the one offending
+    application, so a NEW config can no longer reach the dataplane and
+    disable everything at apply time. **Caveat — the lenient/HA-sync path
+    is NOT yet isolated (#3261):** on the tolerant LOAD / peer-sync path
+    the error is downgraded to a warning (no-brick) so an
+    already-persisted / older-peer-synced config still BOOTS, but the
+    #2124 runtime gate is COARSE — an unrepresentable application still
+    makes `deriveUserspaceCapabilities` set `ForwardingSupported=false`
+    for the **whole** userspace dataplane, disarming userspace forwarding
+    and falling back to the kernel slow path (a system-level fail-OPEN).
+    So one protocol-less app on the lenient path STILL disables
+    enforcement globally; the strict commit gate is the real fix (it
+    stops such an app from ever being committed). Per-policy fail-closed
+    isolation of the lenient path is design-sensitive — a clean
+    per-policy *drop* is fail-open for deny rules, conflicting with the
+    deliberate #2124 whole-snapshot-reject fail-closed family — and is
+    tracked in #3261.
 - `applications application-set` — expands into individual
   applications at compile time. Members may be either
   `application <name>` references or nested

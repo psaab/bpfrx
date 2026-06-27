@@ -1051,9 +1051,15 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
     assert!(state.zone_host_inbound.contains_key(&13));
     assert!(!state.zone_host_inbound.contains_key(&14));
 
-    // wan (id 11): ping (icmp) admitted, gre (proto 47) admitted, ssh (tcp/22)
-    // DENIED, ospf (proto 89) DENIED.
-    assert!(host_inbound_admits(&state, 11, 1, 0, false, 0), "wan ping");
+    // wan (id 11): ping echo-request (icmp type 8) admitted, gre (proto 47)
+    // admitted, ssh (tcp/22) DENIED, ospf (proto 89) DENIED. #3201: a non-echo
+    // ICMP type (13 = timestamp-request) is DENIED — `ping` no longer opens the
+    // whole ICMP protocol.
+    assert!(host_inbound_admits(&state, 11, 1, 0, false, 8), "wan ping echo");
+    assert!(
+        !host_inbound_admits(&state, 11, 1, 0, false, 13),
+        "wan ping does NOT admit timestamp-request"
+    );
     assert!(host_inbound_admits(&state, 11, 47, 0, false, 0), "wan gre");
     assert!(
         !host_inbound_admits(&state, 11, 6, 22, false, 0),
@@ -1067,7 +1073,7 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
     // lan (id 12): ssh (tcp/22) admitted, ping admitted, telnet (tcp/23)
     // DENIED, dhcp (udp/67) DENIED (not listed).
     assert!(host_inbound_admits(&state, 12, 6, 22, false, 0), "lan ssh");
-    assert!(host_inbound_admits(&state, 12, 1, 0, false, 0), "lan ping");
+    assert!(host_inbound_admits(&state, 12, 1, 0, false, 8), "lan ping echo");
     assert!(
         !host_inbound_admits(&state, 12, 6, 23, false, 0),
         "lan telnet deny"
@@ -1110,8 +1116,8 @@ fn build_forwarding_state_enforces_host_inbound_traffic() {
 // DENYING ICMP echo-request when `ping` is not configured. A zone WITH `ping`
 // still admits echo-request.
 //
-// Fail-on-revert: deleting the `is_icmp_host_inbound_error` early-return in
-// `host_inbound_admits` (the blanket ICMP-drop behaviour) turns the
+// Fail-on-revert: deleting the `is_icmp_host_inbound_global_accept` early-return
+// in `host_inbound_admits` (the blanket ICMP-drop behaviour) turns the
 // "admits dest-unreachable" assertions RED while the "drops echo without ping"
 // assertions stay GREEN.
 #[test]
@@ -1189,6 +1195,117 @@ fn build_forwarding_state_admits_icmp_errors_on_pingless_zone() {
     assert!(
         host_inbound_admits(&state, 32, 58, 0, true, 128),
         "ping zone admits icmpv6 echo-request"
+    );
+}
+
+// #3201/#3240: host-inbound ICMP admission is SUBTYPE-specific and matches the
+// nft chain (`pkg/daemon/daemon_nft.go`) exactly — a service admits ONLY the
+// ICMP types it implies, not the whole ICMP/ICMPv6 protocol:
+//   ping            → echo-request (v4 8 / v6 128)
+//   router-discovery → IPv4 router-advert/solicit (9/10); v6 via global ND
+// Error/PMTUD (#3171) and IPv6 ND (133-137) ride the global accept on any
+// configured zone.
+//
+// Fail-on-revert: restoring the protocol-wide `icmp = true` (admitting ANY
+// ICMP type whenever `ping`/`router-discovery` is set) turns the
+// "ping drops timestamp-request" and "router-discovery drops echo" assertions
+// RED (they would over-admit), while every admit assertion stays GREEN.
+#[test]
+fn build_forwarding_state_host_inbound_icmp_subtype_parity() {
+    use crate::ZoneSnapshot;
+    use crate::afxdp::forwarding::host_inbound_admits;
+
+    let snapshot = ConfigSnapshot {
+        zones: vec![
+            // ping zone: echo-request only.
+            ZoneSnapshot {
+                name: "ping-zone".into(),
+                id: 51,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec!["ping".into()],
+                host_inbound_protocols: vec![],
+                ..Default::default()
+            },
+            // router-discovery zone: IPv4 types 9/10 only; NO ping.
+            ZoneSnapshot {
+                name: "rd-zone".into(),
+                id: 52,
+                host_inbound_configured: true,
+                host_inbound_system_services: vec![],
+                host_inbound_protocols: vec!["router-discovery".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let state = build_forwarding_state(&snapshot);
+
+    // ping zone (51): admits echo-request (8 v4 / 128 v6) ...
+    assert!(
+        host_inbound_admits(&state, 51, 1, 0, false, 8),
+        "ping admits icmp echo-request"
+    );
+    assert!(
+        host_inbound_admits(&state, 51, 58, 0, true, 128),
+        "ping admits icmpv6 echo-request"
+    );
+    // ... but DROPS a random non-echo ICMP type (13 = timestamp-request) — the
+    // #3201 over-admission the protocol-wide `icmp=true` allowed.
+    assert!(
+        !host_inbound_admits(&state, 51, 1, 0, false, 13),
+        "ping DROPS icmp timestamp-request"
+    );
+    // ... and DROPS IPv4 router-advertisement (9) — that is router-discovery's
+    // subtype, not ping's.
+    assert!(
+        !host_inbound_admits(&state, 51, 1, 0, false, 9),
+        "ping DROPS icmp router-advertisement"
+    );
+    // ICMP errors (#3171) are still globally admitted on the ping zone.
+    assert!(
+        host_inbound_admits(&state, 51, 1, 0, false, 3),
+        "ping zone still admits icmp destination-unreachable (global)"
+    );
+
+    // router-discovery zone (52): admits IPv4 router-advert (9) + solicit (10) ...
+    assert!(
+        host_inbound_admits(&state, 52, 1, 0, false, 9),
+        "router-discovery admits icmp router-advertisement (9)"
+    );
+    assert!(
+        host_inbound_admits(&state, 52, 1, 0, false, 10),
+        "router-discovery admits icmp router-solicitation (10)"
+    );
+    // ... but DROPS echo-request (8) — that is ping's subtype, not
+    // router-discovery's (the #3240 over-admission).
+    assert!(
+        !host_inbound_admits(&state, 52, 1, 0, false, 8),
+        "router-discovery DROPS icmp echo-request (#3240)"
+    );
+    assert!(
+        !host_inbound_admits(&state, 52, 58, 0, true, 128),
+        "router-discovery DROPS icmpv6 echo-request"
+    );
+    // v6 RS/RA (133/134) reach the host via the global ND accept on ANY
+    // configured zone — matching nft, which returns nil for v6 router-discovery
+    // and relies on the global ND accept.
+    assert!(
+        host_inbound_admits(&state, 52, 58, 0, true, 133),
+        "router-discovery zone admits icmpv6 router-solicitation (global ND)"
+    );
+    assert!(
+        host_inbound_admits(&state, 52, 58, 0, true, 134),
+        "router-discovery zone admits icmpv6 router-advertisement (global ND)"
+    );
+
+    // A service NOT configured drops its ICMP types: a router-discovery-only
+    // zone does not admit echo (asserted above); a ping-only zone does not admit
+    // router-advert (asserted above). Neither zone is `all`, so a non-listed
+    // ICMP type is denied — defense-in-depth parity with the nft type set.
+    assert!(
+        !host_inbound_admits(&state, 52, 1, 0, false, 13),
+        "router-discovery DROPS icmp timestamp-request"
     );
 }
 

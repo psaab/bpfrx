@@ -210,6 +210,32 @@ all files stay in `package ipsec`, so the public API is unchanged.
       configured path, the looked-up interface name for the kernel path).
       Global and IPv4 sources are emitted bare; an address already carrying
       a zone is left unchanged.
+- **Runtime re-bind on interface IP change (#2884).** A gateway with an
+  `external-interface` and no explicit `local-address` resolves
+  `local_addrs` from the interface's CURRENT address at `PrepareConfig`
+  time. When that interface is DHCP-managed, its address can change at
+  runtime (lease renew to a new address, flap). `PrepareConfig` is
+  re-resolution-safe — it re-reads the live address every call — but
+  something has to RE-RUN it on the lease change, or swanctl keeps the
+  stale bind and the tunnel cannot re-establish until the next commit.
+  - The DHCP lease-change callback (`onDHCPAddressChange`,
+    `pkg/daemon/daemon_dhcp.go`) drives this. A lease change on a
+    DATAPLANE-facing interface already triggers a full `applyConfig`,
+    whose step 6 re-renders IPsec. A lease change on a MANAGEMENT-only
+    interface skips the full recompile, so that branch now calls
+    `reapplyIPsecForLeaseChange`, which re-renders + reloads swanctl
+    directly.
+  - **Scoping** (`HasDHCPBoundGateway`, `policy.go`): the management-only
+    re-render fires only when some gateway is actually lease-dependent —
+    `external-interface` set, no explicit `local-address`, and the
+    referenced unit is DHCP/DHCPv6-managed. A lease refresh on a
+    management interface no IPsec gateway uses is a no-op, so an unrelated
+    renew never churns swanctl or resets live SAs. The re-render runs
+    under the daemon's apply semaphore to serialize with a concurrent
+    commit's IPsec apply.
+  - Non-DHCP runtime address changes (e.g. a manual VIP move on a static
+    interface) still rely on a commit/boot re-render; only DHCP lease
+    changes have a runtime hook today.
 - **IKE policy chain → proposal cross-reference (#2270).** A gateway's
   `ike-policy` reference walks gateway → `ike-policy` → `ike-proposal`
   (`resolveIKESettings`, `ike.go`). When that chain breaks — the

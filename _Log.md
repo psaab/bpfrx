@@ -31,6 +31,129 @@
   synced-import count turns `session_limit_synced_sessions_enforced_after_failover`,
   `session_limit_ha_import_promote_demote_count`, and the
   `session_limit_counts_match_live_counted_entries_invariant` RED.
+## 2026-06-26 — #3109 correct false lenient-path claim + file #3261
+
+- **Timestamp**: 2026-06-26
+- **Action**: hostile review of PR #3257 proved the original commit/PR/doc/comment
+  claim FALSE: the lenient load / HA-config-sync path does NOT keep "that one
+  referenced app's policy inert (refuse-to-arm)". `deriveUserspaceCapabilities`
+  is coarse — ANY unrepresentable application sets `ForwardingSupported=false`
+  for the WHOLE userspace dataplane; `SetForwardingArmed` then errors and the
+  XDP shim XDP_PASSes to the kernel `ip_forward` path (system-level fail-OPEN),
+  so one protocol-less app still disables enforcement globally on that path.
+  Corrected the code comment (compiler_validate_strict.go), docs, and PR body to
+  state the true behavior. Did NOT implement per-policy lenient isolation: it is
+  genuinely design-sensitive — a clean per-policy drop is fail-OPEN for deny
+  rules (a dropped `deny` falls through to a later `permit`; verified
+  try_match_rule returns None on no-match, default action Deny), which conflicts
+  with the deliberate #2124 whole-snapshot-reject fail-closed family
+  (#2124/#2142/#2173/#2212/#2240/#2241/#2391/#2505 in userspace-dp/src/policy.rs;
+  the doc comment there explicitly rejects term-dropping as fail-open for deny).
+  Filed #3261 (A/B/C options) for /research. Strict commit reject (PART 1) stays.
+- **File(s)**: `pkg/config/compiler_validate_strict.go`,
+  `docs/services-application-identification.md`, `_Log.md`
+
+## 2026-06-26 — #3109 protocol-less application rejected at commit
+
+- **Timestamp**: 2026-06-26
+- **Action**: a custom `applications application <name>` with a port but NO
+  `protocol` committed cleanly (the strict validator only checked a NON-empty
+  protocol) then disabled ALL userspace security-policy enforcement at apply:
+  `compileApplications` defaults a protocol-less app to the empty protocol, which
+  trips #2124's Go capability gate (`ForwardingSupported=false` for the whole
+  dataplane) and the Rust snapshot integrity check
+  (`UnrepresentableApplicationProtocol`). One bad app silently disabled the whole
+  config (system-level fail-OPEN to the kernel slow path). Junos requires
+  `protocol`, so the fix (Option A — strict-at-commit, #1960 doctrine) hard-rejects
+  a protocol-less REFERENCED application in `validateApplicationSpecsStrict` with a
+  clear error naming the one offending app; downgraded to a warning on the
+  tolerant load / peer-sync path (no-brick). Blast radius is now one named app at
+  commit instead of a global disable at apply. Added the explicit empty-protocol
+  guard and dropped the now-redundant `app.Protocol != ""` precondition on the
+  #3150 check (defense-in-depth). No Rust change — its integrity check stays the
+  backstop.
+- **File(s)**: `pkg/config/compiler_validate_strict.go`,
+  `pkg/config/compiler_application_specs_test.go`,
+  `docs/services-application-identification.md`
+## 2026-06-26 — #3201/#3240 host-inbound ICMP admission is sub-type specific
+
+- **Timestamp**: 2026-06-26
+- **Action**: the Rust host-inbound classifier admitted ICMP at L4-PROTOCOL
+  granularity (`ping`/`router-discovery` set `icmp=true; icmpv6=true`), so the
+  AF_XDP fast-path local-delivery admit was BROADER than the nft chain — a
+  `ping` zone admitted any ICMP type (timestamp/redirect/router-advert), a
+  `router-discovery` zone admitted echo. Replaced the `icmp`/`icmpv6` bools on
+  `ZoneHostInbound` with per-family ICMP-type sets `icmp_types_v4` /
+  `icmp_types_v6`; `admits` now takes the `icmp_type` (already extracted at both
+  poll_descriptor call sites for #3171) and checks membership. `ping` →
+  echo-request only (v4 8 / v6 128); IPv4 `router-discovery` → types 9/10; v6
+  RS/RA ride the global ND accept. Renamed `is_icmp_host_inbound_error` →
+  `is_icmp_host_inbound_global_accept` and extended the v6 arm to also admit the
+  ND set (133-137), matching the nft chain's global
+  `icmpv6 type { 1,2,3,4,133,134,135,136,137 } accept` — this is what lets v6
+  router-discovery carry nothing per-zone while staying at parity (#3240). The
+  per-zone Rust admit set now equals the nft chain's per-service type set for
+  every ICMP service. No wire change (derived Rust-side from the existing
+  host_inbound token list, like #3225). Preserves #3171 error/PMTUD admission
+  and #3225 family-awareness. Fail-on-revert: restoring protocol-wide ICMP
+  (`!icmp_types_v4.is_empty()`) turns the new "ping DROPS timestamp-request"
+  assertion RED.
+- **File(s)**: `userspace-dp/src/afxdp/types/forwarding.rs`,
+  `userspace-dp/src/afxdp/forwarding/host_inbound.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/afxdp/forwarding/README.md`
+## 2026-06-26 — #2884 IPsec re-binds local_addrs on a runtime DHCP lease change
+
+- **Timestamp**: 2026-06-26
+- **Action**: an IPsec gateway with an `external-interface` and no
+  explicit `local-address` resolves `local_addrs` from the interface's
+  current address at `PrepareConfig` time. A DHCP lease change on a
+  DATAPLANE interface already re-renders IPsec via the full `applyConfig`
+  recompile, but a lease change on a MANAGEMENT-only interface skipped the
+  recompile entirely, so swanctl kept the stale local bind until the next
+  commit. Added `ipsec.HasDHCPBoundGateway` (scoping predicate:
+  external-interface set, no explicit local-address, unit is
+  DHCP/DHCPv6-managed) and wired `reapplyIPsecForLeaseChange` into
+  `onDHCPAddressChange`'s management-only branch — it re-renders + reloads
+  swanctl under the apply semaphore only when a lease-dependent gateway
+  exists (no reload storm / SA churn on unrelated renews). Added
+  `ipsec.NewWithConfigDir` so tests redirect the swanctl conf off the real
+  tree. Fail-on-revert: disabling the re-render makes
+  `TestReapplyIPsecForLeaseChange_RebindsLocalAddr` go RED (swanctl conf
+  never written / stale address retained).
+- **File(s)**: `pkg/ipsec/policy.go`, `pkg/ipsec/manager.go`,
+  `pkg/ipsec/dhcp_rebind_test.go`, `pkg/ipsec/README.md`,
+  `pkg/daemon/daemon_dhcp.go`, `pkg/daemon/ipsec_lease_rebind_test.go`
+## 2026-06-26 — #2977 frr/policy: `then next-hop self` emits `neighbor next-hop-self`
+
+- **Timestamp**: 2026-06-26
+- **Action**: `then next-hop self` in a BGP export policy compiled to a silent
+  no-op in `pkg/frr/policy_render.go` (the `term.NextHop == "self"` branch
+  emitted nothing, on the false premise that eBGP rewrites next-hop to self by
+  default). That holds for eBGP but NOT for iBGP / route-reflector peers, where
+  the next-hop is preserved by default — so iBGP peers kept the original eBGP
+  next-hop, had no IGP path to it, and blackholed the prefixes. FRR has no
+  route-map `set ... next-hop self` clause (it is rejected and fails the whole
+  route-map), so the fix emits the canonical per-neighbor / per-address-family
+  `neighbor <peer> next-hop-self` knob in both AF neighbor loops, gated on a new
+  `policyStatementHasNextHopSelf` helper checking the neighbor's EFFECTIVE
+  EXPORT policy-statement (`bgpEffectiveExport`). The route-map `self` branch
+  still emits nothing (keeps the route-map valid). Added two fail-on-revert
+  tests (`TestGenerateProtocols_BGPExportNextHopSelf`,
+  `TestGenerateProtocols_BGPExportNoSpuriousNextHopSelf`) and updated
+  `pkg/frr/README.md`.
+- **Follow-up (review fold)**: emit `neighbor <peer> next-hop-self FORCE`
+  unconditionally at both AF sites. Plain `next-hop-self` rewrites ONLY
+  eBGP-learned routes; Junos `then next-hop self` rewrites ALL matched
+  routes including route-reflector-REFLECTED (iBGP-learned) ones, which xpf
+  supports (`cluster-id` + `route-reflector-client`). `force` overrides the
+  next-hop on reflected routes and is a harmless no-op for eBGP-learned
+  ones, so unconditional `force` is exact Junos parity. Updated the
+  existing test to assert `force` and added
+  `TestGenerateProtocols_BGPExportNextHopSelfRRClient` covering the RR-
+  client reflected-route case. README updated to note unconditional `force`.
+- **File(s)**: `pkg/frr/policy_render.go`, `pkg/frr/frr_test.go`,
+  `pkg/frr/README.md`, `_Log.md`
 
 ## 2026-06-26 — #2883 event-stream idle keepalive rides write_buf backpressure
 
