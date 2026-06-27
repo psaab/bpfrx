@@ -209,11 +209,14 @@ func isDefinedPolicyStatement(name string, po *config.PolicyOptionsConfig) bool 
 // clause that rewrites the next-hop to the local router's own address (a
 // literal `set ip next-hop self` is rejected by FRR's parser, taking the
 // whole route-map down with it). The canonical FRR mechanism is the
-// per-neighbor / per-address-family `neighbor <peer> next-hop-self` knob.
-// `next-hop self` is an OUTBOUND (advertise) concept, so this is consulted
-// only against a neighbor's EXPORT policy-statement: when true, the
-// neighbor loop emits `neighbor <peer> next-hop-self` in that address
-// family instead of a (non-existent) route-map set-clause (#2977).
+// per-neighbor / per-address-family `neighbor <peer> next-hop-self force`
+// knob. `next-hop self` is an OUTBOUND (advertise) concept, so this is
+// consulted only against a neighbor's EXPORT policy-statement: when true,
+// the neighbor loop emits `neighbor <peer> next-hop-self force` in that
+// address family instead of a (non-existent) route-map set-clause (#2977).
+// The `force` modifier is unconditional — plain `next-hop-self` rewrites
+// only eBGP-learned routes, but Junos `then next-hop self` rewrites ALL
+// matched routes including route-reflector-reflected (iBGP-learned) ones.
 //
 // The pre-#2977 code emitted NOTHING for `then next-hop self`, on the false
 // premise that "eBGP rewrites next-hop to self by default". That holds only
@@ -809,9 +812,16 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				// set-clause (FRR has no `set ... next-hop self`). Essential for
 				// iBGP / route-reflector peers, where the next-hop is preserved
 				// by default — dropping the rewrite leaves the peer with the
-				// original eBGP next-hop and blackholes it (#2977).
+				// original eBGP next-hop and blackholes it (#2977). Emit `force`
+				// UNCONDITIONALLY: plain `next-hop-self` rewrites ONLY eBGP-
+				// learned routes, but Junos `then next-hop self` rewrites ALL
+				// matched routes including route-reflector-REFLECTED (iBGP-
+				// learned) ones — `force` is what overrides those. For an eBGP-
+				// learned route `force` is a harmless no-op (already rewritten),
+				// so unconditional `force` exactly matches Junos's unconditional
+				// rewrite for both plain-iBGP and RR-client peers.
 				if rm := bgpEffectiveExport(n, globalExport); policyStatementHasNextHopSelf(rm, policyOptions) {
-					fmt.Fprintf(&b, "  neighbor %s next-hop-self\n", n.Address)
+					fmt.Fprintf(&b, "  neighbor %s next-hop-self force\n", n.Address)
 				}
 				// Inbound filter (#2490). Emit ONLY for a defined
 				// policy-statement so we never point `route-map in` at a
@@ -846,9 +856,10 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if rm := bgpEffectiveExport(n, globalExport); rm != "" && isDefinedPolicyStatement(rm, policyOptions) {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
-				// Next-hop-self knob (#2977) — see the ipv4 block above.
+				// Next-hop-self knob, unconditional `force` (#2977) — see the
+				// ipv4 block above.
 				if rm := bgpEffectiveExport(n, globalExport); policyStatementHasNextHopSelf(rm, policyOptions) {
-					fmt.Fprintf(&b, "  neighbor %s next-hop-self\n", n.Address)
+					fmt.Fprintf(&b, "  neighbor %s next-hop-self force\n", n.Address)
 				}
 				// Inbound filter (#2490) — see the ipv4 block above.
 				if rm := bgpEffectiveImport(n, globalImport); rm != "" && isDefinedPolicyStatement(rm, policyOptions) {

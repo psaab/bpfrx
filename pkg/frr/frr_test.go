@@ -507,14 +507,21 @@ func TestGenerateProtocols_BGPImportAndExport(t *testing.T) {
 
 // TestGenerateProtocols_BGPExportNextHopSelf proves a `then next-hop self`
 // export policy attached to an iBGP neighbor renders the FRR per-neighbor
-// `next-hop-self` knob (#2977). FRR has no `set ... next-hop self` route-map
-// clause, so the rewrite MUST be emitted at the neighbor/address-family
-// level; the pre-#2977 code emitted nothing → iBGP/route-reflector peers
-// kept the original eBGP next-hop and blackholed the prefixes.
+// `next-hop-self force` knob (#2977). FRR has no `set ... next-hop self`
+// route-map clause, so the rewrite MUST be emitted at the neighbor/address-
+// family level; the pre-#2977 code emitted nothing → iBGP/route-reflector
+// peers kept the original eBGP next-hop and blackholed the prefixes.
 //
-// Fail-on-revert: delete the `neighbor %s next-hop-self` emission in the
-// neighbor loops (or revert policyStatementHasNextHopSelf to always-false)
-// and the "neighbor 10.0.0.2 next-hop-self" assertion below goes RED.
+// `force` is emitted UNCONDITIONALLY: plain `next-hop-self` rewrites ONLY
+// eBGP-learned routes, whereas Junos `then next-hop self` rewrites ALL
+// matched routes (including RR-reflected iBGP-learned ones). `force` is a
+// harmless no-op for eBGP-learned routes, so unconditional `force` matches
+// Junos's unconditional semantics for both plain-iBGP and RR-client peers.
+//
+// Fail-on-revert: delete the `neighbor %s next-hop-self force` emission in
+// the neighbor loops (or revert policyStatementHasNextHopSelf to always-
+// false) and the "neighbor 10.0.0.2 next-hop-self force" assertion below
+// goes RED.
 func TestGenerateProtocols_BGPExportNextHopSelf(t *testing.T) {
 	m := New()
 	po := &config.PolicyOptionsConfig{
@@ -536,14 +543,52 @@ func TestGenerateProtocols_BGPExportNextHopSelf(t *testing.T) {
 	}
 	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po)
 
-	// The per-neighbor next-hop-self knob MUST be emitted.
-	if !strings.Contains(got, "neighbor 10.0.0.2 next-hop-self\n") {
-		t.Errorf("#2977: missing per-neighbor next-hop-self for `then next-hop self` export policy, got:\n%s", got)
+	// The per-neighbor next-hop-self knob MUST be emitted WITH `force`.
+	if !strings.Contains(got, "neighbor 10.0.0.2 next-hop-self force\n") {
+		t.Errorf("#2977: missing per-neighbor `next-hop-self force` for `then next-hop self` export policy, got:\n%s", got)
 	}
 	// And NEVER as an invalid route-map set-clause (FRR rejects it, taking
 	// the whole route-map down).
 	if strings.Contains(got, "set ip next-hop self") || strings.Contains(got, "set ipv6 next-hop self") {
 		t.Errorf("#2977: must NOT emit an invalid `set ... next-hop self` route-map clause, got:\n%s", got)
+	}
+}
+
+// TestGenerateProtocols_BGPExportNextHopSelfRRClient proves the route-
+// reflector reflected-route sub-case the #2977 issue title names: a
+// route-reflector-CLIENT neighbor with a `then next-hop self` export must
+// render `next-hop-self force`. Plain `next-hop-self` would NOT rewrite the
+// next-hop on iBGP-learned routes the RR reflects to this client — exactly
+// the routes whose next-hop the operator means to set to self — so `force`
+// is required for Junos parity here, not optional.
+func TestGenerateProtocols_BGPExportNextHopSelfRRClient(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"NHS": {
+				Name: "NHS",
+				Terms: []*config.PolicyTerm{
+					{Name: "t", NextHop: "self", Action: "accept"},
+				},
+			},
+		},
+	}
+	bgp := &config.BGPConfig{
+		LocalAS:  65001, // iBGP
+		RouterID: "1.1.1.1",
+		Neighbors: []*config.BGPNeighbor{
+			// RR client: routes reflected to it are iBGP-learned, so plain
+			// next-hop-self would skip them — force is mandatory.
+			{Address: "10.0.0.3", PeerAS: 65001, Export: []string{"NHS"}, RouteReflectorClient: true},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po)
+
+	if !strings.Contains(got, "neighbor 10.0.0.3 route-reflector-client\n") {
+		t.Fatalf("#2977: RR client not configured as expected, got:\n%s", got)
+	}
+	if !strings.Contains(got, "neighbor 10.0.0.3 next-hop-self force\n") {
+		t.Errorf("#2977: RR-client `then next-hop self` must render `next-hop-self force` (reflected iBGP routes need force), got:\n%s", got)
 	}
 }
 

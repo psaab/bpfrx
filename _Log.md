@@ -16,6 +16,16 @@
   tests (`TestGenerateProtocols_BGPExportNextHopSelf`,
   `TestGenerateProtocols_BGPExportNoSpuriousNextHopSelf`) and updated
   `pkg/frr/README.md`.
+- **Follow-up (review fold)**: emit `neighbor <peer> next-hop-self FORCE`
+  unconditionally at both AF sites. Plain `next-hop-self` rewrites ONLY
+  eBGP-learned routes; Junos `then next-hop self` rewrites ALL matched
+  routes including route-reflector-REFLECTED (iBGP-learned) ones, which xpf
+  supports (`cluster-id` + `route-reflector-client`). `force` overrides the
+  next-hop on reflected routes and is a harmless no-op for eBGP-learned
+  ones, so unconditional `force` is exact Junos parity. Updated the
+  existing test to assert `force` and added
+  `TestGenerateProtocols_BGPExportNextHopSelfRRClient` covering the RR-
+  client reflected-route case. README updated to note unconditional `force`.
 - **File(s)**: `pkg/frr/policy_render.go`, `pkg/frr/frr_test.go`,
   `pkg/frr/README.md`, `_Log.md`
 
