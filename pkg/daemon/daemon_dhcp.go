@@ -2,6 +2,7 @@
 package daemon
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/ipsec"
 )
 
 // buildDHCPClientSpecs computes the desired DHCP client set from the
@@ -96,7 +98,43 @@ func (d *Daemon) onDHCPAddressChange() {
 			// the box always picks up DHCP nameservers, not just on
 			// dataplane-relevant interfaces.
 			d.reconcileDNSFromDHCP()
+			// #2884: the full recompile is skipped on this branch, so an
+			// IPsec gateway that binds local_addrs to a management-only
+			// DHCP interface would otherwise keep the stale lease address
+			// after a renew. The dataplane-facing branch above already
+			// re-renders IPsec via applyConfig (step 6); this closes the
+			// management-only gap so swanctl re-binds to the new IP.
+			d.reapplyIPsecForLeaseChange(activeCfg)
 		}
+	}
+}
+
+// reapplyIPsecForLeaseChange re-renders + reloads swanctl when a DHCP
+// lease change may have moved the kernel address an IPsec gateway is
+// dynamically bound to (#2884). It is called from onDHCPAddressChange's
+// management-only branch, which skips the full recompile; the
+// dataplane-facing branch already re-renders IPsec through applyConfig.
+//
+// The re-render is scoped to lease-dependent gateways
+// (ipsec.HasDHCPBoundGateway): a lease refresh on a management interface
+// no IPsec gateway uses is a no-op, so an unrelated renew never churns
+// swanctl or resets live SAs. It runs under applySem to serialize with a
+// concurrent commit's IPsec apply (both write the same swanctl conf).
+func (d *Daemon) reapplyIPsecForLeaseChange(cfg *config.Config) {
+	if d.ipsec == nil || cfg == nil {
+		return
+	}
+	if !ipsec.HasDHCPBoundGateway(cfg) {
+		return
+	}
+	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+		slog.Warn("IPsec: failed to acquire apply lock for DHCP lease re-render", "err", err)
+		return
+	}
+	defer d.applySem.Release(1)
+	slog.Info("DHCP address changed on IPsec-bound interface, re-rendering swanctl local_addrs")
+	if err := d.ipsec.Apply(ipsec.PrepareConfig(cfg)); err != nil {
+		slog.Warn("failed to re-apply IPsec config after DHCP address change", "err", err)
 	}
 }
 

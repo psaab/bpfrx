@@ -51,7 +51,15 @@ type Manager struct {
 
 // New creates a new IPsec manager.
 func New() *Manager {
-	dir := DefaultSwanctlDir
+	return NewWithConfigDir(DefaultSwanctlDir)
+}
+
+// NewWithConfigDir creates an IPsec manager that writes its swanctl
+// snippet under dir instead of the default /etc/swanctl/conf.d. It lets
+// callers (and tests that must not touch the real swanctl tree) redirect
+// the generated config to an arbitrary directory; reload() still shells
+// out to the system swanctl.
+func NewWithConfigDir(dir string) *Manager {
 	return &Manager{
 		configDir:  dir,
 		configPath: filepath.Join(dir, BPFRXConfFile),
