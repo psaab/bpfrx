@@ -1040,25 +1040,29 @@ pub(super) fn poll_binding_process_descriptor(
                         // and NPTv6 preserve the L4 port, so the original port
                         // flows through for those.
                         //
-                        // NAT64 is DELIBERATELY EXCLUDED here. NAT64 is a
-                        // cross-family translation: the translated destination is
-                        // IPv4 while the flow source stays IPv6. xpf's policy
-                        // matcher (`policy.rs` `evaluate_policy`) requires the
-                        // source and destination to be the SAME family — a mixed
-                        // (V6 src, V4 dst) tuple matches no rule and falls to
-                        // default-deny. Feeding the extracted IPv4 destination
-                        // here would therefore break ALL NAT64 connectivity, not
-                        // fix it. NAT64 keeps its historical behavior (policy
-                        // matched on the synthetic IPv6 destination, the only
-                        // same-family tuple available at this site). Making NAT64
-                        // policy match the real IPv4 server is a larger,
-                        // separate design change (cross-family policy matching);
-                        // see `docs/next-features/twice-nat.md` and #2345.
-                        let policy_dst_ip = if nat64_match.is_some() {
-                            flow.dst_ip
-                        } else {
-                            effective_resolution_target
-                        };
+                        // #2358: NAT64 inbound now also matches the
+                        // POST-translation destination — the real internal IPv4
+                        // host the synthetic NAT64 address was extracted to —
+                        // consistent with Junos/SRX (destination translation
+                        // precedes the policy lookup). NAT64 is a CROSS-FAMILY
+                        // translation: the flow source stays IPv6 while the
+                        // translated destination is IPv4, so the policy match runs
+                        // on a mixed (V6 src, V4 dst) tuple. `policy.rs`
+                        // `try_match_rule` grew a dedicated (V6 src, V4 dst) arm
+                        // (#2358) that matches the source against the rule's IPv6
+                        // source set and the destination against the rule's IPv4
+                        // destination set, so an operator writes a NAT64 policy
+                        // against the real IPv4 server + its destination zone (the
+                        // `to_zone_id` is already derived from the v4
+                        // `effective_resolution_target`). MIGRATION: policies
+                        // previously authored against the synthetic IPv6 NAT64
+                        // prefix no longer match — rewrite them against the real
+                        // IPv4 host. `effective_resolution_target` is already the
+                        // extracted IPv4 destination for a NAT64 match, so it
+                        // carries the correct post-translation tuple for all
+                        // inbound destination translations (DNAT/static-DNAT/
+                        // NPTv6/NAT64). See `docs/next-features/twice-nat.md`.
+                        let policy_dst_ip = effective_resolution_target;
                         let policy_dst_port = pre_routing_dnat
                             .as_ref()
                             .and_then(|d| d.rewrite_dst_port)
@@ -3231,17 +3235,20 @@ pub(super) fn poll_binding_process_descriptor(
                                 //     pre_routing_dnat)`), so the translated
                                 //     internal dst is used; only port-based DNAT
                                 //     also sets `rewrite_dst_port`.
-                                //   - NAT64 populates NEITHER `nptv6_nat` NOR
-                                //     `pre_routing_dnat`, so `decision.nat
-                                //     .rewrite_dst` is None here and the tuple
-                                //     falls back to `flow.dst_ip` (the synthetic
-                                //     IPv6 dst). That is the INTENDED NAT64
-                                //     exclusion — cross-family policy matching is
-                                //     not supported (see the long comment at the
-                                //     ForwardCandidate policy-tuple binding), and
-                                //     this fallback keeps the MissingNeighbor
-                                //     verdict identical to the ForwardCandidate
-                                //     path for NAT64.
+                                //   - NAT64 classification (`classify_ipv6_dest`)
+                                //     runs ONLY in the ForwardCandidate session-
+                                //     miss block, so `decision.nat.rewrite_dst`
+                                //     is None in this arm and the tuple falls back
+                                //     to `flow.dst_ip` (the synthetic IPv6 dst).
+                                //     #2358 added cross-family (V6 src, V4 dst)
+                                //     policy matching for the NAT64 primary
+                                //     (ForwardCandidate) path; the MissingNeighbor
+                                //     arm does not classify NAT64, so the real
+                                //     IPv4 destination is unavailable here and the
+                                //     synthetic-v6 fallback is retained. A NAT64
+                                //     flow whose v4 next-hop is unresolved is
+                                //     handled by the ForwardCandidate path's own
+                                //     resolution, not this arm.
                                 // Both halves fall back to the original dst/port
                                 // when no inbound destination translation applies.
                                 let policy_dst_ip = decision.nat.rewrite_dst.unwrap_or(flow.dst_ip);
