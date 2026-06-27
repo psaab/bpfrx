@@ -88,14 +88,77 @@ impl DnatEntry {
     }
 }
 
+/// #3164: protocol+port key for the prefix (longest-prefix-match) DNAT entries.
+/// Mirrors `DnatKey` minus the destination IP — the IP is matched by prefix
+/// containment, not hashed.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) struct DnatProtoPortKey {
+    pub protocol: u16,
+    pub dst_port: u16,
+}
+
+/// #3164: one non-host DNAT destination prefix and its translation entry. The
+/// prefix is stored in its address family (exactly one of `v4`/`v6` is set);
+/// `contains`/`prefix_len` dispatch on the family.
+#[derive(Clone, Debug)]
+struct DnatPrefixSlot {
+    v4: Option<PrefixV4>,
+    v6: Option<PrefixV6>,
+    entry: DnatEntry,
+}
+
+impl DnatPrefixSlot {
+    fn contains(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => self.v4.is_some_and(|p| p.contains(v4)),
+            IpAddr::V6(v6) => self.v6.is_some_and(|p| p.contains(v6)),
+        }
+    }
+
+    fn prefix_len(&self) -> u8 {
+        self.v4
+            .map(|p| p.prefix_len())
+            .or_else(|| self.v6.map(|p| p.prefix_len()))
+            .unwrap_or(0)
+    }
+
+    /// The prefix network address, for local-address registration.
+    fn network(&self) -> Option<IpAddr> {
+        self.v4
+            .map(|p| IpAddr::V4(p.addr()))
+            .or_else(|| self.v6.map(|p| IpAddr::V6(p.addr())))
+    }
+}
+
 /// Destination NAT lookup table.
 ///
-/// Entries are keyed by `(protocol, dst_ip, dst_port)`. A wildcard port
-/// entry (`dst_port = 0`) matches any destination port when no exact-port
-/// entry exists.
+/// Host destinations (a bare IP, /32, or /128) are keyed by
+/// `(protocol, dst_ip, dst_port)` in the exact `entries` map — the O(1) fast
+/// path. A wildcard port entry (`dst_port = 0`) matches any destination port
+/// when no exact-port entry exists.
+///
+/// #3164: non-host destination PREFIXES (`198.51.100.0/24`) live in
+/// `prefix_entries`, keyed by `(protocol, dst_port)` only, and are matched by
+/// longest-prefix containment. A host (/32, /128) is the longest possible
+/// prefix, so the exact map is always probed first and wins; the prefix scan is
+/// the fallback when no host entry matches.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DnatTable {
     entries: FxHashMap<DnatKey, Vec<DnatEntry>>,
+    /// #3164: non-host prefix entries, keyed by protocol+port; the destination
+    /// IP is matched by prefix containment (longest-prefix-match) within each
+    /// slot vec.
+    prefix_entries: FxHashMap<DnatProtoPortKey, Vec<DnatPrefixSlot>>,
+}
+
+/// #3164: a classified DNAT destination — a host (exact-map key) or a non-host
+/// prefix (longest-prefix-match). Exactly one of `v4`/`v6` is set in `Prefix`.
+enum DnatDest {
+    Host(IpAddr),
+    Prefix {
+        v4: Option<PrefixV4>,
+        v6: Option<PrefixV6>,
+    },
 }
 
 impl DnatTable {
@@ -105,9 +168,47 @@ impl DnatTable {
     ) -> Self {
         let mut table = DnatTable::default();
         for snap in snaps {
-            let dst_ip: IpAddr = match snap.destination_address.parse() {
-                Ok(ip) => ip,
-                Err(_) => continue,
+            // #3164: classify the destination as a HOST (exact-map fast path) or
+            // a non-host PREFIX (longest-prefix-match). `destination_prefix` is
+            // the additive wire signal: non-empty => a non-host CIDR. A host
+            // destination, or an older helper that never sets the field, leaves
+            // it empty and we key the exact `destination_address`. A /32 or /128
+            // prefix is itself a host and collapses back to the exact map.
+            let dest: DnatDest = if !snap.destination_prefix.is_empty() {
+                match snap.destination_prefix.parse::<IpNet>() {
+                    Ok(IpNet::V4(net)) => {
+                        if net.prefix_len() == 32 {
+                            DnatDest::Host(IpAddr::V4(net.addr()))
+                        } else {
+                            DnatDest::Prefix {
+                                v4: Some(PrefixV4::from_net(net)),
+                                v6: None,
+                            }
+                        }
+                    }
+                    Ok(IpNet::V6(net)) => {
+                        if net.prefix_len() == 128 {
+                            DnatDest::Host(IpAddr::V6(net.addr()))
+                        } else {
+                            DnatDest::Prefix {
+                                v4: None,
+                                v6: Some(PrefixV6::from_net(net)),
+                            }
+                        }
+                    }
+                    // Unparseable prefix: fall back to the host
+                    // `destination_address` if it parses, else drop the entry
+                    // (fail-closed, like an unparseable host destination).
+                    Err(_) => match snap.destination_address.parse::<IpAddr>() {
+                        Ok(ip) => DnatDest::Host(ip),
+                        Err(_) => continue,
+                    },
+                }
+            } else {
+                match snap.destination_address.parse::<IpAddr>() {
+                    Ok(ip) => DnatDest::Host(ip),
+                    Err(_) => continue,
+                }
             };
             let pool_ip: IpAddr = match snap.pool_address.parse() {
                 Ok(ip) => ip,
@@ -198,29 +299,44 @@ impl DnatTable {
                     },
                 }
             }
-            {
-                Self::insert_entry(
-                    table.entries.entry(DnatKey {
-                        protocol: proto,
-                        dst_ip,
-                        dst_port: snap.destination_port,
-                    }),
-                    DnatEntry {
-                        from_zone: snap.from_zone.clone().into_boxed_str(),
-                        source_constrained,
-                        source_v4: source_v4.clone(),
-                        source_v6: source_v6.clone(),
-                        value: DnatValue {
-                            new_dst_ip: pool_ip,
-                            new_dst_port: if snap.pool_port != 0 {
-                                snap.pool_port
-                            } else {
-                                snap.destination_port
-                            },
-                        },
-                        hit_counter: hit_counter.clone(),
+            let entry = DnatEntry {
+                from_zone: snap.from_zone.clone().into_boxed_str(),
+                source_constrained,
+                source_v4,
+                source_v6,
+                value: DnatValue {
+                    new_dst_ip: pool_ip,
+                    new_dst_port: if snap.pool_port != 0 {
+                        snap.pool_port
+                    } else {
+                        snap.destination_port
                     },
-                );
+                },
+                hit_counter,
+            };
+            // #3164: route a host to the O(1) exact map and a non-host prefix to
+            // the longest-prefix-match table. Both translate to the same pool
+            // (many:1 for a prefix) — block-mapping (1:1 offset) is out of scope.
+            match dest {
+                DnatDest::Host(dst_ip) => {
+                    Self::insert_entry(
+                        table.entries.entry(DnatKey {
+                            protocol: proto,
+                            dst_ip,
+                            dst_port: snap.destination_port,
+                        }),
+                        entry,
+                    );
+                }
+                DnatDest::Prefix { v4, v6 } => {
+                    Self::insert_prefix_slot(
+                        table.prefix_entries.entry(DnatProtoPortKey {
+                            protocol: proto,
+                            dst_port: snap.destination_port,
+                        }),
+                        DnatPrefixSlot { v4, v6, entry },
+                    );
+                }
             }
         }
         table
@@ -307,6 +423,15 @@ impl DnatTable {
                     src_ip,
                     ingress_zone,
                 )
+            })
+            .or_else(|| {
+                // #3164: longest-prefix-match fallback. Reached only when no
+                // exact-host entry matched — a host (/32, /128) is the longest
+                // possible prefix, so the exact map always wins. Within the
+                // prefix table the same three proto/port tiers apply (exact
+                // proto+port, then wildcard port, then PROTO_ANY), and within a
+                // tier the LONGEST matching prefix wins.
+                self.match_prefix_lpm(protocol, src_ip, dst_ip, dst_port, ingress_zone)
             })?;
         let rewrite_dst_port = if value.new_dst_port != 0 && value.new_dst_port != dst_port {
             Some(value.new_dst_port)
@@ -354,6 +479,113 @@ impl DnatTable {
             })
     }
 
+    /// #3164: longest-prefix-match over the non-host prefix table. Mirrors the
+    /// exact-host probe order — exact `(protocol, dst_port)`, then wildcard port
+    /// `(protocol, 0)`, then `(PROTO_ANY, 0)` — so proto/port specificity is
+    /// honored the same way for prefixes; within each tier the LONGEST matching
+    /// prefix wins. Returns the first tier that yields a match.
+    fn match_prefix_lpm(
+        &self,
+        protocol: u16,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        dst_port: u16,
+        ingress_zone: &str,
+    ) -> Option<(DnatValue, Option<Arc<NatRuleCounter>>)> {
+        self.match_prefix_slots(
+            self.prefix_entries.get(&DnatProtoPortKey {
+                protocol,
+                dst_port,
+            }),
+            dst_ip,
+            src_ip,
+            ingress_zone,
+        )
+        .or_else(|| {
+            self.match_prefix_slots(
+                self.prefix_entries.get(&DnatProtoPortKey {
+                    protocol,
+                    dst_port: 0,
+                }),
+                dst_ip,
+                src_ip,
+                ingress_zone,
+            )
+        })
+        .or_else(|| {
+            self.match_prefix_slots(
+                self.prefix_entries.get(&DnatProtoPortKey {
+                    protocol: PROTO_ANY,
+                    dst_port: 0,
+                }),
+                dst_ip,
+                src_ip,
+                ingress_zone,
+            )
+        })
+    }
+
+    /// #3164: pick the best prefix slot for a destination IP within one
+    /// proto/port bucket. Zone-specific entries win over zone-wildcard entries
+    /// (mirroring `match_entries`); within each zone tier the LONGEST matching
+    /// prefix whose source-address constraint holds wins, and the FIRST such
+    /// slot in insertion order breaks a same-length tie (deterministic).
+    fn match_prefix_slots(
+        &self,
+        slots: Option<&Vec<DnatPrefixSlot>>,
+        dst_ip: IpAddr,
+        src_ip: IpAddr,
+        ingress_zone: &str,
+    ) -> Option<(DnatValue, Option<Arc<NatRuleCounter>>)> {
+        let slots = slots?;
+        let best_in_tier = |zone_specific: bool| -> Option<&DnatPrefixSlot> {
+            let mut best: Option<&DnatPrefixSlot> = None;
+            for slot in slots {
+                let zone_ok = if zone_specific {
+                    !slot.entry.from_zone.is_empty()
+                        && slot.entry.from_zone.as_ref() == ingress_zone
+                } else {
+                    slot.entry.from_zone.is_empty()
+                };
+                if !zone_ok || !slot.contains(dst_ip) || !slot.entry.source_matches(src_ip) {
+                    continue;
+                }
+                // STRICTLY-greater replacement keeps the first slot among equal
+                // prefix lengths (deterministic on overlap ambiguity).
+                if best.is_none_or(|b| slot.prefix_len() > b.prefix_len()) {
+                    best = Some(slot);
+                }
+            }
+            best
+        };
+        best_in_tier(true)
+            .or_else(|| best_in_tier(false))
+            .map(|slot| (slot.entry.value, slot.entry.hit_counter.clone()))
+    }
+
+    /// #3164: dedup-insert a prefix slot. Like `insert_entry`, two slots with the
+    /// same (from_zone, source constraint) AND the same prefix are the same rule
+    /// and the later one replaces the earlier; distinct prefixes or distinct
+    /// source scopes are retained.
+    fn insert_prefix_slot(
+        slot: std::collections::hash_map::Entry<'_, DnatProtoPortKey, Vec<DnatPrefixSlot>>,
+        new_slot: DnatPrefixSlot,
+    ) {
+        let slots = slot.or_default();
+        if let Some(existing) = slots.iter_mut().find(|existing| {
+            existing.v4 == new_slot.v4
+                && existing.v6 == new_slot.v6
+                && existing.entry.from_zone == new_slot.entry.from_zone
+                && existing.entry.source_constrained == new_slot.entry.source_constrained
+                && existing.entry.source_v4 == new_slot.entry.source_v4
+                && existing.entry.source_v6 == new_slot.entry.source_v6
+        }) {
+            *existing = new_slot;
+            return;
+        }
+        slots.push(new_slot);
+    }
+
     fn insert_entry(
         slot: std::collections::hash_map::Entry<'_, DnatKey, Vec<DnatEntry>>,
         entry: DnatEntry,
@@ -379,20 +611,92 @@ impl DnatTable {
         entries.push(entry);
     }
 
-    /// Returns true if the table has any entries.
+    /// Returns true if the table has any entries (exact-host or prefix).
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.prefix_entries.is_empty()
     }
+
+    /// #3164: cold-path cap on whole-block proxy-ARP/ND expansion. A DNAT
+    /// destination prefix whose usable-host count is at or below this bound is
+    /// expanded host-by-host into the local-address set so the firewall answers
+    /// for the entire block on a directly-connected segment; a larger block
+    /// registers only its network base and relies on the block being ROUTED to
+    /// the firewall (no proxy-ARP), which is the usual deployment. The bound
+    /// keeps a fat /16-or-shorter from exploding `local_v4`/`local_v6` (a /20 is
+    /// the smallest v4 prefix that still expands).
+    pub(crate) const MAX_LOCAL_PREFIX_HOSTS: u32 = 4096;
 
     /// Returns all destination IPs (the external/public IPs that DNAT rules match on).
     /// These must be registered as local addresses so traffic to them is recognized.
-    pub(crate) fn destination_ips(&self) -> impl Iterator<Item = IpAddr> + '_ {
+    ///
+    /// #3164: exact-host destinations contribute their IP. A non-host prefix
+    /// contributes its usable hosts when the block is small enough
+    /// (`MAX_LOCAL_PREFIX_HOSTS`) so proxy-ARP/ND works for a directly-connected
+    /// DNAT block; a larger block contributes only its network base (it must be
+    /// routed to the firewall). The DNAT MATCH itself is independent of this set
+    /// (the pre-routing lookup keys on the packet destination directly), so a
+    /// large block is still fully translated — only on-segment proxy-ARP is
+    /// bounded.
+    pub(crate) fn destination_ips(&self) -> impl Iterator<Item = IpAddr> {
         // Deduplicate by collecting unique dst_ip values.
-        let mut seen = FxHashMap::default();
+        let mut seen: FxHashMap<IpAddr, ()> = FxHashMap::default();
         for key in self.entries.keys() {
             seen.entry(key.dst_ip).or_insert(());
         }
+        for slots in self.prefix_entries.values() {
+            for slot in slots {
+                if let Some(net) = slot.network() {
+                    seen.entry(net).or_insert(());
+                }
+                match (slot.v4, slot.v6) {
+                    (Some(p), _) => {
+                        let hosts = host_count_v4(p.prefix_len());
+                        if hosts <= Self::MAX_LOCAL_PREFIX_HOSTS {
+                            if let Ok(net) =
+                                Ipv4Net::new(p.addr(), p.prefix_len())
+                            {
+                                for host in net.hosts() {
+                                    seen.entry(IpAddr::V4(host)).or_insert(());
+                                }
+                            }
+                        }
+                    }
+                    (_, Some(p)) => {
+                        // Only expand a v6 block that is itself host-scale;
+                        // anything shorter is astronomically large.
+                        let hosts = host_count_v6(p.prefix_len());
+                        if hosts.is_some_and(|h| h <= u128::from(Self::MAX_LOCAL_PREFIX_HOSTS)) {
+                            if let Ok(net) =
+                                Ipv6Net::new(p.addr(), p.prefix_len())
+                            {
+                                for host in net.hosts() {
+                                    seen.entry(IpAddr::V6(host)).or_insert(());
+                                }
+                            }
+                        }
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
         seen.into_keys()
+    }
+}
+
+/// #3164: usable host count of an IPv4 prefix (saturating; /0 -> u32::MAX).
+fn host_count_v4(prefix_len: u8) -> u32 {
+    match 32u32.checked_sub(u32::from(prefix_len)) {
+        Some(host_bits) if host_bits < 32 => 1u32 << host_bits,
+        _ => u32::MAX,
+    }
+}
+
+/// #3164: usable host count of an IPv6 prefix; `None` if it overflows u128
+/// (anything shorter than /1), which is always far above any local bound.
+fn host_count_v6(prefix_len: u8) -> Option<u128> {
+    match 128u32.checked_sub(u32::from(prefix_len)) {
+        Some(host_bits) if host_bits < 128 => Some(1u128 << host_bits),
+        _ => None,
     }
 }

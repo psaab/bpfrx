@@ -37,7 +37,8 @@ func TestDNATValidDestinationCompiles(t *testing.T) {
 }
 
 func TestDNATValidDestinationCIDRCompiles(t *testing.T) {
-	// A /32 host CIDR is a valid destination (the builder strips the mask).
+	// A /32 host CIDR is a valid destination (the builder keys it as an
+	// exact host, DestinationPrefix empty).
 	tree := buildTree(t, dnatSet("203.0.113.10/32"))
 	if _, err := CompileConfig(tree); err != nil {
 		t.Fatalf("a DNAT rule with a /32 destination must compile, got: %v", err)
@@ -129,43 +130,30 @@ func TestDNATAllValidDestinationListAccepted(t *testing.T) {
 	}
 }
 
-// #3029: a DNAT match destination-address that is a MULTI-HOST prefix
-// (e.g. 198.51.100.0/24) compiles today but the snapshot builder strips the
-// /mask and the Rust DnatTable keys on an EXACT host IP — so only the network
-// address (198.51.100.0) translates and every other host in the block bypasses
-// DNAT (silent under-translation). The gate must hard-reject it at commit,
-// naming the rule and the offending prefix. Reverting the gate addition makes
-// this RED (the rule compiles and silently narrows).
-func TestDNATPrefixDestinationRejected(t *testing.T) {
+// #3164: a DNAT match destination-address that is a MULTI-HOST prefix
+// (e.g. 198.51.100.0/24) is now HONORED — the snapshot builder carries the
+// canonical prefix to the wire and the Rust DnatTable installs a
+// longest-prefix-match entry that translates every host in the block to the
+// rule's pool. The #3029 reject that previously fired at commit is gone, so the
+// rule must compile cleanly. Reverting the feature (restoring the #3029 gate)
+// makes this RED (the prefix rule is rejected again).
+func TestDNATPrefixDestinationCompiles(t *testing.T) {
 	tree := buildTree(t, dnatSet("198.51.100.0/24"))
-	_, err := CompileConfig(tree)
-	if err == nil {
-		t.Fatal("a DNAT rule whose destination-address is a multi-host prefix must be rejected at commit")
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "destination-nat") ||
-		!strings.Contains(msg, "r1") ||
-		!strings.Contains(msg, "198.51.100.0/24") ||
-		!strings.Contains(msg, "multi-host prefix") {
-		t.Fatalf("error must name the rule + the offending prefix as multi-host, got: %v", err)
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("a DNAT rule whose destination-address is a multi-host prefix must compile (#3164), got: %v", err)
 	}
 }
 
-// #3029: an IPv6 multi-host prefix destination must be rejected the same way.
-func TestDNATPrefixDestinationV6Rejected(t *testing.T) {
+// #3164: an IPv6 multi-host prefix destination is honored the same way.
+func TestDNATPrefixDestinationV6Compiles(t *testing.T) {
 	tree := buildTree(t, dnatSet("2001:db8::/64"))
-	_, err := CompileConfig(tree)
-	if err == nil {
-		t.Fatal("a DNAT rule whose destination-address is an IPv6 multi-host prefix must be rejected at commit")
-	}
-	if !strings.Contains(err.Error(), "multi-host prefix") {
-		t.Fatalf("error must name the v6 prefix as multi-host, got: %v", err)
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("a DNAT rule whose destination-address is an IPv6 multi-host prefix must compile (#3164), got: %v", err)
 	}
 }
 
-// #3029: a single-host destination written as an explicit host mask (/32 or
-// /128) is NOT a multi-host prefix and must still compile — the prefix gate
-// must be surgical and not regress the host-mask cases.
+// #3164: a single-host destination written as an explicit host mask (/32 or
+// /128) or a bare IP still compiles and keys the Rust exact-host fast path.
 func TestDNATHostMaskDestinationCompiles(t *testing.T) {
 	for _, dst := range []string{"203.0.113.10/32", "2001:db8::5/128", "203.0.113.10"} {
 		tree := buildTree(t, dnatSet(dst))
@@ -175,17 +163,17 @@ func TestDNATHostMaskDestinationCompiles(t *testing.T) {
 	}
 }
 
-// #3029: the tolerant load / peer-sync path must NOT brick on a config that
-// committed before this gate existed (a /24 DNAT destination) — downgrade the
-// prefix rejection to a warning (#1960 no-brick), sharing the existing
-// destination-nat-address lenient warning.
-func TestDNATPrefixDestinationLenientWarns(t *testing.T) {
+// #3164: a prefix DNAT destination must NOT emit the old destination-nat
+// multi-host-prefix warning on the tolerant load / peer-sync path — it is now a
+// fully-valid config, not a degraded one. (A genuinely malformed destination
+// still warns; see TestDNATAllInvalidDestinationLenientWarns.)
+func TestDNATPrefixDestinationLenientCompilesNoWarn(t *testing.T) {
 	cfg, err := CompileConfigLenient(buildTree(t, dnatSet("198.51.100.0/24")))
 	if err != nil {
-		t.Fatalf("lenient load must NOT fail (brick-on-restart), got: %v", err)
+		t.Fatalf("lenient load of a prefix DNAT destination must NOT fail, got: %v", err)
 	}
-	if !hasWarningContaining(cfg.Warnings, "destination-nat address") {
-		t.Fatalf("lenient load must emit a destination-nat warning, warnings=%v", cfg.Warnings)
+	if hasWarningContaining(cfg.Warnings, "destination-nat address") {
+		t.Fatalf("a prefix DNAT destination must not emit a destination-nat warning (#3164), warnings=%v", cfg.Warnings)
 	}
 }
 

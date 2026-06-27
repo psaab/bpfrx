@@ -2270,6 +2270,231 @@ fn dnat_multiple_destinations_compose_with_source_scope() {
     }
 }
 
+// #3164 helper: build a DNAT snapshot row as the Go builder emits it.
+// `prefix` is the canonical masked CIDR for a non-host block (empty for a host).
+fn dnat_row(
+    name: &str,
+    dst_addr: &str,
+    dst_prefix: &str,
+    pool: &str,
+    port: u16,
+) -> DestinationNATRuleSnapshot {
+    DestinationNATRuleSnapshot {
+        name: name.to_string(),
+        destination_address: dst_addr.to_string(),
+        destination_prefix: dst_prefix.to_string(),
+        destination_port: port,
+        protocol: "tcp".to_string(),
+        pool_address: pool.to_string(),
+        pool_port: 0,
+        ..DestinationNATRuleSnapshot::default()
+    }
+}
+
+#[test]
+fn dnat_prefix_destination_matches_any_host_in_block() {
+    // #3164 PRIMARY: `match destination-address [ A/32 B/32 C/24 ]` translates a
+    // packet to A, B, or ANY host in C/24, and leaves a destination outside all
+    // three untranslated. The Go builder emits A and B as exact-host rows
+    // (destination_prefix empty) and C/24 as a prefix row (network base in
+    // destination_address, canonical CIDR in destination_prefix).
+    //
+    // FAIL-ON-REVERT: revert to single-prefix exact-host-only matching and the
+    // C/24 host probes (the "matches the third prefix" assertions) return None.
+    let snaps = vec![
+        dnat_row("multi", "203.0.113.5", "", "10.0.0.5", 443),
+        dnat_row("multi", "203.0.113.6", "", "10.0.0.5", 443),
+        dnat_row("multi", "192.0.2.0", "192.0.2.0/24", "10.0.0.5", 443),
+    ];
+    let table = DnatTable::from_snapshots(&snaps, &crate::nat::NatCounterStore::default());
+    let src: IpAddr = "198.51.100.1".parse().unwrap();
+    let pool: IpAddr = "10.0.0.5".parse().unwrap();
+
+    for dst in [
+        "203.0.113.5",   // A/32
+        "203.0.113.6",   // B/32
+        "192.0.2.1",     // first host in C/24
+        "192.0.2.77",    // arbitrary host in C/24
+        "192.0.2.254",   // last host in C/24
+    ] {
+        let got = table.lookup(PROTO_TCP, src, dst.parse().unwrap(), 443, "");
+        assert_eq!(
+            got.and_then(|d| d.rewrite_dst),
+            Some(pool),
+            "destination {dst} must match (A, B, or any host in C/24) and translate to the pool"
+        );
+    }
+
+    for dst in [
+        "198.51.100.99", // outside all three
+        "203.0.113.7",   // adjacent to A/B but not listed
+        "192.0.3.1",     // adjacent block, not in C/24
+    ] {
+        assert_eq!(
+            table.lookup(PROTO_TCP, src, dst.parse().unwrap(), 443, ""),
+            None,
+            "destination {dst} is outside every configured prefix and must NOT translate"
+        );
+    }
+}
+
+#[test]
+fn dnat_prefix_longest_match_wins() {
+    // #3164 LPM: two overlapping prefixes must resolve by longest match. A more
+    // specific /28 (pool P2) nested inside a /24 (pool P1): a host in the /28
+    // translates to P2, a host in the /24 but outside the /28 to P1. An exact
+    // host (/32, pool P3) inside the /28 wins over both (host = longest prefix,
+    // exact-map fast path). FAIL-ON-REVERT: drop the longest-prefix tie-break
+    // (e.g. return the first match) and the /28 host resolves to P1.
+    let snaps = vec![
+        dnat_row("wide", "192.0.2.0", "192.0.2.0/24", "10.0.0.1", 80),
+        dnat_row("narrow", "192.0.2.16", "192.0.2.16/28", "10.0.0.2", 80),
+        dnat_row("host", "192.0.2.20", "", "10.0.0.3", 80),
+    ];
+    let table = DnatTable::from_snapshots(&snaps, &crate::nat::NatCounterStore::default());
+    let src: IpAddr = "198.51.100.1".parse().unwrap();
+
+    // Host inside the /28 but not the exact host -> narrow /28 pool (P2).
+    assert_eq!(
+        table
+            .lookup(PROTO_TCP, src, "192.0.2.18".parse().unwrap(), 80, "")
+            .and_then(|d| d.rewrite_dst),
+        Some("10.0.0.2".parse().unwrap()),
+        "a host in the more-specific /28 must use the /28 pool (longest-prefix-match)"
+    );
+    // Host in the /24 but outside the /28 -> wide /24 pool (P1).
+    assert_eq!(
+        table
+            .lookup(PROTO_TCP, src, "192.0.2.200".parse().unwrap(), 80, "")
+            .and_then(|d| d.rewrite_dst),
+        Some("10.0.0.1".parse().unwrap()),
+        "a host in the /24 outside the /28 must use the /24 pool"
+    );
+    // Exact host inside the /28 -> exact-host pool (P3), beats both prefixes.
+    assert_eq!(
+        table
+            .lookup(PROTO_TCP, src, "192.0.2.20".parse().unwrap(), 80, "")
+            .and_then(|d| d.rewrite_dst),
+        Some("10.0.0.3".parse().unwrap()),
+        "an exact-host entry must win over any covering prefix (host = longest match)"
+    );
+}
+
+#[test]
+fn dnat_prefix_v6_matches_block() {
+    // #3164 IPv6: a /64 destination prefix translates every host in the block.
+    let snaps = vec![dnat_row(
+        "v6-block",
+        "2001:db8:beef::",
+        "2001:db8:beef::/64",
+        "2001:db8:dead::5",
+        443,
+    )];
+    let table = DnatTable::from_snapshots(&snaps, &crate::nat::NatCounterStore::default());
+    let src: IpAddr = "2001:db8:aaaa::1".parse().unwrap();
+    let pool: IpAddr = "2001:db8:dead::5".parse().unwrap();
+    for dst in ["2001:db8:beef::1", "2001:db8:beef::dead:beef", "2001:db8:beef:0:ffff::9"] {
+        assert_eq!(
+            table
+                .lookup(PROTO_TCP, src, dst.parse().unwrap(), 443, "")
+                .and_then(|d| d.rewrite_dst),
+            Some(pool),
+            "v6 host {dst} in the /64 block must translate"
+        );
+    }
+    assert_eq!(
+        table.lookup(PROTO_TCP, src, "2001:db8:cafe::1".parse().unwrap(), 443, ""),
+        None,
+        "a v6 host outside the /64 block must NOT translate"
+    );
+}
+
+#[test]
+fn dnat_prefix_destination_compose_with_source_scope() {
+    // #3164 + #2394: a prefix DNAT that is ALSO source-scoped fires for a host
+    // in the block ONLY when the source matches.
+    let mut row = dnat_row("scoped-block", "192.0.2.0", "192.0.2.0/24", "10.0.0.5", 80);
+    row.source_addresses = vec!["198.51.100.0/24".to_string()];
+    let table = DnatTable::from_snapshots(&[row], &crate::nat::NatCounterStore::default());
+    let dst: IpAddr = "192.0.2.42".parse().unwrap();
+    assert!(
+        table
+            .lookup(PROTO_TCP, "198.51.100.7".parse().unwrap(), dst, 80, "")
+            .is_some(),
+        "in-scope source must DNAT a host in the destination prefix"
+    );
+    assert_eq!(
+        table.lookup(PROTO_TCP, "203.0.113.9".parse().unwrap(), dst, 80, ""),
+        None,
+        "out-of-scope source must NOT DNAT a host in the destination prefix (#2394 holds)"
+    );
+}
+
+#[test]
+fn dnat_prefix_host_mask_collapses_to_exact() {
+    // #3164 defensive: a /32 or /128 carried in destination_prefix is a host and
+    // must collapse onto the exact map (no spurious prefix entry).
+    let snaps = vec![
+        dnat_row("h4", "203.0.113.10", "203.0.113.10/32", "10.0.0.5", 80),
+        dnat_row("h6", "2001:db8::1", "2001:db8::1/128", "2001:db8:dead::5", 80),
+    ];
+    let table = DnatTable::from_snapshots(&snaps, &crate::nat::NatCounterStore::default());
+    assert!(
+        table
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                80,
+                ""
+            )
+            .is_some(),
+        "a /32 in destination_prefix must match as an exact host"
+    );
+    assert!(
+        table
+            .lookup(
+                PROTO_TCP,
+                "2001:db8:aaaa::1".parse().unwrap(),
+                "2001:db8::1".parse().unwrap(),
+                80,
+                ""
+            )
+            .is_some(),
+        "a /128 in destination_prefix must match as an exact host"
+    );
+}
+
+#[test]
+fn dnat_prefix_destination_ips_registers_small_block_base_only_for_large() {
+    // #3164 local-address registration: a small block (<= MAX_LOCAL_PREFIX_HOSTS)
+    // expands host-by-host so the firewall answers proxy-ARP for the whole block;
+    // a large block registers only its network base (the block must be routed to
+    // the firewall). The DNAT MATCH is independent of this set in both cases.
+    let small = dnat_row("small", "192.0.2.0", "192.0.2.0/24", "10.0.0.5", 0);
+    let table = DnatTable::from_snapshots(&[small], &crate::nat::NatCounterStore::default());
+    let ips: std::collections::HashSet<IpAddr> = table.destination_ips().collect();
+    assert!(
+        ips.contains(&"192.0.2.1".parse().unwrap())
+            && ips.contains(&"192.0.2.254".parse().unwrap()),
+        "a /24 block must register its usable hosts for proxy-ARP, got {} ips",
+        ips.len()
+    );
+
+    let large = dnat_row("large", "10.0.0.0", "10.0.0.0/8", "10.9.9.9", 0);
+    let table = DnatTable::from_snapshots(&[large], &crate::nat::NatCounterStore::default());
+    let ips: std::collections::HashSet<IpAddr> = table.destination_ips().collect();
+    assert!(
+        ips.contains(&"10.0.0.0".parse().unwrap()),
+        "a large block must still register its network base"
+    );
+    assert!(
+        ips.len() <= 2,
+        "a /8 block must NOT explode the local set (base only), got {} ips",
+        ips.len()
+    );
+}
+
 #[test]
 fn dnat_port_aware_reverse() {
     // DNAT: rewrite dst to internal, rewrite dst_port from 80 to 8080
@@ -5608,6 +5833,7 @@ fn parsed_nat_rules_share_store_counters() {
             from_zone: "untrust".to_string(),
             source_addresses: vec![],
             destination_address: "203.0.113.20".to_string(),
+            destination_prefix: String::new(),
             destination_port: 443,
             protocol: "tcp".to_string(),
             pool_address: "10.0.0.20".to_string(),

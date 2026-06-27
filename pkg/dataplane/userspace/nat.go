@@ -278,6 +278,47 @@ func appPortsFromSpec(spec string) []int {
 	return []int{int(p)}
 }
 
+// dnatDestinationParts splits a DNAT `match destination-address` token into the
+// base address the DNAT table keys on and, for a non-host prefix, the canonical
+// masked CIDR (#3164). It is the single point that decides host-vs-prefix on the
+// Go side so the snapshot and the Rust DnatTable agree:
+//
+//   - A bare IP ("198.51.100.42") or an explicit host mask ("198.51.100.42/32",
+//     "2001:db8::1/128") is a HOST: base = the address, prefix = "" — the Rust
+//     table keys it in the O(1) exact hash map (unchanged fast path).
+//   - A non-host prefix ("198.51.100.0/24") is a BLOCK: base = the prefix
+//     network address ("198.51.100.0"), prefix = the canonical masked CIDR
+//     ("198.51.100.0/24") — the Rust table installs a longest-prefix-match
+//     entry that translates every host in the block to the rule's pool.
+//
+// ok is false for a token that does not parse as an IP or CIDR (an unresolved
+// address-book name reaches here verbatim on a typo); the caller skips it, so a
+// rule whose destinations are all malformed installs no entry and matches
+// nothing (fail-closed) — the commit-time gate makes the typo operator-visible.
+func dnatDestinationParts(raw string) (base, prefix string, ok bool) {
+	if raw == "" {
+		return "", "", false
+	}
+	if strings.IndexByte(raw, '/') == -1 {
+		// Bare address — always a host.
+		if net.ParseIP(raw) == nil {
+			return "", "", false
+		}
+		return raw, "", true
+	}
+	ip, ipNet, err := net.ParseCIDR(raw)
+	if err != nil {
+		return "", "", false
+	}
+	ones, bits := ipNet.Mask.Size()
+	if ones == bits {
+		// Canonical host mask (/32 or /128) — exact-host fast path.
+		return ip.String(), "", true
+	}
+	// Non-host prefix: base = network address, prefix = canonical masked CIDR.
+	return ipNet.IP.String(), ipNet.String(), true
+}
+
 func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32) []DestinationNATRuleSnapshot {
 	if cfg == nil || cfg.Security.NAT.Destination == nil || len(cfg.Security.NAT.Destination.RuleSets) == 0 {
 		return nil
@@ -416,33 +457,31 @@ func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]u
 
 					// #2395: emit one snapshot per configured destination so a
 					// bracket-list DNAT installs a table entry for EVERY
-					// published destination, not just the first. Strip any CIDR
-					// suffix (DNAT matches exact host IPs) and skip a malformed
-					// destination — if a rule has destinations but ALL are
-					// malformed, no entry is emitted, so the rule matches NOTHING
-					// (fail-closed) rather than broadening to match-any.
+					// published destination, not just the first.
+					//
+					// #3164: a destination may now be a non-host prefix
+					// (`match destination-address 198.51.100.0/24`).
+					// dnatDestinationParts classifies each token: a host (bare IP,
+					// /32, /128) carries an empty DestinationPrefix and keys the
+					// Rust exact hash map (unchanged fast path); a non-host prefix
+					// carries the canonical masked CIDR in DestinationPrefix (the
+					// network base in DestinationAddress) and installs a
+					// longest-prefix-match entry that translates every host in the
+					// block to the rule's pool. A token that does not parse as an
+					// IP or CIDR is skipped — if a rule has destinations but ALL
+					// are malformed, no entry is emitted, so the rule matches
+					// NOTHING (fail-closed) rather than broadening to match-any.
 					for _, rawDst := range destAddrs {
-						dstAddr := rawDst
-						if idx := strings.IndexByte(dstAddr, '/'); idx != -1 {
-							dstAddr = dstAddr[:idx]
-						}
-						if dstAddr == "" {
+						base, prefix, ok := dnatDestinationParts(rawDst)
+						if !ok {
 							continue
 						}
-						// Reject anything that is not a bare host IP — the Rust
-						// table parses `destination_address` with `IpAddr::parse`
-						// and would `continue` (drop) a non-IP entry; skipping
-						// here keeps the Go and Rust views aligned and avoids
-						// emitting dead snapshot rows.
-						if net.ParseIP(dstAddr) == nil {
-							continue
-						}
-
 						out = append(out, DestinationNATRuleSnapshot{
 							Name:               rule.Name,
 							FromZone:           rs.FromZone,
 							SourceAddresses:    sourceAddrs,
-							DestinationAddress: dstAddr,
+							DestinationAddress: base,
+							DestinationPrefix:  prefix,
 							DestinationPort:    dstPort,
 							Protocol:           proto,
 							PoolAddress:        poolAddr,

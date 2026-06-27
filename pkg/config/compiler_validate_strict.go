@@ -3507,32 +3507,17 @@ func validateDestinationNATAddressesStrict(cfg *Config) error {
 						rs.Name, rule.Name, raw, strings.Join(destAddrs, ", "))
 				}
 			}
-			// #3029: a DNAT `match destination-address` that is a MULTI-HOST
-			// prefix (a CIDR with a non-host mask, e.g. 198.51.100.0/24) is
-			// silently narrowed to a single host. The snapshot builder
-			// (buildDestinationNATSnapshots) strips the `/mask` and emits an
-			// entry for the BASE address only, and the Rust DnatTable keys on
-			// an EXACT host IP (no prefix / LPM match) — so only the network
-			// address translates and every other host in the block bypasses
-			// DNAT entirely (silent under-translation). The dataplane has no
-			// prefix-match DNAT, and block-mapping semantics (1:1 offset vs
-			// many:one) are not settled, so REJECT the rule rather than commit a
-			// silently under-translating block. Single-host destinations (a bare
-			// IP, an explicit /32, or /128) are host masks and remain accepted
-			// unchanged. Reuses isHostMaskAddress, the same host-mask predicate
-			// the static-NAT path uses, so the family-specific mask check (32 vs
-			// 128) and the IPv4-mapped-IPv6 classification stay consistent.
-			for _, raw := range destAddrs {
-				if host, parsed := isHostMaskAddress(raw); parsed && !host {
-					return fmt.Errorf(
-						"destination-nat rule-set %q rule %q: match destination-address %q "+
-							"is a multi-host prefix; the dataplane DNAT match is exact-host "+
-							"only, so the rule would translate only the network address and "+
-							"silently bypass every other host in the block (use a /32 or /128 "+
-							"host address, or split the block into per-host rules)",
-						rs.Name, rule.Name, raw)
-				}
-			}
+			// #3164: a DNAT `match destination-address` that is a MULTI-HOST
+			// prefix (a CIDR with a non-host mask, e.g. 198.51.100.0/24) is now
+			// HONORED. The snapshot builder (buildDestinationNATSnapshots) carries
+			// the canonical prefix to the wire (DestinationPrefix) and the Rust
+			// DnatTable installs a longest-prefix-match entry so every host in the
+			// block is translated to the rule's pool. The #3029 reject that
+			// previously fired here (fail-closed against silent narrowing) is gone
+			// — the narrowing no longer exists. Block-mapping semantics (1:1
+			// offset host-N->host-N) remain out of scope: a prefix destination is
+			// a many:1 match to the configured pool, matching the documented
+			// scope of #3164.
 		}
 	}
 	return nil
