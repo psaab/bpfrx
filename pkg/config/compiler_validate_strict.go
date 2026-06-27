@@ -2007,11 +2007,13 @@ var reservedZoneNames = map[string]struct{}{
 // fail-OPEN this PR closes. The definition gate already guarantees no zone
 // named junos-global can exist, so an explicit junos-global reference is always
 // the bug, never a legitimate named-zone use. Global policies (`security
-// policies global { ... }`) are not validated here: they live in
-// cfg.Security.GlobalPolicies with no from/to-zone strings and are mapped to
-// the `junos-global` sentinel only when the dataplane snapshot is built (see
-// pkg/dataplane/userspace/policies.go), so they cannot reference an undefined
-// zone.
+// policies global { ... }`) keep the `junos-global` sentinel on their
+// structural from/to-zone (mapped only when the dataplane snapshot is built,
+// see pkg/dataplane/userspace/policies.go), so they never reference an
+// undefined STRUCTURAL zone. As of #3148 a global policy MAY carry an optional
+// `match from-zone`/`match to-zone` context, which validatePolicyZoneReferences
+// Strict now validates against this same special-token + defined-zone gate
+// (empty = all-zones, exempt via "").
 var policyZoneSpecialTokens = map[string]struct{}{
 	"":           {},
 	"any":        {},
@@ -2114,6 +2116,48 @@ func validatePolicyZoneReferencesStrict(cfg *Config) error {
 			return fmt.Errorf(
 				"security policy from-zone %q to-zone %q references undefined to-zone %q; define `set security zones security-zone %s` in the same commit or the rule is silently never matched (zone-pair falls through to the default policy)",
 				zpp.FromZone, zpp.ToZone, zpp.ToZone, zpp.ToZone)
+		}
+	}
+	// #3148: a global policy may carry optional from-zone/to-zone match
+	// context. An empty context means "all zones" (exempt via the "" special
+	// token); a non-empty context that names an undefined zone makes the
+	// dataplane fail CLOSED (GlobalZoneScope::Unresolved → matches nothing,
+	// userspace-dp/src/policy.rs), so the operator's scoped global policy
+	// silently does nothing. Reject it at commit for the same fail-closed
+	// parity as the zone-pair case above; the lenient path downgrades to a
+	// warning so an already-persisted config still boots.
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if pol == nil {
+			continue
+		}
+		// The reserved self-traffic zone `junos-host` cannot be honored as a
+		// global-policy from/to-zone match context: the userspace dataplane
+		// does NOT evaluate a zone-scoped global policy on the host-bound
+		// (LocalDelivery) path, so a `match from-zone junos-host` / `to-zone
+		// junos-host` global would commit but silently never match (a
+		// commit-vs-dataplane divergence on a security leaf). Reject it at
+		// commit so the two layers agree; real junos-host global-zone-context
+		// support is a follow-up. (`any` and the empty token stay exempt =
+		// all-zones, matching build_global_zone_scope in policy.rs.)
+		if pol.Match.FromZone == "junos-host" {
+			return fmt.Errorf(
+				"security policies global policy %q match from-zone %q is not supported (a zone-scoped global policy is not evaluated on the host-bound path, so it would silently never match); remove the junos-host match context (#3148)",
+				pol.Name, pol.Match.FromZone)
+		}
+		if pol.Match.ToZone == "junos-host" {
+			return fmt.Errorf(
+				"security policies global policy %q match to-zone %q is not supported (a zone-scoped global policy is not evaluated on the host-bound path, so it would silently never match); remove the junos-host match context (#3148)",
+				pol.Name, pol.Match.ToZone)
+		}
+		if !defined(pol.Match.FromZone) {
+			return fmt.Errorf(
+				"security policies global policy %q match from-zone %q references undefined zone; define `set security zones security-zone %s` in the same commit or the global policy is silently never matched (the dataplane fails closed for an unknown match zone)",
+				pol.Name, pol.Match.FromZone, pol.Match.FromZone)
+		}
+		if !defined(pol.Match.ToZone) {
+			return fmt.Errorf(
+				"security policies global policy %q match to-zone %q references undefined zone; define `set security zones security-zone %s` in the same commit or the global policy is silently never matched (the dataplane fails closed for an unknown match zone)",
+				pol.Name, pol.Match.ToZone, pol.Match.ToZone)
 		}
 	}
 	return nil

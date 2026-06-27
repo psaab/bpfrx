@@ -85,6 +85,15 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					"source-address-excluded":      {desc: "Match all sources except source-address", children: nil},
 					"destination-address-excluded": {desc: "Match all destinations except destination-address", children: nil},
 					"application":                  {desc: "Application", args: 1, multi: true, valueHint: ValueHintPolicyApp, placeholder: "<application>", children: nil},
+					// #3148: a Junos global policy can carry optional
+					// from-zone/to-zone match context so one global policy
+					// applies to a chosen zone pair (or one wildcard side)
+					// rather than every zone pair. Absent = all zones (the
+					// historical global behaviour). These leaves exist ONLY
+					// under global policy match — zone-pair policies take
+					// their zones from the from-zone/to-zone stanza.
+					"from-zone": {desc: "Restrict this global policy to packets from this zone", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					"to-zone":   {desc: "Restrict this global policy to packets to this zone", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
 				}},
 				"then": {desc: "Action", children: map[string]*schemaNode{
 					"log": {desc: "Log session", children: nil},

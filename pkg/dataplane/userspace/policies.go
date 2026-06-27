@@ -313,6 +313,12 @@ func buildOneRuleSnapshot(
 		// #2508: per-policy RT_FLOW SYSLOG log selection.
 		LogSessionInit:  logSessionInit,
 		LogSessionClose: logSessionClose,
+		// #3148: a global policy keeps fromZone/toZone == "junos-global"
+		// (preserving global-tier classification + ordering) and carries its
+		// optional zone context out-of-band in these fields. For a zone-pair
+		// policy pol.Match.FromZone/ToZone are empty, so this is inert.
+		MatchFromZone: pol.Match.FromZone,
+		MatchToZone:   pol.Match.ToZone,
 	}
 }
 

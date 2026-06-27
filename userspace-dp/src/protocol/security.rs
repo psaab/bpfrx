@@ -363,6 +363,17 @@ pub(crate) struct PolicyRuleSnapshot {
     pub log_session_init: bool,
     #[serde(rename = "log_session_close", default)]
     pub log_session_close: bool,
+    /// #3148: optional from-zone/to-zone match context for a GLOBAL policy.
+    /// A global rule keeps `from_zone`/`to_zone` == "junos-global" (so the
+    /// classifier keeps it in the global tier and preserves global config
+    /// order); these fields narrow which zone pairs the global rule matches.
+    /// Empty = all zones (the historical global behaviour). `serde(default)`
+    /// makes an old Go snapshot that omits them decode to "" (all zones), so
+    /// version skew degrades safely.
+    #[serde(rename = "match_from_zone", default)]
+    pub match_from_zone: String,
+    #[serde(rename = "match_to_zone", default)]
+    pub match_to_zone: String,
 }
 
 /// #1606: snapshot row for a unique address-book content.

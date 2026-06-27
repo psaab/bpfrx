@@ -620,6 +620,34 @@ probes per cold-path evaluation — no N×N materialization of concrete pairs. A
 deliberately not applied to host-bound traffic to preserve the management
 lifeline guarantee. This lifted the #3018 interim commit reject.
 
+**Global policy zone context (#3148).** A Junos global policy may carry optional
+`match { from-zone <z>; to-zone <z>; }` to scope it to one zone pair (or one
+wildcard side) instead of every zone pair. Such a rule keeps the
+`junos-global` sentinel on its structural zones (so it stays classified in the
+`global_indices` tier and the global config order is preserved) and carries its
+context out-of-band on the additive wire fields `match_from_zone` /
+`match_to_zone` (resolved at snapshot-build time into a `GlobalZoneScope` —
+`Any` for no constraint, `Zone(id)` for a defined zone, `Unresolved` =
+fail-closed for an undefined zone). An OMITTED leaf and an explicit `any` both
+map to `Any` (all zones, the Junos implicit default) — `build_global_zone_scope`
+short-circuits `"any"` so it can never route to `Unresolved` and silently match
+nothing, keeping the dataplane in agreement with the Go commit gate (which
+exempts `any`). The reserved `junos-host` zone is hard-rejected as a global
+match context at commit (a zone-scoped global policy is not evaluated on the
+host-bound path, so it could only ever silently never-match — real junos-host
+global-zone support is a follow-up). The scope is checked as an extra predicate
+inside the `junos-global` tier loop, **in the same tier position** shown above:
+a zone-scoped global policy is NOT promoted ahead of the #3090 wildcard tiers.
+Precedence example — a `from-zone any to-zone untrust` wildcard (zone-pair
+tier 1) wins a `trust->untrust` flow over a conflicting `global match
+from-zone trust to-zone untrust` (tier 4), because the global list is always
+consulted after the zone-pair lookups (matching Junos, where the global policy
+list is evaluated after the from-zone/to-zone policy set). A global policy with
+no zone context keeps the historical all-zones behaviour. The Go commit gate
+(`validatePolicyZoneReferencesStrict`) rejects an undefined global match zone
+(downgraded to a warning on the tolerant load path); the dataplane independently
+fails closed (`Unresolved` matches nothing).
+
 **Unknown-zone guard (#3110).** Zone id `0` is the reserved "unknown / no
 zone" sentinel — assigned to interfaces not bound to any security zone and to
 the over-cap-zone collapse-to-0 path (#2391). `evaluate_policy_result_with_len`
