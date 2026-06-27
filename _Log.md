@@ -22563,3 +22563,42 @@ top.
   **File(s)**: pkg/dataplane/userspace/capabilities.go,
   pkg/dataplane/userspace/app_inactivity_timeout_precedence_3298_test.go,
   docs/userspace-dataplane-gaps.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3300 strict cross-reference: reject a
+  `security dynamic-address address-name … profile feed-name <feed>` whose
+  feed-name resolves to no declared feed-server feed at commit. Previously a
+  typo compiled clean and armed a silent match-none address book (feed-backed
+  deny denied nothing). Added `validateDynamicAddressFeedReferencesStrict`
+  (mirrors feeds.Manager keying) + `lenientDynamicAddressFeedRef` tolerant
+  downgrade. Fail-on-revert test + positive controls.
+  **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/compiler_dynamic_address_feed_ref_3300_test.go,
+  docs/config-schema.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3300 residual (Codex MERGE-NEEDS-MAJOR): a feed-server with no
+  url AND no hostname is SKIPPED by feeds.Manager.Apply (resolveBaseURL=="")
+  → registers no feeds → a bound address-name still resolves empty → the
+  silent match-none persists, and the declared-set parity claim was
+  overstated. Added validateDynamicAddressFeedServerEndpointStrict (replicates
+  resolveBaseURL emptiness, no pkg/feeds import) dispatched BEFORE the feed-ref
+  gate, sharing lenientDynamicAddressFeedRef. Fixed the now-exact parity
+  docstring. Fail-on-revert test + url/hostname positive controls.
+  **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/compiler_dynamic_address_feed_ref_3300_test.go,
+  docs/config-schema.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3300 residual #2 (Codex re-review): the endpoint gate's flat
+  `url=="" && hostname==""` check did NOT match resolveBaseURL, which returns
+  TrimRight(url,"/") BEFORE the hostname fallback — so a slash-only `url /`
+  (operator-reachable: `/` is a valid lexer char, no url-format schema check)
+  trims to "" → Apply skips the server → #3300 silent-miss reproduces.
+  Replaced with feedServerBaseURLEmpty mirroring resolveBaseURL
+  branch-for-branch (url-branch wins; slash-only url rejected even with a
+  hostname set; no whitespace trim, matching resolveBaseURL). Added
+  slash-url + slash-url-with-hostname reject tests (RED on the flat check).
+  **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_dynamic_address_feed_ref_3300_test.go,
+  docs/config-schema.md

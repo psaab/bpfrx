@@ -379,6 +379,188 @@ func validateLogProfileStreamReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// validateDynamicAddressFeedServerEndpointStrict hard-rejects a
+// `security dynamic-address feed-server <name>` that configures no endpoint —
+// neither `url` nor `hostname` (#3300 residual). feeds.Manager.Apply derives
+// each server's base URL via resolveBaseURL (feeds.go): explicit `url`, else
+// `https://<hostname>`, else the empty string — and an empty base URL makes
+// Apply SKIP the whole server (it registers NONE of its feeds, including any
+// nested feed-name entries). The endpoint-less server still compiles into
+// SecurityConfig.DynamicAddress.FeedServers, so its feed names are
+// syntactically "declared", but at runtime no feed exists: an address-name
+// bound to one resolves to an empty (match-nothing) address book and a
+// feed-backed deny policy silently denies nothing — the same #3300 fail-open
+// symptom one layer up, at the feed-server root rather than the binding.
+//
+// This gate replicates resolveBaseURL's emptiness condition directly on the
+// FeedServer config struct (feedServerBaseURLEmpty) rather than importing
+// pkg/feeds (pkg/config must not depend on pkg/feeds). resolveBaseURL prefers
+// `url` and returns strings.TrimRight(url, "/") BEFORE it ever falls back to
+// `hostname`, so a slash-only `url` (e.g. `/`, `//`) trims to "" and the
+// server is skipped even when a hostname is also set — feedServerBaseURLEmpty
+// mirrors that branch order exactly. Keep in sync with resolveBaseURL.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientDynamicAddressFeedRef, shared with the feed-name
+// cross-reference gate) so an already-persisted or peer-synced config carrying
+// an endpoint-less server still boots — the runtime already drops the server
+// (registers no feed), so any bound address-name is fail-closed match-none
+// rather than bricking the load (#1960 / #3261 class). Commit / commit-check
+// stay strict. Mirrors validateLogProfileStreamReferencesStrict.
+func validateDynamicAddressFeedServerEndpointStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	servers := cfg.Security.DynamicAddress.FeedServers
+	if len(servers) == 0 {
+		return nil
+	}
+	// FeedServers is a map (unordered); sort keys so the first-error
+	// commit-check message is deterministic across runs.
+	names := make([]string, 0, len(servers))
+	for name := range servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		fs := servers[name]
+		if fs == nil {
+			continue
+		}
+		if feedServerBaseURLEmpty(fs) {
+			display := fs.Name
+			if display == "" {
+				display = name
+			}
+			return fmt.Errorf("security dynamic-address feed-server %q resolves "+
+				"to an empty endpoint (no url or hostname, or a slash-only url) "+
+				"so it registers no feeds — any address-name bound to it "+
+				"silently matches nothing; set a valid url or hostname",
+				display)
+		}
+	}
+	return nil
+}
+
+// feedServerBaseURLEmpty reports whether feeds.resolveBaseURL would return ""
+// for this feed-server — i.e. feeds.Manager.Apply would SKIP it and register
+// none of its feeds. It mirrors resolveBaseURL (pkg/feeds/feeds.go)
+// BRANCH-FOR-BRANCH:
+//
+//	if URL != "":            empty iff strings.TrimRight(URL, "/") == ""
+//	else if Hostname != "":  never empty ("https://" + ... is always non-empty)
+//	else:                    empty
+//
+// The URL branch wins outright, so a slash-only `url` (e.g. `/`, `//`) trims to
+// "" and the server is skipped EVEN IF a hostname is also configured — the
+// fallback is never reached. resolveBaseURL performs no whitespace trimming
+// (only strings.TrimRight on "/"), so this does not either. pkg/config cannot
+// import pkg/feeds (import cycle); keep this in sync with resolveBaseURL.
+func feedServerBaseURLEmpty(fs *FeedServer) bool {
+	if fs.URL != "" {
+		return strings.TrimRight(fs.URL, "/") == ""
+	}
+	if fs.Hostname != "" {
+		return false
+	}
+	return true
+}
+
+// validateDynamicAddressFeedReferencesStrict hard-rejects a
+// `security dynamic-address address-name <addr> profile feed-name <feed>`
+// binding whose `<feed>` resolves to no declared feed (#3300). The
+// address-name→feed binding is recorded verbatim into
+// AddressBinding.FeedNames with no cross-reference against the configured
+// feed-servers (compileDynamicAddress in compiler_services.go), and at
+// runtime an unknown feed name contributes nothing: feeds.Manager.
+// SnapshotForBindings skips a feed it never registered and still publishes
+// a non-nil EMPTY prefix set for the binding (feeds.go SnapshotForBindings),
+// so the AF_XDP address book gets a book ID that matches nothing
+// (fail-closed). The runtime fail-closed posture is correct for "feed
+// declared but not yet fetched", but a TYPO in the feed-name is
+// indistinguishable from that and arms a silent match-none book: a
+// feed-backed deny policy referencing the dynamic-address denies nothing,
+// with no commit error. Junos rejects an address-name whose profile
+// feed-name does not resolve to a declared feed at commit; this gate
+// restores that behavior.
+//
+// The valid feed-name set mirrors the keys feeds.Manager registers (feeds.go
+// Start): a feed-server with per-feed entries contributes each FeedEntry.Name;
+// a single-feed server contributes its FeedName, or the server name itself
+// when no explicit feed-name is set. This parity is EXACT because
+// validateDynamicAddressFeedServerEndpointStrict (run just before this gate)
+// rejects any feed-server with no url/hostname — the only servers
+// feeds.Manager.Apply silently SKIPS — so every server in the declared set is
+// one Apply would actually register. The schema accepts `profile feed-name` as
+// a free-form value leaf (schema_security.go), so the undefined-token gate
+// (#2008/#2009) does NOT cover a typo here — only this cross-reference does.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientDynamicAddressFeedRef) so an already-persisted config
+// (older binaries never validated the reference) or a peer-synced config
+// still boots — the runtime is already fail-closed (match-none) for an
+// unknown feed, so a leniently-loaded typo denies nothing rather than
+// bricking the load (#1960 / #3261 class). Commit / commit-check stay strict
+// so the operator's next edit fails loudly. Mirrors
+// validateLogProfileStreamReferencesStrict.
+func validateDynamicAddressFeedReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	da := cfg.Security.DynamicAddress
+	if len(da.AddressBindings) == 0 {
+		return nil
+	}
+
+	// Build the set of declared feed names exactly as feeds.Manager keys
+	// them (pkg/feeds Start): FeedEntries name each feed; a single-feed
+	// server keys on FeedName, falling back to the server name.
+	declared := make(map[string]bool)
+	for _, fs := range da.FeedServers {
+		if fs == nil {
+			continue
+		}
+		if len(fs.FeedEntries) > 0 {
+			for _, fe := range fs.FeedEntries {
+				declared[fe.Name] = true
+			}
+			continue
+		}
+		key := fs.FeedName
+		if key == "" {
+			key = fs.Name
+		}
+		if key != "" {
+			declared[key] = true
+		}
+	}
+
+	// AddressBindings is a map (unordered); sort keys so the first-error
+	// commit-check message is deterministic across runs.
+	names := make([]string, 0, len(da.AddressBindings))
+	for name := range da.AddressBindings {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		ab := da.AddressBindings[name]
+		if ab == nil {
+			continue
+		}
+		for _, fn := range ab.FeedNames {
+			if fn == "" || declared[fn] {
+				continue
+			}
+			return fmt.Errorf("security dynamic-address address-name %q "+
+				"profile references undefined feed-name %q (the binding would "+
+				"resolve to an empty address set — a feed-backed policy would "+
+				"silently match nothing; declare the feed under a "+
+				"dynamic-address feed-server or fix the feed-name)", ab.Name, fn)
+		}
+	}
+	return nil
+}
+
 // validateFlowServerTemplateReferencesStrict hard-rejects a per-flow-server
 // NetFlow v9 / IPFIX template reference (`version9 { template <name> }`,
 // `version9-template <name>`, `version-ipfix { template <name> }`, or
