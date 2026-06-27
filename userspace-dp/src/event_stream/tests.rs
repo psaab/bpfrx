@@ -1844,3 +1844,259 @@ fn test_idle_keepalive_wouldblock_is_backpressure_not_reconnect_2883() {
     );
     drop(daemon_side);
 }
+
+// ---------------------------------------------------------------------------
+// #2875 — paused-demotion drain must not silently lose session-sync deltas
+// ---------------------------------------------------------------------------
+
+// Build a benign header-only TELEMETRY frame (RT_FLOW screen-drop type) so we
+// can prove that evicting it while paused does NOT poison the drain. Unlike
+// `replay_seq_frame` (a SESSION_OPEN), this msg_type is not a session-sync
+// delta, so `EventFrame::is_session_sync()` returns false for it.
+fn telemetry_seq_frame(seq: u64) -> EventFrame {
+    let mut data = [0u8; 256];
+    data[4] = super::codec::MSG_SCREEN_DROP;
+    data[8..16].copy_from_slice(&seq.to_le_bytes());
+    EventFrame {
+        data,
+        len: FRAME_HEADER_SIZE as u16,
+        seq,
+    }
+}
+
+// #2875 fail-on-revert guard: pause the helper, overrun the bounded replay
+// buffer so a SESSION-SYNC delta is evicted, then issue DrainRequest. The drain
+// MUST be poisoned — it withholds DrainComplete and emits a FullResync instead,
+// forcing the daemon to full-resync rather than complete demotion with lost
+// session mutations. Reverting the poison gate makes the helper emit
+// DrainComplete here -> this goes RED.
+#[test]
+fn test_paused_session_eviction_poisons_drain_2875() {
+    let (mut daemon_side, helper_side) = std::os::unix::net::UnixStream::pair().unwrap();
+    daemon_side
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let shared = Arc::new(EventStreamShared::new());
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+
+    // Fill the replay buffer to capacity with SESSION-SYNC deltas (no eviction
+    // yet: the buffer holds exactly REPLAY_BUFFER_CAPACITY frames).
+    for seq in 1..=REPLAY_BUFFER_CAPACITY as u64 {
+        push_replay_frame(&shared, &mut replay_buf, replay_seq_frame(seq));
+    }
+    assert_eq!(replay_buf.len(), REPLAY_BUFFER_CAPACITY);
+    assert!(!shared.session_evicted_while_paused.load(Ordering::Acquire));
+
+    // Demotion pause window begins, then one more session delta arrives and
+    // evicts the OLDEST session frame (seq 1) — a lost session mutation.
+    shared.paused.store(true, Ordering::Release);
+    push_replay_frame(
+        &shared,
+        &mut replay_buf,
+        replay_seq_frame(REPLAY_BUFFER_CAPACITY as u64 + 1),
+    );
+    assert!(
+        shared.session_evicted_while_paused.load(Ordering::Acquire),
+        "evicting a session delta while paused must poison the drain (#2875)"
+    );
+
+    // Keep tx alive so the drain loop sees Empty (not Disconnected) and reaches
+    // the fence via replay_buf.back().seq >= target.
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    handle_drain_request(5, &rx, &helper_side, &shared, &mut replay_buf);
+
+    // The daemon must observe a FullResync and NEVER a DrainComplete.
+    let mut saw_full_resync = false;
+    while let Some((msg_type, _seq)) = try_read_frame_header(&mut daemon_side) {
+        assert_ne!(
+            msg_type, MSG_DRAIN_COMPLETE,
+            "poisoned drain must NOT report DrainComplete (#2875 regression)"
+        );
+        if msg_type == MSG_FULL_RESYNC {
+            saw_full_resync = true;
+        }
+    }
+    assert!(
+        saw_full_resync,
+        "poisoned drain must emit a FullResync so the daemon full-resyncs (#2875)"
+    );
+    // Poison is consumed once the resync is sent.
+    assert!(!shared.session_evicted_while_paused.load(Ordering::Acquire));
+}
+
+// #2875: a TELEMETRY-only eviction while paused must NOT poison the drain — the
+// drain still completes normally (no spurious FullResync / FullResync storm).
+#[test]
+fn test_paused_telemetry_eviction_does_not_poison_drain_2875() {
+    let (mut daemon_side, helper_side) = std::os::unix::net::UnixStream::pair().unwrap();
+    daemon_side
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let shared = Arc::new(EventStreamShared::new());
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+
+    // Fill to capacity with TELEMETRY frames, then evict one while paused.
+    for seq in 1..=REPLAY_BUFFER_CAPACITY as u64 {
+        push_replay_frame(&shared, &mut replay_buf, telemetry_seq_frame(seq));
+    }
+    shared.paused.store(true, Ordering::Release);
+    push_replay_frame(
+        &shared,
+        &mut replay_buf,
+        telemetry_seq_frame(REPLAY_BUFFER_CAPACITY as u64 + 1),
+    );
+    assert!(
+        !shared.session_evicted_while_paused.load(Ordering::Acquire),
+        "telemetry eviction while paused must NOT poison the drain (#2875)"
+    );
+
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    handle_drain_request(5, &rx, &helper_side, &shared, &mut replay_buf);
+
+    // The drain must complete normally — DrainComplete present, no FullResync.
+    let mut saw_complete = false;
+    while let Some((msg_type, _seq)) = try_read_frame_header(&mut daemon_side) {
+        assert_ne!(
+            msg_type, MSG_FULL_RESYNC,
+            "telemetry eviction must not cause a spurious FullResync (#2875)"
+        );
+        if msg_type == MSG_DRAIN_COMPLETE {
+            saw_complete = true;
+        }
+    }
+    assert!(
+        saw_complete,
+        "non-poisoned drain must still report DrainComplete (#2875)"
+    );
+}
+
+// #2875: a fresh pause window must start lossless — MSG_PAUSE clears any poison
+// left by a previous drain so a stale flag cannot withhold this window's
+// DrainComplete.
+#[test]
+fn test_pause_start_clears_drain_poison_2875() {
+    let shared = Arc::new(EventStreamShared::new());
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+
+    // Simulate a leftover poison from a prior window.
+    shared
+        .session_evicted_while_paused
+        .store(true, Ordering::Release);
+
+    // A PAUSE control frame must clear it.
+    let mut pause = [0u8; FRAME_HEADER_SIZE];
+    pause[4] = MSG_PAUSE;
+    let (action, consumed) =
+        process_control_frames(&pause, &shared, &rx, &sock_a, &mut replay_buf);
+    assert!(action.is_none());
+    assert_eq!(consumed, FRAME_HEADER_SIZE);
+    assert!(shared.paused.load(Ordering::Acquire));
+    assert!(
+        !shared.session_evicted_while_paused.load(Ordering::Acquire),
+        "MSG_PAUSE must clear stale drain poison (#2875)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #2879 — daemon→helper control frames must have a bounded payload
+// ---------------------------------------------------------------------------
+
+// Build a control header with an arbitrary payload_len and opcode.
+fn build_ctrl_header(payload_len: u32, msg_type: u8) -> [u8; FRAME_HEADER_SIZE] {
+    let mut buf = [0u8; FRAME_HEADER_SIZE];
+    buf[0..4].copy_from_slice(&payload_len.to_le_bytes());
+    buf[4] = msg_type;
+    buf
+}
+
+// #2879 fail-on-revert guard: a daemon that declares payload_len = 1<<30 and
+// trickles bytes must be DISCONNECTED before the helper buffers the (never
+// completing) frame, so ctrl_read_buf cannot grow without bound. Reverting the
+// cap makes process_control_frames return (None, 0) — incomplete-frame break —
+// and the bytes accumulate -> this goes RED.
+#[test]
+fn test_oversized_control_payload_disconnects_2879() {
+    let shared = Arc::new(EventStreamShared::new());
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+
+    let mut ctrl: Vec<u8> = Vec::new();
+    ctrl.extend_from_slice(&build_ctrl_header(1u32 << 30, MSG_PAUSE));
+    // Trickle a few payload bytes — far short of 1<<30.
+    ctrl.extend_from_slice(&[0u8; 8]);
+
+    let (action, _consumed) =
+        process_control_frames(&ctrl, &shared, &rx, &sock_a, &mut replay_buf);
+    assert_eq!(
+        action,
+        Some(true),
+        "oversized payload_len must force a disconnect, not unbounded buffering (#2879)"
+    );
+    // The bogus PAUSE frame must NOT have been processed before the disconnect.
+    assert!(
+        !shared.paused.load(Ordering::Acquire),
+        "an invalid oversized frame must not be applied (#2879)"
+    );
+}
+
+// #2879: the current daemon→helper opcodes (Ack/Pause/Resume/DrainRequest) are
+// header-only; a NONZERO payload_len on any of them is invalid and must be
+// rejected (disconnect).
+#[test]
+fn test_nonzero_payload_on_header_only_opcodes_rejected_2879() {
+    let shared = Arc::new(EventStreamShared::new());
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+
+    for opcode in [MSG_ACK, MSG_PAUSE, MSG_RESUME, MSG_DRAIN_REQUEST] {
+        let mut ctrl: Vec<u8> = Vec::new();
+        // payload_len = 8 (nonzero) plus 8 payload bytes so the frame is fully
+        // present — proving the rejection is on the length, not on completeness.
+        ctrl.extend_from_slice(&build_ctrl_header(8, opcode));
+        ctrl.extend_from_slice(&[0u8; 8]);
+        let (action, _consumed) =
+            process_control_frames(&ctrl, &shared, &rx, &sock_a, &mut replay_buf);
+        assert_eq!(
+            action,
+            Some(true),
+            "nonzero payload on header-only opcode {opcode} must be rejected (#2879)"
+        );
+    }
+}
+
+// #2879 no-regression: a legitimate header-only control frame whose HEADER is
+// split across two reads must still parse once complete — the cap only rejects
+// an invalid payload_len, never a merely-incomplete header.
+#[test]
+fn test_split_header_only_frame_still_parses_2879() {
+    let shared = Arc::new(EventStreamShared::new());
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+
+    let header = build_ctrl_header(0, MSG_PAUSE); // header-only, zero payload
+    let mut ctrl: Vec<u8> = Vec::new();
+
+    // First read: only the first 8 bytes of the 16-byte header.
+    ctrl.extend_from_slice(&header[..8]);
+    let (action, consumed) =
+        process_control_frames(&ctrl, &shared, &rx, &sock_a, &mut replay_buf);
+    assert!(action.is_none(), "partial header must not disconnect (#2879)");
+    assert_eq!(consumed, 0, "partial header must not be consumed");
+    assert!(!shared.paused.load(Ordering::Acquire));
+
+    // Second read: the rest of the header arrives; the PAUSE now applies.
+    ctrl.extend_from_slice(&header[8..]);
+    let (action, consumed) =
+        process_control_frames(&ctrl, &shared, &rx, &sock_a, &mut replay_buf);
+    assert!(action.is_none());
+    assert_eq!(consumed, FRAME_HEADER_SIZE);
+    assert!(
+        shared.paused.load(Ordering::Acquire),
+        "a header-only frame split across reads must still parse (#2879)"
+    );
+}
