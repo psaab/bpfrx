@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/vishvananda/netlink"
@@ -551,6 +552,59 @@ func TestObserveInterfaceAddrTransientVsDefinitive(t *testing.T) {
 		got, ok := d.observeInterfaceAddr("ge-0-0-2", true, unitWithStatic)
 		if !ok || got != dynV4 {
 			t.Fatalf("dynamic address: got (%v, %v); want (%v, true)", got, ok, dynV4)
+		}
+	})
+}
+
+// TestForceDDNSUpdateOwnerGate is the #3276 fail-on-revert proof for the
+// operator `request system dynamic-dns update` verb's owner gate. On a standalone
+// node (no cluster) the force is accepted; on a node that is BACKUP for every RG
+// the force is a no-op with a clear "not the active writer" message — the RG
+// owner publishes, never the standby (#2972). Revert the ddnsWriterGateOpen check
+// in ForceDDNSUpdate and the backup case returns ok=true → this test goes RED.
+func TestForceDDNSUpdateOwnerGate(t *testing.T) {
+	t.Run("standalone forces an update", func(t *testing.T) {
+		d := &Daemon{
+			rgStates: make(map[int]*rgStateMachine),
+			surfaceA: ddns.NewSurfaceAManager(),
+		}
+		ok, msg := d.ForceDDNSUpdate(true)
+		if !ok {
+			t.Fatalf("standalone force must be accepted; got ok=false msg=%q", msg)
+		}
+		if !strings.Contains(msg, "forced") {
+			t.Fatalf("standalone force message = %q, want it to mention a forced update", msg)
+		}
+	})
+
+	t.Run("backup for all RGs is a gated no-op", func(t *testing.T) {
+		d := &Daemon{
+			rgStates: make(map[int]*rgStateMachine),
+			cluster:  cluster.NewManager(0, 1),
+			surfaceA: ddns.NewSurfaceAManager(),
+		}
+		d.getOrCreateRGState(1).SetCluster(false)
+		d.getOrCreateRGState(2).SetCluster(false)
+		ok, msg := d.ForceDDNSUpdate(true)
+		if ok {
+			t.Fatalf("a node BACKUP for all RGs must NOT force a publish; got ok=true msg=%q", msg)
+		}
+		if !strings.Contains(msg, "not the active writer") {
+			t.Fatalf("backup gate message = %q, want a clear not-the-active-writer message", msg)
+		}
+	})
+
+	t.Run("master for one RG forces an update", func(t *testing.T) {
+		d := &Daemon{
+			rgStates: make(map[int]*rgStateMachine),
+			cluster:  cluster.NewManager(0, 1),
+			surfaceA: ddns.NewSurfaceAManager(),
+		}
+		d.getOrCreateRGState(1).SetCluster(false)
+		d.getOrCreateRGState(2).SetCluster(true)
+		ok, _ := d.ForceDDNSUpdate(true)
+		if !ok {
+			t.Fatal("a node MASTER for >=1 RG must accept the force-now verb")
 		}
 	})
 }

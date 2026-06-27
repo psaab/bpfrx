@@ -1,3 +1,55 @@
+## 2026-06-27 — #3276 DDNS operator force-now / check-now verb
+
+- **Timestamp**: 2026-06-27
+- **Action**: Add `request system dynamic-dns update` (force-now) and
+  `request system dynamic-dns check` (check-now) operator verbs. The Surface A
+  DDNS engine already had a forced-refresh path decoupled from the poll (P2
+  #2717) but no operator trigger. Engine: new one-shot `SurfaceAManager.
+  ForceRefresh()` latch consumed by the next non-degraded reconcile pass — makes
+  every configured scope refresh-due so the RG owner re-asserts the wire record
+  even for an unchanged address inside the forced-refresh floor; the latch does
+  NOT bypass the per-RG HA writer gate (#2972). Daemon: `ForceDDNSUpdate(force)`
+  arms the latch (force=true) + nudges both DDNS reconcile loops; honors the
+  node-level owner gate (`ddnsWriterGateOpen`) — on a backup it is a no-op with a
+  clear "not the active writer" message. Wiring: cmdtree node →
+  gRPC `SystemAction("dynamic-dns-update"|"dynamic-dns-check")` → local CLI
+  (`handleRequestSystemDynamicDNS` + `SetSurfaceADDNSForceFn`) + remote CLI.
+  Tests (fail-on-revert): pkg/ddns force-republishes-unchanged + gate-respected;
+  pkg/daemon owner-gate (standalone/backup/master); pkg/grpcapi dispatch +
+  unavailable; pkg/cmdtree completion. Closes #3276.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/surface_a_test.go,
+  pkg/daemon/daemon_ddns_surface_a.go, pkg/daemon/daemon_ddns_surface_a_test.go,
+  pkg/daemon/daemon_run.go, pkg/grpcapi/server.go, pkg/grpcapi/server_diag.go,
+  pkg/grpcapi/system_action_test.go, pkg/cmdtree/tree.go,
+  pkg/cmdtree/tree_test.go, pkg/cli/cli.go, pkg/cli/cli_request.go,
+  cmd/cli/request.go, pkg/ddns/README.md
+## 2026-06-27 — #2930 doc-only: correct demotion-path drift, mark DrainRequest reserved/dormant
+
+- **Timestamp**: 2026-06-27
+- **Action**: Doc + comment only (no behavior change). The /research plan
+  (campaign-8) PLAN-KILLED the correctness-bug framing: the seq-fenced
+  DrainRequest/DrainComplete pair (SendDrainRequest / handle_drain_request,
+  MSG_DRAIN_REQUEST=7) is dormant (no production caller) but the live demotion
+  path has no correctness gap — it uses SessionSync.WaitForPeerBarrier + the
+  continuous lossless event stream, and republish uses
+  ExportOwnerRGSessions(rgIDs, 0) (an unbounded full-conntrack snapshot) fired
+  on event-stream FullResync (#2874 gap / #2442 overflow), NOT on demotion-prep.
+  Verified against master: prepareUserspaceRGDemotionWithTimeout does only the
+  single WaitForPeerBarrier; PrepareRGDemotion does not exist;
+  WaitForIdle/WaitForPeerBarriersDrained/PauseIncrementalSync have no live
+  caller; ExportOwnerRGSessions has one live caller — handleEventStreamFullResync.
+  Corrected docs/session-sync-architecture.md (live demotion path; reframed the
+  stale 10-step "Graceful Demotion" sequence; "Export During Demotion Prep" →
+  "Bulk Owner-RG Export (FullResync republish)"; marked the DrainRequest fence
+  RESERVED/DORMANT; v4 revision entry). Added reserved/dormant doc-comments at
+  SendDrainRequest (eventstream.go) and handle_drain_request (event_stream/mod.rs)
+  and a reserved/dormant note in userspace-dp/src/event_stream/README.md.
+- **File(s)**: docs/session-sync-architecture.md,
+  pkg/dataplane/userspace/eventstream.go,
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/README.md, _Log.md
+- **Validation**: go build ./... clean (doc + comment only, no test needed).
+
 ## 2026-06-26 — #3148 review fold: explicit `any`→Any + reject junos-host global match
 
 - **Timestamp**: 2026-06-26
@@ -22300,3 +22352,8 @@ top.
   pkg/daemon/daemon_flowexport.go,
   pkg/daemon/daemon_flowexport_flowdir_test.go,
   pkg/config/compiler_validate_warn.go, pkg/flowexport/README.md
+  **Action**: #3277 — derive host-inbound lifeline interface set from chassis-cluster config (configured control-interface / fabric interfaces) instead of the hardcoded fxp0/em0/fab* list, so a non-default `control-interface fxp1` is excluded from host-inbound deny scoping (fixes latent HA split-brain). Added fail-on-revert tests at the predicate and full-payload levels; updated host-inbound lifeline doc.
+  **File(s)**: pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/zones_host_inbound_test.go,
+  pkg/daemon/host_inbound_nft_test.go,
+  docs/junos-cli-reference.md

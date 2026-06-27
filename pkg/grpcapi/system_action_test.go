@@ -168,3 +168,55 @@ func TestSystemActionUserspaceInjectDecodesEmitOnWireTargetExtras(t *testing.T) 
 		t.Fatalf("DestinationPort = %v, want 0", dp.got.DestinationPort)
 	}
 }
+
+// TestSystemActionDynamicDNSUpdate is the #3276 gRPC fail-on-revert proof: the
+// `dynamic-dns-update` / `dynamic-dns-check` SystemAction verbs invoke the wired
+// force callback with the correct force flag and relay its message. Revert the
+// dispatch case → the RPC returns an "unknown system action" error and this test
+// goes RED.
+func TestSystemActionDynamicDNSUpdate(t *testing.T) {
+	var gotForce *bool
+	s := NewServer("", Config{
+		SurfaceADDNSForceFn: func(force bool) (bool, string) {
+			f := force
+			gotForce = &f
+			if force {
+				return true, "dynamic-dns: forced an immediate update"
+			}
+			return true, "dynamic-dns: triggered an immediate DDNS check"
+		},
+	})
+
+	resp, err := s.SystemAction(context.Background(), &pb.SystemActionRequest{Action: "dynamic-dns-update"})
+	if err != nil {
+		t.Fatalf("SystemAction(update) error = %v", err)
+	}
+	if gotForce == nil || !*gotForce {
+		t.Fatalf("update must invoke the force callback with force=true; got %v", gotForce)
+	}
+	if resp.Message != "dynamic-dns: forced an immediate update" {
+		t.Fatalf("update message = %q", resp.Message)
+	}
+
+	gotForce = nil
+	resp, err = s.SystemAction(context.Background(), &pb.SystemActionRequest{Action: "dynamic-dns-check"})
+	if err != nil {
+		t.Fatalf("SystemAction(check) error = %v", err)
+	}
+	if gotForce == nil || *gotForce {
+		t.Fatalf("check must invoke the force callback with force=false; got %v", gotForce)
+	}
+	if resp.Message != "dynamic-dns: triggered an immediate DDNS check" {
+		t.Fatalf("check message = %q", resp.Message)
+	}
+}
+
+// TestSystemActionDynamicDNSUnavailable: with no force callback wired (NoDataplane)
+// the verb fails with Unavailable rather than silently succeeding.
+func TestSystemActionDynamicDNSUnavailable(t *testing.T) {
+	s := NewServer("", Config{})
+	_, err := s.SystemAction(context.Background(), &pb.SystemActionRequest{Action: "dynamic-dns-update"})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("want Unavailable when DDNS engine absent, got %v", err)
+	}
+}

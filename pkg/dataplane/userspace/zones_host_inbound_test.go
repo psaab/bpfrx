@@ -336,15 +336,39 @@ func liveZoneHostInboundAddrsForIface(t *testing.T, linuxName string) []string {
 }
 
 func TestHostInboundLifelineInterface(t *testing.T) {
+	// Standalone (no chassis-cluster stanza): only fxp0 is config-derived, but
+	// the em0/fab* backward-compatible defaults still match unconditionally.
+	def := hostInboundLifelineSet(nil)
 	for _, name := range []string{"fxp0", "fxp0.0", "em0", "em0.0", "fab0", "fab1", "fab1.0"} {
-		if !hostInboundLifelineInterface(name) {
+		if !hostInboundLifelineInterface(name, def) {
 			t.Errorf("%q should be a lifeline interface", name)
 		}
 	}
-	for _, name := range []string{"reth0.50", "reth1", "ge-0/0/0.0", "gr-0/0/0.0"} {
-		if hostInboundLifelineInterface(name) {
-			t.Errorf("%q must NOT be a lifeline interface", name)
+	for _, name := range []string{"reth0.50", "reth1", "ge-0/0/0.0", "gr-0/0/0.0", "fxp1", "fxp1.0"} {
+		if hostInboundLifelineInterface(name, def) {
+			t.Errorf("%q must NOT be a lifeline interface (no cluster config)", name)
 		}
+	}
+}
+
+// TestHostInboundLifelineFromControlInterface is the #3277 fail-on-revert proof
+// at the predicate level: a configured chassis-cluster `control-interface fxp1`
+// (an operator-renamed control link) is treated as a lifeline. Reverting to the
+// hardcoded fxp0/em0/fab* set leaves fxp1 NOT a lifeline -> this goes RED.
+func TestHostInboundLifelineFromControlInterface(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chassis.Cluster = &config.ClusterConfig{
+		ControlInterface: "fxp1",
+		FabricInterface:  "xe-0/0/9",
+	}
+	set := hostInboundLifelineSet(cfg)
+	for _, name := range []string{"fxp1", "fxp1.0", "xe-0/0/9", "xe-0/0/9.0", "fxp0", "em0", "fab0"} {
+		if !hostInboundLifelineInterface(name, set) {
+			t.Errorf("%q should be a lifeline with control-interface fxp1 configured", name)
+		}
+	}
+	if hostInboundLifelineInterface("reth0.50", set) {
+		t.Errorf("reth0.50 must NOT be a lifeline")
 	}
 }
 
