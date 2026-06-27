@@ -1,3 +1,36 @@
+## 2026-06-26 — #3122 count peer-synced sessions toward the per-IP session limit
+
+- **Timestamp**: 2026-06-26
+- **Action**: HA failover let a client bypass its per-IP session-limit cap.
+  Before #3122 the `SessionTable` per-IP count tracked only LOCALLY-owned
+  forward sessions; HA-peer-synced sessions were excluded. After a failover the
+  standby-turned-active held synced sessions it had never counted, so a client
+  could open a full fresh allotment ON TOP of its pre-existing sessions — a
+  security limit bypass. Fix: make the counted-class PRESENCE-based and
+  origin-agnostic (`!is_reverse && !is_transient_local_seed()`), so a forward
+  non-seed session counts whether it was locally admitted OR imported from the
+  peer. SEPARATED the count from the HA Open delta (the delta keeps its
+  `!is_peer_synced()` gate — a synced session must not re-emit a delta, a sync
+  loop). Increment now fires at BOTH create sinks (fresh install +
+  `upsert_synced_with_origin`); decrement is the sole `remove_entry` sink, now
+  origin-agnostic. The in-place HA promote (`update_session`) and demote
+  (`demote_owner_rg`) are count-NEUTRAL (no double-count at failover/failback) —
+  EXCEPT demote of a transient `MissingNeighborSeed` (uncounted) → `SyncImport`
+  (counted), which increments to keep balance (the seed carries a real
+  owner_rg_id from `build_missing_neighbor_session_metadata`, so it is reachable
+  by `demote_owner_rg`).
+- **File(s)**: `userspace-dp/src/session/install.rs`,
+  `userspace-dp/src/session/mod.rs`,
+  `userspace-dp/src/session/README.md`,
+  `userspace-dp/src/session/tests.rs`,
+  `docs/feature-gaps.md`, `_Log.md`
+- **Validation**: `cargo build --release` clean; `cargo test --release`
+  (3134 passed; the one `worker_queue::concurrent_recovery` flake passes 3/3
+  isolated — pre-existing concurrency flake, untouched by this change).
+  Fail-on-revert proven: restoring the `!is_peer_synced()` exclusion on the
+  synced-import count turns `session_limit_synced_sessions_enforced_after_failover`,
+  `session_limit_ha_import_promote_demote_count`, and the
+  `session_limit_counts_match_live_counted_entries_invariant` RED.
 ## 2026-06-26 — #3109 correct false lenient-path claim + file #3261
 
 - **Timestamp**: 2026-06-26
