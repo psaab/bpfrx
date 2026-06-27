@@ -21910,3 +21910,25 @@ top.
   pkg/config/compiler_validate_strict.go,
   pkg/config/addressbook_name_slash_3061_test.go,
   pkg/config/README.md, docs/config-schema.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3090 — implement wildcard from-zone/to-zone `any` policy
+  indexing in the userspace dataplane, lifting the #3018 interim commit reject.
+  PolicyState gains three dedicated index lists — from-any (keyed by concrete
+  to-zone id), to-any (keyed by concrete from-zone id), both-any — populated by
+  `parse_policy_state_with_counters`. `evaluate_policy_result_with_icmp`
+  consults them in Junos most-specific-first precedence (exact → single-wildcard
+  merged in config order → both-any → junos-global → default), all O(1) hashmap
+  probes (no N×N expansion). `evaluate_junos_host_policy` consults
+  `from-zone any to-zone junos-host` so the host path is not a new fail-open;
+  to-any / both-any are intentionally excluded from the host path (lifeline).
+  Go: removed `validatePolicyWildcardZoneStrict` + `lenientPolicyWildcardZone`
+  flag/dispatch; flipped the #3018 tests to assert commit-and-enforce. 9 new
+  Rust tests (fail-on-revert: disabling the tiers turns 7 RED, incl.
+  from_zone_any_matches_across_ingress_zones /
+  to_zone_any_matches_across_egress_zones). No wire-field change (snapshot
+  already carries zone strings as literals).
+  **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+  pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/policy_zone_ref_test.go, pkg/config/README.md,
+  docs/userspace-dataplane-architecture.md
