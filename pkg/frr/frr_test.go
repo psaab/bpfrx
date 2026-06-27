@@ -505,6 +505,71 @@ func TestGenerateProtocols_BGPImportAndExport(t *testing.T) {
 	}
 }
 
+// TestGenerateProtocols_BGPExportNextHopSelf proves a `then next-hop self`
+// export policy attached to an iBGP neighbor renders the FRR per-neighbor
+// `next-hop-self` knob (#2977). FRR has no `set ... next-hop self` route-map
+// clause, so the rewrite MUST be emitted at the neighbor/address-family
+// level; the pre-#2977 code emitted nothing → iBGP/route-reflector peers
+// kept the original eBGP next-hop and blackholed the prefixes.
+//
+// Fail-on-revert: delete the `neighbor %s next-hop-self` emission in the
+// neighbor loops (or revert policyStatementHasNextHopSelf to always-false)
+// and the "neighbor 10.0.0.2 next-hop-self" assertion below goes RED.
+func TestGenerateProtocols_BGPExportNextHopSelf(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"NHS": {
+				Name: "NHS",
+				Terms: []*config.PolicyTerm{
+					{Name: "t", NextHop: "self", Action: "accept"},
+				},
+			},
+		},
+	}
+	bgp := &config.BGPConfig{
+		LocalAS:  65001, // iBGP: peer in the same AS
+		RouterID: "1.1.1.1",
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.0.2", PeerAS: 65001, Export: []string{"NHS"}},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po)
+
+	// The per-neighbor next-hop-self knob MUST be emitted.
+	if !strings.Contains(got, "neighbor 10.0.0.2 next-hop-self\n") {
+		t.Errorf("#2977: missing per-neighbor next-hop-self for `then next-hop self` export policy, got:\n%s", got)
+	}
+	// And NEVER as an invalid route-map set-clause (FRR rejects it, taking
+	// the whole route-map down).
+	if strings.Contains(got, "set ip next-hop self") || strings.Contains(got, "set ipv6 next-hop self") {
+		t.Errorf("#2977: must NOT emit an invalid `set ... next-hop self` route-map clause, got:\n%s", got)
+	}
+}
+
+// TestGenerateProtocols_BGPExportNoSpuriousNextHopSelf proves an export
+// policy WITHOUT `then next-hop self` never emits the next-hop-self knob —
+// no regression for the common case (#2977).
+func TestGenerateProtocols_BGPExportNoSpuriousNextHopSelf(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"OUT": {Name: "OUT", Terms: []*config.PolicyTerm{{Name: "t", Action: "accept"}}},
+		},
+	}
+	bgp := &config.BGPConfig{
+		LocalAS:  65001,
+		RouterID: "1.1.1.1",
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.0.2", PeerAS: 65001, Export: []string{"OUT"}},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po)
+	if strings.Contains(got, "next-hop-self") {
+		t.Errorf("#2977: spurious next-hop-self emitted for a policy without `then next-hop self`, got:\n%s", got)
+	}
+}
+
 // TestGeneratePolicyOptions_MultiTermOnMatchNext proves a multi-term policy
 // whose early term is NON-TERMINATING (set clauses, no `then accept`/`reject`)
 // renders `on-match next` so FRR keeps evaluating the later terms (#2451).
