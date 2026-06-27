@@ -188,6 +188,26 @@ cluster-scoped.
 
 - The sequence number is monotonic across reconnects; the daemon ACKs
   the highest seen so the helper can prune its retransmit buffer.
+- **MSG_ACK watermark is validated before it is trusted (#2959).** The
+  `MSG_ACK` arm in `process_control_frames` rejects any ACK whose sequence
+  falls outside the valid `[acked_seq, next_seq]` window BEFORE mutating
+  `acked_seq` or trimming the replay buffer. The contract is:
+  `seq == acked_seq` is a benign duplicate (no-op); `seq == next_seq` is an
+  ACK of the latest allocated frame (valid); `acked_seq < seq < next_seq`
+  is a normal forward ACK (trims). A **backward** ACK (`seq < acked_seq`) or
+  a **future** ACK of a sequence the helper never allocated
+  (`seq > next_seq`) comes from a buggy, mixed-version, or corrupted daemon
+  listener — trusting it would poison `acked_seq` and trim or permanently
+  suppress replay of frames the daemon never actually acknowledged. The
+  helper **fails closed**: it ignores the impossible ACK, leaves the
+  watermark and replay buffer intact, and increments `frames_invalid_acks`
+  (surfaced as `event_stream_invalid_acks` in the daemon status JSON). It
+  does NOT disconnect: ignoring keeps the live connection and avoids a
+  reconnect-thrash loop against a peer that keeps emitting bad ACKs, while
+  valid ACKs interleaved with the bad ones still advance the watermark
+  normally. (A disconnect+FullResync response is a possible future
+  hardening if a corrupt peer ever needs to be actively reset, but it is
+  more disruptive than the value gained here.)
 - The default `push_delta()` path is **non-blocking** (`try_send`) and
   **silently drops** when the channel is full. The internal counter
   is `EventStreamShared.frames_dropped` (`mod.rs`); the surface

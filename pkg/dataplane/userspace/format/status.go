@@ -430,9 +430,9 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 		es := status.EventStream
 		fmt.Fprintf(&b, "  Event stream frames:       read=%d written=%d decode_errors=%d seq_gaps=%d\n",
 			es.FramesRead, es.FramesWritten, es.DecodeErrors, es.SeqGaps)
-		fmt.Fprintf(&b, "  Event stream producer:     sent=%d dropped=%d write_stalls=%d replay_evictions=%d\n",
+		fmt.Fprintf(&b, "  Event stream producer:     sent=%d dropped=%d write_stalls=%d replay_evictions=%d invalid_acks=%d\n",
 			status.EventStreamSent, status.EventStreamDropped, status.EventStreamWriteStalls,
-			status.EventStreamReplayEvictions)
+			status.EventStreamReplayEvictions, status.EventStreamInvalidAcks)
 		// #2512: per-kind helper-side budget accounting for the RT_FLOW
 		// SESSION_CLOSE / SESSION_CREATE frames (rate-limiter + queue budget).
 		// Distinct from the consumer-side es.SessionClose* counters below

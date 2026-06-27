@@ -1010,6 +1010,15 @@ type ProcessStatus struct {
 	// which is NOT a loss and is NOT counted here). JSON tag MUST match the
 	// Rust serde rename(...) exactly.
 	EventStreamReplayEvictions uint64 `json:"event_stream_replay_evictions,omitempty"`
+	// EventStreamInvalidAcks counts MSG_ACK control frames the helper rejected
+	// because the daemon ACKed a sequence outside the valid [acked_seq,
+	// next_seq] window — a backward ACK (seq < acked) or a future ACK of a
+	// sequence never allocated (seq > next) (#2959). The helper fails closed
+	// and ignores such an ACK (watermark + replay buffer left intact), so a
+	// growing value means a buggy, mixed-version, or corrupted daemon-side
+	// listener is emitting impossible ACK watermarks. JSON tag MUST match the
+	// Rust serde rename(...) exactly.
+	EventStreamInvalidAcks uint64 `json:"event_stream_invalid_acks,omitempty"`
 	// #2512: per-kind producer-side accounting for the RT_FLOW SESSION_CLOSE
 	// (type 14) and SESSION_CREATE (type 15) frames. Before #2512 these were
 	// emitted via a bare `try_send` that bypassed the helper's per-kind rate

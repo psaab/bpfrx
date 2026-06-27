@@ -539,6 +539,15 @@ pub(crate) struct ProcessStatus {
     /// is normal acknowledged-frame removal and is NOT counted here.
     #[serde(rename = "event_stream_replay_evictions", default)]
     pub event_stream_replay_evictions: u64,
+    /// MSG_ACK control frames rejected because the daemon ACKed a sequence
+    /// outside the valid `[acked_seq, next_seq]` window — a backward ACK
+    /// (`seq < acked`) or a future ACK of a sequence never allocated
+    /// (`seq > next`) (#2959). The helper fails closed and ignores such an
+    /// ACK (watermark + replay buffer left intact). A non-zero, growing value
+    /// means a buggy / mixed-version / corrupted daemon listener is emitting
+    /// impossible ACK watermarks.
+    #[serde(rename = "event_stream_invalid_acks", default)]
+    pub event_stream_invalid_acks: u64,
     /// #2512: per-kind producer-side accounting for the RT_FLOW SESSION_CLOSE
     /// (type 14) and SESSION_CREATE (type 15) frames. Before #2512 these used
     /// a bare `try_send` that did not pass through the per-kind rate limiter,

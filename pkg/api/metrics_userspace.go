@@ -1277,6 +1277,13 @@ func (c *xpfCollector) emitUserspaceEventStream(ch chan<- prometheus.Metric, sta
 	// observable (it is NOT ACK-trim, which is normal acknowledged removal).
 	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamProducerFramesTotal,
 		prometheus.CounterValue, float64(status.EventStreamReplayEvictions), "replay_evicted")
+	// #2959: MSG_ACK control frames rejected because the daemon ACKed a
+	// sequence outside the valid [acked_seq, next_seq] window (a backward or
+	// future ACK from a buggy/mixed-version/corrupted listener). The helper
+	// fails closed and ignores them; surfaced under the producer metric with a
+	// distinct "invalid_ack" label so an impossible-ACK peer is observable.
+	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamProducerFramesTotal,
+		prometheus.CounterValue, float64(status.EventStreamInvalidAcks), "invalid_ack")
 	// #2512: per-kind producer accounting for the RT_FLOW SESSION_CLOSE
 	// (type 14) and SESSION_CREATE (type 15) frames, which now ride the same
 	// helper-side rate limiter + queue budget as deny/screen/filter instead of
