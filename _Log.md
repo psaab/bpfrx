@@ -1,3 +1,82 @@
+## 2026-06-26 — #2883 event-stream idle keepalive rides write_buf backpressure
+
+- **Timestamp**: 2026-06-26
+- **Action**: the idle keepalive in `run_connected_loop`
+  (`userspace-dp/src/event_stream/mod.rs`) built a frame and called `write_all`
+  directly on the nonblocking socket, returning true (immediate reconnect) on
+  ANY error — including `WouldBlock` when the kernel send buffer is full under a
+  slow reader. That bypassed the normal `write_buf` partial-write/WouldBlock
+  backpressure + stall accounting and caused reconnect churn -> replay storms
+  (which then hit the blocking replay path, #2877). Fix: enqueue the keepalive
+  bytes into `write_buf` so the top-of-loop flush handles WouldBlock as ordinary
+  backpressure. Made the keepalive interval injectable: `run_connected_loop`
+  takes a `keepalive_interval: Duration` (production passes the new
+  `KEEPALIVE_IDLE_INTERVAL` = 10s; the old dead `KEEPALIVE_INTERVAL_NS` const
+  was removed). A genuinely dead consumer is still caught by the socket-error /
+  EOF path.
+- **File(s)**: `userspace-dp/src/event_stream/mod.rs`,
+  `userspace-dp/src/event_stream/tests.rs`,
+  `userspace-dp/src/event_stream/README.md`,
+  `docs/session-sync-design.md`
+- **Tests**: `test_idle_keepalive_wouldblock_is_backpressure_not_reconnect_2883`
+  — a connected daemon stops reading (send buffer filled), the keepalive fires
+  (interval 0); assert `run_connected_loop` does NOT report reconnect. Goes RED
+  when the keepalive is reverted to `write_all` + `return true`.
+
+## 2026-06-26 — #2882 event-stream drain honors the target_seq fence
+
+- **Timestamp**: 2026-06-26
+- **Action**: `handle_drain_request`
+  (`userspace-dp/src/event_stream/mod.rs`) wrote EVERY frame in
+  `replay_buf.iter()` with no `frame.seq <= target_seq` filter and reported
+  DrainComplete with `replay_buf.back().seq` rather than the requested target.
+  DrainRequest is contracted (docs/session-sync-design.md, the arm comment) as
+  "flush all buffered events up to target seq", so flushing/reporting beyond
+  the fence changed it to "dump current replay head" — masking holes and
+  coupling demotion correctness to unrelated later-buffered frames. Fix: skip
+  frames with `seq > target_seq`, track the highest seq `<= target` actually
+  written (`drained_up_to`), and report that (or `target_seq` when the buffer
+  held nothing at/below the fence because it was already ACK-trimmed).
+  DrainComplete is still withheld if the fence was never reached (#2876) or a
+  write failed (#2877).
+- **File(s)**: `userspace-dp/src/event_stream/mod.rs`,
+  `userspace-dp/src/event_stream/tests.rs`,
+  `docs/session-sync-design.md`
+- **Tests**: `test_drain_filters_to_target_and_reports_target_2882` — replay
+  buffer seqs 1..=10, fence target 5; assert only seqs 1..=5 are written and
+  DrainComplete reports 5. Goes RED when the `<= target` filter or the
+  drain_seq fix is reverted (back().seq=10 leaks / is reported).
+
+## 2026-06-26 — #2877 event-stream replay/drain stop-aware nonblocking writes
+
+- **Timestamp**: 2026-06-26
+- **Action**: `replay_buffered` and `handle_drain_request`
+  (`userspace-dp/src/event_stream/mod.rs`) flipped the event-stream socket to
+  BLOCKING and called `write_all` with no write deadline and no stop check. A
+  daemon that connected but stopped reading wedged the helper I/O thread in the
+  blocking write; because `EventStreamSender::stop` joins that thread, a
+  write-blocked thread could not observe the stop flag, so helper stop / RG
+  demotion hung — violating the slow-consumer invariant
+  (`docs/session-sync-design.md`). Fix: moved the stop flag into the shared
+  state (`EventStreamShared.stop`) so every I/O-thread function observes it, and
+  routed replay/drain writes through a new `write_all_backpressured` helper that
+  keeps the socket NONBLOCKING (the canonical data-frame mode) and, on
+  `WouldBlock`, sleeps `REPLAY_DRAIN_WRITE_POLL` and retries while polling
+  `shared.stop` and bailing at a `REPLAY_DRAIN_WRITE_DEADLINE` (5s) shared
+  across the pass. Replay returns Err -> reconnect; drain withholds
+  DrainComplete on a write failure so the daemon times out and refuses demotion
+  (#2876) rather than reporting a false drain. Removed `write_frame_blocking`
+  and the standalone `stop: Arc<AtomicBool>` threaded into `io_thread_main` /
+  `run_connected_loop` / `try_connect`.
+- **File(s)**: `userspace-dp/src/event_stream/mod.rs`,
+  `userspace-dp/src/event_stream/tests.rs`,
+  `userspace-dp/src/event_stream/README.md`,
+  `docs/session-sync-design.md`
+- **Tests**: `test_replay_does_not_wedge_on_stuck_reader_2877`,
+  `test_drain_does_not_wedge_on_stuck_reader_2877` — a stuck (non-reading)
+  connected daemon during replay/drain; assert the I/O-thread function observes
+  the stop flag and returns within 2s instead of wedging. Both go RED when the
+  writer is reverted to the blocking `write_all`.
 ## 2026-06-26 — #2880 tunnel-remap purge records a dropped close delta (error hygiene)
 
 - **Timestamp**: 2026-06-26

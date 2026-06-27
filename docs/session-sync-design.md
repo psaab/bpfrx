@@ -559,6 +559,33 @@ backlog (`write_buf`) and writes non-blocking; on `WouldBlock` it keeps the
 remainder for the next cycle. Daemon detects gaps via sequence numbers and can
 request a full reconciliation.
 
+The idle **keepalive** also rides the canonical write path (#2883): the
+connected loop enqueues the keepalive frame into `write_buf` rather than calling
+`write_all` directly. Before #2883 the keepalive used `write_all` on the
+nonblocking socket and treated ANY error — including `WouldBlock` when the
+kernel send buffer is full under a slow reader — as fatal, returning an
+immediate reconnect. That bypassed the partial-write/WouldBlock backpressure and
+stall accounting and caused reconnect churn → replay storms (which then hit the
+blocking replay path, #2877). Routed through `write_buf`, a keepalive WouldBlock
+is ordinary backpressure (retained for the next flush); a genuinely dead
+consumer is still detected by the normal socket-error / EOF path.
+
+The reconnect **replay** (`replay_buffered`) and demotion **drain**
+(`handle_drain_request`) paths write on the SAME nonblocking socket via a
+bounded, stop-aware writer (`write_all_backpressured`, #2877) — they do NOT
+flip the socket to blocking and call `write_all`. On `WouldBlock` the writer
+sleeps `REPLAY_DRAIN_WRITE_POLL` and retries, polling the I/O-thread stop flag
+each cycle and bailing at a `REPLAY_DRAIN_WRITE_DEADLINE` (5s) shared across the
+whole pass. Before #2877 these two paths used a blocking `write_all` with no
+deadline and no stop check: a daemon that connected but stopped reading wedged
+the I/O thread in the blocking write, and because `EventStreamSender::stop`
+joins that thread, the write-blocked thread could not observe the stop flag —
+so helper stop / RG demotion hung. The stop flag now lives in the shared state
+(`EventStreamShared.stop`) so every I/O-thread function observes it; a stuck
+reader during replay forces a reconnect, and during drain causes DrainComplete
+to be withheld (the daemon then times out and refuses demotion, #2876) instead
+of wedging.
+
 The bounded channel is the ONLY backpressure surface. The write backlog is
 capped at `WRITE_BACKLOG_MAX_BYTES` (16 MiB ≈ 8× a fully-drained 8192×256 B
 channel, since `EventFrame` is a fixed `[u8; 256]`; `drain_channel_into_write_buf`
@@ -588,6 +615,18 @@ sequence. Helper flushes all buffered events up to that sequence and sends
 DrainComplete. This replaces `ExportOwnerRGSessions` RPC for demotion prep —
 the daemon drains the stream to current head instead of doing a separate RPC
 export.
+
+The fence is honored strictly (#2882): `handle_drain_request` writes ONLY
+buffered frames with `seq <= target_seq` and reports DrainComplete with the
+fence target (the highest seq `<= target` actually flushed; `target_seq` when
+the buffer held nothing at/below the fence because it was already ACK-trimmed).
+It does NOT write every frame in the replay buffer, and it does NOT report
+`replay_buf.back().seq` (which can exceed the target). Before #2882 the handler
+flushed and reported the current replay head, changing the contract from "fence
+up to target" to "dump current replay head" — that masks holes and couples
+demotion correctness to unrelated later-buffered frames. DrainComplete is still
+withheld entirely if the fence was never reached within the drain timeout
+(#2876) or a frame write failed against a stuck/stopping reader (#2877).
 
 ### Reconnect / Replay
 

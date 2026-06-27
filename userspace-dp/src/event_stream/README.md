@@ -272,6 +272,32 @@ cluster-scoped.
   already-bounded replay buffer, never to `write_buf`. **Invariant: the
   data plane never stalls because a telemetry consumer is slow; a stuck
   consumer degrades telemetry (counted drops), nothing else.**
+- **Idle keepalive rides write_buf, not write_all (#2883).** The connected
+  loop enqueues its idle keepalive frame into `write_buf` (the same path data
+  frames use), so a `WouldBlock` on a full kernel send buffer is ordinary
+  backpressure (retained for the next flush), not a fatal reconnect. The old
+  keepalive called `write_all` directly and `return true`d on any error,
+  including WouldBlock under a slow reader — causing reconnect churn -> replay
+  storms (which then hit the blocking replay path, #2877). A genuinely dead
+  consumer is still caught by the normal socket-error / EOF path. The keepalive
+  interval is `KEEPALIVE_IDLE_INTERVAL` (10s), passed into `run_connected_loop`
+  (injectable so tests can fire it immediately).
+- **Replay/drain writes are nonblocking + stop-aware (#2877).** The reconnect
+  replay (`replay_buffered`) and demotion drain (`handle_drain_request`) paths
+  push frames through `write_all_backpressured`, which keeps the socket
+  NONBLOCKING (the same mode steady-state data-frame writes use) and, on
+  `WouldBlock`, retries with a `REPLAY_DRAIN_WRITE_POLL` sleep while polling the
+  shared stop flag and bailing at a `REPLAY_DRAIN_WRITE_DEADLINE` (5s) shared
+  across the pass. They MUST NOT flip the socket to blocking and call
+  `write_all`: a daemon that connects but stops reading would wedge the I/O
+  thread in the unbounded blocking write, and since `EventStreamSender::stop`
+  joins that thread, helper stop / RG demotion would hang (the slow-consumer
+  invariant: a stalled consumer degrades telemetry, never wedges the helper).
+  The stop flag lives in `EventStreamShared.stop` so every I/O-thread function
+  (connect, replay, the connected loop, drain) observes it. A stuck reader
+  during replay returns Err -> reconnect; during drain it withholds
+  DrainComplete so the daemon times out and refuses demotion (#2876) rather
+  than reporting a false drain.
 - RT_FLOW dataplane telemetry producers must use
   `try_emit_dataplane_event_at()` (or, for a producer that builds its own
   frame layout such as the session-close/create frames,
