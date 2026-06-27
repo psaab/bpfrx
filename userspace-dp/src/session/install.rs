@@ -179,17 +179,26 @@ impl SessionTable {
         self.index_forward_nat_key(&key, handle, decision, &metadata);
         // #965: schedule the new entry for expiration check.
         self.push_to_wheel(&key, now_ns);
-        if !metadata.is_reverse && !origin.is_peer_synced() && !origin.is_transient_local_seed() {
-            // #2134: this is the fresh-install choke point for counted
-            // (locally-admitted, forward-direction, non-seed,
-            // non-peer-synced) sessions — increment the per-IP count
-            // under the SAME counted-class gate as the Open-delta push.
-            // Capture the Copy IPs before `key` is moved into the delta.
-            // The function returned `false` early at `len() >=
-            // max_sessions` before any state change, so this only runs
-            // on a real install.
-            let (sip, dip) = (key.src_ip, key.dst_ip);
-            self.session_limit_inc(sip, dip);
+        // #3122: SEPARATE the per-IP COUNT gate from the HA Open-delta
+        // gate. The count must follow the session's PRESENCE in the table
+        // regardless of origin (a forward, non-seed session consumes a
+        // per-IP slot whether it was locally admitted or imported from the
+        // HA peer) — otherwise a peer-synced session is invisible to the
+        // limit and a client can exceed its cap after failover (#3122
+        // limit bypass). The Open delta, by contrast, must NOT re-emit for
+        // a peer-synced session (that would echo the peer's own session
+        // back to it — a sync loop), so it keeps the `!is_peer_synced()`
+        // gate. The two were one condition before #3122; they are now two.
+        let counted = !metadata.is_reverse && !origin.is_transient_local_seed();
+        if counted {
+            // #2134/#3122: fresh-install count choke point. Capture the
+            // Copy IPs before `key` is moved into the delta below. The
+            // function returned `false` early at `len() >= max_sessions`
+            // before any state change, so this only runs on a real
+            // install.
+            self.session_limit_inc(key.src_ip, key.dst_ip);
+        }
+        if counted && !origin.is_peer_synced() {
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
                 key,
@@ -311,6 +320,20 @@ impl SessionTable {
         self.index_forward_nat_key(&index_key, handle, decision, &metadata);
         // #965: schedule the synced entry for expiration check.
         self.push_to_wheel(&index_key, now_ns);
+        // #3122: a peer-synced session counts toward the per-IP limit the
+        // moment it is imported — it occupies a real slot on this node and
+        // will be in the table when this node becomes active. Same
+        // PRESENCE-based counted-class gate as the fresh-install path
+        // (forward, non-seed), but ORIGIN-agnostic (a SyncImport is never
+        // a seed; only the reverse direction is excluded so a session is
+        // counted once on its forward key). The matching decrement fires
+        // in `remove_entry` (now origin-agnostic too). Because failover
+        // promotes a synced entry IN PLACE (`update_session`, no
+        // remove+reinstall) and the promote site no longer re-increments,
+        // there is no double-count across import -> promote.
+        if !metadata.is_reverse && !origin.is_transient_local_seed() {
+            self.session_limit_inc(index_key.src_ip, index_key.dst_ip);
+        }
         true
     }
 
@@ -386,23 +409,36 @@ impl SessionTable {
             let Some(entry) = self.entry_by_key_mut(&key) else {
                 continue;
             };
-            // #2134: an in-place demote local→synced un-counts a counted
-            // session WITHOUT going through `remove_entry`, so it must be
-            // decremented explicitly. Snapshot the counted-class
-            // predicate inputs from the CURRENT (pre-mutation)
-            // origin/metadata while the borrow is live, perform the
-            // in-place flip, end the borrow, THEN decrement (semantically
-            // "decrement before flip" — the snapshot is the pre-flip
-            // state). `entry.origin` cannot be re-borrowed mutably for
-            // the &mut self count helper while `entry` is alive.
-            let was_counted = !entry.origin.is_peer_synced()
-                && !entry.origin.is_transient_local_seed()
-                && !entry.metadata.is_reverse;
-            if !entry.origin.is_peer_synced() {
+            // #3122: an in-place demote local→synced is now (almost)
+            // COUNT-NEUTRAL. Before #3122 the per-IP count tracked LOCAL
+            // ownership, so a demote un-counted the session; now it tracks
+            // table PRESENCE (local AND synced count alike), and a demoted
+            // session is still present, so its slot must remain charged.
+            // The matching decrement fires once, later, in `remove_entry`.
+            //
+            // The ONE exception is a transient seed (`MissingNeighborSeed`):
+            // it is uncounted while a seed (presence predicate excludes
+            // seeds) but the flip turns it into a `SyncImport` (a counted
+            // forward session). Snapshot the pre-flip counted-class, flip,
+            // then increment iff the flip ADDED the entry to the counted
+            // class — otherwise the later `remove_entry` decrement would
+            // underflow this IP (or wrongly debit another session's slot).
+            // A normal local entry's counted-class is unchanged by the flip
+            // (count-neutral); a reverse entry is uncounted before and
+            // after.
+            let old_origin = entry.origin;
+            let is_reverse = entry.metadata.is_reverse;
+            let will_flip = !old_origin.is_peer_synced();
+            if will_flip {
                 entry.origin = SessionOrigin::SyncImport;
             }
-            if was_counted {
-                self.session_limit_dec(key.src_ip, key.dst_ip);
+            // Borrow on `entry` ends here so the &mut self count helper can
+            // run. `SyncImport` is never a transient seed, so the post-flip
+            // counted-class is simply `!is_reverse`.
+            let old_counted = !is_reverse && !old_origin.is_transient_local_seed();
+            let new_counted = will_flip && !is_reverse;
+            if new_counted && !old_counted {
+                self.session_limit_inc(key.src_ip, key.dst_ip);
             }
             demoted_keys.push(key);
         }

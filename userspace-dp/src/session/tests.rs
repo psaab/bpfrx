@@ -3792,9 +3792,16 @@ fn session_limit_decrements_on_explicit_delete() {
     assert_eq!(table.session_limit_src_map_len(), 0);
 }
 
-/// §5.6 HA exclusion + promote + demote — the two in-place transition
-/// sites that bypass the install/remove choke points. FAILS if either
-/// explicit increment (promote) or decrement (demote) is omitted.
+/// §5.6 (#3122) HA import → promote → demote → expire — the per-IP count
+/// must be charged exactly ONCE across the whole lifecycle, with NO
+/// double-count when a synced session is promoted to local and NO
+/// premature decrement when it is demoted back. Before #3122 a peer-synced
+/// import counted 0 locally (the limit-bypass bug); now it counts on
+/// import, and the in-place promote/demote origin flips are count-neutral.
+///
+/// FAIL-ON-REVERT: restoring the `!origin.is_peer_synced()` exclusion on
+/// the count (the #3122 bug) makes the FIRST assertion below RED — the
+/// import would count 0 and a client could exceed its cap after failover.
 #[test]
 fn session_limit_ha_import_promote_demote_count() {
     let mut table = SessionTable::new();
@@ -3808,7 +3815,9 @@ fn session_limit_ha_import_promote_demote_count() {
     let mut meta = metadata();
     meta.owner_rg_id = 1;
 
-    // Import a peer session (SyncImport) — must NOT count locally.
+    // Import a peer session (SyncImport) — #3122: MUST count locally so
+    // the limit stays enforced after a failover. (This is the fail-on-
+    // revert anchor: restoring the peer-synced count exclusion → 0 here.)
     assert!(table.upsert_synced_with_origin(
         SessionInstall {
             key: key.clone(),
@@ -3823,11 +3832,13 @@ fn session_limit_ha_import_promote_demote_count() {
     ));
     assert_eq!(
         table.session_limit_src_count(src),
-        0,
-        "peer-synced import must not count locally"
+        1,
+        "#3122: peer-synced import MUST count toward the per-IP limit"
     );
 
-    // Promote synced -> local: +1 exactly (in-place update_session).
+    // Promote synced -> local (in-place update_session): COUNT-NEUTRAL.
+    // The session was already counted at import; re-incrementing here would
+    // double-count the same session across failover (the #3122 hazard).
     assert!(table.promote_synced_with_origin(SessionUpdate {
         key: &key,
         decision: decision(),
@@ -3840,17 +3851,154 @@ fn session_limit_ha_import_promote_demote_count() {
     assert_eq!(
         table.session_limit_src_count(src),
         1,
-        "promote synced->local must increment (in-place site)"
+        "promote synced->local must NOT double-count (stays 1, not 2)"
     );
 
-    // Demote local -> synced: -1 and evict at 0 (in-place demote).
+    // Demote local -> synced (in-place demote): COUNT-NEUTRAL — the session
+    // is still present in the table, so its slot stays charged.
     assert_eq!(table.demote_owner_rg(1).len(), 1);
     assert_eq!(
         table.session_limit_src_count(src),
+        1,
+        "demote local->synced must NOT decrement (session still present)"
+    );
+
+    // Only the actual removal decrements, draining to 0 and evicting.
+    table.delete(&key);
+    assert_eq!(
+        table.session_limit_src_count(src),
         0,
-        "demote local->synced must decrement (in-place site)"
+        "removal (the sole sink) decrements the imported session's slot"
     );
     assert_eq!(table.session_limit_src_map_len(), 0);
+}
+
+/// §5.6b (#3122) the FAILOVER LIMIT-BYPASS scenario, end to end: a client
+/// drives N synced sessions onto the standby, then the standby becomes
+/// active. Its per-IP count must already reflect the N synced sessions so
+/// the enforcement predicate (`count >= limit`) fires for the (N+1)-th new
+/// flow — a client at its cap before failover stays capped after.
+///
+/// FAIL-ON-REVERT: with the peer-synced count exclusion restored, the
+/// imported sessions count 0 and the predicate never fires → bypass.
+#[test]
+fn session_limit_synced_sessions_enforced_after_failover() {
+    let mut table = SessionTable::new();
+    table.set_session_limit_active(true);
+    let now = 1_000_000_000u64;
+    let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 27));
+    let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+    let limit = 3u32;
+
+    // Standby imports `limit` synced sessions from one source IP.
+    for i in 0..limit {
+        let mut meta = metadata();
+        meta.owner_rg_id = 1;
+        assert!(table.upsert_synced_with_origin(
+            SessionInstall {
+                key: SessionKey {
+                    src_ip: src,
+                    dst_ip: dst,
+                    src_port: 48000 + i as u16,
+                    ..limit_key(27, 9, 0)
+                },
+                decision: decision(),
+                metadata: meta,
+                origin: SessionOrigin::SyncImport,
+                now_ns: now,
+                protocol: PROTO_TCP,
+                tcp_flags: 0x10,
+            },
+            false,
+        ));
+    }
+
+    // After failover the new active's enforcement predicate must fire for
+    // the (limit+1)-th new flow — the synced sessions are visible to it.
+    assert_eq!(
+        table.session_limit_src_count(src),
+        limit,
+        "#3122: synced sessions must be counted on the standby-turned-active"
+    );
+    assert!(
+        table.session_limit_src_count(src) >= limit,
+        "#3122: over-limit predicate must fire post-failover (no bypass)"
+    );
+    assert!(
+        table.session_limit_dst_count(dst) >= limit,
+        "#3122: dst over-limit predicate must fire post-failover"
+    );
+}
+
+/// §5.6c (#3122) a re-imported synced session (peer re-syncs the same key)
+/// nets to count 1, not 2 — `upsert_synced_with_origin` removes the prior
+/// entry (decrement, now origin-agnostic) before re-inserting (increment).
+#[test]
+fn session_limit_synced_reimport_nets_to_one() {
+    let mut table = SessionTable::new();
+    table.set_session_limit_active(true);
+    let now = 1_000_000_000u64;
+    let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 29));
+    let key = SessionKey {
+        src_ip: src,
+        ..limit_key(29, 9, 49000)
+    };
+    for t in 0..2u64 {
+        let mut meta = metadata();
+        meta.owner_rg_id = 1;
+        assert!(table.upsert_synced_with_origin(
+            SessionInstall {
+                key: key.clone(),
+                decision: decision(),
+                metadata: meta,
+                origin: SessionOrigin::SyncImport,
+                now_ns: now + t * 1_000_000,
+                protocol: PROTO_TCP,
+                tcp_flags: 0x10,
+            },
+            true,
+        ));
+    }
+    assert_eq!(
+        table.session_limit_src_count(src),
+        1,
+        "re-import of the same synced key must net to 1, not 2"
+    );
+    assert_eq!(table.session_limit_src_map_len(), 1);
+}
+
+/// §5.6d (#3122) a reverse-direction synced import must NOT count — only
+/// the forward key of a session is charged, so the count stays once per
+/// logical session regardless of how many directional entries HA syncs.
+#[test]
+fn session_limit_synced_reverse_import_excluded() {
+    let mut table = SessionTable::new();
+    table.set_session_limit_active(true);
+    let now = 1_000_000_000u64;
+    let rev_src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 31));
+    let mut rev_meta = metadata();
+    rev_meta.is_reverse = true;
+    rev_meta.owner_rg_id = 1;
+    assert!(table.upsert_synced_with_origin(
+        SessionInstall {
+            key: SessionKey {
+                src_ip: rev_src,
+                ..limit_key(31, 9, 50000)
+            },
+            decision: decision(),
+            metadata: rev_meta,
+            origin: SessionOrigin::SyncImport,
+            now_ns: now,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+        },
+        false,
+    ));
+    assert_eq!(
+        table.session_limit_src_count(rev_src),
+        0,
+        "#3122: reverse-direction synced import must not count"
+    );
 }
 
 /// §5.7 reverse + seed exclusion: reverse-flow and MissingNeighborSeed
@@ -3939,8 +4087,9 @@ fn session_limit_idempotent_reinstall_nets_to_one() {
 /// §5.9 differential / invariant (the strongest guard): after an
 /// arbitrary sequence of install / expire / delete / promote / demote /
 /// refresh, the sum of per-IP src counts EQUALS the number of live
-/// counted entries (`!is_reverse && !is_peer_synced && !is_seed`). Same
-/// for dst. Catches ANY missed transition site.
+/// counted entries. As of #3122 the counted-class is PRESENCE-based and
+/// ORIGIN-AGNOSTIC (`!is_reverse && !is_seed` — peer-synced included).
+/// Same for dst. Catches ANY missed transition site.
 #[test]
 fn session_limit_counts_match_live_counted_entries_invariant() {
     let mut table = SessionTable::new();
@@ -3970,7 +4119,8 @@ fn session_limit_counts_match_live_counted_entries_invariant() {
         ));
         counted_keys.push(key);
     }
-    // A reverse + a seed (uncounted) + a synced import (uncounted).
+    // A reverse + a seed (both uncounted) + a synced import (#3122:
+    // now COUNTED — origin-agnostic presence-based counting).
     let mut rev_meta = metadata();
     rev_meta.is_reverse = true;
     let _ = table.install_with_protocol_with_origin(
@@ -4037,7 +4187,9 @@ fn session_limit_counts_match_live_counted_entries_invariant() {
         let mut src_live: std::collections::HashMap<IpAddr, u32> = std::collections::HashMap::new();
         let mut dst_live: std::collections::HashMap<IpAddr, u32> = std::collections::HashMap::new();
         table.iter_with_origin(|key, _decision, md, origin| {
-            if !md.is_reverse && !origin.is_peer_synced() && !origin.is_transient_local_seed() {
+            // #3122: counted-class is origin-agnostic (presence-based) —
+            // peer-synced entries count, only reverse + seed are excluded.
+            if !md.is_reverse && !origin.is_transient_local_seed() {
                 *src_live.entry(key.src_ip).or_insert(0) += 1;
                 *dst_live.entry(key.dst_ip).or_insert(0) += 1;
             }
@@ -4073,7 +4225,9 @@ fn session_limit_counts_match_live_counted_entries_invariant() {
     };
     check_invariant(&table, "after mutations");
 
-    // Demote RG 1 — every counted RG-1 session becomes uncounted.
+    // Demote RG 1 — #3122: the RG-1 sessions flip local->synced but stay
+    // PRESENT, so they remain counted (count-neutral demote). The
+    // origin-agnostic invariant still holds across the flip.
     table.demote_owner_rg(1);
     check_invariant(&table, "after demote RG1");
 

@@ -479,40 +479,63 @@ active node until a future change adds a `policy_id` wire field (mirroring how
 #2785 added the log-flag fields) — a deliberate follow-up, not a regression
 (the pre-#3056 behavior was policy 0 everywhere).
 
-## Per-IP session-limit lifecycle (#2134; #2128 leak-fix preserved)
+## Per-IP session-limit lifecycle (#2134; #3122 peer-synced fix; #2128 leak-fix preserved)
 
 Junos `set security screen ids-option <name> limit-session
 source-ip-based <n>` / `destination-ip-based <n>` caps the concurrent
-locally-admitted sessions one source / destination IP may hold. The
-per-IP count is owned by `SessionTable` (`session_limit_src_counts` /
-`session_limit_dst_counts`), NOT by `ScreenState` — the count must track
-the real session lifecycle, and `SessionTable` is the choke point every
-create/remove already passes through.
+sessions one source / destination IP may hold. The per-IP count is owned
+by `SessionTable` (`session_limit_src_counts` / `session_limit_dst_counts`),
+NOT by `ScreenState` — the count must track the real session lifecycle,
+and `SessionTable` is the choke point every create/remove already passes
+through.
 
-**Counted-class predicate.** A session counts iff it is locally-admitted,
-forward-direction, real (not a transient seed), and not imported from the
-HA peer: `!is_reverse && !origin.is_peer_synced() &&
-!origin.is_transient_local_seed()`. This is exactly the predicate that
-gates the HA Open delta, so the count and the delta stay in lockstep.
+**Counted-class predicate (#3122 — PRESENCE-based, origin-agnostic).** A
+session counts iff it is forward-direction and real (not a transient
+seed): `!is_reverse && !origin.is_transient_local_seed()`. As of #3122
+this is **origin-agnostic** — a session counts whether it was
+locally-admitted OR imported from the HA peer (`SyncImport` /
+`SharedMaterialize` / `WorkerLocalImport`). Before #3122 the predicate
+also excluded `!origin.is_peer_synced()`, which kept peer-synced sessions
+invisible to the per-IP count; after a failover the standby-turned-active
+held synced sessions it had never counted, so a client could open a full
+fresh allotment ON TOP of its pre-existing (synced) sessions — a security
+**limit bypass**. Counting on import closes that gap.
+
+**Count vs. HA Open delta are now SEPARATE conditions (#3122).** The
+fresh-install path increments the count for any counted-class session but
+only emits an HA Open delta for the `!is_peer_synced()` subset — a
+peer-synced session must NOT re-emit a delta (that would echo the peer's
+own session back to it, a sync loop). Before #3122 the two shared one
+condition; they diverged when the count became origin-agnostic.
 
 **Maintenance sites (all OFF-gated by `session_limit_active`).** The
-count is incremented at the two create transitions and decremented at the
-two remove transitions:
+count is incremented at the two CREATE sinks and decremented at the sole
+REMOVE sink. The two in-place HA origin flips (promote / demote) are
+**count-neutral** — the session stays present in the table, only its
+origin changes, so its slot stays charged exactly once across the whole
+import → promote → … → demote → expire lifecycle:
 
 | Transition | Site | Action |
 |---|---|---|
-| fresh install | `install_with_protocol_with_origin` (next to the Open-delta push) | increment |
-| in-place HA promote synced→local | `update_session` promote branch (`mod.rs`) | increment |
+| fresh install (local) | `install_with_protocol_with_origin` (next to the Open-delta push) | increment |
+| peer-synced import (#3122) | `upsert_synced_with_origin` (after the insert) | increment |
 | any removal (expire / clear / RST / fabric-cancel / take_synced_local) | `remove_entry` success path (the sole removal sink) | decrement |
-| in-place HA demote local→synced | `demote_owner_rg` (before the origin flip) | decrement |
+| in-place HA promote synced→local | `update_session` promote branch (`mod.rs`) | **none** (already counted at import) |
+| in-place HA demote local→synced | `demote_owner_rg` | **none** (session stays present) |
 
 Removals are structurally exhaustive through `remove_entry`, so a future
-delete site cannot forget the decrement. The two in-place HA transitions
-bypass the install/remove sinks, so they carry explicit, enumerated
-count adjustments. Every decrement uses `saturating_sub` and **evicts the
-map entry the moment its count reaches 0** — so the maps are bounded by
-distinct IPs with ≥1 live counted session (this is the #2128 fix: the
-read path never inserts a phantom zero entry).
+delete site cannot forget the decrement; `remove_entry`'s decrement is now
+origin-agnostic too, so a peer-synced removal (e.g. `take_synced_local`,
+or a synced session expiring) balances its import increment. The
+re-install promote path (`take_synced_local` + fresh install) decrements
+on the remove and increments on the re-install → still nets to one. The
+in-place promote (`update_session`) and demote (`demote_owner_rg`) do NOT
+touch the count, so the same session is charged exactly once regardless of
+how ownership moves — **no double-count at failover or failback**. Every
+decrement uses `saturating_sub` and **evicts the map entry the moment its
+count reaches 0** — so the maps are bounded by distinct IPs with ≥1 live
+counted session (this is the #2128 fix: the read path never inserts a
+phantom zero entry).
 
 **Where the limit is CHECKED.** At the NEW-FLOW / session-MISS decision
 in `afxdp/poll_descriptor` (`new_flow_session_limit_drop`), NOT in the
