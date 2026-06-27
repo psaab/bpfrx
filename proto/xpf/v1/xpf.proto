@@ -578,6 +578,13 @@ message MatchPoliciesRequest {
   // source_port lets the simulator honor source-port-constrained application
   // terms (#3042). 0 = unspecified (does not constrain the match).
   int32 source_port = 7;
+  // icmp_type / icmp_code let the simulator honor ICMP/ICMPv6 type-constrained
+  // application terms (#3284, junos-ping = type 8). proto3 `optional` so the
+  // simulator can distinguish "unspecified" (a type-constrained app term then
+  // fails closed, mirroring the dataplane's packet_icmp = None) from a valid
+  // type/code 0 (ICMP type 0 = echo-reply).
+  optional uint32 icmp_type = 8;
+  optional uint32 icmp_code = 9;
 }
 message MatchPoliciesResponse {
   string policy_name = 1;

@@ -924,6 +924,24 @@ func (c *ctl) showMatchPolicies(args []string) error {
 				i++
 				req.Protocol = args[i]
 			}
+		case "icmp-type":
+			if i+1 < len(args) {
+				i++
+				// #3284: thread an ICMP/ICMPv6 type so a type-constrained app
+				// term (junos-ping = type 8) is honored by the backend matcher.
+				if v, err := strconv.Atoi(args[i]); err == nil && v >= 0 && v <= 255 {
+					u := uint32(v)
+					req.IcmpType = &u
+				}
+			}
+		case "icmp-code":
+			if i+1 < len(args) {
+				i++
+				if v, err := strconv.Atoi(args[i]); err == nil && v >= 0 && v <= 255 {
+					u := uint32(v)
+					req.IcmpCode = &u
+				}
+			}
 		}
 	}
 

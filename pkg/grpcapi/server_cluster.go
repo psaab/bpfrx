@@ -163,6 +163,20 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
+	// #3284: thread the optional ICMP/ICMPv6 type/code into the simulator so a
+	// type-constrained application term (junos-ping = type 8) matches only the
+	// declared type. The proto3 optional uint32 carries presence; values
+	// outside [0,255] cannot describe a real ICMP packet, so reject them
+	// rather than truncate to 8 bits (which would silently alias e.g. 264->8).
+	icmpType, err := grpcICMPValue(req.IcmpType)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid icmp-type: %v", err)
+	}
+	icmpCode, err := grpcICMPValue(req.IcmpCode)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid icmp-code: %v", err)
+	}
+
 	// #3042: delegate to the single shared simulator so gRPC agrees with the
 	// runtime evaluator (exact zone-pair -> wildcard-zone tiers (#3090) ->
 	// scoped global (#3148) -> default-policy, predefined + nested-app-set +
@@ -181,6 +195,8 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		Protocol:    req.Protocol,
 		SrcPort:     int(req.SourcePort),
 		DstPort:     int(req.DestinationPort),
+		ICMPType:    icmpType,
+		ICMPCode:    icmpCode,
 		FeedOverlay: overlay,
 		// #3104: skip scheduler-inactive policies like the runtime does, so the
 		// simulator falls through to the next active rule / default-policy.
@@ -200,6 +216,21 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		DstAddresses: res.DstAddresses,
 		Applications: res.Applications,
 	}, nil
+}
+
+// grpcICMPValue converts an optional proto3 uint32 ICMP type/code field into
+// the *uint8 the shared simulator consumes (#3284). nil (field absent) stays
+// nil (unspecified). A present value must fit the 8-bit ICMP type/code space;
+// anything above 255 is rejected rather than truncated.
+func grpcICMPValue(v *uint32) (*uint8, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if *v > 255 {
+		return nil, fmt.Errorf("%d out of range (0-255)", *v)
+	}
+	u := uint8(*v)
+	return &u, nil
 }
 
 // grpcResolveAddress looks up a named address in the global address book and returns its CIDR suffix.

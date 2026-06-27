@@ -307,6 +307,20 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// #3284: optional ICMP/ICMPv6 type/code so a type-constrained application
+	// term (junos-ping = type 8) is honored. An empty value is unspecified (a
+	// type-constrained term then fails closed, mirroring the dataplane); a
+	// malformed/out-of-range value is rejected, never coerced.
+	icmpType, err := policymatch.ParseICMPValue(r.URL.Query().Get("icmp_type"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid icmp_type: "+err.Error())
+		return
+	}
+	icmpCode, err := policymatch.ParseICMPValue(r.URL.Query().Get("icmp_code"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid icmp_code: "+err.Error())
+		return
+	}
 
 	// #3042: delegate to the single shared simulator so REST agrees with the
 	// runtime evaluator (exact zone-pair -> wildcard-zone tiers (#3090) ->
@@ -337,6 +351,8 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		Protocol:         proto,
 		SrcPort:          srcPort,
 		DstPort:          dstPort,
+		ICMPType:         icmpType,
+		ICMPCode:         icmpCode,
 		FeedOverlay:      overlay,
 		PolicyInactiveFn: inactiveFn,
 	})

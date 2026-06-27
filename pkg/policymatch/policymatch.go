@@ -96,6 +96,30 @@ func ParsePort(s string) (int, error) {
 	return n, nil
 }
 
+// ParseICMPValue parses an operator-supplied ICMP type or code token (#3284)
+// into a *uint8 the simulator threads into Query.ICMPType / Query.ICMPCode. An
+// empty/whitespace token means "unspecified" and returns (nil, nil) — the
+// dimension is not constrained, the established wildcard behavior. A non-empty
+// token must parse to an integer in [0, 255] (the 8-bit ICMP type/code space);
+// a malformed, negative, or >255 token is REJECTED with an error so it can
+// never silently degrade to the nil wildcard. The pointer return distinguishes
+// "unspecified" from a valid 0 (ICMP type 0 = echo-reply, code 0 is common).
+func ParseICMPValue(s string) (*uint8, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return nil, fmt.Errorf("invalid icmp type/code %q", s)
+	}
+	if n < 0 || n > 255 {
+		return nil, fmt.Errorf("icmp type/code %d out of range (0-255)", n)
+	}
+	v := uint8(n)
+	return &v, nil
+}
+
 // ValidateProtocol checks an explicitly-supplied simulator protocol token. An
 // empty/whitespace token means "unspecified" — the protocol dimension is not
 // constrained (the established match-any wildcard) — and is accepted. A
@@ -140,6 +164,21 @@ type Query struct {
 	Protocol string // "tcp", "udp", "89", "ospf", ... ("" = unspecified)
 	SrcPort  int
 	DstPort  int
+
+	// ICMPType / ICMPCode carry the query packet's ICMP/ICMPv6 type and code
+	// (#3284). They mirror the dataplane's per-packet `packet_icmp` tuple
+	// (policy.rs evaluate_policy_result_with_icmp): a type-constrained
+	// application term (junos-ping = ICMP type 8, junos-pingv6 = ICMPv6
+	// type 128) matches ONLY when the query's type is known and equal (and the
+	// code too, when the term constrains a code). A nil ICMPType means the
+	// query did not specify a type: a type-constrained term then fails closed
+	// (does NOT match), exactly like the runtime passing `packet_icmp = None`.
+	// An UNCONSTRAINED ICMP application (junos-icmp-all) is unaffected by these
+	// fields — it matches every ICMP packet on protocol alone. Pointers
+	// distinguish "unspecified" from a valid type/code 0 (ICMP type 0 is
+	// echo-reply, code 0 is common), which a plain int could not.
+	ICMPType *uint8
+	ICMPCode *uint8
 
 	// FeedOverlay is the dynamic-address feed-prefix overlay (#2049): an
 	// address-name -> union-of-live-feed-CIDR-strings map, the same shape the
@@ -324,7 +363,7 @@ func ruleMatches(cfg *config.Config, q Query, pol *config.Policy) bool {
 	if !matchAddr(cfg, q.FeedOverlay, pol.Match.DestinationAddresses, pol.Match.DestinationAddressExcluded, q.DstIP) {
 		return false
 	}
-	return matchApp(cfg, pol.Match.Applications, q.Protocol, q.SrcPort, q.DstPort)
+	return matchApp(cfg, pol.Match.Applications, q.Protocol, q.SrcPort, q.DstPort, q.ICMPType, q.ICMPCode)
 }
 
 // matchAddr replicates policy.rs try_match_rule's per-side address logic.
@@ -508,7 +547,7 @@ func expandBookName(cfg *config.Config, name string, visited map[string]bool) []
 // An empty application list is the runtime match-any case. An unspecified
 // query protocol does not constrain the match (the established diagnostic
 // behavior).
-func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort int) bool {
+func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort int, icmpType, icmpCode *uint8) bool {
 	if len(apps) == 0 {
 		return true
 	}
@@ -529,20 +568,20 @@ func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort 
 				continue
 			}
 			for _, m := range members {
-				if matchSingleApp(cfg, m, queryProto, queryProtoOK, srcPort, dstPort) {
+				if matchSingleApp(cfg, m, queryProto, queryProtoOK, srcPort, dstPort, icmpType, icmpCode) {
 					return true
 				}
 			}
 			continue
 		}
-		if matchSingleApp(cfg, a, queryProto, queryProtoOK, srcPort, dstPort) {
+		if matchSingleApp(cfg, a, queryProto, queryProtoOK, srcPort, dstPort, icmpType, icmpCode) {
 			return true
 		}
 	}
 	return false
 }
 
-func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryProtoOK bool, srcPort, dstPort int) bool {
+func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryProtoOK bool, srcPort, dstPort int, icmpType, icmpCode *uint8) bool {
 	app, ok := config.ResolveApplication(appName, cfg.Applications.Applications)
 	if !ok {
 		return false
@@ -553,6 +592,21 @@ func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryP
 	if app.Protocol != "" {
 		appProto, appOK := appid.ProtocolNumber(app.Protocol)
 		if !appOK || !queryProtoOK || appProto != queryProto {
+			return false
+		}
+	}
+	// #3284: ICMP/ICMPv6 type[,code] constraint (junos-ping = type 8). Mirror
+	// policy.rs CompiledApplications.matches: a type-constrained term matches
+	// ONLY when the query's ICMP type is known and equal — and the code too,
+	// when the term constrains a code. A nil query type fails closed for the
+	// term (the runtime's `packet_icmp == None` path). An application with NO
+	// ICMP type constraint (junos-icmp-all, or any non-ICMP app) is unaffected:
+	// it matches on protocol/ports alone, exactly as before.
+	if app.ICMPType != nil {
+		if icmpType == nil || *icmpType != *app.ICMPType {
+			return false
+		}
+		if app.ICMPCode != nil && (icmpCode == nil || *icmpCode != *app.ICMPCode) {
 			return false
 		}
 	}

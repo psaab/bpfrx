@@ -147,7 +147,16 @@ dynamic-address feed overlay (`Query.FeedOverlay`, supplied by the daemon via
 `feeds.Manager.SnapshotForBindings`). Application matching resolves predefined +
 user apps via `config.ResolveApplication`, expands application-sets recursively
 via `config.ExpandApplicationSet`, compares protocols by IANA number via
-`appid.ProtocolNumber`, and honors both source-port and destination-port terms.
+`appid.ProtocolNumber`, honors both source-port and destination-port terms, and
+enforces ICMP/ICMPv6 type/code constraints (#3284, junos-ping = type 8,
+junos-pingv6 = type 128) from `Query.ICMPType` / `Query.ICMPCode`. A
+type-constrained application term matches only when the query's type is known
+and equal (and the code too, when the term constrains a code); a query that
+omits the type fails closed for that term, mirroring the dataplane's
+`packet_icmp = None` path. An unconstrained ICMP application (junos-icmp-all) is
+unaffected. The surfaces accept the type/code as `icmp_type`/`icmp_code` (REST
+query, gRPC `MatchPolicies` optional fields), `icmp-type`/`icmp-code` (CLI
+tokens), and `ictype=`/`iccode=` (gRPC `test policy` topic).
 
 Where the runtime and the old simulators disagreed, the runtime wins.
 

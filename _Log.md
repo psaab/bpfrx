@@ -22365,3 +22365,12 @@ top.
   pkg/policymatch/README.md, pkg/api/security.go,
   pkg/cli/cli_request.go, pkg/grpcapi/server_cluster.go,
   pkg/grpcapi/server_show_firewall.go
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3284 — policymatch simulator now enforces ICMP/ICMPv6 type/code application constraints (junos-ping = type 8, junos-pingv6 = type 128) like the dataplane (policy.rs CompiledApplications.matches). Added Query.ICMPType/ICMPCode (*uint8), enforcement in matchSingleApp (fail-closed when the query omits the type for a type-constrained term), and the ParseICMPValue shared parser. Plumbed type/code through every simulator surface: proto3 optional icmp_type/icmp_code on MatchPoliciesRequest (regenerated), REST icmp_type/icmp_code query params, gRPC test-policy ictype=/iccode= topic keys, and CLI/remote-CLI icmp-type/icmp-code tokens. Added fail-on-revert table tests.
+  **File(s)**: pkg/policymatch/policymatch.go,
+  pkg/policymatch/icmp_test.go, pkg/policymatch/README.md,
+  proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/grpcapi/server_cluster.go, pkg/grpcapi/server_show_firewall.go,
+  pkg/api/security.go, pkg/cli/cli_request.go,
+  pkg/cli/cli_show_security.go, cmd/cli/main.go, cmd/cli/show.go

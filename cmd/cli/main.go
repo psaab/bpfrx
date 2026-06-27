@@ -443,6 +443,7 @@ func (c *ctl) handleTest(args []string) error {
 func (c *ctl) testPolicy(args []string) error {
 	var fromZone, toZone, srcIP, dstIP, proto string
 	var srcPort, dstPort int
+	var icmpType, icmpCode *uint8
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "from-zone":
@@ -498,6 +499,26 @@ func (c *ctl) testPolicy(args []string) error {
 				i++
 				proto = args[i]
 			}
+		case "icmp-type":
+			if i+1 < len(args) {
+				i++
+				// #3284: thread an ICMP/ICMPv6 type into the backend matcher so a
+				// type-constrained app term (junos-ping = type 8) is honored.
+				v, err := policymatch.ParseICMPValue(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid icmp-type: %w", err)
+				}
+				icmpType = v
+			}
+		case "icmp-code":
+			if i+1 < len(args) {
+				i++
+				v, err := policymatch.ParseICMPValue(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid icmp-code: %w", err)
+				}
+				icmpCode = v
+			}
 		}
 	}
 
@@ -530,6 +551,12 @@ func (c *ctl) testPolicy(args []string) error {
 	}
 	if proto != "" {
 		topic += ",proto=" + proto
+	}
+	if icmpType != nil {
+		topic += ",ictype=" + strconv.Itoa(int(*icmpType))
+	}
+	if icmpCode != nil {
+		topic += ",iccode=" + strconv.Itoa(int(*icmpCode))
 	}
 	return c.showText(topic)
 }

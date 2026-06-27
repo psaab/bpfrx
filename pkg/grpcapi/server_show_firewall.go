@@ -165,7 +165,8 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 	params := strings.TrimPrefix(req.Topic, "test-policy:")
 	var fromZone, toZone, srcIP, dstIP, proto string
 	var srcPort, dstPort int
-	var srcPortErr, portErr, protoErr error
+	var icmpType, icmpCode *uint8
+	var srcPortErr, portErr, protoErr, icmpTypeErr, icmpCodeErr error
 	for _, kv := range strings.Split(params, ",") {
 		parts := strings.SplitN(kv, "=", 2)
 		if len(parts) != 2 {
@@ -204,6 +205,13 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			// error the way a bad port/src is reported below.
 			proto = parts[1]
 			protoErr = policymatch.ValidateProtocol(proto)
+		case "ictype":
+			// #3284: ICMP/ICMPv6 type so a type-constrained application term
+			// (junos-ping = type 8) is honored. Empty is unspecified (the term
+			// fails closed); a malformed/out-of-range value errors.
+			icmpType, icmpTypeErr = policymatch.ParseICMPValue(parts[1])
+		case "iccode":
+			icmpCode, icmpCodeErr = policymatch.ParseICMPValue(parts[1])
 		}
 	}
 	switch {
@@ -217,6 +225,10 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 		fmt.Fprintf(buf, "invalid port: %v\n", portErr)
 	case protoErr != nil:
 		fmt.Fprintf(buf, "%v\n", protoErr)
+	case icmpTypeErr != nil:
+		fmt.Fprintf(buf, "invalid icmp-type: %v\n", icmpTypeErr)
+	case icmpCodeErr != nil:
+		fmt.Fprintf(buf, "invalid icmp-code: %v\n", icmpCodeErr)
 	case srcIP != "" && net.ParseIP(srcIP) == nil:
 		// A non-empty but malformed src would otherwise parse to nil and be
 		// treated as a wildcard, yielding a false-positive policy match
@@ -249,6 +261,8 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			Protocol:    proto,
 			SrcPort:     srcPort,
 			DstPort:     dstPort,
+			ICMPType:    icmpType,
+			ICMPCode:    icmpCode,
 			FeedOverlay: overlay,
 			// #3104: skip scheduler-inactive policies like the runtime does, so
 			// the `test policy` diagnostic falls through to the next active rule
