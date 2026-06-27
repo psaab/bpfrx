@@ -24,6 +24,29 @@
   `userspace-dp/src/server/lifecycle.rs`,
   `userspace-dp/tests/fixtures/protocol_wire_v1.json`
 
+## 2026-06-26 — #2959 fold: wire event_stream_invalid_acks Go-side
+
+- **Timestamp**: 2026-06-26
+- **Action**: Review fold. The initial #2959 commit added the
+  `frames_invalid_acks` counter on the Rust side and surfaced it in the
+  helper status JSON, but left the Go control-plane half unwired — unlike the
+  sibling counters `event_stream_write_stalls` (#2381) and
+  `event_stream_replay_evictions` (#2382), which are mirrored all the way
+  through Go. Completed the mirror exactly as the siblings: (1) added
+  `EventStreamInvalidAcks uint64 json:"event_stream_invalid_acks,omitempty"`
+  to `ProcessStatus` in `pkg/dataplane/userspace/protocol.go`; (2) added a
+  Prometheus sample under `userspaceEventStreamProducerFramesTotal` with the
+  `invalid_ack` label in `pkg/api/metrics_userspace.go`; (3) added
+  `invalid_acks=%d` to the producer line in
+  `pkg/dataplane/userspace/format/status.go`; (4) extended the cross-language
+  parity test `TestProcessStatusEventStreamFieldsParity1642`
+  (`pkg/dataplane/userspace/protocol_test.go`) to assert the wire key decodes
+  (value 11) and that a legacy payload omitting it defaults to 0.
+- **File(s)**: `pkg/dataplane/userspace/protocol.go`,
+  `pkg/api/metrics_userspace.go`,
+  `pkg/dataplane/userspace/format/status.go`,
+  `pkg/dataplane/userspace/protocol_test.go`
+
 ## 2026-06-26 — #2870 VRRP AF_PACKET receiver: ALLMULTI instead of PROMISC
 
 - **Timestamp**: 2026-06-26
