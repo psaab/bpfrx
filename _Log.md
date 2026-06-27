@@ -21873,6 +21873,47 @@ top.
   docs/session-sync-design.md
 
 - **Timestamp**: 2026-06-26
+  **Action**: #3121 NPTv6 outbound source translation now COMPOSES with DNAT.
+  The decision path gated `nptv6.translate_outbound` on
+  `rewrite_dst.is_none()`, so a flow matching both NPTv6 (source) and DNAT
+  (destination) lost its NPTv6 source rewrite and leaked the internal IPv6
+  source onto the wire. Fix: attempt NPTv6 in BOTH decision branches and
+  `merge()` the source rewrite into any pre-routing DNAT decision (the Permit
+  NAT site and the missing-neighbor seed site, so the seed session carries the
+  same composed decision regardless of ARP timing). Checksum: the NPTv6 source
+  rewrite is checksum-neutral (RFC 6296), but a composed DNAT destination is
+  not — so `compute_l4_csum_delta` short-circuits only for a PURE NPTv6
+  translation (one of src/dst set) and falls through to compute the DNAT delta
+  when both are set (the neutral NPTv6 term nets zero, direction-agnostic), and
+  `apply_nat_ipv6`'s both-sides arm no longer blanket-skips on `nptv6` (only on
+  a non-first fragment). Fail-on-revert test
+  `pin_nptv6_composes_with_dnat_checksum_valid` (descriptor+generic byte-parity
+  + oracle-valid L4 checksum) goes RED when the pre-#3121 nptv6 short-circuit is
+  restored; decision-level `nptv6_source_composes_with_dnat_decision` pins the
+  merge + reverse() compose contract.
+  **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/checksum.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/rewrite.rs,
+  userspace-dp/src/nptv6_tests.rs,
+  docs/feature-coverage.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3121 follow-up — fix #1377 SNAT contract-guard drift. The
+  NPTv6-first refactor folded the duplicated `source_nat_decision_for_flow`
+  calls (rewrite_dst.is_none()/else pair) into a single SNAT fallback per path,
+  dropping the poll_descriptor call sites 4 → 2. `snat_contract_doc_guard.rs`
+  hard-asserts the count, so the FULL `cargo test --release` was RED (the
+  filtered subset run missed it). Updated the guard's expected count 4 → 2 and
+  re-enumerated the now-2 sites (normal new-session @ mod.rs:1963,
+  missing-neighbor seed @ mod.rs:3691) in
+  plan-1377-snat-pools.md with a #3121 reduction note (both remaining sites
+  still record_source_nat_failure; NPTv6 short-circuits before the SNAT
+  fallback and cannot fail in the pool sense, so the fail-closed contract holds
+  at 2 sites). Full suite now green: main bin 3138 passed / 0 failed,
+  snat_contract_doc_guard passes (count=2, doc-parse=2), 0 failures total.
+  **File(s)**: userspace-dp/tests/snat_contract_doc_guard.rs,
+  docs/pr/1373-retire-ebpf-dataplane/plan-1377-snat-pools.md
   **Action**: #3061 zone-local address books — parse `security zones
   security-zone <z> address-book { address; address-set }` into
   ZoneConfig.AddressBook (schema leaf + compileZones via shared

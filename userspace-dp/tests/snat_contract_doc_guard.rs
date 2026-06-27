@@ -13,10 +13,15 @@ fn snat_contract_documents_current_fail_closed_runtime() {
     let architecture_path = repo_root.join("docs/userspace-dataplane-architecture.md");
     let gaps_path = repo_root.join("docs/userspace-dataplane-gaps.md");
     // #1327 Step 1 converted the flat poll_descriptor.rs to a directory
-    // module. The four source_nat_decision_for_flow call sites all stay
+    // module. The source_nat_decision_for_flow call sites all stay
     // in mod.rs (slow-path session resolution, which Step 1 did not
     // attempt to extract — see docs/pr/1327-poll-descriptor-stages/plan.md
     // "Stages 12+ verdict"). Compatibility: keep accepting either layout.
+    // #3121 reduced the count from four to two: NPTv6 source translation now
+    // composes with DNAT, so each path (normal new-session + missing-neighbor
+    // seed) has a SINGLE source_nat_decision_for_flow SNAT fallback instead of
+    // a duplicated rewrite_dst.is_none()/else pair. Both remaining sites still
+    // record_source_nat_failure, so the #1377 fail-closed contract holds.
     let poll_path = {
         let flat = manifest_dir.join("src/afxdp/poll_descriptor.rs");
         if flat.exists() {
@@ -48,8 +53,8 @@ fn snat_contract_documents_current_fail_closed_runtime() {
     let call_lines = source_nat_decision_call_lines(&poll);
     assert_eq!(
         call_lines.len(),
-        4,
-        "update the #1377 SNAT contract when {poll_module_label} no longer has exactly four source-NAT runtime decision call sites: {call_lines:?}"
+        2,
+        "update the #1377 SNAT contract when {poll_module_label} no longer has exactly two source-NAT runtime decision call sites: {call_lines:?}"
     );
     assert!(
         !poll.contains("match_source_nat_for_flow(\n"),

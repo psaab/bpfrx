@@ -586,6 +586,122 @@ fn pin_nptv6_descriptor_matches_generic_byte_for_byte() {
     );
 }
 
+/// #3121 — NPTv6 source translation COMPOSES with DNAT destination
+/// translation. When an outbound IPv6 flow matches BOTH an NPTv6
+/// source-prefix rule and a destination NAT rule, the decision carries
+/// BOTH `rewrite_src` (NPTv6) and `rewrite_dst` (DNAT) with `nptv6 =
+/// true`. The NPTv6 source rewrite is checksum-neutral by RFC 6296 (its
+/// L4 delta nets zero), but the DNAT destination rewrite is NOT neutral
+/// and MUST be folded into the L4 checksum -- so the checksum path may
+/// no longer blanket-skip on `nat.nptv6` when a destination rewrite is
+/// also present.
+///
+/// FAIL-ON-REVERT: with the pre-#3121 short-circuit restored
+/// (`compute_l4_csum_delta` returns 0 whenever `nat.nptv6`, and
+/// `apply_nat_ipv6`'s compose arm skips on `nat.nptv6`), the DNAT
+/// destination change is left out of the L4 checksum -> the output
+/// frame's stored checksum no longer matches the rewritten addresses ->
+/// `oracle_packet_valid` rejects both paths -> RED.
+#[test]
+fn pin_nptv6_composes_with_dnat_checksum_valid() {
+    // Valid IPv6 TCP packet (no VLAN). src6 = 2001::66, dst6 = 2001::c8.
+    let pkt = pin_packet(true, PROTO_TCP, 64, Vec::new());
+
+    // NPTv6 outbound source translation, modelled checksum-neutral
+    // (RFC 6296): swap the /48 prefix to fd00:: and fold the
+    // ones-complement compensation into the adjustment word so the full
+    // address's 16-bit sum is preserved (orig word-sum 0x2001+0x0066 =
+    // 0x2067; new = 0xfd00 + 0x2300 + 0x0066 folds to 0x2067).
+    let new_src: [u8; 16] = [
+        0xfd, 0x00, 0, 0, 0, 0, 0x23, 0x00, 0, 0, 0, 0, 0, 0, 0, 0x66,
+    ];
+    // DNAT destination rewrite to an internal address (NOT checksum-
+    // neutral -- this is the delta that must survive the compose).
+    let new_dst: [u8; 16] = [
+        0xfc, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+    ];
+
+    let nat = NatDecision {
+        rewrite_src: Some(IpAddr::V6(std::net::Ipv6Addr::from(new_src))),
+        rewrite_dst: Some(IpAddr::V6(std::net::Ipv6Addr::from(new_dst))),
+        nptv6: true,
+        ..NatDecision::default()
+    };
+
+    let desc = XdpDesc {
+        addr: DIFF_ADDR as u64,
+        len: pkt.frame.len() as u32,
+        options: 0,
+    };
+
+    // Capture the input L4 checksum (TCP csum at rel_l4 + 16).
+    let l4_csum_off = pkt.l3 + pkt.rel_l4 + 16;
+    let in_l4_csum = u16::from_be_bytes([pkt.frame[l4_csum_off], pkt.frame[l4_csum_off + 1]]);
+
+    // Generic slow path.
+    let area_g = area_with_frame(&pkt.frame);
+    let decision = make_decision(&pkt, nat, 0);
+    let generic = rewrite_forwarded_frame_in_place(&area_g, desc, pkt.meta, &decision, false, None)
+        .expect("generic NPTv6+DNAT rewrite must succeed");
+
+    // Descriptor fast path -- built exactly as the flow cache does,
+    // including the nptv6 flag. Unlike pure NPTv6 (#2652), the compose
+    // descriptor carries a NON-zero L4 delta (the DNAT term).
+    let area_d = area_with_frame(&pkt.frame);
+    let mut rd = make_descriptor(&pkt, nat, 0);
+    rd.nptv6 = true;
+    assert_ne!(
+        rd.l4_csum_delta, 0,
+        "NPTv6+DNAT compose descriptor must carry the DNAT L4 csum delta (#3121)"
+    );
+    let fast = apply_rewrite_descriptor(&area_d, desc, pkt.meta, &rd, None)
+        .expect("descriptor NPTv6+DNAT rewrite must succeed");
+
+    assert_eq!(generic, fast, "InPlaceRewriteResult (offset/len/l2) must agree");
+
+    let out_g = area_g.slice(generic.offset as usize, generic.len as usize).unwrap();
+    let out_d = area_d.slice(fast.offset as usize, fast.len as usize).unwrap();
+    assert_eq!(
+        out_g, out_d,
+        "NPTv6+DNAT fast path must be byte-identical to the generic path"
+    );
+
+    let out_l3 = 14usize; // no VLAN
+
+    // BOTH translations applied: source prefix-translated (NPTv6),
+    // destination rewritten (DNAT).
+    let out_src = &out_g[out_l3 + 8..out_l3 + 24];
+    let out_dst = &out_g[out_l3 + 24..out_l3 + 40];
+    assert_eq!(out_src, &new_src, "NPTv6 must rewrite the IPv6 source address");
+    assert_eq!(out_dst, &new_dst, "DNAT must rewrite the IPv6 destination address");
+
+    // The DNAT destination change is not checksum-neutral, so the stored
+    // L4 checksum MUST have moved off the input value.
+    let out_l4_csum_off = out_l3 + pkt.rel_l4 + 16;
+    let out_l4_csum =
+        u16::from_be_bytes([out_g[out_l4_csum_off], out_g[out_l4_csum_off + 1]]);
+    assert_ne!(
+        out_l4_csum, in_l4_csum,
+        "DNAT must fold its destination delta into the L4 checksum (#3121)"
+    );
+
+    // The stored L4 checksum must be VALID for the rewritten addresses.
+    // This is the fail-on-revert assertion: a pre-#3121 nptv6 blanket
+    // skip leaves the checksum correct for the OLD destination -> invalid.
+    let verdict = oracle_packet_valid(
+        &out_g[out_l3..],
+        pkt.addr_family,
+        pkt.protocol,
+        pkt.rel_l4,
+        false,
+    );
+    assert!(
+        verdict.is_ok(),
+        "NPTv6+DNAT output L4 checksum must be valid for the rewritten src+dst: {:?}",
+        verdict
+    );
+}
+
 /// (d) #1838 (D3) FIXED pin: the generic v6 NAT path threads the
 /// caller's ext-aware L4 offset (shared `v6_rel_l4_offset` helper, the
 /// same precedence rule the descriptor path uses). On a valid IPv6

@@ -42,7 +42,17 @@ pub(super) fn compute_ip_csum_delta(flow: &SessionFlow, nat: &NatDecision) -> u1
 /// Includes both IP address and port changes. Handles IPv4 and IPv6.
 pub(super) fn compute_l4_csum_delta(flow: &SessionFlow, nat: &NatDecision) -> u16 {
     let mut sum: u32 = 0;
-    if nat.nptv6 {
+    // #3121: a PURE NPTv6 translation (only one of src/dst rewritten, no
+    // composed DNAT) is checksum-neutral by RFC 6296 -- the adjustment word
+    // preserves the address's ones-complement sum -- so it contributes no L4
+    // delta and we short-circuit. When NPTv6 COMPOSES with a destination
+    // rewrite (DNAT), BOTH rewrite_src and rewrite_dst are set: the NPTv6 side
+    // is still checksum-neutral (its word delta nets zero by construction,
+    // regardless of whether it lands on src in the forward direction or dst in
+    // the reverse), while the DNAT side is NOT neutral and MUST be folded in.
+    // So in the compose case we fall through and compute both deltas; the
+    // neutral NPTv6 term naturally sums to zero, leaving only the DNAT delta.
+    if nat.nptv6 && !(nat.rewrite_src.is_some() && nat.rewrite_dst.is_some()) {
         return 0;
     }
     if let Some(new_src) = nat.rewrite_src {
@@ -104,6 +114,12 @@ pub(super) fn compute_l4_csum_delta(flow: &SessionFlow, nat: &NatDecision) -> u1
     while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
+    // #3121: the checksum-neutral NPTv6 term in a compose folds to a
+    // ones-complement zero (0x0000 or 0xFFFF) and is the additive identity for
+    // the DNAT term, so a composed NPTv6+DNAT delta folds to the DNAT delta on
+    // its own -- no special canonicalization is needed here. The apply path
+    // already handles a 0xFFFF (ones-complement zero) delta correctly, which
+    // the v6 zero-encoding parity tests pin, so leave the folded sum as-is.
     sum as u16
 }
 
