@@ -77,6 +77,38 @@
   connected daemon during replay/drain; assert the I/O-thread function observes
   the stop flag and returns within 2s instead of wedging. Both go RED when the
   writer is reverted to the blocking `write_all`.
+## 2026-06-26 — #2880 tunnel-remap purge records a dropped close delta (error hygiene)
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fixed `purge_remapped_tunnel_sessions` (ha.rs) silently swallowing
+  `push_delta_lossless` errors with `let _ =`. On a tunnel-endpoint-id remap the
+  coordinator deletes local sessions then emits Close deltas; a disconnected /
+  saturated event stream made the lossless close delta fail with no diagnostic
+  and no metric. REFRAMED after hostile review (PR #3253 NEEDS-MAJOR): this is
+  CLEANUP, not a correctness boundary — a surviving stale entry cannot
+  mis-encapsulate (encap ifindex guard) and self-heals (standby's own
+  snapshot-apply purge + idle GC). A full owner-RG re-export CANNOT recover an
+  undelivered close anyway: the userspace cold-sync ships incremental Opens with
+  EMPTY bulk markers (`pkg/cluster/sync_bulk.go`) and the peer's
+  `reconcileStaleSessions` short-circuits on empty bulk (`pkg/cluster/sync.go`),
+  so re-emitting Opens cannot convey a delete. DROPPED the initially-proposed
+  `WorkerCommand::LatchDeltaLoss`→owner-RG-re-export mechanism entirely (it
+  didn't prune and was redundant with #2874's reconnect resync). Minimal honest
+  fix: `push_purge_close_deltas` records each undelivered delta in the
+  event-stream dropped-frames metric (new `record_dropped_frames` →
+  `frames_dropped`, surfaced in `EventStreamStats`/Prometheus) and logs once,
+  stopping on the first failure. The `usize` return is unchanged (accurate
+  local purge count; the drop is recorded separately, not conflated). Added
+  `EventStreamSender::test_sender(connected, capacity)` test seam (no I/O thread
+  / socket).
+- **File(s)**: userspace-dp/src/afxdp/ha.rs,
+  userspace-dp/src/event_stream/mod.rs, userspace-dp/src/afxdp/ha_tests.rs,
+  docs/session-sync-architecture.md, _Log.md
+- **Validation**: `cargo build --release` + `cargo test --release` (afxdp::ha
+  19, session 132, event_stream 61 — all green). Fail-on-revert: restoring the
+  `let _ =` swallow turns
+  `purge_remapped_tunnel_sessions_records_drop_on_lossless_failure` RED (dropped
+  metric not bumped) while the success test stays green; restored byte-identical.
 
 ## 2026-06-26 — #2959 event-stream MSG_ACK watermark validation
 
