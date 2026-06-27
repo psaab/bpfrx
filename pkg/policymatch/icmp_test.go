@@ -113,6 +113,43 @@ func TestICMPTypeConstraintParity(t *testing.T) {
 	}
 }
 
+// TestICMPTypeConstrainedTermRequiresICMPProtocol pins the defensive gate: an
+// application term that constrains ICMPType must never match a non-ICMP flow.
+// A predefined ICMP app pins its protocol (so the protocol check already gates
+// it), but a CUSTOM app can carry an icmp-type without a pinned protocol; the
+// dataplane keys icmp_constraints under the ICMP protocol, so a TCP query must
+// not satisfy a type-constrained term. Without the gate, an app with
+// Protocol="" + ICMPType set would match any protocol whose query happened to
+// carry a matching ICMPType.
+func TestICMPTypeConstrainedTermRequiresICMPProtocol(t *testing.T) {
+	cfg := cfgWith(config.SecurityConfig{
+		DefaultPolicy: config.PolicyDeny,
+		Zones:         zones("trust", "untrust"),
+		Policies: []*config.ZonePairPolicies{
+			zonePair("trust", "untrust", permit("allow-custom",
+				config.PolicyMatch{Applications: []string{"custom-icmp-noproto"}})),
+		},
+	}, config.ApplicationsConfig{
+		Applications: map[string]*config.Application{
+			// No Protocol pinned — only an ICMP type constraint.
+			"custom-icmp-noproto": {Name: "custom-icmp-noproto", ICMPType: u8(8)},
+		},
+	})
+
+	// A TCP query carrying ICMPType 8 must NOT match (default deny). Without the
+	// ICMP-family gate this would falsely permit.
+	tcp := Match(cfg, Query{FromZone: "trust", ToZone: "untrust", Protocol: "tcp", ICMPType: u8(8)})
+	if tcp.Matched || tcp.Action != config.PolicyDeny {
+		t.Errorf("TCP query matched a type-constrained term: Matched=%v Action=%v", tcp.Matched, tcp.Action)
+	}
+
+	// The same term still matches a genuine ICMP echo (type 8).
+	icmp := Match(cfg, Query{FromZone: "trust", ToZone: "untrust", Protocol: "icmp", ICMPType: u8(8)})
+	if !icmp.Matched || icmp.Action != config.PolicyPermit {
+		t.Errorf("ICMP echo did not match type-constrained term: Matched=%v Action=%v", icmp.Matched, icmp.Action)
+	}
+}
+
 // TestParseICMPValue covers the shared ICMP type/code token parser used by the
 // REST/gRPC/CLI/test-policy surfaces.
 func TestParseICMPValue(t *testing.T) {

@@ -57,6 +57,15 @@ import (
 // MaxPort is the largest valid TCP/UDP port number.
 const MaxPort = 65535
 
+// icmpProtoNum / icmpv6ProtoNum are the IANA protocol numbers for ICMP and
+// ICMPv6. They gate an ICMP-type-constrained application term (#3284) so it can
+// only match an ICMP-family flow, mirroring the dataplane keying its
+// icmp_constraints under the ICMP protocol (policy.rs CompiledApplications).
+const (
+	icmpProtoNum   uint8 = 1
+	icmpv6ProtoNum uint8 = 58
+)
+
 // JunosHostZone is the reserved self-traffic zone name. A query whose ToZone is
 // this name is host-bound (LocalDelivery) traffic; it is evaluated by the
 // dataplane's separate host gate (evaluate_junos_host_policy), not the transit
@@ -608,11 +617,17 @@ func expandBookName(cfg *config.Config, name string, visited map[string]bool) []
 // matchApp replicates policy.rs CompiledApplications.matches fed by the
 // snapshot builder's application expansion: predefined + user applications via
 // ResolveApplication, recursive application-set expansion via
-// ExpandApplicationSet, and BOTH source-port and destination-port terms.
+// ExpandApplicationSet, BOTH source-port and destination-port terms, and the
+// ICMP/ICMPv6 type/code constraints enforced in matchSingleApp (#3284).
 //
-// An empty application list is the runtime match-any case. An unspecified
-// query protocol does not constrain the match (the established diagnostic
-// behavior).
+// An empty application list is the runtime match-any case. An empty query
+// protocol short-circuits to match-any here — a diagnostic convenience (the
+// runtime always has a concrete protocol), NOT a claim that a protocol-bearing
+// app term would match a protocol-less packet. Once a non-empty protocol is
+// supplied, matchSingleApp constrains by protocol (and ICMP type/code for a
+// type-constrained term), failing closed exactly like the dataplane; a
+// non-empty but UNRESOLVABLE protocol therefore fails closed for every
+// protocol-constrained app term.
 func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort int, icmpType, icmpCode *uint8) bool {
 	if len(apps) == 0 {
 		return true
@@ -669,6 +684,15 @@ func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryP
 	// ICMP type constraint (junos-icmp-all, or any non-ICMP app) is unaffected:
 	// it matches on protocol/ports alone, exactly as before.
 	if app.ICMPType != nil {
+		// The dataplane keys icmp_constraints under the app's ICMP protocol, so
+		// the type constraint is only ever consulted for an ICMP-family packet.
+		// A predefined ICMP app pins app.Protocol (handled by the check above),
+		// but a custom app could carry an icmp-type without a pinned protocol;
+		// require the query to be ICMP (1) / ICMPv6 (58) so a type-constrained
+		// term can never match a TCP/UDP flow.
+		if !queryProtoOK || (queryProto != icmpProtoNum && queryProto != icmpv6ProtoNum) {
+			return false
+		}
 		if icmpType == nil || *icmpType != *app.ICMPType {
 			return false
 		}

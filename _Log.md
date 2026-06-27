@@ -22389,3 +22389,9 @@ top.
   **File(s)**: pkg/config/compiler_security.go,
   pkg/policymatch/scoped_global_zonelocal_test.go,
   docs/config-schema.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: PR #3289 quad-review fold (5 findings). (1) Remote CLI `show security match-policies` no-match path now renders the server-provided resp.Action ("<action> (default)") instead of hard-coded "default deny" — the #3283 drift class on the remote surface (wrong verdict under default-policy permit-all). (2) Remote CLI icmp-type/icmp-code now route through policymatch.ParseICMPValue and return an explicit error on invalid/out-of-range input (was a silent inline strconv.Atoi drop). (3) Corrected the stale matchApp docstring (now documents the empty-protocol match-any short-circuit as a diagnostic convenience and the ICMP type/code enforcement). (4) matchSingleApp now gates an ICMP-type-constrained app term on the query being ICMP(1)/ICMPv6(58) so a type-constrained term cannot match a TCP/UDP flow (mirrors the dataplane keying icmp_constraints under the ICMP protocol). (5) Documented the intentional REST-vs-gRPC Action asymmetry for host-inbound-unmatched in the policymatch README. Added 3 fail-on-revert tests (all RED on revert).
+  **File(s)**: cmd/cli/show.go, cmd/cli/nontty_test.go,
+  cmd/cli/show_matchpolicies_test.go, pkg/policymatch/policymatch.go,
+  pkg/policymatch/icmp_test.go, pkg/policymatch/README.md

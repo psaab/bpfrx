@@ -151,6 +151,16 @@ guarantee), never an inherited transit verdict. The surfaces render this as
 applied)"; the gRPC `MatchPolicies` response carries it as
 `host_inbound_unmatched`.
 
+Surface asymmetry (intentional, not a bug): for a host-inbound-unmatched
+result the REST `match-policies` response fills `action` with the descriptive
+string "host-inbound (local delivery; not governed by transit/global/default
+policy)" so a bare REST consumer reads a meaningful verdict, whereas the gRPC
+`MatchPolicies` response leaves `action` EMPTY and sets `matched=false` +
+`host_inbound_unmatched=true`, delegating the wording to the client (the remote
+CLI formats the two-line host-inbound message above). Both convey the same
+"no transit verdict applies" fact; they differ only in where the human string is
+composed.
+
 Address matching honors literal CIDRs, address
 books (recursive set expansion), `any`/`any-ipv4`/`any-ipv6`, source/destination
 exclusion (with the #2008 empty-excluded fail-closed rule), and the live
