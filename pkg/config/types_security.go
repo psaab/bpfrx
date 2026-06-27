@@ -198,6 +198,13 @@ type ZoneConfig struct {
 	ScreenProfile      string // reference to screen profile name
 	HostInboundTraffic *HostInboundTraffic
 	TCPRst             bool // send TCP RST for non-SYN packets to closed ports
+	// AddressBook is the zone-local address book (#3061). A policy whose
+	// from-zone (source-address) or to-zone (destination-address) is this
+	// zone resolves a name against this book FIRST, then falls back to the
+	// global SecurityConfig.AddressBook. Resolved into the global book under
+	// zone-qualified internal names by resolveZoneLocalAddressBooks during
+	// compile, so the dataplane resolution path stays global-only.
+	AddressBook *AddressBook
 }
 
 // HostInboundTraffic defines what services are permitted to the firewall itself.

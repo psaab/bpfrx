@@ -256,6 +256,41 @@ such a policy, so a leniently-loaded bad config is no worse off, now flagged. Th
 lenient path and for unreferenced sets (which never reach the runtime gate, so
 they stay warn-only). Same fail-closed-on-load doctrine as #3144/#3146.
 
+**Zone-local address books (#3061):** Junos supports both the global
+`security address-book global { ... }` and a per-zone book attached inline
+under `security zones security-zone <z> address-book { address ...;
+address-set ...; }`. xpf parses the zone-local shape into
+`ZoneConfig.AddressBook` (`compileZones`, same entry grammar as the global
+book via the shared `parseAddressBookEntries`). Resolution order follows
+Junos scoping: a policy's `match source-address` resolves against its
+FROM-zone book first, `match destination-address` against its TO-zone book
+first, then both fall back to the global book. `resolveZoneLocalAddressBooks`
+(`compiler_security.go`, run from `compileExpanded` after the name gate below)
+folds every zone-local entry into the global `SecurityConfig.AddressBook`
+under a `/`-separated zone-qualified internal name (`zone-local/<zone>/<name>`)
+and rewrites each policy match token that resolves zone-locally to that
+qualified name. A token NOT defined in the policy's zone book is left unchanged
+so it resolves against the global book. The synthetic `zone-local/` namespace
+is collision-proof: the lexer permits `/` in an identifier token (needed for
+IP literals like `10.0.0.0/24`), but `validateAddressBookEntryNamesStrict`
+(#3061, run BEFORE the fold on the pristine global book) hard-rejects `/` in
+any address-book entry name (global or zone-local) and any security-zone name
+at commit — matching Junos object-naming rules — so no operator-typed name can
+contain `/` and therefore none can equal a synthetic name (only the NAME is
+checked, never the address VALUE/prefix; the fold also skips an already-present
+key as a defence-in-depth no-clobber on the tolerant load path, which warns
+rather than rejects per #1960). After this pass
+the entire downstream path (wire snapshot, `nameToID`,
+`classifyPolicyAddresses`, the strict/warn validators, the
+`resolveUserspaceAddressBookEntry` runtime resolver) keeps operating on a
+single flat global book — no zone needs to be plumbed through resolution. A
+name present only in zone A's book is therefore invisible to a policy in zone
+B: if B's policy references it and the global book has no such entry,
+`validatePolicyMatchAddressesStrict` (#2008) rejects it at commit, exactly as
+Junos treats an undefined reference. NAT rule address-name references
+(`source-address-name` etc.) remain global-only; zone-local resolution is
+scoped to security-policy match addresses.
+
 **An interface belongs to exactly one security zone (#3072):**
 `pkg/dataplane/userspace.buildInterfaceZoneMap` builds the interface->zone
 lookup by iterating zone names in SORTED order and writing each interface

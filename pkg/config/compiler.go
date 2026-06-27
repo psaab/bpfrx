@@ -541,6 +541,19 @@ type compileOpts struct {
 	// leniently-loaded over-cap config is inert (the overflow zones do not
 	// forward) rather than mis-attributed. Same doctrine as lenientPolicyZoneRefs.
 	lenientZoneCount bool
+	// lenientAddressBookNames (#3061) downgrades the address-book / zone name
+	// `/`-character gate (validateAddressBookEntryNamesStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit / commit-check
+	// path hard-rejects a `/` in any address-book entry name (global or
+	// zone-local address / address-set) or any security-zone name — matching
+	// Junos object-naming rules and making the synthetic `zone-local/<zone>/
+	// <name>` internal name (resolveZoneLocalAddressBooks) collision-proof. The
+	// tolerant load / peer-sync paths downgrade to a warning so an already-
+	// persisted config an older binary accepted (before this gate existed) still
+	// BOOTS (#1960 no-brick); the fold's no-clobber guard keeps such a config
+	// from silently overwriting an operator entry. Same doctrine as
+	// lenientZoneCount.
+	lenientAddressBookNames bool
 	// lenientZoneInterfaceMembership (#3072) downgrades the zone-interface
 	// membership gate (validateZoneInterfaceMembershipStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit / commit-check
@@ -1013,6 +1026,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientWireguardPeers:               true,
 		lenientPolicyZoneRefs:               true,
 		lenientZoneCount:                    true,
+		lenientAddressBookNames:             true,
 		lenientZoneInterfaceMembership:      true,
 		lenientHostInboundTokens:            true,
 		lenientDestNATAddresses:             true,
@@ -1143,6 +1157,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientWireguardPeers:               true,
 		lenientPolicyZoneRefs:               true,
 		lenientZoneCount:                    true,
+		lenientAddressBookNames:             true,
 		lenientZoneInterfaceMembership:      true,
 		lenientHostInboundTokens:            true,
 		lenientDestNATAddresses:             true,
@@ -1591,6 +1606,33 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	if err := validateDataplaneTypeStrict(cfg); err != nil {
 		return nil, err
 	}
+
+	// #3061 — reject `/` in operator-typed address-book entry names and
+	// security-zone names BEFORE folding zone-local books, so the synthetic
+	// zone-local/<zone>/<name> internal names minted by
+	// resolveZoneLocalAddressBooks are collision-proof (an operator name can no
+	// longer contain `/` and so can never equal a synthetic name). This MUST
+	// run on the pristine global book — i.e. before the fold injects the
+	// `/`-bearing synthetic names — so it is placed here rather than in the
+	// post-fold accumulator. Strict on commit / commit-check (hard-reject);
+	// tolerant load / peer-sync downgrade to a warning (#1960 no-brick — a `/`
+	// name was unusual but accepted before this gate existed; the fold's
+	// no-clobber guard keeps it from silently overwriting an operator entry).
+	if err := validateAddressBookEntryNamesStrict(cfg); err != nil {
+		if opts.lenientAddressBookNames {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("address-book/zone name (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+	// #3061 — fold zone-local address books into the global book under
+	// zone-qualified internal names and rewrite policy match tokens. Runs after
+	// the name gate (above) and before the policy match-address resolution
+	// validators (validatePolicyMatchAddressesStrict /
+	// validatePolicyMatchAddressSetMembersStrict), which depend on the rewritten
+	// tokens and synthetic global entries.
+	resolveZoneLocalAddressBooks(&cfg.Security)
 
 	// #1538 — accumulate independent strict-validator families so
 	// `commit check` surfaces one error per family in a single

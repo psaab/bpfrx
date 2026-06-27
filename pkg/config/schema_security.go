@@ -19,6 +19,19 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				"system-services": {desc: "System services", children: nil},
 				"protocols":       {desc: "Protocols", children: nil},
 			}},
+			// #3061: zone-local address book. Same entry grammar as the
+			// global book (security address-book global) but attached
+			// directly under the zone (no `global` wrapper). A policy in
+			// this zone resolves a name against the zone-local book first,
+			// then falls back to the global book.
+			"address-book": {desc: "Zone-local address book", children: map[string]*schemaNode{
+				"address": {desc: "Named address (name and prefix)", args: 2, multi: true, placeholder: "<address-name>", children: nil},
+				"address-set": {desc: "Address set name", args: 1, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: map[string]*schemaNode{
+					"address":     {desc: "Address to include in this set", args: 1, multi: true, placeholder: "<address-name>", children: nil},
+					"address-set": {desc: "Nested address set to include", args: 1, multi: true, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: nil},
+					"description": {desc: "Address set description", args: 1, placeholder: "<text>", children: nil},
+				}},
+			}},
 		}},
 	}},
 	"policies": {desc: "Security policies", children: map[string]*schemaNode{
