@@ -237,9 +237,14 @@ fn classify_protocol(token: &str, hi: &mut ZoneHostInbound) {
         "vrrp" => {
             hi.ip_protocols.insert(112);
         }
+        // #3299: BFD admits single-hop control (3784) + echo (3785) AND
+        // multi-hop control (4784, RFC 5883). Multi-hop is control-only; echo
+        // stays single-hop on 3785. Keep this set in lockstep with the nft
+        // host-inbound rule (`hostInboundProtocolMatches`, pkg/daemon).
         "bfd" => {
             hi.udp_ports.insert(3784);
             hi.udp_ports.insert(3785);
+            hi.udp_ports.insert(4784);
         }
         "ldp" => {
             hi.tcp_ports.insert(646);
