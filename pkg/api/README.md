@@ -33,7 +33,15 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     counter IDs follow the zone-pair policy-set count (the `policySetID`
     continues from the zone-pair loop), so per-policy hit counters stay
     aligned with the dataplane when `policy-stats system-wide enable` is
-    set.
+    set. A scoped global policy (#3148 `match from-zone`/`to-zone`)
+    carries its narrowing on the per-rule `match_from_zone` /
+    `match_to_zone` fields (#3286), omitted when empty; the group row
+    stays `*`/`*` (the all-zones tier). Before #3286 these were absent,
+    so a scoped global looked all-zones to automation. The Prometheus
+    `xpf_policy_hits_total` collector (metrics_counters.go) likewise emits
+    the scoped global's real zones on its `from_zone`/`to_zone` labels
+    (#3286) — an unscoped global keeps `*`/`*` — so counter-based
+    validation is unambiguous on the canonical metrics surface.
 - `GET /api/v1/events/stream` — Server-Sent Events stream of dataplane
   events. Backed by the `pkg/logging` event ring buffer; long-lived
   consumers must drain.

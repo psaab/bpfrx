@@ -264,8 +264,18 @@ func (c *CLI) handleShowSecurity(args []string) error {
 							hits = fmt.Sprintf("%d", counters.Packets)
 						}
 					}
+					// #3286: a scoped global (#3148) shows its zone pair in
+					// the From/To columns instead of the all-zones "*"; an
+					// unscoped global still reads "*"/"*".
+					briefFrom, briefTo := "*", "*"
+					if pol.Match.FromZone != "" {
+						briefFrom = pol.Match.FromZone
+					}
+					if pol.Match.ToZone != "" {
+						briefTo = pol.Match.ToZone
+					}
 					fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
-						"*", "*", pol.Name, action, hits)
+						briefFrom, briefTo, pol.Name, action, hits)
 				}
 			}
 			return nil
@@ -343,8 +353,18 @@ func (c *CLI) handleShowSecurity(args []string) error {
 				if pol.Description != "" {
 					fmt.Printf("    Description: %s\n", pol.Description)
 				}
-				fmt.Printf("    From zones: any\n")
-				fmt.Printf("    To zones: any\n")
+				// #3286: render the scoped-global zone context (#3148)
+				// instead of the all-zones "any" placeholder. An unscoped
+				// global still shows any/any — no regression.
+				globalFromZone, globalToZone := "any", "any"
+				if pol.Match.FromZone != "" {
+					globalFromZone = pol.Match.FromZone
+				}
+				if pol.Match.ToZone != "" {
+					globalToZone = pol.Match.ToZone
+				}
+				fmt.Printf("    From zones: %s\n", globalFromZone)
+				fmt.Printf("    To zones: %s\n", globalToZone)
 				fmt.Printf("    Source addresses: %s\n",
 					strings.Join(pol.Match.SourceAddresses, ", "))
 				fmt.Printf("    Destination addresses: %s\n",

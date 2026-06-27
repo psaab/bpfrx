@@ -174,8 +174,18 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 			}
 			totalPkts += pkts
 			totalBytes += bytes
+			// #3286: a scoped global (#3148) reports its zone pair in the
+			// From/To columns so the hit-count row is not ambiguous; an
+			// unscoped global keeps "*"/"*".
+			hcFrom, hcTo := "*", "*"
+			if pol.Match.FromZone != "" {
+				hcFrom = pol.Match.FromZone
+			}
+			if pol.Match.ToZone != "" {
+				hcTo = pol.Match.ToZone
+			}
 			fmt.Fprintf(buf, "%-12s %-12s %-24s %-8s %12d %16d\n",
-				"*", "*", pol.Name, action, pkts, bytes)
+				hcFrom, hcTo, pol.Name, action, pkts, bytes)
 		}
 	}
 	fmt.Fprintln(buf, strings.Repeat("-", 88))
@@ -292,6 +302,15 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 				fmt.Fprintf(buf, "    Description: %s\n", pol.Description)
 			}
 			fmt.Fprintf(buf, "    Match:\n")
+			// #3286: a scoped global (#3148) narrows itself to a zone pair;
+			// surface the configured scope so the detail view does not read
+			// as all-zones. Omitted for an unscoped global (no regression).
+			if pol.Match.FromZone != "" {
+				fmt.Fprintf(buf, "      Source zone: %s\n", pol.Match.FromZone)
+			}
+			if pol.Match.ToZone != "" {
+				fmt.Fprintf(buf, "      Destination zone: %s\n", pol.Match.ToZone)
+			}
 			fmt.Fprintf(buf, "      Source addresses:\n")
 			for _, addr := range pol.Match.SourceAddresses {
 				resolved := grpcResolveAddress(cfg, addr)

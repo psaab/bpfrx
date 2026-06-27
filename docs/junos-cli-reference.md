@@ -435,7 +435,7 @@ Global policies:
 
 - Same as regular policies but with `Global policies:` header.
 - Uses `From zones:` and `To zones:` (plural) instead of `From zone:` / `To zone:`.
-- **Zone context (#3148).** A global policy may carry optional
+- **Zone context (#3148, display #3286).** A global policy may carry optional
   `set security policies global policy <p> match from-zone <z>` /
   `match to-zone <z>` to scope it to a chosen zone pair (or one wildcard side)
   instead of every zone pair. With a context set, `From zones:` / `To zones:`
@@ -446,6 +446,20 @@ Global policies:
   omitted leaf and an explicit `match from-zone any` are identical (all zones);
   an undefined match zone is rejected at commit, and `match from-zone junos-host`
   / `to-zone junos-host` is rejected (not supported on a global policy).
+- **#3286 — scope shown on EVERY inventory surface.** Before #3286 only the
+  dataplane enforced the scope; the show/inventory surfaces dropped it and
+  rendered scoped globals as all-zones. All surfaces now reflect the configured
+  scope consistently: CLI `show security policies` (`From zones:`/`To zones:`),
+  `... detail` (`From zone:`/`To zone:`), `... brief` (the From/To columns),
+  and `... hit-count` (the From zone/To zone columns) print the scoped zone for
+  a scoped global; the gRPC `GetPolicies` `PolicyRule` carries
+  `match_from_zone`/`match_to_zone` (empty for an unscoped global) and the gRPC
+  text `policies-hit-count`/`policies-detail` views show the scope; the REST
+  `GET /api/v1/security/policies` `PolicyRule` carries
+  `match_from_zone`/`match_to_zone` (omitted when empty). The global PolicyInfo
+  group still reports `from_zone="*"`/`to_zone="*"` (the all-zones tier) — the
+  per-rule fields carry the narrowing. An unscoped global is unchanged
+  (junos-global / any / `*`).
 
 ---
 
