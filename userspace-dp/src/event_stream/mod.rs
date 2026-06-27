@@ -1136,21 +1136,44 @@ fn handle_drain_request(
     // drain write.
     let write_deadline = Instant::now() + REPLAY_DRAIN_WRITE_DEADLINE;
     let mut write_failed = false;
+    // #2882: honor the fence — write only frames UP TO the requested target,
+    // not the whole replay head. DrainRequest is contracted (see
+    // docs/session-sync-design.md) as "flush all buffered events up to target
+    // seq". Frames newer than the fence belong to a later drain/replay;
+    // flushing (and reporting) them here changes the contract to "dump current
+    // replay head", which masks holes and couples demotion correctness to
+    // unrelated later-buffered frames. `drained_up_to` tracks the highest seq
+    // <= target actually written (the replay buffer is seq-ordered).
+    let mut drained_up_to = 0u64;
     for frame in replay_buf.iter() {
+        if frame.seq > target_seq {
+            continue; // beyond the fence — not part of this drain
+        }
         if let Err(e) = write_all_backpressured(stream, frame.as_bytes(), shared, write_deadline) {
             eprintln!("xpf-event-stream: drain write error: {e}");
             write_failed = true;
             break;
         }
+        drained_up_to = frame.seq;
     }
 
     // Send DrainComplete ONLY when the target fence was reached AND every frame
-    // was flushed. If the drain timed out below the fence, or a write failed
-    // against a stuck/stopping reader, withhold DrainComplete: the daemon's
-    // SendDrainRequest then times out (or rejects a below-target seq) and
-    // refuses to proceed with demotion, rather than silently losing the
+    // up to it was flushed. If the drain timed out below the fence, or a write
+    // failed against a stuck/stopping reader, withhold DrainComplete: the
+    // daemon's SendDrainRequest then times out (or rejects a below-target seq)
+    // and refuses to proceed with demotion, rather than silently losing the
     // post-fence sessions on failover (#2876/#2877).
-    let drain_seq = replay_buf.back().map(|f| f.seq).unwrap_or(target_seq);
+    //
+    // #2882: report the fence the daemon requested, not replay_buf.back().seq
+    // (which could exceed the target). Everything with seq <= target_seq is now
+    // flushed, so report the highest such seq actually written; if the buffer
+    // held nothing at/below the fence (all already ACK-trimmed), the fence is
+    // still satisfied, so report target_seq.
+    let drain_seq = if drained_up_to == 0 {
+        target_seq
+    } else {
+        drained_up_to
+    };
     if reached_target && !write_failed {
         let complete_frame = EventFrame::encode_drain_complete(drain_seq);
         if let Err(e) =

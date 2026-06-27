@@ -1,3 +1,27 @@
+## 2026-06-26 — #2882 event-stream drain honors the target_seq fence
+
+- **Timestamp**: 2026-06-26
+- **Action**: `handle_drain_request`
+  (`userspace-dp/src/event_stream/mod.rs`) wrote EVERY frame in
+  `replay_buf.iter()` with no `frame.seq <= target_seq` filter and reported
+  DrainComplete with `replay_buf.back().seq` rather than the requested target.
+  DrainRequest is contracted (docs/session-sync-design.md, the arm comment) as
+  "flush all buffered events up to target seq", so flushing/reporting beyond
+  the fence changed it to "dump current replay head" — masking holes and
+  coupling demotion correctness to unrelated later-buffered frames. Fix: skip
+  frames with `seq > target_seq`, track the highest seq `<= target` actually
+  written (`drained_up_to`), and report that (or `target_seq` when the buffer
+  held nothing at/below the fence because it was already ACK-trimmed).
+  DrainComplete is still withheld if the fence was never reached (#2876) or a
+  write failed (#2877).
+- **File(s)**: `userspace-dp/src/event_stream/mod.rs`,
+  `userspace-dp/src/event_stream/tests.rs`,
+  `docs/session-sync-design.md`
+- **Tests**: `test_drain_filters_to_target_and_reports_target_2882` — replay
+  buffer seqs 1..=10, fence target 5; assert only seqs 1..=5 are written and
+  DrainComplete reports 5. Goes RED when the `<= target` filter or the
+  drain_seq fix is reverted (back().seq=10 leaks / is reported).
+
 ## 2026-06-26 — #2877 event-stream replay/drain stop-aware nonblocking writes
 
 - **Timestamp**: 2026-06-26

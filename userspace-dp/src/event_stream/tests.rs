@@ -1643,6 +1643,55 @@ fn test_drain_at_fence_emits_drain_complete() {
     assert!(saw_complete, "helper did not emit DrainComplete at fence");
 }
 
+// #2882 fail-on-revert guard: DrainRequest is contracted as "flush all
+// buffered events UP TO target seq". With a replay buffer holding seqs 1..=10
+// and a fence target of 5, handle_drain_request must write ONLY seqs 1..=5 and
+// report DrainComplete == 5 (the fence) — not every buffered frame and not
+// replay_buf.back().seq (10). Reverting the `frame.seq <= target_seq` filter
+// makes 6..=10 leak onto the wire; reverting the drain_seq fix reports 10 ->
+// either makes this RED.
+#[test]
+fn test_drain_filters_to_target_and_reports_target_2882() {
+    let (mut daemon_side, helper_side) = std::os::unix::net::UnixStream::pair().unwrap();
+    daemon_side
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let shared = Arc::new(EventStreamShared::new());
+
+    // Buffer holds frames newer than the fence (1..=10, fence = 5).
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    for seq in 1..=10u64 {
+        replay_buf.push_back(replay_seq_frame(seq));
+    }
+    // Keep tx alive so the drain loop sees Empty (not Disconnected) and reaches
+    // the fence via replay_buf.back().seq (10) >= target (5).
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+
+    handle_drain_request(5, &rx, &helper_side, &shared, &mut replay_buf);
+
+    // Collect everything the helper wrote until DrainComplete.
+    let mut data_seqs: Vec<u64> = Vec::new();
+    let mut drain_complete_seq: Option<u64> = None;
+    while let Some((msg_type, seq)) = try_read_frame_header(&mut daemon_side) {
+        if msg_type == MSG_DRAIN_COMPLETE {
+            drain_complete_seq = Some(seq);
+            break;
+        }
+        data_seqs.push(seq);
+    }
+
+    assert_eq!(
+        data_seqs,
+        vec![1, 2, 3, 4, 5],
+        "drain must write only frames with seq <= target fence (#2882)"
+    );
+    assert_eq!(
+        drain_complete_seq,
+        Some(5),
+        "DrainComplete must report the fence target, not replay_buf.back().seq (#2882)"
+    );
+}
+
 // Fill a nonblocking socket's send buffer so subsequent writes return
 // WouldBlock. Used to simulate a daemon that connected but stopped reading.
 fn fill_send_buffer(stream: &std::os::unix::net::UnixStream) {

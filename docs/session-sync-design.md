@@ -605,6 +605,18 @@ DrainComplete. This replaces `ExportOwnerRGSessions` RPC for demotion prep —
 the daemon drains the stream to current head instead of doing a separate RPC
 export.
 
+The fence is honored strictly (#2882): `handle_drain_request` writes ONLY
+buffered frames with `seq <= target_seq` and reports DrainComplete with the
+fence target (the highest seq `<= target` actually flushed; `target_seq` when
+the buffer held nothing at/below the fence because it was already ACK-trimmed).
+It does NOT write every frame in the replay buffer, and it does NOT report
+`replay_buf.back().seq` (which can exceed the target). Before #2882 the handler
+flushed and reported the current replay head, changing the contract from "fence
+up to target" to "dump current replay head" — that masks holes and couples
+demotion correctness to unrelated later-buffered frames. DrainComplete is still
+withheld entirely if the fence was never reached within the drain timeout
+(#2876) or a frame write failed against a stuck/stopping reader (#2877).
+
 ### Reconnect / Replay
 
 On disconnect, the helper retains its replay buffer (bounded, ~4096 events per
