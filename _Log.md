@@ -1,3 +1,42 @@
+## 2026-06-26 — #3152 session: TCP opening/half-open state machine
+
+- **Timestamp**: 2026-06-26
+- **Action**: Added a TCP three-way-handshake completion state to the
+  userspace session entry. A session created by a bare SYN (SYN set, ACK
+  clear) now starts OPENING (`SessionEntry.established == false`) and is
+  reaped on a short `SessionTimeouts.tcp_opening_ns` window (20 s, Junos
+  `tcp-initial-timeout` default) instead of the full 300 s established
+  timeout, mitigating low-rate bare-SYN half-open table exhaustion (sibling
+  of #3046). It is promoted to ESTABLISHED on the first ACK-bearing segment
+  after the opening SYN (the reverse SYN-ACK and the forward completing ACK
+  both carry ACK); promotion is sticky and applied at all three
+  timeout-selection sites (install/upsert_synced, lookup, update_session).
+  `session_timeout_ns` gained an `established` parameter routing the OPENING
+  branch to `tcp_opening_ns`; the per-app #3227 override and established
+  timeout apply only once established. Non-TCP and TCP mid-stream pickups
+  (non-bare-SYN first packet) initialise ESTABLISHED — byte-identical to
+  pre-#3152. HA decision: `established` is node-local derived state, NOT on
+  the sync wire (no wire-format change); sync gating unchanged. A
+  peer-synced session is imported as ESTABLISHED (not re-derived OPENING
+  from possibly-stale synced tcp_flags), so a live established flow's
+  standby copy is never misclassified and reaped early at the short
+  stale-synced ceiling — zero failover regression. The half-open mitigation
+  holds end to end via the primary's fast reap + Close-delta propagation to
+  the standby. `tcp_opening_ns` is not
+  operator-configurable yet (held at the default on every construction path
+  including from_seconds) — deferred config knob. SYN-cookie integration is
+  out of scope (the existing opt-in screen path already prevents half-open
+  installs when configured). Tests:
+  bare_syn_session_starts_opening_with_short_timeout (RED on revert),
+  half_open_session_reaps_at_opening_timeout (RED on revert),
+  tcp_handshake_promotes_opening_to_established,
+  opening_session_ignores_app_override_until_established, plus
+  default/from_seconds opening-window asserts and an updated
+  session_timeout_ns_honors_app_override.
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/install.rs, userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md
+
 ## 2026-06-26 — #2358 NAT64 inbound cross-family policy matching
 
 - **Timestamp**: 2026-06-26

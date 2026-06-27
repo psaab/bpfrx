@@ -12,6 +12,10 @@ use super::*;
 // (the wheel-driving methods moved to session/expire.rs), so reference
 // them explicitly here. Same symbols, same values — no behavior change.
 use super::wheel::{FAR_FUTURE_OFFSET, WHEEL_BUCKETS, WHEEL_TICK_NS};
+// #3152: TCP control bits used by the half-open / opening-state tests.
+// `TCP_FIN`/`TCP_RST` reach the test via `super::*` (mod.rs imports them);
+// SYN and ACK are not re-exported there, so bring them in explicitly.
+use crate::tcp_flags::{TCP_ACK, TCP_SYN};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 fn key_v4() -> SessionKey {
@@ -188,29 +192,40 @@ fn session_timeout_ns_honors_app_override() {
     let app = 30_000_000_000u64; // 30 s
 
     // ESTABLISHED TCP (ACK, not closing): override wins; None -> global.
-    assert_eq!(session_timeout_ns(PROTO_TCP, 0x10, &to, Some(app)), app);
+    assert_eq!(session_timeout_ns(PROTO_TCP, 0x10, true, &to, Some(app)), app);
     assert_eq!(
-        session_timeout_ns(PROTO_TCP, 0x10, &to, None),
+        session_timeout_ns(PROTO_TCP, 0x10, true, &to, None),
         DEFAULT_TCP_SESSION_TIMEOUT_NS
     );
-    // UDP / ICMP: override wins; None -> global.
-    assert_eq!(session_timeout_ns(PROTO_UDP, 0, &to, Some(app)), app);
+    // #3152: OPENING TCP (handshake incomplete): the short opening window,
+    // regardless of any per-app override (which is the established idle value).
     assert_eq!(
-        session_timeout_ns(PROTO_UDP, 0, &to, None),
+        session_timeout_ns(PROTO_TCP, crate::tcp_flags::TCP_SYN, false, &to, Some(app)),
+        DEFAULT_TCP_OPENING_TIMEOUT_NS
+    );
+    assert_eq!(
+        session_timeout_ns(PROTO_TCP, crate::tcp_flags::TCP_SYN, false, &to, None),
+        DEFAULT_TCP_OPENING_TIMEOUT_NS
+    );
+    // UDP / ICMP: override wins; None -> global. `established` is ignored.
+    assert_eq!(session_timeout_ns(PROTO_UDP, 0, true, &to, Some(app)), app);
+    assert_eq!(
+        session_timeout_ns(PROTO_UDP, 0, true, &to, None),
         DEFAULT_UDP_SESSION_TIMEOUT_NS
     );
-    assert_eq!(session_timeout_ns(PROTO_ICMP, 0, &to, Some(app)), app);
+    assert_eq!(session_timeout_ns(PROTO_ICMP, 0, true, &to, Some(app)), app);
     assert_eq!(
-        session_timeout_ns(PROTO_ICMP, 0, &to, None),
+        session_timeout_ns(PROTO_ICMP, 0, true, &to, None),
         DEFAULT_ICMP_SESSION_TIMEOUT_NS
     );
-    // Closing/RST TCP: the override never extends the short reap window.
+    // Closing/RST TCP: the override never extends the short reap window
+    // (and the closing branch is consulted before the OPENING branch).
     assert_eq!(
-        session_timeout_ns(PROTO_TCP, TCP_RST, &to, Some(app)),
+        session_timeout_ns(PROTO_TCP, TCP_RST, false, &to, Some(app)),
         TCP_RST_TIMEOUT_NS
     );
     assert_eq!(
-        session_timeout_ns(PROTO_TCP, TCP_FIN, &to, Some(app)),
+        session_timeout_ns(PROTO_TCP, TCP_FIN, false, &to, Some(app)),
         TCP_CLOSING_TIMEOUT_NS
     );
 }
@@ -1024,6 +1039,172 @@ fn tcp_rst_uses_short_timeout_not_fin_timeout() {
     assert_eq!(
         after_update.expires_after_ns, TCP_RST_TIMEOUT_NS,
         "update_session must consult the sticky reset flag: a non-RST FIN refresh of a RST'd session keeps the 2s timeout, not 30s"
+    );
+}
+
+/// #3152 FAIL-ON-REVERT: a TCP session created by a bare SYN (SYN set, ACK
+/// clear) must start in the OPENING (half-open) state and take the short
+/// `tcp_opening_ns` window, NOT the full established timeout. If the opening
+/// state machine is reverted (a bare SYN routes to `tcp_established_ns`),
+/// the `expires_after_ns` assert below RED-fails.
+#[test]
+fn bare_syn_session_starts_opening_with_short_timeout() {
+    assert!(
+        DEFAULT_TCP_OPENING_TIMEOUT_NS < DEFAULT_TCP_SESSION_TIMEOUT_NS,
+        "opening window must be strictly shorter than the established window"
+    );
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let now = 1_000_000_000u64;
+    // Bare SYN: SYN set, ACK clear — a connection-opening segment.
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        metadata(),
+        now,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+    let entry = table.entry_by_key(&key).expect("opening entry");
+    assert!(
+        !entry.established,
+        "a bare-SYN session must start OPENING (handshake incomplete)"
+    );
+    assert_eq!(
+        entry.expires_after_ns, DEFAULT_TCP_OPENING_TIMEOUT_NS,
+        "a bare-SYN (half-open) session must use the short opening timeout, \
+         not the established timeout"
+    );
+}
+
+/// #3152: a completed three-way handshake (SYN, SYN-ACK, ACK) promotes the
+/// session from OPENING to ESTABLISHED, at which point the established idle
+/// timeout applies. The reverse SYN-ACK and the forward completing ACK both
+/// carry the ACK bit, so the first ACK-bearing segment after the opening SYN
+/// promotes the entry. Promotion is sticky.
+#[test]
+fn tcp_handshake_promotes_opening_to_established() {
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let now = 1_000_000_000u64;
+    // 1) Opening SYN.
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        metadata(),
+        now,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+    assert!(!table.entry_by_key(&key).expect("opening").established);
+    // 2) Reverse SYN-ACK (carries ACK) — handshake response.
+    assert!(table.lookup(&key, now + 1_000_000, TCP_SYN | TCP_ACK).is_some());
+    // 3) Forward completing ACK.
+    assert!(table.lookup(&key, now + 2_000_000, TCP_ACK).is_some());
+    let entry = table.entry_by_key(&key).expect("established entry");
+    assert!(
+        entry.established,
+        "a completed 3-way handshake must promote the session to ESTABLISHED"
+    );
+    assert_eq!(
+        entry.expires_after_ns, table.timeouts.tcp_established_ns,
+        "an established session must use the established idle timeout"
+    );
+    // Stickiness: a later non-ACK segment must not demote back to OPENING.
+    assert!(table.lookup(&key, now + 3_000_000, 0).is_some());
+    assert!(
+        table.entry_by_key(&key).expect("still established").established,
+        "establishment is sticky — a later segment must not revert to OPENING"
+    );
+}
+
+/// #3152 FAIL-ON-REVERT (reap proof): a half-open (bare-SYN) session that
+/// never completes its handshake must be reaped at the short opening timeout
+/// (20 s), far short of the 300 s established timeout — the SYN-flood
+/// resource-exhaustion mitigation. A control established session installed at
+/// the same instant must survive past the opening window. Revert the state
+/// machine and the half-open session inherits the 300 s timeout, so the
+/// `expired.len() == 1` assertion goes RED.
+#[test]
+fn half_open_session_reaps_at_opening_timeout() {
+    let install_ns = 1_000_000_000u64;
+    // Past the 20 s opening window, far short of the 300 s established window.
+    let advance = install_ns + 25 * WHEEL_TICK_NS;
+
+    // --- half-open (bare SYN, never completes): reaps at the opening window ---
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        metadata(),
+        install_ns,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+    table.last_gc_ns = advance - SESSION_GC_INTERVAL_NS;
+    let expired = table.expire_stale_entries(advance);
+    assert_eq!(
+        expired.len(),
+        1,
+        "a half-open (bare-SYN) session must reap at the short opening timeout, \
+         not survive to the established timeout"
+    );
+    assert_eq!(expired[0].key, key);
+
+    // --- control: an ESTABLISHED session survives past the opening window ---
+    let mut table2 = SessionTable::new();
+    let key2 = key_v4();
+    // First packet carries ACK (a mid-stream pickup / non-bare-SYN) -> ESTABLISHED.
+    assert!(table2.install_with_protocol(
+        key2.clone(),
+        decision(),
+        metadata(),
+        install_ns,
+        PROTO_TCP,
+        TCP_ACK,
+    ));
+    table2.last_gc_ns = advance - SESSION_GC_INTERVAL_NS;
+    assert!(
+        table2.expire_stale_entries(advance).is_empty(),
+        "an established session must survive past the short opening window on the \
+         established timeout"
+    );
+}
+
+/// #3152 x #3227: the per-application inactivity timeout is the ESTABLISHED
+/// idle window — it must NOT shorten or lengthen the OPENING half-open
+/// window. A bare-SYN session carrying a per-app override still reaps on the
+/// short opening timeout; once the handshake completes the per-app override
+/// applies.
+#[test]
+fn opening_session_ignores_app_override_until_established() {
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let now = 1_000_000_000u64;
+    let app = 120 * WHEEL_TICK_NS; // 120 s custom application idle timeout
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        metadata_with_app_timeout(app),
+        now,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+    let opening = table.entry_by_key(&key).expect("opening entry");
+    assert!(!opening.established);
+    assert_eq!(
+        opening.expires_after_ns, DEFAULT_TCP_OPENING_TIMEOUT_NS,
+        "a half-open session uses the short opening window even with a per-app \
+         override stamped (the override is the established idle timeout)"
+    );
+    // Complete the handshake — the per-app override now applies.
+    assert!(table.lookup(&key, now + 1_000_000, TCP_ACK).is_some());
+    let est = table.entry_by_key(&key).expect("established entry");
+    assert!(est.established);
+    assert_eq!(
+        est.expires_after_ns, app,
+        "once established the per-application inactivity timeout applies"
     );
 }
 
@@ -1849,6 +2030,8 @@ fn configurable_udp_timeout_changes_session_expiry() {
 fn default_timeouts_match_original_values() {
     let t = SessionTimeouts::default();
     assert_eq!(t.tcp_established_ns, 300_000_000_000);
+    // #3152: the half-open opening window defaults to 20 s (Junos parity).
+    assert_eq!(t.tcp_opening_ns, 20_000_000_000);
     assert_eq!(t.udp_ns, 60_000_000_000);
     assert_eq!(t.icmp_ns, 60_000_000_000);
 }
@@ -1857,6 +2040,8 @@ fn default_timeouts_match_original_values() {
 fn from_seconds_zero_uses_default() {
     let t = SessionTimeouts::from_seconds(0, 0, 0);
     assert_eq!(t.tcp_established_ns, DEFAULT_TCP_SESSION_TIMEOUT_NS);
+    // #3152: the opening window is not snapshot-driven; always the default.
+    assert_eq!(t.tcp_opening_ns, DEFAULT_TCP_OPENING_TIMEOUT_NS);
     assert_eq!(t.udp_ns, DEFAULT_UDP_SESSION_TIMEOUT_NS);
     assert_eq!(t.icmp_ns, DEFAULT_ICMP_SESSION_TIMEOUT_NS);
 }
@@ -2095,6 +2280,9 @@ fn reference_update_session(
     // in-place/reference parity sweeps stay byte-equivalent.
     entry.reset |= matches!(protocol, PROTO_TCP) && (tcp_flags & TCP_RST) != 0;
     entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
+    // #3152: mirror update_session — promote OPENING -> ESTABLISHED on the
+    // first ACK-bearing segment, then select the timeout consulting the state.
+    entry.established |= matches!(protocol, PROTO_TCP) && has_ack(tcp_flags);
     entry.expires_after_ns = if entry.closing {
         if entry.reset {
             TCP_RST_TIMEOUT_NS
@@ -2105,6 +2293,7 @@ fn reference_update_session(
         session_timeout_ns(
             protocol,
             tcp_flags,
+            entry.established,
             &table.timeouts,
             entry.metadata.inactivity_timeout_ns,
         )

@@ -38,6 +38,19 @@ use wheel::SessionWheel;
 const SESSION_GC_INTERVAL_NS: u64 = 1_000_000_000;
 const DEFAULT_MAX_SESSIONS: usize = 131072;
 const DEFAULT_TCP_SESSION_TIMEOUT_NS: u64 = 300_000_000_000;
+/// #3152: short half-open / opening timeout for a TCP session whose
+/// three-way handshake has not completed. A session created by a bare SYN
+/// (SYN set, ACK clear) starts in the OPENING state and is held only for
+/// this window; it is promoted to the full `tcp_established_ns` idle window
+/// once the handshake completes (the first ACK-bearing segment after the
+/// SYN — the SYN-ACK on the reverse half and the handshake-completing ACK
+/// on the forward half). Without this, a bare SYN landed on the full 300 s
+/// established timeout, so a low-rate SYN flood (SYN with no follow-up ACK)
+/// could pin half-open entries in the bounded `max_sessions` table far
+/// longer than a legitimate incomplete handshake needs and eventually deny
+/// new flows. 20 s matches the Junos `tcp-initial-timeout` default. This
+/// is the SYN-flood/half-open sibling of the #3046 RST-reap window.
+const DEFAULT_TCP_OPENING_TIMEOUT_NS: u64 = 20_000_000_000;
 const TCP_CLOSING_TIMEOUT_NS: u64 = 30_000_000_000;
 /// #3046: a session torn down by RST is reaped far faster than a graceful
 /// FIN close. A RST abruptly aborts the socket — there is no half-closed /
@@ -194,6 +207,12 @@ pub(crate) fn app_inactivity_timeout_ns(secs: Option<u32>) -> Option<u64> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionTimeouts {
     pub(crate) tcp_established_ns: u64,
+    /// #3152: short half-open timeout for a handshake-incomplete (OPENING)
+    /// TCP session. Not operator-configurable yet — held at
+    /// `DEFAULT_TCP_OPENING_TIMEOUT_NS` (the Junos `tcp-initial-timeout`
+    /// default) on every construction path. A future config knob would set
+    /// it here without touching the state machine.
+    pub(crate) tcp_opening_ns: u64,
     pub(crate) udp_ns: u64,
     pub(crate) icmp_ns: u64,
 }
@@ -202,6 +221,7 @@ impl Default for SessionTimeouts {
     fn default() -> Self {
         Self {
             tcp_established_ns: DEFAULT_TCP_SESSION_TIMEOUT_NS,
+            tcp_opening_ns: DEFAULT_TCP_OPENING_TIMEOUT_NS,
             udp_ns: DEFAULT_UDP_SESSION_TIMEOUT_NS,
             icmp_ns: DEFAULT_ICMP_SESSION_TIMEOUT_NS,
         }
@@ -218,6 +238,10 @@ impl SessionTimeouts {
             } else {
                 DEFAULT_TCP_SESSION_TIMEOUT_NS
             },
+            // #3152: the half-open window is not snapshot-driven yet; it stays
+            // at the Junos-parity default regardless of the configured
+            // established timeout (the two are independent windows).
+            tcp_opening_ns: DEFAULT_TCP_OPENING_TIMEOUT_NS,
             udp_ns: if udp_secs > 0 {
                 secs_to_ns_saturating(udp_secs)
             } else {
@@ -237,7 +261,7 @@ use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 // so the conntrack submodules (install, lookup, expire) keep referencing
 // TCP_FIN/TCP_RST via `super::*`. The session-closing test is the shared
 // `is_closing` predicate.
-use crate::tcp_flags::{TCP_FIN, TCP_RST, has_rst, is_closing};
+use crate::tcp_flags::{TCP_FIN, TCP_RST, has_ack, has_rst, is_closing, is_initial_syn};
 
 #[allow(unused_macros)]
 macro_rules! debug_log {
@@ -287,6 +311,26 @@ struct SessionEntry {
     /// set together with `closing`, the timeout selection uses the short
     /// `TCP_RST_TIMEOUT_NS` instead of the FIN close timeout.
     reset: bool,
+    /// #3152: TCP three-way-handshake completion state. `false` = OPENING
+    /// (half-open) — the session was created by a bare SYN and its handshake
+    /// has not yet completed, so it is reaped on the short
+    /// `SessionTimeouts.tcp_opening_ns` window instead of the full
+    /// established idle window. Set `true` once a handshake-completing
+    /// segment is observed (the first ACK-bearing segment after the opening
+    /// SYN — the reverse SYN-ACK and the forward completing ACK both carry
+    /// ACK), at which point the per-app / established timeout applies.
+    /// Initialised `true` for every non-TCP session and for any TCP session
+    /// whose creating packet is NOT a bare SYN (a mid-stream pickup, e.g. a
+    /// SYN-ACK or data segment), preserving the pre-#3152 established-timeout
+    /// behaviour for those. Sticky once set — a later segment never demotes
+    /// an established session back to OPENING. Node-local derived state: it
+    /// is NOT carried on the HA session-sync wire. A peer-synced session is
+    /// imported as ESTABLISHED (see `upsert_synced_with_origin`) rather than
+    /// re-derived as OPENING — the short window is a forwarding-node
+    /// protection, and the standby relies on the primary's fast reap +
+    /// Close-delta propagation, not its own OPENING window. No wire-format
+    /// change.
+    established: bool,
     /// #965: absolute wheel tick at which this session is scheduled to
     /// be checked for expiration. Updated on every push to the wheel.
     /// A WheelEntry whose `scheduled_tick != entry.wheel_tick` is a
@@ -994,6 +1038,14 @@ impl SessionTable {
             // non-RST FIN trigger, would wrongly revert to the 30s FIN window.
             record.entry.reset |= matches!(protocol, PROTO_TCP) && has_rst(tcp_flags);
             record.entry.closing = matches!(protocol, PROTO_TCP) && is_closing(tcp_flags);
+            // #3152: promote OPENING -> ESTABLISHED on the first ACK-bearing
+            // segment after the opening SYN (sticky, mirrors lookup.rs). The
+            // SYN-ACK on the reverse half and the completing ACK on the
+            // forward half both carry ACK; a bare SYN that never gets a reply
+            // never reaches here with an ACK and stays OPENING. Set BEFORE the
+            // timeout selection so an established refresh uses the established
+            // window.
+            record.entry.established |= matches!(protocol, PROTO_TCP) && has_ack(tcp_flags);
             record.entry.expires_after_ns = if record.entry.closing {
                 if record.entry.reset {
                     TCP_RST_TIMEOUT_NS
@@ -1003,9 +1055,12 @@ impl SessionTable {
             } else {
                 // #3227: a real-traffic refresh re-stamps the idle window from
                 // the (possibly updated) metadata's per-app override.
+                // #3152: an un-established TCP session uses the short opening
+                // window via session_timeout_ns(established=false).
                 session_timeout_ns(
                     protocol,
                     tcp_flags,
+                    record.entry.established,
                     &self.timeouts,
                     metadata.inactivity_timeout_ns,
                 )
@@ -1590,9 +1645,18 @@ fn remove_owner_rg_index_entry(
 /// closing/RST reap windows: a FIN/RST close still reaps on the short timeout
 /// so a closed session is not held open for a long custom idle value. When
 /// `None` the result is byte-identical to pre-#3227.
+///
+/// #3152: `established` is the TCP three-way-handshake completion state. A
+/// non-closing TCP session that has NOT completed its handshake (`false`,
+/// OPENING / half-open) is reaped on the short `tcp_opening_ns` window so a
+/// bare-SYN flood cannot pin half-open entries for the full established
+/// idle window. The per-app override and the established timeout apply only
+/// once the session is established. `established` is ignored for non-TCP
+/// protocols and for the closing branch.
 fn session_timeout_ns(
     protocol: u8,
     tcp_flags: u8,
+    established: bool,
     timeouts: &SessionTimeouts,
     app_override_ns: Option<u64>,
 ) -> u64 {
@@ -1608,6 +1672,12 @@ fn session_timeout_ns(
                 } else {
                     TCP_CLOSING_TIMEOUT_NS
                 }
+            } else if !established {
+                // #3152: handshake-incomplete (OPENING / half-open) — the
+                // short opening window. The per-app override does NOT apply
+                // here (it is the established-session idle timeout); a
+                // half-open session reaps fast regardless.
+                timeouts.tcp_opening_ns
             } else {
                 app_override_ns.unwrap_or(timeouts.tcp_established_ns)
             }
