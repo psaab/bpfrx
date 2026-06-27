@@ -317,6 +317,22 @@ cluster-scoped.
   during replay returns Err -> reconnect; during drain it withholds
   DrainComplete so the daemon times out and refuses demotion (#2876) rather
   than reporting a false drain.
+- **Control-frame payload cap (#2879).** `process_control_frames()` reads a
+  32-bit `payload_len` from each daemon→helper frame and waits for the full
+  `FRAME_HEADER_SIZE + payload_len` bytes before parsing. Every current
+  daemon→helper opcode (Ack/Pause/Resume/DrainRequest) is HEADER-ONLY (zero
+  payload), so `MAX_CONTROL_PAYLOAD_LEN` is `0`. Without a cap a buggy or
+  compromised local daemon sends a header with `payload_len = 1<<30` and
+  trickles bytes; the helper would keep extending `ctrl_read_buf` (consuming
+  nothing, since the frame never completes) and grow the heap without bound on
+  the **forwarding plane**. The parser validates `payload_len` on the header
+  alone (the loop guard guarantees a full 16-byte header) BEFORE waiting for
+  the rest of the frame: any `payload_len > MAX_CONTROL_PAYLOAD_LEN`
+  disconnects (returns `Some(true)` → reconnect, which clears `ctrl_read_buf`)
+  instead of buffering. A legitimately partial header-only frame still works —
+  `payload_len == 0` passes, and a split HEADER never reaches the check. The
+  constant is named so a future payload-carrying opcode raises it deliberately
+  rather than the parser honoring an arbitrary 32-bit length.
 - RT_FLOW dataplane telemetry producers must use
   `try_emit_dataplane_event_at()` (or, for a producer that builds its own
   frame layout such as the session-close/create frames,

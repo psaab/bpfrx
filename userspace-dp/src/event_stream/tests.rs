@@ -1998,3 +1998,105 @@ fn test_pause_start_clears_drain_poison_2875() {
         "MSG_PAUSE must clear stale drain poison (#2875)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2879 — daemon→helper control frames must have a bounded payload
+// ---------------------------------------------------------------------------
+
+// Build a control header with an arbitrary payload_len and opcode.
+fn build_ctrl_header(payload_len: u32, msg_type: u8) -> [u8; FRAME_HEADER_SIZE] {
+    let mut buf = [0u8; FRAME_HEADER_SIZE];
+    buf[0..4].copy_from_slice(&payload_len.to_le_bytes());
+    buf[4] = msg_type;
+    buf
+}
+
+// #2879 fail-on-revert guard: a daemon that declares payload_len = 1<<30 and
+// trickles bytes must be DISCONNECTED before the helper buffers the (never
+// completing) frame, so ctrl_read_buf cannot grow without bound. Reverting the
+// cap makes process_control_frames return (None, 0) — incomplete-frame break —
+// and the bytes accumulate -> this goes RED.
+#[test]
+fn test_oversized_control_payload_disconnects_2879() {
+    let shared = Arc::new(EventStreamShared::new());
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+
+    let mut ctrl: Vec<u8> = Vec::new();
+    ctrl.extend_from_slice(&build_ctrl_header(1u32 << 30, MSG_PAUSE));
+    // Trickle a few payload bytes — far short of 1<<30.
+    ctrl.extend_from_slice(&[0u8; 8]);
+
+    let (action, _consumed) =
+        process_control_frames(&ctrl, &shared, &rx, &sock_a, &mut replay_buf);
+    assert_eq!(
+        action,
+        Some(true),
+        "oversized payload_len must force a disconnect, not unbounded buffering (#2879)"
+    );
+    // The bogus PAUSE frame must NOT have been processed before the disconnect.
+    assert!(
+        !shared.paused.load(Ordering::Acquire),
+        "an invalid oversized frame must not be applied (#2879)"
+    );
+}
+
+// #2879: the current daemon→helper opcodes (Ack/Pause/Resume/DrainRequest) are
+// header-only; a NONZERO payload_len on any of them is invalid and must be
+// rejected (disconnect).
+#[test]
+fn test_nonzero_payload_on_header_only_opcodes_rejected_2879() {
+    let shared = Arc::new(EventStreamShared::new());
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+
+    for opcode in [MSG_ACK, MSG_PAUSE, MSG_RESUME, MSG_DRAIN_REQUEST] {
+        let mut ctrl: Vec<u8> = Vec::new();
+        // payload_len = 8 (nonzero) plus 8 payload bytes so the frame is fully
+        // present — proving the rejection is on the length, not on completeness.
+        ctrl.extend_from_slice(&build_ctrl_header(8, opcode));
+        ctrl.extend_from_slice(&[0u8; 8]);
+        let (action, _consumed) =
+            process_control_frames(&ctrl, &shared, &rx, &sock_a, &mut replay_buf);
+        assert_eq!(
+            action,
+            Some(true),
+            "nonzero payload on header-only opcode {opcode} must be rejected (#2879)"
+        );
+    }
+}
+
+// #2879 no-regression: a legitimate header-only control frame whose HEADER is
+// split across two reads must still parse once complete — the cap only rejects
+// an invalid payload_len, never a merely-incomplete header.
+#[test]
+fn test_split_header_only_frame_still_parses_2879() {
+    let shared = Arc::new(EventStreamShared::new());
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+
+    let header = build_ctrl_header(0, MSG_PAUSE); // header-only, zero payload
+    let mut ctrl: Vec<u8> = Vec::new();
+
+    // First read: only the first 8 bytes of the 16-byte header.
+    ctrl.extend_from_slice(&header[..8]);
+    let (action, consumed) =
+        process_control_frames(&ctrl, &shared, &rx, &sock_a, &mut replay_buf);
+    assert!(action.is_none(), "partial header must not disconnect (#2879)");
+    assert_eq!(consumed, 0, "partial header must not be consumed");
+    assert!(!shared.paused.load(Ordering::Acquire));
+
+    // Second read: the rest of the header arrives; the PAUSE now applies.
+    ctrl.extend_from_slice(&header[8..]);
+    let (action, consumed) =
+        process_control_frames(&ctrl, &shared, &rx, &sock_a, &mut replay_buf);
+    assert!(action.is_none());
+    assert_eq!(consumed, FRAME_HEADER_SIZE);
+    assert!(
+        shared.paused.load(Ordering::Acquire),
+        "a header-only frame split across reads must still parse (#2879)"
+    );
+}

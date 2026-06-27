@@ -139,6 +139,22 @@ const CHANNEL_CAPACITY: usize = 8192;
 /// Maximum frames retained for replay after disconnect.
 const REPLAY_BUFFER_CAPACITY: usize = 4096;
 
+/// Hard ceiling on any single daemon->helper control-frame payload (#2879).
+///
+/// `process_control_frames` reads a 32-bit `payload_len` from the wire and waits
+/// for `FRAME_HEADER_SIZE + payload_len` bytes before parsing. Every current
+/// daemon->helper opcode (Ack / Pause / Resume / DrainRequest) is HEADER-ONLY --
+/// zero payload -- so this is 0 today. Without a cap a buggy or compromised local
+/// daemon sends a header with `payload_len = 1<<30` and trickles bytes; the
+/// helper would keep extending `ctrl_read_buf` (consuming nothing, since the
+/// frame never completes) and grow the heap without bound on the forwarding
+/// plane. Any `payload_len` above this ceiling can never form a valid control
+/// frame, so the helper disconnects (reconnect resets `ctrl_read_buf`) instead
+/// of buffering. It is a NAMED constant so a future payload-carrying opcode
+/// raises it deliberately, rather than the parser silently honoring an arbitrary
+/// 32-bit length.
+const MAX_CONTROL_PAYLOAD_LEN: usize = 0;
+
 /// Hard cap on the I/O thread's pending socket-write backlog (`write_buf`).
 ///
 /// The bounded mpsc channel (`CHANNEL_CAPACITY`) is the only intended
@@ -1069,6 +1085,29 @@ fn process_control_frames(
             data[offset + 2],
             data[offset + 3],
         ]);
+        // #2879: reject an impossible payload_len BEFORE waiting for the rest of
+        // the frame. The full header is present (loop guard above), so we can
+        // validate the declared length on the header alone, regardless of how
+        // few payload bytes have arrived. Every current daemon->helper opcode is
+        // header-only, so any payload_len beyond MAX_CONTROL_PAYLOAD_LEN can
+        // never form a valid frame. Disconnecting (Some(true) -> reconnect,
+        // which clears ctrl_read_buf) stops a buggy/compromised daemon from
+        // trickling a 1<<30-length header and growing ctrl_read_buf without
+        // bound on the forwarding plane. A legitimately partial header-only
+        // frame still works: a payload_len of 0 passes here, and a split HEADER
+        // never reaches this point (the loop guard requires a full 16-byte
+        // header first). `offset` is returned so any complete frames parsed
+        // before the bad one are still accounted as consumed.
+        if payload_len as usize > MAX_CONTROL_PAYLOAD_LEN {
+            eprintln!(
+                "xpf-event-stream: control frame opcode {} declared payload_len={} \
+                 exceeds max {} -- disconnecting (#2879)",
+                data[offset + 4],
+                payload_len,
+                MAX_CONTROL_PAYLOAD_LEN
+            );
+            return (Some(true), offset);
+        }
         let frame_len = FRAME_HEADER_SIZE + payload_len as usize;
         if offset + frame_len > data.len() {
             break; // incomplete frame -- wait for more data

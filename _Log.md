@@ -21650,3 +21650,19 @@ top.
   pkg/dataplane/userspace/eventstream.go,
   pkg/dataplane/userspace/eventstream_test.go,
   pkg/dataplane/userspace/protocol.go
+
+- **Timestamp**: 2026-06-26
+  **Action**: #2875 + #2879 event-stream buffer robustness — paused-demotion
+  drain poison-on-session-eviction (withhold DrainComplete + emit FullResync;
+  poison set on session-delta eviction while paused in evict_replay_frame,
+  cleared at MSG_PAUSE and after the poisoned-drain resync) and a
+  daemon→helper control-frame payload cap (MAX_CONTROL_PAYLOAD_LEN=0, reject
+  any nonzero/oversized payload_len before buffering → disconnect; all current
+  opcodes are header-only). Added EventFrame::is_session_sync(). Also removed a
+  stray `stop:` field initializer in test_sender that broke the test build on
+  master. 6 new fail-on-revert tests.
+  **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  userspace-dp/src/event_stream/README.md,
+  docs/session-sync-design.md
