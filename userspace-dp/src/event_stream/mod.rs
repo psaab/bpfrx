@@ -234,6 +234,30 @@ struct EventStreamShared {
     acked_seq: AtomicU64,
     /// Set by Pause, cleared by Resume.
     paused: AtomicBool,
+    /// #2875: poison flag for the paused demotion drain. Set when a SESSION-SYNC
+    /// delta (`SessionOpen`/`SessionUpdate`/`SessionClose`) is evicted from the
+    /// bounded replay buffer at `REPLAY_BUFFER_CAPACITY` WHILE PAUSED.
+    ///
+    /// A paused drain is meant to be a lossless, stable window the future owner
+    /// reads before demotion completes (`docs/session-sync-design.md`). The
+    /// replay buffer is bounded, so a long pause that overruns it evicts the
+    /// oldest frames (bumping `frames_replay_evicted` only). If an evicted frame
+    /// is a session mutation, that mutation never reaches the new owner — yet
+    /// `handle_drain_request` would still report `DrainComplete` and demotion
+    /// would finish with lost sessions on the peer.
+    ///
+    /// When set, `handle_drain_request` WITHHOLDS `DrainComplete` and emits a
+    /// `FullResync` instead, forcing the daemon to re-export full session state
+    /// (the same recovery path as #2874 / the replay-gap resync). Telemetry
+    /// eviction does NOT set this — it must not trigger a spurious resync.
+    ///
+    /// Lifecycle: set on a session-frame eviction during pause
+    /// (`evict_replay_frame`); cleared at pause-start (`MSG_PAUSE`) so each
+    /// fresh pause window starts clean, and after a poisoned drain emits its
+    /// `FullResync` (window consumed — a later eviction re-poisons). NOT a
+    /// substitute for bounding the buffer: the fix is poison-on-loss, the buffer
+    /// stays bounded (no unbounded growth / memory DoS).
+    session_evicted_while_paused: AtomicBool,
     /// Raised once by `EventStreamSender::stop` (and `Drop`) to ask the I/O
     /// thread to exit. Lives in the shared state — rather than as a separately
     /// threaded `Arc<AtomicBool>` — so every I/O-thread function that already
@@ -286,6 +310,7 @@ impl EventStreamShared {
             next_seq: AtomicU64::new(0),
             acked_seq: AtomicU64::new(0),
             paused: AtomicBool::new(false),
+            session_evicted_while_paused: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             frames_sent: AtomicU64::new(0),
@@ -385,7 +410,6 @@ impl EventStreamSender {
                 tx,
                 shared,
                 io_thread: None,
-                stop: Arc::new(AtomicBool::new(false)),
             },
             rx,
         )
@@ -1105,6 +1129,12 @@ fn process_control_frames(
                 }
             }
             MSG_PAUSE => {
+                // #2875: a fresh pause window starts lossless. Clear any poison
+                // left from a previous drain so only an eviction WITHIN this
+                // pause window can withhold the upcoming DrainComplete.
+                shared
+                    .session_evicted_while_paused
+                    .store(false, Ordering::Release);
                 shared.paused.store(true, Ordering::Release);
                 eprintln!("xpf-event-stream: paused by daemon");
             }
@@ -1224,7 +1254,43 @@ fn handle_drain_request(
     } else {
         drained_up_to
     };
-    if reached_target && !write_failed {
+
+    // #2875: a SESSION-SYNC delta was evicted from the bounded replay buffer
+    // while paused, so this drain window is missing mutations the new owner
+    // needs. The drain is POISONED: it must NOT report DrainComplete (that
+    // would complete demotion with lost sessions on the peer). Checked AFTER
+    // the drain+write loops so an eviction during this drain's own
+    // push_replay_frame calls is also caught.
+    let session_evicted = shared
+        .session_evicted_while_paused
+        .load(Ordering::Acquire);
+
+    if session_evicted {
+        // Surface the poison the same way as #2874 / the replay-gap path: emit
+        // a FullResync so the daemon re-exports full session state. The
+        // daemon's SendDrainRequest receives no DrainComplete, times out, and
+        // refuses to proceed with demotion until the resync re-establishes
+        // state. Allocate a fresh seq (mirrors replay_buffered's resync).
+        let resync_seq = shared.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let resync_frame = EventFrame::encode_full_resync(resync_seq);
+        if let Err(e) =
+            write_all_backpressured(stream, resync_frame.as_bytes(), shared, write_deadline)
+        {
+            eprintln!("xpf-event-stream: drain-poison FullResync write error: {e}");
+        } else {
+            shared.frames_sent.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "xpf-event-stream: drain POISONED -- session delta evicted while paused; \
+                 sent FullResync seq {} instead of DrainComplete (demotion must full-resync)",
+                resync_seq
+            );
+        }
+        // Window consumed: clear so a later clean drain in this pause window can
+        // complete (a fresh session-frame eviction re-poisons).
+        shared
+            .session_evicted_while_paused
+            .store(false, Ordering::Release);
+    } else if reached_target && !write_failed {
         let complete_frame = EventFrame::encode_drain_complete(drain_seq);
         if let Err(e) =
             write_all_backpressured(stream, complete_frame.as_bytes(), shared, write_deadline)
@@ -1240,7 +1306,9 @@ fn handle_drain_request(
         shared.paused.store(true, Ordering::Release);
     }
 
-    if reached_target {
+    if session_evicted {
+        // Already logged above (poison + FullResync).
+    } else if reached_target {
         eprintln!("xpf-event-stream: drain complete up to seq {}", drain_seq);
     } else {
         eprintln!(
@@ -1367,10 +1435,23 @@ fn evict_replay_frame(
     replay_buf: &mut VecDeque<EventFrame>,
 ) -> Option<EventFrame> {
     let frame = pop_replay_frame(shared, replay_buf);
-    if frame.is_some() {
+    if let Some(evicted) = frame.as_ref() {
         shared
             .frames_replay_evicted
             .fetch_add(1, Ordering::Relaxed);
+        // #2875: evicting a SESSION-SYNC delta WHILE PAUSED loses a session
+        // mutation the future owner needs to take over cleanly. Poison the
+        // pending demotion drain so `handle_drain_request` withholds
+        // DrainComplete and forces a FullResync instead of silently
+        // completing demotion. Telemetry eviction is a tolerated loss and
+        // must NOT poison (no spurious resync). Read `paused` here so the
+        // poison fires for evictions both in the connected-loop paused drain
+        // and in the drain-request drain loop (both run while paused).
+        if evicted.is_session_sync() && shared.paused.load(Ordering::Acquire) {
+            shared
+                .session_evicted_while_paused
+                .store(true, Ordering::Release);
+        }
     }
     frame
 }

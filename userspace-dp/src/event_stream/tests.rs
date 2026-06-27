@@ -1844,3 +1844,157 @@ fn test_idle_keepalive_wouldblock_is_backpressure_not_reconnect_2883() {
     );
     drop(daemon_side);
 }
+
+// ---------------------------------------------------------------------------
+// #2875 — paused-demotion drain must not silently lose session-sync deltas
+// ---------------------------------------------------------------------------
+
+// Build a benign header-only TELEMETRY frame (RT_FLOW screen-drop type) so we
+// can prove that evicting it while paused does NOT poison the drain. Unlike
+// `replay_seq_frame` (a SESSION_OPEN), this msg_type is not a session-sync
+// delta, so `EventFrame::is_session_sync()` returns false for it.
+fn telemetry_seq_frame(seq: u64) -> EventFrame {
+    let mut data = [0u8; 256];
+    data[4] = super::codec::MSG_SCREEN_DROP;
+    data[8..16].copy_from_slice(&seq.to_le_bytes());
+    EventFrame {
+        data,
+        len: FRAME_HEADER_SIZE as u16,
+        seq,
+    }
+}
+
+// #2875 fail-on-revert guard: pause the helper, overrun the bounded replay
+// buffer so a SESSION-SYNC delta is evicted, then issue DrainRequest. The drain
+// MUST be poisoned — it withholds DrainComplete and emits a FullResync instead,
+// forcing the daemon to full-resync rather than complete demotion with lost
+// session mutations. Reverting the poison gate makes the helper emit
+// DrainComplete here -> this goes RED.
+#[test]
+fn test_paused_session_eviction_poisons_drain_2875() {
+    let (mut daemon_side, helper_side) = std::os::unix::net::UnixStream::pair().unwrap();
+    daemon_side
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let shared = Arc::new(EventStreamShared::new());
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+
+    // Fill the replay buffer to capacity with SESSION-SYNC deltas (no eviction
+    // yet: the buffer holds exactly REPLAY_BUFFER_CAPACITY frames).
+    for seq in 1..=REPLAY_BUFFER_CAPACITY as u64 {
+        push_replay_frame(&shared, &mut replay_buf, replay_seq_frame(seq));
+    }
+    assert_eq!(replay_buf.len(), REPLAY_BUFFER_CAPACITY);
+    assert!(!shared.session_evicted_while_paused.load(Ordering::Acquire));
+
+    // Demotion pause window begins, then one more session delta arrives and
+    // evicts the OLDEST session frame (seq 1) — a lost session mutation.
+    shared.paused.store(true, Ordering::Release);
+    push_replay_frame(
+        &shared,
+        &mut replay_buf,
+        replay_seq_frame(REPLAY_BUFFER_CAPACITY as u64 + 1),
+    );
+    assert!(
+        shared.session_evicted_while_paused.load(Ordering::Acquire),
+        "evicting a session delta while paused must poison the drain (#2875)"
+    );
+
+    // Keep tx alive so the drain loop sees Empty (not Disconnected) and reaches
+    // the fence via replay_buf.back().seq >= target.
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    handle_drain_request(5, &rx, &helper_side, &shared, &mut replay_buf);
+
+    // The daemon must observe a FullResync and NEVER a DrainComplete.
+    let mut saw_full_resync = false;
+    while let Some((msg_type, _seq)) = try_read_frame_header(&mut daemon_side) {
+        assert_ne!(
+            msg_type, MSG_DRAIN_COMPLETE,
+            "poisoned drain must NOT report DrainComplete (#2875 regression)"
+        );
+        if msg_type == MSG_FULL_RESYNC {
+            saw_full_resync = true;
+        }
+    }
+    assert!(
+        saw_full_resync,
+        "poisoned drain must emit a FullResync so the daemon full-resyncs (#2875)"
+    );
+    // Poison is consumed once the resync is sent.
+    assert!(!shared.session_evicted_while_paused.load(Ordering::Acquire));
+}
+
+// #2875: a TELEMETRY-only eviction while paused must NOT poison the drain — the
+// drain still completes normally (no spurious FullResync / FullResync storm).
+#[test]
+fn test_paused_telemetry_eviction_does_not_poison_drain_2875() {
+    let (mut daemon_side, helper_side) = std::os::unix::net::UnixStream::pair().unwrap();
+    daemon_side
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let shared = Arc::new(EventStreamShared::new());
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+
+    // Fill to capacity with TELEMETRY frames, then evict one while paused.
+    for seq in 1..=REPLAY_BUFFER_CAPACITY as u64 {
+        push_replay_frame(&shared, &mut replay_buf, telemetry_seq_frame(seq));
+    }
+    shared.paused.store(true, Ordering::Release);
+    push_replay_frame(
+        &shared,
+        &mut replay_buf,
+        telemetry_seq_frame(REPLAY_BUFFER_CAPACITY as u64 + 1),
+    );
+    assert!(
+        !shared.session_evicted_while_paused.load(Ordering::Acquire),
+        "telemetry eviction while paused must NOT poison the drain (#2875)"
+    );
+
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    handle_drain_request(5, &rx, &helper_side, &shared, &mut replay_buf);
+
+    // The drain must complete normally — DrainComplete present, no FullResync.
+    let mut saw_complete = false;
+    while let Some((msg_type, _seq)) = try_read_frame_header(&mut daemon_side) {
+        assert_ne!(
+            msg_type, MSG_FULL_RESYNC,
+            "telemetry eviction must not cause a spurious FullResync (#2875)"
+        );
+        if msg_type == MSG_DRAIN_COMPLETE {
+            saw_complete = true;
+        }
+    }
+    assert!(
+        saw_complete,
+        "non-poisoned drain must still report DrainComplete (#2875)"
+    );
+}
+
+// #2875: a fresh pause window must start lossless — MSG_PAUSE clears any poison
+// left by a previous drain so a stale flag cannot withhold this window's
+// DrainComplete.
+#[test]
+fn test_pause_start_clears_drain_poison_2875() {
+    let shared = Arc::new(EventStreamShared::new());
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+
+    // Simulate a leftover poison from a prior window.
+    shared
+        .session_evicted_while_paused
+        .store(true, Ordering::Release);
+
+    // A PAUSE control frame must clear it.
+    let mut pause = [0u8; FRAME_HEADER_SIZE];
+    pause[4] = MSG_PAUSE;
+    let (action, consumed) =
+        process_control_frames(&pause, &shared, &rx, &sock_a, &mut replay_buf);
+    assert!(action.is_none());
+    assert_eq!(consumed, FRAME_HEADER_SIZE);
+    assert!(shared.paused.load(Ordering::Acquire));
+    assert!(
+        !shared.session_evicted_while_paused.load(Ordering::Acquire),
+        "MSG_PAUSE must clear stale drain poison (#2875)"
+    );
+}

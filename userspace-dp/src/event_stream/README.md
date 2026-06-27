@@ -272,6 +272,25 @@ cluster-scoped.
   already-bounded replay buffer, never to `write_buf`. **Invariant: the
   data plane never stalls because a telemetry consumer is slow; a stuck
   consumer degrades telemetry (counted drops), nothing else.**
+- **Lossless-demotion fence for session deltas (#2875).** A paused drain is
+  the stable window the future owner reads before demotion completes
+  (`docs/session-sync-design.md`). The replay buffer is bounded, so a long
+  pause that overruns `REPLAY_BUFFER_CAPACITY` evicts the oldest frames —
+  and an evicted frame may be an HA session-sync delta
+  (`MSG_SESSION_OPEN`/`UPDATE`/`CLOSE`). Bumping `frames_replay_evicted` and
+  reporting `DrainComplete` anyway would finish demotion with **lost session
+  mutations on the new owner**. The fix is poison-on-loss, NOT an unbounded
+  buffer (that would be a memory DoS on the forwarding plane):
+  `evict_replay_frame()` sets `session_evicted_while_paused` when it evicts a
+  frame for which `EventFrame::is_session_sync()` is true AND the helper is
+  paused. `handle_drain_request()` then WITHHOLDS `DrainComplete` and emits a
+  `FullResync` instead, so the daemon re-exports full session state (the same
+  recovery path as #2874 / the replay-gap resync) and refuses to proceed with
+  demotion. **Telemetry eviction does NOT poison** (RT_FLOW deny/screen/filter
+  + session create/close frames return `is_session_sync() == false`) — that
+  would cause spurious resyncs. Lifecycle: set on a session-frame eviction
+  during pause; cleared at pause-start (`MSG_PAUSE`, so each window starts
+  clean) and after the poisoned drain emits its `FullResync`.
 - **Idle keepalive rides write_buf, not write_all (#2883).** The connected
   loop enqueues its idle keepalive frame into `write_buf` (the same path data
   frames use), so a `WouldBlock` on a full kernel send buffer is ordinary

@@ -628,6 +628,29 @@ demotion correctness to unrelated later-buffered frames. DrainComplete is still
 withheld entirely if the fence was never reached within the drain timeout
 (#2876) or a frame write failed against a stuck/stopping reader (#2877).
 
+**Lossless-demotion fence for session deltas (#2875).** A paused drain is the
+stable window the future owner reads before demotion completes, but the replay
+buffer is bounded (`REPLAY_BUFFER_CAPACITY`, 4096). A pause long enough to
+overrun the buffer evicts the oldest frames (the #2382 path), and an evicted
+frame may be an HA session-sync delta (`SessionOpen`/`SessionUpdate`/
+`SessionClose`). Reporting `DrainComplete` after such an eviction would finish
+demotion even though the evicted session mutation never reached the new owner —
+silent session loss on failover. The drain is therefore POISONED on any
+session-delta eviction during pause: `evict_replay_frame` sets
+`session_evicted_while_paused` when it evicts a frame whose
+`EventFrame::is_session_sync()` is true while the helper is paused, and
+`handle_drain_request` then WITHHOLDS `DrainComplete` and emits a `FullResync`
+(type 9) instead — the same recovery path as the reconnect replay-gap below.
+The daemon's `SendDrainRequest` receives no DrainComplete, times out, and
+refuses to proceed with demotion until the resync re-exports full session
+state. The fix is poison-on-loss, NOT an unbounded buffer (that would be a
+memory DoS on the forwarding plane). Telemetry eviction (RT_FLOW
+deny/screen/filter + session create/close frames) does NOT poison — those are
+not session-sync deltas, and poisoning on them would cause spurious resyncs.
+Poison lifecycle: set on session-frame eviction during pause; cleared at
+pause-start (`MSG_PAUSE`, so each fresh pause window starts clean) and after a
+poisoned drain emits its `FullResync`.
+
 ### Reconnect / Replay
 
 On disconnect, the helper retains its replay buffer (bounded, ~4096 events per

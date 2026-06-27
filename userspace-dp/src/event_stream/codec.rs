@@ -881,6 +881,21 @@ impl EventFrame {
         DataplaneEventKind::from_msg_type(self.data[4])
     }
 
+    /// True for the correctness-critical HA session-sync deltas
+    /// (`SessionOpen` / `SessionUpdate` / `SessionClose`). These mutate peer
+    /// session state on failover, so they must not be silently dropped from a
+    /// paused demotion drain window (#2875). Telemetry / RT_FLOW frames
+    /// (deny / screen / filter, RT_FLOW session create+close) return `false`:
+    /// evicting them is a tolerated telemetry loss, not a demotion-correctness
+    /// failure, and must not trigger a spurious FullResync. Same discriminator
+    /// (`data[4]` msg_type) the budget/release path keys on (#2874).
+    pub(super) fn is_session_sync(&self) -> bool {
+        matches!(
+            self.data[4],
+            MSG_SESSION_OPEN | MSG_SESSION_CLOSE | MSG_SESSION_UPDATE
+        )
+    }
+
     #[allow(dead_code)]
     pub(crate) fn decode_dataplane_event(&self) -> Option<DataplaneEventPayload> {
         decode_dataplane_event(self.data[4], self.dataplane_event_payload()?)
