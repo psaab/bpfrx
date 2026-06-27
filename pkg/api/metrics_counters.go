@@ -127,12 +127,14 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 	// M4). Junos collects per-policy hit counters only when policy-stats is
 	// enabled system-wide; without the knob the firewall does not maintain
 	// them. Mirror that: when PolicyStatsEnabled is false (the default), skip
-	// per-policy counter collection entirely so the stored-but-unenforced
-	// divergence is closed. The aggregate `policy_denies_total` counter is
-	// emitted separately (collectGlobalCounters) and is unaffected.
-	if !cfg.Security.PolicyStatsEnabled {
-		return
-	}
+	// per-policy counter collection so the stored-but-unenforced divergence
+	// is closed. #3074: a policy with an explicit `then count` modifier
+	// (`rule.Count`) opts into per-policy counting independent of the
+	// system-wide knob (Junos per-policy `count`), so emit its counter even
+	// when the global knob is off. The aggregate `policy_denies_total`
+	// counter is emitted separately (collectGlobalCounters) and is
+	// unaffected.
+	statsEnabled := cfg.Security.PolicyStatsEnabled
 
 	var policySetID uint32
 	for _, zpp := range cfg.Security.Policies {
@@ -140,6 +142,9 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 		toZone := zpp.ToZone
 		// Zone-pair compile output normalizes nil entries out of zpp.Policies.
 		for i, rule := range zpp.Policies {
+			if !statsEnabled && !rule.Count {
+				continue
+			}
 			policyID := policyCounterID(policySetID, i)
 			ctrs, err := dp.ReadPolicyCounters(policyID)
 			if err != nil {
@@ -153,6 +158,9 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 
 	for i, rule := range cfg.Security.GlobalPolicies {
 		if rule == nil {
+			continue
+		}
+		if !statsEnabled && !rule.Count {
 			continue
 		}
 		policyID := policyCounterID(policySetID, i)

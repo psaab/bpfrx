@@ -235,7 +235,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					// the counter is unavailable or the knob is off);
 					// overwrite only on a successful gated read.
 					hits := "0"
-					if statsEnabled && c.dp != nil && c.dp.IsLoaded() {
+					if (statsEnabled || pol.Count) && c.dp != nil && c.dp.IsLoaded() {
 						if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
 							hits = fmt.Sprintf("%d", counters.Packets)
 						}
@@ -259,7 +259,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					// Default to "0" for the same cross-surface
 					// consistency reason as the zone-pair branch above.
 					hits := "0"
-					if statsEnabled && c.dp != nil && c.dp.IsLoaded() {
+					if (statsEnabled || pol.Count) && c.dp != nil && c.dp.IsLoaded() {
 						if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
 							hits = fmt.Sprintf("%d", counters.Packets)
 						}

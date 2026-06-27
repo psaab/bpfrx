@@ -214,11 +214,13 @@ security {
 }
 
 // TestPoliciesHandlerGatesCountersOnPolicyStats verifies the #2118
-// display gate on the REST `GET /api/v1/security/policies` endpoint:
-// with a fully populated dataplane but `policy-stats` OFF, every rule's
-// hit_packets/hit_bytes are 0, matching the Prometheus collector and the
-// CLI/gRPC surfaces. Without the gate the same fixture (verified nonzero
-// by TestPoliciesHandlerExposesScheduledRuleCounters) would leak counts.
+// display gate AND the #3074 per-policy `then count` override on the REST
+// `GET /api/v1/security/policies` endpoint. With `policy-stats` OFF: a
+// rule WITHOUT `then count` (plain-allow) reports 0/0 (the gate), while a
+// rule WITH `then count` (scheduled-allow) reports its live counts —
+// `then count` opts the policy into per-policy counting independent of the
+// system-wide knob. Before #3074 `then count` was inert and every rule
+// read 0/0 with the knob off.
 func TestPoliciesHandlerGatesCountersOnPolicyStats(t *testing.T) {
 	store := newPolicyCounterAPIStoreNoStats(t)
 	policyID := scheduledCounterPolicyID(t, store)
@@ -227,7 +229,8 @@ func TestPoliciesHandlerGatesCountersOnPolicyStats(t *testing.T) {
 		dp: &schedulerCounterAPIDP{
 			Manager: dataplane.New(),
 			counters: map[uint32]dataplane.CounterValue{
-				1:        {Packets: 99, Bytes: 9900},
+				// plain-allow (no then count) occupies slot 0.
+				0:        {Packets: 99, Bytes: 9900},
 				policyID: {Packets: 17, Bytes: 1700},
 			},
 		},
@@ -247,12 +250,28 @@ func TestPoliciesHandlerGatesCountersOnPolicyStats(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
+	var sawScheduled, sawPlain bool
 	for _, policy := range resp.Data {
 		for _, rule := range policy.Rules {
-			if rule.HitPackets != 0 || rule.HitBytes != 0 {
-				t.Fatalf("policy %s->%s rule %q: counters = %d/%d, want 0/0 (policy-stats off)",
-					policy.FromZone, policy.ToZone, rule.Name, rule.HitPackets, rule.HitBytes)
+			switch rule.Name {
+			case "scheduled-allow":
+				sawScheduled = true
+				// #3074: then count -> exposed even with the knob off.
+				if rule.HitPackets != 17 || rule.HitBytes != 1700 {
+					t.Fatalf("scheduled-allow (then count) counters = %d/%d, want 17/1700 (policy-stats off)",
+						rule.HitPackets, rule.HitBytes)
+				}
+			case "plain-allow":
+				sawPlain = true
+				// M4/#2118 gate: no then count -> suppressed with knob off.
+				if rule.HitPackets != 0 || rule.HitBytes != 0 {
+					t.Fatalf("plain-allow (no then count) counters = %d/%d, want 0/0 (policy-stats off)",
+						rule.HitPackets, rule.HitBytes)
+				}
 			}
 		}
+	}
+	if !sawScheduled || !sawPlain {
+		t.Fatalf("policies missing from response (scheduled=%v plain=%v)", sawScheduled, sawPlain)
 	}
 }

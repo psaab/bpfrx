@@ -1,3 +1,26 @@
+## 2026-06-26 — #3074 wire per-policy `then count` to the display surfaces
+
+- **Timestamp**: 2026-06-26
+- **Action**: The Junos `security policies ... policy <p> then count` modifier
+  was parsed and stored (`Policy.Count`) but inert — the six per-policy
+  counter display surfaces gated solely on the system-wide
+  `policy-stats system-wide enable` knob, so a `then count` policy reported 0
+  unless the global knob was also on. Made `then count` a per-policy display
+  selector: every surface now admits the counter when
+  `statsEnabled || <policy>.Count`. REUSE-not-rebuild over #3073 — the Rust
+  per-rule counter is already always-on and per-packet, and the knob was never
+  read by the dataplane, so this is a Go-side display selection with NO new
+  Rust counter and NO wire field. A policy without `then count` keeps the
+  pre-#3074 behavior (0 with the knob off).
+- **File(s)**: pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/grpcapi/server_show_policies_text.go, pkg/grpcapi/server_show_zones.go,
+  pkg/api/security.go, pkg/api/metrics_counters.go,
+  pkg/cli/cli_show_policies_thencount_3074_test.go (new),
+  pkg/grpcapi/server_show_policies_thencount_3074_test.go (new),
+  pkg/api/metrics_test.go, pkg/api/policy_counters_test.go,
+  pkg/grpcapi/server_show_zones_test.go (gate tests made #3074-aware),
+  docs/feature-gaps.md.
+
 ## 2026-06-26 — #3122 count peer-synced sessions toward the per-IP session limit
 
 - **Timestamp**: 2026-06-26
