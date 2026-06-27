@@ -46,6 +46,76 @@
   `pkg/api/metrics_userspace.go`,
   `pkg/dataplane/userspace/format/status.go`,
   `pkg/dataplane/userspace/protocol_test.go`
+## 2026-06-26 — #3073 policy hit-count per-packet on the established fast path
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fixed `show security policies hit-count` reporting only the FIRST
+  frame of each flow. The per-rule packet/byte counter was incremented exactly
+  once per flow on the cold (session-miss) path in `try_match_rule`; the
+  established session fast path and flow-cache hit replay never re-counted the
+  admitting rule. Added a stable 1-based hit-counter handle
+  (`PolicyEvaluationResult.policy_counter_idx` → `SessionMetadata.policy_counter_idx`,
+  resolved by `PolicyState::hit_counter_by_idx`) stamped at install, and
+  re-count every established packet on both fast paths via a per-worker
+  thread-local coalescer (`record_policy_hit_counter` /
+  `flush_recorded_policy_hit_counters`, mirroring `filter::record_filter_counter`).
+  Cold path still counts the first packet once → exactly-once. Flow-cache seed
+  stamped with the real handle at population. Reverse traffic counts via the
+  reverse-companion/shared-materialize metadata inheritance. In-process only
+  (not on the HA wire yet, mirroring #3056). Coalescer flushed once per RX
+  batch beside the filter-counter flush.
+- **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+  userspace-dp/src/session/entry.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/{shared_ops,tunnel,neighbor_dispatch}.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs, userspace-dp/src/server/helpers.rs,
+  (+ test construction sites), docs/feature-gaps.md,
+  docs/pr/2118-policy-hit-count/plan.md, _Log.md
+- **Validation**: `cargo build --release` + `cargo test --release` (3184 passed,
+  0 failed) + `go build ./...`. Fail-on-revert: neutering
+  `record_policy_hit_counter` made
+  `policy_hit_count_counts_every_established_packet_not_just_first` read 1 (RED);
+  restored byte-identical.
+## 2026-06-26 — #2962 HA: owner-RG export ack-wait off the ServerState lock
+
+- **Timestamp**: 2026-06-26
+- **Action**: The control-socket dispatcher held the global
+  `Mutex<ServerState>` across the ENTIRE request `match`, including
+  `export_owner_rg_sessions`, whose `afxdp/ha.rs` ack-wait blocks up to 15 s
+  for every worker to ack the export sequence. A slow/stalled worker therefore
+  froze the whole control plane (status poll, session installs, snapshot/FIB
+  bumps, HA state updates) for up to 15 s — on the failover-critical path. Fix:
+  split the export into a locked KICK phase and a lock-free WAIT phase.
+  `Coordinator::kick_owner_rg_export` (under the lock) enqueues the
+  `ExportOwnerRGSessions` command to every worker, bumps `export_seq`, and
+  snapshots the lock-free handles the wait needs — the per-worker
+  `session_export_ack` atomics (`Arc<AtomicU64>`) and per-binding delta buffers
+  (`Arc<BindingLiveState>`) — returning an `OwnerRgExportWait`. The dispatcher
+  drops the `ServerState` lock, then runs `OwnerRgExportWait::wait_and_collect`
+  (the 15 s ack-wait + delta drain) off-lock, re-deriving status afterward under
+  a fresh short-lived lock. No TOCTOU: the worker set is mutated only by other
+  lock-holding handlers, so it is stable for the lock-free window; the worker
+  threads only advance monotonic ack atomics + push deltas (both Arc-shared,
+  lock-free). 15 s deadline + timeout error preserved verbatim. The old
+  single-call `export_owner_rg_sessions` wrapper was removed (unused after the
+  split). Tests (fail-on-revert proven): server-level
+  `export_owner_rg_does_not_hold_state_lock_during_ack_wait` (RED at
+  "status poll blocked 652ms ... lock held across the ack-wait" when the wait is
+  restored under the lock) + afxdp `kick_owner_rg_export_empty_set_is_noop...`
+  and `kick_owner_rg_export_enqueues_command_then_wait_completes_on_ack`. Added
+  a `#[cfg(test)]` `Coordinator::test_install_export_worker` seam. cargo
+  build/test (ha/export/server/session_glue) green.
+  **File(s)**: userspace-dp/src/afxdp/ha.rs,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/server/handlers/mod.rs,
+  userspace-dp/src/server/handlers/export.rs,
+  userspace-dp/src/server/tests.rs,
+  docs/session-sync-architecture.md
 
 ## 2026-06-26 — #2870 VRRP AF_PACKET receiver: ALLMULTI instead of PROMISC
 

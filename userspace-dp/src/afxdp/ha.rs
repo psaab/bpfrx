@@ -184,59 +184,68 @@ impl super::Coordinator {
         self.on_rg_promote_active();
     }
 
-    pub fn export_owner_rg_sessions(
-        &self,
-        owner_rgs: &[i32],
-        max: usize,
-    ) -> Result<Vec<SessionDeltaInfo>, String> {
+    /// Phase 1 of the owner-RG session export (#2962): enqueue the export
+    /// command to every worker and capture the lock-free handles the
+    /// ack-wait needs, then RETURN immediately. The blocking ack-wait runs
+    /// in [`OwnerRgExportWait::wait_and_collect`] AFTER the caller releases
+    /// the global `ServerState` mutex, so a slow/stalled worker can no
+    /// longer freeze the whole control plane (status poll, session
+    /// installs, snapshot/FIB bumps, HA state updates) for up to 15 s.
+    ///
+    /// This method MUST be called under the `ServerState` lock: it reads
+    /// `workers.handles` / `workers.live` and bumps `export_seq`. Those
+    /// collections are only mutated by other control-socket handlers, which
+    /// all hold the same lock, so snapshotting the per-worker ack atomics
+    /// (`Arc<AtomicU64>`) and the per-binding delta buffers
+    /// (`Arc<BindingLiveState>`) here is equivalent to re-reading them live:
+    /// the worker SET cannot change while the export waits lock-free
+    /// (no TOCTOU). The worker THREADS only bump their ack atomics and push
+    /// into their delta buffers — both `Arc`-shared and lock-free — so the
+    /// wait observes their progress without the global lock.
+    pub fn kick_owner_rg_export(&self, owner_rgs: &[i32], max: usize) -> OwnerRgExportWait {
+        // Snapshot the per-binding delta buffers (same Arcs as
+        // `drain_session_deltas` iterates) so the post-lock drain reads
+        // exactly the buffers that existed at kick time.
+        let live: Vec<Arc<BindingLiveState>> = self.workers.live.values().cloned().collect();
         if owner_rgs.is_empty() {
-            return Ok(Vec::new());
+            // Preserve the pre-split early return: no export is kicked and
+            // no sequence is consumed, and the wait drains nothing.
+            return OwnerRgExportWait {
+                sequence: 0,
+                max,
+                skip: true,
+                ack_atomics: Vec::new(),
+                live,
+            };
         }
         let sequence = self
-            .sessions.export_seq
+            .sessions
+            .export_seq
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
+        let mut ack_atomics = Vec::with_capacity(self.workers.handles.len());
         for handle in self.workers.handles.values() {
             // #1790/#1807: recover, don't early-return — one dead worker's
             // poisoned queue must not block session export for every
             // HEALTHY worker (the export-ack timeout handles dead workers
-            // at the caller). Same policy as update_ha_state above.
+            // in the wait). Same policy as update_ha_state above.
             let mut pending = worker_queue::lock_recover(&handle.commands);
             pending.push_back(WorkerCommand::ExportOwnerRGSessions {
                 sequence,
                 owner_rgs: owner_rgs.to_vec(),
             });
+            drop(pending);
+            ack_atomics.push(handle.session_export_ack.clone());
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            if self
-                .workers
-                .handles
-                .values()
-                .all(|handle| handle.session_export_ack.load(Ordering::Acquire) >= sequence)
-            {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out waiting for session export ack seq={sequence}"
-                ));
-            }
-            thread::sleep(Duration::from_millis(5));
+        OwnerRgExportWait {
+            sequence,
+            max,
+            skip: false,
+            ack_atomics,
+            live,
         }
-        let mut out = Vec::new();
-        let mut remaining = if max == 0 { usize::MAX } else { max.max(1) };
-        while remaining > 0 {
-            let batch_size = remaining.min(1024);
-            let drained = self.drain_session_deltas(batch_size);
-            if drained.is_empty() {
-                break;
-            }
-            remaining = remaining.saturating_sub(drained.len());
-            out.extend(drained);
-        }
-        Ok(out)
     }
+
 
     pub fn ha_groups(&self) -> Vec<HAGroupStatus> {
         let now_secs = monotonic_nanos() / 1_000_000_000;
@@ -621,6 +630,97 @@ impl super::Coordinator {
         );
         Ok(count)
     }
+}
+
+/// Lock-free handle returned by [`Coordinator::kick_owner_rg_export`] so
+/// the control-socket dispatcher can release the global `ServerState`
+/// mutex BEFORE blocking on the per-worker export ack-wait (#2962).
+///
+/// At construction the export command has already been enqueued to every
+/// worker; the only state the wait still needs is the per-worker ack
+/// atomics (`ack_atomics`) and the per-binding delta buffers (`live`),
+/// all `Arc`-shared and advanced by the worker threads without the global
+/// lock. Holding these `Arc` clones lets the wait + drain run entirely
+/// off the `ServerState` lock.
+pub struct OwnerRgExportWait {
+    sequence: u64,
+    max: usize,
+    /// `true` when no export was kicked (empty owner-RG set):
+    /// `wait_and_collect` returns an empty delta set without touching the
+    /// per-binding buffers, byte-identical to the pre-split early return.
+    skip: bool,
+    /// Per-worker `session_export_ack` atomics captured at kick time. The
+    /// worker SET is stable for the lock-free wait window (every mutator
+    /// holds the `ServerState` lock), so this snapshot is equivalent to
+    /// re-reading `workers.handles` live.
+    ack_atomics: Vec<Arc<AtomicU64>>,
+    /// Per-binding delta buffers (`workers.live` values) captured at kick
+    /// time; drained after all workers ack.
+    live: Vec<Arc<BindingLiveState>>,
+}
+
+impl OwnerRgExportWait {
+    /// Phase 2 of the owner-RG export (#2962): block up to 15 s for every
+    /// worker to ack the export sequence, then drain the produced session
+    /// deltas. Runs WITHOUT the global `ServerState` lock, so concurrent
+    /// control RPCs (status poll, session installs, snapshot/FIB bumps, HA
+    /// state updates) stay responsive while one export drains. Preserves
+    /// the original 15 s deadline and timeout error.
+    pub fn wait_and_collect(self) -> Result<Vec<SessionDeltaInfo>, String> {
+        if self.skip {
+            return Ok(Vec::new());
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if self
+                .ack_atomics
+                .iter()
+                .all(|ack| ack.load(Ordering::Acquire) >= self.sequence)
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for session export ack seq={}",
+                    self.sequence
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut out = Vec::new();
+        let mut remaining = if self.max == 0 { usize::MAX } else { self.max.max(1) };
+        while remaining > 0 {
+            let batch_size = remaining.min(1024);
+            let drained = drain_session_deltas_from_live(&self.live, batch_size);
+            if drained.is_empty() {
+                break;
+            }
+            remaining = remaining.saturating_sub(drained.len());
+            out.extend(drained);
+        }
+        Ok(out)
+    }
+}
+
+/// Drain up to `max` session deltas across the captured per-binding
+/// buffers. Mirrors `Coordinator::drain_session_deltas` exactly, but over
+/// an owned snapshot of the `Arc<BindingLiveState>` values so it needs no
+/// `&Coordinator` (and therefore no `ServerState` lock).
+fn drain_session_deltas_from_live(
+    live: &[Arc<BindingLiveState>],
+    max: usize,
+) -> Vec<SessionDeltaInfo> {
+    let mut remaining = max.max(1);
+    let mut out = Vec::new();
+    for binding in live {
+        if remaining == 0 {
+            break;
+        }
+        let drained = binding.drain_session_deltas(remaining);
+        remaining = remaining.saturating_sub(drained.len());
+        out.extend(drained);
+    }
+    out
 }
 
 #[cfg(test)]

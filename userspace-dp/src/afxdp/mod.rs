@@ -434,6 +434,11 @@ mod worker_queue;
 #[path = "worker_runtime.rs"]
 mod worker_runtime;
 pub use self::coordinator::Coordinator;
+// #2962: the lock-free owner-RG export wait handle. The control-socket
+// dispatcher (server/handlers) names this as the return type of
+// kick_owner_rg_export so it can run the blocking ack-wait off the
+// global ServerState lock.
+pub(crate) use self::ha::OwnerRgExportWait;
 // #1636: re-export the warmer types/consts into afxdp scope so the
 // neighbor-warmer loop in neighbor.rs (which uses `use super::*`) and
 // the unit tests can name them without a fully-qualified path.

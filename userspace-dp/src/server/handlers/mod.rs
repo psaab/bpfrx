@@ -101,6 +101,16 @@ pub(crate) fn handle_stream(
     let suppress_status = request.suppress_status;
     let neighbor_replace = request.neighbor_replace;
 
+    // #2962: the owner-RG session export must NOT block under the global
+    // ServerState lock. The locked `match` arm only KICKS the export
+    // (enqueues the per-worker command + captures the lock-free ack/delta
+    // handles); the blocking 15 s ack-wait runs here, AFTER the lock is
+    // dropped, so a slow/stalled worker can no longer freeze status polls,
+    // session installs, snapshot/FIB bumps, and HA state updates. When set,
+    // the post-match status attach is also deferred until after the wait so
+    // the reported status reflects the drained state.
+    let mut export_wait: Option<crate::afxdp::OwnerRgExportWait> = None;
+
     {
         let mut guard = state.lock().expect("server state poisoned");
         match request.request_type.as_str() {
@@ -173,12 +183,11 @@ pub(crate) fn handle_stream(
                 &mut response,
                 &mut persist_state,
             ),
-            "export_owner_rg_sessions" => export::owner_rg(
-                &mut guard,
-                request.session_export,
-                &mut response,
-                &mut persist_state,
-            ),
+            "export_owner_rg_sessions" => {
+                // #2962: locked phase only — enqueue + capture the wait
+                // handle. The blocking ack-wait runs after the lock drops.
+                export_wait = Some(export::owner_rg_kick(&mut guard, request.session_export));
+            }
             "export_all_sessions" => export::all(&mut guard, &mut response),
             "rebind" => rebind::handle(&mut guard, &mut persist_state),
             "stop_workers" => stop_workers::handle(&mut guard, &mut persist_state),
@@ -192,7 +201,23 @@ pub(crate) fn handle_stream(
                 response.error = format!("unknown request type {other}");
             }
         }
+        // #2962: defer status attach for the export verb — it is computed
+        // after the lock-free ack-wait below so it reflects the drained
+        // state (and is not produced while holding the lock across a wait).
+        if export_wait.is_none() && !suppress_status {
+            refresh_status(&mut guard);
+            response.status = Some(guard.status.clone());
+        }
+    }
+
+    // #2962: blocking owner-RG export ack-wait runs here, with the global
+    // ServerState lock RELEASED, so the control plane stays responsive while
+    // one export drains. Status is then re-derived under a fresh short-lived
+    // lock acquisition (the wait is already done).
+    if let Some(wait) = export_wait {
+        export::owner_rg_collect(wait, &mut response, &mut persist_state);
         if !suppress_status {
+            let mut guard = state.lock().expect("server state poisoned");
             refresh_status(&mut guard);
             response.status = Some(guard.status.clone());
         }

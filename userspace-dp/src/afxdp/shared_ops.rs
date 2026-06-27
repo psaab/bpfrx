@@ -676,6 +676,10 @@ pub(super) fn build_reverse_session_from_forward_match(
         // BPF-compat conntrack row.
         policy_id: forward_match.metadata.policy_id,
         inactivity_timeout_ns: None,
+        // #3073: inherit the admitting rule's hit-counter handle from the
+        // forward session so a materialized reverse companion's reply traffic
+        // counts against the same policy.
+        policy_counter_idx: forward_match.metadata.policy_counter_idx,
     };
     let decision = SessionDecision {
         resolution: redirect_session_resolution_for_metadata(forwarding, resolution, &metadata),

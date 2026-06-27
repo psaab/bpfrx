@@ -821,6 +821,10 @@ pub(crate) fn worker_loop(
             }
         }
         crate::filter::flush_recorded_filter_counters();
+        // #3073: fold this worker's coalesced policy hit-count tally into the
+        // shared counters once per RX batch (alongside the filter-counter
+        // flush) so `show security policies hit-count` converges within a tick.
+        crate::policy::flush_recorded_policy_hit_counters();
         #[cfg(feature = "debug-log")]
         {
             dbg.accumulate(&dbg_poll);
@@ -1281,6 +1285,8 @@ pub(crate) fn worker_loop(
         }
     }
     crate::filter::flush_recorded_filter_counters();
+    // #3073: final flush on worker exit (mirrors the filter-counter flush).
+    crate::policy::flush_recorded_policy_hit_counters();
     for binding in bindings.iter_mut() {
         clear_all_cos_exact_backlogs_for_binding(binding);
         release_all_cos_root_leases(binding);

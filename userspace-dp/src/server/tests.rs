@@ -16,8 +16,8 @@ use super::{handle_stream, ServerState};
 use crate::state_writer::StateWriter;
 use crate::{
     afxdp, BindingControlRequest, BindingStatus, ControlRequest, ControlResponse, ForwardingControlRequest,
-    HAGroupStatus, HAStateUpdateRequest, ProcessStatus, QueueControlRequest, SessionSyncRequest,
-    UserspaceCapabilities, MAX_CONTROL_REQUEST_BYTES,
+    HAGroupStatus, HAStateUpdateRequest, ProcessStatus, QueueControlRequest, SessionExportRequest,
+    SessionSyncRequest, UserspaceCapabilities, MAX_CONTROL_REQUEST_BYTES,
 };
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -1092,4 +1092,68 @@ fn wg1866_disarmed_same_plan_apply_does_not_hold_wg_ports() {
         exceptions, 0,
         "disarmed helper must not even attempt a WG bind (no transient spawn)"
     );
+}
+
+// --- #2962: owner-RG export must not hold the ServerState lock ----------
+
+/// Fail-on-revert: the owner-RG session export must run its blocking 15 s
+/// ack-wait WITHOUT holding the global `ServerState` lock, so a slow/stalled
+/// worker cannot freeze the rest of the control plane. This test installs a
+/// worker that never acks on its own, kicks an export (which blocks in
+/// `wait_and_collect`), and proves a concurrent `status` poll is still served
+/// promptly. If the wait runs under the lock again (the bug), the status poll
+/// blocks until the ack arrives and this assertion goes RED.
+#[test]
+fn export_owner_rg_does_not_hold_state_lock_during_ack_wait() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let state = new_state(ProcessStatus::default());
+
+    // Install a worker whose export ack never advances on its own. A timer
+    // thread acks it after 800ms so the export wait stays bounded in BOTH
+    // the fixed and the reverted code paths (no 15 s hang on revert).
+    let ack = {
+        let mut guard = state.lock().expect("lock state");
+        guard.afxdp.test_install_export_worker(0)
+    };
+    let ack_thread = {
+        let ack = ack.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(800));
+            ack.store(u64::MAX, Ordering::Release);
+        })
+    };
+
+    // Run the export in the background: it kicks under the lock, releases the
+    // lock, then blocks in the ack-wait until the timer thread acks (~800ms).
+    let export_state = state.clone();
+    let export_thread = std::thread::spawn(move || {
+        let mut r = req("export_owner_rg_sessions");
+        r.session_export = Some(SessionExportRequest {
+            owner_rgs: vec![1],
+            max: 0,
+        });
+        run_request(export_state, r)
+    });
+
+    // Let the export reach its wait.
+    std::thread::sleep(Duration::from_millis(150));
+
+    // The control plane MUST answer a status poll WHILE the export waits.
+    // With the lock held across the wait (the #2962 bug) this would block
+    // until the 800ms ack releases it (~650ms after t0).
+    let t0 = Instant::now();
+    let resp = run_request(state.clone(), req("status"));
+    let elapsed = t0.elapsed();
+    assert!(resp.ok, "status poll failed: {}", resp.error);
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "status poll blocked {elapsed:?} during owner-RG export — \
+         ServerState lock held across the ack-wait (#2962 regression)"
+    );
+
+    let export_resp = export_thread.join().expect("export thread");
+    assert!(export_resp.ok, "export failed: {}", export_resp.error);
+    ack_thread.join().expect("ack thread");
 }

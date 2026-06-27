@@ -851,10 +851,11 @@ drift) closed in `fix/2008-quickwins-batch1`:
   When `policy-stats system-wide enable` is absent (the default), all six
   report 0 per-rule counts; when set, they all report the same live counts.
   The raw read primitive (`Manager.ReadPolicyCounters`) and
-  `clear security policies hit-count` stay ungated by design. The Rust increment (`policy.rs` `try_match_rule`) stays
-  always-on (a single relaxed atomic) — the gate is display-only, so enabling
-  the knob surfaces counts that accrued while it was off, and no wire-format
-  change was needed. NOTE: the per-rule hit-count chain itself (increment →
+  `clear security policies hit-count` stay ungated by design. The Rust increment
+  (`policy.rs` `try_match_rule` for the first packet, plus the established
+  fast-path / flow-cache re-count added in #3073, see below) stays always-on —
+  the gate is display-only, so enabling the knob surfaces counts that accrued
+  while it was off, and no wire-format change was needed. NOTE: the per-rule hit-count chain itself (increment →
   coordinator snapshot → `policy_rule_counters` wire array → Go
   `ReadPolicyCounters`) was already intact and Go-unit-tested; #2118's "reads
   0" was the display-gate inconsistency above plus the smoke running with the
@@ -913,6 +914,30 @@ drift) closed in `fix/2008-quickwins-batch1`:
   per-policy counter assertion through the slice-index caller handle (the
   coverage the suite lacked — fail-on-revert against a span-accumulated
   resolver).
+- **Per-policy hit-count is PER-PACKET — FIXED (#3073).** Before #3073 the
+  per-rule packet/byte counter was incremented exactly once per flow — on the
+  cold (session-miss) path inside `policy.rs` `try_match_rule`. The established
+  session fast path and the flow-cache hit replay never re-counted the
+  admitting rule, so `show security policies hit-count` reflected only the
+  FIRST frame of each flow: a permitted TCP session moving millions of packets
+  reported `packets=1` and only the first frame's bytes, defeating audits and
+  vSRX parity. The fix stamps a stable 1-based hit-counter handle
+  (`SessionMetadata::policy_counter_idx`, resolved via
+  `PolicyState::hit_counter_by_idx`) onto the session at install and re-counts
+  every established packet against the admitting rule on both fast paths
+  (`poll_descriptor` session-hit + `flow_cache_hit`). The cold path still
+  counts the first packet once and `resolve_flow_session_decision` runs no
+  policy evaluation, so each packet is counted exactly once. Reverse (reply)
+  traffic counts against the same rule via the reverse-companion / shared
+  materialize metadata. The per-packet increment is coalesced in a per-worker
+  thread-local (`record_policy_hit_counter`) and folded into the shared counter
+  once per RX batch — the same technique `filter::record_filter_counter` uses —
+  so the hot path never touches the shared counter cacheline per packet. The
+  handle is in-process only (rides the shared-session map and worker replicas
+  but NOT the cross-node HA `SessionDeltaInfo` wire yet, mirroring the #3056
+  `policy_id` deferral): a peer-promoted session counts nothing on the
+  promoting node's policy counter until a local re-evaluation re-stamps a
+  handle.
 - **Per-policy hit-count reset semantics — INTENTIONAL Junos divergence
   (FLAGGED, behavior unchanged).** Junos resets per-policy hit counters on a
   commit that changes the policy. xpf PRESERVES counts across recompile as
