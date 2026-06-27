@@ -21932,3 +21932,17 @@ top.
   pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
   pkg/config/policy_zone_ref_test.go, pkg/config/README.md,
   docs/userspace-dataplane-architecture.md
+  **Action**: #3099 — replace the capped-exact-map session aggregator with a
+  Space-Saving (Metwally et al.) top-K counter set. K = defaultMaxAggKeys
+  (10000) per direction; map + min-heap keyed on bytes (O(log K) Add); each
+  counter carries (bytes,bytesErr) with the standard
+  bytes-bytesErr<=true<=bytes guarantee; bytes stay the ranking key; the
+  per-window overflow (eviction) count keeps surfacing on the
+  RT_FLOW_SESSION_AGGREGATE dropped-keys warning line. Top-K is now
+  arrival-order independent (a late heavy hitter evicts the min instead of
+  being dropped). Added fail-on-revert tests
+  (TestSessionAggregator_LateHeavyHitterArrivalOrder — RED on the old capped
+  map, TestSessionAggregator_SpaceSavingErrorGuarantee) and migrated
+  TestSessionAggregator_CardinalityCap to the new internals.
+  **File(s)**: pkg/logging/aggregator.go, pkg/logging/aggregator_test.go,
+  docs/phases.md, docs/feature-gaps.md

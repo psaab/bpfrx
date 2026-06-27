@@ -198,21 +198,22 @@ func TestSessionAggregator_Defaults(t *testing.T) {
 	}
 }
 
-// TestSessionAggregator_CardinalityCap is the #2936 fail-on-revert guard.
-// It drives more unique sources AND destinations than the cap through Add()
-// and asserts: (1) neither map ever exceeds the cap, (2) the dropped counters
-// increment by exactly (offered - cap), and (3) Flush still returns a valid
-// top-N over the admitted set. Reverting the cap (unbounded insert) turns this
-// RED: the maps grow past the cap and the dropped counters stay 0.
+// TestSessionAggregator_CardinalityCap is the #2936 bounded-memory guard,
+// carried over to the Space-Saving implementation (#3099). It drives more
+// unique sources AND destinations than K through Add() and asserts:
+// (1) neither counter set ever exceeds K, (2) the overflow (eviction) counters
+// increment by exactly (offered - K), and (3) Flush still returns a valid
+// top-N. Reverting to an unbounded structure turns this RED: the sets grow past
+// K and the overflow counters stay 0.
 func TestSessionAggregator_CardinalityCap(t *testing.T) {
-	const cap = 100
+	const k = 100
 	agg := NewSessionAggregator(time.Hour, 10)
-	agg.maxKeys = cap // small cap for the test; production uses defaultMaxAggKeys
+	agg.maxKeys = k // small K for the test; production uses defaultMaxAggKeys
 
-	const offered = cap + 250
+	const offered = k + 250
 	for i := 0; i < offered; i++ {
-		// Distinct source AND distinct destination per session so both maps
-		// are driven past the cap independently.
+		// Distinct source AND distinct destination per session so both sets
+		// are driven past K independently.
 		agg.Add(EventRecord{
 			Type:         "SESSION_CLOSE",
 			SrcAddr:      fmt.Sprintf("10.10.%d.%d:1234", i/256, i%256),
@@ -222,38 +223,38 @@ func TestSessionAggregator_CardinalityCap(t *testing.T) {
 	}
 
 	agg.mu.Lock()
-	srcLen := len(agg.srcs)
-	dstLen := len(agg.dsts)
-	droppedSrc := agg.droppedSrc
-	droppedDst := agg.droppedDst
+	srcLen := len(agg.srcs.minHeap)
+	dstLen := len(agg.dsts.minHeap)
+	droppedSrc := agg.srcs.overflow
+	droppedDst := agg.dsts.overflow
 	agg.mu.Unlock()
 
-	if srcLen > cap {
-		t.Errorf("src map exceeded cap: len=%d cap=%d (cap not enforced)", srcLen, cap)
+	if srcLen > k {
+		t.Errorf("src set exceeded K: len=%d K=%d (bound not enforced)", srcLen, k)
 	}
-	if dstLen > cap {
-		t.Errorf("dst map exceeded cap: len=%d cap=%d (cap not enforced)", dstLen, cap)
+	if dstLen > k {
+		t.Errorf("dst set exceeded K: len=%d K=%d (bound not enforced)", dstLen, k)
 	}
-	if srcLen != cap {
-		t.Errorf("expected src map at cap=%d, got %d", cap, srcLen)
+	if srcLen != k {
+		t.Errorf("expected src set at K=%d, got %d", k, srcLen)
 	}
-	if dstLen != cap {
-		t.Errorf("expected dst map at cap=%d, got %d", cap, dstLen)
+	if dstLen != k {
+		t.Errorf("expected dst set at K=%d, got %d", k, dstLen)
 	}
-	if want := uint64(offered - cap); droppedSrc != want {
-		t.Errorf("droppedSrc=%d, want exactly %d (offered-cap)", droppedSrc, want)
+	if want := uint64(offered - k); droppedSrc != want {
+		t.Errorf("src overflow=%d, want exactly %d (offered-K)", droppedSrc, want)
 	}
-	if want := uint64(offered - cap); droppedDst != want {
-		t.Errorf("droppedDst=%d, want exactly %d (offered-cap)", droppedDst, want)
+	if want := uint64(offered - k); droppedDst != want {
+		t.Errorf("dst overflow=%d, want exactly %d (offered-K)", droppedDst, want)
 	}
 
-	// Flush must still return a valid, bounded top-N over the admitted set.
+	// Flush must still return a valid, bounded top-N.
 	topSrc, topDst, fdSrc, fdDst := agg.flushWithDropped()
 	if len(topSrc) != 10 || len(topDst) != 10 {
-		t.Errorf("expected top-10 from admitted set, got src=%d dst=%d", len(topSrc), len(topDst))
+		t.Errorf("expected top-10, got src=%d dst=%d", len(topSrc), len(topDst))
 	}
-	if fdSrc != uint64(offered-cap) || fdDst != uint64(offered-cap) {
-		t.Errorf("flush dropped counts src=%d dst=%d, want %d", fdSrc, fdDst, offered-cap)
+	if fdSrc != uint64(offered-k) || fdDst != uint64(offered-k) {
+		t.Errorf("flush overflow counts src=%d dst=%d, want %d", fdSrc, fdDst, offered-k)
 	}
 	// top-N must be sorted by bytes descending.
 	for i := 1; i < len(topSrc); i++ {
@@ -262,12 +263,135 @@ func TestSessionAggregator_CardinalityCap(t *testing.T) {
 		}
 	}
 
-	// Flush resets the dropped counters for the next window.
+	// Flush resets the overflow counters for the next window.
 	agg.mu.Lock()
-	resetSrc, resetDst := agg.droppedSrc, agg.droppedDst
+	resetSrc, resetDst := agg.srcs.overflow, agg.dsts.overflow
 	agg.mu.Unlock()
 	if resetSrc != 0 || resetDst != 0 {
-		t.Errorf("dropped counters not reset after flush: src=%d dst=%d", resetSrc, resetDst)
+		t.Errorf("overflow counters not reset after flush: src=%d dst=%d", resetSrc, resetDst)
+	}
+}
+
+// TestSessionAggregator_LateHeavyHitterArrivalOrder is the #3099 fail-on-revert
+// guard for arrival-order independence — the core property Space-Saving buys
+// over the old capped-exact-map. It fills the counter set with K light keys
+// FIRST (so the set is full), THEN offers a single genuine heavy hitter whose
+// first session of the window arrives last. Space-Saving must evict the current
+// minimum counter and rank the heavy hitter in the top-K.
+//
+// Revert to the capped-exact-map aggregator and this goes RED: once the map is
+// full, the late heavy hitter is a NEW key, gets dropped, and never ranks — the
+// exact arrival-order dependence #3099 fixes.
+func TestSessionAggregator_LateHeavyHitterArrivalOrder(t *testing.T) {
+	const k = 4
+	agg := NewSessionAggregator(time.Hour, k)
+	agg.maxKeys = k
+
+	// Fill the set with K light keys (100 bytes each) so it is exactly full.
+	for i := 0; i < k; i++ {
+		agg.Add(EventRecord{
+			Type:         "SESSION_CLOSE",
+			SrcAddr:      fmt.Sprintf("10.0.0.%d:1234", i+1),
+			DstAddr:      "10.9.9.9:80",
+			SessionBytes: 100,
+		})
+	}
+
+	// The heavy hitter's FIRST session arrives only now — strictly after the
+	// set filled. Under the old cap it would be dropped; Space-Saving evicts the
+	// minimum (a 100-byte key) and the heavy hitter inherits that floor.
+	const heavyIP = "203.0.113.7"
+	agg.Add(EventRecord{
+		Type:         "SESSION_CLOSE",
+		SrcAddr:      heavyIP + ":1234",
+		DstAddr:      "10.9.9.9:80",
+		SessionBytes: 1_000_000,
+	})
+
+	topSrc, _ := agg.Flush()
+
+	var found bool
+	for _, e := range topSrc {
+		if e.IP == heavyIP {
+			found = true
+			if e.Bytes < 1_000_000 {
+				t.Errorf("heavy hitter bytes=%d, want >= 1000000", e.Bytes)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("late heavy hitter %s missing from top-K %+v "+
+			"(arrival-order dependence — old capped map would drop it)", heavyIP, topSrc)
+	}
+	// It is the heaviest key in the window, so it must rank first.
+	if topSrc[0].IP != heavyIP {
+		t.Errorf("expected heavy hitter %s ranked first, got %s", heavyIP, topSrc[0].IP)
+	}
+}
+
+// TestSessionAggregator_SpaceSavingErrorGuarantee verifies the Space-Saving
+// (count, error) bookkeeping invariant on a constructed high-cardinality
+// stream: for every monitored key, bytes-bytesErr <= true_bytes <= bytes, and
+// the reported byte total never under-estimates the truth. It also checks the
+// well-known property that any key with true bytes strictly greater than the
+// final minimum counter value MUST be retained (no true heavy hitter is lost).
+func TestSessionAggregator_SpaceSavingErrorGuarantee(t *testing.T) {
+	const k = 8
+	agg := NewSessionAggregator(time.Hour, k)
+	agg.maxKeys = k
+
+	// Build a stream with a handful of true heavy hitters interleaved with a
+	// long tail of distinct light keys, heavy hitters arriving throughout.
+	trueBytes := map[string]uint64{}
+	add := func(ip string, b uint64) {
+		agg.Add(EventRecord{Type: "SESSION_CLOSE", SrcAddr: ip + ":1", DstAddr: "10.0.0.1:80", SessionBytes: b})
+		trueBytes[ip] += b
+	}
+	heavy := []string{"10.1.1.1", "10.1.1.2", "10.1.1.3"}
+	for round := 0; round < 50; round++ {
+		// Light tail: a fresh distinct key each round (drives cardinality >> K).
+		add(fmt.Sprintf("172.16.%d.%d", round/256, round%256), 10)
+		// Heavy hitters keep arriving across the whole window.
+		for _, h := range heavy {
+			add(h, 1000)
+		}
+	}
+
+	agg.mu.Lock()
+	// Final minimum counter value across the monitored set.
+	var minBytes uint64 = ^uint64(0)
+	for _, c := range agg.srcs.minHeap {
+		if c.bytes < minBytes {
+			minBytes = c.bytes
+		}
+		// Per-key Space-Saving guarantee.
+		tb := trueBytes[c.ip]
+		if c.bytes < tb {
+			t.Errorf("key %s: reported bytes=%d under-estimates true=%d", c.ip, c.bytes, tb)
+		}
+		if c.bytes-c.bytesErr > tb {
+			t.Errorf("key %s: bytes-err=%d exceeds true=%d (error floor violated)",
+				c.ip, c.bytes-c.bytesErr, tb)
+		}
+	}
+	monitored := map[string]bool{}
+	for _, c := range agg.srcs.minHeap {
+		monitored[c.ip] = true
+	}
+	agg.mu.Unlock()
+
+	// No true heavy hitter (true bytes > final minimum) may be missing.
+	for ip, tb := range trueBytes {
+		if tb > minBytes && !monitored[ip] {
+			t.Errorf("key %s with true bytes=%d > min counter=%d was evicted (Space-Saving violation)",
+				ip, tb, minBytes)
+		}
+	}
+	// The three real heavy hitters must all be present and rank at the top.
+	for _, h := range heavy {
+		if !monitored[h] {
+			t.Errorf("true heavy hitter %s not retained", h)
+		}
 	}
 }
 
