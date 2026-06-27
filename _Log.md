@@ -1,3 +1,34 @@
+## 2026-06-26 — #2977 frr/policy: `then next-hop self` emits `neighbor next-hop-self`
+
+- **Timestamp**: 2026-06-26
+- **Action**: `then next-hop self` in a BGP export policy compiled to a silent
+  no-op in `pkg/frr/policy_render.go` (the `term.NextHop == "self"` branch
+  emitted nothing, on the false premise that eBGP rewrites next-hop to self by
+  default). That holds for eBGP but NOT for iBGP / route-reflector peers, where
+  the next-hop is preserved by default — so iBGP peers kept the original eBGP
+  next-hop, had no IGP path to it, and blackholed the prefixes. FRR has no
+  route-map `set ... next-hop self` clause (it is rejected and fails the whole
+  route-map), so the fix emits the canonical per-neighbor / per-address-family
+  `neighbor <peer> next-hop-self` knob in both AF neighbor loops, gated on a new
+  `policyStatementHasNextHopSelf` helper checking the neighbor's EFFECTIVE
+  EXPORT policy-statement (`bgpEffectiveExport`). The route-map `self` branch
+  still emits nothing (keeps the route-map valid). Added two fail-on-revert
+  tests (`TestGenerateProtocols_BGPExportNextHopSelf`,
+  `TestGenerateProtocols_BGPExportNoSpuriousNextHopSelf`) and updated
+  `pkg/frr/README.md`.
+- **Follow-up (review fold)**: emit `neighbor <peer> next-hop-self FORCE`
+  unconditionally at both AF sites. Plain `next-hop-self` rewrites ONLY
+  eBGP-learned routes; Junos `then next-hop self` rewrites ALL matched
+  routes including route-reflector-REFLECTED (iBGP-learned) ones, which xpf
+  supports (`cluster-id` + `route-reflector-client`). `force` overrides the
+  next-hop on reflected routes and is a harmless no-op for eBGP-learned
+  ones, so unconditional `force` is exact Junos parity. Updated the
+  existing test to assert `force` and added
+  `TestGenerateProtocols_BGPExportNextHopSelfRRClient` covering the RR-
+  client reflected-route case. README updated to note unconditional `force`.
+- **File(s)**: `pkg/frr/policy_render.go`, `pkg/frr/frr_test.go`,
+  `pkg/frr/README.md`, `_Log.md`
+
 ## 2026-06-26 — #2883 event-stream idle keepalive rides write_buf backpressure
 
 - **Timestamp**: 2026-06-26
