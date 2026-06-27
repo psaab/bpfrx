@@ -66,20 +66,37 @@ session is still keyed off the public-facing wire tuple (DNAT reverse
 source = the internal host with the translated port; reverse dst = the
 original external client).
 
-**NAT64 is excluded from this post-translation matching, by design.**
+#### Implemented (#2358): inbound NAT64 cross-family policy tuple
+
 NAT64 is a cross-family translation: the translated destination is IPv4
-while the flow source remains IPv6. xpf's policy matcher
-(`policy.rs::evaluate_policy`) requires the source and destination of the
-match to be the SAME address family — a mixed `(V6 src, V4 dst)` tuple
-matches no rule and falls to default-deny. Feeding the extracted IPv4
-destination into the policy match would therefore break ALL NAT64
-connectivity rather than fix it. NAT64 keeps its historical behavior:
-the policy is matched on the synthetic IPv6 destination (the only
-same-family tuple available at the policy-eval site), so NAT64 security
-policy must be written against the synthetic IPv6 destination prefix.
-Making NAT64 policy match the real IPv4 server is a larger, separate
-design change (cross-family policy matching) and is intentionally NOT
-part of #2345.
+while the flow source remains IPv6. Before #2358 xpf's policy matcher
+required the source and destination to be the SAME address family, so a
+mixed `(V6 src, V4 dst)` tuple matched no rule — NAT64 policy had to be
+written against the synthetic IPv6 destination prefix, diverging from
+Junos/SRX (where inbound destination translation precedes the policy
+lookup and the policy matches the real internal IPv4 host).
+
+As of #2358 `policy.rs::try_match_rule` has a dedicated `(V6 src, V4
+dst)` match arm: the source side is matched against the rule's IPv6
+source set and the destination side against the rule's IPv4 destination
+set. The forwarding path (`poll_descriptor`) feeds the POST-translation
+tuple for NAT64 — the v6 client source plus the extracted real IPv4
+destination — exactly as the same-family translations do (#2345). The
+destination zone (`to_zone_id`) was already derived from the translated
+IPv4 destination (`effective_resolution_target`), so only the
+address-tuple half needed correcting. The reverse `(V4 src, V6 dst)`
+tuple (NAT46, unsupported) still fails closed.
+
+**Migration:** NAT64 inbound policy is now authored against the real
+internal IPv4 host address + its destination zone, with the source
+matched in the IPv6 ingress zone — NOT the synthetic IPv6 NAT64 prefix.
+Policies previously written against the synthetic prefix no longer match.
+Note: the legacy address-set parse convention treats a destination set
+with no IPv4 prefix and no `any-ipv4` wildcard as IPv4 match-any, so
+scope the destination to the real IPv4 host explicitly to avoid an
+unintended match-all. Only the ForwardCandidate (primary) NAT64 path
+classifies NAT64 and feeds the v4 tuple; the MissingNeighbor cold path
+does not classify NAT64 and is not the NAT64 forwarding path.
 
 ### 2. Add end-to-end coverage
 Add explicit tests for:

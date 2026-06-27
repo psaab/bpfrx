@@ -37,6 +37,65 @@
   userspace-dp/src/session/install.rs, userspace-dp/src/session/lookup.rs,
   userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md
 
+## 2026-06-26 — #2358 NAT64 inbound cross-family policy matching
+
+- **Timestamp**: 2026-06-26
+- **Action**: Inbound NAT64 security policy now evaluates the
+  POST-translation tuple (v6 client source in the IPv6 ingress zone, real
+  internal IPv4 destination in the destination zone), matching Junos/SRX
+  order-of-operations and composing with the same-family #2345
+  DNAT/static-DNAT/NPTv6 post-translation matching. Added a dedicated
+  cross-family `(V6 src, V4 dst)` arm to `policy.rs::try_match_rule`
+  (source matched against the rule's IPv6 source set, destination against
+  the IPv4 destination set; `*-excluded` empty-set fail-closed and
+  per-family any-match semantics mirror the same-family arms; reverse
+  `(V4 src, V6 dst)` NAT46 still fails closed). Changed the
+  ForwardCandidate `policy_dst_ip` to feed `effective_resolution_target`
+  (the extracted real IPv4 dst) for NAT64 instead of the synthetic
+  `flow.dst_ip`. Updated the MissingNeighbor comment (that arm does not
+  classify NAT64). Added 5 policy tests (matches-real-v4,
+  source-any-to-v4, wrong-v4-host-denies, wrong-v6-source-denies,
+  NAT46-never-matches); verified fail-on-revert (matches-real-v4 flips to
+  Deny when the cross-family arm is removed). Full cargo suite green
+  (3153+46+8+16+1, 0 fail, 2 ignored). Docs: twice-nat.md NAT64 section
+  flipped excluded->implemented with migration note, feature-gaps.md +
+  userspace-dataplane-gaps.md NAT64 rows updated.
+- **File(s)**: userspace-dp/src/policy.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/policy_tests.rs, docs/next-features/twice-nat.md,
+  docs/feature-gaps.md, docs/userspace-dataplane-gaps.md
+
+## 2026-06-26 — #3233 NPTv6: skip the word fixup for a checksum-neutral prefix pair
+
+- **Timestamp**: 2026-06-26
+- **Action**: `adjust_word` unconditionally folded a result of `0xFFFF` to
+  `0x0000` per the RFC 6296 ones-complement convention, and the translator
+  applied it to the interface-ID word (word[3] for /48, word[4] for /64)
+  regardless of the adjustment value. For a checksum-neutral prefix pair
+  (internal and external prefixes with equal ones-complement sums) the
+  precomputed adjustment is ones-complement ZERO and no word fixup is needed,
+  yet the fold still fired: outbound collapsed a host whose adjustment word was
+  `0xFFFF` to `0x0000`, and the inbound side never restored it — so the
+  `0xFFFF` host collided with the `0x0000` host (return traffic misdelivered,
+  `0xFFFF` host unreachable). Fix: added `is_zero_adjustment` and SKIP
+  `adjust_word` in both `translate_outbound`/`translate_inbound` when the
+  adjustment is ones-complement zero, leaving the interface-ID word identity (a
+  checksum-neutral pair is already neutral under a pure prefix swap). NOTE: the
+  issue text said `adjustment == 0`, but `compute_adjustment` represents
+  ones-complement zero as `0xFFFF` (negative zero: `S + !S = 0xFFFF`) and NEVER
+  the literal `0x0000` — the corrected trigger is `0xFFFF` (both accepted
+  defensively). The RFC-6296-mandated `0xFFFF -> 0x0000` fold is unchanged for
+  the general (non-neutral, adjustment != ones-complement-zero) case, and the
+  prefix swap itself is unchanged in all cases. Isolated to nptv6.rs translate
+  functions; the #3121 L4 checksum path keys off the `nat.nptv6` flag, not the
+  adjustment value, so it is untouched.
+- **File(s)**: userspace-dp/src/nptv6.rs, userspace-dp/src/nptv6_tests.rs,
+  docs/feature-coverage.md, _Log.md
+- **Validation**: `cargo build --release` clean; `cargo test --release` full
+  suite 3224 passed / 0 failed. Fail-on-revert proven: reverting the
+  adjustment==zero skip turns `checksum_neutral_0xffff_host_word_survives_outbound`,
+  `checksum_neutral_0xffff_and_0x0000_hosts_stay_distinct`, and
+  `checksum_neutral_round_trip_preserves_0xffff_host` RED.
 ## 2026-06-26 — #2749 doc fold: event_stream README payload 144 -> 152
 
 - **Timestamp**: 2026-06-26
