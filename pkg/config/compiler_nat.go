@@ -840,6 +840,138 @@ func parseZoneList(node *Node) []string {
 	return zones
 }
 
+// natMatchScope is one (kind, value) scope token from a NAT rule-set
+// `from`/`to` clause. kind is one of "zone" | "interface" |
+// "routing-instance" (#3096).
+type natMatchScope struct {
+	kind  string
+	value string
+}
+
+// natScopeKinds is the set of from/to scope keywords a NAT rule-set clause can
+// carry. Order matters only for deterministic emission, not precedence.
+var natScopeKinds = []string{"zone", "interface", "routing-instance"}
+
+// parseNATMatchScopes generalizes parseZoneList (#3096): it extracts every
+// from/to scope token — `zone`, `interface`, AND `routing-instance` — from a
+// from/to clause node in both AST shapes the parser produces, instead of
+// dropping the non-zone kinds:
+//
+//   - Inline: the `from`/`to` node carries the scope on its own Keys, e.g.
+//     Keys=["from","interface","ge-0/0/1.0"] or the bracket-collapsed
+//     Keys=["from","zone","A","B"] (#2419).
+//   - Child-leaf / hierarchical: one child per scope kind, each
+//     Keys=["interface","ge-0/0/1.0"] (with bracket lists collapsed onto the
+//     child's Keys, plus defensive orphan grandchildren — mirroring
+//     parseZoneList / firewallMatchValues).
+//
+// Junos restricts a single from/to clause to ONE kind; xpf accumulates
+// whatever is present so a hostile mixed-kind clause is captured (and AND-ed
+// fail-closed at match time) rather than silently dropped.
+func parseNATMatchScopes(node *Node) []natMatchScope {
+	var out []natMatchScope
+	// Inline shape: `from`/`to` carries the scope on its own Keys.
+	if len(node.Keys) >= 3 {
+		for _, kind := range natScopeKinds {
+			if node.Keys[1] == kind {
+				for _, v := range node.Keys[2:] {
+					if v != "" {
+						out = append(out, natMatchScope{kind: kind, value: v})
+					}
+				}
+			}
+		}
+	}
+	// Child-leaf shape: one child per scope token.
+	for _, child := range node.Children {
+		kind := child.Name()
+		isScope := false
+		for _, k := range natScopeKinds {
+			if k == kind {
+				isScope = true
+				break
+			}
+		}
+		if !isScope {
+			continue
+		}
+		// Unified bracket list / single value: every token after the kind.
+		for _, v := range child.Keys[1:] {
+			if v != "" {
+				out = append(out, natMatchScope{kind: kind, value: v})
+			}
+		}
+		// Defensive: older trees split the bracket list into orphan leaf
+		// grandchildren.
+		for _, grandchild := range child.Children {
+			if grandchild.IsLeaf && len(grandchild.Keys) >= 1 && grandchild.Keys[0] != "" {
+				out = append(out, natMatchScope{kind: kind, value: grandchild.Keys[0]})
+			}
+		}
+	}
+	return out
+}
+
+// collectNATScopes reads the `from` (and, when wantTo, `to`) clauses of a
+// rule-set node into from/to scope lists. An empty side defaults to a single
+// match-any zone scope ({kind:"zone", value:""}) — the legacy global
+// behaviour. #3096.
+func collectNATScopes(rsNode *Node, wantTo bool) (fromScopes, toScopes []natMatchScope) {
+	for _, child := range rsNode.Children {
+		switch child.Name() {
+		case "from":
+			fromScopes = append(fromScopes, parseNATMatchScopes(child)...)
+		case "to":
+			if wantTo {
+				toScopes = append(toScopes, parseNATMatchScopes(child)...)
+			}
+		}
+	}
+	if len(fromScopes) == 0 {
+		fromScopes = []natMatchScope{{kind: "zone", value: ""}}
+	}
+	if wantTo && len(toScopes) == 0 {
+		toScopes = []natMatchScope{{kind: "zone", value: ""}}
+	}
+	return fromScopes, toScopes
+}
+
+// applyNATFromScope stamps a from-scope onto a NATRuleSet's typed fields.
+func applyNATFromScope(rs *NATRuleSet, s natMatchScope) {
+	switch s.kind {
+	case "interface":
+		rs.FromInterface = s.value
+	case "routing-instance":
+		rs.FromRoutingInstance = s.value
+	default: // "zone"
+		rs.FromZone = s.value
+	}
+}
+
+// applyNATToScope stamps a to-scope onto a NATRuleSet's typed fields.
+func applyNATToScope(rs *NATRuleSet, s natMatchScope) {
+	switch s.kind {
+	case "interface":
+		rs.ToInterface = s.value
+	case "routing-instance":
+		rs.ToRoutingInstance = s.value
+	default: // "zone"
+		rs.ToZone = s.value
+	}
+}
+
+// applyStaticNATFromScope stamps a from-scope onto a StaticNATRuleSet.
+func applyStaticNATFromScope(rs *StaticNATRuleSet, s natMatchScope) {
+	switch s.kind {
+	case "interface":
+		rs.FromInterface = s.value
+	case "routing-instance":
+		rs.FromRoutingInstance = s.value
+	default: // "zone"
+		rs.FromZone = s.value
+	}
+}
+
 // expandAddressRange expands "low/mask to high/mask" into individual IP strings.
 // Both low and high must be /32 CIDRs. Max 256 IPs.
 func expandAddressRange(low, high string) ([]string, error) {
@@ -1155,24 +1287,11 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 
 	// Parse source NAT rule-sets
 	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
-		// Parse from/to zones (bracket lists produce multiple keys)
-		var fromZones, toZones []string
-		for _, child := range rsInst.node.Children {
-			if child.Name() == "from" {
-				fromZones = append(fromZones, parseZoneList(child)...)
-			}
-			if child.Name() == "to" {
-				toZones = append(toZones, parseZoneList(child)...)
-			}
-		}
-		if len(fromZones) == 0 {
-			fromZones = []string{""}
-		}
-		if len(toZones) == 0 {
-			toZones = []string{""}
-		}
+		// #3096: capture from/to scope across zone | interface |
+		// routing-instance (bracket lists produce multiple scopes).
+		fromScopes, toScopes := collectNATScopes(rsInst.node, true)
 
-		// Parse rules (shared across all zone-pair expansions)
+		// Parse rules (shared across all scope-pair expansions)
 		var rules []*NATRule
 		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
 			rule := &NATRule{Name: ruleInst.name}
@@ -1272,15 +1391,15 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 			rules = append(rules, rule)
 		}
 
-		// Expand Cartesian product of from-zones × to-zones
-		for _, fz := range fromZones {
-			for _, tz := range toZones {
+		// Expand Cartesian product of from-scopes × to-scopes (#3096).
+		for _, fs := range fromScopes {
+			for _, ts := range toScopes {
 				rs := &NATRuleSet{
-					Name:     rsInst.name,
-					FromZone: fz,
-					ToZone:   tz,
-					Rules:    rules,
+					Name:  rsInst.name,
+					Rules: rules,
 				}
+				applyNATFromScope(rs, fs)
+				applyNATToScope(rs, ts)
 				sec.NAT.Source = append(sec.NAT.Source, rs)
 			}
 		}
@@ -1317,22 +1436,9 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 
 	// Parse rule-sets
 	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
-		// Parse from/to zones (bracket lists produce multiple keys)
-		var fromZones, toZones []string
-		for _, child := range rsInst.node.Children {
-			if child.Name() == "from" {
-				fromZones = append(fromZones, parseZoneList(child)...)
-			}
-			if child.Name() == "to" {
-				toZones = append(toZones, parseZoneList(child)...)
-			}
-		}
-		if len(fromZones) == 0 {
-			fromZones = []string{""}
-		}
-		if len(toZones) == 0 {
-			toZones = []string{""}
-		}
+		// #3096: capture from/to scope across zone | interface |
+		// routing-instance (bracket lists produce multiple scopes).
+		fromScopes, toScopes := collectNATScopes(rsInst.node, true)
 
 		var rules []*NATRule
 		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
@@ -1405,15 +1511,15 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 			rules = append(rules, rule)
 		}
 
-		// Expand Cartesian product of from-zones × to-zones
-		for _, fz := range fromZones {
-			for _, tz := range toZones {
+		// Expand Cartesian product of from-scopes × to-scopes (#3096).
+		for _, fs := range fromScopes {
+			for _, ts := range toScopes {
 				rs := &NATRuleSet{
-					Name:     rsInst.name,
-					FromZone: fz,
-					ToZone:   tz,
-					Rules:    rules,
+					Name:  rsInst.name,
+					Rules: rules,
 				}
+				applyNATFromScope(rs, fs)
+				applyNATToScope(rs, ts)
 				sec.NAT.Destination.RuleSets = append(sec.NAT.Destination.RuleSets, rs)
 			}
 		}
@@ -1533,18 +1639,11 @@ func staticNATMappedPortFromKeys(keys []string) int {
 
 func compileNATStatic(node *Node, sec *SecurityConfig) error {
 	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
-		// Parse from zones (bracket lists produce multiple keys)
-		var fromZones []string
-		for _, child := range rsInst.node.Children {
-			if child.Name() == "from" {
-				fromZones = append(fromZones, parseZoneList(child)...)
-			}
-		}
-		if len(fromZones) == 0 {
-			fromZones = []string{""}
-		}
+		// #3096: capture from scope across zone | interface |
+		// routing-instance (static NAT has no `to` clause).
+		fromScopes, _ := collectNATScopes(rsInst.node, false)
 
-		// Parse rules (shared across all zone expansions)
+		// Parse rules (shared across all scope expansions)
 		var rules []*StaticNATRule
 		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
 			rule := &StaticNATRule{Name: ruleInst.name}
@@ -1618,13 +1717,13 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 			rules = append(rules, rule)
 		}
 
-		// Expand for each from-zone
-		for _, fz := range fromZones {
+		// Expand for each from-scope (#3096).
+		for _, fs := range fromScopes {
 			rs := &StaticNATRuleSet{
-				Name:     rsInst.name,
-				FromZone: fz,
-				Rules:    rules,
+				Name:  rsInst.name,
+				Rules: rules,
 			}
+			applyStaticNATFromScope(rs, fs)
 			sec.NAT.Static = append(sec.NAT.Static, rs)
 		}
 	}

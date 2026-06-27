@@ -760,6 +760,8 @@ pub(super) fn static_nat_snapshot() -> ConfigSnapshot {
             counter_id: 0,
             name: "web-server".to_string(),
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
             match_destination_port: 0,

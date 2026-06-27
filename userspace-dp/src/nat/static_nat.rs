@@ -6,12 +6,35 @@ use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
+/// #3096: does a static-NAT rule's `from` scope (zone + interface +
+/// routing-instance, each empty = wildcard) match the packet's context on the
+/// relevant direction? All present constraints are AND-ed.
+#[inline]
+fn static_scope_ok(
+    from_zone: &str,
+    from_interface: &str,
+    from_routing_instance: &str,
+    zone: &str,
+    ifname: &str,
+    routing_instance: &str,
+) -> bool {
+    (from_zone.is_empty() || from_zone == zone)
+        && (from_interface.is_empty() || from_interface == ifname)
+        && (from_routing_instance.is_empty() || from_routing_instance == routing_instance)
+}
+
 /// Static 1:1 NAT entry (bidirectional).
 #[derive(Clone, Debug)]
 pub(crate) struct StaticNatEntry {
     pub(crate) external_ip: IpAddr,
     pub(crate) internal_ip: IpAddr,
     pub(crate) from_zone: String,
+    /// #3096: interface-/routing-instance scope. The static-NAT `from` clause
+    /// is gated against the INGRESS interface/VRF on the inbound (DNAT)
+    /// direction and against the EGRESS interface/VRF on the reverse (SNAT)
+    /// direction — symmetric with `from_zone`. Empty = unscoped on that axis.
+    pub(crate) from_interface: String,
+    pub(crate) from_routing_instance: String,
     /// #2491: external (pre-translation) destination port the inbound packet
     /// must carry for a port-mapped rule. `None` = whole-address 1:1 (match
     /// any port, the legacy behaviour).
@@ -59,6 +82,9 @@ pub(crate) struct StaticNatBlock {
     /// Rule's `from zone` external-zone constraint (empty = any zone),
     /// gated exactly like the host entry's `from_zone`.
     from_zone: String,
+    /// #3096: interface-/routing-instance scope, gated like the host entry.
+    from_interface: String,
+    from_routing_instance: String,
     /// Per-rule translation hit counter (#2218); None for counter_id 0.
     hit_counter: Option<Arc<NatRuleCounter>>,
 }
@@ -236,6 +262,8 @@ impl StaticNatTable {
                     external: ext_prefix,
                     internal: int_prefix,
                     from_zone: snap.from_zone.clone(),
+                    from_interface: snap.from_interface.clone(),
+                    from_routing_instance: snap.from_routing_instance.clone(),
                     hit_counter: nat_counters.rule_counter(snap.counter_id),
                 });
                 continue;
@@ -258,6 +286,8 @@ impl StaticNatTable {
                 external_ip,
                 internal_ip,
                 from_zone: snap.from_zone.clone(),
+                from_interface: snap.from_interface.clone(),
+                from_routing_instance: snap.from_routing_instance.clone(),
                 match_dst_port,
                 mapped_port,
                 hit_counter: nat_counters.rule_counter(snap.counter_id),
@@ -323,10 +353,36 @@ impl StaticNatTable {
         dst_port: u16,
         ingress_zone: &str,
     ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
-        // Per-candidate zone gate: an entry matches only when its zone
-        // constraint is empty (any zone) or equals the packet's ingress zone.
+        // Unscoped wrapper: empty interface/RI scope = wildcard (pre-#3096
+        // behavior). Tests and zone-only callers use this; the production
+        // transit path uses the *_scoped variant.
+        self.match_dnat_with_counter_scoped(dst_ip, dst_port, ingress_zone, "", "")
+    }
+
+    /// #3096: as [`match_dnat_with_counter`] but additionally gates each
+    /// candidate on the static-NAT rule's `from interface` /
+    /// `from routing-instance` scope against the packet's INGRESS interface
+    /// config-name and routing-instance. Empty scope fields are wildcards, so
+    /// a zone-only or global static-NAT rule is unaffected.
+    pub(crate) fn match_dnat_with_counter_scoped(
+        &self,
+        dst_ip: IpAddr,
+        dst_port: u16,
+        ingress_zone: &str,
+        ingress_ifname: &str,
+        ingress_routing_instance: &str,
+    ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
+        // Per-candidate gate: an entry matches only when its zone AND
+        // interface AND routing-instance constraints all hold (empty = any).
         let zone_ok = |entry: &&StaticNatEntry| {
-            entry.from_zone.is_empty() || entry.from_zone == ingress_zone
+            static_scope_ok(
+                &entry.from_zone,
+                &entry.from_interface,
+                &entry.from_routing_instance,
+                ingress_zone,
+                ingress_ifname,
+                ingress_routing_instance,
+            )
         };
         // Port-specific entry takes precedence over the whole-address entry,
         // but only if its OWN zone check passes. On a port miss OR a
@@ -355,8 +411,14 @@ impl StaticNatTable {
         // carries only `rewrite_dst` (an `IpAddr`), so the existing host
         // static-NAT checksum fixup path applies unchanged.
         for blk in &self.blocks {
-            if (blk.from_zone.is_empty() || blk.from_zone == ingress_zone)
-                && blk.external.contains(dst_ip)
+            if static_scope_ok(
+                &blk.from_zone,
+                &blk.from_interface,
+                &blk.from_routing_instance,
+                ingress_zone,
+                ingress_ifname,
+                ingress_routing_instance,
+            ) && blk.external.contains(dst_ip)
             {
                 if let Some(translated) = remap_addr(dst_ip, &blk.external, &blk.internal) {
                     return Some((
@@ -419,15 +481,38 @@ impl StaticNatTable {
         src_port: u16,
         egress_zone: &str,
     ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
-        // #2871: per-candidate egress-zone gate, the SNAT-direction analog of
-        // the #2864 DNAT ingress-zone gate. An entry matches only when its
-        // external-zone constraint is empty (any zone) or equals the packet's
-        // egress (destination) zone. Evaluate the zone PER CANDIDATE so a
-        // port-specific entry whose zone does not match falls back to the
-        // whole-address entry (validated on its own zone) rather than
-        // short-circuiting to None.
+        // Unscoped wrapper: empty interface/RI scope = wildcard (pre-#3096).
+        self.match_snat_with_counter_scoped(src_ip, src_port, egress_zone, "", "")
+    }
+
+    /// #3096: as [`match_snat_with_counter`] but additionally gates each
+    /// candidate on the static-NAT rule's `from interface` /
+    /// `from routing-instance` scope against the packet's EGRESS interface
+    /// config-name and routing-instance — the SNAT-direction analog of the
+    /// DNAT ingress gate (the rule's `from` external context is matched on
+    /// egress for the reverse translation, symmetric with #2871's egress-zone
+    /// gate). Empty scope fields are wildcards.
+    pub(crate) fn match_snat_with_counter_scoped(
+        &self,
+        src_ip: IpAddr,
+        src_port: u16,
+        egress_zone: &str,
+        egress_ifname: &str,
+        egress_routing_instance: &str,
+    ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
+        // #2871 / #3096: per-candidate egress gate — zone AND interface AND
+        // routing-instance must all hold (empty = any). Evaluate PER CANDIDATE
+        // so a port-specific entry whose scope does not match falls back to the
+        // whole-address entry rather than short-circuiting to None.
         let zone_ok = |entry: &&StaticNatEntry| {
-            entry.from_zone.is_empty() || entry.from_zone == egress_zone
+            static_scope_ok(
+                &entry.from_zone,
+                &entry.from_interface,
+                &entry.from_routing_instance,
+                egress_zone,
+                egress_ifname,
+                egress_routing_instance,
+            )
         };
         if let Some(entry) = self
             .snat
@@ -454,8 +539,14 @@ impl StaticNatTable {
         // same offset in the external prefix, so the return path's source is
         // un-NAT'd to the public block and the reverse session key matches.
         for blk in &self.blocks {
-            if (blk.from_zone.is_empty() || blk.from_zone == egress_zone)
-                && blk.internal.contains(src_ip)
+            if static_scope_ok(
+                &blk.from_zone,
+                &blk.from_interface,
+                &blk.from_routing_instance,
+                egress_zone,
+                egress_ifname,
+                egress_routing_instance,
+            ) && blk.internal.contains(src_ip)
             {
                 if let Some(translated) = remap_addr(src_ip, &blk.internal, &blk.external) {
                     return Some((

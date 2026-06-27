@@ -442,32 +442,48 @@ interim commit reject (`validatePolicyWildcardZoneStrict` and its
 elsewhere in a policy (`match source-address any` / `match application any`) are
 unaffected.
 
-**NAT rule-set `from`/`to` `interface`/`routing-instance` scope is rejected at
-commit (#3079, interim):** Junos NAT rule-sets scope matched traffic with a
-`from`/`to` clause taking one of `zone | interface | routing-instance`. xpf's
-compiler only ever extracted the `zone` children (`parseZoneList`,
-`compiler_nat.go`), so an `interface`- or `routing-instance`-scoped rule-set
-COMMITTED cleanly but had its scope SILENTLY DISCARDED: every caller
-(`compileNATSource` / `compileNATDestination` / `compileNATStatic`) falls back to
-the match-any wildcard `[]string{""}` when the returned zone list is empty, so the
-rule-set applied GLOBALLY — translated sessions leaked across the routing boundary
-the operator drew (a security/isolation failure, not a cosmetic gap).
-`validateNATRuleSetScopeAST` (`compiler_nat_scope.go`) hard-rejects such a
-rule-set at commit, naming the NAT kind, rule-set, direction, the unsupported
-keyword, and its value. It is an AST pre-walk in `compileExpanded` (not a typed
-validator) because the scope keyword is exactly what the compiler drops — by the
-time the typed `*Config` exists the information is gone — and because
-`SchemaValidate` returns nil for unknown keywords by design and cannot REJECT
-`from interface ...`. This is the INTERIM contract: full interface-/
-routing-instance-scoped NAT matching (preserve the scope on the typed
-`NATRuleSet`, enforce it per-flow) is a substantial dataplane change deferred to a
-follow-up. The gate touches ONLY the NAT rule-set from/to scope — not the
-supported `from`/`to` `zone` scope, the legitimate global (no-from/to) case, nor
-the unrelated `interface`/`routing-instance` keywords elsewhere (real interface
-config, VRF definitions). The tolerant load/peer-sync path downgrades to a warning
-(`lenientNATRuleSetScope`) so an already-persisted or peer-synced config an older
-binary silently accepted still boots — it stays applied globally (the pre-existing
-behaviour), now flagged (#1960 no-brick doctrine, same as #3018/#3055/#3060).
+**NAT rule-set `from`/`to` `interface`/`routing-instance` scope is fully
+enforced (#3096, lifts the #3079/#3095 interim reject):** Junos NAT rule-sets
+scope matched traffic with a `from`/`to` clause taking one of `zone | interface
+| routing-instance`. xpf originally extracted only the `zone` children, so an
+`interface`- or `routing-instance`-scoped rule-set committed cleanly but had its
+scope SILENTLY DISCARDED and applied GLOBALLY (translated sessions leaked across
+the routing boundary — a security/isolation failure); #3095 made that an interim
+commit reject (`validateNATRuleSetScopeAST`). #3096 implements the full path:
+
+- **Capture.** `parseNATMatchScopes` / `collectNATScopes` (`compiler_nat.go`,
+  generalizing the old `parseZoneList`) read `zone`, `interface`, AND
+  `routing-instance` from both AST shapes (inline + child-leaf, bracket lists
+  collapsed). The from/to scope lists Cartesian-expand into one
+  `NATRuleSet` / `StaticNATRuleSet` per (from-scope, to-scope) pair, mirroring
+  the existing from-zone × to-zone expansion.
+- **Typed model.** `NATRuleSet` gains `FromInterface`/`ToInterface`/
+  `FromRoutingInstance`/`ToRoutingInstance`; `StaticNATRuleSet` gains
+  `FromInterface`/`FromRoutingInstance` (static NAT has only a `from` clause).
+  Exactly one of zone/interface/routing-instance is non-empty per side for a
+  scoped rule-set; all-empty = match-any (global), the unchanged legacy case.
+- **Snapshot + dataplane match.** The scope plumbs through the userspace
+  snapshot (`from_interface`/`to_interface`/`from_routing_instance`/
+  `to_routing_instance`, additive #1961 wire fields) and is enforced per-flow in
+  the Rust match path: `SourceNatRule::matches` AND-s the scope against the
+  flow's ingress (`from_*`) / egress (`to_*`) interface config-name and routing
+  instance; DNAT (`nat/destination.rs`) and static NAT (`nat/static_nat.rs`)
+  gate on the ingress identity (and, for static NAT's reverse SNAT direction,
+  the egress identity — symmetric with the #2871 egress-zone gate). The Rust
+  forwarding layer resolves each ifindex to its config name and VRF via
+  `ifindex_to_config_name` / `ifindex_to_routing_instance`.
+
+The `from`/`to` `zone` scope and the legitimate global (no-from/to) case are
+unchanged. Cross-rule-set context-specificity ordering (Junos evaluates
+interface- before zone- before routing-instance-scoped rule-sets) is NOT
+implemented — xpf keeps first-match-in-list across the flat rule list, identical
+to the pre-#3096 zone behavior. NPTv6 rule-sets under `security nat static`
+ignore the `from` scope entirely (zone, interface, AND routing-instance) — a
+pre-existing limitation of the stateless prefix-indexed NPTv6 translator, not a
+regression introduced by lifting the reject. The `validateNATRuleSetScopeAST`
+gate and its `lenientNATRuleSetScope` opt are removed; `interface`/
+`routing-instance` are now declared under the NAT rule-set `from`/`to` in
+`schema_security.go` for commit-time validation and CLI completion.
 
 **Unsupported security-policy `match` leaves are rejected at commit (#3113,
 interim):** Junos SRX security policies match traffic with a rich `match`
@@ -498,7 +514,7 @@ a follow-up. The tolerant load/peer-sync path downgrades to a warning
 (`lenientPolicyMatchLeaves`) so an already-persisted or peer-synced config an
 older binary silently accepted still boots — the leaf stays dropped (the
 pre-existing behaviour), now flagged (#1960 no-brick doctrine, same as
-#3079/#3055/#3060).
+#3018/#3055/#3060).
 
 The #3113 gate originally inspected only the DIRECT children of `match`, which
 left a multi-value-leaf ESCAPE (#3142, codex-review-067 finding 067-01). `match

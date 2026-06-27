@@ -472,6 +472,7 @@ impl super::Coordinator {
         let mut counter = None;
         crate::nat::match_source_nat_result_for_tuple(
             &self.forwarding.source_nat_rules,
+            &crate::nat::NatScopeCtx::default(),
             from_zone,
             to_zone,
             src_ip,

@@ -321,11 +321,22 @@ type NAT64RuleSet struct {
 	SourcePool string // IPv4 source pool name for translated packets
 }
 
-// StaticNATRuleSet is a set of static 1:1 NAT rules bound to a zone.
+// StaticNATRuleSet is a set of static 1:1 NAT rules bound to a from scope.
+// Junos static NAT has only a `from` clause (no `to`). The scope is one of
+// zone | interface | routing-instance (#3096); exactly one of FromZone /
+// FromInterface / FromRoutingInstance is non-empty for a scoped rule-set, and
+// all three empty means match-any (global). The compiler Cartesian-expands a
+// bracket list of scope values into one StaticNATRuleSet per value.
 type StaticNATRuleSet struct {
 	Name     string
 	FromZone string
-	Rules    []*StaticNATRule
+	// FromInterface scopes the rule-set to traffic ingressing this logical
+	// interface (config name, e.g. "ge-0/0/1.0"). "" = unscoped. #3096.
+	FromInterface string
+	// FromRoutingInstance scopes the rule-set to traffic in this routing
+	// instance / VRF. "" = the default instance / unscoped. #3096.
+	FromRoutingInstance string
+	Rules               []*StaticNATRule
 }
 
 // DestinationNATConfig holds destination NAT pools and rule sets.
@@ -334,12 +345,28 @@ type DestinationNATConfig struct {
 	RuleSets []*NATRuleSet
 }
 
-// NATRuleSet is a set of NAT rules bound to a zone pair.
+// NATRuleSet is a set of NAT rules bound to a from/to scope pair. Each scope
+// side is one of zone | interface | routing-instance (Junos #3096); within a
+// side exactly one of the *Zone / *Interface / *RoutingInstance fields is
+// non-empty for a scoped rule-set, and all-empty means match-any (global) on
+// that side. The compiler Cartesian-expands a bracket list of scope values
+// into one NATRuleSet per (from-scope, to-scope) pair, mirroring the existing
+// from-zone × to-zone expansion.
 type NATRuleSet struct {
 	Name     string
 	FromZone string
 	ToZone   string
-	Rules    []*NATRule
+	// FromInterface / ToInterface scope the rule-set to traffic
+	// ingressing / egressing this logical interface (config name, e.g.
+	// "ge-0/0/1.0"). "" = unscoped on that side. #3096.
+	FromInterface string
+	ToInterface   string
+	// FromRoutingInstance / ToRoutingInstance scope the rule-set to traffic
+	// in this routing instance / VRF on ingress / egress. "" = the default
+	// instance / unscoped. #3096.
+	FromRoutingInstance string
+	ToRoutingInstance   string
+	Rules               []*NATRule
 }
 
 // NATRule is a single NAT rule.

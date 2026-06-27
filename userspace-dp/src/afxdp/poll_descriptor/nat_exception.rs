@@ -24,6 +24,7 @@ use super::*;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn source_nat_decision_for_flow(
     forwarding: &ForwardingState,
+    ingress_ifindex: i32,
     from_zone: &str,
     to_zone: &str,
     egress_ifindex: i32,
@@ -39,21 +40,33 @@ pub(super) fn source_nat_decision_for_flow(
     matched_counter: &mut Option<std::sync::Arc<crate::nat::NatRuleCounter>>,
 ) -> Result<NatDecision, SourceNatFailure> {
     *matched_counter = None;
+    // #3096: resolve the interface / routing-instance scope for this flow once
+    // (cold path). The static-NAT reverse (SNAT) direction matches the rule's
+    // `from` external context on EGRESS, so it uses the egress identity.
+    let scope = super::super::forwarding::nat_scope_ctx_for_flow(
+        forwarding,
+        ingress_ifindex,
+        egress_ifindex,
+    );
     // #2871: static-NAT reverse (source) translation is gated on the EGRESS
     // (destination) zone matching the rule's external `from zone`, mirroring
     // the #2864 DNAT ingress-zone gate. Pass `to_zone` (where the packet is
     // headed), NOT `from_zone` — an outbound packet from a static-NAT internal
     // IP destined for another internal zone must NOT be source-translated.
-    if let Some((decision, counter)) = forwarding.static_nat.match_snat_with_counter(
+    // #3096: the interface / routing-instance scope is matched on egress too.
+    if let Some((decision, counter)) = forwarding.static_nat.match_snat_with_counter_scoped(
         flow.src_ip,
         flow.forward_key.src_port,
         to_zone,
+        scope.egress_ifname,
+        scope.egress_routing_instance,
     ) {
         *matched_counter = counter;
         return Ok(decision);
     }
     match match_source_nat_for_flow_result_at(
         forwarding,
+        ingress_ifindex,
         from_zone,
         to_zone,
         egress_ifindex,

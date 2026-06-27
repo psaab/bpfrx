@@ -50,6 +50,11 @@ pub(super) fn populate_interfaces(
         state
             .ifindex_to_config_name
             .insert(iface.ifindex, iface.name.clone());
+        // #3096: record the interface's routing instance for NAT rule-set
+        // `from`/`to routing-instance` scope matching ("" = default VRF).
+        state
+            .ifindex_to_routing_instance
+            .insert(iface.ifindex, iface.routing_instance.clone());
         name_to_ifindex.insert(iface.name.clone(), iface.ifindex);
         if !iface.linux_name.is_empty() {
             linux_to_ifindex.insert(iface.linux_name.clone(), iface.ifindex);

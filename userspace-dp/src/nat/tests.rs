@@ -27,6 +27,7 @@ fn interface_source_nat_matches_v4_rule() {
     }]);
     let decision = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.61.102".parse().expect("src"),
@@ -56,6 +57,7 @@ fn interface_source_nat_matches_v6_rule() {
     }]);
     let decision = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "2001:559:8585:ef00::100".parse().expect("src"),
@@ -86,6 +88,7 @@ fn off_rule_short_circuits_translation() {
     assert_eq!(
         match_source_nat(
             &rules,
+            &NatScopeCtx::default(),
             "lan",
             "wan",
             "10.0.61.102".parse().expect("src"),
@@ -118,6 +121,7 @@ fn snat_all_malformed_source_match_fails_closed_v4() {
     }]);
     let decision = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.61.102".parse().expect("src"),
@@ -145,6 +149,7 @@ fn snat_all_malformed_source_match_fails_closed_v6() {
     }]);
     let decision = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "2001:559:8585:ef00::100".parse().expect("src"),
@@ -174,6 +179,7 @@ fn snat_all_malformed_destination_match_fails_closed_v4() {
     }]);
     let decision = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.61.102".parse().expect("src"),
@@ -207,6 +213,7 @@ fn snat_all_malformed_destination_match_fails_closed_v6() {
     }]);
     let decision = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "2001:559:8585:ef00::100".parse().expect("src"),
@@ -236,6 +243,7 @@ fn snat_bare_host_destination_match_scopes_v4() {
     // Traffic to the configured destination host is translated.
     let hit = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.61.102".parse().expect("src"),
@@ -255,6 +263,7 @@ fn snat_bare_host_destination_match_scopes_v4() {
     // Traffic to a different destination is NOT translated (scope held).
     let miss = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.61.102".parse().expect("src"),
@@ -282,6 +291,7 @@ fn snat_bare_host_destination_match_scopes_v6() {
     }]);
     let hit = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "2001:559:8585:ef00::100".parse().expect("src"),
@@ -300,6 +310,7 @@ fn snat_bare_host_destination_match_scopes_v6() {
     );
     let miss = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "2001:559:8585:ef00::100".parse().expect("src"),
@@ -331,6 +342,7 @@ fn snat_bare_host_source_match_scopes_v4() {
     // Configured host is translated.
     let hit = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.61.102".parse().expect("src"),
@@ -350,6 +362,7 @@ fn snat_bare_host_source_match_scopes_v4() {
     // A different host is NOT translated (scope held, not match-any).
     let miss = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.61.200".parse().expect("other src"),
@@ -376,6 +389,7 @@ fn snat_bare_host_source_match_scopes_v6() {
     }]);
     let hit = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "2001:559:8585:ef00::100".parse().expect("src"),
@@ -394,6 +408,7 @@ fn snat_bare_host_source_match_scopes_v6() {
     );
     let miss = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "2001:559:8585:ef00::200".parse().expect("other src"),
@@ -420,6 +435,7 @@ fn snat_unscoped_still_translates_all_sources() {
     for src in ["10.0.61.5", "192.0.2.7", "10.0.99.250"] {
         let decision = match_source_nat(
             &rules,
+            &NatScopeCtx::default(),
             "lan",
             "wan",
             src.parse().expect("src"),
@@ -454,6 +470,7 @@ fn snat_valid_scoped_translates_only_matching() {
     }]);
     let hit = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.61.50".parse().expect("in-subnet"),
@@ -464,6 +481,7 @@ fn snat_valid_scoped_translates_only_matching() {
     assert!(hit.is_some(), "in-subnet source must be translated");
     let miss = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.62.50".parse().expect("out-of-subnet"),
@@ -494,6 +512,7 @@ fn snat_mixed_valid_and_malformed_keeps_valid() {
     // Valid prefix still matches.
     let hit = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.61.7".parse().expect("in valid subnet"),
@@ -508,6 +527,7 @@ fn snat_mixed_valid_and_malformed_keeps_valid() {
     // Out-of-prefix source is not translated (no match-any leak from the garbage).
     let miss = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.62.7".parse().expect("out of valid subnet"),
@@ -550,6 +570,8 @@ fn static_nat_dnat_matches_external_ip_v4() {
             counter_id: 0,
             name: "static-1".to_string(),
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
             match_destination_port: 0,
@@ -575,6 +597,8 @@ fn static_nat_snat_matches_internal_ip_v4() {
             counter_id: 0,
             name: "static-1".to_string(),
             from_zone: "trust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
             match_destination_port: 0,
@@ -600,6 +624,8 @@ fn static_nat_dnat_matches_external_ip_v6() {
             counter_id: 0,
             name: "static-v6".to_string(),
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "2001:db8::1".to_string(),
             internal_ip: "fd00::1".to_string(),
             match_destination_port: 0,
@@ -625,6 +651,8 @@ fn static_nat_snat_matches_internal_ip_v6() {
             counter_id: 0,
             name: "static-v6".to_string(),
             from_zone: "trust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "2001:db8::1".to_string(),
             internal_ip: "fd00::1".to_string(),
             match_destination_port: 0,
@@ -652,6 +680,8 @@ fn block_snapshot(ext: &str, int: &str, from_zone: &str) -> StaticNATRuleSnapsho
         counter_id: 0,
         name: "block-1".to_string(),
         from_zone: from_zone.to_string(),
+        from_interface: String::new(),
+        from_routing_instance: String::new(),
         external_ip: ext.to_string(),
         internal_ip: int.to_string(),
         match_destination_port: 0,
@@ -802,6 +832,8 @@ fn static_nat_host_v4_unchanged_with_block_support() {
             counter_id: 0,
             name: "static-1".to_string(),
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.10/32".to_string(),
             internal_ip: "192.168.1.10/32".to_string(),
             match_destination_port: 0,
@@ -839,6 +871,8 @@ fn static_nat_zone_mismatch_returns_none_for_dnat() {
             counter_id: 0,
             name: "static-1".to_string(),
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
             match_destination_port: 0,
@@ -881,6 +915,8 @@ fn static_nat_snat_honors_egress_zone() {
             // External zone of the rule: reverse SNAT applies only when the
             // packet egresses toward THIS zone.
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
             match_destination_port: 0,
@@ -923,6 +959,8 @@ fn static_nat_snat_empty_zone_matches_any_egress() {
             counter_id: 0,
             name: "wildcard".to_string(),
             from_zone: String::new(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
             match_destination_port: 0,
@@ -946,6 +984,8 @@ fn static_nat_empty_zone_matches_any() {
             counter_id: 0,
             name: "static-any".to_string(),
             from_zone: String::new(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
             match_destination_port: 0,
@@ -977,6 +1017,8 @@ fn static_nat_bidirectional_reverse() {
             counter_id: 0,
             name: "static-1".to_string(),
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
             match_destination_port: 0,
@@ -1020,6 +1062,8 @@ fn static_nat_no_match_returns_none() {
             counter_id: 0,
             name: "static-1".to_string(),
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
             match_destination_port: 0,
@@ -1047,6 +1091,8 @@ fn static_nat_invalid_ip_skipped() {
                 counter_id: 0,
                 name: "bad".to_string(),
                 from_zone: String::new(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 external_ip: "not-an-ip".to_string(),
                 internal_ip: "192.168.1.10".to_string(),
                 match_destination_port: 0,
@@ -1056,6 +1102,8 @@ fn static_nat_invalid_ip_skipped() {
                 counter_id: 0,
                 name: "good".to_string(),
                 from_zone: String::new(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 external_ip: "203.0.113.10".to_string(),
                 internal_ip: "192.168.1.10".to_string(),
                 match_destination_port: 0,
@@ -1080,6 +1128,8 @@ fn static_nat_external_ips_iterator() {
                 counter_id: 0,
                 name: "s1".to_string(),
                 from_zone: String::new(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 external_ip: "203.0.113.10".to_string(),
                 internal_ip: "192.168.1.10".to_string(),
                 match_destination_port: 0,
@@ -1089,6 +1139,8 @@ fn static_nat_external_ips_iterator() {
                 counter_id: 0,
                 name: "s2".to_string(),
                 from_zone: String::new(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 external_ip: "203.0.113.20".to_string(),
                 internal_ip: "192.168.1.20".to_string(),
                 match_destination_port: 0,
@@ -1118,6 +1170,8 @@ fn static_nat_canonical_cidr_mask_v4_installs_entry() {
             counter_id: 0,
             name: "static-cidr".to_string(),
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.5/32".to_string(),
             internal_ip: "10.0.0.5/32".to_string(),
             match_destination_port: 0,
@@ -1157,6 +1211,8 @@ fn static_nat_canonical_cidr_mask_v6_installs_entry() {
             counter_id: 0,
             name: "static-cidr-v6".to_string(),
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "2001:db8::1/128".to_string(),
             internal_ip: "fd00::1/128".to_string(),
             match_destination_port: 0,
@@ -1194,6 +1250,8 @@ fn static_nat_cidr_and_bare_coexist() {
                 counter_id: 0,
                 name: "masked".to_string(),
                 from_zone: String::new(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 external_ip: "203.0.113.5/32".to_string(),
                 internal_ip: "10.0.0.5".to_string(),
                 match_destination_port: 0,
@@ -1203,6 +1261,8 @@ fn static_nat_cidr_and_bare_coexist() {
                 counter_id: 0,
                 name: "bare".to_string(),
                 from_zone: String::new(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 external_ip: "203.0.113.6".to_string(),
                 internal_ip: "10.0.0.6/32".to_string(),
                 match_destination_port: 0,
@@ -1254,6 +1314,8 @@ fn static_nat_non_host_mask_rejected() {
                 counter_id: 0,
                 name: "bad-mask".to_string(),
                 from_zone: String::new(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 external_ip: bad.to_string(),
                 internal_ip: "10.0.0.5".to_string(),
                 match_destination_port: 0,
@@ -1276,6 +1338,8 @@ fn mapped_port_snapshot() -> StaticNATRuleSnapshot {
         counter_id: 0,
         name: "port-map".to_string(),
         from_zone: "untrust".to_string(),
+        from_interface: String::new(),
+        from_routing_instance: String::new(),
         external_ip: "203.0.113.1/32".to_string(),
         internal_ip: "10.0.0.5/32".to_string(),
         match_destination_port: 8080,
@@ -1348,6 +1412,8 @@ fn static_nat_port_mapped_and_whole_address_coexist() {
                 counter_id: 0,
                 name: "whole".to_string(),
                 from_zone: "untrust".to_string(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 external_ip: "203.0.113.1/32".to_string(),
                 internal_ip: "10.0.0.9/32".to_string(),
                 match_destination_port: 0,
@@ -1379,6 +1445,8 @@ fn static_nat_mapped_port_without_match_port_demotes_to_whole_address() {
             counter_id: 0,
             name: "orphan".to_string(),
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.1/32".to_string(),
             internal_ip: "10.0.0.5/32".to_string(),
             match_destination_port: 0,
@@ -1415,6 +1483,8 @@ fn static_nat_match_port_without_mapped_port_scopes_reverse_snat() {
             counter_id: 0,
             name: "port-scoped-1to1".to_string(),
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.1/32".to_string(),
             internal_ip: "10.0.0.5/32".to_string(),
             match_destination_port: 8080,
@@ -1481,6 +1551,8 @@ fn static_nat_dnat_port_zone_mismatch_falls_back_to_whole_address() {
                 counter_id: 0,
                 name: "port-dmz".to_string(),
                 from_zone: "dmz".to_string(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 external_ip: "203.0.113.1/32".to_string(),
                 internal_ip: "10.0.0.5/32".to_string(),
                 match_destination_port: 8080,
@@ -1491,6 +1563,8 @@ fn static_nat_dnat_port_zone_mismatch_falls_back_to_whole_address() {
                 counter_id: 0,
                 name: "whole-untrust".to_string(),
                 from_zone: "untrust".to_string(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 external_ip: "203.0.113.1/32".to_string(),
                 internal_ip: "10.0.0.9/32".to_string(),
                 match_destination_port: 0,
@@ -2722,6 +2796,8 @@ fn dnat_prefers_exact_from_zone_over_any_zone() {
                 counter_id: 0,
                 name: "wan-only".to_string(),
                 from_zone: "wan".to_string(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 destination_address: "203.0.113.10".to_string(),
                 destination_port: 443,
                 protocol: "tcp".to_string(),
@@ -2753,6 +2829,8 @@ fn dnat_zone_mismatch_falls_back_to_any_zone_rule() {
                 counter_id: 0,
                 name: "wan-only".to_string(),
                 from_zone: "wan".to_string(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 destination_address: "203.0.113.10".to_string(),
                 destination_port: 443,
                 protocol: "tcp".to_string(),
@@ -2793,6 +2871,8 @@ fn dnat_zone_mismatch_without_wildcard_returns_none() {
             counter_id: 0,
             name: "wan-only".to_string(),
             from_zone: "wan".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             destination_address: "203.0.113.10".to_string(),
             destination_port: 443,
             protocol: "tcp".to_string(),
@@ -2823,6 +2903,8 @@ fn dnat_duplicate_same_zone_last_rule_wins() {
                 counter_id: 0,
                 name: "first".to_string(),
                 from_zone: "wan".to_string(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 destination_address: "203.0.113.10".to_string(),
                 destination_port: 443,
                 protocol: "tcp".to_string(),
@@ -2834,6 +2916,8 @@ fn dnat_duplicate_same_zone_last_rule_wins() {
                 counter_id: 0,
                 name: "second".to_string(),
                 from_zone: "wan".to_string(),
+                from_interface: String::new(),
+                from_routing_instance: String::new(),
                 destination_address: "203.0.113.10".to_string(),
                 destination_port: 443,
                 protocol: "tcp".to_string(),
@@ -2921,6 +3005,7 @@ fn pool_snat_single_address_rewrites_src_and_port() {
     let mut counter = None;
     let d = expect_snat_decision(match_source_nat_result_for_tuple(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().expect("src"),
@@ -2971,6 +3056,7 @@ fn pool_snat_portless_protocols_translate_ip_only_no_port() {
         let mut counter = None;
         let d = expect_snat_decision(match_source_nat_result_for_tuple(
             &rules,
+            &NatScopeCtx::default(),
             "lan",
             "wan",
             "10.0.1.100".parse().expect("src"),
@@ -3026,6 +3112,7 @@ fn pool_snat_multiple_addresses_round_robin() {
     for _ in 0..6 {
         let d = match_source_nat(
             &rules,
+            &NatScopeCtx::default(),
             "lan",
             "wan",
             "10.0.1.100".parse().unwrap(),
@@ -3089,6 +3176,7 @@ fn pool_snat_subnet_expands_full_cidr_range() {
         let src = format!("10.0.1.{}", i);
         let d = match_source_nat(
             &rules,
+            &NatScopeCtx::default(),
             "lan",
             "wan",
             src.parse().unwrap(),
@@ -3163,6 +3251,7 @@ fn pool_snat_overbroad_prefix_marks_invalid() {
     assert!(rules[0].pool_addresses_v4.is_empty());
     let d = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().unwrap(),
@@ -3219,6 +3308,7 @@ fn per_uplink_pool_selected_by_to_zone() {
     // Same flow, resolved egress in uplink A's zone -> pool A.
     let d = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "trust",
         "untrust-a",
         "10.0.1.100".parse().unwrap(),
@@ -3233,6 +3323,7 @@ fn per_uplink_pool_selected_by_to_zone() {
     // uplink B's zone -> pool B, with no rule-set change.
     let d = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "trust",
         "untrust-b",
         "10.0.1.100".parse().unwrap(),
@@ -3252,6 +3343,7 @@ fn per_uplink_pool_no_match_outside_uplink_zones() {
     assert_eq!(
         match_source_nat(
             &rules,
+            &NatScopeCtx::default(),
             "trust",
             "dmz",
             "10.0.1.100".parse().unwrap(),
@@ -3352,6 +3444,7 @@ fn tuple_snat_lookup_from_src(
     let mut counter = None;
     match_source_nat_result_for_tuple(
         rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         src_ip.parse().unwrap(),
@@ -3911,6 +4004,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
 
     let first = match_source_nat_result_for_tuple(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().unwrap(),
@@ -3928,6 +4022,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
 
     let second = match_source_nat_result_for_tuple(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.2.100".parse().unwrap(),
@@ -3988,6 +4083,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
 
     let first = match_source_nat_result_for_tuple(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().unwrap(),
@@ -4005,6 +4101,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
 
     let second = match_source_nat_result_for_tuple(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.2.100".parse().unwrap(),
@@ -4653,6 +4750,7 @@ fn pool_snat_wrong_family_pool_fails_closed_before_later_rule() {
 
     let lookup = match_source_nat_result(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().unwrap(),
@@ -4686,6 +4784,7 @@ fn pool_snat_wrong_family_pool_fails_closed_when_no_later_rule_matches() {
 
     let lookup = match_source_nat_result(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().unwrap(),
@@ -4718,6 +4817,7 @@ fn pool_snat_missing_pool_snapshot_fails_closed() {
 
     let lookup = match_source_nat_result(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().unwrap(),
@@ -4748,6 +4848,7 @@ fn pool_snat_empty_pool_fails_closed_instead_of_no_match() {
 
     let lookup = match_source_nat_result(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().unwrap(),
@@ -4781,6 +4882,7 @@ fn pool_snat_invalid_port_range_fails_closed() {
 
     let lookup = match_source_nat_result(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().unwrap(),
@@ -4814,6 +4916,7 @@ fn pool_snat_invalid_pool_address_fails_closed() {
 
     let lookup = match_source_nat_result(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().unwrap(),
@@ -4847,6 +4950,7 @@ fn pool_snat_partially_invalid_pool_address_fails_closed() {
 
     let lookup = match_source_nat_result(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().unwrap(),
@@ -4890,6 +4994,7 @@ fn pool_snat_address_persistent_sticks_source_to_pool_address() {
     for want_port in 40000..40004 {
         let d = match_source_nat(
             &rules,
+            &NatScopeCtx::default(),
             "lan",
             "wan",
             src,
@@ -4940,7 +5045,7 @@ fn pool_snat_address_persistent_sticks_each_source_independently() {
         let mut addresses_for_src = std::collections::HashSet::new();
         for dst_host in 1..=20 {
             let dst = IpAddr::V4(Ipv4Addr::new(8, 8, 8, dst_host));
-            let d = match_source_nat(&rules, "lan", "wan", src, dst, None, None)
+            let d = match_source_nat(&rules, &NatScopeCtx::default(), "lan", "wan", src, dst, None, None)
                 .expect("sticky source should match");
             addresses_for_src.insert(d.rewrite_src.expect("pool address"));
         }
@@ -5037,6 +5142,7 @@ fn pool_snat_address_persistent_userspace_v2_selects_pool_addresses() {
     for (src, dst, src_port, want_src) in cases {
         let decision = expect_snat_decision(match_source_nat_result_for_tuple(
             &rules,
+            &NatScopeCtx::default(),
             "lan",
             "wan",
             src.parse().unwrap(),
@@ -5169,6 +5275,7 @@ fn pool_snat_port_range_wrapping() {
     for _ in 0..6 {
         let d = match_source_nat(
             &rules,
+            &NatScopeCtx::default(),
             "lan",
             "wan",
             "10.0.1.100".parse().unwrap(),
@@ -5243,6 +5350,7 @@ fn pool_snat_v6_single_address() {
     }]);
     let decision = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "fd00::100".parse().expect("src"),
@@ -5273,6 +5381,7 @@ fn pool_snat_default_port_range() {
     }]);
     let d = match_source_nat(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().unwrap(),
@@ -5301,6 +5410,7 @@ fn pool_snat_zone_mismatch_returns_none() {
     assert!(
         match_source_nat(
             &rules,
+            &NatScopeCtx::default(),
             "dmz", // wrong from_zone
             "wan",
             "10.0.1.100".parse().unwrap(),
@@ -5574,6 +5684,7 @@ fn pool_snat_non_first_fragment_refused_no_allocation() {
     // Non-first fragment: refused without allocating.
     let frag = match_source_nat_result_for_tuple(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().unwrap(),
@@ -5597,6 +5708,7 @@ fn pool_snat_non_first_fragment_refused_no_allocation() {
     // First/atomic fragment (non_first_fragment=false): still allocates.
     let first = match_source_nat_result_for_tuple(
         &rules,
+        &NatScopeCtx::default(),
         "lan",
         "wan",
         "10.0.1.100".parse().unwrap(),
@@ -5806,6 +5918,8 @@ fn parsed_nat_rules_share_store_counters() {
         &[StaticNATRuleSnapshot {
             name: "static-counted".to_string(),
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
             match_destination_port: 0,
@@ -5831,6 +5945,8 @@ fn parsed_nat_rules_share_store_counters() {
             name: "dnat-counted".to_string(),
             counter_id: 33,
             from_zone: "untrust".to_string(),
+            from_interface: String::new(),
+            from_routing_instance: String::new(),
             source_addresses: vec![],
             destination_address: "203.0.113.20".to_string(),
             destination_prefix: String::new(),
@@ -6184,5 +6300,265 @@ fn dnat_protocol_zero_hopopt_is_distinct_from_wildcard() {
             ..NatDecision::default()
         }),
         "a non-HOPOPT protocol must still fall through to the IP-only wildcard"
+    );
+}
+
+// === #3096: interface- / routing-instance-scoped NAT rule-set matching ===
+
+// Source NAT scoped by `from interface`: matches a flow ingressing the named
+// interface, NOT another. Fail-on-revert: dropping the `scope_matches` gate in
+// SourceNatRule::matches makes the second assertion (wrong-interface) match and
+// so RED.
+#[test]
+fn source_nat_from_interface_scope_matches_only_named_iface() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_interface: "ge-0/0/1.0".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let src: IpAddr = "10.0.61.102".parse().unwrap();
+    let dst: IpAddr = "172.16.80.200".parse().unwrap();
+    let egress_v4 = Some("172.16.80.8".parse().unwrap());
+
+    // Ingress on the named interface -> matches.
+    let on_iface = NatScopeCtx {
+        ingress_ifname: "ge-0/0/1.0",
+        ..NatScopeCtx::default()
+    };
+    assert!(
+        match_source_nat(&rules, &on_iface, "", "", src, dst, egress_v4, None).is_some(),
+        "from-interface-scoped SNAT must match traffic ingressing the named interface"
+    );
+
+    // Ingress on a DIFFERENT interface -> no match.
+    let other_iface = NatScopeCtx {
+        ingress_ifname: "ge-0/0/2.0",
+        ..NatScopeCtx::default()
+    };
+    assert!(
+        match_source_nat(&rules, &other_iface, "", "", src, dst, egress_v4, None).is_none(),
+        "from-interface-scoped SNAT must NOT match traffic ingressing another interface"
+    );
+}
+
+// Source NAT scoped by `from routing-instance`: matches only the named VRF.
+#[test]
+fn source_nat_from_routing_instance_scope_matches_only_named_vrf() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_routing_instance: "VR1".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let src: IpAddr = "10.0.61.102".parse().unwrap();
+    let dst: IpAddr = "172.16.80.200".parse().unwrap();
+    let egress_v4 = Some("172.16.80.8".parse().unwrap());
+
+    let in_vr1 = NatScopeCtx {
+        ingress_routing_instance: "VR1",
+        ..NatScopeCtx::default()
+    };
+    assert!(
+        match_source_nat(&rules, &in_vr1, "", "", src, dst, egress_v4, None).is_some(),
+        "from-routing-instance-scoped SNAT must match traffic in the named VRF"
+    );
+
+    let in_vr2 = NatScopeCtx {
+        ingress_routing_instance: "VR2",
+        ..NatScopeCtx::default()
+    };
+    assert!(
+        match_source_nat(&rules, &in_vr2, "", "", src, dst, egress_v4, None).is_none(),
+        "from-routing-instance-scoped SNAT must NOT match traffic in another VRF"
+    );
+}
+
+// Source NAT scoped by `to interface`: matches only the named egress interface.
+#[test]
+fn source_nat_to_interface_scope_matches_only_named_egress() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        to_interface: "ge-0/0/2.0".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let src: IpAddr = "10.0.61.102".parse().unwrap();
+    let dst: IpAddr = "172.16.80.200".parse().unwrap();
+    let egress_v4 = Some("172.16.80.8".parse().unwrap());
+
+    let to_named = NatScopeCtx {
+        egress_ifname: "ge-0/0/2.0",
+        ..NatScopeCtx::default()
+    };
+    assert!(
+        match_source_nat(&rules, &to_named, "", "", src, dst, egress_v4, None).is_some(),
+        "to-interface-scoped SNAT must match traffic egressing the named interface"
+    );
+    let to_other = NatScopeCtx {
+        egress_ifname: "ge-0/0/9.0",
+        ..NatScopeCtx::default()
+    };
+    assert!(
+        match_source_nat(&rules, &to_other, "", "", src, dst, egress_v4, None).is_none(),
+        "to-interface-scoped SNAT must NOT match traffic egressing another interface"
+    );
+}
+
+// A zone-scoped source NAT rule is unaffected by the #3096 scope plumbing
+// (no-regression): empty interface/RI scope = wildcard, so any interface/VRF
+// in the matching zone pair still matches.
+#[test]
+fn source_nat_zone_scope_unaffected_by_interface_plumbing() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let src: IpAddr = "10.0.61.102".parse().unwrap();
+    let dst: IpAddr = "172.16.80.200".parse().unwrap();
+    let egress_v4 = Some("172.16.80.8".parse().unwrap());
+    // Arbitrary interface names in the scope ctx must not affect a zone rule.
+    let scope = NatScopeCtx {
+        ingress_ifname: "ge-0/0/7.0",
+        egress_ifname: "ge-0/0/8.0",
+        ingress_routing_instance: "whatever",
+        egress_routing_instance: "whatever",
+    };
+    assert!(
+        match_source_nat(&rules, &scope, "lan", "wan", src, dst, egress_v4, None).is_some(),
+        "zone-scoped SNAT must still match regardless of interface/RI ctx"
+    );
+}
+
+// Static NAT (DNAT direction) scoped by `from interface`: the inbound
+// translation fires only when the packet ingresses the named interface.
+// Fail-on-revert: dropping the interface gate in match_dnat_with_counter_scoped
+// makes the wrong-interface assertion fire and so RED.
+#[test]
+fn static_nat_dnat_from_interface_scope_matches_only_named_iface() {
+    let counters = NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            name: "stat".to_string(),
+            from_interface: "ge-0/0/1.0".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+            ..StaticNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    let ext: IpAddr = "203.0.113.10".parse().unwrap();
+    // On the named interface -> DNAT applies.
+    assert!(
+        table
+            .match_dnat_with_counter_scoped(ext, 0, "", "ge-0/0/1.0", "")
+            .is_some(),
+        "interface-scoped static DNAT must match on the named ingress interface"
+    );
+    // On a different interface -> no DNAT.
+    assert!(
+        table
+            .match_dnat_with_counter_scoped(ext, 0, "", "ge-0/0/2.0", "")
+            .is_none(),
+        "interface-scoped static DNAT must NOT match on another ingress interface"
+    );
+}
+
+// Static NAT (SNAT/reverse direction) scoped by `from interface`: the reverse
+// source translation fires only when the packet egresses the named interface.
+#[test]
+fn static_nat_snat_from_interface_scope_matches_only_named_egress() {
+    let counters = NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            name: "stat".to_string(),
+            from_interface: "ge-0/0/1.0".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+            ..StaticNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    let int: IpAddr = "192.168.1.10".parse().unwrap();
+    assert!(
+        table
+            .match_snat_with_counter_scoped(int, 0, "", "ge-0/0/1.0", "")
+            .is_some(),
+        "interface-scoped static SNAT must match on the named egress interface"
+    );
+    assert!(
+        table
+            .match_snat_with_counter_scoped(int, 0, "", "ge-0/0/2.0", "")
+            .is_none(),
+        "interface-scoped static SNAT must NOT match on another egress interface"
+    );
+}
+
+// Destination NAT scoped by `from interface`: the DNAT entry fires only for the
+// named ingress interface. Fail-on-revert: dropping the scope_ok gate in
+// match_entries makes the wrong-interface assertion fire and so RED.
+#[test]
+fn destination_nat_from_interface_scope_matches_only_named_iface() {
+    let counters = NatCounterStore::default();
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "dnat".to_string(),
+            from_interface: "ge-0/0/1.0".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            pool_address: "10.0.0.5".to_string(),
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    let src: IpAddr = "198.51.100.1".parse().unwrap();
+    let dst: IpAddr = "203.0.113.10".parse().unwrap();
+    assert!(
+        table
+            .lookup_with_counter_scoped(PROTO_TCP, src, dst, 443, "", "ge-0/0/1.0", "")
+            .is_some(),
+        "interface-scoped DNAT must match on the named ingress interface"
+    );
+    assert!(
+        table
+            .lookup_with_counter_scoped(PROTO_TCP, src, dst, 443, "", "ge-0/0/2.0", "")
+            .is_none(),
+        "interface-scoped DNAT must NOT match on another ingress interface"
+    );
+}
+
+// Destination NAT scoped by `from routing-instance`.
+#[test]
+fn destination_nat_from_routing_instance_scope_matches_only_named_vrf() {
+    let counters = NatCounterStore::default();
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "dnat".to_string(),
+            from_routing_instance: "VR1".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            pool_address: "10.0.0.5".to_string(),
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    let src: IpAddr = "198.51.100.1".parse().unwrap();
+    let dst: IpAddr = "203.0.113.10".parse().unwrap();
+    assert!(
+        table
+            .lookup_with_counter_scoped(PROTO_TCP, src, dst, 443, "", "", "VR1")
+            .is_some(),
+        "RI-scoped DNAT must match in the named VRF"
+    );
+    assert!(
+        table
+            .lookup_with_counter_scoped(PROTO_TCP, src, dst, 443, "", "", "VR2")
+            .is_none(),
+        "RI-scoped DNAT must NOT match in another VRF"
     );
 }

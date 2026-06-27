@@ -769,24 +769,10 @@ type compileOpts struct {
 	// peer-synced config an older binary accepted still BOOTS (#1960 no-brick).
 	// Same doctrine as lenientPolicyZoneRefs.
 	lenientReservedZoneNames bool
-	// lenientNATRuleSetScope (#3079) downgrades the NAT rule-set from/to
-	// scope gate (validateNATRuleSetScopeAST) from a hard compile error to a
-	// cfg.Warnings entry. A NAT rule-set whose `from`/`to` clause scopes
-	// traffic by `interface` or `routing-instance` (instead of the only
-	// enforced `zone`) committed cleanly but had its scope SILENTLY
-	// DISCARDED: parseZoneList returns only `zone` children, and every NAT
-	// caller falls back to the match-any wildcard when the zone list is
-	// empty, so the rule-set applied GLOBALLY — translated sessions leaked
-	// across the routing boundary the operator drew. The strict commit /
-	// commit-check path hard-rejects so the misconfiguration is operator-
-	// visible (naming the kind, rule-set, direction, keyword); the tolerant
-	// load / peer-sync paths downgrade to a warning so an already-persisted
-	// or peer-synced config an older binary silently accepted still BOOTS
-	// (#1960 fail-closed-on-load class) — it stays applied globally (the
-	// pre-existing behaviour), now flagged. Full interface-/
-	// routing-instance-scoped NAT matching is a deferred follow-up. Same
-	// doctrine as lenientPolicyZoneRefs.
-	lenientNATRuleSetScope bool
+	// #3096: lenientNATRuleSetScope (the #3079 interim NAT rule-set
+	// from/to scope reject) is removed — interface/routing-instance scopes
+	// are now fully captured and enforced in the dataplane match path, so
+	// there is no longer an unsupported-scope reject to make lenient.
 	// lenientBackupRouterDst (#2911) downgrades the backup-router
 	// destination/next-hop family-mismatch gate (validateBackupRouterDst)
 	// from a hard compile error to a cfg.Warnings entry. #2907 (#2891)
@@ -802,7 +788,7 @@ type compileOpts struct {
 	// families); the tolerant load / peer-sync paths downgrade to a warning so
 	// an already-persisted or peer-synced config an older binary accepted still
 	// BOOTS (#1960 fail-closed-on-load class). Same doctrine as
-	// lenientNATRuleSetScope.
+	// lenientReservedZoneNames.
 	lenientBackupRouterDst bool
 	// lenientSecureTunnelBindIface (#2933) downgrades the secure-tunnel
 	// bind-interface alias-collision gate (validateSecureTunnelBindInterfaceAST)
@@ -1026,7 +1012,6 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyLogAction:              true,
 		lenientScreenProfileRefs:            true,
 		lenientReservedZoneNames:            true,
-		lenientNATRuleSetScope:              true,
 		lenientBackupRouterDst:              true,
 		lenientSecureTunnelBindIface:        true,
 		lenientPolicyMatchLeaves:            true,
@@ -1156,7 +1141,6 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyLogAction:              true,
 		lenientScreenProfileRefs:            true,
 		lenientReservedZoneNames:            true,
-		lenientNATRuleSetScope:              true,
 		lenientBackupRouterDst:              true,
 		lenientSecureTunnelBindIface:        true,
 		lenientPolicyMatchLeaves:            true,
@@ -1261,25 +1245,17 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
-	// #3079 NAT rule-set scope gate. A `security nat {source|destination|
-	// static}` rule-set whose `from`/`to` clause scopes traffic by
-	// `interface` or `routing-instance` (instead of the only enforced
-	// `zone`) compiled cleanly but had its scope silently discarded
-	// (parseZoneList returns only `zone`, and every caller widens an empty
-	// zone list to match-any), so the rule-set applied GLOBALLY — translated
-	// sessions leaked across the routing boundary. Runs on the group-
-	// expanded, inactive-pruned tree BEFORE section compilation (which is
-	// where the scope keyword is dropped) so an apply-groups-inherited scope
-	// is caught. Strict (commit / commit-check): hard-reject naming the
-	// kind/rule-set/direction/keyword. Lenient (load / peer-sync): warn so an
-	// already-persisted or peer-synced config still boots (#1960) — it stays
-	// applied globally, now flagged. Full interface-/routing-instance-scoped
-	// matching is a deferred follow-up.
-	natScopeWarnings, err := validateNATRuleSetScopeAST(
-		tree.Children, opts.lenientNATRuleSetScope)
-	if err != nil {
-		return nil, err
-	}
+	// #3096: the #3079 interim NAT rule-set scope reject is LIFTED. A
+	// `security nat {source|destination|static}` rule-set whose `from`/`to`
+	// clause scopes traffic by `interface` or `routing-instance` is now
+	// CAPTURED by the compiler (collectNATScopes / parseNATMatchScopes,
+	// compiler_nat.go), carried on the typed NATRuleSet / StaticNATRuleSet,
+	// plumbed through the userspace snapshot, and ENFORCED per-flow in the
+	// dataplane NAT match path (nat/source.rs, nat/destination.rs,
+	// nat/static_nat.rs) — so the scope restricts matched traffic to the
+	// named ingress/egress interface or routing-instance instead of being
+	// silently widened to match-any. The validateNATRuleSetScopeAST gate and
+	// its lenientNATRuleSetScope opt are removed.
 
 	// #2933 secure-tunnel bind-interface alias-collision gate. Two VPNs that
 	// bind two DISTINCT bind-interface strings deriving the SAME XFRM if_id
@@ -1426,7 +1402,6 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, trackWarnings...)
 	cfg.Warnings = append(cfg.Warnings, mssWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
-	cfg.Warnings = append(cfg.Warnings, natScopeWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyThenPermitWarnings...)

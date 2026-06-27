@@ -46,6 +46,12 @@ pub(crate) struct DnatValue {
 #[derive(Clone, Debug)]
 struct DnatEntry {
     from_zone: Box<str>,
+    /// #3096: interface-/routing-instance scope. DNAT translates on inbound,
+    /// so these gate the entry against the packet's INGRESS interface
+    /// config-name / routing-instance. Empty = unscoped on that axis (a
+    /// zone-only or global DNAT rule is unaffected).
+    from_interface: Box<str>,
+    from_routing_instance: Box<str>,
     /// #2394: whether the DNAT rule was scoped to a `match source-address` at
     /// all (snapshot list non-empty). This is independent of how many entries
     /// PARSED: it stays true even when every source entry was unparseable, so
@@ -64,6 +70,15 @@ struct DnatEntry {
 }
 
 impl DnatEntry {
+    /// #3096: does the packet's ingress interface / routing-instance satisfy
+    /// this entry's `from interface` / `from routing-instance` scope? Empty
+    /// fields are wildcards; present fields are AND-ed.
+    fn scope_ok(&self, ingress_ifname: &str, ingress_routing_instance: &str) -> bool {
+        (self.from_interface.is_empty() || self.from_interface.as_ref() == ingress_ifname)
+            && (self.from_routing_instance.is_empty()
+                || self.from_routing_instance.as_ref() == ingress_routing_instance)
+    }
+
     /// #2394: does the packet source IP satisfy this entry's source-address
     /// constraint?
     ///
@@ -301,6 +316,8 @@ impl DnatTable {
             }
             let entry = DnatEntry {
                 from_zone: snap.from_zone.clone().into_boxed_str(),
+                from_interface: snap.from_interface.clone().into_boxed_str(),
+                from_routing_instance: snap.from_routing_instance.clone().into_boxed_str(),
                 source_constrained,
                 source_v4,
                 source_v6,
@@ -379,6 +396,27 @@ impl DnatTable {
         dst_port: u16,
         ingress_zone: &str,
     ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
+        // Unscoped wrapper: empty interface/RI scope = wildcard (pre-#3096).
+        self.lookup_with_counter_scoped(protocol, src_ip, dst_ip, dst_port, ingress_zone, "", "")
+    }
+
+    /// #3096: as [`lookup_with_counter`] but additionally gates each candidate
+    /// on the DNAT rule's `from interface` / `from routing-instance` scope
+    /// against the packet's INGRESS interface config-name and routing-instance.
+    /// Empty scope fields are wildcards. The zone-tier precedence (zone-
+    /// specific wins over zone-wildcard) and #3164 LPM ordering are unchanged;
+    /// the scope is an additional AND filter on eligibility.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lookup_with_counter_scoped(
+        &self,
+        protocol: u8,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        dst_port: u16,
+        ingress_zone: &str,
+        ingress_ifname: &str,
+        ingress_routing_instance: &str,
+    ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
         // The inbound packet protocol is a real IANA byte; widen it to the
         // u16 key space. The wildcard sentinel (PROTO_ANY = 256) is OUTSIDE
         // this range, so a real packet — even one carrying protocol 0 (HOPOPT)
@@ -394,6 +432,8 @@ impl DnatTable {
                 }),
                 src_ip,
                 ingress_zone,
+                ingress_ifname,
+                ingress_routing_instance,
             )
             .or_else(|| {
                 self.match_entries(
@@ -404,6 +444,8 @@ impl DnatTable {
                     }),
                     src_ip,
                     ingress_zone,
+                    ingress_ifname,
+                    ingress_routing_instance,
                 )
             })
             .or_else(|| {
@@ -422,6 +464,8 @@ impl DnatTable {
                     }),
                     src_ip,
                     ingress_zone,
+                    ingress_ifname,
+                    ingress_routing_instance,
                 )
             })
             .or_else(|| {
@@ -431,7 +475,15 @@ impl DnatTable {
                 // prefix table the same three proto/port tiers apply (exact
                 // proto+port, then wildcard port, then PROTO_ANY), and within a
                 // tier the LONGEST matching prefix wins.
-                self.match_prefix_lpm(protocol, src_ip, dst_ip, dst_port, ingress_zone)
+                self.match_prefix_lpm(
+                    protocol,
+                    src_ip,
+                    dst_ip,
+                    dst_port,
+                    ingress_zone,
+                    ingress_ifname,
+                    ingress_routing_instance,
+                )
             })?;
         let rewrite_dst_port = if value.new_dst_port != 0 && value.new_dst_port != dst_port {
             Some(value.new_dst_port)
@@ -451,30 +503,38 @@ impl DnatTable {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn match_entries(
         &self,
         entries: Option<&Vec<DnatEntry>>,
         src_ip: IpAddr,
         ingress_zone: &str,
+        ingress_ifname: &str,
+        ingress_routing_instance: &str,
     ) -> Option<(DnatValue, Option<Arc<NatRuleCounter>>)> {
         let entries = entries?;
-        // #2394: an entry only fires when BOTH its zone and its source-address
-        // constraint match. Zone-specific entries still win over zone-wildcard
-        // entries, but within each tier the source-address constraint must hold
-        // — an entry whose source does not contain the packet's source IP is
-        // skipped (no fail-open to the wrong source).
+        // #2394: an entry only fires when its zone, source-address, AND #3096
+        // interface/routing-instance scope all match. Zone-specific entries
+        // still win over zone-wildcard entries, but within each tier every
+        // constraint must hold — an entry whose source or interface/RI scope
+        // does not match the packet is skipped (no fail-open).
         entries
             .iter()
             .find(|entry| {
                 !entry.from_zone.is_empty()
                     && entry.from_zone.as_ref() == ingress_zone
+                    && entry.scope_ok(ingress_ifname, ingress_routing_instance)
                     && entry.source_matches(src_ip)
             })
             .map(|entry| (entry.value, entry.hit_counter.clone()))
             .or_else(|| {
                 entries
                     .iter()
-                    .find(|entry| entry.from_zone.is_empty() && entry.source_matches(src_ip))
+                    .find(|entry| {
+                        entry.from_zone.is_empty()
+                            && entry.scope_ok(ingress_ifname, ingress_routing_instance)
+                            && entry.source_matches(src_ip)
+                    })
                     .map(|entry| (entry.value, entry.hit_counter.clone()))
             })
     }
@@ -484,6 +544,7 @@ impl DnatTable {
     /// `(protocol, 0)`, then `(PROTO_ANY, 0)` — so proto/port specificity is
     /// honored the same way for prefixes; within each tier the LONGEST matching
     /// prefix wins. Returns the first tier that yields a match.
+    #[allow(clippy::too_many_arguments)]
     fn match_prefix_lpm(
         &self,
         protocol: u16,
@@ -491,6 +552,8 @@ impl DnatTable {
         dst_ip: IpAddr,
         dst_port: u16,
         ingress_zone: &str,
+        ingress_ifname: &str,
+        ingress_routing_instance: &str,
     ) -> Option<(DnatValue, Option<Arc<NatRuleCounter>>)> {
         self.match_prefix_slots(
             self.prefix_entries.get(&DnatProtoPortKey {
@@ -500,6 +563,8 @@ impl DnatTable {
             dst_ip,
             src_ip,
             ingress_zone,
+            ingress_ifname,
+            ingress_routing_instance,
         )
         .or_else(|| {
             self.match_prefix_slots(
@@ -510,6 +575,8 @@ impl DnatTable {
                 dst_ip,
                 src_ip,
                 ingress_zone,
+                ingress_ifname,
+                ingress_routing_instance,
             )
         })
         .or_else(|| {
@@ -521,6 +588,8 @@ impl DnatTable {
                 dst_ip,
                 src_ip,
                 ingress_zone,
+                ingress_ifname,
+                ingress_routing_instance,
             )
         })
     }
@@ -530,12 +599,15 @@ impl DnatTable {
     /// (mirroring `match_entries`); within each zone tier the LONGEST matching
     /// prefix whose source-address constraint holds wins, and the FIRST such
     /// slot in insertion order breaks a same-length tie (deterministic).
+    #[allow(clippy::too_many_arguments)]
     fn match_prefix_slots(
         &self,
         slots: Option<&Vec<DnatPrefixSlot>>,
         dst_ip: IpAddr,
         src_ip: IpAddr,
         ingress_zone: &str,
+        ingress_ifname: &str,
+        ingress_routing_instance: &str,
     ) -> Option<(DnatValue, Option<Arc<NatRuleCounter>>)> {
         let slots = slots?;
         let best_in_tier = |zone_specific: bool| -> Option<&DnatPrefixSlot> {
@@ -547,7 +619,11 @@ impl DnatTable {
                 } else {
                     slot.entry.from_zone.is_empty()
                 };
-                if !zone_ok || !slot.contains(dst_ip) || !slot.entry.source_matches(src_ip) {
+                if !zone_ok
+                    || !slot.entry.scope_ok(ingress_ifname, ingress_routing_instance)
+                    || !slot.contains(dst_ip)
+                    || !slot.entry.source_matches(src_ip)
+                {
                     continue;
                 }
                 // STRICTLY-greater replacement keeps the first slot among equal
@@ -576,6 +652,10 @@ impl DnatTable {
             existing.v4 == new_slot.v4
                 && existing.v6 == new_slot.v6
                 && existing.entry.from_zone == new_slot.entry.from_zone
+                // #3096: scope-distinct rules (same zone/prefix/source but a
+                // different interface/RI scope) are distinct entries.
+                && existing.entry.from_interface == new_slot.entry.from_interface
+                && existing.entry.from_routing_instance == new_slot.entry.from_routing_instance
                 && existing.entry.source_constrained == new_slot.entry.source_constrained
                 && existing.entry.source_v4 == new_slot.entry.source_v4
                 && existing.entry.source_v6 == new_slot.entry.source_v6
@@ -601,6 +681,9 @@ impl DnatTable {
         // onto each other.
         if let Some(existing) = entries.iter_mut().find(|existing| {
             existing.from_zone == entry.from_zone
+                // #3096: interface/RI scope is part of the rule identity.
+                && existing.from_interface == entry.from_interface
+                && existing.from_routing_instance == entry.from_routing_instance
                 && existing.source_constrained == entry.source_constrained
                 && existing.source_v4 == entry.source_v4
                 && existing.source_v6 == entry.source_v6

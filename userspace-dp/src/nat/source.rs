@@ -19,7 +19,7 @@
 use super::allocator::{
     NS_PER_SEC, PersistentSourceKey, PoolAddressFamily, PortAllocator, TranslatedTuple,
 };
-use super::{NatCounterStore, NatDecision, NatRuleCounter};
+use super::{NatCounterStore, NatDecision, NatRuleCounter, NatScopeCtx};
 use crate::SourceNATRuleSnapshot;
 use crate::prefix::{PrefixV4, PrefixV6};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
@@ -188,6 +188,14 @@ pub(crate) struct SourceNatRule {
     pub(crate) name: String,
     pub(crate) from_zone: String,
     pub(crate) to_zone: String,
+    /// #3096: interface-/routing-instance-scoped rule-set matching. A
+    /// non-empty value restricts the rule to flows whose ingress (`from_*`) or
+    /// egress (`to_*`) interface config-name / routing-instance equals it.
+    /// Empty = unscoped on that axis. Enforced in `scope_matches`.
+    pub(crate) from_interface: String,
+    pub(crate) to_interface: String,
+    pub(crate) from_routing_instance: String,
+    pub(crate) to_routing_instance: String,
     pub(crate) source_v4: Vec<PrefixV4>,
     pub(crate) source_v6: Vec<PrefixV6>,
     pub(crate) destination_v4: Vec<PrefixV4>,
@@ -251,11 +259,46 @@ impl SourceNatRule {
 }
 
 impl SourceNatRule {
-    fn matches(&self, from_zone: &str, to_zone: &str, src_ip: IpAddr, dst_ip: IpAddr) -> bool {
+    /// #3096: does the flow satisfy every non-empty interface /
+    /// routing-instance scope on this rule? Empty scope fields are wildcards.
+    /// All present scopes are AND-ed (Junos restricts a from/to clause to one
+    /// kind, but a hostile multi-kind clause fails closed — it must match
+    /// every set field).
+    fn scope_matches(&self, scope: &NatScopeCtx) -> bool {
+        if !self.from_interface.is_empty() && self.from_interface != scope.ingress_ifname {
+            return false;
+        }
+        if !self.to_interface.is_empty() && self.to_interface != scope.egress_ifname {
+            return false;
+        }
+        if !self.from_routing_instance.is_empty()
+            && self.from_routing_instance != scope.ingress_routing_instance
+        {
+            return false;
+        }
+        if !self.to_routing_instance.is_empty()
+            && self.to_routing_instance != scope.egress_routing_instance
+        {
+            return false;
+        }
+        true
+    }
+
+    fn matches(
+        &self,
+        scope: &NatScopeCtx,
+        from_zone: &str,
+        to_zone: &str,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+    ) -> bool {
         if !self.from_zone.is_empty() && self.from_zone != from_zone {
             return false;
         }
         if !self.to_zone.is_empty() && self.to_zone != to_zone {
+            return false;
+        }
+        if !self.scope_matches(scope) {
             return false;
         }
         match (src_ip, dst_ip) {
@@ -379,6 +422,10 @@ pub(crate) fn parse_source_nat_rules_with_previous(
             name: snap.name.clone(),
             from_zone: snap.from_zone.clone(),
             to_zone: snap.to_zone.clone(),
+            from_interface: snap.from_interface.clone(),
+            to_interface: snap.to_interface.clone(),
+            from_routing_instance: snap.from_routing_instance.clone(),
+            to_routing_instance: snap.to_routing_instance.clone(),
             interface_mode: snap.interface_mode,
             off: snap.off,
             pool_name: snap.pool_name.clone(),
@@ -562,6 +609,7 @@ fn release_source_nat_allocation_with_mode(
 
 pub(crate) fn match_source_nat(
     rules: &[SourceNatRule],
+    scope: &NatScopeCtx,
     from_zone: &str,
     to_zone: &str,
     src_ip: IpAddr,
@@ -570,15 +618,17 @@ pub(crate) fn match_source_nat(
     egress_v6: Option<Ipv6Addr>,
 ) -> Option<NatDecision> {
     match match_source_nat_result(
-        rules, from_zone, to_zone, src_ip, dst_ip, egress_v4, egress_v6,
+        rules, scope, from_zone, to_zone, src_ip, dst_ip, egress_v4, egress_v6,
     ) {
         SourceNatLookup::Matched(decision) => Some(decision),
         SourceNatLookup::NoMatch | SourceNatLookup::Unavailable(_) => None,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn match_source_nat_result(
     rules: &[SourceNatRule],
+    scope: &NatScopeCtx,
     from_zone: &str,
     to_zone: &str,
     src_ip: IpAddr,
@@ -589,6 +639,7 @@ pub(crate) fn match_source_nat_result(
     let mut counter = None;
     match_source_nat_result_for_tuple(
         rules,
+        scope,
         from_zone,
         to_zone,
         src_ip,
@@ -614,6 +665,7 @@ pub(crate) fn match_source_nat_result(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn match_source_nat_result_for_tuple(
     rules: &[SourceNatRule],
+    scope: &NatScopeCtx,
     from_zone: &str,
     to_zone: &str,
     src_ip: IpAddr,
@@ -638,7 +690,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
         dst_port,
     };
     for rule in rules {
-        if !rule.matches(from_zone, to_zone, src_ip, dst_ip) {
+        if !rule.matches(scope, from_zone, to_zone, src_ip, dst_ip) {
             continue;
         }
         if rule.off {

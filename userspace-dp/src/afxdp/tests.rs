@@ -954,6 +954,8 @@ fn static_nat_snat_matches_when_zone_is_empty() {
         counter_id: 0,
         name: "web-server".to_string(),
         from_zone: String::new(), // matches any zone
+        from_interface: String::new(),
+        from_routing_instance: String::new(),
         external_ip: "203.0.113.10".to_string(),
         internal_ip: "192.168.1.10".to_string(),
         match_destination_port: 0,
@@ -982,6 +984,8 @@ fn static_nat_takes_priority_over_interface_snat() {
         counter_id: 0,
         name: "static-web".to_string(),
         from_zone: String::new(),
+        from_interface: String::new(),
+        from_routing_instance: String::new(),
         external_ip: "203.0.113.10".to_string(),
         internal_ip: "192.168.1.10".to_string(),
         match_destination_port: 0,
@@ -1018,6 +1022,8 @@ fn static_nat_v6_dnat_and_snat() {
         counter_id: 0,
         name: "v6-server".to_string(),
         from_zone: String::new(),
+        from_interface: String::new(),
+        from_routing_instance: String::new(),
         external_ip: "2001:db8::10".to_string(),
         internal_ip: "fd00::10".to_string(),
         match_destination_port: 0,
@@ -1084,6 +1090,8 @@ fn post_dnat_source_nat_matches_translated_destination() {
         counter_id: 0,
         name: "web-dnat".to_string(),
         from_zone: "wan".to_string(),
+        from_interface: String::new(),
+        from_routing_instance: String::new(),
         source_addresses: vec![],
         destination_address: "172.16.80.8".to_string(),
         destination_prefix: String::new(),
@@ -1134,7 +1142,7 @@ fn post_dnat_source_nat_matches_translated_destination() {
     assert_eq!(dnat.rewrite_dst_port, Some(8443));
 
     let translated_flow = flow.with_destination(dnat.rewrite_dst.unwrap());
-    let snat = match_source_nat_for_flow(&state, "wan", "lan", 24, &translated_flow)
+    let snat = match_source_nat_for_flow(&state, 0, "wan", "lan", 24, &translated_flow)
         .expect("snat after dnat");
     assert_eq!(
         snat.rewrite_src,
@@ -10100,6 +10108,8 @@ fn inbound_dnat_snapshot(policy: PolicyRuleSnapshot) -> ConfigSnapshot {
         counter_id: 0,
         name: "web-dnat".to_string(),
         from_zone: "wan".to_string(),
+        from_interface: String::new(),
+        from_routing_instance: String::new(),
         source_addresses: vec![],
         destination_address: "172.16.80.8".to_string(),
         destination_prefix: String::new(),

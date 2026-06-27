@@ -157,11 +157,18 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			}},
 			"address-persistent": {desc: "Always map a source IP to the same pool address", children: nil},
 			"rule-set": {desc: "Source NAT rule-set name", args: 1, placeholder: "<rule-set-name>", children: map[string]*schemaNode{
+				// #3096: from/to scope by zone | interface | routing-instance.
+				// All three are now enforced in the dataplane match path, so
+				// each is declared for commit-time validation + CLI completion.
 				"from": {desc: "Source of traffic to match", children: map[string]*schemaNode{
-					"zone": {desc: "Source zone name", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					"zone":             {desc: "Source zone name", args: 1, multi: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					"interface":        {desc: "Ingress interface name", args: 1, multi: true, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
+					"routing-instance": {desc: "Ingress routing instance name", args: 1, multi: true, placeholder: "<routing-instance>", children: nil},
 				}},
 				"to": {desc: "Destination of traffic to match", children: map[string]*schemaNode{
-					"zone": {desc: "Destination zone name", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					"zone":             {desc: "Destination zone name", args: 1, multi: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					"interface":        {desc: "Egress interface name", args: 1, multi: true, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
+					"routing-instance": {desc: "Egress routing instance name", args: 1, multi: true, placeholder: "<routing-instance>", children: nil},
 				}},
 				"rule": {desc: "Source NAT rule name", args: 1, placeholder: "<rule-name>", children: map[string]*schemaNode{
 					"match": {desc: "Match criteria", children: map[string]*schemaNode{
@@ -185,11 +192,16 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		"destination": {desc: "Destination NAT configuration", children: map[string]*schemaNode{
 			"pool": {desc: "Destination NAT pool name", args: 1, valueHint: ValueHintPoolName, placeholder: "<pool-name>", children: nil},
 			"rule-set": {desc: "Destination NAT rule-set name", args: 1, placeholder: "<rule-set-name>", children: map[string]*schemaNode{
+				// #3096: from/to scope by zone | interface | routing-instance.
 				"from": {desc: "Source of traffic to match", children: map[string]*schemaNode{
-					"zone": {desc: "Source zone name", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					"zone":             {desc: "Source zone name", args: 1, multi: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					"interface":        {desc: "Ingress interface name", args: 1, multi: true, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
+					"routing-instance": {desc: "Ingress routing instance name", args: 1, multi: true, placeholder: "<routing-instance>", children: nil},
 				}},
 				"to": {desc: "Destination of traffic to match", children: map[string]*schemaNode{
-					"zone": {desc: "Destination zone name", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					"zone":             {desc: "Destination zone name", args: 1, multi: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					"interface":        {desc: "Egress interface name", args: 1, multi: true, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
+					"routing-instance": {desc: "Egress routing instance name", args: 1, multi: true, placeholder: "<routing-instance>", children: nil},
 				}},
 				"rule": {desc: "Destination NAT rule name", args: 1, placeholder: "<rule-name>", children: map[string]*schemaNode{
 					"match": {desc: "Match criteria", children: map[string]*schemaNode{
@@ -211,15 +223,18 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 		"static": {desc: "Static NAT configuration", children: map[string]*schemaNode{
 			"rule-set": {desc: "Static NAT rule-set name", args: 1, placeholder: "<rule-set-name>", children: map[string]*schemaNode{
-				// `from zone` scopes the rule-set to an ingress zone. The
-				// dataplane enforces it on the inbound (DNAT) direction
-				// (static_nat.rs match_dnat). Junos static NAT has no `to`
-				// clause (unlike source/destination NAT) — only `from`
-				// (zone | interface | routing-instance). xpf compiles the
-				// zone scope; declaring it here restores commit-time
+				// `from` scopes the rule-set to an ingress context. The
+				// dataplane enforces it on the inbound (DNAT) direction and,
+				// symmetrically, on the reverse (SNAT) egress direction
+				// (static_nat.rs match_dnat / match_snat). Junos static NAT
+				// has no `to` clause (unlike source/destination NAT) — only
+				// `from` (zone | interface | routing-instance). #3096 enforces
+				// all three scope kinds, so each is declared for commit-time
 				// validation and CLI completion (#2008 H15).
 				"from": {desc: "Source of traffic to match", children: map[string]*schemaNode{
-					"zone": {desc: "Source zone name", args: 1, multi: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					"zone":             {desc: "Source zone name", args: 1, multi: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					"interface":        {desc: "Ingress interface name", args: 1, multi: true, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
+					"routing-instance": {desc: "Ingress routing instance name", args: 1, multi: true, placeholder: "<routing-instance>", children: nil},
 				}},
 				"rule": {desc: "Static NAT rule name", args: 1, placeholder: "<rule-name>", children: map[string]*schemaNode{
 					// M3 (#2008): the static-NAT rule `match` reads
