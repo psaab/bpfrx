@@ -428,12 +428,83 @@ pub(crate) struct PolicyEvaluationResult {
     pub(crate) policy_counter_idx: u32,
 }
 
+/// #3148: the optional from-zone/to-zone match context of a GLOBAL policy.
+/// A Junos global policy may narrow which zone pairs it applies to with
+/// `match { from-zone <z>; to-zone <z>; }`. The rule stays in the global tier
+/// (`PolicyState::global_indices`) and the global config order is preserved;
+/// this scope is consulted as an extra predicate inside the global-tier loop
+/// before `try_match_rule`. A non-global (zone-pair / wildcard) rule always
+/// carries `Any` on both sides, so the scope check is a no-op for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlobalZoneScope {
+    /// No constraint — the global policy applies to every defined zone on this
+    /// side (the historical all-zones behaviour, and the value for every
+    /// non-global rule).
+    Any,
+    /// Constrained to a resolved zone id: the side matches only this zone.
+    Zone(u16),
+    /// A zone name was configured but does not resolve to a defined zone.
+    /// Fail-closed: the global policy matches NOTHING (it never silently widens
+    /// to all-zones on a typo'd / undefined zone reference).
+    Unresolved,
+}
+
+impl Default for GlobalZoneScope {
+    fn default() -> Self {
+        GlobalZoneScope::Any
+    }
+}
+
+impl GlobalZoneScope {
+    /// Whether a flow whose zone (ingress for from, egress for to) is `id`
+    /// satisfies this scope.
+    #[inline]
+    pub(crate) fn matches(self, id: u16) -> bool {
+        match self {
+            GlobalZoneScope::Any => true,
+            GlobalZoneScope::Zone(z) => z == id,
+            GlobalZoneScope::Unresolved => false,
+        }
+    }
+}
+
+/// #3148: resolve a global policy's `match from-zone`/`to-zone` name into a
+/// [`GlobalZoneScope`]. Empty → `Any` (all zones). A non-empty name resolves
+/// through [`resolve_policy_zone_id`] (so `junos-host` maps to its reserved id
+/// like elsewhere); an unresolvable name → `Unresolved` (fail-closed) with a
+/// diagnostic, matching the "rule kept, but not indexed" treatment of an
+/// unknown zone-pair zone.
+fn build_global_zone_scope(
+    zone_name_to_id: &FxHashMap<String, u16>,
+    name: &str,
+    side: &str,
+    rule_id: &str,
+) -> GlobalZoneScope {
+    if name.is_empty() {
+        return GlobalZoneScope::Any;
+    }
+    match resolve_policy_zone_id(zone_name_to_id, name) {
+        Some(id) => GlobalZoneScope::Zone(id),
+        None => {
+            eprintln!(
+                "xpf-userspace-dp: global policy {:?} match {}-zone references unknown zone {:?} (rule kept, matches nothing)",
+                rule_id, side, name
+            );
+            GlobalZoneScope::Unresolved
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PolicyRule {
     pub(crate) rule_id: String,
     pub(crate) policy_id: u32,
     pub(crate) from_zone: String,
     pub(crate) to_zone: String,
+    /// #3148: optional global-policy zone match context (Any for every
+    /// non-global rule). See [`GlobalZoneScope`].
+    pub(crate) global_from_zone: GlobalZoneScope,
+    pub(crate) global_to_zone: GlobalZoneScope,
     pub(crate) scheduler_name: String,
     pub(crate) inactive: bool,
     /// #1606: literal CIDRs inlined in the rule (renamed from
@@ -494,6 +565,8 @@ impl Default for PolicyRule {
             policy_id: 0,
             from_zone: String::new(),
             to_zone: String::new(),
+            global_from_zone: GlobalZoneScope::Any,
+            global_to_zone: GlobalZoneScope::Any,
             scheduler_name: String::new(),
             inactive: false,
             source_literal_v4: PrefixSetV4::default(),
@@ -532,6 +605,8 @@ impl Clone for PolicyRule {
             policy_id: self.policy_id,
             from_zone: self.from_zone.clone(),
             to_zone: self.to_zone.clone(),
+            global_from_zone: self.global_from_zone,
+            global_to_zone: self.global_to_zone,
             scheduler_name: self.scheduler_name.clone(),
             inactive: self.inactive,
             source_literal_v4: self.source_literal_v4.clone(),
@@ -1309,6 +1384,20 @@ pub(crate) fn parse_policy_state_with_counters(
             policy_id: snap.policy_id,
             from_zone: snap.from_zone.clone(),
             to_zone: snap.to_zone.clone(),
+            // #3148: resolve the optional global-policy zone context. Empty →
+            // Any (all zones). Inert for non-global rules (both fields empty).
+            global_from_zone: build_global_zone_scope(
+                zone_name_to_id,
+                &snap.match_from_zone,
+                "from",
+                &rule_id,
+            ),
+            global_to_zone: build_global_zone_scope(
+                zone_name_to_id,
+                &snap.match_to_zone,
+                "to",
+                &rule_id,
+            ),
             scheduler_name: snap.scheduler_name.clone(),
             inactive: snap.inactive,
             source_literal_v4,
@@ -1745,8 +1834,20 @@ pub(crate) fn evaluate_policy_result_with_icmp(
             }
         }
         for &idx in &state.global_indices {
+            let rule = &state.rules[idx];
+            // #3148: a global policy may carry optional from-zone/to-zone match
+            // context. When present it matches only the configured zone(s);
+            // when absent (Any) it applies to every defined zone pair as
+            // before. The scope check runs in the GLOBAL tier (after the exact
+            // zone-pair and #3090 from-any/to-any/both-any wildcard tiers), in
+            // global config order, so a zone-scoped global policy stays a
+            // global policy — it does not get promoted ahead of the wildcard
+            // tiers. An unresolved (typo'd) zone fails closed (matches none).
+            if !rule.global_from_zone.matches(from_id) || !rule.global_to_zone.matches(to_id) {
+                continue;
+            }
             if let Some(mut result) = try_match_rule(
-                &state.rules[idx],
+                rule,
                 state,
                 src_ip,
                 dst_ip,

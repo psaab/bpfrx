@@ -494,6 +494,24 @@ func compilePolicy(polInst struct {
 				pol.Match.SourceAddressExcluded = true
 			case "destination-address-excluded":
 				pol.Match.DestinationAddressExcluded = true
+			case "from-zone":
+				// #3148: global-policy from-zone match context. The schema
+				// exposes this leaf only under `security policies global
+				// policy <p> match`; for zone-pair policies the zones come
+				// from the surrounding from-zone/to-zone stanza so this case
+				// is never reached. Empty stays "all zones".
+				if len(m.Keys) >= 2 {
+					pol.Match.FromZone = m.Keys[1]
+				} else if len(m.Children) > 0 {
+					pol.Match.FromZone = m.Children[0].Name()
+				}
+			case "to-zone":
+				// #3148: global-policy to-zone match context (see from-zone).
+				if len(m.Keys) >= 2 {
+					pol.Match.ToZone = m.Keys[1]
+				} else if len(m.Children) > 0 {
+					pol.Match.ToZone = m.Children[0].Name()
+				}
 			case "application":
 				if len(m.Keys) >= 2 {
 					pol.Match.Applications = append(pol.Match.Applications, m.Keys[1:]...)

@@ -854,6 +854,16 @@ type PolicyRuleSnapshot struct {
 	// EVERY close regardless of these flags.
 	LogSessionInit  bool `json:"log_session_init,omitempty"`
 	LogSessionClose bool `json:"log_session_close,omitempty"`
+	// #3148: optional from-zone/to-zone match context for a GLOBAL policy.
+	// A global rule keeps FromZone/ToZone == "junos-global" (so the Rust
+	// classifier keeps it in the global tier and the global config order is
+	// preserved); these additive fields narrow which zone pairs the global
+	// rule matches. Empty = all zones (the historical behaviour). Additive
+	// per #1961: an old Rust helper that omits these decodes them to "" and
+	// keeps the all-zones semantics. They are populated only for global
+	// policies — a zone-pair rule leaves them empty.
+	MatchFromZone string `json:"match_from_zone,omitempty"`
+	MatchToZone   string `json:"match_to_zone,omitempty"`
 }
 
 type InterfaceAddressSnapshot struct {

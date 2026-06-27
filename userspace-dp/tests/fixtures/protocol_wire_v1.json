@@ -733,6 +733,8 @@
     "inactive": false,
     "log_session_close": false,
     "log_session_init": false,
+    "match_from_zone": "",
+    "match_to_zone": "",
     "name": "",
     "policy_id": 0,
     "rule_id": "",

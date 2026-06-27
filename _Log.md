@@ -1,3 +1,42 @@
+## 2026-06-26 — #3148 global policy from-zone/to-zone match context
+
+- **Timestamp**: 2026-06-26
+- **Action**: vsrx-parity — a Junos global policy can now carry optional
+  `match from-zone <z>` / `match to-zone <z>` so one global policy scopes to a
+  chosen zone pair (or one wildcard side) instead of every zone pair; absent =
+  all zones (no regression). Composes with #3090: a zone-scoped global policy
+  stays in the `junos-global` tier (keeps the sentinel on its structural zones)
+  and the context rides additive wire fields `match_from_zone`/`match_to_zone`
+  (resolved to a `GlobalZoneScope` checked inside the global-tier loop). So it
+  is evaluated in the global ordering AFTER the exact zone-pair and the #3090
+  from-any/to-any/both-any wildcard tiers — NOT promoted ahead of them.
+  Go: PolicyMatch.FromZone/ToZone, compilePolicy match cases, schema leaves
+  (global policy match only), globalOnlyPolicyMatchLeaves through the #3113
+  gate, PolicyRuleSnapshot wire fields + emitter, and
+  validatePolicyZoneReferencesStrict now rejects an undefined global match zone
+  (lenient → warn). Rust: GlobalZoneScope enum + PolicyRule fields + scope skip
+  in the global tier; serde fields; regenerated protocol_wire_v1.json.
+  Tests (fail-on-revert proven RED): Rust
+  `global_policy_zone_context_scopes_to_pair` / `_single_side_zone_context` /
+  `_unknown_zone_context_fails_closed`; Go
+  `TestGlobalPolicyZoneContextCompiles` / `_StrictCommit`,
+  `TestGlobalPolicyEmitsZoneContext`. cargo build+test (full suite 0 real
+  failures; only the load-sensitive worker_queue/event_stream timing flakes,
+  pass in isolation), go build ./... + go test ./pkg/config/
+  ./pkg/dataplane/... green.
+- **File(s)**: pkg/config/types_security.go,
+  pkg/config/compiler_security.go, pkg/config/schema_security.go,
+  pkg/config/compiler_policy_match.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/compiler_policy_global_zone_3148_test.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/policy_global_zone_3148_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/policy.rs,
+  userspace-dp/src/policy_tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/userspace-dataplane-architecture.md, docs/junos-cli-reference.md,
+  docs/config-schema.md
+
 ## 2026-06-26 — #2749 doc fold: event_stream README payload 144 -> 152
 
 - **Timestamp**: 2026-06-26

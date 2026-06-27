@@ -1697,8 +1697,9 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// (warn so an already-persisted or peer-synced config with a stale zone
 	// reference still boots — #1960 no-brick; the dataplane drops the
 	// unindexed rule on its own, so a leniently-loaded bad config is inert).
-	// Exempts the `any` / `junos-host` / empty special tokens and does not
-	// touch global policies. Runs AFTER the policy match-address gate so a
+	// Exempts the `any` / `junos-host` / empty special tokens. Validates
+	// zone-pair from/to zones AND (as of #3148) a global policy's optional
+	// `match from-zone`/`match to-zone` context. Runs AFTER the policy match-address gate so a
 	// structural CoS/policer/device-map error and a bad match-address still
 	// win the first-error slot before a zone-reference error.
 	if err := validatePolicyZoneReferencesStrict(cfg); err != nil {

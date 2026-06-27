@@ -254,6 +254,19 @@ type PolicyMatch struct {
 	// DestinationAddressExcluded inverts the destination-address match
 	// sense (Junos `match destination-address-excluded`).
 	DestinationAddressExcluded bool
+	// FromZone and ToZone carry the optional from-zone/to-zone match
+	// context of a Junos GLOBAL policy (#3148). A Junos global policy may
+	// narrow which zone pairs it applies to with
+	// `match { from-zone <z>; to-zone <z>; }`; an empty value means "all
+	// zones" (the historical global behaviour). These fields are only
+	// meaningful for global policies — zone-pair policies derive their
+	// zones from the surrounding from-zone/to-zone stanza, so the compiler
+	// never populates these for them. The global policy is still evaluated
+	// in the GLOBAL tier ordering (after exact zone-pair and the #3090
+	// from-any/to-any/both-any wildcard tiers); the zone context is an
+	// extra match predicate, not a tier promotion.
+	FromZone string
+	ToZone   string
 }
 
 // PolicyAction is the action to take when a policy matches.

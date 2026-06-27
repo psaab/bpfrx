@@ -422,6 +422,15 @@ Global policies:
 
 - Same as regular policies but with `Global policies:` header.
 - Uses `From zones:` and `To zones:` (plural) instead of `From zone:` / `To zone:`.
+- **Zone context (#3148).** A global policy may carry optional
+  `set security policies global policy <p> match from-zone <z>` /
+  `match to-zone <z>` to scope it to a chosen zone pair (or one wildcard side)
+  instead of every zone pair. With a context set, `From zones:` / `To zones:`
+  shows the configured zone instead of `any`; absent, it shows `any`
+  (all zones — the historical behaviour). A zone-scoped global policy is still
+  evaluated in the global ordering, AFTER the exact zone-pair and the `from-zone
+  any` / `to-zone any` wildcard policies — it does not jump ahead of them. An
+  undefined match zone is rejected at commit.
 
 ---
 
