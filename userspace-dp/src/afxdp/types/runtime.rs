@@ -320,6 +320,16 @@ pub(in crate::afxdp) enum WorkerCommand {
         owner_rgs: Vec<i32>,
     },
     EnqueueShapedLocal(TxRequest),
+    /// #2880: latch the per-worker session-table loss-of-sync flag
+    /// (`SessionTable::set_delta_loss`) so the worker loop's
+    /// `take_delta_loss` check re-exports the full owner-RG snapshot (the
+    /// #2442/#2874 recovery path). Broadcast by the coordinator when a
+    /// correctness-critical close delta (the tunnel-remap purge in
+    /// `purge_remapped_tunnel_sessions`) could not be queued losslessly to
+    /// the event-stream consumer. The coordinator runs the purge OUTSIDE
+    /// the worker loop, so it cannot touch a worker's `SessionTable`
+    /// directly; this command is the same broadcast seam as `DeleteSynced`.
+    LatchDeltaLoss,
     /// #941 Work item C: vacate ALL V_min slots owned by this worker
     /// across every binding's shared_exact queues. Enqueued by the
     /// coordinator on HA demotion (RG primary→secondary). The actual

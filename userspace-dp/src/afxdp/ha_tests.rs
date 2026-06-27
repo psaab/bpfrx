@@ -750,3 +750,139 @@ fn kick_owner_rg_export_enqueues_command_then_wait_completes_on_ack() {
         "no bindings means no deltas to drain"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2880: purge_remapped_tunnel_sessions must not silently swallow a failed
+// lossless close-delta push. On a disconnected/saturated event stream the
+// close delta cannot be queued — the local sessions are still deleted, but the
+// coordinator MUST latch loss-of-sync on every worker (LatchDeltaLoss) so the
+// existing #2442/#2874 full owner-RG re-export supersedes the missed close on
+// the HA peer / Go shadow conntrack. Before the fix the `let _ =` discarded
+// the error and no resync was forced.
+// ---------------------------------------------------------------------------
+
+/// Install one forward synced session whose resolution carries
+/// `tunnel_endpoint_id`, returning the coordinator + the session key. The
+/// session is in the shared `synced` table (publish_shared_session), so the
+/// purge finds it and `delete_synced_session` can remove it.
+fn coordinator_with_tunnel_session(
+    tunnel_endpoint_id: u16,
+    worker_queues: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+) -> (Coordinator, SessionKey) {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = ForwardingState::default();
+    for (worker_id, queue) in worker_queues.iter().enumerate() {
+        coordinator
+            .workers
+            .handles
+            .insert(worker_id as u32, test_worker_handle(queue.clone()));
+    }
+    let mut decision = test_decision();
+    decision.resolution.tunnel_endpoint_id = tunnel_endpoint_id;
+    let key = test_key();
+    let entry = SyncedSessionEntry {
+        key: key.clone(),
+        decision,
+        metadata: test_metadata(), // is_reverse = false -> emits a close delta
+        origin: SessionOrigin::ForwardFlow,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+    };
+    publish_shared_session(
+        &coordinator.sessions.synced,
+        &coordinator.sessions.nat,
+        &coordinator.sessions.forward_wire,
+        &coordinator.sessions.owner_rg_indexes,
+        &entry,
+    );
+    (coordinator, key)
+}
+
+#[test]
+fn purge_remapped_tunnel_sessions_latches_delta_loss_on_lossless_failure() {
+    let worker_queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..2u32)
+        .map(|_| Arc::new(Mutex::new(VecDeque::new())))
+        .collect();
+    let (mut coordinator, key) = coordinator_with_tunnel_session(7, &worker_queues);
+
+    // Disconnected event stream: push_delta_lossless fails immediately
+    // (connected = false), like a wedged/disconnected consumer. Keep `_rx`
+    // alive so the channel does not also report Disconnected for an unrelated
+    // reason.
+    let (sender, _rx) = crate::event_stream::EventStreamSender::test_sender(false, 16);
+    coordinator.event_stream = Some(sender);
+
+    let purged = coordinator.purge_remapped_tunnel_sessions(&[7]);
+
+    // Local delete still happened and the count is accurate for the local
+    // purge (the loss is latched separately, not conflated with the count).
+    assert_eq!(purged, 1, "the local session is purged regardless of push");
+    assert!(
+        coordinator
+            .sessions
+            .synced
+            .lock()
+            .expect("synced")
+            .get(&key)
+            .is_none(),
+        "the remapped tunnel session must be deleted locally"
+    );
+
+    // FAIL-ON-REVERT: restoring `let _ = handle.push_delta_lossless(...)` (the
+    // swallow) removes this LatchDeltaLoss broadcast, so this assertion goes
+    // RED — the silent skip #2880 describes.
+    for (worker_id, queue) in worker_queues.iter().enumerate() {
+        let pending = queue.lock().expect("commands");
+        assert!(
+            pending
+                .iter()
+                .any(|cmd| matches!(cmd, WorkerCommand::LatchDeltaLoss)),
+            "worker {worker_id} must receive LatchDeltaLoss so its take_delta_loss \
+             re-exports the full owner-RG snapshot after the missed close"
+        );
+    }
+}
+
+#[test]
+fn purge_remapped_tunnel_sessions_no_loss_latched_on_lossless_success() {
+    let worker_queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..2u32)
+        .map(|_| Arc::new(Mutex::new(VecDeque::new())))
+        .collect();
+    let (mut coordinator, key) = coordinator_with_tunnel_session(7, &worker_queues);
+
+    // Connected event stream with a live receiver and ample capacity: the
+    // lossless close-delta push SUCCEEDS, so no loss must be latched.
+    let (sender, rx) = crate::event_stream::EventStreamSender::test_sender(true, 16);
+    coordinator.event_stream = Some(sender);
+
+    let purged = coordinator.purge_remapped_tunnel_sessions(&[7]);
+
+    assert_eq!(purged, 1, "the local session is purged and the count is correct");
+    assert!(
+        coordinator
+            .sessions
+            .synced
+            .lock()
+            .expect("synced")
+            .get(&key)
+            .is_none(),
+        "the remapped tunnel session must be deleted locally"
+    );
+    // The close delta reached the consumer.
+    assert!(
+        rx.try_recv().is_ok(),
+        "a close delta must be queued to the connected consumer"
+    );
+    // No worker may be told to resync — propagation succeeded.
+    for (worker_id, queue) in worker_queues.iter().enumerate() {
+        let pending = queue.lock().expect("commands");
+        assert!(
+            !pending
+                .iter()
+                .any(|cmd| matches!(cmd, WorkerCommand::LatchDeltaLoss)),
+            "worker {worker_id} must NOT be told to resync when the close delta \
+             was queued losslessly"
+        );
+    }
+}

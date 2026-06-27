@@ -1,3 +1,33 @@
+## 2026-06-26 — #2880 tunnel-remap purge latches loss-of-sync on a failed close delta
+
+- **Timestamp**: 2026-06-26
+- **Action**: Fixed `purge_remapped_tunnel_sessions` (ha.rs) silently swallowing
+  `push_delta_lossless` errors with `let _ =`. On a tunnel-endpoint-id remap the
+  coordinator deletes local sessions then emits Close deltas; a disconnected /
+  saturated event stream made the lossless close delta fail, leaving stale
+  tunnel-keyed sessions on the HA peer / Go shadow conntrack while the local
+  delete still happened. Routed the failure through the existing #2442/#2874
+  loss-of-sync recovery instead of inventing a new path: push losslessly and
+  stop on the first failure (mirroring `flush_session_deltas`), then broadcast a
+  new `WorkerCommand::LatchDeltaLoss` to every worker (same broadcast seam as
+  `DeleteSynced`) — the handler calls `SessionTable::set_delta_loss()`, so the
+  worker loop's existing `take_delta_loss()` re-exports the full owner-RG
+  snapshot and the peer re-derives a complete view. The `usize` return is
+  unchanged (accurate local purge count; the loss is latched separately, not
+  conflated). Added `EventStreamSender::test_sender(connected, capacity)` test
+  seam (no I/O thread / socket).
+- **File(s)**: userspace-dp/src/afxdp/ha.rs,
+  userspace-dp/src/afxdp/types/runtime.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/event_stream/mod.rs, userspace-dp/src/afxdp/ha_tests.rs,
+  docs/session-sync-architecture.md, _Log.md
+- **Validation**: `cargo build --release` + `cargo test --release` (afxdp::ha
+  19, session 132, event_stream 61 — all green). Fail-on-revert: restoring the
+  `let _ =` swallow turns
+  `purge_remapped_tunnel_sessions_latches_delta_loss_on_lossless_failure` RED
+  (no LatchDeltaLoss broadcast) while the success test stays green; restored
+  byte-identical.
+
 ## 2026-06-26 — #3073 policy hit-count per-packet on the established fast path
 
 - **Timestamp**: 2026-06-26

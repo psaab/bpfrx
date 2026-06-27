@@ -330,6 +330,31 @@ impl EventStreamSender {
         }
     }
 
+    /// #2880 test seam: build an `EventStreamSender` WITHOUT spawning the I/O
+    /// thread, with the connected flag forced to `connected`. The returned
+    /// `Receiver` must be kept alive by the test so the channel does not
+    /// disconnect; `push_delta_lossless` then succeeds (connected + live rx)
+    /// or fails immediately (`connected = false`) exactly like the production
+    /// disconnected / connected paths, without a real socket.
+    #[cfg(test)]
+    pub(crate) fn test_sender(
+        connected: bool,
+        capacity: usize,
+    ) -> (Self, mpsc::Receiver<EventFrame>) {
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        let shared = Arc::new(EventStreamShared::new());
+        shared.connected.store(connected, Ordering::Release);
+        (
+            Self {
+                tx,
+                shared,
+                io_thread: None,
+                stop: Arc::new(AtomicBool::new(false)),
+            },
+            rx,
+        )
+    }
+
     /// Signal the I/O thread to stop and wait for it to exit.
     pub(crate) fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);

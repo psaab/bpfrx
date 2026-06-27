@@ -435,6 +435,46 @@ resync is entirely worker-local — it re-uses the same per-worker delta ring an
 incremental sync (the control-socket contention rules in CLAUDE.md). It runs at
 most once per worker poll tick and only when an overflow actually occurred.
 
+### Coordinator tunnel-remap purge latches loss-of-sync on a failed close delta (#2880)
+
+The same loss-of-sync recovery now backstops the **coordinator-side**
+tunnel-endpoint-id remap purge (`purge_remapped_tunnel_sessions`, #1873). When a
+snapshot apply remaps a tunnel id, the coordinator deletes every session keyed
+to the old id and emits a `Close` delta on the event stream so the Go shadow
+conntrack and the HA peer drop the stale entry too. That close delta is pushed
+**losslessly** (`push_delta_lossless`) because it is correctness-critical — the
+sibling bulk-export path (`export_all_sessions_to_event_stream`) already
+propagates the same producer's error with `?`.
+
+Pre-#2880 the purge discarded the push result with `let _ =` and returned the
+purge count unconditionally. If the event stream was disconnected or saturated,
+the lossless close delta failed and was silently dropped: the local sessions
+were deleted, but the HA peer / Go shadow conntrack kept stale sessions keyed to
+the OLD endpoint id, and a later failover could forward with stale tunnel
+resolution. This is the close-delta sibling of the #2442/#2874 silent-drop
+class.
+
+The fix routes the failure through the **existing** loss-of-sync machinery
+rather than inventing a new recovery:
+
+- The purge pushes the close deltas losslessly and, mirroring
+  `flush_session_deltas` (#2874), stops on the first genuine failure (peer
+  disconnect / queue timeout) — the full resync supersedes the rest anyway, and
+  this bounds producer backpressure to a single lossless wait per purge.
+- On any failure the coordinator broadcasts a new `WorkerCommand::LatchDeltaLoss`
+  to **every** worker. The coordinator runs the purge OUTSIDE the worker loop and
+  cannot touch a worker's `SessionTable` directly, so this reuses the same
+  broadcast seam as the `DeleteSynced` replication (uniform `lock_recover` poison
+  policy). The command handler calls `SessionTable::set_delta_loss()`; the worker
+  loop's existing `take_delta_loss()` check then re-exports the full owner-RG
+  snapshot, so the peer re-derives a complete session view and the missed close
+  is superseded.
+- The return value is unchanged (`usize`): it remains the accurate **local**
+  purge count. The propagation loss is latched **separately** via the broadcast —
+  the two are deliberately not conflated, and callers
+  (`coordinator/snapshot_refresh.rs`, `coordinator/reconcile/snapshot.rs`) read
+  the count only for logging.
+
 ### Drained deltas reach binding-independent consumers even with no binding (#2669)
 
 The worker loop drains the delta ring **unconditionally** (`drain_deltas`

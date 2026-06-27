@@ -699,6 +699,16 @@ pub(super) fn apply_worker_commands(
                 // Trivial variant — kept inline (#1346 plan v2 §4.1).
                 shaped_tx_requests.push(req);
             }
+            WorkerCommand::LatchDeltaLoss => {
+                // #2880: the coordinator's tunnel-remap purge could not queue
+                // a close delta losslessly. Latch loss-of-sync on THIS worker's
+                // session table so the `take_delta_loss` check in the loop body
+                // re-exports the full owner-RG snapshot (the #2442/#2874
+                // recovery path), superseding the missed close on the peer /
+                // Go shadow conntrack. Mirrors the in-worker latch the #2874
+                // flush path sets via `set_delta_loss`.
+                sessions.set_delta_loss();
+            }
             WorkerCommand::VacateAllSharedExactSlots => {
                 // Trivial variant — kept inline (#1346 plan v2 §4.1).
                 // #941 Work item C: signal the outer poll loop to vacate
