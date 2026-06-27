@@ -22374,3 +22374,12 @@ top.
   pkg/grpcapi/server_cluster.go, pkg/grpcapi/server_show_firewall.go,
   pkg/api/security.go, pkg/cli/cli_request.go,
   pkg/cli/cli_show_security.go, cmd/cli/main.go, cmd/cli/show.go
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3285 — policymatch simulator now mirrors the dataplane host gate (evaluate_junos_host_policy) for to-zone junos-host queries: exact from-zone <ingress> to-zone junos-host then from-zone any to-zone junos-host, with NO global/default transit fallback (and to-zone any / both-any NOT consulted). Added Match() branch + matchJunosHost + Result.HostInboundUnmatched; surfaced through REST (host_inbound_unmatched JSON), gRPC MatchPolicies (new proto bool field), gRPC test-policy text, and local/remote CLI rendering. Added fail-on-revert tests.
+  **File(s)**: pkg/policymatch/policymatch.go,
+  pkg/policymatch/junos_host_test.go, pkg/policymatch/README.md,
+  proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/grpcapi/server_cluster.go, pkg/grpcapi/server_show_firewall.go,
+  pkg/api/security.go, pkg/api/types.go, pkg/cli/cli_request.go,
+  pkg/cli/cli_show_security.go, cmd/cli/show.go

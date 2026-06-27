@@ -140,6 +140,17 @@ terminating:
    typo'd/undefined-zone scope fails closed (matches nothing);
 5. **configured default-policy**.
 
+A `to-zone junos-host` query takes the separate **host gate** (#3285,
+`matchJunosHost` ↔ `evaluate_junos_host_policy`): exact `from-zone <ingress>
+to-zone junos-host` then `from-zone any to-zone junos-host`, with **no** global
+or default transit fallback (and `to-zone any` / `from-zone any to-zone any` are
+NOT pulled onto the host path). An unmatched host-bound flow returns
+`Result.HostInboundUnmatched` — local delivery proceeds (the management lifeline
+guarantee), never an inherited transit verdict. The surfaces render this as
+"host-inbound: local delivery proceeds (transit global/default-policy NOT
+applied)"; the gRPC `MatchPolicies` response carries it as
+`host_inbound_unmatched`.
+
 Address matching honors literal CIDRs, address
 books (recursive set expansion), `any`/`any-ipv4`/`any-ipv6`, source/destination
 exclusion (with the #2008 empty-excluded fail-closed rule), and the live

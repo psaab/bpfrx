@@ -6077,15 +6077,22 @@ func (x *MatchPoliciesRequest) GetIcmpCode() uint32 {
 }
 
 type MatchPoliciesResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	PolicyName    string                 `protobuf:"bytes,1,opt,name=policy_name,json=policyName,proto3" json:"policy_name,omitempty"`
-	Action        string                 `protobuf:"bytes,2,opt,name=action,proto3" json:"action,omitempty"`
-	SrcAddresses  []string               `protobuf:"bytes,3,rep,name=src_addresses,json=srcAddresses,proto3" json:"src_addresses,omitempty"`
-	DstAddresses  []string               `protobuf:"bytes,4,rep,name=dst_addresses,json=dstAddresses,proto3" json:"dst_addresses,omitempty"`
-	Applications  []string               `protobuf:"bytes,5,rep,name=applications,proto3" json:"applications,omitempty"`
-	Matched       bool                   `protobuf:"varint,6,opt,name=matched,proto3" json:"matched,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	PolicyName   string                 `protobuf:"bytes,1,opt,name=policy_name,json=policyName,proto3" json:"policy_name,omitempty"`
+	Action       string                 `protobuf:"bytes,2,opt,name=action,proto3" json:"action,omitempty"`
+	SrcAddresses []string               `protobuf:"bytes,3,rep,name=src_addresses,json=srcAddresses,proto3" json:"src_addresses,omitempty"`
+	DstAddresses []string               `protobuf:"bytes,4,rep,name=dst_addresses,json=dstAddresses,proto3" json:"dst_addresses,omitempty"`
+	Applications []string               `protobuf:"bytes,5,rep,name=applications,proto3" json:"applications,omitempty"`
+	Matched      bool                   `protobuf:"varint,6,opt,name=matched,proto3" json:"matched,omitempty"`
+	// host_inbound_unmatched is true ONLY for a `to-zone junos-host` query that
+	// matched no host-bound policy (#3285). The dataplane host gate returns None
+	// here — no implicit host default-deny and NO transit global/default
+	// fallback — so local delivery proceeds. When set, `matched` is false and
+	// `action` is empty; clients must render "host-inbound (local delivery; not
+	// governed by transit/global/default policy)", NOT a default-policy verdict.
+	HostInboundUnmatched bool `protobuf:"varint,7,opt,name=host_inbound_unmatched,json=hostInboundUnmatched,proto3" json:"host_inbound_unmatched,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *MatchPoliciesResponse) Reset() {
@@ -6156,6 +6163,13 @@ func (x *MatchPoliciesResponse) GetApplications() []string {
 func (x *MatchPoliciesResponse) GetMatched() bool {
 	if x != nil {
 		return x.Matched
+	}
+	return false
+}
+
+func (x *MatchPoliciesResponse) GetHostInboundUnmatched() bool {
+	if x != nil {
+		return x.HostInboundUnmatched
 	}
 	return false
 }
@@ -7439,7 +7453,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"_icmp_typeB\f\n" +
 	"\n" +
-	"_icmp_code\"\xd8\x01\n" +
+	"_icmp_code\"\x8e\x02\n" +
 	"\x15MatchPoliciesResponse\x12\x1f\n" +
 	"\vpolicy_name\x18\x01 \x01(\tR\n" +
 	"policyName\x12\x16\n" +
@@ -7447,7 +7461,8 @@ const file_xpf_proto_rawDesc = "" +
 	"\rsrc_addresses\x18\x03 \x03(\tR\fsrcAddresses\x12#\n" +
 	"\rdst_addresses\x18\x04 \x03(\tR\fdstAddresses\x12\"\n" +
 	"\fapplications\x18\x05 \x03(\tR\fapplications\x12\x18\n" +
-	"\amatched\x18\x06 \x01(\bR\amatched\"N\n" +
+	"\amatched\x18\x06 \x01(\bR\amatched\x124\n" +
+	"\x16host_inbound_unmatched\x18\a \x01(\bR\x14hostInboundUnmatched\"N\n" +
 	"\x16GetNATRuleStatsRequest\x12\x19\n" +
 	"\brule_set\x18\x01 \x01(\tR\aruleSet\x12\x19\n" +
 	"\bnat_type\x18\x02 \x01(\tR\anatType\"E\n" +

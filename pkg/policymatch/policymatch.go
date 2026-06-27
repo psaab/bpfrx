@@ -57,6 +57,12 @@ import (
 // MaxPort is the largest valid TCP/UDP port number.
 const MaxPort = 65535
 
+// JunosHostZone is the reserved self-traffic zone name. A query whose ToZone is
+// this name is host-bound (LocalDelivery) traffic; it is evaluated by the
+// dataplane's separate host gate (evaluate_junos_host_policy), not the transit
+// precedence chain. See matchJunosHost / Result.HostInboundUnmatched (#3285).
+const JunosHostZone = "junos-host"
+
 // ValidatePort checks an already-parsed simulator port value (the gRPC int32
 // field and the REST query int, which arrive numeric). A zero value means
 // "unspecified" — the port dimension is not constrained, the established
@@ -222,6 +228,17 @@ type Result struct {
 	// default-policy.
 	DefaultUsed bool
 
+	// HostInboundUnmatched is true ONLY for a `to-zone junos-host` query that
+	// matched no host-bound policy (#3285). The dataplane host gate
+	// (evaluate_junos_host_policy) returns None here — there is no implicit
+	// host default-deny and NO transit global/default fallback, so local
+	// delivery proceeds (the management lifeline). Matched is false and
+	// DefaultUsed is false; callers must render this as "host-inbound, not
+	// governed by transit/global/default policy", NOT as the default-policy
+	// verdict. Action is unset (PolicyPermit zero value) and carries no
+	// meaning in this case.
+	HostInboundUnmatched bool
+
 	PolicyName   string
 	Description  string
 	Action       config.PolicyAction
@@ -242,9 +259,20 @@ type Result struct {
 //	   `match to-zone` scope (#3148); an empty/`any` scope applies to every
 //	   zone, an undefined-zone scope fails closed (matches nothing)
 //	5. configured default-policy
+//
+// A `to-zone junos-host` query is host-bound and takes the separate host-gate
+// path (matchJunosHost, #3285): exact ingress->junos-host then
+// `from-zone any`->junos-host, with NO global/default transit fallback.
 func Match(cfg *config.Config, q Query) Result {
 	if cfg == nil {
 		return Result{DefaultUsed: true, Action: config.PolicyDeny}
+	}
+
+	// #3285: host-bound (LocalDelivery) traffic is governed by the dataplane's
+	// host gate, which does NOT apply transit global/default fallback. Branch
+	// before the transit tiers so that invariant cannot regress.
+	if q.ToZone == JunosHostZone {
+		return matchJunosHost(cfg, q)
 	}
 
 	// Tier 1: exact zone-pair policies, in config order (first match wins).
@@ -316,6 +344,44 @@ func Match(cfg *config.Config, q Query) Result {
 
 	// Tier 5: configured default-policy (NOT a hard-coded deny).
 	return Result{DefaultUsed: true, Action: cfg.Security.DefaultPolicy}
+}
+
+// matchJunosHost mirrors the dataplane host gate evaluate_junos_host_policy
+// (policy.rs) for a `to-zone junos-host` query (#3285). It consults ONLY exact
+// `from-zone <ingress> to-zone junos-host` rules, then the
+// `from-zone any to-zone junos-host` wildcard — in that order. There is NO
+// implicit host default-deny and NO global / transit-default fallback: an
+// unmatched host-bound flow falls through to local delivery (the management
+// lifeline guarantee), so the simulator returns HostInboundUnmatched rather
+// than inheriting the transit global/default verdict. `to-zone any` and
+// `from-zone any to-zone any` are deliberately NOT pulled onto the host path,
+// matching the runtime gate.
+func matchJunosHost(cfg *config.Config, q Query) Result {
+	// Exact ingress -> junos-host.
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil || zpp.ToZone != JunosHostZone || zpp.FromZone != q.FromZone {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol != nil && ruleMatches(cfg, q, pol) {
+				return matchedResult(pol, false)
+			}
+		}
+	}
+	// from-zone any -> junos-host.
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil || zpp.ToZone != JunosHostZone || zpp.FromZone != "any" {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol != nil && ruleMatches(cfg, q, pol) {
+				return matchedResult(pol, false)
+			}
+		}
+	}
+	// No host-bound rule matched: local delivery proceeds. Do NOT fall through
+	// to global/default — the dataplane host gate returns None here.
+	return Result{HostInboundUnmatched: true}
 }
 
 // globalScopeMatches replicates GlobalZoneScope::matches + build_global_zone_scope

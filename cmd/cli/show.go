@@ -964,6 +964,10 @@ func (c *ctl) showMatchPolicies(args []string) error {
 		fmt.Printf("    Destination addresses: %v\n", resp.DstAddresses)
 		fmt.Printf("    Applications: %v\n", resp.Applications)
 		fmt.Printf("    Action: %s\n", resp.Action)
+	} else if resp.HostInboundUnmatched {
+		// #3285: host-bound traffic — no transit global/default fallback.
+		fmt.Printf("No matching to-zone junos-host policy for %s -> junos-host\n", req.FromZone)
+		fmt.Printf("  host-inbound: local delivery proceeds (transit global/default-policy NOT applied)\n")
 	} else {
 		fmt.Printf("No matching policy found for %s -> %s (default deny)\n", req.FromZone, req.ToZone)
 	}

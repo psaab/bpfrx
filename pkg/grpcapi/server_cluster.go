@@ -202,6 +202,16 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		// simulator falls through to the next active rule / default-policy.
 		PolicyInactiveFn: s.policyInactiveFn(),
 	})
+	// #3285: a `to-zone junos-host` query that matched no host-bound policy is
+	// NOT a transit default — the dataplane host gate returns None (local
+	// delivery; no global/default fallback). Signal it explicitly so the client
+	// does not render a misleading default-policy verdict for the host path.
+	if res.HostInboundUnmatched {
+		return &pb.MatchPoliciesResponse{
+			Matched:              false,
+			HostInboundUnmatched: true,
+		}, nil
+	}
 	if !res.Matched {
 		return &pb.MatchPoliciesResponse{
 			Matched: false,

@@ -356,6 +356,18 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		FeedOverlay:      overlay,
 		PolicyInactiveFn: inactiveFn,
 	})
+	// #3285: a `to-zone junos-host` query that matched no host-bound policy is
+	// not a transit default — the dataplane host gate returns None (local
+	// delivery; no global/default fallback). Surface it explicitly so the
+	// caller does not read a misleading default-policy verdict for the host
+	// path.
+	if res.HostInboundUnmatched {
+		writeOK(w, MatchPoliciesResult{
+			HostInboundUnmatched: true,
+			Action:               "host-inbound (local delivery; not governed by transit/global/default policy)",
+		})
+		return
+	}
 	if !res.Matched {
 		writeOK(w, MatchPoliciesResult{Action: policymatch.ActionString(res.Action) + " (default)"})
 		return

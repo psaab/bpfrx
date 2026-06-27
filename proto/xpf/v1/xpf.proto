@@ -593,6 +593,13 @@ message MatchPoliciesResponse {
   repeated string dst_addresses = 4;
   repeated string applications = 5;
   bool matched = 6;
+  // host_inbound_unmatched is true ONLY for a `to-zone junos-host` query that
+  // matched no host-bound policy (#3285). The dataplane host gate returns None
+  // here — no implicit host default-deny and NO transit global/default
+  // fallback — so local delivery proceeds. When set, `matched` is false and
+  // `action` is empty; clients must render "host-inbound (local delivery; not
+  // governed by transit/global/default policy)", NOT a default-policy verdict.
+  bool host_inbound_unmatched = 7;
 }
 
 // --- NAT rule counters ---
