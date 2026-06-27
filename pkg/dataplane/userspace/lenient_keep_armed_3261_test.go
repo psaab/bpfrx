@@ -198,10 +198,22 @@ func TestFeedBackedAddressIsRepresentableNoSentinel(t *testing.T) {
 //     (dns-name) member — pre-fix the literal gave the row content so the book
 //     looked representable while the dns-name member was silently dropped
 //     (deny narrowing). The whole set must be unrepresentable.
+//   - "empty-set": an address-set with ZERO members. Pre-(convergent-fix) the
+//     structural nameRepresentable's AddressSet branch returned VACUOUSLY true
+//     (no member to taint it), so no sentinel was emitted; the empty row decodes
+//     to MatchNone and the deny falls through (fail-open).
+//   - "cycle-set": a PURE self-cycle (X -> X) with no concrete member. The
+//     cycle-guard returns representable on revisit, so pre-fix the set was
+//     vacuously representable yet compiles to an empty row (fail-open).
+//   - "feed-only-set": an address-set whose ONLY member is a feed-bound name.
+//     Feed prefixes are merged only for the TOP-LEVEL overlay name, never into
+//     a set member's row (#2049 / Codex MAJOR 1), so the set row is empty —
+//     pre-fix it was deemed representable (the member is a representable feed
+//     name) yet decodes to MatchNone (fail-open).
 //
 // All must make the snapshot carry the __unsupported_address__ sentinel and
-// stay armed (#3261).
-func unrepresentableAddressCfg(kind string) *config.Config {
+// stay armed (#3261). overlay carries the feed binding for "feed-only-set".
+func unrepresentableAddressCfg(kind string) (*config.Config, map[string][]string) {
 	cfg := &config.Config{}
 	cfg.Security.DefaultPolicy = config.PolicyPermit
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
@@ -209,6 +221,7 @@ func unrepresentableAddressCfg(kind string) *config.Config {
 		"wan": {Name: "wan", Interfaces: []string{"reth0.80"}},
 	}
 	dstName := "undefined-book"
+	var overlay map[string][]string
 	switch kind {
 	case "empty-value":
 		dstName = "dns-book"
@@ -237,6 +250,33 @@ func unrepresentableAddressCfg(kind string) *config.Config {
 				"mixed-set": {Name: "mixed-set", Addresses: []string{"good-host", "dns-member"}},
 			},
 		}
+	case "empty-set":
+		dstName = "empty-set"
+		cfg.Security.AddressBook = &config.AddressBook{
+			// An address-set with ZERO members — vacuously "representable"
+			// pre-(convergent-fix), but an empty row -> MatchNone -> fail-open.
+			AddressSets: map[string]*config.AddressSet{
+				"empty-set": {Name: "empty-set"},
+			},
+		}
+	case "cycle-set":
+		dstName = "cycle-set"
+		cfg.Security.AddressBook = &config.AddressBook{
+			// Pure self-cycle with no concrete member.
+			AddressSets: map[string]*config.AddressSet{
+				"cycle-set": {Name: "cycle-set", AddressSets: []string{"cycle-set"}},
+			},
+		}
+	case "feed-only-set":
+		dstName = "feed-only-set"
+		cfg.Security.AddressBook = &config.AddressBook{
+			// The set's ONLY member is a feed-bound name. The feed prefixes are
+			// NOT merged into the set row (#2049), so the row is empty.
+			AddressSets: map[string]*config.AddressSet{
+				"feed-only-set": {Name: "feed-only-set", Addresses: []string{"bad-actors"}},
+			},
+		}
+		overlay = map[string][]string{"bad-actors": {"198.51.100.0/24", "2001:db8:bad::/48"}}
 	}
 	cfg.Security.Policies = []*config.ZonePairPolicies{{
 		FromZone: "lan",
@@ -251,18 +291,21 @@ func unrepresentableAddressCfg(kind string) *config.Config {
 			Action: config.PolicyDeny,
 		}},
 	}}
-	return cfg
+	return cfg, overlay
 }
 
 func TestUnrepresentableAddressKeepsArmedAndCarriesSentinel(t *testing.T) {
-	for _, kind := range []string{"undefined", "empty-value", "unparseable-value", "partial-set"} {
+	for _, kind := range []string{
+		"undefined", "empty-value", "unparseable-value", "partial-set",
+		"empty-set", "cycle-set", "feed-only-set",
+	} {
 		t.Run(kind, func(t *testing.T) {
-			cfg := unrepresentableAddressCfg(kind)
+			cfg, overlay := unrepresentableAddressCfg(kind)
 			caps := deriveUserspaceCapabilities(cfg)
 			if !caps.ForwardingSupported {
 				t.Fatalf("ForwardingSupported = false, want true: an unrepresentable address must NOT disarm (#3261). UnsupportedReasons=%v", caps.UnsupportedReasons)
 			}
-			snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+			snap, err := buildSnapshotWithSchedulerState(cfg, config.UserspaceConfig{}, 1, 0, nil, nil, overlay)
 			if err != nil {
 				t.Fatalf("buildSnapshot: %v", err)
 			}
@@ -367,5 +410,60 @@ func TestExplicitAnyAddressBookIsMatchAnyNotRejected(t *testing.T) {
 	}
 	if len(rule.DestinationBookIDs) == 0 {
 		t.Fatal("explicit `any` book must route through a book ID (the 0.0.0.0/0 + ::/0 row)")
+	}
+}
+
+// TestFeedPlusConcreteAddressSetIsRepresentable is the convergent-MAJOR POSITIVE
+// control: an address-set with a feed-bound member ALONGSIDE a concrete CIDR
+// member keeps >=1 concrete contribution, so it stays representable — NO address
+// sentinel, NO content rejection, stays armed. This documents the deferred #2049
+// residual: the feed prefixes are NOT merged into the set row, so a deny over
+// this set under-denies the feed portion; that partial-under-deny is the
+// pre-existing feed-prefixes-not-merged-into-sets limitation and is explicitly
+// OUT OF SCOPE for #3261. Only a set with ZERO concrete members (empty / pure
+// cycle / feed-only) is rejected — see TestUnrepresentableAddressKeepsArmedAndCarriesSentinel.
+func TestFeedPlusConcreteAddressSetIsRepresentable(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.DefaultPolicy = config.PolicyPermit
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"lan": {Name: "lan", Interfaces: []string{"reth1"}},
+		"wan": {Name: "wan", Interfaces: []string{"reth0.80"}},
+	}
+	cfg.Security.AddressBook = &config.AddressBook{
+		Addresses: map[string]*config.Address{
+			"good-host": {Name: "good-host", Value: "172.16.80.200/32"},
+		},
+		AddressSets: map[string]*config.AddressSet{
+			// feed member + concrete member -> >=1 concrete -> representable.
+			"mixed-feed-set": {Name: "mixed-feed-set", Addresses: []string{"bad-actors", "good-host"}},
+		},
+	}
+	cfg.Security.Policies = []*config.ZonePairPolicies{{
+		FromZone: "lan",
+		ToZone:   "wan",
+		Policies: []*config.Policy{{
+			Name: "deny-mixed",
+			Match: config.PolicyMatch{
+				SourceAddresses:      []string{"any"},
+				DestinationAddresses: []string{"mixed-feed-set"},
+				Applications:         []string{"any"},
+			},
+			Action: config.PolicyDeny,
+		}},
+	}}
+	overlay := map[string][]string{"bad-actors": {"198.51.100.0/24"}}
+	snap, err := buildSnapshotWithSchedulerState(cfg, config.UserspaceConfig{}, 1, 0, nil, nil, overlay)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	if len(snap.Capabilities.PolicyContentRejected) != 0 {
+		t.Fatalf("PolicyContentRejected = %v, want empty: a {feed + concrete} set keeps a concrete prefix and stays representable (#2049 under-deny residual is out of scope)", snap.Capabilities.PolicyContentRejected)
+	}
+	rule := snap.Policies[0]
+	if addressListHasSentinel(rule.DestinationLiterals) || addressListHasSentinel(rule.DestinationAddresses) {
+		t.Fatalf("{feed + concrete} set must NOT carry the address sentinel: lit=%v addr=%v", rule.DestinationLiterals, rule.DestinationAddresses)
+	}
+	if len(rule.DestinationBookIDs) == 0 {
+		t.Fatal("{feed + concrete} set must route through a book ID (carries the concrete-member prefix)")
 	}
 }

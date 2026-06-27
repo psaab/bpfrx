@@ -808,52 +808,104 @@ func expandBookNameRecursive(ab *config.AddressBook, name string, visited map[st
 // (#3261). It is structural and content-independent: every resolved member must
 // be a feed-bound name (resolved via the snapshot overlay, #2049), or an
 // Address whose value parses to a concrete prefix (CIDR / bare IP / "any"), or
-// an AddressSet all of whose members are representable. An Address with an
-// empty or unparseable value (a Junos dns-name / wildcard-address /
-// range-address that compiled to Value=="") or an undefined reference makes the
-// name UNREPRESENTABLE — so buildOneRuleSnapshot emits the address sentinel and
-// the Rust preflight rejects the whole snapshot rather than (A) widening an
-// empty value to 0.0.0.0/0 match-any, or (B) silently dropping the
-// unrepresentable member of an otherwise-populated book (deny narrowing).
-// Because the check does not inspect the per-name feed-overlay merge, a set
-// that merely CONTAINS a feed member stays representable (no false reject).
+// an AddressSet all of whose members are representable AND that contributes at
+// least one CONCRETE prefix. An Address with an empty or unparseable value (a
+// Junos dns-name / wildcard-address / range-address that compiled to
+// Value=="") or an undefined reference makes the name UNREPRESENTABLE — so
+// buildOneRuleSnapshot emits the address sentinel and the Rust preflight
+// rejects the whole snapshot rather than (A) widening an empty value to
+// 0.0.0.0/0 match-any, or (B) silently dropping the unrepresentable member of
+// an otherwise-populated book (deny narrowing). Because the check does not
+// inspect the per-name feed-overlay merge, a DIRECT policy token that names a
+// feed (not inside a set) stays representable (no false reject); the empty-feed
+// = MatchNone semantics are by design (#2049).
+//
+// #3261 convergent MAJOR (Codex MAJOR 2 + Claude-SMR): the SET branch
+// additionally requires that at least one recursively-resolved member
+// contributes a concrete prefix. Without this an EMPTY address-set, a pure
+// self-cycle (X -> X), or a set whose ONLY members are feed-bound names were
+// VACUOUSLY representable — no sentinel emitted — yet they compile to an EMPTY
+// book row (feed prefixes are merged only for the TOP-LEVEL overlay name in
+// buildAddressBookTableWithFeeds, never for a set MEMBER; Codex MAJOR 1). An
+// empty-row deny side decodes to MatchNone, so a `deny <empty/cycle/feed-only
+// set>` matches nothing and falls through to a later permit / default-permit —
+// a deny fail-OPEN on the exact lenient-load / peer-sync path this mechanism
+// guards (the strict commit gate is downgraded to a warning there). A set
+// MIXING a feed member and >=1 concrete member stays representable (the
+// feed-portion under-deny is the deferred #2049 feed-prefixes-not-merged-into-
+// sets residual, OUT OF SCOPE here).
 func nameRepresentable(ab *config.AddressBook, feedOverlay map[string][]string, name string, visited map[string]bool) bool {
+	representable, _ := nameRepresentability(ab, feedOverlay, name, visited)
+	return representable
+}
+
+// nameRepresentability returns (representable, concrete) for an address-book
+// name. `representable` is false if any recursively-resolved member is
+// unrepresentable (empty/unparseable value, or an undefined reference).
+// `concrete` reports whether the name contributes at least one CONCRETE prefix
+// to a book row: a CIDR / bare-IP / explicit-`any` Address, or a nested set
+// that itself has a concrete contribution. A feed-bound name and a cycle
+// revisit are representable-but-NOT-concrete (a feed member's prefixes are not
+// merged into an enclosing set's row, and a cycle revisit contributes nothing,
+// matching expandBookNameRecursive's nil-on-revisit). The SET branch is the
+// only one that consults `concrete`: a set is representable iff every member is
+// representable AND at least one member is concrete, closing the empty / pure-
+// cycle / feed-only fail-opens (#3261). The direct Address / direct feed-name
+// paths do not require `concrete`, preserving the #2049 direct-feed exemption.
+func nameRepresentability(ab *config.AddressBook, feedOverlay map[string][]string, name string, visited map[string]bool) (representable, concrete bool) {
 	if name == "" {
-		return false
+		return false, false
 	}
 	if visited[name] {
-		// Cycle: matches expandBookNameRecursive's nil-on-revisit (no extra
-		// contribution) — do not let a self-referential set fail closed.
-		return true
+		// Cycle revisit: matches expandBookNameRecursive's nil-on-revisit — no
+		// extra contribution (not concrete), but it does not taint the name as
+		// unrepresentable. The ENCLOSING set's >=1-concrete requirement is what
+		// rejects a pure self-cycle, so a self-referential set that ALSO has a
+		// real prefix stays representable.
+		return true, false
 	}
 	if _, feedBound := feedOverlay[name]; feedBound {
-		return true
+		// Feed-bound name: representable, but its prefixes are merged only for
+		// the top-level overlay name, never into an enclosing set's row — so it
+		// is NOT a concrete contribution toward a set's representability.
+		return true, false
 	}
 	if ab == nil {
-		return false
+		return false, false
 	}
 	if addr, ok := ab.Addresses[name]; ok {
-		return addressValueRepresentable(addr.Value)
+		if addressValueRepresentable(addr.Value) {
+			return true, true
+		}
+		return false, false
 	}
 	set, ok := ab.AddressSets[name]
 	if !ok {
 		// Neither a static address/set nor a feed-bound name: an undefined
 		// reference is unrepresentable.
-		return false
+		return false, false
 	}
 	visited[name] = true
 	defer delete(visited, name)
+	anyConcrete := false
 	for _, member := range set.Addresses {
-		if !nameRepresentable(ab, feedOverlay, member, visited) {
-			return false
+		r, c := nameRepresentability(ab, feedOverlay, member, visited)
+		if !r {
+			return false, false
 		}
+		anyConcrete = anyConcrete || c
 	}
 	for _, nested := range set.AddressSets {
-		if !nameRepresentable(ab, feedOverlay, nested, visited) {
-			return false
+		r, c := nameRepresentability(ab, feedOverlay, nested, visited)
+		if !r {
+			return false, false
 		}
+		anyConcrete = anyConcrete || c
 	}
-	return true
+	// A set is representable ONLY IF at least one member contributes a concrete
+	// prefix; an empty / pure-cycle / feed-only set compiles to an empty row
+	// (MatchNone) and is rejected fail-closed.
+	return anyConcrete, anyConcrete
 }
 
 // addressValueRepresentable reports whether a single address-book entry VALUE
