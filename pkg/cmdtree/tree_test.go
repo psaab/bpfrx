@@ -104,3 +104,14 @@ func TestLookupDesc_ConfigModeResolvesUniquePrefixWords(t *testing.T) {
 // setSchema), so testing it was a false-coverage trap. The symptom-1
 // completion behaviour is now pinned at the real frontend boundary in
 // pkg/cli (completeConfigWithDesc) and pkg/grpcapi (completeConfigPairs).
+
+// TestCompleteFromTree_RequestSystemDynamicDNS is the #3276 cmdtree SSOT proof:
+// `request system dynamic-dns` completes to the update/check verbs, so tab
+// completion + `?` help expose the operator force-now/check-now command across
+// the local CLI, remote CLI, and gRPC. Revert the cmdtree node → RED.
+func TestCompleteFromTree_RequestSystemDynamicDNS(t *testing.T) {
+	cands := CompleteFromTree(OperationalTree, []string{"request", "system", "dynamic-dns"}, "", nil)
+	if !contains(cands, "update") || !contains(cands, "check") {
+		t.Fatalf("expected update/check completions under request system dynamic-dns, got %v", cands)
+	}
+}

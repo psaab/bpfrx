@@ -1,3 +1,29 @@
+## 2026-06-27 — #3276 DDNS operator force-now / check-now verb
+
+- **Timestamp**: 2026-06-27
+- **Action**: Add `request system dynamic-dns update` (force-now) and
+  `request system dynamic-dns check` (check-now) operator verbs. The Surface A
+  DDNS engine already had a forced-refresh path decoupled from the poll (P2
+  #2717) but no operator trigger. Engine: new one-shot `SurfaceAManager.
+  ForceRefresh()` latch consumed by the next non-degraded reconcile pass — makes
+  every configured scope refresh-due so the RG owner re-asserts the wire record
+  even for an unchanged address inside the forced-refresh floor; the latch does
+  NOT bypass the per-RG HA writer gate (#2972). Daemon: `ForceDDNSUpdate(force)`
+  arms the latch (force=true) + nudges both DDNS reconcile loops; honors the
+  node-level owner gate (`ddnsWriterGateOpen`) — on a backup it is a no-op with a
+  clear "not the active writer" message. Wiring: cmdtree node →
+  gRPC `SystemAction("dynamic-dns-update"|"dynamic-dns-check")` → local CLI
+  (`handleRequestSystemDynamicDNS` + `SetSurfaceADDNSForceFn`) + remote CLI.
+  Tests (fail-on-revert): pkg/ddns force-republishes-unchanged + gate-respected;
+  pkg/daemon owner-gate (standalone/backup/master); pkg/grpcapi dispatch +
+  unavailable; pkg/cmdtree completion. Closes #3276.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/surface_a_test.go,
+  pkg/daemon/daemon_ddns_surface_a.go, pkg/daemon/daemon_ddns_surface_a_test.go,
+  pkg/daemon/daemon_run.go, pkg/grpcapi/server.go, pkg/grpcapi/server_diag.go,
+  pkg/grpcapi/system_action_test.go, pkg/cmdtree/tree.go,
+  pkg/cmdtree/tree_test.go, pkg/cli/cli.go, pkg/cli/cli_request.go,
+  cmd/cli/request.go, pkg/ddns/README.md
+
 ## 2026-06-26 — #3148 review fold: explicit `any`→Any + reject junos-host global match
 
 - **Timestamp**: 2026-06-26

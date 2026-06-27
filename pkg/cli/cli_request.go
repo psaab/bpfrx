@@ -934,8 +934,40 @@ func (c *CLI) handleRequestSystem(args []string) error {
 	case "software":
 		return c.handleRequestSystemSoftware(args[1:])
 
+	case "dynamic-dns":
+		return c.handleRequestSystemDynamicDNS(args[1:])
+
 	default:
 		return fmt.Errorf("unknown request system command: %s", args[0])
+	}
+}
+
+// handleRequestSystemDynamicDNS implements `request system dynamic-dns
+// update|check` (#3276): an operator force-now / check-now verb that triggers an
+// immediate DDNS publish out-of-band of the poll cycle. `update` re-asserts
+// every owned record now (force); `check` re-observes and publishes only changed
+// records. Both honor the per-RG owner gate — on a node that masters no RG the
+// daemon returns a clear "not the active node" message and takes no action.
+func (c *CLI) handleRequestSystemDynamicDNS(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("request system dynamic-dns:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["system"].Children["dynamic-dns"].Children))
+		return nil
+	}
+	if c.surfaceADDNSForceFn == nil {
+		return fmt.Errorf("dynamic-dns: DDNS engine not running")
+	}
+	switch args[0] {
+	case "update":
+		_, msg := c.surfaceADDNSForceFn(true)
+		fmt.Println(msg)
+		return nil
+	case "check":
+		_, msg := c.surfaceADDNSForceFn(false)
+		fmt.Println(msg)
+		return nil
+	default:
+		return fmt.Errorf("unknown request system dynamic-dns command: %s", args[0])
 	}
 }
 

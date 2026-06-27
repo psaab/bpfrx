@@ -113,6 +113,78 @@ func TestSurfaceARepublishesAfterForcedRefresh(t *testing.T) {
 	}
 }
 
+// TestSurfaceAForceRefreshRepublishesUnchanged is the #3276 fail-on-revert
+// proof for the operator force-now verb (`request system dynamic-dns update`).
+// An owned scope whose address has NOT changed and is still inside the
+// forced-refresh floor is normally a counted skip (no wire traffic). After
+// ForceRefresh() the NEXT reconcile MUST re-assert the wire record exactly once,
+// proving the force latch overrides the change-detection + forced-refresh skip.
+// Revert the `force ||` wiring in reconcileScopeLocked (or ForceRefresh) and the
+// forced pass skips → this test goes RED.
+func TestSurfaceAForceRefreshRepublishesUnchanged(t *testing.T) {
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
+	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
+	sc.ForcedRefresh = time.Hour
+	obs := fixedObserver("203.0.113.5")
+
+	// First publish establishes ownership + last-published.
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile1: %v", err)
+	}
+	// Inside the forced-refresh floor, unchanged address: normally a skip.
+	now = now.Add(time.Minute)
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile2: %v", err)
+	}
+	if got := len(fu.upserts); got != 1 {
+		t.Fatalf("baseline: unchanged-in-floor must skip; got %d upserts", got)
+	}
+
+	// Force-now: the next pass must re-assert even though nothing changed and the
+	// floor has not elapsed.
+	m.ForceRefresh()
+	now = now.Add(time.Minute)
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile3 (forced): %v", err)
+	}
+	if got := len(fu.upserts); got != 2 {
+		t.Fatalf("forced update must re-assert the wire record; got %d upserts", got)
+	}
+
+	// The latch is one-shot: a subsequent unchanged pass (still no force) skips
+	// again rather than re-asserting forever.
+	now = now.Add(time.Minute)
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, nil, nil); err != nil {
+		t.Fatalf("Reconcile4: %v", err)
+	}
+	if got := len(fu.upserts); got != 2 {
+		t.Fatalf("force latch must be one-shot; got %d upserts after the forced pass", got)
+	}
+}
+
+// TestSurfaceAForceRefreshRespectsGate proves the force-now latch never bypasses
+// the per-RG HA writer gate (#2972): a forced reconcile on a scope this node may
+// NOT write (gate closed) publishes NOTHING — only the RG owner writes, even
+// under an operator force.
+func TestSurfaceAForceRefreshRespectsGate(t *testing.T) {
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
+	sc := surfaceAScope("wan.example.net", FamilyV4, 1)
+	obs := fixedObserver("203.0.113.5")
+	gateClosed := func(ScopeKey) bool { return false }
+
+	m.ForceRefresh()
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, obs, gateClosed, nil); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := len(fu.upserts); got != 0 {
+		t.Fatalf("force must not bypass the per-RG gate; got %d upserts on a gated-out scope", got)
+	}
+}
+
 // NOTE (#2691 P2 review): the replace-on-address-change, withdraw-on-config-
 // removal, withdraw-on-address-loss, and per-RG-gate-withdraw proofs moved to
 // surface_a_rfc2136_test.go — they MUST run through the REAL rfc2136 backend

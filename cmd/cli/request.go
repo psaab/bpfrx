@@ -128,6 +128,32 @@ func (c *ctl) handleRequest(args []string) error {
 		}
 		fmt.Println(resp.Message)
 		return nil
+	case "dynamic-dns":
+		// #3276: operator force-now / check-now. `update` forces an immediate
+		// publish of all owned DDNS records; `check` re-observes and publishes
+		// only changed records. The daemon honors the per-RG owner gate.
+		if len(args) < 3 {
+			printRemoteTreeHelp("request system dynamic-dns:", "request", "system", "dynamic-dns")
+			return nil
+		}
+		var action string
+		switch args[2] {
+		case "update":
+			action = "dynamic-dns-update"
+		case "check":
+			action = "dynamic-dns-check"
+		default:
+			printRemoteTreeHelp("request system dynamic-dns:", "request", "system", "dynamic-dns")
+			return nil
+		}
+		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
+			Action: action,
+		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Message)
+		return nil
 	default:
 		return fmt.Errorf("unknown request system command: %s", args[1])
 	}

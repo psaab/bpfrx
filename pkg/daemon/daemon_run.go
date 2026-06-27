@@ -1407,6 +1407,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			DDNSStatsFn:          d.DDNSStats,
 			SurfaceADDNSStatsFn:  d.SurfaceAStats,
 			SurfaceADDNSStatusFn: d.SurfaceAStatus,
+			SurfaceADDNSForceFn:  d.ForceDDNSUpdate,
 			DDNSOwnedRecordsFn:   d.OwnedDDNSRecords,
 			// #2464: per-collector NetFlow v9 / IPFIX write-health for
 			// `show services flow-monitoring statistics`.
@@ -1541,6 +1542,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		shell.SetDDNSOwnedRecordsFn(d.OwnedDDNSRecords)
 		shell.SetSurfaceADDNSStatsFn(d.SurfaceAStats)
 		shell.SetSurfaceADDNSStatusFn(d.SurfaceAStatus)
+		shell.SetSurfaceADDNSForceFn(d.ForceDDNSUpdate)
 		shell.SetFlowCollectorHealthFn(d.FlowCollectorHealth)
 		shell.SetVRRPManager(d.vrrpMgr)
 		shell.SetFabricPeer(func() []string {
