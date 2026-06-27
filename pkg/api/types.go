@@ -79,6 +79,15 @@ type PolicyRule struct {
 	Count        bool     `json:"count"`
 	HitPackets   uint64   `json:"hit_packets"`
 	HitBytes     uint64   `json:"hit_bytes"`
+	// MatchFromZone / MatchToZone carry the optional from-zone/to-zone
+	// match context of a scoped GLOBAL policy (#3148, #3286). The global
+	// PolicyInfo group still reports from_zone="*"/to_zone="*" (all-zones
+	// tier), but a global policy may narrow itself to a zone pair; these
+	// per-rule fields surface that scope so automation/audit do not see a
+	// scoped global as all-zones. Empty (omitted) for an all-zones global
+	// and for ordinary zone-pair rules.
+	MatchFromZone string `json:"match_from_zone,omitempty"`
+	MatchToZone   string `json:"match_to_zone,omitempty"`
 }
 
 // SessionEntry holds a single session table entry.

@@ -95,8 +95,18 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 					count = counters.Packets
 				}
 			}
+			// #3286: a scoped global (#3148) shows its zone pair in the
+			// From/To columns so counter-based validation is unambiguous;
+			// an unscoped global keeps junos-global/junos-global.
+			hcFrom, hcTo := "junos-global", "junos-global"
+			if pol.Match.FromZone != "" {
+				hcFrom = pol.Match.FromZone
+			}
+			if pol.Match.ToZone != "" {
+				hcTo = pol.Match.ToZone
+			}
 			fmt.Printf("%-8d%-17s%-18s%-24s%-14d%s\n",
-				index, "junos-global", "junos-global", pol.Name, count, action)
+				index, hcFrom, hcTo, pol.Name, count, action)
 			index++
 		}
 	}
@@ -211,7 +221,19 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 				fmt.Printf("  Scheduler: %s (inactive)\n", pol.SchedulerName)
 			}
 			fmt.Printf("  Sequence number: %d\n", seqNum)
-			fmt.Printf("  From zone: junos-global, To zone: junos-global\n")
+			// #3286: a scoped global policy (#3148) narrows itself to a
+			// zone pair via `match from-zone/to-zone`. Show the configured
+			// scope instead of the all-zones "junos-global" placeholder so
+			// an operator can tell which zone pair a global rule applies to.
+			// An unscoped global keeps junos-global/junos-global.
+			globalFromZone, globalToZone := "junos-global", "junos-global"
+			if pol.Match.FromZone != "" {
+				globalFromZone = pol.Match.FromZone
+			}
+			if pol.Match.ToZone != "" {
+				globalToZone = pol.Match.ToZone
+			}
+			fmt.Printf("  From zone: %s, To zone: %s\n", globalFromZone, globalToZone)
 			if pol.Description != "" {
 				fmt.Printf("  Description: %s\n", pol.Description)
 			}

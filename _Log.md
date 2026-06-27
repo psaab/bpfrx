@@ -22395,3 +22395,45 @@ top.
   **File(s)**: cmd/cli/show.go, cmd/cli/nontty_test.go,
   cmd/cli/show_matchpolicies_test.go, pkg/policymatch/policymatch.go,
   pkg/policymatch/icmp_test.go, pkg/policymatch/README.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3286 — surface scoped-global-policy zone context (#3148
+  `match from-zone`/`to-zone`) on every policy inventory/show surface.
+  Previously only the dataplane enforced the scope; REST, gRPC, and CLI
+  rendered scoped globals as all-zones (`*`/`*`, junos-global, any),
+  hiding the scope from audit and making scoped-global hit counters
+  ambiguous. Added `match_from_zone`/`match_to_zone` to the REST
+  `PolicyRule` (omitempty) and the protobuf `PolicyRule` (fields 11/12,
+  regenerated), populated from `Policy.Match.FromZone/ToZone` in the
+  global loops; rendered the scoped zones in the CLI standard, detail,
+  brief, and hit-count views and the gRPC text hit-count/detail views.
+  Unscoped globals unchanged. Fail-on-revert tests across all three
+  packages (REST, gRPC structured + text, CLI all four views).
+  **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/api/types.go, pkg/api/security.go,
+  pkg/grpcapi/server_show_zones.go,
+  pkg/grpcapi/server_show_policies_text.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/api/security_scoped_global_3286_test.go,
+  pkg/grpcapi/server_show_zones_scoped_global_3286_test.go,
+  pkg/cli/cli_show_security_scoped_global_3286_test.go,
+  docs/junos-cli-reference.md, pkg/api/README.md, pkg/grpcapi/README.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3286 follow-up (Claude-SMR NEEDS-MINOR) — fold in the 4th
+  inventory surface the first pass missed: the Prometheus
+  `xpf_policy_hits_total` collector emitted `from_zone="*"`/`to_zone="*"`
+  for ALL global policies, scoped included. Prometheus is the canonical
+  counter-validation surface the issue's "scoped-global hit counters...
+  ambiguous" concern names directly. metrics_counters.go now uses the
+  policy's Match.FromZone/ToZone for the from_zone/to_zone labels when set
+  (identical conditional to the REST/gRPC/CLI surfaces); unscoped globals
+  keep `*`/`*`. Added a fail-on-revert metrics test (RED when reverted to
+  `*`/`*`). Confirmed no 5th surface: remaining `junos-global`/`*` uses are
+  the group-level PolicyInfo row (correct) and the dataplane
+  snapshot/counter-key computation (by design — tier classification +
+  stable counter IDs, real scope carried out-of-band in MatchFromZone/
+  ToZone and enforced in policy.rs), neither operator-facing display.
+  **File(s)**: pkg/api/metrics_counters.go,
+  pkg/api/metrics_scoped_global_3286_test.go, docs/phases.md,
+  pkg/api/README.md

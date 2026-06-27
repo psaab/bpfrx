@@ -131,7 +131,14 @@ contract.
   structured `GetPolicies`. A `from-zone`/`to-zone` filter selects
   zone-pair policies only, so the global section is suppressed when a
   filter is set. Omitting globals from any one surface is the #3059 /
-  #3045 class of blind-spot bug.
+  #3045 class of blind-spot bug. A scoped global (#3148 `match
+  from-zone`/`to-zone`) carries its narrowing (#3286): the text
+  `policies-hit-count` From/To columns and the `policies-detail` `Source
+  zone:`/`Destination zone:` lines show the configured zone for a scoped
+  global (group still `*`), and structured `GetPolicies` populates the
+  per-rule `match_from_zone`/`match_to_zone` proto fields (empty for an
+  unscoped global). Showing the group `*`/`*` but dropping the per-rule
+  scope is the #3286 blind spot.
 - Request-supplied numeric fields are signed on the wire and must be
   range-checked before they index/slice/size anything (#2282). `Complete`
   rejects a negative `pos` with `InvalidArgument` before slicing

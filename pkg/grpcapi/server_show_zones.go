@@ -130,6 +130,13 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 				Applications: rule.Match.Applications,
 				Log:          rule.Log != nil,
 				Count:        rule.Count,
+				// #3286: a scoped global policy (#3148) narrows the
+				// all-zones group to a zone pair. Carry the configured
+				// from/to-zone so the inventory shows the real scope
+				// instead of the group-level "*"/"*". Empty for an
+				// unscoped (all-zones) global — no regression.
+				MatchFromZone: rule.Match.FromZone,
+				MatchToZone:   rule.Match.ToZone,
 			}
 			if pr.SrcAddresses == nil {
 				pr.SrcAddresses = []string{}

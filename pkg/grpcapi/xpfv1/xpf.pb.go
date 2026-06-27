@@ -2159,17 +2159,24 @@ func (x *PolicyInfo) GetRules() []*PolicyRule {
 }
 
 type PolicyRule struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Action        string                 `protobuf:"bytes,2,opt,name=action,proto3" json:"action,omitempty"`
-	SrcAddresses  []string               `protobuf:"bytes,3,rep,name=src_addresses,json=srcAddresses,proto3" json:"src_addresses,omitempty"`
-	DstAddresses  []string               `protobuf:"bytes,4,rep,name=dst_addresses,json=dstAddresses,proto3" json:"dst_addresses,omitempty"`
-	Applications  []string               `protobuf:"bytes,5,rep,name=applications,proto3" json:"applications,omitempty"`
-	Log           bool                   `protobuf:"varint,6,opt,name=log,proto3" json:"log,omitempty"`
-	Count         bool                   `protobuf:"varint,7,opt,name=count,proto3" json:"count,omitempty"`
-	HitPackets    uint64                 `protobuf:"varint,8,opt,name=hit_packets,json=hitPackets,proto3" json:"hit_packets,omitempty"`
-	HitBytes      uint64                 `protobuf:"varint,9,opt,name=hit_bytes,json=hitBytes,proto3" json:"hit_bytes,omitempty"`
-	Description   string                 `protobuf:"bytes,10,opt,name=description,proto3" json:"description,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Name         string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Action       string                 `protobuf:"bytes,2,opt,name=action,proto3" json:"action,omitempty"`
+	SrcAddresses []string               `protobuf:"bytes,3,rep,name=src_addresses,json=srcAddresses,proto3" json:"src_addresses,omitempty"`
+	DstAddresses []string               `protobuf:"bytes,4,rep,name=dst_addresses,json=dstAddresses,proto3" json:"dst_addresses,omitempty"`
+	Applications []string               `protobuf:"bytes,5,rep,name=applications,proto3" json:"applications,omitempty"`
+	Log          bool                   `protobuf:"varint,6,opt,name=log,proto3" json:"log,omitempty"`
+	Count        bool                   `protobuf:"varint,7,opt,name=count,proto3" json:"count,omitempty"`
+	HitPackets   uint64                 `protobuf:"varint,8,opt,name=hit_packets,json=hitPackets,proto3" json:"hit_packets,omitempty"`
+	HitBytes     uint64                 `protobuf:"varint,9,opt,name=hit_bytes,json=hitBytes,proto3" json:"hit_bytes,omitempty"`
+	Description  string                 `protobuf:"bytes,10,opt,name=description,proto3" json:"description,omitempty"`
+	// match_from_zone / match_to_zone carry the optional from-zone/to-zone
+	// match context of a scoped GLOBAL policy (#3148). Empty for an
+	// all-zones global policy and for ordinary zone-pair rules (whose zones
+	// come from the enclosing PolicyInfo from_zone/to_zone). #3286: surfaces
+	// the configured zone scope so a scoped global is not shown as all-zones.
+	MatchFromZone string `protobuf:"bytes,11,opt,name=match_from_zone,json=matchFromZone,proto3" json:"match_from_zone,omitempty"`
+	MatchToZone   string `protobuf:"bytes,12,opt,name=match_to_zone,json=matchToZone,proto3" json:"match_to_zone,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2270,6 +2277,20 @@ func (x *PolicyRule) GetHitBytes() uint64 {
 func (x *PolicyRule) GetDescription() string {
 	if x != nil {
 		return x.Description
+	}
+	return ""
+}
+
+func (x *PolicyRule) GetMatchFromZone() string {
+	if x != nil {
+		return x.MatchFromZone
+	}
+	return ""
+}
+
+func (x *PolicyRule) GetMatchToZone() string {
+	if x != nil {
+		return x.MatchToZone
 	}
 	return ""
 }
@@ -7141,7 +7162,7 @@ const file_xpf_proto_rawDesc = "" +
 	"PolicyInfo\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12(\n" +
-	"\x05rules\x18\x03 \x03(\v2\x12.xpf.v1.PolicyRuleR\x05rules\"\xae\x02\n" +
+	"\x05rules\x18\x03 \x03(\v2\x12.xpf.v1.PolicyRuleR\x05rules\"\xfa\x02\n" +
 	"\n" +
 	"PolicyRule\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
@@ -7155,7 +7176,9 @@ const file_xpf_proto_rawDesc = "" +
 	"hitPackets\x12\x1b\n" +
 	"\thit_bytes\x18\t \x01(\x04R\bhitBytes\x12 \n" +
 	"\vdescription\x18\n" +
-	" \x01(\tR\vdescription\"\x9e\x04\n" +
+	" \x01(\tR\vdescription\x12&\n" +
+	"\x0fmatch_from_zone\x18\v \x01(\tR\rmatchFromZone\x12\"\n" +
+	"\rmatch_to_zone\x18\f \x01(\tR\vmatchToZone\"\x9e\x04\n" +
 	"\x12GetSessionsRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x05R\x06offset\x12\x12\n" +

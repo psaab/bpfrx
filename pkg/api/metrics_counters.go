@@ -168,8 +168,23 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 		if err != nil {
 			continue
 		}
+		// #3286: a scoped global policy (#3148 `match from-zone`/`to-zone`)
+		// narrows itself to a zone pair. Prometheus is the canonical
+		// counter-validation surface, so the per-policy hit metric must
+		// carry the real scope on its from_zone/to_zone labels instead of
+		// the all-zones "*"/"*" — otherwise scoped-global counters are
+		// indistinguishable from an all-zones global. An unscoped global
+		// keeps from_zone="*"/to_zone="*" (no regression). The rule label
+		// is unchanged.
+		fromZone, toZone := "*", "*"
+		if rule.Match.FromZone != "" {
+			fromZone = rule.Match.FromZone
+		}
+		if rule.Match.ToZone != "" {
+			toZone = rule.Match.ToZone
+		}
 		ch <- prometheus.MustNewConstMetric(c.policyHitsTotal, prometheus.CounterValue,
-			float64(ctrs.Packets), "*", "*", rule.Name)
+			float64(ctrs.Packets), fromZone, toZone, rule.Name)
 	}
 }
 

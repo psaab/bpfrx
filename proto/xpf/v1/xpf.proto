@@ -245,6 +245,13 @@ message PolicyRule {
   uint64 hit_packets = 8;
   uint64 hit_bytes = 9;
   string description = 10;
+  // match_from_zone / match_to_zone carry the optional from-zone/to-zone
+  // match context of a scoped GLOBAL policy (#3148). Empty for an
+  // all-zones global policy and for ordinary zone-pair rules (whose zones
+  // come from the enclosing PolicyInfo from_zone/to_zone). #3286: surfaces
+  // the configured zone scope so a scoped global is not shown as all-zones.
+  string match_from_zone = 11;
+  string match_to_zone = 12;
 }
 
 message GetSessionsRequest {
