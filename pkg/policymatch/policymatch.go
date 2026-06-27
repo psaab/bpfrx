@@ -251,14 +251,14 @@ type Result struct {
 // with the SAME precedence the runtime enforces (userspace-dp/src/policy.rs
 // evaluate_policy_result_with_icmp / try_match_rule), first-match terminating:
 //
-//	1. exact zone-pair (both zones concrete)
-//	2. single-wildcard tier — `from-zone any to-zone <X>` and
-//	   `from-zone <X> to-zone any`, MERGED in config order (#3090)
-//	3. both-any — `from-zone any to-zone any` (#3090)
-//	4. global (`junos-global`), gated by the optional `match from-zone` /
-//	   `match to-zone` scope (#3148); an empty/`any` scope applies to every
-//	   zone, an undefined-zone scope fails closed (matches nothing)
-//	5. configured default-policy
+//  1. exact zone-pair (both zones concrete)
+//  2. single-wildcard tier — `from-zone any to-zone <X>` and
+//     `from-zone <X> to-zone any`, MERGED in config order (#3090)
+//  3. both-any — `from-zone any to-zone any` (#3090)
+//  4. global (`junos-global`), gated by the optional `match from-zone` /
+//     `match to-zone` scope (#3148); an empty/`any` scope applies to every
+//     zone, an undefined-zone scope fails closed (matches nothing)
+//  5. configured default-policy
 //
 // A `to-zone junos-host` query is host-bound and takes the separate host-gate
 // path (matchJunosHost, #3285): exact ingress->junos-host then
