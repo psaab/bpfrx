@@ -21823,3 +21823,29 @@ top.
   userspace-dp/src/event_stream/tests.rs,
   userspace-dp/src/event_stream/README.md,
   docs/session-sync-design.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3121 NPTv6 outbound source translation now COMPOSES with DNAT.
+  The decision path gated `nptv6.translate_outbound` on
+  `rewrite_dst.is_none()`, so a flow matching both NPTv6 (source) and DNAT
+  (destination) lost its NPTv6 source rewrite and leaked the internal IPv6
+  source onto the wire. Fix: attempt NPTv6 in BOTH decision branches and
+  `merge()` the source rewrite into any pre-routing DNAT decision (the Permit
+  NAT site and the missing-neighbor seed site, so the seed session carries the
+  same composed decision regardless of ARP timing). Checksum: the NPTv6 source
+  rewrite is checksum-neutral (RFC 6296), but a composed DNAT destination is
+  not — so `compute_l4_csum_delta` short-circuits only for a PURE NPTv6
+  translation (one of src/dst set) and falls through to compute the DNAT delta
+  when both are set (the neutral NPTv6 term nets zero, direction-agnostic), and
+  `apply_nat_ipv6`'s both-sides arm no longer blanket-skips on `nptv6` (only on
+  a non-first fragment). Fail-on-revert test
+  `pin_nptv6_composes_with_dnat_checksum_valid` (descriptor+generic byte-parity
+  + oracle-valid L4 checksum) goes RED when the pre-#3121 nptv6 short-circuit is
+  restored; decision-level `nptv6_source_composes_with_dnat_decision` pins the
+  merge + reverse() compose contract.
+  **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/checksum.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/rewrite.rs,
+  userspace-dp/src/nptv6_tests.rs,
+  docs/feature-coverage.md

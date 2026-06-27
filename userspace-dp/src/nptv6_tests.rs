@@ -508,6 +508,67 @@ fn multiple_addresses_same_prefix() {
     }
 }
 
+// #3121: NPTv6 outbound source translation must COMPOSE with a
+// destination NAT (DNAT) decision. The dataplane decision path attempts
+// NPTv6 regardless of whether a pre-routing `rewrite_dst` is already
+// present and `merge()`s the NPTv6 source rewrite into the DNAT
+// decision. This decision-layer test pins that the merge preserves BOTH
+// translations (DNAT dst + NPTv6 src, nptv6 flag set) and that the
+// reverse-flow decision swaps them correctly so the return packet is
+// un-DNAT'd on the source and un-NPTv6'd on the destination.
+#[test]
+fn nptv6_source_composes_with_dnat_decision() {
+    use crate::nat::NatDecision;
+    use std::net::IpAddr;
+
+    let internal_src: IpAddr = "2001:db8:1::100".parse().unwrap();
+    let external_src: IpAddr = "2001:db8:abcd::100".parse().unwrap(); // NPTv6 result
+    let original_dst: IpAddr = "2001:db8:ffff::1".parse().unwrap();
+    let dnat_dst: IpAddr = "fd00::10".parse().unwrap(); // DNAT result
+
+    // Pre-routing DNAT decision (destination rewrite only).
+    let dnat = NatDecision {
+        rewrite_dst: Some(dnat_dst),
+        ..NatDecision::default()
+    };
+    // NPTv6 outbound source decision (source rewrite, nptv6 flag).
+    let nptv6 = NatDecision {
+        rewrite_src: Some(external_src),
+        nptv6: true,
+        ..NatDecision::default()
+    };
+
+    // The production path does `decision.nat = decision.nat.merge(nptv6)`.
+    let composed = dnat.merge(nptv6);
+    assert_eq!(
+        composed.rewrite_dst,
+        Some(dnat_dst),
+        "DNAT destination rewrite must survive the compose"
+    );
+    assert_eq!(
+        composed.rewrite_src,
+        Some(external_src),
+        "NPTv6 source rewrite must survive the compose (the #3121 bug dropped it)"
+    );
+    assert!(composed.nptv6, "the nptv6 flag must propagate through merge");
+
+    // Reverse-flow decision for the return packet: a forward `rewrite_dst`
+    // becomes a reverse `rewrite_src` (un-DNAT), a forward `rewrite_src`
+    // becomes a reverse `rewrite_dst` (un-NPTv6); nptv6 carries over.
+    let reverse = composed.reverse(internal_src, original_dst, 0, 0);
+    assert_eq!(
+        reverse.rewrite_src,
+        Some(original_dst),
+        "reverse must restore the original (pre-DNAT) destination as the source"
+    );
+    assert_eq!(
+        reverse.rewrite_dst,
+        Some(internal_src),
+        "reverse must restore the original (internal, pre-NPTv6) source as the destination"
+    );
+    assert!(reverse.nptv6, "reverse decision must keep the nptv6 flag");
+}
+
 /// Compute ones-complement sum of 8 words (for checksum neutrality test).
 fn ones_complement_sum(words: &[u16; 8]) -> u16 {
     let mut sum: u32 = 0;

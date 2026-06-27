@@ -934,6 +934,14 @@ pub(super) fn apply_nat_ipv6(
             )?;
         }
     } else if new_src.is_some() || new_dst.is_some() {
+        // BOTH src and dst are rewritten -- a composed translation
+        // (#3121: NPTv6 source + DNAT destination, or SNAT + DNAT). Unlike
+        // the single-sided arms above, do NOT blanket-skip the L4 checksum
+        // on `nat.nptv6` here: the NPTv6 side is checksum-neutral (its
+        // incremental word adjustment nets zero by RFC 6296, in either
+        // direction), but the composed DNAT side is NOT neutral and its
+        // address change MUST be folded into the L4 checksum. Only a
+        // non-first fragment (no L4 header at `rel_l4`) skips the adjust.
         let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
         let old_dst_words = ipv6_words_from_slice(packet.get(24..40)?)?;
         if let Some(ip) = new_src {
@@ -942,7 +950,7 @@ pub(super) fn apply_nat_ipv6(
         if let Some(ip) = new_dst {
             write_ipv6_dst(packet, 0, ip);
         }
-        if !skip_l4_csum {
+        if !non_first_fragment {
             let new_src_words = new_src
                 .map(|a| ipv6_words_from_octets(a.octets()))
                 .unwrap_or(old_src_words);
