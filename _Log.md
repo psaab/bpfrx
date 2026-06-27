@@ -1,3 +1,51 @@
+## 2026-06-26 — #3074 wire per-policy `then count` to the display surfaces
+
+- **Timestamp**: 2026-06-26
+- **Action**: The Junos `security policies ... policy <p> then count` modifier
+  was parsed and stored (`Policy.Count`) but inert — the six per-policy
+  counter display surfaces gated solely on the system-wide
+  `policy-stats system-wide enable` knob, so a `then count` policy reported 0
+  unless the global knob was also on. Made `then count` a per-policy display
+  selector: every surface now admits the counter when
+  `statsEnabled || <policy>.Count`. REUSE-not-rebuild over #3073 — the Rust
+  per-rule counter is already always-on and per-packet, and the knob was never
+  read by the dataplane, so this is a Go-side display selection with NO new
+  Rust counter and NO wire field. A policy without `then count` keeps the
+  pre-#3074 behavior (0 with the knob off).
+- **File(s)**: pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/grpcapi/server_show_policies_text.go, pkg/grpcapi/server_show_zones.go,
+  pkg/api/security.go, pkg/api/metrics_counters.go,
+  pkg/cli/cli_show_policies_thencount_3074_test.go (new),
+  pkg/grpcapi/server_show_policies_thencount_3074_test.go (new),
+  pkg/api/metrics_test.go, pkg/api/policy_counters_test.go,
+  pkg/grpcapi/server_show_zones_test.go (gate tests made #3074-aware),
+  docs/feature-gaps.md.
+## 2026-06-26 — #2998 FRR policy-statement default action follows the BGP protocol default
+
+- **Timestamp**: 2026-06-26
+- **Action**: A Junos policy-statement with no explicit policy-level default
+  action (`DefaultAction == ""`) was unconditionally rendered as a terminating
+  FRR `route-map <name> deny <seq>`. For a BGP import/export policy that only
+  modifies attributes on specific terms and expects the rest to pass
+  unmodified, that trailing deny (plus FRR's own implicit deny) BLACKHOLES every
+  non-matching route — divergence from Junos, where BGP import AND export
+  default-ACCEPT the unmatched route. Redistribute / forwarding-table export
+  policies correctly default to REJECT. Fix: thread the protocol-application
+  context. `buildManagedSection` builds the set of policy-statements applied as
+  a BGP `route-map in`/`out` (`collectBGPRouteMapPolicies`, default instance +
+  every VRF, mirroring the exact `generateProtocols` emit conditions) and passes
+  it to `generatePolicyOptions` (new optional `bgpAccept ...map[string]bool`
+  variadic). The default-action switch now renders: explicit accept → permit;
+  explicit reject → deny; no-default + BGP route-map context → permit (the fix);
+  no-default elsewhere → deny (fail-closed, unchanged). Direct/test callers omit
+  the variadic and keep the historical deny default.
+- **File(s)**: `pkg/frr/policy_render.go`, `pkg/frr/manager.go`,
+  `pkg/frr/policy_default_action_2998_test.go`, `pkg/frr/README.md`, `_Log.md`
+- **Validation**: `go build ./...`; `go test ./pkg/frr/...` green;
+  fail-on-revert confirmed (forcing the BGP-context default back to `deny`
+  makes `TestBuildManagedSection_BGPPolicyDefaultAccept` render
+  `route-map BGP-IN deny 20` → RED).
+
 ## 2026-06-26 — #3122 count peer-synced sessions toward the per-IP session limit
 
 - **Timestamp**: 2026-06-26

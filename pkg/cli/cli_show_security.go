@@ -67,7 +67,7 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var count uint64
-			if statsEnabled {
+			if statsEnabled || pol.Count {
 				if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
 					count = counters.Packets
 				}
@@ -90,7 +90,7 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var count uint64
-			if statsEnabled {
+			if statsEnabled || pol.Count {
 				if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
 					count = counters.Packets
 				}
