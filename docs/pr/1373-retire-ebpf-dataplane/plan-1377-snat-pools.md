@@ -51,21 +51,34 @@ matched but is unavailable". The packet path converts unavailable pool results
 into `record_source_nat_failure` exceptions and recycles the packet before
 session creation or forwarding.
 
-The current fail-closed runtime call sites are the four
+The current fail-closed runtime call sites are the two
 `source_nat_decision_for_flow(...)` paths in
-`userspace-dp/src/afxdp/poll_descriptor.rs`:
+`userspace-dp/src/afxdp/poll_descriptor/mod.rs`:
 
-- `poll_descriptor.rs:1229` - normal new-session path, no pre-routing DNAT:
-  source NAT lookup fails closed before the NAT decision is installed.
-- `poll_descriptor.rs:1257` - normal new-session path after pre-routing DNAT:
-  the source NAT side of the merged decision fails closed before merge/session
-  creation.
-- `poll_descriptor.rs:2160` - pending-neighbor/session-build retry path, no
-  pre-routing DNAT: source NAT lookup fails closed before the missing-neighbor
-  seed session is installed.
-- `poll_descriptor.rs:2187` - pending-neighbor/session-build retry path after
-  pre-routing DNAT: the source NAT side of the merged decision fails closed
-  before the missing-neighbor seed session is installed.
+- `poll_descriptor/mod.rs:1963` - normal new-session path: the source NAT
+  lookup fails closed before the NAT decision is installed. This is the single
+  SNAT fallback the merge path uses whether or not a pre-routing DNAT is
+  present (the source side of the merged decision still fails closed before
+  merge/session creation).
+- `poll_descriptor/mod.rs:3691` - pending-neighbor/session-build retry path:
+  the source NAT lookup fails closed before the missing-neighbor seed session
+  is installed. Same single-fallback shape as the new-session path.
+
+> #3121 reduction (was four sites): NPTv6 outbound source translation now
+> COMPOSES with destination NAT. Each path (the normal new-session Permit-NAT
+> site and the missing-neighbor seed site) previously had a duplicated
+> `source_nat_decision_for_flow(...)` call — one in a `rewrite_dst.is_none()`
+> branch and one in the `else` (DNAT-present) branch. The #3121 fix attempts
+> NPTv6 first (and `merge()`s its source rewrite into any pre-routing DNAT
+> decision) and falls back to a SINGLE `source_nat_decision_for_flow(...)` SNAT
+> call per path, regardless of whether a destination rewrite is present. The
+> two former duplicate-pair sites therefore collapsed into one fail-closed SNAT
+> call each (4 → 2). The #1377 fail-closed contract is unchanged: NPTv6
+> short-circuits before the SNAT fallback and cannot fail in the pool sense
+> (it is a stateless prefix rewrite with no pool allocation), and BOTH
+> remaining `source_nat_decision_for_flow(...)` calls still convert an
+> unavailable pool result into a `record_source_nat_failure` exception and
+> recycle the packet before session creation or forwarding.
 
 Recent-exception reasons identify the runtime failure class:
 `source_nat_pool_missing`, `source_nat_pool_empty`,
@@ -328,7 +341,7 @@ Status and Prometheus expose:
   owns its own allocator lock and bounded maps. Multiple rules that reference
   the same pool share that allocator.
 - Port-range validation happens before any `u16` truncation.
-- A pool-mode rule without a usable pool is fail-closed at the four runtime
+- A pool-mode rule without a usable pool is fail-closed at the two runtime
   call sites listed above. The packet is dropped and a recent exception is
   recorded before session creation or forwarding.
 - Existing reverse-session NAT behavior remains the source of truth for return
@@ -358,8 +371,8 @@ Covered by #1385 and this closeout:
   addresses, wrong-family-only pools, and allocator exhaustion surfaces are
   distinct from no source-NAT match.
 - Cargo: source-NAT pool rules with missing pools, empty pools, invalid port
-  ranges, wrong-family-only pools, or allocation failures fail closed at all
-  four `poll_descriptor.rs` source-NAT call sites instead of becoming an
+  ranges, wrong-family-only pools, or allocation failures fail closed at both
+  `poll_descriptor` source-NAT call sites instead of becoming an
   untranslated forward.
 - Cargo: userspace-v1 fixtures pin IPv4/IPv6 sticky hash outputs and selected
   pool addresses through the source-NAT rule path.

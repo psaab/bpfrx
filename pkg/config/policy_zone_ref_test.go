@@ -66,12 +66,12 @@ func TestPolicyUndefinedZoneFailsCommit(t *testing.T) {
 // the `junos-host` self-traffic zone and global policies (which carry no
 // from/to-zone strings). A regression here would break valid operator configs.
 //
-// NOTE (#3018): the wildcard `from-zone any` / `to-zone any` cases that this
-// test once asserted commit-and-work have been MOVED to
-// TestPolicyWildcardZoneFailsCommit — they are now hard-rejected at commit
-// because the userspace dataplane never indexes a from-zone/to-zone `any`
-// policy (silent fail-OPEN). The unrelated `any` tokens (`match source-address
-// any` / `match application any`) remain legitimate and are exercised below.
+// NOTE (#3090): the wildcard `from-zone any` / `to-zone any` cases live in
+// TestPolicyWildcardZoneCommitsAndEnforces. As of #3090 they COMMIT and are
+// enforced (the userspace dataplane indexes them in dedicated from-any/to-any/
+// both-any tiers — userspace-dp/src/policy.rs); the #3018 interim commit reject
+// is lifted. The unrelated `any` tokens (`match source-address any` / `match
+// application any`) remain legitimate and are exercised below.
 func TestPolicySpecialZoneTokensCommit(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set security zones security-zone trust",
@@ -91,26 +91,23 @@ func TestPolicySpecialZoneTokensCommit(t *testing.T) {
 	}
 }
 
-// TestPolicyWildcardZoneFailsCommit asserts that an ordinary zone-pair policy
-// whose from-zone or to-zone is the literal Junos wildcard `any` is
-// HARD-REJECTED at commit (#3018).
+// TestPolicyWildcardZoneCommitsAndEnforces asserts that an ordinary zone-pair
+// policy whose from-zone or to-zone is the literal Junos wildcard `any` now
+// COMMITS cleanly (#3090) — lifting the #3018 interim reject — and compiles
+// into a kept policy rule (the Go half of "commit-and-enforce"; the runtime
+// enforcement across concrete zone pairs is covered by the userspace-dp policy
+// tests `from_zone_any_matches_across_ingress_zones` /
+// `to_zone_any_matches_across_egress_zones` etc.).
 //
-// This is the fail-on-revert guard for the fail-open bug: the strict
-// zone-reference gate exempts `any`, so before this fix a `from-zone any` /
-// `to-zone any` policy COMMITTED and looked legitimate, but the userspace
-// snapshot builder carries the literal "any" string unchanged and
-// PolicyState::from_snapshots (userspace-dp/src/policy.rs) only indexes a rule
-// when BOTH zones resolve to a declared zone-id — so the rule was KEPT but
-// never indexed and never evaluated (silent fail-OPEN under a permit default).
-// Make validatePolicyWildcardZoneStrict return nil (or drop its dispatch in
-// compiler.go) and these subtests go green on the BAD config, which is exactly
-// the regression this test exists to catch. Full wildcard-zone runtime indexing
-// is a deferred follow-up.
-func TestPolicyWildcardZoneFailsCommit(t *testing.T) {
+// This is the fail-on-revert guard for re-introducing the interim reject:
+// restoring validatePolicyWildcardZoneStrict (and its dispatch) turns these
+// subtests RED because the wildcard policy would be hard-rejected at commit
+// again. The neither-rejected-nor-warned assertion also guards against the
+// lenient downgrade coming back.
+func TestPolicyWildcardZoneCommitsAndEnforces(t *testing.T) {
 	cases := []struct {
-		name    string
-		cmds    []string
-		wantSub string
+		name string
+		cmds []string
 	}{
 		{
 			name: "from-zone any",
@@ -121,7 +118,6 @@ func TestPolicyWildcardZoneFailsCommit(t *testing.T) {
 				"set security policies from-zone any to-zone trust policy P match application any",
 				"set security policies from-zone any to-zone trust policy P then deny",
 			},
-			wantSub: "wildcard zone `any`",
 		},
 		{
 			name: "to-zone any",
@@ -132,49 +128,34 @@ func TestPolicyWildcardZoneFailsCommit(t *testing.T) {
 				"set security policies from-zone trust to-zone any policy P match application any",
 				"set security policies from-zone trust to-zone any policy P then permit",
 			},
-			wantSub: "wildcard zone `any`",
+		},
+		{
+			name: "from-zone any to-zone any",
+			cmds: []string{
+				"set security zones security-zone trust",
+				"set security policies from-zone any to-zone any policy P match source-address any",
+				"set security policies from-zone any to-zone any policy P match destination-address any",
+				"set security policies from-zone any to-zone any policy P match application any",
+				"set security policies from-zone any to-zone any policy P then deny",
+			},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tree := buildTree(t, tc.cmds)
-			_, err := CompileConfig(tree)
-			if err == nil {
-				t.Fatalf("expected commit to reject a from-zone/to-zone `any` policy, got nil error")
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("strict commit must now accept a from-zone/to-zone `any` policy (#3090): %v", err)
 			}
-			if !strings.Contains(err.Error(), tc.wantSub) {
-				t.Fatalf("error %q does not flag the wildcard zone (want substring %q)", err.Error(), tc.wantSub)
+			for _, w := range cfg.Warnings {
+				if strings.Contains(w, "wildcard zone") {
+					t.Fatalf("a committed wildcard-zone policy must not be flagged (the interim downgrade is removed): %q", w)
+				}
+			}
+			if len(cfg.Security.Policies) == 0 {
+				t.Fatalf("expected the wildcard-zone policy to be compiled and kept, got no zone-pair policies")
 			}
 		})
-	}
-}
-
-// TestPolicyWildcardZoneLenientDowngradesToWarning asserts the tolerant load /
-// peer-sync path downgrades the from-zone/to-zone `any` reject to a warning
-// instead of failing the compile, so an already-persisted or peer-synced config
-// carrying a wildcard-zone policy still boots (#3018 / #1960 no-brick). The
-// dataplane never indexed the rule anyway, so the leniently-loaded config
-// behaves exactly as before — just flagged.
-func TestPolicyWildcardZoneLenientDowngradesToWarning(t *testing.T) {
-	tree := buildTree(t, []string{
-		"set security zones security-zone trust",
-		"set security policies from-zone any to-zone trust policy P match source-address any",
-		"set security policies from-zone any to-zone trust policy P match application any",
-		"set security policies from-zone any to-zone trust policy P then deny",
-	})
-	cfg, err := CompileConfigLenient(tree)
-	if err != nil {
-		t.Fatalf("lenient compile must not fail on a wildcard-zone policy: %v", err)
-	}
-	found := false
-	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "policy wildcard zone (downgraded to warning on tolerant path)") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected a downgraded policy wildcard-zone warning, got warnings: %v", cfg.Warnings)
 	}
 }
 

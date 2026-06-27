@@ -21928,6 +21928,47 @@ top.
   docs/session-sync-design.md
 
 - **Timestamp**: 2026-06-26
+  **Action**: #3121 NPTv6 outbound source translation now COMPOSES with DNAT.
+  The decision path gated `nptv6.translate_outbound` on
+  `rewrite_dst.is_none()`, so a flow matching both NPTv6 (source) and DNAT
+  (destination) lost its NPTv6 source rewrite and leaked the internal IPv6
+  source onto the wire. Fix: attempt NPTv6 in BOTH decision branches and
+  `merge()` the source rewrite into any pre-routing DNAT decision (the Permit
+  NAT site and the missing-neighbor seed site, so the seed session carries the
+  same composed decision regardless of ARP timing). Checksum: the NPTv6 source
+  rewrite is checksum-neutral (RFC 6296), but a composed DNAT destination is
+  not — so `compute_l4_csum_delta` short-circuits only for a PURE NPTv6
+  translation (one of src/dst set) and falls through to compute the DNAT delta
+  when both are set (the neutral NPTv6 term nets zero, direction-agnostic), and
+  `apply_nat_ipv6`'s both-sides arm no longer blanket-skips on `nptv6` (only on
+  a non-first fragment). Fail-on-revert test
+  `pin_nptv6_composes_with_dnat_checksum_valid` (descriptor+generic byte-parity
+  + oracle-valid L4 checksum) goes RED when the pre-#3121 nptv6 short-circuit is
+  restored; decision-level `nptv6_source_composes_with_dnat_decision` pins the
+  merge + reverse() compose contract.
+  **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/checksum.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/rewrite.rs,
+  userspace-dp/src/nptv6_tests.rs,
+  docs/feature-coverage.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3121 follow-up — fix #1377 SNAT contract-guard drift. The
+  NPTv6-first refactor folded the duplicated `source_nat_decision_for_flow`
+  calls (rewrite_dst.is_none()/else pair) into a single SNAT fallback per path,
+  dropping the poll_descriptor call sites 4 → 2. `snat_contract_doc_guard.rs`
+  hard-asserts the count, so the FULL `cargo test --release` was RED (the
+  filtered subset run missed it). Updated the guard's expected count 4 → 2 and
+  re-enumerated the now-2 sites (normal new-session @ mod.rs:1963,
+  missing-neighbor seed @ mod.rs:3691) in
+  plan-1377-snat-pools.md with a #3121 reduction note (both remaining sites
+  still record_source_nat_failure; NPTv6 short-circuits before the SNAT
+  fallback and cannot fail in the pool sense, so the fail-closed contract holds
+  at 2 sites). Full suite now green: main bin 3138 passed / 0 failed,
+  snat_contract_doc_guard passes (count=2, doc-parse=2), 0 failures total.
+  **File(s)**: userspace-dp/tests/snat_contract_doc_guard.rs,
+  docs/pr/1373-retire-ebpf-dataplane/plan-1377-snat-pools.md
   **Action**: #3061 zone-local address books — parse `security zones
   security-zone <z> address-book { address; address-set }` into
   ZoneConfig.AddressBook (schema leaf + compileZones via shared
@@ -21965,3 +22006,39 @@ top.
   pkg/config/compiler_validate_strict.go,
   pkg/config/addressbook_name_slash_3061_test.go,
   pkg/config/README.md, docs/config-schema.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3090 — implement wildcard from-zone/to-zone `any` policy
+  indexing in the userspace dataplane, lifting the #3018 interim commit reject.
+  PolicyState gains three dedicated index lists — from-any (keyed by concrete
+  to-zone id), to-any (keyed by concrete from-zone id), both-any — populated by
+  `parse_policy_state_with_counters`. `evaluate_policy_result_with_icmp`
+  consults them in Junos most-specific-first precedence (exact → single-wildcard
+  merged in config order → both-any → junos-global → default), all O(1) hashmap
+  probes (no N×N expansion). `evaluate_junos_host_policy` consults
+  `from-zone any to-zone junos-host` so the host path is not a new fail-open;
+  to-any / both-any are intentionally excluded from the host path (lifeline).
+  Go: removed `validatePolicyWildcardZoneStrict` + `lenientPolicyWildcardZone`
+  flag/dispatch; flipped the #3018 tests to assert commit-and-enforce. 9 new
+  Rust tests (fail-on-revert: disabling the tiers turns 7 RED, incl.
+  from_zone_any_matches_across_ingress_zones /
+  to_zone_any_matches_across_egress_zones). No wire-field change (snapshot
+  already carries zone strings as literals).
+  **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+  pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/policy_zone_ref_test.go, pkg/config/README.md,
+  docs/userspace-dataplane-architecture.md
+  **Action**: #3099 — replace the capped-exact-map session aggregator with a
+  Space-Saving (Metwally et al.) top-K counter set. K = defaultMaxAggKeys
+  (10000) per direction; map + min-heap keyed on bytes (O(log K) Add); each
+  counter carries (bytes,bytesErr) with the standard
+  bytes-bytesErr<=true<=bytes guarantee; bytes stay the ranking key; the
+  per-window overflow (eviction) count keeps surfacing on the
+  RT_FLOW_SESSION_AGGREGATE dropped-keys warning line. Top-K is now
+  arrival-order independent (a late heavy hitter evicts the min instead of
+  being dropped). Added fail-on-revert tests
+  (TestSessionAggregator_LateHeavyHitterArrivalOrder — RED on the old capped
+  map, TestSessionAggregator_SpaceSavingErrorGuarantee) and migrated
+  TestSessionAggregator_CardinalityCap to the new internals.
+  **File(s)**: pkg/logging/aggregator.go, pkg/logging/aggregator_test.go,
+  docs/phases.md, docs/feature-gaps.md

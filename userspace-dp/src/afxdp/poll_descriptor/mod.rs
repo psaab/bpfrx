@@ -1910,70 +1910,55 @@ pub(super) fn poll_binding_process_descriptor(
                                     // decision rather than overwriting it.
                                     let nat_match_flow =
                                         flow.with_destination(effective_resolution_target);
-                                    if decision.nat.rewrite_dst.is_none() {
-                                        // Try NPTv6 outbound: if src matches an internal prefix,
-                                        // translate to external prefix (stateless, no L4 csum update).
-                                        let nptv6_snat =
-                                            if let IpAddr::V6(mut src_v6) = nat_match_flow.src_ip {
-                                                if worker_ctx
-                                                    .forwarding
-                                                    .nptv6
-                                                    .translate_outbound(&mut src_v6)
-                                                {
-                                                    Some(NatDecision {
-                                                        rewrite_src: Some(IpAddr::V6(src_v6)),
-                                                        rewrite_dst: None,
-                                                        nat64: false,
-                                                        nptv6: true,
-                                                        ..NatDecision::default()
-                                                    })
-                                                } else {
-                                                    None
-                                                }
+                                    // #3121: NPTv6 outbound source-prefix translation is
+                                    // orthogonal to a pre-routing destination rewrite
+                                    // (DNAT / static DNAT). The two NAT stages COMPOSE --
+                                    // DNAT rewrites the destination, NPTv6 the source --
+                                    // so NPTv6 is attempted regardless of whether a
+                                    // destination rewrite is already present and is
+                                    // merged into the decision (not gated on
+                                    // rewrite_dst.is_none(), which leaked the internal
+                                    // IPv6 source whenever DNAT also matched). The merge
+                                    // preserves rewrite_dst (DNAT) + rewrite_src (NPTv6);
+                                    // the NPTv6 source rewrite is checksum-neutral by
+                                    // RFC 6296 (see afxdp::checksum / frame::apply_nat_ipv6),
+                                    // so only the DNAT destination delta is folded into the
+                                    // L4 checksum.
+                                    let nptv6_snat =
+                                        if let IpAddr::V6(mut src_v6) = nat_match_flow.src_ip {
+                                            if worker_ctx
+                                                .forwarding
+                                                .nptv6
+                                                .translate_outbound(&mut src_v6)
+                                            {
+                                                Some(NatDecision {
+                                                    rewrite_src: Some(IpAddr::V6(src_v6)),
+                                                    rewrite_dst: None,
+                                                    nat64: false,
+                                                    nptv6: true,
+                                                    ..NatDecision::default()
+                                                })
                                             } else {
                                                 None
-                                            };
-                                        // #2218: capture the matched SNAT
-                                        // rule's counter via the out-param.
-                                        // NPTv6 has no per-rule NAT counter,
-                                        // so the helper is only called (and
-                                        // the out-param only set) on the
-                                        // non-NPTv6 arm.
-                                        let mut snat_match_counter = None;
-                                        match nptv6_snat.map(Ok).unwrap_or_else(|| {
-                                            source_nat_decision_for_flow(
-                                                worker_ctx.forwarding,
-                                                &from_zone,
-                                                &to_zone,
-                                                decision.resolution.egress_ifindex,
-                                                &nat_match_flow,
-                                                now_ns,
-                                                snat_non_first_fragment,
-                                                &mut snat_match_counter,
-                                            )
-                                        }) {
-                                            Ok(snat_decision) => {
-                                                decision.nat = snat_decision;
-                                                source_nat_release_key =
-                                                    Some(nat_match_flow.forward_key.clone());
-                                                source_nat_counter = snat_match_counter;
                                             }
-                                            Err(failure) => {
-                                                record_source_nat_failure(
-                                                    telemetry,
-                                                    worker_ctx,
-                                                    meta,
-                                                    flow,
-                                                    from_zone_id,
-                                                    to_zone_id,
-                                                    desc.len,
-                                                    &failure,
-                                                );
-                                                binding.scratch.scratch_recycle.push(desc.addr);
-                                                continue;
-                                            }
-                                        }
+                                        } else {
+                                            None
+                                        };
+                                    if let Some(nptv6_decision) = nptv6_snat {
+                                        // NPTv6 matched: compose with any pre-routing
+                                        // DNAT decision. NPTv6 is the source translation
+                                        // and takes precedence over static/interface
+                                        // SNAT for the source (same precedence the old
+                                        // rewrite_dst.is_none() branch applied). NPTv6
+                                        // carries no per-rule NAT counter.
+                                        decision.nat = decision.nat.merge(nptv6_decision);
+                                        source_nat_release_key =
+                                            Some(nat_match_flow.forward_key.clone());
                                     } else {
+                                        // No NPTv6 match: fall back to static / interface
+                                        // SNAT, merging with any pre-routing DNAT decision.
+                                        // #2218: capture the matched rule's counter via
+                                        // the out-param.
                                         let mut snat_match_counter = None;
                                         match source_nat_decision_for_flow(
                                             worker_ctx.forwarding,
@@ -3671,39 +3656,43 @@ pub(super) fn poll_binding_process_descriptor(
                                                 meta.addr_family,
                                             )
                                     };
-                                    if pending_decision.nat.rewrite_dst.is_none() {
-                                        let mut snat_match_counter = None;
-                                        match source_nat_decision_for_flow(
-                                            worker_ctx.forwarding,
-                                            &from_zone,
-                                            &to_zone,
-                                            pending_decision.resolution.egress_ifindex,
-                                            &nat_match_flow,
-                                            now_ns,
-                                            snat_non_first_fragment,
-                                            &mut snat_match_counter,
-                                        ) {
-                                            Ok(snat_decision) => {
-                                                pending_decision.nat = snat_decision;
-                                                source_nat_release_key =
-                                                    Some(nat_match_flow.forward_key.clone());
-                                                source_nat_counter = snat_match_counter;
+                                    // #3121: mirror the main NAT-decision site
+                                    // (Permit path above) on the missing-neighbor
+                                    // seed path so the seed session carries the
+                                    // SAME composed NAT decision regardless of
+                                    // ARP-resolution timing. NPTv6 outbound source
+                                    // translation composes with any pre-routing DNAT
+                                    // (rewrite_dst): NPTv6 rewrites the source, DNAT
+                                    // the destination; both are merged. The NPTv6
+                                    // source rewrite is checksum-neutral (RFC 6296).
+                                    let nptv6_snat =
+                                        if let IpAddr::V6(mut src_v6) = nat_match_flow.src_ip {
+                                            if worker_ctx
+                                                .forwarding
+                                                .nptv6
+                                                .translate_outbound(&mut src_v6)
+                                            {
+                                                Some(NatDecision {
+                                                    rewrite_src: Some(IpAddr::V6(src_v6)),
+                                                    rewrite_dst: None,
+                                                    nat64: false,
+                                                    nptv6: true,
+                                                    ..NatDecision::default()
+                                                })
+                                            } else {
+                                                None
                                             }
-                                            Err(failure) => {
-                                                record_source_nat_failure(
-                                                    telemetry,
-                                                    worker_ctx,
-                                                    meta,
-                                                    flow,
-                                                    from_zone_id,
-                                                    to_zone_id,
-                                                    desc.len,
-                                                    &failure,
-                                                );
-                                                binding.scratch.scratch_recycle.push(desc.addr);
-                                                continue;
-                                            }
-                                        }
+                                        } else {
+                                            None
+                                        };
+                                    if let Some(nptv6_decision) = nptv6_snat {
+                                        // NPTv6 is the source translation and takes
+                                        // precedence over static/interface SNAT; merge
+                                        // into any pre-routing DNAT. No per-rule counter.
+                                        pending_decision.nat =
+                                            pending_decision.nat.merge(nptv6_decision);
+                                        source_nat_release_key =
+                                            Some(nat_match_flow.forward_key.clone());
                                     } else {
                                         let mut snat_match_counter = None;
                                         match source_nat_decision_for_flow(

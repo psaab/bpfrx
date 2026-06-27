@@ -1354,6 +1354,23 @@ Closed all 6 remaining HA feature gaps from docs/feature-gaps.md section 16 (exc
   - `flushAndLog()` emits `RT_FLOW_SESSION_AGGREGATE top-source=...` / `top-destination=...`
   - Log output forwarded via `EventReader.ForwardLogMsg()` to all syslog clients + local writers
   - Daemon lifecycle: `applyAggregator()` starts/stops goroutine on config change
+  - **Bounded accounting — Space-Saving top-K (#3099):** each direction is a
+    Space-Saving (Metwally, Agrawal & El Abbadi 2005) counter set of K =
+    `defaultMaxAggKeys` (10000) counters, `streamSummary` in
+    `pkg/logging/aggregator.go`. Memory is bounded by K exactly as the prior
+    cardinality cap (#2936) bounded it, but the reported top-K is now
+    arrival-order independent: a heavy hitter whose first session arrives after
+    the set fills evicts the current minimum counter instead of being silently
+    dropped. Implementation: a `map[key]*ssCounter` plus a min-heap keyed on
+    bytes (heap root = eviction victim), so `Add` is O(log K) on the
+    SESSION_CLOSE path. Each counter carries (`bytes`, `bytesErr`) with the
+    standard guarantee `bytes - bytesErr <= true_bytes <= bytes`; the session
+    count uses the same bookkeeping. Bytes remain the ranking/sort key. The
+    overflow (eviction) count per window is still surfaced as the
+    `RT_FLOW_SESSION_AGGREGATE dropped-keys ...` warning line — the same
+    high-cardinality incident indicator operators relied on; a non-zero value
+    now means the top-N is approximate (heavy hitters retained) rather than
+    that keys were discarded.
 
 ### DPDK Parity
 - `dpdk_worker/shared_mem.h`: `struct event` extended with NAT fields (matches BPF layout)

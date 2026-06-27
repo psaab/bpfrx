@@ -3337,3 +3337,222 @@ fn policy_hit_count_single_packet_flow_reads_one() {
     assert_eq!(snap.packets, 1, "single-packet flow must read exactly 1");
     assert_eq!(snap.bytes, 64);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// #3090 wildcard from-zone/to-zone `any` policy indexing.
+//
+// These exercise PolicyState's new wildcard tiers (from-any / to-any /
+// both-any) and their Junos most-specific-first precedence vs exact zone-pair
+// rules, global rules, and the default policy. The fail-on-revert guard is
+// `from_zone_any_matches_across_ingress_zones` / `to_zone_any_matches_across_
+// egress_zones`: deleting the wildcard lookup block in
+// evaluate_policy_result_with_icmp makes those RED (the wildcard rule stops
+// matching the non-config-ordered zone and the flow falls to the default
+// action).
+// ─────────────────────────────────────────────────────────────────────────
+
+fn wildcard_rule(name: &str, from_zone: &str, to_zone: &str, action: &str) -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        name: name.to_string(),
+        from_zone: from_zone.to_string(),
+        to_zone: to_zone.to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: action.to_string(),
+        ..Default::default()
+    }
+}
+
+fn eval(state: &PolicyState, from_id: u16, to_id: u16) -> PolicyAction {
+    evaluate_policy(
+        state,
+        from_id,
+        to_id,
+        "10.0.0.1".parse().expect("src"),
+        "10.0.0.2".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        443,
+    )
+}
+
+#[test]
+fn from_zone_any_matches_across_ingress_zones() {
+    // `from-zone any to-zone wan deny` must block traffic into wan from EVERY
+    // ingress zone (lan, trust, untrust), default permit otherwise.
+    let state = parse_policy_state(
+        "permit",
+        &[wildcard_rule("block-to-wan", "any", "wan", "deny")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+    assert_eq!(eval(&state, TEST_UNTRUST_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+    // A flow into a DIFFERENT to-zone is NOT matched by the from-any-to-wan
+    // rule and falls through to the default permit.
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_TRUST_ZONE_ID), PolicyAction::Permit);
+}
+
+#[test]
+fn to_zone_any_matches_across_egress_zones() {
+    // `from-zone trust to-zone any permit`, default deny: trust may reach EVERY
+    // egress zone; other ingress zones stay denied.
+    let state = parse_policy_state(
+        "deny",
+        &[wildcard_rule("trust-out", "trust", "any", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_LAN_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    // A different ingress zone is not matched → default deny.
+    assert_eq!(eval(&state, TEST_UNTRUST_ZONE_ID, TEST_LAN_ZONE_ID), PolicyAction::Deny);
+}
+
+#[test]
+fn both_any_matches_every_pair() {
+    // `from-zone any to-zone any permit`, default deny: matches every defined
+    // zone pair.
+    let state = parse_policy_state(
+        "deny",
+        &[wildcard_rule("all", "any", "any", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_UNTRUST_ZONE_ID, TEST_TRUST_ZONE_ID), PolicyAction::Permit);
+    // An unzoned flow (id 0) still falls through to default (the #3110 guard);
+    // wildcard tiers live inside the from_id!=0 && to_id!=0 gate.
+    assert_eq!(eval(&state, 0, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+}
+
+#[test]
+fn exact_zone_pair_takes_precedence_over_wildcard() {
+    // Even when the wildcard rule is configured FIRST, the exact zone-pair
+    // tier is evaluated before it, so for lan->wan the exact deny wins; for a
+    // non-exact pair (trust->wan) only the from-any rule applies.
+    let state = parse_policy_state(
+        "deny",
+        &[
+            wildcard_rule("wild-permit", "any", "wan", "permit"),
+            wildcard_rule("exact-deny", "lan", "wan", "deny"),
+        ],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(
+        eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID),
+        PolicyAction::Deny,
+        "exact lan->wan deny must win over the earlier from-any permit"
+    );
+    assert_eq!(
+        eval(&state, TEST_TRUST_ZONE_ID, TEST_WAN_ZONE_ID),
+        PolicyAction::Permit,
+        "trust->wan has no exact rule, so the from-any permit applies"
+    );
+}
+
+#[test]
+fn single_wildcard_tier_honors_config_order() {
+    // from-any (deny) configured BEFORE to-any (permit): for an untrust->trust
+    // flow both wildcards match, and the earlier-configured from-any deny wins.
+    let deny_first = parse_policy_state(
+        "permit",
+        &[
+            wildcard_rule("from-any-deny", "any", "trust", "deny"),
+            wildcard_rule("to-any-permit", "untrust", "any", "permit"),
+        ],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&deny_first, TEST_UNTRUST_ZONE_ID, TEST_TRUST_ZONE_ID), PolicyAction::Deny);
+    // Reversed config order: the to-any permit is now first and wins.
+    let permit_first = parse_policy_state(
+        "deny",
+        &[
+            wildcard_rule("to-any-permit", "untrust", "any", "permit"),
+            wildcard_rule("from-any-deny", "any", "trust", "deny"),
+        ],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&permit_first, TEST_UNTRUST_ZONE_ID, TEST_TRUST_ZONE_ID), PolicyAction::Permit);
+}
+
+#[test]
+fn single_wildcard_beats_both_any() {
+    // A single-wildcard rule (from-any-to-wan deny) is more specific than a
+    // both-any permit and wins regardless of config order.
+    let state = parse_policy_state(
+        "permit",
+        &[
+            wildcard_rule("both-any-permit", "any", "any", "permit"),
+            wildcard_rule("from-any-deny", "any", "wan", "deny"),
+        ],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+    // A pair the single-wildcard does not cover falls to both-any permit.
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_TRUST_ZONE_ID), PolicyAction::Permit);
+}
+
+#[test]
+fn wildcard_takes_precedence_over_global() {
+    // A both-any deny must be evaluated BEFORE a global permit (global is the
+    // device-wide fallback tier, consulted only after all wildcard tiers).
+    // Global rules carry the junos-global sentinel on both zones.
+    let state = parse_policy_state(
+        "deny",
+        &[
+            wildcard_rule("global-permit", "junos-global", "junos-global", "permit"),
+            wildcard_rule("both-any-deny", "any", "any", "deny"),
+        ],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(
+        eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID),
+        PolicyAction::Deny,
+        "both-any deny must win over the global permit"
+    );
+}
+
+#[test]
+fn wildcard_falls_through_to_default() {
+    // A from-any-to-wan rule does not match a flow to a different to-zone, so
+    // the default action applies.
+    let state = parse_policy_state(
+        "deny",
+        &[wildcard_rule("from-any-wan", "any", "wan", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_TRUST_ZONE_ID), PolicyAction::Deny);
+}
+
+#[test]
+fn from_zone_any_to_junos_host_blocks_host_inbound_from_any_zone() {
+    // `from-zone any to-zone junos-host deny` must be enforced on the host
+    // (LocalDelivery) path for every ingress zone — proving the wildcard is not
+    // re-introducing the #3018 silent fail-open now that the commit reject is
+    // lifted.
+    let state = parse_policy_state(
+        "permit",
+        &[wildcard_rule("host-block", "any", "junos-host", "deny")],
+        &test_zone_name_to_id(),
+    );
+    for from in [TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, TEST_UNTRUST_ZONE_ID] {
+        let res = evaluate_junos_host_policy(
+            &state,
+            from,
+            "10.0.0.1".parse().expect("src"),
+            "10.0.0.2".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            22,
+            None,
+            64,
+        );
+        assert_eq!(
+            res.map(|r| r.action),
+            Some(PolicyAction::Deny),
+            "from-zone any to-zone junos-host must block host-inbound from zone {from}"
+        );
+    }
+}
