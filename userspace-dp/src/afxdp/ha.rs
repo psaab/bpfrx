@@ -533,10 +533,27 @@ impl super::Coordinator {
         }
         if let Some(es) = self.event_stream.as_ref() {
             let handle = es.worker_handle();
-            let zone_name_to_id = &self.forwarding.zone_name_to_id;
-            for delta in &deltas {
-                let _ = handle.push_delta_lossless(delta, zone_name_to_id);
-            }
+            // #2880: push the close deltas through the LOSSLESS producer and
+            // RECORD any that cannot be queued (event stream disconnected /
+            // saturated) instead of silently swallowing the error with the old
+            // `let _ =`. This is error HYGIENE, not a leak fix: the purge is
+            // CLEANUP, not a correctness boundary. Re-resolution and the encap
+            // builders refuse a tunnel id whose owning netdev ifindex differs
+            // from the one stored in the session's resolution (see the
+            // call-site comments in coordinator/snapshot_refresh.rs and
+            // coordinator/reconcile/snapshot.rs), so a surviving stale entry
+            // can never mis-encapsulate; it self-heals — the standby runs its
+            // OWN snapshot-apply purge and idle GC reaps it. A full owner-RG
+            // re-export would NOT recover an undelivered close anyway: the
+            // userspace cold-sync ships sessions as incremental Opens with
+            // EMPTY bulk markers, and the peer's reconcileStaleSessions
+            // short-circuits on an empty bulk (pkg/cluster/sync_bulk.go,
+            // pkg/cluster/sync.go) — re-emitting Opens cannot convey a delete.
+            // A disconnected stream additionally triggers a fresh resync on
+            // reconnect (#2874) independently. So the honest minimal fix is to
+            // surface the drop in the event-stream drop metric + a one-shot
+            // log, not to drive a heavy resync.
+            let _dropped = self.push_purge_close_deltas(&handle, &deltas);
         }
         if !keys.is_empty() {
             eprintln!(
@@ -546,6 +563,37 @@ impl super::Coordinator {
             );
         }
         keys.len()
+    }
+
+    /// #2880: push the tunnel-remap purge Close deltas through the LOSSLESS
+    /// event-stream producer, returning the number that could NOT be queued.
+    /// Each undelivered delta is recorded in the event-stream dropped-frames
+    /// metric (`record_dropped_frames`) so a disconnected / saturated stream
+    /// surfaces in observability instead of being silently swallowed by the
+    /// old `let _ =`. Stops on the first failure — a disconnected stream fails
+    /// every subsequent push immediately, and a saturated one would otherwise
+    /// burn one lossless-queue timeout per remaining delta — and counts the
+    /// undelivered remainder. Cleanup-only error hygiene: it does NOT trigger a
+    /// resync (the caller comment explains why a re-export cannot recover a
+    /// missed close, and why the surviving entry is harmless + self-healing).
+    pub(crate) fn push_purge_close_deltas(
+        &self,
+        handle: &crate::event_stream::EventStreamWorkerHandle,
+        deltas: &[crate::session::SessionDelta],
+    ) -> usize {
+        let zone_name_to_id = &self.forwarding.zone_name_to_id;
+        for (delivered, delta) in deltas.iter().enumerate() {
+            if let Err(err) = handle.push_delta_lossless(delta, zone_name_to_id) {
+                let dropped = deltas.len() - delivered;
+                handle.record_dropped_frames(dropped as u64);
+                eprintln!(
+                    "xpf-userspace-dp: tunnel-remap purge could not queue {dropped}/{} close delta(s) losslessly ({err}); recorded as dropped frames — surviving peer/Go-shadow entries are harmless (encap ifindex guard) and self-heal via the standby snapshot-apply purge + idle GC (#2880)",
+                    deltas.len()
+                );
+                return dropped;
+            }
+        }
+        0
     }
 
     /// Export all locally-owned forward sessions through the event stream.

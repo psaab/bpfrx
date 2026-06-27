@@ -435,6 +435,52 @@ resync is entirely worker-local — it re-uses the same per-worker delta ring an
 incremental sync (the control-socket contention rules in CLAUDE.md). It runs at
 most once per worker poll tick and only when an overflow actually occurred.
 
+### Coordinator tunnel-remap purge records a dropped close delta (#2880)
+
+The **coordinator-side** tunnel-endpoint-id remap purge
+(`purge_remapped_tunnel_sessions`, #1873) deletes every session keyed to a
+remapped tunnel id and then emits a `Close` delta on the event stream so the Go
+shadow conntrack and the HA peer drop the stale entry too. That close delta is
+pushed via `push_delta_lossless`. Pre-#2880 the result was discarded with
+`let _ =`, so a disconnected / saturated event stream silently dropped the
+delta with no diagnostic and no metric.
+
+**This is an error-hygiene / observability fix, NOT a forwarding-correctness
+leak fix — the purge is CLEANUP, not the correctness boundary.** Two facts make
+a surviving stale entry harmless:
+
+- **It cannot mis-encapsulate.** Re-resolution and the encap builders refuse a
+  tunnel id whose owning netdev ifindex differs from the one stored in the
+  session's resolution (documented at the call sites,
+  `coordinator/snapshot_refresh.rs` and `coordinator/reconcile/snapshot.rs`). A
+  stale entry that escapes the purge dead-ends; it never encaps to the wrong
+  tunnel.
+- **It self-heals.** The standby runs its OWN `purge_remapped_tunnel_sessions`
+  when it applies the same config snapshot, and idle GC reaps the entry on its
+  inactivity timeout regardless.
+
+A full owner-RG re-export would **not** recover an undelivered close anyway. The
+userspace cold-sync delivers sessions as **incremental `Open`s** through the
+event stream and then sends **empty** `BulkStart`/`BulkEnd` markers
+(`pkg/cluster/sync_bulk.go` `doBulkSync` → `BulkSyncOverride`); the peer's
+`reconcileStaleSessions` (`pkg/cluster/sync.go`) short-circuits on an empty bulk
+("skipped (empty bulk)"). Re-emitting `Open`s therefore cannot convey a delete —
+only a non-empty **bracketed** bulk drives the stale-session prune, which the
+event-stream path never produces. A disconnected stream also triggers a fresh
+resync on reconnect (#2874) independently.
+
+So the fix is the minimal honest change: stop silently swallowing the
+`push_delta_lossless` error. `push_purge_close_deltas` records each undelivered
+delta in the event-stream **dropped-frames** metric
+(`EventStreamWorkerHandle::record_dropped_frames` → the same `frames_dropped`
+counter the lossy `try_send` path uses, surfaced in `EventStreamStats` /
+Prometheus) and logs once. It stops on the first failure — a disconnected stream
+fails every subsequent push immediately and a saturated one would otherwise burn
+one lossless-queue timeout per remaining delta — and counts the undelivered
+remainder. The `usize` return of `purge_remapped_tunnel_sessions` is unchanged:
+it remains the accurate **local** purge count (callers read it only for
+logging); the propagation drop is recorded separately, not conflated.
+
 ### Drained deltas reach binding-independent consumers even with no binding (#2669)
 
 The worker loop drains the delta ring **unconditionally** (`drain_deltas`

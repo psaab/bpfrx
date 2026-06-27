@@ -344,6 +344,31 @@ impl EventStreamSender {
         }
     }
 
+    /// #2880 test seam: build an `EventStreamSender` WITHOUT spawning the I/O
+    /// thread, with the connected flag forced to `connected`. The returned
+    /// `Receiver` must be kept alive by the test so the channel does not
+    /// disconnect; `push_delta_lossless` then succeeds (connected + live rx)
+    /// or fails immediately (`connected = false`) exactly like the production
+    /// disconnected / connected paths, without a real socket.
+    #[cfg(test)]
+    pub(crate) fn test_sender(
+        connected: bool,
+        capacity: usize,
+    ) -> (Self, mpsc::Receiver<EventFrame>) {
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        let shared = Arc::new(EventStreamShared::new());
+        shared.connected.store(connected, Ordering::Release);
+        (
+            Self {
+                tx,
+                shared,
+                io_thread: None,
+                stop: Arc::new(AtomicBool::new(false)),
+            },
+            rx,
+        )
+    }
+
     /// Signal the I/O thread to stop and wait for it to exit.
     pub(crate) fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -391,6 +416,17 @@ impl EventStreamWorkerHandle {
     /// Non-blocking send. Returns false if the channel is full (event dropped).
     pub(crate) fn try_send(&self, frame: EventFrame) -> bool {
         self.try_send_frame(frame).is_ok()
+    }
+
+    /// #2880: record `n` deltas that could not be queued through the LOSSLESS
+    /// producer (event stream disconnected / saturated). `send_frame_lossless`
+    /// returns the failure as an `Err` rather than bumping `frames_dropped`
+    /// (its caller decides whether the loss matters), so a caller that treats
+    /// the drop as a tolerated cleanup miss — the tunnel-remap purge, #2880 —
+    /// records it here so it surfaces in the same dropped-frames metric the
+    /// lossy `try_send` path uses, instead of being silently swallowed.
+    pub(crate) fn record_dropped_frames(&self, n: u64) {
+        self.shared.frames_dropped.fetch_add(n, Ordering::Relaxed);
     }
 
     fn try_send_frame(&self, frame: EventFrame) -> Result<(), EventStreamSendError> {
