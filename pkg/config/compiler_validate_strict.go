@@ -393,9 +393,12 @@ func validateLogProfileStreamReferencesStrict(cfg *Config) error {
 // symptom one layer up, at the feed-server root rather than the binding.
 //
 // This gate replicates resolveBaseURL's emptiness condition directly on the
-// FeedServer config struct (URL == "" AND Hostname == "") rather than
-// importing pkg/feeds (pkg/config must not depend on pkg/feeds). Keep in sync
-// with resolveBaseURL.
+// FeedServer config struct (feedServerBaseURLEmpty) rather than importing
+// pkg/feeds (pkg/config must not depend on pkg/feeds). resolveBaseURL prefers
+// `url` and returns strings.TrimRight(url, "/") BEFORE it ever falls back to
+// `hostname`, so a slash-only `url` (e.g. `/`, `//`) trims to "" and the
+// server is skipped even when a hostname is also set — feedServerBaseURLEmpty
+// mirrors that branch order exactly. Keep in sync with resolveBaseURL.
 //
 // On the tolerant load / peer-sync paths the call site downgrades this to a
 // warning (opts.lenientDynamicAddressFeedRef, shared with the feed-name
@@ -424,19 +427,43 @@ func validateDynamicAddressFeedServerEndpointStrict(cfg *Config) error {
 		if fs == nil {
 			continue
 		}
-		// Mirror feeds.resolveBaseURL: empty iff no url AND no hostname.
-		if fs.URL == "" && fs.Hostname == "" {
+		if feedServerBaseURLEmpty(fs) {
 			display := fs.Name
 			if display == "" {
 				display = name
 			}
-			return fmt.Errorf("security dynamic-address feed-server %q has no "+
-				"url or hostname so it registers no feeds — any address-name "+
-				"bound to it silently matches nothing; set a url or hostname",
+			return fmt.Errorf("security dynamic-address feed-server %q resolves "+
+				"to an empty endpoint (no url or hostname, or a slash-only url) "+
+				"so it registers no feeds — any address-name bound to it "+
+				"silently matches nothing; set a valid url or hostname",
 				display)
 		}
 	}
 	return nil
+}
+
+// feedServerBaseURLEmpty reports whether feeds.resolveBaseURL would return ""
+// for this feed-server — i.e. feeds.Manager.Apply would SKIP it and register
+// none of its feeds. It mirrors resolveBaseURL (pkg/feeds/feeds.go)
+// BRANCH-FOR-BRANCH:
+//
+//	if URL != "":            empty iff strings.TrimRight(URL, "/") == ""
+//	else if Hostname != "":  never empty ("https://" + ... is always non-empty)
+//	else:                    empty
+//
+// The URL branch wins outright, so a slash-only `url` (e.g. `/`, `//`) trims to
+// "" and the server is skipped EVEN IF a hostname is also configured — the
+// fallback is never reached. resolveBaseURL performs no whitespace trimming
+// (only strings.TrimRight on "/"), so this does not either. pkg/config cannot
+// import pkg/feeds (import cycle); keep this in sync with resolveBaseURL.
+func feedServerBaseURLEmpty(fs *FeedServer) bool {
+	if fs.URL != "" {
+		return strings.TrimRight(fs.URL, "/") == ""
+	}
+	if fs.Hostname != "" {
+		return false
+	}
+	return true
 }
 
 // validateDynamicAddressFeedReferencesStrict hard-rejects a

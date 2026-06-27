@@ -22588,3 +22588,17 @@ top.
   **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
   pkg/config/compiler_dynamic_address_feed_ref_3300_test.go,
   docs/config-schema.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3300 residual #2 (Codex re-review): the endpoint gate's flat
+  `url=="" && hostname==""` check did NOT match resolveBaseURL, which returns
+  TrimRight(url,"/") BEFORE the hostname fallback — so a slash-only `url /`
+  (operator-reachable: `/` is a valid lexer char, no url-format schema check)
+  trims to "" → Apply skips the server → #3300 silent-miss reproduces.
+  Replaced with feedServerBaseURLEmpty mirroring resolveBaseURL
+  branch-for-branch (url-branch wins; slash-only url rejected even with a
+  hostname set; no whitespace trim, matching resolveBaseURL). Added
+  slash-url + slash-url-with-hostname reject tests (RED on the flat check).
+  **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_dynamic_address_feed_ref_3300_test.go,
+  docs/config-schema.md

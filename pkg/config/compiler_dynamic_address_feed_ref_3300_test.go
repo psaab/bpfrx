@@ -131,6 +131,47 @@ func TestValidateDynamicAddressFeedServerEndpoint(t *testing.T) {
 		}
 	})
 
+	t.Run("commit rejects slash-only url", func(t *testing.T) {
+		// resolveBaseURL returns TrimRight(url, "/") == "" for a slash-only
+		// url, so Apply skips the server — the bound address-name is a silent
+		// match-none. `/` is a valid lexer identifier char and passes the
+		// schema (no url-format validation), so this is operator-reachable.
+		for _, slash := range []string{"/", "//", "///"} {
+			tree := buildTree3300(t, []string{
+				"set security dynamic-address feed-server threat url " + slash,
+				"set security dynamic-address feed-server threat feed-name malware path /malware.txt",
+				"set security dynamic-address address-name bad-actors profile feed-name malware",
+			})
+			_, err := CompileConfig(tree)
+			if err == nil {
+				t.Fatalf("CompileConfig should reject slash-only url %q (resolves to empty endpoint)", slash)
+			}
+			if !strings.Contains(err.Error(), "threat") {
+				t.Fatalf("error should name the feed-server for url %q, got: %v", slash, err)
+			}
+		}
+	})
+
+	t.Run("commit rejects slash-only url even with hostname set", func(t *testing.T) {
+		// resolveBaseURL checks url FIRST and returns "" for a slash-only
+		// url WITHOUT falling back to hostname, so the server is still
+		// skipped despite the hostname. A flat (url=="" && hostname=="")
+		// gate would wrongly accept this.
+		tree := buildTree3300(t, []string{
+			"set security dynamic-address feed-server threat url /",
+			"set security dynamic-address feed-server threat hostname feeds.example.com",
+			"set security dynamic-address feed-server threat feed-name malware path /malware.txt",
+			"set security dynamic-address address-name bad-actors profile feed-name malware",
+		})
+		_, err := CompileConfig(tree)
+		if err == nil {
+			t.Fatalf("CompileConfig should reject slash-only url even when hostname is set (url branch wins in resolveBaseURL)")
+		}
+		if !strings.Contains(err.Error(), "threat") {
+			t.Fatalf("error should name the feed-server, got: %v", err)
+		}
+	})
+
 	t.Run("commit accepts feed-server with url", func(t *testing.T) {
 		tree := buildTree3300(t, []string{
 			"set security dynamic-address feed-server threat url https://feeds.example/list.txt",

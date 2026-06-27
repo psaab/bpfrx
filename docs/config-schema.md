@@ -1383,9 +1383,16 @@ address-name resolves to a match-nothing book exactly as a typo'd feed-name
 would. Rejecting the endpoint-less server at its root ALSO makes the
 cross-reference gate's declared-feed set EXACT — every server it trusts is one
 `Apply` would actually register. The gate replicates `resolveBaseURL`'s
-emptiness condition (`URL == "" && Hostname == ""`) directly on the
-`FeedServer` struct rather than importing `pkg/feeds` (no import cycle); keep
-in sync with `resolveBaseURL`.
+emptiness condition (`feedServerBaseURLEmpty`) directly on the `FeedServer`
+struct rather than importing `pkg/feeds` (no import cycle), mirroring it
+BRANCH-FOR-BRANCH: `resolveBaseURL` prefers `url` and returns
+`strings.TrimRight(url, "/")` BEFORE it ever falls back to `hostname`, so a
+slash-only `url` (`/`, `//`) trims to `""` and the server is skipped EVEN when
+a hostname is also set — a flat `url=="" && hostname==""` check would miss it
+(`/` is a valid lexer identifier char, accepted by the schema with no
+url-format validation). No whitespace trimming is performed (resolveBaseURL
+only `TrimRight`s `"/"`). Keep `feedServerBaseURLEmpty` in sync with
+`resolveBaseURL`.
 
 **Strict/lenient split (flag `lenientDynamicAddressFeedRef`, shared by both
 gates):** strict on the commit / commit-check path (`CompileConfig` —
