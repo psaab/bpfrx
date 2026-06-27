@@ -22357,3 +22357,11 @@ top.
   pkg/dataplane/userspace/zones_host_inbound_test.go,
   pkg/daemon/host_inbound_nft_test.go,
   docs/junos-cli-reference.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3283 — policymatch simulator parity with dataplane wildcard-zone (#3090) and scoped-global (#3148) precedence. Restructured Match() into the dataplane tier chain: exact zone-pair -> single-wildcard (from-any/to-any merged in config order) -> both-any -> global (gated by the optional #3148 from/to-zone match scope, undefined-zone scope fails closed) -> default. Added globalScopeMatches replicating GlobalZoneScope::matches + build_global_zone_scope. Updated stale precedence comments on every surface and the README. Added fail-on-revert table tests.
+  **File(s)**: pkg/policymatch/policymatch.go,
+  pkg/policymatch/wildcard_scoped_test.go,
+  pkg/policymatch/README.md, pkg/api/security.go,
+  pkg/cli/cli_request.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_show_firewall.go

@@ -128,8 +128,19 @@ the OPPOSITE of what the dataplane actually enforces (a dangerous bug for a
 The semantics replicate `userspace-dp/src/policy.rs`
 (`evaluate_policy_result_with_len` + `try_match_rule` + `parse_v3_literal_set`
 + `CompiledApplications`) fed by the Go snapshot builder
-(`pkg/dataplane/userspace/policies.go`). Precedence: **exact zone-pair → global
-→ configured default-policy**. Address matching honors literal CIDRs, address
+(`pkg/dataplane/userspace/policies.go`). Transit precedence, first-match
+terminating:
+
+1. **exact zone-pair** (both zones concrete);
+2. **single-wildcard tier** (#3090) — `from-zone any to-zone <X>` and
+   `from-zone <X> to-zone any`, merged in config order;
+3. **both-any** (#3090) — `from-zone any to-zone any`;
+4. **global** (`junos-global`), gated by the optional `match from-zone` /
+   `match to-zone` scope (#3148): an empty/`any` scope applies to every zone, a
+   typo'd/undefined-zone scope fails closed (matches nothing);
+5. **configured default-policy**.
+
+Address matching honors literal CIDRs, address
 books (recursive set expansion), `any`/`any-ipv4`/`any-ipv6`, source/destination
 exclusion (with the #2008 empty-excluded fail-closed rule), and the live
 dynamic-address feed overlay (`Query.FeedOverlay`, supplied by the daemon via

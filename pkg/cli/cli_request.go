@@ -261,11 +261,12 @@ func (c *CLI) testPolicy(args []string) error {
 	parsedSrc := net.ParseIP(srcIP)
 	parsedDst := net.ParseIP(dstIP)
 
-	// #3042: delegate to the single shared simulator (zone-pair -> global ->
-	// default-policy). The pre-#3042 loop hard-coded "Default deny" (ignoring
-	// default-policy permit-all) and used a narrow address/app matcher that
-	// missed predefined apps, nested application-sets, literal CIDRs,
-	// any-ipv4/any-ipv6, and source/destination exclusion.
+	// #3042: delegate to the single shared simulator (exact zone-pair ->
+	// wildcard-zone tiers (#3090) -> scoped global (#3148) -> default-policy).
+	// The pre-#3042 loop hard-coded "Default deny" (ignoring default-policy
+	// permit-all) and used a narrow address/app matcher that missed predefined
+	// apps, nested application-sets, literal CIDRs, any-ipv4/any-ipv6, and
+	// source/destination exclusion.
 	// #3105: pass the live dynamic-address feed-prefix overlay so a feed-backed
 	// address-name resolves to its live CIDRs on-box, matching the REST/gRPC
 	// simulators and the AF_XDP helper. Nil (CLI outside the daemon) keeps the

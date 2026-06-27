@@ -192,31 +192,82 @@ type Result struct {
 }
 
 // Match runs the simulator against the active config and returns the verdict
-// with the same precedence the runtime enforces: an exact zone-pair policy
-// match wins first, then a global policy, then the configured default-policy.
+// with the SAME precedence the runtime enforces (userspace-dp/src/policy.rs
+// evaluate_policy_result_with_icmp / try_match_rule), first-match terminating:
+//
+//	1. exact zone-pair (both zones concrete)
+//	2. single-wildcard tier — `from-zone any to-zone <X>` and
+//	   `from-zone <X> to-zone any`, MERGED in config order (#3090)
+//	3. both-any — `from-zone any to-zone any` (#3090)
+//	4. global (`junos-global`), gated by the optional `match from-zone` /
+//	   `match to-zone` scope (#3148); an empty/`any` scope applies to every
+//	   zone, an undefined-zone scope fails closed (matches nothing)
+//	5. configured default-policy
 func Match(cfg *config.Config, q Query) Result {
 	if cfg == nil {
 		return Result{DefaultUsed: true, Action: config.PolicyDeny}
 	}
 
-	// 1) Exact zone-pair policies, in config order (first match wins).
+	// Tier 1: exact zone-pair policies, in config order (first match wins).
+	// q.FromZone/q.ToZone are concrete zone names; a wildcard set
+	// (FromZone/ToZone == "any") never compares equal, so it is excluded here.
 	for _, zpp := range cfg.Security.Policies {
 		if zpp == nil || zpp.FromZone != q.FromZone || zpp.ToZone != q.ToZone {
 			continue
 		}
 		for _, pol := range zpp.Policies {
-			if pol == nil {
-				continue
-			}
-			if ruleMatches(cfg, q, pol) {
+			if pol != nil && ruleMatches(cfg, q, pol) {
 				return matchedResult(pol, false)
 			}
 		}
 	}
 
-	// 2) Global policies (junos-global), in config order.
+	// Tier 2: single-wildcard tier (#3090) — `from-zone any to-zone <q.ToZone>`
+	// OR `from-zone <q.FromZone> to-zone any`, MERGED in config order. The
+	// dataplane two-pointer-merges its from_any/to_any index buckets by global
+	// rule index; the snapshot builder (walkPolicyRuleSlots) emits rules in
+	// cfg.Security.Policies slice order with each set's policies contiguous, so
+	// a single in-order pass over the sets reproduces that merge exactly.
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		fromAny := zpp.FromZone == "any"
+		toAny := zpp.ToZone == "any"
+		if fromAny == toAny {
+			continue // both-any (Tier 3) or neither (Tier 1) — not single-wildcard
+		}
+		applies := (fromAny && zpp.ToZone == q.ToZone) || (toAny && zpp.FromZone == q.FromZone)
+		if !applies {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol != nil && ruleMatches(cfg, q, pol) {
+				return matchedResult(pol, false)
+			}
+		}
+	}
+
+	// Tier 3: both-any (`from-zone any to-zone any`), in config order.
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil || zpp.FromZone != "any" || zpp.ToZone != "any" {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol != nil && ruleMatches(cfg, q, pol) {
+				return matchedResult(pol, false)
+			}
+		}
+	}
+
+	// Tier 4: global policies (junos-global), in config order, gated by the
+	// optional #3148 from-zone/to-zone match scope.
 	for _, pol := range cfg.Security.GlobalPolicies {
 		if pol == nil {
+			continue
+		}
+		if !globalScopeMatches(cfg, pol.Match.FromZone, q.FromZone) ||
+			!globalScopeMatches(cfg, pol.Match.ToZone, q.ToZone) {
 			continue
 		}
 		if ruleMatches(cfg, q, pol) {
@@ -224,8 +275,23 @@ func Match(cfg *config.Config, q Query) Result {
 		}
 	}
 
-	// 3) Configured default-policy (NOT a hard-coded deny).
+	// Tier 5: configured default-policy (NOT a hard-coded deny).
 	return Result{DefaultUsed: true, Action: cfg.Security.DefaultPolicy}
+}
+
+// globalScopeMatches replicates GlobalZoneScope::matches + build_global_zone_scope
+// (policy.rs, #3148). An empty or explicit "any" scope applies to every zone.
+// Any other name must resolve to a DEFINED zone and equal the flow's zone; an
+// undefined (typo'd, or reserved like junos-host) scope fails closed — it
+// matches nothing, never silently widening to all-zones.
+func globalScopeMatches(cfg *config.Config, scopeZone, flowZone string) bool {
+	if scopeZone == "" || scopeZone == "any" {
+		return true
+	}
+	if _, ok := cfg.Security.Zones[scopeZone]; !ok {
+		return false // Unresolved → matches nothing
+	}
+	return scopeZone == flowZone
 }
 
 func matchedResult(pol *config.Policy, global bool) Result {

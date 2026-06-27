@@ -227,7 +227,8 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 	default:
 		// #3103: route the gRPC `test policy` diagnostic through the single
 		// shared simulator (pkg/policymatch) so it agrees with the runtime
-		// policy evaluator — zone-pair -> global -> configured default-policy,
+		// policy evaluator — exact zone-pair -> wildcard-zone tiers (#3090) ->
+		// scoped global (#3148) -> configured default-policy,
 		// with predefined/nested-app-set applications, literal-CIDR /
 		// any-ipv4 / any-ipv6 / address-exclusion / feed-overlay address
 		// matching, and source/destination-port terms. The pre-#3103 bespoke

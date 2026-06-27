@@ -164,10 +164,11 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 	}
 
 	// #3042: delegate to the single shared simulator so gRPC agrees with the
-	// runtime evaluator (zone-pair -> global -> default-policy, predefined +
-	// nested-app-set + literal-CIDR + any-ipv4/any-ipv6 + exclusion + feed
-	// overlay). The pre-#3042 loop skipped globals, hard-coded "deny
-	// (default)", and missed predefined apps / literal CIDRs.
+	// runtime evaluator (exact zone-pair -> wildcard-zone tiers (#3090) ->
+	// scoped global (#3148) -> default-policy, predefined + nested-app-set +
+	// literal-CIDR + any-ipv4/any-ipv6 + exclusion + feed overlay). The
+	// pre-#3042 loop skipped globals, hard-coded "deny (default)", and missed
+	// predefined apps / literal CIDRs.
 	var overlay map[string][]string
 	if s.feedOverlayFn != nil {
 		overlay = s.feedOverlayFn()
