@@ -1,3 +1,17 @@
+## 2026-06-26 — #2749 doc fold: event_stream README payload 144 -> 152
+
+- **Timestamp**: 2026-06-26
+- **Action**: Hostile-review NEEDS-MINOR fold. The event_stream module README
+  (userspace-dp/src/event_stream/README.md) still documented the telemetry
+  payload as 144 bytes; #2749 grows the SESSION_CLOSE RT_FLOW frame to 152
+  (SECURITY_EVENT_PAYLOAD_SIZE=152). Updated the codec.rs payload description to
+  152 bytes with the additive [144:152] block (src ToS [144], cumulative TCP
+  control bits [145], reserved flowDirection [146:148], egress ifindex LE u32
+  [148:152]) and the Go len>=152 + close-only / legacy-144 back-compat read,
+  plus the two SESSION_CLOSE/SESSION_CREATE frame descriptions. Doc-only;
+  go build ./... + go test ./pkg/logging/ green.
+- **File(s)**: userspace-dp/src/event_stream/README.md
+
 ## 2026-06-26 — #2749 flowexport: populate TOS/TCPFlags/egress-if via a SESSION_CLOSE wire extension
 
 - **Timestamp**: 2026-06-26
