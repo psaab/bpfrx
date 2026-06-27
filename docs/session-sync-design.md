@@ -559,6 +559,17 @@ backlog (`write_buf`) and writes non-blocking; on `WouldBlock` it keeps the
 remainder for the next cycle. Daemon detects gaps via sequence numbers and can
 request a full reconciliation.
 
+The idle **keepalive** also rides the canonical write path (#2883): the
+connected loop enqueues the keepalive frame into `write_buf` rather than calling
+`write_all` directly. Before #2883 the keepalive used `write_all` on the
+nonblocking socket and treated ANY error — including `WouldBlock` when the
+kernel send buffer is full under a slow reader — as fatal, returning an
+immediate reconnect. That bypassed the partial-write/WouldBlock backpressure and
+stall accounting and caused reconnect churn → replay storms (which then hit the
+blocking replay path, #2877). Routed through `write_buf`, a keepalive WouldBlock
+is ordinary backpressure (retained for the next flush); a genuinely dead
+consumer is still detected by the normal socket-error / EOF path.
+
 The reconnect **replay** (`replay_buffered`) and demotion **drain**
 (`handle_drain_request`) paths write on the SAME nonblocking socket via a
 bounded, stop-aware writer (`write_all_backpressured`, #2877) — they do NOT

@@ -1,3 +1,28 @@
+## 2026-06-26 — #2883 event-stream idle keepalive rides write_buf backpressure
+
+- **Timestamp**: 2026-06-26
+- **Action**: the idle keepalive in `run_connected_loop`
+  (`userspace-dp/src/event_stream/mod.rs`) built a frame and called `write_all`
+  directly on the nonblocking socket, returning true (immediate reconnect) on
+  ANY error — including `WouldBlock` when the kernel send buffer is full under a
+  slow reader. That bypassed the normal `write_buf` partial-write/WouldBlock
+  backpressure + stall accounting and caused reconnect churn -> replay storms
+  (which then hit the blocking replay path, #2877). Fix: enqueue the keepalive
+  bytes into `write_buf` so the top-of-loop flush handles WouldBlock as ordinary
+  backpressure. Made the keepalive interval injectable: `run_connected_loop`
+  takes a `keepalive_interval: Duration` (production passes the new
+  `KEEPALIVE_IDLE_INTERVAL` = 10s; the old dead `KEEPALIVE_INTERVAL_NS` const
+  was removed). A genuinely dead consumer is still caught by the socket-error /
+  EOF path.
+- **File(s)**: `userspace-dp/src/event_stream/mod.rs`,
+  `userspace-dp/src/event_stream/tests.rs`,
+  `userspace-dp/src/event_stream/README.md`,
+  `docs/session-sync-design.md`
+- **Tests**: `test_idle_keepalive_wouldblock_is_backpressure_not_reconnect_2883`
+  — a connected daemon stops reading (send buffer filled), the keepalive fires
+  (interval 0); assert `run_connected_loop` does NOT report reconnect. Goes RED
+  when the keepalive is reverted to `write_all` + `return true`.
+
 ## 2026-06-26 — #2882 event-stream drain honors the target_seq fence
 
 - **Timestamp**: 2026-06-26

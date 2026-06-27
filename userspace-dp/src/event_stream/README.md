@@ -272,6 +272,16 @@ cluster-scoped.
   already-bounded replay buffer, never to `write_buf`. **Invariant: the
   data plane never stalls because a telemetry consumer is slow; a stuck
   consumer degrades telemetry (counted drops), nothing else.**
+- **Idle keepalive rides write_buf, not write_all (#2883).** The connected
+  loop enqueues its idle keepalive frame into `write_buf` (the same path data
+  frames use), so a `WouldBlock` on a full kernel send buffer is ordinary
+  backpressure (retained for the next flush), not a fatal reconnect. The old
+  keepalive called `write_all` directly and `return true`d on any error,
+  including WouldBlock under a slow reader — causing reconnect churn -> replay
+  storms (which then hit the blocking replay path, #2877). A genuinely dead
+  consumer is still caught by the normal socket-error / EOF path. The keepalive
+  interval is `KEEPALIVE_IDLE_INTERVAL` (10s), passed into `run_connected_loop`
+  (injectable so tests can fire it immediately).
 - **Replay/drain writes are nonblocking + stop-aware (#2877).** The reconnect
   replay (`replay_buffered`) and demotion drain (`handle_drain_request`) paths
   push frames through `write_all_backpressured`, which keeps the socket

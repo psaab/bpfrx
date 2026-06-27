@@ -683,6 +683,7 @@ fn dataplane_event_budget_stays_held_after_connected_loop_drains_channel() {
             &loop_shared,
             &mut replay_buf,
             &mut ctrl_read_buf,
+            Duration::from_secs(10),
         );
         drain_remaining(&rx, &loop_shared);
         release_replay_dataplane_event_queue_budget(&loop_shared, &mut replay_buf);
@@ -1033,6 +1034,7 @@ fn stalled_consumer_does_not_grow_backlog_unbounded_end_to_end() {
             &loop_shared,
             &mut replay_buf,
             &mut ctrl_read_buf,
+            Duration::from_secs(10),
         )
     });
 
@@ -1130,6 +1132,7 @@ fn keeping_up_consumer_sees_full_fidelity_and_no_stalls() {
             &loop_shared,
             &mut replay_buf,
             &mut ctrl_read_buf,
+            Duration::from_secs(10),
         )
     });
 
@@ -1788,4 +1791,56 @@ fn test_drain_does_not_wedge_on_stuck_reader_2877() {
 
     drop(daemon_side);
     let _ = handle.join();
+}
+
+// #2883 fail-on-revert guard: the idle keepalive must ride the normal write_buf
+// backpressure path. The old code called write_all directly on the nonblocking
+// socket and returned true (immediate reconnect) on ANY error, including
+// WouldBlock when the kernel send buffer is full under a slow reader. Here a
+// connected daemon stops reading (send buffer filled) and the keepalive fires
+// (interval 0): the fixed loop enqueues it into write_buf as ordinary
+// backpressure and keeps running; the old loop reconnects. We assert the loop
+// does NOT report reconnect. Reverting to the write_all + `return true`
+// keepalive makes the loop return true -> RED.
+#[test]
+fn test_idle_keepalive_wouldblock_is_backpressure_not_reconnect_2883() {
+    let (daemon_side, helper_side) = std::os::unix::net::UnixStream::pair().unwrap();
+    helper_side.set_nonblocking(true).unwrap();
+    // Daemon connects but never reads -> fill the send buffer so the keepalive
+    // write returns WouldBlock.
+    fill_send_buffer(&helper_side);
+
+    // Empty channel + alive tx -> the connected loop is idle (no data frames),
+    // so the idle keepalive path is exercised.
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(4);
+    let shared = Arc::new(EventStreamShared::new());
+
+    let loop_shared = shared.clone();
+    let loop_join = thread::spawn(move || {
+        let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+        let mut ctrl_read_buf: Vec<u8> = Vec::new();
+        // keepalive_interval 0 -> the keepalive fires as soon as the loop is
+        // idle, against the already-full socket.
+        run_connected_loop(
+            &rx,
+            &helper_side,
+            &loop_shared,
+            &mut replay_buf,
+            &mut ctrl_read_buf,
+            Duration::from_millis(0),
+        )
+    });
+
+    // Give the idle keepalive several chances to fire against the full socket.
+    // The buggy write_all keepalive would have reconnected (returned true) by
+    // now; the fixed path keeps running as backpressure.
+    thread::sleep(Duration::from_millis(200));
+    shared.stop.store(true, Ordering::Release);
+    let reconnect = loop_join.join().expect("connected loop thread");
+
+    assert!(
+        !reconnect,
+        "idle keepalive WouldBlock must be backpressure, not a fatal reconnect (#2883)"
+    );
+    drop(daemon_side);
 }

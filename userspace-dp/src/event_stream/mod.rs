@@ -127,9 +127,11 @@ pub(crate) fn mono_ns_to_wall_clock_unix_ns(mono_ns: u64) -> u64 {
     monotonic_ns_to_unix_ns(mono_ns, now_mono_ns, now_unix_ns)
 }
 
-/// Interval between keepalive frames to prevent idle disconnect.
-#[allow(dead_code)] // reserved for event stream keepalive logic
-const KEEPALIVE_INTERVAL_NS: u64 = 10_000_000_000; // 10 seconds
+/// Idle interval after which the connected loop enqueues a keepalive frame to
+/// keep the Go listener from treating the stream as dead. The keepalive is
+/// routed through the normal `write_buf` backpressure path (#2883), so this is
+/// the cadence of enqueue, not of a guaranteed flush.
+const KEEPALIVE_IDLE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Maximum event frames buffered in the mpsc channel (shared across workers).
 const CHANNEL_CAPACITY: usize = 8192;
@@ -734,6 +736,7 @@ fn io_thread_main(
             &shared,
             &mut replay_buf,
             &mut ctrl_read_buf,
+            KEEPALIVE_IDLE_INTERVAL,
         );
 
         shared.connected.store(false, Ordering::Release);
@@ -882,6 +885,7 @@ fn run_connected_loop(
     shared: &Arc<EventStreamShared>,
     replay_buf: &mut VecDeque<EventFrame>,
     ctrl_read_buf: &mut Vec<u8>,
+    keepalive_interval: Duration,
 ) -> bool {
     use std::io::{Read, Write};
 
@@ -961,13 +965,23 @@ fn run_connected_loop(
         } else {
             idle_cycles = idle_cycles.saturating_add(1);
             if idle_cycles > 10 {
-                // Send keepalive to prevent idle disconnect on Go side
-                if last_write.elapsed().as_secs() >= 10 {
+                // Enqueue a keepalive (prevents idle disconnect on the Go side)
+                // through the SAME `write_buf` backpressure path data frames use
+                // (#2883). The old code called `write_all` directly on the
+                // nonblocking socket and returned true (immediate reconnect) on
+                // ANY error — including `WouldBlock` when the kernel send buffer
+                // is full under a slow reader — bypassing the partial-write /
+                // WouldBlock backpressure and stall accounting and causing
+                // reconnect churn -> replay storms. Routing the keepalive bytes
+                // into `write_buf` makes WouldBlock ordinary backpressure: the
+                // top-of-loop flush retains the remainder for the next cycle,
+                // and a genuinely dead consumer is still detected by the normal
+                // socket-error / EOF path rather than by a false reconnect on
+                // transient fullness.
+                if last_write.elapsed() >= keepalive_interval {
                     let mut ka = [0u8; FRAME_HEADER_SIZE];
                     ka[4] = MSG_KEEPALIVE;
-                    if let Err(_) = (&*stream).write_all(&ka) {
-                        return true; // disconnect
-                    }
+                    write_buf.extend_from_slice(&ka);
                     last_write = Instant::now();
                 }
                 thread::sleep(Duration::from_millis(1));
