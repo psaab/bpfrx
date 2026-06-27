@@ -533,21 +533,27 @@ impl super::Coordinator {
         }
         if let Some(es) = self.event_stream.as_ref() {
             let handle = es.worker_handle();
-            // #2880: the previous `let _ = handle.push_delta_lossless(...)`
-            // discarded the Result, so a disconnected or saturated event
-            // stream silently dropped the close delta — the local sessions
-            // were deleted but the Go shadow conntrack and the HA peer kept
-            // stale sessions keyed to the OLD tunnel-endpoint id, and a later
-            // failover could forward with stale tunnel resolution. Mirror the
-            // #2874 flush_session_deltas recovery: push losslessly, and on the
-            // first genuine failure (peer disconnect / queue timeout) stop
-            // attempting further pushes this batch (bounding producer
-            // backpressure to a single lossless wait) and latch loss-of-sync
-            // so the existing full owner-RG re-export supersedes the missed
-            // close.
-            if self.push_purge_close_deltas_lossless(&handle, &deltas) {
-                self.latch_delta_loss_all_workers();
-            }
+            // #2880: push the close deltas through the LOSSLESS producer and
+            // RECORD any that cannot be queued (event stream disconnected /
+            // saturated) instead of silently swallowing the error with the old
+            // `let _ =`. This is error HYGIENE, not a leak fix: the purge is
+            // CLEANUP, not a correctness boundary. Re-resolution and the encap
+            // builders refuse a tunnel id whose owning netdev ifindex differs
+            // from the one stored in the session's resolution (see the
+            // call-site comments in coordinator/snapshot_refresh.rs and
+            // coordinator/reconcile/snapshot.rs), so a surviving stale entry
+            // can never mis-encapsulate; it self-heals — the standby runs its
+            // OWN snapshot-apply purge and idle GC reaps it. A full owner-RG
+            // re-export would NOT recover an undelivered close anyway: the
+            // userspace cold-sync ships sessions as incremental Opens with
+            // EMPTY bulk markers, and the peer's reconcileStaleSessions
+            // short-circuits on an empty bulk (pkg/cluster/sync_bulk.go,
+            // pkg/cluster/sync.go) — re-emitting Opens cannot convey a delete.
+            // A disconnected stream additionally triggers a fresh resync on
+            // reconnect (#2874) independently. So the honest minimal fix is to
+            // surface the drop in the event-stream drop metric + a one-shot
+            // log, not to drive a heavy resync.
+            let _dropped = self.push_purge_close_deltas(&handle, &deltas);
         }
         if !keys.is_empty() {
             eprintln!(
@@ -560,48 +566,34 @@ impl super::Coordinator {
     }
 
     /// #2880: push the tunnel-remap purge Close deltas through the LOSSLESS
-    /// event-stream producer. Returns `true` if any push failed (peer
-    /// disconnect / queue timeout / channel disconnect) — the caller then
-    /// latches loss-of-sync so the full owner-RG re-export recovers the
-    /// missed close. Mirrors the `event_stream_out_of_sync` short-circuit in
-    /// `flush_session_deltas` (#2874): once one push fails we stop attempting
-    /// the rest this batch, because the full resync supersedes them anyway and
-    /// this bounds the worst-case producer backpressure to a single lossless
-    /// wait per purge.
-    pub(crate) fn push_purge_close_deltas_lossless(
+    /// event-stream producer, returning the number that could NOT be queued.
+    /// Each undelivered delta is recorded in the event-stream dropped-frames
+    /// metric (`record_dropped_frames`) so a disconnected / saturated stream
+    /// surfaces in observability instead of being silently swallowed by the
+    /// old `let _ =`. Stops on the first failure — a disconnected stream fails
+    /// every subsequent push immediately, and a saturated one would otherwise
+    /// burn one lossless-queue timeout per remaining delta — and counts the
+    /// undelivered remainder. Cleanup-only error hygiene: it does NOT trigger a
+    /// resync (the caller comment explains why a re-export cannot recover a
+    /// missed close, and why the surviving entry is harmless + self-healing).
+    pub(crate) fn push_purge_close_deltas(
         &self,
         handle: &crate::event_stream::EventStreamWorkerHandle,
         deltas: &[crate::session::SessionDelta],
-    ) -> bool {
+    ) -> usize {
         let zone_name_to_id = &self.forwarding.zone_name_to_id;
-        let mut out_of_sync = false;
-        for delta in deltas {
-            if out_of_sync {
-                break;
-            }
+        for (delivered, delta) in deltas.iter().enumerate() {
             if let Err(err) = handle.push_delta_lossless(delta, zone_name_to_id) {
-                out_of_sync = true;
+                let dropped = deltas.len() - delivered;
+                handle.record_dropped_frames(dropped as u64);
                 eprintln!(
-                    "xpf-userspace-dp: tunnel-remap purge close delta could not be queued losslessly ({err}); latching out-of-sync to force a full owner-RG resync (#2880)"
+                    "xpf-userspace-dp: tunnel-remap purge could not queue {dropped}/{} close delta(s) losslessly ({err}); recorded as dropped frames — surviving peer/Go-shadow entries are harmless (encap ifindex guard) and self-heal via the standby snapshot-apply purge + idle GC (#2880)",
+                    deltas.len()
                 );
+                return dropped;
             }
         }
-        out_of_sync
-    }
-
-    /// #2880: broadcast a `LatchDeltaLoss` command to every worker so each
-    /// worker's `take_delta_loss` re-exports its full owner-RG snapshot (the
-    /// #2442/#2874 recovery path). Used when the coordinator's tunnel-remap
-    /// purge could not propagate a close delta losslessly. The coordinator
-    /// runs outside the worker loop and cannot touch a worker `SessionTable`
-    /// directly, so this mirrors the `DeleteSynced` broadcast seam in
-    /// `delete_synced_session` (#1790/#1807 lock_recover policy — one poisoned
-    /// queue must not block the latch for healthy workers).
-    pub(crate) fn latch_delta_loss_all_workers(&self) {
-        for handle in self.workers.handles.values() {
-            let mut pending = worker_queue::lock_recover(&handle.commands);
-            pending.push_back(WorkerCommand::LatchDeltaLoss);
-        }
+        0
     }
 
     /// Export all locally-owned forward sessions through the event stream.

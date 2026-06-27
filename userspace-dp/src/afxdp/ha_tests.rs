@@ -754,29 +754,21 @@ fn kick_owner_rg_export_enqueues_command_then_wait_completes_on_ack() {
 // ---------------------------------------------------------------------------
 // #2880: purge_remapped_tunnel_sessions must not silently swallow a failed
 // lossless close-delta push. On a disconnected/saturated event stream the
-// close delta cannot be queued — the local sessions are still deleted, but the
-// coordinator MUST latch loss-of-sync on every worker (LatchDeltaLoss) so the
-// existing #2442/#2874 full owner-RG re-export supersedes the missed close on
-// the HA peer / Go shadow conntrack. Before the fix the `let _ =` discarded
-// the error and no resync was forced.
+// close delta cannot be queued — the local sessions are still deleted, and the
+// undelivered delta MUST be recorded in the event-stream dropped-frames metric
+// (error hygiene), not discarded by the old `let _ =`. The purge is
+// CLEANUP-only (not a correctness boundary): a surviving stale entry is
+// harmless (encap ifindex guard) and self-heals via the standby's own
+// snapshot-apply purge + idle GC, so no resync is forced.
 // ---------------------------------------------------------------------------
 
 /// Install one forward synced session whose resolution carries
 /// `tunnel_endpoint_id`, returning the coordinator + the session key. The
 /// session is in the shared `synced` table (publish_shared_session), so the
 /// purge finds it and `delete_synced_session` can remove it.
-fn coordinator_with_tunnel_session(
-    tunnel_endpoint_id: u16,
-    worker_queues: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
-) -> (Coordinator, SessionKey) {
+fn coordinator_with_tunnel_session(tunnel_endpoint_id: u16) -> (Coordinator, SessionKey) {
     let mut coordinator = Coordinator::new();
     coordinator.forwarding = ForwardingState::default();
-    for (worker_id, queue) in worker_queues.iter().enumerate() {
-        coordinator
-            .workers
-            .handles
-            .insert(worker_id as u32, test_worker_handle(queue.clone()));
-    }
     let mut decision = test_decision();
     decision.resolution.tunnel_endpoint_id = tunnel_endpoint_id;
     let key = test_key();
@@ -800,11 +792,8 @@ fn coordinator_with_tunnel_session(
 }
 
 #[test]
-fn purge_remapped_tunnel_sessions_latches_delta_loss_on_lossless_failure() {
-    let worker_queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..2u32)
-        .map(|_| Arc::new(Mutex::new(VecDeque::new())))
-        .collect();
-    let (mut coordinator, key) = coordinator_with_tunnel_session(7, &worker_queues);
+fn purge_remapped_tunnel_sessions_records_drop_on_lossless_failure() {
+    let (mut coordinator, key) = coordinator_with_tunnel_session(7);
 
     // Disconnected event stream: push_delta_lossless fails immediately
     // (connected = false), like a wedged/disconnected consumer. Keep `_rx`
@@ -815,8 +804,9 @@ fn purge_remapped_tunnel_sessions_latches_delta_loss_on_lossless_failure() {
 
     let purged = coordinator.purge_remapped_tunnel_sessions(&[7]);
 
-    // Local delete still happened and the count is accurate for the local
-    // purge (the loss is latched separately, not conflated with the count).
+    // The local delete still happened and the count is accurate for the local
+    // purge (the count is purely local; propagation failure is recorded
+    // separately, not conflated).
     assert_eq!(purged, 1, "the local session is purged regardless of push");
     assert!(
         coordinator
@@ -830,29 +820,27 @@ fn purge_remapped_tunnel_sessions_latches_delta_loss_on_lossless_failure() {
     );
 
     // FAIL-ON-REVERT: restoring `let _ = handle.push_delta_lossless(...)` (the
-    // swallow) removes this LatchDeltaLoss broadcast, so this assertion goes
-    // RED — the silent skip #2880 describes.
-    for (worker_id, queue) in worker_queues.iter().enumerate() {
-        let pending = queue.lock().expect("commands");
-        assert!(
-            pending
-                .iter()
-                .any(|cmd| matches!(cmd, WorkerCommand::LatchDeltaLoss)),
-            "worker {worker_id} must receive LatchDeltaLoss so its take_delta_loss \
-             re-exports the full owner-RG snapshot after the missed close"
-        );
-    }
+    // silent swallow) stops recording the drop, so this assertion goes RED —
+    // the undelivered close is once again invisible (#2880).
+    let dropped = coordinator
+        .event_stream
+        .as_ref()
+        .expect("event stream")
+        .stats()
+        .dropped;
+    assert_eq!(
+        dropped, 1,
+        "an undelivered lossless close delta must be recorded in the \
+         event-stream dropped-frames metric, not silently swallowed"
+    );
 }
 
 #[test]
-fn purge_remapped_tunnel_sessions_no_loss_latched_on_lossless_success() {
-    let worker_queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..2u32)
-        .map(|_| Arc::new(Mutex::new(VecDeque::new())))
-        .collect();
-    let (mut coordinator, key) = coordinator_with_tunnel_session(7, &worker_queues);
+fn purge_remapped_tunnel_sessions_no_drop_on_lossless_success() {
+    let (mut coordinator, key) = coordinator_with_tunnel_session(7);
 
     // Connected event stream with a live receiver and ample capacity: the
-    // lossless close-delta push SUCCEEDS, so no loss must be latched.
+    // lossless close-delta push SUCCEEDS, so nothing is recorded as dropped.
     let (sender, rx) = crate::event_stream::EventStreamSender::test_sender(true, 16);
     coordinator.event_stream = Some(sender);
 
@@ -869,20 +857,19 @@ fn purge_remapped_tunnel_sessions_no_loss_latched_on_lossless_success() {
             .is_none(),
         "the remapped tunnel session must be deleted locally"
     );
-    // The close delta reached the consumer.
+    // The close delta reached the consumer and nothing was dropped.
     assert!(
         rx.try_recv().is_ok(),
         "a close delta must be queued to the connected consumer"
     );
-    // No worker may be told to resync — propagation succeeded.
-    for (worker_id, queue) in worker_queues.iter().enumerate() {
-        let pending = queue.lock().expect("commands");
-        assert!(
-            !pending
-                .iter()
-                .any(|cmd| matches!(cmd, WorkerCommand::LatchDeltaLoss)),
-            "worker {worker_id} must NOT be told to resync when the close delta \
-             was queued losslessly"
-        );
-    }
+    let stats = coordinator
+        .event_stream
+        .as_ref()
+        .expect("event stream")
+        .stats();
+    assert_eq!(stats.sent, 1, "the close delta must be counted as sent");
+    assert_eq!(
+        stats.dropped, 0,
+        "no drop must be recorded when the close delta was queued losslessly"
+    );
 }

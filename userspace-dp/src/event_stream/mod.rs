@@ -404,6 +404,17 @@ impl EventStreamWorkerHandle {
         self.try_send_frame(frame).is_ok()
     }
 
+    /// #2880: record `n` deltas that could not be queued through the LOSSLESS
+    /// producer (event stream disconnected / saturated). `send_frame_lossless`
+    /// returns the failure as an `Err` rather than bumping `frames_dropped`
+    /// (its caller decides whether the loss matters), so a caller that treats
+    /// the drop as a tolerated cleanup miss — the tunnel-remap purge, #2880 —
+    /// records it here so it surfaces in the same dropped-frames metric the
+    /// lossy `try_send` path uses, instead of being silently swallowed.
+    pub(crate) fn record_dropped_frames(&self, n: u64) {
+        self.shared.frames_dropped.fetch_add(n, Ordering::Relaxed);
+    }
+
     fn try_send_frame(&self, frame: EventFrame) -> Result<(), EventStreamSendError> {
         match self.tx.try_send(frame) {
             Ok(()) => {
