@@ -390,6 +390,10 @@ func (d *Daemon) flowExportCallback(rec logging.EventRecord, raw []byte) {
 		}
 		// Family attribution then the single per-instance sampling decision.
 		if lead.ServesFamily(sd.IsIPv6) && lead.ShouldExport(rec.InZone, rec.OutZone) {
+			// #3270: derive flowDirection (IE 61) from the per-zone
+			// sampling-direction. Always computed; only the groups whose
+			// template enabled `export-extension flow-dir` actually encode it.
+			sd.Direction = lead.FlowDirection(rec.InZone, rec.OutZone)
 			for k := i; k < j; k++ {
 				b.groups[k].exp.ExportSessionClose(rec, sd)
 			}
@@ -437,6 +441,8 @@ func (d *Daemon) ipfixExportCallback(rec logging.EventRecord, raw []byte) {
 			j++
 		}
 		if lead.ServesFamily(sd.IsIPv6) && lead.ShouldExport(rec.InZone, rec.OutZone) {
+			// #3270: see flowExportCallback.
+			sd.Direction = lead.FlowDirection(rec.InZone, rec.OutZone)
 			for k := i; k < j; k++ {
 				b.groups[k].exp.ExportSessionClose(rec, sd)
 			}

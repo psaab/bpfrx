@@ -23,15 +23,17 @@ import (
 // packet counter), so the proto->packet-counter adjacency the record-layout
 // goldens below check is preserved.
 //
-// Only flowDirection/Direction (61) stays absent — there is no real per-flow
-// inbound/outbound classification on the close path yet (a deliberate
-// deferral; see docs/flow-export.md).
+// #3270: flowDirection/Direction (61) is no longer permanently absent — it is
+// advertised + populated (from the per-zone sampling-direction) when
+// `export-extension flow-dir` is configured. It stays absent in the BASE
+// (no-extension) template, which is what these tests exercise; the conditional
+// presence/value behaviour is pinned by TestV9TemplateFlowDirConditional and
+// TestIPFIXTemplateFlowDirConditional. See docs/flow-export.md.
 //
-// These tests are fail-on-revert pins: re-adding flowDirection (IE 61) to a
-// template (with a synthetic-zero encoder write) re-fails the template-absence
-// walk; the record-layout goldens still prove the bytes immediately after the
-// protocol byte are the packet/byte counters (the REAL values), never a
-// class-of-service block.
+// These tests are fail-on-revert pins for the BASE template/record layout: the
+// record-layout goldens prove the bytes immediately after the protocol byte
+// are the packet/byte counters (the REAL values), never a class-of-service
+// block, and that the default template advertises no flowDirection.
 
 // --- IPFIX template-absence ------------------------------------------------
 
@@ -42,7 +44,9 @@ import (
 func TestIPFIXTemplateDroppedFieldsAbsent(t *testing.T) {
 	// #2749: IEs 5/6/10/14 are intentionally NOT in this set — they are
 	// re-introduced with real values and pinned present by the *Populated
-	// tests. Only flowDirection (61) stays absent.
+	// tests. #3270: flowDirection (61) is absent in the BASE (no-flow-dir)
+	// template exercised here; its conditional presence is pinned by
+	// TestIPFIXTemplateFlowDirConditional.
 	dropped := map[uint16]string{
 		61: "flowDirection",
 	}

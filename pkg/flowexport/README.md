@@ -109,9 +109,13 @@ body + 2 src/dst mask + 4 ingressInterface + 7 CoS/egress + 12 post-NAT) and
 the IPv6 record is 118 bytes (69 + 2 + 4 + 7 + 36); the NetFlow v9 record
 sizes derive from the template via `recordSize` (4-byte padded, 64 v4 / 112
 v6 — NetFlow `tcpFlags` is 1B not 2B), so they track the template
-automatically.
-An init-time
-assertion in `ipfix.go` pins `ipfixRecordSizeV4/V6` to the sum of their
+automatically. #3270: with `export-extension flow-dir` the templates splice in
+`flowDirection` (IE 61, 1B) before the post-NAT trailer — the IPFIX record
+grows to 71 (v4) / 119 (v6); the v9 record absorbs the byte into its existing
+4-byte padding (`ipfixRecordSize(isV6, includeDir)` /
+`buildTemplateFieldsV4/V6` carry the flag).
+The init-time
+assertion in `ipfix.go` pins the BASE `ipfixRecordSizeV4/V6` to the sum of their
 template field lengths so a template/encoder length drift fails the
 process at startup (a mismatch would corrupt every record). Golden
 byte-level encoder tests (`postnat_test.go`) pin the field offsets/values
@@ -157,7 +161,9 @@ no longer hardcodes 0); `pkg/logging/ringbuf.go` retains the raw numeric value
 The remaining three needed a **wire-format extension**, which #2749 added: the
 SESSION_CLOSE RT_FLOW frame grew 144 → 152 bytes with an ADDITIVE `[144:152]`
 block — `[144]` src ToS (DSCP<<2), `[145]` cumulative TCP control bits,
-`[148:152]` egress ifindex (`[146:148]` reserved for a future flowDirection).
+`[148:152]` egress ifindex (`[146:148]` reserved — #3270 derives flowDirection
+in Go from the per-zone sampling-direction, so this byte stays reserved for a
+possible future intrinsic zone-role signal).
 Conntrack-side, `SessionEntry.observed_tos` / `observed_tcp_flags` are stamped
 on the AF_XDP forwarding path (`account_packet` — forward DSCP, OR of TCP flags
 both directions) and harvested onto the close `SessionDelta` in
@@ -175,15 +181,40 @@ ingress pins in `ingress_interface_test.go`; the Rust side pins the stamping
 (`test_encode_session_close_rt_flow_v4_wire_layout`); the Go decode round-trip
 is pinned by `TestDecodeRawEventCloseCarriesCosBlock`.
 
-**Deferred — `flowDirection` (IE 61).** It stays dropped: the close path has no
-real per-flow inbound/outbound signal, and a constant ingress=0 would
-re-introduce the exact synthetic-zero #2613 fixed. Its absence is still pinned
-by `dropped_fields_test.go`. The `export-extension flow-dir` config knob is
-still accepted but does not add `flowDirection`; the compiler warns when it is
-configured (`compiler_validate_warn.go`), mirroring the `app-id` warn-not-lie
-precedent. The remaining fail-on-revert pins live in `dropped_fields_test.go`
-(template-absence walk for IE 61 + record-layout golden that proves the bytes
-after `protocol` are the real counters, not a sentinel CoS block).
+**#3270 — `flowDirection` (IE 61) populated from the per-zone
+sampling-direction, opt-in.** flowDirection is exported again, but only when a
+template configures `export-extension flow-dir`, and the value is a REAL signal
+derived in Go — never the synthetic ingress=0 #2613 removed. The signal source
+is the per-zone sampling-direction xpf already consults to DECIDE whether to
+export a flow (`ExportConfig.ShouldExport`): a flow is exported because its
+ingress zone has `sampling input` (observed at ingress → `0`) or its egress
+zone has `sampling output` (observed at egress → `1`). `ExportConfig.FlowDirection`
+mirrors that decision (RFC 5102 ingress/egress observation point; the exact
+mapping Junos SRX inline active-flow-monitoring uses for input- vs
+output-applied sampling). **Ingress wins ties** (both directions sampled) to
+match the record's initiator-tuple anchor.
+
+The dataplane is unchanged: it has no zone-role/trust signal, so the original
+"Rust-stamp `[146]`" idea is infeasible — the reserved `[146]` byte on the
+SESSION_CLOSE frame stays reserved. The daemon callback computes
+`sd.Direction = lead.FlowDirection(rec.InZone, rec.OutZone)` and the v9 / IPFIX
+encoders write it **only** in groups whose template enabled flow-dir
+(`IncludeFlowDir`). The templates splice IE 61 in just before the post-NAT
+trailer (`buildTemplateFieldsV4/V6`, `ipfixTemplateFieldsV4/V6`); a config that
+did not opt in keeps the field absent. With flow-dir enabled the IPFIX record
+grows by one byte (V4 70→71, V6 118→119); the v9 record absorbs the byte into
+the existing 4-byte FlowSet padding.
+
+The compiler still warns — but now only when `export-extension flow-dir` is set
+with **no** `sampling input`/`output` configured anywhere
+(`anySamplingDirectionConfigured`), because flowDirection would then be a
+constant 0. Fail-on-revert pins: `TestFlowDirectionFromSampling` (the
+mapping + ingress-wins tie-break), `TestV9TemplateFlowDirConditional` /
+`TestIPFIXTemplateFlowDirConditional` (IE 61 present iff opt-in, with the
+record-size delta), the encode-value pins, and the daemon end-to-end
+`TestSessionCloseFlowDirectionEgress` (egress-sampled flow exports
+flowDirection=1). The base-template absence (no opt-in) is still pinned by
+`dropped_fields_test.go`.
 
 **#2866 — `srcMask` / `dstMask` populated from the FIB.** The NetFlow v9
 templates advertised `srcMask` (IE 9) / `dstMask` (IE 13) and the IPv6

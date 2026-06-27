@@ -30,12 +30,13 @@ const (
 	ipfixDestinationIPv6Address   = 28
 	ipfixSourceIPv6PrefixLength   = 29 // #2866 srcMask v6 (IE 29), unsigned8
 	ipfixDestIPv6PrefixLength     = 30 // #2866 dstMask v6 (IE 30), unsigned8
+	ipfixFlowDirection            = 61 // #3270 flowDirection (IE 61), unsigned8
 	ipfixFlowStartMilliseconds    = 152
 	ipfixFlowEndMilliseconds      = 153
-	// #2613: ipClassOfService (5), tcpControlBits (6), ingressInterface (10),
-	// egressInterface (14) and flowDirection (61) are no longer advertised —
-	// the SESSION_CLOSE wire frame carries no real value for any of them, so
-	// exporting them produced authoritative zeros at the collector.
+	// #2749: ipClassOfService (5), tcpControlBits (6), ingressInterface (10) and
+	// egressInterface (14) are advertised with real values. #3270: flowDirection
+	// (61) is advertised conditionally (opt-in `export-extension flow-dir`),
+	// populated from the per-zone sampling-direction.
 	// ipfixApplicationId (95) is reserved for a future app-id record field.
 	// RFC 5103 post-NAT (translated) tuple elements. IPv4 addresses 225/226
 	// (ipv4Address, 4B); transport ports 227/228 (unsigned16, 2B), which are
@@ -69,19 +70,17 @@ type ipfixField struct {
 	length    uint16
 }
 
-// #2613: the IPFIX templates do NOT advertise ipClassOfService (5),
-// tcpControlBits (6), flowDirection (61), ingressInterface (10) or
-// egressInterface (14). The SESSION_CLOSE wire frame (the only flow source)
-// carries no DSCP/TOS, no observed TCP flags, no per-flow direction and no
-// egress ifindex, and the dataplane hardcodes the ingress ifindex slot to 0
-// on close frames (userspace-dp encode_session_close_rt_flow). Advertising
-// those IEs made every collector ingest authoritative zeros for
-// class-of-service, TCP flags, direction and interface attribution.
-// Populating them requires a Rust<->Go wire-format extension tracked
-// separately; until that exists the templates omit the fields rather than
-// export synthetic zeros.
+// #2749: the IPFIX templates advertise ipClassOfService (5), tcpControlBits
+// (6), ingressInterface (10) and egressInterface (14) with REAL values from
+// the extended SESSION_CLOSE wire frame. #3270: flowDirection (IE 61) is
+// advertised CONDITIONALLY — only when `export-extension flow-dir` is set on
+// the template — and populated in Go from the per-zone sampling-direction
+// (ExportConfig.FlowDirection). The base ipfixTemplateV4/V6 slices below are
+// the flow-dir-ABSENT templates; ipfixTemplateFieldsV4/V6 splice IE 61 in
+// before the post-NAT trailer when includeDir is set, so a config that did not
+// opt in keeps the field absent (no #2613 synthetic-zero regression).
 
-// ipfixTemplateV4 defines the IPv4 IPFIX template fields.
+// ipfixTemplateV4 defines the IPv4 IPFIX base template fields (flow-dir absent).
 var ipfixTemplateV4 = []ipfixField{
 	{ipfixSourceIPv4Address, 4},
 	{ipfixDestinationIPv4Address, 4},
@@ -101,16 +100,16 @@ var ipfixTemplateV4 = []ipfixField{
 	// #2749: ingressInterface (IE 10) re-introduced with a REAL value — the
 	// ingress ifindex on the SESSION_CLOSE frame since #2615. Placed before
 	// the post-NAT tuple so the latter stays the trailing block (#2526
-	// invariant). The other four #2613 drops (ipClassOfService 5 /
-	// flowDirection 61) stays absent — no real per-flow value yet.
+	// invariant).
 	{ipfixIngressInterface, 4},
 	// #2749: class-of-service + egress interface re-introduced with REAL
 	// values from the extended SESSION_CLOSE frame ([144:152]).
 	// ipClassOfService (IE 5, 1B) = forward DSCP<<2; tcpControlBits (IE 6, 2B,
 	// unsigned16) = cumulative TCP control bits; egressInterface (IE 14, 4B) =
 	// egress ifindex. Placed after ingressInterface and before the post-NAT
-	// tuple so the latter stays the trailing block (#2526). flowDirection
-	// (IE 61) stays absent.
+	// tuple so the latter stays the trailing block (#2526). #3270: flowDirection
+	// (IE 61) is spliced in here by ipfixTemplateFieldsV4 when flow-dir is
+	// enabled; it is NOT in this base slice.
 	{ipfixIPClassOfService, 1},
 	{ipfixTCPControlBits, 2},
 	{ipfixEgressInterface, 4},
@@ -170,25 +169,77 @@ const ipfixRecordSizeV4 = 70
 // 16+16+2+2+1+8+8+8+8 + 1+1 + 4 + 1+2+4 + 16+16+2+2 = 118
 const ipfixRecordSizeV6 = 118
 
-// ipfixRecordSizeV4 / V6 must equal the sum of their template field lengths.
-// A drift between the template (what the collector parses) and the encoder
-// (record size) corrupts every record — pin it at build time (#2526).
+// ipfixRecordSizeV4 / V6 must equal the sum of their (base) template field
+// lengths. A drift between the template (what the collector parses) and the
+// encoder (record size) corrupts every record — pin it at build time (#2526).
 var _ = func() struct{} {
-	sum := func(fs []ipfixField) int {
-		n := 0
-		for _, f := range fs {
-			n += int(f.length)
-		}
-		return n
-	}
-	if sum(ipfixTemplateV4) != ipfixRecordSizeV4 {
+	if ipfixSumLen(ipfixTemplateV4) != ipfixRecordSizeV4 {
 		panic("ipfixRecordSizeV4 != sum(ipfixTemplateV4)")
 	}
-	if sum(ipfixTemplateV6) != ipfixRecordSizeV6 {
+	if ipfixSumLen(ipfixTemplateV6) != ipfixRecordSizeV6 {
 		panic("ipfixRecordSizeV6 != sum(ipfixTemplateV6)")
 	}
 	return struct{}{}
 }()
+
+func ipfixSumLen(fs []ipfixField) int {
+	n := 0
+	for _, f := range fs {
+		n += int(f.length)
+	}
+	return n
+}
+
+// ipfixSpliceFlowDir returns base with a {ipfixFlowDirection,1} field inserted
+// before the trailing post-NAT block (first IE >= ipfixPostNatSourceIPv4Address),
+// keeping the #2526 post-NAT trailer last. base is not mutated.
+func ipfixSpliceFlowDir(base []ipfixField) []ipfixField {
+	idx := len(base)
+	for i, f := range base {
+		if f.elementID >= ipfixPostNatSourceIPv4Address {
+			idx = i
+			break
+		}
+	}
+	out := make([]ipfixField, 0, len(base)+1)
+	out = append(out, base[:idx]...)
+	out = append(out, ipfixField{ipfixFlowDirection, 1})
+	out = append(out, base[idx:]...)
+	return out
+}
+
+// ipfixTemplateFieldsV4 returns the IPv4 IPFIX template fields, splicing in
+// flowDirection (IE 61) before the post-NAT trailer when includeDir is set
+// (#3270).
+func ipfixTemplateFieldsV4(includeDir bool) []ipfixField {
+	if includeDir {
+		return ipfixSpliceFlowDir(ipfixTemplateV4)
+	}
+	return ipfixTemplateV4
+}
+
+// ipfixTemplateFieldsV6 returns the IPv6 IPFIX template fields. See
+// ipfixTemplateFieldsV4.
+func ipfixTemplateFieldsV6(includeDir bool) []ipfixField {
+	if includeDir {
+		return ipfixSpliceFlowDir(ipfixTemplateV6)
+	}
+	return ipfixTemplateV6
+}
+
+// ipfixRecordSize returns the encoded record size for the given family and
+// flow-dir state (#3270): the base size plus one byte when flowDirection is
+// advertised.
+func ipfixRecordSize(isV6, includeDir bool) int {
+	base := ipfixRecordSizeV4
+	if isV6 {
+		base = ipfixRecordSizeV6
+	}
+	if includeDir {
+		return base + 1
+	}
+	return base
+}
 
 // ipfixHeader is the 16-byte IPFIX message header (RFC 7011 Section 3.1).
 type ipfixHeader struct {
@@ -213,12 +264,20 @@ func encodeIPFIXHeaderInto(b []byte, h ipfixHeader) {
 	binary.BigEndian.PutUint32(b[12:16], h.ObservationID)
 }
 
-// encodeIPFIXTemplateSet builds an IPFIX template set containing v4 and v6 templates.
+// encodeIPFIXTemplateSet builds an IPFIX template set with the base templates
+// (flow-dir absent). Retained for callers/tests that exercise the default
+// no-extension template.
 func encodeIPFIXTemplateSet() []byte {
-	v4fields := len(ipfixTemplateV4)
-	v6fields := len(ipfixTemplateV6)
+	return encodeIPFIXTemplateSetDir(false)
+}
+
+// encodeIPFIXTemplateSetDir builds an IPFIX template set containing v4 and v6
+// templates, advertising flowDirection (IE 61) when includeDir is set (#3270).
+func encodeIPFIXTemplateSetDir(includeDir bool) []byte {
+	v4 := ipfixTemplateFieldsV4(includeDir)
+	v6 := ipfixTemplateFieldsV6(includeDir)
 	// Set header (4 bytes) + 2 template record headers (4 each) + field specifiers (4 each)
-	totalLen := 4 + (4 + v4fields*4) + (4 + v6fields*4)
+	totalLen := 4 + (4 + len(v4)*4) + (4 + len(v6)*4)
 
 	b := make([]byte, totalLen)
 	off := 0
@@ -230,9 +289,9 @@ func encodeIPFIXTemplateSet() []byte {
 
 	// IPv4 template record header
 	binary.BigEndian.PutUint16(b[off:off+2], ipfixTemplateIDv4)
-	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(v4fields))
+	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(len(v4)))
 	off += 4
-	for _, f := range ipfixTemplateV4 {
+	for _, f := range v4 {
 		binary.BigEndian.PutUint16(b[off:off+2], f.elementID) // no enterprise bit
 		binary.BigEndian.PutUint16(b[off+2:off+4], f.length)
 		off += 4
@@ -240,9 +299,9 @@ func encodeIPFIXTemplateSet() []byte {
 
 	// IPv6 template record header
 	binary.BigEndian.PutUint16(b[off:off+2], ipfixTemplateIDv6)
-	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(v6fields))
+	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(len(v6)))
 	off += 4
-	for _, f := range ipfixTemplateV6 {
+	for _, f := range v6 {
 		binary.BigEndian.PutUint16(b[off:off+2], f.elementID)
 		binary.BigEndian.PutUint16(b[off+2:off+4], f.length)
 		off += 4
@@ -251,25 +310,30 @@ func encodeIPFIXTemplateSet() []byte {
 	return b
 }
 
-// encodeIPFIXDataSet builds an IPFIX data set from a batch of records.
+// encodeIPFIXDataSet builds an IPFIX data set from a batch of records with the
+// base (flow-dir absent) layout. Retained for callers/tests.
 func encodeIPFIXDataSet(records []FlowRecord) []byte {
+	return encodeIPFIXDataSetDir(records, false)
+}
+
+// encodeIPFIXDataSetDir builds an IPFIX data set, encoding flowDirection
+// (IE 61) when includeDir is set (#3270).
+func encodeIPFIXDataSetDir(records []FlowRecord, includeDir bool) []byte {
 	if len(records) == 0 {
 		return nil
 	}
 	isV6 := records[0].IsIPv6
 	var tmplID uint16
-	var recSize int
 	if isV6 {
 		tmplID = ipfixTemplateIDv6
-		recSize = ipfixRecordSizeV6
 	} else {
 		tmplID = ipfixTemplateIDv4
-		recSize = ipfixRecordSizeV4
 	}
+	recSize := ipfixRecordSize(isV6, includeDir)
 
 	totalLen := ipfixDataSetLen(len(records), recSize)
 	b := make([]byte, totalLen)
-	encodeIPFIXDataSetInto(b, records, tmplID, recSize)
+	encodeIPFIXDataSetInto(b, records, tmplID, recSize, includeDir)
 	return b
 }
 
@@ -277,7 +341,7 @@ func ipfixDataSetLen(recordCount, recSize int) int {
 	return 4 + recordCount*recSize
 }
 
-func encodeIPFIXDataSetInto(b []byte, records []FlowRecord, tmplID uint16, recSize int) {
+func encodeIPFIXDataSetInto(b []byte, records []FlowRecord, tmplID uint16, recSize int, includeDir bool) {
 	if len(records) == 0 {
 		return
 	}
@@ -288,15 +352,15 @@ func encodeIPFIXDataSetInto(b []byte, records []FlowRecord, tmplID uint16, recSi
 	isV6 := records[0].IsIPv6
 	for _, r := range records {
 		if isV6 {
-			off = encodeIPFIXRecordV6(b, off, r)
+			off = encodeIPFIXRecordV6(b, off, r, includeDir)
 		} else {
-			off = encodeIPFIXRecordV4(b, off, r)
+			off = encodeIPFIXRecordV4(b, off, r, includeDir)
 		}
 	}
 	clear(b[off:totalLen])
 }
 
-func encodeIPFIXRecordV4(b []byte, off int, r FlowRecord) int {
+func encodeIPFIXRecordV4(b []byte, off int, r FlowRecord, includeDir bool) int {
 	src4 := r.SrcIP.To4()
 	dst4 := r.DstIP.To4()
 	if src4 == nil {
@@ -344,6 +408,13 @@ func encodeIPFIXRecordV4(b []byte, off int, r FlowRecord) int {
 	off += 2
 	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
 	off += 4
+	// #3270: flowDirection (IE 61, unsigned8) — 0 ingress / 1 egress, derived
+	// from the per-zone sampling-direction. Written only when the template
+	// advertises it (includeDir), before the post-NAT trailer.
+	if includeDir {
+		b[off] = r.Direction
+		off++
+	}
 	// #2526: post-NAT (translated) tuple — 225/226/227/228.
 	natSrc4 := r.NATSrcIP.To4()
 	natDst4 := r.NATDstIP.To4()
@@ -364,7 +435,7 @@ func encodeIPFIXRecordV4(b []byte, off int, r FlowRecord) int {
 	return off
 }
 
-func encodeIPFIXRecordV6(b []byte, off int, r FlowRecord) int {
+func encodeIPFIXRecordV6(b []byte, off int, r FlowRecord, includeDir bool) int {
 	src16 := r.SrcIP.To16()
 	dst16 := r.DstIP.To16()
 	if src16 == nil {
@@ -408,6 +479,11 @@ func encodeIPFIXRecordV6(b []byte, off int, r FlowRecord) int {
 	off += 2
 	binary.BigEndian.PutUint32(b[off:off+4], r.OutIf)
 	off += 4
+	// #3270: flowDirection (IE 61, unsigned8) — see encodeIPFIXRecordV4.
+	if includeDir {
+		b[off] = r.Direction
+		off++
+	}
 	// #2526: post-NAT (translated) tuple — 281/282 (16B) + 227/228 (2B).
 	natSrc16 := r.NATSrcIP.To16()
 	natDst16 := r.NATDstIP.To16()
@@ -433,6 +509,10 @@ type IPFIXExporter struct {
 	cfg         *ExportConfig
 	sourceID    uint32
 	templateSet []byte
+	// includeDir mirrors cfg.IncludeFlowDir, resolved once at construction so
+	// the template set and every data record agree on whether flowDirection
+	// (IE 61) is present (#3270).
+	includeDir bool
 
 	mu    sync.Mutex
 	seq   uint32 // cumulative data record count
@@ -460,7 +540,8 @@ func NewIPFIXExporter(cfg *ExportConfig) (*IPFIXExporter, error) {
 	e := &IPFIXExporter{
 		cfg:          cfg,
 		sourceID:     1,
-		templateSet:  encodeIPFIXTemplateSet(),
+		includeDir:   cfg.IncludeFlowDir,
+		templateSet:  encodeIPFIXTemplateSetDir(cfg.IncludeFlowDir),
 		MaskResolver: NewRouteMaskResolver(0),
 	}
 
@@ -537,6 +618,9 @@ func (e *IPFIXExporter) ExportSessionClose(rec logging.EventRecord, evt SessionC
 		TOS:      evt.TOS,
 		TCPFlags: evt.TCPFlags,
 		OutIf:    evt.OutIf,
+		// #3270: flowDirection (IE 61), derived from sampling-direction in the
+		// daemon callback. Encoded only when the group enabled flow-dir.
+		Direction: evt.Direction,
 	}
 
 	e.batch.add(fr)
@@ -610,17 +694,13 @@ func (e *IPFIXExporter) sendRecords(records []FlowRecord) {
 	}
 
 	isV6 := records[0].IsIPv6
-	var (
-		recSize int
-		tmplID  uint16
-	)
+	var tmplID uint16
 	if isV6 {
-		recSize = ipfixRecordSizeV6
 		tmplID = ipfixTemplateIDv6
 	} else {
-		recSize = ipfixRecordSizeV4
 		tmplID = ipfixTemplateIDv4
 	}
+	recSize := ipfixRecordSize(isV6, e.includeDir)
 
 	// Reserve 16 bytes for IPFIX header + 4 bytes for set header
 	maxRecords := (maxPayload - 16 - 4) / recSize
@@ -652,7 +732,7 @@ func (e *IPFIXExporter) sendRecords(records []FlowRecord) {
 
 		pkt := make([]byte, 16+dataLen)
 		encodeIPFIXHeaderInto(pkt[:16], hdr)
-		encodeIPFIXDataSetInto(pkt[16:], batch, tmplID, recSize)
+		encodeIPFIXDataSetInto(pkt[16:], batch, tmplID, recSize, e.includeDir)
 		e.conns.writeAll(pkt, "ipfix data send failed")
 
 		e.exportedFlows.Add(uint64(len(batch)))
