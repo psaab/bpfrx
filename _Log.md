@@ -21823,3 +21823,21 @@ top.
   userspace-dp/src/event_stream/tests.rs,
   userspace-dp/src/event_stream/README.md,
   docs/session-sync-design.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3061 zone-local address books — parse `security zones
+  security-zone <z> address-book { address; address-set }` into
+  ZoneConfig.AddressBook (schema leaf + compileZones via shared
+  parseAddressBookEntries). resolveZoneLocalAddressBooks (end of
+  compileSecurity) folds zone-local entries into the global AddressBook under
+  zone-qualified internal names (zone-local/<zone>/<name>) and rewrites each
+  policy match token that resolves zone-locally; source-address scopes to
+  from-zone, destination-address to to-zone, zone-local wins over global,
+  global is the fallback. Downstream resolution (wire snapshot, nameToID,
+  validators, runtime resolveUserspaceAddressBookEntry) stays global-only. A
+  name only in zone A's book is invisible to zone B (undefined → #2008 commit
+  reject). 2 fail-on-revert tests (resolution + precedence/scoping).
+  **File(s)**: pkg/config/schema_security.go, pkg/config/types_security.go,
+  pkg/config/compiler_security.go,
+  pkg/dataplane/userspace/zone_local_addressbook_3061_test.go,
+  pkg/config/README.md, docs/config-schema.md

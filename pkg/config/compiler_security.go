@@ -174,7 +174,129 @@ func compileSecurity(node *Node, sec *SecurityConfig) error {
 			}
 		}
 	}
+	resolveZoneLocalAddressBooks(sec)
 	return nil
+}
+
+// zoneLocalNamePrefix marks a zone-qualified internal address-book name
+// minted by resolveZoneLocalAddressBooks (#3061). The `/` separators make
+// the synthetic name impossible to collide with an operator-typed Junos
+// identifier (zone names and address names cannot contain `/`).
+const zoneLocalNamePrefix = "zone-local/"
+
+// zoneLocalQualify mints the global-book key for a zone-local address-book
+// entry. Both components are `/`-free, so the result is unambiguous and can
+// never equal a user-typed token.
+func zoneLocalQualify(zone, name string) string {
+	return zoneLocalNamePrefix + zone + "/" + name
+}
+
+// resolveZoneLocalAddressBooks folds every zone-local address book (#3061)
+// into the global SecurityConfig.AddressBook under zone-qualified internal
+// names and rewrites each policy's match address tokens that resolve
+// zone-locally to point at the qualified entry. After this pass the entire
+// downstream resolution path (wire snapshot, nameToID, classifyPolicyAddresses,
+// strict/warn validators) keeps operating on a single flat global book.
+//
+// Junos scoping: a policy's source-address resolves against its FROM zone's
+// book, destination-address against its TO zone's book — zone-local first,
+// then the global book. A token defined in a zone's local book is rewritten
+// to that zone's qualified name (zone-local wins); a token NOT in the zone's
+// local book is left unchanged so it falls back to the global book. A name
+// present only in zone A's book is therefore invisible to a policy in zone B.
+func resolveZoneLocalAddressBooks(sec *SecurityConfig) {
+	hasLocal := false
+	for _, z := range sec.Zones {
+		if z != nil && z.AddressBook != nil {
+			hasLocal = true
+			break
+		}
+	}
+	if !hasLocal {
+		return
+	}
+
+	if sec.AddressBook == nil {
+		sec.AddressBook = &AddressBook{
+			Addresses:   make(map[string]*Address),
+			AddressSets: make(map[string]*AddressSet),
+		}
+	}
+	gb := sec.AddressBook
+
+	localDefines := func(zone, name string) bool {
+		z := sec.Zones[zone]
+		if z == nil || z.AddressBook == nil {
+			return false
+		}
+		if _, ok := z.AddressBook.Addresses[name]; ok {
+			return true
+		}
+		_, ok := z.AddressBook.AddressSets[name]
+		return ok
+	}
+
+	// Inject each zone-local entry into the global book under its qualified
+	// name. Address-set member references are re-pointed to the same zone's
+	// qualified name when the member is also zone-local (zone-local first),
+	// otherwise left as a global reference.
+	for zoneName, z := range sec.Zones {
+		if z == nil || z.AddressBook == nil {
+			continue
+		}
+		for name, addr := range z.AddressBook.Addresses {
+			q := zoneLocalQualify(zoneName, name)
+			gb.Addresses[q] = &Address{Name: q, Value: addr.Value, Description: addr.Description}
+		}
+		for name, set := range z.AddressBook.AddressSets {
+			q := zoneLocalQualify(zoneName, name)
+			ns := &AddressSet{Name: q}
+			for _, m := range set.Addresses {
+				if localDefines(zoneName, m) {
+					ns.Addresses = append(ns.Addresses, zoneLocalQualify(zoneName, m))
+				} else {
+					ns.Addresses = append(ns.Addresses, m)
+				}
+			}
+			for _, m := range set.AddressSets {
+				if localDefines(zoneName, m) {
+					ns.AddressSets = append(ns.AddressSets, zoneLocalQualify(zoneName, m))
+				} else {
+					ns.AddressSets = append(ns.AddressSets, m)
+				}
+			}
+			gb.AddressSets[q] = ns
+		}
+	}
+
+	rewrite := func(zone string, tokens []string) {
+		if zone == "" {
+			return
+		}
+		for i, t := range tokens {
+			switch t {
+			case "", "any", "any4", "any6":
+				continue
+			}
+			if localDefines(zone, t) {
+				tokens[i] = zoneLocalQualify(zone, t)
+			}
+		}
+	}
+	for _, zpp := range sec.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, p := range zpp.Policies {
+			if p == nil {
+				continue
+			}
+			rewrite(zpp.FromZone, p.Match.SourceAddresses)
+			rewrite(zpp.ToZone, p.Match.DestinationAddresses)
+		}
+	}
+	// Global policies (junos-global) have no zone-local scope — they resolve
+	// only against the global book, so their tokens are left unchanged.
 }
 
 func compileZones(node *Node, sec *SecurityConfig) error {
@@ -209,6 +331,16 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 				zone.TCPRst = true
 			case "description":
 				zone.Description = nodeVal(prop)
+			case "address-book":
+				// #3061: zone-local address book. Same entry grammar as the
+				// global book; resolved into the global book under
+				// zone-qualified internal names later (resolveZoneLocalAddressBooks).
+				ab := &AddressBook{
+					Addresses:   make(map[string]*Address),
+					AddressSets: make(map[string]*AddressSet),
+				}
+				parseAddressBookEntries(prop, ab)
+				zone.AddressBook = ab
 			}
 		}
 
@@ -700,7 +832,19 @@ func compileAddressBook(node *Node, sec *SecurityConfig) error {
 		AddressSets: make(map[string]*AddressSet),
 	}
 
-	for _, child := range globalNode.Children {
+	parseAddressBookEntries(globalNode, ab)
+
+	sec.AddressBook = ab
+	return nil
+}
+
+// parseAddressBookEntries folds the `address` / `address-set` children of
+// node into ab. node is either the `global` block under `security
+// address-book` or a zone-local `address-book` block under `security zones
+// security-zone <z>` (#3061) — the entry grammar is identical, only the
+// attachment point differs.
+func parseAddressBookEntries(node *Node, ab *AddressBook) {
+	for _, child := range node.Children {
 		switch child.Name() {
 		case "address":
 			// A single Junos `address <name>` may render as MULTIPLE sibling
@@ -738,9 +882,6 @@ func compileAddressBook(node *Node, sec *SecurityConfig) error {
 			}
 		}
 	}
-
-	sec.AddressBook = ab
-	return nil
 }
 
 // mergeAddressNode folds one `address <name> ...` AST node into addr,
