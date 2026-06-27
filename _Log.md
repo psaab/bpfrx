@@ -1,3 +1,107 @@
+## 2026-06-26 — #3148 review fold: explicit `any`→Any + reject junos-host global match
+
+- **Timestamp**: 2026-06-26
+- **Action**: Hostile-review NEEDS-MINOR fold (commit-gate vs dataplane
+  divergence on a security leaf). The commit gate exempts `any`/`junos-host`/""
+  for the new global match from-zone/to-zone leaves, but `build_global_zone_scope`
+  only mapped "" → Any: explicit `match from-zone any` routed through
+  resolve_policy_zone_id("any") → None → Unresolved (matched NOTHING), so a
+  permit-global silently over-restricted and a deny-global silently no-op'd.
+  Fix: (1) short-circuit `name == "any"` → GlobalZoneScope::Any in policy.rs
+  (omit == explicit any == all-zones, agreeing with the commit gate); (2)
+  hard-reject `match from-zone/to-zone junos-host` on a global policy at commit
+  (validatePolicyZoneReferencesStrict) — a zone-scoped global is not evaluated
+  on the host-bound path, so junos-host could only silently never-match;
+  real junos-host global-zone support is a follow-up. Tests (fail-on-revert
+  proven): Rust global_policy_explicit_any_matches_all_zones (RED when the
+  "any" short-circuit is dropped); Go explicit_any_commits +
+  junos_host_zone_rejected subtests. Full cargo test (only the load-sensitive
+  worker_queue/event_stream timing flakes, pass in isolation), go build ./...
+  + go test ./pkg/config/ ./pkg/dataplane/... green.
+- **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_policy_global_zone_3148_test.go,
+  docs/userspace-dataplane-architecture.md, docs/junos-cli-reference.md,
+  docs/config-schema.md
+
+## 2026-06-26 — #3148 global policy from-zone/to-zone match context
+
+- **Timestamp**: 2026-06-26
+- **Action**: vsrx-parity — a Junos global policy can now carry optional
+  `match from-zone <z>` / `match to-zone <z>` so one global policy scopes to a
+  chosen zone pair (or one wildcard side) instead of every zone pair; absent =
+  all zones (no regression). Composes with #3090: a zone-scoped global policy
+  stays in the `junos-global` tier (keeps the sentinel on its structural zones)
+  and the context rides additive wire fields `match_from_zone`/`match_to_zone`
+  (resolved to a `GlobalZoneScope` checked inside the global-tier loop). So it
+  is evaluated in the global ordering AFTER the exact zone-pair and the #3090
+  from-any/to-any/both-any wildcard tiers — NOT promoted ahead of them.
+  Go: PolicyMatch.FromZone/ToZone, compilePolicy match cases, schema leaves
+  (global policy match only), globalOnlyPolicyMatchLeaves through the #3113
+  gate, PolicyRuleSnapshot wire fields + emitter, and
+  validatePolicyZoneReferencesStrict now rejects an undefined global match zone
+  (lenient → warn). Rust: GlobalZoneScope enum + PolicyRule fields + scope skip
+  in the global tier; serde fields; regenerated protocol_wire_v1.json.
+  Tests (fail-on-revert proven RED): Rust
+  `global_policy_zone_context_scopes_to_pair` / `_single_side_zone_context` /
+  `_unknown_zone_context_fails_closed`; Go
+  `TestGlobalPolicyZoneContextCompiles` / `_StrictCommit`,
+  `TestGlobalPolicyEmitsZoneContext`. cargo build+test (full suite 0 real
+  failures; only the load-sensitive worker_queue/event_stream timing flakes,
+  pass in isolation), go build ./... + go test ./pkg/config/
+  ./pkg/dataplane/... green.
+- **File(s)**: pkg/config/types_security.go,
+  pkg/config/compiler_security.go, pkg/config/schema_security.go,
+  pkg/config/compiler_policy_match.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/compiler_policy_global_zone_3148_test.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/policy_global_zone_3148_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/policy.rs,
+  userspace-dp/src/policy_tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/userspace-dataplane-architecture.md, docs/junos-cli-reference.md,
+  docs/config-schema.md
+
+## 2026-06-26 — #3152 session: TCP opening/half-open state machine
+
+- **Timestamp**: 2026-06-26
+- **Action**: Added a TCP three-way-handshake completion state to the
+  userspace session entry. A session created by a bare SYN (SYN set, ACK
+  clear) now starts OPENING (`SessionEntry.established == false`) and is
+  reaped on a short `SessionTimeouts.tcp_opening_ns` window (20 s, Junos
+  `tcp-initial-timeout` default) instead of the full 300 s established
+  timeout, mitigating low-rate bare-SYN half-open table exhaustion (sibling
+  of #3046). It is promoted to ESTABLISHED on the first ACK-bearing segment
+  after the opening SYN (the reverse SYN-ACK and the forward completing ACK
+  both carry ACK); promotion is sticky and applied at all three
+  timeout-selection sites (install/upsert_synced, lookup, update_session).
+  `session_timeout_ns` gained an `established` parameter routing the OPENING
+  branch to `tcp_opening_ns`; the per-app #3227 override and established
+  timeout apply only once established. Non-TCP and TCP mid-stream pickups
+  (non-bare-SYN first packet) initialise ESTABLISHED — byte-identical to
+  pre-#3152. HA decision: `established` is node-local derived state, NOT on
+  the sync wire (no wire-format change); sync gating unchanged. A
+  peer-synced session is imported as ESTABLISHED (not re-derived OPENING
+  from possibly-stale synced tcp_flags), so a live established flow's
+  standby copy is never misclassified and reaped early at the short
+  stale-synced ceiling — zero failover regression. The half-open mitigation
+  holds end to end via the primary's fast reap + Close-delta propagation to
+  the standby. `tcp_opening_ns` is not
+  operator-configurable yet (held at the default on every construction path
+  including from_seconds) — deferred config knob. SYN-cookie integration is
+  out of scope (the existing opt-in screen path already prevents half-open
+  installs when configured). Tests:
+  bare_syn_session_starts_opening_with_short_timeout (RED on revert),
+  half_open_session_reaps_at_opening_timeout (RED on revert),
+  tcp_handshake_promotes_opening_to_established,
+  opening_session_ignores_app_override_until_established, plus
+  default/from_seconds opening-window asserts and an updated
+  session_timeout_ns_honors_app_override.
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/install.rs, userspace-dp/src/session/lookup.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md
+
 ## 2026-06-26 — #2358 NAT64 inbound cross-family policy matching
 
 - **Timestamp**: 2026-06-26

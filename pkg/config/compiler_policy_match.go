@@ -80,6 +80,18 @@ var supportedPolicyMatchLeaves = map[string]bool{
 	"application":                  true,
 }
 
+// globalOnlyPolicyMatchLeaves are `match` leaves the compiler enforces ONLY
+// under a GLOBAL policy: a Junos global policy may carry optional from-zone/
+// to-zone match context (#3148) to scope it to one zone pair (or one wildcard
+// side) instead of every zone pair. They are meaningless under a zone-pair
+// policy (whose zones come from the surrounding from-zone/to-zone stanza), so
+// the strict gate still rejects them there. Keep in lockstep with
+// compilePolicy's `match` switch (compiler_security.go).
+var globalOnlyPolicyMatchLeaves = map[string]bool{
+	"from-zone": true,
+	"to-zone":   true,
+}
+
 // unsupportedPolicyMatchLeaves enumerates the KNOWN vSRX `match` leaves xpf
 // does not enforce. #3113 rejects them when they appear as a DIRECT child of
 // `match`. #3142 closes the multi-value-leaf escape: `match application` (and
@@ -148,13 +160,19 @@ func validatePolicyMatchLeavesStrict(nodes []*Node, lenient bool) ([]string, err
 		return nil
 	}
 
-	checkPolicy := func(scope, policyName string, polNode *Node) error {
+	checkPolicy := func(scope, policyName string, polNode *Node, isGlobal bool) error {
 		matchNode := polNode.FindChild("match")
 		if matchNode == nil {
 			return nil
 		}
 		for _, m := range matchNode.Children {
 			leaf := m.Name()
+			// #3148: from-zone/to-zone are supported match context for a
+			// global policy only; under a zone-pair policy they fall through
+			// to the unsupported reject below.
+			if isGlobal && globalOnlyPolicyMatchLeaves[leaf] {
+				continue
+			}
 			if supportedPolicyMatchLeaves[leaf] {
 				// #3142: a multi:true match leaf (application/source-address/
 				// destination-address) absorbs trailing non-sibling tokens
@@ -185,7 +203,7 @@ func validatePolicyMatchLeavesStrict(nodes []*Node, lenient bool) ([]string, err
 		switch child.Name() {
 		case "global":
 			for _, polInst := range namedInstances(child.FindChildren("policy")) {
-				if err := checkPolicy("global", polInst.name, polInst.node); err != nil {
+				if err := checkPolicy("global", polInst.name, polInst.node, true); err != nil {
 					return nil, err
 				}
 			}
@@ -214,7 +232,7 @@ func validatePolicyMatchLeavesStrict(nodes []*Node, lenient bool) ([]string, err
 			for _, zp := range pairs {
 				scope := fmt.Sprintf("from-zone %s to-zone %s", zp.from, zp.to)
 				for _, polInst := range namedInstances(zp.policyNode.FindChildren("policy")) {
-					if err := checkPolicy(scope, polInst.name, polInst.node); err != nil {
+					if err := checkPolicy(scope, polInst.name, polInst.node, false); err != nil {
 						return nil, err
 					}
 				}

@@ -52,7 +52,8 @@ structure.)
 
 | Class | Default |
 |-------|---------|
-| TCP   | 300 s |
+| TCP established | 300 s |
+| TCP opening (half-open) | 20 s |
 | UDP   | 60 s |
 | ICMP  | 60 s |
 | TCP closing (graceful FIN) | 30 s |
@@ -84,6 +85,61 @@ like `policy_id`, the override is in-process only — it is NOT yet carried
 on the cross-node session-sync wire, so a peer-promoted session ages on
 the global timeout until a real-traffic refresh re-stamps it (a
 documented follow-up).
+
+**TCP opening / half-open state (#3152).** A TCP session created by a
+bare SYN (SYN set, ACK clear) starts in the OPENING (half-open) state
+(`SessionEntry.established == false`) and is reaped on the short
+`SessionTimeouts.tcp_opening_ns` window (20 s, the Junos
+`tcp-initial-timeout` default) instead of the full 300 s established
+timeout. It is promoted to ESTABLISHED — and the established / per-app
+idle window then applies — on the first ACK-bearing segment after the
+opening SYN: the reverse SYN-ACK and the forward handshake-completing ACK
+both carry the ACK bit, so a completed three-way handshake promotes the
+session while a bare SYN that never gets a reply never produces such a
+segment and reaps at the short window. The promotion is sticky (a later
+segment never demotes an established session back to OPENING) and is
+applied on all three timeout-selection sites (`install` /
+`upsert_synced`, `lookup`, `update_session`). The state is initialised
+ESTABLISHED for every non-TCP session and for any TCP session whose
+creating packet is NOT a bare SYN (a mid-stream pickup such as a SYN-ACK
+or data segment), so those paths are byte-identical to pre-#3152.
+
+Without this, a bare SYN landed on the full established timeout, so a
+low-rate bare-SYN flood (SYN with no follow-up ACK) could pin half-open
+entries in the bounded `max_sessions` table for the full established
+window and eventually deny new legitimate flows. The opt-in syn-flood
+screen + SYN-cookie path already prevents half-open installs entirely
+when configured on the ingress zone; this is the defense-in-depth /
+Junos-parity backstop for zones without it. It is the SYN-flood/half-open
+sibling of the #3046 RST-reap window and composes with the #3227 per-app
+idle timeout (which is the established idle value and never shortens or
+lengthens the opening window). The `tcp_opening_ns` window is not
+operator-configurable yet — held at the default on every construction
+path including `from_seconds` (a future config knob would set it there
+without touching the state machine).
+
+**HA-sync interaction (#3152).** The `established` field is node-local
+derived state and is NOT carried on the cross-node session-sync wire (no
+wire-format change). Sync-delta emission/gating is unchanged, so HA
+failover semantics are untouched — a half-open session is neither
+specially suppressed from nor specially forced onto the peer. A
+peer-synced session is imported as ESTABLISHED (`upsert_synced_with_
+origin`), NOT re-derived as OPENING from the synced `tcp_flags`. Two
+reasons: (1) the short opening window is a FORWARDING-NODE protection
+against a locally-received bare-SYN flood, and the standby never receives
+that flood directly (it receives synced sessions); (2) the synced
+`tcp_flags` are the install-time flags (the opening SYN for a SYN-created
+flow) and are not guaranteed to be re-published as the primary's
+handshake completes, so deriving OPENING on import could misclassify a
+LIVE established flow on the standby and reap its synced copy at the short
+stale-synced ceiling (`STALE_SYNCED_CEILING_MULT × opening`), breaking
+failover for any flow older than that ceiling. Importing as ESTABLISHED
+preserves the exact pre-#3152 standby behaviour (full established timeout
++ #2120 standby retention). The half-open table-exhaustion mitigation
+still holds end to end: the primary (the flood target) reaps its
+half-opens at `tcp_opening_ns` and emits a Close delta
+(`session/expire.rs`) that propagates to the standby, removing the synced
+copy promptly without the standby needing its own OPENING window.
 
 **RST vs FIN close (#3046).** A graceful FIN close keeps the full 30 s
 `TCP_CLOSING_TIMEOUT_NS` (TIME_WAIT-style window for half-closed /

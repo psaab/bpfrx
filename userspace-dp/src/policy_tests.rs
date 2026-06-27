@@ -3557,6 +3557,166 @@ fn from_zone_any_to_junos_host_blocks_host_inbound_from_any_zone() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// #3148 global policy from-zone/to-zone match context.
+//
+// A Junos global policy may carry optional `match from-zone`/`match to-zone`
+// so one global policy applies to a chosen zone pair (or one wildcard side)
+// instead of every zone pair, while still being evaluated in the GLOBAL tier
+// ordering (after exact zone-pair and the #3090 wildcard tiers). The
+// fail-on-revert guard is `global_policy_zone_context_scopes_to_pair`:
+// deleting the `global_*_zone.matches(...)` skip in the global-tier loop of
+// `evaluate_policy_result_with_icmp` makes the scoped global rule match EVERY
+// zone pair again, so the "other pair falls through to default" assertions go
+// RED.
+// ─────────────────────────────────────────────────────────────────────────
+
+fn global_zone_rule(name: &str, match_from: &str, match_to: &str, action: &str) -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        name: name.to_string(),
+        // A global policy keeps the junos-global sentinel on both structural
+        // zone fields (so it is classified into the global tier); the optional
+        // zone context rides in match_from_zone / match_to_zone (#3148).
+        from_zone: "junos-global".to_string(),
+        to_zone: "junos-global".to_string(),
+        match_from_zone: match_from.to_string(),
+        match_to_zone: match_to.to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: action.to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn global_policy_zone_context_scopes_to_pair() {
+    // `global policy match from-zone trust to-zone untrust permit`, default
+    // deny: ONLY trust->untrust is permitted; every other pair falls through
+    // to the default deny. (Fail-on-revert: drop the scope skip and the global
+    // rule matches every pair, so the Deny assertions turn into Permit.)
+    let state = parse_policy_state(
+        "deny",
+        &[global_zone_rule("scoped", "trust", "untrust", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+    assert_eq!(eval(&state, TEST_UNTRUST_ZONE_ID, TEST_TRUST_ZONE_ID), PolicyAction::Deny);
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+}
+
+#[test]
+fn global_policy_no_zone_context_matches_all_pairs() {
+    // No #3148 regression: a global policy with NO from/to zone context keeps
+    // the historical all-zones semantics.
+    let state = parse_policy_state(
+        "deny",
+        &[global_zone_rule("all", "", "", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_UNTRUST_ZONE_ID, TEST_TRUST_ZONE_ID), PolicyAction::Permit);
+}
+
+#[test]
+fn global_policy_single_side_zone_context() {
+    // from-zone-only scope: matches every egress zone but only the named
+    // ingress zone.
+    let state = parse_policy_state(
+        "deny",
+        &[global_zone_rule("from-trust", "trust", "", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+
+    // to-zone-only scope (symmetric).
+    let state = parse_policy_state(
+        "deny",
+        &[global_zone_rule("to-wan", "", "wan", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Deny);
+}
+
+#[test]
+fn global_policy_evaluated_after_wildcard_tiers() {
+    // Precedence vs #3090: a `from-zone any to-zone untrust permit` wildcard
+    // (zone-pair tier 1) is consulted BEFORE the zone-scoped global tier, so it
+    // wins a trust->untrust flow over a conflicting `global match from-zone
+    // trust to-zone untrust deny`. Default deny.
+    let state = parse_policy_state(
+        "deny",
+        &[
+            wildcard_rule("wild-permit", "any", "untrust", "permit"),
+            global_zone_rule("global-deny", "trust", "untrust", "deny"),
+        ],
+        &test_zone_name_to_id(),
+    );
+    // Tier 1 wildcard permit wins over the tier 4 scoped global deny.
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    // The wildcard also covers a different ingress into untrust.
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    // Neither rule covers trust->wan (wildcard is to-untrust, global is
+    // to-untrust) → default deny.
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+}
+
+#[test]
+fn global_policy_unknown_zone_context_fails_closed() {
+    // A global policy whose match zone does not resolve to a defined zone must
+    // match NOTHING (fail-closed), never silently widen to all-zones.
+    let state = parse_policy_state(
+        "deny",
+        &[global_zone_rule("typo", "nonexistent", "untrust", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Deny);
+}
+
+#[test]
+fn global_policy_explicit_any_matches_all_zones() {
+    // #3148 fold: an EXPLICIT `match from-zone any` is the Junos all-zones
+    // default — identical to omitting the leaf. It must resolve to
+    // GlobalZoneScope::Any (matches every from-zone), NOT route through
+    // resolve_policy_zone_id("any") -> None -> Unresolved (matches nothing).
+    // Fail-on-revert: drop the `name == "any"` short-circuit in
+    // build_global_zone_scope and these Permit assertions turn into Deny.
+    let state = parse_policy_state(
+        "deny",
+        &[global_zone_rule("any-to-untrust", "any", "untrust", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    // Not into untrust → default deny (the to-zone scope still applies).
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+
+    // Symmetric: explicit `to-zone any`.
+    let state = parse_policy_state(
+        "deny",
+        &[global_zone_rule("trust-to-any", "trust", "any", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+
+    // Explicit `any` on BOTH sides == no zone context == all zones.
+    let state = parse_policy_state(
+        "deny",
+        &[global_zone_rule("any-any", "any", "any", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_UNTRUST_ZONE_ID, TEST_TRUST_ZONE_ID), PolicyAction::Permit);
+}
 // === #2358: NAT64 inbound cross-family (V6 src, V4 dst) policy matching ===
 //
 // For an inbound NAT64 flow the source remains the IPv6 client while the

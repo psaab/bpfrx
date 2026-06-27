@@ -1323,10 +1323,15 @@ restores that fail-CLOSED parity. It hard-rejects any zone-pair policy
 whose from/to-zone is not a defined `security zones security-zone` and is
 not one of the reserved special tokens **`any`** (Junos wildcard zone),
 **`junos-host`** (reserved self-traffic context), or the empty token (see
-`policyZoneSpecialTokens`). Global policies (`security policies global { }`)
-are NOT iterated — they live in `cfg.Security.GlobalPolicies` with no
-from/to-zone strings and map to the `junos-global` sentinel only when the
-dataplane snapshot is built, so they cannot name an undefined zone.
+`policyZoneSpecialTokens`). A global policy's STRUCTURAL from/to-zone is always
+the `junos-global` sentinel (mapped only at snapshot-build time), so it never
+names an undefined structural zone. As of **#3148** a global policy MAY carry
+an optional `match from-zone`/`match to-zone` context (all-zones when absent);
+`validatePolicyZoneReferencesStrict` now validates those match zones against the
+same special-token + defined-zone gate. The dataplane fails CLOSED for an
+undefined global match zone (`GlobalZoneScope::Unresolved` matches nothing) — a
+silent never-match rather than a fail-open — but the commit gate rejects it
+anyway for operator-visible parity.
 
 **Strict/lenient split (flag `lenientPolicyZoneRefs`):** strict on the
 commit / commit-check path (`CompileConfig` — hard-reject), downgraded to
@@ -1367,6 +1372,56 @@ no compiler/validator behaviour changes). Regression coverage:
 `pkg/config/schema_scheduler_name_3117_test.go` — the leaf is offered by
 `CompleteSetPathWithValues` for zone-pair and global policies (fail-on-revert),
 and the declared form passes `SchemaValidate` without a false reject.
+
+### #3148 — Global-policy `match from-zone`/`to-zone` zone context
+
+A Junos global policy may carry optional `set security policies global policy
+<p> match from-zone <z>` / `match to-zone <z>` so one global policy applies to a
+chosen zone pair (or one wildcard side) instead of every zone pair. xpf
+previously modeled a global policy as an all-zones fallback only — the context
+was unrepresentable, so an imported vSRX policy like "apply this global deny to
+all Internet-egress zones but not management" had to be hand-duplicated.
+
+The two leaves are declared **only under the global policy `match` node** in
+`pkg/config/schema_security.go` (zone-pair policies take their zones from the
+surrounding from-zone/to-zone stanza, so the `match`-level leaves are
+global-only — `globalOnlyPolicyMatchLeaves` in `compiler_policy_match.go`
+admits them through the #3113 unsupported-leaf gate for global scope and the
+gate still rejects them under a zone-pair policy). `compilePolicy` reads them
+into `Policy.Match.FromZone`/`.ToZone` (empty = all zones).
+
+On the wire the global policy keeps the `junos-global` sentinel on its
+structural from/to-zone (so the dataplane classifier keeps it in the global
+tier and preserves global config order) and carries the context on the additive
+fields `match_from_zone` / `match_to_zone` (`PolicyRuleSnapshot`,
+`omitempty` + `serde(default)` — #1961 additive; the wire fixture
+`protocol_wire_v1.json` was regenerated). The dataplane resolves them into a
+`GlobalZoneScope` and consults it inside the `junos-global` tier loop, so a
+zone-scoped global policy is evaluated in the global ordering (after the exact
+zone-pair and the #3090 `from-zone any`/`to-zone any` wildcard tiers), not
+promoted ahead of them. An undefined match zone is strict-rejected at commit
+(`validatePolicyZoneReferencesStrict`, downgraded to a warning on the tolerant
+load path) and independently fails closed in the dataplane
+(`GlobalZoneScope::Unresolved` matches nothing).
+
+**Special-token semantics (commit gate ⇔ dataplane parity).** An OMITTED
+`from-zone`/`to-zone` and an explicit `match from-zone any` / `to-zone any` are
+the SAME thing — the Junos all-zones default. Both commit clean (`any` is a
+reserved special token) and `build_global_zone_scope` (policy.rs) short-circuits
+`""` and `"any"` to `GlobalZoneScope::Any`; without that short-circuit `"any"`
+would route through `resolve_policy_zone_id` → `None` → `Unresolved` and a
+`permit` global would silently over-restrict / a `deny` global silently no-op —
+a commit-vs-dataplane divergence on a security leaf. The reserved `junos-host`
+zone is the one special token that is NOT accepted here: a zone-scoped global
+policy is not evaluated on the host-bound (LocalDelivery) path, so
+`validatePolicyZoneReferencesStrict` hard-rejects `match from-zone junos-host` /
+`to-zone junos-host` at commit (rather than committing a silent never-match);
+real junos-host global-zone-context support is a follow-up.
+
+Regression coverage:
+`pkg/config/compiler_policy_global_zone_3148_test.go`,
+`pkg/dataplane/userspace/policy_global_zone_3148_test.go`, and the Rust
+`global_policy_*` tests in `userspace-dp/src/policy_tests.rs`.
 
 ### #2391 — Security-zone count cap (commit fail-closed)
 
