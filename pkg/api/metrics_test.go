@@ -605,11 +605,15 @@ func TestCollectPolicyCountersExposesSparseAndGlobalPolicyIDs(t *testing.T) {
 	}, 31)
 }
 
-// TestCollectPolicyCountersGatedOnPolicyStats verifies the #2008 M4 gate: when
-// `security policy-stats system-wide enable` is absent (the Junos
-// default), collectPolicyCounters must emit no per-policy hit counters even
-// though the dataplane has nonzero values, matching Junos which does not
-// maintain those counters unless the knob is on.
+// TestCollectPolicyCountersGatedOnPolicyStats verifies the #2008 M4 gate
+// AND the #3074 per-policy `then count` override on the Prometheus
+// collector. With `security policy-stats system-wide enable` absent (the
+// Junos default): a policy WITHOUT `then count` (plain-allow) emits no
+// per-policy hit counter (the M4 gate), while a policy WITH `then count`
+// (scheduled-allow) DOES emit its counter — `then count` opts that policy
+// into per-policy counting independent of the global knob (Junos
+// per-policy `count`). Before #3074 `then count` was inert and this
+// collector emitted nothing with the knob off.
 func TestCollectPolicyCountersGatedOnPolicyStats(t *testing.T) {
 	store := newSchedulerCounterAPIStore(t) // no policy-stats enabled
 	if store.ActiveConfig().Security.PolicyStatsEnabled {
@@ -628,6 +632,10 @@ func TestCollectPolicyCountersGatedOnPolicyStats(t *testing.T) {
 	dp := &schedulerCounterAPIDP{
 		Manager: dataplane.New(),
 		counters: map[uint32]dataplane.CounterValue{
+			// plain-allow occupies a zone-pair slot; give it a nonzero
+			// value to prove the M4 gate still suppresses a no-`then count`
+			// policy with the knob off.
+			0:           {Packets: 99, Bytes: 9900},
 			scheduledID: {Packets: 17, Bytes: 1700},
 		},
 	}
@@ -641,8 +649,16 @@ func TestCollectPolicyCountersGatedOnPolicyStats(t *testing.T) {
 	for m := range ch {
 		got = append(got, m)
 	}
-	if len(got) != 0 {
-		t.Fatalf("policy-stats disabled: expected 0 policy counters, got %d", len(got))
+	// #3074: scheduled-allow (then count) is emitted even with the knob off.
+	assertCounterClose(t, got, c.policyHitsTotal, map[string]string{
+		"from_zone":   "trust",
+		"to_zone":     "untrust",
+		"policy_name": "scheduled-allow",
+	}, 17)
+	// M4 gate: plain-allow (no then count) must NOT be emitted with the
+	// knob off, so scheduled-allow is the ONLY metric.
+	if len(got) != 1 {
+		t.Fatalf("policy-stats off: want exactly 1 counter (scheduled-allow, then count), got %d", len(got))
 	}
 }
 

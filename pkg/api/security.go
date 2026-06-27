@@ -106,7 +106,7 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				pr.Applications = []string{}
 			}
 
-			if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
+			if (statsEnabled || rule.Count) && s.dp != nil && s.dp.IsLoaded() {
 				policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(len(pi.Rules))
 				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
 					pr.HitPackets = ctrs.Packets
@@ -158,7 +158,7 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				pr.Applications = []string{}
 			}
 
-			if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
+			if (statsEnabled || rule.Count) && s.dp != nil && s.dp.IsLoaded() {
 				policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
 					pr.HitPackets = ctrs.Packets

@@ -196,11 +196,13 @@ security {
 }
 
 // TestGetPoliciesGatesCountersOnPolicyStats verifies the #2118 display
-// gate: with a fully populated dataplane but `policy-stats` OFF, the
-// structured GetPolicies response reports zero HitPackets/HitBytes —
-// matching the Prometheus collector (#2008 M4) and the CLI/gRPC text
-// surfaces. Without the gate the same fixture (verified nonzero by
-// TestGetPoliciesExposesScheduledRuleCounters) would leak live counts.
+// gate AND the #3074 per-policy `then count` override on the structured
+// gRPC GetPolicies response. With `policy-stats` OFF: a rule WITHOUT
+// `then count` (plain-allow) reports 0/0 (the gate), while rules WITH
+// `then count` (scheduled-allow, global-scheduled) report their live
+// counts — `then count` opts a policy into per-policy counting
+// independent of the system-wide knob. Before #3074 `then count` was
+// inert and every rule read 0/0 with the knob off.
 func TestGetPoliciesGatesCountersOnPolicyStats(t *testing.T) {
 	store := newPolicyCounterGRPCStoreNoStats(t)
 	policyID := scheduledCounterGRPCPolicyID(t, store)
@@ -209,7 +211,8 @@ func TestGetPoliciesGatesCountersOnPolicyStats(t *testing.T) {
 		dp: &schedulerCounterGRPCDP{
 			Manager: dataplane.New(),
 			counters: map[uint32]dataplane.CounterValue{
-				1:                               {Packets: 99, Bytes: 9900},
+				// plain-allow (no then count) occupies slot 0.
+				0:                               {Packets: 99, Bytes: 9900},
 				policyID:                        {Packets: 23, Bytes: 2300},
 				dataplane.MaxRulesPerPolicy * 2: {Packets: 31, Bytes: 3100},
 			},
@@ -220,13 +223,29 @@ func TestGetPoliciesGatesCountersOnPolicyStats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPolicies() error = %v", err)
 	}
+	seen := map[string]bool{}
 	for _, policy := range resp.GetPolicies() {
 		for _, rule := range policy.GetRules() {
-			if rule.GetHitPackets() != 0 || rule.GetHitBytes() != 0 {
-				t.Fatalf("policy %s->%s rule %q: counters = %d/%d, want 0/0 (policy-stats off)",
-					policy.GetFromZone(), policy.GetToZone(), rule.GetName(),
-					rule.GetHitPackets(), rule.GetHitBytes())
+			seen[rule.GetName()] = true
+			var wantP, wantB uint64
+			switch rule.GetName() {
+			case "scheduled-allow":
+				wantP, wantB = 23, 2300 // #3074: then count exposed
+			case "global-scheduled":
+				wantP, wantB = 31, 3100 // #3074: then count exposed
+			default:
+				wantP, wantB = 0, 0 // no then count -> M4/#2118 gate
 			}
+			if rule.GetHitPackets() != wantP || rule.GetHitBytes() != wantB {
+				t.Fatalf("policy %s->%s rule %q: counters = %d/%d, want %d/%d (policy-stats off)",
+					policy.GetFromZone(), policy.GetToZone(), rule.GetName(),
+					rule.GetHitPackets(), rule.GetHitBytes(), wantP, wantB)
+			}
+		}
+	}
+	for _, name := range []string{"plain-allow", "scheduled-allow", "global-scheduled"} {
+		if !seen[name] {
+			t.Fatalf("policy %q missing from GetPolicies response", name)
 		}
 	}
 }

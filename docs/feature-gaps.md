@@ -863,6 +863,29 @@ drift) closed in `fix/2008-quickwins-batch1`:
   cluster config has only explicit permit rules + `default-policy deny-all`,
   so blocked traffic rides the implicit default-deny — which bumps the
   aggregate `policy_deny` counter, not any per-rule counter).
+  **#3074 per-policy `then count` override (DONE):** before #3074 the
+  per-policy Junos `then count` modifier was parsed/stored (`Policy.Count`,
+  `pkg/config/types_security.go`) but carried NO runtime meaning — the six
+  display surfaces above gated solely on the system-wide
+  `policy-stats system-wide enable` knob, so a `then count` policy reported
+  0 unless the operator ALSO enabled the global knob (the issue's "inert
+  compatibility" complaint). #3074 makes `then count` a per-policy display
+  selector: every surface now admits a rule's counter when
+  `statsEnabled || pol.Count` (`||rule.Count`), so a `then count` policy
+  reports its packets/bytes independent of the global knob (Junos
+  per-policy `count`), while a policy without `then count` keeps the
+  pre-#3074 behavior (0 with the knob off). REUSE-not-rebuild decision: the
+  Rust per-rule counter is already always-on and per-packet (#3073), and
+  the gate was already display-only with no dataplane read of the knob, so
+  `then count` needs NO new Rust counter and NO wire field — it is a
+  Go-side display selection over the existing #3073 counter, using the
+  `Policy.Count` flag already present in the active config. Fail-on-revert
+  tests: `pkg/cli/cli_show_policies_thencount_3074_test.go`,
+  `pkg/grpcapi/server_show_policies_thencount_3074_test.go`, plus the
+  #3074-aware updates to the M4/#2118 gate tests
+  (`pkg/api/metrics_test.go`, `pkg/api/policy_counters_test.go`,
+  `pkg/grpcapi/server_show_zones_test.go`): a `then count` policy surfaces
+  its live counts with the knob OFF; a sibling without it stays 0.
 - **Runtime policy-ID namespaces under app-set expansion — #3145 FIXED,
   #3143 found to be a misdiagnosis.** TWO distinct numeric namespaces coexist
   by design, and conflating them is the trap this work clarified:
