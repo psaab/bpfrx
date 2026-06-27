@@ -1,3 +1,47 @@
+## 2026-06-26 — #3109 correct false lenient-path claim + file #3261
+
+- **Timestamp**: 2026-06-26
+- **Action**: hostile review of PR #3257 proved the original commit/PR/doc/comment
+  claim FALSE: the lenient load / HA-config-sync path does NOT keep "that one
+  referenced app's policy inert (refuse-to-arm)". `deriveUserspaceCapabilities`
+  is coarse — ANY unrepresentable application sets `ForwardingSupported=false`
+  for the WHOLE userspace dataplane; `SetForwardingArmed` then errors and the
+  XDP shim XDP_PASSes to the kernel `ip_forward` path (system-level fail-OPEN),
+  so one protocol-less app still disables enforcement globally on that path.
+  Corrected the code comment (compiler_validate_strict.go), docs, and PR body to
+  state the true behavior. Did NOT implement per-policy lenient isolation: it is
+  genuinely design-sensitive — a clean per-policy drop is fail-OPEN for deny
+  rules (a dropped `deny` falls through to a later `permit`; verified
+  try_match_rule returns None on no-match, default action Deny), which conflicts
+  with the deliberate #2124 whole-snapshot-reject fail-closed family
+  (#2124/#2142/#2173/#2212/#2240/#2241/#2391/#2505 in userspace-dp/src/policy.rs;
+  the doc comment there explicitly rejects term-dropping as fail-open for deny).
+  Filed #3261 (A/B/C options) for /research. Strict commit reject (PART 1) stays.
+- **File(s)**: `pkg/config/compiler_validate_strict.go`,
+  `docs/services-application-identification.md`, `_Log.md`
+
+## 2026-06-26 — #3109 protocol-less application rejected at commit
+
+- **Timestamp**: 2026-06-26
+- **Action**: a custom `applications application <name>` with a port but NO
+  `protocol` committed cleanly (the strict validator only checked a NON-empty
+  protocol) then disabled ALL userspace security-policy enforcement at apply:
+  `compileApplications` defaults a protocol-less app to the empty protocol, which
+  trips #2124's Go capability gate (`ForwardingSupported=false` for the whole
+  dataplane) and the Rust snapshot integrity check
+  (`UnrepresentableApplicationProtocol`). One bad app silently disabled the whole
+  config (system-level fail-OPEN to the kernel slow path). Junos requires
+  `protocol`, so the fix (Option A — strict-at-commit, #1960 doctrine) hard-rejects
+  a protocol-less REFERENCED application in `validateApplicationSpecsStrict` with a
+  clear error naming the one offending app; downgraded to a warning on the
+  tolerant load / peer-sync path (no-brick). Blast radius is now one named app at
+  commit instead of a global disable at apply. Added the explicit empty-protocol
+  guard and dropped the now-redundant `app.Protocol != ""` precondition on the
+  #3150 check (defense-in-depth). No Rust change — its integrity check stays the
+  backstop.
+- **File(s)**: `pkg/config/compiler_validate_strict.go`,
+  `pkg/config/compiler_application_specs_test.go`,
+  `docs/services-application-identification.md`
 ## 2026-06-26 — #3201/#3240 host-inbound ICMP admission is sub-type specific
 
 - **Timestamp**: 2026-06-26
