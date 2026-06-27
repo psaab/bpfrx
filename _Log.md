@@ -21849,3 +21849,20 @@ top.
   userspace-dp/src/afxdp/frame/prop_tests/rewrite.rs,
   userspace-dp/src/nptv6_tests.rs,
   docs/feature-coverage.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3121 follow-up — fix #1377 SNAT contract-guard drift. The
+  NPTv6-first refactor folded the duplicated `source_nat_decision_for_flow`
+  calls (rewrite_dst.is_none()/else pair) into a single SNAT fallback per path,
+  dropping the poll_descriptor call sites 4 → 2. `snat_contract_doc_guard.rs`
+  hard-asserts the count, so the FULL `cargo test --release` was RED (the
+  filtered subset run missed it). Updated the guard's expected count 4 → 2 and
+  re-enumerated the now-2 sites (normal new-session @ mod.rs:1963,
+  missing-neighbor seed @ mod.rs:3691) in
+  plan-1377-snat-pools.md with a #3121 reduction note (both remaining sites
+  still record_source_nat_failure; NPTv6 short-circuits before the SNAT
+  fallback and cannot fail in the pool sense, so the fail-closed contract holds
+  at 2 sites). Full suite now green: main bin 3138 passed / 0 failed,
+  snat_contract_doc_guard passes (count=2, doc-parse=2), 0 failures total.
+  **File(s)**: userspace-dp/tests/snat_contract_doc_guard.rs,
+  docs/pr/1373-retire-ebpf-dataplane/plan-1377-snat-pools.md
