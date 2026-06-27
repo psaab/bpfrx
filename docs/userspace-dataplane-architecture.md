@@ -628,7 +628,14 @@ wildcard side) instead of every zone pair. Such a rule keeps the
 context out-of-band on the additive wire fields `match_from_zone` /
 `match_to_zone` (resolved at snapshot-build time into a `GlobalZoneScope` —
 `Any` for no constraint, `Zone(id)` for a defined zone, `Unresolved` =
-fail-closed for an undefined zone). The scope is checked as an extra predicate
+fail-closed for an undefined zone). An OMITTED leaf and an explicit `any` both
+map to `Any` (all zones, the Junos implicit default) — `build_global_zone_scope`
+short-circuits `"any"` so it can never route to `Unresolved` and silently match
+nothing, keeping the dataplane in agreement with the Go commit gate (which
+exempts `any`). The reserved `junos-host` zone is hard-rejected as a global
+match context at commit (a zone-scoped global policy is not evaluated on the
+host-bound path, so it could only ever silently never-match — real junos-host
+global-zone support is a follow-up). The scope is checked as an extra predicate
 inside the `junos-global` tier loop, **in the same tier position** shown above:
 a zone-scoped global policy is NOT promoted ahead of the #3090 wildcard tiers.
 Precedence example — a `from-zone any to-zone untrust` wildcard (zone-pair

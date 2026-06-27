@@ -1402,7 +1402,23 @@ zone-pair and the #3090 `from-zone any`/`to-zone any` wildcard tiers), not
 promoted ahead of them. An undefined match zone is strict-rejected at commit
 (`validatePolicyZoneReferencesStrict`, downgraded to a warning on the tolerant
 load path) and independently fails closed in the dataplane
-(`GlobalZoneScope::Unresolved` matches nothing). Regression coverage:
+(`GlobalZoneScope::Unresolved` matches nothing).
+
+**Special-token semantics (commit gate ⇔ dataplane parity).** An OMITTED
+`from-zone`/`to-zone` and an explicit `match from-zone any` / `to-zone any` are
+the SAME thing — the Junos all-zones default. Both commit clean (`any` is a
+reserved special token) and `build_global_zone_scope` (policy.rs) short-circuits
+`""` and `"any"` to `GlobalZoneScope::Any`; without that short-circuit `"any"`
+would route through `resolve_policy_zone_id` → `None` → `Unresolved` and a
+`permit` global would silently over-restrict / a `deny` global silently no-op —
+a commit-vs-dataplane divergence on a security leaf. The reserved `junos-host`
+zone is the one special token that is NOT accepted here: a zone-scoped global
+policy is not evaluated on the host-bound (LocalDelivery) path, so
+`validatePolicyZoneReferencesStrict` hard-rejects `match from-zone junos-host` /
+`to-zone junos-host` at commit (rather than committing a silent never-match);
+real junos-host global-zone-context support is a follow-up.
+
+Regression coverage:
 `pkg/config/compiler_policy_global_zone_3148_test.go`,
 `pkg/dataplane/userspace/policy_global_zone_3148_test.go`, and the Rust
 `global_policy_*` tests in `userspace-dp/src/policy_tests.rs`.

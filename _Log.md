@@ -1,3 +1,29 @@
+## 2026-06-26 — #3148 review fold: explicit `any`→Any + reject junos-host global match
+
+- **Timestamp**: 2026-06-26
+- **Action**: Hostile-review NEEDS-MINOR fold (commit-gate vs dataplane
+  divergence on a security leaf). The commit gate exempts `any`/`junos-host`/""
+  for the new global match from-zone/to-zone leaves, but `build_global_zone_scope`
+  only mapped "" → Any: explicit `match from-zone any` routed through
+  resolve_policy_zone_id("any") → None → Unresolved (matched NOTHING), so a
+  permit-global silently over-restricted and a deny-global silently no-op'd.
+  Fix: (1) short-circuit `name == "any"` → GlobalZoneScope::Any in policy.rs
+  (omit == explicit any == all-zones, agreeing with the commit gate); (2)
+  hard-reject `match from-zone/to-zone junos-host` on a global policy at commit
+  (validatePolicyZoneReferencesStrict) — a zone-scoped global is not evaluated
+  on the host-bound path, so junos-host could only silently never-match;
+  real junos-host global-zone support is a follow-up. Tests (fail-on-revert
+  proven): Rust global_policy_explicit_any_matches_all_zones (RED when the
+  "any" short-circuit is dropped); Go explicit_any_commits +
+  junos_host_zone_rejected subtests. Full cargo test (only the load-sensitive
+  worker_queue/event_stream timing flakes, pass in isolation), go build ./...
+  + go test ./pkg/config/ ./pkg/dataplane/... green.
+- **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_policy_global_zone_3148_test.go,
+  docs/userspace-dataplane-architecture.md, docs/junos-cli-reference.md,
+  docs/config-schema.md
+
 ## 2026-06-26 — #3148 global policy from-zone/to-zone match context
 
 - **Timestamp**: 2026-06-26

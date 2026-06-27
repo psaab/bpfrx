@@ -2130,6 +2130,25 @@ func validatePolicyZoneReferencesStrict(cfg *Config) error {
 		if pol == nil {
 			continue
 		}
+		// The reserved self-traffic zone `junos-host` cannot be honored as a
+		// global-policy from/to-zone match context: the userspace dataplane
+		// does NOT evaluate a zone-scoped global policy on the host-bound
+		// (LocalDelivery) path, so a `match from-zone junos-host` / `to-zone
+		// junos-host` global would commit but silently never match (a
+		// commit-vs-dataplane divergence on a security leaf). Reject it at
+		// commit so the two layers agree; real junos-host global-zone-context
+		// support is a follow-up. (`any` and the empty token stay exempt =
+		// all-zones, matching build_global_zone_scope in policy.rs.)
+		if pol.Match.FromZone == "junos-host" {
+			return fmt.Errorf(
+				"security policies global policy %q match from-zone %q is not supported (a zone-scoped global policy is not evaluated on the host-bound path, so it would silently never match); remove the junos-host match context (#3148)",
+				pol.Name, pol.Match.FromZone)
+		}
+		if pol.Match.ToZone == "junos-host" {
+			return fmt.Errorf(
+				"security policies global policy %q match to-zone %q is not supported (a zone-scoped global policy is not evaluated on the host-bound path, so it would silently never match); remove the junos-host match context (#3148)",
+				pol.Name, pol.Match.ToZone)
+		}
 		if !defined(pol.Match.FromZone) {
 			return fmt.Errorf(
 				"security policies global policy %q match from-zone %q references undefined zone; define `set security zones security-zone %s` in the same commit or the global policy is silently never matched (the dataplane fails closed for an unknown match zone)",

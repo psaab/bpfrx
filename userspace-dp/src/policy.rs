@@ -469,18 +469,32 @@ impl GlobalZoneScope {
 }
 
 /// #3148: resolve a global policy's `match from-zone`/`to-zone` name into a
-/// [`GlobalZoneScope`]. Empty → `Any` (all zones). A non-empty name resolves
-/// through [`resolve_policy_zone_id`] (so `junos-host` maps to its reserved id
-/// like elsewhere); an unresolvable name → `Unresolved` (fail-closed) with a
-/// diagnostic, matching the "rule kept, but not indexed" treatment of an
-/// unknown zone-pair zone.
+/// [`GlobalZoneScope`].
+///
+///   - Empty (omitted) → `Any` (all zones — the Junos implicit default).
+///   - Explicit `"any"` → `Any` as well: an explicit `match from-zone any` is
+///     the Junos all-zones default, identical to omitting the leaf. This MUST
+///     agree with the Go commit gate, which exempts `"any"` (a valid commit) —
+///     resolving `"any"` through `resolve_policy_zone_id` would return `None`
+///     (no zone is named `any`) → `Unresolved` (matches nothing), so a `permit`
+///     global silently over-restricts and a `deny` global silently no-ops. The
+///     explicit-`any` short-circuit eliminates that commit-vs-dataplane
+///     divergence.
+///   - Any other name resolves through [`resolve_policy_zone_id`]; an
+///     unresolvable name → `Unresolved` (fail-closed) with a diagnostic,
+///     matching the "rule kept, but not indexed" treatment of an unknown
+///     zone-pair zone. (`"junos-host"` is hard-rejected at commit for these
+///     leaves — see `validatePolicyZoneReferencesStrict` — so on the strict
+///     path the dataplane never sees it; on the tolerant load path it resolves
+///     to the reserved host id, which never matches a transit flow, i.e. inert
+///     fail-closed.)
 fn build_global_zone_scope(
     zone_name_to_id: &FxHashMap<String, u16>,
     name: &str,
     side: &str,
     rule_id: &str,
 ) -> GlobalZoneScope {
-    if name.is_empty() {
+    if name.is_empty() || name == "any" {
         return GlobalZoneScope::Any;
     }
     match resolve_policy_zone_id(zone_name_to_id, name) {

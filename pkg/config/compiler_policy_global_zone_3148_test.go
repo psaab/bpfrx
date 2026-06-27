@@ -114,6 +114,48 @@ func TestGlobalPolicyZoneContextStrictCommit(t *testing.T) {
 		}
 	})
 
+	// Explicit `any` is the Junos all-zones default — it commits clean (it is a
+	// reserved special token, not an undefined zone) and the dataplane resolves
+	// it to GlobalZoneScope::Any (build_global_zone_scope short-circuit), so the
+	// commit gate and the dataplane agree.
+	t.Run("explicit_any_commits", func(t *testing.T) {
+		cmds := append([]string{}, zoneDefs...)
+		cmds = append(cmds,
+			"set security policies global policy anyfrom match from-zone any",
+			"set security policies global policy anyfrom match to-zone untrust")
+		cmds = append(cmds, matchBody("anyfrom")...)
+		tree := build3148Tree(t, cmds...)
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig hard-failed on a global policy with explicit `match from-zone any`: %v", err)
+		}
+		if len(cfg.Security.GlobalPolicies) != 1 || cfg.Security.GlobalPolicies[0].Match.FromZone != "any" {
+			t.Fatalf("explicit `any` not preserved verbatim: %+v", cfg.Security.GlobalPolicies)
+		}
+	})
+
+	// `junos-host` cannot be honored as a global match context (a zone-scoped
+	// global policy is not evaluated on the host-bound path), so it is
+	// hard-rejected at commit so the commit gate and the dataplane agree —
+	// rather than committing into a silent never-match. Fail-on-revert: drop the
+	// junos-host reject in validatePolicyZoneReferencesStrict and this commits.
+	t.Run("junos_host_zone_rejected", func(t *testing.T) {
+		for _, leaf := range []string{"from-zone", "to-zone"} {
+			cmds := append([]string{}, zoneDefs...)
+			cmds = append(cmds,
+				"set security policies global policy hostctx match "+leaf+" junos-host")
+			cmds = append(cmds, matchBody("hostctx")...)
+			tree := build3148Tree(t, cmds...)
+			_, err := CompileConfig(tree)
+			if err == nil {
+				t.Fatalf("CompileConfig accepted a global policy match %s junos-host; want a hard reject", leaf)
+			}
+			if !strings.Contains(err.Error(), "junos-host") || !strings.Contains(err.Error(), "not supported") {
+				t.Fatalf("match %s junos-host error = %v, want an unsupported-junos-host reject", leaf, err)
+			}
+		}
+	})
+
 	// An undefined match zone is hard-rejected at commit (fail-on-revert: drop
 	// the GlobalPolicies loop in validatePolicyZoneReferencesStrict and this
 	// goes GREEN, so RED).

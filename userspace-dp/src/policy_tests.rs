@@ -3679,3 +3679,41 @@ fn global_policy_unknown_zone_context_fails_closed() {
     );
     assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Deny);
 }
+
+#[test]
+fn global_policy_explicit_any_matches_all_zones() {
+    // #3148 fold: an EXPLICIT `match from-zone any` is the Junos all-zones
+    // default — identical to omitting the leaf. It must resolve to
+    // GlobalZoneScope::Any (matches every from-zone), NOT route through
+    // resolve_policy_zone_id("any") -> None -> Unresolved (matches nothing).
+    // Fail-on-revert: drop the `name == "any"` short-circuit in
+    // build_global_zone_scope and these Permit assertions turn into Deny.
+    let state = parse_policy_state(
+        "deny",
+        &[global_zone_rule("any-to-untrust", "any", "untrust", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    // Not into untrust → default deny (the to-zone scope still applies).
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+
+    // Symmetric: explicit `to-zone any`.
+    let state = parse_policy_state(
+        "deny",
+        &[global_zone_rule("trust-to-any", "trust", "any", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+
+    // Explicit `any` on BOTH sides == no zone context == all zones.
+    let state = parse_policy_state(
+        "deny",
+        &[global_zone_rule("any-any", "any", "any", "permit")],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_UNTRUST_ZONE_ID, TEST_TRUST_ZONE_ID), PolicyAction::Permit);
+}

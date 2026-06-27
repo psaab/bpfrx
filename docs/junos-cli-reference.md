@@ -430,7 +430,9 @@ Global policies:
   (all zones — the historical behaviour). A zone-scoped global policy is still
   evaluated in the global ordering, AFTER the exact zone-pair and the `from-zone
   any` / `to-zone any` wildcard policies — it does not jump ahead of them. An
-  undefined match zone is rejected at commit.
+  omitted leaf and an explicit `match from-zone any` are identical (all zones);
+  an undefined match zone is rejected at commit, and `match from-zone junos-host`
+  / `to-zone junos-host` is rejected (not supported on a global policy).
 
 ---
 
