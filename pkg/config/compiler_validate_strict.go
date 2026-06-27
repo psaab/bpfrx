@@ -3054,6 +3054,71 @@ func validateFilterFlexMatchStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFilterPortExceptStrict hard-rejects any firewall-filter term that
+// carries BOTH a positive port match and the negated `*-port-except` list in
+// the SAME direction — #3297.
+//
+// Junos treats `source-port` / `destination-port` and their
+// `source-port-except` / `destination-port-except` counterparts as mutually
+// exclusive match families and rejects a term carrying both at commit. xpf's
+// parser, however, lands the positive list on term.SourcePorts /
+// term.DestinationPorts and the negated list on term.SourcePortsExcept /
+// term.DestPortsExcept (compileFilterFrom), so both can coexist on one term.
+//
+// The Rust matcher (userspace-dp filter/compiler.rs) resolves the ambiguity
+// deterministically as positive-wins (the positive list builds the matcher and
+// the except list is ignored). That is fail-safe at runtime — the configured
+// positive scope is honored, no traffic leaks — but it silently accepts a
+// Junos-invalid term and discards one side of the operator's intent. This gate
+// makes the conflict an operator-visible commit error instead.
+//
+// The walk is deterministic (filters sorted by name, terms in config order).
+// On the tolerant load / peer-sync path the caller downgrades the returned
+// error to a warning (#1960 no-brick); the dataplane's positive-wins fallback
+// keeps that direction fail-safe independently.
+func validateFilterPortExceptStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil {
+					continue
+				}
+				if len(term.SourcePorts) > 0 && len(term.SourcePortsExcept) > 0 {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: `from source-port` and "+
+							"`from source-port-except` are mutually exclusive in the same "+
+							"term (Junos rejects this; remove one)",
+						family, name, term.Name)
+				}
+				if len(term.DestinationPorts) > 0 && len(term.DestPortsExcept) > 0 {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: `from destination-port` and "+
+							"`from destination-port-except` are mutually exclusive in the same "+
+							"term (Junos rejects this; remove one)",
+						family, name, term.Name)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // filterProtocolResolvable reports whether a `from protocol <token>` is
 // representable: it INLINE-mirrors the acceptance set of
 // appid.ProtocolNumber's ok==true result (the #2124/#2175 SSOT). pkg/config
