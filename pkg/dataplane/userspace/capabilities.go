@@ -50,33 +50,26 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 		caps.ForwardingSupported = false
 		caps.UnsupportedReasons = append(caps.UnsupportedReasons, reason)
 	}
-	// #3261: distinguish unrepresentable policy CONTENT from a genuinely
-	// undeliverable dataplane semantic.
+	// #3261: this function reports ONLY class (ii) — genuinely-unsupported
+	// dataplane SEMANTICS with no fail-closed snapshot representation (screen
+	// SYN-cookie material, color-aware 3-color policers, persistent SNAT under
+	// HA). These set ForwardingSupported=false and legitimately disarm.
 	//
-	// CLASS (i) — unrepresentable policy content (a security policy naming an
-	// application protocol/port or address the userspace matcher cannot
-	// represent). This must NOT disarm the helper. buildOneRuleSnapshot already
-	// emits the reserved __unsupported__ sentinel term for such a rule, and the
-	// helper's non-mutating integrity preflight rejects the WHOLE snapshot
-	// (UnrepresentableApplicationProtocol, #2124) — keeping the previous-good
-	// PolicyState on a running node, or leaving the default-deny PolicyState on
-	// a fresh boot. Setting ForwardingSupported=false here instead would DISARM
-	// the helper, so the XDP shim XDP_PASSes transit to the kernel and bypasses
-	// the integrity reject (the kernel forwards with NO xpf policy) — the
-	// system-level fail-OPEN #3261 closes. The deny-rule case is the doctrine
-	// guard: dropping a `deny BAD` term would let blocked traffic fall through;
-	// the whole-snapshot reject keeps it fail-CLOSED. Record this as a
-	// separate, non-disarming diagnostic (surfaced into status + a one-shot
-	// log + Prometheus so the resulting Go/Rust skew stays observable).
-	if !userspaceSupportsSecurityPolicies(cfg) {
-		caps.PolicyContentRejected = append(
-			caps.PolicyContentRejected,
-			"security policy names application/address content the userspace matcher cannot represent: snapshot rejected by the integrity preflight, previous-good retained (fresh boot: default-deny), helper stays armed",
-		)
-	}
-	// CLASS (ii) — genuinely-unsupported semantics with NO fail-closed snapshot
-	// representation. There is no sentinel/reject backstop for these, so the
-	// dataplane legitimately cannot forward at all: keep disarming.
+	// Class (i) — unrepresentable policy CONTENT (a policy naming an application
+	// protocol/port or address the matcher cannot represent) is NOT decided
+	// here. It must NOT disarm: buildOneRuleSnapshot emits a reserved sentinel
+	// (the __unsupported__ application term or the __unsupported_address__
+	// literal) and the helper's non-mutating integrity preflight rejects the
+	// WHOLE snapshot while staying armed (previous-good retained; fresh boot =
+	// default-deny). Crucially, class (i) is feed-aware: a dynamic-address feed
+	// name resolves only through the snapshot's overlay (#2049), which this
+	// cfg-only gate cannot see. Deriving it here would FALSE-POSITIVE on every
+	// healthy feed policy. So the snapshot builder computes PolicyContentRejected
+	// from the ACTUAL built rules' sentinels (collectPolicyContentRejections),
+	// and that snapshot value — not this gate — drives both the diagnostic and
+	// the narrow old-helper disarm.
+	//
+	// CLASS (ii):
 	// Pool-mode source NAT is now implemented in the userspace dataplane
 	// (PortAllocator with round-robin address + port allocation).
 	// NAT64 is supported — NATv6v4 config (no-v6-frag-header option) is fine

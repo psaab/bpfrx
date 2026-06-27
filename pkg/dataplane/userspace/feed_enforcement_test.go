@@ -141,9 +141,12 @@ func TestFeedBackedPolicyRoutesAsBookReference(t *testing.T) {
 		t.Fatalf("feed-backed source must NOT fall through to a no-match literal; SourceLiterals=%v", rule.SourceLiterals)
 	}
 
-	// NON-TAUTOLOGICAL: without the overlay the SAME token IS a no-match
-	// literal (the pre-#2049 broken behaviour). This proves the difference is
-	// the overlay.
+	// NON-TAUTOLOGICAL: without the overlay the SAME token is unresolvable. This
+	// proves the difference is the overlay. Pre-#2049 it silently became a
+	// no-match literal — itself a deny fail-open. #3261 now makes an unresolvable
+	// address fail CLOSED: the token routes to the __unsupported_address__
+	// sentinel (no book reference), so the helper integrity preflight rejects the
+	// whole snapshot rather than collapsing the side to a silent no-match.
 	snapsNoOverlay, _ := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, nil, nil)
 	if len(snapsNoOverlay) != 1 {
 		t.Fatalf("expected 1 rule without overlay, got %d", len(snapsNoOverlay))
@@ -151,8 +154,11 @@ func TestFeedBackedPolicyRoutesAsBookReference(t *testing.T) {
 	if len(snapsNoOverlay[0].SourceBookIDs) != 0 {
 		t.Fatalf("without overlay the feed name must NOT be a book reference; got %v", snapsNoOverlay[0].SourceBookIDs)
 	}
-	if !contains(snapsNoOverlay[0].SourceLiterals, "bad-actors") {
-		t.Fatalf("without overlay the feed name must be an (unmatched) literal; got %v", snapsNoOverlay[0].SourceLiterals)
+	if contains(snapsNoOverlay[0].SourceLiterals, "bad-actors") {
+		t.Fatalf("without overlay the unresolvable feed name must NOT be a silent no-match literal (pre-#2049 fail-open); got %v", snapsNoOverlay[0].SourceLiterals)
+	}
+	if !addressListHasSentinel(snapsNoOverlay[0].SourceLiterals) {
+		t.Fatalf("without overlay the unresolvable feed name must route to the #3261 address sentinel (fail closed); got %v", snapsNoOverlay[0].SourceLiterals)
 	}
 }
 

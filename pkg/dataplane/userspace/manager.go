@@ -676,7 +676,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		snap.DeferWorkers = true
 	}
 	var status ProcessStatus
-	if err := m.disarmBeforeUnsupportedPublishLocked(snap.Config); err != nil {
+	if err := m.disarmBeforeUnsupportedPublishLocked(snap); err != nil {
 		return result, err
 	}
 	// #1197 v5 (Codex code-review v4 #2): apply_snapshot must
@@ -797,6 +797,11 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 		return
 	}
 	next.Policies = policies
+	// #3261: the policies were rebuilt, so recompute the (feed-aware)
+	// content-rejection diagnostic from the new rules' sentinels; the copied
+	// lastSnapshot value would be stale. Class (ii) (ForwardingSupported /
+	// UnsupportedReasons) is unchanged by a scheduler-only republish.
+	next.Capabilities.PolicyContentRejected = collectPolicyContentRejections(policies)
 	// #1606: refresh the address-book table alongside the policies
 	// so book IDs cited in the new policies always resolve on the
 	// dataplane side.
@@ -812,7 +817,7 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 	var status ProcessStatus
 	// #2124: disarm before publishing an unsupported-config snapshot (see
 	// disarmBeforeUnsupportedPublishLocked). cfg is this snapshot's config.
-	if err := m.disarmBeforeUnsupportedPublishLocked(cfg); err != nil {
+	if err := m.disarmBeforeUnsupportedPublishLocked(&publishSnap); err != nil {
 		slog.Warn("userspace: failed to disarm before unsupported-config policy scheduler publish", "err", err)
 		return
 	}
@@ -973,7 +978,7 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 	publishSnap.Neighbors = filterPublishableNeighbors(next.Neighbors)
 	var status ProcessStatus
 	// #2124: disarm before publishing an unsupported-config snapshot.
-	if err := m.disarmBeforeUnsupportedPublishLocked(next.Config); err != nil {
+	if err := m.disarmBeforeUnsupportedPublishLocked(&next); err != nil {
 		return false, err
 	}
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {

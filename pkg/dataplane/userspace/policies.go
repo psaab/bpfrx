@@ -22,6 +22,24 @@ import (
 // by both appid.ProtocolNumber and userspace-dp parse_protocol.
 const unsupportedApplicationSentinel = "__unsupported__"
 
+// unsupportedAddressSentinel is the reserved address literal emitted in a policy
+// rule's source/destination address fields (#3261) when the userspace matcher
+// cannot represent the rule's configured addresses — an undefined address-book
+// name, or a defined book whose value is a non-literal (Junos dns-name /
+// wildcard-address / range-address). It is the ADDRESS analog of
+// unsupportedApplicationSentinel: without it the raw address strings fall
+// through to the Rust matcher, which silently drops an unparseable literal
+// (parse_literal_cidr_into) or empties a non-literal book, collapsing the side
+// to MatchNone. A `deny <unrepresentable-address>` rule would then match
+// nothing and fall through to a later permit / default-permit — a deny
+// fail-OPEN. Emitting this sentinel makes the Rust integrity preflight raise
+// SnapshotIntegrityError::UnrepresentableAddress, rejecting the WHOLE snapshot
+// (previous-good retained; fresh-boot default-deny), symmetric to the
+// application path. It is deliberately not a valid CIDR/IP so it can never
+// match real traffic even on an older helper that lacks the preflight arm.
+// Must stay in lock-step with userspace-dp policy.rs UNREPRESENTABLE_ADDRESS_SENTINEL.
+const unsupportedAddressSentinel = "__unsupported_address__"
+
 // addressBookProbeLimit bounds the deterministic linear probe used to resolve
 // a folded-hash collision when assigning a u32 address-book content ID. The
 // folded FNV hash gives a starting slot; on a collision we walk forward by one
@@ -97,9 +115,49 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 	if cfg == nil || (len(cfg.Security.Policies) == 0 && len(cfg.Security.GlobalPolicies) == 0) {
 		return nil, nil
 	}
-	_, nameToID, err := buildAddressBookTableWithFeeds(cfg, feedOverlay)
+	books, nameToID, err := buildAddressBookTableWithFeeds(cfg, feedOverlay)
 	if err != nil {
 		return nil, err
+	}
+	// #3261: a book ID has representable content iff its built row carries at
+	// least one prefix. Keyed by ID (not row Name) because the table dedups by
+	// CONTENT — many declaring names (address aliases, address-set members)
+	// share one row, and nameToID maps EVERY such name to that row's ID while
+	// the row's Name field carries only the representative. Used (with the feed
+	// binding set below) to tell a genuinely-unrepresentable address (undefined
+	// name, or a static book whose value is a non-literal dns-name/wildcard/range
+	// -> empty row) apart from a feed-backed name whose CURRENT content may
+	// legitimately be empty (#2049).
+	idHasContent := make(map[uint32]bool, len(books))
+	for i := range books {
+		if len(books[i].PrefixesV4) > 0 || len(books[i].PrefixesV6) > 0 {
+			idHasContent[books[i].ID] = true
+		}
+	}
+	// addrRepresentable reports whether the userspace matcher can represent a
+	// single policy address token. A token is representable iff it is match-any,
+	// a valid literal CIDR/IP, a feed-bound name (in the overlay — an empty feed
+	// is MatchNone BY DESIGN per #2049, NOT unrepresentable), or a known book/
+	// address-set whose resolved content is non-empty. Everything else (an
+	// undefined book name, or a static book that resolves to no prefix) is
+	// unrepresentable and must reject the whole snapshot via the address
+	// sentinel rather than silently collapse the side to MatchNone (a deny
+	// fail-open). #3261.
+	addrRepresentable := func(tok string) bool {
+		switch tok {
+		case "", "any", "any4", "any6":
+			return true
+		}
+		if isUserspaceLiteralAddress(tok) {
+			return true
+		}
+		if _, feedBound := feedOverlay[tok]; feedBound {
+			return true
+		}
+		if id, known := nameToID[tok]; known {
+			return idHasContent[id]
+		}
+		return false
 	}
 	out := make([]PolicyRuleSnapshot, 0)
 	// walkPolicyRuleSlots is the single source of truth for the runtime
@@ -110,7 +168,7 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 	// policy set's namespace.
 	if err := walkPolicyRuleSlots(cfg, func(slot policyRuleSlot) error {
 		policyID := slot.policyID()
-		snap := buildOneRuleSnapshot(cfg, nameToID, slot.Policy, slot.FromZone, slot.ToZone, policyID, activeState)
+		snap := buildOneRuleSnapshot(cfg, nameToID, addrRepresentable, slot.Policy, slot.FromZone, slot.ToZone, policyID, activeState)
 		out = append(out, snap)
 		return nil
 	}); err != nil {
@@ -244,6 +302,7 @@ func walkPolicyRuleSlots(cfg *config.Config, fn func(slot policyRuleSlot) error)
 func buildOneRuleSnapshot(
 	cfg *config.Config,
 	nameToID map[string]uint32,
+	addrRepresentable func(tok string) bool,
 	pol *config.Policy,
 	fromZone, toZone string,
 	policyID uint32,
@@ -258,6 +317,23 @@ func buildOneRuleSnapshot(
 	destinationAddresses, okDst := expandUserspacePolicyAddresses(cfg, pol.Match.DestinationAddresses)
 	if !okDst {
 		destinationAddresses = append([]string(nil), pol.Match.DestinationAddresses...)
+	}
+	// #3261: a side that names an address the matcher cannot represent (an
+	// undefined book name, or a static book that resolves to no prefix — but
+	// NOT a feed-bound name, whose empty content is MatchNone by design) must
+	// reject the WHOLE snapshot rather than silently collapse to MatchNone. The
+	// raw address strings otherwise fall through to the Rust matcher, which
+	// drops an unparseable literal / empties a non-literal book; a
+	// `deny <unrepresentable-address>` rule would then match nothing and fall
+	// through to a later permit / default-permit (deny fail-OPEN). The sentinel
+	// is the address analog of the application sentinel below.
+	srcUnrepresentable := !allAddressTokensRepresentable(addrRepresentable, pol.Match.SourceAddresses)
+	dstUnrepresentable := !allAddressTokensRepresentable(addrRepresentable, pol.Match.DestinationAddresses)
+	if srcUnrepresentable {
+		sourceAddresses = []string{unsupportedAddressSentinel}
+	}
+	if dstUnrepresentable {
+		destinationAddresses = []string{unsupportedAddressSentinel}
 	}
 	applicationTerms, ok := expandUserspacePolicyApplications(cfg, pol.Match.Applications)
 	if !ok {
@@ -280,6 +356,18 @@ func buildOneRuleSnapshot(
 	// reference" vs "free-form literal".
 	srcBookIDs, srcLiterals := classifyPolicyAddresses(cfg, nameToID, pol.Match.SourceAddresses)
 	dstBookIDs, dstLiterals := classifyPolicyAddresses(cfg, nameToID, pol.Match.DestinationAddresses)
+	// #3261: force the unrepresentable-address sentinel onto BOTH the v3
+	// (book-ids + literals) and the legacy (sourceAddresses, set above) address
+	// shapes, clearing the book IDs, so the Rust preflight raises
+	// UnrepresentableAddress no matter which shape it reads. Covers an undefined
+	// book name (classified as a literal Rust would drop) AND a static
+	// non-literal book (classified as a book ID whose table entry is empty).
+	if srcUnrepresentable {
+		srcBookIDs, srcLiterals = nil, []string{unsupportedAddressSentinel}
+	}
+	if dstUnrepresentable {
+		dstBookIDs, dstLiterals = nil, []string{unsupportedAddressSentinel}
+	}
 	schedulerName := pol.SchedulerName
 	// #2508: carry the per-policy `then log session-init`/`session-close`
 	// selection into the snapshot so the dataplane can gate the per-policy
@@ -320,6 +408,66 @@ func buildOneRuleSnapshot(
 		MatchFromZone: pol.Match.FromZone,
 		MatchToZone:   pol.Match.ToZone,
 	}
+}
+
+// collectPolicyContentRejections scans the BUILT policy rules for the #3261
+// fail-closed sentinels and returns a human-readable reason per offending rule.
+// This is the ACCURATE, feed-aware signal that the published snapshot will be
+// rejected by the helper integrity preflight (the application __unsupported__
+// term or the __unsupported_address__ literal) — unlike the cfg-only capability
+// gate, it sees the feed overlay already folded into the rules, so a healthy
+// dynamic-address feed policy does NOT false-positive. A non-empty result means
+// the helper keeps the previous-good state (or fresh-boot default-deny) and
+// stays armed; an empty result means every rule is representable.
+func collectPolicyContentRejections(policies []PolicyRuleSnapshot) []string {
+	var reasons []string
+	for i := range policies {
+		rule := &policies[i]
+		appBad := false
+		for _, term := range rule.ApplicationTerms {
+			if term.Protocol == unsupportedApplicationSentinel || term.Name == unsupportedApplicationSentinel {
+				appBad = true
+				break
+			}
+		}
+		addrBad := addressListHasSentinel(rule.SourceLiterals) ||
+			addressListHasSentinel(rule.DestinationLiterals) ||
+			addressListHasSentinel(rule.SourceAddresses) ||
+			addressListHasSentinel(rule.DestinationAddresses)
+		switch {
+		case appBad && addrBad:
+			reasons = append(reasons, fmt.Sprintf("policy %q names an unrepresentable application AND address", rule.Name))
+		case appBad:
+			reasons = append(reasons, fmt.Sprintf("policy %q names an application the userspace matcher cannot represent", rule.Name))
+		case addrBad:
+			reasons = append(reasons, fmt.Sprintf("policy %q names an address the userspace matcher cannot represent", rule.Name))
+		}
+	}
+	return reasons
+}
+
+func addressListHasSentinel(addrs []string) bool {
+	for _, a := range addrs {
+		if a == unsupportedAddressSentinel {
+			return true
+		}
+	}
+	return false
+}
+
+// allAddressTokensRepresentable reports whether EVERY token in a policy
+// address list is representable by the userspace matcher (#3261). An empty list
+// is "any" (representable). A single unrepresentable token taints the whole
+// side so buildOneRuleSnapshot emits the address sentinel and the Rust
+// integrity preflight rejects the snapshot (fail closed) instead of silently
+// dropping that token and narrowing/collapsing the match.
+func allAddressTokensRepresentable(addrRepresentable func(tok string) bool, addrs []string) bool {
+	for _, tok := range addrs {
+		if !addrRepresentable(tok) {
+			return false
+		}
+	}
+	return true
 }
 
 // classifyPolicyAddresses splits the policy's address-token list

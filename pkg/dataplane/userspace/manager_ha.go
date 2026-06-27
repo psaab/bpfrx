@@ -404,19 +404,21 @@ func (m *Manager) configHasDataRGLocked() bool {
 // helper-upgrade-lag window on a single node), NOT on the content being
 // unrepresentable.
 //
-// caps are derived from the snapshot's own config (not m.lastStatus, which
-// still reflects the prior good config). The disarm is issued only when a
-// running helper currently believes it is armed, so steady-state representable
-// configs take no extra control round-trip. The post-publish desired-state
-// sync still reconciles the final state.
-func (m *Manager) disarmBeforeUnsupportedPublishLocked(cfg *config.Config) error {
-	if cfg == nil {
+// caps are read from the snapshot being published (snap.Capabilities), NOT
+// re-derived from cfg: only the snapshot value is feed-aware (#2049) and
+// reflects the ACTUAL per-rule sentinels, so a healthy dynamic-address feed
+// policy is not mistaken for unrepresentable content. The disarm is issued only
+// when a running helper currently believes it is armed, so steady-state
+// representable configs take no extra control round-trip. The post-publish
+// desired-state sync still reconciles the final state.
+func (m *Manager) disarmBeforeUnsupportedPublishLocked(snap *ConfigSnapshot) error {
+	if snap == nil || snap.Config == nil {
 		return nil
 	}
 	if m.proc == nil || m.proc.Process == nil || !m.lastStatus.ForwardingArmed {
 		return nil
 	}
-	caps := deriveUserspaceCapabilities(cfg)
+	caps := snap.Capabilities
 	disarm := !caps.ForwardingSupported // class (ii): genuine semantic gap
 	reason := "unsupported-config"
 	if !disarm && len(caps.PolicyContentRejected) > 0 &&

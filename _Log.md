@@ -22310,3 +22310,41 @@ top.
   pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
   pkg/api/metrics_userspace.go, userspace-dp/src/policy_tests.rs,
   docs/userspace-dataplane-gaps.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3261 review fold (NEEDS-MAJOR) — close the ADDRESS half of the
+  keep-armed fix. The application path had a sentinel + Rust reject backstop,
+  but an unrepresentable ADDRESS (undefined address-book name, or a static book
+  whose value is a non-literal dns-name/wildcard that resolves to no prefix) had
+  NONE: the raw strings reached the Rust matcher, which silently dropped an
+  unparseable literal / emptied a non-literal book -> the side collapsed to
+  MatchNone -> a `deny <bad-address>` rule matched nothing and fell through to a
+  later permit / default-permit (deny fail-OPEN on exactly #3261's
+  lenient/peer-sync path). Fix: emit a reserved `__unsupported_address__`
+  sentinel (Go, onto both v3 and legacy address shapes) + a matching
+  `SnapshotIntegrityError::UnrepresentableAddress` reject arm (Rust), symmetric
+  to the application path. The detection is FEED-AWARE: representability is
+  computed per-token (any-ish | valid literal | feed-bound name in the overlay |
+  known book with content), so a dynamic-address feed policy (#2049) — including
+  a transiently-EMPTY feed (overlay key present = MatchNone by design) — is NOT
+  rejected. Moved the class-(i) `PolicyContentRejected` diagnostic out of the
+  cfg-only `deriveUserspaceCapabilities` (which is feed-blind and would
+  false-positive every feed deployment) and onto the ACTUAL built snapshot via
+  `collectPolicyContentRejections`; `disarmBeforeUnsupportedPublishLocked` now
+  reads `snap.Capabilities` instead of re-deriving from cfg. Incidentally fixes
+  a latent bug: a feed-backed policy previously made the cfg gate return
+  ForwardingSupported=false -> the helper was DISARMED.
+  Validation: fail-on-revert proven for the address override (both sub-cases
+  RED) and the Rust reject (deny-address test RED); feed non-regression +
+  empty-feed (#2049) tests green; full `cargo test --release` (0 failures beyond
+  the known concurrent_recovery flake); `go build ./...` + `go test
+  ./pkg/dataplane/... ./pkg/config/... ./pkg/api/` green.
+  **File(s)**: pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/builder.go, pkg/dataplane/userspace/capabilities.go,
+  pkg/dataplane/userspace/manager.go, pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/process.go, userspace-dp/src/policy.rs,
+  userspace-dp/src/policy_tests.rs,
+  pkg/dataplane/userspace/protocol_failopen_2124_test.go,
+  pkg/dataplane/userspace/lenient_keep_armed_3261_test.go,
+  pkg/dataplane/userspace/feed_enforcement_test.go,
+  docs/userspace-dataplane-gaps.md

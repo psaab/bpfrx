@@ -894,6 +894,90 @@ fn deny_rule_with_unrepresentable_app_rejects_whole_snapshot_no_fall_through() {
 }
 
 #[test]
+fn deny_rule_with_unrepresentable_address_rejects_whole_snapshot_no_fall_through() {
+    // #3261 address half (the deny-rule doctrine guard, symmetric to the
+    // application case): a `deny` rule whose source/destination address the Go
+    // gate could not represent carries the __unsupported_address__ sentinel.
+    // Ahead of a later `permit application any`, the whole snapshot MUST be
+    // rejected — the bad-address deny must NOT silently collapse to MatchNone
+    // and let the blocked traffic fall through to the permit. Pre-fix the
+    // address side had no sentinel/reject backstop and DID fall through (deny
+    // fail-open); removing the sentinel reject flips this RED.
+    let store = PolicyCounterStore::default();
+    let deny_bad_addr = PolicyRuleSnapshot {
+        rule_id: "deny-bad-addr".to_string(),
+        name: "deny-bad-addr".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        // Both shapes carry the sentinel for the failed side, exactly as the Go
+        // builder stamps them.
+        source_addresses: vec![UNREPRESENTABLE_ADDRESS_SENTINEL.to_string()],
+        source_literals: vec![UNREPRESENTABLE_ADDRESS_SENTINEL.to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "deny".to_string(),
+        ..Default::default()
+    };
+    let permit_any = PolicyRuleSnapshot {
+        rule_id: "permit-any".to_string(),
+        name: "permit-any".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "permit".to_string(),
+        ..Default::default()
+    };
+    let result = parse_policy_state_with_counters(
+        "deny",
+        &[deny_bad_addr, permit_any],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(SnapshotIntegrityError::UnrepresentableAddress { .. })
+        ),
+        "deny+unrepresentable-address ahead of permit-any must reject the whole \
+         snapshot (no fall-through), got {result:?}"
+    );
+}
+
+#[test]
+fn unrepresentable_address_sentinel_in_legacy_shape_also_rejects() {
+    // The sentinel must be caught in the legacy (source_addresses) shape too —
+    // an old-reader rule that is not v3-shaped (no book ids / literals) still
+    // fails closed.
+    let store = PolicyCounterStore::default();
+    let rule = PolicyRuleSnapshot {
+        rule_id: "legacy-bad-addr".to_string(),
+        name: "legacy-bad-addr".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        destination_addresses: vec![UNREPRESENTABLE_ADDRESS_SENTINEL.to_string()],
+        source_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "permit".to_string(),
+        ..Default::default()
+    };
+    let result =
+        parse_policy_state_with_counters("deny", &[rule], &test_zone_name_to_id(), &[], &store);
+    assert!(
+        matches!(
+            result,
+            Err(SnapshotIntegrityError::UnrepresentableAddress { .. })
+        ),
+        "legacy-shape unrepresentable-address sentinel must fail closed, got {result:?}"
+    );
+}
+
+#[test]
 fn fresh_boot_default_policy_state_denies_all_transit() {
     // #3261 (plan test #3, fresh-boot half): when the FIRST-ever snapshot is
     // rejected by the integrity preflight, the helper stays armed with the
