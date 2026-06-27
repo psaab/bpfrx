@@ -2690,7 +2690,14 @@ pub(super) fn poll_binding_process_descriptor(
                     // on its install pass via the cache or this site once the
                     // session lands) is a no-op miss.
                     if let Some(flow) = flow.as_ref() {
-                        sessions.account_packet(&flow.forward_key, meta.pkt_len as u64);
+                        // #2749: observe TCP control bits + DSCP alongside the
+                        // volume (see flow_cache_hit.rs).
+                        sessions.account_packet(
+                            &flow.forward_key,
+                            meta.pkt_len as u64,
+                            meta.tcp_flags,
+                            meta.dscp,
+                        );
                     }
                     // Direction-specific tracking
                     let ingress_if = meta.ingress_ifindex as i32;

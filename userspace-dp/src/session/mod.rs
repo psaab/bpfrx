@@ -344,6 +344,20 @@ struct SessionEntry {
     ///     the already-reserved [56:64]/[64:72]/[112:120]/[120:128] wire
     ///     slots (previously hard-zeroed with `(#2501)` markers).
     counters: SessionCounters,
+    /// #2749: the IP ToS byte observed on the FORWARD direction of this
+    /// session (DSCP in the high 6 bits, ECN cleared — the shim meta carries
+    /// only the 6-bit DSCP). Stamped from `meta.dscp << 2` on every forward
+    /// packet (`account_packet`, last-wins — DSCP is stable for the life of a
+    /// flow in practice), 0 until the first forward packet is accounted.
+    /// Snapshotted onto the close `SessionDelta` so the SESSION_CLOSE RT_FLOW
+    /// frame carries the real NetFlow/IPFIX class-of-service value. A plain
+    /// `u8` for the same worker-owned single-threaded reason as `counters`.
+    observed_tos: u8,
+    /// #2749: the OR of every TCP control-flag byte seen on this session, in
+    /// BOTH directions (`account_packet` ORs `meta.tcp_flags` on every
+    /// forwarded packet). Yields the cumulative `tcpControlBits` a collector
+    /// expects (SYN|ACK|FIN|RST|… over the flow). 0 for non-TCP flows.
+    observed_tcp_flags: u8,
 }
 
 /// #2501: per-session traffic accounting, split by direction. A `Copy`
@@ -810,8 +824,18 @@ impl SessionTable {
     /// `&mut self`: plain stores, no atomic, no allocation, no cross-core
     /// traffic. A miss (session reaped between resolution and accounting) is a
     /// no-op — the same fail-open posture as `touch`.
+    ///
+    /// #2749: `tcp_flags` (the packet's TCP control-flag byte, 0 for non-TCP)
+    /// and `dscp` (the packet's 6-bit DSCP) are observed alongside the volume
+    /// so the SESSION_CLOSE RT_FLOW frame can carry real NetFlow/IPFIX
+    /// class-of-service and TCP-flags values. The flags are OR-accumulated in
+    /// BOTH directions (the cumulative `tcpControlBits` a collector expects);
+    /// the ToS byte (`dscp << 2`) is stamped only from the FORWARD direction
+    /// (the initiator's class of service). Both fold onto the canonical
+    /// FORWARD entry, exactly like the reverse counters, so a single close
+    /// harvest sees the whole flow.
     #[inline]
-    pub fn account_packet(&mut self, key: &SessionKey, len: u64) {
+    pub fn account_packet(&mut self, key: &SessionKey, len: u64, tcp_flags: u8, dscp: u8) {
         // Single resolve. For the dominant FORWARD case this is the only
         // session probe `account_packet` does — read the direction and mutate
         // the `fwd` counters under this one `&mut record` borrow. For the
@@ -820,8 +844,11 @@ impl SessionTable {
         let (record_key, nat) = match self.record_by_key_mut(key) {
             Some(record) => {
                 if !record.entry.metadata.is_reverse {
-                    // Forward packet → forward entry. Bump `fwd` in place.
+                    // Forward packet → forward entry. Bump `fwd` in place and
+                    // stamp the forward-direction ToS + OR the TCP flags.
                     record.entry.counters.account(false, len);
+                    record.entry.observed_tos = dscp << 2;
+                    record.entry.observed_tcp_flags |= tcp_flags;
                     return;
                 }
                 (record.key.clone(), record.entry.decision.nat)
@@ -829,13 +856,18 @@ impl SessionTable {
             None => return,
         };
         // Reverse packet → reverse entry. Fold onto the forward entry's `rev`.
+        // The reverse direction does NOT overwrite the forward ToS (it carries
+        // the responder's class of service), but its TCP flags ARE OR-folded
+        // so the cumulative tcpControlBits reflects both half-flows.
         let fwd_key = reverse_session_key(&record_key, nat);
         if let Some(entry) = self.entry_by_key_mut(&fwd_key) {
             entry.counters.account(true, len);
+            entry.observed_tcp_flags |= tcp_flags;
         } else if let Some(entry) = self.entry_by_key_mut(key) {
             // Forward entry already gone (independent expiry) — fall back to
             // the reverse entry so the count is not silently dropped.
             entry.counters.account(true, len);
+            entry.observed_tcp_flags |= tcp_flags;
         }
     }
 
@@ -1032,6 +1064,12 @@ impl SessionTable {
                 .entry_by_key(key)
                 .map(|e| e.counters)
                 .unwrap_or_default();
+            // #2749: a promote keeps the entry's observed ToS / TCP flags
+            // (informational on an Open delta — consistent with counters).
+            let (observed_tos, observed_tcp_flags) = self
+                .entry_by_key(key)
+                .map(|e| (e.observed_tos, e.observed_tcp_flags))
+                .unwrap_or((0, 0));
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
                 key: key.clone(),
@@ -1042,6 +1080,8 @@ impl SessionTable {
                 created_ns,
                 last_seen_ns: now_ns,
                 counters,
+                observed_tos,
+                observed_tcp_flags,
             });
         }
         true

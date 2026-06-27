@@ -2123,6 +2123,8 @@ fn reference_update_session(
             created_ns,
             last_seen_ns: now_ns,
             counters: SessionCounters::default(),
+            observed_tos: 0,
+            observed_tcp_flags: 0,
         });
     }
     true
@@ -4582,6 +4584,8 @@ fn open_delta(key: SessionKey) -> SessionDelta {
         created_ns: 0,
         last_seen_ns: 0,
         counters: SessionCounters::default(),
+        observed_tos: 0,
+        observed_tcp_flags: 0,
     }
 }
 
@@ -4916,8 +4920,8 @@ fn account_packet_forward_increments_fwd_counters() {
     let now = 1_000_000_000u64;
     assert!(table.install_with_protocol(key.clone(), decision(), metadata(), now, PROTO_TCP, 0x10));
 
-    table.account_packet(&key, 100);
-    table.account_packet(&key, 250);
+    table.account_packet(&key, 100, 0, 0);
+    table.account_packet(&key, 250, 0, 0);
 
     let c = table.session_counters(&key).expect("forward entry exists");
     // FAIL-ON-REVERT: revert the hot-path increment and these go to 0.
@@ -4951,9 +4955,9 @@ fn account_packet_reverse_folds_onto_forward_entry() {
 
     // A forward packet (keyed by the forward tuple) and a reverse packet
     // (keyed by the reply tuple).
-    table.account_packet(&fwd, 1000);
-    table.account_packet(&rev, 40);
-    table.account_packet(&rev, 60);
+    table.account_packet(&fwd, 1000, 0, 0);
+    table.account_packet(&rev, 40, 0, 0);
+    table.account_packet(&rev, 60, 0, 0);
 
     // Both directions must land on the canonical FORWARD entry so the
     // forward-only BPF mirror / close harvest sees the complete picture.
@@ -4972,7 +4976,7 @@ fn account_packet_miss_is_noop() {
     let mut table = SessionTable::new();
     // No session installed — accounting an unknown key must not panic or
     // create state.
-    table.account_packet(&key_v4(), 9999);
+    table.account_packet(&key_v4(), 9999, 0, 0);
     assert!(table.session_counters(&key_v4()).is_none());
 }
 
@@ -4985,8 +4989,8 @@ fn close_delta_carries_harvested_counters() {
     // Drain the Open delta so the next drain only sees the Close.
     let _ = table.drain_deltas(8);
 
-    table.account_packet(&key, 500);
-    table.account_packet(&key, 700);
+    table.account_packet(&key, 500, 0, 0);
+    table.account_packet(&key, 700, 0, 0);
 
     // Force expiry.
     table.last_gc_ns = then + 301_000_000_000;
@@ -5002,4 +5006,54 @@ fn close_delta_carries_harvested_counters() {
     // and these revert to 0 — the SESSION_CLOSE RT_FLOW frame loses volume.
     assert_eq!(close.counters.fwd_packets, 2);
     assert_eq!(close.counters.fwd_bytes, 1200);
+}
+
+// #2749 FAIL-ON-REVERT: a session close must carry the REAL observed ToS
+// (forward-direction DSCP<<2) and the cumulative TCP control bits (OR of all
+// flags seen in both directions). Reverting the `account_packet` stamping (or
+// the expire.rs harvest of `removed.observed_*`) drops these to 0 — the exact
+// #2613 regression that exported synthetic-zero ipClassOfService /
+// tcpControlBits to collectors.
+#[test]
+fn close_delta_carries_observed_tos_and_tcp_flags() {
+    let mut table = SessionTable::new();
+    let then = 1_000_000_000u64;
+    let fwd = key_v4();
+    let rev = reverse_session_key(&fwd, NatDecision::default());
+    // Install seeds the cumulative flags with the trigger packet's SYN (0x02).
+    assert!(table.install_with_protocol(fwd.clone(), decision(), metadata(), then, PROTO_TCP, 0x02));
+    assert!(table.install_with_protocol(
+        rev.clone(),
+        decision(),
+        metadata_reverse(),
+        then,
+        PROTO_TCP,
+        0x02,
+    ));
+    let _ = table.drain_deltas(8);
+
+    // Forward packet: DSCP EF (46) → ToS byte 0xB8, TCP ACK (0x10).
+    table.account_packet(&fwd, 500, 0x10, 46);
+    // Reverse packet: FIN|ACK (0x11), a DIFFERENT DSCP (must NOT change the
+    // forward ToS — the responder's class of service is irrelevant to srcTos).
+    table.account_packet(&rev, 40, 0x11, 10);
+
+    table.last_gc_ns = then + 301_000_000_000;
+    // Both halves expire; only the forward (is_reverse=false) entry produces a
+    // Close delta (expire.rs gates the close delta on !is_reverse).
+    let expired = table.expire_stale_entries(then + 302_000_000_000);
+    assert_eq!(expired.len(), 2);
+
+    let deltas = table.drain_deltas(8);
+    let close = deltas
+        .iter()
+        .find(|d| d.kind == SessionDeltaKind::Close)
+        .expect("a Close delta was produced");
+    // Forward-direction ToS = DSCP 46 << 2 = 184 (0xB8); reverse DSCP ignored.
+    assert_eq!(close.observed_tos, 0xB8, "real forward ToS, not 0");
+    // Cumulative flags = SYN(0x02) | ACK(0x10) | FIN|ACK(0x11) = 0x13.
+    assert_eq!(
+        close.observed_tcp_flags, 0x13,
+        "OR of all TCP flags seen in both directions, not 0"
+    );
 }

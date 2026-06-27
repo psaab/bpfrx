@@ -201,6 +201,19 @@ pub(crate) struct SessionDelta {
     /// synthesized close that no longer has the entry carry the
     /// `Default` (all-zero) value, which keeps the prior on-wire behavior.
     pub(crate) counters: SessionCounters,
+    /// #2749: the IP ToS byte (DSCP in the high 6 bits, ECN cleared) observed
+    /// on the forward direction of the session, snapshotted from
+    /// `SessionEntry.observed_tos` when this delta is produced. Drives the
+    /// re-introduced NetFlow v9 `srcTos` (IE 5) / IPFIX `ipClassOfService`
+    /// close-record field. Meaningful only on a Close delta sourced from a
+    /// live local entry; Open / synced / synthesized-close deltas carry 0
+    /// (the prior on-wire behavior).
+    pub(crate) observed_tos: u8,
+    /// #2749: the OR of every TCP control-flag byte seen over the flow's
+    /// lifetime (`SessionEntry.observed_tcp_flags`). Drives the re-introduced
+    /// NetFlow v9 `tcpFlags` (IE 6) / IPFIX `tcpControlBits` close-record
+    /// field. 0 for non-TCP flows and for deltas with no live entry in hand.
+    pub(crate) observed_tcp_flags: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -87,6 +87,20 @@ const (
 	// rawEventPolicyCloseOffset is the wire offset of the #3056 admitting policy
 	// ID on a SESSION_CLOSE frame (LE u32 at [136:140]).
 	rawEventPolicyCloseOffset = 136
+	// #2749: the EXTENDED SESSION_CLOSE frame grew 144 -> 152 to carry a
+	// class-of-service / interface-attribution block at [144:152]: [144] src
+	// ToS byte, [145] accumulated TCP control bits, [146] flow direction
+	// (reserved, deferred), [147] reserved, [148:152] egress ifindex (LE u32).
+	// The growth is ADDITIVE: the minimum-frame acceptance stays at
+	// rawEventWireSize (144) so a new daemon still accepts an old helper's
+	// 144-byte frames, and these slots are read ONLY when the frame actually
+	// carries them (len >= rawEventExtSize) AND only on a SESSION_CLOSE. An old
+	// daemon ignores the trailing 8 bytes. Both rolling-upgrade directions are
+	// safe (#1961 both-sides wire discipline).
+	rawEventExtSize      = 152
+	rawEventTOSOffset    = 144
+	rawEventTCPBitOffset = 145
+	rawEventEgressOffset = 148
 )
 
 var _ [rawEventWireSize]struct{} = [rawEventStructSize]struct{}{}
@@ -557,6 +571,17 @@ func (er *EventReader) logEvent(data []byte) {
 		rec.CloseReason = closeReasonName(closeReasonCode)
 	}
 
+	// #2749: the SESSION_CLOSE class-of-service / interface-attribution block
+	// rides the additive [144:152] slots. Read it ONLY on a close frame that
+	// actually carries the extended length, so a short legacy (144-byte) frame
+	// or a non-close event leaves the fields at their 0 ("unknown") default.
+	if evt.EventType == eventTypeSessionClose && len(data) >= rawEventExtSize {
+		rec.TOS = data[rawEventTOSOffset]
+		rec.TCPControlBits = data[rawEventTCPBitOffset]
+		rec.EgressIfindex = binary.LittleEndian.Uint32(
+			data[rawEventEgressOffset : rawEventEgressOffset+4])
+	}
+
 	// Resolve policy name (skip for screen drops which repurpose policy_id).
 	// #3056: read rec.PolicyID, not evt.PolicyID — they match for every
 	// non-close frame, but on a SESSION_CLOSE evt.PolicyID was zeroed (it held
@@ -830,6 +855,14 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 		// 136-byte) frame already returned false above (len < rawEventWireSize).
 		rec.PolicyID = binary.LittleEndian.Uint32(
 			data[rawEventPolicyCloseOffset : rawEventPolicyCloseOffset+4])
+		// #2749: the class-of-service / interface-attribution block rides the
+		// additive [144:152] slots, present only on the extended close frame.
+		if len(data) >= rawEventExtSize {
+			rec.TOS = data[rawEventTOSOffset]
+			rec.TCPControlBits = data[rawEventTCPBitOffset]
+			rec.EgressIfindex = binary.LittleEndian.Uint32(
+				data[rawEventEgressOffset : rawEventEgressOffset+4])
+		}
 	}
 	if evt.EventType != eventTypeSessionClose {
 		rec.SessionPkts = 0

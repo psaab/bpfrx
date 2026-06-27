@@ -198,7 +198,15 @@ pub(super) fn stage_flow_cache_hit(
         // `key_to_handle` probe (warm — `touch_if_stale` just probed the same
         // key) + a `saturating_add`. Allocation-free, no atomic (worker-owned
         // table).
-        sessions.account_packet(&flow.forward_key, meta.pkt_len as u64);
+        // #2749: also observe the packet's TCP control bits + DSCP so the
+        // SESSION_CLOSE RT_FLOW frame carries real NetFlow/IPFIX
+        // class-of-service / TCP-flags values.
+        sessions.account_packet(
+            &flow.forward_key,
+            meta.pkt_len as u64,
+            meta.tcp_flags,
+            meta.dscp,
+        );
         let mut recycle_now = true;
         if matches!(
             cached_decision.resolution.disposition,

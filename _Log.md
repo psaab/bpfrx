@@ -29,6 +29,60 @@
   adjustment==zero skip turns `checksum_neutral_0xffff_host_word_survives_outbound`,
   `checksum_neutral_0xffff_and_0x0000_hosts_stay_distinct`, and
   `checksum_neutral_round_trip_preserves_0xffff_host` RED.
+## 2026-06-26 — #2749 doc fold: event_stream README payload 144 -> 152
+
+- **Timestamp**: 2026-06-26
+- **Action**: Hostile-review NEEDS-MINOR fold. The event_stream module README
+  (userspace-dp/src/event_stream/README.md) still documented the telemetry
+  payload as 144 bytes; #2749 grows the SESSION_CLOSE RT_FLOW frame to 152
+  (SECURITY_EVENT_PAYLOAD_SIZE=152). Updated the codec.rs payload description to
+  152 bytes with the additive [144:152] block (src ToS [144], cumulative TCP
+  control bits [145], reserved flowDirection [146:148], egress ifindex LE u32
+  [148:152]) and the Go len>=152 + close-only / legacy-144 back-compat read,
+  plus the two SESSION_CLOSE/SESSION_CREATE frame descriptions. Doc-only;
+  go build ./... + go test ./pkg/logging/ green.
+- **File(s)**: userspace-dp/src/event_stream/README.md
+
+## 2026-06-26 — #2749 flowexport: populate TOS/TCPFlags/egress-if via a SESSION_CLOSE wire extension
+
+- **Timestamp**: 2026-06-26
+- **Action**: Re-introduced the NetFlow v9 / IPFIX close-record fields #2613
+  dropped because the close path had no real source — srcTos/ipClassOfService
+  (IE 5), tcpFlags/tcpControlBits (IE 6) and egressInterface/OutputSNMP (IE 14)
+  — with REAL values (ingressInterface IE 10 was already restored by #2615).
+  WIRE: extended the SESSION_CLOSE RT_FLOW frame 144 -> 152 bytes with an
+  ADDITIVE [144:152] block ([144] src ToS = DSCP<<2, [145] cumulative TCP
+  control bits, [146:148] reserved flowDirection, [148:152] egress ifindex LE).
+  Chose the additive grow (not a re-lay) per the STOP-ON-FORK rule — lower
+  compat risk: the Go minimum-frame acceptance stays at the legacy 144
+  (rawEventWireSize), the [144:152] slots are read only when present
+  (len>=rawEventExtSize) AND only on a close, so BOTH rolling-upgrade
+  directions are safe (#1961). CONNTRACK (Rust): SessionEntry.observed_tos /
+  observed_tcp_flags stamped on the AF_XDP forwarding path (account_packet now
+  takes tcp_flags+dscp — forward DSCP last-wins, OR of TCP flags both
+  directions) and harvested onto the close SessionDelta in session/expire.rs
+  like the #2501 counters; egress ifindex comes free off
+  SessionDecision.resolution.egress_ifindex. GO: threaded TOS/TCPControlBits/
+  EgressIfindex through EventRecord -> SessionCloseData -> FlowRecord and re-added
+  the template fields + encoder writes + IPFIX size consts (V4 63->70,
+  V6 111->118). DEFERRED flowDirection (IE 61): no real per-flow inbound/outbound
+  signal; a constant 0 would re-introduce the synthetic-zero #2613 fixed.
+  flow-dir knob stays accepted-not-applied. No wire fixture regen needed (the
+  RT_FLOW frame is a hand-rolled byte buffer, not a serde struct in
+  protocol_wire_v1.json; SessionDeltaInfo serde untouched).
+- **File(s)**: userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/mod.rs, userspace-dp/src/session/entry.rs,
+  userspace-dp/src/session/mod.rs, userspace-dp/src/session/install.rs,
+  userspace-dp/src/session/expire.rs, userspace-dp/src/afxdp/ha.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  pkg/logging/ringbuf.go, pkg/logging/eventbuf.go,
+  pkg/flowexport/manager.go, pkg/flowexport/netflow.go, pkg/flowexport/ipfix.go,
+  pkg/daemon/daemon_flowexport.go, userspace-dp/src/session/README.md,
+  pkg/flowexport/README.md, + tests
+  (close_delta_carries_observed_tos_and_tcp_flags,
+  TestDecodeRawEventCloseCarriesCosBlock, cos_fields_test.go,
+  codec_tests v4 wire layout, dropped_fields/exporter/postnat test updates).
 
 ## 2026-06-26 — #3074 wire per-policy `then count` to the display surfaces
 

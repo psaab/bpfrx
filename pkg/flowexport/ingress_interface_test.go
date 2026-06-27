@@ -17,9 +17,10 @@ import (
 // template field, the encoder write, or the SessionCloseData->FlowRecord
 // plumbing flips any of them RED.
 //
-// The other four #2613 drops (SrcTos 5 / TCPFlags 6 / OutputSNMP 14 /
-// flowDirection 61) remain absent — no wire source exists for them yet; that
-// absence is pinned by dropped_fields_test.go.
+// #2749 also re-introduces SrcTos (5) / TCPFlags (6) / OutputSNMP (14) with
+// real values — pinned by cos_fields_test.go. Only flowDirection (61) remains
+// absent (no per-flow direction source yet); that absence is pinned by
+// dropped_fields_test.go.
 
 const testIngressIfindex uint32 = 0xDEADBEEF
 
