@@ -417,9 +417,18 @@ func (m *Manager) buildManagedSection(fc *FullConfig) string {
 		}
 	}
 
-	// 9. Policy options: prefix-lists and route-maps
+	// 9. Policy options: prefix-lists and route-maps. Collect the set of
+	// policy-statements applied as a BGP route-map in/out (default instance
+	// + every VRF) so a BGP policy with no explicit default action renders a
+	// terminating `permit` (Junos BGP default-accept) rather than FRR's
+	// implicit deny — preventing a non-matching-route blackhole (#2998).
 	if fc.PolicyOptions != nil {
-		b.WriteString(m.generatePolicyOptions(fc.PolicyOptions))
+		bgpAcceptDefault := make(map[string]bool)
+		collectBGPRouteMapPolicies(fc.BGP, fc.PolicyOptions, bgpAcceptDefault)
+		for _, inst := range fc.Instances {
+			collectBGPRouteMapPolicies(inst.BGP, fc.PolicyOptions, bgpAcceptDefault)
+		}
+		b.WriteString(m.generatePolicyOptions(fc.PolicyOptions, bgpAcceptDefault))
 	}
 
 	// Resolve forwarding-table export policy for ECMP. Sets fc.ConsistentHash
