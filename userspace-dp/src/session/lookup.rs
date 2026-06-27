@@ -90,6 +90,16 @@ impl SessionTable {
                 // the entry back to the 30s graceful-FIN close window.
                 entry.reset |= has_rst(tcp_flags);
             }
+            // #3152: promote OPENING -> ESTABLISHED on the first ACK-bearing
+            // segment after the opening SYN. The reverse SYN-ACK and the
+            // forward handshake-completing ACK both carry ACK, so a completed
+            // three-way handshake promotes the session to the established idle
+            // window; a bare SYN that never gets a reply never produces such a
+            // segment and reaps at the short `tcp_opening_ns`. Sticky — once
+            // established a later segment never demotes back to OPENING.
+            if matches!(key.protocol, PROTO_TCP) && has_ack(tcp_flags) {
+                entry.established = true;
+            }
             entry.last_seen_ns = now_ns;
             entry.expires_after_ns = if matches!(key.protocol, PROTO_TCP) && entry.closing {
                 if entry.reset {
@@ -101,9 +111,12 @@ impl SessionTable {
                 // #3227: re-apply the admitting application's per-app idle
                 // timeout on every established refresh so the session keeps
                 // aging on the app's value, not the global per-protocol one.
+                // #3152: an un-established (OPENING) TCP session ages on the
+                // short opening window via session_timeout_ns(established=…).
                 session_timeout_ns(
                     key.protocol,
                     tcp_flags,
+                    entry.established,
                     &timeouts,
                     entry.metadata.inactivity_timeout_ns,
                 )

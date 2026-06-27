@@ -149,9 +149,19 @@ impl SessionTable {
                 // #2465: stamp the creation instant once at install. Never
                 // re-stamped, so the close delta reports the true session age.
                 created_ns: now_ns,
+                // #3152: a TCP session created by a bare SYN (SYN set, ACK
+                // clear) starts OPENING (`established=false`); every other
+                // first packet (non-TCP, or a TCP mid-stream pickup such as a
+                // SYN-ACK or data segment) starts ESTABLISHED, preserving the
+                // pre-#3152 full-established-timeout behaviour. Computed once
+                // here and reused for the initial timeout selection.
+                established: !(matches!(protocol, PROTO_TCP) && is_initial_syn(tcp_flags)),
                 expires_after_ns: session_timeout_ns(
                     protocol,
                     tcp_flags,
+                    // #3152: OPENING half-open sessions take the short opening
+                    // window; mirror the `established` seed computed above.
+                    !(matches!(protocol, PROTO_TCP) && is_initial_syn(tcp_flags)),
                     &self.timeouts,
                     // #3227: per-application idle timeout override (None = global).
                     metadata.inactivity_timeout_ns,
@@ -300,9 +310,34 @@ impl SessionTable {
                 // stamp is the local re-import time; the local close that
                 // follows reports age from here.
                 created_ns: now_ns,
+                // #3152: a peer-synced entry is imported as ESTABLISHED, NOT
+                // re-derived as OPENING from the carried `tcp_flags`. The
+                // short opening window is a FORWARDING-NODE protection against
+                // a locally-received bare-SYN flood; the standby never
+                // receives that flood directly (it receives synced sessions),
+                // so it must not apply the short window. Crucially, the synced
+                // `tcp_flags` are the install-time flags (the opening SYN for a
+                // SYN-created flow) and are not guaranteed to be re-published
+                // as the primary's handshake completes, so deriving OPENING
+                // here could misclassify a LIVE established flow on the standby
+                // and reap its synced copy at the short stale-synced ceiling
+                // (`STALE_SYNCED_CEILING_MULT × opening`), breaking failover
+                // for any flow older than that ceiling. Importing as
+                // ESTABLISHED preserves the exact pre-#3152 standby behaviour
+                // (full established timeout + #2120 standby retention). The
+                // half-open table-exhaustion mitigation still holds end to end:
+                // the primary (the flood target) reaps its half-opens at
+                // `tcp_opening_ns` and emits a Close delta (session/expire.rs)
+                // that propagates to the standby, so the standby copy is
+                // removed promptly without needing its own OPENING window. The
+                // `established` field is node-local and never crosses the HA
+                // wire, so this is a pure import-side decision (no wire change).
+                established: true,
                 expires_after_ns: session_timeout_ns(
                     protocol,
                     tcp_flags,
+                    // #3152: imported ESTABLISHED (see above).
+                    true,
                     &self.timeouts,
                     // #3227: per-application idle timeout override (None = global).
                     metadata.inactivity_timeout_ns,
