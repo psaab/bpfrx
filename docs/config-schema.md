@@ -1349,6 +1349,41 @@ an undefined from-zone and to-zone, `TestPolicySpecialZoneTokensCommit` —
 `any`/`junos-host`/global anti-over-reject, `TestPolicyDefinedZonesCommit`,
 `TestPolicyUndefinedZoneLenientDowngradesToWarning`).
 
+### #3300 — Dynamic-address `address-name … feed-name` cross-reference gate
+
+A `security dynamic-address address-name <addr> profile feed-name <feed>`
+binding records `<feed>` verbatim into `AddressBinding.FeedNames`
+(`compileDynamicAddress`, `compiler_services.go`) with no cross-reference
+against the configured `feed-server`s. The `feed-name` schema leaf is a
+free-form value (`schema_security.go`), so the #2008/#2009 undefined-token
+gate does NOT catch a typo. At runtime an unknown feed name resolves to a
+non-nil EMPTY prefix set (`feeds.Manager.SnapshotForBindings`, `feeds.go`),
+so the AF_XDP address book gets a book ID matching NOTHING — fail-closed,
+which is correct for a "declared but not yet fetched" feed but
+indistinguishable from a typo. A feed-backed deny policy then silently
+denies nothing, with no commit error.
+
+**`validateDynamicAddressFeedReferencesStrict`** (`compiler_validate_strict.go`)
+restores Junos commit-time parity: a binding whose `feed-name` resolves to no
+declared feed is hard-rejected at commit / commit-check, with a message
+naming both the address-name and the unknown feed-name. The valid feed-name
+set is computed exactly as `feeds.Manager` keys feeds (`feeds.go` Start): each
+`feed-server`'s `feed-name` entries, or — for a single-feed server with no
+explicit `feed-name` — the server name itself.
+
+**Strict/lenient split (flag `lenientDynamicAddressFeedRef`):** strict on the
+commit / commit-check path (`CompileConfig` — hard-reject), downgraded to a
+`cfg.Warnings` entry on the tolerant load / peer-sync paths
+(`CompileConfigLenient` / `CompileConfigForNodeLenient`) so an
+already-persisted config (older binaries never validated the reference) or a
+peer-synced config still BOOTS (#1960 / #3261 fail-closed-on-load doctrine) —
+the runtime stays fail-closed (match-none) for the unknown feed, so a
+leniently-loaded typo denies nothing rather than bricking. Regression
+coverage: `pkg/config/compiler_dynamic_address_feed_ref_3300_test.go`
+(`TestValidateDynamicAddressFeedReferences` — the fail-on-revert guard plus
+feed-entry / single-feed / server-name positive controls and the lenient
+downgrade).
+
 ### #3117 — Security-policy `scheduler-name` schema leaf (completion parity)
 
 A security-policy `scheduler-name <name>` binds a class-of-service scheduler

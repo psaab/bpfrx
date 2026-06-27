@@ -379,6 +379,98 @@ func validateLogProfileStreamReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// validateDynamicAddressFeedReferencesStrict hard-rejects a
+// `security dynamic-address address-name <addr> profile feed-name <feed>`
+// binding whose `<feed>` resolves to no declared feed (#3300). The
+// address-name→feed binding is recorded verbatim into
+// AddressBinding.FeedNames with no cross-reference against the configured
+// feed-servers (compileDynamicAddress in compiler_services.go), and at
+// runtime an unknown feed name contributes nothing: feeds.Manager.
+// SnapshotForBindings skips a feed it never registered and still publishes
+// a non-nil EMPTY prefix set for the binding (feeds.go SnapshotForBindings),
+// so the AF_XDP address book gets a book ID that matches nothing
+// (fail-closed). The runtime fail-closed posture is correct for "feed
+// declared but not yet fetched", but a TYPO in the feed-name is
+// indistinguishable from that and arms a silent match-none book: a
+// feed-backed deny policy referencing the dynamic-address denies nothing,
+// with no commit error. Junos rejects an address-name whose profile
+// feed-name does not resolve to a declared feed at commit; this gate
+// restores that behavior.
+//
+// The valid feed-name set mirrors exactly the keys feeds.Manager registers
+// (feeds.go Start): a feed-server with per-feed entries contributes each
+// FeedEntry.Name; a single-feed server contributes its FeedName, or the
+// server name itself when no explicit feed-name is set. The schema accepts
+// `profile feed-name` as a free-form value leaf (schema_security.go), so the
+// undefined-token gate (#2008/#2009) does NOT cover a typo here — only this
+// cross-reference does.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientDynamicAddressFeedRef) so an already-persisted config
+// (older binaries never validated the reference) or a peer-synced config
+// still boots — the runtime is already fail-closed (match-none) for an
+// unknown feed, so a leniently-loaded typo denies nothing rather than
+// bricking the load (#1960 / #3261 class). Commit / commit-check stay strict
+// so the operator's next edit fails loudly. Mirrors
+// validateLogProfileStreamReferencesStrict.
+func validateDynamicAddressFeedReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	da := cfg.Security.DynamicAddress
+	if len(da.AddressBindings) == 0 {
+		return nil
+	}
+
+	// Build the set of declared feed names exactly as feeds.Manager keys
+	// them (pkg/feeds Start): FeedEntries name each feed; a single-feed
+	// server keys on FeedName, falling back to the server name.
+	declared := make(map[string]bool)
+	for _, fs := range da.FeedServers {
+		if fs == nil {
+			continue
+		}
+		if len(fs.FeedEntries) > 0 {
+			for _, fe := range fs.FeedEntries {
+				declared[fe.Name] = true
+			}
+			continue
+		}
+		key := fs.FeedName
+		if key == "" {
+			key = fs.Name
+		}
+		if key != "" {
+			declared[key] = true
+		}
+	}
+
+	// AddressBindings is a map (unordered); sort keys so the first-error
+	// commit-check message is deterministic across runs.
+	names := make([]string, 0, len(da.AddressBindings))
+	for name := range da.AddressBindings {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		ab := da.AddressBindings[name]
+		if ab == nil {
+			continue
+		}
+		for _, fn := range ab.FeedNames {
+			if fn == "" || declared[fn] {
+				continue
+			}
+			return fmt.Errorf("security dynamic-address address-name %q "+
+				"profile references undefined feed-name %q (the binding would "+
+				"resolve to an empty address set — a feed-backed policy would "+
+				"silently match nothing; declare the feed under a "+
+				"dynamic-address feed-server or fix the feed-name)", ab.Name, fn)
+		}
+	}
+	return nil
+}
+
 // validateFlowServerTemplateReferencesStrict hard-rejects a per-flow-server
 // NetFlow v9 / IPFIX template reference (`version9 { template <name> }`,
 // `version9-template <name>`, `version-ipfix { template <name> }`, or

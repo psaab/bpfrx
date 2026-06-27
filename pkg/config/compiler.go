@@ -200,6 +200,22 @@ type compileOpts struct {
 	// lenientIPsecPolicyProposalRef.
 	lenientLogProfileStreamRef bool
 
+	// lenientDynamicAddressFeedRef (#3300) downgrades the
+	// `security dynamic-address address-name <addr> profile feed-name <feed>`
+	// cross-reference (validateDynamicAddressFeedReferencesStrict) from a
+	// hard error to a warning on the tolerant load / peer-sync paths. An
+	// already-persisted config (older binaries never validated the feed-name
+	// reference), or one synced from a peer, may carry an address-name whose
+	// profile feed-name does not resolve to a declared feed; an upgrading /
+	// receiving node must still boot through it (warn) rather than
+	// fail-closed-on-load (#1960 / #3261 class). The runtime is already
+	// fail-closed (an unknown feed resolves to an empty, match-nothing
+	// address book), so a leniently-loaded typo denies nothing rather than
+	// bricking. Commit / commit-check stay strict — a new operator edit that
+	// names an undefined feed (whose deny policy would silently match
+	// nothing) is rejected. Same doctrine as lenientLogProfileStreamRef.
+	lenientDynamicAddressFeedRef bool
+
 	// lenientNATHostMask (#2173) downgrades the static-NAT / NAT64
 	// host-mask gate (validateNATHostMaskStrict) from a hard compile error
 	// to a cfg.Warnings entry. Set ONLY on the tolerant load / peer-sync
@@ -990,6 +1006,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientIPsecGatewayRefs:             true,
 		lenientIKEPolicyChainRef:            true,
 		lenientLogProfileStreamRef:          true,
+		lenientDynamicAddressFeedRef:        true,
 		lenientNATPoolAlarmThreshold:        true,
 		lenientNATHostMask:                  true,
 		lenientUnsupportedInterfaceStanzas:  true,
@@ -1120,6 +1137,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientIPsecGatewayRefs:             true,
 		lenientIKEPolicyChainRef:            true,
 		lenientLogProfileStreamRef:          true,
+		lenientDynamicAddressFeedRef:        true,
 		lenientNATPoolAlarmThreshold:        true,
 		lenientNATHostMask:                  true,
 		lenientUnsupportedInterfaceStanzas:  true,
@@ -2132,6 +2150,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientLogProfileStreamRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("security log profile stream reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3300 dynamic-address feed cross-reference gate. A
+	// `security dynamic-address address-name <addr> profile feed-name <feed>`
+	// whose feed-name resolves to no declared feed-server feed records an
+	// empty (match-nothing) address book at runtime, so a feed-backed deny
+	// policy silently denies nothing with no commit error — a typo is
+	// indistinguishable from a not-yet-fetched feed. Strict on commit /
+	// commit-check (hard reject so the typo is operator-visible); lenient on
+	// load / peer-sync (warn so an already-persisted or peer-synced config
+	// still boots — #1960 / #3261; the runtime stays fail-closed match-none
+	// for the unknown feed). Runs on the fully-compiled *Config so the
+	// feed-server map is populated regardless of authoring order. Mirrors
+	// validateLogProfileStreamReferencesStrict.
+	if err := validateDynamicAddressFeedReferencesStrict(cfg); err != nil {
+		if opts.lenientDynamicAddressFeedRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("dynamic-address feed reference (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

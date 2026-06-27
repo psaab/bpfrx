@@ -22563,3 +22563,15 @@ top.
   **File(s)**: pkg/dataplane/userspace/capabilities.go,
   pkg/dataplane/userspace/app_inactivity_timeout_precedence_3298_test.go,
   docs/userspace-dataplane-gaps.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3300 strict cross-reference: reject a
+  `security dynamic-address address-name … profile feed-name <feed>` whose
+  feed-name resolves to no declared feed-server feed at commit. Previously a
+  typo compiled clean and armed a silent match-none address book (feed-backed
+  deny denied nothing). Added `validateDynamicAddressFeedReferencesStrict`
+  (mirrors feeds.Manager keying) + `lenientDynamicAddressFeedRef` tolerant
+  downgrade. Fail-on-revert test + positive controls.
+  **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/compiler_dynamic_address_feed_ref_3300_test.go,
+  docs/config-schema.md
