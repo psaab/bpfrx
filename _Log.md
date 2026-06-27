@@ -1,3 +1,30 @@
+## 2026-06-27 — #2930 doc-only: correct demotion-path drift, mark DrainRequest reserved/dormant
+
+- **Timestamp**: 2026-06-27
+- **Action**: Doc + comment only (no behavior change). The /research plan
+  (campaign-8) PLAN-KILLED the correctness-bug framing: the seq-fenced
+  DrainRequest/DrainComplete pair (SendDrainRequest / handle_drain_request,
+  MSG_DRAIN_REQUEST=7) is dormant (no production caller) but the live demotion
+  path has no correctness gap — it uses SessionSync.WaitForPeerBarrier + the
+  continuous lossless event stream, and republish uses
+  ExportOwnerRGSessions(rgIDs, 0) (an unbounded full-conntrack snapshot) fired
+  on event-stream FullResync (#2874 gap / #2442 overflow), NOT on demotion-prep.
+  Verified against master: prepareUserspaceRGDemotionWithTimeout does only the
+  single WaitForPeerBarrier; PrepareRGDemotion does not exist;
+  WaitForIdle/WaitForPeerBarriersDrained/PauseIncrementalSync have no live
+  caller; ExportOwnerRGSessions has one live caller — handleEventStreamFullResync.
+  Corrected docs/session-sync-architecture.md (live demotion path; reframed the
+  stale 10-step "Graceful Demotion" sequence; "Export During Demotion Prep" →
+  "Bulk Owner-RG Export (FullResync republish)"; marked the DrainRequest fence
+  RESERVED/DORMANT; v4 revision entry). Added reserved/dormant doc-comments at
+  SendDrainRequest (eventstream.go) and handle_drain_request (event_stream/mod.rs)
+  and a reserved/dormant note in userspace-dp/src/event_stream/README.md.
+- **File(s)**: docs/session-sync-architecture.md,
+  pkg/dataplane/userspace/eventstream.go,
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/README.md, _Log.md
+- **Validation**: go build ./... clean (doc + comment only, no test needed).
+
 ## 2026-06-26 — #3148 review fold: explicit `any`→Any + reject junos-host global match
 
 - **Timestamp**: 2026-06-26

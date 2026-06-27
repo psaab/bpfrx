@@ -15,6 +15,12 @@ periodic ACK from the daemon.
   `MSG_SESSION_UPDATE`, `MSG_ACK`, `MSG_PAUSE`, `MSG_RESUME`,
   `MSG_DRAIN_REQUEST`, `MSG_DRAIN_COMPLETE`, `MSG_FULL_RESYNC`,
   `MSG_KEEPALIVE` (1..10), plus RT_FLOW dataplane telemetry frames
+  (`MSG_DRAIN_REQUEST=7` / `MSG_DRAIN_COMPLETE=8` are **reserved/dormant** —
+  the Go daemon has no live caller; graceful demotion uses the session-sync
+  peer barrier + continuous event stream, and loss-of-sync republish uses the
+  unbounded `ExportOwnerRGSessions` snapshot via `MSG_FULL_RESYNC`. The drain
+  fence below is retained, hardened, and tested for a possible future use —
+  see `docs/session-sync-architecture.md`)
   `MSG_POLICY_DENY`, `MSG_SCREEN_DROP`, and `MSG_FILTER_LOG` (11..13),
   (#2460) `MSG_SESSION_CLOSE_RT_FLOW` (14), and (#2508)
   `MSG_SESSION_CREATE_RT_FLOW` (15).
@@ -285,8 +291,9 @@ cluster-scoped.
   already-bounded replay buffer, never to `write_buf`. **Invariant: the
   data plane never stalls because a telemetry consumer is slow; a stuck
   consumer degrades telemetry (counted drops), nothing else.**
-- **Lossless-demotion fence for session deltas (#2875).** A paused drain is
-  the stable window the future owner reads before demotion completes
+- **Lossless-demotion fence for session deltas (#2875). RESERVED/DORMANT —
+  not wired to the live demotion path; see the codec note above.** A paused
+  drain is the stable window the future owner reads before demotion completes
   (`docs/session-sync-design.md`). The replay buffer is bounded, so a long
   pause that overruns `REPLAY_BUFFER_CAPACITY` evicts the oldest frames —
   and an evicted frame may be an HA session-sync delta
