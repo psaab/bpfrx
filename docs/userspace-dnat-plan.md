@@ -39,6 +39,7 @@ type DestinationNATRuleSnapshot struct {
     Name               string `json:"name"`
     FromZone           string `json:"from_zone,omitempty"`
     DestinationAddress string `json:"destination_address"`
+    DestinationPrefix  string `json:"destination_prefix,omitempty"` // #3164: non-host CIDR; empty for a host
     DestinationPort    uint16 `json:"destination_port,omitempty"`
     Protocol           string `json:"protocol,omitempty"`       // "tcp", "udp", or ""
     PoolAddress        string `json:"pool_address"`
@@ -461,5 +462,56 @@ builder would drop, the validator rejects, naming the offending entry. An
 all-valid list still compiles byte-identical and installs every entry (the
 multi-destination behavior above is unchanged). On the tolerant load / peer-sync
 path the rejection is downgraded to a `destination-nat address` warning (#1960
-no-brick), consistent with the all-malformed (#2396(c)) and multi-host-prefix
-(#3029) gates that share this validator.
+no-brick), consistent with the all-malformed (#2396(c)) gate that shares this
+validator. (The multi-host-prefix reject — #3029 — was removed by #3164, which
+implements prefix matching; see §12.)
+
+## 12. Multi-host-prefix destination matching (#3164)
+
+Junos DNAT `match destination-address` accepts a non-host CIDR prefix
+(`198.51.100.0/24`): every host in the block is translated to the rule's pool.
+Before #3164 the builder STRIPPED the `/mask` and emitted only the network base
+as an exact host, and the Rust `DnatTable` keyed on an exact `IpAddr` — so only
+the network address translated and every other host in the block bypassed DNAT
+(silent under-translation). #3029 (PR #3162) closed the fail-open by REJECTING a
+multi-host prefix at commit; #3164 implements the feature and removes that
+reject.
+
+**Scope.** A prefix destination is a many:1 MATCH to the configured pool (the
+same translation the host case uses). Block-mapping semantics — a 1:1
+host-N->host-N offset map between a destination prefix and a pool prefix — are
+the unsettled design fork called out in #3164 and remain OUT OF SCOPE; the pool
+is a single address (range support is the existing pool behavior, unchanged).
+
+**Wire (additive, #1961).** A new `destination_prefix` field on
+`DestinationNATRuleSnapshot` carries the canonical masked CIDR for a non-host
+prefix; `destination_address` keeps the network base. For a host (bare IP, /32,
+/128) `destination_prefix` is empty and the exact `destination_address` path is
+used, byte-identical to pre-#3164. An older helper ignores the new field and
+keys only `destination_address` (the network base) — the pre-#3164 narrowed
+behavior, never a crash. `protocol_wire_v1.json` gains exactly the one
+`destination_prefix: ""` key.
+
+- `dnatDestinationParts` (`nat.go`) is the single host-vs-prefix classifier: a
+  bare IP or a canonical host mask (/32, /128) is a HOST (base = address, prefix
+  = ""); a non-host CIDR is a BLOCK (base = network address, prefix = canonical
+  masked CIDR). It normalizes a non-canonical input (`198.51.100.7/24` ->
+  base `198.51.100.0`, prefix `198.51.100.0/24`). An unparseable token returns
+  `ok == false` and is skipped (fail-closed, same as before).
+- The Rust `DnatTable` keeps the O(1) exact-host `entries` map for hosts and adds
+  a `prefix_entries` map keyed by `(protocol, dst_port)` whose value is a vec of
+  prefix slots. `lookup_with_counter` probes the exact map first (a host is the
+  longest possible prefix, so it always wins), then falls back to a
+  longest-prefix-match scan over `prefix_entries` using the SAME three proto/port
+  tiers (exact proto+port, wildcard port, `PROTO_ANY`). Within a tier the LONGEST
+  matching prefix wins; zone-specific entries beat zone-wildcard entries and the
+  `match source-address` constraint (#2394) is enforced unchanged.
+
+**Local-address registration is bounded.** `destination_ips()` (consumed by
+`forwarding_build` to populate `local_v4`/`local_v6` for proxy-ARP/ND) expands a
+prefix host-by-host only when the block is at or below `MAX_LOCAL_PREFIX_HOSTS`
+(4096 usable hosts — a v4 /20 or longer; a v6 block must be host-scale). A larger
+block registers only its network base and must be ROUTED to the firewall. The
+DNAT MATCH is independent of this set (the pre-routing lookup keys on the packet
+destination directly), so a large block is still translated in full — only
+on-segment proxy-ARP for the whole block is bounded.

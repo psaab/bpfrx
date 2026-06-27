@@ -105,6 +105,18 @@ pub(crate) struct DestinationNATRuleSnapshot {
     pub source_addresses: Vec<String>,
     #[serde(rename = "destination_address", default)]
     pub destination_address: String,
+    /// #3164: a non-host DNAT `match destination-address` prefix
+    /// (`198.51.100.0/24`). ADDITIVE over `destination_address` (#1961): for a
+    /// host destination (bare IP, /32, /128) this is empty and the table keys
+    /// the O(1) exact `destination_address` map (unchanged fast path). For a
+    /// non-host prefix the Go compiler sets this to the canonical masked CIDR
+    /// and puts the prefix network address in `destination_address`; the DNAT
+    /// table installs a longest-prefix-match entry so every host in the block
+    /// is translated to the rule's pool (many:1). An older helper that does not
+    /// know this field ignores it and keys only `destination_address` (the
+    /// network base) — the pre-#3164 narrowed behavior, never a crash.
+    #[serde(rename = "destination_prefix", default)]
+    pub destination_prefix: String,
     #[serde(rename = "destination_port", default)]
     pub destination_port: u16,
     #[serde(default)]

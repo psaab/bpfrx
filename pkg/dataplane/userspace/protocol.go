@@ -508,7 +508,21 @@ type DestinationNATRuleSnapshot struct {
 	// side rather than reverting to match-any.
 	SourceAddresses    []string `json:"source_addresses,omitempty"`
 	DestinationAddress string   `json:"destination_address"`
-	DestinationPort    uint16   `json:"destination_port,omitempty"`
+	// DestinationPrefix carries the DNAT `match destination-address` as a
+	// non-host CIDR prefix (#3164). Junos permits a multi-host prefix (e.g.
+	// 198.51.100.0/24) as a DNAT destination match: every host in the block
+	// matches and is translated to the rule's pool. It is ADDITIVE over
+	// DestinationAddress (#1961 byte-aligned wire evolution): for a host
+	// destination (a bare IP, /32, or /128) this stays empty and the exact
+	// DestinationAddress fast path is used unchanged. For a non-host prefix it
+	// holds the canonical masked CIDR ("198.51.100.0/24") and DestinationAddress
+	// holds that prefix's network address (the base, kept for back-compat with
+	// an older helper — which would then match only the base, the pre-#3164
+	// behavior — and as the local-address registration anchor). The Rust DNAT
+	// table parses this into a prefix entry and matches with longest-prefix
+	// semantics; a host destination still keys the O(1) exact hash map.
+	DestinationPrefix string `json:"destination_prefix,omitempty"`
+	DestinationPort   uint16 `json:"destination_port,omitempty"`
 	// Protocol is the Junos config protocol token the DNAT rule matches:
 	// "tcp", "udp", "icmp", "icmp6"/"icmpv6", "gre", another known name, a
 	// bare 0-255 number, or "" (any). #2396: the Rust DNAT table resolves the

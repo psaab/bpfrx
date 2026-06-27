@@ -22205,3 +22205,26 @@ top.
   TestSessionAggregator_CardinalityCap to the new internals.
   **File(s)**: pkg/logging/aggregator.go, pkg/logging/aggregator_test.go,
   docs/phases.md, docs/feature-gaps.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3164 — implement multi-host-prefix destination-NAT matching
+  (LPM). A DNAT `match destination-address` may now be a non-host CIDR prefix
+  (e.g. 198.51.100.0/24): every host in the block is translated to the rule's
+  pool (many:1). Go builder carries the canonical prefix on a new additive
+  `destination_prefix` wire field (#1961); the Rust `DnatTable` keeps the O(1)
+  exact-host map and adds a `(protocol, dst_port)`-keyed prefix table matched by
+  longest-prefix containment (host always wins; longest prefix wins within a
+  proto/port tier; #2394 source-scope + zone precedence preserved). Removed the
+  #3029 commit-time multi-host-prefix reject (the silent-narrowing it guarded no
+  longer exists). Whole-block proxy-ARP/ND registration is bounded
+  (MAX_LOCAL_PREFIX_HOSTS=4096). Block-mapping (1:1 offset) stays out of scope.
+  Regenerated protocol_wire_v1.json (one additive `destination_prefix: ""` key).
+  **File(s)**: pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/nat_dest_prefix_3164_test.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_dnat_address_test.go,
+  userspace-dp/src/protocol/nat.rs, userspace-dp/src/nat/destination.rs,
+  userspace-dp/src/nat/tests.rs, userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/userspace-dnat-plan.md, docs/feature-coverage.md
