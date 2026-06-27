@@ -11,8 +11,8 @@ import (
 // was only WARNED at commit (compiler_validate_warn.go). At runtime the userspace
 // address resolver (resolveUserspaceAddressBookEntry) returns false for the same
 // name — a dangling member fails the whole set, an empty set never sets
-// resolvedAny — so userspaceSupportsSecurityPolicies returns false and the
-// dataplane REFUSES to arm security policies. The operator got a green commit and
+// resolvedAny — so the built rule carries the __unsupported_address__ sentinel
+// and the dataplane refuses to arm that policy. The operator got a green commit and
 // a silently DISARMED allow/deny path: a commit/apply split, fail-open, and the
 // address-book sibling of #3144/#3146 (the application gate). The fix
 // hard-rejects at commit (strict CompileConfig) and warns on the tolerant load /

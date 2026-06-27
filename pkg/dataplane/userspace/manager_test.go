@@ -3412,9 +3412,6 @@ func TestUserspaceSupportsSimpleZonePolicies(t *testing.T) {
 			Action: config.PolicyPermit,
 		}},
 	}}
-	if !userspaceSupportsSecurityPolicies(cfg) {
-		t.Fatal("userspaceSupportsSecurityPolicies = false, want true")
-	}
 	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 	if snap.DefaultPolicy != "deny" || len(snap.Policies) != 1 || snap.Policies[0].Action != "permit" {
 		t.Fatalf("unexpected policy snapshot: %+v", snap.Policies)
@@ -3453,9 +3450,6 @@ func TestUserspaceSupportsAddressBookPolicyMatches(t *testing.T) {
 			Action: config.PolicyPermit,
 		}},
 	}}
-	if !userspaceSupportsSecurityPolicies(cfg) {
-		t.Fatal("userspaceSupportsSecurityPolicies = false, want true with resolvable address-book entries")
-	}
 	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 	if len(snap.Policies) != 1 {
 		t.Fatalf("len(Policies) = %d, want 1", len(snap.Policies))
@@ -3465,30 +3459,6 @@ func TestUserspaceSupportsAddressBookPolicyMatches(t *testing.T) {
 	}
 	if got := snap.Policies[0].DestinationAddresses; len(got) != 1 || got[0] != "172.16.80.200/32" {
 		t.Fatalf("DestinationAddresses = %+v, want expanded address-set prefix", got)
-	}
-}
-
-func TestUserspaceRejectsUnknownAddressBookPolicyMatches(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.Security.Zones = map[string]*config.ZoneConfig{
-		"lan": {Name: "lan", Interfaces: []string{"reth1"}},
-		"wan": {Name: "wan", Interfaces: []string{"reth0.80"}},
-	}
-	cfg.Security.Policies = []*config.ZonePairPolicies{{
-		FromZone: "lan",
-		ToZone:   "wan",
-		Policies: []*config.Policy{{
-			Name: "allow-missing-address-book",
-			Match: config.PolicyMatch{
-				SourceAddresses:      []string{"missing-src"},
-				DestinationAddresses: []string{"any"},
-				Applications:         []string{"any"},
-			},
-			Action: config.PolicyPermit,
-		}},
-	}}
-	if userspaceSupportsSecurityPolicies(cfg) {
-		t.Fatal("userspaceSupportsSecurityPolicies = true, want false with unresolved address-book entry")
 	}
 }
 
@@ -3518,9 +3488,6 @@ func TestUserspaceSupportsNamedApplicationPolicyMatches(t *testing.T) {
 			Action: config.PolicyPermit,
 		}},
 	}}
-	if !userspaceSupportsSecurityPolicies(cfg) {
-		t.Fatal("userspaceSupportsSecurityPolicies = false, want true with resolvable application-set")
-	}
 	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
 	if len(snap.Policies) != 1 {
 		t.Fatalf("len(Policies) = %d, want 1", len(snap.Policies))
@@ -3531,30 +3498,6 @@ func TestUserspaceSupportsNamedApplicationPolicyMatches(t *testing.T) {
 	}
 	if terms[0].Protocol != "tcp" || terms[0].DestinationPort == "" {
 		t.Fatalf("unexpected first application term: %+v", terms[0])
-	}
-}
-
-func TestUserspaceRejectsUnknownApplicationPolicyMatches(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.Security.Zones = map[string]*config.ZoneConfig{
-		"lan": {Name: "lan", Interfaces: []string{"reth1"}},
-		"wan": {Name: "wan", Interfaces: []string{"reth0.80"}},
-	}
-	cfg.Security.Policies = []*config.ZonePairPolicies{{
-		FromZone: "lan",
-		ToZone:   "wan",
-		Policies: []*config.Policy{{
-			Name: "allow-missing-app",
-			Match: config.PolicyMatch{
-				SourceAddresses:      []string{"any"},
-				DestinationAddresses: []string{"any"},
-				Applications:         []string{"missing-app"},
-			},
-			Action: config.PolicyPermit,
-		}},
-	}}
-	if userspaceSupportsSecurityPolicies(cfg) {
-		t.Fatal("userspaceSupportsSecurityPolicies = true, want false with unresolved application")
 	}
 }
 
@@ -3663,8 +3606,9 @@ func TestUserspaceSupportsGlobalPolicies(t *testing.T) {
 		},
 		Action: config.PolicyPermit,
 	}}
-	if !userspaceSupportsSecurityPolicies(cfg) {
-		t.Fatal("userspaceSupportsSecurityPolicies = false, want true with simple global policies")
+	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if len(snap.Policies) != 1 || snap.Policies[0].Action != "permit" {
+		t.Fatalf("unexpected global-policy snapshot: %+v", snap.Policies)
 	}
 }
 

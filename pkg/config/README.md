@@ -189,8 +189,9 @@ application, user-defined `applications application <name>`, user-defined
 (`compiler_validate_warn.go`). But at runtime the userspace capability gate
 (`resolveUserspaceApplicationNames` in `pkg/dataplane/userspace/capabilities.go`)
 resolves the SAME name set and returns false for an unknown name →
-`expandUserspacePolicyApplications` fails → `userspaceSupportsSecurityPolicies`
-returns false → the dataplane REFUSES to arm security policies. The operator
+`expandUserspacePolicyApplications` fails → the built rule carries the reserved
+`__unsupported__` sentinel term → the dataplane refuses to arm that policy
+(#3261, helper integrity preflight). The operator
 got a green commit and a silently DISARMED policy engine on the firewall's
 primary allow/deny path — a commit/apply split, fail-open.
 `validatePolicyMatchApplicationsStrict` (`compiler_validate_strict.go`)
@@ -229,9 +230,9 @@ address with no configured prefix, was previously only WARNED at commit
 (`resolveUserspaceAddressBookEntry` + `expandUserspacePolicyAddresses` in
 `pkg/dataplane/userspace/capabilities.go`) returns false for the same name — a
 dangling member fails the WHOLE set, an empty set never sets `resolvedAny`, a
-prefix-less address has an empty Value — so `userspacePolicyAddressesSupported`
-returns false → `userspaceSupportsSecurityPolicies` returns false → the
-dataplane REFUSES to arm security policies. The operator got a green commit and a
+prefix-less address has an empty Value — so `expandUserspacePolicyAddresses`
+fails → the built rule carries the `__unsupported_address__` sentinel → the
+dataplane refuses to arm that policy. The operator got a green commit and a
 silently DISARMED allow/deny path — a commit/apply split, fail-open.
 `validatePolicyMatchAddressSetMembersStrict` (`compiler_validate_strict.go`)
 hard-rejects such a reference (zone-pair OR global, source AND destination,

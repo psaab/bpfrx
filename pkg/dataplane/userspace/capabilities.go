@@ -144,45 +144,6 @@ func userspaceSupportsThreeColorPolicers(cfg *config.Config) bool {
 	return true
 }
 
-func userspaceSupportsSecurityPolicies(cfg *config.Config) bool {
-	if cfg == nil {
-		return true
-	}
-	for _, pol := range cfg.Security.GlobalPolicies {
-		if pol == nil {
-			continue
-		}
-		// SchedulerName and Count are informational — not forwarding-critical.
-		// Schedulers define time windows (not DSCP), and counters are advisory.
-		if !userspacePolicyAddressesSupported(cfg, pol.Match.SourceAddresses) ||
-			!userspacePolicyAddressesSupported(cfg, pol.Match.DestinationAddresses) ||
-			!userspacePolicyApplicationsSupported(cfg, pol.Match.Applications) {
-			return false
-		}
-	}
-	for _, zpp := range cfg.Security.Policies {
-		if zpp == nil {
-			continue
-		}
-		for _, pol := range zpp.Policies {
-			if pol == nil {
-				continue
-			}
-			if !userspacePolicyAddressesSupported(cfg, pol.Match.SourceAddresses) ||
-				!userspacePolicyAddressesSupported(cfg, pol.Match.DestinationAddresses) ||
-				!userspacePolicyApplicationsSupported(cfg, pol.Match.Applications) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func userspacePolicyAddressesSupported(cfg *config.Config, addrs []string) bool {
-	_, ok := expandUserspacePolicyAddresses(cfg, addrs)
-	return ok
-}
-
 func expandUserspacePolicyAddresses(cfg *config.Config, addrs []string) ([]string, bool) {
 	if len(addrs) == 0 {
 		return nil, true
@@ -295,11 +256,6 @@ func resolveUserspaceAddressBookEntry(cfg *config.Config, name string) ([]string
 	return expanded, true
 }
 
-func userspacePolicyApplicationsSupported(cfg *config.Config, apps []string) bool {
-	_, ok := expandUserspacePolicyApplications(cfg, apps)
-	return ok
-}
-
 func expandUserspacePolicyApplications(cfg *config.Config, apps []string) ([]PolicyApplicationSnapshot, bool) {
 	if len(apps) == 0 {
 		return nil, true
@@ -324,12 +280,13 @@ func expandUserspacePolicyApplications(cfg *config.Config, apps []string) ([]Pol
 				return nil, false
 			}
 			// #2124: fail closed on any protocol the Rust matcher cannot
-			// represent. Returning ok=false trips the existing
-			// ForwardingSupported=false refuse-to-arm gate
-			// (userspaceSupportsSecurityPolicies). Without this a named
-			// protocol like esp/ah/sctp (accepted at commit, only lowercased
-			// here) reaches the matcher, gets dropped, and the rule collapses
-			// to match-any — permitting ALL traffic for the zone pair.
+			// represent. Returning ok=false makes buildOneRuleSnapshot emit
+			// the reserved __unsupported__ sentinel term so the helper
+			// integrity preflight rejects the whole snapshot (#3261). Without
+			// this a named protocol like esp/ah/sctp (accepted at commit, only
+			// lowercased here) reaches the matcher, gets dropped, and the rule
+			// collapses to match-any — permitting ALL traffic for the zone
+			// pair.
 			num, ok := appid.ProtocolNumber(proto)
 			if !ok {
 				return nil, false
