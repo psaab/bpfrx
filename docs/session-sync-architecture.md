@@ -16,12 +16,15 @@ The current implementation has four distinct pieces:
    changed sessions.
 3. **Userspace deltas** — low-latency event drain from the AF_XDP helper for
    userspace-managed sessions.
-4. **Demotion handoff** — an explicit quiesce / republish / barrier sequence
-   used before graceful failover, so demotion does not race the sync stream.
+4. **Demotion handoff** — before graceful failover the demoting node writes a
+   single ordered peer barrier (`WaitForPeerBarrier`) and waits for the ack, so
+   demotion does not proceed until the peer has processed every delta already
+   queued onto the sync stream.
 
 The older mental model of "bulk once, then background sweep" is incomplete.
-Current failover safety depends on sender-side bulk acknowledgement,
-barrier-based demotion ordering, and filtered userspace delta replication.
+Current failover safety depends on sender-side bulk acknowledgement, the
+continuous lossless userspace event stream (with gap → full-resync, see #2874),
+the demotion peer barrier, and filtered userspace delta replication.
 
 ## Session Representation
 
@@ -62,8 +65,11 @@ That is only one direction of the userspace integration. Locally-created
 userspace sessions do **not** flow back through `SetClusterSyncedSession*`.
 They are exported through:
 
-- background `DrainSessionDeltas(...)`
-- explicit `ExportOwnerRGSessions(...)` during demotion prep
+- the continuous userspace event stream (steady state), or its
+  `DrainSessionDeltas(...)` fallback poll when the stream is down
+- a one-shot `ExportOwnerRGSessions(...)` bulk republish, triggered by an
+  event-stream **FullResync** (a #2874 sequence gap or a #2442 delta-ring
+  overflow) — **not** by the demotion-prep path
 
 ## Wire Protocol
 
@@ -280,14 +286,27 @@ The Rust helper pushes session events over a persistent binary-framed Unix
 socket (`/run/xpf/userspace-dp-events.sock`). Events (SessionOpen,
 SessionClose, SessionUpdate) carry sequence numbers for reliable delivery.
 The daemon reads events, applies ownership filtering, and queues them to the
-peer sync stream. Ack frames flow back for replay buffer management. Pause,
-Resume, and DrainRequest frames support demotion-prep integration.
+peer sync stream. Ack frames flow back for replay buffer management. Pause and
+Resume frames throttle the stream. The DrainRequest / DrainComplete frame pair
+is **reserved and currently dormant** — see below.
 
-#### DrainRequest fence (#2876)
+#### DrainRequest fence (#2876, #2920) — RESERVED / DORMANT
 
-At demotion, `EventStream.SendDrainRequest` fences the drain to the last
-fully-applied sequence (`lastAppliedSeq`, the *target seq*) and blocks for the
-helper's `DrainComplete`. The drain is only reported successful when the
+> **Status: implemented and hardened, but not wired to any production path.**
+> The live graceful-demotion path does **not** call `SendDrainRequest`; it uses
+> `SessionSync.WaitForPeerBarrier` plus the continuous lossless event stream
+> (see "Graceful Demotion" below). The seq-fenced drain is a strictly *weaker*
+> guarantee than the unbounded `ExportOwnerRGSessions` full-resync republish
+> that already backstops loss-of-sync (#2874 gap, #2442 overflow), so it is not
+> on the failover critical path. The pair is retained — fully tested and
+> hardened — for a possible future fenced-drain use; the wire frames
+> (`MSG_DRAIN_REQUEST = 7`, `MSG_DRAIN_COMPLETE = 8`) are kept rather than
+> deleted to avoid an invasive protocol-version churn. The semantics below
+> describe the dormant primitive, **not** a live demotion step.
+
+`EventStream.SendDrainRequest` fences the drain to the last fully-applied
+sequence (`lastAppliedSeq`, the *target seq*) and blocks for the helper's
+`DrainComplete`. The drain is only reported successful when the
 **acked/drained seq has reached the target fence**:
 
 - **Helper side** (`handle_drain_request`, `event_stream/mod.rs`): the drain
@@ -302,8 +321,9 @@ helper's `DrainComplete`. The drain is only reported successful when the
 
 Before #2876 the Go side returned the first `DrainComplete` seq with no fence
 check and the helper emitted `DrainComplete` even on a below-fence timeout, so
-sessions created after the fence were never synced to the peer before it took
-over — silent HA session loss on failover. The fence carries no new wire field
+were this primitive ever wired into demotion, sessions created after the fence
+could be reported drained without reaching the peer. #2876/#2920 hardened the
+primitive so that defect cannot ship if it is wired in future. The fence carries no new wire field
 (the existing `DrainRequest` target seq and `DrainComplete` seq are reused), so
 the protocol is unchanged. Siblings in the same event-stream/drain cluster:
 #2882 (drain ignores the target_seq filter), #2877 (blocking writes), #2883
@@ -332,12 +352,19 @@ These deltas are **not** blindly mirrored. Filtering in
 The filtering fields on `SessionDeltaInfo` are `FabricRedirect` and
 `FabricIngress` (boolean flags), not a single combined field.
 
-### Export During Demotion Prep
+### Bulk Owner-RG Export (FullResync republish)
 
-`ExportOwnerRGSessions(rgIDs, 0)` is used during graceful demotion prep to dump
-all userspace sessions owned by the demoting RGs. This is not the same thing as
-the steady-state delta drain. It is an explicit republish step used to reduce
-handoff loss.
+`ExportOwnerRGSessions(rgIDs, 0)` dumps **all** userspace sessions owned by the
+primary's RGs. The `max = 0` argument means unbounded (`usize::MAX` helper-side)
+— it is an unbounded ground-truth snapshot of the entire conntrack table for the
+owned RGs, not a Max-truncated or delta-replay export, so it cannot silently drop
+post-snapshot sessions.
+
+This is **not** triggered by demotion prep. Its only live caller is
+`handleEventStreamFullResync` → `exportUserspaceOwnerRGSessionsWithConfig`: the
+event stream signals a FullResync after a #2874 sequence gap or a #2442
+delta-ring overflow (loss-of-sync), and the export republishes the full owned set
+from table truth. It is not the same thing as the steady-state delta drain.
 
 **The export ack-wait runs OFF the global `ServerState` lock (#2962).** The
 helper-side control-socket dispatcher (`server/handlers/mod.rs`) holds a single
@@ -542,30 +569,29 @@ When a node becomes primary for an RG:
 
 ### Graceful Demotion
 
-Graceful demotion is now an explicit staged protocol, not just "send a barrier
-and hope the queue is empty".
+Graceful demotion relies on the continuous real-time session sync rather than a
+staged quiesce/republish at demotion time: by the time a node demotes, both
+nodes already hold full session state from the continuous lossless event stream
+(#2874) plus the steady-state bulk-prime. The demotion-prep step therefore does
+exactly one synchronization: a single peer barrier proving the peer has
+processed every delta already queued onto the sync stream.
 
 Current sequence (`prepareUserspaceRGDemotionWithTimeout()`):
 
-1. Acquire demotion prep gate (`acquireUserspaceRGDemotionPrep`) — prevents
+1. Acquire the demotion prep gate (`acquireUserspaceRGDemotionPrep`) — prevents
    duplicate concurrent preps for the same RG. On failure, the gate is released
    via `releaseUserspaceRGDemotionPrep` so retries are not blocked.
-2. Require `syncPeerBulkPrimed` for the current connection
-3. Wait for any previous demotion barriers to be acknowledged
-   (`WaitForPeerBarriersDrained`)
-4. Repeatedly wait for the sync stream to go idle (`WaitForIdle`) and then send
-   a probe barrier (`WaitForPeerBarrier`) until quiescence is proven or the
-   timeout expires
-5. Pause background incremental sweep with `PauseIncrementalSync(...)` — this
-   is a depth-counted pause that only stops the periodic sweep goroutine. GC
-   delete callbacks continue to run and queue delete messages normally.
-6. Export userspace sessions owned by the demoting RGs
-   (`ExportOwnerRGSessions`)
-7. Drain recent userspace deltas while sweep is paused
-8. Send a final ordered barrier and wait for peer acknowledgement
-9. Call helper `PrepareRGDemotion(...)` which marks demoted sessions as synced
-   in the shared session maps
-10. Resume incremental sync
+2. If the sync transport is absent or disconnected, release the gate and return
+   (a reconnect + retry re-runs the barrier check before demotion proceeds).
+3. Bulk-sync readiness (`syncPeerBulkPrimed`) is deliberately **not** required
+   here — planned failover must not depend on bulk-sync state because both nodes
+   already have full session state from continuous real-time sync. The bulk
+   retry loop is advanced (`syncPrimeRetryGen`) so it stops flooding the sync TCP
+   connection and delaying the barrier ack; it is restarted if the barrier fails.
+4. Write a single ordered peer barrier (`WaitForPeerBarrier`) and wait for the
+   ack. The barrier shares the same FIFO `sendCh` as all sync messages, so the
+   ack proves the peer has processed everything queued ahead of it. The actual
+   demotion then happens atomically in `UpdateRGActive(false)`.
 
 Manual failover uses the same demotion-prep path via
 `prepareUserspaceManualFailover()`, but wraps failures as
@@ -579,9 +605,11 @@ admission on retryable errors instead of proceeding unsafely.
 
 `PauseIncrementalSync(reason)` / `ResumeIncrementalSync(reason)` provide a
 depth-counted pause mechanism. Multiple callers can pause independently; the
-sweep only resumes when all callers have resumed. This is used during demotion
-prep to stop the sweep without affecting GC delete callbacks or explicit sync
-producers.
+sweep only resumes when all callers have resumed. The pause stops only the
+periodic sweep goroutine without affecting GC delete callbacks or explicit sync
+producers. (These helpers — along with `WaitForIdle` and
+`WaitForPeerBarriersDrained` — are retained primitives with no current live
+caller; the demotion path uses only the single peer barrier described above.)
 
 ### Bulk-Prime Retry Loop
 
@@ -620,8 +648,9 @@ cannot overtake messages that `sendLoop` has dequeued but not yet written.
 5. Session ownership filtering happens before incremental sync or userspace
    delta replication.
 6. `local_delivery` sessions are helper-local and are not valid HA sync state.
-7. Graceful demotion is ordered against the session-sync stream with explicit
-   quiescence and barriers.
+7. Graceful demotion is ordered against the session-sync stream with a single
+   ordered peer barrier (no separate quiesce/republish step on the demotion
+   path; the seq-fenced DrainRequest/DrainComplete pair is reserved/dormant).
 
 ## Revision History
 
@@ -631,11 +660,21 @@ This document has been corrected through multiple passes:
   demotion protocol, userspace delta filtering.
 - v2 (PR #264): Added two-readiness-signal model, bulk-prime retry loop,
   explicit demotion-prep sequence, userspace delta filtering details.
-- v3 (current): Corrected delta filtering field names (`FabricRedirect` +
+- v3: Corrected delta filtering field names (`FabricRedirect` +
   `FabricIngress`, not a combined field). Clarified that `PauseIncrementalSync`
   only pauses the sweep — GC delete callbacks are never suppressed. Added
   manual failover retry admission logic, depth-counted pause mechanism,
   readiness generation guard, barrier ordering via sendCh.
+- v4 (current, #2930): Corrected demotion-path doc drift. The live graceful
+  demotion path uses only a single `WaitForPeerBarrier` plus the continuous
+  lossless event stream — it does **not** run the old staged
+  quiesce/export/`PrepareRGDemotion` sequence (that helper does not exist, and
+  `WaitForIdle`/`WaitForPeerBarriersDrained`/`PauseIncrementalSync` have no live
+  caller). `ExportOwnerRGSessions(_, 0)` is an unbounded ground-truth republish
+  triggered by event-stream **FullResync** (#2874 gap / #2442 overflow), not by
+  demotion prep. The seq-fenced `DrainRequest`/`DrainComplete` pair (#2876/#2920)
+  is documented as **reserved/dormant** — implemented and hardened but not wired
+  to any production path.
 
 ## Known Limitations
 

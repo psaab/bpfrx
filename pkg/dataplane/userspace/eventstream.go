@@ -193,6 +193,15 @@ func (es *EventStream) SendResume() error {
 // SendDrainRequest sends a DrainRequest frame and blocks until DrainComplete
 // arrives or the context expires. Returns the drain-complete sequence number.
 //
+// RESERVED / DORMANT: this method has no production caller. The live graceful
+// demotion path (Daemon.prepareUserspaceRGDemotionWithTimeout) synchronizes via
+// SessionSync.WaitForPeerBarrier plus the continuous lossless event stream;
+// bulk republish on loss-of-sync uses ExportOwnerRGSessions(rgIDs, 0) (an
+// unbounded ground-truth snapshot) triggered by an event-stream FullResync, not
+// by this seq-fenced drain. The pair is retained — fully tested and hardened by
+// #2876/#2920 — for a possible future fenced-drain use. See
+// docs/session-sync-architecture.md ("DrainRequest fence — RESERVED / DORMANT").
+//
 // The drain is only reported successful when the helper's DrainComplete seq has
 // reached the target fence (the last fully-applied sequence at demotion time).
 // A DrainComplete carrying seq < targetSeq means the helper timed out below the
