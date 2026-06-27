@@ -22380,3 +22380,22 @@ top.
   pkg/grpcapi/server_show_zones_scoped_global_3286_test.go,
   pkg/cli/cli_show_security_scoped_global_3286_test.go,
   docs/junos-cli-reference.md, pkg/api/README.md, pkg/grpcapi/README.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3286 follow-up (Claude-SMR NEEDS-MINOR) — fold in the 4th
+  inventory surface the first pass missed: the Prometheus
+  `xpf_policy_hits_total` collector emitted `from_zone="*"`/`to_zone="*"`
+  for ALL global policies, scoped included. Prometheus is the canonical
+  counter-validation surface the issue's "scoped-global hit counters...
+  ambiguous" concern names directly. metrics_counters.go now uses the
+  policy's Match.FromZone/ToZone for the from_zone/to_zone labels when set
+  (identical conditional to the REST/gRPC/CLI surfaces); unscoped globals
+  keep `*`/`*`. Added a fail-on-revert metrics test (RED when reverted to
+  `*`/`*`). Confirmed no 5th surface: remaining `junos-global`/`*` uses are
+  the group-level PolicyInfo row (correct) and the dataplane
+  snapshot/counter-key computation (by design — tier classification +
+  stable counter IDs, real scope carried out-of-band in MatchFromZone/
+  ToZone and enforced in policy.rs), neither operator-facing display.
+  **File(s)**: pkg/api/metrics_counters.go,
+  pkg/api/metrics_scoped_global_3286_test.go, docs/phases.md,
+  pkg/api/README.md

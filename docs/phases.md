@@ -222,7 +222,9 @@
 - 15 additional REST endpoints for full gRPC parity
 - Session prefix filtering (source/destination CIDR)
 - Expanded Prometheus metrics: session breakdowns (IPv4/IPv6, SNAT/DNAT), NAT pool usage, DHCP lease counts
-- Per-policy hit counters (`xpf_policy_hits_total` with zone/rule labels)
+- Per-policy hit counters (`xpf_policy_hits_total` with zone/rule labels;
+  a scoped global policy (#3148/#3286) reports its `from-zone`/`to-zone` on
+  the `from_zone`/`to_zone` labels, an unscoped global keeps `*`/`*`)
 - Config management endpoints: load override/merge via REST
 
 ## Phase 48: VRRP State Detection & Load Commands (`6a07fb5`–`9745c61`)
