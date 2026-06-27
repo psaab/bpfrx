@@ -167,6 +167,10 @@ func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32
 				Name:                             rule.Name,
 				FromZone:                         rs.FromZone,
 				ToZone:                           rs.ToZone,
+				FromInterface:                    rs.FromInterface,
+				ToInterface:                      rs.ToInterface,
+				FromRoutingInstance:              rs.FromRoutingInstance,
+				ToRoutingInstance:                rs.ToRoutingInstance,
 				SourceAddresses:                  sourceAddrs,
 				DestinationAddresses:             destAddrs,
 				InterfaceMode:                    rule.Then.Interface,
@@ -235,6 +239,8 @@ func buildStaticNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32
 			out = append(out, StaticNATRuleSnapshot{
 				Name:                 rule.Name,
 				FromZone:             rs.FromZone,
+				FromInterface:        rs.FromInterface,
+				FromRoutingInstance:  rs.FromRoutingInstance,
 				ExternalIP:           rule.Match,
 				InternalIP:           rule.Then,
 				MatchDestinationPort: clampPort(rule.MatchDestinationPort),
@@ -477,16 +483,18 @@ func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]u
 							continue
 						}
 						out = append(out, DestinationNATRuleSnapshot{
-							Name:               rule.Name,
-							FromZone:           rs.FromZone,
-							SourceAddresses:    sourceAddrs,
-							DestinationAddress: base,
-							DestinationPrefix:  prefix,
-							DestinationPort:    dstPort,
-							Protocol:           proto,
-							PoolAddress:        poolAddr,
-							PoolPort:           poolPort,
-							CounterID:          ruleCounterID,
+							Name:                rule.Name,
+							FromZone:            rs.FromZone,
+							FromInterface:       rs.FromInterface,
+							FromRoutingInstance: rs.FromRoutingInstance,
+							SourceAddresses:     sourceAddrs,
+							DestinationAddress:  base,
+							DestinationPrefix:   prefix,
+							DestinationPort:     dstPort,
+							Protocol:            proto,
+							PoolAddress:         poolAddr,
+							PoolPort:            poolPort,
+							CounterID:           ruleCounterID,
 						})
 					}
 				}

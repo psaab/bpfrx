@@ -22228,3 +22228,54 @@ top.
   userspace-dp/src/nat/tests.rs, userspace-dp/src/afxdp/tests.rs,
   userspace-dp/tests/fixtures/protocol_wire_v1.json,
   docs/userspace-dnat-plan.md, docs/feature-coverage.md
+
+- **Timestamp**: 2026-06-26
+  **Action**: #3096 — implement interface- and routing-instance-scoped NAT
+  rule-set matching (full enforcement; lifts the #3079/#3095 interim reject).
+  Junos NAT rule-sets scope `from`/`to` traffic by `zone | interface |
+  routing-instance`; xpf previously enforced only `zone` and #3095 rejected the
+  other two at commit. Now the scope is captured, typed, plumbed, and enforced
+  per-flow. (1) Compiler: `parseZoneList` generalized into
+  `parseNATMatchScopes`/`collectNATScopes` capturing all three scope kinds in
+  both AST shapes; from/to scope lists Cartesian-expand into one rule-set per
+  pair (`applyNAT{From,To}Scope`/`applyStaticNATFromScope`). (2) Typed model:
+  `NATRuleSet` gains From/To Interface + RoutingInstance, `StaticNATRuleSet`
+  gains From Interface + RoutingInstance. (3) Snapshot: 4/2/2 additive
+  string wire fields on Source/Static/Destination NAT snapshots (Go + Rust),
+  protocol_wire_v1.json regenerated (8 keys). (4) Dataplane match: new
+  `NatScopeCtx` (ingress/egress ifname + RI) resolved from
+  `ifindex_to_config_name` + new `ifindex_to_routing_instance` map;
+  `SourceNatRule::matches` AND-s the scope; DNAT (`destination.rs`) and static
+  NAT (`static_nat.rs`) gain `*_scoped` variants gating on ingress (DNAT) /
+  egress (static reverse SNAT) identity; production poll_descriptor +
+  nat_exception wire `meta.ingress_ifindex` through. (5) Lifted the
+  `validateNATRuleSetScopeAST` gate + `lenientNATRuleSetScope` opt (deleted
+  compiler_nat_scope.go); declared interface/routing-instance under NAT
+  rule-set from/to in schema_security.go. Flipped the #3079 reject tests to
+  commit-and-capture. Added Rust per-flow match/no-match tests (source iface/RI,
+  to-iface, zone-no-regression, static DNAT+SNAT iface, DNAT iface+RI) and Go
+  snapshot-scope tests. Fail-on-revert verified: removing the SourceNatRule
+  scope gate turns the 3 source-scope tests RED. Cross-rule-set context
+  precedence and NPTv6 from-scope remain unimplemented (documented, pre-existing
+  for NPTv6). Full cargo test green (3183+ pass, 0 fail); go test
+  ./pkg/config/ ./pkg/dataplane/... green.
+  **File(s)**: pkg/config/compiler_nat.go, pkg/config/types_security.go,
+  pkg/config/schema_security.go, pkg/config/compiler.go,
+  pkg/config/compiler_nat_scope.go (deleted),
+  pkg/config/compiler_nat_scope_3079_test.go,
+  pkg/config/compiler_policy_match.go, pkg/config/compiler_ipsec_bindiface.go,
+  pkg/config/README.md, pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/nat_scope_3096_test.go,
+  userspace-dp/src/protocol/nat.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat/destination.rs,
+  userspace-dp/src/nat/static_nat.rs, userspace-dp/src/nat/tests.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json

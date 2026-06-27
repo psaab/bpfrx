@@ -31,6 +31,21 @@ mod status;
 #[path = "tests.rs"]
 mod tests;
 
+/// #3096: per-flow interface / routing-instance identity passed into the NAT
+/// match path so an interface- or routing-instance-scoped rule-set matches
+/// only its named traffic. The forwarding layer resolves each ifindex to its
+/// config name and routing-instance (VRF) before matching; the strings are
+/// borrowed for the duration of the lookup (no per-flow allocation). All
+/// fields default to "" (the unscoped / default-VRF case), so a zone-only or
+/// global rule-set is unaffected.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NatScopeCtx<'a> {
+    pub(crate) ingress_ifname: &'a str,
+    pub(crate) egress_ifname: &'a str,
+    pub(crate) ingress_routing_instance: &'a str,
+    pub(crate) egress_routing_instance: &'a str,
+}
+
 pub(crate) use allocator::{PortAllocator, PortAllocatorSnapshot};
 pub(crate) use destination::{DnatKey, DnatTable, DnatValue};
 pub(crate) use source::{

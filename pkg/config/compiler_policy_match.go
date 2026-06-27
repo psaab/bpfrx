@@ -45,8 +45,7 @@ import "fmt"
 //   - SchemaValidate is opt-in per known leaf and returns nil for unknown
 //     keywords by design (schema_walk.go), so it cannot REJECT
 //     `match dynamic-application ...`. Every other reject-at-commit-for-
-//     unsupported gate (validateNATRuleSetScopeAST,
-//     validateSecureTunnelBindInterfaceAST,
+//     unsupported gate (validateSecureTunnelBindInterfaceAST,
 //     validateUnsupportedInterfaceStanzasAST) is likewise an AST pre-walk
 //     in compileExpanded. The walk runs on the group-expanded,
 //     inactive-pruned tree, so an apply-groups-inherited match leaf is
@@ -65,7 +64,7 @@ import "fmt"
 // BOOTS (#1960 fail-closed-on-load class). The leaf is NOT removed from
 // the tree; it stays dropped by the compiler exactly as before this gate
 // (the pre-existing behaviour), now flagged. Same doctrine as
-// validateNATRuleSetScopeAST's no-prune lenient handling.
+// validateUnsupportedInterfaceStanzasAST's no-prune lenient handling.
 
 // supportedPolicyMatchLeaves is the EXACT set of `match` leaves the policy
 // compiler (compilePolicy in compiler_security.go) enforces. Anything in a

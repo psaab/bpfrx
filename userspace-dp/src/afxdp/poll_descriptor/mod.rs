@@ -918,22 +918,42 @@ pub(super) fn poll_binding_process_descriptor(
                                     .map(|s| s.as_str())
                             })
                             .unwrap_or("");
+                        // #3096: ingress interface config-name + routing-instance
+                        // for the DNAT `from interface` / `from routing-instance`
+                        // scope. DNAT translates on inbound, so only the ingress
+                        // identity matters here. Empty = unscoped (pre-#3096).
+                        let ingress_ifname_dnat: &str = worker_ctx
+                            .forwarding
+                            .ifindex_to_config_name
+                            .get(&(meta.ingress_ifindex as i32))
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+                        let ingress_ri_dnat: &str = worker_ctx
+                            .forwarding
+                            .ifindex_to_routing_instance
+                            .get(&(meta.ingress_ifindex as i32))
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
                         let dnat_decision = if !worker_ctx.forwarding.dnat_table.is_empty() {
-                            worker_ctx.forwarding.dnat_table.lookup_with_counter(
+                            worker_ctx.forwarding.dnat_table.lookup_with_counter_scoped(
                                 meta.protocol,
                                 flow.forward_key.src_ip,
                                 resolution_target,
                                 flow.forward_key.dst_port,
                                 ingress_zone_name,
+                                ingress_ifname_dnat,
+                                ingress_ri_dnat,
                             )
                         } else {
                             None
                         };
                         let static_dnat_decision = if dnat_decision.is_none() {
-                            worker_ctx.forwarding.static_nat.match_dnat_with_counter(
+                            worker_ctx.forwarding.static_nat.match_dnat_with_counter_scoped(
                                 resolution_target,
                                 flow.forward_key.dst_port,
                                 ingress_zone_name,
+                                ingress_ifname_dnat,
+                                ingress_ri_dnat,
                             )
                         } else {
                             None
@@ -1966,6 +1986,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         let mut snat_match_counter = None;
                                         match source_nat_decision_for_flow(
                                             worker_ctx.forwarding,
+                                            meta.ingress_ifindex as i32,
                                             &from_zone,
                                             &to_zone,
                                             decision.resolution.egress_ifindex,
@@ -3704,6 +3725,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         let mut snat_match_counter = None;
                                         match source_nat_decision_for_flow(
                                             worker_ctx.forwarding,
+                                            meta.ingress_ifindex as i32,
                                             &from_zone,
                                             &to_zone,
                                             pending_decision.resolution.egress_ifindex,

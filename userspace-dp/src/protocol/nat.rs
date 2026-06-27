@@ -20,6 +20,21 @@ pub(crate) struct SourceNATRuleSnapshot {
     pub from_zone: String,
     #[serde(rename = "to_zone", default)]
     pub to_zone: String,
+    /// #3096: interface-/routing-instance-scoped rule-set matching. A
+    /// non-empty value restricts the rule to flows ingressing/egressing the
+    /// named logical interface (config name) or in the named
+    /// ingress/egress routing instance (VRF). Empty = unscoped on that axis
+    /// (pre-#3096 behavior). The match path AND-s every non-empty scope.
+    /// Additive wire fields (#1961): an older control plane omits them; this
+    /// helper defaults them to empty (zone-only scope).
+    #[serde(rename = "from_interface", default)]
+    pub from_interface: String,
+    #[serde(rename = "to_interface", default)]
+    pub to_interface: String,
+    #[serde(rename = "from_routing_instance", default)]
+    pub from_routing_instance: String,
+    #[serde(rename = "to_routing_instance", default)]
+    pub to_routing_instance: String,
     #[serde(rename = "source_addresses", default)]
     pub source_addresses: Vec<String>,
     #[serde(rename = "destination_addresses", default)]
@@ -64,6 +79,14 @@ pub(crate) struct StaticNATRuleSnapshot {
     pub counter_id: u32,
     #[serde(rename = "from_zone", default)]
     pub from_zone: String,
+    /// #3096: interface-/routing-instance-scoped static NAT. Enforced on the
+    /// inbound (DNAT) direction against the ingress interface/VRF and on the
+    /// reverse (SNAT) direction against the egress interface/VRF. Empty =
+    /// unscoped on that axis. Additive wire fields (#1961).
+    #[serde(rename = "from_interface", default)]
+    pub from_interface: String,
+    #[serde(rename = "from_routing_instance", default)]
+    pub from_routing_instance: String,
     #[serde(rename = "external_ip", default)]
     pub external_ip: String,
     #[serde(rename = "internal_ip", default)]
@@ -90,6 +113,13 @@ pub(crate) struct DestinationNATRuleSnapshot {
     pub counter_id: u32,
     #[serde(rename = "from_zone", default)]
     pub from_zone: String,
+    /// #3096: interface-/routing-instance-scoped DNAT, enforced against the
+    /// INGRESS interface/VRF (DNAT translates the destination on inbound).
+    /// Empty = unscoped on that axis. Additive wire fields (#1961).
+    #[serde(rename = "from_interface", default)]
+    pub from_interface: String,
+    #[serde(rename = "from_routing_instance", default)]
+    pub from_routing_instance: String,
     /// #2394: the DNAT rule's `match source-address` constraint. Junos DNAT
     /// `source-address` restricts which source IPs the destination translation
     /// applies to; before #2394 the Go snapshot dropped it, so the helper built

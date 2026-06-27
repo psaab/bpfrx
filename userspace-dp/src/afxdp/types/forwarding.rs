@@ -61,6 +61,12 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) neighbors: FastMap<(i32, IpAddr), NeighborEntry>,
     pub(in crate::afxdp) ifindex_to_name: FastMap<i32, String>,
     pub(in crate::afxdp) ifindex_to_config_name: FastMap<i32, String>,
+    /// #3096: ifindex → routing-instance (VRF) name. Built at config-commit
+    /// from each interface snapshot's `routing_instance` ("" = the default
+    /// instance). Used by the NAT match path to enforce a
+    /// `from`/`to routing-instance` scope against the flow's ingress/egress
+    /// interface VRF. An ifindex absent here resolves to "" (default).
+    pub(in crate::afxdp) ifindex_to_routing_instance: FastMap<i32, String>,
     /// #921: ifindex → zone ID (was `FastMap<i32, String>`). Built
     /// at config-commit time from the snapshot's per-interface
     /// zone NAME via the `zone_name_to_id` lookup. Hot-path callers

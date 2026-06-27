@@ -109,17 +109,52 @@ pub(super) fn resolve_forwarding(
     lookup_forwarding_resolution_with_dynamic(state, dynamic_neighbors, dst)
 }
 
+/// #3096: resolve the (ingress, egress) ifindex pair to the interface /
+/// routing-instance identity the NAT scope match needs. Borrows the
+/// forwarding maps for the lifetime of the match — no per-flow allocation. An
+/// ifindex absent from a map yields "" (unscoped / default VRF), so a
+/// zone-only or global rule-set is unaffected.
+pub(super) fn nat_scope_ctx_for_flow(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    egress_ifindex: i32,
+) -> crate::nat::NatScopeCtx<'_> {
+    let name = |ifindex: i32| -> &str {
+        forwarding
+            .ifindex_to_config_name
+            .get(&ifindex)
+            .map(String::as_str)
+            .unwrap_or("")
+    };
+    let ri = |ifindex: i32| -> &str {
+        forwarding
+            .ifindex_to_routing_instance
+            .get(&ifindex)
+            .map(String::as_str)
+            .unwrap_or("")
+    };
+    crate::nat::NatScopeCtx {
+        ingress_ifname: name(ingress_ifindex),
+        egress_ifname: name(egress_ifindex),
+        ingress_routing_instance: ri(ingress_ifindex),
+        egress_routing_instance: ri(egress_ifindex),
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn match_source_nat_for_flow(
     forwarding: &ForwardingState,
+    ingress_ifindex: i32,
     from_zone: &str,
     to_zone: &str,
     egress_ifindex: i32,
     flow: &SessionFlow,
 ) -> Option<NatDecision> {
     let egress = forwarding.egress.get(&egress_ifindex)?;
+    let scope = nat_scope_ctx_for_flow(forwarding, ingress_ifindex, egress_ifindex);
     match_source_nat(
         &forwarding.source_nat_rules,
+        &scope,
         from_zone,
         to_zone,
         flow.src_ip,
@@ -130,8 +165,10 @@ pub(super) fn match_source_nat_for_flow(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn match_source_nat_for_flow_result(
     forwarding: &ForwardingState,
+    ingress_ifindex: i32,
     from_zone: &str,
     to_zone: &str,
     egress_ifindex: i32,
@@ -140,6 +177,7 @@ pub(super) fn match_source_nat_for_flow_result(
     let mut counter = None;
     match_source_nat_for_flow_result_at(
         forwarding,
+        ingress_ifindex,
         from_zone,
         to_zone,
         egress_ifindex,
@@ -153,6 +191,7 @@ pub(super) fn match_source_nat_for_flow_result(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn match_source_nat_for_flow_result_at(
     forwarding: &ForwardingState,
+    ingress_ifindex: i32,
     from_zone: &str,
     to_zone: &str,
     egress_ifindex: i32,
@@ -166,8 +205,11 @@ pub(super) fn match_source_nat_for_flow_result_at(
     let Some(egress) = forwarding.egress.get(&egress_ifindex) else {
         return SourceNatLookup::NoMatch;
     };
+    // #3096: resolve the interface / routing-instance scope for this flow.
+    let scope = nat_scope_ctx_for_flow(forwarding, ingress_ifindex, egress_ifindex);
     crate::nat::match_source_nat_result_for_tuple(
         &forwarding.source_nat_rules,
+        &scope,
         from_zone,
         to_zone,
         flow.src_ip,

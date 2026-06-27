@@ -39,7 +39,7 @@ import (
 //
 // An unambiguous map (st0.0 + st0.1, or st0 + st1) commits cleanly.
 //
-// This is an AST pre-walk (like validateNATRuleSetScopeAST / the other
+// This is an AST pre-walk (like validateUnsupportedInterfaceStanzasAST / the other
 // reject-at-commit gates) rather than a typed-Config validator so it runs on
 // the group-expanded, inactive-pruned tree in compileExpanded: an
 // apply-groups-inherited bind-interface is covered and an `inactive:` VPN is

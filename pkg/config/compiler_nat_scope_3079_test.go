@@ -5,11 +5,13 @@ import (
 	"testing"
 )
 
-// Tests for #3079: a NAT rule-set whose `from`/`to` clause scopes traffic
-// by `interface` or `routing-instance` (instead of the only enforced
-// `zone`) had its scope silently discarded and applied globally. The
-// interim fix REJECTS those scopes at commit (strict CompileConfig) and
-// WARNS on the tolerant load/peer-sync path (CompileConfigLenient).
+// Tests for #3079 / #3096: a NAT rule-set whose `from`/`to` clause scopes
+// traffic by `interface` or `routing-instance` (in addition to the already-
+// enforced `zone`). #3079 used to SILENTLY discard the scope and widen the
+// rule-set to match-any; #3095 made that an interim reject-at-commit; #3096
+// now CAPTURES the scope on the typed config and ENFORCES it in the dataplane
+// match path, so the rule-set commits cleanly and the scope survives onto the
+// typed NATRuleSet / StaticNATRuleSet.
 //
 // Flat-set syntax MUST be built with ParseSetCommand/SetPath, never
 // NewParser (the parser merges newline-separated set lines into one giant
@@ -26,78 +28,153 @@ func buildNATScopeTree(t *testing.T, cmds ...string) *ConfigTree {
 	return tree
 }
 
-// TestNATRuleSetScopeRejectedAtCommit proves that an interface- or
-// routing-instance-scoped from/to clause is hard-rejected at commit for
-// source, destination, AND static NAT, in both the `from` and `to`
-// directions. Reverting validateNATRuleSetScopeAST to `return nil, nil`
-// turns every one of these cases GREEN (no error) and so RED.
-func TestNATRuleSetScopeRejectedAtCommit(t *testing.T) {
-	cases := []struct {
-		name string
-		cmd  string
-		want string // substring expected in the commit error
-	}{
-		{
-			name: "source from interface",
-			cmd:  "set security nat source rule-set RS from interface ge-0/0/0.0",
-			want: `security nat source rule-set "RS" from interface "ge-0/0/0.0"`,
-		},
-		{
-			name: "source from routing-instance",
-			cmd:  "set security nat source rule-set RS from routing-instance blue",
-			want: `security nat source rule-set "RS" from routing-instance "blue"`,
-		},
-		{
-			name: "source to interface",
-			cmd:  "set security nat source rule-set RS to interface ge-0/0/1.0",
-			want: `security nat source rule-set "RS" to interface "ge-0/0/1.0"`,
-		},
-		{
-			name: "source to routing-instance",
-			cmd:  "set security nat source rule-set RS to routing-instance red",
-			want: `security nat source rule-set "RS" to routing-instance "red"`,
-		},
-		{
-			name: "destination from interface",
-			cmd:  "set security nat destination rule-set RD from interface ge-0/0/0.0",
-			want: `security nat destination rule-set "RD" from interface "ge-0/0/0.0"`,
-		},
-		{
-			name: "destination from routing-instance",
-			cmd:  "set security nat destination rule-set RD from routing-instance blue",
-			want: `security nat destination rule-set "RD" from routing-instance "blue"`,
-		},
-		{
-			name: "static from interface",
-			cmd:  "set security nat static rule-set RT from interface ge-0/0/0.0",
-			want: `security nat static rule-set "RT" from interface "ge-0/0/0.0"`,
-		},
-		{
-			name: "static from routing-instance",
-			cmd:  "set security nat static rule-set RT from routing-instance blue",
-			want: `security nat static rule-set "RT" from routing-instance "blue"`,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			tree := buildNATScopeTree(t, tc.cmd)
-			_, err := CompileConfig(tree)
-			if err == nil {
-				t.Fatalf("CompileConfig accepted unsupported NAT scope %q; want commit rejection (#3079)", tc.cmd)
-			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("CompileConfig error = %q, want substring %q", err.Error(), tc.want)
-			}
-			if !strings.Contains(err.Error(), "#3079") {
-				t.Fatalf("CompileConfig error = %q, want #3079 reference", err.Error())
-			}
-		})
-	}
+// TestNATRuleSetScopeCommitsAndIsCaptured proves the #3095 interim reject is
+// LIFTED (#3096): an interface- or routing-instance-scoped from/to clause now
+// COMMITS for source, destination, AND static NAT, and the scope is captured
+// on the typed config instead of being discarded. Reverting the compiler
+// scope capture (collectNATScopes/applyNAT*Scope) so the scope is dropped
+// turns the field assertions RED.
+func TestNATRuleSetScopeCommitsAndIsCaptured(t *testing.T) {
+	t.Run("source from interface", func(t *testing.T) {
+		tree := buildNATScopeTree(t,
+			"set security nat source rule-set RS from interface ge-0/0/0.0",
+			"set security nat source rule-set RS rule R1 then source-nat interface",
+		)
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig rejected interface-scoped source NAT: %v", err)
+		}
+		if len(cfg.Security.NAT.Source) != 1 {
+			t.Fatalf("got %d source rule-sets, want 1", len(cfg.Security.NAT.Source))
+		}
+		rs := cfg.Security.NAT.Source[0]
+		if rs.FromInterface != "ge-0/0/0.0" {
+			t.Fatalf("FromInterface = %q, want ge-0/0/0.0", rs.FromInterface)
+		}
+		if rs.FromZone != "" {
+			t.Fatalf("FromZone = %q, want empty (interface-scoped)", rs.FromZone)
+		}
+	})
+
+	t.Run("source from routing-instance", func(t *testing.T) {
+		tree := buildNATScopeTree(t,
+			"set security nat source rule-set RS from routing-instance blue",
+			"set security nat source rule-set RS rule R1 then source-nat interface",
+		)
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig rejected RI-scoped source NAT: %v", err)
+		}
+		rs := cfg.Security.NAT.Source[0]
+		if rs.FromRoutingInstance != "blue" {
+			t.Fatalf("FromRoutingInstance = %q, want blue", rs.FromRoutingInstance)
+		}
+	})
+
+	t.Run("source to interface", func(t *testing.T) {
+		tree := buildNATScopeTree(t,
+			"set security nat source rule-set RS to interface ge-0/0/1.0",
+			"set security nat source rule-set RS rule R1 then source-nat interface",
+		)
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig rejected to-interface source NAT: %v", err)
+		}
+		rs := cfg.Security.NAT.Source[0]
+		if rs.ToInterface != "ge-0/0/1.0" {
+			t.Fatalf("ToInterface = %q, want ge-0/0/1.0", rs.ToInterface)
+		}
+	})
+
+	t.Run("source to routing-instance", func(t *testing.T) {
+		tree := buildNATScopeTree(t,
+			"set security nat source rule-set RS to routing-instance red",
+			"set security nat source rule-set RS rule R1 then source-nat interface",
+		)
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig rejected to-RI source NAT: %v", err)
+		}
+		rs := cfg.Security.NAT.Source[0]
+		if rs.ToRoutingInstance != "red" {
+			t.Fatalf("ToRoutingInstance = %q, want red", rs.ToRoutingInstance)
+		}
+	})
+
+	t.Run("destination from interface", func(t *testing.T) {
+		tree := buildNATScopeTree(t,
+			"set security nat destination rule-set RD from interface ge-0/0/0.0",
+			"set security nat destination rule-set RD rule R1 match destination-address 198.51.100.5/32",
+			"set security nat destination rule-set RD rule R1 then destination-nat pool P1",
+		)
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig rejected interface-scoped destination NAT: %v", err)
+		}
+		if cfg.Security.NAT.Destination == nil || len(cfg.Security.NAT.Destination.RuleSets) != 1 {
+			t.Fatalf("destination rule-sets not compiled")
+		}
+		rs := cfg.Security.NAT.Destination.RuleSets[0]
+		if rs.FromInterface != "ge-0/0/0.0" {
+			t.Fatalf("FromInterface = %q, want ge-0/0/0.0", rs.FromInterface)
+		}
+	})
+
+	t.Run("destination from routing-instance", func(t *testing.T) {
+		tree := buildNATScopeTree(t,
+			"set security nat destination rule-set RD from routing-instance blue",
+			"set security nat destination rule-set RD rule R1 match destination-address 198.51.100.5/32",
+			"set security nat destination rule-set RD rule R1 then destination-nat pool P1",
+		)
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig rejected RI-scoped destination NAT: %v", err)
+		}
+		rs := cfg.Security.NAT.Destination.RuleSets[0]
+		if rs.FromRoutingInstance != "blue" {
+			t.Fatalf("FromRoutingInstance = %q, want blue", rs.FromRoutingInstance)
+		}
+	})
+
+	t.Run("static from interface", func(t *testing.T) {
+		tree := buildNATScopeTree(t,
+			"set security nat static rule-set RT from interface ge-0/0/0.0",
+			"set security nat static rule-set RT rule R1 match destination-address 198.51.100.5/32",
+			"set security nat static rule-set RT rule R1 then static-nat prefix 10.0.0.5/32",
+		)
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig rejected interface-scoped static NAT: %v", err)
+		}
+		if len(cfg.Security.NAT.Static) != 1 {
+			t.Fatalf("got %d static rule-sets, want 1", len(cfg.Security.NAT.Static))
+		}
+		rs := cfg.Security.NAT.Static[0]
+		if rs.FromInterface != "ge-0/0/0.0" {
+			t.Fatalf("FromInterface = %q, want ge-0/0/0.0", rs.FromInterface)
+		}
+	})
+
+	t.Run("static from routing-instance", func(t *testing.T) {
+		tree := buildNATScopeTree(t,
+			"set security nat static rule-set RT from routing-instance blue",
+			"set security nat static rule-set RT rule R1 match destination-address 198.51.100.5/32",
+			"set security nat static rule-set RT rule R1 then static-nat prefix 10.0.0.5/32",
+		)
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig rejected RI-scoped static NAT: %v", err)
+		}
+		rs := cfg.Security.NAT.Static[0]
+		if rs.FromRoutingInstance != "blue" {
+			t.Fatalf("FromRoutingInstance = %q, want blue", rs.FromRoutingInstance)
+		}
+	})
 }
 
-// TestNATRuleSetZoneScopeStillCommits proves the supported `from zone` /
-// `to zone` scope, and a rule-set with NO from/to clause (the legitimate
-// global case), still commit cleanly.
+// TestNATRuleSetZoneScopeStillCommits proves the `from zone` / `to zone`
+// scope, and a rule-set with NO from/to clause (the legitimate global case),
+// still commit cleanly and populate the zone fields (no regression).
 func TestNATRuleSetZoneScopeStillCommits(t *testing.T) {
 	t.Run("from/to zone", func(t *testing.T) {
 		tree := buildNATScopeTree(t,
@@ -105,41 +182,53 @@ func TestNATRuleSetZoneScopeStillCommits(t *testing.T) {
 			"set security nat source rule-set RS to zone untrust",
 			"set security nat source rule-set RS rule R1 then source-nat interface",
 		)
-		if _, err := CompileConfig(tree); err != nil {
+		cfg, err := CompileConfig(tree)
+		if err != nil {
 			t.Fatalf("CompileConfig rejected a zone-scoped NAT rule-set: %v", err)
+		}
+		rs := cfg.Security.NAT.Source[0]
+		if rs.FromZone != "trust" || rs.ToZone != "untrust" {
+			t.Fatalf("zone scope = (%q,%q), want (trust,untrust)", rs.FromZone, rs.ToZone)
+		}
+		if rs.FromInterface != "" || rs.ToInterface != "" || rs.FromRoutingInstance != "" || rs.ToRoutingInstance != "" {
+			t.Fatalf("zone-scoped rule-set leaked interface/RI scope: %+v", rs)
 		}
 	})
 	t.Run("global (no from/to)", func(t *testing.T) {
 		tree := buildNATScopeTree(t,
 			"set security nat source rule-set RS rule R1 then source-nat interface",
 		)
-		if _, err := CompileConfig(tree); err != nil {
+		cfg, err := CompileConfig(tree)
+		if err != nil {
 			t.Fatalf("CompileConfig rejected a global (no from/to) NAT rule-set: %v", err)
+		}
+		rs := cfg.Security.NAT.Source[0]
+		if rs.FromZone != "" || rs.ToZone != "" || rs.FromInterface != "" || rs.ToInterface != "" {
+			t.Fatalf("global rule-set carried a scope: %+v", rs)
 		}
 	})
 }
 
-// TestNATRuleSetScopeLenientWarns proves the tolerant load/peer-sync path
-// (CompileConfigLenient) does NOT fail on an unsupported scope — it
-// compiles and records a warning so an already-persisted config still
-// boots (#1960 fail-closed-on-load).
-func TestNATRuleSetScopeLenientWarns(t *testing.T) {
+// TestNATRuleSetScopeLenientCommits proves the tolerant load/peer-sync path
+// (CompileConfigLenient) also accepts and captures an interface/RI scope —
+// the #3079 reject/warn is gone (#3096), the scope is enforced now.
+func TestNATRuleSetScopeLenientCommits(t *testing.T) {
 	tree := buildNATScopeTree(t,
 		"set security nat source rule-set RS from interface ge-0/0/0.0",
 		"set security nat source rule-set RS rule R1 then source-nat interface",
 	)
 	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatalf("CompileConfigLenient hard-failed on unsupported NAT scope; want warn-and-boot: %v", err)
+		t.Fatalf("CompileConfigLenient hard-failed on interface-scoped NAT: %v", err)
 	}
-	found := false
+	rs := cfg.Security.NAT.Source[0]
+	if rs.FromInterface != "ge-0/0/0.0" {
+		t.Fatalf("FromInterface = %q, want ge-0/0/0.0", rs.FromInterface)
+	}
+	// The #3079 reject is lifted: no scope-rejection warning should be emitted.
 	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "#3079") && strings.Contains(w, "interface") {
-			found = true
-			break
+		if strings.Contains(w, "#3079") {
+			t.Fatalf("unexpected #3079 scope warning after enforcement landed: %q", w)
 		}
-	}
-	if !found {
-		t.Fatalf("CompileConfigLenient warnings = %v, want a #3079 NAT scope warning", cfg.Warnings)
 	}
 }

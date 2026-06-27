@@ -433,9 +433,23 @@ type TunnelWgPeerWire struct {
 }
 
 type SourceNATRuleSnapshot struct {
-	Name                             string   `json:"name"`
-	FromZone                         string   `json:"from_zone,omitempty"`
-	ToZone                           string   `json:"to_zone,omitempty"`
+	Name     string `json:"name"`
+	FromZone string `json:"from_zone,omitempty"`
+	ToZone   string `json:"to_zone,omitempty"`
+	// #3096: interface- and routing-instance-scoped rule-set matching.
+	// FromInterface/ToInterface restrict the rule to traffic
+	// ingressing/egressing the named logical interface (config name);
+	// FromRoutingInstance/ToRoutingInstance restrict it to the named
+	// ingress/egress routing instance (VRF). "" = unscoped on that axis (the
+	// pre-#3096 behavior). Additive wire fields: an old Rust helper without
+	// them treats every rule as zone-only-scoped (the pre-#3096 silent global
+	// widening); an old Go binary omits them (omitempty). The Rust match path
+	// AND-s every non-empty scope: a rule fires only when the flow's
+	// ingress/egress interface and routing instance match every set field.
+	FromInterface                    string   `json:"from_interface,omitempty"`
+	ToInterface                      string   `json:"to_interface,omitempty"`
+	FromRoutingInstance              string   `json:"from_routing_instance,omitempty"`
+	ToRoutingInstance                string   `json:"to_routing_instance,omitempty"`
 	SourceAddresses                  []string `json:"source_addresses,omitempty"`
 	DestinationAddresses             []string `json:"destination_addresses,omitempty"`
 	InterfaceMode                    bool     `json:"interface_mode,omitempty"`
@@ -466,10 +480,18 @@ type SourceNATRuleSnapshot struct {
 }
 
 type StaticNATRuleSnapshot struct {
-	Name       string `json:"name"`
-	FromZone   string `json:"from_zone,omitempty"`
-	ExternalIP string `json:"external_ip"`
-	InternalIP string `json:"internal_ip"`
+	Name     string `json:"name"`
+	FromZone string `json:"from_zone,omitempty"`
+	// #3096: interface- / routing-instance-scoped static NAT. Static NAT has
+	// only a `from` clause (no `to`); the scope is enforced on the inbound
+	// (DNAT) direction against the ingress interface/VRF and, symmetrically,
+	// on the reverse (SNAT) direction against the egress interface/VRF — the
+	// same dual-direction treatment FromZone already gets. "" = unscoped on
+	// that axis. Additive wire fields (see SourceNATRuleSnapshot).
+	FromInterface       string `json:"from_interface,omitempty"`
+	FromRoutingInstance string `json:"from_routing_instance,omitempty"`
+	ExternalIP          string `json:"external_ip"`
+	InternalIP          string `json:"internal_ip"`
 	// MatchDestinationPort is the external (pre-translation) destination port
 	// the inbound packet must carry for this port-mapped static-NAT rule
 	// (Junos `match destination-port`). 0 = match any port (whole-address
@@ -493,6 +515,12 @@ type StaticNATRuleSnapshot struct {
 type DestinationNATRuleSnapshot struct {
 	Name     string `json:"name"`
 	FromZone string `json:"from_zone,omitempty"`
+	// #3096: interface- / routing-instance-scoped DNAT. DNAT has only a
+	// `from` clause, enforced against the INGRESS interface/VRF (DNAT
+	// translates the destination on inbound). "" = unscoped on that axis.
+	// Additive wire fields (see SourceNATRuleSnapshot).
+	FromInterface       string `json:"from_interface,omitempty"`
+	FromRoutingInstance string `json:"from_routing_instance,omitempty"`
 	// SourceAddresses carries the DNAT rule's `match source-address`
 	// constraint (#2394). Junos DNAT `source-address` restricts which source
 	// IPs the destination translation applies to; before #2394 the constraint

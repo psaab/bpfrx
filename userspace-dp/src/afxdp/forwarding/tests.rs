@@ -1291,7 +1291,7 @@ fn source_nat_selection_uses_interface_addresses() {
     };
     let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
     assert_eq!(
-        match_source_nat_for_flow(&state, &from_zone, &to_zone, 12, &flow),
+        match_source_nat_for_flow(&state, 24, &from_zone, &to_zone, 12, &flow),
         Some(NatDecision {
             rewrite_src: Some("172.16.80.8".parse().expect("snat")),
             rewrite_dst: None,
@@ -1317,7 +1317,7 @@ fn source_nat_selection_uses_interface_addresses_v6() {
     };
     let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
     assert_eq!(
-        match_source_nat_for_flow(&state, &from_zone, &to_zone, 12, &flow),
+        match_source_nat_for_flow(&state, 24, &from_zone, &to_zone, 12, &flow),
         Some(NatDecision {
             rewrite_src: Some("2001:559:8585:80::8".parse().expect("snat")),
             rewrite_dst: None,
@@ -1356,7 +1356,7 @@ fn source_nat_pool_unavailable_reports_rule_and_pool_identity() {
     let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
 
     assert_eq!(
-        match_source_nat_for_flow_result(&state, &from_zone, &to_zone, 12, &flow),
+        match_source_nat_for_flow_result(&state, 24, &from_zone, &to_zone, 12, &flow),
         SourceNatLookup::Unavailable(SourceNatFailure {
             rule_name: "wrong-family".to_string(),
             pool_name: "v6-only".to_string(),
@@ -1394,7 +1394,7 @@ fn source_nat_allocator_exhausted_reports_rule_and_pool_identity() {
     let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
 
     assert_eq!(
-        match_source_nat_for_flow_result(&state, &from_zone, &to_zone, 12, &flow),
+        match_source_nat_for_flow_result(&state, 24, &from_zone, &to_zone, 12, &flow),
         SourceNatLookup::Unavailable(SourceNatFailure {
             rule_name: "exhausted".to_string(),
             pool_name: "tiny-pool".to_string(),
