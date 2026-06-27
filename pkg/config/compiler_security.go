@@ -281,7 +281,9 @@ func resolveZoneLocalAddressBooks(sec *SecurityConfig) {
 	}
 
 	rewrite := func(zone string, tokens []string) {
-		if zone == "" {
+		// An empty or wildcard ("any") zone names no single zone-local book to
+		// resolve against, so leave such tokens for the global book.
+		if zone == "" || zone == "any" {
 			return
 		}
 		for i, t := range tokens {
@@ -306,8 +308,21 @@ func resolveZoneLocalAddressBooks(sec *SecurityConfig) {
 			rewrite(zpp.ToZone, p.Match.DestinationAddresses)
 		}
 	}
-	// Global policies (junos-global) have no zone-local scope — they resolve
-	// only against the global book, so their tokens are left unchanged.
+	// #3287: a scoped global policy (#3148, `match from-zone <z>` /
+	// `match to-zone <z>`) resolves its zone-local address references against
+	// that zone's local book, exactly like a zone-pair policy. Without this the
+	// bare token kept pointing at the global book (where the entry exists only
+	// under its zone-qualified name), so the address constraint silently
+	// resolved to match-none and legitimate zone-scoped global traffic fell
+	// through to default-deny. An unscoped global (empty / `any` scope) has no
+	// single zone-local book and is left to resolve against the global book.
+	for _, p := range sec.GlobalPolicies {
+		if p == nil {
+			continue
+		}
+		rewrite(p.Match.FromZone, p.Match.SourceAddresses)
+		rewrite(p.Match.ToZone, p.Match.DestinationAddresses)
+	}
 }
 
 func compileZones(node *Node, sec *SecurityConfig) error {

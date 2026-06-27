@@ -22383,3 +22383,9 @@ top.
   pkg/grpcapi/server_cluster.go, pkg/grpcapi/server_show_firewall.go,
   pkg/api/security.go, pkg/api/types.go, pkg/cli/cli_request.go,
   pkg/cli/cli_show_security.go, cmd/cli/show.go
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3287 — resolveZoneLocalAddressBooks now rewrites a scoped global policy's (#3148) source/dest address tokens under its match from-zone/to-zone scope, so a zone-local (#3061) address reference in a scoped global resolves to the zone-qualified global-book entry instead of silently match-none / commit-reject. Unscoped globals (empty/any scope) are left to the global book. Both the simulator (pkg/policymatch) and the dataplane snapshot builder consume the post-fold book, keeping them in agreement. Added a fail-on-revert test that compiles a real config and asserts the simulator resolves the zone-local ref.
+  **File(s)**: pkg/config/compiler_security.go,
+  pkg/policymatch/scoped_global_zonelocal_test.go,
+  docs/config-schema.md
