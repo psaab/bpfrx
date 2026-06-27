@@ -23,6 +23,32 @@
   pkg/grpcapi/system_action_test.go, pkg/cmdtree/tree.go,
   pkg/cmdtree/tree_test.go, pkg/cli/cli.go, pkg/cli/cli_request.go,
   cmd/cli/request.go, pkg/ddns/README.md
+## 2026-06-27 — #2930 doc-only: correct demotion-path drift, mark DrainRequest reserved/dormant
+
+- **Timestamp**: 2026-06-27
+- **Action**: Doc + comment only (no behavior change). The /research plan
+  (campaign-8) PLAN-KILLED the correctness-bug framing: the seq-fenced
+  DrainRequest/DrainComplete pair (SendDrainRequest / handle_drain_request,
+  MSG_DRAIN_REQUEST=7) is dormant (no production caller) but the live demotion
+  path has no correctness gap — it uses SessionSync.WaitForPeerBarrier + the
+  continuous lossless event stream, and republish uses
+  ExportOwnerRGSessions(rgIDs, 0) (an unbounded full-conntrack snapshot) fired
+  on event-stream FullResync (#2874 gap / #2442 overflow), NOT on demotion-prep.
+  Verified against master: prepareUserspaceRGDemotionWithTimeout does only the
+  single WaitForPeerBarrier; PrepareRGDemotion does not exist;
+  WaitForIdle/WaitForPeerBarriersDrained/PauseIncrementalSync have no live
+  caller; ExportOwnerRGSessions has one live caller — handleEventStreamFullResync.
+  Corrected docs/session-sync-architecture.md (live demotion path; reframed the
+  stale 10-step "Graceful Demotion" sequence; "Export During Demotion Prep" →
+  "Bulk Owner-RG Export (FullResync republish)"; marked the DrainRequest fence
+  RESERVED/DORMANT; v4 revision entry). Added reserved/dormant doc-comments at
+  SendDrainRequest (eventstream.go) and handle_drain_request (event_stream/mod.rs)
+  and a reserved/dormant note in userspace-dp/src/event_stream/README.md.
+- **File(s)**: docs/session-sync-architecture.md,
+  pkg/dataplane/userspace/eventstream.go,
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/README.md, _Log.md
+- **Validation**: go build ./... clean (doc + comment only, no test needed).
 
 ## 2026-06-26 — #3148 review fold: explicit `any`→Any + reject junos-host global match
 
@@ -22305,3 +22331,10 @@ top.
   userspace-dp/src/afxdp/coordinator/status.rs,
   userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/test_fixtures.rs,
   userspace-dp/tests/fixtures/protocol_wire_v1.json
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3277 — derive host-inbound lifeline interface set from chassis-cluster config (configured control-interface / fabric interfaces) instead of the hardcoded fxp0/em0/fab* list, so a non-default `control-interface fxp1` is excluded from host-inbound deny scoping (fixes latent HA split-brain). Added fail-on-revert tests at the predicate and full-payload levels; updated host-inbound lifeline doc.
+  **File(s)**: pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/zones_host_inbound_test.go,
+  pkg/daemon/host_inbound_nft_test.go,
+  docs/junos-cli-reference.md

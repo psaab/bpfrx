@@ -1210,6 +1210,15 @@ fn process_control_frames(
 
 /// Handle DrainRequest: drain channel, write all buffered events up to target
 /// seq, then send DrainComplete.
+///
+/// RESERVED / DORMANT: the Go daemon never sends `MSG_DRAIN_REQUEST` in
+/// production (`EventStream.SendDrainRequest` has no live caller). Graceful
+/// demotion synchronizes via the session-sync peer barrier plus the continuous
+/// lossless event stream; bulk republish on loss-of-sync uses the unbounded
+/// `ExportOwnerRGSessions` snapshot triggered by a FullResync, not this
+/// seq-fenced drain. This handler (and the `MSG_DRAIN_REQUEST=7` /
+/// `MSG_DRAIN_COMPLETE=8` frames) is retained — hardened by #2876/#2920 — for a
+/// possible future fenced-drain use. See docs/session-sync-architecture.md.
 fn handle_drain_request(
     target_seq: u64,
     rx: &mpsc::Receiver<EventFrame>,
