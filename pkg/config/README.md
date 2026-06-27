@@ -406,33 +406,41 @@ to a warning (`lenientReservedZoneNames`) so an already-persisted or peer-synced
 config an older binary accepted still boots — #1960 no-brick doctrine, same as
 #3066/#2401.
 
-**Wildcard from-zone/to-zone `any` is rejected at commit (#3018, interim):** an
+**Wildcard from-zone/to-zone `any` is committed AND enforced (#3090):** an
 ordinary zone-pair policy whose `from-zone` or `to-zone` is the literal Junos
-wildcard `any` historically committed cleanly — the #2401 reference gate exempts
-`any` (`policyZoneSpecialTokens`) and the old comment claimed the dataplane
-"treats it as match-any". It does NOT: the userspace snapshot builder
+wildcard `any` is a first-class enforced policy. The #2401 reference gate
+exempts `any` (`policyZoneSpecialTokens`) so it is not mistaken for an
+undefined-zone reference, and a `security zone` named `any` is still rejected by
+`validateReservedZoneNamesStrict`. The userspace snapshot builder
 (`pkg/dataplane/userspace/policies.go`) carries the literal `"any"` string
 unchanged for an ordinary zone-pair policy (only `security policies global` maps
 to the `junos-global` sentinel), and `PolicyState::from_snapshots`
-(`userspace-dp/src/policy.rs`) only indexes a non-global rule when BOTH zones
-resolve via `zone_name_to_id.get()`. `any` is never inserted into that map, so a
-`from-zone any` / `to-zone any` rule is KEPT but never indexed and never
-evaluated: `from-zone any to-zone trust ... then deny` commits and looks
-legitimate yet never blocks traffic (silent fail-OPEN under a permit default);
-`from-zone trust to-zone any then permit` cannot permit under a deny default.
-`validatePolicyWildcardZoneStrict` (`compiler_validate_strict.go`) hard-rejects
-such a policy at commit, naming the policy and which side is `any`. This is the
-INTERIM contract: full wildcard-zone runtime indexing (separate ordered index
-lists for exact / from-any / to-any / both-any, evaluated in Junos precedence
-before global/default; no N×N hot-path expansion) is a substantial dataplane
-change deferred to a follow-up. The gate does NOT touch `security policies
-global` (enforced via the `junos-global` sentinel) nor the unrelated `any`
-tokens elsewhere in a policy (`match source-address any` / `match application
-any`) — only the from-zone/to-zone slot. The tolerant load/peer-sync path
-downgrades to a warning (`lenientPolicyWildcardZone`) so an already-persisted or
-peer-synced config carrying a from-zone/to-zone `any` still boots — the rule was
-already inert, so a leniently-loaded config behaves exactly as before, just
-flagged (#1960 no-brick doctrine, same as #3066/#3055/#2401).
+(`userspace-dp/src/policy.rs`) routes a wildcard rule into one of three
+dedicated index lists keyed for O(1) lookup:
+
+- **from-any** — `from-zone any`, concrete `to-zone`: keyed by the concrete
+  to-zone id; matches a flow into that to-zone regardless of ingress zone.
+- **to-any** — concrete `from-zone`, `to-zone any`: keyed by the concrete
+  from-zone id; matches a flow out of that from-zone regardless of egress zone.
+- **both-any** — `from-zone any to-zone any`: matches every defined zone pair.
+
+`evaluate_policy_result_with_icmp` consults these in Junos most-specific-first
+precedence: exact `(from,to)` zone pair → single-wildcard tier (from-any /
+to-any merged in config order) → both-any → `junos-global` → default policy.
+There is **no N×N hot-path expansion** — the wildcard tiers are FxHashMap O(1)
+probes (or a small Vec scan only when such rules exist), so a config with no
+wildcard policy pays only two empty-slice probes per cold-path evaluation. A
+`from-zone any to-zone junos-host` rule is also enforced on the host
+(LocalDelivery) path (`evaluate_junos_host_policy`); `to-zone any` /
+`from-zone any to-zone any` are intentionally NOT applied to host-bound traffic
+so a broad rule cannot silently brick the management lifeline (mirroring the
+existing no-global-on-host-path rule). Wildcard tiers live inside the
+`from_id != 0 && to_id != 0` guard, so an unzoned flow still falls through to
+the default action (#3110), exactly like a global policy. This lifts the #3018
+interim commit reject (`validatePolicyWildcardZoneStrict` and its
+`lenientPolicyWildcardZone` downgrade, both removed). The unrelated `any` tokens
+elsewhere in a policy (`match source-address any` / `match application any`) are
+unaffected.
 
 **NAT rule-set `from`/`to` `interface`/`routing-instance` scope is rejected at
 commit (#3079, interim):** Junos NAT rule-sets scope matched traffic with a
