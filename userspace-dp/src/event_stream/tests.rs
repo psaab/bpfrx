@@ -1316,6 +1316,9 @@ fn test_partial_read_accumulation() {
     for seq in 1..=5u64 {
         replay_buf.push_back(EventFrame::encode_drain_complete(seq));
     }
+    // next_seq reflects the highest allocated seq so the ACK is in-range
+    // for the #2959 watermark validation.
+    shared.next_seq.store(5, Ordering::Relaxed);
 
     let raw = build_raw_ack_frame(3);
     let mut ctrl_buf: Vec<u8> = Vec::new();
@@ -1358,6 +1361,7 @@ fn test_two_frames_in_one_read() {
     for seq in 1..=10u64 {
         replay_buf.push_back(EventFrame::encode_drain_complete(seq));
     }
+    shared.next_seq.store(10, Ordering::Relaxed);
 
     let ack5 = build_raw_ack_frame(5);
     let ack8 = build_raw_ack_frame(8);
@@ -1384,6 +1388,7 @@ fn test_one_and_half_frames() {
     for seq in 1..=5u64 {
         replay_buf.push_back(EventFrame::encode_drain_complete(seq));
     }
+    shared.next_seq.store(5, Ordering::Relaxed);
 
     let ack2 = build_raw_ack_frame(2);
     let ack4 = build_raw_ack_frame(4);
@@ -1410,6 +1415,126 @@ fn test_one_and_half_frames() {
     assert_eq!(consumed, FRAME_HEADER_SIZE);
     assert_eq!(shared.acked_seq.load(Ordering::Relaxed), 4);
     assert_eq!(replay_buf.len(), 1); // only frame 5 remains
+}
+
+#[test]
+fn test_future_ack_beyond_next_seq_ignored_2959() {
+    // A daemon ACKs a sequence the helper never allocated (seq > next_seq).
+    // The helper must fail closed: leave acked_seq and the replay buffer
+    // intact and bump invalid_acks.
+    let shared = Arc::new(EventStreamShared::new());
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(16);
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    for seq in 1..=5u64 {
+        replay_buf.push_back(EventFrame::encode_drain_complete(seq));
+    }
+    // Highest allocated seq is 5; ACK 99 is impossible.
+    shared.next_seq.store(5, Ordering::Relaxed);
+    shared.acked_seq.store(2, Ordering::Relaxed);
+
+    let raw = build_raw_ack_frame(99);
+    let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (action, consumed) =
+        process_control_frames(&raw, &shared, &rx, &sock_a, &mut replay_buf);
+
+    assert!(action.is_none());
+    assert_eq!(consumed, FRAME_HEADER_SIZE, "frame is still consumed");
+    // Watermark unchanged, replay buffer fully intact (no frames suppressed).
+    assert_eq!(shared.acked_seq.load(Ordering::Relaxed), 2);
+    assert_eq!(replay_buf.len(), 5, "future ACK must not trim replay buffer");
+    assert_eq!(replay_buf.front().unwrap().seq, 1);
+    assert_eq!(shared.frames_invalid_acks.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn test_backward_ack_below_watermark_ignored_2959() {
+    // A daemon ACKs a sequence below the current watermark. The helper must
+    // ignore it: acked_seq stays put and the replay buffer is untouched.
+    let shared = Arc::new(EventStreamShared::new());
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(16);
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    for seq in 6..=10u64 {
+        replay_buf.push_back(EventFrame::encode_drain_complete(seq));
+    }
+    shared.next_seq.store(10, Ordering::Relaxed);
+    shared.acked_seq.store(5, Ordering::Relaxed);
+
+    let raw = build_raw_ack_frame(3); // below acked_seq=5
+    let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (action, consumed) =
+        process_control_frames(&raw, &shared, &rx, &sock_a, &mut replay_buf);
+
+    assert!(action.is_none());
+    assert_eq!(consumed, FRAME_HEADER_SIZE);
+    assert_eq!(shared.acked_seq.load(Ordering::Relaxed), 5, "watermark intact");
+    assert_eq!(replay_buf.len(), 5, "backward ACK must not trim replay buffer");
+    assert_eq!(replay_buf.front().unwrap().seq, 6);
+    assert_eq!(shared.frames_invalid_acks.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn test_future_ack_does_not_suppress_lower_buffered_frames_2959() {
+    // The core impact in #2959: an ACK above next_seq while the replay buffer
+    // holds lower-seq frames must NOT trim/suppress those lower frames.
+    let shared = Arc::new(EventStreamShared::new());
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(16);
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    for seq in 1..=3u64 {
+        replay_buf.push_back(EventFrame::encode_drain_complete(seq));
+    }
+    shared.next_seq.store(3, Ordering::Relaxed);
+    shared.acked_seq.store(0, Ordering::Relaxed);
+
+    // ACK 7 is beyond next_seq=3; without validation this would pop all three
+    // buffered frames (1,2,3 <= 7) and store an impossible acked_seq=7.
+    let raw = build_raw_ack_frame(7);
+    let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (action, _consumed) =
+        process_control_frames(&raw, &shared, &rx, &sock_a, &mut replay_buf);
+
+    assert!(action.is_none());
+    assert_eq!(replay_buf.len(), 3, "lower buffered frames must survive");
+    assert_eq!(shared.acked_seq.load(Ordering::Relaxed), 0);
+    assert_eq!(shared.frames_invalid_acks.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn test_valid_acks_trim_as_before_no_regression_2959() {
+    // Boundary cases that MUST still be accepted:
+    //   - seq == acked_seq (duplicate ACK, benign no-op)
+    //   - acked < seq < next (normal forward ACK, trims)
+    //   - seq == next_seq (ACK of the latest allocated frame)
+    let shared = Arc::new(EventStreamShared::new());
+    let (_tx, rx) = mpsc::sync_channel::<EventFrame>(16);
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+    for seq in 1..=5u64 {
+        replay_buf.push_back(EventFrame::encode_drain_complete(seq));
+    }
+    shared.next_seq.store(5, Ordering::Relaxed);
+    shared.acked_seq.store(0, Ordering::Relaxed);
+    let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+
+    // Duplicate ACK of the current watermark (0): benign no-op, no trim.
+    let dup = build_raw_ack_frame(0);
+    process_control_frames(&dup, &shared, &rx, &sock_a, &mut replay_buf);
+    assert_eq!(replay_buf.len(), 5);
+    assert_eq!(shared.acked_seq.load(Ordering::Relaxed), 0);
+
+    // Normal forward ACK of 3: trims frames 1,2,3.
+    let ack3 = build_raw_ack_frame(3);
+    process_control_frames(&ack3, &shared, &rx, &sock_a, &mut replay_buf);
+    assert_eq!(shared.acked_seq.load(Ordering::Relaxed), 3);
+    assert_eq!(replay_buf.len(), 2);
+    assert_eq!(replay_buf.front().unwrap().seq, 4);
+
+    // ACK of the latest allocated seq (== next_seq=5): trims the rest.
+    let ack5 = build_raw_ack_frame(5);
+    process_control_frames(&ack5, &shared, &rx, &sock_a, &mut replay_buf);
+    assert_eq!(shared.acked_seq.load(Ordering::Relaxed), 5);
+    assert_eq!(replay_buf.len(), 0);
+
+    // No invalid ACKs were recorded across the valid sequence.
+    assert_eq!(shared.frames_invalid_acks.load(Ordering::Relaxed), 0);
 }
 
 // Build a benign header-only replay frame (MSG_SESSION_OPEN type) carrying the

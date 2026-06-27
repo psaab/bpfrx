@@ -1,3 +1,51 @@
+## 2026-06-26 — #2959 event-stream MSG_ACK watermark validation
+
+- **Timestamp**: 2026-06-26
+- **Action**: `process_control_frames` (`userspace-dp/src/event_stream/mod.rs`)
+  trusted the daemon's `MSG_ACK` sequence blindly — it stored `acked_seq` and
+  trimmed the replay buffer with no bounds check. A buggy / mixed-version /
+  corrupted daemon listener could ACK a sequence the helper never allocated
+  (`seq > next_seq`) or one below the current watermark (`seq < acked_seq`),
+  poisoning `acked_seq` and trimming/suppressing replay of frames the daemon
+  never acknowledged. Added a fail-closed validation in the `MSG_ACK` arm: the
+  sequence must lie in `[acked_seq, next_seq]` (duplicate `seq == acked_seq`
+  and `seq == next_seq` are valid boundaries). An out-of-range ACK is ignored
+  (watermark + replay buffer left intact) and counted in the new
+  `frames_invalid_acks` counter, surfaced as `event_stream_invalid_acks` in
+  the daemon status JSON. Chose ignore-with-counter over disconnect+resync:
+  ignoring preserves the live connection and avoids reconnect-thrash against a
+  peer that keeps emitting bad ACKs; valid interleaved ACKs still advance the
+  watermark. Disconnect+FullResync noted as a possible future hardening.
+- **File(s)**: `userspace-dp/src/event_stream/mod.rs`,
+  `userspace-dp/src/event_stream/tests.rs`,
+  `userspace-dp/src/event_stream/README.md`,
+  `userspace-dp/src/protocol/control.rs`,
+  `userspace-dp/src/server/helpers.rs`,
+  `userspace-dp/src/server/lifecycle.rs`,
+  `userspace-dp/tests/fixtures/protocol_wire_v1.json`
+
+## 2026-06-26 — #2959 fold: wire event_stream_invalid_acks Go-side
+
+- **Timestamp**: 2026-06-26
+- **Action**: Review fold. The initial #2959 commit added the
+  `frames_invalid_acks` counter on the Rust side and surfaced it in the
+  helper status JSON, but left the Go control-plane half unwired — unlike the
+  sibling counters `event_stream_write_stalls` (#2381) and
+  `event_stream_replay_evictions` (#2382), which are mirrored all the way
+  through Go. Completed the mirror exactly as the siblings: (1) added
+  `EventStreamInvalidAcks uint64 json:"event_stream_invalid_acks,omitempty"`
+  to `ProcessStatus` in `pkg/dataplane/userspace/protocol.go`; (2) added a
+  Prometheus sample under `userspaceEventStreamProducerFramesTotal` with the
+  `invalid_ack` label in `pkg/api/metrics_userspace.go`; (3) added
+  `invalid_acks=%d` to the producer line in
+  `pkg/dataplane/userspace/format/status.go`; (4) extended the cross-language
+  parity test `TestProcessStatusEventStreamFieldsParity1642`
+  (`pkg/dataplane/userspace/protocol_test.go`) to assert the wire key decodes
+  (value 11) and that a legacy payload omitting it defaults to 0.
+- **File(s)**: `pkg/dataplane/userspace/protocol.go`,
+  `pkg/api/metrics_userspace.go`,
+  `pkg/dataplane/userspace/format/status.go`,
+  `pkg/dataplane/userspace/protocol_test.go`
 ## 2026-06-26 — #3073 policy hit-count per-packet on the established fast path
 
 - **Timestamp**: 2026-06-26

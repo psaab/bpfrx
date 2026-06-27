@@ -1392,7 +1392,8 @@ func TestProcessStatusEventStreamFieldsParity1642(t *testing.T) {
 		"event_stream_sent": 5000,
 		"event_stream_dropped": 3,
 		"event_stream_write_stalls": 17,
-		"event_stream_replay_evictions": 9
+		"event_stream_replay_evictions": 9,
+		"event_stream_invalid_acks": 11
 	}`
 	var got ProcessStatus
 	if err := json.Unmarshal([]byte(rustJSON), &got); err != nil {
@@ -1422,6 +1423,12 @@ func TestProcessStatusEventStreamFieldsParity1642(t *testing.T) {
 	if got.EventStreamReplayEvictions != 9 {
 		t.Errorf("event_stream_replay_evictions dropped: got %d, want 9", got.EventStreamReplayEvictions)
 	}
+	// #2959: the invalid-ACK counter must decode under its exact wire key so a
+	// daemon-side listener emitting impossible ACK watermarks (rejected by the
+	// helper's fail-closed validation) is observable in status/metrics.
+	if got.EventStreamInvalidAcks != 11 {
+		t.Errorf("event_stream_invalid_acks dropped: got %d, want 11", got.EventStreamInvalidAcks)
+	}
 	// #2382: a legacy helper that omits the key must decode to 0, not error
 	// (omitempty + Go zero-value default).
 	var legacy ProcessStatus
@@ -1430,6 +1437,11 @@ func TestProcessStatusEventStreamFieldsParity1642(t *testing.T) {
 	}
 	if legacy.EventStreamReplayEvictions != 0 {
 		t.Errorf("missing event_stream_replay_evictions must default to 0, got %d", legacy.EventStreamReplayEvictions)
+	}
+	// #2959: a legacy helper that omits the invalid-acks key must decode to 0,
+	// not error (omitempty + Go zero-value default).
+	if legacy.EventStreamInvalidAcks != 0 {
+		t.Errorf("missing event_stream_invalid_acks must default to 0, got %d", legacy.EventStreamInvalidAcks)
 	}
 
 	raw, _ := json.Marshal(&ProcessStatus{EventStreamConnected: true, EventStreamSeq: 1, EventStreamAcked: 1})
