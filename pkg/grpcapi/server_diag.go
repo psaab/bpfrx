@@ -755,6 +755,17 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 				"  systemctl stop xpfd && <replace binary> && systemctl start xpfd",
 		}, nil
 
+	case "dynamic-dns-update", "dynamic-dns-check":
+		// #3276: operator force-now / check-now verb. force=true (update)
+		// re-asserts every owned DDNS record now; force=false (check) only
+		// re-observes + publishes changed records. The handler honors the
+		// per-RG owner gate (no-op + clear message on the backup).
+		if s.surfaceADDNSForceFn == nil {
+			return nil, status.Error(codes.Unavailable, "dynamic-dns: DDNS engine not running")
+		}
+		_, msg := s.surfaceADDNSForceFn(req.Action == "dynamic-dns-update")
+		return &pb.SystemActionResponse{Message: msg}, nil
+
 	default:
 		// Handle cluster failover actions: "cluster-failover:<rgID>" and "cluster-failover-reset:<rgID>"
 		if strings.HasPrefix(req.Action, "cluster-failover-reset:") {

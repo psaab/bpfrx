@@ -265,6 +265,20 @@ type SurfaceAManager struct {
 	// update for an unchanged address (inadyn idea #5, plan §5.5).
 	runtime map[string]*surfaceAState
 
+	// forceRefresh is the operator force-now latch (#3276): when set, the NEXT
+	// reconcile pass treats every configured scope as refresh-due, re-asserting
+	// the wire record even for an owned, unchanged address inside the
+	// forced-refresh floor. It is the engine half of the `request system
+	// dynamic-dns update` verb — a one-shot override of the change-detection +
+	// forced-refresh skip, decoupled from the poll cadence (P2 #2717). The latch
+	// is consumed by the first non-degraded pass (set false before Pass 1 runs)
+	// so it forces exactly one publish, not a permanent re-assert storm. The
+	// per-RG HA writer gate still applies — a gated-out scope is never published
+	// even under force (only the RG owner writes, #2972). A degraded pass does
+	// NOT consume the latch (it never publishes), so the force survives until the
+	// state file is healthy.
+	forceRefresh bool
+
 	// newBackend resolves the live Backend for a provider at reconcile time
 	// (resolve-per-Reconcile, plan §6 fork 1). When nil (tests injecting a fixed
 	// backend) the static `backend` field is used for every scope.
@@ -557,6 +571,14 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 		return fmt.Errorf("ddns surface-a: reconcile suspended (state degraded): %s", m.degradedReason)
 	}
 
+	// Consume the operator force-now latch (#3276) for THIS pass: a force makes
+	// every configured scope refresh-due so the RG owner re-asserts the wire
+	// record even for an unchanged address inside the forced-refresh floor. The
+	// latch is cleared before Pass 1 so it forces exactly one publish round; the
+	// per-RG gate below still decides which scopes this node may actually write.
+	force := m.forceRefresh
+	m.forceRefresh = false
+
 	now := m.now()
 	var firstErr error
 	noteErr := func(e error) {
@@ -612,7 +634,7 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 				"fqdn", sc.FQDN, "rg", sc.Key.RGOwner, "iface", sc.Key.Interface)
 			continue
 		}
-		noteErr(m.reconcileScopeLocked(ctx, sc, observe, now))
+		noteErr(m.reconcileScopeLocked(ctx, sc, observe, now, force))
 	}
 
 	// liveRR is the set of {FQDN, AddrText} that a STILL-CONFIGURED scope owns
@@ -705,7 +727,7 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 // reconcileScopeLocked is the per-scope engine (plan §5.5): observe → change
 // detection → forced-refresh → error backoff → publish/withdraw. Caller holds
 // m.mu.
-func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAScope, observe AddressObserver, now time.Time) error {
+func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAScope, observe AddressObserver, now time.Time, force bool) error {
 	sid := sc.scopeID()
 	rt := m.runtime[sid]
 	if rt == nil {
@@ -782,7 +804,10 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 	// new name is published. The old name's record (under the previous FQDN's
 	// scope key) is no longer in `desired`, so Reconcile Pass 2 withdraws it.
 	_, owned := m.state.get(sc.effectiveKey(), surfaceAIdentity, "")
-	refreshDue := rt.lastPublished.IsZero() || now.Sub(rt.lastPublished) >= forced
+	// force (#3276): the operator `request system dynamic-dns update` latch makes
+	// the scope refresh-due regardless of the change-detection / forced-refresh
+	// floor, so the owner re-asserts the wire record now.
+	refreshDue := force || rt.lastPublished.IsZero() || now.Sub(rt.lastPublished) >= forced
 	if owned && !changed && !refreshDue {
 		m.skipped++
 		slog.Debug("ddns surface-a: address unchanged and forced-refresh not due; skipping",
@@ -1311,6 +1336,19 @@ type SurfaceAStats struct {
 	// DegradedReason is a human-readable explanation of Degraded (the load error
 	// plus the quarantine path of the bad file, if any). Empty when not degraded.
 	DegradedReason string
+}
+
+// ForceRefresh arms the operator force-now latch (#3276): the NEXT reconcile
+// pass re-asserts the wire record for every configured scope this node owns,
+// bypassing the change-detection + forced-refresh skip (but NOT the per-RG HA
+// writer gate — only the RG owner publishes). It is the engine half of the
+// `request system dynamic-dns update` operator verb. The daemon arms the latch
+// and then nudges an immediate reconcile pass; the latch is one-shot (consumed
+// by the first non-degraded pass) so it forces exactly one publish round.
+func (m *SurfaceAManager) ForceRefresh() {
+	m.mu.Lock()
+	m.forceRefresh = true
+	m.mu.Unlock()
 }
 
 // Stats returns the current Surface A counters.

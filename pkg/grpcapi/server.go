@@ -72,6 +72,12 @@ type Config struct {
 	// absent (NoDataplane).
 	SurfaceADDNSStatsFn  func() *ddnspkg.SurfaceAStats
 	SurfaceADDNSStatusFn func() []ddnspkg.SurfaceAStatusView
+	// #3276: operator force-now / check-now verb for `request system
+	// dynamic-dns update`. force=true arms the Surface A force-now latch +
+	// nudges an immediate publish; force=false nudges a re-observe pass. Returns
+	// (ok, message); honors the per-RG owner gate (no-op + clear message on the
+	// backup). nil when the manager is absent (NoDataplane).
+	SurfaceADDNSForceFn func(force bool) (bool, string)
 	// #2464: per-collector NetFlow v9 / IPFIX write-health for
 	// `show services flow-monitoring statistics`. nil when no flow export
 	// is wired — the show renders "no flow export configured".
@@ -115,6 +121,7 @@ type Server struct {
 	ddnsOwnedRecordsFn    func() []dhcpserver.DDNSOwnedRecordView
 	surfaceADDNSStatsFn   func() *ddnspkg.SurfaceAStats
 	surfaceADDNSStatusFn  func() []ddnspkg.SurfaceAStatusView
+	surfaceADDNSForceFn   func(force bool) (bool, string)
 	flowCollectorHealthFn func() []flowexport.ExporterCollectorHealth
 	commitFn              func(ctx context.Context, comment string) (*config.Config, error)
 	commitConfirmedFn     func(ctx context.Context, minutes int) (*config.Config, error)
@@ -171,6 +178,7 @@ func NewServer(addr string, cfg Config) *Server {
 		ddnsOwnedRecordsFn:    cfg.DDNSOwnedRecordsFn,
 		surfaceADDNSStatsFn:   cfg.SurfaceADDNSStatsFn,
 		surfaceADDNSStatusFn:  cfg.SurfaceADDNSStatusFn,
+		surfaceADDNSForceFn:   cfg.SurfaceADDNSForceFn,
 		flowCollectorHealthFn: cfg.FlowCollectorHealthFn,
 		commitFn:              cfg.CommitFn,
 		commitConfirmedFn:     cfg.CommitConfirmedFn,
