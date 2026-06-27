@@ -22357,3 +22357,26 @@ top.
   pkg/dataplane/userspace/zones_host_inbound_test.go,
   pkg/daemon/host_inbound_nft_test.go,
   docs/junos-cli-reference.md
+
+- **Timestamp**: 2026-06-27
+  **Action**: #3286 — surface scoped-global-policy zone context (#3148
+  `match from-zone`/`to-zone`) on every policy inventory/show surface.
+  Previously only the dataplane enforced the scope; REST, gRPC, and CLI
+  rendered scoped globals as all-zones (`*`/`*`, junos-global, any),
+  hiding the scope from audit and making scoped-global hit counters
+  ambiguous. Added `match_from_zone`/`match_to_zone` to the REST
+  `PolicyRule` (omitempty) and the protobuf `PolicyRule` (fields 11/12,
+  regenerated), populated from `Policy.Match.FromZone/ToZone` in the
+  global loops; rendered the scoped zones in the CLI standard, detail,
+  brief, and hit-count views and the gRPC text hit-count/detail views.
+  Unscoped globals unchanged. Fail-on-revert tests across all three
+  packages (REST, gRPC structured + text, CLI all four views).
+  **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/api/types.go, pkg/api/security.go,
+  pkg/grpcapi/server_show_zones.go,
+  pkg/grpcapi/server_show_policies_text.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/api/security_scoped_global_3286_test.go,
+  pkg/grpcapi/server_show_zones_scoped_global_3286_test.go,
+  pkg/cli/cli_show_security_scoped_global_3286_test.go,
+  docs/junos-cli-reference.md, pkg/api/README.md, pkg/grpcapi/README.md
