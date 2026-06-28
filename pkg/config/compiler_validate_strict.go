@@ -2999,7 +2999,7 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 				return fmt.Errorf(
 					"application %q: destination-port %q is set on protocol %q, which "+
 						"does not carry L4 ports — source-port/destination-port are valid "+
-						"only on tcp/udp/sctp (the dataplane keys port terms on the "+
+						"only on tcp/udp (the dataplane keys port terms on the "+
 						"packet's ports, which are always 0 for a non-port protocol, so the "+
 						"term would never match; remove the port or change the protocol)",
 					name, port, app.Protocol)
@@ -3008,7 +3008,7 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 				return fmt.Errorf(
 					"application %q: source-port %q is set on protocol %q, which does "+
 						"not carry L4 ports — source-port/destination-port are valid only "+
-						"on tcp/udp/sctp (the dataplane keys port terms on the packet's "+
+						"on tcp/udp (the dataplane keys port terms on the packet's "+
 						"ports, which are always 0 for a non-port protocol, so the term "+
 						"would never match; remove the port or change the protocol)",
 					name, port, app.Protocol)

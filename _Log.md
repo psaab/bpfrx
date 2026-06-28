@@ -22766,3 +22766,11 @@ top.
   - **File(s)**: pkg/config/compiler_validate_strict.go,
     pkg/config/compiler_application_specs_test.go,
     pkg/appid/protocol_number_2124_test.go, pkg/config/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3373 re-review minors — dropped stale "sctp" from the two
+    app-port reject error strings (now "tcp/udp", since sctp+port is rejected
+    after the fold); added explicit sctp + numeric-132 lenient no-brick
+    subcases to TestApplicationSpec_PortOnNonPortProtocol_LenientWarns.
+  - **File(s)**: pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler_application_specs_test.go, _Log.md

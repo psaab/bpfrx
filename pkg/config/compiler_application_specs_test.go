@@ -586,23 +586,44 @@ func TestApplicationSpec_ICMPTypeOnlyNoPort_AcceptsAtCommit(t *testing.T) {
 	}
 }
 
-// No-brick (#1960): a config persisted/synced with a policy-referenced
+// No-brick (#1960/#3261): a config persisted/synced with a policy-referenced
 // port-on-non-port-protocol application must still LOAD on the tolerant path
-// (CompileConfigLenient) — downgraded to a warning — so an upgraded node does
-// not fail closed on boot.
+// (CompileConfigLenient) — downgraded to a warning, NOT a hard fail — so an
+// upgraded node (or one peer-syncing from an older binary that accepted the
+// spec) does not fail closed on boot. The icmp subcase covers a classic
+// non-port protocol; the sctp / numeric-132 subcases pin the contract for the
+// EXACT protocol that triggered the #3373 SCTP MAJOR — SCTP has wire ports but
+// is not extracted by this dataplane (ip_proto.rs has_l4_ports), so the strict
+// gate rejects sctp+port at commit, yet an already-committed sctp+port config
+// must still load leniently.
 func TestApplicationSpec_PortOnNonPortProtocol_LenientWarns(t *testing.T) {
-	tree := flatTreeFromSets(t, referencedNonPortProtoWithPort("icmp", "destination-port", "80")...)
-	cfg, err := CompileConfigLenient(tree)
-	if err != nil {
-		t.Fatalf("lenient load of a referenced port-on-non-port-protocol app must not fail: %v", err)
+	cases := []struct {
+		name, proto, portKind, port string
+	}{
+		{"icmp", "icmp", "destination-port", "80"},
+		{"sctp", "sctp", "destination-port", "80"},
+		{"numeric_sctp", "132", "destination-port", "80"},
 	}
-	var warned bool
-	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "application spec") && strings.Contains(w, "BAD") {
-			warned = true
-		}
-	}
-	if !warned {
-		t.Fatalf("expected lenient path to record an application-spec downgrade warning, got %v", cfg.Warnings)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := flatTreeFromSets(t, referencedNonPortProtoWithPort(tc.proto, tc.portKind, tc.port)...)
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("lenient load of a referenced %s+port app must not fail: %v", tc.proto, err)
+			}
+			if cfg == nil {
+				t.Fatalf("lenient load of a referenced %s+port app must return a non-nil config", tc.proto)
+			}
+			var warned bool
+			for _, w := range cfg.Warnings {
+				if strings.Contains(w, "application spec") && strings.Contains(w, "BAD") {
+					warned = true
+				}
+			}
+			if !warned {
+				t.Fatalf("expected lenient path to record an application-spec downgrade warning for %s, got %v",
+					tc.proto, cfg.Warnings)
+			}
+		})
 	}
 }
