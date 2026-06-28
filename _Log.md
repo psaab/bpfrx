@@ -1,3 +1,18 @@
+## 2026-06-27 — #3303 thread feed overlay into NAT snapshot builders
+
+- **Timestamp**: 2026-06-27
+- **Action**: NAT `match {source,destination}-address-name` resolved
+  static-only because the snapshot builder never passed feedOverlay to the
+  source/destination NAT builders. Added resolveNATAddressNamePrefixes
+  (static book ∪ feed overlay), threaded feedOverlay through the append
+  helpers + buildSourceNATSnapshotsWithFeeds /
+  buildDestinationNATSnapshotsWithFeeds, wired them in builder.go, fixed the
+  docs/feature-gaps.md drift, and added the #3303 fail-on-revert test.
+- **File(s)**: pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/builder.go,
+  pkg/dataplane/userspace/nat_feed_overlay_3303_test.go,
+  docs/feature-gaps.md
+
 ## 2026-06-27 — #3276 DDNS operator force-now / check-now verb
 
 - **Timestamp**: 2026-06-27

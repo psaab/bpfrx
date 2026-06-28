@@ -79,9 +79,13 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 		Flow:                  buildFlowSnapshot(cfg),
 		DefaultPolicy:         policyActionString(cfg.Security.DefaultPolicy),
 		Policies:              policies,
-		SourceNAT:             buildSourceNATSnapshots(cfg, natCounterIDs),
+		// #3303: thread feedOverlay into the NAT builders so a NAT rule scoped
+		// to a feed-backed `match {source,destination}-address-name` resolves the
+		// live feed prefixes, exactly as the policy/address-book path does. Static
+		// NAT has no address-name match, so it needs no overlay.
+		SourceNAT:             buildSourceNATSnapshotsWithFeeds(cfg, natCounterIDs, feedOverlay),
 		StaticNAT:             buildStaticNATSnapshots(cfg, natCounterIDs),
-		DestinationNAT:        buildDestinationNATSnapshots(cfg, natCounterIDs),
+		DestinationNAT:        buildDestinationNATSnapshotsWithFeeds(cfg, natCounterIDs, feedOverlay),
 		NAT64:                 buildNAT64Snapshots(cfg),
 		Nptv6:                 buildNptv6Snapshots(cfg),
 		Screens:               buildScreenSnapshots(cfg),

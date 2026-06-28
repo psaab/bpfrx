@@ -24,11 +24,42 @@ func natCounterID(ids map[string]uint32, natType, ruleSet, rule string) uint32 {
 	return ids[dataplane.NATCounterKey(natType, ruleSet, rule)]
 }
 
+// resolveNATAddressNamePrefixes resolves a NAT `match {source,destination}-
+// address-name` reference into concrete prefixes, unioning the static global
+// address-book expansion (resolveUserspaceAddressBookEntry) with the live
+// dynamic-address feed overlay (#2049 / #3303). feedOverlay maps a
+// `security dynamic-address address-name ... profile <feed>` binding to its
+// live feed-backed CIDR strings (resolved by the daemon from
+// feeds.Manager.SnapshotForBindings).
+//
+// Before #3303 the NAT snapshot builders never received feedOverlay, so a NAT
+// rule scoped to a feed-backed address-name resolved STATIC-ONLY and matched
+// nothing on live feed content — contradicting the docs claim that feeds are
+// enforced via "policy/NAT address-name bindings". This helper mirrors the
+// policy path (buildAddressBookTableWithFeeds), which merges feedOverlay[name]
+// into the name's address-book bucket.
+//
+// The recursive case — an address-SET whose member is feed-backed — remains the
+// known #3294 gap (the static expander does not pull feed prefixes for nested
+// set members). A DIRECT `match ...-address-name <feed-name>` reference is fully
+// resolved here, which is the #3303 NAT-side gap.
+func resolveNATAddressNamePrefixes(cfg *config.Config, feedOverlay map[string][]string, name string) []string {
+	var out []string
+	if values, ok := resolveUserspaceAddressBookEntry(cfg, name); ok {
+		out = append(out, values...)
+	}
+	if feeds := feedOverlay[name]; len(feeds) > 0 {
+		out = append(out, feeds...)
+	}
+	return out
+}
+
 // appendNATSourceAddressName resolves a NAT rule's `match source-address-name
 // <book-entry>` into concrete source prefixes and appends them to the rule's
-// source list (#2416). It reuses resolveUserspaceAddressBookEntry — the same
-// global-address-book expander the security-policy snapshot path uses — so a
-// name-scoped NAT rule carries the entry's prefixes into the #2394 source
+// source list (#2416). It reuses resolveNATAddressNamePrefixes — the same
+// static-book expander the security-policy snapshot path uses, now unioned with
+// the dynamic-address feed overlay (#3303) — so a name-scoped NAT rule carries
+// the entry's prefixes (static AND feed-backed) into the #2394 source
 // constraint instead of publishing an empty (match-any) source list.
 //
 // Fail-closed on an unknown / unresolvable name: the raw token is appended so
@@ -37,11 +68,11 @@ func natCounterID(ids map[string]uint32, natType, ruleSet, rule string) uint32 {
 // prefix — the rule then matches NOTHING rather than collapsing to match-any.
 // This mirrors the policy path's behavior for an unresolved address reference
 // and is backstopped at commit by validateNATSourceAddressNameReferencesStrict.
-func appendNATSourceAddressName(cfg *config.Config, sourceAddrs []string, name string) []string {
+func appendNATSourceAddressName(cfg *config.Config, feedOverlay map[string][]string, sourceAddrs []string, name string) []string {
 	if name == "" {
 		return sourceAddrs
 	}
-	if values, ok := resolveUserspaceAddressBookEntry(cfg, name); ok && len(values) > 0 {
+	if values := resolveNATAddressNamePrefixes(cfg, feedOverlay, name); len(values) > 0 {
 		return append(sourceAddrs, values...)
 	}
 	// Unknown / empty book entry: keep the constraint non-empty but
@@ -52,10 +83,11 @@ func appendNATSourceAddressName(cfg *config.Config, sourceAddrs []string, name s
 // appendNATDestinationAddressName resolves a NAT rule's `match
 // destination-address-name <book-entry>` into concrete destination prefixes and
 // appends them to the rule's destination list (#3229). It is the destination
-// twin of appendNATSourceAddressName and shares the same address-book expander
-// (resolveUserspaceAddressBookEntry) the security-policy and source-address-name
-// paths use, so a name-scoped destination matches the same prefixes a literal
-// `match destination-address` would.
+// twin of appendNATSourceAddressName and shares the same expander
+// (resolveNATAddressNamePrefixes) the security-policy and source-address-name
+// paths use — static address book unioned with the dynamic-address feed overlay
+// (#3303) — so a name-scoped destination matches the same prefixes a literal
+// `match destination-address` would, including feed-backed members.
 //
 // Fail-closed on an unknown / unresolvable name: the raw token is appended so
 // the destination list stays NON-EMPTY (the rule does not collapse to no
@@ -64,11 +96,11 @@ func appendNATSourceAddressName(cfg *config.Config, sourceAddrs []string, name s
 // than broadening. Backstopped at commit by
 // validateNATSourceAddressNameReferencesStrict, which also gates
 // destination-address-name.
-func appendNATDestinationAddressName(cfg *config.Config, destAddrs []string, name string) []string {
+func appendNATDestinationAddressName(cfg *config.Config, feedOverlay map[string][]string, destAddrs []string, name string) []string {
 	if name == "" {
 		return destAddrs
 	}
-	if values, ok := resolveUserspaceAddressBookEntry(cfg, name); ok && len(values) > 0 {
+	if values := resolveNATAddressNamePrefixes(cfg, feedOverlay, name); len(values) > 0 {
 		return append(destAddrs, values...)
 	}
 	// Unknown / empty book entry: keep the list non-empty but unmatchable
@@ -76,7 +108,16 @@ func appendNATDestinationAddressName(cfg *config.Config, destAddrs []string, nam
 	return append(destAddrs, name)
 }
 
+// buildSourceNATSnapshots is the static-only convenience wrapper retained for
+// callers that carry no dynamic-address feed overlay (tests, legacy paths). The
+// production snapshot path uses buildSourceNATSnapshotsWithFeeds so feed-backed
+// `match {source,destination}-address-name` references resolve their live feed
+// prefixes (#3303).
 func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32) []SourceNATRuleSnapshot {
+	return buildSourceNATSnapshotsWithFeeds(cfg, natCounterIDs, nil)
+}
+
+func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[string]uint32, feedOverlay map[string][]string) []SourceNATRuleSnapshot {
 	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
 		return nil
 	}
@@ -96,7 +137,7 @@ func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32
 			// #2416: resolve `match source-address-name` for SNAT too — same
 			// builder gap as DNAT (the source list only carried literal
 			// prefixes). See appendNATSourceAddressName.
-			sourceAddrs = appendNATSourceAddressName(cfg, sourceAddrs, rule.Match.SourceAddressName)
+			sourceAddrs = appendNATSourceAddressName(cfg, feedOverlay, sourceAddrs, rule.Match.SourceAddressName)
 			destAddrs := append([]string(nil), rule.Match.DestinationAddresses...)
 			if len(destAddrs) == 0 && rule.Match.DestinationAddress != "" {
 				destAddrs = append(destAddrs, rule.Match.DestinationAddress)
@@ -105,7 +146,7 @@ func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32
 			// source path resolves source-address-name — without this a
 			// name-scoped destination constraint published an EMPTY list =
 			// match-any destination (fail-open).
-			destAddrs = appendNATDestinationAddressName(cfg, destAddrs, rule.Match.DestinationAddressName)
+			destAddrs = appendNATDestinationAddressName(cfg, feedOverlay, destAddrs, rule.Match.DestinationAddressName)
 			var poolAddresses []string
 			var portLow, portHigh uint16
 			var persistentNAT bool
@@ -325,7 +366,14 @@ func dnatDestinationParts(raw string) (base, prefix string, ok bool) {
 	return ipNet.IP.String(), ipNet.String(), true
 }
 
+// buildDestinationNATSnapshots is the static-only convenience wrapper retained
+// for callers without a dynamic-address feed overlay (tests, legacy paths). The
+// production snapshot path uses buildDestinationNATSnapshotsWithFeeds (#3303).
 func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32) []DestinationNATRuleSnapshot {
+	return buildDestinationNATSnapshotsWithFeeds(cfg, natCounterIDs, nil)
+}
+
+func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[string]uint32, feedOverlay map[string][]string) []DestinationNATRuleSnapshot {
 	if cfg == nil || cfg.Security.NAT.Destination == nil || len(cfg.Security.NAT.Destination.RuleSets) == 0 {
 		return nil
 	}
@@ -369,7 +417,7 @@ func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]u
 			// matches NOTHING (fail-closed). The commit-time strict gate
 			// (validateNATSourceAddressNameReferencesStrict) makes the typo
 			// operator-visible.
-			destAddrs = appendNATDestinationAddressName(cfg, destAddrs, rule.Match.DestinationAddressName)
+			destAddrs = appendNATDestinationAddressName(cfg, feedOverlay, destAddrs, rule.Match.DestinationAddressName)
 			if len(destAddrs) == 0 {
 				continue
 			}
@@ -399,7 +447,7 @@ func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]u
 			// (fail-closed) instead of collapsing back to match-any. A commit-
 			// time strict gate (validateNATSourceAddressNameReferencesStrict)
 			// makes the typo operator-visible; this is the dataplane backstop.
-			sourceAddrs = appendNATSourceAddressName(cfg, sourceAddrs, rule.Match.SourceAddressName)
+			sourceAddrs = appendNATSourceAddressName(cfg, feedOverlay, sourceAddrs, rule.Match.SourceAddressName)
 
 			// Resolve application match to protocol+ports if specified.
 			type appTerm struct {
