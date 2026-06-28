@@ -5293,6 +5293,38 @@ func TestBuildScreenSnapshotsIncludesSynFragOnlyProfile(t *testing.T) {
 	}
 }
 
+// #3316: an icmp-fragment-only screen profile must publish ICMPFragment in the
+// snapshot AND pass the emit gate. The Rust dataplane (screen/stateless.rs
+// check_icmp_fragment) consumes the `icmp_fragment` field and drops fragmented
+// ICMP/ICMPv6 — but buildScreenSnapshots never set the field nor counted it in
+// the enabled-profile predicate, so the protection was unreachable from config.
+// RED if the screens.go publish (or the predicate inclusion) is reverted.
+func TestBuildScreenSnapshotsIncludesICMPFragmentOnlyProfile(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"lan": {Name: "lan", ScreenProfile: "icmp-frag-only"},
+	}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"icmp-frag-only": {
+			Name: "icmp-frag-only",
+			ICMP: config.ICMPScreen{Fragment: true},
+		},
+	}
+	snaps := buildScreenSnapshots(cfg)
+	if len(snaps) != 1 {
+		t.Fatalf("len(snaps) = %d, want 1 — icmp-fragment-only profile must pass the emit gate", len(snaps))
+	}
+	if !snaps[0].ICMPFragment {
+		t.Fatalf("ICMPFragment = false, want true — snapshot must publish the icmp-fragment screen")
+	}
+	// Sanity: nothing else should be on.
+	if snaps[0].SynFin || snaps[0].NoFlag || snaps[0].FinNoAck ||
+		snaps[0].WinNuke || snaps[0].PingDeath || snaps[0].Teardrop ||
+		snaps[0].SynFrag || snaps[0].SourceRoute || snaps[0].Land {
+		t.Fatalf("unexpected other-checks set: %+v", snaps[0])
+	}
+}
+
 // #3082: a zone that REFERENCES an undefined screen profile must be recorded
 // in the references-missing set so the dataplane can emit a runtime WARN
 // (instead of silently passing all screen checks). A zone with no screen

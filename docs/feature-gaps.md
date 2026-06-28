@@ -237,7 +237,7 @@ xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT
 
 ## 9. Screen/IDS Enhancements
 
-xpf implements 11 screen checks (land, syn-flood, ping-death, teardrop, rate-limiting, ip-sweep, winnuke, syn-frag, syn-fin, no-flag, fin-no-ack) plus per-IP session limiting. These are additional vSRX screen options.
+xpf implements 12 screen checks (land, syn-flood, ping-death, icmp-fragment, teardrop, rate-limiting, ip-sweep, winnuke, syn-frag, syn-fin, no-flag, fin-no-ack) plus per-IP session limiting. These are additional vSRX screen options.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -247,6 +247,7 @@ xpf implements 11 screen checks (land, syn-flood, ping-death, teardrop, rate-lim
 | **UDP Port Scan Detection** | `security screen ids-option ... udp port-scan threshold N` | Same as TCP port scan but for UDP | Medium | Missing |
 | **UDP Sweep Detection** | `security screen ids-option ... udp udp-sweep threshold N` | Detect UDP sweeps (same port, many destinations) | Low | Missing |
 | **TCP Sweep Detection** | `security screen ids-option ... tcp tcp-sweep threshold N` | Detect TCP sweeps (same port, many destinations) | Low | Missing |
+| **ICMP Fragment** | `security screen ids-option ... icmp fragment` | Drop any fragmented ICMP/ICMPv6 packet (a fragmentation-based attack signature). | Medium | **Done** (#3316) -- the userspace dataplane (`screen/stateless.rs check_icmp_fragment`) already dropped fragmented ICMP/ICMPv6 when `icmp_fragment` was set, but the Go config→snapshot path was missing (`ICMPScreen` had no field, `compileScreen` ignored the leaf, the schema subtree was open, and `buildScreenSnapshots` never published `ICMPFragment`), so the check was unreachable from config. #3316 adds `ICMPScreen.Fragment`, the `icmp fragment` compiler case, the schema leaf, and the snapshot publish + emit-gate inclusion. |
 | **IP Block Fragment** | `security screen ids-option ... ip block-frag` | Block all IP fragments unconditionally | Low | Partial (fragment checks exist but not unconditional block option) |
 | **IPv6 Extension Header Filtering** | `security screen ids-option ... ip ipv6-extension-header ...` | Filter/block specific IPv6 extension headers (hop-by-hop, routing, destination, fragment, mobility, no-next) | Medium | Missing |
 
