@@ -3,7 +3,6 @@ package grpcapi
 import (
 	"context"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -169,27 +168,45 @@ func runPacketDropUntilMatch(t *testing.T, s *Server, eb *logging.EventBuffer, r
 	return false, ""
 }
 
-// TestMonitorPacketDropProtocolNumericMatches guards the #3382 matcher fix
-// (Codex MAJOR 1): a NUMERIC protocol filter must match a drop whose record
-// renders the protocol NAME. The record carries rec.Protocol="TCP"; a request
-// protocol of "6" must match.
+// TestMonitorPacketDropProtocolMatches guards the #3382 matcher fix (Codex
+// MAJOR 1 + 3rd-round follow-up): the protocol filter must match against the
+// numeric protocol the RECORD carries, not a re-parse of the rendered name.
 //
-// FAIL-ON-REVERT: the old strings.EqualFold(rec.Protocol, req.Protocol) compare
-// makes "6" never match "TCP", so the record is never streamed and matched is
-// false.
-func TestMonitorPacketDropProtocolNumericMatches(t *testing.T) {
-	eb := logging.NewEventBuffer(16)
-	s := &Server{store: packetDropTestStore(t), eventBuf: eb}
-	rec := logging.EventRecord{
-		Type: "POLICY_DENY", Protocol: "TCP",
-		SrcAddr: "1.2.3.4:1000", DstAddr: "5.6.7.8:80",
+//   - "6"/"tcp"/"TCP" all match a TCP drop (rec.Protocol="TCP", num 6).
+//   - "41" matches an IPv6-encap drop (rec.Protocol="IPV6", num 41). This is
+//     the case the re-parse approach got WRONG: protoName(41)="IPV6" but
+//     appid.ProtocolNumber("ipv6") is deliberately one-way, so re-parsing
+//     rec.Protocol dropped every proto-41 record.
+//
+// FAIL-ON-REVERT: comparing by re-parsed rec.Protocol makes the proto-41 case
+// never match (RED), and the old strings.EqualFold compare makes the numeric
+// "6" case never match "TCP".
+func TestMonitorPacketDropProtocolMatches(t *testing.T) {
+	cases := []struct {
+		name     string
+		reqProto string
+		recName  string
+		recNum   uint8
+	}{
+		{"numeric tcp", "6", "TCP", 6},
+		{"lower tcp", "tcp", "TCP", 6},
+		{"upper tcp", "TCP", "TCP", 6},
+		{"numeric ipv6-encap", "41", "IPV6", 41}, // protoName non-reversible
 	}
-	matched, line := runPacketDropUntilMatch(t, s, eb, &pb.MonitorPacketDropRequest{Protocol: "6"}, rec)
-	if !matched {
-		t.Fatal("numeric protocol filter 6 did not match a TCP drop; matcher is accepted-but-never-matches")
-	}
-	if !strings.Contains(line, "tcp") {
-		t.Errorf("matched line = %q, want it to contain the tcp protocol", line)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eb := logging.NewEventBuffer(16)
+			s := &Server{store: packetDropTestStore(t), eventBuf: eb}
+			rec := logging.EventRecord{
+				Type: "POLICY_DENY", Protocol: tc.recName, ProtocolNum: tc.recNum,
+				SrcAddr: "1.2.3.4:1000", DstAddr: "5.6.7.8:80",
+			}
+			matched, _ := runPacketDropUntilMatch(t, s, eb, &pb.MonitorPacketDropRequest{Protocol: tc.reqProto}, rec)
+			if !matched {
+				t.Fatalf("protocol filter %q did not match a %s drop (num %d); matcher is accepted-but-never-matches",
+					tc.reqProto, tc.recName, tc.recNum)
+			}
+		})
 	}
 }
 

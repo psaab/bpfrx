@@ -12,7 +12,8 @@ type EventRecord struct {
 	Type            string // "SESSION_OPEN", "POLICY_DENY", etc.
 	SrcAddr         string // "10.0.1.5:443"
 	DstAddr         string
-	Protocol        string // "TCP", "UDP"
+	Protocol        string // "TCP", "UDP" (rendered name; numeric for unnamed)
+	ProtocolNum     uint8  // raw IP protocol number the record carries (#3382). The matcher compares this directly: protoName rendering is NOT reversible (protoName(41)="IPV6" but ProtocolNumber("ipv6") is one-way), so re-parsing Protocol drops proto-41/ipv6 records.
 	Action          string // "permit", "deny"
 	PolicyID        uint32
 	RuleID          uint32

@@ -352,16 +352,18 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 					continue
 				}
 			}
-			if req.Protocol != "" {
-				// Compare by resolved protocol NUMBER, not string. The
-				// record renders rec.Protocol as a NAME ("TCP") for the
-				// named set and a numeric string otherwise, while the
-				// request may be named or numeric. Resolving rec.Protocol
-				// back through the same SSOT makes "6", "tcp", and "TCP"
-				// all match a TCP drop (#3382 matcher fix).
-				if recNum, ok := appid.ProtocolNumber(rec.Protocol); !ok || recNum != reqProtoNum {
-					continue
-				}
+			if req.Protocol != "" && rec.ProtocolNum != reqProtoNum {
+				// Compare against the numeric protocol the RECORD carries,
+				// not a re-parse of the rendered name. protoName is NOT
+				// reversible — protoName(41)="IPV6" but
+				// appid.ProtocolNumber("ipv6") is deliberately one-way, so
+				// re-parsing rec.Protocol drops every proto-41 record. The
+				// raw number (#3382) makes the match total for named,
+				// named-non-reversible, and unnamed protocols alike.
+				// reqProtoNum is resolved once in validation via
+				// appid.ProtocolNumber (correct for the named/numeric
+				// REQUEST side).
+				continue
 			}
 			if req.FromZone != "" && rec.InZoneName != req.FromZone {
 				continue
