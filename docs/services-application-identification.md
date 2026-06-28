@@ -226,8 +226,7 @@ runtime effect is the L3/L4 catalog classification above
     above never engaged). It is now **typed and validated** at two layers,
     each with the #1960 strict-commit / lenient-load downgrade: (1) the
     schema typed leaf (`schema_security.go`, `ValueInteger` +
-    `ValidateInteger(1, 86400)`, matching the NAT persistent-binding
-    `inactivity-timeout` bound) rejects a malformed **top-level** value at
+    `ValidateInteger(0, 86400)`) rejects a malformed **top-level** value at
     commit-check for every application via the `SchemaValidate` gate; (2)
     `validateApplicationSpecsStrict` rejects a malformed top-level **or
     inline-`term`** timeout of a **referenced** application (the inline-term
@@ -237,7 +236,12 @@ runtime effect is the L3/L4 catalog classification above
     path both layers downgrade to a warning (no-brick) so an
     already-persisted / older-peer-synced config carrying a bad timeout
     still BOOTS — the dataplane already falls back to the global timeout for
-    it.
+    it. The accepted range is **`0..86400`** seconds, where **`0` is the
+    pre-existing inherit-global sentinel** (the dataplane treats
+    `InactivityTimeout <= 0` as "use the global per-protocol timeout",
+    `clampNonNegU32` / `capabilities.go`; `types_security.go` documents `0 =
+    default`), so `inactivity-timeout 0` keeps committing cleanly. Only
+    non-numeric, negative, and `>86400` values are rejected.
 - `applications application-set` — expands into individual
   applications at compile time. Members may be either
   `application <name>` references or nested

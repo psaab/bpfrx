@@ -71,7 +71,11 @@ func referencedTimeoutTermApp(val string) []string {
 // err == nil` drop in compileApplications) makes these commit clean again, so
 // CompileConfig returns nil and the `err == nil` assertions fire RED.
 func TestApplicationSpec_ReferencedBadInactivityTimeout_RejectsAtCommit(t *testing.T) {
-	for _, val := range []string{"30s", "thirty", "-1", "99999", "0"} {
+	// Only MALFORMED values reject: non-numeric, negative, and over-max. The
+	// 86401 / 99999 cases pin the upper edge (86400 is the last accepted value).
+	// 0 is NOT here — it is the valid inherit-global sentinel (see the accept
+	// test below).
+	for _, val := range []string{"30s", "thirty", "-1", "86401", "99999"} {
 		tree := flatTreeFromSets(t, referencedTimeoutApp("inactivity-timeout", val)...)
 		_, err := CompileConfig(tree)
 		if err == nil {
@@ -116,19 +120,58 @@ func TestApplicationSpec_ReferencedBadTermTimeout_RejectsAtCommit(t *testing.T) 
 
 // Non-tautological companion: the SAME policy structure with a VALID
 // inactivity-timeout must commit cleanly, proving the rejects above are caused
-// by the malformed value and not the surrounding policy. Boundary values 1 and
-// 86400 are accepted (the inclusive range edges).
+// by the malformed value and not the surrounding policy. The inclusive range
+// edges 0 (inherit-global sentinel) and 86400 are both accepted, and the
+// configured value actually LANDS on the compiled application (a regression that
+// accepted but dropped it to 0 would be caught by the want check below).
 func TestApplicationSpec_ReferencedValidTimeout_AcceptsAtCommit(t *testing.T) {
-	for _, val := range []string{"1", "300", "1800", "86400"} {
-		tree := flatTreeFromSets(t, referencedTimeoutApp("inactivity-timeout", val)...)
+	for _, val := range []struct {
+		raw  string
+		want int
+	}{
+		{"0", 0}, // inherit-global sentinel — pre-existing valid (capabilities.go)
+		{"1", 1},
+		{"300", 300},
+		{"1800", 1800},
+		{"86400", 86400}, // upper edge
+	} {
+		tree := flatTreeFromSets(t, referencedTimeoutApp("inactivity-timeout", val.raw)...)
 		cfg, err := CompileConfig(tree)
 		if err != nil {
-			t.Fatalf("inactivity-timeout %q: expected commit to accept, got %v", val, err)
+			t.Fatalf("inactivity-timeout %q: expected commit to accept, got %v", val.raw, err)
 		}
-		// And the value actually lands on the compiled application (not dropped).
-		if app := cfg.Applications.Applications["BAD"]; app == nil {
-			t.Fatalf("inactivity-timeout %q: application BAD missing from compiled config", val)
+		app := cfg.Applications.Applications["BAD"]
+		if app == nil {
+			t.Fatalf("inactivity-timeout %q: application BAD missing from compiled config", val.raw)
 		}
+		if app.InactivityTimeout != val.want {
+			t.Fatalf("inactivity-timeout %q: value did not land: got %d, want %d", val.raw, app.InactivityTimeout, val.want)
+		}
+	}
+}
+
+// The 0 inherit-global sentinel must commit cleanly and compile to
+// InactivityTimeout==0 on EVERY path: top-level `timeout` alias and inline term
+// (the top-level `inactivity-timeout 0` case is covered by the accept loop
+// above). RED-on-revert: with appTimeoutMin=1 these go RED (0 is rejected).
+func TestApplicationSpec_ZeroInheritSentinel_Accepts(t *testing.T) {
+	// Top-level `timeout 0`.
+	tree := flatTreeFromSets(t, referencedTimeoutApp("timeout", "0")...)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("timeout 0: expected commit to accept the inherit sentinel, got %v", err)
+	}
+	if app := cfg.Applications.Applications["BAD"]; app == nil || app.InactivityTimeout != 0 {
+		t.Fatalf("timeout 0: expected InactivityTimeout==0 (inherit), got %+v", app)
+	}
+	// Inline term `inactivity-timeout 0`.
+	tree = flatTreeFromSets(t, referencedTimeoutTermApp("0")...)
+	cfg, err = CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("term inactivity-timeout 0: expected commit to accept, got %v", err)
+	}
+	if app := cfg.Applications.Applications["MULTI-t1"]; app == nil || app.InactivityTimeout != 0 {
+		t.Fatalf("term inactivity-timeout 0: expected InactivityTimeout==0 (inherit), got %+v", app)
 	}
 }
 
@@ -210,11 +253,12 @@ func TestApplicationSpec_SchemaGate_TopLevelTimeout(t *testing.T) {
 			t.Fatalf("%s %q: expected SchemaValidate to accept, got %v", leaf, val, err)
 		}
 	}
-	for _, val := range []string{"30s", "thirty", "-1", "0", "99999"} {
+	for _, val := range []string{"30s", "thirty", "-1", "86401", "99999"} {
 		reject("inactivity-timeout", val)
 		reject("timeout", val)
 	}
-	for _, val := range []string{"1", "300", "1800", "86400"} {
+	// 0 is the inherit-global sentinel and 86400 the upper edge — both accepted.
+	for _, val := range []string{"0", "1", "300", "1800", "86400"} {
 		accept("inactivity-timeout", val)
 		accept("timeout", val)
 	}

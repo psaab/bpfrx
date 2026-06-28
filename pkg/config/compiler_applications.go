@@ -6,14 +6,20 @@ import (
 	"strings"
 )
 
-// Application inactivity-timeout / timeout accepted range, in seconds. Mirrors
-// the NAT persistent-binding inactivity-timeout bound (schema_security.go,
-// ValidateInteger(1, 86400)) so the two timeout leaves agree, and matches the
-// session-timeout range a custom application can sensibly set. Junos rejects a
-// non-integer or out-of-range value at commit; xpf historically dropped it
-// silently (#3320).
+// Application inactivity-timeout / timeout accepted range, in seconds. The
+// upper bound matches the NAT persistent-binding inactivity-timeout
+// (schema_security.go) and the session-timeout range a custom application can
+// sensibly set. The lower bound is 0 — NOT 1 — because 0 is a pre-existing,
+// documented "inherit the global per-protocol timeout" sentinel: the userspace
+// serializer treats InactivityTimeout <= 0 as "use the global timeout"
+// (pkg/dataplane/userspace/capabilities.go) and the typed field documents it
+// (types_security.go: "0 = default"). `inactivity-timeout 0` committed cleanly
+// before #3320 (strconv.Atoi("0") = 0, no error), so the strict gate must keep
+// accepting it. #3320 targets MALFORMED values only — non-numeric ("30s",
+// "thirty"), negative, and out-of-range (>86400) — all of which fall outside
+// [0, 86400].
 const (
-	appTimeoutMin = 1
+	appTimeoutMin = 0
 	appTimeoutMax = 86400
 )
 
