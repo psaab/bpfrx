@@ -51,30 +51,43 @@ var nftDeleteTable = func(family, name string) ([]byte, error) {
 // applyLo0Filter applies loopback filter rules for host-bound traffic.
 // Implements "interfaces lo0 unit 0 family inet filter input <name>" by
 // generating nftables rules from the named firewall filter.
-func (d *Daemon) applyLo0Filter(cfg *config.Config) {
+//
+// Fail-closed (#3392, mirroring the host-inbound #3333 fix): both the apply and
+// the teardown surface their failure as a returned error instead of a swallowed
+// WARN. applyConfigLocked joins this into the commit result, so a committed lo0
+// input filter that did not reach the kernel reports commit FAILURE rather than
+// silent success (the lo0 filter is host-protection control-plane enforcement,
+// the same class of fail-open #3333 closed for host-inbound). The retained
+// kernel state is always the more- or equally-restrictive prior state: an `-f -`
+// apply loads atomically (the previous table is kept untouched on failure), and
+// a failed teardown leaves the existing filter in place — neither relaxes
+// enforcement silently. Boot / DHCP re-applies go through applyConfig(), which
+// only logs the error, so a transient nft failure cannot brick startup; the next
+// clean commit re-renders.
+func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 	filterV4 := cfg.System.Lo0FilterInputV4
 	filterV6 := cfg.System.Lo0FilterInputV6
 	if filterV4 == "" && filterV6 == "" {
-		// No lo0 filter configured — clean up any stale nftables rules.
-		// The error stays discarded: delete fails normally when the
-		// table doesn't exist (the common case). Timeout-bounded so a
-		// wedged nft cannot stall the apply path (#1794).
-		_, _ = runCommandTimeout("nft", "delete", "table", "inet", "xpf_lo0")
-		return
+		// No lo0 filter configured — remove any stale table. nftDeleteTable is
+		// idempotent (an add-then-delete payload, so no error when the table is
+		// absent — the common no-lo0-filter case), so a non-nil error here is a
+		// REAL teardown failure that left a stale lo0 input filter in the kernel:
+		// surface it so the commit fails closed rather than reporting that the lo0
+		// filter was removed when it was not.
+		if out, err := nftDeleteTable("inet", "xpf_lo0"); err != nil {
+			slog.Warn("failed to delete stale lo0 filter table", "err", err, "output", string(out))
+			return fmt.Errorf("delete stale lo0 nftables table: %w", err)
+		}
+		return nil
 	}
 
 	nftConf := buildLo0FilterPayload(cfg, filterV4, filterV6)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
-	// WaitDelay caps the post-SIGKILL pipe-drain window (#1794).
-	cmd.WaitDelay = 5 * time.Second
-	cmd.Stdin = strings.NewReader(nftConf)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := nftApplyPayload(nftConf); err != nil {
 		slog.Warn("failed to apply lo0 filter", "err", err, "output", string(out))
-	} else {
-		slog.Info("lo0 filter applied", "v4", filterV4, "v6", filterV6)
+		return fmt.Errorf("apply lo0 nftables filter: %w", err)
 	}
+	slog.Info("lo0 filter applied", "v4", filterV4, "v6", filterV6)
+	return nil
 }
 
 // buildLo0FilterPayload assembles the exact nft ruleset payload that
