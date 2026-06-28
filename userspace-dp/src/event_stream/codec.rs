@@ -385,6 +385,28 @@ impl EventFrame {
         // NextHop (4 or 16 bytes)
         pos = write_ip_opt(&mut buf, pos, decision.resolution.next_hop, is_v6);
 
+        // #3301: the admitting policy's firewall metadata rides the open frame
+        // (trailing fields, additive within MSG_SESSION_OPEN) so a peer-promoted
+        // session is correctly attributed, counted, and aged after failover.
+        // The Go decoder length-skips these; an old daemon ignores them.
+        //
+        // [+0:+4] policy_id u32 LE (#3056)
+        buf[pos..pos + 4].copy_from_slice(&metadata.policy_id.to_le_bytes());
+        pos += 4;
+        // [+4:+8] policy_counter_idx u32 LE (#3073)
+        buf[pos..pos + 4].copy_from_slice(&metadata.policy_counter_idx.to_le_bytes());
+        pos += 4;
+        // [+8:+12] inactivity_timeout SECONDS u32 LE (#3227). The metadata
+        // carries ns; the cross-node wire (Go SessionValue.AppTimeout,
+        // SessionSyncRequest.inactivity_timeout) is whole seconds, so convert
+        // ns -> s (saturating). 0 => "use the global per-protocol timeout".
+        let inactivity_secs = match metadata.inactivity_timeout_ns {
+            Some(ns) => u32::try_from(ns / 1_000_000_000).unwrap_or(u32::MAX),
+            None => 0,
+        };
+        buf[pos..pos + 4].copy_from_slice(&inactivity_secs.to_le_bytes());
+        pos += 4;
+
         // Write header
         let payload_len = (pos - FRAME_HEADER_SIZE) as u32;
         write_header(&mut buf, payload_len, MSG_SESSION_OPEN, seq);
@@ -515,8 +537,9 @@ impl EventFrame {
     /// RT_FLOW_SESSION_CLOSE syslog record and the NetFlow/IPFIX close exporters
     /// name the admitting policy instead of policy 0. A 0 keeps the prior
     /// "no policy" rendering (host-local / seed sessions, or a peer-PROMOTED
-    /// session that closes on a node which never ran the admitting policy —
-    /// policy_id is in-process only, not yet on the cross-node sync wire).
+    /// session synced from a pre-#3301 peer that omitted the policy_id wire
+    /// field; #3301 now carries it on the session-sync wire, so a peer-promoted
+    /// session synced from a current peer closes with the admitting policy).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_session_close_rt_flow(
         seq: u64,
@@ -538,9 +561,10 @@ impl EventFrame {
         // created-subsec-nanos), so the RT_FLOW_SESSION_CLOSE syslog record and
         // the NetFlow/IPFIX close exporters name the admitting policy instead of
         // policy 0. 0 stays the value for a session with no admitting policy
-        // (host-local / seed) and for a peer-PROMOTED session that closes on a
-        // node which never ran the policy (policy_id is in-process only, not yet
-        // on the cross-node sync wire — see server/helpers.rs).
+        // (host-local / seed) and for a peer-PROMOTED session synced from a
+        // pre-#3301 peer; #3301 carries policy_id on the session-sync wire
+        // (SESSION_OPEN delta + SessionSyncRequest), so a session synced from a
+        // current peer closes with the admitting policy (see server/helpers.rs).
         policy_id: u32,
         owner_rg_id: i16,
         log_syslog: bool,

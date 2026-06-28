@@ -463,28 +463,36 @@ pub(crate) fn build_synced_session_entry(
             // log), bit-identical to pre-#2785 behavior.
             log_session_init: req.log_session_init,
             log_session_close: req.log_session_close,
-            // #3056: a peer-synced session imports policy_id 0 — the admitting
-            // policy ID is NOT yet carried on the cross-node HA session-sync
-            // wire (SessionSyncRequest). Stamping the admitting policy on the
-            // session (#3056) is in-process only; carrying it across failover so
-            // a peer-PROMOTED session's live-session row / RT_FLOW records
-            // resolve the admitting policy is a deliberate follow-up that adds a
-            // `req.policy_id` wire field here, mirroring how #2785 added the
-            // log_session_{init,close} fields above (#1961 both-sides
-            // discipline). Until then a synced session resolves policy 0,
-            // bit-identical to today.
-            policy_id: 0,
-            // #3227: like policy_id, the per-application idle timeout is not yet
-            // carried on the cross-node HA session-sync wire. A peer-synced
-            // session ages on the global per-protocol timeout until a
-            // real-traffic refresh re-stamps it from the matched policy — a
-            // deliberate follow-up mirroring the policy_id wire deferral above.
-            inactivity_timeout_ns: None,
-            // #3073: the per-rule hit-counter handle is in-process only and not
-            // carried on the cross-node HA session-sync wire (mirrors the
-            // policy_id deferral above), so a peer-synced session counts nothing
-            // locally until a real-traffic re-evaluation re-stamps a handle.
-            policy_counter_idx: 0,
+            // #3301: the admitting policy ID now rides the cross-node HA
+            // session-sync wire (SessionSyncRequest.policy_id). A peer-PROMOTED
+            // session's live-session row / RT_FLOW records resolve the
+            // admitting policy that #3056 stamps in-process, instead of the `0`
+            // sentinel (which the Go side renders as the FIRST configured
+            // policy — a wrong attribution). An old peer omits the field =>
+            // serde(default) 0, the legitimate "unattributed" value,
+            // bit-identical to pre-#3301 (rolling-upgrade safe).
+            policy_id: req.policy_id,
+            // #3301: the per-application idle timeout now rides the wire in
+            // SECONDS (SessionSyncRequest.inactivity_timeout). Convert to ns via
+            // the shared helper (0 => None => use the global per-protocol
+            // timeout, the pre-#3301 behavior). A short-timeout app session
+            // therefore ages out on the app's value after failover without a
+            // real-traffic refresh (#3227).
+            inactivity_timeout_ns: crate::session::app_inactivity_timeout_ns(
+                if req.inactivity_timeout != 0 {
+                    Some(req.inactivity_timeout)
+                } else {
+                    None
+                },
+            ),
+            // #3301: the per-rule hit-counter handle now rides the wire
+            // (SessionSyncRequest.policy_counter_idx). HA requires identical
+            // config on both nodes, so the same #3073 idx resolves the same
+            // rule on the peer; the established fast path then increments the
+            // correct policy hit counter on every forwarded packet after
+            // failover. An old peer omits the field => serde(default) 0 ("no
+            // per-rule counter"), the pre-#3301 behavior (rolling-upgrade safe).
+            policy_counter_idx: req.policy_counter_idx,
         },
         origin: crate::session::SessionOrigin::SyncImport,
         // #2170: carry the peer's install generation onto the helper entry.

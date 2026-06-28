@@ -80,11 +80,15 @@ within that rule the first matching application term supplies the timeout
 config order, then ICMP-type-constrained terms. An application with no
 custom timeout (`None`) is byte-identical to pre-#3227 and ages on the
 global per-protocol timeout. This restores the legacy-eBPF `appTimeout`
-parity (the retired maps wired the same per-app value). **HA caveat:**
-like `policy_id`, the override is in-process only — it is NOT yet carried
-on the cross-node session-sync wire, so a peer-promoted session ages on
-the global timeout until a real-traffic refresh re-stamps it (a
-documented follow-up).
+parity (the retired maps wired the same per-app value). **HA (#3301):**
+like `policy_id` and `policy_counter_idx`, the override now rides the
+cross-node session-sync wire — the helper emits it (in seconds) on the
+SESSION_OPEN delta and on `SessionSyncRequest.inactivity_timeout`, and
+`build_synced_session_entry` re-applies it via `app_inactivity_timeout_ns`.
+A peer-promoted session therefore ages out on the app's idle window after
+failover without waiting for a real-traffic refresh. An old peer omits the
+field (`serde(default)` 0 → `None` → the global timeout), bit-identical to
+pre-#3301 (rolling-upgrade safe).
 
 **TCP opening / half-open state (#3152).** A TCP session created by a
 bare SYN (SYN set, ACK clear) starts in the OPENING (half-open) state

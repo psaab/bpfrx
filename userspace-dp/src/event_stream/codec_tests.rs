@@ -700,6 +700,47 @@ fn test_encode_session_open_carries_log_flags() {
     assert_eq!(pn[26] & (FLAG_LOG_SESSION_INIT | FLAG_LOG_SESSION_CLOSE), 0);
 }
 
+// #3301: the admitting policy's firewall metadata (policy_id,
+// policy_counter_idx, inactivity_timeout seconds) rides the open frame as
+// trailing fields after NextHop so a peer-promoted session is correctly
+// attributed/counted/aged after failover. Reverting the codec.rs encode drops
+// these and this fails RED.
+#[test]
+fn test_encode_session_open_carries_policy_fields_3301() {
+    let zones = test_zone_map();
+    let mut md = test_metadata();
+    md.policy_id = 42;
+    md.policy_counter_idx = 7;
+    md.inactivity_timeout_ns = Some(30 * 1_000_000_000);
+    let frame =
+        EventFrame::encode_session_open(1, &test_key_v4(), &test_decision(), &md, &zones, false);
+    let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
+    // v4 trailing block is the last 12 bytes: policy_id, policy_counter_idx,
+    // inactivity_timeout (seconds), each u32 LE.
+    let n = p.len();
+    let policy_id = u32::from_le_bytes(p[n - 12..n - 8].try_into().unwrap());
+    let counter_idx = u32::from_le_bytes(p[n - 8..n - 4].try_into().unwrap());
+    let inact_secs = u32::from_le_bytes(p[n - 4..n].try_into().unwrap());
+    assert_eq!(policy_id, 42, "policy_id must ride the open frame");
+    assert_eq!(counter_idx, 7, "policy_counter_idx must ride the open frame");
+    assert_eq!(inact_secs, 30, "inactivity_timeout (ns->s) must ride the open frame");
+
+    // Default metadata => zeros (unattributed / no counter / global timeout).
+    let frame_none = EventFrame::encode_session_open(
+        2,
+        &test_key_v4(),
+        &test_decision(),
+        &test_metadata(),
+        &zones,
+        false,
+    );
+    let pn = &frame_none.data[FRAME_HEADER_SIZE..frame_none.len as usize];
+    let m = pn.len();
+    assert_eq!(u32::from_le_bytes(pn[m - 12..m - 8].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(pn[m - 8..m - 4].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(pn[m - 4..m].try_into().unwrap()), 0);
+}
+
 #[test]
 fn test_encode_session_open_v6() {
     let zones = test_zone_map();

@@ -984,6 +984,15 @@ func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey,
 		// #2170: mirror the install generation to the helper so its in-memory
 		// SyncedSessionEntry can enforce the same generation guard.
 		req.Generation = val.Generation
+		// #3301: carry the admitting policy's firewall metadata so a
+		// peer-PROMOTED session resolves the admitting policy (PolicyID),
+		// increments the correct per-rule hit counter (PolicyCounterIdx), and
+		// ages on the per-application idle timeout (AppTimeout, seconds) after
+		// failover. 0 => unattributed / no counter / global timeout, the
+		// pre-#3301 behavior an old helper still applies via serde(default).
+		req.PolicyID = val.PolicyID
+		req.PolicyCounterIdx = val.PolicyCounterIdx
+		req.InactivityTimeout = val.AppTimeout
 		if val.Flags&dataplane.SessFlagSNAT == 0 {
 			req.NATSrcIP = ""
 			req.NATSrcPort = 0
@@ -1055,6 +1064,10 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		req.LogSessionClose = val.LogFlags&dataplane.LogFlagSessionClose != 0
 		// #2170: mirror the install generation to the helper.
 		req.Generation = val.Generation
+		// #3301: carry the admitting policy's firewall metadata (see V4).
+		req.PolicyID = val.PolicyID
+		req.PolicyCounterIdx = val.PolicyCounterIdx
+		req.InactivityTimeout = val.AppTimeout
 		if val.Flags&dataplane.SessFlagSNAT == 0 {
 			req.NATSrcIP = ""
 			req.NATSrcPort = 0

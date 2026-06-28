@@ -2359,6 +2359,22 @@ type SessionSyncRequest struct {
 	// wire-type discipline (no omitempty ambiguity on a numeric field). The
 	// Rust side declares `#[serde(default)] generation: u64`.
 	Generation uint64 `json:"generation"`
+	// #3301: the admitting policy's firewall metadata, carried so a
+	// peer-PROMOTED session is correctly attributed, counted, and aged after
+	// failover instead of degrading to policy 0 / no counter / the global
+	// timeout. omitempty is safe — an old helper without these keys decodes
+	// them via serde(default) to 0, which is the legitimate "unattributed /
+	// no per-rule counter / use-global-timeout" value, bit-identical to the
+	// pre-#3301 synced-session behavior (rolling-upgrade safe).
+	//
+	// PolicyID is the admitting policy ID (#3056 namespace). PolicyCounterIdx
+	// is the 1-based per-rule hit-counter handle (#3073); HA requires
+	// identical config on both nodes so the same idx resolves the same rule.
+	// InactivityTimeout is the per-application idle timeout in SECONDS (#3227,
+	// matching SessionValue.AppTimeout); the helper converts it to ns.
+	PolicyID          uint32 `json:"policy_id,omitempty"`
+	PolicyCounterIdx  uint32 `json:"policy_counter_idx,omitempty"`
+	InactivityTimeout uint32 `json:"inactivity_timeout,omitempty"`
 }
 
 type SessionDeltaInfo struct {
@@ -2405,6 +2421,18 @@ type SessionDeltaInfo struct {
 	// LogFlags so it logs identically after failover.
 	LogSessionInit  bool `json:"log_session_init,omitempty"`
 	LogSessionClose bool `json:"log_session_close,omitempty"`
+	// #3301: the admitting policy's firewall metadata, decoded from the
+	// trailing fields of the binary open frame (after NextHop) AND mirrored on
+	// the JSON RPC-fallback delta. Stamped onto the synced SessionValue
+	// (PolicyID/PolicyCounterIdx/AppTimeout) by daemon_ha_userspace.go so the
+	// cluster sync wire and the peer helper carry them, correcting a
+	// peer-promoted session's policy attribution / hit-count / idle timeout
+	// after failover. PolicyID = #3056 policy ID; PolicyCounterIdx = #3073
+	// 1-based per-rule counter handle; AppTimeout = #3227 per-application idle
+	// timeout in SECONDS.
+	PolicyID         uint32 `json:"policy_id,omitempty"`
+	PolicyCounterIdx uint32 `json:"policy_counter_idx,omitempty"`
+	AppTimeout       uint32 `json:"app_timeout,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

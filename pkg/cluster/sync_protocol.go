@@ -80,9 +80,10 @@ func encodeRawMessage(msgType uint8, payload []byte) []byte {
 func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue) []byte {
 	keySize := 16
 	valSize := 160
-	// +8 trailing bytes for the #2170 install Generation (length-gated:
-	// old decoders stop after FibGen and ignore it).
-	buf := make([]byte, keySize+valSize+8)
+	// +8 for the #2170 install Generation, +8 for the #3301 trailing
+	// AppTimeout(u32)+PolicyCounterIdx(u32). All length-gated: an old decoder
+	// stops after the field it knows and ignores the rest.
+	buf := make([]byte, keySize+valSize+8+8)
 	off := 0
 	copy(buf[off:], key.SrcIP[:])
 	off += 4
@@ -159,6 +160,13 @@ func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue
 	// #2170: install generation (length-gated trailing field).
 	binary.LittleEndian.PutUint64(buf[off:], val.Generation)
 	off += 8
+	// #3301: per-application idle timeout (seconds) + per-rule hit-counter
+	// handle (length-gated trailing fields). Old decoders stop after the
+	// generation and ignore these; absent => 0 (global timeout / no counter).
+	binary.LittleEndian.PutUint32(buf[off:], val.AppTimeout)
+	off += 4
+	binary.LittleEndian.PutUint32(buf[off:], val.PolicyCounterIdx)
+	off += 4
 	return buf[:off]
 }
 func encodeSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) []byte {
@@ -247,6 +255,12 @@ func encodeSessionV6Payload(key dataplane.SessionKeyV6, val dataplane.SessionVal
 	// #2170: install generation (length-gated trailing field).
 	binary.LittleEndian.PutUint64(buf[off:], val.Generation)
 	off += 8
+	// #3301: per-application idle timeout + per-rule hit-counter handle
+	// (length-gated trailing fields; see encodeSessionV4Payload).
+	binary.LittleEndian.PutUint32(buf[off:], val.AppTimeout)
+	off += 4
+	binary.LittleEndian.PutUint32(buf[off:], val.PolicyCounterIdx)
+	off += 4
 	return buf[:off]
 }
 
@@ -397,6 +411,16 @@ func decodeSessionV4Payload(payload []byte) (dataplane.SessionKey, dataplane.Ses
 		val.Generation = binary.LittleEndian.Uint64(payload[off:])
 		off += 8
 	}
+	// #3301: per-application idle timeout + per-rule hit-counter handle
+	// (length-gated; absent → 0 = legacy peer / global timeout / no counter).
+	if off+4 <= len(payload) {
+		val.AppTimeout = binary.LittleEndian.Uint32(payload[off:])
+		off += 4
+	}
+	if off+4 <= len(payload) {
+		val.PolicyCounterIdx = binary.LittleEndian.Uint32(payload[off:])
+		off += 4
+	}
 	return key, val, true
 }
 
@@ -503,6 +527,16 @@ func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.S
 	if off+8 <= len(payload) {
 		val.Generation = binary.LittleEndian.Uint64(payload[off:])
 		off += 8
+	}
+	// #3301: per-application idle timeout + per-rule hit-counter handle
+	// (length-gated; absent → 0 = legacy peer / global timeout / no counter).
+	if off+4 <= len(payload) {
+		val.AppTimeout = binary.LittleEndian.Uint32(payload[off:])
+		off += 4
+	}
+	if off+4 <= len(payload) {
+		val.PolicyCounterIdx = binary.LittleEndian.Uint32(payload[off:])
+		off += 4
 	}
 	return key, val, true
 }

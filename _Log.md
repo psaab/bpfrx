@@ -45,6 +45,21 @@
   userspace-dp/src/afxdp/forwarding/README.md,
   userspace-dp/src/afxdp/forwarding_build/tests.rs
 
+## 2026-06-27 — #3303 thread feed overlay into NAT snapshot builders
+
+- **Timestamp**: 2026-06-27
+- **Action**: NAT `match {source,destination}-address-name` resolved
+  static-only because the snapshot builder never passed feedOverlay to the
+  source/destination NAT builders. Added resolveNATAddressNamePrefixes
+  (static book ∪ feed overlay), threaded feedOverlay through the append
+  helpers + buildSourceNATSnapshotsWithFeeds /
+  buildDestinationNATSnapshotsWithFeeds, wired them in builder.go, fixed the
+  docs/feature-gaps.md drift, and added the #3303 fail-on-revert test.
+- **File(s)**: pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/builder.go,
+  pkg/dataplane/userspace/nat_feed_overlay_3303_test.go,
+  docs/feature-gaps.md
+
 ## 2026-06-27 — #3276 DDNS operator force-now / check-now verb
 
 - **Timestamp**: 2026-06-27
@@ -22649,3 +22664,19 @@ top.
   **File(s)**: pkg/config/compiler_validate_strict.go,
   pkg/config/compiler_dynamic_address_feed_ref_3300_test.go,
   docs/config-schema.md
+
+- **Timestamp**: 2026-06-27
+  - **Action**: #3301 — carry policy_id, policy_counter_idx, and per-application
+    inactivity-timeout on the HA session-sync wire (additive both-sided,
+    rolling-upgrade safe). Rust SESSION_OPEN delta trailing fields + Go decode +
+    SessionValue sync-only PolicyCounterIdx + cluster sync_protocol trailing
+    fields + SessionSyncRequest fields (Go+Rust) + build_synced_session_entry
+    apply. Regenerated protocol_wire_v1.json (3 new fields only). Fail-on-revert
+    tests Rust+Go; #2360/#2170 guard tests updated.
+  - **File(s)**: userspace-dp/src/protocol/control.rs,
+    userspace-dp/src/server/helpers.rs, userspace-dp/src/event_stream/codec.rs,
+    userspace-dp/src/session/entry.rs, userspace-dp/src/session/README.md,
+    pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/eventstream.go,
+    pkg/dataplane/userspace/manager_ha.go, pkg/daemon/daemon_ha_userspace.go,
+    pkg/dataplane/types.go, pkg/cluster/sync_protocol.go,
+    docs/userspace-dataplane-gaps.md, plus tests + fixture.

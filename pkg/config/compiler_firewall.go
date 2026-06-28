@@ -265,7 +265,13 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm, family string) {
 			// carries values as child.Keys[1:] and/or child nodes, while a
 			// hierarchical leaf carries a single value via nodeVal.
 			term.DSCPs = append(term.DSCPs, firewallMatchValues(child)...)
-		case "protocol":
+		case "protocol", "next-header":
+			// `next-header` is the IPv6 spelling of `protocol` (Junos family
+			// inet6). It matches the IPv6 Next Header / L4 protocol number, which
+			// the dataplane already enforces via term.Protocols — so it is an
+			// ALIAS for the existing protocol matcher, not new matching. Before
+			// #3307 it had no switch case and was silently dropped (the term lost
+			// its protocol constraint); routing it to Protocols enforces it.
 			term.Protocols = append(term.Protocols, firewallMatchValues(child)...)
 		case "source-address":
 			// Multi-value (#2419/#2545): a bracket/flat-set list collapses
@@ -434,6 +440,17 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm, family string) {
 				term.FlexMatch = fm
 				break // only first range supported per term
 			}
+		default:
+			// #3307: a `from` match leaf the dataplane does NOT enforce. The
+			// schema gate is opt-in, so an unknown leaf (ttl, source-mac-address,
+			// ip-options, fragment-offset, hop-limit, ...) passes commit and was
+			// previously dropped silently here — the term then enforced a BROADER
+			// match than authored (an accept over-permits, a discard/reject
+			// over-drops). Record it so validateFilterFromMatchStrict can reject
+			// the commit fail-closed instead of silently dropping the constraint.
+			// The enforced set is exactly the cases above; every one maps to a
+			// wire field the snapshot builder emits and the Rust matcher reads.
+			term.UnknownFrom = append(term.UnknownFrom, child.Name())
 		}
 	}
 }

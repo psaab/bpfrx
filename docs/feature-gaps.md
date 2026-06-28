@@ -137,7 +137,13 @@ are ENFORCED: a policy/NAT rule referencing a feed-backed `address-name` now
 has the live feed prefixes overlaid into the userspace dataplane's address
 book (the `apply_snapshot` the AF_XDP helper enforces), and a feed refresh
 republishes the snapshot. Previously the prefixes were fetched and shown but
-never reached the forwarding path.
+never reached the forwarding path. The NAT side was completed in #3303: the
+snapshot builder now threads the feed overlay into the source/destination NAT
+builders, so a NAT rule scoped to a feed-backed `match
+source-address-name` / `match destination-address-name` resolves the live feed
+prefixes the same way the policy path does (a DIRECT name reference; an
+address-SET whose member is feed-backed is the separate recursive-overlay gap
+tracked in #3294).
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
