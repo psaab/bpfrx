@@ -2397,6 +2397,65 @@ func validateScreenProfileReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// sortedScreenNames returns the screen-profile names in deterministic order so
+// the strict validators report the first offender stably across runs.
+func sortedScreenNames(screens map[string]*ScreenProfile) []string {
+	names := make([]string, 0, len(screens))
+	for name := range screens {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// validateScreenNumericStrict hard-rejects a screen profile carrying a numeric
+// threshold / count leaf whose explicitly-provided value is not a positive
+// integer — #3317.
+//
+// Screen threshold leaves (icmp/udp flood, ip ip-sweep threshold, tcp port-scan
+// threshold, the tcp syn-flood alarm/attack/source/destination-threshold and
+// timeout subfields, and limit-session source/destination-ip-based) are untyped
+// in the schema. Before this gate compileScreen swallowed the strconv.Atoi
+// failure and silently fell back to a Junos default (icmp/udp flood, ip-sweep,
+// port-scan, syn-flood attack-threshold via #3024/#3230) or to zero/disabled
+// (the other syn-flood subfields and limit-session). A typo'd value
+// (`attack-threshold abc`, `udp flood 99999999999999999999`, `source-ip-based
+// -1`) therefore committed cleanly while the enforced control was materially
+// different from — usually weaker or fully disabled relative to — what the
+// operator authored: a silent fail-open. SRX rejects a non-numeric screen value
+// at commit.
+//
+// compileScreen records every explicitly-provided value that does not parse as
+// a positive integer on ScreenProfile.BadNumeric (path + raw value); an EMPTY
+// value is the "enabled without an explicit threshold" case and is NOT recorded
+// (it legitimately takes the Junos default — #3230). This gate makes the
+// refusal operator-visible at commit, naming the screen profile, the leaf path,
+// and the offending value. The walk is deterministic (profiles sorted by name,
+// BadNumeric in config order). On the tolerant load / peer-sync path the caller
+// downgrades the returned error to a warning (#1960 no-brick); compileScreen
+// applied the default for the bad value independently, so a leniently-loaded
+// profile is no worse than the pre-gate behavior — but the operator never
+// reaches that state through a commit. Mirrors validateFilterDSCPStrict.
+func validateScreenNumericStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, name := range sortedScreenNames(cfg.Security.Screen) {
+		profile := cfg.Security.Screen[name]
+		if profile == nil || len(profile.BadNumeric) == 0 {
+			continue
+		}
+		bad := profile.BadNumeric[0]
+		return fmt.Errorf(
+			"security screen ids-option %q: `%s` value %q is not a positive "+
+				"integer (an unparseable value is silently dropped and the leaf "+
+				"falls back to a default or to zero/disabled, so the protection "+
+				"is weaker than — or fully different from — what was configured)",
+			name, bad.Path, bad.Value)
+	}
+	return nil
+}
+
 // policyActionName renders a PolicyAction as its Junos `then` token for
 // operator-facing validator errors.
 func policyActionName(a PolicyAction) string {

@@ -495,6 +495,23 @@ type ScreenProfile struct {
 	TCP          TCPScreen
 	UDP          UDPScreen
 	LimitSession LimitSessionScreen
+
+	// BadNumeric records screen numeric leaves whose explicitly-provided value
+	// failed to parse as a positive integer (#3317). compileScreen previously
+	// swallowed the strconv.Atoi error and fell back to a Junos default or to
+	// zero/disabled — a typo'd threshold silently disabled or weakened the
+	// protection (fail-open). validateScreenNumericStrict reads this to reject
+	// the commit fail-closed instead of silently defaulting. Each entry names
+	// the screen leaf path and the offending value.
+	BadNumeric []ScreenBadNumeric
+}
+
+// ScreenBadNumeric records a screen numeric leaf whose explicitly-provided value
+// did not parse as a positive integer (#3317): the full leaf path (e.g.
+// "tcp syn-flood attack-threshold") and the raw offending value.
+type ScreenBadNumeric struct {
+	Path  string
+	Value string
 }
 
 // ICMPScreen configures ICMP screening.

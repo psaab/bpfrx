@@ -827,6 +827,21 @@ type compileOpts struct {
 	// is the real fix; the warning is the only signal on a leniently-loaded
 	// config. Same doctrine as lenientPolicyZoneRefs.
 	lenientScreenProfileRefs bool
+	// lenientScreenNumeric (#3317) downgrades the screen numeric-value gate
+	// (validateScreenNumericStrict) from a hard compile error to a cfg.Warnings
+	// entry. The strict commit / commit-check path hard-rejects a screen
+	// threshold / count leaf whose explicitly-provided value is not a positive
+	// integer. Before this gate compileScreen swallowed the strconv.Atoi error
+	// and fell back to a Junos default (icmp/udp flood, ip-sweep, port-scan,
+	// syn-flood attack-threshold) or to zero/disabled (the other syn-flood
+	// subfields, limit-session) — a typo'd threshold silently disabled or
+	// weakened the protection (fail-open). The tolerant load / peer-sync paths
+	// downgrade to a warning so an already-persisted or peer-synced config that
+	// an older binary accepted still BOOTS (#1960 no-brick); compileScreen
+	// independently applies the default for the bad value on that path, so the
+	// leniently-loaded profile is no worse than the pre-gate behavior. Same
+	// doctrine as lenientFilterDSCP.
+	lenientScreenNumeric bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1087,6 +1102,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyTerminalAction:          true,
 		lenientPolicyLogAction:               true,
 		lenientScreenProfileRefs:             true,
+		lenientScreenNumeric:                 true,
 		lenientReservedZoneNames:             true,
 		lenientBackupRouterDst:               true,
 		lenientSecureTunnelBindIface:         true,
@@ -1221,6 +1237,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyTerminalAction:          true,
 		lenientPolicyLogAction:               true,
 		lenientScreenProfileRefs:             true,
+		lenientScreenNumeric:                 true,
 		lenientReservedZoneNames:             true,
 		lenientBackupRouterDst:               true,
 		lenientSecureTunnelBindIface:         true,
@@ -1833,6 +1850,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 			return nil, err
 		}
 	}
+
+	// #3317 screen numeric-value gate. Strict on commit / commit-check
+	// (hard-reject a screen threshold / count leaf whose explicitly-provided
+	// value is not a positive integer). Before this gate compileScreen swallowed
+	// the strconv.Atoi error and silently fell back to a Junos default or to
+	// zero/disabled — a typo'd threshold disabled or weakened the protection
+	// (fail-open). Lenient on load / peer-sync (warn so an already-persisted or
+	// peer-synced config still boots — #1960 no-brick; compileScreen applies the
+	// default for the bad value independently on that path). Runs on the
+	// fully-compiled *Config so the typed profile list (with BadNumeric
+	// populated by compileScreen) is available.
+	if err := validateScreenNumericStrict(cfg); err != nil {
+		if opts.lenientScreenNumeric {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("screen numeric value (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 
 	// #3055 reserved zone-name definition gate. Strict on commit / commit-check
 	// (hard-reject a `security zones security-zone <name>` whose name is a
