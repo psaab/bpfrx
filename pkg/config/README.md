@@ -776,6 +776,31 @@ downgrades the reject to a warning (`lenientApplicationSpecs`) per the #1960
 no-brick doctrine. Junos does not couple ports to non-port protocols, so this is
 a vSRX-parity fix.
 
+**Custom-application named ports resolve through the shared service catalog
+(#3340):** a custom application's `source-port`/`destination-port` used to accept
+only a hard-coded 15-name subset (`http https ssh telnet ftp ftp-data smtp dns
+pop3 imap snmp ntp bgp ldap syslog`), so a valid Junos service name beyond it —
+notably `domain`, the canonical alias of the already-accepted `dns` — was
+rejected at commit even though the dataplane can represent the numeric port
+exactly. `compileApplications` / `parseApplicationTerms` now run each port spec
+through `resolveAppPort`, which resolves named ports against the **same
+`junosServicePorts` catalog** (`filter_match_resolve.go`) the firewall-filter
+path uses (`resolveFilterPortTokens`) — the single source of truth for Junos
+service-name → port number. Resolution emits the NUMERIC form (`domain` → `53`,
+`http-https` → `80-443`) so the dataplane only ever parses numerics: the Rust
+`parse_port_spec` and its Go mirror `userspacePortSpecRepresentable` (the #2124
+capability gate) recognize only the 15 literal names, so passing a broader name
+through verbatim would commit yet be unrepresentable at apply (a commit/apply
+split that disables forwarding). `resolveFilterPort` is NOT reused for this
+because it splits on `-` before a whole-spec lookup, mangling hyphenated service
+names (`ftp-data`, `tacacs-ds`, `kerberos-sec`); `resolveAppPort` does the
+whole-spec catalog lookup first. The lookup is case-insensitive, so a mixed-case
+service name resolves rather than passing through unresolved. An unresolvable
+name (unknown service, out-of-range/malformed number, inverted/unresolved range)
+is left verbatim so `validatePortSpec` hard-rejects it at the strict commit gate
+and the tolerant load/peer-sync path downgrades it to a warning
+(`lenientApplicationSpecs`, #1960 no-brick).
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`

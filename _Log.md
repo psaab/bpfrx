@@ -22821,3 +22821,15 @@ top.
   - **File(s)**: pkg/daemon/daemon_nft.go,
     pkg/daemon/host_inbound_nft_test.go,
     pkg/daemon/daemon_apply_runtime_test.go, _Log.md
+
+- **Timestamp**: 2026-06-28 15:33 PDT
+  - **Action**: #3340 — custom-application destination-port/source-port named
+    ports now resolve through the shared `junosServicePorts` catalog at compile
+    time (resolveAppPort) instead of a hard-coded 15-name subset, so valid Junos
+    service names (`domain`, `www`, `kerberos-sec`, hyphenated names, mixed-case)
+    resolve to numerics the dataplane can represent. Unknown names still hard-
+    reject at the strict commit gate and downgrade to a warning on the lenient
+    path. Added tests + README note.
+  - **File(s)**: pkg/config/compiler_applications.go,
+    pkg/config/compiler_application_destport_names_3340_test.go,
+    pkg/config/README.md, _Log.md
