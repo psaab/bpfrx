@@ -22680,3 +22680,18 @@ top.
     pkg/dataplane/userspace/manager_ha.go, pkg/daemon/daemon_ha_userspace.go,
     pkg/dataplane/types.go, pkg/cluster/sync_protocol.go,
     docs/userspace-dataplane-gaps.md, plus tests + fixture.
+
+## 2026-06-27 — #3316 ICMP-fragment screen config plumbing
+- **Timestamp**: 2026-06-27
+- **Action**: Plumb config→snapshot path for the ICMP-fragment screen. The
+  Rust dataplane (screen/stateless.rs check_icmp_fragment) already dropped
+  fragmented ICMP/ICMPv6 when icmp_fragment was set, but the screen was
+  unreachable from config (no typed field, no compiler case, open schema
+  subtree, snapshot never published). Added ICMPScreen.Fragment, the
+  `icmp fragment` compiler case, the schema leaf, and the snapshot publish +
+  emit-gate inclusion. Added RED-on-revert Go tests (config compile + snapshot
+  publish) and updated docs/feature-gaps.md (12 screen checks).
+- **File(s)**: pkg/config/types_security.go, pkg/config/compiler_security.go,
+  pkg/config/schema_security.go, pkg/dataplane/userspace/screens.go,
+  pkg/config/parser_security_test.go, pkg/dataplane/userspace/manager_test.go,
+  docs/feature-gaps.md

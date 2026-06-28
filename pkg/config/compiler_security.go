@@ -693,6 +693,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 				switch opt.Name() {
 				case "ping-death":
 					profile.ICMP.PingDeath = true
+				case "fragment":
+					profile.ICMP.Fragment = true
 				case "flood":
 					if len(opt.Keys) >= 3 {
 						if v, err := strconv.Atoi(opt.Keys[2]); err == nil {
