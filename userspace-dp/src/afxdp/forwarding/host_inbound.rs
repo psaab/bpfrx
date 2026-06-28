@@ -167,13 +167,15 @@ fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
     }
 }
 
-/// The routing-protocol tokens that `protocols all` expands to (#3199). In
-/// Junos `host-inbound-traffic protocols all` admits every supported ROUTING
-/// protocol — NOT every system-service and NOT a blanket bypass. Expanding the
-/// `all` token to this concrete set (rather than a short-circuit admit) keeps a
-/// `protocols all` zone from opening SSH/HTTPS/SNMP/NETCONF on the box. One
-/// entry per unique signature (`ospf3` aliases `ospf`); the caller dedups.
-const ROUTING_PROTOCOL_TOKENS: &[&str] = &[
+/// Every recognized `protocols` token (mirror of the Go SSOT
+/// config.KnownHostInboundProtocols minus the `all` meta-token). The
+/// `protocols all` expansion is derived from this list MINUS the L2/non-IP set
+/// (HOST_INBOUND_L2_PROTOCOLS) — see `routing_protocol_all_expansion`. Listing
+/// IS-IS here (and excluding it via the L2 set) is what makes the L2 set
+/// load-bearing on this surface (#3311): adding a new L2 protocol means adding
+/// it to both lists, after which it is automatically kept out of the IP `all`
+/// expansion with no edit to the expansion logic.
+const KNOWN_ROUTING_PROTOCOL_TOKENS: &[&str] = &[
     // #3225: ospf (OSPFv2, IPv4) and ospf3 (OSPFv3, IPv6) are BOTH listed so
     // `protocols all` admits proto 89 on each family; classify_protocol scopes
     // each to its own family.
@@ -190,7 +192,39 @@ const ROUTING_PROTOCOL_TOKENS: &[&str] = &[
     "msdp",
     "nhrp",
     "router-discovery",
+    // #3311: IS-IS is a recognized protocol but rides L2 (OSI/CLNP), so it is
+    // EXCLUDED from the IP `all` expansion below via HOST_INBOUND_L2_PROTOCOLS.
+    "isis",
 ];
+
+/// L2/non-IP host-inbound protocols — the Rust mirror of the Go SSOT
+/// config.HostInboundL2Protocols (#3311). These ride directly over L2
+/// (OSI/CLNP / LLC) and cannot be expressed as an IP host-inbound match, so
+/// they are excluded from the `protocols all` IP expansion and contribute no
+/// per-token IP admit. Keep in lockstep with the Go set (a Go parity intent +
+/// the protocols_all_excludes_l2 test below guard this).
+const HOST_INBOUND_L2_PROTOCOLS: &[&str] = &["isis"];
+
+/// True if `token` is an L2/non-IP host-inbound protocol (excluded from the IP
+/// `protocols all` expansion). #3311.
+fn is_host_inbound_l2_protocol(token: &str) -> bool {
+    HOST_INBOUND_L2_PROTOCOLS.contains(&token)
+}
+
+/// The routing-protocol tokens that `protocols all` expands to (#3199), derived
+/// from KNOWN_ROUTING_PROTOCOL_TOKENS MINUS the L2/non-IP set (#3311). In Junos
+/// `host-inbound-traffic protocols all` admits every supported ROUTING protocol
+/// — NOT every system-service and NOT a blanket bypass. Expanding to a concrete
+/// IP set (rather than a short-circuit admit) keeps a `protocols all` zone from
+/// opening SSH/HTTPS/SNMP/NETCONF on the box; excluding L2 protocols keeps it
+/// from listing a token that can produce no IP admit. ospf3 aliases ospf; the
+/// caller dedups.
+fn routing_protocol_all_expansion() -> impl Iterator<Item = &'static str> {
+    KNOWN_ROUTING_PROTOCOL_TOKENS
+        .iter()
+        .copied()
+        .filter(|t| !is_host_inbound_l2_protocol(t))
+}
 
 /// Classify one Junos `protocols` (routing-protocol) token. Port-based
 /// protocols (bgp/ldp/msdp/rip) contribute TCP/UDP ports; IP-protocol-based
@@ -199,11 +233,14 @@ const ROUTING_PROTOCOL_TOKENS: &[&str] = &[
 fn classify_protocol(token: &str, hi: &mut ZoneHostInbound) {
     match token {
         // `protocols all` admits only the routing-protocol set (#3199) — it
-        // expands to every entry under the `protocols` stanza, NOT system
-        // services and NOT a blanket accept. `ROUTING_PROTOCOL_TOKENS` never
-        // contains "all", so this recursion terminates.
+        // expands to every recognized routing protocol EXCEPT L2/non-IP ones
+        // (IS-IS), via routing_protocol_all_expansion (= KNOWN_ROUTING_PROTOCOL_
+        // TOKENS minus HOST_INBOUND_L2_PROTOCOLS, #3311), NOT system services
+        // and NOT a blanket accept. The expansion never yields "all", so this
+        // recursion terminates. Mirrors the Go nft `all` case, which derives the
+        // same exclusion from config.HostInboundAllExpansionProtocols().
         "all" => {
-            for tok in ROUTING_PROTOCOL_TOKENS {
+            for tok in routing_protocol_all_expansion() {
                 classify_protocol(tok, hi);
             }
         }
@@ -259,13 +296,14 @@ fn classify_protocol(token: &str, hi: &mut ZoneHostInbound) {
         // #3311: IS-IS rides OSI/CLNP directly over L2 (LLC-encapsulated, NOT
         // IP), so it cannot be expressed in this IP-keyed admit model (proto
         // number / TCP-UDP port / ICMP type). It is a recognized-but-no-op
-        // host-inbound token (Go SSOT: config.HostInboundL2Protocols): the
-        // kernel delivers IS-IS PDUs to FRR's isisd via an LLC packet socket,
-        // outside the IP host-inbound filter (and the AF_XDP local-delivery
-        // path only ever classifies IP packets). Admitting nothing here keeps
-        // this surface consistent with the nft mirror's isis no-op case — both
-        // produce zero IP admit, so there is no split-brain. Explicit arm (not
-        // the catch-all `_`) so the no-op is documented and intentional.
+        // host-inbound token (Go SSOT: config.HostInboundL2Protocols; Rust
+        // mirror: HOST_INBOUND_L2_PROTOCOLS): the kernel delivers IS-IS PDUs to
+        // FRR's isisd via an LLC packet socket, outside the IP host-inbound
+        // filter (and the AF_XDP local-delivery path only ever classifies IP
+        // packets). This explicit arm is DOCUMENTARY — the catch-all `_ => {}`
+        // would no-op identically. The L2 set's load-bearing job is the
+        // `protocols all` exclusion above (routing_protocol_all_expansion),
+        // which is what the protocols_all_excludes_l2 test guards.
         "isis" => {}
         // #3201/#3240: router-discovery admits ICMPv4 router-advertisement (9)
         // and router-solicitation (10) ONLY — matching the nft chain
@@ -359,5 +397,72 @@ pub(in crate::afxdp) fn host_inbound_admits(
     match state.zone_host_inbound.get(&ingress_zone_id) {
         None => true,
         Some(hi) => hi.admits(protocol, dst_port, is_v6, icmp_type),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #3311: the `protocols all` expansion must EXCLUDE every L2/non-IP protocol
+    // (IS-IS) — they cannot produce an IP host-inbound admit and are handled by
+    // FRR over L2. This guards the SSOT-driven exclusion
+    // (routing_protocol_all_expansion = KNOWN_ROUTING_PROTOCOL_TOKENS minus
+    // HOST_INBOUND_L2_PROTOCOLS), the load-bearing job of the L2 set on this
+    // surface. Fail-on-revert: remove "isis" from HOST_INBOUND_L2_PROTOCOLS and
+    // isis (still in KNOWN_ROUTING_PROTOCOL_TOKENS) reappears in the expansion,
+    // turning the exclusion assertion RED. Mirrors the Go
+    // TestHostInboundProtocolsAllExcludesL2.
+    #[test]
+    fn protocols_all_excludes_l2() {
+        let expansion: Vec<&str> = routing_protocol_all_expansion().collect();
+
+        // Every L2 protocol is excluded from the IP `all` expansion.
+        for l2 in HOST_INBOUND_L2_PROTOCOLS {
+            assert!(
+                !expansion.contains(l2),
+                "L2 protocol {l2:?} must be excluded from the `protocols all` IP expansion",
+            );
+        }
+        // IS-IS specifically: a recognized routing token that is nonetheless
+        // kept out of the expansion BECAUSE it is in the L2 set.
+        assert!(
+            KNOWN_ROUTING_PROTOCOL_TOKENS.contains(&"isis"),
+            "isis must be a recognized routing token (so the exclusion is meaningful)",
+        );
+        assert!(
+            !expansion.contains(&"isis"),
+            "isis (L2) must not appear in the `protocols all` IP expansion",
+        );
+        // Sanity: real IP routing protocols still expand.
+        for p in ["ospf", "ospf3", "bgp", "bfd", "router-discovery"] {
+            assert!(
+                expansion.contains(&p),
+                "IP routing protocol {p:?} must remain in the `protocols all` expansion",
+            );
+        }
+    }
+
+    // #3311: a zone with `protocols all` must NOT admit IS-IS as an IP protocol
+    // (proto 124, integrated IS-IS-over-IP), proving the L2 exclusion holds end
+    // to end through classify_protocol. It must still admit a real expanded IP
+    // protocol (OSPF, proto 89). Fail-on-revert: remove isis from
+    // HOST_INBOUND_L2_PROTOCOLS — isis enters the expansion, but its
+    // classify_protocol arm is a no-op, so this stays green; the
+    // protocols_all_excludes_l2 token test above is the real RED-on-revert guard.
+    #[test]
+    fn protocols_all_admits_ip_routing_not_l2() {
+        let mut hi = ZoneHostInbound::default();
+        classify_protocol("all", &mut hi);
+        // OSPFv2 (proto 89) admitted on v4 via the expansion.
+        assert!(
+            hi.admits(89, 0, false, 0),
+            "`protocols all` must admit OSPF (proto 89) on v4",
+        );
+        // Integrated IS-IS-over-IP (proto 124) is NOT admitted — isis is L2.
+        assert!(
+            !hi.admits(124, 0, false, 0),
+            "`protocols all` must not admit IS-IS (proto 124) — L2/OSI, handled by FRR",
+        );
     }
 }

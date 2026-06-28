@@ -103,25 +103,32 @@ func TestHostInboundBfdAdmitsMultiHop(t *testing.T) {
 	}
 }
 
-// TestHostInboundIsisProducesNoIPMatch asserts that `protocols isis` produces
-// NO ip/ip6 host-inbound match in the nft builder (#3311). IS-IS rides OSI/CLNP
-// over L2 (LLC-encapsulated, not IP) and cannot be expressed in the IP input
-// chains; it is a recognized-but-no-op token (config.HostInboundL2Protocols)
-// kept consistent with the Rust classifier's isis no-op arm. The kernel hands
-// IS-IS PDUs to FRR's isisd via an LLC socket, outside this filter.
+// TestHostInboundProtocolsAllExcludesL2Isis asserts that the nft `protocols all`
+// expansion EXCLUDES the L2/non-IP protocol IS-IS (#3311). The nft `all` case
+// derives its expansion from config.HostInboundAllExpansionProtocols()
+// (KnownHostInboundProtocols minus the L2 set), so this is the load-bearing
+// daemon-side use of config.HostInboundL2Protocols. The previous
+// arm-existence assertion (`isis produces no nft match`) was FALSE-GREEN — the
+// default switch arm returns nil too, so deleting the explicit isis case did
+// not turn it RED.
 //
-// Fail-on-revert: make the `isis` arm in hostInboundProtocolMatches emit any
-// match (e.g. a bogus `meta l4proto`) and this RED — that would diverge from
-// the Rust no-op arm and falsely admit non-existent IP traffic.
-func TestHostInboundIsisProducesNoIPMatch(t *testing.T) {
-	if !config.HostInboundL2Protocols["isis"] {
-		t.Fatal("isis must be in config.HostInboundL2Protocols")
+// Fail-on-revert: remove "isis" from config.HostInboundL2Protocols and — because
+// isis stays in config.KnownHostInboundProtocols — it reappears in the SSOT
+// expansion, turning the "excluded" assertion RED. (Its per-token nft match is
+// still nil, so the emitted nft rule set is unchanged; the token-list guard is
+// what catches the SSOT regression.)
+func TestHostInboundProtocolsAllExcludesL2Isis(t *testing.T) {
+	expansion := config.HostInboundAllExpansionProtocols()
+	for _, p := range expansion {
+		if p == "isis" {
+			t.Fatalf("isis (L2) must be excluded from the nft `protocols all` expansion; got %v", expansion)
+		}
 	}
-	if got := hostInboundProtocolMatches("isis", "ip"); len(got) != 0 {
-		t.Errorf("isis produced an IPv4 nft match %v — must be a no-op (handled by FRR over L2)", got)
-	}
-	if got := hostInboundProtocolMatches("isis", "ip6"); len(got) != 0 {
-		t.Errorf("isis produced an IPv6 nft match %v — must be a no-op (handled by FRR over L2)", got)
+	// Sanity: a real IP routing protocol is still in the expansion AND the nft
+	// `all` case emits its match (proves the expansion is actually consumed).
+	allMatches := strings.Join(hostInboundProtocolMatches("all", "ip"), " ; ")
+	if !strings.Contains(allMatches, "179") { // bgp tcp/179
+		t.Errorf("nft `protocols all` (ip) missing BGP tcp/179 — expansion not consumed: %q", allMatches)
 	}
 }
 

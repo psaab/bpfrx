@@ -1,5 +1,7 @@
 package config
 
+import "sort"
+
 // host_inbound_tokens.go is the single source of truth (SSOT) for the set of
 // recognized `security zones <z> host-inbound-traffic { system-services ...;
 // protocols ...; }` tokens (#3200).
@@ -84,9 +86,10 @@ var KnownHostInboundSystemServices = map[string]bool{
 // KnownHostInboundProtocols is the canonical set of recognized
 // host-inbound-traffic `protocols` (routing-protocol) tokens, including `all`
 // (which expands to the routing-protocol set, #3199) and the `ospf3` alias of
-// `ospf`. Keep in lockstep with pkg/daemon hostInboundProtocolMatches +
-// hostInboundRoutingProtocolTokens and the Rust classify_protocol +
-// ROUTING_PROTOCOL_TOKENS.
+// `ospf`. Keep in lockstep with pkg/daemon hostInboundProtocolMatches and the
+// Rust classify_protocol + KNOWN_ROUTING_PROTOCOL_TOKENS. The `protocols all`
+// expansion is derived from this set via HostInboundAllExpansionProtocols
+// (minus HostInboundL2Protocols).
 var KnownHostInboundProtocols = map[string]bool{
 	"all":              true,
 	"ospf":             true,
@@ -129,6 +132,29 @@ var KnownHostInboundProtocols = map[string]bool{
 // no-op arm. Keep in lockstep with that arm. #3311.
 var HostInboundL2Protocols = map[string]bool{
 	"isis": true,
+}
+
+// HostInboundAllExpansionProtocols returns the routing-protocol tokens that
+// `host-inbound-traffic protocols all` expands to (#3199): every recognized
+// protocol (KnownHostInboundProtocols) EXCEPT the `all` meta-token itself and
+// EXCEPT any L2/non-IP protocol (HostInboundL2Protocols). The L2 exclusion is
+// what makes HostInboundL2Protocols load-bearing rather than decorative (#3311):
+// adding a new L2 protocol to that set (and to KnownHostInboundProtocols) is the
+// ONLY edit needed — it is then automatically kept out of the `all` IP
+// expansion on BOTH enforcement surfaces (the nft builder's `all` case and the
+// Rust classifier's `all` arm consume this contract; the Rust side mirrors it
+// via HOST_INBOUND_L2_PROTOCOLS + a parity test). The result is sorted so the
+// expansion is deterministic.
+func HostInboundAllExpansionProtocols() []string {
+	out := make([]string, 0, len(KnownHostInboundProtocols))
+	for tok := range KnownHostInboundProtocols {
+		if tok == "all" || HostInboundL2Protocols[tok] {
+			continue
+		}
+		out = append(out, tok)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Address-family scoping for host-inbound tokens (#3225). Several Junos

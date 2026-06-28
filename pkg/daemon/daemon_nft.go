@@ -391,19 +391,6 @@ func hostInboundServiceMatches(token, family string) []string {
 	}
 }
 
-// hostInboundRoutingProtocolTokens is the routing-protocol set that
-// `protocols all` expands to (#3199). One entry per unique signature
-// (`ospf3` aliases `ospf`); hostInboundMatchSet dedups. Mirrors the Rust
-// ROUTING_PROTOCOL_TOKENS in userspace-dp/src/afxdp/forwarding/host_inbound.rs.
-// ospf3 is listed alongside ospf (#3225): both ride IP protocol 89 but on
-// different families, so `protocols all` must admit proto 89 on BOTH IPv4
-// (ospf) and IPv6 (ospf3). hostInboundProtocolMatches family-gates each, so the
-// expansion emits proto 89 once per family without a wrong-family match.
-var hostInboundRoutingProtocolTokens = []string{
-	"ospf", "ospf3", "bgp", "rip", "ripng", "igmp", "pim",
-	"vrrp", "bfd", "ldp", "msdp", "nhrp", "router-discovery",
-}
-
 // hostInboundProtocolMatches maps a Junos `protocols` (routing-protocol) token
 // to nft match fragments. `all` expands to the full routing-protocol set
 // (#3199) — NOT a blanket accept (that would open every system-service). Returns
@@ -419,9 +406,18 @@ func hostInboundProtocolMatches(token, family string) []string {
 	}
 	switch token {
 	case "all":
-		// `protocols all` = every routing protocol, scoped to protocol traffic.
+		// `protocols all` = every recognized routing protocol, scoped to
+		// protocol traffic (#3199) — NOT a blanket accept. The expansion set is
+		// the SSOT-derived config.HostInboundAllExpansionProtocols()
+		// (KnownHostInboundProtocols minus `all` minus the L2/non-IP set
+		// config.HostInboundL2Protocols), so an L2 protocol like IS-IS is
+		// AUTOMATICALLY excluded from the IP expansion — adding one to the SSOT
+		// requires no edit here (#3311). ospf+ospf3 both appear (#3225): both
+		// ride IP protocol 89 but on different families; hostInboundProtocolMatches
+		// family-gates each, so proto 89 emits once per family. The Rust `all`
+		// arm mirrors this exclusion via routing_protocol_all_expansion().
 		var out []string
-		for _, p := range hostInboundRoutingProtocolTokens {
+		for _, p := range config.HostInboundAllExpansionProtocols() {
 			out = append(out, hostInboundProtocolMatches(p, family)...)
 		}
 		return out

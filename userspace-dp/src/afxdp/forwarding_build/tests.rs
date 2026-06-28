@@ -1173,8 +1173,13 @@ fn build_forwarding_state_bfd_admits_multihop_control() {
 // not accidentally fall open. Kept in lockstep with the nft mirror's isis
 // no-op case (hostInboundProtocolMatches, pkg/daemon/daemon_nft.go).
 //
-// Fail-on-revert: give the "isis" arm in host_inbound.rs any IP admit (e.g.
-// `hi.ip_protocols.insert(...)`) and the "no spurious admit" assertion RED.
+// Scope note: this guards that the isis arm admits NOTHING — giving the "isis"
+// arm any IP admit (e.g. `hi.ip_protocols.insert(124)`) turns the proto-124
+// assertion RED. It does NOT guard the arm's existence (deleting `"isis" => {}`
+// falls through to `_ => {}`, also a no-op). The SSOT-driven `protocols all`
+// EXCLUSION is the genuinely-testable contract for HOST_INBOUND_L2_PROTOCOLS —
+// see `protocols_all_excludes_l2` in afxdp::forwarding::host_inbound (RED when
+// isis is removed from the L2 set), the real fail-on-revert guard.
 #[test]
 fn build_forwarding_state_isis_is_l2_noop() {
     use crate::ZoneSnapshot;
