@@ -5,14 +5,71 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/psaab/xpf/pkg/logging"
 )
+
+// traceLogDir is the directory flow-trace files are written to. It is a
+// package var (not a const) only so tests can redirect it to a temp dir;
+// production always writes under /var/log.
+var traceLogDir = "/var/log"
+
+// sanitizeTraceFilename validates an operator-supplied flow-trace filename.
+// The trace file always lives directly under traceLogDir, so only a bare
+// basename is accepted: path separators, "." / "..", and absolute paths are
+// rejected. Without this a "monitor security flow file ../../etc/x" command
+// resolves to /var/log/../../etc/x and the daemon appends root-written flow
+// telemetry outside the log directory (#3378 HC-01).
+func sanitizeTraceFilename(name string) error {
+	if name == "" {
+		return fmt.Errorf("trace filename must not be empty")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("invalid trace filename: %q", name)
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("trace filename must be a bare name, not a path: %q", name)
+	}
+	if name != filepath.Base(name) {
+		return fmt.Errorf("trace filename must be a bare name, not a path: %q", name)
+	}
+	return nil
+}
+
+// openTraceFile opens the flow-trace file inside traceLogDir with restrictive
+// permissions. The name is sanitized first (basename only), the file is opened
+// O_NOFOLLOW so a pre-planted symlink under /var/log cannot redirect the
+// root-written telemetry (#3378 MC-02), the opened descriptor is verified to be
+// a regular file, and it is created mode 0600 rather than world-readable 0644
+// — flow tuples/zones/policy names are audit-grade telemetry (#3378 MC-01).
+func openTraceFile(name string) (*os.File, string, error) {
+	if err := sanitizeTraceFilename(name); err != nil {
+		return nil, "", err
+	}
+	path := filepath.Join(traceLogDir, name)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, path, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, path, err
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, path, fmt.Errorf("trace target %s is not a regular file", path)
+	}
+	return f, path, nil
+}
 
 // monitorFlowFilter holds the criteria for a single named flow filter.
 type monitorFlowFilter struct {
@@ -214,7 +271,12 @@ func (c *CLI) handleMonitorSecurityFlowFile(args []string) error {
 		return nil
 	}
 
-	// First non-option arg is the filename.
+	// First non-option arg is the filename; reject path traversal up front so a
+	// bad name is never stored (#3378).
+	if err := sanitizeTraceFilename(args[0]); err != nil {
+		fmt.Printf("error: %v\n", err)
+		return nil
+	}
 	c.monitorFlow.filename = args[0]
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
@@ -385,13 +447,13 @@ func (c *CLI) handleMonitorSecurityFlowStart() error {
 	// <regex>` filter actually drops non-matching trace lines (#2288).
 	matchRe := c.monitorFlow.matchRe
 
-	// Open trace file.
-	path := "/var/log/" + c.monitorFlow.filename
-	logFile, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// Open trace file inside /var/log with a sanitized basename, O_NOFOLLOW,
+	// regular-file verification and mode 0600 (#3378).
+	logFile, _, err := openTraceFile(c.monitorFlow.filename)
 	if err != nil {
 		c.monitorFlow.active = false
 		c.monitorFlow.mu.Unlock()
-		return fmt.Errorf("failed to open trace file %s: %w", path, err)
+		return fmt.Errorf("failed to open trace file: %w", err)
 	}
 
 	// Subscribe to event buffer.
@@ -468,7 +530,7 @@ func (c *CLI) showMonitorSecurityFlow() error {
 
 	fmt.Printf("  Monitor security flow session status: %s\n", status)
 	if c.monitorFlow.filename != "" {
-		fmt.Printf("  Monitor security flow trace file: /var/log/%s\n", c.monitorFlow.filename)
+		fmt.Printf("  Monitor security flow trace file: %s\n", filepath.Join(traceLogDir, c.monitorFlow.filename))
 	} else {
 		fmt.Printf("  Monitor security flow trace file: (not configured)\n")
 	}

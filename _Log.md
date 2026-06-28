@@ -22747,3 +22747,8 @@ top.
   pkg/cli/cli_show_security_log.go,
   pkg/logging/eventbuf_negative_3342_test.go,
   pkg/cli/cli_show_security_log_negative_3342_test.go, _Log.md
+
+## 2026-06-28 — #3378 monitor security flow trace file hardening
+- **Timestamp**: 2026-06-28
+- **Action**: #3378 — sanitize trace filename (basename only, reject `..`/separators/absolute), open O_NOFOLLOW + regular-file check, create mode 0600 (was 0644). Validate at config and defensively at open.
+- **File(s)**: pkg/cli/monitor.go, pkg/cli/monitor_security_test.go
