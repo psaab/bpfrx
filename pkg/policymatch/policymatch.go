@@ -775,9 +775,27 @@ func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryP
 			return false
 		}
 	}
-	if app.DestinationPort != "" && dstPort > 0 && !portMatches(app.DestinationPort, dstPort) {
-		return false
+	// #3330: when the application term CONSTRAINS a destination port, an OMITTED
+	// query dst port must NOT match-any — it must fail closed, mirroring the
+	// runtime. The dataplane keys a single dst-port term in exact_dst_ports and
+	// range terms in range_terms (policy.rs CompiledApplications.matches): an
+	// omitted query port arrives as 0, which a real app port (e.g. 80) never
+	// equals and no app range admits, so the constrained term does NOT match.
+	// The old `&& dstPort > 0` gate skipped the check entirely for an omitted
+	// port, reporting a permit for a port-constrained app no concrete packet
+	// would hit (sibling of #3323's protocol omission). An UNCONSTRAINED dst
+	// port term (app.DestinationPort == "") still matches any port, unchanged.
+	if app.DestinationPort != "" {
+		if dstPort <= 0 || !portMatches(app.DestinationPort, dstPort) {
+			return false
+		}
 	}
+	// Source port retains #3107's deliberate diagnostic stance: an OMITTED query
+	// source port (the ephemeral, operator-rarely-known dimension) is treated as
+	// "unconstrained" so a source-port-bearing app term still resolves. Only a
+	// SPECIFIED source port is checked. Narrowing this too would change the
+	// #3107 absent-source-port contract (TestShowTestPolicySourcePort), which is
+	// out of #3330's destination-port scope.
 	if app.SourcePort != "" && srcPort > 0 && !portMatches(app.SourcePort, srcPort) {
 		return false
 	}
