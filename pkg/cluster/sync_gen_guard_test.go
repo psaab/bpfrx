@@ -388,6 +388,9 @@ func TestSessionWireRoundTripPolicyFields3301V6(t *testing.T) {
 	if !ok {
 		t.Fatal("decode failed")
 	}
+	if dVal.PolicyID != 99 {
+		t.Fatalf("PolicyID round-trip = %d, want 99", dVal.PolicyID)
+	}
 	if dVal.AppTimeout != 45 {
 		t.Fatalf("AppTimeout round-trip = %d, want 45", dVal.AppTimeout)
 	}
