@@ -71,6 +71,65 @@ func openTraceFile(name string) (*os.File, string, error) {
 	return f, path, nil
 }
 
+// rotateTraceFile closes the current trace file and rolls the generations:
+// the oldest archive (name.maxFiles-1) is dropped, name.N shifts to name.N+1,
+// the active file becomes name.1, and a fresh active file is opened. maxFiles
+// is the total number of generations to keep (active + archives) and is
+// clamped to a 2 minimum. It honors the operator's `files` cap so a long
+// running trace cannot grow without bound (#3379).
+func rotateTraceFile(cur *os.File, name string, maxFiles int) (*os.File, error) {
+	cur.Close()
+	if maxFiles < 2 {
+		maxFiles = 2
+	}
+	base := filepath.Join(traceLogDir, name)
+	// Drop the oldest archive, then shift the rest up by one.
+	_ = os.Remove(fmt.Sprintf("%s.%d", base, maxFiles-1))
+	for i := maxFiles - 2; i >= 1; i-- {
+		_ = os.Rename(fmt.Sprintf("%s.%d", base, i), fmt.Sprintf("%s.%d", base, i+1))
+	}
+	_ = os.Rename(base, base+".1")
+	f, _, err := openTraceFile(name)
+	return f, err
+}
+
+// traceWriter wraps the active flow-trace file and enforces size/count based
+// rotation (#3379). A zero maxSize disables rotation (unbounded, the pre-3379
+// behavior only when the operator configured no `size`).
+type traceWriter struct {
+	name     string
+	maxSize  int64
+	maxFiles int
+	f        *os.File
+	written  int64
+}
+
+func newTraceWriter(name string, f *os.File, maxSize int64, maxFiles int) *traceWriter {
+	w := &traceWriter{name: name, maxSize: maxSize, maxFiles: maxFiles, f: f}
+	if fi, err := f.Stat(); err == nil {
+		w.written = fi.Size()
+	}
+	return w
+}
+
+// writeLine appends one trace line, rotating first if appending it would push
+// the active file past maxSize. The byte budget includes the trailing newline.
+func (w *traceWriter) writeLine(line string) error {
+	if w.maxSize > 0 && w.written > 0 && w.written+int64(len(line))+1 > w.maxSize {
+		nf, err := rotateTraceFile(w.f, w.name, w.maxFiles)
+		if err != nil {
+			return err
+		}
+		w.f = nf
+		w.written = 0
+	}
+	n, err := fmt.Fprintln(w.f, line)
+	w.written += int64(n)
+	return err
+}
+
+func (w *traceWriter) close() error { return w.f.Close() }
+
 // monitorFlowFilter holds the criteria for a single named flow filter.
 type monitorFlowFilter struct {
 	Name     string
@@ -447,6 +506,11 @@ func (c *CLI) handleMonitorSecurityFlowStart() error {
 	// <regex>` filter actually drops non-matching trace lines (#2288).
 	matchRe := c.monitorFlow.matchRe
 
+	// Snapshot the rotation limits for the writer (#3379).
+	traceName := c.monitorFlow.filename
+	maxSize := c.monitorFlow.fileSize
+	maxFiles := c.monitorFlow.files
+
 	// Open trace file inside /var/log with a sanitized basename, O_NOFOLLOW,
 	// regular-file verification and mode 0600 (#3378).
 	logFile, _, err := openTraceFile(c.monitorFlow.filename)
@@ -464,9 +528,12 @@ func (c *CLI) handleMonitorSecurityFlowStart() error {
 	c.monitorFlow.cancel = cancel
 	c.monitorFlow.mu.Unlock()
 
-	// Run the monitor goroutine in the background.
+	// Run the monitor goroutine in the background. The writer enforces the
+	// configured size/files rotation so the trace cannot grow unbounded under
+	// a deny storm or a broad filter (#3379).
+	writer := newTraceWriter(traceName, logFile, maxSize, maxFiles)
 	go func() {
-		defer logFile.Close()
+		defer writer.close()
 		defer sub.Close()
 		for {
 			select {
@@ -488,7 +555,11 @@ func (c *CLI) handleMonitorSecurityFlowStart() error {
 				if !traceLineMatches(line, matchRe) {
 					continue
 				}
-				fmt.Fprintln(logFile, line)
+				if err := writer.writeLine(line); err != nil {
+					// Rotation or write failed; stop tracing rather than grow
+					// the active file without bound.
+					return
+				}
 			}
 		}
 	}()

@@ -94,3 +94,55 @@ func TestOpenTraceFile_RefusesSymlinkTarget(t *testing.T) {
 		t.Fatal("symlink target was created; the redirected write was not refused")
 	}
 }
+
+// #3379: size/files rotation params were parsed but the writer never rotated,
+// allowing unbounded log growth. This pins enforcement: writing past `size`
+// rotates and the file count is capped at `files` generations.
+func TestTraceWriter_RotatesAndCapsFiles(t *testing.T) {
+	dir := t.TempDir()
+	old := traceLogDir
+	traceLogDir = dir
+	defer func() { traceLogDir = old }()
+
+	const name = "trace"
+	const maxFiles = 3
+	f, _, err := openTraceFile(name)
+	if err != nil {
+		t.Fatalf("openTraceFile: %v", err)
+	}
+	// Small cap so a handful of ~25-byte lines forces several rotations.
+	w := newTraceWriter(name, f, 40, maxFiles)
+	for i := 0; i < 50; i++ {
+		if err := w.writeLine("flow-trace-line-padding-xx"); err != nil {
+			t.Fatalf("writeLine[%d]: %v", i, err)
+		}
+	}
+	w.close()
+
+	base := filepath.Join(dir, name)
+	// The active file plus exactly (maxFiles-1) archives must exist.
+	if _, err := os.Stat(base); err != nil {
+		t.Fatalf("active trace file missing: %v", err)
+	}
+	for i := 1; i <= maxFiles-1; i++ {
+		if _, err := os.Stat(base + "." + itoa(i)); err != nil {
+			t.Fatalf("expected archive %s.%d to exist: %v", base, i, err)
+		}
+	}
+	// No generation beyond the cap may survive.
+	if _, err := os.Stat(base + "." + itoa(maxFiles)); err == nil {
+		t.Fatalf("generation %s.%d exists; files cap (%d) not enforced", base, maxFiles, maxFiles)
+	}
+	// The active file itself must respect the size cap.
+	fi, err := os.Stat(base)
+	if err != nil {
+		t.Fatalf("stat active: %v", err)
+	}
+	if fi.Size() > 40 {
+		t.Fatalf("active file size %d exceeds cap 40; rotation not triggered", fi.Size())
+	}
+}
+
+func itoa(i int) string {
+	return string(rune('0' + i))
+}
