@@ -537,16 +537,26 @@ fail-closed via the `nets_match` empty guard returning `except` = false); an
 v6 vec, and a v6 address is trivially "not in" a v4 list, so the except term
 matches v6 (the v4 list does not constrain v6).
 
-Scope (this PR): the two clean cases — positive prefix-lists (with or without
-literal addresses) and an `except` prefix-list as the SOLE address source for
-the direction — are wired through. The MIXED case (literal/positive addresses
-AND an `except` prefix-list in the SAME direction of ONE term) has no single
-boolean-inversion representation; the `except` modifier is dropped (prefixes
-fold into the positive set) with a warning. That fold is **action-dependent in
-safety**: under-broadening the match is fail-safe for `accept`/permit terms but
-fail-OPEN for a `discard`/`reject` term (traffic the operator meant to drop via
-`except` is no longer dropped). Splitting into two terms is the operator
-workaround; the structured mixed case is a documented follow-up.
+Scope: the two clean cases — positive prefix-lists (with or without literal
+addresses) and an `except` prefix-list as the SOLE address source for the
+direction — are wired through. The MIXED case (literal/positive addresses AND an
+`except` prefix-list in the SAME direction of ONE term) has no single
+boolean-inversion representation (one direction would need both a positive set
+and a negated set). **It is now hard-rejected at commit**
+(`validateFilterAddressExceptStrict`, #3359) — Junos rejects the same
+combination — so the operator is told to split the term. Before #3359 the
+`except` modifier was silently dropped and its prefixes were FOLDED into the
+positive set with only a runtime warning; that fold was **fail-OPEN**: a
+`discard`/`reject` term no longer dropped the traffic the operator carved out via
+`except`, and an `accept` term ADMITTED the prefixes the operator wrote to
+exclude. On the tolerant load / peer-sync path (an already-persisted or
+peer-synced config — #1960 no-brick) the gate downgrades to a warning and the
+runtime is now **positive-wins** (the `except` prefixes are ignored, never folded
+in): an `accept` term's admit set is no wider than the operator's positive scope
+and a `discard`/`reject` term drops at least the positive set — fail-safe in both
+directions. Splitting into two terms is the operator fix; the faithful structured
+representation (a positive set AND a negated set per direction) is a documented
+follow-up. This is the address-match sibling of the #3297 port-except gate.
 
 **Firewall-filter `then loss-priority` is PARTIAL (parse-only, inert-with-warning, #2507).**
 `then loss-priority <low|medium-low|medium-high|high>` is parsed and stored on
