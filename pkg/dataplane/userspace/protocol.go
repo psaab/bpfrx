@@ -652,8 +652,15 @@ type FirewallTermSnapshot struct {
 	// SourceAddresses / DestAddresses set (Junos `from source-prefix-list NAME
 	// except` / `destination-prefix-list NAME except`). The Rust matcher
 	// evaluates `(addr ∈ prefixes) XOR except`. These are populated only when the
-	// except prefix-list is the sole address source for the direction; the mixed
-	// literal+except case folds to a positive set (see resolvePrefixListAddrs).
+	// except prefix-list is the sole address source for the direction. The mixed
+	// positive+except case (a literal/positive address AND an except prefix-list
+	// in the same direction) is hard-rejected at strict commit
+	// (config.validateFilterAddressExceptStrict, #3359); on the lenient /
+	// peer-sync path resolvePrefixListAddrs resolves it POSITIVE-WINS — the
+	// except prefixes are IGNORED (except stays false), NOT folded into the
+	// positive set — so a leniently-loaded term is fail-safe (an accept term's
+	// admit set is no wider than the positive scope; a discard/reject term drops
+	// at least the positive set).
 	SourceExcept bool `json:"source_except,omitempty"`
 	DestExcept   bool `json:"destination_except,omitempty"`
 	// SourceConstrained / DestConstrained record that the term SPECIFIED a
