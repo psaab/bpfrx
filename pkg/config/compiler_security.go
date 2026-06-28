@@ -740,6 +740,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 				switch opt.Name() {
 				case "ping-death":
 					profile.ICMP.PingDeath = true
+				case "fragment":
+					profile.ICMP.Fragment = true
 				case "flood":
 					if n, ok := parseThresh("icmp flood", numVal(opt, 2)); ok {
 						profile.ICMP.FloodThreshold = n

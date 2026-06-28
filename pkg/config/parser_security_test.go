@@ -1337,7 +1337,7 @@ func TestDNATWithProtocol(t *testing.T) {
 
 func TestScreenCompilation(t *testing.T) {
 	tree := &ConfigTree{}
-	setCommands := []string{"set security screen ids-option wan-screen tcp syn-flood alarm-threshold 1000", "set security screen ids-option wan-screen tcp syn-flood attack-threshold 2000", "set security screen ids-option wan-screen tcp land", "set security screen ids-option wan-screen tcp syn-fin", "set security screen ids-option wan-screen tcp no-flag", "set security screen ids-option wan-screen tcp winnuke", "set security screen ids-option wan-screen tcp fin-no-ack", "set security screen ids-option wan-screen icmp ping-death", "set security screen ids-option wan-screen icmp flood threshold 500", "set security screen ids-option wan-screen ip source-route-option", "set security screen ids-option wan-screen ip tear-drop", "set security screen ids-option wan-screen udp flood threshold 1000", "set security screen ids-option wan-screen tcp port-scan threshold 5000", "set security screen ids-option wan-screen ip ip-sweep threshold 3000"}
+	setCommands := []string{"set security screen ids-option wan-screen tcp syn-flood alarm-threshold 1000", "set security screen ids-option wan-screen tcp syn-flood attack-threshold 2000", "set security screen ids-option wan-screen tcp land", "set security screen ids-option wan-screen tcp syn-fin", "set security screen ids-option wan-screen tcp no-flag", "set security screen ids-option wan-screen tcp winnuke", "set security screen ids-option wan-screen tcp fin-no-ack", "set security screen ids-option wan-screen icmp ping-death", "set security screen ids-option wan-screen icmp fragment", "set security screen ids-option wan-screen icmp flood threshold 500", "set security screen ids-option wan-screen ip source-route-option", "set security screen ids-option wan-screen ip tear-drop", "set security screen ids-option wan-screen udp flood threshold 1000", "set security screen ids-option wan-screen tcp port-scan threshold 5000", "set security screen ids-option wan-screen ip ip-sweep threshold 3000"}
 	for _, cmd := range setCommands {
 		path, err := ParseSetCommand(cmd)
 		if err != nil {
@@ -1375,6 +1375,14 @@ func TestScreenCompilation(t *testing.T) {
 	}
 	if !screen.ICMP.PingDeath {
 		t.Error("expected icmp ping-death")
+	}
+	// #3316: the icmp-fragment screen must compile from `icmp fragment`. The
+	// Rust dataplane (screen/stateless.rs check_icmp_fragment) already drops
+	// fragmented ICMP/ICMPv6, but the typed field/compiler path was missing,
+	// so the screen was unreachable from config. RED if compileScreen drops
+	// the `fragment` case.
+	if !screen.ICMP.Fragment {
+		t.Error("expected icmp fragment")
 	}
 	if screen.ICMP.FloodThreshold != 500 {
 		t.Errorf("icmp flood threshold: got %d, want 500", screen.ICMP.FloodThreshold)
@@ -4985,8 +4993,8 @@ func TestFlexibleMatchRangeDefaultMaskNonStandardBitLength(t *testing.T) {
 	}{
 		{24, "0x010203", 0x00FFFFFF},
 		{12, "0x0abc", 0x00000FFF},
-		{8, "0x11", 0xFF},          // unchanged from #3077
-		{16, "0x0800", 0xFFFF},     // unchanged from #3077
+		{8, "0x11", 0xFF},              // unchanged from #3077
+		{16, "0x0800", 0xFFFF},         // unchanged from #3077
 		{32, "0x12345678", 0xFFFFFFFF}, // unchanged from #3077
 	}
 	for _, tc := range cases {

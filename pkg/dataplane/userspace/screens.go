@@ -22,16 +22,17 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 			continue
 		}
 		snap := ScreenProfileSnapshot{
-			Zone:        zone.Name,
-			Land:        sp.TCP.Land,
-			SynFin:      sp.TCP.SynFin,
-			NoFlag:      sp.TCP.NoFlag,
-			FinNoAck:    sp.TCP.FinNoAck,
-			WinNuke:     sp.TCP.WinNuke,
-			PingDeath:   sp.ICMP.PingDeath,
-			Teardrop:    sp.IP.TearDrop,
-			SynFrag:     sp.TCP.SynFrag, // #1137 — port from typed config
-			SourceRoute: sp.IP.SourceRouteOption,
+			Zone:         zone.Name,
+			Land:         sp.TCP.Land,
+			SynFin:       sp.TCP.SynFin,
+			NoFlag:       sp.TCP.NoFlag,
+			FinNoAck:     sp.TCP.FinNoAck,
+			WinNuke:      sp.TCP.WinNuke,
+			PingDeath:    sp.ICMP.PingDeath,
+			ICMPFragment: sp.ICMP.Fragment,
+			Teardrop:     sp.IP.TearDrop,
+			SynFrag:      sp.TCP.SynFrag, // #1137 — port from typed config
+			SourceRoute:  sp.IP.SourceRouteOption,
 		}
 		if sp.ICMP.FloodThreshold > 0 {
 			snap.ICMPFloodThreshold = uint32(sp.ICMP.FloodThreshold)
@@ -57,7 +58,7 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 		}
 		// Only include profiles that have at least one check enabled
 		if snap.Land || snap.SynFin || snap.NoFlag || snap.FinNoAck ||
-			snap.WinNuke || snap.PingDeath || snap.Teardrop ||
+			snap.WinNuke || snap.PingDeath || snap.ICMPFragment || snap.Teardrop ||
 			snap.SynFrag || snap.SourceRoute ||
 			snap.ICMPFloodThreshold > 0 || snap.UDPFloodThreshold > 0 ||
 			snap.SYNFloodThreshold > 0 ||

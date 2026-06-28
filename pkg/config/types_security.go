@@ -525,6 +525,7 @@ type ScreenBadNumeric struct {
 // ICMPScreen configures ICMP screening.
 type ICMPScreen struct {
 	PingDeath      bool
+	Fragment       bool
 	FloodThreshold int
 }
 

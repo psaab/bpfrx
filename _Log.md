@@ -22680,3 +22680,30 @@ top.
     pkg/dataplane/userspace/manager_ha.go, pkg/daemon/daemon_ha_userspace.go,
     pkg/dataplane/types.go, pkg/cluster/sync_protocol.go,
     docs/userspace-dataplane-gaps.md, plus tests + fixture.
+
+## 2026-06-27 — #3316 ICMP-fragment screen config plumbing
+- **Timestamp**: 2026-06-27
+- **Action**: Plumb config→snapshot path for the ICMP-fragment screen. The
+  Rust dataplane (screen/stateless.rs check_icmp_fragment) already dropped
+  fragmented ICMP/ICMPv6 when icmp_fragment was set, but the screen was
+  unreachable from config (no typed field, no compiler case, open schema
+  subtree, snapshot never published). Added ICMPScreen.Fragment, the
+  `icmp fragment` compiler case, the schema leaf, and the snapshot publish +
+  emit-gate inclusion. Added RED-on-revert Go tests (config compile + snapshot
+  publish) and updated docs/feature-gaps.md (12 screen checks).
+- **File(s)**: pkg/config/types_security.go, pkg/config/compiler_security.go,
+  pkg/config/schema_security.go, pkg/dataplane/userspace/screens.go,
+  pkg/config/parser_security_test.go, pkg/dataplane/userspace/manager_test.go,
+  docs/feature-gaps.md
+
+## 2026-06-27 — #3324 quad fold: correct overstated typo-rejection comment
+- **Timestamp**: 2026-06-27
+- **Action**: Fold the one cosmetic MINOR from the #3324 quad (Codex MEDIUM +
+  SMR). The original commit/PR framed the new `fragment` schema leaf as adding
+  commit-time typo validation; that is inaccurate. `fragment` is a childless
+  ValueAny node and walkSchemaNode ignores unknown keywords (schema_walk.go
+  242-243), so `icmp framgent` is NOT rejected by this PR. Added a precise
+  code comment stating the leaf only exposes `fragment` for tab-completion and
+  routes `icmp fragment` to ICMPScreen.Fragment; unknown-screen-leaf rejection
+  is the separate #3318. Comment-only, no behavior change.
+- **File(s)**: pkg/config/schema_security.go
