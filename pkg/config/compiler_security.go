@@ -722,6 +722,18 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			return nodeVal(n)
 		}
 
+		// #3318: the screen schema subtrees are open. Record any unknown/
+		// unsupported top-level screen family so validateScreenUnknownStrict can
+		// reject the commit fail-closed instead of silently dropping it.
+		for _, fam := range inst.node.Children {
+			switch fam.Name() {
+			case "icmp", "ip", "tcp", "udp", "limit-session":
+				// handled below
+			default:
+				profile.UnknownLeaves = append(profile.UnknownLeaves, fam.Name())
+			}
+		}
+
 		icmpNode := inst.node.FindChild("icmp")
 		if icmpNode != nil {
 			for _, opt := range icmpNode.Children {
@@ -738,6 +750,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					if profile.ICMP.FloodThreshold <= 0 {
 						profile.ICMP.FloodThreshold = defaultICMPFloodThreshold
 					}
+				default:
+					profile.UnknownLeaves = append(profile.UnknownLeaves, "icmp "+opt.Name())
 				}
 			}
 		}
@@ -757,6 +771,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 							if n, ok := parseThresh("ip ip-sweep threshold", numVal(swOpt, 1)); ok {
 								profile.IP.IPSweepThreshold = n
 							}
+						default:
+							profile.UnknownLeaves = append(profile.UnknownLeaves, "ip ip-sweep "+swOpt.Name())
 						}
 					}
 					// ip-sweep enabled without an explicit threshold: arm at the
@@ -766,6 +782,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					if profile.IP.IPSweepThreshold <= 0 {
 						profile.IP.IPSweepThreshold = defaultIPSweepThreshold
 					}
+				default:
+					profile.UnknownLeaves = append(profile.UnknownLeaves, "ip "+opt.Name())
 				}
 			}
 		}
@@ -811,6 +829,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 							if n, ok := parseThresh("tcp syn-flood timeout", val); ok {
 								sf.Timeout = n
 							}
+						default:
+							profile.UnknownLeaves = append(profile.UnknownLeaves, "tcp syn-flood "+sfOpt.Name())
 						}
 					}
 					// Junos applies a default attack-threshold of 200
@@ -831,6 +851,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 							if n, ok := parseThresh("tcp port-scan threshold", numVal(psOpt, 1)); ok {
 								profile.TCP.PortScanThreshold = n
 							}
+						default:
+							profile.UnknownLeaves = append(profile.UnknownLeaves, "tcp port-scan "+psOpt.Name())
 						}
 					}
 					// port-scan enabled without an explicit threshold: arm at
@@ -840,6 +862,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					if profile.TCP.PortScanThreshold <= 0 {
 						profile.TCP.PortScanThreshold = defaultPortScanThreshold
 					}
+				default:
+					profile.UnknownLeaves = append(profile.UnknownLeaves, "tcp "+opt.Name())
 				}
 			}
 		}
@@ -858,6 +882,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					if profile.UDP.FloodThreshold <= 0 {
 						profile.UDP.FloodThreshold = defaultUDPFloodThreshold
 					}
+				default:
+					profile.UnknownLeaves = append(profile.UnknownLeaves, "udp "+opt.Name())
 				}
 			}
 		}
@@ -875,6 +901,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					if n, ok := parseThresh("limit-session destination-ip-based", val); ok {
 						profile.LimitSession.DestinationIPBased = n
 					}
+				default:
+					profile.UnknownLeaves = append(profile.UnknownLeaves, "limit-session "+opt.Name())
 				}
 			}
 		}

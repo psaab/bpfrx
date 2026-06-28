@@ -2456,6 +2456,58 @@ func validateScreenNumericStrict(cfg *Config) error {
 	return nil
 }
 
+// validateScreenUnknownStrict hard-rejects a screen profile carrying a leaf the
+// dataplane does NOT support — #3318.
+//
+// The screen schema subtrees are open (schema_security.go: `icmp`, `tcp`, `ip`,
+// `udp` model only their named children; an unknown keyword resolves to a nil
+// schema child and returns no error), and compileScreen switched only on the
+// known child names with no default arm. A misspelled or unsupported leaf
+// (`icmp pong-death`, `tcp syn-flood whitelist`, `ip bad-option`, an unsupported
+// SRX screen such as `tcp sweep`/`ip block-frag`) therefore committed cleanly
+// and was silently DROPPED — the operator believed a protection was enabled when
+// it was entirely absent, a "configured but not enforced" posture with no
+// warning. SRX fails commit on an unknown screen option.
+//
+// The supported set is EXACTLY the compileScreen switch cases: icmp
+// {ping-death, flood}; ip {source-route-option, tear-drop, ip-sweep
+// {threshold}}; tcp {land, winnuke, syn-frag, syn-fin, no-flag, fin-no-ack,
+// syn-flood {alarm/attack/source/destination-threshold, timeout}, port-scan
+// {threshold}}; udp {flood}; limit-session {source-ip-based,
+// destination-ip-based}. Every one maps to a field the userspace screen engine
+// (userspace-dp/src/screen) enforces. compileScreen's default arms record every
+// other leaf — at the top-level family, per-family, and per-subtree depth — on
+// ScreenProfile.UnknownLeaves (the full `<family> <leaf>` path); this gate makes
+// the refusal operator-visible at commit. No NEW screening is implemented — the
+// unsupported leaf is rejected, which is the fail-closed-correct outcome. The
+// walk is deterministic (profiles sorted by name, UnknownLeaves in config
+// order). On the tolerant load / peer-sync path the caller downgrades the
+// returned error to a warning (#1960 no-brick); the dataplane never represented
+// the leaf, so a leniently-loaded profile runs without it independently — but
+// the operator never reaches that state through a commit. Mirrors
+// validateFilterFromMatchStrict.
+func validateScreenUnknownStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, name := range sortedScreenNames(cfg.Security.Screen) {
+		profile := cfg.Security.Screen[name]
+		if profile == nil || len(profile.UnknownLeaves) == 0 {
+			continue
+		}
+		return fmt.Errorf(
+			"security screen ids-option %q: `%s` is not a supported screen "+
+				"option (the dataplane does not enforce it, so it would be "+
+				"silently dropped and the protection the operator believes is "+
+				"enabled would be absent); remove it or use a supported option "+
+				"such as icmp ping-death/flood, ip source-route-option/tear-drop/"+
+				"ip-sweep, tcp land/winnuke/syn-frag/syn-fin/no-flag/fin-no-ack/"+
+				"syn-flood/port-scan, udp flood, or limit-session",
+			name, profile.UnknownLeaves[0])
+	}
+	return nil
+}
+
 // policyActionName renders a PolicyAction as its Junos `then` token for
 // operator-facing validator errors.
 func policyActionName(a PolicyAction) string {

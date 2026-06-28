@@ -504,6 +504,14 @@ type ScreenProfile struct {
 	// the commit fail-closed instead of silently defaulting. Each entry names
 	// the screen leaf path and the offending value.
 	BadNumeric []ScreenBadNumeric
+	// UnknownLeaves records screen leaves the dataplane does NOT support
+	// (#3318). The screen schema subtrees are open and compileScreen switched
+	// only on known child names with no default case, so a misspelled or
+	// unsupported leaf committed cleanly and was silently dropped — the operator
+	// believed a control was enabled when it was absent. validateScreenUnknownStrict
+	// reads this to reject the commit fail-closed. Each entry is the full
+	// `<family> <leaf>` path under the ids-option.
+	UnknownLeaves []string
 }
 
 // ScreenBadNumeric records a screen numeric leaf whose explicitly-provided value

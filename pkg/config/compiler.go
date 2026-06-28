@@ -842,6 +842,20 @@ type compileOpts struct {
 	// leniently-loaded profile is no worse than the pre-gate behavior. Same
 	// doctrine as lenientFilterDSCP.
 	lenientScreenNumeric bool
+	// lenientScreenUnknown (#3318) downgrades the unknown-screen-leaf gate
+	// (validateScreenUnknownStrict) from a hard compile error to a cfg.Warnings
+	// entry. The strict commit / commit-check path hard-rejects a screen leaf
+	// the dataplane does NOT support. The screen schema subtrees are open and
+	// compileScreen switched only on known child names with no default case, so
+	// a misspelled or unsupported leaf committed cleanly and was silently
+	// dropped — the operator believed a protection was enabled when it was
+	// absent. compileScreen now records every unsupported leaf on
+	// ScreenProfile.UnknownLeaves; this gate makes the refusal operator-visible
+	// at commit. The tolerant load / peer-sync paths downgrade to a warning so
+	// an already-persisted or peer-synced config still BOOTS (#1960 no-brick);
+	// the dataplane never represented the leaf, so a leniently-loaded profile
+	// runs without it independently. Same doctrine as lenientFilterFromMatch.
+	lenientScreenUnknown bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1103,6 +1117,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyLogAction:               true,
 		lenientScreenProfileRefs:             true,
 		lenientScreenNumeric:                 true,
+		lenientScreenUnknown:                 true,
 		lenientReservedZoneNames:             true,
 		lenientBackupRouterDst:               true,
 		lenientSecureTunnelBindIface:         true,
@@ -1238,6 +1253,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyLogAction:               true,
 		lenientScreenProfileRefs:             true,
 		lenientScreenNumeric:                 true,
+		lenientScreenUnknown:                 true,
 		lenientReservedZoneNames:             true,
 		lenientBackupRouterDst:               true,
 		lenientSecureTunnelBindIface:         true,
@@ -1870,6 +1886,24 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3318 unknown-screen-leaf gate. Strict on commit / commit-check
+	// (hard-reject a screen leaf the dataplane does NOT support). The screen
+	// schema subtrees are open and compileScreen had no default case, so a
+	// misspelled or unsupported leaf committed cleanly and was silently dropped
+	// — the operator believed a protection was enabled when it was absent.
+	// Lenient on load / peer-sync (warn so an already-persisted or peer-synced
+	// config still boots — #1960 no-brick; the dataplane never represented the
+	// leaf, so the profile runs without it independently). Runs on the
+	// fully-compiled *Config so the typed profile list (with UnknownLeaves
+	// populated by compileScreen) is available.
+	if err := validateScreenUnknownStrict(cfg); err != nil {
+		if opts.lenientScreenUnknown {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("screen unknown leaf (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
 
 	// #3055 reserved zone-name definition gate. Strict on commit / commit-check
 	// (hard-reject a `security zones security-zone <name>` whose name is a
