@@ -743,6 +743,39 @@ older binary accepted still boots (#1960 no-brick doctrine). Distinct from
 residual was specifically the strict app-spec path still using the blanket
 `junos-` HasPrefix.
 
+**Ports are valid only on a protocol the dataplane extracts ports for (#3373 —
+audit finding):** the same `validateApplicationSpecsStrict` gate hard-rejects a
+referenced (or app-id-enabled) `set applications application <name>` that sets
+`source-port`/`destination-port` while its `protocol` is one this dataplane does
+NOT extract L4 ports for. The authoritative port-bearing set is the dataplane's
+own extraction predicate — `userspace-dp/src/ip_proto.rs` `has_l4_ports` ==
+**TCP (6) / UDP (17)** ONLY, mirrored by `inspect.rs parse_flow_ports` (which
+reads port bytes only for TCP/UDP) — NOT a name→number resolver. ICMP/ICMPv6,
+GRE, OSPF, ESP, AH, VRRP, IGMP, PIM, IP-in-IP do not carry ports the dataplane
+reads; **SCTP (132) is also excluded** — it has ports on the wire, but this
+dataplane deliberately never extracts or rewrites them (CRC32c checksum, see the
+`ip_proto.rs has_l4_ports` rationale), so an SCTP packet still presents
+`dst_port`/`src_port` = 0 to the matcher. Before the gate `protocol icmp
+destination-port 80` (or `protocol ospf destination-port 89`, `protocol esp
+source-port 4500`, `protocol sctp destination-port 80`) committed: the port
+passed `validatePortSpec` and the protocol passed `filterProtocolResolvable`,
+but the runtime then compiled a port matcher indexed by the protocol number
+(`userspace-dp/src/policy.rs` keys port terms on the packet's extracted
+`src_port`/`dst_port`, which are 0 for any non-extracted protocol), so the term
+became a NEVER-MATCH — fail-OPEN for a deny rule, fail-CLOSED for a permit rule.
+Rejecting at commit is the fail-closed-correct outcome: the dataplane cannot
+enforce the constraint, so refuse it rather than silently compile a never-match
+term. The gate resolves the port-bearing subset inline via
+`protocolIsPortBearing` (appid cannot be imported here — pkg/appid imports
+pkg/config — so the subset is pinned to the `ip_proto.rs has_l4_ports` SSOT by
+the drift-guard test `TestProtocolIsPortBearingMatchesDataplaneExtraction`). It
+fires ONLY when a port is set AND the protocol is not in the extraction set, so
+an icmp-type-constrained ICMP app with no port (junos-ping shape) and a bare
+`protocol gre`/`protocol sctp` still commit. The tolerant load/peer-sync path
+downgrades the reject to a warning (`lenientApplicationSpecs`) per the #1960
+no-brick doctrine. Junos does not couple ports to non-port protocols, so this is
+a vSRX-parity fix.
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`

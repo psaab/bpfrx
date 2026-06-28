@@ -2980,6 +2980,40 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 					"would commit cleanly but fail to arm the referencing policy)",
 				name, app.Protocol)
 		}
+		// #3373: a source-port/destination-port constraint is only meaningful on a
+		// port-bearing transport (TCP/UDP/SCTP). The protocol is already known
+		// resolvable here (filterProtocolResolvable passed above), so a port on any
+		// OTHER protocol — icmp/icmpv6/gre/ospf/esp/ah/vrrp/igmp/pim/ip-in-ip — is a
+		// silent operator error: the userspace matcher (userspace-dp src/policy.rs)
+		// indexes every application term by protocol number and keys port terms on
+		// src_port/dst_port, but a non-port protocol always presents ports of 0, so
+		// the term becomes a never-match. For a deny rule that fails OPEN; for a
+		// permit rule it fails CLOSED. Junos does not couple ports to non-port
+		// protocols, so reject at COMMIT (the same strict-at-commit / #1960
+		// fail-closed doctrine as the protocol-less #3109 and unresolvable-protocol
+		// #3150 cases above). The call site downgrades this to a warning on the
+		// tolerant load / peer-sync path (compiler.go, lenientApplicationSpecs) so an
+		// already-persisted or older-peer-synced config still BOOTS.
+		if !protocolIsPortBearing(app.Protocol) {
+			if port := app.DestinationPort; port != "" {
+				return fmt.Errorf(
+					"application %q: destination-port %q is set on protocol %q, which "+
+						"does not carry L4 ports — source-port/destination-port are valid "+
+						"only on tcp/udp (the dataplane keys port terms on the "+
+						"packet's ports, which are always 0 for a non-port protocol, so the "+
+						"term would never match; remove the port or change the protocol)",
+					name, port, app.Protocol)
+			}
+			if port := app.SourcePort; port != "" {
+				return fmt.Errorf(
+					"application %q: source-port %q is set on protocol %q, which does "+
+						"not carry L4 ports — source-port/destination-port are valid only "+
+						"on tcp/udp (the dataplane keys port terms on the packet's "+
+						"ports, which are always 0 for a non-port protocol, so the term "+
+						"would never match; remove the port or change the protocol)",
+					name, port, app.Protocol)
+			}
+		}
 	}
 	return nil
 }
@@ -3840,6 +3874,57 @@ func filterProtocolResolvable(token string) bool {
 		}
 		return false
 	}
+}
+
+// protocolIsPortBearing reports whether a protocol token names a transport for
+// which THIS dataplane actually extracts L4 ports — i.e. a protocol for which a
+// source-port/destination-port constraint is enforceable. The authoritative set
+// is the dataplane's own port-extraction predicate, NOT a name→number resolver:
+//
+//   - userspace-dp/src/ip_proto.rs `has_l4_ports(protocol)` == TCP | UDP, and
+//   - userspace-dp/src/afxdp/frame/inspect.rs `parse_flow_ports` reads port
+//     bytes only for TCP | UDP (SCTP and everything else fall through to None).
+//
+// So ONLY TCP (6) and UDP (17) carry ports the dataplane reads. ICMP/ICMPv6,
+// GRE, OSPF, ESP, AH, VRRP, IGMP, PIM, IP-in-IP — and crucially SCTP (132) —
+// do not: SCTP HAS ports on the wire, but this dataplane deliberately never
+// extracts or rewrites them (CRC32c checksum, see the ip_proto.rs has_l4_ports
+// comment), so an SCTP packet still presents dst_port/src_port = 0 to the
+// matcher. policy.rs (`PortMatcher::lookup` / `matches`) indexes every
+// application term by protocol number and keys port terms on those extracted
+// ports; for any protocol outside the extraction set a port-constrained term
+// becomes a NEVER-MATCH — fail-open for a deny rule, fail-closed for a permit
+// rule (the #3373 hole). Rejecting a port on such a protocol at commit is the
+// fail-closed-correct outcome: the dataplane cannot enforce the constraint, so
+// refuse it rather than silently compile a term that never matches.
+//
+// This subset is replicated inline because appid cannot be imported here
+// (pkg/appid imports pkg/config — the same import-cycle constraint that forces
+// filterProtocolResolvable to be duplicated). The
+// TestProtocolIsPortBearingMatchesDataplaneExtraction drift-guard pins it to the
+// ip_proto.rs has_l4_ports SSOT (TCP/UDP).
+func protocolIsPortBearing(token string) bool {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "tcp", "junos-tcp-any",
+		"udp", "junos-udp-any":
+		return true
+	default:
+		// Numeric protocol number form: only 6 (TCP) and 17 (UDP). Note 132
+		// (SCTP) is intentionally absent — this dataplane does not extract SCTP
+		// ports (ip_proto.rs has_l4_ports).
+		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil {
+			return n == 6 || n == 17
+		}
+		return false
+	}
+}
+
+// ProtocolIsPortBearing exposes protocolIsPortBearing for the pkg/appid
+// drift-guard test so the inline port-bearing subset cannot silently drift from
+// the dataplane's port-extraction set (ip_proto.rs has_l4_ports). Test seam only
+// — production code uses the unexported form directly.
+func ProtocolIsPortBearing(token string) bool {
+	return protocolIsPortBearing(token)
 }
 
 // FilterProtocolResolvable exposes filterProtocolResolvable for the pkg/appid
