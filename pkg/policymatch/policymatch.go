@@ -284,6 +284,20 @@ func Match(cfg *config.Config, q Query) Result {
 		return matchJunosHost(cfg, q)
 	}
 
+	// #3355: the runtime gates the ENTIRE transit block — exact zone-pair, the
+	// #3090 from-any/to-any/both-any wildcard tiers, AND the #3148 global tier —
+	// on `from_id != 0 && to_id != 0` (policy.rs evaluate_policy_result_with_icmp).
+	// Zone id 0 is the reserved "unknown / no zone" sentinel an unconfigured
+	// zone name resolves to; a flow whose ingress OR egress zone is unknown
+	// belongs to no DEFINED zone pair and is ineligible for zone-pair, wildcard,
+	// or junos-global policies. A query naming an UNDEFINED zone is the simulator
+	// analogue of id 0, so it must fall straight through to the configured
+	// default-policy rather than wrongly matching a `from-zone any` / `to-zone
+	// any` / global rule.
+	if !zoneKnown(cfg, q.FromZone) || !zoneKnown(cfg, q.ToZone) {
+		return Result{DefaultUsed: true, Action: cfg.Security.DefaultPolicy}
+	}
+
 	// Tier 1: exact zone-pair policies, in config order (first match wins).
 	// q.FromZone/q.ToZone are concrete zone names; a wildcard set
 	// (FromZone/ToZone == "any") never compares equal, so it is excluded here.
@@ -366,6 +380,15 @@ func Match(cfg *config.Config, q Query) Result {
 // `from-zone any to-zone any` are deliberately NOT pulled onto the host path,
 // matching the runtime gate.
 func matchJunosHost(cfg *config.Config, q Query) Result {
+	// #3355: evaluate_junos_host_policy returns None for from_id == 0 (the
+	// unknown/undefined ingress zone), mirroring the #3110 unzoned guard. An
+	// undefined query from-zone therefore matches no host-bound rule; local
+	// delivery proceeds (the management lifeline), so surface
+	// HostInboundUnmatched rather than running the host tiers against an
+	// unresolved ingress zone.
+	if !zoneKnown(cfg, q.FromZone) {
+		return Result{HostInboundUnmatched: true}
+	}
 	// Exact ingress -> junos-host.
 	for _, zpp := range cfg.Security.Policies {
 		if zpp == nil || zpp.ToZone != JunosHostZone || zpp.FromZone != q.FromZone {
@@ -406,6 +429,28 @@ func globalScopeMatches(cfg *config.Config, scopeZone, flowZone string) bool {
 		return false // Unresolved → matches nothing
 	}
 	return scopeZone == flowZone
+}
+
+// zoneKnown reports whether a query zone should be treated as DEFINED for the
+// runtime's `id != 0` eligibility guard (#3355). The runtime resolves an
+// unconfigured zone name to the reserved unknown id 0, which is ineligible for
+// zone-pair / wildcard / global / junos-host policies (policy.rs
+// evaluate_policy_result_with_icmp gates the whole transit block on
+// from_id != 0 && to_id != 0; evaluate_junos_host_policy returns None for
+// from_id == 0). A zone is "known" when it is present in cfg.Security.Zones.
+//
+// When the config carries NO zone definitions at all (len == 0) — an offline or
+// minimal synthetic config that never reached the compiler's zone pass — the
+// simulator cannot determine the defined set, so it is lenient and treats every
+// zone as known, matching the package's established nil/empty offline tolerance
+// (FeedOverlay, PolicyInactiveFn). A committed production config always
+// populates Zones, so the guard is fully active there.
+func zoneKnown(cfg *config.Config, zone string) bool {
+	if len(cfg.Security.Zones) == 0 {
+		return true
+	}
+	_, ok := cfg.Security.Zones[zone]
+	return ok
 }
 
 func matchedResult(pol *config.Policy, global bool) Result {

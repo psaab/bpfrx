@@ -125,6 +125,15 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		return &pb.MatchPoliciesResponse{}, nil
 	}
 
+	// #3355 (H06): the CLI surfaces (show security match-policies / test
+	// policy) require BOTH zones; gRPC accepted a missing zone and evaluated as
+	// if the empty string were a zone, which the #3355 defined-zone guard would
+	// then send straight to the default-policy — a misleading silent verdict for
+	// what is really a malformed query. Reject it for parity with the CLI.
+	if req.FromZone == "" || req.ToZone == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "from-zone and to-zone are required")
+	}
+
 	// An empty source/destination IP means "unspecified" (match any),
 	// which is a legitimate simulator query. A NON-EMPTY but malformed
 	// value is an operator error: net.ParseIP returns nil and

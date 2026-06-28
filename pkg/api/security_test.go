@@ -64,6 +64,18 @@ func TestMatchPoliciesHandlerValidation(t *testing.T) {
 		wantMatch bool // for 200 cases: must data.matched be true?
 	}{
 		{
+			// #3355 (H06): a missing from_zone must be rejected for parity with
+			// the CLI, not evaluated as the empty-string zone.
+			name:     "missing from_zone",
+			query:    url.Values{"to_zone": {"untrust"}, "src_ip": {"10.0.1.5"}},
+			wantCode: 400,
+		},
+		{
+			name:     "missing to_zone",
+			query:    url.Values{"from_zone": {"trust"}, "src_ip": {"10.0.1.5"}},
+			wantCode: 400,
+		},
+		{
 			name:     "invalid src_ip",
 			query:    url.Values{"from_zone": {"trust"}, "to_zone": {"untrust"}, "src_ip": {"10.0.0.999"}},
 			wantCode: 400,
