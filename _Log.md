@@ -22755,3 +22755,14 @@ top.
   - **File(s)**: pkg/config/compiler_validate_strict.go,
     pkg/config/compiler_application_specs_test.go,
     pkg/appid/protocol_number_2124_test.go, pkg/config/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3373 SMR-fold — SCTP (132) is NOT port-extracted by this
+    dataplane (ip_proto.rs has_l4_ports = TCP/UDP only; inspect.rs
+    parse_flow_ports skips SCTP), so sctp+port is the same never-match hole.
+    Dropped SCTP from protocolIsPortBearing (now TCP/UDP only); re-anchored
+    the drift guard to the dataplane port-extraction SSOT (has_l4_ports) not
+    appid.ProtocolNumber; flipped sctp/132 from accept to reject in tests.
+  - **File(s)**: pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler_application_specs_test.go,
+    pkg/appid/protocol_number_2124_test.go, pkg/config/README.md, _Log.md

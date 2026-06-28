@@ -508,6 +508,11 @@ func TestApplicationSpec_PortOnNonPortProtocol_RejectsAtCommit(t *testing.T) {
 		{"esp_src", "esp", "source-port", "4500"},
 		{"ah_dst", "ah", "destination-port", "51"},
 		{"vrrp_dst", "vrrp", "destination-port", "112"},
+		// SCTP HAS ports on the wire but this dataplane never extracts them
+		// (ip_proto.rs has_l4_ports = TCP/UDP only), so an sctp+port term is the
+		// same #3373 never-match — reject it, fail-closed-correct.
+		{"sctp_dst", "sctp", "destination-port", "80"},
+		{"numeric_sctp_dst", "132", "destination-port", "80"},
 		{"junos_ping_dst", "junos-ping", "destination-port", "8"},
 		{"junos_gre_src", "junos-gre", "source-port", "1024"},
 		{"numeric_gre_dst", "47", "destination-port", "80"},
@@ -532,14 +537,16 @@ func TestApplicationSpec_PortOnNonPortProtocol_RejectsAtCommit(t *testing.T) {
 }
 
 // Positive controls — these must continue to commit cleanly, proving the #3373
-// reject is scoped to (port set) AND (non-port protocol):
+// reject is scoped to (port set) AND (a protocol the dataplane does not extract
+// ports for):
 //
-//   - tcp/udp/sctp + a port (the only port-bearing transports);
+//   - tcp/udp + a port (the ONLY protocols ip_proto.rs has_l4_ports extracts —
+//     SCTP is deliberately excluded and tested as a REJECT above);
 //   - a non-port protocol (icmp/gre) with NO port (the port is what makes it
 //     unrepresentable — the protocol alone is fine);
-//   - a numeric port-bearing protocol (6/17/132).
+//   - the numeric forms of the extracted protocols (6/17).
 func TestApplicationSpec_PortBearingProtocolWithPort_AcceptsAtCommit(t *testing.T) {
-	for _, proto := range []string{"tcp", "udp", "sctp", "junos-tcp-any", "junos-udp-any", "6", "17", "132"} {
+	for _, proto := range []string{"tcp", "udp", "junos-tcp-any", "junos-udp-any", "6", "17"} {
 		tree := flatTreeFromSets(t, referencedNonPortProtoWithPort(proto, "destination-port", "8080")...)
 		if _, err := CompileConfig(tree); err != nil {
 			t.Fatalf("expected commit to accept port-bearing protocol %q with a port: %v", proto, err)
@@ -548,7 +555,7 @@ func TestApplicationSpec_PortBearingProtocolWithPort_AcceptsAtCommit(t *testing.
 }
 
 func TestApplicationSpec_NonPortProtocolWithoutPort_AcceptsAtCommit(t *testing.T) {
-	for _, proto := range []string{"icmp", "icmpv6", "gre", "ospf", "esp", "ah", "vrrp", "junos-ping", "47", "0"} {
+	for _, proto := range []string{"icmp", "icmpv6", "gre", "ospf", "esp", "ah", "vrrp", "sctp", "junos-ping", "47", "0", "132"} {
 		tree := flatTreeFromSets(t, referencedProtoApp(proto)...)
 		if _, err := CompileConfig(tree); err != nil {
 			t.Fatalf("expected commit to accept non-port protocol %q with NO port: %v", proto, err)

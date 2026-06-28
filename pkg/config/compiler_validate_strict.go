@@ -3876,30 +3876,44 @@ func filterProtocolResolvable(token string) bool {
 	}
 }
 
-// protocolIsPortBearing reports whether a resolvable protocol token names a
-// transport that actually carries L4 ports (and thus for which a
-// source-port/destination-port constraint is meaningful). Only TCP, UDP and
-// SCTP carry ports in the userspace matcher and on the wire; ICMP/ICMPv6, GRE,
-// OSPF, ESP, AH, VRRP, IGMP, PIM, IP-in-IP and the like do not. The dataplane
-// (userspace-dp src/policy.rs) indexes every application term by protocol
-// number and keys port terms on src_port/dst_port; for a non-port protocol the
-// packet's ports are always 0, so a port-constrained term on such a protocol is
-// a never-match term — fail-open for a deny rule, fail-closed for a permit
-// rule. This mirrors the inline ProtocolNumber subset (appid cannot be imported
-// here — pkg/appid imports pkg/config, the same import-cycle constraint that
-// forces filterProtocolResolvable to be duplicated). The
-// TestProtocolIsPortBearingMatchesProtocolNumber drift-guard keeps this subset
-// in agreement with appid.ProtocolNumber.
+// protocolIsPortBearing reports whether a protocol token names a transport for
+// which THIS dataplane actually extracts L4 ports — i.e. a protocol for which a
+// source-port/destination-port constraint is enforceable. The authoritative set
+// is the dataplane's own port-extraction predicate, NOT a name→number resolver:
+//
+//   - userspace-dp/src/ip_proto.rs `has_l4_ports(protocol)` == TCP | UDP, and
+//   - userspace-dp/src/afxdp/frame/inspect.rs `parse_flow_ports` reads port
+//     bytes only for TCP | UDP (SCTP and everything else fall through to None).
+//
+// So ONLY TCP (6) and UDP (17) carry ports the dataplane reads. ICMP/ICMPv6,
+// GRE, OSPF, ESP, AH, VRRP, IGMP, PIM, IP-in-IP — and crucially SCTP (132) —
+// do not: SCTP HAS ports on the wire, but this dataplane deliberately never
+// extracts or rewrites them (CRC32c checksum, see the ip_proto.rs has_l4_ports
+// comment), so an SCTP packet still presents dst_port/src_port = 0 to the
+// matcher. policy.rs (`PortMatcher::lookup` / `matches`) indexes every
+// application term by protocol number and keys port terms on those extracted
+// ports; for any protocol outside the extraction set a port-constrained term
+// becomes a NEVER-MATCH — fail-open for a deny rule, fail-closed for a permit
+// rule (the #3373 hole). Rejecting a port on such a protocol at commit is the
+// fail-closed-correct outcome: the dataplane cannot enforce the constraint, so
+// refuse it rather than silently compile a term that never matches.
+//
+// This subset is replicated inline because appid cannot be imported here
+// (pkg/appid imports pkg/config — the same import-cycle constraint that forces
+// filterProtocolResolvable to be duplicated). The
+// TestProtocolIsPortBearingMatchesDataplaneExtraction drift-guard pins it to the
+// ip_proto.rs has_l4_ports SSOT (TCP/UDP).
 func protocolIsPortBearing(token string) bool {
 	switch strings.ToLower(strings.TrimSpace(token)) {
 	case "tcp", "junos-tcp-any",
-		"udp", "junos-udp-any",
-		"sctp":
+		"udp", "junos-udp-any":
 		return true
 	default:
-		// Numeric protocol number form (e.g. "6"/"17"/"132").
+		// Numeric protocol number form: only 6 (TCP) and 17 (UDP). Note 132
+		// (SCTP) is intentionally absent — this dataplane does not extract SCTP
+		// ports (ip_proto.rs has_l4_ports).
 		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil {
-			return n == 6 || n == 17 || n == 132
+			return n == 6 || n == 17
 		}
 		return false
 	}
@@ -3907,8 +3921,8 @@ func protocolIsPortBearing(token string) bool {
 
 // ProtocolIsPortBearing exposes protocolIsPortBearing for the pkg/appid
 // drift-guard test so the inline port-bearing subset cannot silently drift from
-// appid.ProtocolNumber. Test seam only — production code uses the unexported
-// form directly.
+// the dataplane's port-extraction set (ip_proto.rs has_l4_ports). Test seam only
+// — production code uses the unexported form directly.
 func ProtocolIsPortBearing(token string) bool {
 	return protocolIsPortBearing(token)
 }
