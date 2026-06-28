@@ -87,5 +87,15 @@ func installFakeNetworkctl(t *testing.T) {
 	if err := os.WriteFile(networkctl, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
 		t.Fatalf("write fake networkctl: %v", err)
 	}
+	// #3333: applyConfigLocked now surfaces a host-inbound `nft` apply/teardown
+	// failure as a commit error (fail-closed). The CI/test host has no `nft`
+	// binary, so without a benign stub these full-apply tests would fail on an
+	// nft-not-found error unrelated to what they assert. Install a no-op nft
+	// alongside networkctl (the host-inbound failure semantics themselves are
+	// covered by the seam-injection tests in host_inbound_nft_test.go).
+	nft := filepath.Join(binDir, "nft")
+	if err := os.WriteFile(nft, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("write fake nft: %v", err)
+	}
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 }

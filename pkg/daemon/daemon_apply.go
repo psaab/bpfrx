@@ -1257,7 +1257,13 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	d.applyTimezone(cfg)
 	d.applyKernelTuning(cfg)
 	d.applyLo0Filter(cfg)
-	d.applyHostInboundFilter(cfg)
+	// #3333: host-inbound is the kernel-nftables PRIMARY enforcement of the
+	// host-inbound contract, so an apply/teardown failure must fail the commit
+	// closed rather than be swallowed at WARN. The error is joined into the
+	// commit result at the tail (alongside networkdErr / dhcpServerErr); the
+	// remaining apply steps still run so management/SSH reconcile is never
+	// skipped by a host-inbound nft failure.
+	hostInboundErr := d.applyHostInboundFilter(cfg)
 
 	// 9.6. Write SSH known hosts file
 	d.applySSHKnownHosts(cfg)
@@ -1445,7 +1451,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// restart/stop failure through the commit so a write that left stale
 	// kernel state fails the commit (fail-closed) instead of reporting
 	// success. Both are joined so neither masks the other.
-	return errors.Join(networkdErr, dhcpServerErr)
+	return errors.Join(networkdErr, dhcpServerErr, hostInboundErr)
 }
 
 // compileErrorMustAbortApply reports whether a dataplane ApplyConfig error

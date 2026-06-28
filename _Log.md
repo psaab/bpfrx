@@ -22788,3 +22788,18 @@ top.
     subcases to TestApplicationSpec_PortOnNonPortProtocol_LenientWarns.
   - **File(s)**: pkg/config/compiler_validate_strict.go,
     pkg/config/compiler_application_specs_test.go, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3333 host-inbound nft fail-closed — applyHostInboundFilter now
+    returns an error on apply (`nft -f -`) AND teardown failure instead of a
+    swallowed WARN; applyConfigLocked joins it into the commit result
+    (errors.Join with networkdErr/dhcpServerErr) so a committed deny that did
+    not reach the kernel reports commit FAILURE. Teardown switched to
+    `nft destroy` (idempotent on absent table) so the benign no-table case is
+    still a no-op while a real teardown failure surfaces. Added package-var
+    seams nftApplyPayload / nftDeleteTable for test failure injection; new
+    seam-injection tests + RED-on-revert. Extended installFakeNetworkctl to
+    stub nft so full-apply tests don't fail on nft-not-found.
+  - **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/daemon_apply.go,
+    pkg/daemon/host_inbound_nft_test.go, pkg/daemon/daemon_apply_runtime_test.go,
+    _Log.md

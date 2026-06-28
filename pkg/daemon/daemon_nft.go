@@ -3,6 +3,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os/exec"
 	"strconv"
@@ -12,6 +13,33 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
+
+// nftApplyPayload runs `nft -f -` with the supplied ruleset payload on stdin.
+// It is a package var so the host-inbound apply path's failure semantics are
+// unit-testable without invoking nft (#3333). The 5s context + WaitDelay mirror
+// the established inline apply sites (#1794): an `-f -` payload loads atomically,
+// so on failure the kernel retains the PREVIOUS table untouched rather than a
+// half-applied ruleset.
+var nftApplyPayload = func(payload string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
+	cmd.WaitDelay = 5 * time.Second
+	cmd.Stdin = strings.NewReader(payload)
+	return cmd.CombinedOutput()
+}
+
+// nftDeleteTable idempotently removes an nft table. It uses `nft destroy`
+// rather than `nft delete`: `destroy` is a no-op when the table is absent (the
+// common no-host-inbound case), so it returns no error for the benign
+// never-existed case while a genuine teardown failure — which would leave stale
+// deny rules in the kernel — surfaces as an error. That lets the host-inbound
+// teardown fail closed (#3333). `destroy` is available on the project's nft
+// floor (Ubuntu 26.04 / nftables 1.1.x, kernel >= 6.18). Package var for test
+// failure injection.
+var nftDeleteTable = func(family, name string) ([]byte, error) {
+	return runCommandTimeout("nft", "destroy", "table", family, name)
+}
 
 // applyLo0Filter applies loopback filter rules for host-bound traffic.
 // Implements "interfaces lo0 unit 0 family inet filter input <name>" by
@@ -106,26 +134,39 @@ func buildLo0FilterPayload(cfg *config.Config, filterV4, filterV6 string) string
 // BuildZoneHostInboundViews, so a host-inbound deny can never strand management
 // or break HA. Established sessions and IPv6 ND / PMTUD control messages are
 // accepted before any deny.
-func (d *Daemon) applyHostInboundFilter(cfg *config.Config) {
+//
+// Fail-closed (#3333): both the apply and the teardown surface their failure as
+// a returned error instead of a swallowed WARN. applyConfigLocked joins this
+// into the commit result, so a committed host-inbound deny that did not reach
+// the kernel reports commit FAILURE rather than silent success. The retained
+// kernel state is always the more- or equally-restrictive prior state: an `-f -`
+// apply loads atomically (the previous table is kept on failure), and a failed
+// teardown leaves the existing deny in place — neither can strand management,
+// since lifeline interfaces are excluded from the address sets. Boot / DHCP
+// re-applies go through applyConfig(), which only logs the error, so a transient
+// nft failure cannot brick startup; the next clean commit re-renders.
+func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	views := dpuserspace.BuildZoneHostInboundViews(cfg)
 	if !hostInboundHasEnforceableView(views) {
-		// No host-inbound-configured zone with a resolvable address — nothing
-		// to enforce. Remove any stale table (idempotent; delete fails benignly
-		// when the table is absent). Timeout-bounded (#1794).
-		_, _ = runCommandTimeout("nft", "delete", "table", "inet", "xpf_hostinbound")
-		return
+		// No host-inbound-configured zone with a resolvable address — nothing to
+		// enforce. Remove any stale table. nftDeleteTable uses `nft destroy`,
+		// which is idempotent (no error when the table is absent — the common
+		// case), so a non-nil error here is a REAL teardown failure that left a
+		// stale deny in the kernel: surface it so the commit fails closed rather
+		// than reporting that host-inbound was relaxed when it was not.
+		if out, err := nftDeleteTable("inet", "xpf_hostinbound"); err != nil {
+			slog.Warn("failed to delete stale host-inbound filter table", "err", err, "output", string(out))
+			return fmt.Errorf("delete stale host-inbound nftables table: %w", err)
+		}
+		return nil
 	}
 	nftConf := buildHostInboundFilterPayload(views)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
-	cmd.WaitDelay = 5 * time.Second
-	cmd.Stdin = strings.NewReader(nftConf)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := nftApplyPayload(nftConf); err != nil {
 		slog.Warn("failed to apply host-inbound filter", "err", err, "output", string(out))
-	} else {
-		slog.Info("host-inbound filter applied", "zones", len(views))
+		return fmt.Errorf("apply host-inbound nftables filter: %w", err)
 	}
+	slog.Info("host-inbound filter applied", "zones", len(views))
+	return nil
 }
 
 // hostInboundHasEnforceableView reports whether at least one view carries a
