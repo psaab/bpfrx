@@ -12,7 +12,12 @@ reports.
   fans events out to configured syslog clients.
 - `EventBuffer` — `eventbuf.go`. `NewEventBuffer(size int)` — the
   caller picks the size; `pkg/daemon/daemon_run.go` constructs it
-  with 1000. Bounded ring; full → drops the oldest entry.
+  with 1000. A non-positive size is clamped to `defaultEventBufferSize`
+  (1000) so the ring is never zero-capacity (a zero ring panics on the
+  first `Add` via `head % size`, #3342). Bounded ring; full → drops the
+  oldest entry. `Latest(n)` and `LatestFiltered(n, …)` both treat
+  `n <= 0` as "return nothing" — a count argument never reaches
+  `make([]EventRecord, n)` with a negative len (which panics).
 - `Subscription` — `eventbuf.go`. A consumer of the event ring.
 - `LocalLogWriter` — `locallog.go`. File-based writer with
   facility/severity filters.
