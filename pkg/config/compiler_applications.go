@@ -51,9 +51,9 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 			case "protocol":
 				app.Protocol = nodeVal(prop)
 			case "destination-port":
-				app.DestinationPort = nodeVal(prop)
+				app.DestinationPort = resolveAppPort(nodeVal(prop))
 			case "source-port":
-				app.SourcePort = nodeVal(prop)
+				app.SourcePort = resolveAppPort(nodeVal(prop))
 			case "inactivity-timeout", "timeout":
 				if v := nodeVal(prop); v != "" {
 					if n, ok := parseAppTimeout(v); ok {
@@ -154,12 +154,12 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 		case "destination-port":
 			if i+1 < len(keys) {
 				i++
-				dstPort = keys[i]
+				dstPort = resolveAppPort(keys[i])
 			}
 		case "source-port":
 			if i+1 < len(keys) {
 				i++
-				srcPort = keys[i]
+				srcPort = resolveAppPort(keys[i])
 			}
 		case "inactivity-timeout", "timeout":
 			if i+1 < len(keys) {
@@ -240,8 +240,76 @@ func normalizeProtocol(name string) string {
 	}
 }
 
+// resolveAppPort rewrites a custom-application port spec (destination-port /
+// source-port) so any Junos service name is replaced by its numeric value,
+// leaving the dataplane to ever parse only numerics. This is the application
+// counterpart of resolveFilterPortTokens (filter_match_resolve.go): both back
+// named-port resolution with the SAME junosServicePorts catalog (the single
+// source of truth for Junos service-name → port number), so a name the firewall
+// filter path accepts (`domain`, `www`, `kerberos-sec`, ...) is accepted here
+// too — closing the #3340 gap where a custom application's destination-port only
+// knew a hard-coded 15-name subset (`dns` yes, its alias `domain` no).
+//
+// Why resolve to a number rather than widen the accepted name set: the Rust
+// dataplane's parse_port_spec (userspace-dp/src/policy.rs) and its Go mirror
+// userspacePortSpecRepresentable (pkg/dataplane/userspace/capabilities.go, the
+// #2124 capability gate) recognize ONLY the 15 literal names. Passing a broader
+// name straight through would parse at commit but be unrepresentable at apply —
+// the #2124 gate would set ForwardingSupported=false for the whole dataplane (a
+// commit/apply split). Resolving to a number here means BOTH the strict commit
+// gate and the runtime capability gate see the numeric form and agree.
+//
+// resolveFilterPort is deliberately NOT reused: it splits on '-' BEFORE a
+// whole-spec name lookup, so a hyphenated service name (ftp-data, tacacs-ds,
+// kerberos-sec) would be misparsed as a low-high range and rejected. The
+// whole-spec catalog lookup here comes first so hyphenated names resolve.
+//
+// On success the canonical numeric string is returned. An UNRESOLVABLE spec
+// (unknown name, out-of-range / malformed number, inverted or unresolved range)
+// is returned verbatim so the caller leaves it for validatePortSpec to reject at
+// the strict commit gate (and to downgrade to a warning on the lenient path) —
+// the strict-reject + lenient-warn discipline (#1960/#3261). The catalog lookup
+// is case-insensitive (strings.ToLower), so a mixed-case service name resolves
+// rather than passing through unresolved.
+func resolveAppPort(spec string) string {
+	trimmed := strings.TrimSpace(spec)
+	if trimmed == "" {
+		return spec
+	}
+	// Whole-spec service name first — covers hyphenated names (ftp-data,
+	// kerberos-sec) that a range-split would otherwise mangle.
+	if p, ok := junosServicePorts[strings.ToLower(trimmed)]; ok {
+		return strconv.Itoa(int(p))
+	}
+	// A bare numeric port is already in the form the dataplane wants; leave it
+	// byte-identical (validatePortSpec still range-checks it).
+	if _, err := strconv.Atoi(trimmed); err == nil {
+		return spec
+	}
+	// A low-high range whose endpoints are numbers or (non-hyphenated) service
+	// names: resolve each side through the catalog and emit a numeric range.
+	if lo, hi, found := strings.Cut(trimmed, "-"); found {
+		l, ok1 := resolveSinglePort(lo)
+		h, ok2 := resolveSinglePort(hi)
+		if ok1 && ok2 && l <= h {
+			return fmt.Sprintf("%d-%d", l, h)
+		}
+	}
+	// Unresolvable — return verbatim so the strict gate rejects / lenient warns.
+	return spec
+}
+
 // validatePortSpec checks that a port specification is valid.
 // Valid formats: "80", "8080-8090", named ports like "http".
+//
+// Application named ports are resolved to numerics by resolveAppPort at compile
+// time (compileApplications / parseApplicationTerms), so by the time this gate
+// runs a recognized service name is already a number. The 15 literal names below
+// are the set the Rust dataplane (parse_port_spec) accepts directly, kept as a
+// belt-and-suspenders backstop so those names still validate even if a future
+// caller reaches this gate without resolving first — it stays in lock-step with
+// userspacePortSpecRepresentable so this validator never accepts a raw name the
+// dataplane cannot represent.
 func validatePortSpec(spec string) error {
 	if spec == "" {
 		return nil
