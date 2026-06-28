@@ -1,3 +1,25 @@
+## 2026-06-28 — #3392 lo0 nftables apply/delete fail-closed (sibling of #3333)
+
+- **Timestamp**: 2026-06-28
+- **Action**: Mirror the #3333/#3389 host-inbound fail-closed fix onto the lo0
+  input-filter path. `applyLo0Filter` now RETURNS the apply/teardown error
+  instead of swallowing it at WARN; `applyConfigLocked` joins it (`lo0Err`) into
+  the deferred-tail `errors.Join(networkdErr, dhcpServerErr, hostInboundErr,
+  lo0Err)` so a committed lo0 filter that did not reach the kernel reports commit
+  FAILURE rather than silent success. The no-filter teardown switched from a
+  bare `nft delete table` (errors when absent) to the idempotent
+  `add table; delete table` payload via the shared `nftDeleteTable` seam
+  (universal verbs — NO `nft destroy`), reusing the atomic `nftApplyPayload`
+  runner. Boot/DHCP re-applies stay log-only via `applyConfig` (no startup
+  brick). Added a commit-level wiring test (RED-on-revert: removing `lo0Err`
+  from the join) + helper apply/teardown failure-surfaced + success-no-error +
+  idempotent add+delete teardown tests. Updated the README lo0 bullet (was
+  documenting the old fail-OPEN warn-only behavior). RED-on-revert verified for
+  the join wiring AND both helper paths.
+- **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/lo0_filter_test.go, pkg/daemon/daemon_apply_runtime_test.go,
+  pkg/daemon/README.md
+
 ## 2026-06-27 — #3311 host-inbound `protocols isis` (L2 no-op, vSRX parity)
 
 - **Timestamp**: 2026-06-27

@@ -272,17 +272,32 @@ never lock an operator out of a remote box it manages.
 - lo0 input filters (`interfaces lo0 unit 0 family inet[6] filter input
   <name>`) lock down host-bound/control-plane traffic via an nftables table
   `inet xpf_lo0`. `daemon_nft.go:applyLo0Filter` builds the table with
-  `buildLo0FilterPayload` and feeds it to `nft -f -`. nft parses an `-f -`
-  payload **atomically** — a syntax error on any line rejects the ENTIRE
-  payload (the filter then fails OPEN, logging only a `slog.Warn`). The
-  payload MUST therefore reset the prior table with the valid atomic idiom:
-  `table inet xpf_lo0` (create-if-absent, no body — idempotent) +
-  `flush table inet xpf_lo0` + the redefined table. Do NOT use
-  `flush ruleset inet xpf_lo0`: `flush ruleset` takes at most an OPTIONAL
-  family (`flush ruleset [<family>]`), never a table name — appending one is
-  an nft parse error that silently dropped the whole filter (#2069).
-  `TestLo0FilterPayloadNftParses` parse-checks the real payload with
-  `nft -c -f -` when nft is on PATH.
+  `buildLo0FilterPayload` and feeds it to `nft -f -` (via the `nftApplyPayload`
+  seam). nft parses an `-f -` payload **atomically** — a syntax error on any
+  line rejects the ENTIRE payload (the kernel keeps the PREVIOUS table
+  untouched, not a half-applied ruleset). The payload MUST therefore reset the
+  prior table with the valid atomic idiom: `table inet xpf_lo0`
+  (create-if-absent, no body — idempotent) + `flush table inet xpf_lo0` + the
+  redefined table. Do NOT use `flush ruleset inet xpf_lo0`: `flush ruleset`
+  takes at most an OPTIONAL family (`flush ruleset [<family>]`), never a table
+  name — appending one is an nft parse error that silently dropped the whole
+  filter (#2069). `TestLo0FilterPayloadNftParses` parse-checks the real payload
+  with `nft -c -f -` when nft is on PATH.
+  **Fail-closed (#3392, mirroring host-inbound #3333):** `applyLo0Filter`
+  RETURNS the apply/teardown error instead of swallowing it at WARN, and
+  `applyConfigLocked` joins it (`lo0Err`) into the commit result alongside
+  `networkdErr`/`dhcpServerErr`/`hostInboundErr`, so a committed lo0 filter that
+  did not reach the kernel reports commit FAILURE rather than silent success.
+  The teardown (no filter bound) uses the idempotent `add table; delete table`
+  payload via `nftDeleteTable` (universal verbs — NOT the unpinned `nft
+  destroy`), so the benign absent-table case is a no-op while a genuine teardown
+  failure (stale filter left in the kernel) still surfaces. Boot / DHCP
+  re-applies go through `applyConfig`, which only LOGS the error, so a transient
+  nft failure cannot brick startup; the next clean commit re-renders. Tests:
+  `lo0_filter_test.go` (apply/teardown failure-surfaced fail-on-revert,
+  success-no-error, idempotent add+delete teardown) and
+  `daemon_apply_runtime_test.go:TestApplyConfigLockedSurfacesLo0Failure` (the
+  commit-level `errors.Join` wiring proof).
 - host-inbound-traffic (`security zones <z> host-inbound-traffic`) is the
   PRIMARY kernel enforcement for host-bound traffic to a firewall interface IP
   / VRRP VIP (SSH, ping, OSPF/BGP to the box — #3070). Such traffic is shunted

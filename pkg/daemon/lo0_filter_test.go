@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"os/exec"
 	"strings"
 	"testing"
@@ -124,6 +125,125 @@ func TestLo0FilterPayloadNftParses(t *testing.T) {
 	// Anything else (typically `Operation not permitted` without CAP_NET_ADMIN)
 	// means the syntax parsed; that is a pass for this parse-check test.
 	t.Logf("nft -c parsed the payload; non-syntax error (expected without CAP_NET_ADMIN): %v\n%s", err, combined)
+}
+
+// TestLo0FilterApplyFailureSurfaced is the #3392 fail-on-revert proof for the
+// APPLY path: when `nft -f -` fails, applyLo0Filter must return the error (so
+// applyConfigLocked fails the commit closed) rather than swallow it at WARN.
+// With the pre-fix warn-only code the function returned nothing and this goes
+// RED. The nft invocation is replaced by the package-var seam so no real nft is
+// run. Mirrors TestHostInboundFilterApplyFailureSurfaced (#3333).
+func TestLo0FilterApplyFailureSurfaced(t *testing.T) {
+	cfg := lo0FilterTestConfig()
+
+	injected := errors.New("nft: lo0 rule load failed")
+	var called bool
+	orig := nftApplyPayload
+	nftApplyPayload = func(payload string) ([]byte, error) {
+		called = true
+		// Sanity: the payload fed to nft must be the lo0 filter ruleset, so a
+		// failure here is a real filter-not-installed event.
+		if !strings.Contains(payload, "table inet xpf_lo0") {
+			t.Errorf("apply seam got unexpected payload:\n%s", payload)
+		}
+		return []byte("Error: could not process rule\n"), injected
+	}
+	defer func() { nftApplyPayload = orig }()
+
+	d := &Daemon{}
+	err := d.applyLo0Filter(cfg)
+	if !called {
+		t.Fatal("expected nft apply seam to be invoked for a configured lo0 filter")
+	}
+	if err == nil {
+		t.Fatal("apply failure must be surfaced as an error (fail-closed), got nil")
+	}
+	if !errors.Is(err, injected) {
+		t.Errorf("returned error must wrap the nft failure, got %v", err)
+	}
+}
+
+// TestLo0FilterDeleteFailureSurfaced is the #3392 fail-on-revert proof for the
+// TEARDOWN path: when no lo0 filter is configured, the stale table is removed via
+// the idempotent add-then-delete payload; a genuine teardown failure (stale lo0
+// filter left in the kernel) must surface as an error. The add+delete is
+// idempotent for the benign absent-table case, so any error from the seam is a
+// real failure. Pre-fix the delete error was discarded entirely (`_, _ =`), so
+// this goes RED. Mirrors TestHostInboundFilterDeleteFailureSurfaced (#3333).
+func TestLo0FilterDeleteFailureSurfaced(t *testing.T) {
+	// A config with NO lo0 filter bound drives the teardown branch.
+	cfg := &config.Config{}
+
+	injected := errors.New("nft: device or resource busy")
+	var gotFamily, gotName string
+	orig := nftDeleteTable
+	nftDeleteTable = func(family, name string) ([]byte, error) {
+		gotFamily, gotName = family, name
+		return []byte("Error: Could not process rule\n"), injected
+	}
+	defer func() { nftDeleteTable = orig }()
+
+	d := &Daemon{}
+	err := d.applyLo0Filter(cfg)
+	if gotName != "xpf_lo0" || gotFamily != "inet" {
+		t.Errorf("teardown must target inet xpf_lo0, got %s %s", gotFamily, gotName)
+	}
+	if err == nil {
+		t.Fatal("teardown failure must be surfaced as an error (fail-closed), got nil")
+	}
+	if !errors.Is(err, injected) {
+		t.Errorf("returned error must wrap the nft teardown failure, got %v", err)
+	}
+}
+
+// TestLo0FilterApplySuccessNoError verifies the happy paths return nil: a
+// successful apply (configured filter) and a successful/benign teardown (no
+// filter bound) must NOT report a commit failure.
+func TestLo0FilterApplySuccessNoError(t *testing.T) {
+	origApply, origDelete := nftApplyPayload, nftDeleteTable
+	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
+	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
+	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
+
+	d := &Daemon{}
+	if err := d.applyLo0Filter(lo0FilterTestConfig()); err != nil {
+		t.Errorf("successful apply must return nil, got %v", err)
+	}
+	if err := d.applyLo0Filter(&config.Config{}); err != nil {
+		t.Errorf("benign teardown (no lo0 filter) must return nil, got %v", err)
+	}
+}
+
+// TestNftDeleteTableLo0IdempotentAddDelete pins the #3392 teardown shape for the
+// lo0 table: the teardown must NOT depend on the recent `nft destroy` verb (the
+// project pins no minimum nftables version) and must instead emit an idempotent
+// add-then-delete payload through the atomic nftApplyPayload runner. Reverting to
+// `nft destroy` (or the bare `delete table` that errors when absent) turns this
+// RED. Mirrors TestNftDeleteTableIdempotentAddDelete (#3333).
+func TestNftDeleteTableLo0IdempotentAddDelete(t *testing.T) {
+	var got string
+	orig := nftApplyPayload
+	nftApplyPayload = func(payload string) ([]byte, error) { got = payload; return nil, nil }
+	defer func() { nftApplyPayload = orig }()
+
+	if _, err := nftDeleteTable("inet", "xpf_lo0"); err != nil {
+		t.Fatalf("nftDeleteTable: %v", err)
+	}
+	if strings.Contains(got, "destroy") {
+		t.Errorf("teardown must not use the unpinned `nft destroy` verb:\n%s", got)
+	}
+	for _, want := range []string{
+		"add table inet xpf_lo0",
+		"delete table inet xpf_lo0",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("teardown payload missing %q:\n%s", want, got)
+		}
+	}
+	// `add` must precede `delete` so the delete always has a target.
+	if strings.Index(got, "add table") > strings.Index(got, "delete table") {
+		t.Errorf("add must precede delete in the teardown payload:\n%s", got)
+	}
 }
 
 func TestNftRuleFromTermPrefixListExpansion(t *testing.T) {

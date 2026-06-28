@@ -71,6 +71,77 @@ func TestApplyConfigLockedSurfacesHostInboundFailure(t *testing.T) {
 	}
 }
 
+// TestApplyConfigLockedSurfacesLo0Failure is the #3392 commit-level wiring
+// proof: it drives the REAL applyConfigLocked body (not the applyLo0Filter
+// helper directly) with an injected lo0-filter nft failure via the
+// nftApplyPayload seam, and asserts the returned commit error includes that
+// failure. This pins the production wiring — the errors.Join(networkdErr,
+// dhcpServerErr, hostInboundErr, lo0Err) at the tail of applyConfigLocked —
+// which the helper-level seam tests do NOT cover.
+//
+// RED-on-revert: remove lo0Err from that join and this test goes RED (the apply
+// completes and returns nil despite the lo0 input filter failing to install —
+// the silent fail-open the issue describes). The config binds an lo0 filter but
+// declares NO host-inbound stanza, so the only nftApplyPayload caller that can
+// fail is applyLo0Filter — isolating this from the #3333 host-inbound wiring.
+func TestApplyConfigLockedSurfacesLo0Failure(t *testing.T) {
+	installFakeNetworkctl(t)
+
+	injected := errors.New("nft: lo0 rule load failed")
+	origApply, origDelete := nftApplyPayload, nftDeleteTable
+	nftApplyPayload = func(string) ([]byte, error) { return []byte("Error: load failed\n"), injected }
+	// nftDeleteTable's default impl delegates to nftApplyPayload, so without this
+	// stub the host-inbound no-enforceable-view TEARDOWN (which this config takes)
+	// would also fail with `injected` and mask the RED-on-revert: removing lo0Err
+	// from the join must be the ONLY thing that surfaces `injected`. Stub the
+	// teardown to succeed so the injected error rides solely on the lo0 apply.
+	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
+	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
+
+	networkDir := t.TempDir()
+	d := &Daemon{
+		dp:       &runtimeOnlyApplyTestDP{},
+		networkd: networkd.NewInDir(networkDir),
+		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
+		vrrpMgr:  vrrp.NewManager(),
+		opts:     Options{NoDataplane: true},
+	}
+
+	// An lo0 input filter is bound (so applyLo0Filter reaches the APPLY path and
+	// the injected nft failure is the filter-not-installed failure). No zone
+	// declares a host-inbound stanza, so applyHostInboundFilter takes the
+	// no-enforceable-view teardown branch, which is stubbed to succeed above —
+	// keeping the injected error scoped to the lo0 apply wiring.
+	cfg := &config.Config{}
+	cfg.System.Lo0FilterInputV4 = "mgmt-lockdown"
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		"mgmt-lockdown": {
+			Name: "mgmt-lockdown",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "deny-all", Action: "discard"},
+			},
+		},
+	}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"10.7.7.1/24"}},
+		}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust", Interfaces: []string{"reth0.0"}},
+	}
+
+	err := d.applyConfigLocked(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("applyConfigLocked must surface the lo0 nft failure " +
+			"(fail-closed); got nil (the silent fail-open #3392 describes)")
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("returned commit error must include the lo0 failure "+
+			"via errors.Join wiring, got %v", err)
+	}
+}
+
 func TestApplyConfigRuntimeResultDrivesDownstreamConsumers(t *testing.T) {
 	networkDir := t.TempDir()
 	installFakeNetworkctl(t)
