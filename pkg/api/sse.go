@@ -151,16 +151,23 @@ func eventEntryFromRecord(rec logging.EventRecord) EventEntry {
 }
 
 // parseCategories parses a comma-separated category string into a bitmask.
-// It is fail-closed (#3383): an unrecognized token returns an error rather
-// than silently collapsing to 0 ("no filter"), which would widen the live SSE
-// feed to everything on a typo. "all"/"" yields a 0 mask with no error.
+// It is fail-closed (#3383): an unrecognized OR empty token returns an error
+// rather than silently collapsing to 0 ("no filter"), which would widen the
+// live SSE feed to everything on a typo or a malformed list (a leading,
+// trailing, or doubled comma). A fully-ABSENT category param ("") still means
+// match-all and yields a 0 mask with no error; only the named "all" token is
+// the explicit no-filter request within a present list.
 func parseCategories(s string) (uint8, error) {
 	if s == "" {
 		return 0, nil
 	}
 	var mask uint8
 	for _, c := range strings.Split(s, ",") {
-		bit, err := logging.ParseCategoryStrict(strings.TrimSpace(c))
+		tok := strings.TrimSpace(c)
+		if tok == "" {
+			return 0, fmt.Errorf("empty category token in %q (no leading/trailing/double comma)", s)
+		}
+		bit, err := logging.ParseCategoryStrict(tok)
 		if err != nil {
 			return 0, err
 		}

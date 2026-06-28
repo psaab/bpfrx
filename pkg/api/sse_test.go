@@ -294,8 +294,14 @@ func TestParseCategories(t *testing.T) {
 		}
 	}
 
-	// #3383: a typo must be rejected (fail-closed), not collapse to 0.
-	for _, bad := range []string{"polciy", "sesion", "session,polciy", "bogus"} {
+	// #3383: a typo OR an empty token (leading/trailing/double comma) must
+	// be rejected (fail-closed), not collapse to 0 = unfiltered. A
+	// fully-absent param ("") stays match-all and is covered by the table
+	// above.
+	for _, bad := range []string{
+		"polciy", "sesion", "session,polciy", "bogus",
+		",", "policy,", ",policy", "session,,policy", " , ",
+	} {
 		if _, err := parseCategories(bad); err == nil {
 			t.Errorf("parseCategories(%q) = nil error, want rejection", bad)
 		}
@@ -344,12 +350,15 @@ func TestEventBufferSubscription(t *testing.T) {
 		t.Fatal("timeout waiting for subscription event")
 	}
 
-	// Unsubscribe and verify no more events
+	// Unsubscribe (#3384: Close also closes the channel). Verify the
+	// channel is closed AND that no live record was delivered after
+	// unsubscribe — a closed channel yields the zero value with ok==false,
+	// so checking ok is what makes this a real assertion rather than a
+	// vacuous read that any closed channel would satisfy.
 	sub.Close()
 	buf.Add(rec)
-	select {
-	case <-sub.C:
-		// drain any buffered
-	case <-time.After(50 * time.Millisecond):
+	got, ok := <-sub.C
+	if ok {
+		t.Fatalf("received a live record (%+v) after Close; want closed channel (ok==false)", got)
 	}
 }

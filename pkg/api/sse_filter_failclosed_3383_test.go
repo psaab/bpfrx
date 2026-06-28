@@ -26,6 +26,10 @@ func TestLogStreamRejectsTypoFilters(t *testing.T) {
 		"/api/v1/logs/stream?category=polciy",
 		"/api/v1/logs/stream?category=session,polciy",
 		"/api/v1/events/stream?category=sesion",
+		// empty tokens (malformed list) must also reject, not widen.
+		"/api/v1/logs/stream?category=,",
+		"/api/v1/logs/stream?category=policy,",
+		"/api/v1/events/stream?category=,session",
 	}
 	for _, url := range cases {
 		t.Run(url, func(t *testing.T) {
