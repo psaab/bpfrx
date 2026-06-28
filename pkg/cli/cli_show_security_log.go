@@ -47,8 +47,15 @@ func (c *CLI) showSecurityLog(args []string) error {
 				filter.Action = args[i]
 			}
 		default:
-			// Try parsing as count.
+			// Try parsing as count. Reject a non-positive count at the
+			// boundary so `show security log -1` is a clean error rather
+			// than a panic — defense in depth alongside the EventBuffer
+			// guard (#3342). A bare non-numeric token is ignored, as
+			// before.
 			if v, err := strconv.Atoi(args[i]); err == nil {
+				if v <= 0 {
+					return fmt.Errorf("event count must be a positive integer, got %d", v)
+				}
 				n = v
 			}
 		}
