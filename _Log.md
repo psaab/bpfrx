@@ -1,3 +1,50 @@
+## 2026-06-27 — #3311 host-inbound `protocols isis` (L2 no-op, vSRX parity)
+
+- **Timestamp**: 2026-06-27
+- **Action**: Accept `security zones <z> host-inbound-traffic protocols isis`
+  at commit (was hard-rejected — a fail-closed vSRX-parity gap even though IS-IS
+  routing is supported via FRR). IS-IS rides OSI/CLNP over L2 (NOT IP), so it
+  cannot be expressed in the IP-keyed host-inbound admit model on EITHER surface
+  (nft ip/ip6 input chains; Rust AF_XDP classifier). Chosen semantics:
+  recognized-but-no-op token (new `config.HostInboundL2Protocols` SSOT) —
+  admits at commit, produces ZERO IP match on both surfaces (consistent, no
+  split-brain). IS-IS PDUs reach FRR's isisd via an LLC packet socket, outside
+  the IP filter. Added `isis` to `KnownHostInboundProtocols`; explicit no-op
+  `case "isis"`/`"isis" => {}` arms in nft + Rust; nft parity test now skips L2
+  tokens and asserts no IP match. Fail-on-revert tests in all three layers.
+- **File(s)**: pkg/config/host_inbound_tokens.go,
+  pkg/daemon/daemon_nft.go,
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  pkg/config/host_inbound_tokens_test.go,
+  pkg/daemon/host_inbound_parity_test.go,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  docs/junos-cli-reference.md
+
+## 2026-06-27 — #3311 follow-up: make HostInboundL2Protocols load-bearing
+
+- **Timestamp**: 2026-06-27
+- **Action**: Quad review (Codex) found two real defects on the #3311 PR.
+  (1) `HostInboundL2Protocols` was a DECORATIVE SSOT — the three sites used
+  hand-maintained local literals; a future 2nd L2 protocol would not auto-wire.
+  Made it load-bearing via the `protocols all` expansion: new
+  `config.HostInboundAllExpansionProtocols()` = KnownHostInboundProtocols minus
+  `all` minus L2 set; the Go nft `all` case now consumes it. Rust mirrors with
+  `HOST_INBOUND_L2_PROTOCOLS` + `routing_protocol_all_expansion()` =
+  `KNOWN_ROUTING_PROTOCOL_TOKENS` (now includes isis) minus the L2 set. Adding
+  any L2 protocol to the SSOT now auto-excludes it from `all` on BOTH surfaces.
+  (2) Two RED-on-revert tests were FALSE-GREEN (a deleted no-op arm falls
+  through to the catch-all no-op). Replaced with genuine SSOT-exclusion guards
+  (`TestHostInboundProtocolsAllExcludesL2` config, `...AllExcludesL2Isis`
+  daemon, `protocols_all_excludes_l2` Rust) that go RED when isis is removed
+  from the L2 set. The no-op model + commit-accept are unchanged.
+- **File(s)**: pkg/config/host_inbound_tokens.go,
+  pkg/config/host_inbound_tokens_test.go,
+  pkg/daemon/daemon_nft.go,
+  pkg/daemon/host_inbound_parity_test.go,
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs
+
 ## 2026-06-27 — #3303 thread feed overlay into NAT snapshot builders
 
 - **Timestamp**: 2026-06-27

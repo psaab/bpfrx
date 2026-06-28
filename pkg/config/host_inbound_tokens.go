@@ -1,5 +1,7 @@
 package config
 
+import "sort"
+
 // host_inbound_tokens.go is the single source of truth (SSOT) for the set of
 // recognized `security zones <z> host-inbound-traffic { system-services ...;
 // protocols ...; }` tokens (#3200).
@@ -84,9 +86,10 @@ var KnownHostInboundSystemServices = map[string]bool{
 // KnownHostInboundProtocols is the canonical set of recognized
 // host-inbound-traffic `protocols` (routing-protocol) tokens, including `all`
 // (which expands to the routing-protocol set, #3199) and the `ospf3` alias of
-// `ospf`. Keep in lockstep with pkg/daemon hostInboundProtocolMatches +
-// hostInboundRoutingProtocolTokens and the Rust classify_protocol +
-// ROUTING_PROTOCOL_TOKENS.
+// `ospf`. Keep in lockstep with pkg/daemon hostInboundProtocolMatches and the
+// Rust classify_protocol + KNOWN_ROUTING_PROTOCOL_TOKENS. The `protocols all`
+// expansion is derived from this set via HostInboundAllExpansionProtocols
+// (minus HostInboundL2Protocols).
 var KnownHostInboundProtocols = map[string]bool{
 	"all":              true,
 	"ospf":             true,
@@ -102,6 +105,56 @@ var KnownHostInboundProtocols = map[string]bool{
 	"msdp":             true,
 	"nhrp":             true,
 	"router-discovery": true,
+	// #3311: IS-IS is a recognized host-inbound protocol for vSRX parity, but
+	// it rides OSI/CLNP directly over L2 (LLC-encapsulated, NOT IP) — see
+	// HostInboundL2Protocols below. It admits at commit yet produces NO IP
+	// host-inbound match on either enforcement surface (the kernel delivers
+	// IS-IS PDUs to FRR's isisd via an LLC packet socket, outside the IP
+	// host-inbound filter). Before #3311 it was hard-rejected at commit even
+	// though IS-IS routing is supported via FRR — a fail-closed parity gap.
+	"isis": true,
+}
+
+// HostInboundL2Protocols is the set of recognized `protocols` tokens that ride
+// directly over L2 (OSI/CLNP / LLC encapsulation) rather than IP, and so cannot
+// be expressed as an IP host-inbound match (a protocol number, a TCP/UDP port,
+// or an ICMP type) on EITHER enforcement surface — the nftables `ip`/`ip6`
+// input chains and the Rust AF_XDP IP-keyed classifier. A token in this set is
+// VALID at commit (vSRX parity) but is a deliberate no-op on both surfaces:
+// IS-IS adjacency PDUs are non-IP frames that never traverse the IP input
+// chains and are never delivered to the XSK as IP packets — the kernel hands
+// them to FRR's isisd via an LLC/SNAP packet socket, entirely outside the IP
+// host-inbound filter. Both surfaces therefore agree (neither admits an IP
+// match for an L2 token), so there is no split-brain. The Go nft parity test
+// (TestHostInboundNftMatchesKnownTokens) skips these tokens in its
+// every-known-token-produces-a-match assertion and instead asserts they
+// produce NO IP match; the Rust classify_protocol mirrors this with an explicit
+// no-op arm. Keep in lockstep with that arm. #3311.
+var HostInboundL2Protocols = map[string]bool{
+	"isis": true,
+}
+
+// HostInboundAllExpansionProtocols returns the routing-protocol tokens that
+// `host-inbound-traffic protocols all` expands to (#3199): every recognized
+// protocol (KnownHostInboundProtocols) EXCEPT the `all` meta-token itself and
+// EXCEPT any L2/non-IP protocol (HostInboundL2Protocols). The L2 exclusion is
+// what makes HostInboundL2Protocols load-bearing rather than decorative (#3311):
+// adding a new L2 protocol to that set (and to KnownHostInboundProtocols) is the
+// ONLY edit needed — it is then automatically kept out of the `all` IP
+// expansion on BOTH enforcement surfaces (the nft builder's `all` case and the
+// Rust classifier's `all` arm consume this contract; the Rust side mirrors it
+// via HOST_INBOUND_L2_PROTOCOLS + a parity test). The result is sorted so the
+// expansion is deterministic.
+func HostInboundAllExpansionProtocols() []string {
+	out := make([]string, 0, len(KnownHostInboundProtocols))
+	for tok := range KnownHostInboundProtocols {
+		if tok == "all" || HostInboundL2Protocols[tok] {
+			continue
+		}
+		out = append(out, tok)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Address-family scoping for host-inbound tokens (#3225). Several Junos

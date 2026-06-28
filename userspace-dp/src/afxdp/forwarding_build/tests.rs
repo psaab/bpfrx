@@ -1163,6 +1163,70 @@ fn build_forwarding_state_bfd_admits_multihop_control() {
     );
 }
 
+// #3311: `host-inbound-traffic protocols isis` must COMPILE into forwarding
+// state and produce NO IP host-inbound admit on the AF_XDP local-delivery path.
+// IS-IS rides OSI/CLNP directly over L2 (LLC-encapsulated, NOT IP), so it cannot
+// be expressed in the IP-keyed admit model; it is a recognized-but-no-op token
+// (Go SSOT config.HostInboundL2Protocols) handled by FRR over an LLC socket,
+// outside this filter. The zone is still host-inbound-CONFIGURED, so a
+// non-admitted IP service (e.g. SSH) stays DENIED — proving the isis arm did
+// not accidentally fall open. Kept in lockstep with the nft mirror's isis
+// no-op case (hostInboundProtocolMatches, pkg/daemon/daemon_nft.go).
+//
+// Scope note: this guards that the isis arm admits NOTHING — giving the "isis"
+// arm any IP admit (e.g. `hi.ip_protocols.insert(124)`) turns the proto-124
+// assertion RED. It does NOT guard the arm's existence (deleting `"isis" => {}`
+// falls through to `_ => {}`, also a no-op). The SSOT-driven `protocols all`
+// EXCLUSION is the genuinely-testable contract for HOST_INBOUND_L2_PROTOCOLS —
+// see `protocols_all_excludes_l2` in afxdp::forwarding::host_inbound (RED when
+// isis is removed from the L2 set), the real fail-on-revert guard.
+#[test]
+fn build_forwarding_state_isis_is_l2_noop() {
+    use crate::ZoneSnapshot;
+    use crate::afxdp::forwarding::host_inbound_admits;
+
+    let snapshot = ConfigSnapshot {
+        zones: vec![ZoneSnapshot {
+            name: "core".into(),
+            id: 51,
+            host_inbound_configured: true,
+            host_inbound_system_services: vec![],
+            host_inbound_protocols: vec!["isis".into()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let state = build_forwarding_state(&snapshot);
+    // The zone compiles into the host-inbound table (config accepted).
+    assert!(
+        state.zone_host_inbound.contains_key(&51),
+        "isis-only zone is host-inbound-configured and present in the table"
+    );
+
+    // isis admits NOTHING on the IP path: no TCP/UDP port, no IP protocol.
+    assert!(
+        !host_inbound_admits(&state, 51, 6, 22, false, 0),
+        "isis zone must not admit ssh (no IP fall-open)"
+    );
+    assert!(
+        !host_inbound_admits(&state, 51, 17, 520, false, 0),
+        "isis zone must not admit an unrelated UDP port"
+    );
+    // Junos uses IP protocol 124 for integrated IS-IS-over-IP in some stacks;
+    // assert no IP-protocol admit landed either (the arm is a true no-op).
+    assert!(
+        !host_inbound_admits(&state, 51, 124, 0, false, 0),
+        "isis zone must not admit any IP protocol (L2/OSI, handled by FRR)"
+    );
+    // ICMP error/PMTUD still rides the global accept (unchanged), but plain
+    // echo-request stays denied because `ping` was not configured.
+    assert!(
+        !host_inbound_admits(&state, 51, 1, 0, false, 8),
+        "isis-only zone still denies ICMP echo-request (ping not configured)"
+    );
+}
+
 // #3171: a CONFIGURED ping-less zone must still admit ICMP/ICMPv6 ERROR /
 // PMTUD control messages (destination-unreachable, packet-too-big, time-
 // exceeded, parameter-problem) reaching the XSK LocalDelivery path — mirroring

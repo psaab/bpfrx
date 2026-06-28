@@ -92,6 +92,83 @@ func TestHostInboundKnownTokensCommit(t *testing.T) {
 	}
 }
 
+// TestHostInboundIsisCommitsAsL2NoOp asserts that
+// `host-inbound-traffic protocols isis` is ACCEPTED at commit (#3311). IS-IS
+// routing is supported via FRR, but before #3311 `isis` was absent from
+// KnownHostInboundProtocols, so the stanza was HARD-REJECTED at commit even
+// though Junos/vSRX accepts it — a fail-closed parity gap (the operator could
+// not even author the stanza). IS-IS rides OSI/CLNP over L2 (not IP), so it is
+// modeled as a recognized-but-no-op host-inbound token: it admits at commit but
+// produces no IP host-inbound match on either enforcement surface (the kernel
+// delivers IS-IS PDUs to FRR's isisd via an LLC socket, outside the IP filter).
+//
+// Fail-on-revert: remove `"isis"` from KnownHostInboundProtocols and commit
+// rejects the stanza again, turning this RED. The companion membership check
+// keeps `isis` in the HostInboundL2Protocols SSOT that the nft parity test and
+// the Rust classifier rely on to stay consistent.
+func TestHostInboundIsisCommitsAsL2NoOp(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set security zones security-zone core host-inbound-traffic protocols isis",
+		"set security zones security-zone core host-inbound-traffic protocols bgp",
+	})
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("strict commit rejected `host-inbound-traffic protocols isis` (vSRX parity gap, #3311): %v", err)
+	}
+	if !KnownHostInboundProtocols["isis"] {
+		t.Fatal("isis must be in KnownHostInboundProtocols so commit accepts it")
+	}
+	if !HostInboundL2Protocols["isis"] {
+		t.Fatal("isis must be in HostInboundL2Protocols (the L2/no-op SSOT the nft + Rust surfaces consult)")
+	}
+}
+
+// TestHostInboundProtocolsAllExcludesL2 asserts that the SSOT-derived
+// `protocols all` expansion (HostInboundAllExpansionProtocols) EXCLUDES every
+// L2/non-IP protocol (HostInboundL2Protocols) while still including the IP
+// routing protocols (#3311). This is the load-bearing use of
+// HostInboundL2Protocols: the nft `all` case (pkg/daemon) and the Rust `all`
+// arm both derive their expansion from this exclusion, so adding a new L2
+// protocol to the SSOT automatically keeps it out of the IP expansion on both
+// surfaces with no other edit.
+//
+// Fail-on-revert: remove "isis" from HostInboundL2Protocols and — because isis
+// stays in KnownHostInboundProtocols — it reappears in the expansion, turning
+// the "isis excluded" assertion RED. This is the genuine SSOT guard (the old
+// arm-existence tests were false-green: the catch-all/default no-op masked a
+// deleted explicit arm).
+func TestHostInboundProtocolsAllExcludesL2(t *testing.T) {
+	expansion := HostInboundAllExpansionProtocols()
+	inExpansion := make(map[string]bool, len(expansion))
+	for _, p := range expansion {
+		inExpansion[p] = true
+	}
+
+	// The `all` meta-token never expands to itself.
+	if inExpansion["all"] {
+		t.Error("HostInboundAllExpansionProtocols must not contain the `all` meta-token")
+	}
+	// Every L2 protocol is excluded from the IP expansion.
+	for l2 := range HostInboundL2Protocols {
+		if inExpansion[l2] {
+			t.Errorf("L2 protocol %q must be excluded from the `protocols all` IP expansion", l2)
+		}
+	}
+	// IS-IS specifically: it IS a recognized routing token (so the exclusion is
+	// meaningful) but must NOT appear in the IP expansion (because it is L2).
+	if !KnownHostInboundProtocols["isis"] {
+		t.Fatal("isis must be a recognized protocol for the exclusion to be meaningful")
+	}
+	if inExpansion["isis"] {
+		t.Error("isis (L2) must not appear in the `protocols all` IP expansion")
+	}
+	// Sanity: real IP routing protocols still expand.
+	for _, p := range []string{"ospf", "ospf3", "bgp", "bfd", "router-discovery"} {
+		if !inExpansion[p] {
+			t.Errorf("IP routing protocol %q must remain in the `protocols all` expansion", p)
+		}
+	}
+}
+
 // TestHostInboundUnknownTokenLenientDowngradesToWarning asserts the tolerant
 // load / peer-sync path downgrades the unknown-token reject to a warning instead
 // of failing the compile, so an already-persisted or peer-synced config carrying

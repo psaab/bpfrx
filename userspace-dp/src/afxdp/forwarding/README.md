@@ -223,16 +223,24 @@ zone that omits them still drops those types. Keep
 `host-inbound-traffic protocols all` admits every supported ROUTING protocol
 (the entries under the `protocols` stanza) — it is NOT `system-services all`
 and NOT a blanket accept. The classifier expands the `all` token to the
-concrete routing-protocol set (`ROUTING_PROTOCOL_TOKENS`:
+concrete routing-protocol set via `routing_protocol_all_expansion()`
+(`KNOWN_ROUTING_PROTOCOL_TOKENS`:
 ospf/ospf3/bgp/rip/ripng/igmp/pim/vrrp/bfd/ldp/msdp/nhrp/router-discovery,
 each family-scoped per #3225) instead
 of setting a short-circuit flag, so a `protocols all` zone admits routing
 protocols but still DENIES SSH/HTTPS/SNMP/NETCONF unless the matching
-`system-services` token is also present. The Go nft mirror
-(`hostInboundProtocolMatches("all", ...)` over
-`hostInboundRoutingProtocolTokens`) expands the same set and still emits the
-per-zone catch-all drop, so the kernel and userspace decisions stay
-consistent.
+`system-services` token is also present.
+
+**L2/non-IP protocols are excluded from the `all` expansion (#3311).** IS-IS
+rides OSI/CLNP directly over L2 (LLC, not IP) and cannot be expressed as an IP
+host-inbound match, so it is a recognized-but-no-op token. The `all` expansion
+filters out `HOST_INBOUND_L2_PROTOCOLS` (the Rust mirror of the Go SSOT
+`config.HostInboundL2Protocols`), so adding a new L2 protocol to that set is the
+only edit needed to keep it out of the IP expansion on both surfaces. The Go nft
+mirror (`hostInboundProtocolMatches("all", ...)` over
+`config.HostInboundAllExpansionProtocols()`) derives the same exclusion and
+still emits the per-zone catch-all drop, so the kernel and userspace decisions
+stay consistent.
 
 ## `junos-host` self-traffic security policy (#3019)
 
