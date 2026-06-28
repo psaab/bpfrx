@@ -1,0 +1,86 @@
+// #3345: a global-counter read failure must be surfaced, not reported as a
+// clean 0. REST returns 500; the Prometheus collector SKIPS the affected
+// sample (rather than emitting 0) and bumps xpf_counter_read_errors_total.
+//
+// FAIL-ON-REVERT: restoring `v, _ := dp.ReadGlobalCounter(idx)` in
+// globalStatsHandler / collectGlobalCounters makes REST return 200 with a
+// zero body and Prometheus emit the per-counter families as 0 with the error
+// total stuck at 0 — both want-assertions below go RED.
+package api
+
+import (
+	"errors"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+
+	"github.com/psaab/xpf/pkg/dataplane"
+)
+
+// counterErrAPIDP is a loaded apiRuntimeDataPlane whose global-counter reads
+// always fail, modeling a degraded counter bridge / userspace shim.
+type counterErrAPIDP struct {
+	*dataplane.Manager
+}
+
+func (d *counterErrAPIDP) IsLoaded() bool { return true }
+
+func (d *counterErrAPIDP) ReadGlobalCounter(uint32) (uint64, error) {
+	return 0, errors.New("counter bridge degraded")
+}
+
+func TestGlobalStatsHandlerSurfacesReadError(t *testing.T) {
+	s := &Server{dp: &counterErrAPIDP{Manager: dataplane.New()}}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/stats/global", nil)
+	s.globalStatsHandler(rr, req)
+
+	if rr.Code == 200 {
+		t.Fatalf("globalStatsHandler returned 200 on counter read failure; "+
+			"want a non-200 (read error must not look like a clean zero). body=%s",
+			rr.Body.String())
+	}
+}
+
+func TestCollectGlobalCountersSkipsAndCountsReadErrors(t *testing.T) {
+	c := newCollector(&Server{})
+	dp := &counterErrAPIDP{Manager: dataplane.New()}
+
+	ch := make(chan prometheus.Metric, 64)
+	c.collectGlobalCounters(ch, dp)
+	close(ch)
+
+	var perCounterEmitted int
+	var errTotal float64
+	var sawErrTotal bool
+	for m := range ch {
+		desc := m.Desc().String()
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			t.Fatalf("metric write: %v", err)
+		}
+		if strings.Contains(desc, "xpf_counter_read_errors_total") {
+			sawErrTotal = true
+			errTotal = pb.GetCounter().GetValue()
+			continue
+		}
+		// Any non-error per-counter sample emitted on an all-failing DP would
+		// be a misleading 0 — that is exactly the bug.
+		perCounterEmitted++
+	}
+
+	if perCounterEmitted != 0 {
+		t.Errorf("collectGlobalCounters emitted %d per-counter samples on an "+
+			"all-failing DP; want 0 (must not report 0 on read error)", perCounterEmitted)
+	}
+	if !sawErrTotal {
+		t.Fatal("xpf_counter_read_errors_total was not emitted")
+	}
+	if errTotal <= 0 {
+		t.Errorf("xpf_counter_read_errors_total = %v, want > 0", errTotal)
+	}
+}

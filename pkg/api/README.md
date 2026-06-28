@@ -110,6 +110,21 @@ under the daemon's errgroup. Nothing else imports this package.
   `sessions_iterator_error_test.go` in this package and in `pkg/grpcapi`
   / `pkg/cli` (CLI top-talkers fails the command; NAT summaries print a
   stderr warning).
+- Global dataplane counters get the same observability-integrity
+  treatment (#3345): a failed `ReadGlobalCounter` is no longer swallowed
+  to `0`, because a degraded counter bridge must not be
+  indistinguishable from "no events" on a security appliance. REST
+  `/stats/global` returns HTTP 500 when any global-counter read fails;
+  gRPC `GetGlobalStats` returns `codes.Internal`. The Prometheus
+  collector (`metrics_counters.go`) OMITS the affected per-counter
+  sample (rather than emitting a misleading `0`) and bumps the monotonic
+  `xpf_counter_read_errors_total` scrape-error counter, which is always
+  emitted (0 when healthy) for alerting. The text CLI / gRPC `show
+  security screen` and `show security alarms` commands print a
+  `warning: screen counter read failed ...` line instead of a clean
+  `Total screen drops: 0`. Pinned by `stats_counter_error_test.go`
+  (REST + Prometheus), `pkg/grpcapi/global_stats_counter_error_test.go`,
+  and `pkg/cli/show_security_counter_error_test.go`.
 - Named source-NAT pool stats are sourced from the userspace helper's
   LIVE runtime status, not config text (#2938). `natPoolStatsHandler`
   (`/security/nat/source/pools`) reads `s.runtimeSourceNATPools()` — the

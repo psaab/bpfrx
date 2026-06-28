@@ -47,8 +47,15 @@ func (s *Server) GetGlobalStats(_ context.Context, _ *pb.GetGlobalStatsRequest) 
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 	}
+	// #3345: surface a global-counter read failure instead of silently
+	// reporting 0. A degraded counter bridge must not be indistinguishable
+	// from "no events" on the structured stats RPC.
+	var readErr error
 	readCounter := func(idx uint32) uint64 {
-		v, _ := s.dp.ReadGlobalCounter(idx)
+		v, err := s.dp.ReadGlobalCounter(idx)
+		if err != nil && readErr == nil {
+			readErr = err
+		}
 		return v
 	}
 
@@ -82,6 +89,11 @@ func (s *Server) GetGlobalStats(_ context.Context, _ *pb.GetGlobalStatsRequest) 
 		if v > 0 {
 			screenDetails[sc.name] = v
 		}
+	}
+
+	if readErr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"reading global counter: %v", readErr)
 	}
 
 	return &pb.GetGlobalStatsResponse{

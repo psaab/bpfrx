@@ -89,13 +89,23 @@ func (c *CLI) showScreen() error {
 
 	// Show screen drop counters (total + per-type)
 	if c.dp != nil && c.dp.IsLoaded() {
+		// #3345: surface a counter-read failure rather than printing a clean
+		// zero that hides a degraded counter bridge.
+		var readErr error
 		readCtr := func(idx uint32) uint64 {
-			v, _ := c.dp.ReadGlobalCounter(idx)
+			v, err := c.dp.ReadGlobalCounter(idx)
+			if err != nil && readErr == nil {
+				readErr = err
+			}
 			return v
 		}
 
 		totalDrops := readCtr(dataplane.GlobalCtrScreenDrops)
-		fmt.Printf("Total screen drops: %d\n", totalDrops)
+		if readErr != nil {
+			fmt.Printf("warning: screen counter read failed (counters unavailable): %v\n", readErr)
+		} else {
+			fmt.Printf("Total screen drops: %d\n", totalDrops)
+		}
 
 		if totalDrops > 0 {
 			screenCounters := []struct {

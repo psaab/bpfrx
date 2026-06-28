@@ -321,8 +321,14 @@ func (s *Server) showSecurityAlarms(cfg *config.Config, topic string, buf *strin
 	}
 
 	if s.dp != nil && s.dp.IsLoaded() {
+		// #3345: track a counter-read failure so a degraded counter bridge
+		// is reported as a warning rather than masquerading as "no alarms".
+		var readErr error
 		readCtr := func(idx uint32) uint64 {
-			v, _ := s.dp.ReadGlobalCounter(idx)
+			v, err := s.dp.ReadGlobalCounter(idx)
+			if err != nil && readErr == nil {
+				readErr = err
+			}
 			return v
 		}
 		screenNames := []struct {
@@ -350,6 +356,9 @@ func (s *Server) showSecurityAlarms(cfg *config.Config, topic string, buf *strin
 					fmt.Fprintf(buf, "Alarm %d:\n  Class: IDS\n  Severity: Major\n  Description: %s attack detected (%d drops)\n\n", alarmCount, sc.name, val)
 				}
 			}
+		}
+		if readErr != nil {
+			fmt.Fprintf(buf, "warning: screen counter read failed (counters may be incomplete): %v\n", readErr)
 		}
 	}
 
@@ -668,12 +677,22 @@ func (s *Server) showScreen(cfg *config.Config, buf *strings.Builder) {
 		}
 		// Per-type drop counters
 		if s.dp != nil && s.dp.IsLoaded() {
+			// #3345: surface a counter-read failure rather than printing a
+			// clean zero that hides a degraded counter bridge.
+			var readErr error
 			readCtr := func(idx uint32) uint64 {
-				v, _ := s.dp.ReadGlobalCounter(idx)
+				v, err := s.dp.ReadGlobalCounter(idx)
+				if err != nil && readErr == nil {
+					readErr = err
+				}
 				return v
 			}
 			totalDrops := readCtr(dataplane.GlobalCtrScreenDrops)
-			fmt.Fprintf(buf, "Total screen drops: %d\n", totalDrops)
+			if readErr != nil {
+				fmt.Fprintf(buf, "warning: screen counter read failed (counters unavailable): %v\n", readErr)
+			} else {
+				fmt.Fprintf(buf, "Total screen drops: %d\n", totalDrops)
+			}
 			if totalDrops > 0 {
 				screenCounters := []struct {
 					idx  uint32

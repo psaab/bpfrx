@@ -22833,3 +22833,20 @@ top.
   - **File(s)**: pkg/config/compiler_applications.go,
     pkg/config/compiler_application_destport_names_3340_test.go,
     pkg/config/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3345 — surface global/dataplane counter read errors across
+    REST/Prometheus/gRPC/CLI instead of swallowing to 0 (a degraded counter
+    bridge must not look identical to "no events"). REST /stats/global → 500;
+    gRPC GetGlobalStats → codes.Internal; Prometheus omits the failed sample
+    and bumps xpf_counter_read_errors_total; text screen/alarms print a warning.
+    Added RED-on-revert tests for each surface.
+  - **File(s)**: pkg/api/stats.go, pkg/api/metrics.go,
+    pkg/api/metrics_descriptors.go, pkg/api/metrics_counters.go,
+    pkg/api/stats_counter_error_test.go,
+    pkg/api/metrics_descriptor_coverage_test.go,
+    pkg/grpcapi/server_show_status.go,
+    pkg/grpcapi/global_stats_counter_error_test.go,
+    pkg/cli/cli_show_security_screen.go, pkg/cli/cli_show_security_log.go,
+    pkg/cli/show_security_counter_error_test.go,
+    pkg/grpcapi/server_show_security_text.go, pkg/api/README.md, _Log.md

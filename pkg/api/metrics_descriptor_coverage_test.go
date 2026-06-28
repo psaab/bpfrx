@@ -64,6 +64,14 @@ func (d *descriptorCoverageDP) LastApplyResult() *dataplane.ApplyResult {
 	return d.apply
 }
 
+// #3345: collectGlobalCounters now SKIPS emitting a counter sample when the
+// read fails (so a degraded bridge is not reported as a clean 0). dataplane.New()
+// answers ReadGlobalCounter with a map-missing error, which would drop the
+// global-counter descriptor families out of coverage — override it to succeed.
+func (d *descriptorCoverageDP) ReadGlobalCounter(uint32) (uint64, error) {
+	return 0, nil
+}
+
 func (d *descriptorCoverageDP) ReadInterfaceCounters(int) (dataplane.InterfaceCounterValue, error) {
 	return dataplane.InterfaceCounterValue{}, nil
 }

@@ -14,8 +14,16 @@ func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 
+	// #3345: surface a global-counter read failure instead of silently
+	// reporting 0. A degraded userspace shim / counter bridge must not be
+	// indistinguishable from "no events" — for a security appliance,
+	// "counter unavailable" and "zero attacks" cannot look identical.
+	var readErr error
 	readCounter := func(idx uint32) uint64 {
-		v, _ := s.dp.ReadGlobalCounter(idx)
+		v, err := s.dp.ReadGlobalCounter(idx)
+		if err != nil && readErr == nil {
+			readErr = err
+		}
 		return v
 	}
 
@@ -36,6 +44,11 @@ func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		FlowCacheMisses:      readCounter(dataplane.GlobalCtrFlowCacheMiss),
 		FlowCacheFlushes:     readCounter(dataplane.GlobalCtrFlowCacheFlush),
 		FlowCacheInvalidates: readCounter(dataplane.GlobalCtrFlowCacheInvalidate),
+	}
+	if readErr != nil {
+		writeError(w, http.StatusInternalServerError,
+			"global counter read failed: "+readErr.Error())
+		return
 	}
 	writeOK(w, stats)
 }

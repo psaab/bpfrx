@@ -3,6 +3,7 @@ package api
 import (
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -29,6 +30,14 @@ type xpfCollector struct {
 	tcEgressPacketsTotal *prometheus.Desc
 	syncookieTotal       *prometheus.Desc
 	flowCacheTotal       *prometheus.Desc
+
+	// #3345: monotonic count of global-counter map reads that failed during
+	// a scrape. A failed read SKIPS emitting that counter's sample (so a
+	// degraded counter bridge does NOT report a misleading 0); this metric
+	// is the scrape-error signal an operator alerts on. Persisted on the
+	// collector so it accumulates across scrapes like a real counter.
+	counterReadErrorsTotal *prometheus.Desc
+	counterReadErrors      atomic.Uint64
 
 	// Interface counters
 	ifacePacketsTotal *prometheus.Desc
@@ -470,6 +479,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.tcEgressPacketsTotal
 	ch <- c.syncookieTotal
 	ch <- c.flowCacheTotal
+	ch <- c.counterReadErrorsTotal
 	ch <- c.ifacePacketsTotal
 	ch <- c.ifaceBytesTotal
 	ch <- c.zonePacketsTotal
