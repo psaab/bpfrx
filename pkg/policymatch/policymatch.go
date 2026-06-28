@@ -431,24 +431,24 @@ func globalScopeMatches(cfg *config.Config, scopeZone, flowZone string) bool {
 	return scopeZone == flowZone
 }
 
-// zoneKnown reports whether a query zone should be treated as DEFINED for the
-// runtime's `id != 0` eligibility guard (#3355). The runtime resolves an
-// unconfigured zone name to the reserved unknown id 0, which is ineligible for
-// zone-pair / wildcard / global / junos-host policies (policy.rs
-// evaluate_policy_result_with_icmp gates the whole transit block on
-// from_id != 0 && to_id != 0; evaluate_junos_host_policy returns None for
-// from_id == 0). A zone is "known" when it is present in cfg.Security.Zones.
+// zoneKnown reports whether a query zone is DEFINED for the runtime's `id != 0`
+// eligibility guard (#3355). The runtime resolves an unconfigured zone name to
+// the reserved unknown id 0, which is ineligible for zone-pair / wildcard /
+// global / junos-host policies (policy.rs evaluate_policy_result_with_icmp gates
+// the whole transit block on from_id != 0 && to_id != 0; evaluate_junos_host_policy
+// returns None for from_id == 0). A zone is "known" iff it is present in
+// cfg.Security.Zones.
 //
-// When the config carries NO zone definitions at all (len == 0) — an offline or
-// minimal synthetic config that never reached the compiler's zone pass — the
-// simulator cannot determine the defined set, so it is lenient and treats every
-// zone as known, matching the package's established nil/empty offline tolerance
-// (FeedOverlay, PolicyInactiveFn). A committed production config always
-// populates Zones, so the guard is fully active there.
+// This mirrors the runtime UNCONDITIONALLY — there is deliberately NO
+// empty-Zones leniency. policy.rs applies the from_id/to_id != 0 gate for every
+// evaluation; a config with no defined zones resolves every zone name to id 0,
+// so the runtime matches NOTHING in the transit tiers. An earlier "offline
+// tolerance" short-circuit (return true when Zones is empty) was simulator-vs-
+// runtime DRIFT: a no-zones config matched transit tiers in the simulator that
+// the runtime would never evaluate. A committed production config always
+// populates Zones; a synthetic config without zones now faithfully matches
+// nothing in transit.
 func zoneKnown(cfg *config.Config, zone string) bool {
-	if len(cfg.Security.Zones) == 0 {
-		return true
-	}
 	_, ok := cfg.Security.Zones[zone]
 	return ok
 }

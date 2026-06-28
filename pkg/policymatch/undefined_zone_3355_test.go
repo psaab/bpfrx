@@ -81,6 +81,51 @@ func TestDefinedZoneStillMatchesWildcard(t *testing.T) {
 	}
 }
 
+// TestNoZonesDefinedNoTransitMatch pins the faithful mirror of policy.rs's
+// UNCONDITIONAL `from_id != 0 && to_id != 0` transit gate (policy.rs:1807): a
+// config with an EMPTY Security.Zones map resolves every zone name to the
+// unknown id 0 in the runtime, so the runtime matches NOTHING in the transit
+// tiers. The simulator must agree — there is no empty-Zones leniency. This
+// config is built directly (NOT via cfgWith, which injects the standard suite
+// zones) so Security.Zones is genuinely empty.
+//
+// FAIL-ON-REVERT: restoring the `if len(cfg.Security.Zones) == 0 { return true }`
+// leniency in zoneKnown makes this trust->untrust query match the permit
+// (Matched=true), reintroducing the exact simulator-vs-runtime drift #3355
+// closes.
+func TestNoZonesDefinedNoTransitMatch(t *testing.T) {
+	cfg := &config.Config{
+		Security: config.SecurityConfig{
+			DefaultPolicy: config.PolicyDeny,
+			// Zones intentionally left nil/empty.
+			Policies: []*config.ZonePairPolicies{
+				{
+					FromZone: "trust",
+					ToZone:   "untrust",
+					Policies: []*config.Policy{{
+						Name:   "allow-all",
+						Action: config.PolicyPermit,
+						Match: config.PolicyMatch{
+							SourceAddresses:      []string{"any"},
+							DestinationAddresses: []string{"any"},
+							Applications:         []string{"any"},
+						},
+					}},
+				},
+			},
+		},
+		Applications: config.ApplicationsConfig{},
+	}
+
+	res := Match(cfg, Query{FromZone: "trust", ToZone: "untrust", Protocol: "tcp", DstPort: 80})
+	if res.Matched {
+		t.Fatalf("no-zones config matched a transit rule the runtime would never evaluate (#3355 drift); res = %+v", res)
+	}
+	if !res.DefaultUsed || res.Action != config.PolicyDeny {
+		t.Fatalf("want default-policy deny for a no-zones config, got %+v", res)
+	}
+}
+
 // TestUndefinedFromZoneJunosHostUnmatched covers matchJunosHost: an undefined
 // ingress zone makes evaluate_junos_host_policy return None (from_id == 0), so
 // the simulator returns HostInboundUnmatched (local delivery), never a matched

@@ -149,9 +149,12 @@ DEFINED (#3355), mirroring the runtime's `from_id != 0 && to_id != 0` guard
 reserved unknown id 0 and is ineligible for zone-pair, wildcard, or global
 policies, so a query naming an undefined zone falls straight through to the
 default-policy instead of wrongly matching a `from-zone any`/`to-zone any`/
-global rule. `zoneKnown` is lenient only when the config carries no zone
-definitions at all (an offline/synthetic config), since a committed config
-always populates `Security.Zones`. The REST and gRPC surfaces additionally
+global rule. `zoneKnown` mirrors the runtime UNCONDITIONALLY — a zone is known
+iff it is present in `Security.Zones`, with NO empty-Zones leniency: policy.rs
+applies the `from_id/to_id != 0` gate on every evaluation, so a config with no
+defined zones resolves every name to id 0 and matches nothing in the transit
+tiers. A committed config always populates `Security.Zones`. The REST and gRPC
+surfaces additionally
 REJECT a missing from/to-zone (HTTP 400 / `InvalidArgument`) for parity with
 the CLI, which already requires both zones (#3355 H06).
 
