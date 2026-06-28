@@ -27,7 +27,10 @@ across every surface:
   (unspecified) and `1..65535`; rejects negative or `>65535`.
 - `ParsePort(string) (int, error)` — for operator string tokens (the CLI
   `destination-port`/`source-port` args, the gRPC `ShowText` `test-policy:`
-  `port=` token, and the remote `cli` client's `destination-port`). An
+  `port=` token, and the remote `cli` client's `destination-port`/`source-port`
+  — the remote surface was fixed in #3354 to route through `ParsePort` instead
+  of a silent `strconv.Atoi` drop that coerced a malformed port to the `0`
+  wildcard). An
   empty/whitespace token is unspecified `(0, nil)`; a non-empty token must parse
   and pass `ValidatePort`; a malformed (`abc`), negative, or out-of-range token
   is rejected. An explicit `0` is accepted as "unspecified" for parity with the
@@ -140,6 +143,18 @@ terminating:
    typo'd/undefined-zone scope fails closed (matches nothing);
 5. **configured default-policy**.
 
+The entire transit block (tiers 1-4) is gated on BOTH query zones being
+DEFINED (#3355), mirroring the runtime's `from_id != 0 && to_id != 0` guard
+(`evaluate_policy_result_with_icmp`): an unconfigured zone name resolves to the
+reserved unknown id 0 and is ineligible for zone-pair, wildcard, or global
+policies, so a query naming an undefined zone falls straight through to the
+default-policy instead of wrongly matching a `from-zone any`/`to-zone any`/
+global rule. `zoneKnown` is lenient only when the config carries no zone
+definitions at all (an offline/synthetic config), since a committed config
+always populates `Security.Zones`. The REST and gRPC surfaces additionally
+REJECT a missing from/to-zone (HTTP 400 / `InvalidArgument`) for parity with
+the CLI, which already requires both zones (#3355 H06).
+
 A `to-zone junos-host` query takes the separate **host gate** (#3285,
 `matchJunosHost` ↔ `evaluate_junos_host_policy`): exact `from-zone <ingress>
 to-zone junos-host` then `from-zone any to-zone junos-host`, with **no** global
@@ -163,12 +178,20 @@ composed.
 
 Address matching honors literal CIDRs, address
 books (recursive set expansion), `any`/`any-ipv4`/`any-ipv6`, source/destination
-exclusion (with the #2008 empty-excluded fail-closed rule), and the live
+exclusion (the #2008 empty-excluded fail-closed rule, hardened in #3356 to run
+BEFORE the empty-list match-any short-circuit and to gate fail-closed on BOTH
+families being empty — so an empty-but-excluded set never inverts to match-all
+and a single-family exclusion, e.g. a v6-only `*-excluded` set, does not
+over-block the other family), and the live
 dynamic-address feed overlay (`Query.FeedOverlay`, supplied by the daemon via
 `feeds.Manager.SnapshotForBindings`). Application matching resolves predefined +
 user apps via `config.ResolveApplication`, expands application-sets recursively
 via `config.ExpandApplicationSet`, compares protocols by IANA number via
-`appid.ProtocolNumber`, honors both source-port and destination-port terms, and
+`appid.ProtocolNumber`, honors both source-port and destination-port terms
+(a destination-port-constrained term fails closed on an OMITTED query
+destination port, #3330 — mirroring the runtime keying exact_dst_ports/range
+terms on the concrete packet port; an omitted SOURCE port stays unconstrained
+per #3107's diagnostic stance), and
 enforces ICMP/ICMPv6 type/code constraints (#3284, junos-ping = type 8,
 junos-pingv6 = type 128) from `Query.ICMPType` / `Query.ICMPCode`. A
 type-constrained application term matches only when the query's type is known
