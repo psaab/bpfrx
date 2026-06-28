@@ -111,3 +111,50 @@ func TestFilterProtocolResolvableMatchesProtocolNumber(t *testing.T) {
 		}
 	}
 }
+
+// TestProtocolIsPortBearingMatchesDataplaneExtraction is the #3373 drift guard
+// for the application-spec commit gate. config.protocolIsPortBearing INLINE-
+// mirrors the set of protocols THIS dataplane extracts L4 ports for — the
+// authoritative SSOT is userspace-dp/src/ip_proto.rs `has_l4_ports`, which is
+// TCP (6) | UDP (17) ONLY (and inspect.rs parse_flow_ports reads port bytes only
+// for those two). It is replicated in pkg/config because pkg/appid imports
+// pkg/config (the import-cycle constraint behind FilterProtocolResolvable).
+//
+// This guard deliberately pins to the PORT-EXTRACTION set, NOT to
+// appid.ProtocolNumber (a name→number resolver that says nothing about whether
+// the dataplane reads ports for a protocol — e.g. it resolves sctp/132, which
+// the dataplane does NOT port-extract). ProtocolNumber is used here only as the
+// alias→number resolver so the test can express "token whose number is 6 or 17";
+// the MEMBERSHIP set {6,17} is the has_l4_ports SSOT. If ip_proto.rs
+// has_l4_ports changes (e.g. SCTP port support is added) the compiler copy must
+// move in lockstep with the expected set below or this fails — turning a silent
+// commit-gate drift into a test failure. Cross-check TEST, not a runtime
+// coupling.
+//
+// dataplaneExtractsPorts mirrors ip_proto.rs has_l4_ports (TCP|UDP). Keep in
+// sync with that predicate.
+func dataplaneExtractsPorts(num uint8) bool {
+	return num == 6 || num == 17 // ip_proto.rs has_l4_ports: PROTO_TCP | PROTO_UDP
+}
+
+func TestProtocolIsPortBearingMatchesDataplaneExtraction(t *testing.T) {
+	tokens := []string{
+		"tcp", "udp", "junos-tcp-any", "junos-udp-any",
+		"sctp", // HAS wire ports but NOT extracted by this dataplane → not port-bearing
+		"icmp", "icmpv6", "icmp6", "gre", "ospf", "ipip", "esp", "ah",
+		"vrrp", "igmp", "pim", "egp",
+		"junos-icmp-all", "junos-ping", "junos-icmp6-all", "junos-pingv6",
+		"junos-gre", "junos-ospf", "junos-ip-in-ip", "junos-ipip",
+		"TCP", "Sctp", " udp ",
+		"0", "1", "6", "17", "47", "132", "136", "255",
+		"256", "-1", "0x50", "bogus", "", "junos-foobar",
+	}
+	for _, tok := range tokens {
+		num, ok := ProtocolNumber(tok)
+		want := ok && dataplaneExtractsPorts(num)
+		if got := config.ProtocolIsPortBearing(tok); got != want {
+			t.Errorf("ProtocolIsPortBearing(%q) = %v, want %v (ProtocolNumber=%d ok=%v, has_l4_ports=%v)",
+				tok, got, want, num, ok, ok && dataplaneExtractsPorts(num))
+		}
+	}
+}

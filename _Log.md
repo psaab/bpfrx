@@ -22747,3 +22747,30 @@ top.
   pkg/cli/cli_show_security_log.go,
   pkg/logging/eventbuf_negative_3342_test.go,
   pkg/cli/cli_show_security_log_negative_3342_test.go, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3373 — reject source/destination-port on a non-port-bearing
+    protocol in validateApplicationSpecsStrict (port-bearing set = tcp/udp/sctp);
+    added protocolIsPortBearing helper + drift guard; tests + README.
+  - **File(s)**: pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler_application_specs_test.go,
+    pkg/appid/protocol_number_2124_test.go, pkg/config/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3373 SMR-fold — SCTP (132) is NOT port-extracted by this
+    dataplane (ip_proto.rs has_l4_ports = TCP/UDP only; inspect.rs
+    parse_flow_ports skips SCTP), so sctp+port is the same never-match hole.
+    Dropped SCTP from protocolIsPortBearing (now TCP/UDP only); re-anchored
+    the drift guard to the dataplane port-extraction SSOT (has_l4_ports) not
+    appid.ProtocolNumber; flipped sctp/132 from accept to reject in tests.
+  - **File(s)**: pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler_application_specs_test.go,
+    pkg/appid/protocol_number_2124_test.go, pkg/config/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3373 re-review minors — dropped stale "sctp" from the two
+    app-port reject error strings (now "tcp/udp", since sctp+port is rejected
+    after the fold); added explicit sctp + numeric-132 lenient no-brick
+    subcases to TestApplicationSpec_PortOnNonPortProtocol_LenientWarns.
+  - **File(s)**: pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler_application_specs_test.go, _Log.md
