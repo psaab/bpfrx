@@ -1179,6 +1179,78 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 	return nil
 }
 
+// validateSecurityLogStreamPortsAST is the #3349 commit-time range gate for
+// `security log stream <s> port <p>` and the nested `host { port <p>; }`
+// spelling. The syslog port value lives in TWO AST locations — a direct
+// `port` child of the stream and a `port` child of a nested `host` block
+// (compileLog reads both) — a dual value-location the declarative
+// SchemaValidate walker cannot express, the same rationale as tcp-mss
+// (validateTCPMSSRanges). compileLog ignores a non-numeric or out-of-range
+// port (strconv.Atoi error path) and silently keeps the default 514, so a typo
+// such as `port 6514x` commits and quietly logs audit to the wrong port. This
+// pass reads the raw tokens before that swallowing and range-checks them.
+//
+// It mirrors compileLog's traversal exactly (FindChild("log") +
+// namedInstances(stream) + per-child switch on host/port) so it validates
+// precisely the tokens the compiler consumes. Runs on the group-expanded tree
+// so apply-groups-inherited ports are covered.
+//
+// Strict path (commit / commit-check, lenient=false): a non-numeric or
+// out-of-range port is a hard compile error. Lenient path (load / peer-sync,
+// lenient=true): downgraded to a warning so an already-persisted or
+// peer-synced config that an older binary accepted (and that the compiler
+// still maps to 514) still boots (#1960 / #3261 fail-closed-on-load class).
+func validateSecurityLogStreamPortsAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
+	var warnings []string
+	check := func(path, raw string) error {
+		if raw == "" {
+			// No value token: the compiler keeps the default 514. The
+			// missing-value case is the schema walker's concern, not this
+			// range gate.
+			return nil
+		}
+		if n, err := strconv.Atoi(raw); err == nil && n >= 1 && n <= 65535 {
+			return nil
+		}
+		msg := fmt.Sprintf("%s: invalid syslog port %q (expected an integer in "+
+			"[1..65535]; an invalid value silently keeps the default 514)", path, raw)
+		if lenient {
+			warnings = append(warnings, msg)
+			return nil
+		}
+		return fmt.Errorf("%s", msg)
+	}
+	for _, n := range nodes {
+		if n.Name() != "security" {
+			continue
+		}
+		secPath := joinNodePath(prefix, n.Keys)
+		for _, logNode := range n.FindChildren("log") {
+			logPath := joinNodePath(secPath, []string{"log"})
+			for _, inst := range namedInstances(logNode.FindChildren("stream")) {
+				streamPath := joinNodePath(logPath, []string{"stream", inst.name})
+				for _, prop := range inst.node.Children {
+					switch prop.Name() {
+					case "port":
+						if err := check(joinNodePath(streamPath, []string{"port"}), nodeVal(prop)); err != nil {
+							return warnings, err
+						}
+					case "host":
+						for _, hc := range prop.Children {
+							if hc.Name() == "port" {
+								if err := check(joinNodePath(streamPath, []string{"host", "port"}), nodeVal(hc)); err != nil {
+									return warnings, err
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return warnings, nil
+}
+
 // tcpMSSKinds are the four tcp-mss sub-kinds the compiler reads
 // (compileFlow MSS switch). Each carries a u16 MSS value that lands in a
 // Rust u16 wire field (TCPMSS{IPsecVPN,GreIn,GreOut}; all-tcp fans out into

@@ -859,6 +859,33 @@ reserved for whole-dataplane selection where a rewrite shim
   parity but not yet used to alter the emitted structured-data field set.
   Regression coverage: `pkg/config/log_profile_test.go` +
   `pkg/config/log_profile_schema_test.go`.
+- **#3349 (security log stream/top-level field validation):** the remaining
+  `security log` leaves were untyped (`children: nil`, no `valueType`), so a
+  typo committed cleanly and then silently widened / remapped / fell back at
+  runtime — a fail-open for an audit path. Typed as enum/value schema leaves
+  (validated by `SchemaValidate`, strict on commit / commit-check, downgraded
+  to a warning on the tolerant load / peer-sync paths exactly like every other
+  typed leaf): `security log mode` (`stream|event`), `format` and `stream
+  <s> format` (`sd-syslog|syslog|binary|structured`), `stream <s> severity`
+  (`error|warning|info`, matching `pkg/logging` `ParseSeverity`), `facility`
+  (the `ParseFacility` set incl. `local0..7`/`change-log`), `category`
+  (`all|session|policy|screen|firewall`, matching `ParseCategory`), and
+  `source-address` (`ValueIPAddress`). `source-interface` uses
+  `ValidateSyslogSourceInterface`, which rejects a non-numeric `.<unit>`
+  suffix (`resolveSourceAddr` silently `Atoi`-fell-back to unit 0, binding the
+  wrong source IP). The enum value sets live in `schema_security.go`
+  (`syslogLogModes`/`syslogLogFormats`/`syslogSeverities`/`syslogFacilities`/
+  `syslogCategories`) and MUST stay in sync with those `pkg/logging` parsers —
+  a value the validator allows but the runtime does not recognize would
+  reintroduce the silent-fallback bug. **Port** (`stream <s> port` AND the
+  nested `host { port }`) is range-checked `[1..65535]` by the
+  `validateSecurityLogStreamPortsAST` compiler pass instead of a schema leaf,
+  because the value has two AST locations the declarative schema walker cannot
+  express — the same dual-location rationale as `tcp-mss`
+  (`validateTCPMSSRanges`); strict on commit, `lenientLogStreamPort`-downgraded
+  to a warning on load/peer-sync. Before this change a bad port was ignored by
+  `compileLog` and silently kept the default 514. No runtime/dataplane change.
+  Regression coverage: `pkg/config/log_stream_config_3349_test.go`.
 - **#2008 H9/H10 (interface silent-drop reject):** two interface stanzas
   that parsed-accepted and were silently dropped (no schema child, no
   compiler case, no dataplane consumer) are now hard-rejected at commit /

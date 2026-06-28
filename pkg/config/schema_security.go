@@ -8,6 +8,35 @@ package config
 // in-package by schema_complete.go / schema_walk.go (two-SSOT doctrine,
 // #1319).
 
+// Security-log enum value sets (#3349). Each MUST stay in sync with the
+// corresponding runtime consumer so the commit-time validator accepts
+// exactly the set the runtime applies — a value the validator allows but the
+// runtime does not recognize would reintroduce the same silent-fallback bug
+// the validator exists to close.
+//
+//   - syslogLogModes:   pkg/daemon/daemon_system.go (Mode == "event" enters
+//     event mode; anything else is stream mode).
+//   - syslogLogFormats: pkg/logging (syslog.go "sd-syslog" timestamp branch,
+//     ringbuf.go "binary"/"structured" branches; "syslog"/"" => RFC 3164).
+//   - syslogSeverities: pkg/logging ParseSeverity (error/warning/info map to
+//     a floor; everything else => 0 = no floor).
+//   - syslogFacilities: pkg/logging ParseFacility (recognized names; every
+//     other name silently remaps to local0).
+//   - syslogCategories: pkg/logging ParseCategory (all/session/policy/screen/
+//     firewall; every other name => 0 = no filter = send ALL).
+var (
+	syslogLogModes   = []string{"event", "stream"}
+	syslogLogFormats = []string{"binary", "sd-syslog", "structured", "syslog"}
+	syslogSeverities = []string{"error", "info", "warning"}
+	syslogFacilities = []string{
+		"auth", "change-log", "daemon", "kern",
+		"local0", "local1", "local2", "local3",
+		"local4", "local5", "local6", "local7",
+		"syslog", "user",
+	}
+	syslogCategories = []string{"all", "firewall", "policy", "screen", "session"}
+)
+
 var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[string]*schemaNode{
 	"zones": {desc: "Security zones", children: map[string]*schemaNode{
 		"security-zone": {desc: "Security zone name", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: map[string]*schemaNode{
@@ -305,17 +334,53 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 	}},
 	"log": {desc: "Security logging configuration", children: map[string]*schemaNode{
-		"mode":             {desc: "Logging mode (stream|event)", args: 1, placeholder: "<mode>", children: nil},
-		"format":           {desc: "Log format (sd-syslog|syslog|binary|structured)", args: 1, placeholder: "<format>", children: nil},
-		"source-interface": {desc: "Interface whose address is used as the syslog source", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
+		// #3349: typed enum/value leaves so a typo (`mode steam`,
+		// `format sdsyslog`, `severity wraning`, `facility locl0`,
+		// `category sesion`, a non-numeric source-interface unit) fails the
+		// commit instead of silently falling back at runtime (mode->stream,
+		// format->RFC3164, severity->0=no floor, facility->local0,
+		// category->0=all). Enum sets are pinned to the runtime parsers in
+		// pkg/logging (daemon_system.go applyLogStreams + ParseSeverity /
+		// ParseFacility / ParseCategory); keep in sync if those change.
+		"mode": {desc: "Logging mode (stream|event)", args: 1, placeholder: "<mode>",
+			valueType: ValueEnumOf, valueDesc: "security log mode",
+			valueExamples: []string{"stream", "event"},
+			validator:     ValidateEnum(syslogLogModes), children: nil},
+		"format": {desc: "Log format (sd-syslog|syslog|binary|structured)", args: 1, placeholder: "<format>",
+			valueType: ValueEnumOf, valueDesc: "security log format",
+			valueExamples: []string{"sd-syslog", "syslog", "binary", "structured"},
+			validator:     ValidateEnum(syslogLogFormats), children: nil},
+		"source-interface": {desc: "Interface whose address is used as the syslog source", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>",
+			valueType: ValueIdentifier, valueDesc: "interface name (optionally .<unit>)",
+			valueExamples: []string{"ge-0-0-0", "reth1.100"},
+			validator:     ValidateSyslogSourceInterface, children: nil},
 		"stream": {desc: "Syslog stream name", args: 1, valueHint: ValueHintStreamName, placeholder: "<stream-name>", children: map[string]*schemaNode{
-			"host":           {desc: "Syslog server address", args: 1, placeholder: "<address>", children: nil},
-			"port":           {desc: "Syslog server port (default 514)", args: 1, placeholder: "<port>", children: nil},
-			"severity":       {desc: "Severity filter (error|warning|info)", args: 1, placeholder: "<severity>", children: nil},
-			"facility":       {desc: "Syslog facility (e.g. local0; default local0)", args: 1, placeholder: "<facility>", children: nil},
-			"format":         {desc: "Per-stream format override", args: 1, placeholder: "<format>", children: nil},
-			"category":       {desc: "Event category filter (all or a specific category)", args: 1, placeholder: "<category>", children: nil},
-			"source-address": {desc: "Source IP for this stream", args: 1, placeholder: "<address>", children: nil},
+			"host": {desc: "Syslog server address", args: 1, placeholder: "<address>", children: nil},
+			// `port` validation (direct AND nested host{port}) lives in the
+			// validateSecurityLogStreamPortsAST compiler pass (#3349): the
+			// value has two AST locations the declarative schema walker cannot
+			// express, the same dual-location rationale as tcp-mss.
+			"port": {desc: "Syslog server port (default 514)", args: 1, placeholder: "<port>", children: nil},
+			"severity": {desc: "Severity filter (error|warning|info)", args: 1, placeholder: "<severity>",
+				valueType: ValueEnumOf, valueDesc: "syslog severity floor",
+				valueExamples: []string{"error", "warning", "info"},
+				validator:     ValidateEnum(syslogSeverities), children: nil},
+			"facility": {desc: "Syslog facility (e.g. local0; default local0)", args: 1, placeholder: "<facility>",
+				valueType: ValueEnumOf, valueDesc: "syslog facility",
+				valueExamples: []string{"local0", "local7", "daemon", "change-log"},
+				validator:     ValidateEnum(syslogFacilities), children: nil},
+			"format": {desc: "Per-stream format override", args: 1, placeholder: "<format>",
+				valueType: ValueEnumOf, valueDesc: "security log format",
+				valueExamples: []string{"sd-syslog", "syslog", "binary", "structured"},
+				validator:     ValidateEnum(syslogLogFormats), children: nil},
+			"category": {desc: "Event category filter (all or a specific category)", args: 1, placeholder: "<category>",
+				valueType: ValueEnumOf, valueDesc: "security log category",
+				valueExamples: []string{"all", "session", "policy", "screen", "firewall"},
+				validator:     ValidateEnum(syslogCategories), children: nil},
+			"source-address": {desc: "Source IP for this stream", args: 1, placeholder: "<address>",
+				valueType: ValueIPAddress, valueDesc: "source IP address for this stream",
+				valueExamples: []string{"10.0.1.10", "2001:db8::1"},
+				validator:     ValidateIPAddress, children: nil},
 			// H8 (#2008): transport is fully compiled
 			// (compiler_security.go stream loop) and runtime-honored
 			// (pkg/logging/syslog.go dial), but the schema declared no
