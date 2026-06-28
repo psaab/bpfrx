@@ -146,6 +146,51 @@ func TestDNATDestinationAddressNameResolvesFeedOverlay(t *testing.T) {
 	}
 }
 
+// TestDNATSourceAddressNameResolvesFeedOverlay: a DNAT rule scoped to a
+// feed-backed `match source-address-name` carries the #2394 source constraint;
+// the feed prefixes must resolve into the snapshot's SourceAddresses (otherwise
+// the destination translation the operator scoped to a named feed set fires for
+// every source = fail-open). This completes the source+dest feed coverage
+// symmetry alongside TestDNATDestinationAddressNameResolvesFeedOverlay. With the
+// overlay un-threaded the name resolves to the raw token (fail-closed) instead.
+func TestDNATSourceAddressNameResolvesFeedOverlay(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.NAT.Destination = &config.DestinationNATConfig{
+		Pools: map[string]*config.NATPool{"dp": {Name: "dp", Address: "10.0.0.5"}},
+		RuleSets: []*config.NATRuleSet{
+			{Name: "rs", FromZone: "untrust", Rules: []*config.NATRule{
+				{
+					Name: "feed-src-dnat",
+					Match: config.NATMatch{
+						SourceAddressName:  "bad-feed",
+						DestinationAddress: "198.51.100.9",
+						Protocol:           "tcp",
+						DestinationPort:    443,
+					},
+					Then: config.NATThen{Type: config.NATDestination, PoolName: "dp"},
+				},
+			}},
+		},
+	}
+	overlay := map[string][]string{"bad-feed": {"203.0.113.0/24", "192.0.2.7/32"}}
+
+	snap := natFeedSnapHelper(t, cfg, overlay)
+	var got []string
+	for _, s := range snap.DestinationNAT {
+		if s.Name == "feed-src-dnat" {
+			got = s.SourceAddresses
+			break
+		}
+	}
+	if !contains(got, "203.0.113.0/24") || !contains(got, "192.0.2.7/32") {
+		t.Fatalf("DNAT source-address-name must resolve feed prefixes, got %v "+
+			"(missing => feedOverlay not threaded into DNAT builder #3303)", got)
+	}
+	if contains(got, "bad-feed") {
+		t.Fatalf("DNAT source list must not carry the raw feed name token (fail-closed fallback => overlay not threaded), got %v", got)
+	}
+}
+
 // TestNATAddressNameUnionsStaticBookAndFeedOverlay: a name that exists BOTH as a
 // static book entry and as a feed binding resolves to the union, mirroring the
 // policy address-book bucket merge. This guards against a revert that resolves

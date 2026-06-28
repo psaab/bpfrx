@@ -35,9 +35,18 @@ func natCounterID(ids map[string]uint32, natType, ruleSet, rule string) uint32 {
 // Before #3303 the NAT snapshot builders never received feedOverlay, so a NAT
 // rule scoped to a feed-backed address-name resolved STATIC-ONLY and matched
 // nothing on live feed content — contradicting the docs claim that feeds are
-// enforced via "policy/NAT address-name bindings". This helper mirrors the
-// policy path (buildAddressBookTableWithFeeds), which merges feedOverlay[name]
-// into the name's address-book bucket.
+// enforced via "policy/NAT address-name bindings". This brings NAT into line
+// with the policy path (buildAddressBookTableWithFeeds), which also merges
+// feedOverlay[name] into a name's content.
+//
+// It is NOT a byte-for-byte mirror of that path: the policy builder
+// family-splits the feed CIDRs and re-sorts/dedups across the static+feed union
+// (it must, to assign a content-hash ID), whereas this helper appends the feed
+// strings to the prefix list directly. That difference is functionally inert —
+// feeds.Manager.SnapshotForBindings already returns the overlay CIDRs sorted
+// and deduped, and the NAT consumer treats the list as an unordered prefix set
+// (duplicates contribute no extra table entry, ordering is irrelevant) — so no
+// re-dedup or family-split is needed here.
 //
 // The recursive case — an address-SET whose member is feed-backed — remains the
 // known #3294 gap (the static expander does not pull feed prefixes for nested
