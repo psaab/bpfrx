@@ -8,19 +8,34 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
-// TestFilterDSCPResolvableMatchesDSCPValues is the #3309 drift guard. pkg/config
-// cannot import pkg/dataplane (import cycle: pkg/dataplane imports pkg/config),
-// so validateFilterDSCPStrict INLINE-mirrors dataplane.DSCPValues (the snapshot
-// builder's table, pkg/dataplane/userspace/filters.go) plus the numeric 0..63
-// range it accepts. This external test pins the two together: every name in
-// dataplane.DSCPValues must be accepted by config.FilterDSCPResolvable, and the
-// numeric range must agree. A future edit to dataplane.DSCPValues that the
-// pkg/config copy does not track turns this RED.
+// TestFilterDSCPResolvableMatchesDSCPValues is the #3309 BIDIRECTIONAL drift
+// guard. pkg/config cannot import pkg/dataplane (import cycle: pkg/dataplane
+// imports pkg/config), so validateFilterDSCPStrict INLINE-mirrors
+// dataplane.DSCPValues (the snapshot builder's table,
+// pkg/dataplane/userspace/filters.go) plus the numeric 0..63 range it accepts.
+// This external test pins the two tables together in BOTH directions plus the
+// numeric range. Either table drifting from the other turns it RED.
 func TestFilterDSCPResolvableMatchesDSCPValues(t *testing.T) {
-	// Every DSCP code-point name the snapshot builder resolves must be accepted.
+	// Forward: every DSCP code-point name the snapshot builder resolves must be
+	// accepted by the config mirror. Catches the config mirror MISSING a name
+	// that the dataplane added (commit would reject a value the dataplane emits).
 	for name := range dataplane.DSCPValues {
 		if !config.FilterDSCPResolvable(name) {
-			t.Errorf("dataplane.DSCPValues has %q but config.FilterDSCPResolvable rejects it", name)
+			t.Errorf("dataplane.DSCPValues has %q but config.FilterDSCPResolvable rejects it "+
+				"(config name mirror is stale — add %q to filterDSCPNames)", name, name)
+		}
+	}
+
+	// Reverse: every name the config mirror accepts must STILL be present in
+	// dataplane.DSCPValues. Catches a name DROPPED from the dataplane SSOT while
+	// the config mirror still accepts it — the validator would pass that stale
+	// name at commit and the snapshot builder would then silently drop it at
+	// encode (a no-op match, not a commit error). This is the direction the
+	// forward-only guard could not see.
+	for _, name := range config.FilterDSCPNames() {
+		if _, ok := dataplane.DSCPValues[name]; !ok {
+			t.Errorf("config.FilterDSCPNames() accepts %q but dataplane.DSCPValues no longer "+
+				"defines it (config name mirror is stale — drop %q from filterDSCPNames)", name, name)
 		}
 	}
 

@@ -3321,6 +3321,9 @@ func validateFilterPortExceptStrict(cfg *Config) error {
 // The enforced set is EXACTLY the compileFilterFrom switch cases: every one
 // maps to a wire field the snapshot builder emits (pkg/dataplane/userspace/
 // filters.go) and the Rust matcher evaluates (userspace-dp/src/filter/engine).
+// `next-header` is IN that enforced set — it is the IPv6 alias for `protocol`
+// (compileFilterFrom routes it to term.Protocols), so it is NOT one of the
+// rejected unenforced leaves despite not having its own typed field.
 // compileFilterFrom's default arm records every other leaf on the term
 // (UnknownFrom, mirroring UnknownActions / UnknownFlexMatch); this gate makes
 // the refusal operator-visible at commit. No NEW matching is implemented — the
@@ -3356,9 +3359,9 @@ func validateFilterFromMatchStrict(cfg *Config) error {
 						"so the term would match more broadly than authored — an "+
 						"accept over-permits, a discard/reject over-drops); remove it "+
 						"or use a supported match such as source-address/"+
-						"destination-address/protocol/source-port/destination-port/"+
-						"dscp/traffic-class/icmp-type/icmp-code/tcp-flags/is-fragment/"+
-						"flexible-match-range",
+						"destination-address/protocol/next-header/source-port/"+
+						"destination-port/dscp/traffic-class/icmp-type/icmp-code/"+
+						"tcp-flags/is-fragment/flexible-match-range",
 					family, name, term.Name, term.UnknownFrom[0])
 			}
 		}
@@ -3556,6 +3559,22 @@ func filterDSCPResolvable(token string) bool {
 // filterDSCPResolvable directly.
 func FilterDSCPResolvable(token string) bool {
 	return filterDSCPResolvable(token)
+}
+
+// FilterDSCPNames exposes the config-side code-point NAME set (the keys of
+// filterDSCPNames) for the BIDIRECTIONAL drift-guard test
+// TestFilterDSCPResolvableMatchesDSCPValues. The forward direction (every
+// dataplane.DSCPValues key is accepted here) catches the config mirror missing a
+// name; this accessor lets the test assert the inverse — every name the config
+// mirror accepts is STILL present in dataplane.DSCPValues — so a name DROPPED
+// from the dataplane SSOT (which the snapshot builder would then silently fail to
+// emit) cannot leave a stale accept here. TEST seam only.
+func FilterDSCPNames() []string {
+	names := make([]string, 0, len(filterDSCPNames))
+	for name := range filterDSCPNames {
+		names = append(names, name)
+	}
+	return names
 }
 
 // filterProtocolResolvable reports whether a `from protocol <token>` is

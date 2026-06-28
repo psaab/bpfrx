@@ -15,11 +15,14 @@ import (
 //
 // The enforced set verified against the dataplane: the compileFilterFrom switch
 // cases are source-address, destination-address, source-prefix-list,
-// destination-prefix-list, protocol, dscp, traffic-class, destination-port,
-// source-port, destination-port-except, source-port-except, icmp-type,
-// icmp-code, tcp-flags, is-fragment, flexible-match-range — each maps to a wire
-// field the snapshot builder emits and the Rust matcher reads. Everything else
-// is parsed-but-ignored.
+// destination-prefix-list, protocol, next-header, dscp, traffic-class,
+// destination-port, source-port, destination-port-except, source-port-except,
+// icmp-type, icmp-code, tcp-flags, is-fragment, flexible-match-range — each maps
+// to a wire field the snapshot builder emits and the Rust matcher reads.
+// next-header is the IPv6 alias for protocol (it compiles to term.Protocols), so
+// it is ENFORCED and is NOT one of the rejected leaves. Everything else (ttl,
+// source-mac-address, ip-options, fragment-offset, hop-limit, ...) is
+// parsed-but-ignored and rejected here.
 //
 // FAIL-ON-REVERT: remove the compileFilterFrom `default:` arm (the silent drop)
 // or the validateFilterFromMatchStrict invocation and these strict-path tests
