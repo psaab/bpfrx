@@ -212,6 +212,32 @@ runtime effect is the L3/L4 catalog classification above
     per-policy *drop* is fail-open for deny rules, conflicting with the
     deliberate #2124 whole-snapshot-reject fail-closed family — and is
     tracked in #3261.
+  - **#3320 malformed inactivity-timeout / timeout (fail-closed):** an
+    application's `inactivity-timeout` / `timeout` leaf used to be an
+    untyped schema leaf with no integer validation. A malformed value (a
+    unit suffix like `30s`, a non-numeric like `thirty`, a negative, or an
+    out-of-range integer) **committed cleanly** and was then **silently
+    dropped** by `compileApplications` (the `strconv.Atoi` error was
+    ignored), leaving `InactivityTimeout` at its zero default — which the
+    userspace serializer (`clampNonNegU32`,
+    `pkg/dataplane/userspace/capabilities.go`) treats as "use the global
+    per-protocol timeout". The operator's intent to age a sensitive
+    application early was silently lost (the per-application #3227 timeout
+    above never engaged). It is now **typed and validated** at two layers,
+    each with the #1960 strict-commit / lenient-load downgrade: (1) the
+    schema typed leaf (`schema_security.go`, `ValueInteger` +
+    `ValidateInteger(1, 86400)`, matching the NAT persistent-binding
+    `inactivity-timeout` bound) rejects a malformed **top-level** value at
+    commit-check for every application via the `SchemaValidate` gate; (2)
+    `validateApplicationSpecsStrict` rejects a malformed top-level **or
+    inline-`term`** timeout of a **referenced** application (the inline-term
+    shape is opaque to the schema walk) using the raw token
+    `compileApplications` records in `Application.UnknownTimeouts` (mirroring
+    `UnknownActions` / `UnknownFlexMatch`). On the tolerant LOAD / peer-sync
+    path both layers downgrade to a warning (no-brick) so an
+    already-persisted / older-peer-synced config carrying a bad timeout
+    still BOOTS — the dataplane already falls back to the global timeout for
+    it.
 - `applications application-set` — expands into individual
   applications at compile time. Members may be either
   `application <name>` references or nested

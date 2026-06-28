@@ -610,6 +610,17 @@ type Application struct {
 	// (the historical behavior and what the all-ICMP aliases keep). #3020.
 	ICMPType *uint8
 	ICMPCode *uint8
+	// UnknownTimeouts records the raw `inactivity-timeout` / `timeout` tokens
+	// (top-level or inline-term) that did NOT parse to a valid integer in the
+	// accepted 1..86400-second range. compileApplications cannot return an
+	// error from the per-leaf parse without breaking the tolerant load path, so
+	// — mirroring UnknownActions / UnknownFlexMatch — it records the offending
+	// raw token here and the deferred gate (validateApplicationSpecsStrict)
+	// hard-rejects it on the strict commit path / warns on the lenient
+	// load / peer-sync path. A malformed value left InactivityTimeout at its
+	// zero default, silently falling the application back to the global
+	// per-protocol timeout instead of the configured one (#3320).
+	UnknownTimeouts []string
 }
 
 // IPsecConfig holds IPsec VPN configuration.

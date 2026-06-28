@@ -590,11 +590,18 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 
 var schemaApplications = &schemaNode{desc: "Applications", children: map[string]*schemaNode{
 	"application": {desc: "Application name", args: 1, valueHint: ValueHintAppName, placeholder: "<name>", children: map[string]*schemaNode{
-		"protocol":           {desc: "Protocol", args: 1, placeholder: "<protocol>", children: nil},
-		"destination-port":   {desc: "Destination port", args: 1, placeholder: "<port>", children: nil},
-		"source-port":        {desc: "Source port", args: 1, placeholder: "<port>", children: nil},
-		"inactivity-timeout": {desc: "Inactivity timeout", args: 1, placeholder: "<seconds>", children: nil},
-		"timeout":            {desc: "Timeout", args: 1, placeholder: "<seconds>", children: nil},
+		"protocol":         {desc: "Protocol", args: 1, placeholder: "<protocol>", children: nil},
+		"destination-port": {desc: "Destination port", args: 1, placeholder: "<port>", children: nil},
+		"source-port":      {desc: "Source port", args: 1, placeholder: "<port>", children: nil},
+		// #3320: typed integer leaves (1..86400 s) so a malformed top-level
+		// inactivity-timeout / timeout is rejected at commit-check by the
+		// SchemaValidate gate (downgraded to a warning on the tolerant
+		// load / peer-sync path by compileTreeLenient) instead of being silently
+		// dropped to the global timeout. The inline-term shape (`term <t> ...
+		// inactivity-timeout <n>`) is an opaque single statement to the schema
+		// walk, so it is covered by validateApplicationSpecsStrict instead.
+		"inactivity-timeout": {desc: "Inactivity timeout", args: 1, valueType: ValueInteger, valueDesc: "Timeout in seconds", valueExamples: []string{"300", "1800"}, validator: ValidateInteger(appTimeoutMin, appTimeoutMax), placeholder: "<seconds>", children: nil},
+		"timeout":            {desc: "Timeout", args: 1, valueType: ValueInteger, valueDesc: "Timeout in seconds", valueExamples: []string{"300", "1800"}, validator: ValidateInteger(appTimeoutMin, appTimeoutMax), placeholder: "<seconds>", children: nil},
 		"alg":                {desc: "Application layer gateway", args: 1, placeholder: "<alg>", children: nil},
 		"description":        {desc: "Description", args: 1, placeholder: "<text>", children: nil},
 		"term":               {desc: "Term", args: 1, placeholder: "<term>", children: nil},

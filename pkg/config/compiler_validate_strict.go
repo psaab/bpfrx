@@ -3014,6 +3014,33 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 					name, port, app.Protocol)
 			}
 		}
+		// #3320: an application inactivity-timeout / timeout that did not parse to
+		// a valid integer in [1, 86400] seconds (non-numeric like "thirty", a unit
+		// suffix like "30s", a negative, or an out-of-range integer) was SILENTLY
+		// dropped by compileApplications (the strconv.Atoi error was ignored),
+		// leaving InactivityTimeout at its zero default — which the userspace
+		// snapshot serializer treats as "use the global per-protocol timeout"
+		// (pkg/dataplane/userspace/capabilities.go clampNonNegU32). The operator's
+		// intent to age a sensitive application early is silently lost, with no
+		// commit error and no log. compileApplications records the offending raw
+		// token in app.UnknownTimeouts (mirroring UnknownActions / UnknownFlexMatch
+		// for the other fail-open gates); reject the first one here so the silent
+		// drop becomes an operator-visible commit error. Junos rejects a
+		// non-integer / out-of-range inactivity-timeout at commit. Strict on the
+		// commit / commit-check path; the call site (compiler.go,
+		// lenientApplicationSpecs) downgrades this to a warning on the tolerant
+		// load / peer-sync path so an already-persisted or older-peer-synced config
+		// carrying a bad timeout still BOOTS (#1960 no-brick) — the dataplane
+		// already falls back to the global timeout for it.
+		if len(app.UnknownTimeouts) > 0 {
+			return fmt.Errorf(
+				"application %q: invalid inactivity-timeout/timeout %q; must be an "+
+					"integer number of seconds in %d..%d (a non-numeric, out-of-range, "+
+					"or unit-suffixed value is silently dropped and the application "+
+					"falls back to the global per-protocol timeout instead of the "+
+					"configured one)",
+				name, app.UnknownTimeouts[0], appTimeoutMin, appTimeoutMax)
+		}
 	}
 	return nil
 }
