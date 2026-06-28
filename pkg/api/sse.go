@@ -37,8 +37,13 @@ func (s *Server) eventStreamHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse category filter
-	categoryFilter := parseCategories(r.URL.Query().Get("category"))
+	// Parse category filter. Reject a typo before switching to SSE so a
+	// misspelled query does not silently stream everything (#3383).
+	categoryFilter, err := parseCategories(r.URL.Query().Get("category"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	setSSEHeaders(w)
 
@@ -73,8 +78,19 @@ func (s *Server) logStreamHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	severityFilter := logging.ParseSeverity(r.URL.Query().Get("severity"))
-	categoryFilter := parseCategories(r.URL.Query().Get("category"))
+	// Reject a typo'd severity/category before switching to SSE (#3383):
+	// a misspelled filter must not silently widen the live feed to all
+	// events. Distinguish absent ("" -> 0, no filter) from unrecognized.
+	severityFilter, err := logging.ParseSeverityStrict(r.URL.Query().Get("severity"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	categoryFilter, err := parseCategories(r.URL.Query().Get("category"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	setSSEHeaders(w)
 
@@ -88,7 +104,7 @@ func (s *Server) logStreamHandler(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case rec := <-sub.C:
-			severity := eventRecordSeverity(rec.Type)
+			severity := eventRecordSeverity(rec)
 			if severityFilter != 0 && severity > severityFilter {
 				continue
 			}
@@ -135,15 +151,29 @@ func eventEntryFromRecord(rec logging.EventRecord) EventEntry {
 }
 
 // parseCategories parses a comma-separated category string into a bitmask.
-func parseCategories(s string) uint8 {
+// It is fail-closed (#3383): an unrecognized OR empty token returns an error
+// rather than silently collapsing to 0 ("no filter"), which would widen the
+// live SSE feed to everything on a typo or a malformed list (a leading,
+// trailing, or doubled comma). A fully-ABSENT category param ("") still means
+// match-all and yields a 0 mask with no error; only the named "all" token is
+// the explicit no-filter request within a present list.
+func parseCategories(s string) (uint8, error) {
 	if s == "" {
-		return 0
+		return 0, nil
 	}
 	var mask uint8
 	for _, c := range strings.Split(s, ",") {
-		mask |= logging.ParseCategory(strings.TrimSpace(c))
+		tok := strings.TrimSpace(c)
+		if tok == "" {
+			return 0, fmt.Errorf("empty category token in %q (no leading/trailing/double comma)", s)
+		}
+		bit, err := logging.ParseCategoryStrict(tok)
+		if err != nil {
+			return 0, err
+		}
+		mask |= bit
 	}
-	return mask
+	return mask, nil
 }
 
 // matchCategory checks if an event type matches a category bitmask.
@@ -159,15 +189,28 @@ func matchCategory(eventType string, mask uint8) bool {
 	case "FILTER_LOG":
 		bit = logging.CategoryFirewall
 	default:
-		return true // pass unknown types
+		// Fail-closed (#3383): a future/unknown event type does not belong
+		// to any requested category, so a narrow category mask must not
+		// deliver it. (A zero mask = "no filter" is handled by the caller,
+		// which only calls matchCategory when mask != 0.)
+		return false
 	}
 	return mask&bit != 0
 }
 
-// eventRecordSeverity maps event type names to syslog severity.
-func eventRecordSeverity(eventType string) int {
-	switch eventType {
+// eventRecordSeverity maps an event record to a syslog severity, classifying
+// by BOTH type and action (#3383). This mirrors logging.eventSeverity: a
+// SCREEN_DROP with action=permit is the #2234 scan-table-pressure alarm — the
+// packet still forwards, so it is informational (SyslogNotice), not an error.
+// Only a screen event that actually dropped (deny/reject) is SyslogError.
+// Classifying every SCREEN_DROP as error emitted false error-severity alerts
+// and let permitted packets pass a severity=error filter.
+func eventRecordSeverity(rec logging.EventRecord) int {
+	switch rec.Type {
 	case "SCREEN_DROP":
+		if strings.EqualFold(rec.Action, "permit") {
+			return logging.SyslogNotice
+		}
 		return logging.SyslogError
 	case "POLICY_DENY":
 		return logging.SyslogWarning
@@ -182,6 +225,8 @@ func severityName(s int) string {
 		return "error"
 	case logging.SyslogWarning:
 		return "warning"
+	case logging.SyslogNotice:
+		return "notice"
 	default:
 		return "info"
 	}

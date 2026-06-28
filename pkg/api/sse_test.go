@@ -284,9 +284,26 @@ func TestParseCategories(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := parseCategories(tt.input)
+		got, err := parseCategories(tt.input)
+		if err != nil {
+			t.Errorf("parseCategories(%q) unexpected error: %v", tt.input, err)
+			continue
+		}
 		if got != tt.want {
 			t.Errorf("parseCategories(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+
+	// #3383: a typo OR an empty token (leading/trailing/double comma) must
+	// be rejected (fail-closed), not collapse to 0 = unfiltered. A
+	// fully-absent param ("") stays match-all and is covered by the table
+	// above.
+	for _, bad := range []string{
+		"polciy", "sesion", "session,polciy", "bogus",
+		",", "policy,", ",policy", "session,,policy", " , ",
+	} {
+		if _, err := parseCategories(bad); err == nil {
+			t.Errorf("parseCategories(%q) = nil error, want rejection", bad)
 		}
 	}
 }
@@ -303,7 +320,7 @@ func TestMatchCategory(t *testing.T) {
 		{"POLICY_DENY", logging.CategoryPolicy, true},
 		{"SCREEN_DROP", logging.CategoryScreen, true},
 		{"FILTER_LOG", logging.CategoryFirewall, true},
-		{"UNKNOWN_TYPE", logging.CategorySession, true}, // unknown passes
+		{"UNKNOWN_TYPE", logging.CategorySession, false}, // #3383: unknown fails closed under a narrow mask
 	}
 
 	for _, tt := range tests {
@@ -333,12 +350,15 @@ func TestEventBufferSubscription(t *testing.T) {
 		t.Fatal("timeout waiting for subscription event")
 	}
 
-	// Unsubscribe and verify no more events
+	// Unsubscribe (#3384: Close also closes the channel). Verify the
+	// channel is closed AND that no live record was delivered after
+	// unsubscribe — a closed channel yields the zero value with ok==false,
+	// so checking ok is what makes this a real assertion rather than a
+	// vacuous read that any closed channel would satisfy.
 	sub.Close()
 	buf.Add(rec)
-	select {
-	case <-sub.C:
-		// drain any buffered
-	case <-time.After(50 * time.Millisecond):
+	got, ok := <-sub.C
+	if ok {
+		t.Fatalf("received a live record (%+v) after Close; want closed channel (ok==false)", got)
 	}
 }

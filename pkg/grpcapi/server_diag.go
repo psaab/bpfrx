@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
@@ -198,6 +199,78 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 		return status.Error(codes.Unavailable, "event buffer not available")
 	}
 
+	// Validate the request before subscribing (#3382). MonitorPacketDrop
+	// streams only LOCAL drops; the CLI applies the same guardrails. An
+	// unvalidated filter silently produces an empty stream that looks like
+	// "no drops" during incident response, so reject impossible inputs up
+	// front with InvalidArgument rather than opening a stream that can never
+	// match.
+
+	// node: packet-drop is local-only — it does not proxy to the cluster
+	// peer the way MonitorInterface does. Honor an empty/local node and
+	// reject any value that designates a different (or "all") node so a
+	// client cannot believe a peer filter was applied.
+	if !s.isLocalNodeRef(req.Node) {
+		return status.Errorf(codes.InvalidArgument,
+			"node %q: monitor packet-drop is local-only; run it on the target node", req.Node)
+	}
+
+	// count: negative is not "unlimited" (the CLI rejects it); enforce the
+	// CLI's 1..8192 cap. 0 remains an explicit "unlimited" sentinel.
+	if req.Count < 0 {
+		return status.Errorf(codes.InvalidArgument, "count must be >= 0 (0 = unlimited), got %d", req.Count)
+	}
+	if req.Count > 8192 {
+		return status.Errorf(codes.InvalidArgument, "count must be 1..8192 (0 = unlimited), got %d", req.Count)
+	}
+
+	// ports: the event records carry 16-bit ports; a value > 65535 can
+	// never match and would silently empty the stream.
+	if req.SourcePort > 65535 {
+		return status.Errorf(codes.InvalidArgument, "source-port must be 0..65535, got %d", req.SourcePort)
+	}
+	if req.DestinationPort > 65535 {
+		return status.Errorf(codes.InvalidArgument, "destination-port must be 0..65535, got %d", req.DestinationPort)
+	}
+
+	// protocol: validate against the shared catalog (case-insensitive,
+	// named or numeric). A typo like "tpc" can never match. Resolve the
+	// request to its protocol NUMBER once so the filter loop can compare
+	// numerically — the event record renders rec.Protocol as a NAME for the
+	// named set, so a numeric request like "6" must not be string-compared
+	// against "TCP" (the accepted-but-never-matches bug).
+	var reqProtoNum uint8
+	if req.Protocol != "" {
+		n, ok := appid.ProtocolNumber(req.Protocol)
+		if !ok {
+			return status.Errorf(codes.InvalidArgument, "unknown protocol %q", req.Protocol)
+		}
+		reqProtoNum = n
+	}
+
+	// zone / interface: validate against the active configuration so a typo
+	// (`trsut`, `ge-0/0/99`) is rejected rather than emitting nothing. The
+	// interface filter must MATCH on whichever alias the daemon stored, so
+	// resolve the full alias set once and reuse it in the loop.
+	var reqIfaceAliases map[string]bool
+	if req.FromZone != "" || req.Interface != "" {
+		cfg := s.store.ActiveConfig()
+		if cfg == nil {
+			return status.Error(codes.Unavailable, "no active configuration to validate zone/interface filters")
+		}
+		if req.FromZone != "" {
+			if _, ok := cfg.Security.Zones[req.FromZone]; !ok {
+				return status.Errorf(codes.InvalidArgument, "unknown from-zone %q", req.FromZone)
+			}
+		}
+		if req.Interface != "" {
+			reqIfaceAliases = interfaceAliasSet(cfg, req.Interface)
+			if len(reqIfaceAliases) == 0 {
+				return status.Errorf(codes.InvalidArgument, "unknown interface %q", req.Interface)
+			}
+		}
+	}
+
 	// Parse filters.
 	var srcNet, dstNet *net.IPNet
 	if req.SourcePrefix != "" {
@@ -279,13 +352,27 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 					continue
 				}
 			}
-			if req.Protocol != "" && !strings.EqualFold(rec.Protocol, req.Protocol) {
+			if req.Protocol != "" && rec.ProtocolNum != reqProtoNum {
+				// Compare against the numeric protocol the RECORD carries,
+				// not a re-parse of the rendered name. protoName is NOT
+				// reversible — protoName(41)="IPV6" but
+				// appid.ProtocolNumber("ipv6") is deliberately one-way, so
+				// re-parsing rec.Protocol drops every proto-41 record. The
+				// raw number (#3382) makes the match total for named,
+				// named-non-reversible, and unnamed protocols alike.
+				// reqProtoNum is resolved once in validation via
+				// appid.ProtocolNumber (correct for the named/numeric
+				// REQUEST side).
 				continue
 			}
 			if req.FromZone != "" && rec.InZoneName != req.FromZone {
 				continue
 			}
-			if req.Interface != "" && rec.IngressIface != req.Interface {
+			if req.Interface != "" && !reqIfaceAliases[rec.IngressIface] {
+				// rec.IngressIface is the single daemon-resolved name; the
+				// request may be any accepted alias (config key, Linux
+				// form, or Name override). Match against the full alias set
+				// so any accepted form matches (#3382 matcher fix).
 				continue
 			}
 
@@ -314,6 +401,54 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 			}
 		}
 	}
+}
+
+// isLocalNodeRef reports whether a request's node reference designates the
+// local node (#3382). An empty string or "local" is always local. In a
+// cluster the node's numeric id ("0"/"1") or "nodeN" form for THIS node is
+// accepted; a standalone daemon (localID 0) accepts "0" or "node0". Anything
+// else — the peer id, "all", "primary" — is not local, so a local-only RPC
+// must reject it rather than silently filter local data.
+func (s *Server) isLocalNodeRef(node string) bool {
+	switch strings.ToLower(strings.TrimSpace(node)) {
+	case "", "local":
+		return true
+	}
+	ref := strings.ToLower(strings.TrimSpace(node))
+	localID := 0
+	if s != nil && s.cluster != nil {
+		localID = s.cluster.NodeID()
+	}
+	return ref == strconv.Itoa(localID) || ref == fmt.Sprintf("node%d", localID)
+}
+
+// interfaceAliasSet returns the set of equivalent names for the configured
+// interface that `name` designates, or nil if it matches none (#3382). The
+// packet-drop filter compares against the SINGLE daemon-resolved ingress name
+// (resolveIfName), but the operator may pass any accepted alias — the config
+// key ("ge-0/0/1"), its Linux-form rendering ("ge-0-0-1"), an explicit Name
+// override, or that Name's Linux form. Returning the full alias set lets both
+// validation (len > 0) and the matcher (membership test) accept whichever form
+// the daemon happened to store, so a validated interface filter cannot
+// accept-but-never-match.
+func interfaceAliasSet(cfg *config.Config, name string) map[string]bool {
+	if cfg == nil {
+		return nil
+	}
+	for key, ifc := range cfg.Interfaces.Interfaces {
+		aliases := map[string]bool{
+			key:                     true,
+			config.LinuxIfName(key): true,
+		}
+		if ifc != nil && ifc.Name != "" {
+			aliases[ifc.Name] = true
+			aliases[config.LinuxIfName(ifc.Name)] = true
+		}
+		if aliases[name] {
+			return aliases
+		}
+	}
+	return nil
 }
 
 // MonitorInterface streams pre-formatted interface statistics frames.

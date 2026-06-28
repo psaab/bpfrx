@@ -19,6 +19,15 @@ reports.
   `n <= 0` as "return nothing" — a count argument never reaches
   `make([]EventRecord, n)` with a negative len (which panics).
 - `Subscription` — `eventbuf.go`. A consumer of the event ring.
+  `Close()` unsubscribes AND closes `C` (#3384): a consumer ranging over
+  `C` until it closes terminates rather than blocking forever. The
+  unsubscribe runs first under the fan-out write lock (so a concurrent
+  `Add` can never send on the closed channel) and `sync.Once` makes a
+  double `Close` safe. `ParseSeverityStrict` / `ParseCategoryStrict`
+  (`syslog.go`) are the fail-closed parse variants — they return an error
+  on an unknown token instead of `0` ("no filter"); the SSE log/event
+  stream uses them so a typo'd query rejects rather than streaming
+  everything (#3383).
 - `LocalLogWriter` — `locallog.go`. File-based writer with
   facility/severity filters.
 - `SessionAggregator` — `aggregator.go`. Top-N per-IP rollups,
