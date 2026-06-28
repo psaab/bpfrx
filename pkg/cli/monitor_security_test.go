@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -53,6 +54,13 @@ func TestOpenTraceFile_Mode0600(t *testing.T) {
 	old := traceLogDir
 	traceLogDir = dir
 	defer func() { traceLogDir = old }()
+
+	// Force a permissive umask for the duration of the test. Without this a
+	// reverted 0644 create mode would be masked down to 0600 under an inherited
+	// umask of 077 and the assertion below would pass falsely. With umask 0 a
+	// reverted 0644 actually lands on disk as 0644 and turns this test RED.
+	oldMask := syscall.Umask(0)
+	defer syscall.Umask(oldMask)
 
 	f, path, err := openTraceFile("trace")
 	if err != nil {
@@ -229,5 +237,64 @@ func TestFlowFilter_ValidCriterionCommits(t *testing.T) {
 	}
 	if f.Protocol != "tcp" {
 		t.Fatalf("protocol = %q, want tcp", f.Protocol)
+	}
+}
+
+// #3378 (open-time hardening): openTraceFile must independently reject
+// traversal/separator names even if the parse-time sanitizeTraceFilename guard
+// were bypassed. This pins the open-site sanitize call directly, not just the
+// command-handler path covered above.
+func TestOpenTraceFile_RejectsTraversalAtOpen(t *testing.T) {
+	dir := t.TempDir()
+	old := traceLogDir
+	traceLogDir = dir
+	defer func() { traceLogDir = old }()
+
+	for _, name := range []string{"../escape", "a/b"} {
+		f, _, err := openTraceFile(name)
+		if err == nil {
+			f.Close()
+			t.Fatalf("openTraceFile(%q) = nil error, want rejection (open-time sanitize must block traversal/separators)", name)
+		}
+	}
+
+	// RED-on-revert anchor: with the sanitize call removed from openTraceFile,
+	// "../escape" resolves to a sibling of traceLogDir and the root-written
+	// file is actually created there. Assert nothing escaped the log dir.
+	escaped := filepath.Join(filepath.Dir(dir), "escape")
+	if _, err := os.Stat(escaped); err == nil {
+		os.Remove(escaped)
+		t.Fatalf("a trace file escaped traceLogDir to %s; open-time sanitize did not block traversal", escaped)
+	}
+}
+
+// #3380 (atomic parse default-reject): the packet-drop parser must reject an
+// unknown token or a value-less option instead of silently skipping it (which
+// would widen forensic collection). The handler reaches the event-subscription
+// loop only on a fully accepted parse; with a nil eventBuf that manifests as a
+// panic in Subscribe, while a parse-time rejection returns before touching the
+// buffer. reachedEventLoop turns that distinction into a boolean.
+func reachedEventLoop(t *testing.T, c *CLI, args []string) (reached bool) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			reached = true
+		}
+	}()
+	_ = c.handleMonitorSecurityPacketDrop(args)
+	return false
+}
+
+func TestPacketDrop_RejectsUnknownToken(t *testing.T) {
+	c := &CLI{} // nil eventBuf: a rejected parse never reaches Subscribe.
+	if reachedEventLoop(t, c, []string{"bogus", "x"}) {
+		t.Fatal("unknown packet-drop token was not rejected (parser fell through to the event loop)")
+	}
+}
+
+func TestPacketDrop_RejectsMissingOptionValue(t *testing.T) {
+	c := &CLI{}
+	if reachedEventLoop(t, c, []string{"count"}) {
+		t.Fatal("value-less packet-drop option was not rejected (parser fell through to the event loop)")
 	}
 }
