@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -398,6 +399,139 @@ func TestHostInboundFilterConfiguredControlInterfaceLifeline(t *testing.T) {
 	// Sanity: the enforced wan zone still scopes its own address.
 	if !strings.Contains(payload, "172.16.50.8 drop") {
 		t.Errorf("wan zone must still emit a scoped deny:\n%s", payload)
+	}
+}
+
+// TestHostInboundFilterApplyFailureSurfaced is the #3333 fail-on-revert proof
+// for the APPLY path: when `nft -f -` fails, applyHostInboundFilter must return
+// the error (so applyConfigLocked fails the commit closed) rather than swallow
+// it at WARN. With the pre-fix warn-only code the function returned nothing and
+// this goes RED. The nft invocation is replaced by the package-var seam so no
+// real nft is run.
+func TestHostInboundFilterApplyFailureSurfaced(t *testing.T) {
+	cfg := hostInboundTestConfig()
+
+	injected := errors.New("nft: rule load failed")
+	var called bool
+	orig := nftApplyPayload
+	nftApplyPayload = func(payload string) ([]byte, error) {
+		called = true
+		// Sanity: the payload fed to nft must be the enforced host-inbound
+		// ruleset (an enforceable view exists), so a failure here is a real
+		// deny-not-installed event.
+		if !strings.Contains(payload, "table inet xpf_hostinbound") {
+			t.Errorf("apply seam got unexpected payload:\n%s", payload)
+		}
+		return []byte("Error: could not process rule\n"), injected
+	}
+	defer func() { nftApplyPayload = orig }()
+
+	d := &Daemon{}
+	err := d.applyHostInboundFilter(cfg)
+	if !called {
+		t.Fatal("expected nft apply seam to be invoked for an enforceable config")
+	}
+	if err == nil {
+		t.Fatal("apply failure must be surfaced as an error (fail-closed), got nil")
+	}
+	if !errors.Is(err, injected) {
+		t.Errorf("returned error must wrap the nft failure, got %v", err)
+	}
+}
+
+// TestHostInboundFilterDeleteFailureSurfaced is the #3333 fail-on-revert proof
+// for the TEARDOWN path: when no zone is enforceable, the stale table is removed
+// via the idempotent add-then-delete payload; a genuine teardown failure (stale
+// deny left in the kernel) must surface as an error. The add+delete is
+// idempotent for the benign absent-table case, so any error from the seam is a
+// real failure. Pre-fix the delete error was discarded entirely (`_, _ =`), so
+// this goes RED.
+func TestHostInboundFilterDeleteFailureSurfaced(t *testing.T) {
+	// A config with no enforceable host-inbound view (no zone declares a
+	// stanza) drives the teardown branch.
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"10.0.0.1/24"}},
+		}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust", Interfaces: []string{"reth0.0"}},
+	}
+	if hostInboundHasEnforceableView(dpuserspace.BuildZoneHostInboundViews(cfg)) {
+		t.Fatal("test config must have no enforceable host-inbound view")
+	}
+
+	injected := errors.New("nft: device or resource busy")
+	var gotFamily, gotName string
+	orig := nftDeleteTable
+	nftDeleteTable = func(family, name string) ([]byte, error) {
+		gotFamily, gotName = family, name
+		return []byte("Error: Could not process rule\n"), injected
+	}
+	defer func() { nftDeleteTable = orig }()
+
+	d := &Daemon{}
+	err := d.applyHostInboundFilter(cfg)
+	if gotName != "xpf_hostinbound" || gotFamily != "inet" {
+		t.Errorf("teardown must target inet xpf_hostinbound, got %s %s", gotFamily, gotName)
+	}
+	if err == nil {
+		t.Fatal("teardown failure must be surfaced as an error (fail-closed), got nil")
+	}
+	if !errors.Is(err, injected) {
+		t.Errorf("returned error must wrap the nft teardown failure, got %v", err)
+	}
+}
+
+// TestNftDeleteTableIdempotentAddDelete pins the #3333 MAJOR-2 teardown shape:
+// the default nftDeleteTable must NOT depend on the recent `nft destroy` verb
+// (the project pins no minimum nftables version), and must instead emit an
+// idempotent add-then-delete payload through the atomic nftApplyPayload runner.
+// Reverting to `nft destroy` (or dropping the `add`) turns this RED.
+func TestNftDeleteTableIdempotentAddDelete(t *testing.T) {
+	var got string
+	orig := nftApplyPayload
+	nftApplyPayload = func(payload string) ([]byte, error) { got = payload; return nil, nil }
+	defer func() { nftApplyPayload = orig }()
+
+	if _, err := nftDeleteTable("inet", "xpf_hostinbound"); err != nil {
+		t.Fatalf("nftDeleteTable: %v", err)
+	}
+	if strings.Contains(got, "destroy") {
+		t.Errorf("teardown must not use the unpinned `nft destroy` verb:\n%s", got)
+	}
+	for _, want := range []string{
+		"add table inet xpf_hostinbound",
+		"delete table inet xpf_hostinbound",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("teardown payload missing %q:\n%s", want, got)
+		}
+	}
+	// `add` must precede `delete` so the delete always has a target.
+	if strings.Index(got, "add table") > strings.Index(got, "delete table") {
+		t.Errorf("add must precede delete in the teardown payload:\n%s", got)
+	}
+}
+
+// TestHostInboundFilterApplySuccessNoError verifies the happy paths return nil:
+// a successful apply (enforceable view) and a successful/benign teardown (no
+// enforceable view) must NOT report a commit failure.
+func TestHostInboundFilterApplySuccessNoError(t *testing.T) {
+	origApply, origDelete := nftApplyPayload, nftDeleteTable
+	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
+	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
+	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
+
+	d := &Daemon{}
+	if err := d.applyHostInboundFilter(hostInboundTestConfig()); err != nil {
+		t.Errorf("successful apply must return nil, got %v", err)
+	}
+
+	empty := &config.Config{}
+	if err := d.applyHostInboundFilter(empty); err != nil {
+		t.Errorf("benign teardown (no enforceable view) must return nil, got %v", err)
 	}
 }
 
