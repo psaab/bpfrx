@@ -82,13 +82,24 @@ func TestProtoConstrainedAppWrongProtoNoMatch(t *testing.T) {
 	}
 }
 
-// TestUnconstrainedAppOmittedQueryProtoStillMatches guards the narrow exception:
-// an application term that is GENUINELY unconstrained on protocol (no protocol,
-// no ports, no ICMP-type constraint) is a true match-any term and must still
-// match an omitted query protocol — removing the short-circuit must not turn a
-// real match-any app into a fail-closed term. Mirrors the runtime keying such an
-// app under every protocol bucket / its match-any short-circuit.
-func TestUnconstrainedAppOmittedQueryProtoStillMatches(t *testing.T) {
+// TestProtocolLessNamedAppNeverMatches pins the parity contract for a NAMED
+// application that carries NO protocol. The dataplane cannot represent such an
+// app and never enforces it: the snapshot builder fails closed
+// (deriveUserspaceCapabilities, pkg/dataplane/userspace/capabilities.go returns
+// ok=false for proto=="" → the __unsupported__ sentinel → whole-snapshot reject,
+// #3261) and strict commit hard-rejects it
+// (pkg/config/compiler_validate_strict.go). A protocol-less named app can only
+// exist via a lenient/HA-loaded config, where the runtime STILL never enforces
+// it. The simulator must therefore NOT report it as a concrete match — reporting
+// a match-any the dataplane would never produce is the simulator-vs-runtime
+// divergence #3323 is about. It must fall through to the configured
+// default-policy, EVEN when the query supplies a concrete protocol (the app is
+// unrepresentable regardless of the query).
+//
+// FAIL-ON-REVERT: restoring the `if app.Protocol != "" { ... }` guard (skipping
+// the protocol gate for an empty app.Protocol) makes a protocol-less named app
+// match-any (Matched=true, permit), failing the want-default-deny assertions.
+func TestProtocolLessNamedAppNeverMatches(t *testing.T) {
 	sec := config.SecurityConfig{
 		DefaultPolicy: config.PolicyDeny,
 		Zones:         zones("trust", "untrust"),
@@ -98,12 +109,12 @@ func TestUnconstrainedAppOmittedQueryProtoStillMatches(t *testing.T) {
 				ToZone:   "untrust",
 				Policies: []*config.Policy{
 					{
-						Name:   "anyapp-permit",
+						Name:   "badapp-permit",
 						Action: config.PolicyPermit,
 						Match: config.PolicyMatch{
 							SourceAddresses:      []string{"any"},
 							DestinationAddresses: []string{"any"},
-							Applications:         []string{"matchall"},
+							Applications:         []string{"noproto"},
 						},
 					},
 				},
@@ -112,15 +123,29 @@ func TestUnconstrainedAppOmittedQueryProtoStillMatches(t *testing.T) {
 	}
 	apps := config.ApplicationsConfig{
 		Applications: map[string]*config.Application{
-			// No protocol, no ports, no ICMP type: a genuinely unconstrained app.
-			"matchall": {Name: "matchall"},
+			// Named app with no protocol: unrepresentable by the dataplane.
+			"noproto": {Name: "noproto"},
 		},
 	}
 	cfg := cfgWith(sec, apps)
 
-	res := Match(cfg, Query{FromZone: "trust", ToZone: "untrust"}) // Protocol omitted
-	if !res.Matched || res.Action != config.PolicyPermit {
-		t.Fatalf("protocol-unconstrained app must still match an omitted protocol; res = %+v", res)
+	// Omitted query protocol: must not match.
+	res := Match(cfg, Query{FromZone: "trust", ToZone: "untrust"})
+	if res.Matched {
+		t.Fatalf("protocol-less named app matched an omitted query protocol; res = %+v", res)
+	}
+	if !res.DefaultUsed || res.Action != config.PolicyDeny {
+		t.Fatalf("want default-policy deny for a protocol-less named app, got %+v", res)
+	}
+
+	// Concrete query protocol: still must not match — the app is unrepresentable
+	// regardless of the query, mirroring the dataplane reject.
+	res = Match(cfg, Query{FromZone: "trust", ToZone: "untrust", Protocol: "tcp", DstPort: 80})
+	if res.Matched {
+		t.Fatalf("protocol-less named app matched a concrete query (dataplane rejects it); res = %+v", res)
+	}
+	if !res.DefaultUsed || res.Action != config.PolicyDeny {
+		t.Fatalf("want default-policy deny for a protocol-less named app, got %+v", res)
 	}
 }
 

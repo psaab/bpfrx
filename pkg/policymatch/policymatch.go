@@ -754,14 +754,28 @@ func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryP
 	if !ok {
 		return false
 	}
-	// Protocol: compare by IANA number so a named app protocol ("89"/"ospf")
-	// and a named/numeric query protocol agree (the old EqualFold string
-	// compare failed "89" vs "ospf").
-	if app.Protocol != "" {
-		appProto, appOK := appid.ProtocolNumber(app.Protocol)
-		if !appOK || !queryProtoOK || appProto != queryProto {
-			return false
-		}
+	// Protocol: a NAMED application MUST carry a resolvable protocol, and it must
+	// equal the query protocol. Compare by IANA number so a named app protocol
+	// ("89"/"ospf") and a named/numeric query protocol agree (the old EqualFold
+	// string compare failed "89" vs "ospf").
+	//
+	// #3323: a protocol-less named app is NOT match-any — it fails closed. The
+	// dataplane cannot represent such an app and never enforces it: the snapshot
+	// builder fails closed (deriveUserspaceCapabilities,
+	// pkg/dataplane/userspace/capabilities.go returns ok=false for proto=="" →
+	// the reserved __unsupported__ sentinel → whole-snapshot reject, #3261) and
+	// strict commit hard-rejects it (pkg/config/compiler_validate_strict.go:
+	// "cannot represent a protocol-less application"). A protocol-less named app
+	// can therefore only exist via a lenient/HA-loaded config, where the runtime
+	// STILL never enforces it; reporting it as a concrete match-any would
+	// over-report vs the runtime — the exact simulator divergence #3323 closes.
+	// appid.ProtocolNumber("") is (0,false), so an empty app.Protocol makes appOK
+	// false and the term fails closed. The literal `application any` token never
+	// reaches matchSingleApp (matchApp short-circuits a == "any"), so this does
+	// not affect the genuine match-any case.
+	appProto, appOK := appid.ProtocolNumber(app.Protocol)
+	if !appOK || !queryProtoOK || appProto != queryProto {
+		return false
 	}
 	// #3284: ICMP/ICMPv6 type[,code] constraint (junos-ping = type 8). Mirror
 	// policy.rs CompiledApplications.matches: a type-constrained term matches

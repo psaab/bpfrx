@@ -198,8 +198,14 @@ an OMITTED or unresolvable query protocol, #3323 — the runtime always carries 
 concrete protocol and keys its per-application terms under it, `by_protocol.get
 (&protocol)?`, so a protocol-bearing term can only match a packet of that
 protocol; an omitted query protocol resolves to `(0,false)` and matches no such
-term, falling through to the default-policy; a genuinely protocol-UNCONSTRAINED
-app and the literal `application any` term still match any protocol), honors both
+term, falling through to the default-policy. A NAMED application that carries NO
+protocol is NOT match-any either: the dataplane cannot represent it and never
+enforces it — the snapshot builder fails closed
+(`deriveUserspaceCapabilities`, `capabilities.go` returns `ok=false` for
+`proto==""` → the `__unsupported__` whole-snapshot reject, #3261) and strict
+commit hard-rejects it (`compiler_validate_strict.go`) — so reporting it as a
+concrete match would over-report vs the runtime; such an app fails closed in the
+simulator too. Only the literal `application any` token is match-any), honors both
 source-port and destination-port terms
 (a destination-port-constrained term fails closed on an OMITTED query
 destination port, #3330 — mirroring the runtime keying exact_dst_ports/range
