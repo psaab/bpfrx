@@ -3433,6 +3433,131 @@ func validateFilterRoutingInstanceConflictStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFilterDSCPStrict hard-rejects a firewall-filter term whose
+// `from dscp` / `from traffic-class` MATCH token or `then dscp` /
+// `then traffic-class` REWRITE token is neither a known DSCP code-point name nor
+// an integer in 0..63 — #3309.
+//
+// Before this gate the compiler appended the raw token to term.DSCPs /
+// term.DSCPRewrite with no validation, and the snapshot builder
+// (pkg/dataplane/userspace/filters.go) emitted only a known name or a numeric
+// 0..63 and SILENTLY DROPPED everything else. A dropped `from dscp` value left
+// the term with NO DSCP constraint — it then matched ALL DSCPs (a policy
+// widening: `from dscp not-a-code then accept` becomes an unconstrained accept;
+// `from dscp 64 then discard` drops broader traffic than intended). A dropped
+// `then dscp` rewrite silently did nothing. There was no commit-time DSCP /
+// traffic-class token validation — the same silent fail-open class as #3205's
+// icmp/port unresolved-token gate, but DSCP was uncovered.
+//
+// The valid name set is filterDSCPResolvable, which INLINE-mirrors
+// dataplane.DSCPValues (the snapshot builder's table) plus the numeric 0..63
+// range it accepts. pkg/config cannot import pkg/dataplane (import cycle:
+// pkg/dataplane imports pkg/config), so the name set is duplicated and pinned by
+// a drift-guard test (TestFilterDSCPResolvableMatchesDSCPValues) via the
+// exported FilterDSCPResolvable accessor — the same arrangement as
+// filterProtocolResolvable / appid.ProtocolNumber. Both `dscp` and
+// `traffic-class` (the IPv6 spelling) compile to the same fields and share the
+// same 0..63 / code-point-name range, so one check covers both.
+//
+// The walk is deterministic (filters sorted by name, terms in config order). On
+// the tolerant load / peer-sync path the caller downgrades the returned error to
+// a warning (#1960 no-brick); the snapshot builder drops the bad token
+// independently (a leniently-loaded match widens, a rewrite no-ops) — but the
+// operator never reaches that state through a commit. Mirrors
+// validateFilterMatchValuesStrict.
+func validateFilterDSCPStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil {
+					continue
+				}
+				for _, d := range term.DSCPs {
+					if d == "" || filterDSCPResolvable(d) {
+						continue
+					}
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: unknown `from` dscp/"+
+							"traffic-class value %q (use a code-point name such as "+
+							"be/ef/af11-af43/cs0-cs7 or a number 0-63) — an unresolved "+
+							"value is silently dropped, leaving the term matching ALL "+
+							"DSCPs",
+						family, name, term.Name, d)
+				}
+				if r := term.DSCPRewrite; r != "" && !filterDSCPResolvable(r) {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: unknown `then` dscp/"+
+							"traffic-class rewrite value %q (use a code-point name such "+
+							"as be/ef/af11-af43/cs0-cs7 or a number 0-63) — an unresolved "+
+							"value is silently dropped, so the rewrite never happens",
+						family, name, term.Name, r)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
+// filterDSCPNames INLINE-mirrors the KEY set of dataplane.DSCPValues
+// (pkg/dataplane/types.go) — the code-point names the snapshot builder
+// (pkg/dataplane/userspace/filters.go) resolves for a firewall-filter dscp /
+// traffic-class match or rewrite. pkg/config cannot import pkg/dataplane (import
+// cycle), so the names are duplicated here and pinned to the SSOT by the
+// drift-guard test TestFilterDSCPResolvableMatchesDSCPValues via the exported
+// FilterDSCPResolvable accessor. Keep in sync with dataplane.DSCPValues.
+var filterDSCPNames = map[string]bool{
+	"ef":   true,
+	"af11": true, "af12": true, "af13": true,
+	"af21": true, "af22": true, "af23": true,
+	"af31": true, "af32": true, "af33": true,
+	"af41": true, "af42": true, "af43": true,
+	"cs0": true, "cs1": true, "cs2": true, "cs3": true,
+	"cs4": true, "cs5": true, "cs6": true, "cs7": true,
+	"be": true,
+}
+
+// filterDSCPResolvable reports whether a firewall-filter dscp / traffic-class
+// token (match or rewrite) is representable: a known code-point name
+// (case-insensitive, mirroring filters.go's strings.ToLower lookup) or an
+// integer in 0..63 (the 6-bit DSCP field). It mirrors the snapshot builder's
+// emit condition branch-for-branch so commit and emission agree on what
+// resolves. Keep in sync with pkg/dataplane/userspace/filters.go.
+func filterDSCPResolvable(token string) bool {
+	if filterDSCPNames[strings.ToLower(token)] {
+		return true
+	}
+	if v, err := strconv.Atoi(token); err == nil && v >= 0 && v <= 63 {
+		return true
+	}
+	return false
+}
+
+// FilterDSCPResolvable exposes filterDSCPResolvable for the drift-guard test
+// TestFilterDSCPResolvableMatchesDSCPValues, which asserts this acceptance set
+// agrees with dataplane.DSCPValues + the snapshot builder's 0..63 numeric range
+// so the INLINE-duplicated table cannot drift from the SSOT silently. It is a
+// TEST seam, not a runtime coupling — production code uses the unexported
+// filterDSCPResolvable directly.
+func FilterDSCPResolvable(token string) bool {
+	return filterDSCPResolvable(token)
+}
+
 // filterProtocolResolvable reports whether a `from protocol <token>` is
 // representable: it INLINE-mirrors the acceptance set of
 // appid.ProtocolNumber's ok==true result (the #2124/#2175 SSOT). pkg/config

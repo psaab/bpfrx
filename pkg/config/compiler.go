@@ -414,6 +414,19 @@ type compileOpts struct {
 	// no-brick); the runtime routes-and-mislogs the term independently. Same
 	// doctrine as lenientFilterPortExcept.
 	lenientFilterRoutingInstanceConflict bool
+	// lenientFilterDSCP (#3309) downgrades the firewall-filter DSCP /
+	// traffic-class range gate (validateFilterDSCPStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a `from dscp` / `from traffic-class` match token or a
+	// `then dscp` / `then traffic-class` rewrite token that is neither a known
+	// code-point name nor an integer 0..63. Before this gate such a token was
+	// appended raw and SILENTLY DROPPED by the snapshot builder: a dropped match
+	// value left the term matching ALL DSCPs (a policy widening) and a dropped
+	// rewrite no-opped. The tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config still BOOTS (#1960
+	// no-brick); the snapshot builder drops the bad token independently. Same
+	// doctrine as lenientFilterMatchValues.
+	lenientFilterDSCP bool
 	// lenientNPTv6 (#2240) downgrades the NPTv6 (RFC 6296) validation gate
 	// (validateNPTv6Strict) from a hard compile error to a cfg.Warnings entry.
 	// The strict commit / commit-check path hard-rejects an NPTv6 static-NAT
@@ -1047,6 +1060,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFilterPortExcept:             true,
 		lenientFilterFromMatch:              true,
 		lenientFilterRoutingInstanceConflict: true,
+		lenientFilterDSCP:                    true,
 		lenientNPTv6:                        true,
 		lenientFirewallRefs:                 true,
 		lenientFlowServerTemplateRef:        true,
@@ -1180,6 +1194,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFilterPortExcept:             true,
 		lenientFilterFromMatch:              true,
 		lenientFilterRoutingInstanceConflict: true,
+		lenientFilterDSCP:                    true,
 		lenientNPTv6:                        true,
 		lenientFirewallRefs:                 true,
 		lenientFlowServerTemplateRef:        true,
@@ -2119,6 +2134,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFilterRoutingInstanceConflict {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("firewall filter routing-instance conflict (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3309 firewall-filter DSCP / traffic-class range gate. Strict on commit /
+	// commit-check (hard-reject a `from dscp`/`from traffic-class` match or a
+	// `then dscp`/`then traffic-class` rewrite token that is neither a known
+	// code-point name nor an integer 0..63). Before this gate such a token was
+	// appended raw and SILENTLY DROPPED by the snapshot builder
+	// (pkg/dataplane/userspace/filters.go) — a dropped match value left the term
+	// matching ALL DSCPs (a policy widening) and a dropped rewrite no-opped.
+	// Lenient on load / peer-sync (warn so an already-persisted or peer-synced
+	// config still boots — #1960 no-brick; the snapshot builder drops the bad
+	// token independently). Runs on the fully-compiled *Config so the typed term
+	// list (DSCPs + DSCPRewrite populated by compileFilterFrom/compileFilterThen)
+	// is available.
+	if err := validateFilterDSCPStrict(cfg); err != nil {
+		if opts.lenientFilterDSCP {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter dscp (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
