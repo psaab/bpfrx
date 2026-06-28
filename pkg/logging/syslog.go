@@ -578,6 +578,50 @@ func ParseCategory(name string) uint8 {
 	}
 }
 
+// ParseCategoryStrict is the fail-closed variant of ParseCategory (#3383).
+// "all" or "" returns (0, nil) — the explicit "no filter" sentinel — while an
+// unrecognized name returns a non-nil error instead of silently collapsing to
+// 0 (which the lenient ParseCategory does). Surfaces that must NOT fail open on
+// a typo (the SSE log/event stream, where a misspelled query would widen a live
+// feed to everything) use this instead of treating an unknown token as "all".
+func ParseCategoryStrict(name string) (uint8, error) {
+	switch name {
+	case "all", "":
+		return 0, nil
+	case "session":
+		return CategorySession, nil
+	case "policy":
+		return CategoryPolicy, nil
+	case "screen":
+		return CategoryScreen, nil
+	case "firewall":
+		return CategoryFirewall, nil
+	default:
+		return 0, fmt.Errorf("unknown log category %q (want session, policy, screen, firewall, or all)", name)
+	}
+}
+
+// ParseSeverityStrict is the fail-closed variant of ParseSeverity (#3383).
+// An empty string returns (0, nil) — "no filter". An unrecognized name returns
+// a non-nil error rather than 0, so a typo'd severity cannot silently disable
+// filtering on the SSE log stream.
+func ParseSeverityStrict(name string) (int, error) {
+	switch name {
+	case "":
+		return 0, nil
+	case "error":
+		return SyslogError, nil
+	case "warning":
+		return SyslogWarning, nil
+	case "notice":
+		return SyslogNotice, nil
+	case "info":
+		return SyslogInfo, nil
+	default:
+		return 0, fmt.Errorf("unknown severity %q (want error, warning, notice, info)", name)
+	}
+}
+
 // ParseSeverity converts a severity name to its numeric value.
 // Returns 0 (no filter) for unrecognized names.
 func ParseSeverity(name string) int {

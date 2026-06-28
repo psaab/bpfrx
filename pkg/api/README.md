@@ -44,7 +44,14 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     validation is unambiguous on the canonical metrics surface.
 - `GET /api/v1/events/stream` — Server-Sent Events stream of dataplane
   events. Backed by the `pkg/logging` event ring buffer; long-lived
-  consumers must drain.
+  consumers must drain. `?category=` (and `?severity=` on
+  `/api/v1/logs/stream`) is fail-closed (#3383): an unrecognized token is
+  rejected with `400` BEFORE the connection switches to event-stream, so a
+  typo cannot silently widen the live feed to everything. A `SCREEN_DROP`
+  with `action=permit` (the scan-table-pressure alarm — the packet still
+  forwards) is classified `notice`, not `error`, mirroring the canonical
+  `logging.eventSeverity`; an unknown event type fails closed under a
+  narrow category mask.
 
 ## Callers
 

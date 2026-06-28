@@ -284,9 +284,20 @@ func TestParseCategories(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := parseCategories(tt.input)
+		got, err := parseCategories(tt.input)
+		if err != nil {
+			t.Errorf("parseCategories(%q) unexpected error: %v", tt.input, err)
+			continue
+		}
 		if got != tt.want {
 			t.Errorf("parseCategories(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+
+	// #3383: a typo must be rejected (fail-closed), not collapse to 0.
+	for _, bad := range []string{"polciy", "sesion", "session,polciy", "bogus"} {
+		if _, err := parseCategories(bad); err == nil {
+			t.Errorf("parseCategories(%q) = nil error, want rejection", bad)
 		}
 	}
 }
@@ -303,7 +314,7 @@ func TestMatchCategory(t *testing.T) {
 		{"POLICY_DENY", logging.CategoryPolicy, true},
 		{"SCREEN_DROP", logging.CategoryScreen, true},
 		{"FILTER_LOG", logging.CategoryFirewall, true},
-		{"UNKNOWN_TYPE", logging.CategorySession, true}, // unknown passes
+		{"UNKNOWN_TYPE", logging.CategorySession, false}, // #3383: unknown fails closed under a narrow mask
 	}
 
 	for _, tt := range tests {
