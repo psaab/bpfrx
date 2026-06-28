@@ -115,6 +115,37 @@ func TestScreenSupportedLeavesCommit(t *testing.T) {
 	}
 }
 
+// TestScreenIcmpFragmentNotRejected guards the #3316 (`icmp fragment`) /
+// #3318 (unknown-leaf gate) interaction across the merge ordering: with #3316's
+// `case "fragment"` arm present in compileScreen's icmp switch, `icmp fragment`
+// is a HANDLED leaf — it sets ScreenProfile.ICMP.Fragment and is NOT recorded on
+// UnknownLeaves, so validateScreenUnknownStrict must NOT reject it.
+//
+// FAIL-ON-REVERT: drop #3316's `case "fragment"` arm and the leaf falls through
+// to compileScreen's `default:` → UnknownLeaves → validateScreenUnknownStrict
+// rejects it, turning this test RED. This is exactly the merge-ordering hazard
+// the #3316/#3318 rebase had to resolve (keep BOTH the fragment case and the
+// default arm).
+func TestScreenIcmpFragmentNotRejected(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set security screen ids-option frag-screen icmp fragment",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("strict commit rejected `icmp fragment` (a supported #3316 leaf): %v", err)
+	}
+	profile := cfg.Security.Screen["frag-screen"]
+	if profile == nil {
+		t.Fatalf("screen profile frag-screen missing from compiled config")
+	}
+	if !profile.ICMP.Fragment {
+		t.Fatalf("`icmp fragment` did not set ICMP.Fragment; it was dropped or misrouted")
+	}
+	if len(profile.UnknownLeaves) != 0 {
+		t.Fatalf("`icmp fragment` was recorded as an unknown leaf %v; the #3316 case arm is missing or below the default", profile.UnknownLeaves)
+	}
+}
+
 // TestScreenUnknownLenientDowngradesToWarning asserts the tolerant load /
 // peer-sync path downgrades the unknown-leaf error to a warning so an
 // already-persisted or peer-synced config carrying an unsupported leaf still

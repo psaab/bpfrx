@@ -22707,3 +22707,17 @@ top.
   routes `icmp fragment` to ICMPScreen.Fragment; unknown-screen-leaf rejection
   is the separate #3318. Comment-only, no behavior change.
 - **File(s)**: pkg/config/schema_security.go
+
+- **Timestamp**: 2026-06-27
+- **Action**: #3317/#3318 fold — rebased fix/3317-3318-screen-strict onto
+  origin/master (merged #3316 icmp fragment, 726fbd5ee). compileScreen icmp
+  switch conflict resolved additively: kept BOTH #3316 `case "fragment"` and
+  #3318 `default:` arm (fragment above default, so the handled leaf never
+  reaches UnknownLeaves). Added `fragment` to the validateScreenUnknownStrict
+  supported-icmp doc + error hint. Softened the doc's "every accepted leaf maps
+  to a field the engine enforces" claim: syn-flood alarm/source/destination-
+  threshold/timeout are accepted-but-not-yet-published (cross-ref #3315; SMR
+  nuance). New regression TestScreenIcmpFragmentNotRejected guards the
+  interaction (RED if #3316's case arm is dropped).
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/screen_unknown_strict_3318_test.go, _Log.md

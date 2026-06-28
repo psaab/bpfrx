@@ -2470,12 +2470,19 @@ func validateScreenNumericStrict(cfg *Config) error {
 // warning. SRX fails commit on an unknown screen option.
 //
 // The supported set is EXACTLY the compileScreen switch cases: icmp
-// {ping-death, flood}; ip {source-route-option, tear-drop, ip-sweep
+// {ping-death, fragment, flood}; ip {source-route-option, tear-drop, ip-sweep
 // {threshold}}; tcp {land, winnuke, syn-frag, syn-fin, no-flag, fin-no-ack,
 // syn-flood {alarm/attack/source/destination-threshold, timeout}, port-scan
 // {threshold}}; udp {flood}; limit-session {source-ip-based,
-// destination-ip-based}. Every one maps to a field the userspace screen engine
-// (userspace-dp/src/screen) enforces. compileScreen's default arms record every
+// destination-ip-based}. These are the leaves compileScreen ACCEPTS (records a
+// typed field for) — most also map to a field the userspace screen engine
+// (userspace-dp/src/screen) enforces, but a few are accepted-but-not-yet-
+// published to the snapshot: the syn-flood alarm-threshold / source-threshold /
+// destination-threshold / timeout subfields are compiled into SynFloodConfig and
+// not currently emitted to the dataplane (tracked in #3315). This gate's
+// contract is "rejects what compileScreen does NOT model", not "guarantees every
+// accepted leaf is enforced" — closing the publish gap is #3315's scope.
+// compileScreen's default arms record every
 // other leaf — at the top-level family, per-family, and per-subtree depth — on
 // ScreenProfile.UnknownLeaves (the full `<family> <leaf>` path); this gate makes
 // the refusal operator-visible at commit. No NEW screening is implemented — the
@@ -2500,7 +2507,7 @@ func validateScreenUnknownStrict(cfg *Config) error {
 				"option (the dataplane does not enforce it, so it would be "+
 				"silently dropped and the protection the operator believes is "+
 				"enabled would be absent); remove it or use a supported option "+
-				"such as icmp ping-death/flood, ip source-route-option/tear-drop/"+
+				"such as icmp ping-death/fragment/flood, ip source-route-option/tear-drop/"+
 				"ip-sweep, tcp land/winnuke/syn-frag/syn-fin/no-flag/fin-no-ack/"+
 				"syn-flood/port-scan, udp flood, or limit-session",
 			name, profile.UnknownLeaves[0])
