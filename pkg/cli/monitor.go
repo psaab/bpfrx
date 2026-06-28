@@ -350,6 +350,14 @@ func (c *CLI) handleMonitorSecurityFlowFilter(args []string) error {
 
 // handleMonitorSecurityFlowStart starts flow tracing.
 func (c *CLI) handleMonitorSecurityFlowStart() error {
+	// Guard a nil event buffer (#3381). A CLI constructed daemonless /
+	// remote (eventBuf == nil) must not panic in Subscribe below; mirror
+	// the graceful diagnostic that showSecurityLog and the gRPC/SSE
+	// surfaces already return.
+	if c.eventBuf == nil {
+		fmt.Println("error: event buffer not initialized")
+		return nil
+	}
 	if c.monitorFlow == nil {
 		c.monitorFlow = newMonitorFlowState()
 	}
@@ -524,6 +532,13 @@ func (c *CLI) showMonitorSecurityFlow() error {
 
 // handleMonitorSecurityPacketDrop streams packet drop events to stdout.
 func (c *CLI) handleMonitorSecurityPacketDrop(args []string) error {
+	// Guard a nil event buffer (#3381) before Subscribe, mirroring
+	// showSecurityLog and the gRPC/SSE surfaces.
+	if c.eventBuf == nil {
+		fmt.Println("error: event buffer not initialized")
+		return nil
+	}
+
 	// Parse optional filters.
 	var (
 		srcIP    *net.IPNet
