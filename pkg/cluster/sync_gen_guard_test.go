@@ -321,6 +321,93 @@ func TestSessionWireRoundTripGenerationV6(t *testing.T) {
 	}
 }
 
+// #3301: the per-application idle timeout (AppTimeout, seconds) and the #3073
+// per-rule hit-counter handle (PolicyCounterIdx) must round-trip on the
+// cluster session-sync wire as length-gated trailing fields, AND a legacy
+// payload truncated before the #3301 block must still decode (fields at 0,
+// rolling-upgrade safe). Reverting the sync_protocol.go encode/decode drops
+// the values and this fails RED.
+func TestSessionWireRoundTripPolicyFields3301V4(t *testing.T) {
+	key := gen2170KeyV4()
+	val := dataplane.SessionValue{
+		State:            dataplane.SessStateEstablished,
+		IngressZone:      1,
+		EgressZone:       2,
+		PolicyID:         42,
+		Generation:       0xDEADBEEFCAFE,
+		AppTimeout:       30,
+		PolicyCounterIdx: 7,
+	}
+	payload := encodeSessionV4Payload(key, val)
+	_, dVal, ok := decodeSessionV4Payload(payload)
+	if !ok {
+		t.Fatal("decode failed")
+	}
+	if dVal.PolicyID != 42 {
+		t.Fatalf("PolicyID round-trip = %d, want 42", dVal.PolicyID)
+	}
+	if dVal.AppTimeout != 30 {
+		t.Fatalf("AppTimeout round-trip = %d, want 30", dVal.AppTimeout)
+	}
+	if dVal.PolicyCounterIdx != 7 {
+		t.Fatalf("PolicyCounterIdx round-trip = %d, want 7", dVal.PolicyCounterIdx)
+	}
+	if dVal.Generation != val.Generation {
+		t.Fatalf("Generation round-trip = %#x, want %#x", dVal.Generation, val.Generation)
+	}
+
+	// Mixed-version: truncate the trailing 8-byte #3301 block (an old peer
+	// stops after Generation). Decode must still succeed with the new fields
+	// at 0 and Generation preserved.
+	legacy := payload[:len(payload)-8]
+	_, lVal, ok := decodeSessionV4Payload(legacy)
+	if !ok {
+		t.Fatal("legacy (truncated) decode failed")
+	}
+	if lVal.AppTimeout != 0 || lVal.PolicyCounterIdx != 0 {
+		t.Fatalf("legacy frame: appto=%d counter=%d, want 0/0", lVal.AppTimeout, lVal.PolicyCounterIdx)
+	}
+	if lVal.Generation != val.Generation {
+		t.Fatalf("legacy Generation = %#x, want %#x preserved", lVal.Generation, val.Generation)
+	}
+}
+
+func TestSessionWireRoundTripPolicyFields3301V6(t *testing.T) {
+	key := gen2170KeyV6()
+	val := dataplane.SessionValueV6{
+		State:            dataplane.SessStateEstablished,
+		IngressZone:      1,
+		EgressZone:       2,
+		PolicyID:         99,
+		Generation:       0x0102030405060708,
+		AppTimeout:       45,
+		PolicyCounterIdx: 11,
+	}
+	payload := encodeSessionV6Payload(key, val)
+	_, dVal, ok := decodeSessionV6Payload(payload)
+	if !ok {
+		t.Fatal("decode failed")
+	}
+	if dVal.AppTimeout != 45 {
+		t.Fatalf("AppTimeout round-trip = %d, want 45", dVal.AppTimeout)
+	}
+	if dVal.PolicyCounterIdx != 11 {
+		t.Fatalf("PolicyCounterIdx round-trip = %d, want 11", dVal.PolicyCounterIdx)
+	}
+	if dVal.Generation != val.Generation {
+		t.Fatalf("Generation round-trip = %#x, want %#x", dVal.Generation, val.Generation)
+	}
+
+	legacy := payload[:len(payload)-8]
+	_, lVal, ok := decodeSessionV6Payload(legacy)
+	if !ok {
+		t.Fatal("legacy (truncated) decode failed")
+	}
+	if lVal.AppTimeout != 0 || lVal.PolicyCounterIdx != 0 {
+		t.Fatalf("legacy frame: appto=%d counter=%d, want 0/0", lVal.AppTimeout, lVal.PolicyCounterIdx)
+	}
+}
+
 // TestDeleteWireRoundTripGeneration verifies the delete message carries the
 // generation as a length-gated trailing uint64 (24/48-byte payload).
 func TestDeleteWireRoundTripGeneration(t *testing.T) {
@@ -353,14 +440,20 @@ func TestCrossVersionShortPayloadDecode(t *testing.T) {
 	key := gen2170KeyV4()
 	val := dataplane.SessionValue{State: dataplane.SessStateEstablished, IngressZone: 1, EgressZone: 2, Generation: 42}
 	full := encodeSessionV4Payload(key, val)
-	// Simulate an OLD encoder: drop the trailing 8-byte generation.
-	short := full[:len(full)-8]
+	// Simulate a pre-#2170 OLD encoder: drop the trailing 16 bytes (the
+	// #2170 generation u64 + the #3301 AppTimeout/PolicyCounterIdx block) so
+	// the payload ends at FibGen.
+	short := full[:len(full)-16]
 	_, dVal, ok := decodeSessionV4Payload(short)
 	if !ok {
 		t.Fatal("short (legacy) payload should still decode")
 	}
 	if dVal.Generation != 0 {
 		t.Fatalf("legacy short payload should decode to Generation 0, got %d", dVal.Generation)
+	}
+	if dVal.AppTimeout != 0 || dVal.PolicyCounterIdx != 0 {
+		t.Fatalf("legacy short payload should decode AppTimeout/PolicyCounterIdx 0, got %d/%d",
+			dVal.AppTimeout, dVal.PolicyCounterIdx)
 	}
 
 	// An OLD delete decoder (16-byte payload) must tolerate the longer 24-byte

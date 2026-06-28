@@ -903,6 +903,51 @@ func TestBuildSessionSyncRequestCarriesLogFlags(t *testing.T) {
 	}
 }
 
+// #3301: buildSessionSyncRequest must copy the admitting policy's firewall
+// metadata (PolicyID, PolicyCounterIdx, AppTimeout->InactivityTimeout) from the
+// SessionValue onto the wire so a peer-PROMOTED session is correctly
+// attributed/counted/aged after failover. Reverting the manager_ha.go
+// population fails this RED. A JSON round-trip pins the wire keys against the
+// Rust SessionSyncRequest serde tags.
+func TestBuildSessionSyncRequestCarriesPolicyFields3301(t *testing.T) {
+	m := &Manager{bpfShim: dataplane.New()}
+	keyV4 := dataplane.SessionKey{
+		SrcIP: [4]byte{10, 0, 61, 102}, DstIP: [4]byte{172, 16, 80, 200},
+		SrcPort: hostToNetwork16(40000), DstPort: hostToNetwork16(5201), Protocol: 6,
+	}
+	valV4 := &dataplane.SessionValue{
+		IngressZone: 1, EgressZone: 2,
+		PolicyID: 42, PolicyCounterIdx: 7, AppTimeout: 30,
+	}
+	reqV4 := m.buildSessionSyncRequestV4("upsert", keyV4, valV4)
+	if reqV4.PolicyID != 42 || reqV4.PolicyCounterIdx != 7 || reqV4.InactivityTimeout != 30 {
+		t.Fatalf("v4: policy=%d counter=%d inact=%d, want 42/7/30",
+			reqV4.PolicyID, reqV4.PolicyCounterIdx, reqV4.InactivityTimeout)
+	}
+
+	// JSON wire keys must match the Rust SessionSyncRequest serde(rename).
+	js, err := json.Marshal(reqV4)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, want := range []string{`"policy_id":42`, `"policy_counter_idx":7`, `"inactivity_timeout":30`} {
+		if !strings.Contains(string(js), want) {
+			t.Fatalf("wire JSON missing %s: %s", want, js)
+		}
+	}
+
+	keyV6 := dataplane.SessionKeyV6{Protocol: 6}
+	valV6 := &dataplane.SessionValueV6{
+		IngressZone: 1, EgressZone: 2,
+		PolicyID: 99, PolicyCounterIdx: 11, AppTimeout: 45,
+	}
+	reqV6 := m.buildSessionSyncRequestV6("upsert", keyV6, valV6)
+	if reqV6.PolicyID != 99 || reqV6.PolicyCounterIdx != 11 || reqV6.InactivityTimeout != 45 {
+		t.Fatalf("v6: policy=%d counter=%d inact=%d, want 99/11/45",
+			reqV6.PolicyID, reqV6.PolicyCounterIdx, reqV6.InactivityTimeout)
+	}
+}
+
 func TestBuildSessionSyncRequestV4PreservesBothNatLegs(t *testing.T) {
 	m := &Manager{bpfShim: dataplane.New()}
 	key := dataplane.SessionKey{

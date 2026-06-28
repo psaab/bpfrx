@@ -47,11 +47,14 @@ pub(crate) struct SessionMetadata {
     /// which the Go side renders as the FIRST configured policy (policyID 0) — a
     /// wrong attribution. `0` remains the legitimate value for non-policy-
     /// forwarded sessions (firewall-local / neighbor-seed / fabric / tunnel).
-    /// In-process only: `SessionMetadata` carries no serde, so this rides the
-    /// shared-session map and sibling-worker replicas automatically but does NOT
-    /// cross the cross-node HA `SessionDeltaInfo` wire (a deliberate follow-up —
-    /// the close-event/rows on a peer-PROMOTED session still resolve `0` until
-    /// the sync delta carries it; #1961 both-sides wire discipline).
+    /// `SessionMetadata` carries no serde, so this rides the shared-session map
+    /// and sibling-worker replicas automatically. #3301 also carries it across
+    /// the cross-node HA session-sync wire (the SESSION_OPEN delta's trailing
+    /// policy_id u32 + `SessionSyncRequest.policy_id`), so a peer-PROMOTED
+    /// session resolves the admitting policy on its rows/close records after
+    /// failover instead of `0`. An old peer omits the additive field
+    /// (`serde(default)` 0), bit-identical to pre-#3301 (#1961 both-sides
+    /// discipline; rolling-upgrade safe).
     pub(crate) policy_id: u32,
     /// #3227: the admitting application term's per-application inactivity (idle)
     /// timeout in NANOSECONDS, stamped at install from the matched policy's
@@ -63,11 +66,14 @@ pub(crate) struct SessionMetadata {
     /// session out on the app's value instead of the global timeout (closing the
     /// legacy-eBPF `appTimeout` parity regression). It does NOT override the
     /// short TCP closing/RST reap windows, matching Junos (inactivity-timeout is
-    /// the idle timeout of an established session). In-process only: like
-    /// `policy_id`, this rides the shared-session map and worker replicas but
-    /// does NOT cross the cross-node HA `SessionDeltaInfo` wire yet, so a
-    /// peer-promoted session ages on the global timeout until a real-traffic
-    /// refresh re-stamps it (a deliberate follow-up).
+    /// the idle timeout of an established session). Like `policy_id`, this rides
+    /// the shared-session map and worker replicas; #3301 also carries it across
+    /// the cross-node HA session-sync wire (the SESSION_OPEN delta + the
+    /// `SessionSyncRequest.inactivity_timeout` SECONDS field, re-applied here via
+    /// `app_inactivity_timeout_ns`), so a peer-promoted short-timeout session
+    /// ages out on the app's value after failover without a real-traffic
+    /// refresh. An old peer omits the field (0 → `None` → global timeout),
+    /// rolling-upgrade safe.
     pub(crate) inactivity_timeout_ns: Option<u64>,
     /// #3073: a stable 1-based handle to the admitting policy rule's per-rule
     /// hit counter (`PolicyState::rules[idx-1].hit_counter`, resolved via
@@ -81,12 +87,15 @@ pub(crate) struct SessionMetadata {
     /// the implicit default-policy and every non-policy-forwarded session
     /// (firewall-local / neighbor-seed / fabric / tunnel), which the fast path
     /// then leaves uncounted. The cold path still counts the first packet once
-    /// in `try_match_rule`, so each packet is counted exactly once. In-process
-    /// only: like `policy_id` (#3056), this rides the shared-session map and
-    /// sibling-worker replicas but does NOT cross the cross-node HA
-    /// `SessionDeltaInfo` wire — a peer-promoted session counts nothing on the
-    /// promoting node's policy counter until a local re-evaluation re-stamps a
-    /// handle (a deliberate follow-up, mirroring the #3056 wire note).
+    /// in `try_match_rule`, so each packet is counted exactly once. Like
+    /// `policy_id` (#3056), this rides the shared-session map and sibling-worker
+    /// replicas; #3301 also carries it across the cross-node HA session-sync
+    /// wire (the SESSION_OPEN delta + `SessionSyncRequest.policy_counter_idx`).
+    /// HA requires identical config on both nodes, so the same idx resolves the
+    /// same rule on the peer; a peer-promoted session therefore increments the
+    /// correct policy counter on every forwarded packet after failover. An old
+    /// peer omits the field (`serde(default)` 0 → no per-rule counter),
+    /// rolling-upgrade safe.
     pub(crate) policy_counter_idx: u32,
 }
 

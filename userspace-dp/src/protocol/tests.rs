@@ -2223,3 +2223,48 @@ fn session_sync_request_log_flags_roundtrip_2785() {
         "missing log flags must default to false"
     );
 }
+
+// #3301: the admitting policy's firewall metadata (policy_id,
+// policy_counter_idx, inactivity_timeout seconds) must round-trip on the
+// session-sync wire, and a legacy payload that omits them must decode to 0
+// (serde default) so an old peer falls back to unattributed / no counter /
+// global timeout (pre-#3301 behavior, rolling-upgrade safe).
+#[test]
+fn session_sync_request_policy_fields_roundtrip_3301() {
+    let req = SessionSyncRequest {
+        operation: "upsert".to_string(),
+        policy_id: 42,
+        policy_counter_idx: 7,
+        inactivity_timeout: 30,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&req).expect("serialize SessionSyncRequest");
+    // Wire keys must match the Go SessionSyncRequest json tags exactly.
+    assert!(json.contains("\"policy_id\":42"), "policy_id wire key/value");
+    assert!(
+        json.contains("\"policy_counter_idx\":7"),
+        "policy_counter_idx wire key/value"
+    );
+    assert!(
+        json.contains("\"inactivity_timeout\":30"),
+        "inactivity_timeout wire key/value"
+    );
+    let back: SessionSyncRequest =
+        serde_json::from_str(&json).expect("deserialize SessionSyncRequest");
+    assert_eq!(back.policy_id, 42, "policy_id must round-trip");
+    assert_eq!(back.policy_counter_idx, 7, "policy_counter_idx must round-trip");
+    assert_eq!(back.inactivity_timeout, 30, "inactivity_timeout must round-trip");
+
+    let legacy: SessionSyncRequest =
+        serde_json::from_str(r#"{"operation":"upsert","src_ip":"10.0.0.1"}"#)
+            .expect("legacy SessionSyncRequest without policy fields decodes");
+    assert_eq!(legacy.policy_id, 0, "missing policy_id defaults to 0");
+    assert_eq!(
+        legacy.policy_counter_idx, 0,
+        "missing policy_counter_idx defaults to 0"
+    );
+    assert_eq!(
+        legacy.inactivity_timeout, 0,
+        "missing inactivity_timeout defaults to 0"
+    );
+}

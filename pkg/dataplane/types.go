@@ -71,6 +71,16 @@ type SessionValue struct {
 	// would over-size value_size by 8 bytes and OOB-write the Rust helper's
 	// lookup buffer (#2360). Do NOT mirror Generation into the BPF map.
 	Generation uint64
+
+	// PolicyCounterIdx is the #3073 1-based handle to the admitting rule's
+	// per-rule hit counter, carried across the HA session-sync wire (#3301)
+	// so a peer-promoted session increments the correct policy counter after
+	// failover. Like Generation, it is userspace-sync-only HA metadata: it is
+	// NOT part of the BPF/C conntrack ABI (bpfSessionValue), so it MUST NOT
+	// be added to bpfSessionValue. A value of 0 means "no per-rule counter"
+	// (default policy / non-policy-forwarded), the rolling-upgrade-safe
+	// default for an old peer that omits it.
+	PolicyCounterIdx uint32
 }
 
 // SessionKeyV6 mirrors the C struct session_key_v6 (5-tuple with 128-bit IPs).
@@ -126,6 +136,11 @@ type SessionValueV6 struct {
 	// Generation: see SessionValue.Generation. Userspace-sync-only HA
 	// deferred-delete guard metadata (#2170), not in the BPF C struct.
 	Generation uint64
+
+	// PolicyCounterIdx: see SessionValue.PolicyCounterIdx. Userspace-sync-only
+	// #3073 per-rule hit-counter handle carried on the HA wire (#3301); NOT in
+	// the BPF/C conntrack ABI (bpfSessionValueV6).
+	PolicyCounterIdx uint32
 }
 
 // ZoneConfig mirrors the C struct zone_config.

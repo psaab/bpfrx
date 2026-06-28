@@ -44,17 +44,26 @@ func TestBPFSessionValueMatchesConntrackABI(t *testing.T) {
 // extra bytes are the trailing Generation field — the #2170 sync-only guard
 // that must NOT be registered into the BPF map (#2360).
 func TestSessionValueCarriesSyncOnlyGeneration(t *testing.T) {
-	deltaV4 := unsafe.Sizeof(SessionValue{}) - unsafe.Sizeof(bpfSessionValue{})
-	if deltaV4 != unsafe.Sizeof(uint64(0)) {
-		t.Fatalf("SessionValue is %d bytes larger than bpfSessionValue, want exactly %d (one uint64 Generation)",
-			deltaV4, unsafe.Sizeof(uint64(0)))
+	// The sync-only fields (#2170 Generation, #3301 PolicyCounterIdx) sit
+	// strictly past the on-map conntrack ABI layout (bpfSessionValue). The
+	// hard invariant guarding #2360 is that bpfSessionValue equals the on-map
+	// ABI size — it must NOT pick up the sync-only fields — and that those
+	// fields begin immediately past it. (The exact byte delta now includes
+	// Generation(u64)+PolicyCounterIdx(u32)+alignment padding, so we assert
+	// the field offsets, not a fixed delta.)
+	if got := unsafe.Sizeof(bpfSessionValue{}); uintptr(conntrackValueSizeV4) != got {
+		t.Fatalf("bpfSessionValue size = %d, want %d (on-map conntrack ABI)", got, conntrackValueSizeV4)
 	}
-	deltaV6 := unsafe.Sizeof(SessionValueV6{}) - unsafe.Sizeof(bpfSessionValueV6{})
-	if deltaV6 != unsafe.Sizeof(uint64(0)) {
-		t.Fatalf("SessionValueV6 is %d bytes larger than bpfSessionValueV6, want exactly %d (one uint64 Generation)",
-			deltaV6, unsafe.Sizeof(uint64(0)))
+	if got := unsafe.Sizeof(bpfSessionValueV6{}); uintptr(conntrackValueSizeV6) != got {
+		t.Fatalf("bpfSessionValueV6 size = %d, want %d (on-map conntrack ABI)", got, conntrackValueSizeV6)
 	}
-	// Generation must be the trailing field: its offset equals the on-map size.
+	if unsafe.Sizeof(SessionValue{}) <= unsafe.Sizeof(bpfSessionValue{}) {
+		t.Fatal("SessionValue must be larger than bpfSessionValue (carries sync-only fields)")
+	}
+	if unsafe.Sizeof(SessionValueV6{}) <= unsafe.Sizeof(bpfSessionValueV6{}) {
+		t.Fatal("SessionValueV6 must be larger than bpfSessionValueV6 (carries sync-only fields)")
+	}
+	// Generation must be the first field past the on-map layout.
 	if off := unsafe.Offsetof(SessionValue{}.Generation); off != conntrackValueSizeV4 {
 		t.Fatalf("SessionValue.Generation offset = %d, want %d (must sit immediately past the on-map layout)",
 			off, conntrackValueSizeV4)
@@ -62,6 +71,16 @@ func TestSessionValueCarriesSyncOnlyGeneration(t *testing.T) {
 	if off := unsafe.Offsetof(SessionValueV6{}.Generation); off != conntrackValueSizeV6 {
 		t.Fatalf("SessionValueV6.Generation offset = %d, want %d (must sit immediately past the on-map layout)",
 			off, conntrackValueSizeV6)
+	}
+	// #3301: PolicyCounterIdx follows Generation (also sync-only, never on the
+	// BPF map).
+	if off := unsafe.Offsetof(SessionValue{}.PolicyCounterIdx); off != conntrackValueSizeV4+unsafe.Sizeof(uint64(0)) {
+		t.Fatalf("SessionValue.PolicyCounterIdx offset = %d, want %d (immediately past Generation)",
+			off, conntrackValueSizeV4+unsafe.Sizeof(uint64(0)))
+	}
+	if off := unsafe.Offsetof(SessionValueV6{}.PolicyCounterIdx); off != conntrackValueSizeV6+unsafe.Sizeof(uint64(0)) {
+		t.Fatalf("SessionValueV6.PolicyCounterIdx offset = %d, want %d (immediately past Generation)",
+			off, conntrackValueSizeV6+unsafe.Sizeof(uint64(0)))
 	}
 }
 
@@ -135,14 +154,16 @@ func TestSessionValueBPFRoundTripDropsGeneration(t *testing.T) {
 		FibVlanID:   50,
 		FibDmac:     [6]byte{1, 2, 3, 4, 5, 6},
 		FibSmac:     [6]byte{6, 5, 4, 3, 2, 1},
-		FibGen:      99,
-		Generation:  0x1122334455667788, // sync-only — must NOT survive to the map
+		FibGen:           99,
+		Generation:       0x1122334455667788, // sync-only — must NOT survive to the map
+		PolicyCounterIdx: 7,                  // #3301 sync-only — must NOT survive to the map
 	}
 
 	got := orig.toBPF().sessionValue()
 
 	want := orig
-	want.Generation = 0 // dropped at the map boundary
+	want.Generation = 0       // dropped at the map boundary
+	want.PolicyCounterIdx = 0 // #3301 sync-only — dropped at the map boundary
 	if got != want {
 		t.Fatalf("v4 round trip mismatch:\n got=%+v\nwant=%+v", got, want)
 	}
@@ -176,13 +197,15 @@ func TestSessionValueBPFRoundTripDropsGeneration(t *testing.T) {
 		FibVlanID:   80,
 		FibDmac:     [6]byte{9, 8, 7, 6, 5, 4},
 		FibSmac:     [6]byte{4, 5, 6, 7, 8, 9},
-		FibGen:      77,
-		Generation:  0x8877665544332211,
+		FibGen:           77,
+		Generation:       0x8877665544332211,
+		PolicyCounterIdx: 11, // #3301 sync-only — must NOT survive to the map
 	}
 
 	gotV6 := origV6.toBPF().sessionValue()
 	wantV6 := origV6
 	wantV6.Generation = 0
+	wantV6.PolicyCounterIdx = 0
 	if gotV6 != wantV6 {
 		t.Fatalf("v6 round trip mismatch:\n got=%+v\nwant=%+v", gotV6, wantV6)
 	}

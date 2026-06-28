@@ -939,6 +939,36 @@ pub(crate) struct SessionSyncRequest {
     /// which falls back to unconditional behavior (rolling-upgrade safe).
     #[serde(default)]
     pub generation: u64,
+    /// #3301: the admitting policy's ID (#3056 namespace), carried so a
+    /// peer-PROMOTED session resolves the admitting policy on its live-session
+    /// rows / RT_FLOW records instead of the `0` sentinel (which the Go side
+    /// renders as the FIRST configured policy — a wrong attribution). The local
+    /// helper stamps this in-process at install; this field carries it across
+    /// the cross-node HA wire (#1961 both-sides discipline). `serde(default)`
+    /// => 0 on an old peer that omits the field, which is the legitimate
+    /// "unattributed / non-policy-forwarded" value, bit-identical to the
+    /// pre-#3301 synced-session behavior (rolling-upgrade safe).
+    #[serde(rename = "policy_id", default)]
+    pub policy_id: u32,
+    /// #3301: a 1-based handle to the admitting rule's per-rule hit counter
+    /// (#3073 `PolicyState::hit_counter_by_idx`). Carried so a peer-promoted
+    /// session increments the correct policy hit counter on EVERY forwarded
+    /// packet after failover (the established fast path uses this idx) instead
+    /// of leaving the rule uncounted until a local re-evaluation re-stamps it.
+    /// HA requires identical config on both nodes, so the same policy snapshot
+    /// resolves the same idx on the peer. `serde(default)` => 0 ("no per-rule
+    /// counter") on an old peer, the pre-#3301 behavior (rolling-upgrade safe).
+    #[serde(rename = "policy_counter_idx", default)]
+    pub policy_counter_idx: u32,
+    /// #3301: the admitting application term's per-application inactivity (idle)
+    /// timeout in SECONDS (#3227). Carried so a peer-promoted short-timeout
+    /// session ages out on the app's value rather than the global per-protocol
+    /// timeout until a real-traffic refresh re-stamps it. The receiver converts
+    /// seconds -> ns via `app_inactivity_timeout_ns`. `serde(default)` => 0 on
+    /// an old peer, which maps to `None` (use the global timeout — pre-#3301
+    /// behavior, rolling-upgrade safe).
+    #[serde(rename = "inactivity_timeout", default)]
+    pub inactivity_timeout: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
