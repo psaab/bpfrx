@@ -107,6 +107,12 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 	"screen": {desc: "Screen options", children: map[string]*schemaNode{
 		"ids-option": {desc: "Screen profile name", args: 1, valueHint: ValueHintScreenProfile, placeholder: "<screen-name>", children: map[string]*schemaNode{
 			"icmp": {desc: "ICMP screening", children: map[string]*schemaNode{
+				// #3316: exposes `fragment` for tab-completion and routes
+				// `icmp fragment` to ICMPScreen.Fragment. This is NOT typo
+				// rejection — `fragment` is a childless ValueAny node, and
+				// walkSchemaNode ignores unknown keywords (the gate is
+				// opt-in; schema_walk.go), so `icmp framgent` is not caught
+				// here. Unknown-screen-leaf rejection is the separate #3318.
 				"fragment": {desc: "Drop fragmented ICMP/ICMPv6 packets", children: nil},
 				// ping-death, flood -> leaf
 			}},
