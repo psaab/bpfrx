@@ -511,10 +511,15 @@ pub(super) fn poll_binding_process_descriptor(
                             // `show security flow session` zone/interface display.
                             // #2008 M5: resolve the application id from the
                             // 5-tuple so the conntrack entry carries app_id.
-                            let app_id = worker_ctx.forwarding.app_catalog.lookup(
+                            // #3321: resolve directionally — the service port
+                            // is the dst on a forward-keyed session, the src on
+                            // a reverse-keyed one, so a forward flow with a
+                            // service-valued SOURCE port is not mislabeled.
+                            let app_id = worker_ctx.forwarding.app_catalog.lookup_directional(
                                 flow.forward_key.protocol,
                                 flow.forward_key.src_port,
                                 flow.forward_key.dst_port,
+                                resolved.metadata.is_reverse,
                             );
                             publish_bpf_conntrack_entry(
                                 conntrack_v4_fd,
@@ -1624,10 +1629,13 @@ pub(super) fn poll_binding_process_descriptor(
                                     c.add(desc.len as u64);
                                 }
                                 // #2008 M5: stamp the resolved application id.
-                                let app_id = worker_ctx.forwarding.app_catalog.lookup(
+                                // #3321: directional resolution (service = dst
+                                // forward / src reverse).
+                                let app_id = worker_ctx.forwarding.app_catalog.lookup_directional(
                                     flow.forward_key.protocol,
                                     flow.forward_key.src_port,
                                     flow.forward_key.dst_port,
+                                    local_metadata.is_reverse,
                                 );
                                 publish_bpf_conntrack_entry(
                                     conntrack_v4_fd,
@@ -3823,10 +3831,13 @@ pub(super) fn poll_binding_process_descriptor(
                                             .fetch_add(1, Ordering::Relaxed);
                                     }
                                     // #2008 M5: stamp the resolved app id.
-                                    let app_id = worker_ctx.forwarding.app_catalog.lookup(
+                                    // #3321: directional resolution (service =
+                                    // dst forward / src reverse).
+                                    let app_id = worker_ctx.forwarding.app_catalog.lookup_directional(
                                         flow.forward_key.protocol,
                                         flow.forward_key.src_port,
                                         flow.forward_key.dst_port,
+                                        entry.metadata.is_reverse,
                                     );
                                     publish_bpf_conntrack_entry(
                                         conntrack_v4_fd,

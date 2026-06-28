@@ -213,13 +213,17 @@ pub(super) fn flush_session_deltas(
             // 1:1 pair per close — no double-counting on the HA channel.
             if delta.kind == SessionDeltaKind::Close {
                 // #2520: resolve the AppID for the closing 5-tuple with the
-                // SAME app_catalog.lookup the forwarding hot path runs, so the
+                // SAME app_catalog the forwarding hot path runs, so the
                 // SESSION_CLOSE RT_FLOW record carries the application instead
                 // of UNKNOWN. 0 (no match) keeps the prior UNKNOWN rendering.
-                let app_id = forwarding.app_catalog.lookup(
+                // #3321: resolve directionally off the delta's own direction
+                // flag (service = dst forward / src reverse) so a forward flow
+                // with a service-valued source port is not mislabeled.
+                let app_id = forwarding.app_catalog.lookup_directional(
                     delta.key.protocol,
                     delta.key.src_port,
                     delta.key.dst_port,
+                    delta.metadata.is_reverse,
                 );
                 // #2615: thread the closing binding's ingress ifindex so the
                 // SESSION_CLOSE RT_FLOW record shows the admitting interface
@@ -239,17 +243,19 @@ pub(super) fn flush_session_deltas(
             // frame's gate byte) because flowexport still needs every close.
             if delta.kind == SessionDeltaKind::Open && delta.metadata.log_session_init {
                 // #2615: resolve the AppID for the new 5-tuple with the SAME
-                // app_catalog.lookup the forwarding hot path runs (mirroring
-                // the #2520 close-side fix), so the SESSION_CREATE RT_FLOW
-                // record carries the application instead of UNKNOWN. 0 (no
-                // match) keeps the prior UNKNOWN rendering. The ingress
-                // ifindex comes from the admitting binding (`ident`); a kernel
-                // ifindex is always positive so the i32 -> u32 cast is
-                // loss-free.
-                let app_id = forwarding.app_catalog.lookup(
+                // app_catalog the forwarding hot path runs (mirroring the #2520
+                // close-side fix), so the SESSION_CREATE RT_FLOW record carries
+                // the application instead of UNKNOWN. 0 (no match) keeps the
+                // prior UNKNOWN rendering. The ingress ifindex comes from the
+                // admitting binding (`ident`); a kernel ifindex is always
+                // positive so the i32 -> u32 cast is loss-free.
+                // #3321: directional resolution off the delta's direction flag
+                // (service = dst forward / src reverse).
+                let app_id = forwarding.app_catalog.lookup_directional(
                     delta.key.protocol,
                     delta.key.src_port,
                     delta.key.dst_port,
+                    delta.metadata.is_reverse,
                 );
                 es.emit_session_create_rt_flow(delta, app_id, ident.ifindex as u32);
             }
