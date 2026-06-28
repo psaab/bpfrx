@@ -92,6 +92,36 @@ func TestHostInboundKnownTokensCommit(t *testing.T) {
 	}
 }
 
+// TestHostInboundIsisCommitsAsL2NoOp asserts that
+// `host-inbound-traffic protocols isis` is ACCEPTED at commit (#3311). IS-IS
+// routing is supported via FRR, but before #3311 `isis` was absent from
+// KnownHostInboundProtocols, so the stanza was HARD-REJECTED at commit even
+// though Junos/vSRX accepts it — a fail-closed parity gap (the operator could
+// not even author the stanza). IS-IS rides OSI/CLNP over L2 (not IP), so it is
+// modeled as a recognized-but-no-op host-inbound token: it admits at commit but
+// produces no IP host-inbound match on either enforcement surface (the kernel
+// delivers IS-IS PDUs to FRR's isisd via an LLC socket, outside the IP filter).
+//
+// Fail-on-revert: remove `"isis"` from KnownHostInboundProtocols and commit
+// rejects the stanza again, turning this RED. The companion membership check
+// keeps `isis` in the HostInboundL2Protocols SSOT that the nft parity test and
+// the Rust classifier rely on to stay consistent.
+func TestHostInboundIsisCommitsAsL2NoOp(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set security zones security-zone core host-inbound-traffic protocols isis",
+		"set security zones security-zone core host-inbound-traffic protocols bgp",
+	})
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("strict commit rejected `host-inbound-traffic protocols isis` (vSRX parity gap, #3311): %v", err)
+	}
+	if !KnownHostInboundProtocols["isis"] {
+		t.Fatal("isis must be in KnownHostInboundProtocols so commit accepts it")
+	}
+	if !HostInboundL2Protocols["isis"] {
+		t.Fatal("isis must be in HostInboundL2Protocols (the L2/no-op SSOT the nft + Rust surfaces consult)")
+	}
+}
+
 // TestHostInboundUnknownTokenLenientDowngradesToWarning asserts the tolerant
 // load / peer-sync path downgrades the unknown-token reject to a warning instead
 // of failing the compile, so an already-persisted or peer-synced config carrying

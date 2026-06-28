@@ -43,6 +43,22 @@ func TestHostInboundNftMatchesKnownTokens(t *testing.T) {
 	// IPv4 (nil for ip6); igmp/router-discovery v6 map to the always-accepted ND
 	// set. So a token recognized by the SSOT must classify in ip OR ip6.
 	for tok := range config.KnownHostInboundProtocols {
+		if config.HostInboundL2Protocols[tok] {
+			// #3311: L2/non-IP routing protocols (IS-IS rides OSI/CLNP over LLC,
+			// not IP) are recognized-but-no-op host-inbound tokens. They CANNOT
+			// be expressed as an ip/ip6 match on either surface, so the
+			// every-token-produces-a-match rule does not apply; instead BOTH
+			// surfaces must produce NO IP match (the kernel hands IS-IS PDUs to
+			// FRR's isisd via an LLC socket, outside this filter). Assert the no-op
+			// so the two surfaces stay consistent. Fail-on-revert: emit any nft
+			// match from the isis arm in hostInboundProtocolMatches and this RED.
+			if len(hostInboundProtocolMatches(tok, "ip")) != 0 ||
+				len(hostInboundProtocolMatches(tok, "ip6")) != 0 {
+				t.Errorf("L2 host-inbound protocol %q produced an IP nft match — it must be "+
+					"a no-op on the IP filter (handled by FRR over L2)", tok)
+			}
+			continue
+		}
 		if len(hostInboundProtocolMatches(tok, "ip")) == 0 &&
 			len(hostInboundProtocolMatches(tok, "ip6")) == 0 {
 			t.Errorf("known protocol %q produces no nft match in either family — "+
@@ -84,6 +100,28 @@ func TestHostInboundBfdAdmitsMultiHop(t *testing.T) {
 		if !strings.Contains(joined, port) {
 			t.Errorf("bfd nft match %q missing UDP dport %s (single-hop 3784/echo 3785 + multi-hop 4784 RFC 5883)", joined, port)
 		}
+	}
+}
+
+// TestHostInboundIsisProducesNoIPMatch asserts that `protocols isis` produces
+// NO ip/ip6 host-inbound match in the nft builder (#3311). IS-IS rides OSI/CLNP
+// over L2 (LLC-encapsulated, not IP) and cannot be expressed in the IP input
+// chains; it is a recognized-but-no-op token (config.HostInboundL2Protocols)
+// kept consistent with the Rust classifier's isis no-op arm. The kernel hands
+// IS-IS PDUs to FRR's isisd via an LLC socket, outside this filter.
+//
+// Fail-on-revert: make the `isis` arm in hostInboundProtocolMatches emit any
+// match (e.g. a bogus `meta l4proto`) and this RED — that would diverge from
+// the Rust no-op arm and falsely admit non-existent IP traffic.
+func TestHostInboundIsisProducesNoIPMatch(t *testing.T) {
+	if !config.HostInboundL2Protocols["isis"] {
+		t.Fatal("isis must be in config.HostInboundL2Protocols")
+	}
+	if got := hostInboundProtocolMatches("isis", "ip"); len(got) != 0 {
+		t.Errorf("isis produced an IPv4 nft match %v — must be a no-op (handled by FRR over L2)", got)
+	}
+	if got := hostInboundProtocolMatches("isis", "ip6"); len(got) != 0 {
+		t.Errorf("isis produced an IPv6 nft match %v — must be a no-op (handled by FRR over L2)", got)
 	}
 }
 

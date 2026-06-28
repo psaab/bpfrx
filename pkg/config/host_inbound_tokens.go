@@ -102,6 +102,33 @@ var KnownHostInboundProtocols = map[string]bool{
 	"msdp":             true,
 	"nhrp":             true,
 	"router-discovery": true,
+	// #3311: IS-IS is a recognized host-inbound protocol for vSRX parity, but
+	// it rides OSI/CLNP directly over L2 (LLC-encapsulated, NOT IP) — see
+	// HostInboundL2Protocols below. It admits at commit yet produces NO IP
+	// host-inbound match on either enforcement surface (the kernel delivers
+	// IS-IS PDUs to FRR's isisd via an LLC packet socket, outside the IP
+	// host-inbound filter). Before #3311 it was hard-rejected at commit even
+	// though IS-IS routing is supported via FRR — a fail-closed parity gap.
+	"isis": true,
+}
+
+// HostInboundL2Protocols is the set of recognized `protocols` tokens that ride
+// directly over L2 (OSI/CLNP / LLC encapsulation) rather than IP, and so cannot
+// be expressed as an IP host-inbound match (a protocol number, a TCP/UDP port,
+// or an ICMP type) on EITHER enforcement surface — the nftables `ip`/`ip6`
+// input chains and the Rust AF_XDP IP-keyed classifier. A token in this set is
+// VALID at commit (vSRX parity) but is a deliberate no-op on both surfaces:
+// IS-IS adjacency PDUs are non-IP frames that never traverse the IP input
+// chains and are never delivered to the XSK as IP packets — the kernel hands
+// them to FRR's isisd via an LLC/SNAP packet socket, entirely outside the IP
+// host-inbound filter. Both surfaces therefore agree (neither admits an IP
+// match for an L2 token), so there is no split-brain. The Go nft parity test
+// (TestHostInboundNftMatchesKnownTokens) skips these tokens in its
+// every-known-token-produces-a-match assertion and instead asserts they
+// produce NO IP match; the Rust classify_protocol mirrors this with an explicit
+// no-op arm. Keep in lockstep with that arm. #3311.
+var HostInboundL2Protocols = map[string]bool{
+	"isis": true,
 }
 
 // Address-family scoping for host-inbound tokens (#3225). Several Junos

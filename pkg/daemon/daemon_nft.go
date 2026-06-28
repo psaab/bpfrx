@@ -454,6 +454,15 @@ func hostInboundProtocolMatches(token, family string) []string {
 		return []string{"tcp dport 639"}
 	case "nhrp":
 		return []string{"meta l4proto 54"}
+	case "isis":
+		// #3311: IS-IS rides OSI/CLNP directly over L2 (LLC-encapsulated, NOT
+		// IP), so it cannot be expressed as an ip/ip6 host-inbound match. It is
+		// a recognized-but-no-op token (config.HostInboundL2Protocols): the
+		// kernel delivers IS-IS PDUs to FRR's isisd via an LLC packet socket,
+		// outside this IP host-inbound filter. Returning nil keeps this surface
+		// consistent with the Rust classifier's isis no-op arm. The nft parity
+		// test skips L2 protocols and asserts they produce no IP match.
+		return nil
 	case "router-discovery":
 		if family == "ip6" {
 			// v6 RS/RA are part of the always-accepted ND set above.

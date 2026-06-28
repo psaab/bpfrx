@@ -256,6 +256,17 @@ fn classify_protocol(token: &str, hi: &mut ZoneHostInbound) {
         "nhrp" => {
             hi.ip_protocols.insert(54);
         }
+        // #3311: IS-IS rides OSI/CLNP directly over L2 (LLC-encapsulated, NOT
+        // IP), so it cannot be expressed in this IP-keyed admit model (proto
+        // number / TCP-UDP port / ICMP type). It is a recognized-but-no-op
+        // host-inbound token (Go SSOT: config.HostInboundL2Protocols): the
+        // kernel delivers IS-IS PDUs to FRR's isisd via an LLC packet socket,
+        // outside the IP host-inbound filter (and the AF_XDP local-delivery
+        // path only ever classifies IP packets). Admitting nothing here keeps
+        // this surface consistent with the nft mirror's isis no-op case — both
+        // produce zero IP admit, so there is no split-brain. Explicit arm (not
+        // the catch-all `_`) so the no-op is documented and intentional.
+        "isis" => {}
         // #3201/#3240: router-discovery admits ICMPv4 router-advertisement (9)
         // and router-solicitation (10) ONLY — matching the nft chain
         // (`hostInboundProtocolMatches`: `icmp type { 9, 10 }`). On v6, RS/RA

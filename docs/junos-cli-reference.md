@@ -278,6 +278,21 @@ From zone: guest, To zone: lan
     accepting `SSH` would itself reintroduce a split-brain). Recognized tokens
     (`ssh`, `ping`, `all`, `any-service`, `ipsec`/`ike`, `protocols all`
     routing-scoped per #3199, …) are unaffected.
+  - **IS-IS host-inbound (L2 no-op, #3311):** `host-inbound-traffic protocols
+    isis` is now ACCEPTED at commit (vSRX parity) — before #3311 it was
+    hard-rejected even though IS-IS routing is supported via FRR, a fail-closed
+    gap that prevented the operator from authoring the stanza. IS-IS rides
+    OSI/CLNP directly over L2 (LLC-encapsulated, NOT IP), so it cannot be
+    expressed as an IP host-inbound match (a protocol number, a TCP/UDP port, or
+    an ICMP type) on either enforcement surface. It is therefore a
+    recognized-but-no-op token (`config.HostInboundL2Protocols`): it admits at
+    commit but contributes ZERO match to both the nftables `ip`/`ip6` input
+    chains and the Rust AF_XDP IP-keyed classifier. This is consistent (neither
+    surface admits an IP match, so no split-brain) and correct — the kernel
+    delivers IS-IS PDUs to FRR's `isisd` via an LLC packet socket, entirely
+    outside the IP host-inbound filter, so adjacencies form regardless. The nft
+    parity test skips L2 tokens and instead asserts they produce no IP match;
+    the Rust `classify_protocol` mirrors this with an explicit no-op arm.
   - **RETH VRRP VIP scoping (#3172):** the kernel host-inbound chain scopes
     its accept/deny rules to each zone's firewall-local addresses. Those
     addresses now include the zone's RETH **VRRP virtual IPs** (the

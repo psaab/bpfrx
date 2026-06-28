@@ -1,3 +1,25 @@
+## 2026-06-27 — #3311 host-inbound `protocols isis` (L2 no-op, vSRX parity)
+
+- **Timestamp**: 2026-06-27
+- **Action**: Accept `security zones <z> host-inbound-traffic protocols isis`
+  at commit (was hard-rejected — a fail-closed vSRX-parity gap even though IS-IS
+  routing is supported via FRR). IS-IS rides OSI/CLNP over L2 (NOT IP), so it
+  cannot be expressed in the IP-keyed host-inbound admit model on EITHER surface
+  (nft ip/ip6 input chains; Rust AF_XDP classifier). Chosen semantics:
+  recognized-but-no-op token (new `config.HostInboundL2Protocols` SSOT) —
+  admits at commit, produces ZERO IP match on both surfaces (consistent, no
+  split-brain). IS-IS PDUs reach FRR's isisd via an LLC packet socket, outside
+  the IP filter. Added `isis` to `KnownHostInboundProtocols`; explicit no-op
+  `case "isis"`/`"isis" => {}` arms in nft + Rust; nft parity test now skips L2
+  tokens and asserts no IP match. Fail-on-revert tests in all three layers.
+- **File(s)**: pkg/config/host_inbound_tokens.go,
+  pkg/daemon/daemon_nft.go,
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  pkg/config/host_inbound_tokens_test.go,
+  pkg/daemon/host_inbound_parity_test.go,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  docs/junos-cli-reference.md
+
 ## 2026-06-27 — #3276 DDNS operator force-now / check-now verb
 
 - **Timestamp**: 2026-06-27
