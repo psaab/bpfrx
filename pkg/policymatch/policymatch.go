@@ -441,41 +441,54 @@ func ruleMatches(cfg *config.Config, q Query, pol *config.Policy) bool {
 	return matchApp(cfg, pol.Match.Applications, q.Protocol, q.SrcPort, q.DstPort, q.ICMPType, q.ICMPCode)
 }
 
-// matchAddr replicates policy.rs try_match_rule's per-side address logic.
+// matchAddr replicates policy.rs try_match_rule's per-side address logic
+// EXACTLY (#3356). A nil ip (unspecified) does not constrain the match.
 //
-// A nil ip (unspecified) does not constrain the match. An empty token list is
-// the runtime "no address constraint = match any" case. Otherwise the raw
-// "ip is in the configured set" predicate is computed per family (only the
-// ip's own family is consulted), then XORed with the exclusion flag. An
-// EMPTY excluded set fails closed (it never matches) instead of inverting to
-// match-all — the #2008 fail-open hardening.
+// The runtime computes, per side:
+//
+//	excluded:     !(v4_empty && v6_empty) && !(ip is in the set)
+//	not excluded:  match_any || (ip is in the set)
+//
+// Two faithfulness fixes over the pre-#3356 simulator:
+//
+//   - The empty-address-list "match any" short-circuit must NOT run before the
+//     exclusion check. An empty-but-EXCLUDED set ([] with excluded=true) is the
+//     genuine typo/parse-drop signal #2008 fails CLOSED on: the runtime sees
+//     v4_empty && v6_empty and yields false. Returning match-any first made the
+//     simulator fail OPEN — it reported a match no dataplane packet would get.
+//     The "no constraint = match any" convenience now applies only to the
+//     NON-excluded empty list.
+//
+//   - The excluded fail-closed gate keys on BOTH families being empty, not on
+//     the packet's own family. The runtime fails closed only when
+//     v4_empty && v6_empty (policy.rs ~2095-2106). A v6-only exclusion set on a
+//     v4 packet (#3023 cross-family) leaves v4_empty true but v6_empty false:
+//     the v4 address is then trivially NOT in the (v6-only) excluded set, so the
+//     side MATCHES. The old per-packet-family `contributesFamily` gate failed
+//     closed there and over-blocked legitimate cross-family traffic.
 func matchAddr(cfg *config.Config, overlay map[string][]string, addrs []string, excluded bool, ip net.IP) bool {
 	if ip == nil {
-		return true
-	}
-	if len(addrs) == 0 {
-		// No address constraint configured: runtime treats this as match-any
-		// for both families (parse_legacy_address_set of an empty list).
 		return true
 	}
 
 	isV4 := ip.To4() != nil
 
 	rawMatched := false
-	contributesFamily := false
+	v4Empty := true
+	v6Empty := true
 	for _, tok := range addrs {
 		v4nets, v6nets, anyV4, anyV6 := resolveToken(cfg, overlay, tok)
+		if anyV4 || len(v4nets) > 0 {
+			v4Empty = false
+		}
+		if anyV6 || len(v6nets) > 0 {
+			v6Empty = false
+		}
 		if isV4 {
-			if anyV4 || len(v4nets) > 0 {
-				contributesFamily = true
-			}
 			if anyV4 || containsAny(v4nets, ip) {
 				rawMatched = true
 			}
 		} else {
-			if anyV6 || len(v6nets) > 0 {
-				contributesFamily = true
-			}
 			if anyV6 || containsAny(v6nets, ip) {
 				rawMatched = true
 			}
@@ -483,10 +496,20 @@ func matchAddr(cfg *config.Config, overlay map[string][]string, addrs []string, 
 	}
 
 	if !excluded {
+		if len(addrs) == 0 {
+			// No address constraint configured: the runtime treats this as
+			// match-any for both families (parse_legacy_address_set of an empty
+			// list). Only the NON-excluded empty list is match-any.
+			return true
+		}
 		return rawMatched
 	}
-	// Excluded: an empty set for this family fails closed.
-	if !contributesFamily {
+	// Excluded: fail CLOSED only when the set is empty across BOTH families —
+	// the #2008 typo/parse-drop signal (matches policy.rs's
+	// `!(v4_empty && v6_empty)`). A populated other-family set means the
+	// operator listed only one family; the packet's family is then trivially
+	// NOT in the excluded set, so the side matches (#3023 cross-family).
+	if v4Empty && v6Empty {
 		return false
 	}
 	return !rawMatched
