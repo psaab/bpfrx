@@ -402,6 +402,18 @@ type compileOpts struct {
 	// no-brick); the dataplane never represented the leaf, so the term keeps
 	// matching without it independently. Same doctrine as lenientFilterActions.
 	lenientFilterFromMatch bool
+	// lenientFilterRoutingInstanceConflict (#3308) downgrades the firewall-filter
+	// routing-instance-vs-discard/reject mutual-exclusion gate
+	// (validateFilterRoutingInstanceConflictStrict) from a hard compile error to
+	// a cfg.Warnings entry. The strict commit / commit-check path hard-rejects a
+	// term that co-locates `then routing-instance <x>` with a terminating
+	// `then discard` / `then reject` — a contradiction the PBR runtime resolves
+	// by ROUTING the packet anyway while logging it as denied (the audit trail
+	// lies; fail-open PBR). The tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config still BOOTS (#1960
+	// no-brick); the runtime routes-and-mislogs the term independently. Same
+	// doctrine as lenientFilterPortExcept.
+	lenientFilterRoutingInstanceConflict bool
 	// lenientNPTv6 (#2240) downgrades the NPTv6 (RFC 6296) validation gate
 	// (validateNPTv6Strict) from a hard compile error to a cfg.Warnings entry.
 	// The strict commit / commit-check path hard-rejects an NPTv6 static-NAT
@@ -1034,6 +1046,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFlexMatch:                    true,
 		lenientFilterPortExcept:             true,
 		lenientFilterFromMatch:              true,
+		lenientFilterRoutingInstanceConflict: true,
 		lenientNPTv6:                        true,
 		lenientFirewallRefs:                 true,
 		lenientFlowServerTemplateRef:        true,
@@ -1166,6 +1179,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFlexMatch:                    true,
 		lenientFilterPortExcept:             true,
 		lenientFilterFromMatch:              true,
+		lenientFilterRoutingInstanceConflict: true,
 		lenientNPTv6:                        true,
 		lenientFirewallRefs:                 true,
 		lenientFlowServerTemplateRef:        true,
@@ -2085,6 +2099,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFilterFromMatch {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("firewall filter from-match (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3308 firewall-filter routing-instance-vs-discard/reject mutual-exclusion
+	// gate. Strict on commit / commit-check (hard-reject a term that co-locates
+	// `then routing-instance <x>` with a terminating `then discard`/`then
+	// reject`). Such a term is contradictory: the PBR runtime
+	// (ingress_route_table_override) logs the deny/reject but UNCONDITIONALLY
+	// returns the routing table, so the packet is routed while the audit stream
+	// records it as denied (the audit lies; fail-open PBR). Lenient on load /
+	// peer-sync (warn so an already-persisted or peer-synced config still boots —
+	// #1960 no-brick; the runtime routes-and-mislogs independently). Runs on the
+	// fully-compiled *Config so the typed term list (RoutingInstance + Action
+	// populated by compileFilterThen) is available.
+	if err := validateFilterRoutingInstanceConflictStrict(cfg); err != nil {
+		if opts.lenientFilterRoutingInstanceConflict {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter routing-instance conflict (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

@@ -3370,6 +3370,69 @@ func validateFilterFromMatchStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFilterRoutingInstanceConflictStrict hard-rejects a firewall-filter
+// term that co-locates `then routing-instance <x>` with a terminating
+// `then discard` / `then reject` — #3308.
+//
+// Such a term is contradictory: it asks the dataplane to BOTH route the packet
+// via the named instance AND drop/reject it. There was no commit-time
+// mutual-exclusion gate, and on the PBR runtime path the deny/reject was reduced
+// to a LOG-ONLY event — ingress_route_table_override (userspace-dp/src/afxdp/
+// forwarding/mod.rs) logs routing_result.action (the discard/reject) and then
+// UNCONDITIONALLY returns the routing-table string, so the packet is still
+// forwarded through <x>.inet.0 / <x>.inet6.0. The audit/syslog stream records
+// the packet as DENY/REJECT while it was actually routed — worse than a syntax
+// gap: the audit trail lies and the security intent is defeated (fail-open PBR).
+//
+// The conflict is on the typed fields term.RoutingInstance (the
+// `then routing-instance` value) and term.Action ("discard" / "reject", set by
+// compileFilterThen). A routing-instance term with `then accept` (or no terminal
+// action) is the legitimate filter-based-forwarding case and is NOT rejected.
+//
+// The walk is deterministic (filters sorted by name, terms in config order). On
+// the tolerant load / peer-sync path the caller downgrades the returned error to
+// a warning (#1960 no-brick); the runtime already routes-and-mislogs such a term
+// independently, but the operator never reaches that state through a commit.
+// Mirrors validateFilterPortExceptStrict.
+func validateFilterRoutingInstanceConflictStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil || term.RoutingInstance == "" {
+					continue
+				}
+				if term.Action == "discard" || term.Action == "reject" {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: `then routing-instance "+
+							"%s` and `then %s` are mutually exclusive in the same term — "+
+							"the dataplane would still route the packet via the named "+
+							"instance while logging it as denied (the audit trail would "+
+							"lie); keep only the routing-instance or only the discard/"+
+							"reject",
+						family, name, term.Name, term.RoutingInstance, term.Action)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // filterProtocolResolvable reports whether a `from protocol <token>` is
 // representable: it INLINE-mirrors the acceptance set of
 // appid.ProtocolNumber's ok==true result (the #2124/#2175 SSOT). pkg/config
