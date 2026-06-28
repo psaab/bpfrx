@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -129,5 +130,85 @@ func TestMonitorPacketDropAcceptsValidInputs(t *testing.T) {
 	}
 	if err != context.Canceled {
 		t.Fatalf("MonitorPacketDrop(valid) err = %v, want context.Canceled (validation passed, loop exited)", err)
+	}
+}
+
+// runPacketDropUntilMatch runs MonitorPacketDrop with count=1 in a goroutine,
+// adds the supplied record once the subscription is live, and returns the
+// matcher result: (matched, line). It bounds the wait so a fail-on-revert
+// (validated-but-never-matches) surfaces as matched==false within the timeout
+// instead of hanging. The cross-goroutine read of stream.sent is safe because
+// the result channel send/receive establishes happens-before.
+func runPacketDropUntilMatch(t *testing.T, s *Server, eb *logging.EventBuffer, req *pb.MonitorPacketDropRequest, rec logging.EventRecord) (bool, string) {
+	t.Helper()
+	req.Count = 1
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream := &mockPacketDropStream{ctx: ctx}
+	errc := make(chan error, 1)
+	go func() { errc <- s.MonitorPacketDrop(req, stream) }()
+
+	// Let the RPC subscribe (it Subscribes then sends "Starting packet
+	// drop:") before publishing the record, so the fan-out reaches it.
+	time.Sleep(100 * time.Millisecond)
+	eb.Add(rec)
+
+	err := <-errc
+	if err != nil {
+		// count=1 returns nil on a match; a non-nil error (e.g. the 3s
+		// DeadlineExceeded) means the record never matched.
+		return false, ""
+	}
+	// stream.sent[0] is the "Starting packet drop:" banner; the matched
+	// record is the next line.
+	for _, line := range stream.sent {
+		if line != "Starting packet drop:" {
+			return true, line
+		}
+	}
+	return false, ""
+}
+
+// TestMonitorPacketDropProtocolNumericMatches guards the #3382 matcher fix
+// (Codex MAJOR 1): a NUMERIC protocol filter must match a drop whose record
+// renders the protocol NAME. The record carries rec.Protocol="TCP"; a request
+// protocol of "6" must match.
+//
+// FAIL-ON-REVERT: the old strings.EqualFold(rec.Protocol, req.Protocol) compare
+// makes "6" never match "TCP", so the record is never streamed and matched is
+// false.
+func TestMonitorPacketDropProtocolNumericMatches(t *testing.T) {
+	eb := logging.NewEventBuffer(16)
+	s := &Server{store: packetDropTestStore(t), eventBuf: eb}
+	rec := logging.EventRecord{
+		Type: "POLICY_DENY", Protocol: "TCP",
+		SrcAddr: "1.2.3.4:1000", DstAddr: "5.6.7.8:80",
+	}
+	matched, line := runPacketDropUntilMatch(t, s, eb, &pb.MonitorPacketDropRequest{Protocol: "6"}, rec)
+	if !matched {
+		t.Fatal("numeric protocol filter 6 did not match a TCP drop; matcher is accepted-but-never-matches")
+	}
+	if !strings.Contains(line, "tcp") {
+		t.Errorf("matched line = %q, want it to contain the tcp protocol", line)
+	}
+}
+
+// TestMonitorPacketDropInterfaceAliasMatches guards the #3382 matcher fix
+// (Codex MAJOR 2): the config-key interface form ("ge-0/0/0") must match a
+// record whose IngressIface is the Linux form ("ge-0-0-0").
+//
+// FAIL-ON-REVERT: the old exact rec.IngressIface != req.Interface compare makes
+// the config-key form never match the Linux-form record, so matched is false.
+func TestMonitorPacketDropInterfaceAliasMatches(t *testing.T) {
+	eb := logging.NewEventBuffer(16)
+	s := &Server{store: packetDropTestStore(t), eventBuf: eb}
+	rec := logging.EventRecord{
+		Type: "POLICY_DENY", Protocol: "TCP",
+		SrcAddr: "1.2.3.4:1000", DstAddr: "5.6.7.8:80",
+		IngressIface: "ge-0-0-0", // Linux form, as resolveIfName stores it
+	}
+	matched, _ := runPacketDropUntilMatch(t, s, eb, &pb.MonitorPacketDropRequest{Interface: "ge-0/0/0"}, rec)
+	if !matched {
+		t.Fatal("config-key interface ge-0/0/0 did not match a record with IngressIface ge-0-0-0; matcher is accepted-but-never-matches")
 	}
 }

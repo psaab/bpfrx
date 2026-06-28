@@ -234,15 +234,25 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 	}
 
 	// protocol: validate against the shared catalog (case-insensitive,
-	// named or numeric). A typo like "tpc" can never match.
+	// named or numeric). A typo like "tpc" can never match. Resolve the
+	// request to its protocol NUMBER once so the filter loop can compare
+	// numerically — the event record renders rec.Protocol as a NAME for the
+	// named set, so a numeric request like "6" must not be string-compared
+	// against "TCP" (the accepted-but-never-matches bug).
+	var reqProtoNum uint8
 	if req.Protocol != "" {
-		if _, ok := appid.ProtocolNumber(req.Protocol); !ok {
+		n, ok := appid.ProtocolNumber(req.Protocol)
+		if !ok {
 			return status.Errorf(codes.InvalidArgument, "unknown protocol %q", req.Protocol)
 		}
+		reqProtoNum = n
 	}
 
 	// zone / interface: validate against the active configuration so a typo
-	// (`trsut`, `ge-0/0/99`) is rejected rather than emitting nothing.
+	// (`trsut`, `ge-0/0/99`) is rejected rather than emitting nothing. The
+	// interface filter must MATCH on whichever alias the daemon stored, so
+	// resolve the full alias set once and reuse it in the loop.
+	var reqIfaceAliases map[string]bool
 	if req.FromZone != "" || req.Interface != "" {
 		cfg := s.store.ActiveConfig()
 		if cfg == nil {
@@ -253,8 +263,11 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 				return status.Errorf(codes.InvalidArgument, "unknown from-zone %q", req.FromZone)
 			}
 		}
-		if req.Interface != "" && !configHasInterface(cfg, req.Interface) {
-			return status.Errorf(codes.InvalidArgument, "unknown interface %q", req.Interface)
+		if req.Interface != "" {
+			reqIfaceAliases = interfaceAliasSet(cfg, req.Interface)
+			if len(reqIfaceAliases) == 0 {
+				return status.Errorf(codes.InvalidArgument, "unknown interface %q", req.Interface)
+			}
 		}
 	}
 
@@ -339,13 +352,25 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 					continue
 				}
 			}
-			if req.Protocol != "" && !strings.EqualFold(rec.Protocol, req.Protocol) {
-				continue
+			if req.Protocol != "" {
+				// Compare by resolved protocol NUMBER, not string. The
+				// record renders rec.Protocol as a NAME ("TCP") for the
+				// named set and a numeric string otherwise, while the
+				// request may be named or numeric. Resolving rec.Protocol
+				// back through the same SSOT makes "6", "tcp", and "TCP"
+				// all match a TCP drop (#3382 matcher fix).
+				if recNum, ok := appid.ProtocolNumber(rec.Protocol); !ok || recNum != reqProtoNum {
+					continue
+				}
 			}
 			if req.FromZone != "" && rec.InZoneName != req.FromZone {
 				continue
 			}
-			if req.Interface != "" && rec.IngressIface != req.Interface {
+			if req.Interface != "" && !reqIfaceAliases[rec.IngressIface] {
+				// rec.IngressIface is the single daemon-resolved name; the
+				// request may be any accepted alias (config key, Linux
+				// form, or Name override). Match against the full alias set
+				// so any accepted form matches (#3382 matcher fix).
 				continue
 			}
 
@@ -379,9 +404,9 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 // isLocalNodeRef reports whether a request's node reference designates the
 // local node (#3382). An empty string or "local" is always local. In a
 // cluster the node's numeric id ("0"/"1") or "nodeN" form for THIS node is
-// accepted; a standalone daemon accepts only "0". Anything else — the peer
-// id, "all", "primary" — is not local, so a local-only RPC must reject it
-// rather than silently filter local data.
+// accepted; a standalone daemon (localID 0) accepts "0" or "node0". Anything
+// else — the peer id, "all", "primary" — is not local, so a local-only RPC
+// must reject it rather than silently filter local data.
 func (s *Server) isLocalNodeRef(node string) bool {
 	switch strings.ToLower(strings.TrimSpace(node)) {
 	case "", "local":
@@ -395,26 +420,33 @@ func (s *Server) isLocalNodeRef(node string) bool {
 	return ref == strconv.Itoa(localID) || ref == fmt.Sprintf("node%d", localID)
 }
 
-// configHasInterface reports whether name matches a configured interface,
-// accepting either the configured key, its explicit Name override, or the
-// Linux-form (slashes→dashes) rendering of either (#3382). The packet-drop
-// filter compares against the resolved ingress interface name, which the
-// daemon derives from the config name, so all three forms are legitimate.
-func configHasInterface(cfg *config.Config, name string) bool {
+// interfaceAliasSet returns the set of equivalent names for the configured
+// interface that `name` designates, or nil if it matches none (#3382). The
+// packet-drop filter compares against the SINGLE daemon-resolved ingress name
+// (resolveIfName), but the operator may pass any accepted alias — the config
+// key ("ge-0/0/1"), its Linux-form rendering ("ge-0-0-1"), an explicit Name
+// override, or that Name's Linux form. Returning the full alias set lets both
+// validation (len > 0) and the matcher (membership test) accept whichever form
+// the daemon happened to store, so a validated interface filter cannot
+// accept-but-never-match.
+func interfaceAliasSet(cfg *config.Config, name string) map[string]bool {
 	if cfg == nil {
-		return false
+		return nil
 	}
 	for key, ifc := range cfg.Interfaces.Interfaces {
-		if name == key || name == config.LinuxIfName(key) {
-			return true
+		aliases := map[string]bool{
+			key:                     true,
+			config.LinuxIfName(key): true,
 		}
 		if ifc != nil && ifc.Name != "" {
-			if name == ifc.Name || name == config.LinuxIfName(ifc.Name) {
-				return true
-			}
+			aliases[ifc.Name] = true
+			aliases[config.LinuxIfName(ifc.Name)] = true
+		}
+		if aliases[name] {
+			return aliases
 		}
 	}
-	return false
+	return nil
 }
 
 // MonitorInterface streams pre-formatted interface statistics frames.
