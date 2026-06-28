@@ -6,6 +6,40 @@ import (
 	"strings"
 )
 
+// Application inactivity-timeout / timeout accepted range, in seconds. The
+// upper bound matches the NAT persistent-binding inactivity-timeout
+// (schema_security.go) and the session-timeout range a custom application can
+// sensibly set. The lower bound is 0 — NOT 1 — because 0 is a pre-existing,
+// documented "inherit the global per-protocol timeout" sentinel: the userspace
+// serializer treats InactivityTimeout <= 0 as "use the global timeout"
+// (pkg/dataplane/userspace/capabilities.go) and the typed field documents it
+// (types_security.go: "0 = default"). `inactivity-timeout 0` committed cleanly
+// before #3320 (strconv.Atoi("0") = 0, no error), so the strict gate must keep
+// accepting it. #3320 targets MALFORMED values only — non-numeric ("30s",
+// "thirty"), negative, and out-of-range (>86400) — all of which fall outside
+// [0, 86400].
+const (
+	appTimeoutMin = 0
+	appTimeoutMax = 86400
+)
+
+// parseAppTimeout parses an application inactivity-timeout / timeout token.
+// It returns the integer value and true when the token is a base-10 integer
+// within [appTimeoutMin, appTimeoutMax]; otherwise it returns (0, false) so the
+// caller records the raw token for a deferred strict rejection rather than
+// silently dropping it. It is the single parse authority shared by the
+// top-level and inline-term application paths and the strict commit gate.
+func parseAppTimeout(raw string) (int, bool) {
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, false
+	}
+	if n < appTimeoutMin || n > appTimeoutMax {
+		return 0, false
+	}
+	return n, true
+}
+
 func compileApplications(node *Node, apps *ApplicationsConfig) error {
 	for _, inst := range namedInstances(node.FindChildren("application")) {
 		appName := inst.name
@@ -22,8 +56,15 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 				app.SourcePort = nodeVal(prop)
 			case "inactivity-timeout", "timeout":
 				if v := nodeVal(prop); v != "" {
-					if n, err := strconv.Atoi(v); err == nil {
+					if n, ok := parseAppTimeout(v); ok {
 						app.InactivityTimeout = n
+					} else {
+						// #3320: a non-numeric / out-of-range / unit-suffixed
+						// value was silently dropped here (Atoi error ignored),
+						// leaving InactivityTimeout at 0 so the application fell
+						// back to the global per-protocol timeout. Record the raw
+						// token so validateApplicationSpecsStrict can reject it.
+						app.UnknownTimeouts = append(app.UnknownTimeouts, v)
 					}
 				}
 			case "alg":
@@ -101,6 +142,7 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 	var protocols []string
 	var dstPort, srcPort, alg string
 	var timeout int
+	var badTimeouts []string
 
 	for i := 1; i < len(keys); i++ {
 		switch keys[i] {
@@ -122,8 +164,13 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 		case "inactivity-timeout", "timeout":
 			if i+1 < len(keys) {
 				i++
-				if v, err := strconv.Atoi(keys[i]); err == nil {
+				if v, ok := parseAppTimeout(keys[i]); ok {
 					timeout = v
+				} else {
+					// #3320: malformed inline-term timeout — record the raw
+					// token so the deferred strict gate rejects it instead of
+					// silently dropping it.
+					badTimeouts = append(badTimeouts, keys[i])
 				}
 			}
 		case "alg":
@@ -164,6 +211,7 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 			SourcePort:        srcPort,
 			InactivityTimeout: timeout,
 			ALG:               alg,
+			UnknownTimeouts:   badTimeouts,
 		})
 	}
 	return result
