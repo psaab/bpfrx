@@ -743,6 +743,29 @@ older binary accepted still boots (#1960 no-brick doctrine). Distinct from
 residual was specifically the strict app-spec path still using the blanket
 `junos-` HasPrefix.
 
+**Ports are valid only on a port-bearing protocol (#3373 — audit finding):**
+the same `validateApplicationSpecsStrict` gate hard-rejects a referenced (or
+app-id-enabled) `set applications application <name>` that sets
+`source-port`/`destination-port` while its `protocol` is NOT a port-bearing
+transport. Only TCP (6), UDP (17) and SCTP (132) carry L4 ports; ICMP/ICMPv6,
+GRE, OSPF, ESP, AH, VRRP, IGMP, PIM, IP-in-IP and friends do not. Before the
+gate `protocol icmp destination-port 80` (or `protocol ospf destination-port
+89`, `protocol esp source-port 4500`) committed: the port passed
+`validatePortSpec` and the protocol passed `filterProtocolResolvable`, but the
+runtime then compiled a port matcher indexed by the protocol number
+(`userspace-dp/src/policy.rs` keys port terms on the packet's `src_port`/
+`dst_port`, which are always 0 for a non-port protocol), so the term became a
+NEVER-MATCH — fail-OPEN for a deny rule, fail-CLOSED for a permit rule. The gate
+resolves the port-bearing subset inline via `protocolIsPortBearing` (appid
+cannot be imported here — pkg/appid imports pkg/config — so the subset is pinned
+to `appid.ProtocolNumber` by the drift-guard test
+`TestProtocolIsPortBearingMatchesProtocolNumber`). It fires ONLY when a port is
+set AND the resolved protocol is non-port-bearing, so an icmp-type-constrained
+ICMP app with no port (junos-ping shape) and a bare `protocol gre` still commit.
+The tolerant load/peer-sync path downgrades the reject to a warning
+(`lenientApplicationSpecs`) per the #1960 no-brick doctrine. Junos does not
+couple ports to non-port protocols, so this is a vSRX-parity fix.
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`

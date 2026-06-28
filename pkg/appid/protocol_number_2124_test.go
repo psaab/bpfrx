@@ -111,3 +111,34 @@ func TestFilterProtocolResolvableMatchesProtocolNumber(t *testing.T) {
 		}
 	}
 }
+
+// TestProtocolIsPortBearingMatchesProtocolNumber is the #3373 drift guard for
+// the application-spec commit gate. config.protocolIsPortBearing INLINE-mirrors
+// the port-bearing subset of ProtocolNumber (TCP=6, UDP=17, SCTP=132) because
+// pkg/appid imports pkg/config (the same import-cycle constraint behind
+// FilterProtocolResolvable). This test pins the two together: for every token
+// the dataplane SSOT resolves, config.ProtocolIsPortBearing must be true iff the
+// resolved number is a port-bearing transport. If ProtocolNumber's table grows a
+// new alias for tcp/udp/sctp (or the port-bearing set changes) and the compiler
+// copy is not updated in lockstep, this fails — turning a silent commit-gate
+// drift into a test failure. Cross-check TEST, not a runtime coupling.
+func TestProtocolIsPortBearingMatchesProtocolNumber(t *testing.T) {
+	tokens := []string{
+		"tcp", "udp", "sctp", "junos-tcp-any", "junos-udp-any",
+		"icmp", "icmpv6", "icmp6", "gre", "ospf", "ipip", "esp", "ah",
+		"vrrp", "igmp", "pim", "egp",
+		"junos-icmp-all", "junos-ping", "junos-icmp6-all", "junos-pingv6",
+		"junos-gre", "junos-ospf", "junos-ip-in-ip", "junos-ipip",
+		"TCP", "Sctp", " udp ",
+		"0", "1", "6", "17", "47", "132", "136", "255",
+		"256", "-1", "0x50", "bogus", "", "junos-foobar",
+	}
+	for _, tok := range tokens {
+		num, ok := ProtocolNumber(tok)
+		want := ok && (num == 6 || num == 17 || num == 132)
+		if got := config.ProtocolIsPortBearing(tok); got != want {
+			t.Errorf("ProtocolIsPortBearing(%q) = %v, want %v (ProtocolNumber=%d ok=%v)",
+				tok, got, want, num, ok)
+		}
+	}
+}

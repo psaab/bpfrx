@@ -383,11 +383,13 @@ func TestApplicationSpec_UnreferencedProtocollessApp_WarnsNotRejected(t *testing
 }
 
 // referencedProtoApp wires the issue's exact #3150 trigger: a policy that
-// matches an application whose `protocol` leaf is the supplied token.
+// matches an application whose `protocol` leaf is the supplied token. No port is
+// attached — these cases exercise protocol RESOLVABILITY only, and the #3373
+// gate now rejects a port on a non-port protocol (icmp/gre/numeric), which
+// several of these tokens are.
 func referencedProtoApp(proto string) []string {
 	return []string{
 		"set applications application BAD protocol " + proto,
-		"set applications application BAD destination-port 80",
 		"set security zones security-zone trust",
 		"set security zones security-zone untrust",
 		"set security policies from-zone trust to-zone untrust policy p match source-address any",
@@ -457,6 +459,139 @@ func TestApplicationSpec_ReferencedUnknownJunosProtocol_LenientWarns(t *testing.
 	var warned bool
 	for _, w := range cfg.Warnings {
 		if strings.Contains(w, "application spec") && strings.Contains(w, "junos-foobar") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("expected lenient path to record an application-spec downgrade warning, got %v", cfg.Warnings)
+	}
+}
+
+// #3373: a source-port/destination-port is only meaningful on a port-bearing
+// transport (TCP/UDP/SCTP). Before this gate validateApplicationSpecsStrict
+// checked port SYNTAX and protocol resolvability but never that the port was
+// attached to a port-bearing protocol, so `protocol icmp destination-port 80`
+// (or gre/ospf/esp + a port) committed. The runtime then compiled a port
+// matcher indexed by the protocol number; a non-port protocol always presents
+// ports of 0, so the term became a never-match — fail-OPEN for a deny rule,
+// fail-CLOSED for a permit rule. The gate rejects such a spec at COMMIT.
+//
+// referencedNonPortProtoWithPort wires a policy-referenced application whose
+// protocol is `proto` (a non-port protocol) carrying `portKind` (destination or
+// source) port `port`. Two `set` lines (one leaf each) so the port leaf is not
+// buried under protocol (see referencedBadApp).
+func referencedNonPortProtoWithPort(proto, portKind, port string) []string {
+	return []string{
+		"set applications application BAD protocol " + proto,
+		"set applications application BAD " + portKind + " " + port,
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
+		"set security policies from-zone trust to-zone untrust policy p match source-address any",
+		"set security policies from-zone trust to-zone untrust policy p match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy p match application BAD",
+		"set security policies from-zone trust to-zone untrust policy p then deny",
+	}
+}
+
+// Fail-on-revert: removing the protocolIsPortBearing gate in
+// validateApplicationSpecsStrict makes every one of these commit SUCCEED (the
+// port passes validatePortSpec and the protocol passes filterProtocolResolvable),
+// turning the test RED.
+func TestApplicationSpec_PortOnNonPortProtocol_RejectsAtCommit(t *testing.T) {
+	cases := []struct {
+		name, proto, portKind, port string
+	}{
+		{"icmp_dst", "icmp", "destination-port", "80"},
+		{"icmpv6_dst", "icmpv6", "destination-port", "80"},
+		{"gre_dst", "gre", "destination-port", "47"},
+		{"ospf_dst", "ospf", "destination-port", "89"},
+		{"esp_src", "esp", "source-port", "4500"},
+		{"ah_dst", "ah", "destination-port", "51"},
+		{"vrrp_dst", "vrrp", "destination-port", "112"},
+		{"junos_ping_dst", "junos-ping", "destination-port", "8"},
+		{"junos_gre_src", "junos-gre", "source-port", "1024"},
+		{"numeric_gre_dst", "47", "destination-port", "80"},
+		{"numeric_hopopt_dst", "0", "destination-port", "80"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := flatTreeFromSets(t, referencedNonPortProtoWithPort(tc.proto, tc.portKind, tc.port)...)
+			_, err := CompileConfig(tree)
+			if err == nil {
+				t.Fatalf("expected commit to reject application BAD with %s %s on non-port protocol %q",
+					tc.portKind, tc.port, tc.proto)
+			}
+			if !strings.Contains(err.Error(), "BAD") ||
+				!strings.Contains(err.Error(), tc.portKind) ||
+				!strings.Contains(err.Error(), tc.proto) {
+				t.Fatalf("error %q must name application BAD, the %s, and protocol %q",
+					err.Error(), tc.portKind, tc.proto)
+			}
+		})
+	}
+}
+
+// Positive controls — these must continue to commit cleanly, proving the #3373
+// reject is scoped to (port set) AND (non-port protocol):
+//
+//   - tcp/udp/sctp + a port (the only port-bearing transports);
+//   - a non-port protocol (icmp/gre) with NO port (the port is what makes it
+//     unrepresentable — the protocol alone is fine);
+//   - a numeric port-bearing protocol (6/17/132).
+func TestApplicationSpec_PortBearingProtocolWithPort_AcceptsAtCommit(t *testing.T) {
+	for _, proto := range []string{"tcp", "udp", "sctp", "junos-tcp-any", "junos-udp-any", "6", "17", "132"} {
+		tree := flatTreeFromSets(t, referencedNonPortProtoWithPort(proto, "destination-port", "8080")...)
+		if _, err := CompileConfig(tree); err != nil {
+			t.Fatalf("expected commit to accept port-bearing protocol %q with a port: %v", proto, err)
+		}
+	}
+}
+
+func TestApplicationSpec_NonPortProtocolWithoutPort_AcceptsAtCommit(t *testing.T) {
+	for _, proto := range []string{"icmp", "icmpv6", "gre", "ospf", "esp", "ah", "vrrp", "junos-ping", "47", "0"} {
+		tree := flatTreeFromSets(t, referencedProtoApp(proto)...)
+		if _, err := CompileConfig(tree); err != nil {
+			t.Fatalf("expected commit to accept non-port protocol %q with NO port: %v", proto, err)
+		}
+	}
+}
+
+// An ICMP application constrained by an icmp-type but carrying NO port must be
+// accepted — the #3373 gate fires only when a port is set, so a type-only ICMP
+// app (e.g. the junos-ping shape) is unaffected. Built as a Config directly
+// because custom-application icmp-type is a typed-leaf the strict validator
+// reads off the Application struct; ApplicationIdentification is enabled so the
+// app is in scope for the strict walk without a policy reference.
+func TestApplicationSpec_ICMPTypeOnlyNoPort_AcceptsAtCommit(t *testing.T) {
+	icmpType := uint8(8)
+	cfg := &Config{}
+	cfg.Services.ApplicationIdentification = true
+	cfg.Applications.Applications = map[string]*Application{
+		"PING": {Name: "PING", Protocol: "icmp", ICMPType: &icmpType},
+	}
+	if err := validateApplicationSpecsStrict(cfg); err != nil {
+		t.Fatalf("expected an icmp-type-only application (no port) to pass the strict gate: %v", err)
+	}
+	// And with a port on the same icmp app, the gate must reject.
+	cfg.Applications.Applications["PING"].DestinationPort = "80"
+	if err := validateApplicationSpecsStrict(cfg); err == nil {
+		t.Fatal("expected an icmp application with a destination-port to be rejected by the #3373 gate")
+	}
+}
+
+// No-brick (#1960): a config persisted/synced with a policy-referenced
+// port-on-non-port-protocol application must still LOAD on the tolerant path
+// (CompileConfigLenient) — downgraded to a warning — so an upgraded node does
+// not fail closed on boot.
+func TestApplicationSpec_PortOnNonPortProtocol_LenientWarns(t *testing.T) {
+	tree := flatTreeFromSets(t, referencedNonPortProtoWithPort("icmp", "destination-port", "80")...)
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient load of a referenced port-on-non-port-protocol app must not fail: %v", err)
+	}
+	var warned bool
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "application spec") && strings.Contains(w, "BAD") {
 			warned = true
 		}
 	}

@@ -2980,6 +2980,40 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 					"would commit cleanly but fail to arm the referencing policy)",
 				name, app.Protocol)
 		}
+		// #3373: a source-port/destination-port constraint is only meaningful on a
+		// port-bearing transport (TCP/UDP/SCTP). The protocol is already known
+		// resolvable here (filterProtocolResolvable passed above), so a port on any
+		// OTHER protocol — icmp/icmpv6/gre/ospf/esp/ah/vrrp/igmp/pim/ip-in-ip — is a
+		// silent operator error: the userspace matcher (userspace-dp src/policy.rs)
+		// indexes every application term by protocol number and keys port terms on
+		// src_port/dst_port, but a non-port protocol always presents ports of 0, so
+		// the term becomes a never-match. For a deny rule that fails OPEN; for a
+		// permit rule it fails CLOSED. Junos does not couple ports to non-port
+		// protocols, so reject at COMMIT (the same strict-at-commit / #1960
+		// fail-closed doctrine as the protocol-less #3109 and unresolvable-protocol
+		// #3150 cases above). The call site downgrades this to a warning on the
+		// tolerant load / peer-sync path (compiler.go, lenientApplicationSpecs) so an
+		// already-persisted or older-peer-synced config still BOOTS.
+		if !protocolIsPortBearing(app.Protocol) {
+			if port := app.DestinationPort; port != "" {
+				return fmt.Errorf(
+					"application %q: destination-port %q is set on protocol %q, which "+
+						"does not carry L4 ports — source-port/destination-port are valid "+
+						"only on tcp/udp/sctp (the dataplane keys port terms on the "+
+						"packet's ports, which are always 0 for a non-port protocol, so the "+
+						"term would never match; remove the port or change the protocol)",
+					name, port, app.Protocol)
+			}
+			if port := app.SourcePort; port != "" {
+				return fmt.Errorf(
+					"application %q: source-port %q is set on protocol %q, which does "+
+						"not carry L4 ports — source-port/destination-port are valid only "+
+						"on tcp/udp/sctp (the dataplane keys port terms on the packet's "+
+						"ports, which are always 0 for a non-port protocol, so the term "+
+						"would never match; remove the port or change the protocol)",
+					name, port, app.Protocol)
+			}
+		}
 	}
 	return nil
 }
@@ -3840,6 +3874,43 @@ func filterProtocolResolvable(token string) bool {
 		}
 		return false
 	}
+}
+
+// protocolIsPortBearing reports whether a resolvable protocol token names a
+// transport that actually carries L4 ports (and thus for which a
+// source-port/destination-port constraint is meaningful). Only TCP, UDP and
+// SCTP carry ports in the userspace matcher and on the wire; ICMP/ICMPv6, GRE,
+// OSPF, ESP, AH, VRRP, IGMP, PIM, IP-in-IP and the like do not. The dataplane
+// (userspace-dp src/policy.rs) indexes every application term by protocol
+// number and keys port terms on src_port/dst_port; for a non-port protocol the
+// packet's ports are always 0, so a port-constrained term on such a protocol is
+// a never-match term — fail-open for a deny rule, fail-closed for a permit
+// rule. This mirrors the inline ProtocolNumber subset (appid cannot be imported
+// here — pkg/appid imports pkg/config, the same import-cycle constraint that
+// forces filterProtocolResolvable to be duplicated). The
+// TestProtocolIsPortBearingMatchesProtocolNumber drift-guard keeps this subset
+// in agreement with appid.ProtocolNumber.
+func protocolIsPortBearing(token string) bool {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "tcp", "junos-tcp-any",
+		"udp", "junos-udp-any",
+		"sctp":
+		return true
+	default:
+		// Numeric protocol number form (e.g. "6"/"17"/"132").
+		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil {
+			return n == 6 || n == 17 || n == 132
+		}
+		return false
+	}
+}
+
+// ProtocolIsPortBearing exposes protocolIsPortBearing for the pkg/appid
+// drift-guard test so the inline port-bearing subset cannot silently drift from
+// appid.ProtocolNumber. Test seam only — production code uses the unexported
+// form directly.
+func ProtocolIsPortBearing(token string) bool {
+	return protocolIsPortBearing(token)
 }
 
 // FilterProtocolResolvable exposes filterProtocolResolvable for the pkg/appid

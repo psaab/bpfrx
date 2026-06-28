@@ -22747,3 +22747,11 @@ top.
   pkg/cli/cli_show_security_log.go,
   pkg/logging/eventbuf_negative_3342_test.go,
   pkg/cli/cli_show_security_log_negative_3342_test.go, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3373 — reject source/destination-port on a non-port-bearing
+    protocol in validateApplicationSpecsStrict (port-bearing set = tcp/udp/sctp);
+    added protocolIsPortBearing helper + drift guard; tests + README.
+  - **File(s)**: pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler_application_specs_test.go,
+    pkg/appid/protocol_number_2124_test.go, pkg/config/README.md, _Log.md
