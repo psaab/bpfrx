@@ -22748,6 +22748,20 @@ top.
   pkg/logging/eventbuf_negative_3342_test.go,
   pkg/cli/cli_show_security_log_negative_3342_test.go, _Log.md
 
+## 2026-06-28 — #3378 monitor security flow trace file hardening
+- **Timestamp**: 2026-06-28
+- **Action**: #3378 — sanitize trace filename (basename only, reject `..`/separators/absolute), open O_NOFOLLOW + regular-file check, create mode 0600 (was 0644). Validate at config and defensively at open.
+- **File(s)**: pkg/cli/monitor.go, pkg/cli/monitor_security_test.go
+
+## 2026-06-28 — #3379 monitor security flow rotation enforcement
+- **Timestamp**: 2026-06-28
+- **Action**: #3379 — enforce size/files rotation in the flow-trace writer (traceWriter + rotateTraceFile); rotate at `size`, cap at `files` generations.
+- **File(s)**: pkg/cli/monitor.go, pkg/cli/monitor_security_test.go
+
+## 2026-06-28 — #3380 monitor security flow/packet-drop fail-open parsing
+- **Timestamp**: 2026-06-28
+- **Action**: #3380 — atomic parse for flow file/filter (commit only after all tokens validate), default cases reject unknown tokens, require option values, reject empty (match-all) filters, reject edits while active; same default+require-value hardening for packet-drop.
+- **File(s)**: pkg/cli/monitor.go, pkg/cli/monitor_security_test.go, pkg/cli/monitor_match_test.go
 - **Timestamp**: 2026-06-28
   - **Action**: #3373 — reject source/destination-port on a non-port-bearing
     protocol in validateApplicationSpecsStrict (port-bearing set = tcp/udp/sctp);

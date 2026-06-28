@@ -5,14 +5,150 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/psaab/xpf/pkg/logging"
 )
+
+// traceLogDir is the directory flow-trace files are written to. It is a
+// package var (not a const) only so tests can redirect it to a temp dir;
+// production always writes under /var/log.
+var traceLogDir = "/var/log"
+
+// sanitizeTraceFilename validates an operator-supplied flow-trace filename.
+// The trace file always lives directly under traceLogDir, so only a bare
+// basename is accepted: path separators, "." / "..", and absolute paths are
+// rejected. Without this a "monitor security flow file ../../etc/x" command
+// resolves to /var/log/../../etc/x and the daemon appends root-written flow
+// telemetry outside the log directory (#3378 HC-01).
+func sanitizeTraceFilename(name string) error {
+	if name == "" {
+		return fmt.Errorf("trace filename must not be empty")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("invalid trace filename: %q", name)
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("trace filename must be a bare name, not a path: %q", name)
+	}
+	if name != filepath.Base(name) {
+		return fmt.Errorf("trace filename must be a bare name, not a path: %q", name)
+	}
+	return nil
+}
+
+// openTraceFile opens the flow-trace file inside traceLogDir with restrictive
+// permissions. The name is sanitized first (basename only), the file is opened
+// O_NOFOLLOW so a pre-planted symlink under /var/log cannot redirect the
+// root-written telemetry (#3378 MC-02), the opened descriptor is verified to be
+// a regular file, and it is created mode 0600 rather than world-readable 0644
+// — flow tuples/zones/policy names are audit-grade telemetry (#3378 MC-01).
+func openTraceFile(name string) (*os.File, string, error) {
+	if err := sanitizeTraceFilename(name); err != nil {
+		return nil, "", err
+	}
+	path := filepath.Join(traceLogDir, name)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, path, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, path, err
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, path, fmt.Errorf("trace target %s is not a regular file", path)
+	}
+	return f, path, nil
+}
+
+// rotateTraceFile closes the current trace file and rolls the generations:
+// the oldest archive (name.maxFiles-1) is dropped, name.N shifts to name.N+1,
+// the active file becomes name.1, and a fresh active file is opened. maxFiles
+// is the total number of generations to keep (active + archives) and is
+// clamped to a 2 minimum. It honors the operator's `files` cap so a long
+// running trace cannot grow without bound (#3379).
+func rotateTraceFile(cur *os.File, name string, maxFiles int) (*os.File, error) {
+	// Best-effort close of the old descriptor. A Close error does not gate the
+	// cap (the file's bytes are already on disk), so it must not abort the
+	// rotation — the rename/remove below are what enforce maxFiles.
+	_ = cur.Close()
+	if maxFiles < 2 {
+		maxFiles = 2
+	}
+	base := filepath.Join(traceLogDir, name)
+	// Drop the oldest archive so the generation count stays within maxFiles. A
+	// missing oldest archive is expected (fewer than maxFiles generations have
+	// accumulated yet) and is fine; any other Remove failure means the count
+	// cap is no longer enforced, so fail closed instead of letting writeLine
+	// reset `written` and keep growing on a broken cap (#3379 follow-up).
+	if err := os.Remove(fmt.Sprintf("%s.%d", base, maxFiles-1)); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("trace rotate: dropping oldest archive: %w", err)
+	}
+	// Shift the surviving archives up by one. A missing intermediate
+	// generation is expected early in a trace, so skip it, but surface any
+	// other failure rather than silently breaking the generation chain.
+	for i := maxFiles - 2; i >= 1; i-- {
+		if err := os.Rename(fmt.Sprintf("%s.%d", base, i), fmt.Sprintf("%s.%d", base, i+1)); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("trace rotate: shifting archive %d->%d: %w", i, i+1, err)
+		}
+	}
+	// Roll the active file to .1. The active file always exists (we just wrote
+	// to it), so a failure here means the size cap did not actually rotate the
+	// file; returning the error makes writeLine stop the writer instead of
+	// reopening and resetting `written` on top of an un-rotated, over-cap file.
+	if err := os.Rename(base, base+".1"); err != nil {
+		return nil, fmt.Errorf("trace rotate: rolling active file: %w", err)
+	}
+	f, _, err := openTraceFile(name)
+	return f, err
+}
+
+// traceWriter wraps the active flow-trace file and enforces size/count based
+// rotation (#3379). A zero maxSize disables rotation (unbounded, the pre-3379
+// behavior only when the operator configured no `size`).
+type traceWriter struct {
+	name     string
+	maxSize  int64
+	maxFiles int
+	f        *os.File
+	written  int64
+}
+
+func newTraceWriter(name string, f *os.File, maxSize int64, maxFiles int) *traceWriter {
+	w := &traceWriter{name: name, maxSize: maxSize, maxFiles: maxFiles, f: f}
+	if fi, err := f.Stat(); err == nil {
+		w.written = fi.Size()
+	}
+	return w
+}
+
+// writeLine appends one trace line, rotating first if appending it would push
+// the active file past maxSize. The byte budget includes the trailing newline.
+func (w *traceWriter) writeLine(line string) error {
+	if w.maxSize > 0 && w.written > 0 && w.written+int64(len(line))+1 > w.maxSize {
+		nf, err := rotateTraceFile(w.f, w.name, w.maxFiles)
+		if err != nil {
+			return err
+		}
+		w.f = nf
+		w.written = 0
+	}
+	n, err := fmt.Fprintln(w.f, line)
+	w.written += int64(n)
+	return err
+}
+
+func (w *traceWriter) close() error { return w.f.Close() }
 
 // monitorFlowFilter holds the criteria for a single named flow filter.
 type monitorFlowFilter struct {
@@ -209,48 +345,85 @@ func (c *CLI) handleMonitorSecurityFlowFile(args []string) error {
 	c.monitorFlow.mu.Lock()
 	defer c.monitorFlow.mu.Unlock()
 
+	if c.monitorFlow.active {
+		fmt.Println("error: stop the active flow monitor before changing the trace file.")
+		return nil
+	}
+
 	if len(args) == 0 {
 		fmt.Println("error: Please specify the trace filename.")
 		return nil
 	}
 
-	// First non-option arg is the filename.
-	c.monitorFlow.filename = args[0]
+	// Parse every token into locals and commit atomically only after all of
+	// them validate (#3380 HC-04/MC-07/MC-08). Previously the filename and
+	// each option were written into the shared state as they were parsed, so a
+	// later failing option (a bad regex, an out-of-range size) left a
+	// half-applied config — including a possibly-traversal filename — behind,
+	// and unknown tokens / value-less options were silently dropped.
+	if err := sanitizeTraceFilename(args[0]); err != nil {
+		fmt.Printf("error: %v\n", err)
+		return nil
+	}
+	filename := args[0]
+	// Seed from current state so existing size/files/match survive a command
+	// that only changes one option.
+	fileSize := c.monitorFlow.fileSize
+	files := c.monitorFlow.files
+	matchPat := c.monitorFlow.match
+	matchRe := c.monitorFlow.matchRe
+
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "size":
-			if i+1 < len(args) {
-				i++
-				v, err := strconv.ParseInt(args[i], 10, 64)
-				if err != nil || v < 10240 || v > 1073741824 {
-					fmt.Println("error: size must be 10240..1073741824")
-					return nil
-				}
-				c.monitorFlow.fileSize = v
+			if i+1 >= len(args) {
+				fmt.Println("error: size requires a value")
+				return nil
 			}
+			i++
+			v, err := strconv.ParseInt(args[i], 10, 64)
+			if err != nil || v < 10240 || v > 1073741824 {
+				fmt.Println("error: size must be 10240..1073741824")
+				return nil
+			}
+			fileSize = v
 		case "files":
-			if i+1 < len(args) {
-				i++
-				v, err := strconv.Atoi(args[i])
-				if err != nil || v < 2 || v > 1000 {
-					fmt.Println("error: files must be 2..1000")
-					return nil
-				}
-				c.monitorFlow.files = v
+			if i+1 >= len(args) {
+				fmt.Println("error: files requires a value")
+				return nil
 			}
+			i++
+			v, err := strconv.Atoi(args[i])
+			if err != nil || v < 2 || v > 1000 {
+				fmt.Println("error: files must be 2..1000")
+				return nil
+			}
+			files = v
 		case "match":
-			if i+1 < len(args) {
-				i++
-				re, err := regexp.Compile(args[i])
-				if err != nil {
-					fmt.Printf("error: invalid match regex %q: %v\n", args[i], err)
-					return nil
-				}
-				c.monitorFlow.match = args[i]
-				c.monitorFlow.matchRe = re
+			if i+1 >= len(args) {
+				fmt.Println("error: match requires a value")
+				return nil
 			}
+			i++
+			re, err := regexp.Compile(args[i])
+			if err != nil {
+				fmt.Printf("error: invalid match regex %q: %v\n", args[i], err)
+				return nil
+			}
+			matchPat = args[i]
+			matchRe = re
+		default:
+			fmt.Printf("error: unknown flow file option: %s\n", args[i])
+			return nil
 		}
 	}
+
+	// All tokens validated: commit.
+	c.monitorFlow.filename = filename
+	c.monitorFlow.fileSize = fileSize
+	c.monitorFlow.files = files
+	c.monitorFlow.match = matchPat
+	c.monitorFlow.matchRe = matchRe
 	return nil
 }
 
@@ -262,89 +435,128 @@ func (c *CLI) handleMonitorSecurityFlowFilter(args []string) error {
 	c.monitorFlow.mu.Lock()
 	defer c.monitorFlow.mu.Unlock()
 
+	if c.monitorFlow.active {
+		fmt.Println("error: stop the active flow monitor before editing filters.")
+		return nil
+	}
+
 	if len(args) == 0 {
 		fmt.Println("error: Please specify the filter name.")
 		return nil
 	}
 
+	// Build into a temporary filter (seeded from the existing one if present)
+	// and commit it into the map only after every token validates (#3380
+	// HC-03/MC-07/MC-08). Previously the named filter was inserted before any
+	// value was parsed, so a command that then failed left an empty filter in
+	// the map — and an empty filter matches every event, silently arming broad
+	// tracing of all flows. Unknown tokens and value-less options were also
+	// dropped, widening collection instead of erroring.
 	name := args[0]
-	f, ok := c.monitorFlow.filters[name]
-	if !ok {
-		f = &monitorFlowFilter{Name: name}
-		c.monitorFlow.filters[name] = f
+	f := &monitorFlowFilter{Name: name}
+	if existing, ok := c.monitorFlow.filters[name]; ok {
+		fc := *existing
+		f = &fc
 	}
 
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "source-prefix":
-			if i+1 < len(args) {
-				i++
-				_, cidr, err := net.ParseCIDR(args[i])
-				if err != nil {
-					// Try as host address
-					ip := net.ParseIP(args[i])
-					if ip == nil {
-						fmt.Printf("error: invalid source-prefix: %s\n", args[i])
-						return nil
-					}
-					if ip.To4() != nil {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
-					} else {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
-					}
-				}
-				f.SrcIP = cidr
+			if i+1 >= len(args) {
+				fmt.Println("error: source-prefix requires a value")
+				return nil
 			}
+			i++
+			_, cidr, err := net.ParseCIDR(args[i])
+			if err != nil {
+				// Try as host address
+				ip := net.ParseIP(args[i])
+				if ip == nil {
+					fmt.Printf("error: invalid source-prefix: %s\n", args[i])
+					return nil
+				}
+				if ip.To4() != nil {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+				} else {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+				}
+			}
+			f.SrcIP = cidr
 		case "destination-prefix":
-			if i+1 < len(args) {
-				i++
-				_, cidr, err := net.ParseCIDR(args[i])
-				if err != nil {
-					ip := net.ParseIP(args[i])
-					if ip == nil {
-						fmt.Printf("error: invalid destination-prefix: %s\n", args[i])
-						return nil
-					}
-					if ip.To4() != nil {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
-					} else {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
-					}
-				}
-				f.DstIP = cidr
+			if i+1 >= len(args) {
+				fmt.Println("error: destination-prefix requires a value")
+				return nil
 			}
+			i++
+			_, cidr, err := net.ParseCIDR(args[i])
+			if err != nil {
+				ip := net.ParseIP(args[i])
+				if ip == nil {
+					fmt.Printf("error: invalid destination-prefix: %s\n", args[i])
+					return nil
+				}
+				if ip.To4() != nil {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+				} else {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+				}
+			}
+			f.DstIP = cidr
 		case "source-port":
-			if i+1 < len(args) {
-				i++
-				p, err := strconv.ParseUint(args[i], 10, 16)
-				if err != nil {
-					fmt.Printf("error: invalid source-port: %s\n", args[i])
-					return nil
-				}
-				f.SrcPort = uint16(p)
+			if i+1 >= len(args) {
+				fmt.Println("error: source-port requires a value")
+				return nil
 			}
+			i++
+			p, err := strconv.ParseUint(args[i], 10, 16)
+			if err != nil {
+				fmt.Printf("error: invalid source-port: %s\n", args[i])
+				return nil
+			}
+			f.SrcPort = uint16(p)
 		case "destination-port":
-			if i+1 < len(args) {
-				i++
-				p, err := strconv.ParseUint(args[i], 10, 16)
-				if err != nil {
-					fmt.Printf("error: invalid destination-port: %s\n", args[i])
-					return nil
-				}
-				f.DstPort = uint16(p)
+			if i+1 >= len(args) {
+				fmt.Println("error: destination-port requires a value")
+				return nil
 			}
+			i++
+			p, err := strconv.ParseUint(args[i], 10, 16)
+			if err != nil {
+				fmt.Printf("error: invalid destination-port: %s\n", args[i])
+				return nil
+			}
+			f.DstPort = uint16(p)
 		case "protocol":
-			if i+1 < len(args) {
-				i++
-				f.Protocol = args[i]
+			if i+1 >= len(args) {
+				fmt.Println("error: protocol requires a value")
+				return nil
 			}
+			i++
+			f.Protocol = args[i]
 		case "interface":
-			if i+1 < len(args) {
-				i++
-				f.Iface = args[i]
+			if i+1 >= len(args) {
+				fmt.Println("error: interface requires a value")
+				return nil
 			}
+			i++
+			f.Iface = args[i]
+		default:
+			fmt.Printf("error: unknown flow filter option: %s\n", args[i])
+			return nil
 		}
 	}
+
+	// Reject a filter with no match criteria: an empty filter matches every
+	// event, so silently installing one would fail open into broad tracing of
+	// all flows (#3380 HC-03).
+	if f.SrcIP == nil && f.DstIP == nil && f.SrcPort == 0 && f.DstPort == 0 &&
+		f.Protocol == "" && f.Iface == "" {
+		fmt.Println("error: filter requires at least one match criterion.")
+		return nil
+	}
+
+	// All tokens validated: commit the filter atomically.
+	c.monitorFlow.filters[name] = f
 	return nil
 }
 
@@ -385,13 +597,18 @@ func (c *CLI) handleMonitorSecurityFlowStart() error {
 	// <regex>` filter actually drops non-matching trace lines (#2288).
 	matchRe := c.monitorFlow.matchRe
 
-	// Open trace file.
-	path := "/var/log/" + c.monitorFlow.filename
-	logFile, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// Snapshot the rotation limits for the writer (#3379).
+	traceName := c.monitorFlow.filename
+	maxSize := c.monitorFlow.fileSize
+	maxFiles := c.monitorFlow.files
+
+	// Open trace file inside /var/log with a sanitized basename, O_NOFOLLOW,
+	// regular-file verification and mode 0600 (#3378).
+	logFile, _, err := openTraceFile(c.monitorFlow.filename)
 	if err != nil {
 		c.monitorFlow.active = false
 		c.monitorFlow.mu.Unlock()
-		return fmt.Errorf("failed to open trace file %s: %w", path, err)
+		return fmt.Errorf("failed to open trace file: %w", err)
 	}
 
 	// Subscribe to event buffer.
@@ -402,9 +619,12 @@ func (c *CLI) handleMonitorSecurityFlowStart() error {
 	c.monitorFlow.cancel = cancel
 	c.monitorFlow.mu.Unlock()
 
-	// Run the monitor goroutine in the background.
+	// Run the monitor goroutine in the background. The writer enforces the
+	// configured size/files rotation so the trace cannot grow unbounded under
+	// a deny storm or a broad filter (#3379).
+	writer := newTraceWriter(traceName, logFile, maxSize, maxFiles)
 	go func() {
-		defer logFile.Close()
+		defer writer.close()
 		defer sub.Close()
 		for {
 			select {
@@ -426,7 +646,11 @@ func (c *CLI) handleMonitorSecurityFlowStart() error {
 				if !traceLineMatches(line, matchRe) {
 					continue
 				}
-				fmt.Fprintln(logFile, line)
+				if err := writer.writeLine(line); err != nil {
+					// Rotation or write failed; stop tracing rather than grow
+					// the active file without bound.
+					return
+				}
 			}
 		}
 	}()
@@ -468,7 +692,7 @@ func (c *CLI) showMonitorSecurityFlow() error {
 
 	fmt.Printf("  Monitor security flow session status: %s\n", status)
 	if c.monitorFlow.filename != "" {
-		fmt.Printf("  Monitor security flow trace file: /var/log/%s\n", c.monitorFlow.filename)
+		fmt.Printf("  Monitor security flow trace file: %s\n", filepath.Join(traceLogDir, c.monitorFlow.filename))
 	} else {
 		fmt.Printf("  Monitor security flow trace file: (not configured)\n")
 	}
@@ -539,86 +763,105 @@ func (c *CLI) handleMonitorSecurityPacketDrop(args []string) error {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "source-prefix":
-			if i+1 < len(args) {
-				i++
-				_, cidr, err := net.ParseCIDR(args[i])
-				if err != nil {
-					ip := net.ParseIP(args[i])
-					if ip == nil {
-						fmt.Printf("error: invalid source-prefix: %s\n", args[i])
-						return nil
-					}
-					if ip.To4() != nil {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
-					} else {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
-					}
-				}
-				srcIP = cidr
+			if i+1 >= len(args) {
+				fmt.Println("error: source-prefix requires a value")
+				return nil
 			}
+			i++
+			_, cidr, err := net.ParseCIDR(args[i])
+			if err != nil {
+				ip := net.ParseIP(args[i])
+				if ip == nil {
+					fmt.Printf("error: invalid source-prefix: %s\n", args[i])
+					return nil
+				}
+				if ip.To4() != nil {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+				} else {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+				}
+			}
+			srcIP = cidr
 		case "destination-prefix":
-			if i+1 < len(args) {
-				i++
-				_, cidr, err := net.ParseCIDR(args[i])
-				if err != nil {
-					ip := net.ParseIP(args[i])
-					if ip == nil {
-						fmt.Printf("error: invalid destination-prefix: %s\n", args[i])
-						return nil
-					}
-					if ip.To4() != nil {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
-					} else {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
-					}
-				}
-				dstIP = cidr
+			if i+1 >= len(args) {
+				fmt.Println("error: destination-prefix requires a value")
+				return nil
 			}
+			i++
+			_, cidr, err := net.ParseCIDR(args[i])
+			if err != nil {
+				ip := net.ParseIP(args[i])
+				if ip == nil {
+					fmt.Printf("error: invalid destination-prefix: %s\n", args[i])
+					return nil
+				}
+				if ip.To4() != nil {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+				} else {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+				}
+			}
+			dstIP = cidr
 		case "source-port":
-			if i+1 < len(args) {
-				i++
-				p, err := strconv.ParseUint(args[i], 10, 16)
-				if err != nil {
-					fmt.Printf("error: invalid source-port: %s\n", args[i])
-					return nil
-				}
-				srcPort = uint16(p)
+			if i+1 >= len(args) {
+				fmt.Println("error: source-port requires a value")
+				return nil
 			}
+			i++
+			p, err := strconv.ParseUint(args[i], 10, 16)
+			if err != nil {
+				fmt.Printf("error: invalid source-port: %s\n", args[i])
+				return nil
+			}
+			srcPort = uint16(p)
 		case "destination-port":
-			if i+1 < len(args) {
-				i++
-				p, err := strconv.ParseUint(args[i], 10, 16)
-				if err != nil {
-					fmt.Printf("error: invalid destination-port: %s\n", args[i])
-					return nil
-				}
-				dstPort = uint16(p)
+			if i+1 >= len(args) {
+				fmt.Println("error: destination-port requires a value")
+				return nil
 			}
+			i++
+			p, err := strconv.ParseUint(args[i], 10, 16)
+			if err != nil {
+				fmt.Printf("error: invalid destination-port: %s\n", args[i])
+				return nil
+			}
+			dstPort = uint16(p)
 		case "protocol":
-			if i+1 < len(args) {
-				i++
-				protocol = args[i]
+			if i+1 >= len(args) {
+				fmt.Println("error: protocol requires a value")
+				return nil
 			}
+			i++
+			protocol = args[i]
 		case "from-zone":
-			if i+1 < len(args) {
-				i++
-				fromZone = args[i]
+			if i+1 >= len(args) {
+				fmt.Println("error: from-zone requires a value")
+				return nil
 			}
+			i++
+			fromZone = args[i]
 		case "interface":
-			if i+1 < len(args) {
-				i++
-				iface = args[i]
+			if i+1 >= len(args) {
+				fmt.Println("error: interface requires a value")
+				return nil
 			}
+			i++
+			iface = args[i]
 		case "count":
-			if i+1 < len(args) {
-				i++
-				v, err := strconv.Atoi(args[i])
-				if err != nil || v < 1 || v > 8192 {
-					fmt.Println("error: count must be 1..8192")
-					return nil
-				}
-				count = v
+			if i+1 >= len(args) {
+				fmt.Println("error: count requires a value")
+				return nil
 			}
+			i++
+			v, err := strconv.Atoi(args[i])
+			if err != nil || v < 1 || v > 8192 {
+				fmt.Println("error: count must be 1..8192")
+				return nil
+			}
+			count = v
+		default:
+			fmt.Printf("error: unknown packet-drop option: %s\n", args[i])
+			return nil
 		}
 	}
 
