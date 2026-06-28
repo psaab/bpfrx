@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"sort"
 	"strconv"
@@ -687,6 +688,66 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 	for _, inst := range namedInstances(node.FindChildren("ids-option")) {
 		profile := &ScreenProfile{Name: inst.name}
 
+		// parseThresh parses an explicitly-provided screen numeric value. An
+		// EMPTY value means the leaf was enabled without an explicit threshold:
+		// ok=false signals the caller to apply the Junos default (#3230) — that
+		// is NOT a bad value. A non-empty value that fails to parse or is not a
+		// positive integer is recorded on profile.BadNumeric for
+		// validateScreenNumericStrict (#3317): before this the strconv error was
+		// swallowed and the leaf silently became the default or zero/disabled
+		// (fail-open). ok=false on a bad value too, so the lenient / load path
+		// still falls back to the default and boots (#1960 no-brick).
+		parseThresh := func(path, val string) (int, bool) {
+			if val == "" {
+				return 0, false
+			}
+			n, err := strconv.Atoi(val)
+			// Reject non-numeric, non-positive, AND > math.MaxUint32. Every
+			// published screen threshold is cast to uint32 in the snapshot
+			// builder (pkg/dataplane/userspace/screens.go) — a value above
+			// 2^32-1 (e.g. 4294967296) would WRAP on that cast (uint32(2^32)==0),
+			// and the Rust screen treats a zero threshold as unset and OMITS the
+			// check. That is the exact fail-open class #3317 closes, so the gate
+			// must reject it at commit rather than let it wrap silently. int64(n)
+			// keeps the comparison portable: on a 32-bit `int` platform an
+			// over-2^32 literal already fails Atoi (err != nil), so this only
+			// adds a real bound on 64-bit. The dataplane-meaningful ceilings are
+			// tighter still (e.g. maxScanSweepThreshold clamps port-scan/ip-sweep
+			// downstream), but math.MaxUint32 is the required floor that prevents
+			// the wrap.
+			if err != nil || n < 1 || int64(n) > math.MaxUint32 {
+				profile.BadNumeric = append(profile.BadNumeric,
+					ScreenBadNumeric{Path: path, Value: val})
+				return 0, false
+			}
+			return n, true
+		}
+		// numVal extracts the numeric value a screen leaf carries at Keys[keyIdx].
+		// In both AST shapes a leaf collapses its tokens onto Keys, so the value
+		// is at a fixed offset: a `threshold <N>` leaf carries it at Keys[1]
+		// (keyIdx=1); a `flood threshold <N>` leaf carries the intermediate
+		// `threshold` keyword at Keys[1] and the number at Keys[2] (keyIdx=2).
+		// nodeVal (Keys[1]) is the fallback only when Keys is too short. An empty
+		// result means the leaf was enabled without an explicit value.
+		numVal := func(n *Node, keyIdx int) string {
+			if len(n.Keys) > keyIdx {
+				return n.Keys[keyIdx]
+			}
+			return nodeVal(n)
+		}
+
+		// #3318: the screen schema subtrees are open. Record any unknown/
+		// unsupported top-level screen family so validateScreenUnknownStrict can
+		// reject the commit fail-closed instead of silently dropping it.
+		for _, fam := range inst.node.Children {
+			switch fam.Name() {
+			case "icmp", "ip", "tcp", "udp", "limit-session":
+				// handled below
+			default:
+				profile.UnknownLeaves = append(profile.UnknownLeaves, fam.Name())
+			}
+		}
+
 		icmpNode := inst.node.FindChild("icmp")
 		if icmpNode != nil {
 			for _, opt := range icmpNode.Children {
@@ -696,14 +757,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 				case "fragment":
 					profile.ICMP.Fragment = true
 				case "flood":
-					if len(opt.Keys) >= 3 {
-						if v, err := strconv.Atoi(opt.Keys[2]); err == nil {
-							profile.ICMP.FloodThreshold = v
-						}
-					} else if v := nodeVal(opt); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							profile.ICMP.FloodThreshold = n
-						}
+					if n, ok := parseThresh("icmp flood", numVal(opt, 2)); ok {
+						profile.ICMP.FloodThreshold = n
 					}
 					// icmp flood enabled without an explicit threshold: arm at
 					// the Junos default (1000 pps) so the dataplane `>0` gate
@@ -711,6 +766,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					if profile.ICMP.FloodThreshold <= 0 {
 						profile.ICMP.FloodThreshold = defaultICMPFloodThreshold
 					}
+				default:
+					profile.UnknownLeaves = append(profile.UnknownLeaves, "icmp "+opt.Name())
 				}
 			}
 		}
@@ -725,14 +782,13 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					profile.IP.TearDrop = true
 				case "ip-sweep":
 					for _, swOpt := range opt.Children {
-						if swOpt.Name() == "threshold" {
-							val := nodeVal(swOpt)
-							if val == "" && len(swOpt.Keys) >= 2 {
-								val = swOpt.Keys[1]
-							}
-							if n, err := strconv.Atoi(val); err == nil {
+						switch swOpt.Name() {
+						case "threshold":
+							if n, ok := parseThresh("ip ip-sweep threshold", numVal(swOpt, 1)); ok {
 								profile.IP.IPSweepThreshold = n
 							}
+						default:
+							profile.UnknownLeaves = append(profile.UnknownLeaves, "ip ip-sweep "+swOpt.Name())
 						}
 					}
 					// ip-sweep enabled without an explicit threshold: arm at the
@@ -742,6 +798,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					if profile.IP.IPSweepThreshold <= 0 {
 						profile.IP.IPSweepThreshold = defaultIPSweepThreshold
 					}
+				default:
+					profile.UnknownLeaves = append(profile.UnknownLeaves, "ip "+opt.Name())
 				}
 			}
 		}
@@ -765,24 +823,30 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 				case "syn-flood":
 					sf := &SynFloodConfig{}
 					for _, sfOpt := range opt.Children {
-						val := nodeVal(sfOpt)
-						if val == "" && len(sfOpt.Keys) >= 2 {
-							val = sfOpt.Keys[1]
-						}
-						if val != "" {
-							n, _ := strconv.Atoi(val)
-							switch sfOpt.Name() {
-							case "alarm-threshold":
+						val := numVal(sfOpt, 1)
+						switch sfOpt.Name() {
+						case "alarm-threshold":
+							if n, ok := parseThresh("tcp syn-flood alarm-threshold", val); ok {
 								sf.AlarmThreshold = n
-							case "attack-threshold":
+							}
+						case "attack-threshold":
+							if n, ok := parseThresh("tcp syn-flood attack-threshold", val); ok {
 								sf.AttackThreshold = n
-							case "source-threshold":
+							}
+						case "source-threshold":
+							if n, ok := parseThresh("tcp syn-flood source-threshold", val); ok {
 								sf.SourceThreshold = n
-							case "destination-threshold":
+							}
+						case "destination-threshold":
+							if n, ok := parseThresh("tcp syn-flood destination-threshold", val); ok {
 								sf.DestinationThreshold = n
-							case "timeout":
+							}
+						case "timeout":
+							if n, ok := parseThresh("tcp syn-flood timeout", val); ok {
 								sf.Timeout = n
 							}
+						default:
+							profile.UnknownLeaves = append(profile.UnknownLeaves, "tcp syn-flood "+sfOpt.Name())
 						}
 					}
 					// Junos applies a default attack-threshold of 200
@@ -798,14 +862,13 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					profile.TCP.SynFlood = sf
 				case "port-scan":
 					for _, psOpt := range opt.Children {
-						if psOpt.Name() == "threshold" {
-							val := nodeVal(psOpt)
-							if val == "" && len(psOpt.Keys) >= 2 {
-								val = psOpt.Keys[1]
-							}
-							if n, err := strconv.Atoi(val); err == nil {
+						switch psOpt.Name() {
+						case "threshold":
+							if n, ok := parseThresh("tcp port-scan threshold", numVal(psOpt, 1)); ok {
 								profile.TCP.PortScanThreshold = n
 							}
+						default:
+							profile.UnknownLeaves = append(profile.UnknownLeaves, "tcp port-scan "+psOpt.Name())
 						}
 					}
 					// port-scan enabled without an explicit threshold: arm at
@@ -815,6 +878,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					if profile.TCP.PortScanThreshold <= 0 {
 						profile.TCP.PortScanThreshold = defaultPortScanThreshold
 					}
+				default:
+					profile.UnknownLeaves = append(profile.UnknownLeaves, "tcp "+opt.Name())
 				}
 			}
 		}
@@ -824,14 +889,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			for _, opt := range udpNode.Children {
 				switch opt.Name() {
 				case "flood":
-					if len(opt.Keys) >= 3 {
-						if v, err := strconv.Atoi(opt.Keys[2]); err == nil {
-							profile.UDP.FloodThreshold = v
-						}
-					} else if v := nodeVal(opt); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							profile.UDP.FloodThreshold = n
-						}
+					if n, ok := parseThresh("udp flood", numVal(opt, 2)); ok {
+						profile.UDP.FloodThreshold = n
 					}
 					// udp flood enabled without an explicit threshold: arm at
 					// the Junos default (1000 pps) so the dataplane `>0` gate
@@ -839,6 +898,8 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					if profile.UDP.FloodThreshold <= 0 {
 						profile.UDP.FloodThreshold = defaultUDPFloodThreshold
 					}
+				default:
+					profile.UnknownLeaves = append(profile.UnknownLeaves, "udp "+opt.Name())
 				}
 			}
 		}
@@ -846,18 +907,18 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 		limitNode := inst.node.FindChild("limit-session")
 		if limitNode != nil {
 			for _, opt := range limitNode.Children {
-				val := nodeVal(opt)
-				if val == "" && len(opt.Keys) >= 2 {
-					val = opt.Keys[1]
-				}
-				if val != "" {
-					n, _ := strconv.Atoi(val)
-					switch opt.Name() {
-					case "source-ip-based":
+				val := numVal(opt, 1)
+				switch opt.Name() {
+				case "source-ip-based":
+					if n, ok := parseThresh("limit-session source-ip-based", val); ok {
 						profile.LimitSession.SourceIPBased = n
-					case "destination-ip-based":
+					}
+				case "destination-ip-based":
+					if n, ok := parseThresh("limit-session destination-ip-based", val); ok {
 						profile.LimitSession.DestinationIPBased = n
 					}
+				default:
+					profile.UnknownLeaves = append(profile.UnknownLeaves, "limit-session "+opt.Name())
 				}
 			}
 		}
