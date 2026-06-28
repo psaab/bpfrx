@@ -440,11 +440,12 @@ func TestHostInboundFilterApplyFailureSurfaced(t *testing.T) {
 }
 
 // TestHostInboundFilterDeleteFailureSurfaced is the #3333 fail-on-revert proof
-// for the TEARDOWN path: when no zone is enforceable, the stale table is
-// removed via `nft destroy`; a genuine destroy failure (stale deny left in the
-// kernel) must surface as an error. `destroy` is idempotent for the benign
-// absent-table case, so any error from the seam is a real failure. Pre-fix the
-// delete error was discarded entirely (`_, _ =`), so this goes RED.
+// for the TEARDOWN path: when no zone is enforceable, the stale table is removed
+// via the idempotent add-then-delete payload; a genuine teardown failure (stale
+// deny left in the kernel) must surface as an error. The add+delete is
+// idempotent for the benign absent-table case, so any error from the seam is a
+// real failure. Pre-fix the delete error was discarded entirely (`_, _ =`), so
+// this goes RED.
 func TestHostInboundFilterDeleteFailureSurfaced(t *testing.T) {
 	// A config with no enforceable host-inbound view (no zone declares a
 	// stanza) drives the teardown branch.
@@ -479,7 +480,38 @@ func TestHostInboundFilterDeleteFailureSurfaced(t *testing.T) {
 		t.Fatal("teardown failure must be surfaced as an error (fail-closed), got nil")
 	}
 	if !errors.Is(err, injected) {
-		t.Errorf("returned error must wrap the nft destroy failure, got %v", err)
+		t.Errorf("returned error must wrap the nft teardown failure, got %v", err)
+	}
+}
+
+// TestNftDeleteTableIdempotentAddDelete pins the #3333 MAJOR-2 teardown shape:
+// the default nftDeleteTable must NOT depend on the recent `nft destroy` verb
+// (the project pins no minimum nftables version), and must instead emit an
+// idempotent add-then-delete payload through the atomic nftApplyPayload runner.
+// Reverting to `nft destroy` (or dropping the `add`) turns this RED.
+func TestNftDeleteTableIdempotentAddDelete(t *testing.T) {
+	var got string
+	orig := nftApplyPayload
+	nftApplyPayload = func(payload string) ([]byte, error) { got = payload; return nil, nil }
+	defer func() { nftApplyPayload = orig }()
+
+	if _, err := nftDeleteTable("inet", "xpf_hostinbound"); err != nil {
+		t.Fatalf("nftDeleteTable: %v", err)
+	}
+	if strings.Contains(got, "destroy") {
+		t.Errorf("teardown must not use the unpinned `nft destroy` verb:\n%s", got)
+	}
+	for _, want := range []string{
+		"add table inet xpf_hostinbound",
+		"delete table inet xpf_hostinbound",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("teardown payload missing %q:\n%s", want, got)
+		}
+	}
+	// `add` must precede `delete` so the delete always has a target.
+	if strings.Index(got, "add table") > strings.Index(got, "delete table") {
+		t.Errorf("add must precede delete in the teardown payload:\n%s", got)
 	}
 }
 

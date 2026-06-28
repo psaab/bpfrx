@@ -22803,3 +22803,21 @@ top.
   - **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/daemon_apply.go,
     pkg/daemon/host_inbound_nft_test.go, pkg/daemon/daemon_apply_runtime_test.go,
     _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3333 Codex re-review fold (PR #3389). MAJOR-2: replaced the
+    `nft destroy` teardown (recent verb; project pins no min nftables version)
+    with an idempotent `add table` + `delete table` payload through
+    nftApplyPayload — universal verbs only, still surfaces real failures,
+    mirrors the in-tree `delete` idiom. MAJOR-6: added a commit-level wiring
+    test (TestApplyConfigLockedSurfacesHostInboundFailure) driving the real
+    applyConfigLocked with an injected nft failure, asserting the returned
+    error includes hostInboundErr (RED on removing it from errors.Join). Added
+    TestNftDeleteTableIdempotentAddDelete pinning the add+delete teardown
+    shape. MAJOR-4: confirmed (no code change) — syncAndApply returns the
+    applyConfigLocked error verbatim and the HA config-sync caller
+    (daemon_ha_sync.go:368) logs+returns, the same path that already carries
+    networkdErr/dhcpServerErr; no retry loop or standby wedge.
+  - **File(s)**: pkg/daemon/daemon_nft.go,
+    pkg/daemon/host_inbound_nft_test.go,
+    pkg/daemon/daemon_apply_runtime_test.go, _Log.md

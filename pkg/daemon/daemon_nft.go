@@ -29,16 +29,23 @@ var nftApplyPayload = func(payload string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
-// nftDeleteTable idempotently removes an nft table. It uses `nft destroy`
-// rather than `nft delete`: `destroy` is a no-op when the table is absent (the
-// common no-host-inbound case), so it returns no error for the benign
-// never-existed case while a genuine teardown failure — which would leave stale
-// deny rules in the kernel — surfaces as an error. That lets the host-inbound
-// teardown fail closed (#3333). `destroy` is available on the project's nft
-// floor (Ubuntu 26.04 / nftables 1.1.x, kernel >= 6.18). Package var for test
-// failure injection.
+// nftDeleteTable idempotently removes an nft table using only the universally
+// available `add` / `delete` verbs (NOT `nft destroy`). `destroy` is a recent
+// nftables verb and the project does not pin a minimum nftables version
+// (debian/control depends on UNVERSIONED `nftables`, with no preflight), so a
+// `destroy` dependency would raise "unknown command" on any non-floor base —
+// and, now that teardown failures propagate (#3333), that would fail EVERY
+// commit. Instead emit a two-line `nft -f -` payload: `add table` makes the
+// table exist (a no-op when it already does), so the following `delete table`
+// always has a target whether or not the table pre-existed — idempotent without
+// `destroy`. A genuine failure (permissions / kernel) still surfaces on either
+// line. This mirrors the established in-tree `delete table` idiom (applyLo0Filter
+// below, scripts/migrate-bpfrx-to-xpf.sh) and reuses the atomic nftApplyPayload
+// runner. Package var for test failure injection.
 var nftDeleteTable = func(family, name string) ([]byte, error) {
-	return runCommandTimeout("nft", "destroy", "table", family, name)
+	payload := "add table " + family + " " + name + "\n" +
+		"delete table " + family + " " + name + "\n"
+	return nftApplyPayload(payload)
 }
 
 // applyLo0Filter applies loopback filter rules for host-bound traffic.
@@ -149,11 +156,11 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	views := dpuserspace.BuildZoneHostInboundViews(cfg)
 	if !hostInboundHasEnforceableView(views) {
 		// No host-inbound-configured zone with a resolvable address — nothing to
-		// enforce. Remove any stale table. nftDeleteTable uses `nft destroy`,
-		// which is idempotent (no error when the table is absent — the common
-		// case), so a non-nil error here is a REAL teardown failure that left a
-		// stale deny in the kernel: surface it so the commit fails closed rather
-		// than reporting that host-inbound was relaxed when it was not.
+		// enforce. Remove any stale table. nftDeleteTable is idempotent (an
+		// add-then-delete payload, so no error when the table is absent — the
+		// common case), so a non-nil error here is a REAL teardown failure that
+		// left a stale deny in the kernel: surface it so the commit fails closed
+		// rather than reporting that host-inbound was relaxed when it was not.
 		if out, err := nftDeleteTable("inet", "xpf_hostinbound"); err != nil {
 			slog.Warn("failed to delete stale host-inbound filter table", "err", err, "output", string(out))
 			return fmt.Errorf("delete stale host-inbound nftables table: %w", err)
