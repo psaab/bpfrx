@@ -911,22 +911,27 @@ struct CompiledApplications {
 #[derive(Clone, Debug, Default)]
 struct ProtoTerms {
     /// Exact destination port set (single-port terms compiled for O(1) lookup).
-    /// #3227: the value is the term's per-application inactivity timeout
-    /// (`None` = use the global per-protocol timeout). First writer wins on an
-    /// overlapping port (matches the catalog "first match wins" convention).
-    exact_dst_ports: FxHashMap<u16, Option<u32>>,
-    /// Port range terms that need linear scan (multi-port ranges).
-    /// #3227: third tuple element is the term's inactivity timeout.
-    range_terms: Vec<(Vec<PortRange>, Vec<PortRange>, Option<u32>)>, // (src, dst, timeout)
+    /// #3227: the value carries the term's per-application inactivity timeout
+    /// (`None` = use the global per-protocol timeout). #3346: the value also
+    /// carries the term's CONFIG-ORDER index (`u32`) so cross-class precedence
+    /// can honor Junos first-term-wins instead of always probing exact before
+    /// range/icmp. First writer wins on an overlapping port (the lower config
+    /// index, matching the catalog "first match wins" convention).
+    exact_dst_ports: FxHashMap<u16, (u32, Option<u32>)>, // port -> (order, timeout)
+    /// Port range terms that need linear scan (multi-port ranges). #3346: the
+    /// leading `u32` is the term's config-order index; the trailing element is
+    /// the #3227 inactivity timeout. Pushed in config order, so the first
+    /// matching entry in the vector is the lowest-order matching range.
+    range_terms: Vec<(u32, Vec<PortRange>, Vec<PortRange>, Option<u32>)>, // (order, src, dst, timeout)
     /// #3020: ICMP/ICMPv6 type[,code] constraints for icmp-constrained terms
-    /// (e.g. junos-ping = type 8). Each entry is `(type, optional code,
-    /// inactivity timeout)`. A packet matches this protocol via the icmp path
-    /// iff its type (and code, when the entry constrains it) equals one of these
-    /// entries. An UNCONSTRAINED ICMP term (junos-icmp-all) does NOT land here —
-    /// it stays a `range_terms` entry with empty ranges, which matches every
-    /// ICMP packet, so a rule citing both still matches all ICMP. #3227 added
-    /// the trailing timeout.
-    icmp_constraints: Vec<(u8, Option<u8>, Option<u32>)>,
+    /// (e.g. junos-ping = type 8). #3346: each entry is `(config-order index,
+    /// type, optional code, inactivity timeout)`. A packet matches this protocol
+    /// via the icmp path iff its type (and code, when the entry constrains it)
+    /// equals one of these entries. An UNCONSTRAINED ICMP term (junos-icmp-all)
+    /// does NOT land here — it stays a `range_terms` entry with empty ranges,
+    /// which matches every ICMP packet, so a rule citing both still matches all
+    /// ICMP. Pushed in config order. #3227 added the timeout.
+    icmp_constraints: Vec<(u32, u8, Option<u8>, Option<u32>)>, // (order, type, code, timeout)
 }
 
 impl CompiledApplications {
@@ -938,7 +943,13 @@ impl CompiledApplications {
             };
         }
         let mut by_protocol: FxHashMap<u8, ProtoTerms> = FxHashMap::default();
-        for app in apps {
+        // #3346: stamp each term with its CONFIG-ORDER index (the order the
+        // operator listed the applications, preserved by the Go emit path —
+        // capabilities.go resolveUserspaceApplicationNames, #3298). The index is
+        // assigned across ALL terms of the rule; since matching is per-protocol,
+        // the relative order WITHIN a protocol is what `matches` compares, and
+        // that relative order is preserved by a single monotonic counter.
+        for (order, app) in (0u32..).zip(apps.iter()) {
             let entry = by_protocol.entry(app.protocol).or_default();
             // #3020: an ICMP/ICMPv6 term with a type constraint (junos-ping)
             // is steered to `icmp_constraints` so it matches ONLY that type
@@ -951,6 +962,7 @@ impl CompiledApplications {
             // constraint takes precedence so a stray port is irrelevant here.)
             if app.icmp_type.is_some() {
                 entry.icmp_constraints.push((
+                    order,
                     app.icmp_type.expect("icmp_type is Some"),
                     app.icmp_code,
                     // #3227: carry the term's idle timeout onto the constraint.
@@ -960,14 +972,16 @@ impl CompiledApplications {
                 && app.destination_ports.len() == 1
                 && app.destination_ports[0].low == app.destination_ports[0].high
             {
-                // #3227: store the term timeout keyed by exact port. First
-                // writer wins on an overlapping port so precedence is stable.
+                // #3227: store the term timeout keyed by exact port. #3346: also
+                // store the config-order index. First writer wins on an
+                // overlapping port (the lower order) so precedence is stable.
                 entry
                     .exact_dst_ports
                     .entry(app.destination_ports[0].low)
-                    .or_insert(app.inactivity_timeout);
+                    .or_insert((order, app.inactivity_timeout));
             } else {
                 entry.range_terms.push((
+                    order,
                     app.source_ports.clone(),
                     app.destination_ports.clone(),
                     // #3227: carry the term's idle timeout onto the range entry.
@@ -995,11 +1009,18 @@ impl CompiledApplications {
     ///   - `None`              → no application term matched (rule does not apply)
     ///   - `Some(None)`        → matched, no custom timeout (use the global one)
     ///   - `Some(Some(secs))`  → matched, use this per-app idle timeout
-    /// Precedence among a rule's terms is the lookup order: the exact
-    /// destination-port term wins first, then range terms in config order, then
-    /// ICMP-type-constrained terms — the first hit supplies the timeout. The
-    /// match-any short-circuit yields `Some(None)` (use-global), so an
-    /// `application any` rule is byte-identical to today.
+    /// #3346: precedence among a rule's terms is CONFIG ORDER — the FIRST term
+    /// the operator listed that matches supplies the timeout (Junos
+    /// first-term-wins), regardless of which class (exact-port / range / icmp)
+    /// it lands in. Each term carries its config-order index; this gathers the
+    /// best (lowest-index) match across all three classes. The O(1) exact-port
+    /// map is retained purely as a lookup accelerator for the common
+    /// single-port term, NOT as a precedence tier — before #3346 it always beat
+    /// a range/icmp term listed earlier, which diverged from vSRX. The match-any
+    /// short-circuit yields `Some(None)` (use-global), so an `application any`
+    /// rule is byte-identical to today. The boolean "does the rule apply?"
+    /// verdict (`Some` vs `None`) is unchanged — only WHICH matched term's
+    /// timeout is returned.
     #[inline]
     fn matches(
         &self,
@@ -1012,16 +1033,24 @@ impl CompiledApplications {
             return Some(None);
         }
         let terms = self.by_protocol.get(&protocol)?;
-        // Fast path: check exact dst port set first (O(1)).
-        if let Some(&timeout) = terms.exact_dst_ports.get(&dst_port) {
-            return Some(timeout);
+        // #3346: track the lowest-config-order matching term across all classes.
+        // `best` holds `(order, timeout)`; a smaller order wins (first listed).
+        let mut best: Option<(u32, Option<u32>)> = None;
+        // Exact dst-port term — O(1) accelerator for the common single-port case.
+        if let Some(&(order, timeout)) = terms.exact_dst_ports.get(&dst_port) {
+            best = Some((order, timeout));
         }
-        // Slow path: check range terms (an unconstrained ICMP term, e.g.
-        // junos-icmp-all, lives here as an empty-range entry → match-all).
-        if let Some(&(_, _, timeout)) = terms.range_terms.iter().find(|(src_ranges, dst_ranges, _)| {
-            port_ranges_match(src_ranges, src_port) && port_ranges_match(dst_ranges, dst_port)
-        }) {
-            return Some(timeout);
+        // Range terms (an unconstrained ICMP term, e.g. junos-icmp-all, lives
+        // here as an empty-range entry → match-all). Pushed in config order, so
+        // the first match in the vector is the lowest-order matching range.
+        if let Some(&(order, _, _, timeout)) = terms.range_terms.iter().find(
+            |(_, src_ranges, dst_ranges, _)| {
+                port_ranges_match(src_ranges, src_port) && port_ranges_match(dst_ranges, dst_port)
+            },
+        ) {
+            if best.map_or(true, |(b, _)| order < b) {
+                best = Some((order, timeout));
+            }
         }
         // #3020: ICMP/ICMPv6 type[,code]-constrained terms (junos-ping). Match
         // only when the packet's type/code is known and equals a constraint.
@@ -1029,16 +1058,16 @@ impl CompiledApplications {
         // non-first fragment) the constrained term does NOT match — fail closed.
         if !terms.icmp_constraints.is_empty() {
             if let Some((ptype, pcode)) = packet_icmp {
-                if let Some(&(_, _, timeout)) = terms
-                    .icmp_constraints
-                    .iter()
-                    .find(|&&(ctype, ccode, _)| ctype == ptype && ccode.map_or(true, |c| c == pcode))
-                {
-                    return Some(timeout);
+                if let Some(&(order, _, _, timeout)) = terms.icmp_constraints.iter().find(
+                    |&&(_, ctype, ccode, _)| ctype == ptype && ccode.map_or(true, |c| c == pcode),
+                ) {
+                    if best.map_or(true, |(b, _)| order < b) {
+                        best = Some((order, timeout));
+                    }
                 }
             }
         }
-        None
+        best.map(|(_, timeout)| timeout)
     }
 }
 

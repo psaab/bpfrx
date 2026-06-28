@@ -349,7 +349,13 @@ func expandUserspacePolicyApplications(cfg *config.Config, apps []string) ([]Pol
 	// preserves member order; resolveUserspaceApplicationNames no longer sorts).
 	// The Rust matcher resolves an overlapping per-application inactivity-timeout
 	// first-writer-wins on the exact port (policy.rs `exact_dst_ports.or_insert`,
-	// #3227), so the emit order decides which timeout wins. Sorting by Name here
+	// #3227), so the emit order decides which timeout wins. #3346: the matcher
+	// now also honors this emit order ACROSS application classes — it stamps each
+	// term with its config-order index and the FIRST listed matching term wins
+	// (Junos first-term-wins), so an exact-port term no longer beats a range or
+	// icmp-constrained term listed earlier. This emit order is therefore the
+	// cross-class precedence contract, not just the within-exact-class one.
+	// Sorting by Name here
 	// made that precedence alphabetical — contradicting #3227's
 	// first-writer-wins-by-config-order contract and Junos/operator intent (two
 	// overlapping apps would resolve to the timeout of whichever name sorts
