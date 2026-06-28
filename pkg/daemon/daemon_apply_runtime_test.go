@@ -30,9 +30,18 @@ func TestApplyConfigLockedSurfacesHostInboundFailure(t *testing.T) {
 	installFakeNetworkctl(t)
 
 	injected := errors.New("nft: host-inbound rule load failed")
-	origApply := nftApplyPayload
+	origApply, origDelete := nftApplyPayload, nftDeleteTable
 	nftApplyPayload = func(string) ([]byte, error) { return []byte("Error: load failed\n"), injected }
-	defer func() { nftApplyPayload = origApply }()
+	// #3392: applyLo0Filter now also routes its no-filter teardown through the
+	// shared nftDeleteTable seam (whose default impl delegates to nftApplyPayload).
+	// This config binds no lo0 filter, so without stubbing nftDeleteTable the lo0
+	// teardown would ALSO fail with `injected` and ride in via lo0Err — making the
+	// hostInboundErr RED-on-revert false-green (dropping hostInboundErr from the
+	// join would still surface `injected` through lo0Err). Stub the teardown to
+	// succeed so the injected failure rides SOLELY on the host-inbound apply path,
+	// isolating this test to its own join term.
+	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
+	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
 
 	networkDir := t.TempDir()
 	d := &Daemon{
