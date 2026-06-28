@@ -259,10 +259,15 @@ func normalizeProtocol(name string) string {
 // commit/apply split). Resolving to a number here means BOTH the strict commit
 // gate and the runtime capability gate see the numeric form and agree.
 //
-// resolveFilterPort is deliberately NOT reused: it splits on '-' BEFORE a
-// whole-spec name lookup, so a hyphenated service name (ftp-data, tacacs-ds,
-// kerberos-sec) would be misparsed as a low-high range and rejected. The
-// whole-spec catalog lookup here comes first so hyphenated names resolve.
+// resolveFilterPort (filter_match_resolve.go) now uses the SAME whole-spec
+// catalog lookup first (#3397), so a hyphenated service name (ftp-data,
+// tacacs-ds, kerberos-sec) resolves on BOTH the application and the firewall
+// filter path. The two helpers are kept separate only because their miss
+// contract differs: resolveAppPort returns the spec VERBATIM on an
+// unresolvable miss (so validatePortSpec rejects it strictly / the lenient
+// path warns), whereas resolveFilterPort returns ok=false so its caller keeps
+// the raw token and records it on term.UnknownPorts for the filter commit
+// gate.
 //
 // On success the canonical numeric string is returned. An UNRESOLVABLE spec
 // (unknown name, out-of-range / malformed number, inverted or unresolved range)
@@ -307,9 +312,14 @@ func resolveAppPort(spec string) string {
 // runs a recognized service name is already a number. The 15 literal names below
 // are the set the Rust dataplane (parse_port_spec) accepts directly, kept as a
 // belt-and-suspenders backstop so those names still validate even if a future
-// caller reaches this gate without resolving first — it stays in lock-step with
-// userspacePortSpecRepresentable so this validator never accepts a raw name the
-// dataplane cannot represent.
+// caller reaches this gate without resolving first. The name SET matches
+// userspacePortSpecRepresentable (the #2124 capability gate) and Rust
+// parse_port_spec, but the case handling does NOT: this gate is
+// case-INSENSITIVE (strings.ToLower), whereas userspacePortSpecRepresentable /
+// parse_port_spec match case-SENSITIVELY. That divergence is not a fail-open in
+// practice because resolveAppPort lowercases and resolves named ports to
+// numerics before this gate ever runs, so a mixed-case name ("HTTP") never
+// reaches the runtime capability gate as a raw name.
 func validatePortSpec(spec string) error {
 	if spec == "" {
 		return nil
