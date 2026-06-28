@@ -22735,3 +22735,15 @@ top.
   + MaxUint32/few-million accepted cases.
 - **File(s)**: pkg/config/compiler_security.go,
   pkg/config/screen_numeric_strict_3317_test.go, _Log.md
+
+- **Timestamp**: 2026-06-28
+- **Action**: #3342 — guard EventBuffer against non-positive n/size panics.
+  Latest(n) now returns nil for n<=0 (was: negative n reached
+  make([]EventRecord,n) → "makeslice: len out of range" panic, reachable via
+  `show security log -1`). NewEventBuffer clamps size<1 to
+  defaultEventBufferSize=1000 (zero ring panicked on first Add via head%size).
+  CLI showSecurityLog rejects a non-positive count with a clean error.
+- **File(s)**: pkg/logging/eventbuf.go, pkg/logging/README.md,
+  pkg/cli/cli_show_security_log.go,
+  pkg/logging/eventbuf_negative_3342_test.go,
+  pkg/cli/cli_show_security_log_negative_3342_test.go, _Log.md

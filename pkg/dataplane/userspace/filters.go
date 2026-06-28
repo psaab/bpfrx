@@ -264,13 +264,20 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 // The MIXED case — literal/positive addresses AND an `except` prefix-list in
 // the SAME direction of ONE term — has no single boolean-inversion
 // representation (one direction would need both a positive set and a negated
-// set). Rather than silently pick a wrong interpretation, the except modifier
-// is dropped (the prefixes fold into the positive set) and a warning is
-// emitted. This fold is ACTION-DEPENDENT in safety: it under-broadens the match
-// (the listed prefixes are matched positively instead of excluded), which is
-// fail-safe for `accept`/permit terms but fail-OPEN for a `discard`/`reject`
-// term (traffic the operator meant to drop via `except` is no longer dropped).
-// The structured mixed case is a documented follow-up.
+// set). This shape is hard-rejected at commit by
+// config.validateFilterAddressExceptStrict (#3359); it reaches here only on the
+// tolerant load / peer-sync path (an already-persisted or peer-synced config —
+// #1960 no-brick). The resolution is POSITIVE-WINS: the except prefixes are
+// IGNORED (never folded into the positive set) and a warning is emitted. The
+// earlier behavior folded the except prefixes INTO the positive set, which was
+// fail-OPEN: a `discard`/`reject` term then no longer dropped the traffic the
+// operator carved out via `except`, and an `accept` term ADMITTED the prefixes
+// the operator wrote to exclude. Positive-wins keeps an `accept` term's admit
+// set no wider than the operator's positive scope and keeps a `discard`/`reject`
+// term dropping at least the positive set — fail-safe in both directions.
+// Sibling of the #3297 port-except positive-wins fallback. The faithful
+// structured representation (a positive set AND a negated set per direction) is
+// a documented follow-up.
 //
 // An undefined prefix-list reference is NOT silently dropped here — it is a
 // strict commit-time error (validateFirewallPrefixListReferencesStrict, #1960
@@ -338,14 +345,26 @@ func resolvePrefixListAddrs(
 
 	if hasExcept {
 		// Mixed positive + except in one direction — out of scope for the
-		// boolean-inversion model. Fold the except prefixes into the positive
-		// set and warn so the operator can split the term. Documented
-		// follow-up. (Action-dependent safety — see the doc comment above.)
+		// boolean-inversion model (one direction would need both a positive set
+		// and a negated set). This shape is hard-rejected at commit by
+		// validateFilterAddressExceptStrict (#3359); it only reaches here on the
+		// tolerant load / peer-sync path (an already-persisted or peer-synced
+		// config — #1960 no-brick). POSITIVE-WINS: ignore the except prefixes
+		// entirely (do NOT fold them in) and warn so the operator splits the
+		// term. The earlier fold (`positive = append(positive, exceptPrefixes)`)
+		// was fail-OPEN: it widened the match by treating the excepted prefixes
+		// as a positive match, so a `discard`/`reject` term no longer dropped
+		// the traffic the operator carved out via `except`, and an `accept` term
+		// ADMITTED the prefixes the operator wrote to exclude. Dropping the
+		// except side instead keeps an `accept` term's admit set no wider than
+		// the operator's positive scope and keeps a `discard`/`reject` term
+		// dropping at least the positive set — fail-safe in both directions.
+		// Sibling of the #3297 port-except positive-wins fallback.
 		slog.Warn("firewall filter term mixes literal/positive addresses with an "+
 			"except prefix-list in one direction; the except modifier is ignored "+
-			"(prefixes treated as a positive match). Split into separate terms.",
+			"(positive-wins — the except prefixes are NOT matched). Split into "+
+			"separate terms (commit rejects this shape, #3359).",
 			"filter", filterName, "term", termName, "direction", direction)
-		positive = append(positive, exceptPrefixes...)
 	}
 
 	// `positive` may be empty here (e.g. a positive prefix-list that resolved to

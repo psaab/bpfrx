@@ -84,8 +84,19 @@ func (s *Subscription) Close() {
 	s.eb.unsubscribe(s)
 }
 
-// NewEventBuffer creates a new event buffer with the given capacity.
+// defaultEventBufferSize is the fallback ring capacity used when a caller
+// requests a non-positive size. A zero-capacity ring is a footgun: Add
+// indexes buf[head] and computes head % size, so size==0 panics with an
+// index-out-of-range / divide-by-zero on the first event (#3342).
+const defaultEventBufferSize = 1000
+
+// NewEventBuffer creates a new event buffer with the given capacity. A
+// non-positive size is clamped to defaultEventBufferSize so the ring is
+// always usable; Add must never index an empty buffer or divide by zero.
 func NewEventBuffer(size int) *EventBuffer {
+	if size < 1 {
+		size = defaultEventBufferSize
+	}
 	return &EventBuffer{
 		buf:  make([]EventRecord, size),
 		size: size,
@@ -191,6 +202,13 @@ func (eb *EventBuffer) Latest(n int) []EventRecord {
 	eb.mu.RLock()
 	defer eb.mu.RUnlock()
 
+	// Guard non-positive n first: a negative count must not reach
+	// make([]EventRecord, n), which panics ("makeslice: len out of
+	// range"). This mirrors LatestFiltered's `n <= 0` contract so a
+	// count argument behaves identically on both surfaces (#3342).
+	if n <= 0 {
+		return nil
+	}
 	if n > eb.count {
 		n = eb.count
 	}
