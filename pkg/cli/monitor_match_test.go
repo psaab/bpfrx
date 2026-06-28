@@ -58,9 +58,10 @@ func TestHandleMonitorSecurityFlowFile_RejectsBadRegex(t *testing.T) {
 	if c.monitorFlow.matchRe != nil {
 		t.Fatal("matchRe should remain nil after a rejected regex")
 	}
-	// The filename (first arg) is still accepted.
-	if c.monitorFlow.filename != "trace" {
-		t.Fatalf("filename = %q, want trace", c.monitorFlow.filename)
+	// #3380: the file command now commits atomically — a failed option (the bad
+	// regex) must NOT mutate the stored filename. It stays empty.
+	if c.monitorFlow.filename != "" {
+		t.Fatalf("filename = %q, want empty (failed option must not mutate filename)", c.monitorFlow.filename)
 	}
 }
 

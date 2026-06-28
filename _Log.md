@@ -22757,3 +22757,8 @@ top.
 - **Timestamp**: 2026-06-28
 - **Action**: #3379 — enforce size/files rotation in the flow-trace writer (traceWriter + rotateTraceFile); rotate at `size`, cap at `files` generations.
 - **File(s)**: pkg/cli/monitor.go, pkg/cli/monitor_security_test.go
+
+## 2026-06-28 — #3380 monitor security flow/packet-drop fail-open parsing
+- **Timestamp**: 2026-06-28
+- **Action**: #3380 — atomic parse for flow file/filter (commit only after all tokens validate), default cases reject unknown tokens, require option values, reject empty (match-all) filters, reject edits while active; same default+require-value hardening for packet-drop.
+- **File(s)**: pkg/cli/monitor.go, pkg/cli/monitor_security_test.go, pkg/cli/monitor_match_test.go

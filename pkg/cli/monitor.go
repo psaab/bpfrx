@@ -325,53 +325,85 @@ func (c *CLI) handleMonitorSecurityFlowFile(args []string) error {
 	c.monitorFlow.mu.Lock()
 	defer c.monitorFlow.mu.Unlock()
 
+	if c.monitorFlow.active {
+		fmt.Println("error: stop the active flow monitor before changing the trace file.")
+		return nil
+	}
+
 	if len(args) == 0 {
 		fmt.Println("error: Please specify the trace filename.")
 		return nil
 	}
 
-	// First non-option arg is the filename; reject path traversal up front so a
-	// bad name is never stored (#3378).
+	// Parse every token into locals and commit atomically only after all of
+	// them validate (#3380 HC-04/MC-07/MC-08). Previously the filename and
+	// each option were written into the shared state as they were parsed, so a
+	// later failing option (a bad regex, an out-of-range size) left a
+	// half-applied config — including a possibly-traversal filename — behind,
+	// and unknown tokens / value-less options were silently dropped.
 	if err := sanitizeTraceFilename(args[0]); err != nil {
 		fmt.Printf("error: %v\n", err)
 		return nil
 	}
-	c.monitorFlow.filename = args[0]
+	filename := args[0]
+	// Seed from current state so existing size/files/match survive a command
+	// that only changes one option.
+	fileSize := c.monitorFlow.fileSize
+	files := c.monitorFlow.files
+	matchPat := c.monitorFlow.match
+	matchRe := c.monitorFlow.matchRe
+
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "size":
-			if i+1 < len(args) {
-				i++
-				v, err := strconv.ParseInt(args[i], 10, 64)
-				if err != nil || v < 10240 || v > 1073741824 {
-					fmt.Println("error: size must be 10240..1073741824")
-					return nil
-				}
-				c.monitorFlow.fileSize = v
+			if i+1 >= len(args) {
+				fmt.Println("error: size requires a value")
+				return nil
 			}
+			i++
+			v, err := strconv.ParseInt(args[i], 10, 64)
+			if err != nil || v < 10240 || v > 1073741824 {
+				fmt.Println("error: size must be 10240..1073741824")
+				return nil
+			}
+			fileSize = v
 		case "files":
-			if i+1 < len(args) {
-				i++
-				v, err := strconv.Atoi(args[i])
-				if err != nil || v < 2 || v > 1000 {
-					fmt.Println("error: files must be 2..1000")
-					return nil
-				}
-				c.monitorFlow.files = v
+			if i+1 >= len(args) {
+				fmt.Println("error: files requires a value")
+				return nil
 			}
+			i++
+			v, err := strconv.Atoi(args[i])
+			if err != nil || v < 2 || v > 1000 {
+				fmt.Println("error: files must be 2..1000")
+				return nil
+			}
+			files = v
 		case "match":
-			if i+1 < len(args) {
-				i++
-				re, err := regexp.Compile(args[i])
-				if err != nil {
-					fmt.Printf("error: invalid match regex %q: %v\n", args[i], err)
-					return nil
-				}
-				c.monitorFlow.match = args[i]
-				c.monitorFlow.matchRe = re
+			if i+1 >= len(args) {
+				fmt.Println("error: match requires a value")
+				return nil
 			}
+			i++
+			re, err := regexp.Compile(args[i])
+			if err != nil {
+				fmt.Printf("error: invalid match regex %q: %v\n", args[i], err)
+				return nil
+			}
+			matchPat = args[i]
+			matchRe = re
+		default:
+			fmt.Printf("error: unknown flow file option: %s\n", args[i])
+			return nil
 		}
 	}
+
+	// All tokens validated: commit.
+	c.monitorFlow.filename = filename
+	c.monitorFlow.fileSize = fileSize
+	c.monitorFlow.files = files
+	c.monitorFlow.match = matchPat
+	c.monitorFlow.matchRe = matchRe
 	return nil
 }
 
@@ -383,89 +415,128 @@ func (c *CLI) handleMonitorSecurityFlowFilter(args []string) error {
 	c.monitorFlow.mu.Lock()
 	defer c.monitorFlow.mu.Unlock()
 
+	if c.monitorFlow.active {
+		fmt.Println("error: stop the active flow monitor before editing filters.")
+		return nil
+	}
+
 	if len(args) == 0 {
 		fmt.Println("error: Please specify the filter name.")
 		return nil
 	}
 
+	// Build into a temporary filter (seeded from the existing one if present)
+	// and commit it into the map only after every token validates (#3380
+	// HC-03/MC-07/MC-08). Previously the named filter was inserted before any
+	// value was parsed, so a command that then failed left an empty filter in
+	// the map — and an empty filter matches every event, silently arming broad
+	// tracing of all flows. Unknown tokens and value-less options were also
+	// dropped, widening collection instead of erroring.
 	name := args[0]
-	f, ok := c.monitorFlow.filters[name]
-	if !ok {
-		f = &monitorFlowFilter{Name: name}
-		c.monitorFlow.filters[name] = f
+	f := &monitorFlowFilter{Name: name}
+	if existing, ok := c.monitorFlow.filters[name]; ok {
+		fc := *existing
+		f = &fc
 	}
 
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "source-prefix":
-			if i+1 < len(args) {
-				i++
-				_, cidr, err := net.ParseCIDR(args[i])
-				if err != nil {
-					// Try as host address
-					ip := net.ParseIP(args[i])
-					if ip == nil {
-						fmt.Printf("error: invalid source-prefix: %s\n", args[i])
-						return nil
-					}
-					if ip.To4() != nil {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
-					} else {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
-					}
-				}
-				f.SrcIP = cidr
+			if i+1 >= len(args) {
+				fmt.Println("error: source-prefix requires a value")
+				return nil
 			}
+			i++
+			_, cidr, err := net.ParseCIDR(args[i])
+			if err != nil {
+				// Try as host address
+				ip := net.ParseIP(args[i])
+				if ip == nil {
+					fmt.Printf("error: invalid source-prefix: %s\n", args[i])
+					return nil
+				}
+				if ip.To4() != nil {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+				} else {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+				}
+			}
+			f.SrcIP = cidr
 		case "destination-prefix":
-			if i+1 < len(args) {
-				i++
-				_, cidr, err := net.ParseCIDR(args[i])
-				if err != nil {
-					ip := net.ParseIP(args[i])
-					if ip == nil {
-						fmt.Printf("error: invalid destination-prefix: %s\n", args[i])
-						return nil
-					}
-					if ip.To4() != nil {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
-					} else {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
-					}
-				}
-				f.DstIP = cidr
+			if i+1 >= len(args) {
+				fmt.Println("error: destination-prefix requires a value")
+				return nil
 			}
+			i++
+			_, cidr, err := net.ParseCIDR(args[i])
+			if err != nil {
+				ip := net.ParseIP(args[i])
+				if ip == nil {
+					fmt.Printf("error: invalid destination-prefix: %s\n", args[i])
+					return nil
+				}
+				if ip.To4() != nil {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+				} else {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+				}
+			}
+			f.DstIP = cidr
 		case "source-port":
-			if i+1 < len(args) {
-				i++
-				p, err := strconv.ParseUint(args[i], 10, 16)
-				if err != nil {
-					fmt.Printf("error: invalid source-port: %s\n", args[i])
-					return nil
-				}
-				f.SrcPort = uint16(p)
+			if i+1 >= len(args) {
+				fmt.Println("error: source-port requires a value")
+				return nil
 			}
+			i++
+			p, err := strconv.ParseUint(args[i], 10, 16)
+			if err != nil {
+				fmt.Printf("error: invalid source-port: %s\n", args[i])
+				return nil
+			}
+			f.SrcPort = uint16(p)
 		case "destination-port":
-			if i+1 < len(args) {
-				i++
-				p, err := strconv.ParseUint(args[i], 10, 16)
-				if err != nil {
-					fmt.Printf("error: invalid destination-port: %s\n", args[i])
-					return nil
-				}
-				f.DstPort = uint16(p)
+			if i+1 >= len(args) {
+				fmt.Println("error: destination-port requires a value")
+				return nil
 			}
+			i++
+			p, err := strconv.ParseUint(args[i], 10, 16)
+			if err != nil {
+				fmt.Printf("error: invalid destination-port: %s\n", args[i])
+				return nil
+			}
+			f.DstPort = uint16(p)
 		case "protocol":
-			if i+1 < len(args) {
-				i++
-				f.Protocol = args[i]
+			if i+1 >= len(args) {
+				fmt.Println("error: protocol requires a value")
+				return nil
 			}
+			i++
+			f.Protocol = args[i]
 		case "interface":
-			if i+1 < len(args) {
-				i++
-				f.Iface = args[i]
+			if i+1 >= len(args) {
+				fmt.Println("error: interface requires a value")
+				return nil
 			}
+			i++
+			f.Iface = args[i]
+		default:
+			fmt.Printf("error: unknown flow filter option: %s\n", args[i])
+			return nil
 		}
 	}
+
+	// Reject a filter with no match criteria: an empty filter matches every
+	// event, so silently installing one would fail open into broad tracing of
+	// all flows (#3380 HC-03).
+	if f.SrcIP == nil && f.DstIP == nil && f.SrcPort == 0 && f.DstPort == 0 &&
+		f.Protocol == "" && f.Iface == "" {
+		fmt.Println("error: filter requires at least one match criterion.")
+		return nil
+	}
+
+	// All tokens validated: commit the filter atomically.
+	c.monitorFlow.filters[name] = f
 	return nil
 }
 
@@ -672,86 +743,105 @@ func (c *CLI) handleMonitorSecurityPacketDrop(args []string) error {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "source-prefix":
-			if i+1 < len(args) {
-				i++
-				_, cidr, err := net.ParseCIDR(args[i])
-				if err != nil {
-					ip := net.ParseIP(args[i])
-					if ip == nil {
-						fmt.Printf("error: invalid source-prefix: %s\n", args[i])
-						return nil
-					}
-					if ip.To4() != nil {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
-					} else {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
-					}
-				}
-				srcIP = cidr
+			if i+1 >= len(args) {
+				fmt.Println("error: source-prefix requires a value")
+				return nil
 			}
+			i++
+			_, cidr, err := net.ParseCIDR(args[i])
+			if err != nil {
+				ip := net.ParseIP(args[i])
+				if ip == nil {
+					fmt.Printf("error: invalid source-prefix: %s\n", args[i])
+					return nil
+				}
+				if ip.To4() != nil {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+				} else {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+				}
+			}
+			srcIP = cidr
 		case "destination-prefix":
-			if i+1 < len(args) {
-				i++
-				_, cidr, err := net.ParseCIDR(args[i])
-				if err != nil {
-					ip := net.ParseIP(args[i])
-					if ip == nil {
-						fmt.Printf("error: invalid destination-prefix: %s\n", args[i])
-						return nil
-					}
-					if ip.To4() != nil {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
-					} else {
-						cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
-					}
-				}
-				dstIP = cidr
+			if i+1 >= len(args) {
+				fmt.Println("error: destination-prefix requires a value")
+				return nil
 			}
+			i++
+			_, cidr, err := net.ParseCIDR(args[i])
+			if err != nil {
+				ip := net.ParseIP(args[i])
+				if ip == nil {
+					fmt.Printf("error: invalid destination-prefix: %s\n", args[i])
+					return nil
+				}
+				if ip.To4() != nil {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+				} else {
+					cidr = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+				}
+			}
+			dstIP = cidr
 		case "source-port":
-			if i+1 < len(args) {
-				i++
-				p, err := strconv.ParseUint(args[i], 10, 16)
-				if err != nil {
-					fmt.Printf("error: invalid source-port: %s\n", args[i])
-					return nil
-				}
-				srcPort = uint16(p)
+			if i+1 >= len(args) {
+				fmt.Println("error: source-port requires a value")
+				return nil
 			}
+			i++
+			p, err := strconv.ParseUint(args[i], 10, 16)
+			if err != nil {
+				fmt.Printf("error: invalid source-port: %s\n", args[i])
+				return nil
+			}
+			srcPort = uint16(p)
 		case "destination-port":
-			if i+1 < len(args) {
-				i++
-				p, err := strconv.ParseUint(args[i], 10, 16)
-				if err != nil {
-					fmt.Printf("error: invalid destination-port: %s\n", args[i])
-					return nil
-				}
-				dstPort = uint16(p)
+			if i+1 >= len(args) {
+				fmt.Println("error: destination-port requires a value")
+				return nil
 			}
+			i++
+			p, err := strconv.ParseUint(args[i], 10, 16)
+			if err != nil {
+				fmt.Printf("error: invalid destination-port: %s\n", args[i])
+				return nil
+			}
+			dstPort = uint16(p)
 		case "protocol":
-			if i+1 < len(args) {
-				i++
-				protocol = args[i]
+			if i+1 >= len(args) {
+				fmt.Println("error: protocol requires a value")
+				return nil
 			}
+			i++
+			protocol = args[i]
 		case "from-zone":
-			if i+1 < len(args) {
-				i++
-				fromZone = args[i]
+			if i+1 >= len(args) {
+				fmt.Println("error: from-zone requires a value")
+				return nil
 			}
+			i++
+			fromZone = args[i]
 		case "interface":
-			if i+1 < len(args) {
-				i++
-				iface = args[i]
+			if i+1 >= len(args) {
+				fmt.Println("error: interface requires a value")
+				return nil
 			}
+			i++
+			iface = args[i]
 		case "count":
-			if i+1 < len(args) {
-				i++
-				v, err := strconv.Atoi(args[i])
-				if err != nil || v < 1 || v > 8192 {
-					fmt.Println("error: count must be 1..8192")
-					return nil
-				}
-				count = v
+			if i+1 >= len(args) {
+				fmt.Println("error: count requires a value")
+				return nil
 			}
+			i++
+			v, err := strconv.Atoi(args[i])
+			if err != nil || v < 1 || v > 8192 {
+				fmt.Println("error: count must be 1..8192")
+				return nil
+			}
+			count = v
+		default:
+			fmt.Printf("error: unknown packet-drop option: %s\n", args[i])
+			return nil
 		}
 	}
 

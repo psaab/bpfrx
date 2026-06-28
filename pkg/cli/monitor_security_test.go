@@ -146,3 +146,88 @@ func TestTraceWriter_RotatesAndCapsFiles(t *testing.T) {
 func itoa(i int) string {
 	return string(rune('0' + i))
 }
+
+// #3380: the flow file/filter parsers committed state incrementally and had no
+// default case, so a failed option mutated the filename, an empty/invalid
+// filter became match-all, and unknown/value-less tokens were silently dropped
+// (widening forensic collection). These tests pin the atomic, fail-closed
+// behavior.
+
+func TestFlowFile_FailedOptionDoesNotMutateFilename(t *testing.T) {
+	c := &CLI{}
+	// Bad size must abort the whole command without storing the filename.
+	if err := c.handleMonitorSecurityFlowFile([]string{"trace", "size", "1"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.monitorFlow.filename != "" {
+		t.Fatalf("filename = %q, want empty (failed size must not commit filename)", c.monitorFlow.filename)
+	}
+}
+
+func TestFlowFile_UnknownOptionRejected(t *testing.T) {
+	c := &CLI{}
+	if err := c.handleMonitorSecurityFlowFile([]string{"trace", "bogus", "x"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Unknown token must abort: nothing committed.
+	if c.monitorFlow.filename != "" {
+		t.Fatalf("filename = %q, want empty (unknown option must reject the command)", c.monitorFlow.filename)
+	}
+}
+
+func TestFlowFile_MissingOptionValueRejected(t *testing.T) {
+	c := &CLI{}
+	if err := c.handleMonitorSecurityFlowFile([]string{"trace", "size"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.monitorFlow.filename != "" {
+		t.Fatalf("filename = %q, want empty (value-less size must reject)", c.monitorFlow.filename)
+	}
+}
+
+func TestFlowFilter_EmptyFilterRejected(t *testing.T) {
+	c := &CLI{}
+	// A filter name with no criteria must NOT be installed (empty == match-all).
+	if err := c.handleMonitorSecurityFlowFilter([]string{"f1"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := c.monitorFlow.filters["f1"]; ok {
+		t.Fatal("empty filter was installed; an empty filter matches everything (fail-open)")
+	}
+}
+
+func TestFlowFilter_FailedOptionLeavesNoFilter(t *testing.T) {
+	c := &CLI{}
+	// Invalid source-port must abort and must NOT leave an empty match-all filter.
+	if err := c.handleMonitorSecurityFlowFilter([]string{"f1", "source-port", "notaport"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := c.monitorFlow.filters["f1"]; ok {
+		t.Fatal("failed filter command left an (empty, match-all) filter installed")
+	}
+}
+
+func TestFlowFilter_UnknownTokenRejected(t *testing.T) {
+	c := &CLI{}
+	// 'from-zone' is a packet-drop token, not a valid flow-filter token.
+	if err := c.handleMonitorSecurityFlowFilter([]string{"f1", "from-zone", "trust"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := c.monitorFlow.filters["f1"]; ok {
+		t.Fatal("unknown filter token was silently dropped and the filter installed")
+	}
+}
+
+func TestFlowFilter_ValidCriterionCommits(t *testing.T) {
+	c := &CLI{}
+	if err := c.handleMonitorSecurityFlowFilter([]string{"f1", "protocol", "tcp"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	f, ok := c.monitorFlow.filters["f1"]
+	if !ok {
+		t.Fatal("valid filter was not installed")
+	}
+	if f.Protocol != "tcp" {
+		t.Fatalf("protocol = %q, want tcp", f.Protocol)
+	}
+}
