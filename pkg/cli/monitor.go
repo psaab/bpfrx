@@ -78,17 +78,37 @@ func openTraceFile(name string) (*os.File, string, error) {
 // clamped to a 2 minimum. It honors the operator's `files` cap so a long
 // running trace cannot grow without bound (#3379).
 func rotateTraceFile(cur *os.File, name string, maxFiles int) (*os.File, error) {
-	cur.Close()
+	// Best-effort close of the old descriptor. A Close error does not gate the
+	// cap (the file's bytes are already on disk), so it must not abort the
+	// rotation — the rename/remove below are what enforce maxFiles.
+	_ = cur.Close()
 	if maxFiles < 2 {
 		maxFiles = 2
 	}
 	base := filepath.Join(traceLogDir, name)
-	// Drop the oldest archive, then shift the rest up by one.
-	_ = os.Remove(fmt.Sprintf("%s.%d", base, maxFiles-1))
-	for i := maxFiles - 2; i >= 1; i-- {
-		_ = os.Rename(fmt.Sprintf("%s.%d", base, i), fmt.Sprintf("%s.%d", base, i+1))
+	// Drop the oldest archive so the generation count stays within maxFiles. A
+	// missing oldest archive is expected (fewer than maxFiles generations have
+	// accumulated yet) and is fine; any other Remove failure means the count
+	// cap is no longer enforced, so fail closed instead of letting writeLine
+	// reset `written` and keep growing on a broken cap (#3379 follow-up).
+	if err := os.Remove(fmt.Sprintf("%s.%d", base, maxFiles-1)); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("trace rotate: dropping oldest archive: %w", err)
 	}
-	_ = os.Rename(base, base+".1")
+	// Shift the surviving archives up by one. A missing intermediate
+	// generation is expected early in a trace, so skip it, but surface any
+	// other failure rather than silently breaking the generation chain.
+	for i := maxFiles - 2; i >= 1; i-- {
+		if err := os.Rename(fmt.Sprintf("%s.%d", base, i), fmt.Sprintf("%s.%d", base, i+1)); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("trace rotate: shifting archive %d->%d: %w", i, i+1, err)
+		}
+	}
+	// Roll the active file to .1. The active file always exists (we just wrote
+	// to it), so a failure here means the size cap did not actually rotate the
+	// file; returning the error makes writeLine stop the writer instead of
+	// reopening and resetting `written` on top of an un-rotated, over-cap file.
+	if err := os.Rename(base, base+".1"); err != nil {
+		return nil, fmt.Errorf("trace rotate: rolling active file: %w", err)
+	}
 	f, _, err := openTraceFile(name)
 	return f, err
 }
