@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
@@ -198,6 +199,65 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 		return status.Error(codes.Unavailable, "event buffer not available")
 	}
 
+	// Validate the request before subscribing (#3382). MonitorPacketDrop
+	// streams only LOCAL drops; the CLI applies the same guardrails. An
+	// unvalidated filter silently produces an empty stream that looks like
+	// "no drops" during incident response, so reject impossible inputs up
+	// front with InvalidArgument rather than opening a stream that can never
+	// match.
+
+	// node: packet-drop is local-only — it does not proxy to the cluster
+	// peer the way MonitorInterface does. Honor an empty/local node and
+	// reject any value that designates a different (or "all") node so a
+	// client cannot believe a peer filter was applied.
+	if !s.isLocalNodeRef(req.Node) {
+		return status.Errorf(codes.InvalidArgument,
+			"node %q: monitor packet-drop is local-only; run it on the target node", req.Node)
+	}
+
+	// count: negative is not "unlimited" (the CLI rejects it); enforce the
+	// CLI's 1..8192 cap. 0 remains an explicit "unlimited" sentinel.
+	if req.Count < 0 {
+		return status.Errorf(codes.InvalidArgument, "count must be >= 0 (0 = unlimited), got %d", req.Count)
+	}
+	if req.Count > 8192 {
+		return status.Errorf(codes.InvalidArgument, "count must be 1..8192 (0 = unlimited), got %d", req.Count)
+	}
+
+	// ports: the event records carry 16-bit ports; a value > 65535 can
+	// never match and would silently empty the stream.
+	if req.SourcePort > 65535 {
+		return status.Errorf(codes.InvalidArgument, "source-port must be 0..65535, got %d", req.SourcePort)
+	}
+	if req.DestinationPort > 65535 {
+		return status.Errorf(codes.InvalidArgument, "destination-port must be 0..65535, got %d", req.DestinationPort)
+	}
+
+	// protocol: validate against the shared catalog (case-insensitive,
+	// named or numeric). A typo like "tpc" can never match.
+	if req.Protocol != "" {
+		if _, ok := appid.ProtocolNumber(req.Protocol); !ok {
+			return status.Errorf(codes.InvalidArgument, "unknown protocol %q", req.Protocol)
+		}
+	}
+
+	// zone / interface: validate against the active configuration so a typo
+	// (`trsut`, `ge-0/0/99`) is rejected rather than emitting nothing.
+	if req.FromZone != "" || req.Interface != "" {
+		cfg := s.store.ActiveConfig()
+		if cfg == nil {
+			return status.Error(codes.Unavailable, "no active configuration to validate zone/interface filters")
+		}
+		if req.FromZone != "" {
+			if _, ok := cfg.Security.Zones[req.FromZone]; !ok {
+				return status.Errorf(codes.InvalidArgument, "unknown from-zone %q", req.FromZone)
+			}
+		}
+		if req.Interface != "" && !configHasInterface(cfg, req.Interface) {
+			return status.Errorf(codes.InvalidArgument, "unknown interface %q", req.Interface)
+		}
+	}
+
 	// Parse filters.
 	var srcNet, dstNet *net.IPNet
 	if req.SourcePrefix != "" {
@@ -314,6 +374,47 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 			}
 		}
 	}
+}
+
+// isLocalNodeRef reports whether a request's node reference designates the
+// local node (#3382). An empty string or "local" is always local. In a
+// cluster the node's numeric id ("0"/"1") or "nodeN" form for THIS node is
+// accepted; a standalone daemon accepts only "0". Anything else — the peer
+// id, "all", "primary" — is not local, so a local-only RPC must reject it
+// rather than silently filter local data.
+func (s *Server) isLocalNodeRef(node string) bool {
+	switch strings.ToLower(strings.TrimSpace(node)) {
+	case "", "local":
+		return true
+	}
+	ref := strings.ToLower(strings.TrimSpace(node))
+	localID := 0
+	if s != nil && s.cluster != nil {
+		localID = s.cluster.NodeID()
+	}
+	return ref == strconv.Itoa(localID) || ref == fmt.Sprintf("node%d", localID)
+}
+
+// configHasInterface reports whether name matches a configured interface,
+// accepting either the configured key, its explicit Name override, or the
+// Linux-form (slashes→dashes) rendering of either (#3382). The packet-drop
+// filter compares against the resolved ingress interface name, which the
+// daemon derives from the config name, so all three forms are legitimate.
+func configHasInterface(cfg *config.Config, name string) bool {
+	if cfg == nil {
+		return false
+	}
+	for key, ifc := range cfg.Interfaces.Interfaces {
+		if name == key || name == config.LinuxIfName(key) {
+			return true
+		}
+		if ifc != nil && ifc.Name != "" {
+			if name == ifc.Name || name == config.LinuxIfName(ifc.Name) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // MonitorInterface streams pre-formatted interface statistics frames.
