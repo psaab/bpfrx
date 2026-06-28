@@ -9,11 +9,23 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/logging"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func (s *Server) GetEvents(_ context.Context, req *pb.GetEventsRequest) (*pb.GetEventsResponse, error) {
 	if s.eventBuf == nil {
 		return &pb.GetEventsResponse{}, nil
+	}
+
+	// Zone IDs are uint16 internally; the request value is uint32. A value
+	// above 65535 used to be narrowed by an unchecked uint16() cast, which
+	// silently WRAPS (65536 -> 0 = no filter, 65537 -> zone 1) and returns
+	// the wrong events or hides the intended ones. Reject out-of-range input
+	// up front, matching the sessions path (buildSessionFilter) and the REST
+	// events guard (queryUint16Strict) which both fail-closed (#3334).
+	if req.Zone > 65535 {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid zone id %d", req.Zone)
 	}
 
 	limit := int(req.Limit)
