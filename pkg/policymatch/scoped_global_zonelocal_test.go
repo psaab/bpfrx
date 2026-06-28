@@ -40,6 +40,11 @@ func compileFromSet(t *testing.T, cmds []string) *config.Config {
 func TestScopedGlobalResolvesZoneLocalAddress(t *testing.T) {
 	cmds := []string{
 		"set security zones security-zone trust address-book address LOCALNET 10.0.1.0/24",
+		// #3355: the egress zone must be a DEFINED zone — a real flow's to-zone
+		// is always derived from a configured zone. Define untrust so the
+		// defined-zone transit guard does not (correctly) route an undefined
+		// egress zone to the default-policy.
+		"set security zones security-zone untrust",
 		"set security policies global policy allow-local match source-address LOCALNET",
 		"set security policies global policy allow-local match destination-address any",
 		"set security policies global policy allow-local match application any",

@@ -260,6 +260,16 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	fromZone := r.URL.Query().Get("from_zone")
 	toZone := r.URL.Query().Get("to_zone")
 
+	// #3355 (H06): the CLI surfaces (show security match-policies / test
+	// policy) require BOTH zones; REST accepted a missing zone and evaluated as
+	// if the empty string were a zone, which the #3355 defined-zone guard would
+	// then send straight to the default-policy — a misleading silent verdict for
+	// what is really a malformed query. Reject it for parity with the CLI.
+	if fromZone == "" || toZone == "" {
+		writeError(w, http.StatusBadRequest, "from_zone and to_zone are required")
+		return
+	}
+
 	// A non-empty but malformed src_ip/dst_ip would parse to nil and be
 	// treated as a wildcard by matchPolicyAddr, yielding a false-positive
 	// PERMIT verdict in the simulator (#1711). Reject it with 400. An

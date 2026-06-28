@@ -412,6 +412,16 @@ func oldMatchApp(apps []string, proto string, dstPort int, cfg *config.Config) b
 }
 
 func cfgWith(sec config.SecurityConfig, apps config.ApplicationsConfig) *config.Config {
+	// #3355: the simulator's transit guard mirrors policy.rs's unconditional
+	// `from_id != 0 && to_id != 0` — a zone is eligible only when defined in
+	// Security.Zones. Test configs that do not set their own zones get the
+	// standard suite zone set so they exercise the populated-zone (production)
+	// path; a committed config always populates Zones. A test that needs the
+	// undefined-/no-zone path builds its config directly with an explicit (or
+	// empty) Zones map rather than through cfgWith.
+	if len(sec.Zones) == 0 {
+		sec.Zones = zones("trust", "untrust", "dmz", "wan")
+	}
 	return &config.Config{Security: sec, Applications: apps}
 }
 

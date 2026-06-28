@@ -284,6 +284,20 @@ func Match(cfg *config.Config, q Query) Result {
 		return matchJunosHost(cfg, q)
 	}
 
+	// #3355: the runtime gates the ENTIRE transit block — exact zone-pair, the
+	// #3090 from-any/to-any/both-any wildcard tiers, AND the #3148 global tier —
+	// on `from_id != 0 && to_id != 0` (policy.rs evaluate_policy_result_with_icmp).
+	// Zone id 0 is the reserved "unknown / no zone" sentinel an unconfigured
+	// zone name resolves to; a flow whose ingress OR egress zone is unknown
+	// belongs to no DEFINED zone pair and is ineligible for zone-pair, wildcard,
+	// or junos-global policies. A query naming an UNDEFINED zone is the simulator
+	// analogue of id 0, so it must fall straight through to the configured
+	// default-policy rather than wrongly matching a `from-zone any` / `to-zone
+	// any` / global rule.
+	if !zoneKnown(cfg, q.FromZone) || !zoneKnown(cfg, q.ToZone) {
+		return Result{DefaultUsed: true, Action: cfg.Security.DefaultPolicy}
+	}
+
 	// Tier 1: exact zone-pair policies, in config order (first match wins).
 	// q.FromZone/q.ToZone are concrete zone names; a wildcard set
 	// (FromZone/ToZone == "any") never compares equal, so it is excluded here.
@@ -366,6 +380,15 @@ func Match(cfg *config.Config, q Query) Result {
 // `from-zone any to-zone any` are deliberately NOT pulled onto the host path,
 // matching the runtime gate.
 func matchJunosHost(cfg *config.Config, q Query) Result {
+	// #3355: evaluate_junos_host_policy returns None for from_id == 0 (the
+	// unknown/undefined ingress zone), mirroring the #3110 unzoned guard. An
+	// undefined query from-zone therefore matches no host-bound rule; local
+	// delivery proceeds (the management lifeline), so surface
+	// HostInboundUnmatched rather than running the host tiers against an
+	// unresolved ingress zone.
+	if !zoneKnown(cfg, q.FromZone) {
+		return Result{HostInboundUnmatched: true}
+	}
 	// Exact ingress -> junos-host.
 	for _, zpp := range cfg.Security.Policies {
 		if zpp == nil || zpp.ToZone != JunosHostZone || zpp.FromZone != q.FromZone {
@@ -408,6 +431,28 @@ func globalScopeMatches(cfg *config.Config, scopeZone, flowZone string) bool {
 	return scopeZone == flowZone
 }
 
+// zoneKnown reports whether a query zone is DEFINED for the runtime's `id != 0`
+// eligibility guard (#3355). The runtime resolves an unconfigured zone name to
+// the reserved unknown id 0, which is ineligible for zone-pair / wildcard /
+// global / junos-host policies (policy.rs evaluate_policy_result_with_icmp gates
+// the whole transit block on from_id != 0 && to_id != 0; evaluate_junos_host_policy
+// returns None for from_id == 0). A zone is "known" iff it is present in
+// cfg.Security.Zones.
+//
+// This mirrors the runtime UNCONDITIONALLY — there is deliberately NO
+// empty-Zones leniency. policy.rs applies the from_id/to_id != 0 gate for every
+// evaluation; a config with no defined zones resolves every zone name to id 0,
+// so the runtime matches NOTHING in the transit tiers. An earlier "offline
+// tolerance" short-circuit (return true when Zones is empty) was simulator-vs-
+// runtime DRIFT: a no-zones config matched transit tiers in the simulator that
+// the runtime would never evaluate. A committed production config always
+// populates Zones; a synthetic config without zones now faithfully matches
+// nothing in transit.
+func zoneKnown(cfg *config.Config, zone string) bool {
+	_, ok := cfg.Security.Zones[zone]
+	return ok
+}
+
 func matchedResult(pol *config.Policy, global bool) Result {
 	return Result{
 		Matched:      true,
@@ -441,41 +486,54 @@ func ruleMatches(cfg *config.Config, q Query, pol *config.Policy) bool {
 	return matchApp(cfg, pol.Match.Applications, q.Protocol, q.SrcPort, q.DstPort, q.ICMPType, q.ICMPCode)
 }
 
-// matchAddr replicates policy.rs try_match_rule's per-side address logic.
+// matchAddr replicates policy.rs try_match_rule's per-side address logic
+// EXACTLY (#3356). A nil ip (unspecified) does not constrain the match.
 //
-// A nil ip (unspecified) does not constrain the match. An empty token list is
-// the runtime "no address constraint = match any" case. Otherwise the raw
-// "ip is in the configured set" predicate is computed per family (only the
-// ip's own family is consulted), then XORed with the exclusion flag. An
-// EMPTY excluded set fails closed (it never matches) instead of inverting to
-// match-all — the #2008 fail-open hardening.
+// The runtime computes, per side:
+//
+//	excluded:     !(v4_empty && v6_empty) && !(ip is in the set)
+//	not excluded:  match_any || (ip is in the set)
+//
+// Two faithfulness fixes over the pre-#3356 simulator:
+//
+//   - The empty-address-list "match any" short-circuit must NOT run before the
+//     exclusion check. An empty-but-EXCLUDED set ([] with excluded=true) is the
+//     genuine typo/parse-drop signal #2008 fails CLOSED on: the runtime sees
+//     v4_empty && v6_empty and yields false. Returning match-any first made the
+//     simulator fail OPEN — it reported a match no dataplane packet would get.
+//     The "no constraint = match any" convenience now applies only to the
+//     NON-excluded empty list.
+//
+//   - The excluded fail-closed gate keys on BOTH families being empty, not on
+//     the packet's own family. The runtime fails closed only when
+//     v4_empty && v6_empty (policy.rs ~2095-2106). A v6-only exclusion set on a
+//     v4 packet (#3023 cross-family) leaves v4_empty true but v6_empty false:
+//     the v4 address is then trivially NOT in the (v6-only) excluded set, so the
+//     side MATCHES. The old per-packet-family `contributesFamily` gate failed
+//     closed there and over-blocked legitimate cross-family traffic.
 func matchAddr(cfg *config.Config, overlay map[string][]string, addrs []string, excluded bool, ip net.IP) bool {
 	if ip == nil {
-		return true
-	}
-	if len(addrs) == 0 {
-		// No address constraint configured: runtime treats this as match-any
-		// for both families (parse_legacy_address_set of an empty list).
 		return true
 	}
 
 	isV4 := ip.To4() != nil
 
 	rawMatched := false
-	contributesFamily := false
+	v4Empty := true
+	v6Empty := true
 	for _, tok := range addrs {
 		v4nets, v6nets, anyV4, anyV6 := resolveToken(cfg, overlay, tok)
+		if anyV4 || len(v4nets) > 0 {
+			v4Empty = false
+		}
+		if anyV6 || len(v6nets) > 0 {
+			v6Empty = false
+		}
 		if isV4 {
-			if anyV4 || len(v4nets) > 0 {
-				contributesFamily = true
-			}
 			if anyV4 || containsAny(v4nets, ip) {
 				rawMatched = true
 			}
 		} else {
-			if anyV6 || len(v6nets) > 0 {
-				contributesFamily = true
-			}
 			if anyV6 || containsAny(v6nets, ip) {
 				rawMatched = true
 			}
@@ -483,10 +541,20 @@ func matchAddr(cfg *config.Config, overlay map[string][]string, addrs []string, 
 	}
 
 	if !excluded {
+		if len(addrs) == 0 {
+			// No address constraint configured: the runtime treats this as
+			// match-any for both families (parse_legacy_address_set of an empty
+			// list). Only the NON-excluded empty list is match-any.
+			return true
+		}
 		return rawMatched
 	}
-	// Excluded: an empty set for this family fails closed.
-	if !contributesFamily {
+	// Excluded: fail CLOSED only when the set is empty across BOTH families —
+	// the #2008 typo/parse-drop signal (matches policy.rs's
+	// `!(v4_empty && v6_empty)`). A populated other-family set means the
+	// operator listed only one family; the packet's family is then trivially
+	// NOT in the excluded set, so the side matches (#3023 cross-family).
+	if v4Empty && v6Empty {
 		return false
 	}
 	return !rawMatched
@@ -707,9 +775,27 @@ func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryP
 			return false
 		}
 	}
-	if app.DestinationPort != "" && dstPort > 0 && !portMatches(app.DestinationPort, dstPort) {
-		return false
+	// #3330: when the application term CONSTRAINS a destination port, an OMITTED
+	// query dst port must NOT match-any — it must fail closed, mirroring the
+	// runtime. The dataplane keys a single dst-port term in exact_dst_ports and
+	// range terms in range_terms (policy.rs CompiledApplications.matches): an
+	// omitted query port arrives as 0, which a real app port (e.g. 80) never
+	// equals and no app range admits, so the constrained term does NOT match.
+	// The old `&& dstPort > 0` gate skipped the check entirely for an omitted
+	// port, reporting a permit for a port-constrained app no concrete packet
+	// would hit (sibling of #3323's protocol omission). An UNCONSTRAINED dst
+	// port term (app.DestinationPort == "") still matches any port, unchanged.
+	if app.DestinationPort != "" {
+		if dstPort <= 0 || !portMatches(app.DestinationPort, dstPort) {
+			return false
+		}
 	}
+	// Source port retains #3107's deliberate diagnostic stance: an OMITTED query
+	// source port (the ephemeral, operator-rarely-known dimension) is treated as
+	// "unconstrained" so a source-port-bearing app term still resolves. Only a
+	// SPECIFIED source port is checked. Narrowing this too would change the
+	// #3107 absent-source-port contract (TestShowTestPolicySourcePort), which is
+	// out of #3330's destination-port scope.
 	if app.SourcePort != "" && srcPort > 0 && !portMatches(app.SourcePort, srcPort) {
 		return false
 	}

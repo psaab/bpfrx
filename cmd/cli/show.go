@@ -909,16 +909,25 @@ func (c *ctl) showMatchPolicies(args []string) error {
 		case "destination-port":
 			if i+1 < len(args) {
 				i++
-				if v, err := strconv.Atoi(args[i]); err == nil {
-					req.DestinationPort = int32(v)
+				// #3354: route through the shared parser so a malformed/
+				// out-of-range port errors instead of silently coercing to the
+				// 0 wildcard (the old assign-on-success-only strconv.Atoi). This
+				// matches the local CLI + `test policy`, which already use
+				// policymatch.ParsePort, and mirrors the #3289 icmp-type fix.
+				v, err := policymatch.ParsePort(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid destination-port: %w", err)
 				}
+				req.DestinationPort = int32(v)
 			}
 		case "source-port":
 			if i+1 < len(args) {
 				i++
-				if v, err := strconv.Atoi(args[i]); err == nil {
-					req.SourcePort = int32(v)
+				v, err := policymatch.ParsePort(args[i])
+				if err != nil {
+					return fmt.Errorf("invalid source-port: %w", err)
 				}
+				req.SourcePort = int32(v)
 			}
 		case "protocol":
 			if i+1 < len(args) {
