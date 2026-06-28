@@ -4074,3 +4074,112 @@ fn nat46_v4_src_v6_dst_tuple_never_matches() {
         "(V4 src, V6 dst) must never match — NAT46 is unsupported"
     );
 }
+
+// ===========================================================================
+// #3346: application-term precedence is CONFIG ORDER (Junos first-term-wins),
+// not the old class heuristic (exact-port always beats range beats
+// icmp-constrained). These tests pin the per-application inactivity-timeout
+// selected by CompiledApplications::matches to the FIRST listed matching term.
+// ===========================================================================
+
+fn exact_app(port: u16, timeout: Option<u32>) -> ApplicationMatch {
+    ApplicationMatch {
+        protocol: PROTO_TCP,
+        source_ports: Vec::new(),
+        destination_ports: vec![PortRange {
+            low: port,
+            high: port,
+        }],
+        icmp_type: None,
+        icmp_code: None,
+        inactivity_timeout: timeout,
+    }
+}
+
+fn range_app(low: u16, high: u16, timeout: Option<u32>) -> ApplicationMatch {
+    ApplicationMatch {
+        protocol: PROTO_TCP,
+        source_ports: Vec::new(),
+        destination_ports: vec![PortRange { low, high }],
+        icmp_type: None,
+        icmp_code: None,
+        inactivity_timeout: timeout,
+    }
+}
+
+#[test]
+fn app_term_range_listed_before_exact_wins() {
+    // Range 80-90 listed FIRST, exact 80 listed SECOND. For dst port 80 (in
+    // BOTH), Junos first-term-wins → the range term's timeout (200) must win.
+    // RED-on-revert: the pre-#3346 class heuristic always probed exact_dst_ports
+    // before range_terms, so the exact term's timeout (100) wrongly won.
+    let apps = vec![range_app(80, 90, Some(200)), exact_app(80, Some(100))];
+    let compiled = CompiledApplications::from_matches(&apps);
+    assert_eq!(
+        compiled.matches(PROTO_TCP, 12345, 80, None),
+        Some(Some(200)),
+        "range term listed first must win the timeout for a port both match"
+    );
+    // Port 85: only the range matches → 200 regardless of order.
+    assert_eq!(
+        compiled.matches(PROTO_TCP, 12345, 85, None),
+        Some(Some(200))
+    );
+}
+
+#[test]
+fn app_term_exact_listed_before_range_wins() {
+    // Reverse order: exact 80 listed FIRST, range 80-90 SECOND. For port 80 the
+    // exact term is first → its timeout (100) wins. Confirms the fix is true
+    // config-order, not "range always wins".
+    let apps = vec![exact_app(80, Some(100)), range_app(80, 90, Some(200))];
+    let compiled = CompiledApplications::from_matches(&apps);
+    assert_eq!(
+        compiled.matches(PROTO_TCP, 12345, 80, None),
+        Some(Some(100)),
+        "exact term listed first must win the timeout for a port both match"
+    );
+    // Port 85: only the range matches → 200.
+    assert_eq!(
+        compiled.matches(PROTO_TCP, 12345, 85, None),
+        Some(Some(200))
+    );
+}
+
+#[test]
+fn app_term_icmp_constrained_before_all_icmp_wins() {
+    // junos-ping (icmp type 8 → icmp_constraints) listed FIRST, junos-icmp-all
+    // (unconstrained → range_terms empty-range match-all) SECOND. For an echo
+    // (type 8) packet both match; first-term-wins → the constrained term's
+    // timeout (11). RED-on-revert: the old order checked range_terms (icmp-all)
+    // before icmp_constraints, so the all-ICMP timeout (22) wrongly won.
+    let ping = ApplicationMatch {
+        protocol: PROTO_ICMP,
+        source_ports: Vec::new(),
+        destination_ports: Vec::new(),
+        icmp_type: Some(8),
+        icmp_code: None,
+        inactivity_timeout: Some(11),
+    };
+    let icmp_all = ApplicationMatch {
+        protocol: PROTO_ICMP,
+        source_ports: Vec::new(),
+        destination_ports: Vec::new(),
+        icmp_type: None,
+        icmp_code: None,
+        inactivity_timeout: Some(22),
+    };
+    let compiled = CompiledApplications::from_matches(&vec![ping.clone(), icmp_all.clone()]);
+    assert_eq!(
+        compiled.matches(PROTO_ICMP, 0, 0, Some((8, 0))),
+        Some(Some(11)),
+        "icmp-type-constrained term listed first must win for an echo packet"
+    );
+    // Reverse order: junos-icmp-all first → its timeout (22) wins.
+    let compiled_rev = CompiledApplications::from_matches(&vec![icmp_all, ping]);
+    assert_eq!(
+        compiled_rev.matches(PROTO_ICMP, 0, 0, Some((8, 0))),
+        Some(Some(22)),
+        "all-icmp term listed first must win for an echo packet"
+    );
+}
