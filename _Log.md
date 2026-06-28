@@ -22721,3 +22721,17 @@ top.
   interaction (RED if #3316's case arm is dropped).
 - **File(s)**: pkg/config/compiler_validate_strict.go,
   pkg/config/screen_unknown_strict_3318_test.go, _Log.md
+
+- **Timestamp**: 2026-06-27
+- **Action**: #3317 fold — close uint32-overflow fail-open in the screen
+  numeric gate (Codex MAJOR). parseThresh accepted any positive 64-bit int;
+  a value > 2^32-1 (e.g. 4294967296) passed the gate but wrapped to 0 at the
+  uint32 publish cast (pkg/dataplane/userspace/screens.go) → Rust screen
+  treats 0 as unset and omits the check. Added `int64(n) > math.MaxUint32`
+  rejection (portable: a >2^32 literal already fails Atoi on 32-bit int).
+  Bounds ALL 7 published-as-uint32 leaves (ICMP/UDP flood, syn-flood
+  attack-threshold, limit-session src/dst, port-scan, ip-sweep) plus the
+  shared not-yet-published syn-flood subfields. Added 3 overflow test cases
+  + MaxUint32/few-million accepted cases.
+- **File(s)**: pkg/config/compiler_security.go,
+  pkg/config/screen_numeric_strict_3317_test.go, _Log.md

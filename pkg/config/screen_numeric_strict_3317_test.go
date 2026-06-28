@@ -62,6 +62,26 @@ func TestScreenNumericBadValueFailsCommit(t *testing.T) {
 			line: "set security screen ids-option bad-screen limit-session destination-ip-based 0",
 			want: "limit-session destination-ip-based",
 		},
+		{
+			// 2^32: passes the non-positive/non-numeric gate but WRAPS to 0 on
+			// the uint32 publish cast (uint32(4294967296)==0), which disables the
+			// check — the exact fail-open #3317 closes. Must be rejected at
+			// commit by the math.MaxUint32 ceiling.
+			name: "syn-flood-attack-threshold-uint32-wrap",
+			line: "set security screen ids-option bad-screen tcp syn-flood attack-threshold 4294967296",
+			want: "tcp syn-flood attack-threshold",
+		},
+		{
+			// just over MaxUint32 (2^32) on another published leaf.
+			name: "udp-flood-over-maxuint32",
+			line: "set security screen ids-option bad-screen udp flood threshold 4294967296",
+			want: "udp flood",
+		},
+		{
+			name: "port-scan-far-over-maxuint32",
+			line: "set security screen ids-option bad-screen tcp port-scan threshold 9999999999",
+			want: "tcp port-scan threshold",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -90,6 +110,10 @@ func TestScreenNumericValidCommit(t *testing.T) {
 		"set security screen ids-option ok-screen ip ip-sweep threshold 10",
 		"set security screen ids-option ok-screen tcp port-scan threshold 14",
 		"set security screen ids-option ok-screen tcp syn-flood attack-threshold 200",
+		// in-range large values (a few million, and MaxUint32 itself) must be
+		// ACCEPTED — only > math.MaxUint32 wraps the publish cast and is rejected.
+		"set security screen ids-option big-screen tcp syn-flood attack-threshold 5000000",
+		"set security screen ids-option big-screen udp flood threshold 4294967295",
 		"set security screen ids-option ok-screen tcp syn-flood alarm-threshold 512",
 		"set security screen ids-option ok-screen tcp syn-flood timeout 20",
 		"set security screen ids-option ok-screen limit-session source-ip-based 128",

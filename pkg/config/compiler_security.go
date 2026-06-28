@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"sort"
 	"strconv"
@@ -701,7 +702,20 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 				return 0, false
 			}
 			n, err := strconv.Atoi(val)
-			if err != nil || n < 1 {
+			// Reject non-numeric, non-positive, AND > math.MaxUint32. Every
+			// published screen threshold is cast to uint32 in the snapshot
+			// builder (pkg/dataplane/userspace/screens.go) — a value above
+			// 2^32-1 (e.g. 4294967296) would WRAP on that cast (uint32(2^32)==0),
+			// and the Rust screen treats a zero threshold as unset and OMITS the
+			// check. That is the exact fail-open class #3317 closes, so the gate
+			// must reject it at commit rather than let it wrap silently. int64(n)
+			// keeps the comparison portable: on a 32-bit `int` platform an
+			// over-2^32 literal already fails Atoi (err != nil), so this only
+			// adds a real bound on 64-bit. The dataplane-meaningful ceilings are
+			// tighter still (e.g. maxScanSweepThreshold clamps port-scan/ip-sweep
+			// downstream), but math.MaxUint32 is the required floor that prevents
+			// the wrap.
+			if err != nil || n < 1 || int64(n) > math.MaxUint32 {
 				profile.BadNumeric = append(profile.BadNumeric,
 					ScreenBadNumeric{Path: path, Value: val})
 				return 0, false
