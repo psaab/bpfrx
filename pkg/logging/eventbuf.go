@@ -75,13 +75,23 @@ type EventBuffer struct {
 
 // Subscription receives new events from an EventBuffer.
 type Subscription struct {
-	C  chan EventRecord
-	eb *EventBuffer
+	C    chan EventRecord
+	eb   *EventBuffer
+	once sync.Once
 }
 
-// Close unsubscribes and closes the channel.
+// Close unsubscribes and closes the channel (#3384). It honors the documented
+// contract so a consumer ranging over sub.C until it closes terminates instead
+// of blocking forever. The unsubscribe runs first under eb.subMu (write lock),
+// which removes this subscription from the fan-out map and waits out any
+// in-flight Add send — so close(s.C) afterwards can never race a send-on-closed
+// in Add. sync.Once makes a double Close safe (the in-tree consumers Close via
+// defer; some also Close explicitly).
 func (s *Subscription) Close() {
-	s.eb.unsubscribe(s)
+	s.once.Do(func() {
+		s.eb.unsubscribe(s)
+		close(s.C)
+	})
 }
 
 // defaultEventBufferSize is the fallback ring capacity used when a caller
