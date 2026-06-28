@@ -40,17 +40,35 @@ func TestLatestFilteredNegativeN(t *testing.T) {
 // or divide by zero (head % size).
 //
 // FAIL-ON-REVERT: removing the `if size < 1` clamp in NewEventBuffer makes
-// the first Add panic (index out of range / integer divide by zero).
+// the first Add PANIC at the real footgun path — eb.buf[eb.head] is an
+// index-out-of-range on a zero-length slice and eb.head % eb.size is an
+// integer divide-by-zero. The test exercises Add (and reads back via
+// Latest) FIRST so the revert fails AT the Add/modulo path, not at a size
+// assertion that would short-circuit before Add ever runs.
 func TestNewEventBufferZeroSize(t *testing.T) {
 	for _, size := range []int{0, -1, -100} {
 		eb := NewEventBuffer(size)
-		if eb.size < 1 {
-			t.Fatalf("NewEventBuffer(%d) left size=%d (<1)", size, eb.size)
-		}
-		// Must not panic on the first event.
-		eb.Add(EventRecord{Type: "SESSION_OPEN"})
+
+		// Drive the genuine Add/modulo path. A recover-based assertion
+		// turns the revert panic into a clear test failure attributed to
+		// the Add call (rather than a bare panic stack), and proves the
+		// fixed buffer accepts an event without panicking.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("NewEventBuffer(%d): Add panicked (size not clamped): %v", size, r)
+				}
+			}()
+			eb.Add(EventRecord{Type: "SESSION_OPEN"})
+		}()
+
 		if got := eb.Latest(1); len(got) != 1 {
 			t.Errorf("NewEventBuffer(%d): Latest(1) = %d, want 1", size, len(got))
+		}
+		// Sanity: the clamp left a usable capacity. Checked last so it
+		// never short-circuits the Add/modulo exercise above.
+		if eb.size < 1 {
+			t.Errorf("NewEventBuffer(%d) left size=%d (<1)", size, eb.size)
 		}
 	}
 }
