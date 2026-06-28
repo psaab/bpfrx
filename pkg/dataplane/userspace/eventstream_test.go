@@ -329,6 +329,60 @@ func TestDecodeSessionEventV4CarriesLogFlags(t *testing.T) {
 	}
 }
 
+// #3301: the admitting policy's firewall metadata (policy_id,
+// policy_counter_idx, inactivity_timeout seconds) rides the open frame as
+// trailing fields after NextHop. Reverting the eventstream.go decode drops
+// them and this fails RED. A legacy (62-byte) frame without the trailing
+// block must still decode with the fields at 0 (rolling-upgrade safe).
+func TestDecodeSessionEventV4CarriesPolicyFields3301(t *testing.T) {
+	base := buildSessionOpenV4Payload(
+		6, 12345, 443,
+		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
+		[4]byte{}, [4]byte{},
+		0, 0, 1, 1, 0, 0, 0,
+		0,
+		1, 2, 0,
+		[6]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
+		[6]byte{0x02, 0xbf, 0x72, 0x00, 0x50, 0x08},
+		[4]byte{172, 16, 80, 1},
+	)
+	// Append the 12-byte trailing block: policy_id, policy_counter_idx,
+	// inactivity_timeout (seconds), each u32 LE.
+	trailer := make([]byte, 12)
+	binary.LittleEndian.PutUint32(trailer[0:4], 42)
+	binary.LittleEndian.PutUint32(trailer[4:8], 7)
+	binary.LittleEndian.PutUint32(trailer[8:12], 30)
+	payload := append(append([]byte{}, base...), trailer...)
+
+	d, ok := decodeSessionEvent(payload)
+	if !ok {
+		t.Fatal("decodeSessionEvent returned false")
+	}
+	if d.NextHop != "172.16.80.1" {
+		t.Fatalf("NextHop = %q, want 172.16.80.1 (trailer must not corrupt prior fields)", d.NextHop)
+	}
+	if d.PolicyID != 42 {
+		t.Fatalf("PolicyID = %d, want 42", d.PolicyID)
+	}
+	if d.PolicyCounterIdx != 7 {
+		t.Fatalf("PolicyCounterIdx = %d, want 7", d.PolicyCounterIdx)
+	}
+	if d.AppTimeout != 30 {
+		t.Fatalf("AppTimeout = %d, want 30", d.AppTimeout)
+	}
+
+	// Mixed-version: a legacy frame WITHOUT the trailing block still decodes,
+	// with the new fields at 0 (unattributed / no counter / global timeout).
+	dLegacy, ok := decodeSessionEvent(base)
+	if !ok {
+		t.Fatal("decodeSessionEvent (legacy, no trailer) returned false")
+	}
+	if dLegacy.PolicyID != 0 || dLegacy.PolicyCounterIdx != 0 || dLegacy.AppTimeout != 0 {
+		t.Fatalf("legacy frame: policy=%d counter=%d appto=%d, want all 0",
+			dLegacy.PolicyID, dLegacy.PolicyCounterIdx, dLegacy.AppTimeout)
+	}
+}
+
 func TestDecodeSessionEventV4LocalDelivery(t *testing.T) {
 	payload := buildSessionOpenV4Payload(
 		17, 53, 53,

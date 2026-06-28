@@ -1075,6 +1075,69 @@ fn build_synced_session_entry_applies_log_flags() {
     assert!(!entry_none.metadata.log_session_close);
 }
 
+// #3301: the admitting policy's firewall metadata (policy_id,
+// policy_counter_idx, per-application inactivity-timeout) must ride the
+// session-sync wire and be applied to the peer's SyncedSessionEntry so a
+// peer-PROMOTED session is correctly attributed, counted, and aged after
+// failover. Reverting build_synced_session_entry to the hard 0/None imports
+// fails this RED.
+#[test]
+fn build_synced_session_entry_applies_policy_fields_3301() {
+    let req = SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: libc::AF_INET as u8,
+        protocol: 6,
+        src_ip: "10.0.61.102".to_string(),
+        dst_ip: "172.16.80.200".to_string(),
+        src_port: 40000,
+        dst_port: 5201,
+        ingress_zone: "lan".to_string(),
+        egress_zone: "wan".to_string(),
+        egress_ifindex: 5,
+        tx_ifindex: 5,
+        policy_id: 42,
+        policy_counter_idx: 7,
+        inactivity_timeout: 30,
+        ..SessionSyncRequest::default()
+    };
+    let entry =
+        build_synced_session_entry(&req, &test_zone_name_to_id()).expect("synced session entry");
+    assert_eq!(entry.metadata.policy_id, 42, "policy_id must be applied");
+    assert_eq!(
+        entry.metadata.policy_counter_idx, 7,
+        "policy_counter_idx must be applied"
+    );
+    assert_eq!(
+        entry.metadata.inactivity_timeout_ns,
+        Some(30u64 * 1_000_000_000),
+        "inactivity_timeout (s) must convert to ns and be applied"
+    );
+
+    // Mixed-version: an OLD peer omits the new fields (serde default 0). The
+    // sync MUST still decode + install with today's defaults (unattributed /
+    // no counter / global timeout), NOT be rejected (rolling-upgrade safe).
+    let req_legacy: SessionSyncRequest =
+        serde_json::from_str(r#"{"operation":"upsert","addr_family":2,"protocol":6,"src_ip":"10.0.61.102","dst_ip":"172.16.80.200","src_port":40000,"dst_port":5201,"ingress_zone":"lan","egress_zone":"wan","egress_ifindex":5,"tx_ifindex":5}"#)
+            .expect("legacy SessionSyncRequest without policy fields decodes");
+    assert_eq!(req_legacy.policy_id, 0, "missing policy_id defaults to 0");
+    assert_eq!(
+        req_legacy.policy_counter_idx, 0,
+        "missing policy_counter_idx defaults to 0"
+    );
+    assert_eq!(
+        req_legacy.inactivity_timeout, 0,
+        "missing inactivity_timeout defaults to 0"
+    );
+    let entry_legacy = build_synced_session_entry(&req_legacy, &test_zone_name_to_id())
+        .expect("legacy synced session still installs (not rejected)");
+    assert_eq!(entry_legacy.metadata.policy_id, 0);
+    assert_eq!(entry_legacy.metadata.policy_counter_idx, 0);
+    assert_eq!(
+        entry_legacy.metadata.inactivity_timeout_ns, None,
+        "0 inactivity_timeout maps to None (use global per-protocol timeout)"
+    );
+}
+
 #[test]
 fn build_synced_session_entry_preserves_tunnel_endpoint_id() {
     let req = SessionSyncRequest {

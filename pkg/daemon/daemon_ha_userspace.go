@@ -260,6 +260,13 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	if delta.LogSessionClose {
 		val.LogFlags |= dataplane.LogFlagSessionClose
 	}
+	// #3301: carry the admitting policy's firewall metadata so a peer-promoted
+	// session is correctly attributed (PolicyID), counted (PolicyCounterIdx),
+	// and aged (AppTimeout = per-application idle timeout, seconds) after
+	// failover instead of degrading to policy 0 / no counter / global timeout.
+	val.PolicyID = delta.PolicyID
+	val.PolicyCounterIdx = delta.PolicyCounterIdx
+	val.AppTimeout = delta.AppTimeout
 	return key, val, true
 }
 
@@ -344,6 +351,10 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	if delta.LogSessionClose {
 		val.LogFlags |= dataplane.LogFlagSessionClose
 	}
+	// #3301: carry the admitting policy's firewall metadata (see V4).
+	val.PolicyID = delta.PolicyID
+	val.PolicyCounterIdx = delta.PolicyCounterIdx
+	val.AppTimeout = delta.AppTimeout
 	return key, val, true
 }
 

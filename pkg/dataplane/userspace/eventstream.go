@@ -854,6 +854,10 @@ func (es *EventStream) writeFrame(typ uint8, seq uint64, payload []byte) error {
 //	[N..]   NeighborMAC (6 bytes)
 //	[N+6..] SrcMAC (6 bytes)
 //	[N+12..]NextHop (4 or 16 bytes)
+//	#3301 trailing firewall metadata (length-gated; absent on old helpers):
+//	[+0:+4]  policy_id u32 LE          (#3056)
+//	[+4:+8]  policy_counter_idx u32 LE (#3073)
+//	[+8:+12] inactivity_timeout secs u32 LE (#3227 -> AppTimeout)
 //
 // #2467: the three identity fields at [10:22] were widened from signed
 // 16-bit to signed 32-bit. Linux ifindexes are a full `int`; with the old
@@ -959,6 +963,27 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 
 	// NextHop.
 	d.NextHop = formatIP(payload[off:off+addrSize], af)
+	off += addrSize
+
+	// #3301: trailing firewall-metadata fields (length-gated; absent on an
+	// old helper => 0, the legitimate "unattributed / no per-rule counter /
+	// use-global-timeout" value). Each is an independent gate so a
+	// partially-extended frame still decodes what it carries.
+	//   [off:off+4]   policy_id u32 LE        (#3056)
+	//   [off+4:off+8] policy_counter_idx u32  (#3073)
+	//   [off+8:off+12] inactivity_timeout secs u32 (#3227 -> AppTimeout)
+	if off+4 <= len(payload) {
+		d.PolicyID = binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+	}
+	if off+4 <= len(payload) {
+		d.PolicyCounterIdx = binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+	}
+	if off+4 <= len(payload) {
+		d.AppTimeout = binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+	}
 
 	return d, true
 }
