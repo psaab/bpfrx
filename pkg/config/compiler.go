@@ -388,6 +388,22 @@ type compileOpts struct {
 	// dataplane's positive-wins fallback keeps that direction fail-safe. Same
 	// doctrine as lenientFilterMatchValues.
 	lenientFilterPortExcept bool
+	// lenientFilterAddressExcept (#3359) downgrades the firewall-filter
+	// positive-vs-except ADDRESS mutual-exclusion gate
+	// (validateFilterAddressExceptStrict) from a hard compile error to a
+	// cfg.Warnings entry. The strict commit / commit-check path hard-rejects a
+	// term that mixes a positive address match (a literal source-address /
+	// destination-address OR a non-except prefix-list) with an `except`
+	// prefix-list in the SAME direction — Junos treats those as mutually
+	// exclusive and rejects the term at commit. Before this gate xpf accepted
+	// the ambiguous term and the userspace lowering FOLDED the except prefixes
+	// into the positive match set (dropping the except modifier) — a silent
+	// fail-OPEN for a discard/reject term (#3359). The runtime fold is now
+	// positive-wins (the except side ignored, never folded in) so a
+	// leniently-loaded term is fail-safe; the tolerant load / peer-sync paths
+	// downgrade to a warning so an already-persisted or peer-synced config still
+	// BOOTS (#1960 no-brick). Sibling of lenientFilterPortExcept (#3297).
+	lenientFilterAddressExcept bool
 	// lenientFilterFromMatch (#3307) downgrades the firewall-filter
 	// unenforced-`from`-leaf gate (validateFilterFromMatchStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit / commit-check
@@ -1087,6 +1103,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFilterMatchValues:             true,
 		lenientFlexMatch:                     true,
 		lenientFilterPortExcept:              true,
+		lenientFilterAddressExcept:           true,
 		lenientFilterFromMatch:               true,
 		lenientFilterRoutingInstanceConflict: true,
 		lenientFilterDSCP:                    true,
@@ -1223,6 +1240,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFilterMatchValues:             true,
 		lenientFlexMatch:                     true,
 		lenientFilterPortExcept:              true,
+		lenientFilterAddressExcept:           true,
 		lenientFilterFromMatch:               true,
 		lenientFilterRoutingInstanceConflict: true,
 		lenientFilterDSCP:                    true,
@@ -2164,6 +2182,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFilterPortExcept {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("firewall filter port-except (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3359 firewall-filter positive-vs-except ADDRESS mutual-exclusion gate.
+	// Strict on commit / commit-check (hard-reject a term that mixes a positive
+	// address match — literal source/destination-address or a non-except
+	// prefix-list — with an `except` prefix-list in the same direction; Junos
+	// rejects this as ambiguous). Before this gate xpf accepted the term and the
+	// userspace lowering FOLDED the except prefixes into the positive set,
+	// dropping the except modifier — a silent fail-OPEN for a discard/reject
+	// term. Lenient on load / peer-sync (warn so an already-persisted or
+	// peer-synced config still boots — #1960 no-brick; the dataplane's
+	// positive-wins fallback keeps that direction fail-safe). Sibling of the
+	// #3297 port-except gate above.
+	if err := validateFilterAddressExceptStrict(cfg); err != nil {
+		if opts.lenientFilterAddressExcept {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter address-except (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

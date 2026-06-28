@@ -663,9 +663,11 @@ firewall {
         filter filter-mgmt {
             term block_unauthorised {
                 from {
-                    source-address {
-                        0.0.0.0/0;
-                    }
+                    /* A clean source-prefix-list except already means "match
+                       every source NOT in the list"; mixing it with a positive
+                       source-address (e.g. 0.0.0.0/0) in one term is the #3359
+                       fail-open shape and is now rejected at commit
+                       (validateFilterAddressExceptStrict). */
                     source-prefix-list {
                         management-hosts except;
                     }

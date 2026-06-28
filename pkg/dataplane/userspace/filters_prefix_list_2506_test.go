@@ -106,9 +106,18 @@ func TestFilterSnapshotDestPrefixListExcept(t *testing.T) {
 }
 
 // The mixed case (literal addresses + an except prefix-list in ONE direction)
-// is out of scope: the except modifier is dropped (folded to a positive set)
-// rather than silently mis-inverting.
-func TestFilterSnapshotMixedLiteralAndExceptFoldsPositive(t *testing.T) {
+// is out of scope for the boolean-inversion model and is hard-rejected at commit
+// (config.validateFilterAddressExceptStrict, #3359). It reaches the userspace
+// lowering only on the tolerant load / peer-sync path, where the resolver is
+// POSITIVE-WINS: the except modifier is dropped AND the except prefixes are NOT
+// folded into the positive set. The earlier fold (`append(positive,
+// exceptPrefixes...)`) was fail-OPEN — it widened the match by treating the
+// excepted prefixes as a positive match, so a discard/reject term no longer
+// dropped the operator's carve-out (#3359).
+//
+// FAIL-ON-REVERT: restore the fold and the except prefix 10.0.0.0/8 reappears in
+// SourceAddresses — this test goes RED.
+func TestFilterSnapshotMixedLiteralAndExceptPositiveWins(t *testing.T) {
 	cfg := prefixListCfg(
 		[]config.PrefixListRef{{Name: "internal", Except: true}},
 		nil,
@@ -120,9 +129,12 @@ func TestFilterSnapshotMixedLiteralAndExceptFoldsPositive(t *testing.T) {
 	if term.SourceExcept {
 		t.Fatal("mixed literal+except must NOT set source_except (ambiguous, scoped out)")
 	}
-	want := []string{"192.168.0.0/16", "10.0.0.0/8"}
+	want := []string{"192.168.0.0/16"}
 	if !reflect.DeepEqual(term.SourceAddresses, want) {
-		t.Fatalf("source addresses = %v, want %v (mixed folds to positive)", term.SourceAddresses, want)
+		t.Fatalf("source addresses = %v, want %v (positive-wins: except NOT folded in, #3359)", term.SourceAddresses, want)
+	}
+	if !term.SourceConstrained {
+		t.Error("source_constrained MUST stay true for a term with a written address scope")
 	}
 }
 

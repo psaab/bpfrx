@@ -3421,6 +3421,110 @@ func validateFilterPortExceptStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFilterAddressExceptStrict hard-rejects any firewall-filter term that
+// mixes a POSITIVE address match (a literal `source-address`/`destination-address`
+// OR a non-except `source-prefix-list`/`destination-prefix-list`) with an
+// `except` prefix-list in the SAME direction — #3359.
+//
+// Junos treats a positive address match and an `except` prefix-list as mutually
+// exclusive in one term and rejects the combination at commit. xpf's parser,
+// however, lands literal addresses on term.SourceAddresses / term.DestAddresses
+// and prefix-list references (positive AND except) on term.SourcePrefixLists /
+// term.DestPrefixLists (compileFilterFrom), so a positive set and an except set
+// can coexist on one direction of one term.
+//
+// The userspace lowering (pkg/dataplane/userspace/filters.go
+// resolvePrefixListAddrs) has no single boolean-inversion representation for the
+// mixed shape — one direction would need both a positive set and a negated set.
+// Before this gate it FOLDED the except prefixes into the positive match set
+// (dropping the `except` modifier) and only emitted a runtime slog.Warn. That
+// fold is a silent fail-OPEN on a stateless drop path: for a `discard`/`reject`
+// term the operator's `(positive) AND NOT (except)` (or `NOT(except)`) intent
+// collapses to a plain positive match, and traffic the operator meant to drop
+// via the except carve-out is no longer dropped. For an `accept` term the fold
+// is also fail-open in the other direction — it ADMITS the except prefixes the
+// operator wrote to exclude. The runtime fold is now changed to positive-wins
+// (the except side is ignored, never folded in) so a leniently-loaded term is
+// fail-safe; this gate makes the conflict an operator-visible commit error so
+// the term is split into faithful per-direction terms instead.
+//
+// The walk is deterministic (filters sorted by name, terms in config order). On
+// the tolerant load / peer-sync path the caller downgrades the returned error to
+// a warning (#1960 no-brick); the dataplane's positive-wins fallback keeps that
+// direction fail-safe independently. Mirrors validateFilterPortExceptStrict
+// (#3297, the port-match sibling of this address-match case).
+func validateFilterAddressExceptStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// hasExcept reports whether any prefix-list ref in the direction carries the
+	// `except` modifier; hasPositiveRef whether any ref is a plain (non-except)
+	// reference.
+	hasExcept := func(refs []PrefixListRef) bool {
+		for _, ref := range refs {
+			if ref.Except {
+				return true
+			}
+		}
+		return false
+	}
+	hasPositiveRef := func(refs []PrefixListRef) bool {
+		for _, ref := range refs {
+			if !ref.Except {
+				return true
+			}
+		}
+		return false
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil {
+					continue
+				}
+				srcPositive := len(term.SourceAddresses) > 0 || hasPositiveRef(term.SourcePrefixLists)
+				if srcPositive && hasExcept(term.SourcePrefixLists) {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: a positive source "+
+							"address match (`from source-address` or a non-except "+
+							"`from source-prefix-list`) and an `except` "+
+							"source-prefix-list are mutually exclusive in the same "+
+							"term (Junos rejects this; split into separate terms — the "+
+							"mixed shape cannot be enforced faithfully and would "+
+							"fail open for discard/reject)",
+						family, name, term.Name)
+				}
+				dstPositive := len(term.DestAddresses) > 0 || hasPositiveRef(term.DestPrefixLists)
+				if dstPositive && hasExcept(term.DestPrefixLists) {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: a positive destination "+
+							"address match (`from destination-address` or a non-except "+
+							"`from destination-prefix-list`) and an `except` "+
+							"destination-prefix-list are mutually exclusive in the same "+
+							"term (Junos rejects this; split into separate terms — the "+
+							"mixed shape cannot be enforced faithfully and would "+
+							"fail open for discard/reject)",
+						family, name, term.Name)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // validateFilterFromMatchStrict hard-rejects any firewall-filter term whose
 // `from` block carries a match leaf the dataplane does NOT enforce — #3307.
 //
