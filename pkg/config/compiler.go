@@ -388,6 +388,20 @@ type compileOpts struct {
 	// dataplane's positive-wins fallback keeps that direction fail-safe. Same
 	// doctrine as lenientFilterMatchValues.
 	lenientFilterPortExcept bool
+	// lenientFilterFromMatch (#3307) downgrades the firewall-filter
+	// unenforced-`from`-leaf gate (validateFilterFromMatchStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit / commit-check
+	// path hard-rejects a term whose `from` block carries a match leaf the
+	// dataplane does NOT enforce (ttl / source-mac-address / ip-options /
+	// fragment-offset / hop-limit / ...). Before this gate such a leaf passed
+	// the opt-in schema gate and was silently dropped by compileFilterFrom (no
+	// default arm), so the term enforced a BROADER match than authored — an
+	// accept over-permits (fail open), a discard/reject over-drops. The tolerant
+	// load / peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config carrying the unsupported leaf still BOOTS (#1960
+	// no-brick); the dataplane never represented the leaf, so the term keeps
+	// matching without it independently. Same doctrine as lenientFilterActions.
+	lenientFilterFromMatch bool
 	// lenientNPTv6 (#2240) downgrades the NPTv6 (RFC 6296) validation gate
 	// (validateNPTv6Strict) from a hard compile error to a cfg.Warnings entry.
 	// The strict commit / commit-check path hard-rejects an NPTv6 static-NAT
@@ -1019,6 +1033,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFilterMatchValues:            true,
 		lenientFlexMatch:                    true,
 		lenientFilterPortExcept:             true,
+		lenientFilterFromMatch:              true,
 		lenientNPTv6:                        true,
 		lenientFirewallRefs:                 true,
 		lenientFlowServerTemplateRef:        true,
@@ -1150,6 +1165,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFilterMatchValues:            true,
 		lenientFlexMatch:                    true,
 		lenientFilterPortExcept:             true,
+		lenientFilterFromMatch:              true,
 		lenientNPTv6:                        true,
 		lenientFirewallRefs:                 true,
 		lenientFlowServerTemplateRef:        true,
@@ -2048,6 +2064,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFilterPortExcept {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("firewall filter port-except (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3307 firewall-filter unenforced-`from`-leaf gate. Strict on commit /
+	// commit-check (hard-reject a term whose `from` block carries a match leaf
+	// the dataplane does NOT enforce — ttl / source-mac-address / ip-options /
+	// fragment-offset / hop-limit / ...). The schema gate is opt-in, so such a
+	// leaf passed commit and was silently DROPPED by compileFilterFrom (no
+	// default arm), leaving the term matching MORE broadly than authored — an
+	// accept over-permits (fail open), a discard/reject over-drops. Lenient on
+	// load / peer-sync (warn so an already-persisted or peer-synced config still
+	// boots — #1960 no-brick; the dataplane never represented the leaf, so the
+	// term matches without it independently). Runs on the fully-compiled *Config
+	// so the typed term list (with UnknownFrom populated by compileFilterFrom) is
+	// available.
+	if err := validateFilterFromMatchStrict(cfg); err != nil {
+		if opts.lenientFilterFromMatch {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter from-match (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

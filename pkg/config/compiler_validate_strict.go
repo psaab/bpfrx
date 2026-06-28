@@ -3303,6 +3303,73 @@ func validateFilterPortExceptStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFilterFromMatchStrict hard-rejects any firewall-filter term whose
+// `from` block carries a match leaf the dataplane does NOT enforce — #3307.
+//
+// The schema gate is opt-in (schema_walk.go: an unknown keyword resolves to a
+// nil schema child and returns no error), and compileFilterFrom's switch had no
+// default arm, so a `from` leaf the matcher does not implement (ttl,
+// source-mac-address, ip-options, fragment-offset, hop-limit, ...) committed
+// cleanly and was silently DROPPED from the compiled term. The resulting term
+// then enforced a BROADER match than the operator authored: a less-constrained
+// `accept` term permits MORE than intended (fail open) and a less-constrained
+// `discard`/`reject` term drops MORE than intended (over-drop). The operator
+// saw neither a commit error nor an apply error — a vSRX/SRX-imported filter
+// could carry a supported-looking but unimplemented match condition and enforce
+// silently-wrong.
+//
+// The enforced set is EXACTLY the compileFilterFrom switch cases: every one
+// maps to a wire field the snapshot builder emits (pkg/dataplane/userspace/
+// filters.go) and the Rust matcher evaluates (userspace-dp/src/filter/engine).
+// compileFilterFrom's default arm records every other leaf on the term
+// (UnknownFrom, mirroring UnknownActions / UnknownFlexMatch); this gate makes
+// the refusal operator-visible at commit. No NEW matching is implemented — the
+// unsupported leaf is rejected, which is the fail-closed-correct outcome (a
+// constraint is never silently dropped). The walk is deterministic (filters
+// sorted by name, terms in config order). On the tolerant load / peer-sync path
+// the caller downgrades the returned error to a warning (#1960 no-brick); the
+// dataplane never represented the leaf, so a leniently-loaded term keeps
+// matching without that constraint independently — but the operator never
+// reaches that state through a commit. Mirrors validateFilterActionsStrict.
+func validateFilterFromMatchStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil || len(term.UnknownFrom) == 0 {
+					continue
+				}
+				return fmt.Errorf(
+					"firewall family %s filter %q term %q: `from %s` is not enforced "+
+						"by the dataplane (the constraint would be silently dropped, "+
+						"so the term would match more broadly than authored — an "+
+						"accept over-permits, a discard/reject over-drops); remove it "+
+						"or use a supported match such as source-address/"+
+						"destination-address/protocol/source-port/destination-port/"+
+						"dscp/traffic-class/icmp-type/icmp-code/tcp-flags/is-fragment/"+
+						"flexible-match-range",
+					family, name, term.Name, term.UnknownFrom[0])
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // filterProtocolResolvable reports whether a `from protocol <token>` is
 // representable: it INLINE-mirrors the acceptance set of
 // appid.ProtocolNumber's ok==true result (the #2124/#2175 SSOT). pkg/config
