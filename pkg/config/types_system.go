@@ -1046,6 +1046,20 @@ type FirewallFilterTerm struct {
 	// the commit; the tolerant load / peer-sync path downgrades to a warning
 	// (#1960 no-brick). Populated by compileFilterFrom.
 	UnknownFlexMatch []string
+	// UnknownFrom records `from` match leaves the dataplane does NOT enforce
+	// (#3307). The schema gate is opt-in (schema_walk.go), so an unknown `from`
+	// leaf (e.g. ttl / source-mac-address / ip-options / fragment-offset /
+	// hop-limit) resolves to a nil schema child and passes commit; the
+	// compileFilterFrom switch had no default arm, so the leaf was silently
+	// dropped and the term enforced a BROADER match than authored — an `accept`
+	// term over-permits, a `discard`/`reject` term over-drops, with no commit or
+	// apply error. Mirroring UnknownActions/UnknownFlexMatch, compileFilterFrom's
+	// default arm records the offending leaf name here and
+	// validateFilterFromMatchStrict hard-rejects the commit; the tolerant load /
+	// peer-sync path downgrades to a warning (#1960 no-brick). The enforced set
+	// is exactly the compileFilterFrom switch cases (every one maps to a wire
+	// field the snapshot builder emits and the Rust matcher evaluates).
+	UnknownFrom []string
 }
 
 // FlexMatchConfig defines a flexible byte-offset match condition.

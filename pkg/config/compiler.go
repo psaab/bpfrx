@@ -388,6 +388,45 @@ type compileOpts struct {
 	// dataplane's positive-wins fallback keeps that direction fail-safe. Same
 	// doctrine as lenientFilterMatchValues.
 	lenientFilterPortExcept bool
+	// lenientFilterFromMatch (#3307) downgrades the firewall-filter
+	// unenforced-`from`-leaf gate (validateFilterFromMatchStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit / commit-check
+	// path hard-rejects a term whose `from` block carries a match leaf the
+	// dataplane does NOT enforce (ttl / source-mac-address / ip-options /
+	// fragment-offset / hop-limit / ...). Before this gate such a leaf passed
+	// the opt-in schema gate and was silently dropped by compileFilterFrom (no
+	// default arm), so the term enforced a BROADER match than authored — an
+	// accept over-permits (fail open), a discard/reject over-drops. The tolerant
+	// load / peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config carrying the unsupported leaf still BOOTS (#1960
+	// no-brick); the dataplane never represented the leaf, so the term keeps
+	// matching without it independently. Same doctrine as lenientFilterActions.
+	lenientFilterFromMatch bool
+	// lenientFilterRoutingInstanceConflict (#3308) downgrades the firewall-filter
+	// routing-instance-vs-discard/reject mutual-exclusion gate
+	// (validateFilterRoutingInstanceConflictStrict) from a hard compile error to
+	// a cfg.Warnings entry. The strict commit / commit-check path hard-rejects a
+	// term that co-locates `then routing-instance <x>` with a terminating
+	// `then discard` / `then reject` — a contradiction the PBR runtime resolves
+	// by ROUTING the packet anyway while logging it as denied (the audit trail
+	// lies; fail-open PBR). The tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config still BOOTS (#1960
+	// no-brick); the runtime routes-and-mislogs the term independently. Same
+	// doctrine as lenientFilterPortExcept.
+	lenientFilterRoutingInstanceConflict bool
+	// lenientFilterDSCP (#3309) downgrades the firewall-filter DSCP /
+	// traffic-class range gate (validateFilterDSCPStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a `from dscp` / `from traffic-class` match token or a
+	// `then dscp` / `then traffic-class` rewrite token that is neither a known
+	// code-point name nor an integer 0..63. Before this gate such a token was
+	// appended raw and SILENTLY DROPPED by the snapshot builder: a dropped match
+	// value left the term matching ALL DSCPs (a policy widening) and a dropped
+	// rewrite no-opped. The tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config still BOOTS (#1960
+	// no-brick); the snapshot builder drops the bad token independently. Same
+	// doctrine as lenientFilterMatchValues.
+	lenientFilterDSCP bool
 	// lenientNPTv6 (#2240) downgrades the NPTv6 (RFC 6296) validation gate
 	// (validateNPTv6Strict) from a hard compile error to a cfg.Warnings entry.
 	// The strict commit / commit-check path hard-rejects an NPTv6 static-NAT
@@ -996,65 +1035,68 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 // #1830 (e) — the dataplane no longer caps equal-flow at 32 workers.)
 func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 	return compileConfigWithOpts(tree, compileOpts{
-		sanitizeFreeTextControlChars:        true,
-		lenientVRRPTrackDuplicates:          true,
-		lenientDeviceMap:                    true,
-		lenientPolicyMatchAddress:           true,
-		lenientTCPMSSRange:                  true,
-		lenientEventAttributesMatch:         true,
-		lenientIPsecPolicyProposalRef:       true,
-		lenientIPsecGatewayRefs:             true,
-		lenientIKEPolicyChainRef:            true,
-		lenientLogProfileStreamRef:          true,
-		lenientDynamicAddressFeedRef:        true,
-		lenientNATPoolAlarmThreshold:        true,
-		lenientNATHostMask:                  true,
-		lenientUnsupportedInterfaceStanzas:  true,
-		lenientRoutingExportRef:             true,
-		lenientFRRAuthValues:                true,
-		lenientRouteFilterMatchTypes:        true,
-		lenientApplicationSpecs:             true,
-		lenientFilterProtocols:              true,
-		lenientFilterActions:                true,
-		lenientFilterMatchValues:            true,
-		lenientFlexMatch:                    true,
-		lenientFilterPortExcept:             true,
-		lenientNPTv6:                        true,
-		lenientFirewallRefs:                 true,
-		lenientFlowServerTemplateRef:        true,
-		lenientSamplingInstanceConflicts:    true,
-		lenientApplicationSetMembers:        true,
-		lenientPolicyMatchApplications:      true,
-		lenientPolicyMatchAddressSetMembers: true,
-		lenientRibGroupRefs:                 true,
-		lenientDHCPStaticBindings:           true,
-		lenientWireguardPeers:               true,
-		lenientPolicyZoneRefs:               true,
-		lenientZoneCount:                    true,
-		lenientAddressBookNames:             true,
-		lenientZoneInterfaceMembership:      true,
-		lenientHostInboundTokens:            true,
-		lenientDestNATAddresses:             true,
-		lenientRPMSourceAddress:             true,
-		lenientRPMLinkLocalZone:             true,
-		lenientRPMHTTPGetScheme:             true,
-		lenientRPMRoutingInstance:           true,
-		lenientBGPNeighborPeerAS:            true,
-		lenientRouterID:                     true,
-		lenientSNMPTrapGroup:                true,
-		lenientPolicyTerminalAction:         true,
-		lenientPolicyLogAction:              true,
-		lenientScreenProfileRefs:            true,
-		lenientReservedZoneNames:            true,
-		lenientBackupRouterDst:              true,
-		lenientSecureTunnelBindIface:        true,
-		lenientPolicyMatchLeaves:            true,
-		lenientPolicyThenPermit:             true,
-		lenientPolicyThenReject:             true,
-		lenientPolicyThenDeny:               true,
-		lenientPolicyMissingMatch:           true,
-		lenientPolicyCommunityRef:           true,
-		lenientVRRPVirtualAddress:           true,
+		sanitizeFreeTextControlChars:         true,
+		lenientVRRPTrackDuplicates:           true,
+		lenientDeviceMap:                     true,
+		lenientPolicyMatchAddress:            true,
+		lenientTCPMSSRange:                   true,
+		lenientEventAttributesMatch:          true,
+		lenientIPsecPolicyProposalRef:        true,
+		lenientIPsecGatewayRefs:              true,
+		lenientIKEPolicyChainRef:             true,
+		lenientLogProfileStreamRef:           true,
+		lenientDynamicAddressFeedRef:         true,
+		lenientNATPoolAlarmThreshold:         true,
+		lenientNATHostMask:                   true,
+		lenientUnsupportedInterfaceStanzas:   true,
+		lenientRoutingExportRef:              true,
+		lenientFRRAuthValues:                 true,
+		lenientRouteFilterMatchTypes:         true,
+		lenientApplicationSpecs:              true,
+		lenientFilterProtocols:               true,
+		lenientFilterActions:                 true,
+		lenientFilterMatchValues:             true,
+		lenientFlexMatch:                     true,
+		lenientFilterPortExcept:              true,
+		lenientFilterFromMatch:               true,
+		lenientFilterRoutingInstanceConflict: true,
+		lenientFilterDSCP:                    true,
+		lenientNPTv6:                         true,
+		lenientFirewallRefs:                  true,
+		lenientFlowServerTemplateRef:         true,
+		lenientSamplingInstanceConflicts:     true,
+		lenientApplicationSetMembers:         true,
+		lenientPolicyMatchApplications:       true,
+		lenientPolicyMatchAddressSetMembers:  true,
+		lenientRibGroupRefs:                  true,
+		lenientDHCPStaticBindings:            true,
+		lenientWireguardPeers:                true,
+		lenientPolicyZoneRefs:                true,
+		lenientZoneCount:                     true,
+		lenientAddressBookNames:              true,
+		lenientZoneInterfaceMembership:       true,
+		lenientHostInboundTokens:             true,
+		lenientDestNATAddresses:              true,
+		lenientRPMSourceAddress:              true,
+		lenientRPMLinkLocalZone:              true,
+		lenientRPMHTTPGetScheme:              true,
+		lenientRPMRoutingInstance:            true,
+		lenientBGPNeighborPeerAS:             true,
+		lenientRouterID:                      true,
+		lenientSNMPTrapGroup:                 true,
+		lenientPolicyTerminalAction:          true,
+		lenientPolicyLogAction:               true,
+		lenientScreenProfileRefs:             true,
+		lenientReservedZoneNames:             true,
+		lenientBackupRouterDst:               true,
+		lenientSecureTunnelBindIface:         true,
+		lenientPolicyMatchLeaves:             true,
+		lenientPolicyThenPermit:              true,
+		lenientPolicyThenReject:              true,
+		lenientPolicyThenDeny:                true,
+		lenientPolicyMissingMatch:            true,
+		lenientPolicyCommunityRef:            true,
+		lenientVRRPVirtualAddress:            true,
 	})
 }
 
@@ -1127,65 +1169,68 @@ func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) {
 // the candidate-commit path — see CompileConfigLenient.
 func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) {
 	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{
-		sanitizeFreeTextControlChars:        true,
-		lenientVRRPTrackDuplicates:          true,
-		lenientDeviceMap:                    true,
-		lenientPolicyMatchAddress:           true,
-		lenientTCPMSSRange:                  true,
-		lenientEventAttributesMatch:         true,
-		lenientIPsecPolicyProposalRef:       true,
-		lenientIPsecGatewayRefs:             true,
-		lenientIKEPolicyChainRef:            true,
-		lenientLogProfileStreamRef:          true,
-		lenientDynamicAddressFeedRef:        true,
-		lenientNATPoolAlarmThreshold:        true,
-		lenientNATHostMask:                  true,
-		lenientUnsupportedInterfaceStanzas:  true,
-		lenientRoutingExportRef:             true,
-		lenientFRRAuthValues:                true,
-		lenientRouteFilterMatchTypes:        true,
-		lenientApplicationSpecs:             true,
-		lenientFilterProtocols:              true,
-		lenientFilterActions:                true,
-		lenientFilterMatchValues:            true,
-		lenientFlexMatch:                    true,
-		lenientFilterPortExcept:             true,
-		lenientNPTv6:                        true,
-		lenientFirewallRefs:                 true,
-		lenientFlowServerTemplateRef:        true,
-		lenientSamplingInstanceConflicts:    true,
-		lenientApplicationSetMembers:        true,
-		lenientPolicyMatchApplications:      true,
-		lenientPolicyMatchAddressSetMembers: true,
-		lenientRibGroupRefs:                 true,
-		lenientDHCPStaticBindings:           true,
-		lenientWireguardPeers:               true,
-		lenientPolicyZoneRefs:               true,
-		lenientZoneCount:                    true,
-		lenientAddressBookNames:             true,
-		lenientZoneInterfaceMembership:      true,
-		lenientHostInboundTokens:            true,
-		lenientDestNATAddresses:             true,
-		lenientRPMSourceAddress:             true,
-		lenientRPMLinkLocalZone:             true,
-		lenientRPMHTTPGetScheme:             true,
-		lenientRPMRoutingInstance:           true,
-		lenientBGPNeighborPeerAS:            true,
-		lenientRouterID:                     true,
-		lenientSNMPTrapGroup:                true,
-		lenientPolicyTerminalAction:         true,
-		lenientPolicyLogAction:              true,
-		lenientScreenProfileRefs:            true,
-		lenientReservedZoneNames:            true,
-		lenientBackupRouterDst:              true,
-		lenientSecureTunnelBindIface:        true,
-		lenientPolicyMatchLeaves:            true,
-		lenientPolicyThenPermit:             true,
-		lenientPolicyThenReject:             true,
-		lenientPolicyThenDeny:               true,
-		lenientPolicyMissingMatch:           true,
-		lenientPolicyCommunityRef:           true,
-		lenientVRRPVirtualAddress:           true,
+		sanitizeFreeTextControlChars:         true,
+		lenientVRRPTrackDuplicates:           true,
+		lenientDeviceMap:                     true,
+		lenientPolicyMatchAddress:            true,
+		lenientTCPMSSRange:                   true,
+		lenientEventAttributesMatch:          true,
+		lenientIPsecPolicyProposalRef:        true,
+		lenientIPsecGatewayRefs:              true,
+		lenientIKEPolicyChainRef:             true,
+		lenientLogProfileStreamRef:           true,
+		lenientDynamicAddressFeedRef:         true,
+		lenientNATPoolAlarmThreshold:         true,
+		lenientNATHostMask:                   true,
+		lenientUnsupportedInterfaceStanzas:   true,
+		lenientRoutingExportRef:              true,
+		lenientFRRAuthValues:                 true,
+		lenientRouteFilterMatchTypes:         true,
+		lenientApplicationSpecs:              true,
+		lenientFilterProtocols:               true,
+		lenientFilterActions:                 true,
+		lenientFilterMatchValues:             true,
+		lenientFlexMatch:                     true,
+		lenientFilterPortExcept:              true,
+		lenientFilterFromMatch:               true,
+		lenientFilterRoutingInstanceConflict: true,
+		lenientFilterDSCP:                    true,
+		lenientNPTv6:                         true,
+		lenientFirewallRefs:                  true,
+		lenientFlowServerTemplateRef:         true,
+		lenientSamplingInstanceConflicts:     true,
+		lenientApplicationSetMembers:         true,
+		lenientPolicyMatchApplications:       true,
+		lenientPolicyMatchAddressSetMembers:  true,
+		lenientRibGroupRefs:                  true,
+		lenientDHCPStaticBindings:            true,
+		lenientWireguardPeers:                true,
+		lenientPolicyZoneRefs:                true,
+		lenientZoneCount:                     true,
+		lenientAddressBookNames:              true,
+		lenientZoneInterfaceMembership:       true,
+		lenientHostInboundTokens:             true,
+		lenientDestNATAddresses:              true,
+		lenientRPMSourceAddress:              true,
+		lenientRPMLinkLocalZone:              true,
+		lenientRPMHTTPGetScheme:              true,
+		lenientRPMRoutingInstance:            true,
+		lenientBGPNeighborPeerAS:             true,
+		lenientRouterID:                      true,
+		lenientSNMPTrapGroup:                 true,
+		lenientPolicyTerminalAction:          true,
+		lenientPolicyLogAction:               true,
+		lenientScreenProfileRefs:             true,
+		lenientReservedZoneNames:             true,
+		lenientBackupRouterDst:               true,
+		lenientSecureTunnelBindIface:         true,
+		lenientPolicyMatchLeaves:             true,
+		lenientPolicyThenPermit:              true,
+		lenientPolicyThenReject:              true,
+		lenientPolicyThenDeny:                true,
+		lenientPolicyMissingMatch:            true,
+		lenientPolicyCommunityRef:            true,
+		lenientVRRPVirtualAddress:            true,
 	})
 }
 
@@ -2048,6 +2093,68 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFilterPortExcept {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("firewall filter port-except (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3307 firewall-filter unenforced-`from`-leaf gate. Strict on commit /
+	// commit-check (hard-reject a term whose `from` block carries a match leaf
+	// the dataplane does NOT enforce — ttl / source-mac-address / ip-options /
+	// fragment-offset / hop-limit / ...). The schema gate is opt-in, so such a
+	// leaf passed commit and was silently DROPPED by compileFilterFrom (no
+	// default arm), leaving the term matching MORE broadly than authored — an
+	// accept over-permits (fail open), a discard/reject over-drops. Lenient on
+	// load / peer-sync (warn so an already-persisted or peer-synced config still
+	// boots — #1960 no-brick; the dataplane never represented the leaf, so the
+	// term matches without it independently). Runs on the fully-compiled *Config
+	// so the typed term list (with UnknownFrom populated by compileFilterFrom) is
+	// available.
+	if err := validateFilterFromMatchStrict(cfg); err != nil {
+		if opts.lenientFilterFromMatch {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter from-match (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3308 firewall-filter routing-instance-vs-discard/reject mutual-exclusion
+	// gate. Strict on commit / commit-check (hard-reject a term that co-locates
+	// `then routing-instance <x>` with a terminating `then discard`/`then
+	// reject`). Such a term is contradictory: the PBR runtime
+	// (ingress_route_table_override) logs the deny/reject but UNCONDITIONALLY
+	// returns the routing table, so the packet is routed while the audit stream
+	// records it as denied (the audit lies; fail-open PBR). Lenient on load /
+	// peer-sync (warn so an already-persisted or peer-synced config still boots —
+	// #1960 no-brick; the runtime routes-and-mislogs independently). Runs on the
+	// fully-compiled *Config so the typed term list (RoutingInstance + Action
+	// populated by compileFilterThen) is available.
+	if err := validateFilterRoutingInstanceConflictStrict(cfg); err != nil {
+		if opts.lenientFilterRoutingInstanceConflict {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter routing-instance conflict (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3309 firewall-filter DSCP / traffic-class range gate. Strict on commit /
+	// commit-check (hard-reject a `from dscp`/`from traffic-class` match or a
+	// `then dscp`/`then traffic-class` rewrite token that is neither a known
+	// code-point name nor an integer 0..63). Before this gate such a token was
+	// appended raw and SILENTLY DROPPED by the snapshot builder
+	// (pkg/dataplane/userspace/filters.go) — a dropped match value left the term
+	// matching ALL DSCPs (a policy widening) and a dropped rewrite no-opped.
+	// Lenient on load / peer-sync (warn so an already-persisted or peer-synced
+	// config still boots — #1960 no-brick; the snapshot builder drops the bad
+	// token independently). Runs on the fully-compiled *Config so the typed term
+	// list (DSCPs + DSCPRewrite populated by compileFilterFrom/compileFilterThen)
+	// is available.
+	if err := validateFilterDSCPStrict(cfg); err != nil {
+		if opts.lenientFilterDSCP {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter dscp (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
