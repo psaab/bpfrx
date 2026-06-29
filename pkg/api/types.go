@@ -149,11 +149,20 @@ type SessionEntry struct {
 }
 
 // SessionListResponse holds paginated session results.
+//
+// Two pagination modes share this shape (#3421 H4):
+//   - Offset mode (default): Total/Limit/Offset describe a best-effort
+//     limit/offset window over a live map traversal.
+//   - Cursor mode (page_size>0): PageSize and NextPageToken describe a
+//     stable cursor page; an empty NextPageToken marks the last page.
+//     Total is omitted in cursor mode (it would require a full scan).
 type SessionListResponse struct {
-	Total    int            `json:"total"`
-	Limit    int            `json:"limit"`
-	Offset   int            `json:"offset"`
-	Sessions []SessionEntry `json:"sessions"`
+	Total         int            `json:"total"`
+	Limit         int            `json:"limit"`
+	Offset        int            `json:"offset"`
+	PageSize      int            `json:"page_size,omitempty"`
+	NextPageToken string         `json:"next_page_token,omitempty"`
+	Sessions      []SessionEntry `json:"sessions"`
 }
 
 // SessionSummary holds session table summary stats.

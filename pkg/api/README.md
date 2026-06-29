@@ -202,6 +202,28 @@ under the daemon's errgroup. Nothing else imports this package.
   EXACTLY (case-insensitive), not by substring — `protocol=C` no longer
   over-matches TCP/ICMP/ICMPv6. These contracts are pinned by
   `rest_filter_failclosed_test.go` in this package.
+- Session list (`GET /api/v1/security/sessions`) pagination and filtering
+  track the gRPC contract (#3421). Filters: `zone`, `protocol`,
+  `source_prefix`, `destination_prefix`, `source_port`, `destination_port`
+  (prefixes accept a CIDR or a bare IP; the four prefix/port filters mirror
+  `pkg/grpcapi` `matchV4`/`matchV6`). Every filter parses FAIL-CLOSED —
+  a malformed prefix/port/zone returns HTTP 400 instead of zeroing the
+  predicate and widening the query. Pagination has two modes: the default
+  best-effort `limit`/`offset` window (`limit`/`offset` now parse strict —
+  malformed/negative → 400, #3421 M8), and a stable cursor mode selected by
+  `page_size>0`. Cursor mode iterates v4 then v6 from an opaque
+  `page_token`, returning up to `page_size` rows plus a `next_page_token`
+  that resumes exactly after the last row (no skip/duplicate across map
+  mutation, the offset path's hazard); an empty `next_page_token` marks the
+  last page. The token codec mirrors the gRPC page-token format and encodes
+  local session-map keys (node-local, opaque to clients). When the runtime
+  dataplane does not implement cursor iteration the handler falls back to the
+  offset path. Pinned by `sessions_pagination_test.go`.
+- Session clear (`POST /api/v1/security/sessions/clear`) clears ALL local
+  sessions and accepts NO parameters: a query string or request body returns
+  HTTP 400 rather than silently ignoring filter parameters and wiping the
+  whole table (#3421 H6). The gRPC-parity FILTERED clear and HA peer
+  propagation are tracked separately (#3423).
 - `GET /api/v1/security/match` (`matchPoliciesHandler`) is a THIN adapter
   over the single shared policy simulator `pkg/policymatch` (#3042). It only
   validates/parses inputs (400 on a malformed IP/port) and renders the

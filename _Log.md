@@ -23377,3 +23377,8 @@ top.
 - **Timestamp**: 2026-06-29
 - **Action**: Verified #3385 over-match already structurally fixed on master by #3321 (lookup_directional removed the OR-decomposition). Added a #3385-specific RED-on-revert regression test for the distinct OVERLAPPING-range cross-slot over-match. No behavior change.
 - **File(s)**: userspace-dp/src/policy_tests.rs (app_catalog_overlapping_dual_range_no_cross_slot_overmatch)
+
+## #3421 — REST session pagination/filtering/input-validation gRPC parity
+- **Timestamp**: 2026-06-29
+- **Action**: Brought REST session list to gRPC parity. Added cursor pagination (page_size/page_token over a stable cursor, next_page_token resume — fixes H4 offset-over-mutable-map skip/dup); added source_prefix/destination_prefix/source_port/destination_port filters with fail-closed validation (M2); made limit/offset/page_size parse strict → HTTP 400 (M8); rejected any query/body on REST clear-all with HTTP 400 so a filtered-clear attempt cannot silently wipe the whole table (H6 — filtered clear + HA peer propagation deferred to sibling #3423). Refactored sessionsHandler into shared restSessionFilter (matchV4/V6) + sessionsOffset/sessionsCursor paths. RED-on-revert verified for H6 + M8.
+- **File(s)**: pkg/api/sessions.go, pkg/api/types.go, pkg/api/README.md, pkg/api/sessions_pagination_test.go

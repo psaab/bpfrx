@@ -1,0 +1,307 @@
+package api
+
+import (
+	"net/http/httptest"
+	"testing"
+
+	"github.com/psaab/xpf/pkg/dataplane"
+)
+
+// multiSessionDP yields a deterministic set of forward sessions for
+// filter/pagination tests. It implements both the offset iterators
+// (IterateSessions/V6) and the cursor iterators (IterateSessionsFrom/V6From)
+// so it can drive both REST pagination paths.
+type multiSessionDP struct {
+	*dataplane.Manager
+	v4 []struct {
+		key dataplane.SessionKey
+		val dataplane.SessionValue
+	}
+	v6 []struct {
+		key dataplane.SessionKeyV6
+		val dataplane.SessionValueV6
+	}
+}
+
+func (d *multiSessionDP) IsLoaded() bool { return true }
+
+func newMultiSessionDP() *multiSessionDP {
+	d := &multiSessionDP{Manager: dataplane.New()}
+	// Three TCP v4 sessions, distinct dst ports.
+	for i, dport := range []uint16{80, 443, 8080} {
+		d.v4 = append(d.v4, struct {
+			key dataplane.SessionKey
+			val dataplane.SessionValue
+		}{
+			key: dataplane.SessionKey{
+				SrcIP:    [4]byte{10, 0, 1, byte(5 + i)},
+				DstIP:    [4]byte{10, 0, 2, 7},
+				SrcPort:  ntohs(uint16(10000 + i)),
+				DstPort:  ntohs(dport),
+				Protocol: 6,
+			},
+			val: dataplane.SessionValue{State: dataplane.SessStateEstablished, IngressZone: 2, EgressZone: 3},
+		})
+	}
+	// One v6 UDP session.
+	d.v6 = append(d.v6, struct {
+		key dataplane.SessionKeyV6
+		val dataplane.SessionValueV6
+	}{
+		key: dataplane.SessionKeyV6{
+			SrcIP:    [16]byte{0x20, 0x01, 0x05, 0x59},
+			DstIP:    [16]byte{0x20, 0x01, 0x05, 0x60},
+			SrcPort:  ntohs(20000),
+			DstPort:  ntohs(53),
+			Protocol: 17,
+		},
+		val: dataplane.SessionValueV6{State: dataplane.SessStateEstablished, IngressZone: 2, EgressZone: 3},
+	})
+	return d
+}
+
+func (d *multiSessionDP) IterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	for _, e := range d.v4 {
+		if !fn(e.key, e.val) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (d *multiSessionDP) IterateSessionsV6(fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	for _, e := range d.v6 {
+		if !fn(e.key, e.val) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// IterateSessionsFrom resumes AFTER cursor (matching the dataplane Manager
+// contract). A nil cursor starts at the beginning.
+func (d *multiSessionDP) IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	started := cursor == nil
+	for _, e := range d.v4 {
+		if !started {
+			if e.key == *cursor {
+				started = true
+			}
+			continue
+		}
+		if !fn(e.key, e.val) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (d *multiSessionDP) IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	started := cursor == nil
+	for _, e := range d.v6 {
+		if !started {
+			if e.key == *cursor {
+				started = true
+			}
+			continue
+		}
+		if !fn(e.key, e.val) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// TestRESTSessionPrefixPortFilters asserts the #3421 M2 contract: REST
+// session list accepts source/destination prefix and source/destination
+// port filters with gRPC-parity semantics.
+//
+// FAIL-ON-REVERT: removing the srcNet/dstNet/srcPort/dstPort predicates from
+// restSessionFilter.matchV4 makes every filtered case return all three v4
+// rows, flipping the narrowed want counts red.
+func TestRESTSessionPrefixPortFilters(t *testing.T) {
+	s := &Server{dp: newMultiSessionDP()}
+
+	cases := []struct {
+		name string
+		q    string
+		want int
+	}{
+		{"no filter", "", 4}, // 3 v4 + 1 v6
+		{"source_prefix matches one", "source_prefix=10.0.1.5/32", 1},
+		{"source_prefix subnet matches all v4", "source_prefix=10.0.1.0/24", 3},
+		{"destination_port 443", "destination_port=443", 1},
+		{"destination_port none", "destination_port=22", 0},
+		{"source_port 10000", "source_port=10000", 1},
+		{"dest_prefix v6", "destination_prefix=2001:560::/32", 1},
+		{"combined src+dport", "source_prefix=10.0.1.0/24&destination_port=80", 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			url := "/api/v1/security/sessions"
+			if tc.q != "" {
+				url += "?" + tc.q
+			}
+			rr := httptest.NewRecorder()
+			s.sessionsHandler(rr, httptest.NewRequest("GET", url, nil))
+			if rr.Code != 200 {
+				t.Fatalf("status %d, want 200; body: %s", rr.Code, rr.Body.String())
+			}
+			got := len(decodeSessions(t, rr.Body.Bytes()).Sessions)
+			if got != tc.want {
+				t.Fatalf("%s: %d sessions, want %d", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRESTSessionFilterFailsClosed asserts the #3421 M2/M8 contract: a
+// malformed prefix/port/page_size/limit/offset must return HTTP 400, not
+// silently zero the predicate (widening the query) or default the page.
+//
+// FAIL-ON-REVERT: reverting parseRESTSessionFilter to silently drop a bad
+// value, or restoring queryInt for limit/offset/page_size, makes these
+// requests return HTTP 200, flipping every want-400 case red.
+func TestRESTSessionFilterFailsClosed(t *testing.T) {
+	s := &Server{dp: newMultiSessionDP()}
+
+	cases := []struct {
+		name string
+		q    string
+		want int
+	}{
+		{"bad source_prefix", "source_prefix=10.0.0.300/24", 400},
+		{"bad destination_prefix", "destination_prefix=notanip", 400},
+		{"bad source_port", "source_port=abc", 400},
+		{"out-of-range destination_port", "destination_port=70000", 400},
+		{"bad limit", "limit=abc", 400},
+		{"negative offset", "offset=-5", 400},
+		{"bad page_size", "page_size=abc", 400},
+		{"negative page_size", "page_size=-1", 400},
+		{"valid", "source_prefix=10.0.1.0/24&destination_port=443", 200},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			s.sessionsHandler(rr, httptest.NewRequest("GET", "/api/v1/security/sessions?"+tc.q, nil))
+			if rr.Code != tc.want {
+				t.Fatalf("%s: status %d, want %d; body: %s", tc.name, rr.Code, tc.want, rr.Body.String())
+			}
+		})
+	}
+}
+
+// TestRESTSessionCursorPagination asserts the #3421 H4 contract: with
+// page_size>0 REST paginates over a stable cursor, returning a
+// next_page_token that resumes exactly after the last row with no skips or
+// duplicates, and an empty token on the final page.
+//
+// FAIL-ON-REVERT: removing the page_size>0 cursor branch (so page_size is
+// ignored and the offset path runs) makes the first request return all 4
+// sessions with no next_page_token, flipping the page-boundary assertions.
+func TestRESTSessionCursorPagination(t *testing.T) {
+	s := &Server{dp: newMultiSessionDP()}
+
+	var seen []string
+	token := ""
+	pages := 0
+	for {
+		url := "/api/v1/security/sessions?page_size=2"
+		if token != "" {
+			url += "&page_token=" + token
+		}
+		rr := httptest.NewRecorder()
+		s.sessionsHandler(rr, httptest.NewRequest("GET", url, nil))
+		if rr.Code != 200 {
+			t.Fatalf("page %d: status %d, want 200; body: %s", pages, rr.Code, rr.Body.String())
+		}
+		resp := decodeSessions(t, rr.Body.Bytes())
+		if len(resp.Sessions) > 2 {
+			t.Fatalf("page %d returned %d rows, want <= page_size 2", pages, len(resp.Sessions))
+		}
+		for _, se := range resp.Sessions {
+			seen = append(seen, se.SrcAddr+":"+se.DstAddr)
+		}
+		pages++
+		if resp.NextPageToken == "" {
+			break
+		}
+		token = resp.NextPageToken
+		if pages > 10 {
+			t.Fatal("pagination did not terminate")
+		}
+	}
+
+	// All 4 sessions returned exactly once across pages.
+	if len(seen) != 4 {
+		t.Fatalf("cursor pagination returned %d total rows, want 4 (rows: %v)", len(seen), seen)
+	}
+	uniq := map[string]bool{}
+	for _, k := range seen {
+		if uniq[k] {
+			t.Fatalf("duplicate row across pages: %s", k)
+		}
+		uniq[k] = true
+	}
+}
+
+// TestRESTSessionCursorBadToken asserts a malformed page_token returns 400.
+func TestRESTSessionCursorBadToken(t *testing.T) {
+	s := &Server{dp: newMultiSessionDP()}
+	rr := httptest.NewRecorder()
+	s.sessionsHandler(rr, httptest.NewRequest("GET",
+		"/api/v1/security/sessions?page_size=2&page_token=!!!notbase64", nil))
+	if rr.Code != 400 {
+		t.Fatalf("bad page_token: status %d, want 400; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// clearAllDP records ClearAllSessions calls.
+type clearAllDP struct {
+	*dataplane.Manager
+	cleared bool
+}
+
+func (d *clearAllDP) IsLoaded() bool { return true }
+func (d *clearAllDP) ClearAllSessions() (int, int, error) {
+	d.cleared = true
+	return 1, 0, nil
+}
+
+// TestRESTClearRejectsFilters asserts the #3421 H6 contract: the REST
+// clear endpoint clears ALL local sessions and must reject any query string
+// or request body with HTTP 400 rather than silently ignoring filter
+// parameters and wiping the whole table. A parameterless clear proceeds.
+//
+// FAIL-ON-REVERT: removing the query/body guard makes the filtered request
+// reach ClearAllSessions and return 200, flipping the want-400 case (and the
+// cleared-flag assertion) red.
+func TestRESTClearRejectsFilters(t *testing.T) {
+	t.Run("filtered clear rejected", func(t *testing.T) {
+		dp := &clearAllDP{Manager: dataplane.New()}
+		s := &Server{dp: dp}
+		rr := httptest.NewRecorder()
+		s.clearSessionsHandler(rr, httptest.NewRequest("POST",
+			"/api/v1/security/sessions/clear?zone=trust", nil))
+		if rr.Code != 400 {
+			t.Fatalf("filtered clear: status %d, want 400; body: %s", rr.Code, rr.Body.String())
+		}
+		if dp.cleared {
+			t.Fatal("filtered clear wiped the table; want no ClearAllSessions call")
+		}
+	})
+
+	t.Run("parameterless clear proceeds", func(t *testing.T) {
+		dp := &clearAllDP{Manager: dataplane.New()}
+		s := &Server{dp: dp}
+		rr := httptest.NewRecorder()
+		s.clearSessionsHandler(rr, httptest.NewRequest("POST",
+			"/api/v1/security/sessions/clear", nil))
+		if rr.Code != 200 {
+			t.Fatalf("clear-all: status %d, want 200; body: %s", rr.Code, rr.Body.String())
+		}
+		if !dp.cleared {
+			t.Fatal("parameterless clear did not call ClearAllSessions")
+		}
+	})
+}
