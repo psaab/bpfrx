@@ -57,14 +57,17 @@ and `cmd/cli/testpolicy_port_test.go`.
 
 ## Protocol input validation (#3108)
 
-`matchApp` short-circuits to "match any application" before the query protocol
-is resolved (`len(apps)==0` or an empty `proto`, and a policy term of
-`application any` returns true immediately). That makes an unvalidated protocol
-token DANGEROUS at the adapter boundary in exactly the way an unvalidated port
-is: a non-empty but unresolvable protocol (an operator typo like `tcpp`, an
-unknown name, or an out-of-range number like `999`) is never rejected by the
-matcher — it simply fails to constrain anything and the simulator returns a
-permit/deny verdict, masking the typo. One shared validator closes this:
+`matchApp` short-circuits to "match any application" only for the genuine
+match-any cases (`len(apps)==0`, or a policy term of `application any`); a
+protocol-constrained application term is NOT short-circuited by an empty `proto`
+(#3323) — it is resolved through the protocol gate and fails closed for an
+omitted/unresolvable protocol, exactly like the runtime. That still leaves an
+unvalidated protocol token DANGEROUS at the adapter boundary in exactly the way
+an unvalidated port is: a non-empty but unresolvable protocol (an operator typo
+like `tcpp`, an unknown name, or an out-of-range number like `999`) is never
+rejected by the matcher — it simply fails closed against every
+protocol-constrained term, masking the typo as a default-policy verdict instead
+of surfacing the error. One shared validator closes this:
 
 - `ValidateProtocol(string) error` — an empty/whitespace token is "unspecified"
   (no protocol constraint — the wildcard, unchanged); a non-empty token must
@@ -190,7 +193,20 @@ dynamic-address feed overlay (`Query.FeedOverlay`, supplied by the daemon via
 `feeds.Manager.SnapshotForBindings`). Application matching resolves predefined +
 user apps via `config.ResolveApplication`, expands application-sets recursively
 via `config.ExpandApplicationSet`, compares protocols by IANA number via
-`appid.ProtocolNumber`, honors both source-port and destination-port terms
+`appid.ProtocolNumber` (a protocol-constrained application term fails closed on
+an OMITTED or unresolvable query protocol, #3323 — the runtime always carries a
+concrete protocol and keys its per-application terms under it, `by_protocol.get
+(&protocol)?`, so a protocol-bearing term can only match a packet of that
+protocol; an omitted query protocol resolves to `(0,false)` and matches no such
+term, falling through to the default-policy. A NAMED application that carries NO
+protocol is NOT match-any either: the dataplane cannot represent it and never
+enforces it — the snapshot builder fails closed
+(`deriveUserspaceCapabilities`, `capabilities.go` returns `ok=false` for
+`proto==""` → the `__unsupported__` whole-snapshot reject, #3261) and strict
+commit hard-rejects it (`compiler_validate_strict.go`) — so reporting it as a
+concrete match would over-report vs the runtime; such an app fails closed in the
+simulator too. Only the literal `application any` token is match-any), honors both
+source-port and destination-port terms
 (a destination-port-constrained term fails closed on an OMITTED query
 destination port, #3330 — mirroring the runtime keying exact_dst_ports/range
 terms on the concrete packet port; an omitted SOURCE port stays unconstrained

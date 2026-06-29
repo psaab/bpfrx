@@ -695,19 +695,31 @@ func expandBookName(cfg *config.Config, name string, visited map[string]bool) []
 // ExpandApplicationSet, BOTH source-port and destination-port terms, and the
 // ICMP/ICMPv6 type/code constraints enforced in matchSingleApp (#3284).
 //
-// An empty application list is the runtime match-any case. An empty query
-// protocol short-circuits to match-any here — a diagnostic convenience (the
-// runtime always has a concrete protocol), NOT a claim that a protocol-bearing
-// app term would match a protocol-less packet. Once a non-empty protocol is
-// supplied, matchSingleApp constrains by protocol (and ICMP type/code for a
-// type-constrained term), failing closed exactly like the dataplane; a
-// non-empty but UNRESOLVABLE protocol therefore fails closed for every
-// protocol-constrained app term.
+// An empty application list is the runtime match-any case.
+//
+// #3323: an OMITTED (or unresolvable) query protocol must NOT short-circuit to
+// match-any for an application-constrained term — it must fail closed, mirroring
+// the runtime. The runtime always carries a concrete protocol and keys its
+// per-application terms under that protocol (policy.rs CompiledApplications.matches
+// does `by_protocol.get(&protocol)?`, yielding None when no term exists for the
+// packet's protocol). An omitted query protocol resolves to queryProtoOK=false
+// (appid.ProtocolNumber("") is (0,false)), so every protocol-bearing app term —
+// the predefined Junos apps and any custom app with a `protocol` — fails the
+// matchSingleApp protocol gate and does NOT match. The old
+// `if proto == "" { return true }` convenience reported a permit/deny by an
+// app-constrained policy that no concrete ICMP/UDP/GRE/random-TCP packet would
+// ever hit (the sibling of #3330's destination-port omission). Falling through
+// here lets Match reach the configured default-policy, exactly as the dataplane
+// would for a protocol that matches no term.
+//
+// An application that is genuinely UNCONSTRAINED on protocol (app.Protocol == ""
+// with no port / ICMP-type constraint either) still matches regardless of the
+// query protocol — it is a true match-any term, unchanged. Once a non-empty
+// protocol IS supplied, matchSingleApp constrains by protocol (and ICMP
+// type/code for a type-constrained term) exactly as before; a non-empty but
+// UNRESOLVABLE protocol fails closed for every protocol-constrained app term.
 func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort int, icmpType, icmpCode *uint8) bool {
 	if len(apps) == 0 {
-		return true
-	}
-	if proto == "" {
 		return true
 	}
 	queryProto, queryProtoOK := appid.ProtocolNumber(proto)
@@ -742,14 +754,28 @@ func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryP
 	if !ok {
 		return false
 	}
-	// Protocol: compare by IANA number so a named app protocol ("89"/"ospf")
-	// and a named/numeric query protocol agree (the old EqualFold string
-	// compare failed "89" vs "ospf").
-	if app.Protocol != "" {
-		appProto, appOK := appid.ProtocolNumber(app.Protocol)
-		if !appOK || !queryProtoOK || appProto != queryProto {
-			return false
-		}
+	// Protocol: a NAMED application MUST carry a resolvable protocol, and it must
+	// equal the query protocol. Compare by IANA number so a named app protocol
+	// ("89"/"ospf") and a named/numeric query protocol agree (the old EqualFold
+	// string compare failed "89" vs "ospf").
+	//
+	// #3323: a protocol-less named app is NOT match-any — it fails closed. The
+	// dataplane cannot represent such an app and never enforces it: the snapshot
+	// builder fails closed (deriveUserspaceCapabilities,
+	// pkg/dataplane/userspace/capabilities.go returns ok=false for proto=="" →
+	// the reserved __unsupported__ sentinel → whole-snapshot reject, #3261) and
+	// strict commit hard-rejects it (pkg/config/compiler_validate_strict.go:
+	// "cannot represent a protocol-less application"). A protocol-less named app
+	// can therefore only exist via a lenient/HA-loaded config, where the runtime
+	// STILL never enforces it; reporting it as a concrete match-any would
+	// over-report vs the runtime — the exact simulator divergence #3323 closes.
+	// appid.ProtocolNumber("") is (0,false), so an empty app.Protocol makes appOK
+	// false and the term fails closed. The literal `application any` token never
+	// reaches matchSingleApp (matchApp short-circuits a == "any"), so this does
+	// not affect the genuine match-any case.
+	appProto, appOK := appid.ProtocolNumber(app.Protocol)
+	if !appOK || !queryProtoOK || appProto != queryProto {
+		return false
 	}
 	// #3284: ICMP/ICMPv6 type[,code] constraint (junos-ping = type 8). Mirror
 	// policy.rs CompiledApplications.matches: a type-constrained term matches
