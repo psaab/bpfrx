@@ -698,8 +698,17 @@ var schemaApplications = &schemaNode{desc: "Applications", children: map[string]
 		// walk, so it is covered by validateApplicationSpecsStrict instead.
 		"inactivity-timeout": {desc: "Inactivity timeout", args: 1, valueType: ValueInteger, valueDesc: "Timeout in seconds", valueExamples: []string{"300", "1800"}, validator: ValidateInteger(appTimeoutMin, appTimeoutMax), placeholder: "<seconds>", children: nil},
 		"timeout":            {desc: "Timeout", args: 1, valueType: ValueInteger, valueDesc: "Timeout in seconds", valueExamples: []string{"300", "1800"}, validator: ValidateInteger(appTimeoutMin, appTimeoutMax), placeholder: "<seconds>", children: nil},
-		"alg":                {desc: "Application layer gateway", args: 1, placeholder: "<alg>", children: nil},
-		"description":        {desc: "Description", args: 1, placeholder: "<text>", children: nil},
+		// #3353: per-application ALG. The value is validated against the four
+		// implemented ALGs (dns/ftp/sip/tftp) at the strict commit gate
+		// (validateApplicationSpecsStrict / applicationALGSupported), which also
+		// covers the inline-`term` shape (opaque to the schema walk); the examples
+		// here drive `?` completion. An unknown name is rejected at commit and
+		// lenient-warned on the tolerant load/peer-sync path. NOTE: a recognized
+		// per-application alg is currently validate-only — it is not yet carried to
+		// the userspace dataplane (only the global `security alg` disable bitfield
+		// is wired); per-application enforcement is the deferred half of #3353.
+		"alg":         {desc: "Application layer gateway (dns/ftp/sip/tftp)", args: 1, valueExamples: []string{"dns", "ftp", "sip", "tftp"}, placeholder: "<alg>", children: nil},
+		"description": {desc: "Description", args: 1, placeholder: "<text>", children: nil},
 		// #3348: typed ICMP/ICMPv6 type/code constraints (0..255) so an operator
 		// can author a constrained custom echo / traceroute / ICMP-control app —
 		// the runtime supports it (userspace-dp icmp_constraints, the #3020 fix)

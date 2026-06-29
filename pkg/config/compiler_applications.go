@@ -170,6 +170,7 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 	var dstPort, srcPort, alg string
 	var timeout int
 	var badTimeouts []string
+	var unknownLeaves []string
 	var icmpType, icmpCode *uint8
 	// #3348: per normalized-protocol echo-type implied by a junos-ping /
 	// junos-pingv6 alias inside an inline term. normalizeProtocol folds the
@@ -230,6 +231,22 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 				i++
 				alg = keys[i]
 			}
+		default:
+			// #3352: an unknown leaf keyword inside an inline term (e.g. a
+			// misspelled `destination-poort`) was silently dropped here — the
+			// switch had no default arm, so the keyword AND its value token were
+			// skipped, and the term kept only its other constraints. A narrow
+			// `protocol tcp destination-poort 22` then widened to all-TCP with no
+			// destination-port, and the commit SUCCEEDED. Record the offending
+			// keyword so validateApplicationSpecsStrict rejects it at the strict
+			// commit gate (lenient-warn on the tolerant load / peer-sync path).
+			// Skip the presumed value token too — every term leaf in this grammar
+			// is keyword+value, so consuming the value keeps a stray value from
+			// being recorded as a second phantom unknown leaf.
+			unknownLeaves = append(unknownLeaves, keys[i])
+			if i+1 < len(keys) {
+				i++
+			}
 		}
 	}
 
@@ -271,6 +288,7 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 			InactivityTimeout: timeout,
 			ALG:               alg,
 			UnknownTimeouts:   badTimeouts,
+			UnknownTermLeaves: unknownLeaves,
 			ICMPType:          it,
 			ICMPCode:          icmpCode,
 		})

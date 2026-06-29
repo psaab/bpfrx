@@ -1,3 +1,28 @@
+## 2026-06-29 — #3352/#3353 unknown inline-term leaf rejected + per-application alg validated
+
+- **Timestamp**: 2026-06-29
+- **Action**: Two applications-strict-validation gaps, one PR, stacked on
+  #3348. #3352: an unknown leaf inside an inline `application <a> term <t> ...`
+  was silently dropped — `parseApplicationTerms` had no default arm, so a typo
+  like `destination-poort 22` lost the port and the term widened to all-TCP
+  with a clean commit. Added a `default:` arm recording the keyword on
+  `Application.UnknownTermLeaves`; `validateApplicationSpecsStrict` rejects it
+  (lenient-warn on the tolerant path, #1960). #3353: per-application `alg` was
+  stored verbatim with no validation (`alg ftpp` committed clean, silent
+  no-op). Added `supportedApplicationALGs`/`applicationALGSupported` (SSOT =
+  dns/ftp/sip/tftp, mirroring the global `security alg` control + ALGConfig) and
+  a strict-gate check covering both the top-level leaf and the inline-term
+  shape; schema `alg` leaf gained completion examples. ENFORCEMENT DEFERRED
+  (design fork): the per-application ALG is not carried into the userspace
+  snapshot (capabilities.go has no ALG field; only the global alg_disable_flags
+  bitfield is wired) — validate-only, deferred to #2008. Documented the
+  validate-only posture at the gate, schema leaf, and Application.ALG field.
+- **File(s)**: pkg/config/compiler_applications.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/schema_security.go,
+  pkg/config/types_security.go,
+  pkg/config/compiler_application_term_alg_3352_3353_test.go,
+  docs/config-schema.md, pkg/config/README.md
+
 ## 2026-06-29 — #3348 custom protocol junos-ping echo constraint + icmp-type/icmp-code grammar
 
 - **Timestamp**: 2026-06-29

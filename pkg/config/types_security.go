@@ -621,8 +621,17 @@ type Application struct {
 	DestinationPort   string // "80", "8080-8090"
 	SourcePort        string // "1024-65535" (optional)
 	InactivityTimeout int    // seconds (0 = default)
-	ALG               string // "ssh", "ftp", etc. (informational)
-	Description       string
+	// ALG names a per-application application-layer gateway. #3353: it is
+	// validated at commit against the four ALGs xpf implements (dns/ftp/sip/tftp,
+	// validateApplicationSpecsStrict / applicationALGSupported) — an unknown name
+	// is rejected at commit / lenient-warned on the tolerant path. It remains
+	// validate-only: the per-application ALG is NOT carried into the userspace
+	// snapshot (capabilities.go has no ALG field; only the global
+	// `security alg` disable bitfield is wired), so a recognized per-app alg does
+	// not yet open/track a data channel. Per-application enforcement is the
+	// deferred half of #3353, tracked under the #2008 ALG-parity work.
+	ALG         string
+	Description string
 	// ICMPType / ICMPCode constrain an ICMP/ICMPv6 application to a single
 	// message type (and optionally code), e.g. junos-ping = ICMP type 8
 	// (echo-request) and junos-pingv6 = ICMPv6 type 128. nil means "no
@@ -641,6 +650,19 @@ type Application struct {
 	// zero default, silently falling the application back to the global
 	// per-protocol timeout instead of the configured one (#3320).
 	UnknownTimeouts []string
+	// UnknownTermLeaves records the unrecognized leaf keywords found inside an
+	// inline `application <a> term <t> { ... }` definition. The inline-term shape
+	// is opaque to the schema walk (the `term` leaf is an args:1 leaf with no
+	// typed subtree), so parseApplicationTerms is the only place an unknown leaf
+	// such as a misspelled `destination-poort` can be detected. Before #3352 its
+	// switch had no default arm: an unknown leaf — and its value token — were
+	// silently dropped, so a term like `protocol tcp destination-poort 22`
+	// compiled to all-TCP with NO destination-port constraint (a silent match
+	// widening). parseApplicationTerms now records the offending keyword(s) here
+	// (mirroring UnknownTimeouts) and the deferred gate
+	// (validateApplicationSpecsStrict) hard-rejects them on the strict commit
+	// path / warns on the lenient load / peer-sync path (#1960 no-brick).
+	UnknownTermLeaves []string
 }
 
 // IPsecConfig holds IPsec VPN configuration.

@@ -822,6 +822,30 @@ non-port protocol) and an `icmp-code` without an `icmp-type` (an ambiguous
 half-constraint); both downgrade to a warning on the tolerant load/peer-sync
 path. `protocolIsICMPFamily` mirrors the ICMP arm of `filterProtocolResolvable`.
 
+**Unknown inline-term leaf rejected (#3352):** `parseApplicationTerms`
+(`compiler_applications.go`) switches on the known inline-`term` leaves with no
+default arm, so an unknown keyword — and its value — were silently dropped. A
+typo like `term t protocol tcp destination-poort 22` compiled to all-TCP with
+NO destination-port (a silent match widening) and the commit succeeded. The
+inline-term shape is opaque to the schema walk, so the compiler is the only
+place to catch it: a `default:` arm now records the keyword on
+`Application.UnknownTermLeaves` and `validateApplicationSpecsStrict` rejects the
+first one at the strict commit gate (lenient-warn on the tolerant load /
+peer-sync path, #1960).
+
+**Per-application `alg` validated, enforcement deferred (#3353):** a per-app
+`alg` was stored verbatim with no validation — `alg ftpp` committed cleanly (a
+silent no-op). `validateApplicationSpecsStrict` now rejects any name outside the
+four ALGs xpf implements (`dns`/`ftp`/`sip`/`tftp` — `supportedApplicationALGs`,
+the same set the global `security alg` control exposes), covering the top-level
+leaf and the inline-`term` shape via `app.ALG`; strict-reject at commit,
+lenient-warn on the tolerant path. Enforcement is a deliberate fork left to the
+#2008 ALG-parity work: a recognized per-app `alg` is currently **validate-only**
+— it is NOT carried into the userspace snapshot (`capabilities.go` has no ALG
+field; only the global `alg_disable_flags` bitfield is wired), so a custom-port
+ALG pin does not yet open a data channel. The validate-only posture is
+documented at the gate, the schema leaf, and the `Application.ALG` field.
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`

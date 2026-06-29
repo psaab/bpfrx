@@ -3171,8 +3171,78 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 					"remove icmp-code)",
 				name)
 		}
+		// #3352: an unknown leaf keyword inside an inline `term { ... }` was
+		// silently dropped by parseApplicationTerms (its switch had no default
+		// arm), so a typo like `destination-poort 22` lost the port constraint
+		// and the term widened (e.g. a narrow `protocol tcp destination-port 22`
+		// term became all-TCP) with the commit succeeding. The inline-term shape
+		// is opaque to the schema walk (the `term` leaf carries no typed subtree),
+		// so this gate — fed by the recorded Application.UnknownTermLeaves — is the
+		// only place the unknown leaf can be rejected. Junos rejects an unknown
+		// statement under `applications application <a> term`; reject at COMMIT
+		// (strict-at-commit / #1960 fail-closed). The call site downgrades to a
+		// warning on the tolerant load / peer-sync path so an already-persisted or
+		// older-peer-synced config still BOOTS.
+		if len(app.UnknownTermLeaves) > 0 {
+			return fmt.Errorf(
+				"application %q: unknown statement %q inside inline term; a misspelled "+
+					"or unsupported term leaf is silently dropped along with its value, "+
+					"which can WIDEN the term's match (e.g. dropping a destination-port "+
+					"leaves an all-port term) — valid inline-term leaves are protocol, "+
+					"source-port, destination-port, icmp-type, icmp-code, "+
+					"inactivity-timeout/timeout, alg",
+				name, app.UnknownTermLeaves[0])
+		}
+		// #3353: a per-application `alg` name was stored verbatim with no
+		// validation, so a typo like `alg ftpp` committed cleanly and the operator
+		// believed an ALG was pinned when none was. xpf recognizes only the four
+		// ALGs the dataplane implements (the same set the global `security alg`
+		// control exposes — dns/ftp/sip/tftp, ALGConfig); any other name is a
+		// silent no-op. Reject an unknown name at COMMIT (strict-at-commit / #1960
+		// fail-closed), lenient-warn on the tolerant load / peer-sync path. NOTE:
+		// even a recognized per-application alg is currently validate-only — the
+		// per-application ALG (and a custom-port pin) is NOT carried into the
+		// userspace snapshot (capabilities.go has no ALG field); only the GLOBAL
+		// alg-disable bitfield is wired to the dataplane. Per-application ALG
+		// enforcement is deferred to the broader #2008 ALG parity work and tracked
+		// by the #3353 enforcement half (see docs/config-schema.md).
+		if app.ALG != "" && !applicationALGSupported(app.ALG) {
+			return fmt.Errorf(
+				"application %q: unknown alg %q; xpf supports the ALGs %s — an "+
+					"unrecognized name is silently accepted but never enforced, so the "+
+					"data channel is not tracked (fix the name or remove the alg)",
+				name, app.ALG, strings.Join(supportedApplicationALGs(), "/"))
+		}
 	}
 	return nil
+}
+
+// supportedApplicationALGs is the SSOT for the ALG names xpf recognizes on a
+// per-application `alg` leaf. It mirrors the global `security alg` control
+// children (schema_security.go) and the ALGConfig disable flags
+// (types_security.go) — the only ALGs the dataplane implements. The list is
+// returned sorted so error messages are deterministic.
+//
+// #3353: per-application ALG is validated against this set at commit. The set is
+// deliberately the four implemented ALGs rather than the broader Junos ALG
+// catalog (rtsp/h323/sunrpc/...): xpf cannot enforce an ALG it does not
+// implement, so accepting such a name would reproduce the silent-no-op the gate
+// exists to prevent. Recognized names are still NOT enforced per-application
+// today (only the global disable bitfield is wired) — see the deferred
+// enforcement half of #3353.
+func supportedApplicationALGs() []string {
+	return []string{"dns", "ftp", "sip", "tftp"}
+}
+
+// applicationALGSupported reports whether name is one of the ALGs xpf
+// implements (case-insensitive). #3353.
+func applicationALGSupported(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "dns", "ftp", "sip", "tftp":
+		return true
+	default:
+		return false
+	}
 }
 
 // applicationsToValidateStrict returns the set of user-defined application

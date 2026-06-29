@@ -2298,6 +2298,69 @@ both strict guards) and the end-to-end matcher test
 `pkg/policymatch/app_junos_ping_3348_test.go` (custom `protocol junos-ping` permits
 type 8, denies 13/5).
 
+### #3352 — unknown leaf inside an inline `application <a> term <t>` rejected
+
+An inline `applications application <a> term <t> ...` is parsed by
+`parseApplicationTerms` (`compiler_applications.go`), whose `switch` over the
+known term leaves (`protocol` / `source-port` / `destination-port` /
+`icmp-type` / `icmp-code` / `inactivity-timeout` / `timeout` / `alg`) had **no
+default arm**. An unknown keyword — and its value token — were silently dropped,
+so a typo like `protocol tcp destination-poort 22` compiled to an application
+with `Protocol=tcp` and an **empty** `DestinationPort`: a narrow per-port term
+silently widened to **all-TCP**, and the commit SUCCEEDED. The inline-term shape
+is opaque to the schema walk (the `term` leaf is an `args:1` leaf with no typed
+subtree), so `SchemaValidate` cannot reach term leaves.
+
+- **record** — `parseApplicationTerms` now has a `default:` arm that records the
+  unrecognized keyword on the generated `Application.UnknownTermLeaves`
+  (mirroring `UnknownTimeouts`, #3320), consuming the presumed value token so a
+  stray value is not recorded as a second phantom leaf.
+- **reject** — `validateApplicationSpecsStrict` (`compiler_validate_strict.go`)
+  rejects the first `UnknownTermLeaves` entry at the strict commit gate, naming
+  the application and the bad keyword and listing the valid term leaves. The
+  call site (`compiler.go`, `lenientApplicationSpecs`) downgrades it to a
+  `cfg.Warnings` entry on the tolerant load / HA peer-sync path (#1960
+  no-brick).
+
+Regression: `pkg/config/compiler_application_term_alg_3352_3353_test.go`
+(the issue's `destination-poort` example + a bare bogus keyword reject; a
+well-formed term commits cleanly with the port landing; lenient-warn).
+
+### #3353 — per-application `alg` validated at commit (enforcement deferred)
+
+A per-application `alg` (`applications application <a> alg <x>`, top-level or
+inline `term`) was stored verbatim on `Application.ALG` with **no validation**:
+a typo like `alg ftpp` committed cleanly. The operator believed an ALG
+(FTP/SIP/TFTP/DNS control + data tracking) was pinned when none was.
+
+- **validate** — `validateApplicationSpecsStrict` now rejects an `alg` name that
+  is not one of the four ALGs xpf implements — `dns` / `ftp` / `sip` / `tftp`,
+  the SSOT `supportedApplicationALGs` / `applicationALGSupported`, mirroring the
+  global `security alg` control children (`schema_security.go`) and the
+  `ALGConfig` disable flags (`types_security.go`). Strict-reject at commit,
+  lenient-warn on the tolerant load / peer-sync path (#1960). The check reads
+  `app.ALG`, so it covers BOTH the top-level leaf and the inline-`term` shape.
+  The schema `alg` leaf gains `valueExamples` (dns/ftp/sip/tftp) for `?`
+  completion.
+- **enforcement — DEFERRED (design fork).** Validating the name is shipped here;
+  *carrying* a per-application ALG (and a custom-port pin such as `alg ftp
+  destination-port 2121`) into the dataplane is a larger change and is **not**
+  in this PR. The only ALG signal on the userspace wire today is the **global**
+  `alg_disable_flags` bitfield (`userspace-dp/src/protocol/snapshot.rs`); the
+  per-application policy snapshot (`pkg/dataplane/userspace/capabilities.go`)
+  has **no ALG field**, and the matcher does not track a per-app ALG data
+  channel. Wiring it requires a new snapshot field, a Rust decode + session-
+  metadata ALG pin, and matcher enforcement — the per-application slice of the
+  broader ALG parity tracked under #2008. Until then a recognized per-app `alg`
+  is **validate-only** (it gates typos but does not open a data channel), which
+  is documented at the gate, on the schema leaf, and on the `Application.ALG`
+  field. This is the explicit fail-closed-on-typo / honest-no-op posture: reject
+  what xpf cannot enforce, and do not silently accept a name that does nothing.
+
+Regression: `pkg/config/compiler_application_term_alg_3352_3353_test.go`
+(unknown alg reject — top-level + inline term; all four supported ALGs accepted
+and land on the app; lenient-warn).
+
 ### #2226 — rib-group `import-rib` undefined-reference validation
 
 `routing-options rib-groups <group> import-rib <rib>` was unvalidated: an
