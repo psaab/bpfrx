@@ -358,6 +358,15 @@ func newCollector(srv *Server) *xpfCollector {
 				"when config persistence is healthy.",
 			nil, nil,
 		),
+		rollbackHistoryDegraded: prometheus.NewDesc(
+			"xpf_config_rollback_persist_degraded",
+			"1 while the most recent commit failed to durably persist its "+
+				"text rollback-history files (the canonical rollback "+
+				"history, #3441); 0 when healthy. The commit still "+
+				"succeeded and the active config is durable (#1799) — this "+
+				"flags a degraded recovery aid, not a forwarding outage.",
+			nil, nil,
+		),
 		userspacePolicyContentRejected: prometheus.NewDesc(
 			"xpf_userspace_policy_content_rejected",
 			"1 while the most recently built userspace snapshot carries "+

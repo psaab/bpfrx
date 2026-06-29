@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -142,6 +143,26 @@ type Store struct {
 	// Archival settings
 	archiveDir string // local archive directory (empty = disabled)
 	archiveMax int    // max archives to keep
+
+	// archiveSeq is a monotonic per-process counter appended to every
+	// archive filename (#3441 H4, Codex MAJOR). The wall-clock timestamp
+	// alone is not a unique key: two successive (mutex-serialized) commits
+	// can format the SAME nanosecond under a coarse clock or an NTP
+	// step-back, and the later atomic write would overwrite the earlier
+	// archive. The seq always advances, so config-<ts>.<seq>.conf is unique
+	// even on an identical timestamp; the ts still gives chronological
+	// sort/prune order (it dominates the lexical compare).
+	archiveSeq atomic.Uint64
+
+	// rollbackPersistDegraded records that the most recent
+	// saveRollbackFiles() failed to durably write a rollback slot or sync
+	// the directory (#3441 L1). The commit itself still succeeds — the
+	// canonical active config persisted via the #1799 persist-before-promote
+	// path — but the text rollback history (loadRollbackHistory reads it at
+	// boot, #1894) is now stale/lossy. Surfaced via RollbackHistoryDegraded()
+	// and a journal entry so the loss is visible instead of warning-only.
+	// Cleared by the next fully-successful saveRollbackFiles().
+	rollbackPersistDegraded bool
 }
 
 // New creates a new config store. It fails closed when the .configdb

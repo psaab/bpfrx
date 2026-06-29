@@ -41,6 +41,16 @@ func (s *Server) healthHandler(w http.ResponseWriter, _ *http.Request) {
 			return
 		}
 	}
+	// #3441: report rollback-history degradation as a non-fatal field. The
+	// active config is durable (the commit succeeded via the #1799 path);
+	// only the best-effort text rollback copies failed, so unlike
+	// config_persist_degraded this does NOT force a 503 — a perfectly
+	// forwarding firewall must not be pulled from rotation over a degraded
+	// recovery aid. The xpf_config_rollback_persist_degraded gauge is the
+	// alerting hook; this field gives a probe the same visibility.
+	if s.rollbackHistoryDegradedFn != nil {
+		payload["rollback_history_degraded"] = s.rollbackHistoryDegradedFn()
+	}
 	writeOK(w, payload)
 }
 

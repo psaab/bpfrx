@@ -117,6 +117,14 @@ type xpfCollector struct {
 	// yet succeeded (restart would load a stale config).
 	configPersistDegraded *prometheus.Desc
 
+	// #3441: 0/1 gauge — 1 while the most recent commit failed to durably
+	// write its text rollback-history files (the canonical rollback
+	// history; loadRollbackHistory reads them at boot). The commit itself
+	// still succeeded — the active config persisted via the #1799 path —
+	// so this is an observability signal for a degraded recovery aid, not
+	// a forwarding/durability emergency.
+	rollbackHistoryDegraded *prometheus.Desc
+
 	// #3261: 0/1 gauge — 1 while the most recently built userspace snapshot
 	// carries unrepresentable policy content that the helper integrity
 	// preflight rejects (previous-good retained / fresh-boot default-deny —
@@ -531,6 +539,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.neighborPeriodicAge
 	ch <- c.frrReloadDegraded
 	ch <- c.configPersistDegraded
+	ch <- c.rollbackHistoryDegraded
 	ch <- c.userspacePolicyContentRejected
 	ch <- c.ipmonPolicyFailed
 	ch <- c.ipmonPolicyTransitions
@@ -741,6 +750,18 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 			v = 1
 		}
 		ch <- prometheus.MustNewConstMetric(c.configPersistDegraded,
+			prometheus.GaugeValue, v)
+	}
+
+	// #3441: rollback-history persistence is likewise a control-plane
+	// signal — emit it before the dataplane gate so the degraded state
+	// stays visible even when the dataplane is not loaded.
+	if c.srv.rollbackHistoryDegradedFn != nil {
+		v := 0.0
+		if c.srv.rollbackHistoryDegradedFn() {
+			v = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.rollbackHistoryDegraded,
 			prometheus.GaugeValue, v)
 	}
 

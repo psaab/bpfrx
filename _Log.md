@@ -23034,6 +23034,44 @@ top.
     #3368 under-admission premise is not borne out by the Junos contract.
   - **File(s)**: docs/junos-cli-reference.md, _Log.md
 
+## #3441 configstore auto-archive correctness + rollback-file durability gaps
+- **Timestamp**: 2026-06-28
+- **Action**: Fix Codex audit-101 H4/L1/L2/L3. H4: auto-archive captures the
+  just-committed text + nanosecond timestamp inside the commit critical
+  section (no wrong-tree race, no same-second overwrite). L1: rollback-slot
+  write / dir-sync failure now sets a degraded bit (RollbackHistoryDegraded)
+  + journals rollback_persist_error instead of warning-only. L2/L3:
+  loadRollbackHistory + cleanupRollbackFiles break only on os.IsNotExist,
+  log+continue on other errors. Added package-var fsatomic seams
+  (rbWriteFileDurable/rbWriteFileAtomic/rbSyncDir/rbRemove) so durability is
+  test-pinnable (#1916 pattern). 5 RED-on-revert tests.
+- **File(s)**: pkg/configstore/store.go, store_commit.go, store_persist.go,
+  durability_3441_test.go, README.md
+
+## #3441 fold: surface rollback-history degradation via Prometheus + health
+- **Timestamp**: 2026-06-28
+- **Action**: SMR MERGE-NEEDS-MINOR fold. RollbackHistoryDegraded() was
+  exported with a doc promising status/health surfacing but nothing consumed
+  it. Mirrored the ConfigPersistDegraded sibling: added
+  xpf_config_rollback_persist_degraded 0/1 gauge (emitted before the dp gate,
+  like configPersistDegraded) + a non-fatal rollback_history_degraded /health
+  field (NOT 503 — active config is durable, only best-effort text copies
+  failed) + wired RollbackHistoryDegradedFn in daemon_run.go. Gauge + health
+  tests (RED-on-revert).
+- **File(s)**: pkg/api/server.go, metrics.go, metrics_descriptors.go,
+  health.go, daemon/daemon_run.go, pkg/api/metrics_persist_degraded_test.go,
+  pkg/api/health_test.go, pkg/api/README.md
+
+## #3441 fold: unique archive filenames via monotonic seq (Codex MAJOR)
+- **Timestamp**: 2026-06-28
+- **Action**: ts-only archive filename could overwrite on same-nanosecond
+  commits (coarse clock / NTP step-back); ArchiveConfig also called
+  time.Now() after unlock. Added archiveSeq atomic.Uint64 per-store counter,
+  filename now config-<ts>.<seq:020d>.conf; capture ts+seq under the lock in
+  both the commit path and ArchiveConfig. New tests: same-timestamp →
+  2 distinct files (RED-on-revert vs ts-only) + prune-keeps-newest-N order.
+- **File(s)**: pkg/configstore/store.go, store_commit.go, store_persist.go,
+  durability_3441_test.go, README.md
 - **Timestamp**: 2026-06-28
   - **Action**: #3420 — constrain persistent `security flow traceoptions file`
     to a basename under /var/log and reject path-traversal. Added commit-time

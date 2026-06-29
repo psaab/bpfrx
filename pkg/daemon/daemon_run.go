@@ -1245,6 +1245,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// reads 1) while the running active config is not durable on
 			// disk (failed HA sync / auto-rollback persist, retry pending).
 			ConfigPersistDegradedFn: d.store.ConfigPersistDegraded,
+			// #3441: surface configstore rollback-history-degraded state so
+			// /health reports it (non-fatal) and
+			// xpf_config_rollback_persist_degraded reads 1 while the most
+			// recent commit failed to durably persist its text rollback
+			// files. The active config is durable; this flags a degraded
+			// recovery aid, so it does not 503.
+			RollbackHistoryDegradedFn: d.store.RollbackHistoryDegraded,
 			// #2050: surface dynamic-address feed staleness so the
 			// xpf_feed_seconds_since_last_success / xpf_feed_stale gauges
 			// read live status. A frozen enforced address set (retain-forever
