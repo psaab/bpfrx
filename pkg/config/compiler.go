@@ -2408,6 +2408,29 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3450 destination-NAT pool port/address gate. The DNAT pool `port` parser
+	// used a bare strconv.Atoi with no bound check and the snapshot builder cast
+	// straight to uint16, so `port 70000` wrapped to 4464 / `-1` to 65535 (wrong
+	// backend port) and `port 0`/`port httpp` collapsed to 0 = preserve-dest-port
+	// (silent no-op of the rewrite). The pool `address` was stored verbatim: a
+	// non-host CIDR (10.0.0.0/24) was coerced to the network base and an
+	// address-book name (web-server) was dropped by the Rust parser, leaving the
+	// VIP untranslated. Strict on commit / commit-check (hard-reject); lenient on
+	// load / peer-sync (downgrade to a warning so a config persisted before this
+	// gate existed still boots — #1960 no-brick; the snapshot builder
+	// independently fails CLOSED, skipping the rule rather than wrapping the port
+	// or coercing the address). Shares the lenientDestNATAddresses flag (same NAT
+	// silent-drop / wrong-translate doctrine). Runs after the destination-port
+	// gate.
+	if err := validateDNATPoolStrict(cfg); err != nil {
+		if opts.lenientDestNATAddresses {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("destination-nat pool (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2243 DHCP-server static (fixed/reserved) host bindings. Strict on
 	// commit / commit-check (hard-reject a fixed-address that is malformed,
 	// family-mismatched, outside the enclosing pool subnet, or duplicates
