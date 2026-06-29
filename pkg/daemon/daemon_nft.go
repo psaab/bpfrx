@@ -15,6 +15,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	xnft "github.com/psaab/xpf/pkg/nftables"
 )
 
 // nftApplyPayload runs `nft -f -` with the supplied ruleset payload on stdin.
@@ -212,10 +213,20 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 
 // buildHostInboundFilterPayload assembles the exact `nft -f -` payload for the
 // host-inbound kernel chain. Split out as a pure function so tests can
-// parse-check the full payload without invoking nft. Uses the same atomic
-// create/flush/redefine idiom as buildLo0FilterPayload (a syntax error on any
-// line rejects the WHOLE payload, so the chain fails closed-as-absent rather
-// than half-applied).
+// parse-check the full payload without invoking nft. A syntax error on any line
+// rejects the WHOLE payload (atomic load), so the chain fails closed-as-absent
+// rather than half-applied.
+//
+// Atomic replace idiom: `add table` (create if absent), `delete table` (now
+// always has a target -> removes the old chain AND its stateful objects), then a
+// fresh `table { ... }` body. This replaces the plain create/flush/redefine used
+// by lo0: `flush table` empties rules but does NOT delete named counter objects,
+// so redeclaring the per-zone DROP counters (below) on the next commit would
+// collide ("File exists"). delete+recreate guarantees the named counters are
+// declared exactly once and never leaves a stale counter for a removed zone.
+// (A consequence: the host-inbound deny counters reset to zero on every
+// rebuild — every commit and every DHCP/DHCPv6 address change that re-renders
+// the table. Prometheus rate() handles the reset; documented on the metric.)
 //
 // Layout of `chain input` (type filter hook input priority 0; policy accept):
 //  1. ct state established,related accept   — return/ongoing host traffic.
@@ -234,13 +245,37 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 //     (and no deny — the operator opened the zone to all services).
 //     - else: one accept per listed service/protocol scoped to the zone addrs
 //     (`protocols all` expands to the routing-protocol set — #3199, NOT a
-//     blanket accept), then a catch-all `<fam> daddr <addrs> drop` (Junos
-//     default-deny to the host is a silent drop).
+//     blanket accept), then a catch-all
+//     `<fam> daddr <addrs> counter name "<n>" drop` (Junos default-deny to the
+//     host is a silent drop). The named counter `<n>` is declared at the top of
+//     the table body and scraped per zone/family into the
+//     xpf_host_inbound_kernel_denies_total metric (#3361) — distinct from the
+//     userspace-dp xpf_host_inbound_denies_total path (#3326).
 func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) string {
+	// Pre-pass: collect the named DROP counters the chain will reference, so they
+	// can be declared at the top of the table body BEFORE the chain. A counter is
+	// emitted exactly when emitHostInboundZone emits a catch-all drop
+	// (hostInboundEmitsDrop) — the two MUST agree on that condition or nft rejects
+	// the load (reference to an undeclared counter / declared-but-unused is fine,
+	// but an undeclared reference is a hard error).
+	var counters []string
+	for _, v := range views {
+		if hostInboundEmitsDrop(v, v.V4Addrs) {
+			counters = append(counters, xnft.HostInboundDenyCounterName(v.Zone, "ip"))
+		}
+		if hostInboundEmitsDrop(v, v.V6Addrs) {
+			counters = append(counters, xnft.HostInboundDenyCounterName(v.Zone, "ip6"))
+		}
+	}
+
 	var rules []string
-	rules = append(rules, "table inet xpf_hostinbound")
-	rules = append(rules, "flush table inet xpf_hostinbound")
+	rules = append(rules, "add table inet xpf_hostinbound")
+	rules = append(rules, "delete table inet xpf_hostinbound")
 	rules = append(rules, "table inet xpf_hostinbound {")
+	for _, cn := range counters {
+		rules = append(rules, "  counter \""+cn+"\" {")
+		rules = append(rules, "  }")
+	}
 	rules = append(rules, "  chain input {")
 	rules = append(rules, "    type filter hook input priority 0; policy accept;")
 	rules = append(rules, "    ct state established,related accept")
@@ -280,6 +315,16 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) stri
 	return strings.Join(rules, "\n") + "\n"
 }
 
+// hostInboundEmitsDrop reports whether emitHostInboundZone will emit a catch-all
+// DROP (and therefore a named DROP counter) for this zone/family. A drop is
+// emitted whenever the family has at least one address AND the zone is not opened
+// to all services (`system-services all`/`any-service`). buildHostInboundFilterPayload
+// uses this to pre-declare the matching counter objects, so the two sites cannot
+// diverge on which (zone, family) pairs get a counter.
+func hostInboundEmitsDrop(v dpuserspace.ZoneHostInboundView, addrs []string) bool {
+	return len(addrs) > 0 && !hostInboundAllowsAll(v)
+}
+
 // emitHostInboundZone appends the accept(+drop) rules for one zone/family to
 // rules. No-op when the zone has no address in this family.
 func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, family string, addrs []string) {
@@ -316,8 +361,12 @@ func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, fam
 		*rules = append(*rules, "    "+daddr+" "+m+" accept")
 	}
 	// Catch-all deny for anything else destined to this zone's addresses
-	// (Junos default-deny to the host is a silent drop).
-	*rules = append(*rules, "    "+daddr+" drop")
+	// (Junos default-deny to the host is a silent drop). Attach a named counter
+	// (declared at the top of the table body by buildHostInboundFilterPayload) so
+	// the kernel host-inbound drops are scrapeable per zone/family (#3361) — the
+	// drop was previously uncounted and invisible to operators.
+	cn := xnft.HostInboundDenyCounterName(v.Zone, family)
+	*rules = append(*rules, "    "+daddr+" counter name \""+cn+"\" drop")
 }
 
 // hostInboundAllowsAll reports whether the zone's system-services contains

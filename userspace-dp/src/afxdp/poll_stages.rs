@@ -491,7 +491,23 @@ pub(super) fn stage_screen_check(
             return StageOutcome::RecycleAndContinue;
         }
     };
-    match screen.check_packet_with_zone_id(zone_name, zone_id, &screen_pkt, now_secs) {
+    let verdict = screen.check_packet_with_zone_id(zone_name, zone_id, &screen_pkt, now_secs);
+    // #3315: drain a pending SYN-flood alarm (alarm-threshold crossed below
+    // attack-threshold). Like scan-table-pressure this is a log-only PERMIT
+    // alarm — it does NOT drop and is rate-limited to ≤1/sec/zone in the screen
+    // runtime — so it is emitted regardless of the verdict (the packet that
+    // raised the alarm typically passes the aggregate and continues here).
+    if screen.take_syn_alarm_event() {
+        emit_screen_alarm_event(
+            worker_ctx.event_stream,
+            &screen_pkt,
+            meta,
+            zone_id,
+            "syn-flood-alarm",
+            event_now_ns_from_secs(now_secs),
+        );
+    }
+    match verdict {
         ScreenVerdict::Pass => StageOutcome::Continue(ScreenCheckOutcome::Pass),
         ScreenVerdict::SynCookieBypass => {
             counters.touched = true;

@@ -186,10 +186,10 @@ func TestHostInboundEmptyStanzaFailsClosed(t *testing.T) {
 	emitHostInboundZone(&rules, v, "ip6", v.V6Addrs)
 
 	joined := strings.Join(rules, "\n")
-	if !strings.Contains(joined, "ip daddr 203.0.113.1 drop") {
+	if !strings.Contains(joined, hiDrop("ip", "203.0.113.1", "untrust")) {
 		t.Errorf("empty-stanza v4 zone did not fail closed (no catch-all drop):\n%s", joined)
 	}
-	if !strings.Contains(joined, "ip6 daddr 2001:db8::1 drop") {
+	if !strings.Contains(joined, hiDrop("ip6", "2001:db8::1", "untrust")) {
 		t.Errorf("empty-stanza v6 zone did not fail closed (no catch-all drop):\n%s", joined)
 	}
 	for _, r := range rules {
