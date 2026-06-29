@@ -91,6 +91,9 @@ func (d *Daemon) assembleFRRConfig(cfg *config.Config, overlay []config.RouteOve
 	ifaceBandwidths := make(map[string]uint64)
 	ifaceP2P := make(map[string]bool)
 	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
 		linuxName := config.LinuxIfName(name)
 		if ifc.Bandwidth > 0 {
 			ifaceBandwidths[linuxName] = ifc.Bandwidth

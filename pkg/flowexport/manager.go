@@ -539,6 +539,13 @@ func BuildIPFIXExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOpt
 func BuildSamplingZones(cfg *config.Config, zoneIDs map[string]uint16) map[uint16]SamplingDir {
 	result := make(map[uint16]SamplingDir)
 	for zoneName, zone := range cfg.Security.Zones {
+		// A nil zone value is reachable on the tolerant/programmatic/
+		// HA-peer-sync config path (the same nil-slot invariant the
+		// dataplane SSOT defends). Skip it, otherwise the zone.Interfaces
+		// deref below panics the flow-export apply path (#3492).
+		if zone == nil {
+			continue
+		}
 		zid, ok := zoneIDs[zoneName]
 		if !ok {
 			continue
@@ -556,7 +563,9 @@ func BuildSamplingZones(cfg *config.Config, zoneIDs map[string]uint16) map[uint1
 				continue
 			}
 			ifCfg, ok := cfg.Interfaces.Interfaces[physName]
-			if !ok {
+			if !ok || ifCfg == nil {
+				// comma-ok checks key-presence, not value-non-nil; a
+				// (nil, true) entry would panic on ifCfg.Units below.
 				continue
 			}
 			unit, ok := ifCfg.Units[unitNum]

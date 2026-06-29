@@ -23153,3 +23153,17 @@ top.
   pkg/dataplane/userspace/nat_l4_match_3429_test.go, userspace-dp/src/protocol/nat.rs,
   userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests.rs,
   docs/services-application-identification.md
+## 2026-06-28 — fix/3492 buildZoneRGMap nil-zone guard
+- **Timestamp**: 2026-06-28
+- **Action**: Add `zone == nil` guard in buildZoneRGMap (per-RG session-sync apply path); add RED-on-revert TestBuildZoneRGMapSkipsNilZones
+- **File(s)**: pkg/daemon/daemon_ha_userspace.go, pkg/daemon/per_rg_test.go
+
+## 2026-06-28 — fix/3492 broadened apply-path nil-zone/nil-interface sweep
+- **Timestamp**: 2026-06-28
+- **Action**: Fold reviewer-found siblings (Codex MAJOR flowexport.BuildSamplingZones nil-zone; SMR buildZoneRGMap (nil,true) ifc + rgHasRETH nil ifc) + broad apply-path sweep guarding every nil zone/interface VALUE deref; add 3 RED-on-revert tests
+- **File(s)**: pkg/flowexport/manager.go, pkg/flowexport/exporter_test.go, pkg/daemon/{daemon_ha_userspace,daemon_ha_vip,daemon_apply,daemon_ipmon,daemon_ha,daemon_ra,daemon_system,daemon_run,daemon_ddns,daemon_ha_fabric}.go, pkg/daemon/per_rg_test.go
+
+## 2026-06-28 — fix/3492 close flowexport ifCfg==nil test-coverage gap
+- **Timestamp**: 2026-06-28
+- **Action**: trust zone in TestBuildSamplingZonesSkipsNilZone now references the nil interface (nilif.0) so the BuildSamplingZones `ifCfg == nil` comma-ok clause is RED-on-revert (was only zone==nil covered)
+- **File(s)**: pkg/flowexport/exporter_test.go

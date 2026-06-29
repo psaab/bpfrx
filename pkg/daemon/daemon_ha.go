@@ -782,6 +782,9 @@ func (d *Daemon) reconcileRGState() {
 func rethInterfacesForRG(cfg *config.Config, rgID int) []string {
 	var names []string
 	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
 		if ifc.RedundancyGroup == rgID && strings.HasPrefix(name, "reth") {
 			// Resolve RETH to physical member for Linux-level operations.
 			resolved := config.LinuxIfName(cfg.ResolveReth(name))
@@ -815,6 +818,9 @@ func (d *Daemon) injectBlackholeRoutes(rgID int) {
 
 	var routes []netlink.Route
 	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
 		if ifc.RedundancyGroup != rgID || !strings.HasPrefix(name, "reth") {
 			continue
 		}

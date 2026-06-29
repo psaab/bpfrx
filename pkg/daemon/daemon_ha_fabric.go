@@ -168,7 +168,7 @@ func (d *Daemon) resolveFabricParent(fabName string) string {
 	if cfg == nil {
 		return fabName
 	}
-	if ifCfg, ok := cfg.Interfaces.Interfaces[fabName]; ok && ifCfg.LocalFabricMember != "" {
+	if ifCfg, ok := cfg.Interfaces.Interfaces[fabName]; ok && ifCfg != nil && ifCfg.LocalFabricMember != "" {
 		return config.LinuxIfName(ifCfg.LocalFabricMember)
 	}
 	return fabName
