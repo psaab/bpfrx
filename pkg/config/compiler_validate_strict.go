@@ -4522,6 +4522,7 @@ func filterProtocolResolvable(token string) bool {
 		"gre", "junos-gre",
 		"ospf", "junos-ospf",
 		"junos-ip-in-ip", "junos-ipip", "ipip",
+		"ipv6",
 		"egp",
 		"igmp",
 		"pim",
