@@ -203,3 +203,18 @@ func TestBuildFlowSnapshotThreadsPowerModeDisable(t *testing.T) {
 		t.Fatal("PowerModeDisable should be threaded into FlowSnapshot")
 	}
 }
+
+// TestBuildFlowSnapshotThreadsGREAcceleration pins the #3360 thread-through:
+// `security flow gre-performance-acceleration`
+// (cfg.Security.Flow.GREPerformanceAcceleration) must reach
+// FlowSnapshot.GREAcceleration so the wire bit reflects operator intent.
+func TestBuildFlowSnapshotThreadsGREAcceleration(t *testing.T) {
+	cfg := &config.Config{}
+	if snap := buildFlowSnapshot(cfg); snap.GREAcceleration {
+		t.Fatal("GREAcceleration should be false when unset")
+	}
+	cfg.Security.Flow.GREPerformanceAcceleration = true
+	if snap := buildFlowSnapshot(cfg); !snap.GREAcceleration {
+		t.Fatal("GREAcceleration should be threaded into FlowSnapshot")
+	}
+}

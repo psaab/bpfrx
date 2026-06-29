@@ -447,6 +447,15 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 	}
 	fmt.Printf("  From zone: %s, To zone: %s\n", fromZone, toZone)
 	fmt.Printf("  Policy: %s\n", res.PolicyName)
+	// #3331: identify WHICH scoped/global policy matched so a verdict maps back
+	// to the runtime policy / session-table ID / audit record when names repeat.
+	fmt.Printf("    Policy ID: %d\n", res.PolicyID)
+	if res.Global {
+		fmt.Printf("    Scope: global (match from-zone: %s, to-zone: %s)\n",
+			matchScopeZone(res.FromZone), matchScopeZone(res.ToZone))
+	} else {
+		fmt.Printf("    Scope: zone-pair (from-zone: %s, to-zone: %s)\n", res.FromZone, res.ToZone)
+	}
 	if res.Description != "" {
 		fmt.Printf("    Description: %s\n", res.Description)
 	}
@@ -455,4 +464,14 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 	fmt.Printf("    Applications: %v\n", res.Applications)
 	fmt.Printf("    Action: %s\n", policymatch.ActionString(res.Action))
 	return nil
+}
+
+// matchScopeZone renders a global policy's match from-zone/to-zone scope for the
+// match-policies output (#3331). An empty scope means the global policy applies
+// to every zone, shown as "any" to match the Junos / `show policies` convention.
+func matchScopeZone(z string) string {
+	if z == "" {
+		return "any"
+	}
+	return z
 }

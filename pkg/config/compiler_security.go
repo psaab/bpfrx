@@ -1313,6 +1313,78 @@ func validateSecurityLogStreamPortsAST(nodes []*Node, prefix string, lenient boo
 	return warnings, nil
 }
 
+// validateSecurityLogStreamTLSProfileAST is the #3350 commit-time gate for
+// `security log stream <s> transport tls-profile <name>`. The token is parsed
+// (schema_security.go), validated for syntax, and stored on
+// stream.Transport.TLSProfile (compileLog) — but it is NEVER resolved into a
+// *tls.Config at runtime: daemon_system.go applyLogStreams always passes a nil
+// *tls.Config to logging.NewSyslogClientTransport, so the TLS dialer falls back
+// to the system CA roots (pkg/logging/syslog.go dialTLS). There is also no
+// `tls-profile` DEFINITION stanza anywhere in the config (no local-certificate /
+// trusted-ca / SNI source for syslog — only IPsec/IKE define certs), so the
+// named profile has nothing to resolve to. An operator who configures
+// `tls-profile` believes mutual TLS / a pinned CA is in force when it is not —
+// a secure-syslog posture silently downgraded to system roots (a fail-open).
+//
+// Because the profile can never be honored, this gate REJECTS any
+// `transport tls-profile` at commit rather than letting it silently no-op.
+// `transport protocol tls` ON ITS OWN is left intact: a TLS stream that trusts
+// the system CA roots is a legitimate, fully-honored configuration — only the
+// named-but-unapplied profile is rejected.
+//
+// It mirrors compileLog's traversal exactly (FindChild("log") +
+// namedInstances(stream) + the `transport` child loop) so it gates precisely
+// the token the compiler reads. Runs on the group-expanded tree so an
+// apply-groups-inherited tls-profile is covered.
+//
+// Strict path (commit / commit-check, lenient=false): a present tls-profile is
+// a hard compile error. Lenient path (load / peer-sync, lenient=true):
+// downgraded to a warning so an already-persisted or peer-synced config that an
+// older binary accepted (and that silently used system roots) still boots
+// (#1960 / #3261 fail-closed-on-load class). The runtime behavior is unchanged
+// by the lenient downgrade — the profile was never applied either way — so a
+// leniently-loaded value is inert, now flagged.
+func validateSecurityLogStreamTLSProfileAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
+	var warnings []string
+	for _, n := range nodes {
+		if n.Name() != "security" {
+			continue
+		}
+		secPath := joinNodePath(prefix, n.Keys)
+		for _, logNode := range n.FindChildren("log") {
+			logPath := joinNodePath(secPath, []string{"log"})
+			for _, inst := range namedInstances(logNode.FindChildren("stream")) {
+				streamPath := joinNodePath(logPath, []string{"stream", inst.name})
+				for _, prop := range inst.node.Children {
+					if prop.Name() != "transport" {
+						continue
+					}
+					for _, tc := range prop.Children {
+						if tc.Name() != "tls-profile" {
+							continue
+						}
+						profile := nodeVal(tc)
+						path := joinNodePath(streamPath, []string{"transport", "tls-profile"})
+						msg := fmt.Sprintf("%s: tls-profile %q is not applied at runtime — "+
+							"xpf has no TLS profile definition (certificate / trusted-ca / "+
+							"SNI) to resolve it to, so the TLS syslog stream silently falls "+
+							"back to the system CA roots instead of the named profile. Remove "+
+							"the tls-profile (a `transport protocol tls` stream that trusts the "+
+							"system CA roots is honored) until profile resolution is implemented",
+							path, profile)
+						if lenient {
+							warnings = append(warnings, msg)
+							continue
+						}
+						return warnings, fmt.Errorf("%s", msg)
+					}
+				}
+			}
+		}
+	}
+	return warnings, nil
+}
+
 // tcpMSSKinds are the four tcp-mss sub-kinds the compiler reads
 // (compileFlow MSS switch). Each carries a u16 MSS value that lands in a
 // Rust u16 wire field (TCPMSS{IPsecVPN,GreIn,GreOut}; all-tcp fans out into

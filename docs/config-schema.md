@@ -701,6 +701,22 @@ reserved for whole-dataplane selection where a rewrite shim
   skipped them and an invalid value committed silently:
   - `security log stream transport` — `protocol` (enum `udp|tcp|tls`,
     matching the `pkg/logging/syslog.go` dial switch) + `tls-profile`.
+    - **#3350 (tls-profile reject):** `transport tls-profile <name>` is
+      parsed/stored but was NEVER resolved into a `*tls.Config` at runtime
+      (`daemon_system.go` applyLogStreams passes a nil `*tls.Config`, and
+      there is no TLS profile definition stanza — cert / trusted-ca / SNI —
+      to resolve it to; only IPsec/IKE define certs). A TLS syslog stream
+      therefore silently used the system CA roots instead of the named
+      profile — a secure-syslog posture silently downgraded (fail-open). It
+      is now REJECTED at commit by `validateSecurityLogStreamTLSProfileAST`
+      (compiler.go), the strict-reject + lenient-downgrade (#1960/#3261)
+      AST-gate pattern shared with the #3349 stream-port gate (the token
+      lives under the `transport` block, a location SchemaValidate cannot
+      express, so it is gated in the compiler not setSchema). A plain
+      `transport protocol tls` stream that trusts the system CA roots stays
+      valid; only the named-but-unapplied profile is rejected. If profile
+      resolution is implemented later, build the `*tls.Config` in
+      `daemon_system.go` and lift the compiler reject.
   - IKE (`security ike proposal`) and IPsec (`security ipsec proposal`)
     crypto leaves — `authentication-method` (IKE only, enum
     `pre-shared-keys|rsa-signatures|ecdsa-signatures`, matching

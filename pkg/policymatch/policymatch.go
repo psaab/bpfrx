@@ -52,6 +52,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // MaxPort is the largest valid TCP/UDP port number.
@@ -248,6 +249,28 @@ type Result struct {
 	// meaning in this case.
 	HostInboundUnmatched bool
 
+	// FromZone and ToZone identify the SCOPE of the matched policy (#3331), so
+	// a caller can disambiguate a verdict when the same policy name repeats
+	// across zone pairs / global scope (legal in Junos). For a zone-pair policy
+	// these are the surrounding `from-zone`/`to-zone` stanza. For a GLOBAL
+	// policy they are the optional `match from-zone`/`match to-zone` scope
+	// (#3148/#3288); an empty value means the global policy is unconstrained and
+	// applies to every zone (callers render "" as "any" when Global is true).
+	// Both are empty when no policy matched (DefaultUsed / HostInboundUnmatched).
+	FromZone string
+	ToZone   string
+
+	// PolicyID is the stable runtime/RT_FLOW/session-table policy ID of the
+	// matched policy (#3331), computed by the SSOT
+	// dataplane/userspace.RuntimePolicyIDs (the same span-accumulated namespace
+	// the dataplane write side and the `show policies` Index column use, #3063).
+	// It lets a match-policies verdict be cross-referenced against the session
+	// table and the policy-deny/permit audit log even when policy names collide
+	// across scopes. Meaningful only when Matched is true; 0 for the
+	// default-policy / host-inbound verdicts (and for a config that overflows
+	// MaxRulesPerPolicy, which cannot be applied anyway — see RuntimePolicyIDs).
+	PolicyID uint32
+
 	PolicyName   string
 	Description  string
 	Action       config.PolicyAction
@@ -277,11 +300,18 @@ func Match(cfg *config.Config, q Query) Result {
 		return Result{DefaultUsed: true, Action: config.PolicyDeny}
 	}
 
+	// #3331: resolve the stable runtime policy-ID namespace once, up front, so a
+	// match can stamp Result.PolicyID. This is the SAME SSOT the dataplane write
+	// side and the `show policies` Index column use (RuntimePolicyIDs ->
+	// walkPolicyRuleSlots), keyed by [policySetID, sliceIndex] — the exact
+	// (set index, slice index) coordinates the tier loops below already iterate.
+	ids := dpuserspace.RuntimePolicyIDs(cfg)
+
 	// #3285: host-bound (LocalDelivery) traffic is governed by the dataplane's
 	// host gate, which does NOT apply transit global/default fallback. Branch
 	// before the transit tiers so that invariant cannot regress.
 	if q.ToZone == JunosHostZone {
-		return matchJunosHost(cfg, q)
+		return matchJunosHost(cfg, q, ids)
 	}
 
 	// #3355: the runtime gates the ENTIRE transit block — exact zone-pair, the
@@ -301,13 +331,13 @@ func Match(cfg *config.Config, q Query) Result {
 	// Tier 1: exact zone-pair policies, in config order (first match wins).
 	// q.FromZone/q.ToZone are concrete zone names; a wildcard set
 	// (FromZone/ToZone == "any") never compares equal, so it is excluded here.
-	for _, zpp := range cfg.Security.Policies {
+	for setIdx, zpp := range cfg.Security.Policies {
 		if zpp == nil || zpp.FromZone != q.FromZone || zpp.ToZone != q.ToZone {
 			continue
 		}
-		for _, pol := range zpp.Policies {
+		for sliceIdx, pol := range zpp.Policies {
 			if pol != nil && ruleMatches(cfg, q, pol) {
-				return matchedResult(pol, false)
+				return matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
 			}
 		}
 	}
@@ -318,7 +348,7 @@ func Match(cfg *config.Config, q Query) Result {
 	// rule index; the snapshot builder (walkPolicyRuleSlots) emits rules in
 	// cfg.Security.Policies slice order with each set's policies contiguous, so
 	// a single in-order pass over the sets reproduces that merge exactly.
-	for _, zpp := range cfg.Security.Policies {
+	for setIdx, zpp := range cfg.Security.Policies {
 		if zpp == nil {
 			continue
 		}
@@ -331,28 +361,32 @@ func Match(cfg *config.Config, q Query) Result {
 		if !applies {
 			continue
 		}
-		for _, pol := range zpp.Policies {
+		for sliceIdx, pol := range zpp.Policies {
 			if pol != nil && ruleMatches(cfg, q, pol) {
-				return matchedResult(pol, false)
+				return matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
 			}
 		}
 	}
 
 	// Tier 3: both-any (`from-zone any to-zone any`), in config order.
-	for _, zpp := range cfg.Security.Policies {
+	for setIdx, zpp := range cfg.Security.Policies {
 		if zpp == nil || zpp.FromZone != "any" || zpp.ToZone != "any" {
 			continue
 		}
-		for _, pol := range zpp.Policies {
+		for sliceIdx, pol := range zpp.Policies {
 			if pol != nil && ruleMatches(cfg, q, pol) {
-				return matchedResult(pol, false)
+				return matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
 			}
 		}
 	}
 
 	// Tier 4: global policies (junos-global), in config order, gated by the
-	// optional #3148 from-zone/to-zone match scope.
-	for _, pol := range cfg.Security.GlobalPolicies {
+	// optional #3148 from-zone/to-zone match scope. The runtime policy-ID
+	// namespace places global policies in the policy set that immediately
+	// follows the last zone-pair set (walkPolicyRuleSlots), i.e. policySetID ==
+	// len(cfg.Security.Policies); use that as the RuntimePolicyIDs lookup key.
+	globalSetIdx := len(cfg.Security.Policies)
+	for sliceIdx, pol := range cfg.Security.GlobalPolicies {
 		if pol == nil {
 			continue
 		}
@@ -361,7 +395,10 @@ func Match(cfg *config.Config, q Query) Result {
 			continue
 		}
 		if ruleMatches(cfg, q, pol) {
-			return matchedResult(pol, true)
+			// A global policy's scope is its `match from-zone`/`match to-zone`
+			// (empty = all zones), NOT the surrounding stanza — report that as
+			// the result's zone context (#3331/#3148).
+			return matchedResult(ids, pol, true, pol.Match.FromZone, pol.Match.ToZone, globalSetIdx, sliceIdx)
 		}
 	}
 
@@ -379,7 +416,7 @@ func Match(cfg *config.Config, q Query) Result {
 // than inheriting the transit global/default verdict. `to-zone any` and
 // `from-zone any to-zone any` are deliberately NOT pulled onto the host path,
 // matching the runtime gate.
-func matchJunosHost(cfg *config.Config, q Query) Result {
+func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Result {
 	// #3355: evaluate_junos_host_policy returns None for from_id == 0 (the
 	// unknown/undefined ingress zone), mirroring the #3110 unzoned guard. An
 	// undefined query from-zone therefore matches no host-bound rule; local
@@ -390,24 +427,24 @@ func matchJunosHost(cfg *config.Config, q Query) Result {
 		return Result{HostInboundUnmatched: true}
 	}
 	// Exact ingress -> junos-host.
-	for _, zpp := range cfg.Security.Policies {
+	for setIdx, zpp := range cfg.Security.Policies {
 		if zpp == nil || zpp.ToZone != JunosHostZone || zpp.FromZone != q.FromZone {
 			continue
 		}
-		for _, pol := range zpp.Policies {
+		for sliceIdx, pol := range zpp.Policies {
 			if pol != nil && ruleMatches(cfg, q, pol) {
-				return matchedResult(pol, false)
+				return matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
 			}
 		}
 	}
 	// from-zone any -> junos-host.
-	for _, zpp := range cfg.Security.Policies {
+	for setIdx, zpp := range cfg.Security.Policies {
 		if zpp == nil || zpp.ToZone != JunosHostZone || zpp.FromZone != "any" {
 			continue
 		}
-		for _, pol := range zpp.Policies {
+		for sliceIdx, pol := range zpp.Policies {
 			if pol != nil && ruleMatches(cfg, q, pol) {
-				return matchedResult(pol, false)
+				return matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
 			}
 		}
 	}
@@ -453,10 +490,20 @@ func zoneKnown(cfg *config.Config, zone string) bool {
 	return ok
 }
 
-func matchedResult(pol *config.Policy, global bool) Result {
+// matchedResult builds the verdict for a concrete policy hit, stamping its zone
+// scope (#3331) and the stable runtime policy ID resolved from the shared
+// RuntimePolicyIDs namespace. setIdx/sliceIdx are the [policySetID, sliceIndex]
+// coordinates of the policy in the typed config — the exact key RuntimePolicyIDs
+// uses (a global policy's setIdx is len(cfg.Security.Policies)). A missing key
+// (a config that overflows MaxRulesPerPolicy and so cannot be applied) yields
+// PolicyID 0; the zone scope + name still disambiguate the verdict.
+func matchedResult(ids map[[2]uint32]uint32, pol *config.Policy, global bool, fromZone, toZone string, setIdx, sliceIdx int) Result {
 	return Result{
 		Matched:      true,
 		Global:       global,
+		FromZone:     fromZone,
+		ToZone:       toZone,
+		PolicyID:     ids[[2]uint32{uint32(setIdx), uint32(sliceIdx)}],
 		PolicyName:   pol.Name,
 		Description:  pol.Description,
 		Action:       pol.Action,
