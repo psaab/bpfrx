@@ -51,6 +51,26 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     the scoped global's real zones on its `from_zone`/`to_zone` labels
     (#3286) — an unscoped global keeps `*`/`*` — so counter-based
     validation is unambiguous on the canonical metrics surface.
+  - `GET /api/v1/security/zones` enumerates security zones (`ZoneInfo`,
+    types.go). The host-inbound admission set is surfaced distinctly
+    (#3328): `host_inbound_configured` is the dataplane posture bit
+    (mirrors `ZoneSnapshot.HostInboundConfigured`, #3070/#3362) — true
+    when the zone declares a `host-inbound-traffic` stanza OR carries any
+    per-interface override. This lets automation tell apart the three
+    postures the dataplane actually models: no stanza
+    (`host_inbound_configured=false` → admit-all for host-bound traffic),
+    explicit empty stanza (`configured=true` with empty lists → deny-all),
+    and a populated set. `host_inbound_system_services` and
+    `host_inbound_protocols` carry the zone-level set split so a
+    system-service (ssh, ping, dhcp) is distinguishable from a routing
+    protocol (ospf, bgp). `interface_host_inbound` (omitted when none)
+    carries per-interface overrides (#3362); the effective set for an
+    interface is the union of the zone-level set and its override. The
+    legacy flattened `host_inbound_services` (services + protocols
+    concatenated) is retained as a back-compat alias. Before #3328 REST
+    exposed only the flattened list and no `configured` flag, so a
+    controller could not distinguish admit-all from deny-all — a
+    host-inbound / control-plane-protection posture ambiguity.
   - `GET /api/v1/security/screen` enumerates the configured screen
     profiles. Each `ScreenInfo` carries the profile `name`, a `checks`
     string list, and a `thresholds` map (keyed by check name). The

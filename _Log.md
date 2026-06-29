@@ -23882,3 +23882,17 @@ top.
   - **File(s)**: pkg/config/filter_protocol_rust_mirror_3393_test.go (new),
     pkg/config/compiler_validate_strict.go, pkg/config/compiler_dnat_protocol_test.go,
     userspace-dp/src/filter/tests.rs, _Log.md
+
+## 2026-06-29 — #3328 REST/gRPC host-inbound posture
+- **Timestamp**: 2026-06-29
+- **Action**: Surface per-zone (and per-interface #3362) host-inbound state
+  distinctly in REST + gRPC instead of one flattened host_inbound_services
+  list. Added host_inbound_configured / host_inbound_system_services /
+  host_inbound_protocols + interface_host_inbound; kept the flattened field as
+  a back-compat alias. proto field 12-15 (additive) + new InterfaceHostInbound
+  message. SSOT helper ZoneConfig.SortedInterfaceHostInboundRefs.
+- **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go (regen),
+  pkg/grpcapi/server_show_zones.go, pkg/api/types.go, pkg/api/security.go,
+  pkg/config/types_security.go, pkg/api/security_zone_hostinbound_3328_test.go (new),
+  pkg/grpcapi/server_show_zones_hostinbound_3328_test.go (new),
+  pkg/api/README.md, pkg/grpcapi/README.md, _Log.md

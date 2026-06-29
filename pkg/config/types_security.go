@@ -1,5 +1,7 @@
 package config
 
+import "sort"
+
 // Security policy domain: zones, policies, NAT, screen/IDS, address book,
 // applications, flow/session, ALG, logging, IPsec/IKE, dynamic-address
 // feeds, and the [edit schedulers] policy time-range scheduler.
@@ -245,6 +247,23 @@ type ZoneConfig struct {
 type HostInboundTraffic struct {
 	SystemServices []string // ssh, ping, dns, etc.
 	Protocols      []string // ospf, bgp, etc.
+}
+
+// SortedInterfaceHostInboundRefs returns the interface refs that declare a
+// per-interface host-inbound-traffic override (#3362), sorted for a stable
+// presentation order. It is the SSOT for the REST/gRPC zone-inventory
+// projection (#3328) so both surfaces iterate the overrides identically.
+// Returns nil for a zone with no per-interface overrides.
+func (z *ZoneConfig) SortedInterfaceHostInboundRefs() []string {
+	if z == nil || len(z.InterfaceHostInbound) == 0 {
+		return nil
+	}
+	refs := make([]string, 0, len(z.InterfaceHostInbound))
+	for ref := range z.InterfaceHostInbound {
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
+	return refs
 }
 
 // ZonePairPolicies contains ordered policies for a from-zone/to-zone pair.
