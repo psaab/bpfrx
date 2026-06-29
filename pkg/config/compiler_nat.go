@@ -1335,20 +1335,17 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 						// snapshot-build time (appendNATDestinationAddressName).
 						rule.Match.DestinationAddressName = nodeVal(m)
 					case "destination-port":
-						if len(m.Children) > 0 {
-							for _, child := range m.Children {
-								if n, err := strconv.Atoi(child.Name()); err == nil {
-									rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, n)
-									if rule.Match.DestinationPort == 0 {
-										rule.Match.DestinationPort = n
-									}
-								}
-							}
-						} else if v := nodeVal(m); v != "" {
-							if n, err := strconv.Atoi(v); err == nil {
-								rule.Match.DestinationPort = n
-								rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, n)
-							}
+						// #3429 (H03): route source-NAT destination-port through
+						// the shared DNAT port-list parser. The old scalar path
+						// read only nodeVal/single child, so a flat-set
+						// `destination-port 20000 to 20003` (collapsed onto
+						// Keys=[destination-port 20000 to 20003], no children)
+						// silently kept only the first port. parseDNATPortList
+						// handles bracket lists and `low to high` ranges in both
+						// the hierarchical and flat-set AST shapes.
+						rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, parseDNATPortList(m)...)
+						if rule.Match.DestinationPort == 0 && len(rule.Match.DestinationPorts) > 0 {
+							rule.Match.DestinationPort = rule.Match.DestinationPorts[0]
 						}
 					case "application":
 						rule.Match.Application = nodeVal(m)

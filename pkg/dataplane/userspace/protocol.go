@@ -440,6 +440,25 @@ type TunnelWgPeerWire struct {
 	WgPresharedKeyHex string `json:"wg_preshared_key_hex,omitempty"`
 }
 
+// NatPortRangeWire is one inclusive [Low,High] L4 destination-port range on the
+// Go->Rust source-NAT match wire (#3429). A single port is Low==High. Used by
+// SourceNATRuleSnapshot.MatchDestinationPorts and inside NatAppTermWire.Ports.
+type NatPortRangeWire struct {
+	Low  uint16 `json:"low"`
+	High uint16 `json:"high"`
+}
+
+// NatAppTermWire is one resolved source-NAT `match application` term (#3429): an
+// L4 protocol (IANA number; 256 = any/unspecified — outside the 0-255 protocol
+// range so it never aliases protocol 0/HOPOPT) and optional destination-port
+// ranges. The flow matches the term when its protocol equals Protocol (or
+// Protocol==256) AND, if Ports is non-empty, its destination port falls in one
+// of the ranges. An application-set expands to one term per resolved member.
+type NatAppTermWire struct {
+	Protocol uint16             `json:"protocol"`
+	Ports    []NatPortRangeWire `json:"ports,omitempty"`
+}
+
 type SourceNATRuleSnapshot struct {
 	Name     string `json:"name"`
 	FromZone string `json:"from_zone,omitempty"`
@@ -478,6 +497,24 @@ type SourceNATRuleSnapshot struct {
 	PersistentNATInactivityTimeout int    `json:"persistent_nat_inactivity_timeout,omitempty"`
 	PoolUnusable                   bool   `json:"pool_unusable,omitempty"`
 	PoolUnusableReason             string `json:"pool_unusable_reason,omitempty"`
+	// MatchDestinationPorts carries the source-NAT rule's `match
+	// destination-port` constraint as inclusive [Low,High] ranges (#3429).
+	// Empty = unconstrained on destination port (match any port, the
+	// pre-#3429 behaviour). Non-empty = the flow's destination port MUST fall
+	// in one of the ranges, otherwise the rule does NOT match (so a port-scoped
+	// SNAT — including a `then source-nat off` exemption — no longer silently
+	// widens to every port). Additive wire field: an old helper without it
+	// treats every rule as port-unconstrained (the pre-#3429 over-match); an
+	// old Go binary omits it (omitempty).
+	MatchDestinationPorts []NatPortRangeWire `json:"match_destination_ports,omitempty"`
+	// MatchApplications carries the source-NAT rule's `match application`
+	// constraint, pre-expanded to (protocol, destination-port ranges) terms at
+	// snapshot build (#3429). Empty = unconstrained on application. Non-empty =
+	// the flow's protocol/destination port MUST satisfy one of the terms,
+	// otherwise the rule does NOT match. An application-set expands to one term
+	// per resolved member. Additive wire field, same skew semantics as
+	// MatchDestinationPorts.
+	MatchApplications []NatAppTermWire `json:"match_applications,omitempty"`
 	// CounterID is the compiler-assigned per-rule translation hit counter ID
 	// (stable key-derived hash, non-zero; 0 means "no counter"). The userspace
 	// dataplane attributes each SNAT translation on this rule to this slot, and
