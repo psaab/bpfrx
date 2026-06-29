@@ -23577,6 +23577,37 @@ top.
 - **Timestamp**: 2026-06-29
   - **Action**: #3290 third-fold (PR #3521) — third fail-open ICMP metadata path. Codex MAJOR: the pending-neighbor buffering fallback (poll_descriptor/mod.rs MissingNeighbor handler) gated only on non-first-fragment, then called parse_session_flow_from_meta(meta) and stored the result as PendingNeighPacket.flow_key. For a non-query ICMP error/control packet with an UNRESOLVED next-hop, that buffered the shim's fake pseudo-port (0xBEEF); retry_pending_neigh then fed it into CoS/output-filter classification AND the prepared TX request — the same #3290 bug class as the conntrack path and the immediate forward_request path, but on the deferred-TX route. Fix: extracted pending_neigh_flow_key(flow, raw_frame, meta) into neighbor_dispatch.rs (mirrors the #2375 pending_neigh_admission extraction pattern) and applied the shared meta_icmp_identifier_bearing gate — a non-identifier-bearing ICMP/ICMPv6 (error/control/ND/MLD/truncated query) now buffers flow_key=None, taking the interface-default-queue / no-output-filter path on flush. Also widened meta_icmp_identifier_bearing to require the full [l4..l4+6) identifier range inside declared_end (frame-equivalent to parse_flow_ports — fix from the prior fold). All THREE metadata consumers (conntrack parse_session_flow_from_bytes, immediate build_live_forward_request_from_frame, pending-neigh pending_neigh_flow_key) now gate identically. Added 3 unit tests on the extracted helper: control ICMP -> None (RED on revert, returns fake src_port=0xBEEF), echo query -> Some(identifier), flowless TCP -> Some(meta ports, gate is protocol-scoped). RED-on-revert verified. cargo test inspect/icmpv/forward_request/cos_classify/pending_neigh green; go test ./pkg/dataplane/... — the only failure is a PRE-EXISTING master canary (TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports flags pkg/daemon/daemon_nft.go from #3436, a Go file untouched by this Rust-only change); rebased onto current origin/master to pick up the allowlist follow-up. rustfmt clean on touched files. Still not session-sync/HA — no test-failover required.
   - **File(s)**: userspace-dp/src/afxdp/neighbor_dispatch.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/frame/README.md, _Log.md
+  - **Action**: #3290 Codex MAJOR fold (PR #3521) — full-suite triage. Codex
+    ran the FULL `cargo test` (not the targeted modules the SMR ran) and found
+    `afxdp::frame::tests::parse_session_flow_prefers_tuple_stamped_in_metadata`
+    failing. Triaged against a pristine-origin/master baseline run (full
+    `cargo test` on both): master baseline = 2 failures, both the KNOWN
+    pre-existing #3457 set (`afxdp::worker_queue::...concurrent_recovery...` +
+    `event_stream::...test_paused_telemetry_eviction_does_not_poison_drain_2875`).
+    Branch had those 2 plus the parse_session_flow one (genuine PR-introduced)
+    plus a one-off `afxdp::umem::tests::tx_latency_hist_cross_thread_snapshot_skew_within_bound`
+    — the latter is a load-sensitive cross-thread statistical timing test NOT in
+    this PR's diff; it passed 3/3 in isolation and did not recur on the re-run,
+    so it is environmental (full-suite CPU contention), not introduced.
+    Disposition of the genuine one: STALE INVARIANT (not over-gating). The old
+    test stamped a 64-byte 0xaa GARBAGE frame with ICMP metadata at offsets=0
+    and expected the metadata pseudo-port admitted — exactly the no-frame-
+    validation fake-session vector #3290 closes; post-fix the gate reads
+    frame[l4]=0xaa (not an identifier-bearing type) and correctly suppresses it
+    to flowless. Updated the test to keep its INTENT (prefer the stamped
+    metadata tuple over the frame-derived identifier) under the new rule: it now
+    builds a LEGITIMATE ICMPv4 Echo Request (type 8, on-wire identifier 0x1234)
+    and stamps a DISTINCT metadata pseudo-port (0x4321); the gate validates the
+    echo type byte, admits the flow, and asserts the stamped 0x4321 wins (IPs
+    agree). This also guards against the dual error — if the gate ever
+    OVER-rejects a legitimate echo query it returns the frame's 0x1234 and the
+    test goes RED. The control/non-query ICMP suppression itself stays covered
+    by the #3290 inspect_tests.rs regressions. After the fix the full
+    `cargo test` failure set on the branch == the pristine-master baseline
+    ({worker_queue, event_stream}); ZERO PR-introduced failures. go test
+    ./pkg/dataplane/... green; touched test region rustfmt-clean (scoped edit,
+    no whole-file reformat of pre-existing dirty byte-array lines).
+  - **File(s)**: userspace-dp/src/afxdp/frame/tests.rs, _Log.md
 
 - **Timestamp**: 2026-06-29T08:45Z
   - **Action**: #3409 event-mode structured / sd-syslog local-file support.
