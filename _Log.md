@@ -23440,3 +23440,16 @@ top.
     pkg/logging/locallog_format_3409_test.go,
     pkg/config/compiler_validate_strict.go,
     pkg/config/log_stream_config_3349_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-29T09:10Z
+  - **Action**: #3409 Codex MERGE-NEEDS-MINOR fold (PR #3532) — doc-accuracy
+    only. The call-site comment above validateLogEventModeFormatStrict in
+    pkg/config/compiler.go still described the PRE-#3409 behavior (event mode
+    only honors binary/standard text; structured/sd-syslog rejected at commit),
+    contradicting the shipped implementation. Rewrote it to state that the
+    event-mode writer now honors binary / standard-syslog / structured (RT_FLOW)
+    / sd-syslog (RFC 5424), the validator accepts the full enum in either mode,
+    and the default-reject only fires for a hypothetical future-unhonored value.
+    No code change. Rebased on origin/master first (union _Log.md). go test
+    ./pkg/config/ ./pkg/logging/ green; gofmt clean.
+  - **File(s)**: pkg/config/compiler.go, _Log.md
