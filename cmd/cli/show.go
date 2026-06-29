@@ -565,13 +565,25 @@ const (
 	flowSessionSortBy
 )
 
+func flowSessionActionName(a flowSessionAction) string {
+	switch a {
+	case flowSessionSummary:
+		return "summary"
+	case flowSessionSortBy:
+		return "sort-by"
+	default:
+		return "list"
+	}
+}
+
 // flowSessionParse is the strict parse result for the remote
 // `show security flow session` argument vector.
 type flowSessionParse struct {
-	req     *pb.GetSessionsRequest
-	brief   bool
-	action  flowSessionAction
-	sortKey string
+	req       *pb.GetSessionsRequest
+	brief     bool
+	action    flowSessionAction
+	sortKey   string
+	hasFilter bool // a traffic-filter predicate token was supplied
 }
 
 // parseFlowSessionArgs strictly parses the remote-CLI session filter
@@ -604,27 +616,34 @@ func parseFlowSessionArgs(args []string) (*flowSessionParse, error) {
 				return nil, fmt.Errorf("invalid zone %q", v)
 			}
 			p.req.Zone = uint32(n)
+			p.hasFilter = true
 		case "protocol":
 			v, err := takeValue(&i, "protocol")
 			if err != nil {
 				return nil, err
 			}
-			if _, ok := appid.ProtocolNumber(v); !ok {
+			// Lenient: accept any protocol NAME the system still
+			// displays (e.g. "ipv6"=41) plus the strict name/numeric set,
+			// so a displayable protocol is never rejected (#3439, #3393).
+			if _, ok := appid.ProtocolNumberLenient(v); !ok {
 				return nil, fmt.Errorf("unknown protocol %q", v)
 			}
 			p.req.Protocol = strings.ToUpper(v)
+			p.hasFilter = true
 		case "source-prefix":
 			v, err := takeValue(&i, "source-prefix")
 			if err != nil {
 				return nil, err
 			}
 			p.req.SourcePrefix = v
+			p.hasFilter = true
 		case "destination-prefix":
 			v, err := takeValue(&i, "destination-prefix")
 			if err != nil {
 				return nil, err
 			}
 			p.req.DestinationPrefix = v
+			p.hasFilter = true
 		case "source-port":
 			v, err := takeValue(&i, "source-port")
 			if err != nil {
@@ -635,6 +654,7 @@ func parseFlowSessionArgs(args []string) (*flowSessionParse, error) {
 				return nil, fmt.Errorf("invalid source-port %q", v)
 			}
 			p.req.SourcePort = uint32(n)
+			p.hasFilter = true
 		case "destination-port":
 			v, err := takeValue(&i, "destination-port")
 			if err != nil {
@@ -645,8 +665,10 @@ func parseFlowSessionArgs(args []string) (*flowSessionParse, error) {
 				return nil, fmt.Errorf("invalid destination-port %q", v)
 			}
 			p.req.DestinationPort = uint32(n)
+			p.hasFilter = true
 		case "nat", "nat-only":
 			p.req.NatOnly = true
+			p.hasFilter = true
 		case "limit":
 			v, err := takeValue(&i, "limit")
 			if err != nil {
@@ -663,6 +685,7 @@ func parseFlowSessionArgs(args []string) (*flowSessionParse, error) {
 				return nil, err
 			}
 			p.req.Application = v
+			p.hasFilter = true
 		case "summary":
 			p.action = flowSessionSummary
 		case "brief":
@@ -673,12 +696,14 @@ func parseFlowSessionArgs(args []string) (*flowSessionParse, error) {
 				return nil, err
 			}
 			p.req.InterfaceFilter = v
+			p.hasFilter = true
 		case "source-nat-pool":
 			v, err := takeValue(&i, "source-nat-pool")
 			if err != nil {
 				return nil, err
 			}
 			p.req.SourceNatPool = v
+			p.hasFilter = true
 		case "sort-by":
 			v, err := takeValue(&i, "sort-by")
 			if err != nil {
@@ -689,6 +714,16 @@ func parseFlowSessionArgs(args []string) (*flowSessionParse, error) {
 		default:
 			return nil, fmt.Errorf("unknown session filter %q", args[i])
 		}
+	}
+	// `summary` and `sort-by` are global aggregations on this remote
+	// surface: the summary RPC (GetSessionSummary) takes no filter, and
+	// the top-talkers path walks the whole table. Earlier they parsed a
+	// filter and then SILENTLY ignored it — the #3439 silent-drop bug in
+	// a different sub-path. Reject the combination with a clear error
+	// instead of returning an unfiltered result the operator did not ask
+	// for (use the filtered per-session listing for a narrowed view).
+	if p.hasFilter && p.action != flowSessionList {
+		return nil, fmt.Errorf("session filters cannot be combined with %q", flowSessionActionName(p.action))
 	}
 	return p, nil
 }

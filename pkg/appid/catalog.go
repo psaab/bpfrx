@@ -193,6 +193,39 @@ func ProtocolNumber(name string) (uint8, bool) {
 	}
 }
 
+// ProtocolNumberLenient resolves an operator protocol-FILTER token (a
+// name, alias, or numeric 0-255) to its IP protocol number for the
+// session-inspection surfaces only. It accepts everything ProtocolNumber
+// resolves PLUS the display-only names that ProtocolName renders but
+// ProtocolNumber deliberately does NOT reverse — notably "ipv6"=41, the
+// documented one-way mapping (#3393).
+//
+// This is a READ/FILTER-side convenience: config compilation and policy
+// matching keep using the strict one-way ProtocolNumber (whose
+// acceptance set is mirrored in pkg/config), so the strict SSOT is
+// unchanged. The effect here is narrow — a protocol NAME the system
+// still DISPLAYS (e.g. a proto-41/"ipv6" session shown by every operator
+// surface) must not be rejected as an invalid session filter, and the
+// matcher must then actually match those sessions. Refs #3393 (does not
+// close it: the global round-trip of ProtocolNumber is intentionally
+// untouched).
+func ProtocolNumberLenient(name string) (uint8, bool) {
+	if n, ok := ProtocolNumber(name); ok {
+		return n, true
+	}
+	t := strings.ToLower(strings.TrimSpace(name))
+	if t == "" {
+		return 0, false
+	}
+	// ProtocolName is the display SSOT; accept any token it can render.
+	for p := 0; p < 256; p++ {
+		if ProtocolName(uint8(p)) == t {
+			return uint8(p), true
+		}
+	}
+	return 0, false
+}
+
 // ProtocolName is the single source of truth for rendering an IP protocol
 // number as a canonical lowercase protocol name. It returns "" for a
 // protocol that has no display name here, letting callers fall back to the

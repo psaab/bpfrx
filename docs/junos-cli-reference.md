@@ -86,12 +86,27 @@ dropping the predicate (which would widen the inspected set):
   fail the command instead of leaving the field at its zero (wildcard)
   default. Previously these were silently ignored, so a typo widened the
   query and the two CLI surfaces disagreed on identical command shapes.
+- `summary` and `sort-by` are global aggregations on the remote surface
+  (the `GetSessionSummary` RPC takes no filter; the top-talkers path
+  walks the whole table). Combining them with a traffic filter
+  (`protocol`, `zone`, ports, prefixes, `nat`, `application`,
+  `interface`, `source-nat-pool`) is **rejected** rather than silently
+  dropping the filter. Use the filtered per-session listing for a
+  narrowed view, or the interactive local CLI (which applies filters to
+  its summary/top-talkers). `brief` is a display modifier, not a filter,
+  so it may accompany `summary`.
 - Direct gRPC `GetSessions` (`pkg/grpcapi/server_sessions.go`) validates
-  the `protocol` token against known names / numeric `0-255`
-  (`appid.ProtocolNumber`) and rejects a negative `offset`; both return
+  the `protocol` token and rejects a negative `offset` (centrally in
+  `GetSessions`, covering both the cursor and legacy paths); both return
   `codes.InvalidArgument` so an invalid input is distinguishable from an
   empty result set. Protocol-name filters with no `protoName()` reverse
-  (e.g. `sctp`, `ospf`) now match their sessions correctly.
+  (e.g. `sctp`, `ospf`) match their sessions correctly. The protocol
+  token is resolved via `appid.ProtocolNumberLenient`, which also accepts
+  a display-only name the strict `appid.ProtocolNumber` does not reverse
+  — notably `ipv6` (IP protocol 41), the one-way mapping of #3393 — so a
+  protocol the system still **displays** is never rejected as an invalid
+  filter. The strict `appid.ProtocolNumber` SSOT used by config
+  compilation / policy matching is unchanged (Refs #3393).
 
 ```
 Session ID: 17179902569, Policy name: allow-everything-out-not-logged/270, HA State: Active, Timeout: 18, Session State: Valid

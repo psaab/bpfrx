@@ -24,11 +24,32 @@ func TestParseFlowSessionArgsRejectsMalformed(t *testing.T) {
 		{"bogus-token"},                        // unknown filter keyword
 		{"destination-port"},                   // missing value
 		{"summary", "destination-port", "abc"}, // malformed after a terminal subcmd
+		// A filter combined with a global aggregation (summary/sort-by)
+		// was parsed and then silently ignored — reject it instead
+		// (#3439 Codex MAJOR fold).
+		{"summary", "protocol", "tcp"},
+		{"protocol", "tcp", "summary"},
+		{"sort-by", "bytes", "destination-port", "443"},
+		{"zone", "1", "sort-by", "packets"},
 	}
 	for _, args := range wantErr {
 		if _, err := parseFlowSessionArgs(args); err == nil {
 			t.Errorf("parseFlowSessionArgs(%v) = nil error; want a rejection", args)
 		}
+	}
+
+	// `ipv6` is a protocol the system DISPLAYS (proto 41); it must be
+	// accepted as a filter, not rejected (#3439 / Refs #3393 regression).
+	if p, err := parseFlowSessionArgs([]string{"protocol", "ipv6"}); err != nil {
+		t.Errorf("parseFlowSessionArgs(protocol ipv6) = %v; want accepted", err)
+	} else if p.req.Protocol != "IPV6" {
+		t.Errorf("protocol ipv6: req.Protocol = %q; want IPV6", p.req.Protocol)
+	}
+
+	// summary / sort-by WITHOUT a filter still work (brief is a display
+	// modifier, not a filter, so it may accompany them).
+	if _, err := parseFlowSessionArgs([]string{"summary", "brief"}); err != nil {
+		t.Errorf("summary brief: unexpected error %v", err)
 	}
 
 	// Valid filters parse and populate the request.
