@@ -2072,15 +2072,21 @@ type BindingStatus struct {
 	SessionDeltaDropped          uint64 `json:"session_delta_dropped,omitempty"`
 	SessionDeltaDrained          uint64 `json:"session_delta_drained,omitempty"`
 	PolicyDeniedPackets          uint64 `json:"policy_denied_packets,omitempty"`
-	ScreenDrops                  uint64 `json:"screen_drops,omitempty"`
-	SYNCookieChallenges          uint64 `json:"syn_cookie_challenges,omitempty"`
-	SYNCookieSecretUnavailable   uint64 `json:"syn_cookie_secret_unavailable,omitempty"`
-	SYNCookieSynAckSent          uint64 `json:"syn_cookie_syn_ack_sent,omitempty"`
-	SYNCookieAckRstSent          uint64 `json:"syn_cookie_ack_rst_sent,omitempty"`
-	SYNCookieReplyBudgetDrops    uint64 `json:"syn_cookie_reply_budget_drops,omitempty"`
-	SYNCookieAckValid            uint64 `json:"syn_cookie_ack_valid,omitempty"`
-	SYNCookieAckInvalid          uint64 `json:"syn_cookie_ack_invalid,omitempty"`
-	SYNCookieBypass              uint64 `json:"syn_cookie_bypass,omitempty"`
+	// #3326: host-bound packets dropped by the zone host-inbound admission
+	// gate. Mirrored into dataplane.GlobalCtrHostInboundDeny by
+	// syncBPFCountersLocked so REST (host_inbound_denies), Prometheus
+	// (xpf_host_inbound_denies_total), and `show security flow statistics`
+	// reflect the drop. Before #3326 these denies were never counted.
+	HostInboundDeniedPackets   uint64 `json:"host_inbound_denied_packets,omitempty"`
+	ScreenDrops                uint64 `json:"screen_drops,omitempty"`
+	SYNCookieChallenges        uint64 `json:"syn_cookie_challenges,omitempty"`
+	SYNCookieSecretUnavailable uint64 `json:"syn_cookie_secret_unavailable,omitempty"`
+	SYNCookieSynAckSent        uint64 `json:"syn_cookie_syn_ack_sent,omitempty"`
+	SYNCookieAckRstSent        uint64 `json:"syn_cookie_ack_rst_sent,omitempty"`
+	SYNCookieReplyBudgetDrops  uint64 `json:"syn_cookie_reply_budget_drops,omitempty"`
+	SYNCookieAckValid          uint64 `json:"syn_cookie_ack_valid,omitempty"`
+	SYNCookieAckInvalid        uint64 `json:"syn_cookie_ack_invalid,omitempty"`
+	SYNCookieBypass            uint64 `json:"syn_cookie_bypass,omitempty"`
 	// #2089: policy `reject` action — RST/ICMP-unreachable replies sent,
 	// and replies suppressed due to TX-frame budget exhaustion.
 	PolicyRejectSent uint64 `json:"policy_reject_sent,omitempty"`

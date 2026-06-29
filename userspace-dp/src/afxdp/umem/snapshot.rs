@@ -79,6 +79,9 @@ impl BindingLiveState {
             session_delta_dropped: self.session_delta_dropped.load(Ordering::Relaxed),
             session_delta_drained: self.session_delta_drained.load(Ordering::Relaxed),
             policy_denied_packets: self.policy_denied_packets.load(Ordering::Relaxed),
+            host_inbound_denied_packets: self
+                .host_inbound_denied_packets
+                .load(Ordering::Relaxed),
             screen_drops: self.screen_drops.load(Ordering::Relaxed),
             syn_cookie_challenges: self.syn_cookie_challenges.load(Ordering::Relaxed),
             syn_cookie_secret_unavailable: self
