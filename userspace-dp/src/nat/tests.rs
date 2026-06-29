@@ -6717,6 +6717,7 @@ fn source_nat_match_application_constrains_protocol_and_port_3429() {
                 low: 443,
                 high: 443,
             }],
+            src_ports: vec![],
         }],
         ..SourceNATRuleSnapshot::default()
     }]);
@@ -6758,6 +6759,111 @@ fn source_nat_match_application_constrains_protocol_and_port_3429() {
         lookup(PROTO_UDP, 443),
         SourceNatLookup::NoMatch,
         "udp/443 must NOT match an app scoped to tcp/443"
+    );
+}
+
+#[test]
+fn source_nat_match_application_constrains_source_port_3491() {
+    // #3491: `match application` pre-expanded to (proto=TCP, dst=443, src=12345).
+    // The application carried a source-port constraint; before #3491 it was
+    // dropped and the rule matched any source port (fail-open). Reverting the
+    // l4_matches src_port gate (or the SrcPorts wire) makes the wrong-source-port
+    // assertion below match -> RED.
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        match_applications: vec![NatAppTermWire {
+            protocol: PROTO_TCP as u16,
+            ports: vec![NatPortRangeWire {
+                low: 443,
+                high: 443,
+            }],
+            src_ports: vec![NatPortRangeWire {
+                low: 12345,
+                high: 12345,
+            }],
+        }],
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
+    let src: IpAddr = "10.0.1.100".parse().unwrap();
+    let dst: IpAddr = "8.8.8.8".parse().unwrap();
+    let lookup = |sport: u16, dport: u16| {
+        let mut counter = None;
+        match_source_nat_result_for_tuple(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            src,
+            dst,
+            PROTO_TCP,
+            sport,
+            dport,
+            egress_v4,
+            None,
+            0,
+            false,
+            &mut counter,
+        )
+    };
+    // Right source port + right dest port -> match.
+    assert!(
+        matches!(lookup(12345, 443), SourceNatLookup::Matched(_)),
+        "tcp src=12345 dst=443 must match the app-scoped rule"
+    );
+    // Right dest port, WRONG source port -> no match (the #3491 fail-open).
+    assert_eq!(
+        lookup(55555, 443),
+        SourceNatLookup::NoMatch,
+        "tcp src=55555 dst=443 must NOT match an app scoped to source-port 12345"
+    );
+}
+
+#[test]
+fn source_nat_app_source_port_never_match_sentinel_3491() {
+    // #3491: the Go builder emits a low>high never-match range when an
+    // application's source-port spec coalesces to nothing. The Rust matcher must
+    // preserve it (port_in_ranges can never satisfy low>high) so the term matches
+    // NO source port rather than widening to any source port.
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        match_applications: vec![NatAppTermWire {
+            protocol: PROTO_TCP as u16,
+            ports: vec![],
+            src_ports: vec![NatPortRangeWire { low: 1, high: 0 }],
+        }],
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
+    let mut counter = None;
+    let lookup = match_source_nat_result_for_tuple(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.1.100".parse().unwrap(),
+        "8.8.8.8".parse().unwrap(),
+        PROTO_TCP,
+        12345,
+        443,
+        egress_v4,
+        None,
+        0,
+        false,
+        &mut counter,
+    );
+    assert_eq!(
+        lookup,
+        SourceNatLookup::NoMatch,
+        "a never-match source-port sentinel must match NO source port"
     );
 }
 
@@ -6912,6 +7018,7 @@ fn source_nat_app_protocol_never_vs_any_3429() {
         match_applications: vec![NatAppTermWire {
             protocol: 0xFFFF,
             ports: vec![],
+            src_ports: vec![],
         }],
         ..SourceNATRuleSnapshot::default()
     }]);
@@ -6934,6 +7041,7 @@ fn source_nat_app_protocol_never_vs_any_3429() {
         match_applications: vec![NatAppTermWire {
             protocol: SOURCE_NAT_PROTO_ANY,
             ports: vec![],
+            src_ports: vec![],
         }],
         ..SourceNATRuleSnapshot::default()
     }]);

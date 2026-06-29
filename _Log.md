@@ -23141,3 +23141,15 @@ top.
 - **Timestamp**: 2026-06-28
   - **Action**: #3438/#3428 Codex MERGE-NEEDS-MINOR fold. (1) buildAppCatalogSnapshot no longer fail-opens: it now returns ([]AppCatalogEntrySnapshot, error) and the snapshot builder propagates a BuildCatalog fault (overflow/malformed set) so the apply rejects closed instead of shipping an empty catalog that degrades all session naming to UNKNOWN; live apply still catches the same input earlier in compileApplications. (2) Added a caller-threading regression test (TestGetSessionsThreadsSourcePortForAppResolution) driving the real gRPC GetSessions legacy enrichment path with a source-port-constrained app — a matching-source-port session must be labeled backup-control, which goes RED if any caller stops threading key.SrcPort (passes 0). Verified RED-on-revert (legacy enrich line -> srcPort 0). Rebased on origin/master.
   - **File(s)**: pkg/dataplane/userspace/flow.go, pkg/dataplane/userspace/builder.go, pkg/grpcapi/session_app_srcport_3428_test.go, _Log.md
+
+## #3491 source-NAT match application source-port enforcement
+- **Timestamp**: 2026-06-28
+- **Action**: Thread the application's source-port constraint into the source-NAT
+  `match application` dataplane term (source-port sibling of #3429). Added
+  `SrcPorts` to NatAppTermWire (Go + Rust wire), `src_ports` to SourceNatAppTerm,
+  threaded src_port through l4_matches/matches; populate from Application.SourcePort
+  with the #3429 fail-closed never-match sentinel. RED-on-revert Go + Rust tests.
+- **File(s)**: pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/nat_l4_match_3429_test.go, userspace-dp/src/protocol/nat.rs,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests.rs,
+  docs/services-application-identification.md

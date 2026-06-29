@@ -450,13 +450,25 @@ type NatPortRangeWire struct {
 
 // NatAppTermWire is one resolved source-NAT `match application` term (#3429): an
 // L4 protocol (IANA number; 256 = any/unspecified — outside the 0-255 protocol
-// range so it never aliases protocol 0/HOPOPT) and optional destination-port
-// ranges. The flow matches the term when its protocol equals Protocol (or
-// Protocol==256) AND, if Ports is non-empty, its destination port falls in one
-// of the ranges. An application-set expands to one term per resolved member.
+// range so it never aliases protocol 0/HOPOPT) and optional destination- and
+// source-port ranges. The flow matches the term when its protocol equals
+// Protocol (or Protocol==256) AND, if Ports is non-empty, its destination port
+// falls in one of the dest ranges, AND, if SrcPorts is non-empty, its source
+// port falls in one of the source ranges. An application-set expands to one term
+// per resolved member.
+//
+// SrcPorts carries the application's `source-port` constraint (#3491). It is an
+// additive wire field (#1961 skew-safe): an older Go binary omits it (omitempty)
+// and an older Rust helper that does not know the field treats the term as
+// source-port-unconstrained — the pre-#3491 over-match. Empty = match any source
+// port. When the application configured a source-port but every value is
+// unrepresentable, the Go builder substitutes the never-match sentinel
+// ({Low:1,High:0}) so the term fails CLOSED rather than widening to any source
+// port (mirrors the #3429 dest-port handling).
 type NatAppTermWire struct {
 	Protocol uint16             `json:"protocol"`
 	Ports    []NatPortRangeWire `json:"ports,omitempty"`
+	SrcPorts []NatPortRangeWire `json:"src_ports,omitempty"`
 }
 
 type SourceNATRuleSnapshot struct {
