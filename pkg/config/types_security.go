@@ -593,6 +593,14 @@ type Address struct {
 	Name        string
 	Value       string // CIDR notation
 	Description string // optional Junos `description` sub-stanza
+	// TrailingTokens holds tokens that rode past the legitimate arity of a
+	// flat-set `address <name> <prefix>` / `address <name> description
+	// <text>` line (#3332). The address node is a `multi:true` leaf (so the
+	// generic scalar-leaf arity gate cannot reach it) and the compiler reads
+	// only the prefix / description-text slot, silently dropping anything
+	// after it. validateAddressBookTrailingStrict rejects these at commit
+	// (lenient downgrade on the tolerant load / peer-sync path).
+	TrailingTokens []string
 }
 
 // AddressSet is a named group of addresses and/or nested address-sets.
@@ -641,6 +649,17 @@ type Application struct {
 	// zero default, silently falling the application back to the global
 	// per-protocol timeout instead of the configured one (#3320).
 	UnknownTimeouts []string
+	// UnknownICMP records the raw `icmp-type` / `icmp-code` tokens (top-level or
+	// inline-term) that did NOT parse to a valid integer in 0..255. The schema
+	// range-validates the TOP-LEVEL leaves at commit-check, but the inline
+	// `term` is opaque to the schema walk (children:nil), so a malformed inline
+	// `icmp-type` would otherwise be silently dropped by parseICMPTypeCode —
+	// leaving the term UNCONSTRAINED, i.e. matching every ICMP type (a fail-open
+	// widening, the inverse of the #3348 fix). Mirroring UnknownTimeouts, the
+	// offending raw token is recorded here and the deferred gate
+	// (validateApplicationSpecsStrict) hard-rejects it on the strict commit path
+	// / warns on the lenient load / peer-sync path (#3348).
+	UnknownICMP []string
 }
 
 // IPsecConfig holds IPsec VPN configuration.
@@ -711,6 +730,15 @@ type IPsecGateway struct {
 	LocalIDValue     string // identity value
 	RemoteIDType     string // "hostname", "inet", "fqdn"
 	RemoteIDValue    string // identity value
+	// DynamicHostnameExtras holds tokens that rode past the FQDN on a
+	// compact-hierarchical `dynamic hostname <fqdn> <extra>` line (#3332).
+	// The flat-set form lands `hostname <fqdn>` as a scalar child the generic
+	// arity gate covers, but the compact-hierarchical form collapses
+	// `hostname <fqdn> <extra>` onto the parent `dynamic` node's Keys and the
+	// compiler reads only Keys[2], silently dropping the rest.
+	// validateTrailingTokensStrict rejects these at commit (lenient downgrade
+	// on the tolerant load / peer-sync path).
+	DynamicHostnameExtras []string
 }
 
 type IPsecTrafficSelector struct {

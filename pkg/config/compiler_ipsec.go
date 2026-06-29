@@ -163,6 +163,14 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 				// and resolveRemoteAddr (#2404).
 				if len(p.Keys) >= 3 && p.Keys[1] == "hostname" {
 					gw.DynamicHostname = p.Keys[2]
+					// #3332: compact-hierarchical `dynamic hostname <fqdn>
+					// <extra>` collapses onto the parent's Keys; the FQDN is a
+					// single token at Keys[2], so Keys[3:] is operator garbage
+					// the compiler silently dropped. Record it for the strict
+					// trailing-token gate.
+					if len(p.Keys) > 3 {
+						gw.DynamicHostnameExtras = append(gw.DynamicHostnameExtras, p.Keys[3:]...)
+					}
 				} else {
 					for _, c := range p.Children {
 						if c.Name() == "hostname" && len(c.Keys) >= 2 {
@@ -345,6 +353,10 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 				// renders remote_addrs = %any (#2404).
 				if len(p.Keys) >= 3 && p.Keys[1] == "hostname" {
 					gw.DynamicHostname = p.Keys[2]
+					// #3332: compact-hierarchical trailing tokens past the FQDN.
+					if len(p.Keys) > 3 {
+						gw.DynamicHostnameExtras = append(gw.DynamicHostnameExtras, p.Keys[3:]...)
+					}
 				} else {
 					for _, c := range p.Children {
 						if c.Name() == "hostname" {
