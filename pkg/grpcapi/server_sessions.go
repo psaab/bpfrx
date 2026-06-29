@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +32,16 @@ type sessionEgressKey struct {
 func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
+	}
+
+	// req.Offset is a signed int32; a negative value made the legacy
+	// path's `idx >= offset` test true for the first row (silently
+	// behaving like offset 0) and was ignored entirely by the cursor
+	// path. Reject it centrally — BEFORE the PageSize branch — so both
+	// the cursor and legacy paths surface bad input as InvalidArgument
+	// rather than a full page returned as success (#3439 L2).
+	if req.Offset < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid offset %d", req.Offset)
 	}
 
 	// Cursor-based pagination: when page_size > 0, use cursor path.
@@ -296,14 +305,18 @@ func (f *sessionFilter) setInputErr(err error) {
 
 // protoFilterMatches matches a session protocol against an operator
 // filter string: case-insensitive protocol name (tcp/udp/icmp/icmpv6/
-// gre/esp/...) or a numeric IP protocol ("47" matches GRE sessions
-// even though protoName(47) renders "gre").
+// gre/esp/sctp/...) or a numeric IP protocol ("47" matches GRE sessions
+// even though protoName(47) renders "gre"). Resolution goes through
+// appid.ProtocolNumberLenient so name-only tokens with no protoName()
+// reverse (e.g. "sctp"=132, "ospf"=89) still match their sessions AND a
+// display-only name the strict ProtocolNumber does not reverse
+// ("ipv6"=41, #3393) matches its sessions too. An unknown token (e.g.
+// "tcpip") matches nothing — buildSessionFilter rejects such tokens with
+// InvalidArgument before iteration so an unparseable protocol is
+// surfaced rather than returned as an empty success (#3439 L2).
 func protoFilterMatches(p uint8, filter string) bool {
-	if strings.EqualFold(protoName(p), filter) {
-		return true
-	}
-	if n, err := strconv.Atoi(filter); err == nil {
-		return n == int(p)
+	if n, ok := appid.ProtocolNumberLenient(filter); ok {
+		return n == p
 	}
 	return false
 }
@@ -357,6 +370,17 @@ func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
 	}
 	if req.DestinationPort > 65535 {
 		f.setInputErr(status.Errorf(codes.InvalidArgument, "invalid destination port %d", req.DestinationPort))
+	}
+	// Validate the protocol token. protoFilterMatches returns false for
+	// an unparseable token (e.g. "tcpip"), so an invalid protocol would
+	// otherwise iterate to an empty list and return as a *successful*
+	// RPC — indistinguishable from "no such sessions". Reject it here so
+	// the predicate is never silently inert (and, on the shared clear
+	// path, so a typo'd protocol never widens to clear-all) (#3439 L2).
+	if f.protoFilter != "" {
+		if _, ok := appid.ProtocolNumberLenient(f.protoFilter); !ok {
+			f.setInputErr(status.Errorf(codes.InvalidArgument, "invalid protocol %q", f.protoFilter))
+		}
 	}
 
 	// Parse CIDR prefix filters.
@@ -569,6 +593,8 @@ func (s *Server) getSessionsLegacy(ctx context.Context, req *pb.GetSessionsReque
 	if limit > 10000 {
 		limit = 10000
 	}
+	// req.Offset (signed int32) is validated for negativity centrally in
+	// GetSessions before path dispatch (#3439 L2).
 	offset := int(req.Offset)
 	noEnrich := req.NoEnrich
 
