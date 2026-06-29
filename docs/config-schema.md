@@ -2271,9 +2271,27 @@ strict-vs-lenient gates:
   snapshot carried the unknown name and the dataplane steered matched packets
   toward a routing table that does not exist (silent blackhole / fall-through to
   the default table).
+- **#3432 — output-attached `then routing-instance` direction →
+  `validateFilterRoutingInstanceDirectionStrict`.** FBF route override is an
+  INGRESS-only operation: the userspace forwarding path
+  (`ingress_route_table_override` / `interface_filter_affects_route_lookup`,
+  `userspace-dp/src/afxdp/forwarding/mod.rs`) resolves the ingress logical
+  ifindex and only consults the INPUT filter's `affects_route_lookup` flag —
+  the Rust filter compiler (`userspace-dp/src/filter/compiler.rs`) sets that
+  flag only on the input attach branch. So a filter carrying a `then
+  routing-instance` term attached with `filter output` compiled cleanly but
+  the steering silently never fired. This gate rejects an output attach of any
+  filter that carries a routing-instance term, naming the interface/unit/family
+  and pointing the operator at `filter input` instead. The SAME filter on an
+  INPUT attach is the legitimate PBR case and still commits. (The Finding C
+  reference gate and the #3308 routing-instance+discard/reject conflict gate
+  check the target NAME and the terminal-action conflict; neither checks the
+  attach DIRECTION.)
 
-All three walk both filter families (`inet` + `inet6`) / both AST shapes
-(hierarchical and flat-set), sorted for a deterministic first-error message.
+All four cover both filter families (`inet` + `inet6`) / both AST shapes
+(hierarchical and flat-set), sorted for a deterministic first-error message
+(the #3432 gate walks interface attachments — inet then inet6 — rather than the
+filter maps directly).
 
 **Strict (`commit` / `commit check`):** a dangling reference is a HARD commit
 error naming the filter/term (or application-set) and the offending name.
