@@ -170,6 +170,145 @@ security {
 	}
 }
 
+// TestDNATRuleSetToScopeRejectedAcrossDuplicateNATBlocks proves the gate
+// iterates EVERY `nat` sibling under a security root, not just the first.
+// compileSecurity compiles every `nat` child (compiler_security.go), and the
+// parser APPENDS a repeated `nat {}` block as a sibling (parseStatements), so
+// ONE security root with a benign first `nat {}` plus a second `nat {
+// destination { rule-set RD ... to zone trust } }` would bypass a first-`nat`
+// walk while the compiler still compiled the second nat's rule-set with the
+// `to` silently dropped (the #3444 bypass, one level deeper). Reverting the
+// nat-level forEachChild back to FindChild-first makes strict CompileConfig
+// compile this clean → RED.
+func TestDNATRuleSetToScopeRejectedAcrossDuplicateNATBlocks(t *testing.T) {
+	cfgText := `
+security {
+    nat {
+        source {
+            rule-set RS {
+                from zone trust;
+                rule R0 {
+                    then {
+                        source-nat interface;
+                    }
+                }
+            }
+        }
+    }
+    nat {
+        destination {
+            pool P1 {
+                address 10.0.30.100;
+            }
+            rule-set RD {
+                from zone untrust;
+                to zone trust;
+                rule R1 {
+                    match {
+                        destination-address 198.51.100.5/32;
+                    }
+                    then {
+                        destination-nat pool P1;
+                    }
+                }
+            }
+        }
+    }
+}
+`
+	p := NewParser(cfgText)
+	tree, perrs := p.Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("Parse: %v", perrs)
+	}
+	// Sanity: the single security root must carry TWO `nat` siblings (the
+	// bypass premise).
+	var natCount int
+	for _, n := range tree.Children {
+		if n.Name() == "security" {
+			for _, c := range n.Children {
+				if c.Name() == "nat" {
+					natCount++
+				}
+			}
+		}
+	}
+	if natCount < 2 {
+		t.Fatalf("expected 2 `nat` siblings under one security root (the bypass premise), got %d", natCount)
+	}
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatalf("CompileConfig accepted a DNAT `to` scope in the SECOND of two nat blocks; want a strict reject (#3444 bypass)")
+	}
+	if !strings.Contains(err.Error(), "RD") || !strings.Contains(err.Error(), "#3444") {
+		t.Fatalf("reject error %q does not name the rule-set (RD) and #3444", err.Error())
+	}
+}
+
+// TestDNATRuleSetToScopeRejectedAcrossDuplicateDestinationBlocks proves the
+// gate also iterates every `destination` sibling within a `nat` block.
+// compileNAT itself reads only the FIRST `destination`, so a duplicate
+// `destination` within one `nat` is not currently compiler-reachable for the
+// silent drop — but the walk rejects it anyway (fail-closed: an operator who
+// authored a DNAT `to` is told it is unsupported, and the gate is defensive
+// against a future compiler that iterates destinations). Reverting the
+// destination-level forEachChild to FindChild-first makes strict CompileConfig
+// compile this clean → RED.
+func TestDNATRuleSetToScopeRejectedAcrossDuplicateDestinationBlocks(t *testing.T) {
+	cfgText := `
+security {
+    nat {
+        destination {
+            pool P0 {
+                address 10.0.30.99;
+            }
+            rule-set RBENIGN {
+                from zone untrust;
+                rule R0 {
+                    match {
+                        destination-address 198.51.100.1/32;
+                    }
+                    then {
+                        destination-nat pool P0;
+                    }
+                }
+            }
+        }
+        destination {
+            pool P1 {
+                address 10.0.30.100;
+            }
+            rule-set RD {
+                from zone untrust;
+                to zone trust;
+                rule R1 {
+                    match {
+                        destination-address 198.51.100.5/32;
+                    }
+                    then {
+                        destination-nat pool P1;
+                    }
+                }
+            }
+        }
+    }
+}
+`
+	p := NewParser(cfgText)
+	tree, perrs := p.Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("Parse: %v", perrs)
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatalf("CompileConfig accepted a DNAT `to` scope in the SECOND of two destination blocks; want a strict reject (#3444 bypass)")
+	}
+	if !strings.Contains(err.Error(), "RD") || !strings.Contains(err.Error(), "#3444") {
+		t.Fatalf("reject error %q does not name the rule-set (RD) and #3444", err.Error())
+	}
+}
+
 // TestDNATRuleSetFromOnlyStillCommits proves the no-regression case: a DNAT
 // rule-set with only a `from` clause (the legitimate Junos shape) commits
 // cleanly with no #3444 warning and the `from` scope survives.

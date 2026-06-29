@@ -61,41 +61,71 @@ func validateDNATRuleSetToScopeAST(nodes []*Node, lenient bool) ([]string, error
 		return nil
 	}
 
-	// Iterate EVERY top-level `security` node, not just the first match.
-	// parseStatements APPENDS a repeated top-level block instead of merging
-	// it (parser.go) and compileExpanded processes every `security` root, so
-	// a config (e.g. a hierarchical LoadOverride input) with two `security {}`
-	// blocks where only the SECOND carries the DNAT `to` would bypass a
-	// first-match-only walk while the compiler still compiled the second
-	// block's rule-set with the `to` silently dropped (the original #3444
-	// bug). Mirror the compiler's root iteration so a DNAT `to` in ANY
-	// duplicate `security` block is caught.
-	for _, n := range nodes {
-		if n.Name() != "security" {
-			continue
-		}
-		natNode := n.FindChild("nat")
-		if natNode == nil {
-			continue
-		}
-		dstNode := natNode.FindChild("destination")
-		if dstNode == nil {
-			continue
-		}
-		for _, rs := range namedInstances(dstNode.FindChildren("rule-set")) {
-			if rs.node.FindChild("to") == nil {
-				continue
-			}
-			if err := emit(
-				"security nat destination rule-set %q: a `to` scope is not "+
-					"supported on a destination-NAT rule-set (Junos DNAT has only "+
-					"a `from` clause — the destination is translated on inbound, so "+
-					"there is no egress context; the `to` scope was silently ignored "+
-					"and the translation applied regardless of it) — remove it (#3444)",
-				rs.name); err != nil {
-				return nil, err
-			}
-		}
+	// Iterate ALL matching children at EVERY level the walk descends, not
+	// the first match at any level. parseStatements APPENDS a repeated block
+	// instead of merging it (parser.go), and the compiler iterates siblings
+	// at each level it descends — compileExpanded processes every `security`
+	// root, compileSecurity compiles every `nat` sibling. So a first-match-
+	// only walk is bypassable at EVERY level (the multi-level duplicate-block
+	// class, #3562): e.g. ONE `security` root with a benign first `nat {}` +
+	// a second `nat { destination { rule-set RD { to zone trust; ... } } }`
+	// would slip past a first-`nat` walk while the compiler still compiles
+	// the second `nat`'s rule-set with the `to` silently dropped (the
+	// original #3444 bug, reachable via a hierarchical LoadOverride input).
+	// Using forEachChild at security/nat/destination guarantees a DNAT `to`
+	// in ANY duplicate block at ANY level is caught. The inner rule-set
+	// iteration + narrow direct-`to` check is unchanged — the scope
+	// precision stays destination-only so the source-NAT `to` (#3096) is
+	// untouched. (compileNAT itself reads only the first `destination` per
+	// `nat`, so a duplicate `destination` WITHIN one `nat` is not currently
+	// compiler-reachable for the silent drop; the walk rejects it anyway —
+	// fail-closed and defensive against future compiler changes.)
+	err := forEachChild(nodes, "security", func(sec *Node) error {
+		return forEachChild(sec.Children, "nat", func(nat *Node) error {
+			return forEachChild(nat.Children, "destination", func(dst *Node) error {
+				for _, rs := range namedInstances(dst.FindChildren("rule-set")) {
+					if rs.node.FindChild("to") == nil {
+						continue
+					}
+					if err := emit(
+						"security nat destination rule-set %q: a `to` scope is not "+
+							"supported on a destination-NAT rule-set (Junos DNAT has only "+
+							"a `from` clause — the destination is translated on inbound, so "+
+							"there is no egress context; the `to` scope was silently ignored "+
+							"and the translation applied regardless of it) — remove it (#3444)",
+						rs.name); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		})
+	})
+	if err != nil {
+		return nil, err
 	}
 	return warnings, nil
+}
+
+// forEachChild invokes fn for every node in children whose Name() equals
+// name, stopping and propagating the first error fn returns. It is the
+// reference iterate-ALL-siblings primitive for the multi-level duplicate-
+// block bypass class (#3562): the Junos parser APPENDS a repeated block as a
+// sibling instead of merging it (parseStatements, parser.go) and the compiler
+// iterates siblings at each level it descends, so a strict-reject AST walk
+// that uses FindChild (first match) at ANY level it descends can be bypassed
+// by placing the offending stanza in a duplicate block. Descending with
+// forEachChild at every level closes that bypass. `children` is a `[]*Node`
+// so the same primitive covers the top-level roots slice and every
+// node.Children slice uniformly.
+func forEachChild(children []*Node, name string, fn func(*Node) error) error {
+	for _, c := range children {
+		if c.Name() != name {
+			continue
+		}
+		if err := fn(c); err != nil {
+			return err
+		}
+	}
+	return nil
 }
