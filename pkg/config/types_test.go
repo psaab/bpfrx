@@ -43,6 +43,71 @@ func TestRethToPhysical_Empty(t *testing.T) {
 	}
 }
 
+// TestRethToPhysical_NilMapValue is the RED-on-revert guard for #3501: a
+// nil *InterfaceConfig map value (reachable on the tolerant/programmatic +
+// HA-peer-sync config path, mirroring zones.go:211) must not panic
+// RethToPhysical. Reverting the `if ifc == nil { continue }` guard panics
+// with a nil-pointer dereference on ifc.RedundantParent.
+func TestRethToPhysical_NilMapValue(t *testing.T) {
+	cfg := &Config{
+		Interfaces: InterfacesConfig{
+			Interfaces: map[string]*InterfaceConfig{
+				"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
+				"ge-0/0/9": nil, // tolerant/HA-sync nil slot
+			},
+		},
+	}
+	m := cfg.RethToPhysical()
+	if m["reth0"] != "ge-0/0/0" {
+		t.Errorf("reth0 → %q, want ge-0/0/0", m["reth0"])
+	}
+	// ResolveReth/ResolveKernelIfName ride on RethToPhysical — they must
+	// survive the nil slot too.
+	if got := cfg.ResolveReth("reth0.50"); got != "ge-0/0/0.50" {
+		t.Errorf("ResolveReth(reth0.50) = %q, want ge-0/0/0.50", got)
+	}
+}
+
+// TestResolveFab_NilMapValue is the RED-on-revert guard for #3501: a nil
+// *InterfaceConfig map value present under the resolved base name must not
+// panic ResolveFab. Reverting the `|| ifc == nil` guard panics on
+// ifc.LocalFabricMember.
+func TestResolveFab_NilMapValue(t *testing.T) {
+	cfg := &Config{
+		Interfaces: InterfacesConfig{
+			Interfaces: map[string]*InterfaceConfig{
+				"fab0": nil, // tolerant/HA-sync nil slot
+			},
+		},
+	}
+	// Key present but value nil → must fall through to the unchanged ref.
+	if got := cfg.ResolveFab("fab0.0"); got != "fab0.0" {
+		t.Errorf("ResolveFab(fab0.0) = %q, want fab0.0", got)
+	}
+}
+
+// TestTunnelNameMap_NilMapValue is the RED-on-revert guard for #3501: a nil
+// *InterfaceConfig map value must not panic TunnelNameMap. Reverting the
+// `if ifc == nil { continue }` guard panics on ifc.Tunnel.
+func TestTunnelNameMap_NilMapValue(t *testing.T) {
+	cfg := &Config{
+		Interfaces: InterfacesConfig{
+			Interfaces: map[string]*InterfaceConfig{
+				"gr-0/0/0": {
+					Name:   "gr-0/0/0",
+					Tunnel: &TunnelConfig{Source: "10.0.0.1", Destination: "10.0.0.2"},
+					Units:  map[int]*InterfaceUnit{0: {Number: 0}},
+				},
+				"gr-0/0/9": nil, // tolerant/HA-sync nil slot
+			},
+		},
+	}
+	m := cfg.TunnelNameMap()
+	if m["gr-0/0/0.0"] != "gr-0-0-0" {
+		t.Errorf("gr-0/0/0.0 → %q, want gr-0-0-0", m["gr-0/0/0.0"])
+	}
+}
+
 func TestResolveReth(t *testing.T) {
 	cfg := &Config{
 		Interfaces: InterfacesConfig{
