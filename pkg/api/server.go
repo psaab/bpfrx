@@ -167,6 +167,12 @@ type Config struct {
 	// Optional; if nil or it returns ok=false the simulator evaluates scheduled
 	// policies as-if-active (the pre-#3104 behavior / #3062 display fallback).
 	PolicySchedulerActiveStateFn func() (map[string]bool, bool)
+	// HAActiveFn reports whether THIS node is the active cluster member for
+	// the default resource group, surfaced as the session ha_active field
+	// (#3419 M6), mirroring the gRPC contract (server_sessions.go
+	// IsLocalPrimary(0)). Optional; if nil the session view reports
+	// ha_active=true (the standalone default).
+	HAActiveFn func() bool
 }
 
 // Server is the HTTP API server.
@@ -198,6 +204,7 @@ type Server struct {
 	flowCollectorHealthFn     func() []flowexport.ExporterCollectorHealth
 	feedOverlayFn             func() map[string][]string
 	policySchedActiveFn       func() (map[string]bool, bool)
+	haActiveFn                func() bool
 	startTime                 time.Time
 }
 
@@ -229,6 +236,7 @@ func NewServer(cfg Config) *Server {
 		flowCollectorHealthFn:     cfg.FlowCollectorHealthFn,
 		feedOverlayFn:             cfg.FeedOverlayFn,
 		policySchedActiveFn:       cfg.PolicySchedulerActiveStateFn,
+		haActiveFn:                cfg.HAActiveFn,
 		startTime:                 time.Now(),
 	}
 
