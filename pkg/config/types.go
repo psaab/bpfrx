@@ -69,6 +69,9 @@ func (c *Config) RethToPhysical() map[string]string {
 		localNodeID = c.Chassis.Cluster.NodeID
 	}
 	for _, ifc := range c.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
 		if ifc.RedundantParent != "" {
 			score := 1
 			if localNodeID >= 0 {
@@ -116,7 +119,7 @@ func (c *Config) ResolveFab(ref string) string {
 		return ref
 	}
 	ifc, ok := c.Interfaces.Interfaces[base]
-	if !ok || ifc.LocalFabricMember == "" {
+	if !ok || ifc == nil || ifc.LocalFabricMember == "" {
 		return ref
 	}
 	resolved := ifc.LocalFabricMember
@@ -313,6 +316,9 @@ func IRBToBridge(bds []*BridgeDomainConfig) map[string]string {
 func (c *Config) TunnelNameMap() map[string]string {
 	m := make(map[string]string)
 	for ifName, ifc := range c.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
 		ifaceTunnel := ifc.Tunnel != nil &&
 			(ifc.Tunnel.Source != "" || ifc.Tunnel.Mode == "wireguard")
 		baseName := LinuxIfName(ifName)
