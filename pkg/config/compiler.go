@@ -2391,8 +2391,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// config carrying a bad app def still boots — the dataplane skips the bad
 	// port and the #2124 runtime capability gate fails closed for a referenced
 	// app it cannot represent). Reuses validatePortSpec / validateProtocol, the
-	// same config-layer validators that produced the warning, so no new
-	// divergent table is introduced.
+	// same config-layer validators that produced the warning, so this gate adds no
+	// new alias table of its own.
+	//
+	// #3372: a clarification on the divergence the dataplane DOES keep. The
+	// runtime #2124 capability gate (pkg/dataplane/userspace
+	// userspacePortSpecRepresentable, mirroring Rust parse_port_spec) matches the
+	// 15 literal service aliases CASE-SENSITIVELY, whereas validatePortSpec here is
+	// case-INSENSITIVE. That asymmetry would be a commit/apply split (a mixed-case
+	// `destination-port HTTPS` accepted here but unrepresentable at apply, which
+	// disarms userspace enforcement for the whole snapshot) EXCEPT that
+	// compileApplications / parseApplicationTerms run every application port spec
+	// through resolveAppPort FIRST, which canonicalizes any recognized service
+	// name (case-insensitively, against the single-source-of-truth
+	// junosServicePorts catalog) to its NUMERIC form. So by the time this gate or
+	// the userspace gate runs, a recognized mixed-case name is already a number and
+	// the case-sensitive gate never sees a raw alias. The 15-name lists in
+	// validatePortSpec and userspacePortSpecRepresentable are belt-and-suspenders
+	// backstops kept consistent with junosServicePorts by the drift canary
+	// TestNamedPortAliasTablesDoNotDrift.
 	if err := validateApplicationSpecsStrict(cfg); err != nil {
 		if opts.lenientApplicationSpecs {
 			cfg.Warnings = append(cfg.Warnings,
