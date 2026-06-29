@@ -91,6 +91,27 @@ type traceFilter struct {
 	srcNet netip.Prefix
 	dstNet netip.Prefix
 	proto  string // normalized protocol name (e.g. "TCP"); "" = any
+	// invalid marks a filter whose configured source/destination prefix did
+	// not parse OR was present-but-empty (`source-prefix ""`, flagged by the
+	// compiler as InvalidPrefix). Such a filter is kept (so the writer still
+	// has a non-empty filter set) but never matches — a typo'd or empty prefix
+	// must NARROW tracing to nothing, not be silently dropped which would leave
+	// tw.filters empty and trace EVERYTHING (#3422 M01). The commit-time gate
+	// (validateFlowTraceFlagsAndFiltersAST) rejects this loudly; this keeps a
+	// leniently-loaded / peer-synced config fail-safe.
+	invalid bool
+}
+
+// traceFlagImplemented reports whether a `security flow traceoptions flag`
+// token is one the writer actually honours (matchFlags). Keep in sync with
+// matchFlags and config.flowTraceImplementedFlags.
+func traceFlagImplemented(flag string) bool {
+	switch flag {
+	case "basic-datapath", "session":
+		return true
+	default:
+		return false
+	}
 }
 
 // NewTraceWriter creates a trace writer from flow traceoptions config.
@@ -126,36 +147,70 @@ func NewTraceWriter(opts *config.FlowTraceoptions) (*TraceWriter, error) {
 		flags:    make(map[string]bool),
 	}
 
-	// Parse flags
+	// Parse flags. Only flags the writer actually implements are installed.
+	// An unimplemented flag (a typo like `sesson`) is dropped here rather than
+	// inserted into the map: a non-empty map of unrecognized flags would
+	// suppress the defaults below, and matchFlags would then never match, so
+	// the daemon would report tracing enabled while writing an empty trace
+	// file (#3422 M02). The commit-time gate
+	// (validateFlowTraceFlagsAndFiltersAST) rejects an unknown flag loudly;
+	// this keeps a leniently-loaded / peer-synced config tracing with the
+	// defaults instead of silently tracing nothing.
 	for _, f := range opts.Flags {
-		tw.flags[f] = true
+		if traceFlagImplemented(f) {
+			tw.flags[f] = true
+		} else {
+			slog.Warn("ignoring unimplemented flow trace flag",
+				"flag", f, "supported", "basic-datapath,session")
+		}
 	}
-	// If no flags specified, trace everything
+	// If no implemented flags specified, trace everything
 	if len(tw.flags) == 0 {
 		tw.flags["basic-datapath"] = true
 		tw.flags["session"] = true
 	}
 
-	// Parse packet filters
+	// Parse packet filters. A filter whose source or destination prefix does
+	// not parse is marked invalid (never-match) but STILL appended, rather
+	// than dropped: dropping every typo'd filter would leave tw.filters empty,
+	// and HandleEvent skips filtering entirely when len(tw.filters)==0, so a
+	// filter meant to narrow tracing would broaden it to every event (#3422
+	// M01). Keeping an invalid filter in the set fails safe — it narrows
+	// tracing to nothing. The commit-time gate rejects an unparseable prefix
+	// loudly; this is the leniently-loaded / peer-synced backstop.
 	for _, pf := range opts.PacketFilters {
-		f := traceFilter{name: pf.Name}
+		// A filter whose source/destination prefix node was present in the
+		// config but empty (`source-prefix ""`) arrives here with an empty
+		// string, indistinguishable from a legitimately-absent prefix (a
+		// protocol-only filter). The compiler tells them apart and sets
+		// InvalidPrefix for the present-but-empty case; seed f.invalid from it
+		// so the filter fails closed (match-none) instead of matching every
+		// event (#3422 M01). A protocol-only filter (InvalidPrefix false, no
+		// prefixes, a protocol) stays valid and matches on its protocol.
+		f := traceFilter{name: pf.Name, invalid: pf.InvalidPrefix}
+		if pf.InvalidPrefix {
+			slog.Warn("empty trace filter prefix; filter set to match-none",
+				"filter", pf.Name)
+		}
 		if pf.SourcePrefix != "" {
 			prefix, err := netip.ParsePrefix(pf.SourcePrefix)
 			if err != nil {
-				slog.Warn("invalid trace filter source prefix",
+				slog.Warn("invalid trace filter source prefix; filter set to match-none",
 					"filter", pf.Name, "prefix", pf.SourcePrefix, "err", err)
-				continue
+				f.invalid = true
+			} else {
+				f.srcNet = prefix
 			}
-			f.srcNet = prefix
 		}
 		if pf.DestinationPrefix != "" {
 			prefix, err := netip.ParsePrefix(pf.DestinationPrefix)
 			if err != nil {
-				slog.Warn("invalid trace filter destination prefix",
+				slog.Warn("invalid trace filter destination prefix; filter set to match-none",
 					"filter", pf.Name, "prefix", pf.DestinationPrefix, "err", err)
-				continue
+				f.invalid = true
+			} else {
+				f.dstNet = prefix
 			}
-			f.dstNet = prefix
 		}
 		if pf.Protocol != "" {
 			f.proto = normalizeTraceProto(pf.Protocol)
@@ -246,6 +301,10 @@ func (tw *TraceWriter) matchFilters(rec EventRecord) bool {
 	recProto := normalizeTraceProto(rec.Protocol)
 
 	for _, f := range tw.filters {
+		if f.invalid {
+			// A filter with an unparseable prefix never matches (#3422 M01).
+			continue
+		}
 		srcMatch := !f.srcNet.IsValid() || (srcAddr.IsValid() && f.srcNet.Contains(srcAddr))
 		dstMatch := !f.dstNet.IsValid() || (dstAddr.IsValid() && f.dstNet.Contains(dstAddr))
 		protoMatch := f.proto == "" || f.proto == recProto
