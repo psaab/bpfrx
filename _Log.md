@@ -23898,6 +23898,15 @@ top.
   pkg/api/README.md, pkg/grpcapi/README.md, _Log.md
 
 - **Timestamp**: 2026-06-29
+  **Action**: #3425 — NAT match {source,destination}-address-name strict gate now
+  rejects defined-but-unresolvable references (empty/dangling address-set,
+  prefix-less address) at commit; lenient-warn on tolerant load/peer-sync; direct
+  dynamic-address feed bindings carved out (accepted). Dataplane already fails
+  closed (raw unmatchable token / zero DNAT entries) — added regression tests.
+  **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_nat_address_name_resolvable_3425_test.go (new),
+  pkg/dataplane/userspace/nat_address_name_failclosed_3425_test.go (new),
+  docs/config-schema.md, _Log.md
 - **Action**: #3337 — surface dropped RT_FLOW forensic fields on the
   security-event APIs. REST/SSE EventEntry expanded to mirror the gRPC entry
   (zone names, policy name, app name, ingress iface, close reason, reverse
