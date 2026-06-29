@@ -45,6 +45,20 @@ type fakeBpfrxClient struct {
 	matchPoliciesCalls int
 	matchPoliciesReq   *pb.MatchPoliciesRequest
 	matchPoliciesResp  *pb.MatchPoliciesResponse
+
+	// GetPolicies recorder (#3357 remote filtered/brief scoped-global coverage).
+	getPoliciesCalls int
+	getPoliciesResp  *pb.GetPoliciesResponse
+}
+
+func (f *fakeBpfrxClient) GetPolicies(
+	_ context.Context, _ *pb.GetPoliciesRequest, _ ...grpc.CallOption,
+) (*pb.GetPoliciesResponse, error) {
+	f.getPoliciesCalls++
+	if f.getPoliciesResp != nil {
+		return f.getPoliciesResp, nil
+	}
+	return &pb.GetPoliciesResponse{}, nil
 }
 
 func (f *fakeBpfrxClient) MatchPolicies(

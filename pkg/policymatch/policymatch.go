@@ -483,6 +483,25 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 	return Result{HostInboundUnmatched: true}
 }
 
+// GlobalPolicyAppliesToZonePair reports whether a global policy (#3148) with the
+// given match-scope zones is selected by a `from-zone X to-zone Y` display
+// filter (#3357). It governs which scoped/unscoped globals a FILTERED policy
+// view shows. An empty filter axis selects every global on that axis. A global
+// whose match-scope zone is empty or "any" spans every zone, so it always
+// applies (it IS enforced for the filtered pair). A scoped global is selected
+// only when its scope equals the filter on each constrained axis. The semantics
+// mirror globalScopeMatches (an "any"/empty scope is all-zones) so the filtered
+// view shows exactly the globals the runtime enforces for that zone pair.
+func GlobalPolicyAppliesToZonePair(matchFrom, matchTo, filterFrom, filterTo string) bool {
+	axisApplies := func(scope, filter string) bool {
+		if filter == "" || scope == "" || scope == "any" {
+			return true
+		}
+		return scope == filter
+	}
+	return axisApplies(matchFrom, filterFrom) && axisApplies(matchTo, filterTo)
+}
+
 // globalScopeMatches replicates GlobalZoneScope::matches + build_global_zone_scope
 // (policy.rs, #3148). An empty or explicit "any" scope applies to every zone.
 // Any other name must resolve to a DEFINED zone and equal the flow's zone; an

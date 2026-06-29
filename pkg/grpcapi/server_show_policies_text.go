@@ -19,6 +19,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/policymatch"
 )
 
 // policySchedulerStateProvider is the optional dataplane capability the
@@ -165,11 +166,20 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 	// with from/to zone "*" (matching the other surfaces). Counter IDs
 	// continue from the zone-pair loop: policySetID*MaxRulesPerPolicy + i,
 	// keeping the global slots aligned with the dataplane (#3045/#3050 did
-	// the same for the REST inventory). A from/to-zone filter selects
-	// zone-pair policies only, so suppress globals when one is set.
-	if len(cfg.Security.GlobalPolicies) > 0 && filterFrom == "" && filterTo == "" {
+	// the same for the REST inventory).
+	//
+	// #3357: a from/to-zone filter no longer suppresses the whole global
+	// block. An unscoped global is enforced for every zone pair and a scoped
+	// global (#3148) may target exactly the filtered pair, so the filtered
+	// hit-count surface must show the globals that govern it.
+	// GlobalPolicyAppliesToZonePair selects per-rule scope against the filter.
+	if len(cfg.Security.GlobalPolicies) > 0 {
 		for i, pol := range cfg.Security.GlobalPolicies {
 			if pol == nil {
+				continue
+			}
+			// #3357: drop a scoped global that targets a different zone pair.
+			if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZone, pol.Match.ToZone, filterFrom, filterTo) {
 				continue
 			}
 			action := "permit"
@@ -344,13 +354,25 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 		policySetID++
 		fmt.Fprintln(buf)
 	}
-	// Global policies
-	if len(cfg.Security.GlobalPolicies) > 0 && filterFrom == "" && filterTo == "" {
-		fmt.Fprintf(buf, "Global policies:\n")
+	// Global policies. #3357: a from/to-zone filter no longer suppresses the
+	// global block — the filtered detail surface must still show an unscoped
+	// global (enforced for every pair) and a scoped global (#3148) targeting
+	// the filtered pair. The "Global policies:" header prints lazily so a
+	// filter that selects no global leaves no dangling empty header.
+	if len(cfg.Security.GlobalPolicies) > 0 {
+		globalHeaderPrinted := false
 		for i, pol := range cfg.Security.GlobalPolicies {
 			// #3476: skip a nil global rule like the runtime walker does.
 			if pol == nil {
 				continue
+			}
+			// #3357: drop a scoped global that targets a different zone pair.
+			if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZone, pol.Match.ToZone, filterFrom, filterTo) {
+				continue
+			}
+			if !globalHeaderPrinted {
+				fmt.Fprintf(buf, "Global policies:\n")
+				globalHeaderPrinted = true
 			}
 			action := "permit"
 			switch pol.Action {
