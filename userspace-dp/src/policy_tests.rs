@@ -3064,6 +3064,64 @@ fn app_catalog_directional_forward_not_mislabeled_by_source_port() {
     assert_eq!(ranged.lookup_directional(6, 9050, 1500, true), 9);
 }
 
+// #3416: the permit-side audit AppID must resolve from the POST-translation
+// destination port a DNAT'd session was admitted under, mirroring the deny side
+// (#3058/#3185). A public-port -> private-port forward (e.g. :2222 -> :22 for
+// junos-ssh) must render the admitting application, not UNKNOWN/the public port.
+#[test]
+fn app_catalog_lookup_admitted_uses_post_nat_dst_port() {
+    // junos-ssh stand-in: TCP dst/22 (exact-port path).
+    let ssh = AppCatalog::from_snapshot(&[cat_entry(22, 6, 22, 22)]);
+
+    // Forward DNAT: client src=51000 -> public dst=2222, DNAT-rewritten to :22.
+    // RED-on-revert: passing the pre-NAT forward-key dst (2222) to the plain
+    // directional lookup mislabels the session UNKNOWN — exactly the #3416 bug.
+    assert_eq!(
+        ssh.lookup_directional(6, 51000, 2222, false),
+        0,
+        "pre-NAT public dst port resolves UNKNOWN — the #3416 mislabel"
+    );
+    // The fix: lookup_admitted substitutes the post-NAT (rewritten) dst port and
+    // resolves the admitting application.
+    assert_eq!(
+        ssh.lookup_admitted(6, 51000, 2222, false, Some(22)),
+        22,
+        "forward DNAT session resolves on the post-NAT (rewritten) dst port"
+    );
+
+    // Negative control: public == private port (no rewrite). rewrite_dst_port is
+    // None, so the result is byte-identical to the plain directional lookup.
+    assert_eq!(
+        ssh.lookup_admitted(6, 51000, 22, false, None),
+        22,
+        "non-translated flow falls back to the forward-key dst port"
+    );
+    // A DNAT that does NOT change the port (rewrite_dst_port None even though the
+    // dst address changed) also falls back to the received service port.
+    assert_eq!(
+        ssh.lookup_admitted(6, 51000, 22, false, None),
+        22,
+        "address-only DNAT (no port rewrite) still resolves on the dst port"
+    );
+
+    // Reverse-keyed entry: the service rides the SRC slot and the key already
+    // carries the real internal port. The forward-only rewrite must NOT touch
+    // the reverse service slot, so a (bogus, for this direction) rewrite_dst_port
+    // is ignored and the src slot still resolves.
+    assert_eq!(
+        ssh.lookup_admitted(6, 22, 51000, true, Some(2222)),
+        22,
+        "reverse-keyed session resolves on its received src service slot"
+    );
+
+    // Wrong post-NAT port still resolves to UNKNOWN (no false positive).
+    assert_eq!(
+        ssh.lookup_admitted(6, 51000, 2222, false, Some(8080)),
+        0,
+        "post-NAT port with no catalog entry resolves UNKNOWN"
+    );
+}
+
 // A (0,0) dst-port pair means "protocol-only" (e.g. ICMP) — match on protocol
 // regardless of ports.
 #[test]

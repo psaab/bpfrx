@@ -1242,6 +1242,43 @@ impl AppCatalog {
     pub(crate) fn lookup_forward(&self, protocol: u8, src_port: u16, dst_port: u16) -> u16 {
         self.lookup_directional(protocol, src_port, dst_port, false)
     }
+
+    /// #3416: resolve the AppID a session was ADMITTED under for the permit-side
+    /// audit surfaces (RT_FLOW `SESSION_CREATE`/`SESSION_CLOSE` and the
+    /// BPF-compatible conntrack publish). A forward DNAT / static-DNAT /
+    /// inbound-NPTv6 flow has its policy evaluated against the POST-translation
+    /// destination port (poll_descriptor `policy_dst_port`, #2345), so the
+    /// permitted-flow audit AppID must use that same translated port — not the
+    /// pre-NAT forward-key destination — or a port-forwarded service (public
+    /// `:2222` -> internal `:22` admitted by `junos-ssh`) renders as
+    /// UNKNOWN/the public-port app. This mirrors the deny-side fix that resolves
+    /// from the post-translation `policy_dst_port` (`resolve_policy_deny_app_id`,
+    /// #3058/#3185), making the permit side symmetric.
+    ///
+    /// `is_reverse` selects the service slot exactly as `lookup_directional`.
+    /// The post-translation rewrite is applied ONLY to the FORWARD service slot
+    /// (the destination). A reverse-keyed entry keeps its received service slot:
+    /// the reverse key already carries the real internal service port, and the
+    /// reverse NAT decision's `rewrite_dst_port` un-translates a destination
+    /// back toward the client side, so applying it there would re-introduce the
+    /// very mislabel this fixes. For a non-translated flow `rewrite_dst_port` is
+    /// `None`, so the result is byte-identical to `lookup_directional`.
+    #[inline]
+    pub(crate) fn lookup_admitted(
+        &self,
+        protocol: u8,
+        src_port: u16,
+        dst_port: u16,
+        is_reverse: bool,
+        rewrite_dst_port: Option<u16>,
+    ) -> u16 {
+        let service_dst_port = if is_reverse {
+            dst_port
+        } else {
+            rewrite_dst_port.unwrap_or(dst_port)
+        };
+        self.lookup_directional(protocol, src_port, service_dst_port, is_reverse)
+    }
 }
 
 #[derive(Clone, Debug)]
