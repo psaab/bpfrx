@@ -23542,6 +23542,31 @@ top.
 - **Timestamp**: 2026-06-29T11:40Z
   - **Action**: #3442 Codex MERGE-NEEDS-MAJOR fold (PR #3517) — over-rejection risk. Verb-set reconciliation: applyEditLine -> ParseSetVerb replays EXACTLY set/delete/deactivate/activate (everything else hits the bare-path default = the M3 bug); FormatSet (display-set, the loadable artifact) emits only set/deactivate. annotate/copy/insert/rename are interactive-only structural edits (pkg/cli/cli_dispatch.go handlers, distinct multi-clause grammar) NEVER present in a flat-load file and NOT replayable — pre-fix they were silently mangled into junk `set annotate ...` nodes, so rejecting them is the M3 fix, not a regression. Confirmed `hasFlatVerb` recognizes exactly the 4 replayable verbs (option 2). Real fix folded: Codex #3 whitespace — the literal-`verb ` prefix check wrongly rejected a tab between verb and path (lexer treats tabs as whitespace); rewrote hasFlatVerb to match the first whitespace-delimited token (strings.Fields) against the verb set + require >=1 path token. Added TestLoadFlatVerbGate (all 4 verbs accepted in sequence; tab-separated set accepted; annotate/copy/insert/rename + garbage rejected on BOTH LoadSet and LoadMerge-flat). RED-on-revert reconfirmed against true origin/master source (garbage + interactive verbs + TestLoadSet all fail) AND the tab assertion fails under the prior literal-space gate. go test ./pkg/configstore/... ./pkg/config/... ./pkg/api/... ./pkg/grpcapi/... ./pkg/cli/... green; gofmt clean.
   - **File(s)**: pkg/configstore/store_command.go, pkg/configstore/store_test.go, pkg/configstore/README.md, _Log.md
+
+## #3421 — REST session pagination/filtering/input-validation gRPC parity
+- **Timestamp**: 2026-06-29
+- **Action**: Brought REST session list pagination/filter/input-validation to gRPC parity. Rebased onto origin/master AFTER #3419 (REST session data parity) landed and FOLDED into #3419's machinery: added cursor pagination (page_size/page_token over a stable cursor via IterateSessionsFrom, next_page_token resume — fixes H4 offset-over-mutable-map skip/dup) reusing #3419's sessionQuery + sessionView + enriched sessionEntryV4/V6 + reverse-counter merge (shared enrichSessionV4/V6 so cursor==offset rows/counters); added source_prefix/destination_prefix/source_port/destination_port INTO #3419's sessionQuery+buildSessionQuery+matchV4/V6 with fail-closed validation (M2, one filter type not two); made limit/offset/page_size parse strict → HTTP 400 (M8); REST clear-all rejects any RawQuery/body with HTTP 400 (H6 — filtered clear + HA peer propagation deferred to sibling #3423). SMR MINOR folded: clear guard tests r.URL.RawQuery (not url.Query(), which drops un-decodable pairs). RED-on-revert verified for H6 + M8; cursor==offset parity asserted.
+- **File(s)**: pkg/api/sessions.go, pkg/api/types.go, pkg/api/README.md, pkg/api/sessions_pagination_test.go
+- **Timestamp**: 2026-06-29T13:30Z
+- **Action**: #3421 Codex MAJOR fold (test-coverage hardening, PR #3533). The
+  H6 clear-sessions guard correctly tests `r.URL.RawQuery != "" || r.ContentLength != 0`
+  (NOT `len(r.URL.Query()) > 0`, which silently swallows the parse error on an
+  un-decodable query and yields an empty map → bypass to clear-all). But
+  TestRESTClearRejectsFilters only exercised `?zone=trust` — a future regression
+  from RawQuery back to url.Query() would still pass while re-opening unsafe
+  full-table clear-all on a `?%zz` request. Added two sub-tests: (a) malformed
+  `?%zz` (set req.URL.RawQuery verbatim; asserts url.Query() parses to len-0 as a
+  precondition, then asserts 400 + ClearAllSessions NOT called) and (b)
+  empty-value `?zone=` (len-1 under url.Query(); confirms RawQuery!="" still
+  rejects and does not under-reject). RED-on-revert: flipping the guard to
+  `len(r.URL.Query()) > 0` makes the malformed `%zz` sub-case FAIL (status 200 +
+  clear-all) — the true RawQuery differentiator; the empty-value sub-case stays
+  green under both guards (url.Query() len==1, as its own case-(b) contract
+  states), so it is a no-under-rejection assertion, not a revert differentiator.
+  Guard restored. go test ./pkg/api/ green (incl #3419 TestRESTSessionParityWithGRPC);
+  gofmt clean. No code or doc change beyond the test.
+- **File(s)**: pkg/api/sessions_pagination_test.go, _Log.md
+
 - **Timestamp**: 2026-06-29T12:00Z
   - **Action**: #3447 strict-parse the CLI `rollback <arg>`. A malformed
     argument (`rollback foo`, `rollback 1x`, `rollback -1`) silently fell
