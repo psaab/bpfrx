@@ -528,6 +528,10 @@ pub(in crate::afxdp) struct BatchCounters {
     ptb_output_filter_drops: u64,
     generated_reply_classify_parse_errors: u64,
     policy_denied_packets: u64,
+    // #3326: host-inbound admission denies on the LocalDelivery path. Bumped
+    // in the two `host_inbound_gated_lo0_action == None` branches in
+    // poll_descriptor and flushed into BindingLiveState below.
+    host_inbound_denied_packets: u64,
     route_miss_packets: u64,
     neighbor_miss_packets: u64,
     discard_route_packets: u64,
@@ -700,6 +704,11 @@ impl BatchCounters {
             live.policy_denied_packets
                 .fetch_add(self.policy_denied_packets, Ordering::Relaxed);
             self.policy_denied_packets = 0;
+        }
+        if self.host_inbound_denied_packets != 0 {
+            live.host_inbound_denied_packets
+                .fetch_add(self.host_inbound_denied_packets, Ordering::Relaxed);
+            self.host_inbound_denied_packets = 0;
         }
         if self.route_miss_packets != 0 {
             live.route_miss_packets

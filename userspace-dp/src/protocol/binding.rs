@@ -411,6 +411,10 @@ pub(crate) struct BindingStatus {
     pub session_delta_drained: u64,
     #[serde(rename = "policy_denied_packets", default)]
     pub policy_denied_packets: u64,
+    // #3326: host-inbound admission denies on the LocalDelivery path. Mirrored
+    // into the Go GlobalCtrHostInboundDeny counter (REST/Prometheus/show).
+    #[serde(rename = "host_inbound_denied_packets", default)]
+    pub host_inbound_denied_packets: u64,
     #[serde(rename = "screen_drops", default)]
     pub screen_drops: u64,
     #[serde(rename = "syn_cookie_challenges", default)]

@@ -4803,7 +4803,23 @@ func TestValidateConfig_ArchiveSitesPasswordWarns(t *testing.T) {
 }
 
 func TestLo0FilterExtraction(t *testing.T) {
-	input := `interfaces {
+	input := `firewall {
+    family inet {
+        filter filter-management {
+            term t1 {
+                then accept;
+            }
+        }
+    }
+    family inet6 {
+        filter filter-management6 {
+            term t1 {
+                then accept;
+            }
+        }
+    }
+}
+interfaces {
     lo0 {
         unit 0 {
             family inet {
@@ -4837,7 +4853,12 @@ func TestLo0FilterExtraction(t *testing.T) {
 }
 
 func TestLo0FilterExtractionSet(t *testing.T) {
-	lines := []string{"set interfaces lo0 unit 0 family inet filter input mgmt-v4", "set interfaces lo0 unit 0 family inet6 filter input mgmt-v6"}
+	lines := []string{
+		"set firewall family inet filter mgmt-v4 term t1 then accept",
+		"set firewall family inet6 filter mgmt-v6 term t1 then accept",
+		"set interfaces lo0 unit 0 family inet filter input mgmt-v4",
+		"set interfaces lo0 unit 0 family inet6 filter input mgmt-v6",
+	}
 	tree := &ConfigTree{}
 	for _, line := range lines {
 		cmd, err := ParseSetCommand(line)

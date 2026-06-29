@@ -8584,6 +8584,100 @@ fn poll_descriptor_no_junos_host_policy_local_delivery_unchanged_session_miss() 
     assert!(rx.try_recv().is_err());
 }
 
+/// #3326 LITERAL fail-on-revert (session-MISS): a host-bound packet denied by
+/// the zone host-inbound admission gate must increment the
+/// `host_inbound_denied_packets` batch counter (which `syncBPFCountersLocked`
+/// mirrors into `GlobalCtrHostInboundDeny` for REST/Prometheus/`show`). Remove
+/// the `telemetry.counters.host_inbound_denied_packets += 1` bump in the
+/// session-MISS host-inbound `None` arm and this test goes RED (the deny would
+/// drop uncounted — the original bug). The admit-all companion below stays
+/// GREEN, proving the bump fires ONLY on a real host-inbound deny.
+#[test]
+fn poll_descriptor_host_inbound_deny_counts_local_delivery_session_miss() {
+    // gre_to_self_snapshot is default-permit with 10.255.0.1 firewall-local =>
+    // LocalDelivery; add a present-but-empty host-inbound set on every zone so
+    // the TCP/179 host-bound packet is denied (Junos deny-all posture).
+    let mut forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let zone_ids: Vec<u16> = forwarding.zone_id_to_name.keys().copied().collect();
+    assert!(!zone_ids.is_empty(), "fixture must define at least one zone");
+    for id in zone_ids {
+        forwarding
+            .zone_host_inbound
+            .insert(id, crate::afxdp::types::ZoneHostInbound::default());
+    }
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(10, 255, 0, 1),
+        12345,
+        179,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+
+    let (batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert_eq!(dbg.local, 1, "packet must take the LocalDelivery arm");
+    assert_eq!(
+        batch.host_inbound_denied_packets, 1,
+        "a host-inbound-denied host-bound packet must bump the host-inbound \
+         deny counter (#3326 — was silently dropped uncounted)"
+    );
+    assert_eq!(
+        sessions.len(),
+        0,
+        "no host-local session may be cached for a host-inbound-denied flow"
+    );
+}
+
+/// #3326 GREEN companion: with NO host-inbound restriction (admit-all default),
+/// the same host-bound packet is admitted and the host-inbound deny counter
+/// stays 0. Proves the #3326 bump cannot newly over-count admitted host/
+/// management traffic.
+#[test]
+fn poll_descriptor_host_inbound_admit_does_not_count_deny_session_miss() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(10, 255, 0, 1),
+        12345,
+        179,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+
+    let (batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert_eq!(dbg.local, 1, "packet must take the LocalDelivery arm");
+    assert_eq!(
+        batch.host_inbound_denied_packets, 0,
+        "admit-all host-inbound must NOT bump the host-inbound deny counter"
+    );
+}
+
 /// #3019 LITERAL fail-on-revert (session-HIT): a tightened `to-zone junos-host
 /// then deny` tears down an ALREADY ESTABLISHED host-bound session on the next
 /// hit (mirroring the #3070 host-inbound re-check) and emits the policy-deny

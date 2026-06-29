@@ -87,6 +87,7 @@
     "flow_cache_misses": 0,
     "forward_candidate_packets": 0,
     "generated_reply_classify_parse_errors": 0,
+    "host_inbound_denied_packets": 0,
     "ifindex": 0,
     "in_place_l2_memmove_fallback_packets": 0,
     "in_place_tx_packets": 0,
