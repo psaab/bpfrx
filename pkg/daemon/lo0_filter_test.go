@@ -266,7 +266,7 @@ func TestNftRuleFromTermPrefixListExpansion(t *testing.T) {
 
 	rule := nftRuleFromTerm(term, "ip", prefixLists)
 	// Should contain expanded CIDRs in nft set syntax
-	want := "ip saddr { 10.0.1.0/24, 10.0.2.0/24, 192.168.1.0/24 } meta l4proto tcp th dport 22 accept"
+	want := "ip saddr { 10.0.1.0/24, 10.0.2.0/24, 192.168.1.0/24 } meta l4proto 6 th dport 22 accept"
 	if rule != want {
 		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
 	}
@@ -291,7 +291,7 @@ func TestNftRuleFromTermPrefixListExcept(t *testing.T) {
 	}
 
 	rule := nftRuleFromTerm(term, "ip", prefixLists)
-	want := "ip saddr != { 10.0.1.0/24, 10.0.2.0/24 } meta l4proto tcp th dport 22 reject"
+	want := "ip saddr != { 10.0.1.0/24, 10.0.2.0/24 } meta l4proto 6 th dport 22 reject"
 	if rule != want {
 		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
 	}
@@ -337,7 +337,7 @@ func TestNftRuleFromTermMultiplePorts(t *testing.T) {
 	}
 
 	rule := nftRuleFromTerm(term, "ip", prefixLists)
-	want := "meta l4proto tcp th dport { 80, 443 } accept"
+	want := "meta l4proto 6 th dport { 80, 443 } accept"
 	if rule != want {
 		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
 	}
@@ -441,7 +441,7 @@ func TestNftRuleFromTermAddressSemantics3433(t *testing.T) {
 				DestinationPorts:  []string{"22"}, Action: "discard",
 			},
 			fam:  "ip",
-			want: "meta l4proto tcp th dport 22 drop",
+			want: "meta l4proto 6 th dport 22 drop",
 		},
 		{
 			// H04: a lenient/peer-sync UNRESOLVED positive prefix-list resolves to
@@ -552,7 +552,7 @@ func TestNftRuleFromTermICMPCodeOnly(t *testing.T) {
 		Action:    "discard",
 	}
 	ruleV4 := nftRuleFromTerm(v4, "ip", prefixLists)
-	wantV4 := "meta l4proto icmp icmp code 4 drop"
+	wantV4 := "meta l4proto 1 icmp code 4 drop"
 	if ruleV4 != wantV4 {
 		t.Errorf("v4 code-only:\n  got:  %s\n  want: %s", ruleV4, wantV4)
 	}
@@ -568,7 +568,7 @@ func TestNftRuleFromTermICMPCodeOnly(t *testing.T) {
 		Action:    "discard",
 	}
 	ruleV6 := nftRuleFromTerm(v6, "ip6", prefixLists)
-	wantV6 := "meta l4proto icmpv6 icmpv6 code 1 drop"
+	wantV6 := "meta l4proto 58 icmpv6 code 1 drop"
 	if ruleV6 != wantV6 {
 		t.Errorf("v6 code-only:\n  got:  %s\n  want: %s", ruleV6, wantV6)
 	}
@@ -598,16 +598,110 @@ func TestNftRuleFromTermDSCP(t *testing.T) {
 		Action: "accept",
 	}
 	rule := nftRuleFromTerm(term, "ip", prefixLists)
-	want := "ip dscp ef accept"
+	// #3436: the DSCP name resolves to its numeric value (ef == 46). nft's DSCP
+	// names are lowercase only and do not cover every xpf code point (e.g. `be`),
+	// so emitting the numeric value is unconditionally nft-safe.
+	want := "ip dscp 46 accept"
 	if rule != want {
 		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
 	}
 
 	// IPv6 traffic-class
 	rule6 := nftRuleFromTerm(term, "ip6", prefixLists)
-	want6 := "ip6 dscp ef accept"
+	want6 := "ip6 dscp 46 accept"
 	if rule6 != want6 {
 		t.Errorf("got:\n  %s\nwant:\n  %s", rule6, want6)
+	}
+}
+
+// TestNftRuleFromTermProtocolAliases is the #3436 H08 proof: a firewall-filter
+// `from protocol` token that is a Junos predefined-protocol alias (junos-gre,
+// junos-tcp-any, junos-icmp-all, ipip, ...) — accepted by the commit gate
+// filterProtocolResolvable and the userspace matcher — must lower to its NUMERIC
+// nft l4proto token, never the raw alias. nft does not share the Junos alias
+// table, so `meta l4proto junos-gre` is a parse error that rejects the whole
+// atomic lo0 table (commit broken) or, on the lenient path, mirrors a different
+// protocol than userspace. RED-on-revert: the pre-fix raw pass-through emits the
+// alias verbatim.
+func TestNftRuleFromTermProtocolAliases(t *testing.T) {
+	prefixLists := map[string]*config.PrefixList{}
+	cases := []struct {
+		name  string
+		proto string
+		want  string // l4proto fragment
+	}{
+		{"junos-gre", "junos-gre", "meta l4proto 47"},
+		{"junos-tcp-any", "junos-tcp-any", "meta l4proto 6"},
+		{"junos-icmp-all", "junos-icmp-all", "meta l4proto 1"},
+		{"ipip", "ipip", "meta l4proto 4"},
+		{"junos-ip-in-ip", "junos-ip-in-ip", "meta l4proto 4"},
+		{"numeric", "47", "meta l4proto 47"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			term := &config.FirewallFilterTerm{
+				Name: "p", Protocols: []string{c.proto}, Action: "accept",
+			}
+			want := c.want + " accept"
+			if rule := nftRuleFromTerm(term, "ip", prefixLists); rule != want {
+				t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
+			}
+		})
+	}
+}
+
+// TestNftRuleFromTermProtocolMultiAliasSet is the #3436 H08 multi-value proof: a
+// `from protocol [ junos-gre tcp 50 ]` set must lower to a numeric nft set
+// (`meta l4proto { 47, 6, 50 }`), preserving order and resolving every alias —
+// not a set containing the raw alias token that fails the atomic load.
+func TestNftRuleFromTermProtocolMultiAliasSet(t *testing.T) {
+	prefixLists := map[string]*config.PrefixList{}
+	term := &config.FirewallFilterTerm{
+		Name: "p", Protocols: []string{"junos-gre", "tcp", "50"}, Action: "accept",
+	}
+	want := "meta l4proto { 47, 6, 50 } accept"
+	if rule := nftRuleFromTerm(term, "ip", prefixLists); rule != want {
+		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
+	}
+}
+
+// TestNftRuleFromTermDSCPNamesAndCase is the #3436 M01 proof: a DSCP name is
+// resolved through dataplane.DSCPValues to its numeric value regardless of case
+// (`EF` accepted case-insensitively by the commit gate), `be` (no nft name)
+// resolves to 0, and a numeric token passes through. The pre-fix pass-through
+// emitted `ip dscp EF` / `ip dscp be`, both nft parse errors that reject the
+// whole atomic lo0 table.
+func TestNftRuleFromTermDSCPNamesAndCase(t *testing.T) {
+	prefixLists := map[string]*config.PrefixList{}
+	cases := []struct {
+		name string
+		dscp string
+		want string // dscp fragment
+	}{
+		{"upper-EF", "EF", "ip dscp 46"},
+		{"mixed-Af11", "Af11", "ip dscp 10"},
+		{"be", "be", "ip dscp 0"},
+		{"numeric", "34", "ip dscp 34"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			term := &config.FirewallFilterTerm{
+				Name: "d", DSCPs: []string{c.dscp}, Action: "accept",
+			}
+			want := c.want + " accept"
+			if rule := nftRuleFromTerm(term, "ip", prefixLists); rule != want {
+				t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
+			}
+		})
+	}
+
+	// Multi-value DSCP set with a mixed-case name and a numeric token.
+	multi := &config.FirewallFilterTerm{
+		Name: "d", DSCPs: []string{"EF", "af21", "0"}, Action: "accept",
+	}
+	want := "ip dscp { 46, 18, 0 } accept"
+	if rule := nftRuleFromTerm(multi, "ip", prefixLists); rule != want {
+		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
 	}
 }
 
@@ -629,21 +723,21 @@ func TestNftRuleFromTermTCPFlags(t *testing.T) {
 			// Single required flag — no parentheses needed on either side.
 			name:  "syn-only",
 			flags: []string{"syn"},
-			want:  "meta l4proto tcp tcp flags & syn == syn drop",
+			want:  "meta l4proto 6 tcp flags & syn == syn drop",
 		},
 		{
 			// Plain list is the Junos AND-conjunction (both required), NOT a
 			// disjunctive comma set. mask == required == syn|ack.
 			name:  "syn-ack-list",
 			flags: []string{"syn", "ack"},
-			want:  "meta l4proto tcp tcp flags & (syn | ack) == (syn | ack) drop",
+			want:  "meta l4proto 6 tcp flags & (syn | ack) == (syn | ack) drop",
 		},
 		{
 			// Negated form: SYN required, ACK forbidden. The mentioned mask is
 			// syn|ack; the required side is just syn (ACK must be clear).
 			name:  "syn-not-ack",
 			flags: []string{"syn", "&", "!ack"},
-			want:  "meta l4proto tcp tcp flags & (syn | ack) == syn drop",
+			want:  "meta l4proto 6 tcp flags & (syn | ack) == syn drop",
 		},
 	}
 	for _, c := range cases {
@@ -681,7 +775,7 @@ func TestNftRuleFromTermPortExcept(t *testing.T) {
 		Action:          "accept",
 	}
 	rule := nftRuleFromTerm(term, "ip", prefixLists)
-	want := "meta l4proto tcp th dport != 22 accept"
+	want := "meta l4proto 6 th dport != 22 accept"
 	if rule != want {
 		t.Errorf("dest-port-except single:\n got:  %s\n want: %s", rule, want)
 	}
@@ -694,7 +788,7 @@ func TestNftRuleFromTermPortExcept(t *testing.T) {
 		Action:          "accept",
 	}
 	rule2 := nftRuleFromTerm(term2, "ip", prefixLists)
-	want2 := "meta l4proto tcp th dport != { 80, 443 } accept"
+	want2 := "meta l4proto 6 th dport != { 80, 443 } accept"
 	if rule2 != want2 {
 		t.Errorf("dest-port-except multi:\n got:  %s\n want: %s", rule2, want2)
 	}
@@ -707,7 +801,7 @@ func TestNftRuleFromTermPortExcept(t *testing.T) {
 		Action:            "discard",
 	}
 	rule3 := nftRuleFromTerm(term3, "ip", prefixLists)
-	want3 := "meta l4proto udp th sport != 123 drop"
+	want3 := "meta l4proto 17 th sport != 123 drop"
 	if rule3 != want3 {
 		t.Errorf("source-port-except:\n got:  %s\n want: %s", rule3, want3)
 	}
@@ -840,7 +934,7 @@ func TestNftRuleFromTermRoutingInstanceTerminatesAccept(t *testing.T) {
 // TestLo0PayloadFallThroughDoesNotShadowDiscard is the end-to-end #3427 proof:
 // a fall-through term followed by a discard term must leave the discard
 // REACHABLE in the rendered nft payload. Before the fix term1 rendered
-// `meta l4proto tcp accept`, which (atomic, first-match-wins chain) made the
+// `meta l4proto 6 accept`, which (atomic, first-match-wins chain) made the
 // later `tcp dport 22 drop` unreachable — SSH was silently permitted in the
 // kernel lo0 mirror. The fix drops term1's rule entirely so the discard stands.
 func TestLo0PayloadFallThroughDoesNotShadowDiscard(t *testing.T) {
@@ -857,7 +951,7 @@ func TestLo0PayloadFallThroughDoesNotShadowDiscard(t *testing.T) {
 
 	payload := buildLo0FilterPayload(cfg, "lo0-in", "")
 
-	if strings.Contains(payload, "meta l4proto tcp accept") {
+	if strings.Contains(payload, "meta l4proto 6 accept") {
 		t.Errorf("fall-through term emitted a shadowing accept in the lo0 payload (#3427 fail-open):\n%s", payload)
 	}
 	if !strings.Contains(payload, "th dport 22 drop") {
@@ -873,7 +967,7 @@ func TestLo0PayloadFallThroughDoesNotShadowDiscard(t *testing.T) {
 // terminating `accept` for the steer term — NOT skip it. A skip lets the later
 // `then discard` match and OVER-DROP legitimate host traffic on the
 // kernel-primary lo0 chain. RED-on-revert: with the skip disposition the steer
-// rule is absent and `meta l4proto tcp drop` is the only verdict.
+// rule is absent and `meta l4proto 6 drop` is the only verdict.
 func TestLo0PayloadRoutingInstanceTerminatesAcceptNoOverDrop(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
@@ -891,11 +985,11 @@ func TestLo0PayloadRoutingInstanceTerminatesAcceptNoOverDrop(t *testing.T) {
 	// The steer term must terminate as accept BEFORE the deny term, so the
 	// accept appears in the payload and (first-match-wins) shields tcp traffic
 	// from the drop. The over-drop bug would leave only the drop rule.
-	if !strings.Contains(payload, "meta l4proto tcp accept") {
+	if !strings.Contains(payload, "meta l4proto 6 accept") {
 		t.Errorf("routing-instance term did not emit a terminating accept (#3427 over-drop): the later discard would over-drop host traffic:\n%s", payload)
 	}
-	acceptIdx := strings.Index(payload, "meta l4proto tcp accept")
-	dropIdx := strings.Index(payload, "meta l4proto tcp drop")
+	acceptIdx := strings.Index(payload, "meta l4proto 6 accept")
+	dropIdx := strings.Index(payload, "meta l4proto 6 drop")
 	if acceptIdx == -1 || (dropIdx != -1 && dropIdx < acceptIdx) {
 		t.Errorf("routing-instance accept must precede the deny term (first-match-wins) so legit traffic is not over-dropped:\n%s", payload)
 	}
