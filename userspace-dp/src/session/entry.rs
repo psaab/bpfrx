@@ -83,10 +83,14 @@ pub(crate) struct SessionMetadata {
     /// uses it to increment the admitting policy's packet/byte counters on
     /// EVERY packet, so `show security policies hit-count` reflects the traffic
     /// the rule actually carries instead of only the first frame of each flow
-    /// (the pre-#3073 cold-path-only count). `0` means "no per-rule counter":
-    /// the implicit default-policy and every non-policy-forwarded session
-    /// (firewall-local / neighbor-seed / fabric / tunnel), which the fast path
-    /// then leaves uncounted. The cold path still counts the first packet once
+    /// (the pre-#3073 cold-path-only count). `0` is reserved for "no counter":
+    /// every non-policy-forwarded session (firewall-local / neighbor-seed /
+    /// fabric / tunnel), which the fast path then leaves uncounted. The
+    /// implicit default-policy is NOT `0`: #3363 stamps the reserved
+    /// `DEFAULT_POLICY_COUNTER_IDX` (`u32::MAX`) sentinel, which
+    /// `hit_counter_by_idx` resolves to `PolicyState::default_counter`, so a
+    /// default-PERMIT session re-counts every packet on the fast path. The
+    /// cold path still counts the first packet once
     /// in `try_match_rule`, so each packet is counted exactly once. Like
     /// `policy_id` (#3056), this rides the shared-session map and sibling-worker
     /// replicas; #3301 also carries it across the cross-node HA session-sync

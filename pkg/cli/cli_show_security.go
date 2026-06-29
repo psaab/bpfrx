@@ -131,6 +131,32 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			index++
 		}
 	}
+	// #3363: the IMPLICIT default-policy is the catch-all every flow matching
+	// no configured rule rides. It now has a reserved hit counter (read via the
+	// DefaultPolicySentinelID handle), surfaced here as a final row separated
+	// from the configured-rule totals so an operator can answer "how many
+	// packets are hitting the default deny?". Shown only in the unfiltered view
+	// (it spans every zone pair, like the globals). Gated on policy-stats like
+	// every other row so all surfaces report the same value.
+	if fromZone == "" && toZone == "" {
+		defAction := "Permit"
+		switch cfg.Security.DefaultPolicy {
+		case config.PolicyDeny:
+			defAction = "Deny"
+		case config.PolicyReject:
+			defAction = "Reject"
+		}
+		var defCount uint64
+		if statsEnabled {
+			if counters, err := c.dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err == nil {
+				defCount = counters.Packets
+			} else if readErr == nil {
+				readErr = err
+			}
+		}
+		fmt.Printf("%-8s%-17s%-18s%-24s%-14d%s\n",
+			"-", "-", "-", dataplane.DefaultPolicyName, defCount, defAction)
+	}
 	if readErr != nil {
 		fmt.Printf("warning: policy counter read failed (counts may be incomplete): %v\n", readErr)
 	}

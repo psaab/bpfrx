@@ -234,6 +234,21 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 		ch <- prometheus.MustNewConstMetric(c.policyHitsTotal, prometheus.CounterValue,
 			float64(ctrs.Packets), fromZone, toZone, rule.Name)
 	}
+
+	// #3363: emit the IMPLICIT default-policy hit counter (read via the
+	// reserved DefaultPolicySentinelID handle) as its own time series, labeled
+	// from_zone="-"/to_zone="-"/policy=dataplane.DefaultPolicyName so an
+	// operator can alert on default-deny rate — the security-critical catch-all
+	// that was previously uncounted. Gated on policy-stats like the per-rule
+	// metrics above so all surfaces agree.
+	if statsEnabled {
+		if ctrs, err := dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err != nil {
+			c.counterReadErrors.Add(1)
+		} else {
+			ch <- prometheus.MustNewConstMetric(c.policyHitsTotal, prometheus.CounterValue,
+				float64(ctrs.Packets), "-", "-", dataplane.DefaultPolicyName)
+		}
+	}
 }
 
 func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
