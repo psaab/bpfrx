@@ -577,6 +577,9 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	if d.routing != nil {
 		var bondIfaces []*config.InterfaceConfig
 		for _, ifc := range cfg.Interfaces.Interfaces {
+			if ifc == nil {
+				continue
+			}
 			if len(ifc.FabricMembers) > 0 {
 				bondIfaces = append(bondIfaces, ifc)
 			}
@@ -612,7 +615,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	var deferredOverlays []deferredIPVLAN
 	bindingCtrl, isUserspaceDP := d.dp.(userspaceXSKBindingController)
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
-		if ifCfg.LocalFabricMember == "" || !strings.HasPrefix(ifName, "fab") {
+		if ifCfg == nil || ifCfg.LocalFabricMember == "" || !strings.HasPrefix(ifName, "fab") {
 			continue
 		}
 		parentLinux := config.LinuxIfName(ifCfg.LocalFabricMember)
@@ -704,7 +707,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		cc := cfg.Chassis.Cluster
 		for rethName, physName := range cfg.RethToPhysical() {
 			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
-			if !ok || rethCfg.RedundancyGroup <= 0 {
+			if !ok || rethCfg == nil || rethCfg.RedundancyGroup <= 0 {
 				continue
 			}
 			linuxName := config.LinuxIfName(physName)
@@ -871,7 +874,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 
 		for rethName, physName := range rethToPhys {
 			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
-			if !ok || rethCfg.RedundancyGroup <= 0 {
+			if !ok || rethCfg == nil || rethCfg.RedundancyGroup <= 0 {
 				continue
 			}
 			linuxName := config.LinuxIfName(physName)

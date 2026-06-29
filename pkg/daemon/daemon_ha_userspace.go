@@ -447,7 +447,9 @@ func buildZoneRGMap(cfg *config.Config, zoneIDs map[string]uint16) map[uint16]in
 			if idx := strings.IndexByte(ifName, '.'); idx >= 0 {
 				baseName = ifName[:idx]
 			}
-			if ifc, ok := cfg.Interfaces.Interfaces[baseName]; ok && ifc.RedundancyGroup > 0 {
+			// comma-ok checks key-presence, not value-non-nil; a
+			// (nil, true) map entry would panic on ifc.RedundancyGroup.
+			if ifc, ok := cfg.Interfaces.Interfaces[baseName]; ok && ifc != nil && ifc.RedundancyGroup > 0 {
 				if rgSeen >= 0 && rgSeen != ifc.RedundancyGroup {
 					slog.Warn("zone spans multiple redundancy groups; "+
 						"active/active session sync ownership is ambiguous",
@@ -470,6 +472,9 @@ func rgHasRETH(cfg *config.Config, rgID int) bool {
 		return false
 	}
 	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
 		if ifc.RedundancyGroup == rgID {
 			return true
 		}

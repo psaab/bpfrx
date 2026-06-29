@@ -109,6 +109,46 @@ func TestBuildSamplingZones(t *testing.T) {
 	}
 }
 
+// TestBuildSamplingZonesSkipsNilZone is the fail-on-revert guard for the
+// #3492 apply-path nil-zone crash class: a nil zone value (reachable on the
+// tolerant/programmatic/HA-peer-sync config path) must be skipped, not
+// dereferenced. Reverting the `if zone == nil` guard in BuildSamplingZones
+// makes this test panic.
+func TestBuildSamplingZonesSkipsNilZone(t *testing.T) {
+	cfg := &config.Config{
+		Security: config.SecurityConfig{
+			Zones: map[string]*config.ZoneConfig{
+				"trust": {Interfaces: []string{"eth0.0"}},
+			},
+		},
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"eth0": {Units: map[int]*config.InterfaceUnit{
+					0: {SamplingInput: true},
+				}},
+			},
+		},
+	}
+	// Inject a nil zone slot and a nil interface value post-construction,
+	// mirroring the reachable nil-slot invariant.
+	cfg.Security.Zones["bogus"] = nil
+	cfg.Interfaces.Interfaces["nilif"] = nil
+
+	zoneIDs := map[string]uint16{"trust": 2, "bogus": 9}
+
+	// Must not panic on the nil "bogus" zone or nil interface value.
+	sz := BuildSamplingZones(cfg, zoneIDs)
+
+	// The healthy zone is still mapped.
+	if d, ok := sz[2]; !ok || !d.Input {
+		t.Errorf("trust zone (id=2): want Input=true, got %+v (ok=%v)", sz[2], ok)
+	}
+	// The nil zone contributes nothing.
+	if _, ok := sz[9]; ok {
+		t.Errorf("nil zone (id=9) should not be in sampling map, got %+v", sz[9])
+	}
+}
+
 func TestShouldExport(t *testing.T) {
 	ec := &ExportConfig{
 		SamplingZones: map[uint16]SamplingDir{

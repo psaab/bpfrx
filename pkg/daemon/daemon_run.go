@@ -1900,6 +1900,9 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]
 	sort.Strings(ifNames)
 	for _, ifName := range ifNames {
 		ifc := cfg.Interfaces.Interfaces[ifName]
+		if ifc == nil {
+			continue
+		}
 		base := config.LinuxIfName(ifName)
 		unitNums := make([]int, 0, len(ifc.Units))
 		for unitNum := range ifc.Units {

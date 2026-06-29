@@ -124,7 +124,7 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 func resolveRASourceLinkLocal(cfg *config.Config, raInterface string) (*config.InterfaceConfig, string) {
 	base, unitTok, hasUnit := strings.Cut(raInterface, ".")
 	ifc, ok := cfg.Interfaces.Interfaces[base]
-	if !ok {
+	if !ok || ifc == nil {
 		return nil, ""
 	}
 	if hasUnit && unitTok != "" {
