@@ -98,6 +98,78 @@ func TestDNATRuleSetToScopeLenientWarns(t *testing.T) {
 	}
 }
 
+// TestDNATRuleSetToScopeRejectedAcrossDuplicateSecurityBlocks proves the gate
+// inspects EVERY top-level `security` node, not just the first match. The
+// hierarchical parser (parseStatements) APPENDS a repeated top-level block
+// instead of merging it, and the compiler processes every `security` root, so
+// a config with two `security {}` blocks where only the SECOND carries the
+// DNAT `to` would bypass a first-match-only walk and silently drop+compile the
+// `to` (the original #3444 bug). This is reachable via LoadOverride, which
+// parses hierarchical input directly through NewParser
+// (configstore/store_command.go). NewParser is the CORRECT builder here — this
+// tests the hierarchical / LoadOverride path, not flat-set. Reverting the gate
+// to first-`security`-only makes strict CompileConfig compile this clean,
+// turning the assertion RED.
+func TestDNATRuleSetToScopeRejectedAcrossDuplicateSecurityBlocks(t *testing.T) {
+	cfgText := `
+security {
+    zones {
+        security-zone untrust {
+            interfaces {
+                ge-0/0/0.0;
+            }
+        }
+    }
+}
+security {
+    nat {
+        destination {
+            pool P1 {
+                address 10.0.30.100;
+            }
+            rule-set RD {
+                from zone untrust;
+                to zone trust;
+                rule R1 {
+                    match {
+                        destination-address 198.51.100.5/32;
+                    }
+                    then {
+                        destination-nat pool P1;
+                    }
+                }
+            }
+        }
+    }
+}
+`
+	p := NewParser(cfgText)
+	tree, perrs := p.Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("Parse: %v", perrs)
+	}
+	// Sanity: the parser must have produced TWO top-level `security` nodes
+	// (the bypass premise). If a future parser merges them, the bypass is
+	// gone and this guard documents why.
+	var secCount int
+	for _, n := range tree.Children {
+		if n.Name() == "security" {
+			secCount++
+		}
+	}
+	if secCount < 2 {
+		t.Fatalf("expected 2 top-level security blocks (the bypass premise), got %d", secCount)
+	}
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatalf("CompileConfig accepted a DNAT `to` scope in the SECOND of two security blocks; want a strict reject (#3444 bypass)")
+	}
+	if !strings.Contains(err.Error(), "RD") || !strings.Contains(err.Error(), "#3444") {
+		t.Fatalf("reject error %q does not name the rule-set (RD) and #3444", err.Error())
+	}
+}
+
 // TestDNATRuleSetFromOnlyStillCommits proves the no-regression case: a DNAT
 // rule-set with only a `from` clause (the legitimate Junos shape) commits
 // cleanly with no #3444 warning and the `from` scope survives.

@@ -51,25 +51,6 @@ import "fmt"
 // wantTo=false), so leaving it in the cloned tree is harmless and the warning
 // is the operator signal.
 func validateDNATRuleSetToScopeAST(nodes []*Node, lenient bool) ([]string, error) {
-	var security *Node
-	for _, n := range nodes {
-		if n.Name() == "security" {
-			security = n
-			break
-		}
-	}
-	if security == nil {
-		return nil, nil
-	}
-	natNode := security.FindChild("nat")
-	if natNode == nil {
-		return nil, nil
-	}
-	dstNode := natNode.FindChild("destination")
-	if dstNode == nil {
-		return nil, nil
-	}
-
 	var warnings []string
 	emit := func(format string, args ...any) error {
 		msg := fmt.Sprintf(format, args...)
@@ -80,18 +61,40 @@ func validateDNATRuleSetToScopeAST(nodes []*Node, lenient bool) ([]string, error
 		return nil
 	}
 
-	for _, rs := range namedInstances(dstNode.FindChildren("rule-set")) {
-		if rs.node.FindChild("to") == nil {
+	// Iterate EVERY top-level `security` node, not just the first match.
+	// parseStatements APPENDS a repeated top-level block instead of merging
+	// it (parser.go) and compileExpanded processes every `security` root, so
+	// a config (e.g. a hierarchical LoadOverride input) with two `security {}`
+	// blocks where only the SECOND carries the DNAT `to` would bypass a
+	// first-match-only walk while the compiler still compiled the second
+	// block's rule-set with the `to` silently dropped (the original #3444
+	// bug). Mirror the compiler's root iteration so a DNAT `to` in ANY
+	// duplicate `security` block is caught.
+	for _, n := range nodes {
+		if n.Name() != "security" {
 			continue
 		}
-		if err := emit(
-			"security nat destination rule-set %q: a `to` scope is not "+
-				"supported on a destination-NAT rule-set (Junos DNAT has only "+
-				"a `from` clause — the destination is translated on inbound, so "+
-				"there is no egress context; the `to` scope was silently ignored "+
-				"and the translation applied regardless of it) — remove it (#3444)",
-			rs.name); err != nil {
-			return nil, err
+		natNode := n.FindChild("nat")
+		if natNode == nil {
+			continue
+		}
+		dstNode := natNode.FindChild("destination")
+		if dstNode == nil {
+			continue
+		}
+		for _, rs := range namedInstances(dstNode.FindChildren("rule-set")) {
+			if rs.node.FindChild("to") == nil {
+				continue
+			}
+			if err := emit(
+				"security nat destination rule-set %q: a `to` scope is not "+
+					"supported on a destination-NAT rule-set (Junos DNAT has only "+
+					"a `from` clause — the destination is translated on inbound, so "+
+					"there is no egress context; the `to` scope was silently ignored "+
+					"and the translation applied regardless of it) — remove it (#3444)",
+				rs.name); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return warnings, nil
