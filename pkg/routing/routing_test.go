@@ -927,10 +927,13 @@ func TestBuildPBRRules(t *testing.T) {
 		}
 	})
 
-	// H2: DSCP 0 (be / cs0 / numeric 0) is a real match — TOSSet must be true
-	// with TOS==0. Pre-fix TOS==0 was the "no DSCP" sentinel, so the term was
-	// skipped (no address) or widened to all DSCP (with address).
-	t.Run("H2 dscp zero representable", func(t *testing.T) {
+	// H2: DSCP 0 (be / cs0 / numeric 0) is NOT representable as an ip rule (the
+	// netlink layer writes the rtmsg tos only when non-zero and has no FRA_DSCP
+	// escape hatch, and a zero tos matches ANY DSCP). The fail-safe disposition
+	// is DROP + degraded build error, NOT a silently over-matching rule.
+	// Pre-fix the builder emitted a TOSSet/TOS=0 rule that reached the wire with
+	// no tos selector and matched all DSCP.
+	t.Run("H2 dscp zero dropped and degraded", func(t *testing.T) {
 		for _, d := range []string{"be", "cs0", "0"} {
 			filter := &config.FirewallFilter{
 				Name: "z",
@@ -938,13 +941,69 @@ func TestBuildPBRRules(t *testing.T) {
 					{Name: "t", DSCPs: []string{d}, RoutingInstance: "ATT"},
 				},
 			}
-			rules, _ := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
-			if len(rules) != 1 {
-				t.Fatalf("dscp %q: expected 1 rule, got %d", d, len(rules))
+			rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+			if len(rules) != 0 {
+				t.Errorf("dscp %q: expected 0 rules (dropped), got %d: %+v", d, len(rules), rules)
 			}
-			if rules[0].TOS != 0 || !rules[0].TOSSet {
-				t.Errorf("dscp %q: TOS=%d set=%v, want 0/true", d, rules[0].TOS, rules[0].TOSSet)
+			if err == nil {
+				t.Errorf("dscp %q: expected a degraded build error", d)
 			}
+		}
+	})
+
+	// H2: DSCP 0 combined with an address must NOT fall back to an address-only
+	// rule (that would over-match all DSCP from that source). Drop entirely.
+	t.Run("H2 dscp zero with address still dropped", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "zaddr",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", DSCPs: []string{"be"}, SourceAddresses: []string{"10.0.0.0/8"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if len(rules) != 0 {
+			t.Errorf("dscp-0 + address must emit 0 rules (no address-only over-match), got %d: %+v", len(rules), rules)
+		}
+		if err == nil {
+			t.Error("expected a degraded build error")
+		}
+	})
+
+	// H2: within a multi-value DSCP set only the DSCP-0 value is dropped; the
+	// representable values still emit exact rules (with the degraded error).
+	t.Run("H2 multi-value dscp drops only zero", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "zmulti",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", DSCPs: []string{"be", "ef"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if len(rules) != 1 {
+			t.Fatalf("expected 1 rule (ef kept, be dropped), got %d: %+v", len(rules), rules)
+		}
+		if rules[0].TOS != 184 || !rules[0].TOSSet {
+			t.Errorf("kept rule TOS=%d set=%v, want 184/true (ef)", rules[0].TOS, rules[0].TOSSet)
+		}
+		if err == nil {
+			t.Error("expected a degraded build error for the dropped be value")
+		}
+	})
+
+	// A representable nonzero DSCP reaches the wire: TOSSet true, TOS nonzero.
+	t.Run("H2 nonzero dscp emits tos selector", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "nz",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", DSCPs: []string{"ef"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(rules) != 1 || rules[0].TOS != 184 || !rules[0].TOSSet {
+			t.Fatalf("expected 1 rule TOS=184/set, got %+v", rules)
 		}
 	})
 
@@ -1024,6 +1083,25 @@ func TestBuildPBRRules(t *testing.T) {
 		rules, _ := BuildPBRRules(pbrTestConfig("inet", filter, instances, pls))
 		if len(rules) != 0 {
 			t.Errorf("empty positive prefix-list must emit 0 rules, got %d: %+v", len(rules), rules)
+		}
+	})
+
+	// M2: an empty `except` prefix-list means "match everything NOT in {}" =
+	// match ALL → one unconstrained rule (Src ""), no degraded error.
+	t.Run("M2 empty except matches all", func(t *testing.T) {
+		pls := map[string]*config.PrefixList{"none": {Name: "none"}}
+		filter := &config.FirewallFilter{
+			Name: "plea",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", DSCPs: []string{"ef"}, SourcePrefixLists: []config.PrefixListRef{{Name: "none", Except: true}}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, pls))
+		if err != nil {
+			t.Fatalf("empty except must not degrade, got err: %v", err)
+		}
+		if len(rules) != 1 || rules[0].Src != "" {
+			t.Fatalf("empty except must yield one unconstrained rule (Src \"\"), got %+v", rules)
 		}
 	})
 

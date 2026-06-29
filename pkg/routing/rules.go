@@ -387,6 +387,13 @@ func (p *pbrManager) Apply(rules []PBRRule) error {
 
 	prio := pbrRulePriority
 	for _, pbr := range rules {
+		// Cap at the priority window (defense-in-depth; BuildPBRRules already
+		// truncates). Checked at the top so exactly maxPBRRules rules install
+		// without a spurious overflow error (#3430 M3 apply leg).
+		if prio >= pbrRulePriority+maxPBRRules {
+			errs = append(errs, fmt.Errorf("PBR rule limit (%d) reached; remaining rules dropped", maxPBRRules))
+			break
+		}
 		rule := netlink.NewRule()
 		rule.Table = pbr.TableID
 		rule.Priority = prio
@@ -421,10 +428,6 @@ func (p *pbrManager) Apply(rules []PBRRule) error {
 			"instance", pbr.Instance, "tos", pbr.TOS, "tos_set", pbr.TOSSet,
 			"src", pbr.Src, "dst", pbr.Dst, "table", pbr.TableID)
 		prio++
-		if prio >= pbrRulePriority+maxPBRRules {
-			errs = append(errs, fmt.Errorf("PBR rule limit (%d) reached; remaining rules dropped", maxPBRRules))
-			break
-		}
 	}
 	// Desired rules are re-added; surface any clear/parse/add/overflow failure.
 	return errors.Join(errs...)
@@ -445,8 +448,12 @@ func (p *pbrManager) clear() error {
 		for _, r := range rules {
 			if r.Priority >= pbrRulePriority && r.Priority < pbrRulePriority+1000 {
 				if err := p.ops.RuleDel(&r); err != nil {
-					slog.Debug("failed to delete stale PBR rule",
-						"priority", r.Priority, "err", err)
+					// #3430 H3: a RuleDel failure leaves a STALE PBR rule in the
+					// kernel. Join it into the returned error so Apply does not
+					// report success after the up-front clear could not remove a
+					// stale (now-divergent) rule — the operator must see that the
+					// installed steering may still carry leftover rules.
+					errs = append(errs, fmt.Errorf("delete stale PBR rule prio %d: %w", r.Priority, err))
 				}
 			}
 		}
@@ -472,9 +479,10 @@ func (p *pbrManager) clear() error {
 // duplicate per attachment would be redundant.
 //
 // The returned error is non-nil when the build is DEGRADED: a term carries an
-// ip-rule-unrepresentable predicate (a non-empty address `except` set) or the
-// expansion exceeds maxPBRRules. The successfully-built rules are still
-// returned so the caller can install them and surface the degradation.
+// ip-rule-unrepresentable predicate (a non-empty address `except` set, or a
+// DSCP-0 match the netlink layer cannot express) or the expansion exceeds
+// maxPBRRules. The successfully-built rules are still returned so the caller
+// can install them and surface the degradation.
 func BuildPBRRules(cfg *config.Config) ([]PBRRule, error) {
 	if cfg == nil {
 		return nil, nil
@@ -582,20 +590,50 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 		// DSCP → TOS presence-tracked values (#2545 multi-value, #3430 H2).
 		// An ip rule carries a SINGLE tos, so a term with several `from dscp`
 		// values expands to one rule per DSCP (× the src/dst cross-product).
-		// Each value is marked present (set=true) so DSCP 0 (be/cs0/0) is a
-		// real match, not the "no DSCP" sentinel. A term with no DSCP yields a
-		// single unset entry so the address-only case still emits one rule.
+		//
+		// DSCP 0 (be / cs0 / numeric 0) is NOT representable as an ip rule: the
+		// netlink layer (vishvananda/netlink) writes the rtmsg tos field only
+		// when non-zero (ruleHandle, rule_linux.go) and exposes no FRA_DSCP
+		// escape hatch, and the kernel treats a zero tos in a fib rule as
+		// "match ANY tos". Emitting a TOS=0 rule would therefore OVER-MATCH
+		// every DSCP — the exact #3430 H2 bug. So a DSCP-0 match value is
+		// DROPPED with a degraded build error (fail-safe under-steer), mirroring
+		// the non-empty `except` handling in resolvePBRDirection. Within a
+		// multi-value set (e.g. `from dscp [ be ef ]`) only the DSCP-0 value is
+		// dropped; the representable values still emit exact rules.
 		type tosEntry struct {
 			tos uint8
 			set bool
 		}
 		var toses []tosEntry
+		hadDSCP := false
 		for _, d := range term.DSCPs {
-			if d != "" {
-				toses = append(toses, tosEntry{tos: dscpToTOS(d), set: true})
+			if d == "" {
+				continue
 			}
+			hadDSCP = true
+			tos := dscpToTOS(d)
+			if tos == 0 {
+				errs = append(errs, fmt.Errorf(
+					"PBR filter %s term %s matches DSCP 0 (%q), which an ip rule "+
+						"cannot represent (the netlink layer has no FRA_DSCP and a zero "+
+						"tos matches ANY DSCP); steering for this DSCP-0 match is dropped",
+					filter.Name, term.Name, d))
+				continue
+			}
+			toses = append(toses, tosEntry{tos: tos, set: true})
 		}
-		if len(toses) == 0 {
+		if hadDSCP {
+			if len(toses) == 0 {
+				// Every DSCP this term matched was DSCP-0 (all dropped above).
+				// Emitting an address-only sentinel rule here would over-match
+				// ALL DSCP, so skip the term entirely — the degraded error is
+				// already recorded.
+				continue
+			}
+		} else {
+			// No DSCP constraint: a single unset entry so the address-only case
+			// still emits one rule (no tos selector).
 			toses = []tosEntry{{tos: 0, set: false}}
 		}
 

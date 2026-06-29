@@ -32,6 +32,11 @@ type fakeRuleOps struct {
 	// used to exercise the #3430 H3 add-failure aggregation in pbrManager.Apply.
 	addErr error
 
+	// delErr, when non-nil, makes RuleDel fail without removing the rule —
+	// used to exercise the #3430 H3 clear-failure aggregation (a stale rule
+	// that cannot be deleted must surface as a non-nil Apply error).
+	delErr error
+
 	adds int
 	dels int
 }
@@ -53,6 +58,9 @@ func (f *fakeRuleOps) RuleAdd(r *netlink.Rule) error {
 }
 
 func (f *fakeRuleOps) RuleDel(r *netlink.Rule) error {
+	if f.delErr != nil {
+		return f.delErr
+	}
 	f.dels++
 	list := f.rules[r.Family]
 	out := list[:0:0]
@@ -490,6 +498,64 @@ func TestPBRApplyAggregatesAddErrors(t *testing.T) {
 	}
 	if ops.count(unix.AF_INET) != 0 {
 		t.Errorf("no rule should have been recorded, got %d", ops.count(unix.AF_INET))
+	}
+}
+
+// TestPBRApplyCapBoundary pins the apply-side priority-window cap: exactly
+// maxPBRRules rules install cleanly, and one more triggers the overflow error
+// after installing the first maxPBRRules (#3430 M3, apply leg).
+func TestPBRApplyCapBoundary(t *testing.T) {
+	mk := func(n int) []PBRRule {
+		out := make([]PBRRule, n)
+		for i := range out {
+			out[i] = PBRRule{Family: unix.AF_INET, Src: fmt.Sprintf("10.%d.%d.0/24", i/256, i%256), TableID: 100, Instance: "vr"}
+		}
+		return out
+	}
+
+	t.Run("exactly at cap", func(t *testing.T) {
+		ops := newFakeRuleOps()
+		p := &pbrManager{ops: ops}
+		if err := p.Apply(mk(maxPBRRules)); err != nil {
+			t.Fatalf("exactly %d rules must apply without error, got %v", maxPBRRules, err)
+		}
+		if ops.count(unix.AF_INET) != maxPBRRules {
+			t.Errorf("expected %d rules installed, got %d", maxPBRRules, ops.count(unix.AF_INET))
+		}
+	})
+
+	t.Run("one over cap", func(t *testing.T) {
+		ops := newFakeRuleOps()
+		p := &pbrManager{ops: ops}
+		err := p.Apply(mk(maxPBRRules + 1))
+		if err == nil {
+			t.Fatal("exceeding the cap must return a non-nil error")
+		}
+		if ops.count(unix.AF_INET) != maxPBRRules {
+			t.Errorf("expected %d rules installed at the cap, got %d", maxPBRRules, ops.count(unix.AF_INET))
+		}
+	})
+}
+
+// TestPBRApplyClearDelFailureSurfaced verifies that a RuleDel failure during
+// the up-front clear is surfaced (#3430 H3 second leg): a stale PBR rule that
+// cannot be removed leaves the kernel in a divergent state, so Apply must
+// return non-nil rather than reporting success because the new adds worked.
+func TestPBRApplyClearDelFailureSurfaced(t *testing.T) {
+	ops := newFakeRuleOps()
+	// Seed a stale rule inside the PBR window so clear() tries to delete it.
+	seedRule(ops, unix.AF_INET, pbrRulePriority+5, 100)
+	ops.delErr = errors.New("netlink EBUSY")
+	p := &pbrManager{ops: ops}
+
+	// New desired rule set; its adds succeed, but the stale rule cannot be
+	// cleared. Pre-fix the clear() RuleDel failure was debug-logged only and
+	// Apply returned nil.
+	rules := []PBRRule{
+		{Family: unix.AF_INET, Src: "10.7.0.0/16", TableID: 101, Instance: "vr-b"},
+	}
+	if err := p.Apply(rules); err == nil {
+		t.Fatal("Apply must return non-nil when a stale rule cannot be cleared (#3430 H3)")
 	}
 }
 
