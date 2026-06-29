@@ -23001,6 +23001,26 @@ top.
     pkg/config/compiler.go,
     pkg/config/log_stream_config_3349_test.go, docs/config-schema.md, _Log.md
 
+- **Timestamp**: 2026-06-28
+  - **Action**: #3339 — reject application/application-set name collisions at
+    commit (AST gate validateApplicationNameCollisionsAST: cross-namespace
+    app-vs-set, duplicate definitions, duplicate term-generated names). Strict
+    on commit, lenient-warn on load/peer-sync (lenientApplicationNameCollisions).
+    Added docs/config-schema.md #3339 subsection + tests.
+  - **File(s)**: pkg/config/compiler_applications_collision.go,
+    pkg/config/compiler.go,
+    pkg/config/compiler_applications_collision_3339_test.go,
+    docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3339 fold (Codex MAJOR) — aggregate collision detection
+    across ALL top-level applications {} blocks, not just the first. The
+    compiler compiles every applications node; a collision split across two
+    sibling blocks (hierarchical parse) was silently accepted. Added 3 split-
+    across-blocks reject tests + 1 distinct-split commit test; doc updated.
+  - **File(s)**: pkg/config/compiler_applications_collision.go,
+    pkg/config/compiler_applications_collision_3339_test.go,
+    docs/config-schema.md, _Log.md
 ## 2026-06-28 — #3360 gre-performance-acceleration config-truth
 - **Action**: Wire GREAcceleration into Rust ForwardingState for parity (mirror power_mode_disable); fix overstated Go wire comment; add mutation-verify tests (Go + Rust); doc feature-gaps entry.
 - **File(s)**: userspace-dp/src/afxdp/forwarding_build/mod.rs, userspace-dp/src/afxdp/types/forwarding.rs, userspace-dp/src/afxdp/forwarding_build/tests.rs, pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/flow_wire_coerce_test.go, docs/feature-gaps.md
