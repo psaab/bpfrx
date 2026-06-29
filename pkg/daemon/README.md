@@ -364,6 +364,30 @@ never lock an operator out of a remote box it manages.
   `discard` dropped ALL ICMP fail-closed-over-broad, an `accept` admitted ALL
   ICMP fail-open). Pinned by `TestNftRuleFromTermICMPCodeOnly` (v4 + v6 +
   multi-value, code-only) and `TestNftRuleFromTermICMPTypeCode`.
+
+  **Protocol / DSCP lowering normalizes through the shared resolvers (#3436):**
+  `nftRuleFromTerm` resolves each `from protocol` token through the shared
+  `appid.ProtocolNumber` SSOT (the same resolver the commit gate
+  `filterProtocolResolvable` and the userspace matcher `ip_proto.rs` use) and
+  emits the NUMERIC nft `l4proto` token (`meta l4proto 47`, set form
+  `meta l4proto { 47, 6, 50 }`). It resolves each `dscp` / `traffic-class` token
+  through the `dataplane.DSCPValues` SSOT (case-insensitive, numeric 0..63
+  pass-through) and emits the numeric `ip[6] dscp` value. The pre-fix code
+  emitted both tokens RAW (codex-094 H08/M01): nft does not share the Junos
+  alias table — `meta l4proto junos-gre` / `junos-tcp-any` / `ipip` is a parse
+  error that rejects the whole atomically-loaded lo0 table (legitimate commit
+  broken) or, on the lenient/peer-sync path, leaves the kernel mirror absent
+  while userspace stays armed. Likewise nft's DSCP names are lowercase only and
+  do not cover every xpf code point — an upper-case `EF` (accepted
+  case-insensitively at commit) and `be` (best-effort, which has NO nft name)
+  both failed the atomic load. Emitting numeric values is unconditionally
+  nft-safe and matches the SAME protocol / code point as userspace. An
+  unresolvable token cannot reach a committed config (the commit gate rejects
+  it); on the lenient path an unresolvable protocol is dropped with a warning
+  (mirroring the tcp-flags lowering) and an unresolvable DSCP token falls back
+  to its lower-cased form. Pinned by `TestNftRuleFromTermProtocolAliases`,
+  `TestNftRuleFromTermProtocolMultiAliasSet`, `TestNftRuleFromTermDSCP`, and
+  `TestNftRuleFromTermDSCPNamesAndCase`.
 - host-inbound-traffic (`security zones <z> host-inbound-traffic`) is the
   PRIMARY kernel enforcement for host-bound traffic to a firewall interface IP
   / VRRP VIP (SSH, ping, OSPF/BGP to the box — #3070). Such traffic is shunted
