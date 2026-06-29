@@ -293,6 +293,19 @@ owned by the `journal/` subpackage.
   generated on first encrypted commit). If the file is missing on a
   node that previously committed encrypted state, decryption fails —
   there is no plaintext fallback.
+- Flat-load fail-closed (#3442 M3/M4): `LoadSet` and the flat-set branch
+  of `LoadMerge` (`store_command.go`) reject any non-blank, non-`#` line
+  that does not start with a recognized verb (`set`/`delete`/`deactivate`/
+  `activate`, gate `hasFlatVerb`) with a line-numbered error. Previously
+  `LoadMerge` ran such a line through `applyEditLine` → `ParseSetVerb`,
+  whose bare-path default turned a typo/free-text line (e.g.
+  `not-a-set-line`) into a junk top-level node, and `LoadSet` silently
+  `continue`d on it so REST/gRPC/CLI returned OK while dropping the
+  intended command. The `ParseSetVerb` bare-path default is reserved for
+  internal callers that prepend the verb themselves (`SetEdit`,
+  `Deactivate`, `Activate`). Hierarchical `LoadMerge` is unaffected — it
+  round-trips through `FormatSet()`, which always emits verb-prefixed
+  lines.
 - Commit atomicity (#846): `pkg/daemon` wraps `Commit()` together with
   `applyConfig()` under a single semaphore. Bypassing the daemon (e.g.
   using `Store` directly) loses that serialization, so concurrent CLI +
