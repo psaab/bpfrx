@@ -158,7 +158,7 @@ func resolveSourceAddr(cfg *config.Config, srcIface string) string {
 			unitNum = n
 		}
 	}
-	if ifc, ok := cfg.Interfaces.Interfaces[base]; ok {
+	if ifc, ok := cfg.Interfaces.Interfaces[base]; ok && ifc != nil {
 		if unit, ok := ifc.Units[unitNum]; ok && unit.PrimaryAddress != "" {
 			// PrimaryAddress is CIDR — strip the prefix length
 			if ip, _, err := net.ParseCIDR(unit.PrimaryAddress); err == nil {

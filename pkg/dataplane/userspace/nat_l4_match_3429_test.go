@@ -198,6 +198,73 @@ func TestBuildSourceNATSnapshotsUnresolvableApplicationFailsClosed(t *testing.T)
 	}
 }
 
+// #3491: the application's source-port constraint must be carried onto the
+// snapshot term's SrcPorts. Before the fix buildSourceNATAppTerms read only
+// DestinationPort, so a source-NAT rule whose `match application` constrained
+// the source port widened to every source port (fail open). Dropping the
+// SrcPorts assignment turns this RED.
+func TestBuildSourceNATSnapshotsCarriesApplicationSourcePortMatch(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Applications.Applications = map[string]*config.Application{
+		"app-svc": {Name: "app-svc", Protocol: "tcp", SourcePort: "12345", DestinationPort: "443"},
+	}
+	cfg.Security.NAT.Source = []*config.NATRuleSet{
+		{
+			Name:     "rs",
+			FromZone: "lan",
+			ToZone:   "wan",
+			Rules: []*config.NATRule{{
+				Name:  "r1",
+				Match: config.NATMatch{Application: "app-svc"},
+				Then:  config.NATThen{Type: config.NATSource, Interface: true},
+			}},
+		},
+	}
+	snaps := buildSourceNATSnapshots(cfg, nil)
+	apps := snaps[0].MatchApplications
+	if len(apps) != 1 {
+		t.Fatalf("MatchApplications = %+v, want 1 term", apps)
+	}
+	if len(apps[0].Ports) != 1 || apps[0].Ports[0] != (NatPortRangeWire{Low: 443, High: 443}) {
+		t.Fatalf("term ports = %+v, want [{443 443}]", apps[0].Ports)
+	}
+	if len(apps[0].SrcPorts) != 1 || apps[0].SrcPorts[0] != (NatPortRangeWire{Low: 12345, High: 12345}) {
+		t.Fatalf("term src ports = %+v, want [{12345 12345}]", apps[0].SrcPorts)
+	}
+}
+
+// #3491: an application whose source-port spec is non-empty but coalesces to
+// nothing (all out of 1..65535) must fail CLOSED with the never-match sentinel,
+// NOT widen to any source port (empty SrcPorts).
+func TestBuildSourceNATSnapshotsAppAllOutOfRangeSourcePortFailsClosed(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Applications.Applications = map[string]*config.Application{
+		"app-bad-sport": {Name: "app-bad-sport", Protocol: "tcp", SourcePort: "70000"},
+	}
+	cfg.Security.NAT.Source = []*config.NATRuleSet{
+		{
+			Name:     "rs",
+			FromZone: "lan",
+			ToZone:   "wan",
+			Rules: []*config.NATRule{{
+				Name:  "r1",
+				Match: config.NATMatch{Application: "app-bad-sport"},
+				Then:  config.NATThen{Type: config.NATSource, Interface: true},
+			}},
+		},
+	}
+	snaps := buildSourceNATSnapshots(cfg, nil)
+	apps := snaps[0].MatchApplications
+	if len(apps) != 1 {
+		t.Fatalf("MatchApplications = %+v, want 1 term", apps)
+	}
+	want := []NatPortRangeWire{natNeverMatchPortRange}
+	if len(apps[0].SrcPorts) != len(want) || apps[0].SrcPorts[0] != want[0] {
+		t.Fatalf("term src ports = %+v, want one never-match range %+v (fail closed, not empty wildcard)",
+			apps[0].SrcPorts, want)
+	}
+}
+
 func TestBuildSourceNATSnapshotsUnconstrainedHasNoL4Match(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.NAT.Source = []*config.NATRuleSet{

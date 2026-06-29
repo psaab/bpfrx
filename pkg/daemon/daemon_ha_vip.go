@@ -309,7 +309,7 @@ func (d *Daemon) addStableRethLinkLocal(rgID int) {
 	rethToPhys := cfg.RethToPhysical()
 
 	for ifName, ifc := range cfg.Interfaces.Interfaces {
-		if ifc.RedundancyGroup != rgID {
+		if ifc == nil || ifc.RedundancyGroup != rgID {
 			continue
 		}
 		if !strings.HasPrefix(ifName, "reth") {
@@ -373,7 +373,7 @@ func (d *Daemon) removeStableRethLinkLocal(rgID int) {
 	rethToPhys := cfg.RethToPhysical()
 
 	for ifName, ifc := range cfg.Interfaces.Interfaces {
-		if ifc.RedundancyGroup != rgID {
+		if ifc == nil || ifc.RedundancyGroup != rgID {
 			continue
 		}
 		if !strings.HasPrefix(ifName, "reth") {
@@ -591,7 +591,7 @@ func (d *Daemon) directSendGARPs(rgID int) {
 		rethToPhys := cfg.RethToPhysical()
 		seen := make(map[string]bool)
 		for ifName, ifc := range cfg.Interfaces.Interfaces {
-			if ifc.RedundancyGroup != rgID || !strings.HasPrefix(ifName, "reth") {
+			if ifc == nil || ifc.RedundancyGroup != rgID || !strings.HasPrefix(ifName, "reth") {
 				continue
 			}
 			// Use configured link-local if present, otherwise stable LL.

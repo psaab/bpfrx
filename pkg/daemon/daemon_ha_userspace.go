@@ -428,6 +428,14 @@ func (d *Daemon) shouldSyncUserspaceDelta(delta dpuserspace.SessionDeltaInfo, in
 func buildZoneRGMap(cfg *config.Config, zoneIDs map[string]uint16) map[uint16]int {
 	result := make(map[uint16]int)
 	for zoneName, zone := range cfg.Security.Zones {
+		// Tolerant/programmatic/HA-peer-sync configs can leave a nil
+		// zone value in the map (the established nil-slot invariant the
+		// dataplane SSOT defends, e.g. zones.go's `if zone == nil`).
+		// Skip it here too, otherwise the zone.Interfaces deref below
+		// panics the per-RG session-sync apply path.
+		if zone == nil {
+			continue
+		}
 		zid, ok := zoneIDs[zoneName]
 		if !ok {
 			continue
@@ -439,7 +447,9 @@ func buildZoneRGMap(cfg *config.Config, zoneIDs map[string]uint16) map[uint16]in
 			if idx := strings.IndexByte(ifName, '.'); idx >= 0 {
 				baseName = ifName[:idx]
 			}
-			if ifc, ok := cfg.Interfaces.Interfaces[baseName]; ok && ifc.RedundancyGroup > 0 {
+			// comma-ok checks key-presence, not value-non-nil; a
+			// (nil, true) map entry would panic on ifc.RedundancyGroup.
+			if ifc, ok := cfg.Interfaces.Interfaces[baseName]; ok && ifc != nil && ifc.RedundancyGroup > 0 {
 				if rgSeen >= 0 && rgSeen != ifc.RedundancyGroup {
 					slog.Warn("zone spans multiple redundancy groups; "+
 						"active/active session sync ownership is ambiguous",
@@ -462,6 +472,9 @@ func rgHasRETH(cfg *config.Config, rgID int) bool {
 		return false
 	}
 	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
 		if ifc.RedundancyGroup == rgID {
 			return true
 		}

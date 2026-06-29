@@ -185,7 +185,14 @@ runtime effect is the L3/L4 catalog classification above
     never-matching (or over-matching) the NAT term; #2187 closes that
     by collecting NAT-rule references into the same strict walk
     (static NAT carries no `match application`, so only source and
-    destination NAT rule-sets are walked). An **unreferenced** application with
+    destination NAT rule-sets are walked). At the dataplane the
+    source-NAT `match application` term enforces the application's
+    **protocol, destination-port, AND source-port** (#3429 carried
+    protocol + destination-port; #3491 added the source-port axis —
+    `buildSourceNATAppTerms` / `SourceNatAppTerm::l4_matches`); each
+    axis is AND-ed, and an axis whose configured spec coalesces to no
+    representable port fails CLOSED (never-match sentinel) rather than
+    widening to match-any. An **unreferenced** application with
     app-id disabled is not matchable by anything, so its malformed
     spec stays a *warning* (the operator can iterate on a
     not-yet-wired application library). This is the

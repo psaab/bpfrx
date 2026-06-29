@@ -292,7 +292,7 @@ func rgForInterfaces(cfg *config.Config, ifaces []string) int {
 		if i := strings.IndexByte(base, '.'); i >= 0 {
 			base = base[:i]
 		}
-		if ifc, ok := cfg.Interfaces.Interfaces[base]; ok {
+		if ifc, ok := cfg.Interfaces.Interfaces[base]; ok && ifc != nil {
 			if ifc.RedundancyGroup > 0 {
 				return ifc.RedundancyGroup
 			}

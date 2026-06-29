@@ -192,15 +192,18 @@ impl SourceNatFlowKey {
 /// Go builder emits for a configured-but-unresolvable `match application`.
 pub(crate) const SOURCE_NAT_PROTO_ANY: u16 = 256;
 
-/// #3429: one resolved source-NAT `match application` term — an L4 protocol
-/// (IANA number, or `SOURCE_NAT_PROTO_ANY` for any) and optional inclusive
-/// destination-port ranges. The flow matches the term when its protocol equals
-/// `protocol` (or `protocol == SOURCE_NAT_PROTO_ANY`) AND, when `ports` is
-/// non-empty, its destination port falls in one of the ranges.
+/// #3429/#3491: one resolved source-NAT `match application` term — an L4
+/// protocol (IANA number, or `SOURCE_NAT_PROTO_ANY` for any) and optional
+/// inclusive destination- and source-port ranges. The flow matches the term when
+/// its protocol equals `protocol` (or `protocol == SOURCE_NAT_PROTO_ANY`) AND,
+/// when `ports` is non-empty, its destination port falls in one of the ranges,
+/// AND, when `src_ports` is non-empty (#3491), its source port falls in one of
+/// the source ranges. An empty axis is unconstrained on that axis.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SourceNatAppTerm {
     pub(crate) protocol: u16,
     pub(crate) ports: Vec<(u16, u16)>,
+    pub(crate) src_ports: Vec<(u16, u16)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -324,7 +327,14 @@ impl SourceNatRule {
     /// constraint cannot be satisfied by an unknown tuple, so it fails closed
     /// (an L4-scoped rule must never fire on traffic whose port/protocol the
     /// caller could not supply). An unconstrained rule is unaffected.
-    fn l4_matches(&self, protocol: u8, dst_port: u16) -> bool {
+    ///
+    /// #3491: a `match application` term may also constrain the SOURCE port (an
+    /// application defined with `source-port`). It is AND-ed with the protocol
+    /// and destination-port checks INSIDE the same term: the flow satisfies the
+    /// term only when its protocol, destination port, AND source port all match.
+    /// Before #3491 the source-port axis was dropped, so an app-scoped rule fired
+    /// regardless of source port — the fail-open this fix closes.
+    fn l4_matches(&self, protocol: u8, src_port: u16, dst_port: u16) -> bool {
         if self.match_dst_ports.is_empty() && self.match_apps.is_empty() {
             return true;
         }
@@ -339,6 +349,7 @@ impl SourceNatRule {
             let ok = self.match_apps.iter().any(|t| {
                 (t.protocol == SOURCE_NAT_PROTO_ANY || t.protocol == proto16)
                     && (t.ports.is_empty() || port_in_ranges(dst_port, &t.ports))
+                    && (t.src_ports.is_empty() || port_in_ranges(src_port, &t.src_ports))
             });
             if !ok {
                 return false;
@@ -355,6 +366,7 @@ impl SourceNatRule {
         src_ip: IpAddr,
         dst_ip: IpAddr,
         protocol: u8,
+        src_port: u16,
         dst_port: u16,
     ) -> bool {
         if !self.from_zone.is_empty() && self.from_zone != from_zone {
@@ -366,7 +378,7 @@ impl SourceNatRule {
         if !self.scope_matches(scope) {
             return false;
         }
-        if !self.l4_matches(protocol, dst_port) {
+        if !self.l4_matches(protocol, src_port, dst_port) {
             return false;
         }
         match (src_ip, dst_ip) {
@@ -549,9 +561,17 @@ pub(crate) fn parse_source_nat_rules_with_previous(
         }
         for term in &snap.match_applications {
             let ports = term.ports.iter().map(|r| (r.low, r.high)).collect();
+            // #3491: source-port ranges are kept VERBATIM, same as the
+            // destination-port ranges above — including a deliberately
+            // impossible `low > high` never-match sentinel the Go builder emits
+            // when the application configured a source-port that coalesced to
+            // nothing. Dropping such a range would empty the list and re-open the
+            // source-port over-match.
+            let src_ports = term.src_ports.iter().map(|r| (r.low, r.high)).collect();
             rule.match_apps.push(SourceNatAppTerm {
                 protocol: term.protocol,
                 ports,
+                src_ports,
             });
         }
         // Parse pool addresses and port range for pool-mode SNAT.
@@ -780,7 +800,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
     };
     for rule in rules {
         if !rule.matches(
-            scope, from_zone, to_zone, src_ip, dst_ip, protocol, dst_port,
+            scope, from_zone, to_zone, src_ip, dst_ip, protocol, src_port, dst_port,
         ) {
             continue;
         }

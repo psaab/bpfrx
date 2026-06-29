@@ -23128,6 +23128,9 @@ top.
 - **Timestamp**: 2026-06-28
   - **Action**: #3422 validate flow traceoptions packet-filter prefixes + flags. Strict commit now rejects an unparseable source/destination-prefix or an unimplemented flag (validateFlowTraceFlagsAndFiltersAST); lenient load/peer-sync downgrades to a warning. Runtime fail-safe: NewTraceWriter keeps an invalid filter as never-match (M01: was dropped -> empty filters -> trace everything) and drops an unknown flag so basic-datapath/session defaults still apply (M02: was installed -> defaults suppressed -> matchFilters never matches -> empty trace file while reporting enabled). Tests RED-on-revert.
   - **File(s)**: pkg/config/compiler_security.go, pkg/config/compiler.go, pkg/logging/trace.go, pkg/config/flow_traceoptions_filter_3422_test.go, pkg/logging/trace_filter_3422_test.go, pkg/logging/README.md, _Log.md
+- **Timestamp**: 2026-06-28
+  - **Action**: #3485 gate the lo0 host-bound firewall filter behind host-inbound admission on the local-delivery path (codex-review-118 M1). Both the session-HIT and session-MISS sites in poll_descriptor ran apply_lo0_filter_action (reject reply / RST / session teardown / term counter / filter log) BEFORE host_inbound_admits, so a packet host-inbound would silently deny still triggered the lo0 active side-effects. Extracted host_inbound_gated_lo0_action (filter.rs): runs the host-inbound gate FIRST, returns None on deny (caller drops silently, no lo0 side-effects) and Some(action) on admit (lo0 evaluated as before). Net order is now host-inbound -> lo0 -> junos-host (#3019). RED-on-revert tests in lo0_gate_tests (deny: None + lo0 counter stays 0; admit: Some(Reject) + counter 1). Pre-existing unrelated event_stream test_paused_telemetry_eviction_does_not_poison_drain_2875 fails on clean origin/master too.
+  - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/filter.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/afxdp/forwarding/README.md, _Log.md
 
 - **Timestamp**: 2026-06-28
   - **Action**: #3486 — add Go<->Rust drift guard for the host-inbound system-services/protocols token ALLOWLISTS. New Go parity test (TestHostInboundRustClassifierMatchesGoSSOT in pkg/config) parses userspace-dp/src/afxdp/forwarding/host_inbound.rs and asserts its classify_system_service / classify_protocol match-arm token sets + KNOWN_ROUTING_PROTOCOL_TOKENS / HOST_INBOUND_L2_PROTOCOLS slices EXACTLY equal the Go SSOT (config.KnownHostInboundSystemServices, KnownHostInboundProtocols, KnownHostInboundProtocols\{all}, HostInboundL2Protocols). Uses the established repo pattern (Go test os.ReadFiles the Rust source via ../.. relative path, see retirement_boundary_canary_test.go). Strips // comments, regex-extracts string literals in match-arm patterns (left of =>). NO real drift found on master — the two sides already agree. RED-on-drift proven both directions (Go-only +madeup-svc -> MISSING from Rust; Rust-only +madeup-proto -> NOT in Go SSOT). Updated SSOT comment + docs/junos-cli-reference.md + a back-reference doc comment in host_inbound.rs.
@@ -23141,3 +23144,29 @@ top.
 - **Timestamp**: 2026-06-28
   - **Action**: #3489 make the TCP `closing` flag sticky in update_session. mod.rs:1040 used a plain `=` while the sibling flags `reset` (#3046) and `established` (#3152) use `|=` and lookup.rs already keeps `closing` sticky. A non-closing segment (reordered data-ACK, flags=0x10) on the HA shared-promote path reset closing->false, moving a FIN'd session from the 30s TCP_CLOSING_TIMEOUT_NS window back to the 300s established window (10x too long, holds a bounded slot). Fix: `closing |=` in update_session + the same fix in the tests.rs reference helper (else the parity sweep stays blind). Added two RED-on-revert tests (closing_flag_is_sticky_across_nonclosing_update + closing_flag_is_sticky_on_ha_promote) that assert closing+30s window survive a non-closing refresh on both the local and HA-promote paths — verified both go RED when reverted to `=`. Updated session/README.md sticky-close-state note. Touches session-sync code (closing is synced to peer) -> test-failover recommended before merge.
   - **File(s)**: userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md, _Log.md
+
+## #3491 source-NAT match application source-port enforcement
+- **Timestamp**: 2026-06-28
+- **Action**: Thread the application's source-port constraint into the source-NAT
+  `match application` dataplane term (source-port sibling of #3429). Added
+  `SrcPorts` to NatAppTermWire (Go + Rust wire), `src_ports` to SourceNatAppTerm,
+  threaded src_port through l4_matches/matches; populate from Application.SourcePort
+  with the #3429 fail-closed never-match sentinel. RED-on-revert Go + Rust tests.
+- **File(s)**: pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/nat_l4_match_3429_test.go, userspace-dp/src/protocol/nat.rs,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests.rs,
+  docs/services-application-identification.md
+## 2026-06-28 — fix/3492 buildZoneRGMap nil-zone guard
+- **Timestamp**: 2026-06-28
+- **Action**: Add `zone == nil` guard in buildZoneRGMap (per-RG session-sync apply path); add RED-on-revert TestBuildZoneRGMapSkipsNilZones
+- **File(s)**: pkg/daemon/daemon_ha_userspace.go, pkg/daemon/per_rg_test.go
+
+## 2026-06-28 — fix/3492 broadened apply-path nil-zone/nil-interface sweep
+- **Timestamp**: 2026-06-28
+- **Action**: Fold reviewer-found siblings (Codex MAJOR flowexport.BuildSamplingZones nil-zone; SMR buildZoneRGMap (nil,true) ifc + rgHasRETH nil ifc) + broad apply-path sweep guarding every nil zone/interface VALUE deref; add 3 RED-on-revert tests
+- **File(s)**: pkg/flowexport/manager.go, pkg/flowexport/exporter_test.go, pkg/daemon/{daemon_ha_userspace,daemon_ha_vip,daemon_apply,daemon_ipmon,daemon_ha,daemon_ra,daemon_system,daemon_run,daemon_ddns,daemon_ha_fabric}.go, pkg/daemon/per_rg_test.go
+
+## 2026-06-28 — fix/3492 close flowexport ifCfg==nil test-coverage gap
+- **Timestamp**: 2026-06-28
+- **Action**: trust zone in TestBuildSamplingZonesSkipsNilZone now references the nil interface (nilif.0) so the BuildSamplingZones `ifCfg == nil` comma-ok clause is RED-on-revert (was only zone==nil covered)
+- **File(s)**: pkg/flowexport/exporter_test.go

@@ -144,6 +144,19 @@ traffic never pays for it), at BOTH sites in `poll_descriptor`:
   re-check) so a tightened host-inbound config tears down an
   already-established host-bound session WITHOUT an explicit purge.
 
+**Ordering: host-inbound gates the lo0 filter (#3485).** Both sites route
+the host-inbound check and the lo0 (host-bound) firewall filter through one
+helper, `poll_descriptor::filter::host_inbound_gated_lo0_action`, which runs
+the host-inbound gate FIRST. A packet the gate denies is a silent fail-closed
+drop with NO lo0 side-effects — no synthesized TCP RST / ICMP-unreachable
+reject reply, no lo0 term counter bump, no lo0 filter log, and (session-hit)
+no host-bound session teardown attributed to the filter. Only an ADMITTED
+packet pays the lo0 evaluation. Before #3485 (codex-review-118 M1)
+`apply_lo0_filter_action` ran first, so a service host-inbound would have
+silently denied still triggered the lo0 reject/RST/teardown/counter/log. The
+`junos-host` security policy (#3019) still runs AFTER host-inbound admission
+(Junos order); the net local-delivery order is host-inbound → lo0 → junos-host.
+
 `host_inbound_admits` returns admit when the zone has **no** stanza (the
 zone is absent from `zone_host_inbound`), preserving the pre-#3070
 admit-all behaviour — a deliberate, zero-regression deviation from strict
