@@ -298,6 +298,31 @@ never lock an operator out of a remote box it manages.
   success-no-error, idempotent add+delete teardown) and
   `daemon_apply_runtime_test.go:TestApplyConfigLockedSurfacesLo0Failure` (the
   commit-level `errors.Join` wiring proof).
+  **Per-term disposition mirrors userspace (#3427):** `nftRuleFromTerm` maps a
+  term's `then` action to the kernel verdict the SAME way the userspace lo0
+  evaluator does (`pkg/dataplane/userspace/filters.go` `NextTerm =
+  (term.NextTerm || term.Action == "") && term.RoutingInstance == ""`). A term
+  with NO terminating action is a Junos FALL-THROUGH (explicit `then next term`
+  or a modifier-only term carrying only count/log/forwarding-class/dscp): it
+  emits NO rule (the kernel chain mirrors no counters/log, so the term has no
+  enforcement effect) and the subsequent terms run. The pre-fix code mapped an
+  empty action to a terminating `accept`, which SHADOWED every later
+  discard/reject term — a control-plane fail-OPEN diverging from userspace
+  (`from protocol tcp then next term` followed by `from destination-port 22 then
+  discard` accepted SSH at term 1, leaving the drop unreachable). A
+  `routing-instance` (PBR) term is explicitly NOT a fall-through: userspace sets
+  `continue_term=false` when `routing_instance` is non-empty and the evaluator
+  TERMINATES the matched term, returning its action — the empty-action
+  placeholder `Accept` — so the packet is ACCEPTED. The kernel lo0 input chain
+  cannot perform route-selection, but the filter VERDICT is accept, so it emits
+  a TERMINATING `accept` (mirroring userspace); it must NOT be skipped, because a
+  skip lets a later deny term match and OVER-DROP legitimate host traffic on the
+  kernel-primary lo0 chain. Userspace stays authoritative for the actual
+  route-selection. Pinned by `TestNftRuleFromTermFallThroughNoBareAccept`,
+  `TestNftRuleFromTermRoutingInstanceTerminatesAccept`, the end-to-end
+  `TestLo0PayloadFallThroughDoesNotShadowDiscard`, and
+  `TestLo0PayloadRoutingInstanceTerminatesAcceptNoOverDrop` (the over-drop
+  counterexample).
 - host-inbound-traffic (`security zones <z> host-inbound-traffic`) is the
   PRIMARY kernel enforcement for host-bound traffic to a firewall interface IP
   / VRRP VIP (SSH, ping, OSPF/BGP to the box — #3070). Such traffic is shunted
