@@ -4601,3 +4601,121 @@ fn app_term_icmp_constrained_before_all_icmp_wins() {
         "all-icmp term listed first must win for an echo packet"
     );
 }
+
+// ── #3448: `clear security policies hit-count` must not replay pre-clear
+// hits buffered in the per-worker pending coalescer ────────────────────────
+//
+// The #3073 coalescer (`record_policy_hit_counter`) buffers up to
+// POLICY_HIT_FLUSH_PACKETS established-flow hits in a thread-local
+// `PendingPolicyHitRecord` before folding them into the shared
+// `PolicyRuleCounter` atomics. `clear()` only zeroes the shared atomics, so
+// before #3448 a pending batch captured before the clear would `add_batch`
+// its stale pre-clear counts onto the freshly-zeroed counter at the next
+// flush — the clear appeared to fail or to invent traffic.
+//
+// These tests drive the load-bearing flush helper directly because the
+// thread-local coalescer is compiled out under `#[cfg(test)]`.
+
+#[test]
+fn clear_discards_pre_clear_pending_policy_hits_3448() {
+    let counter = Arc::new(PolicyRuleCounter::default());
+
+    // A worker buffered 30 established-flow hits for an admitting policy that
+    // have NOT yet been folded into the shared atomics.
+    let mut pending = PendingPolicyHitRecord {
+        counter: Some(counter.clone()),
+        generation: counter.generation(),
+        packets: 30,
+        bytes: 30 * 100,
+    };
+
+    // Operator runs `clear security policies hit-count`: shared atomics zeroed,
+    // clear epoch bumped.
+    counter.reset();
+    let after_clear = counter.snapshot("allow-web");
+    assert_eq!(after_clear.packets, 0, "clear must zero the shared atomics");
+    assert_eq!(after_clear.bytes, 0);
+
+    // The worker's next RX-batch flush must DISCARD the stale pre-clear batch,
+    // not replay it onto the freshly-zeroed counter.
+    flush_pending_policy_hit_record(&mut pending);
+    let after_flush = counter.snapshot("allow-web");
+    assert_eq!(
+        after_flush.packets, 0,
+        "pre-clear pending hits replayed after clear (snap-back) — #3448"
+    );
+    assert_eq!(
+        after_flush.bytes, 0,
+        "pre-clear pending bytes replayed after clear (snap-back) — #3448"
+    );
+    // The discarded batch is drained so it cannot be re-applied.
+    assert!(pending.counter.is_none());
+    assert_eq!(pending.packets, 0);
+    assert_eq!(pending.bytes, 0);
+}
+
+#[test]
+fn post_clear_pending_policy_hits_flush_normally_3448() {
+    let counter = Arc::new(PolicyRuleCounter::default());
+    // Clear first so the live epoch is non-zero.
+    counter.reset();
+
+    // A batch captured AFTER the clear (current epoch) must flush normally —
+    // the generation guard must not over-discard legitimate post-clear hits.
+    let mut pending = PendingPolicyHitRecord {
+        counter: Some(counter.clone()),
+        generation: counter.generation(),
+        packets: 7,
+        bytes: 7 * 100,
+    };
+    flush_pending_policy_hit_record(&mut pending);
+    let snap = counter.snapshot("allow-web");
+    assert_eq!(
+        snap.packets, 7,
+        "post-clear hits captured under the current epoch must be counted"
+    );
+    assert_eq!(snap.bytes, 700);
+}
+
+#[test]
+fn clear_bumps_policy_counter_generation_3448() {
+    let counter = Arc::new(PolicyRuleCounter::default());
+    let g0 = counter.generation();
+    counter.reset();
+    let g1 = counter.generation();
+    counter.reset();
+    let g2 = counter.generation();
+    assert!(g1 > g0, "clear must advance the counter generation");
+    assert!(g2 > g1, "each clear must advance the counter generation");
+}
+
+#[test]
+fn store_clear_bumps_generation_for_all_counters_3448() {
+    // PolicyCounterStore::clear (the control-plane `clear_policy_counters`
+    // entry point) must bump every registered counter's epoch so buffered
+    // pre-clear batches against any rule are discarded.
+    let store = PolicyCounterStore::default();
+    let c_allow = store.rule_hit_counter("security-policy:trust:untrust:allow-web");
+    let c_deny = store.rule_hit_counter(DEFAULT_POLICY_COUNTER_RULE_ID);
+    let g_allow0 = c_allow.generation();
+    let g_deny0 = c_deny.generation();
+
+    // Buffer a pre-clear batch against allow-web.
+    let mut pending = PendingPolicyHitRecord {
+        counter: Some(c_allow.clone()),
+        generation: c_allow.generation(),
+        packets: 50,
+        bytes: 50 * 64,
+    };
+
+    store.clear();
+    assert!(c_allow.generation() > g_allow0);
+    assert!(c_deny.generation() > g_deny0);
+
+    flush_pending_policy_hit_record(&mut pending);
+    assert_eq!(
+        c_allow.snapshot("allow-web").packets,
+        0,
+        "store clear must invalidate pre-clear pending batches — #3448"
+    );
+}
