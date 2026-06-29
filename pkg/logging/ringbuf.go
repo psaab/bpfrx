@@ -372,7 +372,13 @@ func (er *EventReader) ForwardLogMsg(severity int, msg string) {
 	writers := er.localWriters
 	er.localMu.RUnlock()
 	for _, lw := range writers {
-		_ = lw.Send(severity, msg)
+		// #3478 M05: don't discard the aggregator's local-writer error.
+		// LocalLogWriter.Send already counts the drop (DroppedWrites) and
+		// emits a rate-limited WARN; surface it here at Debug so the
+		// per-aggregation context is available without spamming the hot path.
+		if err := lw.Send(severity, msg); err != nil {
+			slog.Debug("aggregation report local log write failed", "err", err)
+		}
 	}
 }
 
