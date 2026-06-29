@@ -71,17 +71,23 @@ pub(super) fn event_now_ns_from_secs(now_secs: u64) -> u64 {
 
 /// #2520: resolve the AppID for a cold-path RT_FLOW record (policy-deny /
 /// filter-log / session-close) from the flow 5-tuple, reusing the SAME
-/// `app_catalog.lookup` the forwarding hot path runs when it stamps the
-/// conntrack entry (`poll_descriptor` session-create:
-/// `worker_ctx.forwarding.app_catalog.lookup(protocol, src_port, dst_port)`).
-/// There is no duplicated resolution logic — the catalog probes both port
-/// slots so a forward- or reverse-keyed tuple resolves to the same app_id.
+/// direction-aware `app_catalog` the forwarding hot path runs when it stamps
+/// the conntrack entry. #3321: a cold-path record carries the received
+/// (forward) 5-tuple, so this uses `lookup_forward` — the service port is the
+/// DESTINATION and a forward flow whose source port coincides with a service
+/// port is NOT mislabeled. (The session-create / -close stamps that DO know
+/// their binding direction call `lookup_directional` with `metadata.is_reverse`
+/// so a legitimately reverse-keyed session still resolves on the src slot.)
 /// Returns 0 (UNKNOWN) when nothing matches, which the Go RT_FLOW logger
 /// renders as `application="UNKNOWN"` — the unchanged behavior for an
 /// unresolvable tuple.
 #[inline]
 pub(super) fn resolve_flow_app_id(app_catalog: &AppCatalog, flow: &SessionFlow) -> u16 {
-    app_catalog.lookup(
+    // #3321: a cold-path record carries the received (forward) 5-tuple, so the
+    // service port is the destination — resolve forward-directionally so a
+    // forward flow whose source port coincides with a service port is not
+    // mislabeled.
+    app_catalog.lookup_forward(
         flow.forward_key.protocol,
         flow.forward_key.src_port,
         flow.forward_key.dst_port,
@@ -105,7 +111,9 @@ pub(super) fn resolve_policy_deny_app_id(
     flow: &SessionFlow,
     policy_dst_port: u16,
 ) -> u16 {
-    app_catalog.lookup(
+    // #3321: forward-directional — the policy was evaluated against the
+    // (post-translation) destination port, which is the service slot.
+    app_catalog.lookup_forward(
         flow.forward_key.protocol,
         flow.forward_key.src_port,
         policy_dst_port,

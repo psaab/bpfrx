@@ -2872,25 +2872,78 @@ fn cat_entry(app_id: u16, proto: u8, dlo: u16, dhi: u16) -> crate::AppCatalogEnt
 fn app_catalog_exact_dst_port_resolves_id() {
     let cat = AppCatalog::from_snapshot(&[cat_entry(7, 6, 443, 443)]);
     // forward session: client ephemeral src -> server dst 443.
-    assert_eq!(cat.lookup(6, 51000, 443), 7);
-    // reverse-keyed session carries the service port in the src slot.
-    assert_eq!(cat.lookup(6, 443, 51000), 7);
+    assert_eq!(cat.lookup_forward(6, 51000, 443), 7);
+    // reverse-keyed session carries the service port in the src slot; only the
+    // reverse-aware lookup probes that slot (#3321).
+    assert_eq!(cat.lookup_directional(6, 443, 51000, true), 7);
+    // #3321 fail-on-revert: a FORWARD flow whose SOURCE port coincides with the
+    // service port (src=443, dst=ephemeral) must NOT be mislabeled. The old
+    // directionless probe returned 7 here.
+    assert_eq!(cat.lookup_forward(6, 443, 51000), 0);
     // wrong protocol on the same port is not the app.
-    assert_eq!(cat.lookup(17, 51000, 443), 0);
+    assert_eq!(cat.lookup_forward(17, 51000, 443), 0);
     // unrelated port resolves to unknown (0).
-    assert_eq!(cat.lookup(6, 51000, 80), 0);
+    assert_eq!(cat.lookup_forward(6, 51000, 80), 0);
 }
 
 #[test]
 fn app_catalog_port_range_resolves_id() {
     let cat = AppCatalog::from_snapshot(&[cat_entry(9, 6, 9000, 9100)]);
-    assert_eq!(cat.lookup(6, 40000, 9000), 9); // low edge
-    assert_eq!(cat.lookup(6, 40000, 9100), 9); // high edge
-    assert_eq!(cat.lookup(6, 40000, 9050), 9); // interior
-    assert_eq!(cat.lookup(6, 40000, 8999), 0); // below
-    assert_eq!(cat.lookup(6, 40000, 9101), 0); // above
-    // reverse-keyed: service-port range in the src slot still resolves.
-    assert_eq!(cat.lookup(6, 9050, 40000), 9);
+    assert_eq!(cat.lookup_forward(6, 40000, 9000), 9); // low edge
+    assert_eq!(cat.lookup_forward(6, 40000, 9100), 9); // high edge
+    assert_eq!(cat.lookup_forward(6, 40000, 9050), 9); // interior
+    assert_eq!(cat.lookup_forward(6, 40000, 8999), 0); // below
+    assert_eq!(cat.lookup_forward(6, 40000, 9101), 0); // above
+    // reverse-keyed: service-port range in the src slot still resolves via the
+    // reverse-aware lookup.
+    assert_eq!(cat.lookup_directional(6, 9050, 40000, true), 9);
+    // #3321: a forward flow with the service-port range in the SOURCE slot is
+    // not mislabeled.
+    assert_eq!(cat.lookup_forward(6, 9050, 40000), 0);
+}
+
+// #3321: the AppID lookup must be DIRECTION-AWARE. A forward flow whose source
+// port coincides with a well-known service port must resolve to UNKNOWN, while
+// the SAME tuple presented as a reverse-keyed session (service in the src slot)
+// resolves to the service. The pre-#3321 directionless probe matched the
+// service on EITHER slot, so the forward false-positive below returned the
+// service id — polluting session display / RT_FLOW / policy-deny / filter-log.
+#[test]
+fn app_catalog_directional_forward_not_mislabeled_by_source_port() {
+    // junos-https stand-in: TCP dst/443 (exact-port path).
+    let https = AppCatalog::from_snapshot(&[cat_entry(7, 6, 443, 443)]);
+    // Forward: src=443 (server-like source), dst=ephemeral client port.
+    assert_eq!(
+        https.lookup_forward(6, 443, 51000),
+        0,
+        "forward flow with a service-valued SOURCE port must be UNKNOWN"
+    );
+    // Reverse-keyed: the service port legitimately rides the src slot.
+    assert_eq!(
+        https.lookup_directional(6, 443, 51000, true),
+        7,
+        "reverse-keyed session with the service port in the src slot resolves"
+    );
+    // The genuine forward direction still resolves on the destination.
+    assert_eq!(https.lookup_forward(6, 51000, 443), 7);
+
+    // Same property on the scan (range) path, with a source-constrained app:
+    // dst range 9000-9100 AND src range 1000-2000.
+    let ranged = AppCatalog::from_snapshot(&[crate::AppCatalogEntry {
+        app_id: 9,
+        protocol: 6,
+        dst_port_low: 9000,
+        dst_port_high: 9100,
+        src_port_low: 1000,
+        src_port_high: 2000,
+    }]);
+    // Forward: client src in 1000-2000, server dst in 9000-9100 -> match.
+    assert_eq!(ranged.lookup_forward(6, 1500, 9050), 9);
+    // Forward false-positive: service-range value in the SOURCE slot, client
+    // value in the dst slot -> must NOT match.
+    assert_eq!(ranged.lookup_forward(6, 9050, 1500), 0);
+    // Reverse-keyed: service range in src, client range in dst -> match.
+    assert_eq!(ranged.lookup_directional(6, 9050, 1500, true), 9);
 }
 
 // A (0,0) dst-port pair means "protocol-only" (e.g. ICMP) — match on protocol
@@ -2898,9 +2951,9 @@ fn app_catalog_port_range_resolves_id() {
 #[test]
 fn app_catalog_protocol_only_entry() {
     let cat = AppCatalog::from_snapshot(&[cat_entry(3, 1, 0, 0)]); // ICMP
-    assert_eq!(cat.lookup(1, 0, 0), 3);
-    assert_eq!(cat.lookup(1, 1234, 5678), 3);
-    assert_eq!(cat.lookup(6, 1234, 5678), 0); // different protocol
+    assert_eq!(cat.lookup_forward(1, 0, 0), 3);
+    assert_eq!(cat.lookup_forward(1, 1234, 5678), 3);
+    assert_eq!(cat.lookup_forward(6, 1234, 5678), 0); // different protocol
 }
 
 // app_id 0 is the reserved unknown sentinel and must never be indexed even if a
@@ -2909,7 +2962,7 @@ fn app_catalog_protocol_only_entry() {
 fn app_catalog_skips_zero_app_id() {
     let cat = AppCatalog::from_snapshot(&[cat_entry(0, 6, 443, 443)]);
     assert!(cat.is_empty());
-    assert_eq!(cat.lookup(6, 51000, 443), 0);
+    assert_eq!(cat.lookup_forward(6, 51000, 443), 0);
 }
 
 // Overlapping entries: first/lowest app_id wins, deterministically (the Go
@@ -2918,18 +2971,18 @@ fn app_catalog_skips_zero_app_id() {
 fn app_catalog_overlap_lowest_id_wins() {
     // Two apps both claiming tcp/80 — exact-port path.
     let cat = AppCatalog::from_snapshot(&[cat_entry(5, 6, 80, 80), cat_entry(11, 6, 80, 80)]);
-    assert_eq!(cat.lookup(6, 40000, 80), 5);
+    assert_eq!(cat.lookup_forward(6, 40000, 80), 5);
 
     // Range vs exact overlap — lowest id still wins.
     let cat = AppCatalog::from_snapshot(&[cat_entry(2, 6, 8000, 8100), cat_entry(20, 6, 8050, 8050)]);
-    assert_eq!(cat.lookup(6, 40000, 8050), 2);
+    assert_eq!(cat.lookup_forward(6, 40000, 8050), 2);
 }
 
 #[test]
 fn app_catalog_empty_resolves_unknown() {
     let cat = AppCatalog::default();
     assert!(cat.is_empty());
-    assert_eq!(cat.lookup(6, 51000, 443), 0);
+    assert_eq!(cat.lookup_forward(6, 51000, 443), 0);
 }
 
 // ---------------------------------------------------------------------------
