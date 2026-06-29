@@ -354,14 +354,13 @@ func (s *Server) MonitorPacketDrop(req *pb.MonitorPacketDropRequest, stream grpc
 			}
 			if req.Protocol != "" && rec.ProtocolNum != reqProtoNum {
 				// Compare against the numeric protocol the RECORD carries,
-				// not a re-parse of the rendered name. protoName is NOT
-				// reversible — protoName(41)="IPV6" but
-				// appid.ProtocolNumber("ipv6") is deliberately one-way, so
-				// re-parsing rec.Protocol drops every proto-41 record. The
-				// raw number (#3382) makes the match total for named,
-				// named-non-reversible, and unnamed protocols alike.
-				// reqProtoNum is resolved once in validation via
-				// appid.ProtocolNumber (correct for the named/numeric
+				// not a re-parse of the rendered name. Comparing numerically
+				// is robust regardless of the name SSOT: even though #3393
+				// closed the ProtocolName↔ProtocolNumber round-trip (proto 41
+				// "ipv6" now reverses), the raw number (#3382) keeps the match
+				// total for named, numeric-only, and any future render-only
+				// protocols alike. reqProtoNum is resolved once in validation
+				// via appid.ProtocolNumber (correct for the named/numeric
 				// REQUEST side).
 				continue
 			}

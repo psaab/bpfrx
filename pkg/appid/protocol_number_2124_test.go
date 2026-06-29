@@ -14,7 +14,7 @@ import (
 func TestProtocolNumberNamedSet(t *testing.T) {
 	cases := map[string]uint8{
 		"tcp": 6, "udp": 17, "icmp": 1, "icmpv6": 58, "icmp6": 58,
-		"gre": 47, "ospf": 89, "ipip": 4,
+		"gre": 47, "ospf": 89, "ipip": 4, "ipv6": 41,
 		"esp": 50, "ah": 51, "sctp": 132, "vrrp": 112,
 		"igmp": 2, "pim": 103, "egp": 8,
 		// Junos predefined aliases.
@@ -87,7 +87,7 @@ func TestProtocolNumberParityWithCatalog(t *testing.T) {
 func TestFilterProtocolResolvableMatchesProtocolNumber(t *testing.T) {
 	tokens := []string{
 		// L4 subset + broader named set.
-		"tcp", "udp", "icmp", "icmpv6", "icmp6", "gre", "ospf", "ipip",
+		"tcp", "udp", "icmp", "icmpv6", "icmp6", "gre", "ospf", "ipip", "ipv6",
 		"esp", "ah", "sctp", "vrrp", "igmp", "pim", "egp",
 		// Junos predefined aliases.
 		"junos-tcp-any", "junos-udp-any", "junos-icmp-all", "junos-ping",
@@ -137,11 +137,55 @@ func dataplaneExtractsPorts(num uint8) bool {
 	return num == 6 || num == 17 // ip_proto.rs has_l4_ports: PROTO_TCP | PROTO_UDP
 }
 
+// TestProtocolNameNumberRoundTrip is the #3393 RED-on-revert guard: every
+// canonical name ProtocolName renders MUST parse back through ProtocolNumber
+// to the same protocol number (the display name re-parses), and that number
+// must render to the same canonical name. Before #3393 ProtocolName(41)=="ipv6"
+// had no reverse (ProtocolNumber("ipv6") returned (0,false)), so a consumer
+// that rendered a protocol to its name and re-parsed it silently failed for
+// proto 41 (the #3388 accepted-but-never-matches class). Reverting the
+// ProtocolNumber "ipv6" case makes this fail on p==41.
+func TestProtocolNameNumberRoundTrip(t *testing.T) {
+	// Per-protocol explicit canonical assertions for the fixed/affected set.
+	canon := map[uint8]string{
+		1: "icmp", 4: "ipip", 6: "tcp", 17: "udp",
+		41: "ipv6", 47: "gre", 50: "esp", 58: "icmpv6",
+	}
+	for num, name := range canon {
+		if got := ProtocolName(num); got != name {
+			t.Errorf("ProtocolName(%d) = %q, want %q", num, got, name)
+		}
+		// canonical name → number
+		if n, ok := ProtocolNumber(name); !ok || n != num {
+			t.Errorf("ProtocolNumber(%q) = (%d, %v), want (%d, true)", name, n, ok, num)
+		}
+		// number → canonical name → number
+		if n, ok := ProtocolNumber(ProtocolName(num)); !ok || n != num {
+			t.Errorf("round-trip ProtocolNumber(ProtocolName(%d)) = (%d, %v), want (%d, true)", num, n, ok, num)
+		}
+	}
+
+	// Exhaustive guard: for EVERY protocol number ProtocolName renders, the
+	// rendered name must reverse to that exact number. This catches any future
+	// render-only name added to ProtocolName without a ProtocolNumber reverse.
+	for p := 0; p < 256; p++ {
+		name := ProtocolName(uint8(p))
+		if name == "" {
+			continue
+		}
+		n, ok := ProtocolNumber(name)
+		if !ok || n != uint8(p) {
+			t.Errorf("ProtocolName(%d)=%q does not round-trip: ProtocolNumber(%q) = (%d, %v), want (%d, true)",
+				p, name, name, n, ok, p)
+		}
+	}
+}
+
 func TestProtocolIsPortBearingMatchesDataplaneExtraction(t *testing.T) {
 	tokens := []string{
 		"tcp", "udp", "junos-tcp-any", "junos-udp-any",
 		"sctp", // HAS wire ports but NOT extracted by this dataplane → not port-bearing
-		"icmp", "icmpv6", "icmp6", "gre", "ospf", "ipip", "esp", "ah",
+		"icmp", "icmpv6", "icmp6", "gre", "ospf", "ipip", "ipv6", "esp", "ah",
 		"vrrp", "igmp", "pim", "egp",
 		"junos-icmp-all", "junos-ping", "junos-icmp6-all", "junos-pingv6",
 		"junos-gre", "junos-ospf", "junos-ip-in-ip", "junos-ipip",

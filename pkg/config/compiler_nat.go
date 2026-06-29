@@ -1343,7 +1343,9 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 						// silently kept only the first port. parseDNATPortList
 						// handles bracket lists and `low to high` ranges in both
 						// the hierarchical and flat-set AST shapes.
-						rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, parseDNATPortList(m)...)
+						dports, dinvalid := parseDNATPortList(m)
+						rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, dports...)
+						rule.Match.InvalidDestinationPorts = append(rule.Match.InvalidDestinationPorts, dinvalid...)
 						if rule.Match.DestinationPort == 0 && len(rule.Match.DestinationPorts) > 0 {
 							rule.Match.DestinationPort = rule.Match.DestinationPorts[0]
 						}
@@ -1464,7 +1466,9 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 						// snapshot-build time (appendNATDestinationAddressName).
 						rule.Match.DestinationAddressName = nodeVal(m)
 					case "destination-port":
-						rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, parseDNATPortList(m)...)
+						dports, dinvalid := parseDNATPortList(m)
+						rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, dports...)
+						rule.Match.InvalidDestinationPorts = append(rule.Match.InvalidDestinationPorts, dinvalid...)
 						if rule.Match.DestinationPort == 0 && len(rule.Match.DestinationPorts) > 0 {
 							rule.Match.DestinationPort = rule.Match.DestinationPorts[0]
 						}
@@ -1530,8 +1534,29 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 //   - Hierarchical multi-port: destination-port { 80; 443; 20000 to 30000; }
 //   - Single port leaf: destination-port 8080;
 //   - Set syntax range: destination-port 20000 { to 30000; } (args=1 consumes low, "to N" is child)
-func parseDNATPortList(m *Node) []int {
-	var ports []int
+//
+// The second return value (#3446) is the list of raw tokens that did NOT parse
+// as an integer — e.g. `http`, `httpp`. The parser previously dropped these
+// silently, which let an all-nonnumeric `match destination-port` collapse to an
+// empty port list and then widen to the wildcard port at snapshot-build time
+// (H14). They are surfaced to the caller (stored on
+// NATMatch.InvalidDestinationPorts) so the strict commit gate can reject them
+// and the snapshot builders can fail CLOSED. The `to` range keyword is never
+// reported as an invalid token. Out-of-range numerics (0, -1, 70000) DO parse
+// as integers, so they flow through `ports` and are range-checked downstream
+// (validateNATMatchDestinationPortStrict + the 1..65535 builder filter).
+func parseDNATPortList(m *Node) (ports []int, invalid []string) {
+	addInvalid := func(tok string) {
+		// `to` is the range keyword; `[`/`]` are bracket-list delimiters that
+		// survive into the flat-set SetPath AST as literal tokens. None of these
+		// is an operator-entered port value, so they are never reported as an
+		// invalid port (only genuine garbage like `http` is).
+		switch tok {
+		case "to", "[", "]":
+			return
+		}
+		invalid = append(invalid, tok)
+	}
 	// Unified single-leaf shape (#2419): both the hierarchical parser and
 	// the flat-set SetPath now collapse a bracket list or a `low to high`
 	// range onto the node's own keys, with NO children:
@@ -1544,6 +1569,7 @@ func parseDNATPortList(m *Node) []int {
 		for i := 0; i < len(vals); i++ {
 			low, err := strconv.Atoi(vals[i])
 			if err != nil {
+				addInvalid(vals[i])
 				continue
 			}
 			if i+2 < len(vals) && vals[i+1] == "to" {
@@ -1557,7 +1583,7 @@ func parseDNATPortList(m *Node) []int {
 			}
 			ports = append(ports, low)
 		}
-		return ports
+		return ports, invalid
 	}
 	if len(m.Children) > 0 {
 		// Check for set-syntax port range: Keys=["destination-port","20000"] + child "to 30000"
@@ -1570,11 +1596,13 @@ func parseDNATPortList(m *Node) []int {
 						for p := low; p <= high; p++ {
 							ports = append(ports, p)
 						}
-						return ports
+						return ports, invalid
 					}
 				}
 				// No range — just a port with non-range children (shouldn't happen, but be safe)
 				ports = append(ports, low)
+			} else {
+				addInvalid(m.Keys[1])
 			}
 		}
 		// Multiple ports/ranges as children: destination-port { 80; 443; 20000 to 30000; }
@@ -1582,6 +1610,7 @@ func parseDNATPortList(m *Node) []int {
 			child := m.Children[i]
 			low, err := strconv.Atoi(child.Name())
 			if err != nil {
+				addInvalid(child.Name())
 				continue
 			}
 			// Hierarchical range: "20000 to 30000" → leaf Keys=["20000", "to", "30000"]
@@ -1609,9 +1638,11 @@ func parseDNATPortList(m *Node) []int {
 		// Single port: destination-port 8080;
 		if n, err := strconv.Atoi(v); err == nil {
 			ports = append(ports, n)
+		} else {
+			addInvalid(v)
 		}
 	}
-	return ports
+	return ports, invalid
 }
 
 // staticNATMappedPortFromKeys extracts the `mapped-port <port>` modifier

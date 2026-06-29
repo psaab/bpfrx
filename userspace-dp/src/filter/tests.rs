@@ -486,7 +486,11 @@ fn source_port_except_negation() {
         0,
         TermMatchExtra::default(),
     );
-    assert_eq!(result.action, FilterAction::Accept, "src port 53 is excepted");
+    assert_eq!(
+        result.action,
+        FilterAction::Accept,
+        "src port 53 is excepted"
+    );
     // Source port 9999 is NOT excepted -> match -> discard.
     let result = evaluate_filter(
         &state,
@@ -895,7 +899,8 @@ fn equivalent_snapshot_refresh_preserves_three_color_state_and_counters() {
         "",
         "",
         Some(&state),
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     assert!(
         std::sync::Arc::ptr_eq(
             &state.three_color_policers[0],
@@ -981,7 +986,8 @@ fn three_color_adding_lower_sorted_policer_does_not_reset_existing_runtime() {
         "",
         "",
         Some(&state),
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     let previous_runtime = state
         .three_color_policer_by_name
         .get("stable-pol")
@@ -1050,7 +1056,8 @@ fn three_color_compatible_refresh_observes_old_runtime_mutations_after_rebuild()
         "",
         "",
         Some(&state),
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     assert!(std::sync::Arc::ptr_eq(
         &state.three_color_policers[0],
         &refreshed.three_color_policers[0]
@@ -1146,7 +1153,8 @@ fn changed_snapshot_shape_resets_three_color_runtime_state() {
         "",
         "",
         Some(&state),
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     let refreshed_filter = refreshed.filters.get("inet:policed").unwrap();
     let second = evaluate_filter_ref_tx_selection_runtime_counted(
         refreshed_filter,
@@ -1718,7 +1726,8 @@ fn interface_filter_assignment() {
         &ifaces,
         "",
         "",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     // v4 filter on ifindex 5
     let result = evaluate_interface_filter(
         &state,
@@ -1805,7 +1814,8 @@ fn parse_filter_state_prequalifies_interface_and_lo0_filter_keys() {
         &ifaces,
         "protect-re",
         "protect-re-v6",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     assert_eq!(
         state.iface_filter_v4.get(&7).map(String::as_str),
         Some("inet:ingress-v4")
@@ -1849,7 +1859,8 @@ fn accept_only_output_filter_does_not_need_tx_eval() {
         &ifaces,
         "",
         "",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
 
     assert!(!interface_output_filter_needs_tx_eval(&state, 7, false));
     assert!(!filter_state_has_output_tx_selection(&state, false));
@@ -1888,7 +1899,8 @@ fn interface_filter_routing_instance_counted_returns_matching_override() {
         &ifaces,
         "",
         "",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
 
     assert!(interface_filter_affects_route_lookup(&state, 11, true));
     let routing_instance = evaluate_interface_filter_routing_instance_counted(
@@ -1936,7 +1948,8 @@ fn interface_output_filter_counted_records_term_hits() {
         &ifaces,
         "",
         "",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     let result = evaluate_interface_output_filter_counted(
         &state,
         7,
@@ -1985,7 +1998,8 @@ fn interface_output_filter_without_count_does_not_record_term_hits() {
         &ifaces,
         "",
         "",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     let result = evaluate_interface_output_filter_counted(
         &state,
         7,
@@ -2034,7 +2048,8 @@ fn lo0_filter_evaluation() {
         &[],
         "protect-RE",
         "",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     // SSH should pass lo0 filter
     let result = evaluate_lo0_filter(
         &state,
@@ -2275,7 +2290,8 @@ fn input_dscp_filter_families_changed_detects_three_color_shape_change() {
         std::slice::from_ref(&iface),
         "",
         "",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     let new = parse_filter_state_with_three_color_preserving(
         &filters,
         &[],
@@ -2284,7 +2300,8 @@ fn input_dscp_filter_families_changed_detects_three_color_shape_change() {
         "",
         "",
         Some(&old),
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
 
     assert!(
         !std::sync::Arc::ptr_eq(
@@ -2602,7 +2619,8 @@ fn evaluate_lo0_filter_ipv6_path() {
         &[],
         "",
         "protect-RE-v6",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     let accepted = evaluate_lo0_filter(
         &state,
         true,
@@ -2653,7 +2671,8 @@ fn evaluate_interface_filter_ipv6_input_path() {
         &ifaces,
         "",
         "",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     let result = evaluate_interface_filter(
         &state,
         9,
@@ -2796,7 +2815,8 @@ fn interface_filter_non_routing_counted_defers_pbr_term() {
         &ifaces,
         "",
         "",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
 
     // A packet that matches the routing-instance term must short-circuit to
     // the default (route-lookup wins) and must NOT increment that term's
@@ -2882,7 +2902,8 @@ fn interface_filter_tx_selection_wrappers_dispatch_and_default() {
         &ifaces,
         "",
         "",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
 
     let input = evaluate_interface_filter_tx_selection_counted(
         &state,
@@ -3001,7 +3022,8 @@ fn thin_accessor_predicates() {
         &ifaces,
         "",
         "",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
 
     // TX-selection accessor reads the TX-selection set, NOT the DSCP set:
     // true on the TX-only ifindex, false on the DSCP-only ifindex.
@@ -3051,7 +3073,8 @@ fn cached_and_runtime_tx_selection_agree_on_plain_term() {
         &ifaces,
         "",
         "",
-    ).expect("filter state compiles");
+    )
+    .expect("filter state compiles");
     let filter = state.iface_filter_v4_fast.get(&30).expect("input filter");
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
     let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
@@ -3283,7 +3306,11 @@ fn tcp_flags_term_forbidden_mask_excludes_negated_flag() {
         )
         .action
     };
-    assert_eq!(eval(0x02), FilterAction::Discard, "bare SYN must match syn & !ack");
+    assert_eq!(
+        eval(0x02),
+        FilterAction::Discard,
+        "bare SYN must match syn & !ack"
+    );
     assert_eq!(
         eval(0x12),
         FilterAction::Accept,
@@ -3334,8 +3361,16 @@ fn tcp_flags_term_forbidden_only_mask() {
         )
         .action
     };
-    assert_eq!(eval(0x02), FilterAction::Discard, "SYN (no RST) matches !rst");
-    assert_eq!(eval(0x04), FilterAction::Accept, "RST set must NOT match !rst");
+    assert_eq!(
+        eval(0x02),
+        FilterAction::Discard,
+        "SYN (no RST) matches !rst"
+    );
+    assert_eq!(
+        eval(0x04),
+        FilterAction::Accept,
+        "RST set must NOT match !rst"
+    );
 }
 
 #[test]
@@ -3651,7 +3686,8 @@ fn per_packet_match_marks_filter_cache_sensitive() {
         filter_input_v4: "pp".into(),
         ..Default::default()
     }];
-    let state = parse_filter_state(&filters, &[], &interfaces, "", "").expect("filter state compiles");
+    let state =
+        parse_filter_state(&filters, &[], &interfaces, "", "").expect("filter state compiles");
     assert!(
         state.iface_filter_v4_has_per_packet_l4_match.contains(&7),
         "interface input filter with a tcp-flags term must be marked per-packet-L4 cache-sensitive"
@@ -4418,7 +4454,11 @@ fn term_2400_valid_scoped_term_matches_only_its_scope() {
         0,
         TermMatchExtra::default(),
     );
-    assert_eq!(in_scope.action, FilterAction::Discard, "in-scope must match");
+    assert_eq!(
+        in_scope.action,
+        FilterAction::Discard,
+        "in-scope must match"
+    );
     // Wrong port: out of scope -> accept.
     let wrong_port = evaluate_filter(
         &state,
@@ -4674,6 +4714,21 @@ fn protocol_2505_named_protocols_resolve_scoped() {
 }
 
 #[test]
+fn protocol_3393_ipv6_resolves_scoped() {
+    // #3393 RED-on-revert guard: `from protocol ipv6` reaches the snapshot
+    // VERBATIM as the name "ipv6" (filters.go emits term.Protocols unresolved,
+    // unlike the application/NAT paths that pre-canonicalize to a number). The
+    // Go filter commit gate (filterProtocolResolvable) accepts "ipv6" since
+    // appid.ProtocolNumber("ipv6")==41 was closed, so proto_number — the Rust
+    // mirror — must resolve it to 41 too. Without the "ipv6" arm this errors
+    // with UnrepresentableFilterProtocol (commit/apply drift). Reverting the
+    // ip_proto.rs arm makes this fail.
+    assert_scoped_to("ipv6", 41);
+    assert_scoped_to("IPv6", 41);
+    assert_scoped_to(" ipv6 ", 41);
+}
+
+#[test]
 fn protocol_2505_normalization_uppercase_and_whitespace() {
     // The stale local parser did not trim/lowercase. The shared resolver does,
     // matching the Go gate's strings.TrimSpace + ToLower.
@@ -4693,6 +4748,62 @@ fn protocol_2505_junos_aliases_resolve() {
     assert_scoped_to("junos-gre", 47);
     assert_scoped_to("junos-ospf", 89);
     assert_scoped_to("junos-ip-in-ip", 4);
+}
+
+#[test]
+fn filter_protocol_accept_set_subset_of_resolver() {
+    // Contract guard (#3393): EVERY named token the Go firewall-filter commit
+    // gate (config.filterProtocolResolvable, pkg/config/
+    // compiler_validate_strict.go) accepts MUST resolve through proto_number,
+    // because a filter's `from protocol <token>` reaches this snapshot path
+    // VERBATIM (filters.go emits term.Protocols with no name->number
+    // canonicalization). A token the gate accepts but proto_number cannot
+    // resolve commits in Go yet fails snapshot compilation here with
+    // UnrepresentableFilterProtocol — commit/apply drift (the #1961 / #3393
+    // class). The numeric-token arm (0..=255) is covered separately.
+    //
+    // CAVEAT: this list is a HARDCODED mirror of the filterProtocolResolvable
+    // named set — it is NOT a mechanical cross-language enumeration. The loop
+    // only exercises the tokens written below, so it CANNOT notice a protocol
+    // newly ADDED to that Go gate; this array MUST be updated in lockstep with
+    // filterProtocolResolvable (and with proto_number above). The lockstep is
+    // enforced on the Go side by pkg/config TestFilterProtocolNamedSetMatchesRustMirror,
+    // which parses the named set out of BOTH this array and the Go gate source
+    // and fails if they diverge — keep that pin green when editing either list.
+    for token in [
+        "tcp",
+        "junos-tcp-any",
+        "udp",
+        "junos-udp-any",
+        "icmp",
+        "junos-icmp-all",
+        "junos-ping",
+        "icmpv6",
+        "icmp6",
+        "junos-icmp6-all",
+        "junos-pingv6",
+        "gre",
+        "junos-gre",
+        "ospf",
+        "junos-ospf",
+        "junos-ip-in-ip",
+        "junos-ipip",
+        "ipip",
+        "ipv6",
+        "egp",
+        "igmp",
+        "pim",
+        "ah",
+        "esp",
+        "sctp",
+        "vrrp",
+    ] {
+        assert!(
+            proto_number(token).is_some(),
+            "filterProtocolResolvable accepts {token:?} but proto_number does not \
+             resolve it — Go commit-accept vs Rust-apply drift (#3393)"
+        );
+    }
 }
 
 #[test]
@@ -5700,8 +5811,7 @@ fn cached_tx_selection_records_all_fallthrough_count_terms() {
 
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
     let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
-    let cached =
-        evaluate_filter_ref_tx_selection_cached(filter, src, dst, PROTO_TCP, 40000, 80, 0);
+    let cached = evaluate_filter_ref_tx_selection_cached(filter, src, dst, PROTO_TCP, 40000, 80, 0);
 
     // The cached descriptor must carry BOTH matched count terms (deduped to 2).
     assert_eq!(
@@ -5781,7 +5891,9 @@ fn fallthrough_log_action_follows_terminal_discard() {
         TermMatchExtra::default(),
     );
     assert_eq!(r.action, FilterAction::Discard);
-    let lm = r.log_match.expect("fall-through log term must emit a log_match");
+    let lm = r
+        .log_match
+        .expect("fall-through log term must emit a log_match");
     // Identity is the fall-through logging term (term 0), but the action must be
     // the terminal verdict, NOT the Accept placeholder.
     assert_eq!(lm.term_id, 0);
@@ -5831,7 +5943,9 @@ fn fallthrough_log_action_follows_terminal_reject() {
         TermMatchExtra::default(),
     );
     assert_eq!(r.action, FilterAction::Reject);
-    let lm = r.log_match.expect("fall-through log term must emit a log_match");
+    let lm = r
+        .log_match
+        .expect("fall-through log term must emit a log_match");
     assert_eq!(
         lm.action,
         FilterAction::Reject,
@@ -6447,11 +6561,7 @@ fn pbr_session_hit_path_counts_fallthrough_term_per_packet() {
 
 // Build a one-term filter carrying a flexible-match-range constraint, then a
 // trailing accept-all term so a non-match is observably Accept.
-fn flex_filter(
-    family: &str,
-    proto: &str,
-    flex: FlexMatchSnapshot,
-) -> Vec<FirewallFilterSnapshot> {
+fn flex_filter(family: &str, proto: &str, flex: FlexMatchSnapshot) -> Vec<FirewallFilterSnapshot> {
     vec![FirewallFilterSnapshot {
         name: "fx".into(),
         family: family.into(),
@@ -6673,7 +6783,11 @@ fn flex_match_respects_mask() {
         0,
         extra_flex(&l3_miss),
     );
-    assert_eq!(miss.action, FilterAction::Accept, "low byte 0x29 must not match");
+    assert_eq!(
+        miss.action,
+        FilterAction::Accept,
+        "low byte 0x29 must not match"
+    );
 }
 
 #[test]

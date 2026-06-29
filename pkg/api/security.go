@@ -246,6 +246,37 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 		result = append(result, pi)
 	}
 
+	// #3363: the IMPLICIT default-policy catch-all now has a reserved hit
+	// counter (read via the DefaultPolicySentinelID handle). Surface it as a
+	// final synthetic policy set ("-"/"-") with one rule named
+	// dataplane.DefaultPolicyName so automation/dashboards can audit
+	// default-deny/permit hits — the most security-relevant boundary — without
+	// scraping logs. Counts gate on policy-stats like every other rule.
+	{
+		defRule := PolicyRule{
+			Name:         dataplane.DefaultPolicyName,
+			Action:       policyActionStr(cfg.Security.DefaultPolicy),
+			SrcAddresses: []string{},
+			DstAddresses: []string{},
+			Applications: []string{},
+			PolicyID:     dataplane.DefaultPolicySentinelID,
+			RuleID:       dataplane.DefaultPolicyName,
+		}
+		if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
+			if ctrs, err := s.dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err == nil {
+				defRule.HitPackets = ctrs.Packets
+				defRule.HitBytes = ctrs.Bytes
+			} else if readErr == nil {
+				readErr = err
+			}
+		}
+		result = append(result, PolicyInfo{
+			FromZone: "-",
+			ToZone:   "-",
+			Rules:    []PolicyRule{defRule},
+		})
+	}
+
 	if readErr != nil {
 		writeError(w, http.StatusInternalServerError,
 			"policy counter read failed: "+readErr.Error())
@@ -355,7 +386,11 @@ func parseEventZoneFilter(s string) (uint16, bool) {
 func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
-		writeOK(w, MatchPoliciesResult{Action: "deny (default)"})
+		// #3375: no active config is the deterministic fail-closed default deny.
+		// Surface the explicit string AND the typed default_used bit (same SSOT
+		// renderer the gRPC surface uses).
+		nilRes := policymatch.Result{DefaultUsed: true, Action: config.PolicyDeny}
+		writeOK(w, MatchPoliciesResult{Action: nilRes.DisplayAction(), DefaultUsed: true})
 		return
 	}
 
@@ -481,12 +516,12 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	if res.HostInboundUnmatched {
 		writeOK(w, MatchPoliciesResult{
 			HostInboundUnmatched: true,
-			Action:               "host-inbound (local delivery; not governed by transit/global/default policy)",
+			Action:               res.DisplayAction(),
 		})
 		return
 	}
 	if !res.Matched {
-		writeOK(w, MatchPoliciesResult{Action: policymatch.ActionString(res.Action) + " (default)"})
+		writeOK(w, MatchPoliciesResult{Action: res.DisplayAction(), DefaultUsed: res.DefaultUsed})
 		return
 	}
 	writeOK(w, MatchPoliciesResult{
@@ -496,7 +531,7 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		FromZone:     res.FromZone,
 		ToZone:       res.ToZone,
 		PolicyID:     res.PolicyID,
-		Action:       policymatch.ActionString(res.Action),
+		Action:       res.DisplayAction(),
 		SrcAddresses: res.SrcAddresses,
 		DstAddresses: res.DstAddresses,
 		Applications: res.Applications,

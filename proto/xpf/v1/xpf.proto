@@ -632,8 +632,11 @@ message MatchPoliciesResponse {
   // matched no host-bound policy (#3285). The dataplane host gate returns None
   // here — no implicit host default-deny and NO transit global/default
   // fallback — so local delivery proceeds. When set, `matched` is false and
-  // `action` is empty; clients must render "host-inbound (local delivery; not
-  // governed by transit/global/default policy)", NOT a default-policy verdict.
+  // `default_used` is false (the host path has no default-policy fallback).
+  // Since #3375 the server populates `action` with the explanatory string
+  // "host-inbound (local delivery; not governed by transit/global/default
+  // policy)" (the SSOT shared with the REST surface), so `action` is NON-empty
+  // and a client may render it directly; it is NOT a default-policy verdict.
   bool host_inbound_unmatched = 7;
   // global is true when the matched policy is a `policy global` rule rather
   // than a zone-pair rule (#3331); it distinguishes a global-scope verdict from
@@ -652,6 +655,13 @@ message MatchPoliciesResponse {
   // against the session table and the policy-deny/permit audit log even when
   // policy names collide across scopes. Set only when matched is true.
   uint32 policy_id = 11;
+  // default_used is true when no policy matched and `action` is the configured
+  // default-policy verdict (#3375), including the no-active-config fail-closed
+  // case (deny). It is the typed form of the " (default)" suffix on `action`,
+  // so a client can branch on the posture without string-parsing. False for a
+  // concrete policy match and for host_inbound_unmatched (which has no
+  // default-policy fallback).
+  bool default_used = 12;
 }
 
 // --- NAT rule counters ---

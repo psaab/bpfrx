@@ -1,7 +1,9 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/http"
@@ -16,22 +18,75 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
+// sessionCursorIterator is the optional cursor-based session iteration
+// surface. The production runtime dataplane (the userspace
+// LegacyDataPlaneAdapter wrapping *dataplane.Manager) implements it; REST
+// type-asserts s.dp to it for stable page_token pagination and falls back
+// to the offset/limit path when it is not available. This mirrors the
+// gRPC sessionCursorIterator (pkg/grpcapi/runtime.go) (#3421 H4).
+type sessionCursorIterator interface {
+	IterateSessionsFrom(*dataplane.SessionKey, func(dataplane.SessionKey, dataplane.SessionValue) bool) error
+	IterateSessionsV6From(*dataplane.SessionKeyV6, func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+}
+
 func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		writeError(w, http.StatusServiceUnavailable, "dataplane not loaded")
 		return
 	}
 
-	limit := queryInt(r, "limit", 100)
-	if limit > 10000 {
-		limit = 10000
-	}
-	offset := queryInt(r, "offset", 0)
-
 	view := s.buildSessionView()
 	q, errMsg := buildSessionQuery(r, view)
 	if errMsg != "" {
 		writeError(w, http.StatusBadRequest, errMsg)
+		return
+	}
+
+	// page_size>0 selects cursor-based pagination over a stable page_token,
+	// matching the gRPC contract (page_size triggers getSessionsCursor).
+	// The offset path remains for backward compatibility but is best-effort:
+	// the backend iterates helper map order, so an offset against a fresh
+	// traversal can skip/duplicate rows when sessions expire or insert
+	// between pages (#3421 H4). queryIntStrict fails closed on a malformed
+	// or negative value (#3421 M8).
+	pageSize, ok := queryIntStrict(r, "page_size", 0)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid page_size: "+r.URL.Query().Get("page_size"))
+		return
+	}
+	if pageSize > 10000 {
+		pageSize = 10000
+	}
+	if pageSize > 0 {
+		if iterDP, cursorOK := s.dp.(sessionCursorIterator); cursorOK {
+			s.sessionsCursor(w, r, iterDP, &q, view, pageSize)
+			return
+		}
+		// Cursor iteration unsupported by this dataplane (test/edge
+		// configurations); fall through to the offset/limit path so the
+		// request still succeeds, mirroring the gRPC fallback.
+	}
+
+	s.sessionsOffset(w, r, &q, view)
+}
+
+// sessionsOffset serves the backward-compatible limit/offset pagination
+// path. limit/offset parse fail-closed on malformed/negative input (#3421
+// M8); an iterator error fails the request rather than returning a partial
+// list as success (#2469). Rows are enriched and reverse-counter-merged
+// identically to the cursor path (#3419).
+func (s *Server) sessionsOffset(w http.ResponseWriter, r *http.Request, q *sessionQuery, view sessionView) {
+	limit, ok := queryIntStrict(r, "limit", 100)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid limit: "+r.URL.Query().Get("limit"))
+		return
+	}
+	if limit > 10000 {
+		limit = 10000
+	}
+	offset, ok := queryIntStrict(r, "offset", 0)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid offset: "+r.URL.Query().Get("offset"))
 		return
 	}
 
@@ -47,16 +102,7 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 			return true
 		}
 		if idx >= offset && len(all) < limit {
-			// Merge the companion reverse entry's counters into the
-			// forward entry so REST top-talkers/accounting report the
-			// full bidirectional volume, matching gRPC (#3419 H3).
-			if rev, err := s.dp.GetSessionV4(val.ReverseKey); err == nil {
-				val.RevPackets += rev.RevPackets
-				val.RevBytes += rev.RevBytes
-				val.FwdPackets += rev.FwdPackets
-				val.FwdBytes += rev.FwdBytes
-			}
-			all = append(all, sessionEntryV4(key, val, now, view))
+			all = append(all, s.enrichSessionV4(key, val, now, view))
 		}
 		idx++
 		return true
@@ -71,13 +117,7 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 			return true
 		}
 		if idx >= offset && len(all) < limit {
-			if rev, err := s.dp.GetSessionV6(val.ReverseKey); err == nil {
-				val.RevPackets += rev.RevPackets
-				val.RevBytes += rev.RevBytes
-				val.FwdPackets += rev.FwdPackets
-				val.FwdBytes += rev.FwdBytes
-			}
-			all = append(all, sessionEntryV6(key, val, now, view))
+			all = append(all, s.enrichSessionV6(key, val, now, view))
 		}
 		idx++
 		return true
@@ -92,6 +132,140 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 		Offset:   offset,
 		Sessions: all,
 	})
+}
+
+// sessionsCursor serves cursor-based pagination using the same stable
+// page_token machinery as gRPC: it iterates v4 then v6 from the cursor,
+// emitting up to page_size matching rows and a next_page_token that resumes
+// exactly after the last row. Because IterateSessionsFrom resumes AFTER the
+// cursor key, pages never skip or duplicate rows across map mutation the way
+// the offset path can (#3421 H4). Rows use the SAME #3419 enrichment +
+// reverse-counter merge as the offset path, so cursor and offset modes
+// report identical rows and counters. An iterator error fails the request
+// (#2469).
+func (s *Server) sessionsCursor(w http.ResponseWriter, r *http.Request, iterDP sessionCursorIterator, q *sessionQuery, view sessionView, pageSize int) {
+	startV4 := true
+	startV6 := false
+	var cursorV4 *dataplane.SessionKey
+	var cursorV6 *dataplane.SessionKeyV6
+
+	if token := r.URL.Query().Get("page_token"); token != "" {
+		kind, keyBytes, err := parseSessionPageToken(token)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid page_token: "+err.Error())
+			return
+		}
+		switch kind {
+		case "v4":
+			k, err := decodeSessionKeyV4(keyBytes)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid v4 page_token: "+err.Error())
+				return
+			}
+			cursorV4 = &k
+		case "v6start":
+			startV4 = false
+			startV6 = true
+		case "v6":
+			startV4 = false
+			startV6 = true
+			k, err := decodeSessionKeyV6(keyBytes)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid v6 page_token: "+err.Error())
+				return
+			}
+			cursorV6 = &k
+		}
+	}
+
+	now := monotonicSeconds()
+	all := make([]SessionEntry, 0, pageSize)
+	var lastV4 dataplane.SessionKey
+	var lastV6 dataplane.SessionKeyV6
+
+	// Phase 1: v4 from cursor.
+	if startV4 {
+		if err := iterDP.IterateSessionsFrom(cursorV4, func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if len(all) >= pageSize {
+				return false
+			}
+			if !q.matchV4(key, val) {
+				return true
+			}
+			all = append(all, s.enrichSessionV4(key, val, now, view))
+			lastV4 = key
+			return true
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "iterate sessions: "+err.Error())
+			return
+		}
+		if len(all) >= pageSize {
+			writeOK(w, SessionListResponse{
+				PageSize:      pageSize,
+				NextPageToken: encodePageTokenV4(lastV4),
+				Sessions:      all,
+			})
+			return
+		}
+		startV6 = true
+	}
+
+	// Phase 2: v6.
+	if startV6 {
+		if err := iterDP.IterateSessionsV6From(cursorV6, func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if len(all) >= pageSize {
+				return false
+			}
+			if !q.matchV6(key, val) {
+				return true
+			}
+			all = append(all, s.enrichSessionV6(key, val, now, view))
+			lastV6 = key
+			return true
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "iterate sessions_v6: "+err.Error())
+			return
+		}
+		if len(all) >= pageSize {
+			writeOK(w, SessionListResponse{
+				PageSize:      pageSize,
+				NextPageToken: encodePageTokenV6(lastV6),
+				Sessions:      all,
+			})
+			return
+		}
+	}
+
+	// Both families exhausted — last page, empty next_page_token.
+	writeOK(w, SessionListResponse{
+		PageSize: pageSize,
+		Sessions: all,
+	})
+}
+
+// enrichSessionV4 merges the companion reverse entry's counters into the
+// forward entry (full bidirectional volume, #3419 H3) and renders the
+// enriched REST row (#3419). Shared by the offset and cursor paths so they
+// report identical rows and counters.
+func (s *Server) enrichSessionV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, view sessionView) SessionEntry {
+	if rev, err := s.dp.GetSessionV4(val.ReverseKey); err == nil {
+		val.RevPackets += rev.RevPackets
+		val.RevBytes += rev.RevBytes
+		val.FwdPackets += rev.FwdPackets
+		val.FwdBytes += rev.FwdBytes
+	}
+	return sessionEntryV4(key, val, now, view)
+}
+
+// enrichSessionV6 is the IPv6 companion to enrichSessionV4.
+func (s *Server) enrichSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, view sessionView) SessionEntry {
+	if rev, err := s.dp.GetSessionV6(val.ReverseKey); err == nil {
+		val.RevPackets += rev.RevPackets
+		val.RevBytes += rev.RevBytes
+		val.FwdPackets += rev.FwdPackets
+		val.FwdBytes += rev.FwdBytes
+	}
+	return sessionEntryV6(key, val, now, view)
 }
 
 func (s *Server) sessionSummaryHandler(w http.ResponseWriter, _ *http.Request) {
@@ -149,11 +323,31 @@ func (s *Server) sessionSummaryHandler(w http.ResponseWriter, _ *http.Request) {
 	writeOK(w, summary)
 }
 
-func (s *Server) clearSessionsHandler(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) clearSessionsHandler(w http.ResponseWriter, r *http.Request) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		writeError(w, http.StatusServiceUnavailable, "dataplane not loaded")
 		return
 	}
+
+	// REST clear is an unconditional clear-ALL of the local table. gRPC
+	// supports a FILTERED clear (source/destination prefix, protocol, zone,
+	// ports, application, interface, nat-only, source-nat-pool); this
+	// handler does not. Silently ignoring filter parameters would degrade a
+	// client's intended-narrow clear into a full-table wipe — so reject any
+	// query string or request body with HTTP 400 rather than performing an
+	// unexpected clear-all (#3421 H6). A parameterless clear (the documented
+	// contract) proceeds. Test against r.URL.RawQuery (not url.Query(),
+	// which silently drops un-decodable pairs like `?%zz` and could let a
+	// non-empty query proceed to clear-all — SMR); a non-zero ContentLength
+	// (including the chunked-transfer -1 sentinel) also rejects so a
+	// body-carrying request cannot be misread as clear-all. Filtered REST
+	// clear plus HA peer propagation is tracked separately in #3423.
+	if r.URL.RawQuery != "" || r.ContentLength != 0 {
+		writeError(w, http.StatusBadRequest,
+			"filtered clear not supported on this endpoint; it clears all local sessions and accepts no parameters")
+		return
+	}
+
 	v4, v6, err := s.dp.ClearAllSessions()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -383,7 +577,14 @@ type sessionQuery struct {
 	iface        string
 	snatPool     string
 	snatPoolNets []*net.IPNet
-	view         sessionView
+	// source/destination prefix + port filters (#3421 M2), mirroring the
+	// gRPC sessionFilter src/dst predicates. A nil net / zero port means
+	// "no filter" on that dimension.
+	srcNet  *net.IPNet
+	dstNet  *net.IPNet
+	srcPort uint16
+	dstPort uint16
+	view    sessionView
 }
 
 // buildSessionQuery parses and validates the session filter query
@@ -419,7 +620,52 @@ func buildSessionQuery(r *http.Request, view sessionView) (sessionQuery, string)
 		}
 		q.snatPoolNets = nets
 	}
+
+	// Source/destination prefix + port filters (#3421 M2). These FAIL
+	// CLOSED on a malformed value (HTTP 400) rather than zeroing the
+	// predicate and widening the query — matching the gRPC sessionFilter
+	// contract.
+	if sp := r.URL.Query().Get("source_prefix"); sp != "" {
+		n, err := parseSessionPrefix(sp)
+		if err != nil {
+			return q, "invalid source_prefix filter: " + sp
+		}
+		q.srcNet = n
+	}
+	if dp := r.URL.Query().Get("destination_prefix"); dp != "" {
+		n, err := parseSessionPrefix(dp)
+		if err != nil {
+			return q, "invalid destination_prefix filter: " + dp
+		}
+		q.dstNet = n
+	}
+	srcPort, ok := queryUint16Strict(r, "source_port", 0)
+	if !ok {
+		return q, "invalid source_port filter: " + r.URL.Query().Get("source_port")
+	}
+	q.srcPort = srcPort
+	dstPort, ok := queryUint16Strict(r, "destination_port", 0)
+	if !ok {
+		return q, "invalid destination_port filter: " + r.URL.Query().Get("destination_port")
+	}
+	q.dstPort = dstPort
+
 	return q, ""
+}
+
+// parseSessionPrefix parses an operator prefix filter — a CIDR or a bare IP
+// (bare IPs become host networks). Mirrors pkg/grpcapi parseSessionPrefix.
+func parseSessionPrefix(prefix string) (*net.IPNet, error) {
+	cidr := prefix
+	if !strings.Contains(cidr, "/") {
+		if strings.Contains(cidr, ":") {
+			cidr += "/128"
+		} else {
+			cidr += "/32"
+		}
+	}
+	_, n, err := net.ParseCIDR(cidr)
+	return n, err
 }
 
 func (q *sessionQuery) matchV4(key dataplane.SessionKey, val dataplane.SessionValue) bool {
@@ -430,6 +676,18 @@ func (q *sessionQuery) matchV4(key dataplane.SessionKey, val dataplane.SessionVa
 		return false
 	}
 	if q.proto != "" && !protoFilterMatches(key.Protocol, q.proto) {
+		return false
+	}
+	if q.srcNet != nil && !q.srcNet.Contains(net.IP(key.SrcIP[:])) {
+		return false
+	}
+	if q.dstNet != nil && !q.dstNet.Contains(net.IP(key.DstIP[:])) {
+		return false
+	}
+	if q.srcPort != 0 && ntohs(key.SrcPort) != q.srcPort {
+		return false
+	}
+	if q.dstPort != 0 && ntohs(key.DstPort) != q.dstPort {
 		return false
 	}
 	if q.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
@@ -462,6 +720,18 @@ func (q *sessionQuery) matchV6(key dataplane.SessionKeyV6, val dataplane.Session
 		return false
 	}
 	if q.proto != "" && !protoFilterMatches(key.Protocol, q.proto) {
+		return false
+	}
+	if q.srcNet != nil && !q.srcNet.Contains(net.IP(key.SrcIP[:])) {
+		return false
+	}
+	if q.dstNet != nil && !q.dstNet.Contains(net.IP(key.DstIP[:])) {
+		return false
+	}
+	if q.srcPort != 0 && ntohs(key.SrcPort) != q.srcPort {
+		return false
+	}
+	if q.dstPort != 0 && ntohs(key.DstPort) != q.dstPort {
 		return false
 	}
 	if q.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
@@ -657,4 +927,90 @@ func protoName(p uint8) string {
 		return "ICMPv6"
 	}
 	return strings.ToUpper(name)
+}
+
+// --- Cursor page-token codec (#3421 H4) ---
+//
+// Token format mirrors the gRPC surface (pkg/grpcapi/server_sessions.go):
+//
+//	"v4:<hex-key>"  — resume v4 iteration after this key, then v6
+//	"v6:<hex-key>"  — v4 done, resume v6 iteration after this key
+//	"v6start"       — v4 done, start v6 from the beginning
+//
+// The blob is base64url(rawkind+":"+hex(key-bytes)). Tokens encode local
+// session-map keys and are only meaningful on the node that issued them;
+// they are opaque to clients.
+
+func encodePageTokenV4(key dataplane.SessionKey) string {
+	b := make([]byte, 13)
+	copy(b[0:4], key.SrcIP[:])
+	copy(b[4:8], key.DstIP[:])
+	binary.NativeEndian.PutUint16(b[8:10], key.SrcPort)
+	binary.NativeEndian.PutUint16(b[10:12], key.DstPort)
+	b[12] = key.Protocol
+	return base64.RawURLEncoding.EncodeToString([]byte("v4:" + hex.EncodeToString(b)))
+}
+
+func encodePageTokenV6(key dataplane.SessionKeyV6) string {
+	b := make([]byte, 37)
+	copy(b[0:16], key.SrcIP[:])
+	copy(b[16:32], key.DstIP[:])
+	binary.NativeEndian.PutUint16(b[32:34], key.SrcPort)
+	binary.NativeEndian.PutUint16(b[34:36], key.DstPort)
+	b[36] = key.Protocol
+	return base64.RawURLEncoding.EncodeToString([]byte("v6:" + hex.EncodeToString(b)))
+}
+
+// parseSessionPageToken returns the token kind ("v4", "v6", "v6start") and
+// the raw key bytes (nil for "v6start").
+func parseSessionPageToken(token string) (kind string, keyBytes []byte, err error) {
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid page_token encoding: %w", err)
+	}
+	str := string(raw)
+	if str == "v6start" {
+		return "v6start", nil, nil
+	}
+	switch {
+	case strings.HasPrefix(str, "v4:"):
+		b, err := hex.DecodeString(str[3:])
+		if err != nil {
+			return "", nil, fmt.Errorf("invalid v4 page_token hex: %w", err)
+		}
+		return "v4", b, nil
+	case strings.HasPrefix(str, "v6:"):
+		b, err := hex.DecodeString(str[3:])
+		if err != nil {
+			return "", nil, fmt.Errorf("invalid v6 page_token hex: %w", err)
+		}
+		return "v6", b, nil
+	}
+	return "", nil, fmt.Errorf("invalid page_token prefix")
+}
+
+func decodeSessionKeyV4(b []byte) (dataplane.SessionKey, error) {
+	var key dataplane.SessionKey
+	if len(b) < 13 {
+		return key, fmt.Errorf("v4 key too short: %d", len(b))
+	}
+	copy(key.SrcIP[:], b[0:4])
+	copy(key.DstIP[:], b[4:8])
+	key.SrcPort = binary.NativeEndian.Uint16(b[8:10])
+	key.DstPort = binary.NativeEndian.Uint16(b[10:12])
+	key.Protocol = b[12]
+	return key, nil
+}
+
+func decodeSessionKeyV6(b []byte) (dataplane.SessionKeyV6, error) {
+	var key dataplane.SessionKeyV6
+	if len(b) < 37 {
+		return key, fmt.Errorf("v6 key too short: %d", len(b))
+	}
+	copy(key.SrcIP[:], b[0:16])
+	copy(key.DstIP[:], b[16:32])
+	key.SrcPort = binary.NativeEndian.Uint16(b[32:34])
+	key.DstPort = binary.NativeEndian.Uint16(b[34:36])
+	key.Protocol = b[36]
+	return key, nil
 }

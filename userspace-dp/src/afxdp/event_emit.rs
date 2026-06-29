@@ -41,6 +41,11 @@ const SCREEN_IP_MALFORMED: u32 = 1 << 18;
 /// screen event path so it surfaces alongside other screen activity; the
 /// triggering 5-tuple is the new source that forced an eviction.
 const SCREEN_SCAN_TABLE_PRESSURE: u32 = 1 << 19;
+/// #3315: the per-zone SYN rate crossed `alarm-threshold` (below
+/// `attack-threshold`). A log-only NOTICE-severity alarm, NOT a drop — like
+/// scan-table-pressure it rides the screen event frame with action=PERMIT, so
+/// the packet still forwards. Rate-limited to ≤1/sec/zone in the screen runtime.
+const SCREEN_SYN_FLOOD_ALARM: u32 = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FilterLogSource {
@@ -479,6 +484,7 @@ fn screen_reason_id(reason: &'static str) -> u32 {
         "icmp-fragment" => SCREEN_ICMP_FRAGMENT,
         "ip-malformed" => SCREEN_IP_MALFORMED,
         "scan-table-pressure" => SCREEN_SCAN_TABLE_PRESSURE,
+        "syn-flood-alarm" => SCREEN_SYN_FLOOD_ALARM,
         _ => 0,
     }
 }
