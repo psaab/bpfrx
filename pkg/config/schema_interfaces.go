@@ -25,7 +25,7 @@ package config
 // low-risk pass-through integers), `speed`/`duplex`/`encapsulation`
 // (free-form pass-through strings).
 var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &schemaNode{desc: "Interface name", valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-	"description": {desc: "Text description of interface", args: 1, children: nil},
+	"description": {desc: "Text description of interface", args: 1, scalar: true, children: nil},
 	// Compiled verbatim (compiler_interfaces.go:44, Atoi with the
 	// error swallowed → garbage silently means "MTU not set", the
 	// zero-value sentinel) and passed through to networkd MTUBytes=
@@ -69,7 +69,7 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 	}},
 	"tunnel": {desc: "Tunnel parameters", children: tunnelSchemaChildren()},
 	"unit": {desc: "Logical unit number", args: 1, valueHint: ValueHintUnitNumber, placeholder: "<unit-number>", children: map[string]*schemaNode{
-		"description":    {desc: "Text description", args: 1, placeholder: "<text>", children: nil},
+		"description":    {desc: "Text description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 		"point-to-point": {desc: "Point-to-point interface", children: nil},
 		// 802.1Q VID is a 12-bit wire field: 0 is the compiler's
 		// "untagged" zero-value sentinel and 4095 is reserved, so

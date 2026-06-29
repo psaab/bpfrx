@@ -2669,6 +2669,99 @@ func validateScreenUnknownStrict(cfg *Config) error {
 	return nil
 }
 
+// validateTrailingTokensStrict hard-rejects trailing tokens that rode past
+// the legitimate value arity of a config leaf the generic schema-walk scalar
+// gate cannot reach (#3332). Two shapes leak:
+//
+//   - address-book `address <name> <prefix>` / `address <name> description
+//     <text>`: the `address` schema node is `multi:true` (it must absorb the
+//     `description` sub-token onto its Keys to keep the #2419 dual-AST shape),
+//     so the scalar-leaf arity gate skips it, and the compiler reads only the
+//     prefix / description-text slot — `address h2 description web-server
+//     bogus` silently drops `bogus`.
+//   - IKE gateway compact-hierarchical `dynamic hostname <fqdn> <extra>`: the
+//     flat-set form lands a `hostname` scalar CHILD the generic gate covers,
+//     but the compact form collapses the tokens onto the parent `dynamic`
+//     node's Keys and the compiler reads only Keys[2].
+//
+// Both record the leftover tokens on the typed struct during compile
+// (mergeAddressNode / compileIPsec); this gate makes the silent drop
+// operator-visible. Strict on commit / commit-check; the call site
+// (compiler.go) downgrades to a warning on the tolerant load / peer-sync
+// path so an already-persisted or peer-synced config still boots (#1960
+// no-brick) — the dropped token never reached the dataplane, so a leniently
+// loaded config runs exactly as it did before the gate. The walk is
+// deterministic (entries sorted by name). Mirrors validateScreenUnknownStrict.
+func validateTrailingTokensStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// Address books: the global book plus every zone-local book. The
+	// zone-local originals (sec.Zones[z].AddressBook) carry the recorded
+	// TrailingTokens; resolveZoneLocalAddressBooks copies only Value /
+	// Description into the qualified global entries, so both sources are
+	// walked to catch the leak regardless of attachment point.
+	checkBook := func(scope string, book *AddressBook) error {
+		if book == nil {
+			return nil
+		}
+		names := make([]string, 0, len(book.Addresses))
+		for name := range book.Addresses {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			addr := book.Addresses[name]
+			if addr == nil || len(addr.TrailingTokens) == 0 {
+				continue
+			}
+			return fmt.Errorf(
+				"security %saddress-book address %q: unexpected trailing token "+
+					"%q (an address takes a single prefix or `description "+
+					"<text>`; the extra token would be silently dropped — "+
+					"quote a multi-word description as `\"...\"`)",
+				scope, name, addr.TrailingTokens[0])
+		}
+		return nil
+	}
+	if err := checkBook("", cfg.Security.AddressBook); err != nil {
+		return err
+	}
+	zoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		zoneNames = append(zoneNames, name)
+	}
+	sort.Strings(zoneNames)
+	for _, zn := range zoneNames {
+		z := cfg.Security.Zones[zn]
+		if z == nil {
+			continue
+		}
+		if err := checkBook(fmt.Sprintf("zones security-zone %s ", zn), z.AddressBook); err != nil {
+			return err
+		}
+	}
+
+	// IKE gateways: compact-hierarchical `dynamic hostname <fqdn> <extra>`.
+	gwNames := make([]string, 0, len(cfg.Security.IPsec.Gateways))
+	for name := range cfg.Security.IPsec.Gateways {
+		gwNames = append(gwNames, name)
+	}
+	sort.Strings(gwNames)
+	for _, gn := range gwNames {
+		gw := cfg.Security.IPsec.Gateways[gn]
+		if gw == nil || len(gw.DynamicHostnameExtras) == 0 {
+			continue
+		}
+		return fmt.Errorf(
+			"security ike gateway %q dynamic hostname: unexpected trailing "+
+				"token %q (the dynamic peer hostname is a single FQDN; the "+
+				"extra token would be silently dropped)",
+			gn, gw.DynamicHostnameExtras[0])
+	}
+	return nil
+}
+
 // validateFlowAgingStrict is the #3440 H2 commit-time gate for
 // `security flow aging`. The aging subtree was an opaque untyped schema
 // node, so its values were parsed with a bare strconv.Atoi and stored with
@@ -3242,6 +3335,56 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 					"falls back to the global per-protocol timeout instead of the "+
 					"configured one)",
 				name, app.UnknownTimeouts[0], appTimeoutMin, appTimeoutMax)
+		}
+		// #3348: a malformed icmp-type / icmp-code (non-integer or outside
+		// 0..255). The schema range-validates the TOP-LEVEL application leaves at
+		// commit-check, but an inline `term` is opaque to the schema walk
+		// (children:nil), so a bad inline icmp-type would otherwise be silently
+		// dropped by parseICMPTypeCode — leaving the term UNCONSTRAINED (matching
+		// EVERY ICMP type), a fail-open widening that is the exact inverse of this
+		// issue's fix. compileApplications records the raw token in app.UnknownICMP
+		// (mirroring UnknownTimeouts); reject the first one here so the silent
+		// widening becomes an operator-visible commit error. Strict on the
+		// commit / commit-check path; the call site (compiler.go,
+		// lenientApplicationSpecs) downgrades it to a warning on the tolerant
+		// load / peer-sync path (#1960 no-brick).
+		if len(app.UnknownICMP) > 0 {
+			return fmt.Errorf(
+				"application %q: invalid icmp-type/icmp-code %q; must be an integer "+
+					"in 0..255 (a non-numeric or out-of-range value is silently dropped "+
+					"and leaves the application matching EVERY ICMP type instead of the "+
+					"intended one)",
+				name, app.UnknownICMP[0])
+		}
+		// #3348: an icmp-type/icmp-code constraint is only meaningful on an
+		// ICMP/ICMPv6 protocol. The userspace matcher keys icmp_constraints
+		// under the ICMP protocol number (userspace-dp policy.rs), and the
+		// pkg/policymatch simulator only consults app.ICMPType when the query
+		// protocol is ICMP/ICMPv6 — so a type/code on tcp/udp/gre/... compiles a
+		// term that can never match (fail-open for a deny rule, fail-closed for a
+		// permit rule), the same #3373 hazard as a port on a non-port protocol.
+		// Junos couples icmp-type/code to an ICMP application, so reject at COMMIT
+		// (strict-at-commit / #1960 fail-closed). The call site downgrades to a
+		// warning on the tolerant load / peer-sync path.
+		if (app.ICMPType != nil || app.ICMPCode != nil) && !protocolIsICMPFamily(app.Protocol) {
+			return fmt.Errorf(
+				"application %q: icmp-type/icmp-code is set on protocol %q, which is "+
+					"not an ICMP protocol; an ICMP type/code constraint is valid only on "+
+					"icmp/icmpv6 (or the junos-ping/junos-pingv6/junos-icmp-all aliases, "+
+					"or protocol number 1/58) — on any other protocol the term can never "+
+					"match (remove the constraint or change the protocol)",
+				name, app.Protocol)
+		}
+		// A code with no type leaves the matcher constraining the code while
+		// ignoring the type (pkg/policymatch matchSingleApp checks ICMPCode
+		// independently of ICMPType), an ambiguous half-constraint Junos does not
+		// allow. Require a type whenever a code is set.
+		if app.ICMPCode != nil && app.ICMPType == nil {
+			return fmt.Errorf(
+				"application %q: icmp-code is set without icmp-type; an ICMP code is "+
+					"meaningful only together with a type (set icmp-type as well, or "+
+					"remove icmp-code)",
+				name)
 		}
 	}
 	return nil
@@ -4250,6 +4393,25 @@ func protocolIsPortBearing(token string) bool {
 		// ports (ip_proto.rs has_l4_ports).
 		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil {
 			return n == 6 || n == 17
+		}
+		return false
+	}
+}
+
+// protocolIsICMPFamily reports whether a protocol token names ICMP or ICMPv6 —
+// the only protocols on which an application `icmp-type`/`icmp-code` constraint
+// is enforceable (#3348). It recognizes the canonical names, the junos-*
+// aliases that resolve to ICMP/ICMPv6 (including junos-ping/junos-pingv6, which
+// carry an implicit echo type), and the numeric protocol numbers 1 (ICMP) and
+// 58 (ICMPv6). The set mirrors the ICMP arm of filterProtocolResolvable.
+func protocolIsICMPFamily(token string) bool {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "icmp", "junos-icmp-all", "junos-ping",
+		"icmpv6", "icmp6", "junos-icmp6-all", "junos-pingv6":
+		return true
+	default:
+		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil {
+			return n == 1 || n == 58
 		}
 		return false
 	}

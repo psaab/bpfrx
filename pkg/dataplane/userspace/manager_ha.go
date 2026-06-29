@@ -666,6 +666,7 @@ type userspaceCounterSnapshot struct {
 	sessionCreates    uint64
 	sessionExpires    uint64
 	policyDenied      uint64
+	hostInboundDenied uint64
 	screenDrops       uint64
 	synCookieSent     uint64
 	synCookieValid    uint64
@@ -687,6 +688,7 @@ func sumBindingCounters(status *ProcessStatus) userspaceCounterSnapshot {
 		s.sessionCreates += b.SessionCreates
 		s.sessionExpires += b.SessionExpires
 		s.policyDenied += b.PolicyDeniedPackets
+		s.hostInboundDenied += b.HostInboundDeniedPackets
 		s.screenDrops += b.ScreenDrops
 		s.synCookieSent += b.SYNCookieSynAckSent
 		s.synCookieValid += b.SYNCookieAckValid
@@ -722,6 +724,12 @@ func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
 		{dataplane.GlobalCtrSessionsNew, safeDelta(cur.sessionCreates, prev.sessionCreates)},
 		{dataplane.GlobalCtrSessionsClosed, safeDelta(cur.sessionExpires, prev.sessionExpires)},
 		{dataplane.GlobalCtrPolicyDeny, safeDelta(cur.policyDenied, prev.policyDenied)},
+		// #3326: surface host-inbound admission denies into the counter the CLI,
+		// gRPC status, REST, and Prometheus collector already read
+		// (GlobalCtrHostInboundDeny). The Rust helper counts each host-inbound
+		// drop per-binding; this delta-push mirrors the policy-deny plumbing so
+		// host-inbound enforcement is observable (was always 0 before #3326).
+		{dataplane.GlobalCtrHostInboundDeny, safeDelta(cur.hostInboundDenied, prev.hostInboundDenied)},
 		{dataplane.GlobalCtrScreenDrops, safeDelta(cur.screenDrops, prev.screenDrops)},
 		// Challenge decisions are not "sent" until the worker admits a
 		// SYN-ACK reply into bounded TX. Secret-unavailable and reply

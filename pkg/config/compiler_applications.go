@@ -67,6 +67,29 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 						app.UnknownTimeouts = append(app.UnknownTimeouts, v)
 					}
 				}
+			case "icmp-type":
+				// #3348: explicit ICMP/ICMPv6 message-type constraint for a
+				// custom application. The schema range-validates 0..255 on the
+				// strict commit path (schema_security.go ValidateInteger). The
+				// tolerant load / peer-sync path does NOT run SchemaValidate, so
+				// record a malformed value (mirroring UnknownTimeouts) rather than
+				// silently dropping it — a dropped value would leave an ICMP app
+				// UNCONSTRAINED (matches all types), a fail-open widening.
+				if v := nodeVal(prop); v != "" {
+					if t, ok := parseICMPTypeCode(v); ok {
+						app.ICMPType = t
+					} else {
+						app.UnknownICMP = append(app.UnknownICMP, v)
+					}
+				}
+			case "icmp-code":
+				if v := nodeVal(prop); v != "" {
+					if c, ok := parseICMPTypeCode(v); ok {
+						app.ICMPCode = c
+					} else {
+						app.UnknownICMP = append(app.UnknownICMP, v)
+					}
+				}
 			case "alg":
 				app.ALG = nodeVal(prop)
 			case "description":
@@ -85,6 +108,20 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 				}
 				termApps := parseApplicationTerms(appName, allKeys)
 				terms = append(terms, termApps...)
+			}
+		}
+
+		// #3348: a custom application whose `protocol` is the junos-ping /
+		// junos-pingv6 alias must carry the same echo-request type constraint
+		// the predefined junos-ping object does (#3020). Without it the alias
+		// lowered to bare ICMP with ICMPType=nil, which the userspace matcher
+		// (and the pkg/policymatch simulator) treat as match-ALL ICMP — silently
+		// widening any policy referencing the app to every ICMP type
+		// (unreachable / redirect / timestamp / ...). Apply the default AFTER the
+		// child loop so an explicit `icmp-type` leaf still wins.
+		if app.ICMPType == nil {
+			if t := aliasEchoICMPType(app.Protocol); t != nil {
+				app.ICMPType = t
 			}
 		}
 
@@ -143,13 +180,62 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 	var dstPort, srcPort, alg string
 	var timeout int
 	var badTimeouts []string
+	var icmpType, icmpCode *uint8
+	var badICMP []string
+	// #3348: per normalized-protocol echo-type implied by a junos-ping /
+	// junos-pingv6 alias inside an inline term. normalizeProtocol folds the
+	// alias to "icmp"/"icmpv6" and loses the ping distinction, so capture the
+	// echo type keyed by the normalized protocol before that information is
+	// gone.
+	echoByProto := map[string]*uint8{}
+	// #3348: a normalized protocol for which the SAME term also lists an
+	// unconstrained ICMP alias (icmp / icmpv6 / junos-icmp-all / junos-icmp6-all)
+	// that dedups onto it. Two app terms — one ping, one all-icmp — union to
+	// all-ICMP in the Rust matcher (policy.rs: separate terms OR together), but
+	// because both normalize to "icmp" here they collapse to ONE term. Applying
+	// the junos-ping echo type to that collapsed term would spuriously NARROW the
+	// union to echo-only (a widening INVERSION). Record the poisoning alias so the
+	// echo default is suppressed for that protocol.
+	unconstrainedICMP := map[string]bool{}
 
 	for i := 1; i < len(keys); i++ {
 		switch keys[i] {
 		case "protocol":
 			if i+1 < len(keys) {
 				i++
-				protocols = append(protocols, normalizeProtocol(keys[i]))
+				norm := normalizeProtocol(keys[i])
+				protocols = append(protocols, norm)
+				if t := aliasEchoICMPType(keys[i]); t != nil {
+					echoByProto[norm] = t
+				} else if norm == "icmp" || norm == "icmpv6" {
+					// An unconstrained ICMP alias (icmp / junos-icmp-all / ...)
+					// for this normalized protocol — widens to all types, so the
+					// junos-ping echo narrowing must NOT apply when both land on
+					// the same collapsed term.
+					unconstrainedICMP[norm] = true
+				}
+			}
+		case "icmp-type":
+			if i+1 < len(keys) {
+				i++
+				if t, ok := parseICMPTypeCode(keys[i]); ok {
+					icmpType = t
+				} else {
+					// #3348: a malformed inline-term icmp-type. The schema does
+					// NOT validate inside an opaque `term`, so silently dropping
+					// it would leave the term UNCONSTRAINED (matches all ICMP) —
+					// a fail-open widening. Record it for the strict gate.
+					badICMP = append(badICMP, keys[i])
+				}
+			}
+		case "icmp-code":
+			if i+1 < len(keys) {
+				i++
+				if c, ok := parseICMPTypeCode(keys[i]); ok {
+					icmpCode = c
+				} else {
+					badICMP = append(badICMP, keys[i])
+				}
 			}
 		case "destination-port":
 			if i+1 < len(keys) {
@@ -204,6 +290,15 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 			}
 			name = parentName + "-" + termName + "-" + suffix
 		}
+		// An explicit inline-term `icmp-type` wins; otherwise fall back to the
+		// echo type implied by a junos-ping / junos-pingv6 protocol alias on
+		// this protocol (#3348) — UNLESS the same term also lists an
+		// unconstrained ICMP alias that dedups onto this protocol, in which case
+		// the union is all-ICMP and the echo narrowing must be suppressed.
+		it := icmpType
+		if it == nil && !unconstrainedICMP[proto] {
+			it = echoByProto[proto]
+		}
 		result = append(result, &Application{
 			Name:              name,
 			Protocol:          proto,
@@ -212,9 +307,51 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 			InactivityTimeout: timeout,
 			ALG:               alg,
 			UnknownTimeouts:   badTimeouts,
+			ICMPType:          it,
+			ICMPCode:          icmpCode,
+			UnknownICMP:       badICMP,
 		})
 	}
 	return result
+}
+
+// aliasEchoICMPType returns the echo-request ICMP / ICMPv6 type implied by a
+// "ping" protocol alias — junos-ping -> 8 (ICMP echo-request), junos-pingv6 ->
+// 128 (ICMPv6 echo-request) — or nil for any other token.
+//
+// #3348: a user-defined application that set `protocol junos-ping` was lowered
+// to bare ICMP with no type constraint, so the projected policy term matched
+// EVERY ICMP type (unreachable / redirect / timestamp / ...) — silently
+// widening any policy that referenced it, and broader than the predefined
+// junos-ping object which carries ICMPType=8 (#3020). Attaching the echo type
+// makes a custom `protocol junos-ping` app behave like the predefined one. The
+// all-ICMP aliases (junos-icmp-all / junos-icmp6-all) intentionally return nil
+// so they stay unconstrained (match every type).
+func aliasEchoICMPType(proto string) *uint8 {
+	switch strings.ToLower(strings.TrimSpace(proto)) {
+	case "junos-ping":
+		return u8p(8)
+	case "junos-pingv6":
+		return u8p(128)
+	default:
+		return nil
+	}
+}
+
+// parseICMPTypeCode parses an application `icmp-type` / `icmp-code` token. It
+// returns the value and true when the token is a base-10 integer in [0,255]
+// (the ICMP/ICMPv6 type and code wire range); otherwise (nil, false). The
+// strict commit path validates the range earlier via the schema
+// (schema_security.go ValidateInteger(0,255)), so this is the compile-time
+// projection of an already-accepted token; an unparsable value is dropped
+// rather than widening the term.
+func parseICMPTypeCode(raw string) (*uint8, bool) {
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n < 0 || n > 255 {
+		return nil, false
+	}
+	v := uint8(n)
+	return &v, true
 }
 
 // normalizeProtocol maps Junos protocol aliases to canonical names

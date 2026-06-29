@@ -159,6 +159,20 @@ type compileOpts struct {
 	// check does NOT live there. Same doctrine as lenientFlowTraceFile.
 	lenientFlowTraceFilter bool
 
+	// lenientFlowTraceSizeFiles (#3424) downgrades the flow-trace size/files
+	// range gate (validateFlowTraceSizeFilesAST) from a hard compile error to a
+	// cfg.Warnings entry. Set ONLY on the tolerant load / peer-sync paths: a
+	// persisted or peer-synced config carrying an out-of-range
+	// `security flow traceoptions file <name> size <s> files <n>` (e.g. the
+	// `size 1 files 1000000000` that an older binary accepted and that turned
+	// each rotation into a ~1e9-iteration rename storm under the writer mutex)
+	// must still boot — NewTraceWriter clamps an out-of-range value to the same
+	// FlowTraceMin/Max bounds at runtime, so a leniently-loaded value is
+	// fail-safe rather than a per-event CPU storm. Like the file/filter gates
+	// the size/files values are AST leaves SchemaValidate treats as opaque, so
+	// the check does NOT live there. Same doctrine as lenientFlowTraceFilter.
+	lenientFlowTraceSizeFiles bool
+
 	// lenientLogEventModeFormat (#3349) downgrades the event-mode log-format
 	// compatibility gate (validateLogEventModeFormatStrict) from a hard
 	// compile error to a cfg.Warnings entry. Set ONLY on the tolerant load /
@@ -963,6 +977,21 @@ type compileOpts struct {
 	// the dataplane never represented the leaf, so a leniently-loaded profile
 	// runs without it independently. Same doctrine as lenientFilterFromMatch.
 	lenientScreenUnknown bool
+	// lenientTrailingTokens (#3332) downgrades the trailing-token gate
+	// (validateTrailingTokensStrict) from a hard compile error to a
+	// cfg.Warnings entry. The strict commit / commit-check path hard-rejects
+	// a token that rode past a leaf's value arity in a shape the generic
+	// schema-walk scalar gate cannot reach — address-book `address <name>
+	// <prefix>` / `... description <text>` (the `address` node is multi:true)
+	// and IKE gateway compact-hierarchical `dynamic hostname <fqdn> <extra>`
+	// (the tokens collapse onto the parent `dynamic` node's Keys). The
+	// compiler read only the value slot and silently dropped the rest. The
+	// tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config still BOOTS (#1960 no-brick);
+	// the dropped token never reached the dataplane, so a leniently-loaded
+	// config is no different from before the gate. Same doctrine as
+	// lenientScreenUnknown.
+	lenientTrailingTokens bool
 	// lenientFlowAging (#3440 H2) downgrades the flow-aging gate
 	// (validateFlowAgingStrict) from a hard compile error to a cfg.Warnings
 	// entry. The strict commit / commit-check path hard-rejects an unknown
@@ -1192,6 +1221,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientLogTLSProfile:                 true,
 		lenientFlowTraceFile:                 true,
 		lenientFlowTraceFilter:               true,
+		lenientFlowTraceSizeFiles:            true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1245,6 +1275,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientScreenProfileRefs:             true,
 		lenientScreenNumeric:                 true,
 		lenientScreenUnknown:                 true,
+		lenientTrailingTokens:                true,
 		lenientFlowAging:                     true,
 		lenientReservedZoneNames:             true,
 		lenientBackupRouterDst:               true,
@@ -1337,6 +1368,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientLogTLSProfile:                 true,
 		lenientFlowTraceFile:                 true,
 		lenientFlowTraceFilter:               true,
+		lenientFlowTraceSizeFiles:            true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1390,6 +1422,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientScreenProfileRefs:             true,
 		lenientScreenNumeric:                 true,
 		lenientScreenUnknown:                 true,
+		lenientTrailingTokens:                true,
 		lenientFlowAging:                     true,
 		lenientReservedZoneNames:             true,
 		lenientBackupRouterDst:               true,
@@ -1534,6 +1567,19 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// still boots — the runtime now fails safe either way.
 	flowTraceFilterWarnings, err := validateFlowTraceFlagsAndFiltersAST(
 		tree.Children, "", opts.lenientFlowTraceFilter)
+	if err != nil {
+		return nil, err
+	}
+
+	// #3424 flow-trace size/files range gate. The compiler stored any positive
+	// `size`/`files` integer verbatim; an absurd `size 1 files 1000000000`
+	// rotates on every trace line and runs a ~1e9-iteration rename loop under
+	// the writer mutex (a per-event CPU storm). Strict (commit / commit-check):
+	// reject an out-of-range value. Lenient (load / peer-sync): warn so a
+	// persisted/peer-synced value still boots — NewTraceWriter clamps to the
+	// same bounds at runtime.
+	flowTraceSizeWarnings, err := validateFlowTraceSizeFilesAST(
+		tree.Children, "", opts.lenientFlowTraceSizeFiles)
 	if err != nil {
 		return nil, err
 	}
@@ -1732,6 +1778,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, logTLSProfileWarnings...)
 	cfg.Warnings = append(cfg.Warnings, flowTraceFileWarnings...)
 	cfg.Warnings = append(cfg.Warnings, flowTraceFilterWarnings...)
+	cfg.Warnings = append(cfg.Warnings, flowTraceSizeWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, appCollisionWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
@@ -2118,6 +2165,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientScreenUnknown {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("screen unknown leaf (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3332 trailing-token gate. Strict on commit / commit-check (hard-reject
+	// a token that rode past a leaf's value arity in a shape the generic
+	// schema-walk scalar gate cannot reach — multi:true address-book
+	// `address` entries and the compact-hierarchical `dynamic hostname`
+	// form). Lenient on load / peer-sync (warn so an already-persisted or
+	// peer-synced config still boots — #1960 no-brick; the dropped token
+	// never reached the dataplane). Runs on the fully-compiled *Config so the
+	// recorded TrailingTokens / DynamicHostnameExtras are available.
+	if err := validateTrailingTokensStrict(cfg); err != nil {
+		if opts.lenientTrailingTokens {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("trailing token (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

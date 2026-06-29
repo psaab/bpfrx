@@ -669,6 +669,13 @@ pub(super) fn poll_binding_process_descriptor(
                                     );
                                     telemetry.dbg.local += 1;
                                     telemetry.dbg.policy_deny += 1;
+                                    // #3326: account the host-inbound deny so
+                                    // `GlobalCtrHostInboundDeny` (REST/Prometheus/
+                                    // `show security flow statistics`) reflects the
+                                    // drop. `touched` must be set so the batch is
+                                    // flushed into BindingLiveState.
+                                    telemetry.counters.touched = true;
+                                    telemetry.counters.host_inbound_denied_packets += 1;
                                     binding.scratch.scratch_recycle.push(desc.addr);
                                     continue;
                                 }
@@ -1522,6 +1529,11 @@ pub(super) fn poll_binding_process_descriptor(
                                     telemetry.dbg.local += 1;
                                     telemetry.dbg.policy_deny += 1;
                                     telemetry.counters.touched = true;
+                                    // #3326: account the host-inbound deny so
+                                    // `GlobalCtrHostInboundDeny` reflects the drop
+                                    // (REST/Prometheus/`show security flow
+                                    // statistics`).
+                                    telemetry.counters.host_inbound_denied_packets += 1;
                                     binding.scratch.scratch_recycle.push(desc.addr);
                                     continue;
                                 }

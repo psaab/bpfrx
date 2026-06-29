@@ -288,6 +288,20 @@ From zone: guest, To zone: lan
   policy-deny RT_FLOW + `reject`/zone-`tcp-rst` reply as a transit deny) and
   tears down any cached host-local session on the next hit. Hit counters for
   these rules now advance.
+  - **Host-inbound deny accounting (#3326):** a host-bound packet dropped by
+    the `host-inbound-traffic` admission gate (a service/protocol not in the
+    ingress zone's set) now increments the host-inbound deny counter, surfaced
+    as `Host-inbound denies` in `show security flow statistics`,
+    `host_inbound_denies` in the REST stats, and
+    `xpf_host_inbound_denies_total` in Prometheus
+    (`dataplane.GlobalCtrHostInboundDeny`). Before #3326 the AF_XDP userspace
+    dataplane silently dropped these denies and bumped only an internal debug
+    counter, so the exported counter sat at 0 even while host-inbound
+    enforcement was dropping traffic — control-plane-protection verification,
+    alerting, and post-incident forensics were blind. The Rust helper counts
+    each host-inbound deny per worker (`host_inbound_denied_packets`) and the Go
+    manager mirrors the per-poll delta into the global counter, identical to the
+    policy-deny plumbing.
   - **Token validation (#3200):** `host-inbound-traffic system-services
     <tok>` / `protocols <tok>` is now validated at commit against the
     recognized-token SSOT (`pkg/config/host_inbound_tokens.go`:

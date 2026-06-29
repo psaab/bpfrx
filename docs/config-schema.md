@@ -108,6 +108,100 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+## Trailing-token arity on scalar value leaves (#3332)
+
+The mirror image of the multi-value contract is the **scalar** value leaf: a
+keyword that consumes EXACTLY `args` value token(s) and models no
+sub-structure (`description`, `host-name`, `peer-address`, `scheduler-map`,
+`port`, …). In the flat-set grammar a recognized non-multi leaf parks any
+trailing token its arity does not expect as a CHILD node rather than on Keys
+— `set interfaces ge-0-0-0 description hello bogus` becomes
+`Keys=[description hello]` with an orphan child `Keys=[bogus]` (`SetPath`,
+`ast_edit.go`). The compiler reads only the declared value span, so before
+#3332 the orphan was silently DROPPED: a typo'd extra token committed cleanly
+and the operator's garbage was discarded with no warning. (This is distinct
+from the #3318 unknown-KEYWORD gate — here the leaf keyword itself IS
+supported; only the trailing token is not. The screen subset was closed
+earlier by #3411's `compileScreen` `recordKeyExtras`/`recordChildExtras`;
+#3332 is the general schema-walk gate.)
+
+`SchemaValidate` (`schema_walk.go`) now rejects the excess —
+`validateScalarValueLeaf` rejects the first Keys token past `1+args` AND the
+first AST child, with a value-arity message ("the extra token would be
+silently dropped"). The gate fires only on an EXACT keyword match (a wildcard
+match means the keyword is a dynamic instance NAME, not this leaf's value
+slot) and only on a leaf the `schemaNode.isScalarValueLeaf` predicate
+(`schema.go`) admits.
+
+**Why an explicit `scalar: true` opt-in, not structural inference.** An
+`args > 0, children: nil` node is NOT reliably a value leaf: several are
+deliberately-OPAQUE CONTAINERS whose body is left to the compiler and parsed
+off the node's AST children — `applications application-set <name> {
+application <member>; }`, `applications application <name> { ... }`, `system
+syslog file <name> { ... }`. Their legitimate body lands on Keys/Children
+exactly like a typo would, so a structural-only gate would false-reject real
+config (caught in review: `application-set my-set application junos-http`).
+The arity contract therefore lives on an explicit per-leaf `scalar: true`
+tag, asserted only on leaves audited to take a fixed value and NO body
+(`description` across the tree, `system host-name`, dynamic-peer/feed
+`hostname`). This is the "design pass on the value-arity contract" the #3332
+body called for; new scalar leaves opt in as they are audited.
+
+`isScalarValueLeaf` also carries belt-and-braces structural guards, so a
+future mis-tag on a node that is actually multi / typed / a container
+degrades to a no-op rather than a surprise rejection. It exempts:
+
+- **`!scalar`** — un-tagged leaves are untouched (the opt-in default).
+- **`multi`** — bracketed lists / value tails (#2419, above) absorb every
+  trailing value by design.
+- **`children != nil` / `wildcard != nil`** — named-instance / modifier
+  containers (`address <cidr> { primary; }`, `transmit-rate 1g exact`): the
+  trailing tokens are real sub-structure the container path validates.
+- **`compoundKey` / `midKeyword`** — the trailing token is part of the node
+  key (`family inet6`, `from-zone X to-zone Y`).
+- **`isTypedLeaf`** — `validateTypedLeaf` already rejects unknown trailing
+  tokens and unexpected children for typed leaves.
+- **`args == 0`** — a childless, untyped, zero-arg node is AMBIGUOUS between
+  a presence-only flag (`dhcp`) and a deliberately-OPAQUE leaf whose subtree
+  the compiler reads despite no schema children (`tcp-mss <mode> <value>`,
+  #1979; the unmodeled NAT pool `address`/`port`/`host` leaves). The screen
+  flag subset (`tcp land`, …) is handled by #3411 instead.
+
+A quoted multi-word value (`description "trust zone"`) arrives as ONE token,
+so it is unaffected — only an UNQUOTED trailing token (`description trust
+zone`, invalid Junos) is rejected. Minimum arity is NOT enforced — a missing
+value is still left to the compiler; the gate is scoped strictly to EXCESS
+trailing tokens, the silent-drop bug class. Pinned by
+`pkg/config/schema_validate_trailing_token_3332_test.go`
+(`TestSchema3332_*`, including the `application-set` opaque-container guard).
+
+**Compiler-side companion gate for the shapes the walker cannot reach.** Two
+silent-drop sites are NOT reachable by the schema-walk scalar gate and are
+caught by `validateTrailingTokensStrict` (`compiler_validate_strict.go`)
+instead, recorded on the typed struct during compile and rejected on the
+strict commit / commit-check path (lenient downgrade to a `cfg.Warnings`
+entry on the tolerant load / peer-sync path, `lenientTrailingTokens`):
+
+- **address-book `address <name> <prefix>` / `address <name> description
+  <text>`** — the `address` schema node is `multi:true` (it must absorb the
+  `description` sub-token onto its Keys to keep the #2419 dual-AST shape), so
+  the scalar gate (which exempts `multi`) never reaches the value slot and
+  `mergeAddressNode` reads only the prefix / `descriptionText` token.
+  `address h2 description web-server bogus` and `address h2 1.2.3.4/32 bogus`
+  now record the leftover on `Address.TrailingTokens` (global AND zone-local
+  books, since `resolveZoneLocalAddressBooks` copies only Value/Description).
+- **IKE gateway compact-hierarchical `dynamic hostname <fqdn> <extra>`** — the
+  flat-set form lands `hostname <fqdn>` as a scalar CHILD the generic gate
+  covers, but the compact-hierarchical one-liner collapses the tokens onto the
+  parent `dynamic` node's Keys and `compileIPsec` reads only `Keys[2]`. The
+  leftover is recorded on `IPsecGateway.DynamicHostnameExtras`.
+
+The address-book `address-set description` leaf is deliberately NOT tagged
+`scalar: true`: `AddressSet` has no `Description` field and the compiler does
+not read it, so the value is currently unsupported and discarded — an arity
+gate there would assert validation on a no-op feature (tag it only if/when
+`AddressSet.Description` is wired).
+
 ### `firewall ... from tcp-flags` — semantic validation, not just a list (#3076)
 
 `from tcp-flags` is a `multi: true` leaf, so the dual-AST contract above
@@ -2259,6 +2353,64 @@ Regression coverage: `pkg/config/compiler_applications_collision_3339_test.go`
 definition, duplicate term-generated name, distinct-names-commit incl. a
 predefined shadow, lenient-warns). Compiler-side only — not a typed `setSchema`
 leaf (applications stay opaque to `SchemaValidate`).
+
+### #3348 — custom `protocol junos-ping` echo constraint + `icmp-type`/`icmp-code` grammar
+
+A **user-defined** application that set `protocol junos-ping` (or `junos-pingv6`)
+lowered to bare ICMP with NO type constraint, so the projected policy term matched
+**every** ICMP type — silently widening any policy referencing it (a permit term
+then admitted unreachable / redirect / timestamp / ... not just echo), and broader
+than the predefined `junos-ping` object which carries `ICMPType=8` (the #3020 fix).
+`appid.ProtocolNumber` and the capability snapshot (`capabilities.go`) folded the
+alias to ICMP and carried `app.ICMPType`, which was `nil` for the custom-app path.
+
+- **alias echo constraint** — `aliasEchoICMPType` (`compiler_applications.go`)
+  maps `junos-ping`→type 8, `junos-pingv6`→type 128. `compileApplications`
+  applies it AFTER the child loop (so an explicit `icmp-type` leaf wins), and
+  `parseApplicationTerms` applies it per normalized protocol inside an inline
+  `term` (capturing the echo type before `normalizeProtocol` folds the alias to
+  `icmp`/`icmpv6`). The all-ICMP aliases (`junos-icmp-all`/`junos-icmp6-all`)
+  return `nil` so they stay match-ALL.
+- **typed grammar** — `schemaApplications.application` gains `icmp-type` and
+  `icmp-code` `ValueInteger` leaves (`ValidateInteger(0,255)`), so an operator can
+  author a constrained custom echo / traceroute / ICMP-control app. The compiler
+  parses them on both the top-level and inline-`term` paths into
+  `Application.ICMPType`/`ICMPCode`.
+- **strict guards** — `validateApplicationSpecsStrict` rejects an
+  `icmp-type`/`icmp-code` on a NON-ICMP protocol (a never-match term — the same
+  fail-open/fail-closed hazard as the #3373 port-on-non-port gate) via
+  `protocolIsICMPFamily`, and rejects an `icmp-code` without an `icmp-type` (an
+  ambiguous half-constraint the matcher would apply code-only). Both downgrade to
+  a `cfg.Warnings` entry on the tolerant load / HA peer-sync path
+  (`lenientApplicationSpecs`, #1960 no-brick).
+
+Two inline-`term` edge cases (the term shape is opaque to `SchemaValidate`, so
+both are handled in `parseApplicationTerms` + the deferred strict gate):
+
+- **widening inversion** — a term that lists BOTH a junos-ping alias AND an
+  unconstrained ICMP alias (`term t { protocol junos-ping; protocol
+  junos-icmp-all; }`) normalizes both to `icmp` and DEDUPS to one term. The
+  union of echo + all-ICMP is all-ICMP (the Rust matcher ORs separate app
+  terms), so applying the echo type to the collapsed term would spuriously
+  NARROW it. `unconstrainedICMP[proto]` records that an all-ICMP alias landed on
+  the normalized protocol and SUPPRESSES the `echoByProto` default for it — the
+  collapsed term stays unconstrained.
+- **fail-open malformed inline icmp-type/code** — a bad inline `icmp-type`
+  (`term t { protocol icmp; icmp-type 999; }`) is NOT seen by the schema range
+  check (opaque term), so silently dropping it would leave the term matching
+  every ICMP type. `parseApplicationTerms` records the raw token on
+  `Application.UnknownICMP` (mirroring `UnknownTimeouts`) and the strict gate
+  rejects the first one at commit (lenient-warn on load/peer-sync). The
+  top-level path also records `UnknownICMP` so the malformed value is caught on
+  the tolerant load path (which does not run `SchemaValidate`).
+
+No wire/Rust change: the snapshot already carries `ICMPType`/`ICMPCode` and the
+matcher already enforces `icmp_constraints` (#3020). Regression coverage:
+`pkg/config/compiler_application_junos_ping_3348_test.go` (alias echo type top-level
++ inline term, all-ICMP stays unconstrained, explicit grammar, explicit-over-alias,
+both strict guards) and the end-to-end matcher test
+`pkg/policymatch/app_junos_ping_3348_test.go` (custom `protocol junos-ping` permits
+type 8, denies 13/5).
 
 ### #2226 — rib-group `import-rib` undefined-reference validation
 

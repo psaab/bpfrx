@@ -261,7 +261,7 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		"import": {desc: "Import policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 		"group": {desc: "BGP group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
 			"peer-as":            {desc: "Peer AS number", args: 1, placeholder: "<as-number>", children: nil},
-			"description":        {desc: "Description", args: 1, placeholder: "<text>", children: nil},
+			"description":        {desc: "Description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 			"multihop":           {desc: "Multihop TTL", args: 1, placeholder: "<ttl>", children: nil},
 			"export":             {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 			"import":             {desc: "Import policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
@@ -290,7 +290,7 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 				"multiplier":       {desc: "Multiplier", args: 1, placeholder: "<multiplier>", children: nil},
 			}},
 			"neighbor": {desc: "BGP neighbor", args: 1, placeholder: "<address>", children: map[string]*schemaNode{
-				"description":            {desc: "Description", args: 1, placeholder: "<text>", children: nil},
+				"description":            {desc: "Description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 				"peer-as":                {desc: "Peer AS number", args: 1, placeholder: "<as-number>", children: nil},
 				"multihop":               {desc: "Multihop TTL", args: 1, placeholder: "<ttl>", children: nil},
 				"export":                 {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
