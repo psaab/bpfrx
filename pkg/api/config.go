@@ -215,7 +215,15 @@ func (s *Server) configExportHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) configCompareHandler(w http.ResponseWriter, r *http.Request) {
-	rollbackN := queryInt(r, "rollback", 0)
+	// #3443: rollback is a change-control selector — fail closed on a
+	// malformed/negative value instead of silently defaulting to 0
+	// (candidate-vs-active), which would compare the wrong target. An
+	// absent parameter keeps the documented default of 0.
+	rollbackN, ok := queryIntStrict(r, "rollback", 0)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid rollback parameter: must be a non-negative integer")
+		return
+	}
 	if rollbackN > 0 {
 		diff, err := s.store.ShowCompareRollback(rollbackN)
 		if err != nil {
@@ -328,7 +336,14 @@ func (s *Server) configConfirmHandler(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) configShowRollbackHandler(w http.ResponseWriter, r *http.Request) {
-	n := queryInt(r, "n", 1)
+	// #3443: n selects a 1-based rollback slot. Fail closed on a
+	// malformed/negative value instead of silently defaulting to slot 1,
+	// which would show a different rollback than the operator asked for.
+	n, ok := queryIntStrict(r, "n", 1)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid n parameter: must be a non-negative integer")
+		return
+	}
 	format := r.URL.Query().Get("format")
 
 	var output string
