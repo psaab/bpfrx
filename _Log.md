@@ -1,3 +1,32 @@
+## 2026-06-29 — #3434 NAT `match application` undefined/empty fail-closed
+
+- **Timestamp**: 2026-06-29
+- **Action**: A source- or destination-NAT `match application <name>` naming an
+  UNDEFINED application (H07) or a defined-but-EMPTY application-set (H08)
+  resolved to zero application terms and the DNAT builder fell through to its
+  explicit-match fallback (`protocol="" + destination-port 0`), publishing the
+  pool VIP for every flow to the destination — a fail-open wildcard
+  translation (the NAT analog of the policy #3144/#3146 gate). Fix: (1)
+  commit-time strict gate `validateNATMatchApplicationsStrict` (NAT analog of
+  `validatePolicyMatchApplicationsStrict`) rejects the undefined token / empty
+  set on the strict path, warns on the tolerant load/peer-sync path
+  (`lenientNATMatchApplications`, #1960 no-brick); (2) the DNAT snapshot builder
+  now emits a never-match term for a configured-but-unresolvable app, reusing
+  the #3437 source-port never-match sentinel (`natNeverMatchPortRange`) so the
+  installed entry can never satisfy `l4_extra_matches`. The SNAT builder already
+  failed closed via the `natProtoNever` term. No new wire field (reuses the
+  #3437 `MatchSourcePorts`), so `protocol_wire_v1.json` is unchanged and
+  `wire_invariant` stays green.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_nat_match_application_3434_test.go,
+  pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/nat_dnat_app_empty_3434_test.go,
+  userspace-dp/src/nat/tests.rs, docs/services-application-identification.md
+- **Validation**: `go test ./pkg/config/... ./pkg/dataplane/userspace/...` green;
+  `cargo test --bin xpf-userspace-dp nat::` 179 pass; `wire_invariant` green;
+  gofmt clean; RED-on-revert verified Go (both the gate dispatch and the DNAT
+  builder branch).
+
 ## 2026-06-29 — #3322 reorder-stable policy hit-counter handle
 
 - **Timestamp**: 2026-06-29
