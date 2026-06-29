@@ -76,6 +76,7 @@ fn test_metadata() -> SessionMetadata {
         policy_id: 0,
         inactivity_timeout_ns: None,
         policy_counter_idx: 0,
+        policy_counter: None,
     }
 }
 
@@ -876,6 +877,7 @@ fn test_close_flags() {
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
         origin: crate::session::SessionOrigin::ForwardFlow,
         fabric_redirect_sync: true,

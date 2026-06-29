@@ -493,6 +493,7 @@ pub(crate) fn build_synced_session_entry(
             // failover. An old peer omits the field => serde(default) 0 ("no
             // per-rule counter"), the pre-#3301 behavior (rolling-upgrade safe).
             policy_counter_idx: req.policy_counter_idx,
+            policy_counter: None,
         },
         origin: crate::session::SessionOrigin::SyncImport,
         // #2170: carry the peer's install generation onto the helper entry.

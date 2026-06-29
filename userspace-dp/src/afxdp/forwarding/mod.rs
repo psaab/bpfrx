@@ -550,6 +550,7 @@ pub(super) fn cluster_peer_return_fast_path(
         // #3073: peer-forwarded fabric-return seed; no local admitting rule, so
         // no per-rule hit counter.
         policy_counter_idx: 0,
+        policy_counter: None,
     };
     Some((
         SessionDecision {

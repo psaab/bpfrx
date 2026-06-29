@@ -678,8 +678,11 @@ pub(super) fn build_reverse_session_from_forward_match(
         inactivity_timeout_ns: None,
         // #3073: inherit the admitting rule's hit-counter handle from the
         // forward session so a materialized reverse companion's reply traffic
-        // counts against the same policy.
+        // counts against the same policy. #3322: inherit the reorder-stable
+        // bound handle too so the reply counts against the admitting rule
+        // even after a live policy reorder.
         policy_counter_idx: forward_match.metadata.policy_counter_idx,
+        policy_counter: forward_match.metadata.policy_counter.clone(),
     };
     let decision = SessionDecision {
         resolution: redirect_session_resolution_for_metadata(forwarding, resolution, &metadata),

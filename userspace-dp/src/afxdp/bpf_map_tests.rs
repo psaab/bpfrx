@@ -39,6 +39,7 @@ fn synced_forward_metadata() -> SessionMetadata {
         policy_id: 0,
         inactivity_timeout_ns: None,
         policy_counter_idx: 0,
+        policy_counter: None,
     }
 }
 
@@ -234,6 +235,7 @@ fn session_map_redirect_keys_for_forward_session_include_nat_aliases() {
         policy_id: 0,
         inactivity_timeout_ns: None,
         policy_counter_idx: 0,
+        policy_counter: None,
     };
 
     let keys = session_map_redirect_keys_for_session(
