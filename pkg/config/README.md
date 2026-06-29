@@ -801,6 +801,27 @@ is left verbatim so `validatePortSpec` hard-rejects it at the strict commit gate
 and the tolerant load/peer-sync path downgrades it to a warning
 (`lenientApplicationSpecs`, #1960 no-brick).
 
+**Custom-application ICMP type/code constraints (#3348):** a user-defined
+application whose `protocol` is the `junos-ping` / `junos-pingv6` alias now
+carries the same echo-request type constraint the predefined `junos-ping`
+object does (ICMP type 8 / ICMPv6 type 128, the #3020 parity). Before this fix
+the alias lowered to bare ICMP with no type, so a custom `protocol junos-ping`
+app projected a term the userspace matcher (and the `pkg/policymatch`
+simulator) treated as match-ALL ICMP — silently widening any policy that
+referenced it to every ICMP type (unreachable / redirect / timestamp / ...).
+`aliasEchoICMPType` (`compiler_applications.go`) attaches the echo type on both
+the top-level and inline-`term` paths, AFTER the child loop so an explicit
+`icmp-type` leaf still wins; the all-ICMP aliases (`junos-icmp-all` /
+`junos-icmp6-all`) stay unconstrained. The grammar now also exposes typed
+`icmp-type` / `icmp-code` leaves (0..255, range-validated by the schema) on a
+custom application and inline term, so an operator can author a constrained
+echo / traceroute / ICMP-control app rather than only the all-ICMP widening.
+`validateApplicationSpecsStrict` rejects an `icmp-type`/`icmp-code` on a
+non-ICMP protocol (a never-match term, the same #3373 hazard as a port on a
+non-port protocol) and an `icmp-code` without an `icmp-type` (an ambiguous
+half-constraint); both downgrade to a warning on the tolerant load/peer-sync
+path. `protocolIsICMPFamily` mirrors the ICMP arm of `filterProtocolResolvable`.
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`

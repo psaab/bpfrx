@@ -700,7 +700,15 @@ var schemaApplications = &schemaNode{desc: "Applications", children: map[string]
 		"timeout":            {desc: "Timeout", args: 1, valueType: ValueInteger, valueDesc: "Timeout in seconds", valueExamples: []string{"300", "1800"}, validator: ValidateInteger(appTimeoutMin, appTimeoutMax), placeholder: "<seconds>", children: nil},
 		"alg":                {desc: "Application layer gateway", args: 1, placeholder: "<alg>", children: nil},
 		"description":        {desc: "Description", args: 1, placeholder: "<text>", children: nil},
-		"term":               {desc: "Term", args: 1, placeholder: "<term>", children: nil},
+		// #3348: typed ICMP/ICMPv6 type/code constraints (0..255) so an operator
+		// can author a constrained custom echo / traceroute / ICMP-control app —
+		// the runtime supports it (userspace-dp icmp_constraints, the #3020 fix)
+		// but the grammar previously did not. Range-validated at the strict
+		// commit gate; validateApplicationSpecsStrict additionally rejects the
+		// constraint on a non-ICMP protocol (and a code without a type).
+		"icmp-type": {desc: "ICMP/ICMPv6 message type", args: 1, valueType: ValueInteger, valueDesc: "ICMP type (e.g. 8 = echo-request, 128 = ICMPv6 echo-request)", valueExamples: []string{"8", "128"}, validator: ValidateInteger(0, 255), placeholder: "<type>", children: nil},
+		"icmp-code": {desc: "ICMP/ICMPv6 message code", args: 1, valueType: ValueInteger, valueDesc: "ICMP code", valueExamples: []string{"0"}, validator: ValidateInteger(0, 255), placeholder: "<code>", children: nil},
+		"term":      {desc: "Term", args: 1, placeholder: "<term>", children: nil},
 	}},
 	"application-set": {desc: "Application set", args: 1, valueHint: ValueHintAppSetName, placeholder: "<name>", children: nil},
 }}

@@ -1,3 +1,30 @@
+## 2026-06-29 — #3348 custom protocol junos-ping echo constraint + icmp-type/icmp-code grammar
+
+- **Timestamp**: 2026-06-29
+- **Action**: A user-defined application with `protocol junos-ping` /
+  `junos-pingv6` lowered to bare ICMP with no type constraint, so the
+  projected policy term matched EVERY ICMP type (security widening — a
+  permit term admitted unreachable/redirect/timestamp, not just echo),
+  broader than the predefined junos-ping object (ICMPType=8, #3020). Added
+  `aliasEchoICMPType` to attach echo type 8/128 on both the top-level and
+  inline-term application paths (after the child loop so an explicit
+  icmp-type wins; all-ICMP aliases stay unconstrained). Also added the
+  missing `icmp-type`/`icmp-code` typed-integer (0..255) schema leaves so
+  an operator can author a constrained custom echo/traceroute/ICMP-control
+  app, wired through to Application.ICMPType/ICMPCode on both paths. Added
+  strict guards (validateApplicationSpecsStrict + protocolIsICMPFamily):
+  reject icmp-type/code on a non-ICMP protocol (never-match term, #3373
+  hazard) and icmp-code without icmp-type; both downgrade to a warning on
+  the lenient load/peer-sync path (#1960). No wire/Rust change — the
+  snapshot already carries the constraint and the matcher already enforces
+  it (#3020).
+- **File(s)**: pkg/config/compiler_applications.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/schema_security.go,
+  pkg/config/compiler_application_junos_ping_3348_test.go,
+  pkg/policymatch/app_junos_ping_3348_test.go,
+  pkg/policymatch/icmp_test.go (stale-comment fix), pkg/config/README.md,
+  docs/config-schema.md
+
 ## 2026-06-28 — #3499 compiler_iface nil zone/interface map-value guards
 
 - **Timestamp**: 2026-06-28
