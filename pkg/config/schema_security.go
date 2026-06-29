@@ -37,6 +37,59 @@ var (
 	syslogCategories = []string{"all", "firewall", "policy", "screen", "session"}
 )
 
+// policyThenSchemaChildren builds the `then` action subtree shared by
+// zone-pair (from-zone/to-zone) and global security policies. It is a
+// factory (not a shared package var) so the two scopes get independent
+// schemaNode trees — schema nodes are mutable containers and must not be
+// aliased between two points in the grammar.
+//
+// #3377: the terminal actions permit/deny/reject and the count modifier
+// were compiled by the security compiler (compilePolicy's `then` switch in
+// compiler_security.go — cases permit, deny, reject, log, count) but were
+// absent from setSchema, present only as a `// permit, deny, reject, count
+// → leaf` comment placeholder. That is the compiled-but-not-schema-visible
+// drift the two-SSOT rule (#1319) exists to prevent: `set security
+// policies ... then ?` config-mode completion / `?` help could not offer
+// the most basic policy actions. This factory makes the schema `then`
+// children EXACTLY mirror the compiler switch.
+//
+// Sub-option modeling matches the EXACT supported surface, so completion
+// never advertises a leaf that the commit-check then rejects:
+//   - permit / reject: declared childless. A bare `then permit` / `then
+//     reject` is supported; any child (application-services, tunnel,
+//     firewall-authentication under permit; profile, tcp-reset under
+//     reject) is rejected at commit by validatePolicyThenPermitStrict
+//     (#3114) / validatePolicyThenRejectStrict (#3115), which stay the SSOT
+//     for that rejection (walkSchemaNode ignores unknown descendants of a
+//     childless container, so the schema does not double-reject).
+//   - deny: carries the log/count observability modifiers it legitimately
+//     combines with (applyCollapsedDenyModifiers / #3141); any OTHER deny
+//     modifier is rejected by validatePolicyThenDenyStrict.
+//   - log: carries its session-init/session-close sub-options (the exact
+//     tokens compilePolicy's `log` arm reads).
+//
+// The canary in schema_policy_then_3377_test.go asserts this child set
+// equals the compiler's `then` switch token set for both scopes so a
+// future action leaf cannot drift back out of the schema.
+func policyThenSchemaChildren() map[string]*schemaNode {
+	logNode := func() *schemaNode {
+		return &schemaNode{desc: "Log session", children: map[string]*schemaNode{
+			"session-init":  {desc: "Log at session open", children: nil},
+			"session-close": {desc: "Log at session close", children: nil},
+		}}
+	}
+	return map[string]*schemaNode{
+		"permit": {desc: "Permit matching traffic", children: nil},
+		"deny": {desc: "Deny matching traffic (silently drop)", children: map[string]*schemaNode{
+			"log":   logNode(),
+			"count": {desc: "Count matching packets and bytes", children: nil},
+		}},
+		"reject": {desc: "Reject matching traffic (ICMP unreachable / TCP RST)", children: nil},
+		"log":    logNode(),
+		"count":  {desc: "Count matching packets and bytes", children: nil},
+	}
+}
+
 var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[string]*schemaNode{
 	"zones": {desc: "Security zones", children: map[string]*schemaNode{
 		"security-zone": {desc: "Security zone name", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: map[string]*schemaNode{
@@ -109,10 +162,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					"destination-address-excluded": {desc: "Match all destinations except destination-address", children: nil},
 					"application":                  {desc: "Application", args: 1, multi: true, valueHint: ValueHintPolicyApp, placeholder: "<application>", children: nil},
 				}},
-				"then": {desc: "Action", children: map[string]*schemaNode{
-					"log": {desc: "Log session", children: nil},
-					// permit, deny, reject, count → leaf
-				}},
+				"then": {desc: "Action", children: policyThenSchemaChildren()},
 				// #3117: `scheduler-name <name>` binds a class-of-service
 				// scheduler to the policy. The compiler reads it as a plain
 				// string (compiler_security.go: polInst.node.FindChild(
@@ -147,9 +197,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					"from-zone": {desc: "Restrict this global policy to packets from this zone", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
 					"to-zone":   {desc: "Restrict this global policy to packets to this zone", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
 				}},
-				"then": {desc: "Action", children: map[string]*schemaNode{
-					"log": {desc: "Log session", children: nil},
-				}},
+				"then": {desc: "Action", children: policyThenSchemaChildren()},
 				// #3117: scheduler-name on global policies — same compiler +
 				// strict-validator path as the zone-pair policy above.
 				"scheduler-name": {desc: "Class-of-service scheduler bound to this policy", args: 1, placeholder: "<scheduler-name>", children: nil},

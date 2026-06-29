@@ -353,21 +353,40 @@ func validatePolicyThenRejectStrict(nodes []*Node, lenient bool) ([]string, erro
 	return warnings, nil
 }
 
-// supportedPolicyThenDenyChildren is the EXACT set of collapsed `then deny`
-// modifiers the policy compiler enforces. Unlike the then-permit (#3114) and
-// then-reject (#3115) arms — whose supported sets are EMPTY because no
-// permit/reject modifier is implemented — `then deny` legitimately combines
-// with the observability modifiers `log` (with session-init/session-close)
-// and `count`, which the standalone `then log`/`then count` arms already
-// implement. compilePolicy's `deny` arm wires these collapsed modifiers via
-// applyCollapsedDenyModifiers (#3141), so they are SUPPORTED here. Any OTHER
-// collapsed deny modifier is silently dropped by the compiler and is rejected
-// by validatePolicyThenDenyStrict. Keep this in lockstep with
-// applyCollapsedDenyModifiers: if the compiler learns to enforce a new
-// collapsed `then deny` modifier, add it here so it is no longer rejected.
-var supportedPolicyThenDenyChildren = map[string]bool{
-	"log":   true,
-	"count": true,
+// collapsedDenyModifierTokens flattens every modifier token under a
+// `then deny` node into the SAME token sequence the compiler's
+// applyCollapsedDenyModifiers (compiler_security.go) acts on, so the
+// reject gate (validatePolicyThenDenyStrict) and the wiring can never
+// disagree on the modifier set regardless of how the parser grouped it.
+//
+// The parser produces three shapes (see checkPolicy for the full table):
+// flat-onto-deny (deny.Keys[1:]), collapsed-child (one child node carrying
+// all tokens on its Keys), and nested (each modifier its own node). This
+// mirrors applyCollapsedDenyModifiers exactly — deny.Keys[1:] plus every
+// key of every descendant node — which is why the two stay in lockstep:
+// any token the compiler would apply is a token the validator examines.
+//
+// The legitimately supported tokens (log with session-init/session-close,
+// and count) are defined by recognizedCollapsedDenyToken; any other token
+// is an unsupported deny modifier the compiler silently drops, so the gate
+// rejects it at commit. Keep recognizedCollapsedDenyToken in lockstep with
+// applyCollapsedDenyModifiers.
+func collapsedDenyModifierTokens(denyNode *Node) []string {
+	var toks []string
+	if len(denyNode.Keys) >= 2 {
+		toks = append(toks, denyNode.Keys[1:]...)
+	}
+	var walk func(n *Node)
+	walk = func(n *Node) {
+		toks = append(toks, n.Keys...)
+		for _, c := range n.Children {
+			walk(c)
+		}
+	}
+	for _, c := range denyNode.Children {
+		walk(c)
+	}
+	return toks
 }
 
 // validatePolicyThenDenyStrict walks the `security policies` subtree of the
@@ -465,38 +484,41 @@ func validatePolicyThenDenyStrict(nodes []*Node, lenient bool) ([]string, error)
 		if denyNode == nil {
 			return nil
 		}
-		// A bare `then deny` (flat-set: a `deny` node with Keys=["deny"] and
-		// no children; hierarchical: an empty `deny` block) is fully
-		// supported. Only `then deny <modifier>` carries a collapsed child,
-		// in TWO AST shapes:
-		//   - Flat set `then deny log session-init count` collapses the WHOLE
-		//     tail onto the deny node:
-		//     Keys=["deny","log","session-init","count"]. EVERY token in
-		//     Keys[1:] is a flattened modifier or modifier sub-token; they
-		//     must ALL be recognized. Checking only Keys[1] missed a
-		//     supported-leads / unsupported-trails sequence like
-		//     `then deny count evilmod`, which slipped through and was
-		//     silently dropped — exactly the failure mode this gate prevents
-		//     (#3141 review fold). The recognized set
-		//     (recognizedCollapsedDenyToken) is the EXACT set
-		//     applyCollapsedDenyModifiers acts on — the `log`/`count`
-		//     modifiers plus log's session-init/session-close sub-tokens — so
-		//     the validator and the wiring agree on what is a modifier vs a
-		//     sub-token. Report the first unrecognized token.
-		//   - Hierarchical `then { deny { profile {...} } }` nests the
-		//     modifier as a DIRECT child node of deny; the modifier's own
-		//     sub-tokens nest deeper, so a direct child must be a top-level
-		//     modifier — checked against supportedPolicyThenDenyChildren
-		//     ({log, count}).
-		tail := denyNode.Keys[1:]
+		// A bare `then deny` (a `deny` node with no modifier tokens) is fully
+		// supported. Only `then deny <modifier>` carries a collapsed modifier,
+		// which the parser groups into one of THREE AST shapes depending on
+		// whether deny / its modifiers are declared schema leaves:
+		//   - Flat-onto-deny (deny NOT a schema leaf — historical):
+		//     `then deny log session-init count` collapses the whole tail onto
+		//     the deny node, Keys=["deny","log","session-init","count"]; the
+		//     modifier tokens are Keys[1:].
+		//   - Collapsed-child (deny IS a schema leaf, #3377): the trailing
+		//     tokens form a single child node with all tokens on its Keys,
+		//     e.g. deny → child Keys=["log","session-init","count"], or
+		//     deny → child Keys=["count","session-init"].
+		//   - Nested (deny + modifiers ARE schema leaves, #3377): each modifier
+		//     is consumed as its own structural node, e.g.
+		//     deny → log → session-init → count.
+		// collapsedDenyModifierTokens flattens all three into the SAME token
+		// sequence the compiler's applyCollapsedDenyModifiers acts on
+		// (compiler_security.go: deny.Keys[1:] plus every key of every
+		// descendant node), so the validator and the wiring agree exactly on
+		// the modifier set regardless of how the parser grouped it. EVERY token
+		// must be recognized: checking only the first child key missed a
+		// supported-leads / unsupported-trails sequence like
+		// `then deny count evilmod` (the #3141 review-fold failure mode), which
+		// would otherwise be silently dropped. recognizedCollapsedDenyToken is
+		// the EXACT set applyCollapsedDenyModifiers acts on — the log/count
+		// modifiers plus log's session-init/session-close sub-tokens.
+		toks := collapsedDenyModifierTokens(denyNode)
 		hasLog := false
-		for _, tok := range tail {
+		for _, tok := range toks {
 			if tok == "log" {
 				hasLog = true
 				break
 			}
 		}
-		for _, tok := range tail {
+		for _, tok := range toks {
 			if !recognizedCollapsedDenyToken(tok) {
 				if err := emit(scope, policyName, tok); err != nil {
 					return err
@@ -504,20 +526,11 @@ func validatePolicyThenDenyStrict(nodes []*Node, lenient bool) ([]string, error)
 				continue
 			}
 			// #3374: a recognized session-init/session-close sub-token is
-			// valid only with a `log` token in the same collapsed tail.
+			// valid only with a `log` token in the same collapsed action.
 			if (tok == "session-init" || tok == "session-close") && !hasLog {
 				if err := emitOrphanLogSub(scope, policyName, tok); err != nil {
 					return err
 				}
-			}
-		}
-		for _, c := range denyNode.Children {
-			child := c.Name()
-			if supportedPolicyThenDenyChildren[child] {
-				continue
-			}
-			if err := emit(scope, policyName, child); err != nil {
-				return err
 			}
 		}
 		return nil
