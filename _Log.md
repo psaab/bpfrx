@@ -22867,3 +22867,18 @@ top.
     pkg/grpcapi/global_stats_counter_error_test.go,
     pkg/grpcapi/flow_cluster_counter_error_test.go,
     pkg/cli/show_security_counter_error_test.go, pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3345 fold round 3 (Codex re-review) — fix early-warn/late-read
+    ordering. The round-2 warnings were placed BEFORE later detail reads (same
+    bug as the H1 GetGlobalStats fix). Moved the readErr check to AFTER all
+    global-counter reads in: cli showScreen, cli showStatistics, cli
+    showFlowStatistics, gRPC showScreen (per-type drop block). Made
+    showNATSource emit an explicit warning on read error (was silent omit).
+    Audited EVERY global-counter read call site (16 total) — all now check
+    readErr after all reads, none swallow silently. Added late-read RED-on-
+    revert tests (lateCounterErrCLIDP fails only a per-type counter).
+  - **File(s)**: pkg/cli/cli_show_security_screen.go, pkg/cli/cli_show_flow.go,
+    pkg/cli/cli_show_nat.go, pkg/grpcapi/server_show_security_text.go,
+    pkg/cli/show_security_counter_error_test.go,
+    pkg/grpcapi/global_stats_counter_error_test.go, pkg/api/README.md, _Log.md

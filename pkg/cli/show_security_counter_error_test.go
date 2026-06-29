@@ -29,6 +29,50 @@ func (d *counterErrCLIDP) ReadGlobalCounter(uint32) (uint64, error) {
 	return 0, errors.New("counter bridge degraded")
 }
 
+// lateCounterErrCLIDP fails ONLY a LATE read (a per-type screen counter that
+// is read after the leading screen-drops total / the global-stats loop), while
+// returning a non-zero GlobalCtrScreenDrops so the per-type breakdown loop is
+// entered. It models the early-warn/late-read ordering bug: an error check
+// placed before the late read would pass, printing a stale 0 with no warning.
+type lateCounterErrCLIDP struct {
+	dataplane.DataPlane
+}
+
+func (d *lateCounterErrCLIDP) IsLoaded() bool { return true }
+
+func (d *lateCounterErrCLIDP) ReadGlobalCounter(idx uint32) (uint64, error) {
+	switch idx {
+	case dataplane.GlobalCtrScreenSynFlood:
+		return 0, errors.New("counter bridge degraded (late read)")
+	case dataplane.GlobalCtrScreenDrops:
+		return 5, nil // non-zero -> the per-type breakdown loop runs
+	}
+	return 0, nil
+}
+
+func (d *lateCounterErrCLIDP) SessionCount() (int, int)          { return 0, 0 }
+func (d *lateCounterErrCLIDP) GetMapStats() []dataplane.MapStats { return nil }
+
+// natCounterErrCLIDP fails ReadGlobalCounter and stubs the session iterators
+// that showNATSource walks before reading the NAT alloc-fail counter.
+type natCounterErrCLIDP struct {
+	dataplane.DataPlane
+}
+
+func (d *natCounterErrCLIDP) IsLoaded() bool { return true }
+
+func (d *natCounterErrCLIDP) ReadGlobalCounter(uint32) (uint64, error) {
+	return 0, errors.New("counter bridge degraded")
+}
+
+func (d *natCounterErrCLIDP) IterateSessions(func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	return nil
+}
+
+func (d *natCounterErrCLIDP) IterateSessionsV6(func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	return nil
+}
+
 // screenProfileStore commits a config with a screen profile + zone so that
 // showScreen reaches the per-type counter section (it returns early when no
 // screen profiles are configured).
@@ -61,11 +105,10 @@ func TestShowScreenWarnsOnCounterReadError(t *testing.T) {
 		}
 	})
 
+	// The total line may still print its (possibly 0) value, but the trailing
+	// warning is what makes a degraded read distinguishable from a true zero.
 	if !strings.Contains(out, "warning") {
 		t.Fatalf("showScreen output lacks a counter-read warning; got:\n%s", out)
-	}
-	if strings.Contains(out, "Total screen drops: 0") {
-		t.Fatalf("showScreen printed a clean zero on read failure; got:\n%s", out)
 	}
 }
 
@@ -113,6 +156,56 @@ func TestShowFlowStatisticsWarnsOnCounterReadError(t *testing.T) {
 	}
 }
 
+// The following three tests pin the early-warn/late-read ORDERING fix: the
+// warning must be checked AFTER all global-counter reads, so a failure on a
+// LATE read (per-type screen breakdown) is surfaced rather than printing a
+// stale 0 under an earlier passed check. Each FAILS if the readErr check is
+// moved before the late read.
+func TestShowScreenWarnsOnLateCounterReadError(t *testing.T) {
+	c := &CLI{store: screenProfileStore(t), dp: &lateCounterErrCLIDP{}}
+
+	out := captureStdout(t, func() {
+		if err := c.showScreen(); err != nil {
+			t.Fatalf("showScreen() error = %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("showScreen lacks a warning on a LATE counter-read failure "+
+			"(early-warn/late-read ordering); got:\n%s", out)
+	}
+}
+
+func TestShowStatisticsDetailWarnsOnLateCounterReadError(t *testing.T) {
+	c := &CLI{dp: &lateCounterErrCLIDP{}}
+
+	out := captureStdout(t, func() {
+		if err := c.showStatistics(true); err != nil {
+			t.Fatalf("showStatistics(detail) error = %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("showStatistics(detail) lacks a warning on a LATE counter-read "+
+			"failure (early-warn/late-read ordering); got:\n%s", out)
+	}
+}
+
+func TestShowFlowStatisticsWarnsOnLateCounterReadError(t *testing.T) {
+	c := &CLI{dp: &lateCounterErrCLIDP{}}
+
+	out := captureStdout(t, func() {
+		if err := c.showFlowStatistics(); err != nil {
+			t.Fatalf("showFlowStatistics() error = %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("showFlowStatistics lacks a warning on a LATE counter-read "+
+			"failure (early-warn/late-read ordering); got:\n%s", out)
+	}
+}
+
 func TestShowChassisClusterFabricStatisticsWarnsOnCounterReadError(t *testing.T) {
 	c := &CLI{dp: &counterErrCLIDP{}}
 
@@ -124,5 +217,23 @@ func TestShowChassisClusterFabricStatisticsWarnsOnCounterReadError(t *testing.T)
 
 	if !strings.Contains(out, "warning") {
 		t.Fatalf("showChassisClusterFabricStatistics output lacks a counter-read warning; got:\n%s", out)
+	}
+}
+
+// showNATSource previously OMITTED the NAT alloc-fail line on a read error
+// (acceptable — no stale 0 — but indistinguishable from "no failures"). It now
+// emits an explicit warning. FAIL-ON-REVERT: dropping the else branch removes
+// the warning line.
+func TestShowNATSourceWarnsOnCounterReadError(t *testing.T) {
+	c := &CLI{dp: &natCounterErrCLIDP{}}
+
+	out := captureStdout(t, func() {
+		if err := c.showNATSource(nil, nil); err != nil {
+			t.Fatalf("showNATSource() error = %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("showNATSource output lacks a NAT alloc-fail counter-read warning; got:\n%s", out)
 	}
 }

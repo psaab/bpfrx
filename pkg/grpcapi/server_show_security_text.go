@@ -688,11 +688,7 @@ func (s *Server) showScreen(cfg *config.Config, buf *strings.Builder) {
 				return v
 			}
 			totalDrops := readCtr(dataplane.GlobalCtrScreenDrops)
-			if readErr != nil {
-				fmt.Fprintf(buf, "warning: screen counter read failed (counters unavailable): %v\n", readErr)
-			} else {
-				fmt.Fprintf(buf, "Total screen drops: %d\n", totalDrops)
-			}
+			fmt.Fprintf(buf, "Total screen drops: %d\n", totalDrops)
 			if totalDrops > 0 {
 				screenCounters := []struct {
 					idx  uint32
@@ -717,6 +713,11 @@ func (s *Server) showScreen(cfg *config.Config, buf *strings.Builder) {
 						fmt.Fprintf(buf, "  %-25s %d\n", sc.name+":", v)
 					}
 				}
+			}
+			// #3345: check AFTER all reads (incl. the per-type loop) so a
+			// failure on a late read is surfaced, not just the first.
+			if readErr != nil {
+				fmt.Fprintf(buf, "warning: screen counter read failed (counters may be incomplete): %v\n", readErr)
 			}
 		}
 	}

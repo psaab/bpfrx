@@ -129,11 +129,13 @@ func (c *CLI) showStatistics(detail bool) error {
 	for _, n := range names {
 		fmt.Printf("  %-25s %d\n", n.name+":", readCounter(n.idx))
 	}
-	if readErr != nil {
-		fmt.Printf("warning: global counter read failed (statistics may be incomplete): %v\n", readErr)
-	}
 
 	if !detail {
+		// #3345: even in the non-detail path, surface a read failure (the
+		// global loop above is the only read set here).
+		if readErr != nil {
+			fmt.Printf("warning: global counter read failed (statistics may be incomplete): %v\n", readErr)
+		}
 		return nil
 	}
 
@@ -187,6 +189,13 @@ func (c *CLI) showStatistics(detail bool) error {
 			}
 			fmt.Printf("  %-24s %d/%d (%.1f%%)%s\n", s.Name+":", s.UsedCount, s.MaxEntries, pct, flag)
 		}
+	}
+
+	// #3345: check AFTER all global-counter reads (incl. the detail screen
+	// breakdown) so a failure on a late read is surfaced rather than printing
+	// a stale 0.
+	if readErr != nil {
+		fmt.Printf("warning: global counter read failed (statistics may be incomplete): %v\n", readErr)
 	}
 
 	return nil
@@ -973,9 +982,6 @@ func (c *CLI) showFlowStatistics() error {
 	cacheInval := readCounter(dataplane.GlobalCtrFlowCacheInvalidate)
 
 	fmt.Println("Flow statistics:")
-	if readErr != nil {
-		fmt.Printf("warning: global counter read failed (statistics may be incomplete): %v\n", readErr)
-	}
 	fmt.Printf("  %-30s %d\n", "Current sessions:", dataplane.CurrentSessions(sessNew, sessClosed))
 	fmt.Printf("  %-30s %d\n", "Sessions created:", sessNew)
 	fmt.Printf("  %-30s %d\n", "Sessions closed:", sessClosed)
@@ -1036,6 +1042,13 @@ func (c *CLI) showFlowStatistics() error {
 				fmt.Printf("    %-28s %d\n", sc.name+":", v)
 			}
 		}
+	}
+
+	// #3345: check AFTER all global-counter reads (incl. the screen breakdown
+	// loop) so a failure on a late read is surfaced rather than printing a
+	// stale 0.
+	if readErr != nil {
+		fmt.Printf("warning: global counter read failed (statistics may be incomplete): %v\n", readErr)
 	}
 
 	return nil

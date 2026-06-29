@@ -128,13 +128,23 @@ under the daemon's errgroup. Nothing else imports this package.
     instead of a clean zero: `show security screen` / `show security
     alarms` (CLI + gRPC), `show security flow statistics` — the canonical
     operator global-counter view (CLI `showStatistics`/`showFlowStatistics`
-    + gRPC `showFlowStatistics`), and `show chassis cluster fabric
-    statistics` (CLI + gRPC fabric-redirect counters).
+    + gRPC `showFlowStatistics`), `show chassis cluster fabric
+    statistics` (CLI + gRPC fabric-redirect counters), and `show security
+    nat source` (NAT alloc-fail counter — previously the line was silently
+    omitted on a read error, now an explicit warning is emitted).
+  - **Ordering invariant**: in every multi-read renderer the `readErr`
+    check runs AFTER all global-counter reads in the function (incl. the
+    detail / per-type screen-breakdown loops), so a failure on a LATE read
+    is surfaced rather than printing a stale `0` under an earlier passed
+    check. The structured APIs follow the same rule (check after the full
+    struct build).
 
   Pinned by `stats_counter_error_test.go` (REST + Prometheus),
   `pkg/grpcapi/global_stats_counter_error_test.go` (incl. the late-read
   ordering case), `pkg/grpcapi/flow_cluster_counter_error_test.go`, and
-  `pkg/cli/show_security_counter_error_test.go`. Per-zone / per-policy /
+  `pkg/cli/show_security_counter_error_test.go` (incl. late-read ordering
+  cases that fail if a warn is moved before the per-type screen-breakdown
+  loop). Per-zone / per-policy /
   per-filter counter-read surfacing (the `collectZoneCounters` /
   `collectPolicyCounters` / `collectFilterCounters` paths that today
   `continue` on error) is tracked separately in #3408.
