@@ -192,6 +192,14 @@ const KNOWN_ROUTING_PROTOCOL_TOKENS: &[&str] = &[
     "msdp",
     "nhrp",
     "router-discovery",
+    // #3341: additional Junos/vSRX routing-control protocols. All ride IP, so
+    // each contributes a concrete IP admit in classify_protocol: rsvp (proto 46,
+    // dual), pgm (proto 113, dual), sap (UDP/9875, dual), dvmrp (proto 2 / IGMP,
+    // IPv4-only). Mirror of config.KnownHostInboundProtocols.
+    "rsvp",
+    "pgm",
+    "sap",
+    "dvmrp",
     // #3311: IS-IS is a recognized protocol but rides L2 (OSI/CLNP), so it is
     // EXCLUDED from the IP `all` expansion below via HOST_INBOUND_L2_PROTOCOLS.
     "isis",
@@ -292,6 +300,25 @@ fn classify_protocol(token: &str, hi: &mut ZoneHostInbound) {
         }
         "nhrp" => {
             hi.ip_protocols.insert(54);
+        }
+        // #3341: RSVP rides directly over IP, protocol 46 (dual-family).
+        "rsvp" => {
+            hi.ip_protocols.insert(46);
+        }
+        // #3341: PGM (Pragmatic General Multicast) rides over IP, protocol 113
+        // (dual-family).
+        "pgm" => {
+            hi.ip_protocols.insert(113);
+        }
+        // #3341: SAP (Session Announcement Protocol) is UDP/9875 (dual-family).
+        "sap" => {
+            hi.udp_ports.insert(9875);
+        }
+        // #3341: DVMRP is carried inside IGMP (IP protocol 2) and is an IPv4-only
+        // multicast routing protocol (SSOT: config.HostInboundProtocolFamily
+        // ["dvmrp"]="ip"), so it admits proto 2 on v4 only — matching igmp.
+        "dvmrp" => {
+            hi.ip_protocols_v4.insert(2);
         }
         // #3311: IS-IS rides OSI/CLNP directly over L2 (LLC-encapsulated, NOT
         // IP), so it cannot be expressed in this IP-keyed admit model (proto
@@ -450,6 +477,54 @@ mod tests {
     // HOST_INBOUND_L2_PROTOCOLS — isis enters the expansion, but its
     // classify_protocol arm is a no-op, so this stays green; the
     // protocols_all_excludes_l2 token test above is the real RED-on-revert guard.
+    // #3341: the routing-control tokens rsvp/pgm/sap/dvmrp must each classify to
+    // the correct IP admit with the correct family scoping, mirroring the nft
+    // matcher (hostInboundProtocolMatches) and the Go SSOT. Fail-on-revert:
+    // before #3341 these hit the catch-all `_ => {}` no-op arm, so every admit
+    // assertion below goes RED.
+    #[test]
+    fn routing_control_protocol_tokens_classify() {
+        // rsvp — IP proto 46, dual-family.
+        let mut hi = ZoneHostInbound::default();
+        classify_protocol("rsvp", &mut hi);
+        assert!(hi.admits(46, 0, false, 0), "rsvp must admit proto 46 on v4");
+        assert!(hi.admits(46, 0, true, 0), "rsvp must admit proto 46 on v6 (dual)");
+
+        // pgm — IP proto 113, dual-family.
+        let mut hi = ZoneHostInbound::default();
+        classify_protocol("pgm", &mut hi);
+        assert!(hi.admits(113, 0, false, 0), "pgm must admit proto 113 on v4");
+        assert!(hi.admits(113, 0, true, 0), "pgm must admit proto 113 on v6 (dual)");
+
+        // sap — UDP/9875, dual-family.
+        let mut hi = ZoneHostInbound::default();
+        classify_protocol("sap", &mut hi);
+        assert!(hi.admits(17, 9875, false, 0), "sap must admit udp/9875 on v4");
+        assert!(hi.admits(17, 9875, true, 0), "sap must admit udp/9875 on v6 (dual)");
+
+        // dvmrp — IGMP-encapsulated (proto 2), IPv4-only.
+        let mut hi = ZoneHostInbound::default();
+        classify_protocol("dvmrp", &mut hi);
+        assert!(hi.admits(2, 0, false, 0), "dvmrp must admit proto 2 (IGMP) on v4");
+        assert!(
+            !hi.admits(2, 0, true, 0),
+            "dvmrp must NOT admit proto 2 on v6 (IPv4-only)",
+        );
+
+        // All four are recognized routing tokens (so `protocols all` covers them)
+        // and none are L2.
+        for tok in ["rsvp", "pgm", "sap", "dvmrp"] {
+            assert!(
+                KNOWN_ROUTING_PROTOCOL_TOKENS.contains(&tok),
+                "{tok} must be a recognized routing token",
+            );
+            assert!(
+                !is_host_inbound_l2_protocol(tok),
+                "{tok} rides IP, must not be an L2 protocol",
+            );
+        }
+    }
+
     #[test]
     fn protocols_all_admits_ip_routing_not_l2() {
         let mut hi = ZoneHostInbound::default();

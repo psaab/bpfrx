@@ -92,6 +92,42 @@ func TestHostInboundKnownTokensCommit(t *testing.T) {
 	}
 }
 
+// TestHostInboundRoutingProtocolTokensCommit asserts the #3341 routing-control
+// tokens (rsvp/pgm/sap/dvmrp) are ACCEPTED at commit and carry the correct
+// address-family scoping. Before #3341 they were absent from
+// KnownHostInboundProtocols, so since #3200 made tokens typed a valid vSRX
+// config naming them was HARD-REJECTED at commit. Fail-on-revert: remove any of
+// these from KnownHostInboundProtocols and the commit subtest goes RED.
+func TestHostInboundRoutingProtocolTokensCommit(t *testing.T) {
+	for _, tok := range []string{"rsvp", "pgm", "sap", "dvmrp"} {
+		t.Run(tok, func(t *testing.T) {
+			tree := buildTree(t, []string{
+				"set security zones security-zone wan host-inbound-traffic protocols " + tok,
+			})
+			if _, err := CompileConfig(tree); err != nil {
+				t.Fatalf("strict commit rejected `host-inbound-traffic protocols %s` (vSRX parity, #3341): %v", tok, err)
+			}
+			if !KnownHostInboundProtocols[tok] {
+				t.Fatalf("%s must be in KnownHostInboundProtocols so commit accepts it", tok)
+			}
+			if HostInboundL2Protocols[tok] {
+				t.Fatalf("%s rides IP, it must NOT be in HostInboundL2Protocols", tok)
+			}
+		})
+	}
+	// rsvp/pgm/sap are dual-family (absent from the family map); dvmrp is
+	// IPv4-only (IGMP-encapsulated), like igmp.
+	for _, dual := range []string{"rsvp", "pgm", "sap"} {
+		if _, scoped := HostInboundProtocolFamily[dual]; scoped {
+			t.Errorf("%s must be dual-family (absent from HostInboundProtocolFamily)", dual)
+		}
+	}
+	if HostInboundProtocolFamily["dvmrp"] != "ip" {
+		t.Errorf("dvmrp must be IPv4-only (HostInboundProtocolFamily[\"dvmrp\"]=%q, want \"ip\")",
+			HostInboundProtocolFamily["dvmrp"])
+	}
+}
+
 // TestHostInboundIsisCommitsAsL2NoOp asserts that
 // `host-inbound-traffic protocols isis` is ACCEPTED at commit (#3311). IS-IS
 // routing is supported via FRR, but before #3311 `isis` was absent from

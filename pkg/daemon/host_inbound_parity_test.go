@@ -103,6 +103,39 @@ func TestHostInboundBfdAdmitsMultiHop(t *testing.T) {
 	}
 }
 
+// TestHostInboundRoutingProtocolTokenMatches asserts the nft host-inbound rules
+// for the #3341 routing-control tokens emit the correct match fragment and
+// family scoping: rsvp=IP proto 46 (dual), pgm=IP proto 113 (dual), sap=UDP/9875
+// (dual), dvmrp=IP proto 2 / IGMP (IPv4-only). These must stay in lockstep with
+// the AF_XDP host_inbound classifier (host_inbound.rs classify_protocol).
+// Fail-on-revert: before #3341 these tokens returned nil (default arm) → no
+// match in either family, turning every subtest RED.
+func TestHostInboundRoutingProtocolTokenMatches(t *testing.T) {
+	dual := []struct {
+		token string
+		want  string
+	}{
+		{"rsvp", "meta l4proto 46"},
+		{"pgm", "meta l4proto 113"},
+		{"sap", "udp dport 9875"},
+	}
+	for _, c := range dual {
+		for _, fam := range []string{"ip", "ip6"} {
+			got := strings.Join(hostInboundProtocolMatches(c.token, fam), " ; ")
+			if !strings.Contains(got, c.want) {
+				t.Errorf("%s (%s) nft match %q missing %q (dual-family)", c.token, fam, got, c.want)
+			}
+		}
+	}
+	// dvmrp is IPv4-only: proto 2 on ip, nothing on ip6 (family gate).
+	if got := strings.Join(hostInboundProtocolMatches("dvmrp", "ip"), " ; "); !strings.Contains(got, "meta l4proto 2") {
+		t.Errorf("dvmrp (ip) nft match %q missing `meta l4proto 2`", got)
+	}
+	if got := hostInboundProtocolMatches("dvmrp", "ip6"); len(got) != 0 {
+		t.Errorf("dvmrp (ip6) must produce NO match (IPv4-only, IGMP-encapsulated); got %v", got)
+	}
+}
+
 // TestHostInboundProtocolsAllExcludesL2Isis asserts that the nft `protocols all`
 // expansion EXCLUDES the L2/non-IP protocol IS-IS (#3311). The nft `all` case
 // derives its expansion from config.HostInboundAllExpansionProtocols()
