@@ -3064,6 +3064,52 @@ fn app_catalog_directional_forward_not_mislabeled_by_source_port() {
     assert_eq!(ranged.lookup_directional(6, 9050, 1500, true), 9);
 }
 
+// #3385: a dual-constrained custom app whose SOURCE and DESTINATION port ranges
+// OVERLAP must still match only when a CONSISTENT directional pairing holds —
+// NOT whenever a single port happens to fall in the overlap. The pre-#3321
+// OR-decomposition (`dst in dstR || src in dstR` AND `src in srcR || dst in
+// srcR`) admitted a packet whose DESTINATION port landed in the overlap
+// regardless of the source port: srcR=80..80, dstR=80..1000, forward
+// src=55555,dst=80 satisfied `dst_ok` (80 in dstR) AND `src_ok` (dst=80 in
+// srcR) and was mislabeled, even though neither the forward nor the reverse
+// pairing actually holds. This is the distinct over-match #3385 calls out; the
+// direction-aware lookup (#3321) eliminates the cross-slot probing entirely.
+#[test]
+fn app_catalog_overlapping_dual_range_no_cross_slot_overmatch() {
+    // Custom app: srcR = 80..80, dstR = 80..1000 (overlapping at 80).
+    let cat = AppCatalog::from_snapshot(&[crate::AppCatalogEntry {
+        app_id: 11,
+        protocol: 6,
+        dst_port_low: 80,
+        dst_port_high: 1000,
+        src_port_low: 80,
+        src_port_high: 80,
+    }]);
+
+    // RED-on-revert: the #3385 over-match. Forward src=55555 (NOT in srcR),
+    // dst=80 (in dstR AND, via the overlap, in srcR). The OR-decomposition
+    // returned 11 here; the directional lookup yields UNKNOWN because the
+    // source constraint is checked ONLY against the client slot (src=55555).
+    assert_eq!(
+        cat.lookup_forward(6, 55555, 80),
+        0,
+        "forward flow whose dst falls in the src/dst overlap but whose src \
+         violates srcR must NOT match (the #3385 cross-slot over-match)"
+    );
+
+    // The genuine forward pairing still resolves: client src=80 (in srcR),
+    // server dst=500 (in dstR).
+    assert_eq!(cat.lookup_forward(6, 80, 500), 11);
+
+    // Reverse-keyed: service slot rides the source port. service=src=500 (in
+    // dstR), client=dst=80 (in srcR) -> match.
+    assert_eq!(cat.lookup_directional(6, 500, 80, true), 11);
+
+    // Reverse-keyed over-match guard: service=src=55555 (NOT in dstR) ->
+    // UNKNOWN regardless of the client (dst) slot landing in the overlap.
+    assert_eq!(cat.lookup_directional(6, 55555, 80, true), 0);
+}
+
 // #3416: the permit-side audit AppID must resolve from the POST-translation
 // destination port a DNAT'd session was admitted under, mirroring the deny side
 // (#3058/#3185). A public-port -> private-port forward (e.g. :2222 -> :22 for
