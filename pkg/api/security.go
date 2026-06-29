@@ -100,6 +100,11 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 	// #3408: surface a per-policy counter read failure as HTTP 500 after
 	// building, rather than reporting clean-zero hit counts.
 	var readErr error
+	// #3336: span-accumulated runtime/RT_FLOW policy IDs keyed
+	// [policySetID, sliceIndex] — the identity the event path logs, so
+	// automation can join a policy_id back to a rule. The raw ordinal stays the
+	// counter handle below.
+	runtimeIDs := dpuserspace.RuntimePolicyIDs(cfg)
 	var policySetID uint32
 	var result []PolicyInfo
 	for _, zpp := range cfg.Security.Policies {
@@ -115,7 +120,7 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 			FromZone: zpp.FromZone,
 			ToZone:   zpp.ToZone,
 		}
-		for _, rule := range zpp.Policies {
+		for i, rule := range zpp.Policies {
 			// #3476: skip a nil rule (Policies is []*Policy) like the
 			// runtime walker does, rather than dereferencing rule.Name.
 			if rule == nil {
@@ -130,6 +135,17 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				Applications: rule.Match.Applications,
 				Log:          rule.Log != nil,
 				Count:        rule.Count,
+				// #3336: surface the match-inversion flags so an audit does not
+				// read a `source-address-excluded` rule's meaning inverted, the
+				// independent session-init/close log modes the Log bool hides,
+				// and the runtime identity (policy_id matches the event path,
+				// rule_id the snapshot) for event<->rule correlation.
+				SourceAddressExcluded:      rule.Match.SourceAddressExcluded,
+				DestinationAddressExcluded: rule.Match.DestinationAddressExcluded,
+				LogSessionInit:             rule.Log != nil && rule.Log.SessionInit,
+				LogSessionClose:            rule.Log != nil && rule.Log.SessionClose,
+				PolicyID:                   dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i)),
+				RuleID:                     dpuserspace.StablePolicyRuleID(zpp.FromZone, zpp.ToZone, rule.Name),
 			}
 			if pr.SrcAddresses == nil {
 				pr.SrcAddresses = []string{}
@@ -190,6 +206,16 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				// all-zones. Empty for an unscoped global — no regression.
 				MatchFromZone: rule.Match.FromZone,
 				MatchToZone:   rule.Match.ToZone,
+				// #3336: match-inversion flags + independent log modes + runtime
+				// identity. The global rule_id uses the "junos-global" sentinel
+				// zones, matching the snapshot builder so it joins to the same
+				// event.
+				SourceAddressExcluded:      rule.Match.SourceAddressExcluded,
+				DestinationAddressExcluded: rule.Match.DestinationAddressExcluded,
+				LogSessionInit:             rule.Log != nil && rule.Log.SessionInit,
+				LogSessionClose:            rule.Log != nil && rule.Log.SessionClose,
+				PolicyID:                   dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i)),
+				RuleID:                     dpuserspace.StablePolicyRuleID("junos-global", "junos-global", rule.Name),
 			}
 			if pr.SrcAddresses == nil {
 				pr.SrcAddresses = []string{}

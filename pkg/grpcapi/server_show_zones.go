@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
@@ -90,6 +91,11 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 	// #3408: surface a per-policy counter read failure as codes.Internal.
 	var readErr error
 	resp := &pb.GetPoliciesResponse{}
+	// #3336: span-accumulated runtime/RT_FLOW policy IDs, keyed
+	// [policySetID, sliceIndex] — the same identity the event path logs, so
+	// automation can join a policy_id back to a rule. The raw ordinal stays the
+	// counter handle below.
+	runtimeIDs := dpuserspace.RuntimePolicyIDs(cfg)
 	var policySetID uint32
 	for _, zpp := range cfg.Security.Policies {
 		// #3476: skip a nil zone-pair set (tolerant / HA-sync path) while
@@ -117,6 +123,18 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 				Applications: rule.Match.Applications,
 				Log:          rule.Log != nil,
 				Count:        rule.Count,
+				// #3336: match-inversion flags — without these an audit reading
+				// src/dst_addresses sees a `source-address-excluded` rule's
+				// meaning inverted. Additive; false for an un-inverted rule.
+				SourceAddressExcluded:      rule.Match.SourceAddressExcluded,
+				DestinationAddressExcluded: rule.Match.DestinationAddressExcluded,
+				// #3336: independent session-init / session-close log modes the
+				// collapsed `log` bool hides.
+				LogSessionInit:  rule.Log != nil && rule.Log.SessionInit,
+				LogSessionClose: rule.Log != nil && rule.Log.SessionClose,
+				// #3336: runtime identity for event correlation.
+				PolicyId: dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i)),
+				RuleId:   dpuserspace.StablePolicyRuleID(zpp.FromZone, zpp.ToZone, rule.Name),
 			}
 			if pr.SrcAddresses == nil {
 				pr.SrcAddresses = []string{}
@@ -173,6 +191,15 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 				// unscoped (all-zones) global — no regression.
 				MatchFromZone: rule.Match.FromZone,
 				MatchToZone:   rule.Match.ToZone,
+				// #3336: match-inversion flags + log modes + runtime identity.
+				// Global rule_id uses the "junos-global" sentinel zones, matching
+				// the snapshot builder so the rule_id joins to the same event.
+				SourceAddressExcluded:      rule.Match.SourceAddressExcluded,
+				DestinationAddressExcluded: rule.Match.DestinationAddressExcluded,
+				LogSessionInit:             rule.Log != nil && rule.Log.SessionInit,
+				LogSessionClose:            rule.Log != nil && rule.Log.SessionClose,
+				PolicyId:                   dpuserspace.RuntimePolicyIndex(runtimeIDs, policySetID, uint32(i)),
+				RuleId:                     dpuserspace.StablePolicyRuleID("junos-global", "junos-global", rule.Name),
 			}
 			if pr.SrcAddresses == nil {
 				pr.SrcAddresses = []string{}

@@ -485,6 +485,18 @@ Policy: log-control4, action-type: permit, services-offload:not-configured , Sta
 - **Policy fields:** 2-space indent.
 - **Address entries:** 4-space indent. Format: `<name>(global): <prefix> ` (trailing space).
   - `(global)` suffix for global address-book entries.
+  - **Match inversion (#3336):** when a policy sets
+    `source-address-excluded` / `destination-address-excluded`, the
+    address header is annotated `Source addresses (except):` /
+    `Destination addresses (except):` — the rule matches every address
+    EXCEPT those listed. An un-inverted policy keeps the plain
+    `Source addresses:` / `Destination addresses:` header (bit-identical
+    to pre-#3336). The REST (`GET /api/v1/security/policies`) and gRPC
+    (`GetPolicies`) inventory surface the same inversion via the
+    `source_address_excluded` / `destination_address_excluded` booleans,
+    alongside the independent `log_session_init` / `log_session_close`
+    modes and the runtime `policy_id` / `rule_id` (the latter joins a
+    runtime event back to an inventory row).
 - **Application block:** 2-space indent for app name, 4-space for protocol details, 6-space for ports.
   - `IP protocol: tcp|udp|0, ALG: 0, Inactivity timeout: <seconds>`
   - `Source port range: [<low>-<high>]`

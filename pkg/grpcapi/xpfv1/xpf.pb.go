@@ -2177,6 +2177,27 @@ type PolicyRule struct {
 	// the configured zone scope so a scoped global is not shown as all-zones.
 	MatchFromZone string `protobuf:"bytes,11,opt,name=match_from_zone,json=matchFromZone,proto3" json:"match_from_zone,omitempty"`
 	MatchToZone   string `protobuf:"bytes,12,opt,name=match_to_zone,json=matchToZone,proto3" json:"match_to_zone,omitempty"`
+	// #3336: match-inversion flags. source_address_excluded /
+	// destination_address_excluded invert the corresponding address match sense
+	// (Junos `source-address-excluded` / `destination-address-excluded`): the
+	// rule matches every address EXCEPT those listed. The flags exist end-to-end
+	// (config -> snapshot -> dataplane) but were never surfaced on the inventory
+	// API, so an audit reading src_addresses/dst_addresses saw the rule's meaning
+	// INVERTED. Additive; false (omitted) for a rule without the modifier.
+	SourceAddressExcluded      bool `protobuf:"varint,13,opt,name=source_address_excluded,json=sourceAddressExcluded,proto3" json:"source_address_excluded,omitempty"`
+	DestinationAddressExcluded bool `protobuf:"varint,14,opt,name=destination_address_excluded,json=destinationAddressExcluded,proto3" json:"destination_address_excluded,omitempty"`
+	// #3336: per-policy `then log session-init` / `session-close` selection. The
+	// `log` bool above collapses both to one flag, so init-only, close-only, and
+	// both render identically. These expose the independent modes the config and
+	// snapshot already carry. Additive; false (omitted) when unset.
+	LogSessionInit  bool `protobuf:"varint,15,opt,name=log_session_init,json=logSessionInit,proto3" json:"log_session_init,omitempty"`
+	LogSessionClose bool `protobuf:"varint,16,opt,name=log_session_close,json=logSessionClose,proto3" json:"log_session_close,omitempty"`
+	// #3336: runtime identity. policy_id is the span-accumulated runtime/RT_FLOW
+	// policy ID (matches the ID events expose); rule_id is the stable
+	// "<from>-><to>/<name>" string the snapshot carries. They let automation join
+	// a runtime event (policy_id=N) back to this inventory row.
+	PolicyId      uint32 `protobuf:"varint,17,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
+	RuleId        string `protobuf:"bytes,18,opt,name=rule_id,json=ruleId,proto3" json:"rule_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2291,6 +2312,48 @@ func (x *PolicyRule) GetMatchFromZone() string {
 func (x *PolicyRule) GetMatchToZone() string {
 	if x != nil {
 		return x.MatchToZone
+	}
+	return ""
+}
+
+func (x *PolicyRule) GetSourceAddressExcluded() bool {
+	if x != nil {
+		return x.SourceAddressExcluded
+	}
+	return false
+}
+
+func (x *PolicyRule) GetDestinationAddressExcluded() bool {
+	if x != nil {
+		return x.DestinationAddressExcluded
+	}
+	return false
+}
+
+func (x *PolicyRule) GetLogSessionInit() bool {
+	if x != nil {
+		return x.LogSessionInit
+	}
+	return false
+}
+
+func (x *PolicyRule) GetLogSessionClose() bool {
+	if x != nil {
+		return x.LogSessionClose
+	}
+	return false
+}
+
+func (x *PolicyRule) GetPolicyId() uint32 {
+	if x != nil {
+		return x.PolicyId
+	}
+	return 0
+}
+
+func (x *PolicyRule) GetRuleId() string {
+	if x != nil {
+		return x.RuleId
 	}
 	return ""
 }
@@ -7207,7 +7270,7 @@ const file_xpf_proto_rawDesc = "" +
 	"PolicyInfo\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12(\n" +
-	"\x05rules\x18\x03 \x03(\v2\x12.xpf.v1.PolicyRuleR\x05rules\"\xfa\x02\n" +
+	"\x05rules\x18\x03 \x03(\v2\x12.xpf.v1.PolicyRuleR\x05rules\"\x80\x05\n" +
 	"\n" +
 	"PolicyRule\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
@@ -7223,7 +7286,13 @@ const file_xpf_proto_rawDesc = "" +
 	"\vdescription\x18\n" +
 	" \x01(\tR\vdescription\x12&\n" +
 	"\x0fmatch_from_zone\x18\v \x01(\tR\rmatchFromZone\x12\"\n" +
-	"\rmatch_to_zone\x18\f \x01(\tR\vmatchToZone\"\x9e\x04\n" +
+	"\rmatch_to_zone\x18\f \x01(\tR\vmatchToZone\x126\n" +
+	"\x17source_address_excluded\x18\r \x01(\bR\x15sourceAddressExcluded\x12@\n" +
+	"\x1cdestination_address_excluded\x18\x0e \x01(\bR\x1adestinationAddressExcluded\x12(\n" +
+	"\x10log_session_init\x18\x0f \x01(\bR\x0elogSessionInit\x12*\n" +
+	"\x11log_session_close\x18\x10 \x01(\bR\x0flogSessionClose\x12\x1b\n" +
+	"\tpolicy_id\x18\x11 \x01(\rR\bpolicyId\x12\x17\n" +
+	"\arule_id\x18\x12 \x01(\tR\x06ruleId\"\x9e\x04\n" +
 	"\x12GetSessionsRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x05R\x06offset\x12\x12\n" +
