@@ -939,6 +939,18 @@ after a failed commit, when zone-name→ID mapping is unavailable) is likewise
 refused instead of widening to all zones — in incident response, silently
 broadening a scoped forensic query is worse than failing the query.
 
+Zone IDs are 1-based, so zone **0** is the "unknown" / unassigned zone carried
+by pre-classification drops, host-inbound traffic, and events emitted before
+zone resolution. Those events are selectable with `zone unknown` (also `none`
+or the literal `0`) — `show security log zone unknown` (#3338). They were
+previously invisible to any zone-filtered query because zone 0 was overloaded
+as the "no filter" sentinel. The same selector is exposed on the public event
+APIs: REST `GET /api/v1/security/events?zone=unknown` (or `?zone=0` /
+`?zone=none`) and the gRPC `GetEvents` RPC via the `has_zone` field set with
+`zone=0`. A bare gRPC `zone=0` with `has_zone` unset stays "no filter"
+(match-all) for backward compatibility; an unfiltered query on any surface
+always includes the zone-0 events.
+
 ---
 
 ## Interfaces: Terse

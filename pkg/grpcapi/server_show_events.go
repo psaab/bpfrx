@@ -36,8 +36,17 @@ func (s *Server) GetEvents(_ context.Context, req *pb.GetEventsRequest) (*pb.Get
 		limit = 10000
 	}
 
+	// Zone-filter presence: an explicit has_zone selects the zone filter even
+	// for zone 0 (the "unknown" / unassigned zone carried by pre-classification
+	// and host-inbound events), which #3338 makes selectable. For backward
+	// compatibility a non-zero zone still filters when has_zone is unset, so a
+	// pre-#3338 client passing only zone=N is unaffected; only the new
+	// has_zone=true + zone=0 combination isolates the unknown-zone events. A
+	// bare zone=0 with has_zone=false stays "no filter" (match-all), preserving
+	// the #3334 sentinel.
 	filter := logging.EventFilter{
 		Zone:     uint16(req.Zone),
+		HasZone:  req.GetHasZone() || req.Zone != 0,
 		Action:   req.Action,
 		Protocol: req.Protocol,
 	}

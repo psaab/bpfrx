@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -314,15 +316,26 @@ func (s *Server) eventsHandler(w http.ResponseWriter, r *http.Request) {
 		limit = 10000
 	}
 
-	zone, ok := queryUint16Strict(r, "zone", 0)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid zone filter: "+r.URL.Query().Get("zone"))
-		return
-	}
 	filter := logging.EventFilter{
-		Zone:     zone,
 		Action:   r.URL.Query().Get("action"),
 		Protocol: r.URL.Query().Get("protocol"),
+	}
+	// Zone filter: presence of the `zone` query parameter selects the filter,
+	// so zone 0 — the "unknown" / unassigned zone carried by pre-classification
+	// and host-inbound events — is selectable (#3338). Zone IDs are 1-based, so
+	// 0 used to be swallowed by the `0 = no filter` sentinel and those events
+	// were invisible to any zone-filtered query. The word sentinels "unknown"
+	// and "none" are accepted as aliases for 0, mirroring the unknown-zone label
+	// used elsewhere. An absent parameter leaves the filter unset (match-all); a
+	// malformed/out-of-range value fails closed with HTTP 400.
+	if zoneStr := r.URL.Query().Get("zone"); zoneStr != "" {
+		z, ok := parseEventZoneFilter(zoneStr)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "invalid zone filter: "+zoneStr)
+			return
+		}
+		filter.Zone = z
+		filter.HasZone = true
 	}
 
 	var events []logging.EventRecord
@@ -350,6 +363,24 @@ func (s *Server) eventsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeOK(w, result)
+}
+
+// parseEventZoneFilter parses a security-event zone filter value. It accepts a
+// 1-based numeric zone ID (0..65535) and the case-insensitive word sentinels
+// "unknown"/"none" as aliases for zone 0, the unassigned/pre-classification
+// zone (#3338). It returns (0,false) for a malformed or out-of-range value so
+// the caller fails closed with HTTP 400 rather than silently widening the query
+// (mirrors queryUint16Strict's fail-closed contract).
+func parseEventZoneFilter(s string) (uint16, bool) {
+	switch strings.ToLower(s) {
+	case "unknown", "none":
+		return 0, true
+	}
+	n, err := strconv.ParseUint(s, 10, 16)
+	if err != nil {
+		return 0, false
+	}
+	return uint16(n), true
 }
 
 func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
