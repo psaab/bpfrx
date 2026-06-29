@@ -3276,6 +3276,13 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// existing/peer-synced configs keep booting on both compile paths.
 	cfg.Warnings = append(cfg.Warnings, validateScreenScanSweepThresholds(cfg)...)
 
+	// #3315: SYN-flood sub-threshold advisories. `timeout` parses but is not yet
+	// enforced (maps to the half-open session window, a tracked follow-up) and an
+	// attack/source ratio orders of magnitude wide can false-throttle legitimate
+	// sources on the per-source count-min sketch. Warn (never reject) so a config
+	// using these leaves commits and the operator is told what is/ isn't honoured.
+	cfg.Warnings = append(cfg.Warnings, validateScreenSynFloodSubThresholds(cfg)...)
+
 	// #2173: static-NAT / NAT64 host-mask gate. #2132 made the Rust
 	// dataplane tolerate the canonical /32-/128 host mask and PR #2167 then
 	// hardened it to REJECT a non-host mask — so a misconfigured non-host
