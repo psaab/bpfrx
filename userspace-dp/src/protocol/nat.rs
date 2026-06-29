@@ -199,6 +199,29 @@ pub(crate) struct DestinationNATRuleSnapshot {
     pub pool_address: String,
     #[serde(rename = "pool_port", default)]
     pub pool_port: u16,
+    /// #3437 (H10): the source-port constraint of the DNAT rule's `match
+    /// application` term as inclusive [low,high] ranges. Empty =
+    /// source-port-unconstrained (the common case). A non-empty set requires
+    /// the flow's source port to fall in one range, otherwise the rule does
+    /// NOT match — so an application-scoped DNAT no longer translates every
+    /// source port hitting the destination port. A low>high range is the
+    /// fail-CLOSED never-match sentinel and survives the wire verbatim.
+    /// Additive wire field (#1961): an older control plane omits it; this
+    /// helper defaults it empty (the pre-#3437 over-match).
+    #[serde(rename = "match_source_ports", default)]
+    pub match_source_ports: Vec<NatPortRangeWire>,
+    /// #3437 (H11): the ICMP/ICMPv6 type[,code] constraint of the DNAT rule's
+    /// `match application` term (e.g. junos-ping = type 8). None = no ICMP
+    /// type/code constraint (match every type/code of the protocol, the
+    /// historical behavior). When `match_icmp_type` is Some the flow's ICMP
+    /// type MUST equal it, and when `match_icmp_code` is also Some the code
+    /// MUST equal it, otherwise the rule does NOT match; a non-ICMP flow never
+    /// satisfies an ICMP-type-constrained entry (fail closed). Additive wire
+    /// fields, same skew semantics as `match_source_ports`.
+    #[serde(rename = "match_icmp_type", default)]
+    pub match_icmp_type: Option<u8>,
+    #[serde(rename = "match_icmp_code", default)]
+    pub match_icmp_code: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

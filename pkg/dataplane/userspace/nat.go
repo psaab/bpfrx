@@ -653,17 +653,50 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			sourceAddrs = appendNATSourceAddressName(cfg, feedOverlay, sourceAddrs, rule.Match.SourceAddressName)
 
 			// Resolve application match to protocol+ports if specified.
+			//
+			// #3437: an application also pins a `source-port` (H10) and, for an
+			// ICMP/ICMPv6 application, an ICMP type[,code] (H11). The pre-#3437
+			// DNAT builder reduced an app to protocol + destination-port only and
+			// dropped both — a fail-open widening (any source port / every ICMP
+			// type was translated to the VIP). Carry them per term:
+			//   - srcPorts: the application's `source-port` spec coalesced to wire
+			//     ranges, with the same fail-CLOSED never-match sentinel the SNAT
+			//     path uses (#3429/#3491) when it was configured but coalesces to
+			//     nothing. nil = source-port unconstrained.
+			//   - icmpType / icmpCode: the application's ICMP type[,code]
+			//     constraint, carried verbatim (already valid u8s). nil = no ICMP
+			//     type/code constraint (match every type/code of the protocol).
 			type appTerm struct {
-				proto string
-				ports []int
+				proto    string
+				ports    []int
+				srcPorts []NatPortRangeWire
+				icmpType *uint8
+				icmpCode *uint8
 			}
 			var appTerms []appTerm
+
+			appTermFor := func(a *config.Application) appTerm {
+				srcPorts := coalescePortRanges(appPortsFromSpec(a.SourcePort))
+				if a.SourcePort != "" && len(srcPorts) == 0 {
+					// #3437: a configured source-port that coalesces to nothing
+					// (every value out of 1..65535) fails CLOSED — match no source
+					// port rather than widening to any.
+					srcPorts = []NatPortRangeWire{natNeverMatchPortRange}
+				}
+				return appTerm{
+					proto:    a.Protocol,
+					ports:    appPortsFromSpec(a.DestinationPort),
+					srcPorts: srcPorts,
+					icmpType: a.ICMPType,
+					icmpCode: a.ICMPCode,
+				}
+			}
 
 			if rule.Match.Application != "" {
 				userApps := cfg.Applications.Applications
 				app, found := config.ResolveApplication(rule.Match.Application, userApps)
 				if found {
-					appTerms = append(appTerms, appTerm{proto: app.Protocol, ports: appPortsFromSpec(app.DestinationPort)})
+					appTerms = append(appTerms, appTermFor(app))
 				} else if _, isSet := cfg.Applications.ApplicationSets[rule.Match.Application]; isSet {
 					expanded, err := config.ExpandApplicationSet(rule.Match.Application, &cfg.Applications)
 					if err == nil {
@@ -672,13 +705,15 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 							if !ok {
 								continue
 							}
-							appTerms = append(appTerms, appTerm{proto: tApp.Protocol, ports: appPortsFromSpec(tApp.DestinationPort)})
+							appTerms = append(appTerms, appTermFor(tApp))
 						}
 					}
 				}
 			}
 
-			// If no application terms resolved, use explicit match values
+			// If no application terms resolved, use explicit match values. DNAT
+			// `match` grammar has no source-port or ICMP type/code, so those axes
+			// stay unconstrained on the explicit-match fallback term.
 			if len(appTerms) == 0 {
 				appTerms = []appTerm{{proto: rule.Match.Protocol, ports: rule.Match.DestinationPorts}}
 			}
@@ -745,7 +780,13 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 							Protocol:            proto,
 							PoolAddress:         poolAddr,
 							PoolPort:            poolPort,
-							CounterID:           ruleCounterID,
+							// #3437: carry the application's source-port and
+							// ICMP type/code constraints so the DNAT match is no
+							// wider than the referenced application.
+							MatchSourcePorts: term.srcPorts,
+							MatchICMPType:    term.icmpType,
+							MatchICMPCode:    term.icmpCode,
+							CounterID:        ruleCounterID,
 						})
 					}
 				}

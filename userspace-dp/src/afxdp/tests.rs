@@ -1099,6 +1099,9 @@ fn post_dnat_source_nat_matches_translated_destination() {
         protocol: "tcp".to_string(),
         pool_address: "10.0.61.102".to_string(),
         pool_port: 8443,
+        match_source_ports: vec![],
+        match_icmp_type: None,
+        match_icmp_code: None,
     }];
     snapshot.policies.push(PolicyRuleSnapshot {
         name: "allow-inbound".to_string(),
@@ -10211,6 +10214,9 @@ fn inbound_dnat_snapshot(policy: PolicyRuleSnapshot) -> ConfigSnapshot {
         protocol: "tcp".to_string(),
         pool_address: "10.0.61.102".to_string(),
         pool_port: 8443,
+        match_source_ports: vec![],
+        match_icmp_type: None,
+        match_icmp_code: None,
     }];
     snapshot.neighbors.push(NeighborSnapshot {
         interface: "reth1.0".to_string(),

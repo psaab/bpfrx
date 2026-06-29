@@ -625,6 +625,39 @@ type DestinationNATRuleSnapshot struct {
 	Protocol    string `json:"protocol,omitempty"`
 	PoolAddress string `json:"pool_address"`
 	PoolPort    uint16 `json:"pool_port,omitempty"`
+	// MatchSourcePorts carries the source-port constraint of the DNAT rule's
+	// `match application <app>` term as inclusive [Low,High] ranges (#3437,
+	// H10). When a DNAT rule matches via an application that pins a
+	// `source-port` (e.g. a back-channel data app), the translation must only
+	// fire for flows whose source port falls in the application's range; the
+	// pre-#3437 builder dropped it, so ANY source port hitting the destination
+	// port was translated (a fail-open NAT widening). Empty = source-port
+	// unconstrained (the common case; an application with no source-port). A
+	// non-empty set whose only entry is the never-match sentinel ({Low:1,
+	// High:0}) is the fail-CLOSED marker for a source-port that WAS configured
+	// but coalesced to nothing (every value out of 1..65535) — it matches no
+	// source port rather than widening to any. Additive wire field (#1961
+	// skew-safe): an older helper without it treats every entry as
+	// source-port-unconstrained (the pre-#3437 over-match); an older Go binary
+	// omits it.
+	MatchSourcePorts []NatPortRangeWire `json:"match_source_ports,omitempty"`
+	// MatchICMPType / MatchICMPCode carry the ICMP/ICMPv6 type[,code]
+	// constraint of the DNAT rule's `match application <app>` term (#3437,
+	// H11). An ICMP application pins a single message type (e.g. junos-ping =
+	// ICMP echo-request, type 8) and optionally a code; the pre-#3437 builder
+	// reduced the app to protocol + (absent) destination-port only, so a
+	// `match application junos-ping` DNAT rule translated EVERY ICMP type
+	// (errors, replies, non-echo) to the VIP — regressing the #3020 / #3194
+	// ICMP type/code parity already enforced on the policy path. nil = no ICMP
+	// type/code constraint (match every type/code of the protocol, the
+	// historical behavior the all-ICMP aliases keep). When MatchICMPType is
+	// non-nil the flow's ICMP type MUST equal it, and when MatchICMPCode is
+	// also non-nil the code MUST equal it, otherwise the rule does NOT match.
+	// A non-ICMP flow never satisfies an ICMP-type-constrained entry, so it
+	// fails CLOSED. Additive wire fields, same skew semantics as
+	// MatchSourcePorts.
+	MatchICMPType *uint8 `json:"match_icmp_type,omitempty"`
+	MatchICMPCode *uint8 `json:"match_icmp_code,omitempty"`
 	// CounterID is the compiler-assigned per-rule translation hit counter ID
 	// (stable key-derived hash, non-zero; 0 means "no counter"). All expanded
 	// (protocol, port) tuples of the same DNAT rule share one counter ID so

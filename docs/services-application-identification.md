@@ -192,7 +192,21 @@ runtime effect is the L3/L4 catalog classification above
     `buildSourceNATAppTerms` / `SourceNatAppTerm::l4_matches`); each
     axis is AND-ed, and an axis whose configured spec coalesces to no
     representable port fails CLOSED (never-match sentinel) rather than
-    widening to match-any. An **unreferenced** application with
+    widening to match-any. The **destination-NAT** `match application`
+    term reaches the same parity (#3437): in addition to the protocol
+    and destination-port it already keyed on, the DNAT snapshot now
+    carries the application's **source-port** (H10,
+    `MatchSourcePorts`) and **ICMP/ICMPv6 type[,code]** (H11,
+    `MatchICMPType` / `MatchICMPCode`), enforced by
+    `DnatEntry::l4_extra_matches` in `nat/destination.rs`. Before
+    #3437 a `match application junos-ping` DNAT rule published its VIP
+    for **every** ICMP type (errors, replies, non-echo) and every
+    source port — a fail-open widening that regressed the #3020/#3194
+    ICMP type/code parity already enforced on the policy path. The
+    source-port axis carries the same never-match sentinel as the
+    source-NAT path (an out-of-range configured source-port fails
+    CLOSED), and an ICMP-type-constrained DNAT entry fails CLOSED for a
+    non-ICMP packet. An **unreferenced** application with
     app-id disabled is not matchable by anything, so its malformed
     spec stays a *warning* (the operator can iterate on a
     not-yet-wired application library). This is the
