@@ -692,7 +692,10 @@ func TestFairnessThroughputDescriptorCoverage(t *testing.T) {
 
 // describedSet captures the full Describe() descriptor set of a collector.
 func describedSet(c *xpfCollector) map[*prometheus.Desc]struct{} {
-	ch := make(chan *prometheus.Desc, 256)
+	// Buffer must hold the FULL Describe() set (sent synchronously before the
+	// drain); size comfortably above the descriptor count so adding a
+	// descriptor does not silently deadlock this capture.
+	ch := make(chan *prometheus.Desc, 512)
 	c.Describe(ch)
 	close(ch)
 	out := map[*prometheus.Desc]struct{}{}
