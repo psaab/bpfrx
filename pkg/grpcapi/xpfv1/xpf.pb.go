@@ -3490,11 +3490,18 @@ func (x *ScreenInfo) GetChecks() []string {
 }
 
 type GetEventsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Limit         int32                  `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"`
-	Zone          uint32                 `protobuf:"varint,2,opt,name=zone,proto3" json:"zone,omitempty"`
-	Action        string                 `protobuf:"bytes,3,opt,name=action,proto3" json:"action,omitempty"`
-	Protocol      string                 `protobuf:"bytes,4,opt,name=protocol,proto3" json:"protocol,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Limit    int32                  `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"`
+	Zone     uint32                 `protobuf:"varint,2,opt,name=zone,proto3" json:"zone,omitempty"`
+	Action   string                 `protobuf:"bytes,3,opt,name=action,proto3" json:"action,omitempty"`
+	Protocol string                 `protobuf:"bytes,4,opt,name=protocol,proto3" json:"protocol,omitempty"`
+	// has_zone selects the zone filter explicitly so zone 0 (the "unknown" /
+	// unassigned zone carried by pre-classification / host-inbound events) is
+	// selectable (#3338). Zone IDs are 1-based, so 0 used to be indistinguishable
+	// from "no filter". When has_zone is false a zone>0 value still filters
+	// (backward compatible); set has_zone=true with zone=0 to isolate the
+	// unknown-zone events.
+	HasZone       bool `protobuf:"varint,5,opt,name=has_zone,json=hasZone,proto3" json:"has_zone,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3555,6 +3562,13 @@ func (x *GetEventsRequest) GetProtocol() string {
 		return x.Protocol
 	}
 	return ""
+}
+
+func (x *GetEventsRequest) GetHasZone() bool {
+	if x != nil {
+		return x.HasZone
+	}
+	return false
 }
 
 type GetEventsResponse struct {
@@ -6172,8 +6186,11 @@ type MatchPoliciesResponse struct {
 	// matched no host-bound policy (#3285). The dataplane host gate returns None
 	// here — no implicit host default-deny and NO transit global/default
 	// fallback — so local delivery proceeds. When set, `matched` is false and
-	// `action` is empty; clients must render "host-inbound (local delivery; not
-	// governed by transit/global/default policy)", NOT a default-policy verdict.
+	// `default_used` is false (the host path has no default-policy fallback).
+	// Since #3375 the server populates `action` with the explanatory string
+	// "host-inbound (local delivery; not governed by transit/global/default
+	// policy)" (the SSOT shared with the REST surface), so `action` is NON-empty
+	// and a client may render it directly; it is NOT a default-policy verdict.
 	HostInboundUnmatched bool `protobuf:"varint,7,opt,name=host_inbound_unmatched,json=hostInboundUnmatched,proto3" json:"host_inbound_unmatched,omitempty"`
 	// global is true when the matched policy is a `policy global` rule rather
 	// than a zone-pair rule (#3331); it distinguishes a global-scope verdict from
@@ -6191,7 +6208,14 @@ type MatchPoliciesResponse struct {
 	// matched policy (#3331), so a match-policies answer can be cross-referenced
 	// against the session table and the policy-deny/permit audit log even when
 	// policy names collide across scopes. Set only when matched is true.
-	PolicyId      uint32 `protobuf:"varint,11,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
+	PolicyId uint32 `protobuf:"varint,11,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
+	// default_used is true when no policy matched and `action` is the configured
+	// default-policy verdict (#3375), including the no-active-config fail-closed
+	// case (deny). It is the typed form of the " (default)" suffix on `action`,
+	// so a client can branch on the posture without string-parsing. False for a
+	// concrete policy match and for host_inbound_unmatched (which has no
+	// default-policy fallback).
+	DefaultUsed   bool `protobuf:"varint,12,opt,name=default_used,json=defaultUsed,proto3" json:"default_used,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6301,6 +6325,13 @@ func (x *MatchPoliciesResponse) GetPolicyId() uint32 {
 		return x.PolicyId
 	}
 	return 0
+}
+
+func (x *MatchPoliciesResponse) GetDefaultUsed() bool {
+	if x != nil {
+		return x.DefaultUsed
+	}
+	return false
 }
 
 type GetNATRuleStatsRequest struct {
@@ -7399,12 +7430,13 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"ScreenInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
-	"\x06checks\x18\x02 \x03(\tR\x06checks\"p\n" +
+	"\x06checks\x18\x02 \x03(\tR\x06checks\"\x8b\x01\n" +
 	"\x10GetEventsRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12\x12\n" +
 	"\x04zone\x18\x02 \x01(\rR\x04zone\x12\x16\n" +
 	"\x06action\x18\x03 \x01(\tR\x06action\x12\x1a\n" +
-	"\bprotocol\x18\x04 \x01(\tR\bprotocol\"?\n" +
+	"\bprotocol\x18\x04 \x01(\tR\bprotocol\x12\x19\n" +
+	"\bhas_zone\x18\x05 \x01(\bR\ahasZone\"?\n" +
 	"\x11GetEventsResponse\x12*\n" +
 	"\x06events\x18\x01 \x03(\v2\x12.xpf.v1.EventEntryR\x06events\"\xa0\x05\n" +
 	"\n" +
@@ -7590,7 +7622,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"_icmp_typeB\f\n" +
 	"\n" +
-	"_icmp_code\"\xf9\x02\n" +
+	"_icmp_code\"\x9c\x03\n" +
 	"\x15MatchPoliciesResponse\x12\x1f\n" +
 	"\vpolicy_name\x18\x01 \x01(\tR\n" +
 	"policyName\x12\x16\n" +
@@ -7604,7 +7636,8 @@ const file_xpf_proto_rawDesc = "" +
 	"\tfrom_zone\x18\t \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\n" +
 	" \x01(\tR\x06toZone\x12\x1b\n" +
-	"\tpolicy_id\x18\v \x01(\rR\bpolicyId\"N\n" +
+	"\tpolicy_id\x18\v \x01(\rR\bpolicyId\x12!\n" +
+	"\fdefault_used\x18\f \x01(\bR\vdefaultUsed\"N\n" +
 	"\x16GetNATRuleStatsRequest\x12\x19\n" +
 	"\brule_set\x18\x01 \x01(\tR\aruleSet\x12\x19\n" +
 	"\bnat_type\x18\x02 \x01(\tR\anatType\"E\n" +

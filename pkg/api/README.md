@@ -51,6 +51,16 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     the scoped global's real zones on its `from_zone`/`to_zone` labels
     (#3286) — an unscoped global keeps `*`/`*` — so counter-based
     validation is unambiguous on the canonical metrics surface.
+  - `GET /api/v1/statistics/global` — global dataplane counters
+    (`GlobalStats`, types.go). The field set mirrors the gRPC
+    `GetGlobalStats` reader: as of #3426 it includes `nat64_translations`
+    (`GlobalCtrNAT64Xlate`) and `host_inbound_allowed`
+    (`GlobalCtrHostInbound`) alongside the long-standing
+    `host_inbound_denies`. Before #3426 REST omitted both, so an automation
+    client reading only REST could not see NAT64 translation volume or the
+    host-inbound allow count even though gRPC and Prometheus
+    (`xpf_nat64_translations_total`) exposed them. A counter read failure
+    returns HTTP 500 (#3345), not a clean zero.
 - `GET /api/v1/events/stream` — Server-Sent Events stream of dataplane
   events. Backed by the `pkg/logging` event ring buffer; long-lived
   consumers must drain. `?category=` (and `?severity=` on
@@ -202,6 +212,54 @@ under the daemon's errgroup. Nothing else imports this package.
   EXACTLY (case-insensitive), not by substring — `protocol=C` no longer
   over-matches TCP/ICMP/ICMPv6. These contracts are pinned by
   `rest_filter_failclosed_test.go` in this package.
+- The `GET /api/v1/security/sessions` view mirrors the gRPC `GetSessions`
+  session contract (#3419). The REST `SessionEntry` previously diverged from
+  gRPC — `age_seconds` carried IDLE time (now-LastSeen) instead of wall age,
+  a session with both SNAT and DNAT lost the SNAT part (the DNAT branch
+  overwrote the single `nat` string), the reverse entry's counters were not
+  merged into the forward entry, and the application/interface/policy-name/
+  zone-name/session-id/ha-active fields were absent. The handler now:
+  - splits `age_seconds` (now-`Created`) from `idle_seconds` (now-`LastSeen`);
+  - joins BOTH NAT parts in `nat` and exposes structured `nat_src_addr/port`
+    and `nat_dst_addr/port`;
+  - merges the companion reverse entry's counters via `GetSessionV4/V6`
+    (added to `apiRuntimeDataPlane`) so top-talkers/accounting report full
+    bidirectional volume;
+  - resolves `application` (`appid.ResolveSessionName`), `ingress_interface`/
+    `egress_interface` (FIB ifindex+VLAN → unit name), `policy_name`,
+    `ingress_zone_name`/`egress_zone_name`, `session_id`, and `ha_active`
+    (wired from the daemon via `HAActiveFn`, default true standalone).
+
+  It also accepts the gRPC filter set: `application=`, `interface=`,
+  `nat_only=true`, and `source_nat_pool=<pool>` (an unresolved pool fails
+  CLOSED with HTTP 400, like the gRPC `sessionFilter.validate`). The numeric
+  `policy_id`/`ingress_zone`/`egress_zone` fields are retained for
+  compatibility. Pinned by `sessions_parity_test.go`.
+- Session list pagination and the remaining filter dimensions reach gRPC
+  parity in #3421, folded into the SAME `sessionQuery` + `sessionView` +
+  enriched `sessionEntryV4/V6` machinery above (one filter type, not two).
+  Added filters: `source_prefix`, `destination_prefix`, `source_port`,
+  `destination_port` (prefixes accept a CIDR or a bare IP; mirror the gRPC
+  `matchV4`/`matchV6` predicates), each parsing FAIL-CLOSED — a malformed
+  prefix/port returns HTTP 400 instead of zeroing the predicate and widening
+  the query (#3421 M2). Pagination has two modes: the default best-effort
+  `limit`/`offset` window (now parsed strict — malformed/negative → 400,
+  #3421 M8), and a stable cursor mode selected by `page_size>0`. Cursor mode
+  iterates v4 then v6 from an opaque `page_token`, returning up to
+  `page_size` rows plus a `next_page_token` that resumes exactly after the
+  last row (no skip/duplicate across map mutation, the offset path's hazard);
+  an empty `next_page_token` marks the last page. Both modes share the
+  reverse-counter merge + enrichment, so they report IDENTICAL rows and
+  counters. The token codec mirrors the gRPC page-token format and encodes
+  node-local session-map keys (opaque to clients); when the runtime
+  dataplane lacks cursor iteration the handler falls back to the offset path.
+  Pinned by `sessions_pagination_test.go`.
+- Session clear (`POST /api/v1/security/sessions/clear`) clears ALL local
+  sessions and accepts NO parameters: a non-empty query string
+  (`r.URL.RawQuery`) or request body returns HTTP 400 rather than silently
+  ignoring filter parameters and wiping the whole table (#3421 H6). The
+  gRPC-parity FILTERED clear and HA peer propagation are tracked separately
+  (#3423).
 - `GET /api/v1/security/match` (`matchPoliciesHandler`) is a THIN adapter
   over the single shared policy simulator `pkg/policymatch` (#3042). It only
   validates/parses inputs (400 on a malformed IP/port) and renders the

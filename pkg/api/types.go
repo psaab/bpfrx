@@ -19,22 +19,33 @@ type StatusResponse struct {
 
 // GlobalStats holds all global counter values.
 type GlobalStats struct {
-	RxPackets            uint64 `json:"rx_packets"`
-	TxPackets            uint64 `json:"tx_packets"`
-	Drops                uint64 `json:"drops"`
-	SessionsCreated      uint64 `json:"sessions_created"`
-	SessionsClosed       uint64 `json:"sessions_closed"`
-	ScreenDrops          uint64 `json:"screen_drops"`
-	PolicyDenies         uint64 `json:"policy_denies"`
-	NATAllocFails        uint64 `json:"nat_alloc_failures"`
-	HostInboundDeny      uint64 `json:"host_inbound_denies"`
-	TCEgressPackets      uint64 `json:"tc_egress_packets"`
-	FabricRedirects      uint64 `json:"fabric_redirects"`
-	FabricFwdDrops       uint64 `json:"fabric_fwd_drops"`
-	FlowCacheHits        uint64 `json:"flow_cache_hits"`
-	FlowCacheMisses      uint64 `json:"flow_cache_misses"`
-	FlowCacheFlushes     uint64 `json:"flow_cache_flushes"`
-	FlowCacheInvalidates uint64 `json:"flow_cache_invalidations"`
+	RxPackets       uint64 `json:"rx_packets"`
+	TxPackets       uint64 `json:"tx_packets"`
+	Drops           uint64 `json:"drops"`
+	SessionsCreated uint64 `json:"sessions_created"`
+	SessionsClosed  uint64 `json:"sessions_closed"`
+	ScreenDrops     uint64 `json:"screen_drops"`
+	PolicyDenies    uint64 `json:"policy_denies"`
+	NATAllocFails   uint64 `json:"nat_alloc_failures"`
+	HostInboundDeny uint64 `json:"host_inbound_denies"`
+	// HostInboundKernelDenies is the aggregate of the kernel nftables
+	// host-inbound DROP counters across all zones/families (#3361). This is the
+	// PRIMARY host-inbound enforcement path and is DISTINCT from
+	// HostInboundDeny (the userspace-dp #3326 path) — they are not double
+	// counts. Best-effort: a netlink read failure leaves this 0 (the canonical
+	// per-zone/family signal is the xpf_host_inbound_kernel_denies_total
+	// Prometheus metric, which omits the series on a read error rather than
+	// reporting a misleading 0).
+	HostInboundKernelDenies uint64 `json:"host_inbound_kernel_denies"`
+	HostInboundAllowed      uint64 `json:"host_inbound_allowed"`
+	NAT64Translations       uint64 `json:"nat64_translations"`
+	TCEgressPackets         uint64 `json:"tc_egress_packets"`
+	FabricRedirects         uint64 `json:"fabric_redirects"`
+	FabricFwdDrops          uint64 `json:"fabric_fwd_drops"`
+	FlowCacheHits           uint64 `json:"flow_cache_hits"`
+	FlowCacheMisses         uint64 `json:"flow_cache_misses"`
+	FlowCacheFlushes        uint64 `json:"flow_cache_flushes"`
+	FlowCacheInvalidates    uint64 `json:"flow_cache_invalidations"`
 }
 
 // InterfaceStats holds per-interface counter values.
@@ -129,31 +140,76 @@ type PolicyRule struct {
 }
 
 // SessionEntry holds a single session table entry.
+//
+// Field parity with the gRPC SessionEntry contract (#3419): the REST view
+// previously dropped or conflated several fields the gRPC GetSessions RPC
+// already surfaced. The numeric PolicyID/InZone/OutZone fields are retained
+// for backward compatibility; the *_name, interface, application,
+// session_id, idle_seconds and structured nat_* fields mirror gRPC.
 type SessionEntry struct {
-	SrcAddr    string `json:"src_addr"`
-	DstAddr    string `json:"dst_addr"`
-	SrcPort    uint16 `json:"src_port"`
-	DstPort    uint16 `json:"dst_port"`
-	Protocol   string `json:"protocol"`
-	State      string `json:"state"`
-	PolicyID   uint32 `json:"policy_id"`
-	InZone     uint16 `json:"ingress_zone"`
-	OutZone    uint16 `json:"egress_zone"`
-	FwdPackets uint64 `json:"fwd_packets"`
-	FwdBytes   uint64 `json:"fwd_bytes"`
-	RevPackets uint64 `json:"rev_packets"`
-	RevBytes   uint64 `json:"rev_bytes"`
+	SrcAddr  string `json:"src_addr"`
+	DstAddr  string `json:"dst_addr"`
+	SrcPort  uint16 `json:"src_port"`
+	DstPort  uint16 `json:"dst_port"`
+	Protocol string `json:"protocol"`
+	State    string `json:"state"`
+	PolicyID uint32 `json:"policy_id"`
+	// PolicyName / IngressZoneName / EgressZoneName mirror the gRPC
+	// enrichment (#3419 M6). The numeric ids above stay for compatibility;
+	// these resolve them to operator-facing names. Omitted when unresolved.
+	PolicyName      string `json:"policy_name,omitempty"`
+	IngressZoneName string `json:"ingress_zone_name,omitempty"`
+	EgressZoneName  string `json:"egress_zone_name,omitempty"`
+	InZone          uint16 `json:"ingress_zone"`
+	OutZone         uint16 `json:"egress_zone"`
+	// IngressInterface / EgressInterface mirror the gRPC FIB-resolved
+	// interface display (#3419 M4). Empty when unresolved.
+	IngressInterface string `json:"ingress_interface,omitempty"`
+	EgressInterface  string `json:"egress_interface,omitempty"`
+	// Application is the resolved application name (#3419 M1), mirroring
+	// gRPC's appid.ResolveSessionName. Empty when enrichment is unavailable.
+	Application string `json:"application,omitempty"`
+	FwdPackets  uint64 `json:"fwd_packets"`
+	FwdBytes    uint64 `json:"fwd_bytes"`
+	RevPackets  uint64 `json:"rev_packets"`
+	RevBytes    uint64 `json:"rev_bytes"`
+	// NAT keeps the human-readable summary, but a session with BOTH SNAT
+	// and DNAT now joins both parts instead of the DNAT branch overwriting
+	// the SNAT branch (#3419 H2). The structured NatSrc*/NatDst* fields
+	// mirror gRPC so callers do not have to parse the text.
 	NAT        string `json:"nat,omitempty"`
-	Age        int64  `json:"age_seconds"`
-	Timeout    uint32 `json:"timeout_seconds"`
+	NATSrcAddr string `json:"nat_src_addr,omitempty"`
+	NATSrcPort uint16 `json:"nat_src_port,omitempty"`
+	NATDstAddr string `json:"nat_dst_addr,omitempty"`
+	NATDstPort uint16 `json:"nat_dst_port,omitempty"`
+	// Age is wall age since the session was CREATED; Idle is time since the
+	// last packet (#3419 H1). REST previously reported idle time in the
+	// age_seconds field, so a long-lived active session looked seconds old.
+	Age     int64  `json:"age_seconds"`
+	Idle    int64  `json:"idle_seconds"`
+	Timeout uint32 `json:"timeout_seconds"`
+	// SessionID is the dataplane session identity; HAActive reports whether
+	// this node is the active member for the session's resource group
+	// (#3419 M6). HAActive defaults true on a standalone firewall.
+	SessionID uint64 `json:"session_id,omitempty"`
+	HAActive  bool   `json:"ha_active"`
 }
 
 // SessionListResponse holds paginated session results.
+//
+// Two pagination modes share this shape (#3421 H4):
+//   - Offset mode (default): Total/Limit/Offset describe a best-effort
+//     limit/offset window over a live map traversal.
+//   - Cursor mode (page_size>0): PageSize and NextPageToken describe a
+//     stable cursor page; an empty NextPageToken marks the last page.
+//     Total is omitted in cursor mode (it would require a full scan).
 type SessionListResponse struct {
-	Total    int            `json:"total"`
-	Limit    int            `json:"limit"`
-	Offset   int            `json:"offset"`
-	Sessions []SessionEntry `json:"sessions"`
+	Total         int            `json:"total"`
+	Limit         int            `json:"limit"`
+	Offset        int            `json:"offset"`
+	PageSize      int            `json:"page_size,omitempty"`
+	NextPageToken string         `json:"next_page_token,omitempty"`
+	Sessions      []SessionEntry `json:"sessions"`
 }
 
 // SessionSummary holds session table summary stats.
@@ -300,6 +356,12 @@ type MatchPoliciesResult struct {
 	// delivery; no transit global/default fallback), so Action is not a
 	// default-policy verdict for this case.
 	HostInboundUnmatched bool `json:"host_inbound_unmatched,omitempty"`
+	// DefaultUsed is true when no policy matched and Action is the configured
+	// default-policy verdict (#3375), including the no-active-config fail-closed
+	// case (deny). It is the typed form of the " (default)" suffix on Action, so
+	// a client can branch on the posture without string-parsing. False for a
+	// concrete policy match and for HostInboundUnmatched.
+	DefaultUsed bool `json:"default_used,omitempty"`
 }
 
 // ClearSessionsResult holds session clear results.

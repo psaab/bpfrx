@@ -391,6 +391,13 @@ message GetEventsRequest {
   uint32 zone = 2;
   string action = 3;
   string protocol = 4;
+  // has_zone selects the zone filter explicitly so zone 0 (the "unknown" /
+  // unassigned zone carried by pre-classification / host-inbound events) is
+  // selectable (#3338). Zone IDs are 1-based, so 0 used to be indistinguishable
+  // from "no filter". When has_zone is false a zone>0 value still filters
+  // (backward compatible); set has_zone=true with zone=0 to isolate the
+  // unknown-zone events.
+  bool has_zone = 5;
 }
 message GetEventsResponse {
   repeated EventEntry events = 1;
@@ -625,8 +632,11 @@ message MatchPoliciesResponse {
   // matched no host-bound policy (#3285). The dataplane host gate returns None
   // here — no implicit host default-deny and NO transit global/default
   // fallback — so local delivery proceeds. When set, `matched` is false and
-  // `action` is empty; clients must render "host-inbound (local delivery; not
-  // governed by transit/global/default policy)", NOT a default-policy verdict.
+  // `default_used` is false (the host path has no default-policy fallback).
+  // Since #3375 the server populates `action` with the explanatory string
+  // "host-inbound (local delivery; not governed by transit/global/default
+  // policy)" (the SSOT shared with the REST surface), so `action` is NON-empty
+  // and a client may render it directly; it is NOT a default-policy verdict.
   bool host_inbound_unmatched = 7;
   // global is true when the matched policy is a `policy global` rule rather
   // than a zone-pair rule (#3331); it distinguishes a global-scope verdict from
@@ -645,6 +655,13 @@ message MatchPoliciesResponse {
   // against the session table and the policy-deny/permit audit log even when
   // policy names collide across scopes. Set only when matched is true.
   uint32 policy_id = 11;
+  // default_used is true when no policy matched and `action` is the configured
+  // default-policy verdict (#3375), including the no-active-config fail-closed
+  // case (deny). It is the typed form of the " (default)" suffix on `action`,
+  // so a client can branch on the posture without string-parsing. False for a
+  // concrete policy match and for host_inbound_unmatched (which has no
+  // default-policy fallback).
+  bool default_used = 12;
 }
 
 // --- NAT rule counters ---

@@ -11103,6 +11103,95 @@ fn non_first_fragment_v4_not_dropped_by_port_matching_output_filter() {
     );
 }
 
+/// Full (non-fragment) IPv4 ICMP frame: eth(14) + IPv4(20, proto=ICMP) + an
+/// 8-byte ICMP header of the given type. `total_len` covers the ICMP header so
+/// the type byte and the [l4+4..l4+6] word both lie inside the declared
+/// datagram. Bytes [l4+4..l4+6] are 0xBEEF — what the shim stamps as the
+/// ungated pseudo source port.
+fn eth_ipv4_icmp_frame(icmp_type: u8) -> Vec<u8> {
+    let mut f = vec![
+        0x02, 0xbf, 0x72, 0x00, 0x80, 0x08, 0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5, 0x08, 0x00,
+    ];
+    let icmp = [icmp_type, 0x00, 0x00, 0x00, 0xbe, 0xef, 0x00, 0x01];
+    let mut ip = vec![0u8; 20];
+    ip[0] = 0x45;
+    let total = (20 + icmp.len()) as u16;
+    ip[2..4].copy_from_slice(&total.to_be_bytes());
+    ip[8] = 64; // ttl
+    ip[9] = PROTO_ICMP;
+    ip[12..16].copy_from_slice(&[10, 0, 61, 100]); // src
+    ip[16..20].copy_from_slice(&[172, 16, 80, 200]); // dst
+    f.extend_from_slice(&ip);
+    f.extend_from_slice(&icmp);
+    f
+}
+
+#[test]
+fn control_icmp_v4_installs_no_synthesized_tx_flow_key() {
+    // #3290 (TX/CoS side): a permitted ICMPv4 control packet (Time-Exceeded)
+    // whose shim metadata carries a hostile pseudo-port (0xBEEF) must NOT
+    // propagate a synthesized flow key into TX selection / CoS output-filter
+    // evaluation. The forward_request meta-fallback gate mirrors the
+    // conntrack-side parse_session_flow_from_bytes verdict (the primary flow is
+    // None for these packets). Reverting the gate makes the fallback synthesize
+    // a meta-keyed flow with src_port=0xBEEF -> req.flow_key becomes Some -> RED.
+    let frame = eth_ipv4_icmp_frame(11); // Time-Exceeded
+    let forwarding = wan_drop_443_forwarding();
+    let ingress_ident = frag_test_ingress_ident();
+    let decision = frag_test_decision();
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 10,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        pkt_len: frame.len() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        flow_src_port: 0xBEEF,
+        flow_dst_port: 0,
+        flow_src_addr: [10, 0, 61, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        flow_dst_addr: [172, 16, 80, 200, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ..UserspaceDpMeta::default()
+    };
+    let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+
+    let req = build_live_forward_request_from_frame(
+        &WorkerBindingLookup::default(),
+        2,
+        &ingress_ident,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        &frame,
+        meta,
+        &decision,
+        &forwarding,
+        None, // primary flow is None (conntrack-side #3290 gate)
+        None,
+        false,
+        123,
+        Some(&event_handle),
+        None,
+        None,
+    )
+    .expect("control ICMP must still forward (TCP-only output filter does not match)");
+
+    assert_eq!(
+        req.flow_key, None,
+        "#3290: a control ICMP packet must not synthesize a metadata-derived TX flow key"
+    );
+}
+
 #[test]
 fn flowless_non_fragmented_tcp_still_hits_port_matching_output_filter() {
     // Same meta (dst port 443) but a FIRST/atomic fragment (offset 0) — a

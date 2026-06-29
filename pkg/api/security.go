@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -244,6 +246,37 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 		result = append(result, pi)
 	}
 
+	// #3363: the IMPLICIT default-policy catch-all now has a reserved hit
+	// counter (read via the DefaultPolicySentinelID handle). Surface it as a
+	// final synthetic policy set ("-"/"-") with one rule named
+	// dataplane.DefaultPolicyName so automation/dashboards can audit
+	// default-deny/permit hits — the most security-relevant boundary — without
+	// scraping logs. Counts gate on policy-stats like every other rule.
+	{
+		defRule := PolicyRule{
+			Name:         dataplane.DefaultPolicyName,
+			Action:       policyActionStr(cfg.Security.DefaultPolicy),
+			SrcAddresses: []string{},
+			DstAddresses: []string{},
+			Applications: []string{},
+			PolicyID:     dataplane.DefaultPolicySentinelID,
+			RuleID:       dataplane.DefaultPolicyName,
+		}
+		if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
+			if ctrs, err := s.dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err == nil {
+				defRule.HitPackets = ctrs.Packets
+				defRule.HitBytes = ctrs.Bytes
+			} else if readErr == nil {
+				readErr = err
+			}
+		}
+		result = append(result, PolicyInfo{
+			FromZone: "-",
+			ToZone:   "-",
+			Rules:    []PolicyRule{defRule},
+		})
+	}
+
 	if readErr != nil {
 		writeError(w, http.StatusInternalServerError,
 			"policy counter read failed: "+readErr.Error())
@@ -283,15 +316,26 @@ func (s *Server) eventsHandler(w http.ResponseWriter, r *http.Request) {
 		limit = 10000
 	}
 
-	zone, ok := queryUint16Strict(r, "zone", 0)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid zone filter: "+r.URL.Query().Get("zone"))
-		return
-	}
 	filter := logging.EventFilter{
-		Zone:     zone,
 		Action:   r.URL.Query().Get("action"),
 		Protocol: r.URL.Query().Get("protocol"),
+	}
+	// Zone filter: presence of the `zone` query parameter selects the filter,
+	// so zone 0 — the "unknown" / unassigned zone carried by pre-classification
+	// and host-inbound events — is selectable (#3338). Zone IDs are 1-based, so
+	// 0 used to be swallowed by the `0 = no filter` sentinel and those events
+	// were invisible to any zone-filtered query. The word sentinels "unknown"
+	// and "none" are accepted as aliases for 0, mirroring the unknown-zone label
+	// used elsewhere. An absent parameter leaves the filter unset (match-all); a
+	// malformed/out-of-range value fails closed with HTTP 400.
+	if zoneStr := r.URL.Query().Get("zone"); zoneStr != "" {
+		z, ok := parseEventZoneFilter(zoneStr)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "invalid zone filter: "+zoneStr)
+			return
+		}
+		filter.Zone = z
+		filter.HasZone = true
 	}
 
 	var events []logging.EventRecord
@@ -321,10 +365,32 @@ func (s *Server) eventsHandler(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, result)
 }
 
+// parseEventZoneFilter parses a security-event zone filter value. It accepts a
+// 1-based numeric zone ID (0..65535) and the case-insensitive word sentinels
+// "unknown"/"none" as aliases for zone 0, the unassigned/pre-classification
+// zone (#3338). It returns (0,false) for a malformed or out-of-range value so
+// the caller fails closed with HTTP 400 rather than silently widening the query
+// (mirrors queryUint16Strict's fail-closed contract).
+func parseEventZoneFilter(s string) (uint16, bool) {
+	switch strings.ToLower(s) {
+	case "unknown", "none":
+		return 0, true
+	}
+	n, err := strconv.ParseUint(s, 10, 16)
+	if err != nil {
+		return 0, false
+	}
+	return uint16(n), true
+}
+
 func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
-		writeOK(w, MatchPoliciesResult{Action: "deny (default)"})
+		// #3375: no active config is the deterministic fail-closed default deny.
+		// Surface the explicit string AND the typed default_used bit (same SSOT
+		// renderer the gRPC surface uses).
+		nilRes := policymatch.Result{DefaultUsed: true, Action: config.PolicyDeny}
+		writeOK(w, MatchPoliciesResult{Action: nilRes.DisplayAction(), DefaultUsed: true})
 		return
 	}
 
@@ -450,12 +516,12 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	if res.HostInboundUnmatched {
 		writeOK(w, MatchPoliciesResult{
 			HostInboundUnmatched: true,
-			Action:               "host-inbound (local delivery; not governed by transit/global/default policy)",
+			Action:               res.DisplayAction(),
 		})
 		return
 	}
 	if !res.Matched {
-		writeOK(w, MatchPoliciesResult{Action: policymatch.ActionString(res.Action) + " (default)"})
+		writeOK(w, MatchPoliciesResult{Action: res.DisplayAction(), DefaultUsed: res.DefaultUsed})
 		return
 	}
 	writeOK(w, MatchPoliciesResult{
@@ -465,7 +531,7 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		FromZone:     res.FromZone,
 		ToZone:       res.ToZone,
 		PolicyID:     res.PolicyID,
-		Action:       policymatch.ActionString(res.Action),
+		Action:       res.DisplayAction(),
 		SrcAddresses: res.SrcAddresses,
 		DstAddresses: res.DstAddresses,
 		Applications: res.Applications,

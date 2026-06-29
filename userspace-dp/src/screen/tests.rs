@@ -22,6 +22,9 @@ fn default_profile() -> ScreenProfile {
         udp_flood_threshold: 0,
         syn_flood_threshold: 0,
         syn_cookie: false,
+        syn_flood_alarm_threshold: 0,
+        syn_flood_dst_threshold: 0,
+        syn_flood_src_threshold: 0,
         session_limit_src: 0,
         session_limit_dst: 0,
         port_scan_threshold: 0,
@@ -778,7 +781,7 @@ fn teardrop_under_length_non_first_fragment_drops() {
         IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
         IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
         PROTO_TCP,
-        2,     // non-first fragment
+        2, // non-first fragment
         false,
         18, // ip_total_len < hdr_len (20) → under-length / "negative"
     );
@@ -832,7 +835,7 @@ fn teardrop_v6_under_length_non_first_fragment_drops() {
         IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
         IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
         PROTO_UDP,
-        2,     // non-first fragment
+        2, // non-first fragment
         false,
         4, // payload_len < frag_data_off (8) → saturating_sub → 0 (< 8)
         8,
@@ -1221,16 +1224,28 @@ fn extract_screen_info_ipv6_first_fragment_extheader_after_fragment_extracts_tcp
     .expect("first fragment with ext header after fragment must parse");
 
     assert!(info.is_fragment, "MF=1 → is_fragment");
-    assert!(info.is_first_fragment, "MF=1 && offset==0 → is_first_fragment");
+    assert!(
+        info.is_first_fragment,
+        "MF=1 && offset==0 → is_first_fragment"
+    );
     // The walk must have continued past the fragment + dest-opts headers to
     // the real TCP header. If the FRAGMENT arm still `break`d (the #3120
     // bug), `tcp_offset` stays None and these fields are left at 0 — the TCP
     // flags/seq/MSS are hidden from the screens (the evasion). The SYN flag
     // (passed in `tcp_flags`) is still seen, but the SYN-cookie challenge
     // consumes `tcp_mss`, which is only populated when the L4 is reached.
-    assert_eq!(info.tcp_seq, 0x1122_3344, "TCP seq must be extracted past the ext-header chain");
-    assert_eq!(info.tcp_mss, 1400, "TCP MSS option must be extracted past the ext-header chain");
-    assert_eq!(info.tcp_flags, 0x02, "SYN flag visible to the TCP-flag screens");
+    assert_eq!(
+        info.tcp_seq, 0x1122_3344,
+        "TCP seq must be extracted past the ext-header chain"
+    );
+    assert_eq!(
+        info.tcp_mss, 1400,
+        "TCP MSS option must be extracted past the ext-header chain"
+    );
+    assert_eq!(
+        info.tcp_flags, 0x02,
+        "SYN flag visible to the TCP-flag screens"
+    );
 }
 
 #[test]
@@ -1309,7 +1324,11 @@ fn extract_screen_info_ipv6_truncated_fragment_fails_closed() {
     );
     let err = res.expect_err("truncated IPv6 FRAGMENT header must FAIL CLOSED, not pass syn-frag");
     assert_eq!(err, ScreenParseError::TruncatedIpv6ExtChain);
-    assert_eq!(err.screen_reason(), "ip-malformed", "fail-closed drop reason");
+    assert_eq!(
+        err.screen_reason(),
+        "ip-malformed",
+        "fail-closed drop reason"
+    );
 }
 
 #[test]
@@ -1931,6 +1950,352 @@ fn syn_flood_disabled_passes() {
 }
 
 // ================================================================
+// SYN-flood sub-thresholds (#3315): source / destination / alarm
+// ================================================================
+
+/// per-DESTINATION threshold trips for a victim flooded from many (varied)
+/// sources while the aggregate attack-threshold stays well under budget. This
+/// is the PRIMARY #3315 control: a single hot destination is capped even though
+/// no single source is hot and the zone aggregate never trips. RED on revert to
+/// aggregate-only enforcement (the victim would never be dropped).
+#[test]
+fn syn_flood_dest_threshold_trips_under_aggregate() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 100_000; // aggregate never trips in this test
+    profile.syn_flood_dst_threshold = 3;
+    let mut state = make_state("trust", profile);
+    let victim = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 50));
+    // 3 SYNs to the victim from 3 distinct sources are admitted.
+    for i in 0..3u8 {
+        let pkt = tcp_pkt(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, i + 1)),
+            victim,
+            1234,
+            80,
+            TCP_SYN,
+        );
+        assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
+    }
+    // The 4th SYN to the victim (from yet another source) trips per-dest.
+    let pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 99)),
+        victim,
+        1234,
+        80,
+        TCP_SYN,
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 100),
+        ScreenVerdict::Drop("syn-flood")
+    );
+    assert_eq!(
+        state.syn_flood_dst_drops(),
+        1,
+        "per-dest sub-attribution counter increments"
+    );
+    assert_eq!(
+        state.syn_flood_src_drops(),
+        0,
+        "no per-source drop occurred"
+    );
+    // A DIFFERENT, un-flooded destination is unaffected.
+    let other_dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 51));
+    let pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 5)),
+        other_dst,
+        1234,
+        80,
+        TCP_SYN,
+    );
+    assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
+}
+
+/// per-SOURCE threshold trips one hot source while a second source under its cap
+/// passes; the aggregate stays under budget throughout.
+#[test]
+fn syn_flood_source_threshold_trips_per_source() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 100_000;
+    profile.syn_flood_src_threshold = 2;
+    let mut state = make_state("trust", profile);
+    let src_a = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let src_b = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2));
+    // src A: 2 admitted, 3rd trips (distinct dsts so per-dest is irrelevant).
+    for i in 0..2u8 {
+        let pkt = tcp_pkt(
+            src_a,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 2, i + 1)),
+            1234,
+            80,
+            TCP_SYN,
+        );
+        assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
+    }
+    let pkt = tcp_pkt(
+        src_a,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 9)),
+        1234,
+        80,
+        TCP_SYN,
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 100),
+        ScreenVerdict::Drop("syn-flood")
+    );
+    assert_eq!(state.syn_flood_src_drops(), 1);
+    // src B under its cap passes.
+    let pkt = tcp_pkt(
+        src_b,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 20)),
+        1234,
+        80,
+        TCP_SYN,
+    );
+    assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
+}
+
+/// alarm-threshold: crossing it (below attack-threshold) raises a single
+/// out-of-band alarm event per second per zone WITHOUT dropping the packet.
+#[test]
+fn syn_flood_alarm_threshold_raises_event_without_drop() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 10; // attack
+    profile.syn_flood_alarm_threshold = 3; // alarm (below attack)
+    let mut state = make_state("trust", profile);
+    let pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        1234,
+        80,
+        TCP_SYN,
+    );
+    // SYNs 1..3: under alarm (sum 3 > 3 is false). No alarm, all Pass.
+    for _ in 0..3 {
+        assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
+        assert!(!state.take_syn_alarm_event());
+    }
+    // SYN 4: sum 4 > 3 alarm, < 10 attack → alarm pending, verdict Pass.
+    assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
+    assert!(
+        state.take_syn_alarm_event(),
+        "alarm-threshold crossing raises an event"
+    );
+    // SYN 5 in the SAME second: alarm still over but cadence suppresses a second
+    // event (≤1/sec/zone).
+    assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
+    assert!(
+        !state.take_syn_alarm_event(),
+        "≤1 alarm per second per zone"
+    );
+    // Next second: a fresh alarm is allowed.
+    assert_eq!(state.check_packet("trust", &pkt, 101), ScreenVerdict::Pass);
+    assert!(
+        state.take_syn_alarm_event(),
+        "a new second admits a fresh alarm"
+    );
+    assert!(state.syn_flood_alarm_events() >= 2);
+}
+
+/// FAIL-ON-REVERT (SMR-F5): the aggregate counter ALWAYS increments before the
+/// per-IP checks, so its cookie-activation side-effect can never be skipped.
+/// With both attack and per-dest configured, driving the aggregate over
+/// attack-threshold mints a cookie (cookie mode) rather than letting a per-dest
+/// hard-drop pre-empt the aggregate. Reverting to "per-IP first, return early"
+/// would make this a per-dest Drop instead of a cookie challenge.
+#[test]
+fn syn_flood_aggregate_authoritative_over_per_ip() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 2; // low aggregate
+    profile.syn_cookie = true;
+    profile.syn_flood_dst_threshold = 100; // per-dest configured but high
+    let mut state = make_state("trust", profile);
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    let pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        1234,
+        80,
+        TCP_SYN,
+    );
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 3, &pkt, 100),
+        ScreenVerdict::Pass
+    );
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 3, &pkt, 100),
+        ScreenVerdict::Pass
+    );
+    // 3rd SYN trips the aggregate → cookie challenge (aggregate authoritative),
+    // NOT a per-dest drop.
+    assert!(matches!(
+        state.check_packet_with_zone_id("trust", 3, &pkt, 100),
+        ScreenVerdict::SynCookieChallenge(_)
+    ));
+    assert_eq!(
+        state.syn_flood_dst_drops(),
+        0,
+        "aggregate cookie path pre-empts per-dest"
+    );
+}
+
+/// D3: per-DESTINATION runs even when the zone is SYN-cookie active (a cookie-
+/// completing distributed flood must not evade destination-threshold). Force the
+/// zone cookie-active and keep the aggregate high so only the per-dest cap can
+/// trip.
+#[test]
+fn syn_flood_dest_runs_when_cookie_active() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 100_000; // aggregate won't trip
+    profile.syn_cookie = true;
+    profile.syn_flood_dst_threshold = 2;
+    let mut state = make_state("trust", profile);
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    // Force the zone cookie-active for the test window.
+    state
+        .syn_cookie_active_until_secs
+        .insert("trust".to_string(), 100_000);
+    let victim = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 7));
+    for i in 0..2u8 {
+        let pkt = tcp_pkt(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, i + 1)),
+            victim,
+            1234,
+            80,
+            TCP_SYN,
+        );
+        assert_eq!(
+            state.check_packet_with_zone_id("trust", 3, &pkt, 100),
+            ScreenVerdict::Pass
+        );
+    }
+    let pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 50)),
+        victim,
+        1234,
+        80,
+        TCP_SYN,
+    );
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 3, &pkt, 100),
+        ScreenVerdict::Drop("syn-flood"),
+        "per-dest must still enforce while the zone is cookie-active"
+    );
+    assert_eq!(state.syn_flood_dst_drops(), 1);
+}
+
+/// D3: per-SOURCE is SKIPPED while the zone is SYN-cookie active. Even a source
+/// well over its cap must NOT be per-source dropped once the cookie governs the
+/// zone (the spoofed-flood regime where per-source is defeated and the sketch
+/// would over-throttle). RED on revert if the cookie-active gate is dropped.
+#[test]
+fn syn_flood_source_skipped_when_cookie_active() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 100_000; // aggregate won't trip
+    profile.syn_cookie = true;
+    profile.syn_flood_src_threshold = 2;
+    let mut state = make_state("trust", profile);
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    state
+        .syn_cookie_active_until_secs
+        .insert("trust".to_string(), 100_000);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    // Many SYNs from one source, far over source-threshold, all Pass (per-source
+    // skipped while cookie-active).
+    for i in 0..10u8 {
+        let pkt = tcp_pkt(
+            src,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 2, i + 1)),
+            1234,
+            80,
+            TCP_SYN,
+        );
+        assert_eq!(
+            state.check_packet_with_zone_id("trust", 3, &pkt, 100),
+            ScreenVerdict::Pass
+        );
+    }
+    assert_eq!(
+        state.syn_flood_src_drops(),
+        0,
+        "per-source must be skipped while cookie-active"
+    );
+}
+
+/// per-SOURCE runs (NOT skipped) when the zone is NOT cookie-active — the
+/// counterpart to the gate test above.
+#[test]
+fn syn_flood_source_runs_when_not_cookie_active() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 100_000;
+    profile.syn_cookie = true; // enabled but zone NOT active
+    profile.syn_flood_src_threshold = 2;
+    let mut state = make_state("trust", profile);
+    state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    for i in 0..2u8 {
+        let pkt = tcp_pkt(
+            src,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 2, i + 1)),
+            1234,
+            80,
+            TCP_SYN,
+        );
+        assert_eq!(
+            state.check_packet_with_zone_id("trust", 3, &pkt, 100),
+            ScreenVerdict::Pass
+        );
+    }
+    let pkt = tcp_pkt(
+        src,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 9)),
+        1234,
+        80,
+        TCP_SYN,
+    );
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 3, &pkt, 100),
+        ScreenVerdict::Drop("syn-flood")
+    );
+    assert_eq!(state.syn_flood_src_drops(), 1);
+}
+
+/// Sub-threshold sketches are allocated only for zones that configure them and
+/// dropped when the threshold is removed (memory tracks live config).
+#[test]
+fn syn_flood_sketches_allocated_only_when_configured() {
+    let mut state = ScreenState::new();
+    // No sub-thresholds → no sketches.
+    let mut p = ScreenProfile::default();
+    p.syn_flood_threshold = 10;
+    state.update_profiles({
+        let mut m = FxHashMap::default();
+        m.insert("trust".to_string(), p.clone());
+        m
+    });
+    assert!(!state.syn_dst_sketch.contains_key("trust"));
+    assert!(!state.syn_src_sketch.contains_key("trust"));
+    // Configure dst + src → sketches appear.
+    let mut p2 = p.clone();
+    p2.syn_flood_dst_threshold = 5;
+    p2.syn_flood_src_threshold = 5;
+    state.update_profiles({
+        let mut m = FxHashMap::default();
+        m.insert("trust".to_string(), p2);
+        m
+    });
+    assert!(state.syn_dst_sketch.contains_key("trust"));
+    assert!(state.syn_src_sketch.contains_key("trust"));
+    // Remove them → sketches freed.
+    state.update_profiles({
+        let mut m = FxHashMap::default();
+        m.insert("trust".to_string(), p);
+        m
+    });
+    assert!(!state.syn_dst_sketch.contains_key("trust"));
+    assert!(!state.syn_src_sketch.contains_key("trust"));
+}
+
+// ================================================================
 // SYN cookie core (#1374)
 // ================================================================
 
@@ -2147,7 +2512,9 @@ fn syn_cookie_round_trip_with_cached_wall_secs() {
         SynCookieCodec::current_full_epoch(mint_unix_secs + 2 * SynCookieCodec::EPOCH_SECS);
     assert_eq!(two_epochs_ahead, mint_epoch + 2);
     assert!(
-        codec.validate_isn(tuple, 7, two_epochs_ahead, cookie).is_none(),
+        codec
+            .validate_isn(tuple, 7, two_epochs_ahead, cookie)
+            .is_none(),
         "validation two epochs later must fail as before",
     );
 }

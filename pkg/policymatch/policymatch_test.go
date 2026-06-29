@@ -288,6 +288,59 @@ func TestFeedOverlayResolvesFeedBackedName(t *testing.T) {
 	}
 }
 
+// TestFeedInSetMatchesUnderA is the #3294 (A′) parity artifact for the
+// simulator: a feed binding nested as a MEMBER of an address-set must resolve
+// to its live feed CIDRs, so a `deny <set>` denies the feed portion (not just
+// the concrete member). Before #3294 expandBookName merged feed prefixes only
+// for a top-level token, so a feed source inside a set silently fell through —
+// the same under-deny the dataplane closed. RED-on-revert: drop the
+// overlay-aware recursion in expandBookName and the in-feed source no longer
+// matches.
+func TestFeedInSetMatchesUnderA(t *testing.T) {
+	cfg := cfgWith(config.SecurityConfig{
+		DefaultPolicy: config.PolicyPermit,
+		AddressBook: &config.AddressBook{
+			Addresses: map[string]*config.Address{
+				"good-host": {Name: "good-host", Value: "10.0.0.0/8"},
+			},
+			AddressSets: map[string]*config.AddressSet{
+				// feed member + concrete member.
+				"s": {Name: "s", Addresses: []string{"bad-actors", "good-host"}},
+			},
+		},
+		Policies: []*config.ZonePairPolicies{
+			zonePair("untrust", "trust", &config.Policy{
+				Name:   "deny-set",
+				Match:  config.PolicyMatch{SourceAddresses: []string{"s"}},
+				Action: config.PolicyDeny,
+			}),
+		},
+	}, config.ApplicationsConfig{})
+
+	overlay := map[string][]string{"bad-actors": {"203.0.113.0/24"}}
+
+	// A source inside the FEED portion of the set must hit the deny.
+	feedSrc := Match(cfg, Query{FromZone: "untrust", ToZone: "trust",
+		SrcIP: net.ParseIP("203.0.113.7"), FeedOverlay: overlay})
+	if !feedSrc.Matched || feedSrc.Action != config.PolicyDeny {
+		t.Fatalf("#3294: feed member of a set must be denied; got %+v, want matched deny", feedSrc)
+	}
+
+	// The concrete portion still denies (no regression).
+	concreteSrc := Match(cfg, Query{FromZone: "untrust", ToZone: "trust",
+		SrcIP: net.ParseIP("10.1.2.3"), FeedOverlay: overlay})
+	if !concreteSrc.Matched || concreteSrc.Action != config.PolicyDeny {
+		t.Fatalf("concrete member of a set must still be denied; got %+v", concreteSrc)
+	}
+
+	// An address outside both portions falls through to default-permit.
+	other := Match(cfg, Query{FromZone: "untrust", ToZone: "trust",
+		SrcIP: net.ParseIP("198.51.100.9"), FeedOverlay: overlay})
+	if other.Matched && other.Action == config.PolicyDeny {
+		t.Fatalf("an out-of-set source must not be denied by the feed-in-set rule; got %+v", other)
+	}
+}
+
 // TestOldNarrowMatcherDiverges is the concrete fail-on-revert artifact: it
 // re-implements the pre-#3042 per-surface logic (zone-pair-only loop, narrow
 // address matcher, narrow app matcher, hard-coded default-deny) and asserts it

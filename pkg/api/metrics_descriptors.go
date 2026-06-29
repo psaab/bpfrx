@@ -62,8 +62,25 @@ func newCollector(srv *Server) *xpfCollector {
 		),
 		hostInboundDeny: prometheus.NewDesc(
 			"xpf_host_inbound_denies_total",
-			"Total host-inbound traffic denials.",
+			"Total host-inbound traffic denials on the userspace-dp (AF_XDP) path.",
 			nil, nil,
+		),
+		// #3361: host-bound traffic to a firewall interface IP / VRRP VIP is
+		// shunted to the kernel by the XDP shim before userspace-dp sees it, so
+		// the PRIMARY host-inbound enforcement is the kernel nftables
+		// `inet xpf_hostinbound` chain. Its catch-all DROP rules now carry a
+		// named per-zone/family nft counter (pkg/daemon/daemon_nft.go), scraped
+		// here. This is a DISTINCT enforcement path from
+		// xpf_host_inbound_denies_total (the userspace-dp #3326 path) — they are
+		// not double counts. The counter resets when the daemon rebuilds the
+		// table (every commit / DHCP address change); Prometheus rate() handles
+		// the reset.
+		hostInboundKernelDenies: prometheus.NewDesc(
+			"xpf_host_inbound_kernel_denies_total",
+			"Total host-inbound traffic denials by the kernel nftables host-inbound "+
+				"chain, per zone/family (distinct from the userspace-dp "+
+				"xpf_host_inbound_denies_total path).",
+			[]string{"zone", "family"}, nil,
 		),
 		tcEgressPacketsTotal: prometheus.NewDesc(
 			"xpf_tc_egress_packets_total",

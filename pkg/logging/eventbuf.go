@@ -13,7 +13,7 @@ type EventRecord struct {
 	SrcAddr         string // "10.0.1.5:443"
 	DstAddr         string
 	Protocol        string // "TCP", "UDP" (rendered name; numeric for unnamed)
-	ProtocolNum     uint8  // raw IP protocol number the record carries (#3382). The matcher compares this directly: protoName rendering is NOT reversible (protoName(41)="IPV6" but ProtocolNumber("ipv6") is one-way), so re-parsing Protocol drops proto-41/ipv6 records.
+	ProtocolNum     uint8  // raw IP protocol number the record carries (#3382). The matcher compares this directly rather than re-parsing the rendered name: numeric comparison stays total for named, numeric-only, and any future render-only protocols (the ProtocolName↔ProtocolNumber round-trip is closed since #3393, but the raw number is the robust key regardless).
 	Action          string // "permit", "deny"
 	PolicyID        uint32
 	RuleID          uint32
@@ -160,19 +160,29 @@ func (eb *EventBuffer) unsubscribe(sub *Subscription) {
 }
 
 // EventFilter specifies criteria for filtering events.
+//
+// Zone-filter presence is tracked by HasZone, NOT by overloading Zone==0 as
+// "no filter" (#3338). Zone IDs are 1-based (the pkg/dataplane compiler
+// assigns 1..N; see compiler.go phase 1), so zone 0 is the "unknown" /
+// unassigned zone — the pre-classification drops, host-inbound, and
+// emitted-before-zone-resolution events. Those are exactly the records an
+// operator needs to isolate during an incident, so zone 0 MUST be a
+// selectable filter value. With the old `Zone==0 means no filter` sentinel
+// they were silently invisible to any zone-filtered query.
 type EventFilter struct {
-	Zone     uint16 // match if InZone or OutZone equals this; 0 = no filter
+	Zone     uint16 // zone ID to match against InZone/OutZone; gated by HasZone
+	HasZone  bool   // true if Zone is an active filter (0 = the unknown zone)
 	Protocol string // exact case-insensitive match on Protocol ("" = no filter)
 	Action   string // exact case-insensitive match on Action ("" = no filter)
 }
 
 // IsEmpty returns true if no filter criteria are set.
 func (f EventFilter) IsEmpty() bool {
-	return f.Zone == 0 && f.Protocol == "" && f.Action == ""
+	return !f.HasZone && f.Protocol == "" && f.Action == ""
 }
 
 func (f EventFilter) matches(rec *EventRecord) bool {
-	if f.Zone != 0 && rec.InZone != f.Zone && rec.OutZone != f.Zone {
+	if f.HasZone && rec.InZone != f.Zone && rec.OutZone != f.Zone {
 		return false
 	}
 	// Exact (case-insensitive) match, NOT substring: substring matching

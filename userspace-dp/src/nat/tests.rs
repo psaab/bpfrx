@@ -7441,3 +7441,57 @@ fn dnat_unconstrained_application_still_matches_any_l4_3437() {
         );
     }
 }
+
+// #3434 (Codex audit 095 H07/H08): a DNAT rule whose `match application` names
+// an UNDEFINED application or a defined-but-EMPTY application-set resolves to
+// zero application terms. Before the fix the Go builder fell through to its
+// explicit-match fallback and emitted protocol="" + destination_port=0 — a
+// PROTO_ANY wildcard entry that translated EVERY flow to the destination (a
+// fail-open wildcard VIP). The fix instead emits that same wildcard shape but
+// with the #3437 source-port never-match sentinel ({low:1, high:0}), so the
+// installed entry can never satisfy l4_extra_matches and translates NOTHING.
+//
+// This test pins the exact snapshot shape the Go builder now emits for an
+// undefined/empty NAT app reference and proves it fails CLOSED across every L4
+// protocol and port. The first table is the pre-fix fail-open (no sentinel) —
+// it translates everything — and is the contrast that proves the sentinel is
+// what closes the hole.
+#[test]
+fn dnat_undefined_application_never_match_sentinel_fails_closed_3434() {
+    let src: IpAddr = "198.51.100.1".parse().unwrap();
+    let dst: IpAddr = "203.0.113.10".parse().unwrap();
+
+    // Pre-fix shape: an IP-only wildcard entry (protocol="" + dst_port=0 =>
+    // PROTO_ANY) with NO L4 constraint translates ANY protocol/port — the
+    // H07/H08 fail-open the explicit-match fallback produced.
+    let fail_open = dnat_table_with_l4("", 0, vec![], None, None);
+    assert!(
+        fail_open
+            .lookup_with_counter(PROTO_TCP, src, dst, 40000, 443, "", None)
+            .is_some(),
+        "control: an unconstrained PROTO_ANY DNAT entry translates any flow (the pre-fix fail-open)"
+    );
+
+    // Post-fix shape: the same wildcard entry carrying the never-match
+    // source-port sentinel matches NOTHING, for every protocol and port.
+    let fail_closed = dnat_table_with_l4("", 0, vec![NatPortRangeWire { low: 1, high: 0 }], None, None);
+    for &(proto, sp, dp) in &[
+        (PROTO_TCP, 0u16, 0u16),
+        (PROTO_TCP, 40000, 443),
+        (PROTO_UDP, 1, 53),
+        (PROTO_ICMP, 0, 0),
+        (PROTO_TCP, 65535, 65535),
+    ] {
+        let icmp = if proto == PROTO_ICMP {
+            Some((8u8, 0u8))
+        } else {
+            None
+        };
+        assert!(
+            fail_closed
+                .lookup_with_counter(proto, src, dst, sp, dp, "", icmp)
+                .is_none(),
+            "undefined-app never-match sentinel must reject proto={proto} sport={sp} dport={dp}"
+        );
+    }
+}

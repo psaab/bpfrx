@@ -306,7 +306,7 @@ in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
 - **Firewall**: Stateful inspection, zone-based policies (including global policies), address books, application matching, multi-term apps, filtered session clearing
 - **NAT**: SNAT (interface + pool, address-persistent), DNAT (with hit counters), static 1:1, NAT64
 - **IPv4 + IPv6**: Dual-stack, DHCPv4/v6 clients, Router Advertisements
-- **Screen/IDS**: 11 checks (land, syn-flood, ping-death, teardrop, rate-limiting), SYN cookie flood protection (XDP-generated SYN-ACK cookies with source validation)
+- **Screen/IDS**: 11 checks (land, syn-flood, ping-death, teardrop, rate-limiting), SYN cookie flood protection (XDP-generated SYN-ACK cookies with source validation), SYN-flood sub-thresholds (#3315: per-source/per-destination caps on a no-eviction count-min sketch + log-only alarm-threshold; `timeout` maps to the half-open session window, tracked follow-up)
 - **Routing**: FRR integration (static, OSPF, BGP, IS-IS, RIP), VRFs, GRE tunnels, export/redistribute, ECMP multipath, next-table + rib-group inter-VRF route leaking, route filtering by protocol/CIDR, probe-driven WAN failover (`services ip-monitoring` preferred-route injection, #1827)
 - **VLANs**: 802.1Q tagging, trunk ports
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation, XFRM interfaces

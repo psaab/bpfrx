@@ -743,7 +743,11 @@ func (er *EventReader) logEvent(data []byte) {
 	if len(localWriters) > 0 {
 		severity := eventSeverity(evt.EventType, evt.Action)
 		catBit := eventCategory(evt.EventType)
-		var stdMsg string
+		// Cache formatted bodies lazily per format type, mirroring the syslog
+		// fanout above. #3409: the event-mode local writer now honors all four
+		// formats instead of branching on `binary` and writing standard text
+		// for everything else (which silently no-op'd structured / sd-syslog).
+		var stdMsg, structMsg string
 		var localBinMsg []byte
 		for _, lw := range localWriters {
 			if !lw.ShouldSendEvent(severity, catBit) {
@@ -758,10 +762,23 @@ func (er *EventReader) logEvent(data []byte) {
 				}
 				continue
 			}
-			if stdMsg == "" {
-				stdMsg = formatSyslogMsg(rec)
+			// Body selection matches the syslog fanout: `structured` emits the
+			// Junos RT_FLOW structured body; `sd-syslog` and the standard
+			// default share the RFC 3164 body, with sd-syslog wrapped in an
+			// RFC 5424 envelope by LocalLogWriter.Send.
+			var msg string
+			if lw.Format == "structured" {
+				if structMsg == "" {
+					structMsg = formatStructuredMsg(rec, evt.Protocol)
+				}
+				msg = structMsg
+			} else {
+				if stdMsg == "" {
+					stdMsg = formatSyslogMsg(rec)
+				}
+				msg = stdMsg
 			}
-			if err := lw.Send(severity, stdMsg); err != nil {
+			if err := lw.Send(severity, msg); err != nil {
 				slog.Debug("local log write failed", "err", err)
 			}
 		}

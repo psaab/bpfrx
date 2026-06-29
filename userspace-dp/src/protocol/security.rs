@@ -38,6 +38,21 @@ pub(crate) struct ScreenProfileSnapshot {
     pub syn_flood_threshold: u32,
     #[serde(rename = "syn_cookie", default)]
     pub syn_cookie: bool,
+    /// #3315: SYN-flood sub-thresholds. Mirror of the Go ScreenProfileSnapshot
+    /// additions. The Go compiler parses the full Junos syn-flood shape but only
+    /// `syn_flood_threshold` (attack-threshold) used to cross the wire; these
+    /// carry the log-only alarm rate and the per-destination / per-source SYN
+    /// rate caps so the dataplane can enforce them (`SynRateSketch`). `timeout`
+    /// is intentionally not on the wire (it maps to the session half-open window,
+    /// a tracked follow-up; the Go compiler warns it is inert). `#[serde(default)]`
+    /// keeps wire parity with an older Go control plane that omits the fields
+    /// (decode to 0 = disabled — #1961 skew tolerance).
+    #[serde(rename = "syn_flood_alarm_threshold", default)]
+    pub syn_flood_alarm_threshold: u32,
+    #[serde(rename = "syn_flood_dst_threshold", default)]
+    pub syn_flood_dst_threshold: u32,
+    #[serde(rename = "syn_flood_src_threshold", default)]
+    pub syn_flood_src_threshold: u32,
     #[serde(rename = "session_limit_src", default)]
     pub session_limit_src: u32,
     #[serde(rename = "session_limit_dst", default)]

@@ -170,6 +170,12 @@ func ProtocolNumber(name string) (uint8, bool) {
 		return 89, true
 	case "junos-ip-in-ip", "junos-ipip", "ipip":
 		return 4, true
+	case "ipv6":
+		// IANA protocol 41 (IPv6 encapsulation). This is the reverse of
+		// ProtocolName(41)=="ipv6" — added in #3393 so the canonical
+		// display name round-trips through the SSOT. ProtocolName renders
+		// it, so it must parse back to the same number.
+		return 41, true
 	case "egp":
 		return 8, true
 	case "igmp":
@@ -195,20 +201,19 @@ func ProtocolNumber(name string) (uint8, bool) {
 
 // ProtocolNumberLenient resolves an operator protocol-FILTER token (a
 // name, alias, or numeric 0-255) to its IP protocol number for the
-// session-inspection surfaces only. It accepts everything ProtocolNumber
-// resolves PLUS the display-only names that ProtocolName renders but
-// ProtocolNumber deliberately does NOT reverse — notably "ipv6"=41, the
-// documented one-way mapping (#3393).
+// session-inspection surfaces. It accepts everything ProtocolNumber
+// resolves PLUS any display-only name that ProtocolName renders but
+// ProtocolNumber does not reverse.
 //
-// This is a READ/FILTER-side convenience: config compilation and policy
-// matching keep using the strict one-way ProtocolNumber (whose
-// acceptance set is mirrored in pkg/config), so the strict SSOT is
-// unchanged. The effect here is narrow — a protocol NAME the system
-// still DISPLAYS (e.g. a proto-41/"ipv6" session shown by every operator
-// surface) must not be rejected as an invalid session filter, and the
-// matcher must then actually match those sessions. Refs #3393 (does not
-// close it: the global round-trip of ProtocolNumber is intentionally
-// untouched).
+// Since #3393 closed the strict round-trip (every name ProtocolName
+// emits — including "ipv6"=41 — now reverses through ProtocolNumber), the
+// ProtocolName reverse-scan below is a belt-and-suspenders backstop rather
+// than a behavioral difference: for the current tables this function is
+// equal to ProtocolNumber. It is retained as a stable seam for the filter
+// callers (cmd/cli, gRPC session filters) so that if ProtocolName ever
+// gains a render-only name ahead of its ProtocolNumber reverse, the
+// read/filter side still accepts the name the system displays rather than
+// rejecting it as an invalid filter.
 func ProtocolNumberLenient(name string) (uint8, bool) {
 	if n, ok := ProtocolNumber(name); ok {
 		return n, true
@@ -235,9 +240,12 @@ func ProtocolNumberLenient(name string) (uint8, bool) {
 // historically displayed (matching the prior gRPC switch); it is NOT a
 // complete inverse of ProtocolNumber. ProtocolNumber resolves additional
 // protocols (ospf/egp/igmp/pim/ah/sctp/vrrp/...) that have no display
-// mapping here, and ProtocolName(41)=="ipv6" has no reverse
-// (ProtocolNumber("ipv6") returns (0,false)). The round-trip holds only for
-// the gre/esp/ipip + icmp/icmpv6/tcp/udp set.
+// mapping here. But the converse round-trip DOES hold for the entire set
+// ProtocolName renders: every name it returns parses back to the same
+// number, i.e. ProtocolNumber(ProtocolName(p)) == p for every p with a
+// display name. #3393 closed the last gap — ProtocolName(41)=="ipv6" now
+// reverses through ProtocolNumber("ipv6")==41, so a rendered protocol name
+// re-parses safely (no accepted-but-never-matches / mislabel for proto 41).
 //
 // This is the SSOT for the named-protocol set rendered by every operator
 // surface (REST pkg/api, gRPC pkg/grpcapi). Before #2949 each surface kept its
