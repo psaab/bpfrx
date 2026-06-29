@@ -122,7 +122,15 @@ func (s *Server) buildInterfacesInput() cluster.InterfacesInput {
 func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) (*pb.MatchPoliciesResponse, error) {
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
-		return &pb.MatchPoliciesResponse{}, nil
+		// #3375: with no active config the verdict is the deterministic
+		// fail-closed default deny — render the same explicit string + typed
+		// default_used bit REST returns, so a gRPC client never sees a BLANK
+		// action and mis-reads the no-config posture as "no answer".
+		nilRes := policymatch.Result{DefaultUsed: true, Action: config.PolicyDeny}
+		return &pb.MatchPoliciesResponse{
+			Action:      nilRes.DisplayAction(),
+			DefaultUsed: true,
+		}, nil
 	}
 
 	// #3355 (H06): the CLI surfaces (show security match-policies / test
@@ -216,15 +224,21 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 	// delivery; no global/default fallback). Signal it explicitly so the client
 	// does not render a misleading default-policy verdict for the host path.
 	if res.HostInboundUnmatched {
+		// #3375: render the same explanatory action string REST returns instead
+		// of leaving it blank, so a gRPC client showing `action` directly gets a
+		// self-describing host-inbound verdict (DisplayAction is the SSOT shared
+		// with REST). Matched stays false and there is no default-policy fallback.
 		return &pb.MatchPoliciesResponse{
 			Matched:              false,
 			HostInboundUnmatched: true,
+			Action:               res.DisplayAction(),
 		}, nil
 	}
 	if !res.Matched {
 		return &pb.MatchPoliciesResponse{
-			Matched: false,
-			Action:  policymatch.ActionString(res.Action) + " (default)",
+			Matched:     false,
+			Action:      res.DisplayAction(),
+			DefaultUsed: res.DefaultUsed,
 		}, nil
 	}
 	return &pb.MatchPoliciesResponse{
@@ -234,7 +248,7 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		FromZone:     res.FromZone,
 		ToZone:       res.ToZone,
 		PolicyId:     res.PolicyID,
-		Action:       policymatch.ActionString(res.Action),
+		Action:       res.DisplayAction(),
 		SrcAddresses: res.SrcAddresses,
 		DstAddresses: res.DstAddresses,
 		Applications: res.Applications,
