@@ -1256,7 +1256,13 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	d.applyHostname(cfg)
 	d.applyTimezone(cfg)
 	d.applyKernelTuning(cfg)
-	d.applyLo0Filter(cfg)
+	// #3392: the lo0 input filter is host-protection control-plane enforcement,
+	// so an apply/teardown failure must fail the commit closed rather than be
+	// swallowed at WARN — the same fail-open #3333 fixed for host-inbound. The
+	// error is joined into the commit result at the tail (alongside networkdErr /
+	// dhcpServerErr / hostInboundErr); the remaining apply steps still run so
+	// management/SSH reconcile is never skipped by an lo0 nft failure.
+	lo0Err := d.applyLo0Filter(cfg)
 	// #3333: host-inbound is the kernel-nftables PRIMARY enforcement of the
 	// host-inbound contract, so an apply/teardown failure must fail the commit
 	// closed rather than be swallowed at WARN. The error is joined into the
@@ -1451,7 +1457,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// restart/stop failure through the commit so a write that left stale
 	// kernel state fails the commit (fail-closed) instead of reporting
 	// success. Both are joined so neither masks the other.
-	return errors.Join(networkdErr, dhcpServerErr, hostInboundErr)
+	return errors.Join(networkdErr, dhcpServerErr, hostInboundErr, lo0Err)
 }
 
 // compileErrorMustAbortApply reports whether a dataplane ApplyConfig error

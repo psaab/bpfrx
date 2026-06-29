@@ -113,15 +113,28 @@ func TestICMPTypeConstraintParity(t *testing.T) {
 	}
 }
 
-// TestICMPTypeConstrainedTermRequiresICMPProtocol pins the defensive gate: an
-// application term that constrains ICMPType must never match a non-ICMP flow.
-// A predefined ICMP app pins its protocol (so the protocol check already gates
-// it), but a CUSTOM app can carry an icmp-type without a pinned protocol; the
-// dataplane keys icmp_constraints under the ICMP protocol, so a TCP query must
-// not satisfy a type-constrained term. Without the gate, an app with
-// Protocol="" + ICMPType set would match any protocol whose query happened to
-// carry a matching ICMPType.
-func TestICMPTypeConstrainedTermRequiresICMPProtocol(t *testing.T) {
+// TestICMPTypeConstrainedProtocolLessAppNeverMatches pins the #3323 parity
+// contract for a protocol-less named application that carries ONLY an ICMP type.
+// Such an app is UNREPRESENTABLE by the dataplane and is never enforced:
+// deriveUserspaceCapabilities (pkg/dataplane/userspace/capabilities.go) fails
+// closed for proto=="" with NO ICMP-protocol inference
+// (normalizeUserspaceApplicationProtocol("")=="") → the __unsupported__ sentinel
+// → whole-snapshot reject (#3261), and strict commit hard-rejects a protocol-less
+// app (pkg/config/compiler_validate_strict.go). It is also not constructible via
+// real config: the application compiler (compiler_applications.go) has no
+// `icmp-type` property, so a user app can NEVER set ICMPType — only predefined
+// apps do (junos-ping/junos-pingv6), and those always pin Protocol. So
+// Protocol=="" implies a no-protocol app the runtime drops.
+//
+// The simulator must therefore report NO concrete match for this app, for EVERY
+// query protocol — mirroring the dataplane reject. Before #3323 the
+// matchSingleApp protocol gate was skipped when app.Protocol=="" and this term
+// falsely matched an ICMP query (a simulator-vs-runtime over-report). The
+// protocol gate (now unconditional) catches it first; the residual ICMP-family
+// gate remains as belt-and-suspenders for a protocol-PINNED ICMP app
+// (junos-ping), whose type/code check is still live and exercised by the cases
+// table above.
+func TestICMPTypeConstrainedProtocolLessAppNeverMatches(t *testing.T) {
 	cfg := cfgWith(config.SecurityConfig{
 		DefaultPolicy: config.PolicyDeny,
 		Zones:         zones("trust", "untrust"),
@@ -131,22 +144,24 @@ func TestICMPTypeConstrainedTermRequiresICMPProtocol(t *testing.T) {
 		},
 	}, config.ApplicationsConfig{
 		Applications: map[string]*config.Application{
-			// No Protocol pinned — only an ICMP type constraint.
+			// No Protocol pinned — only an ICMP type constraint. Not
+			// constructible via real config; the dataplane rejects it.
 			"custom-icmp-noproto": {Name: "custom-icmp-noproto", ICMPType: u8(8)},
 		},
 	})
 
-	// A TCP query carrying ICMPType 8 must NOT match (default deny). Without the
-	// ICMP-family gate this would falsely permit.
+	// A TCP query carrying ICMPType 8 must NOT match (default deny).
 	tcp := Match(cfg, Query{FromZone: "trust", ToZone: "untrust", Protocol: "tcp", ICMPType: u8(8)})
 	if tcp.Matched || tcp.Action != config.PolicyDeny {
-		t.Errorf("TCP query matched a type-constrained term: Matched=%v Action=%v", tcp.Matched, tcp.Action)
+		t.Errorf("TCP query matched a protocol-less term: Matched=%v Action=%v", tcp.Matched, tcp.Action)
 	}
 
-	// The same term still matches a genuine ICMP echo (type 8).
+	// #3323: an ICMP query must ALSO not match — the dataplane rejects a
+	// protocol-less app, so the simulator must not report it as a concrete
+	// permit. (Pre-#3323 this falsely permitted.)
 	icmp := Match(cfg, Query{FromZone: "trust", ToZone: "untrust", Protocol: "icmp", ICMPType: u8(8)})
-	if !icmp.Matched || icmp.Action != config.PolicyPermit {
-		t.Errorf("ICMP echo did not match type-constrained term: Matched=%v Action=%v", icmp.Matched, icmp.Action)
+	if icmp.Matched || icmp.Action != config.PolicyDeny {
+		t.Errorf("ICMP query matched a protocol-less app the dataplane rejects: Matched=%v Action=%v", icmp.Matched, icmp.Action)
 	}
 }
 

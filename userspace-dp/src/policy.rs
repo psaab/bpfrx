@@ -1144,40 +1144,59 @@ impl AppCatalog {
         self.by_protocol.is_empty()
     }
 
-    /// Resolve the app_id for a session 5-tuple. The well-known service port is
-    /// the destination on a forward session and the source on a reverse-keyed
-    /// session, so both port slots are probed — both directions of one session
-    /// then resolve to the same app_id (required because the publisher installs
-    /// forward + reverse conntrack entries). Returns 0 (unknown) when nothing
+    /// Resolve the app_id for a session 5-tuple, honouring flow DIRECTION.
+    ///
+    /// The well-known service port is the DESTINATION on a forward-keyed
+    /// session and the SOURCE on a reverse-keyed session. `is_reverse` selects
+    /// which slot carries the service port, so the catalog's destination-port
+    /// constraint is matched against the real service side ONLY — the lookup
+    /// does not probe both slots. Both directions of one session still resolve
+    /// to the same app_id because the caller passes the matching `is_reverse`
+    /// for each direction (and the publisher stamps the forward + reverse
+    /// conntrack entries from one resolution). Returns 0 (unknown) when nothing
     /// matches; 0 is the existing default the show path treats as "no AppID".
+    ///
+    /// #3321: the previous directionless probe matched the service port on
+    /// EITHER slot. A forward flow whose CLIENT source port coincidentally
+    /// equalled a service port (e.g. tcp `src=443, dst=ephemeral`) was then
+    /// mislabeled as that service in session display / RT_FLOW create+close /
+    /// policy-deny / filter-log records — log-integrity pollution during
+    /// incident response. Matching on the directional service slot fixes it.
     #[inline]
-    pub(crate) fn lookup(&self, protocol: u8, src_port: u16, dst_port: u16) -> u16 {
+    pub(crate) fn lookup_directional(
+        &self,
+        protocol: u8,
+        src_port: u16,
+        dst_port: u16,
+        is_reverse: bool,
+    ) -> u16 {
         let Some(bucket) = self.by_protocol.get(&protocol) else {
             return 0;
         };
-        // Exact single-port match on either slot (service port = dst forward,
-        // src reverse). Prefer the lower app_id when both slots hit distinct
-        // apps, for determinism.
-        let dst_hit = bucket.exact_dst.get(&dst_port).copied();
-        let src_hit = bucket.exact_dst.get(&src_port).copied();
-        let exact = match (dst_hit, src_hit) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) | (None, Some(a)) => Some(a),
-            (None, None) => None,
+        // Service port = destination on a forward flow, source on a reverse-
+        // keyed flow; the client port is the other slot.
+        let (service_port, client_port) = if is_reverse {
+            (src_port, dst_port)
+        } else {
+            (dst_port, src_port)
         };
-        // Scan entries (ranges / protocol-only). Catalog order = ascending id.
+        // Exact single-port entries carry no source constraint by construction
+        // (`from_snapshot` only routes src-unconstrained single-dst entries to
+        // `exact_dst`), so an exact hit needs only the service port.
+        let exact = bucket.exact_dst.get(&service_port).copied();
+        // Scan entries (ranges / source-constrained / protocol-only). Catalog
+        // order = ascending id.
         let in_range = |low: u16, high: u16, p: u16| -> bool {
             // (0,0) means "no constraint".
             (low == 0 && high == 0) || (p >= low && p <= high)
         };
         let mut scan_hit: Option<u16> = None;
         for s in &bucket.scan {
-            // Destination-port constraint may be satisfied by either slot, the
-            // same forward/reverse symmetry the exact path uses.
-            let dst_ok = in_range(s.dst_low, s.dst_high, dst_port)
-                || in_range(s.dst_low, s.dst_high, src_port);
-            let src_ok = in_range(s.src_low, s.src_high, src_port)
-                || in_range(s.src_low, s.src_high, dst_port);
+            // Destination constraint is matched against the service slot and
+            // the source constraint against the client slot — directional, no
+            // cross-slot probing.
+            let dst_ok = in_range(s.dst_low, s.dst_high, service_port);
+            let src_ok = in_range(s.src_low, s.src_high, client_port);
             if dst_ok && src_ok {
                 scan_hit = Some(s.app_id);
                 break;
@@ -1188,6 +1207,15 @@ impl AppCatalog {
             (Some(a), None) | (None, Some(a)) => a,
             (None, None) => 0,
         }
+    }
+
+    /// Forward-keyed convenience wrapper: the service port is the destination.
+    /// This is the common case for cold-path RT_FLOW / filter-log / policy-deny
+    /// resolution where the 5-tuple is the received (forward) packet and there
+    /// is no session-direction flag at the call site.
+    #[inline]
+    pub(crate) fn lookup_forward(&self, protocol: u8, src_port: u16, dst_port: u16) -> u16 {
+        self.lookup_directional(protocol, src_port, dst_port, false)
     }
 }
 

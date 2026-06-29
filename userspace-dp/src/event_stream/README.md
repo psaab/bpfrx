@@ -63,12 +63,20 @@ periodic ACK from the daemon.
   slot (offset 132, little-endian u16) instead of hardcoding 0. The
   `emit_policy_deny_event` / `emit_filter_log_event` call sites and the
   `emit_session_close_rt_flow` (#2520) AND `emit_session_create_rt_flow`
-  (#2615) callers resolve the AppID with the SAME
-  `app_catalog.lookup(protocol, src_port, dst_port)` the forwarding hot
-  path runs when it stamps the conntrack entry on session create (see
-  `afxdp::event_emit::resolve_flow_app_id`), so a policy-deny / filter-log /
-  session-create / session-close record shows `application=<name>` for a
-  resolvable 5-tuple instead of `application="UNKNOWN"`.
+  (#2615) callers resolve the AppID with the SAME direction-aware
+  `app_catalog` the forwarding hot path runs when it stamps the conntrack
+  entry on session create (see `afxdp::event_emit::resolve_flow_app_id`), so
+  a policy-deny / filter-log / session-create / session-close record shows
+  `application=<name>` for a resolvable 5-tuple instead of
+  `application="UNKNOWN"`.
+  (#3321) the lookup is DIRECTIONAL: `lookup_forward` matches the service on
+  the DESTINATION port for a forward-keyed 5-tuple, and `lookup_directional`
+  matches the source slot when the caller knows the entry is reverse-keyed
+  (`metadata.is_reverse`). The cold-path resolvers (`resolve_flow_app_id` /
+  `resolve_policy_deny_app_id`) use `lookup_forward`; the session-create /
+  -close stamps pass the binding's own direction flag. A forward flow whose
+  SOURCE port coincides with a service port (e.g. tcp `src=443`) is no longer
+  mislabeled — the old probe matched the service on either slot.
   (#3058) a DNAT / static-NAT / inbound-NPTv6 policy-DENY record now reflects
   what the policy was actually evaluated against (the #2345 post-translation
   tuple), mirroring the permit / SESSION_CLOSE convention exactly: the

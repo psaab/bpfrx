@@ -293,6 +293,21 @@ From zone: guest, To zone: lan
     outside the IP host-inbound filter, so adjacencies form regardless. The nft
     parity test skips L2 tokens and instead asserts they produce no IP match;
     the Rust `classify_protocol` mirrors this with an explicit no-op arm.
+  - **Routing-control protocol tokens (#3341):** four further Junos/vSRX
+    `host-inbound-traffic protocols` tokens are now recognized — before #3341
+    they were absent from `KnownHostInboundProtocols`, so since #3200 made the
+    set typed a valid vSRX config naming them was HARD-REJECTED at commit. Unlike
+    IS-IS, all four ride IP and so map to a concrete IP host-inbound match on
+    BOTH enforcement surfaces (nft kernel mirror + Rust AF_XDP classifier):
+    `rsvp` (RSVP, IP protocol 46, dual-family), `pgm` (Pragmatic General
+    Multicast, IP protocol 113, dual-family), `sap` (Session Announcement
+    Protocol, UDP/9875, dual-family), and `dvmrp` (carried inside IGMP, IP
+    protocol 2, **IPv4-only** via `config.HostInboundProtocolFamily` — like
+    `igmp`). Each is included in the `protocols all` expansion. Fail-on-revert
+    Go (`TestHostInboundRoutingProtocolTokensCommit`,
+    `TestHostInboundRoutingProtocolTokenMatches`) + Rust
+    (`routing_control_protocol_tokens_classify`) tests guard commit acceptance,
+    the nft match/family scoping, and the Rust admit semantics.
   - **RETH VRRP VIP scoping (#3172):** the kernel host-inbound chain scopes
     its accept/deny rules to each zone's firewall-local addresses. Those
     addresses now include the zone's RETH **VRRP virtual IPs** (the

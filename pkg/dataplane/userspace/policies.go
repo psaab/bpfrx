@@ -230,11 +230,13 @@ func RuntimePolicyIDs(cfg *config.Config) map[[2]uint32]uint32 {
 // drift on how a policy ID maps to a (policy-set, rule-index) pair.
 //
 // Each policy's application-set expansion advances the per-set rule index by
-// userspacePolicyRuleExpansionCount. If a policy set's cumulative expansion
-// reaches MaxRulesPerPolicy (256), the next policy's ID would cross into the
-// following set's namespace; this mirrors the legacy compiler guard
-// (pkg/dataplane/compiler.go) and is rejected fail-closed so the apply path
-// retains the prior good dataplane state.
+// userspacePolicyRuleExpansionCount. A policy set may exactly fill its 256-slot
+// namespace (indices 0..255, the full MaxRulesPerPolicy range) — every such ID
+// stays inside the set's own namespace. Only a policy whose expansion would
+// advance the per-set rule index PAST MaxRulesPerPolicy (256) — i.e. require an
+// ID at index >= 256 — would cross into the following set's namespace; that is
+// rejected fail-closed so the apply path retains the prior good dataplane state.
+// This mirrors the legacy compiler guard (pkg/dataplane/compiler.go).
 func walkPolicyRuleSlots(cfg *config.Config, fn func(slot policyRuleSlot) error) error {
 	if cfg == nil {
 		return nil
@@ -251,8 +253,8 @@ func walkPolicyRuleSlots(cfg *config.Config, fn func(slot policyRuleSlot) error)
 				continue
 			}
 			span := userspacePolicyRuleExpansionCount(cfg, pol.Match.Applications)
-			if ruleIndex+span >= dataplane.MaxRulesPerPolicy {
-				return fmt.Errorf("policy %s->%s: expanded rules reach MaxRulesPerPolicy (%d) and would spill into the next policy set's ID namespace",
+			if ruleIndex+span > dataplane.MaxRulesPerPolicy {
+				return fmt.Errorf("policy %s->%s: expanded rules exceed MaxRulesPerPolicy (%d) and would spill into the next policy set's ID namespace",
 					zpp.FromZone, zpp.ToZone, dataplane.MaxRulesPerPolicy)
 			}
 			if err := fn(policyRuleSlot{
@@ -276,8 +278,8 @@ func walkPolicyRuleSlots(cfg *config.Config, fn func(slot policyRuleSlot) error)
 			continue
 		}
 		span := userspacePolicyRuleExpansionCount(cfg, pol.Match.Applications)
-		if globalRuleIndex+span >= dataplane.MaxRulesPerPolicy {
-			return fmt.Errorf("global policy: expanded rules reach MaxRulesPerPolicy (%d) and would spill into the next policy set's ID namespace",
+		if globalRuleIndex+span > dataplane.MaxRulesPerPolicy {
+			return fmt.Errorf("global policy: expanded rules exceed MaxRulesPerPolicy (%d) and would spill into the next policy set's ID namespace",
 				dataplane.MaxRulesPerPolicy)
 		}
 		if err := fn(policyRuleSlot{

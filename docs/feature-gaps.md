@@ -927,13 +927,25 @@ drift) closed in `fix/2008-quickwins-batch1`:
 
   **#3145 (WRITE side, real bug — FIXED):** `buildPolicySnapshots` advanced
   `ruleIndex` by the expansion count with no `MaxRulesPerPolicy` guard. A set
-  whose cumulative expansion reached 256 pushed the next policy's snapshot
-  PolicyID into the following set's base namespace, mis-attributing RT_FLOW
-  policy IDs and colliding the dataplane/event namespace. The legacy guard at
-  `compiler.go:765/901` is the retired-eBPF path and never fires here. The fix
-  routes ID assignment through `walkPolicyRuleSlots`, which enforces the cap
-  fail-closed — a set whose expansion reaches 256 is rejected at snapshot
-  build (the apply path retains the prior good dataplane state).
+  whose cumulative expansion pushed a policy's ID past index 255 spilled the
+  next policy's snapshot PolicyID into the following set's base namespace,
+  mis-attributing RT_FLOW policy IDs and colliding the dataplane/event
+  namespace. The legacy guard in `compiler.go` is the retired-eBPF path and
+  never fires here. The fix routes ID assignment through `walkPolicyRuleSlots`,
+  which enforces the cap fail-closed — a policy whose expansion would require an
+  ID at index >= `MaxRulesPerPolicy` (256) is rejected at snapshot build (the
+  apply path retains the prior good dataplane state).
+
+  **#3404 (off-by-one in the #3145 cap — FIXED):** the cap originally used `>=`
+  (`ruleIndex+span >= MaxRulesPerPolicy`), which rejected a set that EXACTLY
+  fills its 256-slot namespace (indices 0..255) even though every ID stays in
+  the set's own namespace. The boundary was changed to `>` in both
+  `walkPolicyRuleSlots` and the legacy `compiler.go` mirror, so a set with
+  exactly 256 rules arms and only the 257th rule (which would need index 256)
+  is rejected. Cross-set namespaces stay disjoint: set N's last ID is
+  `N*256+255`, set N+1's first is `(N+1)*256`, so the corrected boundary cannot
+  let them collide. Boundary tests cover exact-256 accept / 257 reject /
+  no-cross-set-collision for both the userspace and legacy paths.
 
   **#3143 (READ side, misdiagnosis — no functional change):** the issue
   assumed `policyRuleIDForCounter`'s `policyID % MaxRulesPerPolicy` was wrong

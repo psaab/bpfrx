@@ -769,7 +769,7 @@ func compilePolicies(dp DataPlane, cfg *config.Config, result *CompileResult) er
 			}
 		}
 
-		if len(expanded) >= MaxRulesPerPolicy {
+		if len(expanded) > MaxRulesPerPolicy {
 			return fmt.Errorf("policy %s->%s: %d expanded rules exceeds MaxRulesPerPolicy (%d)",
 				zpp.FromZone, zpp.ToZone, len(expanded), MaxRulesPerPolicy)
 		}
@@ -905,7 +905,7 @@ func compilePolicies(dp DataPlane, cfg *config.Config, result *CompileResult) er
 			}
 		}
 
-		if len(expanded) >= MaxRulesPerPolicy {
+		if len(expanded) > MaxRulesPerPolicy {
 			return fmt.Errorf("global policy: %d expanded rules exceeds MaxRulesPerPolicy (%d)",
 				len(expanded), MaxRulesPerPolicy)
 		}

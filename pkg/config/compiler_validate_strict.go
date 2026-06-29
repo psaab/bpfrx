@@ -9,6 +9,58 @@ import (
 	"strings"
 )
 
+// validateLogEventModeFormatStrict rejects a top-level `security log format`
+// that the EVENT-mode writer cannot honor (#3349 follow-up). The top-level
+// format leaf is schema-validated to one of {binary, sd-syslog, structured,
+// syslog} regardless of mode, but the value feeds two different runtimes:
+//
+//   - stream mode (remote syslog): honors binary (formatBinaryRecord),
+//     structured (formatStructuredMsg), sd-syslog (RFC 5424 envelope in
+//     SyslogClient.Send), and the standard RFC 3164 default — all four.
+//   - event mode (local file, pkg/logging LocalLogWriter via
+//     ringbuf.go ProcessRawEvent local-writer fanout): branches ONLY on
+//     `binary`; every other value writes standard text. So `structured`
+//     and `sd-syslog` SILENTLY fall back to standard text — the exact
+//     silent-config-fallback #3349 exists to eliminate, on the new typed
+//     surface.
+//
+// This is a CROSS-FIELD rule (format validity depends on the sibling mode),
+// which the declarative per-leaf SchemaValidate walker cannot express, so it
+// lives here as a post-compile pass on cfg.Security.Log. When mode is event,
+// only the event-honorable formats are accepted; structured / sd-syslog are
+// rejected at commit instead of silently no-opping. Event-mode structured /
+// sd-syslog support is a feature gap tracked separately (see the follow-up
+// issue cited in docs/config-schema.md); restricting the enum here is the
+// fail-closed half.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientLogEventModeFormat) so an already-persisted or
+// peer-synced config that an older binary accepted still boots — the runtime
+// already falls back to standard text, so a leniently-loaded value is inert
+// rather than bricking the load (#1960 / #3261). Commit / commit-check stay
+// strict. Mirrors validateLogProfileStreamReferencesStrict.
+//
+// The event-honorable set MUST stay in sync with the LocalLogWriter fanout in
+// pkg/logging/ringbuf.go (binary branch + standard-text default): a value
+// allowed here but unhonored there reintroduces the silent fallback.
+func validateLogEventModeFormatStrict(cfg *Config) error {
+	if cfg == nil || cfg.Security.Log.Mode != "event" {
+		return nil
+	}
+	switch cfg.Security.Log.Format {
+	case "", "binary", "syslog":
+		// "" / "syslog" => standard RFC 3164 text (what the writer produces
+		// and what the operator named); "binary" => binary records. All
+		// honored by the event-mode LocalLogWriter.
+		return nil
+	default:
+		return fmt.Errorf("security log format %q is not honored in event mode "+
+			"(the local-file writer only emits binary or standard text); use "+
+			"`binary` or `syslog`, or switch to `mode stream` for structured / "+
+			"sd-syslog output", cfg.Security.Log.Format)
+	}
+}
+
 func validateThreeColorPolicersStrict(policers map[string]*ThreeColorPolicerConfig) error {
 	for name, pol := range policers {
 		if pol == nil {

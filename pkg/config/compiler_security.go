@@ -736,6 +736,45 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			return nodeVal(n)
 		}
 
+		// recordKeyExtras flags trailing tokens collapsed onto a RECOGNIZED
+		// screen leaf's Keys beyond the tokens compileScreen legitimately
+		// reads (#3332). In the flat-set AST a leaf with no schema children
+		// absorbs every trailing token onto its Keys, so `tcp land bogus`
+		// lands as Keys=["land","bogus"] and the compiler reads only the
+		// keyword (and, for value leaves, a fixed Keys index), silently
+		// dropping the rest — a typo'd extra token is accepted with no
+		// warning. `allowed` is the total Keys length the leaf legitimately
+		// carries: 1 for a boolean flag (`land`), 2 for a single-value leaf
+		// whose value sits at Keys[1] (`port-scan threshold <n>`,
+		// `syn-flood attack-threshold <n>`, `limit-session source-ip-based
+		// <n>` value tail), 3 for `flood threshold <n>` (value at Keys[2]).
+		// Each token past that span is operator garbage; record it on
+		// UnknownLeaves so validateScreenUnknownStrict rejects the commit
+		// (the tolerant load / peer-sync path downgrades to a warning —
+		// #3318 / #1960 no-brick). This is distinct from the #3318 unknown-
+		// KEYWORD gate: here the leaf keyword itself IS supported.
+		recordKeyExtras := func(prefix string, n *Node, allowed int) {
+			for i := allowed; i < len(n.Keys); i++ {
+				profile.UnknownLeaves = append(profile.UnknownLeaves, prefix+" "+n.Keys[i])
+			}
+		}
+		// recordChildExtras flags unexpected CHILD nodes hanging off a
+		// recognized screen leaf that takes no sub-stanza (#3332). A leaf
+		// declared with args>0 in setSchema (limit-session source-ip-based /
+		// destination-ip-based) has SetPath consume its value into Keys and
+		// park any further trailing token as a CHILD node rather than on
+		// Keys, so recordKeyExtras cannot see it. The leaf models no children,
+		// so every child here is garbage that would otherwise be silently
+		// dropped.
+		recordChildExtras := func(prefix string, n *Node) {
+			for _, c := range n.Children {
+				if c == nil || len(c.Keys) == 0 {
+					continue
+				}
+				profile.UnknownLeaves = append(profile.UnknownLeaves, prefix+" "+c.Keys[0])
+			}
+		}
+
 		// #3318: the screen schema subtrees are open. Record any unknown/
 		// unsupported top-level screen family so validateScreenUnknownStrict can
 		// reject the commit fail-closed instead of silently dropping it.
@@ -754,9 +793,12 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 				switch opt.Name() {
 				case "ping-death":
 					profile.ICMP.PingDeath = true
+					recordKeyExtras("icmp ping-death", opt, 1)
 				case "fragment":
 					profile.ICMP.Fragment = true
+					recordKeyExtras("icmp fragment", opt, 1)
 				case "flood":
+					recordKeyExtras("icmp flood", opt, 3)
 					if n, ok := parseThresh("icmp flood", numVal(opt, 2)); ok {
 						profile.ICMP.FloodThreshold = n
 					}
@@ -778,12 +820,15 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 				switch opt.Name() {
 				case "source-route-option":
 					profile.IP.SourceRouteOption = true
+					recordKeyExtras("ip source-route-option", opt, 1)
 				case "tear-drop":
 					profile.IP.TearDrop = true
+					recordKeyExtras("ip tear-drop", opt, 1)
 				case "ip-sweep":
 					for _, swOpt := range opt.Children {
 						switch swOpt.Name() {
 						case "threshold":
+							recordKeyExtras("ip ip-sweep threshold", swOpt, 2)
 							if n, ok := parseThresh("ip ip-sweep threshold", numVal(swOpt, 1)); ok {
 								profile.IP.IPSweepThreshold = n
 							}
@@ -810,38 +855,49 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 				switch opt.Name() {
 				case "land":
 					profile.TCP.Land = true
+					recordKeyExtras("tcp land", opt, 1)
 				case "winnuke":
 					profile.TCP.WinNuke = true
+					recordKeyExtras("tcp winnuke", opt, 1)
 				case "syn-frag":
 					profile.TCP.SynFrag = true
+					recordKeyExtras("tcp syn-frag", opt, 1)
 				case "syn-fin":
 					profile.TCP.SynFin = true
+					recordKeyExtras("tcp syn-fin", opt, 1)
 				case "no-flag":
 					profile.TCP.NoFlag = true
+					recordKeyExtras("tcp no-flag", opt, 1)
 				case "fin-no-ack":
 					profile.TCP.FinNoAck = true
+					recordKeyExtras("tcp fin-no-ack", opt, 1)
 				case "syn-flood":
 					sf := &SynFloodConfig{}
 					for _, sfOpt := range opt.Children {
 						val := numVal(sfOpt, 1)
 						switch sfOpt.Name() {
 						case "alarm-threshold":
+							recordKeyExtras("tcp syn-flood alarm-threshold", sfOpt, 2)
 							if n, ok := parseThresh("tcp syn-flood alarm-threshold", val); ok {
 								sf.AlarmThreshold = n
 							}
 						case "attack-threshold":
+							recordKeyExtras("tcp syn-flood attack-threshold", sfOpt, 2)
 							if n, ok := parseThresh("tcp syn-flood attack-threshold", val); ok {
 								sf.AttackThreshold = n
 							}
 						case "source-threshold":
+							recordKeyExtras("tcp syn-flood source-threshold", sfOpt, 2)
 							if n, ok := parseThresh("tcp syn-flood source-threshold", val); ok {
 								sf.SourceThreshold = n
 							}
 						case "destination-threshold":
+							recordKeyExtras("tcp syn-flood destination-threshold", sfOpt, 2)
 							if n, ok := parseThresh("tcp syn-flood destination-threshold", val); ok {
 								sf.DestinationThreshold = n
 							}
 						case "timeout":
+							recordKeyExtras("tcp syn-flood timeout", sfOpt, 2)
 							if n, ok := parseThresh("tcp syn-flood timeout", val); ok {
 								sf.Timeout = n
 							}
@@ -864,6 +920,7 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					for _, psOpt := range opt.Children {
 						switch psOpt.Name() {
 						case "threshold":
+							recordKeyExtras("tcp port-scan threshold", psOpt, 2)
 							if n, ok := parseThresh("tcp port-scan threshold", numVal(psOpt, 1)); ok {
 								profile.TCP.PortScanThreshold = n
 							}
@@ -889,6 +946,7 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			for _, opt := range udpNode.Children {
 				switch opt.Name() {
 				case "flood":
+					recordKeyExtras("udp flood", opt, 3)
 					if n, ok := parseThresh("udp flood", numVal(opt, 2)); ok {
 						profile.UDP.FloodThreshold = n
 					}
@@ -910,10 +968,14 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 				val := numVal(opt, 1)
 				switch opt.Name() {
 				case "source-ip-based":
+					recordKeyExtras("limit-session source-ip-based", opt, 2)
+					recordChildExtras("limit-session source-ip-based", opt)
 					if n, ok := parseThresh("limit-session source-ip-based", val); ok {
 						profile.LimitSession.SourceIPBased = n
 					}
 				case "destination-ip-based":
+					recordKeyExtras("limit-session destination-ip-based", opt, 2)
+					recordChildExtras("limit-session destination-ip-based", opt)
 					if n, ok := parseThresh("limit-session destination-ip-based", val); ok {
 						profile.LimitSession.DestinationIPBased = n
 					}
@@ -1177,6 +1239,78 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 		sec.Log.Profiles[p.Name] = p
 	}
 	return nil
+}
+
+// validateSecurityLogStreamPortsAST is the #3349 commit-time range gate for
+// `security log stream <s> port <p>` and the nested `host { port <p>; }`
+// spelling. The syslog port value lives in TWO AST locations — a direct
+// `port` child of the stream and a `port` child of a nested `host` block
+// (compileLog reads both) — a dual value-location the declarative
+// SchemaValidate walker cannot express, the same rationale as tcp-mss
+// (validateTCPMSSRanges). compileLog ignores a non-numeric or out-of-range
+// port (strconv.Atoi error path) and silently keeps the default 514, so a typo
+// such as `port 6514x` commits and quietly logs audit to the wrong port. This
+// pass reads the raw tokens before that swallowing and range-checks them.
+//
+// It mirrors compileLog's traversal exactly (FindChild("log") +
+// namedInstances(stream) + per-child switch on host/port) so it validates
+// precisely the tokens the compiler consumes. Runs on the group-expanded tree
+// so apply-groups-inherited ports are covered.
+//
+// Strict path (commit / commit-check, lenient=false): a non-numeric or
+// out-of-range port is a hard compile error. Lenient path (load / peer-sync,
+// lenient=true): downgraded to a warning so an already-persisted or
+// peer-synced config that an older binary accepted (and that the compiler
+// still maps to 514) still boots (#1960 / #3261 fail-closed-on-load class).
+func validateSecurityLogStreamPortsAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
+	var warnings []string
+	check := func(path, raw string) error {
+		if raw == "" {
+			// No value token: the compiler keeps the default 514. The
+			// missing-value case is the schema walker's concern, not this
+			// range gate.
+			return nil
+		}
+		if n, err := strconv.Atoi(raw); err == nil && n >= 1 && n <= 65535 {
+			return nil
+		}
+		msg := fmt.Sprintf("%s: invalid syslog port %q (expected an integer in "+
+			"[1..65535]; an invalid value silently keeps the default 514)", path, raw)
+		if lenient {
+			warnings = append(warnings, msg)
+			return nil
+		}
+		return fmt.Errorf("%s", msg)
+	}
+	for _, n := range nodes {
+		if n.Name() != "security" {
+			continue
+		}
+		secPath := joinNodePath(prefix, n.Keys)
+		for _, logNode := range n.FindChildren("log") {
+			logPath := joinNodePath(secPath, []string{"log"})
+			for _, inst := range namedInstances(logNode.FindChildren("stream")) {
+				streamPath := joinNodePath(logPath, []string{"stream", inst.name})
+				for _, prop := range inst.node.Children {
+					switch prop.Name() {
+					case "port":
+						if err := check(joinNodePath(streamPath, []string{"port"}), nodeVal(prop)); err != nil {
+							return warnings, err
+						}
+					case "host":
+						for _, hc := range prop.Children {
+							if hc.Name() == "port" {
+								if err := check(joinNodePath(streamPath, []string{"host", "port"}), nodeVal(hc)); err != nil {
+									return warnings, err
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return warnings, nil
 }
 
 // tcpMSSKinds are the four tcp-mss sub-kinds the compiler reads

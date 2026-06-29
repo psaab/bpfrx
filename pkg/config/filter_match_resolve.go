@@ -245,6 +245,15 @@ func resolveFilterPort(spec string) (string, bool) {
 	if spec == "" {
 		return "", false
 	}
+	// Whole-spec service name first — covers hyphenated catalog names
+	// (ftp-data, kerberos-sec, tacacs-ds) that a range-split on '-' would
+	// otherwise mangle into a malformed low-high range and reject. Mirrors
+	// resolveAppPort (compiler_applications.go, #3340). A two-token range
+	// such as http-https is not a catalog name, so it falls through to the
+	// range path below and still resolves.
+	if p, ok := junosServicePorts[strings.ToLower(spec)]; ok {
+		return strconv.Itoa(int(p)), true
+	}
 	if i := strings.IndexByte(spec, '-'); i > 0 && i < len(spec)-1 {
 		lo, ok1 := resolveSinglePort(spec[:i])
 		hi, ok2 := resolveSinglePort(spec[i+1:])
