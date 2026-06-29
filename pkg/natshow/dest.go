@@ -3,6 +3,7 @@ package natshow
 import (
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -72,11 +73,11 @@ func RenderDestRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn func(
 			if rule.Match.DestinationPort != 0 {
 				fmt.Fprintf(w, "      Destination port:      %d\n", rule.Match.DestinationPort)
 			}
-			if rule.Match.Protocol != "" {
-				fmt.Fprintf(w, "      IP protocol:           %s\n", rule.Match.Protocol)
+			if protos := rule.Match.ProtocolList(); len(protos) > 0 {
+				fmt.Fprintf(w, "      IP protocol:           %s\n", strings.Join(protos, " "))
 			}
-			if rule.Match.Application != "" {
-				fmt.Fprintf(w, "      Application:           %s\n", rule.Match.Application)
+			if apps := rule.Match.ApplicationList(); len(apps) > 0 {
+				fmt.Fprintf(w, "      Application:           %s\n", strings.Join(apps, " "))
 			}
 			fmt.Fprintf(w, "    Action:                  %s\n", action)
 

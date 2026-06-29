@@ -74,8 +74,8 @@ func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn fun
 			fmt.Fprintf(w, "    Match:\n")
 			fmt.Fprintf(w, "      Source addresses:      %s\n", srcMatch)
 			fmt.Fprintf(w, "      Destination addresses: %s\n", dstMatch)
-			if rule.Match.Protocol != "" {
-				fmt.Fprintf(w, "      IP protocol:           %s\n", rule.Match.Protocol)
+			if protos := rule.Match.ProtocolList(); len(protos) > 0 {
+				fmt.Fprintf(w, "      IP protocol:           %s\n", strings.Join(protos, " "))
 			}
 			fmt.Fprintf(w, "    Action:                  %s\n", action)
 
