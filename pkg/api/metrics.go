@@ -808,18 +808,23 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// stay visible even when the dataplane is not loaded.
 	c.collectFlowExportMetrics(ch)
 
+	// #3361: kernel nftables host-inbound DROP counters, per zone/family. The
+	// `inet xpf_hostinbound` chain is installed by the daemon INDEPENDENT of
+	// dataplane load state (applyConfig runs it even in a config-only / degraded
+	// boot), and it actively DROPS host-bound control-plane traffic. So this is a
+	// control-plane signal — emit it BEFORE the dataplane gate so the kernel-deny
+	// series stays visible exactly in the degraded boot where the dataplane is
+	// unloaded but the deny chain is still dropping (the blind spot this metric
+	// exists to close). ReadHostInboundDenyCounters reads nft via netlink and has
+	// no dataplane dependency.
+	c.collectHostInboundKernelDenies(ch)
+
 	dp := c.srv.dp
 	if dp == nil || !dp.IsLoaded() {
 		return
 	}
 
 	c.collectGlobalCounters(ch, dp)
-	// #3361: kernel nftables host-inbound DROP counters, per zone/family. Read
-	// via netlink (no nft shell-out); on failure the #3345 contract applies
-	// (skip the series, bump counterReadErrors — emitted by collectGlobalCounters
-	// above). Kept inside the dataplane gate so the counterReadErrors accounting
-	// stays coherent with the global-counter scrape error signal.
-	c.collectHostInboundKernelDenies(ch)
 	c.collectInterfaceCounters(ch, dp)
 	c.collectZoneCounters(ch, dp)
 	c.collectPolicyCounters(ch, dp)
