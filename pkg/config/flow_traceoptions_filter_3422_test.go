@@ -45,6 +45,20 @@ func TestFlowTraceFilterFailsCommit(t *testing.T) {
 			want: "10.0.0.1",
 		},
 		{
+			name: "empty-source-prefix",
+			set: []string{
+				`set security flow traceoptions packet-filter pf1 source-prefix ""`,
+			},
+			want: "source-prefix",
+		},
+		{
+			name: "empty-destination-prefix",
+			set: []string{
+				`set security flow traceoptions packet-filter pf1 destination-prefix ""`,
+			},
+			want: "destination-prefix",
+		},
+		{
 			name: "one-valid-one-invalid",
 			set: []string{
 				"set security flow traceoptions packet-filter pf1 source-prefix 10.0.1.0/24",
@@ -112,6 +126,68 @@ func TestFlowTraceFilterValidCommits(t *testing.T) {
 	}
 	if len(to.Flags) != 1 || to.Flags[0] != "basic-datapath" {
 		t.Fatalf("flags = %v, want [basic-datapath]", to.Flags)
+	}
+}
+
+// TestFlowTraceFilterProtocolOnlyCommits is the #3422 BLOCKER anti-over-reject
+// guard: a filter that legitimately OMITS its prefixes (protocol-only) must
+// still commit on the strict path. The empty-prefix rejection is for a
+// present-but-empty node only — an absent prefix is fine.
+//
+// FAIL-ON-REVERT: reject a filter with no prefix and this test fails.
+func TestFlowTraceFilterProtocolOnlyCommits(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set security flow traceoptions file rt-flow.log",
+		"set security flow traceoptions packet-filter pf1 protocol tcp",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("strict commit rejected a protocol-only filter: %v", err)
+	}
+	to := cfg.Security.Flow.Traceoptions
+	if to == nil || len(to.PacketFilters) != 1 {
+		t.Fatalf("traceoptions filters = %+v, want one pf1", to)
+	}
+	if to.PacketFilters[0].InvalidPrefix {
+		t.Fatalf("protocol-only filter wrongly marked InvalidPrefix (over-rejection)")
+	}
+	if to.PacketFilters[0].Protocol != "tcp" {
+		t.Fatalf("protocol = %q, want tcp", to.PacketFilters[0].Protocol)
+	}
+}
+
+// TestFlowTraceFilterEmptyPrefixLenient is the #3422 BLOCKER lenient backstop:
+// a persisted / peer-synced `source-prefix ""` must NOT fail the boot (downgrade
+// to a warning) but must compile to a filter marked InvalidPrefix so the runtime
+// fails it closed (match-none) rather than tracing everything.
+//
+// FAIL-ON-REVERT: restore the `v == ""` skip in the validator and no warning is
+// recorded; drop the compiler InvalidPrefix marking and the filter compiles as a
+// match-everything filter.
+func TestFlowTraceFilterEmptyPrefixLenient(t *testing.T) {
+	tree := buildTree(t, []string{
+		`set security flow traceoptions packet-filter pf1 source-prefix ""`,
+	})
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient load must not fail on a persisted empty prefix: %v", err)
+	}
+	gotWarn := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "source-prefix") && strings.Contains(w, "traceoptions") &&
+			strings.Contains(w, "empty") {
+			gotWarn = true
+		}
+	}
+	if !gotWarn {
+		t.Fatalf("lenient load did not warn about the empty prefix; warnings=%v", cfg.Warnings)
+	}
+	to := cfg.Security.Flow.Traceoptions
+	if to == nil || len(to.PacketFilters) != 1 {
+		t.Fatalf("traceoptions filters = %+v, want one pf1", to)
+	}
+	if !to.PacketFilters[0].InvalidPrefix {
+		t.Fatalf("empty-prefix filter not marked InvalidPrefix; runtime would trace everything (#3422 BLOCKER)")
 	}
 }
 

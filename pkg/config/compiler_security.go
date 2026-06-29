@@ -1549,11 +1549,33 @@ func validateFlowTraceFlagsAndFiltersAST(nodes []*Node, prefix string, lenient b
 			for _, leaf := range []string{"source-prefix", "destination-prefix"} {
 				pn := pf.node.FindChild(leaf)
 				if pn == nil {
+					// Absent prefix: a protocol-only filter is legitimate, so
+					// leave it alone. This is AST-distinguishable from the
+					// present-but-empty case below (node missing vs node
+					// present with an empty value).
 					continue
 				}
 				v := nodeVal(pn)
 				if v == "" {
-					continue
+					// Present-but-empty (`source-prefix ""`): the node exists
+					// but carries no prefix. Accepting it lets the runtime
+					// append a fully-unconstrained filter (zero srcNet/dstNet,
+					// no proto) that matches EVERY event — the #3422 M01
+					// fail-open in a smaller costume. Reject at strict; downgrade
+					// to a warning on the lenient load / peer-sync path, where
+					// the compiler marks the filter InvalidPrefix and the
+					// runtime fails it closed (match-none).
+					path := joinNodePath(pfPath, []string{leaf})
+					msg := fmt.Sprintf("%s: %s is present but empty; an empty "+
+						"prefix would match every event (omit %s for a "+
+						"protocol-only filter, or set a CIDR prefix)",
+						path, leaf, leaf)
+					if lenient {
+						warnings = append(warnings, msg+
+							" (ignored: filter set to match-none)")
+						continue
+					}
+					return warnings, fmt.Errorf("%s", msg)
 				}
 				if _, err := netip.ParsePrefix(v); err != nil {
 					path := joinNodePath(pfPath, []string{leaf})
@@ -1877,11 +1899,23 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 		}
 		for _, pfInst := range namedInstances(toNode.FindChildren("packet-filter")) {
 			pf := &TracePacketFilter{Name: pfInst.name}
+			// A prefix node that is PRESENT but empty (`source-prefix ""`) is
+			// malformed: an empty prefix is not "no constraint" but a typo that
+			// must narrow tracing to nothing, not broaden it to everything
+			// (#3422 M01). Record the distinction here (present-but-empty vs the
+			// absent protocol-only case) so the runtime can fail it closed; the
+			// strict commit gate rejects it outright before it ever lands here.
 			if spNode := pfInst.node.FindChild("source-prefix"); spNode != nil {
 				pf.SourcePrefix = nodeVal(spNode)
+				if pf.SourcePrefix == "" {
+					pf.InvalidPrefix = true
+				}
 			}
 			if dpNode := pfInst.node.FindChild("destination-prefix"); dpNode != nil {
 				pf.DestinationPrefix = nodeVal(dpNode)
+				if pf.DestinationPrefix == "" {
+					pf.InvalidPrefix = true
+				}
 			}
 			if protoNode := pfInst.node.FindChild("protocol"); protoNode != nil {
 				pf.Protocol = nodeVal(protoNode)

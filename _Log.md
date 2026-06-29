@@ -1,3 +1,28 @@
+## 2026-06-28 — #3422 fold: quoted-empty trace packet-filter prefix fail-open
+
+- **Timestamp**: 2026-06-28
+- **Action**: Codex BLOCKER fold into #3422. `source-prefix ""` /
+  `destination-prefix ""` is representable — the lexer/parser preserve the
+  empty-string token, so the AST node is PRESENT with an empty value
+  (`Keys=["source-prefix",""]`, nodeVal == ""). The commit gate
+  (validateFlowTraceFlagsAndFiltersAST) SKIPPED `v == ""` and the runtime
+  (NewTraceWriter) skipped an empty prefix string without marking the filter
+  invalid, so the filter was appended fully-unconstrained (zero
+  srcNet/dstNet, no proto) → matchFilters matched EVERY event — the M01
+  fail-open in a smaller costume. Fixed BOTH layers: (1) the commit gate now
+  REJECTS a present-but-empty prefix at strict / downgrades to a warning at
+  lenient (AST-distinguishable: node-present-but-empty ≠ node-absent, so a
+  legitimate protocol-only filter that omits prefixes is untouched);
+  (2) added TracePacketFilter.InvalidPrefix, set by the compiler when a prefix
+  node is present-but-empty, and seeded into traceFilter.invalid so the
+  runtime fails the filter closed (match-none) on the lenient load / peer-sync
+  path. Strengthened TestTraceWriterOneValidOneInvalidFilter to assert
+  len(filters)==2 AND filters[1].invalid. RED-on-revert verified for all three
+  fix sites; protocol-only filter confirmed still matching (no over-rejection).
+- **File(s)**: pkg/config/types_security.go, pkg/config/compiler_security.go,
+  pkg/logging/trace.go, pkg/config/flow_traceoptions_filter_3422_test.go,
+  pkg/logging/trace_filter_3422_test.go
+
 ## 2026-06-28 — #3350 security-log stream tls-profile reject (parsed-but-never-applied)
 
 - **Timestamp**: 2026-06-28

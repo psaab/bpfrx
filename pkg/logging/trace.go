@@ -92,10 +92,11 @@ type traceFilter struct {
 	dstNet netip.Prefix
 	proto  string // normalized protocol name (e.g. "TCP"); "" = any
 	// invalid marks a filter whose configured source/destination prefix did
-	// not parse. Such a filter is kept (so the writer still has a non-empty
-	// filter set) but never matches — a typo'd prefix must NARROW tracing to
-	// nothing, not be silently dropped which would leave tw.filters empty and
-	// trace EVERYTHING (#3422 M01). The commit-time gate
+	// not parse OR was present-but-empty (`source-prefix ""`, flagged by the
+	// compiler as InvalidPrefix). Such a filter is kept (so the writer still
+	// has a non-empty filter set) but never matches — a typo'd or empty prefix
+	// must NARROW tracing to nothing, not be silently dropped which would leave
+	// tw.filters empty and trace EVERYTHING (#3422 M01). The commit-time gate
 	// (validateFlowTraceFlagsAndFiltersAST) rejects this loudly; this keeps a
 	// leniently-loaded / peer-synced config fail-safe.
 	invalid bool
@@ -178,7 +179,19 @@ func NewTraceWriter(opts *config.FlowTraceoptions) (*TraceWriter, error) {
 	// tracing to nothing. The commit-time gate rejects an unparseable prefix
 	// loudly; this is the leniently-loaded / peer-synced backstop.
 	for _, pf := range opts.PacketFilters {
-		f := traceFilter{name: pf.Name}
+		// A filter whose source/destination prefix node was present in the
+		// config but empty (`source-prefix ""`) arrives here with an empty
+		// string, indistinguishable from a legitimately-absent prefix (a
+		// protocol-only filter). The compiler tells them apart and sets
+		// InvalidPrefix for the present-but-empty case; seed f.invalid from it
+		// so the filter fails closed (match-none) instead of matching every
+		// event (#3422 M01). A protocol-only filter (InvalidPrefix false, no
+		// prefixes, a protocol) stays valid and matches on its protocol.
+		f := traceFilter{name: pf.Name, invalid: pf.InvalidPrefix}
+		if pf.InvalidPrefix {
+			slog.Warn("empty trace filter prefix; filter set to match-none",
+				"filter", pf.Name)
+		}
 		if pf.SourcePrefix != "" {
 			prefix, err := netip.ParsePrefix(pf.SourcePrefix)
 			if err != nil {

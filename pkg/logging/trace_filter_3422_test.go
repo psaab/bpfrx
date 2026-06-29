@@ -68,6 +68,20 @@ func TestTraceWriterOneValidOneInvalidFilter(t *testing.T) {
 	}
 	defer tw.Close()
 
+	// Both filters must be retained (the invalid one kept as match-none, not
+	// dropped) so the writer has a non-empty filter set and the second filter
+	// is marked invalid. Asserting both pins the M01 fail-safe: if the invalid
+	// filter were dropped instead, len would be 1 and this fails.
+	if len(tw.filters) != 2 {
+		t.Fatalf("filters = %d, want 2 (valid + invalid both retained)", len(tw.filters))
+	}
+	if tw.filters[0].invalid {
+		t.Fatalf("valid filter pf1 wrongly marked invalid")
+	}
+	if !tw.filters[1].invalid {
+		t.Fatalf("invalid filter pf2 not marked invalid")
+	}
+
 	// Inside the valid filter -> match.
 	if !tw.matchFilters(EventRecord{SrcAddr: "10.0.1.5:1000", DstAddr: "10.0.2.5:80", Protocol: "TCP"}) {
 		t.Fatalf("valid filter did not match its own traffic")
@@ -75,6 +89,85 @@ func TestTraceWriterOneValidOneInvalidFilter(t *testing.T) {
 	// Outside the valid filter -> no match (the invalid filter must not catch it).
 	if tw.matchFilters(EventRecord{SrcAddr: "10.0.9.5:1000", DstAddr: "10.0.2.5:80", Protocol: "TCP"}) {
 		t.Fatalf("invalid filter broadened tracing to non-matching traffic (#3422 M01)")
+	}
+}
+
+// TestTraceWriterEmptyPrefixMatchesNone is the #3422 BLOCKER runtime guard: a
+// filter whose source-prefix was PRESENT but empty (`source-prefix ""`, flagged
+// by the compiler as InvalidPrefix) must NARROW tracing to nothing, not broaden
+// it to every event. An empty prefix string is indistinguishable from an absent
+// one at the runtime, so the compiler carries the present-but-empty conclusion
+// in InvalidPrefix and NewTraceWriter must fail the filter closed.
+//
+// FAIL-ON-REVERT: drop the `invalid: pf.InvalidPrefix` seed in NewTraceWriter
+// and this filter parses to zero srcNet/dstNet/proto -> matchFilters returns
+// true for everything (the M01 fail-open in a smaller costume).
+func TestTraceWriterEmptyPrefixMatchesNone(t *testing.T) {
+	dir := t.TempDir()
+	old := traceLogDir
+	traceLogDir = dir
+	defer func() { traceLogDir = old }()
+
+	tw, err := NewTraceWriter(&config.FlowTraceoptions{
+		File: "rt-flow.log",
+		PacketFilters: []*config.TracePacketFilter{
+			// Present-but-empty prefix: the compiler sets InvalidPrefix.
+			{Name: "pf1", SourcePrefix: "", InvalidPrefix: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewTraceWriter: %v", err)
+	}
+	defer tw.Close()
+
+	if len(tw.filters) != 1 {
+		t.Fatalf("filters = %d, want 1 (empty-prefix filter retained as match-none)", len(tw.filters))
+	}
+	if !tw.filters[0].invalid {
+		t.Fatalf("empty-prefix filter not marked invalid; it would match every event (#3422 BLOCKER)")
+	}
+	if tw.matchFilters(EventRecord{SrcAddr: "10.0.1.5:1000", DstAddr: "10.0.2.5:80", Protocol: "TCP"}) {
+		t.Fatalf("empty-prefix filter matched an event; tracing was broadened to everything (#3422 BLOCKER)")
+	}
+}
+
+// TestTraceWriterProtocolOnlyFilterMatches is the anti-over-rejection guard for
+// the #3422 BLOCKER fix: a filter with NO prefixes but a protocol (an absent
+// prefix, InvalidPrefix false) must stay VALID and match on its protocol. This
+// is the case the empty-prefix rejection must NOT catch.
+//
+// FAIL-ON-REVERT: mark an absent-prefix filter invalid (over-reject) and this
+// fails (a legitimate protocol-only filter would stop matching).
+func TestTraceWriterProtocolOnlyFilterMatches(t *testing.T) {
+	dir := t.TempDir()
+	old := traceLogDir
+	traceLogDir = dir
+	defer func() { traceLogDir = old }()
+
+	tw, err := NewTraceWriter(&config.FlowTraceoptions{
+		File: "rt-flow.log",
+		PacketFilters: []*config.TracePacketFilter{
+			{Name: "pf1", Protocol: "tcp"}, // no prefixes, InvalidPrefix false
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewTraceWriter: %v", err)
+	}
+	defer tw.Close()
+
+	if len(tw.filters) != 1 {
+		t.Fatalf("filters = %d, want 1", len(tw.filters))
+	}
+	if tw.filters[0].invalid {
+		t.Fatalf("protocol-only filter wrongly marked invalid (over-rejection)")
+	}
+	// Matches its protocol regardless of address.
+	if !tw.matchFilters(EventRecord{SrcAddr: "10.0.9.5:1000", DstAddr: "8.8.8.8:80", Protocol: "TCP"}) {
+		t.Fatalf("protocol-only filter did not match a TCP event")
+	}
+	// Does not match a different protocol.
+	if tw.matchFilters(EventRecord{SrcAddr: "10.0.9.5:1000", DstAddr: "8.8.8.8:80", Protocol: "UDP"}) {
+		t.Fatalf("protocol-only TCP filter matched a UDP event")
 	}
 }
 
