@@ -22847,3 +22847,15 @@ top.
     pkg/config/schema_validators.go, pkg/config/compiler.go,
     pkg/config/compiler_security.go,
     pkg/config/log_stream_config_3349_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3349 fold (Codex MAJOR) — event-mode log format silent
+    fallback. Top-level `security log format` feeds the event-mode
+    LocalLogWriter which only honors binary/standard text, so structured/
+    sd-syslog validated then silently fell back. Added cross-field
+    validateLogEventModeFormatStrict (strict commit / lenient load),
+    event-mode format support matrix in docs, tests, filed follow-up #3409
+    for event-mode structured/sd-syslog support.
+  - **File(s)**: pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler.go,
+    pkg/config/log_stream_config_3349_test.go, docs/config-schema.md, _Log.md

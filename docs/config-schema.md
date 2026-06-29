@@ -886,6 +886,31 @@ reserved for whole-dataplane selection where a rewrite shim
   to a warning on load/peer-sync. Before this change a bad port was ignored by
   `compileLog` and silently kept the default 514. No runtime/dataplane change.
   Regression coverage: `pkg/config/log_stream_config_3349_test.go`.
+
+  **Event-mode format compatibility (cross-field).** The top-level
+  `security log format` value feeds two different runtimes depending on
+  `security log mode`, and they honor different format sets. The schema leaf
+  validates the value to a known format in *any* mode; a second compiler pass
+  (`validateLogEventModeFormatStrict`, post-compile on `cfg.Security.Log`,
+  strict on commit / `lenientLogEventModeFormat`-downgraded on load/peer-sync)
+  rejects an event-mode-incompatible format because the event-mode local-file
+  writer (`pkg/logging` `LocalLogWriter`, driven by the `ringbuf.go`
+  local-writer fanout) only branches on `binary` and otherwise writes standard
+  text — so `structured` / `sd-syslog` would validate at commit and then
+  silently fall back to text (the exact #3349 failure). Support matrix:
+
+  | `format` | `mode stream` (remote syslog) | `mode event` (local file) |
+  |---|---|---|
+  | `binary` | binary records | binary records |
+  | `structured` | Junos RT_FLOW | **rejected at commit** (silently fell back to text) |
+  | `sd-syslog` | RFC 5424 envelope | **rejected at commit** (silently fell back to text) |
+  | `syslog` / unset | standard RFC 3164 text | standard RFC 3164 text |
+
+  Event-mode `structured` / `sd-syslog` is a feature gap, not a deliberate
+  exclusion — tracked in #3409 (widen the event-honorable set once the
+  `LocalLogWriter` implements those formats). The event-honorable set in
+  `validateLogEventModeFormatStrict` MUST stay in sync with the `ringbuf.go`
+  local-writer fanout.
 - **#2008 H9/H10 (interface silent-drop reject):** two interface stanzas
   that parsed-accepted and were silently dropped (no schema child, no
   compiler case, no dataplane consumer) are now hard-rejected at commit /
