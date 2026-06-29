@@ -394,7 +394,16 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					valueType: ValueEnumOf, valueDesc: "syslog transport protocol",
 					valueExamples: []string{"udp", "tcp", "tls"},
 					validator:     ValidateEnum([]string{"udp", "tcp", "tls"}), children: nil},
-				"tls-profile": {desc: "TLS profile name (for protocol tls)", args: 1, placeholder: "<tls-profile-name>", children: nil},
+				// #3350: tls-profile is kept as a parseable leaf (so `?` /
+				// completion still offer it) but is REJECTED at commit by
+				// validateSecurityLogStreamTLSProfileAST (compiler.go) — it is
+				// never resolved into a *tls.Config at runtime (daemon_system.go
+				// passes nil; there is no TLS profile definition stanza to
+				// resolve it to), so a TLS syslog stream silently uses the system
+				// CA roots. The compiler gate gives a descriptive reject rather
+				// than a bare schema "unknown token". `transport protocol tls`
+				// alone (system-root TLS) stays valid.
+				"tls-profile": {desc: "TLS profile name (rejected: not applied at runtime, #3350)", args: 1, placeholder: "<tls-profile-name>", children: nil},
 			}},
 		}},
 		// H7 (#2008): `security log profile <name>` is a Junos log-routing
