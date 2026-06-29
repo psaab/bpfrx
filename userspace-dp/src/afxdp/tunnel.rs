@@ -585,6 +585,7 @@ pub(super) fn build_local_origin_tunnel_tx_request(
             // the HA wire yet, so this flow counts nothing locally until a
             // real-traffic re-evaluation re-stamps a handle.
             policy_counter_idx: 0,
+            policy_counter: None,
         },
         origin: SessionOrigin::SyncImport,
         protocol: meta.protocol,

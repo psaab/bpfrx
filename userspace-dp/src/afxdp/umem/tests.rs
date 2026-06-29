@@ -1531,6 +1531,7 @@ fn active_flow_debug_test_entry(
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
         stamp,
         observed_bytes: 0,

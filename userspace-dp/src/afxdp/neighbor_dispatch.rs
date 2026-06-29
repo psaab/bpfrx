@@ -527,6 +527,7 @@ pub(super) fn build_missing_neighbor_session_metadata(
         inactivity_timeout_ns: None,
         // #3073: a neighbor-seed stub is not policy-admitted; no hit counter.
         policy_counter_idx: 0,
+        policy_counter: None,
     }
 }
 

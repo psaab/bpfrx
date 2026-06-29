@@ -443,6 +443,14 @@ pub(super) fn poll_binding_process_descriptor(
                 // stamped onto the flow-cache entry so its hit path re-counts
                 // every cached packet against the same policy.
                 let mut flow_cache_policy_counter_idx: u32 = 0;
+                // #3322: the reorder-stable BOUND hit-counter handle for this
+                // flow, carried alongside the positional idx and stamped onto
+                // the flow-cache entry so its hit path counts against the same
+                // rule the session was admitted under even after a live policy
+                // reorder renumbers the rule table.
+                let mut flow_cache_policy_counter: Option<
+                    std::sync::Arc<crate::policy::PolicyRuleCounter>,
+                > = None;
                 let mut apply_nat_on_fabric = false;
                 // #1861 §5.4: true when a session install was attempted
                 // for this packet's decision and refused (max_sessions).
@@ -496,11 +504,14 @@ pub(super) fn poll_binding_process_descriptor(
                         // evaluation, so a packet reaching here was never counted
                         // by the cold path: exactly-once holds. The per-worker
                         // coalescer keeps this off the shared counter cacheline.
-                        if let Some(counter) = worker_ctx
-                            .forwarding
-                            .policy
-                            .hit_counter_by_idx(resolved.metadata.policy_counter_idx)
-                        {
+                        // #3322: prefer the session's reorder-stable bound
+                        // handle over the positional idx so a live policy
+                        // reorder cannot re-attribute this established flow's
+                        // packets to a different rule.
+                        if let Some(counter) = worker_ctx.forwarding.policy.resolve_session_hit_counter(
+                            resolved.metadata.policy_counter.as_ref(),
+                            resolved.metadata.policy_counter_idx,
+                        ) {
                             crate::policy::record_policy_hit_counter(counter, desc.len as u64);
                         }
                         flow_cache_install_failed = resolved.install_failed;
@@ -567,6 +578,9 @@ pub(super) fn poll_binding_process_descriptor(
                         // the flow-cache entry populated below re-counts cached
                         // packets against the same policy.
                         flow_cache_policy_counter_idx = resolved.metadata.policy_counter_idx;
+                        // #3322: carry the bound handle from the established
+                        // session onto the flow-cache entry too.
+                        flow_cache_policy_counter = resolved.metadata.policy_counter.clone();
                         apply_nat_on_fabric = true;
                         if let Some(input_filter_eval) =
                             evaluate_dscp_sensitive_input_filter_on_session_hit(
@@ -1634,6 +1648,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 // #3073: host-local sessions are not policy-forwarded,
                                 // so they carry no per-rule hit counter.
                                 policy_counter_idx: 0,
+                                policy_counter: None,
                             };
                             if install_helper_local_session_on_miss(
                                 sessions,
@@ -2142,6 +2157,18 @@ pub(super) fn poll_binding_process_descriptor(
                                         binding.scratch.scratch_recycle.push(desc.addr);
                                         continue;
                                     }
+                                    // #3322: bind the admitting rule's shared
+                                    // hit counter ONCE here, where
+                                    // `policy_result.policy_counter_idx` still
+                                    // indexes the rule that just admitted this
+                                    // flow. Carried on both session entries and
+                                    // the flow-cache entry so a later live
+                                    // policy reorder cannot re-point the count.
+                                    let bound_policy_counter = worker_ctx
+                                        .forwarding
+                                        .policy
+                                        .hit_counter_by_idx(policy_result.policy_counter_idx)
+                                        .cloned();
                                     let forward_metadata = SessionMetadata {
                                         ingress_zone: from_zone_id,
                                         egress_zone: to_zone_id,
@@ -2174,12 +2201,16 @@ pub(super) fn poll_binding_process_descriptor(
                                         // handle so the established fast path re-counts
                                         // every forward packet of this flow.
                                         policy_counter_idx: policy_result.policy_counter_idx,
+                                        // #3322: the reorder-stable bound handle.
+                                        policy_counter: bound_policy_counter.clone(),
                                     };
                                     // #3073: carry the admitting rule's handle so
                                     // the flow-cache entry populated for this new
-                                    // flow re-counts its cached packets.
+                                    // flow re-counts its cached packets. #3322:
+                                    // also carry the bound handle.
                                     flow_cache_policy_counter_idx =
                                         policy_result.policy_counter_idx;
+                                    flow_cache_policy_counter = bound_policy_counter.clone();
                                     let forward_installed = track_in_userspace
                                         && sessions.install_with_protocol_with_origin(
                                             flow.forward_key.clone(),
@@ -2414,8 +2445,10 @@ pub(super) fn poll_binding_process_descriptor(
                                         // #3073: mirror the admitting rule's hit-counter
                                         // handle onto the reverse companion so reply
                                         // traffic of the flow counts against the same
-                                        // policy as the forward direction.
+                                        // policy as the forward direction. #3322:
+                                        // mirror the reorder-stable bound handle too.
                                         policy_counter_idx: policy_result.policy_counter_idx,
+                                        policy_counter: bound_policy_counter.clone(),
                                     };
                                     // #1861 §5.2: the reverse install is gated on
                                     // forward_installed (was track_in_userspace —
@@ -3143,6 +3176,10 @@ pub(super) fn poll_binding_process_descriptor(
                             // packet against the same policy, so cacheable flows
                             // count their full load — not just the first frame.
                             entry.metadata.policy_counter_idx = flow_cache_policy_counter_idx;
+                            // #3322: stamp the reorder-stable bound handle so the
+                            // flow-cache hit path counts against the admitting
+                            // rule even after a live policy reorder.
+                            entry.metadata.policy_counter = flow_cache_policy_counter.clone();
                             binding.flow.flow_cache.insert(entry);
                         }
                         // ── End flow cache population ────────────────
@@ -4311,6 +4348,7 @@ mod new_flow_session_limit_tests {
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         }
     }
 

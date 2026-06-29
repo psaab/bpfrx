@@ -20,7 +20,7 @@ pub(crate) struct SessionDecision {
 /// existing `UserspaceDpMeta.ingress_zone` default at afxdp/types/mod.rs:64).
 /// Removing the `Arc<str>` saves 28 bytes per `SessionMetadata` and
 /// eliminates the `LOCK XADD` atomic on every `metadata.clone()`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct SessionMetadata {
     pub(crate) ingress_zone: u16,
     pub(crate) egress_zone: u16,
@@ -97,7 +97,53 @@ pub(crate) struct SessionMetadata {
     /// peer omits the field (`serde(default)` 0 → no per-rule counter),
     /// rolling-upgrade safe.
     pub(crate) policy_counter_idx: u32,
+    /// #3322: a reorder-stable, BOUND handle to the admitting rule's shared
+    /// hit counter, resolved ONCE from `policy_counter_idx` at session install
+    /// (`poll_descriptor` new-flow path) — when the index still points at the
+    /// admitting rule — and carried for the life of the session. The
+    /// established fast path prefers this Arc over re-resolving the positional
+    /// `policy_counter_idx` against the CURRENT rule table
+    /// (`PolicyState::resolve_session_hit_counter`), so a live policy
+    /// insert/reorder that renumbers the rule table can no longer re-point an
+    /// in-flight session's count at whatever rule now sits at the old index
+    /// (#3322). The bound `Arc<PolicyRuleCounter>` is the same instance the
+    /// persistent `PolicyCounterStore` keys by stable `rule_id`, so it stays
+    /// valid across snapshot rebuilds (the store re-hands the same Arc for a
+    /// surviving rule_id); when the admitting rule is DELETED the bound Arc is
+    /// simply no longer read by `counter_snapshots` (its count goes nowhere),
+    /// never a misattribution. `None` means "not bound" — the implicit
+    /// default-policy / non-policy-forwarded sessions (idx 0), and peer-synced
+    /// sessions materialized from the HA wire, which carry only the positional
+    /// `policy_counter_idx` and fall back to idx resolution (pre-#3322
+    /// behavior; HA requires identical config so the idx resolves the same
+    /// rule at sync time). NOT serialized — `SessionMetadata` carries no serde
+    /// and the binding is local, derived state re-resolved per node.
+    pub(crate) policy_counter: Option<std::sync::Arc<crate::policy::PolicyRuleCounter>>,
 }
+
+// #3322: equality ignores `policy_counter`. It is a BOUND, derived handle to
+// the admitting rule's shared counter (resolved from `policy_counter_idx`), not
+// part of the session's wire/identity — two metadatas that agree on every wire
+// field are equal whether or not the counter Arc has been resolved yet (e.g. a
+// peer-synced entry before binding vs. a locally-installed one). Every other
+// field participates, mirroring the previous `#[derive(PartialEq, Eq)]`.
+impl PartialEq for SessionMetadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.ingress_zone == other.ingress_zone
+            && self.egress_zone == other.egress_zone
+            && self.owner_rg_id == other.owner_rg_id
+            && self.fabric_ingress == other.fabric_ingress
+            && self.is_reverse == other.is_reverse
+            && self.nat64_reverse == other.nat64_reverse
+            && self.log_session_init == other.log_session_init
+            && self.log_session_close == other.log_session_close
+            && self.policy_id == other.policy_id
+            && self.inactivity_timeout_ns == other.inactivity_timeout_ns
+            && self.policy_counter_idx == other.policy_counter_idx
+    }
+}
+
+impl Eq for SessionMetadata {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionLookup {

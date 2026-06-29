@@ -1400,6 +1400,34 @@ impl PolicyState {
             .map(|rule| &rule.hit_counter)
     }
 
+    /// #3322: resolve the hit counter to increment for an ESTABLISHED-session
+    /// packet. Prefers the reorder-stable BOUND handle stamped on the session
+    /// at install (`SessionMetadata::policy_counter`) over re-resolving the
+    /// positional `policy_counter_idx` against the CURRENT rule table.
+    ///
+    /// The positional index is only valid relative to the rule table that was
+    /// live when the session was admitted. After a live policy insert/reorder
+    /// the same index points at whatever rule now occupies that slot, so the
+    /// pre-#3322 `hit_counter_by_idx(idx)` resolution attributed an in-flight
+    /// session's packets to the wrong rule (the original admitting rule stopped
+    /// counting). The bound Arc is captured once at install (when the index is
+    /// still correct) and is the same instance the persistent
+    /// `PolicyCounterStore` re-hands for the rule's stable `rule_id` across
+    /// snapshot rebuilds, so it follows the admitting rule through reorders.
+    ///
+    /// `bound == None` (idx-0 sessions, peer-synced sessions carrying only the
+    /// wire index) falls back to `hit_counter_by_idx`, preserving pre-#3322
+    /// behavior. A `None` result (no per-rule counter / stale index past a
+    /// shrunk table) is silently skipped by the caller — never a panic.
+    #[inline]
+    pub(crate) fn resolve_session_hit_counter<'a>(
+        &'a self,
+        bound: Option<&'a Arc<PolicyRuleCounter>>,
+        idx: u32,
+    ) -> Option<&'a Arc<PolicyRuleCounter>> {
+        bound.or_else(|| self.hit_counter_by_idx(idx))
+    }
+
     /// #1635: the set of concrete `(from_zone_id, to_zone_id)` pairs the
     /// configured policy distinguishes, used to build the cold-path
     /// histogram's direct slot map. Returns a deduplicated, sorted Vec

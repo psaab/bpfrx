@@ -3693,6 +3693,108 @@ fn policy_hit_count_counts_every_established_packet_not_just_first() {
     );
 }
 
+// ── #3322: bound hit-counter handle survives a live policy reorder ──────
+//
+// The per-session counter handle is a 1-based POSITIONAL index into the rule
+// table. #3073 made it stable within one snapshot; it is NOT stable across a
+// live policy insert/reorder. If an operator inserts a rule above an
+// already-counted rule, the same index points at whatever rule now occupies
+// that slot — so established-session packets used to increment the inserted
+// rule's counter (and the real admitting rule stopped counting). #3322 binds
+// the admitting rule's SHARED counter Arc onto the session at install (when the
+// index is still correct) and the established fast path prefers that bound
+// handle over the positional index via `resolve_session_hit_counter`. The Arc
+// is the same instance the persistent `PolicyCounterStore` re-hands for a
+// surviving `rule_id` across snapshot rebuilds, so it follows the admitting
+// rule through reorders.
+fn reorder_rule_snapshot(rule_id: &str, name: &str) -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        rule_id: rule_id.to_string(),
+        name: name.to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn bound_hit_counter_survives_live_policy_reorder() {
+    let id_b = "security-policy:lan:wan:permit-b".to_string();
+    let id_a = "security-policy:lan:wan:permit-a".to_string();
+    let zones = test_zone_name_to_id();
+    // Persistent counter store, exactly as the coordinator keeps it across
+    // snapshot rebuilds.
+    let store = PolicyCounterStore::default();
+
+    // Snapshot 1: a single rule B. B sits at rules[0] -> 1-based handle 1.
+    let rule_b = reorder_rule_snapshot(&id_b, "permit-b");
+    let state1 =
+        parse_policy_state_with_counters("deny", std::slice::from_ref(&rule_b), &zones, &[], &store)
+            .expect("state1");
+    // Bind B's counter the way session install does (idx still valid here).
+    let bound = state1.hit_counter_by_idx(1).cloned();
+    assert!(bound.is_some(), "rule B must surface a bound counter at install");
+
+    // Operator inserts rule A ABOVE B (a live reorder) — same persistent store.
+    let rule_a = reorder_rule_snapshot(&id_a, "permit-a");
+    let state2 = parse_policy_state_with_counters(
+        "deny",
+        &[rule_a, rule_b.clone()],
+        &zones,
+        &[],
+        &store,
+    )
+    .expect("state2");
+    // The positional handle 1 now points at the INSERTED rule A — the stale
+    // index. Resolving it positionally would mis-attribute B's traffic to A.
+    assert_eq!(state2.rules[0].rule_id, id_a, "A must occupy the old slot 1");
+    assert_eq!(state2.rules[1].rule_id, id_b, "B shifted to slot 2");
+
+    // Established fast path: resolve via the BOUND handle, passing the now-stale
+    // idx=1. The bound Arc must win, so the packet counts against B, not A.
+    let counter = state2
+        .resolve_session_hit_counter(bound.as_ref(), 1)
+        .expect("bound handle must resolve");
+    record_policy_hit_counter(counter, 1500);
+    flush_recorded_policy_hit_counters();
+
+    let after = policy_counter(&state2, &id_b);
+    let inserted = policy_counter(&state2, &id_a);
+    assert_eq!(
+        after.packets, 1,
+        "established packet must keep counting against the ADMITTING rule B \
+         after a live reorder (reverting #3322 to positional resolution reads 0 \
+         here and 1 on A -> RED)"
+    );
+    assert_eq!(after.bytes, 1500, "B's byte counter must accumulate");
+    assert_eq!(
+        inserted.packets, 0,
+        "the INSERTED rule A must NOT inherit B's established traffic"
+    );
+
+    // Document the bug the bound handle defeats: resolving the SAME stale idx
+    // positionally (bound = None -> idx fallback) lands on the inserted rule A.
+    let positional = state2
+        .resolve_session_hit_counter(None, 1)
+        .expect("positional idx 1 resolves");
+    record_policy_hit_counter(positional, 1500);
+    flush_recorded_policy_hit_counters();
+    assert_eq!(
+        policy_counter(&state2, &id_a).packets,
+        1,
+        "positional resolution of the stale idx mis-attributes to A (the #3322 bug)"
+    );
+    assert_eq!(
+        policy_counter(&state2, &id_b).packets,
+        1,
+        "B is untouched by the positional mis-attribution"
+    );
+}
+
 #[test]
 fn policy_hit_count_single_packet_flow_reads_one() {
     // Back-compat: a flow whose only packet rides the cold path (no

@@ -481,6 +481,7 @@ impl FlowCacheEntry {
                 // (`poll_descriptor`) stamps `entry.metadata.policy_counter_idx`
                 // from the established flow's metadata after construction.
                 policy_counter_idx: 0,
+                policy_counter: None,
             },
             stamp: FlowCacheStamp::capture(
                 validation.config_generation,

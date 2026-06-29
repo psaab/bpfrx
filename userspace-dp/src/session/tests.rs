@@ -74,6 +74,7 @@ fn metadata() -> SessionMetadata {
         policy_id: 0,
         inactivity_timeout_ns: None,
         policy_counter_idx: 0,
+        policy_counter: None,
     }
 }
 
@@ -178,6 +179,7 @@ fn metadata_with_app_timeout(ns: u64) -> SessionMetadata {
     SessionMetadata {
         inactivity_timeout_ns: Some(ns),
         policy_counter_idx: 0,
+        policy_counter: None,
         ..metadata()
     }
 }

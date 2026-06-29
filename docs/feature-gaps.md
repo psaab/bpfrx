@@ -979,7 +979,26 @@ drift) closed in `fix/2008-quickwins-batch1`:
   (`SessionMetadata::policy_counter_idx`, resolved via
   `PolicyState::hit_counter_by_idx`) onto the session at install and re-counts
   every established packet against the admitting rule on both fast paths
-  (`poll_descriptor` session-hit + `flow_cache_hit`). The cold path still
+  (`poll_descriptor` session-hit + `flow_cache_hit`). **#3322 update:** that
+  1-based handle is POSITIONAL — stable within one snapshot but not across a
+  live policy insert/reorder, which renumbers the rule table so the same index
+  points at whatever rule now occupies the slot (the original admitting rule
+  stops counting; an inserted rule appears to carry established traffic it
+  never admitted). #3322 binds the admitting rule's SHARED counter `Arc`
+  (`SessionMetadata::policy_counter`) onto the session at install — when the
+  index is still correct — and the established fast path prefers that bound
+  handle over re-resolving the positional index
+  (`PolicyState::resolve_session_hit_counter`). The bound `Arc` is the same
+  instance the persistent `PolicyCounterStore` re-hands for a surviving stable
+  `rule_id` across snapshot rebuilds, so it follows the admitting rule through
+  reorders; when the rule is deleted the bound `Arc` is simply no longer read
+  by `counter_snapshots` (count goes nowhere), never a misattribution. The
+  bound handle is local derived state (NOT serialized); a peer-synced session
+  carries only the positional `policy_counter_idx` and falls back to idx
+  resolution at materialize (pre-#3322 behavior; HA requires identical config
+  so the idx resolves the same rule at sync time — but a reorder AFTER a synced
+  session was created still mis-attributes that session's count on the peer,
+  pending a future rule-id-on-wire identity change). The cold path still
   counts the first packet once and `resolve_flow_session_decision` runs no
   policy evaluation, so each packet is counted exactly once. Reverse (reply)
   traffic counts against the same rule via the reverse-companion / shared

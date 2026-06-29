@@ -80,6 +80,7 @@ fn make_metadata(owner_rg_id: i32) -> SessionMetadata {
         policy_id: 0,
         inactivity_timeout_ns: None,
         policy_counter_idx: 0,
+        policy_counter: None,
     }
 }
 

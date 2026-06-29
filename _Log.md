@@ -1,3 +1,41 @@
+## 2026-06-29 — #3322 reorder-stable policy hit-counter handle
+
+- **Timestamp**: 2026-06-29
+- **Action**: The per-session policy hit-counter handle
+  (`SessionMetadata::policy_counter_idx`) was a 1-based POSITIONAL index into
+  the rule table — stable within one snapshot (#3073) but not across a live
+  policy insert/reorder, which renumbers the table so an established session's
+  packets incremented whatever rule now sat at the old index (the real
+  admitting rule stopped counting). Fix: bind the admitting rule's SHARED
+  `Arc<PolicyRuleCounter>` onto the session at install
+  (`SessionMetadata::policy_counter`), when the index is still correct, and
+  prefer that bound handle on the established fast path via
+  `PolicyState::resolve_session_hit_counter` (falls back to the positional idx
+  for unbound / peer-synced sessions). The bound Arc is the same instance the
+  persistent `PolicyCounterStore` re-hands for a surviving stable `rule_id`
+  across snapshot rebuilds, so it follows the admitting rule through reorders;
+  a deleted rule's bound Arc is simply no longer read (count goes nowhere),
+  never a misattribution. Local derived state only — NOT serialized (no wire
+  change; `policy_counter_idx` still rides the HA SESSION_OPEN delta +
+  SessionSyncRequest, peer falls back to idx). Bound at both create sites
+  (forward + reverse companion), the flow-cache populate stamp, and the
+  shared-materialize reverse companion; consumed at both fast-path increments
+  (poll_descriptor session-hit + flow_cache_hit). Added RED-on-revert test
+  `bound_hit_counter_survives_live_policy_reorder` (admit by B, insert A above
+  B, assert established packets keep counting B and A stays 0; reverting the
+  resolver to positional reads B=0/A=1 -> RED, verified). Manual PartialEq/Eq
+  on SessionMetadata ignores the derived counter (not session identity).
+  cargo build + cargo test green (1 pre-existing unrelated failure on
+  origin/master: event_stream telemetry-drain budget debug_assert);
+  go test ./pkg/dataplane/... ./pkg/config/... green. Doc: feature-gaps.md
+  #3073 section updated with the #3322 reorder-stability + HA-residual note.
+- **File(s)**: userspace-dp/src/session/entry.rs, userspace-dp/src/policy.rs,
+  userspace-dp/src/policy_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/shared_ops.rs, userspace-dp/src/server/helpers.rs,
+  + ~15 SessionMetadata literal sites (`policy_counter: None`),
+  docs/feature-gaps.md, _Log.md
 ## 2026-06-29 — #3348 (PR #3506 review fold) inline-term edge cases
 
 - **Timestamp**: 2026-06-29

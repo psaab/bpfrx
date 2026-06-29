@@ -146,11 +146,13 @@ pub(super) fn stage_flow_cache_hit(
         // the first frame. Counted before the policer/drop checks below to
         // match the cold-path "count at policy match" semantics. The
         // per-worker coalescer keeps it off the shared counter cacheline.
-        if let Some(counter) = worker_ctx
-            .forwarding
-            .policy
-            .hit_counter_by_idx(cached_metadata.policy_counter_idx)
-        {
+        // #3322: prefer the cached entry's reorder-stable bound handle over
+        // the positional idx so a live policy reorder cannot re-attribute this
+        // cached flow's packets to a different rule.
+        if let Some(counter) = worker_ctx.forwarding.policy.resolve_session_hit_counter(
+            cached_metadata.policy_counter.as_ref(),
+            cached_metadata.policy_counter_idx,
+        ) {
             crate::policy::record_policy_hit_counter(counter, meta.pkt_len as u64);
         }
         let policer_action = crate::filter::apply_cached_three_color_policers(

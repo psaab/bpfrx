@@ -429,6 +429,7 @@ fn synced_replica_entry_keeps_peer_synced_entries_promotable() {
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
@@ -476,6 +477,7 @@ fn synced_replica_entry_marks_local_entries_worker_local() {
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
         origin: SessionOrigin::ForwardFlow,
         protocol: PROTO_TCP,
@@ -525,6 +527,7 @@ fn reconcile_stop_preserves_shared_synced_sessions() {
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
@@ -585,6 +588,7 @@ fn replay_synced_sessions_requeues_preserved_entries_for_new_workers() {
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
@@ -2719,6 +2723,7 @@ fn icmp_te_nat_reversal_v4_rewrites_outer_dst_and_embedded_src() {
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
     };
 
@@ -2848,6 +2853,7 @@ fn icmp_te_nat_reversal_v4_with_port_snat() {
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
     };
 
@@ -2970,6 +2976,7 @@ fn icmp_dest_unreach_nat_reversal_v4() {
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
     };
 
@@ -3035,6 +3042,7 @@ fn icmp_err_metadata() -> SessionMetadata {
         policy_id: 0,
         inactivity_timeout_ns: None,
         policy_counter_idx: 0,
+        policy_counter: None,
     }
 }
 
@@ -3349,6 +3357,7 @@ fn icmpv6_te_nat_reversal_v6_rewrites_outer_dst_and_embedded_src() {
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
     };
 
@@ -3640,6 +3649,7 @@ fn icmpv6_te_match_fixture(
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
     }
 }
@@ -3921,6 +3931,7 @@ fn icmpv6_te_nptv6_reverse_lookup_restores_internal_client() {
         policy_id: 0,
         inactivity_timeout_ns: None,
         policy_counter_idx: 0,
+        policy_counter: None,
     };
     let mut sessions = SessionTable::new();
     assert!(sessions.install_with_protocol(
@@ -4042,6 +4053,7 @@ fn icmpv6_te_prefers_reverse_session_resolution_for_client_return_path() {
         policy_id: 0,
         inactivity_timeout_ns: None,
         policy_counter_idx: 0,
+        policy_counter: None,
     };
 
     let reverse_key = reverse_session_key(&forward_key, forward_decision.nat);
@@ -4077,6 +4089,7 @@ fn icmpv6_te_prefers_reverse_session_resolution_for_client_return_path() {
         policy_id: 0,
         inactivity_timeout_ns: None,
         policy_counter_idx: 0,
+        policy_counter: None,
     };
 
     let mut sessions = SessionTable::new();
@@ -4233,6 +4246,7 @@ fn embedded_icmp_nat_match_uses_shared_nat_session_for_ipv4() {
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
@@ -4391,6 +4405,7 @@ fn embedded_icmp_nat_match_translates_redirect_v4() {
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
         1_000_000,
         PROTO_TCP,
@@ -5496,6 +5511,7 @@ fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
         policy_id: 0,
         inactivity_timeout_ns: None,
         policy_counter_idx: 0,
+        policy_counter: None,
     };
     assert!(sessions.install_with_protocol_with_origin(
         flow_key.clone(),
@@ -5889,6 +5905,7 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
         policy_id: 0,
         inactivity_timeout_ns: None,
         policy_counter_idx: 0,
+        policy_counter: None,
     };
     assert!(sessions.install_with_protocol_with_origin(
         flow_key.clone(),
@@ -7230,6 +7247,7 @@ fn txn_failed_reply_repair_forwards_uncached_then_self_heals_below_cap() {
             policy_id: 0,
             inactivity_timeout_ns: None,
             policy_counter_idx: 0,
+            policy_counter: None,
         },
         SessionOrigin::ForwardFlow,
         122_000_000_000,
@@ -8831,6 +8849,7 @@ fn poll_descriptor_junos_host_deny_drops_local_delivery_session_hit() {
         policy_id: 0,
         inactivity_timeout_ns: None,
         policy_counter_idx: 0,
+        policy_counter: None,
     };
     assert!(sessions.install_with_protocol_with_origin(
         flow_key.clone(),
@@ -9795,6 +9814,7 @@ fn replay_filter_drops_purged_forward_and_derived_reverse_companion() {
                 policy_id: 0,
                 inactivity_timeout_ns: None,
                 policy_counter_idx: 0,
+                policy_counter: None,
             },
             origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
