@@ -132,6 +132,19 @@ type compileOpts struct {
 	// SchemaValidate. Same doctrine as lenientLogStreamPort.
 	lenientLogTLSProfile bool
 
+	// lenientFlowTraceFile (#3420) downgrades the flow-trace file path-traversal
+	// gate (validateFlowTraceFileAST) from a hard compile error to a
+	// cfg.Warnings entry. Set ONLY on the tolerant load / peer-sync paths: a
+	// persisted or peer-synced config carrying a non-basename
+	// `security flow traceoptions file` value (an absolute path or a ".."
+	// escape) that an older binary accepted must still boot — NewTraceWriter
+	// independently refuses the unsafe path at runtime, so a leniently-loaded
+	// value just disables tracing instead of writing outside /var/log (#1960
+	// fail-closed-on-load class). Like the port/tls-profile gates the filename
+	// is an AST value SchemaValidate treats as opaque, so the check does NOT
+	// live there. Same doctrine as lenientLogStreamPort.
+	lenientFlowTraceFile bool
+
 	// lenientLogEventModeFormat (#3349) downgrades the event-mode log-format
 	// compatibility gate (validateLogEventModeFormatStrict) from a hard
 	// compile error to a cfg.Warnings entry. Set ONLY on the tolerant load /
@@ -351,6 +364,21 @@ type compileOpts struct {
 	// SchemaValidate (applications stay opaque there). Same doctrine as
 	// lenientPolicyMatchAddress / lenientNATHostMask.
 	lenientApplicationSpecs bool
+	// lenientApplicationNameCollisions (#3339, Codex review 080 M07/M08)
+	// downgrades the application / application-set name-collision gate
+	// (validateApplicationNameCollisionsAST) from a hard compile error to a
+	// cfg.Warnings entry. The strict commit / commit-check path hard-rejects a
+	// duplicate application or application-set definition, a name authored as both
+	// an application and an application-set (an explicit set silently overwriting
+	// the implicit set minted for a multi-term application), or two terms whose
+	// generated per-term application names collide — all of which compileApplications
+	// resolves last-write-wins with no commit error, leaving policy expansion and
+	// the AppID catalog free to pick different definitions. The tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or peer-synced
+	// config an older binary silently accepted still BOOTS (#1960 no-brick); the
+	// last-write-wins maps it always produced are unchanged on that path. Same
+	// doctrine as lenientApplicationSpecs / lenientApplicationSetMembers.
+	lenientApplicationNameCollisions bool
 	// lenientFilterProtocols (#2175 review) downgrades the firewall-filter
 	// `from protocol <token>` gate (validateFilterProtocolsStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -1123,6 +1151,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientTCPMSSRange:                   true,
 		lenientLogStreamPort:                 true,
 		lenientLogTLSProfile:                 true,
+		lenientFlowTraceFile:                 true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1137,6 +1166,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFRRAuthValues:                 true,
 		lenientRouteFilterMatchTypes:         true,
 		lenientApplicationSpecs:              true,
+		lenientApplicationNameCollisions:     true,
 		lenientFilterProtocols:               true,
 		lenientFilterActions:                 true,
 		lenientFilterMatchValues:             true,
@@ -1263,6 +1293,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientTCPMSSRange:                   true,
 		lenientLogStreamPort:                 true,
 		lenientLogTLSProfile:                 true,
+		lenientFlowTraceFile:                 true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1277,6 +1308,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFRRAuthValues:                 true,
 		lenientRouteFilterMatchTypes:         true,
 		lenientApplicationSpecs:              true,
+		lenientApplicationNameCollisions:     true,
 		lenientFilterProtocols:               true,
 		lenientFilterActions:                 true,
 		lenientFilterMatchValues:             true,
@@ -1433,6 +1465,21 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3420 flow-trace file path-traversal gate. The compiler stores
+	// `security flow traceoptions file <name>` verbatim and NewTraceWriter
+	// opens it under /var/log without rejecting an absolute path or a ".."
+	// escape — a committed config can append root-written flow telemetry
+	// outside the appliance log area. The filename is a single AST value
+	// SchemaValidate treats as opaque, so it is checked here on the
+	// group-expanded tree. Strict (commit / commit-check): a non-basename value
+	// hard-rejects. Lenient (load / peer-sync): warn so an already-persisted or
+	// peer-synced config still boots (NewTraceWriter refuses the unsafe path at
+	// runtime, so tracing is simply disabled).
+	flowTraceFileWarnings, err := validateFlowTraceFileAST(tree.Children, "", opts.lenientFlowTraceFile)
+	if err != nil {
+		return nil, err
+	}
+
 	// #2008 H9/H10 interface silent-drop gate. Runs on the group-expanded,
 	// inactive-pruned tree (apply-groups-inherited stanzas covered;
 	// `inactive:` stanzas already stripped upstream) and BEFORE section
@@ -1443,6 +1490,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// accepted still boots (#1960 fail-closed-on-load class).
 	unsupportedIfaceWarnings, err := validateUnsupportedInterfaceStanzasAST(
 		tree.Children, opts.lenientUnsupportedInterfaceStanzas)
+	if err != nil {
+		return nil, err
+	}
+
+	// #3339 (Codex review 080 M07/M08) application / application-set name
+	// collision gate. compileApplications collects applications and
+	// application-sets into name-keyed maps with last-write-wins semantics — a
+	// duplicate definition, an application and application-set sharing a name (an
+	// explicit set overwriting the implicit set minted for a multi-term
+	// application), or two terms generating the same per-term application name all
+	// silently keep the last definition with no commit error, and policy
+	// expansion vs the AppID catalog can then resolve the name to different
+	// definitions. Strict (commit / commit-check): the first collision hard-
+	// rejects. Lenient (load / peer-sync): warn so an already-persisted or
+	// peer-synced config an older binary silently accepted still BOOTS (#1960 /
+	// #3261). Runs on the group-expanded, inactive-pruned AST because the
+	// colliding definitions are merged away by last-write-wins by the time the
+	// typed maps exist — only the raw AST still carries every definition.
+	appCollisionWarnings, err := validateApplicationNameCollisionsAST(
+		tree.Children, opts.lenientApplicationNameCollisions)
 	if err != nil {
 		return nil, err
 	}
@@ -1605,7 +1672,9 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, mssWarnings...)
 	cfg.Warnings = append(cfg.Warnings, logStreamPortWarnings...)
 	cfg.Warnings = append(cfg.Warnings, logTLSProfileWarnings...)
+	cfg.Warnings = append(cfg.Warnings, flowTraceFileWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
+	cfg.Warnings = append(cfg.Warnings, appCollisionWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyThenPermitWarnings...)

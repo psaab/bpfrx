@@ -5026,6 +5026,144 @@ fn flush_session_deltas_without_binding_reaches_global_consumers() {
     );
 }
 
+/// #3416 FAIL-ON-REVERT (call-site WIRING pin): the permit-side RT_FLOW
+/// SESSION_CREATE / SESSION_CLOSE application id is resolved INSIDE
+/// `flush_session_deltas` via `AppCatalog::lookup_admitted`, which substitutes
+/// the post-NAT (DNAT-rewritten) destination port for the forward service slot.
+/// The helper-level test (`app_catalog_lookup_admitted_uses_post_nat_dst_port`)
+/// proves `lookup_admitted` in isolation; this drives the PRODUCTION drain loop
+/// end to end against a port-forwarded session and decodes the emitted RT_FLOW
+/// frames, so reverting EITHER session_delta.rs call site back to
+/// `lookup_directional` (dropping the `rewrite_dst_port` argument) makes the
+/// stamped `application_id` resolve UNKNOWN(0) from the pre-NAT public port and
+/// the assertions below go red.
+#[test]
+fn flush_session_deltas_rt_flow_app_id_uses_post_nat_dst_port() {
+    // junos-ssh stand-in: app_id 22 on TCP/22 (the INTERNAL/post-NAT port).
+    // Nothing is registered on the PUBLIC :2222, so a pre-NAT resolution yields
+    // UNKNOWN(0) — exactly the #3416 mislabel the wiring must avoid.
+    const JUNOS_SSH: u16 = 22;
+    let mut forwarding = ForwardingState::default();
+    forwarding.app_catalog = crate::policy::AppCatalog::from_snapshot(&[crate::AppCatalogEntry {
+        app_id: JUNOS_SSH,
+        protocol: PROTO_TCP,
+        dst_port_low: 22,
+        dst_port_high: 22,
+        src_port_low: 0,
+        src_port_high: 0,
+    }]);
+
+    // Forward DNAT session: client 192.0.2.50:51000 -> PUBLIC 203.0.113.10:2222,
+    // DNAT-rewritten to inside 10.0.0.10:22 (admitted by junos-ssh). The forward
+    // session key carries the PRE-NAT public port; the decision carries the
+    // POST-NAT rewrite the policy admitted the flow under.
+    let key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+        src_port: 51000,
+        dst_port: 2222,
+    };
+    let mut decision = test_decision();
+    decision.nat.rewrite_dst = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)));
+    decision.nat.rewrite_dst_port = Some(22);
+    let mut metadata = test_metadata();
+    // SESSION_CREATE is producer-gated on the admitting policy's session-init
+    // log selection; SESSION_CLOSE always emits.
+    metadata.log_session_init = true;
+
+    let make_delta = |kind| SessionDelta {
+        kind,
+        key: key.clone(),
+        decision,
+        metadata: metadata.clone(),
+        origin: SessionOrigin::ForwardFlow,
+        fabric_redirect_sync: false,
+        created_ns: 0,
+        last_seen_ns: 0,
+        counters: crate::session::SessionCounters::default(),
+        observed_tos: 0,
+        observed_tcp_flags: 0,
+    };
+
+    // Drive the production drain loop and return the stamped application_id off
+    // the emitted RT_FLOW frame. `want_event_type` is the RT_FLOW event-type
+    // byte at payload[52] (1 = SESSION_OPEN/create, 2 = SESSION_CLOSE). The
+    // drain also queues an HA session-sync frame (type 1/2 — `from_msg_type`
+    // returns None, so `dataplane_event_payload()` is None for it); the RT_FLOW
+    // create/close frame (type 15/14) is the only one with a Some payload.
+    // NOTE: `decode_dataplane_event()` is NOT used here — it decodes only the
+    // deny/screen/filter kinds (`from_rt_flow_event_type` rejects the session
+    // event types), so app_id is read from the payload [132:134] slot directly,
+    // exactly as the codec/Go side reads it.
+    let stamped_app = |delta: SessionDelta, want_event_type: u8| -> u16 {
+        let (handle, rx) = crate::event_stream::test_worker_handle(
+            8,
+            // Unlimited (events_per_second == 0) — the proven RT_FLOW-emit test
+            // harness config; the default carries a real per-bucket rate limit.
+            crate::event_stream::DataplaneEventRateLimitConfig {
+                events_per_second: 0,
+                burst: 0,
+            },
+        );
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let recent_session_deltas = Arc::new(Mutex::new(VecDeque::new()));
+        let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+        let ident = BindingIdentity {
+            slot: 0,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("ge-0-0-2"),
+            ifindex: 7,
+        };
+        let dnat_fds = crate::afxdp::checksum::DnatTableFds::default();
+        flush_session_deltas(
+            &ident,
+            None,
+            -1,
+            -1,
+            -1,
+            &dnat_fds,
+            &[delta],
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &recent_session_deltas,
+            &peer_worker_commands,
+            &Some(handle),
+            &forwarding,
+        );
+        let frames: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let payload = frames
+            .iter()
+            .find_map(|f| f.dataplane_event_payload())
+            .expect("an RT_FLOW dataplane-event frame on the channel");
+        assert_eq!(
+            payload[52], want_event_type,
+            "RT_FLOW frame must carry the expected session event type at [52]"
+        );
+        u16::from_le_bytes([payload[132], payload[133]])
+    };
+
+    assert_eq!(
+        stamped_app(make_delta(SessionDeltaKind::Open), 1),
+        JUNOS_SSH,
+        "SESSION_CREATE RT_FLOW must stamp the post-NAT app (junos-ssh/22), \
+         not UNKNOWN(0) resolved from the pre-NAT public :2222"
+    );
+    assert_eq!(
+        stamped_app(make_delta(SessionDeltaKind::Close), 2),
+        JUNOS_SSH,
+        "SESSION_CLOSE RT_FLOW must stamp the post-NAT app (junos-ssh/22), \
+         not UNKNOWN(0) resolved from the pre-NAT public :2222"
+    );
+}
+
 /// #2874 FAIL-ON-REVERT: a correctness-critical HA session OPEN delta that
 /// cannot be queued losslessly to the event-stream consumer must be reported as
 /// out-of-sync (flush_session_deltas returns true) so the worker loop forces a

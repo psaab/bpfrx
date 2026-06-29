@@ -307,7 +307,11 @@ func TestNftRuleFromTermRejectVsDiscard(t *testing.T) {
 		{"accept", "accept"},
 		{"reject", "reject"},
 		{"discard", "drop"},
-		{"", "accept"},
+		// #3427: an empty action is a Junos fall-through (modifier-only term),
+		// NOT a terminating accept. The kernel mirror must skip it (emit "") so
+		// later discard/reject terms remain reachable. Before the fix this row
+		// asserted "accept" — the control-plane fail-open this issue tracks.
+		{"", ""},
 	}
 
 	for _, tt := range tests {
@@ -535,5 +539,157 @@ func TestNftRuleFromTermFragment(t *testing.T) {
 	}
 	if strings.Contains(rule6, "ip frag-off") {
 		t.Errorf("ip6 chain emitted IPv4-only `ip frag-off` (#3231 regression): %s", rule6)
+	}
+}
+
+// TestNftRuleFromTermFallThroughNoBareAccept pins #3427: a fall-through term —
+// an explicit `then next term`, or a modifier-only term (empty action) — must
+// NOT emit a terminating kernel verdict that shadows later discard/reject terms.
+// The kernel lo0 chain is the PRIMARY enforcement for host-bound traffic (the
+// XDP shim shunts it to the kernel before userspace), so a bare `accept` here is
+// a real control-plane fail-open. Each case asserts the term emits no rule and,
+// critically, no `accept`. RED before the fix (Action=="" returned "accept";
+// NextTerm was ignored entirely so it also returned "accept").
+func TestNftRuleFromTermFallThroughNoBareAccept(t *testing.T) {
+	prefixLists := map[string]*config.PrefixList{}
+
+	cases := []struct {
+		name string
+		term *config.FirewallFilterTerm
+	}{
+		{
+			// H06: explicit `then next term`, scoped by a match.
+			name: "explicit-next-term",
+			term: &config.FirewallFilterTerm{
+				Name:      "t1",
+				Protocols: []string{"tcp"},
+				NextTerm:  true,
+			},
+		},
+		{
+			// H07: modifier-only term (count, no terminating action), scoped by
+			// a match. Action stays "" — the compiler leaves it empty.
+			name: "modifier-only-count",
+			term: &config.FirewallFilterTerm{
+				Name:      "t1",
+				Protocols: []string{"tcp"},
+				Count:     "tcp-seen",
+			},
+		},
+		{
+			// Bare `then next term` with no match — matches everything, falls
+			// through. Must not become an accept-all.
+			name: "next-term-no-match",
+			term: &config.FirewallFilterTerm{
+				Name:     "t1",
+				NextTerm: true,
+			},
+		},
+	}
+
+	for _, c := range cases {
+		for _, fam := range []string{"ip", "ip6"} {
+			rule := nftRuleFromTerm(c.term, fam, prefixLists)
+			if rule != "" {
+				t.Errorf("%s (%s): fall-through term emitted a rule %q, want \"\" (no terminating verdict)", c.name, fam, rule)
+			}
+			if strings.Contains(rule, "accept") {
+				t.Errorf("%s (%s): fall-through term emitted a terminating accept (fail-open #3427): %q", c.name, fam, rule)
+			}
+		}
+	}
+}
+
+// TestNftRuleFromTermRoutingInstanceTerminatesAccept pins #3427 M08: a
+// routing-instance (PBR) term has an empty terminating action but is NOT a
+// fall-through in userspace. The Rust compiler sets continue_term=false when
+// routing_instance is non-empty and the evaluator RETURNS the matched term's
+// action — the empty-action placeholder Accept — so the packet is ACCEPTED. The
+// kernel lo0 input chain cannot perform route-selection, but the filter VERDICT
+// is accept, so it must emit a TERMINATING accept (mirroring userspace). It must
+// NOT skip the rule: skipping would let a later deny term over-drop legitimate
+// host traffic on the kernel-primary lo0 chain.
+func TestNftRuleFromTermRoutingInstanceTerminatesAccept(t *testing.T) {
+	prefixLists := map[string]*config.PrefixList{}
+
+	term := &config.FirewallFilterTerm{
+		Name:            "to-mgmt-instance",
+		SourceAddresses: []string{"10.0.0.0/8"},
+		RoutingInstance: "mgmt",
+	}
+	for _, fam := range []string{"ip", "ip6"} {
+		fk := "ip"
+		if fam == "ip6" {
+			fk = "ip6"
+		}
+		want := fk + " saddr 10.0.0.0/8 accept"
+		rule := nftRuleFromTerm(term, fam, prefixLists)
+		if rule != want {
+			t.Errorf("routing-instance term (%s): got %q, want %q (terminate-as-accept, mirror userspace)", fam, rule, want)
+		}
+	}
+}
+
+// TestLo0PayloadFallThroughDoesNotShadowDiscard is the end-to-end #3427 proof:
+// a fall-through term followed by a discard term must leave the discard
+// REACHABLE in the rendered nft payload. Before the fix term1 rendered
+// `meta l4proto tcp accept`, which (atomic, first-match-wins chain) made the
+// later `tcp dport 22 drop` unreachable — SSH was silently permitted in the
+// kernel lo0 mirror. The fix drops term1's rule entirely so the discard stands.
+func TestLo0PayloadFallThroughDoesNotShadowDiscard(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		"lo0-in": {
+			Name: "lo0-in",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "fallthrough", Protocols: []string{"tcp"}, NextTerm: true},
+				{Name: "block-ssh", Protocols: []string{"tcp"}, DestinationPorts: []string{"22"}, Action: "discard"},
+			},
+		},
+	}
+
+	payload := buildLo0FilterPayload(cfg, "lo0-in", "")
+
+	if strings.Contains(payload, "meta l4proto tcp accept") {
+		t.Errorf("fall-through term emitted a shadowing accept in the lo0 payload (#3427 fail-open):\n%s", payload)
+	}
+	if !strings.Contains(payload, "th dport 22 drop") {
+		t.Errorf("discard term unreachable / missing from lo0 payload:\n%s", payload)
+	}
+}
+
+// TestLo0PayloadRoutingInstanceTerminatesAcceptNoOverDrop is the #3427 M08
+// counterexample the coordinator caught: a routing-instance (PBR) term followed
+// by a deny term. Userspace TERMINATES the matched routing-instance term as
+// Accept (continue_term=false, placeholder Accept), so the packet is ACCEPTED
+// and the later discard never runs. The kernel mirror must therefore emit a
+// terminating `accept` for the steer term — NOT skip it. A skip lets the later
+// `then discard` match and OVER-DROP legitimate host traffic on the
+// kernel-primary lo0 chain. RED-on-revert: with the skip disposition the steer
+// rule is absent and `meta l4proto tcp drop` is the only verdict.
+func TestLo0PayloadRoutingInstanceTerminatesAcceptNoOverDrop(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		"lo0-in": {
+			Name: "lo0-in",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "steer", Protocols: []string{"tcp"}, RoutingInstance: "mgmt"},
+				{Name: "deny-rest", Protocols: []string{"tcp"}, Action: "discard"},
+			},
+		},
+	}
+
+	payload := buildLo0FilterPayload(cfg, "lo0-in", "")
+
+	// The steer term must terminate as accept BEFORE the deny term, so the
+	// accept appears in the payload and (first-match-wins) shields tcp traffic
+	// from the drop. The over-drop bug would leave only the drop rule.
+	if !strings.Contains(payload, "meta l4proto tcp accept") {
+		t.Errorf("routing-instance term did not emit a terminating accept (#3427 over-drop): the later discard would over-drop host traffic:\n%s", payload)
+	}
+	acceptIdx := strings.Index(payload, "meta l4proto tcp accept")
+	dropIdx := strings.Index(payload, "meta l4proto tcp drop")
+	if acceptIdx == -1 || (dropIdx != -1 && dropIdx < acceptIdx) {
+		t.Errorf("routing-instance accept must precede the deny term (first-match-wins) so legit traffic is not over-dropped:\n%s", payload)
 	}
 }

@@ -834,6 +834,124 @@ fn go_unsupported_sentinel_fails_closed() {
 }
 
 #[test]
+fn unknown_rule_action_rejects_whole_snapshot() {
+    // #3365 RED-on-revert: a per-rule action string that is not
+    // permit/reject/deny must reject the WHOLE snapshot. Pre-fix `parse_action`
+    // mapped any unknown token to PolicyAction::Deny via a catch-all match arm,
+    // so a future `reject-*` variant or a corrupt token silently downgraded to
+    // a plain Deny (a `reject` losing its RST/ICMP-unreachable semantics) with
+    // NO integrity error. Reverting the fix returns Ok(state) here, so this is
+    // non-tautological.
+    let store = PolicyCounterStore::default();
+    let bad = PolicyRuleSnapshot {
+        rule_id: "bad-action".to_string(),
+        name: "bad-action".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "reject-tcp".to_string(),
+        ..Default::default()
+    };
+    let result =
+        parse_policy_state_with_counters("deny", &[bad], &test_zone_name_to_id(), &[], &store);
+    match result {
+        Err(SnapshotIntegrityError::UnknownPolicyAction { context, action }) => {
+            assert!(context.contains("bad-action"), "context names the rule: {context}");
+            assert_eq!(action, "reject-tcp");
+        }
+        other => panic!("expected UnknownPolicyAction, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_rule_action_rejects_whole_snapshot() {
+    // #3365: every configured rule carries a concrete action; an EMPTY action
+    // (which pre-fix also collapsed silently to Deny) is rejected fail-closed.
+    let store = PolicyCounterStore::default();
+    let bad = PolicyRuleSnapshot {
+        rule_id: "empty-action".to_string(),
+        name: "empty-action".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: String::new(),
+        ..Default::default()
+    };
+    let result =
+        parse_policy_state_with_counters("deny", &[bad], &test_zone_name_to_id(), &[], &store);
+    assert!(
+        matches!(result, Err(SnapshotIntegrityError::UnknownPolicyAction { .. })),
+        "an empty per-rule action must fail closed, got {result:?}"
+    );
+}
+
+#[test]
+fn unknown_default_policy_action_rejects_whole_snapshot() {
+    // #3365: the snapshot `default_policy` is the other side of the same
+    // string boundary. A non-empty unknown default action must reject the whole
+    // snapshot rather than silently collapse to Deny.
+    let store = PolicyCounterStore::default();
+    let result =
+        parse_policy_state_with_counters("permit-all", &[], &test_zone_name_to_id(), &[], &store);
+    match result {
+        Err(SnapshotIntegrityError::UnknownPolicyAction { context, action }) => {
+            assert_eq!(context, "default-policy");
+            assert_eq!(action, "permit-all");
+        }
+        other => panic!("expected UnknownPolicyAction for default-policy, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_default_policy_is_accepted_as_deny() {
+    // #3365 guard against over-rejection: an EMPTY default_policy is the
+    // legitimate `omitempty`/unspecified wire state and must decode to the
+    // default-deny posture WITHOUT an integrity error. The Rust snapshot field
+    // is `#[serde(default)]`, so a snapshot that omits default_policy delivers
+    // "" — this must NOT be rejected.
+    let store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters("", &[], &test_zone_name_to_id(), &[], &store)
+        .expect("empty default_policy must be accepted");
+    assert_eq!(state.default_action, PolicyAction::Deny);
+}
+
+#[test]
+fn known_actions_still_parse() {
+    // #3365 sanity: the three known tokens still decode to their actions on both
+    // the default-policy and per-rule boundaries.
+    let store = PolicyCounterStore::default();
+    for (tok, want) in [
+        ("permit", PolicyAction::Permit),
+        ("reject", PolicyAction::Reject),
+        ("deny", PolicyAction::Deny),
+    ] {
+        let rule = PolicyRuleSnapshot {
+            rule_id: format!("r-{tok}"),
+            name: format!("r-{tok}"),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: tok.to_string(),
+            ..Default::default()
+        };
+        let state =
+            parse_policy_state_with_counters(tok, &[rule], &test_zone_name_to_id(), &[], &store)
+                .unwrap_or_else(|e| panic!("token {tok} must parse: {e:?}"));
+        assert_eq!(state.default_action, want, "default-policy {tok}");
+        assert_eq!(state.rules[0].action, want, "rule action {tok}");
+    }
+}
+
+#[test]
 fn deny_rule_with_unrepresentable_app_rejects_whole_snapshot_no_fall_through() {
     // #3261 doctrine guard (plan test #4): a `deny` rule naming an
     // unrepresentable application AHEAD of a later `permit application any` in
@@ -2944,6 +3062,64 @@ fn app_catalog_directional_forward_not_mislabeled_by_source_port() {
     assert_eq!(ranged.lookup_forward(6, 9050, 1500), 0);
     // Reverse-keyed: service range in src, client range in dst -> match.
     assert_eq!(ranged.lookup_directional(6, 9050, 1500, true), 9);
+}
+
+// #3416: the permit-side audit AppID must resolve from the POST-translation
+// destination port a DNAT'd session was admitted under, mirroring the deny side
+// (#3058/#3185). A public-port -> private-port forward (e.g. :2222 -> :22 for
+// junos-ssh) must render the admitting application, not UNKNOWN/the public port.
+#[test]
+fn app_catalog_lookup_admitted_uses_post_nat_dst_port() {
+    // junos-ssh stand-in: TCP dst/22 (exact-port path).
+    let ssh = AppCatalog::from_snapshot(&[cat_entry(22, 6, 22, 22)]);
+
+    // Forward DNAT: client src=51000 -> public dst=2222, DNAT-rewritten to :22.
+    // RED-on-revert: passing the pre-NAT forward-key dst (2222) to the plain
+    // directional lookup mislabels the session UNKNOWN — exactly the #3416 bug.
+    assert_eq!(
+        ssh.lookup_directional(6, 51000, 2222, false),
+        0,
+        "pre-NAT public dst port resolves UNKNOWN — the #3416 mislabel"
+    );
+    // The fix: lookup_admitted substitutes the post-NAT (rewritten) dst port and
+    // resolves the admitting application.
+    assert_eq!(
+        ssh.lookup_admitted(6, 51000, 2222, false, Some(22)),
+        22,
+        "forward DNAT session resolves on the post-NAT (rewritten) dst port"
+    );
+
+    // Negative control: public == private port (no rewrite). rewrite_dst_port is
+    // None, so the result is byte-identical to the plain directional lookup.
+    assert_eq!(
+        ssh.lookup_admitted(6, 51000, 22, false, None),
+        22,
+        "non-translated flow falls back to the forward-key dst port"
+    );
+    // A DNAT that does NOT change the port (rewrite_dst_port None even though the
+    // dst address changed) also falls back to the received service port.
+    assert_eq!(
+        ssh.lookup_admitted(6, 51000, 22, false, None),
+        22,
+        "address-only DNAT (no port rewrite) still resolves on the dst port"
+    );
+
+    // Reverse-keyed entry: the service rides the SRC slot and the key already
+    // carries the real internal port. The forward-only rewrite must NOT touch
+    // the reverse service slot, so a (bogus, for this direction) rewrite_dst_port
+    // is ignored and the src slot still resolves.
+    assert_eq!(
+        ssh.lookup_admitted(6, 22, 51000, true, Some(2222)),
+        22,
+        "reverse-keyed session resolves on its received src service slot"
+    );
+
+    // Wrong post-NAT port still resolves to UNKNOWN (no false positive).
+    assert_eq!(
+        ssh.lookup_admitted(6, 51000, 2222, false, Some(8080)),
+        0,
+        "post-NAT port with no catalog entry resolves UNKNOWN"
+    );
 }
 
 // A (0,0) dst-port pair means "protocol-only" (e.g. ICMP) — match on protocol

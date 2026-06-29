@@ -158,6 +158,25 @@ if `Handle` runs the re-entrancy guard before the client check.
   upper-cases, keeping ICMPv6 mixed-case for the trace-filter contract);
   unknown protocols still fall back to the numeric form. Pin:
   `protoname_test.go`.
+- **Flow-trace files are basename-only under `/var/log` (#3420).**
+  `NewTraceWriter` (`trace.go`) treats the persistent
+  `security flow traceoptions file <name>` value as a bare basename: an
+  absolute path, a path separator, or a `.`/`..` component is rejected
+  (`sanitizeTraceFileName`), the file is opened under `traceLogDir`
+  (`/var/log` in production; a package var only so tests can redirect it)
+  with `O_NOFOLLOW` and verified to be a regular file, and it is created
+  mode `0600` rather than world-readable — flow tuples/zones/policy IDs are
+  audit-grade telemetry. Rotation reopens through the same `openTraceFile`
+  guard. Before #3420 the value was kept verbatim (absolute) or joined under
+  `/var/log` without a `..` check, so a committed config could append
+  root-written telemetry anywhere the daemon could write. The committed
+  config is also rejected at commit-time (`validateFlowTraceFileAST`,
+  `pkg/config`); this runtime guard is the defense-in-depth backstop that
+  fails safe (tracing disabled) on a leniently-loaded / peer-synced value.
+  This is the persistent-config sibling of the interactive
+  `monitor security flow file` hardening (#3378). Pins:
+  `TestNewTraceWriterRejectsPathTraversal`,
+  `TestNewTraceWriterNoFollowSymlink`.
 - **Event time is DECISION time, not receive time (#2465/#2470/#2511).**
   The on-wire RT_FLOW frame carries an absolute Unix-nanosecond timestamp
   in its first 8 bytes (LE u64), stamped by the userspace-dp producer at

@@ -126,6 +126,14 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) cos: CoSState,
     pub(in crate::afxdp) tx_selection_enabled_v4: bool,
     pub(in crate::afxdp) tx_selection_enabled_v6: bool,
+    /// `security flow gre-performance-acceleration` (#3360). On vSRX this
+    /// extracts the GRE key/call-id into the session tuple so multiple GRE
+    /// tunnels between the same endpoints map to distinct sessions. The
+    /// userspace dataplane keys GRE flows on the 5-tuple only, so this flag is
+    /// threaded into ForwardingState for config truth/parity but is NOT yet read
+    /// by any packet/forwarding path — hence `#[allow(dead_code)]`. The consumer
+    /// (GRE key/call-id extraction) is a deferred feature; this is the seam it
+    /// would read.
     #[allow(dead_code)]
     pub(in crate::afxdp) gre_acceleration: bool,
     /// `security flow power-mode-disable` (#2008 H14). vSRX power-mode is an

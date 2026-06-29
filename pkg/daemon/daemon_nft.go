@@ -713,14 +713,53 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		}
 	}
 
-	// Action: discard → drop (silent), reject → reject (ICMP unreachable), accept → accept
+	// Disposition. Mirror the userspace lo0 evaluator
+	// (pkg/dataplane/userspace/filters.go:89) so the kernel lo0 chain enforces the
+	// SAME term semantics. The XDP shim shunts ordinary host-bound traffic to the
+	// Linux kernel before it reaches userspace-dp, so this chain is the PRIMARY
+	// enforcement for host traffic — a wrong terminating verdict here is a real
+	// control-plane mis-enforcement, not a cosmetic shadow.
+	//
+	// #3427: a term with NO terminating action is a FALL-THROUGH in Junos — apply
+	// the term's modifiers and continue to the NEXT term. This covers both the
+	// explicit `then next term` (term.NextTerm) and a modifier-only term
+	// (Action=="" carrying only count/log/forwarding-class/policer/dscp). The
+	// pre-fix code mapped Action=="" to a terminating nft `accept`, which SHADOWED
+	// every later discard/reject term in the kernel mirror — a fail-OPEN that
+	// diverged from userspace (e.g. `from protocol tcp then next term` followed by
+	// `from destination-port 22 then discard` accepted SSH at term 1, leaving the
+	// drop unreachable). Emit NOTHING for a fall-through term: the kernel chain
+	// does not mirror counters/log, so the term contributes no enforcement and the
+	// subsequent terms must run. Returning "" makes buildLo0FilterPayload skip the
+	// rule.
+	//
+	// A routing-instance (PBR) term is explicitly NOT a fall-through: userspace
+	// sets continue_term=false when routing_instance is non-empty
+	// (pkg/dataplane/userspace compiler.rs) and the evaluator TERMINATES the
+	// matched term, returning its action — the empty-action placeholder Accept
+	// (compiler.rs) — so the packet is ACCEPTED. The kernel lo0 input chain
+	// cannot perform route-selection, but the filter VERDICT is accept, so it
+	// must emit a TERMINATING accept (not skip): skipping would let a later
+	// deny term match and OVER-DROP legitimate host traffic on the
+	// kernel-primary lo0 chain. Userspace remains authoritative for the actual
+	// route-selection. Falls through to the action switch below (empty action ->
+	// default accept).
+	if (term.NextTerm || term.Action == "") && term.RoutingInstance == "" {
+		return ""
+	}
+
+	// Action: discard → drop (silent), reject → reject (ICMP unreachable),
+	// accept → accept. An empty action with a routing-instance set reaches here
+	// and takes the default accept (terminate-as-accept, mirroring userspace).
+	// Any other explicit action is unexpected for a committed config; keep the
+	// historical accept default rather than emit garbage.
 	action := "accept"
 	switch term.Action {
 	case "discard":
 		action = "drop"
 	case "reject":
 		action = "reject"
-	case "accept", "":
+	case "accept":
 		action = "accept"
 	}
 

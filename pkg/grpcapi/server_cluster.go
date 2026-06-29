@@ -230,6 +230,10 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 	return &pb.MatchPoliciesResponse{
 		Matched:      true,
 		PolicyName:   res.PolicyName,
+		Global:       res.Global,
+		FromZone:     res.FromZone,
+		ToZone:       res.ToZone,
+		PolicyId:     res.PolicyID,
 		Action:       policymatch.ActionString(res.Action),
 		SrcAddresses: res.SrcAddresses,
 		DstAddresses: res.DstAddresses,
