@@ -32,8 +32,10 @@ func (s *Server) zonesHandler(w http.ResponseWriter, _ *http.Request) {
 			continue
 		}
 		zi := ZoneInfo{
-			Name:       zoneName,
-			Interfaces: zone.Interfaces,
+			Name:        zoneName,
+			Description: zone.Description,
+			TcpRst:      zone.TCPRst,
+			Interfaces:  zone.Interfaces,
 		}
 		if zone.ScreenProfile != "" {
 			zi.ScreenProfile = zone.ScreenProfile
@@ -121,6 +123,7 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 			}
 			pr := PolicyRule{
 				Name:         rule.Name,
+				Description:  rule.Description,
 				Action:       policyActionStr(rule.Action),
 				SrcAddresses: rule.Match.SourceAddresses,
 				DstAddresses: rule.Match.DestinationAddresses,
@@ -175,6 +178,7 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 			}
 			pr := PolicyRule{
 				Name:         rule.Name,
+				Description:  rule.Description,
 				Action:       policyActionStr(rule.Action),
 				SrcAddresses: rule.Match.SourceAddresses,
 				DstAddresses: rule.Match.DestinationAddresses,
