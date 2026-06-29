@@ -1975,6 +1975,20 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 			bookNames[name] = true
 		}
 	}
+	// #3294: a dynamic-address feed binding NAME is a valid DIRECT policy
+	// address token — the userspace dataplane resolves it via the feed overlay
+	// (#2049) and enforces the live feed prefixes. Recognize it here so a direct
+	// feed reference COMMITS instead of being rejected as an undefined token
+	// (the documented #2049 feed-in-policy feature was un-committable under
+	// strict). Deliberately scoped to THIS top-level gate only:
+	// policyMatchAddressBookResolves (#3149) must stay feed-UNaware so a feed
+	// member nested in an address-set still poisons its set at strict — feeding
+	// it through the shared recursive resolver would strict-accept feed-in-set
+	// (the anti-Option-C guardrail; feed-in-set enforcement on the lenient path
+	// is handled by the dataplane set-row merge, not by strict-accepting it).
+	for name := range cfg.Security.DynamicAddress.AddressBindings {
+		bookNames[name] = true
+	}
 	validToken := func(tok string) bool {
 		switch tok {
 		case "", "any", "any-ipv4", "any-ipv6":
