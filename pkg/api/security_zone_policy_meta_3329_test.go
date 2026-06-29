@@ -43,6 +43,13 @@ security {
                 then { permit; }
             }
         }
+        global {
+            policy global-audit {
+                description "global owner=secops ticket=JIRA-99";
+                match { source-address any; destination-address any; application any; }
+                then { deny; }
+            }
+        }
     }
 }
 `); err != nil {
@@ -155,20 +162,39 @@ func TestPoliciesHandlerExposesDescription(t *testing.T) {
 		t.Fatalf("success = false; body: %s", rr.Body.String())
 	}
 
-	var saw bool
+	// Cover BOTH projection sites in security.go: the zone-pair policy loop
+	// AND the global policy loop. Each Description population line is its own
+	// RED-on-revert target — deleting either must fail this test.
+	var sawZonePair, sawGlobal bool
 	for _, policy := range resp.Data {
 		for _, rule := range policy.Rules {
-			if rule.Name != "allow-web" {
-				continue
-			}
-			saw = true
-			if rule.Description != "break-glass exception, decommission 2026-12" {
-				t.Fatalf("allow-web description = %q, want %q (REST dropped policy description — #3329 regression); body: %s",
-					rule.Description, "break-glass exception, decommission 2026-12", rr.Body.String())
+			switch rule.Name {
+			case "allow-web":
+				sawZonePair = true
+				if policy.FromZone != "trust" || policy.ToZone != "untrust" {
+					t.Fatalf("allow-web grouped under %q/%q, want trust/untrust", policy.FromZone, policy.ToZone)
+				}
+				if rule.Description != "break-glass exception, decommission 2026-12" {
+					t.Fatalf("allow-web description = %q, want %q (REST dropped zone-pair policy description — #3329 regression); body: %s",
+						rule.Description, "break-glass exception, decommission 2026-12", rr.Body.String())
+				}
+			case "global-audit":
+				sawGlobal = true
+				// Globals stay grouped under the all-zones "*"/"*" PolicyInfo.
+				if policy.FromZone != "*" || policy.ToZone != "*" {
+					t.Fatalf("global-audit grouped under %q/%q, want */* (global group)", policy.FromZone, policy.ToZone)
+				}
+				if rule.Description != "global owner=secops ticket=JIRA-99" {
+					t.Fatalf("global-audit description = %q, want %q (REST dropped global policy description — #3329 regression); body: %s",
+						rule.Description, "global owner=secops ticket=JIRA-99", rr.Body.String())
+				}
 			}
 		}
 	}
-	if !saw {
-		t.Fatalf("allow-web policy missing from REST inventory; body: %s", rr.Body.String())
+	if !sawZonePair {
+		t.Fatalf("allow-web (zone-pair) policy missing from REST inventory; body: %s", rr.Body.String())
+	}
+	if !sawGlobal {
+		t.Fatalf("global-audit (global) policy missing from REST inventory; body: %s", rr.Body.String())
 	}
 }
