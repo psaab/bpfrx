@@ -1,3 +1,40 @@
+## 2026-06-29 — #3296 undefined interface/lo0 filter reference fail-open
+
+- **Timestamp**: 2026-06-29
+- **Action**: Promote an undefined interface/lo0 firewall filter reference
+  from a commit WARNING to a strict commit error + add a fail-closed
+  dataplane backstop. Before: `interfaces <if> unit <n> family inet|inet6
+  filter input|output <name>` (and lo0 input) naming a filter not defined
+  under `firewall family ... filter` was warn-only at commit, and the Rust
+  snapshot compiler left the per-interface fast-path map (and output
+  needs_tx_eval set) empty for the missing key → hot path returned the
+  default Accept → hook silently disarmed (fail-OPEN on a typo'd security
+  hook). Go: new `validateFirewallFilterReferencesStrict`
+  (compiler_validate_strict.go), wired at the firewall-gate cluster
+  (compiler.go) gated on `opts.lenientFirewallRefs` — strict on commit,
+  downgraded-warn on lenient/peer-sync (#1960). Deleted the superseded
+  warn-only interface filter-reference loop in compiler_validate_warn.go
+  (avoids a duplicate warning on the lenient path). lo0 is covered for free
+  (stored as cfg.Interfaces.Interfaces["lo0"]). Rust: new
+  `SnapshotIntegrityError::MissingFilterRef` raised by `parse_filter_state`
+  (filter/compiler.rs) on a named-but-missing interface/lo0 ref —
+  preflight reject preserves prior good state, never falls open to Accept.
+  Mirrors the policer (#2217) / prefix-list (#2506) strict-reference
+  precedent and the #2505 snapshot-integrity backstop doctrine.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_filter_ref_3296_test.go (new),
+  pkg/config/compiler_interfaces_unsupported_test.go,
+  pkg/config/parser_ast_test.go, pkg/config/parser_services_test.go,
+  userspace-dp/src/policy.rs, userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md
+- **Validation**: `go test ./pkg/config/...` green (8 new + 5 fixed
+  pre-existing tests that referenced undefined filters); `cargo build`
+  green; new Rust tests `missing_filter_ref_3296_*` /
+  `defined_filter_ref_3296_compiles_cleanly` pass; full Rust suite 3223
+  pass / 2 pre-existing flakes (event_stream/worker_queue, confirmed
+  failing on pristine origin/master, unrelated to filters).
+
 ## 2026-06-28 — #3499 compiler_iface nil zone/interface map-value guards
 
 - **Timestamp**: 2026-06-28
