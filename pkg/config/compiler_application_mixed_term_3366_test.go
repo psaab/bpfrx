@@ -160,6 +160,42 @@ func TestApplicationTerm_DuplicateScalarLeaf_Rejected(t *testing.T) {
 	}
 }
 
+// Guard against over-rejection of the value-aware idempotent path: a scalar term
+// leaf repeated with the SAME value is harmless (no value is silently lost) and
+// must COMMIT — only a CONFLICTING (different-value) repeat is rejected. Pins (a)
+// `destination-port 22` repeated as `destination-port 22`, and (b) the
+// `inactivity-timeout 1800` + `timeout 1800` alias-same-value case (the two
+// keywords set the same field). Flip the duplicate detection to value-blind
+// (reject any repeat regardless of value) and this assertion goes RED.
+func TestApplicationTerm_DuplicateScalarLeaf_Idempotent_Accepted(t *testing.T) {
+	cases := []struct {
+		name string
+		term string
+	}{
+		{"same-destination-port", "term t1 protocol tcp destination-port 22 destination-port 22"},
+		{"same-source-port", "term t1 protocol tcp source-port 1024 source-port 1024"},
+		{"same-alg", "term t1 protocol tcp alg ftp alg ftp"},
+		// timeout and inactivity-timeout are aliases for the same field; both set
+		// to 1800 is idempotent, not a conflicting override.
+		{"timeout-alias-same-value", "term t1 protocol tcp inactivity-timeout 1800 timeout 1800"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tree := flatTreeFromSets(t, unrefAppOnly("idem", c.term)...)
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("an idempotent same-value repeat must COMMIT (only a "+
+					"conflicting different-value repeat is rejected), got: %v", err)
+			}
+			// The single value survives on the generated term application.
+			app := cfg.Applications.Applications["idem-t1"]
+			if app == nil {
+				t.Fatalf("term application idem-t1 missing; have %v", appNames(cfg))
+			}
+		})
+	}
+}
+
 // Guard: a repeated `protocol` inside a term is the documented multi-protocol
 // syntax (one application per unique protocol), NOT a duplicate — it must still
 // commit and generate one app per protocol.

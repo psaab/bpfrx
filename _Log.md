@@ -1,3 +1,29 @@
+## 2026-06-29 — #3366 Codex/SMR MINOR fold: pin the value-aware idempotent-accept path (PR #3540)
+
+- **Timestamp**: 2026-06-29
+- **Action**: SMR MINOR fold for PR #3540 (#3366). The duplicate scalar
+  term-leaf rejection in `parseApplicationTerms` is value-AWARE — a
+  repeat with the SAME value is harmless (no value is silently lost) and
+  COMMITS; only a CONFLICTING different-value repeat is rejected. That
+  idempotent-accept path (`if dstPortSet && v != dstPort` etc. at the
+  destination-port / source-port / inactivity-timeout|timeout / alg arms)
+  was correct but had NO committed test pinning it, so a future
+  value-blind refactor (drop the `&& v != …` value comparison) would
+  silently start over-rejecting legitimate idempotent configs undetected.
+  Added `TestApplicationTerm_DuplicateScalarLeaf_Idempotent_Accepted`
+  pinning four idempotent same-value cases — repeated `destination-port
+  22`, repeated `source-port 1024`, repeated `alg ftp`, and the
+  `inactivity-timeout 1800` + `timeout 1800` alias-same-value case (both
+  keywords set the same field). Config built via ParseSetCommand +
+  tree.SetPath (flatTreeFromSets/unrefAppOnly), per CLAUDE.md.
+- **File(s)**: pkg/config/compiler_application_mixed_term_3366_test.go
+- **Validation**: `go test ./pkg/config/` green; gofmt clean. RED-on-
+  revert experiment: flipping all four arms value-blind (`if dstPortSet {`
+  …) turns the new idempotent test RED on all four subcases while
+  `TestApplicationTerm_DuplicateScalarLeaf_Rejected` stays green —
+  confirming the test genuinely guards the idempotent path. Reverted the
+  flip; tree clean.
+
 ## 2026-06-29 — #3363 Codex MEDIUM fold: structured gRPC GetPolicies default-policy parity (PR #3528)
 
 - **Timestamp**: 2026-06-29
