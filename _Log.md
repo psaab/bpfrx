@@ -23377,3 +23377,8 @@ top.
 - **Timestamp**: 2026-06-29
 - **Action**: Verified #3385 over-match already structurally fixed on master by #3321 (lookup_directional removed the OR-decomposition). Added a #3385-specific RED-on-revert regression test for the distinct OVERLAPPING-range cross-slot over-match. No behavior change.
 - **File(s)**: userspace-dp/src/policy_tests.rs (app_catalog_overlapping_dual_range_no_cross_slot_overmatch)
+
+## #3436 — daemon lo0 nft: normalize protocol aliases + DSCP names through shared resolvers
+- **Timestamp**: 2026-06-29
+- **Action**: nftRuleFromTerm emitted `from protocol` tokens and `dscp`/`traffic-class` tokens RAW (codex-094 H08/M01). Junos protocol aliases (junos-gre, junos-tcp-any, junos-icmp-all, ipip/junos-ip-in-ip) and case-variant / `be` DSCP names are accepted by the commit gate and userspace matcher but are not valid nft tokens, so the atomic lo0 load failed (commit broken) or the kernel mirror matched a different protocol/code point than userspace. Fix: resolve protocols through appid.ProtocolNumber and emit NUMERIC l4proto tokens; resolve DSCP through dataplane.DSCPValues (case-insensitive, numeric 0..63 pass-through) and emit numeric values. Unresolvable protocol dropped with a warning on the lenient path. Added RED-on-revert tests (alias single + multi set, DSCP EF/Af11/be/numeric + multi set); updated existing l4proto/DSCP test expectations to numeric; documented in pkg/daemon/README.md.
+- **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/lo0_filter_test.go, pkg/daemon/README.md, _Log.md

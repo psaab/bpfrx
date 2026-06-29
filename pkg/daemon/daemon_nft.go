@@ -11,7 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
@@ -668,10 +670,35 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 	}
 
 	// Protocol matching (#2545: multi-value — emit an nft set on >1).
-	if len(term.Protocols) == 1 {
-		parts = append(parts, "meta l4proto "+term.Protocols[0])
-	} else if len(term.Protocols) > 1 {
-		parts = append(parts, "meta l4proto { "+strings.Join(term.Protocols, ", ")+" }")
+	//
+	// #3436: resolve every `from protocol` token through the shared
+	// appid.ProtocolNumber SSOT and emit NUMERIC protocol numbers. The commit
+	// gate (filterProtocolResolvable) and the userspace matcher (ip_proto.rs)
+	// accept Junos predefined-protocol aliases — junos-gre, junos-tcp-any,
+	// junos-icmp-all, ipip/junos-ip-in-ip, ... — that nft does NOT understand.
+	// Emitting them raw (`meta l4proto junos-gre`) is an nft parse error that
+	// rejects the WHOLE atomic lo0 table (legitimate commit broken) or, on the
+	// lenient/peer-sync path, mirrors a DIFFERENT protocol than userspace. The
+	// numeric form is unconditionally nft-safe and resolves to the SAME protocol
+	// number the Rust matcher uses. A token outside the SSOT cannot reach a
+	// committed config (the gate rejects it); a leniently-loaded one is dropped
+	// with a warning rather than emitted as unloadable nft (mirroring the
+	// tcp-flags lowering below).
+	if len(term.Protocols) > 0 {
+		protos := make([]string, 0, len(term.Protocols))
+		for _, p := range term.Protocols {
+			if n, ok := appid.ProtocolNumber(p); ok {
+				protos = append(protos, strconv.Itoa(int(n)))
+			} else {
+				slog.Warn("dropping unresolvable protocol from lo0 filter term",
+					"term", term.Name, "protocol", p)
+			}
+		}
+		if len(protos) == 1 {
+			parts = append(parts, "meta l4proto "+protos[0])
+		} else if len(protos) > 1 {
+			parts = append(parts, "meta l4proto { "+strings.Join(protos, ", ")+" }")
+		}
 	}
 
 	// Source port matching
@@ -914,9 +941,30 @@ func nftIntSet(vals []int) string {
 	return "{ " + strings.Join(strs, ", ") + " }"
 }
 
+// nftDSCPValue converts a firewall-filter DSCP / traffic-class match token to a
+// numeric nft dscp token, resolving code-point NAMES through the
+// dataplane.DSCPValues SSOT (#3436). The pre-fix pass-through was wrong on two
+// counts that nft rejects atomically (failing the whole lo0 load) or that
+// silently stop the kernel mirror matching:
+//
+//   - Case: the commit gate (filterDSCPResolvable) and the userspace matcher
+//     (pkg/dataplane/userspace/filters.go, via strings.ToLower) accept names
+//     case-insensitively, so `from dscp EF` reaches here as "EF" — but nft's
+//     DSCP names are lowercase only, so `ip dscp EF` is a parse error.
+//   - Name coverage: xpf accepts `be` (best-effort) as a code point, but nft
+//     has NO `be` DSCP name at all — `ip dscp be` is unloadable.
+//
+// Resolving to the numeric value yields an unconditionally nft-safe token that
+// matches the SAME code point as userspace (which resolves the identical table).
+// A numeric 0..63 token passes through as-is. An unresolvable token is
+// unreachable for a committed config (filterDSCPResolvable gates it); it is
+// lower-cased as a best-effort fallback rather than emitted with stray case.
 func nftDSCPValue(name string) string {
-	// Junos and nftables use the same naming for standard DSCP values.
-	// Just pass through — nftables accepts ef, af11, af12, af13, af21,
-	// af22, af23, af31, af32, af33, af41, af42, af43, cs0-cs7.
-	return name
+	if val, ok := dataplane.DSCPValues[strings.ToLower(strings.TrimSpace(name))]; ok {
+		return strconv.Itoa(int(val))
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(name)); err == nil && v >= 0 && v <= 63 {
+		return strconv.Itoa(v)
+	}
+	return strings.ToLower(strings.TrimSpace(name))
 }
