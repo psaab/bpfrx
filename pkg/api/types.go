@@ -362,6 +362,12 @@ type MatchPoliciesResult struct {
 	// delivery; no transit global/default fallback), so Action is not a
 	// default-policy verdict for this case.
 	HostInboundUnmatched bool `json:"host_inbound_unmatched,omitempty"`
+	// DefaultUsed is true when no policy matched and Action is the configured
+	// default-policy verdict (#3375), including the no-active-config fail-closed
+	// case (deny). It is the typed form of the " (default)" suffix on Action, so
+	// a client can branch on the posture without string-parsing. False for a
+	// concrete policy match and for HostInboundUnmatched.
+	DefaultUsed bool `json:"default_used,omitempty"`
 }
 
 // ClearSessionsResult holds session clear results.

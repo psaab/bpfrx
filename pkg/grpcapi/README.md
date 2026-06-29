@@ -84,6 +84,22 @@ contract.
   `Manager.PolicySchedulerActiveState` the #3062 policy-detail display uses) so
   a scheduler-inactive policy is skipped like the runtime; with no live state
   scheduled policies are simulated as-if-active.
+- #3375: the response `action` is rendered through the shared SSOT
+  `policymatch.Result.DisplayAction()` for EVERY verdict, so the gRPC and REST
+  surfaces can never diverge. Before #3375 gRPC returned a BLANK `action` for
+  two security-sensitive verdicts where REST returned an explicit string: a
+  `to-zone junos-host` query that matched no host-bound policy (now
+  `policymatch.HostInboundActionString` — `host-inbound (local delivery; not
+  governed by transit/global/default policy)`, with `host_inbound_unmatched`
+  set), and the no-active-config case (now `deny (default)` instead of an empty
+  response). The response also gained a typed `default_used` bit — the
+  machine-readable form of the ` (default)` suffix on `action`, set when no
+  policy matched and `action` is the configured default-policy (including the
+  no-config fail-closed deny), and false for a concrete match and for
+  `host_inbound_unmatched` (which has no default-policy fallback). The REST
+  `MatchPoliciesResult` carries the same `default_used` JSON field. The CLI
+  `show security match-policies` renders its own multi-line, self-describing
+  host-inbound block, so it never showed a blank verdict and is unchanged.
 - The `test policy` operational command (local `pkg/cli` + remote `cmd/cli`
   → ShowText `test-policy:` topic → `showTestPolicy`) carries the same
   source-port input (#3107). The topic adds a `srcport=` key alongside the
