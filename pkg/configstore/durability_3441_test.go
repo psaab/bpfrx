@@ -2,6 +2,7 @@ package configstore
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,9 +86,92 @@ func TestAutoArchiveCapturesCommittedTreeNoOverwrite(t *testing.T) {
 	}
 }
 
+// TestWriteArchiveSameTimestampNoOverwrite pins the #3441 H4 Codex MAJOR
+// fix: two archives sharing the SAME wall-clock timestamp (the coarse-clock
+// / NTP-step-back collision the nanosecond format alone could not rule out)
+// must still produce TWO distinct files, because the monotonic seq is part
+// of the filename.
+//
+// RED on revert: with a ts-only filename both writes resolve to the same
+// path, so the second overwrites the first — len == 1 and the first config
+// is lost.
+func TestWriteArchiveSameTimestampNoOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	ts := time.Date(2026, 6, 28, 12, 0, 0, 123456789, time.UTC)
+
+	if err := writeArchive(dir, 10, "config-A\n", ts, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeArchive(dir, 10, "config-B\n", ts, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 2 {
+		t.Fatalf("same-timestamp archives must not overwrite: got %d files, want 2", len(ents))
+	}
+	contents := map[string]bool{}
+	for _, e := range ents {
+		d, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		contents[string(d)] = true
+	}
+	if !contents["config-A\n"] || !contents["config-B\n"] {
+		t.Errorf("an archive was overwritten despite the seq: contents=%v", contents)
+	}
+}
+
+// TestWriteArchivePrunesOldestByTimestampSeq verifies retention still prunes
+// the OLDEST archives with the new config-<ts>.<seq>.conf filename: the
+// lexical sort rotateArchives uses stays chronological because the timestamp
+// dominates and the zero-padded seq only breaks same-ts ties in commit order.
+func TestWriteArchivePrunesOldestByTimestampSeq(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		ts := base.Add(time.Duration(i) * time.Second)
+		if err := writeArchive(dir, 3, fmt.Sprintf("cfg-%d\n", i), ts, uint64(i+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 3 {
+		t.Fatalf("want 3 archives after prune (max=3), got %d", len(ents))
+	}
+	remain := map[string]bool{}
+	for _, e := range ents {
+		d, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		remain[strings.TrimSpace(string(d))] = true
+	}
+	for _, w := range []string{"cfg-2", "cfg-3", "cfg-4"} {
+		if !remain[w] {
+			t.Errorf("newest archive %q should be retained; remain=%v", w, remain)
+		}
+	}
+	for _, w := range []string{"cfg-0", "cfg-1"} {
+		if remain[w] {
+			t.Errorf("oldest archive %q should have been pruned; remain=%v", w, remain)
+		}
+	}
+}
+
 // TestRollbackSlotOneDurableAndDirSync pins the rollback-file durability
 // contract via the seam recorders: slot 1 (the immediate `rollback 1` target)
 // must be written with WriteFileDurable, and the directory must be fsync'd.
+// The recorders prove the call ROUTING (durable-vs-atomic + dir-sync); the
+// actual fsync syscalls are covered by pkg/fsatomic's own tests
+// (TestDurableFsyncsFileAndDir, TestSyncDir), so this need not re-assert them.
 //
 // RED on revert: downgrading slot 1 to WriteFileAtomic drops it from the
 // durable-write recorder; removing the trailing SyncDir clears syncedDir.

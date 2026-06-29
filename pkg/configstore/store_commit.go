@@ -123,8 +123,9 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 		}
 		data := s.active.Format()
 		ts := time.Now()
+		seq := s.archiveSeq.Add(1)
 		go func() {
-			if err := writeArchive(dir, max, data, ts); err != nil {
+			if err := writeArchive(dir, max, data, ts, seq); err != nil {
 				slog.Warn("auto-archive failed", "err", err)
 			}
 		}()

@@ -23038,3 +23038,14 @@ top.
 - **File(s)**: pkg/api/server.go, metrics.go, metrics_descriptors.go,
   health.go, daemon/daemon_run.go, pkg/api/metrics_persist_degraded_test.go,
   pkg/api/health_test.go, pkg/api/README.md
+
+## #3441 fold: unique archive filenames via monotonic seq (Codex MAJOR)
+- **Timestamp**: 2026-06-28
+- **Action**: ts-only archive filename could overwrite on same-nanosecond
+  commits (coarse clock / NTP step-back); ArchiveConfig also called
+  time.Now() after unlock. Added archiveSeq atomic.Uint64 per-store counter,
+  filename now config-<ts>.<seq:020d>.conf; capture ts+seq under the lock in
+  both the commit path and ArchiveConfig. New tests: same-timestamp →
+  2 distinct files (RED-on-revert vs ts-only) + prune-keeps-newest-N order.
+- **File(s)**: pkg/configstore/store.go, store_commit.go, store_persist.go,
+  durability_3441_test.go, README.md

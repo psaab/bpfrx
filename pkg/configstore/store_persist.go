@@ -277,31 +277,42 @@ func (s *Store) SetArchiveConfig(dir string, max int) {
 // written archive matches the config that was active at the call (#3441 H4),
 // then the actual write happens off-lock via writeArchive.
 func (s *Store) ArchiveConfig(archiveDir string, maxArchives int) error {
+	// Capture the text, timestamp AND the monotonic seq together under the
+	// lock (#3441 H4, Codex MAJOR): the previous code called time.Now()
+	// AFTER releasing the lock, an ordering race that could mislabel the
+	// archive relative to a concurrent commit. Capturing all three under
+	// the lock matches the commit path and keeps (ts,seq) consistent with
+	// the actual active-config snapshot.
 	s.mu.RLock()
 	data := s.active.Format()
+	ts := time.Now()
+	seq := s.archiveSeq.Add(1)
 	s.mu.RUnlock()
-	return writeArchive(archiveDir, maxArchives, data, time.Now())
+	return writeArchive(archiveDir, maxArchives, data, ts, seq)
 }
 
 // writeArchive writes the captured config text to a uniquely-named archive
-// file and rotates old archives. data and ts are immutable values captured
-// by the caller; writeArchive never reads shared store state, so it is safe
-// to call from the async auto-archive goroutine.
+// file and rotates old archives. data, ts and seq are immutable values
+// captured by the caller under the store lock; writeArchive never reads
+// shared store state, so it is safe to call from the async auto-archive
+// goroutine.
 //
-// #3441 H4: the filename carries a nanosecond-resolution timestamp
-// (config-YYYYMMDD-HHMMSS.nnnnnnnnn.conf). The previous second-resolution
-// name let two same-second commits resolve to the same path, so the later
-// atomic write silently overwrote the earlier archive. Nanosecond precision
-// makes each commit's archive a distinct, never-overwritten file while still
-// sorting chronologically for rotateArchives. (An alternative is an O_EXCL
-// open with a retry-on-EEXIST seq suffix; the per-commit nanosecond ts is
-// simpler and unique across process restarts too.)
-func writeArchive(archiveDir string, maxArchives int, data string, ts time.Time) error {
+// #3441 H4: the filename is config-<ts>.<seq>.conf — a
+// nanosecond-resolution timestamp PLUS a monotonic per-process sequence
+// number (Codex MAJOR fix). The timestamp alone is not a unique key: two
+// successive commits (serialized by the store mutex, so never concurrent)
+// can still format the SAME wall-clock nanosecond under a coarse clock or
+// an NTP step-back, and the later atomic write would overwrite the earlier
+// archive. The seq always advances, so the filename is unique even on an
+// identical timestamp. The ts is kept first so the lexical sort
+// rotateArchives uses stays chronological (ts dominates; the 20-digit
+// zero-padded seq only breaks same-ts ties, in monotonic commit order).
+func writeArchive(archiveDir string, maxArchives int, data string, ts time.Time, seq uint64) error {
 	if err := os.MkdirAll(archiveDir, 0755); err != nil {
 		return fmt.Errorf("create archive dir: %w", err)
 	}
 
-	filename := fmt.Sprintf("config-%s.conf", ts.Format("20060102-150405.000000000"))
+	filename := fmt.Sprintf("config-%s.%020d.conf", ts.Format("20060102-150405.000000000"), seq)
 	path := filepath.Join(archiveDir, filename)
 	// AtomicGeneratedConfig (#1894): archives are best-effort history
 	// copies — atomic so a crash never leaves a torn archive, but not

@@ -268,9 +268,15 @@ owned by the `journal/` subpackage.
   goroutine read `s.active.Format()` whenever it eventually ran (so a
   rapid second commit could make it archive the wrong tree) and named
   the file at second resolution (so two same-second commits overwrote
-  one another). The nanosecond filename
-  (`config-YYYYMMDD-HHMMSS.nnnnnnnnn.conf`) is unique per commit and
-  still sorts chronologically for rotation. The rollback/archive writers
+  one another). The filename
+  (`config-YYYYMMDD-HHMMSS.nnnnnnnnn.<seq>.conf`) carries a nanosecond
+  timestamp PLUS a monotonic per-process sequence number: the timestamp
+  alone is not unique (two serialized commits can format the same
+  nanosecond under a coarse clock or an NTP step-back), so the seq
+  guarantees no archive is ever overwritten while the leading timestamp
+  keeps rotation's lexical sort chronological. `ArchiveConfig` captures
+  the text, timestamp AND seq together under the lock (no after-unlock
+  `time.Now()` race). The rollback/archive writers
   route through package-var seams (`rbWriteFileDurable`,
   `rbWriteFileAtomic`, `rbSyncDir`, `rbRemove`) so tests can pin the
   durability call and inject failures (#1916 pattern).
