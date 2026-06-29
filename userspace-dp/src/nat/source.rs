@@ -183,6 +183,26 @@ impl SourceNatFlowKey {
     }
 }
 
+/// #3429: source-NAT `match application` protocol wildcard. 256 is outside the
+/// 0-255 protocol range so it never aliases protocol 0 (HOPOPT); a term carrying
+/// it matches any L4 protocol. The Go builder emits it for an application whose
+/// protocol token is empty/unresolvable. A reserved 0xFFFF sentinel (any value
+/// in 257..=65535 works) can never equal a real protocol and is not the
+/// wildcard, so a term carrying it matches nothing — the fail-closed marker the
+/// Go builder emits for a configured-but-unresolvable `match application`.
+pub(crate) const SOURCE_NAT_PROTO_ANY: u16 = 256;
+
+/// #3429: one resolved source-NAT `match application` term — an L4 protocol
+/// (IANA number, or `SOURCE_NAT_PROTO_ANY` for any) and optional inclusive
+/// destination-port ranges. The flow matches the term when its protocol equals
+/// `protocol` (or `protocol == SOURCE_NAT_PROTO_ANY`) AND, when `ports` is
+/// non-empty, its destination port falls in one of the ranges.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SourceNatAppTerm {
+    pub(crate) protocol: u16,
+    pub(crate) ports: Vec<(u16, u16)>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SourceNatRule {
     pub(crate) name: String,
@@ -211,6 +231,16 @@ pub(crate) struct SourceNatRule {
     /// constraint at all. Same fail-closed semantics as `source_constrained`,
     /// for the destination match set.
     pub(crate) destination_constrained: bool,
+    /// #3429: source-NAT `match destination-port` constraint as inclusive
+    /// (low, high) ranges. Empty = port-unconstrained (match any destination
+    /// port, the pre-#3429 behavior). Non-empty = the flow's destination port
+    /// MUST fall in one range or the rule does not match. Enforced in
+    /// `l4_matches`, before translation AND before an `off` exemption.
+    pub(crate) match_dst_ports: Vec<(u16, u16)>,
+    /// #3429: source-NAT `match application` constraint, pre-expanded by the Go
+    /// builder to (protocol, port-range) terms. Empty = app-unconstrained.
+    /// Non-empty = the flow MUST satisfy one term. Enforced in `l4_matches`.
+    pub(crate) match_apps: Vec<SourceNatAppTerm>,
     pub(crate) interface_mode: bool,
     pub(crate) off: bool,
     pub(crate) pool_name: String,
@@ -284,6 +314,39 @@ impl SourceNatRule {
         true
     }
 
+    /// #3429: does the flow satisfy this rule's L4 `match destination-port` /
+    /// `match application` constraints? An empty constraint set is a wildcard
+    /// (unchanged match-any behavior). A non-empty set is AND-ed across the two
+    /// kinds (destination-port AND application), mirroring Junos.
+    ///
+    /// `protocol == 0` is the synthetic "L4 tuple unknown" sentinel used by the
+    /// address-only `match_source_nat` callers: a rule that carries ANY L4
+    /// constraint cannot be satisfied by an unknown tuple, so it fails closed
+    /// (an L4-scoped rule must never fire on traffic whose port/protocol the
+    /// caller could not supply). An unconstrained rule is unaffected.
+    fn l4_matches(&self, protocol: u8, dst_port: u16) -> bool {
+        if self.match_dst_ports.is_empty() && self.match_apps.is_empty() {
+            return true;
+        }
+        if protocol == 0 {
+            return false;
+        }
+        if !self.match_dst_ports.is_empty() && !port_in_ranges(dst_port, &self.match_dst_ports) {
+            return false;
+        }
+        if !self.match_apps.is_empty() {
+            let proto16 = protocol as u16;
+            let ok = self.match_apps.iter().any(|t| {
+                (t.protocol == SOURCE_NAT_PROTO_ANY || t.protocol == proto16)
+                    && (t.ports.is_empty() || port_in_ranges(dst_port, &t.ports))
+            });
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
     fn matches(
         &self,
         scope: &NatScopeCtx,
@@ -291,6 +354,8 @@ impl SourceNatRule {
         to_zone: &str,
         src_ip: IpAddr,
         dst_ip: IpAddr,
+        protocol: u8,
+        dst_port: u16,
     ) -> bool {
         if !self.from_zone.is_empty() && self.from_zone != from_zone {
             return false;
@@ -299,6 +364,9 @@ impl SourceNatRule {
             return false;
         }
         if !self.scope_matches(scope) {
+            return false;
+        }
+        if !self.l4_matches(protocol, dst_port) {
             return false;
         }
         match (src_ip, dst_ip) {
@@ -464,6 +532,27 @@ pub(crate) fn parse_source_nat_rules_with_previous(
         }
         for prefix in &snap.destination_addresses {
             parse_match_prefix(prefix, &mut rule.destination_v4, &mut rule.destination_v6);
+        }
+        // #3429: source-NAT L4 match constraints. `match destination-port`
+        // ranges and the pre-expanded `match application` terms. A range with
+        // low > high is dropped (never matches anything anyway); an empty list
+        // leaves the rule unconstrained on that axis.
+        for r in &snap.match_destination_ports {
+            if r.low <= r.high {
+                rule.match_dst_ports.push((r.low, r.high));
+            }
+        }
+        for term in &snap.match_applications {
+            let mut ports = Vec::with_capacity(term.ports.len());
+            for r in &term.ports {
+                if r.low <= r.high {
+                    ports.push((r.low, r.high));
+                }
+            }
+            rule.match_apps.push(SourceNatAppTerm {
+                protocol: term.protocol,
+                ports,
+            });
         }
         // Parse pool addresses and port range for pool-mode SNAT.
         let mut invalid_pool_address = false;
@@ -690,7 +779,9 @@ pub(crate) fn match_source_nat_result_for_tuple(
         dst_port,
     };
     for rule in rules {
-        if !rule.matches(scope, from_zone, to_zone, src_ip, dst_ip) {
+        if !rule.matches(
+            scope, from_zone, to_zone, src_ip, dst_ip, protocol, dst_port,
+        ) {
             continue;
         }
         if rule.off {
@@ -906,6 +997,11 @@ fn parse_match_prefix(prefix: &str, v4: &mut Vec<PrefixV4>, v6: &mut Vec<PrefixV
             Err(_) => {}
         },
     }
+}
+
+/// #3429: is `port` within any inclusive (low, high) range in `ranges`?
+fn port_in_ranges(port: u16, ranges: &[(u16, u16)]) -> bool {
+    ranges.iter().any(|&(lo, hi)| port >= lo && port <= hi)
 }
 
 /// #2398: match a v4 IP against a rule's match set.

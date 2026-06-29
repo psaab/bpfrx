@@ -3,9 +3,11 @@ package userspace
 import (
 	"log/slog"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 )
@@ -213,6 +215,16 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 					}
 				}
 			}
+			// #3429: carry the source-NAT L4 match constraints to the
+			// dataplane. `match destination-port` becomes a set of inclusive
+			// port ranges; `match application` is pre-expanded to (protocol,
+			// port-range) terms (an application-set yields one term per resolved
+			// member). The Rust matcher enforces these before translating AND
+			// before applying a `then source-nat off` exemption, so a
+			// port/app-scoped rule no longer silently widens to every port.
+			matchDestPorts := coalescePortRanges(rule.Match.DestinationPorts)
+			matchApps := buildSourceNATAppTerms(cfg, rule.Match.Application)
+
 			out = append(out, SourceNATRuleSnapshot{
 				Name:                             rule.Name,
 				FromZone:                         rs.FromZone,
@@ -236,11 +248,119 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 				PersistentNATInactivityTimeout:   persistentNATInactivityTimeout,
 				PoolUnusable:                     poolUnusable,
 				PoolUnusableReason:               poolUnusableReason,
+				MatchDestinationPorts:            matchDestPorts,
+				MatchApplications:                matchApps,
 				CounterID:                        natCounterID(natCounterIDs, dataplane.NATCounterTypeSource, rs.Name, rule.Name),
 			})
 		}
 	}
 	return out
+}
+
+// natProtoAny is the source-NAT match-term protocol wildcard, mirroring the
+// Rust PROTO_ANY (256): outside the 0-255 protocol range so it never aliases
+// protocol 0 (HOPOPT). #3429.
+const natProtoAny uint16 = 256
+
+// natProtoNever is a reserved protocol sentinel that can never equal a real
+// 0-255 protocol and is not the wildcard, so a term carrying it matches no flow
+// (#3429). Emitted for a `match application` that was configured but resolved to
+// ZERO terms (a typo / dangling reference / empty application-set) so the rule
+// fails CLOSED — it matches nothing — rather than silently widening to every
+// protocol/port. The commit-time strict gate (#2187) rejects the typo so this
+// is only the lenient load / peer-sync backstop.
+const natProtoNever uint16 = 0xFFFF
+
+// coalescePortRanges collapses a list of individual L4 ports (the expanded
+// output of parseDNATPortList / appPortsFromSpec) into a minimal set of
+// inclusive [Low,High] wire ranges (#3429). Anything outside the valid
+// 1..65535 range is dropped (fail closed — a bad/wrapping value never becomes a
+// wrong u16 match). The result is sorted, deduplicated, and run-merged so a
+// `destination-port 20000 to 20003` carries one range, not four entries.
+func coalescePortRanges(ports []int) []NatPortRangeWire {
+	if len(ports) == 0 {
+		return nil
+	}
+	seen := make(map[int]struct{}, len(ports))
+	uniq := make([]int, 0, len(ports))
+	for _, p := range ports {
+		if p < 1 || p > 65535 {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		uniq = append(uniq, p)
+	}
+	if len(uniq) == 0 {
+		return nil
+	}
+	sort.Ints(uniq)
+	var ranges []NatPortRangeWire
+	lo, hi := uniq[0], uniq[0]
+	for _, p := range uniq[1:] {
+		if p == hi+1 {
+			hi = p
+			continue
+		}
+		ranges = append(ranges, NatPortRangeWire{Low: uint16(lo), High: uint16(hi)})
+		lo, hi = p, p
+	}
+	ranges = append(ranges, NatPortRangeWire{Low: uint16(lo), High: uint16(hi)})
+	return ranges
+}
+
+// natAppProtoNumber resolves an application's protocol token to its IANA number
+// for the source-NAT match wire, returning natProtoAny when the token is empty
+// or unresolvable (#3429). A concrete number — including 0 (HOPOPT) — is
+// honored. Mirrors the appid SSOT (appid.ProtocolNumber) the policy path uses.
+func natAppProtoNumber(proto string) uint16 {
+	if n, ok := appid.ProtocolNumber(proto); ok {
+		return uint16(n)
+	}
+	return natProtoAny
+}
+
+// buildSourceNATAppTerms resolves a source-NAT `match application <name>` into
+// (protocol, destination-port range) terms for the dataplane match (#3429). A
+// single user/predefined application yields one term; an application-set yields
+// one term per resolved member. The empty name (or "any") is unconstrained and
+// yields no terms. A term's Ports are the application's destination-port spec
+// coalesced to ranges; an application with no destination port leaves Ports
+// empty (protocol-only match). A configured-but-unresolvable reference yields a
+// single never-match term so the rule fails closed (see natProtoNever).
+func buildSourceNATAppTerms(cfg *config.Config, appName string) []NatAppTermWire {
+	if cfg == nil || appName == "" || appName == "any" {
+		return nil
+	}
+	userApps := cfg.Applications.Applications
+	var terms []NatAppTermWire
+	addApp := func(a *config.Application) {
+		if a == nil {
+			return
+		}
+		terms = append(terms, NatAppTermWire{
+			Protocol: natAppProtoNumber(a.Protocol),
+			Ports:    coalescePortRanges(appPortsFromSpec(a.DestinationPort)),
+		})
+	}
+	if app, found := config.ResolveApplication(appName, userApps); found {
+		addApp(app)
+	} else if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
+		if expanded, err := config.ExpandApplicationSet(appName, &cfg.Applications); err == nil {
+			for _, termName := range expanded {
+				if a, ok := config.ResolveApplication(termName, userApps); ok {
+					addApp(a)
+				}
+			}
+		}
+	}
+	if len(terms) == 0 {
+		// Configured app reference that resolved to nothing -> fail closed.
+		terms = []NatAppTermWire{{Protocol: natProtoNever}}
+	}
+	return terms
 }
 
 func sourceNATPoolPortRange(pool *config.NATPool) (uint16, uint16, bool) {

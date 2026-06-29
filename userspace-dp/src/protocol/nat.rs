@@ -4,6 +4,27 @@
 
 use serde::{Deserialize, Serialize};
 
+/// #3429: one inclusive [low,high] L4 destination-port range on the source-NAT
+/// match wire. A single port is `low == high`. Mirrors the Go NatPortRangeWire.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct NatPortRangeWire {
+    #[serde(default)]
+    pub low: u16,
+    #[serde(default)]
+    pub high: u16,
+}
+
+/// #3429: one resolved source-NAT `match application` term — an L4 protocol
+/// (IANA number; 256 = any, 0xFFFF = never/fail-closed sentinel) and optional
+/// destination-port ranges. Mirrors the Go NatAppTermWire.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct NatAppTermWire {
+    #[serde(default)]
+    pub protocol: u16,
+    #[serde(default)]
+    pub ports: Vec<NatPortRangeWire>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(crate) struct SourceNATRuleSnapshot {
     pub name: String,
@@ -69,6 +90,22 @@ pub(crate) struct SourceNATRuleSnapshot {
     pub pool_unusable: bool,
     #[serde(rename = "pool_unusable_reason", default)]
     pub pool_unusable_reason: String,
+    /// #3429: source-NAT `match destination-port` constraint as inclusive
+    /// [low,high] ranges. Empty = port-unconstrained (match any port). A
+    /// non-empty set requires the flow's destination port to fall in one of the
+    /// ranges, otherwise the rule does NOT match — so a port-scoped SNAT
+    /// (including a `then source-nat off` exemption) no longer silently widens
+    /// to every port. Additive wire field (#1961): an older control plane omits
+    /// it; this helper defaults it empty (the pre-#3429 over-match).
+    #[serde(rename = "match_destination_ports", default)]
+    pub match_destination_ports: Vec<NatPortRangeWire>,
+    /// #3429: source-NAT `match application` constraint, pre-expanded by the Go
+    /// builder to (protocol, destination-port range) terms (an application-set
+    /// expands to one term per resolved member). Empty = unconstrained. A
+    /// non-empty set requires the flow's protocol/destination port to satisfy
+    /// one term. Additive wire field, same skew semantics.
+    #[serde(rename = "match_applications", default)]
+    pub match_applications: Vec<NatAppTermWire>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
