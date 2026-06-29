@@ -1,3 +1,19 @@
+## 2026-06-28 — #3404 policy-ID namespace exact-256 off-by-one (>= → >)
+
+- **Timestamp**: 2026-06-28
+- **Action**: Fixed the off-by-one in the MaxRulesPerPolicy namespace guard.
+  `walkPolicyRuleSlots` (zone-pair + global) and the legacy `compiler.go`
+  mirror used `>=`, rejecting a policy set that exactly fills its 256-slot
+  namespace (indices 0..255) though every ID stays in-namespace. Changed to
+  `>` so exactly 256 rules arm and only the 257th (index 256) is rejected.
+  Corrected the walkPolicyRuleSlots doc comment + docs/feature-gaps.md, and
+  added exact-256-accept / 257-reject / no-cross-set-collision boundary tests
+  for both the userspace and legacy paths (RED-on-revert verified).
+- **File(s)**: pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/policy_namespace_3143_3145_test.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/compiler_test.go,
+  docs/feature-gaps.md
+
 ## 2026-06-28 — #3392 lo0 nftables apply/delete fail-closed (sibling of #3333)
 
 - **Timestamp**: 2026-06-28
