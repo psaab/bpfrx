@@ -175,7 +175,20 @@ inspect or rewrite a packet sitting in a UMEM frame.
   `parse_session_flow_from_bytes` discards `meta_flow` for a non-query ICMP
   type (`meta_icmp_identifier_bearing`, type byte read from the frame bounded
   by `declared_end`, fail-closed on truncation) so the packet stays flowless
-  on the metadata path too.
+  on the metadata path too. `meta_icmp_identifier_bearing` requires the FULL
+  identifier range `[l4..l4+6)` inside `declared_end` — frame-equivalent to
+  `parse_flow_ports` (a query packet truncated between the type byte and the
+  identifier fails closed, not just the type byte). **All THREE metadata
+  consumers gate identically** so the shim's ungated pseudo-port can never
+  reach a session/flow key: (1) the conntrack-side
+  `parse_session_flow_from_bytes`; (2) the immediate
+  `build_live_forward_request_from_frame` TX/CoS meta-fallback
+  (`afxdp/forward_request.rs`); and (3) the pending-neighbor buffering
+  fallback (`afxdp/neighbor_dispatch.rs::pending_neigh_flow_key`, used at the
+  `MissingNeighbor` handler in `poll_descriptor`) — a non-query ICMP packet
+  whose next-hop is unresolved buffers `flow_key = None`, so
+  `retry_pending_neigh` flushes it to the interface default queue with no
+  output-filter eval.
 - **TCP inspection helpers are ext-header-aware (#2148)**: the read-only
   diagnostic/telemetry helpers `frame_has_tcp_rst`,
   `extract_tcp_flags_and_window`, and `extract_tcp_window` (`tcp.rs`) all

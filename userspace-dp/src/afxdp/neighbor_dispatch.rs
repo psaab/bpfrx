@@ -113,6 +113,45 @@ pub(super) fn record_pending_neigh_admission_drop(
     }
 }
 
+/// The flow key stored on a buffered `PendingNeighPacket` (next-hop
+/// unresolved). `retry_pending_neigh` later feeds this key into CoS / TX
+/// output-filter classification (`resolve_cos_tx_selection_at`) and the
+/// prepared TX request, so a fabricated tuple here misclassifies the flushed
+/// packet exactly like the immediate forward path would.
+///
+/// Precedence (highest first), behavior-identical to the inline closure it
+/// replaces:
+///   1. a real conntrack/frame-derived `flow` → its `forward_key`;
+///   2. otherwise, the metadata fallback — but gated:
+///      - a non-first IP fragment (#2344/#2357) → `None` (no L4 header);
+///      - a non-identifier-bearing ICMP/ICMPv6 packet (#3290 — error /
+///        control / ND/MLD / truncated query) → `None`. The XDP shim stamps
+///        `meta.flow_src_port` from bytes [l4+4..l4+6] for EVERY ICMP type
+///        with no query-type gate, so trusting it here would buffer a fake
+///        pseudo-port. This is the SAME gate the conntrack-side
+///        `parse_session_flow_from_bytes` and the immediate
+///        `build_live_forward_request_from_frame` meta-fallback apply, keeping
+///        all three pending/immediate/conntrack paths consistent;
+///      - otherwise the metadata tuple (legitimate flowless TCP/UDP or an
+///        identifier-bearing ICMP query) → its `forward_key`.
+pub(super) fn pending_neigh_flow_key(
+    flow: Option<&SessionFlow>,
+    raw_frame: &[u8],
+    meta: UserspaceDpMeta,
+) -> Option<SessionKey> {
+    flow.map(|flow| flow.forward_key.clone()).or_else(|| {
+        if frame_is_non_first_fragment(raw_frame, meta) {
+            None
+        } else if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
+            && !meta_icmp_identifier_bearing(raw_frame, meta)
+        {
+            None
+        } else {
+            parse_session_flow_from_meta(meta).map(|flow| flow.forward_key)
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn retry_pending_neigh(
     binding: &mut BindingWorker,
@@ -1263,5 +1302,86 @@ mod pending_admission_tests {
             1
         );
         assert_eq!(live.pending_neigh_capacity_drops.load(Ordering::Relaxed), 4);
+    }
+}
+
+#[cfg(test)]
+mod pending_neigh_flow_key_tests {
+    use super::*;
+
+    /// Full (non-fragment) IPv4 ICMP frame: eth(14) + IPv4(20, proto=ICMP) +
+    /// 8-byte ICMP header of the given type. `total_len` covers the ICMP
+    /// header so the type byte and the [l4+4..l4+6] word both lie inside the
+    /// declared datagram. Bytes [l4+4..l4+6] are 0xBEEF — the ungated
+    /// pseudo source port the shim stamps for every ICMP type.
+    fn eth_ipv4_icmp_frame(icmp_type: u8) -> Vec<u8> {
+        let mut f = vec![
+            0x02, 0xbf, 0x72, 0x00, 0x80, 0x08, 0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5, 0x08, 0x00,
+        ];
+        let icmp = [icmp_type, 0x00, 0x00, 0x00, 0xbe, 0xef, 0x00, 0x01];
+        let mut ip = vec![0u8; 20];
+        ip[0] = 0x45;
+        let total = (20 + icmp.len()) as u16;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip[8] = 64; // ttl
+        ip[9] = PROTO_ICMP;
+        ip[12..16].copy_from_slice(&[10, 0, 61, 100]); // src
+        ip[16..20].copy_from_slice(&[172, 16, 80, 200]); // dst
+        f.extend_from_slice(&ip);
+        f.extend_from_slice(&icmp);
+        f
+    }
+
+    fn hostile_meta(protocol: u8) -> UserspaceDpMeta {
+        UserspaceDpMeta {
+            addr_family: libc::AF_INET as u8,
+            protocol,
+            l3_offset: 14,
+            l4_offset: 34,
+            flow_src_port: 0xBEEF,
+            flow_dst_port: 0,
+            flow_src_addr: [10, 0, 61, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            flow_dst_addr: [172, 16, 80, 200, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            ..UserspaceDpMeta::default()
+        }
+    }
+
+    #[test]
+    fn control_icmp_buffers_no_synthesized_flow_key() {
+        // #3290 (pending-neigh path): a non-query ICMPv4 control packet
+        // (Time-Exceeded) whose next-hop is UNRESOLVED must NOT buffer the
+        // shim's fake pseudo-port as PendingNeighPacket.flow_key. The primary
+        // flow is None for these packets (conntrack-side #3290 gate); the
+        // metadata fallback must therefore also yield None so retry_pending_neigh
+        // feeds None into CoS/TX. Reverting the ICMP gate makes the fallback
+        // synthesize Some(src_port=0xBEEF) -> RED.
+        let frame = eth_ipv4_icmp_frame(11);
+        assert_eq!(
+            pending_neigh_flow_key(None, &frame, hostile_meta(PROTO_ICMP)),
+            None,
+            "control ICMP must buffer no metadata-derived pending flow key"
+        );
+    }
+
+    #[test]
+    fn echo_icmp_keeps_identifier_pending_flow_key() {
+        // Identifier-bearing query (Echo Request) keeps its meta tuple — the
+        // gate must not over-suppress legitimate query flows.
+        let frame = eth_ipv4_icmp_frame(8);
+        let key = pending_neigh_flow_key(None, &frame, hostile_meta(PROTO_ICMP))
+            .expect("ICMP echo keeps its identifier pending flow key");
+        assert_eq!(key.src_port, 0xBEEF);
+        assert_eq!(key.dst_port, 0);
+    }
+
+    #[test]
+    fn flowless_tcp_keeps_meta_pending_flow_key() {
+        // The ICMP gate is protocol-scoped: a flowless TCP packet still buffers
+        // its real meta-derived ports (no behavior change for TCP/UDP). The
+        // frame bytes are irrelevant here — the TCP meta path reads only meta.
+        let frame = eth_ipv4_icmp_frame(8);
+        let key = pending_neigh_flow_key(None, &frame, hostile_meta(PROTO_TCP))
+            .expect("flowless TCP keeps its meta pending flow key");
+        assert_eq!(key.src_port, 0xBEEF);
     }
 }
