@@ -97,6 +97,75 @@ func TestCollectPolicyCountersCountsReadErrors(t *testing.T) {
 	}
 }
 
+// filterErrAPIDP fails the filter reads. cfgErr selects whether the
+// ReadFilterConfig (gate) or ReadFilterCounters (per-term) read fails.
+type filterErrAPIDP struct {
+	*dataplane.Manager
+	apply  *dataplane.ApplyResult
+	cfgErr bool
+}
+
+func (d *filterErrAPIDP) IsLoaded() bool                          { return true }
+func (d *filterErrAPIDP) LastApplyResult() *dataplane.ApplyResult { return d.apply }
+func (d *filterErrAPIDP) ReadFilterConfig(uint32) (dataplane.FilterConfig, error) {
+	if d.cfgErr {
+		return dataplane.FilterConfig{}, errors.New("counter bridge degraded")
+	}
+	return dataplane.FilterConfig{RuleStart: 0}, nil
+}
+func (d *filterErrAPIDP) ReadFilterCounters(uint32) (dataplane.CounterValue, error) {
+	return dataplane.CounterValue{}, errors.New("counter bridge degraded")
+}
+
+func filterApplyResult() *dataplane.ApplyResult {
+	return &dataplane.ApplyResult{FilterIDs: map[string]uint32{"inet:fin": 0, "inet6:fin6": 100}}
+}
+
+func countFilterSamples(t *testing.T, c *xpfCollector, dp apiRuntimeDataPlane) int {
+	t.Helper()
+	ch := make(chan prometheus.Metric, 64)
+	c.collectFilterCounters(ch, dp)
+	close(ch)
+	var n int
+	for m := range ch {
+		if strings.Contains(m.Desc().String(), "xpf_filter_hits_total") {
+			n++
+		}
+	}
+	return n
+}
+
+// MAJOR pin: on a ReadFilterCounters failure the collector must SKIP the
+// xpf_filter_hits_total sample (a missing sample, not a stale 0) AND bump
+// counterReadErrors — matching the zone/policy collectors.
+// FAIL-ON-REVERT: dropping the `if termFailed { continue }` makes the sample
+// emit and `emitted != 0` goes RED.
+func TestCollectFilterCountersSkipsSampleOnCounterReadError(t *testing.T) {
+	c := newCollector(&Server{store: newDescriptorCoverageStore(t)})
+	dp := &filterErrAPIDP{Manager: dataplane.New(), apply: filterApplyResult()}
+
+	emitted := countFilterSamples(t, c, dp)
+	if emitted != 0 {
+		t.Errorf("collectFilterCounters emitted %d filter samples on ReadFilterCounters failure; want 0 (skip on error)", emitted)
+	}
+	if c.counterReadErrors.Load() == 0 {
+		t.Error("counterReadErrors not bumped on a filter counter read failure")
+	}
+}
+
+func TestCollectFilterCountersSkipsSampleOnConfigReadError(t *testing.T) {
+	c := newCollector(&Server{store: newDescriptorCoverageStore(t)})
+	dp := &filterErrAPIDP{Manager: dataplane.New(), apply: filterApplyResult(), cfgErr: true}
+
+	emitted := countFilterSamples(t, c, dp)
+	if emitted != 0 {
+		t.Errorf("collectFilterCounters emitted %d filter samples on ReadFilterConfig failure; want 0", emitted)
+	}
+	if c.counterReadErrors.Load() == 0 {
+		t.Error("counterReadErrors not bumped on a filter config read failure")
+	}
+}
+
 func TestCollectZoneCountersCountsReadErrors(t *testing.T) {
 	srv := &Server{store: newDescriptorCoverageStore(t)}
 	c := newCollector(srv)

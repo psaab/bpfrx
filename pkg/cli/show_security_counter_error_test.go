@@ -249,6 +249,95 @@ func TestShowPoliciesHitCountWarnsOnCounterReadError(t *testing.T) {
 	}
 }
 
+// textErrCLIDP fails per-zone / per-policy / filter / flood reads (filter
+// config read succeeds so the per-term read is reached) and supplies an apply
+// result so zone/flood/filter renderers resolve their IDs.
+type textErrCLIDP struct {
+	dataplane.DataPlane
+	apply *dataplane.ApplyResult
+}
+
+func (d *textErrCLIDP) IsLoaded() bool                          { return true }
+func (d *textErrCLIDP) LastApplyResult() *dataplane.ApplyResult { return d.apply }
+func (d *textErrCLIDP) ReadPolicyCounters(uint32) (dataplane.CounterValue, error) {
+	return dataplane.CounterValue{}, errors.New("counter bridge degraded")
+}
+func (d *textErrCLIDP) ReadZoneCounters(uint16, int) (dataplane.CounterValue, error) {
+	return dataplane.CounterValue{}, errors.New("counter bridge degraded")
+}
+func (d *textErrCLIDP) ReadFloodCounters(uint16) (dataplane.FloodState, error) {
+	return dataplane.FloodState{}, errors.New("counter bridge degraded")
+}
+func (d *textErrCLIDP) ReadFilterConfig(uint32) (dataplane.FilterConfig, error) {
+	return dataplane.FilterConfig{RuleStart: 0}, nil
+}
+func (d *textErrCLIDP) ReadFilterCounters(uint32) (dataplane.CounterValue, error) {
+	return dataplane.CounterValue{}, errors.New("counter bridge degraded")
+}
+
+func TestShowPoliciesBriefWarnsOnCounterReadError(t *testing.T) {
+	c := &CLI{store: newPolicyHitCountCLIStore(t, true), dp: &textErrCLIDP{}}
+
+	out := captureStdout(t, func() {
+		if err := c.handleShowSecurity([]string{"policies", "brief"}); err != nil {
+			t.Fatalf("handleShowSecurity(policies brief) error = %v", err)
+		}
+	})
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("policies brief lacks a counter-read warning; got:\n%s", out)
+	}
+}
+
+func TestShowZonesDisplayWarnsOnCounterReadError(t *testing.T) {
+	store := newPolicyHitCountCLIStore(t, true) // has trust/untrust zones
+	c := &CLI{store: store, dp: &textErrCLIDP{
+		apply: &dataplane.ApplyResult{ZoneIDs: map[string]uint16{"trust": 1, "untrust": 2}},
+	}}
+
+	out := captureStdout(t, func() {
+		if err := c.showZonesDisplay(store.ActiveConfig(), false, ""); err != nil {
+			t.Fatalf("showZonesDisplay() error = %v", err)
+		}
+	})
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("showZonesDisplay lacks a zone counter-read warning; got:\n%s", out)
+	}
+}
+
+func TestShowFirewallFiltersWarnsOnCounterReadError(t *testing.T) {
+	store := newFirewallFilterTestStore(t)
+	c := &CLI{store: store, dp: &textErrCLIDP{
+		apply: &dataplane.ApplyResult{FilterIDs: map[string]uint32{
+			"inet:bandwidth-output": 0, "inet6:bandwidth-output": 100,
+		}},
+	}}
+
+	out := captureStdout(t, func() {
+		if err := c.showFirewallFilters(); err != nil {
+			t.Fatalf("showFirewallFilters() error = %v", err)
+		}
+	})
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("showFirewallFilters lacks a filter counter-read warning; got:\n%s", out)
+	}
+}
+
+func TestShowScreenStatisticsAllWarnsOnCounterReadError(t *testing.T) {
+	store := screenProfileStore(t) // has untrust zone + screen profile
+	c := &CLI{store: store, dp: &textErrCLIDP{
+		apply: &dataplane.ApplyResult{ZoneIDs: map[string]uint16{"untrust": 1}},
+	}}
+
+	out := captureStdout(t, func() {
+		if err := c.showScreenStatisticsAll(); err != nil {
+			t.Fatalf("showScreenStatisticsAll() error = %v", err)
+		}
+	})
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("showScreenStatisticsAll lacks a flood counter-read warning; got:\n%s", out)
+	}
+}
+
 // showNATSource previously OMITTED the NAT alloc-fail line on a read error
 // (acceptable — no stale 0 — but indistinguishable from "no failures"). It now
 // emits an explicit warning. FAIL-ON-REVERT: dropping the else branch removes

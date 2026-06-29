@@ -22904,3 +22904,16 @@ top.
     pkg/cli/cli_show_security_zones.go, pkg/cli/cli_show_security_screen.go,
     pkg/cli/cli_show_security_filters.go, pkg/cli/cli_show_nat.go,
     pkg/cli/show_security_counter_error_test.go, pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3345/#3408 fold round 5 (Codex final) — MAJOR: Prometheus
+    collectFilterCounters must SKIP the xpf_filter_hits_total sample on a
+    filter read error (was bumping counterReadErrors but still emitting a
+    stale 0). Fixed with a termFailed gate (continue before emit; ruleOffset
+    still advances). MINORS: added the 8 missing RED-on-revert tests for the
+    newly-added per-zone/per-policy/filter/flood sites across Prometheus,
+    gRPC text, and CLI text surfaces.
+  - **File(s)**: pkg/api/metrics_counters.go,
+    pkg/api/zones_policies_counter_error_test.go,
+    pkg/grpcapi/text_filter_flood_counter_error_test.go,
+    pkg/cli/show_security_counter_error_test.go, _Log.md

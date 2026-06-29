@@ -228,16 +228,25 @@ func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp api
 				}
 				numRules := uint32(nSrc * nDst)
 				var totalPkts uint64
+				termFailed := false
 				for i := uint32(0); i < numRules; i++ {
 					if ctrs, err := dp.ReadFilterCounters(ruleOffset + i); err == nil {
 						totalPkts += ctrs.Packets
 					} else {
 						c.counterReadErrors.Add(1)
+						termFailed = true
 					}
+				}
+				// Advance the offset regardless so later terms stay aligned.
+				ruleOffset += numRules
+				// #3408: on a read failure SKIP this term's sample (a missing
+				// sample, not a stale/partial 0) — matching the zone/policy
+				// collectors — and rely on the bumped counterReadErrors signal.
+				if termFailed {
+					continue
 				}
 				ch <- prometheus.MustNewConstMetric(c.filterHitsTotal, prometheus.CounterValue,
 					float64(totalPkts), name, family, term.Name)
-				ruleOffset += numRules
 			}
 		}
 	}
