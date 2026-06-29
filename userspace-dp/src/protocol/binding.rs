@@ -417,6 +417,16 @@ pub(crate) struct BindingStatus {
     pub host_inbound_denied_packets: u64,
     #[serde(rename = "screen_drops", default)]
     pub screen_drops: u64,
+    /// #3343: per-screen-reason DROP counters. One u64 per published ordinal
+    /// (see `screen::screen_reason_drop_index` / Go
+    /// `pkg/dataplane.ScreenReasonCounters`). The Go control plane sums these
+    /// across bindings and pushes each ordinal into its `GlobalCtrScreen*`
+    /// global counter so `show security screen-statistics` / alarms / gRPC /
+    /// REST / Prometheus attribute drops to a specific screen check instead of
+    /// reading a permanent 0. Serialized unconditionally (no skip) so the wire
+    /// key is stable.
+    #[serde(rename = "screen_reason_drops", default)]
+    pub screen_reason_drops: [u64; crate::screen::SCREEN_REASON_DROP_COUNT],
     #[serde(rename = "syn_cookie_challenges", default)]
     pub syn_cookie_challenges: u64,
     #[serde(rename = "syn_cookie_secret_unavailable", default)]

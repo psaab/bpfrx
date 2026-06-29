@@ -357,6 +357,13 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// counter reflected. Mirrored into `GlobalCtrHostInboundDeny` (Go side).
     pub(super) host_inbound_denied_packets: AtomicU64,
     pub(super) screen_drops: AtomicU64,
+    /// #3343: per-screen-reason DROP counters, indexed by
+    /// `screen::screen_reason_drop_index`. Snapshotted into
+    /// `BindingLiveSnapshot.screen_reason_drops` and surfaced on the wire as
+    /// `BindingStatus.screen_reason_drops`, where the Go control plane pushes
+    /// each ordinal into its `GlobalCtrScreen*` global counter so the
+    /// per-reason screen-statistics rows stop reading a permanent 0.
+    pub(super) screen_reason_drops: [AtomicU64; crate::screen::SCREEN_REASON_DROP_COUNT],
     /// #1374: SYN-cookie challenge decisions selected by the screen runtime.
     pub(super) syn_cookie_challenges: AtomicU64,
     /// #1374: SYN-cookie mode crossed the threshold but no HA-safe master key
@@ -795,6 +802,8 @@ impl BindingLiveState {
             policy_denied_packets: AtomicU64::new(0),
             host_inbound_denied_packets: AtomicU64::new(0),
             screen_drops: AtomicU64::new(0),
+            // #3343: one atomic per published screen-reason drop ordinal.
+            screen_reason_drops: std::array::from_fn(|_| AtomicU64::new(0)),
             syn_cookie_challenges: AtomicU64::new(0),
             syn_cookie_secret_unavailable: AtomicU64::new(0),
             syn_cookie_syn_ack_sent: AtomicU64::new(0),

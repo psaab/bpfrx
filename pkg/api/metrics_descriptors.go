@@ -45,6 +45,16 @@ func newCollector(srv *Server) *xpfCollector {
 			"Total packets dropped by screen/IDS checks.",
 			nil, nil,
 		),
+		// #3343: per-reason breakdown of screen/IDS drops. The aggregate
+		// xpf_screen_drops_total cannot attribute a drop to a specific screen
+		// check; this labeled series can (reason = syn-flood, port-scan,
+		// session-limit, ...). Each reason maps to a dataplane.GlobalCtrScreen*
+		// counter now populated by the userspace counter bridge (#3343).
+		screenDropsByReasonTotal: prometheus.NewDesc(
+			"xpf_screen_drops_by_reason_total",
+			"Total packets dropped by screen/IDS checks, by reason.",
+			[]string{"reason"}, nil,
+		),
 		policyDeniesTotal: prometheus.NewDesc(
 			"xpf_policy_denies_total",
 			"Total packets denied by policy.",

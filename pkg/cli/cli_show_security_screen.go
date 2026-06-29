@@ -82,27 +82,14 @@ func (c *CLI) showScreen() error {
 		fmt.Printf("Total screen drops: %d\n", totalDrops)
 
 		if totalDrops > 0 {
-			screenCounters := []struct {
-				idx  uint32
-				name string
-			}{
-				{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
-				{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
-				{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
-				{dataplane.GlobalCtrScreenLandAttack, "LAND attack"},
-				{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
-				{dataplane.GlobalCtrScreenTearDrop, "Teardrop"},
-				{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
-				{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no flag"},
-				{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN no ACK"},
-				{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
-				{dataplane.GlobalCtrScreenIPSrcRoute, "IP source route"},
-				{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
-			}
-			for _, sc := range screenCounters {
-				v := readCtr(sc.idx)
+			// #3343: shared screen-reason table so the per-reason breakdown
+			// includes port-scan / ip-sweep / session-limit and matches the
+			// other surfaces.
+			for i := range dataplane.ScreenReasonCounters {
+				rc := &dataplane.ScreenReasonCounters[i]
+				v := readCtr(rc.Index)
 				if v > 0 {
-					fmt.Printf("  %-25s %d\n", sc.name+":", v)
+					fmt.Printf("  %-25s %d\n", rc.Label+":", v)
 				}
 			}
 		}

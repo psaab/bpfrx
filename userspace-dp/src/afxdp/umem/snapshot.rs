@@ -83,6 +83,10 @@ impl BindingLiveState {
                 .host_inbound_denied_packets
                 .load(Ordering::Relaxed),
             screen_drops: self.screen_drops.load(Ordering::Relaxed),
+            // #3343: snapshot each per-reason screen-drop atomic.
+            screen_reason_drops: std::array::from_fn(|i| {
+                self.screen_reason_drops[i].load(Ordering::Relaxed)
+            }),
             syn_cookie_challenges: self.syn_cookie_challenges.load(Ordering::Relaxed),
             syn_cookie_secret_unavailable: self
                 .syn_cookie_secret_unavailable

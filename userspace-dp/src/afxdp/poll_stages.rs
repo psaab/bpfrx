@@ -431,8 +431,7 @@ pub(super) fn stage_screen_check(
                     reason,
                     event_now_ns_from_secs(now_secs),
                 );
-                counters.touched = true;
-                counters.screen_drops += 1;
+                counters.record_screen_drop(reason);
                 return StageOutcome::RecycleAndContinue;
             }
         };
@@ -446,8 +445,7 @@ pub(super) fn stage_screen_check(
                     reason,
                     event_now_ns_from_secs(now_secs),
                 );
-                counters.touched = true;
-                counters.screen_drops += 1;
+                counters.record_screen_drop(reason);
                 StageOutcome::RecycleAndContinue
             }
             // The L3 fragment screens only ever return Pass or Drop — they
@@ -486,8 +484,7 @@ pub(super) fn stage_screen_check(
                 reason,
                 event_now_ns_from_secs(now_secs),
             );
-            counters.touched = true;
-            counters.screen_drops += 1;
+            counters.record_screen_drop(reason);
             return StageOutcome::RecycleAndContinue;
         }
     };
@@ -523,8 +520,7 @@ pub(super) fn stage_screen_check(
                 reason,
                 event_now_ns_from_secs(now_secs),
             );
-            counters.touched = true;
-            counters.screen_drops += 1;
+            counters.record_screen_drop(reason);
             if reason == "syn-cookie-unavailable" {
                 counters.syn_cookie_secret_unavailable += 1;
             }
@@ -539,8 +535,7 @@ pub(super) fn stage_screen_check(
                 "syn-cookie",
                 event_now_ns_from_secs(now_secs),
             );
-            counters.touched = true;
-            counters.screen_drops += 1;
+            counters.record_screen_drop("syn-cookie");
             counters.syn_cookie_challenges += 1;
             StageOutcome::Continue(ScreenCheckOutcome::SynCookieChallenge(challenge))
         }
@@ -639,8 +634,7 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
                 reason,
                 event_now_ns_from_secs(now_secs),
             );
-            counters.touched = true;
-            counters.screen_drops += 1;
+            counters.record_screen_drop(reason);
             return StageOutcome::RecycleAndContinue;
         }
     };
@@ -661,8 +655,7 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
                 "syn-cookie",
                 event_now_ns_from_secs(now_secs),
             );
-            counters.touched = true;
-            counters.screen_drops += 1;
+            counters.record_screen_drop("syn-cookie");
             counters.syn_cookie_ack_invalid += 1;
             StageOutcome::RecycleAndContinue
         }

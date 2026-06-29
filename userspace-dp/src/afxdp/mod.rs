@@ -486,6 +486,13 @@ pub(in crate::afxdp) struct BatchCounters {
     // reload windows. See docs/pr/1187-telemetry-double-buffer/plan.md
     // (v7 PLAN-READY).
     screen_drops: u64,
+    // #3343: per-screen-reason DROP tally, indexed by
+    // `screen::screen_reason_drop_index`. Batched alongside the aggregate
+    // `screen_drops` (same MESI-thrash rationale) and flushed element-wise into
+    // `BindingLiveState.screen_reason_drops`. Reasons without a published
+    // ordinal (SYN-cookie / icmp-fragment / ip-malformed) bump only the
+    // aggregate above.
+    screen_reason_drops: [u64; crate::screen::SCREEN_REASON_DROP_COUNT],
     syn_cookie_challenges: u64,
     syn_cookie_secret_unavailable: u64,
     syn_cookie_syn_ack_sent: u64,
@@ -541,6 +548,21 @@ pub(in crate::afxdp) struct BatchCounters {
 }
 
 impl BatchCounters {
+    /// #3343: record one screen/IDS DROP. Bumps the aggregate `screen_drops`
+    /// and, when `reason` maps to a published per-reason ordinal, the matching
+    /// `screen_reason_drops` slot. Reasons without an ordinal (e.g.
+    /// "syn-cookie", "icmp-fragment", "ip-malformed") are surfaced only through
+    /// the aggregate. Centralizing here keeps the aggregate and per-reason
+    /// tallies from drifting at the many drop sites.
+    #[inline]
+    pub(in crate::afxdp) fn record_screen_drop(&mut self, reason: &str) {
+        self.touched = true;
+        self.screen_drops += 1;
+        if let Some(i) = crate::screen::screen_reason_drop_index(reason) {
+            self.screen_reason_drops[i] += 1;
+        }
+    }
+
     fn flush(&mut self, live: &BindingLiveState) {
         if !self.touched {
             return;
@@ -619,6 +641,13 @@ impl BatchCounters {
             live.screen_drops
                 .fetch_add(self.screen_drops, Ordering::Relaxed);
             self.screen_drops = 0;
+        }
+        // #3343: flush each non-zero per-reason screen-drop slot.
+        for i in 0..crate::screen::SCREEN_REASON_DROP_COUNT {
+            if self.screen_reason_drops[i] != 0 {
+                live.screen_reason_drops[i].fetch_add(self.screen_reason_drops[i], Ordering::Relaxed);
+                self.screen_reason_drops[i] = 0;
+            }
         }
         if self.syn_cookie_challenges != 0 {
             live.syn_cookie_challenges

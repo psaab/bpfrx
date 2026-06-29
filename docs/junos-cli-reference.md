@@ -302,6 +302,29 @@ From zone: guest, To zone: lan
     each host-inbound deny per worker (`host_inbound_denied_packets`) and the Go
     manager mirrors the per-poll delta into the global counter, identical to the
     policy-deny plumbing.
+  - **Per-screen-reason drop accounting (#3343):** the per-reason screen/IDS
+    drop counters (`syn-flood`, `icmp-flood`, `udp-flood`, `port-scan`,
+    `ip-sweep`, `land-attack`, `ping-of-death`, `teardrop`, `tcp-syn-fin`,
+    `tcp-no-flag`, `tcp-fin-no-ack`, `winnuke`, `ip-source-route`, `syn-frag`,
+    `session-limit`) now carry live values. Before #3343 the AF_XDP userspace
+    counter bridge published only the aggregate `screen_drops`, so every
+    per-reason breakdown read a permanent 0: the aggregate climbed during an
+    attack while `show security screen`, `show security flow statistics detail`,
+    the IDS alarms in `show security alarms` (which could read "No security
+    alarms currently active" mid-attack), the gRPC `GetGlobalStats`
+    `screen_drop_details`, and the REST/Prometheus surfaces all showed zero per
+    reason. The Rust helper now counts each drop per reason
+    (`BindingStatus.screen_reason_drops`, indexed by
+    `screen::screen_reason_drop_index`); the Go manager sums them across
+    bindings and pushes each ordinal's per-poll delta into its
+    `dataplane.GlobalCtrScreen*` counter, mirroring the host-inbound / NAT64
+    plumbing. The shared `dataplane.ScreenReasonCounters` table is the single
+    source of truth for the reason ordinal→counter mapping AND the display
+    rows, so port-scan / ip-sweep / session-limit (previously omitted from
+    several hardcoded lists) now appear consistently across every surface. A new
+    labeled Prometheus series `xpf_screen_drops_by_reason_total{reason=...}`
+    exposes the breakdown for alerting; the aggregate `xpf_screen_drops_total`
+    is unchanged.
   - **Token validation (#3200):** `host-inbound-traffic system-services
     <tok>` / `protocols <tok>` is now validated at commit against the
     recognized-token SSOT (`pkg/config/host_inbound_tokens.go`:

@@ -1416,8 +1416,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 reason,
                                 event_now_ns_from_secs(now_secs),
                             );
-                            telemetry.counters.touched = true;
-                            telemetry.counters.screen_drops += 1;
+                            telemetry.counters.record_screen_drop(reason);
                             binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }

@@ -2169,16 +2169,24 @@ type BindingStatus struct {
 	// syncBPFCountersLocked so REST (host_inbound_denies), Prometheus
 	// (xpf_host_inbound_denies_total), and `show security flow statistics`
 	// reflect the drop. Before #3326 these denies were never counted.
-	HostInboundDeniedPackets   uint64 `json:"host_inbound_denied_packets,omitempty"`
-	ScreenDrops                uint64 `json:"screen_drops,omitempty"`
-	SYNCookieChallenges        uint64 `json:"syn_cookie_challenges,omitempty"`
-	SYNCookieSecretUnavailable uint64 `json:"syn_cookie_secret_unavailable,omitempty"`
-	SYNCookieSynAckSent        uint64 `json:"syn_cookie_syn_ack_sent,omitempty"`
-	SYNCookieAckRstSent        uint64 `json:"syn_cookie_ack_rst_sent,omitempty"`
-	SYNCookieReplyBudgetDrops  uint64 `json:"syn_cookie_reply_budget_drops,omitempty"`
-	SYNCookieAckValid          uint64 `json:"syn_cookie_ack_valid,omitempty"`
-	SYNCookieAckInvalid        uint64 `json:"syn_cookie_ack_invalid,omitempty"`
-	SYNCookieBypass            uint64 `json:"syn_cookie_bypass,omitempty"`
+	HostInboundDeniedPackets uint64 `json:"host_inbound_denied_packets,omitempty"`
+	ScreenDrops              uint64 `json:"screen_drops,omitempty"`
+	// ScreenReasonDrops (#3343): per-screen-reason DROP counters, one element per
+	// dataplane.ScreenReasonCounters ordinal (the userspace-dp wire array). The
+	// manager sums these across bindings and pushes each ordinal's delta into its
+	// dataplane.GlobalCtrScreen* index so the per-reason screen-statistics rows
+	// (CLI alarms / show security screen / flow statistics, gRPC, REST,
+	// Prometheus) stop reading a permanent 0. The Rust side always serializes the
+	// fixed-length array, so the key is present even when all-zero.
+	ScreenReasonDrops          []uint64 `json:"screen_reason_drops,omitempty"`
+	SYNCookieChallenges        uint64   `json:"syn_cookie_challenges,omitempty"`
+	SYNCookieSecretUnavailable uint64   `json:"syn_cookie_secret_unavailable,omitempty"`
+	SYNCookieSynAckSent        uint64   `json:"syn_cookie_syn_ack_sent,omitempty"`
+	SYNCookieAckRstSent        uint64   `json:"syn_cookie_ack_rst_sent,omitempty"`
+	SYNCookieReplyBudgetDrops  uint64   `json:"syn_cookie_reply_budget_drops,omitempty"`
+	SYNCookieAckValid          uint64   `json:"syn_cookie_ack_valid,omitempty"`
+	SYNCookieAckInvalid        uint64   `json:"syn_cookie_ack_invalid,omitempty"`
+	SYNCookieBypass            uint64   `json:"syn_cookie_bypass,omitempty"`
 	// #2089: policy `reject` action — RST/ICMP-unreachable replies sent,
 	// and replies suppressed due to TX-frame budget exhaustion.
 	PolicyRejectSent uint64 `json:"policy_reject_sent,omitempty"`

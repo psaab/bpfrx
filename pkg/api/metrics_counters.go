@@ -67,6 +67,13 @@ func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp api
 	emit(c.sessionsCreatedTotal, dataplane.GlobalCtrSessionsNew)
 	emit(c.sessionsClosedTotal, dataplane.GlobalCtrSessionsClosed)
 	emit(c.screenDropsTotal, dataplane.GlobalCtrScreenDrops)
+	// #3343: per-reason screen-drop breakdown. Emit one labeled series per
+	// reason in the shared table; a per-reason read failure SKIPS that series
+	// (and bumps counterReadErrors) under the same #3345 contract as `emit`.
+	for i := range dataplane.ScreenReasonCounters {
+		rc := &dataplane.ScreenReasonCounters[i]
+		emit(c.screenDropsByReasonTotal, rc.Index, rc.Reason)
+	}
 	emit(c.policyDeniesTotal, dataplane.GlobalCtrPolicyDeny)
 	emit(c.natAllocFailsTotal, dataplane.GlobalCtrNATAllocFail)
 	emit(c.nat64XlateTotal, dataplane.GlobalCtrNAT64Xlate)

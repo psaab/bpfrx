@@ -668,6 +668,11 @@ type userspaceCounterSnapshot struct {
 	policyDenied      uint64
 	hostInboundDenied uint64
 	screenDrops       uint64
+	// #3343: per-screen-reason drop tallies, indexed by the
+	// dataplane.ScreenReasonCounters ordinal. Summed across bindings and pushed
+	// into each reason's GlobalCtrScreen* counter so the per-reason
+	// screen-statistics surfaces are no longer stuck at 0.
+	screenReasonDrops [dataplane.ScreenReasonDropCount]uint64
 	synCookieSent     uint64
 	synCookieValid    uint64
 	synCookieInvalid  uint64
@@ -690,6 +695,12 @@ func sumBindingCounters(status *ProcessStatus) userspaceCounterSnapshot {
 		s.policyDenied += b.PolicyDeniedPackets
 		s.hostInboundDenied += b.HostInboundDeniedPackets
 		s.screenDrops += b.ScreenDrops
+		// #3343: sum each per-reason ordinal. The Rust helper always sends a
+		// fixed-length array, but guard the length so a short/old wire payload
+		// (or an over-length future one) cannot panic the status poll.
+		for i := 0; i < len(b.ScreenReasonDrops) && i < dataplane.ScreenReasonDropCount; i++ {
+			s.screenReasonDrops[i] += b.ScreenReasonDrops[i]
+		}
 		s.synCookieSent += b.SYNCookieSynAckSent
 		s.synCookieValid += b.SYNCookieAckValid
 		s.synCookieInvalid += b.SYNCookieAckInvalid
@@ -744,6 +755,18 @@ func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
 		// per-binding; this delta-push mirrors the snat/dnat plumbing so
 		// `show security flow statistics` reflects live NAT64 translation.
 		{dataplane.GlobalCtrNAT64Xlate, safeDelta(cur.nat64Translations, prev.nat64Translations)},
+	}
+
+	// #3343: push each per-screen-reason drop delta into its GlobalCtrScreen*
+	// index, mirroring the aggregate GlobalCtrScreenDrops / SYN-cookie plumbing
+	// above. Without this every per-reason counter the CLI/gRPC/REST/Prometheus
+	// screen-statistics surfaces read stayed at 0 even while the aggregate rose
+	// under attack. Ordinal i maps to dataplane.ScreenReasonCounters[i].Index.
+	for i := range dataplane.ScreenReasonCounters {
+		deltas = append(deltas, counterDelta{
+			index: dataplane.ScreenReasonCounters[i].Index,
+			delta: safeDelta(cur.screenReasonDrops[i], prev.screenReasonDrops[i]),
+		})
 	}
 
 	for _, d := range deltas {
