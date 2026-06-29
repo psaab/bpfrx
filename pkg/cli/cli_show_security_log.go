@@ -94,14 +94,23 @@ func (c *CLI) showSecurityLog(args []string) error {
 		return nil
 	}
 
-	// Build reverse zone ID → name map for event display
+	// Build reverse zone ID → name map from the CURRENT config. This is only a
+	// fallback for legacy records that lack a resolved-at-event-time name
+	// (#3335): each EventRecord stores InZoneName/OutZoneName as resolved when
+	// the event fired, so a later zone rename / delete / ID reuse (#3075) must
+	// NOT retroactively rewrite an old event's zone name from the live config.
+	// Prefer the stored name; consult this map (then a bare numeric fallback)
+	// only when the record carries no resolved name.
 	evZoneNames := make(map[uint16]string)
 	if cr != nil {
 		for name, id := range cr.ZoneIDs {
 			evZoneNames[id] = name
 		}
 	}
-	zoneName := func(id uint16) string {
+	zoneName := func(stored string, id uint16) string {
+		if stored != "" {
+			return stored
+		}
 		if n, ok := evZoneNames[id]; ok {
 			return n
 		}
@@ -139,7 +148,7 @@ func (c *CLI) showSecurityLog(args []string) error {
 
 		inIface := e.IngressIface
 		if inIface == "" {
-			inIface = zoneName(e.InZone)
+			inIface = zoneName(e.InZoneName, e.InZone)
 		}
 		appName := e.AppName
 		if appName == "" {
@@ -152,7 +161,7 @@ func (c *CLI) showSecurityLog(args []string) error {
 				ts, hostname, srcAddr, srcPort, dstAddr, dstPort,
 				natSrcAddr, natSrcPort, natDstAddr, natDstPort,
 				protoNameToID(e.Protocol), policyName(e),
-				zoneName(e.InZone), zoneName(e.OutZone),
+				zoneName(e.InZoneName, e.InZone), zoneName(e.OutZoneName, e.OutZone),
 				e.SessionID, appName, inIface)
 
 		case "SESSION_CLOSE":
@@ -164,7 +173,7 @@ func (c *CLI) showSecurityLog(args []string) error {
 				ts, hostname, reason, srcAddr, srcPort, dstAddr, dstPort,
 				natSrcAddr, natSrcPort, natDstAddr, natDstPort,
 				protoNameToID(e.Protocol), policyName(e),
-				zoneName(e.InZone), zoneName(e.OutZone),
+				zoneName(e.InZoneName, e.InZone), zoneName(e.OutZoneName, e.OutZone),
 				e.SessionID, e.SessionPkts, e.SessionBytes,
 				e.RevSessionPkts, e.RevSessionBytes, e.ElapsedTime,
 				appName, inIface)
@@ -173,20 +182,20 @@ func (c *CLI) showSecurityLog(args []string) error {
 			fmt.Printf("%s %s RT_FLOW - RT_FLOW_SESSION_DENY [source-address=\"%s\" source-port=\"%s\" destination-address=\"%s\" destination-port=\"%s\" protocol-id=\"%s\" policy-name=\"%s\" source-zone-name=\"%s\" destination-zone-name=\"%s\" application=\"%s\" packet-incoming-interface=\"%s\"]\n",
 				ts, hostname, srcAddr, srcPort, dstAddr, dstPort,
 				protoNameToID(e.Protocol), policyName(e),
-				zoneName(e.InZone), zoneName(e.OutZone),
+				zoneName(e.InZoneName, e.InZone), zoneName(e.OutZoneName, e.OutZone),
 				appName, inIface)
 
 		case "SCREEN_DROP":
 			fmt.Printf("%s %s RT_IDS - RT_SCREEN_DROP [attack-name=\"%s\" source-address=\"%s\" destination-address=\"%s\" protocol-id=\"%s\" source-zone-name=\"%s\" action=\"%s\"]\n",
 				ts, hostname, e.ScreenCheck, srcAddr, dstAddr,
-				protoNameToID(e.Protocol), zoneName(e.InZone), e.Action)
+				protoNameToID(e.Protocol), zoneName(e.InZoneName, e.InZone), e.Action)
 
 		default:
 			// Fallback for other event types
 			fmt.Printf("%s %s RT_FLOW - %s [source-address=\"%s\" source-port=\"%s\" destination-address=\"%s\" destination-port=\"%s\" protocol-id=\"%s\" policy-name=\"%s\" source-zone-name=\"%s\" destination-zone-name=\"%s\" application=\"%s\" packet-incoming-interface=\"%s\"]\n",
 				ts, hostname, e.Type, srcAddr, srcPort, dstAddr, dstPort,
 				protoNameToID(e.Protocol), policyName(e),
-				zoneName(e.InZone), zoneName(e.OutZone),
+				zoneName(e.InZoneName, e.InZone), zoneName(e.OutZoneName, e.OutZone),
 				appName, inIface)
 		}
 	}

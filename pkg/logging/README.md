@@ -171,6 +171,19 @@ if `Handle` runs the re-entrancy guard before the client check.
   upper-cases, keeping ICMPv6 mixed-case for the trace-filter contract);
   unknown protocols still fall back to the numeric form. Pin:
   `protoname_test.go`.
+- **Zone names are resolved AS-OF the event, not recomputed live (#3335).**
+  `EventReader.ProcessRawEvent` (`ringbuf.go`) stamps `EventRecord.InZoneName`
+  / `OutZoneName` from the dataplane's zone-ID→name table at the instant the
+  event fires. Consumers that render zone names — `show security log`
+  (`pkg/cli/cli_show_security_log.go`) and the gRPC `GetEvents`
+  (`pkg/grpcapi/server_show_events.go`) — MUST prefer those stored names and
+  fall back to the current-config reverse map only for legacy records whose
+  resolved name is empty. Recomputing from the live config corrupts forensic
+  timelines: zone IDs are assigned from current state and can be renumbered
+  (#3075), so an old event that carried `InZoneName="trust"` would otherwise
+  re-render under whatever name now owns that ID. Pins:
+  `server_show_events_historical_zone_3335_test.go`,
+  `cli_show_security_log_historical_zone_3335_test.go`.
 - **Flow-trace files are basename-only under `/var/log` (#3420).**
   `NewTraceWriter` (`trace.go`) treats the persistent
   `security flow traceoptions file <name>` value as a bare basename: an
