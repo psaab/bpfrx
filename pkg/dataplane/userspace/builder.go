@@ -62,23 +62,30 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 	if err != nil {
 		return nil, err
 	}
+	// #3438: a BuildCatalog fault (overflow / malformed application-set) fails
+	// the snapshot closed rather than shipping an empty catalog that would
+	// silently degrade all session naming to UNKNOWN.
+	appCatalog, err := buildAppCatalogSnapshot(cfg)
+	if err != nil {
+		return nil, err
+	}
 	return &ConfigSnapshot{
-		Version:               ProtocolVersion,
-		Generation:            generation,
-		FIBGeneration:         fibGeneration,
-		GeneratedAt:           time.Now().UTC(),
-		Capabilities:          caps,
-		MapPins:               userspaceMapPins(),
-		Userspace:             ucfg,
-		Zones:                 buildZoneSnapshots(cfg),
-		Interfaces:            interfaces,
-		Fabrics:               buildFabricSnapshots(cfg),
-		TunnelEndpoints:       buildTunnelEndpointSnapshots(cfg, interfaces),
-		Neighbors:             buildNeighborSnapshots(cfg),
-		Routes:                buildRouteSnapshots(cfg, interfaces, routeOverlay),
-		Flow:                  buildFlowSnapshot(cfg),
-		DefaultPolicy:         policyActionString(cfg.Security.DefaultPolicy),
-		Policies:              policies,
+		Version:         ProtocolVersion,
+		Generation:      generation,
+		FIBGeneration:   fibGeneration,
+		GeneratedAt:     time.Now().UTC(),
+		Capabilities:    caps,
+		MapPins:         userspaceMapPins(),
+		Userspace:       ucfg,
+		Zones:           buildZoneSnapshots(cfg),
+		Interfaces:      interfaces,
+		Fabrics:         buildFabricSnapshots(cfg),
+		TunnelEndpoints: buildTunnelEndpointSnapshots(cfg, interfaces),
+		Neighbors:       buildNeighborSnapshots(cfg),
+		Routes:          buildRouteSnapshots(cfg, interfaces, routeOverlay),
+		Flow:            buildFlowSnapshot(cfg),
+		DefaultPolicy:   policyActionString(cfg.Security.DefaultPolicy),
+		Policies:        policies,
 		// #3303: thread feedOverlay into the NAT builders so a NAT rule scoped
 		// to a feed-backed `match {source,destination}-address-name` resolves the
 		// live feed prefixes, exactly as the policy/address-book path does. Static
@@ -98,7 +105,7 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 		FlowExport:            buildFlowExportSnapshot(cfg),
 		MirrorConfigs:         buildMirrorConfigSnapshotsFailClosed(cfg, interfaces),
 		AddressBooks:          addressBooks,
-		AppCatalog:            buildAppCatalogSnapshot(cfg),
+		AppCatalog:            appCatalog,
 		Config:                cfg,
 		Summary: SnapshotSummary{
 			HostName:       cfg.System.HostName,
