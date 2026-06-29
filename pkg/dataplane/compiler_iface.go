@@ -77,7 +77,7 @@ func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, confi
 
 	// Resolve fabric interface to local physical member for BPF attachment.
 	// fab0 is an IPVLAN on ge-0-0-0; XDP/TC must attach to the parent.
-	if ifCfg, ok := cfg.Interfaces.Interfaces[configName]; ok && ifCfg.LocalFabricMember != "" {
+	if ifCfg, ok := cfg.Interfaces.Interfaces[configName]; ok && ifCfg != nil && ifCfg.LocalFabricMember != "" {
 		physBase = ifCfg.LocalFabricMember
 	}
 
@@ -89,7 +89,7 @@ func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, confi
 
 	// Per-unit tunnel interfaces have their own Linux interface name
 	// (e.g. gr-0/0/0 unit 1 → "gr-0-0-0u1")
-	if ifCfg, ok := cfg.Interfaces.Interfaces[configName]; ok {
+	if ifCfg, ok := cfg.Interfaces.Interfaces[configName]; ok && ifCfg != nil {
 		if unit, ok := ifCfg.Units[unitNum]; ok {
 			vlanID = unit.VlanID
 			if unit.Tunnel != nil {
@@ -166,6 +166,9 @@ func isConfiguredVLANSubInterface(name string, cfg *config.Config) bool {
 		return false
 	}
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
+		if ifCfg == nil {
+			continue
+		}
 		if !ifCfg.VlanTagging || config.LinuxIfName(ifName) != base {
 			continue
 		}
@@ -273,6 +276,14 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	tunnelIfindexes := make(map[int]bool)
 
 	for name, zone := range cfg.Security.Zones {
+		// A nil zone value is reachable on the tolerant/programmatic and
+		// HA-peer-sync config paths (the nil-slot invariant the dataplane
+		// SSOT already defends, e.g. userspace/zones.go). Skip it — every
+		// deref below (ScreenProfile, HostInboundTraffic, Interfaces)
+		// would otherwise panic the apply-path interface reconcile.
+		if zone == nil {
+			continue
+		}
 		zid := result.ZoneIDs[name]
 
 		// Write zone_config
@@ -358,7 +369,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				var addrs []string
 				isDHCPSub := false
 				isReth := false
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
 					if unit, ok := ifCfg.Units[unitNum]; ok {
 						addrs = unit.Addresses
 						isDHCPSub = unit.DHCP || unit.DHCPv6
@@ -372,7 +383,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				}
 
 				// Apply unit-level MTU to VLAN sub-interface
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
 					if unit, ok := ifCfg.Units[unitNum]; ok && unit.MTU > 0 {
 						if nl, err := result.cachedLinkByName(subName); err == nil {
 							if nl.Attrs().MTU != unit.MTU {
@@ -407,7 +418,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			var izFlags uint8
 			var rgID uint8
 			var screenFlags uint32
-			if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
+			if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
 				if ifCfg.Tunnel != nil {
 					izFlags |= IfaceFlagTunnel
 				}
@@ -423,7 +434,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 					// rg_id=0 for RETH member VLAN sub-interfaces, bypassing
 					// the HA active/inactive check and preventing fabric
 					// redirect after RG failover.
-					if reth, ok := cfg.Interfaces.Interfaces[ifCfg.RedundantParent]; ok && reth.RedundancyGroup > 0 {
+					if reth, ok := cfg.Interfaces.Interfaces[ifCfg.RedundantParent]; ok && reth != nil && reth.RedundancyGroup > 0 {
 						rgID = uint8(reth.RedundancyGroup)
 					}
 				}
@@ -475,7 +486,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				nl, nlErr := result.cachedLinkByIndex(physIface.Index)
 
 				// Apply interface-level MTU from config
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg.MTU > 0 && nlErr == nil {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil && ifCfg.MTU > 0 && nlErr == nil {
 					if nl.Attrs().MTU != ifCfg.MTU {
 						if err := netlink.LinkSetMTU(nl, ifCfg.MTU); err != nil {
 							slog.Warn("failed to set MTU",
@@ -487,7 +498,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				}
 
 				// Apply interface speed/duplex via ethtool if configured
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
 					result.applyEthtool(physName, ifCfg)
 				}
 
@@ -504,7 +515,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				// driver. DPDK ports are disabled by not including them in the
 				// worker's poll set (the zone map lookup will miss, causing drop).
 				isDisabled := false
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg.Disable {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil && ifCfg.Disable {
 					isDisabled = true
 					if nlErr == nil {
 						if err := netlink.LinkSetDown(nl); err != nil {
@@ -558,7 +569,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				isReth := false
 				isFabricParent := false
 				var unitMTU int
-				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok {
+				if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
 					if unit, ok := ifCfg.Units[unitNum]; ok {
 						addrs = unit.Addresses
 						isDHCP = unit.DHCP || unit.DHCPv6
@@ -597,91 +608,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	}
 
 	// Auto-add HOST_INBOUND_GRE to zones carrying GRE tunnel transport.
-	// When a GRE tunnel is configured, the outer encapsulated packets must
-	// reach the kernel for decapsulation.  Without this, the zone's
-	// host-inbound policy blocks outer GRE (protocol 47) because it's not
-	// explicitly listed as a system-service.
-	autoFlags := make(map[string]uint32) // zone name → extra flags
-	for _, ifCfg := range cfg.Interfaces.Interfaces {
-		tunnels := []*config.TunnelConfig{}
-		if ifCfg.Tunnel != nil {
-			tunnels = append(tunnels, ifCfg.Tunnel)
-		}
-		for _, unit := range ifCfg.Units {
-			if unit.Tunnel != nil {
-				tunnels = append(tunnels, unit.Tunnel)
-			}
-		}
-		for _, tun := range tunnels {
-			if tun.Source == "" {
-				continue
-			}
-			srcIP := net.ParseIP(tun.Source)
-			if srcIP == nil {
-				continue
-			}
-			var flag uint32
-			if tun.Mode == "gre" || tun.Mode == "" {
-				flag = HostInboundGRE
-			}
-			if flag == 0 {
-				continue
-			}
-			// Find which zone's interface carries this tunnel source IP.
-			for zoneName, zone := range cfg.Security.Zones {
-				for _, ifRef := range zone.Interfaces {
-					_, cn, un, _ := resolveInterfaceRef(ifRef, cfg)
-					ic, ok := cfg.Interfaces.Interfaces[cn]
-					if !ok {
-						continue
-					}
-					u, ok := ic.Units[un]
-					if !ok {
-						continue
-					}
-					for _, addr := range u.Addresses {
-						ip, _, err := net.ParseCIDR(addr)
-						if err != nil {
-							continue
-						}
-						if ip.Equal(srcIP) {
-							autoFlags[zoneName] |= flag
-						}
-					}
-				}
-			}
-		}
-	}
-	for zoneName, flags := range autoFlags {
-		zid, ok := result.ZoneIDs[zoneName]
-		if !ok {
-			continue
-		}
-		zone := cfg.Security.Zones[zoneName]
-		var existing uint32
-		if zone.HostInboundTraffic != nil {
-			for _, svc := range zone.HostInboundTraffic.SystemServices {
-				if f, ok := HostInboundServiceFlags[svc]; ok {
-					existing |= f
-				}
-			}
-			for _, proto := range zone.HostInboundTraffic.Protocols {
-				if f, ok := HostInboundProtocolFlags[proto]; ok {
-					existing |= f
-				}
-			}
-		}
-		if existing&flags != flags {
-			merged := existing | flags
-			zc := ZoneConfig{HostInbound: merged}
-			if zone.TCPRst {
-				zc.TCPRst = 1
-			}
-			dp.SetZoneConfig(zid, zc)
-			slog.Info("auto-added host-inbound for tunnel transport",
-				"zone", zoneName, "flags", fmt.Sprintf("0x%x", flags))
-		}
-	}
+	applyTunnelHostInbound(dp, cfg, result)
 
 	// Store pending XDP ifindexes for deferred attachment after all compile phases.
 	result.pendingXDP = xdpIfindexes
@@ -705,6 +632,9 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	rethToPhys := cfg.RethToPhysical()
 	seen := make(map[string]bool)
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
+		if ifCfg == nil {
+			continue
+		}
 		if strings.HasPrefix(ifName, "st") {
 			mtu := ifCfg.MTU
 			for unitNum, unit := range ifCfg.Units {
@@ -753,7 +683,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		effectiveCfg := ifCfg
 		isVRRPReth := false
 		if ifCfg.RedundantParent != "" {
-			if rethCfg, ok := cfg.Interfaces.Interfaces[ifCfg.RedundantParent]; ok {
+			if rethCfg, ok := cfg.Interfaces.Interfaces[ifCfg.RedundantParent]; ok && rethCfg != nil {
 				effectiveCfg = rethCfg
 				isVRRPReth = rethCfg.RedundancyGroup > 0 && clusterNodeID >= 0
 			}
@@ -989,6 +919,9 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	// Skip vSRX-style fabric (LocalFabricMember set) — the daemon creates an
 	// IPVLAN on the single local member; no bond needed.
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
+		if ifCfg == nil {
+			continue
+		}
 		if len(ifCfg.FabricMembers) <= 1 || ifCfg.LocalFabricMember != "" {
 			continue
 		}
@@ -1055,7 +988,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			if len(parts) == 2 {
 				irbName := parts[0] // "irb"
 				unitNum, _ := strconv.Atoi(parts[1])
-				if irbCfg, ok := cfg.Interfaces.Interfaces[irbName]; ok {
+				if irbCfg, ok := cfg.Interfaces.Interfaces[irbName]; ok && irbCfg != nil {
 					if unit, ok := irbCfg.Units[unitNum]; ok {
 						addrs = unit.Addresses
 					}
@@ -1098,6 +1031,9 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		}
 	}
 	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
 		if ifc.Tunnel != nil {
 			daemonOwned[ifc.Tunnel.Name] = true
 		}
@@ -1224,6 +1160,114 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	dp.DeleteStaleVlanIface(writtenVlanIface)
 
 	return nil
+}
+
+// applyTunnelHostInbound auto-adds HOST_INBOUND_GRE to any security zone
+// whose interface carries a configured GRE tunnel's source IP. When a GRE
+// tunnel is configured the outer encapsulated packets must reach the
+// kernel for decapsulation; without this flag the zone's host-inbound
+// policy blocks outer GRE (protocol 47) because it is not explicitly
+// listed as a system-service.
+//
+// Extracted from compileZones as a pure, netlink-free seam (the rest of
+// compileZones reconciles host interfaces via netlink and is not
+// unit-testable). nil zone / interface map values are skipped: a nil
+// *config.ZoneConfig or *config.InterfaceConfig slot is reachable on the
+// tolerant/programmatic and HA-peer-sync config paths (#3499, sibling of
+// #3492/#3496 — the nil-slot invariant the dataplane SSOT already
+// defends, e.g. userspace/zones.go). Without the guards the zone.Interfaces
+// and zone.HostInboundTraffic derefs panic the apply-path reconcile.
+func applyTunnelHostInbound(dp DataPlane, cfg *config.Config, result *CompileResult) {
+	autoFlags := make(map[string]uint32) // zone name → extra flags
+	for _, ifCfg := range cfg.Interfaces.Interfaces {
+		if ifCfg == nil {
+			continue
+		}
+		tunnels := []*config.TunnelConfig{}
+		if ifCfg.Tunnel != nil {
+			tunnels = append(tunnels, ifCfg.Tunnel)
+		}
+		for _, unit := range ifCfg.Units {
+			if unit.Tunnel != nil {
+				tunnels = append(tunnels, unit.Tunnel)
+			}
+		}
+		for _, tun := range tunnels {
+			if tun.Source == "" {
+				continue
+			}
+			srcIP := net.ParseIP(tun.Source)
+			if srcIP == nil {
+				continue
+			}
+			var flag uint32
+			if tun.Mode == "gre" || tun.Mode == "" {
+				flag = HostInboundGRE
+			}
+			if flag == 0 {
+				continue
+			}
+			// Find which zone's interface carries this tunnel source IP.
+			for zoneName, zone := range cfg.Security.Zones {
+				if zone == nil {
+					continue
+				}
+				for _, ifRef := range zone.Interfaces {
+					_, cn, un, _ := resolveInterfaceRef(ifRef, cfg)
+					ic, ok := cfg.Interfaces.Interfaces[cn]
+					if !ok || ic == nil {
+						continue
+					}
+					u, ok := ic.Units[un]
+					if !ok {
+						continue
+					}
+					for _, addr := range u.Addresses {
+						ip, _, err := net.ParseCIDR(addr)
+						if err != nil {
+							continue
+						}
+						if ip.Equal(srcIP) {
+							autoFlags[zoneName] |= flag
+						}
+					}
+				}
+			}
+		}
+	}
+	for zoneName, flags := range autoFlags {
+		zid, ok := result.ZoneIDs[zoneName]
+		if !ok {
+			continue
+		}
+		zone := cfg.Security.Zones[zoneName]
+		if zone == nil {
+			continue
+		}
+		var existing uint32
+		if zone.HostInboundTraffic != nil {
+			for _, svc := range zone.HostInboundTraffic.SystemServices {
+				if f, ok := HostInboundServiceFlags[svc]; ok {
+					existing |= f
+				}
+			}
+			for _, proto := range zone.HostInboundTraffic.Protocols {
+				if f, ok := HostInboundProtocolFlags[proto]; ok {
+					existing |= f
+				}
+			}
+		}
+		if existing&flags != flags {
+			merged := existing | flags
+			zc := ZoneConfig{HostInbound: merged}
+			if zone.TCPRst {
+				zc.TCPRst = 1
+			}
+			dp.SetZoneConfig(zid, zc)
+			slog.Info("auto-added host-inbound for tunnel transport",
+				"zone", zoneName, "flags", fmt.Sprintf("0x%x", flags))
+		}
+	}
 }
 
 func compileScreenProfiles(dp DataPlane, cfg *config.Config, result *CompileResult) error {

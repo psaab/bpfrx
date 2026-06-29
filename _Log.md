@@ -1,3 +1,33 @@
+## 2026-06-28 — #3499 compiler_iface nil zone/interface map-value guards
+
+- **Timestamp**: 2026-06-28
+- **Action**: Guard pkg/dataplane/compiler_iface.go against nil
+  *config.ZoneConfig / *config.InterfaceConfig map values on the live
+  apply-path interface bring-down reconcile (compileZones). The issue's
+  named derefs were the GRE host-inbound auto-flag block — `zone.Interfaces`
+  (~line 632) and `zone.HostInboundTraffic` (~662). Added `if zone == nil`
+  to BOTH zone loops (the main interface-mapping loop and the GRE scan
+  loop), `if zone == nil` to the autoFlags ZoneIDs-index lookup, and
+  `if ifCfg == nil { continue }` to every `range cfg.Interfaces.Interfaces`
+  loop (5) plus `&& ifCfg != nil` to every comma-ok `cfg.Interfaces
+  .Interfaces[k]`-then-deref site (the comma-ok idiom checks key-presence,
+  not value-non-nil — a (nil, true) entry still panics). Mirrors the SSOT
+  idiom (userspace/zones.go) and the #3496 apply-path sweep. Extracted the
+  GRE host-inbound block into a pure, netlink-free helper
+  `applyTunnelHostInbound` as the testable seam (the rest of compileZones
+  reconciles host interfaces via netlink and is not unit-testable).
+  RED-on-revert test: TestApplyTunnelHostInboundSkipsNilZone — a nil zone
+  slot alongside a valid GRE-carrying zone must not panic and must still
+  apply HostInboundGRE to the valid zone; removing either zone guard
+  panics. Validation: gofmt -w; go build ./...; go test
+  ./pkg/dataplane/... -count=1 (all pass); RED-on-revert confirmed.
+  Sibling finding (out of scope, follow-up): config.RethToPhysical
+  (pkg/config/types.go:72) derefs nil interface map values unguarded — a
+  full nil-interface-slot survivability fix needs config-package hardening
+  too.
+- **File(s)**: pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/compiler_test.go, _Log.md
+
 ## 2026-06-28 — #3422 fold: quoted-empty trace packet-filter prefix fail-open
 
 - **Timestamp**: 2026-06-28
