@@ -7,7 +7,18 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	xnft "github.com/psaab/xpf/pkg/nftables"
 )
+
+// hiDrop builds the canonical host-inbound catch-all DROP rule line for a
+// zone/family — the named-counter form (#3361). The drop now carries
+// `counter name "<n>"` so the kernel host-inbound denies are scrapeable; removing
+// the counter attachment (reverting #3361) makes every assertion built from this
+// helper RED.
+func hiDrop(family, addrs, zone string) string {
+	return family + " daddr " + addrs + " counter name \"" +
+		xnft.HostInboundDenyCounterName(zone, family) + "\" drop"
+}
 
 // hostInboundTestConfig builds a config exercising the #3070 kernel-nftables
 // host-inbound enforcement path end to end (config -> BuildZoneHostInboundViews
@@ -78,9 +89,12 @@ func TestHostInboundFilterAcceptsListedDeniesRest(t *testing.T) {
 		// wan allows ping -> accept icmp/icmpv6 echo-request.
 		"ip daddr 172.16.50.8 icmp type echo-request accept",
 		"ip6 daddr 2001:db8:50::8 icmpv6 type echo-request accept",
-		// catch-all deny for the rest, per family.
-		"ip daddr 172.16.50.8 drop",
-		"ip6 daddr 2001:db8:50::8 drop",
+		// catch-all deny for the rest, per family — now carrying a named counter.
+		hiDrop("ip", "172.16.50.8", "wan"),
+		hiDrop("ip6", "2001:db8:50::8", "wan"),
+		// the named counter objects must be declared in the table body.
+		"counter \"" + xnft.HostInboundDenyCounterName("wan", "ip") + "\"",
+		"counter \"" + xnft.HostInboundDenyCounterName("wan", "ip6") + "\"",
 	}
 	for _, want := range mustContain {
 		if !strings.Contains(payload, want) {
@@ -95,10 +109,66 @@ func TestHostInboundFilterAcceptsListedDeniesRest(t *testing.T) {
 	}
 
 	// Ordering: each accept for the wan v4 addr must precede that addr's drop.
-	if idxDrop := strings.Index(payload, "ip daddr 172.16.50.8 drop"); idxDrop >= 0 {
+	if idxDrop := strings.Index(payload, hiDrop("ip", "172.16.50.8", "wan")); idxDrop >= 0 {
 		if idxAccept := strings.Index(payload, "ip daddr 172.16.50.8 tcp dport 22 accept"); idxAccept < 0 || idxAccept > idxDrop {
 			t.Errorf("wan v4 ssh accept must precede the v4 catch-all drop:\n%s", payload)
 		}
+	}
+}
+
+// TestHostInboundFilterDropRulesCounted is the #3361 fail-on-revert proof: each
+// per-zone/family catch-all host-inbound DROP rule carries a NAMED nft counter,
+// and that counter object is DECLARED in the table body. The kernel
+// `inet xpf_hostinbound` chain is the PRIMARY host-inbound enforcement path
+// (host-bound traffic is shunted to the kernel before userspace-dp sees it), so
+// without these counters operator-configured host-inbound denies are invisible
+// (host_inbound_denies = 0 forever — a forensics/alerting blind spot distinct
+// from the #3326 userspace path). Dropping the `counter name "..."` from the drop
+// rule, or the `counter "..." { }` declaration, turns this RED.
+func TestHostInboundFilterDropRulesCounted(t *testing.T) {
+	cfg := hostInboundTestConfig()
+	views := buildAndCheckViews(t, cfg)
+	payload := buildHostInboundFilterPayload(views)
+
+	for _, fam := range []struct{ family, addr string }{
+		{"ip", "172.16.50.8"},
+		{"ip6", "2001:db8:50::8"},
+	} {
+		cn := xnft.HostInboundDenyCounterName("wan", fam.family)
+
+		// The named counter object must be DECLARED in the table body.
+		decl := "counter \"" + cn + "\""
+		if !strings.Contains(payload, decl) {
+			t.Errorf("missing named counter declaration %q\n---\n%s", decl, payload)
+		}
+		// The declaration must appear BEFORE the chain references it (nft rejects
+		// a reference to an undeclared counter on an atomic load).
+		idxDecl := strings.Index(payload, decl)
+		idxChain := strings.Index(payload, "chain input {")
+		if idxDecl < 0 || idxChain < 0 || idxDecl > idxChain {
+			t.Errorf("counter %q must be declared before `chain input`:\n%s", cn, payload)
+		}
+		// The catch-all DROP must reference that named counter.
+		wantDrop := hiDrop(fam.family, fam.addr, "wan")
+		if !strings.Contains(payload, wantDrop) {
+			t.Errorf("catch-all drop missing named counter, want %q\n---\n%s", wantDrop, payload)
+		}
+	}
+
+	// A fully-open zone (`system-services all`, no drop) must NOT declare a deny
+	// counter — only zones that emit a drop get one. control/em0 is a lifeline so
+	// it never scopes; the test config has no non-lifeline `all` zone, so assert
+	// no counter exists for the lan zone (no stanza -> no drop -> no counter).
+	if strings.Contains(payload, xnft.HostInboundDenyCounterName("lan", "ip")) {
+		t.Errorf("lan (no host-inbound stanza) must not get a deny counter:\n%s", payload)
+	}
+
+	// The atomic replace idiom must delete the table before recreating it, so the
+	// per-commit redeclaration of the named counters cannot collide (flush would
+	// leave the objects behind). Reverting to a plain `flush table` turns this RED.
+	if !strings.Contains(payload, "delete table inet xpf_hostinbound") {
+		t.Errorf("payload must delete+recreate the table (not flush) so counter "+
+			"objects do not collide on the next commit:\n%s", payload)
 	}
 }
 
@@ -137,8 +207,8 @@ func TestHostInboundFilterExemptsIPsecAndV6Errors(t *testing.T) {
 		t.Fatalf("ESP/AH accept not found")
 	}
 	for _, drop := range []string{
-		"ip daddr 172.16.50.8 drop",
-		"ip6 daddr 2001:db8:50::8 drop",
+		hiDrop("ip", "172.16.50.8", "wan"),
+		hiDrop("ip6", "2001:db8:50::8", "wan"),
 	} {
 		if idxDrop := strings.Index(payload, drop); idxDrop >= 0 && idxESP > idxDrop {
 			t.Errorf("ESP/AH exemption must precede the per-zone drop %q", drop)
@@ -260,7 +330,7 @@ func TestHostInboundFilterProtocolsAllScopedToRouting(t *testing.T) {
 
 	// A catch-all drop for everything else must be present (default-deny to
 	// the host for non-routing traffic).
-	if !strings.Contains(payload, "ip daddr 10.2.2.1 drop") {
+	if !strings.Contains(payload, hiDrop("ip", "10.2.2.1", "routing")) {
 		t.Errorf("protocols all must still emit the v4 catch-all drop:\n%s", payload)
 	}
 }
@@ -288,7 +358,7 @@ func TestHostInboundFilterExplicitSshStillAdmitted(t *testing.T) {
 	if !strings.Contains(payload, "ip daddr 10.3.3.1 tcp dport 22 accept") {
 		t.Errorf("system-services ssh must accept tcp/22:\n%s", payload)
 	}
-	if !strings.Contains(payload, "ip daddr 10.3.3.1 drop") {
+	if !strings.Contains(payload, hiDrop("ip", "10.3.3.1", "mgmt")) {
 		t.Errorf("system-services ssh zone must emit a catch-all drop:\n%s", payload)
 	}
 }
@@ -397,7 +467,7 @@ func TestHostInboundFilterConfiguredControlInterfaceLifeline(t *testing.T) {
 		t.Errorf("configured control-interface fxp1 address must never appear in host-inbound payload:\n%s", payload)
 	}
 	// Sanity: the enforced wan zone still scopes its own address.
-	if !strings.Contains(payload, "172.16.50.8 drop") {
+	if !strings.Contains(payload, hiDrop("ip", "172.16.50.8", "wan")) {
 		t.Errorf("wan zone must still emit a scoped deny:\n%s", payload)
 	}
 }

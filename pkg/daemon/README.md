@@ -398,6 +398,26 @@ never lock an operator out of a remote box it manages.
   mirrors the Rust classifier and must stay in sync. Tests:
   `host_inbound_nft_test.go` (accept-listed / deny-rest fail-on-revert,
   no-stanza-no-deny, lifeline-never-denied, `all`-opens-zone).
+  **Counted drops + scrape (#3361):** each per-zone/family catch-all drop is
+  `<fam> daddr <addrs> counter name "<n>" drop`, where `<n>` =
+  `nftables.HostInboundDenyCounterName(zone, family)` (encoding
+  `xpfhi_<family>_<len>_<zone>`, reversible even when the zone name contains
+  `_`/`-`). The named counter objects are declared at the top of the table body,
+  so the table now uses an `add table` / `delete table` / recreate idiom instead
+  of lo0's plain `flush table`: `flush` keeps named objects, so redeclaring the
+  counters on the next commit would collide ("File exists"). delete+recreate also
+  drops a stale counter for a zone that no longer enforces. A consequence is that
+  these counters reset to zero on every table rebuild (every commit + every
+  DHCP/DHCPv6 address change that re-renders the chain); Prometheus `rate()` reset
+  detection handles this. `pkg/nftables.ReadHostInboundDenyCounters()` reads the
+  counters back via netlink (no nft shell-out) and the API collector
+  (`pkg/api/metrics_counters.go:collectHostInboundKernelDenies`) exports them as
+  `xpf_host_inbound_kernel_denies_total{zone,family}` (REST aggregate
+  `host_inbound_kernel_denies`). This is the PRIMARY host-inbound enforcement
+  path and is DISTINCT from the userspace-dp `xpf_host_inbound_denies_total`
+  (`GlobalCtrHostInboundDeny`, #3326) — they are not double counts. Before #3361
+  these kernel drops were uncounted and `host_inbound_denies` stayed 0 even while
+  the firewall was actively denying control-plane traffic.
 
 ## RPM + ip-monitoring wiring (#1827)
 

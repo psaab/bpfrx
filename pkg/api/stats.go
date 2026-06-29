@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/nftables"
 )
 
 func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
@@ -49,6 +50,17 @@ func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusInternalServerError,
 			"global counter read failed: "+readErr.Error())
 		return
+	}
+
+	// #3361: aggregate the kernel nftables host-inbound DROP counters (the
+	// PRIMARY host-inbound enforcement path, distinct from the userspace-dp
+	// HostInboundDeny above). Best-effort: a netlink read failure leaves the
+	// field 0 — the per-zone/family Prometheus metric is the canonical surface
+	// and omits the series on error rather than reporting a misleading 0.
+	if kc, err := nftables.ReadHostInboundDenyCounters(); err == nil {
+		for _, ctr := range kc {
+			stats.HostInboundKernelDenies += ctr.Packets
+		}
 	}
 	writeOK(w, stats)
 }

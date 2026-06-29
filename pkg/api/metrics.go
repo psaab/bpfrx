@@ -18,18 +18,19 @@ type xpfCollector struct {
 	mu  sync.Mutex
 
 	// Global counters
-	packetsTotal         *prometheus.Desc
-	dropsTotal           *prometheus.Desc
-	sessionsCreatedTotal *prometheus.Desc
-	sessionsClosedTotal  *prometheus.Desc
-	screenDropsTotal     *prometheus.Desc
-	policyDeniesTotal    *prometheus.Desc
-	natAllocFailsTotal   *prometheus.Desc
-	nat64XlateTotal      *prometheus.Desc
-	hostInboundDeny      *prometheus.Desc
-	tcEgressPacketsTotal *prometheus.Desc
-	syncookieTotal       *prometheus.Desc
-	flowCacheTotal       *prometheus.Desc
+	packetsTotal            *prometheus.Desc
+	dropsTotal              *prometheus.Desc
+	sessionsCreatedTotal    *prometheus.Desc
+	sessionsClosedTotal     *prometheus.Desc
+	screenDropsTotal        *prometheus.Desc
+	policyDeniesTotal       *prometheus.Desc
+	natAllocFailsTotal      *prometheus.Desc
+	nat64XlateTotal         *prometheus.Desc
+	hostInboundDeny         *prometheus.Desc
+	hostInboundKernelDenies *prometheus.Desc
+	tcEgressPacketsTotal    *prometheus.Desc
+	syncookieTotal          *prometheus.Desc
+	flowCacheTotal          *prometheus.Desc
 
 	// #3345: monotonic count of global-counter map reads that failed during
 	// a scrape. A failed read SKIPS emitting that counter's sample (so a
@@ -484,6 +485,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.natAllocFailsTotal
 	ch <- c.nat64XlateTotal
 	ch <- c.hostInboundDeny
+	ch <- c.hostInboundKernelDenies
 	ch <- c.tcEgressPacketsTotal
 	ch <- c.syncookieTotal
 	ch <- c.flowCacheTotal
@@ -812,6 +814,12 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	c.collectGlobalCounters(ch, dp)
+	// #3361: kernel nftables host-inbound DROP counters, per zone/family. Read
+	// via netlink (no nft shell-out); on failure the #3345 contract applies
+	// (skip the series, bump counterReadErrors — emitted by collectGlobalCounters
+	// above). Kept inside the dataplane gate so the counterReadErrors accounting
+	// stays coherent with the global-counter scrape error signal.
+	c.collectHostInboundKernelDenies(ch)
 	c.collectInterfaceCounters(ch, dp)
 	c.collectZoneCounters(ch, dp)
 	c.collectPolicyCounters(ch, dp)
