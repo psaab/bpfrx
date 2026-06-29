@@ -829,6 +829,37 @@ echo narrowing (a widening INVERSION otherwise); and a malformed inline
 dropped, which would leave the term matching all ICMP) for the same strict-reject
 / lenient-warn gate.
 
+**Application is EITHER direct OR term-based, never both; conflicting duplicate
+term leaves rejected (#3366):** a custom `applications application <name>` may
+define EITHER a direct match body (`protocol` / `destination-port` /
+`source-port` / `inactivity-timeout` / `timeout` / `icmp-type` / `icmp-code` /
+`alg`) OR one or more `term` sub-blocks — Junos rejects the mix. Before this fix
+`compileApplications` stored ONLY the synthesized per-term applications for a
+term-bearing app (the `if len(terms) > 0 { ... } else { apps.Applications[appName]
+= app }` branch), so a config that combined a direct body with a `term` silently
+DROPPED the direct match. For a deny application that erased the deny and let
+traffic fall through to a later permit or the default policy (a fail-OPEN
+under-match), with no commit error. `compileApplications` now records such a
+parent on `cfg.Applications.MixedDirectTermApps` and `validateApplicationStructureStrict`
+(`compiler_validate_strict.go`) hard-rejects it at commit (move the direct match
+into its own `term`). The same gate also rejects a single-valued (scalar) term
+leaf — `destination-port` / `source-port` / `inactivity-timeout` / `timeout` /
+`alg` — that appears more than once inside ONE inline term with a CONFLICTING
+value: the inline `term` is opaque to the `SchemaValidate` walk, so a repeat (via
+apply-groups, flat-set ordering, or hand authoring) was last-writer-wins,
+silently overriding the earlier value by token order; `parseApplicationTerms`
+records the offending leaf on `Application.DuplicateTermLeaves`. An IDEMPOTENT
+same-value repeat (e.g. the `timeout` / `inactivity-timeout` aliases both set to
+the same number) is harmless and accepted, and a repeated `protocol` is the
+documented multi-protocol-term syntax (one application per unique protocol) and
+is NOT flagged. Both checks run over EVERY user-defined application — referenced
+or not — like the #3352/#3353 syntactic gate (a structural grammar error Junos
+rejects at definition, regardless of policy wiring), and the tolerant
+load/peer-sync path downgrades the reject to a warning (`lenientApplicationSpecs`)
+so an already-persisted or older-peer-synced config still boots (#1960 no-brick
+doctrine). Distinct from #3339 (implicit-set vs explicit-set collision / duplicate
+term NAMES), #3352 (unknown leaves inside a term), and #3320 (malformed timeout).
+
 **C struct alignment:** when mirroring C BPF structs in Go, match `sizeof`
 exactly with trailing `Pad [N]byte` fields. cilium/ebpf serializes map
 values in native endian, not big-endian, so use `binary.NativeEndian`

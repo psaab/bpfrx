@@ -17,6 +17,13 @@ type apiRuntimeDataPlane interface {
 	IsLoaded() bool
 	IterateSessions(func(dataplane.SessionKey, dataplane.SessionValue) bool) error
 	IterateSessionsV6(func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+	// GetSessionV4/V6 look up a single session entry by key. The session
+	// view uses them to merge the companion reverse entry's counters into
+	// the forward entry, matching the gRPC enrichment (#3419 H3). Without
+	// the merge, REST top-talkers/accounting under-report the reverse
+	// direction's volume.
+	GetSessionV4(dataplane.SessionKey) (dataplane.SessionValue, error)
+	GetSessionV6(dataplane.SessionKeyV6) (dataplane.SessionValueV6, error)
 	ClearAllSessions() (int, int, error)
 
 	ReadGlobalCounter(uint32) (uint64, error)

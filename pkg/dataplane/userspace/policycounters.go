@@ -54,6 +54,17 @@ func buildPolicyRuleCounterIndex(status *ProcessStatus) map[string]PolicyRuleCou
 // incremented in userspace mode), so there is nothing to "round-trip" against —
 // the only requirement is caller/resolver agreement, and both use slice index.
 func policyRuleIDForCounter(cfg *config.Config, policyID uint32) string {
+	// #3363: the reserved sentinel doubles as the read handle for the IMPLICIT
+	// default-policy hit counter. The userspace helper reports that counter
+	// under the stable rule id dataplane.DefaultPolicyName ("default-policy",
+	// the same name rendered in RT_FLOW logs), so resolving the sentinel here
+	// lets EVERY existing counter surface (CLI, gRPC text, REST, Prometheus)
+	// read it via the unchanged ReadPolicyCounters(DefaultPolicySentinelID)
+	// path — no new dataplane interface method. The sentinel can never collide
+	// with a configured policy's computed id (see DefaultPolicySentinelID).
+	if policyID == dataplane.DefaultPolicySentinelID {
+		return dataplane.DefaultPolicyName
+	}
 	if cfg == nil {
 		return ""
 	}
