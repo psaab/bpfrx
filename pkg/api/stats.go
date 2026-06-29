@@ -67,6 +67,9 @@ func (s *Server) ifaceStatsHandler(w http.ResponseWriter, _ *http.Request) {
 	// Build interface->zone map
 	ifZone := make(map[string]string)
 	for zoneName, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		for _, ifName := range zone.Interfaces {
 			ifZone[ifName] = zoneName
 		}

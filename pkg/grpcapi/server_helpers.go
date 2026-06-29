@@ -44,6 +44,9 @@ func allInterfaceNames(cfg *config.Config) map[string]bool {
 		names[ifName] = true
 	}
 	for _, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		for _, ifName := range zone.Interfaces {
 			names[ifName] = true
 		}

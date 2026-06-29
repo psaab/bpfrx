@@ -28,6 +28,9 @@ func (s *Server) zonesHandler(w http.ResponseWriter, _ *http.Request) {
 	var readErr error
 	var zones []ZoneInfo
 	for zoneName, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		zi := ZoneInfo{
 			Name:       zoneName,
 			Interfaces: zone.Interfaces,

@@ -457,6 +457,9 @@ func (c *CLI) testSecurityZone(args []string) error {
 	}
 
 	for zoneName, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		for _, iface := range zone.Interfaces {
 			if iface == ifName {
 				fmt.Printf("Interface %s belongs to zone: %s\n", ifName, zoneName)

@@ -49,6 +49,9 @@ func (s *Server) showInterfacesExtensive(cfg *config.Config, buf *strings.Builde
 			ifCfgMap[ifc.Name] = ifc
 		}
 		for _, z := range cfg.Security.Zones {
+			if z == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+				continue
+			}
 			for _, ifName := range z.Interfaces {
 				ifZoneMap[ifName] = z.Name
 			}
@@ -150,6 +153,9 @@ func (s *Server) showInterfacesDetail(cfg *config.Config, filter string, buf *st
 	ifDescMap := make(map[string]string)
 	if cfg != nil {
 		for _, z := range cfg.Security.Zones {
+			if z == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+				continue
+			}
 			for _, ifName := range z.Interfaces {
 				ifZoneMap[ifName] = z.Name
 			}
@@ -288,6 +294,9 @@ func (s *Server) showVLANs(cfg *config.Config, buf *strings.Builder) {
 	} else {
 		ifZone := make(map[string]string)
 		for zoneName, zone := range cfg.Security.Zones {
+			if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+				continue
+			}
 			for _, iface := range zone.Interfaces {
 				ifZone[iface] = zoneName
 			}
