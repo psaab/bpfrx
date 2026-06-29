@@ -23412,6 +23412,25 @@ top.
 - **Timestamp**: 2026-06-29T11:40Z
   - **Action**: #3442 Codex MERGE-NEEDS-MAJOR fold (PR #3517) — over-rejection risk. Verb-set reconciliation: applyEditLine -> ParseSetVerb replays EXACTLY set/delete/deactivate/activate (everything else hits the bare-path default = the M3 bug); FormatSet (display-set, the loadable artifact) emits only set/deactivate. annotate/copy/insert/rename are interactive-only structural edits (pkg/cli/cli_dispatch.go handlers, distinct multi-clause grammar) NEVER present in a flat-load file and NOT replayable — pre-fix they were silently mangled into junk `set annotate ...` nodes, so rejecting them is the M3 fix, not a regression. Confirmed `hasFlatVerb` recognizes exactly the 4 replayable verbs (option 2). Real fix folded: Codex #3 whitespace — the literal-`verb ` prefix check wrongly rejected a tab between verb and path (lexer treats tabs as whitespace); rewrote hasFlatVerb to match the first whitespace-delimited token (strings.Fields) against the verb set + require >=1 path token. Added TestLoadFlatVerbGate (all 4 verbs accepted in sequence; tab-separated set accepted; annotate/copy/insert/rename + garbage rejected on BOTH LoadSet and LoadMerge-flat). RED-on-revert reconfirmed against true origin/master source (garbage + interactive verbs + TestLoadSet all fail) AND the tab assertion fails under the prior literal-space gate. go test ./pkg/configstore/... ./pkg/config/... ./pkg/api/... ./pkg/grpcapi/... ./pkg/cli/... green; gofmt clean.
   - **File(s)**: pkg/configstore/store_command.go, pkg/configstore/store_test.go, pkg/configstore/README.md, _Log.md
+- **Timestamp**: 2026-06-29T12:00Z
+  - **Action**: #3447 strict-parse the CLI `rollback <arg>`. A malformed
+    argument (`rollback foo`, `rollback 1x`, `rollback -1`) silently fell
+    through to rollback 0, which resets the candidate to active and clears
+    the dirty flag — discarding uncommitted edits. Local CLI used
+    `fmt.Sscanf(parts[1],"%d",&n)` (leaves n=0 on failure, accepts garbage
+    suffixes); remote CLI used `strconv.Atoi` and dropped the error (n=0).
+    Fix: both surfaces now `strconv.Atoi` the token and return a clear error
+    on a non-integer or negative value before touching the store / Rollback
+    RPC. Too-big indices still flow to the store, which range-checks via
+    history.Get and returns out-of-range. Preserved: `rollback 0` and bare
+    `rollback` (both = discard candidate, the only discard path). RED-on-
+    revert verified on BOTH surfaces (revert the strict parse → the malformed
+    cases silently succeed and the candidate-discard / N=0-RPC assertions
+    fail). go test ./pkg/cli/ ./pkg/configstore/ ./pkg/grpcapi/ ./cmd/cli/
+    green; gofmt clean. No operator doc documents rollback-arg validation
+    (cmdtree desc is generic), so no doc change.
+  - **File(s)**: pkg/cli/cli_dispatch.go, cmd/cli/shared.go,
+    pkg/cli/cli_rollback_3447_test.go, cmd/cli/rollback_3447_test.go, _Log.md
   - **Action**: #3361 — count + scrape the KERNEL nftables host-inbound drops (distinct path from #3326 userspace-dp). Verified gap on origin/master: emitHostInboundZone emitted an UNCOUNTED catch-all `<fam> daddr <addrs> drop` and nothing fed host_inbound_denies from nft, so an operator actively denying control-plane traffic saw host_inbound_denies=0. Fix: (1) pkg/nftables/host_inbound_counters.go — deterministic reversible counter-name encoding `xpfhi_<family>_<len>_<zone>` (HostInboundDenyCounterName/ParseHostInboundDenyCounterName) + ReadHostInboundDenyCounters() reading named CounterObj via netlink (no nft shell-out; absent table -> nil,nil). (2) buildHostInboundFilterPayload declares one named counter per drop-emitting zone/family and switched the table preamble from `flush table` to `add table`/`delete table`/recreate (flush keeps named objects -> redeclare collides "File exists"; also drops stale counters). emitHostInboundZone attaches `counter name "<n>"` to each catch-all drop. (3) pkg/api: new metric xpf_host_inbound_kernel_denies_total{zone,family} (collectHostInboundKernelDenies, inside dp gate for counterReadErrors coherence) + REST aggregate host_inbound_kernel_denies (best-effort). Counters reset on each table rebuild (commit/DHCP addr change); documented, rate() handles it. RED-on-revert: stripping the counter from the drop fails TestHostInboundFilterDropRulesCounted + TestHostInboundFilterAcceptsListedDeniesRest (verified). go build ./..., go test ./pkg/daemon/... ./pkg/api/... ./pkg/nftables/... green; gofmt clean.
   - **File(s)**: pkg/nftables/host_inbound_counters.go, pkg/nftables/host_inbound_counters_test.go, pkg/daemon/daemon_nft.go, pkg/daemon/host_inbound_nft_test.go, pkg/daemon/host_inbound_parity_test.go, pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_counters.go, pkg/api/stats.go, pkg/api/types.go, pkg/daemon/README.md, _Log.md
 
