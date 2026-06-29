@@ -419,6 +419,20 @@ fn parse_term(
     filter_name: &str,
     three_color_policers: &rustc_hash::FxHashMap<String, Arc<ThreeColorPolicerRuntime>>,
 ) -> Result<FilterTerm, SnapshotIntegrityError> {
+    // #3367: the Go control plane sets `tcp_flags_unparseable` when it could not
+    // parse the term's tcp-flags expression into required/forbidden masks. Leaving
+    // the masks None (the pre-fix behavior) makes the matcher treat the term as
+    // having NO tcp-flags constraint — silently widening a `then discard`/`reject`
+    // term to match every TCP segment (fail-WIDE). Fail the whole snapshot closed
+    // instead, mirroring the #2505 UnrepresentableFilterProtocol backstop. Checked
+    // first so the preflight stays non-mutating.
+    if snap.tcp_flags_unparseable {
+        return Err(SnapshotIntegrityError::UnrepresentableFilterTCPFlags {
+            family: filter_family.to_string(),
+            filter: filter_name.to_string(),
+            term: snap.name.clone(),
+        });
+    }
     let mut source_v4 = Vec::new();
     let mut source_v6 = Vec::new();
     for addr in &snap.source_addresses {

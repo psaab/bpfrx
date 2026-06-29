@@ -828,6 +828,90 @@ fn all_unparseable_terms_fail_closed_with_integrity_error() {
 }
 
 #[test]
+fn malformed_legacy_source_address_fails_closed_with_integrity_error() {
+    // #3367 RED-on-revert: a rule whose LEGACY `source_addresses` field carries a
+    // token that is non-empty, non-`any`, non-family-wildcard, and unparseable as
+    // an IP/CIDR must reject the WHOLE snapshot. Pre-fix `parse_address` silently
+    // dropped the bad token; with no family-scoped wildcard present the side then
+    // collapsed to the empty->MatchAny legacy convention, so a `deny` rule scoped
+    // to one (mistyped) address WIDENED to match every source (fail-OPEN).
+    // Reverting the fix returns Ok(state) with a match-any source, so this is
+    // non-tautological.
+    let store = PolicyCounterStore::default();
+    let bad = PolicyRuleSnapshot {
+        rule_id: "bad-src".to_string(),
+        name: "deny-host".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        // Legacy path: no source_literals / source_book_ids, so this is parsed by
+        // parse_legacy_address_set. "10.0.0.999" is not a valid IPv4.
+        source_addresses: vec!["10.0.0.999".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "deny".to_string(),
+        ..Default::default()
+    };
+    let result =
+        parse_policy_state_with_counters("deny", &[bad], &test_zone_name_to_id(), &[], &store);
+    match result {
+        Err(SnapshotIntegrityError::UnrepresentableLegacyAddress { rule_id, address }) => {
+            assert_eq!(rule_id, "bad-src");
+            assert_eq!(address, "10.0.0.999");
+        }
+        other => panic!("expected UnrepresentableLegacyAddress, got {other:?}"),
+    }
+}
+
+#[test]
+fn malformed_legacy_destination_address_fails_closed() {
+    // #3367: the destination side of the legacy field is guarded identically.
+    let store = PolicyCounterStore::default();
+    let bad = PolicyRuleSnapshot {
+        rule_id: "bad-dst".to_string(),
+        name: "deny-host".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["not-an-address".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "deny".to_string(),
+        ..Default::default()
+    };
+    let result =
+        parse_policy_state_with_counters("deny", &[bad], &test_zone_name_to_id(), &[], &store);
+    match result {
+        Err(SnapshotIntegrityError::UnrepresentableLegacyAddress { rule_id, address }) => {
+            assert_eq!(rule_id, "bad-dst");
+            assert_eq!(address, "not-an-address");
+        }
+        other => panic!("expected UnrepresentableLegacyAddress, got {other:?}"),
+    }
+}
+
+#[test]
+fn legacy_address_valid_literals_and_wildcards_still_parse() {
+    // #3367 guard: the reject is keyed on UNPARSEABLE tokens only. Valid CIDRs,
+    // bare IPs, `any`, and family-scoped wildcards must still compile cleanly.
+    let store = PolicyCounterStore::default();
+    let good = PolicyRuleSnapshot {
+        rule_id: "good".to_string(),
+        name: "permit-host".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["10.0.61.0/24".to_string(), "192.168.1.5".to_string()],
+        destination_addresses: vec!["any-ipv4".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "permit".to_string(),
+        ..Default::default()
+    };
+    parse_policy_state_with_counters("deny", &[good], &test_zone_name_to_id(), &[], &store)
+        .expect("valid legacy literals / wildcards must compile");
+}
+
+#[test]
 fn go_unsupported_sentinel_fails_closed() {
     // Cross-language contract: the Go capability gate emits a "__unsupported__"
     // sentinel term for an unrepresentable application; Rust must drop it and
@@ -1636,19 +1720,20 @@ fn default_policy_no_match_emits_sentinel_policy_id() {
     assert_eq!(matched.policy_id, 0, "the real first policy keeps ID 0");
 }
 
-/// #923: legacy permissive parse — addresses that fail to parse
-/// are silently dropped by `parse_address`. If ALL configured
-/// addresses are malformed the resulting Vec is empty, which
-/// `PrefixSet::from_prefixes(Vec::new())` collapses to
-/// `MatchAny` — preserving the legacy `Vec::is_empty()` =
-/// match-all behavior. This is intentional; a strict-parse
-/// follow-up issue tracks fixing the silent-drop.
+/// #923 / #3367: legacy permissive parse — addresses that fail to parse used to
+/// be silently dropped by `parse_address`, so an all-malformed list collapsed to
+/// MatchAny (the historical `Vec::is_empty()` = match-all behavior). #3367 makes
+/// that a snapshot-integrity error: a malformed token can no longer silently
+/// widen a rule. This test now PROVES the fail-closed reject (it asserted the
+/// old match-all behavior before #3367, so a revert flips it back to Ok+Permit).
 #[test]
-fn malformed_only_input_yields_match_all_via_evaluate_policy() {
+fn malformed_only_input_fails_closed_not_match_all() {
     let zones = test_zone_name_to_id();
-    let state = parse_policy_state(
+    let store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
         "deny",
         &[PolicyRuleSnapshot {
+            rule_id: "permit-with-typo".into(),
             name: "permit-with-typo".into(),
             from_zone: "lan".into(),
             to_zone: "wan".into(),
@@ -1663,22 +1748,19 @@ fn malformed_only_input_yields_match_all_via_evaluate_policy() {
             ..Default::default()
         }],
         &zones,
+        &[],
+        &store,
     );
-    // The malformed source becomes MatchAny; an arbitrary src
-    // hits the rule and returns Permit.
-    assert_eq!(
-        evaluate_policy(
-            &state,
-            TEST_LAN_ZONE_ID,
-            TEST_WAN_ZONE_ID,
-            "8.8.8.8".parse().expect("src"),
-            "1.1.1.1".parse().expect("dst"),
-            PROTO_TCP,
-            12345,
-            80,
-        ),
-        PolicyAction::Permit
-    );
+    // Pre-#3367 this parsed Ok and the malformed source collapsed to MatchAny
+    // (match-all). Now the whole snapshot is rejected — the first malformed
+    // token is surfaced.
+    match result {
+        Err(SnapshotIntegrityError::UnrepresentableLegacyAddress { rule_id, address }) => {
+            assert_eq!(rule_id, "permit-with-typo");
+            assert_eq!(address, "totally-bogus");
+        }
+        other => panic!("expected UnrepresentableLegacyAddress, got {other:?}"),
+    }
 }
 
 // #1606 — address-book wire-protocol tests.

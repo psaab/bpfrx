@@ -220,6 +220,17 @@ pub(crate) struct FirewallTermSnapshot {
     // independent: a term may set either, both, or neither.
     #[serde(rename = "tcp_flags_forbidden", default)]
     pub tcp_flags_forbidden: Option<u8>,
+    // tcp_flags_unparseable (#3367) is set by the Go control plane when the
+    // term's tcp-flags expression could not be parsed into required/forbidden
+    // masks (disjunction, negated groups, unknown flags). The pre-fix Go builder
+    // logged the error and left both masks None, and this matcher treats absent
+    // masks as "no tcp-flags constraint" — silently widening the term to match
+    // every TCP segment (fail-OPEN for a deny/discard term). With this flag the
+    // filter compiler raises SnapshotIntegrityError::UnrepresentableFilterTCPFlags
+    // and rejects the whole snapshot. serde(default) keeps wire parity with an
+    // older control plane that omits the field (#1961).
+    #[serde(rename = "tcp_flags_unparseable", default)]
+    pub tcp_flags_unparseable: bool,
     // is_fragment matches any IP fragment (IPv4 MF set OR non-zero offset;
     // IPv6 fragment extension header present).
     #[serde(rename = "is_fragment", default)]
