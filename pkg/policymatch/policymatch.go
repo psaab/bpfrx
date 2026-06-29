@@ -927,14 +927,29 @@ func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryP
 			return false
 		}
 	}
-	// Source port retains #3107's deliberate diagnostic stance: an OMITTED query
-	// source port (the ephemeral, operator-rarely-known dimension) is treated as
-	// "unconstrained" so a source-port-bearing app term still resolves. Only a
-	// SPECIFIED source port is checked. Narrowing this too would change the
-	// #3107 absent-source-port contract (TestShowTestPolicySourcePort), which is
-	// out of #3330's destination-port scope.
-	if app.SourcePort != "" && srcPort > 0 && !portMatches(app.SourcePort, srcPort) {
-		return false
+	// #3415: when the application term CONSTRAINS a source port, an OMITTED query
+	// source port must NOT match-any — it must fail closed, mirroring the runtime
+	// and the now fail-closed protocol (#3323) and destination-port (#3330)
+	// siblings above. The runtime always carries a concrete source port and the
+	// dataplane gates a source-port-constrained app on it (appid.matchTuple ->
+	// portInSpec(srcPort, appSrcPort); policy.rs CompiledApplications.matches): a
+	// packet whose source port differs from the app's `source-port` never
+	// matches. An omitted query source port arrives as 0, which a real app source
+	// port (e.g. 5000) never equals and no app range admits, so the constrained
+	// term does NOT match. The old `&& srcPort > 0` gate skipped the check for an
+	// omitted port — #3107's deliberate diagnostic stance — and over-certified a
+	// permit for a source-port-bearing app no concrete packet would hit. This
+	// supersedes that #3107 absent-source-port contract: source port is ephemeral
+	// and rarely known, but a SOURCE-PORT-CONSTRAINED app is rare, and certifying
+	// a permit/deny for a broader class of packets than the runtime enforces is
+	// the exact over-match #3323/#3330 closed. An UNCONSTRAINED source-port term
+	// (app.SourcePort == "") still matches any port, unchanged — the common case
+	// (no source-port constraint) is unaffected, so a query omitting source port
+	// against an ordinary destination-port app behaves exactly as before.
+	if app.SourcePort != "" {
+		if srcPort <= 0 || !portMatches(app.SourcePort, srcPort) {
+			return false
+		}
 	}
 	return true
 }

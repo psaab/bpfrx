@@ -50,15 +50,22 @@ security {
 	return &Server{store: store}
 }
 
-// TestShowTestPolicySourcePort asserts the #3107 contract on the ShowText
-// "test-policy:" simulator (the operational `test policy` served via gRPC, the
-// remote `cli` backend): the `srcport=` topic key threads into
-// policymatch.Query.SrcPort, so the verdict reflects a source-port-constrained
-// policy.
+// TestShowTestPolicySourcePort asserts the #3107 source-port plumbing AND the
+// #3415 fail-closed semantics on the ShowText "test-policy:" simulator (the
+// operational `test policy` served via gRPC, the remote `cli` backend): the
+// `srcport=` topic key threads into policymatch.Query.SrcPort, so the verdict
+// reflects a source-port-constrained policy.
+//
+// #3415 supersedes #3107's original "absent src port matches" contract: an
+// OMITTED query source port against a SOURCE-port-constrained app now fails
+// closed (the runtime always carries a concrete source port and would not match
+// a packet whose source port differs from the app's `source-port`), so the
+// "absent src port" case is now a NON-match (default deny-all).
 //
 // FAIL-ON-REVERT: dropping the srcport parse / the SrcPort field on the Query
 // makes SrcPort always 0 ("any port"), so the wrong-port case would PERMIT
-// (overmatch) and "wrong src port" flips red.
+// (overmatch) and "wrong src port" flips red. Restoring the `&& srcPort > 0`
+// wildcard gate makes "absent src port" PERMIT again, flipping that case red.
 func TestShowTestPolicySourcePort(t *testing.T) {
 	s := srcPortPolicyStore(t)
 
@@ -69,7 +76,7 @@ func TestShowTestPolicySourcePort(t *testing.T) {
 	}{
 		{"correct src port", "test-policy:from=trust,to=untrust,proto=tcp,srcport=5000,port=80", true},
 		{"wrong src port", "test-policy:from=trust,to=untrust,proto=tcp,srcport=6000,port=80", false},
-		{"absent src port", "test-policy:from=trust,to=untrust,proto=tcp,port=80", true},
+		{"absent src port", "test-policy:from=trust,to=untrust,proto=tcp,port=80", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
