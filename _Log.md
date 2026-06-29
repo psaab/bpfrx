@@ -23546,6 +23546,35 @@ top.
   - **Action**: #3327 — REST/gRPC screen inventory omitted port-scan, ip-sweep, limit-session-source/-destination, and icmp-fragment, and exposed no thresholds. Root cause: pkg/api/security.go and pkg/grpcapi/server_helpers.go each carried a byte-identical `screenChecks` string helper (the drift mechanism) listing only 12 checks; ScreenProfile carries PortScanThreshold/IPSweepThreshold/LimitSession.{Source,Destination}IPBased/ICMP.Fragment that buildScreenSnapshots (pkg/dataplane/userspace/screens.go) fully enforces. Fix: introduced single SSOT `config.ScreenChecks` + `config.ScreenThresholds` (pkg/config/screen_inventory.go) consumed by both APIs; both `screenChecks` helpers now delegate. Added the 5 omitted presence checks (set kept superset of enforced set) plus a thresholds map surfacing numeric values (icmp/udp/syn-flood with individually-keyed syn-flood sub-thresholds, port-scan, ip-sweep, session limits). Wire: proto ScreenInfo gained `map<string,int64> thresholds = 3` (regenerated xpf.pb.go via make proto); REST ScreenInfo gained `Thresholds map[string]int json:thresholds,omitempty`. RED-on-revert verified twice (drop the 5 checks -> both API tests fail on each missing check; null the threshold population -> both fail on each missing threshold). go test ./pkg/api/ ./pkg/grpcapi/ ./pkg/config/ ./pkg/dataplane/ ./pkg/logging/ green; go vet + gofmt clean. Cross-package ScreenFlagNames<->ringbuf mirror untouched (runtime event flags, not config inventory) — TestRawEventContractMatchesDataplaneEvent still green.
   - **File(s)**: pkg/config/screen_inventory.go (new), pkg/api/security.go, pkg/api/types.go, pkg/api/security_screen_inventory_3327_test.go (new), pkg/grpcapi/server_show_zones.go, pkg/grpcapi/server_helpers.go, pkg/grpcapi/server_screen_inventory_3327_test.go (new), proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go, pkg/api/README.md, pkg/grpcapi/README.md, _Log.md
 
+- **Timestamp**: 2026-06-29T14:15Z
+  - **Action**: #3327 Codex MERGE-NEEDS-MAJOR fold (PR #3538). PR #3538 fixed
+    the STRUCTURED REST/gRPC screen inventory and introduced the SSOT
+    config.ScreenChecks / config.ScreenThresholds, but left HAND-BUILT screen
+    inventory lists in the TEXT renderers that still omitted port-scan,
+    ip-sweep, limit-session-source, limit-session-destination, and
+    icmp-fragment and did not delegate to the SSOT — so `show security zones`
+    detail and `show security screen` text output kept drifting from the
+    enforced/structured set (the "no second divergent inventory list remains"
+    gate). Fix: routed the enabled-check inventory through a single shared
+    grpcapi helper `screenEnabledCheckList(profile)` (delegates to
+    config.ScreenChecks / config.ScreenThresholds, annotating threshold-bearing
+    tokens as `name(threshold:N)`, syn-flood keyed on its attack-threshold)
+    consumed by (1) server_show_zones_text.go showZonesDetail "Enabled checks"
+    line and (2) server_show_security_text.go showScreen. The
+    screen-ids-option DETAIL table (showScreenIDSOptionDetail) is a
+    full-universe view (lists every check WITH its value AND default, including
+    disabled), so it cannot be ScreenChecks-driven (enabled-only); instead it
+    was completed with a row for each of the 5 omitted checks so it can no
+    longer drift. While here, the sibling non-detail status table
+    (showScreenIDSOption, a 4th hand-built list with the same omission) was
+    completed too so NO screen-inventory renderer remains divergent. RED-on-
+    revert verified for all three flagged sites (revert each delegation/row
+    block → the matching omitted-check assertion fails). go test ./pkg/grpcapi/
+    ./pkg/api/ ./pkg/config/ ./pkg/cli/ green; go vet ./pkg/grpcapi/ + gofmt
+    clean; regenerated the deterministic golden (server_show_golden.json) for
+    the screen + screen-ids-option-detail topics (deliberate output change).
+  - **File(s)**: pkg/grpcapi/server_show_zones_text.go, pkg/grpcapi/server_show_security_text.go, pkg/grpcapi/server_show_screen_inventory_text_3327_test.go (new), pkg/grpcapi/testdata/server_show_golden.json, _Log.md
+
 - **Timestamp**: 2026-06-29T12:30Z
   - **Action**: #3446 source/destination-NAT `match destination-port` range validation. Static NAT validated its destination-port leaf (#2491) but the SNAT/DNAT match grammar did not: parser used bare strconv.Atoi (no bounds, non-numeric silently dropped) and builders cast to uint16, so port 0 → wildcard (H12), 70000 → wrap 4464 / -1 → 65535 (H13), `http` → empty list → wildcard (H14). Fix: (1) parseDNATPortList now returns unparseable raw tokens too → stored on NATMatch.InvalidDestinationPorts (skips `to`/`[`/`]`); (2) validateNATMatchDestinationPortStrict hard-rejects 0/out-of-range/non-numeric at commit for BOTH source and destination NAT, lenient-warn on tolerant load (shares lenientDestNATAddresses); (3) DNAT builder fail-closed — filters term ports to 1..65535 and emits NO snapshot (match nothing) when a port was configured but none survives, never wildcard (mirrors source-NAT #3429 natNeverMatchPortRange). No wire change (InvalidDestinationPorts is compiler-internal; builder uses existing destination_port slot). Boundary tests added (config commit gate + dataplane builder). RED-on-revert verified for both the commit gate and the builder fail-closed (70000→4464 wrap reproduced on revert). go test ./pkg/config/... ./pkg/dataplane/userspace/... green; cargo test --no-run nat:: green (no Rust touched); gofmt/vet clean.
   - **File(s)**: pkg/config/types_security.go, pkg/config/compiler_nat.go, pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/dataplane/userspace/nat.go, pkg/config/compiler_nat_match_dport_3446_test.go, pkg/dataplane/userspace/nat_dnat_match_dport_3446_test.go, docs/userspace-dnat-plan.md, _Log.md
