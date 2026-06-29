@@ -897,6 +897,28 @@ reserved for whole-dataplane selection where a rewrite shim
     source and destination name leaves) and fails closed on the lenient
     load / peer-sync path (the unresolved raw token cannot parse as an IP,
     so the rule matches NOTHING rather than broadening to match-any).
+    **#3425 — defined-but-unresolvable references**: the same gate now also
+    rejects a name that IS defined under `security address-book` but
+    resolves to NO concrete address — a defined-but-empty `address-set`, a
+    set whose members dangle, or an `address` with no prefix
+    (`Value == ""`). Existence alone is not enough: the snapshot builder
+    resolves the name through `resolveUserspaceAddressBookEntry` (which
+    returns `ok=false` for these cases) and appends the raw unparseable
+    token, so the SNAT source list stays non-empty-but-unmatchable and the
+    DNAT rule emits zero `DnatTable` entries — the rule translates no
+    traffic. Strict commit now surfaces this as an operator-visible error
+    (resolution mirrors the runtime via the shared
+    `policyMatchAddressBookResolves` helper, so commit and apply cannot
+    diverge — the NAT analog of the #3149 policy-address representability
+    gate and the #3434 NAT match-application gate). A DIRECT
+    `security dynamic-address address-name <name>` feed binding is ACCEPTED
+    (its static expansion is empty but the live feed overlay supplies the
+    prefixes at runtime, #3303) — mirroring the
+    `validatePolicyMatchAddressesStrict` feed carve-out (#3294); a feed
+    member NESTED in an address-set stays poisoned by the static resolver
+    (the anti-Option-C guardrail). Lenient load / peer-sync downgrades to a
+    warning so an already-persisted or peer-synced config still boots
+    (#1960); the dataplane fails closed independently.
   - `protocols router-advertisement interface` — typed the
     second-denominated leaves (`max/min-advertisement-interval`,
     `default-lifetime`, `link-mtu`; the latter was tightened from
