@@ -133,20 +133,44 @@ type LogStreamEntry struct {
 	Message  string `json:"message"`
 }
 
+// eventEntryFromRecord maps a logging.EventRecord to the REST/SSE EventEntry.
+// It is the single SSOT for both the GET /security/events response and the SSE
+// event stream, so the two surfaces never drift (#3337). The timestamp uses
+// RFC3339Nano so high-rate RT_FLOW events keep sub-second ordering for
+// cross-system correlation (the CLI keeps human-friendly seconds).
 func eventEntryFromRecord(rec logging.EventRecord) EventEntry {
 	return EventEntry{
-		Time:         rec.Time.Format(time.RFC3339),
-		Type:         rec.Type,
-		SrcAddr:      rec.SrcAddr,
-		DstAddr:      rec.DstAddr,
-		Protocol:     rec.Protocol,
-		Action:       rec.Action,
-		PolicyID:     rec.PolicyID,
-		InZone:       rec.InZone,
-		OutZone:      rec.OutZone,
-		ScreenCheck:  rec.ScreenCheck,
-		SessionPkts:  rec.SessionPkts,
-		SessionBytes: rec.SessionBytes,
+		Time:            rec.Time.Format(time.RFC3339Nano),
+		Type:            rec.Type,
+		SrcAddr:         rec.SrcAddr,
+		DstAddr:         rec.DstAddr,
+		Protocol:        rec.Protocol,
+		Action:          rec.Action,
+		PolicyID:        rec.PolicyID,
+		InZone:          rec.InZone,
+		OutZone:         rec.OutZone,
+		InZoneName:      rec.InZoneName,
+		OutZoneName:     rec.OutZoneName,
+		ScreenCheck:     rec.ScreenCheck,
+		SessionPkts:     rec.SessionPkts,
+		SessionBytes:    rec.SessionBytes,
+		RevSessionPkts:  rec.RevSessionPkts,
+		RevSessionBytes: rec.RevSessionBytes,
+		PolicyName:      rec.PolicyName,
+		AppName:         rec.AppName,
+		IngressIface:    rec.IngressIface,
+		CloseReason:     rec.CloseReason,
+		Reason:          rec.Reason,
+		NATSrcAddr:      rec.NATSrcAddr,
+		NATDstAddr:      rec.NATDstAddr,
+		SessionID:       rec.SessionID,
+		ElapsedTime:     rec.ElapsedTime,
+		Created:         rec.Created,
+		CreatedNanos:    rec.CreatedNanos,
+		EgressIfindex:   rec.EgressIfindex,
+		IngressIfindex:  rec.IngressIfindex,
+		TOS:             rec.TOS,
+		TCPControlBits:  rec.TCPControlBits,
 	}
 }
 
