@@ -1641,6 +1641,88 @@ no compiler/validator behaviour changes). Regression coverage:
 `CompleteSetPathWithValues` for zone-pair and global policies (fail-on-revert),
 and the declared form passes `SchemaValidate` without a false reject.
 
+### #3377 — Security-policy `then` action leaves (permit/deny/reject/count completion + drift canary)
+
+The config-mode `then` action subtree under `security policies` declared only
+the `log` leaf; the terminal actions `permit`/`deny`/`reject` and the `count`
+modifier lived solely in a `// permit, deny, reject, count → leaf` comment
+placeholder even though the policy compiler (`compiler_security.go`,
+`compilePolicy`'s `then` switch) consumes all of them. That is the
+compiled-but-not-schema-visible drift the two-SSOT rule exists to prevent:
+`set security policies ... then ?` completion / `?` help could not offer the
+most basic policy actions. (`SchemaValidate` did not *reject* the missing
+actions — `walkSchemaNode` returns nil for unknown keywords — so this was a
+completion gap, not a commit-time false reject.)
+
+The fix declares the `then` children in `pkg/config/schema_security.go` via a
+shared `policyThenSchemaChildren()` factory used by BOTH the zone-pair and the
+global policy `then` nodes (a factory, not a shared var, so the two scopes get
+independent mutable schema trees). The child set mirrors the compiler switch
+**and the EXACT supported surface**, so completion never advertises a leaf the
+commit-check then rejects:
+
+- `permit` / `reject` — declared **childless**. A bare `then permit` / `then
+  reject` is supported; any child (`application-services`, `tunnel`,
+  `firewall-authentication` under permit; `profile`, `tcp-reset` under reject)
+  is rejected at commit by `validatePolicyThenPermitStrict` (#3114) /
+  `validatePolicyThenRejectStrict` (#3115), which remain the SSOT for that
+  rejection. `walkSchemaNode` ignores unknown descendants of a childless
+  container, so the schema does not double-reject.
+- `deny` — carries the `log`/`count` observability modifiers it legitimately
+  combines with (`applyCollapsedDenyModifiers`, #3141); any other deny modifier
+  is rejected by `validatePolicyThenDenyStrict`.
+- `log` — carries its `session-init`/`session-close` sub-options (the exact
+  tokens `compilePolicy`'s `log` arm reads).
+
+**Parser-grouping interaction (the load-bearing detail):** declaring `deny`
+(and its modifiers) as schema leaves changes how the flat-set parser groups a
+collapsed `then deny log session-init count` — instead of collapsing onto the
+deny node's own Keys (`Keys=["deny","log",...]`, the historical shape when
+`deny` was unknown) the trailing tokens become a child node (collapsed-child or
+fully nested). The #3141/#3374 reject gate read only the first child key, so
+`then deny count session-init` (an orphan `session-init` with no `log`) would
+have slipped through under the new shape. `validatePolicyThenDenyStrict` is now
+parse-shape-agnostic: `collapsedThenActionTokens` flattens deny's modifier
+tokens into the SAME sequence the compiler's `applyCollapsedDenyModifiers` acts
+on (deny `Keys[1:]` plus every key of every descendant node), so the gate and
+the wiring agree on the modifier set across all three AST shapes. The
+now-redundant `supportedPolicyThenDenyChildren` map was removed;
+`recognizedCollapsedDenyToken` is the single source of truth for the supported
+deny-modifier tokens.
+
+**All-nodes walk (review fold):** the three then-action reject gates
+(`validatePolicyThenPermitStrict` #3114, `validatePolicyThenRejectStrict` #3115,
+`validatePolicyThenDenyStrict` #3141) inspected only the FIRST action node via
+`thenNode.FindChild`. But `SetPath` can build TWO nodes for one action: a bare
+leaf (`set ... then permit`) plus a later extended form
+(`set ... then permit application-services X`) as a SECOND `permit` node (this
+split predates #3377 and reproduces whether or not permit/reject are schema
+leaves). The compiler iterates every `then` child, so the unsupported modifier
+on the second node is silently dropped — yet the FindChild-first gate checked
+only the (valid) bare node. The strict commit path still rejected such a config
+via the #3043 conflicting-terminal-action gate, but with a generic message; the
+specific #3114/#3115/#3141 fail-open diagnostic (and, on the tolerant load /
+peer-sync path where #3043 is only a warning, the specific warning) was
+suppressed. All three gates now iterate every same-named action node
+(`FindChildren`) and flatten each node's tokens via the shared
+`collapsedThenActionTokens`; the deny gate unions `hasLog` across all deny nodes
+to match the compiler's per-node accumulation onto `pol.Log`.
+
+Regression coverage: `pkg/config/schema_policy_then_3377_test.go` — the actions
+are offered by `CompleteSetPathWithValues` for both scopes, the `deny`/`log`
+sub-options complete, the declared forms pass `SchemaValidate`, and a **drift
+canary** (`TestSchema3377_ThenSchemaMatchesCompiler`) pins the schema `then`
+child set to the compiler's `then` switch token set
+(`{permit, deny, reject, log, count}`) for both scopes so a future compiled
+action cannot drift back out of the schema. Reverting the schema addition turns
+the completion and canary tests RED.
+`pkg/config/compiler_policy_then_twonode_3377_test.go` — the two-node bypass:
+a bare `then permit`/`reject`/`deny` plus a second node carrying an unsupported
+modifier is rejected at commit with the SPECIFIC #3114/#3115/#3141 diagnostic
+(and emits the matching lenient warning); reverting the gates to FindChild-first
+turns them RED (the strict error degrades to the generic #3043 conflict and the
+specific warning vanishes).
+
 ### #3148 — Global-policy `match from-zone`/`to-zone` zone context
 
 A Junos global policy may carry optional `set security policies global policy
