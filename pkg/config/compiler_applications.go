@@ -46,15 +46,31 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 		app := &Application{Name: appName}
 
 		var terms []*Application
+		// #3366: track whether the application carries a DIRECT match body
+		// (protocol / destination-port / source-port / inactivity-timeout /
+		// timeout / icmp-type / icmp-code / alg) at the application level, as
+		// opposed to one or more `term` sub-blocks. Junos requires a custom
+		// application to be EITHER scalar/direct OR term-based, never both. When
+		// both are present the all-or-nothing store below kept only the terms and
+		// silently DROPPED the direct match (e.g. a deny `protocol tcp
+		// destination-port 22` erased by an unrelated term), so the parent app
+		// name is recorded for the strict structure gate. `description` does NOT
+		// count — it is metadata propagated onto every generated term, not a match
+		// constraint.
+		hasDirectBody := false
 		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "protocol":
 				app.Protocol = nodeVal(prop)
+				hasDirectBody = true
 			case "destination-port":
 				app.DestinationPort = resolveAppPort(nodeVal(prop))
+				hasDirectBody = true
 			case "source-port":
 				app.SourcePort = resolveAppPort(nodeVal(prop))
+				hasDirectBody = true
 			case "inactivity-timeout", "timeout":
+				hasDirectBody = true
 				if v := nodeVal(prop); v != "" {
 					if n, ok := parseAppTimeout(v); ok {
 						app.InactivityTimeout = n
@@ -75,6 +91,7 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 				// record a malformed value (mirroring UnknownTimeouts) rather than
 				// silently dropping it — a dropped value would leave an ICMP app
 				// UNCONSTRAINED (matches all types), a fail-open widening.
+				hasDirectBody = true
 				if v := nodeVal(prop); v != "" {
 					if t, ok := parseICMPTypeCode(v); ok {
 						app.ICMPType = t
@@ -83,6 +100,7 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 					}
 				}
 			case "icmp-code":
+				hasDirectBody = true
 				if v := nodeVal(prop); v != "" {
 					if c, ok := parseICMPTypeCode(v); ok {
 						app.ICMPCode = c
@@ -92,6 +110,7 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 				}
 			case "alg":
 				app.ALG = nodeVal(prop)
+				hasDirectBody = true
 			case "description":
 				app.Description = nodeVal(prop)
 			case "term":
@@ -126,6 +145,16 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 		}
 
 		if len(terms) > 0 {
+			// #3366: an application that mixes a direct match body with `term`
+			// sub-blocks is a Junos config error. The store below keeps ONLY the
+			// terms, silently dropping the direct match (a fail-open under-match
+			// for a deny application). Record the parent name so the strict
+			// structure gate (validateApplicationStructureStrict) rejects it at
+			// commit (lenient-warn on the tolerant load / peer-sync path) instead
+			// of compiling a half-defined application.
+			if hasDirectBody {
+				apps.MixedDirectTermApps = append(apps.MixedDirectTermApps, appName)
+			}
 			implicitSet := &ApplicationSet{Name: appName}
 			for _, t := range terms {
 				t.Description = app.Description
@@ -182,6 +211,19 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 	var badTimeouts []string
 	var icmpType, icmpCode *uint8
 	var badICMP []string
+	// #3366: a scalar (single-valued) leaf repeated inside one term with a
+	// DIFFERENT value — via apply-groups, flat-set ordering, or hand authoring —
+	// was last-writer-wins: the loop below overwrote the earlier value with no
+	// validation, silently narrowing (or widening) the term to the final token by
+	// parse order. Track each scalar leaf's first assigned value so a CONFLICTING
+	// repeat (a new value that silently discards the earlier one) is recorded for
+	// the strict structure gate. An idempotent repeat (the same value again, e.g.
+	// the `timeout` / `inactivity-timeout` aliases both set to 1800) is harmless
+	// and accepted. `protocol` is deliberately EXCLUDED — a repeated `protocol` is
+	// the documented multi-protocol-term syntax (one Application per unique
+	// protocol), not a duplicate.
+	dstPortSet, srcPortSet, algSet, timeoutSet := false, false, false, false
+	var dupTermLeaves []string
 	// #3352: tokens inside the inline term that are not a recognized leaf.
 	// The term subtree is opaque to SchemaValidate (children:nil), so without
 	// a default arm an unknown leaf (and its value) were silently dropped,
@@ -245,17 +287,32 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 		case "destination-port":
 			if i+1 < len(keys) {
 				i++
-				dstPort = resolveAppPort(keys[i])
+				v := resolveAppPort(keys[i])
+				if dstPortSet && v != dstPort {
+					dupTermLeaves = append(dupTermLeaves, "destination-port")
+				}
+				dstPortSet = true
+				dstPort = v
 			}
 		case "source-port":
 			if i+1 < len(keys) {
 				i++
-				srcPort = resolveAppPort(keys[i])
+				v := resolveAppPort(keys[i])
+				if srcPortSet && v != srcPort {
+					dupTermLeaves = append(dupTermLeaves, "source-port")
+				}
+				srcPortSet = true
+				srcPort = v
 			}
 		case "inactivity-timeout", "timeout":
 			if i+1 < len(keys) {
 				i++
+				kw := keys[i-1]
 				if v, ok := parseAppTimeout(keys[i]); ok {
+					if timeoutSet && v != timeout {
+						dupTermLeaves = append(dupTermLeaves, kw)
+					}
+					timeoutSet = true
 					timeout = v
 				} else {
 					// #3320: malformed inline-term timeout — record the raw
@@ -267,6 +324,10 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 		case "alg":
 			if i+1 < len(keys) {
 				i++
+				if algSet && keys[i] != alg {
+					dupTermLeaves = append(dupTermLeaves, "alg")
+				}
+				algSet = true
 				alg = keys[i]
 			}
 		default:
@@ -314,17 +375,18 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 			it = echoByProto[proto]
 		}
 		result = append(result, &Application{
-			Name:              name,
-			Protocol:          proto,
-			DestinationPort:   dstPort,
-			SourcePort:        srcPort,
-			InactivityTimeout: timeout,
-			ALG:               alg,
-			UnknownTimeouts:   badTimeouts,
-			ICMPType:          it,
-			ICMPCode:          icmpCode,
-			UnknownICMP:       badICMP,
-			UnknownTermLeaves: badTermLeaves,
+			Name:                name,
+			Protocol:            proto,
+			DestinationPort:     dstPort,
+			SourcePort:          srcPort,
+			InactivityTimeout:   timeout,
+			ALG:                 alg,
+			UnknownTimeouts:     badTimeouts,
+			ICMPType:            it,
+			ICMPCode:            icmpCode,
+			UnknownICMP:         badICMP,
+			UnknownTermLeaves:   badTermLeaves,
+			DuplicateTermLeaves: dupTermLeaves,
 		})
 	}
 	return result

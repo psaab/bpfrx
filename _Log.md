@@ -1,3 +1,93 @@
+## 2026-06-29 — #3434 NAT `match application` undefined/empty fail-closed
+
+- **Timestamp**: 2026-06-29
+- **Action**: A source- or destination-NAT `match application <name>` naming an
+  UNDEFINED application (H07) or a defined-but-EMPTY application-set (H08)
+  resolved to zero application terms and the DNAT builder fell through to its
+  explicit-match fallback (`protocol="" + destination-port 0`), publishing the
+  pool VIP for every flow to the destination — a fail-open wildcard
+  translation (the NAT analog of the policy #3144/#3146 gate). Fix: (1)
+  commit-time strict gate `validateNATMatchApplicationsStrict` (NAT analog of
+  `validatePolicyMatchApplicationsStrict`) rejects the undefined token / empty
+  set on the strict path, warns on the tolerant load/peer-sync path
+  (`lenientNATMatchApplications`, #1960 no-brick); (2) the DNAT snapshot builder
+  now emits a never-match term for a configured-but-unresolvable app, reusing
+  the #3437 source-port never-match sentinel (`natNeverMatchPortRange`) so the
+  installed entry can never satisfy `l4_extra_matches`. The SNAT builder already
+  failed closed via the `natProtoNever` term. No new wire field (reuses the
+  #3437 `MatchSourcePorts`), so `protocol_wire_v1.json` is unchanged and
+  `wire_invariant` stays green.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_nat_match_application_3434_test.go,
+  pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/nat_dnat_app_empty_3434_test.go,
+  userspace-dp/src/nat/tests.rs, docs/services-application-identification.md
+- **Validation**: `go test ./pkg/config/... ./pkg/dataplane/userspace/...` green;
+  `cargo test --bin xpf-userspace-dp nat::` 179 pass; `wire_invariant` green;
+  gofmt clean; RED-on-revert verified Go (both the gate dispatch and the DNAT
+  builder branch).
+## 2026-06-29 — #3366 Codex/SMR MINOR fold: pin the value-aware idempotent-accept path (PR #3540)
+
+- **Timestamp**: 2026-06-29
+- **Action**: SMR MINOR fold for PR #3540 (#3366). The duplicate scalar
+  term-leaf rejection in `parseApplicationTerms` is value-AWARE — a
+  repeat with the SAME value is harmless (no value is silently lost) and
+  COMMITS; only a CONFLICTING different-value repeat is rejected. That
+  idempotent-accept path (`if dstPortSet && v != dstPort` etc. at the
+  destination-port / source-port / inactivity-timeout|timeout / alg arms)
+  was correct but had NO committed test pinning it, so a future
+  value-blind refactor (drop the `&& v != …` value comparison) would
+  silently start over-rejecting legitimate idempotent configs undetected.
+  Added `TestApplicationTerm_DuplicateScalarLeaf_Idempotent_Accepted`
+  pinning four idempotent same-value cases — repeated `destination-port
+  22`, repeated `source-port 1024`, repeated `alg ftp`, and the
+  `inactivity-timeout 1800` + `timeout 1800` alias-same-value case (both
+  keywords set the same field). Config built via ParseSetCommand +
+  tree.SetPath (flatTreeFromSets/unrefAppOnly), per CLAUDE.md.
+- **File(s)**: pkg/config/compiler_application_mixed_term_3366_test.go
+- **Validation**: `go test ./pkg/config/` green; gofmt clean. RED-on-
+  revert experiment: flipping all four arms value-blind (`if dstPortSet {`
+  …) turns the new idempotent test RED on all four subcases while
+  `TestApplicationTerm_DuplicateScalarLeaf_Rejected` stays green —
+  confirming the test genuinely guards the idempotent path. Reverted the
+  flip; tree clean.
+
+## 2026-06-29 — #3363 Codex MEDIUM fold: structured gRPC GetPolicies default-policy parity (PR #3528)
+
+- **Timestamp**: 2026-06-29
+- **Action**: Codex MEDIUM gap fold for PR #3528. The #3363 implicit
+  default-policy hit counter was surfaced as a synthetic `-`/`-`/
+  `default-policy` row across REST `/policies`, CLI, gRPC TEXT hit-count,
+  and Prometheus — but the STRUCTURED gRPC `GetPolicies` RPC omitted it, so
+  automation reading the structured inventory could not audit the
+  default-deny/permit boundary. FOLD 1: append a synthetic `pb.PolicyInfo`
+  (FromZone/ToZone `-`/`-`) with one `pb.PolicyRule{Name/RuleId=
+  dataplane.DefaultPolicyName, PolicyId=dataplane.DefaultPolicySentinelID}`
+  before the `readErr` check in `GetPolicies`, mirroring the REST surface
+  exactly; counters read via `ReadPolicyCounters(DefaultPolicySentinelID)`
+  under the same `statsEnabled && s.dp != nil && s.dp.IsLoaded()` gate, read
+  errors folded into the existing readErr handling. FOLD 2 (NIT): updated
+  the stale doc comments in `userspace-dp/src/policy.rs` and
+  `session/entry.rs` that claimed the implicit default-policy has no
+  fast-path counter — `0` is reserved for non-policy/no-counter sessions;
+  the default-policy is bound to `DEFAULT_POLICY_COUNTER_IDX==u32::MAX`,
+  resolved to `PolicyState::default_counter` so a default-PERMIT session
+  re-counts on the fast path. RED-on-revert: new
+  `TestGetPoliciesIncludesDefaultPolicyRow` asserts the specific
+  default-policy row + sentinel PolicyId/RuleId + the live 42/4200 counter;
+  stripping the append makes it RED (verified). Merge with origin/master
+  surfaced a PRE-EXISTING master breakage from #3436 (daemon_nft.go added a
+  `pkg/dataplane` import via DSCPValues but never updated the retirement
+  import allowlist / #1451 docs table) — added the missing allowlist entry
+  + docs-table row to keep the suite green. go test ./pkg/grpcapi/
+  ./pkg/dataplane/ ./pkg/config/ ./pkg/cli/ ./pkg/api/ green; cargo build
+  clean; gofmt + go vet ./pkg/grpcapi/ clean.
+- **File(s)**: pkg/grpcapi/server_show_zones.go,
+  pkg/grpcapi/server_show_zones_default_policy_3363_test.go,
+  userspace-dp/src/policy.rs, userspace-dp/src/session/entry.rs,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  docs/pr/1373-retire-ebpf-dataplane/README.md, _Log.md
+
 ## 2026-06-29 — #3419 REST session-view parity with gRPC
 
 - **Timestamp**: 2026-06-29
@@ -23387,8 +23477,48 @@ top.
   - **File(s)**: pkg/config/schema.go, pkg/config/schema_walk.go, pkg/config/schema_interfaces.go, pkg/config/schema_security.go, pkg/config/schema_system.go, pkg/config/schema_routing.go, pkg/config/schema_validate_trailing_token_3332_test.go, docs/config-schema.md, _Log.md
   - **Action**: #3332 Codex MERGE-NEEDS-MAJOR fold (PR #3509). Codex confirmed NO over-rejection (scalar-guard crux clean); the MAJOR was INCOMPLETENESS — supported flat-set/compact forms bypass the schema-walk scalar gate because their leaf lives under a non-scalar-eligible node. Added a compiler-side companion gate validateTrailingTokensStrict (strict commit + lenientTrailingTokens downgrade, mirrors validateScreenUnknownStrict) covering the two unreachable shapes: (1 MAJOR) address-book `address <name> description <text>`/`<prefix>` — the `address` node is multi:true (absorbs the description sub-token onto Keys for the #2419 dual-AST shape), so the multi-exempt scalar gate never reaches the value slot and mergeAddressNode read only Keys[3]/Keys[2], dropping the rest; record leftover on Address.TrailingTokens (global + zone-local books, since resolveZoneLocalAddressBooks copies only Value/Description). (2 MINOR) IKE gateway compact-hierarchical `dynamic hostname <fqdn> <extra>` — collapses onto the parent `dynamic` node's Keys (compiler_ipsec.go both sites read Keys[2]); record on IPsecGateway.DynamicHostnameExtras. (3 MINOR) dropped scalar:true on address-set description (AddressSet has no Description field — the tag was a no-op-feature; noted unsupported). (4 NIT) fixed the multi-exempt test to use a REAL #2419 bracketed list (`name-server [ a b c ]`). RED-on-revert verified for all 4 reject cases (strip the recording -> token silently dropped). No over-rejection: `address h2 1.2.3.4/32`, quoted `description "web server frontend"`, and compact `dynamic hostname peer.example.com` all still compile + values preserved. go test ./pkg/config/... ./pkg/cli/... ./pkg/configstore/... ./pkg/cmdtree/... green; gofmt clean.
   - **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/compiler_security.go, pkg/config/compiler_ipsec.go, pkg/config/types_security.go, pkg/config/schema_security.go, pkg/config/schema_validate_trailing_token_3332_test.go, docs/config-schema.md, _Log.md
+  - **Timestamp**: 2026-06-29
+  - **Action**: #3363 implicit default-policy hit counter (PR fix/3363-default-policy-rule). The IMPLICIT default-policy verdict returned `policy_counter_idx: 0` and incremented nothing, so operators could not answer "how many packets hit the default deny?". Added `PolicyState.default_counter` (`Arc<PolicyRuleCounter>`, persisted in `PolicyCounterStore` under the reserved rule id "default-policy" = `dataplane.DefaultPolicyName`, retained across rebuilds by `reconcile_rules`); the default branch now increments it on the cold path (the only count for default-DENY — denied flows install no session) and stamps the reserved handle `DEFAULT_POLICY_COUNTER_IDX`=`u32::MAX` so a default-PERMIT session re-counts on the established fast path via `hit_counter_by_idx`. `counter_snapshots()` appends the reserved row. Go reads it through the EXISTING `ReadPolicyCounters(dataplane.DefaultPolicySentinelID)` path (`policyRuleIDForCounter` maps the sentinel → "default-policy") — NO new dataplane interface method. Surfaced as a final `-`/`-`/`default-policy` row in CLI `show security policies hit-count`, gRPC text hit-count, REST `/policies`, and the `xpf_policy_hits_total` Prometheus metric, gated on `policy-stats` like every other row. NO wire change (reused the existing `policy_id` u32 sentinel; protocol_wire_v1.json unchanged, wire_invariant green). Part 2 of the issue (a `then log` knob on the implicit default) is a genuine config-grammar fork — the `default-policy` schema leaf is a typed enum that cannot also carry structural `then` children — and is deferred; default-deny audit logging is achievable today via an explicit `from-zone any to-zone any` catch-all with `then { deny; log session-init; }`. RED-on-revert verified (Rust counter increment; Go sentinel resolver). cargo build + `cargo test policy::` (117) green; go test ./pkg/dataplane/... ./pkg/config/... ./pkg/cli/... ./pkg/grpcapi/... ./pkg/api/... green (gRPC hit-count golden updated). gofmt clean.
+  - **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs, pkg/dataplane/userspace/policycounters.go, pkg/dataplane/userspace/default_policy_counter_3363_test.go, pkg/cli/cli_show_security.go, pkg/cli/cli_show_policies_hitcount_gate_test.go, pkg/grpcapi/server_show_policies_text.go, pkg/grpcapi/testdata/server_show_golden.json, pkg/api/security.go, pkg/api/metrics_counters.go, docs/userspace-dataplane-gaps.md, _Log.md
 
+## 2026-06-29 — #3315 SYN-flood sub-thresholds reach userspace
+- **Action**: Wire SYN-flood source/destination/alarm thresholds across the
+  userspace-dp boundary and enforce them in the Rust screen runtime
+  (count-min-sketch substrate, no eviction); split `timeout` to a follow-up with
+  a commit-time warning. Per converged plan docs/research/3315 (Option B, R5).
+- **File(s)**: pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/screens.go,
+  pkg/config/compiler_security.go, pkg/config/compiler.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/screen/packet.rs,
+  userspace-dp/src/screen/rate.rs, userspace-dp/src/screen/syn_rate.rs (new),
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/afxdp/event_emit.rs,
+  userspace-dp/src/afxdp/poll_stages.rs, userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json (regen, additive),
+  docs/feature-coverage.md, docs/syn-cookie-flood-protection.md, CLAUDE.md,
+  + Go/Rust tests.
+- **Action**: #3315 Codex MERGE-NEEDS-MAJOR fold (PR #3525) — claims accuracy,
+  no code defect. Codex confirmed the dataplane enforcement is present; the
+  MAJOR was two overstated prose claims. (1) SUBSTANTIATED the Rust RED-on-revert:
+  neutered each of the three hot-path gates in screen/mod.rs in turn and ran
+  `cargo test --bin xpf-userspace-dp screen::` — per-DEST cap (~684) → RED on
+  syn_flood_dest_threshold_trips_under_aggregate + syn_flood_dest_runs_when_cookie_active;
+  per-SOURCE cap (~700) → RED on syn_flood_source_threshold_trips_per_source +
+  syn_flood_source_runs_when_not_cookie_active; log-only alarm gate (~672) → RED
+  on syn_flood_alarm_threshold_raises_event_without_drop; restored → 164/0 green.
+  (2) CORRECTED CLAIMS: the Go TestBuildScreenSnapshotsSynFloodSubThresholds
+  comment now states it guards the WIRE PLUMBING only (screens.go populate +
+  JSON round-trip), NOT enforcement — enforcement RED-on-revert is Rust-side.
+  (3) Fixed the docs/syn-cookie-flood-protection.md memory claim: the sketches
+  allocate PER THRESHOLD (per-dst 64 KiB only when destination-threshold set;
+  per-src 128 KiB only when source-threshold set); an alarm-only profile
+  allocates NEITHER sketch — only the tiny syn_alarm_last_emit_sec cadence u64.
+  192 KiB/zone is the both-caps worst case, not every configured zone. Rebased
+  on origin/master first (union _Log.md). go test ./pkg/config/
+  ./pkg/dataplane/userspace/ green; gofmt clean.
+- **File(s)**: pkg/dataplane/userspace/manager_test.go,
+  docs/syn-cookie-flood-protection.md, _Log.md
 - **Timestamp**: 2026-06-29
+  - **Action**: #3294 {feed + concrete} address-set divergence — implemented the converged research plan (PLAN-READY @ d6da7b5d): Option A′ (dataplane set-row feed merge) + the #2008 direct-ref strict-accept one-liner. (1) Dataplane: made expandBookNameRecursive/expandBookNameToCIDRs feed-aware so a feed-bound MEMBER nested in an address-set contributes its live overlay prefixes to the enclosing set's address-book row (closes the feed-portion under-deny; a `deny <set-with-feed>` now enforces the feed). Removed the now-redundant top-level merge + dead splitFeedPrefixesByFamily. nameRepresentability feed-bound branch returns (true, len(feeds)>0): a live feed member is concrete, an empty feed stays representable-match-none (so an empty-feed feed-only set is #3261-rejected fail-closed, NOT silently dropped). (2) Strict #2008: added DynamicAddress.AddressBindings names to validatePolicyMatchAddressesStrict.bookNames so a DIRECT feed reference COMMITS; policyMatchAddressBookResolves (#3149) left feed-UNaware (anti-Option-C: feed-in-set still strict-rejected at fresh commit). (3) Parity: pkg/policymatch expandBookName made overlay-aware to match. (4) NAT left out of scope per plan constraint 5; updated the stale nat.go "#3294 gap" comment to a tracked residual. RED-on-revert verified for all three layers (dataplane merge, #2008 one-liner, policymatch). go test ./pkg/config/... ./pkg/dataplane/... ./pkg/policymatch/... ./pkg/grpcapi/... ./pkg/api/... green; gofmt + go vet clean.
+  - **File(s)**: pkg/dataplane/userspace/policies.go, pkg/dataplane/userspace/nat.go, pkg/dataplane/userspace/lenient_keep_armed_3261_test.go, pkg/policymatch/policymatch.go, pkg/policymatch/policymatch_test.go, pkg/config/compiler_validate_strict.go, pkg/config/compiler_feed_address_token_3294_test.go, docs/feature-gaps.md, docs/userspace-dataplane-gaps.md, _Log.md
   - **Action**: #3335 historical event zone names. Both event-display surfaces recomputed source/destination zone NAMES from the current config reverse ZoneIDs map and ignored the resolved-at-event-time EventRecord.InZoneName/OutZoneName. After a zone rename/delete/ID-reuse (#3075), an old event with InZoneName="trust" re-rendered under whatever name now owns that ID, corrupting forensic timelines. Fix: prefer the stored InZoneName/OutZoneName when non-empty; fall back to the current-config reverse map (then a bare numeric form in the CLI) only for legacy records that lack a resolved name. gRPC GetEvents and CLI show-security-log both fixed via a zoneName(stored, id) preference helper. RED-on-revert verified on both surfaces (revert renders renamed "marketing"/"sales"); the legacy-fallback tests pass with or without the fix (unchanged path). go test ./pkg/grpcapi/... ./pkg/cli/... ./pkg/logging/... green; gofmt clean.
   - **File(s)**: pkg/grpcapi/server_show_events.go, pkg/cli/cli_show_security_log.go, pkg/grpcapi/server_show_events_historical_zone_3335_test.go, pkg/cli/cli_show_security_log_historical_zone_3335_test.go, pkg/logging/README.md, _Log.md
 
@@ -23447,3 +23577,41 @@ top.
 - **Timestamp**: 2026-06-29
   - **Action**: #3290 third-fold (PR #3521) — third fail-open ICMP metadata path. Codex MAJOR: the pending-neighbor buffering fallback (poll_descriptor/mod.rs MissingNeighbor handler) gated only on non-first-fragment, then called parse_session_flow_from_meta(meta) and stored the result as PendingNeighPacket.flow_key. For a non-query ICMP error/control packet with an UNRESOLVED next-hop, that buffered the shim's fake pseudo-port (0xBEEF); retry_pending_neigh then fed it into CoS/output-filter classification AND the prepared TX request — the same #3290 bug class as the conntrack path and the immediate forward_request path, but on the deferred-TX route. Fix: extracted pending_neigh_flow_key(flow, raw_frame, meta) into neighbor_dispatch.rs (mirrors the #2375 pending_neigh_admission extraction pattern) and applied the shared meta_icmp_identifier_bearing gate — a non-identifier-bearing ICMP/ICMPv6 (error/control/ND/MLD/truncated query) now buffers flow_key=None, taking the interface-default-queue / no-output-filter path on flush. Also widened meta_icmp_identifier_bearing to require the full [l4..l4+6) identifier range inside declared_end (frame-equivalent to parse_flow_ports — fix from the prior fold). All THREE metadata consumers (conntrack parse_session_flow_from_bytes, immediate build_live_forward_request_from_frame, pending-neigh pending_neigh_flow_key) now gate identically. Added 3 unit tests on the extracted helper: control ICMP -> None (RED on revert, returns fake src_port=0xBEEF), echo query -> Some(identifier), flowless TCP -> Some(meta ports, gate is protocol-scoped). RED-on-revert verified. cargo test inspect/icmpv/forward_request/cos_classify/pending_neigh green; go test ./pkg/dataplane/... — the only failure is a PRE-EXISTING master canary (TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports flags pkg/daemon/daemon_nft.go from #3436, a Go file untouched by this Rust-only change); rebased onto current origin/master to pick up the allowlist follow-up. rustfmt clean on touched files. Still not session-sync/HA — no test-failover required.
   - **File(s)**: userspace-dp/src/afxdp/neighbor_dispatch.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/frame/README.md, _Log.md
+
+- **Timestamp**: 2026-06-29T08:45Z
+  - **Action**: #3409 event-mode structured / sd-syslog local-file support.
+    Before this change the event-mode LocalLogWriter fanout
+    (ringbuf.go ProcessRawEvent) branched ONLY on `binary` and wrote
+    standard text for every other format, so `structured` / `sd-syslog`
+    silently no-op'd to standard text — which #3349/#3403 had fail-closed
+    by REJECTING those formats at commit in event mode. Implemented both:
+    the local fanout now selects the structured (Junos RT_FLOW) body via
+    formatStructuredMsg, and LocalLogWriter.Send emits an RFC 5424 envelope
+    (matching SyslogClient.Send) when Format=="sd-syslog" (added Facility +
+    captured hostname to the writer). Widened
+    validateLogEventModeFormatStrict to accept the full schema enum in event
+    mode (defensive default kept for a future-unhonored value). Updated the
+    docs/config-schema.md event-mode format support matrix. RED-on-revert:
+    reverting the fanout body-selection makes the structured sub-test lose
+    RT_FLOW_SESSION_CREATE. go test ./pkg/logging/... ./pkg/config/... green;
+    gofmt clean.
+  - **File(s)**: pkg/logging/locallog.go, pkg/logging/ringbuf.go,
+    pkg/logging/locallog_format_3409_test.go,
+    pkg/config/compiler_validate_strict.go,
+    pkg/config/log_stream_config_3349_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-29T09:10Z
+  - **Action**: #3409 Codex MERGE-NEEDS-MINOR fold (PR #3532) — doc-accuracy
+    only. The call-site comment above validateLogEventModeFormatStrict in
+    pkg/config/compiler.go still described the PRE-#3409 behavior (event mode
+    only honors binary/standard text; structured/sd-syslog rejected at commit),
+    contradicting the shipped implementation. Rewrote it to state that the
+    event-mode writer now honors binary / standard-syslog / structured (RT_FLOW)
+    / sd-syslog (RFC 5424), the validator accepts the full enum in either mode,
+    and the default-reject only fires for a hypothetical future-unhonored value.
+    No code change. Rebased on origin/master first (union _Log.md). go test
+    ./pkg/config/ ./pkg/logging/ green; gofmt clean.
+  - **File(s)**: pkg/config/compiler.go, _Log.md
+- **Timestamp**: 2026-06-29T12:30Z
+  - **Action**: #3366 application EITHER direct OR term-based; conflicting duplicate term leaf. compileApplications now records a parent that mixes a direct match body (protocol/destination-port/source-port/inactivity-timeout/timeout/icmp-type/icmp-code/alg) with `term` sub-blocks on ApplicationsConfig.MixedDirectTermApps; before, the term-store branch kept only the synthesized term apps and silently DROPPED the direct match (fail-open under-match for a deny app). parseApplicationTerms now records a CONFLICTING (different-value) repeat of a single-valued scalar term leaf (destination-port/source-port/inactivity-timeout/timeout/alg) on Application.DuplicateTermLeaves — was last-writer-wins; idempotent same-value repeats (timeout/inactivity-timeout aliases set equal) and repeated `protocol` (multi-protocol syntax) are not flagged. New gate validateApplicationStructureStrict rejects both at commit over ALL user-defined apps (referenced or not, like the #3352/#3353 syntactic gate); lenient-warn on CompileConfigLenient/peer-sync (#1960). Updated existing over-rejection guard test (it had mixed a direct body with a term and expected acceptance — split into two apps). RED-on-revert verified (disable gate -> mixed + duplicate tests fail). go test ./pkg/config ./pkg/appid ./pkg/dataplane/userspace green; go vet clean; gofmt clean.
+  - **File(s)**: pkg/config/compiler_applications.go, pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/types_security.go, pkg/config/compiler_application_mixed_term_3366_test.go, pkg/config/compiler_application_term_alg_3352_3353_test.go, pkg/config/README.md, docs/config-schema.md, _Log.md

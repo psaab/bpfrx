@@ -92,6 +92,15 @@ pub(crate) struct ScreenProfile {
     /// crossings. Defaults false so rate-based SYN flood behavior remains a
     /// plain drop until the control plane explicitly enables cookie mode.
     pub syn_cookie: bool,
+    /// #3315: SYN-flood sub-thresholds (SYN/s; 0 = disabled). `syn_flood_alarm`
+    /// is the log-only rate (below attack-threshold) that raises an out-of-band
+    /// alarm event without dropping. `syn_flood_dst`/`syn_flood_src` are the
+    /// per-destination-IP / per-source-IP caps enforced by the per-zone
+    /// `SynRateSketch` count-min sketch (per-dest primary/spoof-resistant,
+    /// per-source secondary and gated to the non-cookie-active regime).
+    pub syn_flood_alarm_threshold: u32,
+    pub syn_flood_dst_threshold: u32,
+    pub syn_flood_src_threshold: u32,
     pub session_limit_src: u32, // max sessions per source IP, 0 = disabled
     pub session_limit_dst: u32, // max sessions per destination IP, 0 = disabled
     pub port_scan_threshold: u32, // unique dst ports per src IP within window, 0 = disabled
