@@ -15,6 +15,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/policymatch"
 )
 
 // enabledStr returns "enabled" or "disabled" for a boolean flag.
@@ -260,11 +261,17 @@ func (c *CLI) handleShowSecurity(args []string) error {
 				}
 				policySetID++
 			}
-			// Global policies in brief view
-			if len(cfg.Security.GlobalPolicies) > 0 && fromZone == "" && toZone == "" {
+			// Global policies in brief view. #3357: a from/to-zone filter no
+			// longer suppresses the globals — show the unscoped globals (every
+			// pair) plus any scoped global (#3148) targeting the filtered pair.
+			if len(cfg.Security.GlobalPolicies) > 0 {
 				for i, pol := range cfg.Security.GlobalPolicies {
 					// #3476: skip a nil global rule like the runtime walker.
 					if pol == nil {
+						continue
+					}
+					// #3357: drop a scoped global for a different zone pair.
+					if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZone, pol.Match.ToZone, fromZone, toZone) {
 						continue
 					}
 					action := "permit"
@@ -367,13 +374,27 @@ func (c *CLI) handleShowSecurity(args []string) error {
 			// When globalOnly, still count zone-pair policy sets to get correct global ruleID base
 			policySetID = uint32(len(cfg.Security.Policies))
 		}
-		// Global policies
-		if len(cfg.Security.GlobalPolicies) > 0 && (globalOnly || (fromZone == "" && toZone == "")) {
-			fmt.Println("Global policies:")
+		// Global policies. #3357: a from/to-zone filter no longer suppresses the
+		// global block (only `global`-only and the unfiltered view did before) —
+		// the filtered standard view must show an unscoped global (every pair)
+		// and a scoped global (#3148) targeting the filtered pair. When globalOnly
+		// the filter is empty so every global is selected (no regression).
+		if len(cfg.Security.GlobalPolicies) > 0 {
+			// #3357: print the "Global policies:" header lazily so a filter that
+			// selects no global does not leave a dangling empty header.
+			globalHeaderPrinted := false
 			for i, pol := range cfg.Security.GlobalPolicies {
 				// #3476: skip a nil global rule like the runtime walker.
 				if pol == nil {
 					continue
+				}
+				// #3357: drop a scoped global for a different zone pair.
+				if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZone, pol.Match.ToZone, fromZone, toZone) {
+					continue
+				}
+				if !globalHeaderPrinted {
+					fmt.Println("Global policies:")
+					globalHeaderPrinted = true
 				}
 				action := "permit"
 				switch pol.Action {

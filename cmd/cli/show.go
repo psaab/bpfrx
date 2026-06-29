@@ -525,7 +525,44 @@ func (c *ctl) showPoliciesFiltered(fromZone, toZone string) error {
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
+	renderRule := func(rule *pb.PolicyRule) {
+		fmt.Printf("  Rule: %s\n", rule.Name)
+		if rule.Description != "" {
+			fmt.Printf("    Description: %s\n", rule.Description)
+		}
+		fmt.Printf("    Match: src=%v dst=%v app=%v\n",
+			rule.SrcAddresses, rule.DstAddresses, rule.Applications)
+		fmt.Printf("    Action: %s\n", rule.Action)
+		if rule.HitPackets > 0 || rule.HitBytes > 0 {
+			fmt.Printf("    Hit count: %d packets, %d bytes\n", rule.HitPackets, rule.HitBytes)
+		}
+	}
 	for _, pi := range resp.Policies {
+		// #3357: the global group is exposed by GetPolicies with the group-level
+		// zones "*"/"*"; the per-rule scope of a scoped global (#3148) is carried
+		// in rule.MatchFromZone/MatchToZone. Filtering the whole group on its
+		// "*"/"*" zones dropped every scoped global from the filtered view — the
+		// exact command an operator uses to prove which rules govern a zone pair.
+		// Detect the global group and filter per-rule, rendering each rule under a
+		// header that shows its effective scope (falling back to "*"/"*").
+		if pi.FromZone == "*" && pi.ToZone == "*" {
+			for _, rule := range pi.Rules {
+				if !policymatch.GlobalPolicyAppliesToZonePair(rule.MatchFromZone, rule.MatchToZone, fromZone, toZone) {
+					continue
+				}
+				gf, gt := "*", "*"
+				if rule.MatchFromZone != "" {
+					gf = rule.MatchFromZone
+				}
+				if rule.MatchToZone != "" {
+					gt = rule.MatchToZone
+				}
+				fmt.Printf("From zone: %s, To zone: %s\n", gf, gt)
+				renderRule(rule)
+				fmt.Println()
+			}
+			continue
+		}
 		if fromZone != "" && pi.FromZone != fromZone {
 			continue
 		}
@@ -534,16 +571,7 @@ func (c *ctl) showPoliciesFiltered(fromZone, toZone string) error {
 		}
 		fmt.Printf("From zone: %s, To zone: %s\n", pi.FromZone, pi.ToZone)
 		for _, rule := range pi.Rules {
-			fmt.Printf("  Rule: %s\n", rule.Name)
-			if rule.Description != "" {
-				fmt.Printf("    Description: %s\n", rule.Description)
-			}
-			fmt.Printf("    Match: src=%v dst=%v app=%v\n",
-				rule.SrcAddresses, rule.DstAddresses, rule.Applications)
-			fmt.Printf("    Action: %s\n", rule.Action)
-			if rule.HitPackets > 0 || rule.HitBytes > 0 {
-				fmt.Printf("    Hit count: %d packets, %d bytes\n", rule.HitPackets, rule.HitBytes)
-			}
+			renderRule(rule)
 		}
 		fmt.Println()
 	}
@@ -1883,8 +1911,22 @@ func (c *ctl) showPoliciesBrief() error {
 			if rule.HitPackets > 0 {
 				hits = fmt.Sprintf("%d", rule.HitPackets)
 			}
+			// #3357: a scoped global (#3148) is exposed under the global group
+			// (pi.FromZone/ToZone == "*"), but its real zone scope is carried
+			// per-rule in MatchFromZone/MatchToZone. Render the effective scope
+			// so the brief view does not regress a scoped global to "*"/"*",
+			// matching the local-CLI #3286 display. Zone-pair rules and the
+			// default-policy row leave the match-scope empty and fall back to the
+			// group zones (real zones / "-"), so they are unchanged.
+			from, to := pi.FromZone, pi.ToZone
+			if rule.MatchFromZone != "" {
+				from = rule.MatchFromZone
+			}
+			if rule.MatchToZone != "" {
+				to = rule.MatchToZone
+			}
 			fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
-				pi.FromZone, pi.ToZone, rule.Name, rule.Action, hits)
+				from, to, rule.Name, rule.Action, hits)
 		}
 	}
 	return nil

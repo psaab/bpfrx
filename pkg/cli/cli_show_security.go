@@ -93,11 +93,20 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 		}
 		policySetID++
 	}
-	// Global policies
-	if len(cfg.Security.GlobalPolicies) > 0 && fromZone == "" && toZone == "" {
+	// Global policies. #3357: a from/to-zone filter no longer suppresses the
+	// global block — an unscoped global is enforced for every zone pair and a
+	// scoped global (#3148) may target exactly the filtered pair, so the
+	// filtered hit-count table must show the globals that govern it. Per-rule
+	// scope is matched against the filter via GlobalPolicyAppliesToZonePair;
+	// the ruleID is the loop index so skipped rows keep counter alignment.
+	if len(cfg.Security.GlobalPolicies) > 0 {
 		for i, pol := range cfg.Security.GlobalPolicies {
 			// #3476: skip a nil global rule like the runtime walker does.
 			if pol == nil {
+				continue
+			}
+			// #3357: drop a scoped global that targets a different zone pair.
+			if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZone, pol.Match.ToZone, fromZone, toZone) {
 				continue
 			}
 			action := "Permit"
@@ -269,11 +278,18 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 		fmt.Println()
 	}
 
-	// Global policies
-	if len(cfg.Security.GlobalPolicies) > 0 && fromZone == "" && toZone == "" {
+	// Global policies. #3357: a from/to-zone filter no longer suppresses the
+	// global block — the filtered detail view must still show an unscoped
+	// global (enforced for every pair) and a scoped global (#3148) targeting
+	// the filtered pair. GlobalPolicyAppliesToZonePair selects per-rule scope.
+	if len(cfg.Security.GlobalPolicies) > 0 {
 		for i, pol := range cfg.Security.GlobalPolicies {
 			// #3476: skip a nil global rule like the runtime walker does.
 			if pol == nil {
+				continue
+			}
+			// #3357: drop a scoped global that targets a different zone pair.
+			if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZone, pol.Match.ToZone, fromZone, toZone) {
 				continue
 			}
 			action := "permit"
