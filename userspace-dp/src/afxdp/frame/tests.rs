@@ -202,14 +202,38 @@ fn parse_session_flow_reparses_vlan_ipv4_reply_without_meta_offsets() {
 
 #[test]
 fn parse_session_flow_prefers_tuple_stamped_in_metadata() {
+    // #3290: the metadata pseudo-port is preferred over the frame-derived
+    // identifier, but ONLY for an identifier-bearing ICMP query type whose
+    // type byte the gate can validate in the frame. The frame here is a
+    // legitimate ICMPv4 Echo Request (type 8) whose ON-WIRE identifier is
+    // 0x1234; the shim stamped a DIFFERENT pseudo-port (0x4321) in metadata.
+    // The gate (`meta_icmp_identifier_bearing`) reads the echo type byte from
+    // the frame, admits the flow, and the stamped metadata tuple wins because
+    // the metadata and frame IPs agree. (The pre-#3290 form of this test used a
+    // 0xaa garbage frame with offsets=0 and relied on the metadata pseudo-port
+    // being trusted with NO frame validation — exactly the fake-session vector
+    // #3290 closes; that path is now correctly flowless and is covered by the
+    // non-query/control ICMP regression tests in inspect_tests.rs.)
+    let frame = build_icmp_echo_frame_v4(
+        Ipv4Addr::new(172, 16, 80, 200),
+        Ipv4Addr::new(172, 16, 80, 8),
+        64,
+    );
     let mut area = MmapArea::new(256).expect("mmap");
-    area.slice_mut(0, 64).expect("slice").fill(0xaa);
-    let meta = valid_meta();
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let mut meta = valid_meta();
+    meta.l3_offset = 14;
+    meta.l4_offset = 34;
+    // Distinct from the frame's on-wire identifier (0x1234) so a pass proves
+    // the STAMPED metadata tuple is preferred, not the frame-derived one.
+    meta.flow_src_port = 0x4321;
     let flow = parse_session_flow(
         &area,
         XdpDesc {
             addr: 0,
-            len: 64,
+            len: frame.len() as u32,
             options: 0,
         },
         meta,
@@ -217,7 +241,7 @@ fn parse_session_flow_prefers_tuple_stamped_in_metadata() {
     .expect("flow");
     assert_eq!(flow.src_ip, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
     assert_eq!(flow.dst_ip, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)));
-    assert_eq!(flow.forward_key.src_port, 0x1234);
+    assert_eq!(flow.forward_key.src_port, 0x4321);
     assert_eq!(flow.forward_key.dst_port, 0);
 }
 
