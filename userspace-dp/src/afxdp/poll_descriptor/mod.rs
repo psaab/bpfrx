@@ -515,11 +515,16 @@ pub(super) fn poll_binding_process_descriptor(
                             // is the dst on a forward-keyed session, the src on
                             // a reverse-keyed one, so a forward flow with a
                             // service-valued SOURCE port is not mislabeled.
-                            let app_id = worker_ctx.forwarding.app_catalog.lookup_directional(
+                            // #3416: resolve the forward service port from the
+                            // post-translation (DNAT-rewritten) destination so a
+                            // port-forwarded session's conntrack row carries the
+                            // admitting application, not the pre-NAT public port.
+                            let app_id = worker_ctx.forwarding.app_catalog.lookup_admitted(
                                 flow.forward_key.protocol,
                                 flow.forward_key.src_port,
                                 flow.forward_key.dst_port,
                                 resolved.metadata.is_reverse,
+                                resolved.decision.nat.rewrite_dst_port,
                             );
                             publish_bpf_conntrack_entry(
                                 conntrack_v4_fd,
@@ -1631,11 +1636,18 @@ pub(super) fn poll_binding_process_descriptor(
                                 // #2008 M5: stamp the resolved application id.
                                 // #3321: directional resolution (service = dst
                                 // forward / src reverse).
-                                let app_id = worker_ctx.forwarding.app_catalog.lookup_directional(
+                                // #3416: this is the DNAT-to-firewall-local
+                                // delivery path — resolve the forward service
+                                // port from the post-translation (rewritten)
+                                // destination so the local-service conntrack row
+                                // shows the admitting application (e.g. the
+                                // private :22), not the public port.
+                                let app_id = worker_ctx.forwarding.app_catalog.lookup_admitted(
                                     flow.forward_key.protocol,
                                     flow.forward_key.src_port,
                                     flow.forward_key.dst_port,
                                     local_metadata.is_reverse,
+                                    decision.nat.rewrite_dst_port,
                                 );
                                 publish_bpf_conntrack_entry(
                                     conntrack_v4_fd,
@@ -3833,11 +3845,17 @@ pub(super) fn poll_binding_process_descriptor(
                                     // #2008 M5: stamp the resolved app id.
                                     // #3321: directional resolution (service =
                                     // dst forward / src reverse).
-                                    let app_id = worker_ctx.forwarding.app_catalog.lookup_directional(
+                                    // #3416: forward service port from the
+                                    // post-translation (DNAT-rewritten)
+                                    // destination so a port-forwarded
+                                    // neighbor-seed row carries the admitting
+                                    // application, not the public port.
+                                    let app_id = worker_ctx.forwarding.app_catalog.lookup_admitted(
                                         flow.forward_key.protocol,
                                         flow.forward_key.src_port,
                                         flow.forward_key.dst_port,
                                         entry.metadata.is_reverse,
+                                        pending_decision.nat.rewrite_dst_port,
                                     );
                                     publish_bpf_conntrack_entry(
                                         conntrack_v4_fd,

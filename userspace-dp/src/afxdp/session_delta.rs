@@ -219,11 +219,16 @@ pub(super) fn flush_session_deltas(
                 // #3321: resolve directionally off the delta's own direction
                 // flag (service = dst forward / src reverse) so a forward flow
                 // with a service-valued source port is not mislabeled.
-                let app_id = forwarding.app_catalog.lookup_directional(
+                // #3416: resolve the FORWARD service port from the
+                // post-translation destination (the DNAT-rewritten port the
+                // policy admitted the session under), mirroring the deny side,
+                // so a port-forwarded service is not mislabeled UNKNOWN/public.
+                let app_id = forwarding.app_catalog.lookup_admitted(
                     delta.key.protocol,
                     delta.key.src_port,
                     delta.key.dst_port,
                     delta.metadata.is_reverse,
+                    delta.decision.nat.rewrite_dst_port,
                 );
                 // #2615: thread the closing binding's ingress ifindex so the
                 // SESSION_CLOSE RT_FLOW record shows the admitting interface
@@ -251,11 +256,16 @@ pub(super) fn flush_session_deltas(
                 // positive so the i32 -> u32 cast is loss-free.
                 // #3321: directional resolution off the delta's direction flag
                 // (service = dst forward / src reverse).
-                let app_id = forwarding.app_catalog.lookup_directional(
+                // #3416: forward service port from the post-translation
+                // (DNAT-rewritten) destination — the port the policy admitted
+                // the session under — so a port-forwarded create record carries
+                // the admitting application instead of UNKNOWN/the public port.
+                let app_id = forwarding.app_catalog.lookup_admitted(
                     delta.key.protocol,
                     delta.key.src_port,
                     delta.key.dst_port,
                     delta.metadata.is_reverse,
+                    delta.decision.nat.rewrite_dst_port,
                 );
                 es.emit_session_create_rt_flow(delta, app_id, ident.ifindex as u32);
             }
