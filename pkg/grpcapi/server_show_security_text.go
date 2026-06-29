@@ -510,10 +510,16 @@ func (s *Server) showScreenStatisticsAll(cfg *config.Config, buf *strings.Builde
 			zones = append(zones, name)
 		}
 		sort.Strings(zones)
+		// #3408: surface a per-zone flood-counter read failure as a warning
+		// AFTER all zones rather than silently dropping the zone.
+		var readErr error
 		for _, zoneName := range zones {
 			zoneID := cr.ZoneIDs[zoneName]
 			fs, err := s.dp.ReadFloodCounters(zoneID)
 			if err != nil {
+				if readErr == nil {
+					readErr = err
+				}
 				continue
 			}
 			screenProfile := ""
@@ -531,6 +537,9 @@ func (s *Server) showScreenStatisticsAll(cfg *config.Config, buf *strings.Builde
 			buf.WriteString("\n")
 		}
 		buf.WriteString(s.screenSYNCookieCounterRows())
+		if readErr != nil {
+			fmt.Fprintf(buf, "warning: flood counter read failed (screen statistics may be incomplete): %v\n", readErr)
+		}
 	}
 	return &pb.ShowTextResponse{Output: buf.String()}, nil
 }

@@ -92,12 +92,17 @@ func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp apiRu
 	}
 
 	for zoneName, zoneID := range cr.ZoneIDs {
+		// #3408: a failed per-zone read SKIPS the sample (no misleading 0) and
+		// bumps xpf_counter_read_errors_total — the same contract as the
+		// global counters (#3345).
 		ingress, err := dp.ReadZoneCounters(zoneID, 0)
 		if err != nil {
+			c.counterReadErrors.Add(1)
 			continue
 		}
 		egress, err := dp.ReadZoneCounters(zoneID, 1)
 		if err != nil {
+			c.counterReadErrors.Add(1)
 			continue
 		}
 		ch <- prometheus.MustNewConstMetric(c.zonePacketsTotal, prometheus.CounterValue,
@@ -142,6 +147,7 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 			policyID := policyCounterID(policySetID, i)
 			ctrs, err := dp.ReadPolicyCounters(policyID)
 			if err != nil {
+				c.counterReadErrors.Add(1)
 				continue
 			}
 			ch <- prometheus.MustNewConstMetric(c.policyHitsTotal, prometheus.CounterValue,
@@ -160,6 +166,7 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 		policyID := policyCounterID(policySetID, i)
 		ctrs, err := dp.ReadPolicyCounters(policyID)
 		if err != nil {
+			c.counterReadErrors.Add(1)
 			continue
 		}
 		// #3286: a scoped global policy (#3148 `match from-zone`/`to-zone`)
@@ -206,6 +213,7 @@ func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp api
 			}
 			fcfg, err := dp.ReadFilterConfig(fid)
 			if err != nil {
+				c.counterReadErrors.Add(1)
 				continue
 			}
 			ruleOffset := fcfg.RuleStart
@@ -223,6 +231,8 @@ func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp api
 				for i := uint32(0); i < numRules; i++ {
 					if ctrs, err := dp.ReadFilterCounters(ruleOffset + i); err == nil {
 						totalPkts += ctrs.Packets
+					} else {
+						c.counterReadErrors.Add(1)
 					}
 				}
 				ch <- prometheus.MustNewConstMetric(c.filterHitsTotal, prometheus.CounterValue,

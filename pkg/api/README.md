@@ -110,44 +110,49 @@ under the daemon's errgroup. Nothing else imports this package.
   `sessions_iterator_error_test.go` in this package and in `pkg/grpcapi`
   / `pkg/cli` (CLI top-talkers fails the command; NAT summaries print a
   stderr warning).
-- Global dataplane counters get the same observability-integrity
-  treatment (#3345): a failed `ReadGlobalCounter` is no longer swallowed
-  to `0`, because a degraded counter bridge must not be
-  indistinguishable from "no events" on a security appliance. The fix
-  covers EVERY global-counter read surface:
-  - **Structured APIs**: REST `/stats/global` returns HTTP 500 when any
-    global-counter read fails; gRPC `GetGlobalStats` returns
-    `codes.Internal` (the error is checked AFTER the full response struct
-    is built, so a failure on a late read — e.g. `RxPackets`, read after
-    the screen-detail loop — is also covered).
-  - **Prometheus** (`metrics_counters.go`) OMITS the affected per-counter
-    sample (rather than emitting a misleading `0`) and bumps the monotonic
+- Dataplane counter read failures get a uniform observability-integrity
+  treatment (#3345 global; #3408 per-zone / per-policy / screen-flood /
+  filter): a failed counter read is no longer swallowed to `0`, because a
+  degraded counter bridge must not be indistinguishable from "no events"
+  on a security appliance. The fix covers EVERY global, per-zone,
+  per-policy, screen-flood, and filter read surface:
+  - **Structured APIs** return an explicit failure instead of clean-zero
+    counter fields. REST `/stats/global` (global), `/security/zones`
+    (per-zone), and `/security/policies` (per-policy) return HTTP 500 on
+    a read error; gRPC `GetGlobalStats`, `GetZones`, and `GetPolicies`
+    return `codes.Internal`. The error is checked AFTER the full response
+    is built, so a failure on a late read (e.g. `RxPackets` after the
+    screen-detail loop, or any policy/zone in the loop) is covered.
+  - **Prometheus** (`metrics_counters.go`) OMITS the affected sample
+    (rather than emitting a misleading `0`) for global, per-zone,
+    per-policy, and per-filter reads, and bumps the monotonic
     `xpf_counter_read_errors_total` scrape-error counter, always emitted
     (0 when healthy) for alerting.
   - **Text commands** print a `warning: ... counter read failed ...` line
     instead of a clean zero: `show security screen` / `show security
-    alarms` (CLI + gRPC), `show security flow statistics` — the canonical
-    operator global-counter view (CLI `showStatistics`/`showFlowStatistics`
-    + gRPC `showFlowStatistics`), `show chassis cluster fabric
-    statistics` (CLI + gRPC fabric-redirect counters), and `show security
-    nat source` (NAT alloc-fail counter — previously the line was silently
-    omitted on a read error, now an explicit warning is emitted).
+    alarms` / `show security flow statistics` / `show chassis cluster
+    fabric statistics` / `show security nat source` (global + flood), and
+    `show security policies hit-count` + brief (per-policy), `show
+    security zones` (per-zone), `show security screen statistics` (flood),
+    and `show firewall filter` (filter) — across both the CLI and the gRPC
+    text mirrors.
   - **Ordering invariant**: in every multi-read renderer the `readErr`
-    check runs AFTER all global-counter reads in the function (incl. the
-    detail / per-type screen-breakdown loops), so a failure on a LATE read
-    is surfaced rather than printing a stale `0` under an earlier passed
-    check. The structured APIs follow the same rule (check after the full
-    struct build).
+    check runs AFTER all counter reads in the function (incl. the detail /
+    per-type screen-breakdown and per-policy/per-zone loops), so a failure
+    on a LATE read is surfaced rather than printing a stale `0` under an
+    earlier passed check. The structured APIs follow the same rule (check
+    after the full response is built).
+  - **Out of scope**: per-interface and NAT-rule/port counters are not
+    security counters and keep their existing per-read handling.
 
-  Pinned by `stats_counter_error_test.go` (REST + Prometheus),
+  Pinned by `stats_counter_error_test.go` +
+  `zones_policies_counter_error_test.go` (REST + Prometheus),
   `pkg/grpcapi/global_stats_counter_error_test.go` (incl. the late-read
-  ordering case), `pkg/grpcapi/flow_cluster_counter_error_test.go`, and
+  ordering case) + `flow_cluster_counter_error_test.go` +
+  `zones_policies_counter_error_test.go`, and
   `pkg/cli/show_security_counter_error_test.go` (incl. late-read ordering
   cases that fail if a warn is moved before the per-type screen-breakdown
-  loop). Per-zone / per-policy /
-  per-filter counter-read surfacing (the `collectZoneCounters` /
-  `collectPolicyCounters` / `collectFilterCounters` paths that today
-  `continue` on error) is tracked separately in #3408.
+  loop). This resolves both #3345 and #3408.
 - Named source-NAT pool stats are sourced from the userspace helper's
   LIVE runtime status, not config text (#2938). `natPoolStatsHandler`
   (`/security/nat/source/pools`) reads `s.runtimeSourceNATPools()` — the

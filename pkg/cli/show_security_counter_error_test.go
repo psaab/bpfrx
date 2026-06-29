@@ -220,6 +220,35 @@ func TestShowChassisClusterFabricStatisticsWarnsOnCounterReadError(t *testing.T)
 	}
 }
 
+// policyCounterErrCLIDP is a loaded cliRuntime whose per-policy counter reads
+// fail.
+type policyCounterErrCLIDP struct {
+	dataplane.DataPlane
+}
+
+func (d *policyCounterErrCLIDP) IsLoaded() bool { return true }
+
+func (d *policyCounterErrCLIDP) ReadPolicyCounters(uint32) (dataplane.CounterValue, error) {
+	return dataplane.CounterValue{}, errors.New("counter bridge degraded")
+}
+
+// #3408: the CLI `show security policies hit-count` table must warn on a
+// per-policy counter read failure rather than printing clean-zero counts.
+func TestShowPoliciesHitCountWarnsOnCounterReadError(t *testing.T) {
+	store := newPolicyHitCountCLIStore(t, true) // policy-stats enabled
+	c := &CLI{store: store, dp: &policyCounterErrCLIDP{}}
+
+	out := captureStdout(t, func() {
+		if err := c.showPoliciesHitCount(store.ActiveConfig(), "", ""); err != nil {
+			t.Fatalf("showPoliciesHitCount() error = %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("showPoliciesHitCount lacks a counter-read warning; got:\n%s", out)
+	}
+}
+
 // showNATSource previously OMITTED the NAT alloc-fail line on a read error
 // (acceptable — no stale 0 — but indistinguishable from "no failures"). It now
 // emits an explicit warning. FAIL-ON-REVERT: dropping the else branch removes

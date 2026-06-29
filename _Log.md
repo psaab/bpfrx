@@ -22882,3 +22882,25 @@ top.
     pkg/cli/cli_show_nat.go, pkg/grpcapi/server_show_security_text.go,
     pkg/cli/show_security_counter_error_test.go,
     pkg/grpcapi/global_stats_counter_error_test.go, pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3345 fold round 4 (Codex claim-4 scope) — OWN #3408: extend
+    counter-read error surfacing to per-zone / per-policy / screen-flood /
+    filter sites under the SAME contract (REST 500 / gRPC codes.Internal /
+    Prometheus skip+xpf_counter_read_errors_total / CLI+gRPC-text warning
+    after all reads). Covered REST zonesHandler/policiesHandler, gRPC
+    GetZones/GetPolicies, Prometheus collectZone/Policy/Filter, and the
+    text views (policies hit-count/brief/detail, zones, screen-stats-all,
+    firewall filter). Added RED-on-revert tests per surface. PR now Closes
+    #3345 + #3408; README #3408-deferred note dropped.
+  - **File(s)**: pkg/api/security.go, pkg/api/metrics_counters.go,
+    pkg/api/zones_policies_counter_error_test.go,
+    pkg/grpcapi/server_show_zones.go, pkg/grpcapi/server_show_policies_text.go,
+    pkg/grpcapi/server_show_zones_text.go,
+    pkg/grpcapi/server_show_security_text.go,
+    pkg/grpcapi/server_show_firewall.go,
+    pkg/grpcapi/zones_policies_counter_error_test.go,
+    pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+    pkg/cli/cli_show_security_zones.go, pkg/cli/cli_show_security_screen.go,
+    pkg/cli/cli_show_security_filters.go, pkg/cli/cli_show_nat.go,
+    pkg/cli/show_security_counter_error_test.go, pkg/api/README.md, _Log.md

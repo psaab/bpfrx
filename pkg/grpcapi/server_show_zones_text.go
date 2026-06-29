@@ -31,6 +31,9 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 	}
 	sort.Strings(zoneNames)
 	cr := s.applyResult()
+	// #3408: surface a per-zone counter read failure as a warning AFTER all
+	// zones rather than silently dropping the traffic-statistics block.
+	var readErr error
 	for _, name := range zoneNames {
 		zone := cfg.Security.Zones[name]
 		var zoneID uint16
@@ -70,6 +73,12 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 				buf.WriteString("  Traffic statistics:\n")
 				fmt.Fprintf(buf, "    Input:  %d packets, %d bytes\n", ingress.Packets, ingress.Bytes)
 				fmt.Fprintf(buf, "    Output: %d packets, %d bytes\n", egress.Packets, egress.Bytes)
+			} else if readErr == nil {
+				if errIn != nil {
+					readErr = errIn
+				} else {
+					readErr = errOut
+				}
 			}
 		}
 		// Policies referencing this zone
@@ -177,6 +186,9 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 			buf.WriteString("    (no policies)\n")
 		}
 		buf.WriteString("\n")
+	}
+	if readErr != nil {
+		fmt.Fprintf(buf, "warning: zone counter read failed (traffic statistics may be incomplete): %v\n", readErr)
 	}
 }
 

@@ -46,6 +46,9 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 	fmt.Printf("%-8s%-17s%-18s%-24s%-14s%s\n",
 		"Index", "From zone", "To zone", "Name", "Policy count", "Action")
 
+	// #3408: surface a per-policy counter read failure as a warning AFTER
+	// all reads, rather than printing clean-zero hit counts.
+	var readErr error
 	index := uint32(1)
 	policySetID := uint32(0)
 	for _, zpp := range cfg.Security.Policies {
@@ -70,6 +73,8 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			if statsEnabled || pol.Count {
 				if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
 					count = counters.Packets
+				} else if readErr == nil {
+					readErr = err
 				}
 			}
 			fmt.Printf("%-8d%-17s%-18s%-24s%-14d%s\n",
@@ -93,6 +98,8 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			if statsEnabled || pol.Count {
 				if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
 					count = counters.Packets
+				} else if readErr == nil {
+					readErr = err
 				}
 			}
 			// #3286: a scoped global (#3148) shows its zone pair in the
@@ -109,6 +116,9 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 				index, hcFrom, hcTo, pol.Name, count, action)
 			index++
 		}
+	}
+	if readErr != nil {
+		fmt.Printf("warning: policy counter read failed (counts may be incomplete): %v\n", readErr)
 	}
 	return nil
 }

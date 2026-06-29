@@ -17,6 +17,10 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 	sort.Strings(zoneNames)
 	cr := c.applyResult()
 
+	// #3408: surface a per-zone counter read failure as a warning AFTER all
+	// zones are rendered, rather than silently dropping the traffic-statistics
+	// block (which would read like a true zero).
+	var readErr error
 	for _, name := range zoneNames {
 		if filterZone != "" && name != filterZone {
 			continue
@@ -72,6 +76,12 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 					ingress.Packets, ingress.Bytes)
 				fmt.Printf("    Output: %d packets, %d bytes\n",
 					egress.Packets, egress.Bytes)
+			} else if readErr == nil {
+				if errIn != nil {
+					readErr = errIn
+				} else {
+					readErr = errOut
+				}
 			}
 		}
 
@@ -172,6 +182,9 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 		}
 
 		fmt.Println()
+	}
+	if readErr != nil {
+		fmt.Printf("warning: zone counter read failed (traffic statistics may be incomplete): %v\n", readErr)
 	}
 	if filterZone != "" {
 		if _, ok := cfg.Security.Zones[filterZone]; !ok {

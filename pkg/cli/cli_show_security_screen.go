@@ -375,10 +375,17 @@ func (c *CLI) showScreenStatisticsAll() error {
 	}
 	sort.Strings(zones)
 
+	// #3408: surface a per-zone flood-counter read failure as a warning AFTER
+	// all zones, rather than silently dropping the zone (which reads as "no
+	// flood events for that zone").
+	var readErr error
 	for _, zoneName := range zones {
 		zoneID := cr.ZoneIDs[zoneName]
 		fs, err := c.dp.ReadFloodCounters(zoneID)
 		if err != nil {
+			if readErr == nil {
+				readErr = err
+			}
 			continue
 		}
 		screenProfile := ""
@@ -397,6 +404,9 @@ func (c *CLI) showScreenStatisticsAll() error {
 	}
 	if rows := c.screenSYNCookieCounterRows(); rows != "" {
 		fmt.Print(rows)
+	}
+	if readErr != nil {
+		fmt.Printf("warning: flood counter read failed (screen statistics may be incomplete): %v\n", readErr)
 	}
 	return nil
 }

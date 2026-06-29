@@ -208,6 +208,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 			// the Prometheus collector. When the knob is off the column
 			// reads 0 (we skip the dataplane read).
 			statsEnabled := cfg.Security.PolicyStatsEnabled
+			// #3408: surface a per-policy counter read failure as a warning
+			// AFTER all reads rather than rendering a clean "0" hits column.
+			var readErr error
 			// Brief tabular summary
 			fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
 				"From", "To", "Name", "Action", "Hits")
@@ -238,6 +241,8 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					if (statsEnabled || pol.Count) && c.dp != nil && c.dp.IsLoaded() {
 						if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
 							hits = fmt.Sprintf("%d", counters.Packets)
+						} else if readErr == nil {
+							readErr = err
 						}
 					}
 					fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
@@ -262,6 +267,8 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					if (statsEnabled || pol.Count) && c.dp != nil && c.dp.IsLoaded() {
 						if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
 							hits = fmt.Sprintf("%d", counters.Packets)
+						} else if readErr == nil {
+							readErr = err
 						}
 					}
 					// #3286: a scoped global (#3148) shows its zone pair in
@@ -277,6 +284,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
 						briefFrom, briefTo, pol.Name, action, hits)
 				}
+			}
+			if readErr != nil {
+				fmt.Printf("warning: policy counter read failed (hit counts may be incomplete): %v\n", readErr)
 			}
 			return nil
 		}

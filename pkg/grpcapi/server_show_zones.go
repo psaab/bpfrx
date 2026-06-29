@@ -4,6 +4,9 @@ import (
 	"context"
 	"sort"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/psaab/xpf/pkg/dataplane"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
@@ -16,6 +19,9 @@ func (s *Server) GetZones(_ context.Context, _ *pb.GetZonesRequest) (*pb.GetZone
 
 	cr := s.applyResult()
 
+	// #3408: a per-zone counter read failure must surface as codes.Internal
+	// rather than a clean-zero field, mirroring GetGlobalStats (#3345).
+	var readErr error
 	resp := &pb.GetZonesResponse{}
 	for zoneName, zone := range cfg.Security.Zones {
 		zi := &pb.ZoneInfo{
@@ -45,15 +51,22 @@ func (s *Server) GetZones(_ context.Context, _ *pb.GetZonesRequest) (*pb.GetZone
 					if ing, err := s.dp.ReadZoneCounters(id, 0); err == nil {
 						zi.IngressPackets = ing.Packets
 						zi.IngressBytes = ing.Bytes
+					} else if readErr == nil {
+						readErr = err
 					}
 					if eg, err := s.dp.ReadZoneCounters(id, 1); err == nil {
 						zi.EgressPackets = eg.Packets
 						zi.EgressBytes = eg.Bytes
+					} else if readErr == nil {
+						readErr = err
 					}
 				}
 			}
 		}
 		resp.Zones = append(resp.Zones, zi)
+	}
+	if readErr != nil {
+		return nil, status.Errorf(codes.Internal, "reading zone counter: %v", readErr)
 	}
 	sort.Slice(resp.Zones, func(i, j int) bool { return resp.Zones[i].Name < resp.Zones[j].Name })
 	return resp, nil
@@ -71,6 +84,8 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 	// collector and the CLI/gRPC text surfaces. When the knob is off,
 	// HitPackets/HitBytes stay 0 (we skip the dataplane read).
 	statsEnabled := cfg.Security.PolicyStatsEnabled
+	// #3408: surface a per-policy counter read failure as codes.Internal.
+	var readErr error
 	resp := &pb.GetPoliciesResponse{}
 	var policySetID uint32
 	for _, zpp := range cfg.Security.Policies {
@@ -103,6 +118,8 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
 					pr.HitPackets = ctrs.Packets
 					pr.HitBytes = ctrs.Bytes
+				} else if readErr == nil {
+					readErr = err
 				}
 			}
 			pi.Rules = append(pi.Rules, pr)
@@ -152,6 +169,8 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
 					pr.HitPackets = ctrs.Packets
 					pr.HitBytes = ctrs.Bytes
+				} else if readErr == nil {
+					readErr = err
 				}
 			}
 			pi.Rules = append(pi.Rules, pr)
@@ -162,6 +181,9 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 		resp.Policies = append(resp.Policies, pi)
 	}
 
+	if readErr != nil {
+		return nil, status.Errorf(codes.Internal, "reading policy counter: %v", readErr)
+	}
 	return resp, nil
 }
 

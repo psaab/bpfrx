@@ -107,6 +107,9 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 	// the dataplane read) rather than surfacing live counts the operator
 	// did not enable.
 	statsEnabled := cfg.Security.PolicyStatsEnabled
+	// #3408: surface a per-policy counter read failure as a warning AFTER all
+	// reads rather than printing clean-zero hit counts.
+	var readErr error
 	fmt.Fprintf(buf, "%-12s %-12s %-24s %-8s %12s %16s\n",
 		"From zone", "To zone", "Policy", "Action", "Packets", "Bytes")
 	fmt.Fprintln(buf, strings.Repeat("-", 88))
@@ -132,6 +135,8 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
 					pkts = counters.Packets
 					bytes = counters.Bytes
+				} else if readErr == nil {
+					readErr = err
 				}
 			}
 			totalPkts += pkts
@@ -170,6 +175,8 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
 					pkts = counters.Packets
 					bytes = counters.Bytes
+				} else if readErr == nil {
+					readErr = err
 				}
 			}
 			totalPkts += pkts
@@ -190,6 +197,9 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 	}
 	fmt.Fprintln(buf, strings.Repeat("-", 88))
 	fmt.Fprintf(buf, "%-48s %8s %12d %16d\n", "Total", "", totalPkts, totalBytes)
+	if readErr != nil {
+		fmt.Fprintf(buf, "warning: policy counter read failed (hit counts may be incomplete): %v\n", readErr)
+	}
 }
 
 // showPoliciesDetail renders per-policy detail (match conditions,
@@ -220,6 +230,9 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 	// it must honor the knob for cross-surface consistency.
 	statsEnabled := cfg.Security.PolicyStatsEnabled
 	schedActive, haveSched := s.policySchedulerActiveState()
+	// #3408: surface a per-policy counter read failure as a warning AFTER all
+	// reads rather than silently omitting the session-statistics block.
+	var readErr error
 	policySetID := uint32(0)
 	for _, zpp := range cfg.Security.Policies {
 		if (filterFrom != "" && zpp.FromZone != filterFrom) ||
@@ -276,6 +289,8 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
 					fmt.Fprintf(buf, "    Session statistics:\n")
 					fmt.Fprintf(buf, "      %d packets, %d bytes\n", counters.Packets, counters.Bytes)
+				} else if readErr == nil {
+					readErr = err
 				}
 			}
 		}
@@ -337,10 +352,15 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
 					fmt.Fprintf(buf, "    Session statistics:\n")
 					fmt.Fprintf(buf, "      %d packets, %d bytes\n", counters.Packets, counters.Bytes)
+				} else if readErr == nil {
+					readErr = err
 				}
 			}
 		}
 		fmt.Fprintln(buf)
+	}
+	if readErr != nil {
+		fmt.Fprintf(buf, "warning: policy counter read failed (session statistics may be incomplete): %v\n", readErr)
 	}
 }
 
