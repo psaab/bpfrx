@@ -268,7 +268,13 @@ From zone: guest, To zone: lan
     and the Rust classifier (`classify_system_service`/`classify_protocol`)
     recognize, so the runtime only ever sees a token both layers agree on; a
     Go parity test (`TestHostInboundNftMatchesKnownTokens`) keeps the nft
-    matcher domain equal to the SSOT. The tolerant load / peer-sync paths
+    matcher domain equal to the SSOT, and a second Go parity test
+    (`TestHostInboundRustClassifierMatchesGoSSOT`, #3486) parses the Rust
+    classifier source and asserts its `classify_system_service` /
+    `classify_protocol` arms + `KNOWN_ROUTING_PROTOCOL_TOKENS` /
+    `HOST_INBOUND_L2_PROTOCOLS` token sets EXACTLY equal the Go SSOT — so a
+    token added to one side only turns the build RED instead of silently
+    diverging the dataplane allowlist. The tolerant load / peer-sync paths
     downgrade the rejection to a warning so an already-persisted or peer-synced
     config still boots (#1960 no-brick), and a zone whose stanza yields zero
     recognized matches (an empty `host-inbound-traffic { }`) now emits a

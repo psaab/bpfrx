@@ -51,6 +51,13 @@ pub(in crate::afxdp) fn zone_host_inbound_from_snapshot(zone: &ZoneSnapshot) -> 
 /// Unrecognised tokens are intentionally ignored (fail-closed: they do not
 /// broaden admit). Covers the common Junos service set; the repo configs use
 /// {all, ssh, ping, dhcp, dhcpv6, gre} and this is a comprehensive superset.
+///
+/// The recognized token set here is a SECURITY allowlist and MUST stay in
+/// lockstep with the Go SSOT config.KnownHostInboundSystemServices (#3200). A
+/// Go parity test (config.TestHostInboundRustClassifierMatchesGoSSOT, #3486)
+/// parses these match arms and fails the build if a token is added/removed on
+/// only one side. Adding a service here without adding it to the Go SSOT (or
+/// vice versa) turns that test RED.
 fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
     match token {
         "all" | "any-service" => hi.all_services = true,
