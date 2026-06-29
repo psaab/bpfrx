@@ -415,6 +415,10 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, MatchPoliciesResult{
 		Matched:      true,
 		PolicyName:   res.PolicyName,
+		Global:       res.Global,
+		FromZone:     res.FromZone,
+		ToZone:       res.ToZone,
+		PolicyID:     res.PolicyID,
 		Action:       policymatch.ActionString(res.Action),
 		SrcAddresses: res.SrcAddresses,
 		DstAddresses: res.DstAddresses,

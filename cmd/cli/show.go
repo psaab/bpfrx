@@ -978,9 +978,23 @@ func (c *ctl) showMatchPolicies(args []string) error {
 	}
 
 	if resp.Matched {
-		fmt.Printf("Matching policy:\n")
+		if resp.Global {
+			fmt.Printf("Matching policy (global):\n")
+		} else {
+			fmt.Printf("Matching policy:\n")
+		}
 		fmt.Printf("  From zone: %s, To zone: %s\n", req.FromZone, req.ToZone)
 		fmt.Printf("  Policy: %s\n", resp.PolicyName)
+		// #3331: identify WHICH scoped/global policy matched so a verdict maps
+		// back to the runtime policy / session-table ID / audit record when the
+		// same policy name repeats across zone pairs or global scope.
+		fmt.Printf("    Policy ID: %d\n", resp.PolicyId)
+		if resp.Global {
+			fmt.Printf("    Scope: global (match from-zone: %s, to-zone: %s)\n",
+				matchScopeZone(resp.FromZone), matchScopeZone(resp.ToZone))
+		} else {
+			fmt.Printf("    Scope: zone-pair (from-zone: %s, to-zone: %s)\n", resp.FromZone, resp.ToZone)
+		}
 		fmt.Printf("    Source addresses: %v\n", resp.SrcAddresses)
 		fmt.Printf("    Destination addresses: %v\n", resp.DstAddresses)
 		fmt.Printf("    Applications: %v\n", resp.Applications)
@@ -999,6 +1013,16 @@ func (c *ctl) showMatchPolicies(args []string) error {
 		fmt.Printf("No matching policy found for %s -> %s (%s)\n", req.FromZone, req.ToZone, resp.Action)
 	}
 	return nil
+}
+
+// matchScopeZone renders a global policy's match from-zone/to-zone scope for the
+// match-policies output (#3331). An empty scope means the global policy applies
+// to every zone, shown as "any" to match the Junos / `show policies` convention.
+func matchScopeZone(z string) string {
+	if z == "" {
+		return "any"
+	}
+	return z
 }
 
 func (c *ctl) showVRRP() error {
