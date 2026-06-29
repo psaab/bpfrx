@@ -8,7 +8,44 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	xnft "github.com/psaab/xpf/pkg/nftables"
 )
+
+// readHostInboundDenyCounters is the kernel nft host-inbound deny-counter source,
+// a package var so the collector's degraded-boot behavior is unit-testable
+// without a live kernel/netlink (#3361).
+var readHostInboundDenyCounters = xnft.ReadHostInboundDenyCounters
+
+// collectHostInboundKernelDenies scrapes the per-zone/family named DROP counters
+// from the kernel nftables host-inbound chain (#3361) and emits them as
+// xpf_host_inbound_kernel_denies_total. This is the PRIMARY host-inbound
+// enforcement path (host-bound traffic is shunted to the kernel before
+// userspace-dp sees it), and is distinct from the userspace-dp
+// xpf_host_inbound_denies_total path (#3326) — they are not double counts.
+//
+// The nft `inet xpf_hostinbound` chain is installed by the daemon INDEPENDENT of
+// dataplane load state and keeps dropping control-plane traffic in a config-only
+// / degraded boot, so Collect calls this BEFORE the dataplane gate — otherwise
+// the series would vanish in exactly the degraded boot this metric exists to
+// observe. ReadHostInboundDenyCounters reads nft via netlink and has no
+// dataplane dependency.
+//
+// On a read failure the series is SKIPPED (no misleading 0) and
+// xpf_counter_read_errors_total is bumped, matching the #3345 contract: a missing
+// sample is distinguishable from a real zero. (The error-counter SAMPLE is
+// emitted by collectGlobalCounters; the bump here accumulates on the collector
+// so it surfaces on the next scrape that reaches the global counters.)
+func (c *xpfCollector) collectHostInboundKernelDenies(ch chan<- prometheus.Metric) {
+	counts, err := readHostInboundDenyCounters()
+	if err != nil {
+		c.counterReadErrors.Add(1)
+		return
+	}
+	for _, ctr := range counts {
+		ch <- prometheus.MustNewConstMetric(c.hostInboundKernelDenies,
+			prometheus.CounterValue, float64(ctr.Packets), ctr.Zone, ctr.Family)
+	}
+}
 
 func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	// #3345: on a counter-read failure, SKIP emitting the sample instead of

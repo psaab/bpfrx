@@ -49,12 +49,24 @@ func (s *Server) GetEvents(_ context.Context, req *pb.GetEventsRequest) (*pb.Get
 		events = s.eventBuf.LatestFiltered(limit, filter)
 	}
 
-	// Build reverse zone ID → name map
+	// Build reverse zone ID → name map from the CURRENT config. This is only a
+	// fallback for legacy records that predate the resolved-at-event-time zone
+	// names (#3335): each EventRecord already stores InZoneName/OutZoneName as
+	// resolved when the event fired, so a later zone rename / delete / ID reuse
+	// (#3075) must NOT retroactively rewrite an old event's zone name from the
+	// live config. Prefer the stored name; only consult this map when the
+	// record carries no resolved name.
 	evZoneNames := make(map[uint16]string)
 	if cr := s.applyResult(); cr != nil {
 		for name, id := range cr.ZoneIDs {
 			evZoneNames[id] = name
 		}
+	}
+	zoneName := func(stored string, id uint16) string {
+		if stored != "" {
+			return stored
+		}
+		return evZoneNames[id]
 	}
 
 	resp := &pb.GetEventsResponse{}
@@ -69,8 +81,8 @@ func (s *Server) GetEvents(_ context.Context, req *pb.GetEventsRequest) (*pb.Get
 			PolicyId:        ev.PolicyID,
 			IngressZone:     uint32(ev.InZone),
 			EgressZone:      uint32(ev.OutZone),
-			IngressZoneName: evZoneNames[ev.InZone],
-			EgressZoneName:  evZoneNames[ev.OutZone],
+			IngressZoneName: zoneName(ev.InZoneName, ev.InZone),
+			EgressZoneName:  zoneName(ev.OutZoneName, ev.OutZone),
 			ScreenCheck:     ev.ScreenCheck,
 			SessionPackets:  ev.SessionPkts,
 			SessionBytes:    ev.SessionBytes,
