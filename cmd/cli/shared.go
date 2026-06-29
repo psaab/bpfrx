@@ -429,9 +429,17 @@ func (c *ctl) dispatchConfig(line string) error {
 	case "rollback":
 		n := int32(0)
 		if len(parts) >= 2 {
-			if v, err := strconv.Atoi(parts[1]); err == nil {
-				n = int32(v)
+			// Strict integer parse: a malformed token (e.g. "foo",
+			// "1x") or a negative value must NOT silently fall through
+			// to rollback 0, which discards the candidate (#3447).
+			v, err := strconv.Atoi(parts[1])
+			if err != nil {
+				return fmt.Errorf("rollback: invalid rollback number %q", parts[1])
 			}
+			if v < 0 {
+				return fmt.Errorf("rollback: rollback number must be >= 0, got %d", v)
+			}
+			n = int32(v)
 		}
 		_, err := c.client.Rollback(c.ctx(), &pb.RollbackRequest{N: n})
 		if err != nil {

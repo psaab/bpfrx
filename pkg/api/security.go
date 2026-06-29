@@ -244,6 +244,37 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 		result = append(result, pi)
 	}
 
+	// #3363: the IMPLICIT default-policy catch-all now has a reserved hit
+	// counter (read via the DefaultPolicySentinelID handle). Surface it as a
+	// final synthetic policy set ("-"/"-") with one rule named
+	// dataplane.DefaultPolicyName so automation/dashboards can audit
+	// default-deny/permit hits — the most security-relevant boundary — without
+	// scraping logs. Counts gate on policy-stats like every other rule.
+	{
+		defRule := PolicyRule{
+			Name:         dataplane.DefaultPolicyName,
+			Action:       policyActionStr(cfg.Security.DefaultPolicy),
+			SrcAddresses: []string{},
+			DstAddresses: []string{},
+			Applications: []string{},
+			PolicyID:     dataplane.DefaultPolicySentinelID,
+			RuleID:       dataplane.DefaultPolicyName,
+		}
+		if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
+			if ctrs, err := s.dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err == nil {
+				defRule.HitPackets = ctrs.Packets
+				defRule.HitBytes = ctrs.Bytes
+			} else if readErr == nil {
+				readErr = err
+			}
+		}
+		result = append(result, PolicyInfo{
+			FromZone: "-",
+			ToZone:   "-",
+			Rules:    []PolicyRule{defRule},
+		})
+	}
+
 	if readErr != nil {
 		writeError(w, http.StatusInternalServerError,
 			"policy counter read failed: "+readErr.Error())

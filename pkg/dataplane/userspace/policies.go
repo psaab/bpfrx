@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"net"
 	"sort"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -137,9 +138,11 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 	// dropped (deny narrowing / under-match). nameRepresentable rejects BOTH
 	// (any unrepresentable member taints the name) so the address sentinel is
 	// emitted and the Rust preflight rejects the whole snapshot (previous-good
-	// retained / fresh-boot default-deny). A set that merely CONTAINS a
-	// feed-bound member stays representable (the member resolves via the overlay),
-	// so feeds are never falsely rejected.
+	// retained / fresh-boot default-deny). A set that CONTAINS a feed-bound
+	// member stays representable (the member resolves via the overlay) and
+	// #3294 (A′) now merges that member's live feed prefixes INTO the set's row,
+	// so a `deny <set-with-a-feed>` enforces the feed portion instead of
+	// under-denying it.
 	addrRepresentable := func(tok string) bool {
 		switch tok {
 		case "", "any", "any4", "any6":
@@ -328,14 +331,20 @@ func buildOneRuleSnapshot(
 	// is the address analog of the application sentinel below.
 	srcUnrepresentable := !allAddressTokensRepresentable(addrRepresentable, pol.Match.SourceAddresses)
 	dstUnrepresentable := !allAddressTokensRepresentable(addrRepresentable, pol.Match.DestinationAddresses)
+	// #3376: capture the exact offending tokens BEFORE the side collapses to
+	// the sentinel so collectPolicyContentRejections can name them per side.
+	var rejectedSrc, rejectedDst, rejectedApps []string
 	if srcUnrepresentable {
+		rejectedSrc = offendingAddressTokens(addrRepresentable, pol.Match.SourceAddresses)
 		sourceAddresses = []string{unsupportedAddressSentinel}
 	}
 	if dstUnrepresentable {
+		rejectedDst = offendingAddressTokens(addrRepresentable, pol.Match.DestinationAddresses)
 		destinationAddresses = []string{unsupportedAddressSentinel}
 	}
 	applicationTerms, ok := expandUserspacePolicyApplications(cfg, pol.Match.Applications)
 	if !ok {
+		rejectedApps = offendingApplicationTokens(cfg, pol.Match.Applications)
 		// #2124: the rule cites application terms the userspace matcher cannot
 		// honor (unrepresentable protocol or port). Emit a reserved unparseable
 		// sentinel term instead of nil. nil would decode on the Rust side as
@@ -406,7 +415,43 @@ func buildOneRuleSnapshot(
 		// policy pol.Match.FromZone/ToZone are empty, so this is inert.
 		MatchFromZone: pol.Match.FromZone,
 		MatchToZone:   pol.Match.ToZone,
+		// #3376: build-time-only offending-token detail (not serialized).
+		rejectedSourceAddresses: rejectedSrc,
+		rejectedDestAddresses:   rejectedDst,
+		rejectedApplications:    rejectedApps,
 	}
+}
+
+// offendingAddressTokens returns the configured address tokens the userspace
+// matcher cannot represent (#3376). Used to name the exact poisoned object in a
+// fail-closed content-rejection reason rather than the bare "an address". The
+// returned tokens are the operator-configured strings (an undefined book name,
+// or a book that resolves to no representable prefix), in config order.
+func offendingAddressTokens(addrRepresentable func(tok string) bool, addrs []string) []string {
+	var bad []string
+	for _, tok := range addrs {
+		if !addrRepresentable(tok) {
+			bad = append(bad, tok)
+		}
+	}
+	return bad
+}
+
+// offendingApplicationTokens returns the configured application tokens the
+// userspace matcher cannot represent (#3376), identified by re-running the
+// snapshot application expansion on each token individually. A token whose
+// single-element expansion fails (protocol-less app, unrepresentable
+// protocol/port, undefined name, or an application-set with such a member) is
+// reported by its configured name, so the reason names the exact poisoned
+// application rather than the bare "an application".
+func offendingApplicationTokens(cfg *config.Config, apps []string) []string {
+	var bad []string
+	for _, app := range apps {
+		if _, ok := expandUserspacePolicyApplications(cfg, []string{app}); !ok {
+			bad = append(bad, app)
+		}
+	}
+	return bad
 }
 
 // collectPolicyContentRejections scans the BUILT policy rules for the #3261
@@ -429,20 +474,71 @@ func collectPolicyContentRejections(policies []PolicyRuleSnapshot) []string {
 				break
 			}
 		}
-		addrBad := addressListHasSentinel(rule.SourceLiterals) ||
-			addressListHasSentinel(rule.DestinationLiterals) ||
-			addressListHasSentinel(rule.SourceAddresses) ||
-			addressListHasSentinel(rule.DestinationAddresses)
-		switch {
-		case appBad && addrBad:
-			reasons = append(reasons, fmt.Sprintf("policy %q names an unrepresentable application AND address", rule.Name))
-		case appBad:
-			reasons = append(reasons, fmt.Sprintf("policy %q names an application the userspace matcher cannot represent", rule.Name))
-		case addrBad:
-			reasons = append(reasons, fmt.Sprintf("policy %q names an address the userspace matcher cannot represent", rule.Name))
+		srcBad := addressListHasSentinel(rule.SourceLiterals) || addressListHasSentinel(rule.SourceAddresses)
+		dstBad := addressListHasSentinel(rule.DestinationLiterals) || addressListHasSentinel(rule.DestinationAddresses)
+		if !appBad && !srcBad && !dstBad {
+			continue
 		}
+		// #3376: name the stable rule identity (scope-qualified, so duplicate
+		// policy names across distinct zone pairs / global scope are
+		// distinguishable) AND the offending side + configured object(s), so the
+		// operator can jump straight to the poisoned token on the fail-closed
+		// keep-armed path instead of hand-auditing every source/destination/app.
+		var causes []string
+		if srcBad {
+			causes = append(causes, rejectionCause("source-address", rule.rejectedSourceAddresses))
+		}
+		if dstBad {
+			causes = append(causes, rejectionCause("destination-address", rule.rejectedDestAddresses))
+		}
+		if appBad {
+			causes = append(causes, rejectionCause("application", rule.rejectedApplications))
+		}
+		reasons = append(reasons, fmt.Sprintf("policy %s names content the userspace matcher cannot represent: %s",
+			policyRejectionScope(rule), strings.Join(causes, "; ")))
 	}
 	return reasons
+}
+
+// policyRejectionScope returns the stable, scope-qualified rule identity used in
+// a content-rejection reason (#3376). A zone-pair rule renders as
+// "from-zone->to-zone/name"; a global rule (FromZone == ToZone ==
+// "junos-global") renders as "global/name", appending its optional
+// from-zone/to-zone match context ("global(a->b)/name") when present. The bare
+// name alone is ambiguous because duplicate policy names across distinct zone
+// pairs / global scope are valid and common.
+func policyRejectionScope(rule *PolicyRuleSnapshot) string {
+	if rule.FromZone == "junos-global" && rule.ToZone == "junos-global" {
+		if rule.MatchFromZone != "" || rule.MatchToZone != "" {
+			from := rule.MatchFromZone
+			if from == "" {
+				from = "any"
+			}
+			to := rule.MatchToZone
+			if to == "" {
+				to = "any"
+			}
+			return fmt.Sprintf("global(%s->%s)/%s", from, to, rule.Name)
+		}
+		return fmt.Sprintf("global/%s", rule.Name)
+	}
+	return fmt.Sprintf("%s->%s/%s", rule.FromZone, rule.ToZone, rule.Name)
+}
+
+// rejectionCause renders one side's content-rejection cause for #3376, naming
+// the exact offending tokens when known (e.g. `source-address "missing-book"`).
+// It falls back to the bare side label when the offending tokens were not
+// captured (e.g. the snapshot was decoded from the wire, which does not carry
+// the build-time-only detail).
+func rejectionCause(side string, tokens []string) string {
+	if len(tokens) == 0 {
+		return side
+	}
+	quoted := make([]string, len(tokens))
+	for i, t := range tokens {
+		quoted[i] = fmt.Sprintf("%q", t)
+	}
+	return fmt.Sprintf("%s %s", side, strings.Join(quoted, ", "))
 }
 
 func addressListHasSentinel(addrs []string) bool {
@@ -588,17 +684,14 @@ func buildAddressBookTableWithFeeds(cfg *config.Config, feedOverlay map[string][
 	}
 	contentToBucket := make(map[string]*bucket)
 	for _, name := range allNames {
-		v4, v6 := expandBookNameToCIDRs(cfg, name)
-		// #2049: merge the live feed prefixes bound to this name. Feed CIDRs
-		// are already canonical (masked) strings; split by family. They join
-		// the same dedup/sort/canonicalize path as static members, so a
-		// feed-backed name with content identical to a static book shares an
-		// ID by the existing content-equality invariant.
-		if feeds := feedOverlay[name]; len(feeds) > 0 {
-			fv4, fv6 := splitFeedPrefixesByFamily(feeds)
-			v4 = append(v4, fv4...)
-			v6 = append(v6, fv6...)
-		}
+		// #2049 / #3294: expandBookNameToCIDRs is feed-aware — it merges the
+		// live feed prefixes bound to this name AND to any feed-bound MEMBER
+		// nested inside an address-set (so a `deny <set-containing-a-feed>`
+		// enforces the feed portion, closing the #3294 under-deny). The feed
+		// CIDRs join the same dedup/sort/canonicalize path as static members,
+		// so a feed-backed name with content identical to a static book still
+		// shares an ID by the existing content-equality invariant.
+		v4, v6 := expandBookNameToCIDRs(cfg, feedOverlay, name)
 		// Normalise "any" → 0.0.0.0/0 + ::/0 (Codex r6 refinement).
 		v4, v6 = normalizeAnyInCIDRs(v4, v6)
 		// Canonical sort + dedup within each family. Without
@@ -692,37 +785,6 @@ func buildAddressBookTableWithFeeds(cfg *config.Config, feedOverlay map[string][
 	return out, nameToID, nil
 }
 
-// splitFeedPrefixesByFamily classifies feed-backed CIDR strings into v4 and
-// v6 lists (#2049). Feed prefixes are already canonicalized to masked CIDR
-// form by the feed manager (192.0.2.0/24, 2001:db8::/32), and a bare IP is
-// normalized to /32 or /128 there, so this is a pure family split. A prefix
-// that fails to parse (defensive — should not happen for canonical feed
-// content) is dropped.
-func splitFeedPrefixesByFamily(prefixes []string) (v4, v6 []string) {
-	for _, p := range prefixes {
-		if p == "" {
-			continue
-		}
-		if isV4CIDR(p) {
-			v4 = append(v4, p)
-			continue
-		}
-		if isV6CIDR(p) {
-			v6 = append(v6, p)
-			continue
-		}
-		// Not a CIDR — try a bare IP for robustness.
-		if ip := net.ParseIP(p); ip != nil {
-			if ip.To4() != nil {
-				v4 = append(v4, ip.String()+"/32")
-			} else {
-				v6 = append(v6, ip.String()+"/128")
-			}
-		}
-	}
-	return v4, v6
-}
-
 // expandBookNameToCIDRs resolves a single address-book name
 // (Address or AddressSet, recursively) into its v4 + v6 CIDR
 // lists. Returns empty slices if name does not exist.
@@ -734,13 +796,19 @@ func splitFeedPrefixesByFamily(prefixes []string) (v4, v6 []string) {
 //
 // All three forms are surfaced here as canonical CIDRs so the wire
 // row carries concrete prefixes.
-func expandBookNameToCIDRs(cfg *config.Config, name string) ([]string, []string) {
+//
+// #3294: the walk is feed-aware. A dynamic-address feed binding name (whether
+// it IS the top-level name or appears as a MEMBER nested inside an
+// address-set) contributes its live overlay prefixes to the row. Feed CIDRs
+// are already canonical (masked) strings; the classifier below normalises a
+// bare IP and drops an unparseable value, exactly as the old
+// splitFeedPrefixesByFamily did. ab may be nil while feedOverlay carries the
+// name (a pure feed binding with no static book), so this does NOT early-return
+// on nil ab — expandBookNameRecursive handles a nil book.
+func expandBookNameToCIDRs(cfg *config.Config, feedOverlay map[string][]string, name string) ([]string, []string) {
 	ab := cfg.Security.AddressBook
-	if ab == nil {
-		return nil, nil
-	}
 	visited := make(map[string]bool)
-	values := expandBookNameRecursive(ab, name, visited, 0)
+	values := expandBookNameRecursive(ab, feedOverlay, name, visited, 0)
 	var v4, v6 []string
 	for _, value := range values {
 		if value == "" {
@@ -783,26 +851,43 @@ func expandBookNameToCIDRs(cfg *config.Config, name string) ([]string, []string)
 // `resolveUserspaceAddressBookEntry` semantics — Copilot review C2).
 // `visited` is mutated on entry and unwound on exit so siblings
 // can share parents without false cycles.
-func expandBookNameRecursive(ab *config.AddressBook, name string, visited map[string]bool, _depth int) []string {
+//
+// #3294 (A′): the walk is feed-aware. A dynamic-address feed binding name
+// contributes its live overlay prefixes — at the top level AND when it appears
+// as a MEMBER nested inside an address-set. Before this, feed prefixes were
+// merged only for the top-level overlay name (in buildAddressBookTableWithFeeds),
+// so a `deny <set-containing-a-feed>` enforced only the concrete members and
+// silently under-denied the feed portion. Resolving the feed here, in the
+// recursive walk, closes that under-deny. A name that is BOTH a feed binding
+// and a static address accumulates both. ab may be nil (a pure feed binding
+// with no static book), in which case only the overlay prefixes contribute.
+func expandBookNameRecursive(ab *config.AddressBook, feedOverlay map[string][]string, name string, visited map[string]bool, _depth int) []string {
 	if visited[name] {
 		return nil
 	}
 	visited[name] = true
 	defer func() { delete(visited, name) }()
+	var out []string
+	if feeds := feedOverlay[name]; len(feeds) > 0 {
+		out = append(out, feeds...)
+	}
+	if ab == nil {
+		return out
+	}
 	if addr, ok := ab.Addresses[name]; ok {
-		return []string{addr.Value}
+		out = append(out, addr.Value)
+		return out
 	}
 	if as, ok := ab.AddressSets[name]; ok {
-		var out []string
 		for _, member := range as.Addresses {
-			out = append(out, expandBookNameRecursive(ab, member, visited, 0)...)
+			out = append(out, expandBookNameRecursive(ab, feedOverlay, member, visited, 0)...)
 		}
 		for _, nested := range as.AddressSets {
-			out = append(out, expandBookNameRecursive(ab, nested, visited, 0)...)
+			out = append(out, expandBookNameRecursive(ab, feedOverlay, nested, visited, 0)...)
 		}
 		return out
 	}
-	return nil
+	return out
 }
 
 // nameRepresentable reports whether an address-book name (Address or
@@ -824,18 +909,22 @@ func expandBookNameRecursive(ab *config.AddressBook, name string, visited map[st
 //
 // #3261 convergent MAJOR (Codex MAJOR 2 + Claude-SMR): the SET branch
 // additionally requires that at least one recursively-resolved member
-// contributes a concrete prefix. Without this an EMPTY address-set, a pure
-// self-cycle (X -> X), or a set whose ONLY members are feed-bound names were
-// VACUOUSLY representable — no sentinel emitted — yet they compile to an EMPTY
-// book row (feed prefixes are merged only for the TOP-LEVEL overlay name in
-// buildAddressBookTableWithFeeds, never for a set MEMBER; Codex MAJOR 1). An
-// empty-row deny side decodes to MatchNone, so a `deny <empty/cycle/feed-only
-// set>` matches nothing and falls through to a later permit / default-permit —
-// a deny fail-OPEN on the exact lenient-load / peer-sync path this mechanism
-// guards (the strict commit gate is downgraded to a warning there). A set
-// MIXING a feed member and >=1 concrete member stays representable (the
-// feed-portion under-deny is the deferred #2049 feed-prefixes-not-merged-into-
-// sets residual, OUT OF SCOPE here).
+// contributes a concrete prefix. Without this an EMPTY address-set or a pure
+// self-cycle (X -> X) would be VACUOUSLY representable — no sentinel emitted —
+// yet compile to an EMPTY book row. An empty-row deny side decodes to MatchNone,
+// so a `deny <empty/cycle set>` matches nothing and falls through to a later
+// permit / default-permit — a deny fail-OPEN on the exact lenient-load /
+// peer-sync path this mechanism guards (the strict commit gate is downgraded to
+// a warning there).
+//
+// #3294 (A′): a feed-bound MEMBER of a set now contributes its live feed
+// prefixes to the enclosing set's row (expandBookNameRecursive is feed-aware),
+// so it IS a concrete contribution when the feed has >= 1 live prefix. A set
+// MIXING a feed member and a concrete member is representable AND its row
+// carries BOTH (the feed-portion under-deny is closed). A feed-ONLY set is
+// representable+enforced when its feed is live, and #3261-rejected (sentinel,
+// fail-closed) only when the feed is currently empty (an empty row -> MatchNone
+// -> the deny would otherwise drop silently).
 func nameRepresentable(ab *config.AddressBook, feedOverlay map[string][]string, name string, visited map[string]bool) bool {
 	// The closure must be BOTH structurally resolvable AND contribute >=1
 	// concrete prefix. The >=1-concrete requirement is enforced HERE, exactly
@@ -865,11 +954,14 @@ func nameRepresentable(ab *config.AddressBook, feedOverlay map[string][]string, 
 //     set that ALSO has its own resolvable member — the cycle revisit returns
 //     representable (strict's `if seen[ref] { return true }`).
 //   - `concrete` reports whether the name contributes at least one CONCRETE
-//     prefix to a book row: a CIDR / bare-IP / explicit-`any` Address, or a
-//     nested set that itself has a concrete contribution. A feed-bound name and
-//     a cycle revisit are representable-but-NOT-concrete (a feed member's
-//     prefixes are not merged into an enclosing set's row, and a cycle revisit
-//     contributes nothing, matching expandBookNameRecursive's nil-on-revisit).
+//     prefix to a book row: a CIDR / bare-IP / explicit-`any` Address, a
+//     feed-bound name whose feed currently has >= 1 live prefix (#3294 (A′):
+//     its prefixes ARE now merged into the enclosing set's row by
+//     expandBookNameRecursive), or a nested set that itself has a concrete
+//     contribution. A feed-bound name with an EMPTY feed and a cycle revisit are
+//     representable-but-NOT-concrete (an empty feed contributes no prefix, and a
+//     cycle revisit contributes nothing, matching expandBookNameRecursive's
+//     nil-on-revisit).
 //
 // The SET branch returns (hasMember, anyConcrete): an empty set is
 // (false,false) (matches strict's resolvedAny==false reject); a structurally
@@ -901,11 +993,18 @@ func nameRepresentability(ab *config.AddressBook, feedOverlay map[string][]strin
 		// >=1-concrete gate in nameRepresentable is what rejects a pure cycle.
 		return true, false
 	}
-	if _, feedBound := feedOverlay[name]; feedBound {
-		// Feed-bound name: representable, but its prefixes are merged only for
-		// the top-level overlay name, never into an enclosing set's row — so it
-		// is NOT a concrete contribution toward a set's representability.
-		return true, false
+	if feeds, feedBound := feedOverlay[name]; feedBound {
+		// Feed-bound name. #3294 (A′): expandBookNameRecursive now merges the
+		// feed prefixes into an enclosing set's row, so a feed-bound member
+		// with >= 1 live prefix IS a concrete contribution toward the set's
+		// representability (a `deny <set>` enforces the feed portion). An
+		// EMPTY feed (overlay key present, no live prefixes) stays
+		// representable-but-NOT-concrete: match-none by #2049 design, NOT a
+		// reject — so the concrete bit is gated on live prefix count, not set
+		// unconditionally. A top-level direct feed token never reaches here
+		// (addrRepresentable short-circuits it via feedOverlay BEFORE
+		// nameRepresentable), preserving the #2049 direct-feed exemption.
+		return true, len(feeds) > 0
 	}
 	if ab == nil {
 		return false, false

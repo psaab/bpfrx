@@ -82,6 +82,30 @@ impl RateCounter {
         self.prev_count.saturating_add(self.count) > threshold
     }
 
+    /// Advance the window ONCE, count this event, and classify the trailing
+    /// 1-second sum against TWO thresholds in a single pass (#3315 D7).
+    ///
+    /// Returns `(over_attack, over_alarm)`. This avoids a peek-then-increment
+    /// double-advance: `increment` rolls the buckets forward on each call, so
+    /// comparing against a second threshold via a separate call would advance
+    /// the window twice and could miscount across a second boundary. The event
+    /// is always counted (same as `increment`). Both compares read the same
+    /// already-computed trailing sum, so the classification is internally
+    /// consistent: a sum can never be "over attack" without also being "over
+    /// alarm" when `alarm <= attack` (the validated Junos ordering, though the
+    /// caller does not rely on that — it gates the alarm on `!over_attack`).
+    pub(super) fn increment_and_classify(
+        &mut self,
+        now_secs: u64,
+        attack: u32,
+        alarm: u32,
+    ) -> (bool, bool) {
+        self.advance(now_secs);
+        self.count = self.count.saturating_add(1);
+        let trailing = self.prev_count.saturating_add(self.count);
+        (trailing > attack, trailing > alarm)
+    }
+
     /// Reset counter (used in tests).
     #[cfg(test)]
     #[allow(dead_code)]
@@ -166,6 +190,29 @@ mod tests {
             }
         }
         assert_eq!(admitted, THRESHOLD, "fresh budget after a full-window gap");
+    }
+
+    /// #3315 D7: `increment_and_classify` advances the window exactly ONCE and
+    /// classifies the same trailing sum against both thresholds. Each call
+    /// counts exactly one event, so the sum climbs 1,2,3,... and crosses the
+    /// alarm threshold before the (higher) attack threshold. A peek-then-
+    /// increment implementation that advanced the window twice would miscount;
+    /// this sequence pins the single-advance, dual-compare contract.
+    #[test]
+    fn increment_and_classify_single_advance_dual_threshold() {
+        const ATTACK: u32 = 5;
+        const ALARM: u32 = 2;
+        let mut rc = RateCounter::default();
+        // sum 1,2: under both (2 > 2 is false — boundary is ">").
+        assert_eq!(rc.increment_and_classify(0, ATTACK, ALARM), (false, false));
+        assert_eq!(rc.increment_and_classify(0, ATTACK, ALARM), (false, false));
+        // sum 3: over alarm (3 > 2), under attack (3 > 5 false).
+        assert_eq!(rc.increment_and_classify(0, ATTACK, ALARM), (false, true));
+        // sum 4, 5: still over alarm, under/at attack (5 > 5 false).
+        assert_eq!(rc.increment_and_classify(0, ATTACK, ALARM), (false, true));
+        assert_eq!(rc.increment_and_classify(0, ATTACK, ALARM), (false, true));
+        // sum 6: over both.
+        assert_eq!(rc.increment_and_classify(0, ATTACK, ALARM), (true, true));
     }
 
     /// A sustained sender at exactly the threshold rate stays admitted:
