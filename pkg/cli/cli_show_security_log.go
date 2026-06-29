@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -39,7 +40,18 @@ func (c *CLI) showSecurityLog(args []string) error {
 			}
 			i++
 			zoneName := args[i]
-			// A zone filter is meaningless without the apply result that
+			// The "unknown"/"none"/"0" sentinels select zone 0 — the
+			// unassigned/pre-classification zone carried by host-inbound and
+			// emitted-before-zone-resolution events (#3338). Zone IDs are
+			// 1-based, so this value can never collide with a configured zone
+			// and does not need the apply result to resolve a name -> ID.
+			switch strings.ToLower(zoneName) {
+			case "unknown", "none", "0":
+				filter.Zone = 0
+				filter.HasZone = true
+				continue
+			}
+			// A named zone filter is meaningless without the apply result that
 			// maps zone name -> ID. Refuse rather than drop the filter and
 			// widen to all events (M02): during early startup or after a
 			// failed apply, cr == nil and silently honoring the request
@@ -53,6 +65,7 @@ func (c *CLI) showSecurityLog(args []string) error {
 				return fmt.Errorf("zone %q not found", zoneName)
 			}
 			filter.Zone = zid
+			filter.HasZone = true
 		case "protocol":
 			if i+1 >= len(args) {
 				return fmt.Errorf("missing value for %q\n%s", "protocol", usage)
