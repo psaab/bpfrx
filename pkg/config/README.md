@@ -795,7 +795,26 @@ split that disables forwarding). `resolveFilterPort` is NOT reused for this
 because it splits on `-` before a whole-spec lookup, mangling hyphenated service
 names (`ftp-data`, `tacacs-ds`, `kerberos-sec`); `resolveAppPort` does the
 whole-spec catalog lookup first. The lookup is case-insensitive, so a mixed-case
-service name resolves rather than passing through unresolved. An unresolvable
+service name resolves rather than passing through unresolved. **This case-fold
+is load-bearing (#3372):** the userspace #2124 capability gate
+(`userspacePortSpecRepresentable`) and Rust `parse_port_spec` match the 15
+literal aliases CASE-SENSITIVELY (lowercase only), while the strict commit gate
+`validatePortSpec` is case-insensitive. Without `resolveAppPort` lowering a
+recognized name to its number first, a mixed-case `destination-port HTTPS` would
+pass commit yet reach the case-sensitive userspace gate as a raw name, which
+rejects it — a commit/apply split. The apply failure is the #3261 class-(i)
+unrepresentable-content path, NOT a disarm/fail-open: the policy term is
+unrepresentable, `buildOneRuleSnapshot` emits the `__unsupported__` sentinel and
+records `snap.Capabilities.PolicyContentRejected`, and a current
+preflight-capable helper REJECTS the whole snapshot while STAYING ARMED — a
+running node retains its previous-good policy state, a fresh boot lands on
+default-deny (disarm/XDP_PASS-to-kernel is only the narrow
+pre-preflight-protocol-version backstop). So a removed case-fold would break
+APPLY (the new config silently does not take effect), not admit traffic
+fail-open. Because `resolveAppPort` canonicalizes to the numeric form first, the
+case-sensitive gate never sees a raw alias. The two 15-name backstop tables are
+pinned consistent with `junosServicePorts` by the
+`TestNamedPortAliasTablesDoNotDrift` canary. An unresolvable
 name (unknown service, out-of-range/malformed number, inverted/unresolved range)
 is left verbatim so `validatePortSpec` hard-rejects it at the strict commit gate
 and the tolerant load/peer-sync path downgrades it to a warning
