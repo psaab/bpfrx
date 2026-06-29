@@ -780,6 +780,16 @@ impl Clone for PolicyRule {
 pub(crate) struct PolicyRuleCounter {
     packets: AtomicU64,
     bytes: AtomicU64,
+    /// #3448: clear epoch. `clear security policies hit-count` resets the
+    /// shared `packets`/`bytes` atomics but cannot reach the per-worker
+    /// pending hit-count batches buffered by `record_policy_hit_counter`
+    /// (up to `POLICY_HIT_FLUSH_PACKETS`). Without an epoch, a pending batch
+    /// recorded before the clear would `add_batch` its stale pre-clear counts
+    /// onto the freshly-zeroed counter at the next RX-batch flush, so the
+    /// clear appeared to fail or to invent traffic. `reset()` bumps this
+    /// generation; each pending batch records the generation it was captured
+    /// under and is DISCARDED (not flushed) if the generation has advanced.
+    generation: AtomicU64,
 }
 
 impl PolicyRuleCounter {
@@ -805,8 +815,20 @@ impl PolicyRuleCounter {
     }
 
     fn reset(&self) {
+        // #3448: bump the clear epoch so any per-worker pending batch still
+        // holding pre-clear counts (recorded under the previous generation)
+        // is discarded at its next flush instead of replaying onto the
+        // freshly-zeroed atomics. The generation only ever increases.
+        self.generation.fetch_add(1, Ordering::Relaxed);
         self.packets.store(0, Ordering::Relaxed);
         self.bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// #3448: current clear epoch. Stamped onto a per-worker pending batch
+    /// when it is captured and re-checked at flush time to drop stale
+    /// pre-clear counts.
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     fn snapshot(&self, rule_id: &str) -> PolicyRuleCounterStatus {
@@ -878,6 +900,11 @@ impl PolicyCounterStore {
 // run of same-flow packets on a pure thread-local add.
 struct PendingPolicyHitRecord {
     counter: Option<Arc<PolicyRuleCounter>>,
+    /// #3448: clear epoch the buffered `packets`/`bytes` were recorded under.
+    /// Compared against the counter's current generation at flush time so a
+    /// `clear` that happened after this batch was captured discards the
+    /// pre-clear counts instead of replaying them.
+    generation: u64,
     packets: u64,
     bytes: u64,
 }
@@ -886,6 +913,7 @@ impl Default for PendingPolicyHitRecord {
     fn default() -> Self {
         Self {
             counter: None,
+            generation: 0,
             packets: 0,
             bytes: 0,
         }
@@ -901,13 +929,22 @@ thread_local! {
         std::cell::RefCell::new(PendingPolicyHitRecord::default());
 }
 
-#[cfg(not(test))]
+// Not gated on `#[cfg(not(test))]`: the generation-discard logic is the
+// load-bearing part of the #3448 fix and is unit-tested directly (the
+// per-worker thread-local coalescer itself is bypassed under `#[cfg(test)]`).
 #[inline(always)]
 fn flush_pending_policy_hit_record(record: &mut PendingPolicyHitRecord) {
     let Some(counter) = record.counter.take() else {
         return;
     };
-    counter.add_batch(record.packets, record.bytes);
+    // #3448: only fold the pending batch into the shared counter if it was
+    // recorded under the counter's CURRENT clear epoch. If a
+    // `clear security policies hit-count` bumped the generation between
+    // capture and this flush, these are pre-clear hits — discard them so the
+    // clear is durable and the freshly-zeroed counter does not snap back.
+    if record.generation == counter.generation() {
+        counter.add_batch(record.packets, record.bytes);
+    }
     record.packets = 0;
     record.bytes = 0;
 }
@@ -922,16 +959,25 @@ fn flush_pending_policy_hit_record(record: &mut PendingPolicyHitRecord) {
 pub(crate) fn record_policy_hit_counter(counter: &Arc<PolicyRuleCounter>, packet_bytes: u64) {
     PENDING_POLICY_HIT_RECORD.with(|pending| {
         let mut pending = pending.borrow_mut();
+        let generation = counter.generation();
+        // #3448: continue the current batch only when it is the SAME counter
+        // AND the SAME clear epoch. A `clear` mid-batch advances the
+        // generation; the else branch then flushes (and discards, via the
+        // generation guard) the stale pre-clear tally and re-captures the
+        // counter under the new generation, so post-clear packets are counted
+        // fresh from zero instead of being dropped with the pre-clear batch.
         if pending
             .counter
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, counter))
+            && pending.generation == generation
         {
             pending.packets = pending.packets.saturating_add(1);
             pending.bytes = pending.bytes.saturating_add(packet_bytes);
         } else {
             flush_pending_policy_hit_record(&mut pending);
             pending.counter = Some(counter.clone());
+            pending.generation = generation;
             pending.packets = 1;
             pending.bytes = packet_bytes;
         }
