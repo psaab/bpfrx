@@ -145,6 +145,20 @@ type compileOpts struct {
 	// live there. Same doctrine as lenientLogStreamPort.
 	lenientFlowTraceFile bool
 
+	// lenientFlowTraceFilter (#3422) downgrades the flow-trace flag /
+	// packet-filter-prefix gate (validateFlowTraceFlagsAndFiltersAST) from a
+	// hard compile error to a cfg.Warnings entry. Set ONLY on the tolerant
+	// load / peer-sync paths: a persisted or peer-synced config carrying an
+	// unparseable `packet-filter <n> source-prefix` value or an unimplemented
+	// `flag` token (values an older binary accepted) must still boot — the
+	// runtime fixes in NewTraceWriter keep an invalid filter match-none and
+	// drop an unknown flag so the defaults still apply, so a leniently-loaded
+	// value is fail-safe rather than the pre-#3422 fail-open (trace
+	// everything) / fail-silent (trace nothing). Like the file gate the flag
+	// and prefix values are AST leaves SchemaValidate treats as opaque, so the
+	// check does NOT live there. Same doctrine as lenientFlowTraceFile.
+	lenientFlowTraceFilter bool
+
 	// lenientLogEventModeFormat (#3349) downgrades the event-mode log-format
 	// compatibility gate (validateLogEventModeFormatStrict) from a hard
 	// compile error to a cfg.Warnings entry. Set ONLY on the tolerant load /
@@ -482,6 +496,19 @@ type compileOpts struct {
 	// no-brick); the dataplane never represented the leaf, so the term keeps
 	// matching without it independently. Same doctrine as lenientFilterActions.
 	lenientFilterFromMatch bool
+	// lenientFilterAddressLiterals (#3433) downgrades the firewall-filter
+	// literal-address gate (validateFilterAddressLiteralsStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a term whose literal source/destination-address is malformed
+	// (`10.0.0.0/99`) or of the wrong family for the filter (a v4 CIDR under
+	// `family inet6`). Before this gate the bad literal reached the kernel lo0 nft
+	// mirror verbatim and failed the atomic load (or left the mirror absent on the
+	// lenient path while userspace stayed armed). The tolerant load / peer-sync
+	// paths downgrade to a warning so an already-persisted or peer-synced config
+	// still BOOTS (#1960 no-brick); the lowering family-filter and the userspace
+	// matcher both fail closed for the bad token independently. Same doctrine as
+	// lenientFilterFromMatch.
+	lenientFilterAddressLiterals bool
 	// lenientFilterRoutingInstanceConflict (#3308) downgrades the firewall-filter
 	// routing-instance-vs-discard/reject mutual-exclusion gate
 	// (validateFilterRoutingInstanceConflictStrict) from a hard compile error to
@@ -1164,6 +1191,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientLogStreamPort:                 true,
 		lenientLogTLSProfile:                 true,
 		lenientFlowTraceFile:                 true,
+		lenientFlowTraceFilter:               true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1186,6 +1214,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFilterPortExcept:              true,
 		lenientFilterAddressExcept:           true,
 		lenientFilterFromMatch:               true,
+		lenientFilterAddressLiterals:         true,
 		lenientFilterRoutingInstanceConflict: true,
 		lenientFilterDSCP:                    true,
 		lenientNPTv6:                         true,
@@ -1307,6 +1336,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientLogStreamPort:                 true,
 		lenientLogTLSProfile:                 true,
 		lenientFlowTraceFile:                 true,
+		lenientFlowTraceFilter:               true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1329,6 +1359,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFilterPortExcept:              true,
 		lenientFilterAddressExcept:           true,
 		lenientFilterFromMatch:               true,
+		lenientFilterAddressLiterals:         true,
 		lenientFilterRoutingInstanceConflict: true,
 		lenientFilterDSCP:                    true,
 		lenientNPTv6:                         true,
@@ -1490,6 +1521,19 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// peer-synced config still boots (NewTraceWriter refuses the unsafe path at
 	// runtime, so tracing is simply disabled).
 	flowTraceFileWarnings, err := validateFlowTraceFileAST(tree.Children, "", opts.lenientFlowTraceFile)
+	if err != nil {
+		return nil, err
+	}
+
+	// #3422 flow-trace flag / packet-filter prefix gate. The compiler copies
+	// flag tokens and filter prefixes verbatim; an unparseable prefix makes
+	// NewTraceWriter drop the filter (every-filter-invalid -> trace everything,
+	// M01) and an unimplemented flag makes matchFlags never match (trace
+	// nothing while reporting enabled, M02). Strict (commit / commit-check):
+	// reject. Lenient (load / peer-sync): warn so a persisted/peer-synced value
+	// still boots — the runtime now fails safe either way.
+	flowTraceFilterWarnings, err := validateFlowTraceFlagsAndFiltersAST(
+		tree.Children, "", opts.lenientFlowTraceFilter)
 	if err != nil {
 		return nil, err
 	}
@@ -1687,6 +1731,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, logStreamPortWarnings...)
 	cfg.Warnings = append(cfg.Warnings, logTLSProfileWarnings...)
 	cfg.Warnings = append(cfg.Warnings, flowTraceFileWarnings...)
+	cfg.Warnings = append(cfg.Warnings, flowTraceFilterWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, appCollisionWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
@@ -2391,6 +2436,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// term matches without it independently). Runs on the fully-compiled *Config
 	// so the typed term list (with UnknownFrom populated by compileFilterFrom) is
 	// available.
+	// #3433 firewall-filter literal-address gate. Strict on commit / commit-check
+	// (hard-reject a term whose literal source/destination-address is malformed or
+	// of the wrong family for the filter). The address leaves were untyped at
+	// commit, so a bad literal reached the kernel lo0 nft mirror verbatim and
+	// either failed the atomic `nft -f -` load (breaking a legitimate commit) or,
+	// on the lenient path, left the kernel mirror ABSENT while userspace stayed
+	// armed — a host-protection divergence. Lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960 no-brick; the
+	// lowering's family-filter and the userspace matcher both fail closed for the
+	// bad token independently). Runs on the fully-compiled *Config so the typed
+	// term address slices are available. Sibling of the #3307 from-match gate.
+	if err := validateFilterAddressLiteralsStrict(cfg); err != nil {
+		if opts.lenientFilterAddressLiterals {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter address literal (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	if err := validateFilterFromMatchStrict(cfg); err != nil {
 		if opts.lenientFilterFromMatch {
 			cfg.Warnings = append(cfg.Warnings,

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/netip"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -1468,6 +1469,131 @@ func validateFlowTraceFileAST(nodes []*Node, prefix string, lenient bool) ([]str
 	return warnings, nil
 }
 
+// flowTraceImplementedFlags is the set of `security flow traceoptions flag`
+// values the persistent trace writer actually honours
+// (logging.TraceWriter.matchFlags recognizes exactly these two). Any other
+// token is fail-silent at runtime: NewTraceWriter installs it into a non-empty
+// flag map, which suppresses the basic-datapath/session defaults, and
+// matchFlags then never matches — the daemon reports flow tracing enabled while
+// the trace file stays empty (#3422 M02, false evidence during an incident).
+// Keep in sync with logging.matchFlags / logging.traceFlagImplemented.
+var flowTraceImplementedFlags = map[string]bool{
+	"basic-datapath": true,
+	"session":        true,
+}
+
+// validateFlowTraceFlagsAndFiltersAST is the #3422 commit-time gate for
+// `security flow traceoptions { flag <name>; packet-filter <n> { source-prefix
+// / destination-prefix <prefix>; } }`. The compiler copies both flag tokens
+// (compileFlow: to.Flags = append(...)) and filter prefixes
+// (pf.SourcePrefix/DestinationPrefix = nodeVal(...)) verbatim with no
+// validation, and the runtime then fails silently in two directions:
+//
+//   - M01: NewTraceWriter drops a filter whose prefix does not parse, so a
+//     config whose every filter is a typo (`source-prefix 10.0.0.999/32`)
+//     leaves tw.filters empty and HandleEvent traces EVERYTHING — a filter
+//     meant to narrow tracing broadens it.
+//   - M02: an unknown flag (`flag sesson`) makes the flag map non-empty,
+//     suppressing the defaults, so matchFlags never matches and nothing is
+//     traced while the daemon reports tracing enabled.
+//
+// Both values are single AST leaves SchemaValidate treats as opaque free text,
+// so — like the file gate above — they are checked here on the group-expanded
+// tree, mirroring compileFlow's traversal (FindChild("flow") >
+// FindChild("traceoptions") > flag / packet-filter children).
+//
+// Strict path (commit / commit-check, lenient=false): an unparseable
+// source/destination prefix or an unimplemented flag is a hard compile error.
+// Lenient path (load / peer-sync, lenient=true): downgraded to a warning so an
+// already-persisted or peer-synced config an older binary accepted still boots;
+// the runtime fixes (NewTraceWriter marks an invalid filter match-none and
+// drops an unknown flag so defaults still apply) keep a leniently-loaded value
+// fail-safe rather than fail-open (#1960 / #3261 fail-closed-on-load class).
+func validateFlowTraceFlagsAndFiltersAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
+	var warnings []string
+	for _, n := range nodes {
+		if n.Name() != "security" {
+			continue
+		}
+		secPath := joinNodePath(prefix, n.Keys)
+		flowNode := n.FindChild("flow")
+		if flowNode == nil {
+			continue
+		}
+		toNode := flowNode.FindChild("traceoptions")
+		if toNode == nil {
+			continue
+		}
+		toPath := joinNodePath(secPath, []string{"flow", "traceoptions"})
+
+		// flag tokens
+		for _, flagNode := range toNode.FindChildren("flag") {
+			v := nodeVal(flagNode)
+			if v == "" || flowTraceImplementedFlags[v] {
+				continue
+			}
+			path := joinNodePath(toPath, []string{"flag"})
+			msg := fmt.Sprintf("%s: unknown flow trace flag %q "+
+				"(supported: basic-datapath, session)", path, v)
+			if lenient {
+				warnings = append(warnings, msg+
+					" (ignored: unknown flag dropped, defaults apply)")
+				continue
+			}
+			return warnings, fmt.Errorf("%s", msg)
+		}
+
+		// packet-filter source/destination prefixes
+		for _, pf := range namedInstances(toNode.FindChildren("packet-filter")) {
+			pfPath := joinNodePath(toPath, []string{"packet-filter", pf.name})
+			for _, leaf := range []string{"source-prefix", "destination-prefix"} {
+				pn := pf.node.FindChild(leaf)
+				if pn == nil {
+					// Absent prefix: a protocol-only filter is legitimate, so
+					// leave it alone. This is AST-distinguishable from the
+					// present-but-empty case below (node missing vs node
+					// present with an empty value).
+					continue
+				}
+				v := nodeVal(pn)
+				if v == "" {
+					// Present-but-empty (`source-prefix ""`): the node exists
+					// but carries no prefix. Accepting it lets the runtime
+					// append a fully-unconstrained filter (zero srcNet/dstNet,
+					// no proto) that matches EVERY event — the #3422 M01
+					// fail-open in a smaller costume. Reject at strict; downgrade
+					// to a warning on the lenient load / peer-sync path, where
+					// the compiler marks the filter InvalidPrefix and the
+					// runtime fails it closed (match-none).
+					path := joinNodePath(pfPath, []string{leaf})
+					msg := fmt.Sprintf("%s: %s is present but empty; an empty "+
+						"prefix would match every event (omit %s for a "+
+						"protocol-only filter, or set a CIDR prefix)",
+						path, leaf, leaf)
+					if lenient {
+						warnings = append(warnings, msg+
+							" (ignored: filter set to match-none)")
+						continue
+					}
+					return warnings, fmt.Errorf("%s", msg)
+				}
+				if _, err := netip.ParsePrefix(v); err != nil {
+					path := joinNodePath(pfPath, []string{leaf})
+					msg := fmt.Sprintf("%s: invalid %s %q: %v",
+						path, leaf, v, err)
+					if lenient {
+						warnings = append(warnings, msg+
+							" (ignored: filter set to match-none)")
+						continue
+					}
+					return warnings, fmt.Errorf("%s", msg)
+				}
+			}
+		}
+	}
+	return warnings, nil
+}
+
 // tcpMSSKinds are the four tcp-mss sub-kinds the compiler reads
 // (compileFlow MSS switch). Each carries a u16 MSS value that lands in a
 // Rust u16 wire field (TCPMSS{IPsecVPN,GreIn,GreOut}; all-tcp fans out into
@@ -1787,11 +1913,23 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 		}
 		for _, pfInst := range namedInstances(toNode.FindChildren("packet-filter")) {
 			pf := &TracePacketFilter{Name: pfInst.name}
+			// A prefix node that is PRESENT but empty (`source-prefix ""`) is
+			// malformed: an empty prefix is not "no constraint" but a typo that
+			// must narrow tracing to nothing, not broaden it to everything
+			// (#3422 M01). Record the distinction here (present-but-empty vs the
+			// absent protocol-only case) so the runtime can fail it closed; the
+			// strict commit gate rejects it outright before it ever lands here.
 			if spNode := pfInst.node.FindChild("source-prefix"); spNode != nil {
 				pf.SourcePrefix = nodeVal(spNode)
+				if pf.SourcePrefix == "" {
+					pf.InvalidPrefix = true
+				}
 			}
 			if dpNode := pfInst.node.FindChild("destination-prefix"); dpNode != nil {
 				pf.DestinationPrefix = nodeVal(dpNode)
+				if pf.DestinationPrefix == "" {
+					pf.InvalidPrefix = true
+				}
 			}
 			if protoNode := pfInst.node.FindChild("protocol"); protoNode != nil {
 				pf.Protocol = nodeVal(protoNode)

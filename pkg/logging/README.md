@@ -177,6 +177,24 @@ if `Handle` runs the re-entrancy guard before the client check.
   `monitor security flow file` hardening (#3378). Pins:
   `TestNewTraceWriterRejectsPathTraversal`,
   `TestNewTraceWriterNoFollowSymlink`.
+- **Flow-trace flags and packet-filter prefixes are validated, and fail
+  safe at runtime (#3422).** A `security flow traceoptions packet-filter
+  <n> { source-prefix / destination-prefix <prefix> }` whose value does not
+  parse, or a `flag <name>` the writer does not implement (only
+  `basic-datapath` and `session` are honoured — `matchFlags`), is rejected
+  at commit-time (`validateFlowTraceFlagsAndFiltersAST`, `pkg/config`). The
+  lenient load / peer-sync path downgrades both to warnings and
+  `NewTraceWriter` fails safe: an unparseable filter is kept but marked
+  `invalid` (never-match) instead of being dropped — dropping every typo'd
+  filter would leave `tw.filters` empty and `HandleEvent` would then trace
+  EVERYTHING (a filter meant to narrow tracing broadened it, M01); an
+  unimplemented flag is dropped rather than installed into a non-empty flag
+  map that suppresses the `basic-datapath`/`session` defaults and makes
+  `matchFlags` never match (an empty trace file while the daemon reports
+  tracing enabled, M02). Pins: `TestFlowTraceFilterFailsCommit` /
+  `TestFlowTraceFilterLenientDowngrade` (`pkg/config`),
+  `TestTraceWriterInvalidFilterMatchesNone` /
+  `TestTraceWriterUnknownFlagAppliesDefaults` (`pkg/logging`).
 - **Event time is DECISION time, not receive time (#2465/#2470/#2511).**
   The on-wire RT_FLOW frame carries an absolute Unix-nanosecond timestamp
   in its first 8 bytes (LE u64), stamped by the userspace-dp producer at

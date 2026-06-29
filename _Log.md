@@ -1,3 +1,28 @@
+## 2026-06-28 — #3422 fold: quoted-empty trace packet-filter prefix fail-open
+
+- **Timestamp**: 2026-06-28
+- **Action**: Codex BLOCKER fold into #3422. `source-prefix ""` /
+  `destination-prefix ""` is representable — the lexer/parser preserve the
+  empty-string token, so the AST node is PRESENT with an empty value
+  (`Keys=["source-prefix",""]`, nodeVal == ""). The commit gate
+  (validateFlowTraceFlagsAndFiltersAST) SKIPPED `v == ""` and the runtime
+  (NewTraceWriter) skipped an empty prefix string without marking the filter
+  invalid, so the filter was appended fully-unconstrained (zero
+  srcNet/dstNet, no proto) → matchFilters matched EVERY event — the M01
+  fail-open in a smaller costume. Fixed BOTH layers: (1) the commit gate now
+  REJECTS a present-but-empty prefix at strict / downgrades to a warning at
+  lenient (AST-distinguishable: node-present-but-empty ≠ node-absent, so a
+  legitimate protocol-only filter that omits prefixes is untouched);
+  (2) added TracePacketFilter.InvalidPrefix, set by the compiler when a prefix
+  node is present-but-empty, and seeded into traceFilter.invalid so the
+  runtime fails the filter closed (match-none) on the lenient load / peer-sync
+  path. Strengthened TestTraceWriterOneValidOneInvalidFilter to assert
+  len(filters)==2 AND filters[1].invalid. RED-on-revert verified for all three
+  fix sites; protocol-only filter confirmed still matching (no over-rejection).
+- **File(s)**: pkg/config/types_security.go, pkg/config/compiler_security.go,
+  pkg/logging/trace.go, pkg/config/flow_traceoptions_filter_3422_test.go,
+  pkg/logging/trace_filter_3422_test.go
+
 ## 2026-06-28 — #3350 security-log stream tls-profile reject (parsed-but-never-applied)
 
 - **Timestamp**: 2026-06-28
@@ -23096,3 +23121,10 @@ top.
 - **Timestamp**: 2026-06-28
 - **Action**: Verified per-app inactivity-timeout is already enforced (#3227, capabilities.go:334 → expire.rs); the real #3440 gap is watermark aging being inert on userspace (gc.SkipSweep) + opaque schema. Implemented the #2078/#3360 precedent: typed `security flow aging` subtree (early-ageout 0..86400, watermarks 0..100), validateFlowAgingStrict cross-field (low<high) + unknown-leaf reject with lenient no-brick downgrade, #3440 H1 accepted-only commit advisory, defensive negative-early-ageout clamp in SetAgingConfig, doc updates.
 - **File(s)**: pkg/config/schema_security.go, pkg/config/compiler_security.go, pkg/config/types_security.go, pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/compiler_validate_warn.go, pkg/conntrack/gc.go, pkg/config/flow_aging_3440_test.go, pkg/conntrack/gc_test.go, docs/feature-gaps.md, docs/config-schema.md
+- **Timestamp**: 2026-06-28
+  - **Action**: #3433 — lo0 nft address/prefix-list lowering now mirrors the userspace matcher. nftRuleFromTerm routes both directions through the shared dpuserspace.ResolveFilterPrefixListAddrs SSOT + new nftAddrPredicate/nftFamilyAddrs (family-filter + render). Fixes the H01-H05/H09 divergences: positive `any`=match-all (was unloadable `ip saddr any`); constrained-but-empty positive (defined-empty/unresolved prefix-list, all-malformed literal, wrong-family literal)=match-NOTHING/skip (was no-predicate=match-all fail-open); empty-except=match-all; non-empty except=`saddr != {}`; mixed positive+except=positive-wins. resolvePrefixListAddrs now drops `any`/empty literals from the constrained signal (any=no-constraint, matching addr_is_real) — fixes a latent #2506-vs-#2400 userspace inconsistency that made `source-address any` fail closed. Added commit-time validateFilterAddressLiteralsStrict (malformed + wrong-family literal, lenient-downgraded). RED-on-revert verified for all three match-nothing cases + the any-unconstrained case.
+  - **File(s)**: pkg/daemon/daemon_nft.go, pkg/dataplane/userspace/filters.go, pkg/config/compiler.go, pkg/config/compiler_validate_strict.go, pkg/daemon/lo0_filter_test.go, pkg/dataplane/userspace/filters_prefix_list_2506_test.go, pkg/config/firewall_address_literal_3433_test.go, pkg/daemon/README.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3422 validate flow traceoptions packet-filter prefixes + flags. Strict commit now rejects an unparseable source/destination-prefix or an unimplemented flag (validateFlowTraceFlagsAndFiltersAST); lenient load/peer-sync downgrades to a warning. Runtime fail-safe: NewTraceWriter keeps an invalid filter as never-match (M01: was dropped -> empty filters -> trace everything) and drops an unknown flag so basic-datapath/session defaults still apply (M02: was installed -> defaults suppressed -> matchFilters never matches -> empty trace file while reporting enabled). Tests RED-on-revert.
+  - **File(s)**: pkg/config/compiler_security.go, pkg/config/compiler.go, pkg/logging/trace.go, pkg/config/flow_traceoptions_filter_3422_test.go, pkg/logging/trace_filter_3422_test.go, pkg/logging/README.md, _Log.md

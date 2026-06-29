@@ -3686,6 +3686,113 @@ func validateFilterAddressExceptStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFilterAddressLiteralsStrict hard-rejects any firewall-filter term
+// whose literal `from source-address` / `destination-address` carries a MALFORMED
+// token or an address of the WRONG family for the filter — #3433 (codex audit 094
+// H02/H09).
+//
+// The firewall-filter address leaves were untyped at commit:
+// validateFilterMatchValuesStrict checks only icmp-type/icmp-code/named-ports and
+// validateFilterFromMatchStrict only rejects unimplemented `from` leaves, so a
+// malformed CIDR (`10.0.0.0/99`) or a wrong-family literal (a v4 CIDR under
+// `family inet6`) reached the lowering verbatim. In the kernel lo0 mirror it then
+// emitted invalid nft (`ip6 saddr 10.0.0.0/24`, `ip saddr 10.0.0.0/99`) that
+// failed the atomic `nft -f -` load — breaking a legitimate commit, or on the
+// lenient/peer-sync path leaving the kernel mirror ABSENT while userspace stayed
+// armed (a host-protection divergence). The userspace matcher dropped the bad
+// token at parse time and, because the direction was still constrained, fell
+// CLOSED (match nothing); the kernel mirror could not. This gate makes the bad
+// token an operator-visible commit error so the two enforcement paths converge on
+// a clean config.
+//
+// `any` and the empty string are NO-CONSTRAINT placeholders (the userspace
+// matcher's addr_is_real / parse_address drop them); they are NOT malformed and
+// are accepted here. Prefix-list references are NOT validated for family — a
+// prefix-list may legitimately carry both families and the matcher only consults
+// the chain's family vector, so a cross-family prefix in a list is harmless (the
+// empty-resolution / unresolved cases are covered by #2506 + the existing
+// validateFirewallPrefixListReferencesStrict gate).
+//
+// The walk is deterministic (filters sorted by name, terms in config order). On
+// the tolerant load / peer-sync path the caller downgrades the returned error to a
+// warning (#1960 no-brick); the lowering's defensive family-filter (#3433,
+// nftFamilyAddrs) and the userspace matcher both fail closed for the bad token
+// independently, so a leniently-loaded config still enforces fail-safe. Mirrors
+// validateFilterFromMatchStrict.
+func validateFilterAddressLiteralsStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		wantV6 := family == "inet6"
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil {
+					continue
+				}
+				for _, side := range []struct {
+					leaf  string
+					addrs []string
+				}{
+					{"source-address", term.SourceAddresses},
+					{"destination-address", term.DestAddresses},
+				} {
+					for _, a := range side.addrs {
+						// `any` / empty are no-constraint placeholders, not literals.
+						if a == "" || a == "any" {
+							continue
+						}
+						isV6, ok := classifyFilterAddrFamily(a)
+						if !ok {
+							return fmt.Errorf(
+								"firewall family %s filter %q term %q: malformed `from %s` "+
+									"value %q (use a valid IPv%s address or CIDR prefix)",
+								family, name, term.Name, side.leaf, a,
+								map[bool]string{false: "4", true: "6"}[wantV6])
+						}
+						if isV6 != wantV6 {
+							return fmt.Errorf(
+								"firewall family %s filter %q term %q: `from %s` value %q is "+
+									"the wrong address family (an inet filter takes IPv4, an "+
+									"inet6 filter takes IPv6); it would emit unloadable nft and "+
+									"match nothing in the dataplane",
+								family, name, term.Name, side.leaf, a)
+						}
+					}
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
+// classifyFilterAddrFamily reports whether a literal firewall-filter address is
+// IPv6 (isV6) and whether it parsed at all (ok), accepting both a CIDR prefix
+// (10.0.0.0/24) and a bare host IP (10.0.0.1 -> /32, ::1 -> /128) — exactly the
+// forms the userspace matcher's parse_address accepts.
+func classifyFilterAddrFamily(a string) (isV6 bool, ok bool) {
+	if pfx, err := netip.ParsePrefix(a); err == nil {
+		return pfx.Addr().Is6(), true
+	}
+	if ip, err := netip.ParseAddr(a); err == nil {
+		return ip.Is6(), true
+	}
+	return false, false
+}
+
 // validateFilterFromMatchStrict hard-rejects any firewall-filter term whose
 // `from` block carries a match leaf the dataplane does NOT enforce — #3307.
 //

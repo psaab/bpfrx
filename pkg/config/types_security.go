@@ -103,6 +103,20 @@ type TracePacketFilter struct {
 	SourcePrefix      string
 	DestinationPrefix string
 	Protocol          string // protocol name (tcp|udp|icmp|...) or number
+	// InvalidPrefix marks a filter whose source-prefix or destination-prefix
+	// node was PRESENT in the config but carried an empty value (e.g.
+	// `source-prefix ""`). An empty prefix string is indistinguishable from an
+	// absent one once it reaches the runtime (PacketFilter carries only
+	// strings), but the two have opposite intent: an absent prefix is a
+	// legitimate protocol-only filter, while a present-but-empty prefix is
+	// malformed and — if treated as "no constraint" — collapses the filter to
+	// match EVERY event (the #3422 M01 fail-open in a smaller costume). The
+	// compiler, which alone sees the AST and can tell present-empty from
+	// absent, sets this so the runtime (NewTraceWriter) can fail the filter
+	// closed (match-none) without over-rejecting a protocol-only filter. The
+	// strict commit gate rejects present-but-empty loudly; this carries the
+	// conclusion through the lenient load / peer-sync path.
+	InvalidPrefix bool
 }
 
 // ALGConfig holds ALG (Application Layer Gateway) disable flags.

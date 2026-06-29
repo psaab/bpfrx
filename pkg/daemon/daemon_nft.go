@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -555,57 +556,115 @@ func nftAddrSet(addrs []string) string {
 	return "{ " + strings.Join(addrs, ", ") + " }"
 }
 
+// nftFamilyAddrs keeps only the addresses belonging to the chain's family
+// ("ip" -> IPv4, "ip6" -> IPv6), dropping the empty / "any" placeholders, the
+// malformed tokens, and the wrong-family literals. This mirrors the userspace
+// matcher's per-family vectors (parse_address classifies each entry into
+// source_v4 / source_v6, drops "any"/empty/malformed, and the inet / inet6 chain
+// only ever consults the matching family): a v4 CIDR carried in an inet6 filter
+// (#3433 H02) and an all-malformed list (#3433 H09) both leave THIS family's
+// vector empty, which the matcher treats as the empty positive/except set. Each
+// kept entry is re-rendered in its canonical form so a bare host IP and a CIDR
+// are both valid nft right-hand sides.
+func nftFamilyAddrs(family string, addrs []string) []string {
+	wantV6 := family == "ip6"
+	out := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		if a == "" || a == "any" {
+			continue
+		}
+		if pfx, err := netip.ParsePrefix(a); err == nil {
+			if pfx.Addr().Is6() == wantV6 {
+				out = append(out, pfx.String())
+			}
+			continue
+		}
+		if ip, err := netip.ParseAddr(a); err == nil {
+			if ip.Is6() == wantV6 {
+				out = append(out, ip.String())
+			}
+			continue
+		}
+		// Malformed token: contributes nothing (mirrors parse_address's silent
+		// drop). It still made the direction `constrained` upstream, so an
+		// all-malformed positive set fails closed below (match NOTHING).
+	}
+	return out
+}
+
+// nftAddrPredicate lowers one direction (saddr / daddr) of a firewall-filter
+// term's address scope into an nft predicate, mirroring nets_match_v4/v6 in
+// userspace-dp filter/engine/matching.rs so the kernel lo0 chain enforces the
+// SAME verdict as the userspace matcher (#3433). It returns the predicate string
+// (empty == no constraint, i.e. match ALL for this direction) and
+// matchesNothing == true when the direction is constrained but resolves to no
+// prefix of this family with a POSITIVE (non-except) scope — the Junos
+// empty-positive-set semantic (match NOTHING). The caller skips the whole rule in
+// that case (a term that matches nothing contributes no enforcement). Semantics,
+// per family F:
+//   - !constrained                         -> "" (no scope -> match ALL)
+//   - constrained, no F-prefix, except     -> "" (match every addr NOT in {} = ALL)
+//   - constrained, no F-prefix, positive   -> matchesNothing (match addr in {} = none)
+//   - constrained, F-prefixes,  positive   -> "<fam> <field> { prefixes }"
+//   - constrained, F-prefixes,  except     -> "<fam> <field> != { prefixes }"
+func nftAddrPredicate(field, family string, addrs []string, except, constrained bool) (pred string, matchesNothing bool) {
+	if !constrained {
+		return "", false
+	}
+	famAddrs := nftFamilyAddrs(family, addrs)
+	if len(famAddrs) == 0 {
+		if except {
+			// Empty except set -> "match every address NOT in {}" = match ALL ->
+			// no predicate. Mirrors nets_match returning `except` for an empty set.
+			return "", false
+		}
+		// Empty positive set -> "match addresses in {}" = match NOTHING. Fail
+		// closed: the term matches no packet (the caller skips the rule).
+		return "", true
+	}
+	op := family + " " + field + " "
+	if except {
+		op = family + " " + field + " != "
+	}
+	return op + nftAddrSet(famAddrs), false
+}
+
 // nftRuleFromTerm converts a firewall filter term to an nftables rule string.
 // prefixLists is used to expand source-prefix-list and destination-prefix-list references.
 func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists map[string]*config.PrefixList) string {
 	var parts []string
 
-	// Collect all source CIDRs (direct addresses + expanded prefix-lists)
-	var srcCIDRs []string
-	srcCIDRs = append(srcCIDRs, term.SourceAddresses...)
-	var srcNegate bool
-	for _, pl := range term.SourcePrefixLists {
-		if resolved, ok := prefixLists[pl.Name]; ok {
-			srcCIDRs = append(srcCIDRs, resolved.Prefixes...)
-		}
-		if pl.Except {
-			srcNegate = true
-		}
+	// Source / destination address + prefix-list lowering (#3433). Route both
+	// directions through the SHARED userspace resolver
+	// (dpuserspace.ResolveFilterPrefixListAddrs) so the kernel lo0 mirror uses the
+	// SAME empty-set / except / positive-wins / `any`-no-constraint semantics as
+	// the userspace matcher (pkg/dataplane/userspace/filters.go +
+	// userspace-dp/src/filter/engine/matching.rs nets_match_v4/v6) — the raw
+	// string concatenation this replaced diverged on every one of those shapes
+	// (over-matched in the kernel mirror, or emitted invalid nft that failed the
+	// atomic load). nftAddrPredicate then family-filters the resolved set for THIS
+	// chain's family and renders the matching nft predicate. When a direction is
+	// constrained but resolves to no prefix of this family with a positive scope,
+	// the term matches NOTHING (Junos empty-positive set) — skip the whole rule so
+	// the kernel mirror neither over-matches (fail-open) nor emits unloadable nft.
+	srcAddrs, srcExcept, srcConstrained := dpuserspace.ResolveFilterPrefixListAddrs(
+		term.SourceAddresses, term.SourcePrefixLists, prefixLists, "", term.Name, "source")
+	srcPred, srcMatchesNothing := nftAddrPredicate("saddr", family, srcAddrs, srcExcept, srcConstrained)
+	if srcMatchesNothing {
+		return ""
 	}
-	if len(srcCIDRs) > 0 {
-		op := " saddr "
-		if srcNegate {
-			op = " saddr != "
-		}
-		if len(srcCIDRs) == 1 {
-			parts = append(parts, family+op+srcCIDRs[0])
-		} else {
-			parts = append(parts, family+op+"{ "+strings.Join(srcCIDRs, ", ")+" }")
-		}
+	if srcPred != "" {
+		parts = append(parts, srcPred)
 	}
 
-	// Collect all destination CIDRs
-	var dstCIDRs []string
-	dstCIDRs = append(dstCIDRs, term.DestAddresses...)
-	var dstNegate bool
-	for _, pl := range term.DestPrefixLists {
-		if resolved, ok := prefixLists[pl.Name]; ok {
-			dstCIDRs = append(dstCIDRs, resolved.Prefixes...)
-		}
-		if pl.Except {
-			dstNegate = true
-		}
+	dstAddrs, dstExcept, dstConstrained := dpuserspace.ResolveFilterPrefixListAddrs(
+		term.DestAddresses, term.DestPrefixLists, prefixLists, "", term.Name, "destination")
+	dstPred, dstMatchesNothing := nftAddrPredicate("daddr", family, dstAddrs, dstExcept, dstConstrained)
+	if dstMatchesNothing {
+		return ""
 	}
-	if len(dstCIDRs) > 0 {
-		op := " daddr "
-		if dstNegate {
-			op = " daddr != "
-		}
-		if len(dstCIDRs) == 1 {
-			parts = append(parts, family+op+dstCIDRs[0])
-		} else {
-			parts = append(parts, family+op+"{ "+strings.Join(dstCIDRs, ", ")+" }")
-		}
+	if dstPred != "" {
+		parts = append(parts, dstPred)
 	}
 
 	// Protocol matching (#2545: multi-value — emit an nft set on >1).
