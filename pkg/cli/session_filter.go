@@ -235,7 +235,7 @@ func (f *sessionFilter) matchesV4(key dataplane.SessionKey, val dataplane.Sessio
 	}
 	if f.appName != "" {
 		if !appid.SessionMatches(f.appName, f.appNames, f.cfg,
-			key.Protocol, ntohs(key.DstPort), val.AppID) {
+			key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID) {
 			return false
 		}
 	}
@@ -280,7 +280,7 @@ func (f *sessionFilter) matchesV6(key dataplane.SessionKeyV6, val dataplane.Sess
 	}
 	if f.appName != "" {
 		if !appid.SessionMatches(f.appName, f.appNames, f.cfg,
-			key.Protocol, ntohs(key.DstPort), val.AppID) {
+			key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID) {
 			return false
 		}
 	}

@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"fmt"
 	"log/slog"
 	"math"
 
@@ -129,22 +130,27 @@ func algDisableFlags(alg *config.ALGConfig) uint8 {
 // guess. The app_id values are produced by appid.BuildCatalog in the SAME
 // sorted order with the SAME id assignment that pkg/dataplane.compileApplications
 // uses for CompileResult.AppNames (the map ResolveSessionName consumes), so the
-// stamped id resolves to the matching name on the show path. A build error (a
-// malformed application-set reference) yields an empty catalog and a warning
-// rather than aborting the snapshot — the commit-time compiler already
-// hard-errors the same input, so reaching here means the config compiled.
-func buildAppCatalogSnapshot(cfg *config.Config) []AppCatalogEntrySnapshot {
+// stamped id resolves to the matching name on the show path.
+//
+// A BuildCatalog error is propagated, NOT swallowed into an empty catalog: a
+// malformed application-set reference or an app_id-space overflow (#3438 H4)
+// must fail the snapshot build closed so the apply path rejects the config and
+// retains the prior dataplane state. The live apply path catches the same input
+// earlier — compileApplications (the CompileUserspaceShim leg) hard-errors and
+// aborts the apply before this builder runs — so in practice this returns nil
+// here. But returning an empty catalog on error would silently degrade ALL
+// session naming to UNKNOWN/tuple-guess instead of surfacing the fault, so the
+// error is surfaced rather than masked.
+func buildAppCatalogSnapshot(cfg *config.Config) ([]AppCatalogEntrySnapshot, error) {
 	if cfg == nil {
-		return nil
+		return nil, nil
 	}
 	cat, err := appid.BuildCatalog(cfg)
 	if err != nil {
-		slog.Warn("userspace: app catalog build failed; sessions will not be app-identified (#2008 M5)",
-			"err", err)
-		return nil
+		return nil, fmt.Errorf("userspace: app catalog build failed (#2008 M5): %w", err)
 	}
 	if len(cat.Entries) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make([]AppCatalogEntrySnapshot, 0, len(cat.Entries))
 	for _, e := range cat.Entries {
@@ -157,7 +163,7 @@ func buildAppCatalogSnapshot(cfg *config.Config) []AppCatalogEntrySnapshot {
 			SrcPortHigh: e.SrcPortHigh,
 		})
 	}
-	return out
+	return out, nil
 }
 
 // buildFlowExportSnapshot constructs the FlowExportSnapshot wire field.

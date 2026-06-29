@@ -538,6 +538,20 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 		return err
 	}
 	for _, appName := range refNames {
+		// #3438 H4: app_id narrows to a uint16 on the Rust wire with 0 reserved
+		// as the unknown sentinel, so the assignable space is 1..65535. Reject a
+		// config that would assign a 65536th id BEFORE narrowing it — otherwise
+		// uint16(65536) wraps to 0 (the sentinel) and later ids overwrite earlier
+		// AppNames, corrupting session app resolution. This is the live path:
+		// CompileUserspaceShim -> CompileConfig -> compileApplications builds
+		// CompileResult.AppNames, which the AF_XDP show path consumes via
+		// applyResult(). The fail-closed error aborts the apply and the daemon
+		// retains the previous-good snapshot. appid.BuildCatalog enforces the
+		// same boundary on the catalog shipped to the helper.
+		if appID > 65535 {
+			return fmt.Errorf("application catalog exceeds 65535 entries: assigning app_id to %q would overflow the uint16 app_id space (0 is the reserved unknown sentinel); reduce the number of referenced applications", appName)
+		}
+
 		app, found := config.ResolveApplication(appName, userApps)
 		if !found {
 			return fmt.Errorf("application %q not found", appName)
