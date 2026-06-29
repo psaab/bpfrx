@@ -23966,3 +23966,6 @@ top.
   server_show_security_text.go}, pkg/cli/{cli_show_flow.go, cli_show_security_screen.go,
   cli_show_security_log.go}, pkg/api/{metrics.go, metrics_descriptors.go,
   metrics_counters.go}, docs/junos-cli-reference.md
+- **Timestamp**: 2026-06-29 (review fold)
+  - **Action**: #3343 MERGE-NEEDS-MINOR fold — pin the API-visible screen_drop_details / per-reason key names to the dataplane.ScreenReasonCounters SSOT (canonical Rust ScreenVerdict::Drop strings; the #3343 SSOT routing renamed gRPC keys tear-drop->teardrop, syn-fragment->syn-frag). Added a dataplane SSOT contract test (ordinal->index/reason/label, dup/legacy guards) and a grpcapi GetGlobalStats key-pin test (canonical 15 keys + values, no legacy keys, exact count). Both verified RED on a key re-rename.
+  - **File(s)**: pkg/dataplane/screen_reason_counters_3343_test.go (new), pkg/grpcapi/global_stats_screen_keys_3343_test.go (new), _Log.md
