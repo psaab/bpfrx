@@ -713,14 +713,51 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		}
 	}
 
-	// Action: discard → drop (silent), reject → reject (ICMP unreachable), accept → accept
+	// Disposition. Mirror the userspace lo0 evaluator
+	// (pkg/dataplane/userspace/filters.go:89) so the kernel lo0 chain enforces the
+	// SAME term semantics. The XDP shim shunts ordinary host-bound traffic to the
+	// Linux kernel before it reaches userspace-dp, so this chain is the PRIMARY
+	// enforcement for host traffic — a wrong terminating verdict here is a real
+	// control-plane mis-enforcement, not a cosmetic shadow.
+	//
+	// #3427: a term with NO terminating action is a FALL-THROUGH in Junos — apply
+	// the term's modifiers and continue to the NEXT term. This covers both the
+	// explicit `then next term` (term.NextTerm) and a modifier-only term
+	// (Action=="" carrying only count/log/forwarding-class/policer/dscp). The
+	// pre-fix code mapped Action=="" to a terminating nft `accept`, which SHADOWED
+	// every later discard/reject term in the kernel mirror — a fail-OPEN that
+	// diverged from userspace (e.g. `from protocol tcp then next term` followed by
+	// `from destination-port 22 then discard` accepted SSH at term 1, leaving the
+	// drop unreachable). Emit NOTHING for a fall-through term: the kernel chain
+	// does not mirror counters/log, so the term contributes no enforcement and the
+	// subsequent terms must run. Returning "" makes buildLo0FilterPayload skip the
+	// rule.
+	//
+	// A routing-instance (PBR) term is terminating in userspace and is explicitly
+	// NOT a fall-through (filters.go gates NextTerm on RoutingInstance==""). The
+	// kernel lo0 input chain cannot perform route-selection, so mirroring it as a
+	// terminating `accept` would again fail open and shadow later terms. Skip it
+	// (emit nothing, warn once) so it neither silently accepts nor shadows later
+	// terms; userspace remains the sole authority for the route-selection itself.
+	if term.RoutingInstance != "" {
+		slog.Warn("lo0 kernel filter cannot mirror a routing-instance term; skipping rule (userspace remains authoritative)",
+			"term", term.Name, "routing_instance", term.RoutingInstance)
+		return ""
+	}
+	if term.NextTerm || term.Action == "" {
+		return ""
+	}
+
+	// Action: discard → drop (silent), reject → reject (ICMP unreachable),
+	// accept → accept. Any other explicit action is unexpected for a committed
+	// config; keep the historical accept default rather than emit garbage.
 	action := "accept"
 	switch term.Action {
 	case "discard":
 		action = "drop"
 	case "reject":
 		action = "reject"
-	case "accept", "":
+	case "accept":
 		action = "accept"
 	}
 

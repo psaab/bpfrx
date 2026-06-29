@@ -23010,3 +23010,7 @@ top.
     host-inbound system-service. No behavior/admit change — docs-only; the
     #3368 under-admission premise is not borne out by the Junos contract.
   - **File(s)**: docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3427 fix lo0 nft fall-through/modifier-only/routing-instance terms emitting silent terminating accept (control-plane fail-open). Mirror userspace filters.go disposition; fall-through and routing-instance terms now emit no rule instead of bare accept.
+  - **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/lo0_filter_test.go, pkg/daemon/README.md
