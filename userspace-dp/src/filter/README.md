@@ -327,7 +327,7 @@ exactly one of these two classes:
 | `dscp_values` / `dscp_bitmap` (+ `dscp_match_enabled`) | NO — cache-sensitive | see #1430 pattern below |
 | (future) `tos_match` / ECN bits (non-DSCP TOS) | NO — cache-sensitive | TOS lower bits and ECN vary per packet |
 | `tcp_flags_mask` (#2362) | NO — cache-sensitive | required-bits mask over the TCP flags byte: matches when `(flags & mask) == mask`. TCP flags vary per packet. Threaded via `TermMatchExtra` (path (b)) |
-| `tcp_flags_forbidden` (#3076) | NO — cache-sensitive | forbidden-bits mask over the same byte: matches only when `(flags & forbidden) == 0`. Carries the negated operands of a Junos tcp-flags expression (`syn & !ack` → required SYN, forbidden ACK). Independent of `tcp_flags_mask`. Unrepresentable expressions (disjunction `\|`, negated groups, unknown flags) are rejected at commit by the Go compiler, never silently dropped |
+| `tcp_flags_forbidden` (#3076) | NO — cache-sensitive | forbidden-bits mask over the same byte: matches only when `(flags & forbidden) == 0`. Carries the negated operands of a Junos tcp-flags expression (`syn & !ack` → required SYN, forbidden ACK). Independent of `tcp_flags_mask`. Unrepresentable expressions (disjunction `\|`, negated groups, unknown flags) are rejected at commit by the Go compiler; if one reaches the snapshot builder anyway (corrupt / hand-built / version-drifted), the Go builder sets the `tcp_flags_unparseable` wire marker and the compiler raises `SnapshotIntegrityError::UnrepresentableFilterTCPFlags` (#3367) — never silently dropped (the pre-#3367 builder logged + left both masks nil, which this matcher reads as "no tcp-flags constraint" → match every TCP segment, fail-WIDE) |
 | `is_fragment` (#2362) | NO — cache-sensitive | Junos `is-fragment`: matches ANY fragment (IPv4 MF set OR offset != 0; IPv6 fragment header present). Computed by `is_any_fragment` |
 | (future) `ihl_match` / IP options | NO — cache-sensitive | IHL varies per packet |
 | `icmp_type` / `icmp_code` (#2362) | NO — cache-sensitive | exact match on the ICMP/ICMPv6 type/code byte; non-ICMP packets never match. Could later be promoted to cache-key by adding (type, code) to `SessionKey` |
@@ -512,6 +512,20 @@ peer-sync path. An EMPTY reference (no filter on the hook) is the legitimate
 "unfiltered" case and is NOT an error. Covers all four interface directions plus
 both lo0 input families. Tests: `missing_filter_ref_3296_*` /
 `defined_filter_ref_3296_compiles_cleanly` in `filter/tests.rs` (fail-on-revert).
+
+Unparseable tcp-flags backstop (#3367): a term whose Junos `tcp-flags`
+expression the Go control plane could not parse into required/forbidden masks
+(disjunction, negated groups, unknown flags) is marked with the
+`tcp_flags_unparseable` wire bool. `parse_term` raises
+`SnapshotIntegrityError::UnrepresentableFilterTCPFlags` on the marker, aborting
+the reconcile before teardown/publish. The pre-#3367 Go builder logged the parse
+error and left both masks nil, and the matcher treats absent masks as "no
+tcp-flags constraint" — silently WIDENING a `then discard`/`reject` term to match
+every TCP segment (fail-WIDE). The Go commit gate (`config::ParseTCPFlagsExpression`
+in `compileFirewall`) is the primary defense; this backstop guards the lenient /
+peer-sync path, consistent with the #2505/#3296 fail-closed family. Tests:
+`tcp_flags_unparseable_*` (Rust) and `TestFilterSnapshotTCPFlagsUnparseableSetsMarker`
+(Go) (fail-on-revert).
 
 ### Negated port match — `source-port-except` / `destination-port-except` (#2622)
 

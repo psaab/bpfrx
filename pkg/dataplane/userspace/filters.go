@@ -152,12 +152,16 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 		// Unrepresentable expressions (disjunction, negated groups, unknown
 		// flags) are rejected at commit by compileFirewall, so a parse error
 		// here is unreachable for a committed config; if one slips through
-		// (e.g. a hand-built snapshot) log it and leave the masks nil rather
-		// than emit a 0 mask that would match every packet (the pre-#3076
-		// fail-open).
+		// (e.g. a hand-built snapshot) #3367 marks the term unparseable on the
+		// wire so the Rust filter compiler fails the snapshot CLOSED
+		// (SnapshotIntegrityError::UnrepresentableFilterTCPFlags). Leaving the
+		// masks nil silently widened the term to match every TCP segment (the
+		// pre-#3076/#3367 fail-open), since the Rust matcher treats absent masks
+		// as "no tcp-flags constraint".
 		if required, forbidden, ok, err := config.ParseTCPFlagsExpression(term.TCPFlags); err != nil {
-			slog.Warn("dropping unparseable tcp-flags expression from filter term",
+			slog.Warn("rejecting filter term with unparseable tcp-flags expression",
 				"filter", filterName, "term", term.Name, "tcp_flags", term.TCPFlags, "error", err)
+			snap.TCPFlagsUnparseable = true
 		} else if ok {
 			if required != 0 {
 				r := required

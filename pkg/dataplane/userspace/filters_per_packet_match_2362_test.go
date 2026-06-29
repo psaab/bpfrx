@@ -50,6 +50,49 @@ func TestFilterSnapshotTCPFlagsSerialized(t *testing.T) {
 	}
 }
 
+// #3367 RED-on-revert: an unparseable tcp-flags expression (one rejected by
+// ParseTCPFlagsExpression — e.g. a disjunction) must set the
+// TCPFlagsUnparseable wire marker so the Rust filter compiler fails the snapshot
+// CLOSED, instead of the pre-fix behavior of logging + leaving both masks nil
+// (which the Rust matcher treats as "no tcp-flags constraint" → match every TCP
+// segment, fail-WIDE). Reverting the filters.go change leaves the marker false
+// and both masks nil, so this asserts the corrected behavior.
+func TestFilterSnapshotTCPFlagsUnparseableSetsMarker(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		"f": {Name: "f", Terms: []*config.FirewallFilterTerm{{
+			Name: "bad-flags",
+			// A logical-OR expression is a disjunction the conjunctive dataplane
+			// matcher cannot represent — ParseTCPFlagsExpression rejects it.
+			Protocols: []string{"tcp"},
+			TCPFlags:  []string{"syn", "|", "ack"},
+			Action:    "discard",
+		}}},
+	}
+	snaps := buildFirewallFilterSnapshots(cfg)
+	if len(snaps) != 1 || len(snaps[0].Terms) != 1 {
+		t.Fatalf("expected 1 filter with 1 term, got %#v", snaps)
+	}
+	term := snaps[0].Terms[0]
+	if !term.TCPFlagsUnparseable {
+		t.Fatal("unparseable tcp-flags expression must set TCPFlagsUnparseable (#3367)")
+	}
+	// The masks must stay nil — the term must NOT be emitted with a usable
+	// (and necessarily wrong) constraint.
+	if term.TCPFlags != nil || term.TCPFlagsForbidden != nil {
+		t.Errorf("unparseable tcp-flags must leave both masks nil, got required=%v forbidden=%v",
+			term.TCPFlags, term.TCPFlagsForbidden)
+	}
+}
+
+// A representable tcp-flags expression must NOT set the unparseable marker.
+func TestFilterSnapshotTCPFlagsRepresentableLeavesMarkerClear(t *testing.T) {
+	snaps := buildFirewallFilterSnapshots(perPacketMatchCfg())
+	if snaps[0].Terms[0].TCPFlagsUnparseable {
+		t.Error("a representable tcp-flags expression must not set TCPFlagsUnparseable")
+	}
+}
+
 func TestFilterSnapshotTCPFlagsMultipleAreAnded(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{

@@ -863,6 +863,19 @@ type FirewallTermSnapshot struct {
 	// forbidden=ACK). Nil = no forbidden-flags constraint. Required and
 	// forbidden are independent: a term may set either, both, or neither.
 	TCPFlagsForbidden *uint8 `json:"tcp_flags_forbidden,omitempty"`
+	// TCPFlagsUnparseable (#3367) is set true when the term's tcp-flags
+	// expression could not be parsed into required/forbidden masks (disjunction,
+	// negated groups, unknown flags). Such expressions are rejected at commit by
+	// compileFirewall, so a committed config never sets this; it is the
+	// helper-boundary fail-closed marker for a corrupt / hand-built /
+	// version-drifted snapshot. The pre-#3367 builder logged the parse error and
+	// left both masks nil, and the Rust matcher treats absent masks as "no
+	// tcp-flags constraint" — silently WIDENING the term to match every TCP
+	// segment (fail-OPEN for a deny/discard term). With this flag the Rust filter
+	// compiler raises SnapshotIntegrityError::UnrepresentableFilterTCPFlags and
+	// rejects the whole snapshot instead. omitempty + the Rust serde default keep
+	// wire parity with an older control plane that omits the field (#1961).
+	TCPFlagsUnparseable bool `json:"tcp_flags_unparseable,omitempty"`
 	// IsFragment matches any IP fragment (IPv4 MF set OR non-zero offset; IPv6
 	// fragment extension header present). False = no fragment constraint.
 	IsFragment bool `json:"is_fragment,omitempty"`
