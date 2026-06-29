@@ -112,6 +112,32 @@ and deleted the bespoke helpers. Its rendered output format is unchanged except
 the formerly hard-coded `Default deny` line now reflects the configured
 default-policy (`Default permit`/`Default deny`/`Default reject`).
 
+## Verdict scope and identity (#3331)
+
+A match-policies answer of "policy X matched" is ambiguous: duplicate policy
+names are legal across different from-zone/to-zone pairs and the global scope
+(Junos), so a name alone cannot be mapped back to the runtime policy, the
+session-table policy ID, or the policy-deny/permit audit record. `Result` (and
+the REST `MatchPoliciesResult` / gRPC `MatchPoliciesResponse` it feeds) therefore
+carries the matched policy's full identity:
+
+- `Global` — true when the match came from a `policy global` rule rather than a
+  zone-pair rule.
+- `FromZone` / `ToZone` — the SCOPE of the matched policy. For a zone-pair policy
+  these are the surrounding `from-zone`/`to-zone` stanza; for a global policy
+  they are its optional `match from-zone`/`match to-zone` scope (#3148), empty
+  meaning the global policy applies to every zone (rendered `any`).
+- `PolicyID` — the stable runtime/RT_FLOW/session-table policy ID, computed by
+  the SSOT `dataplane/userspace.RuntimePolicyIDs` (the same span-accumulated
+  namespace the dataplane write side and the `show policies` Index column use,
+  #3063). `Match` resolves this map once up front and stamps the ID by the
+  matched policy's `[policySetID, sliceIndex]` coordinates (a global policy's
+  `policySetID` is `len(cfg.Security.Policies)`), so a verdict cross-references
+  the session table / audit log even when policy names collide across scopes.
+
+These are meaningful only on a concrete match (`Matched == true`); the
+default-policy and host-inbound verdicts leave them zero-valued.
+
 ## Why this exists (#3042)
 
 Before #3042 each surface carried its own hand-written shadow matcher, and all

@@ -6112,8 +6112,25 @@ type MatchPoliciesResponse struct {
 	// `action` is empty; clients must render "host-inbound (local delivery; not
 	// governed by transit/global/default policy)", NOT a default-policy verdict.
 	HostInboundUnmatched bool `protobuf:"varint,7,opt,name=host_inbound_unmatched,json=hostInboundUnmatched,proto3" json:"host_inbound_unmatched,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// global is true when the matched policy is a `policy global` rule rather
+	// than a zone-pair rule (#3331); it distinguishes a global-scope verdict from
+	// a same-named zone-pair policy.
+	Global bool `protobuf:"varint,8,opt,name=global,proto3" json:"global,omitempty"`
+	// from_zone/to_zone are the SCOPE of the matched policy (#3331): for a
+	// zone-pair policy the surrounding from-zone/to-zone stanza; for a global
+	// policy its optional `match from-zone`/`match to-zone` scope (empty when the
+	// global policy applies to all zones). They disambiguate a verdict when the
+	// same policy name repeats across zone pairs (legal in Junos). Set only when
+	// matched is true.
+	FromZone string `protobuf:"bytes,9,opt,name=from_zone,json=fromZone,proto3" json:"from_zone,omitempty"`
+	ToZone   string `protobuf:"bytes,10,opt,name=to_zone,json=toZone,proto3" json:"to_zone,omitempty"`
+	// policy_id is the stable runtime/RT_FLOW/session-table policy ID of the
+	// matched policy (#3331), so a match-policies answer can be cross-referenced
+	// against the session table and the policy-deny/permit audit log even when
+	// policy names collide across scopes. Set only when matched is true.
+	PolicyId      uint32 `protobuf:"varint,11,opt,name=policy_id,json=policyId,proto3" json:"policy_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *MatchPoliciesResponse) Reset() {
@@ -6193,6 +6210,34 @@ func (x *MatchPoliciesResponse) GetHostInboundUnmatched() bool {
 		return x.HostInboundUnmatched
 	}
 	return false
+}
+
+func (x *MatchPoliciesResponse) GetGlobal() bool {
+	if x != nil {
+		return x.Global
+	}
+	return false
+}
+
+func (x *MatchPoliciesResponse) GetFromZone() string {
+	if x != nil {
+		return x.FromZone
+	}
+	return ""
+}
+
+func (x *MatchPoliciesResponse) GetToZone() string {
+	if x != nil {
+		return x.ToZone
+	}
+	return ""
+}
+
+func (x *MatchPoliciesResponse) GetPolicyId() uint32 {
+	if x != nil {
+		return x.PolicyId
+	}
+	return 0
 }
 
 type GetNATRuleStatsRequest struct {
@@ -7476,7 +7521,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"_icmp_typeB\f\n" +
 	"\n" +
-	"_icmp_code\"\x8e\x02\n" +
+	"_icmp_code\"\xf9\x02\n" +
 	"\x15MatchPoliciesResponse\x12\x1f\n" +
 	"\vpolicy_name\x18\x01 \x01(\tR\n" +
 	"policyName\x12\x16\n" +
@@ -7485,7 +7530,12 @@ const file_xpf_proto_rawDesc = "" +
 	"\rdst_addresses\x18\x04 \x03(\tR\fdstAddresses\x12\"\n" +
 	"\fapplications\x18\x05 \x03(\tR\fapplications\x12\x18\n" +
 	"\amatched\x18\x06 \x01(\bR\amatched\x124\n" +
-	"\x16host_inbound_unmatched\x18\a \x01(\bR\x14hostInboundUnmatched\"N\n" +
+	"\x16host_inbound_unmatched\x18\a \x01(\bR\x14hostInboundUnmatched\x12\x16\n" +
+	"\x06global\x18\b \x01(\bR\x06global\x12\x1b\n" +
+	"\tfrom_zone\x18\t \x01(\tR\bfromZone\x12\x17\n" +
+	"\ato_zone\x18\n" +
+	" \x01(\tR\x06toZone\x12\x1b\n" +
+	"\tpolicy_id\x18\v \x01(\rR\bpolicyId\"N\n" +
 	"\x16GetNATRuleStatsRequest\x12\x19\n" +
 	"\brule_set\x18\x01 \x01(\tR\aruleSet\x12\x19\n" +
 	"\bnat_type\x18\x02 \x01(\tR\anatType\"E\n" +

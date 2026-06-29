@@ -19,16 +19,16 @@ type StatusResponse struct {
 
 // GlobalStats holds all global counter values.
 type GlobalStats struct {
-	RxPackets       uint64 `json:"rx_packets"`
-	TxPackets       uint64 `json:"tx_packets"`
-	Drops           uint64 `json:"drops"`
-	SessionsCreated uint64 `json:"sessions_created"`
-	SessionsClosed  uint64 `json:"sessions_closed"`
-	ScreenDrops     uint64 `json:"screen_drops"`
-	PolicyDenies    uint64 `json:"policy_denies"`
-	NATAllocFails   uint64 `json:"nat_alloc_failures"`
-	HostInboundDeny  uint64 `json:"host_inbound_denies"`
-	TCEgressPackets  uint64 `json:"tc_egress_packets"`
+	RxPackets            uint64 `json:"rx_packets"`
+	TxPackets            uint64 `json:"tx_packets"`
+	Drops                uint64 `json:"drops"`
+	SessionsCreated      uint64 `json:"sessions_created"`
+	SessionsClosed       uint64 `json:"sessions_closed"`
+	ScreenDrops          uint64 `json:"screen_drops"`
+	PolicyDenies         uint64 `json:"policy_denies"`
+	NATAllocFails        uint64 `json:"nat_alloc_failures"`
+	HostInboundDeny      uint64 `json:"host_inbound_denies"`
+	TCEgressPackets      uint64 `json:"tc_egress_packets"`
 	FabricRedirects      uint64 `json:"fabric_redirects"`
 	FabricFwdDrops       uint64 `json:"fabric_fwd_drops"`
 	FlowCacheHits        uint64 `json:"flow_cache_hits"`
@@ -120,13 +120,13 @@ type SessionListResponse struct {
 
 // SessionSummary holds session table summary stats.
 type SessionSummary struct {
-	TotalEntries  int `json:"total_entries"`
-	ForwardOnly   int `json:"forward_only"`
-	Established   int `json:"established"`
-	IPv4Sessions  int `json:"ipv4_sessions"`
-	IPv6Sessions  int `json:"ipv6_sessions"`
-	SNATSessions  int `json:"snat_sessions"`
-	DNATSessions  int `json:"dnat_sessions"`
+	TotalEntries int `json:"total_entries"`
+	ForwardOnly  int `json:"forward_only"`
+	Established  int `json:"established"`
+	IPv4Sessions int `json:"ipv4_sessions"`
+	IPv6Sessions int `json:"ipv6_sessions"`
+	SNATSessions int `json:"snat_sessions"`
+	DNATSessions int `json:"dnat_sessions"`
 }
 
 // EventEntry holds a single event record.
@@ -155,10 +155,10 @@ type NATSourceInfo struct {
 
 // NATDestInfo holds destination NAT configuration.
 type NATDestInfo struct {
-	Name        string `json:"name"`
-	DstAddr     string `json:"dst_addr"`
-	DstPort     uint16 `json:"dst_port,omitempty"`
-	TranslateIP string `json:"translate_ip"`
+	Name          string `json:"name"`
+	DstAddr       string `json:"dst_addr"`
+	DstPort       uint16 `json:"dst_port,omitempty"`
+	TranslateIP   string `json:"translate_ip"`
 	TranslatePort uint16 `json:"translate_port,omitempty"`
 }
 
@@ -206,15 +206,15 @@ type NATPoolStatsInfo struct {
 
 // NATRuleStatsInfo holds NAT rule counters.
 type NATRuleStatsInfo struct {
-	RuleSet     string `json:"rule_set"`
-	RuleName    string `json:"rule_name"`
-	FromZone    string `json:"from_zone"`
-	ToZone      string `json:"to_zone"`
-	Action      string `json:"action"`
-	SrcMatch    string `json:"source_match"`
-	DstMatch    string `json:"destination_match"`
-	HitPackets  uint64 `json:"hit_packets"`
-	HitBytes    uint64 `json:"hit_bytes"`
+	RuleSet    string `json:"rule_set"`
+	RuleName   string `json:"rule_name"`
+	FromZone   string `json:"from_zone"`
+	ToZone     string `json:"to_zone"`
+	Action     string `json:"action"`
+	SrcMatch   string `json:"source_match"`
+	DstMatch   string `json:"destination_match"`
+	HitPackets uint64 `json:"hit_packets"`
+	HitBytes   uint64 `json:"hit_bytes"`
 }
 
 // VRRPInstanceInfo holds VRRP instance information.
@@ -235,8 +235,24 @@ type VRRPStatusResponse struct {
 
 // MatchPoliciesResult holds policy match results.
 type MatchPoliciesResult struct {
-	Matched      bool     `json:"matched"`
-	PolicyName   string   `json:"policy_name,omitempty"`
+	Matched    bool   `json:"matched"`
+	PolicyName string `json:"policy_name,omitempty"`
+	// Global is true when the matched policy is a `policy global` rule rather
+	// than a zone-pair rule (#3331). It distinguishes a global-scope verdict
+	// from a same-named zone-pair policy.
+	Global bool `json:"global,omitempty"`
+	// FromZone/ToZone are the SCOPE of the matched policy (#3331): for a
+	// zone-pair policy the surrounding from-zone/to-zone stanza; for a global
+	// policy its optional `match from-zone`/`match to-zone` scope (empty when
+	// the global policy applies to all zones). They disambiguate a verdict when
+	// the same policy name repeats across zone pairs (legal in Junos).
+	FromZone string `json:"from_zone,omitempty"`
+	ToZone   string `json:"to_zone,omitempty"`
+	// PolicyID is the stable runtime/RT_FLOW/session-table policy ID of the
+	// matched policy (#3331), so a match-policies answer can be cross-referenced
+	// against the session table and the policy-deny/permit audit log even when
+	// policy names collide across scopes. Present only when matched.
+	PolicyID     uint32   `json:"policy_id,omitempty"`
 	Action       string   `json:"action"`
 	SrcAddresses []string `json:"src_addresses,omitempty"`
 	DstAddresses []string `json:"dst_addresses,omitempty"`
