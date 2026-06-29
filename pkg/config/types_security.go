@@ -406,8 +406,16 @@ type NATMatch struct {
 	DestinationAddressName string   // address-book name (resolved during compilation, #3229)
 	DestinationPort        int      // primary port (first port for BPF rule)
 	DestinationPorts       []int    // all matched ports (for multi-port DNAT rules)
-	Protocol               string   // "tcp", "udp", "icmp6", "gre", or "" (auto)
-	Application            string   // application name (e.g. "junos-http")
+	// InvalidDestinationPorts holds raw `match destination-port` tokens that
+	// did NOT parse as an integer (e.g. "http", "httpp"). The parser used to
+	// silently drop them, which let an all-nonnumeric port list collapse to an
+	// empty DestinationPorts and then widen to the wildcard port (#3446 H14).
+	// They are preserved so validateNATMatchDestinationPortStrict can reject
+	// them at commit and the snapshot builders can fail CLOSED (match nothing)
+	// on the lenient load / peer-sync path.
+	InvalidDestinationPorts []string
+	Protocol                string // "tcp", "udp", "icmp6", "gre", or "" (auto)
+	Application             string // application name (e.g. "junos-http")
 }
 
 // NATThen defines the NAT translation action.

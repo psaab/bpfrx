@@ -5168,6 +5168,84 @@ func validateDestinationNATProtocolStrict(cfg *Config) error {
 	return nil
 }
 
+// validateNATMatchDestinationPortStrict (#3446) hard-rejects a source- or
+// destination-NAT rule whose `match destination-port` carries a value the
+// dataplane cannot honor: 0, a negative or >65535 number, or a non-numeric
+// token (`http`). Static NAT already validates its typed `destination-port`
+// leaf (#2491 / validateNATHostMaskStrict 1..65535); this closes the same gap
+// for the source/destination NAT match grammar, whose parser used a bare
+// strconv.Atoi with no bound check and whose builders cast straight to uint16
+// (so 70000 wrapped to 4464, -1 to 65535) or collapsed an unparseable list to
+// the wildcard port (translating EVERY port instead of failing closed).
+//
+// The compiled match carries two signals: DestinationPorts (every numeric
+// token, including out-of-range ones) and InvalidDestinationPorts (the raw
+// tokens that did not parse as integers — preserved by parseDNATPortList for
+// exactly this gate). A 0/out-of-range number or any invalid token is an
+// operator error that can never become a valid L4 port match.
+//
+// Strict on commit / commit-check (hard reject so the bad port is
+// operator-visible); the compiler downgrades this to a warning on the tolerant
+// load / peer-sync path (#1960 no-brick) — the snapshot builders independently
+// fail CLOSED (coalescePortRanges / sourceNATDestPortRanges emit a never-match
+// sentinel; the DNAT builder drops the rule rather than wildcarding), so a
+// leniently-loaded bad rule installs nothing rather than over-translating.
+// Rule-sets are walked in sorted name order, rules in configured order, for a
+// deterministic first-reported offender.
+func validateNATMatchDestinationPortStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(kind string, rulesets []*NATRuleSet) error {
+		sorted := append([]*NATRuleSet(nil), rulesets...)
+		sort.SliceStable(sorted, func(i, j int) bool {
+			if sorted[i] == nil || sorted[j] == nil {
+				return sorted[i] != nil
+			}
+			return sorted[i].Name < sorted[j].Name
+		})
+		for _, rs := range sorted {
+			if rs == nil {
+				continue
+			}
+			for _, rule := range rs.Rules {
+				if rule == nil {
+					continue
+				}
+				for _, p := range rule.Match.DestinationPorts {
+					if p < 1 || p > 65535 {
+						return fmt.Errorf(
+							"%s-nat rule-set %q rule %q: match destination-port %d is out "+
+								"of range (1-65535); the rule would commit but the dataplane "+
+								"cannot install it as an L4 port match (the value wraps on a "+
+								"uint16 cast or collapses to the wildcard port, translating "+
+								"the wrong port or every port)",
+							kind, rs.Name, rule.Name, p)
+					}
+				}
+				if len(rule.Match.InvalidDestinationPorts) > 0 {
+					return fmt.Errorf(
+						"%s-nat rule-set %q rule %q: match destination-port %q is not a "+
+							"numeric port (1-65535); the rule would commit but the bad token "+
+							"is dropped and the port match collapses to the wildcard port "+
+							"(translating every port instead of failing closed)",
+						kind, rs.Name, rule.Name, rule.Match.InvalidDestinationPorts[0])
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("source", cfg.Security.NAT.Source); err != nil {
+		return err
+	}
+	if cfg.Security.NAT.Destination != nil {
+		if err := check("destination", cfg.Security.NAT.Destination.RuleSets); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validateRouteFilterMatchTypesStrict gates the two route-filter match-types
 // that the FRR prefix-list backend cannot render losslessly (#2525):
 //

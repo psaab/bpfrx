@@ -714,20 +714,42 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			// If no application terms resolved, use explicit match values. DNAT
 			// `match` grammar has no source-port or ICMP type/code, so those axes
 			// stay unconstrained on the explicit-match fallback term.
+			explicitFallback := false
 			if len(appTerms) == 0 {
 				appTerms = []appTerm{{proto: rule.Match.Protocol, ports: rule.Match.DestinationPorts}}
+				explicitFallback = true
 			}
 
 			for _, term := range appTerms {
+				// #3446: a `match destination-port` that was configured but
+				// resolves to NO valid 1..65535 port must match NOTHING (fail
+				// closed) — never widen to the wildcard port (0 = any). Out-of-
+				// range numerics are dropped here (the bare uint16 cast used to
+				// wrap 70000→4464); non-numeric tokens (`http`) were dropped at
+				// parse and surface via Match.InvalidDestinationPorts. The strict
+				// commit gate (validateNATMatchDestinationPortStrict) rejects all
+				// of these at commit; this hardens the lenient / peer-sync path.
 				var dstPorts []uint16
-				if len(term.ports) > 0 {
-					for _, p := range term.ports {
+				for _, p := range term.ports {
+					if p >= 1 && p <= 65535 {
 						dstPorts = append(dstPorts, uint16(p))
 					}
-				} else if rule.Match.DestinationPort != 0 {
-					dstPorts = []uint16{uint16(rule.Match.DestinationPort)}
-				} else {
-					dstPorts = []uint16{0}
+				}
+				// Did this rule CONFIGURE a destination-port at all? A configured
+				// port that survived to no valid value must not become wildcard.
+				portConfigured := len(term.ports) > 0 ||
+					(explicitFallback && (rule.Match.DestinationPort != 0 || len(rule.Match.InvalidDestinationPorts) > 0))
+				if len(dstPorts) == 0 {
+					switch {
+					case rule.Match.DestinationPort >= 1 && rule.Match.DestinationPort <= 65535:
+						dstPorts = []uint16{uint16(rule.Match.DestinationPort)}
+					case portConfigured:
+						// Configured but no valid port → fail closed: emit no
+						// snapshot for this term so the rule matches nothing.
+						continue
+					default:
+						dstPorts = []uint16{0} // genuine wildcard (no port match)
+					}
 				}
 
 				for _, dstPort := range dstPorts {
