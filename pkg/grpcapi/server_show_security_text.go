@@ -447,6 +447,9 @@ func (s *Server) showScreenIDSOption(req *pb.ShowTextRequest, cfg *config.Config
 			// Show which zones use this profile
 			var zones []string
 			for name, zone := range cfg.Security.Zones {
+				if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+					continue
+				}
 				if zone.ScreenProfile == profileName {
 					zones = append(zones, name)
 				}
@@ -480,7 +483,7 @@ func (s *Server) showScreenStatistics(req *pb.ShowTextRequest, cfg *config.Confi
 					fmt.Fprintf(buf, "Error reading flood counters: %v\n", err)
 				} else {
 					screenProfile := ""
-					if z, ok := cfg.Security.Zones[zoneName]; ok {
+					if z, ok := cfg.Security.Zones[zoneName]; ok && z != nil { // #3493: nil zone value
 						screenProfile = z.ScreenProfile
 					}
 					fmt.Fprintf(buf, "Screen statistics for zone '%s':\n", zoneName)
@@ -525,7 +528,7 @@ func (s *Server) showScreenStatisticsAll(cfg *config.Config, buf *strings.Builde
 				continue
 			}
 			screenProfile := ""
-			if z, ok := cfg.Security.Zones[zoneName]; ok {
+			if z, ok := cfg.Security.Zones[zoneName]; ok && z != nil { // #3493: nil zone value
 				screenProfile = z.ScreenProfile
 			}
 			fmt.Fprintf(buf, "Screen statistics for zone '%s':\n", zoneName)
@@ -612,6 +615,9 @@ func (s *Server) showScreenIDSOptionDetail(req *pb.ShowTextRequest, cfg *config.
 			}
 			var zones []string
 			for name, zone := range cfg.Security.Zones {
+				if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+					continue
+				}
 				if zone.ScreenProfile == profileName {
 					zones = append(zones, name)
 				}
@@ -634,6 +640,9 @@ func (s *Server) showScreen(cfg *config.Config, buf *strings.Builder) {
 		// Build reverse map: profile name -> zones
 		zonesByProfile := make(map[string][]string)
 		for name, zone := range cfg.Security.Zones {
+			if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+				continue
+			}
 			if zone.ScreenProfile != "" {
 				zonesByProfile[zone.ScreenProfile] = append(zonesByProfile[zone.ScreenProfile], name)
 			}

@@ -24,6 +24,9 @@ func (c *CLI) showScreen() error {
 	// Build reverse map: profile name -> zones using it
 	zonesByProfile := make(map[string][]string)
 	for name, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		if zone.ScreenProfile != "" {
 			zonesByProfile[zone.ScreenProfile] = append(
 				zonesByProfile[zone.ScreenProfile], name)
@@ -207,6 +210,9 @@ func (c *CLI) showScreenIdsOption(name string) error {
 	// Show zones using this profile
 	var zones []string
 	for zname, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		if zone.ScreenProfile == name {
 			zones = append(zones, zname)
 		}
@@ -308,6 +314,9 @@ func (c *CLI) showScreenIdsOptionDetail(name string) error {
 	// Zones using this profile
 	var zones []string
 	for zname, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		if zone.ScreenProfile == name {
 			zones = append(zones, zname)
 		}
@@ -348,7 +357,7 @@ func (c *CLI) showScreenStatistics(zoneName string) error {
 	}
 	totalSyn, totalICMP, totalUDP := fs.SynCount, fs.ICMPCount, fs.UDPCount
 	screenProfile := ""
-	if z, ok := cfg.Security.Zones[zoneName]; ok {
+	if z, ok := cfg.Security.Zones[zoneName]; ok && z != nil { // #3493: nil zone value
 		screenProfile = z.ScreenProfile
 	}
 	fmt.Printf("Screen statistics for zone '%s':\n", zoneName)
@@ -399,7 +408,7 @@ func (c *CLI) showScreenStatisticsAll() error {
 			continue
 		}
 		screenProfile := ""
-		if z, ok := cfg.Security.Zones[zoneName]; ok {
+		if z, ok := cfg.Security.Zones[zoneName]; ok && z != nil { // #3493: nil zone value
 			screenProfile = z.ScreenProfile
 		}
 		fmt.Printf("Screen statistics for zone '%s':\n", zoneName)

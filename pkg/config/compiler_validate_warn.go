@@ -97,6 +97,9 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate application port specs and protocols
 	for name, app := range cfg.Applications.Applications {
+		if app == nil { // #3494: tolerant/HA-sync path may carry a nil application
+			continue
+		}
 		if err := validatePortSpec(app.DestinationPort); err != nil {
 			warnings = append(warnings, fmt.Sprintf("application %s: destination-port: %v", name, err))
 		}
@@ -123,6 +126,13 @@ func ValidateConfig(cfg *Config) []string {
 		return zones[zone]
 	}
 	for _, zpp := range cfg.Security.Policies {
+		// #3494: the tolerant / HA-sync config path (#3474) can leave a nil
+		// zone-pair set (Policies is []*ZonePairPolicies); skip it like the
+		// runtime walker (pkg/dataplane/userspace/policies.go) does rather
+		// than panicking on zpp.FromZone while generating warnings.
+		if zpp == nil {
+			continue
+		}
 		if !policyZoneDefined(zpp.FromZone) {
 			warnings = append(warnings, fmt.Sprintf(
 				"policy from-zone %q: zone not defined", zpp.FromZone))
@@ -132,6 +142,12 @@ func ValidateConfig(cfg *Config) []string {
 				"policy to-zone %q: zone not defined", zpp.ToZone))
 		}
 		for _, p := range zpp.Policies {
+			// #3494: skip a nil rule (Policies is []*Policy) like the
+			// runtime walker does, mirroring the guards already present at
+			// lines ~813/1084, rather than dereferencing p.Match.
+			if p == nil {
+				continue
+			}
 			for _, addr := range p.Match.SourceAddresses {
 				if addr != "any" && !addrs[addr] {
 					warnings = append(warnings, fmt.Sprintf(
@@ -156,6 +172,9 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate NAT zone references
 	for _, rs := range cfg.Security.NAT.Source {
+		if rs == nil { // #3494: tolerant/HA-sync path may carry a nil rule-set
+			continue
+		}
 		if rs.FromZone != "" && !zones[rs.FromZone] {
 			warnings = append(warnings, fmt.Sprintf(
 				"source-nat ruleset %q: from-zone %q not defined", rs.Name, rs.FromZone))
@@ -184,6 +203,9 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate screen references in zones
 	for name, zone := range cfg.Security.Zones {
+		if zone == nil { // #3494: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		if zone.ScreenProfile != "" {
 			if _, ok := cfg.Security.Screen[zone.ScreenProfile]; !ok {
 				warnings = append(warnings, fmt.Sprintf(
@@ -195,6 +217,9 @@ func ValidateConfig(cfg *Config) []string {
 	// Validate address-book entries have valid CIDR or IP formats
 	if ab := cfg.Security.AddressBook; ab != nil {
 		for name, entry := range ab.Addresses {
+			if entry == nil { // #3494: tolerant/HA-sync path may carry a nil address
+				continue
+			}
 			if entry.Value == "" {
 				// An `address <name>` entry with no compiled prefix —
 				// either no prefix at all, or only an as-yet-uncompiled
@@ -218,6 +243,9 @@ func ValidateConfig(cfg *Config) []string {
 		}
 		// Validate address-set members reference valid entries
 		for setName, as := range ab.AddressSets {
+			if as == nil { // #3494: tolerant/HA-sync path may carry a nil address-set
+				continue
+			}
 			for _, m := range as.Addresses {
 				if !addrs[m] {
 					warnings = append(warnings, fmt.Sprintf(
@@ -235,6 +263,9 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate static route destinations are valid CIDR
 	for _, sr := range cfg.RoutingOptions.StaticRoutes {
+		if sr == nil { // #3494: tolerant/HA-sync path may carry a nil static route
+			continue
+		}
 		if sr.Destination != "" {
 			if _, _, err := net.ParseCIDR(sr.Destination); err != nil {
 				warnings = append(warnings, fmt.Sprintf(
@@ -246,7 +277,13 @@ func ValidateConfig(cfg *Config) []string {
 	// Validate DNAT pool references
 	if dnat := cfg.Security.NAT.Destination; dnat != nil {
 		for _, rs := range dnat.RuleSets {
+			if rs == nil { // #3494: tolerant/HA-sync path may carry a nil rule-set
+				continue
+			}
 			for _, rule := range rs.Rules {
+				if rule == nil { // #3494: tolerant/HA-sync path may carry a nil rule
+					continue
+				}
 				if rule.Then.PoolName != "" {
 					if _, ok := dnat.Pools[rule.Then.PoolName]; !ok {
 						warnings = append(warnings, fmt.Sprintf(
@@ -260,7 +297,13 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate SNAT pool references
 	for _, rs := range cfg.Security.NAT.Source {
+		if rs == nil { // #3494: tolerant/HA-sync path may carry a nil rule-set
+			continue
+		}
 		for _, rule := range rs.Rules {
+			if rule == nil { // #3494: tolerant/HA-sync path may carry a nil rule
+				continue
+			}
 			if rule.Then.PoolName != "" {
 				if _, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]; !ok {
 					warnings = append(warnings, fmt.Sprintf(
@@ -277,6 +320,9 @@ func ValidateConfig(cfg *Config) []string {
 		configuredIfaces[name] = true
 	}
 	for zoneName, zone := range cfg.Security.Zones {
+		if zone == nil { // #3494: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		for _, ifName := range zone.Interfaces {
 			// Strip unit suffix (e.g. "trust0.0" -> "trust0")
 			base := ifName
@@ -292,7 +338,13 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate scheduler references in policies
 	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil { // #3494: tolerant/HA-sync path may carry a nil zone-pair set
+			continue
+		}
 		for _, p := range zpp.Policies {
+			if p == nil { // #3494: tolerant/HA-sync path may carry a nil rule
+				continue
+			}
 			if p.SchedulerName != "" {
 				if _, ok := cfg.Schedulers[p.SchedulerName]; !ok {
 					warnings = append(warnings, fmt.Sprintf(
@@ -302,6 +354,9 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 	for _, p := range cfg.Security.GlobalPolicies {
+		if p == nil { // #3494: tolerant/HA-sync path may carry a nil global rule
+			continue
+		}
 		if p.SchedulerName != "" {
 			if _, ok := cfg.Schedulers[p.SchedulerName]; !ok {
 				warnings = append(warnings, fmt.Sprintf(
@@ -312,6 +367,9 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate routing-instance interface references
 	for _, ri := range cfg.RoutingInstances {
+		if ri == nil { // #3494: tolerant/HA-sync path may carry a nil routing-instance
+			continue
+		}
 		for _, ifName := range ri.Interfaces {
 			base := ifName
 			if idx := strings.Index(ifName, "."); idx > 0 {
@@ -327,7 +385,13 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate firewall filter references on interfaces
 	for ifName, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil { // #3494: tolerant/HA-sync path may carry a nil interface
+			continue
+		}
 		for unitNum, unit := range ifc.Units {
+			if unit == nil { // #3494: tolerant/HA-sync path may carry a nil unit
+				continue
+			}
 			if unit.FilterInputV4 != "" {
 				if _, ok := cfg.Firewall.FiltersInet[unit.FilterInputV4]; !ok {
 					warnings = append(warnings, fmt.Sprintf(
@@ -408,6 +472,9 @@ func ValidateConfig(cfg *Config) []string {
 	// Validate strict-vip-ownership requires VRRP (incompatible with no-reth-vrrp / private-rg-election)
 	if cc := cfg.Chassis.Cluster; cc != nil && (cc.NoRethVRRP || cc.PrivateRGElection) {
 		for _, rg := range cc.RedundancyGroups {
+			if rg == nil { // #3494: tolerant/HA-sync path may carry a nil redundancy-group
+				continue
+			}
 			if rg.StrictVIPOwnership {
 				warnings = append(warnings, fmt.Sprintf(
 					"redundancy-group %d: strict-vip-ownership incompatible with no-reth-vrrp (no VRRP instances to gate on)", rg.ID))
@@ -547,11 +614,17 @@ func ValidateConfig(cfg *Config) []string {
 		}
 		if fm.Version9 != nil {
 			for _, tmpl := range fm.Version9.Templates {
+				if tmpl == nil { // #3494: tolerant/HA-sync path may carry a nil template
+					continue
+				}
 				checkExtWarning("version9", tmpl.Name, tmpl.ExportExtensions)
 			}
 		}
 		if fm.VersionIPFIX != nil {
 			for _, tmpl := range fm.VersionIPFIX.Templates {
+				if tmpl == nil { // #3494: tolerant/HA-sync path may carry a nil template
+					continue
+				}
 				checkExtWarning("version-ipfix", tmpl.Name, tmpl.ExportExtensions)
 			}
 		}

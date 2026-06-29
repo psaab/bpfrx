@@ -107,6 +107,9 @@ func (c *CLI) showInterfaces(args []string) error {
 	ifaceZone := make(map[string]*config.ZoneConfig)
 	ifaceZoneName := make(map[string]string)
 	for name, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		for _, ifaceName := range zone.Interfaces {
 			ifaceZone[ifaceName] = zone
 			ifaceZoneName[ifaceName] = name
@@ -402,6 +405,9 @@ func (c *CLI) showInterfacesDetail(filterName string) error {
 	ifDescMap := make(map[string]string)
 	if activeCfg := c.store.ActiveConfig(); activeCfg != nil {
 		for _, z := range activeCfg.Security.Zones {
+			if z == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+				continue
+			}
 			for _, ifName := range z.Interfaces {
 				ifZoneMap[ifName] = z.Name
 			}
@@ -838,6 +844,9 @@ func (c *CLI) showInterfacesExtensiveFiltered(filterName string) error {
 	ifCfgMap := make(map[string]*config.InterfaceConfig)
 	if activeCfg := c.store.ActiveConfig(); activeCfg != nil {
 		for _, z := range activeCfg.Security.Zones {
+			if z == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+				continue
+			}
 			for _, ifName := range z.Interfaces {
 				ifZoneMap[ifName] = z.Name
 			}
@@ -1029,6 +1038,9 @@ func (c *CLI) showVlans() error {
 	// Build zone lookup: interface name → zone name
 	ifZone := make(map[string]string)
 	for zoneName, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		for _, iface := range zone.Interfaces {
 			ifZone[iface] = zoneName
 		}

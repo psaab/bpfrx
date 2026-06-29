@@ -406,6 +406,9 @@ func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.Schem
 	case config.ValueHintZoneName:
 		var out []config.SchemaCompletion
 		for name, zone := range cfg.Security.Zones {
+			if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+				continue
+			}
 			desc := zone.Description
 			if desc == "" {
 				desc = "(configured)"
