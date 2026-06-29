@@ -156,6 +156,24 @@ once a session has carried a RST it stays on the short timeout even if a
 later reordered non-RST segment arrives, so it can never be promoted back
 to the 30 s FIN window.
 
+**Sticky close state (#3489).** All three TCP state flags are sticky and
+set with `|=` on both the read path (`lookup.rs`) and the refresh /
+HA-promote path (`update_session` in `mod.rs`): `reset` (#3046),
+`established` (#3152), and `closing` (#3489). `closing` was the last
+non-sticky one — it used a plain `=` in `update_session`, so a later
+non-closing segment (e.g. a reordered data-ACK, `flags=0x10`) refreshing
+a FIN'd entry — including over the HA shared-promote path, where the
+`closing` flag is synced to the peer — reset `closing` back to false. The
+expires selection then took the established branch and moved the session
+from the 30 s `TCP_CLOSING_TIMEOUT_NS` window back to the 300 s
+established window, so a FIN'd connection lingered up to 10× too long
+holding a bounded `max_sessions` slot. Making `closing` sticky restores
+the read-path/refresh-path equivalence #3046 set out to guarantee. (The
+close is an *idle* timeout — `expire.rs` reaps only after
+`now - last_seen_ns > expires_after_ns`, and `last_seen_ns` is re-stamped
+on every refresh — so a genuinely active half-closed flow keeps advancing
+`last_seen_ns` and is never reaped early by the short window.)
+
 **Seconds→nanoseconds bound (#2441).** Configured TCP/UDP/ICMP timeouts
 arrive in the snapshot as `u64` seconds and are converted in
 `SessionTimeouts::from_seconds`. The conversion uses `checked_mul` and
