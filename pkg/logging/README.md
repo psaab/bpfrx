@@ -174,15 +174,19 @@ if `Handle` runs the re-entrancy guard before the client check.
 - **Zone names are resolved AS-OF the event, not recomputed live (#3335).**
   `EventReader.ProcessRawEvent` (`ringbuf.go`) stamps `EventRecord.InZoneName`
   / `OutZoneName` from the dataplane's zone-ID→name table at the instant the
-  event fires. Consumers that render zone names — `show security log`
-  (`pkg/cli/cli_show_security_log.go`) and the gRPC `GetEvents`
-  (`pkg/grpcapi/server_show_events.go`) — MUST prefer those stored names and
+  event fires. All three consumers that render zone names — the interactive
+  `show security log` (`pkg/cli/cli_show_security_log.go`), the gRPC
+  `GetEvents` (`pkg/grpcapi/server_show_events.go`), and the showText
+  "security-log" topic (`Server.showSecurityLog` in
+  `pkg/grpcapi/server_show_security_text.go`, which the remote `cli` binary
+  routes `show security log` through) — MUST prefer those stored names and
   fall back to the current-config reverse map only for legacy records whose
   resolved name is empty. Recomputing from the live config corrupts forensic
   timelines: zone IDs are assigned from current state and can be renumbered
   (#3075), so an old event that carried `InZoneName="trust"` would otherwise
   re-render under whatever name now owns that ID. Pins:
-  `server_show_events_historical_zone_3335_test.go`,
+  `server_show_events_historical_zone_3335_test.go` (covers `GetEvents` AND the
+  showText `showSecurityLog` topic),
   `cli_show_security_log_historical_zone_3335_test.go`.
 - **Flow-trace files are basename-only under `/var/log` (#3420).**
   `NewTraceWriter` (`trace.go`) treats the persistent
