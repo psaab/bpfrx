@@ -1045,10 +1045,12 @@ drift) closed in `fix/2008-quickwins-batch1`:
   into session ports", behavior that never happened). On vSRX the knob extracts
   the GRE key/call-id into the session tuple so multiple GRE tunnels between the
   same endpoints map to distinct sessions; the userspace dataplane keys GRE
-  flows on the 5-tuple only, so the flag is now carried for config truth/parity
-  and does not currently alter packet handling (there is no GRE-key extraction
-  path to switch on). Actually keying GRE sessions on the extracted call-id is a
-  separate dataplane feature, not part of this config-truth fix.
+  flows on the 5-tuple only, so the flag is now threaded into the Rust
+  `ForwardingState` for config truth/parity but is NOT yet read by any
+  packet/forwarding path (the field is still `#[allow(dead_code)]`). The
+  consumer — GRE key/call-id extraction into the session tuple — is the deferred
+  feature, and this is the seam it would read; it is not part of this
+  config-truth fix.
 - **M9 `security flow tcp-session no-sequence-check`** — DONE (typed). Added
   the schema child (`pkg/config/schema_security.go`), the
   `TCPSessionConfig.NoSequenceCheck` field (`pkg/config/types_security.go`),

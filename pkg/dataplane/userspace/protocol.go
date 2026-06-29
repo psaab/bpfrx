@@ -145,9 +145,10 @@ type FlowSnapshot struct {
 	// (#3360). On vSRX this extracts the GRE key/call-id into the session tuple
 	// so multiple GRE tunnels between the same endpoints map to distinct
 	// sessions. The userspace dataplane keys GRE flows on the 5-tuple only, so
-	// this threads the operator's intent into ForwardingState (mirroring the
-	// PowerModeDisable plumbing) and is read on the Rust side for parity; it does
-	// not currently alter packet handling (there is no GRE-key extraction path).
+	// this threads the operator's intent into the Rust ForwardingState
+	// (mirroring the PowerModeDisable plumbing) for config truth/parity; the bit
+	// is NOT yet read by any forwarding path. The consumer (GRE key/call-id
+	// extraction) is a deferred feature.
 	GREAcceleration bool `json:"gre_acceleration,omitempty"`
 	// PowerModeDisable carries `security flow power-mode-disable` (#2008 H14).
 	// On vSRX power-mode is an express datapath; disabling it forces the
