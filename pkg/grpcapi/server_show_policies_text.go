@@ -116,12 +116,22 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 	policySetID := uint32(0)
 	var totalPkts, totalBytes uint64
 	for _, zpp := range cfg.Security.Policies {
+		// #3476: skip a nil zone-pair set (tolerant / HA-sync path) while
+		// advancing the policy-set ID, mirroring the runtime walker.
+		if zpp == nil {
+			policySetID++
+			continue
+		}
 		if (filterFrom != "" && zpp.FromZone != filterFrom) ||
 			(filterTo != "" && zpp.ToZone != filterTo) {
 			policySetID++
 			continue
 		}
 		for i, pol := range zpp.Policies {
+			// #3476: skip a nil rule like the runtime walker does.
+			if pol == nil {
+				continue
+			}
 			action := "permit"
 			switch pol.Action {
 			case 1:
@@ -235,6 +245,12 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 	var readErr error
 	policySetID := uint32(0)
 	for _, zpp := range cfg.Security.Policies {
+		// #3476: skip a nil zone-pair set (tolerant / HA-sync path) while
+		// advancing the policy-set ID, mirroring the runtime walker.
+		if zpp == nil {
+			policySetID++
+			continue
+		}
 		if (filterFrom != "" && zpp.FromZone != filterFrom) ||
 			(filterTo != "" && zpp.ToZone != filterTo) {
 			policySetID++
@@ -242,6 +258,10 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 		}
 		fmt.Fprintf(buf, "Policy: %s -> %s, State: enabled\n", zpp.FromZone, zpp.ToZone)
 		for i, pol := range zpp.Policies {
+			// #3476: skip a nil rule like the runtime walker does.
+			if pol == nil {
+				continue
+			}
 			action := "permit"
 			switch pol.Action {
 			case 1:
@@ -301,6 +321,10 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 	if len(cfg.Security.GlobalPolicies) > 0 && filterFrom == "" && filterTo == "" {
 		fmt.Fprintf(buf, "Global policies:\n")
 		for i, pol := range cfg.Security.GlobalPolicies {
+			// #3476: skip a nil global rule like the runtime walker does.
+			if pol == nil {
+				continue
+			}
 			action := "permit"
 			switch pol.Action {
 			case 1:

@@ -137,10 +137,20 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 
 	var policySetID uint32
 	for _, zpp := range cfg.Security.Policies {
+		// #3476: the compile path normalizes nil entries out, but the
+		// tolerant / HA-sync config path (#3474) can leave a nil zone-pair
+		// set or rule that the runtime walker skips. Mirror that here so a
+		// Prometheus scrape does not crash on zpp.FromZone / rule.Count.
+		if zpp == nil {
+			policySetID++
+			continue
+		}
 		fromZone := zpp.FromZone
 		toZone := zpp.ToZone
-		// Zone-pair compile output normalizes nil entries out of zpp.Policies.
 		for i, rule := range zpp.Policies {
+			if rule == nil {
+				continue
+			}
 			if !statsEnabled && !rule.Count {
 				continue
 			}

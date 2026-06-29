@@ -250,6 +250,12 @@ func lookupAppFilter(appName string, cfg *config.Config) (proto uint8, port uint
 }
 
 func screenChecks(p *config.ScreenProfile) []string {
+	// #3476: a nil screen-profile map value (reachable on the tolerant /
+	// HA-sync config path the runtime walker skips) must render as "no
+	// checks", not panic on p.TCP.SynFlood.
+	if p == nil {
+		return nil
+	}
 	var checks []string
 	if p.TCP.SynFlood != nil {
 		checks = append(checks, "syn-flood")

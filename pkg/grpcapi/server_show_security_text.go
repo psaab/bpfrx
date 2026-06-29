@@ -389,7 +389,9 @@ func (s *Server) showScreenIDSOption(req *pb.ShowTextRequest, cfg *config.Config
 		buf.WriteString("No screen profiles configured\n")
 	} else {
 		profile, ok := cfg.Security.Screen[profileName]
-		if !ok {
+		if !ok || profile == nil {
+			// #3476: a present-but-nil profile value (tolerant / HA-sync
+			// path) must not panic on the profile.TCP.* derefs below.
 			fmt.Fprintf(buf, "Screen profile '%s' not found\n", profileName)
 		} else {
 			fmt.Fprintf(buf, "Screen object status:\n\n")
@@ -550,7 +552,9 @@ func (s *Server) showScreenIDSOptionDetail(req *pb.ShowTextRequest, cfg *config.
 		buf.WriteString("No screen profiles configured\n")
 	} else {
 		profile, ok := cfg.Security.Screen[profileName]
-		if !ok {
+		if !ok || profile == nil {
+			// #3476: a present-but-nil profile value must not panic on the
+			// profile.TCP.* derefs below.
 			fmt.Fprintf(buf, "Screen profile '%s' not found\n", profileName)
 		} else {
 			fmt.Fprintf(buf, "Screen object status (detail):\n\n")
@@ -641,6 +645,11 @@ func (s *Server) showScreen(cfg *config.Config, buf *strings.Builder) {
 		sort.Strings(names)
 		for _, name := range names {
 			profile := cfg.Security.Screen[name]
+			// #3476: skip a nil profile map value (tolerant / HA-sync path)
+			// rather than dereferencing profile.TCP.Land below.
+			if profile == nil {
+				continue
+			}
 			fmt.Fprintf(buf, "Screen profile: %s\n", name)
 			if profile.TCP.Land {
 				buf.WriteString("  TCP LAND attack detection: enabled\n")

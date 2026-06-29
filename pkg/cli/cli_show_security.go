@@ -52,6 +52,12 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 	index := uint32(1)
 	policySetID := uint32(0)
 	for _, zpp := range cfg.Security.Policies {
+		// #3476: skip a nil zone-pair set (tolerant / HA-sync path) while
+		// advancing the policy-set ID, mirroring the runtime walker.
+		if zpp == nil {
+			policySetID++
+			continue
+		}
 		if fromZone != "" && zpp.FromZone != fromZone {
 			policySetID++
 			continue
@@ -61,6 +67,10 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			continue
 		}
 		for i, pol := range zpp.Policies {
+			// #3476: skip a nil rule like the runtime walker does.
+			if pol == nil {
+				continue
+			}
 			action := "Permit"
 			switch pol.Action {
 			case 1:
@@ -86,6 +96,10 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 	// Global policies
 	if len(cfg.Security.GlobalPolicies) > 0 && fromZone == "" && toZone == "" {
 		for i, pol := range cfg.Security.GlobalPolicies {
+			// #3476: skip a nil global rule like the runtime walker does.
+			if pol == nil {
+				continue
+			}
 			action := "Permit"
 			switch pol.Action {
 			case 1:
@@ -136,6 +150,12 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 	policySetID := uint32(0)
 	seqNum := 1
 	for _, zpp := range cfg.Security.Policies {
+		// #3476: skip a nil zone-pair set (tolerant / HA-sync path) while
+		// advancing the policy-set ID, mirroring the runtime walker.
+		if zpp == nil {
+			policySetID++
+			continue
+		}
 		if fromZone != "" && zpp.FromZone != fromZone {
 			policySetID++
 			continue
@@ -145,6 +165,10 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 			continue
 		}
 		for i, pol := range zpp.Policies {
+			// #3476: skip a nil rule like the runtime walker does.
+			if pol == nil {
+				continue
+			}
 			action := "permit"
 			switch pol.Action {
 			case 1:
@@ -214,6 +238,10 @@ func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) er
 	// Global policies
 	if len(cfg.Security.GlobalPolicies) > 0 && fromZone == "" && toZone == "" {
 		for i, pol := range cfg.Security.GlobalPolicies {
+			// #3476: skip a nil global rule like the runtime walker does.
+			if pol == nil {
+				continue
+			}
 			action := "permit"
 			switch pol.Action {
 			case 1:

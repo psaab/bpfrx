@@ -513,6 +513,11 @@ func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.Schem
 				fromZone := path[i+1]
 				toZone := path[i+3]
 				for _, zpp := range cfg.Security.Policies {
+					// #3476: skip a nil zone-pair set (tolerant / HA-sync
+					// path) rather than dereferencing zpp.FromZone.
+					if zpp == nil {
+						continue
+					}
 					if zpp.FromZone == fromZone && zpp.ToZone == toZone {
 						policies = zpp.Policies
 						break
@@ -527,6 +532,11 @@ func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.Schem
 		}
 		var out []config.SchemaCompletion
 		for _, pol := range policies {
+			// #3476: skip a nil policy (Policies / GlobalPolicies are
+			// []*Policy) rather than dereferencing pol.Description.
+			if pol == nil {
+				continue
+			}
 			desc := pol.Description
 			if desc == "" {
 				desc = "(configured)"

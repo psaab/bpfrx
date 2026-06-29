@@ -110,7 +110,9 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 
 			// Screen profile details
 			if zone.ScreenProfile != "" {
-				if profile, ok := cfg.Security.Screen[zone.ScreenProfile]; ok {
+				// #3476: a present-but-nil screen-profile map value (tolerant
+				// / HA-sync config path) must not panic on profile.TCP.Land.
+				if profile, ok := cfg.Security.Screen[zone.ScreenProfile]; ok && profile != nil {
 					fmt.Printf("  Screen profile details (%s):\n", zone.ScreenProfile)
 					var checks []string
 					if profile.TCP.Land {
@@ -161,8 +163,19 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 			fmt.Println("  Policy summary:")
 			totalPolicies := 0
 			for _, zpp := range cfg.Security.Policies {
+				// #3476: skip a nil zone-pair set (tolerant / HA-sync config
+				// path the runtime walker skips) rather than dereferencing
+				// zpp.FromZone.
+				if zpp == nil {
+					continue
+				}
 				if zpp.FromZone == name || zpp.ToZone == name {
 					for _, pol := range zpp.Policies {
+						// #3476: skip a nil rule rather than dereferencing
+						// pol.Action / pol.Name.
+						if pol == nil {
+							continue
+						}
 						action := "permit"
 						switch pol.Action {
 						case 1:

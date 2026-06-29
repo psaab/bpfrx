@@ -31,6 +31,12 @@ func (c *CLI) showScreen() error {
 	}
 
 	for name, profile := range cfg.Security.Screen {
+		// #3476: skip a nil profile map value (reachable on the tolerant /
+		// HA-sync config path the runtime walker skips) rather than
+		// dereferencing profile.TCP.Land.
+		if profile == nil {
+			continue
+		}
 		fmt.Printf("Screen profile: %s\n", name)
 
 		// TCP checks
@@ -146,7 +152,9 @@ func (c *CLI) showScreenIdsOption(name string) error {
 		return nil
 	}
 	profile, ok := cfg.Security.Screen[name]
-	if !ok {
+	if !ok || profile == nil {
+		// #3476: a present-but-nil profile value (tolerant / HA-sync path)
+		// must not panic on profile.TCP.Land.
 		fmt.Printf("Screen profile '%s' not found\n", name)
 		return nil
 	}
@@ -217,7 +225,9 @@ func (c *CLI) showScreenIdsOptionDetail(name string) error {
 		return nil
 	}
 	profile, ok := cfg.Security.Screen[name]
-	if !ok {
+	if !ok || profile == nil {
+		// #3476: a present-but-nil profile value must not panic on the
+		// profile.TCP.* derefs below.
 		fmt.Printf("Screen profile '%s' not found\n", name)
 		return nil
 	}
