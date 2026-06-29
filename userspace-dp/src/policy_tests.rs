@@ -834,6 +834,124 @@ fn go_unsupported_sentinel_fails_closed() {
 }
 
 #[test]
+fn unknown_rule_action_rejects_whole_snapshot() {
+    // #3365 RED-on-revert: a per-rule action string that is not
+    // permit/reject/deny must reject the WHOLE snapshot. Pre-fix `parse_action`
+    // mapped any unknown token to PolicyAction::Deny via a catch-all match arm,
+    // so a future `reject-*` variant or a corrupt token silently downgraded to
+    // a plain Deny (a `reject` losing its RST/ICMP-unreachable semantics) with
+    // NO integrity error. Reverting the fix returns Ok(state) here, so this is
+    // non-tautological.
+    let store = PolicyCounterStore::default();
+    let bad = PolicyRuleSnapshot {
+        rule_id: "bad-action".to_string(),
+        name: "bad-action".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "reject-tcp".to_string(),
+        ..Default::default()
+    };
+    let result =
+        parse_policy_state_with_counters("deny", &[bad], &test_zone_name_to_id(), &[], &store);
+    match result {
+        Err(SnapshotIntegrityError::UnknownPolicyAction { context, action }) => {
+            assert!(context.contains("bad-action"), "context names the rule: {context}");
+            assert_eq!(action, "reject-tcp");
+        }
+        other => panic!("expected UnknownPolicyAction, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_rule_action_rejects_whole_snapshot() {
+    // #3365: every configured rule carries a concrete action; an EMPTY action
+    // (which pre-fix also collapsed silently to Deny) is rejected fail-closed.
+    let store = PolicyCounterStore::default();
+    let bad = PolicyRuleSnapshot {
+        rule_id: "empty-action".to_string(),
+        name: "empty-action".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: String::new(),
+        ..Default::default()
+    };
+    let result =
+        parse_policy_state_with_counters("deny", &[bad], &test_zone_name_to_id(), &[], &store);
+    assert!(
+        matches!(result, Err(SnapshotIntegrityError::UnknownPolicyAction { .. })),
+        "an empty per-rule action must fail closed, got {result:?}"
+    );
+}
+
+#[test]
+fn unknown_default_policy_action_rejects_whole_snapshot() {
+    // #3365: the snapshot `default_policy` is the other side of the same
+    // string boundary. A non-empty unknown default action must reject the whole
+    // snapshot rather than silently collapse to Deny.
+    let store = PolicyCounterStore::default();
+    let result =
+        parse_policy_state_with_counters("permit-all", &[], &test_zone_name_to_id(), &[], &store);
+    match result {
+        Err(SnapshotIntegrityError::UnknownPolicyAction { context, action }) => {
+            assert_eq!(context, "default-policy");
+            assert_eq!(action, "permit-all");
+        }
+        other => panic!("expected UnknownPolicyAction for default-policy, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_default_policy_is_accepted_as_deny() {
+    // #3365 guard against over-rejection: an EMPTY default_policy is the
+    // legitimate `omitempty`/unspecified wire state and must decode to the
+    // default-deny posture WITHOUT an integrity error. The Rust snapshot field
+    // is `#[serde(default)]`, so a snapshot that omits default_policy delivers
+    // "" — this must NOT be rejected.
+    let store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters("", &[], &test_zone_name_to_id(), &[], &store)
+        .expect("empty default_policy must be accepted");
+    assert_eq!(state.default_action, PolicyAction::Deny);
+}
+
+#[test]
+fn known_actions_still_parse() {
+    // #3365 sanity: the three known tokens still decode to their actions on both
+    // the default-policy and per-rule boundaries.
+    let store = PolicyCounterStore::default();
+    for (tok, want) in [
+        ("permit", PolicyAction::Permit),
+        ("reject", PolicyAction::Reject),
+        ("deny", PolicyAction::Deny),
+    ] {
+        let rule = PolicyRuleSnapshot {
+            rule_id: format!("r-{tok}"),
+            name: format!("r-{tok}"),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: tok.to_string(),
+            ..Default::default()
+        };
+        let state =
+            parse_policy_state_with_counters(tok, &[rule], &test_zone_name_to_id(), &[], &store)
+                .unwrap_or_else(|e| panic!("token {tok} must parse: {e:?}"));
+        assert_eq!(state.default_action, want, "default-policy {tok}");
+        assert_eq!(state.rules[0].action, want, "rule action {tok}");
+    }
+}
+
+#[test]
 fn deny_rule_with_unrepresentable_app_rejects_whole_snapshot_no_fall_through() {
     // #3261 doctrine guard (plan test #4): a `deny` rule naming an
     // unrepresentable application AHEAD of a later `permit application any` in
