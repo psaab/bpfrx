@@ -23162,3 +23162,8 @@ top.
 - **Timestamp**: 2026-06-28
 - **Action**: Fold reviewer-found siblings (Codex MAJOR flowexport.BuildSamplingZones nil-zone; SMR buildZoneRGMap (nil,true) ifc + rgHasRETH nil ifc) + broad apply-path sweep guarding every nil zone/interface VALUE deref; add 3 RED-on-revert tests
 - **File(s)**: pkg/flowexport/manager.go, pkg/flowexport/exporter_test.go, pkg/daemon/{daemon_ha_userspace,daemon_ha_vip,daemon_apply,daemon_ipmon,daemon_ha,daemon_ra,daemon_system,daemon_run,daemon_ddns,daemon_ha_fabric}.go, pkg/daemon/per_rg_test.go
+
+## 2026-06-28 — fix/3492 close flowexport ifCfg==nil test-coverage gap
+- **Timestamp**: 2026-06-28
+- **Action**: trust zone in TestBuildSamplingZonesSkipsNilZone now references the nil interface (nilif.0) so the BuildSamplingZones `ifCfg == nil` comma-ok clause is RED-on-revert (was only zone==nil covered)
+- **File(s)**: pkg/flowexport/exporter_test.go

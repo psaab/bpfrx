@@ -118,7 +118,10 @@ func TestBuildSamplingZonesSkipsNilZone(t *testing.T) {
 	cfg := &config.Config{
 		Security: config.SecurityConfig{
 			Zones: map[string]*config.ZoneConfig{
-				"trust": {Interfaces: []string{"eth0.0"}},
+				// trust references BOTH a healthy interface (eth0.0) AND a
+				// nil-valued interface (nilif.0) so the inner
+				// `ifCfg == nil` clause is exercised on the apply path.
+				"trust": {Interfaces: []string{"eth0.0", "nilif.0"}},
 			},
 		},
 		Interfaces: config.InterfacesConfig{
@@ -130,7 +133,9 @@ func TestBuildSamplingZonesSkipsNilZone(t *testing.T) {
 		},
 	}
 	// Inject a nil zone slot and a nil interface value post-construction,
-	// mirroring the reachable nil-slot invariant.
+	// mirroring the reachable nil-slot invariant. "nilif" is a (nil) value
+	// referenced by the trust zone above, so BuildSamplingZones reaches the
+	// `if !ok || ifCfg == nil` comma-ok clause for it.
 	cfg.Security.Zones["bogus"] = nil
 	cfg.Interfaces.Interfaces["nilif"] = nil
 
