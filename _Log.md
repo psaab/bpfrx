@@ -23915,3 +23915,28 @@ top.
   cmd/cli/show.go, cmd/cli/nontty_test.go,
   cmd/cli/show_policies_scoped_global_3357_test.go (new),
   docs/junos-cli-reference.md, _Log.md
+- **Timestamp**: 2026-06-29
+  **Action**: #3425 — NAT match {source,destination}-address-name strict gate now
+  rejects defined-but-unresolvable references (empty/dangling address-set,
+  prefix-less address) at commit; lenient-warn on tolerant load/peer-sync; direct
+  dynamic-address feed bindings carved out (accepted). Dataplane already fails
+  closed (raw unmatchable token / zero DNAT entries) — added regression tests.
+  **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_nat_address_name_resolvable_3425_test.go (new),
+  pkg/dataplane/userspace/nat_address_name_failclosed_3425_test.go (new),
+  docs/config-schema.md, _Log.md
+- **Action**: #3337 — surface dropped RT_FLOW forensic fields on the
+  security-event APIs. REST/SSE EventEntry expanded to mirror the gRPC entry
+  (zone names, policy name, app name, ingress iface, close reason, reverse
+  counters) AND the new forensic block; gRPC proto EventEntry gained additive
+  fields 21-31 (nat_src_addr, nat_dst_addr, session_id, elapsed_time, created,
+  created_nanos, egress_ifindex, ingress_ifindex, tos, tcp_control_bits,
+  reason). All machine APIs now format RFC3339Nano (sub-second); CLI keeps
+  whole-second. REST+SSE share one mapper (eventEntryFromRecord) so they can't
+  drift. RED-on-revert tests added on both surfaces (verified failing when the
+  mappings are reverted).
+- **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go (regen),
+  pkg/grpcapi/server_show_events.go, pkg/api/types.go, pkg/api/security.go,
+  pkg/api/sse.go, pkg/api/rest_events_forensic_3337_test.go (new),
+  pkg/grpcapi/server_show_events_forensic_3337_test.go (new),
+  pkg/api/README.md, pkg/grpcapi/README.md, _Log.md

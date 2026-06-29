@@ -430,6 +430,32 @@ func validatePolicyThenDenyStrict(nodes []*Node, lenient bool) ([]string, error)
 		return nil
 	}
 
+	// #3374: session-init/session-close are LOG sub-options, valid ONLY when
+	// a `log` token accompanies them in the same collapsed action. A flat-set
+	// `then deny session-init` (no `log`) collapses to
+	// Keys=["deny","session-init"]; recognizedCollapsedDenyToken accepts the
+	// bare sub-token (it cannot tell a sub-token from a top-level modifier
+	// positionally), so the gate above let it through and
+	// applyCollapsedDenyModifiers silently wired session-init logging for a
+	// form Junos rejects. emitOrphanLogSub flags a session-init/session-close
+	// sub-token that has no `log` parent in the collapsed tail.
+	emitOrphanLogSub := func(scope, policyName, tok string) error {
+		msg := fmt.Sprintf(
+			"security policies %s policy %q then deny %q is not valid without "+
+				"a log token — session-init/session-close are sub-options of "+
+				"then deny log (or the standalone then log), not bare deny "+
+				"modifiers, so a collapsed then deny %s silently wires logging "+
+				"for syntax Junos rejects — use then deny log %s (or then log "+
+				"%s) instead (#3374)",
+			scope, policyName, tok, tok, tok, tok,
+		)
+		if !lenient {
+			return fmt.Errorf("%s", msg)
+		}
+		warnings = append(warnings, msg)
+		return nil
+	}
+
 	checkPolicy := func(scope, policyName string, polNode *Node) error {
 		thenNode := polNode.FindChild("then")
 		if thenNode == nil {
@@ -462,9 +488,25 @@ func validatePolicyThenDenyStrict(nodes []*Node, lenient bool) ([]string, error)
 		//     sub-tokens nest deeper, so a direct child must be a top-level
 		//     modifier — checked against supportedPolicyThenDenyChildren
 		//     ({log, count}).
-		for _, tok := range denyNode.Keys[1:] {
+		tail := denyNode.Keys[1:]
+		hasLog := false
+		for _, tok := range tail {
+			if tok == "log" {
+				hasLog = true
+				break
+			}
+		}
+		for _, tok := range tail {
 			if !recognizedCollapsedDenyToken(tok) {
 				if err := emit(scope, policyName, tok); err != nil {
+					return err
+				}
+				continue
+			}
+			// #3374: a recognized session-init/session-close sub-token is
+			// valid only with a `log` token in the same collapsed tail.
+			if (tok == "session-init" || tok == "session-close") && !hasLog {
+				if err := emitOrphanLogSub(scope, policyName, tok); err != nil {
 					return err
 				}
 			}

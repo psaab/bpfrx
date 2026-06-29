@@ -3774,8 +3774,24 @@ type EventEntry struct {
 	AppName         string                 `protobuf:"bytes,18,opt,name=app_name,json=appName,proto3" json:"app_name,omitempty"`
 	IngressIface    string                 `protobuf:"bytes,19,opt,name=ingress_iface,json=ingressIface,proto3" json:"ingress_iface,omitempty"`
 	CloseReason     string                 `protobuf:"bytes,20,opt,name=close_reason,json=closeReason,proto3" json:"close_reason,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// #3337 additive forensic fields. These carry the remaining RT_FLOW
+	// record values the CLI prints (cli_show_security_log.go) so a SIEM
+	// consuming GetEvents can reproduce the full close record. All are
+	// additive (new field numbers, no renumber). 0 / "" means the event
+	// did not carry the field (e.g. a non-close event, or no NAT applied).
+	NatSrcAddr     string `protobuf:"bytes,21,opt,name=nat_src_addr,json=natSrcAddr,proto3" json:"nat_src_addr,omitempty"`              // post-NAT source "ip:port" ("" = no NAT)
+	NatDstAddr     string `protobuf:"bytes,22,opt,name=nat_dst_addr,json=natDstAddr,proto3" json:"nat_dst_addr,omitempty"`              // post-NAT destination "ip:port"
+	SessionId      uint64 `protobuf:"varint,23,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`                  // unique session identifier
+	ElapsedTime    uint32 `protobuf:"varint,24,opt,name=elapsed_time,json=elapsedTime,proto3" json:"elapsed_time,omitempty"`            // seconds since session creation (CLOSE)
+	Created        uint32 `protobuf:"varint,25,opt,name=created,proto3" json:"created,omitempty"`                                       // absolute session-creation Unix seconds (CLOSE)
+	CreatedNanos   uint32 `protobuf:"varint,26,opt,name=created_nanos,json=createdNanos,proto3" json:"created_nanos,omitempty"`         // sub-second nanosecond remainder of created
+	EgressIfindex  uint32 `protobuf:"varint,27,opt,name=egress_ifindex,json=egressIfindex,proto3" json:"egress_ifindex,omitempty"`      // SNMP ifIndex of the resolved output interface
+	IngressIfindex uint32 `protobuf:"varint,28,opt,name=ingress_ifindex,json=ingressIfindex,proto3" json:"ingress_ifindex,omitempty"`   // SNMP ifIndex of the ingress interface
+	Tos            uint32 `protobuf:"varint,29,opt,name=tos,proto3" json:"tos,omitempty"`                                               // IP ToS byte observed on the forward direction
+	TcpControlBits uint32 `protobuf:"varint,30,opt,name=tcp_control_bits,json=tcpControlBits,proto3" json:"tcp_control_bits,omitempty"` // OR of every TCP flag byte seen over the flow
+	Reason         string `protobuf:"bytes,31,opt,name=reason,proto3" json:"reason,omitempty"`                                          // policy/screen reason (deny/drop events)
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *EventEntry) Reset() {
@@ -3944,6 +3960,83 @@ func (x *EventEntry) GetIngressIface() string {
 func (x *EventEntry) GetCloseReason() string {
 	if x != nil {
 		return x.CloseReason
+	}
+	return ""
+}
+
+func (x *EventEntry) GetNatSrcAddr() string {
+	if x != nil {
+		return x.NatSrcAddr
+	}
+	return ""
+}
+
+func (x *EventEntry) GetNatDstAddr() string {
+	if x != nil {
+		return x.NatDstAddr
+	}
+	return ""
+}
+
+func (x *EventEntry) GetSessionId() uint64 {
+	if x != nil {
+		return x.SessionId
+	}
+	return 0
+}
+
+func (x *EventEntry) GetElapsedTime() uint32 {
+	if x != nil {
+		return x.ElapsedTime
+	}
+	return 0
+}
+
+func (x *EventEntry) GetCreated() uint32 {
+	if x != nil {
+		return x.Created
+	}
+	return 0
+}
+
+func (x *EventEntry) GetCreatedNanos() uint32 {
+	if x != nil {
+		return x.CreatedNanos
+	}
+	return 0
+}
+
+func (x *EventEntry) GetEgressIfindex() uint32 {
+	if x != nil {
+		return x.EgressIfindex
+	}
+	return 0
+}
+
+func (x *EventEntry) GetIngressIfindex() uint32 {
+	if x != nil {
+		return x.IngressIfindex
+	}
+	return 0
+}
+
+func (x *EventEntry) GetTos() uint32 {
+	if x != nil {
+		return x.Tos
+	}
+	return 0
+}
+
+func (x *EventEntry) GetTcpControlBits() uint32 {
+	if x != nil {
+		return x.TcpControlBits
+	}
+	return 0
+}
+
+func (x *EventEntry) GetReason() string {
+	if x != nil {
+		return x.Reason
 	}
 	return ""
 }
@@ -7592,7 +7685,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\bprotocol\x18\x04 \x01(\tR\bprotocol\x12\x19\n" +
 	"\bhas_zone\x18\x05 \x01(\bR\ahasZone\"?\n" +
 	"\x11GetEventsResponse\x12*\n" +
-	"\x06events\x18\x01 \x03(\v2\x12.xpf.v1.EventEntryR\x06events\"\xa0\x05\n" +
+	"\x06events\x18\x01 \x03(\v2\x12.xpf.v1.EventEntryR\x06events\"\x89\b\n" +
 	"\n" +
 	"EventEntry\x12\x12\n" +
 	"\x04time\x18\x01 \x01(\tR\x04time\x12\x12\n" +
@@ -7617,7 +7710,21 @@ const file_xpf_proto_rawDesc = "" +
 	"\x11rev_session_bytes\x18\x11 \x01(\x04R\x0frevSessionBytes\x12\x19\n" +
 	"\bapp_name\x18\x12 \x01(\tR\aappName\x12#\n" +
 	"\ringress_iface\x18\x13 \x01(\tR\fingressIface\x12!\n" +
-	"\fclose_reason\x18\x14 \x01(\tR\vcloseReason\"\x16\n" +
+	"\fclose_reason\x18\x14 \x01(\tR\vcloseReason\x12 \n" +
+	"\fnat_src_addr\x18\x15 \x01(\tR\n" +
+	"natSrcAddr\x12 \n" +
+	"\fnat_dst_addr\x18\x16 \x01(\tR\n" +
+	"natDstAddr\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x17 \x01(\x04R\tsessionId\x12!\n" +
+	"\felapsed_time\x18\x18 \x01(\rR\velapsedTime\x12\x18\n" +
+	"\acreated\x18\x19 \x01(\rR\acreated\x12#\n" +
+	"\rcreated_nanos\x18\x1a \x01(\rR\fcreatedNanos\x12%\n" +
+	"\x0eegress_ifindex\x18\x1b \x01(\rR\regressIfindex\x12'\n" +
+	"\x0fingress_ifindex\x18\x1c \x01(\rR\x0eingressIfindex\x12\x10\n" +
+	"\x03tos\x18\x1d \x01(\rR\x03tos\x12(\n" +
+	"\x10tcp_control_bits\x18\x1e \x01(\rR\x0etcpControlBits\x12\x16\n" +
+	"\x06reason\x18\x1f \x01(\tR\x06reason\"\x16\n" +
 	"\x14GetInterfacesRequest\"N\n" +
 	"\x15GetInterfacesResponse\x125\n" +
 	"\n" +

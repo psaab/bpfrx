@@ -628,7 +628,17 @@ direct child of `deny` is a top-level modifier, checked against the
 `supportedPolicyThenDenyChildren` allowlist (`log`/`count`); its sub-tokens
 nest deeper. Keep `recognizedCollapsedDenyToken` /
 `supportedPolicyThenDenyChildren` in lockstep with
-`applyCollapsedDenyModifiers`. The tolerant load/peer-sync path downgrades
+`applyCollapsedDenyModifiers`. **#3374:** `session-init`/`session-close` are
+LOG sub-options, valid ONLY when a `log` token accompanies them in the same
+collapsed action. Because `recognizedCollapsedDenyToken` cannot tell a
+sub-token from a top-level modifier positionally, a flat-set
+`then deny session-init` (no `log`, `Keys=["deny","session-init"]`) used to
+pass the gate and `applyCollapsedDenyModifiers` silently wired session-init
+logging — syntax Junos rejects. The gate now scans the collapsed tail for a
+`log` token and rejects a bare `session-init`/`session-close` that has no
+`log` parent (`emitOrphanLogSub`); `then deny log session-init` (and the
+standalone `then log session-init`) still commit. The tolerant load/peer-sync
+path downgrades both the unsupported-modifier and the orphan-sub-token reject
 to a warning (`lenientPolicyThenDeny`) so an already-persisted or peer-synced
 config an older binary silently accepted still boots (#1960 no-brick doctrine,
 same as #3114/#3115).

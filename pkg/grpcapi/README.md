@@ -186,6 +186,23 @@ contract.
   and exposed no thresholds — under-reporting active enforcement to a
   structured-state consumer. The `checks` set is kept a superset of the
   dataplane-enforced set; the duplicated-helper drift mechanism is gone.
+- `GetEvents` returns recent security events (`EventEntry`) from the
+  `pkg/logging` ring buffer. As of #3337 the entry carries the full RT_FLOW
+  forensic record so a SIEM can reproduce the CLI close line: beyond the
+  5-tuple / zones / policy ID it maps the resolved zone names, policy name,
+  application name, ingress interface, close reason, the reverse counters,
+  and the additive forensic block — `nat_src_addr`, `nat_dst_addr`,
+  `session_id`, `elapsed_time`, `created` (+`created_nanos`),
+  `egress_ifindex`, `ingress_ifindex`, `tos`, `tcp_control_bits`, and
+  `reason` (proto field numbers 21-31, additive — no renumber). Before
+  #3337 the proto stopped at `close_reason` (field 20) and dropped the NAT
+  tuples, session ID, timing, ifIndexes, and CoS bits the `EventRecord`
+  already held, and REST/SSE dropped even the policy/app/zone-name/reverse
+  fields gRPC exposed. The `time` field now formats `RFC3339Nano`
+  (sub-second) so high-rate events keep ordering; the REST/SSE surfaces
+  mirror the same fields via the shared `eventEntryFromRecord` mapper. The
+  zone filter (`zone` + `has_zone`) and out-of-range rejection are unchanged
+  (#3334/#3338).
 - Request-supplied numeric fields are signed on the wire and must be
   range-checked before they index/slice/size anything (#2282). `Complete`
   rejects a negative `pos` with `InvalidArgument` before slicing

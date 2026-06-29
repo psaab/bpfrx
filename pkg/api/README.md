@@ -110,6 +110,21 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
   forwards) is classified `notice`, not `error`, mirroring the canonical
   `logging.eventSeverity`; an unknown event type fails closed under a
   narrow category mask.
+- `GET /api/v1/security/events` (and the SSE event stream) return the full
+  RT_FLOW forensic `EventEntry` (#3337). Both surfaces share one mapper,
+  `eventEntryFromRecord`, so they never drift: beyond the 5-tuple they carry
+  the resolved ingress/egress zone names, policy name, application name,
+  ingress interface, close reason / policy reason, the reverse
+  (server→client) packet/byte counters, the post-NAT source/destination
+  tuples, session ID, elapsed/created time (with `created_nanos` sub-second
+  remainder), ingress/egress SNMP ifIndex, IP TOS, and the OR of the TCP
+  control bits. These mirror the gRPC `EventEntry`
+  (`pkg/grpcapi` `GetEvents`) and the CLI RT_FLOW line. All forensic fields
+  are `omitempty`, so a non-close event (or an unNAT'd / screen-drop record)
+  omits the ones it does not carry. The machine APIs format timestamps with
+  `RFC3339Nano` (sub-second), so high-rate events keep ordering/burst
+  fidelity for cross-system correlation; the CLI keeps human-friendly
+  whole-second output.
 
 ## Callers
 
