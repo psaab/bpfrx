@@ -2362,6 +2362,24 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3352/#3353: syntactic application errors (an unknown leaf inside an
+	// opaque inline `term`, or an unsupported `alg` name) are rejected for ALL
+	// user-defined applications — referenced or not — unlike the
+	// reference-scoped semantic specs above. These are grammar / enum
+	// violations Junos rejects at commit regardless of policy wiring; a typo'd
+	// term-leaf silently widens a term and a bogus `alg` silently no-ops from
+	// the moment the app is defined, so they must be caught at definition.
+	// Lenient-downgrade on the tolerant load / peer-sync path, identical to
+	// validateApplicationSpecsStrict (#1960 no-brick).
+	if err := validateApplicationSyntaxStrict(cfg); err != nil {
+		if opts.lenientApplicationSpecs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("application syntax (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2175 firewall-filter `from protocol <token>` fail-open gate. Strict on
 	// commit / commit-check (hard-reject a term whose protocol token is not
 	// resolvable by the centralized appid.ProtocolNumber SSOT — neither a

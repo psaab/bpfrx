@@ -125,3 +125,88 @@ func TestApplicationALG_SupportedName_InlineTerm_Accepted(t *testing.T) {
 		t.Fatalf("inline-term alg ftp must be recorded, got %+v", app)
 	}
 }
+
+// unrefAppOnly builds a config carrying ONLY `set applications application
+// <name> <prop>...` lines — the application is NOT named by any policy,
+// application-set, or NAT rule, so it is OUTSIDE applicationsToValidateStrict's
+// referenced / app-id-enabled subset. The #3352/#3353 syntactic gate
+// (validateApplicationSyntaxStrict) must still reject a typo'd term leaf or a
+// bad alg here, at the moment the app is defined.
+func unrefAppOnly(name string, props ...string) []string {
+	var sets []string
+	for _, p := range props {
+		sets = append(sets, "set applications application "+name+" "+p)
+	}
+	return sets
+}
+
+// #3352 scope fail-on-revert (the Codex MERGE-NEEDS-MAJOR gap): an UNREFERENCED
+// user application with a typo'd inline-term leaf must be rejected at commit.
+// Before widening the gate to all user apps this committed silently (the app is
+// not in applicationsToValidateStrict). Revert validateApplicationSyntaxStrict's
+// all-user-apps loop and this goes RED.
+func TestApplicationTerm_UnknownLeaf_Unreferenced_Rejected(t *testing.T) {
+	tree := flatTreeFromSets(t, unrefAppOnly("lonely", "term t1 protocol tcp destination-poort 22")...)
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatalf("expected commit to REJECT unknown term leaf on an UNREFERENCED app")
+	} else if !strings.Contains(err.Error(), "unknown statement") {
+		t.Fatalf("error should mention the unknown statement, got: %v", err)
+	}
+}
+
+// #3353 scope fail-on-revert: an UNREFERENCED user application with an
+// unsupported `alg` must be rejected at commit (top-level and inline-term).
+func TestApplicationALG_UnknownName_Unreferenced_Rejected(t *testing.T) {
+	cases := [][]string{
+		{"protocol tcp", "alg ftpp"},
+		{"term t protocol tcp alg h323"},
+	}
+	for i, props := range cases {
+		t.Run(strings.Join(props, "_"), func(t *testing.T) {
+			tree := flatTreeFromSets(t, unrefAppOnly("lonely", props...)...)
+			if _, err := CompileConfig(tree); err == nil {
+				t.Fatalf("case %d: expected commit to REJECT unknown alg on an UNREFERENCED app", i)
+			} else if !strings.Contains(err.Error(), "unknown alg") {
+				t.Fatalf("case %d: error should mention the unknown alg, got: %v", i, err)
+			}
+		})
+	}
+}
+
+// Guard against over-rejection: an UNREFERENCED user app with only valid leaves
+// and a supported alg still commits cleanly.
+func TestApplicationTermALG_Unreferenced_Valid_Accepted(t *testing.T) {
+	tree := flatTreeFromSets(t, unrefAppOnly("lonely",
+		"protocol tcp", "destination-port 22", "alg ftp",
+		"term t protocol udp destination-port 53 alg dns")...)
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("expected commit to accept a well-formed UNREFERENCED app: %v", err)
+	}
+}
+
+// Predefined junos-* applications (junos-rtsp / junos-ftp / ...) are owned by
+// the PredefinedApplications table, NOT cfg.Applications.Applications, so the
+// all-user-apps syntax gate never reaches them. A policy referencing a
+// predefined app — including ones that legitimately carry ALGs — must still
+// commit cleanly (the widening must not false-reject predefined apps).
+func TestApplicationALG_PredefinedApp_NotRejected(t *testing.T) {
+	for _, pre := range []string{"junos-rtsp", "junos-ftp"} {
+		t.Run(pre, func(t *testing.T) {
+			sets := []string{
+				"set security zones security-zone trust",
+				"set security zones security-zone untrust",
+				"set security policies from-zone trust to-zone untrust policy p match source-address any",
+				"set security policies from-zone trust to-zone untrust policy p match destination-address any",
+				"set security policies from-zone trust to-zone untrust policy p match application " + pre,
+				"set security policies from-zone trust to-zone untrust policy p then permit",
+			}
+			tree := flatTreeFromSets(t, sets...)
+			if _, err := CompileConfig(tree); err != nil {
+				t.Fatalf("expected commit to accept predefined app %q reference: %v", pre, err)
+			}
+			if _, isUser := PredefinedApplications[pre]; !isUser {
+				t.Fatalf("test precondition: %q must be a predefined app", pre)
+			}
+		})
+	}
+}

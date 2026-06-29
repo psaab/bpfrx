@@ -3386,18 +3386,61 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 					"remove icmp-code)",
 				name)
 		}
+	}
+	return nil
+}
+
+// validateApplicationSyntaxStrict hard-rejects SYNTACTIC errors in a
+// user-defined application definition that the typed-schema walk cannot reach:
+// an unrecognized leaf inside an opaque inline `term { ... }` (#3352) and an
+// `alg` name xpf does not support (#3353).
+//
+// Unlike validateApplicationSpecsStrict — whose port / protocol / icmp / timeout
+// checks are SEMANTIC and deliberately scoped to REFERENCED applications (an
+// unreferenced malformed app cannot break a live policy decision, so it stays a
+// warning so an operator iterating on a not-yet-wired application library is not
+// blocked, see that function's doc) — these two checks run over EVERY
+// user-defined application, referenced or not. They are grammar / enum
+// violations (the config names a statement or an ALG that does not exist), the
+// same class Junos rejects at commit regardless of whether the application is
+// wired into a policy; deferring them until the app is referenced would let a
+// typo'd term-leaf silently widen a term, or a bogus `alg` silently no-op, from
+// the moment it is defined. The map iterated is cfg.Applications.Applications,
+// which holds ONLY user-defined applications and the per-term applications they
+// generate (`<parent>-<term>`); PREDEFINED junos-* applications (junos-rtsp /
+// junos-h323 / junos-pptp, which legitimately use ALGs outside the supported
+// set) are owned by the predefined table and are never in this map, so they are
+// never reached by the `alg` check. Iteration is sorted by name so the
+// first-reported error is deterministic.
+//
+// Strict on the commit / commit-check path; the call site (compiler.go,
+// lenientApplicationSpecs) downgrades a returned error to a warning on the
+// tolerant load / peer-sync path so an already-persisted or older-peer-synced
+// config still BOOTS (#1960 no-brick).
+func validateApplicationSyntaxStrict(cfg *Config) error {
+	if cfg == nil || len(cfg.Applications.Applications) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Applications.Applications))
+	for name := range cfg.Applications.Applications {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		app := cfg.Applications.Applications[name]
+		if app == nil {
+			continue
+		}
 		// #3352: an unrecognized leaf inside an inline `term { ... }`. The term
 		// subtree is an opaque `args:1` schema leaf (children:nil), so the
 		// SchemaValidate walk never reaches inside it and a typo'd leaf (e.g.
 		// `destination-poort 22`) was silently dropped along with its value —
 		// the term kept only its remaining constraints (e.g. `protocol tcp`) and
 		// a narrow permit/deny term widened to all-protocol (all-TCP), with no
-		// commit error. parseApplicationTerms now records the offending token on
+		// commit error. parseApplicationTerms records the offending token on
 		// UnknownTermLeaves (mirroring UnknownTimeouts / UnknownICMP); reject the
-		// first one here so the silent match-widening becomes an operator-visible
-		// commit error. Strict on the commit / commit-check path; the call site
-		// (compiler.go, lenientApplicationSpecs) downgrades it to a warning on the
-		// tolerant load / peer-sync path (#1960 no-brick).
+		// first one so the silent match-widening becomes an operator-visible
+		// commit error.
 		if len(app.UnknownTermLeaves) > 0 {
 			return fmt.Errorf(
 				"application %q: unknown statement %q inside `term`; a custom "+
@@ -3417,8 +3460,7 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 		// (the wire has only the global alg_disable_flags bitfield), so a valid
 		// `alg` name remains informational until the enforcement half lands. That
 		// dataplane half is a genuine fork (new snapshot field + Rust) tracked as
-		// the per-application slice of #2008. Strict on the commit / commit-check
-		// path; lenient-warn on the tolerant load / peer-sync path.
+		// the per-application slice of #2008.
 		if app.ALG != "" && !validApplicationALG(app.ALG) {
 			return fmt.Errorf(
 				"application %q: unknown alg %q; supported application ALGs are "+

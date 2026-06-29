@@ -2451,13 +2451,34 @@ gaps lived under that opacity:
   is deliberately not built here. Until then this gate makes an unsupported
   name an operator-visible commit error instead of a silent no-op.
 
+**Scope — ALL user-defined applications, referenced or not.** These two checks
+live in a SEPARATE pass, `validateApplicationSyntaxStrict`, that iterates every
+entry in `cfg.Applications.Applications`, NOT the reference-scoped
+`applicationsToValidateStrict` subset that `validateApplicationSpecsStrict` uses
+for its port / protocol / icmp / timeout checks. The reference scope is correct
+for those SEMANTIC checks (an unreferenced malformed-port app cannot break a
+live policy decision, so it stays a warning so an operator iterating on a
+not-yet-wired application library is not blocked). But an unknown term statement
+and an unsupported `alg` are SYNTACTIC / enum violations — the config names a
+statement or an ALG that does not exist — which Junos rejects at commit
+regardless of policy wiring; deferring them until reference would let a typo'd
+term-leaf silently widen a term, or a bogus `alg` silently no-op, from the
+moment the app is defined. `cfg.Applications.Applications` holds ONLY
+user-defined applications (and the per-term apps they generate); PREDEFINED
+junos-* apps (`junos-rtsp`, `junos-h323`, ...) live in the separate
+`PredefinedApplications` table and are never in this map, so the `alg` check
+never false-rejects a predefined app that legitimately carries an
+out-of-supported-set ALG.
+
 Both checks are STRICT on the commit / commit-check path and downgrade to a
 `cfg.Warnings` entry on the tolerant load / HA peer-sync path
 (`lenientApplicationSpecs`, #1960 no-brick), the same discipline as the #3320 /
 #3348 application gates. Regression coverage:
 `pkg/config/compiler_application_term_alg_3352_3353_test.go` (unknown term leaf
-rejected, well-formed term keeps its port constraint, unknown alg rejected
-top-level + inline-term, supported alg names accepted on both paths).
+rejected referenced AND unreferenced, well-formed term keeps its port
+constraint, unknown alg rejected top-level + inline-term + unreferenced,
+supported alg names accepted on both paths, predefined-app reference not
+rejected).
 
 ### #2226 — rib-group `import-rib` undefined-reference validation
 

@@ -167,7 +167,7 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 }
 
 // parseApplicationTerms parses an inline term like:
-// "term-name [alg ssh] protocol tcp [source-port 22] [destination-port 22] [inactivity-timeout 86400]"
+// "term-name [alg ftp] protocol tcp [source-port 22] [destination-port 22] [inactivity-timeout 86400]"
 // When multiple protocol values are present, returns one Application per
 // unique protocol (each sharing the same ports/timeout/alg).
 func parseApplicationTerms(parentName string, keys []string) []*Application {
