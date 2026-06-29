@@ -869,6 +869,16 @@ session, this would show structured security log events. The format is known fro
 
 The `show configuration security log` was also permission-denied.
 
+**Filter syntax:** `show security log [<count>] [zone <name>] [protocol <proto>]
+[action <action>]`. Argument parsing fails **closed** (#3347): an unknown
+token (e.g. a typo `zon trust`), a filter keyword with no value (`action`
+with nothing after it), or a non-positive count returns a usage error rather
+than silently dropping the filter and dumping every event. A `zone <name>`
+filter requested before a successful dataplane apply exists (early startup or
+after a failed commit, when zone-name→ID mapping is unavailable) is likewise
+refused instead of widening to all zones — in incident response, silently
+broadening a scoped forensic query is worse than failing the query.
+
 ---
 
 ## Interfaces: Terse
