@@ -7,7 +7,7 @@ use super::allocator::{
     ALLOCATION_GC_BUDGET, NS_PER_SEC, PersistentLease, PersistentSourceKey, PoolAddressFamily,
     sticky_pool_index,
 };
-use super::source::{PersistentNatPermit, SourceNatFlowKey};
+use super::source::{PersistentNatPermit, SOURCE_NAT_PROTO_ANY, SourceNatFlowKey};
 use super::destination::{PROTO_ANY, PROTO_TCP, PROTO_UDP};
 use super::*;
 use crate::ip_proto::{PROTO_ESP, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6};
@@ -6821,4 +6821,127 @@ fn source_nat_l4_constrained_rule_fails_closed_on_unknown_tuple_3429() {
         d.is_none(),
         "an L4-scoped SNAT rule must NOT fire for an unknown (proto=0) tuple"
     );
+}
+
+// #3471 fold: a destination-port constraint that is purely an impossible
+// (low > high) range — the natNeverMatchPortRange fail-closed sentinel the Go
+// builder emits when every configured port is out of range — must match
+// NOTHING, NOT collapse to "unconstrained". The Rust parser keeps a low > high
+// range verbatim; dropping it (the pre-fold revert) empties match_dst_ports and
+// l4_matches then treats the rule as port-unconstrained = match-all (fail-open).
+#[test]
+fn source_nat_never_match_port_sentinel_matches_nothing_3429() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        // natNeverMatchPortRange = {low:1, high:0} — impossible, never matches.
+        match_destination_ports: vec![NatPortRangeWire { low: 1, high: 0 }],
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
+    let src: IpAddr = "10.0.1.100".parse().unwrap();
+    let dst: IpAddr = "8.8.8.8".parse().unwrap();
+    for dport in [1u16, 80, 443, 20001, 65535] {
+        let mut counter = None;
+        let r = match_source_nat_result_for_tuple(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            src,
+            dst,
+            PROTO_TCP,
+            12345,
+            dport,
+            egress_v4,
+            None,
+            0,
+            false,
+            &mut counter,
+        );
+        assert_eq!(
+            r,
+            SourceNatLookup::NoMatch,
+            "never-match port sentinel must reject dst port {}",
+            dport
+        );
+    }
+}
+
+// #3471 fold: an app term whose protocol is the never-match sentinel (0xFFFF,
+// what the Go builder emits for an empty/unresolvable app protocol) must match
+// NOTHING, while a genuinely-any term (SOURCE_NAT_PROTO_ANY = 256) still matches
+// every protocol. This locks the distinction the Codex finding turned on:
+// returning natProtoAny for an unresolvable protocol (the revert) would make the
+// never term behave like the any term — fail-open.
+#[test]
+fn source_nat_app_protocol_never_vs_any_3429() {
+    let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
+    let src: IpAddr = "10.0.1.100".parse().unwrap();
+    let dst: IpAddr = "8.8.8.8".parse().unwrap();
+    let lookup = |rules: &[_], proto: u8| {
+        let mut counter = None;
+        match_source_nat_result_for_tuple(
+            rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            src,
+            dst,
+            proto,
+            12345,
+            443,
+            egress_v4,
+            None,
+            0,
+            false,
+            &mut counter,
+        )
+    };
+
+    // Never-match protocol sentinel (0xFFFF): no protocol satisfies the term.
+    let never = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        match_applications: vec![NatAppTermWire {
+            protocol: 0xFFFF,
+            ports: vec![],
+        }],
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    for proto in [PROTO_TCP, PROTO_UDP, PROTO_ICMP, PROTO_GRE] {
+        assert_eq!(
+            lookup(&never, proto),
+            SourceNatLookup::NoMatch,
+            "never-match app protocol must reject protocol {}",
+            proto
+        );
+    }
+
+    // Genuinely-any protocol (256): every protocol matches the term.
+    let any = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        match_applications: vec![NatAppTermWire {
+            protocol: SOURCE_NAT_PROTO_ANY,
+            ports: vec![],
+        }],
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    for proto in [PROTO_TCP, PROTO_UDP, PROTO_ICMP, PROTO_GRE] {
+        assert!(
+            matches!(lookup(&any, proto), SourceNatLookup::Matched(_)),
+            "any-protocol app term must match protocol {}",
+            proto
+        );
+    }
 }

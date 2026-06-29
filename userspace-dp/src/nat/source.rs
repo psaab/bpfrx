@@ -534,21 +534,21 @@ pub(crate) fn parse_source_nat_rules_with_previous(
             parse_match_prefix(prefix, &mut rule.destination_v4, &mut rule.destination_v6);
         }
         // #3429: source-NAT L4 match constraints. `match destination-port`
-        // ranges and the pre-expanded `match application` terms. A range with
-        // low > high is dropped (never matches anything anyway); an empty list
-        // leaves the rule unconstrained on that axis.
+        // ranges and the pre-expanded `match application` terms. Ranges are kept
+        // VERBATIM — including a deliberately impossible `low > high` range,
+        // which `port_in_ranges` can never satisfy. The Go builder emits exactly
+        // such a range (natNeverMatchPortRange = {1,0}) as a fail-CLOSED sentinel
+        // when a port constraint was configured but every value is out of range:
+        // dropping it here would empty the list, and an empty list is read as
+        // "unconstrained" by `l4_matches` (match any port) — re-opening the
+        // fail-open this fix closes (AGY finding on PR #3471). A non-empty list
+        // that is purely such sentinels therefore matches NOTHING; an empty list
+        // (no constraint configured) leaves the rule unconstrained on that axis.
         for r in &snap.match_destination_ports {
-            if r.low <= r.high {
-                rule.match_dst_ports.push((r.low, r.high));
-            }
+            rule.match_dst_ports.push((r.low, r.high));
         }
         for term in &snap.match_applications {
-            let mut ports = Vec::with_capacity(term.ports.len());
-            for r in &term.ports {
-                if r.low <= r.high {
-                    ports.push((r.low, r.high));
-                }
-            }
+            let ports = term.ports.iter().map(|r| (r.low, r.high)).collect();
             rule.match_apps.push(SourceNatAppTerm {
                 protocol: term.protocol,
                 ports,

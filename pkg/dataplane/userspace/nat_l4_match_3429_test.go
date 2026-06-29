@@ -68,6 +68,85 @@ func TestBuildSourceNATSnapshotsDropsOutOfRangePort(t *testing.T) {
 	}
 }
 
+// #3471 AGY fail-open: a destination-port constraint whose ports are ALL out of
+// range must NOT coalesce to an empty list — empty means "unconstrained" =
+// match-any-port. It must emit the never-match sentinel so the rule matches
+// nothing. RED-on-revert: with the plain coalescePortRanges (drop-to-empty),
+// MatchDestinationPorts is empty and the rule widens to every port.
+func TestBuildSourceNATSnapshotsAllOutOfRangePortFailsClosed(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.NAT.Source = []*config.NATRuleSet{
+		{
+			Name:     "rs",
+			FromZone: "lan",
+			ToZone:   "wan",
+			Rules: []*config.NATRule{{
+				Name: "r1",
+				Match: config.NATMatch{
+					DestinationPorts: []int{0, 70000, 99999},
+				},
+				Then: config.NATThen{Type: config.NATSource, Interface: true},
+			}},
+		},
+	}
+	snaps := buildSourceNATSnapshots(cfg, nil)
+	got := snaps[0].MatchDestinationPorts
+	if len(got) != 1 || got[0] != natNeverMatchPortRange {
+		t.Fatalf("MatchDestinationPorts = %+v, want one never-match range %+v (fail closed, not empty wildcard)",
+			got, natNeverMatchPortRange)
+	}
+}
+
+// #3471 Codex fail-open: an application whose protocol is empty or unresolvable
+// must emit the never-match protocol sentinel, NOT natProtoAny (256, wildcard).
+// RED-on-revert: returning natProtoAny widens the app term to every protocol.
+func TestBuildSourceNATSnapshotsAppEmptyProtocolFailsClosed(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Applications.Applications = map[string]*config.Application{
+		"app-noproto": {Name: "app-noproto", Protocol: "", DestinationPort: "443"},
+	}
+	cfg.Security.NAT.Source = []*config.NATRuleSet{
+		{
+			Name:     "rs",
+			FromZone: "lan",
+			ToZone:   "wan",
+			Rules: []*config.NATRule{{
+				Name:  "r1",
+				Match: config.NATMatch{Application: "app-noproto"},
+				Then:  config.NATThen{Type: config.NATSource, Interface: true},
+			}},
+		},
+	}
+	apps := buildSourceNATSnapshots(cfg, nil)[0].MatchApplications
+	if len(apps) != 1 || apps[0].Protocol != natProtoNever {
+		t.Fatalf("MatchApplications = %+v, want one never-match term (proto %d), NOT natProtoAny %d",
+			apps, natProtoNever, natProtoAny)
+	}
+}
+
+func TestBuildSourceNATSnapshotsAppUnknownProtocolFailsClosed(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Applications.Applications = map[string]*config.Application{
+		"app-bad": {Name: "app-bad", Protocol: "frobnicate", DestinationPort: "443"},
+	}
+	cfg.Security.NAT.Source = []*config.NATRuleSet{
+		{
+			Name:     "rs",
+			FromZone: "lan",
+			ToZone:   "wan",
+			Rules: []*config.NATRule{{
+				Name:  "r1",
+				Match: config.NATMatch{Application: "app-bad"},
+				Then:  config.NATThen{Type: config.NATSource, Interface: true},
+			}},
+		},
+	}
+	apps := buildSourceNATSnapshots(cfg, nil)[0].MatchApplications
+	if len(apps) != 1 || apps[0].Protocol != natProtoNever {
+		t.Fatalf("MatchApplications = %+v, want one never-match term (proto %d)", apps, natProtoNever)
+	}
+}
+
 func TestBuildSourceNATSnapshotsCarriesApplicationMatch(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Applications.Applications = map[string]*config.Application{

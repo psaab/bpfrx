@@ -222,7 +222,7 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 			// member). The Rust matcher enforces these before translating AND
 			// before applying a `then source-nat off` exemption, so a
 			// port/app-scoped rule no longer silently widens to every port.
-			matchDestPorts := coalescePortRanges(rule.Match.DestinationPorts)
+			matchDestPorts := sourceNATDestPortRanges(rule.Match.DestinationPorts)
 			matchApps := buildSourceNATAppTerms(cfg, rule.Match.Application)
 
 			out = append(out, SourceNATRuleSnapshot{
@@ -258,9 +258,17 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 }
 
 // natProtoAny is the source-NAT match-term protocol wildcard, mirroring the
-// Rust PROTO_ANY (256): outside the 0-255 protocol range so it never aliases
-// protocol 0 (HOPOPT). #3429.
+// Rust SOURCE_NAT_PROTO_ANY (256): outside the 0-255 protocol range so it never
+// aliases protocol 0 (HOPOPT). It denotes a GENUINELY unconstrained term and
+// must never be used as a fallback for an unresolvable protocol (that is a
+// fail-open widen — Codex finding on PR #3471; see natAppProtoNumber). The
+// builder does not currently emit it: an application always constrains protocol,
+// and an unconstrained `match application` (empty / "any") produces NO term at
+// all rather than an any-protocol term. Kept defined to document the wire
+// wildcard the Rust matcher honors and to keep the two sides legible. #3429.
 const natProtoAny uint16 = 256
+
+var _ = natProtoAny // reserved wire wildcard; see doc above (not emitted today)
 
 // natProtoNever is a reserved protocol sentinel that can never equal a real
 // 0-255 protocol and is not the wildcard, so a term carrying it matches no flow
@@ -271,12 +279,32 @@ const natProtoAny uint16 = 256
 // is only the lenient load / peer-sync backstop.
 const natProtoNever uint16 = 0xFFFF
 
+// natNeverMatchPortRange is an impossible inclusive range (Low > High): no L4
+// port satisfies `p >= 1 && p <= 0`, so a rule carrying it matches NOTHING
+// (#3429). It is the fail-CLOSED sentinel emitted when a destination-port (or an
+// application's destination-port) constraint WAS configured but every value is
+// unrepresentable / out of the valid 1..65535 range. Without it, coalescing to
+// an EMPTY range list would be read downstream as "no port constraint" = match
+// any port — re-introducing the exact fail-OPEN widening #3429 closes (AGY
+// finding on PR #3471). The Rust matcher PRESERVES a Low>High range (it never
+// matches) rather than dropping it, so the sentinel survives the wire. The
+// strict commit gate (#3386) already rejects an out-of-range port at commit;
+// this hardens the lenient / tolerant-load / peer-sync path.
+var natNeverMatchPortRange = NatPortRangeWire{Low: 1, High: 0}
+
 // coalescePortRanges collapses a list of individual L4 ports (the expanded
 // output of parseDNATPortList / appPortsFromSpec) into a minimal set of
-// inclusive [Low,High] wire ranges (#3429). Anything outside the valid
-// 1..65535 range is dropped (fail closed — a bad/wrapping value never becomes a
-// wrong u16 match). The result is sorted, deduplicated, and run-merged so a
+// inclusive [Low,High] wire ranges (#3429). Any value outside the valid
+// 1..65535 range is skipped (a bad/wrapping value never becomes a wrong u16
+// match). The result is sorted, deduplicated, and run-merged so a
 // `destination-port 20000 to 20003` carries one range, not four entries.
+//
+// This is a pure utility: it returns an EMPTY slice both for "no ports given"
+// AND for "ports given but none representable" — the two are indistinguishable
+// here and an empty result means "unconstrained" downstream. Callers that must
+// fail CLOSED on an all-out-of-range constraint (rather than widen to match-any)
+// MUST go through sourceNATDestPortRanges / the app-term guard, which substitute
+// natNeverMatchPortRange when the input was non-empty but coalesced to nothing.
 func coalescePortRanges(ports []int) []NatPortRangeWire {
 	if len(ports) == 0 {
 		return nil
@@ -311,15 +339,40 @@ func coalescePortRanges(ports []int) []NatPortRangeWire {
 	return ranges
 }
 
+// sourceNATDestPortRanges coalesces a configured source-NAT `match
+// destination-port` list to wire ranges, failing CLOSED when the constraint was
+// specified but nothing is representable (#3429). An empty input (no constraint
+// configured) stays empty — a legitimate match-any-port wildcard. A non-empty
+// input that coalesces to nothing (every port out of 1..65535) returns the
+// never-match sentinel so the rule matches NOTHING instead of widening to every
+// port (the AGY-found fail-open on PR #3471). NOTE: source NAT has no
+// `match source-port` grammar (the SNAT parser only reads source/destination
+// address(-name), destination-port, and application), so there is no
+// source-port coalesce path to guard symmetrically.
+func sourceNATDestPortRanges(ports []int) []NatPortRangeWire {
+	ranges := coalescePortRanges(ports)
+	if len(ports) > 0 && len(ranges) == 0 {
+		return []NatPortRangeWire{natNeverMatchPortRange}
+	}
+	return ranges
+}
+
 // natAppProtoNumber resolves an application's protocol token to its IANA number
-// for the source-NAT match wire, returning natProtoAny when the token is empty
-// or unresolvable (#3429). A concrete number — including 0 (HOPOPT) — is
-// honored. Mirrors the appid SSOT (appid.ProtocolNumber) the policy path uses.
+// for the source-NAT match wire (#3429). A resolvable token — including a
+// numeric "0" (HOPOPT) — maps to its IANA value via the appid SSOT
+// (appid.ProtocolNumber, the same resolver the policy path uses). An EMPTY or
+// unresolvable protocol returns natProtoNever (0xFFFF), a never-match sentinel:
+// a Junos application ALWAYS constrains protocol, so a term whose protocol
+// cannot be resolved must match NOTHING. Returning natProtoAny (256, the
+// wildcard) here would widen the app-scoped rule to EVERY protocol — a fail-open
+// of the same class #3429 closes (Codex finding on PR #3471). natProtoAny is
+// reserved for a genuinely unconstrained term, which the app path never produces
+// (the "any" / empty app name short-circuits to no terms before this is called).
 func natAppProtoNumber(proto string) uint16 {
 	if n, ok := appid.ProtocolNumber(proto); ok {
 		return uint16(n)
 	}
-	return natProtoAny
+	return natProtoNever
 }
 
 // buildSourceNATAppTerms resolves a source-NAT `match application <name>` into
@@ -340,9 +393,18 @@ func buildSourceNATAppTerms(cfg *config.Config, appName string) []NatAppTermWire
 		if a == nil {
 			return
 		}
+		ports := coalescePortRanges(appPortsFromSpec(a.DestinationPort))
+		if a.DestinationPort != "" && len(ports) == 0 {
+			// #3429: the application carried a destination-port spec but none of
+			// it is representable (out of 1..65535) — fail CLOSED so the term
+			// matches nothing rather than silently demoting to a protocol-only
+			// (any-port) match. An app with NO destination-port keeps Ports empty
+			// (a legitimate protocol-only match).
+			ports = []NatPortRangeWire{natNeverMatchPortRange}
+		}
 		terms = append(terms, NatAppTermWire{
 			Protocol: natAppProtoNumber(a.Protocol),
-			Ports:    coalescePortRanges(appPortsFromSpec(a.DestinationPort)),
+			Ports:    ports,
 		})
 	}
 	if app, found := config.ResolveApplication(appName, userApps); found {
