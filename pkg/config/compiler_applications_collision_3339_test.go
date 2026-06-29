@@ -157,6 +157,129 @@ func TestDistinctApplicationNamesCommit(t *testing.T) {
 	}
 }
 
+// parseHier (shared with vrrp_track_test.go) parses a hierarchical (braced)
+// config string. A hierarchical parse can emit MULTIPLE top-level sibling
+// `applications {}` nodes; the compiler compiles every one, so the collision
+// gate must aggregate across all of them.
+
+// Collision SPLIT across two top-level `applications {}` blocks: an application
+// in the first block, an application-set of the same name in the second. The
+// compiler compiles both blocks, so this must be rejected — a walker that
+// stopped at the first `applications` node missed it.
+func TestApplicationVsApplicationSetCollisionSplitAcrossBlocks(t *testing.T) {
+	tree := parseHier(t, `
+applications {
+    application web {
+        protocol tcp;
+        destination-port 80;
+    }
+}
+applications {
+    application-set web {
+        application junos-https;
+    }
+}
+`)
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig: expected rejection of app/app-set collision split across applications blocks, got nil")
+	}
+	if !strings.Contains(err.Error(), "web") ||
+		!strings.Contains(err.Error(), "BOTH an application and an application-set") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
+// Duplicate application definition split across two `applications {}` blocks.
+func TestDuplicateApplicationDefinitionSplitAcrossBlocks(t *testing.T) {
+	tree := parseHier(t, `
+applications {
+    application dup {
+        protocol tcp;
+        destination-port 80;
+    }
+}
+applications {
+    application dup {
+        protocol udp;
+        destination-port 53;
+    }
+}
+`)
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig: expected rejection of duplicate application split across blocks, got nil")
+	}
+	if !strings.Contains(err.Error(), "application \"dup\"") ||
+		!strings.Contains(err.Error(), "defined 2 times") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
+// Duplicate application-set definition split across two `applications {}` blocks.
+func TestDuplicateApplicationSetDefinitionSplitAcrossBlocks(t *testing.T) {
+	tree := parseHier(t, `
+applications {
+    application a1 {
+        protocol tcp;
+        destination-port 80;
+    }
+    application-set dupset {
+        application a1;
+    }
+}
+applications {
+    application-set dupset {
+        application junos-http;
+    }
+}
+`)
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig: expected rejection of duplicate application-set split across blocks, got nil")
+	}
+	if !strings.Contains(err.Error(), "application-set \"dupset\"") ||
+		!strings.Contains(err.Error(), "defined 2 times") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
+// Two distinct `applications {}` blocks with non-colliding names commit cleanly
+// — the aggregation must not over-reject legitimately split definitions.
+func TestDistinctApplicationNamesSplitAcrossBlocksCommit(t *testing.T) {
+	tree := parseHier(t, `
+applications {
+    application web {
+        protocol tcp;
+        destination-port 80;
+    }
+}
+applications {
+    application ssh {
+        protocol tcp;
+        destination-port 22;
+    }
+    application-set webset {
+        application web;
+        application ssh;
+    }
+}
+`)
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: unexpected error on distinct names split across blocks: %v", err)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "#3339") {
+			t.Fatalf("unexpected #3339 collision warning on a valid split config: %q", w)
+		}
+	}
+}
+
 // Lenient path (load / peer-sync) must WARN, not brick: an already-persisted
 // colliding config still compiles, with the collision surfaced as a warning.
 func TestApplicationNameCollisionLenientWarns(t *testing.T) {

@@ -69,14 +69,20 @@ import (
 // group-expanded AST and rejects duplicate / cross-namespace application name
 // definitions. See the file-level comment for the doctrine.
 func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string, error) {
-	var appsNode *Node
+	// The compiler compiles EVERY top-level `applications` node (compiler.go's
+	// `for _, node := range tree.Children` switch hits `case "applications"`
+	// once per node), so a collision SPLIT across two sibling `applications {}`
+	// blocks (which a hierarchical parse emits as separate top-level nodes) is
+	// just as real as one inside a single block. Aggregate counts across ALL of
+	// them rather than stopping at the first — stopping at the first missed the
+	// exact #3339 bug for a split definition.
+	var appsNodes []*Node
 	for _, n := range nodes {
 		if n.Name() == "applications" {
-			appsNode = n
-			break
+			appsNodes = append(appsNodes, n)
 		}
 	}
-	if appsNode == nil {
+	if len(appsNodes) == 0 {
 		return nil, nil
 	}
 
@@ -90,25 +96,28 @@ func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string
 		return nil
 	}
 
-	// Count each name within its namespace. namedInstances enumerates every
-	// instance (it does NOT dedup), so a name authored twice yields count > 1.
+	// Count each name within its namespace across every `applications` block.
+	// namedInstances enumerates every instance (it does NOT dedup), so a name
+	// authored twice — in one block or split across blocks — yields count > 1.
 	appCounts := map[string]int{}
 	appOrder := []string{}
-	for _, inst := range namedInstances(appsNode.FindChildren("application")) {
-		if inst.name == "" {
-			continue
-		}
-		if appCounts[inst.name] == 0 {
-			appOrder = append(appOrder, inst.name)
-		}
-		appCounts[inst.name]++
-	}
 	setCounts := map[string]int{}
-	for _, inst := range namedInstances(appsNode.FindChildren("application-set")) {
-		if inst.name == "" {
-			continue
+	for _, appsNode := range appsNodes {
+		for _, inst := range namedInstances(appsNode.FindChildren("application")) {
+			if inst.name == "" {
+				continue
+			}
+			if appCounts[inst.name] == 0 {
+				appOrder = append(appOrder, inst.name)
+			}
+			appCounts[inst.name]++
 		}
-		setCounts[inst.name]++
+		for _, inst := range namedInstances(appsNode.FindChildren("application-set")) {
+			if inst.name == "" {
+				continue
+			}
+			setCounts[inst.name]++
+		}
 	}
 
 	// 1. Duplicate application definition (same name twice in the application
@@ -172,43 +181,54 @@ func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string
 	//    (M08). Two terms whose generated `<parent>-<term>` names collide make
 	//    the later overwrite the earlier in apps.Applications. Computed via the
 	//    SAME parseApplicationTerms the compiler uses so the detected names match
-	//    exactly what would be written. Applications iterated in first-seen order.
-	for _, inst := range namedInstances(appsNode.FindChildren("application")) {
-		appName := inst.name
-		if appName == "" {
-			continue
-		}
-		seen := map[string]bool{}
-		var dupReported = map[string]bool{}
-		for _, prop := range inst.node.Children {
-			if prop.Name() != "term" || len(prop.Keys) < 2 {
+	//    exactly what would be written. The seen/reported sets are keyed by
+	//    application NAME (not per AST node) so a name whose terms are split
+	//    across two `applications` blocks is still caught. Applications iterated
+	//    in first-seen order.
+	termSeen := map[string]map[string]bool{}
+	termDupReported := map[string]map[string]bool{}
+	for _, appsNode := range appsNodes {
+		for _, inst := range namedInstances(appsNode.FindChildren("application")) {
+			appName := inst.name
+			if appName == "" {
 				continue
 			}
-			// Reassemble the term tokens across both AST shapes, mirroring
-			// compileApplications: hierarchical packs values in prop.Keys, flat
-			// set splits them across prop.Keys and prop.Children.
-			allKeys := append([]string(nil), prop.Keys[1:]...)
-			for _, c := range prop.Children {
-				allKeys = append(allKeys, c.Keys...)
+			if termSeen[appName] == nil {
+				termSeen[appName] = map[string]bool{}
+				termDupReported[appName] = map[string]bool{}
 			}
-			for _, t := range parseApplicationTerms(appName, allKeys) {
-				if seen[t.Name] {
-					if !dupReported[t.Name] {
-						dupReported[t.Name] = true
-						if err := emit(
-							"applications application %q has terms that generate "+
-								"the duplicate application name %q — the later term "+
-								"silently overwrites the earlier (with no commit "+
-								"error) while the implicit set still lists the "+
-								"duplicate member; give the terms distinct names "+
-								"(#3339)",
-							appName, t.Name); err != nil {
-							return nil, err
-						}
-					}
+			seen := termSeen[appName]
+			dupReported := termDupReported[appName]
+			for _, prop := range inst.node.Children {
+				if prop.Name() != "term" || len(prop.Keys) < 2 {
 					continue
 				}
-				seen[t.Name] = true
+				// Reassemble the term tokens across both AST shapes, mirroring
+				// compileApplications: hierarchical packs values in prop.Keys,
+				// flat set splits them across prop.Keys and prop.Children.
+				allKeys := append([]string(nil), prop.Keys[1:]...)
+				for _, c := range prop.Children {
+					allKeys = append(allKeys, c.Keys...)
+				}
+				for _, t := range parseApplicationTerms(appName, allKeys) {
+					if seen[t.Name] {
+						if !dupReported[t.Name] {
+							dupReported[t.Name] = true
+							if err := emit(
+								"applications application %q has terms that generate "+
+									"the duplicate application name %q — the later term "+
+									"silently overwrites the earlier (with no commit "+
+									"error) while the implicit set still lists the "+
+									"duplicate member; give the terms distinct names "+
+									"(#3339)",
+								appName, t.Name); err != nil {
+								return nil, err
+							}
+						}
+						continue
+					}
+					seen[t.Name] = true
+				}
 			}
 		}
 	}

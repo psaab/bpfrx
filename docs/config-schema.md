@@ -2203,7 +2203,11 @@ the group-expanded, inactive-pruned tree in `compileExpanded` (alongside
 `validateUnsupportedInterfaceStanzasAST`), NOT a post-compile check on the typed
 `*Config`: by the time the maps are built the colliding definitions have already
 been merged away by last-write-wins — only the raw AST still carries every
-definition. The predefined `junos-*` table lives outside the AST, so a user
+definition. It aggregates counts across EVERY top-level `applications {}` node (a
+hierarchical parse can emit several sibling blocks and `compileExpanded` compiles
+all of them), so a collision SPLIT across two `applications {}` blocks is caught
+just like one inside a single block — the walk must not stop at the first node.
+The predefined `junos-*` table lives outside the AST, so a user
 `application junos-http` that merely SHADOWS a predefined application is not a
 collision (one AST stanza, no peer) and is left untouched; a multi-term
 application minting an implicit set under its own name is likewise not a
