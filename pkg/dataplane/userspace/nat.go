@@ -376,13 +376,14 @@ func natAppProtoNumber(proto string) uint16 {
 }
 
 // buildSourceNATAppTerms resolves a source-NAT `match application <name>` into
-// (protocol, destination-port range) terms for the dataplane match (#3429). A
-// single user/predefined application yields one term; an application-set yields
-// one term per resolved member. The empty name (or "any") is unconstrained and
-// yields no terms. A term's Ports are the application's destination-port spec
-// coalesced to ranges; an application with no destination port leaves Ports
-// empty (protocol-only match). A configured-but-unresolvable reference yields a
-// single never-match term so the rule fails closed (see natProtoNever).
+// (protocol, destination-port range, source-port range) terms for the dataplane
+// match (#3429, #3491). A single user/predefined application yields one term; an
+// application-set yields one term per resolved member. The empty name (or "any")
+// is unconstrained and yields no terms. A term's Ports are the application's
+// destination-port spec coalesced to ranges and SrcPorts its source-port spec;
+// an application with no destination (resp. source) port leaves that axis empty
+// (unconstrained on it). A configured-but-unresolvable reference yields a single
+// never-match term so the rule fails closed (see natProtoNever).
 func buildSourceNATAppTerms(cfg *config.Config, appName string) []NatAppTermWire {
 	if cfg == nil || appName == "" || appName == "any" {
 		return nil
@@ -402,9 +403,20 @@ func buildSourceNATAppTerms(cfg *config.Config, appName string) []NatAppTermWire
 			// (a legitimate protocol-only match).
 			ports = []NatPortRangeWire{natNeverMatchPortRange}
 		}
+		// #3491: the application's source-port constraint, dropped before this
+		// fix. Same fail-CLOSED guard as the destination-port axis: an app that
+		// configured a source-port but coalesces to nothing (all out of
+		// 1..65535) gets the never-match sentinel rather than widening to any
+		// source port. An app with NO source-port keeps SrcPorts empty (a
+		// legitimate source-port-unconstrained match — the common case).
+		srcPorts := coalescePortRanges(appPortsFromSpec(a.SourcePort))
+		if a.SourcePort != "" && len(srcPorts) == 0 {
+			srcPorts = []NatPortRangeWire{natNeverMatchPortRange}
+		}
 		terms = append(terms, NatAppTermWire{
 			Protocol: natAppProtoNumber(a.Protocol),
 			Ports:    ports,
+			SrcPorts: srcPorts,
 		})
 	}
 	if app, found := config.ResolveApplication(appName, userApps); found {
