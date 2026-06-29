@@ -235,8 +235,13 @@ simulator too. Only the literal `application any` token is match-any), honors bo
 source-port and destination-port terms
 (a destination-port-constrained term fails closed on an OMITTED query
 destination port, #3330 — mirroring the runtime keying exact_dst_ports/range
-terms on the concrete packet port; an omitted SOURCE port stays unconstrained
-per #3107's diagnostic stance), and
+terms on the concrete packet port; a SOURCE-port-constrained term likewise
+fails closed on an OMITTED query source port, #3415 — the runtime always
+carries a concrete source port and gates the app on it
+(`appid.matchTuple`/`policy.rs CompiledApplications.matches`), so certifying a
+permit for an omitted source port over-matches vs the runtime. This supersedes
+#3107's earlier "omitted source port stays unconstrained" diagnostic stance;
+an unconstrained source-port term still matches any source port), and
 enforces ICMP/ICMPv6 type/code constraints (#3284, junos-ping = type 8,
 junos-pingv6 = type 128) from `Query.ICMPType` / `Query.ICMPCode`. A
 type-constrained application term matches only when the query's type is known

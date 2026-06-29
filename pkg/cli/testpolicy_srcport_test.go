@@ -48,18 +48,24 @@ security {
 	return &CLI{store: store}
 }
 
-// TestTestPolicySourcePort asserts the #3107 contract for the local CLI `test
-// policy` surface: a source-port token threads into policymatch.Query.SrcPort,
-// so the verdict reflects a source-port-constrained policy.
+// TestTestPolicySourcePort asserts the #3107 source-port plumbing AND the #3415
+// fail-closed semantics for the local CLI `test policy` surface: a source-port
+// token threads into policymatch.Query.SrcPort, so the verdict reflects a
+// source-port-constrained policy.
 //
 //   - correct source-port 5000 (and dest 80) -> Policy match (permit)
 //   - wrong source-port 6000                  -> Default deny
-//   - absent source-port                      -> unspecified (matches, the
-//     pre-#3107 behavior is preserved when no source-port is given)
+//   - absent source-port                      -> Default deny (#3415): an
+//     omitted query source port fails closed against a source-port-constrained
+//     app, since the runtime always carries a concrete source port and would
+//     not match a packet whose source port differs from the app's `source-port`
+//     (supersedes #3107's earlier "absent matches" stance).
 //
 // FAIL-ON-REVERT: dropping the source-port parsing / the SrcPort field on the
 // Query makes SrcPort always 0 ("any port"), so the wrong-port case would
-// PERMIT (overmatch) and "wrong src port" flips red.
+// PERMIT (overmatch) and "wrong src port" flips red. Restoring the
+// `&& srcPort > 0` wildcard gate makes "absent src port" PERMIT again, flipping
+// that case red.
 func TestTestPolicySourcePort(t *testing.T) {
 	c := newSrcPortPolicyCLI(t)
 
@@ -81,7 +87,7 @@ func TestTestPolicySourcePort(t *testing.T) {
 		{
 			"absent src port",
 			[]string{"from-zone", "trust", "to-zone", "untrust", "protocol", "tcp", "destination-port", "80"},
-			true,
+			false,
 		},
 	}
 	for _, tc := range cases {
