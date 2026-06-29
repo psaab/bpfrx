@@ -1,0 +1,127 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+// Tests for #3444: a destination-NAT rule-set `to` scope. Junos DNAT
+// rule-sets have only a `from` clause — the destination is translated on
+// inbound, so there is no egress context. xpf briefly advertised a `to`
+// scope under `security nat destination rule-set` and Cartesian-expanded it
+// onto each NATRuleSet, but the userspace snapshot builder and the Rust DNAT
+// runtime model ONLY the `from` clause, so the `to` scope was silently
+// dropped and the translation applied regardless of it. The fix rejects a
+// DNAT `to` scope at strict commit (validateDNATRuleSetToScopeAST) and warns
+// (does not fail) on the tolerant load / peer-sync path (#1960), and stops
+// the compiler from stamping a phantom To* onto the typed NATRuleSet.
+//
+// Flat-set syntax MUST be built with ParseSetCommand/SetPath, never
+// NewParser (the parser merges newline-separated set lines into one giant
+// node).
+
+func buildDNATToTree(t *testing.T, scope string) *ConfigTree {
+	t.Helper()
+	return buildNATScopeTree(t,
+		"set security nat destination pool P1 address 10.0.30.100",
+		"set security nat destination rule-set RD from zone untrust",
+		"set security nat destination rule-set RD "+scope,
+		"set security nat destination rule-set RD rule R1 match destination-address 198.51.100.5/32",
+		"set security nat destination rule-set RD rule R1 then destination-nat pool P1",
+	)
+}
+
+// TestDNATRuleSetToScopeRejectedAtCommit proves the strict commit path hard-
+// rejects a DNAT rule-set `to` scope for every scope kind (zone | interface |
+// routing-instance). Reverting the gate (validateDNATRuleSetToScopeAST) makes
+// CompileConfig accept the config and these assertions go RED.
+func TestDNATRuleSetToScopeRejectedAtCommit(t *testing.T) {
+	cases := []struct {
+		name  string
+		scope string
+	}{
+		{"to zone", "to zone trust"},
+		{"to interface", "to interface ge-0/0/1.0"},
+		{"to routing-instance", "to routing-instance red"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := buildDNATToTree(t, tc.scope)
+			_, err := CompileConfig(tree)
+			if err == nil {
+				t.Fatalf("CompileConfig accepted a DNAT rule-set %q scope; want a strict reject", tc.scope)
+			}
+			// The error must name the offending rule-set so the operator can
+			// find it, and cite the issue tag.
+			if !strings.Contains(err.Error(), "RD") || !strings.Contains(err.Error(), "#3444") {
+				t.Fatalf("reject error %q does not name the rule-set (RD) and #3444", err.Error())
+			}
+			if !strings.Contains(err.Error(), "destination") || !strings.Contains(err.Error(), "to") {
+				t.Fatalf("reject error %q does not identify a destination-NAT `to` scope", err.Error())
+			}
+		})
+	}
+}
+
+// TestDNATRuleSetToScopeLenientWarns proves the tolerant load / peer-sync path
+// (CompileConfigLenient) does NOT hard-fail on a DNAT `to` scope (so an
+// already-persisted config still boots, #1960), emits a warning, and the
+// rule-set still compiles with NO phantom To* stamped on the typed NATRuleSet
+// (the `to` scope was never enforceable for DNAT).
+func TestDNATRuleSetToScopeLenientWarns(t *testing.T) {
+	tree := buildDNATToTree(t, "to zone trust")
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient hard-failed on a DNAT `to` scope: %v", err)
+	}
+	var found bool
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "#3444") && strings.Contains(w, "RD") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("CompileConfigLenient emitted no #3444 DNAT `to` warning; warnings=%v", cfg.Warnings)
+	}
+	if cfg.Security.NAT.Destination == nil || len(cfg.Security.NAT.Destination.RuleSets) != 1 {
+		t.Fatalf("destination rule-set did not compile under lenient load")
+	}
+	rs := cfg.Security.NAT.Destination.RuleSets[0]
+	if rs.FromZone != "untrust" {
+		t.Fatalf("FromZone = %q, want untrust (the `from` scope must survive)", rs.FromZone)
+	}
+	// The `to` scope must NOT be carried onto the typed config — it is not
+	// enforceable for DNAT and would be a silent lie.
+	if rs.ToZone != "" || rs.ToInterface != "" || rs.ToRoutingInstance != "" {
+		t.Fatalf("DNAT rule-set carried a phantom To* scope: %+v", rs)
+	}
+}
+
+// TestDNATRuleSetFromOnlyStillCommits proves the no-regression case: a DNAT
+// rule-set with only a `from` clause (the legitimate Junos shape) commits
+// cleanly with no #3444 warning and the `from` scope survives.
+func TestDNATRuleSetFromOnlyStillCommits(t *testing.T) {
+	tree := buildNATScopeTree(t,
+		"set security nat destination pool P1 address 10.0.30.100",
+		"set security nat destination rule-set RD from zone untrust",
+		"set security nat destination rule-set RD rule R1 match destination-address 198.51.100.5/32",
+		"set security nat destination rule-set RD rule R1 then destination-nat pool P1",
+	)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig rejected a from-only DNAT rule-set: %v", err)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "#3444") {
+			t.Fatalf("unexpected #3444 warning on a from-only DNAT rule-set: %q", w)
+		}
+	}
+	if cfg.Security.NAT.Destination == nil || len(cfg.Security.NAT.Destination.RuleSets) != 1 {
+		t.Fatalf("from-only DNAT rule-set did not compile")
+	}
+	rs := cfg.Security.NAT.Destination.RuleSets[0]
+	if rs.FromZone != "untrust" {
+		t.Fatalf("FromZone = %q, want untrust", rs.FromZone)
+	}
+}

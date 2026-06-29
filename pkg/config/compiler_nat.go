@@ -1452,9 +1452,15 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 
 	// Parse rule-sets
 	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
-		// #3096: capture from/to scope across zone | interface |
+		// #3096: capture the `from` scope across zone | interface |
 		// routing-instance (bracket lists produce multiple scopes).
-		fromScopes, toScopes := collectNATScopes(rsInst.node, true)
+		// #3444: a destination-NAT rule-set has only a `from` clause — DNAT
+		// translates the destination on inbound, so there is no egress
+		// context. A `to` scope is rejected at strict commit
+		// (validateDNATRuleSetToScopeAST); it is NOT collected here so it
+		// can never be stamped onto a NATRuleSet (the snapshot builder and
+		// the Rust DNAT runtime model only the `from` clause).
+		fromScopes, _ := collectNATScopes(rsInst.node, false)
 
 		var rules []*NATRule
 		for _, ruleInst := range namedInstances(rsInst.node.FindChildren("rule")) {
@@ -1547,17 +1553,14 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 			rules = append(rules, rule)
 		}
 
-		// Expand Cartesian product of from-scopes × to-scopes (#3096).
+		// Expand per from-scope (#3096). DNAT carries no `to` scope (#3444).
 		for _, fs := range fromScopes {
-			for _, ts := range toScopes {
-				rs := &NATRuleSet{
-					Name:  rsInst.name,
-					Rules: rules,
-				}
-				applyNATFromScope(rs, fs)
-				applyNATToScope(rs, ts)
-				sec.NAT.Destination.RuleSets = append(sec.NAT.Destination.RuleSets, rs)
+			rs := &NATRuleSet{
+				Name:  rsInst.name,
+				Rules: rules,
 			}
+			applyNATFromScope(rs, fs)
+			sec.NAT.Destination.RuleSets = append(sec.NAT.Destination.RuleSets, rs)
 		}
 	}
 	return nil
