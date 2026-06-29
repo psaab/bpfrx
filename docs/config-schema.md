@@ -2354,6 +2354,64 @@ definition, duplicate term-generated name, distinct-names-commit incl. a
 predefined shadow, lenient-warns). Compiler-side only — not a typed `setSchema`
 leaf (applications stay opaque to `SchemaValidate`).
 
+### #3348 — custom `protocol junos-ping` echo constraint + `icmp-type`/`icmp-code` grammar
+
+A **user-defined** application that set `protocol junos-ping` (or `junos-pingv6`)
+lowered to bare ICMP with NO type constraint, so the projected policy term matched
+**every** ICMP type — silently widening any policy referencing it (a permit term
+then admitted unreachable / redirect / timestamp / ... not just echo), and broader
+than the predefined `junos-ping` object which carries `ICMPType=8` (the #3020 fix).
+`appid.ProtocolNumber` and the capability snapshot (`capabilities.go`) folded the
+alias to ICMP and carried `app.ICMPType`, which was `nil` for the custom-app path.
+
+- **alias echo constraint** — `aliasEchoICMPType` (`compiler_applications.go`)
+  maps `junos-ping`→type 8, `junos-pingv6`→type 128. `compileApplications`
+  applies it AFTER the child loop (so an explicit `icmp-type` leaf wins), and
+  `parseApplicationTerms` applies it per normalized protocol inside an inline
+  `term` (capturing the echo type before `normalizeProtocol` folds the alias to
+  `icmp`/`icmpv6`). The all-ICMP aliases (`junos-icmp-all`/`junos-icmp6-all`)
+  return `nil` so they stay match-ALL.
+- **typed grammar** — `schemaApplications.application` gains `icmp-type` and
+  `icmp-code` `ValueInteger` leaves (`ValidateInteger(0,255)`), so an operator can
+  author a constrained custom echo / traceroute / ICMP-control app. The compiler
+  parses them on both the top-level and inline-`term` paths into
+  `Application.ICMPType`/`ICMPCode`.
+- **strict guards** — `validateApplicationSpecsStrict` rejects an
+  `icmp-type`/`icmp-code` on a NON-ICMP protocol (a never-match term — the same
+  fail-open/fail-closed hazard as the #3373 port-on-non-port gate) via
+  `protocolIsICMPFamily`, and rejects an `icmp-code` without an `icmp-type` (an
+  ambiguous half-constraint the matcher would apply code-only). Both downgrade to
+  a `cfg.Warnings` entry on the tolerant load / HA peer-sync path
+  (`lenientApplicationSpecs`, #1960 no-brick).
+
+Two inline-`term` edge cases (the term shape is opaque to `SchemaValidate`, so
+both are handled in `parseApplicationTerms` + the deferred strict gate):
+
+- **widening inversion** — a term that lists BOTH a junos-ping alias AND an
+  unconstrained ICMP alias (`term t { protocol junos-ping; protocol
+  junos-icmp-all; }`) normalizes both to `icmp` and DEDUPS to one term. The
+  union of echo + all-ICMP is all-ICMP (the Rust matcher ORs separate app
+  terms), so applying the echo type to the collapsed term would spuriously
+  NARROW it. `unconstrainedICMP[proto]` records that an all-ICMP alias landed on
+  the normalized protocol and SUPPRESSES the `echoByProto` default for it — the
+  collapsed term stays unconstrained.
+- **fail-open malformed inline icmp-type/code** — a bad inline `icmp-type`
+  (`term t { protocol icmp; icmp-type 999; }`) is NOT seen by the schema range
+  check (opaque term), so silently dropping it would leave the term matching
+  every ICMP type. `parseApplicationTerms` records the raw token on
+  `Application.UnknownICMP` (mirroring `UnknownTimeouts`) and the strict gate
+  rejects the first one at commit (lenient-warn on load/peer-sync). The
+  top-level path also records `UnknownICMP` so the malformed value is caught on
+  the tolerant load path (which does not run `SchemaValidate`).
+
+No wire/Rust change: the snapshot already carries `ICMPType`/`ICMPCode` and the
+matcher already enforces `icmp_constraints` (#3020). Regression coverage:
+`pkg/config/compiler_application_junos_ping_3348_test.go` (alias echo type top-level
++ inline term, all-ICMP stays unconstrained, explicit grammar, explicit-over-alias,
+both strict guards) and the end-to-end matcher test
+`pkg/policymatch/app_junos_ping_3348_test.go` (custom `protocol junos-ping` permits
+type 8, denies 13/5).
+
 ### #2226 — rib-group `import-rib` undefined-reference validation
 
 `routing-options rib-groups <group> import-rib <rib>` was unvalidated: an

@@ -1,3 +1,88 @@
+## 2026-06-29 — #3348 (PR #3506 review fold) inline-term edge cases
+
+- **Timestamp**: 2026-06-29
+- **Action**: Codex MERGE-NEEDS-MAJOR on PR #3506 — top-level junos-ping
+  fix correct, two inline-term edge cases folded. (1) Widening inversion:
+  a term listing BOTH junos-ping AND an all-ICMP alias normalizes both to
+  "icmp" and dedups to one term; applying echoByProto narrowed the union
+  to echo-only. Added unconstrainedICMP[proto] tracking — an all-ICMP
+  alias (icmp/icmpv6/junos-icmp-all/junos-icmp6-all) on a normalized proto
+  suppresses the echo default for that proto. (2) Fail-open: a malformed
+  inline-term icmp-type (e.g. 999) was silently dropped (term opaque to
+  schema) → unconstrained all-ICMP. Added Application.UnknownICMP
+  (mirroring UnknownTimeouts), recorded in both inline-term and top-level
+  parse, rejected by validateApplicationSpecsStrict at commit /
+  downgraded to warning on the lenient load/peer-sync path. RED-on-revert
+  tests added for both. go test config/appid/policymatch green; gofmt +
+  vet clean. Rebased on origin/master (clean, no #3332 overlap).
+- **File(s)**: pkg/config/compiler_applications.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/types_security.go,
+  pkg/config/compiler_application_junos_ping_3348_test.go,
+  pkg/config/README.md, docs/config-schema.md
+
+## 2026-06-29 — #3348 custom protocol junos-ping echo constraint + icmp-type/icmp-code grammar
+
+- **Timestamp**: 2026-06-29
+- **Action**: A user-defined application with `protocol junos-ping` /
+  `junos-pingv6` lowered to bare ICMP with no type constraint, so the
+  projected policy term matched EVERY ICMP type (security widening — a
+  permit term admitted unreachable/redirect/timestamp, not just echo),
+  broader than the predefined junos-ping object (ICMPType=8, #3020). Added
+  `aliasEchoICMPType` to attach echo type 8/128 on both the top-level and
+  inline-term application paths (after the child loop so an explicit
+  icmp-type wins; all-ICMP aliases stay unconstrained). Also added the
+  missing `icmp-type`/`icmp-code` typed-integer (0..255) schema leaves so
+  an operator can author a constrained custom echo/traceroute/ICMP-control
+  app, wired through to Application.ICMPType/ICMPCode on both paths. Added
+  strict guards (validateApplicationSpecsStrict + protocolIsICMPFamily):
+  reject icmp-type/code on a non-ICMP protocol (never-match term, #3373
+  hazard) and icmp-code without icmp-type; both downgrade to a warning on
+  the lenient load/peer-sync path (#1960). No wire/Rust change — the
+  snapshot already carries the constraint and the matcher already enforces
+  it (#3020).
+- **File(s)**: pkg/config/compiler_applications.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/schema_security.go,
+  pkg/config/compiler_application_junos_ping_3348_test.go,
+  pkg/policymatch/app_junos_ping_3348_test.go,
+  pkg/policymatch/icmp_test.go (stale-comment fix), pkg/config/README.md,
+  docs/config-schema.md
+## 2026-06-29 — #3296 undefined interface/lo0 filter reference fail-open
+
+- **Timestamp**: 2026-06-29
+- **Action**: Promote an undefined interface/lo0 firewall filter reference
+  from a commit WARNING to a strict commit error + add a fail-closed
+  dataplane backstop. Before: `interfaces <if> unit <n> family inet|inet6
+  filter input|output <name>` (and lo0 input) naming a filter not defined
+  under `firewall family ... filter` was warn-only at commit, and the Rust
+  snapshot compiler left the per-interface fast-path map (and output
+  needs_tx_eval set) empty for the missing key → hot path returned the
+  default Accept → hook silently disarmed (fail-OPEN on a typo'd security
+  hook). Go: new `validateFirewallFilterReferencesStrict`
+  (compiler_validate_strict.go), wired at the firewall-gate cluster
+  (compiler.go) gated on `opts.lenientFirewallRefs` — strict on commit,
+  downgraded-warn on lenient/peer-sync (#1960). Deleted the superseded
+  warn-only interface filter-reference loop in compiler_validate_warn.go
+  (avoids a duplicate warning on the lenient path). lo0 is covered for free
+  (stored as cfg.Interfaces.Interfaces["lo0"]). Rust: new
+  `SnapshotIntegrityError::MissingFilterRef` raised by `parse_filter_state`
+  (filter/compiler.rs) on a named-but-missing interface/lo0 ref —
+  preflight reject preserves prior good state, never falls open to Accept.
+  Mirrors the policer (#2217) / prefix-list (#2506) strict-reference
+  precedent and the #2505 snapshot-integrity backstop doctrine.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_filter_ref_3296_test.go (new),
+  pkg/config/compiler_interfaces_unsupported_test.go,
+  pkg/config/parser_ast_test.go, pkg/config/parser_services_test.go,
+  userspace-dp/src/policy.rs, userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md
+- **Validation**: `go test ./pkg/config/...` green (8 new + 5 fixed
+  pre-existing tests that referenced undefined filters); `cargo build`
+  green; new Rust tests `missing_filter_ref_3296_*` /
+  `defined_filter_ref_3296_compiles_cleanly` pass; full Rust suite 3223
+  pass / 2 pre-existing flakes (event_stream/worker_queue, confirmed
+  failing on pristine origin/master, unrelated to filters).
+
 ## 2026-06-28 — #3499 compiler_iface nil zone/interface map-value guards
 
 - **Timestamp**: 2026-06-28

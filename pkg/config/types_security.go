@@ -649,6 +649,17 @@ type Application struct {
 	// zero default, silently falling the application back to the global
 	// per-protocol timeout instead of the configured one (#3320).
 	UnknownTimeouts []string
+	// UnknownICMP records the raw `icmp-type` / `icmp-code` tokens (top-level or
+	// inline-term) that did NOT parse to a valid integer in 0..255. The schema
+	// range-validates the TOP-LEVEL leaves at commit-check, but the inline
+	// `term` is opaque to the schema walk (children:nil), so a malformed inline
+	// `icmp-type` would otherwise be silently dropped by parseICMPTypeCode —
+	// leaving the term UNCONSTRAINED, i.e. matching every ICMP type (a fail-open
+	// widening, the inverse of the #3348 fix). Mirroring UnknownTimeouts, the
+	// offending raw token is recorded here and the deferred gate
+	// (validateApplicationSpecsStrict) hard-rejects it on the strict commit path
+	// / warns on the lenient load / peer-sync path (#3348).
+	UnknownICMP []string
 }
 
 // IPsecConfig holds IPsec VPN configuration.

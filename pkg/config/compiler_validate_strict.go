@@ -1653,6 +1653,108 @@ func validateFirewallRoutingInstanceReferencesStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFirewallFilterReferencesStrict hard-rejects an interface/unit (and
+// lo0) `family inet|inet6 filter input|output <name>` reference that names a
+// filter not defined under `firewall family inet|inet6 filter <name>` (#3296).
+//
+// A dangling filter reference compiled cleanly: ValidateConfig only WARNED
+// (`compiler_validate_warn.go`, "filter input %q not defined"), and at runtime
+// the userspace filter compiler left the per-interface fast-path map with NO
+// entry for the missing key, so the hot path returned the default
+// FilterResult — Accept. The security hook was silently disarmed,
+// indistinguishable from "no filter configured": a fail-OPEN on a typo'd
+// firewall hook (e.g. `filter input WAN-BLOCK` where the defined filter is
+// `WAN_BLOCK`). This gate makes the typo an operator-visible commit error,
+// consistent with the policer / prefix-list / routing-instance reference
+// gates above.
+//
+// lo0 input/output references are covered for free: lo0 is stored as an
+// ordinary interface under `cfg.Interfaces.Interfaces["lo0"]`
+// (compiler.go:1819), so the interface walk validates the lo0 host-bound
+// filter hooks too.
+//
+// Interfaces are walked in sorted name order, then by ascending unit number,
+// then in a fixed direction order (input-v4, input-v6, output-v4, output-v6),
+// so the first-reported error is deterministic across runs (Go map order is
+// randomized).
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientFirewallRefs) so an already-persisted or peer-synced
+// config carrying the typo still BOOTS (#1960 fail-closed-on-load class); the
+// userspace helper's own snapshot-integrity backstop then refuses to publish a
+// snapshot whose interface references an undefined filter (preserving the
+// prior good state rather than degrading the hook to Accept). Commit /
+// commit-check stay strict. Mirrors validateFirewallPolicerReferencesStrict.
+func validateFirewallFilterReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	inetDefined := func(name string) bool {
+		if cfg.Firewall.FiltersInet == nil {
+			return false
+		}
+		_, ok := cfg.Firewall.FiltersInet[name]
+		return ok
+	}
+	inet6Defined := func(name string) bool {
+		if cfg.Firewall.FiltersInet6 == nil {
+			return false
+		}
+		_, ok := cfg.Firewall.FiltersInet6[name]
+		return ok
+	}
+
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, name)
+	}
+	sort.Strings(ifNames)
+
+	for _, ifName := range ifNames {
+		ifc := cfg.Interfaces.Interfaces[ifName]
+		if ifc == nil { // tolerant/HA-sync path may carry a nil interface (#3494)
+			continue
+		}
+		unitNums := make([]int, 0, len(ifc.Units))
+		for unitNum := range ifc.Units {
+			unitNums = append(unitNums, unitNum)
+		}
+		sort.Ints(unitNums)
+		for _, unitNum := range unitNums {
+			unit := ifc.Units[unitNum]
+			if unit == nil { // tolerant/HA-sync path may carry a nil unit (#3494)
+				continue
+			}
+			// Fixed direction order for a deterministic first error.
+			type ref struct {
+				name      string
+				family    string
+				direction string
+				defined   func(string) bool
+			}
+			for _, r := range []ref{
+				{unit.FilterInputV4, "inet", "input", inetDefined},
+				{unit.FilterInputV6, "inet6", "input", inet6Defined},
+				{unit.FilterOutputV4, "inet", "output", inetDefined},
+				{unit.FilterOutputV6, "inet6", "output", inet6Defined},
+			} {
+				if r.name == "" || r.defined(r.name) {
+					continue
+				}
+				return fmt.Errorf(
+					"interface %s unit %d family %s filter %s references "+
+						"undefined filter %q (define `firewall family %s "+
+						"filter %s` or fix the name — the security hook would "+
+						"otherwise be silently disarmed and the interface would "+
+						"forward unfiltered, a fail-open on a firewall filter)",
+					ifName, unitNum, r.family, r.direction, r.name,
+					r.family, r.name)
+			}
+		}
+	}
+	return nil
+}
+
 // validateApplicationSetMembersStrict hard-rejects an `applications
 // application-set <set>` (Finding B, #2217) whose member references neither a
 // defined application (user-defined or junos-* predefined), nor a defined
@@ -3234,6 +3336,56 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 					"configured one)",
 				name, app.UnknownTimeouts[0], appTimeoutMin, appTimeoutMax)
 		}
+		// #3348: a malformed icmp-type / icmp-code (non-integer or outside
+		// 0..255). The schema range-validates the TOP-LEVEL application leaves at
+		// commit-check, but an inline `term` is opaque to the schema walk
+		// (children:nil), so a bad inline icmp-type would otherwise be silently
+		// dropped by parseICMPTypeCode — leaving the term UNCONSTRAINED (matching
+		// EVERY ICMP type), a fail-open widening that is the exact inverse of this
+		// issue's fix. compileApplications records the raw token in app.UnknownICMP
+		// (mirroring UnknownTimeouts); reject the first one here so the silent
+		// widening becomes an operator-visible commit error. Strict on the
+		// commit / commit-check path; the call site (compiler.go,
+		// lenientApplicationSpecs) downgrades it to a warning on the tolerant
+		// load / peer-sync path (#1960 no-brick).
+		if len(app.UnknownICMP) > 0 {
+			return fmt.Errorf(
+				"application %q: invalid icmp-type/icmp-code %q; must be an integer "+
+					"in 0..255 (a non-numeric or out-of-range value is silently dropped "+
+					"and leaves the application matching EVERY ICMP type instead of the "+
+					"intended one)",
+				name, app.UnknownICMP[0])
+		}
+		// #3348: an icmp-type/icmp-code constraint is only meaningful on an
+		// ICMP/ICMPv6 protocol. The userspace matcher keys icmp_constraints
+		// under the ICMP protocol number (userspace-dp policy.rs), and the
+		// pkg/policymatch simulator only consults app.ICMPType when the query
+		// protocol is ICMP/ICMPv6 — so a type/code on tcp/udp/gre/... compiles a
+		// term that can never match (fail-open for a deny rule, fail-closed for a
+		// permit rule), the same #3373 hazard as a port on a non-port protocol.
+		// Junos couples icmp-type/code to an ICMP application, so reject at COMMIT
+		// (strict-at-commit / #1960 fail-closed). The call site downgrades to a
+		// warning on the tolerant load / peer-sync path.
+		if (app.ICMPType != nil || app.ICMPCode != nil) && !protocolIsICMPFamily(app.Protocol) {
+			return fmt.Errorf(
+				"application %q: icmp-type/icmp-code is set on protocol %q, which is "+
+					"not an ICMP protocol; an ICMP type/code constraint is valid only on "+
+					"icmp/icmpv6 (or the junos-ping/junos-pingv6/junos-icmp-all aliases, "+
+					"or protocol number 1/58) — on any other protocol the term can never "+
+					"match (remove the constraint or change the protocol)",
+				name, app.Protocol)
+		}
+		// A code with no type leaves the matcher constraining the code while
+		// ignoring the type (pkg/policymatch matchSingleApp checks ICMPCode
+		// independently of ICMPType), an ambiguous half-constraint Junos does not
+		// allow. Require a type whenever a code is set.
+		if app.ICMPCode != nil && app.ICMPType == nil {
+			return fmt.Errorf(
+				"application %q: icmp-code is set without icmp-type; an ICMP code is "+
+					"meaningful only together with a type (set icmp-type as well, or "+
+					"remove icmp-code)",
+				name)
+		}
 	}
 	return nil
 }
@@ -4241,6 +4393,25 @@ func protocolIsPortBearing(token string) bool {
 		// ports (ip_proto.rs has_l4_ports).
 		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil {
 			return n == 6 || n == 17
+		}
+		return false
+	}
+}
+
+// protocolIsICMPFamily reports whether a protocol token names ICMP or ICMPv6 —
+// the only protocols on which an application `icmp-type`/`icmp-code` constraint
+// is enforceable (#3348). It recognizes the canonical names, the junos-*
+// aliases that resolve to ICMP/ICMPv6 (including junos-ping/junos-pingv6, which
+// carry an implicit echo type), and the numeric protocol numbers 1 (ICMP) and
+// 58 (ICMPv6). The set mirrors the ICMP arm of filterProtocolResolvable.
+func protocolIsICMPFamily(token string) bool {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "icmp", "junos-icmp-all", "junos-ping",
+		"icmpv6", "icmp6", "junos-icmp6-all", "junos-pingv6":
+		return true
+	default:
+		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil {
+			return n == 1 || n == 58
 		}
 		return false
 	}

@@ -2897,6 +2897,29 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3296: interface/unit (and lo0) `family inet|inet6 filter input|output
+	// <name>` cross-reference. A filter hook naming a filter not defined under
+	// `firewall family inet|inet6 filter` compiled cleanly with only a
+	// warning, and the userspace filter compiler left the per-interface
+	// fast-path map empty for the missing key, so the hot path returned the
+	// default Accept — the security hook was silently disarmed and the
+	// interface forwarded unfiltered (a fail-OPEN on a typo'd firewall hook).
+	// Strict on commit / commit-check (hard reject so the typo is operator-
+	// visible); lenient on load / peer-sync (warn so an already-persisted or
+	// peer-synced config still boots — #1960; the helper's snapshot-integrity
+	// backstop then refuses to publish a snapshot whose interface references an
+	// undefined filter, preserving prior good state rather than degrading the
+	// hook to Accept). Supersedes the warn-only interface filter-reference loop
+	// in ValidateConfig. Mirrors validateFirewallPrefixListReferencesStrict.
+	if err := validateFirewallFilterReferencesStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2461: per-flow-server NetFlow v9 / IPFIX template cross-reference. A
 	// flow-server `version9 { template <name> }` / `version-ipfix { template
 	// <name> }` (or the flat `version9-template` / `version-ipfix-template`)
