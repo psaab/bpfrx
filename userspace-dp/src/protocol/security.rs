@@ -245,6 +245,33 @@ pub(crate) struct FirewallTermSnapshot {
     pub icmp_types: Vec<u8>,
     #[serde(rename = "icmp_codes", default)]
     pub icmp_codes: Vec<u8>,
+    // icmp_type_unrepresentable / icmp_code_unrepresentable (#3406) are set by the
+    // Go control plane when the term carried a `from icmp-type` / `from icmp-code`
+    // token it could not resolve to a byte in 0..255. The pre-fix Go builder
+    // dropped the unresolved token and emitted only the resolved bytes; when EVERY
+    // token was unresolvable the vector above was empty, which this matcher reads
+    // as "no ICMP constraint" — silently WIDENING the term to match every ICMP(v6)
+    // packet (fail-OPEN for a discard/reject term). With these flags the filter
+    // compiler raises SnapshotIntegrityError::UnrepresentableFilterICMP and rejects
+    // the whole snapshot. serde(default) keeps wire parity with an older control
+    // plane that omits the field (#1961).
+    #[serde(rename = "icmp_type_unrepresentable", default)]
+    pub icmp_type_unrepresentable: bool,
+    #[serde(rename = "icmp_code_unrepresentable", default)]
+    pub icmp_code_unrepresentable: bool,
+    // dscp_match_unrepresentable (#3406) is set by the Go control plane when the
+    // term carried a non-empty `from dscp` / `from traffic-class` MATCH token that
+    // resolves to neither a known code-point name nor an integer 0..63. The pre-fix
+    // Go builder dropped the bad token from dscp_values; when EVERY token was
+    // unresolvable the vector was empty, which this matcher reads as "no DSCP
+    // constraint" — silently WIDENING the term to match all DSCPs (fail-OPEN). With
+    // this flag the filter compiler raises
+    // SnapshotIntegrityError::UnrepresentableFilterDSCP and rejects the whole
+    // snapshot. An unrepresentable `then dscp` REWRITE is CoS-only and is NOT
+    // carried here (the Go builder warns instead of failing closed). serde(default)
+    // keeps wire parity with an older control plane that omits the field (#1961).
+    #[serde(rename = "dscp_match_unrepresentable", default)]
+    pub dscp_match_unrepresentable: bool,
     // flex_match is the Junos `from flexible-match-range` byte-offset match
     // (#3077). It was parsed + compiled for the retired legacy dataplane but
     // dropped on the userspace wire, so the byte-offset constraint vanished and

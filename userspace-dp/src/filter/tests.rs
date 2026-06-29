@@ -61,6 +61,9 @@ fn basic_accept_discard() {
                     tcp_flags: None,
                     tcp_flags_forbidden: None,
                     tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -91,6 +94,9 @@ fn basic_accept_discard() {
                     tcp_flags: None,
                     tcp_flags_forbidden: None,
                     tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -302,6 +308,9 @@ fn port_range_matching() {
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
                 tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -378,6 +387,9 @@ fn destination_port_except_negation() {
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
                 tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -469,6 +481,9 @@ fn source_port_except_negation() {
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
                 tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -544,6 +559,9 @@ fn protocol_matching() {
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
                 tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -612,6 +630,9 @@ fn dscp_rewrite_action() {
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
                 tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -666,6 +687,9 @@ fn dscp_rewrite_action_allows_default_zero() {
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
                 tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -1539,6 +1563,9 @@ fn multiple_terms_first_match_wins() {
                     tcp_flags: None,
                     tcp_flags_forbidden: None,
                     tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -1569,6 +1596,9 @@ fn multiple_terms_first_match_wins() {
                     tcp_flags: None,
                     tcp_flags_forbidden: None,
                     tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -1638,6 +1668,9 @@ fn source_dest_address_matching() {
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
                 tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -3294,6 +3327,9 @@ fn tcp_flags_term_forbidden_mask_excludes_negated_flag() {
                 tcp_flags: Some(0x02),
                 tcp_flags_forbidden: Some(0x10),
                 tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
                 ..Default::default()
             },
             FirewallTermSnapshot {
@@ -3350,6 +3386,9 @@ fn tcp_flags_term_forbidden_only_mask() {
                 tcp_flags: None,
                 tcp_flags_forbidden: Some(0x04),
                 tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
                 ..Default::default()
             },
             FirewallTermSnapshot {
@@ -4997,6 +5036,151 @@ fn protocol_2505_empty_list_is_unconstrained() {
         !term.protocol_match_enabled,
         "an empty protocol list must leave the protocol match disabled (match-any constraint)"
     );
+}
+
+// Build a single-term `discard` filter carrying one of the #3406 unrepresentable
+// wire markers, returning the compiled FilterState result (Ok or the integrity
+// Err). The closure mutates a default term so each test sets exactly one marker.
+fn filter_with_marked_term(
+    family: &str,
+    mark: impl FnOnce(&mut FirewallTermSnapshot),
+) -> Result<FilterState, SnapshotIntegrityError> {
+    let mut term = FirewallTermSnapshot {
+        name: "marked".into(),
+        action: "discard".into(),
+        ..Default::default()
+    };
+    mark(&mut term);
+    parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f".into(),
+            family: family.into(),
+            terms: vec![term],
+        }],
+        &[],
+        &[],
+        "",
+        "",
+    )
+}
+
+#[test]
+fn icmp_type_unrepresentable_marker_fails_closed_not_match_all() {
+    // #3406 RED-on-revert: a term carrying the `icmp_type_unrepresentable` wire
+    // marker (the Go control plane could not resolve a `from icmp-type` token to a
+    // byte in 0..255) must reject the WHOLE snapshot — NOT compile into a term with
+    // no ICMP constraint. Pre-#3406 the Go builder dropped the unresolved token; an
+    // all-unresolvable list emitted an empty `icmp_types` vec, which this matcher
+    // reads as "no constraint" → the term matched EVERY ICMP packet (a `then
+    // discard` term that should drop only one type would discard ALL ICMP —
+    // fail-WIDE). Reverting the parse_term guard returns Ok here.
+    let err = filter_with_marked_term("inet", |t| t.icmp_type_unrepresentable = true)
+        .expect_err("an unrepresentable icmp-type marker must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnrepresentableFilterICMP {
+            family,
+            filter,
+            term,
+            dimension,
+        } => {
+            assert_eq!(family, "inet");
+            assert_eq!(filter, "f");
+            assert_eq!(term, "marked");
+            assert_eq!(dimension, "icmp-type");
+        }
+        other => panic!("expected UnrepresentableFilterICMP, got {other:?}"),
+    }
+    // A term WITHOUT the marker compiles fine (the guard is keyed on the marker).
+    filter_with_marked_term("inet", |_| {})
+        .expect("a term without the marker must compile");
+}
+
+#[test]
+fn icmp_code_unrepresentable_marker_fails_closed() {
+    // Sibling of the icmp-type guard for the code dimension; names inet6 to prove
+    // the family is carried (filter names can be reused across families).
+    let err = filter_with_marked_term("inet6", |t| t.icmp_code_unrepresentable = true)
+        .expect_err("an unrepresentable icmp-code marker must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnrepresentableFilterICMP {
+            family, dimension, ..
+        } => {
+            assert_eq!(family, "inet6");
+            assert_eq!(dimension, "icmp-code");
+        }
+        other => panic!("expected UnrepresentableFilterICMP, got {other:?}"),
+    }
+}
+
+#[test]
+fn dscp_match_unrepresentable_marker_fails_closed_not_match_all() {
+    // #3406 RED-on-revert: the `dscp_match_unrepresentable` marker (an unresolvable
+    // `from dscp` MATCH token) must reject the whole snapshot. Pre-#3406 the Go
+    // builder dropped the bad token; an all-unresolvable list left `dscp_values`
+    // empty, which this matcher reads as "no DSCP constraint" → match all DSCPs
+    // (fail-WIDE).
+    let err = filter_with_marked_term("inet", |t| t.dscp_match_unrepresentable = true)
+        .expect_err("an unrepresentable from-dscp match marker must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnrepresentableFilterDSCP {
+            family,
+            filter,
+            term,
+        } => {
+            assert_eq!(family, "inet");
+            assert_eq!(filter, "f");
+            assert_eq!(term, "marked");
+        }
+        other => panic!("expected UnrepresentableFilterDSCP, got {other:?}"),
+    }
+}
+
+#[test]
+fn flex_match_oversized_width_fails_closed_not_truncated() {
+    // #3406 RED-on-revert: a present flex_match whose byte `length` is outside
+    // 1..=4 (the value/mask wire fields are u32) must reject the whole snapshot.
+    // Pre-#3406 the Go builder capped an oversized width to 4 and still emitted the
+    // term, so only the truncated 4-byte window was compared and the match
+    // BROADENED (fail-open); the matcher's `flex_enabled` derivation would also
+    // silently disable an out-of-range flex (no constraint = match-any). Reverting
+    // the parse_term guard returns Ok with the flex silently disabled.
+    let err = filter_with_marked_term("inet", |t| {
+        t.flex_match = Some(FlexMatchSnapshot {
+            offset: 0,
+            length: 5, // 5 bytes — exceeds the u32 wire value
+            value: 0x1,
+            mask: 0xFFFF_FFFF,
+            match_start: String::new(),
+        });
+    })
+    .expect_err("an oversized flex-match width must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnrepresentableFilterFlexMatch {
+            family,
+            filter,
+            term,
+            length,
+        } => {
+            assert_eq!(family, "inet");
+            assert_eq!(filter, "f");
+            assert_eq!(term, "marked");
+            assert_eq!(length, 5);
+        }
+        other => panic!("expected UnrepresentableFilterFlexMatch, got {other:?}"),
+    }
+
+    // A representable 1..=4-byte flex compiles fine (the guard is keyed on the
+    // out-of-range length, not on every flex term).
+    filter_with_marked_term("inet", |t| {
+        t.flex_match = Some(FlexMatchSnapshot {
+            offset: 0,
+            length: 4,
+            value: 0x1,
+            mask: 0xFFFF_FFFF,
+            match_start: String::new(),
+        });
+    })
+    .expect("a representable 4-byte flex must compile");
 }
 
 // #3296: an interface hook naming a filter NOT present in the compiled table

@@ -527,6 +527,49 @@ peer-sync path, consistent with the #2505/#3296 fail-closed family. Tests:
 `tcp_flags_unparseable_*` (Rust) and `TestFilterSnapshotTCPFlagsUnparseableSetsMarker`
 (Go) (fail-on-revert).
 
+Unrepresentable match-content backstops (#3406): four more filter-term fields
+that the pre-fix builder silently dropped/capped on the lenient / peer-sync path,
+each a sibling of the #3367 tcp-flags backstop and consistent with the
+#2505/#3296 fail-closed family. The Go commit gates
+(`validateFilterMatchValuesStrict`, `validateFilterDSCPStrict`,
+`validateFilterFlexMatchStrict`) are the primary defense; these backstops guard a
+corrupt / hand-built / version-drifted snapshot. The first three FAIL THE
+SNAPSHOT CLOSED because the silent drop WIDENED the term (an empty match vector
+reads as "no constraint" = match-any); the fourth WARNS because it has no
+match/action widening:
+
+- **`from icmp-type` / `from icmp-code` out of range (104-M07):** a token the Go
+  compiler could not resolve to a byte in `0..255` (recorded on
+  `term.UnknownICMPTypes` / `UnknownICMPCodes`) sets the
+  `icmp_type_unrepresentable` / `icmp_code_unrepresentable` wire bool; `parse_term`
+  raises `SnapshotIntegrityError::UnrepresentableFilterICMP`. Pre-fix an
+  all-unresolvable list emitted an empty `icmp_types`/`icmp_codes` vec → the term
+  matched every ICMP(v6) packet (fail-WIDE for a discard/reject term).
+- **`from dscp` / `from traffic-class` MATCH token (104-M09 match half):** a token
+  resolving to neither a code-point name nor `0..63` sets `dscp_match_unrepresentable`;
+  `parse_term` raises `SnapshotIntegrityError::UnrepresentableFilterDSCP`. Pre-fix
+  an all-unresolvable list left `dscp_values` empty → match all DSCPs (fail-WIDE).
+- **`from flexible-match-range` oversized width (104-M08):** the Go builder no
+  longer caps an oversized byte width to 4; it carries the real `flex_match.length`
+  and `parse_term` raises `SnapshotIntegrityError::UnrepresentableFilterFlexMatch`
+  for any length outside `1..=4` (the `value`/`mask` wire fields are u32). Pre-fix
+  the cap-to-4 still emitted the term, comparing only the truncated 4-byte window —
+  BROADENING the match (fail-open).
+- **`then dscp` / `then traffic-class` REWRITE token (104-M09 rewrite half):** an
+  unresolvable rewrite is CoS-only (no match/action widening), so it is NOT failed
+  closed — the Go builder emits NO rewrite and a `slog.Warn` so the lost CoS marking
+  is operator-visible (failing forwarding over a cosmetic marking would be worse).
+- **Mixed positive + `*-port-except` in one direction (104-M05):** the Rust
+  compiler already resolves this positive-wins (the except list is dropped — a
+  fail-SAFE narrowing, see "Negated port match" below), but the pre-#3406 drop was
+  SILENT; the Go builder now emits a `slog.Warn` symmetric with the mixed
+  address-except warning (#3359), so the dropped except set is operator-visible.
+
+Tests: `icmp_type_unrepresentable_marker_*`, `icmp_code_unrepresentable_marker_*`,
+`dscp_match_unrepresentable_marker_*`, `flex_match_oversized_width_*` (Rust) and
+`TestFilterSnapshot{ICMP,DSCPMatch,DSCPRewrite,FlexMatchOversizedWidth,MixedPortExcept}*`
+(Go) (fail-on-revert).
+
 ### Negated port match — `source-port-except` / `destination-port-except` (#2622)
 
 Junos `from source-port-except` / `from destination-port-except` matches every
