@@ -23001,6 +23001,9 @@ top.
     pkg/config/compiler.go,
     pkg/config/log_stream_config_3349_test.go, docs/config-schema.md, _Log.md
 
+## 2026-06-28 — #3360 gre-performance-acceleration config-truth
+- **Action**: Wire GREAcceleration into Rust ForwardingState for parity (mirror power_mode_disable); fix overstated Go wire comment; add mutation-verify tests (Go + Rust); doc feature-gaps entry.
+- **File(s)**: userspace-dp/src/afxdp/forwarding_build/mod.rs, userspace-dp/src/afxdp/types/forwarding.rs, userspace-dp/src/afxdp/forwarding_build/tests.rs, pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/flow_wire_coerce_test.go, docs/feature-gaps.md
 - **Timestamp**: 2026-06-28
   - **Action**: Document host-inbound `system-services traceroute` admit
     contract (#3368). Verified against authoritative Junos docs that

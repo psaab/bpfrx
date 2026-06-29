@@ -1034,6 +1034,23 @@ drift) closed in `fix/2008-quickwins-batch1`:
   express datapath; the userspace dataplane has a single forwarding path, so
   the flag is carried for config truth/parity and does not currently switch
   packet behavior (there is no express/regular split to select between).
+- **`security flow gre-performance-acceleration`** — DONE (threaded, #3360).
+  The parsed `cfg.Security.Flow.GREPerformanceAcceleration` reaches the
+  dataplane via `FlowSnapshot.GREAcceleration` (`buildFlowSnapshot` +
+  `pkg/dataplane/userspace/protocol.go`) and the Rust
+  `FlowSnapshot`/`ForwardingState` (`gre_acceleration`, mirroring
+  `power_mode_disable`). Before #3360 the bit was deserialized on the Rust side
+  and rendered in `show security flow` but never assigned into runtime state —
+  a silent config-truth gap (the Go wire comment even claimed "extract GRE key
+  into session ports", behavior that never happened). On vSRX the knob extracts
+  the GRE key/call-id into the session tuple so multiple GRE tunnels between the
+  same endpoints map to distinct sessions; the userspace dataplane keys GRE
+  flows on the 5-tuple only, so the flag is now threaded into the Rust
+  `ForwardingState` for config truth/parity but is NOT yet read by any
+  packet/forwarding path (the field is still `#[allow(dead_code)]`). The
+  consumer — GRE key/call-id extraction into the session tuple — is the deferred
+  feature, and this is the seam it would read; it is not part of this
+  config-truth fix.
 - **M9 `security flow tcp-session no-sequence-check`** — DONE (typed). Added
   the schema child (`pkg/config/schema_security.go`), the
   `TCPSessionConfig.NoSequenceCheck` field (`pkg/config/types_security.go`),
