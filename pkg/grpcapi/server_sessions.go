@@ -146,7 +146,7 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 			}
 			se := sessionEntryV4(key, val, now, filter.zoneNames, filter.policyNames, filter.zoneIfaces, filter.egressIfaces, haActive)
 			if !noEnrich {
-				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
+				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID)
 			}
 			all = append(all, se)
 			lastV4Key = key
@@ -192,7 +192,7 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 			}
 			se := sessionEntryV6(key, val, now, filter.zoneNames, filter.policyNames, filter.zoneIfaces, filter.egressIfaces, haActive)
 			if !noEnrich {
-				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
+				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID)
 			}
 			all = append(all, se)
 			lastV6Key = key
@@ -444,7 +444,7 @@ func (f *sessionFilter) matchV4(key dataplane.SessionKey, val dataplane.SessionV
 		return false
 	}
 	if f.appFilter != "" && !appid.SessionMatches(f.appFilter, f.appNames, f.cfg,
-		key.Protocol, ntohs(key.DstPort), val.AppID) {
+		key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID) {
 		return false
 	}
 	if f.ifaceFilter != "" {
@@ -489,7 +489,7 @@ func (f *sessionFilter) matchV6(key dataplane.SessionKeyV6, val dataplane.Sessio
 		return false
 	}
 	if f.appFilter != "" && !appid.SessionMatches(f.appFilter, f.appNames, f.cfg,
-		key.Protocol, ntohs(key.DstPort), val.AppID) {
+		key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID) {
 		return false
 	}
 	if f.ifaceFilter != "" {
@@ -602,7 +602,7 @@ func (s *Server) getSessionsLegacy(ctx context.Context, req *pb.GetSessionsReque
 			}
 			se := sessionEntryV4(key, val, now, filter.zoneNames, filter.policyNames, filter.zoneIfaces, filter.egressIfaces, haActive)
 			if !noEnrich {
-				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
+				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID)
 			}
 			all = append(all, se)
 		}
@@ -627,7 +627,7 @@ func (s *Server) getSessionsLegacy(ctx context.Context, req *pb.GetSessionsReque
 			}
 			se := sessionEntryV6(key, val, now, filter.zoneNames, filter.policyNames, filter.zoneIfaces, filter.egressIfaces, haActive)
 			if !noEnrich {
-				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
+				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID)
 			}
 			all = append(all, se)
 		}

@@ -1,11 +1,17 @@
 package appid
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// maxCatalogAppID is the largest assignable application id. app_id is a uint16
+// on the Rust wire (userspace-dp/src/protocol/security.rs) where 0 is the
+// reserved "unknown" sentinel, so real applications take ids 1..65535 (#3438).
+const maxCatalogAppID = 65535
 
 // CatalogEntry is one application's L3/L4 classification rule, carrying the
 // numeric app_id that the dataplane stamps on a matching session. One config
@@ -62,8 +68,17 @@ func BuildCatalog(cfg *config.Config) (Catalog, error) {
 	}
 
 	userApps := cfg.Applications.Applications
-	appID := uint16(1)
+	// #3438 H4: app_id is a uint16 on the Rust wire with 0 reserved as the
+	// unknown sentinel, so the assignable id space is 1..65535. nextID is a
+	// uint32 working counter precisely so it CANNOT silently wrap a uint16 past
+	// 65535 back onto 0 (the reserved sentinel) — the boundary check below
+	// rejects a config that would need a 65536th id deterministically instead.
+	nextID := uint32(1)
 	for _, name := range names {
+		if nextID > maxCatalogAppID {
+			return cat, fmt.Errorf("application catalog exceeds %d entries: assigning app_id to %q would overflow the uint16 app_id space (0 is the reserved unknown sentinel); reduce the number of referenced applications", maxCatalogAppID, name)
+		}
+		appID := uint16(nextID)
 		app, found := config.ResolveApplication(name, userApps)
 		if !found {
 			// compileApplications hard-errors here; the snapshot builder must
@@ -116,7 +131,7 @@ func BuildCatalog(cfg *config.Config) (Catalog, error) {
 				SrcPortHigh: srcHigh,
 			})
 		}
-		appID++
+		nextID++
 	}
 
 	return cat, nil

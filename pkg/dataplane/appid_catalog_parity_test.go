@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/appid"
@@ -79,7 +80,7 @@ func TestAppCatalogIDsMatchCompileResultAppNames(t *testing.T) {
 	if udpID == 0 {
 		t.Fatal("my-udp-app not assigned an app_id")
 	}
-	got := appid.ResolveSessionName(result.AppNames, cfg, 17, 7777, udpID)
+	got := appid.ResolveSessionName(result.AppNames, cfg, 17, 0, 7777, udpID)
 	if got != "my-udp-app" {
 		t.Fatalf("ResolveSessionName(udpID=%d) = %q, want my-udp-app", udpID, got)
 	}
@@ -132,7 +133,7 @@ func TestAppCatalogIDsMatchOnMalformedDestPort(t *testing.T) {
 	if goodID == 0 {
 		t.Fatal("zzz-good not assigned an app_id")
 	}
-	if got := appid.ResolveSessionName(result.AppNames, cfg, 6, 8443, goodID); got != "zzz-good" {
+	if got := appid.ResolveSessionName(result.AppNames, cfg, 6, 0, 8443, goodID); got != "zzz-good" {
 		t.Fatalf("ResolveSessionName(goodID=%d) = %q, want zzz-good (id drift)", goodID, got)
 	}
 }
@@ -206,5 +207,56 @@ func TestAppCatalogEntryPortsAndProtos(t *testing.T) {
 	}
 	if cat.AppNames[anyL4ID] != "any-l4" {
 		t.Fatalf("AppNames[%d] = %q, want any-l4", anyL4ID, cat.AppNames[anyL4ID])
+	}
+}
+
+// TestCompileApplicationsRejectsAppIDOverflow is the #3438 H4 fail-on-revert
+// guard for the LIVE compile path. CompileUserspaceShim -> CompileConfig ->
+// compileApplications builds CompileResult.AppNames, the map the AF_XDP show
+// path resolves session app_ids through. app_id narrows to a uint16 on the Rust
+// wire with 0 reserved as the unknown sentinel, so a config needing more than
+// 65535 ids must be rejected deterministically (fail-closed: the apply aborts
+// and the daemon keeps the previous-good snapshot) rather than wrapping a
+// 65536th id to 0 and overwriting earlier names. Reverting the boundary check
+// (uint16(appID) narrowing with no guard) wraps silently and returns no error,
+// failing this test. The boundary sibling proves exactly 65535 is accepted.
+func TestCompileApplicationsRejectsAppIDOverflow(t *testing.T) {
+	// Reject: 65536 referenced applications.
+	result := &CompileResult{AppIDs: make(map[string]uint32)}
+	if err := compileApplications(appCatalogParityDP{}, compileOverflowConfig(65536), result); err == nil {
+		t.Fatal("compileApplications(65536 apps) returned no error; the uint16 app_id space must be rejected, not wrapped to 0")
+	}
+
+	// Accept: exactly 65535 applications; no id 0 assigned to a real app.
+	okResult := &CompileResult{AppIDs: make(map[string]uint32)}
+	if err := compileApplications(appCatalogParityDP{}, compileOverflowConfig(65535), okResult); err != nil {
+		t.Fatalf("compileApplications(65535 apps) error = %v; the boundary must be accepted", err)
+	}
+	if _, hasZero := okResult.AppNames[0]; hasZero {
+		t.Fatal("compileApplications assigned the reserved app_id 0 to a real application")
+	}
+	if len(okResult.AppNames) != 65535 {
+		t.Fatalf("compileApplications(65535 apps) produced %d ids, want 65535", len(okResult.AppNames))
+	}
+}
+
+// compileOverflowConfig builds a config with n distinct TCP/80 applications,
+// each referenced by one policy so CatalogNames(cfg, false) returns exactly n
+// names (AppID disabled keeps the catalog at the policy-referenced set).
+func compileOverflowConfig(n int) *config.Config {
+	apps := make(map[string]*config.Application, n)
+	match := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("app-%06d", i)
+		apps[name] = &config.Application{Name: name, Protocol: "tcp", DestinationPort: "80"}
+		match = append(match, name)
+	}
+	return &config.Config{
+		Applications: config.ApplicationsConfig{Applications: apps},
+		Security: config.SecurityConfig{
+			Policies: []*config.ZonePairPolicies{
+				{Policies: []*config.Policy{{Match: config.PolicyMatch{Applications: match}}}},
+			},
+		},
 	}
 }

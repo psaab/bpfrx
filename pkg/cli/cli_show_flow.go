@@ -378,7 +378,7 @@ func (c *CLI) showFlowSession(args []string) error {
 		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
 			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
 			outIf, outZone, val.RevPackets, val.RevBytes)
-		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, dstPort, val.AppID); appName != "" {
+		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, srcPort, dstPort, val.AppID); appName != "" {
 			fmt.Printf("  Application: %s\n", appName)
 		}
 		fmt.Println()
@@ -508,7 +508,7 @@ func (c *CLI) showFlowSession(args []string) error {
 		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
 			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
 			outIf, outZone, val.RevPackets, val.RevBytes)
-		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, dstPort, val.AppID); appName != "" {
+		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, srcPort, dstPort, val.AppID); appName != "" {
 			fmt.Printf("  Application: %s\n", appName)
 		}
 		fmt.Println()
@@ -781,7 +781,7 @@ func (c *CLI) showTopTalkers(f sessionFilter) error {
 			proto:    protoNameFromNum(key.Protocol),
 			zone:     inZone + "->" + outZone,
 			state:    sessionStateName(val.State),
-			app:      appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, ntohs(key.DstPort), val.AppID),
+			app:      appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID),
 			fwdPkts:  val.FwdPackets,
 			revPkts:  val.RevPackets,
 			fwdBytes: val.FwdBytes,
@@ -820,7 +820,7 @@ func (c *CLI) showTopTalkers(f sessionFilter) error {
 			proto:    protoNameFromNum(key.Protocol),
 			zone:     inZone + "->" + outZone,
 			state:    sessionStateName(val.State),
-			app:      appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, ntohs(key.DstPort), val.AppID),
+			app:      appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID),
 			fwdPkts:  val.FwdPackets,
 			revPkts:  val.RevPackets,
 			fwdBytes: val.FwdBytes,
