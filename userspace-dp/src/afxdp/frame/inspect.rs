@@ -942,6 +942,59 @@ pub(in crate::afxdp) fn declared_l3_end(frame: &[u8], l3: usize, addr_family: u8
 /// policy / firewall-filter / CoS / session installation. This is the same
 /// invariant the sibling generated-reply parser enforces via
 /// `generated.rs::generated_l4_ports`.
+/// #3067/#3290: the ICMP/ICMPv6 types whose 3rd/4th header bytes
+/// (`[l4+4..l4+6]`) are a genuine Identifier usable as a stateful
+/// pseudo source port. Echo Request/Reply carry one in both families;
+/// ICMPv4 additionally has the Timestamp and Information query+reply
+/// pairs (same offset per RFC 792). For every error/control type
+/// (Dest-Unreachable, Packet-Too-Big, Time-Exceeded, Parameter-Problem,
+/// Redirect, ND/MLD, ...) those bytes are part of a gateway address /
+/// next-hop MTU / pointer / unused word — NOT a port.
+///
+/// This is the single predicate shared by the frame port parser
+/// (`parse_flow_ports`) and the metadata-fallback gate in
+/// `parse_session_flow_from_bytes` (#3290), so both arms honor the SAME
+/// query-type rule and the shim's ungated pseudo-port can never install a
+/// fake session for a non-query ICMP packet.
+#[inline]
+pub(in crate::afxdp) fn icmp_identifier_bearing(protocol: u8, icmp_type: u8) -> bool {
+    match protocol {
+        // Echo Reply (0) / Echo Request (8), Timestamp Request (13) /
+        // Reply (14), Information Request (15) / Reply (16).
+        PROTO_ICMP => matches!(icmp_type, 0 | 8 | 13 | 14 | 15 | 16),
+        // Echo Request (128) / Echo Reply (129).
+        PROTO_ICMPV6 => matches!(icmp_type, 128 | 129),
+        _ => false,
+    }
+}
+
+/// #3290: read the ICMP/ICMPv6 type byte from the frame, bounded by the
+/// IP-declared datagram end (the #2361 fail-closed invariant), and report
+/// whether it is an identifier-bearing query type. Returns `false` (fail
+/// closed -> suppress the metadata pseudo-port fallback) when the L3 header
+/// is malformed, the type byte is truncated, or it lies past the declared
+/// datagram end (trailing slack is not authoritative). Only used to gate the
+/// metadata fallback; the frame parsers re-derive the type independently.
+fn meta_icmp_identifier_bearing(frame: &[u8], meta: UserspaceDpMeta) -> bool {
+    let l3 = meta.l3_offset as usize;
+    let l4 = meta.l4_offset as usize;
+    let declared_end = match meta.addr_family as i32 {
+        libc::AF_INET => ipv4_declared_l3_end(frame, l3),
+        libc::AF_INET6 => ipv6_declared_l3_end(frame, l3),
+        _ => None,
+    };
+    let Some(declared_end) = declared_end else {
+        return false;
+    };
+    if l4 >= declared_end {
+        return false;
+    }
+    match frame.get(l4) {
+        Some(&icmp_type) => icmp_identifier_bearing(meta.protocol, icmp_type),
+        None => false,
+    }
+}
+
 pub(in crate::afxdp) fn parse_flow_ports(
     frame: &[u8],
     l4: usize,
@@ -984,15 +1037,7 @@ pub(in crate::afxdp) fn parse_flow_ports(
                 return None;
             }
             let icmp_type = *frame.get(l4)?;
-            let identifier_bearing = match protocol {
-                // Echo Reply (0) / Echo Request (8), Timestamp Request (13) /
-                // Reply (14), Information Request (15) / Reply (16).
-                PROTO_ICMP => matches!(icmp_type, 0 | 8 | 13 | 14 | 15 | 16),
-                // Echo Request (128) / Echo Reply (129).
-                PROTO_ICMPV6 => matches!(icmp_type, 128 | 129),
-                _ => false,
-            };
-            if !identifier_bearing {
+            if !icmp_identifier_bearing(protocol, icmp_type) {
                 return None;
             }
             let ident_start = l4.checked_add(4)?;
@@ -1171,6 +1216,23 @@ pub(in crate::afxdp) fn parse_session_flow_from_bytes(
         return None;
     }
     let meta_flow = parse_session_flow_from_meta(meta);
+    // #3290: the metadata fallback below copies `meta.flow_src_port` verbatim
+    // into the SessionKey, but the XDP shim stamps bytes [l4+4..l4+6] as
+    // `flow_src_port` for EVERY ICMP/ICMPv6 type with NO query-type gate. An
+    // ICMP error/control packet (Dest-Unreachable, Packet-Too-Big,
+    // Time-Exceeded, Parameter-Problem, Redirect, ND/MLD, ...) would otherwise
+    // install a stateful session keyed on a non-port control word, bypassing
+    // the #3067 invariant the frame parser (`parse_flow_ports`) enforces.
+    // Discard the metadata flow for a non-query ICMP type so the packet stays
+    // flowless: `frame_flow` is already `None` for it (the frame parser gates),
+    // and the offset fallback re-runs the same `parse_flow_ports` gate, so the
+    // packet follows the session-less, route-based forward path. Only
+    // identifier-bearing query types keep their metadata tuple (where it equals
+    // the frame-derived identifier anyway).
+    let meta_flow = match meta.protocol {
+        PROTO_ICMP | PROTO_ICMPV6 if !meta_icmp_identifier_bearing(frame, meta) => None,
+        _ => meta_flow,
+    };
     // Fast path: for TCP/UDP with complete metadata tuple, use meta directly
     // without parsing the frame. This avoids extra L3/L4 parsing for the
     // common established-flow case.

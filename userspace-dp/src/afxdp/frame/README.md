@@ -164,7 +164,18 @@ inspect or rewrite a packet sitting in a UMEM frame.
   route-based, session-less forward path instead of installing a bogus
   identifier-keyed stateful session that would pollute the session table and
   risk spurious collisions. Matching ICMP errors to their embedded inner flow
-  remains out of scope (tracked as the larger #2393 model).
+  remains out of scope (tracked as the larger #2393 model). **#3290 — the
+  metadata path honors the SAME gate:** the XDP shim stamps
+  `meta.flow_src_port = bytes[l4+4..l4+6]` for EVERY ICMP type with no
+  query-type gate, so `parse_session_flow_from_bytes` could otherwise
+  reconstruct a fake session from that control word when the frame parser
+  returned `None` (the meta fallback fired). The gate is now shared: the
+  query-type predicate is factored into `icmp_identifier_bearing(protocol,
+  type)` (used by both `parse_flow_ports` and the meta fallback), and
+  `parse_session_flow_from_bytes` discards `meta_flow` for a non-query ICMP
+  type (`meta_icmp_identifier_bearing`, type byte read from the frame bounded
+  by `declared_end`, fail-closed on truncation) so the packet stays flowless
+  on the metadata path too.
 - **TCP inspection helpers are ext-header-aware (#2148)**: the read-only
   diagnostic/telemetry helpers `frame_has_tcp_rst`,
   `extract_tcp_flags_and_window`, and `extract_tcp_window` (`tcp.rs`) all
