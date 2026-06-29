@@ -92,30 +92,36 @@ func CatalogNames(cfg *config.Config, includeAll bool) ([]string, error) {
 // ResolveSessionName returns the session application name using the actual
 // dataplane-assigned app_id when available. When AppID is enabled, unknown
 // sessions are reported as UNKNOWN instead of guessed from port heuristics.
-func ResolveSessionName(appNames map[uint16]string, cfg *config.Config, proto uint8, dstPort uint16, appID uint16) string {
+//
+// srcPort is the session source port; it is required so the tuple fallback can
+// honor a configured `source-port` constraint (#3428). Both the source and the
+// destination port are threaded through to the fallback matcher.
+func ResolveSessionName(appNames map[uint16]string, cfg *config.Config, proto uint8, srcPort, dstPort uint16, appID uint16) string {
 	if appID != 0 {
 		if name := appNames[appID]; name != "" {
 			return name
 		}
 	}
 
+	// #3438 L1: when AppID is enabled the contract
+	// (docs/services-application-identification.md) is honest UNKNOWN, never a
+	// port-heuristic guess. A session whose app_id is 0 (unstamped/legacy) OR
+	// nonzero-but-absent from AppNames (a control/dataplane catalog skew,
+	// including the #3438 H4 id wrap) must render UNKNOWN rather than masking the
+	// skew with a tuple guess. Tuple fallback is kept ONLY for the disabled-knob
+	// path below.
 	if cfg != nil && cfg.Services.ApplicationIdentification {
-		if appID != 0 {
-			if guess := resolveTupleFallback(proto, dstPort, cfg); guess != "" {
-				return guess
-			}
-		}
 		return Unknown
 	}
 
-	return resolveTupleFallback(proto, dstPort, cfg)
+	return resolveTupleFallback(proto, srcPort, dstPort, cfg)
 }
 
-func SessionMatches(filter string, appNames map[uint16]string, cfg *config.Config, proto uint8, dstPort uint16, appID uint16) bool {
+func SessionMatches(filter string, appNames map[uint16]string, cfg *config.Config, proto uint8, srcPort, dstPort uint16, appID uint16) bool {
 	if filter == "" {
 		return true
 	}
-	return strings.EqualFold(ResolveSessionName(appNames, cfg, proto, dstPort, appID), filter)
+	return strings.EqualFold(ResolveSessionName(appNames, cfg, proto, srcPort, dstPort, appID), filter)
 }
 
 func sortedNames(names map[string]struct{}) []string {
@@ -127,22 +133,23 @@ func sortedNames(names map[string]struct{}) []string {
 	return out
 }
 
-func resolveTupleFallback(proto uint8, dstPort uint16, cfg *config.Config) string {
+func resolveTupleFallback(proto uint8, srcPort, dstPort uint16, cfg *config.Config) string {
 	if cfg != nil {
 		// #2578: cfg.Applications.Applications is a Go map; iterating it and
 		// returning the first match is non-deterministic. When BOTH a
 		// port-constrained app (e.g. tcp/8443) and a protocol-only app (tcp)
 		// match the same session, the more-specific port-based app must win,
 		// deterministically. Scan all matches, prefer a port-constrained app
-		// (DestinationPort != "") over a protocol-only one, and break ties by
-		// name so the result is stable regardless of map iteration order.
+		// (a source-port and/or destination-port constraint) over a
+		// protocol-only one, and break ties by name so the result is stable
+		// regardless of map iteration order.
 		best := ""
 		bestPortBased := false
 		for name, app := range cfg.Applications.Applications {
-			if !matchTuple(proto, dstPort, app.Protocol, app.DestinationPort) {
+			if !matchTuple(proto, srcPort, dstPort, app.Protocol, app.SourcePort, app.DestinationPort) {
 				continue
 			}
-			portBased := app.DestinationPort != ""
+			portBased := app.DestinationPort != "" || app.SourcePort != ""
 			if best == "" || (portBased && !bestPortBased) ||
 				(portBased == bestPortBased && name < best) {
 				best = name
@@ -161,32 +168,50 @@ func resolveTupleFallback(proto uint8, dstPort uint16, cfg *config.Config) strin
 	return ""
 }
 
-func matchTuple(proto uint8, dstPort uint16, appProto, appPort string) bool {
+// matchTuple reports whether a session (proto, srcPort, dstPort) satisfies a
+// configured application's protocol + source-port + destination-port
+// constraints. An empty appProto never match-alls. An empty appSrcPort /
+// appDstPort is "no constraint" for that port. A source-port AND a
+// destination-port constraint are both required to hold when present (#3428).
+func matchTuple(proto uint8, srcPort, dstPort uint16, appProto, appSrcPort, appDstPort string) bool {
 	if appProto == "" {
 		return false
 	}
 	if pn, ok := protocolNumber(appProto); !ok || pn != proto {
 		return false
 	}
+	// #3428: a configured `source-port` constraint must be honored. Previously
+	// only protocol + destination-port were compared, so a source-port-scoped
+	// app (e.g. `protocol tcp source-port 12345 destination-port 8443`) was
+	// matched on dst-port alone — ANY session to dst/8443 was mislabeled as that
+	// app regardless of its source port. An empty source-port is unconstrained.
+	if !portInSpec(srcPort, appSrcPort) {
+		return false
+	}
 	// #2548: a custom application configured with a protocol but no
 	// destination-port is PROTOCOL-ONLY (e.g. user-defined GRE/ESP/AH). The
-	// protocol match above is the whole constraint, so it matches here instead
-	// of being rejected — previously this returned false, so a protocol-only
-	// app could never tuple-match and its sessions reported UNKNOWN. The
-	// appProto=="" guard above still rejects an unconstrained app from
-	// match-all; a port-only/port-ranged app (appPort != "") below still
-	// requires BOTH the protocol and the port to match (unchanged).
-	if appPort == "" {
+	// protocol (and any source-port) match above is the whole constraint, so an
+	// empty destination-port matches here instead of being rejected. A
+	// port-only/port-ranged app (appDstPort != "") still requires the
+	// destination port to match.
+	return portInSpec(dstPort, appDstPort)
+}
+
+// portInSpec reports whether port satisfies an application port spec. An empty
+// spec means "no constraint" and always matches. A "lo-hi" spec is an inclusive
+// range; a bare value is an exact match. A malformed spec never matches.
+func portInSpec(port uint16, spec string) bool {
+	if spec == "" {
 		return true
 	}
-	if strings.Contains(appPort, "-") {
-		parts := strings.SplitN(appPort, "-", 2)
+	if strings.Contains(spec, "-") {
+		parts := strings.SplitN(spec, "-", 2)
 		lo, err1 := strconv.Atoi(parts[0])
 		hi, err2 := strconv.Atoi(parts[1])
-		return err1 == nil && err2 == nil && int(dstPort) >= lo && int(dstPort) <= hi
+		return err1 == nil && err2 == nil && int(port) >= lo && int(port) <= hi
 	}
-	v, err := strconv.Atoi(appPort)
-	return err == nil && uint16(v) == dstPort
+	v, err := strconv.Atoi(spec)
+	return err == nil && uint16(v) == port
 }
 
 // protocolNumber resolves a protocol token for app-id runtime tuple matching.

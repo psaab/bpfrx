@@ -1,6 +1,7 @@
 package appid
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"testing"
@@ -128,7 +129,7 @@ func TestResolveSessionNameUsesAppIDWhenEnabled(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Services.ApplicationIdentification = true
 
-	got := ResolveSessionName(map[uint16]string{7: "junos-http"}, cfg, 6, 80, 7)
+	got := ResolveSessionName(map[uint16]string{7: "junos-http"}, cfg, 6, 40000, 80, 7)
 	if got != "junos-http" {
 		t.Fatalf("ResolveSessionName() = %q, want junos-http", got)
 	}
@@ -138,7 +139,7 @@ func TestResolveSessionNameUnknownWhenEnabled(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Services.ApplicationIdentification = true
 
-	got := ResolveSessionName(nil, cfg, 6, 80, 0)
+	got := ResolveSessionName(nil, cfg, 6, 40000, 80, 0)
 	if got != Unknown {
 		t.Fatalf("ResolveSessionName() = %q, want %q", got, Unknown)
 	}
@@ -153,7 +154,7 @@ func TestResolveSessionNameFallbackWhenDisabled(t *testing.T) {
 		},
 	}
 
-	got := ResolveSessionName(nil, cfg, 6, 8444, 0)
+	got := ResolveSessionName(nil, cfg, 6, 40000, 8444, 0)
 	if got != "custom-web" {
 		t.Fatalf("ResolveSessionName() = %q, want custom-web", got)
 	}
@@ -169,39 +170,39 @@ func TestMatchTupleProtocolOnly(t *testing.T) {
 	const greProto = 47
 
 	// Protocol-only app matches a session of its protocol regardless of port.
-	if !matchTuple(greProto, 0, "gre", "") {
+	if !matchTuple(greProto, 0, 0, "gre", "", "") {
 		t.Error("protocol-only GRE app must match a GRE session (proto match alone) — got no match")
 	}
-	if !matchTuple(greProto, 1234, "gre", "") {
+	if !matchTuple(greProto, 0, 1234, "gre", "", "") {
 		t.Error("protocol-only GRE app must match regardless of dstPort — got no match")
 	}
 	// Protocol-only app does NOT match a different protocol.
-	if matchTuple(6 /*tcp*/, 0, "gre", "") {
+	if matchTuple(6 /*tcp*/, 0, 0, "gre", "", "") {
 		t.Error("protocol-only GRE app must NOT match a TCP session")
 	}
 	// Numeric protocol token, protocol-only.
-	if !matchTuple(greProto, 0, "47", "") {
+	if !matchTuple(greProto, 0, 0, "47", "", "") {
 		t.Error("protocol-only numeric-protocol app must match its protocol")
 	}
 	// Port-based app still requires BOTH protocol AND port — no regression.
-	if !matchTuple(6, 8443, "tcp", "8443") {
+	if !matchTuple(6, 0, 8443, "tcp", "", "8443") {
 		t.Error("port-based app must match on protocol+port")
 	}
-	if matchTuple(6, 9999, "tcp", "8443") {
+	if matchTuple(6, 0, 9999, "tcp", "", "8443") {
 		t.Error("port-based app must NOT match on protocol-match/port-mismatch")
 	}
-	if matchTuple(17 /*udp*/, 8443, "tcp", "8443") {
+	if matchTuple(17 /*udp*/, 0, 8443, "tcp", "", "8443") {
 		t.Error("port-based app must NOT match on port-match/protocol-mismatch")
 	}
 	// Port-range app unchanged.
-	if !matchTuple(6, 8444, "tcp", "8443-8445") {
+	if !matchTuple(6, 0, 8444, "tcp", "", "8443-8445") {
 		t.Error("port-range app must match a dstPort inside the range")
 	}
-	if matchTuple(6, 8500, "tcp", "8443-8445") {
+	if matchTuple(6, 0, 8500, "tcp", "", "8443-8445") {
 		t.Error("port-range app must NOT match a dstPort outside the range")
 	}
 	// Empty appProto must NOT match-all.
-	if matchTuple(47, 0, "", "") {
+	if matchTuple(47, 0, 0, "", "", "") {
 		t.Error("app with empty protocol must NOT match-all")
 	}
 }
@@ -219,12 +220,12 @@ func TestResolveSessionNameProtocolOnlyApp(t *testing.T) {
 	}
 
 	// AppID disabled → tuple fallback. A GRE session (proto 47) names the app.
-	got := ResolveSessionName(nil, cfg, 47, 0, 0)
+	got := ResolveSessionName(nil, cfg, 47, 0, 0, 0)
 	if got != "custom-gre" {
 		t.Fatalf("ResolveSessionName(GRE) = %q, want custom-gre (protocol-only app)", got)
 	}
 	// A non-GRE session must not pick up the protocol-only GRE app.
-	if got := ResolveSessionName(nil, cfg, 6, 80, 0); got == "custom-gre" {
+	if got := ResolveSessionName(nil, cfg, 6, 40000, 80, 0); got == "custom-gre" {
 		t.Fatalf("ResolveSessionName(TCP/80) = %q, must not match protocol-only GRE app", got)
 	}
 }
@@ -253,10 +254,10 @@ func TestResolveTupleFallbackPrefersPortOverProtocol(t *testing.T) {
 	// first-match implementation would intermittently return the protocol-only
 	// app. The specificity sort must make every iteration deterministic.
 	for i := 0; i < 256; i++ {
-		if got := resolveTupleFallback(6, 8443, cfg); got != "zzz-port-8443" {
+		if got := resolveTupleFallback(6, 0, 8443, cfg); got != "zzz-port-8443" {
 			t.Fatalf("iter %d: TCP/8443 = %q, want zzz-port-8443 (port-based beats protocol-only)", i, got)
 		}
-		if got := resolveTupleFallback(6, 9999, cfg); got != "aaa-proto-only" {
+		if got := resolveTupleFallback(6, 0, 9999, cfg); got != "aaa-proto-only" {
 			t.Fatalf("iter %d: TCP/9999 = %q, want aaa-proto-only (only the protocol-only app matches)", i, got)
 		}
 	}
@@ -265,7 +266,127 @@ func TestResolveTupleFallbackPrefersPortOverProtocol(t *testing.T) {
 func TestSessionMatchesUnknown(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Services.ApplicationIdentification = true
-	if !SessionMatches("unknown", nil, cfg, 6, 80, 0) {
+	if !SessionMatches("unknown", nil, cfg, 6, 40000, 80, 0) {
 		t.Fatal("SessionMatches() should match UNKNOWN when AppID is enabled")
+	}
+}
+
+// TestResolveSessionNameUnmappedNonzeroUnknown is the #3438 L1 fail-on-revert
+// guard. When AppID is enabled, a session carrying a NONZERO app_id that is
+// absent from AppNames (a control/dataplane catalog skew, including the H4 id
+// wrap) must render UNKNOWN — NOT a port-heuristic tuple guess. The session
+// here is TCP dst/22, which the builtin fallback would otherwise name
+// "junos-ssh". Reverting the L1 fix (restoring the enabled-path tuple fallback)
+// returns "junos-ssh" and fails this test.
+func TestResolveSessionNameUnmappedNonzeroUnknown(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Services.ApplicationIdentification = true
+
+	// app_id 999 is not present in AppNames; tuple would guess junos-ssh.
+	got := ResolveSessionName(map[uint16]string{1: "mapped-app"}, cfg, 6, 40000, 22, 999)
+	if got != Unknown {
+		t.Fatalf("unmapped nonzero app_id with AppID enabled = %q, want %q (honest UNKNOWN, not a tuple guess)", got, Unknown)
+	}
+}
+
+// TestResolveTupleFallbackHonorsSourcePort is the #3428 fail-on-revert guard.
+// An application constrained by BOTH a source-port and a destination-port must
+// match a session only when the session's source port also matches; a session
+// to the same destination port with a DIFFERENT source port must not be
+// mislabeled as that app. With AppID disabled the tuple fallback is the active
+// path. Reverting the source-port match (matchTuple ignoring SourcePort) makes
+// the wrong-source-port session resolve to backup-control and fails this test.
+func TestResolveTupleFallbackHonorsSourcePort(t *testing.T) {
+	cfg := &config.Config{
+		Applications: config.ApplicationsConfig{
+			Applications: map[string]*config.Application{
+				"backup-control": {
+					Name:            "backup-control",
+					Protocol:        "tcp",
+					SourcePort:      "12345",
+					DestinationPort: "8443",
+				},
+			},
+		},
+	}
+
+	// Matching source AND destination port → labeled.
+	if got := ResolveSessionName(nil, cfg, 6, 12345, 8443, 0); got != "backup-control" {
+		t.Fatalf("matching src+dst port = %q, want backup-control", got)
+	}
+	// Same destination port, WRONG source port → must NOT be mislabeled.
+	if got := ResolveSessionName(nil, cfg, 6, 9999, 8443, 0); got == "backup-control" {
+		t.Fatalf("non-matching source port = %q, must not be labeled backup-control", got)
+	}
+}
+
+// TestResolveTupleFallbackSourcePortRange proves the source-port constraint
+// honors an inclusive range spec (mirroring the destination-port range path).
+func TestResolveTupleFallbackSourcePortRange(t *testing.T) {
+	cfg := &config.Config{
+		Applications: config.ApplicationsConfig{
+			Applications: map[string]*config.Application{
+				"ranged-src": {
+					Name:            "ranged-src",
+					Protocol:        "udp",
+					SourcePort:      "1024-2048",
+					DestinationPort: "5000",
+				},
+			},
+		},
+	}
+	if got := ResolveSessionName(nil, cfg, 17, 1500, 5000, 0); got != "ranged-src" {
+		t.Fatalf("source port inside range = %q, want ranged-src", got)
+	}
+	if got := ResolveSessionName(nil, cfg, 17, 3000, 5000, 0); got == "ranged-src" {
+		t.Fatalf("source port outside range = %q, must not be labeled ranged-src", got)
+	}
+}
+
+// TestBuildCatalogRejectsAppIDOverflow is the #3438 H4 fail-on-revert guard for
+// the catalog shipped to the Rust helper. A config that needs more than 65535
+// application ids (the uint16 wire space minus the reserved-0 sentinel) must be
+// rejected deterministically rather than wrapping a 65536th id to 0. Reverting
+// the cap (uint16 appID with no boundary check) wraps silently and returns no
+// error, failing this test. The boundary sibling proves exactly 65535 is
+// accepted and never assigns the reserved id 0.
+func TestBuildCatalogRejectsAppIDOverflow(t *testing.T) {
+	// Reject: 65536 referenced applications.
+	if _, err := BuildCatalog(catalogConfigWithNApps(65536)); err == nil {
+		t.Fatal("BuildCatalog(65536 apps) returned no error; the uint16 app_id space must be rejected, not wrapped to 0")
+	}
+
+	// Accept: exactly 65535 applications, ids 1..65535, none wraps to 0.
+	cat, err := BuildCatalog(catalogConfigWithNApps(65535))
+	if err != nil {
+		t.Fatalf("BuildCatalog(65535 apps) error = %v; the boundary must be accepted", err)
+	}
+	if _, hasZero := cat.AppNames[0]; hasZero {
+		t.Fatal("BuildCatalog assigned the reserved app_id 0 to a real application")
+	}
+	if len(cat.AppNames) != 65535 {
+		t.Fatalf("BuildCatalog(65535 apps) produced %d ids, want 65535", len(cat.AppNames))
+	}
+}
+
+// catalogConfigWithNApps builds a config with n distinct TCP/80 applications,
+// each referenced by a single policy so CatalogNames(cfg, false) returns exactly
+// n names (AppID disabled keeps the catalog at the policy-referenced set rather
+// than fanning in the predefined table).
+func catalogConfigWithNApps(n int) *config.Config {
+	apps := make(map[string]*config.Application, n)
+	match := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("app-%06d", i)
+		apps[name] = &config.Application{Name: name, Protocol: "tcp", DestinationPort: "80"}
+		match = append(match, name)
+	}
+	return &config.Config{
+		Applications: config.ApplicationsConfig{Applications: apps},
+		Security: config.SecurityConfig{
+			Policies: []*config.ZonePairPolicies{
+				{Policies: []*config.Policy{{Match: config.PolicyMatch{Applications: match}}}},
+			},
+		},
 	}
 }

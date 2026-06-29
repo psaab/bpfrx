@@ -27,8 +27,12 @@ import "sort"
 // The fix makes unknown tokens fail at commit (strict) / warn on the tolerant
 // load path (lenient, #1960 no-brick) so the runtime only ever sees a known
 // token, and both enforcement layers therefore agree. The pkg/daemon nft
-// matchers reference these sets for a parity test; the Rust classifier mirrors
-// them (kept in sync by comment + the Go-side parity test). Tokens are matched
+// matchers reference these sets for a parity test
+// (TestHostInboundNftMatchesKnownTokens); the Rust classifier mirrors them and
+// is held in lockstep by a Go parity test that parses host_inbound.rs and
+// asserts its token sets EXACTLY equal these maps
+// (TestHostInboundRustClassifierMatchesGoSSOT, #3486 — add a token to one side
+// only and it goes RED). Tokens are matched
 // case-sensitively against the canonical lowercase spellings. At runtime BOTH
 // layers normalize case (the nft path lowercases via lowerTokens before its
 // switch; the Rust classifier lowercases too), so a wrong-case token would in
