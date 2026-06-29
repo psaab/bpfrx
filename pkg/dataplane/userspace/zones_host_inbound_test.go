@@ -26,7 +26,8 @@ func TestBuildZoneSnapshotsCarriesHostInbound(t *testing.T) {
 				SystemServices: []string{"ssh", "ping"},
 			},
 		},
-		// trust: no host-inbound-traffic stanza → must stay unconfigured.
+		// trust: no host-inbound-traffic stanza → #3405 default-deny (configured
+		// with empty token sets).
 		"trust": {Name: "trust"},
 	}
 
@@ -62,22 +63,28 @@ func TestBuildZoneSnapshotsCarriesHostInbound(t *testing.T) {
 		t.Errorf("lan protocols = %v, want empty", lan.HostInboundProtocols)
 	}
 
-	// trust declared no stanza: enforcement stays off (admit-all preserved).
+	// #3405: trust declared NO stanza but is still HostInboundConfigured=true
+	// (Junos default-deny parity). Its token sets are EMPTY, so the Rust
+	// classifier inserts an empty ZoneHostInbound -> default-deny, identical to an
+	// empty `host-inbound-traffic { }` stanza. Before #3405 this stayed
+	// unconfigured (admit-all) — the security gap the issue describes.
+	// Fail-on-revert: restore the `HostInboundTraffic != nil` gate in
+	// buildZoneSnapshots and HostInboundConfigured flips back to false here.
 	trust := byName["trust"]
-	if trust.HostInboundConfigured {
-		t.Error("trust: HostInboundConfigured = true, want false (no stanza)")
+	if !trust.HostInboundConfigured {
+		t.Error("trust: HostInboundConfigured = false, want true (#3405 no-stanza default-deny)")
 	}
 	if trust.HostInboundSystemServices != nil || trust.HostInboundProtocols != nil {
-		t.Errorf("trust: expected nil host-inbound slices, got services=%v protocols=%v",
+		t.Errorf("trust: expected nil/empty host-inbound slices (no stanza), got services=%v protocols=%v",
 			trust.HostInboundSystemServices, trust.HostInboundProtocols)
 	}
 }
 
 // TestBuildZoneHostInboundViews verifies the per-zone enforcement view used by
-// the kernel-nftables primary path (#3070): configured zones resolve their
-// firewall-local host addresses, unconfigured zones are omitted, and
-// management/cluster-control lifeline interfaces (fxp0/em0/fab*) are excluded
-// from the address sets.
+// the kernel-nftables primary path (#3070): every configured zone resolves its
+// firewall-local host addresses (including no-stanza zones, which default-deny
+// per #3405), and management/cluster-control lifeline interfaces (fxp0/em0/fab*)
+// are excluded from the address sets.
 func TestBuildZoneHostInboundViews(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
@@ -107,8 +114,21 @@ func TestBuildZoneHostInboundViews(t *testing.T) {
 		byZone[v.Zone] = v
 	}
 
-	if _, ok := byZone["lan"]; ok {
-		t.Error("lan (no host-inbound stanza) must be omitted from views")
+	// #3405: lan declared NO stanza but is now enforced (Junos default-deny) — it
+	// gets a view scoped to its firewall-local address with an EMPTY match set, so
+	// the daemon emits a catch-all DROP (deny every host-bound service/protocol).
+	// Before #3405 lan was omitted entirely (admit-all). Fail-on-revert: restore
+	// the stanza-required `configured` predicate and this view disappears.
+	lanView, ok := byZone["lan"]
+	if !ok {
+		t.Fatal("lan (no host-inbound stanza) must now have a default-deny view (#3405)")
+	}
+	if !eqStr(lanView.V4Addrs, []string{"10.0.61.1"}) {
+		t.Errorf("lan v4 addrs = %v, want [10.0.61.1]", lanView.V4Addrs)
+	}
+	if len(lanView.SystemServices) != 0 || len(lanView.Protocols) != 0 {
+		t.Errorf("lan (no stanza) must carry an empty match set (default-deny), got services=%v protocols=%v",
+			lanView.SystemServices, lanView.Protocols)
 	}
 	wan, ok := byZone["wan"]
 	if !ok {
@@ -133,6 +153,77 @@ func TestBuildZoneHostInboundViews(t *testing.T) {
 	if len(control.V4Addrs) != 0 || len(control.V6Addrs) != 0 {
 		t.Errorf("control/em0 lifeline must contribute no addresses, got v4=%v v6=%v",
 			control.V4Addrs, control.V6Addrs)
+	}
+}
+
+// TestNoStanzaZoneDefaultDeniesBothSurfaces is the #3405 RED-on-revert guard. A
+// security zone with interfaces but NO `host-inbound-traffic` stanza must
+// default-DENY host-bound traffic (Junos/vSRX parity), and the kernel-nft
+// primary path and the Rust AF_XDP secondary path must AGREE. It pins both
+// surfaces against the single config (a no-stanza zone "edge" with a
+// firewall-local address):
+//
+//   - ZoneSnapshot (Rust wire): HostInboundConfigured=true with EMPTY token
+//     sets. The Rust classifier inserts the zone into zone_host_inbound with an
+//     empty ZoneHostInbound -> admits() denies every service -> default-deny.
+//   - ZoneHostInboundView (kernel nft): a view scoped to the zone's address with
+//     an EMPTY match set -> emitHostInboundZone emits ONLY a catch-all DROP.
+//
+// Fail-on-revert: restore the pre-#3405 "stanza-required" gates (in
+// buildZoneSnapshots and BuildZoneHostInboundViews.configured) and the no-stanza
+// zone reverts to admit-all — HostInboundConfigured flips to false AND the view
+// disappears, turning every assertion below RED.
+func TestNoStanzaZoneDefaultDeniesBothSurfaces(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"ge-0-0-1": {Name: "ge-0-0-1", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"198.51.100.1/24", "2001:db8:51::1/64"}},
+		}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		// "edge" has an interface + address but NO host-inbound-traffic stanza.
+		"edge": {Name: "edge", Interfaces: []string{"ge-0-0-1.0"}},
+	}
+
+	// Rust wire surface.
+	var edge *ZoneSnapshot
+	snaps := buildZoneSnapshots(cfg)
+	for i := range snaps {
+		if snaps[i].Name == "edge" {
+			edge = &snaps[i]
+		}
+	}
+	if edge == nil {
+		t.Fatal("edge zone snapshot missing")
+	}
+	if !edge.HostInboundConfigured {
+		t.Error("no-stanza zone must be HostInboundConfigured=true (#3405 default-deny on the Rust wire)")
+	}
+	if len(edge.HostInboundSystemServices) != 0 || len(edge.HostInboundProtocols) != 0 {
+		t.Errorf("no-stanza zone must carry empty token sets, got services=%v protocols=%v",
+			edge.HostInboundSystemServices, edge.HostInboundProtocols)
+	}
+
+	// Kernel-nft surface.
+	views := BuildZoneHostInboundViews(cfg)
+	var edgeView *ZoneHostInboundView
+	for i := range views {
+		if views[i].Zone == "edge" {
+			edgeView = &views[i]
+		}
+	}
+	if edgeView == nil {
+		t.Fatal("no-stanza zone must have a kernel-nft view (#3405 default-deny)")
+	}
+	if !eqStr(edgeView.V4Addrs, []string{"198.51.100.1"}) {
+		t.Errorf("edge v4 addrs = %v, want [198.51.100.1]", edgeView.V4Addrs)
+	}
+	if !eqStr(edgeView.V6Addrs, []string{"2001:db8:51::1"}) {
+		t.Errorf("edge v6 addrs = %v, want [2001:db8:51::1]", edgeView.V6Addrs)
+	}
+	if len(edgeView.SystemServices) != 0 || len(edgeView.Protocols) != 0 {
+		t.Errorf("no-stanza zone view must carry an empty match set (catch-all drop only), "+
+			"got services=%v protocols=%v", edgeView.SystemServices, edgeView.Protocols)
 	}
 }
 

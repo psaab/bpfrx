@@ -157,10 +157,12 @@ func TestHostInboundFilterDropRulesCounted(t *testing.T) {
 
 	// A fully-open zone (`system-services all`, no drop) must NOT declare a deny
 	// counter — only zones that emit a drop get one. control/em0 is a lifeline so
-	// it never scopes; the test config has no non-lifeline `all` zone, so assert
-	// no counter exists for the lan zone (no stanza -> no drop -> no counter).
-	if strings.Contains(payload, xnft.HostInboundDenyCounterName("lan", "ip")) {
-		t.Errorf("lan (no host-inbound stanza) must not get a deny counter:\n%s", payload)
+	// it never scopes. #3405: lan declared NO stanza but is now default-deny, so
+	// it DOES emit a catch-all drop scoped to its address (10.0.61.1) and thus a
+	// deny counter. Fail-on-revert: restore the no-stanza=admit-all posture and
+	// this counter disappears (lan reverts to a permit-all exposure).
+	if !strings.Contains(payload, xnft.HostInboundDenyCounterName("lan", "ip")) {
+		t.Errorf("lan (no stanza, #3405 default-deny) must get a deny counter:\n%s", payload)
 	}
 
 	// The atomic replace idiom must delete the table before recreating it, so the
@@ -216,17 +218,29 @@ func TestHostInboundFilterExemptsIPsecAndV6Errors(t *testing.T) {
 	}
 }
 
-// TestHostInboundFilterNoStanzaNoDeny verifies a zone with NO
-// host-inbound-traffic stanza (lan) emits no deny — admit-all preserved
-// (zero-regression lifeline guarantee for unconfigured zones).
-func TestHostInboundFilterNoStanzaNoDeny(t *testing.T) {
+// TestHostInboundFilterNoStanzaDefaultDeny verifies #3405 (Junos/vSRX
+// default-deny parity): a zone with NO host-inbound-traffic stanza (lan) is now
+// enforced exactly like an empty stanza — its firewall-local address gets a
+// catch-all DROP and NO service/protocol accept. Before #3405 a no-stanza zone
+// emitted no deny (admit-all), a permit-all management-plane exposure.
+// Fail-on-revert: restore the stanza-required `configured` predicate and lan's
+// address vanishes from the payload (no drop), turning the assertions RED.
+func TestHostInboundFilterNoStanzaDefaultDeny(t *testing.T) {
 	cfg := hostInboundTestConfig()
 	views := buildAndCheckViews(t, cfg)
 	payload := buildHostInboundFilterPayload(views)
 
-	// lan's reth1 address must appear nowhere — no accept, no drop.
-	if strings.Contains(payload, "10.0.61.1") {
-		t.Errorf("lan (no host-inbound stanza) must not appear in payload:\n%s", payload)
+	// lan's reth1 address must now be scoped by a catch-all drop.
+	wantDrop := hiDrop("ip", "10.0.61.1", "lan")
+	if !strings.Contains(payload, wantDrop) {
+		t.Errorf("lan (no stanza, #3405) must emit a default-deny catch-all drop %q:\n%s", wantDrop, payload)
+	}
+	// And it must NOT carry any service/protocol accept (the operator opened
+	// nothing). The only line referencing lan's address is the drop.
+	for _, line := range strings.Split(payload, "\n") {
+		if strings.Contains(line, "10.0.61.1") && strings.Contains(line, "accept") {
+			t.Errorf("lan (no stanza) must not accept any service to its address, got: %q", line)
+		}
 	}
 }
 
@@ -517,12 +531,15 @@ func TestHostInboundFilterApplyFailureSurfaced(t *testing.T) {
 // real failure. Pre-fix the delete error was discarded entirely (`_, _ =`), so
 // this goes RED.
 func TestHostInboundFilterDeleteFailureSurfaced(t *testing.T) {
-	// A config with no enforceable host-inbound view (no zone declares a
-	// stanza) drives the teardown branch.
+	// A config with no enforceable host-inbound view drives the teardown branch.
+	// #3405 makes every zone host-inbound-enforcing (default-deny), so "no
+	// enforceable view" now means a zone with no firewall-local ADDRESS to scope
+	// a deny (rather than the pre-#3405 "no stanza"): the interface carries no
+	// address, so BuildZoneHostInboundViews yields an empty (address-less) view.
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
 		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
-			0: {Number: 0, Addresses: []string{"10.0.0.1/24"}},
+			0: {Number: 0},
 		}},
 	}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{

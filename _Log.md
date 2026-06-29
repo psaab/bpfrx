@@ -23940,3 +23940,21 @@ top.
   pkg/api/sse.go, pkg/api/rest_events_forensic_3337_test.go (new),
   pkg/grpcapi/server_show_events_forensic_3337_test.go (new),
   pkg/api/README.md, pkg/grpcapi/README.md, _Log.md
+
+## 2026-06-29 — #3405 host-inbound no-stanza default-deny (Junos/vSRX parity)
+- **Timestamp**: 2026-06-29
+- **Action**: A configured security zone with no `host-inbound-traffic` stanza
+  now DEFAULT-DENIES host-bound traffic (was admit-all). Implemented by marking
+  every configured zone host-inbound-enforcing on BOTH surfaces (kernel-nft
+  `configured` predicate + Rust-wire `buildZoneSnapshots`), reusing the existing
+  empty-stanza deny machinery. No Rust logic / wire-field change. Lifeline
+  (fxp0/em0/fab*) exclusion + ICMP/ND/PMTUD/established global accepts preserved.
+- **File(s)**: pkg/dataplane/userspace/zones.go,
+  pkg/daemon/daemon_nft.go,
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs (docs + new unit test),
+  userspace-dp/src/afxdp/forwarding/README.md,
+  docs/junos-cli-reference.md,
+  pkg/dataplane/userspace/zones_host_inbound_test.go (updated + new cross-surface
+  RED-on-revert test),
+  pkg/daemon/host_inbound_nft_test.go (updated),
+  pkg/daemon/daemon_apply_runtime_test.go (test isolation fix)

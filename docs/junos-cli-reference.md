@@ -288,6 +288,22 @@ From zone: guest, To zone: lan
   policy-deny RT_FLOW + `reject`/zone-`tcp-rst` reply as a transit deny) and
   tears down any cached host-local session on the next hit. Hit counters for
   these rules now advance.
+  - **Default-deny posture (#3405):** EVERY configured security zone denies
+    host-bound traffic by default (Junos/vSRX parity). A zone with interfaces
+    but NO `host-inbound-traffic` stanza is treated exactly like an empty
+    `host-inbound-traffic { }` stanza — it admits nothing, so SSH / HTTP / SNMP
+    / routing protocols to a firewall-local interface IP in that zone are
+    DROPPED unless the operator adds the matching `system-services` /
+    `protocols` token. Before #3405 a no-stanza zone admitted ALL host-bound
+    traffic (`None => true` on the Rust path; no kernel rule), a permit-all
+    management-plane exposure on any zone the operator never locked down. Both
+    enforcement surfaces flip together: the kernel-nft chain scopes a catch-all
+    DROP to the zone's addresses, and the Rust AF_XDP classifier inserts the
+    zone with an empty admission set. The lifeline interfaces (fxp0 / em0 /
+    fab*) are excluded from the deny address sets and the global ICMP / IPv6 ND
+    / PMTUD / established-session accepts precede every deny, so the default-deny
+    cannot strand management or break HA. (All shipped reference configs already
+    declare a `host-inbound-traffic` stanza per zone, so they are unaffected.)
   - **Host-inbound deny accounting (#3326):** a host-bound packet dropped by
     the `host-inbound-traffic` admission gate (a service/protocol not in the
     ingress zone's set) now increments the host-inbound deny counter, surfaced
