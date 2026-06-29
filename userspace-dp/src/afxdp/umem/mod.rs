@@ -350,6 +350,12 @@ pub(in crate::afxdp) struct BindingLiveState {
     pub(super) session_delta_dropped: AtomicU64,
     pub(super) session_delta_drained: AtomicU64,
     pub(super) policy_denied_packets: AtomicU64,
+    /// #3326: host-bound (LocalDelivery) packets dropped by the zone
+    /// host-inbound admission gate (`host_inbound_admits` => false). These
+    /// denies bypass the `policy_denied_packets` disposition path, so before
+    /// #3326 a configured host-inbound restriction dropped traffic that no
+    /// counter reflected. Mirrored into `GlobalCtrHostInboundDeny` (Go side).
+    pub(super) host_inbound_denied_packets: AtomicU64,
     pub(super) screen_drops: AtomicU64,
     /// #1374: SYN-cookie challenge decisions selected by the screen runtime.
     pub(super) syn_cookie_challenges: AtomicU64,
@@ -787,6 +793,7 @@ impl BindingLiveState {
             session_delta_dropped: AtomicU64::new(0),
             session_delta_drained: AtomicU64::new(0),
             policy_denied_packets: AtomicU64::new(0),
+            host_inbound_denied_packets: AtomicU64::new(0),
             screen_drops: AtomicU64::new(0),
             syn_cookie_challenges: AtomicU64::new(0),
             syn_cookie_secret_unavailable: AtomicU64::new(0),
