@@ -499,6 +499,28 @@ impl Default for PolicyAction {
 /// by a cross-language contract test in pkg/dataplane/userspace).
 pub(crate) const DEFAULT_POLICY_SENTINEL_ID: u32 = u32::MAX;
 
+/// #3363: stable rule identity under which the IMPLICIT default-policy hit
+/// counter is reported in [`PolicyState::counter_snapshots`] (and persisted in
+/// the [`PolicyCounterStore`] across snapshot rebuilds). The real per-rule
+/// identity format is `from->to/name` (`stable_policy_rule_id`); this reserved
+/// name contains no `->` or `/`, so it can never collide with a configured
+/// rule's id. This string MUST equal the Go `dataplane.DefaultPolicyName`
+/// ("default-policy") — the Go control plane reads this counter by resolving
+/// the reserved `DefaultPolicySentinelID` handle to that name (see
+/// `pkg/dataplane/userspace/policycounters.go`).
+pub(crate) const DEFAULT_POLICY_COUNTER_RULE_ID: &str = "default-policy";
+
+/// #3363: reserved 1-based hit-counter handle for the IMPLICIT default-policy
+/// result. The matched-rule path stamps `rule_index + 1` (1..=rules.len());
+/// `0` means "no per-rule counter". This sentinel (`u32::MAX`) is distinct from
+/// both — it routes [`PolicyState::hit_counter_by_idx`] to the reserved
+/// `default_counter` so a default-PERMIT session re-counts every packet of the
+/// flow on the established fast path (mirroring #3073 for configured rules). A
+/// real handle can never reach it: that would require ~4.29e9 configured rules.
+/// The default-DENY path counts on the cold path alone (a denied flow installs
+/// no session), so this handle only ever does work for default-permit.
+pub(crate) const DEFAULT_POLICY_COUNTER_IDX: u32 = u32::MAX;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PolicyEvaluationResult {
     pub(crate) action: PolicyAction,
@@ -801,7 +823,12 @@ pub(crate) struct PolicyCounterStore {
 
 impl PolicyCounterStore {
     pub(crate) fn reconcile_rules(&self, rules: &[PolicyRuleSnapshot]) {
-        let active_rule_ids: FxHashSet<String> = rules.iter().map(stable_policy_rule_id).collect();
+        let mut active_rule_ids: FxHashSet<String> =
+            rules.iter().map(stable_policy_rule_id).collect();
+        // #3363: the implicit default-policy counter has no PolicyRuleSnapshot,
+        // so retain its reserved id explicitly — otherwise every reconcile
+        // would evict it and reset the default-deny hit count to zero.
+        active_rule_ids.insert(DEFAULT_POLICY_COUNTER_RULE_ID.to_string());
         if let Ok(mut counters) = self.counters.lock() {
             counters.retain(|rule_id, _| active_rule_ids.contains(rule_id));
         }
@@ -1354,6 +1381,18 @@ pub(crate) struct PolicyState {
     /// set, so a config with no junos-host policy keeps pre-#3019 host-bound
     /// behavior exactly (no risk of newly denying management traffic).
     has_junos_host_rules: bool,
+    /// #3363: reserved hit counter for the IMPLICIT default-policy verdict
+    /// (the result returned when a flow matches no configured zone-pair,
+    /// wildcard, or `junos-global` policy). Before #3363 the default path
+    /// returned `policy_counter_idx: 0` and incremented nothing, so an
+    /// operator could not answer "how many packets are hitting the implicit
+    /// default deny?". The counter is incremented on the cold path for every
+    /// default verdict and (for default-permit) re-counted on the established
+    /// fast path via [`DEFAULT_POLICY_COUNTER_IDX`]. Persisted in the
+    /// `PolicyCounterStore` under [`DEFAULT_POLICY_COUNTER_RULE_ID`] so it
+    /// survives snapshot rebuilds, and reported as that rule id in
+    /// [`PolicyState::counter_snapshots`].
+    pub(crate) default_counter: Arc<PolicyRuleCounter>,
 }
 
 impl Default for PolicyState {
@@ -1369,16 +1408,27 @@ impl Default for PolicyState {
             books: Vec::new(),
             book_id_to_idx: FxHashMap::default(),
             has_junos_host_rules: false,
+            default_counter: Arc::new(PolicyRuleCounter::default()),
         }
     }
 }
 
 impl PolicyState {
     pub(crate) fn counter_snapshots(&self) -> Vec<PolicyRuleCounterStatus> {
-        self.rules
+        let mut snapshots: Vec<PolicyRuleCounterStatus> = self
+            .rules
             .iter()
             .map(|rule| rule.hit_counter.snapshot(&rule.rule_id))
-            .collect()
+            .collect();
+        // #3363: surface the implicit default-policy hit counter under its
+        // reserved rule id so the Go control plane can read it (via the
+        // reserved `DefaultPolicyCounterID` handle) and render a `Default
+        // policy` row separated from the configured-rule totals.
+        snapshots.push(
+            self.default_counter
+                .snapshot(DEFAULT_POLICY_COUNTER_RULE_ID),
+        );
+        snapshots
     }
 
     /// #3073: resolve the 1-based hit-counter handle stamped onto a session at
@@ -1394,6 +1444,12 @@ impl PolicyState {
     pub(crate) fn hit_counter_by_idx(&self, idx: u32) -> Option<&Arc<PolicyRuleCounter>> {
         if idx == 0 {
             return None;
+        }
+        // #3363: the reserved default-policy handle routes to the reserved
+        // counter (not into `rules`), so a default-PERMIT session binds it at
+        // install and re-counts every packet on the established fast path.
+        if idx == DEFAULT_POLICY_COUNTER_IDX {
+            return Some(&self.default_counter);
         }
         self.rules
             .get((idx - 1) as usize)
@@ -1494,6 +1550,11 @@ pub(crate) fn parse_policy_state_with_counters(
         book_id_to_idx: FxHashMap::default(),
         // #3019: armed below if any rule names the `junos-host` self zone.
         has_junos_host_rules: false,
+        // #3363: persistent reserved counter for the implicit default-policy
+        // verdict. Re-handed from the store under the reserved rule id so the
+        // Arc instance is stable across snapshot rebuilds (an in-flight
+        // default-permit session's bound counter keeps pointing at it).
+        default_counter: counter_store.rule_hit_counter(DEFAULT_POLICY_COUNTER_RULE_ID),
     };
 
     // #1606: build the dense book table first. Hard-fail on
@@ -2132,6 +2193,13 @@ pub(crate) fn evaluate_policy_result_with_icmp(
             }
         }
     }
+    // #3363: count the implicit default-policy verdict on the cold path. For
+    // default-DENY this is the ONLY count (a denied flow installs no session,
+    // so every dropped packet re-evaluates here); for default-PERMIT this is
+    // the first-packet count and the established fast path re-counts the rest
+    // via the reserved handle below. Mirrors the per-rule `rule.hit_counter.add`
+    // in `try_match_rule`.
+    state.default_counter.add(packet_len);
     PolicyEvaluationResult {
         action: state.default_action,
         // #3057: the implicit default-policy carries a reserved sentinel ID,
@@ -2141,13 +2209,20 @@ pub(crate) fn evaluate_policy_result_with_icmp(
         // as `default-policy` by the Go log/display planes.
         policy_id: DEFAULT_POLICY_SENTINEL_ID,
         // #2508: the implicit default policy has no `then log` selection.
+        // Operators who need default-deny audit logging configure an explicit
+        // `from-zone any to-zone any` catch-all policy with `then { deny; log
+        // session-init; }`, which the wildcard tier above honors (counter +
+        // log selection). Grafting `then log` onto the implicit default's enum
+        // leaf is a config-grammar change tracked separately from #3363.
         log_session_init: false,
         log_session_close: false,
         // #3227: the implicit default policy carries no per-app timeout; the
         // session ages on the global per-protocol timeout (today's behavior).
         inactivity_timeout: None,
-        // #3073: the implicit default policy has no per-rule hit counter.
-        policy_counter_idx: 0,
+        // #3363: reserved default-policy hit-counter handle (was 0 = "no
+        // counter"). Stamped onto a default-PERMIT session at install so the
+        // established fast path re-counts every packet against `default_counter`.
+        policy_counter_idx: DEFAULT_POLICY_COUNTER_IDX,
     }
 }
 

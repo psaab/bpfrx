@@ -224,16 +224,14 @@ fn default_deny_applies_without_match() {
     );
 }
 
-// #2118: explicit permit AND explicit deny rules both attribute their
-// hit to the matched rule's per-rule counter (visible in
-// counter_snapshots), while a flow that matches NO explicit rule and
-// rides the implicit default-deny increments NO per-rule counter. The
-// last assertion is the load-bearing one for #2118: it proves that the
-// "deny rows read 0" observed in the loss-cluster smoke is CORRECT when
-// the config has only explicit permit rules plus default-policy
-// deny-all — the blocked traffic rode the default-deny, which bumps the
-// aggregate counter but no per-rule counter, so there is no bug to fix
-// on the deny rows.
+// #2118 / #3363: explicit permit AND explicit deny rules both attribute
+// their hit to the matched rule's per-rule counter (visible in
+// counter_snapshots). A flow that matches NO explicit rule and rides the
+// implicit default-deny attributes its hit to the RESERVED default-policy
+// counter (#3363) — NOT to any named per-rule counter. Before #3363 the
+// default verdict incremented nothing; this asserts the named counters
+// stay clean of default-deny traffic AND that the default counter now
+// captures it under its reserved rule id.
 #[test]
 fn hit_counter_attributes_permit_and_deny_but_not_default_deny() {
     let permit_id = "security-policy:lan:wan:permit-web".to_string();
@@ -322,20 +320,30 @@ fn hit_counter_attributes_permit_and_deny_but_not_default_deny() {
     assert_eq!(deny_counter.packets, 1, "explicit deny rule must record 1 hit");
     assert_eq!(deny_counter.bytes, 200);
 
-    // The default-deny flow must NOT have inflated either per-rule
-    // counter — there is no rule_id for the default action, so no
-    // per-rule counter exists for it (the aggregate policy_deny counter,
-    // owned by the forwarding path, accounts for it instead).
-    let total_per_rule_packets: u64 = state
+    // #3363: the default-deny flow must NOT have inflated either NAMED
+    // per-rule counter — only the explicit permit + deny hits attribute to
+    // those. The sum across the named rules is therefore exactly 2.
+    let named_per_rule_packets: u64 = state
         .counter_snapshots()
         .into_iter()
+        .filter(|c| c.rule_id != "default-policy")
         .map(|c| c.packets)
         .sum();
     assert_eq!(
-        total_per_rule_packets, 2,
-        "default-deny must not increment any per-rule counter (only the \
-         permit + explicit-deny hits should be attributed)"
+        named_per_rule_packets, 2,
+        "default-deny must not increment any NAMED per-rule counter (only \
+         the permit + explicit-deny hits should be attributed)"
     );
+
+    // #3363: the default-deny flow IS captured by the reserved default-policy
+    // counter (1 packet, 300 bytes) — the implicit catch-all is now visible.
+    let default_counter = policy_counter(&state, "default-policy");
+    assert_eq!(
+        default_counter.packets, 1,
+        "the implicit default-deny flow must increment the reserved \
+         default-policy counter"
+    );
+    assert_eq!(default_counter.bytes, 300);
 }
 
 #[test]
@@ -560,7 +568,15 @@ fn hit_counters_reset_after_rule_absent_then_readded() {
         &[],
         &counter_store,
     ).expect("test snapshot must not produce integrity error");
-    assert!(deleted.counter_snapshots().is_empty());
+    // #3363: counter_snapshots always carries the reserved default-policy
+    // row, so the only surviving counter after deleting every named rule is
+    // that reserved one — no NAMED rule counter remains.
+    let deleted_named: Vec<_> = deleted
+        .counter_snapshots()
+        .into_iter()
+        .filter(|c| c.rule_id != "default-policy")
+        .collect();
+    assert!(deleted_named.is_empty());
 
     counter_store.reconcile_rules(&[scheduled_allow_snapshot(&rule_id, false)]);
     let active_again = parse_policy_state_with_counters(
@@ -3581,8 +3597,10 @@ fn policy_hit_count_evaluation_emits_one_based_counter_handle() {
         state.hit_counter_by_idx(res.policy_counter_idx).is_some(),
         "the handle must resolve to the admitting rule's counter"
     );
-    // The implicit default-deny (an unconfigured zone pair: wan->lan has no
-    // rule) carries NO handle, so the fast path counts nothing for it.
+    // #3363: the implicit default-deny (an unconfigured zone pair: wan->lan
+    // has no rule) now carries the RESERVED default-policy handle, and that
+    // handle resolves to the reserved default counter so a default-PERMIT
+    // session would re-count on the fast path.
     let defaulted = evaluate_policy_result_with_len(
         &state,
         TEST_WAN_ZONE_ID,
@@ -3596,8 +3614,23 @@ fn policy_hit_count_evaluation_emits_one_based_counter_handle() {
     );
     assert_eq!(defaulted.action, PolicyAction::Deny);
     assert_eq!(
-        defaulted.policy_counter_idx, 0,
-        "the implicit default-policy must carry no per-rule counter handle"
+        defaulted.policy_counter_idx,
+        crate::policy::DEFAULT_POLICY_COUNTER_IDX,
+        "the implicit default-policy must carry the reserved default-policy handle"
+    );
+    assert!(
+        state
+            .hit_counter_by_idx(defaulted.policy_counter_idx)
+            .is_some(),
+        "the reserved handle must resolve to the default-policy counter"
+    );
+    // The reserved handle resolves to a DIFFERENT counter than the named rule.
+    assert!(
+        !std::sync::Arc::ptr_eq(
+            state.hit_counter_by_idx(res.policy_counter_idx).unwrap(),
+            state.hit_counter_by_idx(defaulted.policy_counter_idx).unwrap(),
+        ),
+        "the default-policy counter must be distinct from any named-rule counter"
     );
 }
 
@@ -3626,7 +3659,15 @@ fn hit_counter_by_idx_guards_sentinel_and_stale() {
     // A stale handle past the (now smaller) rule table resolves to None —
     // never a panic, never a wrong-rule increment off the table end.
     assert!(state.hit_counter_by_idx(2).is_none());
-    assert!(state.hit_counter_by_idx(u32::MAX).is_none());
+    // A near-max stale handle (NOT the reserved sentinel) also resolves None.
+    assert!(state.hit_counter_by_idx(u32::MAX - 1).is_none());
+    // #3363: u32::MAX is the RESERVED default-policy handle and resolves to the
+    // reserved default counter (distinct from any named rule's counter).
+    assert!(state.hit_counter_by_idx(u32::MAX).is_some());
+    assert!(std::sync::Arc::ptr_eq(
+        state.hit_counter_by_idx(u32::MAX).unwrap(),
+        &state.default_counter,
+    ));
 }
 
 #[test]
