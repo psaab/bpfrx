@@ -372,6 +372,15 @@ func (d *clearAllDP) ClearAllSessions() (int, int, error) {
 // FAIL-ON-REVERT: removing the query/body guard makes the filtered request
 // reach ClearAllSessions and return 200, flipping the want-400 case (and the
 // cleared-flag assertion) red.
+//
+// The "malformed query" and "empty-value param" sub-cases specifically pin
+// why the guard tests r.URL.RawQuery rather than len(r.URL.Query()) > 0:
+//   - `?%zz` is an un-decodable percent-escape. url.Query() swallows the
+//     parse error and yields an EMPTY map (len 0), so a Query()-based guard
+//     would let it through and clear the whole table. RawQuery != "" rejects.
+//   - `?zone=` is a present-but-empty-value param. Both url.Query() (len 1)
+//     and RawQuery != "" reject it, but this case proves RawQuery does not
+//     under-reject a syntactically valid empty-value filter request.
 func TestRESTClearRejectsFilters(t *testing.T) {
 	t.Run("filtered clear rejected", func(t *testing.T) {
 		dp := &clearAllDP{Manager: dataplane.New()}
@@ -384,6 +393,46 @@ func TestRESTClearRejectsFilters(t *testing.T) {
 		}
 		if dp.cleared {
 			t.Fatal("filtered clear wiped the table; want no ClearAllSessions call")
+		}
+	})
+
+	t.Run("malformed query rejected", func(t *testing.T) {
+		dp := &clearAllDP{Manager: dataplane.New()}
+		s := &Server{dp: dp}
+		req := httptest.NewRequest("POST",
+			"/api/v1/security/sessions/clear", nil)
+		// Carry an un-decodable percent-escape verbatim in RawQuery.
+		// url.Query() would parse this to an empty map (len 0) and a
+		// Query()-based guard would wrongly proceed to clear-all.
+		req.URL.RawQuery = "%zz"
+		if got := req.URL.Query(); len(got) != 0 {
+			t.Fatalf("precondition: url.Query() of %q = %v (len %d), want empty map",
+				req.URL.RawQuery, got, len(got))
+		}
+		rr := httptest.NewRecorder()
+		s.clearSessionsHandler(rr, req)
+		if rr.Code != 400 {
+			t.Fatalf("malformed query: status %d, want 400; body: %s", rr.Code, rr.Body.String())
+		}
+		if dp.cleared {
+			t.Fatal("malformed query wiped the table; want no ClearAllSessions call")
+		}
+	})
+
+	t.Run("empty-value param rejected", func(t *testing.T) {
+		dp := &clearAllDP{Manager: dataplane.New()}
+		s := &Server{dp: dp}
+		req := httptest.NewRequest("POST",
+			"/api/v1/security/sessions/clear", nil)
+		// Present-but-empty value: `?zone=`. RawQuery != "" must still reject.
+		req.URL.RawQuery = "zone="
+		rr := httptest.NewRecorder()
+		s.clearSessionsHandler(rr, req)
+		if rr.Code != 400 {
+			t.Fatalf("empty-value param: status %d, want 400; body: %s", rr.Code, rr.Body.String())
+		}
+		if dp.cleared {
+			t.Fatal("empty-value param wiped the table; want no ClearAllSessions call")
 		}
 	})
 
