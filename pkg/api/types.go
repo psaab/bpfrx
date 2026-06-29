@@ -72,14 +72,50 @@ type ZoneInfo struct {
 	// security-zone <z> tcp-rst` is configured the zone sends a TCP RST for
 	// non-SYN packets to closed ports, changing client-visible deny
 	// behaviour. Omitted (false) for zones without it.
-	TcpRst         bool     `json:"tcp_rst,omitempty"`
-	ScreenProfile  string   `json:"screen_profile,omitempty"`
-	Interfaces     []string `json:"interfaces"`
-	HostInbound    []string `json:"host_inbound_services"`
-	IngressPackets uint64   `json:"ingress_packets"`
-	IngressBytes   uint64   `json:"ingress_bytes"`
-	EgressPackets  uint64   `json:"egress_packets"`
-	EgressBytes    uint64   `json:"egress_bytes"`
+	TcpRst        bool     `json:"tcp_rst,omitempty"`
+	ScreenProfile string   `json:"screen_profile,omitempty"`
+	Interfaces    []string `json:"interfaces"`
+	// HostInbound is the LEGACY flattened admission set: system-services +
+	// protocols concatenated. Kept as a back-compat alias (#3328); new
+	// consumers should read the split fields below.
+	HostInbound []string `json:"host_inbound_services"`
+	// HostInboundConfigured (#3328) records whether the zone is host-inbound
+	// ENFORCING: true when the zone declares a `host-inbound-traffic` stanza OR
+	// carries any per-interface override (#3362). Mirrors the dataplane posture
+	// bit (ZoneSnapshot.HostInboundConfigured): false = no stanza = default
+	// admit-all for host-bound traffic; true with EMPTY service/protocol lists
+	// = explicit deny-all. Without it an operator cannot distinguish "no
+	// stanza" (admit-all) from "empty stanza" (deny-all).
+	HostInboundConfigured bool `json:"host_inbound_configured"`
+	// HostInboundSystemServices / HostInboundProtocols (#3328) carry the
+	// ZONE-LEVEL admission set, kept distinct so automation can tell a
+	// system-service (ssh, ping, dhcp) apart from a routing protocol (ospf,
+	// bgp). Empty when the zone expresses host-inbound only via per-interface
+	// overrides.
+	HostInboundSystemServices []string `json:"host_inbound_system_services"`
+	HostInboundProtocols      []string `json:"host_inbound_protocols"`
+	// InterfaceHostInbound (#3328, #3362) carries per-interface host-inbound
+	// overrides. An entry exists only for an interface that declares its own
+	// `host-inbound-traffic` stanza; the effective admission set for that
+	// interface is the UNION of the zone-level set above and the override.
+	// Omitted when no interface declares an override.
+	InterfaceHostInbound []ZoneInterfaceHostInbound `json:"interface_host_inbound,omitempty"`
+	IngressPackets       uint64                     `json:"ingress_packets"`
+	IngressBytes         uint64                     `json:"ingress_bytes"`
+	EgressPackets        uint64                     `json:"egress_packets"`
+	EgressBytes          uint64                     `json:"egress_bytes"`
+}
+
+// ZoneInterfaceHostInbound is a per-interface host-inbound-traffic override
+// (#3328, #3362): a zone may expose a service (e.g. ssh) on one interface
+// while denying it on the others. Configured is always true for an emitted
+// entry (the stanza is present); empty SystemServices/Protocols with
+// Configured=true mean an explicit deny-all override on that interface.
+type ZoneInterfaceHostInbound struct {
+	Interface      string   `json:"interface"`
+	Configured     bool     `json:"configured"`
+	SystemServices []string `json:"system_services"`
+	Protocols      []string `json:"protocols"`
 }
 
 // PolicyInfo holds policy configuration data.

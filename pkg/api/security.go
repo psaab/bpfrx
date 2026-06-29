@@ -43,13 +43,38 @@ func (s *Server) zonesHandler(w http.ResponseWriter, _ *http.Request) {
 			zi.ScreenProfile = zone.ScreenProfile
 		}
 
-		// Host-inbound services
+		// Host-inbound services. #3328: surface the admission posture
+		// distinctly. HostInbound stays the flattened back-compat alias, but the
+		// split fields let automation tell a service apart from a protocol and —
+		// via HostInboundConfigured — tell "no stanza" (admit-all) apart from an
+		// explicit empty stanza (deny-all).
 		if zone.HostInboundTraffic != nil {
 			zi.HostInbound = append(zi.HostInbound, zone.HostInboundTraffic.SystemServices...)
 			zi.HostInbound = append(zi.HostInbound, zone.HostInboundTraffic.Protocols...)
+			zi.HostInboundSystemServices = append(zi.HostInboundSystemServices, zone.HostInboundTraffic.SystemServices...)
+			zi.HostInboundProtocols = append(zi.HostInboundProtocols, zone.HostInboundTraffic.Protocols...)
+		}
+		// HostInboundConfigured mirrors ZoneSnapshot.HostInboundConfigured
+		// (#3070/#3362): the zone is host-inbound ENFORCING when it declares a
+		// zone-level stanza OR carries any per-interface override.
+		zi.HostInboundConfigured = zone.HostInboundTraffic != nil || len(zone.InterfaceHostInbound) > 0
+		for _, ref := range zone.SortedInterfaceHostInboundRefs() {
+			hib := zone.InterfaceHostInbound[ref]
+			zi.InterfaceHostInbound = append(zi.InterfaceHostInbound, ZoneInterfaceHostInbound{
+				Interface:      ref,
+				Configured:     true,
+				SystemServices: append([]string{}, hib.SystemServices...),
+				Protocols:      append([]string{}, hib.Protocols...),
+			})
 		}
 		if zi.HostInbound == nil {
 			zi.HostInbound = []string{}
+		}
+		if zi.HostInboundSystemServices == nil {
+			zi.HostInboundSystemServices = []string{}
+		}
+		if zi.HostInboundProtocols == nil {
+			zi.HostInboundProtocols = []string{}
 		}
 		if zi.Interfaces == nil {
 			zi.Interfaces = []string{}

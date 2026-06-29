@@ -155,6 +155,25 @@ contract.
   per-rule `match_from_zone`/`match_to_zone` proto fields (empty for an
   unscoped global). Showing the group `*`/`*` but dropping the per-rule
   scope is the #3286 blind spot.
+- `GetZones` enumerates security zones (`ZoneInfo`). The host-inbound
+  admission set is surfaced distinctly (#3328): `host_inbound_configured`
+  is the dataplane posture bit (mirrors `ZoneSnapshot.HostInboundConfigured`,
+  #3070/#3362) — true when the zone declares a `host-inbound-traffic`
+  stanza OR carries any per-interface override. It lets a controller tell
+  apart the three postures the dataplane models: no stanza
+  (`configured=false` → admit-all for host-bound traffic), explicit empty
+  stanza (`configured=true` with empty lists → deny-all), and a populated
+  set. `host_inbound_system_services` / `host_inbound_protocols` carry the
+  zone-level set split (a service vs a routing protocol);
+  `interface_host_inbound` (repeated `InterfaceHostInbound`) carries
+  per-interface overrides (#3362), the effective set being the union of
+  the zone-level set and the override. The legacy `host_inbound_services`
+  flattened list (services + protocols) is kept as a back-compat alias.
+  The split projection is the SSOT-shared `ZoneConfig.SortedInterfaceHostInboundRefs`
+  iteration the REST `GET /api/v1/security/zones` handler also uses. Before
+  #3328 this RPC exposed only the flattened list and no `configured` flag —
+  a host-inbound / control-plane-protection posture ambiguity for
+  automation.
 - `GetScreen` enumerates the configured screen profiles. `ScreenInfo`
   carries `name`, the `checks` string list, and a `map<string,int64>
   thresholds`. The `checks` list and thresholds come from the shared

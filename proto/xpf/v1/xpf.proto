@@ -216,6 +216,9 @@ message ZoneInfo {
   uint32 id = 2;
   string screen_profile = 3;
   repeated string interfaces = 4;
+  // host_inbound_services is the LEGACY flattened admission set:
+  // system-services + protocols concatenated into one list. Kept as a
+  // back-compat alias; new consumers should read the split fields below.
   repeated string host_inbound_services = 5;
   uint64 ingress_packets = 6;
   uint64 ingress_bytes = 7;
@@ -223,6 +226,38 @@ message ZoneInfo {
   uint64 egress_bytes = 9;
   bool tcp_rst = 10;
   string description = 11;
+  // host_inbound_configured (#3328) records whether the zone is host-inbound
+  // ENFORCING: true when the zone declares a `host-inbound-traffic` stanza OR
+  // carries any per-interface override (#3362). This is the dataplane posture
+  // bit (ZoneSnapshot.HostInboundConfigured): false = no stanza = default
+  // admit-all for host-bound traffic; true with EMPTY lists = explicit
+  // deny-all. Without it an operator cannot distinguish "no stanza"
+  // (admit-all) from "empty stanza" (deny-all).
+  bool host_inbound_configured = 12;
+  // host_inbound_system_services / host_inbound_protocols (#3328) carry the
+  // ZONE-LEVEL admission set, kept distinct so automation can tell a
+  // system-service (ssh, ping, dhcp) apart from a routing protocol (ospf,
+  // bgp). Empty when the zone has no zone-level stanza (e.g. host-inbound is
+  // expressed only via per-interface overrides below).
+  repeated string host_inbound_system_services = 13;
+  repeated string host_inbound_protocols = 14;
+  // interface_host_inbound (#3328, #3362) carries per-interface host-inbound
+  // overrides. An entry exists only for an interface that declares its own
+  // `host-inbound-traffic` stanza; the effective admission set for that
+  // interface is the UNION of the zone-level set above and its override.
+  repeated InterfaceHostInbound interface_host_inbound = 15;
+}
+
+// InterfaceHostInbound (#3328, #3362) is a per-interface host-inbound-traffic
+// override: a zone may expose a service (e.g. ssh) on one interface while
+// denying it on the others. `configured` is always true for an emitted entry
+// (the stanza is present); empty service/protocol lists with configured=true
+// mean an explicit deny-all override on that interface.
+message InterfaceHostInbound {
+  string interface = 1;
+  bool configured = 2;
+  repeated string system_services = 3;
+  repeated string protocols = 4;
 }
 
 message GetPoliciesRequest {}
