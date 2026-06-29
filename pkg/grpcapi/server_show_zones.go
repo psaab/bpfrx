@@ -89,11 +89,22 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 	resp := &pb.GetPoliciesResponse{}
 	var policySetID uint32
 	for _, zpp := range cfg.Security.Policies {
+		// #3476: skip a nil zone-pair set (tolerant / HA-sync path) while
+		// advancing the policy-set ID, mirroring the runtime walker, rather
+		// than dereferencing zpp.FromZone.
+		if zpp == nil {
+			policySetID++
+			continue
+		}
 		pi := &pb.PolicyInfo{
 			FromZone: zpp.FromZone,
 			ToZone:   zpp.ToZone,
 		}
 		for i, rule := range zpp.Policies {
+			// #3476: skip a nil rule like the runtime walker does.
+			if rule == nil {
+				continue
+			}
 			pr := &pb.PolicyRule{
 				Name:         rule.Name,
 				Description:  rule.Description,
@@ -138,6 +149,11 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 			ToZone:   "*",
 		}
 		for i, rule := range cfg.Security.GlobalPolicies {
+			// #3476: skip a nil global rule (GlobalPolicies is []*Policy)
+			// like the runtime walker does.
+			if rule == nil {
+				continue
+			}
 			pr := &pb.PolicyRule{
 				Name:         rule.Name,
 				Description:  rule.Description,

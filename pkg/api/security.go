@@ -98,11 +98,24 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 	var policySetID uint32
 	var result []PolicyInfo
 	for _, zpp := range cfg.Security.Policies {
+		// #3476: the tolerant / HA-sync config path can leave a nil
+		// zone-pair set (Policies is []*ZonePairPolicies); the runtime
+		// walker skips it while advancing the policy-set ID. Mirror that so
+		// the inventory does not panic on zpp.FromZone.
+		if zpp == nil {
+			policySetID++
+			continue
+		}
 		pi := PolicyInfo{
 			FromZone: zpp.FromZone,
 			ToZone:   zpp.ToZone,
 		}
 		for _, rule := range zpp.Policies {
+			// #3476: skip a nil rule (Policies is []*Policy) like the
+			// runtime walker does, rather than dereferencing rule.Name.
+			if rule == nil {
+				continue
+			}
 			pr := PolicyRule{
 				Name:         rule.Name,
 				Action:       policyActionStr(rule.Action),
@@ -440,6 +453,14 @@ func policyActionStr(a config.PolicyAction) string {
 }
 
 func screenChecks(p *config.ScreenProfile) []string {
+	// #3476: the Screen map is `map[string]*ScreenProfile`; the tolerant /
+	// HA-sync config path can leave a nil profile value the runtime walker
+	// (pkg/dataplane/userspace/screens.go) skips. Treat a nil profile as
+	// "no checks" so the REST/gRPC inventory renders it absent rather than
+	// panicking on p.TCP.SynFlood.
+	if p == nil {
+		return nil
+	}
 	var checks []string
 	if p.TCP.SynFlood != nil {
 		checks = append(checks, "syn-flood")
