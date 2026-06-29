@@ -23091,3 +23091,7 @@ top.
 - **Timestamp**: 2026-06-28
   - **Action**: #3427 fold — routing-instance lo0 term now TERMINATES as accept (mirror userspace continue_term=false + Accept placeholder), not skip. Skip introduced an over-drop when a later deny term matched on the kernel-primary lo0 chain. Fall-through/modifier-only still emit no rule.
   - **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/lo0_filter_test.go, pkg/daemon/README.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3422 validate flow traceoptions packet-filter prefixes + flags. Strict commit now rejects an unparseable source/destination-prefix or an unimplemented flag (validateFlowTraceFlagsAndFiltersAST); lenient load/peer-sync downgrades to a warning. Runtime fail-safe: NewTraceWriter keeps an invalid filter as never-match (M01: was dropped -> empty filters -> trace everything) and drops an unknown flag so basic-datapath/session defaults still apply (M02: was installed -> defaults suppressed -> matchFilters never matches -> empty trace file while reporting enabled). Tests RED-on-revert.
+  - **File(s)**: pkg/config/compiler_security.go, pkg/config/compiler.go, pkg/logging/trace.go, pkg/config/flow_traceoptions_filter_3422_test.go, pkg/logging/trace_filter_3422_test.go, pkg/logging/README.md, _Log.md
