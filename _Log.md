@@ -23153,3 +23153,7 @@ top.
   pkg/dataplane/userspace/nat_l4_match_3429_test.go, userspace-dp/src/protocol/nat.rs,
   userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests.rs,
   docs/services-application-identification.md
+## 2026-06-28 — fix/3492 buildZoneRGMap nil-zone guard
+- **Timestamp**: 2026-06-28
+- **Action**: Add `zone == nil` guard in buildZoneRGMap (per-RG session-sync apply path); add RED-on-revert TestBuildZoneRGMapSkipsNilZones
+- **File(s)**: pkg/daemon/daemon_ha_userspace.go, pkg/daemon/per_rg_test.go

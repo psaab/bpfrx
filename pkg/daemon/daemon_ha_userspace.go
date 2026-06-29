@@ -428,6 +428,14 @@ func (d *Daemon) shouldSyncUserspaceDelta(delta dpuserspace.SessionDeltaInfo, in
 func buildZoneRGMap(cfg *config.Config, zoneIDs map[string]uint16) map[uint16]int {
 	result := make(map[uint16]int)
 	for zoneName, zone := range cfg.Security.Zones {
+		// Tolerant/programmatic/HA-peer-sync configs can leave a nil
+		// zone value in the map (the established nil-slot invariant the
+		// dataplane SSOT defends, e.g. zones.go's `if zone == nil`).
+		// Skip it here too, otherwise the zone.Interfaces deref below
+		// panics the per-RG session-sync apply path.
+		if zone == nil {
+			continue
+		}
 		zid, ok := zoneIDs[zoneName]
 		if !ok {
 			continue

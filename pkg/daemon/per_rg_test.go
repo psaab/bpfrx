@@ -318,6 +318,46 @@ func TestBuildZoneRGMap(t *testing.T) {
 	}
 }
 
+// TestBuildZoneRGMapSkipsNilZones asserts that a nil zone value in
+// cfg.Security.Zones (reachable on the tolerant/programmatic/HA-peer-sync
+// config path, the same nil-slot invariant the dataplane SSOT defends) does
+// NOT panic the per-RG session-sync apply path. Reverting the `zone == nil`
+// guard in buildZoneRGMap makes this test panic (RED-on-revert).
+func TestBuildZoneRGMapSkipsNilZones(t *testing.T) {
+	cfg := &config.Config{
+		Security: config.SecurityConfig{
+			Zones: map[string]*config.ZoneConfig{
+				"trust": {Name: "trust", Interfaces: []string{"reth0.0"}},
+			},
+		},
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"reth0": {Name: "reth0", RedundancyGroup: 1},
+			},
+		},
+	}
+	// Inject a nil zone slot post-construction, mirroring the reachable
+	// nil-slot invariant exercised by the other nil-safety tests.
+	cfg.Security.Zones["bogus"] = nil
+
+	zoneIDs := map[string]uint16{
+		"trust": 2,
+		"bogus": 9,
+	}
+
+	// Must not panic on the nil "bogus" zone.
+	m := buildZoneRGMap(cfg, zoneIDs)
+
+	// The healthy zone is still mapped: trust (zone 2) → reth0 → RG 1.
+	if rg, ok := m[2]; !ok || rg != 1 {
+		t.Errorf("zone 'trust' (ID 2): expected RG 1, got %d (ok=%v)", rg, ok)
+	}
+	// The nil zone contributes nothing.
+	if _, ok := m[9]; ok {
+		t.Error("nil zone 'bogus' (ID 9): should not be in zone RG map")
+	}
+}
+
 func TestBuildZoneRGMapEmptyConfig(t *testing.T) {
 	cfg := &config.Config{}
 	m := buildZoneRGMap(cfg, nil)
