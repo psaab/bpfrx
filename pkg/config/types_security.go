@@ -525,9 +525,20 @@ type NATPool struct {
 	// `port httpp` collapsed to Port==0 and was indistinguishable from the
 	// preserve-port default, silently no-op'ing the requested rewrite (#3450
 	// M04).
-	PortRaw       string
-	PortLow       int // source pool port range low (default 1024)
-	PortHigh      int // source pool port range high (default 65535)
+	//
+	// `json:"-"`: PortRaw is a compile-time parse artifact recomputed from the
+	// ConfigTree on every compile. It is read only Go-side — by the commit gate
+	// and the dataplane snapshot builder, both of which run against the
+	// in-memory config (the builder resolves the validated port into the
+	// existing DestinationNATRuleSnapshot.PoolPort wire slot). It must NEVER be
+	// serialized: it does not cross the wire to the Rust helper (the helper
+	// decodes the Snapshot, not config.NATPool — protocol_wire_v1.json is
+	// unaffected), and it would otherwise leak into configstore.ExportJSON's
+	// debug dump of the compiled *config.Config as a redundant duplicate of
+	// Port. The tag keeps it out of any json.Marshal of NATPool.
+	PortRaw       string `json:"-"`
+	PortLow       int    // source pool port range low (default 1024)
+	PortHigh      int    // source pool port range high (default 65535)
 	PersistentNAT *PersistentNATConfig
 	Deterministic *DeterministicNATConfig
 }

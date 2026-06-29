@@ -1,7 +1,6 @@
 package config
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -35,7 +34,14 @@ func dnatPoolTree(t *testing.T, poolCmds ...string) *ConfigTree {
 		"set security nat destination rule-set RS rule R1 then destination-nat pool p1",
 	)
 	for _, cmd := range cmds {
-		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
+		// CLAUDE.md: build flat-set syntax via ParseSetCommand (the production
+		// tokenizer — strips the `set` verb, splits bracket lists / quotes) +
+		// tree.SetPath, NEVER NewParser (which merges all lines into one node).
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
 	}
