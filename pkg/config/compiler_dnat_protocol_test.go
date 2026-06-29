@@ -73,11 +73,15 @@ func TestDNATProtocolUnresolvableLenientWarns(t *testing.T) {
 	}
 }
 
-// TestDNATProtocolResolvableMatchesRustSSOT pins the Go mirror's acceptance to
-// the documented Rust ip_proto::proto_number set: bare protocol names + a
-// 0-255 number (normalized), and NOT junos-* aliases (the DNAT path does not
-// pre-resolve them, so accepting one here would re-introduce the silent drop).
-// Empty ("" = any) is the IP-only wildcard and is resolvable.
+// TestDNATProtocolResolvableMatchesRustSSOT pins the DNAT match-protocol gate's
+// acceptance set. The set is a deliberately-TIGHTER SSOT than the Rust
+// ip_proto::proto_number resolver, NOT a 1:1 mirror of it: it accepts bare
+// protocol names + a 0-255 number (normalized), and excludes both (a) junos-*
+// aliases (the DNAT path does not pre-resolve them, so accepting one would
+// re-introduce the #2396 silent drop) and (b) "ipv6"/41, which proto_number
+// resolves since #3393 but DNAT match-protocol intentionally rejects (IPv6
+// encapsulation is not a meaningful DNAT destination-rule selector here). Empty
+// ("" = any) is the IP-only wildcard and is resolvable.
 func TestDNATProtocolResolvableMatchesRustSSOT(t *testing.T) {
 	accept := []string{
 		"", "tcp", "udp", "icmp", "icmp6", "icmpv6", "gre", "ospf", "ipip",
@@ -96,6 +100,9 @@ func TestDNATProtocolResolvableMatchesRustSSOT(t *testing.T) {
 		// junos-* aliases are NOT resolved on the raw DNAT match-protocol path
 		// (proto_number rejects them), so the gate must reject them too.
 		"junos-gre", "junos-icmp-all", "junos-tcp-any",
+		// "ipv6"/41 IS resolvable by proto_number (#3393) but is intentionally
+		// rejected by the DNAT match-protocol gate — the deliberate divergence.
+		"ipv6",
 	}
 	for _, tok := range reject {
 		if DNATProtocolResolvable(tok) {
