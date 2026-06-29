@@ -50,8 +50,18 @@ type InterfaceStats struct {
 
 // ZoneInfo holds zone configuration and counter data.
 type ZoneInfo struct {
-	Name           string   `json:"name"`
-	ID             uint16   `json:"id"`
+	Name string `json:"name"`
+	ID   uint16 `json:"id"`
+	// Description carries the zone's `description` sub-stanza (#3329). gRPC
+	// GetZones already exposes it; REST omits it when unset (no behavior
+	// change for zones without a description). Security audits routinely use
+	// the description to carry intent/owner/ticket metadata.
+	Description string `json:"description,omitempty"`
+	// TcpRst mirrors gRPC GetZones (#3329): when `set security zones
+	// security-zone <z> tcp-rst` is configured the zone sends a TCP RST for
+	// non-SYN packets to closed ports, changing client-visible deny
+	// behaviour. Omitted (false) for zones without it.
+	TcpRst         bool     `json:"tcp_rst,omitempty"`
 	ScreenProfile  string   `json:"screen_profile,omitempty"`
 	Interfaces     []string `json:"interfaces"`
 	HostInbound    []string `json:"host_inbound_services"`
@@ -70,7 +80,12 @@ type PolicyInfo struct {
 
 // PolicyRule holds a single policy rule with counters.
 type PolicyRule struct {
-	Name         string   `json:"name"`
+	Name string `json:"name"`
+	// Description carries the policy's `description` sub-stanza (#3329). gRPC
+	// GetPolicies already exposes it; REST omits it when unset (no behavior
+	// change for rules without a description). Audits use it for
+	// intent/owner/ticket/break-glass metadata.
+	Description  string   `json:"description,omitempty"`
 	Action       string   `json:"action"`
 	SrcAddresses []string `json:"src_addresses"`
 	DstAddresses []string `json:"dst_addresses"`
