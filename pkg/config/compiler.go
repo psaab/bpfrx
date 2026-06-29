@@ -2968,6 +2968,24 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3432: an OUTPUT-attached firewall filter carrying a `then
+	// routing-instance <x>` (FBF) term compiled cleanly but was a silent
+	// no-op: the userspace route-override path only consults the INPUT
+	// filter's affects_route_lookup flag (the Rust filter compiler sets it
+	// only on the input attach branch), so an output attach never steers the
+	// traffic. Reject the unsupported direction at commit so the dead steering
+	// action is operator-visible. Strict on commit / commit-check; lenient on
+	// load / peer-sync (warn — #1960; the runtime already treats the output
+	// steering term as inert). Mirrors the filter-reference gate above.
+	if err := validateFilterRoutingInstanceDirectionStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter routing-instance direction (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2461: per-flow-server NetFlow v9 / IPFIX template cross-reference. A
 	// flow-server `version9 { template <name> }` / `version-ipfix { template
 	// <name> }` (or the flat `version9-template` / `version-ipfix-template`)
