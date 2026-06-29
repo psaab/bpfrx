@@ -616,27 +616,35 @@ collapsed deny modifier the compiler cannot enforce is
 `then deny <unsupported>` modifier at commit, naming the policy scope (zone-pair
 or global), the policy, and the offending modifier; a bare `then deny`,
 `then deny log`, and `then deny count` still commit. AST pre-walk in
-`compileExpanded`, both AST shapes, zone-pair and `global` coverage. On the
-flat path the lexer flattens a modifier and its sub-tokens into one
-`Keys` slice (`["deny","log","session-init","count"]`), so the gate inspects
-EVERY collapsed token (`Keys[1:]`) against `recognizedCollapsedDenyToken` —
-the exact `{log, session-init, session-close, count}` set
-`applyCollapsedDenyModifiers` consumes — not just `Keys[1]`; checking only
-the first token let a supported-leads / unsupported-trails sequence like
-`then deny count evilmod` slip through silently. On the hierarchical path a
-direct child of `deny` is a top-level modifier, checked against the
-`supportedPolicyThenDenyChildren` allowlist (`log`/`count`); its sub-tokens
-nest deeper. Keep `recognizedCollapsedDenyToken` /
-`supportedPolicyThenDenyChildren` in lockstep with
-`applyCollapsedDenyModifiers`. **#3374:** `session-init`/`session-close` are
-LOG sub-options, valid ONLY when a `log` token accompanies them in the same
-collapsed action. Because `recognizedCollapsedDenyToken` cannot tell a
-sub-token from a top-level modifier positionally, a flat-set
-`then deny session-init` (no `log`, `Keys=["deny","session-init"]`) used to
-pass the gate and `applyCollapsedDenyModifiers` silently wired session-init
-logging — syntax Junos rejects. The gate now scans the collapsed tail for a
-`log` token and rejects a bare `session-init`/`session-close` that has no
-`log` parent (`emitOrphanLogSub`); `then deny log session-init` (and the
+`compileExpanded`, both AST shapes, zone-pair and `global` coverage. The gate
+is **parse-shape-agnostic** (#3377): `collapsedDenyModifierTokens`
+(`compiler_policy_then.go`) flattens deny's modifier tokens — `deny.Keys[1:]`
+plus the keys of every descendant node — into the SAME token sequence the
+compiler's `applyCollapsedDenyModifiers` (`compiler_security.go`) acts on, and
+the gate checks EVERY token in that sequence against
+`recognizedCollapsedDenyToken` (the exact `{log, session-init, session-close,
+count}` set `applyCollapsedDenyModifiers` consumes). Flattening is what makes
+the gate independent of how the flat-set parser grouped the modifiers: once
+`deny` (and its `log`/`count` modifiers) became declared schema leaves (#3377),
+the trailing tokens of a `then deny log session-init count` no longer always
+collapse onto deny's own `Keys` — depending on which tokens are known leaves
+they may land on deny's `Keys` (`["deny","log","session-init","count"]`), on a
+single collapsed child node (`deny → child Keys=["count","session-init"]`), or
+fully nested (`deny → log → session-init → count`). Reading only the first key
+of a child (the pre-#3377 per-child `supportedPolicyThenDenyChildren` allowlist,
+now removed) let a supported-leads / unsupported-trails sequence like
+`then deny count session-init` or `then deny count evilmod` slip through
+silently — exactly the fail-through the gate exists to prevent. Keep
+`recognizedCollapsedDenyToken` in lockstep with `applyCollapsedDenyModifiers`.
+**#3374:** `session-init`/`session-close` are LOG sub-options, valid ONLY when
+a `log` token accompanies them in the same collapsed action. Because
+`recognizedCollapsedDenyToken` cannot tell a sub-token from a top-level modifier
+positionally, a `then deny session-init` (no `log`) used to pass the gate and
+`applyCollapsedDenyModifiers` silently wired session-init logging — syntax Junos
+rejects. The gate now scans the flattened token sequence for a `log` token and
+rejects a `session-init`/`session-close` that has no `log` parent
+(`emitOrphanLogSub`) regardless of how the parser grouped it;
+`then deny log session-init` (and the
 standalone `then log session-init`) still commit. The tolerant load/peer-sync
 path downgrades both the unsupported-modifier and the orphan-sub-token reject
 to a warning (`lenientPolicyThenDeny`) so an already-persisted or peer-synced
