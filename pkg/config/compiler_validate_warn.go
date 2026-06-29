@@ -97,6 +97,9 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate application port specs and protocols
 	for name, app := range cfg.Applications.Applications {
+		if app == nil { // #3494: tolerant/HA-sync path may carry a nil application
+			continue
+		}
 		if err := validatePortSpec(app.DestinationPort); err != nil {
 			warnings = append(warnings, fmt.Sprintf("application %s: destination-port: %v", name, err))
 		}
@@ -169,6 +172,9 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate NAT zone references
 	for _, rs := range cfg.Security.NAT.Source {
+		if rs == nil { // #3494: tolerant/HA-sync path may carry a nil rule-set
+			continue
+		}
 		if rs.FromZone != "" && !zones[rs.FromZone] {
 			warnings = append(warnings, fmt.Sprintf(
 				"source-nat ruleset %q: from-zone %q not defined", rs.Name, rs.FromZone))
@@ -211,6 +217,9 @@ func ValidateConfig(cfg *Config) []string {
 	// Validate address-book entries have valid CIDR or IP formats
 	if ab := cfg.Security.AddressBook; ab != nil {
 		for name, entry := range ab.Addresses {
+			if entry == nil { // #3494: tolerant/HA-sync path may carry a nil address
+				continue
+			}
 			if entry.Value == "" {
 				// An `address <name>` entry with no compiled prefix —
 				// either no prefix at all, or only an as-yet-uncompiled
@@ -234,6 +243,9 @@ func ValidateConfig(cfg *Config) []string {
 		}
 		// Validate address-set members reference valid entries
 		for setName, as := range ab.AddressSets {
+			if as == nil { // #3494: tolerant/HA-sync path may carry a nil address-set
+				continue
+			}
 			for _, m := range as.Addresses {
 				if !addrs[m] {
 					warnings = append(warnings, fmt.Sprintf(
@@ -251,6 +263,9 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate static route destinations are valid CIDR
 	for _, sr := range cfg.RoutingOptions.StaticRoutes {
+		if sr == nil { // #3494: tolerant/HA-sync path may carry a nil static route
+			continue
+		}
 		if sr.Destination != "" {
 			if _, _, err := net.ParseCIDR(sr.Destination); err != nil {
 				warnings = append(warnings, fmt.Sprintf(
@@ -262,7 +277,13 @@ func ValidateConfig(cfg *Config) []string {
 	// Validate DNAT pool references
 	if dnat := cfg.Security.NAT.Destination; dnat != nil {
 		for _, rs := range dnat.RuleSets {
+			if rs == nil { // #3494: tolerant/HA-sync path may carry a nil rule-set
+				continue
+			}
 			for _, rule := range rs.Rules {
+				if rule == nil { // #3494: tolerant/HA-sync path may carry a nil rule
+					continue
+				}
 				if rule.Then.PoolName != "" {
 					if _, ok := dnat.Pools[rule.Then.PoolName]; !ok {
 						warnings = append(warnings, fmt.Sprintf(
@@ -276,7 +297,13 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate SNAT pool references
 	for _, rs := range cfg.Security.NAT.Source {
+		if rs == nil { // #3494: tolerant/HA-sync path may carry a nil rule-set
+			continue
+		}
 		for _, rule := range rs.Rules {
+			if rule == nil { // #3494: tolerant/HA-sync path may carry a nil rule
+				continue
+			}
 			if rule.Then.PoolName != "" {
 				if _, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]; !ok {
 					warnings = append(warnings, fmt.Sprintf(

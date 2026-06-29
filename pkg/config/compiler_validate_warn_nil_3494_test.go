@@ -39,10 +39,57 @@ func TestValidateConfigNilSlotsNoPanic(t *testing.T) {
 		nil, // #3494: nil global rule (line 304)
 	}
 
+	// #3494 (Codex MERGE-NEEDS-MAJOR fold): the same warning pass derefs NAT
+	// rule-sets/rules, applications, address-book entries/sets, and static
+	// routes — all nil-tolerant pointer slices/maps. Inject a nil element into
+	// each so reverting any added guard panics.
+	cfg.Security.NAT.Source = []*NATRuleSet{
+		{
+			Name:     "snat-rs",
+			FromZone: "trust",
+			ToZone:   "no-such-zone", // undefined -> warning
+			Rules: []*NATRule{
+				{Name: "sr1", Then: NATThen{PoolName: "no-such-spool"}}, // undefined pool -> warning
+				nil, // #3494: nil NAT rule (source pool loop)
+			},
+		},
+		nil, // #3494: nil NAT rule-set (zone-ref loop + source pool loop)
+	}
+	cfg.Security.NAT.Destination = &DestinationNATConfig{
+		RuleSets: []*NATRuleSet{
+			{
+				Name: "dnat-rs",
+				Rules: []*NATRule{
+					{Name: "dr1", Then: NATThen{PoolName: "no-such-dpool"}}, // undefined pool -> warning
+					nil, // #3494: nil NAT rule (DNAT pool loop)
+				},
+			},
+			nil, // #3494: nil NAT rule-set (DNAT pool loop)
+		},
+	}
+	cfg.Applications.Applications = map[string]*Application{
+		"app1":       {Name: "app1", Protocol: "not-a-proto"}, // invalid proto -> warning
+		"zz-nil-app": nil,                                     // #3494: nil application value
+	}
+	cfg.Security.AddressBook = &AddressBook{
+		Addresses: map[string]*Address{
+			"a1":          {Name: "a1", Value: ""}, // empty prefix -> warning
+			"zz-nil-addr": nil,                     // #3494: nil address value
+		},
+		AddressSets: map[string]*AddressSet{
+			"s1":         {Name: "s1", Addresses: []string{"not-in-book"}}, // unknown member -> warning
+			"zz-nil-set": nil,                                              // #3494: nil address-set value
+		},
+	}
+	cfg.RoutingOptions.StaticRoutes = []*StaticRoute{
+		{Destination: "not-a-cidr"}, // invalid CIDR -> warning
+		nil,                         // #3494: nil static route
+	}
+
 	// Must not panic. We don't assert on exact warning text — only that the
 	// pass completes and still emits the warnings for the non-nil slots.
 	warnings := ValidateConfig(cfg)
 	if len(warnings) == 0 {
-		t.Fatalf("expected warnings for the undefined zone/screen/scheduler refs, got none")
+		t.Fatalf("expected warnings for the undefined zone/screen/scheduler/NAT/address refs, got none")
 	}
 }
