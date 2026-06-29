@@ -28,7 +28,13 @@ func (s *Server) GetInterfaces(_ context.Context, _ *pb.GetInterfacesRequest) (*
 
 	resp := &pb.GetInterfacesResponse{}
 	for ifName := range allInterfaceNames(cfg) {
-		iface, err := net.InterfaceByName(ifName)
+		// Translate the Junos config name to the Linux kernel ifname
+		// before the kernel lookup. Config names may contain '/' (e.g.
+		// "ge-0/0/0", forbidden by IFNAMSIZ) or be virtual aliases
+		// (reth0, fab0, irb.0, gr-0/0/0.0) that don't directly map to a
+		// kernel ifindex. Matches REST /interfaces (pkg/api/interfaces.go)
+		// and the Prometheus collector. See #1565, #3460.
+		iface, err := net.InterfaceByName(cfg.ResolveKernelIfName(ifName))
 		ii := &pb.InterfaceInfo{
 			Name: ifName,
 			Zone: ifZone[ifName],
