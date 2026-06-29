@@ -83,6 +83,17 @@ type Config struct {
 	// load a stale config. /health returns 503 while degraded. Optional;
 	// if nil, the check and gauge are omitted.
 	ConfigPersistDegradedFn func() bool
+	// RollbackHistoryDegradedFn surfaces the configstore's
+	// rollback-history-degraded state via /health and the
+	// xpf_config_rollback_persist_degraded gauge (#3441, mirrors the
+	// ConfigPersistDegradedFn pattern). Returning true means the most
+	// recent commit failed to durably write its text rollback-history
+	// files. UNLIKE ConfigPersistDegradedFn this does NOT make /health
+	// return 503: the commit succeeded and the active config is durable
+	// (the rollback files are a best-effort recovery aid), so it is
+	// reported as a non-fatal field plus the gauge for alerting. Optional;
+	// if nil, the field and gauge are omitted.
+	RollbackHistoryDegradedFn func() bool
 	// NeighborPhaseAgeFn surfaces the age (seconds) since each Go
 	// periodic neighbor-maintenance phase last completed (#1780 Path A).
 	// Keys: resolve/force_probe/clean_failed/warm. A monotonically
@@ -160,63 +171,65 @@ type Config struct {
 
 // Server is the HTTP API server.
 type Server struct {
-	httpServer              *http.Server
-	httpsServer             *http.Server
-	store                   *configstore.Store
-	dp                      apiRuntimeDataPlane
-	eventBuf                *logging.EventBuffer
-	gc                      *conntrack.GC
-	routing                 *routing.Manager
-	frr                     *frr.Manager
-	ipsec                   *ipsec.Manager
-	dhcp                    *dhcp.Manager
-	vrrpMgr                 *vrrp.Manager
-	commitFn                func(ctx context.Context, comment string) (*config.Config, error)
-	commitConfirmedFn       func(ctx context.Context, minutes int) (*config.Config, error)
-	compileHealthFn         func() CompileHealthSnapshot
-	configPersistDegradedFn func() bool
-	neighborPhaseAgeFn      func() map[string]float64
-	frrReloadDegradedFn     func() bool
-	ipmonStatusFn           func() []ipmon.PolicyStatus
-	eventActionStatsFn      func() eventengine.Stats
-	rpmPinFailedFn          func() float64
-	feedsFn                 func() map[string]feeds.FeedInfo
-	ddnsStatsFn             func() *dhcpserver.DDNSStats
-	surfaceAStatsFn         func() *ddns.SurfaceAStats
-	flowCollectorHealthFn   func() []flowexport.ExporterCollectorHealth
-	feedOverlayFn           func() map[string][]string
-	policySchedActiveFn     func() (map[string]bool, bool)
-	startTime               time.Time
+	httpServer                *http.Server
+	httpsServer               *http.Server
+	store                     *configstore.Store
+	dp                        apiRuntimeDataPlane
+	eventBuf                  *logging.EventBuffer
+	gc                        *conntrack.GC
+	routing                   *routing.Manager
+	frr                       *frr.Manager
+	ipsec                     *ipsec.Manager
+	dhcp                      *dhcp.Manager
+	vrrpMgr                   *vrrp.Manager
+	commitFn                  func(ctx context.Context, comment string) (*config.Config, error)
+	commitConfirmedFn         func(ctx context.Context, minutes int) (*config.Config, error)
+	compileHealthFn           func() CompileHealthSnapshot
+	configPersistDegradedFn   func() bool
+	rollbackHistoryDegradedFn func() bool
+	neighborPhaseAgeFn        func() map[string]float64
+	frrReloadDegradedFn       func() bool
+	ipmonStatusFn             func() []ipmon.PolicyStatus
+	eventActionStatsFn        func() eventengine.Stats
+	rpmPinFailedFn            func() float64
+	feedsFn                   func() map[string]feeds.FeedInfo
+	ddnsStatsFn               func() *dhcpserver.DDNSStats
+	surfaceAStatsFn           func() *ddns.SurfaceAStats
+	flowCollectorHealthFn     func() []flowexport.ExporterCollectorHealth
+	feedOverlayFn             func() map[string][]string
+	policySchedActiveFn       func() (map[string]bool, bool)
+	startTime                 time.Time
 }
 
 // NewServer creates a new API server.
 func NewServer(cfg Config) *Server {
 	s := &Server{
-		store:                   cfg.Store,
-		dp:                      cfg.DP,
-		eventBuf:                cfg.EventBuf,
-		gc:                      cfg.GC,
-		routing:                 cfg.Routing,
-		frr:                     cfg.FRR,
-		ipsec:                   cfg.IPsec,
-		dhcp:                    cfg.DHCP,
-		vrrpMgr:                 cfg.VRRPMgr,
-		commitFn:                cfg.CommitFn,
-		commitConfirmedFn:       cfg.CommitConfirmedFn,
-		compileHealthFn:         cfg.CompileHealthFn,
-		configPersistDegradedFn: cfg.ConfigPersistDegradedFn,
-		neighborPhaseAgeFn:      cfg.NeighborPhaseAgeFn,
-		frrReloadDegradedFn:     cfg.FRRReloadDegradedFn,
-		ipmonStatusFn:           cfg.IPMonStatusFn,
-		eventActionStatsFn:      cfg.EventActionStatsFn,
-		rpmPinFailedFn:          cfg.RPMPinFailedFn,
-		feedsFn:                 cfg.FeedsFn,
-		ddnsStatsFn:             cfg.DDNSStatsFn,
-		surfaceAStatsFn:         cfg.SurfaceAStatsFn,
-		flowCollectorHealthFn:   cfg.FlowCollectorHealthFn,
-		feedOverlayFn:           cfg.FeedOverlayFn,
-		policySchedActiveFn:     cfg.PolicySchedulerActiveStateFn,
-		startTime:               time.Now(),
+		store:                     cfg.Store,
+		dp:                        cfg.DP,
+		eventBuf:                  cfg.EventBuf,
+		gc:                        cfg.GC,
+		routing:                   cfg.Routing,
+		frr:                       cfg.FRR,
+		ipsec:                     cfg.IPsec,
+		dhcp:                      cfg.DHCP,
+		vrrpMgr:                   cfg.VRRPMgr,
+		commitFn:                  cfg.CommitFn,
+		commitConfirmedFn:         cfg.CommitConfirmedFn,
+		compileHealthFn:           cfg.CompileHealthFn,
+		configPersistDegradedFn:   cfg.ConfigPersistDegradedFn,
+		rollbackHistoryDegradedFn: cfg.RollbackHistoryDegradedFn,
+		neighborPhaseAgeFn:        cfg.NeighborPhaseAgeFn,
+		frrReloadDegradedFn:       cfg.FRRReloadDegradedFn,
+		ipmonStatusFn:             cfg.IPMonStatusFn,
+		eventActionStatsFn:        cfg.EventActionStatsFn,
+		rpmPinFailedFn:            cfg.RPMPinFailedFn,
+		feedsFn:                   cfg.FeedsFn,
+		ddnsStatsFn:               cfg.DDNSStatsFn,
+		surfaceAStatsFn:           cfg.SurfaceAStatsFn,
+		flowCollectorHealthFn:     cfg.FlowCollectorHealthFn,
+		feedOverlayFn:             cfg.FeedOverlayFn,
+		policySchedActiveFn:       cfg.PolicySchedulerActiveStateFn,
+		startTime:                 time.Now(),
 	}
 
 	mux := http.NewServeMux()

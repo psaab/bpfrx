@@ -1054,6 +1054,8 @@
     "from_routing_instance": "",
     "from_zone": "",
     "interface_mode": false,
+    "match_applications": [],
+    "match_destination_ports": [],
     "name": "",
     "off": false,
     "persistent_nat": false,

@@ -11,6 +11,18 @@ import (
 	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
+// Rollback/archive persistence seams (#3441, following the #1916
+// pkg/api/tls_test.go pattern). Production code must never mutate these;
+// tests override them to record durability calls (so a test fails RED if a
+// WriteFileDurable is downgraded to atomic or a SyncDir is dropped) and to
+// inject write failures. nil-free: each aliases the real fsatomic writer.
+var (
+	rbWriteFileDurable = fsatomic.WriteFileDurable
+	rbWriteFileAtomic  = fsatomic.WriteFileAtomic
+	rbSyncDir          = fsatomic.SyncDir
+	rbRemove           = os.Remove
+)
+
 // CommitCheck validates the candidate configuration without applying it.
 func (s *Store) CommitCheck() (*config.Config, error) {
 	s.mu.RLock()
@@ -93,14 +105,27 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 
 	s.saveRollbackFiles()
 
-	// Auto-archive if configured
+	// Auto-archive if configured (#3441 H4). Capture the JUST-COMMITTED
+	// text, directory, max, and a nanosecond-resolution timestamp INSIDE
+	// the commit critical section, then hand only those immutable values
+	// to the async writer. The previous code passed nothing and let the
+	// goroutine read s.active.Format() whenever it eventually ran: two
+	// rapid commits raced so goroutine A could archive commit B's tree
+	// (mislabeled archive), and the second-resolution filename meant two
+	// same-second commits wrote the same path (later overwrote earlier).
+	// The nanosecond timestamp makes the filename unique per commit (no
+	// overwrite) and correctly labels the captured tree.
 	if s.archiveDir != "" {
+		dir := s.archiveDir
 		max := s.archiveMax
 		if max <= 0 {
 			max = 10
 		}
+		data := s.active.Format()
+		ts := time.Now()
+		seq := s.archiveSeq.Add(1)
 		go func() {
-			if err := s.ArchiveConfig(s.archiveDir, max); err != nil {
+			if err := writeArchive(dir, max, data, ts, seq); err != nil {
 				slog.Warn("auto-archive failed", "err", err)
 			}
 		}()
@@ -506,33 +531,61 @@ func (s *Store) saveRollbackFiles() {
 	}
 
 	entries := s.history.List() // most-recent-first
+	degraded := false
 	for i, entry := range entries {
 		path := s.rollbackPath(i + 1)
 		data := entry.Config.Format()
 		var err error
 		if i == 0 {
-			err = fsatomic.WriteFileDurable(path, []byte(data), 0644)
+			err = rbWriteFileDurable(path, []byte(data), 0644)
 		} else {
-			err = fsatomic.WriteFileAtomic(path, []byte(data), 0644)
+			err = rbWriteFileAtomic(path, []byte(data), 0644)
 		}
 		if err != nil {
 			slog.Warn("failed to write rollback file", "path", path, "err", err)
+			degraded = true
 		}
 	}
 	s.cleanupRollbackFiles(len(entries) + 1)
 	if len(entries) > 0 {
-		if err := fsatomic.SyncDir(filepath.Dir(s.filePath)); err != nil {
+		if err := rbSyncDir(filepath.Dir(s.filePath)); err != nil {
 			slog.Warn("failed to sync rollback directory", "err", err)
+			degraded = true
 		}
 	}
+	// #3441 L1: a rollback-slot write or dir-sync failure used to be
+	// warning-only — the commit reported success and health stayed green
+	// while xpf.conf.1 silently went missing/stale, so a restart loaded a
+	// degraded text rollback history with no signal. Record the loss in a
+	// degraded bit (surfaced via RollbackHistoryDegraded) and a journal
+	// entry. The commit still succeeds: the canonical active config already
+	// persisted durably via the #1799 persist-before-promote path; only the
+	// best-effort text rollback copies are affected.
+	if degraded && !s.rollbackPersistDegraded {
+		s.journalLog(&JournalEntry{
+			Action: "rollback_persist_error",
+			Detail: "one or more rollback history files failed to persist; rollback history may be stale after restart",
+		})
+	}
+	s.rollbackPersistDegraded = degraded
 }
 
 // cleanupRollbackFiles removes stale rollback files starting at startN.
+//
+// #3441 L3: stop only when a slot is genuinely absent (os.IsNotExist) — the
+// contiguous-sequence invariant the loader assumes. A non-not-found remove
+// error (e.g. EACCES, EBUSY) used to break the loop and leave higher slots
+// behind, which then violated that invariant on the next boot; log and keep
+// going so every reachable stale slot is cleared.
 func (s *Store) cleanupRollbackFiles(startN int) {
 	for i := startN; i <= s.history.MaxSize()+1; i++ {
 		path := s.rollbackPath(i)
-		if err := os.Remove(path); err != nil {
-			break // stop on first not-found (contiguous sequence)
+		if err := rbRemove(path); err != nil {
+			if os.IsNotExist(err) {
+				break // genuinely absent: contiguous sequence ends here
+			}
+			slog.Warn("failed to remove stale rollback file, continuing", "path", path, "err", err)
+			continue
 		}
 	}
 }
@@ -549,7 +602,16 @@ func (s *Store) loadRollbackHistory() {
 		path := s.rollbackPath(i)
 		data, err := os.ReadFile(path)
 		if err != nil {
-			break // stop on first not-found
+			// #3441 L2: stop only at a genuinely missing slot (the
+			// contiguous-sequence terminator). A transient/permission
+			// error on an intermediate slot must NOT drop all the later
+			// readable slots — log and continue so the rest of the
+			// history still loads.
+			if os.IsNotExist(err) {
+				break
+			}
+			slog.Warn("error reading rollback file, continuing", "path", path, "err", err)
+			continue
 		}
 		parser := config.NewParser(string(data))
 		tree, errs := parser.Parse()

@@ -23,6 +23,15 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
   a restart would load a stale config). The same state is exported as
   the `xpf_daemon_config_persist_degraded` 0/1 gauge, emitted even when
   the dataplane is not loaded.
+  `RollbackHistoryDegradedFn` (#3441, same injection pattern) reports
+  whether the most recent commit failed to durably persist its text
+  rollback-history files. UNLIKE the two above it does NOT downgrade
+  `/health` to 503 — the commit succeeded and the active config is
+  durable, so a forwarding firewall must not be pulled from rotation over
+  a degraded recovery aid; it is surfaced as the non-fatal
+  `rollback_history_degraded` field plus the
+  `xpf_config_rollback_persist_degraded` 0/1 gauge (also emitted even
+  when the dataplane is not loaded) for alerting.
 - `GET /metrics` — Prometheus exposition.
 - `GET /api/v1/...` — REST mirrors of the gRPC API: sessions, routes,
   NAT, DHCP, IPsec, VRRP, OSPF, BGP, etc.

@@ -7,11 +7,14 @@ use super::allocator::{
     ALLOCATION_GC_BUDGET, NS_PER_SEC, PersistentLease, PersistentSourceKey, PoolAddressFamily,
     sticky_pool_index,
 };
-use super::source::{PersistentNatPermit, SourceNatFlowKey};
+use super::source::{PersistentNatPermit, SOURCE_NAT_PROTO_ANY, SourceNatFlowKey};
 use super::destination::{PROTO_ANY, PROTO_TCP, PROTO_UDP};
 use super::*;
 use crate::ip_proto::{PROTO_ESP, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6};
-use crate::{DestinationNATRuleSnapshot, SourceNATRuleSnapshot, StaticNATRuleSnapshot};
+use crate::{
+    DestinationNATRuleSnapshot, NatAppTermWire, NatPortRangeWire, SourceNATRuleSnapshot,
+    StaticNATRuleSnapshot,
+};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -6561,4 +6564,384 @@ fn destination_nat_from_routing_instance_scope_matches_only_named_vrf() {
             .is_none(),
         "RI-scoped DNAT must NOT match in another VRF"
     );
+}
+
+// === #3429: source-NAT `match destination-port` / `match application`
+// enforcement. Before the fix these match fields were parsed and compiled but
+// never carried to the dataplane, so a port/app-scoped source-NAT rule
+// (including a `then source-nat off` exemption) silently widened to every
+// port/protocol. Reverting the l4_matches gate makes the wrong-port / wrong-app
+// lookups translate, turning the NoMatch assertions RED. ===
+
+#[test]
+fn source_nat_match_destination_port_constrains_flow_3429() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        // `match destination-port 20000 to 20003`.
+        match_destination_ports: vec![NatPortRangeWire {
+            low: 20000,
+            high: 20003,
+        }],
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
+    let src: IpAddr = "10.0.1.100".parse().unwrap();
+    let dst: IpAddr = "8.8.8.8".parse().unwrap();
+    let mut counter = None;
+    // In-range destination port -> translated.
+    let hit = match_source_nat_result_for_tuple(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        src,
+        dst,
+        PROTO_TCP,
+        12345,
+        20001,
+        egress_v4,
+        None,
+        0,
+        false,
+        &mut counter,
+    );
+    assert!(
+        matches!(hit, SourceNatLookup::Matched(_)),
+        "in-range dst port must match: {:?}",
+        hit
+    );
+    // Out-of-range destination port -> NO match (pre-fix this over-matched).
+    let miss = match_source_nat_result_for_tuple(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        src,
+        dst,
+        PROTO_TCP,
+        12345,
+        80,
+        egress_v4,
+        None,
+        0,
+        false,
+        &mut counter,
+    );
+    assert_eq!(
+        miss,
+        SourceNatLookup::NoMatch,
+        "out-of-range dst port must NOT match"
+    );
+}
+
+#[test]
+fn source_nat_match_destination_port_constrains_off_exemption_3429() {
+    // `then source-nat off` scoped to a destination port must exempt ONLY that
+    // port. Pre-fix the exemption widened to every port, so a flow on a
+    // different port was wrongly left untranslated (Matched(default)).
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "no-nat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        off: true,
+        match_destination_ports: vec![NatPortRangeWire { low: 53, high: 53 }],
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
+    let src: IpAddr = "10.0.1.100".parse().unwrap();
+    let dst: IpAddr = "8.8.8.8".parse().unwrap();
+    let mut counter = None;
+    // Exempt port -> matched as a no-op (off) rule.
+    let on_port = match_source_nat_result_for_tuple(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        src,
+        dst,
+        PROTO_UDP,
+        40000,
+        53,
+        egress_v4,
+        None,
+        0,
+        false,
+        &mut counter,
+    );
+    assert!(
+        matches!(on_port, SourceNatLookup::Matched(_)),
+        "exempt port must match the off rule: {:?}",
+        on_port
+    );
+    // Different port -> the off rule must NOT swallow it.
+    let other_port = match_source_nat_result_for_tuple(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        src,
+        dst,
+        PROTO_UDP,
+        40000,
+        443,
+        egress_v4,
+        None,
+        0,
+        false,
+        &mut counter,
+    );
+    assert_eq!(
+        other_port,
+        SourceNatLookup::NoMatch,
+        "a port-scoped `source-nat off` must NOT exempt other ports"
+    );
+}
+
+#[test]
+fn source_nat_match_application_constrains_protocol_and_port_3429() {
+    // `match application` pre-expanded to (proto=TCP, ports=[443]).
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        match_applications: vec![NatAppTermWire {
+            protocol: PROTO_TCP as u16,
+            ports: vec![NatPortRangeWire {
+                low: 443,
+                high: 443,
+            }],
+        }],
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
+    let src: IpAddr = "10.0.1.100".parse().unwrap();
+    let dst: IpAddr = "8.8.8.8".parse().unwrap();
+    let lookup = |proto: u8, dport: u16| {
+        let mut counter = None;
+        match_source_nat_result_for_tuple(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            src,
+            dst,
+            proto,
+            12345,
+            dport,
+            egress_v4,
+            None,
+            0,
+            false,
+            &mut counter,
+        )
+    };
+    // Right proto + right port -> match.
+    assert!(
+        matches!(lookup(PROTO_TCP, 443), SourceNatLookup::Matched(_)),
+        "tcp/443 must match the app-scoped rule"
+    );
+    // Right proto, wrong port -> no match.
+    assert_eq!(
+        lookup(PROTO_TCP, 80),
+        SourceNatLookup::NoMatch,
+        "tcp/80 must NOT match an app scoped to tcp/443"
+    );
+    // Wrong proto (UDP) on the same port -> no match.
+    assert_eq!(
+        lookup(PROTO_UDP, 443),
+        SourceNatLookup::NoMatch,
+        "udp/443 must NOT match an app scoped to tcp/443"
+    );
+}
+
+#[test]
+fn source_nat_unconstrained_rule_still_matches_any_l4_3429() {
+    // A rule with NO L4 match fields keeps the pre-#3429 match-any behavior,
+    // including for the address-only (proto=0) tuple-unknown caller.
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
+    let d = match_source_nat(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.1.100".parse().unwrap(),
+        "8.8.8.8".parse().unwrap(),
+        egress_v4,
+        None,
+    );
+    assert!(
+        d.is_some(),
+        "an unconstrained SNAT rule must still match (proto-unknown caller)"
+    );
+}
+
+#[test]
+fn source_nat_l4_constrained_rule_fails_closed_on_unknown_tuple_3429() {
+    // The address-only (proto=0) caller cannot supply a port/protocol, so an
+    // L4-constrained rule fails closed (does not fire) rather than over-match.
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        match_destination_ports: vec![NatPortRangeWire {
+            low: 443,
+            high: 443,
+        }],
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
+    let d = match_source_nat(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.1.100".parse().unwrap(),
+        "8.8.8.8".parse().unwrap(),
+        egress_v4,
+        None,
+    );
+    assert!(
+        d.is_none(),
+        "an L4-scoped SNAT rule must NOT fire for an unknown (proto=0) tuple"
+    );
+}
+
+// #3471 fold: a destination-port constraint that is purely an impossible
+// (low > high) range — the natNeverMatchPortRange fail-closed sentinel the Go
+// builder emits when every configured port is out of range — must match
+// NOTHING, NOT collapse to "unconstrained". The Rust parser keeps a low > high
+// range verbatim; dropping it (the pre-fold revert) empties match_dst_ports and
+// l4_matches then treats the rule as port-unconstrained = match-all (fail-open).
+#[test]
+fn source_nat_never_match_port_sentinel_matches_nothing_3429() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        // natNeverMatchPortRange = {low:1, high:0} — impossible, never matches.
+        match_destination_ports: vec![NatPortRangeWire { low: 1, high: 0 }],
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
+    let src: IpAddr = "10.0.1.100".parse().unwrap();
+    let dst: IpAddr = "8.8.8.8".parse().unwrap();
+    for dport in [1u16, 80, 443, 20001, 65535] {
+        let mut counter = None;
+        let r = match_source_nat_result_for_tuple(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            src,
+            dst,
+            PROTO_TCP,
+            12345,
+            dport,
+            egress_v4,
+            None,
+            0,
+            false,
+            &mut counter,
+        );
+        assert_eq!(
+            r,
+            SourceNatLookup::NoMatch,
+            "never-match port sentinel must reject dst port {}",
+            dport
+        );
+    }
+}
+
+// #3471 fold: an app term whose protocol is the never-match sentinel (0xFFFF,
+// what the Go builder emits for an empty/unresolvable app protocol) must match
+// NOTHING, while a genuinely-any term (SOURCE_NAT_PROTO_ANY = 256) still matches
+// every protocol. This locks the distinction the Codex finding turned on:
+// returning natProtoAny for an unresolvable protocol (the revert) would make the
+// never term behave like the any term — fail-open.
+#[test]
+fn source_nat_app_protocol_never_vs_any_3429() {
+    let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
+    let src: IpAddr = "10.0.1.100".parse().unwrap();
+    let dst: IpAddr = "8.8.8.8".parse().unwrap();
+    let lookup = |rules: &[_], proto: u8| {
+        let mut counter = None;
+        match_source_nat_result_for_tuple(
+            rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            src,
+            dst,
+            proto,
+            12345,
+            443,
+            egress_v4,
+            None,
+            0,
+            false,
+            &mut counter,
+        )
+    };
+
+    // Never-match protocol sentinel (0xFFFF): no protocol satisfies the term.
+    let never = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        match_applications: vec![NatAppTermWire {
+            protocol: 0xFFFF,
+            ports: vec![],
+        }],
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    for proto in [PROTO_TCP, PROTO_UDP, PROTO_ICMP, PROTO_GRE] {
+        assert_eq!(
+            lookup(&never, proto),
+            SourceNatLookup::NoMatch,
+            "never-match app protocol must reject protocol {}",
+            proto
+        );
+    }
+
+    // Genuinely-any protocol (256): every protocol matches the term.
+    let any = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        match_applications: vec![NatAppTermWire {
+            protocol: SOURCE_NAT_PROTO_ANY,
+            ports: vec![],
+        }],
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    for proto in [PROTO_TCP, PROTO_UDP, PROTO_ICMP, PROTO_GRE] {
+        assert!(
+            matches!(lookup(&any, proto), SourceNatLookup::Matched(_)),
+            "any-protocol app term must match protocol {}",
+            proto
+        );
+    }
 }

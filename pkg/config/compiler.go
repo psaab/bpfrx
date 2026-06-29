@@ -145,6 +145,20 @@ type compileOpts struct {
 	// live there. Same doctrine as lenientLogStreamPort.
 	lenientFlowTraceFile bool
 
+	// lenientFlowTraceFilter (#3422) downgrades the flow-trace flag /
+	// packet-filter-prefix gate (validateFlowTraceFlagsAndFiltersAST) from a
+	// hard compile error to a cfg.Warnings entry. Set ONLY on the tolerant
+	// load / peer-sync paths: a persisted or peer-synced config carrying an
+	// unparseable `packet-filter <n> source-prefix` value or an unimplemented
+	// `flag` token (values an older binary accepted) must still boot — the
+	// runtime fixes in NewTraceWriter keep an invalid filter match-none and
+	// drop an unknown flag so the defaults still apply, so a leniently-loaded
+	// value is fail-safe rather than the pre-#3422 fail-open (trace
+	// everything) / fail-silent (trace nothing). Like the file gate the flag
+	// and prefix values are AST leaves SchemaValidate treats as opaque, so the
+	// check does NOT live there. Same doctrine as lenientFlowTraceFile.
+	lenientFlowTraceFilter bool
+
 	// lenientLogEventModeFormat (#3349) downgrades the event-mode log-format
 	// compatibility gate (validateLogEventModeFormatStrict) from a hard
 	// compile error to a cfg.Warnings entry. Set ONLY on the tolerant load /
@@ -1165,6 +1179,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientLogStreamPort:                 true,
 		lenientLogTLSProfile:                 true,
 		lenientFlowTraceFile:                 true,
+		lenientFlowTraceFilter:               true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1308,6 +1323,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientLogStreamPort:                 true,
 		lenientLogTLSProfile:                 true,
 		lenientFlowTraceFile:                 true,
+		lenientFlowTraceFilter:               true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1491,6 +1507,19 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// peer-synced config still boots (NewTraceWriter refuses the unsafe path at
 	// runtime, so tracing is simply disabled).
 	flowTraceFileWarnings, err := validateFlowTraceFileAST(tree.Children, "", opts.lenientFlowTraceFile)
+	if err != nil {
+		return nil, err
+	}
+
+	// #3422 flow-trace flag / packet-filter prefix gate. The compiler copies
+	// flag tokens and filter prefixes verbatim; an unparseable prefix makes
+	// NewTraceWriter drop the filter (every-filter-invalid -> trace everything,
+	// M01) and an unimplemented flag makes matchFlags never match (trace
+	// nothing while reporting enabled, M02). Strict (commit / commit-check):
+	// reject. Lenient (load / peer-sync): warn so a persisted/peer-synced value
+	// still boots — the runtime now fails safe either way.
+	flowTraceFilterWarnings, err := validateFlowTraceFlagsAndFiltersAST(
+		tree.Children, "", opts.lenientFlowTraceFilter)
 	if err != nil {
 		return nil, err
 	}
@@ -1688,6 +1717,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, logStreamPortWarnings...)
 	cfg.Warnings = append(cfg.Warnings, logTLSProfileWarnings...)
 	cfg.Warnings = append(cfg.Warnings, flowTraceFileWarnings...)
+	cfg.Warnings = append(cfg.Warnings, flowTraceFilterWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, appCollisionWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
