@@ -28,6 +28,8 @@ type GlobalStats struct {
 	PolicyDenies         uint64 `json:"policy_denies"`
 	NATAllocFails        uint64 `json:"nat_alloc_failures"`
 	HostInboundDeny      uint64 `json:"host_inbound_denies"`
+	HostInboundAllowed   uint64 `json:"host_inbound_allowed"`
+	NAT64Translations    uint64 `json:"nat64_translations"`
 	TCEgressPackets      uint64 `json:"tc_egress_packets"`
 	FabricRedirects      uint64 `json:"fabric_redirects"`
 	FabricFwdDrops       uint64 `json:"fabric_fwd_drops"`

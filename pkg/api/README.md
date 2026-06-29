@@ -51,6 +51,16 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     the scoped global's real zones on its `from_zone`/`to_zone` labels
     (#3286) — an unscoped global keeps `*`/`*` — so counter-based
     validation is unambiguous on the canonical metrics surface.
+  - `GET /api/v1/statistics/global` — global dataplane counters
+    (`GlobalStats`, types.go). The field set mirrors the gRPC
+    `GetGlobalStats` reader: as of #3426 it includes `nat64_translations`
+    (`GlobalCtrNAT64Xlate`) and `host_inbound_allowed`
+    (`GlobalCtrHostInbound`) alongside the long-standing
+    `host_inbound_denies`. Before #3426 REST omitted both, so an automation
+    client reading only REST could not see NAT64 translation volume or the
+    host-inbound allow count even though gRPC and Prometheus
+    (`xpf_nat64_translations_total`) exposed them. A counter read failure
+    returns HTTP 500 (#3345), not a clean zero.
 - `GET /api/v1/events/stream` — Server-Sent Events stream of dataplane
   events. Backed by the `pkg/logging` event ring buffer; long-lived
   consumers must drain. `?category=` (and `?severity=` on
