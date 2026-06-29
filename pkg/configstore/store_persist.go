@@ -272,22 +272,41 @@ func (s *Store) SetArchiveConfig(dir string, max int) {
 	s.archiveMax = max
 }
 
-// ArchiveConfig saves a timestamped copy of the active config.
+// ArchiveConfig saves a timestamped copy of the active config. The active
+// text and the timestamp are captured together under the lock so the
+// written archive matches the config that was active at the call (#3441 H4),
+// then the actual write happens off-lock via writeArchive.
 func (s *Store) ArchiveConfig(archiveDir string, maxArchives int) error {
 	s.mu.RLock()
 	data := s.active.Format()
 	s.mu.RUnlock()
+	return writeArchive(archiveDir, maxArchives, data, time.Now())
+}
 
+// writeArchive writes the captured config text to a uniquely-named archive
+// file and rotates old archives. data and ts are immutable values captured
+// by the caller; writeArchive never reads shared store state, so it is safe
+// to call from the async auto-archive goroutine.
+//
+// #3441 H4: the filename carries a nanosecond-resolution timestamp
+// (config-YYYYMMDD-HHMMSS.nnnnnnnnn.conf). The previous second-resolution
+// name let two same-second commits resolve to the same path, so the later
+// atomic write silently overwrote the earlier archive. Nanosecond precision
+// makes each commit's archive a distinct, never-overwritten file while still
+// sorting chronologically for rotateArchives. (An alternative is an O_EXCL
+// open with a retry-on-EEXIST seq suffix; the per-commit nanosecond ts is
+// simpler and unique across process restarts too.)
+func writeArchive(archiveDir string, maxArchives int, data string, ts time.Time) error {
 	if err := os.MkdirAll(archiveDir, 0755); err != nil {
 		return fmt.Errorf("create archive dir: %w", err)
 	}
 
-	filename := fmt.Sprintf("config-%s.conf", time.Now().Format("20060102-150405"))
+	filename := fmt.Sprintf("config-%s.conf", ts.Format("20060102-150405.000000000"))
 	path := filepath.Join(archiveDir, filename)
 	// AtomicGeneratedConfig (#1894): archives are best-effort history
 	// copies — atomic so a crash never leaves a torn archive, but not
 	// worth an fsync.
-	if err := fsatomic.WriteFileAtomic(path, []byte(data), 0644); err != nil {
+	if err := rbWriteFileAtomic(path, []byte(data), 0644); err != nil {
 		return fmt.Errorf("write archive: %w", err)
 	}
 
@@ -298,6 +317,18 @@ func (s *Store) ArchiveConfig(archiveDir string, maxArchives int) error {
 		rotateArchives(archiveDir, maxArchives)
 	}
 	return nil
+}
+
+// RollbackHistoryDegraded reports whether the most recent commit failed to
+// durably persist its text rollback history files (#3441 L1). The commit
+// itself still succeeded — the canonical active config persisted via the
+// #1799 path — but loadRollbackHistory would read a stale/lossy history
+// after a restart. Surfaced so callers (status/health) can report the loss
+// instead of it being warning-only.
+func (s *Store) RollbackHistoryDegraded() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rollbackPersistDegraded
 }
 
 // rotateArchives keeps only the most recent maxArchives files.

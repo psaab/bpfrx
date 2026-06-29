@@ -23010,3 +23010,17 @@ top.
     host-inbound system-service. No behavior/admit change — docs-only; the
     #3368 under-admission premise is not borne out by the Junos contract.
   - **File(s)**: docs/junos-cli-reference.md, _Log.md
+
+## #3441 configstore auto-archive correctness + rollback-file durability gaps
+- **Timestamp**: 2026-06-28
+- **Action**: Fix Codex audit-101 H4/L1/L2/L3. H4: auto-archive captures the
+  just-committed text + nanosecond timestamp inside the commit critical
+  section (no wrong-tree race, no same-second overwrite). L1: rollback-slot
+  write / dir-sync failure now sets a degraded bit (RollbackHistoryDegraded)
+  + journals rollback_persist_error instead of warning-only. L2/L3:
+  loadRollbackHistory + cleanupRollbackFiles break only on os.IsNotExist,
+  log+continue on other errors. Added package-var fsatomic seams
+  (rbWriteFileDurable/rbWriteFileAtomic/rbSyncDir/rbRemove) so durability is
+  test-pinnable (#1916 pattern). 5 RED-on-revert tests.
+- **File(s)**: pkg/configstore/store.go, store_commit.go, store_persist.go,
+  durability_3441_test.go, README.md

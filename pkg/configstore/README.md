@@ -248,6 +248,32 @@ owned by the `journal/` subpackage.
   may lag after a power cut), then one `fsatomic.SyncDir` makes the
   shuffle and the stale-slot unlinks durable — a single dir fsync
   instead of ~50 fsync pairs under the store mutex.
+- Rollback-history degradation (#3441 L1): a rollback-slot write or the
+  trailing dir-sync failing no longer just logs a warning. The commit
+  still succeeds (the canonical active config already persisted via the
+  #1799 path), but the store sets a degraded bit — surfaced by
+  `RollbackHistoryDegraded()` — and journals a `rollback_persist_error`
+  entry, so a stale-on-restart rollback history is visible rather than
+  silent. The bit clears on the next fully-successful save.
+- `loadRollbackHistory` / `cleanupRollbackFiles` stop ONLY on a
+  genuinely-missing slot (`os.IsNotExist`), not on an arbitrary read/
+  remove error (#3441 L2/L3): a transient or permission error on an
+  intermediate slot logs-and-continues so the later readable slots still
+  load and every stale slot is still cleared (preserving the
+  contiguous-sequence invariant the loader assumes).
+- Auto-archive correctness (#3441 H4): `CommitWithDescription` captures
+  the JUST-COMMITTED `Format()` text plus a nanosecond-resolution
+  timestamp inside the commit critical section and hands only those
+  immutable values to the async archive goroutine. Previously the
+  goroutine read `s.active.Format()` whenever it eventually ran (so a
+  rapid second commit could make it archive the wrong tree) and named
+  the file at second resolution (so two same-second commits overwrote
+  one another). The nanosecond filename
+  (`config-YYYYMMDD-HHMMSS.nnnnnnnnn.conf`) is unique per commit and
+  still sorts chronologically for rotation. The rollback/archive writers
+  route through package-var seams (`rbWriteFileDurable`,
+  `rbWriteFileAtomic`, `rbSyncDir`, `rbRemove`) so tests can pin the
+  durability call and inject failures (#1916 pattern).
 - `master.key` is written durably BEFORE any tree encrypted with it
   (the key persist runs inside writeTree's encrypt step) — a lost key
   meant a permanently undecryptable active config.
