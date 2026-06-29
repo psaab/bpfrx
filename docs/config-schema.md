@@ -2167,6 +2167,63 @@ lenient-warns; plus three-color-policer + `junos-*` predefined + nested-set +
 implicit-multi-term-not-false-rejected cases). Like the gates above, these are
 compiler-side only — not yet typed `setSchema` leaves.
 
+### #3339 — application / application-set name-collision validation
+
+`compileApplications` (`compiler_applications.go`) collects user applications and
+application-sets into two name-keyed maps with **last-write-wins** semantics, and
+a multi-term `applications application <X>` additionally MINTS an implicit
+application-set under the application's own name
+(`apps.ApplicationSets[appName] = implicitSet`). Every one of these writes
+silently overwrote a colliding earlier definition with no commit error
+(Codex review 080, M07 + M08):
+
+- **Application vs application-set sharing a name (M07).** An explicit
+  `applications application-set <X>` silently replaced the implicit set minted
+  for a multi-term `applications application <X>` (and, generally, an application
+  and an application-set are one flat Junos namespace). A policy referencing `<X>`
+  then enforced whichever definition won the map-write race — and the two
+  resolvers DISAGREE on which that is: policy expansion
+  (`resolveUserspaceApplicationNames`) resolves application-first, while the
+  AppID catalog (`addPolicyApps`) resolves application-set-first, so a session
+  could be admitted by one definition but cataloged/labeled by the other.
+- **Duplicate term-generated application name (M08).** Two `term`s under one
+  application generating the same per-term name (`<parent>-<term>`, with a
+  protocol suffix only when one term carries multiple protocols) made the later
+  `apps.Applications[name] = t` overwrite the earlier while the implicit set
+  still listed the duplicate member — ambiguous and silent.
+- **Duplicate application / application-set definition** (the same name authored
+  twice in one namespace) is also rejected. Such duplicates survive as distinct
+  AST siblings only on a hierarchical file parse (the set-command config tree
+  merges same-named siblings), but rejecting them keeps the gate honest for
+  either representation.
+
+The gate `validateApplicationNameCollisionsAST`
+(`pkg/config/compiler_applications_collision.go`) is an **AST pre-walk** run on
+the group-expanded, inactive-pruned tree in `compileExpanded` (alongside
+`validateUnsupportedInterfaceStanzasAST`), NOT a post-compile check on the typed
+`*Config`: by the time the maps are built the colliding definitions have already
+been merged away by last-write-wins — only the raw AST still carries every
+definition. The predefined `junos-*` table lives outside the AST, so a user
+`application junos-http` that merely SHADOWS a predefined application is not a
+collision (one AST stanza, no peer) and is left untouched; a multi-term
+application minting an implicit set under its own name is likewise not a
+self-collision.
+
+**Strict (`commit` / `commit check`):** the first collision is a HARD commit
+error naming the offending name. **Lenient (`Store.Load` / HA peer-sync —
+`CompileConfigLenient` / `CompileConfigForNodeLenient`, flag
+`lenientApplicationNameCollisions`):** the violation downgrades to a
+`cfg.Warnings` entry so a node that committed a colliding config BEFORE this gate
+existed (or a peer-synced config) still BOOTS after upgrade instead of failing
+closed (#1960 / #3261 fail-closed-on-load doctrine); `compileApplications` keeps
+producing the same (arbitrary but stable) last-write-wins maps on that path.
+
+Regression coverage: `pkg/config/compiler_applications_collision_3339_test.go`
+(app-vs-set collision, implicit-set-overwrite, duplicate application / set
+definition, duplicate term-generated name, distinct-names-commit incl. a
+predefined shadow, lenient-warns). Compiler-side only — not a typed `setSchema`
+leaf (applications stay opaque to `SchemaValidate`).
+
 ### #2226 — rib-group `import-rib` undefined-reference validation
 
 `routing-options rib-groups <group> import-rib <rib>` was unvalidated: an

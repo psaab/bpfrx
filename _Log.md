@@ -22979,3 +22979,14 @@ top.
   - **File(s)**: pkg/config/compiler_validate_strict.go,
     pkg/config/compiler.go,
     pkg/config/log_stream_config_3349_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3339 — reject application/application-set name collisions at
+    commit (AST gate validateApplicationNameCollisionsAST: cross-namespace
+    app-vs-set, duplicate definitions, duplicate term-generated names). Strict
+    on commit, lenient-warn on load/peer-sync (lenientApplicationNameCollisions).
+    Added docs/config-schema.md #3339 subsection + tests.
+  - **File(s)**: pkg/config/compiler_applications_collision.go,
+    pkg/config/compiler.go,
+    pkg/config/compiler_applications_collision_3339_test.go,
+    docs/config-schema.md, _Log.md
