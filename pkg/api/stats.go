@@ -38,6 +38,8 @@ func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		PolicyDenies:         readCounter(dataplane.GlobalCtrPolicyDeny),
 		NATAllocFails:        readCounter(dataplane.GlobalCtrNATAllocFail),
 		HostInboundDeny:      readCounter(dataplane.GlobalCtrHostInboundDeny),
+		HostInboundAllowed:   readCounter(dataplane.GlobalCtrHostInbound),
+		NAT64Translations:    readCounter(dataplane.GlobalCtrNAT64Xlate),
 		TCEgressPackets:      readCounter(dataplane.GlobalCtrTCEgressPackets),
 		FabricRedirects:      readCounter(dataplane.GlobalCtrFabricRedirect),
 		FabricFwdDrops:       readCounter(dataplane.GlobalCtrFabricFwdDrop),
