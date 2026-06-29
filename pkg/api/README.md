@@ -113,18 +113,31 @@ under the daemon's errgroup. Nothing else imports this package.
 - Global dataplane counters get the same observability-integrity
   treatment (#3345): a failed `ReadGlobalCounter` is no longer swallowed
   to `0`, because a degraded counter bridge must not be
-  indistinguishable from "no events" on a security appliance. REST
-  `/stats/global` returns HTTP 500 when any global-counter read fails;
-  gRPC `GetGlobalStats` returns `codes.Internal`. The Prometheus
-  collector (`metrics_counters.go`) OMITS the affected per-counter
-  sample (rather than emitting a misleading `0`) and bumps the monotonic
-  `xpf_counter_read_errors_total` scrape-error counter, which is always
-  emitted (0 when healthy) for alerting. The text CLI / gRPC `show
-  security screen` and `show security alarms` commands print a
-  `warning: screen counter read failed ...` line instead of a clean
-  `Total screen drops: 0`. Pinned by `stats_counter_error_test.go`
-  (REST + Prometheus), `pkg/grpcapi/global_stats_counter_error_test.go`,
-  and `pkg/cli/show_security_counter_error_test.go`.
+  indistinguishable from "no events" on a security appliance. The fix
+  covers EVERY global-counter read surface:
+  - **Structured APIs**: REST `/stats/global` returns HTTP 500 when any
+    global-counter read fails; gRPC `GetGlobalStats` returns
+    `codes.Internal` (the error is checked AFTER the full response struct
+    is built, so a failure on a late read — e.g. `RxPackets`, read after
+    the screen-detail loop — is also covered).
+  - **Prometheus** (`metrics_counters.go`) OMITS the affected per-counter
+    sample (rather than emitting a misleading `0`) and bumps the monotonic
+    `xpf_counter_read_errors_total` scrape-error counter, always emitted
+    (0 when healthy) for alerting.
+  - **Text commands** print a `warning: ... counter read failed ...` line
+    instead of a clean zero: `show security screen` / `show security
+    alarms` (CLI + gRPC), `show security flow statistics` — the canonical
+    operator global-counter view (CLI `showStatistics`/`showFlowStatistics`
+    + gRPC `showFlowStatistics`), and `show chassis cluster fabric
+    statistics` (CLI + gRPC fabric-redirect counters).
+
+  Pinned by `stats_counter_error_test.go` (REST + Prometheus),
+  `pkg/grpcapi/global_stats_counter_error_test.go` (incl. the late-read
+  ordering case), `pkg/grpcapi/flow_cluster_counter_error_test.go`, and
+  `pkg/cli/show_security_counter_error_test.go`. Per-zone / per-policy /
+  per-filter counter-read surfacing (the `collectZoneCounters` /
+  `collectPolicyCounters` / `collectFilterCounters` paths that today
+  `continue` on error) is tracked separately in #3408.
 - Named source-NAT pool stats are sourced from the userspace helper's
   LIVE runtime status, not config text (#2938). `natPoolStatsHandler`
   (`/security/nat/source/pools`) reads `s.runtimeSourceNATPools()` — the

@@ -42,3 +42,34 @@ func TestGetGlobalStatsFailsOnCounterReadError(t *testing.T) {
 		t.Fatalf("GetGlobalStats error code = %v, want Internal; err: %v", status.Code(err), err)
 	}
 }
+
+// lateCounterFaultGRPCDP fails ONLY GlobalCtrRxPackets, which GetGlobalStats
+// reads AFTER the screen-counter loop. This pins the H1 ordering fix: the
+// readErr check must run AFTER the full response struct is built, or a
+// failure on a late read returns a nil-error zero-valued field.
+type lateCounterFaultGRPCDP struct {
+	*dataplane.Manager
+}
+
+func (d *lateCounterFaultGRPCDP) IsLoaded() bool { return true }
+
+func (d *lateCounterFaultGRPCDP) ReadGlobalCounter(idx uint32) (uint64, error) {
+	if idx == dataplane.GlobalCtrRxPackets {
+		return 0, errors.New("counter bridge degraded")
+	}
+	return 0, nil
+}
+
+func TestGetGlobalStatsFailsOnLateCounterReadError(t *testing.T) {
+	dp := &lateCounterFaultGRPCDP{Manager: dataplane.New()}
+	s := newViewServer(t, dp)
+
+	_, err := s.GetGlobalStats(context.Background(), &pb.GetGlobalStatsRequest{})
+	if err == nil {
+		t.Fatal("GetGlobalStats returned nil error on a LATE (post-screen-loop) " +
+			"counter read failure; want codes.Internal (H1 ordering)")
+	}
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("GetGlobalStats error code = %v, want Internal; err: %v", status.Code(err), err)
+	}
+}

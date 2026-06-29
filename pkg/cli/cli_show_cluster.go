@@ -28,14 +28,20 @@ type fabricRedirectCounters struct {
 }
 
 // readFabricRedirectCounters samples the dataplane fabric counters.
-// Returns (zeroed, false) when the dataplane is not loaded.
-func (c *CLI) readFabricRedirectCounters() (fabricRedirectCounters, bool) {
+// Returns (zeroed, false, nil) when the dataplane is not loaded. The third
+// value is the first global-counter read error (#3345) so the caller can
+// surface a degraded counter bridge instead of presenting clean zeros.
+func (c *CLI) readFabricRedirectCounters() (fabricRedirectCounters, bool, error) {
 	if !c.dataplaneLoaded() {
-		return fabricRedirectCounters{}, false
+		return fabricRedirectCounters{}, false, nil
 	}
 	telemetry := dataplane.TelemetryOf(c.dp)
+	var readErr error
 	read := func(index uint32) uint64 {
-		v, _ := telemetry.GlobalCounter(index)
+		v, err := telemetry.GlobalCounter(index)
+		if err != nil && readErr == nil {
+			readErr = err
+		}
 		return v
 	}
 	return fabricRedirectCounters{
@@ -44,7 +50,7 @@ func (c *CLI) readFabricRedirectCounters() (fabricRedirectCounters, bool) {
 		fab1:  read(dataplane.GlobalCtrFabricRedirectFab1),
 		zone:  read(dataplane.GlobalCtrFabricRedirectZone),
 		drops: read(dataplane.GlobalCtrFabricFwdDrop),
-	}, true
+	}, true, readErr
 }
 
 // showChassis shows hardware information (like Junos "show chassis hardware").
@@ -281,13 +287,16 @@ func (c *CLI) showChassisClusterStatistics() error {
 }
 
 func (c *CLI) showChassisClusterFabricStatistics() error {
-	counters, ok := c.readFabricRedirectCounters()
+	counters, ok, readErr := c.readFabricRedirectCounters()
 	if !ok {
 		fmt.Println("Dataplane not loaded")
 		return nil
 	}
 
 	fmt.Println("Fabric redirect statistics:")
+	if readErr != nil {
+		fmt.Printf("warning: fabric counter read failed (statistics may be incomplete): %v\n", readErr)
+	}
 	fmt.Printf("    Total redirects:          %d\n", counters.total)
 	fmt.Printf("    fab0 redirects:           %d\n", counters.fab0)
 	fmt.Printf("    fab1 redirects:           %d\n", counters.fab1)

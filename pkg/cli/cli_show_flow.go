@@ -95,8 +95,15 @@ func (c *CLI) showStatistics(detail bool) error {
 		return nil
 	}
 
+	// #3345: surface a counter-read failure rather than printing clean zeros
+	// that hide a degraded counter bridge. This is the canonical operator
+	// global-counter view (`show security flow statistics`).
+	var readErr error
 	readCounter := func(idx uint32) uint64 {
-		v, _ := c.dp.ReadGlobalCounter(idx)
+		v, err := c.dp.ReadGlobalCounter(idx)
+		if err != nil && readErr == nil {
+			readErr = err
+		}
 		return v
 	}
 
@@ -121,6 +128,9 @@ func (c *CLI) showStatistics(detail bool) error {
 	fmt.Println("Global statistics:")
 	for _, n := range names {
 		fmt.Printf("  %-25s %d\n", n.name+":", readCounter(n.idx))
+	}
+	if readErr != nil {
+		fmt.Printf("warning: global counter read failed (statistics may be incomplete): %v\n", readErr)
 	}
 
 	if !detail {
@@ -933,8 +943,14 @@ func (c *CLI) showFlowStatistics() error {
 		return nil
 	}
 
+	// #3345: surface a counter-read failure rather than printing clean zeros
+	// that hide a degraded counter bridge.
+	var readErr error
 	readCounter := func(idx uint32) uint64 {
-		v, _ := c.dp.ReadGlobalCounter(idx)
+		v, err := c.dp.ReadGlobalCounter(idx)
+		if err != nil && readErr == nil {
+			readErr = err
+		}
 		return v
 	}
 
@@ -957,6 +973,9 @@ func (c *CLI) showFlowStatistics() error {
 	cacheInval := readCounter(dataplane.GlobalCtrFlowCacheInvalidate)
 
 	fmt.Println("Flow statistics:")
+	if readErr != nil {
+		fmt.Printf("warning: global counter read failed (statistics may be incomplete): %v\n", readErr)
+	}
 	fmt.Printf("  %-30s %d\n", "Current sessions:", dataplane.CurrentSessions(sessNew, sessClosed))
 	fmt.Printf("  %-30s %d\n", "Sessions created:", sessNew)
 	fmt.Printf("  %-30s %d\n", "Sessions closed:", sessClosed)

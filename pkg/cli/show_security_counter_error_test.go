@@ -82,3 +82,47 @@ func TestShowSecurityAlarmsWarnsOnCounterReadError(t *testing.T) {
 		t.Fatalf("showSecurityAlarms output lacks a counter-read warning; got:\n%s", out)
 	}
 }
+
+// showStatistics / showFlowStatistics are the canonical operator global-counter
+// views (`show security flow statistics`). Both must warn on a degraded read.
+func TestShowStatisticsWarnsOnCounterReadError(t *testing.T) {
+	c := &CLI{dp: &counterErrCLIDP{}}
+
+	out := captureStdout(t, func() {
+		if err := c.showStatistics(false); err != nil {
+			t.Fatalf("showStatistics() error = %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("showStatistics output lacks a counter-read warning; got:\n%s", out)
+	}
+}
+
+func TestShowFlowStatisticsWarnsOnCounterReadError(t *testing.T) {
+	c := &CLI{dp: &counterErrCLIDP{}}
+
+	out := captureStdout(t, func() {
+		if err := c.showFlowStatistics(); err != nil {
+			t.Fatalf("showFlowStatistics() error = %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("showFlowStatistics output lacks a counter-read warning; got:\n%s", out)
+	}
+}
+
+func TestShowChassisClusterFabricStatisticsWarnsOnCounterReadError(t *testing.T) {
+	c := &CLI{dp: &counterErrCLIDP{}}
+
+	out := captureStdout(t, func() {
+		if err := c.showChassisClusterFabricStatistics(); err != nil {
+			t.Fatalf("showChassisClusterFabricStatistics() error = %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "warning") {
+		t.Fatalf("showChassisClusterFabricStatistics output lacks a counter-read warning; got:\n%s", out)
+	}
+}

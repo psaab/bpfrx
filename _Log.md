@@ -22850,3 +22850,20 @@ top.
     pkg/cli/cli_show_security_screen.go, pkg/cli/cli_show_security_log.go,
     pkg/cli/show_security_counter_error_test.go,
     pkg/grpcapi/server_show_security_text.go, pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: #3345 fold (Codex MAJOR + SMR) — complete GLOBAL counter-read
+    error surfacing. H1: GetGlobalStats now checks readErr AFTER the full
+    struct build so late reads (RxPackets/HostInbound) are covered. Added
+    warnings to show security flow statistics (CLI showStatistics +
+    showFlowStatistics, gRPC showFlowStatistics) and show chassis cluster
+    fabric statistics (CLI + gRPC). M1: REST test asserts exactly 500.
+    README updated to actual coverage + #3408 for per-zone/policy.
+    RED-on-revert tests added for each new global site.
+  - **File(s)**: pkg/grpcapi/server_show_status.go,
+    pkg/cli/cli_show_flow.go, pkg/grpcapi/server_show_flow.go,
+    pkg/grpcapi/server_show_cluster_text.go, pkg/cli/cli_show_cluster.go,
+    pkg/api/stats_counter_error_test.go,
+    pkg/grpcapi/global_stats_counter_error_test.go,
+    pkg/grpcapi/flow_cluster_counter_error_test.go,
+    pkg/cli/show_security_counter_error_test.go, pkg/api/README.md, _Log.md

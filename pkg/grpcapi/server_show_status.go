@@ -91,12 +91,7 @@ func (s *Server) GetGlobalStats(_ context.Context, _ *pb.GetGlobalStatsRequest) 
 		}
 	}
 
-	if readErr != nil {
-		return nil, status.Errorf(codes.Internal,
-			"reading global counter: %v", readErr)
-	}
-
-	return &pb.GetGlobalStatsResponse{
+	resp := &pb.GetGlobalStatsResponse{
 		RxPackets:          readCounter(dataplane.GlobalCtrRxPackets),
 		TxPackets:          readCounter(dataplane.GlobalCtrTxPackets),
 		Drops:              readCounter(dataplane.GlobalCtrDrops),
@@ -110,7 +105,17 @@ func (s *Server) GetGlobalStats(_ context.Context, _ *pb.GetGlobalStatsRequest) 
 		Nat64Translations:  readCounter(dataplane.GlobalCtrNAT64Xlate),
 		HostInboundAllowed: readCounter(dataplane.GlobalCtrHostInbound),
 		ScreenDropDetails:  screenDetails,
-	}, nil
+	}
+
+	// #3345: check readErr AFTER the full struct build so EVERY global read
+	// (incl. RxPackets/HostInbound below the screen loop) is covered — a
+	// failure on any of them must not return a zero-valued field.
+	if readErr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"reading global counter: %v", readErr)
+	}
+
+	return resp, nil
 }
 
 func (s *Server) GetSystemInfo(ctx context.Context, req *pb.GetSystemInfoRequest) (*pb.GetSystemInfoResponse, error) {

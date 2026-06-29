@@ -10,6 +10,7 @@ package api
 
 import (
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -39,10 +40,12 @@ func TestGlobalStatsHandlerSurfacesReadError(t *testing.T) {
 	req := httptest.NewRequest("GET", "/api/v1/stats/global", nil)
 	s.globalStatsHandler(rr, req)
 
-	if rr.Code == 200 {
-		t.Fatalf("globalStatsHandler returned 200 on counter read failure; "+
-			"want a non-200 (read error must not look like a clean zero). body=%s",
-			rr.Body.String())
+	// Assert exactly 500 so a future regression to 200/400/503 is caught
+	// (a read error must surface as an internal failure, not a clean zero).
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("globalStatsHandler status = %d, want %d (read error must not "+
+			"look like a clean zero). body=%s",
+			rr.Code, http.StatusInternalServerError, rr.Body.String())
 	}
 }
 
