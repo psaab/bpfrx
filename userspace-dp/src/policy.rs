@@ -41,6 +41,22 @@ pub(crate) enum SnapshotIntegrityError {
     /// the whole snapshot (the preflight keeps the previous good state; a fresh
     /// boot keeps the default-deny `PolicyState`) is action-agnostic.
     UnrepresentableAddress { rule_id: String },
+    /// #3367: a policy rule's LEGACY (`source_addresses` / `destination_addresses`)
+    /// address field carried a token that is non-empty, not the bare `any`, not a
+    /// family-scoped wildcard (`any-ipv4` / `any-ipv6`), and does NOT parse as an
+    /// IP/CIDR literal. The pre-fix `parse_address` `Err(_)` arm silently DROPPED
+    /// such a token (pushed nothing, returned). For a fully-malformed token list on
+    /// the common "empty -> MatchAny" legacy path (no family-scoped wildcard
+    /// present) the side then collapsed to an UNCONSTRAINED MatchAny — broadening a
+    /// `deny` rule to match every source/destination (fail-OPEN). The v3-shaped
+    /// literal path already fails closed via the `__unsupported_address__` sentinel
+    /// (`UnrepresentableAddress`, #3261); this is the analogous backstop for the
+    /// legacy field, which carries raw literals with no sentinel. A normal Go
+    /// snapshot only ever emits parseable literals / `any` / family wildcards, so
+    /// this guards against a corrupt / hand-built / version-drifted snapshot.
+    /// Rejecting the WHOLE snapshot (the preflight keeps the previous good state)
+    /// is action-agnostic.
+    UnrepresentableLegacyAddress { rule_id: String, address: String },
     /// #2212: a NAT64 rule snapshot carried an unparseable field — a prefix
     /// that is empty / malformed / not /96, or a pool address that is neither a
     /// bare IPv4 nor a `/32` host. (A pool that is genuinely UNCONFIGURED — no
@@ -110,6 +126,27 @@ pub(crate) enum SnapshotIntegrityError {
         filter: String,
         term: String,
         token: String,
+    },
+    /// #3367: a firewall-filter term carried the `tcp_flags_unparseable` wire
+    /// marker — the Go control plane could not parse the term's tcp-flags
+    /// expression (disjunction, negated groups, unknown flags) into
+    /// required/forbidden masks. The pre-fix Go builder logged the error and left
+    /// both masks nil, and the matcher (`engine/matching.rs`) treats absent masks
+    /// as "no tcp-flags constraint" — silently WIDENING the term to match every
+    /// TCP segment. For a `then discard`/`reject` term that should drop only a
+    /// specific flag combination (e.g. SYN floods) that is a fail-WIDE security
+    /// bug. The Go commit gate (`compileFirewall` /
+    /// `config::ParseTCPFlagsExpression`) is the primary defense — a committed
+    /// config never sets the marker — so this is the helper-boundary backstop for
+    /// a corrupt / hand-built / version-drifted snapshot, consistent with the
+    /// #2505 `UnrepresentableFilterProtocol` fail-closed pattern. Rejecting the
+    /// whole snapshot (the reconcile preflight keeps the previous good filter
+    /// state) is action-agnostic. `family` (inet / inet6) is carried because
+    /// filter names can be reused across families.
+    UnrepresentableFilterTCPFlags {
+        family: String,
+        filter: String,
+        term: String,
     },
     /// #3296: an interface (or lo0) snapshot named a NON-EMPTY firewall filter
     /// (`filter_input_v4/v6` / `filter_output_v4/v6`, or the lo0 host-bound
@@ -290,6 +327,11 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 "rule {:?} has an unrepresentable address (undefined address book, or a non-literal dns-name/wildcard/range value) — refusing to fail open by collapsing the side to match-none (which lets a deny fall through)",
                 rule_id
             ),
+            Self::UnrepresentableLegacyAddress { rule_id, address } => write!(
+                f,
+                "rule {:?} has an unparseable legacy address literal {:?} (not an IP/CIDR, `any`, or family wildcard) — refusing to fail open by dropping it (which on the empty->match-any legacy path widens a deny to match everything)",
+                rule_id, address
+            ),
             Self::Nat64UnparseableRule { rule_name, field } => write!(
                 f,
                 "nat64 rule {:?} has an unparseable {} — refusing to fail open by silently dropping the rule",
@@ -318,6 +360,15 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "firewall family {:?} filter {:?} term {:?} has an unresolvable protocol token {:?} — refusing to fail wide by dropping it (which would make the term match every protocol)",
                 family, filter, term, token
+            ),
+            Self::UnrepresentableFilterTCPFlags {
+                family,
+                filter,
+                term,
+            } => write!(
+                f,
+                "firewall family {:?} filter {:?} term {:?} has an unparseable tcp-flags expression — refusing to fail wide by dropping it (which would make the term match every TCP segment)",
+                family, filter, term
             ),
             Self::MissingFilterRef {
                 interface,
@@ -1643,16 +1694,28 @@ pub(crate) fn parse_policy_state_with_counters(
             || !snap.destination_literals.is_empty();
 
         // Build literal prefix sets per side using the appropriate
-        // factory.
+        // factory. #3367: the legacy path also reports a malformed literal
+        // (an unparseable token on the `source_addresses`/`destination_addresses`
+        // field) so the rule can be failed closed below instead of silently
+        // collapsing to MatchAny.
+        let mut legacy_malformed: Option<String> = None;
         let (source_literal_v4, source_literal_v6) = if source_is_v3_shaped {
             parse_v3_literal_set(&snap.source_literals)
         } else {
-            parse_legacy_address_set(&snap.source_addresses)
+            let (v4, v6, malformed) = parse_legacy_address_set(&snap.source_addresses);
+            if legacy_malformed.is_none() {
+                legacy_malformed = malformed;
+            }
+            (v4, v6)
         };
         let (destination_literal_v4, destination_literal_v6) = if destination_is_v3_shaped {
             parse_v3_literal_set(&snap.destination_literals)
         } else {
-            parse_legacy_address_set(&snap.destination_addresses)
+            let (v4, v6, malformed) = parse_legacy_address_set(&snap.destination_addresses);
+            if legacy_malformed.is_none() {
+                legacy_malformed = malformed;
+            }
+            (v4, v6)
         };
 
         let rule_id = stable_policy_rule_id(snap);
@@ -1665,8 +1728,24 @@ pub(crate) fn parse_policy_state_with_counters(
         // `deny <unrepresentable-address>` rule would fall through to a later
         // permit / default-permit (deny fail-open). Checked BEFORE any literal
         // parsing / book resolution so the preflight stays non-mutating.
+        //
+        // #3367: checked BEFORE the legacy-malformed reject below — the sentinel
+        // is the more specific cause (an undefined book / non-literal value the
+        // Go gate already flagged), and it parses as malformed too, so the
+        // sentinel diagnostic would otherwise be masked by the generic
+        // unparseable-literal error.
         if rule_has_unrepresentable_address_sentinel(snap) {
             return Err(SnapshotIntegrityError::UnrepresentableAddress { rule_id });
+        }
+
+        // #3367: a malformed legacy address literal (an unparseable token on the
+        // `source_addresses`/`destination_addresses` field that is not the
+        // sentinel) is a snapshot-integrity error. Without this the side would
+        // silently drop the token and collapse to MatchAny on the empty->match-any
+        // legacy path, widening a deny rule. Checked BEFORE any book resolution so
+        // the preflight stays non-mutating and keeps the previous good state.
+        if let Some(address) = legacy_malformed {
+            return Err(SnapshotIntegrityError::UnrepresentableLegacyAddress { rule_id, address });
         }
 
         // Resolve book IDs to dense indices. Sort + dedup + hard
@@ -1896,11 +1975,18 @@ pub(crate) fn parse_policy_state_with_counters(
 /// family-scoped wildcard appears does the legacy "empty = MatchAny"
 /// convention apply (via `from_prefixes`), preserving back-compat for
 /// the unconstrained / `any` / all-malformed cases.
-fn parse_legacy_address_set(addresses: &[String]) -> (PrefixSetV4, PrefixSetV6) {
+///
+/// #3367: the returned `Option<String>` carries the FIRST token that was
+/// non-empty, non-`any`, non-family-wildcard, and unparseable as an IP/CIDR.
+/// The pre-fix code silently dropped such a token, so an all-malformed list on
+/// the empty→MatchAny path collapsed to an unconstrained MatchAny (broadening a
+/// deny). The caller fails the whole snapshot closed when this is `Some`.
+fn parse_legacy_address_set(addresses: &[String]) -> (PrefixSetV4, PrefixSetV6, Option<String>) {
     let mut any_v4 = false;
     let mut any_v6 = false;
     let mut v4: Vec<PrefixV4> = Vec::new();
     let mut v6: Vec<PrefixV6> = Vec::new();
+    let mut malformed: Option<String> = None;
     for tok in addresses {
         match tok.as_str() {
             // Bare `any` is the unconstrained both-families wildcard;
@@ -1909,7 +1995,11 @@ fn parse_legacy_address_set(addresses: &[String]) -> (PrefixSetV4, PrefixSetV6) 
             "any" | "" => {}
             "any-ipv4" => any_v4 = true,
             "any-ipv6" => any_v6 = true,
-            s => parse_address(s, &mut v4, &mut v6),
+            s => {
+                if !parse_address(s, &mut v4, &mut v6) && malformed.is_none() {
+                    malformed = Some(s.to_string());
+                }
+            }
         }
     }
     let any_family_scoped = any_v4 || any_v6;
@@ -1932,7 +2022,7 @@ fn parse_legacy_address_set(addresses: &[String]) -> (PrefixSetV4, PrefixSetV6) 
     } else {
         PrefixSetV6::from_prefixes(v6)
     };
-    (v4_set, v6_set)
+    (v4_set, v6_set, malformed)
 }
 
 /// #1606: parse the v3 `source_literals` / `destination_literals`
@@ -2591,35 +2681,54 @@ fn parse_action(action: &str) -> Option<PolicyAction> {
     }
 }
 
-fn parse_address(prefix: &str, out_v4: &mut Vec<PrefixV4>, out_v6: &mut Vec<PrefixV6>) {
+/// Parse one legacy address literal into the per-family prefix vectors. Returns
+/// `true` when the token was represented (a placeholder `any`/empty, a
+/// family-scoped wildcard, or a successfully-parsed IP/CIDR literal) and `false`
+/// when a NON-placeholder token failed to parse as an IP or CIDR. #3367: the
+/// caller (`parse_legacy_address_set`) propagates a `false` up so the policy
+/// builder can fail the snapshot closed rather than silently dropping the token
+/// (which on the empty->match-any legacy path widens a deny rule to match-any).
+fn parse_address(prefix: &str, out_v4: &mut Vec<PrefixV4>, out_v6: &mut Vec<PrefixV6>) -> bool {
     if prefix.is_empty() || prefix == "any" {
-        return;
+        return true;
     }
     // #2008 H11: family-scoped wildcards (see parse_literal_cidr_into).
     if prefix == "any-ipv4" {
         out_v4.push(PrefixV4::from_net(
             ipnet::Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("v4 /0"),
         ));
-        return;
+        return true;
     }
     if prefix == "any-ipv6" {
         out_v6.push(PrefixV6::from_net(
             ipnet::Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 0).expect("v6 /0"),
         ));
-        return;
+        return true;
     }
     match prefix.parse::<IpNet>() {
-        Ok(IpNet::V4(net)) => out_v4.push(PrefixV4::from_net(net)),
-        Ok(IpNet::V6(net)) => out_v6.push(PrefixV6::from_net(net)),
+        Ok(IpNet::V4(net)) => {
+            out_v4.push(PrefixV4::from_net(net));
+            true
+        }
+        Ok(IpNet::V6(net)) => {
+            out_v6.push(PrefixV6::from_net(net));
+            true
+        }
         Err(_) => {
             if let Ok(ip) = prefix.parse::<Ipv4Addr>() {
                 out_v4.push(PrefixV4::from_net(
                     ipnet::Ipv4Net::new(ip, 32).expect("v4 /32"),
                 ));
+                true
             } else if let Ok(ip) = prefix.parse::<Ipv6Addr>() {
                 out_v6.push(PrefixV6::from_net(
                     ipnet::Ipv6Net::new(ip, 128).expect("v6 /128"),
                 ));
+                true
+            } else {
+                // #3367: a non-empty, non-placeholder token that is neither an IP
+                // nor a CIDR. Signal the malformed literal to the caller.
+                false
             }
         }
     }

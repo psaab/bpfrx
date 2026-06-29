@@ -60,6 +60,7 @@ fn basic_accept_discard() {
                     dscp_rewrite: None,
                     tcp_flags: None,
                     tcp_flags_forbidden: None,
+                    tcp_flags_unparseable: false,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -89,6 +90,7 @@ fn basic_accept_discard() {
                     dscp_rewrite: None,
                     tcp_flags: None,
                     tcp_flags_forbidden: None,
+                    tcp_flags_unparseable: false,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -299,6 +301,7 @@ fn port_range_matching() {
                 dscp_rewrite: None,
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
+                tcp_flags_unparseable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -374,6 +377,7 @@ fn destination_port_except_negation() {
                 dscp_rewrite: None,
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
+                tcp_flags_unparseable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -464,6 +468,7 @@ fn source_port_except_negation() {
                 dscp_rewrite: None,
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
+                tcp_flags_unparseable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -538,6 +543,7 @@ fn protocol_matching() {
                 dscp_rewrite: None,
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
+                tcp_flags_unparseable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -605,6 +611,7 @@ fn dscp_rewrite_action() {
                 dscp_rewrite: Some(46), // EF
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
+                tcp_flags_unparseable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -658,6 +665,7 @@ fn dscp_rewrite_action_allows_default_zero() {
                 dscp_rewrite: Some(0),
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
+                tcp_flags_unparseable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -1530,6 +1538,7 @@ fn multiple_terms_first_match_wins() {
                     dscp_rewrite: None,
                     tcp_flags: None,
                     tcp_flags_forbidden: None,
+                    tcp_flags_unparseable: false,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -1559,6 +1568,7 @@ fn multiple_terms_first_match_wins() {
                     dscp_rewrite: None,
                     tcp_flags: None,
                     tcp_flags_forbidden: None,
+                    tcp_flags_unparseable: false,
                     is_fragment: false,
                     icmp_types: vec![],
                     icmp_codes: vec![],
@@ -1627,6 +1637,7 @@ fn source_dest_address_matching() {
                 dscp_rewrite: None,
                 tcp_flags: None,
                 tcp_flags_forbidden: None,
+                tcp_flags_unparseable: false,
                 is_fragment: false,
                 icmp_types: vec![],
                 icmp_codes: vec![],
@@ -3282,6 +3293,7 @@ fn tcp_flags_term_forbidden_mask_excludes_negated_flag() {
                 action: "discard".into(),
                 tcp_flags: Some(0x02),
                 tcp_flags_forbidden: Some(0x10),
+                tcp_flags_unparseable: false,
                 ..Default::default()
             },
             FirewallTermSnapshot {
@@ -3337,6 +3349,7 @@ fn tcp_flags_term_forbidden_only_mask() {
                 action: "discard".into(),
                 tcp_flags: None,
                 tcp_flags_forbidden: Some(0x04),
+                tcp_flags_unparseable: false,
                 ..Default::default()
             },
             FirewallTermSnapshot {
@@ -4803,6 +4816,77 @@ fn filter_protocol_accept_set_subset_of_resolver() {
             "filterProtocolResolvable accepts {token:?} but proto_number does not \
              resolve it — Go commit-accept vs Rust-apply drift (#3393)"
         );
+    }
+}
+
+// Build a single-term `discard` filter carrying the #3367
+// `tcp_flags_unparseable` wire marker, returning the compiled FilterState
+// result (Ok or the integrity Err).
+fn filter_with_tcp_flags_unparseable(
+    family: &str,
+    unparseable: bool,
+) -> Result<FilterState, SnapshotIntegrityError> {
+    parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f".into(),
+            family: family.into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "flagged".into(),
+                protocols: vec!["tcp".into()],
+                tcp_flags_unparseable: unparseable,
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &[],
+        "",
+        "",
+    )
+}
+
+#[test]
+fn tcp_flags_unparseable_marker_fails_closed_not_match_all() {
+    // #3367 RED-on-revert: a filter term carrying the `tcp_flags_unparseable`
+    // wire marker (the Go control plane could not parse the tcp-flags
+    // expression) must reject the WHOLE snapshot — NOT compile into a term with
+    // no tcp-flags constraint. Pre-fix the Go builder logged + left both masks
+    // nil, and this compiler ignored the marker, so the term matched EVERY TCP
+    // segment (a `then discard` term that should drop only a specific flag combo
+    // would discard ALL TCP — fail-WIDE). Reverting the parse_term guard returns
+    // Ok here, so this is non-tautological.
+    let err = filter_with_tcp_flags_unparseable("inet", true)
+        .expect_err("an unparseable tcp-flags marker must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnrepresentableFilterTCPFlags {
+            family,
+            filter,
+            term,
+        } => {
+            assert_eq!(family, "inet");
+            assert_eq!(filter, "f");
+            assert_eq!(term, "flagged");
+        }
+        other => panic!("expected UnrepresentableFilterTCPFlags, got {other:?}"),
+    }
+
+    // A term WITHOUT the marker compiles fine (proves the guard is keyed on the
+    // marker, not on every TCP-scoped term).
+    filter_with_tcp_flags_unparseable("inet", false)
+        .expect("a term without the unparseable marker must compile");
+}
+
+#[test]
+fn tcp_flags_unparseable_error_names_the_family_for_reused_filter_names() {
+    // Filter names can be reused across families; the diagnostic must name the
+    // family carrying the unparseable marker.
+    let err = filter_with_tcp_flags_unparseable("inet6", true)
+        .expect_err("an unparseable tcp-flags marker must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnrepresentableFilterTCPFlags { family, .. } => {
+            assert_eq!(family, "inet6");
+        }
+        other => panic!("expected UnrepresentableFilterTCPFlags, got {other:?}"),
     }
 }
 

@@ -536,7 +536,8 @@
     "source_ports": [],
     "source_ports_except": [],
     "tcp_flags": null,
-    "tcp_flags_forbidden": null
+    "tcp_flags_forbidden": null,
+    "tcp_flags_unparseable": false
   },
   "flow_export_snapshot": {
     "active_timeout": 0,
