@@ -460,6 +460,9 @@ From zone: guest, To zone: lan
 ### Filtering
 
 - `show security policies from-zone lan to-zone Internet-ATT` shows only that zone pair.
+  Global policies that govern the pair are also shown (#3357): an unscoped/`any`
+  global and a scoped global (#3148) whose `match from-zone`/`to-zone` equals the
+  filter; a scoped global bound to a different pair is omitted.
 
 ---
 
@@ -611,6 +614,19 @@ Global policies:
   group still reports `from_zone="*"`/`to_zone="*"` (the all-zones tier) — the
   per-rule fields carry the narrowing. An unscoped global is unchanged
   (junos-global / any / `*`).
+- **#3357 — scope shown in the FILTERED and remote views too.** #3286 fixed the
+  *unfiltered* surfaces; the *filtered* form (`show security policies hit-count
+  from-zone X to-zone Y`, `... detail ...`, the standard/brief forms, and the
+  gRPC `policies-hit-count`/`policies-detail` text views) plus the remote CLI
+  still suppressed scoped globals. A `from-zone X to-zone Y` filter now includes
+  every global that GOVERNS that pair — an unscoped/`any` global (enforced for
+  every pair) and a scoped global whose `match from-zone`/`to-zone` equals the
+  filter — and excludes a scoped global bound to a different pair, mirroring the
+  runtime `globalScopeMatches` selection. The remote `show security policies`
+  (filtered) renders each global rule under its effective scope, and the remote
+  `... brief` prints the per-rule `match_from_zone`/`match_to_zone` (falling back
+  to `*`/`*` only for an unscoped global) instead of the group `*`. The shared
+  selection predicate is `policymatch.GlobalPolicyAppliesToZonePair`.
 
 ---
 

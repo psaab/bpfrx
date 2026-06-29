@@ -23897,6 +23897,24 @@ top.
   pkg/grpcapi/server_show_zones_hostinbound_3328_test.go (new),
   pkg/api/README.md, pkg/grpcapi/README.md, _Log.md
 
+## 2026-06-29 — #3357 scoped global policies suppressed in filtered/remote policy views
+
+- **Timestamp**: 2026-06-29
+- **Action**: Surface scoped global policies (#3148) in the FILTERED local-CLI
+  hit-count/detail/brief/standard views, the gRPC text hit-count/detail views,
+  and the remote-CLI filtered + brief views. Added shared selection predicate
+  `policymatch.GlobalPolicyAppliesToZonePair` (empty/"any" scope = all-zones,
+  mirroring runtime globalScopeMatches). RED-on-revert tests across all four
+  surfaces + a predicate unit test. Doc note in junos-cli-reference.md.
+- **File(s)**: pkg/policymatch/policymatch.go,
+  pkg/policymatch/global_zone_filter_3357_test.go (new),
+  pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/cli/cli_show_security_scoped_global_3357_test.go (new),
+  pkg/grpcapi/server_show_policies_text.go,
+  pkg/grpcapi/server_show_policies_text_scoped_global_3357_test.go (new),
+  cmd/cli/show.go, cmd/cli/nontty_test.go,
+  cmd/cli/show_policies_scoped_global_3357_test.go (new),
+  docs/junos-cli-reference.md, _Log.md
 - **Timestamp**: 2026-06-29
   **Action**: #3425 — NAT match {source,destination}-address-name strict gate now
   rejects defined-but-unresolvable references (empty/dangling address-set,
