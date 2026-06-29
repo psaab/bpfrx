@@ -5576,15 +5576,37 @@ func validatePrefixLengthRange(rf *RouteFilter) error {
 
 // validateNATSourceAddressNameReferencesStrict hard-rejects a source or
 // destination NAT rule whose `match source-address-name <name>` OR `match
-// destination-address-name <name>` (#3229) names an address-book entry not
-// defined under `security address-book` (#2416).
+// destination-address-name <name>` (#3229) names an address-book entry that
+// either is not defined under `security address-book` (#2416) OR is defined
+// but does not resolve to >= 1 concrete address (#3425).
 //
-// The name is resolved to concrete source prefixes at snapshot-build time
-// (appendNATSourceAddressName). A dangling reference contributes no prefix and
-// the rule fails closed (matches NOTHING) — safe, but silent: the operator's
-// intended source scoping vanishes with no signal. This gate makes the typo
-// operator-visible at commit, consistent with the firewall prefix-list and
-// policer reference gates.
+// The name is resolved to concrete prefixes at snapshot-build time
+// (appendNATSourceAddressName → resolveNATAddressNamePrefixes →
+// resolveUserspaceAddressBookEntry). Two distinct failures both translate to a
+// rule that matches NOTHING (fail-closed but SILENT):
+//
+//   - a wholly UNDEFINED name (a typo) — neither an address-book entry nor a
+//     dynamic-address feed binding; and
+//   - a DEFINED-but-UNRESOLVABLE name (#3425) — a defined `address` with no
+//     prefix (empty Value), a defined-but-EMPTY `address-set`, or a set with a
+//     dangling / member-less expansion. resolveUserspaceAddressBookEntry
+//     returns ok=false for these, so the builder appends the raw (unparseable)
+//     token to keep the constraint non-empty and the rule translates no
+//     traffic — exactly the policy-address fail-open class #3149 closes for
+//     security policies, here for NAT.
+//
+// This gate makes BOTH visible at commit, consistent with the policy-address
+// representability gate (validatePolicyMatchAddressSetMembersStrict) and the
+// NAT match-application gate (validateNATMatchApplicationsStrict).
+//
+// Feed carve-out (#3303 / #3294): a DIRECT `match ...-address-name <feed-name>`
+// reference to a `security dynamic-address address-name <name> profile <feed>`
+// binding is ACCEPTED — the static book expansion is empty but
+// resolveNATAddressNamePrefixes unions the live feed overlay at runtime, so the
+// rule does carry prefixes. Mirrors validatePolicyMatchAddressesStrict's
+// AddressBindings carve-out; deliberately scoped to the DIRECT reference (a
+// feed member NESTED in an address-set is still poisoned by the static
+// resolver — the anti-Option-C guardrail, identical to the policy path).
 //
 // On the tolerant load / peer-sync paths the call site downgrades to a warning
 // (opts.lenientFirewallRefs) so an already-persisted or peer-synced config
@@ -5596,6 +5618,13 @@ func validateNATSourceAddressNameReferencesStrict(cfg *Config) error {
 		return nil
 	}
 	ab := cfg.Security.AddressBook
+	feedBinding := func(name string) bool {
+		if name == "" {
+			return false
+		}
+		_, ok := cfg.Security.DynamicAddress.AddressBindings[name]
+		return ok
+	}
 	defined := func(name string) bool {
 		if name == "" || ab == nil {
 			return false
@@ -5606,6 +5635,38 @@ func validateNATSourceAddressNameReferencesStrict(cfg *Config) error {
 		_, ok := ab.AddressSets[name]
 		return ok
 	}
+	// nameError returns nil when the reference is valid, or the strict
+	// rejection error otherwise. field is "source-address-name" /
+	// "destination-address-name" and scope is "source scope" / "destination
+	// scope" for the operator-facing message.
+	nameError := func(natType, ruleSet, ruleName, field, scope, name string) error {
+		if name == "" || feedBinding(name) {
+			return nil
+		}
+		if !defined(name) {
+			return fmt.Errorf(
+				"%s NAT rule-set %q rule %q references undefined "+
+					"%s %q (define `security address-book "+
+					"address %s` / `address-set %s`, or fix the name — the "+
+					"%s would otherwise be silently lost and the "+
+					"rule would match no traffic)",
+				natType, ruleSet, ruleName, field, name, name, name, scope)
+		}
+		// #3425: a DEFINED name that the runtime resolver cannot expand to >= 1
+		// literal address (empty address, empty/dangling set). The builder
+		// appends the raw token → the rule is non-empty but unmatchable. Reject
+		// it so the operator sees the dead scope at commit.
+		if cause := policyMatchAddressBookResolves(ab, name); cause != nil {
+			return fmt.Errorf(
+				"%s NAT rule-set %q rule %q match %s %q does not resolve to "+
+					"any address: %w — the rule commits but the dataplane "+
+					"installs a match-nothing %s so the translation never "+
+					"fires (add at least one resolvable member / a prefix to "+
+					"the address, or remove the reference) (#3425)",
+				natType, ruleSet, ruleName, field, name, cause, scope)
+		}
+		return nil
+	}
 	check := func(natType string, rs *NATRuleSet) error {
 		if rs == nil {
 			return nil
@@ -5614,31 +5675,21 @@ func validateNATSourceAddressNameReferencesStrict(cfg *Config) error {
 			if rule == nil {
 				continue
 			}
-			if rule.Match.SourceAddressName != "" && !defined(rule.Match.SourceAddressName) {
-				return fmt.Errorf(
-					"%s NAT rule-set %q rule %q references undefined "+
-						"source-address-name %q (define `security address-book "+
-						"address %s` / `address-set %s`, or fix the name — the "+
-						"source scope would otherwise be silently lost and the "+
-						"rule would match no traffic)",
-					natType, rs.Name, rule.Name, rule.Match.SourceAddressName,
-					rule.Match.SourceAddressName, rule.Match.SourceAddressName)
+			if err := nameError(natType, rs.Name, rule.Name,
+				"source-address-name", "source scope",
+				rule.Match.SourceAddressName); err != nil {
+				return err
 			}
 			// #3229: destination-address-name is the destination twin of
 			// source-address-name and resolves through the same address-book
-			// expander (appendNATDestinationAddressName). A dangling reference
-			// installs no destination = the rule matches nothing (fail-closed
-			// but silent); gate it here so the typo is operator-visible at
-			// commit, exactly like the source name above.
-			if rule.Match.DestinationAddressName != "" && !defined(rule.Match.DestinationAddressName) {
-				return fmt.Errorf(
-					"%s NAT rule-set %q rule %q references undefined "+
-						"destination-address-name %q (define `security address-book "+
-						"address %s` / `address-set %s`, or fix the name — the "+
-						"destination scope would otherwise be silently lost and the "+
-						"rule would match no traffic)",
-					natType, rs.Name, rule.Name, rule.Match.DestinationAddressName,
-					rule.Match.DestinationAddressName, rule.Match.DestinationAddressName)
+			// expander (appendNATDestinationAddressName). A dangling or
+			// unresolvable reference installs no destination = the rule matches
+			// nothing (fail-closed but silent); gate it here so the problem is
+			// operator-visible at commit, exactly like the source name above.
+			if err := nameError(natType, rs.Name, rule.Name,
+				"destination-address-name", "destination scope",
+				rule.Match.DestinationAddressName); err != nil {
+				return err
 			}
 		}
 		return nil

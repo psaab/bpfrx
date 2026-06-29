@@ -23896,3 +23896,14 @@ top.
   pkg/config/types_security.go, pkg/api/security_zone_hostinbound_3328_test.go (new),
   pkg/grpcapi/server_show_zones_hostinbound_3328_test.go (new),
   pkg/api/README.md, pkg/grpcapi/README.md, _Log.md
+
+- **Timestamp**: 2026-06-29
+  **Action**: #3425 — NAT match {source,destination}-address-name strict gate now
+  rejects defined-but-unresolvable references (empty/dangling address-set,
+  prefix-less address) at commit; lenient-warn on tolerant load/peer-sync; direct
+  dynamic-address feed bindings carved out (accepted). Dataplane already fails
+  closed (raw unmatchable token / zero DNAT entries) — added regression tests.
+  **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_nat_address_name_resolvable_3425_test.go (new),
+  pkg/dataplane/userspace/nat_address_name_failclosed_3425_test.go (new),
+  docs/config-schema.md, _Log.md
