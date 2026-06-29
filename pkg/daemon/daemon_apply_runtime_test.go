@@ -117,10 +117,12 @@ func TestApplyConfigLockedSurfacesLo0Failure(t *testing.T) {
 	}
 
 	// An lo0 input filter is bound (so applyLo0Filter reaches the APPLY path and
-	// the injected nft failure is the filter-not-installed failure). No zone
-	// declares a host-inbound stanza, so applyHostInboundFilter takes the
-	// no-enforceable-view teardown branch, which is stubbed to succeed above —
-	// keeping the injected error scoped to the lo0 apply wiring.
+	// the injected nft failure is the filter-not-installed failure). The single
+	// zone's interface has NO firewall-local address, so even though #3405 makes
+	// every zone host-inbound-enforcing (default-deny), the zone yields no
+	// enforceable host-inbound view (no address to scope a drop): applyHostInbound
+	// Filter takes the no-enforceable-view teardown branch, which is stubbed to
+	// succeed above — keeping the injected error scoped to the lo0 apply wiring.
 	cfg := &config.Config{}
 	cfg.System.Lo0FilterInputV4 = "mgmt-lockdown"
 	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
@@ -133,7 +135,7 @@ func TestApplyConfigLockedSurfacesLo0Failure(t *testing.T) {
 	}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
 		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
-			0: {Number: 0, Addresses: []string{"10.7.7.1/24"}},
+			0: {Number: 0},
 		}},
 	}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{

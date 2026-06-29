@@ -152,12 +152,14 @@ func buildLo0FilterPayload(cfg *config.Config, filterV4, filterV6 string) string
 // subset that actually reaches the XSK. This kernel chain enforces the
 // host-inbound set for the rest, mirroring the lo0-filter precedent.
 //
-// Safety: only zones that DECLARED a host-inbound-traffic stanza get any rule;
-// a zone with no stanza is admit-all (unchanged). Management / cluster-control
-// lifeline interfaces (fxp0 / em0 / fab*) are excluded from the address sets by
-// BuildZoneHostInboundViews, so a host-inbound deny can never strand management
-// or break HA. Established sessions and IPv6 ND / PMTUD control messages are
-// accepted before any deny.
+// Safety: #3405 — EVERY configured security zone gets a rule (Junos default-deny
+// parity). A zone with no `host-inbound-traffic` stanza is treated as an empty
+// stanza: its firewall-local addresses get a catch-all DROP, denying every
+// host-bound service/protocol not explicitly permitted. Management /
+// cluster-control lifeline interfaces (fxp0 / em0 / fab*) are excluded from the
+// address sets by BuildZoneHostInboundViews, so a host-inbound deny can never
+// strand management or break HA. Established sessions and IPv6 ND / PMTUD
+// control messages are accepted before any deny.
 //
 // Fail-closed (#3333): both the apply and the teardown surface their failure as
 // a returned error instead of a swallowed WARN. applyConfigLocked joins this
@@ -361,15 +363,15 @@ func emitHostInboundZone(rules *[]string, v dpuserspace.ZoneHostInboundView, fam
 		return
 	}
 	matches := hostInboundMatchSet(v, family)
-	// Zero recognized service/protocol matches for this configured zone — an
-	// empty `host-inbound-traffic { }` stanza (or, on the tolerant load path,
-	// a zone whose every token was an unrecognized typo that commit-time
-	// validation downgraded to a warning rather than rejected). Fall through to
-	// emit ONLY the catch-all drop below: a configured-but-empty stanza means
-	// the operator opened nothing, so Junos denies all host-bound traffic to
-	// the zone, and the Rust AF_XDP classifier already fails CLOSED for the
-	// same case (host_inbound_admits returns deny when the zone is configured
-	// but matches nothing). Emitting nothing here would fail OPEN and leave the
+	// Zero recognized service/protocol matches for this configured zone — a zone
+	// with NO `host-inbound-traffic` stanza (#3405 default-deny parity), an empty
+	// `host-inbound-traffic { }` stanza (#3200), or (on the tolerant load path) a
+	// zone whose every token was an unrecognized typo that commit-time validation
+	// downgraded to a warning rather than rejected. Fall through to emit ONLY the
+	// catch-all drop below: the operator opened nothing, so Junos denies all
+	// host-bound traffic to the zone, and the Rust AF_XDP classifier already fails
+	// CLOSED for the same case (host_inbound_admits returns deny when the zone is
+	// configured but matches nothing). Emitting nothing here would fail OPEN and leave the
 	// kernel and Rust paths in disagreement — the #3200 split-brain. Management
 	// / cluster-control lifeline interfaces are excluded from v.V4Addrs /
 	// v.V6Addrs by BuildZoneHostInboundViews, and the established / ESP-AH / ND

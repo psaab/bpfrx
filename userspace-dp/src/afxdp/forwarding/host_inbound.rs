@@ -9,16 +9,23 @@
 //! tokens carried on `ZoneSnapshot` into a `ZoneHostInbound` admission set and
 //! provides the per-packet admit check used on the local-delivery path.
 //!
-//! Default posture: a zone is enforced only when it declared a
-//! `host-inbound-traffic` stanza (`ZoneSnapshot::host_inbound_configured`). A
-//! zone without a stanza is absent from `ForwardingState::zone_host_inbound`
-//! and `host_inbound_admits` returns admit (preserving the pre-#3070
-//! admit-all behaviour with zero regression for configs that never opted in).
-//! This is a deliberate, safe deviation from strict Junos (which denies
-//! host-bound traffic to an unconfigured zone): it closes the gap exactly
-//! where the operator expressed intent without risking management/routing
-//! lockout on existing deploys. Strict absent-zone deny can be layered on top
-//! later behind an explicit knob.
+//! Default posture (#3405 — Junos/vSRX default-deny parity): EVERY configured
+//! security zone is enforced. The Go control plane marks every zone
+//! `host_inbound_configured == true` (`ZoneSnapshot::host_inbound_configured`),
+//! so a zone with NO `host-inbound-traffic` stanza arrives with EMPTY token
+//! sets and is inserted into `ForwardingState::zone_host_inbound` with an empty
+//! [`ZoneHostInbound`] — `admits()` then returns false for every
+//! service/protocol, i.e. default-deny, identical to an empty
+//! `host-inbound-traffic { }` stanza. Before #3405 a no-stanza zone was absent
+//! from the map and `host_inbound_admits` returned admit (`None => true`), a
+//! permit-all management-plane exposure on any zone the operator never locked
+//! down. The `None => true` arm now applies ONLY to a genuinely unknown / global
+//! ingress zone (e.g. id 0), never to a configured zone. The global
+//! ICMP/ND/PMTUD accepts (`is_icmp_host_inbound_global_accept`, #3171) still
+//! precede the per-zone deny, and lifeline interfaces (fxp0/em0/fab*) never
+//! reach this AF_XDP local-delivery classifier (their host-bound traffic is
+//! served by the kernel, which excludes them from the deny address sets), so the
+//! default-deny cannot strand management or break HA.
 
 use super::*;
 
@@ -33,9 +40,11 @@ const ICMP4_ROUTER_SOLICITATION: u8 = 10;
 const ICMP6_ECHO_REQUEST: u8 = 128;
 
 /// Build the per-zone host-inbound admission table from the snapshot. Only
-/// zones with `host_inbound_configured == true` get an entry. The zone id used
-/// as the key MUST be the same validated id `populate_zones` accepted (caller
-/// passes it), so the two maps stay aligned.
+/// zones with `host_inbound_configured == true` get an entry — which, since
+/// #3405, is EVERY configured security zone (a no-stanza zone arrives with
+/// empty token sets -> empty `ZoneHostInbound` -> default-deny). The zone id
+/// used as the key MUST be the same validated id `populate_zones` accepted
+/// (caller passes it), so the two maps stay aligned.
 pub(in crate::afxdp) fn zone_host_inbound_from_snapshot(zone: &ZoneSnapshot) -> ZoneHostInbound {
     zone_host_inbound_from_tokens(
         &zone.host_inbound_system_services,
@@ -422,11 +431,13 @@ fn is_icmp_host_inbound_global_accept(protocol: u8, icmp_type: u8) -> bool {
 /// Per-packet host-inbound admit check for a host-bound (local-delivery)
 /// packet ingressing `ingress_zone_id`. Returns true (admit) when the packet is
 /// an ICMP/ICMPv6 error/PMTUD control message (#3171 — always exempt, mirroring
-/// the kernel chain), when the zone has no host-inbound stanza (absent from the
-/// table — the admit-all default), or when the packet's service/protocol is in
-/// the zone's set. Returns false (deny) only when the zone IS configured and the
-/// packet matches nothing. `icmp_type` is the first L4 byte for ICMP/ICMPv6
-/// packets and is ignored for every other protocol (pass 0).
+/// the kernel chain), when the ingress zone is genuinely unknown / global (id
+/// not in the table — see below), or when the packet's service/protocol is in
+/// the zone's admission set. Returns false (deny) when the zone IS configured
+/// and the packet matches nothing — which, since #3405, includes every
+/// configured security zone with no `host-inbound-traffic` stanza (it arrives
+/// with an empty set -> default-deny). `icmp_type` is the first L4 byte for
+/// ICMP/ICMPv6 packets and is ignored for every other protocol (pass 0).
 pub(in crate::afxdp) fn host_inbound_admits(
     state: &ForwardingState,
     ingress_zone_id: u16,
@@ -445,7 +456,15 @@ pub(in crate::afxdp) fn host_inbound_admits(
         return true;
     }
     match state.zone_host_inbound.get(&ingress_zone_id) {
+        // #3405: every configured security zone is in the table (the Go control
+        // plane marks them all `host_inbound_configured`), so `None` is now only
+        // a genuinely unknown / global ingress zone (e.g. id 0, no resolved
+        // security zone). Such traffic keeps the admit default — narrowing it is
+        // out of scope for the configured-zone default-deny fix and risks
+        // breaking ND / control delivery on the global context.
         None => true,
+        // A configured zone — including one with no `host-inbound-traffic` stanza
+        // (empty set) — denies anything its set does not admit (#3405).
         Some(hi) => hi.admits(protocol, dst_port, is_v6, icmp_type),
     }
 }
@@ -481,6 +500,63 @@ pub(in crate::afxdp) fn host_inbound_admits_iface(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #3405: a CONFIGURED zone with an EMPTY admission set (the on-wire shape of a
+    // security zone that declared no `host-inbound-traffic` stanza — the Go
+    // control plane now marks every zone host_inbound_configured) must
+    // default-DENY every host-bound service/protocol, while the global
+    // ICMP/ND/PMTUD accept still admits error/PMTUD control. This pins the
+    // load-bearing Rust half of the #3405 default-deny: `Some(empty) => deny`,
+    // NOT the pre-#3405 admit. Fail-on-revert: change the `Some(hi)` arm of
+    // host_inbound_admits to admit when the set is empty (or special-case an
+    // empty zone back to admit) and the SSH assertion below flips RED.
+    #[test]
+    fn empty_configured_zone_default_denies() {
+        const TCP: u8 = 6;
+        const ZONE: u16 = 7;
+
+        let mut state = ForwardingState::default();
+        // A configured zone with NO tokens = the no-stanza / empty-stanza shape.
+        state
+            .zone_host_inbound
+            .insert(ZONE, zone_host_inbound_from_tokens(&[], &[]));
+
+        // SSH (tcp/22) to the host on this zone is DENIED — the zone opened
+        // nothing. (Pre-#3405 a no-stanza zone was absent from the table and this
+        // returned admit via `None => true`.)
+        assert!(
+            !host_inbound_admits(&state, ZONE, TCP, 22, false, 0),
+            "empty configured zone must deny ssh (tcp/22) — #3405 default-deny",
+        );
+        // HTTPS (tcp/443) and an arbitrary UDP service are likewise denied.
+        assert!(
+            !host_inbound_admits(&state, ZONE, TCP, 443, false, 0),
+            "empty configured zone must deny https (tcp/443)",
+        );
+        assert!(
+            !host_inbound_admits(&state, ZONE, 17, 53, true, 0),
+            "empty configured zone must deny udp/53 on v6",
+        );
+
+        // The global ICMP error/PMTUD accept (#3171) still fires: v4
+        // destination-unreachable (type 3) and v6 packet-too-big (type 2) reach
+        // the host even on a default-deny zone, so PMTUD is never black-holed.
+        assert!(
+            host_inbound_admits(&state, ZONE, 1, 0, false, 3),
+            "ICMPv4 destination-unreachable must stay globally admitted",
+        );
+        assert!(
+            host_inbound_admits(&state, ZONE, 58, 0, true, 2),
+            "ICMPv6 packet-too-big (PMTUD) must stay globally admitted",
+        );
+
+        // A genuinely unknown / global ingress zone (id not in the table) keeps
+        // the admit default — #3405 is scoped to configured zones only.
+        assert!(
+            host_inbound_admits(&state, 999, TCP, 22, false, 0),
+            "unknown/global zone (absent from table) keeps the admit default",
+        );
+    }
 
     // #3311: the `protocols all` expansion must EXCLUDE every L2/non-IP protocol
     // (IS-IS) — they cannot produce an IP host-inbound admit and are handled by
