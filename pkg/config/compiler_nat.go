@@ -1315,7 +1315,14 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 					case "source-address-name":
 						// #2416: address-book reference; resolved to prefixes at
 						// snapshot-build time (appendNATSourceAddressName).
-						rule.Match.SourceAddressName = nodeVal(m)
+						// #3431: accumulate EVERY value of a bracket list /
+						// repeated leaf (mirror firewallMatchValues) — a
+						// `match source-address-name [ a b ]` used to keep only
+						// the first and silently drop the rest.
+						rule.Match.SourceAddressNames = append(rule.Match.SourceAddressNames, firewallMatchValues(m)...)
+						if len(rule.Match.SourceAddressNames) > 0 {
+							rule.Match.SourceAddressName = rule.Match.SourceAddressNames[0]
+						}
 					case "destination-address":
 						// Support bracket lists: destination-address [ addr1 addr2 ... ]
 						if len(m.Keys) >= 2 {
@@ -1333,7 +1340,11 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 					case "destination-address-name":
 						// #3229: address-book reference; resolved to prefixes at
 						// snapshot-build time (appendNATDestinationAddressName).
-						rule.Match.DestinationAddressName = nodeVal(m)
+						// #3431: accumulate every value (bracket list / repeated).
+						rule.Match.DestinationAddressNames = append(rule.Match.DestinationAddressNames, firewallMatchValues(m)...)
+						if len(rule.Match.DestinationAddressNames) > 0 {
+							rule.Match.DestinationAddressName = rule.Match.DestinationAddressNames[0]
+						}
 					case "destination-port":
 						// #3429 (H03): route source-NAT destination-port through
 						// the shared DNAT port-list parser. The old scalar path
@@ -1350,7 +1361,13 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 							rule.Match.DestinationPort = rule.Match.DestinationPorts[0]
 						}
 					case "application":
-						rule.Match.Application = nodeVal(m)
+						// #3431: accumulate every application (bracket list /
+						// repeated) — `match application [ a b ]` used to keep
+						// only the first and silently drop the rest.
+						rule.Match.Applications = append(rule.Match.Applications, firewallMatchValues(m)...)
+						if len(rule.Match.Applications) > 0 {
+							rule.Match.Application = rule.Match.Applications[0]
+						}
 					}
 				}
 			}
@@ -1464,7 +1481,11 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 					case "destination-address-name":
 						// #3229: address-book reference; resolved to prefixes at
 						// snapshot-build time (appendNATDestinationAddressName).
-						rule.Match.DestinationAddressName = nodeVal(m)
+						// #3431: accumulate every value (bracket list / repeated).
+						rule.Match.DestinationAddressNames = append(rule.Match.DestinationAddressNames, firewallMatchValues(m)...)
+						if len(rule.Match.DestinationAddressNames) > 0 {
+							rule.Match.DestinationAddressName = rule.Match.DestinationAddressNames[0]
+						}
 					case "destination-port":
 						dports, dinvalid := parseDNATPortList(m)
 						rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, dports...)
@@ -1485,11 +1506,25 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 							rule.Match.SourceAddress = rule.Match.SourceAddresses[0]
 						}
 					case "source-address-name":
-						rule.Match.SourceAddressName = nodeVal(m)
+						// #3431: accumulate every value (bracket list / repeated).
+						rule.Match.SourceAddressNames = append(rule.Match.SourceAddressNames, firewallMatchValues(m)...)
+						if len(rule.Match.SourceAddressNames) > 0 {
+							rule.Match.SourceAddressName = rule.Match.SourceAddressNames[0]
+						}
 					case "protocol":
-						rule.Match.Protocol = nodeVal(m)
+						// #3431: accumulate every protocol (bracket list /
+						// repeated) — `match protocol [ tcp udp ]` used to keep
+						// only the first.
+						rule.Match.Protocols = append(rule.Match.Protocols, firewallMatchValues(m)...)
+						if len(rule.Match.Protocols) > 0 {
+							rule.Match.Protocol = rule.Match.Protocols[0]
+						}
 					case "application":
-						rule.Match.Application = nodeVal(m)
+						// #3431: accumulate every application (bracket list / repeated).
+						rule.Match.Applications = append(rule.Match.Applications, firewallMatchValues(m)...)
+						if len(rule.Match.Applications) > 0 {
+							rule.Match.Application = rule.Match.Applications[0]
+						}
 					}
 				}
 			}

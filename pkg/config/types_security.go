@@ -433,12 +433,16 @@ type NATRule struct {
 type NATMatch struct {
 	SourceAddress          string   // CIDR (first address, for backward compat)
 	SourceAddresses        []string // all matched source CIDRs (bracket list support)
-	SourceAddressName      string   // address-book name (resolved during compilation)
+	SourceAddressName      string   // first address-book name (backward compat)
+	SourceAddressNames     []string // all matched source address-book names (#3431 bracket list / repeated)
 	DestinationAddress     string   // CIDR (first address, for backward compat)
 	DestinationAddresses   []string // all matched destination CIDRs (bracket list support)
-	DestinationAddressName string   // address-book name (resolved during compilation, #3229)
-	DestinationPort        int      // primary port (first port for BPF rule)
-	DestinationPorts       []int    // all matched ports (for multi-port DNAT rules)
+	DestinationAddressName string   // first address-book name (backward compat, #3229)
+	// DestinationAddressNames is every `match destination-address-name`
+	// value (#3431). The scalar above keeps the first for back-compat.
+	DestinationAddressNames []string
+	DestinationPort         int   // primary port (first port for BPF rule)
+	DestinationPorts        []int // all matched ports (for multi-port DNAT rules)
 	// InvalidDestinationPorts holds raw `match destination-port` tokens that
 	// did NOT parse as an integer (e.g. "http", "httpp"). The parser used to
 	// silently drop them, which let an all-nonnumeric port list collapse to an
@@ -447,8 +451,46 @@ type NATMatch struct {
 	// them at commit and the snapshot builders can fail CLOSED (match nothing)
 	// on the lenient load / peer-sync path.
 	InvalidDestinationPorts []string
-	Protocol                string // "tcp", "udp", "icmp6", "gre", or "" (auto)
-	Application             string // application name (e.g. "junos-http")
+	Protocol                string   // first protocol (backward compat): "tcp", "udp", "icmp6", "gre", or "" (auto)
+	Protocols               []string // all matched protocols (#3431 bracket list / repeated, DNAT only)
+	Application             string   // first application name (backward compat), e.g. "junos-http"
+	Applications            []string // all matched application names (#3431 bracket list / repeated)
+}
+
+// natMatchValues returns the full multi-value list for a NAT match axis,
+// falling back to the scalar when the plural slice is empty. The fallback
+// keeps consumers correct when a NATMatch arrives without the #3431 plural
+// fields populated (e.g. a config JSON-synced from an older peer that only
+// carried the scalar). An empty result means "criterion absent".
+func natMatchValues(list []string, scalar string) []string {
+	if len(list) > 0 {
+		return list
+	}
+	if scalar != "" {
+		return []string{scalar}
+	}
+	return nil
+}
+
+// ApplicationList returns every `match application` value (#3431).
+func (m NATMatch) ApplicationList() []string {
+	return natMatchValues(m.Applications, m.Application)
+}
+
+// ProtocolList returns every `match protocol` value (#3431, DNAT only).
+func (m NATMatch) ProtocolList() []string {
+	return natMatchValues(m.Protocols, m.Protocol)
+}
+
+// SourceAddressNameList returns every `match source-address-name` value (#3431).
+func (m NATMatch) SourceAddressNameList() []string {
+	return natMatchValues(m.SourceAddressNames, m.SourceAddressName)
+}
+
+// DestinationAddressNameList returns every `match destination-address-name`
+// value (#3431).
+func (m NATMatch) DestinationAddressNameList() []string {
+	return natMatchValues(m.DestinationAddressNames, m.DestinationAddressName)
 }
 
 // NATThen defines the NAT translation action.

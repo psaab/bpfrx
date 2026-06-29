@@ -23922,3 +23922,7 @@ top.
   pkg/api/sse.go, pkg/api/rest_events_forensic_3337_test.go (new),
   pkg/grpcapi/server_show_events_forensic_3337_test.go (new),
   pkg/api/README.md, pkg/grpcapi/README.md, _Log.md
+
+- **Timestamp**: 2026-06-29
+  - **Action**: #3431 — accumulate ALL values of multi-value NAT `match` leaves (application/protocol/source-address-name/destination-address-name); validate every value; expand union in userspace snapshot build. Added NATMatch plural slices + List() accessors. RED-on-revert tests (both AST shapes + snapshot path). Doc update.
+  - **File(s)**: pkg/config/types_security.go, pkg/config/compiler_nat.go, pkg/config/compiler_validate_strict.go, pkg/dataplane/userspace/nat.go, pkg/natshow/{dest,source}.go, docs/config-schema.md, pkg/config/compiler_nat_match_multivalue_3431_test.go, pkg/dataplane/userspace/nat_match_multivalue_3431_test.go

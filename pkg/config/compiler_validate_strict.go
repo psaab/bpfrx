@@ -2245,8 +2245,14 @@ func validateNATMatchApplicationsStrict(cfg *Config) error {
 			if rule == nil {
 				continue
 			}
-			if err := appRefError(natKind, rs.Name, rule.Name, rule.Match.Application); err != nil {
-				return err
+			// #3431: validate EVERY application in a bracket list / repeated
+			// `match application [ a b ]`, not just the first. The parser used
+			// to collapse the list to one value, so a trailing typo was never
+			// reached by this gate.
+			for _, app := range rule.Match.ApplicationList() {
+				if err := appRefError(natKind, rs.Name, rule.Name, app); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -5375,12 +5381,19 @@ func validateDestinationNATProtocolStrict(cfg *Config) error {
 			// application override (the builder prefers app terms). But gating it
 			// regardless is correct: an unresolvable token can never be a valid
 			// DNAT protocol, application override or not.
-			if !dnatProtocolResolvable(rule.Match.Protocol) {
-				return fmt.Errorf(
-					"destination-nat rule-set %q rule %q: match protocol %q is not a "+
-						"resolvable protocol (known name or 0-255 number); the rule would "+
-						"commit but never translate any traffic",
-					rs.Name, rule.Name, rule.Match.Protocol)
+			//
+			// #3431: validate EVERY protocol of a bracket list / repeated
+			// `match protocol [ tcp udp ]`. The parser used to keep only the
+			// first, so a bad trailing protocol committed silently AND only the
+			// first protocol was ever published.
+			for _, proto := range rule.Match.ProtocolList() {
+				if !dnatProtocolResolvable(proto) {
+					return fmt.Errorf(
+						"destination-nat rule-set %q rule %q: match protocol %q is not a "+
+							"resolvable protocol (known name or 0-255 number); the rule would "+
+							"commit but never translate any traffic",
+						rs.Name, rule.Name, proto)
+				}
 			}
 		}
 	}
@@ -5675,10 +5688,13 @@ func validateNATSourceAddressNameReferencesStrict(cfg *Config) error {
 			if rule == nil {
 				continue
 			}
-			if err := nameError(natType, rs.Name, rule.Name,
-				"source-address-name", "source scope",
-				rule.Match.SourceAddressName); err != nil {
-				return err
+			// #3431: validate EVERY name in a bracket list / repeated
+			// `match source-address-name [ a b ]`, not just the first.
+			for _, name := range rule.Match.SourceAddressNameList() {
+				if err := nameError(natType, rs.Name, rule.Name,
+					"source-address-name", "source scope", name); err != nil {
+					return err
+				}
 			}
 			// #3229: destination-address-name is the destination twin of
 			// source-address-name and resolves through the same address-book
@@ -5686,10 +5702,12 @@ func validateNATSourceAddressNameReferencesStrict(cfg *Config) error {
 			// unresolvable reference installs no destination = the rule matches
 			// nothing (fail-closed but silent); gate it here so the problem is
 			// operator-visible at commit, exactly like the source name above.
-			if err := nameError(natType, rs.Name, rule.Name,
-				"destination-address-name", "destination scope",
-				rule.Match.DestinationAddressName); err != nil {
-				return err
+			// #3431: validate every value of a bracket list / repeated leaf.
+			for _, name := range rule.Match.DestinationAddressNameList() {
+				if err := nameError(natType, rs.Name, rule.Name,
+					"destination-address-name", "destination scope", name); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
