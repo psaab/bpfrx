@@ -3386,6 +3386,48 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 					"remove icmp-code)",
 				name)
 		}
+		// #3352: an unrecognized leaf inside an inline `term { ... }`. The term
+		// subtree is an opaque `args:1` schema leaf (children:nil), so the
+		// SchemaValidate walk never reaches inside it and a typo'd leaf (e.g.
+		// `destination-poort 22`) was silently dropped along with its value —
+		// the term kept only its remaining constraints (e.g. `protocol tcp`) and
+		// a narrow permit/deny term widened to all-protocol (all-TCP), with no
+		// commit error. parseApplicationTerms now records the offending token on
+		// UnknownTermLeaves (mirroring UnknownTimeouts / UnknownICMP); reject the
+		// first one here so the silent match-widening becomes an operator-visible
+		// commit error. Strict on the commit / commit-check path; the call site
+		// (compiler.go, lenientApplicationSpecs) downgrades it to a warning on the
+		// tolerant load / peer-sync path (#1960 no-brick).
+		if len(app.UnknownTermLeaves) > 0 {
+			return fmt.Errorf(
+				"application %q: unknown statement %q inside `term`; a custom "+
+					"application term accepts only protocol / source-port / "+
+					"destination-port / inactivity-timeout / timeout / icmp-type / "+
+					"icmp-code / alg (an unrecognized leaf is silently dropped along "+
+					"with its value, widening the term to match more than intended)",
+				name, app.UnknownTermLeaves[0])
+		}
+		// #3353: a per-application `alg` name that is not one xpf supports. The
+		// `alg` leaf is a raw string with no schema validator, so a typo
+		// (`alg ftpp`) committed cleanly and the operator believed an ALG was
+		// pinned when none existed (a silent no-op on a security knob). Validate
+		// it against supportedApplicationALGs — the same DNS/FTP/SIP/TFTP set the
+		// global `security alg` control exposes. This is VALIDATION only: the
+		// per-application ALG is still not carried to the userspace dataplane
+		// (the wire has only the global alg_disable_flags bitfield), so a valid
+		// `alg` name remains informational until the enforcement half lands. That
+		// dataplane half is a genuine fork (new snapshot field + Rust) tracked as
+		// the per-application slice of #2008. Strict on the commit / commit-check
+		// path; lenient-warn on the tolerant load / peer-sync path.
+		if app.ALG != "" && !validApplicationALG(app.ALG) {
+			return fmt.Errorf(
+				"application %q: unknown alg %q; supported application ALGs are "+
+					"dns/ftp/sip/tftp (the same set the global `security alg` control "+
+					"exposes). NOTE: a per-application alg is validated at commit but "+
+					"is not yet enforced by the userspace dataplane — enforcement is "+
+					"deferred to the per-application ALG slice of #2008",
+				name, app.ALG)
+		}
 	}
 	return nil
 }

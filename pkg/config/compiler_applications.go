@@ -182,6 +182,11 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 	var badTimeouts []string
 	var icmpType, icmpCode *uint8
 	var badICMP []string
+	// #3352: tokens inside the inline term that are not a recognized leaf.
+	// The term subtree is opaque to SchemaValidate (children:nil), so without
+	// a default arm an unknown leaf (and its value) were silently dropped,
+	// widening the term. Record them for the deferred strict gate.
+	var badTermLeaves []string
 	// #3348: per normalized-protocol echo-type implied by a junos-ping /
 	// junos-pingv6 alias inside an inline term. normalizeProtocol folds the
 	// alias to "icmp"/"icmpv6" and loses the ping distinction, so capture the
@@ -264,6 +269,15 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 				i++
 				alg = keys[i]
 			}
+		default:
+			// #3352: an unrecognized token inside the inline term. This catches
+			// both a typo'd leaf keyword (e.g. `destination-poort`) and the value
+			// that follows it (which, being a non-keyword, also lands here) —
+			// either way the term subtree carried something the parser cannot
+			// honor, so record it and let validateApplicationSpecsStrict reject
+			// the first one rather than silently dropping the constraint and
+			// widening the match.
+			badTermLeaves = append(badTermLeaves, keys[i])
 		}
 	}
 
@@ -310,6 +324,7 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 			ICMPType:          it,
 			ICMPCode:          icmpCode,
 			UnknownICMP:       badICMP,
+			UnknownTermLeaves: badTermLeaves,
 		})
 	}
 	return result
@@ -496,6 +511,40 @@ func validatePortSpec(spec string) error {
 		return fmt.Errorf("invalid port %d: must be 1-65535", port)
 	}
 	return nil
+}
+
+// supportedApplicationALGs is the single source of truth for the per-application
+// `alg` names xpf recognizes. It MIRRORS the global `security alg <proto>`
+// control surface (schema_security.go `alg` children + algDisableFlags in
+// pkg/dataplane/userspace/flow.go), which exposes exactly DNS / FTP / SIP / TFTP.
+// A name outside this set is a silent operator error today: before #3353 the
+// per-application `alg` leaf was a raw `args:1` string with no validator, so a
+// typo (`alg ftpp`) committed cleanly and the operator believed an ALG was
+// pinned when none existed.
+//
+// #3353 ships VALIDATION only. The per-application ALG is recorded on
+// Application.ALG but is NOT carried into the userspace dataplane snapshot — the
+// only ALG signal on the wire is the global alg_disable_flags bitfield
+// (userspace-dp snapshot.rs), there is no per-application ALG / custom-port pin.
+// Wiring per-application ALG (e.g. `alg ftp destination-port 2121`) through to
+// enforcement is a genuine dataplane fork (it needs a new snapshot field plus
+// Rust session-metadata handling) and is the per-application slice of the
+// broader ALG parity tracked under #2008; it is deliberately deferred. Until
+// then this gate makes an unsupported name an operator-visible commit error
+// instead of a silent no-op.
+var supportedApplicationALGs = map[string]bool{
+	"dns":  true,
+	"ftp":  true,
+	"sip":  true,
+	"tftp": true,
+}
+
+// validApplicationALG reports whether name is a supported per-application ALG.
+// The match is case-insensitive (like validatePortSpec / validateProtocol). An
+// empty name means "no alg" and is treated as valid by the caller before this
+// is reached.
+func validApplicationALG(name string) bool {
+	return supportedApplicationALGs[strings.ToLower(strings.TrimSpace(name))]
 }
 
 // validateProtocol checks that a protocol specification is valid.
