@@ -22979,3 +22979,13 @@ top.
   - **File(s)**: pkg/config/compiler_validate_strict.go,
     pkg/config/compiler.go,
     pkg/config/log_stream_config_3349_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-28
+  - **Action**: Document host-inbound `system-services traceroute` admit
+    contract (#3368). Verified against authoritative Junos docs that
+    `traceroute` is UDP-probe-only (Junos: UDP 33434; xpf already admits the
+    full 33434-33523 Unix probe window dual-family = a superset). ICMP
+    traceroute is admitted via the `ping` token, TCP traceroute is not a Junos
+    host-inbound system-service. No behavior/admit change — docs-only; the
+    #3368 under-admission premise is not borne out by the Junos contract.
+  - **File(s)**: docs/junos-cli-reference.md, _Log.md
