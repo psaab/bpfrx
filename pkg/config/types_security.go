@@ -593,6 +593,14 @@ type Address struct {
 	Name        string
 	Value       string // CIDR notation
 	Description string // optional Junos `description` sub-stanza
+	// TrailingTokens holds tokens that rode past the legitimate arity of a
+	// flat-set `address <name> <prefix>` / `address <name> description
+	// <text>` line (#3332). The address node is a `multi:true` leaf (so the
+	// generic scalar-leaf arity gate cannot reach it) and the compiler reads
+	// only the prefix / description-text slot, silently dropping anything
+	// after it. validateAddressBookTrailingStrict rejects these at commit
+	// (lenient downgrade on the tolerant load / peer-sync path).
+	TrailingTokens []string
 }
 
 // AddressSet is a named group of addresses and/or nested address-sets.
@@ -722,6 +730,15 @@ type IPsecGateway struct {
 	LocalIDValue     string // identity value
 	RemoteIDType     string // "hostname", "inet", "fqdn"
 	RemoteIDValue    string // identity value
+	// DynamicHostnameExtras holds tokens that rode past the FQDN on a
+	// compact-hierarchical `dynamic hostname <fqdn> <extra>` line (#3332).
+	// The flat-set form lands `hostname <fqdn>` as a scalar child the generic
+	// arity gate covers, but the compact-hierarchical form collapses
+	// `hostname <fqdn> <extra>` onto the parent `dynamic` node's Keys and the
+	// compiler reads only Keys[2], silently dropping the rest.
+	// validateTrailingTokensStrict rejects these at commit (lenient downgrade
+	// on the tolerant load / peer-sync path).
+	DynamicHostnameExtras []string
 }
 
 type IPsecTrafficSelector struct {

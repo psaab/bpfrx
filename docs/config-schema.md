@@ -108,6 +108,100 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+## Trailing-token arity on scalar value leaves (#3332)
+
+The mirror image of the multi-value contract is the **scalar** value leaf: a
+keyword that consumes EXACTLY `args` value token(s) and models no
+sub-structure (`description`, `host-name`, `peer-address`, `scheduler-map`,
+`port`, …). In the flat-set grammar a recognized non-multi leaf parks any
+trailing token its arity does not expect as a CHILD node rather than on Keys
+— `set interfaces ge-0-0-0 description hello bogus` becomes
+`Keys=[description hello]` with an orphan child `Keys=[bogus]` (`SetPath`,
+`ast_edit.go`). The compiler reads only the declared value span, so before
+#3332 the orphan was silently DROPPED: a typo'd extra token committed cleanly
+and the operator's garbage was discarded with no warning. (This is distinct
+from the #3318 unknown-KEYWORD gate — here the leaf keyword itself IS
+supported; only the trailing token is not. The screen subset was closed
+earlier by #3411's `compileScreen` `recordKeyExtras`/`recordChildExtras`;
+#3332 is the general schema-walk gate.)
+
+`SchemaValidate` (`schema_walk.go`) now rejects the excess —
+`validateScalarValueLeaf` rejects the first Keys token past `1+args` AND the
+first AST child, with a value-arity message ("the extra token would be
+silently dropped"). The gate fires only on an EXACT keyword match (a wildcard
+match means the keyword is a dynamic instance NAME, not this leaf's value
+slot) and only on a leaf the `schemaNode.isScalarValueLeaf` predicate
+(`schema.go`) admits.
+
+**Why an explicit `scalar: true` opt-in, not structural inference.** An
+`args > 0, children: nil` node is NOT reliably a value leaf: several are
+deliberately-OPAQUE CONTAINERS whose body is left to the compiler and parsed
+off the node's AST children — `applications application-set <name> {
+application <member>; }`, `applications application <name> { ... }`, `system
+syslog file <name> { ... }`. Their legitimate body lands on Keys/Children
+exactly like a typo would, so a structural-only gate would false-reject real
+config (caught in review: `application-set my-set application junos-http`).
+The arity contract therefore lives on an explicit per-leaf `scalar: true`
+tag, asserted only on leaves audited to take a fixed value and NO body
+(`description` across the tree, `system host-name`, dynamic-peer/feed
+`hostname`). This is the "design pass on the value-arity contract" the #3332
+body called for; new scalar leaves opt in as they are audited.
+
+`isScalarValueLeaf` also carries belt-and-braces structural guards, so a
+future mis-tag on a node that is actually multi / typed / a container
+degrades to a no-op rather than a surprise rejection. It exempts:
+
+- **`!scalar`** — un-tagged leaves are untouched (the opt-in default).
+- **`multi`** — bracketed lists / value tails (#2419, above) absorb every
+  trailing value by design.
+- **`children != nil` / `wildcard != nil`** — named-instance / modifier
+  containers (`address <cidr> { primary; }`, `transmit-rate 1g exact`): the
+  trailing tokens are real sub-structure the container path validates.
+- **`compoundKey` / `midKeyword`** — the trailing token is part of the node
+  key (`family inet6`, `from-zone X to-zone Y`).
+- **`isTypedLeaf`** — `validateTypedLeaf` already rejects unknown trailing
+  tokens and unexpected children for typed leaves.
+- **`args == 0`** — a childless, untyped, zero-arg node is AMBIGUOUS between
+  a presence-only flag (`dhcp`) and a deliberately-OPAQUE leaf whose subtree
+  the compiler reads despite no schema children (`tcp-mss <mode> <value>`,
+  #1979; the unmodeled NAT pool `address`/`port`/`host` leaves). The screen
+  flag subset (`tcp land`, …) is handled by #3411 instead.
+
+A quoted multi-word value (`description "trust zone"`) arrives as ONE token,
+so it is unaffected — only an UNQUOTED trailing token (`description trust
+zone`, invalid Junos) is rejected. Minimum arity is NOT enforced — a missing
+value is still left to the compiler; the gate is scoped strictly to EXCESS
+trailing tokens, the silent-drop bug class. Pinned by
+`pkg/config/schema_validate_trailing_token_3332_test.go`
+(`TestSchema3332_*`, including the `application-set` opaque-container guard).
+
+**Compiler-side companion gate for the shapes the walker cannot reach.** Two
+silent-drop sites are NOT reachable by the schema-walk scalar gate and are
+caught by `validateTrailingTokensStrict` (`compiler_validate_strict.go`)
+instead, recorded on the typed struct during compile and rejected on the
+strict commit / commit-check path (lenient downgrade to a `cfg.Warnings`
+entry on the tolerant load / peer-sync path, `lenientTrailingTokens`):
+
+- **address-book `address <name> <prefix>` / `address <name> description
+  <text>`** — the `address` schema node is `multi:true` (it must absorb the
+  `description` sub-token onto its Keys to keep the #2419 dual-AST shape), so
+  the scalar gate (which exempts `multi`) never reaches the value slot and
+  `mergeAddressNode` reads only the prefix / `descriptionText` token.
+  `address h2 description web-server bogus` and `address h2 1.2.3.4/32 bogus`
+  now record the leftover on `Address.TrailingTokens` (global AND zone-local
+  books, since `resolveZoneLocalAddressBooks` copies only Value/Description).
+- **IKE gateway compact-hierarchical `dynamic hostname <fqdn> <extra>`** — the
+  flat-set form lands `hostname <fqdn>` as a scalar CHILD the generic gate
+  covers, but the compact-hierarchical one-liner collapses the tokens onto the
+  parent `dynamic` node's Keys and `compileIPsec` reads only `Keys[2]`. The
+  leftover is recorded on `IPsecGateway.DynamicHostnameExtras`.
+
+The address-book `address-set description` leaf is deliberately NOT tagged
+`scalar: true`: `AddressSet` has no `Description` field and the compiler does
+not read it, so the value is currently unsupported and discarded — an arity
+gate there would assert validation on a no-op feature (tag it only if/when
+`AddressSet.Description` is wired).
+
 ### `firewall ... from tcp-flags` — semantic validation, not just a list (#3076)
 
 `from tcp-flags` is a `multi: true` leaf, so the dual-AST contract above

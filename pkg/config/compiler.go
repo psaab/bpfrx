@@ -977,6 +977,21 @@ type compileOpts struct {
 	// the dataplane never represented the leaf, so a leniently-loaded profile
 	// runs without it independently. Same doctrine as lenientFilterFromMatch.
 	lenientScreenUnknown bool
+	// lenientTrailingTokens (#3332) downgrades the trailing-token gate
+	// (validateTrailingTokensStrict) from a hard compile error to a
+	// cfg.Warnings entry. The strict commit / commit-check path hard-rejects
+	// a token that rode past a leaf's value arity in a shape the generic
+	// schema-walk scalar gate cannot reach — address-book `address <name>
+	// <prefix>` / `... description <text>` (the `address` node is multi:true)
+	// and IKE gateway compact-hierarchical `dynamic hostname <fqdn> <extra>`
+	// (the tokens collapse onto the parent `dynamic` node's Keys). The
+	// compiler read only the value slot and silently dropped the rest. The
+	// tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config still BOOTS (#1960 no-brick);
+	// the dropped token never reached the dataplane, so a leniently-loaded
+	// config is no different from before the gate. Same doctrine as
+	// lenientScreenUnknown.
+	lenientTrailingTokens bool
 	// lenientFlowAging (#3440 H2) downgrades the flow-aging gate
 	// (validateFlowAgingStrict) from a hard compile error to a cfg.Warnings
 	// entry. The strict commit / commit-check path hard-rejects an unknown
@@ -1260,6 +1275,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientScreenProfileRefs:             true,
 		lenientScreenNumeric:                 true,
 		lenientScreenUnknown:                 true,
+		lenientTrailingTokens:                true,
 		lenientFlowAging:                     true,
 		lenientReservedZoneNames:             true,
 		lenientBackupRouterDst:               true,
@@ -1406,6 +1422,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientScreenProfileRefs:             true,
 		lenientScreenNumeric:                 true,
 		lenientScreenUnknown:                 true,
+		lenientTrailingTokens:                true,
 		lenientFlowAging:                     true,
 		lenientReservedZoneNames:             true,
 		lenientBackupRouterDst:               true,
@@ -2148,6 +2165,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientScreenUnknown {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("screen unknown leaf (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3332 trailing-token gate. Strict on commit / commit-check (hard-reject
+	// a token that rode past a leaf's value arity in a shape the generic
+	// schema-walk scalar gate cannot reach — multi:true address-book
+	// `address` entries and the compact-hierarchical `dynamic hostname`
+	// form). Lenient on load / peer-sync (warn so an already-persisted or
+	// peer-synced config still boots — #1960 no-brick; the dropped token
+	// never reached the dataplane). Runs on the fully-compiled *Config so the
+	// recorded TrailingTokens / DynamicHostnameExtras are available.
+	if err := validateTrailingTokensStrict(cfg); err != nil {
+		if opts.lenientTrailingTokens {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("trailing token (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

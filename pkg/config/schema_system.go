@@ -33,7 +33,7 @@ func syslogFacilitySeverityLeaf() *schemaNode {
 }
 
 var schemaSystem = &schemaNode{desc: "System configuration", children: map[string]*schemaNode{
-	"host-name":     {desc: "System hostname", args: 1, placeholder: "<hostname>", children: nil},
+	"host-name":     {desc: "System hostname", args: 1, scalar: true, placeholder: "<hostname>", children: nil},
 	"domain-name":   {desc: "Domain name", args: 1, placeholder: "<domain>", children: nil},
 	"domain-search": {desc: "Domain search list", args: 1, multi: true, placeholder: "<domain>", children: nil},
 	"time-zone":     {desc: "System time zone", args: 1, placeholder: "<timezone>", children: nil},

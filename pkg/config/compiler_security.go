@@ -1076,12 +1076,24 @@ func mergeAddressNode(addr *Address, node *Node) {
 		if d := descriptionText(node); d != "" {
 			addr.Description = d
 		}
+		// #3332: the description text is a single token at Keys[3] (a quoted
+		// multi-word description is one token); any token past it is operator
+		// garbage the compiler silently dropped. Record it for the strict
+		// trailing-token gate.
+		if len(node.Keys) > 4 {
+			addr.TrailingTokens = append(addr.TrailingTokens, node.Keys[4:]...)
+		}
 		return
 	}
 
 	// Prefix-bearing leaf: Keys[2] is the prefix iff it parses as an IP/CIDR.
 	if len(node.Keys) >= 3 && looksLikeIPOrCIDR(node.Keys[2]) {
 		addr.Value = node.Keys[2]
+		// #3332: a named address takes exactly one prefix; anything after it
+		// (Keys[3:]) is operator garbage the compiler silently dropped.
+		if len(node.Keys) > 3 {
+			addr.TrailingTokens = append(addr.TrailingTokens, node.Keys[3:]...)
+		}
 	}
 
 	// Hierarchical-block children: bare-leaf prefix and/or `description`.
