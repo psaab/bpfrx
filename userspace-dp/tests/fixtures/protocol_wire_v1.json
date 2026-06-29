@@ -453,6 +453,7 @@
     "from_interface": "",
     "from_routing_instance": "",
     "from_zone": "",
+    "match_destination_ports": [],
     "match_icmp_code": null,
     "match_icmp_type": null,
     "match_source_ports": [],

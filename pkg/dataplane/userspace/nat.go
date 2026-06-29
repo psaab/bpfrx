@@ -871,30 +871,54 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 				// parse and surface via Match.InvalidDestinationPorts. The strict
 				// commit gate (validateNATMatchDestinationPortStrict) rejects all
 				// of these at commit; this hardens the lenient / peer-sync path.
-				var dstPorts []uint16
-				for _, p := range term.ports {
-					if p >= 1 && p <= 65535 {
-						dstPorts = append(dstPorts, uint16(p))
-					}
-				}
+				//
+				// #3449: coalesce the term's valid 1..65535 ports into inclusive
+				// [Low,High] ranges so a wide `destination-port low to high` (or
+				// an application's wide destination-port) carries ONE compact
+				// entry instead of (high-low+1) per-port snapshots — a
+				// control-plane memory/apply-time amplification hazard. A single
+				// port (Low==High) keeps the exact-port O(1) fast-path entry; a
+				// multi-port range becomes a wildcard-port (DestinationPort=0)
+				// entry whose MatchDestinationPorts the Rust l4_extra_matches
+				// AND-checks against the flow's destination port (mirroring the
+				// #3437 MatchSourcePorts handling). coalescePortRanges drops
+				// out-of-range values; an all-invalid configured port therefore
+				// coalesces to nothing and is failed CLOSED below.
+				portRanges := coalescePortRanges(term.ports)
 				// Did this rule CONFIGURE a destination-port at all? A configured
 				// port that survived to no valid value must not become wildcard.
 				portConfigured := len(term.ports) > 0 ||
 					(explicitFallback && (rule.Match.DestinationPort != 0 || len(rule.Match.InvalidDestinationPorts) > 0))
-				if len(dstPorts) == 0 {
+				if len(portRanges) == 0 {
 					switch {
 					case rule.Match.DestinationPort >= 1 && rule.Match.DestinationPort <= 65535:
-						dstPorts = []uint16{uint16(rule.Match.DestinationPort)}
+						p := uint16(rule.Match.DestinationPort)
+						portRanges = []NatPortRangeWire{{Low: p, High: p}}
 					case portConfigured:
 						// Configured but no valid port → fail closed: emit no
 						// snapshot for this term so the rule matches nothing.
 						continue
 					default:
-						dstPorts = []uint16{0} // genuine wildcard (no port match)
+						// Genuine wildcard (no port match): a [0,0] range maps to
+						// DestinationPort=0 with no range constraint below.
+						portRanges = []NatPortRangeWire{{Low: 0, High: 0}}
 					}
 				}
 
-				for _, dstPort := range dstPorts {
+				for _, pr := range portRanges {
+					// A single-port range (Low==High, including the [0,0]
+					// wildcard) keeps the exact wire key; a multi-port range
+					// uses the wildcard key (DestinationPort=0) plus a
+					// MatchDestinationPorts range constraint so it is NOT
+					// expanded per port.
+					var dstPort uint16
+					var matchDstPorts []NatPortRangeWire
+					if pr.Low == pr.High {
+						dstPort = pr.Low
+					} else {
+						dstPort = 0
+						matchDstPorts = []NatPortRangeWire{pr}
+					}
 					poolPort := dstPort
 					if pool.Port != 0 {
 						// #3450: pool.Port is gated to 1..65535 above (an
@@ -904,9 +928,11 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 						poolPort = uint16(pool.Port)
 					}
 
-					// Determine protocol string for the snapshot.
+					// Determine protocol string for the snapshot. A port-based
+					// rule (an exact port OR a range constraint) defaults to TCP
+					// when the rule did not pin a protocol, exactly as before.
 					proto := term.proto
-					if proto == "" && dstPort != 0 {
+					if proto == "" && (dstPort != 0 || len(matchDstPorts) > 0) {
 						proto = "tcp" // default for port-based DNAT
 					}
 
@@ -944,9 +970,13 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 							DestinationAddress:  base,
 							DestinationPrefix:   prefix,
 							DestinationPort:     dstPort,
-							Protocol:            proto,
-							PoolAddress:         poolAddr,
-							PoolPort:            poolPort,
+							// #3449: a multi-port range rides this field as
+							// one [Low,High] constraint instead of (High-Low+1)
+							// per-port entries; empty for a single/exact port.
+							MatchDestinationPorts: matchDstPorts,
+							Protocol:              proto,
+							PoolAddress:           poolAddr,
+							PoolPort:              poolPort,
 							// #3437: carry the application's source-port and
 							// ICMP type/code constraints so the DNAT match is no
 							// wider than the referenced application.
