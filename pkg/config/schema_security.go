@@ -40,7 +40,7 @@ var (
 var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[string]*schemaNode{
 	"zones": {desc: "Security zones", children: map[string]*schemaNode{
 		"security-zone": {desc: "Security zone name", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: map[string]*schemaNode{
-			"description": {desc: "Zone description", args: 1, placeholder: "<text>", children: nil},
+			"description": {desc: "Zone description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 			"interfaces":  {desc: "Interfaces in this zone", children: nil},
 			"tcp-rst":     {desc: "Send TCP RST for denied traffic", children: nil},
 			"screen":      {desc: "Screen profile name", args: 1, placeholder: "<screen-name>", children: nil},
@@ -58,7 +58,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				"address-set": {desc: "Address set name", args: 1, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: map[string]*schemaNode{
 					"address":     {desc: "Address to include in this set", args: 1, multi: true, placeholder: "<address-name>", children: nil},
 					"address-set": {desc: "Nested address set to include", args: 1, multi: true, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: nil},
-					"description": {desc: "Address set description", args: 1, placeholder: "<text>", children: nil},
+					"description": {desc: "Address set description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 				}},
 			}},
 		}},
@@ -78,7 +78,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		},
 		"from-zone": {desc: "From zone", args: 3, valueHint: ValueHintZoneName, midKeyword: "to-zone", midKeywordAt: 2, placeholder: "<zone-name>", children: map[string]*schemaNode{
 			"policy": {desc: "Policy name", args: 1, valueHint: ValueHintPolicyName, placeholder: "<policy-name>", children: map[string]*schemaNode{
-				"description": {desc: "Policy description", args: 1, placeholder: "<text>", children: nil},
+				"description": {desc: "Policy description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 				"match": {desc: "Match criteria", children: map[string]*schemaNode{
 					"source-address":               {desc: "Source address", args: 1, multi: true, valueHint: ValueHintPolicyAddress, placeholder: "<address>", children: nil},
 					"destination-address":          {desc: "Destination address", args: 1, multi: true, valueHint: ValueHintPolicyAddress, placeholder: "<address>", children: nil},
@@ -107,7 +107,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 		"global": {desc: "Global policies", children: map[string]*schemaNode{
 			"policy": {desc: "Policy name", args: 1, valueHint: ValueHintPolicyName, placeholder: "<policy-name>", children: map[string]*schemaNode{
-				"description": {desc: "Policy description", args: 1, placeholder: "<text>", children: nil},
+				"description": {desc: "Policy description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 				"match": {desc: "Match criteria", children: map[string]*schemaNode{
 					"source-address":               {desc: "Source address", args: 1, multi: true, valueHint: ValueHintPolicyAddress, placeholder: "<address>", children: nil},
 					"destination-address":          {desc: "Destination address", args: 1, multi: true, valueHint: ValueHintPolicyAddress, placeholder: "<address>", children: nil},
@@ -329,7 +329,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"address-set": {desc: "Address set name", args: 1, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: map[string]*schemaNode{
 				"address":     {desc: "Address to include in this set", args: 1, multi: true, placeholder: "<address-name>", children: nil},
 				"address-set": {desc: "Nested address set to include", args: 1, multi: true, valueHint: ValueHintAddressName, placeholder: "<address-set-name>", children: nil},
-				"description": {desc: "Address set description", args: 1, placeholder: "<text>", children: nil},
+				"description": {desc: "Address set description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 			}},
 		}},
 	}},
@@ -575,7 +575,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"local-identity":  {desc: "Local IKE identity (type and value)", children: nil},
 			"remote-identity": {desc: "Remote IKE identity (type and value)", children: nil},
 			"dynamic": {desc: "Dynamic peer (peer has a dynamic IP). With `hostname <fqdn>` the peer is DNS-resolved; a bare `dynamic` block marks a responder-only peer (remote_addrs = %any, #2404)", children: map[string]*schemaNode{
-				"hostname": {desc: "Dynamic peer FQDN (DNS-resolved)", args: 1, placeholder: "<fqdn>", children: nil},
+				"hostname": {desc: "Dynamic peer FQDN (DNS-resolved)", args: 1, scalar: true, placeholder: "<fqdn>", children: nil},
 			}},
 		}},
 	}},
@@ -631,7 +631,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"local-identity":  {desc: "Local IKE identity (type and value)", children: nil},
 			"remote-identity": {desc: "Remote IKE identity (type and value)", children: nil},
 			"dynamic": {desc: "Dynamic peer (peer has a dynamic IP). With `hostname <fqdn>` the peer is DNS-resolved; a bare `dynamic` block marks a responder-only peer (remote_addrs = %any, #2404)", children: map[string]*schemaNode{
-				"hostname": {desc: "Dynamic peer FQDN (DNS-resolved)", args: 1, placeholder: "<fqdn>", children: nil},
+				"hostname": {desc: "Dynamic peer FQDN (DNS-resolved)", args: 1, scalar: true, placeholder: "<fqdn>", children: nil},
 			}},
 		}},
 		"vpn": {desc: "IPsec VPN tunnel name", args: 1, placeholder: "<vpn-name>", children: map[string]*schemaNode{
@@ -655,7 +655,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 	"dynamic-address": {desc: "Dynamic address feeds", children: map[string]*schemaNode{
 		"feed-server": {desc: "Feed server name", args: 1, placeholder: "<server-name>", children: map[string]*schemaNode{
 			"url":             {desc: "Feed URL (takes precedence over hostname)", args: 1, placeholder: "<url>", children: nil},
-			"hostname":        {desc: "Server hostname for building per-feed URLs", args: 1, placeholder: "<hostname>", children: nil},
+			"hostname":        {desc: "Server hostname for building per-feed URLs", args: 1, scalar: true, placeholder: "<hostname>", children: nil},
 			"update-interval": {desc: "Feed refresh interval in seconds (default 3600)", args: 1, placeholder: "<seconds>", children: nil},
 			"hold-interval":   {desc: "Drop a feed's last-good snapshot to empty after N seconds of fetch failure; omit to retain last-good forever (default)", args: 1, placeholder: "<seconds>", children: nil},
 			"feed-name": {desc: "Named feed on this server", args: 1, placeholder: "<feed-name>", children: map[string]*schemaNode{
@@ -699,7 +699,7 @@ var schemaApplications = &schemaNode{desc: "Applications", children: map[string]
 		"inactivity-timeout": {desc: "Inactivity timeout", args: 1, valueType: ValueInteger, valueDesc: "Timeout in seconds", valueExamples: []string{"300", "1800"}, validator: ValidateInteger(appTimeoutMin, appTimeoutMax), placeholder: "<seconds>", children: nil},
 		"timeout":            {desc: "Timeout", args: 1, valueType: ValueInteger, valueDesc: "Timeout in seconds", valueExamples: []string{"300", "1800"}, validator: ValidateInteger(appTimeoutMin, appTimeoutMax), placeholder: "<seconds>", children: nil},
 		"alg":                {desc: "Application layer gateway", args: 1, placeholder: "<alg>", children: nil},
-		"description":        {desc: "Description", args: 1, placeholder: "<text>", children: nil},
+		"description":        {desc: "Description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 		"term":               {desc: "Term", args: 1, placeholder: "<term>", children: nil},
 	}},
 	"application-set": {desc: "Application set", args: 1, valueHint: ValueHintAppSetName, placeholder: "<name>", children: nil},
