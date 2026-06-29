@@ -323,6 +323,32 @@ never lock an operator out of a remote box it manages.
   `TestLo0PayloadFallThroughDoesNotShadowDiscard`, and
   `TestLo0PayloadRoutingInstanceTerminatesAcceptNoOverDrop` (the over-drop
   counterexample).
+
+  **Address / prefix-list lowering mirrors userspace (#3433):**
+  `nftRuleFromTerm` lowers each direction's `source-address` /
+  `destination-address` + `source-prefix-list` / `destination-prefix-list`
+  scope through the SHARED userspace resolver
+  (`dpuserspace.ResolveFilterPrefixListAddrs`) so the kernel mirror uses the
+  EXACT empty-set / except / positive-wins / `any`-no-constraint semantics of
+  the userspace matcher (`filters.go` + `userspace-dp` `filter/engine/matching.rs`
+  `nets_match_v4/v6`). `nftAddrPredicate` then family-filters the resolved set
+  for the chain's family and renders the predicate. The replaced raw string
+  concatenation diverged on every one of these shapes (codex-094 H01-H05/H09):
+  a positive literal `any` is no constraint (match ALL, NOT the unloadable
+  `ip saddr any`); a constrained-but-empty POSITIVE scope (defined-empty or
+  lenient-unresolved prefix-list, all-malformed literal, or a wrong-family
+  literal such as a v4 CIDR in an inet6 filter) matches NOTHING — the rule is
+  SKIPPED (a term that matches nothing has no enforcement), fail-CLOSED rather
+  than the pre-fix "no predicate -> match ALL sources" fail-OPEN; an empty
+  EXCEPT scope is match-all (no predicate); a non-empty except is the nft
+  negated set `saddr != { ... }`; and a leniently-loaded MIXED positive+except
+  in one direction is positive-wins (the except side is dropped, never folded —
+  mirroring `resolvePrefixListAddrs`, hard-rejected at commit by #3359). A
+  malformed or wrong-family literal is also an operator-visible commit error
+  (`validateFilterAddressLiteralsStrict`, lenient-downgraded on the peer-sync /
+  load path — #1960 no-brick). Pinned by `TestNftRuleFromTermAddressSemantics3433`,
+  `TestNftRuleFromTermWrongFamilyMatchesNothing`, and (config side)
+  `firewall_address_literal_3433_test.go`.
 - host-inbound-traffic (`security zones <z> host-inbound-traffic`) is the
   PRIMARY kernel enforcement for host-bound traffic to a firewall interface IP
   / VRRP VIP (SSH, ping, OSPF/BGP to the box — #3070). Such traffic is shunted

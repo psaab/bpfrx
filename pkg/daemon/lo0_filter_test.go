@@ -346,16 +346,159 @@ func TestNftRuleFromTermMultiplePorts(t *testing.T) {
 func TestNftRuleFromTermSingleSourceAddr(t *testing.T) {
 	prefixLists := map[string]*config.PrefixList{}
 
+	// A v4 literal in the IPv4 chain renders its predicate verbatim.
 	term := &config.FirewallFilterTerm{
 		Name:            "allow-single",
 		SourceAddresses: []string{"10.0.1.0/24"},
 		Action:          "accept",
 	}
+	if rule := nftRuleFromTerm(term, "ip", prefixLists); rule != "ip saddr 10.0.1.0/24 accept" {
+		t.Errorf("v4 literal in ip chain: got %q, want %q", rule, "ip saddr 10.0.1.0/24 accept")
+	}
+}
 
-	rule := nftRuleFromTerm(term, "ip6", prefixLists)
-	want := "ip6 saddr 10.0.1.0/24 accept"
-	if rule != want {
-		t.Errorf("got:\n  %s\nwant:\n  %s", rule, want)
+// TestNftRuleFromTermWrongFamilyMatchesNothing is the #3433 H02 RED-on-revert:
+// a v4 literal carried in the IPv6 chain (a `family inet6` filter with a v4
+// source-address) must NOT emit `ip6 saddr 10.0.1.0/24` — that is invalid nft
+// (no v6 object for a v4 CIDR) that fails the atomic `nft -f -` load and, before
+// the fix, the unit test even PINNED that broken output. The userspace matcher
+// leaves the v6 vector empty -> constrained + empty positive -> match NOTHING, so
+// the kernel mirror must skip the rule (return ""). Reverting the family-filter in
+// nftFamilyAddrs makes this RED.
+func TestNftRuleFromTermWrongFamilyMatchesNothing(t *testing.T) {
+	prefixLists := map[string]*config.PrefixList{}
+
+	term := &config.FirewallFilterTerm{
+		Name:            "v4-in-v6",
+		SourceAddresses: []string{"10.0.1.0/24"},
+		Action:          "accept",
+	}
+	if rule := nftRuleFromTerm(term, "ip6", prefixLists); rule != "" {
+		t.Errorf("wrong-family v4 literal in ip6 chain: got %q, want \"\" (match-nothing, #3433 H02)", rule)
+	}
+
+	// Symmetric: a v6 literal in the IPv4 chain.
+	term6 := &config.FirewallFilterTerm{
+		Name:            "v6-in-v4",
+		SourceAddresses: []string{"2001:db8::/32"},
+		Action:          "discard",
+	}
+	if rule := nftRuleFromTerm(term6, "ip", prefixLists); rule != "" {
+		t.Errorf("wrong-family v6 literal in ip chain: got %q, want \"\" (match-nothing, #3433 H02)", rule)
+	}
+}
+
+// TestNftRuleFromTermAddressSemantics3433 pins the lo0 nft address /
+// prefix-list lowering to the userspace matcher's set semantics
+// (pkg/dataplane/userspace/filters.go + userspace-dp filter/engine/matching.rs
+// nets_match_v4/v6). Each sub-case is a shape where the pre-#3433 raw string
+// concatenation DIVERGED from userspace — either over-matching in the kernel
+// mirror (fail-open) or emitting invalid nft that fails the atomic load.
+// FAIL-ON-REVERT: restoring the raw concatenation flips every want below.
+func TestNftRuleFromTermAddressSemantics3433(t *testing.T) {
+	pls := map[string]*config.PrefixList{
+		"trusted": {Name: "trusted", Prefixes: []string{"10.0.0.0/8", "192.168.0.0/16"}},
+		"empty":   {Name: "empty", Prefixes: nil}, // defined-but-empty
+	}
+
+	tests := []struct {
+		name string
+		term *config.FirewallFilterTerm
+		fam  string
+		want string
+	}{
+		{
+			// H01: a positive literal `any` is NO constraint (match ALL), not a
+			// match-nothing empty set and not the unloadable `ip saddr any`.
+			name: "positive any -> no predicate (match all)",
+			term: &config.FirewallFilterTerm{
+				Name: "any-accept", SourceAddresses: []string{"any"}, Action: "accept",
+			},
+			fam:  "ip",
+			want: "accept",
+		},
+		{
+			// H03: a defined-but-empty POSITIVE prefix-list is constrained +
+			// empty -> match NOTHING. The term contributes no enforcement; the
+			// rule is skipped (""). The pre-fix code emitted no saddr predicate ->
+			// the rest of the rule matched ALL sources (fail-open).
+			name: "empty positive prefix-list -> match nothing (skip)",
+			term: &config.FirewallFilterTerm{
+				Name: "empty-pos", Protocols: []string{"tcp"},
+				SourcePrefixLists: []config.PrefixListRef{{Name: "empty"}},
+				DestinationPorts:  []string{"22"}, Action: "accept",
+			},
+			fam:  "ip",
+			want: "",
+		},
+		{
+			// Empty EXCEPT prefix-list -> "match every source NOT in {}" = match
+			// ALL -> no predicate (the term still applies its other criteria).
+			name: "empty except prefix-list -> match all (no predicate)",
+			term: &config.FirewallFilterTerm{
+				Name: "empty-exc", Protocols: []string{"tcp"},
+				SourcePrefixLists: []config.PrefixListRef{{Name: "empty", Except: true}},
+				DestinationPorts:  []string{"22"}, Action: "discard",
+			},
+			fam:  "ip",
+			want: "meta l4proto tcp th dport 22 drop",
+		},
+		{
+			// H04: a lenient/peer-sync UNRESOLVED positive prefix-list resolves to
+			// zero prefixes but stays constrained -> match NOTHING (skip). The
+			// pre-fix code emitted no predicate -> unconstrained accept (fail-open).
+			name: "unresolved positive prefix-list -> match nothing (skip)",
+			term: &config.FirewallFilterTerm{
+				Name: "typo", SourcePrefixLists: []config.PrefixListRef{{Name: "does-not-exist"}},
+				Action: "accept",
+			},
+			fam:  "ip",
+			want: "",
+		},
+		{
+			// H05: mixed positive literal + except prefix-list (lenient path).
+			// POSITIVE-WINS: emit the positive literal only, NO negation. The
+			// pre-fix code folded both into one set and negated the whole thing
+			// (`saddr != { 10.0.0.0/24, 10.0.0.0/8, 192.168.0.0/16 }`).
+			name: "mixed positive + except -> positive wins",
+			term: &config.FirewallFilterTerm{
+				Name: "mixed", SourceAddresses: []string{"172.16.0.0/24"},
+				SourcePrefixLists: []config.PrefixListRef{{Name: "trusted", Except: true}},
+				Action:            "discard",
+			},
+			fam:  "ip",
+			want: "ip saddr 172.16.0.0/24 drop",
+		},
+		{
+			// H09: an all-malformed positive literal set is constrained + empty
+			// (parse drops the bad token) -> match NOTHING (skip). The pre-fix
+			// code emitted `ip saddr 10.0.0.0/99 ...` -> atomic load failure.
+			name: "malformed positive literal -> match nothing (skip)",
+			term: &config.FirewallFilterTerm{
+				Name: "bad", SourceAddresses: []string{"10.0.0.0/99"}, Action: "accept",
+			},
+			fam:  "ip",
+			want: "",
+		},
+		{
+			// Non-empty except is representable in nft as a negated set.
+			name: "non-empty except -> negated set",
+			term: &config.FirewallFilterTerm{
+				Name: "exc", SourcePrefixLists: []config.PrefixListRef{{Name: "trusted", Except: true}},
+				Action: "discard",
+			},
+			fam:  "ip",
+			want: "ip saddr != { 10.0.0.0/8, 192.168.0.0/16 } drop",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := nftRuleFromTerm(tt.term, tt.fam, pls)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -612,20 +755,26 @@ func TestNftRuleFromTermFallThroughNoBareAccept(t *testing.T) {
 func TestNftRuleFromTermRoutingInstanceTerminatesAccept(t *testing.T) {
 	prefixLists := map[string]*config.PrefixList{}
 
-	term := &config.FirewallFilterTerm{
-		Name:            "to-mgmt-instance",
-		SourceAddresses: []string{"10.0.0.0/8"},
-		RoutingInstance: "mgmt",
+	// Use a family-appropriate source address per chain (a v4 CIDR in the ip
+	// chain, a v6 CIDR in the ip6 chain) so the test exercises the PBR
+	// terminate-as-accept verdict, not the #3433 wrong-family match-nothing path.
+	cases := []struct {
+		fam  string
+		addr string
+		want string
+	}{
+		{"ip", "10.0.0.0/8", "ip saddr 10.0.0.0/8 accept"},
+		{"ip6", "2001:db8::/32", "ip6 saddr 2001:db8::/32 accept"},
 	}
-	for _, fam := range []string{"ip", "ip6"} {
-		fk := "ip"
-		if fam == "ip6" {
-			fk = "ip6"
+	for _, c := range cases {
+		term := &config.FirewallFilterTerm{
+			Name:            "to-mgmt-instance",
+			SourceAddresses: []string{c.addr},
+			RoutingInstance: "mgmt",
 		}
-		want := fk + " saddr 10.0.0.0/8 accept"
-		rule := nftRuleFromTerm(term, fam, prefixLists)
-		if rule != want {
-			t.Errorf("routing-instance term (%s): got %q, want %q (terminate-as-accept, mirror userspace)", fam, rule, want)
+		rule := nftRuleFromTerm(term, c.fam, prefixLists)
+		if rule != c.want {
+			t.Errorf("routing-instance term (%s): got %q, want %q (terminate-as-accept, mirror userspace)", c.fam, rule, c.want)
 		}
 	}
 }

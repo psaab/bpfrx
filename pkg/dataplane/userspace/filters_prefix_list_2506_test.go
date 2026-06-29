@@ -39,6 +39,41 @@ func prefixListCfg(srcRefs, dstRefs []config.PrefixListRef, prefixes map[string]
 	return cfg
 }
 
+// #3433 H01: a literal `from source-address any` is a NO-CONSTRAINT placeholder
+// (mirroring the Rust matcher's addr_is_real / parse_address), so the direction
+// is UNCONSTRAINED (match ALL) — NOT constrained+empty (which would fail closed =
+// match nothing). A bare `any` that fell closed would silently black-hole a
+// `from source-address any; then accept` lo0 term and risk a control-plane
+// lockout. FAIL-ON-REVERT: if resolvePrefixListAddrs counts `any` toward
+// `constrained`, SourceConstrained flips to true and this goes RED.
+func TestFilterSnapshotLiteralAnyIsUnconstrained(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		"edge": {
+			Name: "edge",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", SourceAddresses: []string{"any"}, Action: "accept"},
+			},
+		},
+	}
+	term := buildFirewallFilterSnapshots(cfg)[0].Terms[0]
+	if term.SourceConstrained {
+		t.Error("literal `any` must NOT make the direction constrained (#3433 H01: any = match ALL)")
+	}
+	if len(term.SourceAddresses) != 0 {
+		t.Errorf("literal `any` must contribute no address, got %v", term.SourceAddresses)
+	}
+	// A real address ALONGSIDE `any` keeps its scope (the `any` is ignored).
+	cfg.Firewall.FiltersInet["edge"].Terms[0].SourceAddresses = []string{"any", "10.0.0.0/8"}
+	term = buildFirewallFilterSnapshots(cfg)[0].Terms[0]
+	if !term.SourceConstrained {
+		t.Error("a real address alongside `any` must stay constrained")
+	}
+	if !reflect.DeepEqual(term.SourceAddresses, []string{"10.0.0.0/8"}) {
+		t.Errorf("source addresses = %v, want [10.0.0.0/8] (any dropped)", term.SourceAddresses)
+	}
+}
+
 // A plain `source-prefix-list` reference resolves to its CIDRs in the snapshot
 // with the except flag clear.
 func TestFilterSnapshotSourcePrefixListResolved(t *testing.T) {
