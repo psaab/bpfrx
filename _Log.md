@@ -1,3 +1,24 @@
+## 2026-06-28 — #3350 security-log stream tls-profile reject (parsed-but-never-applied)
+
+- **Timestamp**: 2026-06-28
+- **Action**: `security log stream <s> transport tls-profile <name>` parsed,
+  validated, and stored (compiler_security.go) but was NEVER resolved into a
+  `*tls.Config` at runtime — daemon_system.go applyLogStreams always passes a
+  nil `*tls.Config` to NewSyslogClientTransport, so a TLS syslog stream
+  silently fell back to the system CA roots instead of the named profile (a
+  secure-syslog posture silently downgraded, fail-open). There is also no TLS
+  profile DEFINITION stanza anywhere in the config (only IPsec/IKE define
+  certs), so the named profile has nothing to resolve to — wiring it is
+  impossible. Chose REJECT (issue option b): added
+  `validateSecurityLogStreamTLSProfileAST`, the strict-reject + lenient-
+  downgrade (#1960/#3261) AST-gate pattern shared with the #3349 stream-port
+  gate. A plain `transport protocol tls` (system-root TLS) stays valid; only
+  the named-but-unapplied profile is rejected. Documented the runtime nil-pass
+  + the lift path. RED-on-revert verified.
+- **File(s)**: pkg/config/compiler_security.go, pkg/config/compiler.go,
+  pkg/config/schema_security.go, pkg/daemon/daemon_system.go,
+  pkg/config/log_stream_tls_profile_3350_test.go, docs/config-schema.md
+
 ## 2026-06-28 — #3404 policy-ID namespace exact-256 off-by-one (>= → >)
 
 - **Timestamp**: 2026-06-28
@@ -22983,3 +23004,12 @@ top.
 ## 2026-06-28 — #3360 gre-performance-acceleration config-truth
 - **Action**: Wire GREAcceleration into Rust ForwardingState for parity (mirror power_mode_disable); fix overstated Go wire comment; add mutation-verify tests (Go + Rust); doc feature-gaps entry.
 - **File(s)**: userspace-dp/src/afxdp/forwarding_build/mod.rs, userspace-dp/src/afxdp/types/forwarding.rs, userspace-dp/src/afxdp/forwarding_build/tests.rs, pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/flow_wire_coerce_test.go, docs/feature-gaps.md
+- **Timestamp**: 2026-06-28
+  - **Action**: Document host-inbound `system-services traceroute` admit
+    contract (#3368). Verified against authoritative Junos docs that
+    `traceroute` is UDP-probe-only (Junos: UDP 33434; xpf already admits the
+    full 33434-33523 Unix probe window dual-family = a superset). ICMP
+    traceroute is admitted via the `ping` token, TCP traceroute is not a Junos
+    host-inbound system-service. No behavior/admit change — docs-only; the
+    #3368 under-admission premise is not borne out by the Junos contract.
+  - **File(s)**: docs/junos-cli-reference.md, _Log.md

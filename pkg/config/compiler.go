@@ -119,6 +119,19 @@ type compileOpts struct {
 	// NOT live in SchemaValidate. Same doctrine as lenientTCPMSSRange.
 	lenientLogStreamPort bool
 
+	// lenientLogTLSProfile (#3350) downgrades the security-log stream
+	// tls-profile gate (validateSecurityLogStreamTLSProfileAST) from a hard
+	// compile error to a cfg.Warnings entry. Set ONLY on the tolerant load /
+	// peer-sync paths: a persisted or peer-synced config naming a
+	// `transport tls-profile` that an older binary accepted (and that the
+	// runtime silently ignored, falling back to system CA roots) must still
+	// boot, not blackout the upgraded node (#1960 / #3261 fail-closed-on-load
+	// class). The profile was never applied either way, so a leniently-loaded
+	// value is inert. Like the port gate this is an AST-level compile decision
+	// (the token lives under the `transport` block) and so does NOT live in
+	// SchemaValidate. Same doctrine as lenientLogStreamPort.
+	lenientLogTLSProfile bool
+
 	// lenientLogEventModeFormat (#3349) downgrades the event-mode log-format
 	// compatibility gate (validateLogEventModeFormatStrict) from a hard
 	// compile error to a cfg.Warnings entry. Set ONLY on the tolerant load /
@@ -1109,6 +1122,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyMatchAddress:            true,
 		lenientTCPMSSRange:                   true,
 		lenientLogStreamPort:                 true,
+		lenientLogTLSProfile:                 true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1248,6 +1262,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyMatchAddress:            true,
 		lenientTCPMSSRange:                   true,
 		lenientLogStreamPort:                 true,
+		lenientLogTLSProfile:                 true,
 		lenientLogEventModeFormat:            true,
 		lenientEventAttributesMatch:          true,
 		lenientIPsecPolicyProposalRef:        true,
@@ -1399,6 +1414,21 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// (load / peer-sync): warn so an already-persisted or peer-synced config
 	// still boots.
 	logStreamPortWarnings, err := validateSecurityLogStreamPortsAST(tree.Children, "", opts.lenientLogStreamPort)
+	if err != nil {
+		return nil, err
+	}
+
+	// #3350 security-log stream tls-profile gate. `transport tls-profile <name>`
+	// is parsed, validated, and stored but NEVER resolved into a *tls.Config at
+	// runtime (daemon_system.go always passes nil), and there is no TLS profile
+	// definition stanza to resolve it to — so a TLS syslog stream silently uses
+	// the system CA roots instead of the named profile (a secure-syslog posture
+	// silently downgraded, fail-open). Like the port gate this is an AST-level
+	// decision under the `transport` block, so it lives here, not in
+	// SchemaValidate. Strict (commit / commit-check): a present tls-profile
+	// hard-rejects. Lenient (load / peer-sync): warn so an already-persisted or
+	// peer-synced config still boots (the profile was never applied either way).
+	logTLSProfileWarnings, err := validateSecurityLogStreamTLSProfileAST(tree.Children, "", opts.lenientLogTLSProfile)
 	if err != nil {
 		return nil, err
 	}
@@ -1574,6 +1604,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, trackWarnings...)
 	cfg.Warnings = append(cfg.Warnings, mssWarnings...)
 	cfg.Warnings = append(cfg.Warnings, logStreamPortWarnings...)
+	cfg.Warnings = append(cfg.Warnings, logTLSProfileWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
