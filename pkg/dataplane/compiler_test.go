@@ -98,6 +98,60 @@ func TestCompilePoliciesRecordsExpandedPolicyScheduleSlots(t *testing.T) {
 	}
 }
 
+// TestCompilePoliciesExactMaxRulesBoundary covers the #3404 off-by-one in the
+// legacy compiler guard. A zone-pair set with exactly MaxRulesPerPolicy (256)
+// expanded rules occupies RuleIDs policySetID*256+0..255 — all inside its own
+// namespace — and must compile; a 257th rule would need index 256 and spill, so
+// it is rejected. Each policy here has no applications, expanding to one rule.
+//
+// Fail-on-revert: with the old `len(expanded) >= MaxRulesPerPolicy` guard the
+// exact-256 case is rejected and the first assertion fails RED.
+func TestCompilePoliciesExactMaxRulesBoundary(t *testing.T) {
+	mkCfg := func(n int) *config.Config {
+		cfg := &config.Config{}
+		pols := make([]*config.Policy, 0, n)
+		for i := 0; i < n; i++ {
+			pols = append(pols, &config.Policy{
+				Name:   "p",
+				Action: config.PolicyPermit,
+				Match: config.PolicyMatch{
+					SourceAddresses:      []string{"any"},
+					DestinationAddresses: []string{"any"},
+				},
+			})
+		}
+		cfg.Security.Policies = []*config.ZonePairPolicies{{
+			FromZone: "trust",
+			ToZone:   "untrust",
+			Policies: pols,
+		}}
+		return cfg
+	}
+	result := func() *CompileResult {
+		return &CompileResult{ZoneIDs: map[string]uint16{"trust": 1, "untrust": 2}}
+	}
+
+	// Exactly 256 expanded rules: in-namespace (IDs 0..255), must compile.
+	dp := &policyScheduleSlotTestDP{}
+	if err := compilePolicies(dp, mkCfg(MaxRulesPerPolicy), result()); err != nil {
+		t.Fatalf("compilePolicies(256 rules) returned error, want success: %v", err)
+	}
+	if len(dp.rules) != MaxRulesPerPolicy {
+		t.Fatalf("compiled %d rules, want %d", len(dp.rules), MaxRulesPerPolicy)
+	}
+	for _, r := range dp.rules {
+		if r.RuleID >= MaxRulesPerPolicy {
+			t.Fatalf("rule RuleID %d >= %d (spilled out of policy-set 0 namespace)", r.RuleID, MaxRulesPerPolicy)
+		}
+	}
+
+	// 257 expanded rules: would require index 256, rejected fail-closed.
+	dp2 := &policyScheduleSlotTestDP{}
+	if err := compilePolicies(dp2, mkCfg(MaxRulesPerPolicy+1), result()); err == nil {
+		t.Fatalf("compilePolicies(257 rules) succeeded, want MaxRulesPerPolicy rejection")
+	}
+}
+
 func TestExpandFilterTermNegateFlags(t *testing.T) {
 	prefixLists := map[string]*config.PrefixList{
 		"rfc1918": {

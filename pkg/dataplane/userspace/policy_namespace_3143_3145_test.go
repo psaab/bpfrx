@@ -197,9 +197,13 @@ func singleBigPolicyConfig(nApps int) *config.Config {
 }
 
 // Test_3145_MaxRulesPerPolicyCap verifies the per-set MaxRulesPerPolicy cap on
-// the LIVE userspace snapshot path. A set whose cumulative app-set expansion
-// reaches 256 is rejected fail-closed; 255 builds. Reverting the cap in
-// walkPolicyRuleSlots makes the 256/257 cases build, failing this test.
+// the LIVE userspace snapshot path. The 256-slot namespace is indices 0..255
+// (the full MaxRulesPerPolicy range), so a set whose cumulative app-set
+// expansion EXACTLY fills it (256 terms → IDs 0..255) builds; only an expansion
+// that would require an ID at index >= 256 is rejected fail-closed.
+//
+// Fail-on-revert (#3404): with the off-by-one >= guard, the exact-256 case is
+// rejected and this test's "256 builds" assertion fails RED.
 func Test_3145_MaxRulesPerPolicyCap(t *testing.T) {
 	const max = dataplane.MaxRulesPerPolicy
 
@@ -207,13 +211,85 @@ func Test_3145_MaxRulesPerPolicyCap(t *testing.T) {
 	if _, err := buildPolicySnapshots(singleBigPolicyConfig(max - 1)); err != nil {
 		t.Fatalf("buildPolicySnapshots(255 apps) returned error, want success: %v", err)
 	}
-	// 256 effective terms: at the cap, rejected.
-	if _, err := buildPolicySnapshots(singleBigPolicyConfig(max)); err == nil {
-		t.Fatalf("buildPolicySnapshots(256 apps) succeeded, want MaxRulesPerPolicy rejection")
+	// 256 effective terms: EXACTLY fills the namespace (IDs 0..255), accepted.
+	// This is the #3404 boundary: rejected by the old >= guard, accepted by >.
+	// buildPolicySnapshots emits one snapshot per POLICY (slot), so the single
+	// big policy yields one snapshot whose span fills indices 0..255.
+	snaps256, err := buildPolicySnapshots(singleBigPolicyConfig(max))
+	if err != nil {
+		t.Fatalf("buildPolicySnapshots(256 apps) returned error, want success (exact 256-fill is in-namespace): %v", err)
 	}
-	// 257 effective terms: over the cap, rejected.
+	if len(snaps256) != 1 {
+		t.Fatalf("buildPolicySnapshots(256-term single policy) emitted %d snapshots, want 1", len(snaps256))
+	}
+	// The exact-fill set must occupy IDs 0..255 — none at or past MaxRulesPerPolicy.
+	for _, s := range snaps256 {
+		if s.PolicyID >= max {
+			t.Fatalf("256-fill snapshot %q has runtime ID %d >= %d (spilled out of its own namespace)", s.Name, s.PolicyID, max)
+		}
+	}
+	// 257 effective terms: over the cap (would need index 256), rejected.
 	if _, err := buildPolicySnapshots(singleBigPolicyConfig(max + 1)); err == nil {
 		t.Fatalf("buildPolicySnapshots(257 apps) succeeded, want MaxRulesPerPolicy rejection")
+	}
+}
+
+// Test_3404_ExactFillNoCrossSetCollision proves the corrected boundary keeps
+// adjacent policy sets in disjoint ID namespaces. The first zone-pair set is
+// filled with exactly MaxRulesPerPolicy (256) single-application policies
+// (indices 0..255); a second set follows. The first set's last ID must be
+// policySetID*256+255 and the second set's first ID must be (policySetID+1)*256,
+// so the +1 boundary cannot let set N's last ID collide with set N+1's first.
+//
+// Fail-on-revert (#3404): the old >= guard rejects the exact 256-fill outright,
+// so buildPolicySnapshots errors and this test fails RED at the build step.
+func Test_3404_ExactFillNoCrossSetCollision(t *testing.T) {
+	const max = dataplane.MaxRulesPerPolicy
+	cfg := &config.Config{}
+	first := make([]*config.Policy, 0, max)
+	for i := 0; i < max; i++ {
+		first = append(first, &config.Policy{
+			Name:   fmt.Sprintf("rule-%d", i),
+			Match:  config.PolicyMatch{Applications: []string{"junos-ssh"}},
+			Action: config.PolicyPermit,
+		})
+	}
+	cfg.Security.Policies = []*config.ZonePairPolicies{
+		{FromZone: "lan", ToZone: "wan", Policies: first},
+		{FromZone: "dmz", ToZone: "wan", Policies: []*config.Policy{{
+			Name:   "next-set-rule",
+			Match:  config.PolicyMatch{Applications: []string{"junos-ssh"}},
+			Action: config.PolicyPermit,
+		}}},
+	}
+
+	snaps, err := buildPolicySnapshots(cfg)
+	if err != nil {
+		t.Fatalf("buildPolicySnapshots(exact 256-fill + second set): %v", err)
+	}
+
+	seen := map[uint32]string{}
+	var firstMax, nextBase uint32
+	haveNext := false
+	for _, s := range snaps {
+		key := stablePolicyRuleID(s.FromZone, s.ToZone, s.Name)
+		if prev, ok := seen[s.PolicyID]; ok && prev != key {
+			t.Fatalf("runtime policy ID %d shared by %q and %q (cross-set namespace collision)", s.PolicyID, prev, key)
+		}
+		seen[s.PolicyID] = key
+		if s.FromZone == "lan" && s.PolicyID > firstMax {
+			firstMax = s.PolicyID
+		}
+		if s.Name == "next-set-rule" {
+			nextBase = s.PolicyID
+			haveNext = true
+		}
+	}
+	if firstMax != max-1 {
+		t.Fatalf("first set's max runtime ID = %d, want %d (indices 0..255)", firstMax, max-1)
+	}
+	if !haveNext || nextBase != max {
+		t.Fatalf("second set base runtime ID = %d, want %d (its own namespace, no overlap with first set's %d)", nextBase, max, firstMax)
 	}
 }
 
