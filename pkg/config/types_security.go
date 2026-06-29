@@ -660,6 +660,20 @@ type Application struct {
 	// (validateApplicationSpecsStrict) hard-rejects it on the strict commit path
 	// / warns on the lenient load / peer-sync path (#3348).
 	UnknownICMP []string
+	// UnknownTermLeaves records the raw tokens inside an inline
+	// `application <a> term <t> { ... }` that are NOT a recognized term leaf
+	// (protocol / source-port / destination-port / inactivity-timeout / timeout
+	// / icmp-type / icmp-code / alg). The inline `term` is declared as an opaque
+	// `args:1` schema leaf (children:nil), so the SchemaValidate walk cannot
+	// reach inside it; before #3352 parseApplicationTerms had no default arm, so
+	// an unknown leaf (a typo like `destination-poort 22`) was silently dropped
+	// along with its value — the term kept only its remaining constraints and a
+	// narrow permit/deny term widened to all-protocol (e.g. all-TCP). Mirroring
+	// UnknownTimeouts / UnknownICMP, the offending token is recorded here and the
+	// deferred gate (validateApplicationSpecsStrict) hard-rejects the first one
+	// on the strict commit path / warns on the tolerant load / peer-sync path
+	// (#3352).
+	UnknownTermLeaves []string
 }
 
 // IPsecConfig holds IPsec VPN configuration.

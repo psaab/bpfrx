@@ -1,3 +1,27 @@
+## 2026-06-29 — #3419 REST session-view parity with gRPC
+
+- **Timestamp**: 2026-06-29
+- **Action**: The REST `GET /api/v1/security/sessions` view diverged from
+  the gRPC `GetSessions` contract (Codex audit 099 H1/H2/H3/M1/M3/M4/M6).
+  Fixed: `age_seconds` is now wall age (now-`Created`) with a separate
+  `idle_seconds` (now-`LastSeen`) — REST previously reported idle time AS
+  age (H1); a session with both SNAT and DNAT now joins both `nat` text
+  parts and exposes structured `nat_src_addr/port` + `nat_dst_addr/port`
+  instead of the DNAT branch overwriting the SNAT string (H2); the
+  companion reverse entry's counters are merged into the forward entry via
+  new `GetSessionV4/V6` on `apiRuntimeDataPlane` (H3); `application`,
+  `ingress_interface`/`egress_interface`, `policy_name`,
+  `ingress_zone_name`/`egress_zone_name`, `session_id`, and `ha_active`
+  are surfaced (M1/M4/M6), and `application=`, `interface=`, `nat_only=`,
+  `source_nat_pool=` filters added (M1/M3/M4) — an unresolved pool fails
+  CLOSED (HTTP 400) like the gRPC `sessionFilter.validate`. `ha_active`
+  is wired from the daemon via a new optional `HAActiveFn` (default true
+  standalone = `cluster.IsLocalPrimary(0)`). Numeric `policy_id`/zone ids
+  retained for compatibility. Pagination/clear out of scope (#3421/#3423).
+- **File(s)**: pkg/api/sessions.go, pkg/api/types.go, pkg/api/api.go,
+  pkg/api/server.go, pkg/api/sessions_parity_test.go, pkg/api/README.md,
+  pkg/daemon/runtime_probes.go, pkg/daemon/daemon_run.go
+
 ## 2026-06-29 — #3322 reorder-stable policy hit-counter handle
 
 - **Timestamp**: 2026-06-29
@@ -23378,3 +23402,89 @@ top.
   userspace-dp/tests/fixtures/protocol_wire_v1.json (regen, additive),
   docs/feature-coverage.md, docs/syn-cookie-flood-protection.md, CLAUDE.md,
   + Go/Rust tests.
+- **Timestamp**: 2026-06-29
+  - **Action**: #3294 {feed + concrete} address-set divergence — implemented the converged research plan (PLAN-READY @ d6da7b5d): Option A′ (dataplane set-row feed merge) + the #2008 direct-ref strict-accept one-liner. (1) Dataplane: made expandBookNameRecursive/expandBookNameToCIDRs feed-aware so a feed-bound MEMBER nested in an address-set contributes its live overlay prefixes to the enclosing set's address-book row (closes the feed-portion under-deny; a `deny <set-with-feed>` now enforces the feed). Removed the now-redundant top-level merge + dead splitFeedPrefixesByFamily. nameRepresentability feed-bound branch returns (true, len(feeds)>0): a live feed member is concrete, an empty feed stays representable-match-none (so an empty-feed feed-only set is #3261-rejected fail-closed, NOT silently dropped). (2) Strict #2008: added DynamicAddress.AddressBindings names to validatePolicyMatchAddressesStrict.bookNames so a DIRECT feed reference COMMITS; policyMatchAddressBookResolves (#3149) left feed-UNaware (anti-Option-C: feed-in-set still strict-rejected at fresh commit). (3) Parity: pkg/policymatch expandBookName made overlay-aware to match. (4) NAT left out of scope per plan constraint 5; updated the stale nat.go "#3294 gap" comment to a tracked residual. RED-on-revert verified for all three layers (dataplane merge, #2008 one-liner, policymatch). go test ./pkg/config/... ./pkg/dataplane/... ./pkg/policymatch/... ./pkg/grpcapi/... ./pkg/api/... green; gofmt + go vet clean.
+  - **File(s)**: pkg/dataplane/userspace/policies.go, pkg/dataplane/userspace/nat.go, pkg/dataplane/userspace/lenient_keep_armed_3261_test.go, pkg/policymatch/policymatch.go, pkg/policymatch/policymatch_test.go, pkg/config/compiler_validate_strict.go, pkg/config/compiler_feed_address_token_3294_test.go, docs/feature-gaps.md, docs/userspace-dataplane-gaps.md, _Log.md
+  - **Action**: #3335 historical event zone names. Both event-display surfaces recomputed source/destination zone NAMES from the current config reverse ZoneIDs map and ignored the resolved-at-event-time EventRecord.InZoneName/OutZoneName. After a zone rename/delete/ID-reuse (#3075), an old event with InZoneName="trust" re-rendered under whatever name now owns that ID, corrupting forensic timelines. Fix: prefer the stored InZoneName/OutZoneName when non-empty; fall back to the current-config reverse map (then a bare numeric form in the CLI) only for legacy records that lack a resolved name. gRPC GetEvents and CLI show-security-log both fixed via a zoneName(stored, id) preference helper. RED-on-revert verified on both surfaces (revert renders renamed "marketing"/"sales"); the legacy-fallback tests pass with or without the fix (unchanged path). go test ./pkg/grpcapi/... ./pkg/cli/... ./pkg/logging/... green; gofmt clean.
+  - **File(s)**: pkg/grpcapi/server_show_events.go, pkg/cli/cli_show_security_log.go, pkg/grpcapi/server_show_events_historical_zone_3335_test.go, pkg/cli/cli_show_security_log_historical_zone_3335_test.go, pkg/logging/README.md, _Log.md
+
+- **Timestamp**: 2026-06-29
+  - **Action**: #3335 SMR fold (PR #3519). SMR MERGE-NEEDS-MAJOR: the two fixed surfaces were correct but a THIRD event-display surface had the identical defect and the README claimed to enumerate all consumers. pkg/grpcapi/server_show_security_text.go Server.showSecurityLog (the showText "security-log" topic) rendered zone=%s->%s via a current-config-only zoneName(id), never consulting e.InZoneName/e.OutZoneName. This is LIVE and PRIMARY: the remote `cli` binary routes `show security log` -> showTextFiltered("security-log") -> server_show.go -> this function, so a remote-CLI query re-rendered historical events under the renamed zone after a rename/ID-reuse (#3075). Fix: widened the local zoneName closure to zoneName(stored, id) with the same stored-first preference; passed e.InZoneName/e.OutZoneName at the three call sites (SCREEN_DROP in-zone; SESSION_CLOSE + default in/out). Added RED-on-revert + legacy-fallback tests mirroring the other two surfaces (revert renders "marketing"/"sales" -> RED, verified). Updated pkg/logging/README to enumerate all THREE consumers accurately. Rebased on origin/master first (no _Log.md conflict). go test ./pkg/grpcapi/... ./pkg/cli/... ./pkg/logging/... ./cmd/cli/... green; gofmt clean.
+  - **File(s)**: pkg/grpcapi/server_show_security_text.go, pkg/grpcapi/server_show_events_historical_zone_3335_test.go, pkg/logging/README.md, _Log.md
+  **Action**: #3432 — reject output-attached `then routing-instance` (FBF) at commit; FBF route override is ingress-only so an output attach was a silent no-op. Added validateFilterRoutingInstanceDirectionStrict + call site + RED-on-revert tests + config-schema doc.
+  **Files**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go, pkg/config/firewall_ri_output_direction_3432_test.go, docs/config-schema.md
+## #3385 — AppCatalog dual-range overlap over-match regression guard
+- **Timestamp**: 2026-06-29
+- **Action**: Verified #3385 over-match already structurally fixed on master by #3321 (lookup_directional removed the OR-decomposition). Added a #3385-specific RED-on-revert regression test for the distinct OVERLAPPING-range cross-slot over-match. No behavior change.
+- **File(s)**: userspace-dp/src/policy_tests.rs (app_catalog_overlapping_dual_range_no_cross_slot_overmatch)
+
+## #3436 — daemon lo0 nft: normalize protocol aliases + DSCP names through shared resolvers
+- **Timestamp**: 2026-06-29
+- **Action**: nftRuleFromTerm emitted `from protocol` tokens and `dscp`/`traffic-class` tokens RAW (codex-094 H08/M01). Junos protocol aliases (junos-gre, junos-tcp-any, junos-icmp-all, ipip/junos-ip-in-ip) and case-variant / `be` DSCP names are accepted by the commit gate and userspace matcher but are not valid nft tokens, so the atomic lo0 load failed (commit broken) or the kernel mirror matched a different protocol/code point than userspace. Fix: resolve protocols through appid.ProtocolNumber and emit NUMERIC l4proto tokens; resolve DSCP through dataplane.DSCPValues (case-insensitive, numeric 0..63 pass-through) and emit numeric values. Unresolvable protocol dropped with a warning on the lenient path. Added RED-on-revert tests (alias single + multi set, DSCP EF/Af11/be/numeric + multi set); updated existing l4proto/DSCP test expectations to numeric; documented in pkg/daemon/README.md.
+- **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/lo0_filter_test.go, pkg/daemon/README.md, _Log.md
+- **Timestamp**: 2026-06-29T11:00Z
+  - **Action**: #3442 M3/M4 fail-closed flat-load. Service-mode flat config load paths mishandled malformed lines. M3: `LoadMerge` flipped `isSetFormat` true if any line started with a flat verb, then ran EVERY non-comment line through `applyEditLine`→`ParseSetVerb`, whose bare-path default turned a typo line (e.g. `not-a-set-line`) into a junk top-level node and returned nil. M4: `LoadSet` silently `continue`d on any non-verb, non-comment line, so REST/gRPC/CLI returned OK while dropping the intended command. Fix: added `hasFlatVerb` gate; LoadMerge flat branch + LoadSet now reject any non-blank/non-`#` line lacking a recognized verb with a line-numbered error. Hierarchical LoadMerge unaffected (round-trips through `FormatSet()`, always verb-prefixed). The `ParseSetVerb` bare-path default stays for internal callers that prepend the verb. RED-on-revert verified (revert store_command.go → both TestLoadSet and TestLoadMergeRejectsGarbageLine fail). go test ./pkg/configstore/... ./pkg/config/... ./pkg/api/... ./pkg/grpcapi/... ./pkg/cli/... ./pkg/daemon/... green; gofmt clean.
+  - **File(s)**: pkg/configstore/store_command.go, pkg/configstore/store_test.go, pkg/configstore/README.md, _Log.md
+- **Timestamp**: 2026-06-29T11:40Z
+  - **Action**: #3442 Codex MERGE-NEEDS-MAJOR fold (PR #3517) — over-rejection risk. Verb-set reconciliation: applyEditLine -> ParseSetVerb replays EXACTLY set/delete/deactivate/activate (everything else hits the bare-path default = the M3 bug); FormatSet (display-set, the loadable artifact) emits only set/deactivate. annotate/copy/insert/rename are interactive-only structural edits (pkg/cli/cli_dispatch.go handlers, distinct multi-clause grammar) NEVER present in a flat-load file and NOT replayable — pre-fix they were silently mangled into junk `set annotate ...` nodes, so rejecting them is the M3 fix, not a regression. Confirmed `hasFlatVerb` recognizes exactly the 4 replayable verbs (option 2). Real fix folded: Codex #3 whitespace — the literal-`verb ` prefix check wrongly rejected a tab between verb and path (lexer treats tabs as whitespace); rewrote hasFlatVerb to match the first whitespace-delimited token (strings.Fields) against the verb set + require >=1 path token. Added TestLoadFlatVerbGate (all 4 verbs accepted in sequence; tab-separated set accepted; annotate/copy/insert/rename + garbage rejected on BOTH LoadSet and LoadMerge-flat). RED-on-revert reconfirmed against true origin/master source (garbage + interactive verbs + TestLoadSet all fail) AND the tab assertion fails under the prior literal-space gate. go test ./pkg/configstore/... ./pkg/config/... ./pkg/api/... ./pkg/grpcapi/... ./pkg/cli/... green; gofmt clean.
+  - **File(s)**: pkg/configstore/store_command.go, pkg/configstore/store_test.go, pkg/configstore/README.md, _Log.md
+- **Timestamp**: 2026-06-29T12:00Z
+  - **Action**: #3447 strict-parse the CLI `rollback <arg>`. A malformed
+    argument (`rollback foo`, `rollback 1x`, `rollback -1`) silently fell
+    through to rollback 0, which resets the candidate to active and clears
+    the dirty flag — discarding uncommitted edits. Local CLI used
+    `fmt.Sscanf(parts[1],"%d",&n)` (leaves n=0 on failure, accepts garbage
+    suffixes); remote CLI used `strconv.Atoi` and dropped the error (n=0).
+    Fix: both surfaces now `strconv.Atoi` the token and return a clear error
+    on a non-integer or negative value before touching the store / Rollback
+    RPC. Too-big indices still flow to the store, which range-checks via
+    history.Get and returns out-of-range. Preserved: `rollback 0` and bare
+    `rollback` (both = discard candidate, the only discard path). RED-on-
+    revert verified on BOTH surfaces (revert the strict parse → the malformed
+    cases silently succeed and the candidate-discard / N=0-RPC assertions
+    fail). go test ./pkg/cli/ ./pkg/configstore/ ./pkg/grpcapi/ ./cmd/cli/
+    green; gofmt clean. No operator doc documents rollback-arg validation
+    (cmdtree desc is generic), so no doc change.
+  - **File(s)**: pkg/cli/cli_dispatch.go, cmd/cli/shared.go,
+    pkg/cli/cli_rollback_3447_test.go, cmd/cli/rollback_3447_test.go, _Log.md
+  - **Action**: #3361 — count + scrape the KERNEL nftables host-inbound drops (distinct path from #3326 userspace-dp). Verified gap on origin/master: emitHostInboundZone emitted an UNCOUNTED catch-all `<fam> daddr <addrs> drop` and nothing fed host_inbound_denies from nft, so an operator actively denying control-plane traffic saw host_inbound_denies=0. Fix: (1) pkg/nftables/host_inbound_counters.go — deterministic reversible counter-name encoding `xpfhi_<family>_<len>_<zone>` (HostInboundDenyCounterName/ParseHostInboundDenyCounterName) + ReadHostInboundDenyCounters() reading named CounterObj via netlink (no nft shell-out; absent table -> nil,nil). (2) buildHostInboundFilterPayload declares one named counter per drop-emitting zone/family and switched the table preamble from `flush table` to `add table`/`delete table`/recreate (flush keeps named objects -> redeclare collides "File exists"; also drops stale counters). emitHostInboundZone attaches `counter name "<n>"` to each catch-all drop. (3) pkg/api: new metric xpf_host_inbound_kernel_denies_total{zone,family} (collectHostInboundKernelDenies, inside dp gate for counterReadErrors coherence) + REST aggregate host_inbound_kernel_denies (best-effort). Counters reset on each table rebuild (commit/DHCP addr change); documented, rate() handles it. RED-on-revert: stripping the counter from the drop fails TestHostInboundFilterDropRulesCounted + TestHostInboundFilterAcceptsListedDeniesRest (verified). go build ./..., go test ./pkg/daemon/... ./pkg/api/... ./pkg/nftables/... green; gofmt clean.
+  - **File(s)**: pkg/nftables/host_inbound_counters.go, pkg/nftables/host_inbound_counters_test.go, pkg/daemon/daemon_nft.go, pkg/daemon/host_inbound_nft_test.go, pkg/daemon/host_inbound_parity_test.go, pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_counters.go, pkg/api/stats.go, pkg/api/types.go, pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-06-29
+  - **Action**: #3361 SMR MERGE-NEEDS-MINOR fold (PR #3523). SMR caught a genuine degraded-boot gap + a self-contradicting doc comment: collectHostInboundKernelDenies was called AFTER the `if dp == nil || !dp.IsLoaded() { return }` gate in Collect, but the kernel `inet xpf_hostinbound` chain is installed and DROPS control-plane traffic independent of dataplane load state — so in a config-only/degraded boot (dp unloaded, deny chain still dropping) xpf_host_inbound_kernel_denies_total silently vanished, the exact blind spot the metric exists to close; the function's own doc comment already (incorrectly) claimed it ran "BEFORE the dataplane gate". Fix: moved the call before the gate, into the control-plane-signal section alongside frr/feeds/flowexport (confirmed ReadHostInboundDenyCounters is netlink-only, no dp dependency); updated the metrics.go placement comment to match. Added a `readHostInboundDenyCounters` package-var seam so the degraded-boot path is unit-testable without a live kernel. RED-on-revert: TestHostInboundKernelDeniesEmittedWhenDataplaneUnloaded builds a Server{} (dp nil), injects fake counts, and asserts the series is emitted — moving the call back below the gate makes it RED (verified); plus TestHostInboundKernelDeniesReadErrorOmitsSeries pins the #3345 omit-series+bump-error contract. Kept bump-counterReadErrors behavior (the error SAMPLE is still emitted by collectGlobalCounters; the bump accumulates and surfaces on the next gate-reaching scrape — documented). Rebased on origin/master first (union _Log.md). go build ./..., go test ./pkg/api/... ./pkg/daemon/... ./pkg/nftables/... green; gofmt clean.
+  - **File(s)**: pkg/api/metrics.go, pkg/api/metrics_counters.go, pkg/api/metrics_host_inbound_kernel_test.go, _Log.md
+
+- **Timestamp**: 2026-06-29T08:45Z
+  - **Action**: #3409 event-mode structured / sd-syslog local-file support.
+    Before this change the event-mode LocalLogWriter fanout
+    (ringbuf.go ProcessRawEvent) branched ONLY on `binary` and wrote
+    standard text for every other format, so `structured` / `sd-syslog`
+    silently no-op'd to standard text — which #3349/#3403 had fail-closed
+    by REJECTING those formats at commit in event mode. Implemented both:
+    the local fanout now selects the structured (Junos RT_FLOW) body via
+    formatStructuredMsg, and LocalLogWriter.Send emits an RFC 5424 envelope
+    (matching SyslogClient.Send) when Format=="sd-syslog" (added Facility +
+    captured hostname to the writer). Widened
+    validateLogEventModeFormatStrict to accept the full schema enum in event
+    mode (defensive default kept for a future-unhonored value). Updated the
+    docs/config-schema.md event-mode format support matrix. RED-on-revert:
+    reverting the fanout body-selection makes the structured sub-test lose
+    RT_FLOW_SESSION_CREATE. go test ./pkg/logging/... ./pkg/config/... green;
+    gofmt clean.
+  - **File(s)**: pkg/logging/locallog.go, pkg/logging/ringbuf.go,
+    pkg/logging/locallog_format_3409_test.go,
+    pkg/config/compiler_validate_strict.go,
+    pkg/config/log_stream_config_3349_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-29T09:10Z
+  - **Action**: #3409 Codex MERGE-NEEDS-MINOR fold (PR #3532) — doc-accuracy
+    only. The call-site comment above validateLogEventModeFormatStrict in
+    pkg/config/compiler.go still described the PRE-#3409 behavior (event mode
+    only honors binary/standard text; structured/sd-syslog rejected at commit),
+    contradicting the shipped implementation. Rewrote it to state that the
+    event-mode writer now honors binary / standard-syslog / structured (RT_FLOW)
+    / sd-syslog (RFC 5424), the validator accepts the full enum in either mode,
+    and the default-reject only fires for a hypothetical future-unhonored value.
+    No code change. Rebased on origin/master first (union _Log.md). go test
+    ./pkg/config/ ./pkg/logging/ green; gofmt clean.
+  - **File(s)**: pkg/config/compiler.go, _Log.md

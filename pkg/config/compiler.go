@@ -2362,6 +2362,24 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3352/#3353: syntactic application errors (an unknown leaf inside an
+	// opaque inline `term`, or an unsupported `alg` name) are rejected for ALL
+	// user-defined applications — referenced or not — unlike the
+	// reference-scoped semantic specs above. These are grammar / enum
+	// violations Junos rejects at commit regardless of policy wiring; a typo'd
+	// term-leaf silently widens a term and a bogus `alg` silently no-ops from
+	// the moment the app is defined, so they must be caught at definition.
+	// Lenient-downgrade on the tolerant load / peer-sync path, identical to
+	// validateApplicationSpecsStrict (#1960 no-brick).
+	if err := validateApplicationSyntaxStrict(cfg); err != nil {
+		if opts.lenientApplicationSpecs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("application syntax (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2175 firewall-filter `from protocol <token>` fail-open gate. Strict on
 	// commit / commit-check (hard-reject a term whose protocol token is not
 	// resolvable by the centralized appid.ProtocolNumber SSOT — neither a
@@ -2672,15 +2690,16 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
-	// #3349 follow-up: event-mode log-format compatibility. The top-level
-	// `security log format` is schema-validated to a known format in any mode,
-	// but the EVENT-mode local-file writer only honors binary / standard text
-	// — `structured` and `sd-syslog` silently fall back to standard text. That
-	// silent no-op is the exact failure #3349 closes, so reject an
-	// event-incompatible format at commit (cross-field rule the per-leaf
-	// SchemaValidate gate cannot express). Strict on commit / commit-check;
-	// lenient on load / peer-sync (warn — the runtime already falls back, so a
-	// leniently-loaded value is inert rather than bricking the load).
+	// #3349 follow-up, #3409 implemented: event-mode log-format compatibility.
+	// The top-level `security log format` is schema-validated to a known format
+	// in any mode. As of #3409 the EVENT-mode local-file writer honors the full
+	// set — binary, standard/syslog text, `structured` (Junos RT_FLOW), and
+	// `sd-syslog` (RFC 5424 envelope) — so nothing silently falls back, and this
+	// validator accepts the entire schema enum in either mode. It is retained as
+	// a cross-field gate (the per-leaf SchemaValidate walker cannot express a
+	// mode-dependent rule) and default-rejects only a hypothetical future schema
+	// value not yet wired into the writer fanout. Strict on commit / commit-check;
+	// lenient on load / peer-sync — now inert for the four known formats.
 	if err := validateLogEventModeFormatStrict(cfg); err != nil {
 		if opts.lenientLogEventModeFormat {
 			cfg.Warnings = append(cfg.Warnings,
@@ -2945,6 +2964,24 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFirewallRefs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("firewall filter reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3432: an OUTPUT-attached firewall filter carrying a `then
+	// routing-instance <x>` (FBF) term compiled cleanly but was a silent
+	// no-op: the userspace route-override path only consults the INPUT
+	// filter's affects_route_lookup flag (the Rust filter compiler sets it
+	// only on the input attach branch), so an output attach never steers the
+	// traffic. Reject the unsupported direction at commit so the dead steering
+	// action is operator-visible. Strict on commit / commit-check; lenient on
+	// load / peer-sync (warn — #1960; the runtime already treats the output
+	// steering term as inert). Mirrors the filter-reference gate above.
+	if err := validateFilterRoutingInstanceDirectionStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter routing-instance direction (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

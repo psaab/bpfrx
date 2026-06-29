@@ -1017,6 +1017,19 @@ type PolicyRuleSnapshot struct {
 	// policies — a zone-pair rule leaves them empty.
 	MatchFromZone string `json:"match_from_zone,omitempty"`
 	MatchToZone   string `json:"match_to_zone,omitempty"`
+	// #3376: build-time-only diagnostic detail (deliberately NOT serialized —
+	// no JSON tag, never carried on the wire). When buildOneRuleSnapshot
+	// collapses an unrepresentable side to the fail-closed sentinel (#3261), it
+	// records the exact offending configured tokens here so
+	// collectPolicyContentRejections can name them per side
+	// (source-address / destination-address / application) instead of the bare
+	// "an address" / "an application". A representable rule leaves these nil; a
+	// decoded snapshot also leaves them nil (they round-trip to empty), which is
+	// fine because the rejection diagnostic is only ever computed from the
+	// freshly-built snapshot.
+	rejectedSourceAddresses []string
+	rejectedDestAddresses   []string
+	rejectedApplications    []string
 }
 
 type InterfaceAddressSnapshot struct {

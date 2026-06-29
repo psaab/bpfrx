@@ -141,9 +141,14 @@ never reached the forwarding path. The NAT side was completed in #3303: the
 snapshot builder now threads the feed overlay into the source/destination NAT
 builders, so a NAT rule scoped to a feed-backed `match
 source-address-name` / `match destination-address-name` resolves the live feed
-prefixes the same way the policy path does (a DIRECT name reference; an
-address-SET whose member is feed-backed is the separate recursive-overlay gap
-tracked in #3294).
+prefixes the same way the policy path does (a DIRECT name reference). #3294
+extended the SECURITY-POLICY path so an address-SET whose member is a
+feed-backed binding now merges that member's live feed prefixes into the set's
+address-book row (the feed-aware `expandBookNameRecursive`) — a `deny
+<set-containing-a-feed>` enforces the feed portion instead of under-denying it,
+and a DIRECT feed reference now also COMMITS under strict validation (the #2008
+`bookNames` one-liner). The NAT path's recursive (feed-member-in-an-address-set)
+resolution remains a tracked residual (it was deliberately out of #3294 scope).
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|

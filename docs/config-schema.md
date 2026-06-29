@@ -999,28 +999,30 @@ reserved for whole-dataplane selection where a rewrite shim
 
   **Event-mode format compatibility (cross-field).** The top-level
   `security log format` value feeds two different runtimes depending on
-  `security log mode`, and they honor different format sets. The schema leaf
-  validates the value to a known format in *any* mode; a second compiler pass
-  (`validateLogEventModeFormatStrict`, post-compile on `cfg.Security.Log`,
-  strict on commit / `lenientLogEventModeFormat`-downgraded on load/peer-sync)
-  rejects an event-mode-incompatible format because the event-mode local-file
-  writer (`pkg/logging` `LocalLogWriter`, driven by the `ringbuf.go`
-  local-writer fanout) only branches on `binary` and otherwise writes standard
-  text — so `structured` / `sd-syslog` would validate at commit and then
-  silently fall back to text (the exact #3349 failure). Support matrix:
+  `security log mode`. As of #3409 BOTH runtimes honor every schema format —
+  the event-mode local-file writer (`pkg/logging` `LocalLogWriter`, driven by
+  the `ringbuf.go` local-writer fanout) implements `structured` (Junos RT_FLOW
+  body) and `sd-syslog` (RFC 5424 envelope) alongside `binary` and the standard
+  default, so nothing silently falls back. The schema leaf validates the value
+  to a known format in *any* mode; `validateLogEventModeFormatStrict`
+  (post-compile on `cfg.Security.Log`, strict on commit /
+  `lenientLogEventModeFormat`-downgraded on load/peer-sync) now accepts the
+  full enum in either mode and only fires defensively if a future schema value
+  is added but not yet honored by the writer. Support matrix:
 
   | `format` | `mode stream` (remote syslog) | `mode event` (local file) |
   |---|---|---|
   | `binary` | binary records | binary records |
-  | `structured` | Junos RT_FLOW | **rejected at commit** (silently fell back to text) |
-  | `sd-syslog` | RFC 5424 envelope | **rejected at commit** (silently fell back to text) |
-  | `syslog` / unset | standard RFC 3164 text | standard RFC 3164 text |
+  | `structured` | Junos RT_FLOW | Junos RT_FLOW (local timestamp+tag prefix) |
+  | `sd-syslog` | RFC 5424 envelope | RFC 5424 envelope |
+  | `syslog` / unset | standard RFC 3164 text | standard text (local timestamp+tag prefix) |
 
-  Event-mode `structured` / `sd-syslog` is a feature gap, not a deliberate
-  exclusion — tracked in #3409 (widen the event-honorable set once the
-  `LocalLogWriter` implements those formats). The event-honorable set in
+  The #3409 follow-up closed the prior event-mode gap (before it, `structured`
+  / `sd-syslog` were rejected at commit because the event-mode writer would
+  silently no-op them to standard text). The event-honorable set in
   `validateLogEventModeFormatStrict` MUST stay in sync with the `ringbuf.go`
-  local-writer fanout.
+  local-writer fanout: a value accepted there but unhonored in the fanout would
+  reintroduce the silent fallback.
 - **#2008 H9/H10 (interface silent-drop reject):** two interface stanzas
   that parsed-accepted and were silently dropped (no schema child, no
   compiler case, no dataplane consumer) are now hard-rejected at commit /
@@ -2271,9 +2273,27 @@ strict-vs-lenient gates:
   snapshot carried the unknown name and the dataplane steered matched packets
   toward a routing table that does not exist (silent blackhole / fall-through to
   the default table).
+- **#3432 — output-attached `then routing-instance` direction →
+  `validateFilterRoutingInstanceDirectionStrict`.** FBF route override is an
+  INGRESS-only operation: the userspace forwarding path
+  (`ingress_route_table_override` / `interface_filter_affects_route_lookup`,
+  `userspace-dp/src/afxdp/forwarding/mod.rs`) resolves the ingress logical
+  ifindex and only consults the INPUT filter's `affects_route_lookup` flag —
+  the Rust filter compiler (`userspace-dp/src/filter/compiler.rs`) sets that
+  flag only on the input attach branch. So a filter carrying a `then
+  routing-instance` term attached with `filter output` compiled cleanly but
+  the steering silently never fired. This gate rejects an output attach of any
+  filter that carries a routing-instance term, naming the interface/unit/family
+  and pointing the operator at `filter input` instead. The SAME filter on an
+  INPUT attach is the legitimate PBR case and still commits. (The Finding C
+  reference gate and the #3308 routing-instance+discard/reject conflict gate
+  check the target NAME and the terminal-action conflict; neither checks the
+  attach DIRECTION.)
 
-All three walk both filter families (`inet` + `inet6`) / both AST shapes
-(hierarchical and flat-set), sorted for a deterministic first-error message.
+All four cover both filter families (`inet` + `inet6`) / both AST shapes
+(hierarchical and flat-set), sorted for a deterministic first-error message
+(the #3432 gate walks interface attachments — inet then inet6 — rather than the
+filter maps directly).
 
 **Strict (`commit` / `commit check`):** a dangling reference is a HARD commit
 error naming the filter/term (or application-set) and the offending name.
@@ -2411,6 +2431,74 @@ matcher already enforces `icmp_constraints` (#3020). Regression coverage:
 both strict guards) and the end-to-end matcher test
 `pkg/policymatch/app_junos_ping_3348_test.go` (custom `protocol junos-ping` permits
 type 8, denies 13/5).
+
+### #3352 / #3353 — unknown inline-`term` leaf + per-application `alg` validation
+
+An inline `applications application <a> term <t> { ... }` is declared as an
+opaque `args:1` schema leaf (`schemaApplications.application.term`,
+`children:nil`), so `SchemaValidate` cannot reach inside it. Two silent-accept
+gaps lived under that opacity:
+
+- **#3352 — unknown leaf inside a `term`.** `parseApplicationTerms`
+  (`compiler_applications.go`) was a fixed `switch` with no `default` arm, so a
+  typo'd leaf (`term t1 { protocol tcp; destination-poort 22; }`) was silently
+  dropped along with its value token — the term kept only its remaining
+  constraints (`protocol tcp`) and a narrow permit/deny term **widened to
+  all-TCP**, with no commit error. The parser now records every unrecognized
+  token on `Application.UnknownTermLeaves` (mirroring `UnknownTimeouts` /
+  `UnknownICMP`), and `validateApplicationSpecsStrict` rejects the first one at
+  commit. A custom application term accepts only `protocol` / `source-port` /
+  `destination-port` / `inactivity-timeout` / `timeout` / `icmp-type` /
+  `icmp-code` / `alg`.
+- **#3353 — unsupported per-application `alg`.** The `alg` leaf was a raw
+  `args:1` string with no validator, so a typo (`alg ftpp`) committed cleanly
+  and the operator believed an ALG was pinned when none existed (a silent no-op
+  on a security knob). `validateApplicationSpecsStrict` now validates the name
+  against `supportedApplicationALGs` (`compiler_applications.go`) — the SSOT
+  set `dns`/`ftp`/`sip`/`tftp`, MIRRORING the global `security alg <proto>`
+  control (`algDisableFlags`, `pkg/dataplane/userspace/flow.go`). The same gate
+  covers the top-level `app.ALG` and the inline-term `alg` (the term app carries
+  it). The match is case-insensitive.
+
+  **#3353 is VALIDATION only — enforcement is deferred.** A per-application ALG
+  is recorded on `Application.ALG` but is NOT carried into the userspace
+  dataplane snapshot: the only ALG signal on the wire is the *global*
+  `alg_disable_flags` bitfield (`userspace-dp` `snapshot.rs`), with no
+  per-application ALG / custom-port pin. Wiring per-application ALG (e.g. `alg
+  ftp destination-port 2121`) through to enforcement needs a new snapshot field
+  plus Rust session-metadata handling — a genuine dataplane fork that is the
+  per-application slice of the broader ALG parity tracked under **#2008**, and
+  is deliberately not built here. Until then this gate makes an unsupported
+  name an operator-visible commit error instead of a silent no-op.
+
+**Scope — ALL user-defined applications, referenced or not.** These two checks
+live in a SEPARATE pass, `validateApplicationSyntaxStrict`, that iterates every
+entry in `cfg.Applications.Applications`, NOT the reference-scoped
+`applicationsToValidateStrict` subset that `validateApplicationSpecsStrict` uses
+for its port / protocol / icmp / timeout checks. The reference scope is correct
+for those SEMANTIC checks (an unreferenced malformed-port app cannot break a
+live policy decision, so it stays a warning so an operator iterating on a
+not-yet-wired application library is not blocked). But an unknown term statement
+and an unsupported `alg` are SYNTACTIC / enum violations — the config names a
+statement or an ALG that does not exist — which Junos rejects at commit
+regardless of policy wiring; deferring them until reference would let a typo'd
+term-leaf silently widen a term, or a bogus `alg` silently no-op, from the
+moment the app is defined. `cfg.Applications.Applications` holds ONLY
+user-defined applications (and the per-term apps they generate); PREDEFINED
+junos-* apps (`junos-rtsp`, `junos-h323`, ...) live in the separate
+`PredefinedApplications` table and are never in this map, so the `alg` check
+never false-rejects a predefined app that legitimately carries an
+out-of-supported-set ALG.
+
+Both checks are STRICT on the commit / commit-check path and downgrade to a
+`cfg.Warnings` entry on the tolerant load / HA peer-sync path
+(`lenientApplicationSpecs`, #1960 no-brick), the same discipline as the #3320 /
+#3348 application gates. Regression coverage:
+`pkg/config/compiler_application_term_alg_3352_3353_test.go` (unknown term leaf
+rejected referenced AND unreferenced, well-formed term keeps its port
+constraint, unknown alg rejected top-level + inline-term + unreferenced,
+supported alg names accepted on both paths, predefined-app reference not
+rejected).
 
 ### #2226 — rib-group `import-rib` undefined-reference validation
 
