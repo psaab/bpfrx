@@ -5292,20 +5292,26 @@ func validateDestinationNATAddressesStrict(cfg *Config) error {
 }
 
 // dnatProtocolResolvable reports whether a DNAT `match protocol` token is one
-// the userspace dataplane can resolve. It is the Go mirror of the Rust
-// ip_proto::proto_number SSOT (userspace-dp/src/ip_proto.rs): the DNAT path
-// emits the token VERBATIM (no junos-* pre-resolution), and proto_number
-// accepts ONLY bare protocol names and a 0-255 number — NOT junos-* aliases
-// (those are resolved by the application path, never the raw match-protocol
-// path). Normalization (trim + lower-case) matches proto_number exactly, so
-// the commit gate and the dataplane agree on the accepted set.
+// the userspace dataplane can resolve for the DNAT match path. The DNAT path
+// emits the token VERBATIM (no junos-* pre-resolution); normalization (trim +
+// lower-case) matches proto_number exactly.
 //
-// This is deliberately a TIGHTER set than filterProtocolResolvable /
-// appid.ProtocolNumber (which add junos-* aliases for the filter/application
-// paths): a junos-* token in a DNAT match-protocol would resolve in those
-// supersets but be DROPPED by proto_number, so accepting it here would
-// re-introduce the #2396 silent drop. Empty ("" = any protocol) is the IP-only
-// wildcard and is always resolvable.
+// This is a deliberately-tighter SSOT than the Rust ip_proto::proto_number
+// resolver — it is NOT a 1:1 mirror of it. It is tighter in TWO ways:
+//
+//  1. junos-* aliases: proto_number resolves them (for the filter/application
+//     paths), but the raw DNAT match-protocol path never pre-resolves them, so
+//     accepting a junos-* token here would re-introduce the #2396 silent drop.
+//
+//  2. ipv6 (IANA protocol 41): proto_number was widened in #3393 to resolve the
+//     "ipv6" name (so a firewall filter's `from protocol ipv6` round-trips),
+//     but DNAT match-protocol intentionally EXCLUDES it — matching on the IPv6
+//     encapsulation protocol number is not a meaningful DNAT destination-rule
+//     selector here. So `match protocol ipv6` is rejected at commit even though
+//     proto_number would resolve it. (filterProtocolResolvable / the appid
+//     SSOT accept "ipv6"; DNAT does not — that divergence is by design.)
+//
+// Empty ("" = any protocol) is the IP-only wildcard and is always resolvable.
 func dnatProtocolResolvable(token string) bool {
 	switch strings.ToLower(strings.TrimSpace(token)) {
 	case "",
@@ -5324,9 +5330,10 @@ func dnatProtocolResolvable(token string) bool {
 }
 
 // DNATProtocolResolvable exposes dnatProtocolResolvable for a cross-package
-// drift-guard test that asserts this acceptance set agrees with the Rust
-// proto_number SSOT (the two INLINE copies cannot drift silently). TEST seam,
-// not a runtime coupling.
+// drift-guard test that pins this acceptance set to its documented,
+// deliberately-tighter relationship to the Rust proto_number SSOT (it excludes
+// the junos-* aliases and "ipv6"/41 that proto_number resolves — see
+// dnatProtocolResolvable). TEST seam, not a runtime coupling.
 func DNATProtocolResolvable(token string) bool {
 	return dnatProtocolResolvable(token)
 }

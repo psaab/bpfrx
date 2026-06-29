@@ -4760,9 +4760,16 @@ fn filter_protocol_accept_set_subset_of_resolver() {
     // canonicalization). A token the gate accepts but proto_number cannot
     // resolve commits in Go yet fails snapshot compilation here with
     // UnrepresentableFilterProtocol — commit/apply drift (the #1961 / #3393
-    // class). This enumerates the full filterProtocolResolvable named set so a
-    // future addition to that gate without the matching proto_number arm trips
-    // this test. The numeric-token arm (0..=255) is covered separately.
+    // class). The numeric-token arm (0..=255) is covered separately.
+    //
+    // CAVEAT: this list is a HARDCODED mirror of the filterProtocolResolvable
+    // named set — it is NOT a mechanical cross-language enumeration. The loop
+    // only exercises the tokens written below, so it CANNOT notice a protocol
+    // newly ADDED to that Go gate; this array MUST be updated in lockstep with
+    // filterProtocolResolvable (and with proto_number above). The lockstep is
+    // enforced on the Go side by pkg/config TestFilterProtocolNamedSetMatchesRustMirror,
+    // which parses the named set out of BOTH this array and the Go gate source
+    // and fails if they diverge — keep that pin green when editing either list.
     for token in [
         "tcp",
         "junos-tcp-any",

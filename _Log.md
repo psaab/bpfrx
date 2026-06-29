@@ -23703,3 +23703,28 @@ top.
     ./pkg/daemon green; gofmt + rustfmt clean.
   - **File(s)**: userspace-dp/src/ip_proto.rs, userspace-dp/src/filter/tests.rs,
     pkg/dataplane/userspace/filters_protocol_ipv6_3393_test.go, _Log.md
+
+- **Timestamp**: 2026-06-29
+  - **Action**: #3393 follow-up — fold two doc-accuracy items into PR #3537.
+    ITEM 1 (filter mirror guard hardening): the Rust mirror test
+    filter::tests::filter_protocol_accept_set_subset_of_resolver is a HARDCODED
+    list, not a mechanical enumeration — its `for token in [...]` loop only
+    exercises tokens it already lists, so a protocol newly ADDED to the Go gate
+    filterProtocolResolvable would go un-mirrored silently. Corrected its comment
+    to drop the "trips this test" overclaim and state the lockstep requirement,
+    pointing at the new Go pin. Added Go-side mechanical cross-language guard
+    TestFilterProtocolNamedSetMatchesRustMirror (pkg/config) that parses the
+    named token set out of BOTH the Go gate source and the Rust mirror array and
+    asserts set-equality (reuses the host_inbound_rust_parity_test.go helpers).
+    RED-on-mutation verified: adding a "dccp" arm to filterProtocolResolvable
+    makes it FAIL naming dccp as missing from the Rust mirror.
+    ITEM 2 (DNAT comment accuracy): dnatProtocolResolvable is no longer a 1:1
+    mirror of Rust proto_number (proto_number resolves ipv6=41 since #3393; DNAT
+    intentionally rejects it). Updated the gate comment, the exported-wrapper
+    comment, and the TestDNATProtocolResolvableMatchesRustSSOT comment to document
+    the deliberately-tighter SSOT (excludes junos-* AND ipv6), and added "ipv6"
+    to that test's reject list to pin the divergence. go test ./pkg/config
+    ./pkg/appid green; cargo test filter:: green; gofmt + rustfmt clean.
+  - **File(s)**: pkg/config/filter_protocol_rust_mirror_3393_test.go (new),
+    pkg/config/compiler_validate_strict.go, pkg/config/compiler_dnat_protocol_test.go,
+    userspace-dp/src/filter/tests.rs, _Log.md
