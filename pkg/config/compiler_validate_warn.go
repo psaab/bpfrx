@@ -123,6 +123,13 @@ func ValidateConfig(cfg *Config) []string {
 		return zones[zone]
 	}
 	for _, zpp := range cfg.Security.Policies {
+		// #3494: the tolerant / HA-sync config path (#3474) can leave a nil
+		// zone-pair set (Policies is []*ZonePairPolicies); skip it like the
+		// runtime walker (pkg/dataplane/userspace/policies.go) does rather
+		// than panicking on zpp.FromZone while generating warnings.
+		if zpp == nil {
+			continue
+		}
 		if !policyZoneDefined(zpp.FromZone) {
 			warnings = append(warnings, fmt.Sprintf(
 				"policy from-zone %q: zone not defined", zpp.FromZone))
@@ -132,6 +139,12 @@ func ValidateConfig(cfg *Config) []string {
 				"policy to-zone %q: zone not defined", zpp.ToZone))
 		}
 		for _, p := range zpp.Policies {
+			// #3494: skip a nil rule (Policies is []*Policy) like the
+			// runtime walker does, mirroring the guards already present at
+			// lines ~813/1084, rather than dereferencing p.Match.
+			if p == nil {
+				continue
+			}
 			for _, addr := range p.Match.SourceAddresses {
 				if addr != "any" && !addrs[addr] {
 					warnings = append(warnings, fmt.Sprintf(
@@ -184,6 +197,9 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate screen references in zones
 	for name, zone := range cfg.Security.Zones {
+		if zone == nil { // #3494: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		if zone.ScreenProfile != "" {
 			if _, ok := cfg.Security.Screen[zone.ScreenProfile]; !ok {
 				warnings = append(warnings, fmt.Sprintf(
@@ -277,6 +293,9 @@ func ValidateConfig(cfg *Config) []string {
 		configuredIfaces[name] = true
 	}
 	for zoneName, zone := range cfg.Security.Zones {
+		if zone == nil { // #3494: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		for _, ifName := range zone.Interfaces {
 			// Strip unit suffix (e.g. "trust0.0" -> "trust0")
 			base := ifName
@@ -292,7 +311,13 @@ func ValidateConfig(cfg *Config) []string {
 
 	// Validate scheduler references in policies
 	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil { // #3494: tolerant/HA-sync path may carry a nil zone-pair set
+			continue
+		}
 		for _, p := range zpp.Policies {
+			if p == nil { // #3494: tolerant/HA-sync path may carry a nil rule
+				continue
+			}
 			if p.SchedulerName != "" {
 				if _, ok := cfg.Schedulers[p.SchedulerName]; !ok {
 					warnings = append(warnings, fmt.Sprintf(
@@ -302,6 +327,9 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 	for _, p := range cfg.Security.GlobalPolicies {
+		if p == nil { // #3494: tolerant/HA-sync path may carry a nil global rule
+			continue
+		}
 		if p.SchedulerName != "" {
 			if _, ok := cfg.Schedulers[p.SchedulerName]; !ok {
 				warnings = append(warnings, fmt.Sprintf(

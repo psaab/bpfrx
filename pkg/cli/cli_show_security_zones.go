@@ -26,6 +26,9 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 			continue
 		}
 		zone := cfg.Security.Zones[name]
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 
 		// Resolve zone ID for counter lookup
 		var zoneID uint16

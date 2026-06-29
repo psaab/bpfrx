@@ -24,6 +24,9 @@ func (s *Server) GetZones(_ context.Context, _ *pb.GetZonesRequest) (*pb.GetZone
 	var readErr error
 	resp := &pb.GetZonesResponse{}
 	for zoneName, zone := range cfg.Security.Zones {
+		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
 		zi := &pb.ZoneInfo{
 			Name:        zoneName,
 			Description: zone.Description,
