@@ -23418,3 +23418,25 @@ top.
 - **Timestamp**: 2026-06-29
   - **Action**: #3361 SMR MERGE-NEEDS-MINOR fold (PR #3523). SMR caught a genuine degraded-boot gap + a self-contradicting doc comment: collectHostInboundKernelDenies was called AFTER the `if dp == nil || !dp.IsLoaded() { return }` gate in Collect, but the kernel `inet xpf_hostinbound` chain is installed and DROPS control-plane traffic independent of dataplane load state — so in a config-only/degraded boot (dp unloaded, deny chain still dropping) xpf_host_inbound_kernel_denies_total silently vanished, the exact blind spot the metric exists to close; the function's own doc comment already (incorrectly) claimed it ran "BEFORE the dataplane gate". Fix: moved the call before the gate, into the control-plane-signal section alongside frr/feeds/flowexport (confirmed ReadHostInboundDenyCounters is netlink-only, no dp dependency); updated the metrics.go placement comment to match. Added a `readHostInboundDenyCounters` package-var seam so the degraded-boot path is unit-testable without a live kernel. RED-on-revert: TestHostInboundKernelDeniesEmittedWhenDataplaneUnloaded builds a Server{} (dp nil), injects fake counts, and asserts the series is emitted — moving the call back below the gate makes it RED (verified); plus TestHostInboundKernelDeniesReadErrorOmitsSeries pins the #3345 omit-series+bump-error contract. Kept bump-counterReadErrors behavior (the error SAMPLE is still emitted by collectGlobalCounters; the bump accumulates and surfaces on the next gate-reaching scrape — documented). Rebased on origin/master first (union _Log.md). go build ./..., go test ./pkg/api/... ./pkg/daemon/... ./pkg/nftables/... green; gofmt clean.
   - **File(s)**: pkg/api/metrics.go, pkg/api/metrics_counters.go, pkg/api/metrics_host_inbound_kernel_test.go, _Log.md
+
+- **Timestamp**: 2026-06-29T08:45Z
+  - **Action**: #3409 event-mode structured / sd-syslog local-file support.
+    Before this change the event-mode LocalLogWriter fanout
+    (ringbuf.go ProcessRawEvent) branched ONLY on `binary` and wrote
+    standard text for every other format, so `structured` / `sd-syslog`
+    silently no-op'd to standard text — which #3349/#3403 had fail-closed
+    by REJECTING those formats at commit in event mode. Implemented both:
+    the local fanout now selects the structured (Junos RT_FLOW) body via
+    formatStructuredMsg, and LocalLogWriter.Send emits an RFC 5424 envelope
+    (matching SyslogClient.Send) when Format=="sd-syslog" (added Facility +
+    captured hostname to the writer). Widened
+    validateLogEventModeFormatStrict to accept the full schema enum in event
+    mode (defensive default kept for a future-unhonored value). Updated the
+    docs/config-schema.md event-mode format support matrix. RED-on-revert:
+    reverting the fanout body-selection makes the structured sub-test lose
+    RT_FLOW_SESSION_CREATE. go test ./pkg/logging/... ./pkg/config/... green;
+    gofmt clean.
+  - **File(s)**: pkg/logging/locallog.go, pkg/logging/ringbuf.go,
+    pkg/logging/locallog_format_3409_test.go,
+    pkg/config/compiler_validate_strict.go,
+    pkg/config/log_stream_config_3349_test.go, docs/config-schema.md, _Log.md
