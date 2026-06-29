@@ -78,13 +78,35 @@ upfront what they're getting and not getting.
 4. **Show output**:
    `pkg/appid/runtime.go:ResolveSessionName` resolves the
    `app_id` back to a name via the `compiler.go` `AppNames`
-   map. If `app_id == 0`:
+   map. A nonzero `app_id` present in `AppNames` resolves to its
+   name directly. Otherwise:
    - When `services application-identification` is **enabled**,
-     return `UNKNOWN`.
-   - When **disabled**, return a built-in port→name guess
-     (`junos-http=80`, `junos-https=443`, `junos-ssh=22`,
-     `junos-ftp=21`, etc. — the 15-entry `builtinFallbacks`
-     map).
+     return `UNKNOWN` — for `app_id == 0` (unstamped/legacy) AND
+     for a nonzero `app_id` that is absent from `AppNames`. The
+     latter is a control/dataplane catalog skew (e.g. a snapshot
+     mismatch); the contract is honest `UNKNOWN`, never a
+     port-heuristic guess that would mask the skew (#3438 L1).
+   - When **disabled**, return a tuple fallback: a configured
+     `applications` entry whose `(protocol, source-port,
+     destination-port)` constraints all match the session, else a
+     built-in port→name guess (`junos-http=80`, `junos-https=443`,
+     `junos-ssh=22`, `junos-ftp=21`, etc. — the 15-entry
+     `builtinFallbacks` map). The fallback honors a configured
+     `source-port` constraint as well as the destination port, so
+     a source-port-scoped custom app is not matched on dst-port
+     alone (#3428); the session source port is threaded into
+     `ResolveSessionName` for this purpose.
+
+**`app_id` space cap (#3438 H4)**: `app_id` is a `u16` on the
+Rust wire with `0` reserved as the unknown sentinel, so real
+applications occupy ids `1..65535`. Both id-assignment walks
+(`compiler.go:compileApplications` and `catalog.go:BuildCatalog`)
+reject a config that would need a 65536th id with a deterministic
+error rather than wrapping `uint16(65536)` back to `0` (which
+would stamp a real app with the unknown sentinel and overwrite
+earlier `AppNames`). The reject is fail-closed on the live apply
+path (`CompileUserspaceShim → CompileConfig → compileApplications`):
+the apply aborts and the daemon retains the previous-good snapshot.
 
 ### ICMP type/code constraint in policy matching (#3020)
 
