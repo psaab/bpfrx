@@ -1,3 +1,27 @@
+## 2026-06-29 — #3419 REST session-view parity with gRPC
+
+- **Timestamp**: 2026-06-29
+- **Action**: The REST `GET /api/v1/security/sessions` view diverged from
+  the gRPC `GetSessions` contract (Codex audit 099 H1/H2/H3/M1/M3/M4/M6).
+  Fixed: `age_seconds` is now wall age (now-`Created`) with a separate
+  `idle_seconds` (now-`LastSeen`) — REST previously reported idle time AS
+  age (H1); a session with both SNAT and DNAT now joins both `nat` text
+  parts and exposes structured `nat_src_addr/port` + `nat_dst_addr/port`
+  instead of the DNAT branch overwriting the SNAT string (H2); the
+  companion reverse entry's counters are merged into the forward entry via
+  new `GetSessionV4/V6` on `apiRuntimeDataPlane` (H3); `application`,
+  `ingress_interface`/`egress_interface`, `policy_name`,
+  `ingress_zone_name`/`egress_zone_name`, `session_id`, and `ha_active`
+  are surfaced (M1/M4/M6), and `application=`, `interface=`, `nat_only=`,
+  `source_nat_pool=` filters added (M1/M3/M4) — an unresolved pool fails
+  CLOSED (HTTP 400) like the gRPC `sessionFilter.validate`. `ha_active`
+  is wired from the daemon via a new optional `HAActiveFn` (default true
+  standalone = `cluster.IsLocalPrimary(0)`). Numeric `policy_id`/zone ids
+  retained for compatibility. Pagination/clear out of scope (#3421/#3423).
+- **File(s)**: pkg/api/sessions.go, pkg/api/types.go, pkg/api/api.go,
+  pkg/api/server.go, pkg/api/sessions_parity_test.go, pkg/api/README.md,
+  pkg/daemon/runtime_probes.go, pkg/daemon/daemon_run.go
+
 ## 2026-06-29 — #3322 reorder-stable policy hit-counter handle
 
 - **Timestamp**: 2026-06-29
