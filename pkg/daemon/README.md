@@ -349,6 +349,21 @@ never lock an operator out of a remote box it manages.
   load path — #1960 no-brick). Pinned by `TestNftRuleFromTermAddressSemantics3433`,
   `TestNftRuleFromTermWrongFamilyMatchesNothing`, and (config side)
   `firewall_address_literal_3433_test.go`.
+
+  **ICMP type/code lowering mirrors userspace (#3483):** `nftRuleFromTerm`
+  renders `icmp-type` and `icmp-code` as INDEPENDENT predicates, each gated
+  only on its own value list — `icmp[v6] type <set>` when `len(ICMPTypes) > 0`
+  and `icmp[v6] code <set>` when `len(ICMPCodes) > 0` (family selects `icmp`
+  vs `icmpv6`). This matches both userspace projections: `filters.go` emits
+  `ICMPCodes` gated only on `len > 0`, and the Rust matcher tests
+  `icmp_code_match_enabled` in a block separate from `icmp_type_match_enabled`.
+  The pre-fix nft mirror nested the code predicate inside
+  `if len(term.ICMPTypes) > 0`, so a code-only term (`from protocol icmp
+  icmp-code 4 then discard`, no `icmp-type`) dropped the code match on the
+  kernel lo0 path — the kernel mirror then matched BROADER than userspace (a
+  `discard` dropped ALL ICMP fail-closed-over-broad, an `accept` admitted ALL
+  ICMP fail-open). Pinned by `TestNftRuleFromTermICMPCodeOnly` (v4 + v6 +
+  multi-value, code-only) and `TestNftRuleFromTermICMPTypeCode`.
 - host-inbound-traffic (`security zones <z> host-inbound-traffic`) is the
   PRIMARY kernel enforcement for host-bound traffic to a firewall interface IP
   / VRRP VIP (SSH, ping, OSPF/BGP to the box — #3070). Such traffic is shunted
