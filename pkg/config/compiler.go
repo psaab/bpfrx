@@ -2340,6 +2340,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #3446 source/destination-NAT match destination-port gate. The DNAT/SNAT
+	// `match destination-port` parser used a bare strconv.Atoi with no bound
+	// check and the builders cast straight to uint16, so a 0/out-of-range
+	// (70000→4464, -1→65535) or non-numeric (`http`) port wrapped to the wrong
+	// port or collapsed the whole match to the wildcard port (translating every
+	// port). Static NAT already validates its typed destination-port leaf
+	// (#2491); this closes the same gap for the source/destination NAT match
+	// grammar. Strict on commit / commit-check (hard-reject); lenient on load /
+	// peer-sync (downgrade to a warning so a config persisted before this gate
+	// existed still boots — #1960 no-brick; the snapshot builders independently
+	// fail CLOSED). Shares the lenientDestNATAddresses flag (same NAT
+	// silent-drop / wrong-translate doctrine). Runs after the protocol gate.
+	if err := validateNATMatchDestinationPortStrict(cfg); err != nil {
+		if opts.lenientDestNATAddresses {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("nat match destination-port (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2243 DHCP-server static (fixed/reserved) host bindings. Strict on
 	// commit / commit-check (hard-reject a fixed-address that is malformed,
 	// family-mismatched, outside the enclosing pool subnet, or duplicates
