@@ -301,16 +301,19 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		"destination": {desc: "Destination NAT configuration", children: map[string]*schemaNode{
 			"pool": {desc: "Destination NAT pool name", args: 1, valueHint: ValueHintPoolName, placeholder: "<pool-name>", children: nil},
 			"rule-set": {desc: "Destination NAT rule-set name", args: 1, placeholder: "<rule-set-name>", children: map[string]*schemaNode{
-				// #3096: from/to scope by zone | interface | routing-instance.
+				// #3096: `from` scope by zone | interface | routing-instance.
+				// #3444: a destination-NAT rule-set has only a `from` clause —
+				// DNAT translates the destination on inbound, so there is no
+				// egress / `to` context (unlike source NAT, which has both).
+				// The `to` subtree was removed here so completion no longer
+				// advertises it; a `to` scope under DNAT is rejected at strict
+				// commit by validateDNATRuleSetToScopeAST (it was silently
+				// dropped before the snapshot builder — the Rust DNAT runtime
+				// models only `from`).
 				"from": {desc: "Source of traffic to match", children: map[string]*schemaNode{
 					"zone":             {desc: "Source zone name", args: 1, multi: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
 					"interface":        {desc: "Ingress interface name", args: 1, multi: true, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
 					"routing-instance": {desc: "Ingress routing instance name", args: 1, multi: true, placeholder: "<routing-instance>", children: nil},
-				}},
-				"to": {desc: "Destination of traffic to match", children: map[string]*schemaNode{
-					"zone":             {desc: "Destination zone name", args: 1, multi: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
-					"interface":        {desc: "Egress interface name", args: 1, multi: true, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: nil},
-					"routing-instance": {desc: "Egress routing instance name", args: 1, multi: true, placeholder: "<routing-instance>", children: nil},
 				}},
 				"rule": {desc: "Destination NAT rule name", args: 1, placeholder: "<rule-name>", children: map[string]*schemaNode{
 					"match": {desc: "Match criteria", children: map[string]*schemaNode{

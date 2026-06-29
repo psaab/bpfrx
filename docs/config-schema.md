@@ -1095,6 +1095,38 @@ reserved for whole-dataplane selection where a rewrite shim
   no-op knob, not a false dataplane/identity promise — and its real
   implementation is split to /research. Regression coverage:
   `pkg/config/compiler_interfaces_unsupported_test.go`.
+- **#3444 (destination-NAT rule-set `to` scope reject):** a Junos
+  destination-NAT rule-set has only a `from` clause (zone | interface |
+  routing-instance) — DNAT translates the destination on inbound, so there
+  is no egress / `to` context (only source NAT, which has both `from` and
+  `to`, can scope by an egress context). xpf briefly advertised a `to`
+  subtree under `security nat destination rule-set` and
+  `compileNATDestination` Cartesian-expanded the collected `to` scopes onto
+  each `NATRuleSet` (`ToZone`/`ToInterface`/`ToRoutingInstance`), but the
+  userspace snapshot builder (`buildDestinationNATSnapshots`,
+  `pkg/dataplane/userspace/nat.go`) and the Rust DNAT runtime
+  (`userspace-dp/src/nat/destination.rs`) model ONLY the `from` clause — the
+  `DestinationNATRuleSnapshot` wire struct intentionally has no `to_*`. So a
+  configured `to` scope was silently dropped: the translation applied
+  regardless of the operator's declared destination context, with no commit
+  error. The `to` subtree is removed from the DNAT rule-set `setSchema` (so
+  completion no longer offers it), `compileNATDestination` no longer collects
+  or stamps a `to` scope (`collectNATScopes(..., false)` — no phantom `To*`
+  on the typed config), and an AST pre-walk
+  (`validateDNATRuleSetToScopeAST`, `compiler_nat_dnat_to.go`) hard-rejects
+  any `to` scope at strict commit / commit-check, naming the rule-set. Strict
+  on commit, downgraded to a warning on the tolerant load / peer-sync paths
+  (`lenientDNATToScope`, #1960 fail-closed-on-load doctrine) so an
+  older-binary-persisted or peer-synced config that silently accepted a `to`
+  scope still boots (the scope is ignored either way, now flagged); an
+  `inactive:` / apply-groups-inherited `to` is handled correctly (the walk
+  runs after the inactive prune + group expansion). Detection is scoped to
+  `security nat destination rule-set` so the source-NAT `to` clause (a real
+  feature, #3096) is untouched. If a future design genuinely wants
+  egress-scoped DNAT after route resolution, that is a separate enhancement
+  (add `to_*` to the snapshot + runtime + a regression that a mismatched
+  `to zone` DNAT does not translate). Regression coverage:
+  `pkg/config/compiler_nat_dnat_to_3444_test.go`.
 - **#3200 (host-inbound-traffic token validation):** `security zones <z>
   host-inbound-traffic { system-services <tok>; protocols <tok>; }` keeps its
   untyped-container schema shape (the leaves stay `children: nil` so flat-set

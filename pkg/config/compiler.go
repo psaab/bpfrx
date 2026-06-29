@@ -1208,6 +1208,25 @@ type compileOpts struct {
 	// peer-synced config an older binary accepted still BOOTS (#1960
 	// fail-closed-on-load class). Same doctrine as lenientBackupRouterDst.
 	lenientVRRPVirtualAddress bool
+
+	// lenientDNATToScope (#3444) downgrades the destination-NAT rule-set
+	// `to` scope reject (validateDNATRuleSetToScopeAST) from a hard compile
+	// error to a cfg.Warnings entry. Junos destination NAT rule-sets have
+	// only a `from` clause (DNAT translates the destination on inbound, so
+	// there is no egress context yet); xpf's schema briefly advertised a
+	// `to` scope under `security nat destination rule-set` and the compiler
+	// Cartesian-expanded it onto each NATRuleSet, but the userspace snapshot
+	// builder and the Rust DNAT runtime model ONLY the `from` clause — so a
+	// configured `to zone|interface|routing-instance` was silently dropped
+	// and the translation applied regardless of the operator's declared
+	// destination context (a silent functional lie). The strict commit /
+	// commit-check path hard-rejects so the operator error is visible; the
+	// tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config an older binary accepted still
+	// BOOTS (#1960 fail-closed-on-load class) — the `to` scope is ignored
+	// either way, now flagged. Same doctrine as
+	// lenientUnsupportedInterfaceStanzas.
+	lenientDNATToScope bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -1305,6 +1324,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyMissingMatch:            true,
 		lenientPolicyCommunityRef:            true,
 		lenientVRRPVirtualAddress:            true,
+		lenientDNATToScope:                   true,
 	})
 }
 
@@ -1453,6 +1473,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyMissingMatch:            true,
 		lenientPolicyCommunityRef:            true,
 		lenientVRRPVirtualAddress:            true,
+		lenientDNATToScope:                   true,
 	})
 }
 
@@ -1648,6 +1669,12 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// named ingress/egress interface or routing-instance instead of being
 	// silently widened to match-any. The validateNATRuleSetScopeAST gate and
 	// its lenientNATRuleSetScope opt are removed.
+	//
+	// #3444 caveat: this enforcement covers the `from` scope for all three
+	// NAT kinds AND the `to` scope for SOURCE NAT (source.rs reads to_*).
+	// DESTINATION NAT has only a `from` clause (Junos) — the DNAT snapshot /
+	// runtime model no `to_*`, so a DNAT `to` scope is rejected at commit by
+	// validateDNATRuleSetToScopeAST below rather than enforced.
 
 	// #2933 secure-tunnel bind-interface alias-collision gate. Two VPNs that
 	// bind two DISTINCT bind-interface strings deriving the SAME XFRM if_id
@@ -1759,6 +1786,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #3444: reject a `security nat destination rule-set <name> to ...`
+	// scope. A Junos destination-NAT rule-set has only a `from` clause —
+	// DNAT translates the destination on inbound, so there is no egress
+	// context yet. xpf briefly advertised a `to` scope under the DNAT
+	// rule-set and Cartesian-expanded it onto each NATRuleSet, but the
+	// userspace snapshot builder and the Rust DNAT runtime model ONLY the
+	// `from` clause, so the `to` scope was silently dropped and the
+	// translation applied regardless of the declared destination context.
+	// Runs on the group-expanded, inactive-pruned tree so an apply-groups-
+	// inherited `to` is caught and an inactive rule-set is ignored. Strict
+	// (commit / commit-check): hard-reject naming the rule-set. Lenient
+	// (load / peer-sync): warn so an already-persisted or peer-synced
+	// config still boots (#1960) — the `to` stays ignored, now flagged.
+	dnatToScopeWarnings, err := validateDNATRuleSetToScopeAST(
+		tree.Children, opts.lenientDNATToScope)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -1806,6 +1852,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, policyThenRejectWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyThenDenyWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMissingMatchWarnings...)
+	cfg.Warnings = append(cfg.Warnings, dnatToScopeWarnings...)
 
 	for _, node := range tree.Children {
 		switch node.Name() {
