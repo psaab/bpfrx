@@ -220,6 +220,28 @@ runtime effect is the L3/L4 catalog classification above
     (`ForwardingSupported=false`) for a referenced app it cannot
     represent, so the leniently-loaded bad app is inert rather than
     silently mis-matching.
+  - **#3434 undefined / empty-set NAT `match application` (fail-closed,
+    Codex audit 095 H07/H08):** distinct from #2142 above, which
+    validates the SPEC of a DEFINED app — this gate
+    (`validateNATMatchApplicationsStrict`) rejects a source- or
+    destination-NAT `match application <name>` whose NAME resolves to no
+    predefined/user application and no NON-EMPTY application-set: an
+    UNDEFINED token (H07, a typo / dangling reference) or a defined-but-
+    EMPTY application-set (H08). It is the NAT analog of the policy
+    #3144/#3146 gate. Before #3434 such a reference resolved to zero
+    application terms and the DNAT builder fell THROUGH to its
+    explicit-match fallback (`protocol="" + destination-port 0`),
+    publishing the pool VIP for **every** flow to the destination — a
+    fail-open wildcard translation. The commit-time gate hard-rejects on
+    the strict path (naming the NAT kind, rule-set, rule, and the
+    unresolved token); on the tolerant LOAD / peer-sync path it is
+    downgraded to a warning (#1960 no-brick). The dataplane is now an
+    independent backstop: the source-NAT builder already emits a
+    `natProtoNever` never-match term and the destination-NAT builder now
+    emits the #3437 source-port never-match sentinel
+    (`natNeverMatchPortRange`) for a configured-but-unresolvable app, so
+    a leniently-loaded bad reference fails CLOSED (matches nothing)
+    rather than widening to the wildcard VIP.
   - **#3109 protocol-less application (fail-closed):** a custom
     application with a port (or any spec) but **no `protocol`** is
     likewise **rejected at commit** under the same referenced-only

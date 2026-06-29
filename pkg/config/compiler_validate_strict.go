@@ -2175,6 +2175,125 @@ func policyMatchEmptyAppSetError(scope, policyName, name string) error {
 		where, name, name)
 }
 
+// validateNATMatchApplicationsStrict hard-rejects a source- or
+// destination-NAT rule's `match application <name>` token that resolves to
+// NONE of: a predefined junos-* application, a user-defined `applications
+// application <name>`, or a non-empty user-defined `applications
+// application-set <name>` (#3434, Codex audit 095 H07/H08). It is the NAT
+// analog of validatePolicyMatchApplicationsStrict (#3144/#3146).
+//
+// A NAT `match application` consumes the referenced application's
+// protocol/port the same way a policy match does (the SNAT/DNAT snapshot
+// builders in pkg/dataplane/userspace/nat.go resolve it via
+// ResolveApplication / ExpandApplicationSet). When the token is a typo /
+// dangling reference (H07) or a defined-but-EMPTY application-set (H08), the
+// reference resolves to ZERO application terms — and the DNAT builder then
+// fell THROUGH to its explicit-match fallback (protocol="" + destination-port
+// 0), publishing the pool VIP for EVERY flow to the destination (a fail-open
+// wildcard translation). The dataplane backstop now substitutes a never-match
+// term on that path (the source-NAT buildSourceNATAppTerms natProtoNever term,
+// and the destination-NAT natNeverMatchPortRange source-port sentinel), but
+// the operator still got a green commit for a NAT rule that quietly fails
+// closed. Failing the unresolved reference at commit turns that silent break
+// into an operator-visible error.
+//
+// Resolution mirrors the snapshot builders EXACTLY (ResolveApplication, which
+// checks user apps then the predefined table, plus ResolveApplicationSet +
+// ExpandApplicationSet) so the commit gate and the dataplane cannot diverge.
+// The `any` keyword and the empty token are always accepted (they mean
+// "unconstrained" and the builders short-circuit them to no terms). Static NAT
+// carries no application match, so only source and destination NAT rule-sets
+// are walked.
+//
+// Strict on commit / commit-check (hard reject naming the NAT kind, rule-set,
+// rule, and the undefined app); lenient on load / peer-sync (warn — #1960; the
+// dataplane independently fails the rule closed, so a leniently-loaded bad
+// config is no worse off, now flagged). Same doctrine as
+// lenientPolicyMatchApplications.
+func validateNATMatchApplicationsStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// appRefError returns nil if the token resolves, or a tailored reject.
+	// Resolution mirrors the SNAT/DNAT snapshot builders: a name resolves only
+	// if it is a predefined / user application OR an application-set that
+	// EXPANDS to >= 1 member. A defined-but-EMPTY application-set resolves by
+	// NAME but expands to zero members -> the builder produces a never-match
+	// term (H08).
+	appRefError := func(natKind, ruleSet, ruleName, name string) error {
+		switch name {
+		case "", "any":
+			return nil
+		}
+		if _, ok := ResolveApplication(name, cfg.Applications.Applications); ok {
+			return nil
+		}
+		if _, ok := ResolveApplicationSet(name, cfg.Applications.ApplicationSets); ok {
+			expanded, err := ExpandApplicationSet(name, &cfg.Applications)
+			if err == nil && len(expanded) == 0 {
+				return natMatchEmptyAppSetError(natKind, ruleSet, ruleName, name)
+			}
+			return nil
+		}
+		return natMatchApplicationError(natKind, ruleSet, ruleName, name)
+	}
+	checkRuleSet := func(natKind string, rs *NATRuleSet) error {
+		if rs == nil {
+			return nil
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			if err := appRefError(natKind, rs.Name, rule.Name, rule.Match.Application); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, rs := range cfg.Security.NAT.Source {
+		if err := checkRuleSet("source", rs); err != nil {
+			return err
+		}
+	}
+	if cfg.Security.NAT.Destination != nil {
+		for _, rs := range cfg.Security.NAT.Destination.RuleSets {
+			if err := checkRuleSet("destination", rs); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// natMatchApplicationError formats the #3434 H07 reject for a NAT rule whose
+// `match application` names neither a predefined/user application nor an
+// application-set.
+func natMatchApplicationError(natKind, ruleSet, ruleName, app string) error {
+	return fmt.Errorf(
+		"%s NAT rule-set %q rule %q match application %q resolves to no "+
+			"predefined application, user-defined application, or "+
+			"application-set (a typo or undefined application disarms the NAT "+
+			"match and the dataplane falls open to a wildcard translation) — "+
+			"define the application or fix the reference (#3434)",
+		natKind, ruleSet, ruleName, app)
+}
+
+// natMatchEmptyAppSetError formats the #3434 H08 reject for a NAT rule
+// referencing a DEFINED but EMPTY application-set. The set exists by name but
+// expands to zero members, so the snapshot builder produces a never-match term
+// and the rule quietly matches nothing — the NAT sibling of #3146.
+func natMatchEmptyAppSetError(natKind, ruleSet, ruleName, name string) error {
+	return fmt.Errorf(
+		"%s NAT rule-set %q rule %q match application %q is a defined but "+
+			"EMPTY application-set (it expands to zero applications) — the rule "+
+			"commits but the dataplane installs a never-match term so the "+
+			"translation never fires — add at least one `applications "+
+			"application-set %q application <name>` member or remove the "+
+			"reference (#3434)",
+		natKind, ruleSet, ruleName, name, name)
+}
+
 // policyMatchAddressBookResolves mirrors the runtime address resolver
 // resolveUserspaceAddressBookEntry + expandUserspacePolicyAddresses
 // (pkg/dataplane/userspace/capabilities.go) for a single address-book NAME
